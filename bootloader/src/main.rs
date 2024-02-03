@@ -1,7 +1,7 @@
 #![no_main]
 #![no_std]
 
-use uefi::prelude::*;
+use uefi::{prelude::*, table::boot::MemoryType};
 
 #[entry]
 fn main(_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
@@ -9,5 +9,7 @@ fn main(_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
 
     uefi_services::println!("Hello, world!");
 
-    Status::SUCCESS
+    // let (_system_table, _memory_map) = system_table.exit_boot_services(MemoryType::CONVENTIONAL);
+
+    loop {}
 }

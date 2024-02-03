@@ -124,6 +124,9 @@ fn create_gpt_disk_with_esp_partition(esp_volume_bytes: Vec<u8>) -> Vec<u8> {
 
 fn main() -> std::io::Result<()> {
     // Build the kernel and bootloader projects
+    println!("cargo:rerun-if-changed=./src/");
+    println!("cargo:rerun-if-changed=../bootloader/src/");
+    println!("cargo:rerun-if-changed=../kernel/src/");
     Command::new("cargo")
         .args(&["build", "--release"])
         .current_dir("../kernel")
