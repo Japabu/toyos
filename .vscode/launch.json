@@ -1,0 +1,17 @@
+{
+    "configurations": [
+        {
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "run",
+                    "--manifest-path",
+                    "${workspaceFolder}/bootable/Cargo.toml"
+                ],
+            },
+            "name": "run bootable",
+            "cwd": "${workspaceFolder}/bootable"
+        }
+    ]
+}

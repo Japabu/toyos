@@ -1,0 +1,22 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "run",
+			"type": "cargo",
+			"command": "run",
+			"options": {
+				"cwd": "${workspaceFolder}/bootable"
+			},
+			"isBackground": true
+		},
+		{
+			"label": "build",
+			"type": "cargo",
+			"command": "build",
+			"options": {
+				"cwd": "${workspaceFolder}/bootable"
+			},
+		}
+	]
+}

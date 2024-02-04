@@ -8,3 +8,9 @@ edition = "2021"
 [dependencies]
 uefi = "0.26.0"
 uefi-services = "0.23.0"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

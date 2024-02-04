@@ -16,8 +16,10 @@ fn main() {
         
         .arg("-serial").arg("stdio")
 
-        .arg("-d").arg("cpu_reset")
         .arg("-no-reboot")
+
+        // Enable gdb at port 1234
+        .arg("-s")
 
         .status()
         .expect("failed to execute process");

@@ -4,8 +4,8 @@ use std::io::{Cursor, Write};
 use std::process::Command;
 
 fn create_fat_fs_with_bl_and_kernel() -> Vec<u8> {
-    let kernel_path = "../kernel/target/x86_64-unknown-none/release/kernel";
-    let bl_path = "../bootloader/target/x86_64-unknown-uefi/release/bootloader.efi";
+    let kernel_path = "../kernel/target/x86_64-unknown-none/debug/kernel";
+    let bl_path = "../bootloader/target/x86_64-unknown-uefi/debug/bootloader.efi";
 
     let kernel_bytes = fs::read(kernel_path).expect("Failed to read kernel");
     let bl_bytes = fs::read(bl_path).expect("Failed to read bootloader");
@@ -127,16 +127,23 @@ fn main() -> std::io::Result<()> {
     println!("cargo:rerun-if-changed=./src/");
     println!("cargo:rerun-if-changed=../bootloader/src/");
     println!("cargo:rerun-if-changed=../kernel/src/");
-    Command::new("cargo")
-        .args(&["build", "--release"])
+    if !Command::new("cargo")
+        .args(&["build"])
         .current_dir("../kernel")
-        .status()
-        .expect("Failed to build kernel");
-    Command::new("cargo")
-        .args(&["build", "--release"])
+        .status()?
+        .success()
+    {
+        panic!("Failed to build kernel");
+    }
+
+    if !Command::new("cargo")
+        .args(&["build"])
         .current_dir("../bootloader")
-        .status()
-        .expect("Failed to build bootloader");
+        .status()?
+        .success()
+    {
+        panic!("Failed to build bootloader");
+    }
 
     let volume_bytes = create_fat_fs_with_bl_and_kernel();
     let disk_bytes = create_gpt_disk_with_esp_partition(volume_bytes);
