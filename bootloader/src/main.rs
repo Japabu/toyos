@@ -10,7 +10,7 @@ use elf::{abi, endian::AnyEndian, ElfBytes};
 use uefi::{
     prelude::*,
     proto::media::file::{File, FileInfo, FileMode},
-    table::boot::{MemoryType, PAGE_SIZE},
+    table::{boot::{MemoryType, PAGE_SIZE}, cfg::ACPI2_GUID},
 };
 use uefi_services::println;
 
@@ -29,6 +29,7 @@ pub struct KernelArgs {
     pub kernel_memory_size: u64,
     pub kernel_stack_addr: u64,
     pub kernel_stack_size: u64,
+    pub rsdp_addr: u64,
 }
 
 #[repr(C)]
@@ -158,7 +159,7 @@ fn load_kernel_elf(kernel_elf_bytes: &[u8]) -> LoadedKernel {
     }
 }
 
-fn start_kernel(kernel: LoadedKernel, system_table: SystemTable<Boot>) -> ! {
+fn start_kernel(kernel: LoadedKernel, rsdp_addr: u64, system_table: SystemTable<Boot>) -> ! {
     // Estimate memory map size
     let mms = system_table.boot_services().memory_map_size();
     let memory_map_entry_count = mms.map_size / mms.entry_size + 8;
@@ -182,6 +183,7 @@ fn start_kernel(kernel: LoadedKernel, system_table: SystemTable<Boot>) -> ! {
         kernel_memory_size: kernel.memory.len() as u64,
         kernel_stack_addr: kernel.stack_offset as u64,
         kernel_stack_size: kernel.stack_size as u64,
+        rsdp_addr,
     };
     let entry_addr = kernel.memory.as_ptr() as usize + kernel.entry_offset;
 
@@ -197,6 +199,15 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
     uefi_services::init(&mut system_table).unwrap();
     println!("ToyOS Bootloader 1.0");
 
+    // Find ACPI 2.0 RSDP from UEFI configuration table
+    let rsdp_addr = system_table
+        .config_table()
+        .iter()
+        .find(|entry| entry.guid == ACPI2_GUID)
+        .map(|entry| entry.address as u64)
+        .expect("ACPI 2.0 RSDP not found in UEFI config table");
+    println!("RSDP address: {:#x}", rsdp_addr);
+
     println!("Loading kernel...");
     let kernel_bytes = load_kernel_bytes(handle, &system_table);
 
@@ -204,5 +215,5 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
     let loaded_kernel = load_kernel_elf(&kernel_bytes);
 
     println!("Starting kernel...");
-    start_kernel(loaded_kernel, system_table);
+    start_kernel(loaded_kernel, rsdp_addr, system_table);
 }

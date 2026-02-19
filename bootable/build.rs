@@ -150,5 +150,13 @@ fn main() -> std::io::Result<()> {
 
     fs::write("target/bootable.img", disk_bytes).expect("Failed to write image");
 
+    // Create empty NVMe disk image if it doesn't already exist (persistent across rebuilds)
+    let nvme_path = "target/nvme.img";
+    if !std::path::Path::new(nvme_path).exists() {
+        let nvme_size = 128 * 1024 * 1024; // 128 MB
+        let nvme_bytes = vec![0u8; nvme_size];
+        fs::write(nvme_path, nvme_bytes).expect("Failed to write NVMe image");
+    }
+
     Ok(())
 }
