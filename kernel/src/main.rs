@@ -79,11 +79,7 @@ pub unsafe extern "sysv64" fn _start(kernel_args: KernelArgs) -> ! {
         log::println("ACPI: Failed to find ECAM base address");
     }
 
-    if let Some(data) = fs.read_file("hello.txt") {
-        if let Ok(text) = core::str::from_utf8(&data) {
-            log::println(&format!("hello.txt: {}", text));
-        }
-    }
+    acpi::init_power(kernel_args.rsdp_addr);
 
     // Set up GDT (UEFI's may be in reclaimable memory) and interrupts
     gdt::init();
@@ -91,7 +87,6 @@ pub unsafe extern "sysv64" fn _start(kernel_args: KernelArgs) -> ! {
     interrupts::init();
     log::println("Keyboard IRQ enabled");
 
-    // Shell loop
     console::write_str("> ");
 
     let mut line_buf = [0u8; 256];
@@ -108,10 +103,9 @@ pub unsafe extern "sysv64" fn _start(kernel_args: KernelArgs) -> ! {
                         let cmd = cmd.trim();
                         match cmd {
                             "" => {}
-                            "help" => log::println("Commands: help, clear"),
-                            "clear" => {
-                                for _ in 0..50 { console::putchar(b'\n'); }
-                            }
+                            "help" => log::println("Commands: help, clear, shutdown"),
+                            "clear" => console::clear(),
+                            "shutdown" => acpi::shutdown(),
                             _ => log::println(&format!("Unknown command: {}", cmd)),
                         }
                     }

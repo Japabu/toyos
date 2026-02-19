@@ -138,6 +138,16 @@ pub fn putchar(b: u8) {
     }
 }
 
+pub fn clear() {
+    unsafe {
+        if let Some(console) = &mut *CONSOLE.inner.get() {
+            console.fb.clear(console.bg);
+            console.cursor_col = 0;
+            console.cursor_row = 0;
+        }
+    }
+}
+
 pub fn backspace() {
     unsafe {
         if let Some(console) = &mut *CONSOLE.inner.get() {
