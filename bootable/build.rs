@@ -1,9 +1,73 @@
 use fatfs::FsOptions;
+use fontdue::{Font, FontSettings};
 use std::fs;
 use std::io::{Cursor, Write};
 use std::path::Path;
 use std::process::Command;
 use tyfs::{Disk, SimpleFs, VecDisk};
+
+const FONT_WIDTH: usize = 8;
+const FONT_HEIGHT: usize = 16;
+const FONT_GLYPHS: usize = 256;
+
+fn generate_font_bitmap(rootfs_dir: &str) {
+    let font_bytes = include_bytes!("assets/JetBrainsMono-Regular.ttf");
+    let font = Font::from_bytes(font_bytes as &[u8], FontSettings::default())
+        .expect("Failed to parse font");
+
+    // Find a px_size where the line height fits in FONT_HEIGHT.
+    // fontdue rasterizes individual glyphs; we pick a size where ascent+descent <= 16.
+    let px_size = 14.0f32;
+    // Use the font's line metrics to position glyphs consistently.
+    let line_metrics = font.horizontal_line_metrics(px_size).unwrap();
+    let ascent = line_metrics.ascent.ceil() as i32;
+
+    let mut output = vec![0u8; FONT_GLYPHS * FONT_HEIGHT];
+
+    for ch in 0..FONT_GLYPHS {
+        let c = ch as u8 as char;
+        let (metrics, bitmap) = font.rasterize(c, px_size);
+
+        // Position glyph in the 8x16 cell
+        // x offset: center horizontally if narrower than 8
+        let x_offset = if metrics.width < FONT_WIDTH {
+            ((FONT_WIDTH as i32 - metrics.width as i32) / 2).max(0) as usize
+        } else {
+            0
+        };
+        // y offset: baseline is at `ascent` pixels from top, glyph top is baseline - ymin
+        let glyph_top = ascent - metrics.height as i32 - metrics.ymin;
+        let y_offset = glyph_top.max(0) as usize;
+
+        let glyph_base = ch * FONT_HEIGHT;
+
+        for gy in 0..metrics.height {
+            let cell_y = y_offset + gy;
+            if cell_y >= FONT_HEIGHT {
+                break;
+            }
+            let mut row_byte: u8 = 0;
+            for gx in 0..metrics.width {
+                let cell_x = x_offset + gx;
+                if cell_x >= FONT_WIDTH {
+                    break;
+                }
+                let pixel = bitmap[gy * metrics.width + gx];
+                if pixel > 100 {
+                    row_byte |= 0x80 >> cell_x;
+                }
+            }
+            output[glyph_base + cell_y] |= row_byte;
+        }
+    }
+
+    let font_path = Path::new(rootfs_dir).join("font8x16.bin");
+    fs::write(&font_path, &output).expect("Failed to write font bitmap");
+    eprintln!(
+        "rootfs: generated font8x16.bin ({} bytes) from JetBrains Mono",
+        output.len()
+    );
+}
 
 fn create_rootfs_image(rootfs_dir: &str) -> Vec<u8> {
     let rootfs = Path::new(rootfs_dir);
@@ -171,6 +235,7 @@ fn main() -> std::io::Result<()> {
     println!("cargo:rerun-if-changed=../bootloader/src/");
     println!("cargo:rerun-if-changed=../kernel/src/");
     println!("cargo:rerun-if-changed=../rootfs/");
+    println!("cargo:rerun-if-changed=./assets/");
     if !Command::new("cargo")
         .args(&["build"])
         .current_dir("../kernel")
@@ -189,6 +254,7 @@ fn main() -> std::io::Result<()> {
         panic!("Failed to build bootloader");
     }
 
+    generate_font_bitmap("../rootfs");
     let rootfs_bytes = create_rootfs_image("../rootfs");
     let volume_bytes = create_fat_fs_with_bl_and_kernel(&rootfs_bytes);
     let disk_bytes = create_gpt_disk_with_esp_partition(volume_bytes);

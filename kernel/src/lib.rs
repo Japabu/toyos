@@ -6,6 +6,10 @@ pub mod log;
 
 #[cfg(not(test))]
 pub mod serial;
+#[cfg(not(test))]
+pub mod framebuffer;
+#[cfg(not(test))]
+pub mod console;
 pub mod acpi;
 pub mod pci;
 pub mod nvme;
@@ -22,6 +26,12 @@ pub struct KernelArgs {
     pub rsdp_addr: u64,
     pub initrd_addr: u64,
     pub initrd_size: u64,
+    pub framebuffer_addr: u64,
+    pub framebuffer_size: u64,
+    pub framebuffer_width: u32,
+    pub framebuffer_height: u32,
+    pub framebuffer_stride: u32,
+    pub framebuffer_pixel_format: u32,
 }
 
 #[repr(C)]

@@ -27,13 +27,7 @@ pub unsafe extern "sysv64" fn _start(kernel_args: KernelArgs) -> ! {
 
     serial::println("Hello from Kernel!");
 
-    if let Some(ecam_base) = acpi::find_ecam_base(kernel_args.rsdp_addr) {
-        pci::enumerate(ecam_base);
-    } else {
-        serial::println("ACPI: Failed to find ECAM base address");
-    }
-
-    // Mount initrd ramdisk
+    // Mount initrd ramdisk (needed to load font)
     assert!(kernel_args.initrd_size > 0, "No initrd provided");
     serial::println(&format!(
         "Initrd: addr={:#x} size={} bytes",
@@ -51,9 +45,37 @@ pub unsafe extern "sysv64" fn _start(kernel_args: KernelArgs) -> ! {
     for (name, size) in fs.list() {
         serial::println(&format!("  {} ({} bytes)", name, size));
     }
+
+    // Initialize framebuffer console
+    let fb = framebuffer::Framebuffer::new(
+        kernel_args.framebuffer_addr,
+        kernel_args.framebuffer_size,
+        kernel_args.framebuffer_width,
+        kernel_args.framebuffer_height,
+        kernel_args.framebuffer_stride,
+        kernel_args.framebuffer_pixel_format,
+    );
+    let font_data = fs
+        .read_file("font8x16.bin")
+        .expect("Failed to load font8x16.bin from rootfs");
+    console::init(fb, &font_data);
+
+    // From here on, log::println outputs to both serial and framebuffer
+    log::println("ToyOS Kernel initialized");
+    log::println(&format!(
+        "Framebuffer: {}x{} stride={}",
+        kernel_args.framebuffer_width, kernel_args.framebuffer_height, kernel_args.framebuffer_stride
+    ));
+
+    if let Some(ecam_base) = acpi::find_ecam_base(kernel_args.rsdp_addr) {
+        pci::enumerate(ecam_base);
+    } else {
+        log::println("ACPI: Failed to find ECAM base address");
+    }
+
     if let Some(data) = fs.read_file("hello.txt") {
         if let Ok(text) = core::str::from_utf8(&data) {
-            serial::println(&format!("hello.txt: {}", text));
+            log::println(&format!("hello.txt: {}", text));
         }
     }
 
