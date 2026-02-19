@@ -15,56 +15,71 @@ fn generate_font_bitmap(rootfs_dir: &str) {
     let font = Font::from_bytes(font_bytes as &[u8], FontSettings::default())
         .expect("Failed to parse font");
 
-    // Find a px_size where the line height fits in FONT_HEIGHT.
-    // fontdue rasterizes individual glyphs; we pick a size where ascent+descent <= 16.
-    let px_size = 14.0f32;
-    // Use the font's line metrics to position glyphs consistently.
+    // Find the largest px_size where every glyph fits in the cell
+    let mut px_size = FONT_HEIGHT as f32;
+    loop {
+        let lm = font.horizontal_line_metrics(px_size).unwrap();
+        let asc = lm.ascent.ceil() as i32;
+        let mut fits = true;
+        for ch in 0..FONT_GLYPHS {
+            let c = ch as u8 as char;
+            let (m, _) = font.rasterize(c, px_size);
+            let glyph_top = asc - m.height as i32 - m.ymin;
+            if glyph_top < 0
+                || (glyph_top as usize) + m.height > FONT_HEIGHT
+                || m.width > FONT_WIDTH
+            {
+                fits = false;
+                break;
+            }
+        }
+        if fits {
+            break;
+        }
+        px_size -= 0.25;
+        assert!(px_size > 4.0, "Could not find a font size that fits in {}x{}", FONT_WIDTH, FONT_HEIGHT);
+    }
+    eprintln!("font: selected px_size={:.2} for {}x{} cell", px_size, FONT_WIDTH, FONT_HEIGHT);
     let line_metrics = font.horizontal_line_metrics(px_size).unwrap();
     let ascent = line_metrics.ascent.ceil() as i32;
 
-    let mut output = vec![0u8; FONT_GLYPHS * FONT_HEIGHT];
+    let mut output = vec![0u8; FONT_GLYPHS * FONT_WIDTH * FONT_HEIGHT];
 
     for ch in 0..FONT_GLYPHS {
         let c = ch as u8 as char;
         let (metrics, bitmap) = font.rasterize(c, px_size);
 
-        // Position glyph in the 8x16 cell
-        // x offset: center horizontally if narrower than 8
         let x_offset = if metrics.width < FONT_WIDTH {
             ((FONT_WIDTH as i32 - metrics.width as i32) / 2).max(0) as usize
         } else {
             0
         };
-        // y offset: baseline is at `ascent` pixels from top, glyph top is baseline - ymin
         let glyph_top = ascent - metrics.height as i32 - metrics.ymin;
         let y_offset = glyph_top.max(0) as usize;
 
-        let glyph_base = ch * FONT_HEIGHT;
+        assert!(glyph_top >= 0,
+            "glyph '{}' (0x{:02x}) clipped at top", c, ch);
+        assert!(y_offset + metrics.height <= FONT_HEIGHT,
+            "glyph '{}' (0x{:02x}) clipped at bottom", c, ch);
+        assert!(x_offset + metrics.width <= FONT_WIDTH,
+            "glyph '{}' (0x{:02x}) clipped at right", c, ch);
+
+        let glyph_base = ch * FONT_WIDTH * FONT_HEIGHT;
 
         for gy in 0..metrics.height {
             let cell_y = y_offset + gy;
-            if cell_y >= FONT_HEIGHT {
-                break;
-            }
-            let mut row_byte: u8 = 0;
             for gx in 0..metrics.width {
                 let cell_x = x_offset + gx;
-                if cell_x >= FONT_WIDTH {
-                    break;
-                }
-                let pixel = bitmap[gy * metrics.width + gx];
-                if pixel > 100 {
-                    row_byte |= 0x80 >> cell_x;
-                }
+                let alpha = bitmap[gy * metrics.width + gx];
+                output[glyph_base + cell_y * FONT_WIDTH + cell_x] = alpha;
             }
-            output[glyph_base + cell_y] |= row_byte;
         }
     }
 
-    let font_path = Path::new(rootfs_dir).join("font8x16.bin");
+    let font_path = Path::new(rootfs_dir).join("font.bin");
     fs::write(&font_path, &output).expect("Failed to write font bitmap");
     eprintln!(
-        "rootfs: generated font8x16.bin ({} bytes) from JetBrains Mono",
+        "rootfs: generated font.bin ({} bytes, grayscale) from JetBrains Mono",
         output.len()
     );
 }

@@ -11,6 +11,8 @@ pub mod serial;
 #[cfg(not(test))]
 pub mod framebuffer;
 #[cfg(not(test))]
+pub mod font;
+#[cfg(not(test))]
 pub mod console;
 #[cfg(not(test))]
 pub mod gdt;

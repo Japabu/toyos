@@ -1,15 +1,12 @@
+use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 
+use crate::font::{self, Font};
 use crate::framebuffer::{Color, Framebuffer};
-
-const FONT_WIDTH: usize = 8;
-const FONT_HEIGHT: usize = 16;
-const FONT_GLYPHS: usize = 256;
-const FONT_BYTES: usize = FONT_GLYPHS * FONT_HEIGHT;
 
 struct Console {
     fb: Framebuffer,
-    font: [u8; FONT_BYTES],
+    font: Font,
     cols: usize,
     rows: usize,
     cursor_col: usize,
@@ -19,17 +16,13 @@ struct Console {
 }
 
 impl Console {
-    fn new(fb: Framebuffer, font_data: &[u8]) -> Self {
-        assert!(font_data.len() >= FONT_BYTES, "Font data too small");
-        let mut font = [0u8; FONT_BYTES];
-        font.copy_from_slice(&font_data[..FONT_BYTES]);
-
-        let cols = fb.width() / FONT_WIDTH;
-        let rows = fb.height() / FONT_HEIGHT;
+    fn new(fb: Framebuffer, font_data: Vec<u8>) -> Self {
+        let cols = fb.width() / font::WIDTH;
+        let rows = fb.height() / font::HEIGHT;
 
         let console = Self {
             fb,
-            font,
+            font: Font::new(font_data),
             cols,
             rows,
             cursor_col: 0,
@@ -43,25 +36,13 @@ impl Console {
     }
 
     fn draw_char(&self, col: usize, row: usize, ch: u8) {
-        let glyph_offset = (ch as usize) * FONT_HEIGHT;
-        let px = col * FONT_WIDTH;
-        let py = row * FONT_HEIGHT;
-
-        for glyph_row in 0..FONT_HEIGHT {
-            let bitmap_byte = self.font[glyph_offset + glyph_row];
-            for bit in 0..FONT_WIDTH {
-                let color = if bitmap_byte & (0x80 >> bit) != 0 {
-                    self.fg
-                } else {
-                    self.bg
-                };
-                self.fb.put_pixel(px + bit, py + glyph_row, color);
-            }
-        }
+        let px = col * font::WIDTH;
+        let py = row * font::HEIGHT;
+        self.font.draw_char(&self.fb, px, py, ch, self.fg, self.bg);
     }
 
     fn scroll(&mut self) {
-        self.fb.scroll_up(FONT_HEIGHT, self.bg);
+        self.fb.scroll_up(font::HEIGHT, self.bg);
         self.cursor_row = self.rows - 1;
         self.cursor_col = 0;
     }
@@ -107,7 +88,7 @@ static CONSOLE: GlobalConsole = GlobalConsole {
     inner: UnsafeCell::new(None),
 };
 
-pub fn init(fb: Framebuffer, font_data: &[u8]) {
+pub fn init(fb: Framebuffer, font_data: Vec<u8>) {
     unsafe {
         *CONSOLE.inner.get() = Some(Console::new(fb, font_data));
     }

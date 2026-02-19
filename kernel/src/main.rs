@@ -53,6 +53,11 @@ pub unsafe extern "sysv64" fn _start(kernel_args: KernelArgs) -> ! {
     }
 
     // Initialize framebuffer console
+    serial::println(&format!(
+        "GOP: {}x{} stride={} fmt={}",
+        kernel_args.framebuffer_width, kernel_args.framebuffer_height,
+        kernel_args.framebuffer_stride, kernel_args.framebuffer_pixel_format
+    ));
     let fb = framebuffer::Framebuffer::new(
         kernel_args.framebuffer_addr,
         kernel_args.framebuffer_size,
@@ -62,9 +67,9 @@ pub unsafe extern "sysv64" fn _start(kernel_args: KernelArgs) -> ! {
         kernel_args.framebuffer_pixel_format,
     );
     let font_data = initrd_fs
-        .read_file("font8x16.bin")
-        .expect("Failed to load font8x16.bin from rootfs");
-    console::init(fb, &font_data);
+        .read_file("font.bin")
+        .expect("Failed to load font.bin from rootfs");
+    console::init(fb, font_data);
 
     // From here on, log::println outputs to both serial and framebuffer
     log::println("ToyOS Kernel initialized");
