@@ -3,6 +3,7 @@
 extern crate alloc;
 
 pub mod disk;
+pub mod fs;
 pub mod log;
 
 #[cfg(not(test))]
