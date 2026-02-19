@@ -9,6 +9,7 @@ use alloc::vec;
 use elf::{abi, endian::AnyEndian, ElfBytes};
 use uefi::{
     prelude::*,
+    CStr16,
     proto::media::file::{File, FileInfo, FileMode},
     table::{boot::{MemoryType, PAGE_SIZE}, cfg::ACPI2_GUID},
 };
@@ -30,6 +31,8 @@ pub struct KernelArgs {
     pub kernel_stack_addr: u64,
     pub kernel_stack_size: u64,
     pub rsdp_addr: u64,
+    pub initrd_addr: u64,
+    pub initrd_size: u64,
 }
 
 #[repr(C)]
@@ -39,44 +42,36 @@ struct MemoryMapEntry {
     pub end: u64,
 }
 
-fn load_kernel_bytes(handle: Handle, system_table: &SystemTable<Boot>) -> vec::Vec<u8> {
+fn load_file_bytes(handle: Handle, system_table: &SystemTable<Boot>, path: &CStr16) -> vec::Vec<u8> {
     let mut fs = system_table
         .boot_services()
         .get_image_file_system(handle)
         .expect("Failed to get file system");
 
-    let mut kernel_file = fs
+    let mut file = fs
         .open_volume()
         .expect("Failed to open volume")
-        .open(
-            cstr16!("\\toyos\\kernel.elf"),
-            FileMode::Read,
-            Default::default(),
-        )
-        .expect("Failed to open kernel file")
+        .open(path, FileMode::Read, Default::default())
+        .expect("Failed to open file")
         .into_regular_file()
-        .expect("Failed to convert kernel file to regular file");
+        .expect("Failed to convert to regular file");
 
-    let kernel_file_info_len = kernel_file
+    let file_info_len = file
         .get_info::<FileInfo>(&mut [])
         .expect_err("Failed to get file info len")
         .data()
         .expect("File info len was None");
 
-    let mut buffer = vec![0; kernel_file_info_len];
-    let kernel_file_info = kernel_file
+    let mut buffer = vec![0; file_info_len];
+    let file_info = file
         .get_info::<FileInfo>(&mut buffer)
         .expect("Failed to get file info");
 
-    println!("Kernel file size: {}", kernel_file_info.file_size());
+    let size = file_info.file_size() as usize;
+    let mut bytes = vec![0; size];
+    file.read(&mut bytes).expect("Failed to read file");
 
-    println!("Reading kernel...");
-    let mut kernel_bytes = vec![0; kernel_file_info.file_size() as usize];
-    kernel_file
-        .read(&mut kernel_bytes)
-        .expect("Failed to read kernel file");
-
-    kernel_bytes
+    bytes
 }
 
 fn load_kernel_elf(kernel_elf_bytes: &[u8]) -> LoadedKernel {
@@ -159,7 +154,7 @@ fn load_kernel_elf(kernel_elf_bytes: &[u8]) -> LoadedKernel {
     }
 }
 
-fn start_kernel(kernel: LoadedKernel, rsdp_addr: u64, system_table: SystemTable<Boot>) -> ! {
+fn start_kernel(kernel: LoadedKernel, initrd: vec::Vec<u8>, rsdp_addr: u64, system_table: SystemTable<Boot>) -> ! {
     // Estimate memory map size
     let mms = system_table.boot_services().memory_map_size();
     let memory_map_entry_count = mms.map_size / mms.entry_size + 8;
@@ -184,11 +179,14 @@ fn start_kernel(kernel: LoadedKernel, rsdp_addr: u64, system_table: SystemTable<
         kernel_stack_addr: kernel.stack_offset as u64,
         kernel_stack_size: kernel.stack_size as u64,
         rsdp_addr,
+        initrd_addr: initrd.as_ptr() as u64,
+        initrd_size: initrd.len() as u64,
     };
     let entry_addr = kernel.memory.as_ptr() as usize + kernel.entry_offset;
 
     mem::forget(memory_map);
     mem::forget(kernel.memory);
+    mem::forget(initrd);
 
     let entry: extern "sysv64" fn(KernelArgs) -> ! = unsafe { mem::transmute(entry_addr) };
     entry(kernel_args);
@@ -209,11 +207,16 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
     println!("RSDP address: {:#x}", rsdp_addr);
 
     println!("Loading kernel...");
-    let kernel_bytes = load_kernel_bytes(handle, &system_table);
+    let kernel_bytes = load_file_bytes(handle, &system_table, cstr16!("\\toyos\\kernel.elf"));
+    println!("Kernel: {} bytes", kernel_bytes.len());
+
+    println!("Loading initrd...");
+    let initrd = load_file_bytes(handle, &system_table, cstr16!("\\toyos\\rootfs.img"));
+    println!("Initrd: {} bytes", initrd.len());
 
     println!("Loading kernel elf...");
     let loaded_kernel = load_kernel_elf(&kernel_bytes);
 
     println!("Starting kernel...");
-    start_kernel(loaded_kernel, rsdp_addr, system_table);
+    start_kernel(loaded_kernel, initrd, rsdp_addr, system_table);
 }

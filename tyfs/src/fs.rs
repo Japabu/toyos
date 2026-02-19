@@ -73,6 +73,10 @@ impl<T: BlockDevice> SimpleFs<T> {
         })
     }
 
+    pub fn into_disk(self) -> Disk<T> {
+        self.disk
+    }
+
     fn write_header(&mut self) {
         let mut header = [0u8; HEADER_SIZE as usize];
         header[0..4].copy_from_slice(&MAGIC);
@@ -233,7 +237,7 @@ mod tests {
         let fs = SimpleFs::format(disk, size);
 
         // Re-mount from the same disk
-        let fs2 = SimpleFs::mount(fs.disk);
+        let fs2 = SimpleFs::mount(fs.into_disk());
         assert!(fs2.is_some());
         let fs2 = fs2.unwrap();
         assert_eq!(fs2.disk_size, size);
@@ -301,7 +305,7 @@ mod tests {
         fs.create("persist.txt", b"saved data");
 
         // Re-mount
-        let mut fs2 = SimpleFs::mount(fs.disk).unwrap();
+        let mut fs2 = SimpleFs::mount(fs.into_disk()).unwrap();
         let data = fs2.read_file("persist.txt");
         assert_eq!(data.as_deref(), Some(b"saved data".as_slice()));
     }

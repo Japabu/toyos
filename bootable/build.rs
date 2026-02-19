@@ -1,9 +1,46 @@
 use fatfs::FsOptions;
 use std::fs;
 use std::io::{Cursor, Write};
+use std::path::Path;
 use std::process::Command;
+use tyfs::{Disk, SimpleFs, VecDisk};
 
-fn create_fat_fs_with_bl_and_kernel() -> Vec<u8> {
+fn create_rootfs_image(rootfs_dir: &str) -> Vec<u8> {
+    let rootfs = Path::new(rootfs_dir);
+    assert!(rootfs.is_dir(), "rootfs directory not found: {}", rootfs_dir);
+
+    // Collect files and calculate needed size
+    let mut files: Vec<(String, Vec<u8>)> = Vec::new();
+    for entry in fs::read_dir(rootfs).expect("Failed to read rootfs") {
+        let entry = entry.expect("Failed to read dir entry");
+        let path = entry.path();
+        if path.is_file() {
+            let name = path.file_name().unwrap().to_str().unwrap().to_string();
+            let data = fs::read(&path).expect("Failed to read file");
+            eprintln!("rootfs: adding '{}' ({} bytes)", name, data.len());
+            files.push((name, data));
+        }
+    }
+
+    // Size: header(64) + file data + toc entries(64 each) + padding
+    let data_size: usize = files.iter().map(|(_, d)| d.len()).sum();
+    let toc_size = files.len() * 64;
+    let size = (64 + data_size + toc_size + 4095) & !4095; // round up to 4K
+    let size = size.max(4096);
+
+    let vec_disk = VecDisk::new(size, 512);
+    let mut tyfs = SimpleFs::format(Disk::new(vec_disk), size as u64);
+
+    for (name, data) in &files {
+        if !tyfs.create(name, data) {
+            panic!("Failed to add '{}' to rootfs image", name);
+        }
+    }
+
+    tyfs.into_disk().into_inner().data
+}
+
+fn create_fat_fs_with_bl_and_kernel(rootfs_bytes: &[u8]) -> Vec<u8> {
     let kernel_path = "../kernel/target/x86_64-unknown-none/debug/kernel";
     let bl_path = "../bootloader/target/x86_64-unknown-uefi/debug/bootloader.efi";
 
@@ -11,7 +48,7 @@ fn create_fat_fs_with_bl_and_kernel() -> Vec<u8> {
     let bl_bytes = fs::read(bl_path).expect("Failed to read bootloader");
 
     let fatfs_overhead_estimate = 100 * 1024; // 100 KiB
-    let total_size = kernel_bytes.len() + bl_bytes.len() + fatfs_overhead_estimate;
+    let total_size = kernel_bytes.len() + bl_bytes.len() + rootfs_bytes.len() + fatfs_overhead_estimate;
 
     let mut volume_bytes = Vec::new();
     volume_bytes.resize(total_size, 0);
@@ -38,13 +75,19 @@ fn create_fat_fs_with_bl_and_kernel() -> Vec<u8> {
             .expect("Failed to create bootx64.efi")
             .write_all(&bl_bytes)
             .expect("Failed to write bootloader");
-        fat.root_dir()
+        let toyos_dir = fat.root_dir()
             .create_dir("toyos")
-            .expect("Failed to create toyos directory")
+            .expect("Failed to create toyos directory");
+        toyos_dir
             .create_file("kernel.elf")
             .expect("Failed to create kernel.elf")
             .write_all(&kernel_bytes)
             .expect("Failed to write kernel");
+        toyos_dir
+            .create_file("rootfs.img")
+            .expect("Failed to create rootfs.img")
+            .write_all(rootfs_bytes)
+            .expect("Failed to write rootfs");
     }
 
     volume_bytes
@@ -127,6 +170,7 @@ fn main() -> std::io::Result<()> {
     println!("cargo:rerun-if-changed=./src/");
     println!("cargo:rerun-if-changed=../bootloader/src/");
     println!("cargo:rerun-if-changed=../kernel/src/");
+    println!("cargo:rerun-if-changed=../rootfs/");
     if !Command::new("cargo")
         .args(&["build"])
         .current_dir("../kernel")
@@ -145,7 +189,8 @@ fn main() -> std::io::Result<()> {
         panic!("Failed to build bootloader");
     }
 
-    let volume_bytes = create_fat_fs_with_bl_and_kernel();
+    let rootfs_bytes = create_rootfs_image("../rootfs");
+    let volume_bytes = create_fat_fs_with_bl_and_kernel(&rootfs_bytes);
     let disk_bytes = create_gpt_disk_with_esp_partition(volume_bytes);
 
     fs::write("target/bootable.img", disk_bytes).expect("Failed to write image");

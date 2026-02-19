@@ -300,7 +300,7 @@ impl NvmeController {
     }
 }
 
-impl crate::disk::BlockDevice for NvmeController {
+impl tyfs::BlockDevice for NvmeController {
     fn sector_size(&self) -> u32 {
         self.sector_size
     }

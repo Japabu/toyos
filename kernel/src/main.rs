@@ -33,5 +33,29 @@ pub unsafe extern "sysv64" fn _start(kernel_args: KernelArgs) -> ! {
         serial::println("ACPI: Failed to find ECAM base address");
     }
 
+    // Mount initrd ramdisk
+    assert!(kernel_args.initrd_size > 0, "No initrd provided");
+    serial::println(&format!(
+        "Initrd: addr={:#x} size={} bytes",
+        kernel_args.initrd_addr, kernel_args.initrd_size
+    ));
+
+    let ramdisk = tyfs::SliceDisk::new(
+        kernel_args.initrd_addr as *mut u8,
+        kernel_args.initrd_size as usize,
+        512,
+    );
+    let disk = tyfs::Disk::new(ramdisk);
+    let mut fs = tyfs::SimpleFs::mount(disk).expect("Failed to mount initrd");
+    serial::println("TYFS: mounted initrd");
+    for (name, size) in fs.list() {
+        serial::println(&format!("  {} ({} bytes)", name, size));
+    }
+    if let Some(data) = fs.read_file("hello.txt") {
+        if let Ok(text) = core::str::from_utf8(&data) {
+            serial::println(&format!("hello.txt: {}", text));
+        }
+    }
+
     loop {}
 }

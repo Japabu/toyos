@@ -3,12 +3,5 @@
 version = 4
 
 [[package]]
-name = "kernel"
-version = "0.1.0"
-dependencies = [
- "tyfs",
-]
-
-[[package]]
 name = "tyfs"
 version = "0.1.0"

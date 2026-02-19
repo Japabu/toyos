@@ -35,6 +35,11 @@ impl<T: BlockDevice> Disk<T> {
         }
     }
 
+    pub fn into_inner(mut self) -> T {
+        self.flush();
+        self.dev
+    }
+
     fn ensure_sector(&mut self, lba: u64) {
         if self.cache_lba == Some(lba) {
             return;
@@ -83,6 +88,87 @@ impl<T: BlockDevice> Disk<T> {
             pos += chunk as u64;
             buf_off += chunk;
             remaining -= chunk as u64;
+        }
+    }
+}
+
+/// In-memory block device backed by a Vec<u8>. Available in std builds (build scripts).
+#[cfg(feature = "std")]
+pub struct VecDisk {
+    pub data: Vec<u8>,
+    pub sector_size: u32,
+}
+
+#[cfg(feature = "std")]
+impl VecDisk {
+    pub fn new(size: usize, sector_size: u32) -> Self {
+        Self {
+            data: alloc::vec![0u8; size],
+            sector_size,
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl BlockDevice for VecDisk {
+    fn sector_size(&self) -> u32 {
+        self.sector_size
+    }
+
+    fn read_sector(&mut self, lba: u64, buf: &mut [u8]) {
+        let offset = lba as usize * self.sector_size as usize;
+        let len = buf.len().min(self.sector_size as usize);
+        buf[..len].copy_from_slice(&self.data[offset..offset + len]);
+    }
+
+    fn write_sector(&mut self, lba: u64, buf: &[u8]) {
+        let offset = lba as usize * self.sector_size as usize;
+        let len = buf.len().min(self.sector_size as usize);
+        self.data[offset..offset + len].copy_from_slice(&buf[..len]);
+    }
+}
+
+/// Block device backed by a raw memory slice. Available in no_std builds (kernel ramdisk).
+#[cfg(not(feature = "std"))]
+pub struct SliceDisk {
+    ptr: *mut u8,
+    len: usize,
+    sector_size: u32,
+}
+
+#[cfg(not(feature = "std"))]
+impl SliceDisk {
+    /// # Safety
+    /// The caller must ensure `ptr` points to a valid memory region of at least `len` bytes
+    /// that remains valid for the lifetime of this SliceDisk.
+    pub unsafe fn new(ptr: *mut u8, len: usize, sector_size: u32) -> Self {
+        Self {
+            ptr,
+            len,
+            sector_size,
+        }
+    }
+}
+
+#[cfg(not(feature = "std"))]
+impl BlockDevice for SliceDisk {
+    fn sector_size(&self) -> u32 {
+        self.sector_size
+    }
+
+    fn read_sector(&mut self, lba: u64, buf: &mut [u8]) {
+        let offset = lba as usize * self.sector_size as usize;
+        let len = buf.len().min(self.sector_size as usize).min(self.len - offset);
+        unsafe {
+            core::ptr::copy_nonoverlapping(self.ptr.add(offset), buf.as_mut_ptr(), len);
+        }
+    }
+
+    fn write_sector(&mut self, lba: u64, buf: &[u8]) {
+        let offset = lba as usize * self.sector_size as usize;
+        let len = buf.len().min(self.sector_size as usize).min(self.len - offset);
+        unsafe {
+            core::ptr::copy_nonoverlapping(buf.as_ptr(), self.ptr.add(offset), len);
         }
     }
 }

@@ -2,8 +2,6 @@
 #![feature(allocator_api)]
 extern crate alloc;
 
-pub mod disk;
-pub mod fs;
 pub mod log;
 
 #[cfg(not(test))]
@@ -22,6 +20,8 @@ pub struct KernelArgs {
     pub kernel_stack_addr: u64,
     pub kernel_stack_size: u64,
     pub rsdp_addr: u64,
+    pub initrd_addr: u64,
+    pub initrd_size: u64,
 }
 
 #[repr(C)]
