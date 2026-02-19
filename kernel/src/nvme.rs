@@ -92,6 +92,7 @@ pub struct NvmeController {
     io_phase: bool,
     next_cid: u16,
     sector_size: u32,
+    ns_size: u64, // namespace size in sectors
 }
 
 // MMIO helpers
@@ -254,12 +255,17 @@ impl NvmeController {
             let lba_fmt = core::ptr::read_unaligned(buf.add(128 + fmt_idx * 4) as *const u32);
             let lba_ds = ((lba_fmt >> 16) & 0xFF) as u32;
             self.sector_size = 1 << lba_ds;
+            self.ns_size = nsze;
             log::println(&format!("NVMe: NS1 size={} sectors, sector_size={}", nsze, self.sector_size));
         }
     }
 
     pub fn sector_size(&self) -> u32 {
         self.sector_size
+    }
+
+    pub fn total_bytes(&self) -> u64 {
+        self.ns_size * self.sector_size as u64
     }
 
     pub fn read(&mut self, lba: u64, buf: &mut [u8]) {
@@ -386,6 +392,7 @@ pub fn init(ecam_base: u64) -> Option<NvmeController> {
         io_phase: true,
         next_cid: 0,
         sector_size: 512, // default, overwritten by identify_namespace
+        ns_size: 0,
     };
 
     ctrl.identify_controller();

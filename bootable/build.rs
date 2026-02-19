@@ -111,8 +111,9 @@ fn create_fat_fs_with_bl_and_kernel(rootfs_bytes: &[u8]) -> Vec<u8> {
     let kernel_bytes = fs::read(kernel_path).expect("Failed to read kernel");
     let bl_bytes = fs::read(bl_path).expect("Failed to read bootloader");
 
-    let fatfs_overhead_estimate = 100 * 1024; // 100 KiB
-    let total_size = kernel_bytes.len() + bl_bytes.len() + rootfs_bytes.len() + fatfs_overhead_estimate;
+    let content_size = kernel_bytes.len() + bl_bytes.len() + rootfs_bytes.len();
+    // FAT32 requires at least 65525 clusters; ensure volume is large enough
+    let total_size = (content_size + 1024 * 1024).max(34 * 1024 * 1024);
 
     let mut volume_bytes = Vec::new();
     volume_bytes.resize(total_size, 0);
