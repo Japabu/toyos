@@ -204,7 +204,13 @@ static ALLOCATOR: RealAllocator = RealAllocator::new();
 #[cfg(not(test))]
 /// Initialize the allocator. Must be called before any allocations.
 /// Uses the arena internally to bootstrap the region vecs.
-pub unsafe fn init(entries: &[MemoryMapEntry], kernel_start: u64, kernel_size: u64) {
+pub unsafe fn init(
+    entries: &[MemoryMapEntry],
+    kernel_start: u64,
+    kernel_size: u64,
+    initrd_start: u64,
+    initrd_size: u64,
+) {
     let usable = build_usable_regions(entries);
 
     let u = &mut *ALLOCATOR.usable.get();
@@ -213,6 +219,7 @@ pub unsafe fn init(entries: &[MemoryMapEntry], kernel_start: u64, kernel_size: u
 
     r.push(Region { start: 0, end: 0x1000 });
     r.push(Region { start: kernel_start, end: kernel_start + kernel_size });
+    r.push(Region { start: initrd_start, end: initrd_start + initrd_size });
 
     r.sort_unstable_by_key(|r| r.start);
     merge_in_place(r);

@@ -121,3 +121,30 @@ pub fn println(s: &str) {
         }
     }
 }
+
+pub fn write_str(s: &str) {
+    unsafe {
+        if let Some(console) = &mut *CONSOLE.inner.get() {
+            console.write_str(s);
+        }
+    }
+}
+
+pub fn putchar(b: u8) {
+    unsafe {
+        if let Some(console) = &mut *CONSOLE.inner.get() {
+            console.write_byte(b);
+        }
+    }
+}
+
+pub fn backspace() {
+    unsafe {
+        if let Some(console) = &mut *CONSOLE.inner.get() {
+            if console.cursor_col > 0 {
+                console.cursor_col -= 1;
+                console.draw_char(console.cursor_col, console.cursor_row, b' ');
+            }
+        }
+    }
+}

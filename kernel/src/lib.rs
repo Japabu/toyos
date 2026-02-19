@@ -5,11 +5,19 @@ extern crate alloc;
 pub mod log;
 
 #[cfg(not(test))]
+pub mod io;
+#[cfg(not(test))]
 pub mod serial;
 #[cfg(not(test))]
 pub mod framebuffer;
 #[cfg(not(test))]
 pub mod console;
+#[cfg(not(test))]
+pub mod gdt;
+#[cfg(not(test))]
+pub mod interrupts;
+#[cfg(not(test))]
+pub mod keyboard;
 pub mod acpi;
 pub mod pci;
 pub mod nvme;

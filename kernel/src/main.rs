@@ -23,7 +23,13 @@ pub unsafe extern "sysv64" fn _start(kernel_args: KernelArgs) -> ! {
         kernel_args.memory_map_addr as *const MemoryMapEntry,
         entry_count,
     );
-    allocator::init(maps, kernel_args.kernel_memory_addr, kernel_args.kernel_memory_size);
+    allocator::init(
+        maps,
+        kernel_args.kernel_memory_addr,
+        kernel_args.kernel_memory_size,
+        kernel_args.initrd_addr,
+        kernel_args.initrd_size,
+    );
 
     serial::println("Hello from Kernel!");
 
@@ -79,5 +85,56 @@ pub unsafe extern "sysv64" fn _start(kernel_args: KernelArgs) -> ! {
         }
     }
 
-    loop {}
+    // Set up GDT (UEFI's may be in reclaimable memory) and interrupts
+    gdt::init();
+    log::println("GDT: loaded");
+    interrupts::init();
+    log::println("Keyboard IRQ enabled");
+
+    // Shell loop
+    console::write_str("> ");
+
+    let mut line_buf = [0u8; 256];
+    let mut line_len: usize = 0;
+
+    loop {
+        if let Some(ch) = keyboard::try_read_char() {
+            match ch {
+                b'\n' => {
+                    console::putchar(b'\n');
+                    serial::println("");
+
+                    if let Ok(cmd) = core::str::from_utf8(&line_buf[..line_len]) {
+                        let cmd = cmd.trim();
+                        match cmd {
+                            "" => {}
+                            "help" => log::println("Commands: help, clear"),
+                            "clear" => {
+                                for _ in 0..50 { console::putchar(b'\n'); }
+                            }
+                            _ => log::println(&format!("Unknown command: {}", cmd)),
+                        }
+                    }
+
+                    line_len = 0;
+                    console::write_str("> ");
+                }
+                0x08 => {
+                    if line_len > 0 {
+                        line_len -= 1;
+                        console::backspace();
+                    }
+                }
+                ch => {
+                    if line_len < line_buf.len() {
+                        line_buf[line_len] = ch;
+                        line_len += 1;
+                        console::putchar(ch);
+                    }
+                }
+            }
+        } else {
+            core::hint::spin_loop();
+        }
+    }
 }

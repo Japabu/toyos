@@ -1,4 +1,4 @@
-use core::arch::asm;
+use crate::io::{inb, outb};
 
 const PORT: u16 = 0x3f8; // COM1
 
@@ -29,28 +29,6 @@ pub fn println(s: &str) {
         write_serial(c);
     }
     write_serial('\n');
-}
-
-fn outb(port: u16, value: u8) {
-    unsafe {
-        asm!(
-           "out dx, al",
-           in("dx") port,
-           in("al") value,
-        );
-    }
-}
-
-fn inb(port: u16) -> u8 {
-    let value: u8;
-    unsafe {
-        asm!(
-            "in al, dx",
-            out("al") value,
-            in("dx") port,
-        );
-    }
-    value
 }
 
 fn is_transmit_empty() -> bool {
