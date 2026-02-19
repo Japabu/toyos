@@ -71,7 +71,7 @@ const DMA_POOL_SIZE: usize = (DMA_PAGES + 1) * 4096;
 static mut DMA_POOL: [u8; DMA_POOL_SIZE] = [0; DMA_POOL_SIZE];
 
 fn dma_page(index: usize) -> u64 {
-    let raw = unsafe { DMA_POOL.as_ptr() as u64 };
+    let raw = core::ptr::addr_of!(DMA_POOL) as u64;
     let base = (raw + 4095) & !4095;
     base + (index as u64) * 4096
 }
@@ -306,17 +306,95 @@ impl NvmeController {
     }
 }
 
-impl tyfs::BlockDevice for NvmeController {
-    fn sector_size(&self) -> u32 {
-        self.sector_size
+/// Byte-addressable disk backed by an NVMe controller, with single-sector write cache.
+pub struct NvmeDisk {
+    ctrl: NvmeController,
+    sector_size: u64,
+    cache_lba: Option<u64>,
+    cache_buf: alloc::vec::Vec<u8>,
+    cache_dirty: bool,
+}
+
+impl NvmeDisk {
+    pub fn new(ctrl: NvmeController) -> Self {
+        let sector_size = ctrl.sector_size() as u64;
+        Self {
+            cache_buf: alloc::vec![0u8; sector_size as usize],
+            ctrl,
+            sector_size,
+            cache_lba: None,
+            cache_dirty: false,
+        }
     }
 
-    fn read_sector(&mut self, lba: u64, buf: &mut [u8]) {
-        self.read(lba, buf);
+    pub fn total_bytes(&self) -> u64 {
+        self.ctrl.total_bytes()
     }
 
-    fn write_sector(&mut self, lba: u64, buf: &[u8]) {
-        self.write(lba, buf);
+    fn ensure_sector(&mut self, lba: u64) {
+        if self.cache_lba == Some(lba) {
+            return;
+        }
+        self.flush_cache();
+        self.ctrl.read(lba, &mut self.cache_buf);
+        self.cache_lba = Some(lba);
+        self.cache_dirty = false;
+    }
+
+    fn flush_cache(&mut self) {
+        if self.cache_dirty {
+            if let Some(lba) = self.cache_lba {
+                self.ctrl.write(lba, &self.cache_buf);
+                self.cache_dirty = false;
+            }
+        }
+    }
+}
+
+impl tyfs::Disk for NvmeDisk {
+    fn read(&mut self, offset: u64, buf: &mut [u8]) {
+        let mut remaining = buf.len() as u64;
+        let mut pos = offset;
+        let mut buf_off: usize = 0;
+
+        while remaining > 0 {
+            let lba = pos / self.sector_size;
+            let sector_off = (pos % self.sector_size) as usize;
+            let chunk = core::cmp::min(remaining, self.sector_size - sector_off as u64) as usize;
+
+            self.ensure_sector(lba);
+            buf[buf_off..buf_off + chunk]
+                .copy_from_slice(&self.cache_buf[sector_off..sector_off + chunk]);
+
+            pos += chunk as u64;
+            buf_off += chunk;
+            remaining -= chunk as u64;
+        }
+    }
+
+    fn write(&mut self, offset: u64, buf: &[u8]) {
+        let mut remaining = buf.len() as u64;
+        let mut pos = offset;
+        let mut buf_off: usize = 0;
+
+        while remaining > 0 {
+            let lba = pos / self.sector_size;
+            let sector_off = (pos % self.sector_size) as usize;
+            let chunk = core::cmp::min(remaining, self.sector_size - sector_off as u64) as usize;
+
+            self.ensure_sector(lba);
+            self.cache_buf[sector_off..sector_off + chunk]
+                .copy_from_slice(&buf[buf_off..buf_off + chunk]);
+            self.cache_dirty = true;
+
+            pos += chunk as u64;
+            buf_off += chunk;
+            remaining -= chunk as u64;
+        }
+    }
+
+    fn flush(&mut self) {
+        self.flush_cache();
     }
 }
 

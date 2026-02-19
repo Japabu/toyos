@@ -144,7 +144,6 @@ fn load_kernel_elf(kernel_elf_bytes: &[u8]) -> LoadedKernel {
             elf.section_data_as_relas(&section_header)
                 .expect("Failed to parse SHT_RELA")
                 .for_each(|rela| {
-                    println!("Relocation: {:?}", rela);
                     match rela.r_type {
                         abi::R_X86_64_RELATIVE => {
                             let offset = rela.r_offset as isize;

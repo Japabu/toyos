@@ -4,7 +4,7 @@ use std::fs;
 use std::io::{Cursor, Write};
 use std::path::Path;
 use std::process::Command;
-use tyfs::{Disk, SimpleFs, VecDisk};
+use tyfs::SimpleFs;
 
 const FONT_WIDTH: usize = 8;
 const FONT_HEIGHT: usize = 16;
@@ -69,6 +69,28 @@ fn generate_font_bitmap(rootfs_dir: &str) {
     );
 }
 
+struct VecDisk {
+    data: Vec<u8>,
+}
+
+impl VecDisk {
+    fn new(size: usize) -> Self {
+        Self { data: vec![0u8; size] }
+    }
+}
+
+impl tyfs::Disk for VecDisk {
+    fn read(&mut self, offset: u64, buf: &mut [u8]) {
+        let off = offset as usize;
+        buf.copy_from_slice(&self.data[off..off + buf.len()]);
+    }
+    fn write(&mut self, offset: u64, buf: &[u8]) {
+        let off = offset as usize;
+        self.data[off..off + buf.len()].copy_from_slice(buf);
+    }
+    fn flush(&mut self) {}
+}
+
 fn create_rootfs_image(rootfs_dir: &str) -> Vec<u8> {
     let rootfs = Path::new(rootfs_dir);
     assert!(rootfs.is_dir(), "rootfs directory not found: {}", rootfs_dir);
@@ -92,8 +114,8 @@ fn create_rootfs_image(rootfs_dir: &str) -> Vec<u8> {
     let size = (64 + data_size + toc_size + 4095) & !4095; // round up to 4K
     let size = size.max(4096);
 
-    let vec_disk = VecDisk::new(size, 512);
-    let mut tyfs = SimpleFs::format(Disk::new(vec_disk), size as u64);
+    let vec_disk = VecDisk::new(size);
+    let mut tyfs = SimpleFs::format(vec_disk, size as u64);
 
     for (name, data) in &files {
         if !tyfs.create(name, data) {
@@ -101,7 +123,7 @@ fn create_rootfs_image(rootfs_dir: &str) -> Vec<u8> {
         }
     }
 
-    tyfs.into_disk().into_inner().data
+    tyfs.into_disk().data
 }
 
 fn create_fat_fs_with_bl_and_kernel(rootfs_bytes: &[u8]) -> Vec<u8> {

@@ -1,7 +1,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use crate::disk::{BlockDevice, Disk};
+use crate::disk::Disk;
 
 const MAGIC: [u8; 4] = *b"TYFS";
 const VERSION: u32 = 1;
@@ -23,15 +23,15 @@ const ENTRY_SIZE: u64 = 64;
 //   [40..48] size (file size in bytes)
 //   [48..64] reserved
 
-pub struct SimpleFs<T: BlockDevice> {
-    disk: Disk<T>,
+pub struct SimpleFs<D: Disk> {
+    disk: D,
     disk_size: u64,
     data_end: u64,
     toc_start: u64,
 }
 
-impl<T: BlockDevice> SimpleFs<T> {
-    pub fn format(mut disk: Disk<T>, disk_size: u64) -> Self {
+impl<D: Disk> SimpleFs<D> {
+    pub fn format(mut disk: D, disk_size: u64) -> Self {
         let mut header = [0u8; HEADER_SIZE as usize];
         header[0..4].copy_from_slice(&MAGIC);
         header[4..8].copy_from_slice(&VERSION.to_le_bytes());
@@ -49,7 +49,7 @@ impl<T: BlockDevice> SimpleFs<T> {
         }
     }
 
-    pub fn mount(mut disk: Disk<T>) -> Option<Self> {
+    pub fn mount(mut disk: D) -> Option<Self> {
         let mut header = [0u8; HEADER_SIZE as usize];
         disk.read(0, &mut header);
 
@@ -73,7 +73,7 @@ impl<T: BlockDevice> SimpleFs<T> {
         })
     }
 
-    pub fn into_disk(self) -> Disk<T> {
+    pub fn into_disk(self) -> D {
         self.disk
     }
 
@@ -121,21 +121,18 @@ impl<T: BlockDevice> SimpleFs<T> {
             return false;
         }
 
-        // Write file data at data_end
         let file_offset = self.data_end;
         self.disk.write(file_offset, data);
 
-        // Build ToC entry
         let new_toc = self.toc_start - ENTRY_SIZE;
         let mut entry = [0u8; ENTRY_SIZE as usize];
-        entry[0] = 1; // in-use
+        entry[0] = 1;
         entry[1..1 + name_bytes.len()].copy_from_slice(name_bytes);
         entry[32..40].copy_from_slice(&file_offset.to_le_bytes());
         entry[40..48].copy_from_slice(&(data.len() as u64).to_le_bytes());
 
         self.disk.write(new_toc, &entry);
 
-        // Update pointers
         self.data_end += data.len() as u64;
         self.toc_start = new_toc;
         self.write_header();
@@ -155,7 +152,7 @@ impl<T: BlockDevice> SimpleFs<T> {
 
     pub fn delete(&mut self, name: &str) -> bool {
         if let Some(entry_offset) = self.find_entry(name) {
-            self.disk.write(entry_offset, &[0u8; 1]); // clear flags byte
+            self.disk.write(entry_offset, &[0u8; 1]);
             self.disk.flush();
             true
         } else {
@@ -184,65 +181,46 @@ impl<T: BlockDevice> SimpleFs<T> {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
     use super::*;
+    use crate::disk::Disk;
 
-    struct MemDisk {
-        data: Vec<u8>,
-        sector_size: u32,
-    }
+    struct MemDisk(std::vec::Vec<u8>);
 
     impl MemDisk {
-        fn new(num_sectors: usize, sector_size: u32) -> Self {
-            Self {
-                data: alloc::vec![0u8; num_sectors * sector_size as usize],
-                sector_size,
-            }
-        }
-
-        fn size(&self) -> u64 {
-            self.data.len() as u64
+        fn new(size: usize) -> Self {
+            Self(std::vec![0u8; size])
         }
     }
 
-    impl BlockDevice for MemDisk {
-        fn sector_size(&self) -> u32 {
-            self.sector_size
+    impl Disk for MemDisk {
+        fn read(&mut self, offset: u64, buf: &mut [u8]) {
+            let off = offset as usize;
+            buf.copy_from_slice(&self.0[off..off + buf.len()]);
         }
-
-        fn read_sector(&mut self, lba: u64, buf: &mut [u8]) {
-            let offset = lba as usize * self.sector_size as usize;
-            let len = buf.len().min(self.sector_size as usize);
-            buf[..len].copy_from_slice(&self.data[offset..offset + len]);
+        fn write(&mut self, offset: u64, buf: &[u8]) {
+            let off = offset as usize;
+            self.0[off..off + buf.len()].copy_from_slice(buf);
         }
-
-        fn write_sector(&mut self, lba: u64, buf: &[u8]) {
-            let offset = lba as usize * self.sector_size as usize;
-            let len = buf.len().min(self.sector_size as usize);
-            self.data[offset..offset + len].copy_from_slice(&buf[..len]);
-        }
+        fn flush(&mut self) {}
     }
 
     fn make_fs() -> SimpleFs<MemDisk> {
-        let mem = MemDisk::new(64, 512);
-        let size = mem.size();
-        let disk = Disk::new(mem);
-        SimpleFs::format(disk, size)
+        let size = 64 * 512;
+        SimpleFs::format(MemDisk::new(size), size as u64)
     }
 
     #[test]
     fn format_and_mount() {
-        let mem = MemDisk::new(64, 512);
-        let size = mem.size();
-        let disk = Disk::new(mem);
-        let fs = SimpleFs::format(disk, size);
+        let size = 64 * 512;
+        let fs = SimpleFs::format(MemDisk::new(size), size as u64);
 
-        // Re-mount from the same disk
         let fs2 = SimpleFs::mount(fs.into_disk());
         assert!(fs2.is_some());
         let fs2 = fs2.unwrap();
-        assert_eq!(fs2.disk_size, size);
+        assert_eq!(fs2.disk_size, size as u64);
         assert_eq!(fs2.data_end, HEADER_SIZE);
-        assert_eq!(fs2.toc_start, size);
+        assert_eq!(fs2.toc_start, size as u64);
     }
 
     #[test]
@@ -263,7 +241,6 @@ mod tests {
         let files = fs.list();
         assert_eq!(files.len(), 3);
 
-        // ToC grows downward, so first entry (c.txt) is at lowest offset
         let names: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
         assert!(names.contains(&"a.txt"));
         assert!(names.contains(&"b.txt"));
@@ -286,16 +263,10 @@ mod tests {
 
     #[test]
     fn disk_full() {
-        let mem = MemDisk::new(1, 512); // tiny disk: 512 bytes
-        let size = mem.size();
-        let disk = Disk::new(mem);
-        let mut fs = SimpleFs::format(disk, size);
+        let size = 512;
+        let mut fs = SimpleFs::format(MemDisk::new(size), size as u64);
 
-        // 512 - 64 (header) = 448 bytes free
-        // Creating a file needs data.len() + 64 (entry) bytes
-        // So max data = 448 - 64 = 384
         assert!(fs.create("big.txt", &[0xAA; 384]));
-        // No room left
         assert!(!fs.create("nope.txt", b"x"));
     }
 
@@ -304,7 +275,6 @@ mod tests {
         let mut fs = make_fs();
         fs.create("persist.txt", b"saved data");
 
-        // Re-mount
         let mut fs2 = SimpleFs::mount(fs.into_disk()).unwrap();
         let data = fs2.read_file("persist.txt");
         assert_eq!(data.as_deref(), Some(b"saved data".as_slice()));

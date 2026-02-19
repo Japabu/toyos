@@ -21,7 +21,14 @@ pub mod keyboard;
 pub mod acpi;
 pub mod pci;
 pub mod nvme;
+#[cfg(not(test))]
+pub mod ramdisk;
+pub mod xhci;
 pub mod allocator;
+#[cfg(not(test))]
+pub mod vfs;
+#[cfg(not(test))]
+pub mod shell;
 
 #[repr(C)]
 pub struct KernelArgs {
