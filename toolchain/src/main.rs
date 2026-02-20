@@ -34,10 +34,16 @@ fn main() {
     let stage2 = find_stage2(&rust_dir);
     run("rustup", &["toolchain", "link", "toyos", stage2.to_str().unwrap()]);
 
+    // Step 6: Write stamp so bootable/build.rs knows to rebuild userland
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        .to_string();
+    fs::write(toolchain_dir.join(".sysroot-stamp"), stamp).unwrap();
+
     println!();
     println!("Done! Toolchain 'toyos' is ready.");
-    println!("Build userland with:");
-    println!("  cd userland/hello && cargo +toyos build --target x86_64-unknown-toyos");
 }
 
 // ---------------------------------------------------------------------------
@@ -89,8 +95,10 @@ fn copy_patches(base: &Path, dir: &Path, rust_dir: &Path) {
             let rel = path.strip_prefix(base).unwrap();
             let dest = rust_dir.join(rel);
             fs::create_dir_all(dest.parent().unwrap()).unwrap();
-            fs::copy(&path, &dest).unwrap();
-            println!("  Copied: {}", rel.display());
+            // Use write (not copy) so mtime is always now — ensures cargo
+            // detects changes and recompiles only affected crates.
+            fs::write(&dest, fs::read(&path).unwrap()).unwrap();
+            println!("  Patched: {}", rel.display());
         }
     }
 }

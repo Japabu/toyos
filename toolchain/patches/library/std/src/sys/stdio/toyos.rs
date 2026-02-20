@@ -1,38 +1,8 @@
 use crate::io::{self, BorrowedCursor, IoSlice, IoSliceMut};
-use core::arch::asm;
+use crate::sys::syscall;
 
 const SYS_WRITE: u64 = 0;
 const SYS_READ: u64 = 1;
-
-fn syscall_write(buf: *const u8, len: usize) -> isize {
-    let ret: isize;
-    unsafe {
-        asm!(
-            "syscall",
-            inlateout("rax") SYS_WRITE => ret,
-            in("rdi") buf,
-            in("rsi") len,
-            out("rcx") _,
-            out("r11") _,
-        );
-    }
-    ret
-}
-
-fn syscall_read(buf: *mut u8, len: usize) -> isize {
-    let ret: isize;
-    unsafe {
-        asm!(
-            "syscall",
-            inlateout("rax") SYS_READ => ret,
-            in("rdi") buf,
-            in("rsi") len,
-            out("rcx") _,
-            out("r11") _,
-        );
-    }
-    ret
-}
 
 pub struct Stdin;
 pub struct Stdout;
@@ -46,7 +16,7 @@ impl Stdin {
 
 impl io::Read for Stdin {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let n = syscall_read(buf.as_mut_ptr(), buf.len());
+        let n = syscall(SYS_READ, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0) as isize;
         if n < 0 { Err(io::Error::new(io::ErrorKind::Other, "toyos io error")) } else { Ok(n as usize) }
     }
 
@@ -75,7 +45,7 @@ impl Stdout {
 
 impl io::Write for Stdout {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let n = syscall_write(buf.as_ptr(), buf.len());
+        let n = syscall(SYS_WRITE, buf.as_ptr() as u64, buf.len() as u64, 0, 0) as isize;
         if n < 0 { Err(io::Error::new(io::ErrorKind::Other, "toyos io error")) } else { Ok(n as usize) }
     }
 

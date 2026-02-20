@@ -35,6 +35,27 @@ pub mod sync;
 pub mod thread;
 pub mod thread_local;
 
+// ToyOS syscall ABI: SysV with RCX skipped (hardware clobbers it).
+//   RDI=num, RSI=a1, RDX=a2, R8=a3, R9=a4, return in RAX.
+#[cfg(target_os = "toyos")]
+pub(crate) fn syscall(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
+    let ret: u64;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rdi") num,
+            in("rsi") a1,
+            in("rdx") a2,
+            in("r8") a3,
+            in("r9") a4,
+            lateout("rax") ret,
+            out("rcx") _,
+            out("r11") _,
+        );
+    }
+    ret
+}
+
 // FIXME(117276): remove this, move feature implementations into individual
 //                submodules.
 pub use pal::*;

@@ -1,6 +1,6 @@
-use core::arch::{asm, global_asm};
+use core::arch::{asm, naked_asm};
 
-use crate::{console, keyboard, gdt, serial};
+use crate::{console, keyboard, gdt};
 
 // MSR addresses
 const MSR_EFER: u32 = 0xC000_0080;
@@ -8,7 +8,7 @@ const MSR_STAR: u32 = 0xC000_0081;
 const MSR_LSTAR: u32 = 0xC000_0082;
 const MSR_FMASK: u32 = 0xC000_0084;
 
-// Syscall numbers (must match toyos-api)
+// Syscall numbers (must match toolchain patches)
 const SYS_WRITE: u64 = 0;
 const SYS_READ: u64 = 1;
 const SYS_ALLOC: u64 = 2;
@@ -59,57 +59,24 @@ pub fn init() {
 }
 
 // Low-level syscall entry point (called by `syscall` instruction from ring 3)
-// On entry: RAX=syscall#, RDI=a1, RSI=a2, RDX=a3, R10=a4
-//           RCX=return RIP (set by hardware), R11=return RFLAGS (set by hardware)
-//           RSP=user stack (CPU does NOT switch stacks on syscall)
-global_asm!(
-    ".global syscall_entry",
-    "syscall_entry:",
-
-    // Switch from user stack to kernel stack
-    "mov [rip + SYSCALL_USER_RSP], rsp",
-    "mov rsp, [rip + SYSCALL_KERNEL_RSP]",
-
-    // Save caller-preserved state (on kernel stack)
-    "push rcx",         // return RIP
-    "push r11",         // return RFLAGS
-    "push rbp",
-    "push rbx",
-    "push r12",
-    "push r13",
-    "push r14",
-    "push r15",
-
-    // Shuffle args for sysv64 calling convention:
-    //   syscall_dispatch(num, a1, a2, a3, a4)
-    // Before: rax=num, rdi=a1, rsi=a2, rdx=a3, r10=a4
-    // After:  rdi=num, rsi=a1, rdx=a2, rcx=a3, r8=a4
-    "mov r8, r10",
-    "mov rcx, rdx",
-    "mov rdx, rsi",
-    "mov rsi, rdi",
-    "mov rdi, rax",
-
-    "call syscall_dispatch",
-
-    // RAX = return value
-    // Restore caller state
-    "pop r15",
-    "pop r14",
-    "pop r13",
-    "pop r12",
-    "pop rbx",
-    "pop rbp",
-    "pop r11",          // return RFLAGS
-    "pop rcx",          // return RIP
-
-    // Switch back to user stack and return to ring 3
-    "mov rsp, [rip + SYSCALL_USER_RSP]",
-    "sysretq",
-);
-
-extern "C" {
-    fn syscall_entry();
+// Syscall ABI matches SysV with RCX skipped (hardware clobbers it):
+//   RDI=num, RSI=a1, RDX=a2, R8=a3, R9=a4
+//   RCX=return RIP (set by hardware), R11=return RFLAGS (set by hardware)
+//   RSP=user stack (CPU does NOT switch stacks on syscall)
+#[unsafe(naked)]
+extern "C" fn syscall_entry() {
+    naked_asm!(
+        "mov [rip + SYSCALL_USER_RSP], rsp",
+        "mov rsp, [rip + SYSCALL_KERNEL_RSP]",
+        "push rcx",
+        "push r11",
+        "call {handler}",
+        "pop r11",
+        "pop rcx",
+        "mov rsp, [rip + SYSCALL_USER_RSP]",
+        "sysretq",
+        handler = sym syscall_handler,
+    );
 }
 
 // Context saved before executing a userland program, restored by SYS_EXIT
@@ -130,18 +97,7 @@ pub static mut KERNEL_CTX: KernelContext = KernelContext {
     valid: false,
 };
 
-#[no_mangle]
-extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
-    serial::println(match num {
-        SYS_WRITE => "syscall: WRITE",
-        SYS_READ => "syscall: READ",
-        SYS_ALLOC => "syscall: ALLOC",
-        SYS_FREE => "syscall: FREE",
-        SYS_REALLOC => "syscall: REALLOC",
-        SYS_EXIT => "syscall: EXIT",
-        SYS_RANDOM => "syscall: RANDOM",
-        _ => "syscall: UNKNOWN",
-    });
+extern "C" fn syscall_handler(num: u64, a1: u64, a2: u64, _: u64, a3: u64, a4: u64) -> u64 {
     match num {
         SYS_WRITE => sys_write(a1 as *const u8, a2 as usize),
         SYS_READ => sys_read(a1 as *mut u8, a2 as usize),

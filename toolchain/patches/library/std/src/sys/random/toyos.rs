@@ -1,16 +1,7 @@
-use core::arch::asm;
+use crate::sys::syscall;
 
 const SYS_RANDOM: u64 = 6;
 
 pub fn fill_bytes(buf: &mut [u8]) {
-    unsafe {
-        asm!(
-            "syscall",
-            inlateout("rax") SYS_RANDOM => _,
-            in("rdi") buf.as_mut_ptr(),
-            in("rsi") buf.len(),
-            out("rcx") _,
-            out("r11") _,
-        );
-    }
+    syscall(SYS_RANDOM, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0);
 }

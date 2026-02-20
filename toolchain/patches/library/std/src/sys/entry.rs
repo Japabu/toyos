@@ -7,12 +7,5 @@ extern "C" fn _start() -> ! {
     let code = unsafe { main() };
 
     const SYS_EXIT: u64 = 5;
-    unsafe {
-        core::arch::asm!(
-            "syscall",
-            in("rax") SYS_EXIT,
-            in("rdi") code as u64,
-            options(noreturn),
-        );
-    }
+    loop { crate::sys::syscall(SYS_EXIT, code as u64, 0, 0, 0); }
 }

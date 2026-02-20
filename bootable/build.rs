@@ -274,6 +274,7 @@ fn main() -> std::io::Result<()> {
     println!("cargo:rerun-if-changed=../kernel/src/");
     println!("cargo:rerun-if-changed=../initrd/");
     println!("cargo:rerun-if-changed=../userland/");
+    println!("cargo:rerun-if-changed=../toolchain/.sysroot-stamp");
     println!("cargo:rerun-if-changed=./assets/");
     if !Command::new("cargo")
         .args(&["build"])
