@@ -1,0 +1,14 @@
+--- a/library/std/src/sys/stdio/mod.rs
++++ b/library/std/src/sys/stdio/mod.rs
+@@ -48,7 +48,11 @@
+     target_os = "zkvm" => {
+         mod zkvm;
+         pub use zkvm::*;
+     }
++    target_os = "toyos" => {
++        mod toyos;
++        pub use toyos::*;
++    }
+     _ => {
+         mod unsupported;
+         pub use unsupported::*;
