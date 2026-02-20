@@ -31,6 +31,12 @@ pub mod allocator;
 pub mod vfs;
 #[cfg(not(test))]
 pub mod shell;
+#[cfg(not(test))]
+pub mod syscall;
+#[cfg(not(test))]
+pub mod elf;
+#[cfg(not(test))]
+pub mod paging;
 
 #[repr(C)]
 pub struct KernelArgs {

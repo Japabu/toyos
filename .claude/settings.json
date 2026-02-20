@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//Users/jan/.rustup/toolchains/nightly-aarch64-apple-darwin/lib/rustlib/src/rust/library/std/src/sys/pal/common/**)",
+      "Read(//Users/jan/.rustup/toolchains/nightly-aarch64-apple-darwin/lib/rustlib/src/rust/library/std/src/sys/args/**)",
+      "Read(//Users/jan/.rustup/toolchains/nightly-aarch64-apple-darwin/lib/rustlib/src/rust/library/std/src/sys/env/**)",
+      "Read(//Users/jan/.rustup/toolchains/nightly-aarch64-apple-darwin/lib/rustlib/src/rust/library/std/src/sys/**)",
+      "Read(//Users/jan/.rustup/toolchains/nightly-aarch64-apple-darwin/lib/rustlib/src/rust/**)",
+      "Read(//Users/jan/.rustup/toolchains/nightly-aarch64-apple-darwin/lib/rustlib/src/rust/library/**)",
+      "WebFetch(domain:internals.rust-lang.org)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(/Users/jan/.cargo/bin/rust-readelf:*)"
+    ]
+  }
+}

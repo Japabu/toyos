@@ -104,8 +104,10 @@ pub unsafe extern "sysv64" fn _start(kernel_args: KernelArgs) -> ! {
 
     // Set up GDT (UEFI's may be in reclaimable memory) and interrupts
     gdt::init();
-    log::println("GDT: loaded");
     interrupts::init();
+    syscall::init();
+    paging::set_all_user_accessible();
+    log::println("Ring 3: ready");
 
     // Build VFS with mount points
     let mut vfs = vfs::Vfs::new();

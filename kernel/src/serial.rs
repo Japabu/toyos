@@ -39,3 +39,14 @@ fn write_serial(a: char) {
     while !is_transmit_empty() {}
     outb(PORT, a as u8);
 }
+
+/// Print a label followed by a hex u64, no allocations.
+pub fn print_hex(label: &str, val: u64) {
+    for c in label.chars() { write_serial(c); }
+    write_serial('0'); write_serial('x');
+    for i in (0..16).rev() {
+        let nibble = ((val >> (i * 4)) & 0xF) as u8;
+        write_serial(if nibble < 10 { (b'0' + nibble) as char } else { (b'a' + nibble - 10) as char });
+    }
+    write_serial('\n');
+}

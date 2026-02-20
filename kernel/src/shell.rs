@@ -3,7 +3,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::vfs::Vfs;
-use crate::{acpi, console, keyboard, log, serial, xhci};
+use crate::{acpi, console, elf, keyboard, log, serial, xhci};
 
 pub fn run(vfs: &mut Vfs, xhci_ctrl: &mut xhci::XhciController) -> ! {
     console::write_str(&format!("{}> ", vfs.cwd()));
@@ -95,6 +95,7 @@ fn exec(
             log::println("  cd <path>       Change directory");
             log::println("  pwd             Print working directory");
             log::println("  clear           Clear screen");
+            log::println("  run <file>      Run an ELF program");
             log::println("  shutdown        Power off");
         }
         "clear" => console::clear(),
@@ -195,6 +196,15 @@ fn exec(
                     *editing_file = Some(String::from(arg));
                     text_buf.clear();
                 }
+            }
+        }
+        "run" => {
+            if arg.is_empty() {
+                log::println("Usage: run <file>");
+            } else if let Some(data) = vfs.read_file(arg) {
+                elf::run(&data);
+            } else {
+                log::println(&format!("{}: file not found", arg));
             }
         }
         _ => {
