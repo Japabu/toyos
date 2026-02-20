@@ -533,6 +533,9 @@ pub fn init(ecam_base: u64) -> Option<XhciController> {
     pci::enable_bus_master(ecam_base, bus, dev, func);
     log::println(&format!("xHCI: BAR0={:#x}", bar));
 
+    // Map BAR MMIO region into our page tables
+    crate::paging::map_kernel(bar, 0x10000); // xHCI register space
+
     // 2. Read capability registers
     let cap_length = mmio_read8(bar, CAP_CAPLENGTH) as u64;
     let hcsparams1 = mmio_read32(bar, CAP_HCSPARAMS1);

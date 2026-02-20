@@ -1,6 +1,9 @@
-use core::arch::asm;
+use core::arch::{asm, naked_asm};
 
 use crate::io::{outb, io_wait};
+use crate::{log, serial, syscall};
+
+use alloc::format;
 
 // PIC ports
 const PIC1_CMD: u16 = 0x20;
@@ -31,6 +34,18 @@ impl IdtEntry {
         offset_high: 0,
         reserved: 0,
     };
+
+    fn new(handler: u64) -> Self {
+        Self {
+            offset_low: handler as u16,
+            selector: 0x08, // kernel CS
+            ist: 0,
+            type_attr: 0x8E, // interrupt gate, DPL=0, present
+            offset_mid: (handler >> 16) as u16,
+            offset_high: (handler >> 32) as u32,
+            reserved: 0,
+        }
+    }
 }
 
 #[repr(C, align(16))]
@@ -83,6 +98,10 @@ pub fn init() {
     remap_pic();
 
     unsafe {
+        // Register exception handlers
+        IDT.entries[13] = IdtEntry::new(gpf_entry as u64);
+        IDT.entries[14] = IdtEntry::new(page_fault_entry as u64);
+
         let ptr = IdtPointer {
             limit: (core::mem::size_of::<Idt>() - 1) as u16,
             base: &raw const IDT as *const Idt as u64,
@@ -90,5 +109,80 @@ pub fn init() {
 
         asm!("lidt [{}]", in(reg) &ptr);
         asm!("sti");
+    }
+}
+
+// --- Exception entry stubs ---
+// For exceptions with error codes, the CPU pushes:
+//   [SS] [RSP] [RFLAGS] [CS] [RIP] [error_code] <- RSP
+
+#[unsafe(naked)]
+extern "C" fn page_fault_entry() {
+    naked_asm!(
+        "mov rdi, 14",          // vector
+        "mov rsi, [rsp]",      // error_code
+        "mov rdx, [rsp + 8]",  // faulting RIP
+        "mov rcx, [rsp + 16]", // CS
+        "mov r8, cr2",         // fault address
+        "call {handler}",
+        "cli",
+        "hlt",
+        handler = sym exception_handler,
+    );
+}
+
+#[unsafe(naked)]
+extern "C" fn gpf_entry() {
+    naked_asm!(
+        "mov rdi, 13",          // vector
+        "mov rsi, [rsp]",      // error_code
+        "mov rdx, [rsp + 8]",  // faulting RIP
+        "mov rcx, [rsp + 16]", // CS
+        "xor r8, r8",          // no fault address for #GP
+        "call {handler}",
+        "cli",
+        "hlt",
+        handler = sym exception_handler,
+    );
+}
+
+// --- Exception handler ---
+
+extern "C" fn exception_handler(vector: u64, error_code: u64, rip: u64, cs: u64, addr: u64) {
+    let is_user = cs & 3 != 0;
+
+    let name = match vector {
+        13 => "General Protection Fault",
+        14 => "Page Fault",
+        _ => "Exception",
+    };
+
+    let detail = if vector == 14 {
+        let action = if error_code & 16 != 0 {
+            "execute"
+        } else if error_code & 2 != 0 {
+            "write"
+        } else {
+            "read"
+        };
+        let cause = if error_code & 1 != 0 {
+            "protection violation"
+        } else {
+            "page not mapped"
+        };
+        format!("{}: {} at {:#x} ({})", name, action, addr, cause)
+    } else {
+        format!("{} (error_code={:#x})", name, error_code)
+    };
+
+    if is_user {
+        log::println(&format!("Process crashed: {}, rip={:#x}", detail, rip));
+        syscall::kill_process(-1);
+    } else {
+        // Kernel fault — unrecoverable
+        serial::println(&format!("KERNEL PANIC: {}, rip={:#x}", detail, rip));
+        loop {
+            unsafe { asm!("cli; hlt"); }
+        }
     }
 }

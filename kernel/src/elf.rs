@@ -2,7 +2,7 @@ use alloc::alloc::{alloc_zeroed, Layout};
 use core::arch::asm;
 
 use alloc::format;
-use crate::{gdt, log, serial, syscall};
+use crate::{gdt, log, paging, serial, syscall};
 
 // ELF constants
 const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
@@ -128,10 +128,10 @@ pub fn run(data: &[u8]) {
         return;
     }
 
-    let load_size = (vaddr_max - vaddr_min) as usize;
+    let load_size = ((vaddr_max - vaddr_min) as usize + 4095) & !4095; // page-align up
     let load_align = 4096usize;
 
-    // Allocate memory for the loaded image
+    // Allocate page-aligned memory for the loaded image
     let layout = match Layout::from_size_align(load_size, load_align) {
         Ok(l) => l,
         Err(_) => {
@@ -204,14 +204,21 @@ pub fn run(data: &[u8]) {
     serial::println(&format!("ELF: {} relocations applied", if rela_ent > 0 { rela_size / rela_ent } else { 0 }));
     let entry = base + ehdr.e_entry;
 
-    // Allocate stack for the program
-    let stack_layout = Layout::from_size_align(USER_STACK_SIZE, 16).unwrap();
+    // Mark ELF memory as user-accessible
+    paging::map_user(base_ptr as u64, load_size as u64);
+
+    // Allocate page-aligned stack for the program
+    let stack_layout = Layout::from_size_align(USER_STACK_SIZE, 4096).unwrap();
     let stack_base = unsafe { alloc_zeroed(stack_layout) };
     if stack_base.is_null() {
         log::println("ELF: stack allocation failed");
         return;
     }
     let stack_top = stack_base as u64 + USER_STACK_SIZE as u64;
+    paging::map_user(stack_base as u64, USER_STACK_SIZE as u64);
+
+    // Set up user heap for syscall allocations
+    syscall::init_user_heap();
 
     // Execute the program
     serial::println(&format!("ELF: entry={:#x}, stack={:#x}", entry, stack_top));

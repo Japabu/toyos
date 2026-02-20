@@ -408,6 +408,9 @@ pub fn init(ecam_base: u64) -> Option<NvmeController> {
     pci::enable_bus_master(ecam_base, bus, dev, func);
     log::println(&format!("NVMe: BAR0={:#x}", bar));
 
+    // Map BAR MMIO region into our page tables
+    crate::paging::map_kernel(bar, 0x4000); // NVMe register space
+
     // Read capabilities
     let cap = mmio_read64(bar, REG_CAP);
     let stride = ((cap >> 32) & 0xF) as u32;

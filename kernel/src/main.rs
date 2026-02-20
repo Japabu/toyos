@@ -34,6 +34,11 @@ pub unsafe extern "sysv64" fn _start(kernel_args: KernelArgs) -> ! {
         kernel_args.initrd_size,
     );
 
+    // Build our own page tables (identity-mapped, kernel-only).
+    // Must happen right after allocator init, before UEFI's page table pages
+    // get handed out by the allocator.
+    paging::init(maps);
+
     serial::println("Hello from Kernel!");
 
     // Mount initrd ramdisk (needed to load font)
@@ -98,7 +103,7 @@ pub unsafe extern "sysv64" fn _start(kernel_args: KernelArgs) -> ! {
     };
 
     // Initialize USB (xHCI) keyboard
-    let mut xhci_ctrl = xhci::init(ecam_base).expect("xHCI: no USB controller found");
+    let _xhci_ctrl = xhci::init(ecam_base).expect("xHCI: no USB controller found");
     log::println("USB keyboard enabled");
 
     acpi::init_power(kernel_args.rsdp_addr);
@@ -107,7 +112,6 @@ pub unsafe extern "sysv64" fn _start(kernel_args: KernelArgs) -> ! {
     gdt::init();
     interrupts::init();
     syscall::init();
-    paging::set_all_user_accessible();
     log::println("Ring 3: ready");
 
     // Build VFS with mount points
@@ -129,6 +133,5 @@ pub unsafe extern "sysv64" fn _start(kernel_args: KernelArgs) -> ! {
         elf::run(&data);
     }
 
-    // Enter interactive shell
-    shell::run(&mut vfs, &mut xhci_ctrl);
+    acpi::shutdown();
 }
