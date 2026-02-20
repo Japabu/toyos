@@ -2,7 +2,7 @@ use alloc::alloc::{alloc_zeroed, Layout};
 use core::arch::asm;
 
 use alloc::format;
-use crate::{log, serial, syscall};
+use crate::{gdt, log, serial, syscall};
 
 // ELF constants
 const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
@@ -224,45 +224,54 @@ pub fn run(data: &[u8]) {
 fn execute(entry: u64, stack_top: u64) -> i32 {
     let code: u64;
     unsafe {
-        let ctx_ptr = &raw const syscall::KERNEL_CTX as u64;
         let krsp_ptr = &raw mut syscall::SYSCALL_KERNEL_RSP as *mut u64;
+        let tss_rsp0_ptr = gdt::tss_rsp0_ptr();
+        (&raw mut syscall::PROCESS_ACTIVE).write(true);
 
-        // Save kernel context, then enter ring 3 via sysretq.
-        // sys_exit restores the saved context and `ret`s back to label 2:.
+        // Save callee-saved registers on the kernel stack, then enter ring 3
+        // via iretq. sys_exit restores the kernel RSP and `ret`s to label 2:.
         asm!(
-            // Push return label onto kernel stack
+            // Save callee-saved registers on kernel stack
+            "push rbp",
+            "push rbx",
+            "push r12",
+            "push r13",
+            "push r14",
+            "push r15",
+
+            // Push return address (sys_exit will `ret` here)
             "lea rax, [rip + 2f]",
             "push rax",
 
-            // Save callee-saved registers and RSP (with return addr on top)
-            "mov [{ctx} + 0], rsp",
-            "mov [{ctx} + 8], rbp",
-            "mov [{ctx} + 16], rbx",
-            "mov [{ctx} + 24], r12",
-            "mov [{ctx} + 32], r13",
-            "mov [{ctx} + 40], r14",
-            "mov [{ctx} + 48], r15",
-            "mov byte ptr [{ctx} + 56], 1",  // valid = true
-
-            // Set kernel RSP for syscall entry to switch to
+            // Save kernel RSP for syscall entry, sys_exit, and ring-3 interrupts
             "mov [{krsp}], rsp",
+            "mov [{tss_rsp0}], rsp",
 
-            // Enter ring 3 via sysretq
-            "mov rcx, {entry}",     // RIP for sysret
-            "mov r11, 0x202",       // RFLAGS: IF=1
-            "mov rsp, {stack}",     // user stack
-            "sysretq",
+            // Enter ring 3 via iretq
+            "push 0x1B",        // SS:  user_data | RPL=3
+            "push {stack}",     // RSP: user stack
+            "push 0x202",       // RFLAGS: IF=1
+            "push 0x23",        // CS:  user_code | RPL=3
+            "push {entry}",     // RIP: entry point
+            "iretq",
 
-            // sys_exit restores kernel RSP and does `ret`, landing here
+            // sys_exit restores kernel RSP and `ret`s here
             "2:",
-            "sti",                  // re-enable interrupts (FMASK cleared IF)
+            "sti",              // re-enable interrupts (FMASK cleared IF on last syscall)
 
-            ctx = in(reg) ctx_ptr,
+            // Restore callee-saved registers
+            "pop r15",
+            "pop r14",
+            "pop r13",
+            "pop r12",
+            "pop rbx",
+            "pop rbp",
+
             krsp = in(reg) krsp_ptr,
+            tss_rsp0 = in(reg) tss_rsp0_ptr,
             entry = in(reg) entry,
             stack = in(reg) stack_top,
             out("rax") code,
-            // These are clobbered by the user program
             clobber_abi("sysv64"),
         );
     }

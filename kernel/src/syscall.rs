@@ -79,23 +79,8 @@ extern "C" fn syscall_entry() {
     );
 }
 
-// Context saved before executing a userland program, restored by SYS_EXIT
-#[repr(C)]
-pub struct KernelContext {
-    pub rsp: u64,
-    pub rbp: u64,
-    pub rbx: u64,
-    pub r12: u64,
-    pub r13: u64,
-    pub r14: u64,
-    pub r15: u64,
-    pub valid: bool,
-}
-
-pub static mut KERNEL_CTX: KernelContext = KernelContext {
-    rsp: 0, rbp: 0, rbx: 0, r12: 0, r13: 0, r14: 0, r15: 0,
-    valid: false,
-};
+// Whether a userspace process is active (checked by sys_exit)
+pub static mut PROCESS_ACTIVE: bool = false;
 
 extern "C" fn syscall_handler(num: u64, a1: u64, a2: u64, _: u64, a3: u64, a4: u64) -> u64 {
     match num {
@@ -175,24 +160,20 @@ fn sys_realloc(ptr: *mut u8, size: usize, align: usize, new_size: usize) -> u64 
 
 fn sys_exit(code: i32) -> u64 {
     unsafe {
-        if !KERNEL_CTX.valid {
-            // No context to return to — just halt
+        let active = (&raw const PROCESS_ACTIVE).read();
+        if !active {
             loop { asm!("hlt"); }
         }
-        KERNEL_CTX.valid = false;
+        (&raw mut PROCESS_ACTIVE).write(false);
 
-        // Restore kernel context and return from execute_program
+        // Restore kernel RSP and `ret` to execute()'s landing label.
+        // Callee-saved registers are restored there via stack pops.
+        let krsp = (&raw const SYSCALL_KERNEL_RSP).read();
         asm!(
-            "mov rsp, [{ctx} + 0]",
-            "mov rbp, [{ctx} + 8]",
-            "mov rbx, [{ctx} + 16]",
-            "mov r12, [{ctx} + 24]",
-            "mov r13, [{ctx} + 32]",
-            "mov r14, [{ctx} + 40]",
-            "mov r15, [{ctx} + 48]",
+            "mov rsp, {krsp}",
             "mov rax, {code}",
             "ret",
-            ctx = in(reg) &raw const KERNEL_CTX as *const KernelContext,
+            krsp = in(reg) krsp,
             code = in(reg) code as u64,
             options(noreturn),
         );

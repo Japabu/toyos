@@ -114,3 +114,8 @@ pub fn init() {
         asm!("ltr {0:x}", in(reg) TSS_SEL as u64);
     }
 }
+
+/// Returns a pointer to TSS.RSP0 so execute() can update it before entering ring 3.
+pub fn tss_rsp0_ptr() -> *mut u64 {
+    unsafe { &raw mut TSS.rsp0 as *mut u64 }
+}
