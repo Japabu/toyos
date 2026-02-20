@@ -69,39 +69,28 @@ fn clone_rust(rust_dir: &Path, commit: &str) {
 // Patches
 // ---------------------------------------------------------------------------
 
-/// Walk the patches/ directory. For each file:
-/// - `.rs` files are copied to the same relative path in the rust tree
-/// - `.patch` files are applied with `git apply`
+/// Walk the patches/ directory and copy each file to the same relative path
+/// in the rust tree, replacing the original.
 fn apply_patches(patches_dir: &Path, rust_dir: &Path) {
     // Reset tracked files so patches are idempotent (preserves build/)
     git(rust_dir, &["checkout", "--", "."]);
-    walk_patches(patches_dir, patches_dir, rust_dir);
+    copy_patches(patches_dir, patches_dir, rust_dir);
 }
 
-fn walk_patches(base: &Path, dir: &Path, rust_dir: &Path) {
+fn copy_patches(base: &Path, dir: &Path, rust_dir: &Path) {
     let mut entries: Vec<_> = fs::read_dir(dir).unwrap().map(|e| e.unwrap()).collect();
     entries.sort_by_key(|e| e.file_name());
 
     for entry in entries {
         let path = entry.path();
         if path.is_dir() {
-            walk_patches(base, &path, rust_dir);
-        } else if let Some(ext) = path.extension() {
+            copy_patches(base, &path, rust_dir);
+        } else {
             let rel = path.strip_prefix(base).unwrap();
-            if ext == "rs" {
-                let dest = rust_dir.join(rel);
-                fs::create_dir_all(dest.parent().unwrap()).unwrap();
-                fs::copy(&path, &dest).unwrap();
-                println!("  Copied: {}", rel.display());
-            } else if ext == "patch" {
-                let status = Command::new("git")
-                    .args(["apply", "--verbose", path.to_str().unwrap()])
-                    .current_dir(rust_dir)
-                    .status()
-                    .unwrap_or_else(|e| panic!("Failed to run git apply: {e}"));
-                assert!(status.success(), "git apply failed for {}", rel.display());
-                println!("  Applied: {}", rel.display());
-            }
+            let dest = rust_dir.join(rel);
+            fs::create_dir_all(dest.parent().unwrap()).unwrap();
+            fs::copy(&path, &dest).unwrap();
+            println!("  Copied: {}", rel.display());
         }
     }
 }

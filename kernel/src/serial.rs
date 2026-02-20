@@ -24,11 +24,34 @@ pub fn init_serial() -> i32 {
     return 0;
 }
 
-pub fn println(s: &str) {
+pub fn print(s: &str) {
     for c in s.chars() {
         write_serial(c);
     }
+}
+
+pub fn println(s: &str) {
+    print(s);
     write_serial('\n');
+}
+
+pub fn print_u64(val: u64) {
+    if val == 0 {
+        write_serial('0');
+        return;
+    }
+    let mut buf = [0u8; 20];
+    let mut i = 0;
+    let mut n = val;
+    while n > 0 {
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        i += 1;
+    }
+    while i > 0 {
+        i -= 1;
+        write_serial(buf[i] as char);
+    }
 }
 
 fn is_transmit_empty() -> bool {
@@ -38,6 +61,15 @@ fn is_transmit_empty() -> bool {
 fn write_serial(a: char) {
     while !is_transmit_empty() {}
     outb(PORT, a as u8);
+}
+
+pub struct SerialWriter;
+
+impl core::fmt::Write for SerialWriter {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        print(s);
+        Ok(())
+    }
 }
 
 /// Print a label followed by a hex u64, no allocations.

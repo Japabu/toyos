@@ -5,10 +5,3 @@ version = 4
 [[package]]
 name = "hello"
 version = "0.1.0"
-dependencies = [
- "toyos-api",
-]
-
-[[package]]
-name = "toyos-api"
-version = "0.1.0"

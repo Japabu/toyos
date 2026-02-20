@@ -49,6 +49,8 @@ pub struct KernelArgs {
     pub framebuffer_height: u32,
     pub framebuffer_stride: u32,
     pub framebuffer_pixel_format: u32,
+    pub init_program_addr: u64,
+    pub init_program_len: u64,
 }
 
 #[repr(C)]
@@ -207,6 +209,8 @@ fn init_gop(system_table: &SystemTable<Boot>) -> FramebufferInfo {
     }
 }
 
+static INIT_PROGRAM: &[u8] = b"/initrd/hello";
+
 fn start_kernel(kernel: LoadedKernel, initrd: vec::Vec<u8>, rsdp_addr: u64, fb: FramebufferInfo, system_table: SystemTable<Boot>) -> ! {
     // Estimate memory map size
     let mms = system_table.boot_services().memory_map_size();
@@ -240,6 +244,8 @@ fn start_kernel(kernel: LoadedKernel, initrd: vec::Vec<u8>, rsdp_addr: u64, fb: 
         framebuffer_height: fb.height,
         framebuffer_stride: fb.stride,
         framebuffer_pixel_format: fb.pixel_format,
+        init_program_addr: INIT_PROGRAM.as_ptr() as u64,
+        init_program_len: INIT_PROGRAM.len() as u64,
     };
     let entry_addr = kernel.memory.as_ptr() as usize + kernel.entry_offset;
 
@@ -270,7 +276,7 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
     println!("Kernel: {} bytes", kernel_bytes.len());
 
     println!("Loading initrd...");
-    let initrd = load_file_bytes(handle, &system_table, cstr16!("\\toyos\\rootfs.img"));
+    let initrd = load_file_bytes(handle, &system_table, cstr16!("\\toyos\\initrd.img"));
     println!("Initrd: {} bytes", initrd.len());
 
     println!("Loading kernel elf...");

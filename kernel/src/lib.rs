@@ -39,6 +39,7 @@ pub mod elf;
 pub mod paging;
 
 #[repr(C)]
+#[derive(Debug)]
 pub struct KernelArgs {
     pub memory_map_addr: u64,
     pub memory_map_size: u64,
@@ -55,6 +56,8 @@ pub struct KernelArgs {
     pub framebuffer_height: u32,
     pub framebuffer_stride: u32,
     pub framebuffer_pixel_format: u32,
+    pub init_program_addr: u64,
+    pub init_program_len: u64,
 }
 
 #[repr(C)]

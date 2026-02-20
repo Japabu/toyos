@@ -10,7 +10,7 @@ const FONT_WIDTH: usize = 8;
 const FONT_HEIGHT: usize = 16;
 const FONT_GLYPHS: usize = 256;
 
-fn generate_font_bitmap(rootfs_dir: &str) {
+fn generate_font_bitmap(initrd_dir: &str) {
     let font_bytes = include_bytes!("assets/JetBrainsMono-Regular.ttf");
     let font = Font::from_bytes(font_bytes as &[u8], FontSettings::default())
         .expect("Failed to parse font");
@@ -76,10 +76,10 @@ fn generate_font_bitmap(rootfs_dir: &str) {
         }
     }
 
-    let font_path = Path::new(rootfs_dir).join("font.bin");
+    let font_path = Path::new(initrd_dir).join("font.bin");
     fs::write(&font_path, &output).expect("Failed to write font bitmap");
     eprintln!(
-        "rootfs: generated font.bin ({} bytes, grayscale) from JetBrains Mono",
+        "initrd: generated font.bin ({} bytes, grayscale) from JetBrains Mono",
         output.len()
     );
 }
@@ -106,19 +106,19 @@ impl tyfs::Disk for VecDisk {
     fn flush(&mut self) {}
 }
 
-fn create_rootfs_image(rootfs_dir: &str) -> Vec<u8> {
-    let rootfs = Path::new(rootfs_dir);
-    assert!(rootfs.is_dir(), "rootfs directory not found: {}", rootfs_dir);
+fn create_initrd_image(initrd_dir: &str) -> Vec<u8> {
+    let initrd = Path::new(initrd_dir);
+    assert!(initrd.is_dir(), "initrd directory not found: {}", initrd_dir);
 
     // Collect files and calculate needed size
     let mut files: Vec<(String, Vec<u8>)> = Vec::new();
-    for entry in fs::read_dir(rootfs).expect("Failed to read rootfs") {
+    for entry in fs::read_dir(initrd).expect("Failed to read initrd") {
         let entry = entry.expect("Failed to read dir entry");
         let path = entry.path();
         if path.is_file() {
             let name = path.file_name().unwrap().to_str().unwrap().to_string();
             let data = fs::read(&path).expect("Failed to read file");
-            eprintln!("rootfs: adding '{}' ({} bytes)", name, data.len());
+            eprintln!("initrd: adding '{}' ({} bytes)", name, data.len());
             files.push((name, data));
         }
     }
@@ -141,14 +141,14 @@ fn create_rootfs_image(rootfs_dir: &str) -> Vec<u8> {
     tyfs.into_disk().data
 }
 
-fn create_fat_fs_with_bl_and_kernel(rootfs_bytes: &[u8]) -> Vec<u8> {
+fn create_fat_fs_with_bl_and_kernel(initrd_bytes: &[u8]) -> Vec<u8> {
     let kernel_path = "../kernel/target/x86_64-unknown-none/debug/kernel";
     let bl_path = "../bootloader/target/x86_64-unknown-uefi/debug/bootloader.efi";
 
     let kernel_bytes = fs::read(kernel_path).expect("Failed to read kernel");
     let bl_bytes = fs::read(bl_path).expect("Failed to read bootloader");
 
-    let content_size = kernel_bytes.len() + bl_bytes.len() + rootfs_bytes.len();
+    let content_size = kernel_bytes.len() + bl_bytes.len() + initrd_bytes.len();
     // FAT32 requires at least 65525 clusters; ensure volume is large enough
     let total_size = (content_size + 1024 * 1024).max(34 * 1024 * 1024);
 
@@ -186,10 +186,10 @@ fn create_fat_fs_with_bl_and_kernel(rootfs_bytes: &[u8]) -> Vec<u8> {
             .write_all(&kernel_bytes)
             .expect("Failed to write kernel");
         toyos_dir
-            .create_file("rootfs.img")
-            .expect("Failed to create rootfs.img")
-            .write_all(rootfs_bytes)
-            .expect("Failed to write rootfs");
+            .create_file("initrd.img")
+            .expect("Failed to create initrd.img")
+            .write_all(initrd_bytes)
+            .expect("Failed to write initrd");
     }
 
     volume_bytes
@@ -272,7 +272,8 @@ fn main() -> std::io::Result<()> {
     println!("cargo:rerun-if-changed=./src/");
     println!("cargo:rerun-if-changed=../bootloader/src/");
     println!("cargo:rerun-if-changed=../kernel/src/");
-    println!("cargo:rerun-if-changed=../rootfs/");
+    println!("cargo:rerun-if-changed=../initrd/");
+    println!("cargo:rerun-if-changed=../userland/");
     println!("cargo:rerun-if-changed=./assets/");
     if !Command::new("cargo")
         .args(&["build"])
@@ -292,9 +293,25 @@ fn main() -> std::io::Result<()> {
         panic!("Failed to build bootloader");
     }
 
-    generate_font_bitmap("../rootfs");
-    let rootfs_bytes = create_rootfs_image("../rootfs");
-    let volume_bytes = create_fat_fs_with_bl_and_kernel(&rootfs_bytes);
+    if !Command::new("cargo")
+        .args(&["build", "--target", "x86_64-unknown-toyos"])
+        .env("RUSTUP_TOOLCHAIN", "toyos")
+        .env_remove("RUSTC")
+        .current_dir("../userland/hello")
+        .status()?
+        .success()
+    {
+        panic!("Failed to build userland/hello");
+    }
+    fs::create_dir_all("../initrd").ok();
+    fs::copy(
+        "../userland/hello/target/x86_64-unknown-toyos/debug/hello",
+        "../initrd/hello",
+    )?;
+
+    generate_font_bitmap("../initrd");
+    let initrd_bytes = create_initrd_image("../initrd");
+    let volume_bytes = create_fat_fs_with_bl_and_kernel(&initrd_bytes);
     let disk_bytes = create_gpt_disk_with_esp_partition(volume_bytes);
 
     fs::write("target/bootable.img", disk_bytes).expect("Failed to write image");

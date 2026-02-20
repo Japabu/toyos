@@ -7,17 +7,18 @@ use alloc::boxed::Box;
 use alloc::format;
 use kernel::*;
 use tyfs::Disk;
+use core::fmt::Write;
 
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
-    serial::println("PANIC!");
-    serial::println(&format!("{}", info));
+    let _ = write!(serial::SerialWriter, "PANIC: {}\n", info);
     loop {}
 }
 
 #[no_mangle]
 pub unsafe extern "sysv64" fn _start(kernel_args: KernelArgs) -> ! {
     serial::init_serial();
+    let _ = write!(serial::SerialWriter, "{:?}\n", kernel_args);
 
     // Initialize allocator first — no allocations before this point
     let entry_count = kernel_args.memory_map_size as usize / core::mem::size_of::<MemoryMapEntry>();
@@ -114,6 +115,19 @@ pub unsafe extern "sysv64" fn _start(kernel_args: KernelArgs) -> ! {
     vfs.mount("initrd", Box::new(initrd_fs));
     vfs.mount("nvme", Box::new(nvme_fs));
     vfs.cd("/nvme");
+
+    // Run init program
+    let init_path = unsafe {
+        let ptr = kernel_args.init_program_addr as *const u8;
+        let len = kernel_args.init_program_len as usize;
+        core::str::from_utf8_unchecked(core::slice::from_raw_parts(ptr, len))
+    };
+    if !init_path.is_empty() {
+        log::println(&format!("init: running {}", init_path));
+        let data = vfs.read_file(init_path)
+            .unwrap_or_else(|| panic!("init: {} not found", init_path));
+        elf::run(&data);
+    }
 
     // Enter interactive shell
     shell::run(&mut vfs, &mut xhci_ctrl);

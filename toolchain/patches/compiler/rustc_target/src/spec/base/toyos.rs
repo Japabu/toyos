@@ -10,6 +10,7 @@ pub(crate) fn opts() -> TargetOptions {
         position_independent_executables: true,
         dynamic_linking: false,
         has_thread_local: false,
+        main_needs_argc_argv: false,
         ..Default::default()
     }
 }

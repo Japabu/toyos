@@ -1,7 +1,16 @@
-unsafe extern "C" {
-    fn toyos_random(buf: *mut u8, len: usize);
-}
+use core::arch::asm;
+
+const SYS_RANDOM: u64 = 6;
 
 pub fn fill_bytes(buf: &mut [u8]) {
-    unsafe { toyos_random(buf.as_mut_ptr(), buf.len()) }
+    unsafe {
+        asm!(
+            "syscall",
+            inlateout("rax") SYS_RANDOM => _,
+            in("rdi") buf.as_mut_ptr(),
+            in("rsi") buf.len(),
+            out("rcx") _,
+            out("r11") _,
+        );
+    }
 }
