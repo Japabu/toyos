@@ -296,50 +296,28 @@ fn main() -> std::io::Result<()> {
 
     fs::create_dir_all("../initrd").ok();
 
-    if !Command::new("cargo")
-        .args(&["build", "--target", "x86_64-unknown-toyos"])
-        .env("RUSTUP_TOOLCHAIN", "toyos")
-        .env_remove("RUSTC")
-        .current_dir("../userland/hello")
-        .status()?
-        .success()
-    {
-        panic!("Failed to build userland/hello");
+    // Build all userland apps (any directory under ../userland with a Cargo.toml)
+    for entry in fs::read_dir("../userland")? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_dir() || !path.join("Cargo.toml").exists() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_str().unwrap();
+        if !Command::new("cargo")
+            .args(&["build", "--target", "x86_64-unknown-toyos"])
+            .env("RUSTUP_TOOLCHAIN", "toyos")
+            .env_remove("RUSTC")
+            .current_dir(&path)
+            .status()?
+            .success()
+        {
+            panic!("Failed to build userland/{name}");
+        }
+        let binary = path.join(format!("target/x86_64-unknown-toyos/debug/{name}"));
+        fs::copy(&binary, format!("../initrd/{name}"))?;
     }
-    fs::copy(
-        "../userland/hello/target/x86_64-unknown-toyos/debug/hello",
-        "../initrd/hello",
-    )?;
-
-    if !Command::new("cargo")
-        .args(&["build", "--target", "x86_64-unknown-toyos"])
-        .env("RUSTUP_TOOLCHAIN", "toyos")
-        .env_remove("RUSTC")
-        .current_dir("../userland/edit")
-        .status()?
-        .success()
-    {
-        panic!("Failed to build userland/edit");
-    }
-    fs::copy(
-        "../userland/edit/target/x86_64-unknown-toyos/debug/edit",
-        "../initrd/edit",
-    )?;
-
-    if !Command::new("cargo")
-        .args(&["build", "--target", "x86_64-unknown-toyos"])
-        .env("RUSTUP_TOOLCHAIN", "toyos")
-        .env_remove("RUSTC")
-        .current_dir("../userland/input-test")
-        .status()?
-        .success()
-    {
-        panic!("Failed to build userland/input-test");
-    }
-    fs::copy(
-        "../userland/input-test/target/x86_64-unknown-toyos/debug/input-test",
-        "../initrd/input-test",
-    )?;
 
     generate_font_bitmap("../initrd");
     let initrd_bytes = create_initrd_image("../initrd");

@@ -22,6 +22,7 @@ fn main() {
     let x = if rust_dir.join("x").exists() { "./x" } else { "./x.py" };
     let status = Command::new(x)
         .args(["build", "--stage", "2"])
+        .env("BOOTSTRAP_SKIP_TARGET_SANITY", "1")
         .current_dir(&rust_dir)
         .status()
         .expect("Failed to run x build");
@@ -49,7 +50,8 @@ fn main() {
 
 fn write_config(rust_dir: &Path, host: &str) {
     let config = format!(
-        r#"profile = "compiler"
+        r#"change-id = "ignore"
+profile = "compiler"
 
 [build]
 host = ["{host}"]
@@ -60,8 +62,8 @@ incremental = true
 lld = true
 "#
     );
-    fs::write(rust_dir.join("config.toml"), config).unwrap();
-    println!("  Wrote: config.toml");
+    fs::write(rust_dir.join("bootstrap.toml"), config).unwrap();
+    println!("  Wrote: bootstrap.toml");
 }
 
 // ---------------------------------------------------------------------------
