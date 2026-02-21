@@ -431,8 +431,61 @@ impl XhciController {
             if keycode < 4 { continue; } // 0=none, 1=rollover, 2=POST fail, 3=undef
             // Only process newly pressed keys
             if !self.prev_report[2..8].contains(&keycode) {
-                if let Some(ascii) = hid_usage_to_ascii(keycode, shift) {
-                    keyboard::handle_key(ascii);
+                // Arrow keys and special keys emit ANSI escape sequences
+                match keycode {
+                    0x4F => { // Right arrow → ESC [ C
+                        keyboard::handle_key(0x1B);
+                        keyboard::handle_key(b'[');
+                        keyboard::handle_key(b'C');
+                    }
+                    0x50 => { // Left arrow → ESC [ D
+                        keyboard::handle_key(0x1B);
+                        keyboard::handle_key(b'[');
+                        keyboard::handle_key(b'D');
+                    }
+                    0x51 => { // Down arrow → ESC [ B
+                        keyboard::handle_key(0x1B);
+                        keyboard::handle_key(b'[');
+                        keyboard::handle_key(b'B');
+                    }
+                    0x52 => { // Up arrow → ESC [ A
+                        keyboard::handle_key(0x1B);
+                        keyboard::handle_key(b'[');
+                        keyboard::handle_key(b'A');
+                    }
+                    0x4A => { // Home → ESC [ H
+                        keyboard::handle_key(0x1B);
+                        keyboard::handle_key(b'[');
+                        keyboard::handle_key(b'H');
+                    }
+                    0x4D => { // End → ESC [ F
+                        keyboard::handle_key(0x1B);
+                        keyboard::handle_key(b'[');
+                        keyboard::handle_key(b'F');
+                    }
+                    0x4C => { // Delete → ESC [ 3 ~
+                        keyboard::handle_key(0x1B);
+                        keyboard::handle_key(b'[');
+                        keyboard::handle_key(b'3');
+                        keyboard::handle_key(b'~');
+                    }
+                    0x4B => { // Page Up → ESC [ 5 ~
+                        keyboard::handle_key(0x1B);
+                        keyboard::handle_key(b'[');
+                        keyboard::handle_key(b'5');
+                        keyboard::handle_key(b'~');
+                    }
+                    0x4E => { // Page Down → ESC [ 6 ~
+                        keyboard::handle_key(0x1B);
+                        keyboard::handle_key(b'[');
+                        keyboard::handle_key(b'6');
+                        keyboard::handle_key(b'~');
+                    }
+                    _ => {
+                        if let Some(ascii) = hid_usage_to_ascii(keycode, shift) {
+                            keyboard::handle_key(ascii);
+                        }
+                    }
                 }
             }
         }
@@ -475,6 +528,24 @@ impl XhciController {
         unsafe { write_volatile((ctx_base + offset as u64) as *mut u32, val); }
     }
 
+}
+
+// ---------------------------------------------------------------------------
+// Global singleton (for sys_read polling)
+// ---------------------------------------------------------------------------
+
+static mut XHCI: Option<XhciController> = None;
+
+pub fn set_global(ctrl: XhciController) {
+    unsafe { (&raw mut XHCI).write(Some(ctrl)); }
+}
+
+pub fn poll_global() {
+    unsafe {
+        if let Some(ref mut ctrl) = *(&raw mut XHCI) {
+            ctrl.poll();
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -310,6 +310,21 @@ fn main() -> std::io::Result<()> {
         "../initrd/hello",
     )?;
 
+    if !Command::new("cargo")
+        .args(&["build", "--target", "x86_64-unknown-toyos"])
+        .env("RUSTUP_TOOLCHAIN", "toyos")
+        .env_remove("RUSTC")
+        .current_dir("../userland/edit")
+        .status()?
+        .success()
+    {
+        panic!("Failed to build userland/edit");
+    }
+    fs::copy(
+        "../userland/edit/target/x86_64-unknown-toyos/debug/edit",
+        "../initrd/edit",
+    )?;
+
     generate_font_bitmap("../initrd");
     let initrd_bytes = create_initrd_image("../initrd");
     let volume_bytes = create_fat_fs_with_bl_and_kernel(&initrd_bytes);

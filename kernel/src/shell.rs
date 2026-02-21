@@ -5,7 +5,7 @@ use alloc::vec::Vec;
 use crate::vfs::Vfs;
 use crate::{acpi, console, elf, keyboard, log, serial, xhci};
 
-pub fn run(vfs: &mut Vfs, xhci_ctrl: &mut xhci::XhciController) -> ! {
+pub fn run(vfs: &mut Vfs) -> ! {
     console::write_str(&format!("{}> ", vfs.cwd()));
 
     let mut line_buf = [0u8; 256];
@@ -16,7 +16,7 @@ pub fn run(vfs: &mut Vfs, xhci_ctrl: &mut xhci::XhciController) -> ! {
     let mut text_buf: Vec<u8> = Vec::new();
 
     loop {
-        xhci_ctrl.poll();
+        xhci::poll_global();
 
         if let Some(ch) = keyboard::try_read_char() {
             match ch {
@@ -202,7 +202,11 @@ fn exec(
             if arg.is_empty() {
                 log::println("Usage: run <file>");
             } else if let Some(data) = vfs.read_file(arg) {
-                elf::run(&data);
+                let code = elf::run(&data);
+                crate::fd::close_all(vfs);
+                if code != 0 {
+                    log::println(&format!("Process exited with code {}", code));
+                }
             } else {
                 log::println(&format!("{}: file not found", arg));
             }

@@ -102,11 +102,15 @@ pub unsafe extern "sysv64" fn _start(kernel_args: KernelArgs) -> ! {
         tyfs::SimpleFs::format(disk, total_bytes)
     };
 
-    // Initialize USB (xHCI) keyboard
-    let _xhci_ctrl = xhci::init(ecam_base).expect("xHCI: no USB controller found");
+    // Initialize USB (xHCI) keyboard (global singleton for sys_read polling)
+    let xhci_ctrl = xhci::init(ecam_base).expect("xHCI: no USB controller found");
+    xhci::set_global(xhci_ctrl);
     log::println("USB keyboard enabled");
 
     acpi::init_power(kernel_args.rsdp_addr);
+
+    // Calibrate TSC clock (needs PIT, do before entering userland)
+    clock::init();
 
     // Set up GDT (UEFI's may be in reclaimable memory) and interrupts
     gdt::init();
@@ -120,7 +124,10 @@ pub unsafe extern "sysv64" fn _start(kernel_args: KernelArgs) -> ! {
     vfs.mount("nvme", Box::new(nvme_fs));
     vfs.cd("/nvme");
 
-    // Run init program
+    // Make VFS accessible from syscall handlers
+    syscall::set_vfs(&mut vfs);
+
+    // Run init program (if specified)
     let init_path = unsafe {
         let ptr = kernel_args.init_program_addr as *const u8;
         let len = kernel_args.init_program_len as usize;
@@ -133,5 +140,6 @@ pub unsafe extern "sysv64" fn _start(kernel_args: KernelArgs) -> ! {
         elf::run(&data);
     }
 
-    acpi::shutdown();
+    // Drop into interactive shell
+    shell::run(&mut vfs);
 }

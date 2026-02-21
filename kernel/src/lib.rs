@@ -37,6 +37,10 @@ pub mod syscall;
 pub mod elf;
 #[cfg(not(test))]
 pub mod paging;
+#[cfg(not(test))]
+pub mod clock;
+#[cfg(not(test))]
+pub mod fd;
 
 #[repr(C)]
 #[derive(Debug)]

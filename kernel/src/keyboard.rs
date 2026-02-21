@@ -1,7 +1,7 @@
 use core::cell::UnsafeCell;
 
 // Ring buffer for translated key characters
-const BUF_SIZE: usize = 64;
+const BUF_SIZE: usize = 256;
 
 struct KeyBuffer {
     buf: UnsafeCell<[u8; BUF_SIZE]>,

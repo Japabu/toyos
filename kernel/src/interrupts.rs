@@ -1,7 +1,7 @@
 use core::arch::{asm, naked_asm};
 
 use crate::io::{outb, io_wait};
-use crate::{log, serial, syscall};
+use crate::{elf, log, serial, syscall};
 
 use alloc::format;
 
@@ -63,6 +63,26 @@ struct IdtPointer {
     base: u64,
 }
 
+// Saved general-purpose registers (pushed by exception entry stubs)
+#[repr(C)]
+pub struct SavedRegs {
+    pub rax: u64,
+    pub rbx: u64,
+    pub rcx: u64,
+    pub rdx: u64,
+    pub rsi: u64,
+    pub rdi: u64,
+    pub rbp: u64,
+    pub r8: u64,
+    pub r9: u64,
+    pub r10: u64,
+    pub r11: u64,
+    pub r12: u64,
+    pub r13: u64,
+    pub r14: u64,
+    pub r15: u64,
+}
+
 /// Remap the 8259 PIC: master IRQ 0-7 -> vectors 32-39, slave -> 40-47.
 fn remap_pic() {
     // ICW1: begin init (bit 4=1, bit 0=ICW4 needed)
@@ -113,17 +133,41 @@ pub fn init() {
 }
 
 // --- Exception entry stubs ---
-// For exceptions with error codes, the CPU pushes:
+// For exceptions with error codes, the CPU pushes (on the kernel stack, since
+// IST=0 and TSS.RSP0 is set):
 //   [SS] [RSP] [RFLAGS] [CS] [RIP] [error_code] <- RSP
+//
+// We save all GPRs, then call the handler with:
+//   rdi=vector, rsi=regs_ptr, rdx=error_code, rcx=rip, r8=cs, r9=fault_addr
 
 #[unsafe(naked)]
-extern "C" fn page_fault_entry() {
+extern "C" fn gpf_entry() {
     naked_asm!(
-        "mov rdi, 14",          // vector
-        "mov rsi, [rsp]",      // error_code
-        "mov rdx, [rsp + 8]",  // faulting RIP
-        "mov rcx, [rsp + 16]", // CS
-        "mov r8, cr2",         // fault address
+        // Save all GPRs (reverse order so SavedRegs struct matches)
+        "push r15",
+        "push r14",
+        "push r13",
+        "push r12",
+        "push r11",
+        "push r10",
+        "push r9",
+        "push r8",
+        "push rbp",
+        "push rdi",
+        "push rsi",
+        "push rdx",
+        "push rcx",
+        "push rbx",
+        "push rax",
+
+        // Set up handler args
+        "mov rdi, 13",              // vector
+        "mov rsi, rsp",             // regs ptr (SavedRegs on stack)
+        "mov rdx, [rsp + 15*8]",    // error_code (past 15 saved regs)
+        "mov rcx, [rsp + 16*8]",    // RIP
+        "mov r8,  [rsp + 17*8]",    // CS
+        "xor r9, r9",               // no fault address for #GP
+
         "call {handler}",
         "cli",
         "hlt",
@@ -132,13 +176,31 @@ extern "C" fn page_fault_entry() {
 }
 
 #[unsafe(naked)]
-extern "C" fn gpf_entry() {
+extern "C" fn page_fault_entry() {
     naked_asm!(
-        "mov rdi, 13",          // vector
-        "mov rsi, [rsp]",      // error_code
-        "mov rdx, [rsp + 8]",  // faulting RIP
-        "mov rcx, [rsp + 16]", // CS
-        "xor r8, r8",          // no fault address for #GP
+        "push r15",
+        "push r14",
+        "push r13",
+        "push r12",
+        "push r11",
+        "push r10",
+        "push r9",
+        "push r8",
+        "push rbp",
+        "push rdi",
+        "push rsi",
+        "push rdx",
+        "push rcx",
+        "push rbx",
+        "push rax",
+
+        "mov rdi, 14",              // vector
+        "mov rsi, rsp",             // regs ptr
+        "mov rdx, [rsp + 15*8]",    // error_code
+        "mov rcx, [rsp + 16*8]",    // RIP
+        "mov r8,  [rsp + 17*8]",    // CS
+        "mov r9, cr2",              // fault address
+
         "call {handler}",
         "cli",
         "hlt",
@@ -148,8 +210,24 @@ extern "C" fn gpf_entry() {
 
 // --- Exception handler ---
 
-extern "C" fn exception_handler(vector: u64, error_code: u64, rip: u64, cs: u64, addr: u64) {
+fn format_addr(addr: u64) -> alloc::string::String {
+    if let Some((name, offset)) = elf::resolve_symbol(addr) {
+        format!("{:#x}  {}+{:#x}", addr, name, offset)
+    } else {
+        format!("{:#x}", addr)
+    }
+}
+
+extern "C" fn exception_handler(
+    vector: u64,
+    regs: *const SavedRegs,
+    error_code: u64,
+    rip: u64,
+    cs: u64,
+    fault_addr: u64,
+) {
     let is_user = cs & 3 != 0;
+    let regs = unsafe { &*regs };
 
     let name = match vector {
         13 => "General Protection Fault",
@@ -170,16 +248,59 @@ extern "C" fn exception_handler(vector: u64, error_code: u64, rip: u64, cs: u64,
         } else {
             "page not mapped"
         };
-        format!("{}: {} at {:#x} ({})", name, action, addr, cause)
+        format!("{}: {} at {:#x} ({})", name, action, fault_addr, cause)
     } else {
         format!("{} (error_code={:#x})", name, error_code)
     };
 
+    let print = |s: &str| {
+        log::println(s);
+        serial::println(s);
+    };
+
+    print(&format!("Process crashed: {}", detail));
+    print(&format!("  rip: {}", format_addr(rip)));
+
+    // User RSP is in the CPU's iret frame: 15 saved regs + error_code + RIP + CS + RFLAGS + RSP
+    let user_rsp = unsafe { *((regs as *const SavedRegs as *const u64).add(19)) };
+
+    // Register dump
+    print("  Registers:");
+    print(&format!("    rax={:#018x}  rbx={:#018x}", regs.rax, regs.rbx));
+    print(&format!("    rcx={:#018x}  rdx={:#018x}", regs.rcx, regs.rdx));
+    print(&format!("    rsi={:#018x}  rdi={:#018x}", regs.rsi, regs.rdi));
+    print(&format!("    rbp={:#018x}  rsp={:#018x}", regs.rbp, user_rsp));
+    print(&format!("     r8={:#018x}   r9={:#018x}", regs.r8, regs.r9));
+    print(&format!("    r10={:#018x}  r11={:#018x}", regs.r10, regs.r11));
+    print(&format!("    r12={:#018x}  r13={:#018x}", regs.r12, regs.r13));
+    print(&format!("    r14={:#018x}  r15={:#018x}", regs.r14, regs.r15));
+
+    // Stack backtrace
     if is_user {
-        log::println(&format!("Process crashed: {}, rip={:#x}", detail, rip));
+        print("  Backtrace:");
+        print(&format!("    0: {}", format_addr(rip)));
+        let mut rbp = regs.rbp;
+        for i in 1..20 {
+            if rbp == 0 || rbp % 8 != 0 {
+                break;
+            }
+            // Validate the RBP is in user-accessible memory (basic check)
+            if !elf::is_valid_user_addr(rbp) || !elf::is_valid_user_addr(rbp + 8) {
+                break;
+            }
+            let saved_rbp = unsafe { *(rbp as *const u64) };
+            let return_addr = unsafe { *((rbp + 8) as *const u64) };
+            if return_addr == 0 {
+                break;
+            }
+            print(&format!("    {}: {}", i, format_addr(return_addr)));
+            rbp = saved_rbp;
+        }
+    }
+
+    if is_user {
         syscall::kill_process(-1);
     } else {
-        // Kernel fault — unrecoverable
         serial::println(&format!("KERNEL PANIC: {}, rip={:#x}", detail, rip));
         loop {
             unsafe { asm!("cli; hlt"); }
