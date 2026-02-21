@@ -1,0 +1,4 @@
+[submodule "rust"]
+	path = rust
+	url = https://github.com/Japabu/rust.git
+	branch = toyos

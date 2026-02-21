@@ -4,23 +4,20 @@ use std::process::Command;
 
 fn main() {
     let toolchain_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let rust_dir = toolchain_dir.join("rust");
-    let patches_dir = toolchain_dir.join("patches");
+    let rust_dir = toolchain_dir.parent().unwrap().join("rust");
 
-    let commit = rustc_commit_hash();
+    assert!(
+        rust_dir.join("compiler").exists(),
+        "Rust submodule not found at {}. Run: git submodule update --init",
+        rust_dir.display()
+    );
+
     let host = host_triple();
 
-    // Step 1: Clone Rust source
-    clone_rust(&rust_dir, &commit);
-
-    // Step 2: Apply patches
-    println!("Applying patches...");
-    apply_patches(&patches_dir, &rust_dir);
-
-    // Step 3: Write config.toml
+    // Step 1: Write config.toml
     write_config(&rust_dir, &host);
 
-    // Step 4: Build
+    // Step 2: Build
     println!("Building toolchain (this takes a while on first run)...");
     let x = if rust_dir.join("x").exists() { "./x" } else { "./x.py" };
     let status = Command::new(x)
@@ -30,11 +27,11 @@ fn main() {
         .expect("Failed to run x build");
     assert!(status.success(), "Toolchain build failed");
 
-    // Step 5: Link the toolchain
+    // Step 3: Link the toolchain
     let stage2 = find_stage2(&rust_dir);
     run("rustup", &["toolchain", "link", "toyos", stage2.to_str().unwrap()]);
 
-    // Step 6: Build libtoyos and install to sysroot
+    // Step 4: Build libtoyos and install to sysroot
     println!("Building libtoyos...");
     let libtoyos_dir = toolchain_dir.parent().unwrap().join("libtoyos");
     let status = Command::new("cargo")
@@ -53,7 +50,7 @@ fn main() {
     .expect("Failed to copy libtoyos.so to sysroot");
     println!("  Installed libtoyos.so to sysroot");
 
-    // Step 7: Write stamp so bootable/build.rs knows to rebuild userland
+    // Step 5: Write stamp so bootable/build.rs knows to rebuild userland
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -63,63 +60,6 @@ fn main() {
 
     println!();
     println!("Done! Toolchain 'toyos' is ready.");
-}
-
-// ---------------------------------------------------------------------------
-// Clone
-// ---------------------------------------------------------------------------
-
-fn clone_rust(rust_dir: &Path, commit: &str) {
-    let marker = rust_dir.join(".toyos-commit");
-    if marker.exists() && fs::read_to_string(&marker).unwrap().trim() == commit {
-        println!("Rust source up to date ({commit}).");
-        return;
-    }
-
-    if rust_dir.exists() {
-        println!("Removing old Rust source...");
-        fs::remove_dir_all(rust_dir).unwrap();
-    }
-
-    println!("Cloning Rust at {commit} (shallow)...");
-    fs::create_dir_all(rust_dir).unwrap();
-    git(rust_dir, &["init"]);
-    git(rust_dir, &["remote", "add", "origin", "https://github.com/rust-lang/rust.git"]);
-    git(rust_dir, &["fetch", "--depth", "1", "origin", commit]);
-    git(rust_dir, &["checkout", "FETCH_HEAD"]);
-    fs::write(&marker, commit).unwrap();
-}
-
-// ---------------------------------------------------------------------------
-// Patches
-// ---------------------------------------------------------------------------
-
-/// Walk the patches/ directory and copy each file to the same relative path
-/// in the rust tree, replacing the original.
-fn apply_patches(patches_dir: &Path, rust_dir: &Path) {
-    // Reset tracked files so patches are idempotent (preserves build/)
-    git(rust_dir, &["checkout", "--", "."]);
-    copy_patches(patches_dir, patches_dir, rust_dir);
-}
-
-fn copy_patches(base: &Path, dir: &Path, rust_dir: &Path) {
-    let mut entries: Vec<_> = fs::read_dir(dir).unwrap().map(|e| e.unwrap()).collect();
-    entries.sort_by_key(|e| e.file_name());
-
-    for entry in entries {
-        let path = entry.path();
-        if path.is_dir() {
-            copy_patches(base, &path, rust_dir);
-        } else {
-            let rel = path.strip_prefix(base).unwrap();
-            let dest = rust_dir.join(rel);
-            fs::create_dir_all(dest.parent().unwrap()).unwrap();
-            // Use write (not copy) so mtime is always now — ensures cargo
-            // detects changes and recompiles only affected crates.
-            fs::write(&dest, fs::read(&path).unwrap()).unwrap();
-            println!("  Patched: {}", rel.display());
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -159,33 +99,12 @@ fn find_stage2(rust_dir: &Path) -> PathBuf {
     panic!("stage2 sysroot not found in {}", build_dir.display());
 }
 
-fn git(dir: &Path, args: &[&str]) {
-    let status = Command::new("git")
-        .args(args)
-        .current_dir(dir)
-        .status()
-        .expect("Failed to run git");
-    assert!(status.success(), "git {:?} failed", args);
-}
-
 fn run(cmd: &str, args: &[&str]) {
     let status = Command::new(cmd)
         .args(args)
         .status()
         .unwrap_or_else(|e| panic!("Failed to run {cmd}: {e}"));
     assert!(status.success(), "{cmd} failed");
-}
-
-fn rustc_commit_hash() -> String {
-    let output = Command::new("rustc")
-        .args(["--version", "--verbose"])
-        .output()
-        .expect("Failed to run rustc");
-    let text = String::from_utf8(output.stdout).unwrap();
-    text.lines()
-        .find(|l| l.starts_with("commit-hash:"))
-        .map(|l| l.strip_prefix("commit-hash: ").unwrap().to_string())
-        .expect("Could not determine rustc commit hash")
 }
 
 fn host_triple() -> String {
