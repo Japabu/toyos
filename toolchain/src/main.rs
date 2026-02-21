@@ -31,26 +31,7 @@ fn main() {
     let stage2 = find_stage2(&rust_dir);
     run("rustup", &["toolchain", "link", "toyos", stage2.to_str().unwrap()]);
 
-    // Step 4: Build libtoyos and install to sysroot
-    println!("Building libtoyos...");
-    let libtoyos_dir = toolchain_dir.parent().unwrap().join("libtoyos");
-    let status = Command::new("cargo")
-        .args(["+toyos", "build", "--release", "--target", "x86_64-unknown-toyos"])
-        .current_dir(&libtoyos_dir)
-        .status()
-        .expect("Failed to build libtoyos");
-    assert!(status.success(), "libtoyos build failed");
-
-    let sysroot_lib = stage2.join("lib/rustlib/x86_64-unknown-toyos/lib");
-    fs::create_dir_all(&sysroot_lib).unwrap();
-    fs::copy(
-        libtoyos_dir.join("target/x86_64-unknown-toyos/release/libtoyos.so"),
-        sysroot_lib.join("libtoyos.so"),
-    )
-    .expect("Failed to copy libtoyos.so to sysroot");
-    println!("  Installed libtoyos.so to sysroot");
-
-    // Step 5: Write stamp so bootable/build.rs knows to rebuild userland
+    // Step 4: Write stamp so bootable/build.rs knows to rebuild userland
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
