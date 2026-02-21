@@ -8,7 +8,8 @@ pub(crate) fn opts() -> TargetOptions {
         stack_probes: StackProbeType::Inline,
         relocation_model: RelocModel::Pic,
         position_independent_executables: true,
-        dynamic_linking: false,
+        dynamic_linking: true,
+        only_cdylib: true,
         has_thread_local: false,
         main_needs_argc_argv: false,
         ..Default::default()

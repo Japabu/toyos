@@ -11,7 +11,9 @@
       "WebFetch(domain:raw.githubusercontent.com)",
       "Bash(/Users/jan/.cargo/bin/rust-readelf:*)",
       "Bash(cargo +toyos build:*)",
-      "Bash(/Users/jan/Dev/toyos/toolchain/rust/build/aarch64-apple-darwin/ci-llvm/bin/llvm-objdump:*)"
+      "Bash(/Users/jan/Dev/toyos/toolchain/rust/build/aarch64-apple-darwin/ci-llvm/bin/llvm-objdump:*)",
+      "Bash(readelf:*)",
+      "Bash(echo:*)"
     ]
   }
 }

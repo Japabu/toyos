@@ -13,10 +13,18 @@ const EM_X86_64: u16 = 62;
 const ET_DYN: u16 = 3; // PIE executables are ET_DYN
 const PT_LOAD: u32 = 1;
 const PT_DYNAMIC: u32 = 2;
+const DT_NEEDED: i64 = 1;
+const DT_PLTRELSZ: i64 = 2;
+const DT_STRTAB: i64 = 5;
+const DT_SYMTAB: i64 = 6;
 const DT_RELA: i64 = 7;
 const DT_RELASZ: i64 = 8;
 const DT_RELAENT: i64 = 9;
+const DT_JMPREL: i64 = 23;
+const R_X86_64_GLOB_DAT: u32 = 6;
+const R_X86_64_JUMP_SLOT: u32 = 7;
 const R_X86_64_RELATIVE: u32 = 8;
+const SHT_DYNSYM: u32 = 11;
 
 // Section header types
 const SHT_SYMTAB: u32 = 2;
@@ -109,6 +117,149 @@ impl Elf64Rela {
     fn r_type(&self) -> u32 {
         (self.r_info & 0xFFFF_FFFF) as u32
     }
+    fn r_sym(&self) -> u32 {
+        (self.r_info >> 32) as u32
+    }
+}
+
+// --- Dynamic linking support ---
+
+/// A loaded shared library with its symbol resolution data.
+struct LoadedLib {
+    base: u64,
+    dynsym: u64,  // address of .dynsym in loaded memory
+    dynstr: u64,  // address of .dynstr in loaded memory
+    sym_count: usize,
+}
+
+impl LoadedLib {
+    /// Resolve a symbol name to its runtime address in this library.
+    fn resolve(&self, name: &[u8]) -> Option<u64> {
+        let sym_size = core::mem::size_of::<Elf64Sym>() as u64;
+        for i in 1..self.sym_count { // skip index 0 (STN_UNDEF)
+            let sym = unsafe {
+                &*((self.dynsym + i as u64 * sym_size) as *const Elf64Sym)
+            };
+            if sym.st_value == 0 { continue; }
+            let sym_name = unsafe { c_str_bytes(self.dynstr + sym.st_name as u64) };
+            if sym_name == name {
+                return Some(self.base + sym.st_value);
+            }
+        }
+        None
+    }
+}
+
+/// Read a null-terminated C string from a memory address as a byte slice.
+unsafe fn c_str_bytes(addr: u64) -> &'static [u8] {
+    let ptr = addr as *const u8;
+    let mut len = 0;
+    while *ptr.add(len) != 0 { len += 1; }
+    core::slice::from_raw_parts(ptr, len)
+}
+
+/// Load a shared library ELF into memory and return its symbol resolution data.
+fn load_shared_lib(data: &[u8]) -> Option<LoadedLib> {
+    if data.len() < core::mem::size_of::<Elf64Ehdr>() { return None; }
+    let ehdr = unsafe { read_struct::<Elf64Ehdr>(data, 0) };
+    if ehdr.e_ident[0..4] != ELF_MAGIC { return None; }
+    if ehdr.e_ident[4] != ELFCLASS64 { return None; }
+    if ehdr.e_machine != EM_X86_64 { return None; }
+    if ehdr.e_type != ET_DYN { return None; }
+
+    // Find vaddr range
+    let mut vaddr_min = u64::MAX;
+    let mut vaddr_max = 0u64;
+    for i in 0..ehdr.e_phnum as usize {
+        let off = ehdr.e_phoff as usize + i * ehdr.e_phentsize as usize;
+        let phdr = unsafe { read_struct::<Elf64Phdr>(data, off) };
+        if phdr.p_type == PT_LOAD {
+            vaddr_min = vaddr_min.min(phdr.p_vaddr);
+            vaddr_max = vaddr_max.max(phdr.p_vaddr + phdr.p_memsz);
+        }
+    }
+    if vaddr_min == u64::MAX { return None; }
+
+    let load_size = ((vaddr_max - vaddr_min) as usize + 4095) & !4095;
+    let layout = Layout::from_size_align(load_size, 4096).ok()?;
+    let base_ptr = unsafe { alloc_zeroed(layout) };
+    if base_ptr.is_null() { return None; }
+    let base = base_ptr as u64 - vaddr_min;
+
+    // Load PT_LOAD segments
+    for i in 0..ehdr.e_phnum as usize {
+        let off = ehdr.e_phoff as usize + i * ehdr.e_phentsize as usize;
+        let phdr = unsafe { read_struct::<Elf64Phdr>(data, off) };
+        if phdr.p_type == PT_LOAD {
+            let dst = (base + phdr.p_vaddr) as *mut u8;
+            let src = &data[phdr.p_offset as usize..][..phdr.p_filesz as usize];
+            unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), dst, src.len()); }
+        }
+    }
+
+    // Parse PT_DYNAMIC: apply RELATIVE relocs, extract symtab/strtab
+    let mut rela_addr = 0u64;
+    let mut rela_size = 0u64;
+    let mut rela_ent = 0u64;
+    let mut symtab_addr = 0u64;
+    let mut strtab_addr = 0u64;
+
+    for i in 0..ehdr.e_phnum as usize {
+        let off = ehdr.e_phoff as usize + i * ehdr.e_phentsize as usize;
+        let phdr = unsafe { read_struct::<Elf64Phdr>(data, off) };
+        if phdr.p_type == PT_DYNAMIC {
+            let dyn_start = (base + phdr.p_vaddr) as *const Elf64Dyn;
+            let mut j = 0;
+            loop {
+                let d = unsafe { &*dyn_start.add(j) };
+                match d.d_tag {
+                    0 => break,
+                    DT_RELA => rela_addr = d.d_val,
+                    DT_RELASZ => rela_size = d.d_val,
+                    DT_RELAENT => rela_ent = d.d_val,
+                    DT_SYMTAB => symtab_addr = base + d.d_val,
+                    DT_STRTAB => strtab_addr = base + d.d_val,
+                    _ => {}
+                }
+                j += 1;
+            }
+        }
+    }
+
+    // Apply RELATIVE relocations
+    if rela_addr != 0 && rela_ent != 0 && rela_size != 0 {
+        let count = rela_size / rela_ent;
+        for i in 0..count {
+            let rela = unsafe { &*((base + rela_addr + i * rela_ent) as *const Elf64Rela) };
+            if rela.r_type() == R_X86_64_RELATIVE {
+                let target = (base + rela.r_offset) as *mut u64;
+                unsafe { *target = (base as i64 + rela.r_addend) as u64; }
+            }
+        }
+    }
+
+    // Mark library memory as user-accessible
+    paging::map_user(base_ptr as u64, load_size as u64);
+
+    // Find .dynsym entry count from section headers
+    let mut sym_count = 0usize;
+    if ehdr.e_shoff != 0 {
+        let shent = ehdr.e_shentsize as usize;
+        for i in 0..ehdr.e_shnum as usize {
+            let off = ehdr.e_shoff as usize + i * shent;
+            if off + shent > data.len() { break; }
+            let shdr = unsafe { read_struct::<Elf64Shdr>(data, off) };
+            if shdr.sh_type == SHT_DYNSYM && shdr.sh_entsize > 0 {
+                sym_count = shdr.sh_size as usize / shdr.sh_entsize as usize;
+                break;
+            }
+        }
+    }
+
+    serial::println(&format!("LIB: loaded at base={:#x}, {} bytes, {} dynsym entries",
+        base, load_size, sym_count));
+
+    Some(LoadedLib { base, dynsym: symtab_addr, dynstr: strtab_addr, sym_count })
 }
 
 // --- Symbol table for crash diagnostics ---
@@ -401,10 +552,15 @@ pub fn run(data: &[u8]) -> i32 {
         }
     }
 
-    // Find and process relocations via PT_DYNAMIC
+    // Parse PT_DYNAMIC for relocations, shared libraries, and symbol tables
     let mut rela_addr: u64 = 0;
     let mut rela_size: u64 = 0;
     let mut rela_ent: u64 = 0;
+    let mut jmprel_addr: u64 = 0;
+    let mut jmprel_size: u64 = 0;
+    let mut exe_symtab: u64 = 0;
+    let mut exe_strtab: u64 = 0;
+    let mut needed: Vec<u64> = Vec::new();
 
     for i in 0..ehdr.e_phnum as usize {
         let phdr_off = ehdr.e_phoff as usize + i * ehdr.e_phentsize as usize;
@@ -416,9 +572,14 @@ pub fn run(data: &[u8]) -> i32 {
                 let dyn_entry = unsafe { &*dyn_start.add(j) };
                 match dyn_entry.d_tag {
                     0 => break, // DT_NULL
+                    DT_NEEDED => needed.push(dyn_entry.d_val),
                     DT_RELA => rela_addr = dyn_entry.d_val,
                     DT_RELASZ => rela_size = dyn_entry.d_val,
                     DT_RELAENT => rela_ent = dyn_entry.d_val,
+                    DT_SYMTAB => exe_symtab = base + dyn_entry.d_val,
+                    DT_STRTAB => exe_strtab = base + dyn_entry.d_val,
+                    DT_JMPREL => jmprel_addr = dyn_entry.d_val,
+                    DT_PLTRELSZ => jmprel_size = dyn_entry.d_val,
                     _ => {}
                 }
                 j += 1;
@@ -426,22 +587,71 @@ pub fn run(data: &[u8]) -> i32 {
         }
     }
 
-    // Process R_X86_64_RELATIVE relocations
+    // Load shared libraries (DT_NEEDED)
+    let mut libs: Vec<LoadedLib> = Vec::new();
+    if !needed.is_empty() && exe_strtab != 0 {
+        let vfs_ptr = unsafe { (&raw const syscall::VFS_PTR).read() };
+        if !vfs_ptr.is_null() {
+            let vfs = unsafe { &mut *vfs_ptr };
+            for &name_off in &needed {
+                let name = unsafe { c_str_bytes(exe_strtab + name_off) };
+                let name_str = core::str::from_utf8(name).unwrap_or("?");
+                serial::println(&format!("ELF: DT_NEEDED: {}", name_str));
+                let path = format!("/initrd/{}", name_str);
+                if let Some(lib_data) = vfs.read_file(&path) {
+                    if let Some(lib) = load_shared_lib(&lib_data) {
+                        libs.push(lib);
+                    } else {
+                        log::println(&format!("ELF: failed to load {}", name_str));
+                    }
+                } else {
+                    log::println(&format!("ELF: {} not found", name_str));
+                }
+            }
+        }
+    }
+
+    // Process DT_RELA table (RELATIVE, GLOB_DAT)
+    let mut reloc_count = 0u64;
     if rela_addr != 0 && rela_ent != 0 && rela_size != 0 {
         let count = rela_size / rela_ent;
         for i in 0..count {
             let rela = unsafe {
                 &*((base + rela_addr + i * rela_ent) as *const Elf64Rela)
             };
-            if rela.r_type() == R_X86_64_RELATIVE {
-                let target = (base + rela.r_offset) as *mut u64;
-                let value = (base as i64 + rela.r_addend) as u64;
-                unsafe { *target = value; }
+            match rela.r_type() {
+                R_X86_64_RELATIVE => {
+                    let target = (base + rela.r_offset) as *mut u64;
+                    let value = (base as i64 + rela.r_addend) as u64;
+                    unsafe { *target = value; }
+                    reloc_count += 1;
+                }
+                R_X86_64_GLOB_DAT | R_X86_64_JUMP_SLOT => {
+                    if resolve_dynamic_reloc(rela, base, exe_symtab, exe_strtab, &libs) {
+                        reloc_count += 1;
+                    }
+                }
+                _ => {}
             }
         }
     }
 
-    serial::println(&format!("ELF: {} relocations applied", if rela_ent > 0 { rela_size / rela_ent } else { 0 }));
+    // Process DT_JMPREL table (JUMP_SLOT for PLT)
+    if jmprel_addr != 0 && jmprel_size != 0 && rela_ent != 0 {
+        let count = jmprel_size / rela_ent;
+        for i in 0..count {
+            let rela = unsafe {
+                &*((base + jmprel_addr + i * rela_ent) as *const Elf64Rela)
+            };
+            if rela.r_type() == R_X86_64_JUMP_SLOT {
+                if resolve_dynamic_reloc(rela, base, exe_symtab, exe_strtab, &libs) {
+                    reloc_count += 1;
+                }
+            }
+        }
+    }
+
+    serial::println(&format!("ELF: {} relocations applied", reloc_count));
     let entry = base + ehdr.e_entry;
 
     // Mark ELF memory as user-accessible
@@ -482,6 +692,31 @@ pub fn run(data: &[u8]) -> i32 {
 
     // TODO: free program memory and stack
     exit_code
+}
+
+/// Resolve a GLOB_DAT or JUMP_SLOT relocation using loaded shared libraries.
+fn resolve_dynamic_reloc(
+    rela: &Elf64Rela,
+    base: u64,
+    exe_symtab: u64,
+    exe_strtab: u64,
+    libs: &[LoadedLib],
+) -> bool {
+    let sym_idx = rela.r_sym() as u64;
+    let sym = unsafe {
+        &*((exe_symtab + sym_idx * core::mem::size_of::<Elf64Sym>() as u64) as *const Elf64Sym)
+    };
+    let name = unsafe { c_str_bytes(exe_strtab + sym.st_name as u64) };
+    for lib in libs {
+        if let Some(addr) = lib.resolve(name) {
+            let target = (base + rela.r_offset) as *mut u64;
+            unsafe { *target = addr; }
+            return true;
+        }
+    }
+    let name_str = core::str::from_utf8(name).unwrap_or("?");
+    serial::println(&format!("ELF: unresolved symbol: {}", name_str));
+    false
 }
 
 fn execute(entry: u64, stack_top: u64) -> i32 {

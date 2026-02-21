@@ -8,13 +8,6 @@ use crate::sys::fs::File;
 use crate::sys::pipe::AnonPipe;
 use crate::{fmt, io};
 
-// Syscall numbers (must match kernel)
-const SYS_EXEC: u64 = 16;
-
-fn syscall(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
-    crate::sys::syscall(num, a1, a2, a3, a4)
-}
-
 ////////////////////////////////////////////////////////////////////////////////
 // Command
 ////////////////////////////////////////////////////////////////////////////////
@@ -104,13 +97,9 @@ impl Command {
         // Allocate output buffer (64KB)
         let mut stdout_buf = vec![0u8; 65536];
         let path = self.program.as_encoded_bytes();
-        let result = syscall(
-            SYS_EXEC,
-            path.as_ptr() as u64,
-            path.len() as u64,
-            stdout_buf.as_mut_ptr() as u64,
-            stdout_buf.len() as u64,
-        );
+        let result = unsafe {
+            crate::sys::toyos_exec(path.as_ptr(), path.len(), stdout_buf.as_mut_ptr(), stdout_buf.len())
+        };
 
         if result == u64::MAX {
             return Err(io::Error::new(io::ErrorKind::NotFound, "program not found"));

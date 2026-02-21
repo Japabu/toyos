@@ -35,25 +35,31 @@ pub mod sync;
 pub mod thread;
 pub mod thread_local;
 
-// ToyOS syscall ABI: SysV with RCX skipped (hardware clobbers it).
-//   RDI=num, RSI=a1, RDX=a2, R8=a3, R9=a4, return in RAX.
+// ToyOS syscall wrappers — provided by libtoyos.so at runtime.
 #[cfg(target_os = "toyos")]
-pub(crate) fn syscall(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
-    let ret: u64;
-    unsafe {
-        core::arch::asm!(
-            "syscall",
-            in("rdi") num,
-            in("rsi") a1,
-            in("rdx") a2,
-            in("r8") a3,
-            in("r9") a4,
-            lateout("rax") ret,
-            out("rcx") _,
-            out("r11") _,
-        );
-    }
-    ret
+#[link(name = "toyos")]
+unsafe extern "C" {
+    // stdio
+    pub(crate) fn toyos_write(buf: *const u8, len: usize) -> isize;
+    pub(crate) fn toyos_read(buf: *mut u8, len: usize) -> isize;
+    // alloc
+    pub(crate) fn toyos_alloc(size: usize, align: usize) -> *mut u8;
+    pub(crate) fn toyos_free(ptr: *mut u8, size: usize, align: usize);
+    pub(crate) fn toyos_realloc(ptr: *mut u8, size: usize, align: usize, new_size: usize) -> *mut u8;
+    // process
+    pub(crate) fn toyos_exit(code: i32) -> !;
+    pub(crate) fn toyos_exec(path: *const u8, path_len: usize, out: *mut u8, out_len: usize) -> u64;
+    // misc
+    pub(crate) fn toyos_random(buf: *mut u8, len: usize);
+    pub(crate) fn toyos_clock() -> u64;
+    // fs
+    pub(crate) fn toyos_open(path: *const u8, path_len: usize, flags: u64) -> u64;
+    pub(crate) fn toyos_close(fd: u64);
+    pub(crate) fn toyos_read_file(fd: u64, buf: *mut u8, len: usize) -> u64;
+    pub(crate) fn toyos_write_file(fd: u64, buf: *const u8, len: usize) -> u64;
+    pub(crate) fn toyos_seek(fd: u64, offset: i64, whence: u64) -> u64;
+    pub(crate) fn toyos_fstat(fd: u64) -> u64;
+    pub(crate) fn toyos_fsync(fd: u64);
 }
 
 // FIXME(117276): remove this, move feature implementations into individual

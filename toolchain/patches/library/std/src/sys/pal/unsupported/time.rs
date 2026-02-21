@@ -12,7 +12,7 @@ impl Instant {
     pub fn now() -> Instant {
         #[cfg(target_os = "toyos")]
         {
-            let nanos = crate::sys::syscall(8, 0, 0, 0, 0); // SYS_CLOCK
+            let nanos = unsafe { crate::sys::toyos_clock() };
             Instant(Duration::from_nanos(nanos))
         }
         #[cfg(not(target_os = "toyos"))]

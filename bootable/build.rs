@@ -274,6 +274,7 @@ fn main() -> std::io::Result<()> {
     println!("cargo:rerun-if-changed=../kernel/src/");
     println!("cargo:rerun-if-changed=../initrd/");
     println!("cargo:rerun-if-changed=../userland/");
+    println!("cargo:rerun-if-changed=../libtoyos/");
     println!("cargo:rerun-if-changed=../toolchain/.sysroot-stamp");
     println!("cargo:rerun-if-changed=./assets/");
     if !Command::new("cargo")
@@ -294,6 +295,23 @@ fn main() -> std::io::Result<()> {
         panic!("Failed to build bootloader");
     }
 
+    // Build libtoyos shared library and copy to initrd (must be before userland builds)
+    if !Command::new("cargo")
+        .args(&["build", "--release", "--target", "x86_64-unknown-toyos"])
+        .env("RUSTUP_TOOLCHAIN", "toyos")
+        .env_remove("RUSTC")
+        .current_dir("../libtoyos")
+        .status()?
+        .success()
+    {
+        panic!("Failed to build libtoyos");
+    }
+    fs::create_dir_all("../initrd").ok();
+    fs::copy(
+        "../libtoyos/target/x86_64-unknown-toyos/release/libtoyos.so",
+        "../initrd/libtoyos.so",
+    )?;
+
     if !Command::new("cargo")
         .args(&["build", "--target", "x86_64-unknown-toyos"])
         .env("RUSTUP_TOOLCHAIN", "toyos")
@@ -304,7 +322,6 @@ fn main() -> std::io::Result<()> {
     {
         panic!("Failed to build userland/hello");
     }
-    fs::create_dir_all("../initrd").ok();
     fs::copy(
         "../userland/hello/target/x86_64-unknown-toyos/debug/hello",
         "../initrd/hello",
@@ -323,6 +340,21 @@ fn main() -> std::io::Result<()> {
     fs::copy(
         "../userland/edit/target/x86_64-unknown-toyos/debug/edit",
         "../initrd/edit",
+    )?;
+
+    if !Command::new("cargo")
+        .args(&["build", "--target", "x86_64-unknown-toyos"])
+        .env("RUSTUP_TOOLCHAIN", "toyos")
+        .env_remove("RUSTC")
+        .current_dir("../userland/input-test")
+        .status()?
+        .success()
+    {
+        panic!("Failed to build userland/input-test");
+    }
+    fs::copy(
+        "../userland/input-test/target/x86_64-unknown-toyos/debug/input-test",
+        "../initrd/input-test",
     )?;
 
     generate_font_bitmap("../initrd");

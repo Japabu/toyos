@@ -67,8 +67,7 @@ pub fn home_dir() -> Option<PathBuf> {
 pub fn exit(code: i32) -> ! {
     #[cfg(target_os = "toyos")]
     {
-        crate::sys::syscall(5, code as u64, 0, 0, 0); // SYS_EXIT
-        unreachable!()
+        unsafe { crate::sys::toyos_exit(code) }
     }
     #[cfg(not(target_os = "toyos"))]
     crate::intrinsics::abort()

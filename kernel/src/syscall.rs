@@ -161,21 +161,36 @@ fn sys_write(buf: *const u8, len: usize) -> u64 {
 }
 
 fn sys_read(buf: *mut u8, len: usize) -> u64 {
+    // Line-buffered read with echo and backspace handling.
+    // Blocks until '\n' is received or buffer is full.
     let mut count = 0usize;
-    while count < len {
+    loop {
+        if count >= len { break; }
         crate::xhci::poll_global(); // pump USB keyboard events
         if let Some(ch) = keyboard::try_read_char() {
-            unsafe { *buf.add(count) = ch; }
-            count += 1;
-            // Return after first char (non-blocking-ish) for line-based input
-            if ch == b'\n' {
-                break;
+            match ch {
+                b'\n' => {
+                    console::putchar(b'\n');
+                    unsafe { *buf.add(count) = b'\n'; }
+                    count += 1;
+                    break;
+                }
+                0x08 | 0x7F => {
+                    // Backspace: erase last character from buffer and screen
+                    if count > 0 {
+                        count -= 1;
+                        console::putchar(0x08);
+                        console::putchar(b' ');
+                        console::putchar(0x08);
+                    }
+                }
+                ch => {
+                    console::putchar(ch);
+                    unsafe { *buf.add(count) = ch; }
+                    count += 1;
+                }
             }
         } else {
-            if count > 0 {
-                break; // return what we have
-            }
-            // Spin-wait for at least one character
             core::hint::spin_loop();
         }
     }

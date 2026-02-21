@@ -1,8 +1,4 @@
-use crate::io::{self, BorrowedCursor, IoSlice, IoSliceMut};
-use crate::sys::syscall;
-
-const SYS_WRITE: u64 = 0;
-const SYS_READ: u64 = 1;
+use crate::io::{self, IoSlice, IoSliceMut};
 
 pub struct Stdin;
 pub struct Stdout;
@@ -16,12 +12,8 @@ impl Stdin {
 
 impl io::Read for Stdin {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let n = syscall(SYS_READ, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0) as isize;
+        let n = unsafe { crate::sys::toyos_read(buf.as_mut_ptr(), buf.len()) };
         if n < 0 { Err(io::Error::new(io::ErrorKind::Other, "toyos io error")) } else { Ok(n as usize) }
-    }
-
-    fn read_buf(&mut self, _cursor: BorrowedCursor<'_>) -> io::Result<()> {
-        Ok(())
     }
 
     fn read_vectored(&mut self, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
@@ -45,7 +37,7 @@ impl Stdout {
 
 impl io::Write for Stdout {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let n = syscall(SYS_WRITE, buf.as_ptr() as u64, buf.len() as u64, 0, 0) as isize;
+        let n = unsafe { crate::sys::toyos_write(buf.as_ptr(), buf.len()) };
         if n < 0 { Err(io::Error::new(io::ErrorKind::Other, "toyos io error")) } else { Ok(n as usize) }
     }
 

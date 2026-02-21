@@ -6,24 +6,11 @@ use crate::io::{self, BorrowedCursor, IoSlice, IoSliceMut, SeekFrom};
 use crate::path::{Path, PathBuf};
 use crate::sys::time::SystemTime;
 
-// Syscall numbers (must match kernel)
-const SYS_OPEN: u64 = 9;
-const SYS_CLOSE: u64 = 10;
-const SYS_READ_FILE: u64 = 11;
-const SYS_WRITE_FILE: u64 = 12;
-const SYS_SEEK: u64 = 13;
-const SYS_FSTAT: u64 = 14;
-const SYS_FSYNC: u64 = 15;
-
 // Open flags (must match kernel)
 const O_READ: u64 = 1;
 const O_WRITE: u64 = 2;
 const O_CREATE: u64 = 4;
 const O_TRUNCATE: u64 = 8;
-
-fn syscall(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
-    crate::sys::syscall(num, a1, a2, a3, a4)
-}
 
 fn unsupported<T>() -> io::Result<T> {
     Err(io::Error::new(io::ErrorKind::Unsupported, "not supported on toyos"))
@@ -191,13 +178,7 @@ impl File {
     pub fn open(path: &Path, opts: &OpenOptions) -> io::Result<File> {
         let flags = opts.to_flags();
         let path_bytes = path.as_os_str().as_encoded_bytes();
-        let fd = syscall(
-            SYS_OPEN,
-            path_bytes.as_ptr() as u64,
-            path_bytes.len() as u64,
-            flags,
-            0,
-        );
+        let fd = unsafe { crate::sys::toyos_open(path_bytes.as_ptr(), path_bytes.len(), flags) };
         if fd == u64::MAX {
             Err(io::Error::new(io::ErrorKind::NotFound, "file not found"))
         } else {
@@ -206,7 +187,7 @@ impl File {
     }
 
     pub fn file_attr(&self) -> io::Result<FileAttr> {
-        let result = syscall(SYS_FSTAT, self.0, 0, 0, 0);
+        let result = unsafe { crate::sys::toyos_fstat(self.0) };
         if result == u64::MAX {
             return Err(io::Error::new(io::ErrorKind::Other, "fstat failed"));
         }
@@ -216,7 +197,7 @@ impl File {
     }
 
     pub fn fsync(&self) -> io::Result<()> {
-        syscall(SYS_FSYNC, self.0, 0, 0, 0);
+        unsafe { crate::sys::toyos_fsync(self.0) };
         Ok(())
     }
 
@@ -235,13 +216,7 @@ impl File {
     }
 
     pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
-        let n = syscall(
-            SYS_READ_FILE,
-            self.0,
-            buf.as_mut_ptr() as u64,
-            buf.len() as u64,
-            0,
-        );
+        let n = unsafe { crate::sys::toyos_read_file(self.0, buf.as_mut_ptr(), buf.len()) };
         if n == u64::MAX {
             Err(io::Error::new(io::ErrorKind::Other, "read failed"))
         } else {
@@ -270,13 +245,7 @@ impl File {
     }
 
     pub fn write(&self, buf: &[u8]) -> io::Result<usize> {
-        let n = syscall(
-            SYS_WRITE_FILE,
-            self.0,
-            buf.as_ptr() as u64,
-            buf.len() as u64,
-            0,
-        );
+        let n = unsafe { crate::sys::toyos_write_file(self.0, buf.as_ptr(), buf.len()) };
         if n == u64::MAX {
             Err(io::Error::new(io::ErrorKind::Other, "write failed"))
         } else {
@@ -308,7 +277,7 @@ impl File {
             SeekFrom::Current(n) => (n, 1u64),
             SeekFrom::End(n) => (n, 2u64),
         };
-        let result = syscall(SYS_SEEK, self.0, offset as u64, whence, 0);
+        let result = unsafe { crate::sys::toyos_seek(self.0, offset, whence) };
         if result == u64::MAX {
             Err(io::Error::new(io::ErrorKind::Other, "seek failed"))
         } else {
@@ -339,7 +308,7 @@ impl File {
 
 impl Drop for File {
     fn drop(&mut self) {
-        syscall(SYS_CLOSE, self.0, 0, 0, 0);
+        unsafe { crate::sys::toyos_close(self.0) };
     }
 }
 
@@ -384,19 +353,12 @@ pub fn remove_dir_all(_path: &Path) -> io::Result<()> {
 }
 
 pub fn exists(path: &Path) -> io::Result<bool> {
-    // Try to open the file read-only; if it succeeds, it exists
     let path_bytes = path.as_os_str().as_encoded_bytes();
-    let fd = syscall(
-        SYS_OPEN,
-        path_bytes.as_ptr() as u64,
-        path_bytes.len() as u64,
-        O_READ,
-        0,
-    );
+    let fd = unsafe { crate::sys::toyos_open(path_bytes.as_ptr(), path_bytes.len(), O_READ) };
     if fd == u64::MAX {
         Ok(false)
     } else {
-        syscall(SYS_CLOSE, fd, 0, 0, 0);
+        unsafe { crate::sys::toyos_close(fd) };
         Ok(true)
     }
 }
@@ -415,18 +377,12 @@ pub fn link(_src: &Path, _dst: &Path) -> io::Result<()> {
 
 pub fn stat(path: &Path) -> io::Result<FileAttr> {
     let path_bytes = path.as_os_str().as_encoded_bytes();
-    let fd = syscall(
-        SYS_OPEN,
-        path_bytes.as_ptr() as u64,
-        path_bytes.len() as u64,
-        O_READ,
-        0,
-    );
+    let fd = unsafe { crate::sys::toyos_open(path_bytes.as_ptr(), path_bytes.len(), O_READ) };
     if fd == u64::MAX {
         return Err(io::Error::new(io::ErrorKind::NotFound, "file not found"));
     }
-    let result = syscall(SYS_FSTAT, fd, 0, 0, 0);
-    syscall(SYS_CLOSE, fd, 0, 0, 0);
+    let result = unsafe { crate::sys::toyos_fstat(fd) };
+    unsafe { crate::sys::toyos_close(fd) };
     if result == u64::MAX {
         return Err(io::Error::new(io::ErrorKind::Other, "fstat failed"));
     }
