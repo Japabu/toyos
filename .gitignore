@@ -1,3 +1,4 @@
 target/
 initrd/
 .claude/
+toolchain/.sysroot-stamp
