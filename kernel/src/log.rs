@@ -4,7 +4,6 @@ pub struct LogWriter;
 impl core::fmt::Write for LogWriter {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
         crate::drivers::serial::print(s);
-        crate::console::write_str(s);
         Ok(())
     }
 }
@@ -28,7 +27,6 @@ macro_rules! log {
 #[cfg(not(test))]
 pub fn println(s: &str) {
     crate::drivers::serial::println(s);
-    crate::console::println(s);
 }
 
 #[cfg(test)]

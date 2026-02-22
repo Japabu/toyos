@@ -12,7 +12,10 @@ fn main() {
         print!("{}> ", cwd);
         io::stdout().flush().ok();
 
-        let Some(input) = readline(&mut history) else { break };
+        set_stdin_raw(true);
+        let result = readline(&mut history);
+        set_stdin_raw(false);
+        let Some(input) = result else { break };
         let input = input.trim().to_string();
         if input.is_empty() {
             continue;
@@ -64,13 +67,13 @@ fn syscall(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
     ret
 }
 
-fn read_raw(buf: &mut [u8]) -> usize {
-    syscall(1, buf.as_mut_ptr() as u64, buf.len() as u64, 1, 0) as usize
+fn set_stdin_raw(raw: bool) {
+    syscall(22, raw as u64, 0, 0, 0); // SYS_SET_STDIN_MODE
 }
 
 fn read_byte() -> u8 {
     let mut buf = [0u8; 1];
-    read_raw(&mut buf);
+    syscall(1, buf.as_mut_ptr() as u64, 1, 0, 0); // SYS_READ
     buf[0]
 }
 
@@ -91,7 +94,7 @@ fn readline(history: &mut Vec<String>) -> Option<String> {
     loop {
         let ch = read_byte();
         match ch {
-            b'\n' => {
+            b'\r' => {
                 echo(b"\n");
                 return Some(String::from_utf8_lossy(&line).into_owned());
             }

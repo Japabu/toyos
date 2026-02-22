@@ -177,7 +177,7 @@ fn hid_usage_to_ascii(usage: u8, shift: bool) -> Option<u8> {
             }
         }
         0x27 => Some(if shift { b')' } else { b'0' }),
-        0x28 => Some(b'\n'),     // Enter
+        0x28 => Some(b'\r'),     // Enter
         0x29 => Some(0x1B),      // Escape
         0x2A => Some(0x08),      // Backspace
         0x2B => Some(b'\t'),     // Tab
@@ -376,6 +376,7 @@ impl XhciController {
 
         let modifiers = report[0];
         let shift = (modifiers & 0x22) != 0; // Left Shift | Right Shift
+        let ctrl = (modifiers & 0x11) != 0;  // Left Ctrl | Right Ctrl
 
         for i in 2..8 {
             let keycode = report[i];
@@ -433,7 +434,10 @@ impl XhciController {
                         keyboard::handle_key(b'~');
                     }
                     _ => {
-                        if let Some(ascii) = hid_usage_to_ascii(keycode, shift) {
+                        if ctrl && (0x04..=0x1D).contains(&keycode) {
+                            // Ctrl+letter → control character (0x01-0x1A)
+                            keyboard::handle_key(keycode - 0x04 + 1);
+                        } else if let Some(ascii) = hid_usage_to_ascii(keycode, shift) {
                             keyboard::handle_key(ascii);
                         }
                     }

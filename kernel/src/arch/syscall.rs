@@ -35,6 +35,10 @@ const SYS_DELETE: u64 = 18;
 const SYS_SHUTDOWN: u64 = 19;
 const SYS_CHDIR: u64 = 20;
 const SYS_GETCWD: u64 = 21;
+const SYS_SET_STDIN_MODE: u64 = 22;
+
+// Global stdin mode: false=canonical (line-buffered), true=raw (byte-at-a-time)
+static STDIN_RAW: SyncCell<bool> = SyncCell::new(false);
 
 // Output capture buffer for SYS_EXEC (redirects SYS_WRITE to buffer instead of console)
 static CAPTURE_BUF: SyncCell<Option<Vec<u8>>> = SyncCell::new(None);
@@ -104,9 +108,13 @@ extern "C" fn syscall_entry() {
 pub static PROCESS_ACTIVE: SyncCell<bool> = SyncCell::new(false);
 
 extern "C" fn syscall_handler(num: u64, a1: u64, a2: u64, _: u64, a3: u64, a4: u64) -> u64 {
+    syscall_dispatch(num, a1, a2, a3, a4)
+}
+
+fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
     match num {
         SYS_WRITE => sys_write(a1 as *const u8, a2 as usize),
-        SYS_READ => sys_read(a1 as *mut u8, a2 as usize, a3),
+        SYS_READ => sys_read(a1 as *mut u8, a2 as usize),
         SYS_ALLOC => user_heap::alloc(a1 as usize, a2 as usize),
         SYS_FREE => { user_heap::free(a1 as *mut u8, a2 as usize); 0 }
         SYS_REALLOC => user_heap::realloc(a1 as *mut u8, a2 as usize, a3 as usize, a4 as usize),
@@ -140,13 +148,15 @@ extern "C" fn syscall_handler(num: u64, a1: u64, a2: u64, _: u64, a3: u64, a4: u
         SYS_SHUTDOWN => { acpi::shutdown(); }
         SYS_CHDIR => sys_chdir(a1, a2),
         SYS_GETCWD => sys_getcwd(a1, a2),
+        SYS_SET_STDIN_MODE => { *STDIN_RAW.get_mut() = a1 != 0; 0 }
         _ => u64::MAX, // unknown syscall
     }
 }
 
 fn sys_write(buf: *const u8, len: usize) -> u64 {
     let bytes = unsafe { core::slice::from_raw_parts(buf, len) };
-    serial::write_bytes(bytes);
+    // Send to serial with ANSI escape sequences stripped
+    serial_write_plain(bytes);
     if let Some(ref mut capture) = *CAPTURE_BUF.get_mut() {
         capture.extend_from_slice(bytes);
     } else {
@@ -155,8 +165,30 @@ fn sys_write(buf: *const u8, len: usize) -> u64 {
     len as u64
 }
 
-fn sys_read(buf: *mut u8, len: usize, mode: u64) -> u64 {
-    if mode == 1 {
+/// Write bytes to serial, skipping ANSI escape sequences (ESC [ ... final_byte).
+fn serial_write_plain(bytes: &[u8]) {
+    let mut i = 0;
+    let mut start = 0; // start of current plain-text run
+    while i < bytes.len() {
+        if bytes[i] == 0x1B && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
+            // Flush plain text before the escape
+            if start < i { serial::write_bytes(&bytes[start..i]); }
+            // Skip ESC [ params until final byte (0x40..=0x7E)
+            i += 2;
+            while i < bytes.len() && !(0x40..=0x7E).contains(&bytes[i]) {
+                i += 1;
+            }
+            if i < bytes.len() { i += 1; } // skip final byte
+            start = i;
+        } else {
+            i += 1;
+        }
+    }
+    if start < bytes.len() { serial::write_bytes(&bytes[start..]); }
+}
+
+fn sys_read(buf: *mut u8, len: usize) -> u64 {
+    if *STDIN_RAW.get() {
         return sys_read_raw(buf, len);
     }
     // Line-buffered read with readline editing.
@@ -172,7 +204,7 @@ fn sys_read(buf: *mut u8, len: usize, mode: u64) -> u64 {
         crate::drivers::xhci::poll_global();
         if let Some(ch) = keyboard::try_read_char() {
             match ch {
-                b'\n' => {
+                b'\r' => {
                     console::hide_cursor();
                     // Move visual cursor to end, then newline
                     let mut echo = [0u8; 1025];
@@ -340,6 +372,7 @@ fn sys_exit(code: i32) -> u64 {
 /// Used by sys_exit and exception handlers.
 pub fn kill_process(code: i32) -> ! {
     *PROCESS_ACTIVE.get_mut() = false;
+    *STDIN_RAW.get_mut() = false;
     let krsp = *SYSCALL_KERNEL_RSP.get();
     unsafe {
         asm!(
@@ -379,6 +412,7 @@ fn sys_exec(argv_ptr: u64, argv_len: u64, out_buf_ptr: u64, out_buf_max: u64) ->
     let saved_kernel_rsp = *SYSCALL_KERNEL_RSP.get();
     let saved_active = *PROCESS_ACTIVE.get();
     let saved_tss_rsp0 = unsafe { *gdt::tss_rsp0_ptr() };
+    let saved_stdin_raw = *STDIN_RAW.get();
 
     // Enable output capture only when caller provides a buffer
     let capture = out_buf_max > 0;
@@ -401,6 +435,7 @@ fn sys_exec(argv_ptr: u64, argv_len: u64, out_buf_ptr: u64, out_buf_max: u64) ->
     *SYSCALL_USER_RSP.get_mut() = saved_user_rsp;
     *SYSCALL_KERNEL_RSP.get_mut() = saved_kernel_rsp;
     unsafe { *gdt::tss_rsp0_ptr() = saved_tss_rsp0; }
+    *STDIN_RAW.get_mut() = saved_stdin_raw;
     user_heap::restore(saved_heap);
 
     // Copy captured output to parent's buffer

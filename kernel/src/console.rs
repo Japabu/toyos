@@ -65,6 +65,26 @@ enum AnsiState {
     QuestionMark, // saw \x1b[?
 }
 
+/// Saved main-screen state for alternate screen buffer switching.
+struct SavedScreen {
+    char_buf: Vec<char>,
+    rendered: Vec<u64>,
+    cursor_col: usize,
+    cursor_row: usize,
+}
+
+/// Pack codepoint + fg + bg into a u64 for fast equality checks.
+/// Uses 21 bits for Unicode codepoint + 7 bits per color channel (42 bits) = 63 bits.
+fn cell_key(ch: char, fg: Color, bg: Color) -> u64 {
+    (ch as u64 & 0x1F_FFFF)
+        | ((fg.r as u64 >> 1) << 21)
+        | ((fg.g as u64 >> 1) << 28)
+        | ((fg.b as u64 >> 1) << 35)
+        | ((bg.r as u64 >> 1) << 42)
+        | ((bg.g as u64 >> 1) << 49)
+        | ((bg.b as u64 >> 1) << 56)
+}
+
 struct Console {
     fb: Framebuffer,
     font: Font,
@@ -75,13 +95,20 @@ struct Console {
     fg: Color,
     bg: Color,
     // Character buffer for cursor restore
-    char_buf: Vec<u8>,
+    char_buf: Vec<char>,
+    // Tracks what was last rendered to each cell (codepoint + colors packed into u64)
+    rendered: Vec<u64>,
     // ANSI state machine
     ansi_state: AnsiState,
     ansi_buf: [u8; 16],
     ansi_len: usize,
     reverse_video: bool,
     cursor_visible: bool,
+    saved_screen: Option<SavedScreen>,
+    // UTF-8 decoder state
+    utf8_buf: [u8; 4],
+    utf8_len: usize,
+    utf8_needed: usize, // total bytes expected (0 = not in a sequence)
 }
 
 impl Console {
@@ -98,35 +125,49 @@ impl Console {
             cursor_row: 0,
             fg: DEFAULT_FG,
             bg: DEFAULT_BG,
-            char_buf: vec![b' '; cols * rows],
+            char_buf: vec![' '; cols * rows],
+            rendered: vec![cell_key(' ', DEFAULT_FG, DEFAULT_BG); cols * rows],
             ansi_state: AnsiState::Normal,
             ansi_buf: [0; 16],
             ansi_len: 0,
             reverse_video: false,
             cursor_visible: false,
+            saved_screen: None,
+            utf8_buf: [0; 4],
+            utf8_len: 0,
+            utf8_needed: 0,
         };
 
         console.fb.clear(console.bg);
         console
     }
 
-    fn put_char(&mut self, col: usize, row: usize, ch: u8) {
-        self.char_buf[row * self.cols + col] = ch;
-        let px = col * font::WIDTH;
-        let py = row * font::HEIGHT;
+    fn put_char(&mut self, col: usize, row: usize, ch: char) {
+        let idx = row * self.cols + col;
+        self.char_buf[idx] = ch;
         let (fg, bg) = if self.reverse_video {
             (self.bg, self.fg)
         } else {
             (self.fg, self.bg)
         };
+        let key = cell_key(ch, fg, bg);
+        if self.rendered[idx] == key {
+            return;
+        }
+        self.rendered[idx] = key;
+        let px = col * font::WIDTH;
+        let py = row * font::HEIGHT;
         self.font.draw_char(&self.fb, px, py, ch, fg, bg);
     }
 
     fn draw_cursor(&mut self) {
         if self.cursor_col < self.cols && self.cursor_row < self.rows {
-            let ch = self.char_buf[self.cursor_row * self.cols + self.cursor_col];
+            let idx = self.cursor_row * self.cols + self.cursor_col;
+            let ch = self.char_buf[idx];
             let px = self.cursor_col * font::WIDTH;
             let py = self.cursor_row * font::HEIGHT;
+            // Cursor uses inverted colors — invalidate so next put_char redraws
+            self.rendered[idx] = 0;
             self.font.draw_char(&self.fb, px, py, ch, self.bg, self.fg);
         }
         self.cursor_visible = true;
@@ -134,9 +175,11 @@ impl Console {
 
     fn erase_cursor(&mut self) {
         if self.cursor_col < self.cols && self.cursor_row < self.rows {
-            let ch = self.char_buf[self.cursor_row * self.cols + self.cursor_col];
+            let idx = self.cursor_row * self.cols + self.cursor_col;
+            let ch = self.char_buf[idx];
             let px = self.cursor_col * font::WIDTH;
             let py = self.cursor_row * font::HEIGHT;
+            self.rendered[idx] = 0;
             self.font.draw_char(&self.fb, px, py, ch, self.fg, self.bg);
         }
         self.cursor_visible = false;
@@ -147,9 +190,11 @@ impl Console {
         // Shift character buffer up by one row
         let row_size = self.cols;
         self.char_buf.copy_within(row_size.., 0);
+        self.rendered.copy_within(row_size.., 0);
         let last_row = (self.rows - 1) * row_size;
         for i in last_row..last_row + row_size {
-            self.char_buf[i] = b' ';
+            self.char_buf[i] = ' ';
+            self.rendered[i] = 0; // invalidate — force redraw of last row
         }
         self.cursor_row = self.rows - 1;
         self.cursor_col = 0;
@@ -165,12 +210,64 @@ impl Console {
 
     fn clear_screen(&mut self) {
         self.fb.clear(self.bg);
-        self.char_buf.fill(b' ');
+        self.char_buf.fill(' ');
+        let blank = cell_key(' ', DEFAULT_FG, DEFAULT_BG);
+        self.rendered.fill(blank);
         self.cursor_col = 0;
         self.cursor_row = 0;
     }
 
+    /// Redraw all characters from the char buffer to the framebuffer.
+    fn redraw_all(&mut self) {
+        self.fb.clear(self.bg);
+        // Invalidate all rendered state so subsequent put_char calls will redraw
+        self.rendered.fill(0);
+        for row in 0..self.rows {
+            for col in 0..self.cols {
+                let idx = row * self.cols + col;
+                let ch = self.char_buf[idx];
+                if ch != ' ' {
+                    let px = col * font::WIDTH;
+                    let py = row * font::HEIGHT;
+                    self.rendered[idx] = cell_key(ch, self.fg, self.bg);
+                    self.font.draw_char(&self.fb, px, py, ch, self.fg, self.bg);
+                }
+            }
+        }
+    }
+
+    fn emit_char(&mut self, ch: char) {
+        if self.cursor_col >= self.cols {
+            self.newline();
+        }
+        self.put_char(self.cursor_col, self.cursor_row, ch);
+        self.cursor_col += 1;
+    }
+
+    fn flush_utf8(&mut self) {
+        if let Ok(s) = core::str::from_utf8(&self.utf8_buf[..self.utf8_len]) {
+            if let Some(ch) = s.chars().next() {
+                self.emit_char(ch);
+            }
+        }
+        self.utf8_needed = 0;
+    }
+
     fn write_byte(&mut self, byte: u8) {
+        // Handle UTF-8 continuation bytes before ANSI state machine
+        if self.utf8_needed > 0 {
+            if byte & 0xC0 == 0x80 {
+                self.utf8_buf[self.utf8_len] = byte;
+                self.utf8_len += 1;
+                if self.utf8_len == self.utf8_needed {
+                    self.flush_utf8();
+                }
+                return;
+            }
+            // Invalid continuation — discard partial sequence and fall through
+            self.utf8_needed = 0;
+        }
+
         match self.ansi_state {
             AnsiState::Normal => match byte {
                 0x1B => self.ansi_state = AnsiState::Escape,
@@ -181,13 +278,17 @@ impl Console {
                         self.cursor_col -= 1;
                     }
                 }
-                byte => {
-                    if self.cursor_col >= self.cols {
-                        self.newline();
-                    }
-                    self.put_char(self.cursor_col, self.cursor_row, byte);
-                    self.cursor_col += 1;
+                b if b & 0xE0 == 0xC0 => {
+                    self.utf8_buf[0] = b; self.utf8_len = 1; self.utf8_needed = 2;
                 }
+                b if b & 0xF0 == 0xE0 => {
+                    self.utf8_buf[0] = b; self.utf8_len = 1; self.utf8_needed = 3;
+                }
+                b if b & 0xF8 == 0xF0 => {
+                    self.utf8_buf[0] = b; self.utf8_len = 1; self.utf8_needed = 4;
+                }
+                byte if byte >= 0x20 => self.emit_char(byte as char),
+                _ => {}
             },
             AnsiState::Escape => match byte {
                 b'[' => {
@@ -270,7 +371,7 @@ impl Console {
             b'K' => {
                 if p1 == 0 {
                     for col in self.cursor_col..self.cols {
-                        self.put_char(col, self.cursor_row, b' ');
+                        self.put_char(col, self.cursor_row, ' ');
                     }
                 }
             }
@@ -345,10 +446,33 @@ impl Console {
         match (p1, cmd) {
             (25, b'l') => {} // hide cursor (no-op for now)
             (25, b'h') => {} // show cursor (no-op for now)
-            (1049, b'h') => { // alternate screen buffer: just clear
-                self.clear_screen();
+            (1049, b'h') => { // switch to alternate screen buffer
+                let n = self.cols * self.rows;
+                self.saved_screen = Some(SavedScreen {
+                    char_buf: core::mem::replace(
+                        &mut self.char_buf,
+                        vec![' '; n],
+                    ),
+                    rendered: core::mem::replace(
+                        &mut self.rendered,
+                        vec![0; n],
+                    ),
+                    cursor_col: self.cursor_col,
+                    cursor_row: self.cursor_row,
+                });
+                self.cursor_col = 0;
+                self.cursor_row = 0;
+                self.fb.clear(self.bg);
             }
-            (1049, b'l') => {} // restore main screen (no-op)
+            (1049, b'l') => { // restore main screen buffer
+                if let Some(saved) = self.saved_screen.take() {
+                    self.char_buf = saved.char_buf;
+                    self.rendered = saved.rendered;
+                    self.cursor_col = saved.cursor_col;
+                    self.cursor_row = saved.cursor_row;
+                    self.redraw_all();
+                }
+            }
             _ => {}
         }
     }
@@ -369,29 +493,6 @@ pub fn init(fb: Framebuffer, font_data: Vec<u8>) {
     *CONSOLE.get_mut() = Some(Console::new(fb, font_data));
 }
 
-pub fn println(s: &str) {
-    with((), |c| {
-        let v = c.cursor_visible;
-        if v { c.erase_cursor(); }
-        for byte in s.bytes() {
-            c.write_byte(byte);
-        }
-        c.write_byte(b'\n');
-        if v { c.draw_cursor(); }
-    });
-}
-
-pub fn write_str(s: &str) {
-    with((), |c| {
-        let v = c.cursor_visible;
-        if v { c.erase_cursor(); }
-        for byte in s.bytes() {
-            c.write_byte(byte);
-        }
-        if v { c.draw_cursor(); }
-    });
-}
-
 pub fn write_bytes(bytes: &[u8]) {
     with((), |c| {
         let v = c.cursor_visible;
@@ -400,6 +501,7 @@ pub fn write_bytes(bytes: &[u8]) {
             c.write_byte(byte);
         }
         if v { c.draw_cursor(); }
+
     });
 }
 
@@ -409,6 +511,7 @@ pub fn putchar(b: u8) {
         if v { c.erase_cursor(); }
         c.write_byte(b);
         if v { c.draw_cursor(); }
+
     });
 }
 
@@ -416,6 +519,7 @@ pub fn clear() {
     with((), |c| {
         c.cursor_visible = false;
         c.clear_screen();
+
     });
 }
 
@@ -427,6 +531,7 @@ pub fn show_cursor() {
     with((), |c| {
         if !c.cursor_visible {
             c.draw_cursor();
+    
         }
     });
 }
@@ -435,6 +540,7 @@ pub fn hide_cursor() {
     with((), |c| {
         if c.cursor_visible {
             c.erase_cursor();
+    
         }
     });
 }

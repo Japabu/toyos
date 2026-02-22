@@ -5,21 +5,39 @@ use crate::drivers::framebuffer::{Color, Framebuffer};
 pub const WIDTH: usize = 8;
 pub const HEIGHT: usize = 16;
 
-const GLYPHS: usize = 256;
-const BYTES: usize = GLYPHS * WIDTH * HEIGHT;
-
 pub struct Font {
+    codepoints: Vec<u32>,
     data: Vec<u8>,
 }
 
 impl Font {
-    pub fn new(data: Vec<u8>) -> Self {
-        assert!(data.len() >= BYTES, "Font data too small");
-        Self { data }
+    /// Parse font.bin: [u32 count][u32 codepoints...][glyph data...]
+    pub fn new(raw: Vec<u8>) -> Self {
+        assert!(raw.len() >= 4, "Font data too small");
+        let count = u32::from_le_bytes(raw[0..4].try_into().unwrap()) as usize;
+        let codepoints_end = 4 + count * 4;
+        assert!(raw.len() >= codepoints_end + count * WIDTH * HEIGHT, "Font data too small");
+
+        let mut codepoints = Vec::with_capacity(count);
+        for i in 0..count {
+            let off = 4 + i * 4;
+            let cp = u32::from_le_bytes(raw[off..off + 4].try_into().unwrap());
+            codepoints.push(cp);
+        }
+        let data = raw[codepoints_end..].to_vec();
+
+        Self { codepoints, data }
     }
 
-    pub fn draw_char(&self, fb: &Framebuffer, px: usize, py: usize, ch: u8, fg: Color, bg: Color) {
-        let glyph_offset = (ch as usize) * WIDTH * HEIGHT;
+    fn glyph_index(&self, ch: char) -> usize {
+        self.codepoints
+            .binary_search(&(ch as u32))
+            .unwrap_or(0x3F) // '?' for unknown codepoints
+    }
+
+    pub fn draw_char(&self, fb: &Framebuffer, px: usize, py: usize, ch: char, fg: Color, bg: Color) {
+        let idx = self.glyph_index(ch);
+        let glyph_offset = idx * WIDTH * HEIGHT;
 
         for gy in 0..HEIGHT {
             for gx in 0..WIDTH {
