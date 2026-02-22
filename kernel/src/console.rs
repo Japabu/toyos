@@ -1,3 +1,4 @@
+use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::font::{self, Font};
@@ -73,11 +74,14 @@ struct Console {
     cursor_row: usize,
     fg: Color,
     bg: Color,
+    // Character buffer for cursor restore
+    char_buf: Vec<u8>,
     // ANSI state machine
     ansi_state: AnsiState,
     ansi_buf: [u8; 16],
     ansi_len: usize,
     reverse_video: bool,
+    cursor_visible: bool,
 }
 
 impl Console {
@@ -94,17 +98,20 @@ impl Console {
             cursor_row: 0,
             fg: DEFAULT_FG,
             bg: DEFAULT_BG,
+            char_buf: vec![b' '; cols * rows],
             ansi_state: AnsiState::Normal,
             ansi_buf: [0; 16],
             ansi_len: 0,
             reverse_video: false,
+            cursor_visible: false,
         };
 
         console.fb.clear(console.bg);
         console
     }
 
-    fn draw_char(&self, col: usize, row: usize, ch: u8) {
+    fn put_char(&mut self, col: usize, row: usize, ch: u8) {
+        self.char_buf[row * self.cols + col] = ch;
         let px = col * font::WIDTH;
         let py = row * font::HEIGHT;
         let (fg, bg) = if self.reverse_video {
@@ -115,8 +122,35 @@ impl Console {
         self.font.draw_char(&self.fb, px, py, ch, fg, bg);
     }
 
+    fn draw_cursor(&mut self) {
+        if self.cursor_col < self.cols && self.cursor_row < self.rows {
+            let ch = self.char_buf[self.cursor_row * self.cols + self.cursor_col];
+            let px = self.cursor_col * font::WIDTH;
+            let py = self.cursor_row * font::HEIGHT;
+            self.font.draw_char(&self.fb, px, py, ch, self.bg, self.fg);
+        }
+        self.cursor_visible = true;
+    }
+
+    fn erase_cursor(&mut self) {
+        if self.cursor_col < self.cols && self.cursor_row < self.rows {
+            let ch = self.char_buf[self.cursor_row * self.cols + self.cursor_col];
+            let px = self.cursor_col * font::WIDTH;
+            let py = self.cursor_row * font::HEIGHT;
+            self.font.draw_char(&self.fb, px, py, ch, self.fg, self.bg);
+        }
+        self.cursor_visible = false;
+    }
+
     fn scroll(&mut self) {
         self.fb.scroll_up(font::HEIGHT, self.bg);
+        // Shift character buffer up by one row
+        let row_size = self.cols;
+        self.char_buf.copy_within(row_size.., 0);
+        let last_row = (self.rows - 1) * row_size;
+        for i in last_row..last_row + row_size {
+            self.char_buf[i] = b' ';
+        }
         self.cursor_row = self.rows - 1;
         self.cursor_col = 0;
     }
@@ -129,17 +163,29 @@ impl Console {
         }
     }
 
+    fn clear_screen(&mut self) {
+        self.fb.clear(self.bg);
+        self.char_buf.fill(b' ');
+        self.cursor_col = 0;
+        self.cursor_row = 0;
+    }
+
     fn write_byte(&mut self, byte: u8) {
         match self.ansi_state {
             AnsiState::Normal => match byte {
                 0x1B => self.ansi_state = AnsiState::Escape,
                 b'\n' => self.newline(),
                 b'\r' => self.cursor_col = 0,
+                0x08 | 0x7F => {
+                    if self.cursor_col > 0 {
+                        self.cursor_col -= 1;
+                    }
+                }
                 byte => {
                     if self.cursor_col >= self.cols {
                         self.newline();
                     }
-                    self.draw_char(self.cursor_col, self.cursor_row, byte);
+                    self.put_char(self.cursor_col, self.cursor_row, byte);
                     self.cursor_col += 1;
                 }
             },
@@ -218,15 +264,13 @@ impl Console {
             }
             b'J' => {
                 if p1 == 2 || p1 == 3 {
-                    self.fb.clear(self.bg);
-                    self.cursor_col = 0;
-                    self.cursor_row = 0;
+                    self.clear_screen();
                 }
             }
             b'K' => {
                 if p1 == 0 {
                     for col in self.cursor_col..self.cols {
-                        self.draw_char(col, self.cursor_row, b' ');
+                        self.put_char(col, self.cursor_row, b' ');
                     }
                 }
             }
@@ -302,18 +346,10 @@ impl Console {
             (25, b'l') => {} // hide cursor (no-op for now)
             (25, b'h') => {} // show cursor (no-op for now)
             (1049, b'h') => { // alternate screen buffer: just clear
-                self.fb.clear(self.bg);
-                self.cursor_col = 0;
-                self.cursor_row = 0;
+                self.clear_screen();
             }
             (1049, b'l') => {} // restore main screen (no-op)
             _ => {}
-        }
-    }
-
-    fn write_str(&mut self, s: &str) {
-        for byte in s.bytes() {
-            self.write_byte(byte);
         }
     }
 }
@@ -322,50 +358,83 @@ impl Console {
 
 static CONSOLE: SyncCell<Option<Console>> = SyncCell::new(None);
 
+fn with<R>(default: R, f: impl FnOnce(&mut Console) -> R) -> R {
+    match CONSOLE.get_mut() {
+        Some(c) => f(c),
+        None => default,
+    }
+}
+
 pub fn init(fb: Framebuffer, font_data: Vec<u8>) {
     *CONSOLE.get_mut() = Some(Console::new(fb, font_data));
 }
 
 pub fn println(s: &str) {
-    if let Some(console) = CONSOLE.get_mut() {
-        console.write_str(s);
-        console.write_byte(b'\n');
-    }
+    with((), |c| {
+        let v = c.cursor_visible;
+        if v { c.erase_cursor(); }
+        for byte in s.bytes() {
+            c.write_byte(byte);
+        }
+        c.write_byte(b'\n');
+        if v { c.draw_cursor(); }
+    });
 }
 
 pub fn write_str(s: &str) {
-    if let Some(console) = CONSOLE.get_mut() {
-        console.write_str(s);
-    }
+    with((), |c| {
+        let v = c.cursor_visible;
+        if v { c.erase_cursor(); }
+        for byte in s.bytes() {
+            c.write_byte(byte);
+        }
+        if v { c.draw_cursor(); }
+    });
+}
+
+pub fn write_bytes(bytes: &[u8]) {
+    with((), |c| {
+        let v = c.cursor_visible;
+        if v { c.erase_cursor(); }
+        for &byte in bytes {
+            c.write_byte(byte);
+        }
+        if v { c.draw_cursor(); }
+    });
 }
 
 pub fn putchar(b: u8) {
-    if let Some(console) = CONSOLE.get_mut() {
-        console.write_byte(b);
-    }
+    with((), |c| {
+        let v = c.cursor_visible;
+        if v { c.erase_cursor(); }
+        c.write_byte(b);
+        if v { c.draw_cursor(); }
+    });
 }
 
 pub fn clear() {
-    if let Some(console) = CONSOLE.get_mut() {
-        console.fb.clear(console.bg);
-        console.cursor_col = 0;
-        console.cursor_row = 0;
-    }
+    with((), |c| {
+        c.cursor_visible = false;
+        c.clear_screen();
+    });
 }
 
 pub fn screen_size() -> (usize, usize) {
-    if let Some(console) = CONSOLE.get() {
-        (console.cols, console.rows)
-    } else {
-        (80, 24)
-    }
+    with((80, 24), |c| (c.cols, c.rows))
 }
 
-pub fn backspace() {
-    if let Some(console) = CONSOLE.get_mut() {
-        if console.cursor_col > 0 {
-            console.cursor_col -= 1;
-            console.draw_char(console.cursor_col, console.cursor_row, b' ');
+pub fn show_cursor() {
+    with((), |c| {
+        if !c.cursor_visible {
+            c.draw_cursor();
         }
-    }
+    });
+}
+
+pub fn hide_cursor() {
+    with((), |c| {
+        if c.cursor_visible {
+            c.erase_cursor();
+        }
+    });
 }

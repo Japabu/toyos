@@ -9,7 +9,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use kernel::arch::{gdt, idt, paging, syscall};
 use kernel::drivers::{acpi, framebuffer, nvme, pci, serial, xhci};
-use kernel::{allocator, clock, console, log, process, ramdisk, shell, symbols, vfs, KernelArgs, MemoryMapEntry};
+use kernel::{allocator, clock, console, log, process, ramdisk, symbols, vfs, KernelArgs, MemoryMapEntry};
 use tyfs::Disk;
 use core::fmt::Write;
 
@@ -37,10 +37,11 @@ pub unsafe extern "sysv64" fn _start(kernel_args: KernelArgs) -> ! {
         kernel_args.kernel_elf_addr as *const u8,
         kernel_args.kernel_elf_size as usize,
     );
-    let init_path = core::str::from_utf8_unchecked(core::slice::from_raw_parts(
+    let init_bytes = core::slice::from_raw_parts(
         kernel_args.init_program_addr as *const u8,
         kernel_args.init_program_len as usize,
-    ));
+    );
+    let init_path = core::str::from_utf8(init_bytes).expect("init_program: invalid UTF-8");
 
     kernel_main(&kernel_args, maps, initrd, kernel_elf, init_path);
 }
@@ -156,27 +157,25 @@ fn kernel_main(
     let mut vfs = vfs::Vfs::new();
     vfs.mount("initrd", Box::new(initrd_fs));
     vfs.mount("nvme", Box::new(nvme_fs));
-    vfs.cd("/nvme");
 
-    // Make VFS accessible from syscall handlers
-    syscall::set_vfs(&mut vfs);
+    // Move VFS into global static (accessible from syscall handlers)
+    vfs::set_global(vfs);
 
-    // Run init program (if specified)
-    if !init_path.is_empty() {
-        let args: Vec<&str> = init_path.split_whitespace().collect();
-        let cmd = args[0];
-        // Resolve bare name against /initrd/
-        let path = if cmd.starts_with('/') {
-            String::from(cmd)
-        } else {
-            format!("/initrd/{}", cmd)
-        };
-        log!("init: running {}", path);
-        let data = vfs.read_file(&path)
-            .unwrap_or_else(|| panic!("init: {} not found", path));
-        process::run(&data, &args);
-    }
+    // Run init program (default: "shell")
+    let init = if init_path.is_empty() { "shell" } else { init_path };
+    let args: Vec<&str> = init.split_whitespace().collect();
+    let cmd = args[0];
+    let path = if cmd.starts_with('/') {
+        String::from(cmd)
+    } else {
+        format!("/initrd/{}", cmd)
+    };
+    log!("init: running {}", path);
+    let data = vfs::global().read_file(&path)
+        .unwrap_or_else(|| panic!("init: {} not found", path));
+    let code = process::run(&data, &args);
+    kernel::fd::close_all(vfs::global());
 
-    // Drop into interactive shell
-    shell::run(&mut vfs);
+    log!("init exited with code {}", code);
+    kernel::arch::cpu::halt();
 }

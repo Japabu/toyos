@@ -23,6 +23,16 @@ impl Mmio {
     }
 
     #[inline]
+    pub fn read_u16(self, offset: u64) -> u16 {
+        unsafe { read_volatile((self.0 + offset) as *const u16) }
+    }
+
+    #[inline]
+    pub fn write_u16(self, offset: u64, val: u16) {
+        unsafe { write_volatile((self.0 + offset) as *mut u16, val) }
+    }
+
+    #[inline]
     pub fn read_u32(self, offset: u64) -> u32 {
         unsafe { read_volatile((self.0 + offset) as *const u32) }
     }

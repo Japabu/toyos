@@ -60,6 +60,61 @@ struct CqEntry {
     status: u16, // bit 0 = phase, bits [15:1] = status
 }
 
+// Submission/completion queue pair with doorbell management
+struct NvmeQueue {
+    sq: *mut SqEntry,
+    cq: *mut CqEntry,
+    sq_tail: u16,
+    cq_head: u16,
+    phase: bool,
+    sq_doorbell: u64, // BAR offset for SQ tail doorbell
+    cq_doorbell: u64, // BAR offset for CQ head doorbell
+}
+
+impl NvmeQueue {
+    fn new(sq: *mut SqEntry, cq: *mut CqEntry, qid: u16, stride: u32) -> Self {
+        let doorbell_stride = 4u64 << stride;
+        Self {
+            sq,
+            cq,
+            sq_tail: 0,
+            cq_head: 0,
+            phase: true,
+            sq_doorbell: 0x1000 + (2 * qid as u64) * doorbell_stride,
+            cq_doorbell: 0x1000 + (2 * qid as u64 + 1) * doorbell_stride,
+        }
+    }
+
+    fn submit(&mut self, bar: &Mmio, cmd: SqEntry) {
+        unsafe { write_volatile(self.sq.add(self.sq_tail as usize), cmd); }
+        self.sq_tail = (self.sq_tail + 1) % QUEUE_DEPTH as u16;
+        fence(Ordering::Release);
+        bar.write_u32(self.sq_doorbell, self.sq_tail as u32);
+    }
+
+    fn wait_completion(&mut self, bar: &Mmio) -> u16 {
+        loop {
+            let cq = unsafe { read_volatile(self.cq.add(self.cq_head as usize)) };
+            let phase = (cq.status & 1) != 0;
+            if phase == self.phase {
+                let status = cq.status >> 1;
+                self.cq_head = (self.cq_head + 1) % QUEUE_DEPTH as u16;
+                if self.cq_head == 0 {
+                    self.phase = !self.phase;
+                }
+                bar.write_u32(self.cq_doorbell, self.cq_head as u32);
+                return status;
+            }
+            core::hint::spin_loop();
+        }
+    }
+
+    fn submit_and_wait(&mut self, bar: &Mmio, cmd: SqEntry) -> u16 {
+        self.submit(bar, cmd);
+        self.wait_completion(bar)
+    }
+}
+
 // DMA memory pool
 //   Page 0: Admin SQ (16 * 64 = 1024 bytes)
 //   Page 1: Admin CQ (16 * 16 = 256 bytes)
@@ -76,94 +131,15 @@ fn dma_page(index: usize) -> u64 {
 
 pub struct NvmeController {
     bar: Mmio,
-    stride: u32,
-    admin_sq: *mut SqEntry,
-    admin_cq: *mut CqEntry,
-    io_sq: *mut SqEntry,
-    io_cq: *mut CqEntry,
+    admin: NvmeQueue,
+    io: NvmeQueue,
     data_buf: *mut u8,
-    admin_sq_tail: u16,
-    admin_cq_head: u16,
-    admin_phase: bool,
-    io_sq_tail: u16,
-    io_cq_head: u16,
-    io_phase: bool,
     next_cid: u16,
     sector_size: u32,
     ns_size: u64, // namespace size in sectors
 }
 
 impl NvmeController {
-    fn sq_doorbell_offset(&self, qid: u16) -> u64 {
-        0x1000 + (2 * qid as u64) * (4 << self.stride)
-    }
-
-    fn cq_doorbell_offset(&self, qid: u16) -> u64 {
-        0x1000 + (2 * qid as u64 + 1) * (4 << self.stride)
-    }
-
-    fn submit_admin_cmd(&mut self, cmd: SqEntry) {
-        unsafe {
-            write_volatile(self.admin_sq.add(self.admin_sq_tail as usize), cmd);
-        }
-        self.admin_sq_tail = (self.admin_sq_tail + 1) % QUEUE_DEPTH as u16;
-        fence(Ordering::Release);
-        self.bar.write_u32(self.sq_doorbell_offset(0), self.admin_sq_tail as u32);
-    }
-
-    fn wait_admin_completion(&mut self) -> u16 {
-        loop {
-            let cq = unsafe {
-                read_volatile(self.admin_cq.add(self.admin_cq_head as usize))
-            };
-            let phase = (cq.status & 1) != 0;
-            if phase == self.admin_phase {
-                let status = cq.status >> 1;
-                self.admin_cq_head = (self.admin_cq_head + 1) % QUEUE_DEPTH as u16;
-                if self.admin_cq_head == 0 {
-                    self.admin_phase = !self.admin_phase;
-                }
-                self.bar.write_u32(self.cq_doorbell_offset(0), self.admin_cq_head as u32);
-                if status != 0 {
-                    log!("NVMe: admin cmd failed, status={:#x}", status);
-                }
-                return status;
-            }
-            core::hint::spin_loop();
-        }
-    }
-
-    fn submit_io_cmd(&mut self, cmd: SqEntry) {
-        unsafe {
-            write_volatile(self.io_sq.add(self.io_sq_tail as usize), cmd);
-        }
-        self.io_sq_tail = (self.io_sq_tail + 1) % QUEUE_DEPTH as u16;
-        fence(Ordering::Release);
-        self.bar.write_u32(self.sq_doorbell_offset(1), self.io_sq_tail as u32);
-    }
-
-    fn wait_io_completion(&mut self) -> u16 {
-        loop {
-            let cq = unsafe {
-                read_volatile(self.io_cq.add(self.io_cq_head as usize))
-            };
-            let phase = (cq.status & 1) != 0;
-            if phase == self.io_phase {
-                let status = cq.status >> 1;
-                self.io_cq_head = (self.io_cq_head + 1) % QUEUE_DEPTH as u16;
-                if self.io_cq_head == 0 {
-                    self.io_phase = !self.io_phase;
-                }
-                self.bar.write_u32(self.cq_doorbell_offset(1), self.io_cq_head as u32);
-                if status != 0 {
-                    log!("NVMe: I/O cmd failed, status={:#x}", status);
-                }
-                return status;
-            }
-            core::hint::spin_loop();
-        }
-    }
-
     fn alloc_cid(&mut self) -> u16 {
         let cid = self.next_cid;
         self.next_cid = self.next_cid.wrapping_add(1);
@@ -177,36 +153,33 @@ impl NvmeController {
         cmd.cdw0 = (cid as u32) << 16 | ADMIN_IDENTIFY as u32;
         cmd.prp1 = identify_buf;
         cmd.cdw10 = 1; // CNS = 1 (controller)
-        self.submit_admin_cmd(cmd);
-        self.wait_admin_completion();
+        self.admin.submit_and_wait(&self.bar, cmd);
         log::println("NVMe: Identify Controller OK");
     }
 
     fn create_io_cq(&mut self) {
-        let io_cq_phys = self.io_cq as u64;
-        unsafe { write_bytes(self.io_cq as *mut u8, 0, QUEUE_DEPTH * core::mem::size_of::<CqEntry>()); }
+        let io_cq_phys = self.io.cq as u64;
+        unsafe { write_bytes(self.io.cq as *mut u8, 0, QUEUE_DEPTH * core::mem::size_of::<CqEntry>()); }
         let cid = self.alloc_cid();
         let mut cmd = SqEntry::ZERO;
         cmd.cdw0 = (cid as u32) << 16 | ADMIN_CREATE_IO_CQ as u32;
         cmd.prp1 = io_cq_phys;
         cmd.cdw10 = ((QUEUE_DEPTH as u32 - 1) << 16) | 1; // size (0-based) | QID=1
         cmd.cdw11 = 1; // physically contiguous
-        self.submit_admin_cmd(cmd);
-        self.wait_admin_completion();
+        self.admin.submit_and_wait(&self.bar, cmd);
         log::println("NVMe: I/O CQ created");
     }
 
     fn create_io_sq(&mut self) {
-        let io_sq_phys = self.io_sq as u64;
-        unsafe { write_bytes(self.io_sq as *mut u8, 0, QUEUE_DEPTH * core::mem::size_of::<SqEntry>()); }
+        let io_sq_phys = self.io.sq as u64;
+        unsafe { write_bytes(self.io.sq as *mut u8, 0, QUEUE_DEPTH * core::mem::size_of::<SqEntry>()); }
         let cid = self.alloc_cid();
         let mut cmd = SqEntry::ZERO;
         cmd.cdw0 = (cid as u32) << 16 | ADMIN_CREATE_IO_SQ as u32;
         cmd.prp1 = io_sq_phys;
         cmd.cdw10 = ((QUEUE_DEPTH as u32 - 1) << 16) | 1; // size (0-based) | QID=1
         cmd.cdw11 = (1 << 16) | 1; // CQID=1 | physically contiguous
-        self.submit_admin_cmd(cmd);
-        self.wait_admin_completion();
+        self.admin.submit_and_wait(&self.bar, cmd);
         log::println("NVMe: I/O SQ created");
     }
 
@@ -219,8 +192,7 @@ impl NvmeController {
         cmd.nsid = 1;
         cmd.prp1 = identify_buf;
         cmd.cdw10 = 0; // CNS = 0 (namespace)
-        self.submit_admin_cmd(cmd);
-        self.wait_admin_completion();
+        self.admin.submit_and_wait(&self.bar, cmd);
 
         unsafe {
             let buf = identify_buf as *const u8;
@@ -255,8 +227,7 @@ impl NvmeController {
         cmd.cdw10 = lba as u32;
         cmd.cdw11 = (lba >> 32) as u32;
         cmd.cdw12 = 0; // read 1 sector (NLB is 0-based)
-        self.submit_io_cmd(cmd);
-        self.wait_io_completion();
+        self.io.submit_and_wait(&self.bar, cmd);
 
         let len = buf.len().min(self.sector_size as usize);
         unsafe {
@@ -279,8 +250,7 @@ impl NvmeController {
         cmd.cdw10 = lba as u32;
         cmd.cdw11 = (lba >> 32) as u32;
         cmd.cdw12 = 0; // write 1 sector (NLB is 0-based)
-        self.submit_io_cmd(cmd);
-        self.wait_io_completion();
+        self.io.submit_and_wait(&self.bar, cmd);
     }
 }
 
@@ -382,7 +352,7 @@ pub fn init(ecam_base: u64) -> Option<NvmeController> {
     log!("NVMe: found at PCI {:02x}:{:02x}.{}", pci_dev.bus, pci_dev.dev, pci_dev.func);
 
     // Read BAR0 and enable bus mastering
-    let bar = Mmio::new(pci_dev.bar0_64());
+    let bar = Mmio::new(pci_dev.read_bar_64(0));
     pci_dev.enable_bus_master();
     log!("NVMe: BAR0={:#x}", bar.addr());
 
@@ -437,18 +407,9 @@ pub fn init(ecam_base: u64) -> Option<NvmeController> {
 
     let mut ctrl = NvmeController {
         bar,
-        stride,
-        admin_sq,
-        admin_cq,
-        io_sq,
-        io_cq,
+        admin: NvmeQueue::new(admin_sq, admin_cq, 0, stride),
+        io: NvmeQueue::new(io_sq, io_cq, 1, stride),
         data_buf,
-        admin_sq_tail: 0,
-        admin_cq_head: 0,
-        admin_phase: true,
-        io_sq_tail: 0,
-        io_cq_head: 0,
-        io_phase: true,
         next_cid: 0,
         sector_size: 512, // default, overwritten by identify_namespace
         ns_size: 0,

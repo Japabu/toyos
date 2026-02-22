@@ -22,8 +22,6 @@ pub mod ramdisk;
 #[cfg(not(test))]
 pub mod vfs;
 #[cfg(not(test))]
-pub mod shell;
-#[cfg(not(test))]
 pub mod elf;
 #[cfg(not(test))]
 pub mod symbols;

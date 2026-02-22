@@ -1,4 +1,4 @@
-use alloc::alloc::{alloc_zeroed, Layout};
+use alloc::alloc::{alloc_zeroed, dealloc, Layout};
 use alloc::vec::Vec;
 use core::arch::asm;
 
@@ -29,6 +29,7 @@ pub fn run(data: &[u8], args: &[&str]) -> i32 {
         return -1;
     }
     let stack_top = stack_base as u64 + USER_STACK_SIZE as u64;
+    let elf_layout = Layout::from_size_align(loaded.load_size, 4096).unwrap();
     paging::map_user(stack_base as u64, USER_STACK_SIZE as u64);
 
     // Load symbols for crash diagnostics
@@ -81,7 +82,14 @@ pub fn run(data: &[u8], args: &[&str]) -> i32 {
     // Clear symbols on process exit
     symbols::clear();
 
-    // TODO: free program memory and stack
+    // Revoke user-accessible mappings and free memory
+    paging::unmap_user(loaded.base_ptr as u64, loaded.load_size as u64);
+    paging::unmap_user(stack_base as u64, USER_STACK_SIZE as u64);
+    unsafe {
+        dealloc(loaded.base_ptr, elf_layout);
+        dealloc(stack_base, stack_layout);
+    }
+
     exit_code
 }
 

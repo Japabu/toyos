@@ -1,32 +1,27 @@
 pub struct RamDisk {
-    ptr: *mut u8,
-    len: usize,
+    data: &'static mut [u8],
 }
 
 impl RamDisk {
     /// # Safety
     /// The caller must ensure `ptr` points to a valid memory region of at least `len` bytes
-    /// that remains valid for the lifetime of this RamDisk.
+    /// that remains valid for the static lifetime.
     pub unsafe fn new(ptr: *mut u8, len: usize) -> Self {
-        Self { ptr, len }
+        Self { data: core::slice::from_raw_parts_mut(ptr, len) }
     }
 }
 
 impl tyfs::Disk for RamDisk {
     fn read(&mut self, offset: u64, buf: &mut [u8]) {
         let off = offset as usize;
-        let len = buf.len().min(self.len - off);
-        unsafe {
-            core::ptr::copy_nonoverlapping(self.ptr.add(off), buf.as_mut_ptr(), len);
-        }
+        let len = buf.len().min(self.data.len() - off);
+        buf[..len].copy_from_slice(&self.data[off..off + len]);
     }
 
     fn write(&mut self, offset: u64, buf: &[u8]) {
         let off = offset as usize;
-        let len = buf.len().min(self.len - off);
-        unsafe {
-            core::ptr::copy_nonoverlapping(buf.as_ptr(), self.ptr.add(off), len);
-        }
+        let len = buf.len().min(self.data.len() - off);
+        self.data[off..off + len].copy_from_slice(&buf[..len]);
     }
 
     fn flush(&mut self) {}

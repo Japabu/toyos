@@ -27,6 +27,13 @@ pub fn println(s: &str) {
     write_serial('\n');
 }
 
+pub fn write_bytes(bytes: &[u8]) {
+    for &b in bytes {
+        while !is_transmit_empty() {}
+        outb(PORT, b);
+    }
+}
+
 fn is_transmit_empty() -> bool {
     inb(PORT + 5) & 0x20 != 0
 }

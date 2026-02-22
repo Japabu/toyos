@@ -2,10 +2,29 @@ use core::ptr::{read_unaligned, read_volatile};
 use core::sync::atomic::{AtomicU16, Ordering};
 use crate::log;
 
+// ACPI table structure offsets
+const SDT_LENGTH: usize = 4;         // u32 table length at offset 4
+const SDT_HEADER_SIZE: usize = 36;   // XSDT entries start after 36-byte header
+
+// RSDP offsets
+const RSDP_XSDT_ADDR: usize = 24;   // u64 XSDT physical address
+
+// FADT (FACP) offsets
+const FADT_REVISION: usize = 8;      // u8 revision
+const FADT_DSDT: usize = 40;         // u32 DSDT physical address (ACPI 1.0)
+const FADT_PM1A_CNT_BLK: usize = 64; // u32 PM1a control block port
+const FADT_X_DSDT: usize = 140;      // u64 DSDT physical address (ACPI 2.0+)
+
+// MCFG/HPET first entry base address (after 36B header + 8B reserved)
+const MCFG_FIRST_ENTRY_BASE: usize = 44;
+const HPET_BASE_ADDR: usize = 44;    // 36B header + 4B event timer block ID + 4B GAS header
+
+const SLP_EN: u16 = 1 << 13;
+
 static PM1A_CNT_PORT: AtomicU16 = AtomicU16::new(0);
 static SLP_TYPA: AtomicU16 = AtomicU16::new(0);
 
-/// Given the RSDP address from UEFI, parse XSDT → MCFG → return ECAM base address.
+/// Given the RSDP address from UEFI, parse XSDT -> MCFG -> return ECAM base address.
 pub fn find_ecam_base(rsdp_addr: u64) -> Option<u64> {
     let rsdp = rsdp_addr as *const u8;
     log!("ACPI: RSDP at {:#x}", rsdp_addr);
@@ -16,7 +35,7 @@ pub fn find_ecam_base(rsdp_addr: u64) -> Option<u64> {
     let mcfg = find_table(xsdt, b"MCFG")?;
     log!("ACPI: MCFG found at {:#x}", mcfg as u64);
 
-    let ecam_base = read_ecam_base(mcfg);
+    let ecam_base = unsafe { read_unaligned(mcfg.add(MCFG_FIRST_ENTRY_BASE) as *const u64) };
     log!("ACPI: ECAM base address: {:#x}", ecam_base);
 
     Some(ecam_base)
@@ -29,27 +48,26 @@ pub fn init_power(rsdp_addr: u64) {
 
     let fadt = find_table(xsdt, b"FACP").expect("ACPI: FADT not found");
 
-    // PM1a_CNT_BLK: FADT offset 64, 4 bytes
-    let pm1a = unsafe { read_unaligned(fadt.add(64) as *const u32) } as u16;
+    let pm1a = unsafe { read_unaligned(fadt.add(FADT_PM1A_CNT_BLK) as *const u32) } as u16;
     PM1A_CNT_PORT.store(pm1a, Ordering::Relaxed);
 
-    // Get DSDT address — prefer X_DSDT (offset 140) over DSDT (offset 40)
-    let revision = unsafe { read_volatile(fadt.add(8)) };
+    // Prefer X_DSDT (64-bit, ACPI 2.0+) over DSDT (32-bit)
+    let revision = unsafe { read_volatile(fadt.add(FADT_REVISION)) };
     let dsdt_addr = if revision >= 2 {
-        let x_dsdt = unsafe { read_unaligned(fadt.add(140) as *const u64) };
+        let x_dsdt = unsafe { read_unaligned(fadt.add(FADT_X_DSDT) as *const u64) };
         if x_dsdt != 0 {
             x_dsdt
         } else {
-            (unsafe { read_unaligned(fadt.add(40) as *const u32) }) as u64
+            (unsafe { read_unaligned(fadt.add(FADT_DSDT) as *const u32) }) as u64
         }
     } else {
-        (unsafe { read_unaligned(fadt.add(40) as *const u32) }) as u64
+        (unsafe { read_unaligned(fadt.add(FADT_DSDT) as *const u32) }) as u64
     };
 
     assert!(dsdt_addr != 0, "ACPI: DSDT not found");
 
     let dsdt = dsdt_addr as *const u8;
-    let dsdt_len = unsafe { read_unaligned(dsdt.add(4) as *const u32) } as usize;
+    let dsdt_len = unsafe { read_unaligned(dsdt.add(SDT_LENGTH) as *const u32) } as usize;
 
     let slp_typ = find_s5_slp_typ(dsdt, dsdt_len).expect("ACPI: \\_S5_ not found in DSDT");
     SLP_TYPA.store(slp_typ, Ordering::Relaxed);
@@ -69,20 +87,17 @@ pub fn shutdown() -> ! {
     crate::arch::cpu::halt();
 }
 
-const SLP_EN: u16 = 1 << 13;
-
-/// Read XSDT address from RSDP (offset 24, 8 bytes).
+/// Read XSDT address from RSDP.
 fn get_xsdt_addr(rsdp: *const u8) -> *const u8 {
-    unsafe { read_unaligned(rsdp.add(24) as *const u64) as *const u8 }
+    unsafe { read_unaligned(rsdp.add(RSDP_XSDT_ADDR) as *const u64) as *const u8 }
 }
 
 /// Iterate XSDT entries looking for a table with the given 4-byte signature.
 fn find_table(xsdt: *const u8, signature: &[u8; 4]) -> Option<*const u8> {
-    let length = unsafe { read_unaligned(xsdt.add(4) as *const u32) } as usize;
-    let header_size = 36;
-    let entry_count = (length - header_size) / 8;
+    let length = unsafe { read_unaligned(xsdt.add(SDT_LENGTH) as *const u32) } as usize;
+    let entry_count = (length - SDT_HEADER_SIZE) / 8;
 
-    let entries_base = unsafe { xsdt.add(header_size) };
+    let entries_base = unsafe { xsdt.add(SDT_HEADER_SIZE) };
 
     for i in 0..entry_count {
         let table_addr =
@@ -101,21 +116,13 @@ fn find_table(xsdt: *const u8, signature: &[u8; 4]) -> Option<*const u8> {
     None
 }
 
-/// Given the RSDP address, parse XSDT → HPET table → return HPET MMIO base address.
+/// Given the RSDP address, parse XSDT -> HPET table -> return HPET MMIO base address.
 pub fn find_hpet_base(rsdp_addr: u64) -> Option<u64> {
     let xsdt = get_xsdt_addr(rsdp_addr as *const u8);
     let hpet = find_table(xsdt, b"HPET")?;
-    // HPET table: 36B SDT header + 4B Event Timer Block ID + 4B GAS header + 8B address
-    let base = unsafe { read_unaligned(hpet.add(44) as *const u64) };
+    let base = unsafe { read_unaligned(hpet.add(HPET_BASE_ADDR) as *const u64) };
     log!("ACPI: HPET at {:#x}", base);
     Some(base)
-}
-
-/// Read ECAM base address from the first MCFG configuration entry.
-/// MCFG layout: 36-byte SDT header + 8 bytes reserved + 16-byte entries.
-/// First entry base address is at offset 44.
-fn read_ecam_base(mcfg: *const u8) -> u64 {
-    unsafe { read_unaligned(mcfg.add(44) as *const u64) }
 }
 
 /// Scan DSDT AML bytecode for the \_S5_ package and extract SLP_TYPa.
@@ -151,7 +158,7 @@ fn find_s5_slp_typ(dsdt: *const u8, len: usize) -> Option<u16> {
 
         let byte = unsafe { read_volatile(dsdt.add(val_off)) };
         let slp_typ = if byte == 0x0A {
-            // BytePrefix — next byte is the value
+            // BytePrefix -- next byte is the value
             if val_off + 1 >= len { return None; }
             (unsafe { read_volatile(dsdt.add(val_off + 1)) }) as u16
         } else {

@@ -516,7 +516,7 @@ pub fn init(ecam_base: u64) -> Option<XhciController> {
     let pci_dev = PciDevice::find(ecam_base, 0x0C, 0x03, Some(0x30))?;
     log!("xHCI: found at PCI {:02x}:{:02x}.{}", pci_dev.bus, pci_dev.dev, pci_dev.func);
 
-    let bar = Mmio::new(pci_dev.bar0_64());
+    let bar = Mmio::new(pci_dev.read_bar_64(0));
     pci_dev.enable_bus_master();
     log!("xHCI: BAR0={:#x}", bar.addr());
 

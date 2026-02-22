@@ -87,6 +87,24 @@ pub struct SavedRegs {
     pub r15: u64,
 }
 
+// CPU-pushed interrupt/exception frame (follows saved regs + error code on stack)
+#[repr(C)]
+struct InterruptFrame {
+    error_code: u64,
+    rip: u64,
+    cs: u64,
+    rflags: u64,
+    rsp: u64,
+    ss: u64,
+}
+
+impl SavedRegs {
+    /// Access the CPU-pushed interrupt frame that follows this SavedRegs on the stack.
+    fn interrupt_frame(&self) -> &InterruptFrame {
+        unsafe { &*((self as *const SavedRegs).add(1) as *const InterruptFrame) }
+    }
+}
+
 // Kernel base address for crash diagnostics
 static KERNEL_BASE: SyncCell<u64> = SyncCell::new(0);
 
@@ -94,8 +112,10 @@ pub fn set_kernel_base(base: u64) {
     *KERNEL_BASE.get_mut() = base;
 }
 
-/// Remap the 8259 PIC: master IRQ 0-7 -> vectors 32-39, slave -> 40-47.
-fn remap_pic() {
+/// Disable the legacy 8259 PIC. We don't use it (keyboard is USB, clock is HPET),
+/// but it must be initialized and masked to prevent spurious IRQs from aliasing
+/// CPU exception vectors 0-15. Remapping to 32+ ensures any leak-through is harmless.
+fn disable_pic() {
     // ICW1: begin init (bit 4=1, bit 0=ICW4 needed)
     outb(PIC1_CMD, 0x11);
     io_wait();
@@ -126,7 +146,7 @@ fn remap_pic() {
 }
 
 pub fn init() {
-    remap_pic();
+    disable_pic();
 
     IDT.get_mut().entries[6] = IdtEntry::new(ud_entry as u64);
     IDT.get_mut().entries[13] = IdtEntry::new(gpf_entry as u64);
@@ -147,8 +167,9 @@ pub fn init() {
 // For exceptions with error codes, the CPU pushes (on the kernel stack):
 //   [SS] [RSP] [RFLAGS] [CS] [RIP] [error_code] <- RSP
 // For exceptions WITHOUT error codes, we push a dummy 0 to unify the layout.
-// After saving all GPRs, the handler is called with:
-//   rdi=vector, rsi=regs_ptr, rdx=error_code, rcx=rip, r8=cs, r9=fault_addr
+// After saving all GPRs we have 21 qwords on stack (5 CPU + 1 error + 15 GPRs),
+// so RSP is 8-misaligned. `sub rsp, 8` fixes alignment before the call.
+// Handler args: rdi=vector, rsi=regs_ptr, rdx=error_code, rcx=rip, r8=cs, r9=fault_addr
 
 macro_rules! exception_entry {
     // No error code, no fault address (e.g. #UD)
@@ -167,6 +188,7 @@ macro_rules! exception_entry {
                 "mov rcx, [rsp + 16*8]",
                 "mov r8,  [rsp + 17*8]",
                 "xor r9, r9",
+                "sub rsp, 8", // align stack to 16 bytes before call
                 "call {handler}", "cli", "hlt",
                 handler = sym exception_handler,
             );
@@ -187,6 +209,7 @@ macro_rules! exception_entry {
                 "mov rcx, [rsp + 16*8]",
                 "mov r8,  [rsp + 17*8]",
                 "xor r9, r9",
+                "sub rsp, 8", // align stack to 16 bytes before call
                 "call {handler}", "cli", "hlt",
                 handler = sym exception_handler,
             );
@@ -207,6 +230,7 @@ macro_rules! exception_entry {
                 "mov rcx, [rsp + 16*8]",
                 "mov r8,  [rsp + 17*8]",
                 "mov r9, cr2",
+                "sub rsp, 8", // align stack to 16 bytes before call
                 "call {handler}", "cli", "hlt",
                 handler = sym exception_handler,
             );
@@ -273,9 +297,8 @@ extern "C" fn exception_handler(
     log!("{}: {}", prefix, detail);
     log!("  rip: {}", format_addr(rip));
 
-    // User RSP is in the CPU's iret frame: 15 saved regs + error_code + RIP + CS + RFLAGS + RSP
-    let user_rsp = unsafe { *((regs as *const SavedRegs as *const u64).add(19)) };
-    let rsp = if is_user { user_rsp } else { regs.rbp }; // approximate for kernel
+    let frame = regs.interrupt_frame();
+    let rsp = if is_user { frame.rsp } else { regs.rbp }; // approximate for kernel
 
     // Instruction bytes at RIP (helps identify the faulting instruction)
     if is_user && symbols::is_valid_user_addr(rip) {
@@ -302,10 +325,10 @@ extern "C" fn exception_handler(
     log!("    r14={:#018x}  r15={:#018x}", regs.r14, regs.r15);
 
     // Stack dump (8 words from RSP)
-    if is_user && user_rsp % 8 == 0 {
+    if is_user && frame.rsp % 8 == 0 {
         log::println("  Stack:");
         for i in 0..8u64 {
-            let addr = user_rsp + i * 8;
+            let addr = frame.rsp + i * 8;
             if !symbols::is_valid_user_addr(addr) && !symbols::is_valid_user_addr(addr + 7) { break; }
             let val = unsafe { *(addr as *const u64) };
             let sym = if let Some((name, off)) = symbols::resolve(val) {

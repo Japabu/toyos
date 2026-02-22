@@ -2,9 +2,9 @@ use core::arch::{asm, naked_asm};
 
 use alloc::vec::Vec;
 use super::{cpu, gdt};
-use crate::drivers::serial;
+use crate::drivers::{acpi, serial};
 use crate::sync::SyncCell;
-use crate::{console, keyboard, user_heap, vfs::Vfs};
+use crate::{console, keyboard, user_heap, vfs};
 
 // MSR addresses
 const MSR_EFER: u32 = 0xC000_0080;
@@ -30,17 +30,11 @@ const SYS_SEEK: u64 = 13;
 const SYS_FSTAT: u64 = 14;
 const SYS_FSYNC: u64 = 15;
 const SYS_EXEC: u64 = 16;
-
-// Global VFS pointer (set once in main, lives for the duration of the kernel)
-pub(crate) static VFS_PTR: SyncCell<*mut Vfs> = SyncCell::new(core::ptr::null_mut());
-
-pub fn set_vfs(vfs: &mut Vfs) {
-    *VFS_PTR.get_mut() = vfs as *mut _;
-}
-
-fn vfs() -> &'static mut Vfs {
-    unsafe { &mut **VFS_PTR.get_mut() }
-}
+const SYS_READDIR: u64 = 17;
+const SYS_DELETE: u64 = 18;
+const SYS_SHUTDOWN: u64 = 19;
+const SYS_CHDIR: u64 = 20;
+const SYS_GETCWD: u64 = 21;
 
 // Output capture buffer for SYS_EXEC (redirects SYS_WRITE to buffer instead of console)
 static CAPTURE_BUF: SyncCell<Option<Vec<u8>>> = SyncCell::new(None);
@@ -76,12 +70,28 @@ pub fn init() {
 //   RSP=user stack (CPU does NOT switch stacks on syscall)
 #[unsafe(naked)]
 extern "C" fn syscall_entry() {
+    // Save user RSP, switch to kernel stack, call handler, restore, sysretq.
+    // Must preserve all registers except RAX (return value), RCX, R11 (clobbered
+    // by syscall hardware). The SysV handler clobbers RDI/RSI/RDX/R8/R9/R10,
+    // so we save and restore them here.
     naked_asm!(
         "mov [rip + SYSCALL_USER_RSP], rsp",
         "mov rsp, [rip + SYSCALL_KERNEL_RSP]",
         "push rcx",
         "push r11",
+        "push rdi",
+        "push rsi",
+        "push rdx",
+        "push r8",
+        "push r9",
+        "push r10",
         "call {handler}",
+        "pop r10",
+        "pop r9",
+        "pop r8",
+        "pop rdx",
+        "pop rsi",
+        "pop rdi",
         "pop r11",
         "pop rcx",
         "mov rsp, [rip + SYSCALL_USER_RSP]",
@@ -96,7 +106,7 @@ pub static PROCESS_ACTIVE: SyncCell<bool> = SyncCell::new(false);
 extern "C" fn syscall_handler(num: u64, a1: u64, a2: u64, _: u64, a3: u64, a4: u64) -> u64 {
     match num {
         SYS_WRITE => sys_write(a1 as *const u8, a2 as usize),
-        SYS_READ => sys_read(a1 as *mut u8, a2 as usize),
+        SYS_READ => sys_read(a1 as *mut u8, a2 as usize, a3),
         SYS_ALLOC => user_heap::alloc(a1 as usize, a2 as usize),
         SYS_FREE => { user_heap::free(a1 as *mut u8, a2 as usize); 0 }
         SYS_REALLOC => user_heap::realloc(a1 as *mut u8, a2 as usize, a3 as usize, a4 as usize),
@@ -108,13 +118,11 @@ extern "C" fn syscall_handler(num: u64, a1: u64, a2: u64, _: u64, a3: u64, a4: u
         }
         SYS_CLOCK => crate::clock::nanos_since_boot(),
         SYS_OPEN => {
-            let path = unsafe {
-                let slice = core::slice::from_raw_parts(a1 as *const u8, a2 as usize);
-                core::str::from_utf8_unchecked(slice)
-            };
-            crate::fd::open(vfs(), path, a3)
+            let slice = unsafe { core::slice::from_raw_parts(a1 as *const u8, a2 as usize) };
+            let Ok(path) = core::str::from_utf8(slice) else { return u64::MAX };
+            crate::fd::open(vfs::global(), path, a3)
         }
-        SYS_CLOSE => crate::fd::close(vfs(), a1),
+        SYS_CLOSE => crate::fd::close(vfs::global(), a1),
         SYS_READ_FILE => {
             let buf = unsafe { core::slice::from_raw_parts_mut(a2 as *mut u8, a3 as usize) };
             crate::fd::read(a1, buf)
@@ -125,59 +133,199 @@ extern "C" fn syscall_handler(num: u64, a1: u64, a2: u64, _: u64, a3: u64, a4: u
         }
         SYS_SEEK => crate::fd::seek(a1, a2 as i64, a3),
         SYS_FSTAT => crate::fd::fstat(a1),
-        SYS_FSYNC => crate::fd::fsync(vfs(), a1),
+        SYS_FSYNC => crate::fd::fsync(vfs::global(), a1),
         SYS_EXEC => sys_exec(a1, a2, a3, a4),
+        SYS_READDIR => sys_readdir(a1, a2, a3, a4),
+        SYS_DELETE => sys_delete(a1, a2),
+        SYS_SHUTDOWN => { acpi::shutdown(); }
+        SYS_CHDIR => sys_chdir(a1, a2),
+        SYS_GETCWD => sys_getcwd(a1, a2),
         _ => u64::MAX, // unknown syscall
     }
 }
 
 fn sys_write(buf: *const u8, len: usize) -> u64 {
-    let s = unsafe { core::slice::from_raw_parts(buf, len) };
-    serial::print(unsafe { core::str::from_utf8_unchecked(s) });
+    let bytes = unsafe { core::slice::from_raw_parts(buf, len) };
+    serial::write_bytes(bytes);
     if let Some(ref mut capture) = *CAPTURE_BUF.get_mut() {
-        capture.extend_from_slice(s);
+        capture.extend_from_slice(bytes);
     } else {
-        for &byte in s {
-            console::putchar(byte);
-        }
+        console::write_bytes(bytes);
     }
     len as u64
 }
 
-fn sys_read(buf: *mut u8, len: usize) -> u64 {
-    // Line-buffered read with echo and backspace handling.
-    // Blocks until '\n' is received or buffer is full.
-    let mut count = 0usize;
+fn sys_read(buf: *mut u8, len: usize, mode: u64) -> u64 {
+    if mode == 1 {
+        return sys_read_raw(buf, len);
+    }
+    // Line-buffered read with readline editing.
+    // Supports left/right arrows, Home/End, Delete, insert mode.
+    let mut line = [0u8; 1024];
+    let mut line_len: usize = 0;
+    let mut cursor: usize = 0;
+    let max_len = len.min(line.len());
+
+    console::show_cursor();
+
     loop {
-        if count >= len { break; }
-        crate::drivers::xhci::poll_global(); // pump USB keyboard events
+        crate::drivers::xhci::poll_global();
         if let Some(ch) = keyboard::try_read_char() {
             match ch {
                 b'\n' => {
-                    console::putchar(b'\n');
-                    unsafe { *buf.add(count) = b'\n'; }
-                    count += 1;
-                    break;
+                    console::hide_cursor();
+                    // Move visual cursor to end, then newline
+                    let mut echo = [0u8; 1025];
+                    let mut n = 0;
+                    for i in cursor..line_len {
+                        echo[n] = line[i]; n += 1;
+                    }
+                    echo[n] = b'\n'; n += 1;
+                    console::write_bytes(&echo[..n]);
+                    // Copy to user buffer
+                    let copy = line_len.min(len.saturating_sub(1));
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(line.as_ptr(), buf, copy);
+                        *buf.add(copy) = b'\n';
+                    }
+                    return (copy + 1) as u64;
                 }
                 0x08 | 0x7F => {
-                    if count > 0 {
-                        count -= 1;
-                        console::putchar(0x08);
-                        console::putchar(b' ');
-                        console::putchar(0x08);
+                    if cursor > 0 {
+                        line.copy_within(cursor..line_len, cursor - 1);
+                        line_len -= 1;
+                        cursor -= 1;
+                        readline_redraw(&line, line_len, cursor, true);
                     }
                 }
-                ch => {
-                    console::putchar(ch);
-                    unsafe { *buf.add(count) = ch; }
-                    count += 1;
+                0x1B => readline_escape(&mut line, &mut line_len, &mut cursor),
+                ch if ch >= 0x20 => {
+                    if line_len < max_len {
+                        line.copy_within(cursor..line_len, cursor + 1);
+                        line[cursor] = ch;
+                        line_len += 1;
+                        cursor += 1;
+                        readline_redraw(&line, line_len, cursor, false);
+                    }
                 }
+                _ => {}
             }
         } else {
             core::hint::spin_loop();
         }
     }
-    count as u64
+}
+
+/// Redraw the line from an edit point and reposition the console cursor.
+/// `backspace`: true if a char was deleted (need to move left first and clear trailing).
+fn readline_redraw(line: &[u8], line_len: usize, cursor: usize, backspace: bool) {
+    let mut echo = [0u8; 2048];
+    let mut n = 0;
+    let start = if backspace {
+        // Move console cursor left one position
+        echo[n] = 0x08; n += 1;
+        cursor
+    } else {
+        // After insert, cursor already advanced; redraw from insert point
+        cursor - 1
+    };
+    for i in start..line_len {
+        echo[n] = line[i]; n += 1;
+    }
+    if backspace {
+        echo[n] = b' '; n += 1; // clear old trailing char
+    }
+    // Move console cursor back to cursor position
+    let back = line_len - cursor + if backspace { 1 } else { 0 };
+    for _ in 0..back {
+        echo[n] = 0x08; n += 1;
+    }
+    console::write_bytes(&echo[..n]);
+}
+
+/// Handle escape sequences from the keyboard in sys_read.
+fn readline_escape(line: &mut [u8], line_len: &mut usize, cursor: &mut usize) {
+    let Some(b'[') = keyboard::try_read_char() else { return };
+    match keyboard::try_read_char() {
+        Some(b'A') | Some(b'B') => {} // up/down — ignore
+        Some(b'C') => { // right
+            if *cursor < *line_len {
+                console::putchar(line[*cursor]);
+                *cursor += 1;
+            }
+        }
+        Some(b'D') => { // left
+            if *cursor > 0 {
+                *cursor -= 1;
+                console::putchar(0x08);
+            }
+        }
+        Some(b'H') => { // Home
+            let mut echo = [0u8; 1024];
+            let mut n = 0;
+            for _ in 0..*cursor {
+                echo[n] = 0x08; n += 1;
+            }
+            if n > 0 { console::write_bytes(&echo[..n]); }
+            *cursor = 0;
+        }
+        Some(b'F') => { // End
+            let mut echo = [0u8; 1024];
+            let mut n = 0;
+            for i in *cursor..*line_len {
+                echo[n] = line[i]; n += 1;
+            }
+            if n > 0 { console::write_bytes(&echo[..n]); }
+            *cursor = *line_len;
+        }
+        Some(b'3') => { // Delete: ESC[3~
+            if keyboard::try_read_char() == Some(b'~') && *cursor < *line_len {
+                line.copy_within(*cursor + 1..*line_len, *cursor);
+                *line_len -= 1;
+                // Redraw from cursor without moving left first
+                let mut echo = [0u8; 2048];
+                let mut n = 0;
+                for i in *cursor..*line_len {
+                    echo[n] = line[i]; n += 1;
+                }
+                echo[n] = b' '; n += 1;
+                let back = *line_len - *cursor + 1;
+                for _ in 0..back {
+                    echo[n] = 0x08; n += 1;
+                }
+                console::write_bytes(&echo[..n]);
+            }
+        }
+        Some(b'5') | Some(b'6') => { // Page Up/Down: ESC[5~ / ESC[6~
+            keyboard::try_read_char(); // consume '~'
+        }
+        _ => {}
+    }
+}
+
+/// Raw read: block until at least 1 byte, return all available bytes (no echo, no line editing).
+fn sys_read_raw(buf: *mut u8, len: usize) -> u64 {
+    if len == 0 {
+        return 0;
+    }
+    console::show_cursor();
+    loop {
+        crate::drivers::xhci::poll_global();
+        if let Some(ch) = keyboard::try_read_char() {
+            unsafe { *buf = ch; }
+            let mut count = 1usize;
+            while count < len {
+                if let Some(ch) = keyboard::try_read_char() {
+                    unsafe { *buf.add(count) = ch; }
+                    count += 1;
+                } else {
+                    break;
+                }
+            }
+            return count as u64;
+        }
+        core::hint::spin_loop();
+    }
 }
 
 fn sys_exit(code: i32) -> u64 {
@@ -211,14 +359,16 @@ fn sys_random(buf: *mut u8, len: usize) {
     }
 }
 
-fn sys_exec(path_ptr: u64, path_len: u64, out_buf_ptr: u64, out_buf_max: u64) -> u64 {
-    let path = unsafe {
-        let slice = core::slice::from_raw_parts(path_ptr as *const u8, path_len as usize);
-        core::str::from_utf8_unchecked(slice)
-    };
+fn sys_exec(argv_ptr: u64, argv_len: u64, out_buf_ptr: u64, out_buf_max: u64) -> u64 {
+    let buf = unsafe { core::slice::from_raw_parts(argv_ptr as *const u8, argv_len as usize) };
+    let Ok(text) = core::str::from_utf8(buf) else { return u64::MAX };
+
+    // Parse null-separated argv: "path\0arg1\0arg2"
+    let args: Vec<&str> = text.split('\0').filter(|s| !s.is_empty()).collect();
+    let Some(path) = args.first() else { return u64::MAX };
 
     // Load binary from VFS
-    let binary = match vfs().read_file(path) {
+    let binary = match vfs::global().read_file(path) {
         Some(data) => data,
         None => return u64::MAX,
     };
@@ -230,12 +380,18 @@ fn sys_exec(path_ptr: u64, path_len: u64, out_buf_ptr: u64, out_buf_max: u64) ->
     let saved_active = *PROCESS_ACTIVE.get();
     let saved_tss_rsp0 = unsafe { *gdt::tss_rsp0_ptr() };
 
-    // Enable output capture
-    *CAPTURE_BUF.get_mut() = Some(Vec::new());
+    // Enable output capture only when caller provides a buffer
+    let capture = out_buf_max > 0;
+    if capture {
+        *CAPTURE_BUF.get_mut() = Some(Vec::new());
+    }
 
     // Init fresh heap for child and run
     user_heap::init();
-    let exit_code = crate::process::run(&binary, &[path]);
+    let exit_code = crate::process::run(&binary, &args);
+
+    // Close any file descriptors the child left open
+    crate::fd::close_all(vfs::global());
 
     // Collect captured output
     let captured = core::mem::replace(CAPTURE_BUF.get_mut(), None).unwrap_or_default();
@@ -260,4 +416,55 @@ fn sys_exec(path_ptr: u64, path_len: u64, out_buf_ptr: u64, out_buf_max: u64) ->
     }
 
     ((exit_code as u64) << 32) | (copy_len as u64)
+}
+
+fn sys_readdir(path_ptr: u64, path_len: u64, buf_ptr: u64, buf_len: u64) -> u64 {
+    let slice = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, path_len as usize) };
+    let Ok(path) = core::str::from_utf8(slice) else { return u64::MAX };
+
+    let entries = match vfs::global().list(path) {
+        Ok(e) => e,
+        Err(_) => return u64::MAX,
+    };
+
+    // Serialize entries into buffer: type_u8 name_bytes \0 size_u64_le per entry
+    let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, buf_len as usize) };
+    let mut pos = 0;
+    for (name, size) in &entries {
+        let is_dir = name.ends_with('/');
+        let clean_name = if is_dir { &name[..name.len() - 1] } else { name.as_str() };
+        let needed = 1 + clean_name.len() + 1 + 8; // type + name + \0 + size
+        if pos + needed > buf.len() {
+            break;
+        }
+        buf[pos] = if is_dir { 2 } else { 1 };
+        pos += 1;
+        buf[pos..pos + clean_name.len()].copy_from_slice(clean_name.as_bytes());
+        pos += clean_name.len();
+        buf[pos] = 0;
+        pos += 1;
+        buf[pos..pos + 8].copy_from_slice(&size.to_le_bytes());
+        pos += 8;
+    }
+    pos as u64
+}
+
+fn sys_delete(path_ptr: u64, path_len: u64) -> u64 {
+    let slice = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, path_len as usize) };
+    let Ok(path) = core::str::from_utf8(slice) else { return u64::MAX };
+    if vfs::global().delete(path) { 0 } else { u64::MAX }
+}
+
+fn sys_chdir(path_ptr: u64, path_len: u64) -> u64 {
+    let slice = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, path_len as usize) };
+    let Ok(path) = core::str::from_utf8(slice) else { return u64::MAX };
+    if vfs::global().cd(path) { 0 } else { u64::MAX }
+}
+
+fn sys_getcwd(buf_ptr: u64, buf_len: u64) -> u64 {
+    let cwd = vfs::global().cwd();
+    let len = cwd.len().min(buf_len as usize);
+    let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, len) };
+    buf.copy_from_slice(&cwd.as_bytes()[..len]);
+    len as u64
 }

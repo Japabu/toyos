@@ -296,6 +296,12 @@ fn main() -> std::io::Result<()> {
 
     fs::create_dir_all("../initrd").ok();
 
+    // Detect toolchain changes — clean userland targets to avoid stale incremental artifacts
+    let sysroot_stamp = fs::read_to_string("../toolchain/.sysroot-stamp").unwrap_or_default();
+    let last_stamp_path = "target/.toolchain-stamp";
+    let last_stamp = fs::read_to_string(last_stamp_path).unwrap_or_default();
+    let toolchain_changed = sysroot_stamp != last_stamp && !sysroot_stamp.is_empty();
+
     // Build all userland apps (any directory under ../userland with a Cargo.toml)
     for entry in fs::read_dir("../userland")? {
         let entry = entry?;
@@ -305,6 +311,14 @@ fn main() -> std::io::Result<()> {
         }
         let name = entry.file_name();
         let name = name.to_str().unwrap();
+        if toolchain_changed {
+            eprintln!("toolchain changed: cleaning userland/{name}");
+            Command::new("cargo")
+                .args(&["clean"])
+                .current_dir(&path)
+                .status()
+                .ok();
+        }
         if !Command::new("cargo")
             .args(&["build", "--target", "x86_64-unknown-toyos"])
             .env("RUSTUP_TOOLCHAIN", "toyos")
@@ -317,6 +331,9 @@ fn main() -> std::io::Result<()> {
         }
         let binary = path.join(format!("target/x86_64-unknown-toyos/debug/{name}"));
         fs::copy(&binary, format!("../initrd/{name}"))?;
+    }
+    if !sysroot_stamp.is_empty() {
+        fs::write(last_stamp_path, &sysroot_stamp).ok();
     }
 
     generate_font_bitmap("../initrd");

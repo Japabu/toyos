@@ -3,6 +3,20 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use crate::sync::SyncCell;
+
+static VFS: SyncCell<Option<Vfs>> = SyncCell::new(None);
+
+/// Store the VFS in a global static (takes ownership).
+pub fn set_global(vfs: Vfs) {
+    *VFS.get_mut() = Some(vfs);
+}
+
+/// Get a mutable reference to the global VFS.
+pub fn global() -> &'static mut Vfs {
+    VFS.get_mut().as_mut().expect("VFS not initialized")
+}
+
 /// Trait abstracting filesystem operations so the VFS can hold
 /// heterogeneous mount points (initrd on SliceDisk, nvme on NvmeDisk).
 pub trait FileSystem {

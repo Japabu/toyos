@@ -81,17 +81,34 @@ impl Framebuffer {
         }
     }
 
-    pub fn clear(&self, color: Color) {
-        for y in 0..self.height {
+    /// Encode a color as a 4-byte pixel value (format-aware).
+    fn encode_pixel(&self, color: Color) -> [u8; 4] {
+        match self.pixel_format {
+            PixelFormat::Rgb => [color.r, color.g, color.b, 0],
+            PixelFormat::Bgr => [color.b, color.g, color.r, 0],
+        }
+    }
+
+    /// Fill a row range with a solid color using bulk writes.
+    fn fill_rows(&self, y_start: usize, y_end: usize, color: Color) {
+        let pixel = self.encode_pixel(color);
+        for y in y_start..y_end {
+            let row_offset = y * self.stride * 4;
             for x in 0..self.width {
-                self.put_pixel(x, y, color);
+                unsafe {
+                    let dst = self.addr.add(row_offset + x * 4);
+                    ptr::write_volatile(dst as *mut [u8; 4], pixel);
+                }
             }
         }
     }
 
+    pub fn clear(&self, color: Color) {
+        self.fill_rows(0, self.height, color);
+    }
+
     pub fn scroll_up(&self, pixel_rows: usize, bg: Color) {
-        let bytes_per_pixel = 4usize;
-        let row_bytes = self.stride * bytes_per_pixel;
+        let row_bytes = self.stride * 4;
 
         unsafe {
             let src = self.addr.add(pixel_rows * row_bytes);
@@ -100,11 +117,6 @@ impl Framebuffer {
             ptr::copy(src, dst, count);
         }
 
-        let clear_start_y = self.height - pixel_rows;
-        for y in clear_start_y..self.height {
-            for x in 0..self.width {
-                self.put_pixel(x, y, bg);
-            }
-        }
+        self.fill_rows(self.height - pixel_rows, self.height, bg);
     }
 }
