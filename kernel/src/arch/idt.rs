@@ -3,7 +3,7 @@ use core::arch::naked_asm;
 use super::cpu;
 use super::cpu::{outb, io_wait};
 use crate::arch::syscall;
-use crate::{elf, log};
+use crate::{symbols, log};
 
 use alloc::format;
 
@@ -220,7 +220,7 @@ exception_entry!(page_fault_entry, "14", error_code_cr2);
 // --- Exception handler ---
 
 fn format_addr(addr: u64) -> alloc::string::String {
-    if let Some((name, offset)) = elf::resolve_symbol(addr) {
+    if let Some((name, offset)) = symbols::resolve(addr) {
         format!("{:#x}  {}+{:#x}", addr, name, offset)
     } else {
         let kernel_base = unsafe { *(&raw const KERNEL_BASE) };
@@ -277,11 +277,11 @@ extern "C" fn exception_handler(
     let rsp = if is_user { user_rsp } else { regs.rbp }; // approximate for kernel
 
     // Instruction bytes at RIP (helps identify the faulting instruction)
-    if is_user && elf::is_valid_user_addr(rip) {
+    if is_user && symbols::is_valid_user_addr(rip) {
         let mut bytes_str = alloc::string::String::with_capacity(16 * 3);
         for i in 0..16u64 {
             let addr = rip + i;
-            if !elf::is_valid_user_addr(addr) { break; }
+            if !symbols::is_valid_user_addr(addr) { break; }
             let byte = unsafe { *(addr as *const u8) };
             if !bytes_str.is_empty() { bytes_str.push(' '); }
             bytes_str.push_str(&format!("{:02x}", byte));
@@ -305,9 +305,9 @@ extern "C" fn exception_handler(
         log::println("  Stack:");
         for i in 0..8u64 {
             let addr = user_rsp + i * 8;
-            if !elf::is_valid_user_addr(addr) && !elf::is_valid_user_addr(addr + 7) { break; }
+            if !symbols::is_valid_user_addr(addr) && !symbols::is_valid_user_addr(addr + 7) { break; }
             let val = unsafe { *(addr as *const u64) };
-            let sym = if let Some((name, off)) = elf::resolve_symbol(val) {
+            let sym = if let Some((name, off)) = symbols::resolve(val) {
                 format!("  <{}+{:#x}>", name, off)
             } else {
                 alloc::string::String::new()
@@ -325,7 +325,7 @@ extern "C" fn exception_handler(
             if rbp == 0 || rbp % 8 != 0 {
                 break;
             }
-            if !elf::is_valid_user_addr(rbp) || !elf::is_valid_user_addr(rbp + 8) {
+            if !symbols::is_valid_user_addr(rbp) || !symbols::is_valid_user_addr(rbp + 8) {
                 break;
             }
             let saved_rbp = unsafe { *(rbp as *const u64) };

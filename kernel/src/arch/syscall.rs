@@ -236,7 +236,7 @@ fn sys_exec(path_ptr: u64, path_len: u64, out_buf_ptr: u64, out_buf_max: u64) ->
 
     // Init fresh heap for child and run
     user_heap::init();
-    let exit_code = crate::elf::run(&binary, &[path]);
+    let exit_code = crate::process::run(&binary, &[path]);
 
     // Collect captured output
     let captured = unsafe {

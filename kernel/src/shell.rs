@@ -4,7 +4,7 @@ use alloc::vec::Vec;
 
 use crate::vfs::Vfs;
 use crate::drivers::{acpi, serial, xhci};
-use crate::{console, elf, keyboard, log};
+use crate::{console, process, keyboard, log};
 
 pub fn run(vfs: &mut Vfs) -> ! {
     console::write_str(&format!("{}> ", vfs.cwd()));
@@ -214,7 +214,7 @@ fn exec(
                     if !rest.is_empty() {
                         args.extend(rest.split_whitespace());
                     }
-                    let code = elf::run(&data, &args);
+                    let code = process::run(&data, &args);
                     crate::fd::close_all(vfs);
                     if code != 0 {
                         log::println(&format!("Process exited with code {}", code));
@@ -233,7 +233,7 @@ fn exec(
                 if !arg.is_empty() {
                     args.extend(arg.split_whitespace());
                 }
-                let code = elf::run(&data, &args);
+                let code = process::run(&data, &args);
                 crate::fd::close_all(vfs);
                 if code != 0 {
                     log::println(&format!("Process exited with code {}", code));

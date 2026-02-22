@@ -9,7 +9,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use kernel::arch::{gdt, idt, paging, syscall};
 use kernel::drivers::{acpi, framebuffer, nvme, pci, serial, xhci};
-use kernel::{allocator, clock, console, elf, log, ramdisk, shell, vfs, KernelArgs, MemoryMapEntry};
+use kernel::{allocator, clock, console, log, process, ramdisk, shell, symbols, vfs, KernelArgs, MemoryMapEntry};
 use tyfs::Disk;
 use core::fmt::Write;
 
@@ -131,7 +131,7 @@ pub unsafe extern "sysv64" fn _start(kernel_args: KernelArgs) -> ! {
                 kernel_args.kernel_elf_size as usize,
             )
         };
-        elf::load_kernel_symbols(kernel_elf, kernel_args.kernel_memory_addr);
+        symbols::load_kernel(kernel_elf, kernel_args.kernel_memory_addr);
     }
 
     syscall::init();
@@ -164,7 +164,7 @@ pub unsafe extern "sysv64" fn _start(kernel_args: KernelArgs) -> ! {
         log::println(&format!("init: running {}", path));
         let data = vfs.read_file(&path)
             .unwrap_or_else(|| panic!("init: {} not found", path));
-        elf::run(&data, &args);
+        process::run(&data, &args);
     }
 
     // Drop into interactive shell
