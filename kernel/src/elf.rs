@@ -7,7 +7,9 @@ use alloc::format;
 use elf::ElfBytes;
 use elf::endian::AnyEndian;
 use elf::abi::{PT_LOAD, ET_DYN, EM_X86_64, R_X86_64_RELATIVE, STT_FUNC};
-use crate::{gdt, log, paging, serial, syscall};
+use crate::arch::{gdt, paging, syscall};
+use crate::drivers::serial;
+use crate::log;
 
 const USER_STACK_SIZE: usize = 64 * 1024; // 64 KB
 
@@ -276,7 +278,7 @@ pub fn run(data: &[u8], args: &[&str]) -> i32 {
     }
 
     // Set up user heap for syscall allocations
-    syscall::init_user_heap();
+    crate::user_heap::init();
 
     // Write argc/argv onto the user stack (Linux-style layout).
     // Stack grows down from stack_top. We place:

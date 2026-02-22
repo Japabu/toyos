@@ -1,7 +1,9 @@
-use core::arch::{asm, naked_asm};
+use core::arch::naked_asm;
 
-use crate::io::{outb, io_wait};
-use crate::{elf, log, syscall};
+use super::cpu;
+use crate::arch::io::{outb, io_wait};
+use crate::arch::syscall;
+use crate::{elf, log};
 
 use alloc::format;
 
@@ -135,125 +137,85 @@ pub fn init() {
             base: &raw const IDT as *const Idt as u64,
         };
 
-        asm!("lidt [{}]", in(reg) &ptr);
-        asm!("sti");
+        cpu::lidt(&ptr as *const IdtPointer as *const u8);
+        cpu::enable_interrupts();
     }
 }
 
 // --- Exception entry stubs ---
-// For exceptions with error codes, the CPU pushes (on the kernel stack, since
-// IST=0 and TSS.RSP0 is set):
+// For exceptions with error codes, the CPU pushes (on the kernel stack):
 //   [SS] [RSP] [RFLAGS] [CS] [RIP] [error_code] <- RSP
-//
-// For exceptions WITHOUT error codes (#UD), we push a dummy 0 to unify the
-// stack layout.
-//
-// We save all GPRs, then call the handler with:
+// For exceptions WITHOUT error codes, we push a dummy 0 to unify the layout.
+// After saving all GPRs, the handler is called with:
 //   rdi=vector, rsi=regs_ptr, rdx=error_code, rcx=rip, r8=cs, r9=fault_addr
 
-#[unsafe(naked)]
-extern "C" fn ud_entry() {
-    naked_asm!(
-        // #UD has no error code — push dummy 0 to unify stack layout
-        "push 0",
-
-        "push r15",
-        "push r14",
-        "push r13",
-        "push r12",
-        "push r11",
-        "push r10",
-        "push r9",
-        "push r8",
-        "push rbp",
-        "push rdi",
-        "push rsi",
-        "push rdx",
-        "push rcx",
-        "push rbx",
-        "push rax",
-
-        "mov rdi, 6",               // vector
-        "mov rsi, rsp",             // regs ptr (SavedRegs on stack)
-        "mov rdx, [rsp + 15*8]",    // error_code (dummy 0)
-        "mov rcx, [rsp + 16*8]",    // RIP
-        "mov r8,  [rsp + 17*8]",    // CS
-        "xor r9, r9",               // no fault address
-
-        "call {handler}",
-        "cli",
-        "hlt",
-        handler = sym exception_handler,
-    );
+macro_rules! exception_entry {
+    // No error code, no fault address (e.g. #UD)
+    ($name:ident, $vector:literal, no_error_code) => {
+        #[unsafe(naked)]
+        extern "C" fn $name() {
+            naked_asm!(
+                "push 0", // dummy error code
+                "push r15", "push r14", "push r13", "push r12",
+                "push r11", "push r10", "push r9",  "push r8",
+                "push rbp", "push rdi", "push rsi", "push rdx",
+                "push rcx", "push rbx", "push rax",
+                concat!("mov rdi, ", $vector),
+                "mov rsi, rsp",
+                "mov rdx, [rsp + 15*8]",
+                "mov rcx, [rsp + 16*8]",
+                "mov r8,  [rsp + 17*8]",
+                "xor r9, r9",
+                "call {handler}", "cli", "hlt",
+                handler = sym exception_handler,
+            );
+        }
+    };
+    // Has error code, no fault address (e.g. #GP)
+    ($name:ident, $vector:literal, error_code) => {
+        #[unsafe(naked)]
+        extern "C" fn $name() {
+            naked_asm!(
+                "push r15", "push r14", "push r13", "push r12",
+                "push r11", "push r10", "push r9",  "push r8",
+                "push rbp", "push rdi", "push rsi", "push rdx",
+                "push rcx", "push rbx", "push rax",
+                concat!("mov rdi, ", $vector),
+                "mov rsi, rsp",
+                "mov rdx, [rsp + 15*8]",
+                "mov rcx, [rsp + 16*8]",
+                "mov r8,  [rsp + 17*8]",
+                "xor r9, r9",
+                "call {handler}", "cli", "hlt",
+                handler = sym exception_handler,
+            );
+        }
+    };
+    // Has error code + reads CR2 (page fault)
+    ($name:ident, $vector:literal, error_code_cr2) => {
+        #[unsafe(naked)]
+        extern "C" fn $name() {
+            naked_asm!(
+                "push r15", "push r14", "push r13", "push r12",
+                "push r11", "push r10", "push r9",  "push r8",
+                "push rbp", "push rdi", "push rsi", "push rdx",
+                "push rcx", "push rbx", "push rax",
+                concat!("mov rdi, ", $vector),
+                "mov rsi, rsp",
+                "mov rdx, [rsp + 15*8]",
+                "mov rcx, [rsp + 16*8]",
+                "mov r8,  [rsp + 17*8]",
+                "mov r9, cr2",
+                "call {handler}", "cli", "hlt",
+                handler = sym exception_handler,
+            );
+        }
+    };
 }
 
-#[unsafe(naked)]
-extern "C" fn gpf_entry() {
-    naked_asm!(
-        // Save all GPRs (reverse order so SavedRegs struct matches)
-        "push r15",
-        "push r14",
-        "push r13",
-        "push r12",
-        "push r11",
-        "push r10",
-        "push r9",
-        "push r8",
-        "push rbp",
-        "push rdi",
-        "push rsi",
-        "push rdx",
-        "push rcx",
-        "push rbx",
-        "push rax",
-
-        // Set up handler args
-        "mov rdi, 13",              // vector
-        "mov rsi, rsp",             // regs ptr (SavedRegs on stack)
-        "mov rdx, [rsp + 15*8]",    // error_code (past 15 saved regs)
-        "mov rcx, [rsp + 16*8]",    // RIP
-        "mov r8,  [rsp + 17*8]",    // CS
-        "xor r9, r9",               // no fault address for #GP
-
-        "call {handler}",
-        "cli",
-        "hlt",
-        handler = sym exception_handler,
-    );
-}
-
-#[unsafe(naked)]
-extern "C" fn page_fault_entry() {
-    naked_asm!(
-        "push r15",
-        "push r14",
-        "push r13",
-        "push r12",
-        "push r11",
-        "push r10",
-        "push r9",
-        "push r8",
-        "push rbp",
-        "push rdi",
-        "push rsi",
-        "push rdx",
-        "push rcx",
-        "push rbx",
-        "push rax",
-
-        "mov rdi, 14",              // vector
-        "mov rsi, rsp",             // regs ptr
-        "mov rdx, [rsp + 15*8]",    // error_code
-        "mov rcx, [rsp + 16*8]",    // RIP
-        "mov r8,  [rsp + 17*8]",    // CS
-        "mov r9, cr2",              // fault address
-
-        "call {handler}",
-        "cli",
-        "hlt",
-        handler = sym exception_handler,
-    );
-}
+exception_entry!(ud_entry,         "6",  no_error_code);
+exception_entry!(gpf_entry,        "13", error_code);
+exception_entry!(page_fault_entry, "14", error_code_cr2);
 
 // --- Exception handler ---
 
@@ -379,8 +341,6 @@ extern "C" fn exception_handler(
     if is_user {
         syscall::kill_process(-1);
     } else {
-        loop {
-            unsafe { asm!("cli; hlt"); }
-        }
+        cpu::halt();
     }
 }

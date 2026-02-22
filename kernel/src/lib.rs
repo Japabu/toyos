@@ -2,45 +2,33 @@
 #![feature(allocator_api)]
 extern crate alloc;
 
-pub mod log;
+#[cfg(not(test))]
+pub mod arch;
+pub mod drivers;
 
-#[cfg(not(test))]
-pub mod io;
-#[cfg(not(test))]
-pub mod serial;
-#[cfg(not(test))]
-pub mod framebuffer;
+pub mod log;
+pub mod allocator;
+
 #[cfg(not(test))]
 pub mod font;
 #[cfg(not(test))]
 pub mod console;
 #[cfg(not(test))]
-pub mod gdt;
-#[cfg(not(test))]
-pub mod interrupts;
-#[cfg(not(test))]
 pub mod keyboard;
-pub mod acpi;
-pub mod pci;
-pub mod nvme;
 #[cfg(not(test))]
 pub mod ramdisk;
-pub mod xhci;
-pub mod allocator;
 #[cfg(not(test))]
 pub mod vfs;
 #[cfg(not(test))]
 pub mod shell;
 #[cfg(not(test))]
-pub mod syscall;
-#[cfg(not(test))]
 pub mod elf;
-#[cfg(not(test))]
-pub mod paging;
 #[cfg(not(test))]
 pub mod clock;
 #[cfg(not(test))]
 pub mod fd;
+#[cfg(not(test))]
+pub mod user_heap;
 
 #[repr(C)]
 #[derive(Debug)]

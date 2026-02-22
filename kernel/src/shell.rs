@@ -3,7 +3,8 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::vfs::Vfs;
-use crate::{acpi, console, elf, keyboard, log, serial, xhci};
+use crate::drivers::{acpi, serial, xhci};
+use crate::{console, elf, keyboard, log};
 
 pub fn run(vfs: &mut Vfs) -> ! {
     console::write_str(&format!("{}> ", vfs.cwd()));

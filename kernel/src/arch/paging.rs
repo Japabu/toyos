@@ -1,9 +1,9 @@
 use core::alloc::Layout;
-use core::arch::asm;
 use core::ptr::null_mut;
 
 use alloc::alloc::alloc_zeroed;
 
+use super::cpu;
 use crate::MemoryMapEntry;
 
 const PAGE_PRESENT: u64 = 1 << 0;
@@ -61,7 +61,7 @@ pub fn init(memory_map: &[MemoryMapEntry]) {
 
     unsafe {
         PML4 = pml4;
-        asm!("mov cr3, {}", in(reg) pml4 as u64);
+        cpu::write_cr3(pml4 as u64);
     }
 }
 
@@ -147,7 +147,7 @@ pub fn map_user(addr: u64, size: u64) {
     }
 
     // Flush TLB
-    unsafe { asm!("mov {0}, cr3", "mov cr3, {0}", out(reg) _); }
+    cpu::flush_tlb();
 }
 
 /// Identity-map an MMIO region as kernel-only using 2MB large pages.
@@ -178,7 +178,7 @@ pub fn map_kernel(addr: u64, size: u64) {
     }
 
     // Flush TLB
-    unsafe { asm!("mov {0}, cr3", "mov cr3, {0}", out(reg) _); }
+    cpu::flush_tlb();
 }
 
 /// Remove user-accessible flag from a physical address range.
@@ -221,5 +221,5 @@ pub fn unmap_user(addr: u64, size: u64) {
     }
 
     // Flush TLB
-    unsafe { asm!("mov {0}, cr3", "mov cr3, {0}", out(reg) _); }
+    cpu::flush_tlb();
 }

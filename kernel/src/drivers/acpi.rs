@@ -64,12 +64,10 @@ pub fn shutdown() -> ! {
 
     if pm1a != 0 {
         let val = (slp_typ << 10) | SLP_EN;
-        crate::io::outw(pm1a, val);
+        crate::arch::io::outw(pm1a, val);
     }
 
-    loop {
-        unsafe { core::arch::asm!("cli; hlt"); }
-    }
+    crate::arch::cpu::halt();
 }
 
 const SLP_EN: u16 = 1 << 13;
@@ -102,6 +100,16 @@ fn find_table(xsdt: *const u8, signature: &[u8; 4]) -> Option<*const u8> {
     }
 
     None
+}
+
+/// Given the RSDP address, parse XSDT → HPET table → return HPET MMIO base address.
+pub fn find_hpet_base(rsdp_addr: u64) -> Option<u64> {
+    let xsdt = get_xsdt_addr(rsdp_addr as *const u8);
+    let hpet = find_table(xsdt, b"HPET")?;
+    // HPET table: 36B SDT header + 4B Event Timer Block ID + 4B GAS header + 8B address
+    let base = unsafe { read_unaligned(hpet.add(44) as *const u64) };
+    log::println(&format!("ACPI: HPET at {:#x}", base));
+    Some(base)
 }
 
 /// Read ECAM base address from the first MCFG configuration entry.

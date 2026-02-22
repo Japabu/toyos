@@ -1,6 +1,8 @@
 use core::arch::asm;
 use core::mem::size_of;
 
+use super::cpu;
+
 // 64-bit TSS (104 bytes)
 #[repr(C, packed)]
 pub struct Tss {
@@ -66,9 +68,7 @@ const TSS_SEL: u16 = 0x28;
 pub fn init() {
     unsafe {
         // Set TSS.RSP0 to current kernel stack (for interrupts from ring 3)
-        let rsp: u64;
-        asm!("mov {}, rsp", out(reg) rsp);
-        core::ptr::write_unaligned(&raw mut TSS.rsp0, rsp);
+        core::ptr::write_unaligned(&raw mut TSS.rsp0, cpu::read_rsp());
 
         // Build 16-byte TSS descriptor
         let tss_addr = &raw const TSS as u64;
@@ -90,15 +90,14 @@ pub fn init() {
             base: (&raw const GDT.entries) as *const u64 as u64,
         };
 
+        // Load GDT and reload CS via far return (structural asm — can't be wrapped)
         asm!(
             "lgdt [{}]",
-            // Reload CS via far return
             "push {cs}",
             "lea {tmp}, [rip + 2f]",
             "push {tmp}",
             "retfq",
             "2:",
-            // Reload data segment registers
             "mov ds, {ds:x}",
             "mov es, {ds:x}",
             "mov fs, {ds:x}",
@@ -110,8 +109,7 @@ pub fn init() {
             tmp = lateout(reg) _,
         );
 
-        // Load TSS
-        asm!("ltr {0:x}", in(reg) TSS_SEL as u64);
+        cpu::ltr(TSS_SEL);
     }
 }
 

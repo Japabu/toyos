@@ -7,7 +7,9 @@ use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
-use kernel::*;
+use kernel::arch::{gdt, idt, paging, syscall};
+use kernel::drivers::{acpi, framebuffer, nvme, pci, serial, xhci};
+use kernel::{allocator, clock, console, elf, log, ramdisk, shell, vfs, KernelArgs, MemoryMapEntry};
 use tyfs::Disk;
 use core::fmt::Write;
 
@@ -19,7 +21,7 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 
 #[no_mangle]
 pub unsafe extern "sysv64" fn _start(kernel_args: KernelArgs) -> ! {
-    serial::init_serial();
+    serial::init();
     let _ = write!(serial::SerialWriter, "{:?}\n", kernel_args);
 
     // Initialize allocator first — no allocations before this point
@@ -89,8 +91,8 @@ pub unsafe extern "sysv64" fn _start(kernel_args: KernelArgs) -> ! {
     let ecam_base = acpi::find_ecam_base(kernel_args.rsdp_addr)
         .expect("ACPI: failed to find ECAM base address");
     pci::enumerate(ecam_base);
-    let nvme = nvme::init(ecam_base).expect("NVMe: no controller found");
-    let mut disk = nvme::NvmeDisk::new(nvme);
+    let nvme_ctrl = nvme::init(ecam_base).expect("NVMe: no controller found");
+    let mut disk = nvme::NvmeDisk::new(nvme_ctrl);
     let total_bytes = disk.total_bytes();
     // Peek at byte 0 to check for existing TYFS magic
     let mut magic = [0u8; 4];
@@ -110,13 +112,16 @@ pub unsafe extern "sysv64" fn _start(kernel_args: KernelArgs) -> ! {
 
     acpi::init_power(kernel_args.rsdp_addr);
 
-    // Calibrate TSC clock (needs PIT, do before entering userland)
-    clock::init();
+    // Initialize HPET clock
+    let hpet_base = acpi::find_hpet_base(kernel_args.rsdp_addr)
+        .expect("ACPI: HPET not found");
+    paging::map_kernel(hpet_base, 0x1000);
+    clock::init(hpet_base);
 
     // Set up GDT (UEFI's may be in reclaimable memory) and interrupts
     gdt::init();
-    interrupts::init();
-    interrupts::set_kernel_base(kernel_args.kernel_memory_addr);
+    idt::init();
+    idt::set_kernel_base(kernel_args.kernel_memory_addr);
 
     // Load kernel symbols for crash diagnostics
     if kernel_args.kernel_elf_size > 0 {

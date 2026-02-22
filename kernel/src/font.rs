@@ -1,6 +1,6 @@
 use alloc::vec::Vec;
 
-use crate::framebuffer::{Color, Framebuffer};
+use crate::drivers::framebuffer::{Color, Framebuffer};
 
 pub const WIDTH: usize = 8;
 pub const HEIGHT: usize = 16;
