@@ -267,12 +267,58 @@ fn load_shared_lib(data: &[u8]) -> Option<LoadedLib> {
 struct Symbol {
     addr: u64,
     size: u64,
-    name_start: u32, // offset into SYMBOL_NAMES
+    name_start: u32, // offset into associated names vec
 }
 
-// Global symbol data for the current process
-static mut SYMBOLS: Vec<Symbol> = Vec::new();
-static mut SYMBOL_NAMES: Vec<u8> = Vec::new();
+struct SymbolTable {
+    symbols: Vec<Symbol>,
+    names: Vec<u8>,
+}
+
+impl SymbolTable {
+    const fn new() -> Self {
+        Self { symbols: Vec::new(), names: Vec::new() }
+    }
+
+    fn clear(&mut self) {
+        self.symbols.clear();
+        self.names.clear();
+    }
+
+    fn resolve(&self, addr: u64) -> Option<(String, u64)> {
+        if self.symbols.is_empty() { return None; }
+
+        // Binary search for the last symbol with addr <= target
+        let mut lo = 0usize;
+        let mut hi = self.symbols.len();
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.symbols[mid].addr <= addr {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+
+        if lo == 0 { return None; }
+        let sym = &self.symbols[lo - 1];
+        let offset = addr - sym.addr;
+
+        if sym.size > 0 && offset >= sym.size { return None; }
+
+        let name_start = sym.name_start as usize;
+        let name_end = self.names[name_start..].iter().position(|&b| b == 0)
+            .map(|i| name_start + i)
+            .unwrap_or(self.names.len());
+        let raw = unsafe { core::str::from_utf8_unchecked(&self.names[name_start..name_end]) };
+        Some((demangle(raw), offset))
+    }
+}
+
+// Userland process symbols (cleared between process runs)
+static mut PROCESS_SYMS: SymbolTable = SymbolTable::new();
+// Kernel symbols (loaded once at boot, never cleared)
+static mut KERNEL_SYMS: SymbolTable = SymbolTable::new();
 // Memory range of loaded program (for backtrace address validation)
 static mut PROG_BASE: u64 = 0;
 static mut PROG_END: u64 = 0;
@@ -281,8 +327,7 @@ static mut STACK_END: u64 = 0;
 
 pub fn clear_symbols() {
     unsafe {
-        (&raw mut SYMBOLS).as_mut().unwrap().clear();
-        (&raw mut SYMBOL_NAMES).as_mut().unwrap().clear();
+        (&raw mut PROCESS_SYMS).as_mut().unwrap().clear();
         (&raw mut PROG_BASE).write(0);
         (&raw mut PROG_END).write(0);
         (&raw mut STACK_BASE).write(0);
@@ -290,96 +335,19 @@ pub fn clear_symbols() {
     }
 }
 
-/// Demangle a Rust symbol name. Handles the legacy `_ZN...E` mangling scheme.
+/// Demangle a Rust symbol name (supports both legacy `_ZN...E` and v0 `_R...` mangling).
 fn demangle(mangled: &str) -> String {
-    // Legacy Rust mangling: _ZN {len}{component}... E
-    if !mangled.starts_with("_ZN") || !mangled.ends_with('E') {
-        return String::from(mangled);
-    }
-
-    let inner = &mangled[3..mangled.len() - 1]; // strip _ZN and E
-    let mut result = String::new();
-    let bytes = inner.as_bytes();
-    let mut i = 0;
-
-    while i < bytes.len() {
-        // Parse decimal length
-        let start = i;
-        while i < bytes.len() && bytes[i].is_ascii_digit() {
-            i += 1;
-        }
-        if start == i {
-            // Not a valid component — return original
-            return String::from(mangled);
-        }
-        let len: usize = match inner[start..i].parse() {
-            Ok(n) => n,
-            Err(_) => return String::from(mangled),
-        };
-        if i + len > bytes.len() {
-            return String::from(mangled);
-        }
-        let component = &inner[i..i + len];
-        i += len;
-
-        // Skip hash suffix (e.g. "h1234abcdef567890")
-        if i == bytes.len() && component.len() == 17 && component.starts_with('h')
-            && component[1..].chars().all(|c| c.is_ascii_hexdigit())
-        {
-            break;
-        }
-
-        if !result.is_empty() {
-            result.push_str("::");
-        }
-        result.push_str(component);
-    }
-
-    if result.is_empty() {
-        String::from(mangled)
-    } else {
-        result
-    }
+    format!("{:#}", rustc_demangle::demangle(mangled))
 }
 
-/// Look up a symbol by runtime address. Returns (demangled_name, offset_from_symbol_start).
+/// Look up a symbol by runtime address (checks both process and kernel symbols).
 pub fn resolve_symbol(addr: u64) -> Option<(String, u64)> {
-    let symbols = unsafe { &*(&raw const SYMBOLS) };
-    let names = unsafe { &*(&raw const SYMBOL_NAMES) };
-    if symbols.is_empty() {
-        return None;
+    let process = unsafe { &*(&raw const PROCESS_SYMS) };
+    if let Some(result) = process.resolve(addr) {
+        return Some(result);
     }
-
-    // Binary search for the last symbol with addr <= target
-    let mut lo = 0usize;
-    let mut hi = symbols.len();
-    while lo < hi {
-        let mid = lo + (hi - lo) / 2;
-        if symbols[mid].addr <= addr {
-            lo = mid + 1;
-        } else {
-            hi = mid;
-        }
-    }
-
-    if lo == 0 {
-        return None;
-    }
-    let sym = &symbols[lo - 1];
-    let offset = addr - sym.addr;
-
-    // If the symbol has a known size, only match within that range
-    if sym.size > 0 && offset >= sym.size {
-        return None;
-    }
-
-    let name_start = sym.name_start as usize;
-    // Find null terminator
-    let name_end = names[name_start..].iter().position(|&b| b == 0)
-        .map(|i| name_start + i)
-        .unwrap_or(names.len());
-    let raw = unsafe { core::str::from_utf8_unchecked(&names[name_start..name_end]) };
-    Some((demangle(raw), offset))
+    let kernel = unsafe { &*(&raw const KERNEL_SYMS) };
+    kernel.resolve(addr)
 }
 
 /// Check if an address is in user-accessible memory (program or stack).
@@ -391,16 +359,13 @@ pub fn is_valid_user_addr(addr: u64) -> bool {
     (addr >= prog_base && addr < prog_end) || (addr >= stack_base && addr < stack_end)
 }
 
-/// Parse .symtab and its associated .strtab from the raw ELF file bytes.
-fn load_symbols(data: &[u8], ehdr: &Elf64Ehdr, base: u64) {
-    if ehdr.e_shoff == 0 || ehdr.e_shnum == 0 {
-        return;
-    }
+/// Parse .symtab from raw ELF bytes into a SymbolTable.
+fn parse_symtab(data: &[u8], ehdr: &Elf64Ehdr, base: u64, table: &mut SymbolTable) {
+    table.clear();
 
+    if ehdr.e_shoff == 0 || ehdr.e_shnum == 0 { return; }
     let shent = ehdr.e_shentsize as usize;
-    if shent < core::mem::size_of::<Elf64Shdr>() {
-        return;
-    }
+    if shent < core::mem::size_of::<Elf64Shdr>() { return; }
 
     // Find SHT_SYMTAB section
     let mut symtab_shdr: Option<&Elf64Shdr> = None;
@@ -430,10 +395,7 @@ fn load_symbols(data: &[u8], ehdr: &Elf64Ehdr, base: u64) {
     let strtab_size = strtab_shdr.sh_size as usize;
     if strtab_start + strtab_size > data.len() { return; }
 
-    // Copy string table
-    let names = unsafe { &mut *(&raw mut SYMBOL_NAMES) };
-    names.clear();
-    names.extend_from_slice(&data[strtab_start..strtab_start + strtab_size]);
+    table.names.extend_from_slice(&data[strtab_start..strtab_start + strtab_size]);
 
     // Parse symbol entries
     let sym_start = symtab.sh_offset as usize;
@@ -443,15 +405,11 @@ fn load_symbols(data: &[u8], ehdr: &Elf64Ehdr, base: u64) {
     if sym_start + sym_size > data.len() { return; }
 
     let count = sym_size / sym_ent;
-    let symbols = unsafe { &mut *(&raw mut SYMBOLS) };
-    symbols.clear();
-
     for i in 0..count {
         let off = sym_start + i * sym_ent;
         let sym = unsafe { read_struct::<Elf64Sym>(data, off) };
-        // Only include function symbols with nonzero address
         if sym.st_type() == STT_FUNC && sym.st_value != 0 {
-            symbols.push(Symbol {
+            table.symbols.push(Symbol {
                 addr: base + sym.st_value,
                 size: sym.st_size,
                 name_start: sym.st_name,
@@ -459,9 +417,25 @@ fn load_symbols(data: &[u8], ehdr: &Elf64Ehdr, base: u64) {
         }
     }
 
-    // Sort by address for binary search
-    symbols.sort_unstable_by_key(|s| s.addr);
-    serial::println(&format!("ELF: loaded {} function symbols", symbols.len()));
+    table.symbols.sort_unstable_by_key(|s| s.addr);
+}
+
+/// Load userland process symbols from raw ELF bytes.
+fn load_symbols(data: &[u8], ehdr: &Elf64Ehdr, base: u64) {
+    let table = unsafe { &mut *(&raw mut PROCESS_SYMS) };
+    parse_symtab(data, ehdr, base, table);
+    serial::println(&format!("ELF: loaded {} function symbols", table.symbols.len()));
+}
+
+/// Load kernel symbols from raw ELF bytes. Called once at boot.
+pub fn load_kernel_symbols(data: &[u8], base: u64) {
+    if data.len() < core::mem::size_of::<Elf64Ehdr>() { return; }
+    let ehdr = unsafe { read_struct::<Elf64Ehdr>(data, 0) };
+    if ehdr.e_ident[0..4] != ELF_MAGIC { return; }
+
+    let table = unsafe { &mut *(&raw mut KERNEL_SYMS) };
+    parse_symtab(data, ehdr, base, table);
+    serial::println(&format!("Kernel: loaded {} function symbols", table.symbols.len()));
 }
 
 unsafe fn read_struct<T>(data: &[u8], offset: usize) -> &T {
@@ -469,7 +443,7 @@ unsafe fn read_struct<T>(data: &[u8], offset: usize) -> &T {
     &*(data.as_ptr().add(offset) as *const T)
 }
 
-pub fn run(data: &[u8]) -> i32 {
+pub fn run(data: &[u8], args: &[&str]) -> i32 {
     // Validate ELF header
     if data.len() < core::mem::size_of::<Elf64Ehdr>() {
         log::println("ELF: file too small");
@@ -680,12 +654,40 @@ pub fn run(data: &[u8]) -> i32 {
     // Set up user heap for syscall allocations
     syscall::init_user_heap();
 
-    // Execute the program
-    // x86_64 SysV ABI: RSP must be 16n+8 at function entry (as if `call` pushed a return address).
-    // iretq doesn't push a return address, so subtract 8 to simulate it.
-    let stack_top = stack_top - 8;
-    serial::println(&format!("ELF: entry={:#x}, stack={:#x}", entry, stack_top));
-    let exit_code = execute(entry, stack_top);
+    // Write argc/argv onto the user stack (Linux-style layout).
+    // Stack grows down from stack_top. We place:
+    //   1. Null-terminated arg strings at the top
+    //   2. argc (u64) + argv[] pointer array + NULL below, 16-byte aligned
+    // RSP will point to argc on entry.
+    let mut sp = stack_top;
+
+    // 1. Write arg strings at top of stack, collect their user-space addresses
+    let mut argv_ptrs: Vec<u64> = Vec::with_capacity(args.len());
+    for arg in args.iter().rev() {
+        sp -= (arg.len() + 1) as u64; // +1 for null terminator
+        unsafe {
+            core::ptr::copy_nonoverlapping(arg.as_ptr(), sp as *mut u8, arg.len());
+            *((sp + arg.len() as u64) as *mut u8) = 0; // null terminator
+        }
+        argv_ptrs.push(sp);
+    }
+    argv_ptrs.reverse(); // restore original order
+
+    // 2. Reserve space for metadata (argc + argv[0..n] + NULL), align to 16
+    let metadata_qwords = args.len() + 2; // argc + argv pointers + NULL
+    sp = (sp - metadata_qwords as u64 * 8) & !15;
+
+    // 3. Write argc at sp, argv pointers at sp+8.., NULL terminator at end
+    unsafe {
+        *(sp as *mut u64) = args.len() as u64; // argc
+        for (i, ptr) in argv_ptrs.iter().enumerate() {
+            *((sp + 8 + i as u64 * 8) as *mut u64) = *ptr;
+        }
+        *((sp + 8 + args.len() as u64 * 8) as *mut u64) = 0; // NULL
+    }
+
+    serial::println(&format!("ELF: entry={:#x}, stack={:#x}, argc={}", entry, sp, args.len()));
+    let exit_code = execute(entry, sp);
 
     // Clear symbols on process exit
     clear_symbols();

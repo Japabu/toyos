@@ -3,7 +3,7 @@ use std::process::Command;
 fn main() {
     Command::new("qemu-system-x86_64")
         .arg("-machine").arg("q35")
-        .arg("-cpu").arg("qemu64")
+        .arg("-cpu").arg("qemu64,+rdrand")
         .arg("-m").arg("1G")
         // Flash the OVMF UEFI firmware
         .arg("-drive").arg("if=pflash,format=raw,unit=0,file=ovmf/OVMF_CODE-pure-efi.fd,readonly=on")

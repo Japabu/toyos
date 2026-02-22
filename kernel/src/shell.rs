@@ -201,18 +201,45 @@ fn exec(
         "run" => {
             if arg.is_empty() {
                 log::println("Usage: run <file>");
-            } else if let Some(data) = vfs.read_file(arg) {
-                let code = elf::run(&data);
+            } else {
+                // Split arg into file + remaining args
+                let (file, rest) = match arg.find(' ') {
+                    Some(pos) => (&arg[..pos], arg[pos + 1..].trim()),
+                    None => (arg, ""),
+                };
+                if let Some(data) = vfs.read_file(file) {
+                    let mut args: Vec<&str> = Vec::new();
+                    args.push(file);
+                    if !rest.is_empty() {
+                        args.extend(rest.split_whitespace());
+                    }
+                    let code = elf::run(&data, &args);
+                    crate::fd::close_all(vfs);
+                    if code != 0 {
+                        log::println(&format!("Process exited with code {}", code));
+                    }
+                } else {
+                    log::println(&format!("{}: file not found", file));
+                }
+            }
+        }
+        _ => {
+            // PATH: try to find the command in /initrd/
+            let path = format!("/initrd/{}", cmd);
+            if let Some(data) = vfs.read_file(&path) {
+                let mut args: Vec<&str> = Vec::new();
+                args.push(cmd);
+                if !arg.is_empty() {
+                    args.extend(arg.split_whitespace());
+                }
+                let code = elf::run(&data, &args);
                 crate::fd::close_all(vfs);
                 if code != 0 {
                     log::println(&format!("Process exited with code {}", code));
                 }
             } else {
-                log::println(&format!("{}: file not found", arg));
+                log::println(&format!("Unknown command: {}", cmd));
             }
-        }
-        _ => {
-            log::println(&format!("Unknown command: {}", cmd));
         }
     }
 }

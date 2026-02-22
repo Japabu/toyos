@@ -62,6 +62,8 @@ pub struct KernelArgs {
     pub framebuffer_pixel_format: u32,
     pub init_program_addr: u64,
     pub init_program_len: u64,
+    pub kernel_elf_addr: u64,
+    pub kernel_elf_size: u64,
 }
 
 #[repr(C)]

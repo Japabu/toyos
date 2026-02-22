@@ -1,4 +1,7 @@
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    println!("args: {:?}", args);
+
     println!("--- alloc/free test ---");
 
     // Allocate a vec, print its address, drop it

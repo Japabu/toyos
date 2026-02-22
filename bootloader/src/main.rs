@@ -51,6 +51,8 @@ pub struct KernelArgs {
     pub framebuffer_pixel_format: u32,
     pub init_program_addr: u64,
     pub init_program_len: u64,
+    pub kernel_elf_addr: u64,
+    pub kernel_elf_size: u64,
 }
 
 #[repr(C)]
@@ -209,9 +211,9 @@ fn init_gop(system_table: &SystemTable<Boot>) -> FramebufferInfo {
     }
 }
 
-static INIT_PROGRAM: &[u8] = b"/initrd/hello";
+static INIT_PROGRAM: &[u8] = b"hello foo bar";
 
-fn start_kernel(kernel: LoadedKernel, initrd: vec::Vec<u8>, rsdp_addr: u64, fb: FramebufferInfo, system_table: SystemTable<Boot>) -> ! {
+fn start_kernel(kernel: LoadedKernel, kernel_elf_bytes: vec::Vec<u8>, initrd: vec::Vec<u8>, rsdp_addr: u64, fb: FramebufferInfo, system_table: SystemTable<Boot>) -> ! {
     // Estimate memory map size
     let mms = system_table.boot_services().memory_map_size();
     let memory_map_entry_count = mms.map_size / mms.entry_size + 8;
@@ -246,11 +248,14 @@ fn start_kernel(kernel: LoadedKernel, initrd: vec::Vec<u8>, rsdp_addr: u64, fb: 
         framebuffer_pixel_format: fb.pixel_format,
         init_program_addr: INIT_PROGRAM.as_ptr() as u64,
         init_program_len: INIT_PROGRAM.len() as u64,
+        kernel_elf_addr: kernel_elf_bytes.as_ptr() as u64,
+        kernel_elf_size: kernel_elf_bytes.len() as u64,
     };
     let entry_addr = kernel.memory.as_ptr() as usize + kernel.entry_offset;
 
     mem::forget(memory_map);
     mem::forget(kernel.memory);
+    mem::forget(kernel_elf_bytes);
     mem::forget(initrd);
 
     let entry: extern "sysv64" fn(KernelArgs) -> ! = unsafe { mem::transmute(entry_addr) };
@@ -286,5 +291,5 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
     let fb_info = init_gop(&system_table);
 
     println!("Starting kernel...");
-    start_kernel(loaded_kernel, initrd, rsdp_addr, fb_info, system_table);
+    start_kernel(loaded_kernel, kernel_bytes, initrd, rsdp_addr, fb_info, system_table);
 }

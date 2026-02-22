@@ -1,7 +1,7 @@
 use core::arch::{asm, naked_asm};
 
 use crate::io::{outb, io_wait};
-use crate::{elf, log, serial, syscall};
+use crate::{elf, log, syscall};
 
 use alloc::format;
 
@@ -83,6 +83,13 @@ pub struct SavedRegs {
     pub r15: u64,
 }
 
+// Kernel base address for crash diagnostics
+static mut KERNEL_BASE: u64 = 0;
+
+pub fn set_kernel_base(base: u64) {
+    unsafe { (&raw mut KERNEL_BASE).write(base); }
+}
+
 /// Remap the 8259 PIC: master IRQ 0-7 -> vectors 32-39, slave -> 40-47.
 fn remap_pic() {
     // ICW1: begin init (bit 4=1, bit 0=ICW4 needed)
@@ -119,6 +126,7 @@ pub fn init() {
 
     unsafe {
         // Register exception handlers
+        IDT.entries[6] = IdtEntry::new(ud_entry as u64);
         IDT.entries[13] = IdtEntry::new(gpf_entry as u64);
         IDT.entries[14] = IdtEntry::new(page_fault_entry as u64);
 
@@ -137,8 +145,47 @@ pub fn init() {
 // IST=0 and TSS.RSP0 is set):
 //   [SS] [RSP] [RFLAGS] [CS] [RIP] [error_code] <- RSP
 //
+// For exceptions WITHOUT error codes (#UD), we push a dummy 0 to unify the
+// stack layout.
+//
 // We save all GPRs, then call the handler with:
 //   rdi=vector, rsi=regs_ptr, rdx=error_code, rcx=rip, r8=cs, r9=fault_addr
+
+#[unsafe(naked)]
+extern "C" fn ud_entry() {
+    naked_asm!(
+        // #UD has no error code — push dummy 0 to unify stack layout
+        "push 0",
+
+        "push r15",
+        "push r14",
+        "push r13",
+        "push r12",
+        "push r11",
+        "push r10",
+        "push r9",
+        "push r8",
+        "push rbp",
+        "push rdi",
+        "push rsi",
+        "push rdx",
+        "push rcx",
+        "push rbx",
+        "push rax",
+
+        "mov rdi, 6",               // vector
+        "mov rsi, rsp",             // regs ptr (SavedRegs on stack)
+        "mov rdx, [rsp + 15*8]",    // error_code (dummy 0)
+        "mov rcx, [rsp + 16*8]",    // RIP
+        "mov r8,  [rsp + 17*8]",    // CS
+        "xor r9, r9",               // no fault address
+
+        "call {handler}",
+        "cli",
+        "hlt",
+        handler = sym exception_handler,
+    );
+}
 
 #[unsafe(naked)]
 extern "C" fn gpf_entry() {
@@ -214,7 +261,12 @@ fn format_addr(addr: u64) -> alloc::string::String {
     if let Some((name, offset)) = elf::resolve_symbol(addr) {
         format!("{:#x}  {}+{:#x}", addr, name, offset)
     } else {
-        format!("{:#x}", addr)
+        let kernel_base = unsafe { *(&raw const KERNEL_BASE) };
+        if kernel_base != 0 && addr >= kernel_base {
+            format!("{:#x}  [kernel+{:#x}]", addr, addr - kernel_base)
+        } else {
+            format!("{:#x}", addr)
+        }
     }
 }
 
@@ -230,6 +282,7 @@ extern "C" fn exception_handler(
     let regs = unsafe { &*regs };
 
     let name = match vector {
+        6 => "Invalid Opcode",
         13 => "General Protection Fault",
         14 => "Page Fault",
         _ => "Exception",
@@ -253,38 +306,63 @@ extern "C" fn exception_handler(
         format!("{} (error_code={:#x})", name, error_code)
     };
 
-    let print = |s: &str| {
-        log::println(s);
-        serial::println(s);
-    };
-
-    print(&format!("Process crashed: {}", detail));
-    print(&format!("  rip: {}", format_addr(rip)));
+    let prefix = if is_user { "Process crashed" } else { "KERNEL PANIC" };
+    log::println(&format!("{}: {}", prefix, detail));
+    log::println(&format!("  rip: {}", format_addr(rip)));
 
     // User RSP is in the CPU's iret frame: 15 saved regs + error_code + RIP + CS + RFLAGS + RSP
     let user_rsp = unsafe { *((regs as *const SavedRegs as *const u64).add(19)) };
+    let rsp = if is_user { user_rsp } else { regs.rbp }; // approximate for kernel
+
+    // Instruction bytes at RIP (helps identify the faulting instruction)
+    if is_user && elf::is_valid_user_addr(rip) {
+        let mut bytes_str = alloc::string::String::with_capacity(16 * 3);
+        for i in 0..16u64 {
+            let addr = rip + i;
+            if !elf::is_valid_user_addr(addr) { break; }
+            let byte = unsafe { *(addr as *const u8) };
+            if !bytes_str.is_empty() { bytes_str.push(' '); }
+            bytes_str.push_str(&format!("{:02x}", byte));
+        }
+        log::println(&format!("  code: {}", bytes_str));
+    }
 
     // Register dump
-    print("  Registers:");
-    print(&format!("    rax={:#018x}  rbx={:#018x}", regs.rax, regs.rbx));
-    print(&format!("    rcx={:#018x}  rdx={:#018x}", regs.rcx, regs.rdx));
-    print(&format!("    rsi={:#018x}  rdi={:#018x}", regs.rsi, regs.rdi));
-    print(&format!("    rbp={:#018x}  rsp={:#018x}", regs.rbp, user_rsp));
-    print(&format!("     r8={:#018x}   r9={:#018x}", regs.r8, regs.r9));
-    print(&format!("    r10={:#018x}  r11={:#018x}", regs.r10, regs.r11));
-    print(&format!("    r12={:#018x}  r13={:#018x}", regs.r12, regs.r13));
-    print(&format!("    r14={:#018x}  r15={:#018x}", regs.r14, regs.r15));
+    log::println("  Registers:");
+    log::println(&format!("    rax={:#018x}  rbx={:#018x}", regs.rax, regs.rbx));
+    log::println(&format!("    rcx={:#018x}  rdx={:#018x}", regs.rcx, regs.rdx));
+    log::println(&format!("    rsi={:#018x}  rdi={:#018x}", regs.rsi, regs.rdi));
+    log::println(&format!("    rbp={:#018x}  rsp={:#018x}", regs.rbp, rsp));
+    log::println(&format!("     r8={:#018x}   r9={:#018x}", regs.r8, regs.r9));
+    log::println(&format!("    r10={:#018x}  r11={:#018x}", regs.r10, regs.r11));
+    log::println(&format!("    r12={:#018x}  r13={:#018x}", regs.r12, regs.r13));
+    log::println(&format!("    r14={:#018x}  r15={:#018x}", regs.r14, regs.r15));
+
+    // Stack dump (8 words from RSP)
+    if is_user && user_rsp % 8 == 0 {
+        log::println("  Stack:");
+        for i in 0..8u64 {
+            let addr = user_rsp + i * 8;
+            if !elf::is_valid_user_addr(addr) && !elf::is_valid_user_addr(addr + 7) { break; }
+            let val = unsafe { *(addr as *const u64) };
+            let sym = if let Some((name, off)) = elf::resolve_symbol(val) {
+                format!("  <{}+{:#x}>", name, off)
+            } else {
+                alloc::string::String::new()
+            };
+            log::println(&format!("    [{:#x}] = {:#018x}{}", addr, val, sym));
+        }
+    }
 
     // Stack backtrace
     if is_user {
-        print("  Backtrace:");
-        print(&format!("    0: {}", format_addr(rip)));
+        log::println("  Backtrace:");
+        log::println(&format!("    0: {}", format_addr(rip)));
         let mut rbp = regs.rbp;
         for i in 1..20 {
             if rbp == 0 || rbp % 8 != 0 {
                 break;
             }
-            // Validate the RBP is in user-accessible memory (basic check)
             if !elf::is_valid_user_addr(rbp) || !elf::is_valid_user_addr(rbp + 8) {
                 break;
             }
@@ -293,7 +371,7 @@ extern "C" fn exception_handler(
             if return_addr == 0 {
                 break;
             }
-            print(&format!("    {}: {}", i, format_addr(return_addr)));
+            log::println(&format!("    {}: {}", i, format_addr(return_addr)));
             rbp = saved_rbp;
         }
     }
@@ -301,7 +379,6 @@ extern "C" fn exception_handler(
     if is_user {
         syscall::kill_process(-1);
     } else {
-        serial::println(&format!("KERNEL PANIC: {}, rip={:#x}", detail, rip));
         loop {
             unsafe { asm!("cli; hlt"); }
         }

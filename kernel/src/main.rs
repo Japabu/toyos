@@ -5,6 +5,8 @@ extern crate alloc;
 
 use alloc::boxed::Box;
 use alloc::format;
+use alloc::string::String;
+use alloc::vec::Vec;
 use kernel::*;
 use tyfs::Disk;
 use core::fmt::Write;
@@ -26,13 +28,12 @@ pub unsafe extern "sysv64" fn _start(kernel_args: KernelArgs) -> ! {
         kernel_args.memory_map_addr as *const MemoryMapEntry,
         entry_count,
     );
-    allocator::init(
-        maps,
-        kernel_args.kernel_memory_addr,
-        kernel_args.kernel_memory_size,
-        kernel_args.initrd_addr,
-        kernel_args.initrd_size,
-    );
+    let reserved = [
+        allocator::Region { start: kernel_args.kernel_memory_addr, end: kernel_args.kernel_memory_addr + kernel_args.kernel_memory_size },
+        allocator::Region { start: kernel_args.initrd_addr, end: kernel_args.initrd_addr + kernel_args.initrd_size },
+        allocator::Region { start: kernel_args.kernel_elf_addr, end: kernel_args.kernel_elf_addr + kernel_args.kernel_elf_size },
+    ];
+    allocator::init(maps, &reserved);
 
     // Build our own page tables (identity-mapped, kernel-only).
     // Must happen right after allocator init, before UEFI's page table pages
@@ -115,6 +116,19 @@ pub unsafe extern "sysv64" fn _start(kernel_args: KernelArgs) -> ! {
     // Set up GDT (UEFI's may be in reclaimable memory) and interrupts
     gdt::init();
     interrupts::init();
+    interrupts::set_kernel_base(kernel_args.kernel_memory_addr);
+
+    // Load kernel symbols for crash diagnostics
+    if kernel_args.kernel_elf_size > 0 {
+        let kernel_elf = unsafe {
+            core::slice::from_raw_parts(
+                kernel_args.kernel_elf_addr as *const u8,
+                kernel_args.kernel_elf_size as usize,
+            )
+        };
+        elf::load_kernel_symbols(kernel_elf, kernel_args.kernel_memory_addr);
+    }
+
     syscall::init();
     log::println("Ring 3: ready");
 
@@ -134,10 +148,18 @@ pub unsafe extern "sysv64" fn _start(kernel_args: KernelArgs) -> ! {
         core::str::from_utf8_unchecked(core::slice::from_raw_parts(ptr, len))
     };
     if !init_path.is_empty() {
-        log::println(&format!("init: running {}", init_path));
-        let data = vfs.read_file(init_path)
-            .unwrap_or_else(|| panic!("init: {} not found", init_path));
-        elf::run(&data);
+        let args: Vec<&str> = init_path.split_whitespace().collect();
+        let cmd = args[0];
+        // Resolve bare name against /initrd/
+        let path = if cmd.starts_with('/') {
+            String::from(cmd)
+        } else {
+            format!("/initrd/{}", cmd)
+        };
+        log::println(&format!("init: running {}", path));
+        let data = vfs.read_file(&path)
+            .unwrap_or_else(|| panic!("init: {} not found", path));
+        elf::run(&data, &args);
     }
 
     // Drop into interactive shell
