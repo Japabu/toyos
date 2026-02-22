@@ -154,48 +154,8 @@ fn setup_packet(bm_request_type: u8, b_request: u8, w_value: u16, w_index: u16, 
 }
 
 // ---------------------------------------------------------------------------
-// USB HID usage ID → ASCII translation (boot protocol keyboard)
+// USB HID usage ID → character translation via keyboard layout
 // ---------------------------------------------------------------------------
-fn hid_usage_to_ascii(usage: u8, shift: bool) -> Option<u8> {
-    match usage {
-        // Letters: 0x04 ('a') through 0x1D ('z')
-        0x04..=0x1D => {
-            let base = b'a' + (usage - 0x04);
-            Some(if shift { base - 32 } else { base })
-        }
-        // Numbers: 0x1E ('1') through 0x26 ('9')
-        0x1E..=0x26 => {
-            if shift {
-                Some(match usage {
-                    0x1E => b'!', 0x1F => b'@', 0x20 => b'#', 0x21 => b'$',
-                    0x22 => b'%', 0x23 => b'^', 0x24 => b'&', 0x25 => b'*',
-                    0x26 => b'(',
-                    _ => return None,
-                })
-            } else {
-                Some(b'1' + (usage - 0x1E))
-            }
-        }
-        0x27 => Some(if shift { b')' } else { b'0' }),
-        0x28 => Some(b'\r'),     // Enter
-        0x29 => Some(0x1B),      // Escape
-        0x2A => Some(0x08),      // Backspace
-        0x2B => Some(b'\t'),     // Tab
-        0x2C => Some(b' '),      // Space
-        0x2D => Some(if shift { b'_' } else { b'-' }),
-        0x2E => Some(if shift { b'+' } else { b'=' }),
-        0x2F => Some(if shift { b'{' } else { b'[' }),
-        0x30 => Some(if shift { b'}' } else { b']' }),
-        0x31 => Some(if shift { b'|' } else { b'\\' }),
-        0x33 => Some(if shift { b':' } else { b';' }),
-        0x34 => Some(if shift { b'"' } else { b'\'' }),
-        0x35 => Some(if shift { b'~' } else { b'`' }),
-        0x36 => Some(if shift { b'<' } else { b',' }),
-        0x37 => Some(if shift { b'>' } else { b'.' }),
-        0x38 => Some(if shift { b'?' } else { b'/' }),
-        _ => None,
-    }
-}
 
 // ---------------------------------------------------------------------------
 // XhciController
@@ -437,8 +397,10 @@ impl XhciController {
                         if ctrl && (0x04..=0x1D).contains(&keycode) {
                             // Ctrl+letter → control character (0x01-0x1A)
                             keyboard::handle_key(keycode - 0x04 + 1);
-                        } else if let Some(ascii) = hid_usage_to_ascii(keycode, shift) {
-                            keyboard::handle_key(ascii);
+                        } else if let Some(bytes) = keyboard::layout_lookup(keycode, shift) {
+                            for &b in bytes {
+                                keyboard::handle_key(b);
+                            }
                         }
                     }
                 }

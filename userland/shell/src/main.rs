@@ -3,9 +3,12 @@ use std::fs;
 use std::io::{self, Write};
 use std::process::Command;
 
+const HISTORY_PATH: &str = "/nvme/config/shell_history";
+const HISTORY_MAX: usize = 200;
+
 fn main() {
     let _ = env::set_current_dir("/");
-    let mut history: Vec<String> = Vec::new();
+    let mut history = load_history();
 
     loop {
         let cwd = env::current_dir().map(|p| p.display().to_string()).unwrap_or_else(|_| "?".into());
@@ -23,6 +26,10 @@ fn main() {
 
         if history.last().map_or(true, |last| *last != input) {
             history.push(input.clone());
+            if history.len() > HISTORY_MAX {
+                history.remove(0);
+            }
+            save_history(&history);
         }
 
         let (cmd, arg) = match input.find(' ') {
@@ -42,9 +49,21 @@ fn main() {
             "write" => cmd_write(arg),
             "edit" => cmd_edit(arg),
             "run" => cmd_run(arg),
+            "layout" => cmd_layout(arg),
             _ => cmd_exec(cmd, arg),
         }
     }
+}
+
+fn load_history() -> Vec<String> {
+    fs::read_to_string(HISTORY_PATH)
+        .map(|s| s.lines().map(String::from).collect())
+        .unwrap_or_default()
+}
+
+fn save_history(history: &[String]) {
+    let content = history.join("\n");
+    let _ = fs::write(HISTORY_PATH, &content);
 }
 
 // --- Raw syscall helpers ---
@@ -259,6 +278,7 @@ fn print_help() {
     println!("  pwd             Print working directory");
     println!("  clear           Clear screen");
     println!("  run <file>      Run an ELF program");
+    println!("  layout [name]   Set keyboard layout");
     println!("  shutdown        Power off");
 }
 
@@ -439,6 +459,21 @@ fn resolve(arg: &str) -> String {
     } else {
         let cwd = env::current_dir().unwrap_or_else(|_| "/".into());
         format!("{}/{}", cwd.display(), arg)
+    }
+}
+
+fn cmd_layout(arg: &str) {
+    if arg.is_empty() {
+        println!("Available layouts: us, swiss-german-mac");
+        println!("Usage: layout <name>");
+        return;
+    }
+    let name = arg.trim();
+    let result = syscall(23, name.as_ptr() as u64, name.len() as u64, 0, 0);
+    if result == u64::MAX {
+        println!("layout: unknown layout '{}'", name);
+    } else {
+        println!("Keyboard layout set to '{}'", name);
     }
 }
 

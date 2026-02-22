@@ -161,6 +161,15 @@ fn kernel_main(
     // Move VFS into global static (accessible from syscall handlers)
     vfs::set_global(vfs);
 
+    // Load keyboard layout from config (if present)
+    if let Some(data) = vfs::global().read_file("/nvme/config/keyboard_layout") {
+        if let Ok(name) = core::str::from_utf8(&data) {
+            let name = name.trim();
+            kernel::keyboard::set_layout(name);
+        }
+    }
+    log!("Keyboard layout: {}", kernel::keyboard::layout_name());
+
     // Run init program (default: "shell")
     let init = if init_path.is_empty() { "shell" } else { init_path };
     let args: Vec<&str> = init.split_whitespace().collect();

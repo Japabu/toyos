@@ -36,6 +36,7 @@ const SYS_SHUTDOWN: u64 = 19;
 const SYS_CHDIR: u64 = 20;
 const SYS_GETCWD: u64 = 21;
 const SYS_SET_STDIN_MODE: u64 = 22;
+const SYS_SET_KEYBOARD_LAYOUT: u64 = 23;
 
 // Global stdin mode: false=canonical (line-buffered), true=raw (byte-at-a-time)
 static STDIN_RAW: SyncCell<bool> = SyncCell::new(false);
@@ -149,6 +150,7 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         SYS_CHDIR => sys_chdir(a1, a2),
         SYS_GETCWD => sys_getcwd(a1, a2),
         SYS_SET_STDIN_MODE => { *STDIN_RAW.get_mut() = a1 != 0; 0 }
+        SYS_SET_KEYBOARD_LAYOUT => sys_set_keyboard_layout(a1, a2),
         _ => u64::MAX, // unknown syscall
     }
 }
@@ -502,4 +504,16 @@ fn sys_getcwd(buf_ptr: u64, buf_len: u64) -> u64 {
     let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, len) };
     buf.copy_from_slice(&cwd.as_bytes()[..len]);
     len as u64
+}
+
+fn sys_set_keyboard_layout(name_ptr: u64, name_len: u64) -> u64 {
+    let slice = unsafe { core::slice::from_raw_parts(name_ptr as *const u8, name_len as usize) };
+    let Ok(name) = core::str::from_utf8(slice) else { return u64::MAX };
+    if keyboard::set_layout(name) {
+        // Persist the choice to config
+        vfs::global().write_file("/nvme/config/keyboard_layout", name.as_bytes());
+        0
+    } else {
+        u64::MAX
+    }
 }
