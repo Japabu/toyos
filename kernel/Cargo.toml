@@ -8,3 +8,4 @@ edition = "2021"
 [dependencies]
 tyfs = { path = "../tyfs" }
 rustc-demangle = "0.1"
+elf = { version = "0.8", default-features = false }
