@@ -1,7 +1,7 @@
 use core::arch::naked_asm;
 
 use super::cpu;
-use crate::arch::io::{outb, io_wait};
+use super::cpu::{outb, io_wait};
 use crate::arch::syscall;
 use crate::{elf, log};
 

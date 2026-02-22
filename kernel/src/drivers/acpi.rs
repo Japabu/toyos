@@ -64,7 +64,7 @@ pub fn shutdown() -> ! {
 
     if pm1a != 0 {
         let val = (slp_typ << 10) | SLP_EN;
-        crate::arch::io::outw(pm1a, val);
+        crate::arch::cpu::outw(pm1a, val);
     }
 
     crate::arch::cpu::halt();

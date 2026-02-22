@@ -1,4 +1,4 @@
-use crate::arch::io::{inb, outb};
+use crate::arch::cpu::{inb, outb};
 
 const PORT: u16 = 0x3f8; // COM1
 
