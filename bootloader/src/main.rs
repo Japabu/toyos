@@ -6,6 +6,7 @@ extern crate alloc;
 use core::mem;
 
 use alloc::vec;
+use alloc::alloc::Layout;
 use elf::{abi, endian::AnyEndian, ElfBytes};
 use uefi::{
     prelude::*,
@@ -15,6 +16,14 @@ use uefi::{
     table::{boot::{MemoryType, PAGE_SIZE}, cfg::ACPI2_GUID},
 };
 use uefi_services::println;
+
+/// Allocate a zeroed Vec<u8> with page (4096-byte) alignment.
+fn alloc_page_aligned(size: usize) -> vec::Vec<u8> {
+    let layout = Layout::from_size_align(size, 4096).expect("invalid layout");
+    let ptr = unsafe { alloc::alloc::alloc_zeroed(layout) };
+    assert!(!ptr.is_null(), "page-aligned allocation failed");
+    unsafe { vec::Vec::from_raw_parts(ptr, size, size) }
+}
 
 struct LoadedKernel {
     pub memory: vec::Vec<u8>,
@@ -117,7 +126,7 @@ fn load_kernel_elf(kernel_elf_bytes: &[u8]) -> LoadedKernel {
 
     println!("Kernel memory size: {}", mem_size);
 
-    let mut process_mem = vec![0; mem_size as usize];
+    let mut process_mem = alloc_page_aligned(mem_size);
     println!("Kernel memory located at: {:?}", process_mem.as_ptr());
 
     // handle load segments

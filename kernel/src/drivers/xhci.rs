@@ -1,8 +1,10 @@
 use core::ptr::{read_volatile, write_volatile, write_bytes, copy_nonoverlapping};
 use core::sync::atomic::{fence, Ordering};
-use super::{mmio, pci};
+use super::mmio::Mmio;
+use super::pci::PciDevice;
+use super::DmaPool;
 use crate::{keyboard, log};
-use alloc::format;
+use crate::sync::SyncCell;
 
 // ---------------------------------------------------------------------------
 // xHCI Capability Register offsets (from BAR0)
@@ -78,12 +80,47 @@ const TRB_CONFIGURE_EP:   u32 = trb_type(12);
 // Event TRB types (read from event ring, encoded in bits [15:10])
 const EVENT_TRANSFER:     u32 = 32;
 const EVENT_CMD_COMPLETE: u32 = 33;
-const _EVENT_PORT_STATUS: u32 = 34;
 
 // ---------------------------------------------------------------------------
 // Ring sizes
 // ---------------------------------------------------------------------------
 const RING_SIZE: usize = 256; // TRBs per ring (one page = 256 * 16)
+
+// ---------------------------------------------------------------------------
+// TRB Ring — shared enqueue logic for command, EP0, and interrupt rings
+// ---------------------------------------------------------------------------
+struct TrbRing {
+    base: *mut Trb,
+    base_phys: u64,
+    tail: u16,
+    cycle: bool,
+}
+
+impl TrbRing {
+    fn new(base: *mut Trb, base_phys: u64) -> Self {
+        Self { base, base_phys, tail: 0, cycle: true }
+    }
+
+    fn enqueue(&mut self, mut trb: Trb) {
+        if self.cycle {
+            trb.control |= TRB_CYCLE;
+        } else {
+            trb.control &= !TRB_CYCLE;
+        }
+        unsafe { write_volatile(self.base.add(self.tail as usize), trb); }
+        self.tail += 1;
+
+        if self.tail as usize >= RING_SIZE - 1 {
+            let mut link = Trb::ZERO;
+            link.param = self.base_phys;
+            link.control = TRB_LINK | (1 << 1); // TC (Toggle Cycle)
+            if self.cycle { link.control |= TRB_CYCLE; }
+            unsafe { write_volatile(self.base.add(self.tail as usize), link); }
+            self.tail = 0;
+            self.cycle = !self.cycle;
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // DMA memory pool (same pattern as NVMe)
@@ -99,13 +136,10 @@ const RING_SIZE: usize = 256; // TRBs per ring (one page = 256 * 16)
 //   Page 8: Data buffer (control transfer responses, HID reports)
 //   Page 9: Scratchpad buffer array / spare
 const DMA_PAGES: usize = 10;
-const DMA_POOL_SIZE: usize = (DMA_PAGES + 1) * 4096;
-static mut XHCI_DMA_POOL: [u8; DMA_POOL_SIZE] = [0; DMA_POOL_SIZE];
+static XHCI_DMA_POOL: SyncCell<DmaPool<DMA_PAGES>> = SyncCell::new(DmaPool::new());
 
 fn dma_page(index: usize) -> u64 {
-    let raw = core::ptr::addr_of!(XHCI_DMA_POOL) as u64;
-    let base = (raw + 4095) & !4095;
-    base + (index as u64) * 4096
+    XHCI_DMA_POOL.get().page_addr(index)
 }
 
 // ---------------------------------------------------------------------------
@@ -168,31 +202,21 @@ fn hid_usage_to_ascii(usage: u8, shift: bool) -> Option<u8> {
 // ---------------------------------------------------------------------------
 pub struct XhciController {
     // Base addresses (MMIO)
-    db_base: u64,
-    rt_base: u64,
+    db_base: Mmio,
+    rt_base: Mmio,
 
     // Capabilities
     context_size: usize, // 32 or 64
 
-    // Command Ring
-    cmd_ring: *mut Trb,
-    cmd_tail: u16,
-    cmd_cycle: bool,
+    // Transfer rings
+    cmd_ring: TrbRing,
+    ep0_ring: TrbRing,
+    int_ring: TrbRing,
 
     // Event Ring
     event_ring: *const Trb,
     event_head: u16,
     event_phase: bool,
-
-    // EP0 Transfer Ring
-    ep0_ring: *mut Trb,
-    ep0_tail: u16,
-    ep0_cycle: bool,
-
-    // Interrupt IN Transfer Ring
-    int_ring: *mut Trb,
-    int_tail: u16,
-    int_cycle: bool,
 
     // Device state
     slot_id: u8,
@@ -206,30 +230,11 @@ impl XhciController {
     // -------------------------------------------------------------------
     // Command ring: submit + wait
     // -------------------------------------------------------------------
-    fn submit_command(&mut self, mut trb: Trb) {
-        if self.cmd_cycle {
-            trb.control |= TRB_CYCLE;
-        } else {
-            trb.control &= !TRB_CYCLE;
-        }
-
-        unsafe { write_volatile(self.cmd_ring.add(self.cmd_tail as usize), trb); }
-        self.cmd_tail += 1;
-
-        // Wrap via Link TRB at last entry
-        if self.cmd_tail as usize >= RING_SIZE - 1 {
-            let mut link = Trb::ZERO;
-            link.param = dma_page(1);
-            link.control = TRB_LINK | (1 << 1); // Toggle Cycle
-            if self.cmd_cycle { link.control |= TRB_CYCLE; }
-            unsafe { write_volatile(self.cmd_ring.add(self.cmd_tail as usize), link); }
-            self.cmd_tail = 0;
-            self.cmd_cycle = !self.cmd_cycle;
-        }
-
+    fn submit_command(&mut self, trb: Trb) {
+        self.cmd_ring.enqueue(trb);
         fence(Ordering::Release);
         // Ring Host Controller doorbell (slot 0, target 0)
-        mmio::write_u32(self.db_base, 0, 0);
+        self.db_base.write_u32(0, 0);
     }
 
     fn wait_command(&mut self) -> (u32, u32) {
@@ -263,36 +268,20 @@ impl XhciController {
             self.event_phase = !self.event_phase;
         }
         let erdp = dma_page(3) + (self.event_head as u64) * 16;
-        mmio::write_u64(self.rt_base, IR0_ERDP, erdp | (1 << 3)); // EHB bit
+        self.rt_base.write_u64(IR0_ERDP, erdp | (1 << 3)); // EHB bit
     }
 
     // -------------------------------------------------------------------
     // EP0 transfer ring: enqueue TRBs + ring doorbell
     // -------------------------------------------------------------------
-    fn enqueue_ep0(&mut self, mut trb: Trb) {
-        if self.ep0_cycle {
-            trb.control |= TRB_CYCLE;
-        } else {
-            trb.control &= !TRB_CYCLE;
-        }
-        unsafe { write_volatile(self.ep0_ring.add(self.ep0_tail as usize), trb); }
-        self.ep0_tail += 1;
-
-        if self.ep0_tail as usize >= RING_SIZE - 1 {
-            let mut link = Trb::ZERO;
-            link.param = dma_page(6);
-            link.control = TRB_LINK | (1 << 1);
-            if self.ep0_cycle { link.control |= TRB_CYCLE; }
-            unsafe { write_volatile(self.ep0_ring.add(self.ep0_tail as usize), link); }
-            self.ep0_tail = 0;
-            self.ep0_cycle = !self.ep0_cycle;
-        }
+    fn enqueue_ep0(&mut self, trb: Trb) {
+        self.ep0_ring.enqueue(trb);
     }
 
     fn ring_ep0_doorbell(&self) {
         fence(Ordering::Release);
         // Doorbell for slot_id, target = 1 (DCI 1 = EP0)
-        mmio::write_u32(self.db_base, self.slot_id as u64 * 4, 1);
+        self.db_base.write_u32(self.slot_id as u64 * 4, 1);
     }
 
     fn wait_transfer(&mut self) -> u32 {
@@ -364,7 +353,6 @@ impl XhciController {
     // Interrupt IN transfer ring
     // -------------------------------------------------------------------
     fn queue_interrupt_transfer(&mut self) {
-        // Use offset 512 in data page for 8-byte HID report
         let report_buf = dma_page(8) + 512;
 
         let mut trb = Trb::ZERO;
@@ -372,28 +360,10 @@ impl XhciController {
         trb.status = 8; // 8-byte boot protocol report
         trb.control = TRB_NORMAL | (1 << 5); // IOC
 
-        if self.int_cycle {
-            trb.control |= TRB_CYCLE;
-        } else {
-            trb.control &= !TRB_CYCLE;
-        }
-
-        unsafe { write_volatile(self.int_ring.add(self.int_tail as usize), trb); }
-        self.int_tail += 1;
-
-        if self.int_tail as usize >= RING_SIZE - 1 {
-            let mut link = Trb::ZERO;
-            link.param = dma_page(7);
-            link.control = TRB_LINK | (1 << 1);
-            if self.int_cycle { link.control |= TRB_CYCLE; }
-            unsafe { write_volatile(self.int_ring.add(self.int_tail as usize), link); }
-            self.int_tail = 0;
-            self.int_cycle = !self.int_cycle;
-        }
+        self.int_ring.enqueue(trb);
 
         fence(Ordering::Release);
-        // Ring doorbell for slot, target = interrupt endpoint DCI
-        mmio::write_u32(self.db_base, self.slot_id as u64 * 4, self.int_ep_dci as u32);
+        self.db_base.write_u32(self.slot_id as u64 * 4, self.int_ep_dci as u32);
     }
 
     // -------------------------------------------------------------------
@@ -515,17 +485,15 @@ impl XhciController {
 // Global singleton (for sys_read polling)
 // ---------------------------------------------------------------------------
 
-static mut XHCI: Option<XhciController> = None;
+static XHCI: SyncCell<Option<XhciController>> = SyncCell::new(None);
 
 pub fn set_global(ctrl: XhciController) {
-    unsafe { (&raw mut XHCI).write(Some(ctrl)); }
+    *XHCI.get_mut() = Some(ctrl);
 }
 
 pub fn poll_global() {
-    unsafe {
-        if let Some(ref mut ctrl) = *(&raw mut XHCI) {
-            ctrl.poll();
-        }
+    if let Some(ctrl) = XHCI.get_mut() {
+        ctrl.poll();
     }
 }
 
@@ -545,56 +513,56 @@ fn max_packet_for_speed(speed: u8) -> u16 {
 
 pub fn init(ecam_base: u64) -> Option<XhciController> {
     // 1. PCI discovery
-    let (bus, dev, func) = pci::find_device(ecam_base, 0x0C, 0x03, Some(0x30))?;
-    log::println(&format!("xHCI: found at PCI {:02x}:{:02x}.{}", bus, dev, func));
+    let pci_dev = PciDevice::find(ecam_base, 0x0C, 0x03, Some(0x30))?;
+    log!("xHCI: found at PCI {:02x}:{:02x}.{}", pci_dev.bus, pci_dev.dev, pci_dev.func);
 
-    let bar = pci::read_bar0_64(ecam_base, bus, dev, func);
-    pci::enable_bus_master(ecam_base, bus, dev, func);
-    log::println(&format!("xHCI: BAR0={:#x}", bar));
+    let bar = Mmio::new(pci_dev.bar0_64());
+    pci_dev.enable_bus_master();
+    log!("xHCI: BAR0={:#x}", bar.addr());
 
     // Map BAR MMIO region into our page tables
-    crate::arch::paging::map_kernel(bar, 0x10000); // xHCI register space
+    crate::arch::paging::map_kernel(bar.addr(), 0x10000); // xHCI register space
 
     // 2. Read capability registers
-    let cap_length = mmio::read_u8(bar, CAP_CAPLENGTH) as u64;
-    let hcsparams1 = mmio::read_u32(bar, CAP_HCSPARAMS1);
-    let hcsparams2 = mmio::read_u32(bar, CAP_HCSPARAMS2);
-    let hccparams1 = mmio::read_u32(bar, CAP_HCCPARAMS1);
-    let db_offset = (mmio::read_u32(bar, CAP_DBOFF) & !0x3) as u64;
-    let rts_offset = (mmio::read_u32(bar, CAP_RTSOFF) & !0x1F) as u64;
+    let cap_length = bar.read_u8(CAP_CAPLENGTH) as u64;
+    let hcsparams1 = bar.read_u32(CAP_HCSPARAMS1);
+    let hcsparams2 = bar.read_u32(CAP_HCSPARAMS2);
+    let hccparams1 = bar.read_u32(CAP_HCCPARAMS1);
+    let db_offset = (bar.read_u32(CAP_DBOFF) & !0x3) as u64;
+    let rts_offset = (bar.read_u32(CAP_RTSOFF) & !0x1F) as u64;
 
     let max_slots = (hcsparams1 & 0xFF) as u8;
     let max_ports = ((hcsparams1 >> 24) & 0xFF) as u8;
     let csz = ((hccparams1 >> 2) & 1) != 0;
     let context_size: usize = if csz { 64 } else { 32 };
 
-    let op_base = bar + cap_length;
-    let db_base = bar + db_offset;
-    let rt_base = bar + rts_offset;
+    let op_base = bar.offset(cap_length);
+    let db_base = bar.offset(db_offset);
+    let rt_base = bar.offset(rts_offset);
 
-    log::println(&format!("xHCI: max_slots={} max_ports={} ctx_size={}", max_slots, max_ports, context_size));
+    log!("xHCI: max_slots={} max_ports={} ctx_size={}", max_slots, max_ports, context_size);
 
     // 3. Halt controller
-    let usbcmd = mmio::read_u32(op_base, OP_USBCMD);
+    let usbcmd = op_base.read_u32(OP_USBCMD);
     if usbcmd & 1 != 0 {
-        mmio::write_u32(op_base, OP_USBCMD, usbcmd & !1);
+        op_base.write_u32(OP_USBCMD, usbcmd & !1);
     }
-    while mmio::read_u32(op_base, OP_USBSTS) & 1 == 0 {
+    while op_base.read_u32(OP_USBSTS) & 1 == 0 {
         core::hint::spin_loop(); // Wait for HCH (Halted) bit
     }
 
     // 4. Reset controller
-    mmio::write_u32(op_base, OP_USBCMD, 1 << 1); // HCRST
-    while mmio::read_u32(op_base, OP_USBCMD) & (1 << 1) != 0 {
+    op_base.write_u32(OP_USBCMD, 1 << 1); // HCRST
+    while op_base.read_u32(OP_USBCMD) & (1 << 1) != 0 {
         core::hint::spin_loop();
     }
-    while mmio::read_u32(op_base, OP_USBSTS) & (1 << 11) != 0 {
+    while op_base.read_u32(OP_USBSTS) & (1 << 11) != 0 {
         core::hint::spin_loop(); // Wait for CNR (Controller Not Ready) to clear
     }
     log::println("xHCI: controller reset");
 
     // 5. Configure MaxSlotsEn
-    mmio::write_u32(op_base, OP_CONFIG, max_slots as u32);
+    op_base.write_u32(OP_CONFIG, max_slots as u32);
 
     // 6. Zero DMA pages
     for i in 0..DMA_PAGES {
@@ -617,10 +585,10 @@ pub fn init(ecam_base: u64) -> Option<XhciController> {
         unsafe { write_volatile(sp_array, dma_page(9) + 2048); }
         // DCBAA[0] = scratchpad buffer array pointer
         unsafe { write_volatile(dma_page(0) as *mut u64, dma_page(9)); }
-        log::println(&format!("xHCI: {} scratchpad buffers configured", max_scratchpad));
+        log!("xHCI: {} scratchpad buffers configured", max_scratchpad);
     }
 
-    mmio::write_u64(op_base, OP_DCBAAP, dma_page(0));
+    op_base.write_u64(OP_DCBAAP, dma_page(0));
 
     // 8. Set up Command Ring with Link TRB at last entry
     let cmd_ring = dma_page(1) as *mut Trb;
@@ -630,7 +598,7 @@ pub fn init(ecam_base: u64) -> Option<XhciController> {
     unsafe { write_volatile(cmd_ring.add(RING_SIZE - 1), link); }
 
     // Write CRCR with ring base + RCS=1
-    mmio::write_u64(op_base, OP_CRCR, dma_page(1) | 1);
+    op_base.write_u64(OP_CRCR, dma_page(1) | 1);
 
     // 9. Set up Event Ring
     // Event Ring Segment Table entry at page 2:
@@ -641,9 +609,9 @@ pub fn init(ecam_base: u64) -> Option<XhciController> {
         write_volatile(erst as *mut u64, dma_page(3));
         write_volatile(erst.add(8) as *mut u32, RING_SIZE as u32);
     }
-    mmio::write_u32(rt_base, IR0_ERSTSZ, 1);
-    mmio::write_u64(rt_base, IR0_ERDP, dma_page(3));
-    mmio::write_u64(rt_base, IR0_ERSTBA, dma_page(2));
+    rt_base.write_u32(IR0_ERSTSZ, 1);
+    rt_base.write_u64(IR0_ERDP, dma_page(3));
+    rt_base.write_u64(IR0_ERSTBA, dma_page(2));
 
     // 10. Set up EP0 and Interrupt transfer rings with Link TRBs
     let ep0_ring = dma_page(6) as *mut Trb;
@@ -659,8 +627,8 @@ pub fn init(ecam_base: u64) -> Option<XhciController> {
     unsafe { write_volatile(int_ring.add(RING_SIZE - 1), int_link); }
 
     // 11. Start controller
-    mmio::write_u32(op_base, OP_USBCMD, 1); // R/S = 1
-    while mmio::read_u32(op_base, OP_USBSTS) & 1 != 0 {
+    op_base.write_u32(OP_USBCMD, 1); // R/S = 1
+    while op_base.read_u32(OP_USBSTS) & 1 != 0 {
         core::hint::spin_loop(); // Wait for HCH to clear (running)
     }
     log::println("xHCI: controller started");
@@ -671,18 +639,12 @@ pub fn init(ecam_base: u64) -> Option<XhciController> {
         db_base,
         rt_base,
         context_size,
-        cmd_ring,
-        cmd_tail: 0,
-        cmd_cycle: true,
+        cmd_ring: TrbRing::new(cmd_ring, dma_page(1)),
+        ep0_ring: TrbRing::new(ep0_ring, dma_page(6)),
+        int_ring: TrbRing::new(int_ring, dma_page(7)),
         event_ring,
         event_head: 0,
         event_phase: true,
-        ep0_ring,
-        ep0_tail: 0,
-        ep0_cycle: true,
-        int_ring,
-        int_tail: 0,
-        int_cycle: true,
         slot_id: 0,
         int_ep_dci: 0,
         prev_report: [0; 8],
@@ -691,10 +653,10 @@ pub fn init(ecam_base: u64) -> Option<XhciController> {
     // 12. Scan ports for a connected device
     let mut port_index: Option<u8> = None;
     for p in 0..max_ports {
-        let portsc = mmio::read_u32(op_base, OP_PORT_BASE + p as u64 * PORT_REG_SIZE);
+        let portsc = op_base.read_u32(OP_PORT_BASE + p as u64 * PORT_REG_SIZE);
         if portsc & PORTSC_CCS != 0 {
             let speed = (portsc >> 10) & 0xF;
-            log::println(&format!("xHCI: port {} connected, speed={}", p + 1, speed));
+            log!("xHCI: port {} connected, speed={}", p + 1, speed);
             port_index = Some(p);
             // Don't break — we want to find all devices and pick the right one later
         }
@@ -710,27 +672,27 @@ pub fn init(ecam_base: u64) -> Option<XhciController> {
 
     // 13. Reset the port
     let portsc_off = OP_PORT_BASE + port_idx as u64 * PORT_REG_SIZE;
-    let portsc = mmio::read_u32(op_base, portsc_off);
-    mmio::write_u32(op_base, portsc_off, (portsc & !PORTSC_RW1C) | PORTSC_PR);
+    let portsc = op_base.read_u32(portsc_off);
+    op_base.write_u32(portsc_off, (portsc & !PORTSC_RW1C) | PORTSC_PR);
 
     // Wait for Port Reset Change
     loop {
-        let ps = mmio::read_u32(op_base, portsc_off);
+        let ps = op_base.read_u32(portsc_off);
         if ps & PORTSC_PRC != 0 { break; }
         core::hint::spin_loop();
     }
 
     // Clear PRC
-    let portsc = mmio::read_u32(op_base, portsc_off);
-    mmio::write_u32(op_base, portsc_off, (portsc & !PORTSC_RW1C) | PORTSC_PRC);
+    let portsc = op_base.read_u32(portsc_off);
+    op_base.write_u32(portsc_off, (portsc & !PORTSC_RW1C) | PORTSC_PRC);
 
-    let portsc = mmio::read_u32(op_base, portsc_off);
+    let portsc = op_base.read_u32(portsc_off);
     if portsc & PORTSC_PED == 0 {
         log::println("xHCI: port not enabled after reset");
         return None;
     }
     let speed = ((portsc >> 10) & 0xF) as u8;
-    log::println(&format!("xHCI: port {} reset, speed={}", port_idx + 1, speed));
+    log!("xHCI: port {} reset, speed={}", port_idx + 1, speed);
 
     // 14. Enable Slot
     let mut enable_slot = Trb::ZERO;
@@ -738,11 +700,11 @@ pub fn init(ecam_base: u64) -> Option<XhciController> {
     ctrl.submit_command(enable_slot);
     let (code, slot_id) = ctrl.wait_command();
     if code != 1 {
-        log::println(&format!("xHCI: Enable Slot failed, code={}", code));
+        log!("xHCI: Enable Slot failed, code={}", code);
         return None;
     }
     ctrl.slot_id = slot_id as u8;
-    log::println(&format!("xHCI: slot {} enabled", ctrl.slot_id));
+    log!("xHCI: slot {} enabled", ctrl.slot_id);
 
     // 15. Address Device
     // Prepare Input Context at page 5
@@ -787,7 +749,7 @@ pub fn init(ecam_base: u64) -> Option<XhciController> {
     ctrl.submit_command(addr_dev);
     let (code, _) = ctrl.wait_command();
     if code != 1 {
-        log::println(&format!("xHCI: Address Device failed, code={}", code));
+        log!("xHCI: Address Device failed, code={}", code);
         return None;
     }
     log::println("xHCI: device addressed");
@@ -797,7 +759,7 @@ pub fn init(ecam_base: u64) -> Option<XhciController> {
     unsafe { write_bytes(data_buf as *mut u8, 0, 256); }
     let code = ctrl.control_transfer(0x80, 0x06, 0x0100, 0, Some(data_buf), 18);
     if code != 1 && code != 13 {
-        log::println(&format!("xHCI: GET_DESCRIPTOR(Device) failed, code={}", code));
+        log!("xHCI: GET_DESCRIPTOR(Device) failed, code={}", code);
         return None;
     }
 
@@ -810,13 +772,13 @@ pub fn init(ecam_base: u64) -> Option<XhciController> {
             | (read_volatile(buf.add(11)) as u16) << 8;
         (dev_class, vendor_id, product_id)
     };
-    log::println(&format!("xHCI: device class={:#x} vendor={:04x} product={:04x}", dev_class, vendor_id, product_id));
+    log!("xHCI: device class={:#x} vendor={:04x} product={:04x}", dev_class, vendor_id, product_id);
 
     // 17. GET_DESCRIPTOR (Configuration) — request 256 bytes
     unsafe { write_bytes(data_buf as *mut u8, 0, 256); }
     let code = ctrl.control_transfer(0x80, 0x06, 0x0200, 0, Some(data_buf), 256);
     if code != 1 && code != 13 {
-        log::println(&format!("xHCI: GET_DESCRIPTOR(Config) failed, code={}", code));
+        log!("xHCI: GET_DESCRIPTOR(Config) failed, code={}", code);
         return None;
     }
 
@@ -885,15 +847,15 @@ pub fn init(ecam_base: u64) -> Option<XhciController> {
     let int_ep_dci = ep_num * 2 + 1; // IN endpoint DCI = ep_num * 2 + 1
     ctrl.int_ep_dci = int_ep_dci;
 
-    log::println(&format!(
+    log!(
         "xHCI: HID keyboard iface={} ep={:#x} max_pkt={} interval={} dci={}",
         iface_num, ep_addr, ep_max_packet, ep_interval, int_ep_dci
-    ));
+    );
 
     // 18. SET_CONFIGURATION
     let code = ctrl.control_transfer(0x00, 0x09, config_val as u16, 0, None, 0);
     if code != 1 {
-        log::println(&format!("xHCI: SET_CONFIGURATION failed, code={}", code));
+        log!("xHCI: SET_CONFIGURATION failed, code={}", code);
         return None;
     }
     log::println("xHCI: configuration set");
@@ -901,7 +863,7 @@ pub fn init(ecam_base: u64) -> Option<XhciController> {
     // 19. SET_PROTOCOL (boot protocol, wValue=0)
     let code = ctrl.control_transfer(0x21, 0x0B, 0, iface_num as u16, None, 0);
     if code != 1 {
-        log::println(&format!("xHCI: SET_PROTOCOL failed, code={}", code));
+        log!("xHCI: SET_PROTOCOL failed, code={}", code);
         // Non-fatal: some devices default to boot protocol
     }
 
@@ -965,7 +927,7 @@ pub fn init(ecam_base: u64) -> Option<XhciController> {
     ctrl.submit_command(config_ep);
     let (code, _) = ctrl.wait_command();
     if code != 1 {
-        log::println(&format!("xHCI: Configure Endpoint failed, code={}", code));
+        log!("xHCI: Configure Endpoint failed, code={}", code);
         return None;
     }
     log::println("xHCI: endpoint configured");

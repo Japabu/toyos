@@ -5,9 +5,9 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use crate::sync::SyncCell;
 use crate::vfs::Vfs;
 
-const O_READ: u64 = 1;
 const O_WRITE: u64 = 2;
 const O_CREATE: u64 = 4;
 const O_TRUNCATE: u64 = 8;
@@ -20,10 +20,10 @@ struct OpenFile {
     modified: bool,
 }
 
-static mut FD_TABLE: Vec<Option<OpenFile>> = Vec::new();
+static FD_TABLE: SyncCell<Vec<Option<OpenFile>>> = SyncCell::new(Vec::new());
 
-fn fd_table() -> &'static mut Vec<Option<OpenFile>> {
-    unsafe { &mut *(&raw mut FD_TABLE) }
+fn get_file(fd: u64) -> Option<&'static mut OpenFile> {
+    FD_TABLE.get_mut().get_mut(fd as usize)?.as_mut()
 }
 
 /// Open a file. Returns fd index, or u64::MAX on error.
@@ -56,7 +56,7 @@ pub fn open(vfs: &mut Vfs, path: &str, flags: u64) -> u64 {
         modified: false,
     };
 
-    let table = fd_table();
+    let table = FD_TABLE.get_mut();
     // Find a free slot
     for (i, slot) in table.iter_mut().enumerate() {
         if slot.is_none() {
@@ -72,7 +72,7 @@ pub fn open(vfs: &mut Vfs, path: &str, flags: u64) -> u64 {
 
 /// Close a file descriptor. Writes back to VFS if modified.
 pub fn close(vfs: &mut Vfs, fd: u64) -> u64 {
-    let table = fd_table();
+    let table = FD_TABLE.get_mut();
     let fd = fd as usize;
     if fd >= table.len() {
         return u64::MAX;
@@ -87,14 +87,7 @@ pub fn close(vfs: &mut Vfs, fd: u64) -> u64 {
 
 /// Read from a file descriptor.
 pub fn read(fd: u64, buf: &mut [u8]) -> u64 {
-    let table = fd_table();
-    let fd = fd as usize;
-    if fd >= table.len() {
-        return u64::MAX;
-    }
-    let Some(file) = table[fd].as_mut() else {
-        return u64::MAX;
-    };
+    let Some(file) = get_file(fd) else { return u64::MAX };
     let available = file.data.len().saturating_sub(file.position);
     let count = buf.len().min(available);
     buf[..count].copy_from_slice(&file.data[file.position..file.position + count]);
@@ -104,14 +97,7 @@ pub fn read(fd: u64, buf: &mut [u8]) -> u64 {
 
 /// Write to a file descriptor.
 pub fn write(fd: u64, buf: &[u8]) -> u64 {
-    let table = fd_table();
-    let fd = fd as usize;
-    if fd >= table.len() {
-        return u64::MAX;
-    }
-    let Some(file) = table[fd].as_mut() else {
-        return u64::MAX;
-    };
+    let Some(file) = get_file(fd) else { return u64::MAX };
     if !file.writable {
         return u64::MAX;
     }
@@ -129,14 +115,7 @@ pub fn write(fd: u64, buf: &[u8]) -> u64 {
 /// Seek in a file descriptor.
 /// whence: 0=Start, 1=Current, 2=End
 pub fn seek(fd: u64, offset: i64, whence: u64) -> u64 {
-    let table = fd_table();
-    let fd = fd as usize;
-    if fd >= table.len() {
-        return u64::MAX;
-    }
-    let Some(file) = table[fd].as_mut() else {
-        return u64::MAX;
-    };
+    let Some(file) = get_file(fd) else { return u64::MAX };
 
     let new_pos = match whence {
         0 => offset as usize,                                    // SEEK_SET
@@ -152,14 +131,7 @@ pub fn seek(fd: u64, offset: i64, whence: u64) -> u64 {
 /// Get file metadata. Returns (file_type << 32) | size.
 /// file_type: 1 = regular file
 pub fn fstat(fd: u64) -> u64 {
-    let table = fd_table();
-    let fd = fd as usize;
-    if fd >= table.len() {
-        return u64::MAX;
-    }
-    let Some(file) = table[fd].as_ref() else {
-        return u64::MAX;
-    };
+    let Some(file) = get_file(fd) else { return u64::MAX };
     let file_type: u64 = 1; // regular file
     let size = file.data.len() as u64;
     (file_type << 32) | size
@@ -167,14 +139,7 @@ pub fn fstat(fd: u64) -> u64 {
 
 /// Flush a file descriptor (write data back to VFS without closing).
 pub fn fsync(vfs: &mut Vfs, fd: u64) -> u64 {
-    let table = fd_table();
-    let fd = fd as usize;
-    if fd >= table.len() {
-        return u64::MAX;
-    }
-    let Some(file) = table[fd].as_mut() else {
-        return u64::MAX;
-    };
+    let Some(file) = get_file(fd) else { return u64::MAX };
     if file.modified && file.writable {
         vfs.write_file(&file.path, &file.data);
         file.modified = false;
@@ -184,7 +149,7 @@ pub fn fsync(vfs: &mut Vfs, fd: u64) -> u64 {
 
 /// Close all open file descriptors (called on process exit).
 pub fn close_all(vfs: &mut Vfs) {
-    let table = fd_table();
+    let table = FD_TABLE.get_mut();
     for slot in table.iter_mut() {
         if let Some(file) = slot.take() {
             if file.modified && file.writable {

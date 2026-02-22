@@ -24,18 +24,41 @@ pub unsafe extern "sysv64" fn _start(kernel_args: KernelArgs) -> ! {
     serial::init();
     let _ = write!(serial::SerialWriter, "{:?}\n", kernel_args);
 
-    // Initialize allocator first — no allocations before this point
     let entry_count = kernel_args.memory_map_size as usize / core::mem::size_of::<MemoryMapEntry>();
     let maps = core::slice::from_raw_parts(
         kernel_args.memory_map_addr as *const MemoryMapEntry,
         entry_count,
     );
+    let initrd = core::slice::from_raw_parts(
+        kernel_args.initrd_addr as *const u8,
+        kernel_args.initrd_size as usize,
+    );
+    let kernel_elf = core::slice::from_raw_parts(
+        kernel_args.kernel_elf_addr as *const u8,
+        kernel_args.kernel_elf_size as usize,
+    );
+    let init_path = core::str::from_utf8_unchecked(core::slice::from_raw_parts(
+        kernel_args.init_program_addr as *const u8,
+        kernel_args.init_program_len as usize,
+    ));
+
+    kernel_main(&kernel_args, maps, initrd, kernel_elf, init_path);
+}
+
+fn kernel_main(
+    kernel_args: &KernelArgs,
+    maps: &[MemoryMapEntry],
+    initrd: &[u8],
+    kernel_elf: &[u8],
+    init_path: &str,
+) -> ! {
+    // Initialize allocator first — no allocations before this point
     let reserved = [
         allocator::Region { start: kernel_args.kernel_memory_addr, end: kernel_args.kernel_memory_addr + kernel_args.kernel_memory_size },
         allocator::Region { start: kernel_args.initrd_addr, end: kernel_args.initrd_addr + kernel_args.initrd_size },
         allocator::Region { start: kernel_args.kernel_elf_addr, end: kernel_args.kernel_elf_addr + kernel_args.kernel_elf_size },
     ];
-    allocator::init(maps, &reserved);
+    unsafe { allocator::init(maps, &reserved); }
 
     // Build our own page tables (identity-mapped, kernel-only).
     // Must happen right after allocator init, before UEFI's page table pages
@@ -45,36 +68,35 @@ pub unsafe extern "sysv64" fn _start(kernel_args: KernelArgs) -> ! {
     serial::println("Hello from Kernel!");
 
     // Mount initrd ramdisk (needed to load font)
-    assert!(kernel_args.initrd_size > 0, "No initrd provided");
-    serial::println(&format!(
+    assert!(!initrd.is_empty(), "No initrd provided");
+    let _ = writeln!(serial::SerialWriter,
         "Initrd: addr={:#x} size={} bytes",
-        kernel_args.initrd_addr, kernel_args.initrd_size
-    ));
-
-    let ramdisk = ramdisk::RamDisk::new(
-        kernel_args.initrd_addr as *mut u8,
-        kernel_args.initrd_size as usize,
+        initrd.as_ptr() as u64, initrd.len()
     );
+
+    let ramdisk = unsafe { ramdisk::RamDisk::new(initrd.as_ptr() as *mut u8, initrd.len()) };
     let mut initrd_fs = tyfs::SimpleFs::mount(ramdisk).expect("Failed to mount initrd");
     serial::println("TYFS: mounted initrd");
     for (name, size) in initrd_fs.list() {
-        serial::println(&format!("  {} ({} bytes)", name, size));
+        let _ = writeln!(serial::SerialWriter, "  {} ({} bytes)", name, size);
     }
 
     // Initialize framebuffer console
-    serial::println(&format!(
+    let _ = writeln!(serial::SerialWriter,
         "GOP: {}x{} stride={} fmt={}",
         kernel_args.framebuffer_width, kernel_args.framebuffer_height,
         kernel_args.framebuffer_stride, kernel_args.framebuffer_pixel_format
-    ));
-    let fb = framebuffer::Framebuffer::new(
-        kernel_args.framebuffer_addr,
-        kernel_args.framebuffer_size,
-        kernel_args.framebuffer_width,
-        kernel_args.framebuffer_height,
-        kernel_args.framebuffer_stride,
-        kernel_args.framebuffer_pixel_format,
     );
+    let fb = unsafe {
+        framebuffer::Framebuffer::new(
+            kernel_args.framebuffer_addr,
+            kernel_args.framebuffer_size,
+            kernel_args.framebuffer_width,
+            kernel_args.framebuffer_height,
+            kernel_args.framebuffer_stride,
+            kernel_args.framebuffer_pixel_format,
+        )
+    };
     let font_data = initrd_fs
         .read_file("font.bin")
         .expect("Failed to load font.bin from rootfs");
@@ -82,10 +104,9 @@ pub unsafe extern "sysv64" fn _start(kernel_args: KernelArgs) -> ! {
 
     // From here on, log::println outputs to both serial and framebuffer
     log::println("ToyOS Kernel initialized");
-    log::println(&format!(
-        "Framebuffer: {}x{} stride={}",
+    log!("Framebuffer: {}x{} stride={}",
         kernel_args.framebuffer_width, kernel_args.framebuffer_height, kernel_args.framebuffer_stride
-    ));
+    );
 
     // Initialize NVMe for persistent storage
     let ecam_base = acpi::find_ecam_base(kernel_args.rsdp_addr)
@@ -124,13 +145,7 @@ pub unsafe extern "sysv64" fn _start(kernel_args: KernelArgs) -> ! {
     idt::set_kernel_base(kernel_args.kernel_memory_addr);
 
     // Load kernel symbols for crash diagnostics
-    if kernel_args.kernel_elf_size > 0 {
-        let kernel_elf = unsafe {
-            core::slice::from_raw_parts(
-                kernel_args.kernel_elf_addr as *const u8,
-                kernel_args.kernel_elf_size as usize,
-            )
-        };
+    if !kernel_elf.is_empty() {
         symbols::load_kernel(kernel_elf, kernel_args.kernel_memory_addr);
     }
 
@@ -147,11 +162,6 @@ pub unsafe extern "sysv64" fn _start(kernel_args: KernelArgs) -> ! {
     syscall::set_vfs(&mut vfs);
 
     // Run init program (if specified)
-    let init_path = unsafe {
-        let ptr = kernel_args.init_program_addr as *const u8;
-        let len = kernel_args.init_program_len as usize;
-        core::str::from_utf8_unchecked(core::slice::from_raw_parts(ptr, len))
-    };
     if !init_path.is_empty() {
         let args: Vec<&str> = init_path.split_whitespace().collect();
         let cmd = args[0];
@@ -161,7 +171,7 @@ pub unsafe extern "sysv64" fn _start(kernel_args: KernelArgs) -> ! {
         } else {
             format!("/initrd/{}", cmd)
         };
-        log::println(&format!("init: running {}", path));
+        log!("init: running {}", path);
         let data = vfs.read_file(&path)
             .unwrap_or_else(|| panic!("init: {} not found", path));
         process::run(&data, &args);

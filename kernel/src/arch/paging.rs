@@ -5,6 +5,7 @@ use alloc::alloc::alloc_zeroed;
 
 use super::cpu;
 use crate::MemoryMapEntry;
+use crate::sync::SyncCell;
 
 const PAGE_PRESENT: u64 = 1 << 0;
 const PAGE_WRITE: u64 = 1 << 1;
@@ -15,7 +16,7 @@ const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 const PAGE_4K: u64 = 4096;
 const PAGE_2M: u64 = 2 * 1024 * 1024;
 
-static mut PML4: *mut u64 = null_mut();
+static PML4: SyncCell<*mut u64> = SyncCell::new(null_mut());
 
 /// Allocate a zeroed, page-aligned 4KB page for page table structures.
 fn alloc_page() -> *mut u64 {
@@ -59,10 +60,8 @@ pub fn init(memory_map: &[MemoryMapEntry]) {
         addr += PAGE_2M;
     }
 
-    unsafe {
-        PML4 = pml4;
-        cpu::write_cr3(pml4 as u64);
-    }
+    *PML4.get_mut() = pml4;
+    unsafe { cpu::write_cr3(pml4 as u64) };
 }
 
 /// Get or create a next-level page table at the given index.
@@ -103,7 +102,7 @@ unsafe fn split_2m(pd: *mut u64, pd_idx: usize) -> *mut u64 {
 /// Mark a physical address range as user-accessible (PRESENT | WRITE | USER).
 /// Splits 2MB large pages into 4KB pages as needed.
 pub fn map_user(addr: u64, size: u64) {
-    let pml4 = unsafe { PML4 };
+    let pml4 = *PML4.get();
     assert!(!pml4.is_null(), "paging: not initialized");
 
     let start = addr & !0xFFF;
@@ -153,7 +152,7 @@ pub fn map_user(addr: u64, size: u64) {
 /// Identity-map an MMIO region as kernel-only using 2MB large pages.
 /// Call this before accessing PCI BARs that lie outside the initial mapping.
 pub fn map_kernel(addr: u64, size: u64) {
-    let pml4 = unsafe { PML4 };
+    let pml4 = *PML4.get();
     assert!(!pml4.is_null(), "paging: not initialized");
 
     let start = addr & !(PAGE_2M - 1); // round down to 2MB
@@ -183,7 +182,7 @@ pub fn map_kernel(addr: u64, size: u64) {
 
 /// Remove user-accessible flag from a physical address range.
 pub fn unmap_user(addr: u64, size: u64) {
-    let pml4 = unsafe { PML4 };
+    let pml4 = *PML4.get();
     assert!(!pml4.is_null(), "paging: not initialized");
 
     let start = addr & !0xFFF;

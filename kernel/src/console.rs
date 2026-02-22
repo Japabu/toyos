@@ -1,8 +1,8 @@
 use alloc::vec::Vec;
-use core::cell::UnsafeCell;
 
 use crate::font::{self, Font};
 use crate::drivers::framebuffer::{Color, Framebuffer};
+use crate::sync::SyncCell;
 
 const DEFAULT_FG: Color = Color { r: 255, g: 255, b: 255 };
 const DEFAULT_BG: Color = Color { r: 0, g: 0, b: 0 };
@@ -320,74 +320,52 @@ impl Console {
 
 // Global singleton
 
-struct GlobalConsole {
-    inner: UnsafeCell<Option<Console>>,
-}
-
-unsafe impl Sync for GlobalConsole {}
-
-static CONSOLE: GlobalConsole = GlobalConsole {
-    inner: UnsafeCell::new(None),
-};
+static CONSOLE: SyncCell<Option<Console>> = SyncCell::new(None);
 
 pub fn init(fb: Framebuffer, font_data: Vec<u8>) {
-    unsafe {
-        *CONSOLE.inner.get() = Some(Console::new(fb, font_data));
-    }
+    *CONSOLE.get_mut() = Some(Console::new(fb, font_data));
 }
 
 pub fn println(s: &str) {
-    unsafe {
-        if let Some(console) = &mut *CONSOLE.inner.get() {
-            console.write_str(s);
-            console.write_byte(b'\n');
-        }
+    if let Some(console) = CONSOLE.get_mut() {
+        console.write_str(s);
+        console.write_byte(b'\n');
     }
 }
 
 pub fn write_str(s: &str) {
-    unsafe {
-        if let Some(console) = &mut *CONSOLE.inner.get() {
-            console.write_str(s);
-        }
+    if let Some(console) = CONSOLE.get_mut() {
+        console.write_str(s);
     }
 }
 
 pub fn putchar(b: u8) {
-    unsafe {
-        if let Some(console) = &mut *CONSOLE.inner.get() {
-            console.write_byte(b);
-        }
+    if let Some(console) = CONSOLE.get_mut() {
+        console.write_byte(b);
     }
 }
 
 pub fn clear() {
-    unsafe {
-        if let Some(console) = &mut *CONSOLE.inner.get() {
-            console.fb.clear(console.bg);
-            console.cursor_col = 0;
-            console.cursor_row = 0;
-        }
+    if let Some(console) = CONSOLE.get_mut() {
+        console.fb.clear(console.bg);
+        console.cursor_col = 0;
+        console.cursor_row = 0;
     }
 }
 
 pub fn screen_size() -> (usize, usize) {
-    unsafe {
-        if let Some(console) = &*CONSOLE.inner.get() {
-            (console.cols, console.rows)
-        } else {
-            (80, 24)
-        }
+    if let Some(console) = CONSOLE.get() {
+        (console.cols, console.rows)
+    } else {
+        (80, 24)
     }
 }
 
 pub fn backspace() {
-    unsafe {
-        if let Some(console) = &mut *CONSOLE.inner.get() {
-            if console.cursor_col > 0 {
-                console.cursor_col -= 1;
-                console.draw_char(console.cursor_col, console.cursor_row, b' ');
-            }
+    if let Some(console) = CONSOLE.get_mut() {
+        if console.cursor_col > 0 {
+            console.cursor_col -= 1;
+            console.draw_char(console.cursor_col, console.cursor_row, b' ');
         }
     }
 }

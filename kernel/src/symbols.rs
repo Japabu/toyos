@@ -1,11 +1,13 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use core::fmt::Write;
 use alloc::format;
 use elf::ElfBytes;
 use elf::endian::AnyEndian;
 use elf::abi::STT_FUNC;
 use crate::drivers::serial;
+use crate::sync::SyncCell;
 
 struct Symbol {
     addr: u64,
@@ -59,23 +61,21 @@ impl SymbolTable {
 }
 
 // Userland process symbols (cleared between process runs)
-static mut PROCESS_SYMS: SymbolTable = SymbolTable::new();
+static PROCESS_SYMS: SyncCell<SymbolTable> = SyncCell::new(SymbolTable::new());
 // Kernel symbols (loaded once at boot, never cleared)
-static mut KERNEL_SYMS: SymbolTable = SymbolTable::new();
+static KERNEL_SYMS: SyncCell<SymbolTable> = SyncCell::new(SymbolTable::new());
 // Memory range of loaded program (for backtrace address validation)
-static mut PROG_BASE: u64 = 0;
-static mut PROG_END: u64 = 0;
-static mut STACK_BASE: u64 = 0;
-static mut STACK_END: u64 = 0;
+static PROG_BASE: SyncCell<u64> = SyncCell::new(0);
+static PROG_END: SyncCell<u64> = SyncCell::new(0);
+static STACK_BASE: SyncCell<u64> = SyncCell::new(0);
+static STACK_END: SyncCell<u64> = SyncCell::new(0);
 
 pub fn clear() {
-    unsafe {
-        (&raw mut PROCESS_SYMS).as_mut().unwrap().clear();
-        (&raw mut PROG_BASE).write(0);
-        (&raw mut PROG_END).write(0);
-        (&raw mut STACK_BASE).write(0);
-        (&raw mut STACK_END).write(0);
-    }
+    PROCESS_SYMS.get_mut().clear();
+    *PROG_BASE.get_mut() = 0;
+    *PROG_END.get_mut() = 0;
+    *STACK_BASE.get_mut() = 0;
+    *STACK_END.get_mut() = 0;
 }
 
 /// Demangle a Rust symbol name (supports both legacy `_ZN...E` and v0 `_R...` mangling).
@@ -85,20 +85,20 @@ fn demangle(mangled: &str) -> String {
 
 /// Look up a symbol by runtime address (checks both process and kernel symbols).
 pub fn resolve(addr: u64) -> Option<(String, u64)> {
-    let process = unsafe { &*(&raw const PROCESS_SYMS) };
+    let process = PROCESS_SYMS.get();
     if let Some(result) = process.resolve(addr) {
         return Some(result);
     }
-    let kernel = unsafe { &*(&raw const KERNEL_SYMS) };
+    let kernel = KERNEL_SYMS.get();
     kernel.resolve(addr)
 }
 
 /// Check if an address is in user-accessible memory (program or stack).
 pub fn is_valid_user_addr(addr: u64) -> bool {
-    let prog_base = unsafe { *(&raw const PROG_BASE) };
-    let prog_end = unsafe { *(&raw const PROG_END) };
-    let stack_base = unsafe { *(&raw const STACK_BASE) };
-    let stack_end = unsafe { *(&raw const STACK_END) };
+    let prog_base = *PROG_BASE.get();
+    let prog_end = *PROG_END.get();
+    let stack_base = *STACK_BASE.get();
+    let stack_end = *STACK_END.get();
     (addr >= prog_base && addr < prog_end) || (addr >= stack_base && addr < stack_end)
 }
 
@@ -138,24 +138,22 @@ fn parse_symtab(data: &[u8], base: u64, table: &mut SymbolTable) {
 
 /// Load userland process symbols from raw ELF bytes.
 pub fn load_process(data: &[u8], base: u64) {
-    let table = unsafe { &mut *(&raw mut PROCESS_SYMS) };
+    let table = PROCESS_SYMS.get_mut();
     parse_symtab(data, base, table);
-    serial::println(&format!("symbols: loaded {} process symbols", table.symbols.len()));
+    let _ = writeln!(serial::SerialWriter, "symbols: loaded {} process symbols", table.symbols.len());
 }
 
 /// Load kernel symbols from raw ELF bytes. Called once at boot.
 pub fn load_kernel(data: &[u8], base: u64) {
-    let table = unsafe { &mut *(&raw mut KERNEL_SYMS) };
+    let table = KERNEL_SYMS.get_mut();
     parse_symtab(data, base, table);
-    serial::println(&format!("symbols: loaded {} kernel symbols", table.symbols.len()));
+    let _ = writeln!(serial::SerialWriter, "symbols: loaded {} kernel symbols", table.symbols.len());
 }
 
 /// Record the memory ranges of a loaded process for backtrace validation.
 pub fn set_process_ranges(prog_base: u64, prog_end: u64, stack_base: u64, stack_end: u64) {
-    unsafe {
-        (&raw mut PROG_BASE).write(prog_base);
-        (&raw mut PROG_END).write(prog_end);
-        (&raw mut STACK_BASE).write(stack_base);
-        (&raw mut STACK_END).write(stack_end);
-    }
+    *PROG_BASE.get_mut() = prog_base;
+    *PROG_END.get_mut() = prog_end;
+    *STACK_BASE.get_mut() = stack_base;
+    *STACK_END.get_mut() = stack_end;
 }

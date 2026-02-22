@@ -105,7 +105,7 @@ fn exec(
         "cd" => {
             let target = if arg.is_empty() { "/" } else { arg };
             if !vfs.cd(target) {
-                log::println(&format!("cd: {}: no such directory", target));
+                log!("cd: {}: no such directory", target);
             }
         }
         "ls" => match vfs.list(arg) {
@@ -115,14 +115,14 @@ fn exec(
                 } else {
                     for (name, size) in &files {
                         if name.ends_with('/') {
-                            log::println(&format!("  {}", name));
+                            log!("  {}", name);
                         } else {
-                            log::println(&format!("  {} ({} bytes)", name, size));
+                            log!("  {} ({} bytes)", name, size);
                         }
                     }
                 }
             }
-            Err(e) => log::println(&format!("ls: {}", e)),
+            Err(e) => log!("ls: {}", e),
         },
         "cat" => {
             if arg.is_empty() {
@@ -130,15 +130,15 @@ fn exec(
             } else {
                 let (mount, file) = vfs.resolve_path(arg);
                 if file.is_empty() {
-                    log::println(&format!("cat: /{}: is a directory", mount));
+                    log!("cat: /{}: is a directory", mount);
                 } else if let Some(data) = vfs.read_file(arg) {
                     if let Ok(text) = core::str::from_utf8(&data) {
                         log::println(text);
                     } else {
-                        log::println(&format!("{}: {} bytes (binary)", file, data.len()));
+                        log!("{}: {} bytes (binary)", file, data.len());
                     }
                 } else {
-                    log::println(&format!("{}: file not found", arg));
+                    log!("{}: file not found", arg);
                 }
             }
         }
@@ -150,9 +150,9 @@ fn exec(
                 if file.is_empty() {
                     log::println("rm: cannot remove a mount point");
                 } else if vfs.delete(arg) {
-                    log::println(&format!("{}: deleted", file));
+                    log!("{}: deleted", file);
                 } else {
-                    log::println(&format!("{}: file not found", arg));
+                    log!("{}: file not found", arg);
                 }
             }
         }
@@ -164,7 +164,7 @@ fn exec(
                 if file.is_empty() {
                     log::println("write: need a filename");
                 } else if !vfs.mount_exists(&mount) {
-                    log::println(&format!("write: /{}: no such directory", mount));
+                    log!("write: /{}: no such directory", mount);
                 } else {
                     log::println("Enter text (type . on a line by itself to save):");
                     *editing_file = Some(String::from(arg));
@@ -180,14 +180,14 @@ fn exec(
                 if file.is_empty() {
                     log::println("edit: need a filename");
                 } else if !vfs.mount_exists(&mount) {
-                    log::println(&format!("edit: /{}: no such directory", mount));
+                    log!("edit: /{}: no such directory", mount);
                 } else {
                     if let Some(data) = vfs.read_file(arg) {
                         if let Ok(text) = core::str::from_utf8(&data) {
                             log::println("Current contents:");
                             log::println(text);
                         } else {
-                            log::println(&format!("{}: binary file, cannot edit", file));
+                            log!("{}: binary file, cannot edit", file);
                             return;
                         }
                     } else {
@@ -217,10 +217,10 @@ fn exec(
                     let code = process::run(&data, &args);
                     crate::fd::close_all(vfs);
                     if code != 0 {
-                        log::println(&format!("Process exited with code {}", code));
+                        log!("Process exited with code {}", code);
                     }
                 } else {
-                    log::println(&format!("{}: file not found", file));
+                    log!("{}: file not found", file);
                 }
             }
         }
@@ -236,10 +236,10 @@ fn exec(
                 let code = process::run(&data, &args);
                 crate::fd::close_all(vfs);
                 if code != 0 {
-                    log::println(&format!("Process exited with code {}", code));
+                    log!("Process exited with code {}", code);
                 }
             } else {
-                log::println(&format!("Unknown command: {}", cmd));
+                log!("Unknown command: {}", cmd);
             }
         }
     }

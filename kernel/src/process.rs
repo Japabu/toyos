@@ -2,7 +2,7 @@ use alloc::alloc::{alloc_zeroed, Layout};
 use alloc::vec::Vec;
 use core::arch::asm;
 
-use alloc::format;
+use core::fmt::Write;
 use crate::arch::{gdt, paging, syscall};
 use crate::drivers::serial;
 use crate::{elf, log, symbols};
@@ -75,7 +75,7 @@ pub fn run(data: &[u8], args: &[&str]) -> i32 {
         *((sp + 8 + args.len() as u64 * 8) as *mut u64) = 0; // NULL
     }
 
-    serial::println(&format!("process: entry={:#x}, stack={:#x}, argc={}", loaded.entry, sp, args.len()));
+    let _ = writeln!(serial::SerialWriter, "process: entry={:#x}, stack={:#x}, argc={}", loaded.entry, sp, args.len());
     let exit_code = execute(loaded.entry, sp);
 
     // Clear symbols on process exit
@@ -88,9 +88,9 @@ pub fn run(data: &[u8], args: &[&str]) -> i32 {
 fn execute(entry: u64, stack_top: u64) -> i32 {
     let code: u64;
     unsafe {
-        let krsp_ptr = &raw mut syscall::SYSCALL_KERNEL_RSP as *mut u64;
+        let krsp_ptr = syscall::SYSCALL_KERNEL_RSP.as_ptr();
         let tss_rsp0_ptr = gdt::tss_rsp0_ptr();
-        (&raw mut syscall::PROCESS_ACTIVE).write(true);
+        *syscall::PROCESS_ACTIVE.get_mut() = true;
 
         // Save callee-saved registers on the kernel stack, then enter ring 3
         // via iretq. sys_exit restores the kernel RSP and `ret`s to label 2:.

@@ -1,8 +1,10 @@
 use core::ptr::{read_volatile, write_volatile, write_bytes, copy_nonoverlapping};
 use core::sync::atomic::{fence, Ordering};
-use super::{mmio, pci};
+use super::mmio::Mmio;
+use super::pci::PciDevice;
+use super::DmaPool;
 use crate::log;
-use alloc::format;
+use crate::sync::SyncCell;
 
 // NVMe register offsets (BAR0 MMIO)
 const REG_CAP: u64 = 0x00;
@@ -58,9 +60,7 @@ struct CqEntry {
     status: u16, // bit 0 = phase, bits [15:1] = status
 }
 
-// DMA memory pool: 6 pages for buffers + 1 page for alignment padding.
-// The kernel may be loaded at a non-page-aligned address, so we over-allocate
-// and find a page-aligned region at runtime.
+// DMA memory pool
 //   Page 0: Admin SQ (16 * 64 = 1024 bytes)
 //   Page 1: Admin CQ (16 * 16 = 256 bytes)
 //   Page 2: I/O SQ
@@ -68,17 +68,14 @@ struct CqEntry {
 //   Page 4: Identify buffer (4096 bytes)
 //   Page 5: Data buffer (4096 bytes)
 const DMA_PAGES: usize = 6;
-const DMA_POOL_SIZE: usize = (DMA_PAGES + 1) * 4096;
-static mut DMA_POOL: [u8; DMA_POOL_SIZE] = [0; DMA_POOL_SIZE];
+static DMA_POOL: SyncCell<DmaPool<DMA_PAGES>> = SyncCell::new(DmaPool::new());
 
 fn dma_page(index: usize) -> u64 {
-    let raw = core::ptr::addr_of!(DMA_POOL) as u64;
-    let base = (raw + 4095) & !4095;
-    base + (index as u64) * 4096
+    DMA_POOL.get().page_addr(index)
 }
 
 pub struct NvmeController {
-    bar: u64,
+    bar: Mmio,
     stride: u32,
     admin_sq: *mut SqEntry,
     admin_cq: *mut CqEntry,
@@ -111,7 +108,7 @@ impl NvmeController {
         }
         self.admin_sq_tail = (self.admin_sq_tail + 1) % QUEUE_DEPTH as u16;
         fence(Ordering::Release);
-        mmio::write_u32(self.bar, self.sq_doorbell_offset(0), self.admin_sq_tail as u32);
+        self.bar.write_u32(self.sq_doorbell_offset(0), self.admin_sq_tail as u32);
     }
 
     fn wait_admin_completion(&mut self) -> u16 {
@@ -126,9 +123,9 @@ impl NvmeController {
                 if self.admin_cq_head == 0 {
                     self.admin_phase = !self.admin_phase;
                 }
-                mmio::write_u32(self.bar, self.cq_doorbell_offset(0), self.admin_cq_head as u32);
+                self.bar.write_u32(self.cq_doorbell_offset(0), self.admin_cq_head as u32);
                 if status != 0 {
-                    log::println(&format!("NVMe: admin cmd failed, status={:#x}", status));
+                    log!("NVMe: admin cmd failed, status={:#x}", status);
                 }
                 return status;
             }
@@ -142,7 +139,7 @@ impl NvmeController {
         }
         self.io_sq_tail = (self.io_sq_tail + 1) % QUEUE_DEPTH as u16;
         fence(Ordering::Release);
-        mmio::write_u32(self.bar, self.sq_doorbell_offset(1), self.io_sq_tail as u32);
+        self.bar.write_u32(self.sq_doorbell_offset(1), self.io_sq_tail as u32);
     }
 
     fn wait_io_completion(&mut self) -> u16 {
@@ -157,9 +154,9 @@ impl NvmeController {
                 if self.io_cq_head == 0 {
                     self.io_phase = !self.io_phase;
                 }
-                mmio::write_u32(self.bar, self.cq_doorbell_offset(1), self.io_cq_head as u32);
+                self.bar.write_u32(self.cq_doorbell_offset(1), self.io_cq_head as u32);
                 if status != 0 {
-                    log::println(&format!("NVMe: I/O cmd failed, status={:#x}", status));
+                    log!("NVMe: I/O cmd failed, status={:#x}", status);
                 }
                 return status;
             }
@@ -237,7 +234,7 @@ impl NvmeController {
             let lba_ds = ((lba_fmt >> 16) & 0xFF) as u32;
             self.sector_size = 1 << lba_ds;
             self.ns_size = nsze;
-            log::println(&format!("NVMe: NS1 size={} sectors, sector_size={}", nsze, self.sector_size));
+            log!("NVMe: NS1 size={} sectors, sector_size={}", nsze, self.sector_size);
         }
     }
 
@@ -381,26 +378,26 @@ impl tyfs::Disk for NvmeDisk {
 
 pub fn init(ecam_base: u64) -> Option<NvmeController> {
     // Find NVMe controller (class=01 Mass Storage, subclass=08 NVM)
-    let (bus, dev, func) = pci::find_device(ecam_base, 0x01, 0x08, None)?;
-    log::println(&format!("NVMe: found at PCI {:02x}:{:02x}.{}", bus, dev, func));
+    let pci_dev = PciDevice::find(ecam_base, 0x01, 0x08, None)?;
+    log!("NVMe: found at PCI {:02x}:{:02x}.{}", pci_dev.bus, pci_dev.dev, pci_dev.func);
 
     // Read BAR0 and enable bus mastering
-    let bar = pci::read_bar0_64(ecam_base, bus, dev, func);
-    pci::enable_bus_master(ecam_base, bus, dev, func);
-    log::println(&format!("NVMe: BAR0={:#x}", bar));
+    let bar = Mmio::new(pci_dev.bar0_64());
+    pci_dev.enable_bus_master();
+    log!("NVMe: BAR0={:#x}", bar.addr());
 
     // Map BAR MMIO region into our page tables
-    crate::arch::paging::map_kernel(bar, 0x4000); // NVMe register space
+    crate::arch::paging::map_kernel(bar.addr(), 0x4000); // NVMe register space
 
     // Read capabilities
-    let cap = mmio::read_u64(bar, REG_CAP);
+    let cap = bar.read_u64(REG_CAP);
     let stride = ((cap >> 32) & 0xF) as u32;
 
     // Disable controller
-    let cc = mmio::read_u32(bar, REG_CC);
+    let cc = bar.read_u32(REG_CC);
     if cc & 1 != 0 {
-        mmio::write_u32(bar, REG_CC, cc & !1);
-        while mmio::read_u32(bar, REG_CSTS) & 1 != 0 {
+        bar.write_u32(REG_CC, cc & !1);
+        while bar.read_u32(REG_CSTS) & 1 != 0 {
             core::hint::spin_loop();
         }
     }
@@ -421,19 +418,19 @@ pub fn init(ecam_base: u64) -> Option<NvmeController> {
 
     // Set admin queue attributes (ACQS | ASQS, both 0-based)
     let aqa = ((QUEUE_DEPTH as u32 - 1) << 16) | (QUEUE_DEPTH as u32 - 1);
-    mmio::write_u32(bar, REG_AQA, aqa);
+    bar.write_u32(REG_AQA, aqa);
 
     // Set admin queue base addresses (physical = virtual, identity mapped)
-    mmio::write_u64(bar, REG_ASQ, admin_sq as u64);
-    mmio::write_u64(bar, REG_ACQ, admin_cq as u64);
-    log::println(&format!("NVMe: ASQ={:#x} ACQ={:#x}", admin_sq as u64, admin_cq as u64));
+    bar.write_u64(REG_ASQ, admin_sq as u64);
+    bar.write_u64(REG_ACQ, admin_cq as u64);
+    log!("NVMe: ASQ={:#x} ACQ={:#x}", admin_sq as u64, admin_cq as u64);
 
     // Enable controller: EN=1, CSS=0 (NVM), MPS=0 (4KB), IOSQES=6 (64B), IOCQES=4 (16B)
     let cc = 1 | (6 << 16) | (4 << 20);
-    mmio::write_u32(bar, REG_CC, cc);
+    bar.write_u32(REG_CC, cc);
 
     // Wait for ready
-    while mmio::read_u32(bar, REG_CSTS) & 1 == 0 {
+    while bar.read_u32(REG_CSTS) & 1 == 0 {
         core::hint::spin_loop();
     }
     log::println("NVMe: controller enabled");

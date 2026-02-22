@@ -1,49 +1,40 @@
-use core::cell::UnsafeCell;
+use crate::sync::SyncCell;
 
 // Ring buffer for translated key characters
 const BUF_SIZE: usize = 256;
 
 struct KeyBuffer {
-    buf: UnsafeCell<[u8; BUF_SIZE]>,
-    head: UnsafeCell<usize>,
-    tail: UnsafeCell<usize>,
+    buf: [u8; BUF_SIZE],
+    head: usize,
+    tail: usize,
 }
 
-unsafe impl Sync for KeyBuffer {}
-
-static KEY_BUF: KeyBuffer = KeyBuffer {
-    buf: UnsafeCell::new([0; BUF_SIZE]),
-    head: UnsafeCell::new(0),
-    tail: UnsafeCell::new(0),
-};
+static KEY_BUF: SyncCell<KeyBuffer> = SyncCell::new(KeyBuffer {
+    buf: [0; BUF_SIZE],
+    head: 0,
+    tail: 0,
+});
 
 /// Called from the USB HID driver with a pre-translated ASCII byte.
 pub fn handle_key(ascii: u8) {
     if ascii == 0 {
         return;
     }
-    unsafe {
-        let buf = &mut *KEY_BUF.buf.get();
-        let head = &mut *KEY_BUF.head.get();
-        let tail = *KEY_BUF.tail.get();
-        let next = (*head + 1) % BUF_SIZE;
-        if next != tail {
-            buf[*head] = ascii;
-            *head = next;
-        }
+    let kb = KEY_BUF.get_mut();
+    let next = (kb.head + 1) % BUF_SIZE;
+    if next != kb.tail {
+        kb.buf[kb.head] = ascii;
+        kb.head = next;
     }
 }
 
 /// Non-blocking read of the next character from the keyboard buffer.
 pub fn try_read_char() -> Option<u8> {
-    unsafe {
-        let head = *KEY_BUF.head.get();
-        let tail = &mut *KEY_BUF.tail.get();
-        if *tail == head {
-            return None;
-        }
-        let ch = (*KEY_BUF.buf.get())[*tail];
-        *tail = (*tail + 1) % BUF_SIZE;
-        Some(ch)
+    let kb = KEY_BUF.get_mut();
+    if kb.tail == kb.head {
+        return None;
     }
+    let ch = kb.buf[kb.tail];
+    kb.tail = (kb.tail + 1) % BUF_SIZE;
+    Some(ch)
 }

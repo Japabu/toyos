@@ -1,7 +1,6 @@
 use core::ptr::{read_unaligned, read_volatile};
 use core::sync::atomic::{AtomicU16, Ordering};
 use crate::log;
-use alloc::format;
 
 static PM1A_CNT_PORT: AtomicU16 = AtomicU16::new(0);
 static SLP_TYPA: AtomicU16 = AtomicU16::new(0);
@@ -9,16 +8,16 @@ static SLP_TYPA: AtomicU16 = AtomicU16::new(0);
 /// Given the RSDP address from UEFI, parse XSDT → MCFG → return ECAM base address.
 pub fn find_ecam_base(rsdp_addr: u64) -> Option<u64> {
     let rsdp = rsdp_addr as *const u8;
-    log::println(&format!("ACPI: RSDP at {:#x}", rsdp_addr));
+    log!("ACPI: RSDP at {:#x}", rsdp_addr);
 
     let xsdt = get_xsdt_addr(rsdp);
-    log::println(&format!("ACPI: XSDT at {:#x}", xsdt as u64));
+    log!("ACPI: XSDT at {:#x}", xsdt as u64);
 
     let mcfg = find_table(xsdt, b"MCFG")?;
-    log::println(&format!("ACPI: MCFG found at {:#x}", mcfg as u64));
+    log!("ACPI: MCFG found at {:#x}", mcfg as u64);
 
     let ecam_base = read_ecam_base(mcfg);
-    log::println(&format!("ACPI: ECAM base address: {:#x}", ecam_base));
+    log!("ACPI: ECAM base address: {:#x}", ecam_base);
 
     Some(ecam_base)
 }
@@ -54,7 +53,7 @@ pub fn init_power(rsdp_addr: u64) {
 
     let slp_typ = find_s5_slp_typ(dsdt, dsdt_len).expect("ACPI: \\_S5_ not found in DSDT");
     SLP_TYPA.store(slp_typ, Ordering::Relaxed);
-    log::println(&format!("ACPI: PM1a={:#x} SLP_TYPa={}", pm1a, slp_typ));
+    log!("ACPI: PM1a={:#x} SLP_TYPa={}", pm1a, slp_typ);
 }
 
 /// Trigger ACPI S5 (soft-off) shutdown.
@@ -108,7 +107,7 @@ pub fn find_hpet_base(rsdp_addr: u64) -> Option<u64> {
     let hpet = find_table(xsdt, b"HPET")?;
     // HPET table: 36B SDT header + 4B Event Timer Block ID + 4B GAS header + 8B address
     let base = unsafe { read_unaligned(hpet.add(44) as *const u64) };
-    log::println(&format!("ACPI: HPET at {:#x}", base));
+    log!("ACPI: HPET at {:#x}", base);
     Some(base)
 }
 

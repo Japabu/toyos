@@ -5,32 +5,27 @@
 use alloc::alloc::{alloc_zeroed, Layout};
 use alloc::vec::Vec;
 use crate::arch::paging;
-use crate::drivers::serial;
+use crate::sync::SyncCell;
 
 const CHUNK_SIZE: usize = 1024 * 1024; // 1MB
 
 // Sorted list of free regions: (start, end)
-static mut FREE_LIST: Vec<(u64, u64)> = Vec::new();
-
-#[inline]
-unsafe fn free_list() -> &'static mut Vec<(u64, u64)> {
-    &mut *(&raw mut FREE_LIST)
-}
+static FREE_LIST: SyncCell<Vec<(u64, u64)>> = SyncCell::new(Vec::new());
 
 /// Reset the user heap. Called before executing a new program.
 pub fn init() {
-    unsafe { free_list().clear(); }
+    FREE_LIST.get_mut().clear();
     grow(CHUNK_SIZE);
 }
 
 /// Save current heap state (for nested exec).
 pub fn save() -> Vec<(u64, u64)> {
-    unsafe { free_list().clone() }
+    FREE_LIST.get_mut().clone()
 }
 
 /// Restore saved heap state.
 pub fn restore(saved: Vec<(u64, u64)>) {
-    unsafe { *free_list() = saved; }
+    *FREE_LIST.get_mut() = saved;
 }
 
 fn grow(min_size: usize) {
@@ -41,16 +36,14 @@ fn grow(min_size: usize) {
     paging::map_user(ptr as u64, size as u64);
     let start = ptr as u64;
     let end = start + size as u64;
-    unsafe {
-        let fl = free_list();
-        let pos = fl.iter().position(|&(s, _)| s > start).unwrap_or(fl.len());
-        fl.insert(pos, (start, end));
-    }
+    let fl = FREE_LIST.get_mut();
+    let pos = fl.iter().position(|&(s, _)| s > start).unwrap_or(fl.len());
+    fl.insert(pos, (start, end));
 }
 
 /// First-fit search across free regions.
-unsafe fn try_alloc(size: u64, align: u64) -> Option<u64> {
-    let fl = free_list();
+fn try_alloc(size: u64, align: u64) -> Option<u64> {
+    let fl = FREE_LIST.get_mut();
     for i in 0..fl.len() {
         let (start, end) = fl[i];
         let aligned = (start + align - 1) & !(align - 1);
@@ -78,37 +71,29 @@ pub fn alloc(size: usize, align: usize) -> u64 {
     let align = align.max(1) as u64;
     let sz = size as u64;
 
-    unsafe {
-        if let Some(addr) = try_alloc(sz, align) {
-            serial::println(&alloc::format!("alloc({}, {}) = {:#x}", size, align, addr));
-            return addr;
-        }
+    if let Some(addr) = try_alloc(sz, align) {
+        return addr;
     }
     grow(size + align as usize);
-    let addr = unsafe { try_alloc(sz, align).expect("user heap: alloc failed after grow") };
-    serial::println(&alloc::format!("alloc({}, {}) = {:#x}", size, align, addr));
-    addr
+    try_alloc(sz, align).expect("user heap: alloc failed after grow")
 }
 
 pub fn free(ptr: *mut u8, size: usize) {
     if ptr.is_null() || size == 0 { return; }
     let addr = ptr as u64;
-    serial::println(&alloc::format!("free({:#x}, {})", addr, size));
     let end = addr + size as u64;
-    unsafe {
-        let fl = free_list();
-        let pos = fl.iter().position(|&(s, _)| s > addr).unwrap_or(fl.len());
-        fl.insert(pos, (addr, end));
-        // Merge with next
-        if pos + 1 < fl.len() && fl[pos].1 >= fl[pos + 1].0 {
-            fl[pos].1 = fl[pos + 1].1;
-            fl.remove(pos + 1);
-        }
-        // Merge with prev
-        if pos > 0 && fl[pos - 1].1 >= fl[pos].0 {
-            fl[pos - 1].1 = fl[pos].1;
-            fl.remove(pos);
-        }
+    let fl = FREE_LIST.get_mut();
+    let pos = fl.iter().position(|&(s, _)| s > addr).unwrap_or(fl.len());
+    fl.insert(pos, (addr, end));
+    // Merge with next
+    if pos + 1 < fl.len() && fl[pos].1 >= fl[pos + 1].0 {
+        fl[pos].1 = fl[pos + 1].1;
+        fl.remove(pos + 1);
+    }
+    // Merge with prev
+    if pos > 0 && fl[pos - 1].1 >= fl[pos].0 {
+        fl[pos - 1].1 = fl[pos].1;
+        fl.remove(pos);
     }
 }
 

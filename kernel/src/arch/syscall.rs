@@ -3,6 +3,7 @@ use core::arch::{asm, naked_asm};
 use alloc::vec::Vec;
 use super::{cpu, gdt};
 use crate::drivers::serial;
+use crate::sync::SyncCell;
 use crate::{console, keyboard, user_heap, vfs::Vfs};
 
 // MSR addresses
@@ -31,24 +32,24 @@ const SYS_FSYNC: u64 = 15;
 const SYS_EXEC: u64 = 16;
 
 // Global VFS pointer (set once in main, lives for the duration of the kernel)
-pub(crate) static mut VFS_PTR: *mut Vfs = core::ptr::null_mut();
+pub(crate) static VFS_PTR: SyncCell<*mut Vfs> = SyncCell::new(core::ptr::null_mut());
 
 pub fn set_vfs(vfs: &mut Vfs) {
-    unsafe { (&raw mut VFS_PTR).write(vfs as *mut _); }
+    *VFS_PTR.get_mut() = vfs as *mut _;
 }
 
-unsafe fn vfs() -> &'static mut Vfs {
-    &mut *(&raw mut VFS_PTR).read()
+fn vfs() -> &'static mut Vfs {
+    unsafe { &mut **VFS_PTR.get_mut() }
 }
 
 // Output capture buffer for SYS_EXEC (redirects SYS_WRITE to buffer instead of console)
-static mut CAPTURE_BUF: Option<Vec<u8>> = None;
+static CAPTURE_BUF: SyncCell<Option<Vec<u8>>> = SyncCell::new(None);
 
 // Kernel/user RSP storage for stack switching (single-core, no swapgs needed)
 #[no_mangle]
-pub static mut SYSCALL_KERNEL_RSP: u64 = 0;
+pub static SYSCALL_KERNEL_RSP: SyncCell<u64> = SyncCell::new(0);
 #[no_mangle]
-static mut SYSCALL_USER_RSP: u64 = 0;
+static SYSCALL_USER_RSP: SyncCell<u64> = SyncCell::new(0);
 
 pub fn init() {
     // Enable syscall/sysret in EFER (set SCE bit 0)
@@ -90,7 +91,7 @@ extern "C" fn syscall_entry() {
 }
 
 // Whether a userspace process is active (checked by sys_exit)
-pub static mut PROCESS_ACTIVE: bool = false;
+pub static PROCESS_ACTIVE: SyncCell<bool> = SyncCell::new(false);
 
 extern "C" fn syscall_handler(num: u64, a1: u64, a2: u64, _: u64, a3: u64, a4: u64) -> u64 {
     match num {
@@ -111,9 +112,9 @@ extern "C" fn syscall_handler(num: u64, a1: u64, a2: u64, _: u64, a3: u64, a4: u
                 let slice = core::slice::from_raw_parts(a1 as *const u8, a2 as usize);
                 core::str::from_utf8_unchecked(slice)
             };
-            crate::fd::open(unsafe { vfs() }, path, a3)
+            crate::fd::open(vfs(), path, a3)
         }
-        SYS_CLOSE => crate::fd::close(unsafe { vfs() }, a1),
+        SYS_CLOSE => crate::fd::close(vfs(), a1),
         SYS_READ_FILE => {
             let buf = unsafe { core::slice::from_raw_parts_mut(a2 as *mut u8, a3 as usize) };
             crate::fd::read(a1, buf)
@@ -124,7 +125,7 @@ extern "C" fn syscall_handler(num: u64, a1: u64, a2: u64, _: u64, a3: u64, a4: u
         }
         SYS_SEEK => crate::fd::seek(a1, a2 as i64, a3),
         SYS_FSTAT => crate::fd::fstat(a1),
-        SYS_FSYNC => crate::fd::fsync(unsafe { vfs() }, a1),
+        SYS_FSYNC => crate::fd::fsync(vfs(), a1),
         SYS_EXEC => sys_exec(a1, a2, a3, a4),
         _ => u64::MAX, // unknown syscall
     }
@@ -133,13 +134,11 @@ extern "C" fn syscall_handler(num: u64, a1: u64, a2: u64, _: u64, a3: u64, a4: u
 fn sys_write(buf: *const u8, len: usize) -> u64 {
     let s = unsafe { core::slice::from_raw_parts(buf, len) };
     serial::print(unsafe { core::str::from_utf8_unchecked(s) });
-    unsafe {
-        if let Some(ref mut capture) = *(&raw mut CAPTURE_BUF) {
-            capture.extend_from_slice(s);
-        } else {
-            for &byte in s {
-                console::putchar(byte);
-            }
+    if let Some(ref mut capture) = *CAPTURE_BUF.get_mut() {
+        capture.extend_from_slice(s);
+    } else {
+        for &byte in s {
+            console::putchar(byte);
         }
     }
     len as u64
@@ -182,7 +181,7 @@ fn sys_read(buf: *mut u8, len: usize) -> u64 {
 }
 
 fn sys_exit(code: i32) -> u64 {
-    let active = unsafe { (&raw const PROCESS_ACTIVE).read() };
+    let active = *PROCESS_ACTIVE.get();
     if !active {
         cpu::halt();
     }
@@ -192,9 +191,9 @@ fn sys_exit(code: i32) -> u64 {
 /// Terminate the current userspace process and return to execute()'s landing label.
 /// Used by sys_exit and exception handlers.
 pub fn kill_process(code: i32) -> ! {
+    *PROCESS_ACTIVE.get_mut() = false;
+    let krsp = *SYSCALL_KERNEL_RSP.get();
     unsafe {
-        (&raw mut PROCESS_ACTIVE).write(false);
-        let krsp = (&raw const SYSCALL_KERNEL_RSP).read();
         asm!(
             "mov rsp, {krsp}",
             "mov rax, {code}",
@@ -219,37 +218,33 @@ fn sys_exec(path_ptr: u64, path_len: u64, out_buf_ptr: u64, out_buf_max: u64) ->
     };
 
     // Load binary from VFS
-    let binary = match unsafe { vfs() }.read_file(path) {
+    let binary = match vfs().read_file(path) {
         Some(data) => data,
         None => return u64::MAX,
     };
 
     // Save parent process state
     let saved_heap = user_heap::save();
-    let saved_user_rsp = unsafe { (&raw const SYSCALL_USER_RSP).read() };
-    let saved_kernel_rsp = unsafe { (&raw const SYSCALL_KERNEL_RSP).read() };
-    let saved_active = unsafe { (&raw const PROCESS_ACTIVE).read() };
+    let saved_user_rsp = *SYSCALL_USER_RSP.get();
+    let saved_kernel_rsp = *SYSCALL_KERNEL_RSP.get();
+    let saved_active = *PROCESS_ACTIVE.get();
     let saved_tss_rsp0 = unsafe { *gdt::tss_rsp0_ptr() };
 
     // Enable output capture
-    unsafe { *(&raw mut CAPTURE_BUF) = Some(Vec::new()); }
+    *CAPTURE_BUF.get_mut() = Some(Vec::new());
 
     // Init fresh heap for child and run
     user_heap::init();
     let exit_code = crate::process::run(&binary, &[path]);
 
     // Collect captured output
-    let captured = unsafe {
-        core::mem::replace(&mut *(&raw mut CAPTURE_BUF), None)
-    }.unwrap_or_default();
+    let captured = core::mem::replace(CAPTURE_BUF.get_mut(), None).unwrap_or_default();
 
     // Restore parent process state
-    unsafe {
-        (&raw mut PROCESS_ACTIVE).write(saved_active);
-        (&raw mut SYSCALL_USER_RSP).write(saved_user_rsp);
-        (&raw mut SYSCALL_KERNEL_RSP).write(saved_kernel_rsp);
-        *gdt::tss_rsp0_ptr() = saved_tss_rsp0;
-    }
+    *PROCESS_ACTIVE.get_mut() = saved_active;
+    *SYSCALL_USER_RSP.get_mut() = saved_user_rsp;
+    *SYSCALL_KERNEL_RSP.get_mut() = saved_kernel_rsp;
+    unsafe { *gdt::tss_rsp0_ptr() = saved_tss_rsp0; }
     user_heap::restore(saved_heap);
 
     // Copy captured output to parent's buffer

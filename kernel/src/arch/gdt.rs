@@ -2,6 +2,7 @@ use core::arch::asm;
 use core::mem::size_of;
 
 use super::cpu;
+use crate::sync::SyncCell;
 
 // 64-bit TSS (104 bytes)
 #[repr(C, packed)]
@@ -17,7 +18,7 @@ pub struct Tss {
     iopb_offset: u16,
 }
 
-static mut TSS: Tss = Tss {
+static TSS: SyncCell<Tss> = SyncCell::new(Tss {
     reserved0: 0,
     rsp0: 0,
     rsp1: 0,
@@ -27,7 +28,7 @@ static mut TSS: Tss = Tss {
     reserved2: 0,
     reserved3: 0,
     iopb_offset: size_of::<Tss>() as u16,
-};
+});
 
 #[repr(C, align(16))]
 struct Gdt {
@@ -42,7 +43,7 @@ struct Gdt {
 //   0x20: user code64   (DPL=3)
 //   0x28: TSS low       (filled at runtime)
 //   0x30: TSS high      (filled at runtime)
-static mut GDT: Gdt = Gdt {
+static GDT: SyncCell<Gdt> = SyncCell::new(Gdt {
     entries: [
         0x0000_0000_0000_0000, // null
         0x00AF_9A00_0000_FFFF, // kernel code64: G=1, L=1, P=1, DPL=0, Execute/Read
@@ -52,7 +53,7 @@ static mut GDT: Gdt = Gdt {
         0,                      // TSS low (runtime)
         0,                      // TSS high (runtime)
     ],
-};
+});
 
 #[repr(C, packed)]
 struct GdtPointer {
@@ -66,30 +67,29 @@ pub const KERNEL_DS: u16 = 0x10;
 const TSS_SEL: u16 = 0x28;
 
 pub fn init() {
+    unsafe { core::ptr::write_unaligned(&raw mut (*TSS.as_ptr()).rsp0, cpu::read_rsp()); }
+
+    // Build 16-byte TSS descriptor
+    let tss_addr = TSS.as_ptr() as u64;
+    let tss_limit = (size_of::<Tss>() - 1) as u64;
+
+    let low = (tss_limit & 0xFFFF)
+        | ((tss_addr & 0xFFFF) << 16)
+        | (((tss_addr >> 16) & 0xFF) << 32)
+        | (0x89u64 << 40) // P=1, DPL=0, Type=0x9 (64-bit TSS Available)
+        | (((tss_limit >> 16) & 0xF) << 48)
+        | (((tss_addr >> 24) & 0xFF) << 56);
+    let high = tss_addr >> 32;
+
+    GDT.get_mut().entries[5] = low;
+    GDT.get_mut().entries[6] = high;
+
+    let ptr = GdtPointer {
+        limit: (size_of::<[u64; 7]>() - 1) as u16,
+        base: GDT.get().entries.as_ptr() as u64,
+    };
+
     unsafe {
-        // Set TSS.RSP0 to current kernel stack (for interrupts from ring 3)
-        core::ptr::write_unaligned(&raw mut TSS.rsp0, cpu::read_rsp());
-
-        // Build 16-byte TSS descriptor
-        let tss_addr = &raw const TSS as u64;
-        let tss_limit = (size_of::<Tss>() - 1) as u64;
-
-        let low = (tss_limit & 0xFFFF)
-            | ((tss_addr & 0xFFFF) << 16)
-            | (((tss_addr >> 16) & 0xFF) << 32)
-            | (0x89u64 << 40) // P=1, DPL=0, Type=0x9 (64-bit TSS Available)
-            | (((tss_limit >> 16) & 0xF) << 48)
-            | (((tss_addr >> 24) & 0xFF) << 56);
-        let high = tss_addr >> 32;
-
-        GDT.entries[5] = low;
-        GDT.entries[6] = high;
-
-        let ptr = GdtPointer {
-            limit: (size_of::<[u64; 7]>() - 1) as u16,
-            base: (&raw const GDT.entries) as *const u64 as u64,
-        };
-
         // Load GDT and reload CS via far return (structural asm — can't be wrapped)
         asm!(
             "lgdt [{}]",
@@ -115,5 +115,5 @@ pub fn init() {
 
 /// Returns a pointer to TSS.RSP0 so execute() can update it before entering ring 3.
 pub fn tss_rsp0_ptr() -> *mut u64 {
-    unsafe { &raw mut TSS.rsp0 as *mut u64 }
+    unsafe { &raw mut (*TSS.as_ptr()).rsp0 as *mut u64 }
 }

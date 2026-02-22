@@ -7,6 +7,8 @@ use crate::{symbols, log};
 
 use alloc::format;
 
+use crate::sync::SyncCell;
+
 // PIC ports
 const PIC1_CMD: u16 = 0x20;
 const PIC1_DATA: u16 = 0x21;
@@ -55,9 +57,9 @@ struct Idt {
     entries: [IdtEntry; 256],
 }
 
-static mut IDT: Idt = Idt {
+static IDT: SyncCell<Idt> = SyncCell::new(Idt {
     entries: [IdtEntry::EMPTY; 256],
-};
+});
 
 #[repr(C, packed)]
 struct IdtPointer {
@@ -86,10 +88,10 @@ pub struct SavedRegs {
 }
 
 // Kernel base address for crash diagnostics
-static mut KERNEL_BASE: u64 = 0;
+static KERNEL_BASE: SyncCell<u64> = SyncCell::new(0);
 
 pub fn set_kernel_base(base: u64) {
-    unsafe { (&raw mut KERNEL_BASE).write(base); }
+    *KERNEL_BASE.get_mut() = base;
 }
 
 /// Remap the 8259 PIC: master IRQ 0-7 -> vectors 32-39, slave -> 40-47.
@@ -126,17 +128,16 @@ fn remap_pic() {
 pub fn init() {
     remap_pic();
 
+    IDT.get_mut().entries[6] = IdtEntry::new(ud_entry as u64);
+    IDT.get_mut().entries[13] = IdtEntry::new(gpf_entry as u64);
+    IDT.get_mut().entries[14] = IdtEntry::new(page_fault_entry as u64);
+
+    let ptr = IdtPointer {
+        limit: (core::mem::size_of::<Idt>() - 1) as u16,
+        base: IDT.as_ptr() as u64,
+    };
+
     unsafe {
-        // Register exception handlers
-        IDT.entries[6] = IdtEntry::new(ud_entry as u64);
-        IDT.entries[13] = IdtEntry::new(gpf_entry as u64);
-        IDT.entries[14] = IdtEntry::new(page_fault_entry as u64);
-
-        let ptr = IdtPointer {
-            limit: (core::mem::size_of::<Idt>() - 1) as u16,
-            base: &raw const IDT as *const Idt as u64,
-        };
-
         cpu::lidt(&ptr as *const IdtPointer as *const u8);
         cpu::enable_interrupts();
     }
@@ -223,7 +224,7 @@ fn format_addr(addr: u64) -> alloc::string::String {
     if let Some((name, offset)) = symbols::resolve(addr) {
         format!("{:#x}  {}+{:#x}", addr, name, offset)
     } else {
-        let kernel_base = unsafe { *(&raw const KERNEL_BASE) };
+        let kernel_base = *KERNEL_BASE.get();
         if kernel_base != 0 && addr >= kernel_base {
             format!("{:#x}  [kernel+{:#x}]", addr, addr - kernel_base)
         } else {
@@ -269,8 +270,8 @@ extern "C" fn exception_handler(
     };
 
     let prefix = if is_user { "Process crashed" } else { "KERNEL PANIC" };
-    log::println(&format!("{}: {}", prefix, detail));
-    log::println(&format!("  rip: {}", format_addr(rip)));
+    log!("{}: {}", prefix, detail);
+    log!("  rip: {}", format_addr(rip));
 
     // User RSP is in the CPU's iret frame: 15 saved regs + error_code + RIP + CS + RFLAGS + RSP
     let user_rsp = unsafe { *((regs as *const SavedRegs as *const u64).add(19)) };
@@ -286,19 +287,19 @@ extern "C" fn exception_handler(
             if !bytes_str.is_empty() { bytes_str.push(' '); }
             bytes_str.push_str(&format!("{:02x}", byte));
         }
-        log::println(&format!("  code: {}", bytes_str));
+        log!("  code: {}", bytes_str);
     }
 
     // Register dump
     log::println("  Registers:");
-    log::println(&format!("    rax={:#018x}  rbx={:#018x}", regs.rax, regs.rbx));
-    log::println(&format!("    rcx={:#018x}  rdx={:#018x}", regs.rcx, regs.rdx));
-    log::println(&format!("    rsi={:#018x}  rdi={:#018x}", regs.rsi, regs.rdi));
-    log::println(&format!("    rbp={:#018x}  rsp={:#018x}", regs.rbp, rsp));
-    log::println(&format!("     r8={:#018x}   r9={:#018x}", regs.r8, regs.r9));
-    log::println(&format!("    r10={:#018x}  r11={:#018x}", regs.r10, regs.r11));
-    log::println(&format!("    r12={:#018x}  r13={:#018x}", regs.r12, regs.r13));
-    log::println(&format!("    r14={:#018x}  r15={:#018x}", regs.r14, regs.r15));
+    log!("    rax={:#018x}  rbx={:#018x}", regs.rax, regs.rbx);
+    log!("    rcx={:#018x}  rdx={:#018x}", regs.rcx, regs.rdx);
+    log!("    rsi={:#018x}  rdi={:#018x}", regs.rsi, regs.rdi);
+    log!("    rbp={:#018x}  rsp={:#018x}", regs.rbp, rsp);
+    log!("     r8={:#018x}   r9={:#018x}", regs.r8, regs.r9);
+    log!("    r10={:#018x}  r11={:#018x}", regs.r10, regs.r11);
+    log!("    r12={:#018x}  r13={:#018x}", regs.r12, regs.r13);
+    log!("    r14={:#018x}  r15={:#018x}", regs.r14, regs.r15);
 
     // Stack dump (8 words from RSP)
     if is_user && user_rsp % 8 == 0 {
@@ -312,14 +313,14 @@ extern "C" fn exception_handler(
             } else {
                 alloc::string::String::new()
             };
-            log::println(&format!("    [{:#x}] = {:#018x}{}", addr, val, sym));
+            log!("    [{:#x}] = {:#018x}{}", addr, val, sym);
         }
     }
 
     // Stack backtrace
     if is_user {
         log::println("  Backtrace:");
-        log::println(&format!("    0: {}", format_addr(rip)));
+        log!("    0: {}", format_addr(rip));
         let mut rbp = regs.rbp;
         for i in 1..20 {
             if rbp == 0 || rbp % 8 != 0 {
@@ -333,7 +334,7 @@ extern "C" fn exception_handler(
             if return_addr == 0 {
                 break;
             }
-            log::println(&format!("    {}: {}", i, format_addr(return_addr)));
+            log!("    {}: {}", i, format_addr(return_addr));
             rbp = saved_rbp;
         }
     }
