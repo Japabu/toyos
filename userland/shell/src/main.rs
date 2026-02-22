@@ -15,9 +15,9 @@ fn main() {
         print!("{}> ", cwd);
         io::stdout().flush().ok();
 
-        set_stdin_raw(true);
+        std::os::toyos::io::set_stdin_raw(true);
         let result = readline(&mut history);
-        set_stdin_raw(false);
+        std::os::toyos::io::set_stdin_raw(false);
         let Some(input) = result else { break };
         let input = input.trim().to_string();
         if input.is_empty() {
@@ -40,7 +40,7 @@ fn main() {
         match cmd {
             "help" => print_help(),
             "clear" => print!("\x1b[2J\x1b[H"),
-            "shutdown" => shutdown(),
+            "shutdown" => std::os::toyos::io::shutdown(),
             "pwd" => println!("{}", cwd),
             "cd" => cmd_cd(arg),
             "ls" => cmd_ls(arg),
@@ -66,33 +66,11 @@ fn save_history(history: &[String]) {
     let _ = fs::write(HISTORY_PATH, &content);
 }
 
-// --- Raw syscall helpers ---
-
-fn syscall(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
-    let ret: u64;
-    unsafe {
-        std::arch::asm!(
-            "syscall",
-            in("rdi") num,
-            in("rsi") a1,
-            in("rdx") a2,
-            in("r8") a3,
-            in("r9") a4,
-            lateout("rax") ret,
-            out("rcx") _,
-            out("r11") _,
-        );
-    }
-    ret
-}
-
-fn set_stdin_raw(raw: bool) {
-    syscall(22, raw as u64, 0, 0, 0); // SYS_SET_STDIN_MODE
-}
+// --- Readline helpers ---
 
 fn read_byte() -> u8 {
     let mut buf = [0u8; 1];
-    syscall(1, buf.as_mut_ptr() as u64, 1, 0, 0); // SYS_READ
+    let _ = std::os::toyos::io::read_stdin_raw(&mut buf);
     buf[0]
 }
 
@@ -469,16 +447,9 @@ fn cmd_layout(arg: &str) {
         return;
     }
     let name = arg.trim();
-    let result = syscall(23, name.as_ptr() as u64, name.len() as u64, 0, 0);
-    if result == u64::MAX {
-        println!("layout: unknown layout '{}'", name);
-    } else {
+    if std::os::toyos::io::set_keyboard_layout(name) {
         println!("Keyboard layout set to '{}'", name);
+    } else {
+        println!("layout: unknown layout '{}'", name);
     }
-}
-
-/// Raw syscall to power off the machine.
-fn shutdown() -> ! {
-    syscall(19, 0, 0, 0, 0);
-    unreachable!()
 }

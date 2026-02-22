@@ -50,7 +50,6 @@ struct Mount {
 /// Subdirectories are virtual — TYFS stores flat filenames with `/` separators.
 pub struct Vfs {
     mounts: Vec<Mount>,
-    cwd: String,
 }
 
 /// Normalize a path by resolving `.` and `..` components.
@@ -75,7 +74,6 @@ impl Vfs {
     pub fn new() -> Self {
         Self {
             mounts: Vec::new(),
-            cwd: String::from("/"),
         }
     }
 
@@ -86,19 +84,15 @@ impl Vfs {
         });
     }
 
-    pub fn cwd(&self) -> &str {
-        &self.cwd
-    }
-
-    /// Resolve a (possibly relative) path against the cwd.
+    /// Resolve a (possibly relative) path against the given cwd.
     /// Returns `(mount_name, filename)`. An empty mount means root.
-    pub fn resolve_path(&self, arg: &str) -> (String, String) {
+    pub fn resolve_path(&self, cwd: &str, arg: &str) -> (String, String) {
         let full = if arg.starts_with('/') {
             normalize(arg)
-        } else if self.cwd == "/" {
+        } else if cwd == "/" {
             normalize(&format!("/{}", arg))
         } else {
-            normalize(&format!("{}/{}", self.cwd, arg))
+            normalize(&format!("{}/{}", cwd, arg))
         };
 
         if full == "/" {
@@ -115,42 +109,39 @@ impl Vfs {
         }
     }
 
-    /// Change directory. Returns false if the target doesn't exist.
-    pub fn cd(&mut self, target: &str) -> bool {
-        let (mount, subdir) = self.resolve_path(target);
+    /// Check if a directory target exists. Returns the new absolute cwd, or None.
+    pub fn cd(&mut self, cwd: &str, target: &str) -> Option<String> {
+        let (mount, subdir) = self.resolve_path(cwd, target);
 
         if mount.is_empty() {
-            self.cwd = String::from("/");
-            return true;
+            return Some(String::from("/"));
         }
 
         if self.find_mount(&mount).is_none() {
-            return false;
+            return None;
         }
 
         if subdir.is_empty() {
-            self.cwd = format!("/{}", mount);
-            return true;
+            return Some(format!("/{}", mount));
         }
 
         // Check if any files exist with this subdirectory prefix
         let prefix = format!("{}/", subdir);
         if let Some(m) = self.find_mount_mut(&mount) {
             if m.fs.list().iter().any(|(name, _)| name.starts_with(&prefix)) {
-                self.cwd = format!("/{}/{}", mount, subdir);
-                return true;
+                return Some(format!("/{}/{}", mount, subdir));
             }
         }
 
-        false
+        None
     }
 
     /// List entries at a path. Returns files and virtual subdirectories.
-    pub fn list(&mut self, path: &str) -> Result<Vec<(String, u64)>, &'static str> {
+    pub fn list(&mut self, cwd: &str, path: &str) -> Result<Vec<(String, u64)>, &'static str> {
         let (mount, subdir) = if path.is_empty() {
-            self.resolve_path("")
+            self.resolve_path(cwd, "")
         } else {
-            self.resolve_path(path)
+            self.resolve_path(cwd, path)
         };
 
         if mount.is_empty() {
@@ -203,7 +194,8 @@ impl Vfs {
     }
 
     pub fn read_file(&mut self, path: &str) -> Option<Vec<u8>> {
-        let (mount, file) = self.resolve_path(path);
+        // read_file always takes absolute paths
+        let (mount, file) = self.resolve_path("/", path);
         if file.is_empty() {
             return None;
         }
@@ -212,7 +204,7 @@ impl Vfs {
     }
 
     pub fn write_file(&mut self, path: &str, data: &[u8]) -> bool {
-        let (mount, file) = self.resolve_path(path);
+        let (mount, file) = self.resolve_path("/", path);
         if file.is_empty() {
             return false;
         }
@@ -225,7 +217,7 @@ impl Vfs {
     }
 
     pub fn delete(&mut self, path: &str) -> bool {
-        let (mount, file) = self.resolve_path(path);
+        let (mount, file) = self.resolve_path("/", path);
         if file.is_empty() {
             return false;
         }

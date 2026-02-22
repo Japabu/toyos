@@ -32,6 +32,8 @@ pub mod clock;
 #[cfg(not(test))]
 pub mod fd;
 #[cfg(not(test))]
+pub mod pipe;
+#[cfg(not(test))]
 pub mod user_heap;
 
 #[repr(C)]

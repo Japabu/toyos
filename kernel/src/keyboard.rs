@@ -30,6 +30,12 @@ pub fn handle_key(byte: u8) {
     }
 }
 
+/// Check if there is data in the keyboard buffer.
+pub fn has_data() -> bool {
+    let kb = KEY_BUF.get();
+    kb.tail != kb.head
+}
+
 /// Non-blocking read of the next character from the keyboard buffer.
 pub fn try_read_char() -> Option<u8> {
     let kb = KEY_BUF.get_mut();

@@ -3,6 +3,7 @@
 #![feature(allocator_api)]
 extern crate alloc;
 
+use alloc::alloc::{alloc_zeroed, Layout};
 use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::String;
@@ -46,6 +47,8 @@ pub unsafe extern "sysv64" fn _start(kernel_args: KernelArgs) -> ! {
     kernel_main(&kernel_args, maps, initrd, kernel_elf, init_path);
 }
 
+const USER_STACK_SIZE: usize = 64 * 1024;
+
 fn kernel_main(
     kernel_args: &KernelArgs,
     maps: &[MemoryMapEntry],
@@ -53,7 +56,7 @@ fn kernel_main(
     kernel_elf: &[u8],
     init_path: &str,
 ) -> ! {
-    // Initialize allocator first — no allocations before this point
+    // Initialize allocator first
     let reserved = [
         allocator::Region { start: kernel_args.kernel_memory_addr, end: kernel_args.kernel_memory_addr + kernel_args.kernel_memory_size },
         allocator::Region { start: kernel_args.initrd_addr, end: kernel_args.initrd_addr + kernel_args.initrd_size },
@@ -61,14 +64,11 @@ fn kernel_main(
     ];
     unsafe { allocator::init(maps, &reserved); }
 
-    // Build our own page tables (identity-mapped, kernel-only).
-    // Must happen right after allocator init, before UEFI's page table pages
-    // get handed out by the allocator.
     paging::init(maps);
 
     serial::println("Hello from Kernel!");
 
-    // Mount initrd ramdisk (needed to load font)
+    // Mount initrd ramdisk
     assert!(!initrd.is_empty(), "No initrd provided");
     let _ = writeln!(serial::SerialWriter,
         "Initrd: addr={:#x} size={} bytes",
@@ -103,20 +103,18 @@ fn kernel_main(
         .expect("Failed to load font.bin from rootfs");
     console::init(fb, font_data);
 
-    // From here on, log::println outputs to both serial and framebuffer
     log::println("ToyOS Kernel initialized");
     log!("Framebuffer: {}x{} stride={}",
         kernel_args.framebuffer_width, kernel_args.framebuffer_height, kernel_args.framebuffer_stride
     );
 
-    // Initialize NVMe for persistent storage
+    // Initialize NVMe
     let ecam_base = acpi::find_ecam_base(kernel_args.rsdp_addr)
         .expect("ACPI: failed to find ECAM base address");
     pci::enumerate(ecam_base);
     let nvme_ctrl = nvme::init(ecam_base).expect("NVMe: no controller found");
     let mut disk = nvme::NvmeDisk::new(nvme_ctrl);
     let total_bytes = disk.total_bytes();
-    // Peek at byte 0 to check for existing TYFS magic
     let mut magic = [0u8; 4];
     disk.read(0, &mut magic);
     let nvme_fs = if &magic == b"TYFS" {
@@ -127,7 +125,7 @@ fn kernel_main(
         tyfs::SimpleFs::format(disk, total_bytes)
     };
 
-    // Initialize USB (xHCI) keyboard (global singleton for sys_read polling)
+    // Initialize USB keyboard
     let xhci_ctrl = xhci::init(ecam_base).expect("xHCI: no USB controller found");
     xhci::set_global(xhci_ctrl);
     log::println("USB keyboard enabled");
@@ -140,7 +138,7 @@ fn kernel_main(
     paging::map_kernel(hpet_base, 0x1000);
     clock::init(hpet_base);
 
-    // Set up GDT (UEFI's may be in reclaimable memory) and interrupts
+    // Set up GDT and interrupts
     gdt::init();
     idt::init();
     idt::set_kernel_base(kernel_args.kernel_memory_addr);
@@ -153,15 +151,13 @@ fn kernel_main(
     syscall::init();
     log::println("Ring 3: ready");
 
-    // Build VFS with mount points
+    // Build VFS
     let mut vfs = vfs::Vfs::new();
     vfs.mount("initrd", Box::new(initrd_fs));
     vfs.mount("nvme", Box::new(nvme_fs));
-
-    // Move VFS into global static (accessible from syscall handlers)
     vfs::set_global(vfs);
 
-    // Load keyboard layout from config (if present)
+    // Load keyboard layout from config
     if let Some(data) = vfs::global().read_file("/nvme/config/keyboard_layout") {
         if let Ok(name) = core::str::from_utf8(&data) {
             let name = name.trim();
@@ -170,7 +166,7 @@ fn kernel_main(
     }
     log!("Keyboard layout: {}", kernel::keyboard::layout_name());
 
-    // Run init program (default: "shell")
+    // Load and prepare the init program
     let init = if init_path.is_empty() { "shell" } else { init_path };
     let args: Vec<&str> = init.split_whitespace().collect();
     let cmd = args[0];
@@ -182,9 +178,51 @@ fn kernel_main(
     log!("init: running {}", path);
     let data = vfs::global().read_file(&path)
         .unwrap_or_else(|| panic!("init: {} not found", path));
-    let code = process::run(&data, &args);
-    kernel::fd::close_all(vfs::global());
 
-    log!("init exited with code {}", code);
-    kernel::arch::cpu::halt();
+    // Load ELF, map user pages, set up stack
+    let loaded = kernel::elf::load(&data).expect("init: ELF load failed");
+    paging::map_user(loaded.base_ptr as u64, loaded.load_size as u64);
+
+    let stack_layout = Layout::from_size_align(USER_STACK_SIZE, 4096).unwrap();
+    let stack_base = unsafe { alloc_zeroed(stack_layout) };
+    assert!(!stack_base.is_null(), "init: stack alloc failed");
+    let stack_top = stack_base as u64 + USER_STACK_SIZE as u64;
+    let elf_layout = Layout::from_size_align(loaded.load_size, 4096).unwrap();
+    paging::map_user(stack_base as u64, USER_STACK_SIZE as u64);
+
+    symbols::load_process(&data, loaded.base);
+    symbols::set_process_ranges(
+        loaded.base_ptr as u64,
+        loaded.base_ptr as u64 + loaded.load_size as u64,
+        stack_base as u64,
+        stack_top,
+    );
+
+    // Write argc/argv onto user stack
+    let mut sp = stack_top;
+    let mut argv_ptrs: Vec<u64> = Vec::with_capacity(args.len());
+    for arg in args.iter().rev() {
+        sp -= (arg.len() + 1) as u64;
+        unsafe {
+            core::ptr::copy_nonoverlapping(arg.as_ptr(), sp as *mut u8, arg.len());
+            *((sp + arg.len() as u64) as *mut u8) = 0;
+        }
+        argv_ptrs.push(sp);
+    }
+    argv_ptrs.reverse();
+    let metadata_qwords = args.len() + 2;
+    sp = (sp - metadata_qwords as u64 * 8) & !15;
+    unsafe {
+        *(sp as *mut u64) = args.len() as u64;
+        for (i, ptr) in argv_ptrs.iter().enumerate() {
+            *((sp + 8 + i as u64 * 8) as *mut u64) = *ptr;
+        }
+        *((sp + 8 + args.len() as u64 * 8) as *mut u64) = 0;
+    }
+
+    let _ = writeln!(serial::SerialWriter, "init: entry={:#x}, stack={:#x}, argc={}", loaded.entry, sp, args.len());
+
+    // Create process 0 and start the scheduler (never returns)
+    process::init_process0(loaded.entry, sp, loaded.base_ptr, elf_layout, stack_base, stack_layout);
+    unreachable!();
 }
