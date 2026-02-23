@@ -240,6 +240,11 @@ pub fn spawn(argv: &[&str], stdin_fd: u64, stdout_fd: u64) -> u64 {
             pipe::add_reader(*id);
             Descriptor::PipeRead(*id)
         }
+        Some(Descriptor::TtyRead(id)) => {
+            pipe::add_reader(*id);
+            Descriptor::TtyRead(*id)
+        }
+        Some(Descriptor::File(file)) => Descriptor::File(file.clone()),
         _ => Descriptor::Keyboard,
     };
     child_fds.push(Some(stdin_desc));
@@ -252,6 +257,11 @@ pub fn spawn(argv: &[&str], stdin_fd: u64, stdout_fd: u64) -> u64 {
             pipe::add_writer(*id);
             Descriptor::PipeWrite(*id)
         }
+        Some(Descriptor::TtyWrite(id)) => {
+            pipe::add_writer(*id);
+            Descriptor::TtyWrite(*id)
+        }
+        Some(Descriptor::File(file)) => Descriptor::File(file.clone()),
         _ => Descriptor::SerialConsole,
     };
     // FD 2 (stderr) — same as stdout so panics appear in terminal
@@ -260,6 +270,11 @@ pub fn spawn(argv: &[&str], stdin_fd: u64, stdout_fd: u64) -> u64 {
             pipe::add_writer(*id);
             Descriptor::PipeWrite(*id)
         }
+        Descriptor::TtyWrite(id) => {
+            pipe::add_writer(*id);
+            Descriptor::TtyWrite(*id)
+        }
+        Descriptor::File(file) => Descriptor::File(file.clone()),
         _ => Descriptor::SerialConsole,
     };
     child_fds.push(Some(stdout_desc));

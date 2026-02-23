@@ -4,7 +4,8 @@ mod framebuffer;
 
 use std::io::{Read, Write};
 use std::os::toyos::io::{self, AsRawFd};
-use std::process::{Command, Stdio};
+use std::os::toyos::process;
+use std::process::Command;
 
 /// FramebufferInfo layout matches kernel's `fd::FramebufferInfo` (repr(C)).
 #[repr(C)]
@@ -50,8 +51,8 @@ fn main() {
     let mut console = console::Console::new(fb, font);
 
     let mut child = Command::new("/initrd/shell")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
+        .stdin(process::tty_piped())
+        .stdout(process::tty_piped())
         .spawn()
         .expect("failed to spawn shell");
 

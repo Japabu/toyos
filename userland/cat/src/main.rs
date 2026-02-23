@@ -10,7 +10,7 @@ fn main() {
         match fs::read(path) {
             Ok(data) => {
                 if let Ok(text) = std::str::from_utf8(&data) {
-                    println!("{}", text);
+                    print!("{}", text);
                 } else {
                     eprintln!("{}: {} bytes (binary)", path, data.len());
                 }

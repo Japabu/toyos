@@ -1,4 +1,21 @@
 {
     "rust-analyzer.check.allTargets": false,
-    "rust-analyzer.files.excludeDirs": ["rust"]
+    "rust-analyzer.files.excludeDirs": ["rust"],
+    "rust-analyzer.linkedProjects": [
+        "kernel/Cargo.toml",
+        "userland/cat/Cargo.toml",
+        "userland/echo/Cargo.toml",
+        "userland/grep/Cargo.toml",
+        "userland/hello/Cargo.toml",
+        "userland/input-test/Cargo.toml",
+        "userland/keyboard/Cargo.toml",
+        "userland/kibi/Cargo.toml",
+        "userland/ls/Cargo.toml",
+        "userland/proctest/Cargo.toml",
+        "userland/pwd/Cargo.toml",
+        "userland/rm/Cargo.toml",
+        "userland/shell/Cargo.toml",
+        "userland/shutdown/Cargo.toml",
+        "userland/terminal/Cargo.toml"
+    ]
 }

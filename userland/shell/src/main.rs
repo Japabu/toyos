@@ -1,7 +1,7 @@
 use std::env;
-use std::fs;
+use std::fs::{self, File};
 use std::io::{self, Read, Write};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 const HISTORY_PATH: &str = "/nvme/config/shell_history";
 const HISTORY_MAX: usize = 200;
@@ -30,17 +30,19 @@ fn main() {
             save_history(&history);
         }
 
-        let (cmd, arg) = match input.find(' ') {
-            Some(pos) => (&input[..pos], input[pos + 1..].trim()),
-            None => (input.as_str(), ""),
-        };
-
-        match cmd {
-            "help" => print_help(),
-            "clear" => print!("\x1b[2J\x1b[H"),
-            "cd" => cmd_cd(arg),
-            "run" => cmd_run(arg),
-            _ => cmd_exec(cmd, arg),
+        let segments: Vec<&str> = input.split('|').collect();
+        if segments.len() > 1 {
+            run_pipeline(&segments);
+        } else {
+            let (input, redirect) = parse_redirect(&input);
+            let (cmd, arg) = parse_cmd_arg(&input);
+            match cmd.as_str() {
+                "help" => print_help(),
+                "clear" => print!("\x1b[2J\x1b[H"),
+                "cd" => cmd_cd(&arg),
+                "run" => cmd_run(&arg, redirect.as_deref()),
+                _ => cmd_exec(&cmd, &arg, redirect.as_deref()),
+            }
         }
     }
 }
@@ -256,6 +258,89 @@ fn redraw(line: &str, cursor: usize, backspace: bool) {
     echo(&buf);
 }
 
+// --- Parsing helpers ---
+
+fn parse_redirect(input: &str) -> (String, Option<String>) {
+    match input.find('>') {
+        Some(pos) => {
+            let file = input[pos + 1..].trim().to_string();
+            (input[..pos].trim().to_string(), Some(file))
+        }
+        None => (input.to_string(), None),
+    }
+}
+
+fn parse_cmd_arg(input: &str) -> (String, String) {
+    match input.find(' ') {
+        Some(pos) => (input[..pos].to_string(), input[pos + 1..].trim().to_string()),
+        None => (input.to_string(), String::new()),
+    }
+}
+
+fn build_command(cmd: &str, arg: &str) -> Command {
+    let path = if cmd.starts_with('/') { cmd.to_string() } else { format!("/initrd/{}", cmd) };
+    let mut command = Command::new(&path);
+    if !arg.is_empty() {
+        for a in arg.split_whitespace() {
+            command.arg(a);
+        }
+    }
+    command
+}
+
+// --- Pipeline execution ---
+
+fn run_pipeline(segments: &[&str]) {
+    let mut children = Vec::new();
+    let mut prev_stdout: Option<std::process::ChildStdout> = None;
+
+    for (i, segment) in segments.iter().enumerate() {
+        let is_last = i == segments.len() - 1;
+
+        let (segment, redirect) = if is_last {
+            parse_redirect(segment.trim())
+        } else {
+            (segment.trim().to_string(), None)
+        };
+
+        let (cmd, arg) = parse_cmd_arg(&segment);
+        let mut command = build_command(&cmd, &arg);
+
+        if let Some(stdout) = prev_stdout.take() {
+            command.stdin(stdout);
+        }
+
+        if !is_last {
+            command.stdout(Stdio::piped());
+        } else if let Some(ref path) = redirect {
+            match File::create(path) {
+                Ok(file) => { command.stdout(file); }
+                Err(_) => {
+                    println!("cannot open: {}", path);
+                    return;
+                }
+            }
+        }
+
+        match command.spawn() {
+            Ok(mut child) => {
+                if !is_last {
+                    prev_stdout = child.stdout.take();
+                }
+                children.push(child);
+            }
+            Err(_) => {
+                println!("{}: not found", cmd);
+                break;
+            }
+        }
+    }
+
+    for mut child in children {
+        let _ = child.wait();
+    }
+}
+
 // --- Shell commands ---
 
 fn print_help() {
@@ -275,30 +360,30 @@ fn cmd_cd(arg: &str) {
     }
 }
 
-fn cmd_run(arg: &str) {
+fn cmd_run(arg: &str, redirect: Option<&str>) {
     if arg.is_empty() {
         println!("Usage: run <file>");
         return;
     }
     let parts: Vec<&str> = arg.split_whitespace().collect();
-    let program = parts[0];
-    let status = Command::new(program).args(&parts[1..]).status();
-    match status {
-        Ok(code) => {
-            if !code.success() {
-                println!("Process exited with code {}", code.code().unwrap_or(-1));
-            }
-        }
-        Err(_) => println!("{}: not found", program),
-    }
+    let mut command = Command::new(parts[0]);
+    command.args(&parts[1..]);
+    run_single(parts[0], &mut command, redirect);
 }
 
-fn cmd_exec(cmd: &str, arg: &str) {
-    let path = format!("/initrd/{}", cmd);
-    let mut command = Command::new(&path);
-    if !arg.is_empty() {
-        for a in arg.split_whitespace() {
-            command.arg(a);
+fn cmd_exec(cmd: &str, arg: &str, redirect: Option<&str>) {
+    let mut command = build_command(cmd, arg);
+    run_single(cmd, &mut command, redirect);
+}
+
+fn run_single(name: &str, command: &mut Command, redirect: Option<&str>) {
+    if let Some(path) = redirect {
+        match File::create(path) {
+            Ok(file) => { command.stdout(file); }
+            Err(_) => {
+                println!("cannot open: {}", path);
+                return;
+            }
         }
     }
     match command.status() {
@@ -307,6 +392,6 @@ fn cmd_exec(cmd: &str, arg: &str) {
                 println!("Process exited with code {}", code.code().unwrap_or(-1));
             }
         }
-        Err(_) => println!("{}: not found", cmd),
+        Err(_) => println!("{}: not found", name),
     }
 }

@@ -37,6 +37,7 @@ const SYS_PIPE: u64 = 24;
 const SYS_SPAWN: u64 = 25;
 const SYS_WAITPID: u64 = 26;
 const SYS_POLL: u64 = 27;
+const SYS_MARK_TTY: u64 = 28;
 
 // Kernel/user RSP storage for stack switching
 #[no_mangle]
@@ -132,6 +133,10 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         SYS_SPAWN => sys_spawn(a1, a2, a3, a4),
         SYS_WAITPID => sys_waitpid(a1),
         SYS_POLL => sys_poll(a1, a2),
+        SYS_MARK_TTY => {
+            let proc = process::current();
+            fd::mark_tty(&mut proc.fds, a1)
+        }
         _ => u64::MAX,
     }
 }
@@ -144,7 +149,8 @@ fn sys_write(fd_num: u64, buf: &[u8]) -> u64 {
             None => {
                 let proc = process::current();
                 let reason = match proc.fds.get(fd_num as usize).and_then(|s| s.as_ref()) {
-                    Some(fd::Descriptor::PipeWrite(id)) => process::ProcessState::BlockedPipeWrite(*id),
+                    Some(fd::Descriptor::PipeWrite(id)) | Some(fd::Descriptor::TtyWrite(id)) =>
+                        process::ProcessState::BlockedPipeWrite(*id),
                     _ => return u64::MAX,
                 };
                 process::block(reason);
@@ -162,7 +168,8 @@ fn sys_read(fd_num: u64, buf: &mut [u8]) -> u64 {
                 let proc = process::current();
                 let reason = match proc.fds.get(fd_num as usize).and_then(|s| s.as_ref()) {
                     Some(fd::Descriptor::Keyboard) => process::ProcessState::BlockedKeyboard,
-                    Some(fd::Descriptor::PipeRead(id)) => process::ProcessState::BlockedPipeRead(*id),
+                    Some(fd::Descriptor::PipeRead(id)) | Some(fd::Descriptor::TtyRead(id)) =>
+                        process::ProcessState::BlockedPipeRead(*id),
                     _ => return u64::MAX,
                 };
                 process::block(reason);

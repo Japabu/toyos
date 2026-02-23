@@ -19,6 +19,7 @@ pub struct FramebufferInfo {
     pub pixel_format: u32,
 }
 
+#[derive(Clone)]
 pub struct OpenFile {
     path: String,
     data: Vec<u8>,
@@ -31,6 +32,8 @@ pub enum Descriptor {
     File(OpenFile),
     PipeRead(usize),
     PipeWrite(usize),
+    TtyRead(usize),
+    TtyWrite(usize),
     Keyboard,
     SerialConsole,
     Framebuffer(FramebufferInfo),
@@ -53,6 +56,14 @@ pub fn open(table: &mut FdTable, vfs: &mut Vfs, path: &str, flags: u64) -> u64 {
     let writable = flags & O_WRITE != 0;
     let create = flags & O_CREATE != 0;
     let truncate = flags & O_TRUNCATE != 0;
+
+    // Validate path resolves to a real mount + filename
+    if create {
+        let (_, file) = vfs.resolve_path("/", path);
+        if file.is_empty() {
+            return u64::MAX;
+        }
+    }
 
     let data = if truncate && create {
         Vec::new()
@@ -92,8 +103,8 @@ pub fn close(table: &mut FdTable, vfs: &mut Vfs, fd: u64) -> u64 {
                 }
             }
         }
-        Descriptor::PipeRead(id) => pipe::close_read(id),
-        Descriptor::PipeWrite(id) => pipe::close_write(id),
+        Descriptor::PipeRead(id) | Descriptor::TtyRead(id) => pipe::close_read(id),
+        Descriptor::PipeWrite(id) | Descriptor::TtyWrite(id) => pipe::close_write(id),
         Descriptor::Keyboard | Descriptor::SerialConsole | Descriptor::Framebuffer(_) => {}
     }
     0
@@ -109,7 +120,7 @@ pub fn try_read(table: &mut FdTable, fd: u64, buf: &mut [u8]) -> Option<u64> {
             file.position += count;
             Some(count as u64)
         }
-        Descriptor::PipeRead(id) => {
+        Descriptor::PipeRead(id) | Descriptor::TtyRead(id) => {
             pipe::try_read(*id, buf).map(|n| n as u64)
         }
         Descriptor::Keyboard => {
@@ -141,7 +152,7 @@ pub fn try_read(table: &mut FdTable, fd: u64, buf: &mut [u8]) -> Option<u64> {
             buf[..count].copy_from_slice(&info_bytes[..count]);
             Some(count as u64)
         }
-        Descriptor::PipeWrite(_) | Descriptor::SerialConsole => Some(u64::MAX),
+        Descriptor::PipeWrite(_) | Descriptor::TtyWrite(_) | Descriptor::SerialConsole => Some(u64::MAX),
     }
 }
 
@@ -161,7 +172,7 @@ pub fn try_write(table: &mut FdTable, fd: u64, buf: &[u8]) -> Option<u64> {
             file.modified = true;
             Some(buf.len() as u64)
         }
-        Descriptor::PipeWrite(id) => {
+        Descriptor::PipeWrite(id) | Descriptor::TtyWrite(id) => {
             match pipe::try_write(*id, buf) {
                 Some(usize::MAX) => Some(u64::MAX),
                 Some(n) => Some(n as u64),
@@ -172,7 +183,7 @@ pub fn try_write(table: &mut FdTable, fd: u64, buf: &[u8]) -> Option<u64> {
             serial_write_plain(buf);
             Some(buf.len() as u64)
         }
-        Descriptor::Keyboard | Descriptor::PipeRead(_) | Descriptor::Framebuffer(_) => Some(u64::MAX),
+        Descriptor::Keyboard | Descriptor::PipeRead(_) | Descriptor::TtyRead(_) | Descriptor::Framebuffer(_) => Some(u64::MAX),
     }
 }
 
@@ -190,7 +201,7 @@ pub fn seek(table: &mut FdTable, fd: u64, offset: i64, whence: u64) -> u64 {
     file.position as u64
 }
 
-/// Returns (type << 32) | payload. Types: 1=file, 2=pipe, 3=keyboard, 4=serial, 5=framebuffer.
+/// Returns (type << 32) | payload. Types: 1=file, 2=pipe, 3=keyboard, 4=serial, 5=framebuffer, 6=tty.
 /// Payload: file size for files, 0 otherwise. Returns 0 for invalid FD.
 pub fn fstat(table: &mut FdTable, fd: u64) -> u64 {
     match table.get(fd as usize).and_then(|s| s.as_ref()) {
@@ -199,6 +210,7 @@ pub fn fstat(table: &mut FdTable, fd: u64) -> u64 {
         Some(Descriptor::Keyboard) => 3u64 << 32,
         Some(Descriptor::SerialConsole) => 4u64 << 32,
         Some(Descriptor::Framebuffer(_)) => 5u64 << 32,
+        Some(Descriptor::TtyRead(_) | Descriptor::TtyWrite(_)) => 6u64 << 32,
         None => 0,
     }
 }
@@ -227,8 +239,8 @@ pub fn close_all(table: &mut FdTable, vfs: &mut Vfs) {
                         }
                     }
                 }
-                Descriptor::PipeRead(id) => pipe::close_read(id),
-                Descriptor::PipeWrite(id) => pipe::close_write(id),
+                Descriptor::PipeRead(id) | Descriptor::TtyRead(id) => pipe::close_read(id),
+                Descriptor::PipeWrite(id) | Descriptor::TtyWrite(id) => pipe::close_write(id),
                 Descriptor::Keyboard | Descriptor::SerialConsole | Descriptor::Framebuffer(_) => {}
             }
         }
@@ -237,10 +249,22 @@ pub fn close_all(table: &mut FdTable, vfs: &mut Vfs) {
 
 pub fn has_data(table: &FdTable, fd: u64) -> bool {
     match table.get(fd as usize).and_then(|s| s.as_ref()) {
-        Some(Descriptor::PipeRead(id)) => pipe::has_data(*id),
+        Some(Descriptor::PipeRead(id)) | Some(Descriptor::TtyRead(id)) => pipe::has_data(*id),
         Some(Descriptor::Keyboard) => keyboard::has_data(),
         Some(Descriptor::File(_)) | Some(Descriptor::Framebuffer(_)) => true,
         _ => false,
+    }
+}
+
+pub fn mark_tty(table: &mut FdTable, fd: u64) -> u64 {
+    let Some(desc) = table.get_mut(fd as usize).and_then(|s| s.as_mut()) else {
+        return u64::MAX;
+    };
+    match desc {
+        Descriptor::PipeRead(id) => { *desc = Descriptor::TtyRead(*id); 0 }
+        Descriptor::PipeWrite(id) => { *desc = Descriptor::TtyWrite(*id); 0 }
+        Descriptor::TtyRead(_) | Descriptor::TtyWrite(_) => 0,
+        _ => u64::MAX,
     }
 }
 
