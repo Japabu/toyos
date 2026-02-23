@@ -525,7 +525,7 @@ pub fn init(ecam_base: u64) -> Option<XhciController> {
     while op_base.read_u32(OP_USBSTS) & (1 << 11) != 0 {
         core::hint::spin_loop(); // Wait for CNR (Controller Not Ready) to clear
     }
-    log::println("xHCI: controller reset");
+    log!("xHCI: controller reset");
 
     // 5. Configure MaxSlotsEn
     op_base.write_u32(OP_CONFIG, max_slots as u32);
@@ -597,7 +597,7 @@ pub fn init(ecam_base: u64) -> Option<XhciController> {
     while op_base.read_u32(OP_USBSTS) & 1 != 0 {
         core::hint::spin_loop(); // Wait for HCH to clear (running)
     }
-    log::println("xHCI: controller started");
+    log!("xHCI: controller started");
 
     let event_ring = dma_page(3) as *const Trb;
 
@@ -631,7 +631,7 @@ pub fn init(ecam_base: u64) -> Option<XhciController> {
     let port_idx = match port_index {
         Some(p) => p,
         None => {
-            log::println("xHCI: no device connected");
+            log!("xHCI: no device connected");
             return None;
         }
     };
@@ -654,7 +654,7 @@ pub fn init(ecam_base: u64) -> Option<XhciController> {
 
     let portsc = op_base.read_u32(portsc_off);
     if portsc & PORTSC_PED == 0 {
-        log::println("xHCI: port not enabled after reset");
+        log!("xHCI: port not enabled after reset");
         return None;
     }
     let speed = ((portsc >> 10) & 0xF) as u8;
@@ -718,7 +718,7 @@ pub fn init(ecam_base: u64) -> Option<XhciController> {
         log!("xHCI: Address Device failed, code={}", code);
         return None;
     }
-    log::println("xHCI: device addressed");
+    log!("xHCI: device addressed");
 
     // 16. GET_DESCRIPTOR (Device) — 18 bytes
     let data_buf = dma_page(8);
@@ -806,7 +806,7 @@ pub fn init(ecam_base: u64) -> Option<XhciController> {
     };
 
     if ep_addr == 0 {
-        log::println("xHCI: no HID keyboard interface found");
+        log!("xHCI: no HID keyboard interface found");
         return None;
     }
     let ep_num = ep_addr & 0x0F;
@@ -824,7 +824,7 @@ pub fn init(ecam_base: u64) -> Option<XhciController> {
         log!("xHCI: SET_CONFIGURATION failed, code={}", code);
         return None;
     }
-    log::println("xHCI: configuration set");
+    log!("xHCI: configuration set");
 
     // 19. SET_PROTOCOL (boot protocol, wValue=0)
     let code = ctrl.control_transfer(0x21, 0x0B, 0, iface_num as u16, None, 0);
@@ -896,11 +896,11 @@ pub fn init(ecam_base: u64) -> Option<XhciController> {
         log!("xHCI: Configure Endpoint failed, code={}", code);
         return None;
     }
-    log::println("xHCI: endpoint configured");
+    log!("xHCI: endpoint configured");
 
     // 21. Queue initial interrupt IN transfer
     ctrl.queue_interrupt_transfer();
 
-    log::println("xHCI: USB keyboard ready");
+    log!("xHCI: USB keyboard ready");
     Some(ctrl)
 }

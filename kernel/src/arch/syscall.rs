@@ -145,7 +145,7 @@ fn sys_write(fd_num: u64, buf: &[u8]) -> u64 {
             Some(n) => return n,
             None => {
                 let proc = process::current();
-                let reason = match &proc.fds[fd_num as usize] {
+                let reason = match proc.fds.get(fd_num as usize).and_then(|s| s.as_ref()) {
                     Some(fd::Descriptor::PipeWrite(id)) => process::ProcessState::BlockedPipeWrite(*id),
                     _ => return u64::MAX,
                 };
@@ -162,7 +162,7 @@ fn sys_read(fd_num: u64, buf: &mut [u8]) -> u64 {
             Some(n) => return n,
             None => {
                 let proc = process::current();
-                let reason = match &proc.fds[fd_num as usize] {
+                let reason = match proc.fds.get(fd_num as usize).and_then(|s| s.as_ref()) {
                     Some(fd::Descriptor::Keyboard) => process::ProcessState::BlockedKeyboard,
                     Some(fd::Descriptor::PipeRead(id)) => process::ProcessState::BlockedPipeRead(*id),
                     _ => return u64::MAX,
@@ -192,7 +192,7 @@ fn sys_random(buf: *mut u8, len: usize) {
     }
 }
 
-/// SYS_EXEC backward compat: spawn child, optionally capture output, wait for exit.
+/// Spawn child, optionally capture stdout, wait for exit.
 fn sys_exec(argv_ptr: u64, argv_len: u64, out_buf_ptr: u64, out_buf_max: u64) -> u64 {
     let buf = unsafe { core::slice::from_raw_parts(argv_ptr as *const u8, argv_len as usize) };
     let Ok(text) = core::str::from_utf8(buf) else { return u64::MAX };
@@ -236,7 +236,7 @@ fn sys_exec(argv_ptr: u64, argv_len: u64, out_buf_ptr: u64, out_buf_max: u64) ->
                 None => {
                     // Block on pipe read
                     let proc = process::current();
-                    let pipe_id = match &proc.fds[read_fd as usize] {
+                    let pipe_id = match proc.fds.get(read_fd as usize).and_then(|s| s.as_ref()) {
                         Some(fd::Descriptor::PipeRead(id)) => *id,
                         _ => break,
                     };

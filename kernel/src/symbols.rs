@@ -1,12 +1,11 @@
 use alloc::string::String;
 use alloc::vec::Vec;
-
-use core::fmt::Write;
 use alloc::format;
+
 use elf::ElfBytes;
 use elf::endian::AnyEndian;
 use elf::abi::STT_FUNC;
-use crate::drivers::serial;
+use crate::log;
 use crate::sync::SyncCell;
 
 struct Symbol {
@@ -140,14 +139,14 @@ fn parse_symtab(data: &[u8], base: u64, table: &mut SymbolTable) {
 pub fn load_process(data: &[u8], base: u64) {
     let table = PROCESS_SYMS.get_mut();
     parse_symtab(data, base, table);
-    let _ = writeln!(serial::SerialWriter, "symbols: loaded {} process symbols", table.symbols.len());
+    log!("symbols: loaded {} process symbols", table.symbols.len());
 }
 
 /// Load kernel symbols from raw ELF bytes. Called once at boot.
 pub fn load_kernel(data: &[u8], base: u64) {
     let table = KERNEL_SYMS.get_mut();
     parse_symtab(data, base, table);
-    let _ = writeln!(serial::SerialWriter, "symbols: loaded {} kernel symbols", table.symbols.len());
+    log!("symbols: loaded {} kernel symbols", table.symbols.len());
 }
 
 /// Record the memory ranges of a loaded process for backtrace validation.

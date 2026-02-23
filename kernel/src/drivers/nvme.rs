@@ -154,7 +154,7 @@ impl NvmeController {
         cmd.prp1 = identify_buf;
         cmd.cdw10 = 1; // CNS = 1 (controller)
         self.admin.submit_and_wait(&self.bar, cmd);
-        log::println("NVMe: Identify Controller OK");
+        log!("NVMe: Identify Controller OK");
     }
 
     fn create_io_cq(&mut self) {
@@ -167,7 +167,7 @@ impl NvmeController {
         cmd.cdw10 = ((QUEUE_DEPTH as u32 - 1) << 16) | 1; // size (0-based) | QID=1
         cmd.cdw11 = 1; // physically contiguous
         self.admin.submit_and_wait(&self.bar, cmd);
-        log::println("NVMe: I/O CQ created");
+        log!("NVMe: I/O CQ created");
     }
 
     fn create_io_sq(&mut self) {
@@ -180,7 +180,7 @@ impl NvmeController {
         cmd.cdw10 = ((QUEUE_DEPTH as u32 - 1) << 16) | 1; // size (0-based) | QID=1
         cmd.cdw11 = (1 << 16) | 1; // CQID=1 | physically contiguous
         self.admin.submit_and_wait(&self.bar, cmd);
-        log::println("NVMe: I/O SQ created");
+        log!("NVMe: I/O SQ created");
     }
 
     fn identify_namespace(&mut self) {
@@ -371,7 +371,7 @@ pub fn init(ecam_base: u64) -> Option<NvmeController> {
             core::hint::spin_loop();
         }
     }
-    log::println("NVMe: controller disabled");
+    log!("NVMe: controller disabled");
 
     // Set up DMA pointers (page-aligned from static pool)
     let admin_sq = dma_page(0) as *mut SqEntry;
@@ -403,7 +403,7 @@ pub fn init(ecam_base: u64) -> Option<NvmeController> {
     while bar.read_u32(REG_CSTS) & 1 == 0 {
         core::hint::spin_loop();
     }
-    log::println("NVMe: controller enabled");
+    log!("NVMe: controller enabled");
 
     let mut ctrl = NvmeController {
         bar,

@@ -1,8 +1,3 @@
-// Per-process file descriptor table.
-//
-// Each descriptor is either a VFS-backed file (loaded into memory on open,
-// written back on close), a pipe endpoint, the keyboard, or the serial console.
-
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -13,8 +8,6 @@ use crate::drivers::serial;
 const O_WRITE: u64 = 2;
 const O_CREATE: u64 = 4;
 const O_TRUNCATE: u64 = 8;
-
-pub const MAX_FDS: usize = 32;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -43,24 +36,19 @@ pub enum Descriptor {
     Framebuffer(FramebufferInfo),
 }
 
-pub type FdTable = [Option<Descriptor>; MAX_FDS];
+pub type FdTable = Vec<Option<Descriptor>>;
 
-pub fn new_fd_table() -> FdTable {
-    [const { None }; MAX_FDS]
-}
-
-/// Allocate a descriptor in the given FD table. Returns fd index or `u64::MAX`.
 pub fn alloc(table: &mut FdTable, desc: Descriptor) -> u64 {
-    for (i, slot) in table.iter_mut().enumerate() {
-        if slot.is_none() {
-            *slot = Some(desc);
-            return i as u64;
-        }
+    if let Some(i) = table.iter().position(|slot| slot.is_none()) {
+        table[i] = Some(desc);
+        i as u64
+    } else {
+        let i = table.len();
+        table.push(Some(desc));
+        i as u64
     }
-    u64::MAX
 }
 
-/// Open a VFS file and allocate an FD. Returns fd index or `u64::MAX`.
 pub fn open(table: &mut FdTable, vfs: &mut Vfs, path: &str, flags: u64) -> u64 {
     let writable = flags & O_WRITE != 0;
     let create = flags & O_CREATE != 0;
@@ -92,37 +80,27 @@ pub fn open(table: &mut FdTable, vfs: &mut Vfs, path: &str, flags: u64) -> u64 {
     alloc(table, Descriptor::File(file))
 }
 
-/// Close a file descriptor.
 pub fn close(table: &mut FdTable, vfs: &mut Vfs, fd: u64) -> u64 {
-    let fd = fd as usize;
-    if fd >= MAX_FDS {
+    let Some(desc) = table.get_mut(fd as usize).and_then(|slot| slot.take()) else {
         return u64::MAX;
-    }
-    if let Some(desc) = table[fd].take() {
-        match desc {
-            Descriptor::File(file) => {
-                if file.modified && file.writable {
-                    if !vfs.write_file(&file.path, &file.data) {
-                        return u64::MAX;
-                    }
+    };
+    match desc {
+        Descriptor::File(file) => {
+            if file.modified && file.writable {
+                if !vfs.write_file(&file.path, &file.data) {
+                    return u64::MAX;
                 }
             }
-            Descriptor::PipeRead(id) => pipe::close_read(id),
-            Descriptor::PipeWrite(id) => pipe::close_write(id),
-            Descriptor::Keyboard | Descriptor::SerialConsole | Descriptor::Framebuffer(_) => {}
         }
+        Descriptor::PipeRead(id) => pipe::close_read(id),
+        Descriptor::PipeWrite(id) => pipe::close_write(id),
+        Descriptor::Keyboard | Descriptor::SerialConsole | Descriptor::Framebuffer(_) => {}
     }
     0
 }
 
-/// Read from a file descriptor. Returns bytes read or `u64::MAX` on error.
-/// Returns `None` if the read would block (caller should context-switch).
 pub fn try_read(table: &mut FdTable, fd: u64, buf: &mut [u8]) -> Option<u64> {
-    let fd = fd as usize;
-    if fd >= MAX_FDS {
-        return Some(u64::MAX);
-    }
-    let desc = table[fd].as_mut()?;
+    let desc = table.get_mut(fd as usize)?.as_mut()?;
     match desc {
         Descriptor::File(file) => {
             let available = file.data.len().saturating_sub(file.position);
@@ -135,7 +113,6 @@ pub fn try_read(table: &mut FdTable, fd: u64, buf: &mut [u8]) -> Option<u64> {
             pipe::try_read(*id, buf).map(|n| n as u64)
         }
         Descriptor::Keyboard => {
-            // Non-blocking: return first available byte(s), or None to block
             crate::drivers::xhci::poll_global();
             if let Some(ch) = keyboard::try_read_char() {
                 buf[0] = ch;
@@ -150,7 +127,7 @@ pub fn try_read(table: &mut FdTable, fd: u64, buf: &mut [u8]) -> Option<u64> {
                 }
                 Some(count as u64)
             } else {
-                None // would block
+                None
             }
         }
         Descriptor::Framebuffer(info) => {
@@ -168,14 +145,8 @@ pub fn try_read(table: &mut FdTable, fd: u64, buf: &mut [u8]) -> Option<u64> {
     }
 }
 
-/// Write to a file descriptor. Returns bytes written or `u64::MAX` on error.
-/// Returns `None` if the write would block.
 pub fn try_write(table: &mut FdTable, fd: u64, buf: &[u8]) -> Option<u64> {
-    let fd = fd as usize;
-    if fd >= MAX_FDS {
-        return Some(u64::MAX);
-    }
-    let desc = table[fd].as_mut()?;
+    let desc = table.get_mut(fd as usize)?.as_mut()?;
     match desc {
         Descriptor::File(file) => {
             if !file.writable {
@@ -192,9 +163,9 @@ pub fn try_write(table: &mut FdTable, fd: u64, buf: &[u8]) -> Option<u64> {
         }
         Descriptor::PipeWrite(id) => {
             match pipe::try_write(*id, buf) {
-                Some(usize::MAX) => Some(u64::MAX), // broken pipe
+                Some(usize::MAX) => Some(u64::MAX),
                 Some(n) => Some(n as u64),
-                None => None, // would block
+                None => None,
             }
         }
         Descriptor::SerialConsole => {
@@ -205,44 +176,31 @@ pub fn try_write(table: &mut FdTable, fd: u64, buf: &[u8]) -> Option<u64> {
     }
 }
 
-/// Seek in a file descriptor.
 pub fn seek(table: &mut FdTable, fd: u64, offset: i64, whence: u64) -> u64 {
-    let fd = fd as usize;
-    if fd >= MAX_FDS {
+    let Some(Descriptor::File(file)) = table.get_mut(fd as usize).and_then(|s| s.as_mut()) else {
         return u64::MAX;
-    }
-    let Some(Descriptor::File(file)) = table[fd].as_mut() else { return u64::MAX };
-
+    };
     let new_pos = match whence {
         0 => offset as usize,
         1 => (file.position as i64 + offset) as usize,
         2 => (file.data.len() as i64 + offset) as usize,
         _ => return u64::MAX,
     };
-
     file.position = new_pos.min(file.data.len());
     file.position as u64
 }
 
-/// Get file metadata. Returns (file_type << 32) | size.
 pub fn fstat(table: &mut FdTable, fd: u64) -> u64 {
-    let fd = fd as usize;
-    if fd >= MAX_FDS {
+    let Some(Descriptor::File(file)) = table.get_mut(fd as usize).and_then(|s| s.as_mut()) else {
         return u64::MAX;
-    }
-    let Some(Descriptor::File(file)) = table[fd].as_mut() else { return u64::MAX };
-    let file_type: u64 = 1;
-    let size = file.data.len() as u64;
-    (file_type << 32) | size
+    };
+    (1u64 << 32) | file.data.len() as u64
 }
 
-/// Flush a file descriptor.
 pub fn fsync(table: &mut FdTable, vfs: &mut Vfs, fd: u64) -> u64 {
-    let fd = fd as usize;
-    if fd >= MAX_FDS {
+    let Some(Descriptor::File(file)) = table.get_mut(fd as usize).and_then(|s| s.as_mut()) else {
         return u64::MAX;
-    }
-    let Some(Descriptor::File(file)) = table[fd].as_mut() else { return u64::MAX };
+    };
     if file.modified && file.writable {
         if !vfs.write_file(&file.path, &file.data) {
             return u64::MAX;
@@ -252,7 +210,6 @@ pub fn fsync(table: &mut FdTable, vfs: &mut Vfs, fd: u64) -> u64 {
     0
 }
 
-/// Close all open file descriptors.
 pub fn close_all(table: &mut FdTable, vfs: &mut Vfs) {
     for slot in table.iter_mut() {
         if let Some(desc) = slot.take() {
@@ -272,13 +229,8 @@ pub fn close_all(table: &mut FdTable, vfs: &mut Vfs) {
     }
 }
 
-/// Check if an FD has data available for reading (for poll).
 pub fn has_data(table: &FdTable, fd: u64) -> bool {
-    let fd = fd as usize;
-    if fd >= MAX_FDS {
-        return false;
-    }
-    match &table[fd] {
+    match table.get(fd as usize).and_then(|s| s.as_ref()) {
         Some(Descriptor::PipeRead(id)) => pipe::has_data(*id),
         Some(Descriptor::Keyboard) => keyboard::has_data(),
         Some(Descriptor::File(_)) | Some(Descriptor::Framebuffer(_)) => true,
@@ -286,7 +238,7 @@ pub fn has_data(table: &FdTable, fd: u64) -> bool {
     }
 }
 
-/// Write bytes to serial, skipping ANSI escape sequences.
+/// Strips ANSI escape sequences before writing to serial.
 fn serial_write_plain(bytes: &[u8]) {
     let mut i = 0;
     let mut start = 0;

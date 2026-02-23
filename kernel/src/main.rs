@@ -12,18 +12,17 @@ use kernel::arch::{gdt, idt, paging, syscall};
 use kernel::drivers::{acpi, nvme, pci, serial, xhci};
 use kernel::{allocator, clock, fd, log, process, ramdisk, symbols, vfs, KernelArgs, MemoryMapEntry};
 use tyfs::Disk;
-use core::fmt::Write;
 
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
-    let _ = write!(serial::SerialWriter, "PANIC: {}\n", info);
+    log!("PANIC: {}", info);
     loop {}
 }
 
 #[no_mangle]
 pub unsafe extern "sysv64" fn _start(kernel_args: KernelArgs) -> ! {
     serial::init();
-    let _ = write!(serial::SerialWriter, "{:?}\n", kernel_args);
+    log!("{:?}", kernel_args);
 
     let entry_count = kernel_args.memory_map_size as usize / core::mem::size_of::<MemoryMapEntry>();
     let maps = core::slice::from_raw_parts(
@@ -66,32 +65,28 @@ fn kernel_main(
 
     paging::init(maps);
 
-    serial::println("Hello from Kernel!");
+    log!("Hello from Kernel!");
 
     // Mount initrd ramdisk
     assert!(!initrd.is_empty(), "No initrd provided");
-    let _ = writeln!(serial::SerialWriter,
-        "Initrd: addr={:#x} size={} bytes",
-        initrd.as_ptr() as u64, initrd.len()
-    );
+    log!("Initrd: addr={:#x} size={} bytes", initrd.as_ptr() as u64, initrd.len());
 
     let ramdisk = unsafe { ramdisk::RamDisk::new(initrd.as_ptr() as *mut u8, initrd.len()) };
     let mut initrd_fs = tyfs::SimpleFs::mount(ramdisk).expect("Failed to mount initrd");
-    serial::println("TYFS: mounted initrd");
+    log!("TYFS: mounted initrd");
     for (name, size) in initrd_fs.list() {
-        let _ = writeln!(serial::SerialWriter, "  {} ({} bytes)", name, size);
+        log!("  {} ({} bytes)", name, size);
     }
 
     // Map framebuffer for userland access and store screen dimensions
-    let _ = writeln!(serial::SerialWriter,
-        "GOP: {}x{} stride={} fmt={}",
+    log!("GOP: {}x{} stride={} fmt={}",
         kernel_args.framebuffer_width, kernel_args.framebuffer_height,
         kernel_args.framebuffer_stride, kernel_args.framebuffer_pixel_format
     );
     paging::map_user(kernel_args.framebuffer_addr, kernel_args.framebuffer_size);
     syscall::set_screen_size(kernel_args.framebuffer_width, kernel_args.framebuffer_height);
 
-    log::println("ToyOS Kernel initialized");
+    log!("ToyOS Kernel initialized");
     log!("Framebuffer: {}x{} stride={}",
         kernel_args.framebuffer_width, kernel_args.framebuffer_height, kernel_args.framebuffer_stride
     );
@@ -106,17 +101,17 @@ fn kernel_main(
     let mut magic = [0u8; 4];
     disk.read(0, &mut magic);
     let nvme_fs = if &magic == b"TYFS" {
-        log::println("NVMe: mounted TYFS");
+        log!("NVMe: mounted TYFS");
         tyfs::SimpleFs::mount(disk).expect("TYFS header valid but mount failed")
     } else {
-        log::println("NVMe: formatting TYFS");
+        log!("NVMe: formatting TYFS");
         tyfs::SimpleFs::format(disk, total_bytes)
     };
 
     // Initialize USB keyboard
     let xhci_ctrl = xhci::init(ecam_base).expect("xHCI: no USB controller found");
     xhci::set_global(xhci_ctrl);
-    log::println("USB keyboard enabled");
+    log!("USB keyboard enabled");
 
     acpi::init_power(kernel_args.rsdp_addr);
 
@@ -137,7 +132,7 @@ fn kernel_main(
     }
 
     syscall::init();
-    log::println("Ring 3: ready");
+    log!("Ring 3: ready");
 
     // Build VFS
     let mut vfs = vfs::Vfs::new();
@@ -186,29 +181,9 @@ fn kernel_main(
         stack_top,
     );
 
-    // Write argc/argv onto user stack
-    let mut sp = stack_top;
-    let mut argv_ptrs: Vec<u64> = Vec::with_capacity(args.len());
-    for arg in args.iter().rev() {
-        sp -= (arg.len() + 1) as u64;
-        unsafe {
-            core::ptr::copy_nonoverlapping(arg.as_ptr(), sp as *mut u8, arg.len());
-            *((sp + arg.len() as u64) as *mut u8) = 0;
-        }
-        argv_ptrs.push(sp);
-    }
-    argv_ptrs.reverse();
-    let metadata_qwords = args.len() + 2;
-    sp = (sp - metadata_qwords as u64 * 8) & !15;
-    unsafe {
-        *(sp as *mut u64) = args.len() as u64;
-        for (i, ptr) in argv_ptrs.iter().enumerate() {
-            *((sp + 8 + i as u64 * 8) as *mut u64) = *ptr;
-        }
-        *((sp + 8 + args.len() as u64 * 8) as *mut u64) = 0;
-    }
+    let sp = process::write_argv_to_stack(stack_top, &args);
 
-    let _ = writeln!(serial::SerialWriter, "init: entry={:#x}, stack={:#x}, argc={}", loaded.entry, sp, args.len());
+    log!("init: entry={:#x}, stack={:#x}, argc={}", loaded.entry, sp, args.len());
 
     // Create process 0 and start the scheduler (never returns)
     let fb_info = fd::FramebufferInfo {

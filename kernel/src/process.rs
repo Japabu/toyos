@@ -2,17 +2,39 @@ use alloc::alloc::{alloc_zeroed, dealloc, Layout};
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::arch::{asm, naked_asm};
-use core::fmt::Write;
 
 use crate::arch::{gdt, paging, syscall};
-use crate::drivers::serial;
 use crate::fd::{self, Descriptor, FdTable};
 use crate::sync::SyncCell;
 use crate::{elf, keyboard, log, pipe, symbols, user_heap, vfs};
 
-const MAX_PROCESSES: usize = 16;
 const USER_STACK_SIZE: usize = 64 * 1024;
 const KERNEL_STACK_SIZE: usize = 64 * 1024;
+
+/// Write argc, argv pointers, and string data onto a user stack. Returns new SP.
+pub fn write_argv_to_stack(stack_top: u64, args: &[&str]) -> u64 {
+    let mut sp = stack_top;
+    let mut argv_ptrs: Vec<u64> = Vec::with_capacity(args.len());
+    for arg in args.iter().rev() {
+        sp -= (arg.len() + 1) as u64;
+        unsafe {
+            core::ptr::copy_nonoverlapping(arg.as_ptr(), sp as *mut u8, arg.len());
+            *((sp + arg.len() as u64) as *mut u8) = 0;
+        }
+        argv_ptrs.push(sp);
+    }
+    argv_ptrs.reverse();
+    let metadata_qwords = args.len() + 2;
+    sp = (sp - metadata_qwords as u64 * 8) & !15;
+    unsafe {
+        *(sp as *mut u64) = args.len() as u64;
+        for (i, ptr) in argv_ptrs.iter().enumerate() {
+            *((sp + 8 + i as u64 * 8) as *mut u64) = *ptr;
+        }
+        *((sp + 8 + args.len() as u64 * 8) as *mut u64) = 0;
+    }
+    sp
+}
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum ProcessState {
@@ -47,14 +69,14 @@ pub struct Process {
 }
 
 struct ProcessTable {
-    procs: [Option<Process>; MAX_PROCESSES],
-    current: usize, // index of Running process
+    procs: Vec<Option<Process>>,
+    current: usize,
 }
 
 impl ProcessTable {
     const fn new() -> Self {
         Self {
-            procs: [const { None }; MAX_PROCESSES],
+            procs: Vec::new(),
             current: 0,
         }
     }
@@ -81,19 +103,17 @@ pub fn init_process0(
 ) {
     let table = PROCESS_TABLE.get_mut();
 
-    // Allocate kernel stack for process 0
     let ks_layout = Layout::from_size_align(KERNEL_STACK_SIZE, 4096).unwrap();
     let ks_base = unsafe { alloc_zeroed(ks_layout) };
     assert!(!ks_base.is_null(), "process 0: kernel stack alloc failed");
     let ks_top = ks_base as u64 + KERNEL_STACK_SIZE as u64;
 
-    // Set up initial FDs: 0=Keyboard, 1=SerialConsole, 2=SerialConsole, 3=Framebuffer
-    let mut fds = fd::new_fd_table();
-    fds[0] = Some(Descriptor::Keyboard);
-    fds[1] = Some(Descriptor::SerialConsole);
-    fds[2] = Some(Descriptor::SerialConsole);
+    let mut fds: FdTable = Vec::new();
+    fds.push(Some(Descriptor::Keyboard));
+    fds.push(Some(Descriptor::SerialConsole));
+    fds.push(Some(Descriptor::SerialConsole));
     if let Some(info) = fb_info {
-        fds[3] = Some(Descriptor::Framebuffer(info));
+        fds.push(Some(Descriptor::Framebuffer(info)));
     }
 
     // Set up kernel stack so context_switch's `ret` goes to the trampoline
@@ -114,7 +134,7 @@ pub fn init_process0(
 
     user_heap::init();
 
-    table.procs[0] = Some(Process {
+    table.procs.push(Some(Process {
         pid: 0,
         state: ProcessState::Running,
         kernel_stack_base: ks_base,
@@ -128,7 +148,7 @@ pub fn init_process0(
         elf_layout,
         stack_base,
         stack_layout,
-    });
+    }));
     table.current = 0;
 
     // Set SYSCALL_KERNEL_RSP and TSS.RSP0 to the top of process 0's kernel stack
@@ -173,7 +193,7 @@ pub fn spawn(argv: &[&str], stdin_fd: u64, stdout_fd: u64) -> u64 {
     let loaded = match elf::load(&binary) {
         Ok(l) => l,
         Err(msg) => {
-            log::println(msg);
+            log!("{}", msg);
             return u64::MAX;
         }
     };
@@ -189,27 +209,7 @@ pub fn spawn(argv: &[&str], stdin_fd: u64, stdout_fd: u64) -> u64 {
     let elf_layout = Layout::from_size_align(loaded.load_size, 4096).unwrap();
     paging::map_user(stack_base as u64, USER_STACK_SIZE as u64);
 
-    // Write argc/argv onto user stack
-    let mut sp = stack_top;
-    let mut argv_ptrs: Vec<u64> = Vec::with_capacity(argv.len());
-    for arg in argv.iter().rev() {
-        sp -= (arg.len() + 1) as u64;
-        unsafe {
-            core::ptr::copy_nonoverlapping(arg.as_ptr(), sp as *mut u8, arg.len());
-            *((sp + arg.len() as u64) as *mut u8) = 0;
-        }
-        argv_ptrs.push(sp);
-    }
-    argv_ptrs.reverse();
-    let metadata_qwords = argv.len() + 2;
-    sp = (sp - metadata_qwords as u64 * 8) & !15;
-    unsafe {
-        *(sp as *mut u64) = argv.len() as u64;
-        for (i, ptr) in argv_ptrs.iter().enumerate() {
-            *((sp + 8 + i as u64 * 8) as *mut u64) = *ptr;
-        }
-        *((sp + 8 + argv.len() as u64 * 8) as *mut u64) = 0;
-    }
+    let sp = write_argv_to_stack(stack_top, argv);
 
     // Allocate kernel stack for child
     let ks_layout = Layout::from_size_align(KERNEL_STACK_SIZE, 4096).unwrap();
@@ -219,48 +219,45 @@ pub fn spawn(argv: &[&str], stdin_fd: u64, stdout_fd: u64) -> u64 {
     }
     let ks_top = ks_base as u64 + KERNEL_STACK_SIZE as u64;
 
-    // Find free PID
     let table = PROCESS_TABLE.get_mut();
-    let slot_idx = match table.procs.iter().position(|p| p.is_none()) {
-        Some(i) => i,
-        None => return u64::MAX,
+    let slot_idx = if let Some(i) = table.procs.iter().position(|p| p.is_none()) {
+        i
+    } else {
+        let i = table.procs.len();
+        table.procs.push(None);
+        i
     };
     let pid = slot_idx as u32;
     let parent_pid = current_pid();
 
-    // Set up child FDs
-    let mut child_fds = fd::new_fd_table();
+    let mut child_fds: FdTable = Vec::new();
 
     // FD 0 (stdin)
-    {
-        let src_fd = if stdin_fd != u64::MAX { stdin_fd } else { 0 };
-        let parent = table.procs[table.current].as_ref().unwrap();
-        match &parent.fds[src_fd as usize] {
-            Some(Descriptor::PipeRead(id)) => {
-                pipe::add_reader(*id);
-                child_fds[0] = Some(Descriptor::PipeRead(*id));
-            }
-            Some(Descriptor::Keyboard) => child_fds[0] = Some(Descriptor::Keyboard),
-            _ => child_fds[0] = Some(Descriptor::Keyboard),
+    let src_fd = if stdin_fd != u64::MAX { stdin_fd } else { 0 };
+    let parent = table.procs[table.current].as_ref().unwrap();
+    let stdin_desc = match parent.fds.get(src_fd as usize).and_then(|s| s.as_ref()) {
+        Some(Descriptor::PipeRead(id)) => {
+            pipe::add_reader(*id);
+            Descriptor::PipeRead(*id)
         }
-    }
+        _ => Descriptor::Keyboard,
+    };
+    child_fds.push(Some(stdin_desc));
 
     // FD 1 (stdout)
-    {
-        let src_fd = if stdout_fd != u64::MAX { stdout_fd } else { 1 };
-        let parent = table.procs[table.current].as_ref().unwrap();
-        match &parent.fds[src_fd as usize] {
-            Some(Descriptor::PipeWrite(id)) => {
-                pipe::add_writer(*id);
-                child_fds[1] = Some(Descriptor::PipeWrite(*id));
-            }
-            Some(Descriptor::SerialConsole) => child_fds[1] = Some(Descriptor::SerialConsole),
-            _ => child_fds[1] = Some(Descriptor::SerialConsole),
+    let src_fd = if stdout_fd != u64::MAX { stdout_fd } else { 1 };
+    let parent = table.procs[table.current].as_ref().unwrap();
+    let stdout_desc = match parent.fds.get(src_fd as usize).and_then(|s| s.as_ref()) {
+        Some(Descriptor::PipeWrite(id)) => {
+            pipe::add_writer(*id);
+            Descriptor::PipeWrite(*id)
         }
-    }
+        _ => Descriptor::SerialConsole,
+    };
+    child_fds.push(Some(stdout_desc));
 
-    // FD 2 (stderr) — always serial console
-    child_fds[2] = Some(Descriptor::SerialConsole);
+    // FD 2 (stderr)
+    child_fds.push(Some(Descriptor::SerialConsole));
 
     // Inherit parent's cwd
     let parent_cwd = table.procs[table.current].as_ref().unwrap().cwd.clone();
@@ -278,7 +275,7 @@ pub fn spawn(argv: &[&str], stdin_fd: u64, stdout_fd: u64) -> u64 {
         *frame_ptr.add(6) = process_entry_trampoline as u64;
     }
 
-    let _ = writeln!(serial::SerialWriter, "spawn: pid={} entry={:#x} stack={:#x}", pid, loaded.entry, sp);
+    log!("spawn: pid={} entry={:#x} stack={:#x}", pid, loaded.entry, sp);
 
     table.procs[slot_idx] = Some(Process {
         pid,
@@ -360,11 +357,11 @@ pub fn schedule() {
     let old_idx = table.current;
 
     loop {
-        // Try to find a Ready process (round-robin)
-        let start = (old_idx + 1) % MAX_PROCESSES;
+        let len = table.procs.len();
+        let start = (old_idx + 1) % len;
         let mut found = None;
-        for i in 0..MAX_PROCESSES {
-            let idx = (start + i) % MAX_PROCESSES;
+        for i in 0..len {
+            let idx = (start + i) % len;
             if let Some(proc) = &table.procs[idx] {
                 if proc.state == ProcessState::Ready {
                     found = Some(idx);
@@ -418,7 +415,7 @@ fn schedule_no_return() -> ! {
 
     loop {
         // Find any Ready process
-        for i in 0..MAX_PROCESSES {
+        for i in 0..table.procs.len() {
             if let Some(proc) = &mut table.procs[i] {
                 if proc.state == ProcessState::Ready {
                     proc.state = ProcessState::Running;
@@ -463,14 +460,11 @@ fn idle_poll(table: &mut ProcessTable) {
 
     let kb_ready = keyboard::has_data();
 
-    // Collect zombie PIDs first (avoids borrow conflict)
-    let mut zombie_pids = [0u32; MAX_PROCESSES];
-    let mut zombie_count = 0;
+    let mut zombie_pids: Vec<u32> = Vec::new();
     for slot in table.procs.iter() {
         if let Some(p) = slot {
             if matches!(p.state, ProcessState::Zombie(_)) {
-                zombie_pids[zombie_count] = p.pid;
-                zombie_count += 1;
+                zombie_pids.push(p.pid);
             }
         }
     }
@@ -488,7 +482,7 @@ fn idle_poll(table: &mut ProcessTable) {
                     proc.state = ProcessState::Ready;
                 }
                 ProcessState::BlockedWaitPid(child_pid) => {
-                    if zombie_pids[..zombie_count].contains(&child_pid) {
+                    if zombie_pids.contains(&child_pid) {
                         proc.state = ProcessState::Ready;
                     }
                 }

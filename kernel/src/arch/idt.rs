@@ -314,7 +314,7 @@ extern "C" fn exception_handler(
     }
 
     // Register dump
-    log::println("  Registers:");
+    log!("  Registers:");
     log!("    rax={:#018x}  rbx={:#018x}", regs.rax, regs.rbx);
     log!("    rcx={:#018x}  rdx={:#018x}", regs.rcx, regs.rdx);
     log!("    rsi={:#018x}  rdi={:#018x}", regs.rsi, regs.rdi);
@@ -326,7 +326,7 @@ extern "C" fn exception_handler(
 
     // Stack dump (8 words from RSP)
     if is_user && frame.rsp % 8 == 0 {
-        log::println("  Stack:");
+        log!("  Stack:");
         for i in 0..8u64 {
             let addr = frame.rsp + i * 8;
             if !symbols::is_valid_user_addr(addr) && !symbols::is_valid_user_addr(addr + 7) { break; }
@@ -342,7 +342,7 @@ extern "C" fn exception_handler(
 
     // Stack backtrace
     if is_user {
-        log::println("  Backtrace:");
+        log!("  Backtrace:");
         log!("    0: {}", format_addr(rip));
         let mut rbp = regs.rbp;
         for i in 1..20 {

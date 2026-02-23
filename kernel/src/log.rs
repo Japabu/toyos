@@ -23,13 +23,3 @@ macro_rules! log {
         let _ = writeln!($crate::log::LogWriter, $($arg)*);
     }};
 }
-
-#[cfg(not(test))]
-pub fn println(s: &str) {
-    crate::drivers::serial::println(s);
-}
-
-#[cfg(test)]
-pub fn println(s: &str) {
-    std::println!("{}", s);
-}

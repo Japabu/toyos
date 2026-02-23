@@ -25,7 +25,7 @@ pub struct PciDevice {
 impl PciDevice {
     fn new(ecam_base: u64, bus: u8, dev: u8, func: u8) -> Self {
         let addr = ecam_base
-            + ((bus as u64) << 20)
+            | ((bus as u64) << 20)
             | ((dev as u64) << 15)
             | ((func as u64) << 12);
         Self { mmio: Mmio::new(addr), bus, dev, func }
@@ -79,7 +79,7 @@ impl PciDevice {
 
 /// Enumerate all PCIe devices via ECAM and print them.
 pub fn enumerate(ecam_base: u64) {
-    log::println("PCI: Enumerating devices...");
+    log!("PCI: Enumerating devices...");
 
     for bus in 0..=255u16 {
         for dev in 0..32u8 {
@@ -99,7 +99,7 @@ pub fn enumerate(ecam_base: u64) {
         }
     }
 
-    log::println("PCI: Enumeration complete.");
+    log!("PCI: Enumeration complete.");
 }
 
 fn print_device(pci: &PciDevice) {

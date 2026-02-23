@@ -1,10 +1,9 @@
 use alloc::alloc::{alloc_zeroed, Layout};
 
-use core::fmt::Write;
+use crate::log;
 use elf::ElfBytes;
 use elf::endian::AnyEndian;
 use elf::abi::{PT_LOAD, ET_DYN, EM_X86_64, R_X86_64_RELATIVE};
-use crate::drivers::serial;
 
 pub struct LoadedElf {
     pub entry: u64,
@@ -36,7 +35,7 @@ pub fn load(data: &[u8]) -> Result<LoadedElf, &'static str> {
         None => return Err("ELF: no program headers"),
     };
 
-    let _ = writeln!(serial::SerialWriter, "ELF: valid header, entry={:#x}, {} phdrs", ehdr.e_entry, ehdr.e_phnum);
+    log!("ELF: valid header, entry={:#x}, {} phdrs", ehdr.e_entry, ehdr.e_phnum);
 
     // Scan PT_LOAD segments to find total virtual address range
     let mut vaddr_min: u64 = u64::MAX;
@@ -65,7 +64,7 @@ pub fn load(data: &[u8]) -> Result<LoadedElf, &'static str> {
         return Err("ELF: allocation failed");
     }
     let base = base_ptr as u64 - vaddr_min;
-    let _ = writeln!(serial::SerialWriter, "ELF: allocated {} bytes at {:#x}, base={:#x}", load_size, base_ptr as u64, base);
+    log!("ELF: allocated {} bytes at {:#x}, base={:#x}", load_size, base_ptr as u64, base);
 
     // Load PT_LOAD segments
     for phdr in segments.iter() {
@@ -96,7 +95,7 @@ pub fn load(data: &[u8]) -> Result<LoadedElf, &'static str> {
         }
     }
 
-    let _ = writeln!(serial::SerialWriter, "ELF: {} relocations applied", reloc_count);
+    log!("ELF: {} relocations applied", reloc_count);
 
     Ok(LoadedElf {
         entry: base + ehdr.e_entry,
