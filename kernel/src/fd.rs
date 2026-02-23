@@ -7,7 +7,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::vfs::Vfs;
-use crate::{console, keyboard, pipe};
+use crate::{keyboard, log, pipe};
 use crate::drivers::serial;
 
 const O_WRITE: u64 = 2;
@@ -15,6 +15,16 @@ const O_CREATE: u64 = 4;
 const O_TRUNCATE: u64 = 8;
 
 pub const MAX_FDS: usize = 32;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FramebufferInfo {
+    pub addr: u64,
+    pub width: u32,
+    pub height: u32,
+    pub stride: u32,
+    pub pixel_format: u32,
+}
 
 pub struct OpenFile {
     path: String,
@@ -30,6 +40,7 @@ pub enum Descriptor {
     PipeWrite(usize),
     Keyboard,
     SerialConsole,
+    Framebuffer(FramebufferInfo),
 }
 
 pub type FdTable = [Option<Descriptor>; MAX_FDS];
@@ -91,12 +102,14 @@ pub fn close(table: &mut FdTable, vfs: &mut Vfs, fd: u64) -> u64 {
         match desc {
             Descriptor::File(file) => {
                 if file.modified && file.writable {
-                    vfs.write_file(&file.path, &file.data);
+                    if !vfs.write_file(&file.path, &file.data) {
+                        return u64::MAX;
+                    }
                 }
             }
             Descriptor::PipeRead(id) => pipe::close_read(id),
             Descriptor::PipeWrite(id) => pipe::close_write(id),
-            Descriptor::Keyboard | Descriptor::SerialConsole => {}
+            Descriptor::Keyboard | Descriptor::SerialConsole | Descriptor::Framebuffer(_) => {}
         }
     }
     0
@@ -140,6 +153,17 @@ pub fn try_read(table: &mut FdTable, fd: u64, buf: &mut [u8]) -> Option<u64> {
                 None // would block
             }
         }
+        Descriptor::Framebuffer(info) => {
+            let info_bytes = unsafe {
+                core::slice::from_raw_parts(
+                    info as *const FramebufferInfo as *const u8,
+                    core::mem::size_of::<FramebufferInfo>(),
+                )
+            };
+            let count = buf.len().min(info_bytes.len());
+            buf[..count].copy_from_slice(&info_bytes[..count]);
+            Some(count as u64)
+        }
         Descriptor::PipeWrite(_) | Descriptor::SerialConsole => Some(u64::MAX),
     }
 }
@@ -175,10 +199,9 @@ pub fn try_write(table: &mut FdTable, fd: u64, buf: &[u8]) -> Option<u64> {
         }
         Descriptor::SerialConsole => {
             serial_write_plain(buf);
-            console::write_bytes(buf);
             Some(buf.len() as u64)
         }
-        Descriptor::Keyboard | Descriptor::PipeRead(_) => Some(u64::MAX),
+        Descriptor::Keyboard | Descriptor::PipeRead(_) | Descriptor::Framebuffer(_) => Some(u64::MAX),
     }
 }
 
@@ -221,7 +244,9 @@ pub fn fsync(table: &mut FdTable, vfs: &mut Vfs, fd: u64) -> u64 {
     }
     let Some(Descriptor::File(file)) = table[fd].as_mut() else { return u64::MAX };
     if file.modified && file.writable {
-        vfs.write_file(&file.path, &file.data);
+        if !vfs.write_file(&file.path, &file.data) {
+            return u64::MAX;
+        }
         file.modified = false;
     }
     0
@@ -234,12 +259,14 @@ pub fn close_all(table: &mut FdTable, vfs: &mut Vfs) {
             match desc {
                 Descriptor::File(file) => {
                     if file.modified && file.writable {
-                        vfs.write_file(&file.path, &file.data);
+                        if !vfs.write_file(&file.path, &file.data) {
+                            log!("warning: VFS write failed on process exit: {}", file.path);
+                        }
                     }
                 }
                 Descriptor::PipeRead(id) => pipe::close_read(id),
                 Descriptor::PipeWrite(id) => pipe::close_write(id),
-                Descriptor::Keyboard | Descriptor::SerialConsole => {}
+                Descriptor::Keyboard | Descriptor::SerialConsole | Descriptor::Framebuffer(_) => {}
             }
         }
     }
@@ -254,7 +281,7 @@ pub fn has_data(table: &FdTable, fd: u64) -> bool {
     match &table[fd] {
         Some(Descriptor::PipeRead(id)) => pipe::has_data(*id),
         Some(Descriptor::Keyboard) => keyboard::has_data(),
-        Some(Descriptor::File(_)) => true, // files always "ready"
+        Some(Descriptor::File(_)) | Some(Descriptor::Framebuffer(_)) => true,
         _ => false,
     }
 }

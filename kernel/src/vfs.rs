@@ -85,6 +85,18 @@ impl Vfs {
     }
 
     /// Resolve a (possibly relative) path against the given cwd.
+    /// Returns the absolute normalized path.
+    pub fn resolve_absolute(&self, cwd: &str, path: &str) -> String {
+        if path.starts_with('/') {
+            normalize(path)
+        } else if cwd == "/" {
+            normalize(&format!("/{}", path))
+        } else {
+            normalize(&format!("{}/{}", cwd, path))
+        }
+    }
+
+    /// Resolve a (possibly relative) path against the given cwd.
     /// Returns `(mount_name, filename)`. An empty mount means root.
     pub fn resolve_path(&self, cwd: &str, arg: &str) -> (String, String) {
         let full = if arg.starts_with('/') {

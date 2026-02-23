@@ -4,7 +4,6 @@ pub mod acpi;
 pub mod pci;
 pub mod nvme;
 pub mod xhci;
-pub mod framebuffer;
 
 /// Page-aligned DMA memory pool for device I/O buffers.
 #[repr(C, align(4096))]

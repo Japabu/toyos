@@ -1,0 +1,7 @@
+[package]
+name = "terminal"
+version = "0.1.0"
+edition = "2021"
+
+[build-dependencies]
+fontdue = "0.9"

@@ -12,10 +12,6 @@ pub mod log;
 pub mod allocator;
 
 #[cfg(not(test))]
-pub mod font;
-#[cfg(not(test))]
-pub mod console;
-#[cfg(not(test))]
 pub mod keyboard;
 #[cfg(not(test))]
 pub mod ramdisk;

@@ -1,6 +1,4 @@
-use alloc::vec::Vec;
-
-use crate::drivers::framebuffer::{Color, Framebuffer};
+use crate::framebuffer::{Color, Framebuffer};
 
 pub const WIDTH: usize = 8;
 pub const HEIGHT: usize = 16;
@@ -12,11 +10,14 @@ pub struct Font {
 
 impl Font {
     /// Parse font.bin: [u32 count][u32 codepoints...][glyph data...]
-    pub fn new(raw: Vec<u8>) -> Self {
+    pub fn new(raw: &[u8]) -> Self {
         assert!(raw.len() >= 4, "Font data too small");
         let count = u32::from_le_bytes(raw[0..4].try_into().unwrap()) as usize;
         let codepoints_end = 4 + count * 4;
-        assert!(raw.len() >= codepoints_end + count * WIDTH * HEIGHT, "Font data too small");
+        assert!(
+            raw.len() >= codepoints_end + count * WIDTH * HEIGHT,
+            "Font data too small"
+        );
 
         let mut codepoints = Vec::with_capacity(count);
         for i in 0..count {
@@ -35,7 +36,15 @@ impl Font {
             .unwrap_or(0x3F) // '?' for unknown codepoints
     }
 
-    pub fn draw_char(&self, fb: &Framebuffer, px: usize, py: usize, ch: char, fg: Color, bg: Color) {
+    pub fn draw_char(
+        &self,
+        fb: &Framebuffer,
+        px: usize,
+        py: usize,
+        ch: char,
+        fg: Color,
+        bg: Color,
+    ) {
         let idx = self.glyph_index(ch);
         let glyph_offset = idx * WIDTH * HEIGHT;
 

@@ -7,11 +7,6 @@ pub struct Color {
     pub b: u8,
 }
 
-impl Color {
-    pub const WHITE: Color = Color { r: 255, g: 255, b: 255 };
-    pub const BLACK: Color = Color { r: 0, g: 0, b: 0 };
-}
-
 #[derive(Clone, Copy, PartialEq)]
 enum PixelFormat {
     Rgb,
@@ -27,16 +22,7 @@ pub struct Framebuffer {
 }
 
 impl Framebuffer {
-    /// # Safety
-    /// `addr` must point to valid framebuffer memory of at least `size` bytes.
-    pub unsafe fn new(
-        addr: u64,
-        _size: u64,
-        width: u32,
-        height: u32,
-        stride: u32,
-        pixel_format: u32,
-    ) -> Self {
+    pub fn new(addr: u64, width: u32, height: u32, stride: u32, pixel_format: u32) -> Self {
         Self {
             addr: addr as *mut u8,
             width: width as usize,
@@ -81,7 +67,6 @@ impl Framebuffer {
         }
     }
 
-    /// Encode a color as a 4-byte pixel value (format-aware).
     fn encode_pixel(&self, color: Color) -> [u8; 4] {
         match self.pixel_format {
             PixelFormat::Rgb => [color.r, color.g, color.b, 0],
@@ -89,7 +74,6 @@ impl Framebuffer {
         }
     }
 
-    /// Fill a row range with a solid color using bulk writes.
     fn fill_rows(&self, y_start: usize, y_end: usize, color: Color) {
         let pixel = self.encode_pixel(color);
         for y in y_start..y_end {
@@ -109,14 +93,12 @@ impl Framebuffer {
 
     pub fn scroll_up(&self, pixel_rows: usize, bg: Color) {
         let row_bytes = self.stride * 4;
-
         unsafe {
             let src = self.addr.add(pixel_rows * row_bytes);
             let dst = self.addr;
             let count = (self.height - pixel_rows) * row_bytes;
             ptr::copy(src, dst, count);
         }
-
         self.fill_rows(self.height - pixel_rows, self.height, bg);
     }
 }

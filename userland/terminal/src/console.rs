@@ -1,9 +1,5 @@
-use alloc::vec;
-use alloc::vec::Vec;
-
 use crate::font::{self, Font};
-use crate::drivers::framebuffer::{Color, Framebuffer};
-use crate::sync::SyncCell;
+use crate::framebuffer::{Color, Framebuffer};
 
 const DEFAULT_FG: Color = Color { r: 255, g: 255, b: 255 };
 const DEFAULT_BG: Color = Color { r: 0, g: 0, b: 0 };
@@ -56,16 +52,14 @@ fn color256(n: usize) -> Color {
     }
 }
 
-// ANSI escape sequence parser states
 #[derive(Clone, Copy)]
 enum AnsiState {
     Normal,
-    Escape,       // saw \x1b
-    Bracket,      // saw \x1b[
-    QuestionMark, // saw \x1b[?
+    Escape,
+    Bracket,
+    QuestionMark,
 }
 
-/// Saved main-screen state for alternate screen buffer switching.
 struct SavedScreen {
     char_buf: Vec<char>,
     rendered: Vec<u64>,
@@ -74,7 +68,6 @@ struct SavedScreen {
 }
 
 /// Pack codepoint + fg + bg into a u64 for fast equality checks.
-/// Uses 21 bits for Unicode codepoint + 7 bits per color channel (42 bits) = 63 bits.
 fn cell_key(ch: char, fg: Color, bg: Color) -> u64 {
     (ch as u64 & 0x1F_FFFF)
         | ((fg.r as u64 >> 1) << 21)
@@ -85,7 +78,7 @@ fn cell_key(ch: char, fg: Color, bg: Color) -> u64 {
         | ((bg.b as u64 >> 1) << 56)
 }
 
-struct Console {
+pub struct Console {
     fb: Framebuffer,
     font: Font,
     cols: usize,
@@ -94,31 +87,27 @@ struct Console {
     cursor_row: usize,
     fg: Color,
     bg: Color,
-    // Character buffer for cursor restore
     char_buf: Vec<char>,
-    // Tracks what was last rendered to each cell (codepoint + colors packed into u64)
     rendered: Vec<u64>,
-    // ANSI state machine
     ansi_state: AnsiState,
     ansi_buf: [u8; 16],
     ansi_len: usize,
     reverse_video: bool,
     cursor_visible: bool,
     saved_screen: Option<SavedScreen>,
-    // UTF-8 decoder state
     utf8_buf: [u8; 4],
     utf8_len: usize,
-    utf8_needed: usize, // total bytes expected (0 = not in a sequence)
+    utf8_needed: usize,
 }
 
 impl Console {
-    fn new(fb: Framebuffer, font_data: Vec<u8>) -> Self {
+    pub fn new(fb: Framebuffer, font: Font) -> Self {
         let cols = fb.width() / font::WIDTH;
         let rows = fb.height() / font::HEIGHT;
 
         let console = Self {
             fb,
-            font: Font::new(font_data),
+            font,
             cols,
             rows,
             cursor_col: 0,
@@ -138,7 +127,7 @@ impl Console {
             utf8_needed: 0,
         };
 
-        console.fb.clear(console.bg);
+        console.fb.clear(DEFAULT_BG);
         console
     }
 
@@ -166,7 +155,6 @@ impl Console {
             let ch = self.char_buf[idx];
             let px = self.cursor_col * font::WIDTH;
             let py = self.cursor_row * font::HEIGHT;
-            // Cursor uses inverted colors — invalidate so next put_char redraws
             self.rendered[idx] = 0;
             self.font.draw_char(&self.fb, px, py, ch, self.bg, self.fg);
         }
@@ -187,14 +175,13 @@ impl Console {
 
     fn scroll(&mut self) {
         self.fb.scroll_up(font::HEIGHT, self.bg);
-        // Shift character buffer up by one row
         let row_size = self.cols;
         self.char_buf.copy_within(row_size.., 0);
         self.rendered.copy_within(row_size.., 0);
         let last_row = (self.rows - 1) * row_size;
         for i in last_row..last_row + row_size {
             self.char_buf[i] = ' ';
-            self.rendered[i] = 0; // invalidate — force redraw of last row
+            self.rendered[i] = 0;
         }
         self.cursor_row = self.rows - 1;
         self.cursor_col = 0;
@@ -217,10 +204,8 @@ impl Console {
         self.cursor_row = 0;
     }
 
-    /// Redraw all characters from the char buffer to the framebuffer.
     fn redraw_all(&mut self) {
         self.fb.clear(self.bg);
-        // Invalidate all rendered state so subsequent put_char calls will redraw
         self.rendered.fill(0);
         for row in 0..self.rows {
             for col in 0..self.cols {
@@ -254,7 +239,6 @@ impl Console {
     }
 
     fn write_byte(&mut self, byte: u8) {
-        // Handle UTF-8 continuation bytes before ANSI state machine
         if self.utf8_needed > 0 {
             if byte & 0xC0 == 0x80 {
                 self.utf8_buf[self.utf8_len] = byte;
@@ -264,7 +248,6 @@ impl Console {
                 }
                 return;
             }
-            // Invalid continuation — discard partial sequence and fall through
             self.utf8_needed = 0;
         }
 
@@ -279,13 +262,19 @@ impl Console {
                     }
                 }
                 b if b & 0xE0 == 0xC0 => {
-                    self.utf8_buf[0] = b; self.utf8_len = 1; self.utf8_needed = 2;
+                    self.utf8_buf[0] = b;
+                    self.utf8_len = 1;
+                    self.utf8_needed = 2;
                 }
                 b if b & 0xF0 == 0xE0 => {
-                    self.utf8_buf[0] = b; self.utf8_len = 1; self.utf8_needed = 3;
+                    self.utf8_buf[0] = b;
+                    self.utf8_len = 1;
+                    self.utf8_needed = 3;
                 }
                 b if b & 0xF8 == 0xF0 => {
-                    self.utf8_buf[0] = b; self.utf8_len = 1; self.utf8_needed = 4;
+                    self.utf8_buf[0] = b;
+                    self.utf8_len = 1;
+                    self.utf8_needed = 4;
                 }
                 byte if byte >= 0x20 => self.emit_char(byte as char),
                 _ => {}
@@ -295,7 +284,7 @@ impl Console {
                     self.ansi_state = AnsiState::Bracket;
                     self.ansi_len = 0;
                 }
-                _ => self.ansi_state = AnsiState::Normal, // invalid, reset
+                _ => self.ansi_state = AnsiState::Normal,
             },
             AnsiState::Bracket => {
                 if byte == b'?' {
@@ -307,7 +296,6 @@ impl Console {
                         self.ansi_len += 1;
                     }
                 } else {
-                    // Terminal byte — execute the command
                     self.execute_ansi(byte);
                     self.ansi_state = AnsiState::Normal;
                 }
@@ -397,7 +385,6 @@ impl Console {
     }
 
     fn execute_sgr(&mut self, params: &[usize]) {
-        // \x1b[m with no params is equivalent to \x1b[0m
         if params.is_empty() {
             self.fg = DEFAULT_FG;
             self.bg = DEFAULT_BG;
@@ -416,7 +403,6 @@ impl Console {
                 27 => self.reverse_video = false,
                 30..=37 => self.fg = ansi_color(params[i] - 30),
                 38 => {
-                    // Extended foreground: 38;5;N (256-color)
                     if i + 2 < params.len() && params[i + 1] == 5 {
                         self.fg = color256(params[i + 2]);
                         i += 2;
@@ -425,7 +411,6 @@ impl Console {
                 39 => self.fg = DEFAULT_FG,
                 40..=47 => self.bg = ansi_color(params[i] - 40),
                 48 => {
-                    // Extended background: 48;5;N (256-color)
                     if i + 2 < params.len() && params[i + 1] == 5 {
                         self.bg = color256(params[i + 2]);
                         i += 2;
@@ -444,19 +429,13 @@ impl Console {
         let (params, count) = self.parse_params();
         let p1 = if count > 0 { params[0] } else { 0 };
         match (p1, cmd) {
-            (25, b'l') => {} // hide cursor (no-op for now)
-            (25, b'h') => {} // show cursor (no-op for now)
-            (1049, b'h') => { // switch to alternate screen buffer
+            (25, b'l') => {}
+            (25, b'h') => {}
+            (1049, b'h') => {
                 let n = self.cols * self.rows;
                 self.saved_screen = Some(SavedScreen {
-                    char_buf: core::mem::replace(
-                        &mut self.char_buf,
-                        vec![' '; n],
-                    ),
-                    rendered: core::mem::replace(
-                        &mut self.rendered,
-                        vec![0; n],
-                    ),
+                    char_buf: core::mem::replace(&mut self.char_buf, vec![' '; n]),
+                    rendered: core::mem::replace(&mut self.rendered, vec![0; n]),
                     cursor_col: self.cursor_col,
                     cursor_row: self.cursor_row,
                 });
@@ -464,7 +443,7 @@ impl Console {
                 self.cursor_row = 0;
                 self.fb.clear(self.bg);
             }
-            (1049, b'l') => { // restore main screen buffer
+            (1049, b'l') => {
                 if let Some(saved) = self.saved_screen.take() {
                     self.char_buf = saved.char_buf;
                     self.rendered = saved.rendered;
@@ -476,71 +455,17 @@ impl Console {
             _ => {}
         }
     }
-}
 
-// Global singleton
-
-static CONSOLE: SyncCell<Option<Console>> = SyncCell::new(None);
-
-fn with<R>(default: R, f: impl FnOnce(&mut Console) -> R) -> R {
-    match CONSOLE.get_mut() {
-        Some(c) => f(c),
-        None => default,
-    }
-}
-
-pub fn init(fb: Framebuffer, font_data: Vec<u8>) {
-    *CONSOLE.get_mut() = Some(Console::new(fb, font_data));
-}
-
-pub fn write_bytes(bytes: &[u8]) {
-    with((), |c| {
-        let v = c.cursor_visible;
-        if v { c.erase_cursor(); }
+    pub fn write_bytes(&mut self, bytes: &[u8]) {
+        let v = self.cursor_visible;
+        if v {
+            self.erase_cursor();
+        }
         for &byte in bytes {
-            c.write_byte(byte);
+            self.write_byte(byte);
         }
-        if v { c.draw_cursor(); }
-
-    });
-}
-
-pub fn putchar(b: u8) {
-    with((), |c| {
-        let v = c.cursor_visible;
-        if v { c.erase_cursor(); }
-        c.write_byte(b);
-        if v { c.draw_cursor(); }
-
-    });
-}
-
-pub fn clear() {
-    with((), |c| {
-        c.cursor_visible = false;
-        c.clear_screen();
-
-    });
-}
-
-pub fn screen_size() -> (usize, usize) {
-    with((80, 24), |c| (c.cols, c.rows))
-}
-
-pub fn show_cursor() {
-    with((), |c| {
-        if !c.cursor_visible {
-            c.draw_cursor();
-    
+        if v {
+            self.draw_cursor();
         }
-    });
-}
-
-pub fn hide_cursor() {
-    with((), |c| {
-        if c.cursor_visible {
-            c.erase_cursor();
-    
-        }
-    });
+    }
 }

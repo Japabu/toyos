@@ -22,6 +22,7 @@ pub enum ProcessState {
     BlockedPipeRead(usize),
     BlockedPipeWrite(usize),
     BlockedWaitPid(u32),
+    BlockedPoll(u32, u32),
     Zombie(i32),
 }
 
@@ -72,7 +73,12 @@ pub fn current() -> &'static mut Process {
 }
 
 /// Initialize process 0 (init). Called from main after all kernel init.
-pub fn init_process0(entry: u64, user_stack_top: u64, elf_base: *mut u8, elf_layout: Layout, stack_base: *mut u8, stack_layout: Layout) {
+pub fn init_process0(
+    entry: u64, user_stack_top: u64,
+    elf_base: *mut u8, elf_layout: Layout,
+    stack_base: *mut u8, stack_layout: Layout,
+    fb_info: Option<fd::FramebufferInfo>,
+) {
     let table = PROCESS_TABLE.get_mut();
 
     // Allocate kernel stack for process 0
@@ -81,11 +87,14 @@ pub fn init_process0(entry: u64, user_stack_top: u64, elf_base: *mut u8, elf_lay
     assert!(!ks_base.is_null(), "process 0: kernel stack alloc failed");
     let ks_top = ks_base as u64 + KERNEL_STACK_SIZE as u64;
 
-    // Set up initial FDs: 0=Keyboard, 1=SerialConsole, 2=SerialConsole
+    // Set up initial FDs: 0=Keyboard, 1=SerialConsole, 2=SerialConsole, 3=Framebuffer
     let mut fds = fd::new_fd_table();
     fds[0] = Some(Descriptor::Keyboard);
     fds[1] = Some(Descriptor::SerialConsole);
     fds[2] = Some(Descriptor::SerialConsole);
+    if let Some(info) = fb_info {
+        fds[3] = Some(Descriptor::Framebuffer(info));
+    }
 
     // Set up kernel stack so context_switch's `ret` goes to the trampoline
     // that enters ring 3 via iretq.
@@ -223,36 +232,29 @@ pub fn spawn(argv: &[&str], stdin_fd: u64, stdout_fd: u64) -> u64 {
     let mut child_fds = fd::new_fd_table();
 
     // FD 0 (stdin)
-    if stdin_fd != u64::MAX {
+    {
+        let src_fd = if stdin_fd != u64::MAX { stdin_fd } else { 0 };
         let parent = table.procs[table.current].as_ref().unwrap();
-        match &parent.fds[stdin_fd as usize] {
-            Some(Descriptor::PipeRead(id)) => child_fds[0] = Some(Descriptor::PipeRead(*id)),
+        match &parent.fds[src_fd as usize] {
+            Some(Descriptor::PipeRead(id)) => {
+                pipe::add_reader(*id);
+                child_fds[0] = Some(Descriptor::PipeRead(*id));
+            }
             Some(Descriptor::Keyboard) => child_fds[0] = Some(Descriptor::Keyboard),
-            _ => child_fds[0] = Some(Descriptor::Keyboard),
-        }
-    } else {
-        // Inherit parent's stdin type
-        let parent = table.procs[table.current].as_ref().unwrap();
-        match &parent.fds[0] {
-            Some(Descriptor::Keyboard) => child_fds[0] = Some(Descriptor::Keyboard),
-            Some(Descriptor::PipeRead(id)) => child_fds[0] = Some(Descriptor::PipeRead(*id)),
             _ => child_fds[0] = Some(Descriptor::Keyboard),
         }
     }
 
     // FD 1 (stdout)
-    if stdout_fd != u64::MAX {
+    {
+        let src_fd = if stdout_fd != u64::MAX { stdout_fd } else { 1 };
         let parent = table.procs[table.current].as_ref().unwrap();
-        match &parent.fds[stdout_fd as usize] {
-            Some(Descriptor::PipeWrite(id)) => child_fds[1] = Some(Descriptor::PipeWrite(*id)),
+        match &parent.fds[src_fd as usize] {
+            Some(Descriptor::PipeWrite(id)) => {
+                pipe::add_writer(*id);
+                child_fds[1] = Some(Descriptor::PipeWrite(*id));
+            }
             Some(Descriptor::SerialConsole) => child_fds[1] = Some(Descriptor::SerialConsole),
-            _ => child_fds[1] = Some(Descriptor::SerialConsole),
-        }
-    } else {
-        let parent = table.procs[table.current].as_ref().unwrap();
-        match &parent.fds[1] {
-            Some(Descriptor::SerialConsole) => child_fds[1] = Some(Descriptor::SerialConsole),
-            Some(Descriptor::PipeWrite(id)) => child_fds[1] = Some(Descriptor::PipeWrite(*id)),
             _ => child_fds[1] = Some(Descriptor::SerialConsole),
         }
     }
@@ -487,6 +489,11 @@ fn idle_poll(table: &mut ProcessTable) {
                 }
                 ProcessState::BlockedWaitPid(child_pid) => {
                     if zombie_pids[..zombie_count].contains(&child_pid) {
+                        proc.state = ProcessState::Ready;
+                    }
+                }
+                ProcessState::BlockedPoll(fd1, fd2) => {
+                    if fd::has_data(&proc.fds, fd1 as u64) || fd::has_data(&proc.fds, fd2 as u64) {
                         proc.state = ProcessState::Ready;
                     }
                 }

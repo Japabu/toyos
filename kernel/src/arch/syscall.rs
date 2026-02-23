@@ -4,7 +4,7 @@ use alloc::vec::Vec;
 use super::{cpu, gdt};
 use crate::drivers::acpi;
 use crate::sync::SyncCell;
-use crate::{console, fd, keyboard, pipe, process, user_heap, vfs};
+use crate::{fd, keyboard, log, pipe, process, user_heap, vfs};
 
 // MSR addresses
 const MSR_EFER: u32 = 0xC000_0080;
@@ -24,8 +24,6 @@ const SYS_SCREEN_SIZE: u64 = 7;
 const SYS_CLOCK: u64 = 8;
 const SYS_OPEN: u64 = 9;
 const SYS_CLOSE: u64 = 10;
-const SYS_READ_FILE: u64 = 11;
-const SYS_WRITE_FILE: u64 = 12;
 const SYS_SEEK: u64 = 13;
 const SYS_FSTAT: u64 = 14;
 const SYS_FSYNC: u64 = 15;
@@ -39,6 +37,7 @@ const SYS_SET_KEYBOARD_LAYOUT: u64 = 23;
 const SYS_PIPE: u64 = 24;
 const SYS_SPAWN: u64 = 25;
 const SYS_WAITPID: u64 = 26;
+const SYS_POLL: u64 = 27;
 
 // Kernel/user RSP storage for stack switching
 #[no_mangle]
@@ -92,30 +91,25 @@ extern "C" fn syscall_handler(num: u64, a1: u64, a2: u64, _: u64, a3: u64, a4: u
 
 fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
     match num {
-        SYS_WRITE => sys_write(a1 as *const u8, a2 as usize),
-        SYS_READ => sys_read(a1 as *mut u8, a2 as usize),
+        SYS_WRITE => {
+            let buf = unsafe { core::slice::from_raw_parts(a2 as *const u8, a3 as usize) };
+            sys_write(a1, buf)
+        }
+        SYS_READ => {
+            let buf = unsafe { core::slice::from_raw_parts_mut(a2 as *mut u8, a3 as usize) };
+            sys_read(a1, buf)
+        }
         SYS_ALLOC => user_heap::alloc(a1 as usize, a2 as usize),
         SYS_FREE => { user_heap::free(a1 as *mut u8, a2 as usize); 0 }
         SYS_REALLOC => user_heap::realloc(a1 as *mut u8, a2 as usize, a3 as usize, a4 as usize),
         SYS_EXIT => sys_exit(a1 as i32),
         SYS_RANDOM => { sys_random(a1 as *mut u8, a2 as usize); 0 }
-        SYS_SCREEN_SIZE => {
-            let (cols, rows) = console::screen_size();
-            ((rows as u64) << 32) | (cols as u64)
-        }
+        SYS_SCREEN_SIZE => screen_size(),
         SYS_CLOCK => crate::clock::nanos_since_boot(),
         SYS_OPEN => sys_open(a1, a2, a3),
         SYS_CLOSE => {
             let proc = process::current();
             fd::close(&mut proc.fds, vfs::global(), a1)
-        }
-        SYS_READ_FILE => {
-            let buf = unsafe { core::slice::from_raw_parts_mut(a2 as *mut u8, a3 as usize) };
-            sys_read_file(a1, buf)
-        }
-        SYS_WRITE_FILE => {
-            let buf = unsafe { core::slice::from_raw_parts(a2 as *const u8, a3 as usize) };
-            sys_write_file(a1, buf)
         }
         SYS_SEEK => {
             let proc = process::current();
@@ -139,47 +133,41 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         SYS_PIPE => sys_pipe(),
         SYS_SPAWN => sys_spawn(a1, a2, a3, a4),
         SYS_WAITPID => sys_waitpid(a1),
+        SYS_POLL => sys_poll(a1, a2),
         _ => u64::MAX,
     }
 }
 
-fn sys_write(buf: *const u8, len: usize) -> u64 {
-    let bytes = unsafe { core::slice::from_raw_parts(buf, len) };
-    // Route through FD 1 of current process
-    let proc = process::current();
-    match fd::try_write(&mut proc.fds, 1, bytes) {
-        Some(n) => n,
-        None => {
-            // Would block — for stdout this shouldn't happen with SerialConsole,
-            // but for pipes we need to block and retry
-            process::block(process::ProcessState::BlockedPipeWrite(
-                match &proc.fds[1] {
-                    Some(fd::Descriptor::PipeWrite(id)) => *id,
+fn sys_write(fd_num: u64, buf: &[u8]) -> u64 {
+    loop {
+        let proc = process::current();
+        match fd::try_write(&mut proc.fds, fd_num, buf) {
+            Some(n) => return n,
+            None => {
+                let proc = process::current();
+                let reason = match &proc.fds[fd_num as usize] {
+                    Some(fd::Descriptor::PipeWrite(id)) => process::ProcessState::BlockedPipeWrite(*id),
                     _ => return u64::MAX,
-                }
-            ));
-            // After wakeup, retry
-            let proc = process::current();
-            fd::try_write(&mut proc.fds, 1, bytes).unwrap_or(u64::MAX)
+                };
+                process::block(reason);
+            }
         }
     }
 }
 
-fn sys_read(buf: *mut u8, len: usize) -> u64 {
-    let slice = unsafe { core::slice::from_raw_parts_mut(buf, len) };
+fn sys_read(fd_num: u64, buf: &mut [u8]) -> u64 {
     loop {
         let proc = process::current();
-        match fd::try_read(&mut proc.fds, 0, slice) {
+        match fd::try_read(&mut proc.fds, fd_num, buf) {
             Some(n) => return n,
             None => {
-                // Would block — determine block reason from FD type
-                let reason = match &proc.fds[0] {
+                let proc = process::current();
+                let reason = match &proc.fds[fd_num as usize] {
                     Some(fd::Descriptor::Keyboard) => process::ProcessState::BlockedKeyboard,
                     Some(fd::Descriptor::PipeRead(id)) => process::ProcessState::BlockedPipeRead(*id),
                     _ => return u64::MAX,
                 };
                 process::block(reason);
-                // After wakeup, retry the read
             }
         }
     }
@@ -189,18 +177,9 @@ fn sys_open(path_ptr: u64, path_len: u64, flags: u64) -> u64 {
     let slice = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, path_len as usize) };
     let Ok(path) = core::str::from_utf8(slice) else { return u64::MAX };
     let proc = process::current();
-    fd::open(&mut proc.fds, vfs::global(), path, flags)
-}
-
-fn sys_read_file(file_fd: u64, buf: &mut [u8]) -> u64 {
+    let resolved = vfs::global().resolve_absolute(&proc.cwd, path);
     let proc = process::current();
-    // File reads never block
-    fd::try_read(&mut proc.fds, file_fd, buf).unwrap_or(u64::MAX)
-}
-
-fn sys_write_file(file_fd: u64, buf: &[u8]) -> u64 {
-    let proc = process::current();
-    fd::try_write(&mut proc.fds, file_fd, buf).unwrap_or(u64::MAX)
+    fd::open(&mut proc.fds, vfs::global(), &resolved, flags)
 }
 
 fn sys_exit(code: i32) -> u64 {
@@ -344,7 +323,9 @@ fn sys_readdir(path_ptr: u64, path_len: u64, buf_ptr: u64, buf_len: u64) -> u64 
 fn sys_delete(path_ptr: u64, path_len: u64) -> u64 {
     let slice = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, path_len as usize) };
     let Ok(path) = core::str::from_utf8(slice) else { return u64::MAX };
-    if vfs::global().delete(path) { 0 } else { u64::MAX }
+    let cwd = process::current().cwd.clone();
+    let resolved = vfs::global().resolve_absolute(&cwd, path);
+    if vfs::global().delete(&resolved) { 0 } else { u64::MAX }
 }
 
 fn sys_chdir(path_ptr: u64, path_len: u64) -> u64 {
@@ -374,7 +355,9 @@ fn sys_set_keyboard_layout(name_ptr: u64, name_len: u64) -> u64 {
     let slice = unsafe { core::slice::from_raw_parts(name_ptr as *const u8, name_len as usize) };
     let Ok(name) = core::str::from_utf8(slice) else { return u64::MAX };
     if keyboard::set_layout(name) {
-        vfs::global().write_file("/nvme/config/keyboard_layout", name.as_bytes());
+        if !vfs::global().write_file("/nvme/config/keyboard_layout", name.as_bytes()) {
+            log!("warning: failed to persist keyboard layout");
+        }
         0
     } else {
         u64::MAX
@@ -410,6 +393,35 @@ fn sys_waitpid(pid: u64) -> u64 {
         }
         process::block(process::ProcessState::BlockedWaitPid(child_pid));
     }
+}
+
+fn sys_poll(fd1: u64, fd2: u64) -> u64 {
+    loop {
+        crate::drivers::xhci::poll_global();
+        let proc = process::current();
+        let r1 = fd::has_data(&proc.fds, fd1);
+        let r2 = fd::has_data(&proc.fds, fd2);
+        let mask = (r1 as u64) | ((r2 as u64) << 1);
+        if mask != 0 {
+            return mask;
+        }
+        process::block(process::ProcessState::BlockedPoll(fd1 as u32, fd2 as u32));
+    }
+}
+
+// Screen size globals (set during kernel init, font is always 8x16)
+static SCREEN_COLS: SyncCell<usize> = SyncCell::new(80);
+static SCREEN_ROWS: SyncCell<usize> = SyncCell::new(24);
+
+pub fn set_screen_size(width: u32, height: u32) {
+    *SCREEN_COLS.get_mut() = width as usize / 8;
+    *SCREEN_ROWS.get_mut() = height as usize / 16;
+}
+
+fn screen_size() -> u64 {
+    let cols = *SCREEN_COLS.get() as u64;
+    let rows = *SCREEN_ROWS.get() as u64;
+    (rows << 32) | cols
 }
 
 /// Terminate the current userspace process (called from exception handlers).

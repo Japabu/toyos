@@ -9,8 +9,8 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 use kernel::arch::{gdt, idt, paging, syscall};
-use kernel::drivers::{acpi, framebuffer, nvme, pci, serial, xhci};
-use kernel::{allocator, clock, console, log, process, ramdisk, symbols, vfs, KernelArgs, MemoryMapEntry};
+use kernel::drivers::{acpi, nvme, pci, serial, xhci};
+use kernel::{allocator, clock, fd, log, process, ramdisk, symbols, vfs, KernelArgs, MemoryMapEntry};
 use tyfs::Disk;
 use core::fmt::Write;
 
@@ -82,26 +82,14 @@ fn kernel_main(
         let _ = writeln!(serial::SerialWriter, "  {} ({} bytes)", name, size);
     }
 
-    // Initialize framebuffer console
+    // Map framebuffer for userland access and store screen dimensions
     let _ = writeln!(serial::SerialWriter,
         "GOP: {}x{} stride={} fmt={}",
         kernel_args.framebuffer_width, kernel_args.framebuffer_height,
         kernel_args.framebuffer_stride, kernel_args.framebuffer_pixel_format
     );
-    let fb = unsafe {
-        framebuffer::Framebuffer::new(
-            kernel_args.framebuffer_addr,
-            kernel_args.framebuffer_size,
-            kernel_args.framebuffer_width,
-            kernel_args.framebuffer_height,
-            kernel_args.framebuffer_stride,
-            kernel_args.framebuffer_pixel_format,
-        )
-    };
-    let font_data = initrd_fs
-        .read_file("font.bin")
-        .expect("Failed to load font.bin from rootfs");
-    console::init(fb, font_data);
+    paging::map_user(kernel_args.framebuffer_addr, kernel_args.framebuffer_size);
+    syscall::set_screen_size(kernel_args.framebuffer_width, kernel_args.framebuffer_height);
 
     log::println("ToyOS Kernel initialized");
     log!("Framebuffer: {}x{} stride={}",
@@ -223,6 +211,13 @@ fn kernel_main(
     let _ = writeln!(serial::SerialWriter, "init: entry={:#x}, stack={:#x}, argc={}", loaded.entry, sp, args.len());
 
     // Create process 0 and start the scheduler (never returns)
-    process::init_process0(loaded.entry, sp, loaded.base_ptr, elf_layout, stack_base, stack_layout);
+    let fb_info = fd::FramebufferInfo {
+        addr: kernel_args.framebuffer_addr,
+        width: kernel_args.framebuffer_width,
+        height: kernel_args.framebuffer_height,
+        stride: kernel_args.framebuffer_stride,
+        pixel_format: kernel_args.framebuffer_pixel_format,
+    };
+    process::init_process0(loaded.entry, sp, loaded.base_ptr, elf_layout, stack_base, stack_layout, Some(fb_info));
     unreachable!();
 }
