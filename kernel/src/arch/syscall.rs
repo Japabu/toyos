@@ -190,7 +190,6 @@ fn sys_random(buf: *mut u8, len: usize) {
     }
 }
 
-/// Spawn child, optionally capture stdout, wait for exit.
 fn sys_readdir(path_ptr: u64, path_len: u64, buf_ptr: u64, buf_len: u64) -> u64 {
     let slice = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, path_len as usize) };
     let Ok(path) = core::str::from_utf8(slice) else { return u64::MAX };

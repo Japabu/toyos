@@ -22,11 +22,6 @@ pub fn print(s: &str) {
     }
 }
 
-pub fn println(s: &str) {
-    print(s);
-    write_serial('\n');
-}
-
 pub fn write_bytes(bytes: &[u8]) {
     for &b in bytes {
         while !is_transmit_empty() {}
@@ -43,12 +38,4 @@ fn write_serial(a: char) {
     outb(PORT, a as u8);
 }
 
-pub struct SerialWriter;
-
-impl core::fmt::Write for SerialWriter {
-    fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        print(s);
-        Ok(())
-    }
-}
 

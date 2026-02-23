@@ -1,13 +1,14 @@
+use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::sync::SyncCell;
 
-static KEY_BUF: SyncCell<Vec<u8>> = SyncCell::new(Vec::new());
+static KEY_BUF: SyncCell<VecDeque<u8>> = SyncCell::new(VecDeque::new());
 
 pub fn handle_key(byte: u8) {
     if byte != 0 {
-        KEY_BUF.get_mut().push(byte);
+        KEY_BUF.get_mut().push_back(byte);
     }
 }
 
@@ -16,27 +17,38 @@ pub fn has_data() -> bool {
 }
 
 pub fn try_read_char() -> Option<u8> {
-    let buf = KEY_BUF.get_mut();
-    if buf.is_empty() { None } else { Some(buf.remove(0)) }
+    KEY_BUF.get_mut().pop_front()
 }
 
 pub struct KeyEntry {
     pub normal: &'static [u8],
     pub shift: &'static [u8],
+    pub option: &'static [u8],
+    pub shift_option: &'static [u8],
 }
 
 /// HID usage codes 0x04..=0x38 mapped to characters (index = usage - 0x04).
 pub struct Layout {
     pub name: &'static str,
     pub keys: [KeyEntry; 53],
+    /// HID 0x64: the ISO key between left Shift and Y/Z on ISO keyboards.
+    pub iso_key: KeyEntry,
 }
 
-pub fn layout_lookup(usage: u8, shift: bool) -> Option<&'static [u8]> {
-    if !(0x04..=0x38).contains(&usage) {
+pub fn layout_lookup(usage: u8, shift: bool, alt: bool) -> Option<&'static [u8]> {
+    let entry = if (0x04..=0x38).contains(&usage) {
+        &active_layout().keys[(usage - 0x04) as usize]
+    } else if usage == 0x64 {
+        &active_layout().iso_key
+    } else {
         return None;
-    }
-    let entry = &active_layout().keys[(usage - 0x04) as usize];
-    let bytes = if shift { entry.shift } else { entry.normal };
+    };
+    let bytes = match (shift, alt) {
+        (false, false) => entry.normal,
+        (true, false) => entry.shift,
+        (false, true) => entry.option,
+        (true, true) => entry.shift_option,
+    };
     if bytes.is_empty() { None } else { Some(bytes) }
 }
 
@@ -67,64 +79,86 @@ pub fn available_layouts() -> String {
     names.join(", ")
 }
 
-const K: KeyEntry = KeyEntry { normal: &[], shift: &[] };
+const K: KeyEntry = KeyEntry { normal: &[], shift: &[], option: &[], shift_option: &[] };
+
+const fn key(normal: &'static [u8], shift: &'static [u8]) -> KeyEntry {
+    KeyEntry { normal, shift, option: &[], shift_option: &[] }
+}
+
+const fn key_opt(
+    normal: &'static [u8],
+    shift: &'static [u8],
+    option: &'static [u8],
+) -> KeyEntry {
+    KeyEntry { normal, shift, option, shift_option: &[] }
+}
+
+const fn key_full(
+    normal: &'static [u8],
+    shift: &'static [u8],
+    option: &'static [u8],
+    shift_option: &'static [u8],
+) -> KeyEntry {
+    KeyEntry { normal, shift, option, shift_option }
+}
 
 const US_QWERTY: Layout = Layout {
     name: "us",
+    iso_key: K,
     keys: [
-        KeyEntry { normal: b"a", shift: b"A" },
-        KeyEntry { normal: b"b", shift: b"B" },
-        KeyEntry { normal: b"c", shift: b"C" },
-        KeyEntry { normal: b"d", shift: b"D" },
-        KeyEntry { normal: b"e", shift: b"E" },
-        KeyEntry { normal: b"f", shift: b"F" },
-        KeyEntry { normal: b"g", shift: b"G" },
-        KeyEntry { normal: b"h", shift: b"H" },
-        KeyEntry { normal: b"i", shift: b"I" },
-        KeyEntry { normal: b"j", shift: b"J" },
-        KeyEntry { normal: b"k", shift: b"K" },
-        KeyEntry { normal: b"l", shift: b"L" },
-        KeyEntry { normal: b"m", shift: b"M" },
-        KeyEntry { normal: b"n", shift: b"N" },
-        KeyEntry { normal: b"o", shift: b"O" },
-        KeyEntry { normal: b"p", shift: b"P" },
-        KeyEntry { normal: b"q", shift: b"Q" },
-        KeyEntry { normal: b"r", shift: b"R" },
-        KeyEntry { normal: b"s", shift: b"S" },
-        KeyEntry { normal: b"t", shift: b"T" },
-        KeyEntry { normal: b"u", shift: b"U" },
-        KeyEntry { normal: b"v", shift: b"V" },
-        KeyEntry { normal: b"w", shift: b"W" },
-        KeyEntry { normal: b"x", shift: b"X" },
-        KeyEntry { normal: b"y", shift: b"Y" },
-        KeyEntry { normal: b"z", shift: b"Z" },
-        KeyEntry { normal: b"1", shift: b"!" },
-        KeyEntry { normal: b"2", shift: b"@" },
-        KeyEntry { normal: b"3", shift: b"#" },
-        KeyEntry { normal: b"4", shift: b"$" },
-        KeyEntry { normal: b"5", shift: b"%" },
-        KeyEntry { normal: b"6", shift: b"^" },
-        KeyEntry { normal: b"7", shift: b"&" },
-        KeyEntry { normal: b"8", shift: b"*" },
-        KeyEntry { normal: b"9", shift: b"(" },
-        KeyEntry { normal: b"0", shift: b")" },
-        KeyEntry { normal: b"\r", shift: b"\r" },
-        KeyEntry { normal: &[0x1B], shift: &[0x1B] },
-        KeyEntry { normal: &[0x08], shift: &[0x08] },
-        KeyEntry { normal: b"\t", shift: b"\t" },
-        KeyEntry { normal: b" ", shift: b" " },
-        KeyEntry { normal: b"-", shift: b"_" },
-        KeyEntry { normal: b"=", shift: b"+" },
-        KeyEntry { normal: b"[", shift: b"{" },
-        KeyEntry { normal: b"]", shift: b"}" },
-        KeyEntry { normal: b"\\", shift: b"|" },
+        key(b"a", b"A"),
+        key(b"b", b"B"),
+        key(b"c", b"C"),
+        key(b"d", b"D"),
+        key(b"e", b"E"),
+        key(b"f", b"F"),
+        key(b"g", b"G"),
+        key(b"h", b"H"),
+        key(b"i", b"I"),
+        key(b"j", b"J"),
+        key(b"k", b"K"),
+        key(b"l", b"L"),
+        key(b"m", b"M"),
+        key(b"n", b"N"),
+        key(b"o", b"O"),
+        key(b"p", b"P"),
+        key(b"q", b"Q"),
+        key(b"r", b"R"),
+        key(b"s", b"S"),
+        key(b"t", b"T"),
+        key(b"u", b"U"),
+        key(b"v", b"V"),
+        key(b"w", b"W"),
+        key(b"x", b"X"),
+        key(b"y", b"Y"),
+        key(b"z", b"Z"),
+        key(b"1", b"!"),
+        key(b"2", b"@"),
+        key(b"3", b"#"),
+        key(b"4", b"$"),
+        key(b"5", b"%"),
+        key(b"6", b"^"),
+        key(b"7", b"&"),
+        key(b"8", b"*"),
+        key(b"9", b"("),
+        key(b"0", b")"),
+        key(b"\r", b"\r"),
+        key(&[0x1B], &[0x1B]),
+        key(&[0x08], &[0x08]),
+        key(b"\t", b"\t"),
+        key(b" ", b" "),
+        key(b"-", b"_"),
+        key(b"=", b"+"),
+        key(b"[", b"{"),
+        key(b"]", b"}"),
+        key(b"\\", b"|"),
         K,
-        KeyEntry { normal: b";", shift: b":" },
-        KeyEntry { normal: b"'", shift: b"\"" },
-        KeyEntry { normal: b"`", shift: b"~" },
-        KeyEntry { normal: b",", shift: b"<" },
-        KeyEntry { normal: b".", shift: b">" },
-        KeyEntry { normal: b"/", shift: b"?" },
+        key(b";", b":"),
+        key(b"'", b"\""),
+        key(b"`", b"~"),
+        key(b",", b"<"),
+        key(b".", b">"),
+        key(b"/", b"?"),
     ],
 };
 
@@ -142,59 +176,60 @@ const DIAER:  &[u8] = "¨".as_bytes();
 
 const SWISS_GERMAN_MAC: Layout = Layout {
     name: "swiss-german-mac",
+    iso_key: key(SECT, DEGREE),              // 0x64 (top-left key on Mac ISO)
     keys: [
-        KeyEntry { normal: b"a", shift: b"A" },
-        KeyEntry { normal: b"b", shift: b"B" },
-        KeyEntry { normal: b"c", shift: b"C" },
-        KeyEntry { normal: b"d", shift: b"D" },
-        KeyEntry { normal: b"e", shift: b"E" },
-        KeyEntry { normal: b"f", shift: b"F" },
-        KeyEntry { normal: b"g", shift: b"G" },
-        KeyEntry { normal: b"h", shift: b"H" },
-        KeyEntry { normal: b"i", shift: b"I" },
-        KeyEntry { normal: b"j", shift: b"J" },
-        KeyEntry { normal: b"k", shift: b"K" },
-        KeyEntry { normal: b"l", shift: b"L" },
-        KeyEntry { normal: b"m", shift: b"M" },
-        KeyEntry { normal: b"n", shift: b"N" },
-        KeyEntry { normal: b"o", shift: b"O" },
-        KeyEntry { normal: b"p", shift: b"P" },
-        KeyEntry { normal: b"q", shift: b"Q" },
-        KeyEntry { normal: b"r", shift: b"R" },
-        KeyEntry { normal: b"s", shift: b"S" },
-        KeyEntry { normal: b"t", shift: b"T" },
-        KeyEntry { normal: b"u", shift: b"U" },
-        KeyEntry { normal: b"v", shift: b"V" },
-        KeyEntry { normal: b"w", shift: b"W" },
-        KeyEntry { normal: b"x", shift: b"X" },
-        KeyEntry { normal: b"z", shift: b"Z" }, // QWERTZ: Y position -> z
-        KeyEntry { normal: b"y", shift: b"Y" }, // QWERTZ: Z position -> y
-        KeyEntry { normal: b"1", shift: b"+" },
-        KeyEntry { normal: b"2", shift: b"\"" },
-        KeyEntry { normal: b"3", shift: b"*" },
-        KeyEntry { normal: b"4", shift: CCEDIL },
-        KeyEntry { normal: b"5", shift: b"%" },
-        KeyEntry { normal: b"6", shift: b"&" },
-        KeyEntry { normal: b"7", shift: b"/" },
-        KeyEntry { normal: b"8", shift: b"(" },
-        KeyEntry { normal: b"9", shift: b")" },
-        KeyEntry { normal: b"0", shift: b"=" },
-        KeyEntry { normal: b"\r", shift: b"\r" },
-        KeyEntry { normal: &[0x1B], shift: &[0x1B] },
-        KeyEntry { normal: &[0x08], shift: &[0x08] },
-        KeyEntry { normal: b"\t", shift: b"\t" },
-        KeyEntry { normal: b" ", shift: b" " },
-        KeyEntry { normal: b"'", shift: b"?" },
-        KeyEntry { normal: b"^", shift: b"`" },
-        KeyEntry { normal: UUML_L, shift: EGRV_L },
-        KeyEntry { normal: DIAER, shift: b"!" },
-        KeyEntry { normal: b"$", shift: POUND },
-        KeyEntry { normal: b"<", shift: b">" },
-        KeyEntry { normal: OUML_L, shift: EACU_L },
-        KeyEntry { normal: AUML_L, shift: AGRV_L },
-        KeyEntry { normal: SECT, shift: DEGREE },
-        KeyEntry { normal: b",", shift: b";" },
-        KeyEntry { normal: b".", shift: b":" },
-        KeyEntry { normal: b"-", shift: b"_" },
+        key(b"a", b"A"),                        // 0x04
+        key(b"b", b"B"),                        // 0x05
+        key(b"c", b"C"),                        // 0x06
+        key(b"d", b"D"),                        // 0x07
+        key(b"e", b"E"),                        // 0x08
+        key(b"f", b"F"),                        // 0x09
+        key_opt(b"g", b"G", b"@"),              // 0x0A
+        key(b"h", b"H"),                        // 0x0B
+        key(b"i", b"I"),                        // 0x0C
+        key(b"j", b"J"),                        // 0x0D
+        key(b"k", b"K"),                        // 0x0E
+        key(b"l", b"L"),                        // 0x0F
+        key(b"m", b"M"),                        // 0x10
+        key_opt(b"n", b"N", b"~"),              // 0x11
+        key(b"o", b"O"),                        // 0x12
+        key(b"p", b"P"),                        // 0x13
+        key(b"q", b"Q"),                        // 0x14
+        key(b"r", b"R"),                        // 0x15
+        key(b"s", b"S"),                        // 0x16
+        key(b"t", b"T"),                        // 0x17
+        key(b"u", b"U"),                        // 0x18
+        key(b"v", b"V"),                        // 0x19
+        key(b"w", b"W"),                        // 0x1A
+        key(b"x", b"X"),                        // 0x1B
+        key(b"z", b"Z"),                        // 0x1C (QWERTZ)
+        key(b"y", b"Y"),                        // 0x1D (QWERTZ)
+        key(b"1", b"+"),                        // 0x1E
+        key(b"2", b"\""),                       // 0x1F
+        key_opt(b"3", b"*", b"#"),              // 0x20
+        key(b"4", CCEDIL),                      // 0x21
+        key_opt(b"5", b"%", b"["),              // 0x22
+        key_opt(b"6", b"&", b"]"),              // 0x23
+        key_full(b"7", b"/", b"|", b"\\"),      // 0x24
+        key_opt(b"8", b"(", b"{"),              // 0x25
+        key_opt(b"9", b")", b"}"),              // 0x26
+        key(b"0", b"="),                        // 0x27
+        key(b"\r", b"\r"),                      // 0x28
+        key(&[0x1B], &[0x1B]),                  // 0x29
+        key(&[0x08], &[0x08]),                  // 0x2A
+        key(b"\t", b"\t"),                      // 0x2B
+        key(b" ", b" "),                        // 0x2C
+        key(b"'", b"?"),                        // 0x2D
+        key(b"^", b"`"),                        // 0x2E
+        key(UUML_L, EGRV_L),                   // 0x2F
+        key(DIAER, b"!"),                       // 0x30
+        key(b"$", POUND),                       // 0x31
+        K,                                      // 0x32 (not used on Mac ISO)
+        key(OUML_L, EACU_L),                    // 0x33
+        key(AUML_L, AGRV_L),                    // 0x34
+        key(b"<", b">"),                        // 0x35 (between left Shift and Y on Mac ISO)
+        key(b",", b";"),                        // 0x36
+        key(b".", b":"),                        // 0x37
+        key(b"-", b"_"),                        // 0x38
     ],
 };

@@ -337,6 +337,7 @@ impl XhciController {
         let modifiers = report[0];
         let shift = (modifiers & 0x22) != 0; // Left Shift | Right Shift
         let ctrl = (modifiers & 0x11) != 0;  // Left Ctrl | Right Ctrl
+        let alt = (modifiers & 0x44) != 0;   // Left Alt | Right Alt (Option on Mac)
 
         for i in 2..8 {
             let keycode = report[i];
@@ -397,7 +398,7 @@ impl XhciController {
                         if ctrl && (0x04..=0x1D).contains(&keycode) {
                             // Ctrl+letter → control character (0x01-0x1A)
                             keyboard::handle_key(keycode - 0x04 + 1);
-                        } else if let Some(bytes) = keyboard::layout_lookup(keycode, shift) {
+                        } else if let Some(bytes) = keyboard::layout_lookup(keycode, shift, alt) {
                             for &b in bytes {
                                 keyboard::handle_key(b);
                             }

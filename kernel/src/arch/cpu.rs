@@ -20,16 +20,6 @@ pub fn wrmsr(msr: u32, value: u64) {
 }
 
 #[inline]
-pub fn rdtsc() -> u64 {
-    let lo: u32;
-    let hi: u32;
-    unsafe {
-        asm!("rdtsc", out("eax") lo, out("edx") hi, options(nomem, nostack));
-    }
-    (hi as u64) << 32 | lo as u64
-}
-
-#[inline]
 pub fn rdrand() -> u64 {
     let val: u64;
     unsafe {
@@ -52,15 +42,6 @@ pub fn read_rsp() -> u64 {
     rsp
 }
 
-#[inline]
-pub fn read_cr2() -> u64 {
-    let cr2: u64;
-    unsafe {
-        asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack));
-    }
-    cr2
-}
-
 /// # Safety
 /// The caller must ensure the value is a valid PML4 physical address.
 #[inline]
@@ -73,13 +54,6 @@ pub fn flush_tlb() {
     unsafe {
         asm!("mov {0}, cr3", "mov cr3, {0}", out(reg) _, options(nostack));
     }
-}
-
-/// # Safety
-/// The pointer must reference a valid GDT descriptor.
-#[inline]
-pub unsafe fn lgdt(ptr: *const u8) {
-    asm!("lgdt [{}]", in(reg) ptr, options(nostack));
 }
 
 /// # Safety
