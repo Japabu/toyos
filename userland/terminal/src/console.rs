@@ -94,6 +94,7 @@ pub struct Console {
     ansi_len: usize,
     reverse_video: bool,
     cursor_visible: bool,
+    cursor_enabled: bool,
     saved_screen: Option<SavedScreen>,
     utf8_buf: [u8; 4],
     utf8_len: usize,
@@ -105,7 +106,7 @@ impl Console {
         let cols = fb.width() / font::WIDTH;
         let rows = fb.height() / font::HEIGHT;
 
-        let console = Self {
+        let mut console = Self {
             fb,
             font,
             cols,
@@ -121,6 +122,7 @@ impl Console {
             ansi_len: 0,
             reverse_video: false,
             cursor_visible: false,
+            cursor_enabled: true,
             saved_screen: None,
             utf8_buf: [0; 4],
             utf8_len: 0,
@@ -128,6 +130,7 @@ impl Console {
         };
 
         console.fb.clear(DEFAULT_BG);
+        console.draw_cursor();
         console
     }
 
@@ -150,6 +153,9 @@ impl Console {
     }
 
     fn draw_cursor(&mut self) {
+        if !self.cursor_enabled {
+            return;
+        }
         if self.cursor_col < self.cols && self.cursor_row < self.rows {
             let idx = self.cursor_row * self.cols + self.cursor_col;
             let ch = self.char_buf[idx];
@@ -162,6 +168,9 @@ impl Console {
     }
 
     fn erase_cursor(&mut self) {
+        if !self.cursor_visible {
+            return;
+        }
         if self.cursor_col < self.cols && self.cursor_row < self.rows {
             let idx = self.cursor_row * self.cols + self.cursor_col;
             let ch = self.char_buf[idx];
@@ -429,8 +438,13 @@ impl Console {
         let (params, count) = self.parse_params();
         let p1 = if count > 0 { params[0] } else { 0 };
         match (p1, cmd) {
-            (25, b'l') => {}
-            (25, b'h') => {}
+            (25, b'l') => {
+                self.cursor_enabled = false;
+                self.erase_cursor();
+            }
+            (25, b'h') => {
+                self.cursor_enabled = true;
+            }
             (1049, b'h') => {
                 let n = self.cols * self.rows;
                 self.saved_screen = Some(SavedScreen {
@@ -457,15 +471,10 @@ impl Console {
     }
 
     pub fn write_bytes(&mut self, bytes: &[u8]) {
-        let v = self.cursor_visible;
-        if v {
-            self.erase_cursor();
-        }
+        self.erase_cursor();
         for &byte in bytes {
             self.write_byte(byte);
         }
-        if v {
-            self.draw_cursor();
-        }
+        self.draw_cursor();
     }
 }

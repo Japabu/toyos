@@ -254,10 +254,16 @@ pub fn spawn(argv: &[&str], stdin_fd: u64, stdout_fd: u64) -> u64 {
         }
         _ => Descriptor::SerialConsole,
     };
+    // FD 2 (stderr) — same as stdout so panics appear in terminal
+    let stderr_desc = match &stdout_desc {
+        Descriptor::PipeWrite(id) => {
+            pipe::add_writer(*id);
+            Descriptor::PipeWrite(*id)
+        }
+        _ => Descriptor::SerialConsole,
+    };
     child_fds.push(Some(stdout_desc));
-
-    // FD 2 (stderr)
-    child_fds.push(Some(Descriptor::SerialConsole));
+    child_fds.push(Some(stderr_desc));
 
     // Inherit parent's cwd
     let parent_cwd = table.procs[table.current].as_ref().unwrap().cwd.clone();

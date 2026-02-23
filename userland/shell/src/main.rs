@@ -1,6 +1,6 @@
 use std::env;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::process::Command;
 
 const HISTORY_PATH: &str = "/nvme/config/shell_history";
@@ -9,16 +9,14 @@ const HISTORY_MAX: usize = 200;
 fn main() {
     let _ = env::set_current_dir("/");
     let mut history = load_history();
+    std::os::toyos::io::set_stdin_raw(true);
 
     loop {
         let cwd = env::current_dir().map(|p| p.display().to_string()).unwrap_or_else(|_| "?".into());
         print!("{}> ", cwd);
         io::stdout().flush().ok();
 
-        std::os::toyos::io::set_stdin_raw(true);
-        let result = readline(&mut history);
-        std::os::toyos::io::set_stdin_raw(false);
-        let Some(input) = result else { break };
+        let Some(input) = readline(&mut history) else { break };
         let input = input.trim().to_string();
         if input.is_empty() {
             continue;
@@ -40,16 +38,8 @@ fn main() {
         match cmd {
             "help" => print_help(),
             "clear" => print!("\x1b[2J\x1b[H"),
-            "shutdown" => std::os::toyos::io::shutdown(),
-            "pwd" => println!("{}", cwd),
             "cd" => cmd_cd(arg),
-            "ls" => cmd_ls(arg),
-            "cat" => cmd_cat(arg),
-            "rm" => cmd_rm(arg),
-            "write" => cmd_write(arg),
-            "edit" => cmd_edit(arg),
             "run" => cmd_run(arg),
-            "layout" => cmd_layout(arg),
             _ => cmd_exec(cmd, arg),
         }
     }
@@ -70,8 +60,25 @@ fn save_history(history: &[String]) {
 
 fn read_byte() -> u8 {
     let mut buf = [0u8; 1];
-    let _ = std::os::toyos::io::read_stdin_raw(&mut buf);
+    io::stdin().lock().read_exact(&mut buf).ok();
     buf[0]
+}
+
+fn read_char() -> char {
+    let b = read_byte();
+    if b < 0x80 {
+        return b as char;
+    }
+    let expected = if b < 0xE0 { 2 } else if b < 0xF0 { 3 } else { 4 };
+    let mut buf = [0u8; 4];
+    buf[0] = b;
+    for i in 1..expected {
+        buf[i] = read_byte();
+    }
+    core::str::from_utf8(&buf[..expected])
+        .ok()
+        .and_then(|s| s.chars().next())
+        .unwrap_or('\u{FFFD}')
 }
 
 fn echo(bytes: &[u8]) {
@@ -80,33 +87,39 @@ fn echo(bytes: &[u8]) {
     out.flush().ok();
 }
 
+fn char_to_byte(s: &str, char_idx: usize) -> usize {
+    s.char_indices().nth(char_idx).map_or(s.len(), |(i, _)| i)
+}
+
 // --- Readline with history ---
 
 fn readline(history: &mut Vec<String>) -> Option<String> {
-    let mut line: Vec<u8> = Vec::new();
+    let mut line = String::new();
     let mut cursor: usize = 0;
     let mut hist_idx = history.len();
     let mut saved_input = String::new();
 
     loop {
-        let ch = read_byte();
+        let ch = read_char();
         match ch {
-            b'\r' => {
+            '\r' => {
                 echo(b"\n");
-                return Some(String::from_utf8_lossy(&line).into_owned());
+                return Some(line);
             }
-            0x08 | 0x7F => {
+            '\x08' | '\x7F' => {
                 if cursor > 0 {
-                    line.remove(cursor - 1);
                     cursor -= 1;
+                    let byte_pos = char_to_byte(&line, cursor);
+                    line.remove(byte_pos);
                     redraw(&line, cursor, true);
                 }
             }
-            0x1B => handle_escape(
+            '\x1B' => handle_escape(
                 &mut line, &mut cursor, history, &mut hist_idx, &mut saved_input,
             ),
-            ch if ch >= 0x20 => {
-                line.insert(cursor, ch);
+            ch if ch >= ' ' => {
+                let byte_pos = char_to_byte(&line, cursor);
+                line.insert(byte_pos, ch);
                 cursor += 1;
                 redraw(&line, cursor, false);
             }
@@ -116,7 +129,7 @@ fn readline(history: &mut Vec<String>) -> Option<String> {
 }
 
 fn handle_escape(
-    line: &mut Vec<u8>,
+    line: &mut String,
     cursor: &mut usize,
     history: &[String],
     hist_idx: &mut usize,
@@ -127,43 +140,42 @@ fn handle_escape(
     }
     match read_byte() {
         b'A' => {
-            // Up — previous history entry
             if *hist_idx > 0 {
                 if *hist_idx == history.len() {
-                    *saved_input = String::from_utf8_lossy(line).into_owned();
+                    *saved_input = line.clone();
                 }
                 *hist_idx -= 1;
-                replace_line(line, cursor, history[*hist_idx].as_bytes());
+                let entry = history[*hist_idx].clone();
+                replace_line(line, cursor, &entry);
             }
         }
         b'B' => {
-            // Down — next history entry
             if *hist_idx < history.len() {
                 *hist_idx += 1;
                 let new = if *hist_idx == history.len() {
-                    saved_input.as_bytes().to_vec()
+                    saved_input.clone()
                 } else {
-                    history[*hist_idx].as_bytes().to_vec()
+                    history[*hist_idx].clone()
                 };
                 replace_line(line, cursor, &new);
             }
         }
         b'C' => {
-            // Right
-            if *cursor < line.len() {
-                echo(&[line[*cursor]]);
+            let char_count = line.chars().count();
+            if *cursor < char_count {
+                let byte_pos = char_to_byte(line, *cursor);
+                let next_byte = char_to_byte(line, *cursor + 1);
+                echo(line[byte_pos..next_byte].as_bytes());
                 *cursor += 1;
             }
         }
         b'D' => {
-            // Left
             if *cursor > 0 {
                 *cursor -= 1;
                 echo(&[0x08]);
             }
         }
         b'H' => {
-            // Home
             if *cursor > 0 {
                 let buf: Vec<u8> = vec![0x08; *cursor];
                 echo(&buf);
@@ -171,72 +183,73 @@ fn handle_escape(
             }
         }
         b'F' => {
-            // End
-            if *cursor < line.len() {
-                echo(&line[*cursor..]);
-                *cursor = line.len();
+            let char_count = line.chars().count();
+            if *cursor < char_count {
+                let byte_pos = char_to_byte(line, *cursor);
+                echo(line[byte_pos..].as_bytes());
+                *cursor = char_count;
             }
         }
         b'3' => {
-            // Delete: ESC[3~
-            if read_byte() == b'~' && *cursor < line.len() {
-                line.remove(*cursor);
+            let char_count = line.chars().count();
+            if read_byte() == b'~' && *cursor < char_count {
+                let byte_pos = char_to_byte(line, *cursor);
+                line.remove(byte_pos);
                 let mut buf = Vec::new();
-                buf.extend_from_slice(&line[*cursor..]);
+                buf.extend_from_slice(line[byte_pos..].as_bytes());
                 buf.push(b' ');
-                let back = line.len() - *cursor + 1;
-                for _ in 0..back {
+                let chars_after = line.chars().count() - *cursor;
+                for _ in 0..chars_after + 1 {
                     buf.push(0x08);
                 }
                 echo(&buf);
             }
         }
         b'5' | b'6' => {
-            read_byte(); // consume '~' for Page Up/Down
+            read_byte();
         }
         _ => {}
     }
 }
 
-/// Replace the visible line with new content (used for history navigation).
-fn replace_line(line: &mut Vec<u8>, cursor: &mut usize, new_content: &[u8]) {
-    let old_len = line.len();
+fn replace_line(line: &mut String, cursor: &mut usize, new_content: &str) {
+    let old_chars = line.chars().count();
+    let new_chars = new_content.chars().count();
     let mut buf = Vec::new();
-    // Move console cursor to start of input
     for _ in 0..*cursor {
         buf.push(0x08);
     }
-    // Write new content
-    buf.extend_from_slice(new_content);
-    // Clear remaining chars if new content is shorter
-    if new_content.len() < old_len {
-        for _ in 0..(old_len - new_content.len()) {
+    buf.extend_from_slice(new_content.as_bytes());
+    if new_chars < old_chars {
+        for _ in 0..(old_chars - new_chars) {
             buf.push(b' ');
         }
-        for _ in 0..(old_len - new_content.len()) {
+        for _ in 0..(old_chars - new_chars) {
             buf.push(0x08);
         }
     }
     echo(&buf);
     line.clear();
-    line.extend_from_slice(new_content);
-    *cursor = new_content.len();
+    line.push_str(new_content);
+    *cursor = new_chars;
 }
 
-/// Redraw line after an insert or backspace at cursor position.
-fn redraw(line: &[u8], cursor: usize, backspace: bool) {
-    let mut buf = Vec::new();
-    let start = if backspace {
-        buf.push(0x08);
-        cursor
+fn redraw(line: &str, cursor: usize, backspace: bool) {
+    let char_count = line.chars().count();
+    let start_byte = if backspace {
+        char_to_byte(line, cursor)
     } else {
-        cursor - 1
+        char_to_byte(line, cursor - 1)
     };
-    buf.extend_from_slice(&line[start..]);
+    let mut buf = Vec::new();
+    if backspace {
+        buf.push(0x08);
+    }
+    buf.extend_from_slice(line[start_byte..].as_bytes());
     if backspace {
         buf.push(b' ');
     }
-    let back = line.len() - cursor + if backspace { 1 } else { 0 };
+    let back = char_count - cursor + if backspace { 1 } else { 0 };
     for _ in 0..back {
         buf.push(0x08);
     }
@@ -246,18 +259,13 @@ fn redraw(line: &[u8], cursor: usize, backspace: bool) {
 // --- Shell commands ---
 
 fn print_help() {
-    println!("Commands:");
-    println!("  ls [path]       List files");
-    println!("  cat <file>      Print file contents");
-    println!("  rm <file>       Delete a file");
-    println!("  write <file>    Create a file");
-    println!("  edit <file>     Edit a file");
-    println!("  cd <path>       Change directory");
-    println!("  pwd             Print working directory");
-    println!("  clear           Clear screen");
-    println!("  run <file>      Run an ELF program");
-    println!("  layout [name]   Set keyboard layout");
-    println!("  shutdown        Power off");
+    println!("Builtins:");
+    println!("  cd <path>     Change directory");
+    println!("  clear         Clear screen");
+    println!("  run <file>    Run program by path");
+    println!("  help          Show this help");
+    println!();
+    println!("Programs in /initrd/ are available by name.");
 }
 
 fn cmd_cd(arg: &str) {
@@ -267,189 +275,38 @@ fn cmd_cd(arg: &str) {
     }
 }
 
-fn cmd_ls(arg: &str) {
-    let path = if arg.is_empty() {
-        env::current_dir().unwrap_or_else(|_| "/".into())
-    } else if arg.starts_with('/') {
-        arg.into()
-    } else {
-        env::current_dir().unwrap_or_else(|_| "/".into()).join(arg)
-    };
-
-    match fs::read_dir(&path) {
-        Ok(entries) => {
-            let mut any = false;
-            for entry in entries {
-                let Ok(entry) = entry else { continue };
-                any = true;
-                let name = entry.file_name();
-                let name = name.to_string_lossy();
-                if let Ok(ft) = entry.file_type() {
-                    if ft.is_dir() {
-                        println!("  {}/", name);
-                    } else if let Ok(meta) = entry.metadata() {
-                        println!("  {} ({} bytes)", name, meta.len());
-                    } else {
-                        println!("  {}", name);
-                    }
-                }
-            }
-            if !any {
-                println!("No files.");
-            }
-        }
-        Err(e) => println!("ls: {}", e),
-    }
-}
-
-fn cmd_cat(arg: &str) {
-    if arg.is_empty() {
-        println!("Usage: cat <file>");
-        return;
-    }
-    let path = resolve(arg);
-    match fs::read(&path) {
-        Ok(data) => {
-            if let Ok(text) = std::str::from_utf8(&data) {
-                println!("{}", text);
-            } else {
-                println!("{}: {} bytes (binary)", arg, data.len());
-            }
-        }
-        Err(_) => println!("{}: file not found", arg),
-    }
-}
-
-fn cmd_rm(arg: &str) {
-    if arg.is_empty() {
-        println!("Usage: rm <file>");
-        return;
-    }
-    let path = resolve(arg);
-    match fs::remove_file(&path) {
-        Ok(()) => println!("{}: deleted", arg),
-        Err(_) => println!("{}: file not found", arg),
-    }
-}
-
-fn cmd_write(arg: &str) {
-    if arg.is_empty() {
-        println!("Usage: write <file>");
-        return;
-    }
-    println!("Enter text (type . on a line by itself to save):");
-    let text = read_text_block();
-    let path = resolve(arg);
-    if fs::write(&path, &text).is_ok() {
-        println!("File saved.");
-    } else {
-        println!("Error: could not save file.");
-    }
-}
-
-fn cmd_edit(arg: &str) {
-    if arg.is_empty() {
-        println!("Usage: edit <file>");
-        return;
-    }
-    let path = resolve(arg);
-    match fs::read(&path) {
-        Ok(data) => {
-            if let Ok(text) = std::str::from_utf8(&data) {
-                println!("Current contents:");
-                println!("{}", text);
-            } else {
-                println!("{}: binary file, cannot edit", arg);
-                return;
-            }
-        }
-        Err(_) => println!("(new file)"),
-    }
-    println!("Enter new text (type . on a line by itself to save):");
-    let text = read_text_block();
-    if fs::write(&path, &text).is_ok() {
-        println!("File saved.");
-    } else {
-        println!("Error: could not save file.");
-    }
-}
-
-fn read_text_block() -> String {
-    let mut text = String::new();
-    let mut line = String::new();
-    loop {
-        print!("| ");
-        io::stdout().flush().ok();
-        line.clear();
-        if io::stdin().read_line(&mut line).unwrap_or(0) == 0 {
-            break;
-        }
-        if line.trim() == "." {
-            break;
-        }
-        text.push_str(&line);
-    }
-    text
-}
-
 fn cmd_run(arg: &str) {
     if arg.is_empty() {
         println!("Usage: run <file>");
         return;
     }
-    let name = arg.split_whitespace().next().unwrap_or(arg);
-    run_program(name, arg);
-}
-
-fn cmd_exec(cmd: &str, arg: &str) {
-    // PATH lookup: try /initrd/<cmd>
-    let path = format!("/initrd/{}", cmd);
-    let full = if arg.is_empty() {
-        path.clone()
-    } else {
-        format!("{} {}", path, arg)
-    };
-    run_program(cmd, &full);
-}
-
-fn run_program(display_name: &str, arg: &str) {
     let parts: Vec<&str> = arg.split_whitespace().collect();
-    let Some(program) = parts.first() else { return };
-
-    let status = Command::new(program)
-        .args(&parts[1..])
-        .status();
-
+    let program = parts[0];
+    let status = Command::new(program).args(&parts[1..]).status();
     match status {
         Ok(code) => {
             if !code.success() {
                 println!("Process exited with code {}", code.code().unwrap_or(-1));
             }
         }
-        Err(_) => println!("{}: not found", display_name),
+        Err(_) => println!("{}: not found", program),
     }
 }
 
-/// Resolve a path relative to cwd, returning an absolute path string.
-fn resolve(arg: &str) -> String {
-    if arg.starts_with('/') {
-        arg.to_string()
-    } else {
-        let cwd = env::current_dir().unwrap_or_else(|_| "/".into());
-        format!("{}/{}", cwd.display(), arg)
+fn cmd_exec(cmd: &str, arg: &str) {
+    let path = format!("/initrd/{}", cmd);
+    let mut command = Command::new(&path);
+    if !arg.is_empty() {
+        for a in arg.split_whitespace() {
+            command.arg(a);
+        }
     }
-}
-
-fn cmd_layout(arg: &str) {
-    if arg.is_empty() {
-        println!("Available layouts: us, swiss-german-mac");
-        println!("Usage: layout <name>");
-        return;
-    }
-    let name = arg.trim();
-    if std::os::toyos::io::set_keyboard_layout(name) {
-        println!("Keyboard layout set to '{}'", name);
-    } else {
-        println!("layout: unknown layout '{}'", name);
+    match command.status() {
+        Ok(code) => {
+            if !code.success() {
+                println!("Process exited with code {}", code.code().unwrap_or(-1));
+            }
+        }
+        Err(_) => println!("{}: not found", cmd),
     }
 }

@@ -190,11 +190,17 @@ pub fn seek(table: &mut FdTable, fd: u64, offset: i64, whence: u64) -> u64 {
     file.position as u64
 }
 
+/// Returns (type << 32) | payload. Types: 1=file, 2=pipe, 3=keyboard, 4=serial, 5=framebuffer.
+/// Payload: file size for files, 0 otherwise. Returns 0 for invalid FD.
 pub fn fstat(table: &mut FdTable, fd: u64) -> u64 {
-    let Some(Descriptor::File(file)) = table.get_mut(fd as usize).and_then(|s| s.as_mut()) else {
-        return u64::MAX;
-    };
-    (1u64 << 32) | file.data.len() as u64
+    match table.get(fd as usize).and_then(|s| s.as_ref()) {
+        Some(Descriptor::File(file)) => (1u64 << 32) | file.data.len() as u64,
+        Some(Descriptor::PipeRead(_) | Descriptor::PipeWrite(_)) => 2u64 << 32,
+        Some(Descriptor::Keyboard) => 3u64 << 32,
+        Some(Descriptor::SerialConsole) => 4u64 << 32,
+        Some(Descriptor::Framebuffer(_)) => 5u64 << 32,
+        None => 0,
+    }
 }
 
 pub fn fsync(table: &mut FdTable, vfs: &mut Vfs, fd: u64) -> u64 {

@@ -27,7 +27,6 @@ const SYS_CLOSE: u64 = 10;
 const SYS_SEEK: u64 = 13;
 const SYS_FSTAT: u64 = 14;
 const SYS_FSYNC: u64 = 15;
-const SYS_EXEC: u64 = 16;
 const SYS_READDIR: u64 = 17;
 const SYS_DELETE: u64 = 18;
 const SYS_SHUTDOWN: u64 = 19;
@@ -123,7 +122,6 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             let proc = process::current();
             fd::fsync(&mut proc.fds, vfs::global(), a1)
         }
-        SYS_EXEC => sys_exec(a1, a2, a3, a4),
         SYS_READDIR => sys_readdir(a1, a2, a3, a4),
         SYS_DELETE => sys_delete(a1, a2),
         SYS_SHUTDOWN => { acpi::shutdown(); }
@@ -193,102 +191,6 @@ fn sys_random(buf: *mut u8, len: usize) {
 }
 
 /// Spawn child, optionally capture stdout, wait for exit.
-fn sys_exec(argv_ptr: u64, argv_len: u64, out_buf_ptr: u64, out_buf_max: u64) -> u64 {
-    let buf = unsafe { core::slice::from_raw_parts(argv_ptr as *const u8, argv_len as usize) };
-    let Ok(text) = core::str::from_utf8(buf) else { return u64::MAX };
-    let args: Vec<&str> = text.split('\0').filter(|s| !s.is_empty()).collect();
-
-    let capture = out_buf_max > 0;
-
-    if capture {
-        // Create a pipe for stdout capture
-        let pipe_id = match pipe::create() {
-            Some(id) => id,
-            None => return u64::MAX,
-        };
-
-        // Allocate pipe FDs in parent
-        let proc = process::current();
-        let read_fd = fd::alloc(&mut proc.fds, fd::Descriptor::PipeRead(pipe_id));
-        let write_fd = fd::alloc(&mut proc.fds, fd::Descriptor::PipeWrite(pipe_id));
-        if read_fd == u64::MAX || write_fd == u64::MAX {
-            return u64::MAX;
-        }
-
-        // Spawn child with pipe as stdout, inherit stdin
-        let child_pid = process::spawn(&args, u64::MAX, write_fd);
-        if child_pid == u64::MAX {
-            return u64::MAX;
-        }
-
-        // Close write end in parent (child has its own reference)
-        let proc = process::current();
-        fd::close(&mut proc.fds, vfs::global(), write_fd);
-
-        // Read all output from pipe
-        let mut output = Vec::new();
-        let mut tmp = [0u8; 4096];
-        loop {
-            let proc = process::current();
-            match fd::try_read(&mut proc.fds, read_fd, &mut tmp) {
-                Some(0) => break, // EOF
-                Some(n) => output.extend_from_slice(&tmp[..n as usize]),
-                None => {
-                    // Block on pipe read
-                    let proc = process::current();
-                    let pipe_id = match proc.fds.get(read_fd as usize).and_then(|s| s.as_ref()) {
-                        Some(fd::Descriptor::PipeRead(id)) => *id,
-                        _ => break,
-                    };
-                    process::block(process::ProcessState::BlockedPipeRead(pipe_id));
-                }
-            }
-        }
-
-        // Close read end
-        let proc = process::current();
-        fd::close(&mut proc.fds, vfs::global(), read_fd);
-
-        // Wait for child
-        let exit_code = loop {
-            if let Some(code) = process::collect_zombie(child_pid as u32) {
-                break code;
-            }
-            process::block(process::ProcessState::BlockedWaitPid(child_pid as u32));
-        };
-
-        // Copy output to caller's buffer
-        let copy_len = output.len().min(out_buf_max as usize);
-        if copy_len > 0 && out_buf_ptr != 0 {
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    output.as_ptr(),
-                    out_buf_ptr as *mut u8,
-                    copy_len,
-                );
-            }
-        }
-
-        ((exit_code as u64) << 32) | (copy_len as u64)
-    } else {
-        // No capture — spawn child with inherited FDs and wait
-        let child_pid = process::spawn(&args, u64::MAX, u64::MAX);
-        if child_pid == u64::MAX {
-            return u64::MAX;
-        }
-
-        // Wait for child to exit
-        let exit_code = loop {
-            if let Some(code) = process::collect_zombie(child_pid as u32) {
-                break code;
-            }
-            process::block(process::ProcessState::BlockedWaitPid(child_pid as u32));
-        };
-
-        ((exit_code as u64) << 32) | 0u64
-    }
-}
-
 fn sys_readdir(path_ptr: u64, path_len: u64, buf_ptr: u64, buf_len: u64) -> u64 {
     let slice = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, path_len as usize) };
     let Ok(path) = core::str::from_utf8(slice) else { return u64::MAX };

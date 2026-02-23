@@ -2,7 +2,9 @@ mod console;
 mod font;
 mod framebuffer;
 
-use std::os::toyos::io;
+use std::io::{Read, Write};
+use std::os::toyos::io::{self, AsRawFd};
+use std::process::{Command, Stdio};
 
 /// FramebufferInfo layout matches kernel's `fd::FramebufferInfo` (repr(C)).
 #[repr(C)]
@@ -34,6 +36,8 @@ fn read_fb_info() -> FramebufferInfo {
 }
 
 fn main() {
+    std::os::toyos::io::set_stdin_raw(true);
+
     let fb_info = read_fb_info();
     let fb = framebuffer::Framebuffer::new(
         fb_info.addr,
@@ -45,38 +49,42 @@ fn main() {
     let font = font::Font::new(include_bytes!(concat!(env!("OUT_DIR"), "/font.bin")));
     let mut console = console::Console::new(fb, font);
 
-    // Create pipes for shell communication
-    let (shell_stdin_r, shell_stdin_w) = io::pipe();
-    let (shell_stdout_r, shell_stdout_w) = io::pipe();
+    let mut child = Command::new("/initrd/shell")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn shell");
 
-    // Spawn shell with pipes
-    let shell_pid = io::spawn(&["/initrd/shell"], shell_stdin_r, shell_stdout_w);
-    io::close_fd(shell_stdin_r);
-    io::close_fd(shell_stdout_w);
+    let mut shell_stdin = child.stdin.take().unwrap();
+    let mut shell_stdout = child.stdout.take().unwrap();
+    let shell_stdout_fd = shell_stdout.as_raw_fd();
 
-    // Event loop: multiplex keyboard input and shell output
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+
     loop {
-        let mask = io::poll(0, shell_stdout_r);
+        let mask = io::poll(0, shell_stdout_fd);
 
         if mask & 1 != 0 {
             let mut buf = [0u8; 64];
-            let n = io::read_stdin_raw(&mut buf).unwrap_or(0);
+            let n = stdin.lock().read(&mut buf).unwrap_or(0);
             if n > 0 {
-                io::write_fd(shell_stdin_w, &buf[..n]);
+                shell_stdin.write_all(&buf[..n]).ok();
             }
         }
 
         if mask & 2 != 0 {
             let mut buf = [0u8; 4096];
-            let n = io::read_fd(shell_stdout_r, &mut buf);
+            let n = shell_stdout.read(&mut buf).unwrap_or(0);
             if n == 0 {
                 break;
             }
             console.write_bytes(&buf[..n]);
+            stdout.lock().write_all(&buf[..n]).ok();
         }
     }
 
-    io::close_fd(shell_stdin_w);
-    io::close_fd(shell_stdout_r);
-    io::waitpid(shell_pid);
+    drop(shell_stdin);
+    drop(shell_stdout);
+    child.wait().ok();
 }
