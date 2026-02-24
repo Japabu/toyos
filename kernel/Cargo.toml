@@ -9,4 +9,4 @@ edition = "2021"
 tyfs = { path = "../tyfs" }
 rustc-demangle = "0.1"
 elf = { version = "0.8", default-features = false }
-hashbrown = { version = "0.16.1", default-features = false }
+hashbrown = { version = "0.16", default-features = false, features = ["default-hasher"] }

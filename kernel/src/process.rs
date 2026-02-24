@@ -77,23 +77,21 @@ struct ProcessTable {
     current: u32,
 }
 
-impl ProcessTable {
-    const fn new() -> Self {
-        Self {
-            procs: IdMap::new(),
-            current: 0,
-        }
-    }
+static PROCESS_TABLE: SyncCell<Option<ProcessTable>> = SyncCell::new(None);
+
+fn table() -> &'static mut ProcessTable {
+    PROCESS_TABLE.get_mut().get_or_insert_with(|| ProcessTable {
+        procs: IdMap::new(),
+        current: 0,
+    })
 }
 
-static PROCESS_TABLE: SyncCell<ProcessTable> = SyncCell::new(ProcessTable::new());
-
 pub fn current_pid() -> u32 {
-    PROCESS_TABLE.get().current
+    table().current
 }
 
 pub fn current() -> &'static mut Process {
-    let table = PROCESS_TABLE.get_mut();
+    let table = table();
     table.procs.get_mut(table.current).unwrap()
 }
 
@@ -103,7 +101,7 @@ pub fn init_process0(
     elf_base: *mut u8, elf_layout: Layout,
     stack_base: *mut u8, stack_layout: Layout,
 ) {
-    let table = PROCESS_TABLE.get_mut();
+    let table = table();
 
     let ks_layout = Layout::from_size_align(KERNEL_STACK_SIZE, 4096).unwrap();
     let ks_base = unsafe { alloc_zeroed(ks_layout) };
@@ -219,7 +217,7 @@ pub fn spawn(argv: &[&str], stdin_fd: u64, stdout_fd: u64) -> u64 {
     }
     let ks_top = ks_base as u64 + KERNEL_STACK_SIZE as u64;
 
-    let table = PROCESS_TABLE.get_mut();
+    let table = table();
     let parent_pid = table.current;
 
     let mut child_fds = FdTable::new();
@@ -314,7 +312,7 @@ pub fn spawn(argv: &[&str], stdin_fd: u64, stdout_fd: u64) -> u64 {
 
 /// Exit the current process.
 pub fn exit(code: i32) -> ! {
-    let table = PROCESS_TABLE.get_mut();
+    let table = table();
     let pid = table.current;
     let proc = table.procs.get_mut(pid).unwrap();
 
@@ -347,21 +345,21 @@ pub fn exit(code: i32) -> ! {
 
 /// Block the current process and switch to the next ready one.
 pub fn block(reason: ProcessState) {
-    let table = PROCESS_TABLE.get_mut();
+    let table = table();
     table.procs.get_mut(table.current).unwrap().state = reason;
     schedule();
 }
 
 /// Cooperative yield: mark current as Ready, switch to next.
 pub fn yield_now() {
-    let table = PROCESS_TABLE.get_mut();
+    let table = table();
     table.procs.get_mut(table.current).unwrap().state = ProcessState::Ready;
     schedule();
 }
 
 /// Find next ready process (round-robin by PID order) and context switch to it.
 pub fn schedule() {
-    let table = PROCESS_TABLE.get_mut();
+    let table = table();
     let current_pid = table.current;
 
     loop {
@@ -418,7 +416,7 @@ pub fn schedule() {
 
 /// Schedule without saving current context (used by exit).
 fn schedule_no_return() -> ! {
-    let table = PROCESS_TABLE.get_mut();
+    let table = table();
 
     loop {
         // Find any Ready process
@@ -511,7 +509,7 @@ fn idle_poll(table: &mut ProcessTable) {
 
 /// Send a message to a target process. Wakes the target if blocked.
 pub fn send_message(target_pid: u32, msg: crate::message::Message) -> bool {
-    let table = PROCESS_TABLE.get_mut();
+    let table = table();
     if let Some(proc) = table.procs.get_mut(target_pid) {
         proc.messages.push(msg);
         match proc.state {
@@ -528,7 +526,7 @@ pub fn send_message(target_pid: u32, msg: crate::message::Message) -> bool {
 
 /// Collect a zombie child. Returns exit code, or None if not a zombie yet.
 pub fn collect_zombie(child_pid: u32) -> Option<i32> {
-    let table = PROCESS_TABLE.get_mut();
+    let table = table();
     let proc = table.procs.get(child_pid)?;
     if let ProcessState::Zombie(code) = proc.state {
         let ks_base = proc.kernel_stack_base;

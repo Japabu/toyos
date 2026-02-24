@@ -1,28 +1,6 @@
-use core::hash::{BuildHasher, Hash, Hasher};
+use core::hash::Hash;
 use core::ops::Add;
-
-struct IdentityHasher(u64);
-
-impl Hasher for IdentityHasher {
-    fn write(&mut self, _: &[u8]) { unreachable!() }
-    fn write_u32(&mut self, i: u32) { self.0 = i as u64; }
-    fn write_u64(&mut self, i: u64) { self.0 = i; }
-    fn write_usize(&mut self, i: usize) { self.0 = i as u64; }
-    fn finish(&self) -> u64 { self.0 }
-}
-
-pub struct IdentityBuildHasher;
-
-impl BuildHasher for IdentityBuildHasher {
-    type Hasher = IdentityHasher;
-    fn build_hasher(&self) -> IdentityHasher { IdentityHasher(0) }
-}
-
-type HashMap<K, V> = hashbrown::HashMap<K, V, IdentityBuildHasher>;
-
-const fn new_map<K, V>() -> HashMap<K, V> {
-    hashbrown::HashMap::with_hasher(IdentityBuildHasher)
-}
+use hashbrown::HashMap;
 
 /// A HashMap with auto-incrementing keys. IDs are never reused.
 pub struct IdMap<K, V> {
@@ -40,8 +18,8 @@ impl IdKey for u64 { const ZERO: Self = 0; const ONE: Self = 1; }
 impl IdKey for usize { const ZERO: Self = 0; const ONE: Self = 1; }
 
 impl<K: IdKey, V> IdMap<K, V> {
-    pub const fn new() -> Self {
-        Self { map: new_map(), next: K::ZERO }
+    pub fn new() -> Self {
+        Self { map: HashMap::new(), next: K::ZERO }
     }
 
     /// Insert with auto-assigned ID. Returns the new ID.
