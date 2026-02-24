@@ -1,12 +1,11 @@
-use std::{env, fs};
+use std::fs;
 
-fn main() {
-    let args: Vec<String> = env::args().collect();
-    if args.len() < 2 {
+pub fn main(args: Vec<String>) {
+    if args.is_empty() {
         eprintln!("Usage: cat <file>");
         return;
     }
-    for path in &args[1..] {
+    for path in &args {
         match fs::read(path) {
             Ok(data) => {
                 if let Ok(text) = std::str::from_utf8(&data) {

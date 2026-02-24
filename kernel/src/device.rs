@@ -1,5 +1,5 @@
 use alloc::string::String;
-use alloc::vec::Vec;
+use hashbrown::HashMap;
 use crate::fd::{Descriptor, FramebufferInfo};
 use crate::sync::SyncCell;
 
@@ -12,7 +12,7 @@ static MOUSE_OWNER: SyncCell<Option<u32>> = SyncCell::new(None);
 static FRAMEBUFFER_OWNER: SyncCell<Option<u32>> = SyncCell::new(None);
 static FB_INFO: SyncCell<Option<FramebufferInfo>> = SyncCell::new(None);
 
-static NAME_REGISTRY: SyncCell<Vec<(String, u32)>> = SyncCell::new(Vec::new());
+static NAME_REGISTRY: SyncCell<Option<HashMap<String, u32>>> = SyncCell::new(None);
 
 pub fn set_framebuffer_info(info: FramebufferInfo) {
     *FB_INFO.get_mut() = Some(info);
@@ -74,14 +74,14 @@ pub fn release_descriptor(desc: &Descriptor, pid: u32) {
 }
 
 pub fn register_name(name: &str, pid: u32) -> bool {
-    let registry = NAME_REGISTRY.get_mut();
-    if registry.iter().any(|(n, _)| n == name) {
+    let registry = NAME_REGISTRY.get_mut().get_or_insert_with(HashMap::new);
+    if registry.contains_key(name) {
         return false;
     }
-    registry.push((String::from(name), pid));
+    registry.insert(String::from(name), pid);
     true
 }
 
 pub fn find_pid(name: &str) -> Option<u32> {
-    NAME_REGISTRY.get().iter().find(|(n, _)| n == name).map(|(_, pid)| *pid)
+    NAME_REGISTRY.get().as_ref()?.get(name).copied()
 }

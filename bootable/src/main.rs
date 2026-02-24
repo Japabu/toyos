@@ -73,7 +73,20 @@ fn build() {
     initrd_files.push(("font.bin".to_string(), assets::rasterize_font()));
     initrd_files.push(("cursor.bin".to_string(), assets::generate_cursor()));
 
-    let initrd_bytes = image::create_initrd(&initrd_files);
+    // Generate symlinks for toybox commands by scanning its source modules
+    let mut symlinks: Vec<(String, String)> = Vec::new();
+    for entry in fs::read_dir("../userland/toybox/src").expect("Failed to read toybox/src") {
+        let entry = entry.expect("Failed to read dir entry");
+        let name = entry.file_name();
+        let name = name.to_str().unwrap().to_string();
+        if name == "main.rs" || !name.ends_with(".rs") {
+            continue;
+        }
+        let cmd = name.strip_suffix(".rs").unwrap().to_string();
+        symlinks.push((cmd, "toybox".to_string()));
+    }
+
+    let initrd_bytes = image::create_initrd(&initrd_files, &symlinks);
     let disk_bytes = image::create_boot_image(&initrd_bytes);
 
     fs::write("target/bootable.img", disk_bytes).expect("Failed to write image");

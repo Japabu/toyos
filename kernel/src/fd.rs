@@ -1,6 +1,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use crate::id_map::IdMap;
 use crate::vfs::Vfs;
 use crate::{device, keyboard, mouse, log, pipe};
 use crate::drivers::serial;
@@ -40,17 +41,10 @@ pub enum Descriptor {
     Framebuffer(FramebufferInfo),
 }
 
-pub type FdTable = Vec<Option<Descriptor>>;
+pub type FdTable = IdMap<u64, Descriptor>;
 
 pub fn alloc(table: &mut FdTable, desc: Descriptor) -> u64 {
-    if let Some(i) = table.iter().position(|slot| slot.is_none()) {
-        table[i] = Some(desc);
-        i as u64
-    } else {
-        let i = table.len();
-        table.push(Some(desc));
-        i as u64
-    }
+    table.insert(desc)
 }
 
 pub fn open(table: &mut FdTable, vfs: &mut Vfs, path: &str, flags: u64) -> u64 {
@@ -93,7 +87,7 @@ pub fn open(table: &mut FdTable, vfs: &mut Vfs, path: &str, flags: u64) -> u64 {
 }
 
 pub fn close(table: &mut FdTable, vfs: &mut Vfs, fd: u64, pid: u32) -> u64 {
-    let Some(desc) = table.get_mut(fd as usize).and_then(|slot| slot.take()) else {
+    let Some(desc) = table.remove(fd) else {
         return u64::MAX;
     };
     match &desc {
@@ -115,7 +109,7 @@ pub fn close(table: &mut FdTable, vfs: &mut Vfs, fd: u64, pid: u32) -> u64 {
 }
 
 pub fn try_read(table: &mut FdTable, fd: u64, buf: &mut [u8]) -> Option<u64> {
-    let desc = table.get_mut(fd as usize)?.as_mut()?;
+    let desc = table.get_mut(fd)?;
     match desc {
         Descriptor::File(file) => {
             let available = file.data.len().saturating_sub(file.position);
@@ -177,7 +171,7 @@ pub fn try_read(table: &mut FdTable, fd: u64, buf: &mut [u8]) -> Option<u64> {
 }
 
 pub fn try_write(table: &mut FdTable, fd: u64, buf: &[u8]) -> Option<u64> {
-    let desc = table.get_mut(fd as usize)?.as_mut()?;
+    let desc = table.get_mut(fd)?;
     match desc {
         Descriptor::File(file) => {
             if !file.writable {
@@ -208,7 +202,7 @@ pub fn try_write(table: &mut FdTable, fd: u64, buf: &[u8]) -> Option<u64> {
 }
 
 pub fn seek(table: &mut FdTable, fd: u64, offset: i64, whence: u64) -> u64 {
-    let Some(Descriptor::File(file)) = table.get_mut(fd as usize).and_then(|s| s.as_mut()) else {
+    let Some(Descriptor::File(file)) = table.get_mut(fd) else {
         return u64::MAX;
     };
     let new_pos = match whence {
@@ -224,7 +218,7 @@ pub fn seek(table: &mut FdTable, fd: u64, offset: i64, whence: u64) -> u64 {
 /// Returns (type << 32) | payload. Types: 1=file, 2=pipe, 3=keyboard, 4=serial, 5=framebuffer, 6=tty.
 /// Payload: file size for files, 0 otherwise. Returns 0 for invalid FD.
 pub fn fstat(table: &mut FdTable, fd: u64) -> u64 {
-    match table.get(fd as usize).and_then(|s| s.as_ref()) {
+    match table.get(fd) {
         Some(Descriptor::File(file)) => (1u64 << 32) | file.data.len() as u64,
         Some(Descriptor::PipeRead(_) | Descriptor::PipeWrite(_)) => 2u64 << 32,
         Some(Descriptor::Keyboard) => 3u64 << 32,
@@ -237,7 +231,7 @@ pub fn fstat(table: &mut FdTable, fd: u64) -> u64 {
 }
 
 pub fn fsync(table: &mut FdTable, vfs: &mut Vfs, fd: u64) -> u64 {
-    let Some(Descriptor::File(file)) = table.get_mut(fd as usize).and_then(|s| s.as_mut()) else {
+    let Some(Descriptor::File(file)) = table.get_mut(fd) else {
         return u64::MAX;
     };
     if file.modified && file.writable {
@@ -250,29 +244,27 @@ pub fn fsync(table: &mut FdTable, vfs: &mut Vfs, fd: u64) -> u64 {
 }
 
 pub fn close_all(table: &mut FdTable, vfs: &mut Vfs, pid: u32) {
-    for slot in table.iter_mut() {
-        if let Some(desc) = slot.take() {
-            match &desc {
-                Descriptor::File(file) => {
-                    if file.modified && file.writable {
-                        if !vfs.write_file(&file.path, &file.data) {
-                            log!("warning: VFS write failed on process exit: {}", file.path);
-                        }
+    for (_, desc) in table.drain() {
+        match &desc {
+            Descriptor::File(file) => {
+                if file.modified && file.writable {
+                    if !vfs.write_file(&file.path, &file.data) {
+                        log!("warning: VFS write failed on process exit: {}", file.path);
                     }
                 }
-                Descriptor::PipeRead(id) | Descriptor::TtyRead(id) => pipe::close_read(*id),
-                Descriptor::PipeWrite(id) | Descriptor::TtyWrite(id) => pipe::close_write(*id),
-                Descriptor::Keyboard | Descriptor::Mouse | Descriptor::Framebuffer(_) => {
-                    device::release_descriptor(&desc, pid);
-                }
-                Descriptor::SerialConsole => {}
             }
+            Descriptor::PipeRead(id) | Descriptor::TtyRead(id) => pipe::close_read(*id),
+            Descriptor::PipeWrite(id) | Descriptor::TtyWrite(id) => pipe::close_write(*id),
+            Descriptor::Keyboard | Descriptor::Mouse | Descriptor::Framebuffer(_) => {
+                device::release_descriptor(&desc, pid);
+            }
+            Descriptor::SerialConsole => {}
         }
     }
 }
 
 pub fn has_data(table: &FdTable, fd: u64) -> bool {
-    match table.get(fd as usize).and_then(|s| s.as_ref()) {
+    match table.get(fd) {
         Some(Descriptor::PipeRead(id)) | Some(Descriptor::TtyRead(id)) => pipe::has_data(*id),
         Some(Descriptor::Keyboard) => keyboard::has_data(),
         Some(Descriptor::Mouse) => mouse::has_data(),
@@ -282,7 +274,7 @@ pub fn has_data(table: &FdTable, fd: u64) -> bool {
 }
 
 pub fn mark_tty(table: &mut FdTable, fd: u64) -> u64 {
-    let Some(desc) = table.get_mut(fd as usize).and_then(|s| s.as_mut()) else {
+    let Some(desc) = table.get_mut(fd) else {
         return u64::MAX;
     };
     match desc {

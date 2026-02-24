@@ -1,8 +1,8 @@
-use std::{env, fs};
 use std::path::PathBuf;
+use std::{env, fs};
 
-fn main() {
-    let path = match env::args().nth(1) {
+pub fn main(args: Vec<String>) {
+    let path = match args.first() {
         Some(arg) => {
             if arg.starts_with('/') {
                 PathBuf::from(arg)

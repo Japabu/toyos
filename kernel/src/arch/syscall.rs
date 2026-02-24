@@ -159,7 +159,7 @@ fn sys_write(fd_num: u64, buf: &[u8]) -> u64 {
             Some(n) => return n,
             None => {
                 let proc = process::current();
-                let reason = match proc.fds.get(fd_num as usize).and_then(|s| s.as_ref()) {
+                let reason = match proc.fds.get(fd_num) {
                     Some(fd::Descriptor::PipeWrite(id)) | Some(fd::Descriptor::TtyWrite(id)) =>
                         process::ProcessState::BlockedPipeWrite(*id),
                     _ => return u64::MAX,
@@ -177,7 +177,7 @@ fn sys_read(fd_num: u64, buf: &mut [u8]) -> u64 {
             Some(n) => return n,
             None => {
                 let proc = process::current();
-                let reason = match proc.fds.get(fd_num as usize).and_then(|s| s.as_ref()) {
+                let reason = match proc.fds.get(fd_num) {
                     Some(fd::Descriptor::Keyboard) => process::ProcessState::BlockedKeyboard,
                     Some(fd::Descriptor::PipeRead(id)) | Some(fd::Descriptor::TtyRead(id)) =>
                         process::ProcessState::BlockedPipeRead(*id),
@@ -284,16 +284,10 @@ fn sys_set_keyboard_layout(name_ptr: u64, name_len: u64) -> u64 {
 }
 
 fn sys_pipe() -> u64 {
-    let pipe_id = match pipe::create() {
-        Some(id) => id,
-        None => return u64::MAX,
-    };
+    let pipe_id = pipe::create();
     let proc = process::current();
     let read_fd = fd::alloc(&mut proc.fds, fd::Descriptor::PipeRead(pipe_id));
     let write_fd = fd::alloc(&mut proc.fds, fd::Descriptor::PipeWrite(pipe_id));
-    if read_fd == u64::MAX || write_fd == u64::MAX {
-        return u64::MAX;
-    }
     (read_fd << 32) | write_fd
 }
 

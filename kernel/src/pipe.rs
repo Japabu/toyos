@@ -1,6 +1,6 @@
 use alloc::collections::VecDeque;
-use alloc::vec::Vec;
 
+use crate::id_map::IdMap;
 use crate::sync::SyncCell;
 
 const PIPE_BUF_SIZE: usize = 4096;
@@ -43,23 +43,15 @@ impl Pipe {
     }
 }
 
-static PIPES: SyncCell<Vec<Option<Pipe>>> = SyncCell::new(Vec::new());
+static PIPES: SyncCell<IdMap<usize, Pipe>> = SyncCell::new(IdMap::new());
 
-pub fn create() -> Option<usize> {
-    let table = PIPES.get_mut();
-    if let Some(i) = table.iter().position(|slot| slot.is_none()) {
-        table[i] = Some(Pipe::new());
-        Some(i)
-    } else {
-        let i = table.len();
-        table.push(Some(Pipe::new()));
-        Some(i)
-    }
+pub fn create() -> usize {
+    PIPES.get_mut().insert(Pipe::new())
 }
 
 /// Returns bytes read, 0 for EOF, None if would block.
 pub fn try_read(pipe_id: usize, buf: &mut [u8]) -> Option<usize> {
-    let pipe = PIPES.get_mut().get_mut(pipe_id)?.as_mut()?;
+    let pipe = PIPES.get_mut().get_mut(pipe_id)?;
     if pipe.available() > 0 {
         Some(pipe.read(buf))
     } else if pipe.writers == 0 {
@@ -71,7 +63,7 @@ pub fn try_read(pipe_id: usize, buf: &mut [u8]) -> Option<usize> {
 
 /// Returns bytes written, usize::MAX for broken pipe, None if would block.
 pub fn try_write(pipe_id: usize, buf: &[u8]) -> Option<usize> {
-    let pipe = PIPES.get_mut().get_mut(pipe_id)?.as_mut()?;
+    let pipe = PIPES.get_mut().get_mut(pipe_id)?;
     if pipe.readers == 0 {
         Some(usize::MAX)
     } else if pipe.space() > 0 {
@@ -84,38 +76,37 @@ pub fn try_write(pipe_id: usize, buf: &[u8]) -> Option<usize> {
 pub fn has_data(pipe_id: usize) -> bool {
     PIPES.get()
         .get(pipe_id)
-        .and_then(|slot| slot.as_ref())
         .map_or(false, |p| p.available() > 0 || p.writers == 0)
 }
 
 pub fn add_reader(pipe_id: usize) {
-    if let Some(Some(pipe)) = PIPES.get_mut().get_mut(pipe_id) {
+    if let Some(pipe) = PIPES.get_mut().get_mut(pipe_id) {
         pipe.readers += 1;
     }
 }
 
 pub fn add_writer(pipe_id: usize) {
-    if let Some(Some(pipe)) = PIPES.get_mut().get_mut(pipe_id) {
+    if let Some(pipe) = PIPES.get_mut().get_mut(pipe_id) {
         pipe.writers += 1;
     }
 }
 
 pub fn close_read(pipe_id: usize) {
     let table = PIPES.get_mut();
-    if let Some(Some(pipe)) = table.get_mut(pipe_id) {
+    if let Some(pipe) = table.get_mut(pipe_id) {
         pipe.readers -= 1;
         if pipe.readers == 0 && pipe.writers == 0 {
-            table[pipe_id] = None;
+            table.remove(pipe_id);
         }
     }
 }
 
 pub fn close_write(pipe_id: usize) {
     let table = PIPES.get_mut();
-    if let Some(Some(pipe)) = table.get_mut(pipe_id) {
+    if let Some(pipe) = table.get_mut(pipe_id) {
         pipe.writers -= 1;
         if pipe.readers == 0 && pipe.writers == 0 {
-            table[pipe_id] = None;
+            table.remove(pipe_id);
         }
     }
 }

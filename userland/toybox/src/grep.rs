@@ -1,8 +1,6 @@
-use std::env;
 use std::io::{self, BufRead};
 
-fn main() {
-    let args: Vec<String> = env::args().skip(1).collect();
+pub fn main(args: Vec<String>) {
     if args.is_empty() {
         eprintln!("Usage: grep <pattern> [file...]");
         return;

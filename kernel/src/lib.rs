@@ -3,6 +3,7 @@
 extern crate alloc;
 
 pub mod sync;
+pub mod id_map;
 
 #[cfg(not(test))]
 pub mod arch;

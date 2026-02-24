@@ -17,7 +17,7 @@ const ENTRY_SIZE: u64 = 64;
 //   [32..64] reserved
 
 // ToC entry layout (64 bytes each, growing downward from end):
-//   [0]      flags (0=free, 1=in-use)
+//   [0]      type (0=free, 1=file, 2=symlink)
 //   [1..32]  name (null-terminated)
 //   [32..40] offset (byte offset of file data)
 //   [40..48] size (file size in bytes)
@@ -99,7 +99,7 @@ impl<D: Disk> SimpleFs<D> {
         let mut offset = self.toc_start;
         while offset + ENTRY_SIZE <= self.disk_size {
             let entry = self.read_entry(offset);
-            if entry[0] == 1 {
+            if entry[0] != 0 {
                 let end = entry[1..32].iter().position(|&b| b == 0).unwrap_or(31);
                 if &entry[1..1 + end] == name_bytes {
                     return Some(offset);
@@ -111,6 +111,27 @@ impl<D: Disk> SimpleFs<D> {
     }
 
     pub fn create(&mut self, name: &str, data: &[u8]) -> bool {
+        self.create_entry(name, 1, data)
+    }
+
+    pub fn create_symlink(&mut self, name: &str, target: &str) -> bool {
+        self.create_entry(name, 2, target.as_bytes())
+    }
+
+    pub fn read_link(&mut self, name: &str) -> Option<String> {
+        let entry_offset = self.find_entry(name)?;
+        let entry = self.read_entry(entry_offset);
+        if entry[0] != 2 {
+            return None;
+        }
+        let offset = u64::from_le_bytes(entry[32..40].try_into().unwrap());
+        let size = u64::from_le_bytes(entry[40..48].try_into().unwrap());
+        let mut buf = alloc::vec![0u8; size as usize];
+        self.disk.read(offset, &mut buf);
+        Some(String::from(core::str::from_utf8(&buf).ok()?))
+    }
+
+    fn create_entry(&mut self, name: &str, entry_type: u8, data: &[u8]) -> bool {
         let name_bytes = name.as_bytes();
         if name_bytes.len() > 30 {
             return false;
@@ -126,7 +147,7 @@ impl<D: Disk> SimpleFs<D> {
 
         let new_toc = self.toc_start - ENTRY_SIZE;
         let mut entry = [0u8; ENTRY_SIZE as usize];
-        entry[0] = 1;
+        entry[0] = entry_type;
         entry[1..1 + name_bytes.len()].copy_from_slice(name_bytes);
         entry[32..40].copy_from_slice(&file_offset.to_le_bytes());
         entry[40..48].copy_from_slice(&(data.len() as u64).to_le_bytes());
@@ -165,7 +186,7 @@ impl<D: Disk> SimpleFs<D> {
         let mut offset = self.toc_start;
         while offset + ENTRY_SIZE <= self.disk_size {
             let entry = self.read_entry(offset);
-            if entry[0] == 1 {
+            if entry[0] != 0 {
                 let end = entry[1..32].iter().position(|&b| b == 0).unwrap_or(31);
                 let name = core::str::from_utf8(&entry[1..1 + end])
                     .unwrap_or("")
@@ -268,6 +289,23 @@ mod tests {
 
         assert!(fs.create("big.txt", &[0xAA; 384]));
         assert!(!fs.create("nope.txt", b"x"));
+    }
+
+    #[test]
+    fn symlinks() {
+        let mut fs = make_fs();
+        assert!(fs.create("target.txt", b"real data"));
+        assert!(fs.create_symlink("link.txt", "target.txt"));
+
+        // read_link returns target for symlinks, None for regular files
+        assert_eq!(fs.read_link("link.txt").as_deref(), Some("target.txt"));
+        assert_eq!(fs.read_link("target.txt"), None);
+
+        // read_file on a symlink returns the raw target bytes (VFS resolves)
+        assert_eq!(fs.read_file("link.txt").as_deref(), Some(b"target.txt".as_slice()));
+
+        // Both show up in list
+        assert_eq!(fs.list().len(), 2);
     }
 
     #[test]

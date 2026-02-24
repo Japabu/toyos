@@ -25,9 +25,10 @@ impl tyfs::Disk for VecDisk {
     fn flush(&mut self) {}
 }
 
-pub fn create_initrd(files: &[(String, Vec<u8>)]) -> Vec<u8> {
-    let data_size: usize = files.iter().map(|(_, d)| d.len()).sum();
-    let toc_size = files.len() * 64;
+pub fn create_initrd(files: &[(String, Vec<u8>)], symlinks: &[(String, String)]) -> Vec<u8> {
+    let data_size: usize = files.iter().map(|(_, d)| d.len()).sum::<usize>()
+        + symlinks.iter().map(|(_, target)| target.len()).sum::<usize>();
+    let toc_size = (files.len() + symlinks.len()) * 64;
     let size = (64 + data_size + toc_size + 4095) & !4095;
     let size = size.max(4096);
 
@@ -38,6 +39,13 @@ pub fn create_initrd(files: &[(String, Vec<u8>)]) -> Vec<u8> {
         eprintln!("initrd: adding '{}' ({} bytes)", name, data.len());
         if !tyfs.create(name, data) {
             panic!("Failed to add '{}' to initrd image", name);
+        }
+    }
+
+    for (name, target) in symlinks {
+        eprintln!("initrd: symlink '{}' -> '{}'", name, target);
+        if !tyfs.create_symlink(name, target) {
+            panic!("Failed to add symlink '{}' -> '{}' to initrd image", name, target);
         }
     }
 

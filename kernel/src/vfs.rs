@@ -2,6 +2,7 @@ use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
+use hashbrown::{HashMap, HashSet};
 
 use crate::sync::SyncCell;
 
@@ -22,6 +23,7 @@ pub fn global() -> &'static mut Vfs {
 pub trait FileSystem {
     fn list(&mut self) -> Vec<(String, u64)>;
     fn read_file(&mut self, name: &str) -> Option<Vec<u8>>;
+    fn read_link(&mut self, name: &str) -> Option<String>;
     fn create(&mut self, name: &str, data: &[u8]) -> bool;
     fn delete(&mut self, name: &str) -> bool;
 }
@@ -33,6 +35,9 @@ impl<D: tyfs::Disk> FileSystem for tyfs::SimpleFs<D> {
     fn read_file(&mut self, name: &str) -> Option<Vec<u8>> {
         tyfs::SimpleFs::read_file(self, name)
     }
+    fn read_link(&mut self, name: &str) -> Option<String> {
+        tyfs::SimpleFs::read_link(self, name)
+    }
     fn create(&mut self, name: &str, data: &[u8]) -> bool {
         tyfs::SimpleFs::create(self, name, data)
     }
@@ -41,15 +46,10 @@ impl<D: tyfs::Disk> FileSystem for tyfs::SimpleFs<D> {
     }
 }
 
-struct Mount {
-    name: String,
-    fs: Box<dyn FileSystem>,
-}
-
 /// Virtual filesystem that dispatches to named mount points.
 /// Subdirectories are virtual — TYFS stores flat filenames with `/` separators.
 pub struct Vfs {
-    mounts: Vec<Mount>,
+    mounts: HashMap<String, Box<dyn FileSystem>>,
 }
 
 /// Normalize a path by resolving `.` and `..` components.
@@ -73,15 +73,12 @@ fn normalize(path: &str) -> String {
 impl Vfs {
     pub fn new() -> Self {
         Self {
-            mounts: Vec::new(),
+            mounts: HashMap::new(),
         }
     }
 
     pub fn mount(&mut self, name: &str, fs: Box<dyn FileSystem>) {
-        self.mounts.push(Mount {
-            name: String::from(name),
-            fs,
-        });
+        self.mounts.insert(String::from(name), fs);
     }
 
     /// Resolve a (possibly relative) path against the given cwd.
@@ -129,7 +126,7 @@ impl Vfs {
             return Some(String::from("/"));
         }
 
-        if self.find_mount(&mount).is_none() {
+        if !self.mounts.contains_key(&mount) {
             return None;
         }
 
@@ -139,8 +136,8 @@ impl Vfs {
 
         // Check if any files exist with this subdirectory prefix
         let prefix = format!("{}/", subdir);
-        if let Some(m) = self.find_mount_mut(&mount) {
-            if m.fs.list().iter().any(|(name, _)| name.starts_with(&prefix)) {
+        if let Some(fs) = self.mounts.get_mut(&mount) {
+            if fs.list().iter().any(|(name, _)| name.starts_with(&prefix)) {
                 return Some(format!("/{}/{}", mount, subdir));
             }
         }
@@ -159,15 +156,15 @@ impl Vfs {
         if mount.is_empty() {
             let names: Vec<(String, u64)> = self
                 .mounts
-                .iter()
-                .map(|m| (format!("{}/", m.name), 0))
+                .keys()
+                .map(|name| (format!("{}/", name), 0))
                 .collect();
             return Ok(names);
         }
 
-        let m = self.mounts.iter_mut().find(|m| m.name == mount)
+        let fs = self.mounts.get_mut(&mount)
             .ok_or("no such directory")?;
-        let all_files = m.fs.list();
+        let all_files = fs.list();
 
         let prefix = if subdir.is_empty() {
             String::new()
@@ -176,7 +173,7 @@ impl Vfs {
         };
 
         let mut result = Vec::new();
-        let mut seen_dirs: Vec<String> = Vec::new();
+        let mut seen_dirs = HashSet::new();
 
         for (name, size) in &all_files {
             let rest = if prefix.is_empty() {
@@ -189,8 +186,7 @@ impl Vfs {
 
             if let Some(slash_pos) = rest.find('/') {
                 let dir_name = format!("{}/", &rest[..slash_pos]);
-                if !seen_dirs.contains(&dir_name) {
-                    seen_dirs.push(dir_name.clone());
+                if seen_dirs.insert(dir_name.clone()) {
                     result.push((dir_name, 0));
                 }
             } else {
@@ -211,8 +207,13 @@ impl Vfs {
         if file.is_empty() {
             return None;
         }
-        let m = self.find_mount_mut(&mount)?;
-        m.fs.read_file(&file)
+        let fs = self.mounts.get_mut(&mount)?;
+        if let Some(target) = fs.read_link(&file) {
+            // Symlink target is resolved within the same mount
+            let resolved = format!("/{}/{}", mount, target);
+            return self.read_file(&resolved);
+        }
+        fs.read_file(&file)
     }
 
     pub fn write_file(&mut self, path: &str, data: &[u8]) -> bool {
@@ -220,9 +221,9 @@ impl Vfs {
         if file.is_empty() {
             return false;
         }
-        if let Some(m) = self.find_mount_mut(&mount) {
-            m.fs.delete(&file);
-            m.fs.create(&file, data)
+        if let Some(fs) = self.mounts.get_mut(&mount) {
+            fs.delete(&file);
+            fs.create(&file, data)
         } else {
             false
         }
@@ -233,22 +234,14 @@ impl Vfs {
         if file.is_empty() {
             return false;
         }
-        if let Some(m) = self.find_mount_mut(&mount) {
-            m.fs.delete(&file)
+        if let Some(fs) = self.mounts.get_mut(&mount) {
+            fs.delete(&file)
         } else {
             false
         }
     }
 
     pub fn mount_exists(&self, name: &str) -> bool {
-        self.find_mount(name).is_some()
-    }
-
-    fn find_mount(&self, name: &str) -> Option<&Mount> {
-        self.mounts.iter().find(|m| m.name == name)
-    }
-
-    fn find_mount_mut(&mut self, name: &str) -> Option<&mut Mount> {
-        self.mounts.iter_mut().find(|m| m.name == name)
+        self.mounts.contains_key(name)
     }
 }

@@ -5,6 +5,7 @@ use core::arch::{asm, naked_asm};
 
 use crate::arch::{gdt, paging, syscall};
 use crate::fd::{self, Descriptor, FdTable};
+use crate::id_map::IdMap;
 use crate::message::MessageQueue;
 use crate::sync::SyncCell;
 use crate::{elf, keyboard, log, pipe, symbols, user_heap, vfs};
@@ -72,14 +73,14 @@ pub struct Process {
 }
 
 struct ProcessTable {
-    procs: Vec<Option<Process>>,
-    current: usize,
+    procs: IdMap<u32, Process>,
+    current: u32,
 }
 
 impl ProcessTable {
     const fn new() -> Self {
         Self {
-            procs: Vec::new(),
+            procs: IdMap::new(),
             current: 0,
         }
     }
@@ -88,13 +89,12 @@ impl ProcessTable {
 static PROCESS_TABLE: SyncCell<ProcessTable> = SyncCell::new(ProcessTable::new());
 
 pub fn current_pid() -> u32 {
-    let table = PROCESS_TABLE.get();
-    table.procs[table.current].as_ref().unwrap().pid
+    PROCESS_TABLE.get().current
 }
 
 pub fn current() -> &'static mut Process {
     let table = PROCESS_TABLE.get_mut();
-    table.procs[table.current].as_mut().unwrap()
+    table.procs.get_mut(table.current).unwrap()
 }
 
 /// Initialize process 0 (init). Called from main after all kernel init.
@@ -110,10 +110,10 @@ pub fn init_process0(
     assert!(!ks_base.is_null(), "process 0: kernel stack alloc failed");
     let ks_top = ks_base as u64 + KERNEL_STACK_SIZE as u64;
 
-    let mut fds: FdTable = Vec::new();
-    fds.push(Some(Descriptor::SerialConsole)); // stdin
-    fds.push(Some(Descriptor::SerialConsole)); // stdout
-    fds.push(Some(Descriptor::SerialConsole)); // stderr
+    let mut fds = FdTable::new();
+    fds.insert_at(0, Descriptor::SerialConsole); // stdin
+    fds.insert_at(1, Descriptor::SerialConsole); // stdout
+    fds.insert_at(2, Descriptor::SerialConsole); // stderr
 
     // Set up kernel stack so context_switch's `ret` goes to the trampoline
     // that enters ring 3 via iretq.
@@ -133,7 +133,7 @@ pub fn init_process0(
 
     user_heap::init();
 
-    table.procs.push(Some(Process {
+    let pid = table.procs.insert(Process {
         pid: 0,
         state: ProcessState::Running,
         kernel_stack_base: ks_base,
@@ -148,8 +148,8 @@ pub fn init_process0(
         elf_layout,
         stack_base,
         stack_layout,
-    }));
-    table.current = 0;
+    });
+    table.current = pid;
 
     // Set SYSCALL_KERNEL_RSP and TSS.RSP0 to the top of process 0's kernel stack
     *syscall::SYSCALL_KERNEL_RSP.get_mut() = ks_top;
@@ -220,22 +220,14 @@ pub fn spawn(argv: &[&str], stdin_fd: u64, stdout_fd: u64) -> u64 {
     let ks_top = ks_base as u64 + KERNEL_STACK_SIZE as u64;
 
     let table = PROCESS_TABLE.get_mut();
-    let slot_idx = if let Some(i) = table.procs.iter().position(|p| p.is_none()) {
-        i
-    } else {
-        let i = table.procs.len();
-        table.procs.push(None);
-        i
-    };
-    let pid = slot_idx as u32;
-    let parent_pid = current_pid();
+    let parent_pid = table.current;
 
-    let mut child_fds: FdTable = Vec::new();
+    let mut child_fds = FdTable::new();
 
     // FD 0 (stdin)
     let src_fd = if stdin_fd != u64::MAX { stdin_fd } else { 0 };
-    let parent = table.procs[table.current].as_ref().unwrap();
-    let stdin_desc = match parent.fds.get(src_fd as usize).and_then(|s| s.as_ref()) {
+    let parent = table.procs.get(table.current).unwrap();
+    let stdin_desc = match parent.fds.get(src_fd) {
         Some(Descriptor::PipeRead(id)) => {
             pipe::add_reader(*id);
             Descriptor::PipeRead(*id)
@@ -247,12 +239,12 @@ pub fn spawn(argv: &[&str], stdin_fd: u64, stdout_fd: u64) -> u64 {
         Some(Descriptor::File(file)) => Descriptor::File(file.clone()),
         _ => Descriptor::SerialConsole,
     };
-    child_fds.push(Some(stdin_desc));
+    child_fds.insert_at(0, stdin_desc);
 
     // FD 1 (stdout)
     let src_fd = if stdout_fd != u64::MAX { stdout_fd } else { 1 };
-    let parent = table.procs[table.current].as_ref().unwrap();
-    let stdout_desc = match parent.fds.get(src_fd as usize).and_then(|s| s.as_ref()) {
+    let parent = table.procs.get(table.current).unwrap();
+    let stdout_desc = match parent.fds.get(src_fd) {
         Some(Descriptor::PipeWrite(id)) => {
             pipe::add_writer(*id);
             Descriptor::PipeWrite(*id)
@@ -277,11 +269,11 @@ pub fn spawn(argv: &[&str], stdin_fd: u64, stdout_fd: u64) -> u64 {
         Descriptor::File(file) => Descriptor::File(file.clone()),
         _ => Descriptor::SerialConsole,
     };
-    child_fds.push(Some(stdout_desc));
-    child_fds.push(Some(stderr_desc));
+    child_fds.insert_at(1, stdout_desc);
+    child_fds.insert_at(2, stderr_desc);
 
     // Inherit parent's cwd
-    let parent_cwd = table.procs[table.current].as_ref().unwrap().cwd.clone();
+    let parent_cwd = table.procs.get(table.current).unwrap().cwd.clone();
 
     // Set up kernel stack frame for context switch -> trampoline
     // Pop order: r15, r14, r13, r12, rbx, rbp, ret
@@ -296,10 +288,8 @@ pub fn spawn(argv: &[&str], stdin_fd: u64, stdout_fd: u64) -> u64 {
         *frame_ptr.add(6) = process_entry_trampoline as u64;
     }
 
-    log!("spawn: pid={} entry={:#x} stack={:#x}", pid, loaded.entry, sp);
-
-    table.procs[slot_idx] = Some(Process {
-        pid,
+    let pid = table.procs.insert(Process {
+        pid: 0, // placeholder, set below
         state: ProcessState::Ready,
         kernel_stack_base: ks_base,
         kernel_stack_layout: ks_layout,
@@ -314,6 +304,10 @@ pub fn spawn(argv: &[&str], stdin_fd: u64, stdout_fd: u64) -> u64 {
         stack_base,
         stack_layout,
     });
+    // Set the actual PID now that we know it
+    table.procs.get_mut(pid).unwrap().pid = pid;
+
+    log!("spawn: pid={} entry={:#x} stack={:#x}", pid, loaded.entry, sp);
 
     pid as u64
 }
@@ -321,8 +315,8 @@ pub fn spawn(argv: &[&str], stdin_fd: u64, stdout_fd: u64) -> u64 {
 /// Exit the current process.
 pub fn exit(code: i32) -> ! {
     let table = PROCESS_TABLE.get_mut();
-    let idx = table.current;
-    let proc = table.procs[idx].as_mut().unwrap();
+    let pid = table.current;
+    let proc = table.procs.get_mut(pid).unwrap();
 
     // Close all FDs
     fd::close_all(&mut proc.fds, vfs::global(), proc.pid);
@@ -339,16 +333,10 @@ pub fn exit(code: i32) -> ! {
     proc.state = ProcessState::Zombie(code);
 
     // Wake parent if blocked on WaitPid for us
-    let pid = proc.pid;
     if let Some(ppid) = proc.parent_pid {
-        for slot in table.procs.iter_mut() {
-            if let Some(p) = slot {
-                if p.pid == ppid {
-                    if p.state == ProcessState::BlockedWaitPid(pid) {
-                        p.state = ProcessState::Ready;
-                    }
-                    break;
-                }
+        if let Some(parent) = table.procs.get_mut(ppid) {
+            if parent.state == ProcessState::BlockedWaitPid(pid) {
+                parent.state = ProcessState::Ready;
             }
         }
     }
@@ -360,59 +348,56 @@ pub fn exit(code: i32) -> ! {
 /// Block the current process and switch to the next ready one.
 pub fn block(reason: ProcessState) {
     let table = PROCESS_TABLE.get_mut();
-    let idx = table.current;
-    table.procs[idx].as_mut().unwrap().state = reason;
+    table.procs.get_mut(table.current).unwrap().state = reason;
     schedule();
 }
 
 /// Cooperative yield: mark current as Ready, switch to next.
 pub fn yield_now() {
     let table = PROCESS_TABLE.get_mut();
-    let idx = table.current;
-    table.procs[idx].as_mut().unwrap().state = ProcessState::Ready;
+    table.procs.get_mut(table.current).unwrap().state = ProcessState::Ready;
     schedule();
 }
 
-/// Find next ready process and context switch to it.
+/// Find next ready process (round-robin by PID order) and context switch to it.
 pub fn schedule() {
     let table = PROCESS_TABLE.get_mut();
-    let old_idx = table.current;
+    let current_pid = table.current;
 
     loop {
-        let len = table.procs.len();
-        let start = (old_idx + 1) % len;
-        let mut found = None;
-        for i in 0..len {
-            let idx = (start + i) % len;
-            if let Some(proc) = &table.procs[idx] {
-                if proc.state == ProcessState::Ready {
-                    found = Some(idx);
-                    break;
+        // Round-robin: find smallest Ready PID > current, or wrap to smallest Ready PID
+        let mut best_after: Option<u32> = None;
+        let mut best_any: Option<u32> = None;
+        for (pid, proc) in table.procs.iter() {
+            if proc.state == ProcessState::Ready {
+                if pid > current_pid && best_after.map_or(true, |b| pid < b) {
+                    best_after = Some(pid);
+                }
+                if best_any.map_or(true, |b| pid < b) {
+                    best_any = Some(pid);
                 }
             }
         }
 
-        if let Some(new_idx) = found {
-            if new_idx == old_idx {
-                // Self-switch: just mark as Running and return
-                table.procs[old_idx].as_mut().unwrap().state = ProcessState::Running;
+        if let Some(new_pid) = best_after.or(best_any) {
+            if new_pid == current_pid {
+                table.procs.get_mut(current_pid).unwrap().state = ProcessState::Running;
                 return;
             }
 
             // Save current process's user heap
-            let old_proc = table.procs[old_idx].as_mut().unwrap();
-            old_proc.user_heap = user_heap::save();
+            table.procs.get_mut(current_pid).unwrap().user_heap = user_heap::save();
 
             // Switch to new process
-            table.procs[new_idx].as_mut().unwrap().state = ProcessState::Running;
-            table.current = new_idx;
+            table.procs.get_mut(new_pid).unwrap().state = ProcessState::Running;
+            table.current = new_pid;
 
-            let new_proc = table.procs[new_idx].as_ref().unwrap();
+            let new_proc = table.procs.get(new_pid).unwrap();
             let new_rsp = new_proc.kernel_rsp;
             let new_ks_top = new_proc.kernel_stack_base as u64 + KERNEL_STACK_SIZE as u64;
 
             // Restore new process's user heap
-            user_heap::restore(table.procs[new_idx].as_ref().unwrap().user_heap.clone());
+            user_heap::restore(new_proc.user_heap.clone());
 
             // Update TSS.RSP0 and SYSCALL_KERNEL_RSP
             *syscall::SYSCALL_KERNEL_RSP.get_mut() = new_ks_top;
@@ -421,7 +406,7 @@ pub fn schedule() {
             // Load symbols for crash diagnostics
             symbols::clear();
 
-            let old_rsp_ptr = &mut table.procs[old_idx].as_mut().unwrap().kernel_rsp as *mut u64;
+            let old_rsp_ptr = &mut table.procs.get_mut(current_pid).unwrap().kernel_rsp as *mut u64;
             unsafe { context_switch(old_rsp_ptr, new_rsp); }
             return;
         }
@@ -437,37 +422,35 @@ fn schedule_no_return() -> ! {
 
     loop {
         // Find any Ready process
-        for i in 0..table.procs.len() {
-            if let Some(proc) = &mut table.procs[i] {
-                if proc.state == ProcessState::Ready {
-                    proc.state = ProcessState::Running;
-                    table.current = i;
+        for (pid, proc) in table.procs.iter_mut() {
+            if proc.state == ProcessState::Ready {
+                proc.state = ProcessState::Running;
+                table.current = pid;
 
-                    let new_rsp = proc.kernel_rsp;
-                    let new_ks_top = proc.kernel_stack_base as u64 + KERNEL_STACK_SIZE as u64;
+                let new_rsp = proc.kernel_rsp;
+                let new_ks_top = proc.kernel_stack_base as u64 + KERNEL_STACK_SIZE as u64;
 
-                    user_heap::restore(proc.user_heap.clone());
+                user_heap::restore(proc.user_heap.clone());
 
-                    *syscall::SYSCALL_KERNEL_RSP.get_mut() = new_ks_top;
-                    unsafe { *gdt::tss_rsp0_ptr() = new_ks_top; }
+                *syscall::SYSCALL_KERNEL_RSP.get_mut() = new_ks_top;
+                unsafe { *gdt::tss_rsp0_ptr() = new_ks_top; }
 
-                    symbols::clear();
+                symbols::clear();
 
-                    // Jump without saving (same pop order as context_switch)
-                    unsafe {
-                        asm!(
-                            "mov rsp, {rsp}",
-                            "pop r15",
-                            "pop r14",
-                            "pop r13",
-                            "pop r12",
-                            "pop rbx",
-                            "pop rbp",
-                            "ret",
-                            rsp = in(reg) new_rsp,
-                            options(noreturn),
-                        );
-                    }
+                // Jump without saving (same pop order as context_switch)
+                unsafe {
+                    asm!(
+                        "mov rsp, {rsp}",
+                        "pop r15",
+                        "pop r14",
+                        "pop r13",
+                        "pop r12",
+                        "pop rbx",
+                        "pop rbp",
+                        "ret",
+                        rsp = in(reg) new_rsp,
+                        options(noreturn),
+                    );
                 }
             }
         }
@@ -483,47 +466,43 @@ fn idle_poll(table: &mut ProcessTable) {
     let kb_ready = keyboard::has_data();
 
     let mut zombie_pids: Vec<u32> = Vec::new();
-    for slot in table.procs.iter() {
-        if let Some(p) = slot {
-            if matches!(p.state, ProcessState::Zombie(_)) {
-                zombie_pids.push(p.pid);
-            }
+    for (_, proc) in table.procs.iter() {
+        if matches!(proc.state, ProcessState::Zombie(_)) {
+            zombie_pids.push(proc.pid);
         }
     }
 
-    for slot in table.procs.iter_mut() {
-        if let Some(proc) = slot {
-            match proc.state {
-                ProcessState::BlockedKeyboard if kb_ready => {
-                    proc.state = ProcessState::Ready;
-                }
-                ProcessState::BlockedPipeRead(id) if pipe::has_data(id) => {
-                    proc.state = ProcessState::Ready;
-                }
-                ProcessState::BlockedPipeWrite(_) => {
-                    proc.state = ProcessState::Ready;
-                }
-                ProcessState::BlockedWaitPid(child_pid) => {
-                    if zombie_pids.contains(&child_pid) {
-                        proc.state = ProcessState::Ready;
-                    }
-                }
-                ProcessState::BlockedPoll(fds_ptr, fds_len) => {
-                    let fds = unsafe {
-                        core::slice::from_raw_parts(fds_ptr as *const u64, fds_len as usize)
-                    };
-                    let any_fd_ready = fds.iter().any(|&fd| fd::has_data(&proc.fds, fd));
-                    if any_fd_ready || proc.messages.has_messages() {
-                        proc.state = ProcessState::Ready;
-                    }
-                }
-                ProcessState::BlockedRecvMsg => {
-                    if proc.messages.has_messages() {
-                        proc.state = ProcessState::Ready;
-                    }
-                }
-                _ => {}
+    for (_, proc) in table.procs.iter_mut() {
+        match proc.state {
+            ProcessState::BlockedKeyboard if kb_ready => {
+                proc.state = ProcessState::Ready;
             }
+            ProcessState::BlockedPipeRead(id) if pipe::has_data(id) => {
+                proc.state = ProcessState::Ready;
+            }
+            ProcessState::BlockedPipeWrite(_) => {
+                proc.state = ProcessState::Ready;
+            }
+            ProcessState::BlockedWaitPid(child_pid) => {
+                if zombie_pids.contains(&child_pid) {
+                    proc.state = ProcessState::Ready;
+                }
+            }
+            ProcessState::BlockedPoll(fds_ptr, fds_len) => {
+                let fds = unsafe {
+                    core::slice::from_raw_parts(fds_ptr as *const u64, fds_len as usize)
+                };
+                let any_fd_ready = fds.iter().any(|&fd| fd::has_data(&proc.fds, fd));
+                if any_fd_ready || proc.messages.has_messages() {
+                    proc.state = ProcessState::Ready;
+                }
+            }
+            ProcessState::BlockedRecvMsg => {
+                if proc.messages.has_messages() {
+                    proc.state = ProcessState::Ready;
+                }
+            }
+            _ => {}
         }
     }
 
@@ -533,42 +512,33 @@ fn idle_poll(table: &mut ProcessTable) {
 /// Send a message to a target process. Wakes the target if blocked.
 pub fn send_message(target_pid: u32, msg: crate::message::Message) -> bool {
     let table = PROCESS_TABLE.get_mut();
-    for slot in table.procs.iter_mut() {
-        if let Some(proc) = slot {
-            if proc.pid == target_pid {
-                proc.messages.push(msg);
-                match proc.state {
-                    ProcessState::BlockedRecvMsg | ProcessState::BlockedPoll(..) => {
-                        proc.state = ProcessState::Ready;
-                    }
-                    _ => {}
-                }
-                return true;
+    if let Some(proc) = table.procs.get_mut(target_pid) {
+        proc.messages.push(msg);
+        match proc.state {
+            ProcessState::BlockedRecvMsg | ProcessState::BlockedPoll(..) => {
+                proc.state = ProcessState::Ready;
             }
+            _ => {}
         }
+        true
+    } else {
+        false
     }
-    false
 }
 
 /// Collect a zombie child. Returns exit code, or None if not a zombie yet.
 pub fn collect_zombie(child_pid: u32) -> Option<i32> {
     let table = PROCESS_TABLE.get_mut();
-    for slot in table.procs.iter_mut() {
-        if let Some(proc) = slot {
-            if proc.pid == child_pid {
-                if let ProcessState::Zombie(code) = proc.state {
-                    // Free kernel stack
-                    let ks_base = proc.kernel_stack_base;
-                    let ks_layout = proc.kernel_stack_layout;
-                    unsafe { dealloc(ks_base, ks_layout); }
-                    *slot = None;
-                    return Some(code);
-                }
-                return None;
-            }
-        }
+    let proc = table.procs.get(child_pid)?;
+    if let ProcessState::Zombie(code) = proc.state {
+        let ks_base = proc.kernel_stack_base;
+        let ks_layout = proc.kernel_stack_layout;
+        table.procs.remove(child_pid);
+        unsafe { dealloc(ks_base, ks_layout); }
+        Some(code)
+    } else {
+        None
     }
-    None
 }
 
 /// Naked assembly context switch.
