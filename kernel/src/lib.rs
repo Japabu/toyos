@@ -14,6 +14,8 @@ pub mod allocator;
 #[cfg(not(test))]
 pub mod keyboard;
 #[cfg(not(test))]
+pub mod mouse;
+#[cfg(not(test))]
 pub mod ramdisk;
 #[cfg(not(test))]
 pub mod vfs;

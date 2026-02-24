@@ -17,6 +17,91 @@ const TITLE_BAR_COLOR: Color = Color { r: 0x33, g: 0x33, b: 0x33 };
 const BORDER_COLOR: Color = Color { r: 0x55, g: 0x55, b: 0x55 };
 const TITLE_TEXT_COLOR: Color = Color { r: 0xcc, g: 0xcc, b: 0xcc };
 
+const CURSOR_WIDTH: usize = 12;
+const CURSOR_HEIGHT: usize = 17;
+const CURSOR_SPRITE: [&[u8]; CURSOR_HEIGHT] = [
+    b"B...........",
+    b"BB..........",
+    b"BWB.........",
+    b"BWWB........",
+    b"BWWWB.......",
+    b"BWWWWB......",
+    b"BWWWWWB.....",
+    b"BWWWWWWB....",
+    b"BWWWWWWWB...",
+    b"BWWWWWWWWB..",
+    b"BWWWWWBBBBB.",
+    b"BWWBWWB.....",
+    b"BWBBWWB.....",
+    b"BB..BWWB....",
+    b"B...BWWB....",
+    b"....BWWB....",
+    b".....BB.....",
+];
+
+const MOUSE_FD: u64 = 4;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct MouseEvent {
+    buttons: u8,
+    dx: i8,
+    dy: i8,
+}
+
+struct Cursor {
+    x: i32,
+    y: i32,
+    saved_bg: Vec<Color>,
+    visible: bool,
+}
+
+impl Cursor {
+    fn new(x: i32, y: i32) -> Self {
+        Self {
+            x,
+            y,
+            saved_bg: vec![Color { r: 0, g: 0, b: 0 }; CURSOR_WIDTH * CURSOR_HEIGHT],
+            visible: false,
+        }
+    }
+
+    fn hide(&mut self, fb: &Framebuffer) {
+        if !self.visible { return; }
+        for cy in 0..CURSOR_HEIGHT {
+            for cx in 0..CURSOR_WIDTH {
+                let sx = self.x as usize + cx;
+                let sy = self.y as usize + cy;
+                fb.put_pixel(sx, sy, self.saved_bg[cy * CURSOR_WIDTH + cx]);
+            }
+        }
+        self.visible = false;
+    }
+
+    fn show(&mut self, fb: &Framebuffer) {
+        for cy in 0..CURSOR_HEIGHT {
+            for cx in 0..CURSOR_WIDTH {
+                let sx = self.x as usize + cx;
+                let sy = self.y as usize + cy;
+                self.saved_bg[cy * CURSOR_WIDTH + cx] = fb.read_pixel(sx, sy);
+            }
+        }
+        for cy in 0..CURSOR_HEIGHT {
+            let row = CURSOR_SPRITE[cy];
+            for cx in 0..CURSOR_WIDTH {
+                let sx = self.x as usize + cx;
+                let sy = self.y as usize + cy;
+                match row[cx] {
+                    b'B' => fb.put_pixel(sx, sy, Color { r: 0, g: 0, b: 0 }),
+                    b'W' => fb.put_pixel(sx, sy, Color { r: 255, g: 255, b: 255 }),
+                    _ => {}
+                }
+            }
+        }
+        self.visible = true;
+    }
+}
+
 #[repr(C)]
 struct FramebufferInfo {
     addr: u64,
@@ -87,9 +172,13 @@ fn main() {
     let stdout = std::io::stdout();
 
     let mut windows: Vec<WindowState> = Vec::new();
+    let screen_w = screen.width() as i32;
+    let screen_h = screen.height() as i32;
+    let mut cursor = Cursor::new(screen_w / 2, screen_h / 2);
+    cursor.show(&screen);
 
     loop {
-        let ready = io::poll(&[0, terminal_stdout_fd]);
+        let ready = io::poll(&[0, terminal_stdout_fd, MOUSE_FD]);
 
         if ready.fd(0) {
             let mut buf = [0u8; 64];
@@ -103,6 +192,22 @@ fn main() {
                     event.bytes[..n.min(16)].copy_from_slice(&buf[..n.min(16)]);
                     message::send(win.pid, Message::new(window::MSG_KEY_INPUT, event));
                 }
+            }
+        }
+
+        if ready.fd(2) {
+            let mut buf = [0u8; 3];
+            let n = io::read_fd(MOUSE_FD, &mut buf);
+            if n >= 3 {
+                let event = MouseEvent {
+                    buttons: buf[0],
+                    dx: buf[1] as i8,
+                    dy: buf[2] as i8,
+                };
+                cursor.hide(&screen);
+                cursor.x = (cursor.x + event.dx as i32).clamp(0, screen_w - 1);
+                cursor.y = (cursor.y + event.dy as i32).clamp(0, screen_h - 1);
+                cursor.show(&screen);
             }
         }
 
@@ -173,6 +278,7 @@ fn main() {
                 }
                 window::MSG_PRESENT => {
                     if let Some(win) = windows.iter().find(|w| w.pid == sender) {
+                        cursor.hide(&screen);
                         screen.blit(
                             win.content_x,
                             win.content_y,
@@ -180,6 +286,7 @@ fn main() {
                             win.height,
                             &win.buffer,
                         );
+                        cursor.show(&screen);
                     }
                 }
                 _ => {}

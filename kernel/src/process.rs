@@ -118,6 +118,7 @@ pub fn init_process0(
     if let Some(info) = fb_info {
         fds.push(Some(Descriptor::Framebuffer(info)));
     }
+    fds.push(Some(Descriptor::Mouse));
 
     // Set up kernel stack so context_switch's `ret` goes to the trampoline
     // that enters ring 3 via iretq.

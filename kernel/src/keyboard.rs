@@ -5,6 +5,45 @@ use alloc::vec::Vec;
 use crate::sync::SyncCell;
 
 static KEY_BUF: SyncCell<VecDeque<u8>> = SyncCell::new(VecDeque::new());
+static PREV_REPORT: SyncCell<[u8; 8]> = SyncCell::new([0; 8]);
+
+/// Process a HID boot protocol keyboard report (8 bytes).
+pub fn handle_report(report: &[u8]) {
+    let modifiers = report[0];
+    let shift = (modifiers & 0x22) != 0;
+    let ctrl = (modifiers & 0x11) != 0;
+    let alt = (modifiers & 0x44) != 0;
+    let prev = PREV_REPORT.get();
+
+    for i in 2..8 {
+        let keycode = report[i];
+        if keycode < 4 { continue; }
+        if !prev[2..8].contains(&keycode) {
+            match keycode {
+                0x4F => { handle_key(0x1B); handle_key(b'['); handle_key(b'C'); }
+                0x50 => { handle_key(0x1B); handle_key(b'['); handle_key(b'D'); }
+                0x51 => { handle_key(0x1B); handle_key(b'['); handle_key(b'B'); }
+                0x52 => { handle_key(0x1B); handle_key(b'['); handle_key(b'A'); }
+                0x4A => { handle_key(0x1B); handle_key(b'['); handle_key(b'H'); }
+                0x4D => { handle_key(0x1B); handle_key(b'['); handle_key(b'F'); }
+                0x4C => { handle_key(0x1B); handle_key(b'['); handle_key(b'3'); handle_key(b'~'); }
+                0x4B => { handle_key(0x1B); handle_key(b'['); handle_key(b'5'); handle_key(b'~'); }
+                0x4E => { handle_key(0x1B); handle_key(b'['); handle_key(b'6'); handle_key(b'~'); }
+                _ => {
+                    if ctrl && (0x04..=0x1D).contains(&keycode) {
+                        handle_key(keycode - 0x04 + 1);
+                    } else if let Some(bytes) = layout_lookup(keycode, shift, alt) {
+                        for &b in bytes {
+                            handle_key(b);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    PREV_REPORT.get_mut().copy_from_slice(&report[..8]);
+}
 
 pub fn handle_key(byte: u8) {
     if byte != 0 {

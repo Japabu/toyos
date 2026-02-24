@@ -2,7 +2,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::vfs::Vfs;
-use crate::{keyboard, log, pipe};
+use crate::{keyboard, mouse, log, pipe};
 use crate::drivers::serial;
 
 const O_WRITE: u64 = 2;
@@ -35,6 +35,7 @@ pub enum Descriptor {
     TtyRead(usize),
     TtyWrite(usize),
     Keyboard,
+    Mouse,
     SerialConsole,
     Framebuffer(FramebufferInfo),
 }
@@ -105,7 +106,7 @@ pub fn close(table: &mut FdTable, vfs: &mut Vfs, fd: u64) -> u64 {
         }
         Descriptor::PipeRead(id) | Descriptor::TtyRead(id) => pipe::close_read(id),
         Descriptor::PipeWrite(id) | Descriptor::TtyWrite(id) => pipe::close_write(id),
-        Descriptor::Keyboard | Descriptor::SerialConsole | Descriptor::Framebuffer(_) => {}
+        Descriptor::Keyboard | Descriptor::Mouse | Descriptor::SerialConsole | Descriptor::Framebuffer(_) => {}
     }
     0
 }
@@ -136,6 +137,22 @@ pub fn try_read(table: &mut FdTable, fd: u64, buf: &mut [u8]) -> Option<u64> {
                         break;
                     }
                 }
+                Some(count as u64)
+            } else {
+                None
+            }
+        }
+        Descriptor::Mouse => {
+            crate::drivers::xhci::poll_global();
+            if let Some(event) = mouse::try_read_event() {
+                let bytes = unsafe {
+                    core::slice::from_raw_parts(
+                        &event as *const mouse::MouseEvent as *const u8,
+                        core::mem::size_of::<mouse::MouseEvent>(),
+                    )
+                };
+                let count = buf.len().min(bytes.len());
+                buf[..count].copy_from_slice(&bytes[..count]);
                 Some(count as u64)
             } else {
                 None
@@ -183,7 +200,7 @@ pub fn try_write(table: &mut FdTable, fd: u64, buf: &[u8]) -> Option<u64> {
             serial_write_plain(buf);
             Some(buf.len() as u64)
         }
-        Descriptor::Keyboard | Descriptor::PipeRead(_) | Descriptor::TtyRead(_) | Descriptor::Framebuffer(_) => Some(u64::MAX),
+        Descriptor::Keyboard | Descriptor::Mouse | Descriptor::PipeRead(_) | Descriptor::TtyRead(_) | Descriptor::Framebuffer(_) => Some(u64::MAX),
     }
 }
 
@@ -208,6 +225,7 @@ pub fn fstat(table: &mut FdTable, fd: u64) -> u64 {
         Some(Descriptor::File(file)) => (1u64 << 32) | file.data.len() as u64,
         Some(Descriptor::PipeRead(_) | Descriptor::PipeWrite(_)) => 2u64 << 32,
         Some(Descriptor::Keyboard) => 3u64 << 32,
+        Some(Descriptor::Mouse) => 7u64 << 32,
         Some(Descriptor::SerialConsole) => 4u64 << 32,
         Some(Descriptor::Framebuffer(_)) => 5u64 << 32,
         Some(Descriptor::TtyRead(_) | Descriptor::TtyWrite(_)) => 6u64 << 32,
@@ -241,7 +259,7 @@ pub fn close_all(table: &mut FdTable, vfs: &mut Vfs) {
                 }
                 Descriptor::PipeRead(id) | Descriptor::TtyRead(id) => pipe::close_read(id),
                 Descriptor::PipeWrite(id) | Descriptor::TtyWrite(id) => pipe::close_write(id),
-                Descriptor::Keyboard | Descriptor::SerialConsole | Descriptor::Framebuffer(_) => {}
+                Descriptor::Keyboard | Descriptor::Mouse | Descriptor::SerialConsole | Descriptor::Framebuffer(_) => {}
             }
         }
     }
@@ -251,6 +269,7 @@ pub fn has_data(table: &FdTable, fd: u64) -> bool {
     match table.get(fd as usize).and_then(|s| s.as_ref()) {
         Some(Descriptor::PipeRead(id)) | Some(Descriptor::TtyRead(id)) => pipe::has_data(*id),
         Some(Descriptor::Keyboard) => keyboard::has_data(),
+        Some(Descriptor::Mouse) => mouse::has_data(),
         Some(Descriptor::File(_)) | Some(Descriptor::Framebuffer(_)) => true,
         _ => false,
     }

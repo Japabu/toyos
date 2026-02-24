@@ -45,6 +45,20 @@ impl Framebuffer {
         if self.pixel_format == PixelFormat::Rgb { 0 } else { 1 }
     }
 
+    pub fn read_pixel(&self, x: usize, y: usize) -> Color {
+        if x < self.width && y < self.height {
+            let pixel: [u8; 4] = unsafe {
+                ptr::read_volatile(self.addr.add((y * self.stride + x) * 4) as *const [u8; 4])
+            };
+            match self.pixel_format {
+                PixelFormat::Rgb => Color { r: pixel[0], g: pixel[1], b: pixel[2] },
+                PixelFormat::Bgr => Color { r: pixel[2], g: pixel[1], b: pixel[0] },
+            }
+        } else {
+            Color { r: 0, g: 0, b: 0 }
+        }
+    }
+
     pub fn put_pixel(&self, x: usize, y: usize, color: Color) {
         if x < self.width && y < self.height {
             let pixel = self.encode_pixel(color);

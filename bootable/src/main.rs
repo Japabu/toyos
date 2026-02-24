@@ -285,8 +285,9 @@ fn main() {
         .arg("-drive").arg("if=none,id=stick,format=raw,file=target/bootable.img")
         .arg("-device").arg("usb-storage,bus=xhci.0,drive=stick,bootindex=0")
 
-        // USB keyboard
+        // USB keyboard + mouse
         .arg("-device").arg("usb-kbd,bus=xhci.0")
+        .arg("-device").arg("usb-mouse,bus=xhci.0")
 
         // NVMe SSD
         .arg("-drive").arg("if=none,id=nvme0,format=raw,file=target/nvme.img")
