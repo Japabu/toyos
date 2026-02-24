@@ -8,7 +8,7 @@ use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
-use kernel::arch::{gdt, idt, paging, syscall};
+use kernel::arch::{apic, gdt, idt, paging, smp, syscall};
 use kernel::drivers::{acpi, nvme, pci, serial, xhci};
 use kernel::{allocator, clock, fd, log, pipe, process, ramdisk, symbols, vfs, KernelArgs, MemoryMapEntry};
 use tyfs::Disk;
@@ -60,6 +60,7 @@ fn kernel_main(
         allocator::Region { start: kernel_args.kernel_memory_addr, end: kernel_args.kernel_memory_addr + kernel_args.kernel_memory_size },
         allocator::Region { start: kernel_args.initrd_addr, end: kernel_args.initrd_addr + kernel_args.initrd_size },
         allocator::Region { start: kernel_args.kernel_elf_addr, end: kernel_args.kernel_elf_addr + kernel_args.kernel_elf_size },
+        allocator::Region { start: 0x8000, end: 0x9000 }, // AP trampoline page
     ];
     unsafe { allocator::init(maps, &reserved); }
 
@@ -133,6 +134,11 @@ fn kernel_main(
 
     syscall::init();
     log!("Ring 3: ready");
+
+    // Boot secondary CPUs
+    let madt = acpi::parse_madt(kernel_args.rsdp_addr).expect("ACPI: MADT not found");
+    apic::init(madt.local_apic_addr);
+    smp::boot_aps(&madt);
 
     // Initialize subsystems
     vfs::init();

@@ -41,6 +41,7 @@ fn main() {
                 break;
             }
             console.write_bytes(&buf[..n]);
+            std::io::stdout().lock().write_all(&buf[..n]).ok();
             window.present();
         }
 

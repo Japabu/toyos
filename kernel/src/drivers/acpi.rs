@@ -1,6 +1,12 @@
+use alloc::vec::Vec;
 use core::ptr::{read_unaligned, read_volatile};
 use core::sync::atomic::{AtomicU16, Ordering};
 use crate::log;
+
+pub struct MadtInfo {
+    pub local_apic_addr: u32,
+    pub apic_ids: Vec<u8>,
+}
 
 // ACPI table structure offsets
 const SDT_LENGTH: usize = 4;         // u32 table length at offset 4
@@ -123,6 +129,39 @@ pub fn find_hpet_base(rsdp_addr: u64) -> Option<u64> {
     let base = unsafe { read_unaligned(hpet.add(HPET_BASE_ADDR) as *const u64) };
     log!("ACPI: HPET at {:#x}", base);
     Some(base)
+}
+
+/// Parse MADT (signature "APIC") to discover Local APIC address and per-CPU APIC IDs.
+pub fn parse_madt(rsdp_addr: u64) -> Option<MadtInfo> {
+    let xsdt = get_xsdt_addr(rsdp_addr as *const u8);
+    let madt = find_table(xsdt, b"APIC")?;
+
+    let length = unsafe { read_unaligned(madt.add(SDT_LENGTH) as *const u32) } as usize;
+    let local_apic_addr = unsafe { read_unaligned(madt.add(36) as *const u32) };
+
+    let mut apic_ids = Vec::new();
+    let mut offset = 44; // variable-length entries start after 36B header + 4B LAPIC addr + 4B flags
+
+    while offset + 1 < length {
+        let entry_type = unsafe { read_volatile(madt.add(offset)) };
+        let entry_len = unsafe { read_volatile(madt.add(offset + 1)) } as usize;
+        if entry_len == 0 { break; }
+
+        // Type 0 = Processor Local APIC (8 bytes: type, len, proc_id, apic_id, flags)
+        if entry_type == 0 && entry_len >= 8 {
+            let apic_id = unsafe { read_volatile(madt.add(offset + 3)) };
+            let flags = unsafe { read_unaligned(madt.add(offset + 4) as *const u32) };
+            // Bit 0: Processor Enabled, Bit 1: Online Capable
+            if flags & 1 != 0 {
+                apic_ids.push(apic_id);
+            }
+        }
+
+        offset += entry_len;
+    }
+
+    log!("ACPI: MADT local_apic={:#x} cpus={:?}", local_apic_addr, apic_ids);
+    Some(MadtInfo { local_apic_addr, apic_ids })
 }
 
 /// Scan DSDT AML bytecode for the \_S5_ package and extract SLP_TYPa.
