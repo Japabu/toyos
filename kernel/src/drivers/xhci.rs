@@ -5,7 +5,7 @@ use super::mmio::Mmio;
 use super::pci::PciDevice;
 use super::DmaPool;
 use crate::{keyboard, mouse, log};
-use crate::sync::SyncCell;
+use crate::sync::Lock;
 
 // ---------------------------------------------------------------------------
 // xHCI Capability Register offsets (from BAR0)
@@ -140,7 +140,7 @@ impl TrbRing {
 //   Page 11: Mouse Interrupt Ring
 //   Page 12: Output Context (slot 3)
 const DMA_PAGES: usize = 13;
-static XHCI_DMA_POOL: SyncCell<DmaPool<DMA_PAGES>> = SyncCell::new(DmaPool::new());
+static XHCI_DMA_POOL: Lock<DmaPool<DMA_PAGES>> = Lock::new(DmaPool::new());
 
 fn dma_page(index: usize) -> u64 {
     XHCI_DMA_POOL.get().page_addr(index)
@@ -388,7 +388,7 @@ impl XhciController {
 // Global singleton (for sys_read polling)
 // ---------------------------------------------------------------------------
 
-static XHCI: SyncCell<Option<XhciController>> = SyncCell::new(None);
+static XHCI: Lock<Option<XhciController>> = Lock::new(None);
 
 pub fn set_global(ctrl: XhciController) {
     *XHCI.get_mut() = Some(ctrl);

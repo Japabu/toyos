@@ -2,7 +2,7 @@ use core::arch::asm;
 use core::mem::size_of;
 
 use super::cpu;
-use crate::sync::SyncCell;
+use crate::sync::Lock;
 
 // 64-bit TSS (104 bytes)
 #[repr(C, packed)]
@@ -18,7 +18,7 @@ pub struct Tss {
     iopb_offset: u16,
 }
 
-static TSS: SyncCell<Tss> = SyncCell::new(Tss {
+static TSS: Lock<Tss> = Lock::new(Tss {
     reserved0: 0,
     rsp0: 0,
     rsp1: 0,
@@ -43,7 +43,7 @@ struct Gdt {
 //   0x20: user code64   (DPL=3)
 //   0x28: TSS low       (filled at runtime)
 //   0x30: TSS high      (filled at runtime)
-static GDT: SyncCell<Gdt> = SyncCell::new(Gdt {
+static GDT: Lock<Gdt> = Lock::new(Gdt {
     entries: [
         0x0000_0000_0000_0000, // null
         0x00AF_9A00_0000_FFFF, // kernel code64: G=1, L=1, P=1, DPL=0, Execute/Read

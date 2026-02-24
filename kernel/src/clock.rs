@@ -2,15 +2,15 @@
 
 use crate::drivers::mmio::Mmio;
 use crate::log;
-use crate::sync::SyncCell;
+use crate::sync::Lock;
 
 // HPET register offsets
 const HPET_CAP: u64 = 0x000;   // General Capabilities and ID (64-bit, RO)
 const HPET_CFG: u64 = 0x010;   // General Configuration (64-bit, RW)
 const HPET_COUNTER: u64 = 0x0F0; // Main Counter Value (64-bit, RW)
 
-static HPET: SyncCell<Option<Mmio>> = SyncCell::new(None);
-static PERIOD_FS: SyncCell<u64> = SyncCell::new(0); // counter period in femtoseconds
+static HPET: Lock<Option<Mmio>> = Lock::new(None);
+static PERIOD_FS: Lock<u64> = Lock::new(0); // counter period in femtoseconds
 
 pub fn init(hpet_base: u64) {
     let hpet = Mmio::new(hpet_base);

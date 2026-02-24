@@ -1,5 +1,5 @@
 use alloc::collections::VecDeque;
-use crate::sync::SyncCell;
+use crate::sync::Lock;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -9,7 +9,7 @@ pub struct MouseEvent {
     pub dy: i8,
 }
 
-static MOUSE_BUF: SyncCell<VecDeque<MouseEvent>> = SyncCell::new(VecDeque::new());
+static MOUSE_BUF: Lock<VecDeque<MouseEvent>> = Lock::new(VecDeque::new());
 
 /// Process a HID boot protocol mouse report (3+ bytes).
 pub fn handle_report(report: &[u8]) {

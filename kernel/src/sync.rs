@@ -6,14 +6,14 @@ use core::cell::UnsafeCell;
 /// `#[repr(transparent)]` ensures layout matches `T`, so `#[no_mangle]` statics
 /// used from naked asm (SYSCALL_KERNEL_RSP, SYSCALL_USER_RSP) keep their layout.
 #[repr(transparent)]
-pub struct SyncCell<T>(UnsafeCell<T>);
+pub struct Lock<T>(UnsafeCell<T>);
 
-const _: () = assert!(size_of::<SyncCell<u64>>() == 8);
+const _: () = assert!(size_of::<Lock<u64>>() == 8);
 
 // SAFETY: Single-core kernel with no concurrent access.
-unsafe impl<T> Sync for SyncCell<T> {}
+unsafe impl<T> Sync for Lock<T> {}
 
-impl<T> SyncCell<T> {
+impl<T> Lock<T> {
     pub const fn new(val: T) -> Self {
         Self(UnsafeCell::new(val))
     }

@@ -7,7 +7,7 @@ use crate::{symbols, log};
 
 use alloc::format;
 
-use crate::sync::SyncCell;
+use crate::sync::Lock;
 
 // PIC ports
 const PIC1_CMD: u16 = 0x20;
@@ -57,7 +57,7 @@ struct Idt {
     entries: [IdtEntry; 256],
 }
 
-static IDT: SyncCell<Idt> = SyncCell::new(Idt {
+static IDT: Lock<Idt> = Lock::new(Idt {
     entries: [IdtEntry::EMPTY; 256],
 });
 
@@ -106,7 +106,7 @@ impl SavedRegs {
 }
 
 // Kernel base address for crash diagnostics
-static KERNEL_BASE: SyncCell<u64> = SyncCell::new(0);
+static KERNEL_BASE: Lock<u64> = Lock::new(0);
 
 pub fn set_kernel_base(base: u64) {
     *KERNEL_BASE.get_mut() = base;

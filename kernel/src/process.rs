@@ -2,12 +2,13 @@ use alloc::alloc::{alloc_zeroed, dealloc, Layout};
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::arch::{asm, naked_asm};
+use hashbrown::HashMap;
 
 use crate::arch::{gdt, paging, syscall};
 use crate::fd::{self, Descriptor, FdTable};
 use crate::id_map::IdMap;
 use crate::message::MessageQueue;
-use crate::sync::SyncCell;
+use crate::sync::Lock;
 use crate::{elf, keyboard, log, pipe, symbols, user_heap, vfs};
 
 const USER_STACK_SIZE: usize = 64 * 1024;
@@ -77,21 +78,42 @@ struct ProcessTable {
     current: u32,
 }
 
-static PROCESS_TABLE: SyncCell<Option<ProcessTable>> = SyncCell::new(None);
+impl ProcessTable {
+    fn new() -> Self {
+        Self { procs: IdMap::new(), current: 0 }
+    }
+}
 
-fn table() -> &'static mut ProcessTable {
-    PROCESS_TABLE.get_mut().get_or_insert_with(|| ProcessTable {
-        procs: IdMap::new(),
-        current: 0,
-    })
+static PROCESS_TABLE: Lock<Option<ProcessTable>> = Lock::new(None);
+static NAME_REGISTRY: Lock<Option<HashMap<String, u32>>> = Lock::new(None);
+
+pub fn init() {
+    *PROCESS_TABLE.get_mut() = Some(ProcessTable::new());
+    *NAME_REGISTRY.get_mut() = Some(HashMap::new());
+}
+
+fn table() -> &'static ProcessTable {
+    PROCESS_TABLE.get().as_ref().expect("process table not initialized")
+}
+
+fn table_mut() -> &'static mut ProcessTable {
+    PROCESS_TABLE.get_mut().as_mut().expect("process table not initialized")
+}
+
+fn names() -> &'static HashMap<String, u32> {
+    NAME_REGISTRY.get().as_ref().expect("name registry not initialized")
+}
+
+fn names_mut() -> &'static mut HashMap<String, u32> {
+    NAME_REGISTRY.get_mut().as_mut().expect("name registry not initialized")
 }
 
 pub fn current_pid() -> u32 {
     table().current
 }
 
-pub fn current() -> &'static mut Process {
-    let table = table();
+pub fn current_mut() -> &'static mut Process {
+    let table = table_mut();
     table.procs.get_mut(table.current).unwrap()
 }
 
@@ -101,7 +123,7 @@ pub fn init_process0(
     elf_base: *mut u8, elf_layout: Layout,
     stack_base: *mut u8, stack_layout: Layout,
 ) {
-    let table = table();
+    let table = table_mut();
 
     let ks_layout = Layout::from_size_align(KERNEL_STACK_SIZE, 4096).unwrap();
     let ks_base = unsafe { alloc_zeroed(ks_layout) };
@@ -183,7 +205,7 @@ pub fn spawn(argv: &[&str], stdin_fd: u64, stdout_fd: u64) -> u64 {
     let path = argv[0];
 
     // Load binary from VFS
-    let binary = match vfs::global().read_file(path) {
+    let binary = match vfs::global_mut().read_file(path) {
         Some(data) => data,
         None => return u64::MAX,
     };
@@ -217,7 +239,7 @@ pub fn spawn(argv: &[&str], stdin_fd: u64, stdout_fd: u64) -> u64 {
     }
     let ks_top = ks_base as u64 + KERNEL_STACK_SIZE as u64;
 
-    let table = table();
+    let table = table_mut();
     let parent_pid = table.current;
 
     let mut child_fds = FdTable::new();
@@ -312,12 +334,12 @@ pub fn spawn(argv: &[&str], stdin_fd: u64, stdout_fd: u64) -> u64 {
 
 /// Exit the current process.
 pub fn exit(code: i32) -> ! {
-    let table = table();
+    let table = table_mut();
     let pid = table.current;
     let proc = table.procs.get_mut(pid).unwrap();
 
     // Close all FDs
-    fd::close_all(&mut proc.fds, vfs::global(), proc.pid);
+    fd::close_all(&mut proc.fds, vfs::global_mut(), proc.pid);
 
     // Free user memory
     paging::unmap_user(proc.elf_base as u64, proc.elf_layout.size() as u64);
@@ -345,21 +367,21 @@ pub fn exit(code: i32) -> ! {
 
 /// Block the current process and switch to the next ready one.
 pub fn block(reason: ProcessState) {
-    let table = table();
+    let table = table_mut();
     table.procs.get_mut(table.current).unwrap().state = reason;
     schedule();
 }
 
 /// Cooperative yield: mark current as Ready, switch to next.
 pub fn yield_now() {
-    let table = table();
+    let table = table_mut();
     table.procs.get_mut(table.current).unwrap().state = ProcessState::Ready;
     schedule();
 }
 
 /// Find next ready process (round-robin by PID order) and context switch to it.
 pub fn schedule() {
-    let table = table();
+    let table = table_mut();
     let current_pid = table.current;
 
     loop {
@@ -416,7 +438,7 @@ pub fn schedule() {
 
 /// Schedule without saving current context (used by exit).
 fn schedule_no_return() -> ! {
-    let table = table();
+    let table = table_mut();
 
     loop {
         // Find any Ready process
@@ -509,7 +531,7 @@ fn idle_poll(table: &mut ProcessTable) {
 
 /// Send a message to a target process. Wakes the target if blocked.
 pub fn send_message(target_pid: u32, msg: crate::message::Message) -> bool {
-    let table = table();
+    let table = table_mut();
     if let Some(proc) = table.procs.get_mut(target_pid) {
         proc.messages.push(msg);
         match proc.state {
@@ -526,7 +548,7 @@ pub fn send_message(target_pid: u32, msg: crate::message::Message) -> bool {
 
 /// Collect a zombie child. Returns exit code, or None if not a zombie yet.
 pub fn collect_zombie(child_pid: u32) -> Option<i32> {
-    let table = table();
+    let table = table_mut();
     let proc = table.procs.get(child_pid)?;
     if let ProcessState::Zombie(code) = proc.state {
         let ks_base = proc.kernel_stack_base;
@@ -537,6 +559,19 @@ pub fn collect_zombie(child_pid: u32) -> Option<i32> {
     } else {
         None
     }
+}
+
+pub fn register_name(name: &str, pid: u32) -> bool {
+    let names = names_mut();
+    if names.contains_key(name) {
+        return false;
+    }
+    names.insert(String::from(name), pid);
+    true
+}
+
+pub fn find_pid(name: &str) -> Option<u32> {
+    names().get(name).copied()
 }
 
 /// Naked assembly context switch.

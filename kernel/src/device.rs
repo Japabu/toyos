@@ -1,18 +1,14 @@
-use alloc::string::String;
-use hashbrown::HashMap;
 use crate::fd::{Descriptor, FramebufferInfo};
-use crate::sync::SyncCell;
+use crate::sync::Lock;
 
 pub const DEVICE_KEYBOARD: u64 = 0;
 pub const DEVICE_MOUSE: u64 = 1;
 pub const DEVICE_FRAMEBUFFER: u64 = 2;
 
-static KEYBOARD_OWNER: SyncCell<Option<u32>> = SyncCell::new(None);
-static MOUSE_OWNER: SyncCell<Option<u32>> = SyncCell::new(None);
-static FRAMEBUFFER_OWNER: SyncCell<Option<u32>> = SyncCell::new(None);
-static FB_INFO: SyncCell<Option<FramebufferInfo>> = SyncCell::new(None);
-
-static NAME_REGISTRY: SyncCell<Option<HashMap<String, u32>>> = SyncCell::new(None);
+static KEYBOARD_OWNER: Lock<Option<u32>> = Lock::new(None);
+static MOUSE_OWNER: Lock<Option<u32>> = Lock::new(None);
+static FRAMEBUFFER_OWNER: Lock<Option<u32>> = Lock::new(None);
+static FB_INFO: Lock<Option<FramebufferInfo>> = Lock::new(None);
 
 pub fn set_framebuffer_info(info: FramebufferInfo) {
     *FB_INFO.get_mut() = Some(info);
@@ -73,15 +69,3 @@ pub fn release_descriptor(desc: &Descriptor, pid: u32) {
     }
 }
 
-pub fn register_name(name: &str, pid: u32) -> bool {
-    let registry = NAME_REGISTRY.get_mut().get_or_insert_with(HashMap::new);
-    if registry.contains_key(name) {
-        return false;
-    }
-    registry.insert(String::from(name), pid);
-    true
-}
-
-pub fn find_pid(name: &str) -> Option<u32> {
-    NAME_REGISTRY.get().as_ref()?.get(name).copied()
-}

@@ -2,10 +2,10 @@ use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use crate::sync::SyncCell;
+use crate::sync::Lock;
 
-static KEY_BUF: SyncCell<VecDeque<u8>> = SyncCell::new(VecDeque::new());
-static PREV_REPORT: SyncCell<[u8; 8]> = SyncCell::new([0; 8]);
+static KEY_BUF: Lock<VecDeque<u8>> = Lock::new(VecDeque::new());
+static PREV_REPORT: Lock<[u8; 8]> = Lock::new([0; 8]);
 
 /// Process a HID boot protocol keyboard report (8 bytes).
 pub fn handle_report(report: &[u8]) {
@@ -91,7 +91,7 @@ pub fn layout_lookup(usage: u8, shift: bool, alt: bool) -> Option<&'static [u8]>
     if bytes.is_empty() { None } else { Some(bytes) }
 }
 
-static ACTIVE_LAYOUT: SyncCell<usize> = SyncCell::new(0);
+static ACTIVE_LAYOUT: Lock<usize> = Lock::new(0);
 
 const LAYOUTS: &[&Layout] = &[&US_QWERTY, &SWISS_GERMAN_MAC];
 

@@ -4,7 +4,7 @@ use super::mmio::Mmio;
 use super::pci::PciDevice;
 use super::DmaPool;
 use crate::log;
-use crate::sync::SyncCell;
+use crate::sync::Lock;
 
 // NVMe register offsets (BAR0 MMIO)
 const REG_CAP: u64 = 0x00;
@@ -123,7 +123,7 @@ impl NvmeQueue {
 //   Page 4: Identify buffer (4096 bytes)
 //   Page 5: Data buffer (4096 bytes)
 const DMA_PAGES: usize = 6;
-static DMA_POOL: SyncCell<DmaPool<DMA_PAGES>> = SyncCell::new(DmaPool::new());
+static DMA_POOL: Lock<DmaPool<DMA_PAGES>> = Lock::new(DmaPool::new());
 
 fn dma_page(index: usize) -> u64 {
     DMA_POOL.get().page_addr(index)

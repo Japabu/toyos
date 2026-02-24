@@ -6,7 +6,7 @@ use elf::ElfBytes;
 use elf::endian::AnyEndian;
 use elf::abi::STT_FUNC;
 use crate::log;
-use crate::sync::SyncCell;
+use crate::sync::Lock;
 
 struct Symbol {
     addr: u64,
@@ -60,14 +60,14 @@ impl SymbolTable {
 }
 
 // Userland process symbols (cleared between process runs)
-static PROCESS_SYMS: SyncCell<SymbolTable> = SyncCell::new(SymbolTable::new());
+static PROCESS_SYMS: Lock<SymbolTable> = Lock::new(SymbolTable::new());
 // Kernel symbols (loaded once at boot, never cleared)
-static KERNEL_SYMS: SyncCell<SymbolTable> = SyncCell::new(SymbolTable::new());
+static KERNEL_SYMS: Lock<SymbolTable> = Lock::new(SymbolTable::new());
 // Memory range of loaded program (for backtrace address validation)
-static PROG_BASE: SyncCell<u64> = SyncCell::new(0);
-static PROG_END: SyncCell<u64> = SyncCell::new(0);
-static STACK_BASE: SyncCell<u64> = SyncCell::new(0);
-static STACK_END: SyncCell<u64> = SyncCell::new(0);
+static PROG_BASE: Lock<u64> = Lock::new(0);
+static PROG_END: Lock<u64> = Lock::new(0);
+static STACK_BASE: Lock<u64> = Lock::new(0);
+static STACK_END: Lock<u64> = Lock::new(0);
 
 pub fn clear() {
     PROCESS_SYMS.get_mut().clear();

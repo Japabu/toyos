@@ -5,7 +5,7 @@ use alloc::alloc::alloc_zeroed;
 
 use super::cpu;
 use crate::MemoryMapEntry;
-use crate::sync::SyncCell;
+use crate::sync::Lock;
 
 const PAGE_PRESENT: u64 = 1 << 0;
 const PAGE_WRITE: u64 = 1 << 1;
@@ -16,7 +16,7 @@ const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 const PAGE_4K: u64 = 4096;
 const PAGE_2M: u64 = 2 * 1024 * 1024;
 
-static PML4: SyncCell<*mut u64> = SyncCell::new(null_mut());
+static PML4: Lock<*mut u64> = Lock::new(null_mut());
 
 /// Allocate a zeroed, page-aligned 4KB page for page table structures.
 fn alloc_page() -> *mut u64 {

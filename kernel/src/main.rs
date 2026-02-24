@@ -10,7 +10,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use kernel::arch::{gdt, idt, paging, syscall};
 use kernel::drivers::{acpi, nvme, pci, serial, xhci};
-use kernel::{allocator, clock, fd, log, process, ramdisk, symbols, vfs, KernelArgs, MemoryMapEntry};
+use kernel::{allocator, clock, fd, log, pipe, process, ramdisk, symbols, vfs, KernelArgs, MemoryMapEntry};
 use tyfs::Disk;
 
 #[panic_handler]
@@ -134,14 +134,17 @@ fn kernel_main(
     syscall::init();
     log!("Ring 3: ready");
 
-    // Build VFS
-    let mut vfs = vfs::Vfs::new();
-    vfs.mount("initrd", Box::new(initrd_fs));
-    vfs.mount("nvme", Box::new(nvme_fs));
-    vfs::set_global(vfs);
+    // Initialize subsystems
+    vfs::init();
+    process::init();
+    pipe::init();
+
+    // Mount filesystems
+    vfs::global_mut().mount("initrd", Box::new(initrd_fs));
+    vfs::global_mut().mount("nvme", Box::new(nvme_fs));
 
     // Load keyboard layout from config
-    if let Some(data) = vfs::global().read_file("/nvme/config/keyboard_layout") {
+    if let Some(data) = vfs::global_mut().read_file("/nvme/config/keyboard_layout") {
         if let Ok(name) = core::str::from_utf8(&data) {
             let name = name.trim();
             kernel::keyboard::set_layout(name);
@@ -159,7 +162,7 @@ fn kernel_main(
         format!("/initrd/{}", cmd)
     };
     log!("init: running {}", path);
-    let data = vfs::global().read_file(&path)
+    let data = vfs::global_mut().read_file(&path)
         .unwrap_or_else(|| panic!("init: {} not found", path));
 
     // Load ELF, map user pages, set up stack

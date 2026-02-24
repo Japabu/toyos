@@ -5,12 +5,12 @@
 use alloc::alloc::{alloc_zeroed, Layout};
 use alloc::vec::Vec;
 use crate::arch::paging;
-use crate::sync::SyncCell;
+use crate::sync::Lock;
 
 const CHUNK_SIZE: usize = 1024 * 1024; // 1MB
 
 // Sorted list of free regions: (start, end)
-static FREE_LIST: SyncCell<Vec<(u64, u64)>> = SyncCell::new(Vec::new());
+static FREE_LIST: Lock<Vec<(u64, u64)>> = Lock::new(Vec::new());
 
 /// Reset the user heap. Called before executing a new program.
 pub fn init() {

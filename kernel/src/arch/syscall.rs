@@ -3,7 +3,7 @@ use core::arch::naked_asm;
 use alloc::vec::Vec;
 use super::{cpu, gdt};
 use crate::drivers::acpi;
-use crate::sync::SyncCell;
+use crate::sync::Lock;
 use crate::{device, fd, keyboard, log, message, pipe, process, user_heap, vfs};
 
 // MSR addresses
@@ -46,9 +46,9 @@ const SYS_FIND_PID: u64 = 33;
 
 // Kernel/user RSP storage for stack switching
 #[no_mangle]
-pub static SYSCALL_KERNEL_RSP: SyncCell<u64> = SyncCell::new(0);
+pub static SYSCALL_KERNEL_RSP: Lock<u64> = Lock::new(0);
 #[no_mangle]
-static SYSCALL_USER_RSP: SyncCell<u64> = SyncCell::new(0);
+static SYSCALL_USER_RSP: Lock<u64> = Lock::new(0);
 
 pub fn init() {
     let efer = cpu::rdmsr(MSR_EFER);
@@ -114,20 +114,20 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         SYS_OPEN => sys_open(a1, a2, a3),
         SYS_CLOSE => {
             let pid = process::current_pid();
-            let proc = process::current();
-            fd::close(&mut proc.fds, vfs::global(), a1, pid)
+            let proc = process::current_mut();
+            fd::close(&mut proc.fds, vfs::global_mut(), a1, pid)
         }
         SYS_SEEK => {
-            let proc = process::current();
+            let proc = process::current_mut();
             fd::seek(&mut proc.fds, a1, a2 as i64, a3)
         }
         SYS_FSTAT => {
-            let proc = process::current();
+            let proc = process::current_mut();
             fd::fstat(&mut proc.fds, a1)
         }
         SYS_FSYNC => {
-            let proc = process::current();
-            fd::fsync(&mut proc.fds, vfs::global(), a1)
+            let proc = process::current_mut();
+            fd::fsync(&mut proc.fds, vfs::global_mut(), a1)
         }
         SYS_READDIR => sys_readdir(a1, a2, a3, a4),
         SYS_DELETE => sys_delete(a1, a2),
@@ -140,7 +140,7 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         SYS_WAITPID => sys_waitpid(a1),
         SYS_POLL => sys_poll(a1, a2),
         SYS_MARK_TTY => {
-            let proc = process::current();
+            let proc = process::current_mut();
             fd::mark_tty(&mut proc.fds, a1)
         }
         SYS_SEND_MSG => sys_send_msg(a1, a2),
@@ -154,11 +154,11 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
 
 fn sys_write(fd_num: u64, buf: &[u8]) -> u64 {
     loop {
-        let proc = process::current();
+        let proc = process::current_mut();
         match fd::try_write(&mut proc.fds, fd_num, buf) {
             Some(n) => return n,
             None => {
-                let proc = process::current();
+                let proc = process::current_mut();
                 let reason = match proc.fds.get(fd_num) {
                     Some(fd::Descriptor::PipeWrite(id)) | Some(fd::Descriptor::TtyWrite(id)) =>
                         process::ProcessState::BlockedPipeWrite(*id),
@@ -172,11 +172,11 @@ fn sys_write(fd_num: u64, buf: &[u8]) -> u64 {
 
 fn sys_read(fd_num: u64, buf: &mut [u8]) -> u64 {
     loop {
-        let proc = process::current();
+        let proc = process::current_mut();
         match fd::try_read(&mut proc.fds, fd_num, buf) {
             Some(n) => return n,
             None => {
-                let proc = process::current();
+                let proc = process::current_mut();
                 let reason = match proc.fds.get(fd_num) {
                     Some(fd::Descriptor::Keyboard) => process::ProcessState::BlockedKeyboard,
                     Some(fd::Descriptor::PipeRead(id)) | Some(fd::Descriptor::TtyRead(id)) =>
@@ -192,10 +192,10 @@ fn sys_read(fd_num: u64, buf: &mut [u8]) -> u64 {
 fn sys_open(path_ptr: u64, path_len: u64, flags: u64) -> u64 {
     let slice = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, path_len as usize) };
     let Ok(path) = core::str::from_utf8(slice) else { return u64::MAX };
-    let proc = process::current();
-    let resolved = vfs::global().resolve_absolute(&proc.cwd, path);
-    let proc = process::current();
-    fd::open(&mut proc.fds, vfs::global(), &resolved, flags)
+    let proc = process::current_mut();
+    let resolved = vfs::global_mut().resolve_absolute(&proc.cwd, path);
+    let proc = process::current_mut();
+    fd::open(&mut proc.fds, vfs::global_mut(), &resolved, flags)
 }
 
 fn sys_exit(code: i32) -> u64 {
@@ -212,8 +212,8 @@ fn sys_readdir(path_ptr: u64, path_len: u64, buf_ptr: u64, buf_len: u64) -> u64 
     let slice = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, path_len as usize) };
     let Ok(path) = core::str::from_utf8(slice) else { return u64::MAX };
 
-    let cwd = process::current().cwd.clone();
-    let entries = match vfs::global().list(&cwd, path) {
+    let cwd = process::current_mut().cwd.clone();
+    let entries = match vfs::global_mut().list(&cwd, path) {
         Ok(e) => e,
         Err(_) => return u64::MAX,
     };
@@ -242,19 +242,19 @@ fn sys_readdir(path_ptr: u64, path_len: u64, buf_ptr: u64, buf_len: u64) -> u64 
 fn sys_delete(path_ptr: u64, path_len: u64) -> u64 {
     let slice = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, path_len as usize) };
     let Ok(path) = core::str::from_utf8(slice) else { return u64::MAX };
-    let cwd = process::current().cwd.clone();
-    let resolved = vfs::global().resolve_absolute(&cwd, path);
-    if vfs::global().delete(&resolved) { 0 } else { u64::MAX }
+    let cwd = process::current_mut().cwd.clone();
+    let resolved = vfs::global_mut().resolve_absolute(&cwd, path);
+    if vfs::global_mut().delete(&resolved) { 0 } else { u64::MAX }
 }
 
 fn sys_chdir(path_ptr: u64, path_len: u64) -> u64 {
     let slice = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, path_len as usize) };
     let Ok(path) = core::str::from_utf8(slice) else { return u64::MAX };
-    let proc = process::current();
+    let proc = process::current_mut();
     let cwd = proc.cwd.clone();
-    match vfs::global().cd(&cwd, path) {
+    match vfs::global_mut().cd(&cwd, path) {
         Some(new_cwd) => {
-            process::current().cwd = new_cwd;
+            process::current_mut().cwd = new_cwd;
             0
         }
         None => u64::MAX,
@@ -262,7 +262,7 @@ fn sys_chdir(path_ptr: u64, path_len: u64) -> u64 {
 }
 
 fn sys_getcwd(buf_ptr: u64, buf_len: u64) -> u64 {
-    let proc = process::current();
+    let proc = process::current_mut();
     let cwd = &proc.cwd;
     let len = cwd.len().min(buf_len as usize);
     let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, len) };
@@ -274,7 +274,7 @@ fn sys_set_keyboard_layout(name_ptr: u64, name_len: u64) -> u64 {
     let slice = unsafe { core::slice::from_raw_parts(name_ptr as *const u8, name_len as usize) };
     let Ok(name) = core::str::from_utf8(slice) else { return u64::MAX };
     if keyboard::set_layout(name) {
-        if !vfs::global().write_file("/nvme/config/keyboard_layout", name.as_bytes()) {
+        if !vfs::global_mut().write_file("/nvme/config/keyboard_layout", name.as_bytes()) {
             log!("warning: failed to persist keyboard layout");
         }
         0
@@ -285,7 +285,7 @@ fn sys_set_keyboard_layout(name_ptr: u64, name_len: u64) -> u64 {
 
 fn sys_pipe() -> u64 {
     let pipe_id = pipe::create();
-    let proc = process::current();
+    let proc = process::current_mut();
     let read_fd = fd::alloc(&mut proc.fds, fd::Descriptor::PipeRead(pipe_id));
     let write_fd = fd::alloc(&mut proc.fds, fd::Descriptor::PipeWrite(pipe_id));
     (read_fd << 32) | write_fd
@@ -312,7 +312,7 @@ fn sys_poll(fds_ptr: u64, fds_len: u64) -> u64 {
     let fds = unsafe { core::slice::from_raw_parts(fds_ptr as *const u64, fds_len as usize) };
     loop {
         crate::drivers::xhci::poll_global();
-        let proc = process::current();
+        let proc = process::current_mut();
         let mut mask: u64 = 0;
         for (i, &fd) in fds.iter().enumerate() {
             if fd::has_data(&proc.fds, fd) {
@@ -342,7 +342,7 @@ fn sys_send_msg(target_pid: u64, msg_ptr: u64) -> u64 {
 
 fn sys_recv_msg(msg_ptr: u64) -> u64 {
     loop {
-        let proc = process::current();
+        let proc = process::current_mut();
         if let Some(msg) = proc.messages.pop() {
             unsafe { *(msg_ptr as *mut message::Message) = msg; }
             return 0;
@@ -352,8 +352,8 @@ fn sys_recv_msg(msg_ptr: u64) -> u64 {
 }
 
 // Screen size globals (set during kernel init, font is always 8x16)
-static SCREEN_COLS: SyncCell<usize> = SyncCell::new(80);
-static SCREEN_ROWS: SyncCell<usize> = SyncCell::new(24);
+static SCREEN_COLS: Lock<usize> = Lock::new(80);
+static SCREEN_ROWS: Lock<usize> = Lock::new(24);
 
 pub fn set_screen_size(width: u32, height: u32) {
     *SCREEN_COLS.get_mut() = width as usize / 8;
@@ -372,7 +372,7 @@ fn sys_open_device(device_type: u64) -> u64 {
         Some(d) => d,
         None => return u64::MAX,
     };
-    let proc = process::current();
+    let proc = process::current_mut();
     fd::alloc(&mut proc.fds, desc)
 }
 
@@ -380,13 +380,13 @@ fn sys_register_name(name_ptr: u64, name_len: u64) -> u64 {
     let slice = unsafe { core::slice::from_raw_parts(name_ptr as *const u8, name_len as usize) };
     let Ok(name) = core::str::from_utf8(slice) else { return u64::MAX };
     let pid = process::current_pid();
-    if device::register_name(name, pid) { 0 } else { u64::MAX }
+    if process::register_name(name, pid) { 0 } else { u64::MAX }
 }
 
 fn sys_find_pid(name_ptr: u64, name_len: u64) -> u64 {
     let slice = unsafe { core::slice::from_raw_parts(name_ptr as *const u8, name_len as usize) };
     let Ok(name) = core::str::from_utf8(slice) else { return u64::MAX };
-    match device::find_pid(name) {
+    match process::find_pid(name) {
         Some(pid) => pid as u64,
         None => u64::MAX,
     }
