@@ -45,16 +45,16 @@ impl Pipe {
 
 static PIPES: Lock<Option<IdMap<usize, Pipe>>> = Lock::new(None);
 
-pub fn init() {
-    *PIPES.get_mut() = Some(IdMap::new());
-}
-
 fn pipes() -> &'static IdMap<usize, Pipe> {
-    PIPES.get().as_ref().expect("pipes not initialized")
+    unsafe { &*PIPES.data_ptr() }.as_ref().expect("pipes not initialized")
 }
 
 fn pipes_mut() -> &'static mut IdMap<usize, Pipe> {
-    PIPES.get_mut().as_mut().expect("pipes not initialized")
+    unsafe { &mut *PIPES.data_ptr() }.as_mut().expect("pipes not initialized")
+}
+
+pub fn init() {
+    *PIPES.lock() = Some(IdMap::new());
 }
 
 pub fn create() -> usize {
@@ -91,6 +91,10 @@ pub fn has_data(pipe_id: usize) -> bool {
         .map_or(false, |p| p.available() > 0 || p.writers == 0)
 }
 
+pub fn all_empty() -> bool {
+    pipes().iter().all(|(_, pipe)| pipe.available() == 0)
+}
+
 pub fn add_reader(pipe_id: usize) {
     if let Some(pipe) = pipes_mut().get_mut(pipe_id) {
         pipe.readers += 1;
@@ -104,21 +108,19 @@ pub fn add_writer(pipe_id: usize) {
 }
 
 pub fn close_read(pipe_id: usize) {
-    let table = pipes_mut();
-    if let Some(pipe) = table.get_mut(pipe_id) {
+    if let Some(pipe) = pipes_mut().get_mut(pipe_id) {
         pipe.readers -= 1;
         if pipe.readers == 0 && pipe.writers == 0 {
-            table.remove(pipe_id);
+            pipes_mut().remove(pipe_id);
         }
     }
 }
 
 pub fn close_write(pipe_id: usize) {
-    let table = pipes_mut();
-    if let Some(pipe) = table.get_mut(pipe_id) {
+    if let Some(pipe) = pipes_mut().get_mut(pipe_id) {
         pipe.writers -= 1;
         if pipe.readers == 0 && pipe.writers == 0 {
-            table.remove(pipe_id);
+            pipes_mut().remove(pipe_id);
         }
     }
 }

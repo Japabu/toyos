@@ -70,11 +70,11 @@ static STACK_BASE: Lock<u64> = Lock::new(0);
 static STACK_END: Lock<u64> = Lock::new(0);
 
 pub fn clear() {
-    PROCESS_SYMS.get_mut().clear();
-    *PROG_BASE.get_mut() = 0;
-    *PROG_END.get_mut() = 0;
-    *STACK_BASE.get_mut() = 0;
-    *STACK_END.get_mut() = 0;
+    PROCESS_SYMS.lock().clear();
+    *PROG_BASE.lock() = 0;
+    *PROG_END.lock() = 0;
+    *STACK_BASE.lock() = 0;
+    *STACK_END.lock() = 0;
 }
 
 /// Demangle a Rust symbol name (supports both legacy `_ZN...E` and v0 `_R...` mangling).
@@ -84,20 +84,20 @@ fn demangle(mangled: &str) -> String {
 
 /// Look up a symbol by runtime address (checks both process and kernel symbols).
 pub fn resolve(addr: u64) -> Option<(String, u64)> {
-    let process = PROCESS_SYMS.get();
+    let process = PROCESS_SYMS.lock();
     if let Some(result) = process.resolve(addr) {
         return Some(result);
     }
-    let kernel = KERNEL_SYMS.get();
+    let kernel = KERNEL_SYMS.lock();
     kernel.resolve(addr)
 }
 
 /// Check if an address is in user-accessible memory (program or stack).
 pub fn is_valid_user_addr(addr: u64) -> bool {
-    let prog_base = *PROG_BASE.get();
-    let prog_end = *PROG_END.get();
-    let stack_base = *STACK_BASE.get();
-    let stack_end = *STACK_END.get();
+    let prog_base = *PROG_BASE.lock();
+    let prog_end = *PROG_END.lock();
+    let stack_base = *STACK_BASE.lock();
+    let stack_end = *STACK_END.lock();
     (addr >= prog_base && addr < prog_end) || (addr >= stack_base && addr < stack_end)
 }
 
@@ -137,22 +137,22 @@ fn parse_symtab(data: &[u8], base: u64, table: &mut SymbolTable) {
 
 /// Load userland process symbols from raw ELF bytes.
 pub fn load_process(data: &[u8], base: u64) {
-    let table = PROCESS_SYMS.get_mut();
-    parse_symtab(data, base, table);
+    let mut table = PROCESS_SYMS.lock();
+    parse_symtab(data, base, &mut table);
     log!("symbols: loaded {} process symbols", table.symbols.len());
 }
 
 /// Load kernel symbols from raw ELF bytes. Called once at boot.
 pub fn load_kernel(data: &[u8], base: u64) {
-    let table = KERNEL_SYMS.get_mut();
-    parse_symtab(data, base, table);
+    let mut table = KERNEL_SYMS.lock();
+    parse_symtab(data, base, &mut table);
     log!("symbols: loaded {} kernel symbols", table.symbols.len());
 }
 
 /// Record the memory ranges of a loaded process for backtrace validation.
 pub fn set_process_ranges(prog_base: u64, prog_end: u64, stack_base: u64, stack_end: u64) {
-    *PROG_BASE.get_mut() = prog_base;
-    *PROG_END.get_mut() = prog_end;
-    *STACK_BASE.get_mut() = stack_base;
-    *STACK_END.get_mut() = stack_end;
+    *PROG_BASE.lock() = prog_base;
+    *PROG_END.lock() = prog_end;
+    *STACK_BASE.lock() = stack_base;
+    *STACK_END.lock() = stack_end;
 }

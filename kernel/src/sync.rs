@@ -1,32 +1,60 @@
 use core::cell::UnsafeCell;
+use core::ops::{Deref, DerefMut};
+use core::sync::atomic::{AtomicU32, Ordering};
 
-/// Interior-mutability cell for single-core kernel globals.
-///
-/// Safe because: single core, no preemption, interrupts masked during syscalls.
-/// `#[repr(transparent)]` ensures layout matches `T`, so `#[no_mangle]` statics
-/// used from naked asm (SYSCALL_KERNEL_RSP, SYSCALL_USER_RSP) keep their layout.
-#[repr(transparent)]
-pub struct Lock<T>(UnsafeCell<T>);
+/// Ticket spinlock. Provides mutual exclusion via `lock() -> LockGuard`.
+pub struct Lock<T> {
+    ticket: AtomicU32,
+    now: AtomicU32,
+    data: UnsafeCell<T>,
+}
 
-const _: () = assert!(size_of::<Lock<u64>>() == 8);
-
-// SAFETY: Single-core kernel with no concurrent access.
+// SAFETY: The ticket spinlock ensures exclusive access to T.
 unsafe impl<T> Sync for Lock<T> {}
 
 impl<T> Lock<T> {
     pub const fn new(val: T) -> Self {
-        Self(UnsafeCell::new(val))
+        Self {
+            ticket: AtomicU32::new(0),
+            now: AtomicU32::new(0),
+            data: UnsafeCell::new(val),
+        }
     }
 
-    pub fn get(&self) -> &T {
-        unsafe { &*self.0.get() }
+    pub fn lock(&self) -> LockGuard<'_, T> {
+        let my_ticket = self.ticket.fetch_add(1, Ordering::Relaxed);
+        while self.now.load(Ordering::Acquire) != my_ticket {
+            core::hint::spin_loop();
+        }
+        LockGuard { lock: self }
     }
 
-    pub fn get_mut(&self) -> &mut T {
-        unsafe { &mut *self.0.get() }
+    /// Raw pointer to the underlying data. Does not acquire the lock.
+    /// Only for statics that need a stable address for asm (GDT, TSS, IDT).
+    pub fn data_ptr(&self) -> *mut T {
+        self.data.get()
     }
+}
 
-    pub fn as_ptr(&self) -> *mut T {
-        self.0.get()
+pub struct LockGuard<'a, T> {
+    lock: &'a Lock<T>,
+}
+
+impl<T> Deref for LockGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        unsafe { &*self.lock.data.get() }
+    }
+}
+
+impl<T> DerefMut for LockGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        unsafe { &mut *self.lock.data.get() }
+    }
+}
+
+impl<T> Drop for LockGuard<'_, T> {
+    fn drop(&mut self) {
+        self.lock.now.fetch_add(1, Ordering::Release);
     }
 }

@@ -109,7 +109,7 @@ impl SavedRegs {
 static KERNEL_BASE: Lock<u64> = Lock::new(0);
 
 pub fn set_kernel_base(base: u64) {
-    *KERNEL_BASE.get_mut() = base;
+    *KERNEL_BASE.lock() = base;
 }
 
 /// Disable the legacy 8259 PIC. We don't use it (keyboard is USB, clock is HPET),
@@ -148,13 +148,17 @@ fn disable_pic() {
 pub fn init() {
     disable_pic();
 
-    IDT.get_mut().entries[6] = IdtEntry::new(ud_entry as u64);
-    IDT.get_mut().entries[13] = IdtEntry::new(gpf_entry as u64);
-    IDT.get_mut().entries[14] = IdtEntry::new(page_fault_entry as u64);
+    {
+        let mut idt = IDT.lock();
+        idt.entries[6] = IdtEntry::new(ud_entry as u64);
+        idt.entries[13] = IdtEntry::new(gpf_entry as u64);
+        idt.entries[14] = IdtEntry::new(page_fault_entry as u64);
+        idt.entries[0xFE] = IdtEntry::new(tlb_flush_entry as u64);
+    }
 
     let ptr = IdtPointer {
         limit: (core::mem::size_of::<Idt>() - 1) as u16,
-        base: IDT.as_ptr() as u64,
+        base: IDT.data_ptr() as u64,
     };
 
     unsafe {
@@ -163,12 +167,32 @@ pub fn init() {
     }
 }
 
+// --- TLB flush IPI handler (vector 0xFE) ---
+// Sent between CPUs after page table changes. Always arrives in kernel mode.
+// Writes EOI directly to LAPIC MMIO (lock-free) to avoid deadlock.
+#[unsafe(naked)]
+extern "C" fn tlb_flush_entry() {
+    naked_asm!(
+        "push rax",
+        "push rdx",
+        "mov rax, cr3",
+        "mov cr3, rax",                     // reload CR3 flushes TLB
+        "mov rdx, [rip + LAPIC_BASE]",      // load LAPIC base address
+        "mov dword ptr [rdx + 0xB0], 0",    // EOI = LAPIC_BASE + 0xB0
+        "pop rdx",
+        "pop rax",
+        "iretq",
+    );
+}
+
 // --- Exception entry stubs ---
-// For exceptions with error codes, the CPU pushes (on the kernel stack):
-//   [SS] [RSP] [RFLAGS] [CS] [RIP] [error_code] <- RSP
-// For exceptions WITHOUT error codes, we push a dummy 0 to unify the layout.
-// After saving all GPRs we have 21 qwords on stack (5 CPU + 1 error + 15 GPRs),
-// so RSP is 8-misaligned. `sub rsp, 8` fixes alignment before the call.
+// Exceptions from ring 3 need swapgs so kernel code sees the per-CPU GS base.
+// We check the saved CS on stack: if CPL was 3, do swapgs on entry.
+// The handler never returns (user: kill_process, kernel: halt), so no exit swapgs.
+//
+// Stack on entry (no error code): [RIP][CS][RFLAGS][RSP][SS]  — CS at [rsp+8]
+// Stack on entry (error code):    [err][RIP][CS][RFLAGS][RSP][SS] — CS at [rsp+16]
+//
 // Handler args: rdi=vector, rsi=regs_ptr, rdx=error_code, rcx=rip, r8=cs, r9=fault_addr
 
 macro_rules! exception_entry {
@@ -177,6 +201,10 @@ macro_rules! exception_entry {
         #[unsafe(naked)]
         extern "C" fn $name() {
             naked_asm!(
+                "test dword ptr [rsp + 8], 3",  // check saved CS RPL
+                "jz 1f",
+                "swapgs",
+                "1:",
                 "push 0", // dummy error code
                 "push r15", "push r14", "push r13", "push r12",
                 "push r11", "push r10", "push r9",  "push r8",
@@ -188,7 +216,7 @@ macro_rules! exception_entry {
                 "mov rcx, [rsp + 16*8]",
                 "mov r8,  [rsp + 17*8]",
                 "xor r9, r9",
-                "sub rsp, 8", // align stack to 16 bytes before call
+                "sub rsp, 8",
                 "call {handler}", "cli", "hlt",
                 handler = sym exception_handler,
             );
@@ -199,6 +227,10 @@ macro_rules! exception_entry {
         #[unsafe(naked)]
         extern "C" fn $name() {
             naked_asm!(
+                "test dword ptr [rsp + 16], 3",
+                "jz 1f",
+                "swapgs",
+                "1:",
                 "push r15", "push r14", "push r13", "push r12",
                 "push r11", "push r10", "push r9",  "push r8",
                 "push rbp", "push rdi", "push rsi", "push rdx",
@@ -209,7 +241,7 @@ macro_rules! exception_entry {
                 "mov rcx, [rsp + 16*8]",
                 "mov r8,  [rsp + 17*8]",
                 "xor r9, r9",
-                "sub rsp, 8", // align stack to 16 bytes before call
+                "sub rsp, 8",
                 "call {handler}", "cli", "hlt",
                 handler = sym exception_handler,
             );
@@ -220,6 +252,10 @@ macro_rules! exception_entry {
         #[unsafe(naked)]
         extern "C" fn $name() {
             naked_asm!(
+                "test dword ptr [rsp + 16], 3",
+                "jz 1f",
+                "swapgs",
+                "1:",
                 "push r15", "push r14", "push r13", "push r12",
                 "push r11", "push r10", "push r9",  "push r8",
                 "push rbp", "push rdi", "push rsi", "push rdx",
@@ -230,7 +266,7 @@ macro_rules! exception_entry {
                 "mov rcx, [rsp + 16*8]",
                 "mov r8,  [rsp + 17*8]",
                 "mov r9, cr2",
-                "sub rsp, 8", // align stack to 16 bytes before call
+                "sub rsp, 8",
                 "call {handler}", "cli", "hlt",
                 handler = sym exception_handler,
             );
@@ -248,7 +284,7 @@ fn format_addr(addr: u64) -> alloc::string::String {
     if let Some((name, offset)) = symbols::resolve(addr) {
         format!("{:#x}  {}+{:#x}", addr, name, offset)
     } else {
-        let kernel_base = *KERNEL_BASE.get();
+        let kernel_base = *KERNEL_BASE.lock();
         if kernel_base != 0 && addr >= kernel_base {
             format!("{:#x}  [kernel+{:#x}]", addr, addr - kernel_base)
         } else {

@@ -1,6 +1,7 @@
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
 use core::ptr::{null_mut, NonNull};
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use alloc::vec::Vec;
 
@@ -90,9 +91,11 @@ fn build_usable_regions(entries: &[MemoryMapEntry]) -> Vec<Region, &'static Aren
     merged
 }
 
-// --- Real allocator ---
+// --- Real allocator with internal spinlock ---
 
 struct RealAllocator {
+    ticket: AtomicU32,
+    now: AtomicU32,
     usable: UnsafeCell<Vec<Region, &'static Arena>>,
     reserved: UnsafeCell<Vec<Region, &'static Arena>>,
 }
@@ -102,37 +105,25 @@ unsafe impl Sync for RealAllocator {}
 impl RealAllocator {
     const fn new() -> Self {
         Self {
+            ticket: AtomicU32::new(0),
+            now: AtomicU32::new(0),
             usable: UnsafeCell::new(Vec::new_in(&ARENA)),
             reserved: UnsafeCell::new(Vec::new_in(&ARENA)),
         }
     }
-}
 
-fn align_up(val: u64, align: u64) -> u64 {
-    (val + align - 1) & !(align - 1)
-}
-
-fn merge_in_place(v: &mut Vec<Region, &'static Arena>) {
-    if v.len() < 2 { return; }
-    let mut write = 0;
-    for read in 1..v.len() {
-        if v[read].start <= v[write].end {
-            v[write].end = v[write].end.max(v[read].end);
-        } else {
-            write += 1;
-            v[write] = v[read];
+    fn acquire(&self) {
+        let my_ticket = self.ticket.fetch_add(1, Ordering::Relaxed);
+        while self.now.load(Ordering::Acquire) != my_ticket {
+            core::hint::spin_loop();
         }
     }
-    v.truncate(write + 1);
-}
 
-fn sorted_insert(v: &mut Vec<Region, &'static Arena>, region: Region) {
-    let pos = v.iter().position(|r| r.start > region.start).unwrap_or(v.len());
-    v.insert(pos, region);
-}
+    fn release(&self) {
+        self.now.fetch_add(1, Ordering::Release);
+    }
 
-unsafe impl GlobalAlloc for RealAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+    unsafe fn alloc_inner(&self, layout: Layout) -> *mut u8 {
         let usable = &*self.usable.get();
         let reserved = &mut *self.reserved.get();
         let size = layout.size() as u64;
@@ -172,7 +163,7 @@ unsafe impl GlobalAlloc for RealAllocator {
         null_mut()
     }
 
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+    unsafe fn dealloc_inner(&self, ptr: *mut u8, layout: Layout) {
         let reserved = &mut *self.reserved.get();
         let free_start = ptr as u64;
         let free_end = free_start + layout.size() as u64;
@@ -194,6 +185,44 @@ unsafe impl GlobalAlloc for RealAllocator {
                 return;
             }
         }
+    }
+}
+
+fn align_up(val: u64, align: u64) -> u64 {
+    (val + align - 1) & !(align - 1)
+}
+
+fn merge_in_place(v: &mut Vec<Region, &'static Arena>) {
+    if v.len() < 2 { return; }
+    let mut write = 0;
+    for read in 1..v.len() {
+        if v[read].start <= v[write].end {
+            v[write].end = v[write].end.max(v[read].end);
+        } else {
+            write += 1;
+            v[write] = v[read];
+        }
+    }
+    v.truncate(write + 1);
+}
+
+fn sorted_insert(v: &mut Vec<Region, &'static Arena>, region: Region) {
+    let pos = v.iter().position(|r| r.start > region.start).unwrap_or(v.len());
+    v.insert(pos, region);
+}
+
+unsafe impl GlobalAlloc for RealAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        self.acquire();
+        let result = self.alloc_inner(layout);
+        self.release();
+        result
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        self.acquire();
+        self.dealloc_inner(ptr, layout);
+        self.release();
     }
 }
 

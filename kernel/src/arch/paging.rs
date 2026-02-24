@@ -3,7 +3,7 @@ use core::ptr::null_mut;
 
 use alloc::alloc::alloc_zeroed;
 
-use super::cpu;
+use super::{apic, cpu};
 use crate::MemoryMapEntry;
 use crate::sync::Lock;
 
@@ -60,7 +60,7 @@ pub fn init(memory_map: &[MemoryMapEntry]) {
         addr += PAGE_2M;
     }
 
-    *PML4.get_mut() = pml4;
+    *PML4.lock() = pml4;
     unsafe { cpu::write_cr3(pml4 as u64) };
 }
 
@@ -102,7 +102,7 @@ unsafe fn split_2m(pd: *mut u64, pd_idx: usize) -> *mut u64 {
 /// Mark a physical address range as user-accessible (PRESENT | WRITE | USER).
 /// Splits 2MB large pages into 4KB pages as needed.
 pub fn map_user(addr: u64, size: u64) {
-    let pml4 = *PML4.get();
+    let pml4 = *PML4.lock();
     assert!(!pml4.is_null(), "paging: not initialized");
 
     let start = addr & !0xFFF;
@@ -145,14 +145,14 @@ pub fn map_user(addr: u64, size: u64) {
         cur += PAGE_4K;
     }
 
-    // Flush TLB
     cpu::flush_tlb();
+    apic::tlb_shootdown();
 }
 
 /// Identity-map an MMIO region as kernel-only using 2MB large pages.
 /// Call this before accessing PCI BARs that lie outside the initial mapping.
 pub fn map_kernel(addr: u64, size: u64) {
-    let pml4 = *PML4.get();
+    let pml4 = *PML4.lock();
     assert!(!pml4.is_null(), "paging: not initialized");
 
     let start = addr & !(PAGE_2M - 1); // round down to 2MB
@@ -176,13 +176,13 @@ pub fn map_kernel(addr: u64, size: u64) {
         cur += PAGE_2M;
     }
 
-    // Flush TLB
     cpu::flush_tlb();
+    apic::tlb_shootdown();
 }
 
 /// Remove user-accessible flag from a physical address range.
 pub fn unmap_user(addr: u64, size: u64) {
-    let pml4 = *PML4.get();
+    let pml4 = *PML4.lock();
     assert!(!pml4.is_null(), "paging: not initialized");
 
     let start = addr & !0xFFF;
@@ -219,6 +219,6 @@ pub fn unmap_user(addr: u64, size: u64) {
         cur += PAGE_4K;
     }
 
-    // Flush TLB
     cpu::flush_tlb();
+    apic::tlb_shootdown();
 }

@@ -14,18 +14,18 @@ static FREE_LIST: Lock<Vec<(u64, u64)>> = Lock::new(Vec::new());
 
 /// Reset the user heap. Called before executing a new program.
 pub fn init() {
-    FREE_LIST.get_mut().clear();
+    FREE_LIST.lock().clear();
     grow(CHUNK_SIZE);
 }
 
 /// Save current heap state (for nested exec).
 pub fn save() -> Vec<(u64, u64)> {
-    FREE_LIST.get_mut().clone()
+    FREE_LIST.lock().clone()
 }
 
 /// Restore saved heap state.
 pub fn restore(saved: Vec<(u64, u64)>) {
-    *FREE_LIST.get_mut() = saved;
+    *FREE_LIST.lock() = saved;
 }
 
 fn grow(min_size: usize) {
@@ -36,14 +36,14 @@ fn grow(min_size: usize) {
     paging::map_user(ptr as u64, size as u64);
     let start = ptr as u64;
     let end = start + size as u64;
-    let fl = FREE_LIST.get_mut();
+    let mut fl = FREE_LIST.lock();
     let pos = fl.iter().position(|&(s, _)| s > start).unwrap_or(fl.len());
     fl.insert(pos, (start, end));
 }
 
 /// First-fit search across free regions.
 fn try_alloc(size: u64, align: u64) -> Option<u64> {
-    let fl = FREE_LIST.get_mut();
+    let mut fl = FREE_LIST.lock();
     for i in 0..fl.len() {
         let (start, end) = fl[i];
         let aligned = (start + align - 1) & !(align - 1);
@@ -82,7 +82,7 @@ pub fn free(ptr: *mut u8, size: usize) {
     if ptr.is_null() || size == 0 { return; }
     let addr = ptr as u64;
     let end = addr + size as u64;
-    let fl = FREE_LIST.get_mut();
+    let mut fl = FREE_LIST.lock();
     let pos = fl.iter().position(|&(s, _)| s > addr).unwrap_or(fl.len());
     fl.insert(pos, (addr, end));
     // Merge with next

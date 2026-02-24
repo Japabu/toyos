@@ -23,8 +23,8 @@ pub fn init(hpet_base: u64) {
     let cfg = hpet.read_u64(HPET_CFG);
     hpet.write_u64(HPET_CFG, cfg | 1);
 
-    *HPET.get_mut() = Some(hpet);
-    *PERIOD_FS.get_mut() = period_fs;
+    *HPET.lock() = Some(hpet);
+    *PERIOD_FS.lock() = period_fs;
 
     let freq_hz = 1_000_000_000_000_000u64 / period_fs;
     log!("HPET: period={}fs freq={}Hz", period_fs, freq_hz);
@@ -32,9 +32,9 @@ pub fn init(hpet_base: u64) {
 
 /// Returns nanoseconds since HPET was enabled.
 pub fn nanos_since_boot() -> u64 {
-    let Some(hpet) = *HPET.get() else { return 0; };
+    let Some(hpet) = *HPET.lock() else { return 0; };
     let counter = hpet.read_u64(HPET_COUNTER);
-    let period_fs = *PERIOD_FS.get();
+    let period_fs = *PERIOD_FS.lock();
     // counter * period_fs gives femtoseconds; divide by 1_000_000 for nanoseconds
     // Use u128 to avoid overflow
     ((counter as u128 * period_fs as u128) / 1_000_000) as u64

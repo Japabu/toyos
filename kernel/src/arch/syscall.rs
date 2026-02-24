@@ -44,12 +44,6 @@ const SYS_OPEN_DEVICE: u64 = 31;
 const SYS_REGISTER_NAME: u64 = 32;
 const SYS_FIND_PID: u64 = 33;
 
-// Kernel/user RSP storage for stack switching
-#[no_mangle]
-pub static SYSCALL_KERNEL_RSP: Lock<u64> = Lock::new(0);
-#[no_mangle]
-static SYSCALL_USER_RSP: Lock<u64> = Lock::new(0);
-
 pub fn init() {
     let efer = cpu::rdmsr(MSR_EFER);
     cpu::wrmsr(MSR_EFER, efer | 1);
@@ -60,15 +54,17 @@ pub fn init() {
     cpu::wrmsr(MSR_FMASK, 0x200);
 }
 
-// syscall entry: save user RSP on kernel stack (survives context switches)
+// Syscall entry: swapgs to get kernel GS, use GS-relative kernel/user RSP.
+// PerCpu layout: offset 16 = kernel_rsp, offset 24 = user_rsp.
 #[unsafe(naked)]
 extern "C" fn syscall_entry() {
     naked_asm!(
-        "mov [rip + SYSCALL_USER_RSP], rsp",
-        "mov rsp, [rip + SYSCALL_KERNEL_RSP]",
-        "push [rip + SYSCALL_USER_RSP]",  // user RSP on kernel stack
-        "push rcx",         // return RIP
-        "push r11",         // return RFLAGS
+        "swapgs",
+        "mov gs:[24], rsp",     // save user RSP to percpu.user_rsp
+        "mov rsp, gs:[16]",     // load kernel RSP from percpu.kernel_rsp
+        "push gs:[24]",         // user RSP on kernel stack
+        "push rcx",             // return RIP
+        "push r11",             // return RFLAGS
         "push rdi",
         "push rsi",
         "push rdx",
@@ -84,7 +80,8 @@ extern "C" fn syscall_entry() {
         "pop rdi",
         "pop r11",
         "pop rcx",
-        "pop rsp",          // restore user RSP from kernel stack
+        "pop rsp",              // restore user RSP from kernel stack
+        "swapgs",
         "sysretq",
         handler = sym syscall_handler,
     );
@@ -112,26 +109,18 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         SYS_SCREEN_SIZE => screen_size(),
         SYS_CLOCK => crate::clock::nanos_since_boot(),
         SYS_OPEN => sys_open(a1, a2, a3),
-        SYS_CLOSE => {
-            let pid = process::current_pid();
-            let proc = process::current_mut();
-            fd::close(&mut proc.fds, vfs::global_mut(), a1, pid)
-        }
-        SYS_SEEK => {
-            let proc = process::current_mut();
-            fd::seek(&mut proc.fds, a1, a2 as i64, a3)
-        }
-        SYS_FSTAT => {
-            let proc = process::current_mut();
-            fd::fstat(&mut proc.fds, a1)
-        }
-        SYS_FSYNC => {
-            let proc = process::current_mut();
-            fd::fsync(&mut proc.fds, vfs::global_mut(), a1)
-        }
+        SYS_CLOSE => sys_close(a1),
+        SYS_SEEK => process::with_current_mut(|proc| fd::seek(&mut proc.fds, a1, a2 as i64, a3)),
+        SYS_FSTAT => process::with_current_mut(|proc| fd::fstat(&mut proc.fds, a1)),
+        SYS_FSYNC => process::with_current_mut(|proc| fd::fsync(&mut proc.fds, &mut *vfs::lock(), a1)),
         SYS_READDIR => sys_readdir(a1, a2, a3, a4),
         SYS_DELETE => sys_delete(a1, a2),
-        SYS_SHUTDOWN => { acpi::shutdown(); }
+        SYS_SHUTDOWN => {
+            while !pipe::all_empty() {
+                process::yield_now();
+            }
+            acpi::shutdown();
+        }
         SYS_CHDIR => sys_chdir(a1, a2),
         SYS_GETCWD => sys_getcwd(a1, a2),
         SYS_SET_KEYBOARD_LAYOUT => sys_set_keyboard_layout(a1, a2),
@@ -139,10 +128,7 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         SYS_SPAWN => sys_spawn(a1, a2, a3, a4),
         SYS_WAITPID => sys_waitpid(a1),
         SYS_POLL => sys_poll(a1, a2),
-        SYS_MARK_TTY => {
-            let proc = process::current_mut();
-            fd::mark_tty(&mut proc.fds, a1)
-        }
+        SYS_MARK_TTY => process::with_current_mut(|proc| fd::mark_tty(&mut proc.fds, a1)),
         SYS_SEND_MSG => sys_send_msg(a1, a2),
         SYS_RECV_MSG => sys_recv_msg(a1),
         SYS_OPEN_DEVICE => sys_open_device(a1),
@@ -154,17 +140,28 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
 
 fn sys_write(fd_num: u64, buf: &[u8]) -> u64 {
     loop {
-        let proc = process::current_mut();
-        match fd::try_write(&mut proc.fds, fd_num, buf) {
-            Some(n) => return n,
+        let result = process::with_current_mut(|proc| fd::try_write(&mut proc.fds, fd_num, buf));
+        match result {
+            Some(n) => {
+                let pipe_id = process::with_current(|proc| match proc.fds.get(fd_num) {
+                    Some(fd::Descriptor::PipeWrite(id)) | Some(fd::Descriptor::TtyWrite(id)) => Some(*id),
+                    _ => None,
+                });
+                if let Some(pipe_id) = pipe_id {
+                    process::wake_pipe_readers(pipe_id);
+                }
+                return n;
+            }
             None => {
-                let proc = process::current_mut();
-                let reason = match proc.fds.get(fd_num) {
+                let reason = process::with_current(|proc| match proc.fds.get(fd_num) {
                     Some(fd::Descriptor::PipeWrite(id)) | Some(fd::Descriptor::TtyWrite(id)) =>
-                        process::ProcessState::BlockedPipeWrite(*id),
-                    _ => return u64::MAX,
-                };
-                process::block(reason);
+                        Some(process::ProcessState::BlockedPipeWrite(*id)),
+                    _ => None,
+                });
+                match reason {
+                    Some(r) => process::block(r),
+                    None => return u64::MAX,
+                }
             }
         }
     }
@@ -172,18 +169,29 @@ fn sys_write(fd_num: u64, buf: &[u8]) -> u64 {
 
 fn sys_read(fd_num: u64, buf: &mut [u8]) -> u64 {
     loop {
-        let proc = process::current_mut();
-        match fd::try_read(&mut proc.fds, fd_num, buf) {
-            Some(n) => return n,
+        let result = process::with_current_mut(|proc| fd::try_read(&mut proc.fds, fd_num, buf));
+        match result {
+            Some(n) => {
+                let pipe_id = process::with_current(|proc| match proc.fds.get(fd_num) {
+                    Some(fd::Descriptor::PipeRead(id)) | Some(fd::Descriptor::TtyRead(id)) => Some(*id),
+                    _ => None,
+                });
+                if let Some(pipe_id) = pipe_id {
+                    process::wake_pipe_writers(pipe_id);
+                }
+                return n;
+            }
             None => {
-                let proc = process::current_mut();
-                let reason = match proc.fds.get(fd_num) {
-                    Some(fd::Descriptor::Keyboard) => process::ProcessState::BlockedKeyboard,
+                let reason = process::with_current(|proc| match proc.fds.get(fd_num) {
+                    Some(fd::Descriptor::Keyboard) => Some(process::ProcessState::BlockedKeyboard),
                     Some(fd::Descriptor::PipeRead(id)) | Some(fd::Descriptor::TtyRead(id)) =>
-                        process::ProcessState::BlockedPipeRead(*id),
-                    _ => return u64::MAX,
-                };
-                process::block(reason);
+                        Some(process::ProcessState::BlockedPipeRead(*id)),
+                    _ => None,
+                });
+                match reason {
+                    Some(r) => process::block(r),
+                    None => return u64::MAX,
+                }
             }
         }
     }
@@ -192,10 +200,29 @@ fn sys_read(fd_num: u64, buf: &mut [u8]) -> u64 {
 fn sys_open(path_ptr: u64, path_len: u64, flags: u64) -> u64 {
     let slice = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, path_len as usize) };
     let Ok(path) = core::str::from_utf8(slice) else { return u64::MAX };
-    let proc = process::current_mut();
-    let resolved = vfs::global_mut().resolve_absolute(&proc.cwd, path);
-    let proc = process::current_mut();
-    fd::open(&mut proc.fds, vfs::global_mut(), &resolved, flags)
+    let cwd = process::with_current(|p| p.cwd.clone());
+    let resolved = vfs::lock().resolve_absolute(&cwd, path);
+    process::with_current_mut(|proc| fd::open(&mut proc.fds, &mut *vfs::lock(), &resolved, flags))
+}
+
+fn sys_close(fd_num: u64) -> u64 {
+    let pid = process::current_pid();
+    let wake = process::with_current(|proc| match proc.fds.get(fd_num) {
+        Some(fd::Descriptor::PipeWrite(id)) | Some(fd::Descriptor::TtyWrite(id)) => Some((true, *id)),
+        Some(fd::Descriptor::PipeRead(id)) | Some(fd::Descriptor::TtyRead(id)) => Some((false, *id)),
+        _ => None,
+    });
+    let result = process::with_current_mut(|proc| {
+        fd::close(&mut proc.fds, &mut *vfs::lock(), fd_num, pid)
+    });
+    if let Some((is_write, pipe_id)) = wake {
+        if is_write {
+            process::wake_pipe_readers(pipe_id);
+        } else {
+            process::wake_pipe_writers(pipe_id);
+        }
+    }
+    result
 }
 
 fn sys_exit(code: i32) -> u64 {
@@ -212,8 +239,8 @@ fn sys_readdir(path_ptr: u64, path_len: u64, buf_ptr: u64, buf_len: u64) -> u64 
     let slice = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, path_len as usize) };
     let Ok(path) = core::str::from_utf8(slice) else { return u64::MAX };
 
-    let cwd = process::current_mut().cwd.clone();
-    let entries = match vfs::global_mut().list(&cwd, path) {
+    let cwd = process::with_current(|p| p.cwd.clone());
+    let entries = match vfs::lock().list(&cwd, path) {
         Ok(e) => e,
         Err(_) => return u64::MAX,
     };
@@ -242,19 +269,19 @@ fn sys_readdir(path_ptr: u64, path_len: u64, buf_ptr: u64, buf_len: u64) -> u64 
 fn sys_delete(path_ptr: u64, path_len: u64) -> u64 {
     let slice = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, path_len as usize) };
     let Ok(path) = core::str::from_utf8(slice) else { return u64::MAX };
-    let cwd = process::current_mut().cwd.clone();
-    let resolved = vfs::global_mut().resolve_absolute(&cwd, path);
-    if vfs::global_mut().delete(&resolved) { 0 } else { u64::MAX }
+    let cwd = process::with_current(|p| p.cwd.clone());
+    let mut vfs = vfs::lock();
+    let resolved = vfs.resolve_absolute(&cwd, path);
+    if vfs.delete(&resolved) { 0 } else { u64::MAX }
 }
 
 fn sys_chdir(path_ptr: u64, path_len: u64) -> u64 {
     let slice = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, path_len as usize) };
     let Ok(path) = core::str::from_utf8(slice) else { return u64::MAX };
-    let proc = process::current_mut();
-    let cwd = proc.cwd.clone();
-    match vfs::global_mut().cd(&cwd, path) {
+    let cwd = process::with_current(|p| p.cwd.clone());
+    match vfs::lock().cd(&cwd, path) {
         Some(new_cwd) => {
-            process::current_mut().cwd = new_cwd;
+            process::with_current_mut(|p| p.cwd = new_cwd);
             0
         }
         None => u64::MAX,
@@ -262,19 +289,20 @@ fn sys_chdir(path_ptr: u64, path_len: u64) -> u64 {
 }
 
 fn sys_getcwd(buf_ptr: u64, buf_len: u64) -> u64 {
-    let proc = process::current_mut();
-    let cwd = &proc.cwd;
-    let len = cwd.len().min(buf_len as usize);
-    let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, len) };
-    buf.copy_from_slice(&cwd.as_bytes()[..len]);
-    len as u64
+    process::with_current(|proc| {
+        let cwd = &proc.cwd;
+        let len = cwd.len().min(buf_len as usize);
+        let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, len) };
+        buf.copy_from_slice(&cwd.as_bytes()[..len]);
+        len as u64
+    })
 }
 
 fn sys_set_keyboard_layout(name_ptr: u64, name_len: u64) -> u64 {
     let slice = unsafe { core::slice::from_raw_parts(name_ptr as *const u8, name_len as usize) };
     let Ok(name) = core::str::from_utf8(slice) else { return u64::MAX };
     if keyboard::set_layout(name) {
-        if !vfs::global_mut().write_file("/nvme/config/keyboard_layout", name.as_bytes()) {
+        if !vfs::lock().write_file("/nvme/config/keyboard_layout", name.as_bytes()) {
             log!("warning: failed to persist keyboard layout");
         }
         0
@@ -285,10 +313,11 @@ fn sys_set_keyboard_layout(name_ptr: u64, name_len: u64) -> u64 {
 
 fn sys_pipe() -> u64 {
     let pipe_id = pipe::create();
-    let proc = process::current_mut();
-    let read_fd = fd::alloc(&mut proc.fds, fd::Descriptor::PipeRead(pipe_id));
-    let write_fd = fd::alloc(&mut proc.fds, fd::Descriptor::PipeWrite(pipe_id));
-    (read_fd << 32) | write_fd
+    process::with_current_mut(|proc| {
+        let read_fd = fd::alloc(&mut proc.fds, fd::Descriptor::PipeRead(pipe_id));
+        let write_fd = fd::alloc(&mut proc.fds, fd::Descriptor::PipeWrite(pipe_id));
+        (read_fd << 32) | write_fd
+    })
 }
 
 fn sys_spawn(argv_ptr: u64, argv_len: u64, stdin_fd: u64, stdout_fd: u64) -> u64 {
@@ -312,27 +341,30 @@ fn sys_poll(fds_ptr: u64, fds_len: u64) -> u64 {
     let fds = unsafe { core::slice::from_raw_parts(fds_ptr as *const u64, fds_len as usize) };
     loop {
         crate::drivers::xhci::poll_global();
-        let proc = process::current_mut();
-        let mut mask: u64 = 0;
-        for (i, &fd) in fds.iter().enumerate() {
-            if fd::has_data(&proc.fds, fd) {
-                mask |= 1 << i;
+        let result = process::with_current(|proc| {
+            let mut mask: u64 = 0;
+            for (i, &fd) in fds.iter().enumerate() {
+                if fd::has_data(&proc.fds, fd) {
+                    mask |= 1 << i;
+                }
             }
-        }
-        if proc.messages.has_messages() {
-            mask |= 1 << fds_len;
-        }
-        if mask != 0 {
-            return mask;
+            if proc.messages.has_messages() {
+                mask |= 1 << fds_len;
+            }
+            mask
+        });
+        if result != 0 {
+            return result;
         }
         process::block(process::ProcessState::BlockedPoll(fds_ptr, fds_len as u32));
     }
 }
 
 fn sys_send_msg(target_pid: u64, msg_ptr: u64) -> u64 {
+    let sender = process::current_pid();
     let user_msg = unsafe { &*(msg_ptr as *const message::Message) };
     let msg = message::Message {
-        sender: process::current_pid(),
+        sender,
         msg_type: user_msg.msg_type,
         data: user_msg.data,
         len: user_msg.len,
@@ -342,8 +374,8 @@ fn sys_send_msg(target_pid: u64, msg_ptr: u64) -> u64 {
 
 fn sys_recv_msg(msg_ptr: u64) -> u64 {
     loop {
-        let proc = process::current_mut();
-        if let Some(msg) = proc.messages.pop() {
+        let msg = process::with_current_mut(|proc| proc.messages.pop());
+        if let Some(msg) = msg {
             unsafe { *(msg_ptr as *mut message::Message) = msg; }
             return 0;
         }
@@ -356,13 +388,13 @@ static SCREEN_COLS: Lock<usize> = Lock::new(80);
 static SCREEN_ROWS: Lock<usize> = Lock::new(24);
 
 pub fn set_screen_size(width: u32, height: u32) {
-    *SCREEN_COLS.get_mut() = width as usize / 8;
-    *SCREEN_ROWS.get_mut() = height as usize / 16;
+    *SCREEN_COLS.lock() = width as usize / 8;
+    *SCREEN_ROWS.lock() = height as usize / 16;
 }
 
 fn screen_size() -> u64 {
-    let cols = *SCREEN_COLS.get() as u64;
-    let rows = *SCREEN_ROWS.get() as u64;
+    let cols = *SCREEN_COLS.lock() as u64;
+    let rows = *SCREEN_ROWS.lock() as u64;
     (rows << 32) | cols
 }
 
@@ -372,8 +404,7 @@ fn sys_open_device(device_type: u64) -> u64 {
         Some(d) => d,
         None => return u64::MAX,
     };
-    let proc = process::current_mut();
-    fd::alloc(&mut proc.fds, desc)
+    process::with_current_mut(|proc| fd::alloc(&mut proc.fds, desc))
 }
 
 fn sys_register_name(name_ptr: u64, name_len: u64) -> u64 {

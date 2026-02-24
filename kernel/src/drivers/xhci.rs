@@ -143,7 +143,7 @@ const DMA_PAGES: usize = 13;
 static XHCI_DMA_POOL: Lock<DmaPool<DMA_PAGES>> = Lock::new(DmaPool::new());
 
 fn dma_page(index: usize) -> u64 {
-    XHCI_DMA_POOL.get().page_addr(index)
+    XHCI_DMA_POOL.lock().page_addr(index)
 }
 
 // ---------------------------------------------------------------------------
@@ -391,11 +391,12 @@ impl XhciController {
 static XHCI: Lock<Option<XhciController>> = Lock::new(None);
 
 pub fn set_global(ctrl: XhciController) {
-    *XHCI.get_mut() = Some(ctrl);
+    *XHCI.lock() = Some(ctrl);
 }
 
 pub fn poll_global() {
-    if let Some(ctrl) = XHCI.get_mut() {
+    let mut guard = XHCI.lock();
+    if let Some(ctrl) = guard.as_mut() {
         ctrl.poll();
     }
 }

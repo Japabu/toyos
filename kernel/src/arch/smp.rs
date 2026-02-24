@@ -1,9 +1,9 @@
 use core::arch::global_asm;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use alloc::alloc::{alloc_zeroed, Layout};
 
-use crate::arch::apic;
+use crate::arch::{apic, percpu, syscall};
 use crate::clock;
 use crate::drivers::acpi::MadtInfo;
 use crate::log;
@@ -27,6 +27,7 @@ const AP_STACK_SIZE: usize = 64 * 1024;
 const DATA_OFFSET: usize = 0xF00;
 
 static AP_STARTED: AtomicBool = AtomicBool::new(false);
+static NEXT_CPU_ID: AtomicU32 = AtomicU32::new(1); // BSP is 0
 
 extern "C" {
     static _trampoline_start: u8;
@@ -132,7 +133,19 @@ pub fn boot_aps(madt: &MadtInfo) {
 }
 
 extern "C" fn ap_entry() -> ! {
-    log!("Hello from CPU (LAPIC ID {})", apic::id());
+    let lapic_id = apic::id();
+    let cpu_id = NEXT_CPU_ID.fetch_add(1, Ordering::Relaxed);
+
+    // Set up per-CPU data, GDT, and GS base
+    percpu::init_ap(cpu_id, lapic_id as u32);
+
+    // Enable syscall/sysret MSRs for this CPU
+    syscall::init();
+
+    // Enable this CPU's local APIC
+    apic::init_ap();
+
+    log!("Hello from CPU {} (LAPIC ID {})", cpu_id, lapic_id);
     AP_STARTED.store(true, Ordering::Release);
     loop {
         unsafe { core::arch::asm!("hlt", options(nomem, nostack)); }

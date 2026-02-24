@@ -8,7 +8,7 @@ use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
-use kernel::arch::{apic, gdt, idt, paging, smp, syscall};
+use kernel::arch::{apic, idt, paging, percpu, smp, syscall};
 use kernel::drivers::{acpi, nvme, pci, serial, xhci};
 use kernel::{allocator, clock, fd, log, pipe, process, ramdisk, symbols, vfs, KernelArgs, MemoryMapEntry};
 use tyfs::Disk;
@@ -122,8 +122,14 @@ fn kernel_main(
     paging::map_kernel(hpet_base, 0x1000);
     clock::init(hpet_base);
 
-    // Set up GDT and interrupts
-    gdt::init();
+    // Parse MADT and init LAPIC (needed for per-CPU setup)
+    let madt = acpi::parse_madt(kernel_args.rsdp_addr).expect("ACPI: MADT not found");
+    apic::init(madt.local_apic_addr);
+
+    // Per-CPU data + GDT for BSP
+    percpu::init_bsp(apic::id() as u32);
+
+    // IDT and syscall MSRs
     idt::init();
     idt::set_kernel_base(kernel_args.kernel_memory_addr);
 
@@ -136,8 +142,6 @@ fn kernel_main(
     log!("Ring 3: ready");
 
     // Boot secondary CPUs
-    let madt = acpi::parse_madt(kernel_args.rsdp_addr).expect("ACPI: MADT not found");
-    apic::init(madt.local_apic_addr);
     smp::boot_aps(&madt);
 
     // Initialize subsystems
@@ -146,11 +150,11 @@ fn kernel_main(
     pipe::init();
 
     // Mount filesystems
-    vfs::global_mut().mount("initrd", Box::new(initrd_fs));
-    vfs::global_mut().mount("nvme", Box::new(nvme_fs));
+    vfs::lock().mount("initrd", Box::new(initrd_fs));
+    vfs::lock().mount("nvme", Box::new(nvme_fs));
 
     // Load keyboard layout from config
-    if let Some(data) = vfs::global_mut().read_file("/nvme/config/keyboard_layout") {
+    if let Some(data) = vfs::lock().read_file("/nvme/config/keyboard_layout") {
         if let Ok(name) = core::str::from_utf8(&data) {
             let name = name.trim();
             kernel::keyboard::set_layout(name);
@@ -168,7 +172,7 @@ fn kernel_main(
         format!("/initrd/{}", cmd)
     };
     log!("init: running {}", path);
-    let data = vfs::global_mut().read_file(&path)
+    let data = vfs::lock().read_file(&path)
         .unwrap_or_else(|| panic!("init: {} not found", path));
 
     // Load ELF, map user pages, set up stack

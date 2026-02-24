@@ -4,7 +4,7 @@ use alloc::vec::Vec;
 use core::arch::{asm, naked_asm};
 use hashbrown::HashMap;
 
-use crate::arch::{gdt, paging, syscall};
+use crate::arch::{paging, percpu};
 use crate::fd::{self, Descriptor, FdTable};
 use crate::id_map::IdMap;
 use crate::message::MessageQueue;
@@ -88,33 +88,29 @@ static PROCESS_TABLE: Lock<Option<ProcessTable>> = Lock::new(None);
 static NAME_REGISTRY: Lock<Option<HashMap<String, u32>>> = Lock::new(None);
 
 pub fn init() {
-    *PROCESS_TABLE.get_mut() = Some(ProcessTable::new());
-    *NAME_REGISTRY.get_mut() = Some(HashMap::new());
-}
-
-fn table() -> &'static ProcessTable {
-    PROCESS_TABLE.get().as_ref().expect("process table not initialized")
-}
-
-fn table_mut() -> &'static mut ProcessTable {
-    PROCESS_TABLE.get_mut().as_mut().expect("process table not initialized")
-}
-
-fn names() -> &'static HashMap<String, u32> {
-    NAME_REGISTRY.get().as_ref().expect("name registry not initialized")
-}
-
-fn names_mut() -> &'static mut HashMap<String, u32> {
-    NAME_REGISTRY.get_mut().as_mut().expect("name registry not initialized")
+    *PROCESS_TABLE.lock() = Some(ProcessTable::new());
+    *NAME_REGISTRY.lock() = Some(HashMap::new());
 }
 
 pub fn current_pid() -> u32 {
-    table().current
+    PROCESS_TABLE.lock().as_ref().expect("process table not initialized").current
 }
 
-pub fn current_mut() -> &'static mut Process {
-    let table = table_mut();
-    table.procs.get_mut(table.current).unwrap()
+/// Access the current process immutably. The process table lock is held for
+/// the duration of the closure. The closure may acquire locks that come AFTER
+/// process_table in the ordering (vfs, pipes, keyboard, device, allocator).
+pub fn with_current<R>(f: impl FnOnce(&Process) -> R) -> R {
+    let guard = PROCESS_TABLE.lock();
+    let table = guard.as_ref().expect("process table not initialized");
+    f(table.procs.get(table.current).unwrap())
+}
+
+/// Access the current process mutably. Same lock ordering rules as with_current.
+pub fn with_current_mut<R>(f: impl FnOnce(&mut Process) -> R) -> R {
+    let mut guard = PROCESS_TABLE.lock();
+    let table = guard.as_mut().expect("process table not initialized");
+    let current = table.current;
+    f(table.procs.get_mut(current).unwrap())
 }
 
 /// Initialize process 0 (init). Called from main after all kernel init.
@@ -123,8 +119,6 @@ pub fn init_process0(
     elf_base: *mut u8, elf_layout: Layout,
     stack_base: *mut u8, stack_layout: Layout,
 ) {
-    let table = table_mut();
-
     let ks_layout = Layout::from_size_align(KERNEL_STACK_SIZE, 4096).unwrap();
     let ks_base = unsafe { alloc_zeroed(ks_layout) };
     assert!(!ks_base.is_null(), "process 0: kernel stack alloc failed");
@@ -138,8 +132,6 @@ pub fn init_process0(
     // Set up kernel stack so context_switch's `ret` goes to the trampoline
     // that enters ring 3 via iretq.
     // context_switch pops: r15, r14, r13, r12, rbx, rbp, then ret.
-    // Stack at frame_ptr (RSP points here, lowest address):
-    //   [0] r15, [1] r14, [2] r13, [3] r12, [4] rbx, [5] rbp, [6] ret_addr
     let frame_ptr = (ks_top - 7 * 8) as *mut u64;
     unsafe {
         *frame_ptr.add(0) = 0; // r15
@@ -153,39 +145,39 @@ pub fn init_process0(
 
     user_heap::init();
 
-    let pid = table.procs.insert(Process {
-        pid: 0,
-        state: ProcessState::Running,
-        kernel_stack_base: ks_base,
-        kernel_stack_layout: ks_layout,
-        kernel_rsp: frame_ptr as u64,
-        fds,
-        user_heap: Vec::new(),
-        messages: MessageQueue::new(),
-        cwd: String::from("/"),
-        parent_pid: None,
-        elf_base,
-        elf_layout,
-        stack_base,
-        stack_layout,
-    });
-    table.current = pid;
+    {
+        let mut guard = PROCESS_TABLE.lock();
+        let table = guard.as_mut().expect("process table not initialized");
+        let pid = table.procs.insert(Process {
+            pid: 0,
+            state: ProcessState::Running,
+            kernel_stack_base: ks_base,
+            kernel_stack_layout: ks_layout,
+            kernel_rsp: frame_ptr as u64,
+            fds,
+            user_heap: Vec::new(),
+            messages: MessageQueue::new(),
+            cwd: String::from("/"),
+            parent_pid: None,
+            elf_base,
+            elf_layout,
+            stack_base,
+            stack_layout,
+        });
+        table.current = pid;
+    }
 
-    // Set SYSCALL_KERNEL_RSP and TSS.RSP0 to the top of process 0's kernel stack
-    *syscall::SYSCALL_KERNEL_RSP.get_mut() = ks_top;
-    unsafe { *gdt::tss_rsp0_ptr() = ks_top; }
+    unsafe { percpu::set_kernel_stack(ks_top); }
 
     // Context switch to process 0 (starts the trampoline)
     let mut dummy_rsp: u64 = 0;
-    let new_rsp = frame_ptr as u64;
-    unsafe {
-        context_switch(&mut dummy_rsp, new_rsp);
-    }
+    unsafe { context_switch(&mut dummy_rsp, frame_ptr as u64); }
     // Never returns
 }
 
 /// Trampoline for new processes. Entered via context_switch's `ret`.
 /// r12 = entry point, r13 = user stack pointer.
+/// swapgs before iretq: kernel→user GS transition.
 #[unsafe(naked)]
 extern "C" fn process_entry_trampoline() {
     naked_asm!(
@@ -194,6 +186,7 @@ extern "C" fn process_entry_trampoline() {
         "push 0x202",       // RFLAGS: IF=1
         "push 0x23",        // CS: user_code | RPL=3
         "push r12",         // RIP: entry point
+        "swapgs",
         "iretq",
     );
 }
@@ -204,8 +197,8 @@ extern "C" fn process_entry_trampoline() {
 pub fn spawn(argv: &[&str], stdin_fd: u64, stdout_fd: u64) -> u64 {
     let path = argv[0];
 
-    // Load binary from VFS
-    let binary = match vfs::global_mut().read_file(path) {
+    // Load binary from VFS (no process table lock needed)
+    let binary = match vfs::lock().read_file(path) {
         Some(data) => data,
         None => return u64::MAX,
     };
@@ -239,15 +232,28 @@ pub fn spawn(argv: &[&str], stdin_fd: u64, stdout_fd: u64) -> u64 {
     }
     let ks_top = ks_base as u64 + KERNEL_STACK_SIZE as u64;
 
-    let table = table_mut();
+    // Set up kernel stack frame for context switch -> trampoline
+    let frame_ptr = (ks_top - 7 * 8) as *mut u64;
+    unsafe {
+        *frame_ptr.add(0) = 0; // r15
+        *frame_ptr.add(1) = 0; // r14
+        *frame_ptr.add(2) = sp; // r13 = user stack
+        *frame_ptr.add(3) = loaded.entry; // r12 = entry
+        *frame_ptr.add(4) = 0; // rbx
+        *frame_ptr.add(5) = 0; // rbp
+        *frame_ptr.add(6) = process_entry_trampoline as u64;
+    }
+
+    // Lock process table to read parent and create child
+    let mut guard = PROCESS_TABLE.lock();
+    let table = guard.as_mut().expect("process table not initialized");
     let parent_pid = table.current;
 
     let mut child_fds = FdTable::new();
 
     // FD 0 (stdin)
     let src_fd = if stdin_fd != u64::MAX { stdin_fd } else { 0 };
-    let parent = table.procs.get(table.current).unwrap();
-    let stdin_desc = match parent.fds.get(src_fd) {
+    let stdin_desc = match table.procs.get(parent_pid).unwrap().fds.get(src_fd) {
         Some(Descriptor::PipeRead(id)) => {
             pipe::add_reader(*id);
             Descriptor::PipeRead(*id)
@@ -263,8 +269,7 @@ pub fn spawn(argv: &[&str], stdin_fd: u64, stdout_fd: u64) -> u64 {
 
     // FD 1 (stdout)
     let src_fd = if stdout_fd != u64::MAX { stdout_fd } else { 1 };
-    let parent = table.procs.get(table.current).unwrap();
-    let stdout_desc = match parent.fds.get(src_fd) {
+    let stdout_desc = match table.procs.get(parent_pid).unwrap().fds.get(src_fd) {
         Some(Descriptor::PipeWrite(id)) => {
             pipe::add_writer(*id);
             Descriptor::PipeWrite(*id)
@@ -293,20 +298,7 @@ pub fn spawn(argv: &[&str], stdin_fd: u64, stdout_fd: u64) -> u64 {
     child_fds.insert_at(2, stderr_desc);
 
     // Inherit parent's cwd
-    let parent_cwd = table.procs.get(table.current).unwrap().cwd.clone();
-
-    // Set up kernel stack frame for context switch -> trampoline
-    // Pop order: r15, r14, r13, r12, rbx, rbp, ret
-    let frame_ptr = (ks_top - 7 * 8) as *mut u64;
-    unsafe {
-        *frame_ptr.add(0) = 0; // r15
-        *frame_ptr.add(1) = 0; // r14
-        *frame_ptr.add(2) = sp; // r13 = user stack
-        *frame_ptr.add(3) = loaded.entry; // r12 = entry
-        *frame_ptr.add(4) = 0; // rbx
-        *frame_ptr.add(5) = 0; // rbp
-        *frame_ptr.add(6) = process_entry_trampoline as u64;
-    }
+    let parent_cwd = table.procs.get(parent_pid).unwrap().cwd.clone();
 
     let pid = table.procs.insert(Process {
         pid: 0, // placeholder, set below
@@ -334,29 +326,32 @@ pub fn spawn(argv: &[&str], stdin_fd: u64, stdout_fd: u64) -> u64 {
 
 /// Exit the current process.
 pub fn exit(code: i32) -> ! {
-    let table = table_mut();
-    let pid = table.current;
-    let proc = table.procs.get_mut(pid).unwrap();
+    {
+        let mut guard = PROCESS_TABLE.lock();
+        let table = guard.as_mut().expect("process table not initialized");
+        let pid = table.current;
+        let proc = table.procs.get_mut(pid).unwrap();
 
-    // Close all FDs
-    fd::close_all(&mut proc.fds, vfs::global_mut(), proc.pid);
+        // Close all FDs (acquires VFS lock — correct order: process_table < vfs)
+        fd::close_all(&mut proc.fds, &mut *vfs::lock(), proc.pid);
 
-    // Free user memory
-    paging::unmap_user(proc.elf_base as u64, proc.elf_layout.size() as u64);
-    paging::unmap_user(proc.stack_base as u64, proc.stack_layout.size() as u64);
-    unsafe {
-        dealloc(proc.elf_base, proc.elf_layout);
-        dealloc(proc.stack_base, proc.stack_layout);
-    }
+        // Free user memory
+        paging::unmap_user(proc.elf_base as u64, proc.elf_layout.size() as u64);
+        paging::unmap_user(proc.stack_base as u64, proc.stack_layout.size() as u64);
+        unsafe {
+            dealloc(proc.elf_base, proc.elf_layout);
+            dealloc(proc.stack_base, proc.stack_layout);
+        }
 
-    // Mark as zombie
-    proc.state = ProcessState::Zombie(code);
+        // Mark as zombie
+        proc.state = ProcessState::Zombie(code);
 
-    // Wake parent if blocked on WaitPid for us
-    if let Some(ppid) = proc.parent_pid {
-        if let Some(parent) = table.procs.get_mut(ppid) {
-            if parent.state == ProcessState::BlockedWaitPid(pid) {
-                parent.state = ProcessState::Ready;
+        // Wake parent if blocked on WaitPid for us
+        if let Some(ppid) = proc.parent_pid {
+            if let Some(parent) = table.procs.get_mut(ppid) {
+                if parent.state == ProcessState::BlockedWaitPid(pid) {
+                    parent.state = ProcessState::Ready;
+                }
             }
         }
     }
@@ -367,24 +362,33 @@ pub fn exit(code: i32) -> ! {
 
 /// Block the current process and switch to the next ready one.
 pub fn block(reason: ProcessState) {
-    let table = table_mut();
-    table.procs.get_mut(table.current).unwrap().state = reason;
+    {
+        let mut guard = PROCESS_TABLE.lock();
+        let table = guard.as_mut().expect("process table not initialized");
+        let current = table.current;
+        table.procs.get_mut(current).unwrap().state = reason;
+    }
     schedule();
 }
 
 /// Cooperative yield: mark current as Ready, switch to next.
 pub fn yield_now() {
-    let table = table_mut();
-    table.procs.get_mut(table.current).unwrap().state = ProcessState::Ready;
+    {
+        let mut guard = PROCESS_TABLE.lock();
+        let table = guard.as_mut().expect("process table not initialized");
+        let current = table.current;
+        table.procs.get_mut(current).unwrap().state = ProcessState::Ready;
+    }
     schedule();
 }
 
 /// Find next ready process (round-robin by PID order) and context switch to it.
 pub fn schedule() {
-    let table = table_mut();
-    let current_pid = table.current;
-
     loop {
+        let mut guard = PROCESS_TABLE.lock();
+        let table = guard.as_mut().expect("process table not initialized");
+        let current_pid = table.current;
+
         // Round-robin: find smallest Ready PID > current, or wrap to smallest Ready PID
         let mut best_after: Option<u32> = None;
         let mut best_any: Option<u32> = None;
@@ -419,41 +423,54 @@ pub fn schedule() {
             // Restore new process's user heap
             user_heap::restore(new_proc.user_heap.clone());
 
-            // Update TSS.RSP0 and SYSCALL_KERNEL_RSP
-            *syscall::SYSCALL_KERNEL_RSP.get_mut() = new_ks_top;
-            unsafe { *gdt::tss_rsp0_ptr() = new_ks_top; }
+            // SAFETY: old_rsp_ptr points into the current process's IdMap slot.
+            // The process won't be removed while we exist (only zombies are collected).
+            // Safe in Phase 2 (AP idle); Phase 3 will use per-CPU state instead.
+            let old_rsp_ptr = &mut table.procs.get_mut(current_pid).unwrap().kernel_rsp as *mut u64;
+
+            // Drop lock before context switch to avoid deadlock when resumed
+            drop(guard);
+
+            unsafe { percpu::set_kernel_stack(new_ks_top); }
 
             // Load symbols for crash diagnostics
             symbols::clear();
 
-            let old_rsp_ptr = &mut table.procs.get_mut(current_pid).unwrap().kernel_rsp as *mut u64;
             unsafe { context_switch(old_rsp_ptr, new_rsp); }
             return;
         }
 
         // No ready process — idle: poll USB, check for wakeups
         idle_poll(table);
+        drop(guard);
+        core::hint::spin_loop();
     }
 }
 
 /// Schedule without saving current context (used by exit).
 fn schedule_no_return() -> ! {
-    let table = table_mut();
-
     loop {
-        // Find any Ready process
-        for (pid, proc) in table.procs.iter_mut() {
-            if proc.state == ProcessState::Ready {
+        {
+            let mut guard = PROCESS_TABLE.lock();
+            let table = guard.as_mut().expect("process table not initialized");
+
+            let ready = table.procs.iter()
+                .find(|(_, p)| p.state == ProcessState::Ready)
+                .map(|(pid, _)| pid);
+
+            if let Some(new_pid) = ready {
+                let proc = table.procs.get_mut(new_pid).unwrap();
                 proc.state = ProcessState::Running;
-                table.current = pid;
+                table.current = new_pid;
 
                 let new_rsp = proc.kernel_rsp;
                 let new_ks_top = proc.kernel_stack_base as u64 + KERNEL_STACK_SIZE as u64;
 
                 user_heap::restore(proc.user_heap.clone());
 
-                *syscall::SYSCALL_KERNEL_RSP.get_mut() = new_ks_top;
-                unsafe { *gdt::tss_rsp0_ptr() = new_ks_top; }
+                drop(guard);
+
+                unsafe { percpu::set_kernel_stack(new_ks_top); }
 
                 symbols::clear();
 
@@ -473,9 +490,10 @@ fn schedule_no_return() -> ! {
                     );
                 }
             }
-        }
 
-        idle_poll(table);
+            idle_poll(table);
+        }
+        core::hint::spin_loop();
     }
 }
 
@@ -531,7 +549,8 @@ fn idle_poll(table: &mut ProcessTable) {
 
 /// Send a message to a target process. Wakes the target if blocked.
 pub fn send_message(target_pid: u32, msg: crate::message::Message) -> bool {
-    let table = table_mut();
+    let mut guard = PROCESS_TABLE.lock();
+    let table = guard.as_mut().expect("process table not initialized");
     if let Some(proc) = table.procs.get_mut(target_pid) {
         proc.messages.push(msg);
         match proc.state {
@@ -546,9 +565,43 @@ pub fn send_message(target_pid: u32, msg: crate::message::Message) -> bool {
     }
 }
 
+/// Wake processes blocked on reading from a pipe that now has data.
+pub fn wake_pipe_readers(pipe_id: usize) {
+    let mut guard = PROCESS_TABLE.lock();
+    let table = guard.as_mut().expect("process table not initialized");
+    for (_, proc) in table.procs.iter_mut() {
+        match proc.state {
+            ProcessState::BlockedPipeRead(id) if id == pipe_id => {
+                proc.state = ProcessState::Ready;
+            }
+            ProcessState::BlockedPoll(fds_ptr, fds_len) => {
+                let fds = unsafe {
+                    core::slice::from_raw_parts(fds_ptr as *const u64, fds_len as usize)
+                };
+                if fds.iter().any(|&fd| fd::has_data(&proc.fds, fd)) {
+                    proc.state = ProcessState::Ready;
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Wake processes blocked on writing to a pipe that now has space.
+pub fn wake_pipe_writers(pipe_id: usize) {
+    let mut guard = PROCESS_TABLE.lock();
+    let table = guard.as_mut().expect("process table not initialized");
+    for (_, proc) in table.procs.iter_mut() {
+        if proc.state == ProcessState::BlockedPipeWrite(pipe_id) {
+            proc.state = ProcessState::Ready;
+        }
+    }
+}
+
 /// Collect a zombie child. Returns exit code, or None if not a zombie yet.
 pub fn collect_zombie(child_pid: u32) -> Option<i32> {
-    let table = table_mut();
+    let mut guard = PROCESS_TABLE.lock();
+    let table = guard.as_mut().expect("process table not initialized");
     let proc = table.procs.get(child_pid)?;
     if let ProcessState::Zombie(code) = proc.state {
         let ks_base = proc.kernel_stack_base;
@@ -562,7 +615,8 @@ pub fn collect_zombie(child_pid: u32) -> Option<i32> {
 }
 
 pub fn register_name(name: &str, pid: u32) -> bool {
-    let names = names_mut();
+    let mut guard = NAME_REGISTRY.lock();
+    let names = guard.as_mut().expect("name registry not initialized");
     if names.contains_key(name) {
         return false;
     }
@@ -571,7 +625,7 @@ pub fn register_name(name: &str, pid: u32) -> bool {
 }
 
 pub fn find_pid(name: &str) -> Option<u32> {
-    names().get(name).copied()
+    NAME_REGISTRY.lock().as_ref().expect("name registry not initialized").get(name).copied()
 }
 
 /// Naked assembly context switch.

@@ -126,7 +126,7 @@ const DMA_PAGES: usize = 6;
 static DMA_POOL: Lock<DmaPool<DMA_PAGES>> = Lock::new(DmaPool::new());
 
 fn dma_page(index: usize) -> u64 {
-    DMA_POOL.get().page_addr(index)
+    DMA_POOL.lock().page_addr(index)
 }
 
 pub struct NvmeController {

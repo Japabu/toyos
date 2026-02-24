@@ -4,20 +4,28 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use hashbrown::{HashMap, HashSet};
 
-use crate::sync::Lock;
+use core::ops::{Deref, DerefMut};
+use crate::sync::{Lock, LockGuard};
 
 static VFS: Lock<Option<Vfs>> = Lock::new(None);
 
 pub fn init() {
-    *VFS.get_mut() = Some(Vfs::new());
+    *VFS.lock() = Some(Vfs::new());
 }
 
-pub fn global() -> &'static Vfs {
-    VFS.get().as_ref().expect("VFS not initialized")
+pub struct VfsGuard(LockGuard<'static, Option<Vfs>>);
+
+impl Deref for VfsGuard {
+    type Target = Vfs;
+    fn deref(&self) -> &Vfs { self.0.as_ref().expect("VFS not initialized") }
 }
 
-pub fn global_mut() -> &'static mut Vfs {
-    VFS.get_mut().as_mut().expect("VFS not initialized")
+impl DerefMut for VfsGuard {
+    fn deref_mut(&mut self) -> &mut Vfs { self.0.as_mut().expect("VFS not initialized") }
+}
+
+pub fn lock() -> VfsGuard {
+    VfsGuard(VFS.lock())
 }
 
 /// Trait abstracting filesystem operations so the VFS can hold

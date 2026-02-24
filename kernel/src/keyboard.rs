@@ -13,7 +13,7 @@ pub fn handle_report(report: &[u8]) {
     let shift = (modifiers & 0x22) != 0;
     let ctrl = (modifiers & 0x11) != 0;
     let alt = (modifiers & 0x44) != 0;
-    let prev = PREV_REPORT.get();
+    let prev = *PREV_REPORT.lock();
 
     for i in 2..8 {
         let keycode = report[i];
@@ -42,21 +42,21 @@ pub fn handle_report(report: &[u8]) {
         }
     }
 
-    PREV_REPORT.get_mut().copy_from_slice(&report[..8]);
+    PREV_REPORT.lock().copy_from_slice(&report[..8]);
 }
 
 pub fn handle_key(byte: u8) {
     if byte != 0 {
-        KEY_BUF.get_mut().push_back(byte);
+        KEY_BUF.lock().push_back(byte);
     }
 }
 
 pub fn has_data() -> bool {
-    !KEY_BUF.get().is_empty()
+    !KEY_BUF.lock().is_empty()
 }
 
 pub fn try_read_char() -> Option<u8> {
-    KEY_BUF.get_mut().pop_front()
+    KEY_BUF.lock().pop_front()
 }
 
 pub struct KeyEntry {
@@ -96,13 +96,13 @@ static ACTIVE_LAYOUT: Lock<usize> = Lock::new(0);
 const LAYOUTS: &[&Layout] = &[&US_QWERTY, &SWISS_GERMAN_MAC];
 
 fn active_layout() -> &'static Layout {
-    LAYOUTS[*ACTIVE_LAYOUT.get()]
+    LAYOUTS[*ACTIVE_LAYOUT.lock()]
 }
 
 pub fn set_layout(name: &str) -> bool {
     for (i, layout) in LAYOUTS.iter().enumerate() {
         if layout.name == name {
-            *ACTIVE_LAYOUT.get_mut() = i;
+            *ACTIVE_LAYOUT.lock() = i;
             return true;
         }
     }

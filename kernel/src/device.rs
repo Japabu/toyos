@@ -11,14 +11,14 @@ static FRAMEBUFFER_OWNER: Lock<Option<u32>> = Lock::new(None);
 static FB_INFO: Lock<Option<FramebufferInfo>> = Lock::new(None);
 
 pub fn set_framebuffer_info(info: FramebufferInfo) {
-    *FB_INFO.get_mut() = Some(info);
+    *FB_INFO.lock() = Some(info);
 }
 
 /// Try to claim exclusive access to a device. Returns the Descriptor if unclaimed.
 pub fn try_claim(device_type: u64, pid: u32) -> Option<Descriptor> {
     match device_type {
         DEVICE_KEYBOARD => {
-            let owner = KEYBOARD_OWNER.get_mut();
+            let mut owner = KEYBOARD_OWNER.lock();
             if owner.is_some() {
                 return None;
             }
@@ -26,7 +26,7 @@ pub fn try_claim(device_type: u64, pid: u32) -> Option<Descriptor> {
             Some(Descriptor::Keyboard)
         }
         DEVICE_MOUSE => {
-            let owner = MOUSE_OWNER.get_mut();
+            let mut owner = MOUSE_OWNER.lock();
             if owner.is_some() {
                 return None;
             }
@@ -34,11 +34,11 @@ pub fn try_claim(device_type: u64, pid: u32) -> Option<Descriptor> {
             Some(Descriptor::Mouse)
         }
         DEVICE_FRAMEBUFFER => {
-            let owner = FRAMEBUFFER_OWNER.get_mut();
+            let mut owner = FRAMEBUFFER_OWNER.lock();
             if owner.is_some() {
                 return None;
             }
-            let info = (*FB_INFO.get())?;
+            let info = (*FB_INFO.lock())?;
             *owner = Some(pid);
             Some(Descriptor::Framebuffer(info))
         }
@@ -48,10 +48,10 @@ pub fn try_claim(device_type: u64, pid: u32) -> Option<Descriptor> {
 
 /// Release a device owned by the given PID.
 pub fn release(device_type: u64, pid: u32) {
-    let owner = match device_type {
-        DEVICE_KEYBOARD => KEYBOARD_OWNER.get_mut(),
-        DEVICE_MOUSE => MOUSE_OWNER.get_mut(),
-        DEVICE_FRAMEBUFFER => FRAMEBUFFER_OWNER.get_mut(),
+    let mut owner = match device_type {
+        DEVICE_KEYBOARD => KEYBOARD_OWNER.lock(),
+        DEVICE_MOUSE => MOUSE_OWNER.lock(),
+        DEVICE_FRAMEBUFFER => FRAMEBUFFER_OWNER.lock(),
         _ => return,
     };
     if *owner == Some(pid) {
