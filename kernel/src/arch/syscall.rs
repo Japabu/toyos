@@ -4,7 +4,7 @@ use alloc::vec::Vec;
 use super::{cpu, gdt};
 use crate::drivers::acpi;
 use crate::sync::SyncCell;
-use crate::{fd, keyboard, log, pipe, process, user_heap, vfs};
+use crate::{fd, keyboard, log, message, pipe, process, user_heap, vfs};
 
 // MSR addresses
 const MSR_EFER: u32 = 0xC000_0080;
@@ -38,6 +38,8 @@ const SYS_SPAWN: u64 = 25;
 const SYS_WAITPID: u64 = 26;
 const SYS_POLL: u64 = 27;
 const SYS_MARK_TTY: u64 = 28;
+const SYS_SEND_MSG: u64 = 29;
+const SYS_RECV_MSG: u64 = 30;
 
 // Kernel/user RSP storage for stack switching
 #[no_mangle]
@@ -137,6 +139,8 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             let proc = process::current();
             fd::mark_tty(&mut proc.fds, a1)
         }
+        SYS_SEND_MSG => sys_send_msg(a1, a2),
+        SYS_RECV_MSG => sys_recv_msg(a1),
         _ => u64::MAX,
     }
 }
@@ -303,17 +307,46 @@ fn sys_waitpid(pid: u64) -> u64 {
     }
 }
 
-fn sys_poll(fd1: u64, fd2: u64) -> u64 {
+fn sys_poll(fds_ptr: u64, fds_len: u64) -> u64 {
+    let fds = unsafe { core::slice::from_raw_parts(fds_ptr as *const u64, fds_len as usize) };
     loop {
         crate::drivers::xhci::poll_global();
         let proc = process::current();
-        let r1 = fd::has_data(&proc.fds, fd1);
-        let r2 = fd::has_data(&proc.fds, fd2);
-        let mask = (r1 as u64) | ((r2 as u64) << 1);
+        let mut mask: u64 = 0;
+        for (i, &fd) in fds.iter().enumerate() {
+            if fd::has_data(&proc.fds, fd) {
+                mask |= 1 << i;
+            }
+        }
+        if proc.messages.has_messages() {
+            mask |= 1 << fds_len;
+        }
         if mask != 0 {
             return mask;
         }
-        process::block(process::ProcessState::BlockedPoll(fd1 as u32, fd2 as u32));
+        process::block(process::ProcessState::BlockedPoll(fds_ptr, fds_len as u32));
+    }
+}
+
+fn sys_send_msg(target_pid: u64, msg_ptr: u64) -> u64 {
+    let user_msg = unsafe { &*(msg_ptr as *const message::Message) };
+    let msg = message::Message {
+        sender: process::current_pid(),
+        msg_type: user_msg.msg_type,
+        data: user_msg.data,
+        len: user_msg.len,
+    };
+    if process::send_message(target_pid as u32, msg) { 0 } else { u64::MAX }
+}
+
+fn sys_recv_msg(msg_ptr: u64) -> u64 {
+    loop {
+        let proc = process::current();
+        if let Some(msg) = proc.messages.pop() {
+            unsafe { *(msg_ptr as *mut message::Message) = msg; }
+            return 0;
+        }
+        process::block(process::ProcessState::BlockedRecvMsg);
     }
 }
 

@@ -221,7 +221,7 @@ fn build() {
     for entry in fs::read_dir("../userland").expect("Failed to read userland") {
         let entry = entry.expect("Failed to read dir entry");
         let path = entry.path();
-        if !path.is_dir() || !path.join("Cargo.toml").exists() {
+        if !path.is_dir() || !path.join("Cargo.toml").exists() || !path.join("src/main.rs").exists() {
             continue;
         }
         let name = entry.file_name();

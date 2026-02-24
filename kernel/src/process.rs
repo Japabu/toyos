@@ -5,6 +5,7 @@ use core::arch::{asm, naked_asm};
 
 use crate::arch::{gdt, paging, syscall};
 use crate::fd::{self, Descriptor, FdTable};
+use crate::message::MessageQueue;
 use crate::sync::SyncCell;
 use crate::{elf, keyboard, log, pipe, symbols, user_heap, vfs};
 
@@ -44,7 +45,8 @@ pub enum ProcessState {
     BlockedPipeRead(usize),
     BlockedPipeWrite(usize),
     BlockedWaitPid(u32),
-    BlockedPoll(u32, u32),
+    BlockedPoll(u64, u32),
+    BlockedRecvMsg,
     Zombie(i32),
 }
 
@@ -59,6 +61,7 @@ pub struct Process {
     pub fds: FdTable,
     pub user_heap: Vec<(u64, u64)>,
     pub cwd: String,
+    pub messages: MessageQueue,
     // Hierarchy
     pub parent_pid: Option<u32>,
     // ELF memory tracking
@@ -142,6 +145,7 @@ pub fn init_process0(
         kernel_rsp: frame_ptr as u64,
         fds,
         user_heap: Vec::new(),
+        messages: MessageQueue::new(),
         cwd: String::from("/"),
         parent_pid: None,
         elf_base,
@@ -306,6 +310,7 @@ pub fn spawn(argv: &[&str], stdin_fd: u64, stdout_fd: u64) -> u64 {
         kernel_rsp: frame_ptr as u64,
         fds: child_fds,
         user_heap: Vec::new(),
+        messages: MessageQueue::new(),
         cwd: parent_cwd,
         parent_pid: Some(parent_pid),
         elf_base: loaded.base_ptr,
@@ -507,8 +512,17 @@ fn idle_poll(table: &mut ProcessTable) {
                         proc.state = ProcessState::Ready;
                     }
                 }
-                ProcessState::BlockedPoll(fd1, fd2) => {
-                    if fd::has_data(&proc.fds, fd1 as u64) || fd::has_data(&proc.fds, fd2 as u64) {
+                ProcessState::BlockedPoll(fds_ptr, fds_len) => {
+                    let fds = unsafe {
+                        core::slice::from_raw_parts(fds_ptr as *const u64, fds_len as usize)
+                    };
+                    let any_fd_ready = fds.iter().any(|&fd| fd::has_data(&proc.fds, fd));
+                    if any_fd_ready || proc.messages.has_messages() {
+                        proc.state = ProcessState::Ready;
+                    }
+                }
+                ProcessState::BlockedRecvMsg => {
+                    if proc.messages.has_messages() {
                         proc.state = ProcessState::Ready;
                     }
                 }
@@ -518,6 +532,26 @@ fn idle_poll(table: &mut ProcessTable) {
     }
 
     core::hint::spin_loop();
+}
+
+/// Send a message to a target process. Wakes the target if blocked.
+pub fn send_message(target_pid: u32, msg: crate::message::Message) -> bool {
+    let table = PROCESS_TABLE.get_mut();
+    for slot in table.procs.iter_mut() {
+        if let Some(proc) = slot {
+            if proc.pid == target_pid {
+                proc.messages.push(msg);
+                match proc.state {
+                    ProcessState::BlockedRecvMsg | ProcessState::BlockedPoll(..) => {
+                        proc.state = ProcessState::Ready;
+                    }
+                    _ => {}
+                }
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Collect a zombie child. Returns exit code, or None if not a zombie yet.

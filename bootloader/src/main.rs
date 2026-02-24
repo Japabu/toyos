@@ -220,7 +220,7 @@ fn init_gop(system_table: &SystemTable<Boot>) -> FramebufferInfo {
     }
 }
 
-static INIT_PROGRAM: &[u8] = b"terminal";
+static INIT_PROGRAM: &[u8] = b"compositor";
 
 fn start_kernel(kernel: LoadedKernel, kernel_elf_bytes: vec::Vec<u8>, initrd: vec::Vec<u8>, rsdp_addr: u64, fb: FramebufferInfo, system_table: SystemTable<Boot>) -> ! {
     // Estimate memory map size

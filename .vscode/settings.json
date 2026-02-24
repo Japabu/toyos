@@ -1,6 +1,5 @@
 {
     "rust-analyzer.check.allTargets": false,
-    "rust-analyzer.files.excludeDirs": ["rust"],
     "rust-analyzer.linkedProjects": [
         "kernel/Cargo.toml",
         "userland/cat/Cargo.toml",
@@ -9,7 +8,6 @@
         "userland/hello/Cargo.toml",
         "userland/input-test/Cargo.toml",
         "userland/keyboard/Cargo.toml",
-        "userland/kibi/Cargo.toml",
         "userland/ls/Cargo.toml",
         "userland/proctest/Cargo.toml",
         "userland/pwd/Cargo.toml",
