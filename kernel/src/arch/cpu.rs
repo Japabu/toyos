@@ -77,6 +77,20 @@ pub fn enable_interrupts() {
     }
 }
 
+/// Enable SSE/SSE2+ by setting CR4.OSFXSR and CR4.OSXMMEXCPT.
+/// Must be called on each CPU before any SSE instructions execute.
+pub fn enable_sse() {
+    unsafe {
+        asm!(
+            "mov {0}, cr4",
+            "or {0}, 0x600",   // bit 9 = OSFXSR, bit 10 = OSXMMEXCPT
+            "mov cr4, {0}",
+            out(reg) _,
+            options(nostack),
+        );
+    }
+}
+
 pub fn halt() -> ! {
     loop {
         unsafe {

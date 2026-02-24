@@ -58,3 +58,14 @@ impl<T> Drop for LockGuard<'_, T> {
         self.lock.now.fetch_add(1, Ordering::Release);
     }
 }
+
+impl<T> Lock<T> {
+    /// Release the lock without a guard. Used when the lock is acquired on one
+    /// stack (before context_switch) and released on another (after resume).
+    ///
+    /// # Safety
+    /// Caller must ensure the lock is currently held and this is called exactly once.
+    pub unsafe fn force_unlock(&self) {
+        self.now.fetch_add(1, Ordering::Release);
+    }
+}

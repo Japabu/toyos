@@ -11,7 +11,7 @@ use crate::sync::Lock;
 struct Symbol {
     addr: u64,
     size: u64,
-    name_start: u32, // offset into associated names vec
+    name_start: u32,
 }
 
 struct SymbolTable {
@@ -24,15 +24,9 @@ impl SymbolTable {
         Self { symbols: Vec::new(), names: Vec::new() }
     }
 
-    fn clear(&mut self) {
-        self.symbols.clear();
-        self.names.clear();
-    }
-
     fn resolve(&self, addr: u64) -> Option<(String, u64)> {
         if self.symbols.is_empty() { return None; }
 
-        // Binary search for the last symbol with addr <= target
         let mut lo = 0usize;
         let mut hi = self.symbols.len();
         while lo < hi {
@@ -59,51 +53,98 @@ impl SymbolTable {
     }
 }
 
-// Userland process symbols (cleared between process runs)
-static PROCESS_SYMS: Lock<SymbolTable> = Lock::new(SymbolTable::new());
-// Kernel symbols (loaded once at boot, never cleared)
-static KERNEL_SYMS: Lock<SymbolTable> = Lock::new(SymbolTable::new());
-// Memory range of loaded program (for backtrace address validation)
-static PROG_BASE: Lock<u64> = Lock::new(0);
-static PROG_END: Lock<u64> = Lock::new(0);
-static STACK_BASE: Lock<u64> = Lock::new(0);
-static STACK_END: Lock<u64> = Lock::new(0);
-
-pub fn clear() {
-    PROCESS_SYMS.lock().clear();
-    *PROG_BASE.lock() = 0;
-    *PROG_END.lock() = 0;
-    *STACK_BASE.lock() = 0;
-    *STACK_END.lock() = 0;
+/// Per-process symbol info: parsed function symbols + valid memory ranges.
+pub struct ProcessSymbols {
+    table: SymbolTable,
+    prog_base: u64,
+    prog_end: u64,
+    stack_base: u64,
+    stack_end: u64,
 }
 
-/// Demangle a Rust symbol name (supports both legacy `_ZN...E` and v0 `_R...` mangling).
+impl ProcessSymbols {
+    pub fn empty() -> Self {
+        Self {
+            table: SymbolTable::new(),
+            prog_base: 0,
+            prog_end: 0,
+            stack_base: 0,
+            stack_end: 0,
+        }
+    }
+
+    /// Parse symbols from ELF bytes and record memory ranges.
+    pub fn parse(
+        data: &[u8], base: u64,
+        prog_base: u64, prog_end: u64,
+        stack_base: u64, stack_end: u64,
+    ) -> Self {
+        let mut table = SymbolTable::new();
+        parse_symtab(data, base, &mut table);
+        Self { table, prog_base, prog_end, stack_base, stack_end }
+    }
+
+    pub fn resolve(&self, addr: u64) -> Option<(String, u64)> {
+        self.table.resolve(addr)
+    }
+
+    pub fn is_valid_user_addr(&self, addr: u64) -> bool {
+        (addr >= self.prog_base && addr < self.prog_end)
+            || (addr >= self.stack_base && addr < self.stack_end)
+    }
+
+    pub fn symbol_count(&self) -> usize {
+        self.table.symbols.len()
+    }
+}
+
+// Kernel symbols (loaded once at boot, never cleared)
+static KERNEL_SYMS: Lock<SymbolTable> = Lock::new(SymbolTable::new());
+static KERNEL_BASE: Lock<u64> = Lock::new(0);
+
 fn demangle(mangled: &str) -> String {
     format!("{:#}", rustc_demangle::demangle(mangled))
 }
 
-/// Look up a symbol by runtime address (checks both process and kernel symbols).
-pub fn resolve(addr: u64) -> Option<(String, u64)> {
-    let process = PROCESS_SYMS.lock();
-    if let Some(result) = process.resolve(addr) {
-        return Some(result);
+/// Resolve an address against kernel symbols only.
+pub fn resolve_kernel(addr: u64) -> Option<(String, u64)> {
+    KERNEL_SYMS.lock().resolve(addr)
+}
+
+/// Format an address with kernel symbol info if available.
+pub fn format_kernel_addr(addr: u64) -> String {
+    if let Some((name, offset)) = resolve_kernel(addr) {
+        format!("{:#x}  {}+{:#x}", addr, name, offset)
+    } else {
+        let kernel_base = *KERNEL_BASE.lock();
+        if kernel_base != 0 && addr >= kernel_base {
+            format!("{:#x}  [kernel+{:#x}]", addr, addr - kernel_base)
+        } else {
+            format!("{:#x}", addr)
+        }
     }
-    let kernel = KERNEL_SYMS.lock();
-    kernel.resolve(addr)
 }
 
-/// Check if an address is in user-accessible memory (program or stack).
-pub fn is_valid_user_addr(addr: u64) -> bool {
-    let prog_base = *PROG_BASE.lock();
-    let prog_end = *PROG_END.lock();
-    let stack_base = *STACK_BASE.lock();
-    let stack_end = *STACK_END.lock();
-    (addr >= prog_base && addr < prog_end) || (addr >= stack_base && addr < stack_end)
+/// Format an address: try process symbols first, then kernel.
+pub fn format_addr(addr: u64, proc_syms: &ProcessSymbols) -> String {
+    if let Some((name, offset)) = proc_syms.resolve(addr) {
+        format!("{:#x}  {}+{:#x}", addr, name, offset)
+    } else if let Some((name, offset)) = resolve_kernel(addr) {
+        format!("{:#x}  {}+{:#x}", addr, name, offset)
+    } else {
+        let kernel_base = *KERNEL_BASE.lock();
+        if kernel_base != 0 && addr >= kernel_base {
+            format!("{:#x}  [kernel+{:#x}]", addr, addr - kernel_base)
+        } else {
+            format!("{:#x}", addr)
+        }
+    }
 }
 
-/// Parse .symtab from raw ELF bytes into our SymbolTable.
+/// Parse .symtab from raw ELF bytes into a SymbolTable.
 fn parse_symtab(data: &[u8], base: u64, table: &mut SymbolTable) {
-    table.clear();
+    table.symbols.clear();
+    table.names.clear();
 
     let elf = match ElfBytes::<AnyEndian>::minimal_parse(data) {
         Ok(e) => e,
@@ -123,7 +164,7 @@ fn parse_symtab(data: &[u8], base: u64, table: &mut SymbolTable) {
             };
             let name_start = table.names.len() as u32;
             table.names.extend_from_slice(name.as_bytes());
-            table.names.push(0); // null terminator
+            table.names.push(0);
             table.symbols.push(Symbol {
                 addr: base + sym.st_value,
                 size: sym.st_size,
@@ -135,13 +176,6 @@ fn parse_symtab(data: &[u8], base: u64, table: &mut SymbolTable) {
     table.symbols.sort_unstable_by_key(|s| s.addr);
 }
 
-/// Load userland process symbols from raw ELF bytes.
-pub fn load_process(data: &[u8], base: u64) {
-    let mut table = PROCESS_SYMS.lock();
-    parse_symtab(data, base, &mut table);
-    log!("symbols: loaded {} process symbols", table.symbols.len());
-}
-
 /// Load kernel symbols from raw ELF bytes. Called once at boot.
 pub fn load_kernel(data: &[u8], base: u64) {
     let mut table = KERNEL_SYMS.lock();
@@ -149,10 +183,7 @@ pub fn load_kernel(data: &[u8], base: u64) {
     log!("symbols: loaded {} kernel symbols", table.symbols.len());
 }
 
-/// Record the memory ranges of a loaded process for backtrace validation.
-pub fn set_process_ranges(prog_base: u64, prog_end: u64, stack_base: u64, stack_end: u64) {
-    *PROG_BASE.lock() = prog_base;
-    *PROG_END.lock() = prog_end;
-    *STACK_BASE.lock() = stack_base;
-    *STACK_END.lock() = stack_end;
+/// Set the kernel base address for crash diagnostics.
+pub fn set_kernel_base(base: u64) {
+    *KERNEL_BASE.lock() = base;
 }

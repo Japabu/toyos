@@ -131,7 +131,7 @@ fn kernel_main(
 
     // IDT and syscall MSRs
     idt::init();
-    idt::set_kernel_base(kernel_args.kernel_memory_addr);
+    symbols::set_kernel_base(kernel_args.kernel_memory_addr);
 
     // Load kernel symbols for crash diagnostics
     if !kernel_elf.is_empty() {
@@ -186,13 +186,12 @@ fn kernel_main(
     let elf_layout = Layout::from_size_align(loaded.load_size, 4096).unwrap();
     paging::map_user(stack_base as u64, USER_STACK_SIZE as u64);
 
-    symbols::load_process(&data, loaded.base);
-    symbols::set_process_ranges(
-        loaded.base_ptr as u64,
-        loaded.base_ptr as u64 + loaded.load_size as u64,
-        stack_base as u64,
-        stack_top,
+    let init_syms = kernel::symbols::ProcessSymbols::parse(
+        &data, loaded.base,
+        loaded.base_ptr as u64, loaded.base_ptr as u64 + loaded.load_size as u64,
+        stack_base as u64, stack_top,
     );
+    log!("init: {} symbols", init_syms.symbol_count());
 
     let sp = process::write_argv_to_stack(stack_top, &args);
 
@@ -207,7 +206,8 @@ fn kernel_main(
         pixel_format: kernel_args.framebuffer_pixel_format,
     });
 
-    // Create process 0 and start the scheduler (never returns)
-    process::init_process0(loaded.entry, sp, loaded.base_ptr, elf_layout, stack_base, stack_layout);
+    // Signal APs to join the scheduler, then start process 0 (never returns)
+    smp::set_ready();
+    process::init_process0(loaded.entry, sp, loaded.base_ptr, elf_layout, stack_base, stack_layout, init_syms);
     unreachable!();
 }

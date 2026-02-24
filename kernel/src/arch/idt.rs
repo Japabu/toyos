@@ -3,7 +3,8 @@ use core::arch::naked_asm;
 use super::cpu;
 use super::cpu::{outb, io_wait};
 use crate::arch::syscall;
-use crate::{symbols, log};
+use crate::arch::percpu;
+use crate::{symbols, process, log};
 
 use alloc::format;
 
@@ -99,48 +100,33 @@ struct InterruptFrame {
 }
 
 impl SavedRegs {
-    /// Access the CPU-pushed interrupt frame that follows this SavedRegs on the stack.
     fn interrupt_frame(&self) -> &InterruptFrame {
         unsafe { &*((self as *const SavedRegs).add(1) as *const InterruptFrame) }
     }
 }
 
-// Kernel base address for crash diagnostics
-static KERNEL_BASE: Lock<u64> = Lock::new(0);
-
-pub fn set_kernel_base(base: u64) {
-    *KERNEL_BASE.lock() = base;
-}
-
-/// Disable the legacy 8259 PIC. We don't use it (keyboard is USB, clock is HPET),
-/// but it must be initialized and masked to prevent spurious IRQs from aliasing
-/// CPU exception vectors 0-15. Remapping to 32+ ensures any leak-through is harmless.
+/// Disable the legacy 8259 PIC.
 fn disable_pic() {
-    // ICW1: begin init (bit 4=1, bit 0=ICW4 needed)
     outb(PIC1_CMD, 0x11);
     io_wait();
     outb(PIC2_CMD, 0x11);
     io_wait();
 
-    // ICW2: vector offsets
     outb(PIC1_DATA, 32);
     io_wait();
     outb(PIC2_DATA, 40);
     io_wait();
 
-    // ICW3: master/slave wiring
-    outb(PIC1_DATA, 4); // slave on IRQ2
+    outb(PIC1_DATA, 4);
     io_wait();
-    outb(PIC2_DATA, 2); // cascade identity
+    outb(PIC2_DATA, 2);
     io_wait();
 
-    // ICW4: 8086 mode
     outb(PIC1_DATA, 0x01);
     io_wait();
     outb(PIC2_DATA, 0x01);
     io_wait();
 
-    // Mask all IRQs (keyboard input is handled via USB polling)
     outb(PIC1_DATA, 0xFF);
     outb(PIC2_DATA, 0xFF);
 }
@@ -168,17 +154,15 @@ pub fn init() {
 }
 
 // --- TLB flush IPI handler (vector 0xFE) ---
-// Sent between CPUs after page table changes. Always arrives in kernel mode.
-// Writes EOI directly to LAPIC MMIO (lock-free) to avoid deadlock.
 #[unsafe(naked)]
 extern "C" fn tlb_flush_entry() {
     naked_asm!(
         "push rax",
         "push rdx",
         "mov rax, cr3",
-        "mov cr3, rax",                     // reload CR3 flushes TLB
-        "mov rdx, [rip + LAPIC_BASE]",      // load LAPIC base address
-        "mov dword ptr [rdx + 0xB0], 0",    // EOI = LAPIC_BASE + 0xB0
+        "mov cr3, rax",
+        "mov rdx, [rip + LAPIC_BASE]",
+        "mov dword ptr [rdx + 0xB0], 0",
         "pop rdx",
         "pop rax",
         "iretq",
@@ -187,25 +171,18 @@ extern "C" fn tlb_flush_entry() {
 
 // --- Exception entry stubs ---
 // Exceptions from ring 3 need swapgs so kernel code sees the per-CPU GS base.
-// We check the saved CS on stack: if CPL was 3, do swapgs on entry.
-// The handler never returns (user: kill_process, kernel: halt), so no exit swapgs.
-//
-// Stack on entry (no error code): [RIP][CS][RFLAGS][RSP][SS]  — CS at [rsp+8]
-// Stack on entry (error code):    [err][RIP][CS][RFLAGS][RSP][SS] — CS at [rsp+16]
-//
 // Handler args: rdi=vector, rsi=regs_ptr, rdx=error_code, rcx=rip, r8=cs, r9=fault_addr
 
 macro_rules! exception_entry {
-    // No error code, no fault address (e.g. #UD)
     ($name:ident, $vector:literal, no_error_code) => {
         #[unsafe(naked)]
         extern "C" fn $name() {
             naked_asm!(
-                "test dword ptr [rsp + 8], 3",  // check saved CS RPL
+                "test dword ptr [rsp + 8], 3",
                 "jz 1f",
                 "swapgs",
                 "1:",
-                "push 0", // dummy error code
+                "push 0",
                 "push r15", "push r14", "push r13", "push r12",
                 "push r11", "push r10", "push r9",  "push r8",
                 "push rbp", "push rdi", "push rsi", "push rdx",
@@ -222,7 +199,6 @@ macro_rules! exception_entry {
             );
         }
     };
-    // Has error code, no fault address (e.g. #GP)
     ($name:ident, $vector:literal, error_code) => {
         #[unsafe(naked)]
         extern "C" fn $name() {
@@ -247,7 +223,6 @@ macro_rules! exception_entry {
             );
         }
     };
-    // Has error code + reads CR2 (page fault)
     ($name:ident, $vector:literal, error_code_cr2) => {
         #[unsafe(naked)]
         extern "C" fn $name() {
@@ -280,17 +255,19 @@ exception_entry!(page_fault_entry, "14", error_code_cr2);
 
 // --- Exception handler ---
 
-fn format_addr(addr: u64) -> alloc::string::String {
-    if let Some((name, offset)) = symbols::resolve(addr) {
-        format!("{:#x}  {}+{:#x}", addr, name, offset)
-    } else {
-        let kernel_base = *KERNEL_BASE.lock();
-        if kernel_base != 0 && addr >= kernel_base {
-            format!("{:#x}  [kernel+{:#x}]", addr, addr - kernel_base)
-        } else {
-            format!("{:#x}", addr)
+/// Resolve an address: process symbols (via process table), then kernel symbols.
+fn format_addr(addr: u64, is_user: bool) -> alloc::string::String {
+    if is_user {
+        if let Some((name, offset)) = process::resolve_symbol(addr) {
+            return format!("{:#x}  {}+{:#x}", addr, name, offset);
         }
     }
+    symbols::format_kernel_addr(addr)
+}
+
+/// Check if addr is a plausible kernel pointer (in identity-mapped RAM).
+fn is_kernel_addr(addr: u64) -> bool {
+    addr > 0x1000 && addr < 0x1_0000_0000_0000
 }
 
 extern "C" fn exception_handler(
@@ -329,72 +306,74 @@ extern "C" fn exception_handler(
         format!("{} (error_code={:#x})", name, error_code)
     };
 
-    let prefix = if is_user { "Process crashed" } else { "KERNEL PANIC" };
-    log!("{}: {}", prefix, detail);
-    log!("  rip: {}", format_addr(rip));
+    if is_user {
+        let pid = percpu::current_pid();
+        log!("Process {} crashed: {}", pid, detail);
+    } else {
+        let cpu = percpu::cpu_id();
+        let pid = percpu::current_pid();
+        let pid_str = if pid == u32::MAX { format!("idle") } else { format!("{}", pid) };
+        log!("KERNEL PANIC on CPU {} (pid={}): {}", cpu, pid_str, detail);
+    }
+    log!("  rip: {}", format_addr(rip, is_user));
 
     let frame = regs.interrupt_frame();
-    let rsp = if is_user { frame.rsp } else { regs.rbp }; // approximate for kernel
-
-    // Instruction bytes at RIP (helps identify the faulting instruction)
-    if is_user && symbols::is_valid_user_addr(rip) {
-        let mut bytes_str = alloc::string::String::with_capacity(16 * 3);
-        for i in 0..16u64 {
-            let addr = rip + i;
-            if !symbols::is_valid_user_addr(addr) { break; }
-            let byte = unsafe { *(addr as *const u8) };
-            if !bytes_str.is_empty() { bytes_str.push(' '); }
-            bytes_str.push_str(&format!("{:02x}", byte));
-        }
-        log!("  code: {}", bytes_str);
-    }
 
     // Register dump
     log!("  Registers:");
     log!("    rax={:#018x}  rbx={:#018x}", regs.rax, regs.rbx);
     log!("    rcx={:#018x}  rdx={:#018x}", regs.rcx, regs.rdx);
     log!("    rsi={:#018x}  rdi={:#018x}", regs.rsi, regs.rdi);
-    log!("    rbp={:#018x}  rsp={:#018x}", regs.rbp, rsp);
+    log!("    rbp={:#018x}  rsp={:#018x}", regs.rbp, frame.rsp);
     log!("     r8={:#018x}   r9={:#018x}", regs.r8, regs.r9);
     log!("    r10={:#018x}  r11={:#018x}", regs.r10, regs.r11);
     log!("    r12={:#018x}  r13={:#018x}", regs.r12, regs.r13);
     log!("    r14={:#018x}  r15={:#018x}", regs.r14, regs.r15);
 
-    // Stack dump (8 words from RSP)
-    if is_user && frame.rsp % 8 == 0 {
+    // Backtrace
+    log!("  Backtrace:");
+    log!("    0: {}", format_addr(rip, is_user));
+    let mut rbp = regs.rbp;
+    for i in 1..20 {
+        if rbp == 0 || rbp % 8 != 0 { break; }
+        let valid = if is_user {
+            process::is_valid_user_addr(rbp) && process::is_valid_user_addr(rbp + 8)
+        } else {
+            is_kernel_addr(rbp)
+        };
+        if !valid { break; }
+        let saved_rbp = unsafe { *(rbp as *const u64) };
+        let return_addr = unsafe { *((rbp + 8) as *const u64) };
+        if return_addr == 0 { break; }
+        log!("    {}: {}", i, format_addr(return_addr, is_user));
+        rbp = saved_rbp;
+    }
+
+    // Stack dump
+    let dump_rsp = frame.rsp;
+    if dump_rsp % 8 == 0 {
         log!("  Stack:");
-        for i in 0..8u64 {
-            let addr = frame.rsp + i * 8;
-            if !symbols::is_valid_user_addr(addr) && !symbols::is_valid_user_addr(addr + 7) { break; }
+        for i in 0..16u64 {
+            let addr = dump_rsp + i * 8;
+            let valid = if is_user {
+                process::is_valid_user_addr(addr)
+            } else {
+                is_kernel_addr(addr)
+            };
+            if !valid { break; }
             let val = unsafe { *(addr as *const u64) };
-            let sym = if let Some((name, off)) = symbols::resolve(val) {
+            let sym = if is_user {
+                if let Some((name, off)) = process::resolve_symbol(val) {
+                    format!("  <{}+{:#x}>", name, off)
+                } else {
+                    alloc::string::String::new()
+                }
+            } else if let Some((name, off)) = symbols::resolve_kernel(val) {
                 format!("  <{}+{:#x}>", name, off)
             } else {
                 alloc::string::String::new()
             };
             log!("    [{:#x}] = {:#018x}{}", addr, val, sym);
-        }
-    }
-
-    // Stack backtrace
-    if is_user {
-        log!("  Backtrace:");
-        log!("    0: {}", format_addr(rip));
-        let mut rbp = regs.rbp;
-        for i in 1..20 {
-            if rbp == 0 || rbp % 8 != 0 {
-                break;
-            }
-            if !symbols::is_valid_user_addr(rbp) || !symbols::is_valid_user_addr(rbp + 8) {
-                break;
-            }
-            let saved_rbp = unsafe { *(rbp as *const u64) };
-            let return_addr = unsafe { *((rbp + 8) as *const u64) };
-            if return_addr == 0 {
-                break;
-            }
-            log!("    {}: {}", i, format_addr(return_addr));
-            rbp = saved_rbp;
         }
     }
 

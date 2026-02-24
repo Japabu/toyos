@@ -4,7 +4,7 @@ use alloc::vec::Vec;
 use super::{cpu, gdt};
 use crate::drivers::acpi;
 use crate::sync::Lock;
-use crate::{device, fd, keyboard, log, message, pipe, process, user_heap, vfs};
+use crate::{device, fd, keyboard, log, message, pipe, process, vfs};
 
 // MSR addresses
 const MSR_EFER: u32 = 0xC000_0080;
@@ -101,9 +101,9 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             let buf = unsafe { core::slice::from_raw_parts_mut(a2 as *mut u8, a3 as usize) };
             sys_read(a1, buf)
         }
-        SYS_ALLOC => user_heap::alloc(a1 as usize, a2 as usize),
-        SYS_FREE => { user_heap::free(a1 as *mut u8, a2 as usize); 0 }
-        SYS_REALLOC => user_heap::realloc(a1 as *mut u8, a2 as usize, a3 as usize, a4 as usize),
+        SYS_ALLOC => process::with_current_mut(|p| crate::user_heap::alloc(&mut p.user_heap, a1 as usize, a2 as usize)),
+        SYS_FREE => { process::with_current_mut(|p| crate::user_heap::free(&mut p.user_heap, a1 as *mut u8, a2 as usize)); 0 }
+        SYS_REALLOC => process::with_current_mut(|p| crate::user_heap::realloc(&mut p.user_heap, a1 as *mut u8, a2 as usize, a3 as usize, a4 as usize)),
         SYS_EXIT => sys_exit(a1 as i32),
         SYS_RANDOM => { sys_random(a1 as *mut u8, a2 as usize); 0 }
         SYS_SCREEN_SIZE => screen_size(),
