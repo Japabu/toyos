@@ -7,5 +7,6 @@ edition = "2021"
 
 [dependencies]
 fatfs = "0.3.6"
+fontdue = "0.9"
 gpt = "3.1.0"
 tyfs = { path = "../tyfs" }

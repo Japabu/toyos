@@ -1,5 +1,4 @@
 mod console;
-mod font;
 mod framebuffer;
 
 use std::io::{Read, Write};
@@ -18,7 +17,8 @@ fn main() {
         window.width(),
         window.pixel_format(),
     );
-    let font = font::Font::new(include_bytes!(concat!(env!("OUT_DIR"), "/font.bin")));
+    let font_data = std::fs::read("/initrd/font.bin").expect("failed to read font");
+    let font = font::Font::new(&font_data);
     let mut console = console::Console::new(fb, font);
 
     let mut child = Command::new("/initrd/shell")

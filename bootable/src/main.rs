@@ -1,4 +1,5 @@
 use fatfs::FsOptions;
+use fontdue::{Font, FontSettings};
 use std::fs;
 use std::io::{Cursor, Read, Write};
 use std::path::Path;
@@ -27,39 +28,97 @@ impl tyfs::Disk for VecDisk {
     fn flush(&mut self) {}
 }
 
-fn create_initrd_image(initrd_dir: &str) -> Vec<u8> {
-    let initrd = Path::new(initrd_dir);
-    assert!(initrd.is_dir(), "initrd directory not found: {}", initrd_dir);
-
-    // Collect files and calculate needed size
-    let mut files: Vec<(String, Vec<u8>)> = Vec::new();
-    for entry in fs::read_dir(initrd).expect("Failed to read initrd") {
-        let entry = entry.expect("Failed to read dir entry");
-        let path = entry.path();
-        if path.is_file() {
-            let name = path.file_name().unwrap().to_str().unwrap().to_string();
-            let data = fs::read(&path).expect("Failed to read file");
-            eprintln!("initrd: adding '{}' ({} bytes)", name, data.len());
-            files.push((name, data));
-        }
-    }
-
-    // Size: header(64) + file data + toc entries(64 each) + padding
+fn create_initrd_image(files: &[(String, Vec<u8>)]) -> Vec<u8> {
     let data_size: usize = files.iter().map(|(_, d)| d.len()).sum();
     let toc_size = files.len() * 64;
-    let size = (64 + data_size + toc_size + 4095) & !4095; // round up to 4K
+    let size = (64 + data_size + toc_size + 4095) & !4095;
     let size = size.max(4096);
 
     let vec_disk = VecDisk::new(size);
     let mut tyfs = SimpleFs::format(vec_disk, size as u64);
 
-    for (name, data) in &files {
+    for (name, data) in files {
+        eprintln!("initrd: adding '{}' ({} bytes)", name, data.len());
         if !tyfs.create(name, data) {
-            panic!("Failed to add '{}' to rootfs image", name);
+            panic!("Failed to add '{}' to initrd image", name);
         }
     }
 
     tyfs.into_disk().data
+}
+
+fn rasterize_font() -> Vec<u8> {
+    const FONT_WIDTH: usize = 8;
+    const FONT_HEIGHT: usize = 16;
+
+    let font_bytes = include_bytes!("../assets/JetBrainsMono-Regular.ttf");
+    let font = Font::from_bytes(font_bytes as &[u8], FontSettings::default())
+        .expect("Failed to parse font");
+
+    let mut codepoints: Vec<u32> = (0u32..=255).collect();
+    codepoints.extend(0x2500u32..=0x257F); // Box Drawing
+    codepoints.extend(0x2580u32..=0x259F); // Block Elements
+
+    let mut px_size = FONT_HEIGHT as f32;
+    loop {
+        let lm = font.horizontal_line_metrics(px_size).unwrap();
+        let asc = lm.ascent.ceil() as i32;
+        let fits = (0x20u32..=0x7E).all(|ch| {
+            let (m, _) = font.rasterize(char::from_u32(ch).unwrap(), px_size);
+            let glyph_top = asc - m.height as i32 - m.ymin;
+            glyph_top >= 0
+                && (glyph_top as usize) + m.height <= FONT_HEIGHT
+                && m.width <= FONT_WIDTH
+        });
+        if fits {
+            break;
+        }
+        px_size -= 0.25;
+        assert!(px_size > 4.0, "Could not find a font size that fits");
+    }
+    let line_metrics = font.horizontal_line_metrics(px_size).unwrap();
+    let ascent = line_metrics.ascent.ceil() as i32;
+
+    let glyph_count = codepoints.len();
+    let mut glyph_data = vec![0u8; glyph_count * FONT_WIDTH * FONT_HEIGHT];
+
+    for (idx, &cp) in codepoints.iter().enumerate() {
+        let Some(c) = char::from_u32(cp) else {
+            continue;
+        };
+        let (metrics, bitmap) = font.rasterize(c, px_size);
+        if metrics.width == 0 || metrics.height == 0 {
+            continue;
+        }
+
+        let x_offset = ((FONT_WIDTH as i32 - metrics.width as i32) / 2).max(0) as usize;
+        let glyph_top = ascent - metrics.height as i32 - metrics.ymin;
+        let y_offset = glyph_top.max(0) as usize;
+        let glyph_base = idx * FONT_WIDTH * FONT_HEIGHT;
+
+        for gy in 0..metrics.height {
+            let cell_y = y_offset + gy;
+            if cell_y >= FONT_HEIGHT {
+                break;
+            }
+            for gx in 0..metrics.width {
+                let cell_x = x_offset + gx;
+                if cell_x >= FONT_WIDTH {
+                    break;
+                }
+                glyph_data[glyph_base + cell_y * FONT_WIDTH + cell_x] =
+                    bitmap[gy * metrics.width + gx];
+            }
+        }
+    }
+
+    let mut output = Vec::with_capacity(4 + glyph_count * 4 + glyph_data.len());
+    output.extend_from_slice(&(glyph_count as u32).to_le_bytes());
+    for &cp in &codepoints {
+        output.extend_from_slice(&cp.to_le_bytes());
+    }
+    output.extend_from_slice(&glyph_data);
+    output
 }
 
 fn create_fat_fs_with_bl_and_kernel(initrd_bytes: &[u8]) -> Vec<u8> {
@@ -209,15 +268,15 @@ fn build() {
         panic!("Failed to build bootloader");
     }
 
-    fs::create_dir_all("../initrd").ok();
-
     // Detect toolchain changes — clean userland targets to avoid stale incremental artifacts
     let sysroot_stamp = fs::read_to_string("../toolchain/.sysroot-stamp").unwrap_or_default();
     let last_stamp_path = "target/.toolchain-stamp";
     let last_stamp = fs::read_to_string(last_stamp_path).unwrap_or_default();
     let toolchain_changed = sysroot_stamp != last_stamp && !sysroot_stamp.is_empty();
 
-    // Build all userland apps (any directory under ../userland with a Cargo.toml)
+    let mut initrd_files: Vec<(String, Vec<u8>)> = Vec::new();
+
+    // Build all userland apps (any directory under ../userland with a Cargo.toml and main.rs)
     for entry in fs::read_dir("../userland").expect("Failed to read userland") {
         let entry = entry.expect("Failed to read dir entry");
         let path = entry.path();
@@ -246,13 +305,16 @@ fn build() {
             panic!("Failed to build userland/{name}");
         }
         let binary = path.join(format!("target/x86_64-unknown-toyos/debug/{name}"));
-        fs::copy(&binary, format!("../initrd/{name}")).expect("Failed to copy binary");
+        let data = fs::read(&binary).expect("Failed to read binary");
+        initrd_files.push((name.to_string(), data));
     }
     if !sysroot_stamp.is_empty() {
         fs::write(last_stamp_path, &sysroot_stamp).ok();
     }
 
-    let initrd_bytes = create_initrd_image("../initrd");
+    initrd_files.push(("font.bin".to_string(), rasterize_font()));
+
+    let initrd_bytes = create_initrd_image(&initrd_files);
     let volume_bytes = create_fat_fs_with_bl_and_kernel(&initrd_bytes);
     let disk_bytes = create_gpt_disk_with_esp_partition(volume_bytes);
 

@@ -1,7 +1,16 @@
-use crate::framebuffer::{Color, Framebuffer};
-
 pub const WIDTH: usize = 8;
 pub const HEIGHT: usize = 16;
+
+#[derive(Clone, Copy)]
+pub struct Color {
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+}
+
+pub trait Canvas {
+    fn put_pixel(&self, x: usize, y: usize, color: Color);
+}
 
 pub struct Font {
     codepoints: Vec<u32>,
@@ -9,7 +18,6 @@ pub struct Font {
 }
 
 impl Font {
-    /// Parse font.bin: [u32 count][u32 codepoints...][glyph data...]
     pub fn new(raw: &[u8]) -> Self {
         assert!(raw.len() >= 4, "Font data too small");
         let count = u32::from_le_bytes(raw[0..4].try_into().unwrap()) as usize;
@@ -33,14 +41,14 @@ impl Font {
     fn glyph_index(&self, ch: char) -> usize {
         self.codepoints
             .binary_search(&(ch as u32))
-            .unwrap_or(0x3F) // '?' for unknown codepoints
+            .unwrap_or(0x3F)
     }
 
     pub fn draw_char(
         &self,
-        fb: &Framebuffer,
-        px: usize,
-        py: usize,
+        canvas: &impl Canvas,
+        x: usize,
+        y: usize,
         ch: char,
         fg: Color,
         bg: Color,
@@ -57,8 +65,22 @@ impl Font {
                     g: ((fg.g as u16 * alpha + bg.g as u16 * inv) / 255) as u8,
                     b: ((fg.b as u16 * alpha + bg.b as u16 * inv) / 255) as u8,
                 };
-                fb.put_pixel(px + gx, py + gy, color);
+                canvas.put_pixel(x + gx, y + gy, color);
             }
+        }
+    }
+
+    pub fn draw_string(
+        &self,
+        canvas: &impl Canvas,
+        x: usize,
+        y: usize,
+        text: &str,
+        fg: Color,
+        bg: Color,
+    ) {
+        for (i, ch) in text.chars().enumerate() {
+            self.draw_char(canvas, x + i * WIDTH, y, ch, fg, bg);
         }
     }
 }

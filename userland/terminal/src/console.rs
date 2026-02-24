@@ -1,4 +1,4 @@
-use crate::font::{self, Font};
+use font::{self, Font};
 use crate::framebuffer::{Color, Framebuffer};
 
 const DEFAULT_FG: Color = Color { r: 255, g: 255, b: 255 };

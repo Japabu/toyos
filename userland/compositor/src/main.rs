@@ -1,4 +1,3 @@
-mod font;
 mod framebuffer;
 
 use std::io::{Read, Write};
@@ -148,7 +147,8 @@ fn main() {
         fb_info.pixel_format,
     );
 
-    let font = font::Font::new(include_bytes!(concat!(env!("OUT_DIR"), "/font.bin")));
+    let font_data = std::fs::read("/initrd/font.bin").expect("failed to read font");
+    let font = font::Font::new(&font_data);
 
     screen.clear(DESKTOP_COLOR);
 

@@ -1,11 +1,6 @@
 use core::ptr;
 
-#[derive(Clone, Copy)]
-pub struct Color {
-    pub r: u8,
-    pub g: u8,
-    pub b: u8,
-}
+pub use font::Color;
 
 #[derive(Clone, Copy, PartialEq)]
 enum PixelFormat {
@@ -119,5 +114,11 @@ impl Framebuffer {
                 );
             }
         }
+    }
+}
+
+impl font::Canvas for Framebuffer {
+    fn put_pixel(&self, x: usize, y: usize, color: Color) {
+        self.put_pixel(x, y, color);
     }
 }
