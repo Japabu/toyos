@@ -102,7 +102,6 @@ pub fn init_process0(
     entry: u64, user_stack_top: u64,
     elf_base: *mut u8, elf_layout: Layout,
     stack_base: *mut u8, stack_layout: Layout,
-    fb_info: Option<fd::FramebufferInfo>,
 ) {
     let table = PROCESS_TABLE.get_mut();
 
@@ -112,13 +111,9 @@ pub fn init_process0(
     let ks_top = ks_base as u64 + KERNEL_STACK_SIZE as u64;
 
     let mut fds: FdTable = Vec::new();
-    fds.push(Some(Descriptor::Keyboard));
-    fds.push(Some(Descriptor::SerialConsole));
-    fds.push(Some(Descriptor::SerialConsole));
-    if let Some(info) = fb_info {
-        fds.push(Some(Descriptor::Framebuffer(info)));
-    }
-    fds.push(Some(Descriptor::Mouse));
+    fds.push(Some(Descriptor::SerialConsole)); // stdin
+    fds.push(Some(Descriptor::SerialConsole)); // stdout
+    fds.push(Some(Descriptor::SerialConsole)); // stderr
 
     // Set up kernel stack so context_switch's `ret` goes to the trampoline
     // that enters ring 3 via iretq.
@@ -250,7 +245,7 @@ pub fn spawn(argv: &[&str], stdin_fd: u64, stdout_fd: u64) -> u64 {
             Descriptor::TtyRead(*id)
         }
         Some(Descriptor::File(file)) => Descriptor::File(file.clone()),
-        _ => Descriptor::Keyboard,
+        _ => Descriptor::SerialConsole,
     };
     child_fds.push(Some(stdin_desc));
 
@@ -330,7 +325,7 @@ pub fn exit(code: i32) -> ! {
     let proc = table.procs[idx].as_mut().unwrap();
 
     // Close all FDs
-    fd::close_all(&mut proc.fds, vfs::global());
+    fd::close_all(&mut proc.fds, vfs::global(), proc.pid);
 
     // Free user memory
     paging::unmap_user(proc.elf_base as u64, proc.elf_layout.size() as u64);

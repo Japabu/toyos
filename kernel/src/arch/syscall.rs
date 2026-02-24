@@ -4,7 +4,7 @@ use alloc::vec::Vec;
 use super::{cpu, gdt};
 use crate::drivers::acpi;
 use crate::sync::SyncCell;
-use crate::{fd, keyboard, log, message, pipe, process, user_heap, vfs};
+use crate::{device, fd, keyboard, log, message, pipe, process, user_heap, vfs};
 
 // MSR addresses
 const MSR_EFER: u32 = 0xC000_0080;
@@ -40,6 +40,9 @@ const SYS_POLL: u64 = 27;
 const SYS_MARK_TTY: u64 = 28;
 const SYS_SEND_MSG: u64 = 29;
 const SYS_RECV_MSG: u64 = 30;
+const SYS_OPEN_DEVICE: u64 = 31;
+const SYS_REGISTER_NAME: u64 = 32;
+const SYS_FIND_PID: u64 = 33;
 
 // Kernel/user RSP storage for stack switching
 #[no_mangle]
@@ -110,8 +113,9 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         SYS_CLOCK => crate::clock::nanos_since_boot(),
         SYS_OPEN => sys_open(a1, a2, a3),
         SYS_CLOSE => {
+            let pid = process::current_pid();
             let proc = process::current();
-            fd::close(&mut proc.fds, vfs::global(), a1)
+            fd::close(&mut proc.fds, vfs::global(), a1, pid)
         }
         SYS_SEEK => {
             let proc = process::current();
@@ -141,6 +145,9 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         }
         SYS_SEND_MSG => sys_send_msg(a1, a2),
         SYS_RECV_MSG => sys_recv_msg(a1),
+        SYS_OPEN_DEVICE => sys_open_device(a1),
+        SYS_REGISTER_NAME => sys_register_name(a1, a2),
+        SYS_FIND_PID => sys_find_pid(a1, a2),
         _ => u64::MAX,
     }
 }
@@ -363,6 +370,32 @@ fn screen_size() -> u64 {
     let cols = *SCREEN_COLS.get() as u64;
     let rows = *SCREEN_ROWS.get() as u64;
     (rows << 32) | cols
+}
+
+fn sys_open_device(device_type: u64) -> u64 {
+    let pid = process::current_pid();
+    let desc = match device::try_claim(device_type, pid) {
+        Some(d) => d,
+        None => return u64::MAX,
+    };
+    let proc = process::current();
+    fd::alloc(&mut proc.fds, desc)
+}
+
+fn sys_register_name(name_ptr: u64, name_len: u64) -> u64 {
+    let slice = unsafe { core::slice::from_raw_parts(name_ptr as *const u8, name_len as usize) };
+    let Ok(name) = core::str::from_utf8(slice) else { return u64::MAX };
+    let pid = process::current_pid();
+    if device::register_name(name, pid) { 0 } else { u64::MAX }
+}
+
+fn sys_find_pid(name_ptr: u64, name_len: u64) -> u64 {
+    let slice = unsafe { core::slice::from_raw_parts(name_ptr as *const u8, name_len as usize) };
+    let Ok(name) = core::str::from_utf8(slice) else { return u64::MAX };
+    match device::find_pid(name) {
+        Some(pid) => pid as u64,
+        None => u64::MAX,
+    }
 }
 
 /// Terminate the current userspace process (called from exception handlers).

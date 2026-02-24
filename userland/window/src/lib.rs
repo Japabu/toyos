@@ -1,6 +1,11 @@
+use std::os::toyos::io;
 use std::os::toyos::message::{self, Message};
+use std::sync::OnceLock;
 
-const COMPOSITOR_PID: u32 = 0;
+fn compositor_pid() -> u32 {
+    static PID: OnceLock<u32> = OnceLock::new();
+    *PID.get_or_init(|| io::find_pid("compositor").expect("no compositor running"))
+}
 
 // Client → Compositor
 pub const MSG_CREATE_WINDOW: u32 = 1;
@@ -55,7 +60,7 @@ impl Window {
     /// Request a window from the compositor. Blocks until the window is created.
     /// Pass 0 for width/height to let the compositor decide.
     pub fn create(width: u32, height: u32) -> Self {
-        message::send(COMPOSITOR_PID, Message::new(
+        message::send(compositor_pid(), Message::new(
             MSG_CREATE_WINDOW,
             CreateWindowRequest { width, height },
         ));
@@ -74,7 +79,7 @@ impl Window {
 
     /// Notify the compositor that the buffer has been updated.
     pub fn present(&self) {
-        message::send(COMPOSITOR_PID, Message::signal(MSG_PRESENT));
+        message::send(compositor_pid(), Message::signal(MSG_PRESENT));
     }
 
     pub fn buffer_ptr(&self) -> *mut u8 {

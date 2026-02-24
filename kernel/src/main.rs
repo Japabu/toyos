@@ -185,14 +185,16 @@ fn kernel_main(
 
     log!("init: entry={:#x}, stack={:#x}, argc={}", loaded.entry, sp, args.len());
 
-    // Create process 0 and start the scheduler (never returns)
-    let fb_info = fd::FramebufferInfo {
+    // Store framebuffer info for open_device claims
+    kernel::device::set_framebuffer_info(fd::FramebufferInfo {
         addr: kernel_args.framebuffer_addr,
         width: kernel_args.framebuffer_width,
         height: kernel_args.framebuffer_height,
         stride: kernel_args.framebuffer_stride,
         pixel_format: kernel_args.framebuffer_pixel_format,
-    };
-    process::init_process0(loaded.entry, sp, loaded.base_ptr, elf_layout, stack_base, stack_layout, Some(fb_info));
+    });
+
+    // Create process 0 and start the scheduler (never returns)
+    process::init_process0(loaded.entry, sp, loaded.base_ptr, elf_layout, stack_base, stack_layout);
     unreachable!();
 }

@@ -34,6 +34,8 @@ pub mod pipe;
 #[cfg(not(test))]
 pub mod message;
 #[cfg(not(test))]
+pub mod device;
+#[cfg(not(test))]
 pub mod user_heap;
 
 #[repr(C)]

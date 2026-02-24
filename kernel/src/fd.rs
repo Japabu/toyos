@@ -2,7 +2,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::vfs::Vfs;
-use crate::{keyboard, mouse, log, pipe};
+use crate::{device, keyboard, mouse, log, pipe};
 use crate::drivers::serial;
 
 const O_WRITE: u64 = 2;
@@ -92,11 +92,11 @@ pub fn open(table: &mut FdTable, vfs: &mut Vfs, path: &str, flags: u64) -> u64 {
     alloc(table, Descriptor::File(file))
 }
 
-pub fn close(table: &mut FdTable, vfs: &mut Vfs, fd: u64) -> u64 {
+pub fn close(table: &mut FdTable, vfs: &mut Vfs, fd: u64, pid: u32) -> u64 {
     let Some(desc) = table.get_mut(fd as usize).and_then(|slot| slot.take()) else {
         return u64::MAX;
     };
-    match desc {
+    match &desc {
         Descriptor::File(file) => {
             if file.modified && file.writable {
                 if !vfs.write_file(&file.path, &file.data) {
@@ -104,9 +104,12 @@ pub fn close(table: &mut FdTable, vfs: &mut Vfs, fd: u64) -> u64 {
                 }
             }
         }
-        Descriptor::PipeRead(id) | Descriptor::TtyRead(id) => pipe::close_read(id),
-        Descriptor::PipeWrite(id) | Descriptor::TtyWrite(id) => pipe::close_write(id),
-        Descriptor::Keyboard | Descriptor::Mouse | Descriptor::SerialConsole | Descriptor::Framebuffer(_) => {}
+        Descriptor::PipeRead(id) | Descriptor::TtyRead(id) => pipe::close_read(*id),
+        Descriptor::PipeWrite(id) | Descriptor::TtyWrite(id) => pipe::close_write(*id),
+        Descriptor::Keyboard | Descriptor::Mouse | Descriptor::Framebuffer(_) => {
+            device::release_descriptor(&desc, pid);
+        }
+        Descriptor::SerialConsole => {}
     }
     0
 }
@@ -246,10 +249,10 @@ pub fn fsync(table: &mut FdTable, vfs: &mut Vfs, fd: u64) -> u64 {
     0
 }
 
-pub fn close_all(table: &mut FdTable, vfs: &mut Vfs) {
+pub fn close_all(table: &mut FdTable, vfs: &mut Vfs, pid: u32) {
     for slot in table.iter_mut() {
         if let Some(desc) = slot.take() {
-            match desc {
+            match &desc {
                 Descriptor::File(file) => {
                     if file.modified && file.writable {
                         if !vfs.write_file(&file.path, &file.data) {
@@ -257,9 +260,12 @@ pub fn close_all(table: &mut FdTable, vfs: &mut Vfs) {
                         }
                     }
                 }
-                Descriptor::PipeRead(id) | Descriptor::TtyRead(id) => pipe::close_read(id),
-                Descriptor::PipeWrite(id) | Descriptor::TtyWrite(id) => pipe::close_write(id),
-                Descriptor::Keyboard | Descriptor::Mouse | Descriptor::SerialConsole | Descriptor::Framebuffer(_) => {}
+                Descriptor::PipeRead(id) | Descriptor::TtyRead(id) => pipe::close_read(*id),
+                Descriptor::PipeWrite(id) | Descriptor::TtyWrite(id) => pipe::close_write(*id),
+                Descriptor::Keyboard | Descriptor::Mouse | Descriptor::Framebuffer(_) => {
+                    device::release_descriptor(&desc, pid);
+                }
+                Descriptor::SerialConsole => {}
             }
         }
     }

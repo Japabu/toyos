@@ -39,16 +39,6 @@ const CURSOR_SPRITE: [&[u8]; CURSOR_HEIGHT] = [
     b".....BB.....",
 ];
 
-const MOUSE_FD: u64 = 4;
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct MouseEvent {
-    buttons: u8,
-    dx: i8,
-    dy: i8,
-}
-
 struct Cursor {
     x: i32,
     y: i32,
@@ -111,7 +101,7 @@ struct FramebufferInfo {
     pixel_format: u32,
 }
 
-fn read_fb_info() -> FramebufferInfo {
+fn read_fb_info(fd: u64) -> FramebufferInfo {
     let mut info = FramebufferInfo {
         addr: 0,
         width: 0,
@@ -125,10 +115,10 @@ fn read_fb_info() -> FramebufferInfo {
             std::mem::size_of::<FramebufferInfo>(),
         )
     };
-    let n = io::read_fd(3, buf);
+    let n = io::read_fd(fd, buf);
     assert!(
         n == std::mem::size_of::<FramebufferInfo>(),
-        "Failed to read framebuffer info from FD 3"
+        "failed to read framebuffer info"
     );
     info
 }
@@ -143,9 +133,13 @@ struct WindowState {
 }
 
 fn main() {
-    io::set_stdin_raw(true);
+    io::register_name("compositor").expect("compositor already running");
 
-    let fb_info = read_fb_info();
+    let kb_fd = io::open_device(io::DeviceType::Keyboard).expect("failed to claim keyboard");
+    let mouse_fd = io::open_device(io::DeviceType::Mouse).expect("failed to claim mouse");
+    let fb_fd = io::open_device(io::DeviceType::Framebuffer).expect("failed to claim framebuffer");
+
+    let fb_info = read_fb_info(fb_fd);
     let screen = Framebuffer::new(
         fb_info.addr,
         fb_info.width,
@@ -168,7 +162,6 @@ fn main() {
     let mut terminal_stdout = child.stdout.take().unwrap();
     let terminal_stdout_fd = terminal_stdout.as_raw_fd();
 
-    let stdin = std::io::stdin();
     let stdout = std::io::stdout();
 
     let mut windows: Vec<WindowState> = Vec::new();
@@ -178,11 +171,11 @@ fn main() {
     cursor.show(&screen);
 
     loop {
-        let ready = io::poll(&[0, terminal_stdout_fd, MOUSE_FD]);
+        let ready = io::poll(&[kb_fd, mouse_fd, terminal_stdout_fd]);
 
         if ready.fd(0) {
             let mut buf = [0u8; 64];
-            let n = stdin.lock().read(&mut buf).unwrap_or(0);
+            let n = io::read_fd(kb_fd, &mut buf);
             if n > 0 {
                 if let Some(win) = windows.first() {
                     let mut event = window::KeyEvent {
@@ -195,23 +188,20 @@ fn main() {
             }
         }
 
-        if ready.fd(2) {
+        if ready.fd(1) {
             let mut buf = [0u8; 3];
-            let n = io::read_fd(MOUSE_FD, &mut buf);
+            let n = io::read_fd(mouse_fd, &mut buf);
             if n >= 3 {
-                let event = MouseEvent {
-                    buttons: buf[0],
-                    dx: buf[1] as i8,
-                    dy: buf[2] as i8,
-                };
+                let dx = buf[1] as i8;
+                let dy = buf[2] as i8;
                 cursor.hide(&screen);
-                cursor.x = (cursor.x + event.dx as i32).clamp(0, screen_w - 1);
-                cursor.y = (cursor.y + event.dy as i32).clamp(0, screen_h - 1);
+                cursor.x = (cursor.x + dx as i32).clamp(0, screen_w - 1);
+                cursor.y = (cursor.y + dy as i32).clamp(0, screen_h - 1);
                 cursor.show(&screen);
             }
         }
 
-        if ready.fd(1) {
+        if ready.fd(2) {
             let mut buf = [0u8; 4096];
             let n = terminal_stdout.read(&mut buf).unwrap_or(0);
             if n == 0 {
