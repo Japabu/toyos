@@ -16,11 +16,11 @@ use uefi::{
 };
 use uefi_services::println;
 
-/// Allocate a zeroed Vec<u8> with page (4096-byte) alignment.
-fn alloc_page_aligned(size: usize) -> vec::Vec<u8> {
-    let layout = Layout::from_size_align(size, 4096).expect("invalid layout");
+fn alloc_kernel_memory(size: usize) -> vec::Vec<u8> {
+    const KERNEL_ALIGN: usize = 2 * 1024 * 1024; // 2MB
+    let layout = Layout::from_size_align(size, KERNEL_ALIGN).expect("invalid layout");
     let ptr = unsafe { alloc::alloc::alloc_zeroed(layout) };
-    assert!(!ptr.is_null(), "page-aligned allocation failed");
+    assert!(!ptr.is_null(), "kernel allocation failed");
     unsafe { vec::Vec::from_raw_parts(ptr, size, size) }
 }
 
@@ -110,7 +110,7 @@ fn load_kernel_elf(kernel_elf_bytes: &[u8]) -> LoadedKernel {
 
     println!("Kernel memory size: {}", mem_size);
 
-    let mut process_mem = alloc_page_aligned(mem_size);
+    let mut process_mem = alloc_kernel_memory(mem_size);
     println!("Kernel memory located at: {:?}", process_mem.as_ptr());
 
     // handle load segments

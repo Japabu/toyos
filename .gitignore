@@ -1,3 +1,5 @@
 target/
 .claude/
+.vscode/
 toolchain/.sysroot-stamp
+.mcp.json

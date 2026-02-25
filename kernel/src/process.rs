@@ -360,8 +360,8 @@ pub fn spawn(argv: &[&str], stdin_fd: u64, stdout_fd: u64) -> u64 {
     // Set the actual PID now that we know it
     table.procs.get_mut(pid).unwrap().pid = pid;
 
-    log!("spawn: pid={} cr3={:#x} entry={:#x} stack={:#x} ks={:#x}..{:#x} rsp={:#x}",
-        pid, child_cr3, loaded.entry, sp, ks_base as u64, ks_top, frame_ptr as u64);
+    log!("spawn: {} pid={} base={:#x} entry={:#x} cr3={:#x} ks={:#x}..{:#x}",
+        path, pid, loaded.base_ptr as u64, loaded.entry, child_cr3, ks_base as u64, ks_top);
 
     pid as u64
 }
