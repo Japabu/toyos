@@ -5,7 +5,7 @@ use std::os::toyos::io::{self, AsRawFd};
 use std::os::toyos::message::{self, Message};
 use std::process::{Command, Stdio};
 
-use framebuffer::{Color, Framebuffer};
+use framebuffer::{Color, CursorImage, Framebuffer};
 
 const MARGIN: usize = 40;
 const TITLE_BAR_HEIGHT: usize = 28;
@@ -15,77 +15,6 @@ const DESKTOP_COLOR: Color = Color { r: 0x2d, g: 0x2d, b: 0x2d };
 const TITLE_BAR_COLOR: Color = Color { r: 0x33, g: 0x33, b: 0x33 };
 const BORDER_COLOR: Color = Color { r: 0x55, g: 0x55, b: 0x55 };
 const TITLE_TEXT_COLOR: Color = Color { r: 0xcc, g: 0xcc, b: 0xcc };
-
-struct CursorImage {
-    width: usize,
-    height: usize,
-    data: Vec<u8>,
-}
-
-impl CursorImage {
-    fn new(raw: &[u8]) -> Self {
-        let width = u32::from_le_bytes(raw[0..4].try_into().unwrap()) as usize;
-        let height = u32::from_le_bytes(raw[4..8].try_into().unwrap()) as usize;
-        let data = raw[8..8 + width * height * 4].to_vec();
-        Self { width, height, data }
-    }
-
-    fn pixel(&self, x: usize, y: usize) -> (Color, u8) {
-        let off = (y * self.width + x) * 4;
-        (
-            Color { r: self.data[off], g: self.data[off + 1], b: self.data[off + 2] },
-            self.data[off + 3],
-        )
-    }
-}
-
-struct Cursor {
-    x: i32,
-    y: i32,
-    image: CursorImage,
-    saved_bg: Vec<Color>,
-    visible: bool,
-}
-
-impl Cursor {
-    fn new(x: i32, y: i32, image: CursorImage) -> Self {
-        let saved_bg = vec![Color { r: 0, g: 0, b: 0 }; image.width * image.height];
-        Self { x, y, image, saved_bg, visible: false }
-    }
-
-    fn hide(&mut self, fb: &Framebuffer) {
-        if !self.visible { return; }
-        for cy in 0..self.image.height {
-            for cx in 0..self.image.width {
-                let sx = self.x as usize + cx;
-                let sy = self.y as usize + cy;
-                fb.put_pixel(sx, sy, self.saved_bg[cy * self.image.width + cx]);
-            }
-        }
-        self.visible = false;
-    }
-
-    fn show(&mut self, fb: &Framebuffer) {
-        for cy in 0..self.image.height {
-            for cx in 0..self.image.width {
-                let sx = self.x as usize + cx;
-                let sy = self.y as usize + cy;
-                self.saved_bg[cy * self.image.width + cx] = fb.read_pixel(sx, sy);
-            }
-        }
-        for cy in 0..self.image.height {
-            for cx in 0..self.image.width {
-                let (color, alpha) = self.image.pixel(cx, cy);
-                if alpha > 0 {
-                    let sx = self.x as usize + cx;
-                    let sy = self.y as usize + cy;
-                    fb.put_pixel(sx, sy, color);
-                }
-            }
-        }
-        self.visible = true;
-    }
-}
 
 #[repr(C)]
 struct FramebufferInfo {
@@ -146,7 +75,7 @@ fn main() {
     let font_data = std::fs::read("/initrd/font.bin").expect("failed to read font");
     let font = font::Font::new(&font_data);
     let cursor_data = std::fs::read("/initrd/cursor.bin").expect("failed to read cursor");
-    let cursor_image = CursorImage::new(&cursor_data);
+    let cursor = CursorImage::new(&cursor_data);
 
     screen.clear(DESKTOP_COLOR);
 
@@ -165,10 +94,16 @@ fn main() {
     let mut windows: Vec<WindowState> = Vec::new();
     let screen_w = screen.width() as i32;
     let screen_h = screen.height() as i32;
-    let mut cursor = Cursor::new(screen_w / 2, screen_h / 2, cursor_image);
-    cursor.show(&screen);
+    let mut cursor_x = screen_w / 2;
+    let mut cursor_y = screen_h / 2;
+    let mut dirty = true;
 
     loop {
+        if dirty {
+            screen.present(cursor_x, cursor_y, &cursor);
+            dirty = false;
+        }
+
         let ready = io::poll(&[kb_fd, mouse_fd, terminal_stdout_fd]);
 
         if ready.fd(0) {
@@ -192,10 +127,9 @@ fn main() {
             if n >= 3 {
                 let dx = buf[1] as i8;
                 let dy = buf[2] as i8;
-                cursor.hide(&screen);
-                cursor.x = (cursor.x + dx as i32).clamp(0, screen_w - 1);
-                cursor.y = (cursor.y + dy as i32).clamp(0, screen_h - 1);
-                cursor.show(&screen);
+                cursor_x = (cursor_x + dx as i32).clamp(0, screen_w - 1);
+                cursor_y = (cursor_y + dy as i32).clamp(0, screen_h - 1);
+                dirty = true;
             }
         }
 
@@ -263,10 +197,10 @@ fn main() {
                             pixel_format,
                         },
                     ));
+                    dirty = true;
                 }
                 window::MSG_PRESENT => {
                     if let Some(win) = windows.iter().find(|w| w.pid == sender) {
-                        cursor.hide(&screen);
                         screen.blit(
                             win.content_x,
                             win.content_y,
@@ -274,7 +208,7 @@ fn main() {
                             win.height,
                             &win.buffer,
                         );
-                        cursor.show(&screen);
+                        dirty = true;
                     }
                 }
                 _ => {}
