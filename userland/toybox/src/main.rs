@@ -6,6 +6,7 @@ mod ls;
 mod pwd;
 mod rm;
 mod shutdown;
+mod spin;
 
 macro_rules! commands {
     ($($name:ident),*) => {
@@ -18,7 +19,7 @@ macro_rules! commands {
     };
 }
 
-commands!(cat, echo, grep, keyboard, ls, pwd, rm, shutdown);
+commands!(cat, echo, grep, keyboard, ls, pwd, rm, shutdown, spin);
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();

@@ -16,6 +16,12 @@ pub fn yield_now() {
     schedule(ProcessState::Ready);
 }
 
+/// Timer preemption: called from the timer interrupt handler when a process
+/// is interrupted in user mode. Same as yield — mark Ready, switch to next.
+pub fn preempt() {
+    yield_now();
+}
+
 /// Mark current process with `cur_state`, find next ready process, context switch.
 ///
 /// Single-pass: if no Ready process is found, saves the current process's RSP

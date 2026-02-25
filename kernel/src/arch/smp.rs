@@ -199,6 +199,7 @@ extern "C" fn ap_entry() -> ! {
     percpu::init_ap(cpu_id, lapic_id as u32);
     syscall::init();
     apic::init_ap();
+    apic::init_timer_ap();
 
     log!("Hello from CPU {} (LAPIC ID {})", cpu_id, lapic_id);
     AP_STARTED.store(true, Ordering::Release);

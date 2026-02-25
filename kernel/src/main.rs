@@ -129,6 +129,7 @@ fn kernel_main(
     }
 
     syscall::init();
+    apic::init_timer();
     log!("Ring 3: ready");
 
     // Boot secondary CPUs

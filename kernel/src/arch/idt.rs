@@ -25,6 +25,9 @@ const PF_PRESENT: u64 = 1 << 0;
 const PF_WRITE: u64 = 1 << 1;
 const PF_INSTRUCTION_FETCH: u64 = 1 << 4;
 
+// Timer vector
+const VECTOR_TIMER: usize = 0x20;
+
 // IPI vectors
 const VECTOR_TLB_FLUSH: usize = 0xFE;
 
@@ -154,6 +157,7 @@ pub fn init() {
         idt.entries[VECTOR_INVALID_OPCODE as usize] = IdtEntry::new(ud_entry as u64);
         idt.entries[VECTOR_GPF as usize] = IdtEntry::new(gpf_entry as u64);
         idt.entries[VECTOR_PAGE_FAULT as usize] = IdtEntry::new(page_fault_entry as u64);
+        idt.entries[VECTOR_TIMER] = IdtEntry::new(timer_entry as u64);
         idt.entries[VECTOR_TLB_FLUSH] = IdtEntry::new(tlb_flush_entry as u64);
     }
 
@@ -182,6 +186,50 @@ extern "C" fn tlb_flush_entry() {
         "pop rax",
         "iretq",
     );
+}
+
+// --- Timer interrupt (vector 0x20) ---
+// Ring 3: save all registers, preempt, restore, iretq.
+// Ring 0: just EOI and return (no preemption while kernel code runs).
+#[unsafe(naked)]
+extern "C" fn timer_entry() {
+    naked_asm!(
+        // No error code for interrupts. CS is at [rsp + 8].
+        "test dword ptr [rsp + 8], 3",
+        "jz 2f",
+
+        // Ring 3: preempt
+        "swapgs",
+        "push 0", // dummy error code for stack layout consistency
+        "push r15", "push r14", "push r13", "push r12",
+        "push r11", "push r10", "push r9",  "push r8",
+        "push rbp", "push rdi", "push rsi", "push rdx",
+        "push rcx", "push rbx", "push rax",
+        "call {handler}",
+        "pop rax",  "pop rbx",  "pop rcx",  "pop rdx",
+        "pop rsi",  "pop rdi",  "pop rbp",
+        "pop r8",   "pop r9",   "pop r10",  "pop r11",
+        "pop r12",  "pop r13",  "pop r14",  "pop r15",
+        "add rsp, 8", // pop dummy error code
+        "swapgs",
+        "iretq",
+
+        // Ring 0: EOI only
+        "2:",
+        "push rax",
+        "push rdx",
+        "mov rdx, [rip + LAPIC_BASE]",
+        "mov dword ptr [rdx + 0xB0], 0",
+        "pop rdx",
+        "pop rax",
+        "iretq",
+        handler = sym timer_handler,
+    );
+}
+
+extern "C" fn timer_handler() {
+    crate::arch::apic::eoi();
+    crate::scheduler::preempt();
 }
 
 // --- Exception entry stubs ---
