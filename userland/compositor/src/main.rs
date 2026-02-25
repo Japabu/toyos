@@ -4,7 +4,7 @@ use std::os::toyos::io;
 use std::os::toyos::message::{self, Message};
 use std::process::Command;
 
-use framebuffer::{Color, CursorImage, Framebuffer};
+use framebuffer::{Color, Framebuffer};
 
 const TITLE_BAR_HEIGHT: usize = 28;
 const BORDER_WIDTH: usize = 1;
@@ -76,6 +76,7 @@ struct WindowState {
     height: usize,
     buf_width: usize,
     buf_height: usize,
+    title: String,
 }
 
 enum HitZone {
@@ -143,7 +144,7 @@ fn redraw(
     windows: &[WindowState],
     cursor_x: i32,
     cursor_y: i32,
-    cursor: &CursorImage,
+    cursor: &sprite::Sprite,
 ) {
     screen.clear(DESKTOP_COLOR);
 
@@ -172,7 +173,8 @@ fn redraw(
         // Title text
         let title_x = win_x + BORDER_WIDTH + 8;
         let title_y = win_y + BORDER_WIDTH + (TITLE_BAR_HEIGHT - 16) / 2;
-        font.draw_string(screen, title_x, title_y, "Terminal", text_color, title_color);
+        let title = if win.title.is_empty() { "Window" } else { &win.title };
+        font.draw_string(screen, title_x, title_y, title, text_color, title_color);
 
         // Close button
         let close_x = win_x + win_w - BORDER_WIDTH - CLOSE_BUTTON_WIDTH;
@@ -210,7 +212,10 @@ fn redraw(
         );
         let text_x = tab_x + 8;
         let text_y = taskbar_y + (TASKBAR_HEIGHT - 16) / 2;
-        font.draw_string(screen, text_x, text_y, "Terminal", fg, bg);
+        let max_chars = (TASKBAR_ITEM_WIDTH - 16) / font::WIDTH;
+        let title = if _win.title.is_empty() { "Window" } else { &_win.title };
+        let display: String = title.chars().take(max_chars).collect();
+        font.draw_string(screen, text_x, text_y, &display, fg, bg);
     }
 
     // "+" button on right
@@ -251,8 +256,10 @@ fn main() {
 
     let font_data = std::fs::read("/initrd/font.bin").expect("failed to read font");
     let font = font::Font::new(&font_data);
-    let cursor_data = std::fs::read("/initrd/cursor.bin").expect("failed to read cursor");
-    let cursor = CursorImage::new(&cursor_data);
+    let cursor_svg = std::fs::read("/initrd/cursor-bold.svg").expect("failed to read cursor");
+    let cursor_default = sprite::Sprite::from_svg_colored(&cursor_svg, 20, [255, 255, 255]);
+    let resize_svg = std::fs::read("/initrd/arrow-down-right-bold.svg").expect("failed to read resize cursor");
+    let cursor_resize = sprite::Sprite::from_svg_colored(&resize_svg, 20, [255, 255, 255]);
 
     Command::new("/initrd/terminal")
         .spawn()
@@ -269,7 +276,14 @@ fn main() {
 
     loop {
         if dirty {
-            redraw(&screen, &font, &windows, cursor_x, cursor_y, &cursor);
+            let active_cursor = match interaction {
+                Interaction::Resizing { .. } => &cursor_resize,
+                _ => match hit_test(&windows, cursor_x, cursor_y, screen_w, screen_h) {
+                    HitZone::ResizeCorner(_) => &cursor_resize,
+                    _ => &cursor_default,
+                },
+            };
+            redraw(&screen, &font, &windows, cursor_x, cursor_y, active_cursor);
             io::gpu_present();
             screen.swap();
             dirty = false;
@@ -343,6 +357,13 @@ fn main() {
                                 let win = windows.remove(idx);
                                 windows.push(win);
                             }
+                            let win = windows.last().unwrap();
+                            let local_x = (cursor_x - win.content_x as i32).max(0) as u16;
+                            let local_y = (cursor_y - win.content_y as i32).max(0) as u16;
+                            message::send(win.pid, Message::new(
+                                window::MSG_MOUSE_INPUT,
+                                window::MouseEvent { x: local_x, y: local_y, button: 1 },
+                            ));
                         }
                         HitZone::TaskbarItem(idx) => {
                             if idx < windows.len() && idx != windows.len() - 1 {
@@ -417,7 +438,13 @@ fn main() {
             let sender = msg.sender();
             match msg.msg_type() {
                 window::MSG_CREATE_WINDOW => {
-                    let _req: window::CreateWindowRequest = msg.take_payload();
+                    let req: window::CreateWindowRequest = msg.take_payload();
+                    let title = if req.title_len > 0 {
+                        let len = (req.title_len as usize).min(31);
+                        String::from_utf8_lossy(&req.title[..len]).into_owned()
+                    } else {
+                        String::new()
+                    };
 
                     let screen_w = screen.width();
                     let screen_h = screen.height();
@@ -450,6 +477,7 @@ fn main() {
                         height: content_h,
                         buf_width: content_w,
                         buf_height: content_h,
+                        title,
                     });
 
                     message::send(sender, Message::new(

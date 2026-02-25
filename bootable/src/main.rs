@@ -70,8 +70,7 @@ fn build() {
         fs::write(last_stamp_path, &sysroot_stamp).ok();
     }
 
-    initrd_files.push(("font.bin".to_string(), assets::rasterize_font()));
-    initrd_files.push(("cursor.bin".to_string(), assets::generate_cursor()));
+    initrd_files.extend(assets::collect());
 
     // Generate symlinks for toybox commands by scanning its source modules
     let mut symlinks: Vec<(String, String)> = Vec::new();

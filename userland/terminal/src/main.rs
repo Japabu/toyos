@@ -9,7 +9,7 @@ use std::process::Command;
 use window::Window;
 
 fn main() {
-    let mut window = Window::create(0, 0);
+    let mut window = Window::create_with_title(0, 0, "Terminal");
     io::set_screen_size(window.width(), window.height());
     let fb = framebuffer::Framebuffer::new(
         window.buffer_ptr() as u64,
@@ -51,6 +51,7 @@ fn main() {
                 window::Event::KeyInput(event) => {
                     shell_stdin.write_all(&event.translated[..event.len as usize]).ok();
                 }
+                window::Event::MouseInput(_) => {}
                 window::Event::Close => break,
                 window::Event::Resized => {
                     io::set_screen_size(window.width(), window.height());

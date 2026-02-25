@@ -16,11 +16,22 @@ pub const MSG_WINDOW_CREATED: u32 = 1;
 pub const MSG_KEY_INPUT: u32 = 2;
 pub const MSG_WINDOW_RESIZED: u32 = 3;
 pub const MSG_WINDOW_CLOSE: u32 = 4;
+pub const MSG_MOUSE_INPUT: u32 = 5;
 
 #[repr(C)]
 pub struct CreateWindowRequest {
     pub width: u32,
     pub height: u32,
+    pub title_len: u8,
+    pub title: [u8; 31],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct MouseEvent {
+    pub x: u16,
+    pub y: u16,
+    pub button: u8,
 }
 
 #[repr(C)]
@@ -55,6 +66,7 @@ impl KeyEvent {
 
 pub enum Event {
     KeyInput(KeyEvent),
+    MouseInput(MouseEvent),
     Resized,
     Close,
 }
@@ -70,10 +82,21 @@ impl Window {
     /// Request a window from the compositor. Blocks until the window is created.
     /// Pass 0 for width/height to let the compositor decide.
     pub fn create(width: u32, height: u32) -> Self {
-        message::send(compositor_pid(), Message::new(
-            MSG_CREATE_WINDOW,
-            CreateWindowRequest { width, height },
-        ));
+        Self::create_with_title(width, height, "")
+    }
+
+    pub fn create_with_title(width: u32, height: u32, title: &str) -> Self {
+        let mut req = CreateWindowRequest {
+            width,
+            height,
+            title_len: 0,
+            title: [0; 31],
+        };
+        let bytes = title.as_bytes();
+        let len = bytes.len().min(31);
+        req.title[..len].copy_from_slice(&bytes[..len]);
+        req.title_len = len as u8;
+        message::send(compositor_pid(), Message::new(MSG_CREATE_WINDOW, req));
 
         let response = message::recv();
         assert_eq!(response.msg_type(), MSG_WINDOW_CREATED, "unexpected message from compositor");
@@ -94,6 +117,7 @@ impl Window {
         let msg = message::recv();
         match msg.msg_type() {
             MSG_KEY_INPUT => Event::KeyInput(msg.take_payload()),
+            MSG_MOUSE_INPUT => Event::MouseInput(msg.take_payload()),
             MSG_WINDOW_RESIZED => {
                 let info: WindowInfo = msg.take_payload();
                 self.buffer = io::map_shared(info.token);

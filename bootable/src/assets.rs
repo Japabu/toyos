@@ -1,6 +1,25 @@
+use std::fs;
+
 use fontdue::{Font, FontSettings};
 
-pub fn rasterize_font() -> Vec<u8> {
+pub fn collect() -> Vec<(String, Vec<u8>)> {
+    let mut files = vec![("font.bin".to_string(), rasterize_font())];
+
+    for entry in fs::read_dir("assets/icons").expect("Failed to read assets/icons") {
+        let entry = entry.expect("Failed to read dir entry");
+        let path = entry.path();
+        if path.extension().map_or(false, |e| e == "svg") {
+            let stem = path.file_stem().unwrap().to_str().unwrap();
+            let name = format!("{stem}.svg");
+            let data = fs::read(&path).expect("Failed to read SVG asset");
+            files.push((name, data));
+        }
+    }
+
+    files
+}
+
+fn rasterize_font() -> Vec<u8> {
     const FONT_WIDTH: usize = 8;
     const FONT_HEIGHT: usize = 16;
 
@@ -74,40 +93,3 @@ pub fn rasterize_font() -> Vec<u8> {
     output
 }
 
-pub fn generate_cursor() -> Vec<u8> {
-    const WIDTH: u32 = 12;
-    const HEIGHT: u32 = 17;
-    const SPRITE: [&[u8]; HEIGHT as usize] = [
-        b"B...........",
-        b"BB..........",
-        b"BWB.........",
-        b"BWWB........",
-        b"BWWWB.......",
-        b"BWWWWB......",
-        b"BWWWWWB.....",
-        b"BWWWWWWB....",
-        b"BWWWWWWWB...",
-        b"BWWWWWWWWB..",
-        b"BWWWWWBBBBB.",
-        b"BWWBWWB.....",
-        b"BWBBWWB.....",
-        b"BB..BWWB....",
-        b"B...BWWB....",
-        b"....BWWB....",
-        b".....BB.....",
-    ];
-
-    let mut output = Vec::with_capacity(8 + (WIDTH * HEIGHT * 4) as usize);
-    output.extend_from_slice(&WIDTH.to_le_bytes());
-    output.extend_from_slice(&HEIGHT.to_le_bytes());
-    for row in &SPRITE {
-        for &pixel in *row {
-            match pixel {
-                b'B' => output.extend_from_slice(&[0, 0, 0, 255]),
-                b'W' => output.extend_from_slice(&[255, 255, 255, 255]),
-                _ => output.extend_from_slice(&[0, 0, 0, 0]),
-            }
-        }
-    }
-    output
-}

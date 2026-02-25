@@ -8,21 +8,6 @@ enum PixelFormat {
     Bgr,
 }
 
-pub struct CursorImage {
-    width: usize,
-    height: usize,
-    data: Vec<u8>,
-}
-
-impl CursorImage {
-    pub fn new(raw: &[u8]) -> Self {
-        let width = u32::from_le_bytes(raw[0..4].try_into().unwrap()) as usize;
-        let height = u32::from_le_bytes(raw[4..8].try_into().unwrap()) as usize;
-        let data = raw[8..8 + width * height * 4].to_vec();
-        Self { width, height, data }
-    }
-}
-
 pub struct Framebuffer {
     bufs: [*mut u8; 2],
     back_idx: usize,
@@ -155,30 +140,17 @@ impl Framebuffer {
         }
     }
 
-    /// Overlay cursor onto the back buffer.
-    pub fn draw_cursor(&self, cursor_x: i32, cursor_y: i32, cursor: &CursorImage) {
-        for cy in 0..cursor.height {
-            let sy = cursor_y as usize + cy;
-            if sy >= self.height { break; }
-            for cx in 0..cursor.width {
-                let sx = cursor_x as usize + cx;
-                if sx >= self.width { break; }
-                let off = (cy * cursor.width + cx) * 4;
-                let alpha = cursor.data[off + 3];
-                if alpha > 0 {
-                    let color = Color {
-                        r: cursor.data[off],
-                        g: cursor.data[off + 1],
-                        b: cursor.data[off + 2],
-                    };
-                    let pixel = self.encode_pixel(color);
-                    let dst_offset = (sy * self.stride + sx) * 4;
-                    unsafe {
-                        ptr::copy_nonoverlapping(pixel.as_ptr(), self.back().add(dst_offset), 4);
-                    }
-                }
-            }
-        }
+    /// Overlay cursor sprite onto the back buffer.
+    pub fn draw_cursor(&self, cursor_x: i32, cursor_y: i32, cursor: &sprite::Sprite) {
+        cursor.draw(
+            self.back(),
+            self.stride,
+            self.width,
+            self.height,
+            self.pixel_format_raw(),
+            cursor_x.max(0) as usize,
+            cursor_y.max(0) as usize,
+        );
     }
 }
 
