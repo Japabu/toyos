@@ -4,52 +4,83 @@ use alloc::vec::Vec;
 
 use crate::sync::Lock;
 
-static KEY_BUF: Lock<VecDeque<u8>> = Lock::new(VecDeque::new());
+pub const MOD_SHIFT: u8 = 1;
+pub const MOD_CTRL: u8 = 2;
+pub const MOD_ALT: u8 = 4;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct RawKeyEvent {
+    pub keycode: u8,
+    pub modifiers: u8,
+    pub len: u8,
+    pub translated: [u8; 5],
+}
+
+static KEY_BUF: Lock<VecDeque<RawKeyEvent>> = Lock::new(VecDeque::new());
 static PREV_REPORT: Lock<[u8; 8]> = Lock::new([0; 8]);
 
 /// Process a HID boot protocol keyboard report (8 bytes).
 pub fn handle_report(report: &[u8]) {
-    let modifiers = report[0];
-    let shift = (modifiers & 0x22) != 0;
-    let ctrl = (modifiers & 0x11) != 0;
-    let alt = (modifiers & 0x44) != 0;
+    let hid_modifiers = report[0];
+    let shift = (hid_modifiers & 0x22) != 0;
+    let ctrl = (hid_modifiers & 0x11) != 0;
+    let alt = (hid_modifiers & 0x44) != 0;
     let prev = *PREV_REPORT.lock();
+
+    let modifiers = if shift { MOD_SHIFT } else { 0 }
+        | if ctrl { MOD_CTRL } else { 0 }
+        | if alt { MOD_ALT } else { 0 };
 
     for i in 2..8 {
         let keycode = report[i];
         if keycode < 4 { continue; }
         if !prev[2..8].contains(&keycode) {
-            match keycode {
-                0x4F => { handle_key(0x1B); handle_key(b'['); handle_key(b'C'); }
-                0x50 => { handle_key(0x1B); handle_key(b'['); handle_key(b'D'); }
-                0x51 => { handle_key(0x1B); handle_key(b'['); handle_key(b'B'); }
-                0x52 => { handle_key(0x1B); handle_key(b'['); handle_key(b'A'); }
-                0x4A => { handle_key(0x1B); handle_key(b'['); handle_key(b'H'); }
-                0x4D => { handle_key(0x1B); handle_key(b'['); handle_key(b'F'); }
-                0x4C => { handle_key(0x1B); handle_key(b'['); handle_key(b'3'); handle_key(b'~'); }
-                0x4B => { handle_key(0x1B); handle_key(b'['); handle_key(b'5'); handle_key(b'~'); }
-                0x4E => { handle_key(0x1B); handle_key(b'['); handle_key(b'6'); handle_key(b'~'); }
-                _ => {
-                    if alt && keycode == 0x2B {
-                        handle_key(0x1C);
-                    } else if ctrl && (0x04..=0x1D).contains(&keycode) {
-                        handle_key(keycode - 0x04 + 1);
-                    } else if let Some(bytes) = layout_lookup(keycode, shift, alt) {
-                        for &b in bytes {
-                            handle_key(b);
-                        }
-                    }
-                }
-            }
+            let mut event = RawKeyEvent {
+                keycode,
+                modifiers,
+                len: 0,
+                translated: [0; 5],
+            };
+            translate(keycode, shift, ctrl, alt, &mut event);
+            KEY_BUF.lock().push_back(event);
         }
     }
 
     PREV_REPORT.lock().copy_from_slice(&report[..8]);
 }
 
-pub fn handle_key(byte: u8) {
-    if byte != 0 {
-        KEY_BUF.lock().push_back(byte);
+fn translate(keycode: u8, shift: bool, ctrl: bool, alt: bool, event: &mut RawKeyEvent) {
+    let escape_seq: Option<&[u8]> = match keycode {
+        0x4F => Some(b"\x1B[C"),  // Right
+        0x50 => Some(b"\x1B[D"),  // Left
+        0x51 => Some(b"\x1B[B"),  // Down
+        0x52 => Some(b"\x1B[A"),  // Up
+        0x4A => Some(b"\x1B[H"),  // Home
+        0x4D => Some(b"\x1B[F"),  // End
+        0x4C => Some(b"\x1B[3~"), // Delete
+        0x4B => Some(b"\x1B[5~"), // Page Up
+        0x4E => Some(b"\x1B[6~"), // Page Down
+        _ => None,
+    };
+
+    if let Some(seq) = escape_seq {
+        let n = seq.len().min(5);
+        event.translated[..n].copy_from_slice(&seq[..n]);
+        event.len = n as u8;
+        return;
+    }
+
+    if ctrl && (0x04..=0x1D).contains(&keycode) {
+        event.translated[0] = keycode - 0x04 + 1;
+        event.len = 1;
+        return;
+    }
+
+    if let Some(bytes) = layout_lookup(keycode, shift, alt) {
+        let n = bytes.len().min(5);
+        event.translated[..n].copy_from_slice(&bytes[..n]);
+        event.len = n as u8;
     }
 }
 
@@ -57,7 +88,7 @@ pub fn has_data() -> bool {
     !KEY_BUF.lock().is_empty()
 }
 
-pub fn try_read_char() -> Option<u8> {
+pub fn try_read_event() -> Option<RawKeyEvent> {
     KEY_BUF.lock().pop_front()
 }
 

@@ -134,21 +134,18 @@ pub fn try_read(table: &mut FdTable, fd: u64, buf: &mut [u8]) -> Option<u64> {
         }
         Descriptor::Keyboard => {
             crate::drivers::xhci::poll_global();
-            if let Some(ch) = keyboard::try_read_char() {
-                buf[0] = ch;
-                let mut count = 1usize;
-                while count < buf.len() {
-                    if let Some(ch) = keyboard::try_read_char() {
-                        buf[count] = ch;
-                        count += 1;
-                    } else {
-                        break;
-                    }
+            let event_size = core::mem::size_of::<keyboard::RawKeyEvent>();
+            let mut count = 0;
+            while count + event_size <= buf.len() {
+                if let Some(event) = keyboard::try_read_event() {
+                    let bytes = as_bytes(&event);
+                    buf[count..count + event_size].copy_from_slice(bytes);
+                    count += event_size;
+                } else {
+                    break;
                 }
-                Some(count as u64)
-            } else {
-                None
             }
+            if count > 0 { Some(count as u64) } else { None }
         }
         Descriptor::Mouse => {
             crate::drivers::xhci::poll_global();

@@ -278,37 +278,28 @@ fn main() {
         let ready = io::poll(&[kb_fd, mouse_fd]);
 
         if ready.fd(0) {
-            let mut buf = [0u8; 64];
-            let n = io::read_fd(kb_fd, &mut buf);
-            if n > 0 {
-                let mut forward = [0u8; 64];
-                let mut forward_len = 0;
-                for &b in &buf[..n] {
-                    match b {
-                        0x0E => { Command::new("/initrd/terminal").spawn().ok(); }
-                        0x1C => {
-                            // Alt+Tab: rotate focus
-                            if windows.len() > 1 {
-                                let win = windows.pop().unwrap();
-                                windows.insert(0, win);
-                                dirty = true;
-                            }
-                        }
-                        _ => {
-                            forward[forward_len] = b;
-                            forward_len += 1;
-                        }
+            let mut events = [window::KeyEvent::EMPTY; 8];
+            let buf = unsafe {
+                std::slice::from_raw_parts_mut(
+                    events.as_mut_ptr() as *mut u8,
+                    std::mem::size_of_val(&events),
+                )
+            };
+            let n = io::read_fd(kb_fd, buf);
+            for event in &events[..n / std::mem::size_of::<window::KeyEvent>()] {
+                if event.alt() && event.keycode == 0x2B {
+                    // Alt+Tab: rotate focus
+                    if windows.len() > 1 {
+                        let win = windows.pop().unwrap();
+                        windows.insert(0, win);
+                        dirty = true;
                     }
-                }
-                if forward_len > 0 {
+                } else if event.ctrl() && event.keycode == 0x11 {
+                    // Ctrl+N: spawn terminal
+                    Command::new("/initrd/terminal").spawn().ok();
+                } else if event.len > 0 {
                     if let Some(win) = windows.last() {
-                        let mut event = window::KeyEvent {
-                            len: forward_len as u8,
-                            bytes: [0u8; 16],
-                        };
-                        event.bytes[..forward_len.min(16)]
-                            .copy_from_slice(&forward[..forward_len.min(16)]);
-                        message::send(win.pid, Message::new(window::MSG_KEY_INPUT, event));
+                        message::send(win.pid, Message::new(window::MSG_KEY_INPUT, *event));
                     }
                 }
             }

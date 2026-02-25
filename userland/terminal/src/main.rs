@@ -49,7 +49,7 @@ fn main() {
         if ready.messages() {
             match window.recv_event() {
                 window::Event::KeyInput(event) => {
-                    shell_stdin.write_all(&event.bytes[..event.len as usize]).ok();
+                    shell_stdin.write_all(&event.translated[..event.len as usize]).ok();
                 }
                 window::Event::Close => break,
                 window::Event::Resized => {
