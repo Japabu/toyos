@@ -42,6 +42,13 @@ pub fn read_rsp() -> u64 {
     rsp
 }
 
+#[inline]
+pub fn read_cr3() -> u64 {
+    let value: u64;
+    unsafe { asm!("mov {}, cr3", out(reg) value, options(nomem, nostack)); }
+    value
+}
+
 /// # Safety
 /// The caller must ensure the value is a valid PML4 physical address.
 #[inline]

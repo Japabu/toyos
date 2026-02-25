@@ -1,9 +1,10 @@
 use core::arch::global_asm;
+use core::mem::size_of;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use alloc::alloc::{alloc_zeroed, Layout};
 
-use crate::arch::{apic, percpu, syscall};
+use crate::arch::{apic, cpu, percpu, syscall};
 use crate::clock;
 use crate::drivers::acpi::MadtInfo;
 use crate::{log, process};
@@ -11,19 +12,6 @@ use crate::{log, process};
 const TRAMPOLINE_PAGE: u64 = 0x8000;
 const TRAMPOLINE_VECTOR: u8 = 0x08;
 const AP_STACK_SIZE: usize = 64 * 1024;
-
-// Data block at TRAMPOLINE_PAGE + 0xF00 = 0x8F00.
-// Layout (offsets from 0x8F00):
-//   +0x00: u64  CR3 (PML4 physical address)
-//   +0x08: u64  stack top
-//   +0x10: u64  Rust entry function pointer
-//   +0x18: 10B  kernel GDT descriptor (u16 limit + u64 base)
-//   +0x28: 10B  kernel IDT descriptor (u16 limit + u64 base)
-//   +0x38: 6B   temp GDT descriptor (u16 limit + u32 base) for 16-bit lgdt
-//   +0x40: 32B  temp GDT entries (null, code32, data, code64)
-//   +0x60: 6B   PM32 far-jump target {u32 offset, u16 selector}
-//   +0x68: 6B   LM64 far-jump target {u32 offset, u16 selector}
-//   +0x70: u64  64-bit CS reload address (for retfq)
 const DATA_OFFSET: usize = 0xF00;
 
 static AP_STARTED: AtomicBool = AtomicBool::new(false);
@@ -35,6 +23,57 @@ pub fn set_ready() {
     SMP_READY.store(true, Ordering::Release);
 }
 
+// ---- Trampoline data block layout ----
+//
+// Shared between BSP (Rust) and AP (assembly trampoline at 0x8000).
+// Field offsets are hardcoded in the global_asm! below — the static
+// assertion at the bottom guarantees the struct matches.
+
+#[derive(Clone, Copy)]
+#[repr(C, packed)]
+struct DescriptorTablePointer {
+    limit: u16,
+    base: u64,
+}
+
+#[derive(Clone, Copy)]
+#[repr(C, packed)]
+struct DescriptorTablePointer32 {
+    limit: u16,
+    base: u32,
+}
+
+#[derive(Clone, Copy)]
+#[repr(C, packed)]
+struct FarPointer {
+    offset: u32,
+    selector: u16,
+}
+
+#[derive(Clone, Copy)]
+#[repr(C, packed)]
+struct TrampolineData {
+    cr3: u64,                                // +0x00
+    stack_top: u64,                          // +0x08
+    entry: u64,                              // +0x10
+    kernel_gdt: DescriptorTablePointer,      // +0x18 (10 bytes)
+    _pad1: [u8; 6],                          // +0x22
+    kernel_idt: DescriptorTablePointer,      // +0x28 (10 bytes)
+    _pad2: [u8; 6],                          // +0x32
+    temp_gdt_ptr: DescriptorTablePointer32,  // +0x38 (6 bytes)
+    _pad3: [u8; 2],                          // +0x3E
+    temp_gdt: [u64; 4],                      // +0x40 (32 bytes)
+    pm32_far: FarPointer,                    // +0x60 (6 bytes)
+    _pad4: [u8; 2],                          // +0x66
+    lm64_far: FarPointer,                    // +0x68 (6 bytes)
+    _pad5: [u8; 2],                          // +0x6E
+    cs_reload_addr: u64,                     // +0x70
+}
+
+const _: () = assert!(size_of::<TrampolineData>() == 0x78);
+
+// ---- Trampoline blob (linked into .text, copied to 0x8000 at runtime) ----
+
 extern "C" {
     static _trampoline_start: u8;
     static _trampoline_end: u8;
@@ -43,77 +82,86 @@ extern "C" {
     static _ap_cs_reload: u8;
 }
 
+/// Copy the trampoline assembly blob to physical page 0x8000.
+fn copy_trampoline() {
+    let start = unsafe { &_trampoline_start as *const u8 };
+    let end = unsafe { &_trampoline_end as *const u8 };
+    let size = end as usize - start as usize;
+    assert!(size <= DATA_OFFSET, "trampoline code exceeds data block");
+    unsafe {
+        core::ptr::copy_nonoverlapping(start, TRAMPOLINE_PAGE as *mut u8, size);
+    }
+}
+
+/// Compute the runtime physical address of a trampoline label.
+fn label_addr(label: *const u8) -> u32 {
+    let base = unsafe { &_trampoline_start as *const u8 } as usize;
+    0x8000u32 + (label as usize - base) as u32
+}
+
+/// Build the TrampolineData struct with all global (non-per-AP) fields filled.
+fn build_trampoline_data() -> TrampolineData {
+    let pm32_addr = label_addr(unsafe { &_ap_pm32 });
+    let lm64_addr = label_addr(unsafe { &_ap_lm64 });
+    let cs_reload_addr = label_addr(unsafe { &_ap_cs_reload }) as u64;
+
+    // Read kernel's current GDT and IDT descriptors
+    let mut kernel_gdt = DescriptorTablePointer { limit: 0, base: 0 };
+    let mut kernel_idt = DescriptorTablePointer { limit: 0, base: 0 };
+    unsafe {
+        core::arch::asm!("sgdt [{}]", in(reg) &mut kernel_gdt, options(nostack));
+        core::arch::asm!("sidt [{}]", in(reg) &mut kernel_idt, options(nostack));
+    }
+
+    let data_base = (TRAMPOLINE_PAGE + DATA_OFFSET as u64) as u32;
+
+    TrampolineData {
+        cr3: cpu::read_cr3(),
+        stack_top: 0, // filled per-AP
+        entry: 0,     // filled per-AP
+        kernel_gdt,
+        _pad1: [0; 6],
+        kernel_idt,
+        _pad2: [0; 6],
+        temp_gdt_ptr: DescriptorTablePointer32 {
+            limit: 4 * 8 - 1,
+            base: data_base + 0x40, // points to temp_gdt field
+        },
+        _pad3: [0; 2],
+        temp_gdt: [
+            0x0000_0000_0000_0000, // null
+            0x00CF_9A00_0000_FFFF, // code32
+            0x00CF_9200_0000_FFFF, // data
+            0x00AF_9A00_0000_FFFF, // code64
+        ],
+        pm32_far: FarPointer { offset: pm32_addr, selector: 0x08 },
+        _pad4: [0; 2],
+        lm64_far: FarPointer { offset: lm64_addr, selector: 0x18 },
+        _pad5: [0; 2],
+        cs_reload_addr,
+    }
+}
+
+// ---- AP boot ----
+
 /// Boot all Application Processors found in the MADT.
 pub fn boot_aps(madt: &MadtInfo) {
     let bsp_id = apic::id();
+    copy_trampoline();
 
-    // Copy trampoline blob to physical 0x8000
-    let tramp_start = unsafe { &_trampoline_start as *const u8 };
-    let tramp_end = unsafe { &_trampoline_end as *const u8 };
-    let size = tramp_end as usize - tramp_start as usize;
-    assert!(size <= DATA_OFFSET, "trampoline code exceeds data block offset");
-    unsafe {
-        core::ptr::copy_nonoverlapping(tramp_start, TRAMPOLINE_PAGE as *mut u8, size);
-    }
-
-    // Compute runtime addresses for trampoline labels
-    let base = tramp_start as usize;
-    let pm32_addr = 0x8000u32 + (unsafe { &_ap_pm32 as *const u8 } as usize - base) as u32;
-    let lm64_addr = 0x8000u32 + (unsafe { &_ap_lm64 as *const u8 } as usize - base) as u32;
-    let cs_reload_addr = 0x8000u64 + (unsafe { &_ap_cs_reload as *const u8 } as usize - base) as u64;
-
-    // Fill data block
-    let data = (TRAMPOLINE_PAGE + DATA_OFFSET as u64) as *mut u8;
-    unsafe {
-        // CR3
-        let cr3: u64;
-        core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack));
-        core::ptr::write_unaligned(data as *mut u64, cr3);
-
-        // Kernel GDT pointer (10 bytes)
-        core::arch::asm!("sgdt [{}]", in(reg) data.add(0x18), options(nostack));
-        // Kernel IDT pointer (10 bytes)
-        core::arch::asm!("sidt [{}]", in(reg) data.add(0x28), options(nostack));
-
-        // Temp GDT entries at +0x40
-        let gdt = data.add(0x40) as *mut u64;
-        gdt.add(0).write(0);                      // null
-        gdt.add(1).write(0x00CF_9A00_0000_FFFF);  // code32
-        gdt.add(2).write(0x00CF_9200_0000_FFFF);  // data
-        gdt.add(3).write(0x00AF_9A00_0000_FFFF);  // code64
-
-        // Temp GDT descriptor at +0x38 (u16 limit + u32 base)
-        core::ptr::write_unaligned(data.add(0x38) as *mut u16, 4 * 8 - 1); // limit
-        core::ptr::write_unaligned(data.add(0x3A) as *mut u32, 0x8F40);    // base
-
-        // PM32 far-jump target at +0x60 {u32 offset, u16 selector}
-        core::ptr::write_unaligned(data.add(0x60) as *mut u32, pm32_addr);
-        core::ptr::write_unaligned(data.add(0x64) as *mut u16, 0x08);
-
-        // LM64 far-jump target at +0x68 {u32 offset, u16 selector}
-        core::ptr::write_unaligned(data.add(0x68) as *mut u32, lm64_addr);
-        core::ptr::write_unaligned(data.add(0x6C) as *mut u16, 0x18);
-
-        // CS reload address at +0x70
-        core::ptr::write_unaligned(data.add(0x70) as *mut u64, cs_reload_addr);
-    }
+    let mut data = build_trampoline_data();
+    let target = (TRAMPOLINE_PAGE + DATA_OFFSET as u64) as *mut TrampolineData;
 
     for &ap_id in &madt.apic_ids {
-        if ap_id == bsp_id {
-            continue;
-        }
+        if ap_id == bsp_id { continue; }
 
-        // Allocate per-AP stack
         let stack_layout = Layout::from_size_align(AP_STACK_SIZE, 4096).unwrap();
         let stack_base = unsafe { alloc_zeroed(stack_layout) };
         assert!(!stack_base.is_null(), "SMP: failed to allocate AP stack");
-        let stack_top = stack_base as u64 + AP_STACK_SIZE as u64;
 
-        // Write per-AP data
-        unsafe {
-            core::ptr::write_unaligned(data.add(0x08) as *mut u64, stack_top);
-            core::ptr::write_unaligned(data.add(0x10) as *mut u64, ap_entry as u64);
-        }
+        data.stack_top = stack_base as u64 + AP_STACK_SIZE as u64;
+        data.entry = ap_entry as u64;
+        unsafe { core::ptr::write_unaligned(target, data); }
 
         AP_STARTED.store(false, Ordering::Release);
         log!("SMP: starting AP (LAPIC ID {})", ap_id);
@@ -132,9 +180,7 @@ pub fn boot_aps(madt: &MadtInfo) {
         // Wait up to 100ms for AP to complete initialization
         let deadline = clock::nanos_since_boot() + 100_000_000;
         while !AP_STARTED.load(Ordering::Acquire) {
-            if clock::nanos_since_boot() >= deadline {
-                break;
-            }
+            if clock::nanos_since_boot() >= deadline { break; }
             core::hint::spin_loop();
         }
 
@@ -171,10 +217,12 @@ fn delay_ms(ms: u64) {
     while clock::nanos_since_boot() - start < ms * 1_000_000 {}
 }
 
-// AP trampoline: real mode → protected mode → long mode → Rust entry.
+// ---- AP trampoline assembly ----
+//
+// Real mode → protected mode → long mode → Rust entry.
 // Assembled as a blob in .text, copied to 0x8000 at runtime.
-// All memory addresses reference the data block at 0x8F00 (hardcoded constants).
-// No label arithmetic — BSP fills far-jump targets at runtime.
+// All memory addresses reference TrampolineData at 0x8F00.
+// BSP fills far-jump targets and other fields at runtime.
 global_asm!(
     ".global _trampoline_start",
     ".global _trampoline_end",
@@ -191,7 +239,7 @@ global_asm!(
     "mov es, ax",
     "mov ss, ax",
 
-    // Load temp GDT descriptor from data block at 0x8F38
+    // Load temp GDT descriptor from TrampolineData.temp_gdt_ptr (+0x38)
     "lgdt [0x8F38]",
 
     // Enable Protected Mode (CR0.PE)
@@ -199,7 +247,7 @@ global_asm!(
     "or al, 1",
     "mov cr0, eax",
 
-    // Indirect far jump to PM32 via data block at 0x8F60 {u32 offset, u16 selector}
+    // Far jump to PM32 via TrampolineData.pm32_far (+0x60)
     ".byte 0x66, 0xFF, 0x2E",  // data32 jmp far [disp16]
     ".word 0x8F60",
 
@@ -216,7 +264,7 @@ global_asm!(
     "or eax, 0x20",
     "mov cr4, eax",
 
-    // Load PML4 from data block
+    // Load PML4 from TrampolineData.cr3 (+0x00)
     "mov eax, [0x8F00]",
     "mov cr3, eax",
 
@@ -231,7 +279,7 @@ global_asm!(
     "or eax, 0x80000000",
     "mov cr0, eax",
 
-    // Indirect far jump to LM64 via data block at 0x8F68 {u32 offset, u16 selector}
+    // Far jump to LM64 via TrampolineData.lm64_far (+0x68)
     ".byte 0xFF, 0x2D",  // jmp far [disp32]
     ".long 0x8F68",
 
@@ -239,15 +287,15 @@ global_asm!(
     ".code64",
     "_ap_lm64:",
 
-    // Set up stack and load data block base
+    // Load TrampolineData base and set up stack
     "mov edi, 0x8F00",
-    "mov rsp, [rdi + 0x08]",
+    "mov rsp, [rdi + 0x08]",   // TrampolineData.stack_top
 
     // Load kernel GDT and reload CS via retfq
-    "lgdt [rdi + 0x18]",
+    "lgdt [rdi + 0x18]",       // TrampolineData.kernel_gdt
     "push 0x08",
-    "push qword ptr [rdi + 0x70]",
-    ".byte 0x48, 0xCB",  // REX.W RETF
+    "push qword ptr [rdi + 0x70]", // TrampolineData.cs_reload_addr
+    ".byte 0x48, 0xCB",        // REX.W RETF
 
     "_ap_cs_reload:",
     "mov ax, 0x10",
@@ -259,10 +307,10 @@ global_asm!(
 
     // Load kernel IDT
     "mov edi, 0x8F00",
-    "lidt [rdi + 0x28]",
+    "lidt [rdi + 0x28]",       // TrampolineData.kernel_idt
 
     // Call Rust entry
-    "call qword ptr [rdi + 0x10]",
+    "call qword ptr [rdi + 0x10]", // TrampolineData.entry
     "2: hlt",
     "jmp 2b",
 
