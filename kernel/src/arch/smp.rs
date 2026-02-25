@@ -127,7 +127,15 @@ pub fn boot_aps(madt: &MadtInfo) {
 
         if !AP_STARTED.load(Ordering::Acquire) {
             apic::send_sipi(ap_id, TRAMPOLINE_VECTOR);
-            delay_ms(1);
+        }
+
+        // Wait up to 100ms for AP to complete initialization
+        let deadline = clock::nanos_since_boot() + 100_000_000;
+        while !AP_STARTED.load(Ordering::Acquire) {
+            if clock::nanos_since_boot() >= deadline {
+                break;
+            }
+            core::hint::spin_loop();
         }
 
         if AP_STARTED.load(Ordering::Acquire) {
