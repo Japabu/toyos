@@ -189,7 +189,7 @@ fn kernel_main(
     // Initialize VirtIO GPU display
     let gpu = virtio_gpu::init(ecam_base).expect("VirtIO GPU not found");
     let fb_info = fd::FramebufferInfo {
-        addr: gpu.backing_addr,
+        addr: gpu.backing,
         width: gpu.width,
         height: gpu.height,
         stride: gpu.width,

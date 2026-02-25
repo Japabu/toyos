@@ -148,7 +148,8 @@ struct GpuController {
     resp_buf: u64,
     width: u32,
     height: u32,
-    resource_id: u32,
+    resources: [u32; 2],
+    front: usize,
 }
 
 impl GpuController {
@@ -295,7 +296,7 @@ impl GpuController {
 static GPU: Lock<Option<GpuController>> = Lock::new(None);
 
 pub struct GpuInfo {
-    pub backing_addr: u64,
+    pub backing: [u64; 2],
     pub width: u32,
     pub height: u32,
 }
@@ -324,7 +325,8 @@ pub fn init(ecam_base: u64) -> Option<GpuInfo> {
         resp_buf,
         width: 0,
         height: 0,
-        resource_id: 1,
+        resources: [1, 2],
+        front: 0,
     };
 
     // Query display info
@@ -347,38 +349,44 @@ pub fn init(ecam_base: u64) -> Option<GpuInfo> {
     };
     log!("VirtIO GPU: display {}x{}", width, height);
 
-    // Allocate framebuffer backing store
+    // Allocate two framebuffer backing stores for page-flipping
     let fb_size = (width * height * 4) as usize;
     let fb_layout = Layout::from_size_align(fb_size, 4096).unwrap();
-    let fb_ptr = unsafe { alloc_zeroed(fb_layout) };
-    assert!(!fb_ptr.is_null(), "VirtIO GPU: framebuffer alloc failed");
-    let fb_addr = fb_ptr as u64;
-    paging::map_user(fb_addr, fb_size as u64);
-    log!("VirtIO GPU: framebuffer at {:#x} ({} bytes)", fb_addr, fb_size);
+    let mut backing = [0u64; 2];
+    for i in 0..2 {
+        let ptr = unsafe { alloc_zeroed(fb_layout) };
+        assert!(!ptr.is_null(), "VirtIO GPU: framebuffer alloc failed");
+        let addr = ptr as u64;
+        paging::map_user(addr, fb_size as u64);
+        gpu.create_resource(gpu.resources[i], width, height);
+        gpu.attach_backing(gpu.resources[i], addr, fb_size as u32);
+        backing[i] = addr;
+        log!("VirtIO GPU: buffer {} at {:#x} ({} bytes)", i, addr, fb_size);
+    }
 
-    // Create resource, attach backing, set scanout
-    gpu.create_resource(1, width, height);
-    gpu.attach_backing(1, fb_addr, fb_size as u32);
-
+    // Display resource 0 (front), compositor draws to resource 1 (back)
     let rect = Rect { x: 0, y: 0, width, height };
-    gpu.set_scanout(0, 1, rect);
+    gpu.set_scanout(0, gpu.resources[0], rect);
 
     gpu.width = width;
     gpu.height = height;
 
-    let info = GpuInfo { backing_addr: fb_addr, width, height };
+    let info = GpuInfo { backing, width, height };
     *GPU.lock() = Some(gpu);
 
     Some(info)
 }
 
-/// Transfer the framebuffer to the host and flush the display.
-/// No-op if VirtIO GPU is not initialized (GOP fallback).
+/// Transfer the back buffer to the host, flip the scanout, and flush.
 pub fn present() {
     let mut guard = GPU.lock();
     if let Some(gpu) = guard.as_mut() {
+        let back = 1 - gpu.front;
+        let resource = gpu.resources[back];
         let rect = Rect { x: 0, y: 0, width: gpu.width, height: gpu.height };
-        gpu.transfer_to_host(gpu.resource_id, rect);
-        gpu.flush(gpu.resource_id, rect);
+        gpu.transfer_to_host(resource, rect);
+        gpu.set_scanout(0, resource, rect);
+        gpu.flush(resource, rect);
+        gpu.front = back;
     }
 }

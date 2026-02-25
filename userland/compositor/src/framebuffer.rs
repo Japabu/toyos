@@ -24,8 +24,8 @@ impl CursorImage {
 }
 
 pub struct Framebuffer {
-    hw: *mut u8,
-    back: Vec<u8>,
+    bufs: [*mut u8; 2],
+    back_idx: usize,
     width: usize,
     height: usize,
     stride: usize,
@@ -33,19 +33,22 @@ pub struct Framebuffer {
 }
 
 impl Framebuffer {
-    pub fn new(addr: u64, width: u32, height: u32, stride: u32, pixel_format: u32) -> Self {
+    pub fn new(addrs: [u64; 2], width: u32, height: u32, stride: u32, pixel_format: u32) -> Self {
         let width = width as usize;
         let height = height as usize;
         let stride = stride as usize;
-        let back = vec![0u8; height * stride * 4];
         Self {
-            hw: addr as *mut u8,
-            back,
+            bufs: [addrs[0] as *mut u8, addrs[1] as *mut u8],
+            back_idx: 1, // front=0 (displayed), back=1 (draw target)
             width,
             height,
             stride,
             pixel_format: if pixel_format == 0 { PixelFormat::Rgb } else { PixelFormat::Bgr },
         }
+    }
+
+    fn back(&self) -> *mut u8 {
+        self.bufs[self.back_idx]
     }
 
     pub fn width(&self) -> usize {
@@ -60,12 +63,16 @@ impl Framebuffer {
         if self.pixel_format == PixelFormat::Rgb { 0 } else { 1 }
     }
 
+    pub fn swap(&mut self) {
+        self.back_idx = 1 - self.back_idx;
+    }
+
     pub fn put_pixel(&self, x: usize, y: usize, color: Color) {
         if x < self.width && y < self.height {
             let pixel = self.encode_pixel(color);
             let offset = (y * self.stride + x) * 4;
             unsafe {
-                ptr::copy_nonoverlapping(pixel.as_ptr(), self.back.as_ptr().add(offset) as *mut u8, 4);
+                ptr::copy_nonoverlapping(pixel.as_ptr(), self.back().add(offset), 4);
             }
         }
     }
@@ -77,25 +84,57 @@ impl Framebuffer {
         }
     }
 
+    /// Fill a row of pixels with a 4-byte pattern starting at `dst`.
+    unsafe fn fill_row(dst: *mut u8, pixel: &[u8; 4], count: usize) {
+        if count == 0 { return; }
+        // Write first pixel
+        ptr::copy_nonoverlapping(pixel.as_ptr(), dst, 4);
+        // Doubling copy: 1→2→4→8→... until the row is filled
+        let total_bytes = count * 4;
+        let mut filled = 4usize;
+        while filled < total_bytes {
+            let chunk = filled.min(total_bytes - filled);
+            ptr::copy_nonoverlapping(dst, dst.add(filled), chunk);
+            filled += chunk;
+        }
+    }
+
     pub fn fill_rect(&self, x: usize, y: usize, w: usize, h: usize, color: Color) {
+        if w == 0 || h == 0 { return; }
         let pixel = self.encode_pixel(color);
-        for dy in 0..h {
-            let sy = y + dy;
-            if sy >= self.height { break; }
-            let row_base = sy * self.stride * 4;
-            for dx in 0..w {
-                let sx = x + dx;
-                if sx >= self.width { break; }
-                unsafe {
-                    let dst = self.back.as_ptr().add(row_base + sx * 4) as *mut u8;
-                    ptr::copy_nonoverlapping(pixel.as_ptr(), dst, 4);
-                }
+        let x_end = (x + w).min(self.width);
+        let y_end = (y + h).min(self.height);
+        let actual_w = x_end.saturating_sub(x);
+        if actual_w == 0 { return; }
+        let row_bytes = actual_w * 4;
+
+        unsafe {
+            // Fill first row with the pixel pattern
+            let first_row = self.back().add((y * self.stride + x) * 4);
+            Self::fill_row(first_row, &pixel, actual_w);
+
+            // Copy first row to all remaining rows
+            for dy in 1..(y_end - y) {
+                let dst = self.back().add(((y + dy) * self.stride + x) * 4);
+                ptr::copy_nonoverlapping(first_row, dst, row_bytes);
             }
         }
     }
 
     pub fn clear(&self, color: Color) {
-        self.fill_rect(0, 0, self.width, self.height, color);
+        let pixel = self.encode_pixel(color);
+        unsafe {
+            // Fill first scanline
+            let first_row = self.back();
+            Self::fill_row(first_row, &pixel, self.stride);
+
+            // Copy to all remaining scanlines
+            let row_bytes = self.stride * 4;
+            for y in 1..self.height {
+                let dst = self.back().add(y * row_bytes);
+                ptr::copy_nonoverlapping(first_row, dst, row_bytes);
+            }
+        }
     }
 
     /// Blit a buffer to a region of the back buffer (row-by-row memcpy).
@@ -109,20 +148,15 @@ impl Framebuffer {
             unsafe {
                 ptr::copy_nonoverlapping(
                     buffer.as_ptr().add(src_offset),
-                    self.back.as_ptr().add(dst_offset) as *mut u8,
+                    self.back().add(dst_offset),
                     row_bytes,
                 );
             }
         }
     }
 
-    /// Copy back buffer to hardware framebuffer, overlaying the cursor.
-    pub fn present(&self, cursor_x: i32, cursor_y: i32, cursor: &CursorImage) {
-        // Copy entire back buffer to hardware framebuffer
-        unsafe {
-            ptr::copy_nonoverlapping(self.back.as_ptr(), self.hw, self.back.len());
-        }
-        // Overlay cursor on hardware framebuffer
+    /// Overlay cursor onto the back buffer.
+    pub fn draw_cursor(&self, cursor_x: i32, cursor_y: i32, cursor: &CursorImage) {
         for cy in 0..cursor.height {
             let sy = cursor_y as usize + cy;
             if sy >= self.height { break; }
@@ -140,7 +174,7 @@ impl Framebuffer {
                     let pixel = self.encode_pixel(color);
                     let dst_offset = (sy * self.stride + sx) * 4;
                     unsafe {
-                        ptr::write_volatile(self.hw.add(dst_offset) as *mut [u8; 4], pixel);
+                        ptr::copy_nonoverlapping(pixel.as_ptr(), self.back().add(dst_offset), 4);
                     }
                 }
             }

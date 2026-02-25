@@ -18,7 +18,7 @@ const TITLE_TEXT_COLOR: Color = Color { r: 0xcc, g: 0xcc, b: 0xcc };
 
 #[repr(C)]
 struct FramebufferInfo {
-    addr: u64,
+    addr: [u64; 2],
     width: u32,
     height: u32,
     stride: u32,
@@ -27,7 +27,7 @@ struct FramebufferInfo {
 
 fn read_fb_info(fd: u64) -> FramebufferInfo {
     let mut info = FramebufferInfo {
-        addr: 0,
+        addr: [0; 2],
         width: 0,
         height: 0,
         stride: 0,
@@ -56,6 +56,40 @@ struct WindowState {
     height: usize,
 }
 
+fn redraw(
+    screen: &Framebuffer,
+    font: &font::Font,
+    windows: &[WindowState],
+    cursor_x: i32,
+    cursor_y: i32,
+    cursor: &CursorImage,
+) {
+    screen.clear(DESKTOP_COLOR);
+
+    for win in windows {
+        let win_x = win.content_x - BORDER_WIDTH;
+        let win_y = win.content_y - BORDER_WIDTH - TITLE_BAR_HEIGHT;
+        let win_w = win.width + BORDER_WIDTH * 2;
+        let win_h = win.height + BORDER_WIDTH * 2 + TITLE_BAR_HEIGHT;
+
+        screen.fill_rect(win_x, win_y, win_w, win_h, BORDER_COLOR);
+        screen.fill_rect(
+            win_x + BORDER_WIDTH,
+            win_y + BORDER_WIDTH,
+            win_w - BORDER_WIDTH * 2,
+            TITLE_BAR_HEIGHT,
+            TITLE_BAR_COLOR,
+        );
+        let title_x = win_x + BORDER_WIDTH + 8;
+        let title_y = win_y + BORDER_WIDTH + (TITLE_BAR_HEIGHT - 16) / 2;
+        font.draw_string(screen, title_x, title_y, "Terminal", TITLE_TEXT_COLOR, TITLE_BAR_COLOR);
+
+        screen.blit(win.content_x, win.content_y, win.width, win.height, &win.buffer);
+    }
+
+    screen.draw_cursor(cursor_x, cursor_y, cursor);
+}
+
 fn main() {
     io::register_name("compositor").expect("compositor already running");
 
@@ -64,7 +98,7 @@ fn main() {
     let fb_fd = io::open_device(io::DeviceType::Framebuffer).expect("failed to claim framebuffer");
 
     let fb_info = read_fb_info(fb_fd);
-    let screen = Framebuffer::new(
+    let mut screen = Framebuffer::new(
         fb_info.addr,
         fb_info.width,
         fb_info.height,
@@ -76,8 +110,6 @@ fn main() {
     let font = font::Font::new(&font_data);
     let cursor_data = std::fs::read("/initrd/cursor.bin").expect("failed to read cursor");
     let cursor = CursorImage::new(&cursor_data);
-
-    screen.clear(DESKTOP_COLOR);
 
     let mut child = Command::new("/initrd/terminal")
         .stdin(Stdio::piped())
@@ -100,8 +132,9 @@ fn main() {
 
     loop {
         if dirty {
-            screen.present(cursor_x, cursor_y, &cursor);
+            redraw(&screen, &font, &windows, cursor_x, cursor_y, &cursor);
             io::gpu_present();
+            screen.swap();
             dirty = false;
         }
 
@@ -163,18 +196,6 @@ fn main() {
                     let content_w = win_w - BORDER_WIDTH * 2;
                     let content_h = win_h - BORDER_WIDTH * 2 - TITLE_BAR_HEIGHT;
 
-                    screen.fill_rect(win_x, win_y, win_w, win_h, BORDER_COLOR);
-                    screen.fill_rect(
-                        win_x + BORDER_WIDTH,
-                        win_y + BORDER_WIDTH,
-                        win_w - BORDER_WIDTH * 2,
-                        TITLE_BAR_HEIGHT,
-                        TITLE_BAR_COLOR,
-                    );
-                    let title_x = win_x + BORDER_WIDTH + 8;
-                    let title_y = win_y + BORDER_WIDTH + (TITLE_BAR_HEIGHT - 16) / 2;
-                    font.draw_string(&screen, title_x, title_y, "Terminal", TITLE_TEXT_COLOR, TITLE_BAR_COLOR);
-
                     let buffer = vec![0u8; content_w * content_h * 4];
                     let buffer_ptr = buffer.as_ptr() as *mut u8;
                     let pixel_format = screen.pixel_format_raw();
@@ -201,14 +222,7 @@ fn main() {
                     dirty = true;
                 }
                 window::MSG_PRESENT => {
-                    if let Some(win) = windows.iter().find(|w| w.pid == sender) {
-                        screen.blit(
-                            win.content_x,
-                            win.content_y,
-                            win.width,
-                            win.height,
-                            &win.buffer,
-                        );
+                    if let Some(_win) = windows.iter().find(|w| w.pid == sender) {
                         dirty = true;
                     }
                 }
