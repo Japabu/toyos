@@ -101,6 +101,7 @@ fn main() {
     loop {
         if dirty {
             screen.present(cursor_x, cursor_y, &cursor);
+            io::gpu_present();
             dirty = false;
         }
 

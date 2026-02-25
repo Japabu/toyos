@@ -44,6 +44,7 @@ const SYS_OPEN_DEVICE: u64 = 31;
 const SYS_REGISTER_NAME: u64 = 32;
 const SYS_FIND_PID: u64 = 33;
 const SYS_SET_SCREEN_SIZE: u64 = 34;
+const SYS_GPU_PRESENT: u64 = 35;
 
 // ---------------------------------------------------------------------------
 // User pointer validation
@@ -192,6 +193,7 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         SYS_REGISTER_NAME => sys_register_name(a1, a2),
         SYS_FIND_PID => sys_find_pid(a1, a2),
         SYS_SET_SCREEN_SIZE => { set_screen_size(a1 as u32, a2 as u32); 0 }
+        SYS_GPU_PRESENT => { crate::drivers::virtio_gpu::present(); 0 }
         _ => u64::MAX,
     }
 }

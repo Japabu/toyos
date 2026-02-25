@@ -9,7 +9,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 use kernel::arch::{apic, idt, paging, percpu, smp, syscall};
-use kernel::drivers::{acpi, nvme, pci, serial, xhci};
+use kernel::drivers::{acpi, nvme, pci, serial, virtio_gpu, xhci};
 use kernel::{allocator, clock, fd, log, pipe, process, ramdisk, symbols, vfs, KernelArgs, MemoryMapEntry};
 use tyfs::Disk;
 
@@ -79,18 +79,7 @@ fn kernel_main(
         log!("  {} ({} bytes)", name, size);
     }
 
-    // Map framebuffer for userland access and store screen dimensions
-    log!("GOP: {}x{} stride={} fmt={}",
-        kernel_args.framebuffer_width, kernel_args.framebuffer_height,
-        kernel_args.framebuffer_stride, kernel_args.framebuffer_pixel_format
-    );
-    paging::map_user(kernel_args.framebuffer_addr, kernel_args.framebuffer_size);
-    syscall::set_screen_size(kernel_args.framebuffer_width, kernel_args.framebuffer_height);
-
     log!("ToyOS Kernel initialized");
-    log!("Framebuffer: {}x{} stride={}",
-        kernel_args.framebuffer_width, kernel_args.framebuffer_height, kernel_args.framebuffer_stride
-    );
 
     // Initialize NVMe
     let ecam_base = acpi::find_ecam_base(kernel_args.rsdp_addr)
@@ -197,14 +186,17 @@ fn kernel_main(
 
     log!("init: entry={:#x}, stack={:#x}, argc={}", loaded.entry, sp, args.len());
 
-    // Store framebuffer info for open_device claims
-    kernel::device::set_framebuffer_info(fd::FramebufferInfo {
-        addr: kernel_args.framebuffer_addr,
-        width: kernel_args.framebuffer_width,
-        height: kernel_args.framebuffer_height,
-        stride: kernel_args.framebuffer_stride,
-        pixel_format: kernel_args.framebuffer_pixel_format,
-    });
+    // Initialize VirtIO GPU display
+    let gpu = virtio_gpu::init(ecam_base).expect("VirtIO GPU not found");
+    let fb_info = fd::FramebufferInfo {
+        addr: gpu.backing_addr,
+        width: gpu.width,
+        height: gpu.height,
+        stride: gpu.width,
+        pixel_format: 1, // BGR (B8G8R8X8_UNORM)
+    };
+    syscall::set_screen_size(fb_info.width, fb_info.height);
+    kernel::device::set_framebuffer_info(fb_info);
 
     // Signal APs to join the scheduler, then start process 0 (never returns)
     smp::set_ready();

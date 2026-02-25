@@ -126,6 +126,10 @@ fn main() {
         .arg("-drive").arg("if=none,id=nvme0,format=raw,file=target/nvme.img")
         .arg("-device").arg("nvme,serial=deadbeef,drive=nvme0")
 
+        // VirtIO GPU (no legacy VGA)
+        .arg("-vga").arg("none")
+        .arg("-device").arg("virtio-gpu-pci")
+
         .arg("-serial").arg("stdio")
 
         .arg("-no-reboot")

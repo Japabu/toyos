@@ -1,0 +1,384 @@
+use core::ptr::{copy_nonoverlapping, read_volatile};
+
+use alloc::alloc::{alloc_zeroed, Layout};
+
+use super::pci::PciDevice;
+use super::virtio::{BufDir, Virtqueue, VirtioDevice, VIRTIO_F_VERSION_1};
+use super::DmaPool;
+use crate::arch::paging;
+use crate::log;
+use crate::sync::Lock;
+
+// VirtIO GPU PCI identity
+const VIRTIO_VENDOR: u16 = 0x1AF4;
+const VIRTIO_GPU_DEVICE: u16 = 0x1050; // 0x1040 + device_id 16
+
+// GPU command types
+const CMD_GET_DISPLAY_INFO: u32 = 0x0100;
+const CMD_RESOURCE_CREATE_2D: u32 = 0x0101;
+const CMD_SET_SCANOUT: u32 = 0x0103;
+const CMD_RESOURCE_FLUSH: u32 = 0x0104;
+const CMD_TRANSFER_TO_HOST_2D: u32 = 0x0105;
+const CMD_RESOURCE_ATTACH_BACKING: u32 = 0x0106;
+
+// GPU response types
+const RESP_OK_NODATA: u32 = 0x1100;
+const RESP_OK_DISPLAY_INFO: u32 = 0x1101;
+
+// Pixel formats
+const FORMAT_B8G8R8X8_UNORM: u32 = 2;
+
+// DMA page assignments
+const PAGE_CONTROLQ: usize = 0;
+const PAGE_CONTROLQ_BUFS: usize = 1;
+const PAGE_CURSORQ: usize = 2;
+
+const REQ_OFFSET: usize = 0x000;
+const RESP_OFFSET: usize = 0x800;
+
+static DMA: Lock<DmaPool<4>> = Lock::new(DmaPool::new());
+
+fn dma_addr(page: usize) -> u64 {
+    DMA.lock().page_addr(page)
+}
+
+// ---- GPU command/response structs ----
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CtrlHeader {
+    cmd_type: u32,
+    flags: u32,
+    fence_id: u64,
+    ctx_id: u32,
+    ring_idx: u8,
+    padding: [u8; 3],
+}
+
+impl CtrlHeader {
+    fn new(cmd_type: u32) -> Self {
+        Self { cmd_type, flags: 0, fence_id: 0, ctx_id: 0, ring_idx: 0, padding: [0; 3] }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Rect {
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DisplayOne {
+    r: Rect,
+    enabled: u32,
+    flags: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RespDisplayInfo {
+    hdr: CtrlHeader,
+    pmodes: [DisplayOne; 16],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ResourceCreate2d {
+    hdr: CtrlHeader,
+    resource_id: u32,
+    format: u32,
+    width: u32,
+    height: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SetScanout {
+    hdr: CtrlHeader,
+    r: Rect,
+    scanout_id: u32,
+    resource_id: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ResourceFlush {
+    hdr: CtrlHeader,
+    r: Rect,
+    resource_id: u32,
+    padding: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct TransferToHost2d {
+    hdr: CtrlHeader,
+    r: Rect,
+    offset: u64,
+    resource_id: u32,
+    padding: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ResourceAttachBacking {
+    hdr: CtrlHeader,
+    resource_id: u32,
+    nr_entries: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct MemEntry {
+    addr: u64,
+    length: u32,
+    padding: u32,
+}
+
+// ---- GPU Controller ----
+
+struct GpuController {
+    device: VirtioDevice,
+    controlq: Virtqueue,
+    req_buf: u64,
+    resp_buf: u64,
+    width: u32,
+    height: u32,
+    resource_id: u32,
+}
+
+impl GpuController {
+    /// Copy a command struct to the request DMA buffer and submit it.
+    /// Returns the response header's type field.
+    fn command_raw(&mut self, req_bytes: &[u8], resp_size: u32) -> u32 {
+        unsafe {
+            copy_nonoverlapping(req_bytes.as_ptr(), self.req_buf as *mut u8, req_bytes.len());
+        }
+
+        self.controlq.submit_and_wait(
+            &[
+                (self.req_buf, req_bytes.len() as u32, BufDir::Readable),
+                (self.resp_buf, resp_size, BufDir::Writable),
+            ],
+            self.device.notify_mmio(),
+            self.device.notify_off_multiplier(),
+            0, // controlq index
+        );
+
+        // Read response type from header
+        unsafe { read_volatile(self.resp_buf as *const u32) }
+    }
+
+    fn command<T: Copy>(&mut self, req: &T) -> u32 {
+        let bytes = unsafe {
+            core::slice::from_raw_parts(req as *const T as *const u8, core::mem::size_of::<T>())
+        };
+        self.command_raw(bytes, core::mem::size_of::<CtrlHeader>() as u32)
+    }
+
+    fn get_display_info(&mut self) -> RespDisplayInfo {
+        let hdr = CtrlHeader::new(CMD_GET_DISPLAY_INFO);
+        let bytes = unsafe {
+            core::slice::from_raw_parts(&hdr as *const _ as *const u8, core::mem::size_of::<CtrlHeader>())
+        };
+        let resp_size = core::mem::size_of::<RespDisplayInfo>() as u32;
+
+        unsafe {
+            copy_nonoverlapping(bytes.as_ptr(), self.req_buf as *mut u8, bytes.len());
+        }
+
+        self.controlq.submit_and_wait(
+            &[
+                (self.req_buf, bytes.len() as u32, BufDir::Readable),
+                (self.resp_buf, resp_size, BufDir::Writable),
+            ],
+            self.device.notify_mmio(),
+            self.device.notify_off_multiplier(),
+            0,
+        );
+
+        unsafe { read_volatile(self.resp_buf as *const RespDisplayInfo) }
+    }
+
+    fn create_resource(&mut self, id: u32, width: u32, height: u32) {
+        let cmd = ResourceCreate2d {
+            hdr: CtrlHeader::new(CMD_RESOURCE_CREATE_2D),
+            resource_id: id,
+            format: FORMAT_B8G8R8X8_UNORM,
+            width,
+            height,
+        };
+        let resp = self.command(&cmd);
+        assert!(resp == RESP_OK_NODATA, "VirtIO GPU: RESOURCE_CREATE_2D failed: {:#x}", resp);
+    }
+
+    fn attach_backing(&mut self, id: u32, addr: u64, len: u32) {
+        // This command has a variable-length payload: header + mem_entry array.
+        // We write them consecutively into the request buffer.
+        let cmd = ResourceAttachBacking {
+            hdr: CtrlHeader::new(CMD_RESOURCE_ATTACH_BACKING),
+            resource_id: id,
+            nr_entries: 1,
+        };
+        let entry = MemEntry { addr, length: len, padding: 0 };
+
+        let cmd_size = core::mem::size_of::<ResourceAttachBacking>();
+        let entry_size = core::mem::size_of::<MemEntry>();
+        unsafe {
+            copy_nonoverlapping(
+                &cmd as *const _ as *const u8,
+                self.req_buf as *mut u8,
+                cmd_size,
+            );
+            copy_nonoverlapping(
+                &entry as *const _ as *const u8,
+                (self.req_buf as *mut u8).add(cmd_size),
+                entry_size,
+            );
+        }
+
+        self.controlq.submit_and_wait(
+            &[
+                (self.req_buf, (cmd_size + entry_size) as u32, BufDir::Readable),
+                (self.resp_buf, core::mem::size_of::<CtrlHeader>() as u32, BufDir::Writable),
+            ],
+            self.device.notify_mmio(),
+            self.device.notify_off_multiplier(),
+            0,
+        );
+
+        let resp = unsafe { read_volatile(self.resp_buf as *const u32) };
+        assert!(resp == RESP_OK_NODATA, "VirtIO GPU: RESOURCE_ATTACH_BACKING failed: {:#x}", resp);
+    }
+
+    fn set_scanout(&mut self, scanout: u32, resource: u32, rect: Rect) {
+        let cmd = SetScanout {
+            hdr: CtrlHeader::new(CMD_SET_SCANOUT),
+            r: rect,
+            scanout_id: scanout,
+            resource_id: resource,
+        };
+        let resp = self.command(&cmd);
+        assert!(resp == RESP_OK_NODATA, "VirtIO GPU: SET_SCANOUT failed: {:#x}", resp);
+    }
+
+    fn transfer_to_host(&mut self, resource: u32, rect: Rect) {
+        let cmd = TransferToHost2d {
+            hdr: CtrlHeader::new(CMD_TRANSFER_TO_HOST_2D),
+            r: rect,
+            offset: 0,
+            resource_id: resource,
+            padding: 0,
+        };
+        let resp = self.command(&cmd);
+        assert!(resp == RESP_OK_NODATA, "VirtIO GPU: TRANSFER_TO_HOST_2D failed: {:#x}", resp);
+    }
+
+    fn flush(&mut self, resource: u32, rect: Rect) {
+        let cmd = ResourceFlush {
+            hdr: CtrlHeader::new(CMD_RESOURCE_FLUSH),
+            r: rect,
+            resource_id: resource,
+            padding: 0,
+        };
+        let resp = self.command(&cmd);
+        assert!(resp == RESP_OK_NODATA, "VirtIO GPU: RESOURCE_FLUSH failed: {:#x}", resp);
+    }
+}
+
+// ---- Global state ----
+
+static GPU: Lock<Option<GpuController>> = Lock::new(None);
+
+pub struct GpuInfo {
+    pub backing_addr: u64,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Initialize the VirtIO GPU. Returns display info on success.
+pub fn init(ecam_base: u64) -> Option<GpuInfo> {
+    let pci_dev = PciDevice::find_by_id(ecam_base, VIRTIO_VENDOR, VIRTIO_GPU_DEVICE)?;
+    log!("VirtIO GPU: found at PCI {:02x}:{:02x}.{}", pci_dev.bus, pci_dev.dev, pci_dev.func);
+
+    let device = VirtioDevice::init(&pci_dev, VIRTIO_F_VERSION_1);
+
+    let mut controlq = Virtqueue::new(dma_addr(PAGE_CONTROLQ));
+    let mut cursorq = Virtqueue::new(dma_addr(PAGE_CURSORQ));
+
+    device.setup_queue(0, &mut controlq);
+    device.setup_queue(1, &mut cursorq);
+    device.activate();
+
+    let req_buf = dma_addr(PAGE_CONTROLQ_BUFS) + REQ_OFFSET as u64;
+    let resp_buf = dma_addr(PAGE_CONTROLQ_BUFS) + RESP_OFFSET as u64;
+
+    let mut gpu = GpuController {
+        device,
+        controlq,
+        req_buf,
+        resp_buf,
+        width: 0,
+        height: 0,
+        resource_id: 1,
+    };
+
+    // Query display info
+    let display_info = gpu.get_display_info();
+    assert!(
+        display_info.hdr.cmd_type == RESP_OK_DISPLAY_INFO,
+        "VirtIO GPU: GET_DISPLAY_INFO failed: {:#x}", display_info.hdr.cmd_type
+    );
+
+    let scanout = &display_info.pmodes[0];
+    let width = if scanout.enabled != 0 && scanout.r.width > 0 {
+        scanout.r.width
+    } else {
+        1024 // fallback
+    };
+    let height = if scanout.enabled != 0 && scanout.r.height > 0 {
+        scanout.r.height
+    } else {
+        768
+    };
+    log!("VirtIO GPU: display {}x{}", width, height);
+
+    // Allocate framebuffer backing store
+    let fb_size = (width * height * 4) as usize;
+    let fb_layout = Layout::from_size_align(fb_size, 4096).unwrap();
+    let fb_ptr = unsafe { alloc_zeroed(fb_layout) };
+    assert!(!fb_ptr.is_null(), "VirtIO GPU: framebuffer alloc failed");
+    let fb_addr = fb_ptr as u64;
+    paging::map_user(fb_addr, fb_size as u64);
+    log!("VirtIO GPU: framebuffer at {:#x} ({} bytes)", fb_addr, fb_size);
+
+    // Create resource, attach backing, set scanout
+    gpu.create_resource(1, width, height);
+    gpu.attach_backing(1, fb_addr, fb_size as u32);
+
+    let rect = Rect { x: 0, y: 0, width, height };
+    gpu.set_scanout(0, 1, rect);
+
+    gpu.width = width;
+    gpu.height = height;
+
+    let info = GpuInfo { backing_addr: fb_addr, width, height };
+    *GPU.lock() = Some(gpu);
+
+    Some(info)
+}
+
+/// Transfer the framebuffer to the host and flush the display.
+/// No-op if VirtIO GPU is not initialized (GOP fallback).
+pub fn present() {
+    let mut guard = GPU.lock();
+    if let Some(gpu) = guard.as_mut() {
+        let rect = Rect { x: 0, y: 0, width: gpu.width, height: gpu.height };
+        gpu.transfer_to_host(gpu.resource_id, rect);
+        gpu.flush(gpu.resource_id, rect);
+    }
+}

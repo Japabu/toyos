@@ -11,7 +11,6 @@ use elf::{abi, endian::AnyEndian, ElfBytes};
 use uefi::{
     prelude::*,
     CStr16,
-    proto::console::gop::{GraphicsOutput, PixelFormat},
     proto::media::file::{File, FileInfo, FileMode},
     table::{boot::{MemoryType, PAGE_SIZE}, cfg::ACPI2_GUID},
 };
@@ -32,15 +31,6 @@ struct LoadedKernel {
     pub stack_size: usize,
 }
 
-struct FramebufferInfo {
-    addr: u64,
-    size: u64,
-    width: u32,
-    height: u32,
-    stride: u32,
-    pixel_format: u32, // 0 = RGB, 1 = BGR
-}
-
 #[repr(C)]
 pub struct KernelArgs {
     pub memory_map_addr: u64,
@@ -52,12 +42,6 @@ pub struct KernelArgs {
     pub rsdp_addr: u64,
     pub initrd_addr: u64,
     pub initrd_size: u64,
-    pub framebuffer_addr: u64,
-    pub framebuffer_size: u64,
-    pub framebuffer_width: u32,
-    pub framebuffer_height: u32,
-    pub framebuffer_stride: u32,
-    pub framebuffer_pixel_format: u32,
     pub init_program_addr: u64,
     pub init_program_len: u64,
     pub kernel_elf_addr: u64,
@@ -182,47 +166,9 @@ fn load_kernel_elf(kernel_elf_bytes: &[u8]) -> LoadedKernel {
     }
 }
 
-fn init_gop(system_table: &SystemTable<Boot>) -> FramebufferInfo {
-    let gop_handle = system_table
-        .boot_services()
-        .get_handle_for_protocol::<GraphicsOutput>()
-        .expect("GOP not available");
-    let mut gop = system_table
-        .boot_services()
-        .open_protocol_exclusive::<GraphicsOutput>(gop_handle)
-        .expect("Failed to open GOP");
-
-    let mode_info = gop.current_mode_info();
-    let (width, height) = mode_info.resolution();
-    let stride = mode_info.stride();
-    let pixel_format = match mode_info.pixel_format() {
-        PixelFormat::Rgb => 0u32,
-        PixelFormat::Bgr => 1u32,
-        _ => panic!("Unsupported pixel format"),
-    };
-
-    let mut fb = gop.frame_buffer();
-    let addr = fb.as_mut_ptr() as u64;
-    let size = fb.size() as u64;
-
-    println!(
-        "GOP: {}x{} stride={} format={} addr={:#x} size={}",
-        width, height, stride, pixel_format, addr, size
-    );
-
-    FramebufferInfo {
-        addr,
-        size,
-        width: width as u32,
-        height: height as u32,
-        stride: stride as u32,
-        pixel_format,
-    }
-}
-
 static INIT_PROGRAM: &[u8] = b"compositor";
 
-fn start_kernel(kernel: LoadedKernel, kernel_elf_bytes: vec::Vec<u8>, initrd: vec::Vec<u8>, rsdp_addr: u64, fb: FramebufferInfo, system_table: SystemTable<Boot>) -> ! {
+fn start_kernel(kernel: LoadedKernel, kernel_elf_bytes: vec::Vec<u8>, initrd: vec::Vec<u8>, rsdp_addr: u64, system_table: SystemTable<Boot>) -> ! {
     // Estimate memory map size
     let mms = system_table.boot_services().memory_map_size();
     let memory_map_entry_count = mms.map_size / mms.entry_size + 8;
@@ -249,12 +195,6 @@ fn start_kernel(kernel: LoadedKernel, kernel_elf_bytes: vec::Vec<u8>, initrd: ve
         rsdp_addr,
         initrd_addr: initrd.as_ptr() as u64,
         initrd_size: initrd.len() as u64,
-        framebuffer_addr: fb.addr,
-        framebuffer_size: fb.size,
-        framebuffer_width: fb.width,
-        framebuffer_height: fb.height,
-        framebuffer_stride: fb.stride,
-        framebuffer_pixel_format: fb.pixel_format,
         init_program_addr: INIT_PROGRAM.as_ptr() as u64,
         init_program_len: INIT_PROGRAM.len() as u64,
         kernel_elf_addr: kernel_elf_bytes.as_ptr() as u64,
@@ -296,9 +236,6 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
     println!("Loading kernel elf...");
     let loaded_kernel = load_kernel_elf(&kernel_bytes);
 
-    println!("Initializing GOP...");
-    let fb_info = init_gop(&system_table);
-
     println!("Starting kernel...");
-    start_kernel(loaded_kernel, kernel_bytes, initrd, rsdp_addr, fb_info, system_table);
+    start_kernel(loaded_kernel, kernel_bytes, initrd, rsdp_addr, system_table);
 }
