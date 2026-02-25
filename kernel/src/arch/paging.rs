@@ -127,18 +127,14 @@ pub fn map_user(addr: u64, size: u64) {
             let pt = if pde & PAGE_PRESENT != 0 && pde & PAGE_SIZE_BIT != 0 {
                 split_2m(pd, pd_idx)
             } else if pde & PAGE_PRESENT != 0 {
-                // Already a PT pointer, just add USER flag to PDE
-                let updated = pde | PAGE_USER;
-                if updated != pde {
-                    pd.add(pd_idx).write(updated);
-                }
                 (pde & ADDR_MASK) as *mut u64
             } else {
-                // No mapping — create PT (shouldn't normally happen with init)
                 get_or_create(pd, pd_idx, user_flags)
             };
 
-            // Set USER on the 4KB PTE
+            // Ensure USER on PDE and PTE
+            let pde = pd.add(pd_idx).read();
+            pd.add(pd_idx).write(pde | PAGE_USER);
             let pte = pt.add(pt_idx).read();
             pt.add(pt_idx).write(pte | PAGE_USER);
         }
@@ -250,6 +246,55 @@ pub fn is_user_mapped(addr: u64, size: u64) -> bool {
     }
 
     true
+}
+
+fn has(entry: u64, flag: u64) -> u8 {
+    if entry & flag != 0 { 1 } else { 0 }
+}
+
+/// Dump page table entries for an address. Lock-free for crash safety.
+pub fn debug_page_walk(addr: u64) {
+    use crate::log;
+
+    let pml4 = cpu::read_cr3() as *const u64;
+    let pml4_idx = ((addr >> 39) & 0x1FF) as usize;
+    let pdpt_idx = ((addr >> 30) & 0x1FF) as usize;
+    let pd_idx = ((addr >> 21) & 0x1FF) as usize;
+    let pt_idx = ((addr >> 12) & 0x1FF) as usize;
+
+    log!("  Page walk for {:#x} [PML4[{}] PDPT[{}] PD[{}] PT[{}]]:",
+        addr, pml4_idx, pdpt_idx, pd_idx, pt_idx);
+
+    unsafe {
+        let pml4e = pml4.add(pml4_idx).read_volatile();
+        log!("    PML4E: {:#018x} P={} W={} U={}", pml4e,
+            has(pml4e, PAGE_PRESENT), has(pml4e, PAGE_WRITE), has(pml4e, PAGE_USER));
+        if pml4e & PAGE_PRESENT == 0 { return; }
+
+        let pdpt = (pml4e & ADDR_MASK) as *const u64;
+        let pdpte = pdpt.add(pdpt_idx).read_volatile();
+        log!("    PDPTE: {:#018x} P={} W={} U={}", pdpte,
+            has(pdpte, PAGE_PRESENT), has(pdpte, PAGE_WRITE), has(pdpte, PAGE_USER));
+        if pdpte & PAGE_PRESENT == 0 { return; }
+
+        let pd = (pdpte & ADDR_MASK) as *const u64;
+        let pde = pd.add(pd_idx).read_volatile();
+        log!("    PDE:   {:#018x} P={} W={} U={} PS={}", pde,
+            has(pde, PAGE_PRESENT), has(pde, PAGE_WRITE), has(pde, PAGE_USER), has(pde, PAGE_SIZE_BIT));
+        if pde & PAGE_PRESENT == 0 { return; }
+        if pde & PAGE_SIZE_BIT != 0 {
+            log!("    -> 2MB large page at {:#x}", pde & ADDR_MASK);
+            return;
+        }
+
+        let pt = (pde & ADDR_MASK) as *const u64;
+        let pte = pt.add(pt_idx).read_volatile();
+        log!("    PTE:   {:#018x} P={} W={} U={}", pte,
+            has(pte, PAGE_PRESENT), has(pte, PAGE_WRITE), has(pte, PAGE_USER));
+        if pte & PAGE_PRESENT != 0 {
+            log!("    -> maps {:#x}", pte & ADDR_MASK);
+        }
+    }
 }
 
 /// Remove user-accessible flag from a physical address range.

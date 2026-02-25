@@ -2,8 +2,7 @@ use core::arch::naked_asm;
 
 use super::cpu;
 use super::cpu::{outb, io_wait};
-use crate::arch::syscall;
-use crate::arch::percpu;
+use crate::arch::{paging, syscall, percpu};
 use crate::{symbols, process, log};
 
 use alloc::format;
@@ -15,6 +14,22 @@ const PIC1_CMD: u16 = 0x20;
 const PIC1_DATA: u16 = 0x21;
 const PIC2_CMD: u16 = 0xA0;
 const PIC2_DATA: u16 = 0xA1;
+
+// Exception vectors
+const VECTOR_INVALID_OPCODE: u64 = 6;
+const VECTOR_GPF: u64 = 13;
+const VECTOR_PAGE_FAULT: u64 = 14;
+
+// Page fault error code bits
+const PF_PRESENT: u64 = 1 << 0;
+const PF_WRITE: u64 = 1 << 1;
+const PF_INSTRUCTION_FETCH: u64 = 1 << 4;
+
+// IPI vectors
+const VECTOR_TLB_FLUSH: usize = 0xFE;
+
+// CS ring mask
+const RPL_MASK: u64 = 3;
 
 // IDT entry (16 bytes in 64-bit mode)
 #[repr(C)]
@@ -136,10 +151,10 @@ pub fn init() {
 
     {
         let mut idt = IDT.lock();
-        idt.entries[6] = IdtEntry::new(ud_entry as u64);
-        idt.entries[13] = IdtEntry::new(gpf_entry as u64);
-        idt.entries[14] = IdtEntry::new(page_fault_entry as u64);
-        idt.entries[0xFE] = IdtEntry::new(tlb_flush_entry as u64);
+        idt.entries[VECTOR_INVALID_OPCODE as usize] = IdtEntry::new(ud_entry as u64);
+        idt.entries[VECTOR_GPF as usize] = IdtEntry::new(gpf_entry as u64);
+        idt.entries[VECTOR_PAGE_FAULT as usize] = IdtEntry::new(page_fault_entry as u64);
+        idt.entries[VECTOR_TLB_FLUSH] = IdtEntry::new(tlb_flush_entry as u64);
     }
 
     let ptr = IdtPointer {
@@ -278,25 +293,25 @@ extern "C" fn exception_handler(
     cs: u64,
     fault_addr: u64,
 ) {
-    let is_user = cs & 3 != 0;
+    let is_user = cs & RPL_MASK != 0;
     let regs = unsafe { &*regs };
 
     let name = match vector {
-        6 => "Invalid Opcode",
-        13 => "General Protection Fault",
-        14 => "Page Fault",
+        VECTOR_INVALID_OPCODE => "Invalid Opcode",
+        VECTOR_GPF => "General Protection Fault",
+        VECTOR_PAGE_FAULT => "Page Fault",
         _ => "Exception",
     };
 
-    let detail = if vector == 14 {
-        let action = if error_code & 16 != 0 {
+    let detail = if vector == VECTOR_PAGE_FAULT {
+        let action = if error_code & PF_INSTRUCTION_FETCH != 0 {
             "execute"
-        } else if error_code & 2 != 0 {
+        } else if error_code & PF_WRITE != 0 {
             "write"
         } else {
             "read"
         };
-        let cause = if error_code & 1 != 0 {
+        let cause = if error_code & PF_PRESENT != 0 {
             "protection violation"
         } else {
             "page not mapped"
@@ -316,6 +331,10 @@ extern "C" fn exception_handler(
         log!("KERNEL PANIC on CPU {} (pid={}): {}", cpu, pid_str, detail);
     }
     log!("  rip: {}", format_addr(rip, is_user));
+
+    if vector == VECTOR_PAGE_FAULT {
+        paging::debug_page_walk(fault_addr);
+    }
 
     let frame = regs.interrupt_frame();
 

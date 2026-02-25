@@ -7,6 +7,7 @@ use alloc::vec::Vec;
 use core::alloc::Layout;
 
 use crate::arch::paging;
+use crate::log;
 
 const CHUNK_SIZE: usize = 1024 * 1024; // 1MB
 
@@ -22,9 +23,10 @@ fn grow(heap: &mut Vec<(u64, u64)>, min_size: usize) {
     let layout = Layout::from_size_align(size, 4096).unwrap();
     let ptr = unsafe { alloc_zeroed(layout) };
     assert!(!ptr.is_null(), "user heap: out of memory");
-    paging::map_user(ptr as u64, size as u64);
     let start = ptr as u64;
     let end = start + size as u64;
+    log!("user_heap: grow {:#x}..{:#x} ({} KB)", start, end, size / 1024);
+    paging::map_user(start, size as u64);
     let pos = heap.iter().position(|&(s, _)| s > start).unwrap_or(heap.len());
     heap.insert(pos, (start, end));
 }

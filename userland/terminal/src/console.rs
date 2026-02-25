@@ -62,6 +62,7 @@ enum AnsiState {
 
 struct SavedScreen {
     char_buf: Vec<char>,
+    wrapped: Vec<bool>,
     rendered: Vec<u64>,
     cursor_col: usize,
     cursor_row: usize,
@@ -88,6 +89,8 @@ pub struct Console {
     fg: Color,
     bg: Color,
     char_buf: Vec<char>,
+    /// Per-row flag: true if this row soft-wrapped into the next row.
+    wrapped: Vec<bool>,
     rendered: Vec<u64>,
     ansi_state: AnsiState,
     ansi_buf: [u8; 16],
@@ -116,6 +119,7 @@ impl Console {
             fg: DEFAULT_FG,
             bg: DEFAULT_BG,
             char_buf: vec![' '; cols * rows],
+            wrapped: vec![false; rows],
             rendered: vec![cell_key(' ', DEFAULT_FG, DEFAULT_BG); cols * rows],
             ansi_state: AnsiState::Normal,
             ansi_buf: [0; 16],
@@ -187,11 +191,13 @@ impl Console {
         let row_size = self.cols;
         self.char_buf.copy_within(row_size.., 0);
         self.rendered.copy_within(row_size.., 0);
+        self.wrapped.copy_within(1.., 0);
         let last_row = (self.rows - 1) * row_size;
         for i in last_row..last_row + row_size {
             self.char_buf[i] = ' ';
             self.rendered[i] = 0;
         }
+        self.wrapped[self.rows - 1] = false;
         self.cursor_row = self.rows - 1;
         self.cursor_col = 0;
     }
@@ -207,6 +213,7 @@ impl Console {
     fn clear_screen(&mut self) {
         self.fb.clear(self.bg);
         self.char_buf.fill(' ');
+        self.wrapped.fill(false);
         let blank = cell_key(' ', DEFAULT_FG, DEFAULT_BG);
         self.rendered.fill(blank);
         self.cursor_col = 0;
@@ -232,6 +239,7 @@ impl Console {
 
     fn emit_char(&mut self, ch: char) {
         if self.cursor_col >= self.cols {
+            self.wrapped[self.cursor_row] = true;
             self.newline();
         }
         self.put_char(self.cursor_col, self.cursor_row, ch);
@@ -449,6 +457,7 @@ impl Console {
                 let n = self.cols * self.rows;
                 self.saved_screen = Some(SavedScreen {
                     char_buf: core::mem::replace(&mut self.char_buf, vec![' '; n]),
+                    wrapped: core::mem::replace(&mut self.wrapped, vec![false; self.rows]),
                     rendered: core::mem::replace(&mut self.rendered, vec![0; n]),
                     cursor_col: self.cursor_col,
                     cursor_row: self.cursor_row,
@@ -460,6 +469,7 @@ impl Console {
             (1049, b'l') => {
                 if let Some(saved) = self.saved_screen.take() {
                     self.char_buf = saved.char_buf;
+                    self.wrapped = saved.wrapped;
                     self.rendered = saved.rendered;
                     self.cursor_col = saved.cursor_col;
                     self.cursor_row = saved.cursor_row;
@@ -471,19 +481,85 @@ impl Console {
     }
 
     pub fn resize(&mut self, fb: Framebuffer) {
-        self.cols = fb.width() / font::WIDTH;
-        self.rows = fb.height() / font::HEIGHT;
+        let new_cols = fb.width() / font::WIDTH;
+        let new_rows = fb.height() / font::HEIGHT;
+
+        // Find cursor's offset within its logical line
+        let mut cursor_line_offset = self.cursor_col;
+        let mut r = self.cursor_row;
+        while r > 0 && self.wrapped[r - 1] {
+            r -= 1;
+            cursor_line_offset += self.cols;
+        }
+        let cursor_logical_start = r;
+
+        let mut new_char_buf = vec![' '; new_cols * new_rows];
+        let mut new_wrapped = vec![false; new_rows];
+        let mut new_cursor_row = 0;
+        let mut new_cursor_col = 0;
+        let mut dest_row = 0;
+        let mut src_row = 0;
+
+        while src_row < self.rows && dest_row < new_rows {
+            let logical_start = src_row;
+
+            // Collect one logical line (join soft-wrapped rows)
+            let mut line: Vec<char> = Vec::new();
+            loop {
+                let start = src_row * self.cols;
+                let row_chars = &self.char_buf[start..start + self.cols];
+
+                if self.wrapped[src_row] {
+                    // Wrapped row: all columns are content
+                    line.extend_from_slice(row_chars);
+                    src_row += 1;
+                    if src_row >= self.rows { break; }
+                } else {
+                    // Final row: trim trailing spaces
+                    let len = row_chars.iter().rposition(|&c| c != ' ')
+                        .map_or(0, |p| p + 1);
+                    line.extend_from_slice(&row_chars[..len]);
+                    src_row += 1;
+                    break;
+                }
+            }
+
+            // Track cursor
+            if logical_start == cursor_logical_start {
+                new_cursor_row = dest_row + cursor_line_offset / new_cols;
+                new_cursor_col = cursor_line_offset % new_cols;
+            }
+
+            if line.is_empty() {
+                dest_row += 1;
+                continue;
+            }
+
+            // Write logical line to new buffer, wrapping at new_cols
+            let mut col = 0;
+            for (i, &ch) in line.iter().enumerate() {
+                if dest_row >= new_rows { break; }
+                new_char_buf[dest_row * new_cols + col] = ch;
+                col += 1;
+                if col >= new_cols && i + 1 < line.len() {
+                    new_wrapped[dest_row] = true;
+                    dest_row += 1;
+                    col = 0;
+                }
+            }
+            dest_row += 1;
+        }
+
         self.fb = fb;
-        self.cursor_col = 0;
-        self.cursor_row = 0;
-        self.fg = DEFAULT_FG;
-        self.bg = DEFAULT_BG;
-        self.char_buf = vec![' '; self.cols * self.rows];
-        self.rendered = vec![cell_key(' ', DEFAULT_FG, DEFAULT_BG); self.cols * self.rows];
+        self.cols = new_cols;
+        self.rows = new_rows;
+        self.char_buf = new_char_buf;
+        self.wrapped = new_wrapped;
+        self.rendered = vec![0; new_cols * new_rows];
+        self.cursor_row = new_cursor_row.min(new_rows.saturating_sub(1));
+        self.cursor_col = new_cursor_col.min(new_cols.saturating_sub(1));
         self.saved_screen = None;
-        self.ansi_state = AnsiState::Normal;
-        self.fb.clear(DEFAULT_BG);
-        self.draw_cursor();
+        self.redraw_all();
     }
 
     pub fn write_bytes(&mut self, bytes: &[u8]) {
