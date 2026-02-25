@@ -14,6 +14,7 @@ pub const MSG_PRESENT: u32 = 2;
 // Compositor → Client
 pub const MSG_WINDOW_CREATED: u32 = 1;
 pub const MSG_KEY_INPUT: u32 = 2;
+pub const MSG_WINDOW_RESIZED: u32 = 3;
 
 #[repr(C)]
 pub struct CreateWindowRequest {
@@ -38,15 +39,7 @@ pub struct KeyEvent {
 
 pub enum Event {
     KeyInput(KeyEvent),
-}
-
-/// Receive the next window event from the compositor.
-pub fn recv_event() -> Event {
-    let msg = message::recv();
-    match msg.msg_type() {
-        MSG_KEY_INPUT => Event::KeyInput(msg.take_payload()),
-        other => panic!("unknown window event type: {other}"),
-    }
+    Resized,
 }
 
 pub struct Window {
@@ -74,6 +67,24 @@ impl Window {
             width: info.width,
             height: info.height,
             pixel_format: info.pixel_format,
+        }
+    }
+
+    /// Receive the next window event from the compositor.
+    /// Updates internal state on resize events.
+    pub fn recv_event(&mut self) -> Event {
+        let msg = message::recv();
+        match msg.msg_type() {
+            MSG_KEY_INPUT => Event::KeyInput(msg.take_payload()),
+            MSG_WINDOW_RESIZED => {
+                let info: WindowInfo = msg.take_payload();
+                self.buffer = info.buffer;
+                self.width = info.width;
+                self.height = info.height;
+                self.pixel_format = info.pixel_format;
+                Event::Resized
+            }
+            other => panic!("unknown window event type: {other}"),
         }
     }
 

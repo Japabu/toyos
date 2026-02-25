@@ -100,20 +100,16 @@ impl Framebuffer {
     }
 
     pub fn fill_rect(&self, x: usize, y: usize, w: usize, h: usize, color: Color) {
-        if w == 0 || h == 0 { return; }
-        let pixel = self.encode_pixel(color);
         let x_end = (x + w).min(self.width);
         let y_end = (y + h).min(self.height);
-        let actual_w = x_end.saturating_sub(x);
-        if actual_w == 0 { return; }
+        if x >= x_end || y >= y_end { return; }
+        let actual_w = x_end - x;
         let row_bytes = actual_w * 4;
+        let pixel = self.encode_pixel(color);
 
         unsafe {
-            // Fill first row with the pixel pattern
             let first_row = self.back().add((y * self.stride + x) * 4);
             Self::fill_row(first_row, &pixel, actual_w);
-
-            // Copy first row to all remaining rows
             for dy in 1..(y_end - y) {
                 let dst = self.back().add(((y + dy) * self.stride + x) * 4);
                 ptr::copy_nonoverlapping(first_row, dst, row_bytes);
@@ -138,18 +134,22 @@ impl Framebuffer {
     }
 
     /// Blit a buffer to a region of the back buffer (row-by-row memcpy).
-    pub fn blit(&self, x: usize, y: usize, w: usize, h: usize, buffer: &[u8]) {
-        let row_bytes = w * 4;
+    /// `src_stride` is the width of the source buffer (may be wider than `w` during resize).
+    pub fn blit(&self, x: usize, y: usize, w: usize, h: usize, src_stride: usize, buffer: &[u8]) {
+        let blit_w = w.min(self.width.saturating_sub(x));
+        if blit_w == 0 { return; }
+        let copy_bytes = blit_w * 4;
+        let src_row_bytes = src_stride * 4;
         for dy in 0..h {
             let sy = y + dy;
             if sy >= self.height { break; }
-            let src_offset = dy * row_bytes;
+            let src_offset = dy * src_row_bytes;
             let dst_offset = (sy * self.stride + x) * 4;
             unsafe {
                 ptr::copy_nonoverlapping(
                     buffer.as_ptr().add(src_offset),
                     self.back().add(dst_offset),
-                    row_bytes,
+                    copy_bytes,
                 );
             }
         }

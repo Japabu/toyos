@@ -470,6 +470,22 @@ impl Console {
         }
     }
 
+    pub fn resize(&mut self, fb: Framebuffer) {
+        self.cols = fb.width() / font::WIDTH;
+        self.rows = fb.height() / font::HEIGHT;
+        self.fb = fb;
+        self.cursor_col = 0;
+        self.cursor_row = 0;
+        self.fg = DEFAULT_FG;
+        self.bg = DEFAULT_BG;
+        self.char_buf = vec![' '; self.cols * self.rows];
+        self.rendered = vec![cell_key(' ', DEFAULT_FG, DEFAULT_BG); self.cols * self.rows];
+        self.saved_screen = None;
+        self.ansi_state = AnsiState::Normal;
+        self.fb.clear(DEFAULT_BG);
+        self.draw_cursor();
+    }
+
     pub fn write_bytes(&mut self, bytes: &[u8]) {
         self.erase_cursor();
         for &byte in bytes {

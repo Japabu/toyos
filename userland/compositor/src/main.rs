@@ -7,9 +7,12 @@ use std::process::{Command, Stdio};
 
 use framebuffer::{Color, CursorImage, Framebuffer};
 
-const MARGIN: usize = 40;
 const TITLE_BAR_HEIGHT: usize = 28;
 const BORDER_WIDTH: usize = 1;
+const RESIZE_HANDLE_SIZE: usize = 16;
+const MIN_CONTENT_WIDTH: usize = 200;
+const MIN_CONTENT_HEIGHT: usize = 100;
+const INITIAL_MARGIN: usize = 40;
 
 const DESKTOP_COLOR: Color = Color { r: 0x2d, g: 0x2d, b: 0x2d };
 const TITLE_BAR_COLOR: Color = Color { r: 0x33, g: 0x33, b: 0x33 };
@@ -54,6 +57,45 @@ struct WindowState {
     content_y: usize,
     width: usize,
     height: usize,
+    buf_width: usize,
+    buf_height: usize,
+}
+
+enum HitZone {
+    Desktop,
+    TitleBar(usize),
+    ResizeCorner(usize),
+}
+
+fn hit_test(windows: &[WindowState], x: i32, y: i32) -> HitZone {
+    for (idx, win) in windows.iter().enumerate().rev() {
+        let win_x = win.content_x as i32 - BORDER_WIDTH as i32;
+        let win_y = win.content_y as i32 - BORDER_WIDTH as i32 - TITLE_BAR_HEIGHT as i32;
+        let win_w = win.width as i32 + BORDER_WIDTH as i32 * 2;
+        let win_h = win.height as i32 + BORDER_WIDTH as i32 * 2 + TITLE_BAR_HEIGHT as i32;
+
+        if x >= win_x && x < win_x + win_w && y >= win_y && y < win_y + win_h {
+            // Bottom-right corner = resize handle
+            let corner_x = win_x + win_w - RESIZE_HANDLE_SIZE as i32;
+            let corner_y = win_y + win_h - RESIZE_HANDLE_SIZE as i32;
+            if x >= corner_x && y >= corner_y {
+                return HitZone::ResizeCorner(idx);
+            }
+            // Title bar = drag handle
+            let title_y_end = win_y + BORDER_WIDTH as i32 + TITLE_BAR_HEIGHT as i32;
+            if y < title_y_end {
+                return HitZone::TitleBar(idx);
+            }
+            return HitZone::Desktop;
+        }
+    }
+    HitZone::Desktop
+}
+
+enum Interaction {
+    None,
+    Dragging { window_idx: usize },
+    Resizing { window_idx: usize },
 }
 
 fn redraw(
@@ -84,7 +126,10 @@ fn redraw(
         let title_y = win_y + BORDER_WIDTH + (TITLE_BAR_HEIGHT - 16) / 2;
         font.draw_string(screen, title_x, title_y, "Terminal", TITLE_TEXT_COLOR, TITLE_BAR_COLOR);
 
-        screen.blit(win.content_x, win.content_y, win.width, win.height, &win.buffer);
+        // Blit content, clipped to buffer dimensions
+        let blit_w = win.width.min(win.buf_width);
+        let blit_h = win.height.min(win.buf_height);
+        screen.blit(win.content_x, win.content_y, blit_w, blit_h, win.buf_width, &win.buffer);
     }
 
     screen.draw_cursor(cursor_x, cursor_y, cursor);
@@ -129,6 +174,8 @@ fn main() {
     let mut cursor_x = screen_w / 2;
     let mut cursor_y = screen_h / 2;
     let mut dirty = true;
+    let mut prev_buttons: u8 = 0;
+    let mut interaction = Interaction::None;
 
     loop {
         if dirty {
@@ -159,10 +206,74 @@ fn main() {
             let mut buf = [0u8; 3];
             let n = io::read_fd(mouse_fd, &mut buf);
             if n >= 3 {
+                let buttons = buf[0];
                 let dx = buf[1] as i8;
                 let dy = buf[2] as i8;
+
                 cursor_x = (cursor_x + dx as i32).clamp(0, screen_w - 1);
                 cursor_y = (cursor_y + dy as i32).clamp(0, screen_h - 1);
+
+                let left = buttons & 1 != 0;
+                let was_left = prev_buttons & 1 != 0;
+
+                // Left button just pressed — start interaction
+                if left && !was_left {
+                    match hit_test(&windows, cursor_x, cursor_y) {
+                        HitZone::TitleBar(idx) => {
+                            interaction = Interaction::Dragging { window_idx: idx };
+                        }
+                        HitZone::ResizeCorner(idx) => {
+                            interaction = Interaction::Resizing { window_idx: idx };
+                        }
+                        HitZone::Desktop => {}
+                    }
+                }
+
+                // Apply movement while button held
+                if left {
+                    match interaction {
+                        Interaction::Dragging { window_idx } => {
+                            let win = &mut windows[window_idx];
+                            let min_x = BORDER_WIDTH as i32;
+                            let min_y = (BORDER_WIDTH + TITLE_BAR_HEIGHT) as i32;
+                            win.content_x = (win.content_x as i32 + dx as i32).max(min_x) as usize;
+                            win.content_y = (win.content_y as i32 + dy as i32).max(min_y) as usize;
+                        }
+                        Interaction::Resizing { window_idx } => {
+                            let win = &mut windows[window_idx];
+                            win.width = (win.width as i32 + dx as i32)
+                                .max(MIN_CONTENT_WIDTH as i32) as usize;
+                            win.height = (win.height as i32 + dy as i32)
+                                .max(MIN_CONTENT_HEIGHT as i32) as usize;
+                        }
+                        Interaction::None => {}
+                    }
+                }
+
+                // Left button released — finalize interaction
+                if !left && was_left {
+                    if let Interaction::Resizing { window_idx } = interaction {
+                        let win = &mut windows[window_idx];
+                        win.buffer = vec![0u8; win.width * win.height * 4];
+                        win.buf_width = win.width;
+                        win.buf_height = win.height;
+                        let buffer_ptr = win.buffer.as_ptr() as *mut u8;
+                        let pixel_format = screen.pixel_format_raw();
+                        message::send(win.pid, Message::new(
+                            window::MSG_WINDOW_RESIZED,
+                            window::WindowInfo {
+                                buffer: buffer_ptr,
+                                width: win.width as u32,
+                                height: win.height as u32,
+                                stride: win.width as u32,
+                                pixel_format,
+                            },
+                        ));
+                    }
+                    interaction = Interaction::None;
+                }
+
+                prev_buttons = buttons;
                 dirty = true;
             }
         }
@@ -186,10 +297,10 @@ fn main() {
                     let screen_w = screen.width();
                     let screen_h = screen.height();
 
-                    let win_x = MARGIN;
-                    let win_y = MARGIN;
-                    let win_w = screen_w - MARGIN * 2;
-                    let win_h = screen_h - MARGIN * 2;
+                    let win_x = INITIAL_MARGIN;
+                    let win_y = INITIAL_MARGIN;
+                    let win_w = screen_w - INITIAL_MARGIN * 2;
+                    let win_h = screen_h - INITIAL_MARGIN * 2;
 
                     let content_x = win_x + BORDER_WIDTH;
                     let content_y = win_y + BORDER_WIDTH + TITLE_BAR_HEIGHT;
@@ -207,6 +318,8 @@ fn main() {
                         content_y,
                         width: content_w,
                         height: content_h,
+                        buf_width: content_w,
+                        buf_height: content_h,
                     });
 
                     message::send(sender, Message::new(
