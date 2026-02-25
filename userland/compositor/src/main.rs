@@ -1,9 +1,8 @@
 mod framebuffer;
 
-use std::io::{Read, Write};
-use std::os::toyos::io::{self, AsRawFd};
+use std::os::toyos::io;
 use std::os::toyos::message::{self, Message};
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 use framebuffer::{Color, CursorImage, Framebuffer};
 
@@ -13,6 +12,7 @@ const RESIZE_HANDLE_SIZE: usize = 16;
 const MIN_CONTENT_WIDTH: usize = 200;
 const MIN_CONTENT_HEIGHT: usize = 100;
 const INITIAL_MARGIN: usize = 40;
+const CASCADE_OFFSET: usize = 30;
 
 const DESKTOP_COLOR: Color = Color { r: 0x2d, g: 0x2d, b: 0x2d };
 const TITLE_BAR_COLOR: Color = Color { r: 0x33, g: 0x33, b: 0x33 };
@@ -66,6 +66,7 @@ struct WindowState {
 enum HitZone {
     Desktop,
     TitleBar(usize),
+    Content(usize),
     ResizeCorner(usize),
 }
 
@@ -88,7 +89,7 @@ fn hit_test(windows: &[WindowState], x: i32, y: i32) -> HitZone {
             if y < title_y_end {
                 return HitZone::TitleBar(idx);
             }
-            return HitZone::Desktop;
+            return HitZone::Content(idx);
         }
     }
     HitZone::Desktop
@@ -163,17 +164,9 @@ fn main() {
     let cursor_data = std::fs::read("/initrd/cursor.bin").expect("failed to read cursor");
     let cursor = CursorImage::new(&cursor_data);
 
-    let mut child = Command::new("/initrd/terminal")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
+    Command::new("/initrd/terminal")
         .spawn()
         .expect("failed to spawn terminal");
-
-    let _terminal_stdin = child.stdin.take().unwrap();
-    let mut terminal_stdout = child.stdout.take().unwrap();
-    let terminal_stdout_fd = terminal_stdout.as_raw_fd();
-
-    let stdout = std::io::stdout();
 
     let mut windows: Vec<WindowState> = Vec::new();
     let screen_w = screen.width() as i32;
@@ -192,19 +185,33 @@ fn main() {
             dirty = false;
         }
 
-        let ready = io::poll(&[kb_fd, mouse_fd, terminal_stdout_fd]);
+        let ready = io::poll(&[kb_fd, mouse_fd]);
 
         if ready.fd(0) {
             let mut buf = [0u8; 64];
             let n = io::read_fd(kb_fd, &mut buf);
             if n > 0 {
-                if let Some(win) = windows.first() {
-                    let mut event = window::KeyEvent {
-                        len: n as u8,
-                        bytes: [0u8; 16],
-                    };
-                    event.bytes[..n.min(16)].copy_from_slice(&buf[..n.min(16)]);
-                    message::send(win.pid, Message::new(window::MSG_KEY_INPUT, event));
+                // Filter out Ctrl+N (0x0E) — spawn new terminal
+                let mut forward = [0u8; 64];
+                let mut forward_len = 0;
+                for &b in &buf[..n] {
+                    if b == 0x0E {
+                        Command::new("/initrd/terminal").spawn().ok();
+                    } else {
+                        forward[forward_len] = b;
+                        forward_len += 1;
+                    }
+                }
+                if forward_len > 0 {
+                    if let Some(win) = windows.last() {
+                        let mut event = window::KeyEvent {
+                            len: forward_len as u8,
+                            bytes: [0u8; 16],
+                        };
+                        event.bytes[..forward_len.min(16)]
+                            .copy_from_slice(&forward[..forward_len.min(16)]);
+                        message::send(win.pid, Message::new(window::MSG_KEY_INPUT, event));
+                    }
                 }
             }
         }
@@ -227,10 +234,22 @@ fn main() {
                 if left && !was_left {
                     match hit_test(&windows, cursor_x, cursor_y) {
                         HitZone::TitleBar(idx) => {
-                            interaction = Interaction::Dragging { window_idx: idx };
+                            let win = windows.remove(idx);
+                            windows.push(win);
+                            let new_idx = windows.len() - 1;
+                            interaction = Interaction::Dragging { window_idx: new_idx };
                         }
                         HitZone::ResizeCorner(idx) => {
-                            interaction = Interaction::Resizing { window_idx: idx };
+                            let win = windows.remove(idx);
+                            windows.push(win);
+                            let new_idx = windows.len() - 1;
+                            interaction = Interaction::Resizing { window_idx: new_idx };
+                        }
+                        HitZone::Content(idx) => {
+                            if idx != windows.len() - 1 {
+                                let win = windows.remove(idx);
+                                windows.push(win);
+                            }
                         }
                         HitZone::Desktop => {}
                     }
@@ -291,15 +310,6 @@ fn main() {
             }
         }
 
-        if ready.fd(2) {
-            let mut buf = [0u8; 4096];
-            let n = terminal_stdout.read(&mut buf).unwrap_or(0);
-            if n == 0 {
-                break;
-            }
-            stdout.lock().write_all(&buf[..n]).ok();
-        }
-
         if ready.messages() {
             let msg = message::recv();
             let sender = msg.sender();
@@ -310,8 +320,9 @@ fn main() {
                     let screen_w = screen.width();
                     let screen_h = screen.height();
 
-                    let win_x = INITIAL_MARGIN;
-                    let win_y = INITIAL_MARGIN;
+                    let offset = CASCADE_OFFSET * (windows.len() % 10);
+                    let win_x = INITIAL_MARGIN + offset;
+                    let win_y = INITIAL_MARGIN + offset;
                     let win_w = screen_w - INITIAL_MARGIN * 2;
                     let win_h = screen_h - INITIAL_MARGIN * 2;
 
@@ -360,8 +371,4 @@ fn main() {
             }
         }
     }
-
-    drop(_terminal_stdin);
-    drop(terminal_stdout);
-    child.wait().ok();
 }
