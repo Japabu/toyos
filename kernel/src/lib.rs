@@ -27,6 +27,8 @@ pub mod symbols;
 #[cfg(not(test))]
 pub mod process;
 #[cfg(not(test))]
+pub mod scheduler;
+#[cfg(not(test))]
 pub mod clock;
 #[cfg(not(test))]
 pub mod fd;

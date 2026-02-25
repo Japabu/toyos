@@ -10,6 +10,17 @@ const O_WRITE: u64 = 2;
 const O_CREATE: u64 = 4;
 const O_TRUNCATE: u64 = 8;
 
+/// View any `#[repr(C)]` struct as a byte slice.
+///
+/// # Safety
+/// Caller must ensure `T` has no padding that leaks uninitialized memory.
+/// All current uses are `#[repr(C)]` structs with fully initialized fields.
+fn as_bytes<T: Sized>(val: &T) -> &[u8] {
+    unsafe {
+        core::slice::from_raw_parts(val as *const T as *const u8, core::mem::size_of::<T>())
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct FramebufferInfo {
@@ -142,12 +153,7 @@ pub fn try_read(table: &mut FdTable, fd: u64, buf: &mut [u8]) -> Option<u64> {
         Descriptor::Mouse => {
             crate::drivers::xhci::poll_global();
             if let Some(event) = mouse::try_read_event() {
-                let bytes = unsafe {
-                    core::slice::from_raw_parts(
-                        &event as *const mouse::MouseEvent as *const u8,
-                        core::mem::size_of::<mouse::MouseEvent>(),
-                    )
-                };
+                let bytes = as_bytes(&event);
                 let count = buf.len().min(bytes.len());
                 buf[..count].copy_from_slice(&bytes[..count]);
                 Some(count as u64)
@@ -156,14 +162,9 @@ pub fn try_read(table: &mut FdTable, fd: u64, buf: &mut [u8]) -> Option<u64> {
             }
         }
         Descriptor::Framebuffer(info) => {
-            let info_bytes = unsafe {
-                core::slice::from_raw_parts(
-                    info as *const FramebufferInfo as *const u8,
-                    core::mem::size_of::<FramebufferInfo>(),
-                )
-            };
-            let count = buf.len().min(info_bytes.len());
-            buf[..count].copy_from_slice(&info_bytes[..count]);
+            let bytes = as_bytes(info);
+            let count = buf.len().min(bytes.len());
+            buf[..count].copy_from_slice(&bytes[..count]);
             Some(count as u64)
         }
         Descriptor::PipeWrite(_) | Descriptor::TtyWrite(_) | Descriptor::SerialConsole => Some(u64::MAX),

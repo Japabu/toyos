@@ -1,7 +1,7 @@
 use core::arch::naked_asm;
 
 use alloc::vec::Vec;
-use super::{cpu, gdt};
+use super::{cpu, gdt, paging};
 use crate::drivers::acpi;
 use crate::sync::Lock;
 use crate::{device, fd, keyboard, log, message, pipe, process, vfs};
@@ -43,6 +43,62 @@ const SYS_RECV_MSG: u64 = 30;
 const SYS_OPEN_DEVICE: u64 = 31;
 const SYS_REGISTER_NAME: u64 = 32;
 const SYS_FIND_PID: u64 = 33;
+
+// ---------------------------------------------------------------------------
+// User pointer validation
+// ---------------------------------------------------------------------------
+
+/// Validate a user pointer range and return a shared slice, or None if invalid.
+fn user_slice(ptr: u64, len: u64) -> Option<&'static [u8]> {
+    let len = len as usize;
+    if len == 0 {
+        return Some(&[]);
+    }
+    if !paging::is_user_mapped(ptr, len as u64) {
+        return None;
+    }
+    Some(unsafe { core::slice::from_raw_parts(ptr as *const u8, len) })
+}
+
+/// Validate a user pointer range and return a mutable slice, or None if invalid.
+fn user_slice_mut(ptr: u64, len: u64) -> Option<&'static mut [u8]> {
+    let len = len as usize;
+    if len == 0 {
+        return Some(&mut []);
+    }
+    if !paging::is_user_mapped(ptr, len as u64) {
+        return None;
+    }
+    Some(unsafe { core::slice::from_raw_parts_mut(ptr as *mut u8, len) })
+}
+
+/// Validate a user pointer range and return it as a UTF-8 str, or None if invalid.
+fn user_str(ptr: u64, len: u64) -> Option<&'static str> {
+    let slice = user_slice(ptr, len)?;
+    core::str::from_utf8(slice).ok()
+}
+
+/// Validate a user pointer to a sized struct, or None if invalid.
+fn user_ref<T>(ptr: u64) -> Option<&'static T> {
+    let size = core::mem::size_of::<T>() as u64;
+    if size == 0 || !paging::is_user_mapped(ptr, size) {
+        return None;
+    }
+    Some(unsafe { &*(ptr as *const T) })
+}
+
+/// Validate a user pointer to a mutable sized struct, or None if invalid.
+fn user_mut<T>(ptr: u64) -> Option<&'static mut T> {
+    let size = core::mem::size_of::<T>() as u64;
+    if size == 0 || !paging::is_user_mapped(ptr, size) {
+        return None;
+    }
+    Some(unsafe { &mut *(ptr as *mut T) })
+}
+
+// ---------------------------------------------------------------------------
+// Syscall entry point
+// ---------------------------------------------------------------------------
 
 pub fn init() {
     let efer = cpu::rdmsr(MSR_EFER);
@@ -94,18 +150,18 @@ extern "C" fn syscall_handler(num: u64, a1: u64, a2: u64, _: u64, a3: u64, a4: u
 fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
     match num {
         SYS_WRITE => {
-            let buf = unsafe { core::slice::from_raw_parts(a2 as *const u8, a3 as usize) };
+            let Some(buf) = user_slice(a2, a3) else { return u64::MAX };
             sys_write(a1, buf)
         }
         SYS_READ => {
-            let buf = unsafe { core::slice::from_raw_parts_mut(a2 as *mut u8, a3 as usize) };
+            let Some(buf) = user_slice_mut(a2, a3) else { return u64::MAX };
             sys_read(a1, buf)
         }
         SYS_ALLOC => process::with_current_mut(|p| crate::user_heap::alloc(&mut p.user_heap, a1 as usize, a2 as usize)),
         SYS_FREE => { process::with_current_mut(|p| crate::user_heap::free(&mut p.user_heap, a1 as *mut u8, a2 as usize)); 0 }
         SYS_REALLOC => process::with_current_mut(|p| crate::user_heap::realloc(&mut p.user_heap, a1 as *mut u8, a2 as usize, a3 as usize, a4 as usize)),
         SYS_EXIT => sys_exit(a1 as i32),
-        SYS_RANDOM => { sys_random(a1 as *mut u8, a2 as usize); 0 }
+        SYS_RANDOM => sys_random(a1, a2),
         SYS_SCREEN_SIZE => screen_size(),
         SYS_CLOCK => crate::clock::nanos_since_boot(),
         SYS_OPEN => sys_open(a1, a2, a3),
@@ -137,6 +193,10 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         _ => u64::MAX,
     }
 }
+
+// ---------------------------------------------------------------------------
+// Syscall implementations
+// ---------------------------------------------------------------------------
 
 fn sys_write(fd_num: u64, buf: &[u8]) -> u64 {
     loop {
@@ -198,8 +258,7 @@ fn sys_read(fd_num: u64, buf: &mut [u8]) -> u64 {
 }
 
 fn sys_open(path_ptr: u64, path_len: u64, flags: u64) -> u64 {
-    let slice = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, path_len as usize) };
-    let Ok(path) = core::str::from_utf8(slice) else { return u64::MAX };
+    let Some(path) = user_str(path_ptr, path_len) else { return u64::MAX };
     let cwd = process::with_current(|p| p.cwd.clone());
     let resolved = vfs::lock().resolve_absolute(&cwd, path);
     process::with_current_mut(|proc| fd::open(&mut proc.fds, &mut *vfs::lock(), &resolved, flags))
@@ -229,15 +288,17 @@ fn sys_exit(code: i32) -> u64 {
     process::exit(code);
 }
 
-fn sys_random(buf: *mut u8, len: usize) {
-    for i in 0..len {
-        unsafe { *buf.add(i) = cpu::rdrand() as u8; }
+fn sys_random(buf_ptr: u64, len: u64) -> u64 {
+    let Some(buf) = user_slice_mut(buf_ptr, len) else { return u64::MAX };
+    for b in buf.iter_mut() {
+        *b = cpu::rdrand() as u8;
     }
+    0
 }
 
 fn sys_readdir(path_ptr: u64, path_len: u64, buf_ptr: u64, buf_len: u64) -> u64 {
-    let slice = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, path_len as usize) };
-    let Ok(path) = core::str::from_utf8(slice) else { return u64::MAX };
+    let Some(path) = user_str(path_ptr, path_len) else { return u64::MAX };
+    let Some(buf) = user_slice_mut(buf_ptr, buf_len) else { return u64::MAX };
 
     let cwd = process::with_current(|p| p.cwd.clone());
     let entries = match vfs::lock().list(&cwd, path) {
@@ -245,7 +306,6 @@ fn sys_readdir(path_ptr: u64, path_len: u64, buf_ptr: u64, buf_len: u64) -> u64 
         Err(_) => return u64::MAX,
     };
 
-    let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, buf_len as usize) };
     let mut pos = 0;
     for (name, size) in &entries {
         let is_dir = name.ends_with('/');
@@ -267,8 +327,7 @@ fn sys_readdir(path_ptr: u64, path_len: u64, buf_ptr: u64, buf_len: u64) -> u64 
 }
 
 fn sys_delete(path_ptr: u64, path_len: u64) -> u64 {
-    let slice = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, path_len as usize) };
-    let Ok(path) = core::str::from_utf8(slice) else { return u64::MAX };
+    let Some(path) = user_str(path_ptr, path_len) else { return u64::MAX };
     let cwd = process::with_current(|p| p.cwd.clone());
     let mut vfs = vfs::lock();
     let resolved = vfs.resolve_absolute(&cwd, path);
@@ -276,8 +335,7 @@ fn sys_delete(path_ptr: u64, path_len: u64) -> u64 {
 }
 
 fn sys_chdir(path_ptr: u64, path_len: u64) -> u64 {
-    let slice = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, path_len as usize) };
-    let Ok(path) = core::str::from_utf8(slice) else { return u64::MAX };
+    let Some(path) = user_str(path_ptr, path_len) else { return u64::MAX };
     let cwd = process::with_current(|p| p.cwd.clone());
     match vfs::lock().cd(&cwd, path) {
         Some(new_cwd) => {
@@ -289,18 +347,17 @@ fn sys_chdir(path_ptr: u64, path_len: u64) -> u64 {
 }
 
 fn sys_getcwd(buf_ptr: u64, buf_len: u64) -> u64 {
+    let Some(buf) = user_slice_mut(buf_ptr, buf_len) else { return u64::MAX };
     process::with_current(|proc| {
         let cwd = &proc.cwd;
-        let len = cwd.len().min(buf_len as usize);
-        let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, len) };
-        buf.copy_from_slice(&cwd.as_bytes()[..len]);
+        let len = cwd.len().min(buf.len());
+        buf[..len].copy_from_slice(&cwd.as_bytes()[..len]);
         len as u64
     })
 }
 
 fn sys_set_keyboard_layout(name_ptr: u64, name_len: u64) -> u64 {
-    let slice = unsafe { core::slice::from_raw_parts(name_ptr as *const u8, name_len as usize) };
-    let Ok(name) = core::str::from_utf8(slice) else { return u64::MAX };
+    let Some(name) = user_str(name_ptr, name_len) else { return u64::MAX };
     if keyboard::set_layout(name) {
         if !vfs::lock().write_file("/nvme/config/keyboard_layout", name.as_bytes()) {
             log!("warning: failed to persist keyboard layout");
@@ -321,8 +378,7 @@ fn sys_pipe() -> u64 {
 }
 
 fn sys_spawn(argv_ptr: u64, argv_len: u64, stdin_fd: u64, stdout_fd: u64) -> u64 {
-    let buf = unsafe { core::slice::from_raw_parts(argv_ptr as *const u8, argv_len as usize) };
-    let Ok(text) = core::str::from_utf8(buf) else { return u64::MAX };
+    let Some(text) = user_str(argv_ptr, argv_len) else { return u64::MAX };
     let args: Vec<&str> = text.split('\0').filter(|s| !s.is_empty()).collect();
     process::spawn(&args, stdin_fd, stdout_fd)
 }
@@ -338,6 +394,10 @@ fn sys_waitpid(pid: u64) -> u64 {
 }
 
 fn sys_poll(fds_ptr: u64, fds_len: u64) -> u64 {
+    let byte_len = fds_len.checked_mul(8).unwrap_or(u64::MAX);
+    if !paging::is_user_mapped(fds_ptr, byte_len) {
+        return u64::MAX;
+    }
     let fds = unsafe { core::slice::from_raw_parts(fds_ptr as *const u64, fds_len as usize) };
     loop {
         crate::drivers::xhci::poll_global();
@@ -361,8 +421,8 @@ fn sys_poll(fds_ptr: u64, fds_len: u64) -> u64 {
 }
 
 fn sys_send_msg(target_pid: u64, msg_ptr: u64) -> u64 {
+    let Some(user_msg) = user_ref::<message::Message>(msg_ptr) else { return u64::MAX };
     let sender = process::current_pid();
-    let user_msg = unsafe { &*(msg_ptr as *const message::Message) };
     let msg = message::Message {
         sender,
         msg_type: user_msg.msg_type,
@@ -373,10 +433,11 @@ fn sys_send_msg(target_pid: u64, msg_ptr: u64) -> u64 {
 }
 
 fn sys_recv_msg(msg_ptr: u64) -> u64 {
+    let Some(out) = user_mut::<message::Message>(msg_ptr) else { return u64::MAX };
     loop {
         let msg = process::with_current_mut(|proc| proc.messages.pop());
         if let Some(msg) = msg {
-            unsafe { *(msg_ptr as *mut message::Message) = msg; }
+            *out = msg;
             return 0;
         }
         process::block(process::ProcessState::BlockedRecvMsg);
@@ -408,15 +469,13 @@ fn sys_open_device(device_type: u64) -> u64 {
 }
 
 fn sys_register_name(name_ptr: u64, name_len: u64) -> u64 {
-    let slice = unsafe { core::slice::from_raw_parts(name_ptr as *const u8, name_len as usize) };
-    let Ok(name) = core::str::from_utf8(slice) else { return u64::MAX };
+    let Some(name) = user_str(name_ptr, name_len) else { return u64::MAX };
     let pid = process::current_pid();
     if process::register_name(name, pid) { 0 } else { u64::MAX }
 }
 
 fn sys_find_pid(name_ptr: u64, name_len: u64) -> u64 {
-    let slice = unsafe { core::slice::from_raw_parts(name_ptr as *const u8, name_len as usize) };
-    let Ok(name) = core::str::from_utf8(slice) else { return u64::MAX };
+    let Some(name) = user_str(name_ptr, name_len) else { return u64::MAX };
     match process::find_pid(name) {
         Some(pid) => pid as u64,
         None => u64::MAX,

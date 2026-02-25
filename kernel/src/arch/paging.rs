@@ -182,6 +182,76 @@ pub fn map_kernel(addr: u64, size: u64) {
     apic::tlb_shootdown();
 }
 
+/// Check if every page in a range has PAGE_USER set.
+/// Used by syscall to validate user-provided pointers.
+pub fn is_user_mapped(addr: u64, size: u64) -> bool {
+    if size == 0 {
+        return true;
+    }
+    // Overflow check
+    let Some(end_addr) = addr.checked_add(size) else { return false };
+
+    let pml4_guard = PML4.lock();
+    let pml4 = *pml4_guard;
+    if pml4.is_null() {
+        return false;
+    }
+
+    let start = addr & !0xFFF;
+    let end = (end_addr + 0xFFF) & !0xFFF;
+    let mut cur = start;
+
+    while cur < end {
+        let pml4_idx = ((cur >> 39) & 0x1FF) as usize;
+        let pdpt_idx = ((cur >> 30) & 0x1FF) as usize;
+        let pd_idx = ((cur >> 21) & 0x1FF) as usize;
+
+        unsafe {
+            let pml4e = pml4.add(pml4_idx).read();
+            if pml4e & PAGE_PRESENT == 0 || pml4e & PAGE_USER == 0 {
+                return false;
+            }
+            let pdpt = (pml4e & ADDR_MASK) as *const u64;
+
+            let pdpte = pdpt.add(pdpt_idx).read();
+            if pdpte & PAGE_PRESENT == 0 || pdpte & PAGE_USER == 0 {
+                return false;
+            }
+            let pd = (pdpte & ADDR_MASK) as *const u64;
+
+            let pde = pd.add(pd_idx).read();
+            if pde & PAGE_PRESENT == 0 {
+                return false;
+            }
+
+            if pde & PAGE_SIZE_BIT != 0 {
+                // 2MB large page — check USER on the PDE itself
+                if pde & PAGE_USER == 0 {
+                    return false;
+                }
+                // Skip to next 2MB boundary
+                cur = (cur + PAGE_2M) & !(PAGE_2M - 1);
+                continue;
+            }
+
+            if pde & PAGE_USER == 0 {
+                return false;
+            }
+            let pt = (pde & ADDR_MASK) as *const u64;
+            let pt_idx = ((cur >> 12) & 0x1FF) as usize;
+
+            let pte = pt.add(pt_idx).read();
+            if pte & PAGE_PRESENT == 0 || pte & PAGE_USER == 0 {
+                return false;
+            }
+        }
+
+        cur += PAGE_4K;
+    }
+
+    true
+}
+
 /// Remove user-accessible flag from a physical address range.
 pub fn unmap_user(addr: u64, size: u64) {
     let pml4_guard = PML4.lock();

@@ -251,7 +251,4 @@ impl Vfs {
         }
     }
 
-    pub fn mount_exists(&self, name: &str) -> bool {
-        self.mounts.contains_key(name)
-    }
 }

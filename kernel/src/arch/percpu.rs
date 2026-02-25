@@ -135,6 +135,15 @@ impl PerCpu {
     }
 }
 
+// Compile-time checks: assembly uses hardcoded GS-relative offsets into PerCpu.
+// If any field is reordered or resized, these will fail at compile time.
+const _: () = assert!(core::mem::offset_of!(PerCpu, self_ptr) == 0);
+const _: () = assert!(core::mem::offset_of!(PerCpu, cpu_id) == 8);
+const _: () = assert!(core::mem::offset_of!(PerCpu, kernel_rsp) == 16);
+const _: () = assert!(core::mem::offset_of!(PerCpu, user_rsp) == 24);
+const _: () = assert!(core::mem::offset_of!(PerCpu, tss) == 32);
+const _: () = assert!(core::mem::offset_of!(PerCpu, current_pid) == 136);
+
 const IDLE_STACK_SIZE: usize = 16384; // 16KB
 
 /// Allocate and initialize PerCpu for a CPU. Returns a raw pointer (lives forever).
