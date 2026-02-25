@@ -10,6 +10,7 @@ use window::Window;
 
 fn main() {
     let window = Window::create(0, 0);
+    io::set_screen_size(window.width(), window.height());
     let fb = framebuffer::Framebuffer::new(
         window.buffer_ptr() as u64,
         window.width(),

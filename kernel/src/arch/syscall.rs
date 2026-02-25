@@ -43,6 +43,7 @@ const SYS_RECV_MSG: u64 = 30;
 const SYS_OPEN_DEVICE: u64 = 31;
 const SYS_REGISTER_NAME: u64 = 32;
 const SYS_FIND_PID: u64 = 33;
+const SYS_SET_SCREEN_SIZE: u64 = 34;
 
 // ---------------------------------------------------------------------------
 // User pointer validation
@@ -190,6 +191,7 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         SYS_OPEN_DEVICE => sys_open_device(a1),
         SYS_REGISTER_NAME => sys_register_name(a1, a2),
         SYS_FIND_PID => sys_find_pid(a1, a2),
+        SYS_SET_SCREEN_SIZE => { set_screen_size(a1 as u32, a2 as u32); 0 }
         _ => u64::MAX,
     }
 }
