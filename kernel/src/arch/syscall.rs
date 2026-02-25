@@ -428,7 +428,10 @@ fn sys_poll(fds_ptr: u64, fds_len: u64) -> u64 {
         if result != 0 {
             return result;
         }
-        process::block(process::ProcessState::BlockedPoll(fds_ptr, fds_len as u32));
+        let mut poll_fds = [0u64; 8];
+        let copy_len = (fds_len as usize).min(8);
+        poll_fds[..copy_len].copy_from_slice(&fds[..copy_len]);
+        process::block(process::ProcessState::BlockedPoll { fds: poll_fds, len: copy_len as u32 });
     }
 }
 

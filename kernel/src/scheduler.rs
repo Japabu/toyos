@@ -150,11 +150,8 @@ pub fn idle_unlock_and_loop() -> ! {
 }
 
 /// Check whether a BlockedPoll process has any ready FDs.
-fn poll_has_ready_fd(fds_ptr: u64, fds_len: u32, fds: &fd::FdTable) -> bool {
-    let poll_fds = unsafe {
-        core::slice::from_raw_parts(fds_ptr as *const u64, fds_len as usize)
-    };
-    poll_fds.iter().any(|&fd_num| fd::has_data(fds, fd_num))
+fn poll_has_ready_fd(poll_fds: &[u64; 8], len: u32, fds: &fd::FdTable) -> bool {
+    poll_fds[..len as usize].iter().any(|&fd_num| fd::has_data(fds, fd_num))
 }
 
 /// Poll for I/O and wake blocked processes.
@@ -189,8 +186,8 @@ fn idle_poll(table: &mut ProcessTable) {
                     proc.state = ProcessState::Ready;
                 }
             }
-            ProcessState::BlockedPoll(fds_ptr, fds_len) => {
-                if poll_has_ready_fd(fds_ptr, fds_len, &proc.fds) || proc.messages.has_messages() {
+            ProcessState::BlockedPoll { fds: ref poll_fds, len } => {
+                if poll_has_ready_fd(poll_fds, len, &proc.fds) || proc.messages.has_messages() {
                     proc.state = ProcessState::Ready;
                 }
             }
@@ -215,8 +212,8 @@ pub fn wake_pipe_readers(pipe_id: usize) {
             ProcessState::BlockedPipeRead(id) if id == pipe_id => {
                 proc.state = ProcessState::Ready;
             }
-            ProcessState::BlockedPoll(fds_ptr, fds_len) => {
-                if poll_has_ready_fd(fds_ptr, fds_len, &proc.fds) {
+            ProcessState::BlockedPoll { fds: ref poll_fds, len } => {
+                if poll_has_ready_fd(poll_fds, len, &proc.fds) {
                     proc.state = ProcessState::Ready;
                 }
             }

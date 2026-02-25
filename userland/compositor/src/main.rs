@@ -9,15 +9,30 @@ use framebuffer::{Color, CursorImage, Framebuffer};
 const TITLE_BAR_HEIGHT: usize = 28;
 const BORDER_WIDTH: usize = 1;
 const RESIZE_HANDLE_SIZE: usize = 16;
+const CLOSE_BUTTON_WIDTH: usize = 28;
 const MIN_CONTENT_WIDTH: usize = 200;
 const MIN_CONTENT_HEIGHT: usize = 100;
 const INITIAL_MARGIN: usize = 40;
 const CASCADE_OFFSET: usize = 30;
+const TASKBAR_HEIGHT: usize = 32;
+const TASKBAR_ITEM_WIDTH: usize = 160;
+const TASKBAR_PADDING: usize = 4;
 
-const DESKTOP_COLOR: Color = Color { r: 0x2d, g: 0x2d, b: 0x2d };
-const TITLE_BAR_COLOR: Color = Color { r: 0x33, g: 0x33, b: 0x33 };
-const BORDER_COLOR: Color = Color { r: 0x55, g: 0x55, b: 0x55 };
-const TITLE_TEXT_COLOR: Color = Color { r: 0xcc, g: 0xcc, b: 0xcc };
+const DESKTOP_COLOR: Color = Color { r: 0x1a, g: 0x1a, b: 0x2e };
+const FOCUSED_TITLE_COLOR: Color = Color { r: 0x3a, g: 0x3a, b: 0x4e };
+const UNFOCUSED_TITLE_COLOR: Color = Color { r: 0x28, g: 0x28, b: 0x32 };
+const FOCUSED_BORDER_COLOR: Color = Color { r: 0x58, g: 0x58, b: 0x6e };
+const UNFOCUSED_BORDER_COLOR: Color = Color { r: 0x38, g: 0x38, b: 0x42 };
+const FOCUSED_TITLE_TEXT: Color = Color { r: 0xe0, g: 0xe0, b: 0xe8 };
+const UNFOCUSED_TITLE_TEXT: Color = Color { r: 0x60, g: 0x60, b: 0x70 };
+const CLOSE_BUTTON_COLOR: Color = Color { r: 0xc0, g: 0x40, b: 0x40 };
+const CLOSE_BUTTON_BG: Color = Color { r: 0x50, g: 0x28, b: 0x28 };
+const TASKBAR_COLOR: Color = Color { r: 0x18, g: 0x18, b: 0x25 };
+const TASKBAR_ACTIVE_COLOR: Color = Color { r: 0x30, g: 0x30, b: 0x45 };
+const TASKBAR_TEXT_COLOR: Color = Color { r: 0x80, g: 0x80, b: 0x90 };
+const TASKBAR_ACTIVE_TEXT: Color = Color { r: 0xe0, g: 0xe0, b: 0xe8 };
+const TASKBAR_NEW_COLOR: Color = Color { r: 0x40, g: 0x60, b: 0x40 };
+const TASKBAR_NEW_TEXT: Color = Color { r: 0x80, g: 0xc0, b: 0x80 };
 
 #[repr(C)]
 struct FramebufferInfo {
@@ -66,11 +81,27 @@ struct WindowState {
 enum HitZone {
     Desktop,
     TitleBar(usize),
+    CloseButton(usize),
     Content(usize),
     ResizeCorner(usize),
+    TaskbarItem(usize),
+    TaskbarNew,
 }
 
-fn hit_test(windows: &[WindowState], x: i32, y: i32) -> HitZone {
+fn hit_test(windows: &[WindowState], x: i32, y: i32, screen_w: i32, screen_h: i32) -> HitZone {
+    // Taskbar at bottom of screen
+    if y >= screen_h - TASKBAR_HEIGHT as i32 {
+        let new_x = screen_w - TASKBAR_HEIGHT as i32;
+        if x >= new_x {
+            return HitZone::TaskbarNew;
+        }
+        let tab_x = x as usize / TASKBAR_ITEM_WIDTH;
+        if tab_x < windows.len() {
+            return HitZone::TaskbarItem(tab_x);
+        }
+        return HitZone::Desktop;
+    }
+
     for (idx, win) in windows.iter().enumerate().rev() {
         let win_x = win.content_x as i32 - BORDER_WIDTH as i32;
         let win_y = win.content_y as i32 - BORDER_WIDTH as i32 - TITLE_BAR_HEIGHT as i32;
@@ -78,6 +109,12 @@ fn hit_test(windows: &[WindowState], x: i32, y: i32) -> HitZone {
         let win_h = win.height as i32 + BORDER_WIDTH as i32 * 2 + TITLE_BAR_HEIGHT as i32;
 
         if x >= win_x && x < win_x + win_w && y >= win_y && y < win_y + win_h {
+            // Close button (right side of title bar)
+            let close_x = win_x + win_w - BORDER_WIDTH as i32 - CLOSE_BUTTON_WIDTH as i32;
+            let title_y_end = win_y + BORDER_WIDTH as i32 + TITLE_BAR_HEIGHT as i32;
+            if x >= close_x && y < title_y_end {
+                return HitZone::CloseButton(idx);
+            }
             // Bottom-right corner = resize handle
             let corner_x = win_x + win_w - RESIZE_HANDLE_SIZE as i32;
             let corner_y = win_y + win_h - RESIZE_HANDLE_SIZE as i32;
@@ -85,7 +122,6 @@ fn hit_test(windows: &[WindowState], x: i32, y: i32) -> HitZone {
                 return HitZone::ResizeCorner(idx);
             }
             // Title bar = drag handle
-            let title_y_end = win_y + BORDER_WIDTH as i32 + TITLE_BAR_HEIGHT as i32;
             if y < title_y_end {
                 return HitZone::TitleBar(idx);
             }
@@ -111,23 +147,41 @@ fn redraw(
 ) {
     screen.clear(DESKTOP_COLOR);
 
-    for win in windows {
+    let focused_idx = windows.len().wrapping_sub(1);
+
+    for (i, win) in windows.iter().enumerate() {
+        let focused = i == focused_idx;
+        let border_color = if focused { FOCUSED_BORDER_COLOR } else { UNFOCUSED_BORDER_COLOR };
+        let title_color = if focused { FOCUSED_TITLE_COLOR } else { UNFOCUSED_TITLE_COLOR };
+        let text_color = if focused { FOCUSED_TITLE_TEXT } else { UNFOCUSED_TITLE_TEXT };
+
         let win_x = win.content_x - BORDER_WIDTH;
         let win_y = win.content_y - BORDER_WIDTH - TITLE_BAR_HEIGHT;
         let win_w = win.width + BORDER_WIDTH * 2;
         let win_h = win.height + BORDER_WIDTH * 2 + TITLE_BAR_HEIGHT;
 
-        screen.fill_rect(win_x, win_y, win_w, win_h, BORDER_COLOR);
+        screen.fill_rect(win_x, win_y, win_w, win_h, border_color);
         screen.fill_rect(
             win_x + BORDER_WIDTH,
             win_y + BORDER_WIDTH,
             win_w - BORDER_WIDTH * 2,
             TITLE_BAR_HEIGHT,
-            TITLE_BAR_COLOR,
+            title_color,
         );
+
+        // Title text
         let title_x = win_x + BORDER_WIDTH + 8;
         let title_y = win_y + BORDER_WIDTH + (TITLE_BAR_HEIGHT - 16) / 2;
-        font.draw_string(screen, title_x, title_y, "Terminal", TITLE_TEXT_COLOR, TITLE_BAR_COLOR);
+        font.draw_string(screen, title_x, title_y, "Terminal", text_color, title_color);
+
+        // Close button
+        let close_x = win_x + win_w - BORDER_WIDTH - CLOSE_BUTTON_WIDTH;
+        let close_bg = if focused { CLOSE_BUTTON_BG } else { title_color };
+        let close_fg = if focused { CLOSE_BUTTON_COLOR } else { UNFOCUSED_TITLE_TEXT };
+        screen.fill_rect(close_x, win_y + BORDER_WIDTH, CLOSE_BUTTON_WIDTH, TITLE_BAR_HEIGHT, close_bg);
+        let x_char_x = close_x + (CLOSE_BUTTON_WIDTH - 8) / 2;
+        let x_char_y = win_y + BORDER_WIDTH + (TITLE_BAR_HEIGHT - 16) / 2;
+        font.draw_char(screen, x_char_x, x_char_y, 'X', close_fg, close_bg);
 
         // Blit content, clipped to buffer dimensions
         let blit_w = win.width.min(win.buf_width);
@@ -135,6 +189,42 @@ fn redraw(
         let buffer_slice = unsafe { std::slice::from_raw_parts(win.buffer, win.buffer_size) };
         screen.blit(win.content_x, win.content_y, blit_w, blit_h, win.buf_width, buffer_slice);
     }
+
+    // Taskbar
+    let screen_w = screen.width();
+    let screen_h = screen.height();
+    let taskbar_y = screen_h - TASKBAR_HEIGHT;
+    screen.fill_rect(0, taskbar_y, screen_w, TASKBAR_HEIGHT, TASKBAR_COLOR);
+
+    for (i, _win) in windows.iter().enumerate() {
+        let focused = i == focused_idx;
+        let tab_x = i * TASKBAR_ITEM_WIDTH;
+        let bg = if focused { TASKBAR_ACTIVE_COLOR } else { TASKBAR_COLOR };
+        let fg = if focused { TASKBAR_ACTIVE_TEXT } else { TASKBAR_TEXT_COLOR };
+        screen.fill_rect(
+            tab_x + 1,
+            taskbar_y + TASKBAR_PADDING,
+            TASKBAR_ITEM_WIDTH - 2,
+            TASKBAR_HEIGHT - TASKBAR_PADDING * 2,
+            bg,
+        );
+        let text_x = tab_x + 8;
+        let text_y = taskbar_y + (TASKBAR_HEIGHT - 16) / 2;
+        font.draw_string(screen, text_x, text_y, "Terminal", fg, bg);
+    }
+
+    // "+" button on right
+    let new_x = screen_w - TASKBAR_HEIGHT;
+    screen.fill_rect(
+        new_x + 1,
+        taskbar_y + TASKBAR_PADDING,
+        TASKBAR_HEIGHT - 2,
+        TASKBAR_HEIGHT - TASKBAR_PADDING * 2,
+        TASKBAR_NEW_COLOR,
+    );
+    let plus_x = new_x + (TASKBAR_HEIGHT - 8) / 2;
+    let plus_y = taskbar_y + (TASKBAR_HEIGHT - 16) / 2;
+    font.draw_char(screen, plus_x, plus_y, '+', TASKBAR_NEW_TEXT, TASKBAR_NEW_COLOR);
 
     screen.draw_cursor(cursor_x, cursor_y, cursor);
 }
@@ -191,15 +281,23 @@ fn main() {
             let mut buf = [0u8; 64];
             let n = io::read_fd(kb_fd, &mut buf);
             if n > 0 {
-                // Filter out Ctrl+N (0x0E) — spawn new terminal
                 let mut forward = [0u8; 64];
                 let mut forward_len = 0;
                 for &b in &buf[..n] {
-                    if b == 0x0E {
-                        Command::new("/initrd/terminal").spawn().ok();
-                    } else {
-                        forward[forward_len] = b;
-                        forward_len += 1;
+                    match b {
+                        0x0E => { Command::new("/initrd/terminal").spawn().ok(); }
+                        0x1C => {
+                            // Alt+Tab: rotate focus
+                            if windows.len() > 1 {
+                                let win = windows.pop().unwrap();
+                                windows.insert(0, win);
+                                dirty = true;
+                            }
+                        }
+                        _ => {
+                            forward[forward_len] = b;
+                            forward_len += 1;
+                        }
                     }
                 }
                 if forward_len > 0 {
@@ -232,7 +330,11 @@ fn main() {
 
                 // Left button just pressed — start interaction
                 if left && !was_left {
-                    match hit_test(&windows, cursor_x, cursor_y) {
+                    match hit_test(&windows, cursor_x, cursor_y, screen_w, screen_h) {
+                        HitZone::CloseButton(idx) => {
+                            let win = windows.remove(idx);
+                            message::send(win.pid, Message::signal(window::MSG_WINDOW_CLOSE));
+                        }
                         HitZone::TitleBar(idx) => {
                             let win = windows.remove(idx);
                             windows.push(win);
@@ -250,6 +352,15 @@ fn main() {
                                 let win = windows.remove(idx);
                                 windows.push(win);
                             }
+                        }
+                        HitZone::TaskbarItem(idx) => {
+                            if idx < windows.len() && idx != windows.len() - 1 {
+                                let win = windows.remove(idx);
+                                windows.push(win);
+                            }
+                        }
+                        HitZone::TaskbarNew => {
+                            Command::new("/initrd/terminal").spawn().ok();
                         }
                         HitZone::Desktop => {}
                     }
@@ -324,7 +435,7 @@ fn main() {
                     let win_x = INITIAL_MARGIN + offset;
                     let win_y = INITIAL_MARGIN + offset;
                     let win_w = screen_w - INITIAL_MARGIN * 2;
-                    let win_h = screen_h - INITIAL_MARGIN * 2;
+                    let win_h = screen_h - INITIAL_MARGIN * 2 - TASKBAR_HEIGHT;
 
                     let content_x = win_x + BORDER_WIDTH;
                     let content_y = win_y + BORDER_WIDTH + TITLE_BAR_HEIGHT;

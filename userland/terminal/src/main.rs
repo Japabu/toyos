@@ -51,6 +51,7 @@ fn main() {
                 window::Event::KeyInput(event) => {
                     shell_stdin.write_all(&event.bytes[..event.len as usize]).ok();
                 }
+                window::Event::Close => break,
                 window::Event::Resized => {
                     io::set_screen_size(window.width(), window.height());
                     let fb = framebuffer::Framebuffer::new(

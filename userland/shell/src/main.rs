@@ -60,27 +60,27 @@ fn save_history(history: &[String]) {
 
 // --- Readline helpers ---
 
-fn read_byte() -> u8 {
+fn read_byte() -> Option<u8> {
     let mut buf = [0u8; 1];
-    io::stdin().lock().read_exact(&mut buf).ok();
-    buf[0]
+    io::stdin().lock().read_exact(&mut buf).ok()?;
+    Some(buf[0])
 }
 
-fn read_char() -> char {
-    let b = read_byte();
+fn read_char() -> Option<char> {
+    let b = read_byte()?;
     if b < 0x80 {
-        return b as char;
+        return Some(b as char);
     }
     let expected = if b < 0xE0 { 2 } else if b < 0xF0 { 3 } else { 4 };
     let mut buf = [0u8; 4];
     buf[0] = b;
     for i in 1..expected {
-        buf[i] = read_byte();
+        buf[i] = read_byte()?;
     }
-    core::str::from_utf8(&buf[..expected])
+    Some(core::str::from_utf8(&buf[..expected])
         .ok()
         .and_then(|s| s.chars().next())
-        .unwrap_or('\u{FFFD}')
+        .unwrap_or('\u{FFFD}'))
 }
 
 fn echo(bytes: &[u8]) {
@@ -102,7 +102,7 @@ fn readline(history: &mut Vec<String>) -> Option<String> {
     let mut saved_input = String::new();
 
     loop {
-        let ch = read_char();
+        let ch = read_char()?;
         match ch {
             '\r' => {
                 echo(b"\n");
@@ -137,10 +137,10 @@ fn handle_escape(
     hist_idx: &mut usize,
     saved_input: &mut String,
 ) {
-    if read_byte() != b'[' {
+    if read_byte() != Some(b'[') {
         return;
     }
-    match read_byte() {
+    match read_byte().unwrap_or(0) {
         b'A' => {
             if *hist_idx > 0 {
                 if *hist_idx == history.len() {
@@ -194,7 +194,7 @@ fn handle_escape(
         }
         b'3' => {
             let char_count = line.chars().count();
-            if read_byte() == b'~' && *cursor < char_count {
+            if read_byte() == Some(b'~') && *cursor < char_count {
                 let byte_pos = char_to_byte(line, *cursor);
                 line.remove(byte_pos);
                 let mut buf = Vec::new();

@@ -30,7 +30,9 @@ pub fn handle_report(report: &[u8]) {
                 0x4B => { handle_key(0x1B); handle_key(b'['); handle_key(b'5'); handle_key(b'~'); }
                 0x4E => { handle_key(0x1B); handle_key(b'['); handle_key(b'6'); handle_key(b'~'); }
                 _ => {
-                    if ctrl && (0x04..=0x1D).contains(&keycode) {
+                    if alt && keycode == 0x2B {
+                        handle_key(0x1C);
+                    } else if ctrl && (0x04..=0x1D).contains(&keycode) {
                         handle_key(keycode - 0x04 + 1);
                     } else if let Some(bytes) = layout_lookup(keycode, shift, alt) {
                         for &b in bytes {

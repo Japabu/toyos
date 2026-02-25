@@ -15,6 +15,7 @@ pub const MSG_PRESENT: u32 = 2;
 pub const MSG_WINDOW_CREATED: u32 = 1;
 pub const MSG_KEY_INPUT: u32 = 2;
 pub const MSG_WINDOW_RESIZED: u32 = 3;
+pub const MSG_WINDOW_CLOSE: u32 = 4;
 
 #[repr(C)]
 pub struct CreateWindowRequest {
@@ -40,6 +41,7 @@ pub struct KeyEvent {
 pub enum Event {
     KeyInput(KeyEvent),
     Resized,
+    Close,
 }
 
 pub struct Window {
@@ -85,6 +87,7 @@ impl Window {
                 self.pixel_format = info.pixel_format;
                 Event::Resized
             }
+            MSG_WINDOW_CLOSE => Event::Close,
             other => panic!("unknown window event type: {other}"),
         }
     }

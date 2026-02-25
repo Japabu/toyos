@@ -49,7 +49,7 @@ pub enum ProcessState {
     BlockedPipeRead(usize),
     BlockedPipeWrite(usize),
     BlockedWaitPid(u32),
-    BlockedPoll(u64, u32),
+    BlockedPoll { fds: [u64; 8], len: u32 },
     BlockedRecvMsg,
     Zombie(i32),
 }
@@ -430,7 +430,7 @@ pub fn send_message(target_pid: u32, msg: crate::message::Message) -> bool {
     if let Some(proc) = table.procs.get_mut(target_pid) {
         proc.messages.push(msg);
         match proc.state {
-            ProcessState::BlockedRecvMsg | ProcessState::BlockedPoll(..) => {
+            ProcessState::BlockedRecvMsg | ProcessState::BlockedPoll { .. } => {
                 proc.state = ProcessState::Ready;
             }
             _ => {}
