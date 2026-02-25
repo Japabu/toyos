@@ -1,17 +1,8 @@
 pub struct LogWriter;
 
-#[cfg(not(test))]
 impl core::fmt::Write for LogWriter {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
         crate::drivers::serial::print(s);
-        Ok(())
-    }
-}
-
-#[cfg(test)]
-impl core::fmt::Write for LogWriter {
-    fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        std::print!("{}", s);
         Ok(())
     }
 }

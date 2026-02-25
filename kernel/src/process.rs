@@ -4,15 +4,16 @@ use alloc::vec::Vec;
 use core::arch::naked_asm;
 use hashbrown::HashMap;
 
-use crate::arch::{paging, percpu};
+use crate::arch::{cpu, paging, percpu};
+use crate::arch::paging::PAGE_2M;
 use crate::fd::{self, Descriptor, FdTable};
 use crate::id_map::IdMap;
 use crate::message::MessageQueue;
 use crate::sync::Lock;
 use crate::symbols::ProcessSymbols;
-use crate::{elf, log, pipe, scheduler, vfs};
+use crate::{elf, log, pipe, scheduler, shared_memory, vfs};
 
-const USER_STACK_SIZE: usize = 64 * 1024;
+const USER_STACK_SIZE: usize = PAGE_2M as usize;
 const KERNEL_STACK_SIZE: usize = 64 * 1024;
 
 /// Write argc, argv pointers, and string data onto a user stack. Returns new SP.
@@ -56,6 +57,8 @@ pub enum ProcessState {
 pub struct Process {
     pub pid: u32,
     pub state: ProcessState,
+    // Per-process page table (physical address of PML4)
+    pub cr3: u64,
     // Kernel context (saved RSP during context switch)
     pub kernel_stack_base: *mut u8,
     kernel_stack_layout: Layout,
@@ -121,6 +124,7 @@ pub fn init_process0(
     entry: u64, user_stack_top: u64,
     elf_base: *mut u8, elf_layout: Layout,
     stack_base: *mut u8, stack_layout: Layout,
+    cr3: u64,
     syms: ProcessSymbols,
 ) {
     let ks_layout = Layout::from_size_align(KERNEL_STACK_SIZE, 4096).unwrap();
@@ -152,6 +156,7 @@ pub fn init_process0(
     let pid = table.procs.insert(Process {
         pid: 0,
         state: ProcessState::Running,
+        cr3,
         kernel_stack_base: ks_base,
         kernel_stack_layout: ks_layout,
         kernel_rsp: frame_ptr as u64,
@@ -169,6 +174,9 @@ pub fn init_process0(
     percpu::set_current_pid(pid);
     unsafe { percpu::set_kernel_stack(ks_top); }
     percpu::reset_idle(scheduler::idle_unlock_and_loop as u64);
+
+    // Switch to process 0's page tables before entering userspace
+    unsafe { cpu::write_cr3(cr3); }
 
     // Hold lock through context_switch — process_start releases it.
     core::mem::forget(guard);
@@ -228,16 +236,23 @@ pub fn spawn(argv: &[&str], stdin_fd: u64, stdout_fd: u64) -> u64 {
         }
     };
 
-    paging::map_user(loaded.base_ptr as u64, loaded.load_size as u64);
+    // Create per-process page tables
+    let child_pml4 = paging::create_user_pml4();
+    let child_cr3 = child_pml4 as u64;
 
-    let stack_layout = Layout::from_size_align(USER_STACK_SIZE, 4096).unwrap();
+    // Map ELF and stack in the child's page tables (2MB aligned)
+    let elf_alloc_size = ((loaded.load_size + PAGE_2M as usize - 1) & !(PAGE_2M as usize - 1)) as u64;
+    let elf_layout = Layout::from_size_align(elf_alloc_size as usize, PAGE_2M as usize).unwrap();
+    paging::map_user_in(child_pml4, loaded.base_ptr as u64, elf_alloc_size);
+
+    let stack_layout = Layout::from_size_align(USER_STACK_SIZE, PAGE_2M as usize).unwrap();
     let stack_base = unsafe { alloc_zeroed(stack_layout) };
     if stack_base.is_null() {
+        paging::free_user_page_tables(child_pml4);
         return u64::MAX;
     }
     let stack_top = stack_base as u64 + USER_STACK_SIZE as u64;
-    let elf_layout = Layout::from_size_align(loaded.load_size, 4096).unwrap();
-    paging::map_user(stack_base as u64, USER_STACK_SIZE as u64);
+    paging::map_user_in(child_pml4, stack_base as u64, USER_STACK_SIZE as u64);
 
     let sp = write_argv_to_stack(stack_top, argv);
 
@@ -251,6 +266,7 @@ pub fn spawn(argv: &[&str], stdin_fd: u64, stdout_fd: u64) -> u64 {
     let ks_layout = Layout::from_size_align(KERNEL_STACK_SIZE, 4096).unwrap();
     let ks_base = unsafe { alloc_zeroed(ks_layout) };
     if ks_base.is_null() {
+        paging::free_user_page_tables(child_pml4);
         return u64::MAX;
     }
     let ks_top = ks_base as u64 + KERNEL_STACK_SIZE as u64;
@@ -326,6 +342,7 @@ pub fn spawn(argv: &[&str], stdin_fd: u64, stdout_fd: u64) -> u64 {
     let pid = table.procs.insert(Process {
         pid: 0, // placeholder, set below
         state: ProcessState::Ready,
+        cr3: child_cr3,
         kernel_stack_base: ks_base,
         kernel_stack_layout: ks_layout,
         kernel_rsp: frame_ptr as u64,
@@ -343,8 +360,8 @@ pub fn spawn(argv: &[&str], stdin_fd: u64, stdout_fd: u64) -> u64 {
     // Set the actual PID now that we know it
     table.procs.get_mut(pid).unwrap().pid = pid;
 
-    log!("spawn: pid={} entry={:#x} stack={:#x} ks={:#x}..{:#x} rsp={:#x}",
-        pid, loaded.entry, sp, ks_base as u64, ks_top, frame_ptr as u64);
+    log!("spawn: pid={} cr3={:#x} entry={:#x} stack={:#x} ks={:#x}..{:#x} rsp={:#x}",
+        pid, child_cr3, loaded.entry, sp, ks_base as u64, ks_top, frame_ptr as u64);
 
     pid as u64
 }
@@ -360,13 +377,24 @@ pub fn exit(code: i32) -> ! {
         // Close all FDs (acquires VFS lock — correct order: process_table < vfs)
         fd::close_all(&mut proc.fds, &mut *vfs::lock(), proc.pid);
 
+        let proc_cr3 = proc.cr3;
+        let pml4 = proc_cr3 as *mut u64;
+
+        // Switch to kernel page tables before freeing process page tables
+        unsafe { cpu::write_cr3(paging::kernel_cr3()); }
+
+        // Clean up shared memory (unmap, free owned regions)
+        shared_memory::cleanup_process(pid, pml4);
+
         // Free user memory
-        paging::unmap_user(proc.elf_base as u64, proc.elf_layout.size() as u64);
-        paging::unmap_user(proc.stack_base as u64, proc.stack_layout.size() as u64);
         unsafe {
             dealloc(proc.elf_base, proc.elf_layout);
             dealloc(proc.stack_base, proc.stack_layout);
         }
+
+        // Free per-process page table structures
+        paging::free_user_page_tables(pml4);
+        proc.cr3 = 0;
 
         // Mark as zombie
         proc.state = ProcessState::Zombie(code);

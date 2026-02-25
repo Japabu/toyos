@@ -1,4 +1,5 @@
 use crate::fd::{Descriptor, FramebufferInfo};
+use crate::shared_memory;
 use crate::sync::Lock;
 
 pub const DEVICE_KEYBOARD: u64 = 0;
@@ -40,6 +41,10 @@ pub fn try_claim(device_type: u64, pid: u32) -> Option<Descriptor> {
             }
             let info = (*FB_INFO.lock())?;
             *owner = Some(pid);
+            // Grant GPU buffer tokens to the claiming process
+            for &token in &info.token {
+                shared_memory::grant(token, u32::MAX, pid);
+            }
             Some(Descriptor::Framebuffer(info))
         }
         _ => None,

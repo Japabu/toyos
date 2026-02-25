@@ -5,8 +5,9 @@ use alloc::alloc::{alloc_zeroed, Layout};
 use super::pci::PciDevice;
 use super::virtio::{BufDir, Virtqueue, VirtioDevice, VIRTIO_F_VERSION_1};
 use super::DmaPool;
-use crate::arch::paging;
+use crate::arch::paging::PAGE_2M;
 use crate::log;
+use crate::shared_memory;
 use crate::sync::Lock;
 
 // VirtIO GPU PCI identity
@@ -296,7 +297,7 @@ impl GpuController {
 static GPU: Lock<Option<GpuController>> = Lock::new(None);
 
 pub struct GpuInfo {
-    pub backing: [u64; 2],
+    pub tokens: [u32; 2],
     pub width: u32,
     pub height: u32,
 }
@@ -349,19 +350,19 @@ pub fn init(ecam_base: u64) -> Option<GpuInfo> {
     };
     log!("VirtIO GPU: display {}x{}", width, height);
 
-    // Allocate two framebuffer backing stores for page-flipping
+    // Allocate two framebuffer backing stores for page-flipping (2MB-aligned)
     let fb_size = (width * height * 4) as usize;
-    let fb_layout = Layout::from_size_align(fb_size, 4096).unwrap();
-    let mut backing = [0u64; 2];
+    let fb_aligned = (fb_size + PAGE_2M as usize - 1) & !(PAGE_2M as usize - 1);
+    let fb_layout = Layout::from_size_align(fb_aligned, PAGE_2M as usize).unwrap();
+    let mut tokens = [0u32; 2];
     for i in 0..2 {
         let ptr = unsafe { alloc_zeroed(fb_layout) };
         assert!(!ptr.is_null(), "VirtIO GPU: framebuffer alloc failed");
         let addr = ptr as u64;
-        paging::map_user(addr, fb_size as u64);
+        tokens[i] = shared_memory::register(addr, fb_aligned as u64);
         gpu.create_resource(gpu.resources[i], width, height);
         gpu.attach_backing(gpu.resources[i], addr, fb_size as u32);
-        backing[i] = addr;
-        log!("VirtIO GPU: buffer {} at {:#x} ({} bytes)", i, addr, fb_size);
+        log!("VirtIO GPU: buffer {} at {:#x} ({} bytes) token={}", i, addr, fb_size, tokens[i]);
     }
 
     // Display resource 0 (front), compositor draws to resource 1 (back)
@@ -371,7 +372,7 @@ pub fn init(ecam_base: u64) -> Option<GpuInfo> {
     gpu.width = width;
     gpu.height = height;
 
-    let info = GpuInfo { backing, width, height };
+    let info = GpuInfo { tokens, width, height };
     *GPU.lock() = Some(gpu);
 
     Some(info)

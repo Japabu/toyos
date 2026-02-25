@@ -1,45 +1,31 @@
-#![cfg_attr(not(test), no_std)]
+#![no_std]
 #![feature(allocator_api)]
 extern crate alloc;
 
 pub mod sync;
 pub mod id_map;
 
-#[cfg(not(test))]
 pub mod arch;
 pub mod drivers;
 
 pub mod log;
 pub mod allocator;
 
-#[cfg(not(test))]
 pub mod keyboard;
-#[cfg(not(test))]
 pub mod mouse;
-#[cfg(not(test))]
 pub mod ramdisk;
-#[cfg(not(test))]
 pub mod vfs;
-#[cfg(not(test))]
 pub mod elf;
-#[cfg(not(test))]
 pub mod symbols;
-#[cfg(not(test))]
 pub mod process;
-#[cfg(not(test))]
 pub mod scheduler;
-#[cfg(not(test))]
 pub mod clock;
-#[cfg(not(test))]
 pub mod fd;
-#[cfg(not(test))]
 pub mod pipe;
-#[cfg(not(test))]
 pub mod message;
-#[cfg(not(test))]
 pub mod device;
-#[cfg(not(test))]
 pub mod user_heap;
+pub mod shared_memory;
 
 #[repr(C)]
 #[derive(Debug)]

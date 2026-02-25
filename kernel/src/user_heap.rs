@@ -6,21 +6,20 @@ use alloc::alloc::alloc_zeroed;
 use alloc::vec::Vec;
 use core::alloc::Layout;
 
-use crate::arch::paging;
+use crate::arch::paging::{self, PAGE_2M};
 use crate::log;
 
-const CHUNK_SIZE: usize = 1024 * 1024; // 1MB
+const CHUNK_SIZE: usize = PAGE_2M as usize;
 
 /// Create an initial user heap for a new process.
+/// Returns empty — first SYS_ALLOC triggers grow in the correct CR3 context.
 pub fn new_heap() -> Vec<(u64, u64)> {
-    let mut heap = Vec::new();
-    grow(&mut heap, CHUNK_SIZE);
-    heap
+    Vec::new()
 }
 
 fn grow(heap: &mut Vec<(u64, u64)>, min_size: usize) {
-    let size = (min_size.max(CHUNK_SIZE) + 4095) & !4095;
-    let layout = Layout::from_size_align(size, 4096).unwrap();
+    let size = (min_size.max(CHUNK_SIZE) + PAGE_2M as usize - 1) & !(PAGE_2M as usize - 1);
+    let layout = Layout::from_size_align(size, PAGE_2M as usize).unwrap();
     let ptr = unsafe { alloc_zeroed(layout) };
     assert!(!ptr.is_null(), "user heap: out of memory");
     let start = ptr as u64;

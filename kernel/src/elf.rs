@@ -1,5 +1,6 @@
 use alloc::alloc::{alloc_zeroed, Layout};
 
+use crate::arch::paging::PAGE_2M;
 use crate::log;
 use elf::ElfBytes;
 use elf::endian::AnyEndian;
@@ -52,10 +53,10 @@ pub fn load(data: &[u8]) -> Result<LoadedElf, &'static str> {
         return Err("ELF: no loadable segments");
     }
 
-    let load_size = ((vaddr_max - vaddr_min) as usize + 4095) & !4095; // page-align up
+    let load_size = ((vaddr_max - vaddr_min) as usize + PAGE_2M as usize - 1) & !(PAGE_2M as usize - 1);
 
-    // Allocate page-aligned memory for the loaded image
-    let layout = match Layout::from_size_align(load_size, 4096) {
+    // Allocate 2MB-aligned memory for the loaded image
+    let layout = match Layout::from_size_align(load_size, PAGE_2M as usize) {
         Ok(l) => l,
         Err(_) => return Err("ELF: invalid layout"),
     };

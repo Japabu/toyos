@@ -21,7 +21,7 @@ const TITLE_TEXT_COLOR: Color = Color { r: 0xcc, g: 0xcc, b: 0xcc };
 
 #[repr(C)]
 struct FramebufferInfo {
-    addr: [u64; 2],
+    token: [u32; 2],
     width: u32,
     height: u32,
     stride: u32,
@@ -30,7 +30,7 @@ struct FramebufferInfo {
 
 fn read_fb_info(fd: u64) -> FramebufferInfo {
     let mut info = FramebufferInfo {
-        addr: [0; 2],
+        token: [0; 2],
         width: 0,
         height: 0,
         stride: 0,
@@ -52,7 +52,9 @@ fn read_fb_info(fd: u64) -> FramebufferInfo {
 
 struct WindowState {
     pid: u32,
-    buffer: Vec<u8>,
+    token: u32,
+    buffer: *mut u8,
+    buffer_size: usize,
     content_x: usize,
     content_y: usize,
     width: usize,
@@ -129,7 +131,8 @@ fn redraw(
         // Blit content, clipped to buffer dimensions
         let blit_w = win.width.min(win.buf_width);
         let blit_h = win.height.min(win.buf_height);
-        screen.blit(win.content_x, win.content_y, blit_w, blit_h, win.buf_width, &win.buffer);
+        let buffer_slice = unsafe { std::slice::from_raw_parts(win.buffer, win.buffer_size) };
+        screen.blit(win.content_x, win.content_y, blit_w, blit_h, win.buf_width, buffer_slice);
     }
 
     screen.draw_cursor(cursor_x, cursor_y, cursor);
@@ -143,8 +146,12 @@ fn main() {
     let fb_fd = io::open_device(io::DeviceType::Framebuffer).expect("failed to claim framebuffer");
 
     let fb_info = read_fb_info(fb_fd);
+    let fb_addrs = [
+        io::map_shared(fb_info.token[0]) as u64,
+        io::map_shared(fb_info.token[1]) as u64,
+    ];
     let mut screen = Framebuffer::new(
-        fb_info.addr,
+        fb_addrs,
         fb_info.width,
         fb_info.height,
         fb_info.stride,
@@ -254,15 +261,21 @@ fn main() {
                 if !left && was_left {
                     if let Interaction::Resizing { window_idx } = interaction {
                         let win = &mut windows[window_idx];
-                        win.buffer = vec![0u8; win.width * win.height * 4];
+                        io::free_shared(win.token);
+                        let buf_size = win.width * win.height * 4;
+                        let token = io::alloc_shared(buf_size);
+                        let buffer = io::map_shared(token);
+                        io::grant_shared(token, win.pid);
+                        win.token = token;
+                        win.buffer = buffer;
+                        win.buffer_size = buf_size;
                         win.buf_width = win.width;
                         win.buf_height = win.height;
-                        let buffer_ptr = win.buffer.as_ptr() as *mut u8;
                         let pixel_format = screen.pixel_format_raw();
                         message::send(win.pid, Message::new(
                             window::MSG_WINDOW_RESIZED,
                             window::WindowInfo {
-                                buffer: buffer_ptr,
+                                token,
                                 width: win.width as u32,
                                 height: win.height as u32,
                                 stride: win.width as u32,
@@ -307,13 +320,17 @@ fn main() {
                     let content_w = win_w - BORDER_WIDTH * 2;
                     let content_h = win_h - BORDER_WIDTH * 2 - TITLE_BAR_HEIGHT;
 
-                    let buffer = vec![0u8; content_w * content_h * 4];
-                    let buffer_ptr = buffer.as_ptr() as *mut u8;
+                    let buf_size = content_w * content_h * 4;
+                    let token = io::alloc_shared(buf_size);
+                    let buffer = io::map_shared(token);
+                    io::grant_shared(token, sender);
                     let pixel_format = screen.pixel_format_raw();
 
                     windows.push(WindowState {
                         pid: sender,
+                        token,
                         buffer,
+                        buffer_size: buf_size,
                         content_x,
                         content_y,
                         width: content_w,
@@ -325,7 +342,7 @@ fn main() {
                     message::send(sender, Message::new(
                         window::MSG_WINDOW_CREATED,
                         window::WindowInfo {
-                            buffer: buffer_ptr,
+                            token,
                             width: content_w as u32,
                             height: content_h as u32,
                             stride: content_w as u32,

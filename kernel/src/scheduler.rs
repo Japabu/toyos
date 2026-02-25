@@ -1,6 +1,6 @@
 use core::arch::{asm, naked_asm};
 
-use crate::arch::percpu;
+use crate::arch::{cpu, paging, percpu};
 use crate::process::{ProcessState, ProcessTable, PROCESS_TABLE};
 use crate::{fd, keyboard};
 
@@ -56,6 +56,7 @@ fn schedule(cur_state: ProcessState) {
         // Switch to another process.
         let new_proc = table.procs.get(new_pid).unwrap();
         let new_rsp = new_proc.kernel_rsp;
+        let new_cr3 = new_proc.cr3;
         let new_ks_top = new_proc.kernel_stack_base as u64 + KERNEL_STACK_SIZE as u64;
 
         table.procs.get_mut(new_pid).unwrap().state = ProcessState::Running;
@@ -63,6 +64,8 @@ fn schedule(cur_state: ProcessState) {
 
         let old_rsp_ptr = &mut table.procs.get_mut(cur_pid).unwrap().kernel_rsp as *mut u64;
         unsafe { percpu::set_kernel_stack(new_ks_top); }
+
+        unsafe { cpu::write_cr3(new_cr3); }
 
         // Hold lock through context_switch — the resuming side releases it.
         core::mem::forget(guard);
@@ -76,6 +79,8 @@ fn schedule(cur_state: ProcessState) {
     percpu::set_current_pid(u32::MAX);
     unsafe { percpu::set_kernel_stack(percpu::idle_stack_top()); }
 
+    unsafe { cpu::write_cr3(paging::kernel_cr3()); }
+
     // Hold lock through context_switch — idle_unlock_and_loop releases it.
     core::mem::forget(guard);
     unsafe { context_switch(old_rsp_ptr, percpu::idle_rsp()); }
@@ -88,6 +93,7 @@ fn schedule(cur_state: ProcessState) {
 pub fn schedule_no_return() -> ! {
     percpu::set_current_pid(u32::MAX);
     unsafe { percpu::set_kernel_stack(percpu::idle_stack_top()); }
+    unsafe { cpu::write_cr3(paging::kernel_cr3()); }
     let sp = percpu::idle_stack_top();
     unsafe {
         asm!(
@@ -116,11 +122,14 @@ fn cpu_idle_loop() -> ! {
             if let Some(new_pid) = ready {
                 let new_proc = table.procs.get(new_pid).unwrap();
                 let new_rsp = new_proc.kernel_rsp;
+                let new_cr3 = new_proc.cr3;
                 let new_ks_top = new_proc.kernel_stack_base as u64 + KERNEL_STACK_SIZE as u64;
 
                 table.procs.get_mut(new_pid).unwrap().state = ProcessState::Running;
                 percpu::set_current_pid(new_pid);
                 unsafe { percpu::set_kernel_stack(new_ks_top); }
+
+                unsafe { cpu::write_cr3(new_cr3); }
 
                 core::mem::forget(guard);
                 unsafe { context_switch(percpu::idle_rsp_ptr(), new_rsp); }

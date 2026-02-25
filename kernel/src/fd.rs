@@ -24,7 +24,7 @@ fn as_bytes<T: Sized>(val: &T) -> &[u8] {
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct FramebufferInfo {
-    pub addr: [u64; 2],
+    pub token: [u32; 2],
     pub width: u32,
     pub height: u32,
     pub stride: u32,

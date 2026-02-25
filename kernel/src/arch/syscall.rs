@@ -4,7 +4,7 @@ use alloc::vec::Vec;
 use super::{cpu, gdt, paging};
 use crate::drivers::acpi;
 use crate::sync::Lock;
-use crate::{device, fd, keyboard, log, message, pipe, process, vfs};
+use crate::{device, fd, keyboard, log, message, pipe, process, shared_memory, user_heap, vfs};
 
 // MSR addresses
 const MSR_EFER: u32 = 0xC000_0080;
@@ -45,6 +45,10 @@ const SYS_REGISTER_NAME: u64 = 32;
 const SYS_FIND_PID: u64 = 33;
 const SYS_SET_SCREEN_SIZE: u64 = 34;
 const SYS_GPU_PRESENT: u64 = 35;
+const SYS_ALLOC_SHARED: u64 = 36;
+const SYS_GRANT_SHARED: u64 = 37;
+const SYS_MAP_SHARED: u64 = 38;
+const SYS_FREE_SHARED: u64 = 39;
 
 // ---------------------------------------------------------------------------
 // User pointer validation
@@ -194,6 +198,10 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         SYS_FIND_PID => sys_find_pid(a1, a2),
         SYS_SET_SCREEN_SIZE => { set_screen_size(a1 as u32, a2 as u32); 0 }
         SYS_GPU_PRESENT => { crate::drivers::virtio_gpu::present(); 0 }
+        SYS_ALLOC_SHARED => sys_alloc_shared(a1),
+        SYS_GRANT_SHARED => sys_grant_shared(a1, a2),
+        SYS_MAP_SHARED => sys_map_shared(a1),
+        SYS_FREE_SHARED => sys_free_shared(a1),
         _ => u64::MAX,
     }
 }
@@ -425,23 +433,53 @@ fn sys_poll(fds_ptr: u64, fds_len: u64) -> u64 {
 }
 
 fn sys_send_msg(target_pid: u64, msg_ptr: u64) -> u64 {
-    let Some(user_msg) = user_ref::<message::Message>(msg_ptr) else { return u64::MAX };
+    let Some(user_msg) = user_ref::<message::UserMessage>(msg_ptr) else { return u64::MAX };
     let sender = process::current_pid();
+
+    // Copy payload from sender's address space into kernel
+    let payload = if user_msg.data != 0 && user_msg.len != 0 {
+        let Some(data) = user_slice(user_msg.data, user_msg.len) else { return u64::MAX };
+        data.to_vec()
+    } else {
+        Vec::new()
+    };
+
     let msg = message::Message {
         sender,
         msg_type: user_msg.msg_type,
-        data: user_msg.data,
-        len: user_msg.len,
+        payload,
     };
     if process::send_message(target_pid as u32, msg) { 0 } else { u64::MAX }
 }
 
 fn sys_recv_msg(msg_ptr: u64) -> u64 {
-    let Some(out) = user_mut::<message::Message>(msg_ptr) else { return u64::MAX };
+    let Some(out) = user_mut::<message::UserMessage>(msg_ptr) else { return u64::MAX };
     loop {
         let msg = process::with_current_mut(|proc| proc.messages.pop());
         if let Some(msg) = msg {
-            *out = msg;
+            let (data, len) = if !msg.payload.is_empty() {
+                // Allocate in receiver's user heap and copy payload
+                let addr = process::with_current_mut(|proc| {
+                    user_heap::alloc(&mut proc.user_heap, msg.payload.len(), 8)
+                });
+                if addr != 0 {
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            msg.payload.as_ptr(),
+                            addr as *mut u8,
+                            msg.payload.len(),
+                        );
+                    }
+                }
+                (addr, msg.payload.len() as u64)
+            } else {
+                (0, 0)
+            };
+
+            out.sender = msg.sender;
+            out.msg_type = msg.msg_type;
+            out.data = data;
+            out.len = len;
             return 0;
         }
         process::block(process::ProcessState::BlockedRecvMsg);
@@ -484,6 +522,32 @@ fn sys_find_pid(name_ptr: u64, name_len: u64) -> u64 {
         Some(pid) => pid as u64,
         None => u64::MAX,
     }
+}
+
+fn sys_alloc_shared(size: u64) -> u64 {
+    let pid = process::current_pid();
+    let pml4 = process::with_current(|p| p.cr3 as *mut u64);
+    let (token, _addr) = shared_memory::alloc(size, pid, pml4);
+    token as u64
+}
+
+fn sys_grant_shared(token: u64, target_pid: u64) -> u64 {
+    let pid = process::current_pid();
+    if shared_memory::grant(token as u32, pid, target_pid as u32) { 0 } else { u64::MAX }
+}
+
+fn sys_map_shared(token: u64) -> u64 {
+    let pid = process::current_pid();
+    let pml4 = process::with_current(|p| p.cr3 as *mut u64);
+    match shared_memory::map(token as u32, pid, pml4) {
+        Some(addr) => addr,
+        None => u64::MAX,
+    }
+}
+
+fn sys_free_shared(token: u64) -> u64 {
+    let pid = process::current_pid();
+    if shared_memory::free(token as u32, pid) { 0 } else { u64::MAX }
 }
 
 /// Terminate the current userspace process (called from exception handlers).

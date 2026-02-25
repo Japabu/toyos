@@ -9,8 +9,9 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 use kernel::arch::{apic, idt, paging, percpu, smp, syscall};
+use kernel::arch::paging::PAGE_2M;
 use kernel::drivers::{acpi, nvme, pci, serial, virtio_gpu, xhci};
-use kernel::{allocator, clock, fd, log, pipe, process, ramdisk, symbols, vfs, KernelArgs, MemoryMapEntry};
+use kernel::{allocator, clock, fd, log, pipe, process, ramdisk, shared_memory, symbols, vfs, KernelArgs, MemoryMapEntry};
 use tyfs::Disk;
 
 #[panic_handler]
@@ -46,7 +47,7 @@ pub unsafe extern "sysv64" fn _start(kernel_args: KernelArgs) -> ! {
     kernel_main(&kernel_args, maps, initrd, kernel_elf, init_path);
 }
 
-const USER_STACK_SIZE: usize = 64 * 1024;
+const USER_STACK_SIZE: usize = PAGE_2M as usize;
 
 fn kernel_main(
     kernel_args: &KernelArgs,
@@ -137,6 +138,7 @@ fn kernel_main(
     vfs::init();
     process::init();
     pipe::init();
+    shared_memory::init();
 
     // Mount filesystems
     vfs::lock().mount("initrd", Box::new(initrd_fs));
@@ -164,16 +166,21 @@ fn kernel_main(
     let data = vfs::lock().read_file(&path)
         .unwrap_or_else(|| panic!("init: {} not found", path));
 
-    // Load ELF, map user pages, set up stack
+    // Load ELF (2MB-aligned by elf::load)
     let loaded = kernel::elf::load(&data).expect("init: ELF load failed");
-    paging::map_user(loaded.base_ptr as u64, loaded.load_size as u64);
+    let elf_alloc_size = (loaded.load_size + PAGE_2M as usize - 1) & !(PAGE_2M as usize - 1);
+    let elf_layout = Layout::from_size_align(elf_alloc_size, PAGE_2M as usize).unwrap();
 
-    let stack_layout = Layout::from_size_align(USER_STACK_SIZE, 4096).unwrap();
+    let stack_layout = Layout::from_size_align(USER_STACK_SIZE, PAGE_2M as usize).unwrap();
     let stack_base = unsafe { alloc_zeroed(stack_layout) };
     assert!(!stack_base.is_null(), "init: stack alloc failed");
     let stack_top = stack_base as u64 + USER_STACK_SIZE as u64;
-    let elf_layout = Layout::from_size_align(loaded.load_size, 4096).unwrap();
-    paging::map_user(stack_base as u64, USER_STACK_SIZE as u64);
+
+    // Create per-process page tables and map ELF + stack
+    let init_pml4 = paging::create_user_pml4();
+    paging::map_user_in(init_pml4, loaded.base_ptr as u64, elf_alloc_size as u64);
+    paging::map_user_in(init_pml4, stack_base as u64, USER_STACK_SIZE as u64);
+    let init_cr3 = init_pml4 as u64;
 
     let init_syms = kernel::symbols::ProcessSymbols::parse(
         &data, loaded.base,
@@ -189,7 +196,7 @@ fn kernel_main(
     // Initialize VirtIO GPU display
     let gpu = virtio_gpu::init(ecam_base).expect("VirtIO GPU not found");
     let fb_info = fd::FramebufferInfo {
-        addr: gpu.backing,
+        token: gpu.tokens,
         width: gpu.width,
         height: gpu.height,
         stride: gpu.width,
@@ -200,6 +207,6 @@ fn kernel_main(
 
     // Signal APs to join the scheduler, then start process 0 (never returns)
     smp::set_ready();
-    process::init_process0(loaded.entry, sp, loaded.base_ptr, elf_layout, stack_base, stack_layout, init_syms);
+    process::init_process0(loaded.entry, sp, loaded.base_ptr, elf_layout, stack_base, stack_layout, init_cr3, init_syms);
     unreachable!();
 }

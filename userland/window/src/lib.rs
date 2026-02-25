@@ -24,7 +24,7 @@ pub struct CreateWindowRequest {
 
 #[repr(C)]
 pub struct WindowInfo {
-    pub buffer: *mut u8,
+    pub token: u32,
     pub width: u32,
     pub height: u32,
     pub stride: u32,
@@ -61,9 +61,10 @@ impl Window {
         let response = message::recv();
         assert_eq!(response.msg_type(), MSG_WINDOW_CREATED, "unexpected message from compositor");
         let info: WindowInfo = response.take_payload();
+        let buffer = io::map_shared(info.token);
 
         Self {
-            buffer: info.buffer,
+            buffer,
             width: info.width,
             height: info.height,
             pixel_format: info.pixel_format,
@@ -78,7 +79,7 @@ impl Window {
             MSG_KEY_INPUT => Event::KeyInput(msg.take_payload()),
             MSG_WINDOW_RESIZED => {
                 let info: WindowInfo = msg.take_payload();
-                self.buffer = info.buffer;
+                self.buffer = io::map_shared(info.token);
                 self.width = info.width;
                 self.height = info.height;
                 self.pixel_format = info.pixel_format;
