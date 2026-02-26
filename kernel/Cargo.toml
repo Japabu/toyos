@@ -10,6 +10,7 @@ debug-wait = []
 
 [dependencies]
 tyfs = { path = "../tyfs" }
+toyos-abi = { path = "../rust/library/toyos-abi" }
 rustc-demangle = "0.1"
 elf = { version = "0.8", default-features = false }
 hashbrown = { version = "0.16", default-features = false, features = ["default-hasher"] }

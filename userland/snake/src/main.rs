@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 use std::fs;
-use std::os::toyos::io;
+use toyos_abi::syscall;
 
 use window::{Color, Framebuffer, Window};
 
@@ -50,7 +50,7 @@ struct Rng(u64);
 
 impl Rng {
     fn new() -> Self {
-        let mut seed = io::clock_nanos();
+        let mut seed = syscall::clock_nanos();
         if seed == 0 {
             seed = 0xdeadbeef;
         }
@@ -125,7 +125,7 @@ impl Game {
         self.next_dir = Dir::Right;
         self.score = 0;
         self.game_over = false;
-        self.next_tick = io::clock_nanos() + TICK_NANOS;
+        self.next_tick = syscall::clock_nanos() + TICK_NANOS;
 
         let cx = self.cols / 2;
         let cy = self.rows / 2;
@@ -290,7 +290,7 @@ impl Game {
 
     fn run(&mut self) {
         loop {
-            let now = io::clock_nanos();
+            let now = syscall::clock_nanos();
             // timeout=0 means block forever, so use max(1) when game is running
             let timeout = if self.game_over {
                 0
@@ -309,9 +309,9 @@ impl Game {
                 _ => {}
             }
 
-            if !self.game_over && io::clock_nanos() >= self.next_tick {
+            if !self.game_over && syscall::clock_nanos() >= self.next_tick {
                 self.step();
-                self.next_tick = io::clock_nanos() + TICK_NANOS;
+                self.next_tick = syscall::clock_nanos() + TICK_NANOS;
                 self.dirty = true;
             }
 

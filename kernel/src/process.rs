@@ -314,13 +314,25 @@ fn make_name(path: &str) -> [u8; 28] {
     name
 }
 
+/// Build a child's FdTable from (child_fd, parent_fd) pairs.
+/// Duplicates each referenced parent descriptor into the child table.
+pub fn build_child_fds(pairs: &[[u32; 2]]) -> FdTable {
+    let guard = PROCESS_TABLE.lock();
+    let table = guard.as_ref().expect("process table not initialized");
+    let parent = table.procs.get(percpu::current_pid()).unwrap();
+    let mut fds = FdTable::new();
+    for &[child_fd, parent_fd] in pairs {
+        if let Some(desc) = parent.fds.get(parent_fd as u64) {
+            fds.insert_at(child_fd as u64, fd::dup(desc));
+        }
+    }
+    fds
+}
+
 /// Spawn a new process from an ELF binary. Returns child PID or u64::MAX.
-/// stdin_fd/stdout_fd: FD numbers in the parent to dup into child's FD 0/1,
-/// or u64::MAX to inherit parent's FD 0/1 type.
-pub fn spawn(argv: &[&str], stdin_fd: u64, stdout_fd: u64) -> u64 {
+pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<u32>) -> u64 {
     let path = argv[0];
 
-    // Load binary from VFS (no process table lock needed)
     let binary = match vfs::lock().read_file(path) {
         Some(data) => data,
         None => return u64::MAX,
@@ -334,11 +346,9 @@ pub fn spawn(argv: &[&str], stdin_fd: u64, stdout_fd: u64) -> u64 {
         }
     };
 
-    // Create per-process page tables
     let child_pml4 = paging::create_user_pml4();
     let child_cr3 = child_pml4 as u64;
 
-    // Map ELF and stack in the child's page tables (2MB aligned)
     let elf_alloc_size = ((loaded.load_size + PAGE_2M as usize - 1) & !(PAGE_2M as usize - 1)) as u64;
     let elf_layout = Layout::from_size_align(elf_alloc_size as usize, PAGE_2M as usize).unwrap();
     paging::map_user_in(child_pml4, loaded.base_ptr as u64, elf_alloc_size);
@@ -352,19 +362,17 @@ pub fn spawn(argv: &[&str], stdin_fd: u64, stdout_fd: u64) -> u64 {
     let stack_top = stack_base as u64 + USER_STACK_SIZE as u64;
     paging::map_user_in(child_pml4, stack_base as u64, USER_STACK_SIZE as u64);
 
-    // Set up TLS for child
     let (tls_block, tls_block_layout, fs_base) = setup_tls(loaded.tls_template, loaded.tls_filesz, loaded.tls_memsz);
     paging::map_user_in(child_pml4, tls_block as u64, tls_block_layout.size() as u64);
 
     let sp = write_argv_to_stack(stack_top, argv);
 
-    // Parse symbols before we lock the process table
     let syms = ProcessSymbols::parse(
         &binary, loaded.base,
         loaded.base_ptr as u64, loaded.base_ptr as u64 + loaded.load_size as u64,
         stack_base as u64, stack_top,
     );
-    // Allocate kernel stack for child
+
     let ks_layout = Layout::from_size_align(KERNEL_STACK_SIZE, 4096).unwrap();
     let ks_base = unsafe { alloc_zeroed(ks_layout) };
     if ks_base.is_null() {
@@ -373,7 +381,6 @@ pub fn spawn(argv: &[&str], stdin_fd: u64, stdout_fd: u64) -> u64 {
     }
     let ks_top = ks_base as u64 + KERNEL_STACK_SIZE as u64;
 
-    // Set up kernel stack frame for context switch -> trampoline
     let frame_ptr = (ks_top - 7 * 8) as *mut u64;
     unsafe {
         *frame_ptr.add(0) = 0; // r15
@@ -385,162 +392,13 @@ pub fn spawn(argv: &[&str], stdin_fd: u64, stdout_fd: u64) -> u64 {
         *frame_ptr.add(6) = process_start as u64;
     }
 
-    // Lock process table to read parent and create child
     let mut guard = PROCESS_TABLE.lock();
     let table = guard.as_mut().expect("process table not initialized");
-    let parent_pid = percpu::current_pid();
 
-    let mut child_fds = FdTable::new();
-
-    // FD 0 (stdin)
-    let src_fd = if stdin_fd != u64::MAX { stdin_fd } else { 0 };
-    let stdin_desc = match table.procs.get(parent_pid).unwrap().fds.get(src_fd) {
-        Some(Descriptor::PipeRead(id)) => {
-            pipe::add_reader(*id);
-            Descriptor::PipeRead(*id)
-        }
-        Some(Descriptor::TtyRead(id)) => {
-            pipe::add_reader(*id);
-            Descriptor::TtyRead(*id)
-        }
-        Some(Descriptor::File(file)) => Descriptor::File(file.clone()),
-        _ => Descriptor::SerialConsole,
+    let cwd = match parent {
+        Some(ppid) => table.procs.get(ppid).unwrap().cwd.clone(),
+        None => String::from("/"),
     };
-    child_fds.insert_at(0, stdin_desc);
-
-    // FD 1 (stdout)
-    let src_fd = if stdout_fd != u64::MAX { stdout_fd } else { 1 };
-    let stdout_desc = match table.procs.get(parent_pid).unwrap().fds.get(src_fd) {
-        Some(Descriptor::PipeWrite(id)) => {
-            pipe::add_writer(*id);
-            Descriptor::PipeWrite(*id)
-        }
-        Some(Descriptor::TtyWrite(id)) => {
-            pipe::add_writer(*id);
-            Descriptor::TtyWrite(*id)
-        }
-        Some(Descriptor::File(file)) => Descriptor::File(file.clone()),
-        _ => Descriptor::SerialConsole,
-    };
-    // FD 2 (stderr) — same as stdout so panics appear in terminal
-    let stderr_desc = match &stdout_desc {
-        Descriptor::PipeWrite(id) => {
-            pipe::add_writer(*id);
-            Descriptor::PipeWrite(*id)
-        }
-        Descriptor::TtyWrite(id) => {
-            pipe::add_writer(*id);
-            Descriptor::TtyWrite(*id)
-        }
-        Descriptor::File(file) => Descriptor::File(file.clone()),
-        _ => Descriptor::SerialConsole,
-    };
-    child_fds.insert_at(1, stdout_desc);
-    child_fds.insert_at(2, stderr_desc);
-
-    // Inherit parent's cwd
-    let parent_cwd = table.procs.get(parent_pid).unwrap().cwd.clone();
-
-    let pid = table.procs.insert(Process {
-        pid: 0, // placeholder, set below
-        state: ProcessState::Ready,
-        cr3: child_cr3,
-        kernel_stack_base: ks_base,
-        kernel_stack_layout: ks_layout,
-        kernel_rsp: frame_ptr as u64,
-        fds: child_fds,
-        user_heap: crate::user_heap::new_heap(),
-        messages: MessageQueue::new(),
-        cwd: parent_cwd,
-        parent_pid: Some(parent_pid),
-        thread_parent: None,
-        heap_owner: 0, // set below
-        elf_base: loaded.base_ptr,
-        elf_layout,
-        stack_base,
-        stack_layout,
-        fs_base,
-        tls_template: loaded.tls_template,
-        tls_filesz: loaded.tls_filesz,
-        tls_memsz: loaded.tls_memsz,
-        tls_block,
-        tls_block_layout,
-        symbols: syms,
-        name: make_name(path),
-    });
-    // Set the actual PID now that we know it
-    let p = table.procs.get_mut(pid).unwrap();
-    p.pid = pid;
-    p.heap_owner = pid;
-
-    log!("spawn: {} pid={} base={:#x} entry={:#x} cr3={:#x} ks={:#x}..{:#x}",
-        path, pid, loaded.base_ptr as u64, loaded.entry, child_cr3, ks_base as u64, ks_top);
-
-    pid as u64
-}
-
-/// Spawn a process from kernel context (no parent). Used during boot to launch
-/// initial services. The process starts in Ready state with SerialConsole FDs.
-pub fn spawn_kernel(argv: &[&str]) -> u32 {
-    let path = argv[0];
-    let full_path = if path.starts_with('/') {
-        String::from(path)
-    } else {
-        alloc::format!("/initrd/{}", path)
-    };
-
-    let binary = vfs::lock().read_file(&full_path)
-        .unwrap_or_else(|| panic!("spawn_kernel: {} not found", full_path));
-
-    let loaded = elf::load(&binary).expect("spawn_kernel: ELF load failed");
-
-    let child_pml4 = paging::create_user_pml4();
-    let child_cr3 = child_pml4 as u64;
-
-    let elf_alloc_size = ((loaded.load_size + PAGE_2M as usize - 1) & !(PAGE_2M as usize - 1)) as u64;
-    let elf_layout = Layout::from_size_align(elf_alloc_size as usize, PAGE_2M as usize).unwrap();
-    paging::map_user_in(child_pml4, loaded.base_ptr as u64, elf_alloc_size);
-
-    let stack_layout = Layout::from_size_align(USER_STACK_SIZE, PAGE_2M as usize).unwrap();
-    let stack_base = unsafe { alloc_zeroed(stack_layout) };
-    assert!(!stack_base.is_null(), "spawn_kernel: stack alloc failed");
-    let stack_top = stack_base as u64 + USER_STACK_SIZE as u64;
-    paging::map_user_in(child_pml4, stack_base as u64, USER_STACK_SIZE as u64);
-
-    let (tls_block, tls_block_layout, fs_base) = setup_tls(loaded.tls_template, loaded.tls_filesz, loaded.tls_memsz);
-    paging::map_user_in(child_pml4, tls_block as u64, tls_block_layout.size() as u64);
-
-    let sp = write_argv_to_stack(stack_top, argv);
-
-    let syms = ProcessSymbols::parse(
-        &binary, loaded.base,
-        loaded.base_ptr as u64, loaded.base_ptr as u64 + loaded.load_size as u64,
-        stack_base as u64, stack_top,
-    );
-
-    let ks_layout = Layout::from_size_align(KERNEL_STACK_SIZE, 4096).unwrap();
-    let ks_base = unsafe { alloc_zeroed(ks_layout) };
-    assert!(!ks_base.is_null(), "spawn_kernel: kernel stack alloc failed");
-    let ks_top = ks_base as u64 + KERNEL_STACK_SIZE as u64;
-
-    let frame_ptr = (ks_top - 7 * 8) as *mut u64;
-    unsafe {
-        *frame_ptr.add(0) = 0; // r15
-        *frame_ptr.add(1) = 0; // r14
-        *frame_ptr.add(2) = sp; // r13 = user stack
-        *frame_ptr.add(3) = loaded.entry; // r12 = entry
-        *frame_ptr.add(4) = 0; // rbx
-        *frame_ptr.add(5) = 0; // rbp
-        *frame_ptr.add(6) = process_start as u64;
-    }
-
-    let mut fds = FdTable::new();
-    fds.insert_at(0, Descriptor::SerialConsole);
-    fds.insert_at(1, Descriptor::SerialConsole);
-    fds.insert_at(2, Descriptor::SerialConsole);
-
-    let mut guard = PROCESS_TABLE.lock();
-    let table = guard.as_mut().expect("process table not initialized");
 
     let pid = table.procs.insert(Process {
         pid: 0,
@@ -552,8 +410,8 @@ pub fn spawn_kernel(argv: &[&str]) -> u32 {
         fds,
         user_heap: crate::user_heap::new_heap(),
         messages: MessageQueue::new(),
-        cwd: String::from("/"),
-        parent_pid: None,
+        cwd,
+        parent_pid: parent,
         thread_parent: None,
         heap_owner: 0,
         elf_base: loaded.base_ptr,
@@ -567,16 +425,37 @@ pub fn spawn_kernel(argv: &[&str]) -> u32 {
         tls_block,
         tls_block_layout,
         symbols: syms,
-        name: make_name(&full_path),
+        name: make_name(path),
     });
     let p = table.procs.get_mut(pid).unwrap();
     p.pid = pid;
     p.heap_owner = pid;
 
     log!("spawn: {} pid={} base={:#x} entry={:#x} cr3={:#x} ks={:#x}..{:#x}",
-        full_path, pid, loaded.base_ptr as u64, loaded.entry, child_cr3, ks_base as u64, ks_top);
+        path, pid, loaded.base_ptr as u64, loaded.entry, child_cr3, ks_base as u64, ks_top);
 
-    pid
+    pid as u64
+}
+
+/// Spawn a process from kernel context (during boot). Resolves bare names
+/// to `/initrd/<name>`. Panics on failure.
+pub fn spawn_kernel(argv: &[&str]) -> u32 {
+    let path = argv[0];
+    let full_path = if path.starts_with('/') {
+        String::from(path)
+    } else {
+        alloc::format!("/initrd/{}", path)
+    };
+    let mut full_argv: Vec<&str> = Vec::with_capacity(argv.len());
+    full_argv.push(&full_path);
+    full_argv.extend_from_slice(&argv[1..]);
+    let mut fds = FdTable::new();
+    fds.insert_at(0, Descriptor::SerialConsole);
+    fds.insert_at(1, Descriptor::SerialConsole);
+    fds.insert_at(2, Descriptor::SerialConsole);
+    let pid = spawn(&full_argv, fds, None);
+    assert!(pid != u64::MAX, "spawn_kernel: failed to spawn {}", full_path);
+    pid as u32
 }
 
 /// Exit the current process.

@@ -2,13 +2,13 @@ pub mod framebuffer;
 
 pub use framebuffer::{Color, Framebuffer};
 
-use std::os::toyos::io;
+use toyos_abi::syscall;
 use std::os::toyos::message::{self, Message};
 use std::sync::OnceLock;
 
 fn compositor_pid() -> u32 {
     static PID: OnceLock<u32> = OnceLock::new();
-    *PID.get_or_init(|| io::find_pid("compositor").expect("no compositor running"))
+    *PID.get_or_init(|| syscall::find_pid("compositor").expect("no compositor running"))
 }
 
 // Client → Compositor
@@ -135,7 +135,7 @@ impl Window {
         let response = message::recv();
         assert_eq!(response.msg_type(), MSG_WINDOW_CREATED, "unexpected message from compositor");
         let info: WindowInfo = response.take_payload();
-        let buffer = io::map_shared(info.token);
+        let buffer = syscall::map_shared(info.token);
 
         Self {
             buffer,
@@ -153,7 +153,7 @@ impl Window {
 
     /// Wait up to `timeout_nanos` for an event. Returns `None` on timeout.
     pub fn poll_event(&mut self, timeout_nanos: u64) -> Option<Event> {
-        let result = io::poll_timeout(&[], timeout_nanos);
+        let result = syscall::poll_timeout(&[], timeout_nanos);
         if result.messages() {
             Some(self.recv_event())
         } else {
@@ -167,8 +167,8 @@ impl Window {
             MSG_MOUSE_INPUT => Event::MouseInput(msg.take_payload()),
             MSG_WINDOW_RESIZED => {
                 let info: ResizeInfo = msg.take_payload();
-                io::release_shared(info.old_token);
-                self.buffer = io::map_shared(info.token);
+                syscall::release_shared(info.old_token);
+                self.buffer = syscall::map_shared(info.token);
                 self.width = info.width;
                 self.height = info.height;
                 self.pixel_format = info.pixel_format;

@@ -1,5 +1,5 @@
-use std::os::toyos::io;
 use std::os::toyos::message::{self, Message};
+use toyos_abi::syscall;
 use std::process::Command;
 
 use window::{Color, Framebuffer};
@@ -75,7 +75,7 @@ fn read_fb_info(fd: u64) -> FramebufferInfo {
             std::mem::size_of::<FramebufferInfo>(),
         )
     };
-    let n = io::read_fd(fd, buf);
+    let n = syscall::read_fd(fd, buf);
     assert!(
         n == std::mem::size_of::<FramebufferInfo>(),
         "failed to read framebuffer info"
@@ -143,9 +143,9 @@ fn focused_window_idx(windows: &[WindowState]) -> Option<usize> {
 fn resize_window(win: &mut WindowState, new_w: usize, new_h: usize, pixel_format: u32) {
     let old_token = win.token;
     let buf_size = new_w * new_h * 4;
-    let token = io::alloc_shared(buf_size);
-    let buffer = io::map_shared(token);
-    io::grant_shared(token, win.pid);
+    let token = syscall::alloc_shared(buf_size);
+    let buffer = syscall::map_shared(token);
+    syscall::grant_shared(token, win.pid);
     win.token = token;
     win.buffer = buffer;
     win.buffer_size = buf_size;
@@ -167,7 +167,7 @@ fn resize_window(win: &mut WindowState, new_w: usize, new_h: usize, pixel_format
             },
         ),
     );
-    io::release_shared(old_token);
+    syscall::release_shared(old_token);
 }
 
 fn save_if_normal(win: &mut WindowState) {
@@ -563,7 +563,7 @@ fn draw_taskbar(
     font.draw_char(screen, plus_x, text_y, '+', TASKBAR_NEW_TEXT, TASKBAR_NEW_COLOR);
 
     // System stats + clock on the right
-    let time = io::clock_realtime();
+    let time = syscall::clock_realtime();
     let hours = (time >> 16) & 0xFF;
     let minutes = (time >> 8) & 0xFF;
 
@@ -607,18 +607,18 @@ fn upload_cursor(cursor_buf: *mut u8, sprite: &sprite::Sprite) {
             }
         }
     }
-    io::gpu_set_cursor(0, 0);
+    syscall::gpu_set_cursor(0, 0);
 }
 
 fn main() {
-    io::register_name("compositor").expect("compositor already running");
+    syscall::register_name("compositor").expect("compositor already running");
 
-    let kb_fd = io::open_device(io::DeviceType::Keyboard).expect("failed to claim keyboard");
-    let mouse_fd = io::open_device(io::DeviceType::Mouse).expect("failed to claim mouse");
-    let fb_fd = io::open_device(io::DeviceType::Framebuffer).expect("failed to claim framebuffer");
+    let kb_fd = syscall::open_device(syscall::DeviceType::Keyboard).expect("failed to claim keyboard");
+    let mouse_fd = syscall::open_device(syscall::DeviceType::Mouse).expect("failed to claim mouse");
+    let fb_fd = syscall::open_device(syscall::DeviceType::Framebuffer).expect("failed to claim framebuffer");
 
     let fb_info = read_fb_info(fb_fd);
-    let fb_addr = io::map_shared(fb_info.token[0]);
+    let fb_addr = syscall::map_shared(fb_info.token[0]);
     let screen = Framebuffer::new(
         fb_addr,
         fb_info.width as usize,
@@ -628,7 +628,7 @@ fn main() {
     );
 
     // Set up hardware cursor
-    let cursor_buf = io::map_shared(fb_info.cursor_token);
+    let cursor_buf = syscall::map_shared(fb_info.cursor_token);
     let cursor_svg = std::fs::read("/initrd/cursor-bold.svg").expect("failed to read cursor");
     let cursor_default = sprite::Sprite::from_svg_colored(&cursor_svg, 20, [255, 255, 255]);
     let resize_svg =
@@ -685,7 +685,7 @@ fn main() {
     let screen_h = screen.height() as i32;
     let mut cursor_x = screen_w / 2;
     let mut cursor_y = screen_h / 2;
-    io::gpu_move_cursor(cursor_x as u32, cursor_y as u32);
+    syscall::gpu_move_cursor(cursor_x as u32, cursor_y as u32);
     let mut dirty_rect: Option<DirtyRect> = Some(DirtyRect::full(screen_w as usize, screen_h as usize));
     let mut prev_buttons: u8 = 0;
     let mut interaction = Interaction::None;
@@ -704,7 +704,7 @@ fn main() {
         let mut waited = false;
         loop {
             let timeout = if waited { 1 } else { FRAME_INTERVAL_NS };
-            let ready = io::poll_timeout(&[kb_fd, mouse_fd], timeout);
+            let ready = syscall::poll_timeout(&[kb_fd, mouse_fd], timeout);
 
             if !ready.fd(0) && !ready.fd(1) && !ready.messages() {
                 break;
@@ -719,7 +719,7 @@ fn main() {
                     std::mem::size_of_val(&events),
                 )
             };
-            let n = io::read_fd(kb_fd, buf);
+            let n = syscall::read_fd(kb_fd, buf);
             for event in &events[..n / std::mem::size_of::<window::KeyEvent>()] {
                 if launcher_open && event.keycode == 0x29 {
                     // Escape: close launcher
@@ -823,7 +823,7 @@ fn main() {
         if ready.fd(1) {
             // Drain all pending mouse events in one read
             let mut buf = [0u8; 512];
-            let n = io::read_fd(mouse_fd, &mut buf);
+            let n = syscall::read_fd(mouse_fd, &mut buf);
             let event_count = n / 4;
 
             // Accumulate deltas and track button transitions
@@ -854,7 +854,7 @@ fn main() {
                 // Move cursor once for all accumulated deltas
                 cursor_x = (cursor_x + total_dx).clamp(0, screen_w - 1);
                 cursor_y = (cursor_y + total_dy).clamp(0, screen_h - 1);
-                io::gpu_move_cursor(cursor_x as u32, cursor_y as u32);
+                syscall::gpu_move_cursor(cursor_x as u32, cursor_y as u32);
 
                 // Update hardware cursor shape
                 let want_resize = match interaction {
@@ -926,7 +926,7 @@ fn main() {
                             let new_idx = windows.len() - 1;
 
                             // Double-click detection
-                            let now = io::clock_nanos();
+                            let now = syscall::clock_nanos();
                             let pid = windows[new_idx].pid;
                             if pid == last_title_click_pid
                                 && now.wrapping_sub(last_title_click_time) < DOUBLE_CLICK_NS
@@ -1164,9 +1164,9 @@ fn main() {
                     let content_h = win_h - BORDER_WIDTH * 2 - TITLE_BAR_HEIGHT;
 
                     let buf_size = content_w * content_h * 4;
-                    let token = io::alloc_shared(buf_size);
-                    let buffer = io::map_shared(token);
-                    io::grant_shared(token, sender);
+                    let token = syscall::alloc_shared(buf_size);
+                    let buffer = syscall::map_shared(token);
+                    syscall::grant_shared(token, sender);
                     let pixel_format = screen.pixel_format_raw();
 
                     windows.push(WindowState {
@@ -1221,12 +1221,12 @@ fn main() {
         } // end inner drain loop
 
         // Refresh taskbar once per second for clock + stats
-        let now = io::clock_nanos();
+        let now = syscall::clock_nanos();
         if now - last_taskbar_update >= 1_000_000_000 {
             last_taskbar_update = now;
 
             let mut si = [0u8; 48];
-            if io::sysinfo(&mut si) >= 48 {
+            if syscall::sysinfo(&mut si) >= 48 {
                 let total_mem = u64::from_le_bytes(si[0..8].try_into().unwrap());
                 let used_mem = u64::from_le_bytes(si[8..16].try_into().unwrap());
                 let busy = u64::from_le_bytes(si[32..40].try_into().unwrap());
@@ -1257,7 +1257,7 @@ fn main() {
             let rect = rect.clamp(screen_w as usize, screen_h as usize);
             if rect.w > 0 && rect.h > 0 {
                 redraw(&screen, &font, &windows, &icons, &wallpaper, launcher_open, &cached_stats, rect);
-                io::gpu_present(rect.x as u32, rect.y as u32, rect.w as u32, rect.h as u32);
+                syscall::gpu_present(rect.x as u32, rect.y as u32, rect.w as u32, rect.h as u32);
 
                 // Send frame callbacks to windows that presented and were composited
                 for win in windows.iter_mut() {

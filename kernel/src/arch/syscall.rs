@@ -12,52 +12,7 @@ const MSR_STAR: u32 = 0xC000_0081;
 const MSR_LSTAR: u32 = 0xC000_0082;
 const MSR_FMASK: u32 = 0xC000_0084;
 
-// Syscall numbers
-const SYS_WRITE: u64 = 0;
-const SYS_READ: u64 = 1;
-const SYS_ALLOC: u64 = 2;
-const SYS_FREE: u64 = 3;
-const SYS_REALLOC: u64 = 4;
-const SYS_EXIT: u64 = 5;
-const SYS_RANDOM: u64 = 6;
-const SYS_SCREEN_SIZE: u64 = 7;
-const SYS_CLOCK: u64 = 8;
-const SYS_OPEN: u64 = 9;
-const SYS_CLOSE: u64 = 10;
-const SYS_SEEK: u64 = 13;
-const SYS_FSTAT: u64 = 14;
-const SYS_FSYNC: u64 = 15;
-const SYS_READDIR: u64 = 17;
-const SYS_DELETE: u64 = 18;
-const SYS_SHUTDOWN: u64 = 19;
-const SYS_CHDIR: u64 = 20;
-const SYS_GETCWD: u64 = 21;
-const SYS_SET_KEYBOARD_LAYOUT: u64 = 23;
-const SYS_PIPE: u64 = 24;
-const SYS_SPAWN: u64 = 25;
-const SYS_WAITPID: u64 = 26;
-const SYS_POLL: u64 = 27;
-const SYS_MARK_TTY: u64 = 28;
-const SYS_SEND_MSG: u64 = 29;
-const SYS_RECV_MSG: u64 = 30;
-const SYS_OPEN_DEVICE: u64 = 31;
-const SYS_REGISTER_NAME: u64 = 32;
-const SYS_FIND_PID: u64 = 33;
-const SYS_SET_SCREEN_SIZE: u64 = 34;
-const SYS_GPU_PRESENT: u64 = 35;
-const SYS_ALLOC_SHARED: u64 = 36;
-const SYS_GRANT_SHARED: u64 = 37;
-const SYS_MAP_SHARED: u64 = 38;
-const SYS_RELEASE_SHARED: u64 = 39;
-const SYS_THREAD_SPAWN: u64 = 40;
-const SYS_THREAD_JOIN: u64 = 41;
-const SYS_CLOCK_REALTIME: u64 = 42;
-const SYS_GPU_SET_CURSOR: u64 = 43;
-const SYS_GPU_MOVE_CURSOR: u64 = 44;
-const SYS_SYSINFO: u64 = 45;
-const SYS_NET_INFO: u64 = 46;
-const SYS_NET_SEND: u64 = 47;
-const SYS_NET_RECV: u64 = 48;
+use toyos_abi::syscall::*;
 
 // ---------------------------------------------------------------------------
 // User pointer validation
@@ -426,10 +381,18 @@ fn sys_pipe() -> u64 {
     })
 }
 
-fn sys_spawn(argv_ptr: u64, argv_len: u64, stdin_fd: u64, stdout_fd: u64) -> u64 {
+fn sys_spawn(argv_ptr: u64, argv_len: u64, fd_map_ptr: u64, fd_map_count: u64) -> u64 {
     let Some(text) = user_str(argv_ptr, argv_len) else { return u64::MAX };
     let args: Vec<&str> = text.split('\0').filter(|s| !s.is_empty()).collect();
-    process::spawn(&args, stdin_fd, stdout_fd)
+    let count = fd_map_count as usize;
+    let fds = if count > 0 {
+        let Some(bytes) = user_slice(fd_map_ptr, (count * 8) as u64) else { return u64::MAX };
+        let pairs = unsafe { core::slice::from_raw_parts(bytes.as_ptr() as *const [u32; 2], count) };
+        process::build_child_fds(pairs)
+    } else {
+        fd::FdTable::new()
+    };
+    process::spawn(&args, fds, Some(crate::arch::percpu::current_pid()))
 }
 
 fn sys_waitpid(pid: u64) -> u64 {

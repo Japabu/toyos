@@ -1,6 +1,7 @@
 use std::collections::HashMap;
-use std::os::toyos::io;
 use std::os::toyos::message::{self, Message};
+use toyos_abi::net::*;
+use toyos_abi::syscall;
 
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{self, Device, DeviceCapabilities, Medium};
@@ -9,156 +10,6 @@ use smoltcp::time::Instant;
 use smoltcp::wire::{DnsQueryType, EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint};
 
 use std::net::Ipv4Addr;
-
-// --- IPC protocol constants ---
-
-// Client -> netd
-const MSG_TCP_CONNECT: u32 = 1;
-const MSG_TCP_SEND: u32 = 2;
-const MSG_TCP_RECV: u32 = 3;
-const MSG_TCP_CLOSE: u32 = 4;
-const MSG_TCP_BIND: u32 = 5;
-const MSG_TCP_ACCEPT: u32 = 6;
-const MSG_TCP_SHUTDOWN: u32 = 7;
-const MSG_UDP_BIND: u32 = 8;
-const MSG_UDP_SEND_TO: u32 = 9;
-const MSG_UDP_RECV_FROM: u32 = 10;
-const MSG_UDP_CLOSE: u32 = 11;
-const MSG_DNS_LOOKUP: u32 = 12;
-const MSG_TCP_SET_OPTION: u32 = 13;
-const MSG_TCP_GET_OPTION: u32 = 14;
-
-// netd -> client
-const MSG_RESULT: u32 = 128;
-const MSG_ERROR: u32 = 129;
-
-// Error codes (map to io::ErrorKind)
-const ERR_CONNECTION_REFUSED: u32 = 1;
-const ERR_CONNECTION_RESET: u32 = 2;
-const ERR_TIMED_OUT: u32 = 3;
-const ERR_ADDR_IN_USE: u32 = 5;
-const ERR_NOT_CONNECTED: u32 = 6;
-const ERR_INVALID_INPUT: u32 = 7;
-const ERR_OTHER: u32 = 255;
-
-// TCP option types
-const OPT_NODELAY: u32 = 1;
-
-// --- IPC payload structures ---
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct TcpConnectRequest {
-    addr: [u8; 4],
-    port: u16,
-    _pad: u16,
-    timeout_ms: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct TcpConnectResponse {
-    socket_id: u32,
-    local_port: u16,
-    _pad: u16,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct TcpRecvRequest {
-    socket_id: u32,
-    max_len: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct TcpCloseRequest {
-    socket_id: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct TcpBindRequest {
-    addr: [u8; 4],
-    port: u16,
-    _pad: u16,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct TcpBindResponse {
-    socket_id: u32,
-    bound_port: u16,
-    _pad: u16,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct TcpAcceptRequest {
-    socket_id: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct TcpAcceptResponse {
-    socket_id: u32,
-    remote_addr: [u8; 4],
-    remote_port: u16,
-    local_port: u16,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct TcpShutdownRequest {
-    socket_id: u32,
-    how: u32, // 0=Read, 1=Write, 2=Both
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct UdpBindRequest {
-    addr: [u8; 4],
-    port: u16,
-    _pad: u16,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct UdpBindResponse {
-    socket_id: u32,
-    bound_port: u16,
-    _pad: u16,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct UdpRecvFromRequest {
-    socket_id: u32,
-    max_len: u32,
-}
-
-// Response for recv_from: [addr:4][port:2][pad:2][data...]
-// Sent as bytes via Message::from_bytes
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct SocketOptionRequest {
-    socket_id: u32,
-    option: u32,
-    value: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct SocketOptionResponse {
-    value: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct ErrorResponse {
-    code: u32,
-}
 
 // --- smoltcp Device wrapper ---
 
@@ -181,7 +32,7 @@ impl ToyNic {
             return;
         }
         // 1ns timeout = effectively non-blocking (syscall overhead > 1ns)
-        let n = io::net_recv_timeout(&mut self.rx_buf, 1);
+        let n = syscall::net_recv_timeout(&mut self.rx_buf, 1);
         if n > 0 {
             self.pending_rx = Some(n);
         }
@@ -237,7 +88,7 @@ impl phy::TxToken for ToyTxToken {
     {
         let mut buf = vec![0u8; len];
         let result = f(&mut buf);
-        io::net_send(&buf);
+        syscall::net_send(&buf);
         result
     }
 }
@@ -383,7 +234,7 @@ impl NetDaemon {
         self.owners.insert(socket_id, sender);
 
         let deadline = if req.timeout_ms > 0 {
-            io::clock_nanos() + req.timeout_ms as u64 * 1_000_000
+            syscall::clock_nanos() + req.timeout_ms as u64 * 1_000_000
         } else {
             0
         };
@@ -780,7 +631,7 @@ impl NetDaemon {
 
     /// Process pending async operations (connects, recvs, accepts, DNS).
     fn process_pending(&mut self, socket_set: &mut SocketSet<'_>) {
-        let now = io::clock_nanos();
+        let now = syscall::clock_nanos();
 
         // Pending connects
         let mut i = 0;
@@ -974,9 +825,9 @@ impl NetDaemon {
 }
 
 fn main() {
-    io::register_name("netd").expect("netd already running");
+    syscall::register_name("netd").expect("netd already running");
 
-    let mac = match io::net_mac() {
+    let mac = match syscall::net_mac() {
         Some(m) => m,
         None => {
             eprintln!("netd: no network interface");
@@ -991,7 +842,7 @@ fn main() {
 
     let mut device = ToyNic::new();
     let config = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
-    let now = Instant::from_millis((io::clock_nanos() / 1_000_000) as i64);
+    let now = Instant::from_millis((syscall::clock_nanos() / 1_000_000) as i64);
     let mut iface = Interface::new(config, &mut device, now);
 
     iface.update_ip_addrs(|addrs| {
@@ -1013,7 +864,7 @@ fn main() {
     eprintln!("netd: ready");
 
     loop {
-        let now = Instant::from_millis((io::clock_nanos() / 1_000_000) as i64);
+        let now = Instant::from_millis((syscall::clock_nanos() / 1_000_000) as i64);
 
         // Try to receive a frame
         device.try_recv();
@@ -1045,7 +896,7 @@ fn main() {
         };
 
         // Wait for IPC messages or timeout
-        let result = io::poll_timeout(&[], timeout_ns);
+        let result = syscall::poll_timeout(&[], timeout_ns);
 
         if result.messages() {
             // Drain all messages
@@ -1054,7 +905,7 @@ fn main() {
                 daemon.handle_message(msg, &mut socket_set, &mut iface);
 
                 // Check for more messages (non-blocking)
-                let check = io::poll_timeout(&[], 1);
+                let check = syscall::poll_timeout(&[], 1);
                 if !check.messages() {
                     break;
                 }

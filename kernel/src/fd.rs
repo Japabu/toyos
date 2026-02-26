@@ -55,6 +55,21 @@ pub enum Descriptor {
 
 pub type FdTable = IdMap<u64, Descriptor>;
 
+/// Duplicate a descriptor, bumping pipe refcounts as needed.
+pub fn dup(desc: &Descriptor) -> Descriptor {
+    match desc {
+        Descriptor::PipeRead(id) => { pipe::add_reader(*id); Descriptor::PipeRead(*id) }
+        Descriptor::PipeWrite(id) => { pipe::add_writer(*id); Descriptor::PipeWrite(*id) }
+        Descriptor::TtyRead(id) => { pipe::add_reader(*id); Descriptor::TtyRead(*id) }
+        Descriptor::TtyWrite(id) => { pipe::add_writer(*id); Descriptor::TtyWrite(*id) }
+        Descriptor::File(file) => Descriptor::File(file.clone()),
+        Descriptor::Keyboard => Descriptor::Keyboard,
+        Descriptor::Mouse => Descriptor::Mouse,
+        Descriptor::SerialConsole => Descriptor::SerialConsole,
+        Descriptor::Framebuffer(info) => Descriptor::Framebuffer(*info),
+    }
+}
+
 pub fn alloc(table: &mut FdTable, desc: Descriptor) -> u64 {
     table.insert(desc)
 }

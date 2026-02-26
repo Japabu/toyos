@@ -175,8 +175,8 @@ fn kernel_main(
     }
 
     // Spawn initial userland processes
-    let init = if init_path.is_empty() { "compositor" } else { init_path };
-    let args: Vec<&str> = init.split_whitespace().collect();
+    assert!(!init_path.is_empty(), "bootloader must provide init_program");
+    let args: Vec<&str> = init_path.split_whitespace().collect();
     process::spawn_kernel(&args);
     process::spawn_kernel(&["/initrd/netd"]);
 

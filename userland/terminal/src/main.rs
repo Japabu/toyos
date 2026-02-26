@@ -1,7 +1,8 @@
 mod console;
 
 use std::io::{Read, Write};
-use std::os::toyos::io::{self, AsRawFd};
+use std::os::toyos::io::AsRawFd;
+use toyos_abi::syscall;
 use std::os::toyos::process;
 use std::process::Command;
 
@@ -16,7 +17,7 @@ fn main() {
         .expect("failed to spawn shell");
 
     let mut window = Window::create_with_title(0, 0, "Terminal");
-    io::set_screen_size(window.width(), window.height());
+    syscall::set_screen_size(window.width(), window.height());
     let fb = window.framebuffer();
     let font_data = std::fs::read("/initrd/JetBrainsMono-8x16.font").expect("failed to read font");
     let font = font::Font::from_prebuilt(&font_data);
@@ -27,7 +28,7 @@ fn main() {
     let shell_stdout_fd = shell_stdout.as_raw_fd();
 
     loop {
-        let ready = io::poll(&[shell_stdout_fd]);
+        let ready = syscall::poll(&[shell_stdout_fd]);
 
         if ready.fd(0) {
             let mut buf = [0u8; 4096];
@@ -87,7 +88,7 @@ fn main() {
                 }
                 window::Event::Close => break,
                 window::Event::Resized => {
-                    io::set_screen_size(window.width(), window.height());
+                    syscall::set_screen_size(window.width(), window.height());
                     console.resize(window.framebuffer());
                     window.present();
                 }

@@ -91,6 +91,7 @@ name = "netd"
 version = "0.0.0"
 dependencies = [
  "smoltcp",
+ "toyos-abi",
 ]
 
 [[package]]
@@ -183,6 +184,10 @@ dependencies = [
  "quote",
  "syn",
 ]
+
+[[package]]
+name = "toyos-abi"
+version = "0.1.0"
 
 [[package]]
 name = "unicode-ident"

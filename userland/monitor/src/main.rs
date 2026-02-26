@@ -1,4 +1,4 @@
-use std::os::toyos::io;
+use toyos_abi::syscall;
 use window::{Color, Framebuffer, Window};
 
 const BG: Color = Color { r: 0x1e, g: 0x1e, b: 0x2e };
@@ -35,7 +35,7 @@ struct ProcessInfo {
 
 fn query_sysinfo() -> SysInfo {
     let mut buf = vec![0u8; 8192];
-    let n = io::sysinfo(&mut buf);
+    let n = syscall::sysinfo(&mut buf);
 
     let total_memory = u64::from_le_bytes(buf[0..8].try_into().unwrap());
     let used_memory = u64::from_le_bytes(buf[8..16].try_into().unwrap());
