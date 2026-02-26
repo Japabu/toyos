@@ -180,6 +180,7 @@ fn idle_poll(table: &mut ProcessTable) {
     }
 
     let kb_ready = keyboard::has_data();
+    let net_ready = crate::net::has_packet();
 
     let mut zombie_pids = alloc::vec::Vec::new();
     for (_, proc) in table.procs.iter() {
@@ -216,6 +217,11 @@ fn idle_poll(table: &mut ProcessTable) {
                 if proc.messages.has_messages() {
                     proc.state = ProcessState::Ready;
                 }
+            }
+            ProcessState::BlockedNetRecv { deadline } if net_ready
+                || (deadline > 0 && crate::clock::nanos_since_boot() >= deadline) =>
+            {
+                proc.state = ProcessState::Ready;
             }
             _ => {}
         }

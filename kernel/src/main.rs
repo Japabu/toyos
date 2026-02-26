@@ -10,7 +10,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use kernel::arch::{apic, idt, paging, percpu, smp, syscall};
 use kernel::arch::paging::PAGE_2M;
-use kernel::drivers::{acpi, nvme, pci, serial, virtio_gpu, xhci};
+use kernel::drivers::{acpi, nvme, pci, serial, virtio_gpu, virtio_net, xhci};
 use kernel::{allocator, clock, fd, log, pipe, process, ramdisk, shared_memory, symbols, vfs, KernelArgs, MemoryMapEntry};
 use tyfs::Disk;
 
@@ -193,6 +193,9 @@ fn kernel_main(
     let sp = process::write_argv_to_stack(stack_top, &args);
 
     log!("init: entry={:#x}, stack={:#x}, argc={}", loaded.entry, sp, args.len());
+
+    // Initialize VirtIO networking
+    virtio_net::init(ecam_base);
 
     // Initialize VirtIO GPU display
     let gpu = virtio_gpu::init(ecam_base).expect("VirtIO GPU not found");

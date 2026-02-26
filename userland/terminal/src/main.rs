@@ -91,6 +91,7 @@ fn main() {
                     console.resize(window.framebuffer());
                     window.present();
                 }
+                window::Event::Frame => {}
             }
         }
     }

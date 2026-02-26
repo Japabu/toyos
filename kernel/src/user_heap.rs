@@ -17,17 +17,21 @@ pub fn new_heap() -> Vec<(u64, u64)> {
     Vec::new()
 }
 
-fn grow(heap: &mut Vec<(u64, u64)>, min_size: usize) {
+fn grow(heap: &mut Vec<(u64, u64)>, min_size: usize) -> bool {
     let size = (min_size.max(CHUNK_SIZE) + PAGE_2M as usize - 1) & !(PAGE_2M as usize - 1);
     let layout = Layout::from_size_align(size, PAGE_2M as usize).unwrap();
     let ptr = unsafe { alloc_zeroed(layout) };
-    assert!(!ptr.is_null(), "user heap: out of memory");
+    if ptr.is_null() {
+        log!("user_heap: out of memory (requested {} KB)", size / 1024);
+        return false;
+    }
     let start = ptr as u64;
     let end = start + size as u64;
     log!("user_heap: grow {:#x}..{:#x} ({} KB)", start, end, size / 1024);
     paging::map_user(start, size as u64);
     let pos = heap.iter().position(|&(s, _)| s > start).unwrap_or(heap.len());
     heap.insert(pos, (start, end));
+    true
 }
 
 fn try_alloc(heap: &mut Vec<(u64, u64)>, size: u64, align: u64) -> Option<u64> {
@@ -61,8 +65,10 @@ pub fn alloc(heap: &mut Vec<(u64, u64)>, size: usize, align: usize) -> u64 {
     if let Some(addr) = try_alloc(heap, sz, align) {
         return addr;
     }
-    grow(heap, size + align as usize);
-    try_alloc(heap, sz, align).expect("user heap: alloc failed after grow")
+    if !grow(heap, size + align as usize) {
+        return 0;
+    }
+    try_alloc(heap, sz, align).unwrap_or(0)
 }
 
 pub fn free(heap: &mut Vec<(u64, u64)>, ptr: *mut u8, size: usize) {

@@ -23,6 +23,7 @@ pub const MSG_WINDOW_RESIZED: u32 = 3;
 pub const MSG_WINDOW_CLOSE: u32 = 4;
 pub const MSG_MOUSE_INPUT: u32 = 5;
 pub const MSG_CLIPBOARD_PASTE: u32 = 6;
+pub const MSG_FRAME: u32 = 7;
 
 #[repr(C)]
 pub struct CreateWindowRequest {
@@ -96,6 +97,7 @@ pub enum Event {
     ClipboardPaste(Vec<u8>),
     Resized,
     Close,
+    Frame,
 }
 
 /// Set the system clipboard contents.
@@ -174,6 +176,7 @@ impl Window {
             }
             MSG_CLIPBOARD_PASTE => Event::ClipboardPaste(msg.take_bytes()),
             MSG_WINDOW_CLOSE => Event::Close,
+            MSG_FRAME => Event::Frame,
             other => panic!("unknown window event type: {other}"),
         }
     }

@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 font = { path = "../font" }
-jpeg-decoder = { version = "0.3", default-features = false }
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
 sprite = { path = "../sprite" }
 window = { path = "../window" }
 

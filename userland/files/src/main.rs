@@ -355,6 +355,7 @@ impl FileBrowser {
                     self.window.present();
                 }
                 window::Event::ClipboardPaste(_) => {}
+                window::Event::Frame => {}
                 window::Event::Close => break,
             }
         }

@@ -136,6 +136,10 @@ fn main() {
         .arg("-vga").arg("none")
         .arg("-device").arg("virtio-gpu-pci")
 
+        // VirtIO networking with user-mode (SLIRP) backend
+        .arg("-netdev").arg("user,id=net0")
+        .arg("-device").arg("virtio-net-pci-non-transitional,netdev=net0")
+
         .arg("-serial").arg("stdio")
 
         .arg("-no-reboot")

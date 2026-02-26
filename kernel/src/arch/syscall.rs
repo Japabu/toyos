@@ -55,6 +55,9 @@ const SYS_CLOCK_REALTIME: u64 = 42;
 const SYS_GPU_SET_CURSOR: u64 = 43;
 const SYS_GPU_MOVE_CURSOR: u64 = 44;
 const SYS_SYSINFO: u64 = 45;
+const SYS_NET_INFO: u64 = 46;
+const SYS_NET_SEND: u64 = 47;
+const SYS_NET_RECV: u64 = 48;
 
 // ---------------------------------------------------------------------------
 // User pointer validation
@@ -229,6 +232,13 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         SYS_THREAD_JOIN => sys_thread_join(a1),
         SYS_CLOCK_REALTIME => crate::rtc::read_time(),
         SYS_SYSINFO => sys_sysinfo(a1, a2),
+        SYS_NET_INFO => sys_net_info(a1, a2),
+        SYS_NET_SEND => {
+            let Some(buf) = user_slice(a1, a2) else { return u64::MAX };
+            crate::net::send(buf);
+            0
+        }
+        SYS_NET_RECV => sys_net_recv(a1, a2, a3),
         _ => u64::MAX,
     }
 }
@@ -661,6 +671,32 @@ fn sys_sysinfo(buf_ptr: u64, buf_len: u64) -> u64 {
     }
 
     pos as u64
+}
+
+fn sys_net_info(buf_ptr: u64, buf_len: u64) -> u64 {
+    let Some(buf) = user_slice_mut(buf_ptr, buf_len) else { return u64::MAX };
+    let Some(mac) = crate::net::mac() else { return u64::MAX };
+    if buf.len() < 6 { return u64::MAX; }
+    buf[..6].copy_from_slice(&mac);
+    0
+}
+
+fn sys_net_recv(buf_ptr: u64, buf_len: u64, timeout_nanos: u64) -> u64 {
+    let Some(buf) = user_slice_mut(buf_ptr, buf_len) else { return u64::MAX };
+    let deadline = if timeout_nanos > 0 {
+        crate::clock::nanos_since_boot() + timeout_nanos
+    } else {
+        0
+    };
+    loop {
+        if let Some(n) = crate::net::recv(buf) {
+            return n as u64;
+        }
+        if deadline > 0 && crate::clock::nanos_since_boot() >= deadline {
+            return 0;
+        }
+        process::block(process::ProcessState::BlockedNetRecv { deadline });
+    }
 }
 
 /// Terminate the current userspace process (called from exception handlers).

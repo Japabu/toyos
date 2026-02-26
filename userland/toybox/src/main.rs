@@ -3,6 +3,7 @@ mod echo;
 mod grep;
 mod keyboard;
 mod ls;
+mod net;
 mod pwd;
 mod rm;
 mod shutdown;
@@ -19,7 +20,7 @@ macro_rules! commands {
     };
 }
 
-commands!(cat, echo, grep, keyboard, ls, pwd, rm, shutdown, spin);
+commands!(cat, echo, grep, keyboard, ls, net, pwd, rm, shutdown, spin);
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();

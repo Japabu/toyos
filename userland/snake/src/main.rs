@@ -7,7 +7,7 @@ use window::{Color, Framebuffer, Window};
 const CELL: usize = 16;
 const HEADER: usize = 24;
 const TICK_MS: u64 = 150;
-const TICK_NANOS: u64 = TICK_MS * 1_000_000;
+const TICK_NANOS: u64 = TICK_MS * 500_000;
 
 const BG: Color = Color { r: 0x1a, g: 0x1a, b: 0x2e };
 const GRID_BG: Color = Color { r: 0x22, g: 0x22, b: 0x38 };
@@ -83,6 +83,8 @@ struct Game {
     score: usize,
     game_over: bool,
     next_tick: u64,
+    dirty: bool,
+    frame_ready: bool,
 }
 
 impl Game {
@@ -110,6 +112,8 @@ impl Game {
             score: 0,
             game_over: false,
             next_tick: 0,
+            dirty: false,
+            frame_ready: true,
         };
         game.reset();
         game
@@ -130,8 +134,8 @@ impl Game {
         self.snake.push_back((cx - 2, cy));
 
         self.place_food();
-        self.redraw();
-        self.window.present();
+        self.dirty = true;
+        self.frame_ready = true;
     }
 
     fn place_food(&mut self) {
@@ -278,7 +282,7 @@ impl Game {
         };
 
         if let Some(d) = new_dir {
-            if d != self.next_dir.opposite() {
+            if d != self.dir.opposite() {
                 self.next_dir = d;
             }
         }
@@ -296,7 +300,11 @@ impl Game {
 
             match self.window.poll_event(timeout) {
                 Some(window::Event::KeyInput(ev)) => self.handle_key(ev),
-                Some(window::Event::Resized) => self.handle_resize(),
+                Some(window::Event::Resized) => {
+                    self.handle_resize();
+                    self.dirty = true;
+                }
+                Some(window::Event::Frame) => self.frame_ready = true,
                 Some(window::Event::Close) => break,
                 _ => {}
             }
@@ -304,10 +312,15 @@ impl Game {
             if !self.game_over && io::clock_nanos() >= self.next_tick {
                 self.step();
                 self.next_tick = io::clock_nanos() + TICK_NANOS;
+                self.dirty = true;
             }
 
-            self.redraw();
-            self.window.present();
+            if self.dirty && self.frame_ready {
+                self.redraw();
+                self.window.present();
+                self.dirty = false;
+                self.frame_ready = false;
+            }
         }
     }
 }

@@ -16,6 +16,7 @@ const TASKBAR_HEIGHT: usize = 32;
 const TASKBAR_ITEM_WIDTH: usize = 160;
 const TASKBAR_PADDING: usize = 4;
 const DOUBLE_CLICK_NS: u64 = 400_000_000;
+const FRAME_INTERVAL_NS: u64 = 16_666_667; // ~60fps
 
 const FOCUSED_TITLE_COLOR: Color = Color { r: 0x3a, g: 0x3a, b: 0x4e };
 const UNFOCUSED_TITLE_COLOR: Color = Color { r: 0x28, g: 0x28, b: 0x32 };
@@ -100,6 +101,7 @@ struct WindowState {
     saved_y: usize,
     saved_w: usize,
     saved_h: usize,
+    presented: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -611,6 +613,9 @@ fn upload_cursor(cursor_buf: *mut u8, sprite: &sprite::Sprite) {
 fn main() {
     io::register_name("compositor").expect("compositor already running");
 
+    // Start network daemon
+    Command::new("/initrd/netd").spawn().ok();
+
     let kb_fd = io::open_device(io::DeviceType::Keyboard).expect("failed to claim keyboard");
     let mouse_fd = io::open_device(io::DeviceType::Mouse).expect("failed to claim mouse");
     let fb_fd = io::open_device(io::DeviceType::Framebuffer).expect("failed to claim framebuffer");
@@ -641,17 +646,17 @@ fn main() {
     eprintln!("compositor: decoding wallpaper...");
     let wallpaper = {
         let jpg_data = std::fs::read("/initrd/wallpaper.jpg").expect("failed to read wallpaper");
-        let mut decoder = jpeg_decoder::Decoder::new(std::io::Cursor::new(&jpg_data));
-        let pixels = decoder.decode().expect("failed to decode wallpaper");
-        let info = decoder.info().unwrap();
+        let img = image::load_from_memory_with_format(&jpg_data, image::ImageFormat::Jpeg)
+            .expect("failed to decode wallpaper");
+        let rgb = img.to_rgb8();
         eprintln!(
             "compositor: wallpaper decoded {}x{}, scaling to {}x{}",
-            info.width, info.height, screen.width(), screen.height()
+            rgb.width(), rgb.height(), screen.width(), screen.height()
         );
         scale_wallpaper(
-            &pixels,
-            info.width as usize,
-            info.height as usize,
+            rgb.as_raw(),
+            rgb.width() as usize,
+            rgb.height() as usize,
             screen.width(),
             screen.height(),
             screen.pixel_format_raw() != 0,
@@ -695,9 +700,19 @@ fn main() {
     let mut prev_total_ticks: u64 = 0;
     let mut cpu_pct: u64 = 0;
     let mut last_taskbar_update: u64 = 0;
+    let mut cached_stats = SystemStats { used_mb: 0, total_mb: 0, cpu_pct: 0 };
 
     loop {
-        let ready = io::poll_timeout(&[kb_fd, mouse_fd], 1_000_000_000);
+        // Drain all pending events before compositing
+        let mut waited = false;
+        loop {
+            let timeout = if waited { 1 } else { FRAME_INTERVAL_NS };
+            let ready = io::poll_timeout(&[kb_fd, mouse_fd], timeout);
+
+            if !ready.fd(0) && !ready.fd(1) && !ready.messages() {
+                break;
+            }
+            waited = true;
 
         if ready.fd(0) {
             let mut events = [window::KeyEvent::EMPTY; 8];
@@ -1175,6 +1190,7 @@ fn main() {
                         saved_y: 0,
                         saved_w: 0,
                         saved_h: 0,
+                        presented: false,
                     });
 
                     message::send(
@@ -1193,7 +1209,8 @@ fn main() {
                     mark_dirty(&mut dirty_rect, DirtyRect::full(screen_w, screen_h));
                 }
                 window::MSG_PRESENT => {
-                    if let Some(win) = windows.iter().find(|w| w.pid == sender) {
+                    if let Some(win) = windows.iter_mut().find(|w| w.pid == sender) {
+                        win.presented = true;
                         mark_dirty(&mut dirty_rect, window_screen_rect(win));
                     }
                 }
@@ -1204,11 +1221,33 @@ fn main() {
                 _ => {}
             }
         }
+        } // end inner drain loop
 
         // Refresh taskbar once per second for clock + stats
         let now = io::clock_nanos();
         if now - last_taskbar_update >= 1_000_000_000 {
             last_taskbar_update = now;
+
+            let mut si = [0u8; 48];
+            if io::sysinfo(&mut si) >= 48 {
+                let total_mem = u64::from_le_bytes(si[0..8].try_into().unwrap());
+                let used_mem = u64::from_le_bytes(si[8..16].try_into().unwrap());
+                let busy = u64::from_le_bytes(si[32..40].try_into().unwrap());
+                let total = u64::from_le_bytes(si[40..48].try_into().unwrap());
+                let d_busy = busy.wrapping_sub(prev_busy_ticks);
+                let d_total = total.wrapping_sub(prev_total_ticks);
+                if d_total > 0 {
+                    cpu_pct = d_busy * 100 / d_total;
+                }
+                prev_busy_ticks = busy;
+                prev_total_ticks = total;
+                cached_stats = SystemStats {
+                    used_mb: used_mem / (1024 * 1024),
+                    total_mb: total_mem / (1024 * 1024),
+                    cpu_pct,
+                };
+            }
+
             let taskbar_dirty = DirtyRect {
                 x: 0, y: screen_h as usize - TASKBAR_HEIGHT,
                 w: screen_w as usize, h: TASKBAR_HEIGHT,
@@ -1216,34 +1255,20 @@ fn main() {
             mark_dirty(&mut dirty_rect, taskbar_dirty);
         }
 
-        // Composite and present dirty region
+        // Composite once per frame
         if let Some(rect) = dirty_rect.take() {
             let rect = rect.clamp(screen_w as usize, screen_h as usize);
             if rect.w > 0 && rect.h > 0 {
-                // Update system stats from sysinfo
-                let mut si = [0u8; 48];
-                let mut stats = SystemStats { used_mb: 0, total_mb: 0, cpu_pct };
-                if io::sysinfo(&mut si) >= 48 {
-                    let total_mem = u64::from_le_bytes(si[0..8].try_into().unwrap());
-                    let used_mem = u64::from_le_bytes(si[8..16].try_into().unwrap());
-                    let busy = u64::from_le_bytes(si[32..40].try_into().unwrap());
-                    let total = u64::from_le_bytes(si[40..48].try_into().unwrap());
-                    let d_busy = busy.wrapping_sub(prev_busy_ticks);
-                    let d_total = total.wrapping_sub(prev_total_ticks);
-                    if d_total > 0 {
-                        cpu_pct = d_busy * 100 / d_total;
-                    }
-                    prev_busy_ticks = busy;
-                    prev_total_ticks = total;
-                    stats = SystemStats {
-                        used_mb: used_mem / (1024 * 1024),
-                        total_mb: total_mem / (1024 * 1024),
-                        cpu_pct,
-                    };
-                }
-
-                redraw(&screen, &font, &windows, &icons, &wallpaper, launcher_open, &stats, rect);
+                redraw(&screen, &font, &windows, &icons, &wallpaper, launcher_open, &cached_stats, rect);
                 io::gpu_present(rect.x as u32, rect.y as u32, rect.w as u32, rect.h as u32);
+
+                // Send frame callbacks to windows that presented and were composited
+                for win in windows.iter_mut() {
+                    if win.presented && !win.minimized && rect.overlaps(window_screen_rect(win)) {
+                        message::send(win.pid, Message::signal(window::MSG_FRAME));
+                        win.presented = false;
+                    }
+                }
             }
         }
     }

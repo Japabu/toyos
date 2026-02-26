@@ -162,17 +162,17 @@ impl Virtqueue {
     fn avail(&self) -> *mut VirtqAvail { (self.base + AVAIL_OFFSET) as *mut VirtqAvail }
     fn used(&self) -> *const VirtqUsed { (self.base + USED_OFFSET) as *const VirtqUsed }
 
-    /// Submit a descriptor chain and wait for the device to complete it.
-    pub fn submit_and_wait(
+    /// Submit a descriptor chain and notify the device (non-blocking).
+    /// Returns the first descriptor index of the chain.
+    pub fn submit(
         &mut self,
         bufs: &[(u64, u32, BufDir)],
         notify_mmio: Mmio,
         notify_multiplier: u32,
         queue_index: u16,
-    ) {
+    ) -> u16 {
         let descs = self.descs();
 
-        // Build descriptor chain
         let first_desc = self.next_desc;
         for (i, (addr, len, dir)) in bufs.iter().enumerate() {
             let desc_idx = (first_desc + i as u16) % QUEUE_SIZE;
@@ -192,7 +192,6 @@ impl Virtqueue {
         }
         self.next_desc = (first_desc + bufs.len() as u16) % QUEUE_SIZE;
 
-        // Add to available ring
         let avail = self.avail();
         let avail_idx = unsafe { read_volatile(&raw const (*avail).idx) };
         unsafe {
@@ -201,17 +200,46 @@ impl Virtqueue {
             write_volatile(&raw mut (*avail).idx, avail_idx.wrapping_add(1));
         }
 
-        // Notify device
         fence(Ordering::Release);
         let notify_off = self.notify_offset as u64 * notify_multiplier as u64;
         notify_mmio.write_u16(notify_off, queue_index);
 
-        // Poll used ring for completion
+        first_desc
+    }
+
+    /// Non-destructive check whether the device has completed any request.
+    pub fn has_used(&self) -> bool {
         let used = self.used();
+        let used_idx = unsafe { read_volatile(&raw const (*used).idx) };
+        used_idx != self.last_used_idx
+    }
+
+    /// Non-blocking poll of the used ring. Returns `(descriptor_id, written_len)` if
+    /// the device has completed a request, or `None` if nothing new.
+    pub fn poll_used(&mut self) -> Option<(u16, u32)> {
+        let used = self.used();
+        let used_idx = unsafe { read_volatile(&raw const (*used).idx) };
+        if used_idx == self.last_used_idx {
+            return None;
+        }
+        let entry = unsafe {
+            read_volatile(&raw const (*used).ring[(self.last_used_idx % QUEUE_SIZE) as usize])
+        };
+        self.last_used_idx = self.last_used_idx.wrapping_add(1);
+        Some((entry.id as u16, entry.len))
+    }
+
+    /// Submit a descriptor chain and wait for the device to complete it.
+    pub fn submit_and_wait(
+        &mut self,
+        bufs: &[(u64, u32, BufDir)],
+        notify_mmio: Mmio,
+        notify_multiplier: u32,
+        queue_index: u16,
+    ) {
+        self.submit(bufs, notify_mmio, notify_multiplier, queue_index);
         loop {
-            let used_idx = unsafe { read_volatile(&raw const (*used).idx) };
-            if used_idx != self.last_used_idx {
-                self.last_used_idx = used_idx;
+            if self.poll_used().is_some() {
                 break;
             }
             core::hint::spin_loop();

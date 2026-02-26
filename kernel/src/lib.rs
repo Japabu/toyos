@@ -25,6 +25,7 @@ pub mod fd;
 pub mod pipe;
 pub mod message;
 pub mod device;
+pub mod net;
 pub mod user_heap;
 pub mod shared_memory;
 
