@@ -79,6 +79,15 @@ fn main() {
                             }
                             window.present();
                         }
+                        window::MOUSE_SCROLL => {
+                            let pixels = console.font_height();
+                            if ev.scroll < 0 {
+                                console.scroll_view_up(pixels);
+                            } else if ev.scroll > 0 {
+                                console.scroll_view_down(pixels);
+                            }
+                            window.present();
+                        }
                         _ => {}
                     }
                 }

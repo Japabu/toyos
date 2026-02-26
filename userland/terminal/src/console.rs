@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+
 use font::Font;
 use crate::framebuffer::{Color, Framebuffer};
 
@@ -5,6 +7,26 @@ const DEFAULT_FG: Color = Color { r: 255, g: 255, b: 255 };
 const DEFAULT_BG: Color = Color { r: 0, g: 0, b: 0 };
 const SEL_FG: Color = Color { r: 255, g: 255, b: 255 };
 const SEL_BG: Color = Color { r: 58, g: 110, b: 165 };
+const SCROLLBACK_ROWS: usize = 1000;
+const SCROLLBAR_WIDTH: usize = 6;
+const SCROLLBAR_TRACK: Color = Color { r: 0x20, g: 0x20, b: 0x20 };
+const SCROLLBAR_THUMB: Color = Color { r: 0x60, g: 0x60, b: 0x60 };
+const SCROLLBAR_THUMB_MIN: usize = 20;
+
+/// Canvas wrapper that applies a signed y-offset for pixel-level scroll clipping.
+struct ScrollCanvas<'a> {
+    fb: &'a Framebuffer,
+    y_offset: isize,
+}
+
+impl font::Canvas for ScrollCanvas<'_> {
+    fn put_pixel(&self, x: usize, y: usize, color: Color) {
+        let sy = y as isize + self.y_offset;
+        if sy >= 0 && (sy as usize) < self.fb.height() {
+            self.fb.put_pixel(x, sy as usize, color);
+        }
+    }
+}
 
 fn ansi_color(index: usize) -> Color {
     match index {
@@ -83,6 +105,12 @@ fn cell_key(ch: char, fg: Color, bg: Color) -> u64 {
         | ((bg.b as u64 >> 1) << 56)
 }
 
+struct ScrollbackRow {
+    chars: Vec<char>,
+    fg: Vec<Color>,
+    bg: Vec<Color>,
+}
+
 pub struct Console {
     fb: Framebuffer,
     font: Font,
@@ -110,6 +138,8 @@ pub struct Console {
     utf8_needed: usize,
     sel_anchor: Option<(usize, usize)>,
     sel_end: Option<(usize, usize)>,
+    scrollback: VecDeque<ScrollbackRow>,
+    scroll_pixel_offset: usize,
 }
 
 impl Console {
@@ -143,6 +173,8 @@ impl Console {
             utf8_needed: 0,
             sel_anchor: None,
             sel_end: None,
+            scrollback: VecDeque::new(),
+            scroll_pixel_offset: 0,
         };
 
         console.fb.clear(DEFAULT_BG);
@@ -201,8 +233,18 @@ impl Console {
     }
 
     fn scroll(&mut self) {
-        self.fb.scroll_up(self.font.height(), self.bg);
+        // Save the top row to scrollback
         let row_size = self.cols;
+        self.scrollback.push_back(ScrollbackRow {
+            chars: self.char_buf[..row_size].to_vec(),
+            fg: self.fg_buf[..row_size].to_vec(),
+            bg: self.bg_buf[..row_size].to_vec(),
+        });
+        if self.scrollback.len() > SCROLLBACK_ROWS {
+            self.scrollback.pop_front();
+        }
+
+        self.fb.scroll_up(self.font.height(), self.bg);
         self.char_buf.copy_within(row_size.., 0);
         self.fg_buf.copy_within(row_size.., 0);
         self.bg_buf.copy_within(row_size.., 0);
@@ -257,6 +299,7 @@ impl Console {
                 }
             }
         }
+        self.draw_scrollbar();
     }
 
     fn emit_char(&mut self, ch: char) {
@@ -589,6 +632,7 @@ impl Console {
         self.saved_screen = None;
         self.sel_anchor = None;
         self.sel_end = None;
+        self.scroll_pixel_offset = 0;
         self.redraw_all();
     }
 
@@ -715,8 +759,125 @@ impl Console {
         }
     }
 
+    /// Scroll the view up (into history) by `pixels` pixels.
+    pub fn scroll_view_up(&mut self, pixels: usize) {
+        let fh = self.font.height();
+        let max_offset = self.scrollback.len() * fh;
+        let new_offset = (self.scroll_pixel_offset + pixels).min(max_offset);
+        if new_offset == self.scroll_pixel_offset {
+            return;
+        }
+        self.scroll_pixel_offset = new_offset;
+        self.redraw_scrollback_view();
+    }
+
+    /// Scroll the view down (toward present) by `pixels` pixels.
+    pub fn scroll_view_down(&mut self, pixels: usize) {
+        if self.scroll_pixel_offset == 0 {
+            return;
+        }
+        let new_offset = self.scroll_pixel_offset.saturating_sub(pixels);
+        self.scroll_pixel_offset = new_offset;
+        if new_offset == 0 {
+            self.redraw_all();
+            self.draw_cursor();
+        } else {
+            self.redraw_scrollback_view();
+        }
+    }
+
+    fn scroll_to_bottom(&mut self) {
+        if self.scroll_pixel_offset > 0 {
+            self.scroll_pixel_offset = 0;
+            self.redraw_all();
+        }
+    }
+
+    /// Redraw the screen showing scrollback + current buffer content with pixel-level offset.
+    fn redraw_scrollback_view(&mut self) {
+        let fh = self.font.height();
+        let fw = self.font.width();
+        let sb_len = self.scrollback.len();
+        let viewport_height = self.rows * fh;
+
+        // viewport_top is the content-y of the top of the viewport.
+        // Content: scrollback rows [0..sb_len] then current buffer rows [0..self.rows].
+        // Total content rows = sb_len + self.rows.
+        // When scroll_pixel_offset=0, viewport_top = sb_len * fh (shows current buffer).
+        // When scroll_pixel_offset=max, viewport_top = 0 (shows top of scrollback).
+        let viewport_top = sb_len * fh - self.scroll_pixel_offset;
+
+        let canvas = ScrollCanvas {
+            fb: &self.fb,
+            y_offset: -(viewport_top as isize),
+        };
+
+        self.fb.clear(DEFAULT_BG);
+        self.rendered.fill(0);
+
+        // Determine visible row range in total content
+        let first_row = viewport_top / fh;
+        let last_row = ((viewport_top + viewport_height + fh - 1) / fh).min(sb_len + self.rows);
+
+        for row_idx in first_row..last_row {
+            let content_y = row_idx * fh;
+            if row_idx < sb_len {
+                // Scrollback row
+                let sb_row = &self.scrollback[row_idx];
+                let cols_to_draw = sb_row.chars.len().min(self.cols);
+                for col in 0..cols_to_draw {
+                    let ch = sb_row.chars[col];
+                    let fg = sb_row.fg[col];
+                    let bg = sb_row.bg[col];
+                    if ch != ' ' || bg != DEFAULT_BG {
+                        self.font.draw_char(&canvas, col * fw, content_y, ch, fg, bg);
+                    }
+                }
+            } else {
+                // Current buffer row
+                let buf_row = row_idx - sb_len;
+                for col in 0..self.cols {
+                    let idx = buf_row * self.cols + col;
+                    let ch = self.char_buf[idx];
+                    let fg = self.fg_buf[idx];
+                    let bg = self.bg_buf[idx];
+                    if ch != ' ' || bg != DEFAULT_BG {
+                        self.font.draw_char(&canvas, col * fw, content_y, ch, fg, bg);
+                    }
+                }
+            }
+        }
+
+        self.draw_scrollbar();
+    }
+
+    fn draw_scrollbar(&self) {
+        if self.scrollback.is_empty() {
+            return;
+        }
+        let fh = self.font.height();
+        let viewport_height = self.rows * fh;
+        let total_content = (self.scrollback.len() + self.rows) * fh;
+        let max_scroll = self.scrollback.len() * fh;
+        let x = self.fb.width() - SCROLLBAR_WIDTH;
+
+        // Track
+        self.fb.fill_rect(x, 0, SCROLLBAR_WIDTH, viewport_height, SCROLLBAR_TRACK);
+
+        // Thumb
+        let thumb_height = (viewport_height * viewport_height / total_content).max(SCROLLBAR_THUMB_MIN);
+        let track_range = viewport_height.saturating_sub(thumb_height);
+        let thumb_top = if max_scroll > 0 {
+            track_range - (self.scroll_pixel_offset * track_range / max_scroll)
+        } else {
+            track_range
+        };
+        self.fb.fill_rect(x, thumb_top, SCROLLBAR_WIDTH, thumb_height, SCROLLBAR_THUMB);
+    }
+
     pub fn write_bytes(&mut self, bytes: &[u8]) {
         self.clear_selection();
+        self.scroll_to_bottom();
         self.erase_cursor();
         for &byte in bytes {
             self.write_byte(byte);

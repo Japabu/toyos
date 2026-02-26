@@ -86,6 +86,21 @@ impl Framebuffer {
         self.fill_rows(0, self.height, color);
     }
 
+    pub fn fill_rect(&self, x: usize, y: usize, w: usize, h: usize, color: Color) {
+        let pixel = self.encode_pixel(color);
+        let x_end = (x + w).min(self.width);
+        let y_end = (y + h).min(self.height);
+        for py in y..y_end {
+            let row_offset = py * self.stride * 4;
+            for px in x..x_end {
+                unsafe {
+                    let dst = self.addr.add(row_offset + px * 4);
+                    ptr::write_volatile(dst as *mut [u8; 4], pixel);
+                }
+            }
+        }
+    }
+
     pub fn scroll_up(&self, pixel_rows: usize, bg: Color) {
         let row_bytes = self.stride * 4;
         unsafe {
