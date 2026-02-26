@@ -1,5 +1,4 @@
 mod console;
-mod framebuffer;
 
 use std::io::{Read, Write};
 use std::os::toyos::io::{self, AsRawFd};
@@ -18,13 +17,7 @@ fn main() {
 
     let mut window = Window::create_with_title(0, 0, "Terminal");
     io::set_screen_size(window.width(), window.height());
-    let fb = framebuffer::Framebuffer::new(
-        window.buffer_ptr() as u64,
-        window.width(),
-        window.height(),
-        window.width(),
-        window.pixel_format(),
-    );
+    let fb = window.framebuffer();
     let font_data = std::fs::read("/initrd/JetBrainsMono-8x16.font").expect("failed to read font");
     let font = font::Font::from_prebuilt(&font_data);
     let mut console = console::Console::new(fb, font);
@@ -95,14 +88,7 @@ fn main() {
                 window::Event::Close => break,
                 window::Event::Resized => {
                     io::set_screen_size(window.width(), window.height());
-                    let fb = framebuffer::Framebuffer::new(
-                        window.buffer_ptr() as u64,
-                        window.width(),
-                        window.height(),
-                        window.width(),
-                        window.pixel_format(),
-                    );
-                    console.resize(fb);
+                    console.resize(window.framebuffer());
                     window.present();
                 }
             }

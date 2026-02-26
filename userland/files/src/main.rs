@@ -1,11 +1,8 @@
-mod framebuffer;
-
 use std::fs;
 use std::path::PathBuf;
 
-use framebuffer::{Color, Framebuffer};
 use sprite::Sprite;
-use window::Window;
+use window::{Color, Framebuffer, Window};
 
 const BG: Color = Color { r: 0x1e, g: 0x1e, b: 0x2e };
 const TEXT_COLOR: Color = Color { r: 0xe0, g: 0xe0, b: 0xe8 };
@@ -55,13 +52,7 @@ struct FileBrowser {
 impl FileBrowser {
     fn new() -> Self {
         let window = Window::create_with_title(0, 0, "Files");
-        let fb = Framebuffer::new(
-            window.buffer_ptr() as u64,
-            window.width(),
-            window.height(),
-            window.width(),
-            window.pixel_format(),
-        );
+        let fb = window.framebuffer();
 
         let font_data = fs::read("/initrd/JetBrainsMono-8x16.font").expect("failed to read font");
         let font = font::Font::from_prebuilt(&font_data);
@@ -358,13 +349,7 @@ impl FileBrowser {
                     }
                 }
                 window::Event::Resized => {
-                    self.fb = Framebuffer::new(
-                        self.window.buffer_ptr() as u64,
-                        self.window.width(),
-                        self.window.height(),
-                        self.window.width(),
-                        self.window.pixel_format(),
-                    );
+                    self.fb = self.window.framebuffer();
                     self.scroll_y = self.scroll_y.min(self.max_scroll());
                     self.redraw();
                     self.window.present();

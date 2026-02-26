@@ -141,7 +141,10 @@ fn main() {
         .arg("-no-reboot")
 
         // Enable gdb at port 1234
-        .arg("-s");
+        .arg("-s")
+
+        // QMP socket for programmatic control
+        .arg("-qmp").arg("unix:/tmp/toyos-qmp.sock,server,nowait");
 
     if debug {
         eprintln!("Debug mode: kernel will wait for debugger before entering userland");

@@ -1,11 +1,8 @@
-mod framebuffer;
-
 use std::collections::VecDeque;
 use std::fs;
 use std::os::toyos::io;
 
-use framebuffer::{Color, Framebuffer};
-use window::Window;
+use window::{Color, Framebuffer, Window};
 
 const CELL: usize = 16;
 const HEADER: usize = 24;
@@ -91,13 +88,7 @@ struct Game {
 impl Game {
     fn new() -> Self {
         let window = Window::create_with_title(0, 0, "Snake");
-        let fb = Framebuffer::new(
-            window.buffer_ptr() as u64,
-            window.width(),
-            window.height(),
-            window.width(),
-            window.pixel_format(),
-        );
+        let fb = window.framebuffer();
         let font_data = fs::read("/initrd/JetBrainsMono-8x16.font").expect("font");
         let font = font::Font::from_prebuilt(&font_data);
         let rng = Rng::new();
@@ -256,13 +247,7 @@ impl Game {
     }
 
     fn handle_resize(&mut self) {
-        self.fb = Framebuffer::new(
-            self.window.buffer_ptr() as u64,
-            self.window.width(),
-            self.window.height(),
-            self.window.width(),
-            self.window.pixel_format(),
-        );
+        self.fb = self.window.framebuffer();
         self.cols = self.fb.width() / CELL;
         self.rows = (self.fb.height() - HEADER) / CELL;
         let snake_oob = self.snake.iter().any(|&(x, y)| x >= self.cols || y >= self.rows);

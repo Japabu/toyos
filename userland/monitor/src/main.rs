@@ -1,8 +1,5 @@
-mod framebuffer;
-
 use std::os::toyos::io;
-use framebuffer::{Color, Framebuffer};
-use window::Window;
+use window::{Color, Framebuffer, Window};
 
 const BG: Color = Color { r: 0x1e, g: 0x1e, b: 0x2e };
 const FG: Color = Color { r: 0xcd, g: 0xd6, b: 0xf4 };
@@ -221,13 +218,7 @@ fn render(fb: &Framebuffer, font: &font::Font, info: &SysInfo) {
 
 fn main() {
     let mut window = Window::create_with_title(480, 400, "Monitor");
-    let mut fb = Framebuffer::new(
-        window.buffer_ptr() as u64,
-        window.width(),
-        window.height(),
-        window.width(),
-        window.pixel_format(),
-    );
+    let mut fb = window.framebuffer();
     let font_data = std::fs::read("/initrd/JetBrainsMono-8x16.font").expect("failed to read font");
     let font = font::Font::from_prebuilt(&font_data);
 
@@ -244,13 +235,7 @@ fn main() {
                 window.present();
             }
             window::Event::Resized => {
-                fb = Framebuffer::new(
-                    window.buffer_ptr() as u64,
-                    window.width(),
-                    window.height(),
-                    window.width(),
-                    window.pixel_format(),
-                );
+                fb = window.framebuffer();
                 let info = query_sysinfo();
                 render(&fb, &font, &info);
                 window.present();

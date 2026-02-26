@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 
 use font::Font;
-use crate::framebuffer::{Color, Framebuffer};
+use window::{Color, Framebuffer};
 
 const DEFAULT_FG: Color = Color { r: 255, g: 255, b: 255 };
 const DEFAULT_BG: Color = Color { r: 0, g: 0, b: 0 };

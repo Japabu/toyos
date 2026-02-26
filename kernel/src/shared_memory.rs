@@ -106,26 +106,36 @@ pub fn map(token: u32, caller_pid: u32, caller_pml4: *mut u64) -> Option<u64> {
     Some(region.phys_addr)
 }
 
-/// Free a shared region owned by the caller. Unmaps from all processes that mapped it.
-pub fn free(token: u32, caller_pid: u32) -> bool {
+/// Release a process's mapping of a shared region. Any mapped process can call this.
+/// Unmaps only from the caller's page tables. If no mappings remain, deallocates.
+pub fn release(token: u32, caller_pid: u32, caller_pml4: *mut u64) -> bool {
     let mut guard = REGIONS.lock();
     let regions = guard.as_mut().expect("shared_memory not initialized");
     let Some(pos) = regions.iter().position(|(t, _)| *t == token) else {
         return false;
     };
-    if regions[pos].1.owner_pid != caller_pid {
-        return false;
-    }
-    let (_, region) = regions.swap_remove(pos);
 
-    // Unmap from all processes (safe: we hold REGIONS lock so no concurrent cleanup_process)
-    for &(_, pml4) in &region.mapped_in {
-        paging::unmap_user(pml4, region.phys_addr, region.size);
+    let region = &mut regions[pos].1;
+
+    // Unmap from caller's page tables
+    if let Some(idx) = region.mapped_in.iter().position(|&(p, _)| p == caller_pid) {
+        paging::unmap_user(caller_pml4, region.phys_addr, region.size);
+        region.mapped_in.swap_remove(idx);
     }
 
-    if let Some(layout) = region.layout {
-        unsafe { dealloc(region.phys_addr as *mut u8, layout); }
+    // Remove from allowed list
+    if let Some(idx) = region.allowed.iter().position(|&p| p == caller_pid) {
+        region.allowed.swap_remove(idx);
     }
+
+    // If no mappings remain, deallocate
+    if region.mapped_in.is_empty() {
+        let (_, region) = regions.swap_remove(pos);
+        if let Some(layout) = region.layout {
+            unsafe { dealloc(region.phys_addr as *mut u8, layout); }
+        }
+    }
+
     true
 }
 
@@ -146,7 +156,8 @@ pub fn cleanup_process(pid: u32, pml4: *mut u64) {
         }
     }
 
-    // Free regions owned by this process, unmapping from all other processes
+    // Free regions owned by this process (unmapping all other processes),
+    // and deallocate any regions left with no mappings (owner already released).
     let mut i = 0;
     while i < regions.len() {
         if regions[i].1.owner_pid == pid {
@@ -154,6 +165,11 @@ pub fn cleanup_process(pid: u32, pml4: *mut u64) {
             for &(_, mapped_pml4) in &region.mapped_in {
                 paging::unmap_user(mapped_pml4, region.phys_addr, region.size);
             }
+            if let Some(layout) = region.layout {
+                unsafe { dealloc(region.phys_addr as *mut u8, layout); }
+            }
+        } else if regions[i].1.mapped_in.is_empty() {
+            let (_, region) = regions.swap_remove(i);
             if let Some(layout) = region.layout {
                 unsafe { dealloc(region.phys_addr as *mut u8, layout); }
             }

@@ -1,3 +1,7 @@
+pub mod framebuffer;
+
+pub use framebuffer::{Color, Framebuffer};
+
 use std::os::toyos::io;
 use std::os::toyos::message::{self, Message};
 use std::sync::OnceLock;
@@ -47,6 +51,16 @@ pub struct MouseEvent {
 #[repr(C)]
 pub struct WindowInfo {
     pub token: u32,
+    pub width: u32,
+    pub height: u32,
+    pub stride: u32,
+    pub pixel_format: u32,
+}
+
+#[repr(C)]
+pub struct ResizeInfo {
+    pub token: u32,
+    pub old_token: u32,
     pub width: u32,
     pub height: u32,
     pub stride: u32,
@@ -150,7 +164,8 @@ impl Window {
             MSG_KEY_INPUT => Event::KeyInput(msg.take_payload()),
             MSG_MOUSE_INPUT => Event::MouseInput(msg.take_payload()),
             MSG_WINDOW_RESIZED => {
-                let info: WindowInfo = msg.take_payload();
+                let info: ResizeInfo = msg.take_payload();
+                io::release_shared(info.old_token);
                 self.buffer = io::map_shared(info.token);
                 self.width = info.width;
                 self.height = info.height;
@@ -168,10 +183,6 @@ impl Window {
         message::send(compositor_pid(), Message::signal(MSG_PRESENT));
     }
 
-    pub fn buffer_ptr(&self) -> *mut u8 {
-        self.buffer
-    }
-
     pub fn width(&self) -> u32 {
         self.width
     }
@@ -180,7 +191,13 @@ impl Window {
         self.height
     }
 
-    pub fn pixel_format(&self) -> u32 {
-        self.pixel_format
+    pub fn framebuffer(&self) -> Framebuffer {
+        Framebuffer::new(
+            self.buffer,
+            self.width as usize,
+            self.height as usize,
+            self.width as usize,
+            self.pixel_format,
+        )
     }
 }

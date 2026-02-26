@@ -48,7 +48,7 @@ const SYS_GPU_PRESENT: u64 = 35;
 const SYS_ALLOC_SHARED: u64 = 36;
 const SYS_GRANT_SHARED: u64 = 37;
 const SYS_MAP_SHARED: u64 = 38;
-const SYS_FREE_SHARED: u64 = 39;
+const SYS_RELEASE_SHARED: u64 = 39;
 const SYS_THREAD_SPAWN: u64 = 40;
 const SYS_THREAD_JOIN: u64 = 41;
 const SYS_CLOCK_REALTIME: u64 = 42;
@@ -224,7 +224,7 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         SYS_ALLOC_SHARED => sys_alloc_shared(a1),
         SYS_GRANT_SHARED => sys_grant_shared(a1, a2),
         SYS_MAP_SHARED => sys_map_shared(a1),
-        SYS_FREE_SHARED => sys_free_shared(a1),
+        SYS_RELEASE_SHARED => sys_release_shared(a1),
         SYS_THREAD_SPAWN => process::spawn_thread(a1, a2, a3),
         SYS_THREAD_JOIN => sys_thread_join(a1),
         SYS_CLOCK_REALTIME => crate::rtc::read_time(),
@@ -583,9 +583,10 @@ fn sys_map_shared(token: u64) -> u64 {
     }
 }
 
-fn sys_free_shared(token: u64) -> u64 {
+fn sys_release_shared(token: u64) -> u64 {
     let pid = process::current_pid();
-    if shared_memory::free(token as u32, pid) { 0 } else { u64::MAX }
+    let pml4 = process::with_current(|p| p.cr3 as *mut u64);
+    if shared_memory::release(token as u32, pid, pml4) { 0 } else { u64::MAX }
 }
 
 fn sys_thread_join(tid: u64) -> u64 {

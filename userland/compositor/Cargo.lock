@@ -322,6 +322,9 @@ dependencies = [
 [[package]]
 name = "window"
 version = "0.1.0"
+dependencies = [
+ "font",
+]
 
 [[package]]
 name = "xmlwriter"

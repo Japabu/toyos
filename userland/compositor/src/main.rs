@@ -1,10 +1,8 @@
-mod framebuffer;
-
 use std::os::toyos::io;
 use std::os::toyos::message::{self, Message};
 use std::process::Command;
 
-use framebuffer::{Color, Framebuffer};
+use window::{Color, Framebuffer};
 
 const TITLE_BAR_HEIGHT: usize = 28;
 const BORDER_WIDTH: usize = 1;
@@ -141,7 +139,7 @@ fn focused_window_idx(windows: &[WindowState]) -> Option<usize> {
 }
 
 fn resize_window(win: &mut WindowState, new_w: usize, new_h: usize, pixel_format: u32) {
-    io::free_shared(win.token);
+    let old_token = win.token;
     let buf_size = new_w * new_h * 4;
     let token = io::alloc_shared(buf_size);
     let buffer = io::map_shared(token);
@@ -157,8 +155,9 @@ fn resize_window(win: &mut WindowState, new_w: usize, new_h: usize, pixel_format
         win.pid,
         Message::new(
             window::MSG_WINDOW_RESIZED,
-            window::WindowInfo {
+            window::ResizeInfo {
                 token,
+                old_token,
                 width: new_w as u32,
                 height: new_h as u32,
                 stride: new_w as u32,
@@ -166,6 +165,7 @@ fn resize_window(win: &mut WindowState, new_w: usize, new_h: usize, pixel_format
             },
         ),
     );
+    io::release_shared(old_token);
 }
 
 fn save_if_normal(win: &mut WindowState) {
@@ -256,7 +256,7 @@ fn draw_icon_centered(
 ) {
     let ix = area_x + area_w.saturating_sub(icon.width()) / 2;
     let iy = area_y + area_h.saturating_sub(icon.height()) / 2;
-    screen.draw_sprite(icon, ix, iy);
+    icon.draw(screen.ptr(), screen.stride(), screen.width(), screen.height(), screen.pixel_format_raw(), ix, iy);
 }
 
 fn launcher_rect(windows: &[WindowState], screen_h: i32) -> (i32, i32, i32, i32) {
@@ -616,12 +616,12 @@ fn main() {
     let fb_fd = io::open_device(io::DeviceType::Framebuffer).expect("failed to claim framebuffer");
 
     let fb_info = read_fb_info(fb_fd);
-    let fb_addr = io::map_shared(fb_info.token[0]) as u64;
+    let fb_addr = io::map_shared(fb_info.token[0]);
     let screen = Framebuffer::new(
         fb_addr,
-        fb_info.width,
-        fb_info.height,
-        fb_info.stride,
+        fb_info.width as usize,
+        fb_info.height as usize,
+        fb_info.stride as usize,
         fb_info.pixel_format,
     );
 
