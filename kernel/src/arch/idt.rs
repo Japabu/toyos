@@ -1,5 +1,5 @@
 use core::arch::naked_asm;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use super::cpu;
 use super::cpu::{outb, io_wait};
@@ -16,6 +16,14 @@ static CPU_TOTAL_TICKS: AtomicU64 = AtomicU64::new(0);
 pub fn cpu_ticks() -> (u64, u64) {
     (CPU_BUSY_TICKS.load(Ordering::Relaxed), CPU_TOTAL_TICKS.load(Ordering::Relaxed))
 }
+
+/// Atomically check and clear the xHCI interrupt pending flag.
+pub fn xhci_irq_pending() -> bool {
+    XHCI_IRQ_PENDING.swap(0, Ordering::Acquire) != 0
+}
+
+#[no_mangle]
+static XHCI_IRQ_PENDING: AtomicU32 = AtomicU32::new(0);
 
 // PIC ports
 const PIC1_CMD: u16 = 0x20;
@@ -35,6 +43,9 @@ const PF_INSTRUCTION_FETCH: u64 = 1 << 4;
 
 // Timer vector
 const VECTOR_TIMER: usize = 0x20;
+
+// xHCI MSI-X vector
+const VECTOR_XHCI: usize = 0x21;
 
 // IPI vectors
 const VECTOR_TLB_FLUSH: usize = 0xFE;
@@ -166,6 +177,7 @@ pub fn init() {
         idt.entries[VECTOR_GPF as usize] = IdtEntry::new(gpf_entry as u64);
         idt.entries[VECTOR_PAGE_FAULT as usize] = IdtEntry::new(page_fault_entry as u64);
         idt.entries[VECTOR_TIMER] = IdtEntry::new(timer_entry as u64);
+        idt.entries[VECTOR_XHCI] = IdtEntry::new(xhci_entry as u64);
         idt.entries[VECTOR_TLB_FLUSH] = IdtEntry::new(tlb_flush_entry as u64);
     }
 
@@ -178,6 +190,23 @@ pub fn init() {
         cpu::lidt(&ptr as *const IdtPointer as *const u8);
         cpu::enable_interrupts();
     }
+}
+
+// --- xHCI MSI-X handler (vector 0x21) ---
+// Minimal: set atomic flag + EOI. No lock acquisition.
+#[unsafe(naked)]
+extern "C" fn xhci_entry() {
+    naked_asm!(
+        "push rax",
+        "push rdx",
+        "lock bts dword ptr [rip + {flag}], 0",
+        "mov rdx, [rip + LAPIC_BASE]",
+        "mov dword ptr [rdx + 0xB0], 0",
+        "pop rdx",
+        "pop rax",
+        "iretq",
+        flag = sym XHCI_IRQ_PENDING,
+    );
 }
 
 // --- TLB flush IPI handler (vector 0xFE) ---

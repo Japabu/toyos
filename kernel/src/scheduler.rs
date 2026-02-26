@@ -153,7 +153,10 @@ fn cpu_idle_loop() -> ! {
                 continue;
             }
         }
-        core::hint::spin_loop();
+        // Halt until next interrupt (timer at 100Hz or xHCI MSI-X).
+        // `sti; hlt` atomically enables interrupts and halts — any pending
+        // interrupt will wake the CPU immediately.
+        unsafe { core::arch::asm!("sti; hlt", options(nomem, nostack)); }
     }
 }
 
@@ -171,9 +174,9 @@ fn poll_has_ready_fd(poll_fds: &[u64; 8], len: u32, fds: &fd::FdTable) -> bool {
 
 /// Poll for I/O and wake blocked processes.
 fn idle_poll(table: &mut ProcessTable) {
-    // USB polling only on BSP
+    // Process USB events only when MSI-X interrupt fired (BSP only)
     if percpu::cpu_id() == 0 {
-        crate::drivers::xhci::poll_global();
+        crate::drivers::xhci::poll_if_pending();
     }
 
     let kb_ready = keyboard::has_data();
@@ -217,8 +220,6 @@ fn idle_poll(table: &mut ProcessTable) {
             _ => {}
         }
     }
-
-    core::hint::spin_loop();
 }
 
 /// Wake processes blocked on reading from a pipe that now has data.

@@ -444,7 +444,7 @@ fn sys_poll(fds_ptr: u64, fds_len: u64, timeout_nanos: u64) -> u64 {
         0
     };
     loop {
-        crate::drivers::xhci::poll_global();
+        crate::drivers::xhci::poll_if_pending();
         let result = process::with_current(|proc| {
             let mut mask: u64 = 0;
             for (i, &fd) in fds.iter().enumerate() {

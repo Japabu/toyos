@@ -37,6 +37,10 @@ impl Capability<'_> {
     pub fn read_u32(&self, field: u64) -> u32 {
         self.device.read_config_u32(self.offset + field)
     }
+
+    pub fn write_u16(&self, field: u64, val: u16) {
+        self.device.write_config_u16(self.offset + field, val)
+    }
 }
 
 /// PCI device identified by ECAM base + Bus/Device/Function.
@@ -79,6 +83,14 @@ impl PciDevice {
     /// Read a 64-bit Base Address Register by index (0–5).
     pub fn read_bar_64(&self, index: u8) -> u64 {
         self.mmio.read_u64(BAR_BASE + index as u64 * 4) & !0xF
+    }
+
+    pub fn write_config_u16(&self, offset: u64, val: u16) {
+        self.mmio.write_u16(offset, val)
+    }
+
+    pub fn write_config_u32(&self, offset: u64, val: u32) {
+        self.mmio.write_u32(offset, val)
     }
 
     /// Enable memory space access and bus mastering in PCI command register.

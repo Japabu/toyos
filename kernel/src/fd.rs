@@ -134,7 +134,7 @@ pub fn try_read(table: &mut FdTable, fd: u64, buf: &mut [u8]) -> Option<u64> {
             pipe::try_read(*id, buf).map(|n| n as u64)
         }
         Descriptor::Keyboard => {
-            crate::drivers::xhci::poll_global();
+            crate::drivers::xhci::poll_if_pending();
             let event_size = core::mem::size_of::<keyboard::RawKeyEvent>();
             let mut count = 0;
             while count + event_size <= buf.len() {
@@ -149,7 +149,7 @@ pub fn try_read(table: &mut FdTable, fd: u64, buf: &mut [u8]) -> Option<u64> {
             if count > 0 { Some(count as u64) } else { None }
         }
         Descriptor::Mouse => {
-            crate::drivers::xhci::poll_global();
+            crate::drivers::xhci::poll_if_pending();
             let event_size = core::mem::size_of::<mouse::MouseEvent>();
             let mut count = 0;
             while count + event_size <= buf.len() {

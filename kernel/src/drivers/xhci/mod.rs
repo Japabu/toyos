@@ -47,9 +47,16 @@ const PORTSC_RW1C: u32 = PORTSC_CSC | (1 << 18) | (1 << 19) | (1 << 20)
 // Runtime Register offsets (from rt_base = BAR0 + rts_offset)
 // Interrupter 0 starts at offset 0x20
 // ---------------------------------------------------------------------------
+const IR0_IMAN:   u64 = 0x20; // Interrupt Management (IP + IE)
+const IR0_IMOD:   u64 = 0x24; // Interrupt Moderation
 const IR0_ERSTSZ: u64 = 0x28;
 const IR0_ERSTBA: u64 = 0x30; // 64-bit
 const IR0_ERDP:   u64 = 0x38; // 64-bit
+
+// MSI-X PCI capability ID
+const PCI_CAP_MSIX: u8 = 0x11;
+// xHCI interrupt vector
+const XHCI_VECTOR: u8 = 0x21;
 
 // ---------------------------------------------------------------------------
 // TRB (Transfer Request Block) — 16 bytes
@@ -167,6 +174,7 @@ fn setup_packet(bm_request_type: u8, b_request: u8, w_value: u16, w_index: u16, 
 // ---------------------------------------------------------------------------
 pub struct XhciController {
     // Base addresses (MMIO)
+    op_base: Mmio,
     db_base: Mmio,
     rt_base: Mmio,
 
@@ -229,7 +237,8 @@ impl XhciController {
             self.event_phase = !self.event_phase;
         }
         let erdp = dma_page(3) + (self.event_head as u64) * 16;
-        self.rt_base.write_u64(IR0_ERDP, erdp | (1 << 3));
+        self.rt_base.write_u64(IR0_ERDP, erdp | (1 << 3)); // EHB clears interrupt pending
+        self.rt_base.write_u32(IR0_IMAN, 3); // clear IP (W1C) + keep IE
     }
 
     // -------------------------------------------------------------------
@@ -359,11 +368,51 @@ pub fn set_global(ctrl: XhciController) {
     *XHCI.lock() = Some(ctrl);
 }
 
-pub fn poll_global() {
-    let mut guard = XHCI.lock();
-    if let Some(ctrl) = guard.as_mut() {
-        ctrl.poll();
+/// Process xHCI events only if an MSI-X interrupt fired.
+pub fn poll_if_pending() {
+    if crate::arch::idt::xhci_irq_pending() {
+        let mut guard = XHCI.lock();
+        if let Some(ctrl) = guard.as_mut() {
+            ctrl.poll();
+        }
     }
+}
+
+// ---------------------------------------------------------------------------
+// MSI-X configuration
+// ---------------------------------------------------------------------------
+
+fn setup_msix(pci_dev: &PciDevice) {
+    let cap = pci_dev.capabilities().find(|c| c.id() == PCI_CAP_MSIX);
+    let cap = match cap {
+        Some(c) => c,
+        None => {
+            log!("xHCI: no MSI-X capability, using polled mode");
+            return;
+        }
+    };
+
+    // Read MSI-X table location
+    let table_info = cap.read_u32(4);
+    let table_bir = (table_info & 0x7) as u8;
+    let table_offset = (table_info & !0x7) as u64;
+    let table_bar = pci_dev.read_bar_64(table_bir);
+    let table_addr = table_bar + table_offset;
+
+    crate::arch::paging::map_kernel(table_addr, 0x1000);
+    let table = Mmio::new(table_addr);
+
+    // Configure entry 0: route to LAPIC with vector XHCI_VECTOR
+    table.write_u32(0x00, 0xFEE0_0000); // msg_addr_lo: LAPIC base
+    table.write_u32(0x04, 0);            // msg_addr_hi
+    table.write_u32(0x08, XHCI_VECTOR as u32); // msg_data: vector
+    table.write_u32(0x0C, 0);            // vector control: unmask
+
+    // Enable MSI-X in capability (bit 15), clear function mask (bit 14)
+    let msg_ctrl = cap.read_u16(2);
+    cap.write_u16(2, (msg_ctrl | (1 << 15)) & !(1 << 14));
+
+    log!("xHCI: MSI-X enabled (vector {:#x})", XHCI_VECTOR);
 }
 
 // ---------------------------------------------------------------------------
@@ -379,6 +428,9 @@ pub fn init(ecam_base: u64) -> Option<XhciController> {
     log!("xHCI: BAR0={:#x}", bar.addr());
 
     crate::arch::paging::map_kernel(bar.addr(), 0x10000);
+
+    // Configure MSI-X
+    setup_msix(&pci_dev);
 
     let cap_length = bar.read_u8(CAP_CAPLENGTH) as u64;
     let hcsparams1 = bar.read_u32(CAP_HCSPARAMS1);
@@ -455,6 +507,10 @@ pub fn init(ecam_base: u64) -> Option<XhciController> {
     rt_base.write_u64(IR0_ERDP, dma_page(3));
     rt_base.write_u64(IR0_ERSTBA, dma_page(2));
 
+    // Enable interrupter 0: set IE (bit 1) in IMAN, no moderation
+    rt_base.write_u32(IR0_IMOD, 0);
+    rt_base.write_u32(IR0_IMAN, 3); // clear IP (W1C) + set IE
+
     // EP0 Ring (will be reset per device)
     let ep0_ring = dma_page(6) as *mut Trb;
     let mut ep0_link = Trb::ZERO;
@@ -462,14 +518,15 @@ pub fn init(ecam_base: u64) -> Option<XhciController> {
     ep0_link.control = TRB_LINK | (1 << 1);
     unsafe { write_volatile(ep0_ring.add(RING_SIZE - 1), ep0_link); }
 
-    // Start controller
-    op_base.write_u32(OP_USBCMD, 1);
+    // Start controller (R/S + INTE for interrupt delivery)
+    op_base.write_u32(OP_USBCMD, 1 | (1 << 2));
     while op_base.read_u32(OP_USBSTS) & 1 != 0 {
         core::hint::spin_loop();
     }
     log!("xHCI: controller started");
 
     let mut ctrl = XhciController {
+        op_base,
         db_base,
         rt_base,
         context_size,
