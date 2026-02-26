@@ -34,6 +34,22 @@ const TASKBAR_NEW_COLOR: Color = Color { r: 0x40, g: 0x60, b: 0x40 };
 const TASKBAR_NEW_TEXT: Color = Color { r: 0x80, g: 0xc0, b: 0x80 };
 const TASKBAR_MINIMIZED_COLOR: Color = Color { r: 0x20, g: 0x20, b: 0x30 };
 const TASKBAR_MINIMIZED_TEXT: Color = Color { r: 0x50, g: 0x50, b: 0x60 };
+const LAUNCHER_WIDTH: usize = 160;
+const LAUNCHER_ITEM_HEIGHT: usize = 28;
+const LAUNCHER_BG: Color = Color { r: 0x20, g: 0x20, b: 0x30 };
+const LAUNCHER_HOVER: Color = Color { r: 0x35, g: 0x35, b: 0x50 };
+const LAUNCHER_TEXT: Color = Color { r: 0xe0, g: 0xe0, b: 0xe8 };
+
+struct LauncherEntry {
+    name: &'static str,
+    path: &'static str,
+}
+
+const LAUNCHER_APPS: &[LauncherEntry] = &[
+    LauncherEntry { name: "Terminal", path: "/initrd/terminal" },
+    LauncherEntry { name: "Files", path: "/initrd/files" },
+    LauncherEntry { name: "Editor", path: "/initrd/kibi" },
+];
 
 #[repr(C)]
 struct FramebufferInfo {
@@ -110,6 +126,7 @@ enum HitZone {
     ResizeCorner(usize),
     TaskbarItem(usize),
     TaskbarNew,
+    LauncherItem(usize),
 }
 
 fn focused_window_idx(windows: &[WindowState]) -> Option<usize> {
@@ -240,7 +257,25 @@ fn draw_icon_centered(
     screen.draw_sprite(icon, ix, iy);
 }
 
-fn hit_test(windows: &[WindowState], x: i32, y: i32, screen_h: i32) -> HitZone {
+fn launcher_rect(windows: &[WindowState], screen_h: i32) -> (i32, i32, i32, i32) {
+    let lx = (windows.len() * TASKBAR_ITEM_WIDTH) as i32;
+    let lh = (LAUNCHER_APPS.len() * LAUNCHER_ITEM_HEIGHT) as i32;
+    let ly = screen_h - TASKBAR_HEIGHT as i32 - lh;
+    (lx, ly, LAUNCHER_WIDTH as i32, lh)
+}
+
+fn hit_test(windows: &[WindowState], x: i32, y: i32, screen_h: i32, launcher_open: bool) -> HitZone {
+    // Launcher popup
+    if launcher_open {
+        let (lx, ly, lw, lh) = launcher_rect(windows, screen_h);
+        if x >= lx && x < lx + lw && y >= ly && y < ly + lh {
+            let item = ((y - ly) / LAUNCHER_ITEM_HEIGHT as i32) as usize;
+            if item < LAUNCHER_APPS.len() {
+                return HitZone::LauncherItem(item);
+            }
+        }
+    }
+
     // Taskbar at bottom of screen
     if y >= screen_h - TASKBAR_HEIGHT as i32 {
         let tab_x = x as usize / TASKBAR_ITEM_WIDTH;
@@ -314,6 +349,7 @@ fn redraw(
     cursor: &sprite::Sprite,
     icons: &TitleBarIcons,
     wallpaper: &[u8],
+    launcher_open: bool,
 ) {
     screen.blit(0, 0, screen.width(), screen.height(), screen.width(), wallpaper);
 
@@ -445,6 +481,25 @@ fn redraw(
     let clock_x = screen_w - clock_w - 12;
     font.draw_string(screen, clock_x, text_y, &clock_str, TASKBAR_ACTIVE_TEXT, TASKBAR_COLOR);
 
+    // Launcher popup
+    if launcher_open {
+        let (lx, ly, lw, lh) = launcher_rect(windows, screen_h as i32);
+        screen.fill_rect(lx as usize, ly as usize, lw as usize, lh as usize, LAUNCHER_BG);
+        for (i, app) in LAUNCHER_APPS.iter().enumerate() {
+            let item_y = ly as usize + i * LAUNCHER_ITEM_HEIGHT;
+            let hover = cursor_x >= lx
+                && cursor_x < lx + lw
+                && cursor_y >= item_y as i32
+                && cursor_y < (item_y + LAUNCHER_ITEM_HEIGHT) as i32;
+            let bg = if hover { LAUNCHER_HOVER } else { LAUNCHER_BG };
+            if hover {
+                screen.fill_rect(lx as usize, item_y, lw as usize, LAUNCHER_ITEM_HEIGHT, bg);
+            }
+            let text_y = item_y + (LAUNCHER_ITEM_HEIGHT - 16) / 2;
+            font.draw_string(screen, lx as usize + 12, text_y, app.name, LAUNCHER_TEXT, bg);
+        }
+    }
+
     screen.draw_cursor(cursor_x, cursor_y, cursor);
 }
 
@@ -531,12 +586,13 @@ fn main() {
     let mut last_title_click_time: u64 = 0;
     let mut last_title_click_pid: u32 = 0;
     let mut clipboard = String::new();
+    let mut launcher_open = false;
 
     loop {
         if dirty {
             let active_cursor = match interaction {
                 Interaction::Resizing { .. } => &cursor_resize,
-                _ => match hit_test(&windows, cursor_x, cursor_y, screen_h) {
+                _ => match hit_test(&windows, cursor_x, cursor_y, screen_h, launcher_open) {
                     HitZone::ResizeCorner(_) => &cursor_resize,
                     _ => &cursor_default,
                 },
@@ -550,6 +606,7 @@ fn main() {
                 active_cursor,
                 &icons,
                 &wallpaper,
+                launcher_open,
             );
             io::gpu_present();
             screen.swap();
@@ -568,7 +625,11 @@ fn main() {
             };
             let n = io::read_fd(kb_fd, buf);
             for event in &events[..n / std::mem::size_of::<window::KeyEvent>()] {
-                if event.alt() && event.keycode == 0x2B {
+                if launcher_open && event.keycode == 0x29 {
+                    // Escape: close launcher
+                    launcher_open = false;
+                    dirty = true;
+                } else if event.alt() && event.keycode == 0x2B {
                     // Alt+Tab: rotate focus
                     if windows.len() > 1 {
                         let win = windows.pop().unwrap();
@@ -694,7 +755,7 @@ fn main() {
 
                 // Left button just pressed
                 if left && !was_left {
-                    match hit_test(&windows, cursor_x, cursor_y, screen_h) {
+                    match hit_test(&windows, cursor_x, cursor_y, screen_h, launcher_open) {
                         HitZone::CloseButton(idx) => {
                             let win = windows.remove(idx);
                             message::send(win.pid, Message::signal(window::MSG_WINDOW_CLOSE));
@@ -774,6 +835,7 @@ fn main() {
                             };
                         }
                         HitZone::Content(idx) => {
+                            launcher_open = false;
                             if idx != windows.len() - 1 {
                                 let win = windows.remove(idx);
                                 windows.push(win);
@@ -800,9 +862,15 @@ fn main() {
                             }
                         }
                         HitZone::TaskbarNew => {
-                            Command::new("/initrd/terminal").spawn().ok();
+                            launcher_open = !launcher_open;
                         }
-                        HitZone::Desktop => {}
+                        HitZone::LauncherItem(idx) => {
+                            Command::new(LAUNCHER_APPS[idx].path).spawn().ok();
+                            launcher_open = false;
+                        }
+                        HitZone::Desktop => {
+                            launcher_open = false;
+                        }
                     }
                 }
 
@@ -897,7 +965,7 @@ fn main() {
                 if scroll != 0 {
                     if let Some(idx) = focused_window_idx(&windows) {
                         if let HitZone::Content(_) =
-                            hit_test(&windows, cursor_x, cursor_y, screen_h)
+                            hit_test(&windows, cursor_x, cursor_y, screen_h, launcher_open)
                         {
                             let ev =
                                 make_mouse_event(&windows[idx], window::MOUSE_SCROLL, 0, scroll);
