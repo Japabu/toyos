@@ -54,6 +54,7 @@ pub struct WindowInfo {
 pub const MOD_SHIFT: u8 = 1;
 pub const MOD_CTRL: u8 = 2;
 pub const MOD_ALT: u8 = 4;
+pub const MOD_GUI: u8 = 8;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -70,6 +71,7 @@ impl KeyEvent {
     pub fn shift(&self) -> bool { self.modifiers & MOD_SHIFT != 0 }
     pub fn ctrl(&self) -> bool { self.modifiers & MOD_CTRL != 0 }
     pub fn alt(&self) -> bool { self.modifiers & MOD_ALT != 0 }
+    pub fn gui(&self) -> bool { self.modifiers & MOD_GUI != 0 }
 }
 
 pub enum Event {

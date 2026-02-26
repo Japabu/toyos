@@ -80,11 +80,19 @@ struct WindowState {
     buf_height: usize,
     title: String,
     minimized: bool,
-    maximized: bool,
+    mode: WindowMode,
     saved_x: usize,
     saved_y: usize,
     saved_w: usize,
     saved_h: usize,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum WindowMode {
+    Normal,
+    Maximized,
+    SnappedLeft,
+    SnappedRight,
 }
 
 struct TitleBarIcons {
@@ -142,12 +150,18 @@ fn resize_window(win: &mut WindowState, new_w: usize, new_h: usize, pixel_format
     );
 }
 
+fn save_if_normal(win: &mut WindowState) {
+    if win.mode == WindowMode::Normal {
+        win.saved_x = win.content_x;
+        win.saved_y = win.content_y;
+        win.saved_w = win.width;
+        win.saved_h = win.height;
+    }
+}
+
 fn maximize_window(win: &mut WindowState, screen_w: usize, screen_h: usize, pixel_format: u32) {
-    win.saved_x = win.content_x;
-    win.saved_y = win.content_y;
-    win.saved_w = win.width;
-    win.saved_h = win.height;
-    win.maximized = true;
+    save_if_normal(win);
+    win.mode = WindowMode::Maximized;
     win.content_x = BORDER_WIDTH;
     win.content_y = BORDER_WIDTH + TITLE_BAR_HEIGHT;
     let new_w = screen_w - BORDER_WIDTH * 2;
@@ -155,8 +169,28 @@ fn maximize_window(win: &mut WindowState, screen_w: usize, screen_h: usize, pixe
     resize_window(win, new_w, new_h, pixel_format);
 }
 
+fn snap_left(win: &mut WindowState, screen_w: usize, screen_h: usize, pixel_format: u32) {
+    save_if_normal(win);
+    win.mode = WindowMode::SnappedLeft;
+    win.content_x = BORDER_WIDTH;
+    win.content_y = BORDER_WIDTH + TITLE_BAR_HEIGHT;
+    let new_w = screen_w / 2 - BORDER_WIDTH * 2;
+    let new_h = screen_h - TASKBAR_HEIGHT - BORDER_WIDTH * 2 - TITLE_BAR_HEIGHT;
+    resize_window(win, new_w, new_h, pixel_format);
+}
+
+fn snap_right(win: &mut WindowState, screen_w: usize, screen_h: usize, pixel_format: u32) {
+    save_if_normal(win);
+    win.mode = WindowMode::SnappedRight;
+    win.content_x = screen_w / 2 + BORDER_WIDTH;
+    win.content_y = BORDER_WIDTH + TITLE_BAR_HEIGHT;
+    let new_w = screen_w / 2 - BORDER_WIDTH * 2;
+    let new_h = screen_h - TASKBAR_HEIGHT - BORDER_WIDTH * 2 - TITLE_BAR_HEIGHT;
+    resize_window(win, new_w, new_h, pixel_format);
+}
+
 fn restore_window(win: &mut WindowState, pixel_format: u32) {
-    win.maximized = false;
+    win.mode = WindowMode::Normal;
     win.content_x = win.saved_x;
     win.content_y = win.saved_y;
     let w = win.saved_w;
@@ -218,8 +252,8 @@ fn hit_test(windows: &[WindowState], x: i32, y: i32, screen_w: i32, screen_h: i3
                 return HitZone::MinimizeButton(idx);
             }
 
-            // Resize corner (not for maximized windows)
-            if !win.maximized {
+            // Resize corner (not for snapped/maximized windows)
+            if win.mode == WindowMode::Normal {
                 let corner_x = win_x + win_w - RESIZE_HANDLE_SIZE as i32;
                 let corner_y = win_y + win_h - RESIZE_HANDLE_SIZE as i32;
                 if x >= corner_x && y >= corner_y {
@@ -482,6 +516,60 @@ fn main() {
                         }
                         dirty = true;
                     }
+                } else if event.gui() {
+                    // Super+arrow: window snapping
+                    if let Some(idx) = focused_window_idx(&windows) {
+                        let pixel_format = screen.pixel_format_raw();
+                        match event.keycode {
+                            0x50 => {
+                                // Super+Left: snap left or restore
+                                if windows[idx].mode == WindowMode::SnappedLeft {
+                                    restore_window(&mut windows[idx], pixel_format);
+                                } else {
+                                    snap_left(
+                                        &mut windows[idx],
+                                        screen_w as usize,
+                                        screen_h as usize,
+                                        pixel_format,
+                                    );
+                                }
+                            }
+                            0x4F => {
+                                // Super+Right: snap right or restore
+                                if windows[idx].mode == WindowMode::SnappedRight {
+                                    restore_window(&mut windows[idx], pixel_format);
+                                } else {
+                                    snap_right(
+                                        &mut windows[idx],
+                                        screen_w as usize,
+                                        screen_h as usize,
+                                        pixel_format,
+                                    );
+                                }
+                            }
+                            0x52 => {
+                                // Super+Up: maximize or restore
+                                if windows[idx].mode == WindowMode::Maximized {
+                                    restore_window(&mut windows[idx], pixel_format);
+                                } else {
+                                    maximize_window(
+                                        &mut windows[idx],
+                                        screen_w as usize,
+                                        screen_h as usize,
+                                        pixel_format,
+                                    );
+                                }
+                            }
+                            0x51 => {
+                                // Super+Down: restore
+                                if windows[idx].mode != WindowMode::Normal {
+                                    restore_window(&mut windows[idx], pixel_format);
+                                }
+                            }
+                            _ => {}
+                        }
+                        dirty = true;
+                    }
                 } else if event.ctrl() && event.keycode == 0x11 {
                     // Ctrl+N: spawn terminal
                     Command::new("/initrd/terminal").spawn().ok();
@@ -542,7 +630,7 @@ fn main() {
                             }
                             let new_idx = windows.len() - 1;
                             let pixel_format = screen.pixel_format_raw();
-                            if windows[new_idx].maximized {
+                            if windows[new_idx].mode != WindowMode::Normal {
                                 restore_window(&mut windows[new_idx], pixel_format);
                             } else {
                                 maximize_window(
@@ -567,7 +655,7 @@ fn main() {
                                 && now.wrapping_sub(last_title_click_time) < DOUBLE_CLICK_NS
                             {
                                 let pixel_format = screen.pixel_format_raw();
-                                if windows[new_idx].maximized {
+                                if windows[new_idx].mode != WindowMode::Normal {
                                     restore_window(&mut windows[new_idx], pixel_format);
                                 } else {
                                     maximize_window(
@@ -582,8 +670,8 @@ fn main() {
                             } else {
                                 last_title_click_pid = pid;
                                 last_title_click_time = now;
-                                // Un-maximize on drag
-                                if windows[new_idx].maximized {
+                                // Un-snap/maximize on drag
+                                if windows[new_idx].mode != WindowMode::Normal {
                                     let pixel_format = screen.pixel_format_raw();
                                     restore_window(&mut windows[new_idx], pixel_format);
                                     let win = &mut windows[new_idx];
@@ -648,12 +736,41 @@ fn main() {
                             Message::new(window::MSG_MOUSE_INPUT, ev),
                         );
                     }
-                    if let Interaction::Resizing { window_idx } = interaction {
-                        let pixel_format = screen.pixel_format_raw();
-                        let win = &mut windows[window_idx];
-                        let new_w = win.width;
-                        let new_h = win.height;
-                        resize_window(win, new_w, new_h, pixel_format);
+                    match interaction {
+                        Interaction::Dragging { window_idx } => {
+                            // Snap detection on drag release
+                            let pixel_format = screen.pixel_format_raw();
+                            if cursor_x <= 2 {
+                                snap_left(
+                                    &mut windows[window_idx],
+                                    screen_w as usize,
+                                    screen_h as usize,
+                                    pixel_format,
+                                );
+                            } else if cursor_x >= screen_w - 3 {
+                                snap_right(
+                                    &mut windows[window_idx],
+                                    screen_w as usize,
+                                    screen_h as usize,
+                                    pixel_format,
+                                );
+                            } else if cursor_y <= 2 {
+                                maximize_window(
+                                    &mut windows[window_idx],
+                                    screen_w as usize,
+                                    screen_h as usize,
+                                    pixel_format,
+                                );
+                            }
+                        }
+                        Interaction::Resizing { window_idx } => {
+                            let pixel_format = screen.pixel_format_raw();
+                            let win = &mut windows[window_idx];
+                            let new_w = win.width;
+                            let new_h = win.height;
+                            resize_window(win, new_w, new_h, pixel_format);
+                        }
+                        Interaction::None => {}
                     }
                     interaction = Interaction::None;
                 }
@@ -750,7 +867,7 @@ fn main() {
                         buf_height: content_h,
                         title,
                         minimized: false,
-                        maximized: false,
+                        mode: WindowMode::Normal,
                         saved_x: 0,
                         saved_y: 0,
                         saved_w: 0,

@@ -7,6 +7,7 @@ use crate::sync::Lock;
 pub const MOD_SHIFT: u8 = 1;
 pub const MOD_CTRL: u8 = 2;
 pub const MOD_ALT: u8 = 4;
+pub const MOD_GUI: u8 = 8;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -26,11 +27,13 @@ pub fn handle_report(report: &[u8]) {
     let shift = (hid_modifiers & 0x22) != 0;
     let ctrl = (hid_modifiers & 0x11) != 0;
     let alt = (hid_modifiers & 0x44) != 0;
+    let gui = (hid_modifiers & 0x88) != 0;
     let prev = *PREV_REPORT.lock();
 
     let modifiers = if shift { MOD_SHIFT } else { 0 }
         | if ctrl { MOD_CTRL } else { 0 }
-        | if alt { MOD_ALT } else { 0 };
+        | if alt { MOD_ALT } else { 0 }
+        | if gui { MOD_GUI } else { 0 };
 
     for i in 2..8 {
         let keycode = report[i];
