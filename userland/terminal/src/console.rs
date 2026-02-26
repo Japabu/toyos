@@ -13,16 +13,18 @@ const SCROLLBAR_TRACK: Color = Color { r: 0x20, g: 0x20, b: 0x20 };
 const SCROLLBAR_THUMB: Color = Color { r: 0x60, g: 0x60, b: 0x60 };
 const SCROLLBAR_THUMB_MIN: usize = 20;
 
-/// Canvas wrapper that applies a signed y-offset for pixel-level scroll clipping.
+/// Canvas wrapper that applies a signed y-offset and vertical clipping for scroll rendering.
 struct ScrollCanvas<'a> {
     fb: &'a Framebuffer,
     y_offset: isize,
+    y_min: usize,
+    y_max: usize,
 }
 
 impl font::Canvas for ScrollCanvas<'_> {
     fn put_pixel(&self, x: usize, y: usize, color: Color) {
         let sy = y as isize + self.y_offset;
-        if sy >= 0 && (sy as usize) < self.fb.height() {
+        if sy >= self.y_min as isize && (sy as usize) < self.y_max {
             self.fb.put_pixel(x, sy as usize, color);
         }
     }
@@ -700,13 +702,17 @@ impl Console {
         }
         let col = col.min(self.cols.saturating_sub(1));
         let row = row.min(self.rows.saturating_sub(1));
-        let old_range = self.selection_range();
-        self.sel_end = Some((col, row));
-        let new_range = self.selection_range();
-        // Redraw the union of old and new ranges
-        let start = old_range.map_or(0, |(s, _)| s).min(new_range.map_or(0, |(s, _)| s));
-        let end = old_range.map_or(0, |(_, e)| e).max(new_range.map_or(0, |(_, e)| e));
-        self.redraw_selection_range(start, end);
+        // Only redraw cells between old and new end — those are the ones whose state changed
+        if let Some((oc, or)) = self.sel_end {
+            let old_idx = or * self.cols + oc;
+            let new_idx = row * self.cols + col;
+            self.sel_end = Some((col, row));
+            let start = old_idx.min(new_idx);
+            let end = old_idx.max(new_idx);
+            self.redraw_selection_range(start, end);
+        } else {
+            self.sel_end = Some((col, row));
+        }
     }
 
     pub fn mouse_up(&mut self, col: usize, row: usize) -> Option<String> {
@@ -767,8 +773,19 @@ impl Console {
         if new_offset == self.scroll_pixel_offset {
             return;
         }
+        let delta = new_offset - self.scroll_pixel_offset;
         self.scroll_pixel_offset = new_offset;
-        self.redraw_scrollback_view();
+
+        let viewport_height = self.rows * fh;
+        if delta >= viewport_height {
+            self.redraw_scrollback_view();
+            return;
+        }
+
+        // Shift framebuffer DOWN — new content appears at top
+        self.fb.scroll_down(delta, DEFAULT_BG);
+        self.render_strip(0, delta);
+        self.draw_scrollbar();
     }
 
     /// Scroll the view down (toward present) by `pixels` pixels.
@@ -777,13 +794,26 @@ impl Console {
             return;
         }
         let new_offset = self.scroll_pixel_offset.saturating_sub(pixels);
+        let delta = self.scroll_pixel_offset - new_offset;
         self.scroll_pixel_offset = new_offset;
+
         if new_offset == 0 {
             self.redraw_all();
             self.draw_cursor();
-        } else {
-            self.redraw_scrollback_view();
+            return;
         }
+
+        let fh = self.font.height();
+        let viewport_height = self.rows * fh;
+        if delta >= viewport_height {
+            self.redraw_scrollback_view();
+            return;
+        }
+
+        // Shift framebuffer UP — new content appears at bottom
+        self.fb.scroll_up(delta, DEFAULT_BG);
+        self.render_strip(viewport_height - delta, viewport_height);
+        self.draw_scrollbar();
     }
 
     fn scroll_to_bottom(&mut self) {
@@ -793,36 +823,28 @@ impl Console {
         }
     }
 
-    /// Redraw the screen showing scrollback + current buffer content with pixel-level offset.
-    fn redraw_scrollback_view(&mut self) {
+    /// Render content rows that map to screen y in [screen_y_start, screen_y_end).
+    fn render_strip(&self, screen_y_start: usize, screen_y_end: usize) {
         let fh = self.font.height();
         let fw = self.font.width();
         let sb_len = self.scrollback.len();
-        let viewport_height = self.rows * fh;
-
-        // viewport_top is the content-y of the top of the viewport.
-        // Content: scrollback rows [0..sb_len] then current buffer rows [0..self.rows].
-        // Total content rows = sb_len + self.rows.
-        // When scroll_pixel_offset=0, viewport_top = sb_len * fh (shows current buffer).
-        // When scroll_pixel_offset=max, viewport_top = 0 (shows top of scrollback).
         let viewport_top = sb_len * fh - self.scroll_pixel_offset;
 
         let canvas = ScrollCanvas {
             fb: &self.fb,
             y_offset: -(viewport_top as isize),
+            y_min: screen_y_start,
+            y_max: screen_y_end,
         };
 
-        self.fb.clear(DEFAULT_BG);
-        self.rendered.fill(0);
-
-        // Determine visible row range in total content
-        let first_row = viewport_top / fh;
-        let last_row = ((viewport_top + viewport_height + fh - 1) / fh).min(sb_len + self.rows);
+        let content_y_start = viewport_top + screen_y_start;
+        let content_y_end = viewport_top + screen_y_end;
+        let first_row = content_y_start / fh;
+        let last_row = ((content_y_end + fh - 1) / fh).min(sb_len + self.rows);
 
         for row_idx in first_row..last_row {
             let content_y = row_idx * fh;
             if row_idx < sb_len {
-                // Scrollback row
                 let sb_row = &self.scrollback[row_idx];
                 let cols_to_draw = sb_row.chars.len().min(self.cols);
                 for col in 0..cols_to_draw {
@@ -834,7 +856,6 @@ impl Console {
                     }
                 }
             } else {
-                // Current buffer row
                 let buf_row = row_idx - sb_len;
                 for col in 0..self.cols {
                     let idx = buf_row * self.cols + col;
@@ -847,7 +868,15 @@ impl Console {
                 }
             }
         }
+    }
 
+    /// Full redraw of scrollback view (used for large jumps and initial scroll).
+    fn redraw_scrollback_view(&mut self) {
+        let fh = self.font.height();
+        let viewport_height = self.rows * fh;
+        self.fb.clear(DEFAULT_BG);
+        self.rendered.fill(0);
+        self.render_strip(0, viewport_height);
         self.draw_scrollbar();
     }
 

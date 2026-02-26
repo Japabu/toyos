@@ -9,6 +9,13 @@ use std::process::Command;
 use window::Window;
 
 fn main() {
+    // Spawn shell first so it initializes while we load the font
+    let mut child = Command::new("/initrd/shell")
+        .stdin(process::tty_piped())
+        .stdout(process::tty_piped())
+        .spawn()
+        .expect("failed to spawn shell");
+
     let mut window = Window::create_with_title(0, 0, "Terminal");
     io::set_screen_size(window.width(), window.height());
     let fb = framebuffer::Framebuffer::new(
@@ -18,15 +25,9 @@ fn main() {
         window.width(),
         window.pixel_format(),
     );
-    let ttf_data = std::fs::read("/initrd/JetBrainsMono-Regular.ttf").expect("failed to read font");
-    let font = font::Font::new(&ttf_data, 8, 16);
+    let font_data = std::fs::read("/initrd/JetBrainsMono-8x16.font").expect("failed to read font");
+    let font = font::Font::from_prebuilt(&font_data);
     let mut console = console::Console::new(fb, font);
-
-    let mut child = Command::new("/initrd/shell")
-        .stdin(process::tty_piped())
-        .stdout(process::tty_piped())
-        .spawn()
-        .expect("failed to spawn shell");
 
     let mut shell_stdin = child.stdin.take().unwrap();
     let mut shell_stdout = child.stdout.take().unwrap();

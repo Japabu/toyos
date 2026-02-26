@@ -21,18 +21,25 @@ const CMD_SET_SCANOUT: u32 = 0x0103;
 const CMD_RESOURCE_FLUSH: u32 = 0x0104;
 const CMD_TRANSFER_TO_HOST_2D: u32 = 0x0105;
 const CMD_RESOURCE_ATTACH_BACKING: u32 = 0x0106;
+const CMD_UPDATE_CURSOR: u32 = 0x0300;
+const CMD_MOVE_CURSOR: u32 = 0x0301;
 
 // GPU response types
 const RESP_OK_NODATA: u32 = 0x1100;
 const RESP_OK_DISPLAY_INFO: u32 = 0x1101;
 
 // Pixel formats
+const FORMAT_B8G8R8A8_UNORM: u32 = 1;
 const FORMAT_B8G8R8X8_UNORM: u32 = 2;
 
 // DMA page assignments
 const PAGE_CONTROLQ: usize = 0;
 const PAGE_CONTROLQ_BUFS: usize = 1;
 const PAGE_CURSORQ: usize = 2;
+const PAGE_CURSORQ_BUFS: usize = 3;
+
+const CURSOR_SIZE: u32 = 64;
+const CURSOR_RESOURCE_ID: u32 = 3;
 
 const REQ_OFFSET: usize = 0x000;
 const RESP_OFFSET: usize = 0x800;
@@ -140,17 +147,39 @@ struct MemEntry {
     padding: u32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CursorPos {
+    scanout_id: u32,
+    x: u32,
+    y: u32,
+    padding: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct UpdateCursor {
+    hdr: CtrlHeader,
+    pos: CursorPos,
+    resource_id: u32,
+    hot_x: u32,
+    hot_y: u32,
+    padding: u32,
+}
+
 // ---- GPU Controller ----
 
 struct GpuController {
     device: VirtioDevice,
     controlq: Virtqueue,
+    cursorq: Virtqueue,
     req_buf: u64,
     resp_buf: u64,
+    cursor_req_buf: u64,
+    cursor_resp_buf: u64,
     width: u32,
     height: u32,
-    resources: [u32; 2],
-    front: usize,
+    resource: u32,
 }
 
 impl GpuController {
@@ -206,11 +235,11 @@ impl GpuController {
         unsafe { read_volatile(self.resp_buf as *const RespDisplayInfo) }
     }
 
-    fn create_resource(&mut self, id: u32, width: u32, height: u32) {
+    fn create_resource(&mut self, id: u32, format: u32, width: u32, height: u32) {
         let cmd = ResourceCreate2d {
             hdr: CtrlHeader::new(CMD_RESOURCE_CREATE_2D),
             resource_id: id,
-            format: FORMAT_B8G8R8X8_UNORM,
+            format,
             width,
             height,
         };
@@ -268,11 +297,11 @@ impl GpuController {
         assert!(resp == RESP_OK_NODATA, "VirtIO GPU: SET_SCANOUT failed: {:#x}", resp);
     }
 
-    fn transfer_to_host(&mut self, resource: u32, rect: Rect) {
+    fn transfer_to_host(&mut self, resource: u32, rect: Rect, offset: u64) {
         let cmd = TransferToHost2d {
             hdr: CtrlHeader::new(CMD_TRANSFER_TO_HOST_2D),
             r: rect,
-            offset: 0,
+            offset,
             resource_id: resource,
             padding: 0,
         };
@@ -290,6 +319,48 @@ impl GpuController {
         let resp = self.command(&cmd);
         assert!(resp == RESP_OK_NODATA, "VirtIO GPU: RESOURCE_FLUSH failed: {:#x}", resp);
     }
+
+    fn cursor_command<T: Copy>(&mut self, req: &T) {
+        let bytes = unsafe {
+            core::slice::from_raw_parts(req as *const T as *const u8, core::mem::size_of::<T>())
+        };
+        unsafe {
+            copy_nonoverlapping(bytes.as_ptr(), self.cursor_req_buf as *mut u8, bytes.len());
+        }
+        self.cursorq.submit_and_wait(
+            &[
+                (self.cursor_req_buf, bytes.len() as u32, BufDir::Readable),
+                (self.cursor_resp_buf, core::mem::size_of::<CtrlHeader>() as u32, BufDir::Writable),
+            ],
+            self.device.notify_mmio(),
+            self.device.notify_off_multiplier(),
+            1, // cursor queue index
+        );
+    }
+
+    fn update_cursor(&mut self, x: u32, y: u32, hot_x: u32, hot_y: u32) {
+        let cmd = UpdateCursor {
+            hdr: CtrlHeader::new(CMD_UPDATE_CURSOR),
+            pos: CursorPos { scanout_id: 0, x, y, padding: 0 },
+            resource_id: CURSOR_RESOURCE_ID,
+            hot_x,
+            hot_y,
+            padding: 0,
+        };
+        self.cursor_command(&cmd);
+    }
+
+    fn move_cursor(&mut self, x: u32, y: u32) {
+        let cmd = UpdateCursor {
+            hdr: CtrlHeader::new(CMD_MOVE_CURSOR),
+            pos: CursorPos { scanout_id: 0, x, y, padding: 0 },
+            resource_id: CURSOR_RESOURCE_ID,
+            hot_x: 0,
+            hot_y: 0,
+            padding: 0,
+        };
+        self.cursor_command(&cmd);
+    }
 }
 
 // ---- Global state ----
@@ -298,6 +369,7 @@ static GPU: Lock<Option<GpuController>> = Lock::new(None);
 
 pub struct GpuInfo {
     pub tokens: [u32; 2],
+    pub cursor_token: u32,
     pub width: u32,
     pub height: u32,
 }
@@ -318,16 +390,20 @@ pub fn init(ecam_base: u64) -> Option<GpuInfo> {
 
     let req_buf = dma_addr(PAGE_CONTROLQ_BUFS) + REQ_OFFSET as u64;
     let resp_buf = dma_addr(PAGE_CONTROLQ_BUFS) + RESP_OFFSET as u64;
+    let cursor_req_buf = dma_addr(PAGE_CURSORQ_BUFS) + REQ_OFFSET as u64;
+    let cursor_resp_buf = dma_addr(PAGE_CURSORQ_BUFS) + RESP_OFFSET as u64;
 
     let mut gpu = GpuController {
         device,
         controlq,
+        cursorq,
         req_buf,
         resp_buf,
+        cursor_req_buf,
+        cursor_resp_buf,
         width: 0,
         height: 0,
-        resources: [1, 2],
-        front: 0,
+        resource: 1,
     };
 
     // Query display info
@@ -350,7 +426,8 @@ pub fn init(ecam_base: u64) -> Option<GpuInfo> {
     };
     log!("VirtIO GPU: display {}x{}", width, height);
 
-    // Allocate two framebuffer backing stores for page-flipping (2MB-aligned)
+    // Allocate framebuffer backing stores (2MB-aligned).
+    // We allocate two for kernel FramebufferInfo compatibility but only use buffer 0.
     let fb_size = (width * height * 4) as usize;
     let fb_aligned = (fb_size + PAGE_2M as usize - 1) & !(PAGE_2M as usize - 1);
     let fb_layout = Layout::from_size_align(fb_aligned, PAGE_2M as usize).unwrap();
@@ -360,34 +437,76 @@ pub fn init(ecam_base: u64) -> Option<GpuInfo> {
         assert!(!ptr.is_null(), "VirtIO GPU: framebuffer alloc failed");
         let addr = ptr as u64;
         tokens[i] = shared_memory::register(addr, fb_aligned as u64);
-        gpu.create_resource(gpu.resources[i], width, height);
-        gpu.attach_backing(gpu.resources[i], addr, fb_size as u32);
+        if i == 0 {
+            gpu.create_resource(gpu.resource, FORMAT_B8G8R8X8_UNORM, width, height);
+            gpu.attach_backing(gpu.resource, addr, fb_size as u32);
+        }
         log!("VirtIO GPU: buffer {} at {:#x} ({} bytes) token={}", i, addr, fb_size, tokens[i]);
     }
 
-    // Display resource 0 (front), compositor draws to resource 1 (back)
+    // Set scanout to the single resource
     let rect = Rect { x: 0, y: 0, width, height };
-    gpu.set_scanout(0, gpu.resources[0], rect);
+    gpu.set_scanout(0, gpu.resource, rect);
+
+    // Create cursor resource (64x64, BGRA with alpha)
+    let cursor_bytes = (CURSOR_SIZE * CURSOR_SIZE * 4) as usize;
+    let cursor_aligned = (cursor_bytes + PAGE_2M as usize - 1) & !(PAGE_2M as usize - 1);
+    let cursor_layout = Layout::from_size_align(cursor_aligned, PAGE_2M as usize).unwrap();
+    let cursor_ptr = unsafe { alloc_zeroed(cursor_layout) };
+    assert!(!cursor_ptr.is_null(), "VirtIO GPU: cursor alloc failed");
+    let cursor_addr = cursor_ptr as u64;
+    let cursor_token = shared_memory::register(cursor_addr, cursor_aligned as u64);
+    gpu.create_resource(CURSOR_RESOURCE_ID, FORMAT_B8G8R8A8_UNORM, CURSOR_SIZE, CURSOR_SIZE);
+    gpu.attach_backing(CURSOR_RESOURCE_ID, cursor_addr, cursor_bytes as u32);
+    log!("VirtIO GPU: cursor resource at {:#x} token={}", cursor_addr, cursor_token);
 
     gpu.width = width;
     gpu.height = height;
 
-    let info = GpuInfo { tokens, width, height };
+    let info = GpuInfo { tokens, cursor_token, width, height };
     *GPU.lock() = Some(gpu);
 
     Some(info)
 }
 
-/// Transfer the back buffer to the host, flip the scanout, and flush.
-pub fn present() {
+/// Transfer a region of the framebuffer to the host and flush it.
+/// If w==0 or h==0, transfers the full screen.
+pub fn present_rect(x: u32, y: u32, w: u32, h: u32) {
     let mut guard = GPU.lock();
     if let Some(gpu) = guard.as_mut() {
-        let back = 1 - gpu.front;
-        let resource = gpu.resources[back];
-        let rect = Rect { x: 0, y: 0, width: gpu.width, height: gpu.height };
-        gpu.transfer_to_host(resource, rect);
-        gpu.set_scanout(0, resource, rect);
-        gpu.flush(resource, rect);
-        gpu.front = back;
+        let rect = if w == 0 || h == 0 {
+            Rect { x: 0, y: 0, width: gpu.width, height: gpu.height }
+        } else {
+            // Clamp rect to screen bounds
+            let cx = x.min(gpu.width);
+            let cy = y.min(gpu.height);
+            let cw = w.min(gpu.width - cx);
+            let ch = h.min(gpu.height - cy);
+            if cw == 0 || ch == 0 { return; }
+            Rect { x: cx, y: cy, width: cw, height: ch }
+        };
+        // Offset into backing store: the GPU reads from backing[offset] with the
+        // resource's stride, so point it to where the rect starts in the buffer.
+        let offset = (rect.y as u64 * gpu.width as u64 + rect.x as u64) * 4;
+        gpu.transfer_to_host(gpu.resource, rect, offset);
+        gpu.flush(gpu.resource, rect);
+    }
+}
+
+/// Upload cursor image from backing store and enable the hardware cursor.
+pub fn set_cursor(hot_x: u32, hot_y: u32) {
+    let mut guard = GPU.lock();
+    if let Some(gpu) = guard.as_mut() {
+        let rect = Rect { x: 0, y: 0, width: CURSOR_SIZE, height: CURSOR_SIZE };
+        gpu.transfer_to_host(CURSOR_RESOURCE_ID, rect, 0);
+        gpu.update_cursor(0, 0, hot_x, hot_y);
+    }
+}
+
+/// Move the hardware cursor to (x, y).
+pub fn move_cursor(x: u32, y: u32) {
+    let mut guard = GPU.lock();
+    if let Some(gpu) = guard.as_mut() {
+        gpu.move_cursor(x, y);
     }
 }

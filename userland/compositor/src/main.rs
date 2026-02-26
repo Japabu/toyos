@@ -37,7 +37,6 @@ const TASKBAR_MINIMIZED_TEXT: Color = Color { r: 0x50, g: 0x50, b: 0x60 };
 const LAUNCHER_WIDTH: usize = 160;
 const LAUNCHER_ITEM_HEIGHT: usize = 28;
 const LAUNCHER_BG: Color = Color { r: 0x20, g: 0x20, b: 0x30 };
-const LAUNCHER_HOVER: Color = Color { r: 0x35, g: 0x35, b: 0x50 };
 const LAUNCHER_TEXT: Color = Color { r: 0xe0, g: 0xe0, b: 0xe8 };
 
 struct LauncherEntry {
@@ -49,11 +48,13 @@ const LAUNCHER_APPS: &[LauncherEntry] = &[
     LauncherEntry { name: "Terminal", path: "/initrd/terminal" },
     LauncherEntry { name: "Files", path: "/initrd/files" },
     LauncherEntry { name: "Editor", path: "/initrd/kibi" },
+    LauncherEntry { name: "Monitor", path: "/initrd/monitor" },
 ];
 
 #[repr(C)]
 struct FramebufferInfo {
     token: [u32; 2],
+    cursor_token: u32,
     width: u32,
     height: u32,
     stride: u32,
@@ -63,6 +64,7 @@ struct FramebufferInfo {
 fn read_fb_info(fd: u64) -> FramebufferInfo {
     let mut info = FramebufferInfo {
         token: [0; 2],
+        cursor_token: 0,
         width: 0,
         height: 0,
         stride: 0,
@@ -264,6 +266,56 @@ fn launcher_rect(windows: &[WindowState], screen_h: i32) -> (i32, i32, i32, i32)
     (lx, ly, LAUNCHER_WIDTH as i32, lh)
 }
 
+#[derive(Clone, Copy)]
+struct DirtyRect {
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+}
+
+impl DirtyRect {
+    fn full(screen_w: usize, screen_h: usize) -> Self {
+        Self { x: 0, y: 0, w: screen_w, h: screen_h }
+    }
+
+    fn union(self, other: Self) -> Self {
+        let x = self.x.min(other.x);
+        let y = self.y.min(other.y);
+        let right = (self.x + self.w).max(other.x + other.w);
+        let bottom = (self.y + self.h).max(other.y + other.h);
+        Self { x, y, w: right - x, h: bottom - y }
+    }
+
+    fn clamp(self, screen_w: usize, screen_h: usize) -> Self {
+        let x = self.x.min(screen_w);
+        let y = self.y.min(screen_h);
+        let w = self.w.min(screen_w - x);
+        let h = self.h.min(screen_h - y);
+        Self { x, y, w, h }
+    }
+
+    fn overlaps(self, other: Self) -> bool {
+        self.x < other.x + other.w && self.x + self.w > other.x
+            && self.y < other.y + other.h && self.y + self.h > other.y
+    }
+}
+
+fn window_screen_rect(win: &WindowState) -> DirtyRect {
+    let x = win.content_x.saturating_sub(BORDER_WIDTH);
+    let y = win.content_y.saturating_sub(BORDER_WIDTH + TITLE_BAR_HEIGHT);
+    let w = win.width + BORDER_WIDTH * 2;
+    let h = win.height + BORDER_WIDTH * 2 + TITLE_BAR_HEIGHT;
+    DirtyRect { x, y, w, h }
+}
+
+fn mark_dirty(dirty_rect: &mut Option<DirtyRect>, r: DirtyRect) {
+    *dirty_rect = Some(match dirty_rect.take() {
+        Some(old) => old.union(r),
+        None => r,
+    });
+}
+
 fn hit_test(windows: &[WindowState], x: i32, y: i32, screen_h: i32, launcher_open: bool) -> HitZone {
     // Launcher popup
     if launcher_open {
@@ -344,14 +396,15 @@ fn redraw(
     screen: &Framebuffer,
     font: &font::Font,
     windows: &[WindowState],
-    cursor_x: i32,
-    cursor_y: i32,
-    cursor: &sprite::Sprite,
     icons: &TitleBarIcons,
     wallpaper: &[u8],
     launcher_open: bool,
+    stats: &SystemStats,
+    region: DirtyRect,
 ) {
-    screen.blit(0, 0, screen.width(), screen.height(), screen.width(), wallpaper);
+    // Only blit wallpaper within the dirty region
+    let wp_offset = (region.y * screen.width() + region.x) * 4;
+    screen.blit(region.x, region.y, region.w, region.h, screen.width(), &wallpaper[wp_offset..]);
 
     let focused_idx = focused_window_idx(windows);
 
@@ -359,18 +412,45 @@ fn redraw(
         if win.minimized {
             continue;
         }
+        if region.overlaps(window_screen_rect(win)) {
+            draw_window(screen, font, win, Some(i) == focused_idx, icons, region);
+        }
+    }
 
-        let focused = Some(i) == focused_idx;
-        let border_color = if focused { FOCUSED_BORDER_COLOR } else { UNFOCUSED_BORDER_COLOR };
-        let title_color = if focused { FOCUSED_TITLE_COLOR } else { UNFOCUSED_TITLE_COLOR };
-        let text_color = if focused { FOCUSED_TITLE_TEXT } else { UNFOCUSED_TITLE_TEXT };
+    let taskbar_rect = DirtyRect { x: 0, y: screen.height() - TASKBAR_HEIGHT, w: screen.width(), h: TASKBAR_HEIGHT };
+    if region.overlaps(taskbar_rect) {
+        draw_taskbar(screen, font, windows, focused_idx, stats);
+    }
 
-        let win_x = win.content_x - BORDER_WIDTH;
-        let win_y = win.content_y - BORDER_WIDTH - TITLE_BAR_HEIGHT;
-        let win_w = win.width + BORDER_WIDTH * 2;
-        let win_h = win.height + BORDER_WIDTH * 2 + TITLE_BAR_HEIGHT;
+    // Draw launcher popup last so it's always on top of windows
+    if launcher_open {
+        let (lx, ly, lw, lh) = launcher_rect(windows, screen.height() as i32);
+        let launcher_dirty = DirtyRect { x: lx as usize, y: ly as usize, w: lw as usize, h: lh as usize };
+        if region.overlaps(launcher_dirty) {
+            draw_launcher(screen, font, lx as usize, ly as usize, lw as usize, lh as usize);
+        }
+    }
+}
 
-        screen.fill_rect(win_x, win_y, win_w, win_h, border_color);
+fn draw_window(
+    screen: &Framebuffer,
+    font: &font::Font,
+    win: &WindowState,
+    focused: bool,
+    icons: &TitleBarIcons,
+    clip: DirtyRect,
+) {
+    let border_color = if focused { FOCUSED_BORDER_COLOR } else { UNFOCUSED_BORDER_COLOR };
+    let title_color = if focused { FOCUSED_TITLE_COLOR } else { UNFOCUSED_TITLE_COLOR };
+    let text_color = if focused { FOCUSED_TITLE_TEXT } else { UNFOCUSED_TITLE_TEXT };
+
+    let win_x = win.content_x - BORDER_WIDTH;
+    let win_y = win.content_y - BORDER_WIDTH - TITLE_BAR_HEIGHT;
+    let win_w = win.width + BORDER_WIDTH * 2;
+
+    let title_bar = DirtyRect { x: win_x, y: win_y, w: win_w, h: BORDER_WIDTH * 2 + TITLE_BAR_HEIGHT };
+    if clip.overlaps(title_bar) {
+        screen.fill_rect(win_x, win_y, win_w, BORDER_WIDTH + TITLE_BAR_HEIGHT, border_color);
         screen.fill_rect(
             win_x + BORDER_WIDTH,
             win_y + BORDER_WIDTH,
@@ -379,57 +459,65 @@ fn redraw(
             title_color,
         );
 
-        // Title text
         let title_x = win_x + BORDER_WIDTH + 8;
         let title_y = win_y + BORDER_WIDTH + (TITLE_BAR_HEIGHT - 16) / 2;
         let title = if win.title.is_empty() { "Window" } else { &win.title };
         font.draw_string(screen, title_x, title_y, title, text_color, title_color);
 
-        // Close button (rightmost)
         let close_x = win_x + win_w - BORDER_WIDTH - BUTTON_WIDTH;
         let close_bg = if focused { CLOSE_BUTTON_BG } else { title_color };
         screen.fill_rect(close_x, win_y + BORDER_WIDTH, BUTTON_WIDTH, TITLE_BAR_HEIGHT, close_bg);
-        draw_icon_centered(
-            screen,
-            &icons.close,
-            close_x,
-            win_y + BORDER_WIDTH,
-            BUTTON_WIDTH,
-            TITLE_BAR_HEIGHT,
-        );
+        draw_icon_centered(screen, &icons.close, close_x, win_y + BORDER_WIDTH, BUTTON_WIDTH, TITLE_BAR_HEIGHT);
 
-        // Maximize button
         let max_x = close_x - BUTTON_WIDTH;
         screen.fill_rect(max_x, win_y + BORDER_WIDTH, BUTTON_WIDTH, TITLE_BAR_HEIGHT, title_color);
-        draw_icon_centered(
-            screen,
-            &icons.maximize,
-            max_x,
-            win_y + BORDER_WIDTH,
-            BUTTON_WIDTH,
-            TITLE_BAR_HEIGHT,
-        );
+        draw_icon_centered(screen, &icons.maximize, max_x, win_y + BORDER_WIDTH, BUTTON_WIDTH, TITLE_BAR_HEIGHT);
 
-        // Minimize button
         let min_x = max_x - BUTTON_WIDTH;
         screen.fill_rect(min_x, win_y + BORDER_WIDTH, BUTTON_WIDTH, TITLE_BAR_HEIGHT, title_color);
-        draw_icon_centered(
-            screen,
-            &icons.minimize,
-            min_x,
-            win_y + BORDER_WIDTH,
-            BUTTON_WIDTH,
-            TITLE_BAR_HEIGHT,
-        );
-
-        // Blit content, clipped to buffer dimensions
-        let blit_w = win.width.min(win.buf_width);
-        let blit_h = win.height.min(win.buf_height);
-        let buffer_slice = unsafe { std::slice::from_raw_parts(win.buffer, win.buffer_size) };
-        screen.blit(win.content_x, win.content_y, blit_w, blit_h, win.buf_width, buffer_slice);
+        draw_icon_centered(screen, &icons.minimize, min_x, win_y + BORDER_WIDTH, BUTTON_WIDTH, TITLE_BAR_HEIGHT);
     }
 
-    // Taskbar
+    // Draw side/bottom borders only if clip overlaps them
+    let content_bottom = win.content_y + win.height;
+    if win.content_y < content_bottom {
+        // Left border
+        screen.fill_rect(win_x, win.content_y, BORDER_WIDTH, win.height, border_color);
+        // Right border
+        screen.fill_rect(win.content_x + win.width, win.content_y, BORDER_WIDTH, win.height, border_color);
+    }
+    // Bottom border
+    screen.fill_rect(win_x, content_bottom, win_w, BORDER_WIDTH, border_color);
+
+    // Clip content blit to dirty region
+    let blit_w = win.width.min(win.buf_width);
+    let blit_h = win.height.min(win.buf_height);
+    let cx = win.content_x.max(clip.x);
+    let cy = win.content_y.max(clip.y);
+    let cr = (win.content_x + blit_w).min(clip.x + clip.w);
+    let cb = (win.content_y + blit_h).min(clip.y + clip.h);
+    if cx < cr && cy < cb {
+        let src_x = cx - win.content_x;
+        let src_y = cy - win.content_y;
+        let src_offset = (src_y * win.buf_width + src_x) * 4;
+        let buffer_slice = unsafe { std::slice::from_raw_parts(win.buffer, win.buffer_size) };
+        screen.blit(cx, cy, cr - cx, cb - cy, win.buf_width, &buffer_slice[src_offset..]);
+    }
+}
+
+struct SystemStats {
+    used_mb: u64,
+    total_mb: u64,
+    cpu_pct: u64,
+}
+
+fn draw_taskbar(
+    screen: &Framebuffer,
+    font: &font::Font,
+    windows: &[WindowState],
+    focused_idx: Option<usize>,
+    stats: &SystemStats,
+) {
     let screen_w = screen.width();
     let screen_h = screen.height();
     let taskbar_y = screen_h - TASKBAR_HEIGHT;
@@ -472,35 +560,52 @@ fn redraw(
     let plus_x = new_x + (TASKBAR_HEIGHT - 8) / 2;
     font.draw_char(screen, plus_x, text_y, '+', TASKBAR_NEW_TEXT, TASKBAR_NEW_COLOR);
 
-    // Clock on the right
+    // System stats + clock on the right
     let time = io::clock_realtime();
     let hours = (time >> 16) & 0xFF;
     let minutes = (time >> 8) & 0xFF;
-    let clock_str = format!("{:02}:{:02}", hours, minutes);
-    let clock_w = clock_str.len() * font.width();
-    let clock_x = screen_w - clock_w - 12;
-    font.draw_string(screen, clock_x, text_y, &clock_str, TASKBAR_ACTIVE_TEXT, TASKBAR_COLOR);
 
-    // Launcher popup
-    if launcher_open {
-        let (lx, ly, lw, lh) = launcher_rect(windows, screen_h as i32);
-        screen.fill_rect(lx as usize, ly as usize, lw as usize, lh as usize, LAUNCHER_BG);
-        for (i, app) in LAUNCHER_APPS.iter().enumerate() {
-            let item_y = ly as usize + i * LAUNCHER_ITEM_HEIGHT;
-            let hover = cursor_x >= lx
-                && cursor_x < lx + lw
-                && cursor_y >= item_y as i32
-                && cursor_y < (item_y + LAUNCHER_ITEM_HEIGHT) as i32;
-            let bg = if hover { LAUNCHER_HOVER } else { LAUNCHER_BG };
-            if hover {
-                screen.fill_rect(lx as usize, item_y, lw as usize, LAUNCHER_ITEM_HEIGHT, bg);
+    let status_str = format!(
+        "{}M/{}M  CPU {}%  {:02}:{:02}",
+        stats.used_mb, stats.total_mb, stats.cpu_pct, hours, minutes
+    );
+    let status_w = status_str.len() * font.width();
+    let status_x = screen_w - status_w - 12;
+    font.draw_string(screen, status_x, text_y, &status_str, TASKBAR_ACTIVE_TEXT, TASKBAR_COLOR);
+
+}
+
+fn draw_launcher(screen: &Framebuffer, font: &font::Font, x: usize, y: usize, w: usize, h: usize) {
+    screen.fill_rect(x, y, w, h, LAUNCHER_BG);
+    for (i, app) in LAUNCHER_APPS.iter().enumerate() {
+        let item_y = y + i * LAUNCHER_ITEM_HEIGHT;
+        let text_y = item_y + (LAUNCHER_ITEM_HEIGHT - 16) / 2;
+        font.draw_string(screen, x + 12, text_y, app.name, LAUNCHER_TEXT, LAUNCHER_BG);
+    }
+}
+
+/// Render the cursor sprite (RGBA) into a 64x64 BGRA hardware cursor buffer.
+fn upload_cursor(cursor_buf: *mut u8, sprite: &sprite::Sprite) {
+    let data = sprite.data();
+    let w = sprite.width();
+    let h = sprite.height();
+    // Clear the full 64x64 buffer
+    unsafe { core::ptr::write_bytes(cursor_buf, 0, 64 * 64 * 4); }
+    // Copy sprite pixels, converting RGBA → BGRA
+    for y in 0..h.min(64) {
+        for x in 0..w.min(64) {
+            let si = (y * w + x) * 4;
+            let di = (y * 64 + x) * 4;
+            unsafe {
+                let dst = cursor_buf.add(di);
+                *dst = data[si + 2];       // B
+                *dst.add(1) = data[si + 1]; // G
+                *dst.add(2) = data[si];     // R
+                *dst.add(3) = data[si + 3]; // A
             }
-            let text_y = item_y + (LAUNCHER_ITEM_HEIGHT - 16) / 2;
-            font.draw_string(screen, lx as usize + 12, text_y, app.name, LAUNCHER_TEXT, bg);
         }
     }
-
-    screen.draw_cursor(cursor_x, cursor_y, cursor);
+    io::gpu_set_cursor(0, 0);
 }
 
 fn main() {
@@ -511,25 +616,27 @@ fn main() {
     let fb_fd = io::open_device(io::DeviceType::Framebuffer).expect("failed to claim framebuffer");
 
     let fb_info = read_fb_info(fb_fd);
-    let fb_addrs = [
-        io::map_shared(fb_info.token[0]) as u64,
-        io::map_shared(fb_info.token[1]) as u64,
-    ];
-    let mut screen = Framebuffer::new(
-        fb_addrs,
+    let fb_addr = io::map_shared(fb_info.token[0]) as u64;
+    let screen = Framebuffer::new(
+        fb_addr,
         fb_info.width,
         fb_info.height,
         fb_info.stride,
         fb_info.pixel_format,
     );
 
-    let ttf_data = std::fs::read("/initrd/JetBrainsMono-Regular.ttf").expect("failed to read font");
-    let font = font::Font::new(&ttf_data, 8, 16);
+    // Set up hardware cursor
+    let cursor_buf = io::map_shared(fb_info.cursor_token);
     let cursor_svg = std::fs::read("/initrd/cursor-bold.svg").expect("failed to read cursor");
     let cursor_default = sprite::Sprite::from_svg_colored(&cursor_svg, 20, [255, 255, 255]);
     let resize_svg =
         std::fs::read("/initrd/arrow-down-right-bold.svg").expect("failed to read resize cursor");
     let cursor_resize = sprite::Sprite::from_svg_colored(&resize_svg, 20, [255, 255, 255]);
+    upload_cursor(cursor_buf, &cursor_default);
+    let mut current_cursor_is_resize = false;
+
+    let font_data = std::fs::read("/initrd/JetBrainsMono-8x16.font").expect("failed to read font");
+    let font = font::Font::from_prebuilt(&font_data);
 
     eprintln!("compositor: decoding wallpaper...");
     let wallpaper = {
@@ -571,49 +678,26 @@ fn main() {
 
     eprintln!("compositor: ready");
 
-    Command::new("/initrd/terminal")
-        .spawn()
-        .expect("failed to spawn terminal");
-
     let mut windows: Vec<WindowState> = Vec::new();
     let screen_w = screen.width() as i32;
     let screen_h = screen.height() as i32;
     let mut cursor_x = screen_w / 2;
     let mut cursor_y = screen_h / 2;
-    let mut dirty = true;
+    io::gpu_move_cursor(cursor_x as u32, cursor_y as u32);
+    let mut dirty_rect: Option<DirtyRect> = Some(DirtyRect::full(screen_w as usize, screen_h as usize));
     let mut prev_buttons: u8 = 0;
     let mut interaction = Interaction::None;
     let mut last_title_click_time: u64 = 0;
     let mut last_title_click_pid: u32 = 0;
     let mut clipboard = String::new();
     let mut launcher_open = false;
+    let mut prev_busy_ticks: u64 = 0;
+    let mut prev_total_ticks: u64 = 0;
+    let mut cpu_pct: u64 = 0;
+    let mut last_taskbar_update: u64 = 0;
 
     loop {
-        if dirty {
-            let active_cursor = match interaction {
-                Interaction::Resizing { .. } => &cursor_resize,
-                _ => match hit_test(&windows, cursor_x, cursor_y, screen_h, launcher_open) {
-                    HitZone::ResizeCorner(_) => &cursor_resize,
-                    _ => &cursor_default,
-                },
-            };
-            redraw(
-                &screen,
-                &font,
-                &windows,
-                cursor_x,
-                cursor_y,
-                active_cursor,
-                &icons,
-                &wallpaper,
-                launcher_open,
-            );
-            io::gpu_present();
-            screen.swap();
-            dirty = false;
-        }
-
-        let ready = io::poll(&[kb_fd, mouse_fd]);
+        let ready = io::poll_timeout(&[kb_fd, mouse_fd], 1_000_000_000);
 
         if ready.fd(0) {
             let mut events = [window::KeyEvent::EMPTY; 8];
@@ -628,7 +712,7 @@ fn main() {
                 if launcher_open && event.keycode == 0x29 {
                     // Escape: close launcher
                     launcher_open = false;
-                    dirty = true;
+                    mark_dirty(&mut dirty_rect, DirtyRect::full(screen_w as usize, screen_h as usize));
                 } else if event.alt() && event.keycode == 0x2B {
                     // Alt+Tab: rotate focus
                     if windows.len() > 1 {
@@ -637,7 +721,7 @@ fn main() {
                         if let Some(top) = windows.last_mut() {
                             top.minimized = false;
                         }
-                        dirty = true;
+                        mark_dirty(&mut dirty_rect, DirtyRect::full(screen_w as usize, screen_h as usize));
                     }
                 } else if event.gui() {
                     if let Some(idx) = focused_window_idx(&windows) {
@@ -708,7 +792,7 @@ fn main() {
                                 );
                             }
                         }
-                        dirty = true;
+                        mark_dirty(&mut dirty_rect, DirtyRect::full(screen_w as usize, screen_h as usize));
                     }
                 } else if event.ctrl() && event.keycode == 0x11 {
                     // Ctrl+N: spawn terminal
@@ -725,19 +809,57 @@ fn main() {
         }
 
         if ready.fd(1) {
-            let mut buf = [0u8; 4];
+            // Drain all pending mouse events in one read
+            let mut buf = [0u8; 512];
             let n = io::read_fd(mouse_fd, &mut buf);
-            if n >= 3 {
-                let buttons = buf[0];
-                let dx = buf[1] as i8;
-                let dy = buf[2] as i8;
-                let scroll = if n >= 4 { buf[3] as i8 } else { 0 };
+            let event_count = n / 4;
 
-                cursor_x = (cursor_x + dx as i32).clamp(0, screen_w - 1);
-                cursor_y = (cursor_y + dy as i32).clamp(0, screen_h - 1);
+            // Accumulate deltas and track button transitions
+            let mut total_dx: i32 = 0;
+            let mut total_dy: i32 = 0;
+            let mut total_scroll: i32 = 0;
+            let mut buttons = prev_buttons;
+            let mut press_happened = false;
+            let mut release_happened = false;
 
+            for i in 0..event_count {
+                let off = i * 4;
+                let new_buttons = buf[off];
+                total_dx += buf[off + 1] as i8 as i32;
+                total_dy += buf[off + 2] as i8 as i32;
+                total_scroll += buf[off + 3] as i8 as i32;
+
+                let new_left = new_buttons & 1 != 0;
+                let old_left = buttons & 1 != 0;
+                if new_left && !old_left { press_happened = true; }
+                if !new_left && old_left { release_happened = true; }
+                buttons = new_buttons;
+            }
+
+            if event_count > 0 {
                 let left = buttons & 1 != 0;
-                let was_left = prev_buttons & 1 != 0;
+
+                // Move cursor once for all accumulated deltas
+                cursor_x = (cursor_x + total_dx).clamp(0, screen_w - 1);
+                cursor_y = (cursor_y + total_dy).clamp(0, screen_h - 1);
+                io::gpu_move_cursor(cursor_x as u32, cursor_y as u32);
+
+                // Update hardware cursor shape
+                let want_resize = match interaction {
+                    Interaction::Resizing { .. } => true,
+                    _ => matches!(
+                        hit_test(&windows, cursor_x, cursor_y, screen_h, launcher_open),
+                        HitZone::ResizeCorner(_)
+                    ),
+                };
+                if want_resize != current_cursor_is_resize {
+                    current_cursor_is_resize = want_resize;
+                    if want_resize {
+                        upload_cursor(cursor_buf, &cursor_resize);
+                    } else {
+                        upload_cursor(cursor_buf, &cursor_default);
+                    }
+                }
 
                 let make_mouse_event =
                     |win: &WindowState, event_type: u8, changed: u8, scroll: i8| {
@@ -753,15 +875,17 @@ fn main() {
                         }
                     };
 
-                // Left button just pressed
-                if left && !was_left {
+                // Left button pressed during this batch
+                if press_happened {
                     match hit_test(&windows, cursor_x, cursor_y, screen_h, launcher_open) {
                         HitZone::CloseButton(idx) => {
                             let win = windows.remove(idx);
                             message::send(win.pid, Message::signal(window::MSG_WINDOW_CLOSE));
+                            mark_dirty(&mut dirty_rect, DirtyRect::full(screen_w as usize, screen_h as usize));
                         }
                         HitZone::MinimizeButton(idx) => {
                             windows[idx].minimized = true;
+                            mark_dirty(&mut dirty_rect, DirtyRect::full(screen_w as usize, screen_h as usize));
                         }
                         HitZone::MaximizeButton(idx) => {
                             if idx != windows.len() - 1 {
@@ -780,6 +904,7 @@ fn main() {
                                     pixel_format,
                                 );
                             }
+                            mark_dirty(&mut dirty_rect, DirtyRect::full(screen_w as usize, screen_h as usize));
                         }
                         HitZone::TitleBar(idx) => {
                             if idx != windows.len() - 1 {
@@ -825,6 +950,7 @@ fn main() {
                                     window_idx: new_idx,
                                 };
                             }
+                            mark_dirty(&mut dirty_rect, DirtyRect::full(screen_w as usize, screen_h as usize));
                         }
                         HitZone::ResizeCorner(idx) => {
                             let win = windows.remove(idx);
@@ -833,12 +959,14 @@ fn main() {
                             interaction = Interaction::Resizing {
                                 window_idx: new_idx,
                             };
+                            mark_dirty(&mut dirty_rect, DirtyRect::full(screen_w as usize, screen_h as usize));
                         }
                         HitZone::Content(idx) => {
                             launcher_open = false;
                             if idx != windows.len() - 1 {
                                 let win = windows.remove(idx);
                                 windows.push(win);
+                                mark_dirty(&mut dirty_rect, DirtyRect::full(screen_w as usize, screen_h as usize));
                             }
                             let win = windows.last().unwrap();
                             let ev = make_mouse_event(win, window::MOUSE_PRESS, 1, 0);
@@ -859,23 +987,29 @@ fn main() {
                                     let win = windows.remove(idx);
                                     windows.push(win);
                                 }
+                                mark_dirty(&mut dirty_rect, DirtyRect::full(screen_w as usize, screen_h as usize));
                             }
                         }
                         HitZone::TaskbarNew => {
                             launcher_open = !launcher_open;
+                            mark_dirty(&mut dirty_rect, DirtyRect::full(screen_w as usize, screen_h as usize));
                         }
                         HitZone::LauncherItem(idx) => {
                             Command::new(LAUNCHER_APPS[idx].path).spawn().ok();
                             launcher_open = false;
+                            mark_dirty(&mut dirty_rect, DirtyRect::full(screen_w as usize, screen_h as usize));
                         }
                         HitZone::Desktop => {
-                            launcher_open = false;
+                            if launcher_open {
+                                launcher_open = false;
+                                mark_dirty(&mut dirty_rect, DirtyRect::full(screen_w as usize, screen_h as usize));
+                            }
                         }
                     }
                 }
 
-                // Left button released
-                if !left && was_left {
+                // Left button released during this batch
+                if release_happened {
                     if let Some(idx) = focused_window_idx(&windows) {
                         let ev = make_mouse_event(&windows[idx], window::MOUSE_RELEASE, 1, 0);
                         message::send(
@@ -909,6 +1043,7 @@ fn main() {
                                     pixel_format,
                                 );
                             }
+                            mark_dirty(&mut dirty_rect, DirtyRect::full(screen_w as usize, screen_h as usize));
                         }
                         Interaction::Resizing { window_idx } => {
                             let pixel_format = screen.pixel_format_raw();
@@ -916,32 +1051,39 @@ fn main() {
                             let new_w = win.width;
                             let new_h = win.height;
                             resize_window(win, new_w, new_h, pixel_format);
+                            mark_dirty(&mut dirty_rect, DirtyRect::full(screen_w as usize, screen_h as usize));
                         }
                         Interaction::None => {}
                     }
                     interaction = Interaction::None;
                 }
 
-                // Drag / resize while held
+                // Drag / resize with accumulated deltas
                 if left {
                     match interaction {
                         Interaction::Dragging { window_idx } => {
+                            let old_rect = window_screen_rect(&windows[window_idx]);
                             let win = &mut windows[window_idx];
                             let min_x = BORDER_WIDTH as i32;
                             let min_y = (BORDER_WIDTH + TITLE_BAR_HEIGHT) as i32;
                             win.content_x =
-                                (win.content_x as i32 + dx as i32).max(min_x) as usize;
+                                (win.content_x as i32 + total_dx).max(min_x) as usize;
                             win.content_y =
-                                (win.content_y as i32 + dy as i32).max(min_y) as usize;
+                                (win.content_y as i32 + total_dy).max(min_y) as usize;
+                            let new_rect = window_screen_rect(&windows[window_idx]);
+                            mark_dirty(&mut dirty_rect, old_rect.union(new_rect));
                         }
                         Interaction::Resizing { window_idx } => {
+                            let old_rect = window_screen_rect(&windows[window_idx]);
                             let win = &mut windows[window_idx];
-                            win.width = (win.width as i32 + dx as i32)
+                            win.width = (win.width as i32 + total_dx)
                                 .max(MIN_CONTENT_WIDTH as i32)
                                 as usize;
-                            win.height = (win.height as i32 + dy as i32)
+                            win.height = (win.height as i32 + total_dy)
                                 .max(MIN_CONTENT_HEIGHT as i32)
                                 as usize;
+                            let new_rect = window_screen_rect(&windows[window_idx]);
+                            mark_dirty(&mut dirty_rect, old_rect.union(new_rect));
                         }
                         Interaction::None => {
                             // Forward mouse move to focused app for drag selection
@@ -961,14 +1103,15 @@ fn main() {
                     }
                 }
 
-                // Scroll events
-                if scroll != 0 {
+                // Scroll with accumulated total
+                if total_scroll != 0 {
                     if let Some(idx) = focused_window_idx(&windows) {
                         if let HitZone::Content(_) =
                             hit_test(&windows, cursor_x, cursor_y, screen_h, launcher_open)
                         {
+                            let clamped_scroll = total_scroll.clamp(-128, 127) as i8;
                             let ev =
-                                make_mouse_event(&windows[idx], window::MOUSE_SCROLL, 0, scroll);
+                                make_mouse_event(&windows[idx], window::MOUSE_SCROLL, 0, clamped_scroll);
                             message::send(
                                 windows[idx].pid,
                                 Message::new(window::MSG_MOUSE_INPUT, ev),
@@ -978,7 +1121,6 @@ fn main() {
                 }
 
                 prev_buttons = buttons;
-                dirty = true;
             }
         }
 
@@ -1048,11 +1190,11 @@ fn main() {
                             },
                         ),
                     );
-                    dirty = true;
+                    mark_dirty(&mut dirty_rect, DirtyRect::full(screen_w, screen_h));
                 }
                 window::MSG_PRESENT => {
-                    if let Some(_win) = windows.iter().find(|w| w.pid == sender) {
-                        dirty = true;
+                    if let Some(win) = windows.iter().find(|w| w.pid == sender) {
+                        mark_dirty(&mut dirty_rect, window_screen_rect(win));
                     }
                 }
                 window::MSG_CLIPBOARD_SET => {
@@ -1060,6 +1202,48 @@ fn main() {
                     clipboard = String::from_utf8_lossy(&bytes).into_owned();
                 }
                 _ => {}
+            }
+        }
+
+        // Refresh taskbar once per second for clock + stats
+        let now = io::clock_nanos();
+        if now - last_taskbar_update >= 1_000_000_000 {
+            last_taskbar_update = now;
+            let taskbar_dirty = DirtyRect {
+                x: 0, y: screen_h as usize - TASKBAR_HEIGHT,
+                w: screen_w as usize, h: TASKBAR_HEIGHT,
+            };
+            mark_dirty(&mut dirty_rect, taskbar_dirty);
+        }
+
+        // Composite and present dirty region
+        if let Some(rect) = dirty_rect.take() {
+            let rect = rect.clamp(screen_w as usize, screen_h as usize);
+            if rect.w > 0 && rect.h > 0 {
+                // Update system stats from sysinfo
+                let mut si = [0u8; 48];
+                let mut stats = SystemStats { used_mb: 0, total_mb: 0, cpu_pct };
+                if io::sysinfo(&mut si) >= 48 {
+                    let total_mem = u64::from_le_bytes(si[0..8].try_into().unwrap());
+                    let used_mem = u64::from_le_bytes(si[8..16].try_into().unwrap());
+                    let busy = u64::from_le_bytes(si[32..40].try_into().unwrap());
+                    let total = u64::from_le_bytes(si[40..48].try_into().unwrap());
+                    let d_busy = busy.wrapping_sub(prev_busy_ticks);
+                    let d_total = total.wrapping_sub(prev_total_ticks);
+                    if d_total > 0 {
+                        cpu_pct = d_busy * 100 / d_total;
+                    }
+                    prev_busy_ticks = busy;
+                    prev_total_ticks = total;
+                    stats = SystemStats {
+                        used_mb: used_mem / (1024 * 1024),
+                        total_mb: total_mem / (1024 * 1024),
+                        cpu_pct,
+                    };
+                }
+
+                redraw(&screen, &font, &windows, &icons, &wallpaper, launcher_open, &stats, rect);
+                io::gpu_present(rect.x as u32, rect.y as u32, rect.w as u32, rect.h as u32);
             }
         }
     }

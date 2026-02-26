@@ -1,4 +1,5 @@
 use core::arch::naked_asm;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::cpu;
 use super::cpu::{outb, io_wait};
@@ -8,6 +9,13 @@ use crate::{symbols, process, log};
 use alloc::format;
 
 use crate::sync::Lock;
+
+static CPU_BUSY_TICKS: AtomicU64 = AtomicU64::new(0);
+static CPU_TOTAL_TICKS: AtomicU64 = AtomicU64::new(0);
+
+pub fn cpu_ticks() -> (u64, u64) {
+    (CPU_BUSY_TICKS.load(Ordering::Relaxed), CPU_TOTAL_TICKS.load(Ordering::Relaxed))
+}
 
 // PIC ports
 const PIC1_CMD: u16 = 0x20;
@@ -214,21 +222,25 @@ extern "C" fn timer_entry() {
         "swapgs",
         "iretq",
 
-        // Ring 0: EOI only
+        // Ring 0: EOI + count idle tick
         "2:",
         "push rax",
         "push rdx",
         "mov rdx, [rip + LAPIC_BASE]",
         "mov dword ptr [rdx + 0xB0], 0",
+        "lock inc qword ptr [rip + {total_ticks}]",
         "pop rdx",
         "pop rax",
         "iretq",
         handler = sym timer_handler,
+        total_ticks = sym CPU_TOTAL_TICKS,
     );
 }
 
 extern "C" fn timer_handler() {
     crate::arch::apic::eoi();
+    CPU_BUSY_TICKS.fetch_add(1, Ordering::Relaxed);
+    CPU_TOTAL_TICKS.fetch_add(1, Ordering::Relaxed);
     crate::scheduler::preempt();
 }
 

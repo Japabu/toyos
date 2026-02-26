@@ -7,7 +7,7 @@ name = "font"
 version = "0.1.0"
 
 [[package]]
-name = "terminal"
+name = "snake"
 version = "0.1.0"
 dependencies = [
  "font",

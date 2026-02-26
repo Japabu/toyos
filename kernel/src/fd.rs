@@ -25,6 +25,7 @@ fn as_bytes<T: Sized>(val: &T) -> &[u8] {
 #[derive(Clone, Copy)]
 pub struct FramebufferInfo {
     pub token: [u32; 2],
+    pub cursor_token: u32,
     pub width: u32,
     pub height: u32,
     pub stride: u32,
@@ -149,14 +150,18 @@ pub fn try_read(table: &mut FdTable, fd: u64, buf: &mut [u8]) -> Option<u64> {
         }
         Descriptor::Mouse => {
             crate::drivers::xhci::poll_global();
-            if let Some(event) = mouse::try_read_event() {
-                let bytes = as_bytes(&event);
-                let count = buf.len().min(bytes.len());
-                buf[..count].copy_from_slice(&bytes[..count]);
-                Some(count as u64)
-            } else {
-                None
+            let event_size = core::mem::size_of::<mouse::MouseEvent>();
+            let mut count = 0;
+            while count + event_size <= buf.len() {
+                if let Some(event) = mouse::try_read_event() {
+                    let bytes = as_bytes(&event);
+                    buf[count..count + event_size].copy_from_slice(bytes);
+                    count += event_size;
+                } else {
+                    break;
+                }
             }
+            if count > 0 { Some(count as u64) } else { None }
         }
         Descriptor::Framebuffer(info) => {
             let bytes = as_bytes(info);

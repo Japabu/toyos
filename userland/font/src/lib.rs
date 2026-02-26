@@ -19,72 +19,30 @@ pub struct Font {
 }
 
 impl Font {
-    /// Rasterize a TTF at the given cell dimensions.
-    pub fn new(ttf_bytes: &[u8], cell_width: usize, cell_height: usize) -> Self {
-        let font = fontdue::Font::from_bytes(ttf_bytes, fontdue::FontSettings::default())
-            .expect("failed to parse TTF");
+    /// Load a pre-rasterized font from the binary format produced at build time.
+    ///
+    /// Format: [u16 width][u16 height][u32 glyph_count][codepoints...][alpha data...]
+    pub fn from_prebuilt(bytes: &[u8]) -> Self {
+        let width = u16::from_le_bytes([bytes[0], bytes[1]]) as usize;
+        let height = u16::from_le_bytes([bytes[2], bytes[3]]) as usize;
+        let glyph_count = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as usize;
 
-        let mut codepoints: Vec<u32> = (0u32..=255).collect();
-        codepoints.extend(0x2500u32..=0x257F); // Box Drawing
-        codepoints.extend(0x2580u32..=0x259F); // Block Elements
-
-        // Find the largest pixel size that fits all printable ASCII glyphs in the cell
-        let mut px_size = cell_height as f32;
-        loop {
-            let lm = font.horizontal_line_metrics(px_size).unwrap();
-            let asc = lm.ascent.ceil() as i32;
-            let fits = (0x20u32..=0x7E).all(|ch| {
-                let (m, _) = font.rasterize(char::from_u32(ch).unwrap(), px_size);
-                let glyph_top = asc - m.height as i32 - m.ymin;
-                glyph_top >= 0
-                    && (glyph_top as usize) + m.height <= cell_height
-                    && m.width <= cell_width
-            });
-            if fits {
-                break;
-            }
-            px_size -= 0.25;
-            assert!(
-                px_size > 2.0,
-                "could not find a font size that fits {}x{}",
-                cell_width,
-                cell_height,
-            );
+        let cp_start = 8;
+        let cp_end = cp_start + glyph_count * 4;
+        let mut codepoints = Vec::with_capacity(glyph_count);
+        for i in 0..glyph_count {
+            let off = cp_start + i * 4;
+            codepoints.push(u32::from_le_bytes([
+                bytes[off],
+                bytes[off + 1],
+                bytes[off + 2],
+                bytes[off + 3],
+            ]));
         }
 
-        let ascent = font.horizontal_line_metrics(px_size).unwrap().ascent.ceil() as i32;
-        let glyph_count = codepoints.len();
-        let mut data = vec![0u8; glyph_count * cell_width * cell_height];
+        let data = bytes[cp_end..].to_vec();
 
-        for (idx, &cp) in codepoints.iter().enumerate() {
-            let Some(c) = char::from_u32(cp) else { continue };
-            let (metrics, bitmap) = font.rasterize(c, px_size);
-            if metrics.width == 0 || metrics.height == 0 {
-                continue;
-            }
-
-            let x_offset = ((cell_width as i32 - metrics.width as i32) / 2).max(0) as usize;
-            let glyph_top = ascent - metrics.height as i32 - metrics.ymin;
-            let y_offset = glyph_top.max(0) as usize;
-            let glyph_base = idx * cell_width * cell_height;
-
-            for gy in 0..metrics.height {
-                let cell_y = y_offset + gy;
-                if cell_y >= cell_height {
-                    break;
-                }
-                for gx in 0..metrics.width {
-                    let cell_x = x_offset + gx;
-                    if cell_x >= cell_width {
-                        break;
-                    }
-                    data[glyph_base + cell_y * cell_width + cell_x] =
-                        bitmap[gy * metrics.width + gx];
-                }
-            }
-        }
-
-        Self { width: cell_width, height: cell_height, codepoints, data }
+        Self { width, height, codepoints, data }
     }
 
     pub fn width(&self) -> usize {

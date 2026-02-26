@@ -201,8 +201,11 @@ fn idle_poll(table: &mut ProcessTable) {
                     proc.state = ProcessState::Ready;
                 }
             }
-            ProcessState::BlockedPoll { fds: ref poll_fds, len } => {
-                if poll_has_ready_fd(poll_fds, len, &proc.fds) || proc.messages.has_messages() {
+            ProcessState::BlockedPoll { fds: ref poll_fds, len, deadline } => {
+                if poll_has_ready_fd(poll_fds, len, &proc.fds)
+                    || proc.messages.has_messages()
+                    || (deadline > 0 && crate::clock::nanos_since_boot() >= deadline)
+                {
                     proc.state = ProcessState::Ready;
                 }
             }
@@ -227,7 +230,7 @@ pub fn wake_pipe_readers(pipe_id: usize) {
             ProcessState::BlockedPipeRead(id) if id == pipe_id => {
                 proc.state = ProcessState::Ready;
             }
-            ProcessState::BlockedPoll { fds: ref poll_fds, len } => {
+            ProcessState::BlockedPoll { fds: ref poll_fds, len, .. } => {
                 if poll_has_ready_fd(poll_fds, len, &proc.fds) {
                     proc.state = ProcessState::Ready;
                 }

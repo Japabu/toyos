@@ -249,3 +249,18 @@ pub unsafe fn init(
     r.sort_unstable_by_key(|r| r.start);
     merge_in_place(r);
 }
+
+/// Returns (total_usable_bytes, reserved_bytes).
+pub fn memory_stats() -> (u64, u64) {
+    ALLOCATOR.acquire();
+    let total: u64 = unsafe { &*ALLOCATOR.usable.get() }
+        .iter()
+        .map(|r| r.end - r.start)
+        .sum();
+    let used: u64 = unsafe { &*ALLOCATOR.reserved.get() }
+        .iter()
+        .map(|r| r.end - r.start)
+        .sum();
+    ALLOCATOR.release();
+    (total, used)
+}

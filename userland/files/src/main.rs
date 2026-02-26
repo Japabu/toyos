@@ -63,8 +63,8 @@ impl FileBrowser {
             window.pixel_format(),
         );
 
-        let ttf_data = fs::read("/initrd/JetBrainsMono-Regular.ttf").expect("failed to read font");
-        let font = font::Font::new(&ttf_data, 8, 16);
+        let font_data = fs::read("/initrd/JetBrainsMono-8x16.font").expect("failed to read font");
+        let font = font::Font::from_prebuilt(&font_data);
 
         let folder_svg = fs::read("/initrd/folder-bold.svg").expect("failed to read folder icon");
         let file_svg = fs::read("/initrd/file-bold.svg").expect("failed to read file icon");

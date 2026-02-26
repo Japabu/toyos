@@ -46,6 +46,10 @@ impl Sprite {
         self.height
     }
 
+    pub fn data(&self) -> &[u8] {
+        &self.data
+    }
+
     /// Alpha-blended blit onto a raw pixel buffer.
     /// `pixel_format`: 0 = RGB, 1 = BGR (matches WindowInfo.pixel_format).
     pub fn draw(

@@ -44,21 +44,10 @@ impl Framebuffer {
         if x >= self.width || y >= self.height {
             return;
         }
+        let pixel = self.encode_pixel(color);
         let offset = (y * self.stride + x) * 4;
         unsafe {
-            let pixel = self.addr.add(offset);
-            match self.pixel_format {
-                PixelFormat::Rgb => {
-                    ptr::write_volatile(pixel, color.r);
-                    ptr::write_volatile(pixel.add(1), color.g);
-                    ptr::write_volatile(pixel.add(2), color.b);
-                }
-                PixelFormat::Bgr => {
-                    ptr::write_volatile(pixel, color.b);
-                    ptr::write_volatile(pixel.add(1), color.g);
-                    ptr::write_volatile(pixel.add(2), color.r);
-                }
-            }
+            ptr::copy_nonoverlapping(pixel.as_ptr(), self.addr.add(offset), 4);
         }
     }
 
@@ -75,8 +64,7 @@ impl Framebuffer {
             let row_offset = y * self.stride * 4;
             for x in 0..self.width {
                 unsafe {
-                    let dst = self.addr.add(row_offset + x * 4);
-                    ptr::write_volatile(dst as *mut [u8; 4], pixel);
+                    ptr::copy_nonoverlapping(pixel.as_ptr(), self.addr.add(row_offset + x * 4), 4);
                 }
             }
         }
@@ -94,8 +82,7 @@ impl Framebuffer {
             let row_offset = py * self.stride * 4;
             for px in x..x_end {
                 unsafe {
-                    let dst = self.addr.add(row_offset + px * 4);
-                    ptr::write_volatile(dst as *mut [u8; 4], pixel);
+                    ptr::copy_nonoverlapping(pixel.as_ptr(), self.addr.add(row_offset + px * 4), 4);
                 }
             }
         }
@@ -110,6 +97,21 @@ impl Framebuffer {
             ptr::copy(src, dst, count);
         }
         self.fill_rows(self.height - pixel_rows, self.height, bg);
+    }
+
+    pub fn scroll_down(&self, pixel_rows: usize, bg: Color) {
+        if pixel_rows >= self.height {
+            self.clear(bg);
+            return;
+        }
+        let row_bytes = self.stride * 4;
+        unsafe {
+            let src = self.addr;
+            let dst = self.addr.add(pixel_rows * row_bytes);
+            let count = (self.height - pixel_rows) * row_bytes;
+            ptr::copy(src, dst, count);
+        }
+        self.fill_rows(0, pixel_rows, bg);
     }
 }
 

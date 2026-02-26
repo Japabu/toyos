@@ -198,6 +198,7 @@ fn kernel_main(
     let gpu = virtio_gpu::init(ecam_base).expect("VirtIO GPU not found");
     let fb_info = fd::FramebufferInfo {
         token: gpu.tokens,
+        cursor_token: gpu.cursor_token,
         width: gpu.width,
         height: gpu.height,
         stride: gpu.width,

@@ -50,7 +50,7 @@ pub enum ProcessState {
     BlockedPipeWrite(usize),
     BlockedWaitPid(u32),
     BlockedThreadJoin(u32),
-    BlockedPoll { fds: [u64; 8], len: u32 },
+    BlockedPoll { fds: [u64; 8], len: u32, deadline: u64 },
     BlockedRecvMsg,
     Zombie(i32),
 }
@@ -77,9 +77,9 @@ pub struct Process {
     pub heap_owner: u32,
     // ELF memory tracking
     elf_base: *mut u8,
-    elf_layout: Layout,
+    pub elf_layout: Layout,
     stack_base: *mut u8,
-    stack_layout: Layout,
+    pub stack_layout: Layout,
     // Thread-local storage
     pub fs_base: u64,
     tls_template: u64,
@@ -89,6 +89,8 @@ pub struct Process {
     tls_block_layout: Layout,
     // Crash diagnostics
     pub symbols: ProcessSymbols,
+    // Process name (filename from argv[0], null-terminated)
+    pub name: [u8; 28],
 }
 
 pub struct ProcessTable {
@@ -220,6 +222,7 @@ pub fn init_process0(
         tls_block,
         tls_block_layout,
         symbols: syms,
+        name: *b"init\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0",
     });
     table.procs.get_mut(pid).unwrap().heap_owner = pid;
     percpu::set_current_pid(pid);
@@ -378,10 +381,19 @@ pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64) -> u64 {
         tls_block,
         tls_block_layout,
         symbols: ProcessSymbols::empty(),
+        name: [0; 28],
     });
     table.procs.get_mut(tid).unwrap().pid = tid;
 
     tid as u64
+}
+
+fn make_name(path: &str) -> [u8; 28] {
+    let filename = path.rsplit('/').next().unwrap_or(path);
+    let mut name = [0u8; 28];
+    let len = filename.len().min(27);
+    name[..len].copy_from_slice(&filename.as_bytes()[..len]);
+    name
 }
 
 /// Spawn a new process from an ELF binary. Returns child PID or u64::MAX.
@@ -536,6 +548,7 @@ pub fn spawn(argv: &[&str], stdin_fd: u64, stdout_fd: u64) -> u64 {
         tls_block,
         tls_block_layout,
         symbols: syms,
+        name: make_name(path),
     });
     // Set the actual PID now that we know it
     let p = table.procs.get_mut(pid).unwrap();

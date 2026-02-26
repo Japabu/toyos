@@ -41,10 +41,11 @@ pub fn try_claim(device_type: u64, pid: u32) -> Option<Descriptor> {
             }
             let info = (*FB_INFO.lock())?;
             *owner = Some(pid);
-            // Grant GPU buffer tokens to the claiming process
+            // Grant GPU buffer and cursor tokens to the claiming process
             for &token in &info.token {
                 shared_memory::grant(token, u32::MAX, pid);
             }
+            shared_memory::grant(info.cursor_token, u32::MAX, pid);
             Some(Descriptor::Framebuffer(info))
         }
         _ => None,

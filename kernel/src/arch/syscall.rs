@@ -4,7 +4,7 @@ use alloc::vec::Vec;
 use super::{cpu, gdt, paging};
 use crate::drivers::acpi;
 use crate::sync::Lock;
-use crate::{device, fd, keyboard, log, message, pipe, process, shared_memory, user_heap, vfs};
+use crate::{allocator, device, fd, keyboard, log, message, pipe, process, shared_memory, user_heap, vfs};
 
 // MSR addresses
 const MSR_EFER: u32 = 0xC000_0080;
@@ -52,6 +52,9 @@ const SYS_FREE_SHARED: u64 = 39;
 const SYS_THREAD_SPAWN: u64 = 40;
 const SYS_THREAD_JOIN: u64 = 41;
 const SYS_CLOCK_REALTIME: u64 = 42;
+const SYS_GPU_SET_CURSOR: u64 = 43;
+const SYS_GPU_MOVE_CURSOR: u64 = 44;
+const SYS_SYSINFO: u64 = 45;
 
 // ---------------------------------------------------------------------------
 // User pointer validation
@@ -207,7 +210,7 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         SYS_PIPE => sys_pipe(),
         SYS_SPAWN => sys_spawn(a1, a2, a3, a4),
         SYS_WAITPID => sys_waitpid(a1),
-        SYS_POLL => sys_poll(a1, a2),
+        SYS_POLL => sys_poll(a1, a2, a3),
         SYS_MARK_TTY => process::with_current_mut(|proc| fd::mark_tty(&mut proc.fds, a1)),
         SYS_SEND_MSG => sys_send_msg(a1, a2),
         SYS_RECV_MSG => sys_recv_msg(a1),
@@ -215,7 +218,9 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         SYS_REGISTER_NAME => sys_register_name(a1, a2),
         SYS_FIND_PID => sys_find_pid(a1, a2),
         SYS_SET_SCREEN_SIZE => { set_screen_size(a1 as u32, a2 as u32); 0 }
-        SYS_GPU_PRESENT => { crate::drivers::virtio_gpu::present(); 0 }
+        SYS_GPU_PRESENT => { crate::drivers::virtio_gpu::present_rect(a1 as u32, a2 as u32, a3 as u32, a4 as u32); 0 }
+        SYS_GPU_SET_CURSOR => { crate::drivers::virtio_gpu::set_cursor(a1 as u32, a2 as u32); 0 }
+        SYS_GPU_MOVE_CURSOR => { crate::drivers::virtio_gpu::move_cursor(a1 as u32, a2 as u32); 0 }
         SYS_ALLOC_SHARED => sys_alloc_shared(a1),
         SYS_GRANT_SHARED => sys_grant_shared(a1, a2),
         SYS_MAP_SHARED => sys_map_shared(a1),
@@ -223,6 +228,7 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         SYS_THREAD_SPAWN => process::spawn_thread(a1, a2, a3),
         SYS_THREAD_JOIN => sys_thread_join(a1),
         SYS_CLOCK_REALTIME => crate::rtc::read_time(),
+        SYS_SYSINFO => sys_sysinfo(a1, a2),
         _ => u64::MAX,
     }
 }
@@ -426,12 +432,17 @@ fn sys_waitpid(pid: u64) -> u64 {
     }
 }
 
-fn sys_poll(fds_ptr: u64, fds_len: u64) -> u64 {
+fn sys_poll(fds_ptr: u64, fds_len: u64, timeout_nanos: u64) -> u64 {
     let byte_len = fds_len.checked_mul(8).unwrap_or(u64::MAX);
     if !paging::is_user_mapped(fds_ptr, byte_len) {
         return u64::MAX;
     }
     let fds = unsafe { core::slice::from_raw_parts(fds_ptr as *const u64, fds_len as usize) };
+    let deadline = if timeout_nanos > 0 {
+        crate::clock::nanos_since_boot() + timeout_nanos
+    } else {
+        0
+    };
     loop {
         crate::drivers::xhci::poll_global();
         let result = process::with_current(|proc| {
@@ -449,10 +460,13 @@ fn sys_poll(fds_ptr: u64, fds_len: u64) -> u64 {
         if result != 0 {
             return result;
         }
+        if deadline > 0 && crate::clock::nanos_since_boot() >= deadline {
+            return 0;
+        }
         let mut poll_fds = [0u64; 8];
         let copy_len = (fds_len as usize).min(8);
         poll_fds[..copy_len].copy_from_slice(&fds[..copy_len]);
-        process::block(process::ProcessState::BlockedPoll { fds: poll_fds, len: copy_len as u32 });
+        process::block(process::ProcessState::BlockedPoll { fds: poll_fds, len: copy_len as u32, deadline });
     }
 }
 
@@ -582,6 +596,70 @@ fn sys_thread_join(tid: u64) -> u64 {
         }
         process::block(process::ProcessState::BlockedThreadJoin(tid));
     }
+}
+
+fn sys_sysinfo(buf_ptr: u64, buf_len: u64) -> u64 {
+    let Some(buf) = user_slice_mut(buf_ptr, buf_len) else { return u64::MAX };
+
+    const HEADER_SIZE: usize = 48;
+    const ENTRY_SIZE: usize = 48;
+    if buf.len() < HEADER_SIZE {
+        return u64::MAX;
+    }
+
+    let (total_mem, used_mem) = allocator::memory_stats();
+    let cpu_count = super::smp::cpu_count();
+    let uptime = crate::clock::nanos_since_boot();
+    let (busy_ticks, total_ticks) = super::idt::cpu_ticks();
+
+    let guard = process::PROCESS_TABLE.lock();
+    let table = guard.as_ref().expect("process table not initialized");
+
+    let process_count = table.procs.iter().count() as u32;
+
+    // Write header
+    buf[0..8].copy_from_slice(&total_mem.to_le_bytes());
+    buf[8..16].copy_from_slice(&used_mem.to_le_bytes());
+    buf[16..20].copy_from_slice(&cpu_count.to_le_bytes());
+    buf[20..24].copy_from_slice(&process_count.to_le_bytes());
+    buf[24..32].copy_from_slice(&uptime.to_le_bytes());
+    buf[32..40].copy_from_slice(&busy_ticks.to_le_bytes());
+    buf[40..48].copy_from_slice(&total_ticks.to_le_bytes());
+
+    // Write process entries
+    let max_entries = (buf.len() - HEADER_SIZE) / ENTRY_SIZE;
+    let mut sorted_pids: Vec<u32> = table.procs.iter().map(|(pid, _)| pid).collect();
+    sorted_pids.sort();
+
+    let mut pos = HEADER_SIZE;
+    for (i, &pid) in sorted_pids.iter().enumerate() {
+        if i >= max_entries {
+            break;
+        }
+        let proc = table.procs.get(pid).unwrap();
+
+        let state: u8 = match proc.state {
+            process::ProcessState::Running => 0,
+            process::ProcessState::Ready => 1,
+            process::ProcessState::Zombie(_) => 3,
+            _ => 2, // all Blocked variants
+        };
+        let is_thread = proc.thread_parent.is_some() as u8;
+        let parent_pid = proc.parent_pid.unwrap_or(u32::MAX);
+        let memory = (proc.elf_layout.size() + proc.stack_layout.size()) as u64;
+
+        buf[pos..pos + 4].copy_from_slice(&pid.to_le_bytes());
+        buf[pos + 4..pos + 8].copy_from_slice(&parent_pid.to_le_bytes());
+        buf[pos + 8] = state;
+        buf[pos + 9] = is_thread;
+        buf[pos + 10..pos + 12].copy_from_slice(&[0, 0]); // padding
+        buf[pos + 12..pos + 20].copy_from_slice(&memory.to_le_bytes());
+        buf[pos + 20..pos + 48].copy_from_slice(&proc.name);
+
+        pos += ENTRY_SIZE;
+    }
+
+    pos as u64
 }
 
 /// Terminate the current userspace process (called from exception handlers).

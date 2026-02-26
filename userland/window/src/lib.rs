@@ -129,10 +129,23 @@ impl Window {
         }
     }
 
-    /// Receive the next window event from the compositor.
-    /// Updates internal state on resize events.
+    /// Receive the next window event from the compositor. Blocks until an event arrives.
     pub fn recv_event(&mut self) -> Event {
         let msg = message::recv();
+        self.decode_event(msg)
+    }
+
+    /// Wait up to `timeout_nanos` for an event. Returns `None` on timeout.
+    pub fn poll_event(&mut self, timeout_nanos: u64) -> Option<Event> {
+        let result = io::poll_timeout(&[], timeout_nanos);
+        if result.messages() {
+            Some(self.recv_event())
+        } else {
+            None
+        }
+    }
+
+    fn decode_event(&mut self, msg: Message) -> Event {
         match msg.msg_type() {
             MSG_KEY_INPUT => Event::KeyInput(msg.take_payload()),
             MSG_MOUSE_INPUT => Event::MouseInput(msg.take_payload()),

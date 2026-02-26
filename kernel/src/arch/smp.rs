@@ -17,6 +17,11 @@ const DATA_OFFSET: usize = 0xF00;
 static AP_STARTED: AtomicBool = AtomicBool::new(false);
 static SMP_READY: AtomicBool = AtomicBool::new(false);
 static NEXT_CPU_ID: AtomicU32 = AtomicU32::new(1); // BSP is 0
+static CPU_COUNT: AtomicU32 = AtomicU32::new(1); // BSP counts as 1
+
+pub fn cpu_count() -> u32 {
+    CPU_COUNT.load(Ordering::Relaxed)
+}
 
 /// Signal APs that the kernel is fully initialized and they can join the scheduler.
 pub fn set_ready() {
@@ -185,6 +190,7 @@ pub fn boot_aps(madt: &MadtInfo) {
         }
 
         if AP_STARTED.load(Ordering::Acquire) {
+            CPU_COUNT.fetch_add(1, Ordering::Relaxed);
             log!("SMP: AP {} online", ap_id);
         } else {
             log!("SMP: AP {} failed to start!", ap_id);
