@@ -5,9 +5,14 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
-fn build() {
+fn build(debug: bool) {
+    let mut kernel_args = vec!["build"];
+    if debug {
+        kernel_args.push("--features");
+        kernel_args.push("debug-wait");
+    }
     if !Command::new("cargo")
-        .args(&["build"])
+        .args(&kernel_args)
         .current_dir("../kernel")
         .status()
         .expect("Failed to run cargo")
@@ -99,9 +104,11 @@ fn build() {
 }
 
 fn main() {
-    build();
+    let debug = std::env::args().any(|a| a == "--debug");
+    build(debug);
 
-    Command::new("qemu-system-x86_64")
+    let mut qemu = Command::new("qemu-system-x86_64");
+    qemu
         .arg("-machine").arg("q35")
         .arg("-cpu").arg("qemu64,+rdrand")
         .arg("-smp").arg("2")
@@ -134,8 +141,11 @@ fn main() {
         .arg("-no-reboot")
 
         // Enable gdb at port 1234
-        .arg("-s")
+        .arg("-s");
 
-        .status()
-        .expect("failed to execute process");
+    if debug {
+        eprintln!("Debug mode: kernel will wait for debugger before entering userland");
+    }
+
+    qemu.status().expect("failed to execute process");
 }

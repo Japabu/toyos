@@ -5,6 +5,7 @@ use crate::process::{ProcessState, ProcessTable, PROCESS_TABLE};
 use crate::{fd, keyboard};
 
 const KERNEL_STACK_SIZE: usize = 64 * 1024;
+const IA32_FS_BASE: u32 = 0xC0000100;
 
 /// Block the current process and switch to the next ready one.
 pub fn block(reason: ProcessState) {
@@ -63,15 +64,19 @@ fn schedule(cur_state: ProcessState) {
         let new_proc = table.procs.get(new_pid).unwrap();
         let new_rsp = new_proc.kernel_rsp;
         let new_cr3 = new_proc.cr3;
+        let new_fs_base = new_proc.fs_base;
         let new_ks_top = new_proc.kernel_stack_base as u64 + KERNEL_STACK_SIZE as u64;
 
         table.procs.get_mut(new_pid).unwrap().state = ProcessState::Running;
         percpu::set_current_pid(new_pid);
 
+        // Save current FS base (TLS)
+        table.procs.get_mut(cur_pid).unwrap().fs_base = cpu::rdmsr(IA32_FS_BASE);
         let old_rsp_ptr = &mut table.procs.get_mut(cur_pid).unwrap().kernel_rsp as *mut u64;
         unsafe { percpu::set_kernel_stack(new_ks_top); }
 
         unsafe { cpu::write_cr3(new_cr3); }
+        cpu::wrmsr(IA32_FS_BASE, new_fs_base);
 
         // Hold lock through context_switch — the resuming side releases it.
         core::mem::forget(guard);
@@ -81,6 +86,8 @@ fn schedule(cur_state: ProcessState) {
     }
 
     // No Ready process — switch to per-CPU idle stack.
+    // Save current FS base (TLS)
+    table.procs.get_mut(cur_pid).unwrap().fs_base = cpu::rdmsr(IA32_FS_BASE);
     let old_rsp_ptr = &mut table.procs.get_mut(cur_pid).unwrap().kernel_rsp as *mut u64;
     percpu::set_current_pid(u32::MAX);
     unsafe { percpu::set_kernel_stack(percpu::idle_stack_top()); }
@@ -129,6 +136,7 @@ fn cpu_idle_loop() -> ! {
                 let new_proc = table.procs.get(new_pid).unwrap();
                 let new_rsp = new_proc.kernel_rsp;
                 let new_cr3 = new_proc.cr3;
+                let new_fs_base = new_proc.fs_base;
                 let new_ks_top = new_proc.kernel_stack_base as u64 + KERNEL_STACK_SIZE as u64;
 
                 table.procs.get_mut(new_pid).unwrap().state = ProcessState::Running;
@@ -136,6 +144,7 @@ fn cpu_idle_loop() -> ! {
                 unsafe { percpu::set_kernel_stack(new_ks_top); }
 
                 unsafe { cpu::write_cr3(new_cr3); }
+                cpu::wrmsr(IA32_FS_BASE, new_fs_base);
 
                 core::mem::forget(guard);
                 unsafe { context_switch(percpu::idle_rsp_ptr(), new_rsp); }
@@ -187,7 +196,7 @@ fn idle_poll(table: &mut ProcessTable) {
             ProcessState::BlockedPipeWrite(_) => {
                 proc.state = ProcessState::Ready;
             }
-            ProcessState::BlockedWaitPid(child_pid) => {
+            ProcessState::BlockedWaitPid(child_pid) | ProcessState::BlockedThreadJoin(child_pid) => {
                 if zombie_pids.contains(&child_pid) {
                     proc.state = ProcessState::Ready;
                 }

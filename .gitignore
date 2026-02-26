@@ -3,3 +3,4 @@ target/
 .vscode/
 toolchain/.sysroot-stamp
 .mcp.json
+phosphor-icons

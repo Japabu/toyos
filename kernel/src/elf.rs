@@ -4,13 +4,19 @@ use crate::arch::paging::PAGE_2M;
 use crate::log;
 use elf::ElfBytes;
 use elf::endian::AnyEndian;
-use elf::abi::{PT_LOAD, ET_DYN, EM_X86_64, R_X86_64_RELATIVE};
+use elf::abi::{PT_LOAD, PT_TLS, ET_DYN, EM_X86_64, R_X86_64_RELATIVE};
 
 pub struct LoadedElf {
     pub entry: u64,
     pub base: u64,
     pub base_ptr: *mut u8,
     pub load_size: usize,
+    /// Runtime address of TLS template data (.tdata) in the loaded image.
+    pub tls_template: u64,
+    /// Size of initialized TLS data (.tdata).
+    pub tls_filesz: usize,
+    /// Total TLS size (.tdata + .tbss).
+    pub tls_memsz: usize,
 }
 
 /// Parse, validate, and load an ELF binary into memory.
@@ -98,10 +104,26 @@ pub fn load(data: &[u8]) -> Result<LoadedElf, &'static str> {
 
     log!("ELF: {} relocations applied", reloc_count);
 
+    // Parse PT_TLS segment for thread-local storage
+    let mut tls_template = 0u64;
+    let mut tls_filesz = 0usize;
+    let mut tls_memsz = 0usize;
+    for phdr in segments.iter() {
+        if phdr.p_type == PT_TLS {
+            tls_template = base + phdr.p_vaddr;
+            tls_filesz = phdr.p_filesz as usize;
+            tls_memsz = phdr.p_memsz as usize;
+            log!("ELF: TLS template at {:#x}, filesz={}, memsz={}", tls_template, tls_filesz, tls_memsz);
+        }
+    }
+
     Ok(LoadedElf {
         entry: base + ehdr.e_entry,
         base,
         base_ptr,
         load_size,
+        tls_template,
+        tls_filesz,
+        tls_memsz,
     })
 }

@@ -102,22 +102,6 @@ impl Framebuffer {
         }
     }
 
-    pub fn clear(&self, color: Color) {
-        let pixel = self.encode_pixel(color);
-        unsafe {
-            // Fill first scanline
-            let first_row = self.back();
-            Self::fill_row(first_row, &pixel, self.stride);
-
-            // Copy to all remaining scanlines
-            let row_bytes = self.stride * 4;
-            for y in 1..self.height {
-                let dst = self.back().add(y * row_bytes);
-                ptr::copy_nonoverlapping(first_row, dst, row_bytes);
-            }
-        }
-    }
-
     /// Blit a buffer to a region of the back buffer (row-by-row memcpy).
     /// `src_stride` is the width of the source buffer (may be wider than `w` during resize).
     pub fn blit(&self, x: usize, y: usize, w: usize, h: usize, src_stride: usize, buffer: &[u8]) {

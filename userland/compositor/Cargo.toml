@@ -5,5 +5,9 @@ edition = "2021"
 
 [dependencies]
 font = { path = "../font" }
+jpeg-decoder = { version = "0.3", default-features = false }
 sprite = { path = "../sprite" }
 window = { path = "../window" }
+
+[profile.dev]
+opt-level = 2

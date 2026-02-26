@@ -7,6 +7,9 @@ pub fn collect() -> Vec<(String, Vec<u8>)> {
     let ttf = fs::read("assets/JetBrainsMono-Regular.ttf").expect("Failed to read font TTF");
     files.push(("JetBrainsMono-Regular.ttf".to_string(), ttf));
 
+    let wallpaper = fs::read("assets/wallpaper.jpg").expect("Failed to read wallpaper");
+    files.push(("wallpaper.jpg".to_string(), wallpaper));
+
     for entry in fs::read_dir("assets/icons").expect("Failed to read assets/icons") {
         let entry = entry.expect("Failed to read dir entry");
         let path = entry.path();

@@ -19,7 +19,6 @@ const TASKBAR_ITEM_WIDTH: usize = 160;
 const TASKBAR_PADDING: usize = 4;
 const DOUBLE_CLICK_NS: u64 = 400_000_000;
 
-const DESKTOP_COLOR: Color = Color { r: 0x1a, g: 0x1a, b: 0x2e };
 const FOCUSED_TITLE_COLOR: Color = Color { r: 0x3a, g: 0x3a, b: 0x4e };
 const UNFOCUSED_TITLE_COLOR: Color = Color { r: 0x28, g: 0x28, b: 0x32 };
 const FOCUSED_BORDER_COLOR: Color = Color { r: 0x58, g: 0x58, b: 0x6e };
@@ -198,6 +197,36 @@ fn restore_window(win: &mut WindowState, pixel_format: u32) {
     resize_window(win, w, h, pixel_format);
 }
 
+/// Scale RGB image and convert to native framebuffer pixel format (4 bytes/pixel).
+fn scale_wallpaper(
+    src: &[u8],
+    src_w: usize,
+    src_h: usize,
+    dst_w: usize,
+    dst_h: usize,
+    bgr: bool,
+) -> Vec<u8> {
+    let mut dst = vec![0u8; dst_w * dst_h * 4];
+    for y in 0..dst_h {
+        let sy = y * src_h / dst_h;
+        for x in 0..dst_w {
+            let sx = x * src_w / dst_w;
+            let si = (sy * src_w + sx) * 3;
+            let di = (y * dst_w + x) * 4;
+            if bgr {
+                dst[di] = src[si + 2];
+                dst[di + 1] = src[si + 1];
+                dst[di + 2] = src[si];
+            } else {
+                dst[di] = src[si];
+                dst[di + 1] = src[si + 1];
+                dst[di + 2] = src[si + 2];
+            }
+        }
+    }
+    dst
+}
+
 fn draw_icon_centered(
     screen: &Framebuffer,
     icon: &sprite::Sprite,
@@ -284,8 +313,9 @@ fn redraw(
     cursor_y: i32,
     cursor: &sprite::Sprite,
     icons: &TitleBarIcons,
+    wallpaper: &[u8],
 ) {
-    screen.clear(DESKTOP_COLOR);
+    screen.blit(0, 0, screen.width(), screen.height(), screen.width(), wallpaper);
 
     let focused_idx = focused_window_idx(windows);
 
@@ -438,6 +468,26 @@ fn main() {
         std::fs::read("/initrd/arrow-down-right-bold.svg").expect("failed to read resize cursor");
     let cursor_resize = sprite::Sprite::from_svg_colored(&resize_svg, 20, [255, 255, 255]);
 
+    eprintln!("compositor: decoding wallpaper...");
+    let wallpaper = {
+        let jpg_data = std::fs::read("/initrd/wallpaper.jpg").expect("failed to read wallpaper");
+        let mut decoder = jpeg_decoder::Decoder::new(std::io::Cursor::new(&jpg_data));
+        let pixels = decoder.decode().expect("failed to decode wallpaper");
+        let info = decoder.info().unwrap();
+        eprintln!(
+            "compositor: wallpaper decoded {}x{}, scaling to {}x{}",
+            info.width, info.height, screen.width(), screen.height()
+        );
+        scale_wallpaper(
+            &pixels,
+            info.width as usize,
+            info.height as usize,
+            screen.width(),
+            screen.height(),
+            screen.pixel_format_raw() != 0,
+        )
+    };
+
     let icons = TitleBarIcons {
         minimize: sprite::Sprite::from_svg_colored(
             &std::fs::read("/initrd/minus-bold.svg").expect("failed to read minimize icon"),
@@ -455,6 +505,8 @@ fn main() {
             [255, 255, 255],
         ),
     };
+
+    eprintln!("compositor: ready");
 
     Command::new("/initrd/terminal")
         .spawn()
@@ -488,6 +540,7 @@ fn main() {
                 cursor_y,
                 active_cursor,
                 &icons,
+                &wallpaper,
             );
             io::gpu_present();
             screen.swap();

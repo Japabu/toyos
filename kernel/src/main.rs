@@ -206,8 +206,18 @@ fn kernel_main(
     syscall::set_screen_size(fb_info.width, fb_info.height);
     kernel::device::set_framebuffer_info(fb_info);
 
+    #[cfg(feature = "debug-wait")]
+    {
+        use core::sync::atomic::AtomicBool;
+        static DEBUG_WAIT: AtomicBool = AtomicBool::new(true);
+        log!("debug: waiting for debugger — set DEBUG_WAIT=false to continue");
+        while DEBUG_WAIT.load(core::sync::atomic::Ordering::Relaxed) {
+            core::hint::spin_loop();
+        }
+    }
+
     // Signal APs to join the scheduler, then start process 0 (never returns)
     smp::set_ready();
-    process::init_process0(loaded.entry, sp, loaded.base_ptr, elf_layout, stack_base, stack_layout, init_cr3, init_syms);
+    process::init_process0(loaded.entry, sp, loaded.base_ptr, elf_layout, stack_base, stack_layout, init_cr3, init_syms, loaded.tls_template, loaded.tls_filesz, loaded.tls_memsz);
     unreachable!();
 }

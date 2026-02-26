@@ -65,7 +65,7 @@ pub fn create_boot_image(initrd_bytes: &[u8]) -> Vec<u8> {
 fn create_fat_volume(kernel: &[u8], bootloader: &[u8], initrd: &[u8]) -> Vec<u8> {
     let content_size = kernel.len() + bootloader.len() + initrd.len();
     // FAT32 requires at least 65525 clusters; ensure volume is large enough
-    let total_size = (content_size + 1024 * 1024).max(34 * 1024 * 1024);
+    let total_size = (content_size + 4 * 1024 * 1024).max(34 * 1024 * 1024);
 
     let mut volume = vec![0u8; total_size];
 

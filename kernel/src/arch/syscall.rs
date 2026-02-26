@@ -49,6 +49,8 @@ const SYS_ALLOC_SHARED: u64 = 36;
 const SYS_GRANT_SHARED: u64 = 37;
 const SYS_MAP_SHARED: u64 = 38;
 const SYS_FREE_SHARED: u64 = 39;
+const SYS_THREAD_SPAWN: u64 = 40;
+const SYS_THREAD_JOIN: u64 = 41;
 
 // ---------------------------------------------------------------------------
 // User pointer validation
@@ -100,6 +102,21 @@ fn user_mut<T>(ptr: u64) -> Option<&'static mut T> {
         return None;
     }
     Some(unsafe { &mut *(ptr as *mut T) })
+}
+
+// ---------------------------------------------------------------------------
+// Heap owner routing (threads share parent's heap)
+// ---------------------------------------------------------------------------
+
+/// Run a closure with the heap owner's user_heap. For normal processes this is
+/// the process itself; for threads it's the parent process.
+fn with_heap_owner<R>(f: impl FnOnce(&mut Vec<(u64, u64)>) -> R) -> R {
+    let mut guard = process::PROCESS_TABLE.lock();
+    let table = guard.as_mut().expect("process table not initialized");
+    let pid = crate::arch::percpu::current_pid();
+    let owner_pid = table.procs.get(pid).unwrap().heap_owner;
+    let owner = table.procs.get_mut(owner_pid).unwrap();
+    f(&mut owner.user_heap)
 }
 
 // ---------------------------------------------------------------------------
@@ -163,9 +180,9 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             let Some(buf) = user_slice_mut(a2, a3) else { return u64::MAX };
             sys_read(a1, buf)
         }
-        SYS_ALLOC => process::with_current_mut(|p| crate::user_heap::alloc(&mut p.user_heap, a1 as usize, a2 as usize)),
-        SYS_FREE => { process::with_current_mut(|p| crate::user_heap::free(&mut p.user_heap, a1 as *mut u8, a2 as usize)); 0 }
-        SYS_REALLOC => process::with_current_mut(|p| crate::user_heap::realloc(&mut p.user_heap, a1 as *mut u8, a2 as usize, a3 as usize, a4 as usize)),
+        SYS_ALLOC => with_heap_owner(|heap| user_heap::alloc(heap, a1 as usize, a2 as usize)),
+        SYS_FREE => { with_heap_owner(|heap| { user_heap::free(heap, a1 as *mut u8, a2 as usize); 0 }) }
+        SYS_REALLOC => with_heap_owner(|heap| user_heap::realloc(heap, a1 as *mut u8, a2 as usize, a3 as usize, a4 as usize)),
         SYS_EXIT => sys_exit(a1 as i32),
         SYS_RANDOM => sys_random(a1, a2),
         SYS_SCREEN_SIZE => screen_size(),
@@ -202,6 +219,8 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         SYS_GRANT_SHARED => sys_grant_shared(a1, a2),
         SYS_MAP_SHARED => sys_map_shared(a1),
         SYS_FREE_SHARED => sys_free_shared(a1),
+        SYS_THREAD_SPAWN => process::spawn_thread(a1, a2, a3),
+        SYS_THREAD_JOIN => sys_thread_join(a1),
         _ => u64::MAX,
     }
 }
@@ -462,8 +481,8 @@ fn sys_recv_msg(msg_ptr: u64) -> u64 {
         if let Some(msg) = msg {
             let (data, len) = if !msg.payload.is_empty() {
                 // Allocate in receiver's user heap and copy payload
-                let addr = process::with_current_mut(|proc| {
-                    user_heap::alloc(&mut proc.user_heap, msg.payload.len(), 8)
+                let addr = with_heap_owner(|heap| {
+                    user_heap::alloc(heap, msg.payload.len(), 8)
                 });
                 if addr != 0 {
                     unsafe {
@@ -551,6 +570,16 @@ fn sys_map_shared(token: u64) -> u64 {
 fn sys_free_shared(token: u64) -> u64 {
     let pid = process::current_pid();
     if shared_memory::free(token as u32, pid) { 0 } else { u64::MAX }
+}
+
+fn sys_thread_join(tid: u64) -> u64 {
+    let tid = tid as u32;
+    loop {
+        if let Some(_code) = process::collect_zombie(tid) {
+            return 0;
+        }
+        process::block(process::ProcessState::BlockedThreadJoin(tid));
+    }
 }
 
 /// Terminate the current userspace process (called from exception handlers).
