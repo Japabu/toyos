@@ -18,8 +18,8 @@ fn main() {
         window.width(),
         window.pixel_format(),
     );
-    let font_data = std::fs::read("/initrd/font.bin").expect("failed to read font");
-    let font = font::Font::new(&font_data);
+    let ttf_data = std::fs::read("/initrd/JetBrainsMono-Regular.ttf").expect("failed to read font");
+    let font = font::Font::new(&ttf_data, 8, 16);
     let mut console = console::Console::new(fb, font);
 
     let mut child = Command::new("/initrd/shell")

@@ -46,8 +46,8 @@ impl FileBrowser {
             window.pixel_format(),
         );
 
-        let font_data = fs::read("/initrd/font.bin").expect("failed to read font");
-        let font = font::Font::new(&font_data);
+        let ttf_data = fs::read("/initrd/JetBrainsMono-Regular.ttf").expect("failed to read font");
+        let font = font::Font::new(&ttf_data, 8, 16);
 
         let folder_svg = fs::read("/initrd/folder-bold.svg").expect("failed to read folder icon");
         let file_svg = fs::read("/initrd/file-bold.svg").expect("failed to read file icon");
@@ -110,7 +110,7 @@ impl FileBrowser {
         // Path bar
         self.fb.fill_rect(0, 0, w, PATH_BAR_HEIGHT, PATH_BG);
         let path_str = self.current_dir.display().to_string();
-        let max_chars = (w - 16) / font::WIDTH;
+        let max_chars = (w - 16) / self.font.width();
         let display_path: String = path_str.chars().take(max_chars).collect();
         self.font
             .draw_string(&self.fb, 8, 4, &display_path, PATH_COLOR, PATH_BG);
@@ -148,9 +148,9 @@ impl FileBrowser {
                 y,
             );
 
-            let max_chars = ITEM_WIDTH / font::WIDTH;
+            let max_chars = ITEM_WIDTH / self.font.width();
             let name: String = entry.name.chars().take(max_chars).collect();
-            let text_x = x + (ITEM_WIDTH.saturating_sub(name.len() * font::WIDTH)) / 2;
+            let text_x = x + (ITEM_WIDTH.saturating_sub(name.len() * self.font.width())) / 2;
             let text_y = y + ICON_SIZE + 4;
             let text_bg = if self.selected == Some(i) {
                 SELECTED_BG

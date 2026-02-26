@@ -212,7 +212,7 @@ fn redraw(
         );
         let text_x = tab_x + 8;
         let text_y = taskbar_y + (TASKBAR_HEIGHT - 16) / 2;
-        let max_chars = (TASKBAR_ITEM_WIDTH - 16) / font::WIDTH;
+        let max_chars = (TASKBAR_ITEM_WIDTH - 16) / font.width();
         let title = if _win.title.is_empty() { "Window" } else { &_win.title };
         let display: String = title.chars().take(max_chars).collect();
         font.draw_string(screen, text_x, text_y, &display, fg, bg);
@@ -254,8 +254,8 @@ fn main() {
         fb_info.pixel_format,
     );
 
-    let font_data = std::fs::read("/initrd/font.bin").expect("failed to read font");
-    let font = font::Font::new(&font_data);
+    let ttf_data = std::fs::read("/initrd/JetBrainsMono-Regular.ttf").expect("failed to read font");
+    let font = font::Font::new(&ttf_data, 8, 16);
     let cursor_svg = std::fs::read("/initrd/cursor-bold.svg").expect("failed to read cursor");
     let cursor_default = sprite::Sprite::from_svg_colored(&cursor_svg, 20, [255, 255, 255]);
     let resize_svg = std::fs::read("/initrd/arrow-down-right-bold.svg").expect("failed to read resize cursor");

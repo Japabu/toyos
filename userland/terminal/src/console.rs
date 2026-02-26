@@ -1,4 +1,4 @@
-use font::{self, Font};
+use font::Font;
 use crate::framebuffer::{Color, Framebuffer};
 
 const DEFAULT_FG: Color = Color { r: 255, g: 255, b: 255 };
@@ -106,8 +106,8 @@ pub struct Console {
 
 impl Console {
     pub fn new(fb: Framebuffer, font: Font) -> Self {
-        let cols = fb.width() / font::WIDTH;
-        let rows = fb.height() / font::HEIGHT;
+        let cols = fb.width() / font.width();
+        let rows = fb.height() / font.height();
 
         let mut console = Self {
             fb,
@@ -151,8 +151,8 @@ impl Console {
             return;
         }
         self.rendered[idx] = key;
-        let px = col * font::WIDTH;
-        let py = row * font::HEIGHT;
+        let px = col * self.font.width();
+        let py = row * self.font.height();
         self.font.draw_char(&self.fb, px, py, ch, fg, bg);
     }
 
@@ -163,8 +163,8 @@ impl Console {
         if self.cursor_col < self.cols && self.cursor_row < self.rows {
             let idx = self.cursor_row * self.cols + self.cursor_col;
             let ch = self.char_buf[idx];
-            let px = self.cursor_col * font::WIDTH;
-            let py = self.cursor_row * font::HEIGHT;
+            let px = self.cursor_col * self.font.width();
+            let py = self.cursor_row * self.font.height();
             self.rendered[idx] = 0;
             self.font.draw_char(&self.fb, px, py, ch, self.bg, self.fg);
         }
@@ -178,8 +178,8 @@ impl Console {
         if self.cursor_col < self.cols && self.cursor_row < self.rows {
             let idx = self.cursor_row * self.cols + self.cursor_col;
             let ch = self.char_buf[idx];
-            let px = self.cursor_col * font::WIDTH;
-            let py = self.cursor_row * font::HEIGHT;
+            let px = self.cursor_col * self.font.width();
+            let py = self.cursor_row * self.font.height();
             self.rendered[idx] = 0;
             self.font.draw_char(&self.fb, px, py, ch, self.fg, self.bg);
         }
@@ -187,7 +187,7 @@ impl Console {
     }
 
     fn scroll(&mut self) {
-        self.fb.scroll_up(font::HEIGHT, self.bg);
+        self.fb.scroll_up(self.font.height(), self.bg);
         let row_size = self.cols;
         self.char_buf.copy_within(row_size.., 0);
         self.rendered.copy_within(row_size.., 0);
@@ -228,8 +228,8 @@ impl Console {
                 let idx = row * self.cols + col;
                 let ch = self.char_buf[idx];
                 if ch != ' ' {
-                    let px = col * font::WIDTH;
-                    let py = row * font::HEIGHT;
+                    let px = col * self.font.width();
+                    let py = row * self.font.height();
                     self.rendered[idx] = cell_key(ch, self.fg, self.bg);
                     self.font.draw_char(&self.fb, px, py, ch, self.fg, self.bg);
                 }
@@ -481,8 +481,8 @@ impl Console {
     }
 
     pub fn resize(&mut self, fb: Framebuffer) {
-        let new_cols = fb.width() / font::WIDTH;
-        let new_rows = fb.height() / font::HEIGHT;
+        let new_cols = fb.width() / self.font.width();
+        let new_rows = fb.height() / self.font.height();
 
         // Find cursor's offset within its logical line
         let mut cursor_line_offset = self.cursor_col;
