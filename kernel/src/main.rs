@@ -3,13 +3,9 @@
 #![feature(allocator_api)]
 extern crate alloc;
 
-use alloc::alloc::{alloc_zeroed, Layout};
 use alloc::boxed::Box;
-use alloc::format;
-use alloc::string::String;
 use alloc::vec::Vec;
 use kernel::arch::{apic, idt, paging, percpu, smp, syscall};
-use kernel::arch::paging::PAGE_2M;
 use kernel::drivers::{acpi, nvme, pci, serial, virtio_gpu, virtio_net, xhci};
 use kernel::{allocator, clock, fd, log, pipe, process, ramdisk, shared_memory, symbols, vfs, KernelArgs, MemoryMapEntry};
 use tyfs::Disk;
@@ -46,8 +42,6 @@ pub unsafe extern "sysv64" fn _start(kernel_args: KernelArgs) -> ! {
 
     kernel_main(&kernel_args, maps, initrd, kernel_elf, init_path);
 }
-
-const USER_STACK_SIZE: usize = 4 * PAGE_2M as usize; // 8 MB
 
 fn kernel_main(
     kernel_args: &KernelArgs,
@@ -154,46 +148,6 @@ fn kernel_main(
     }
     log!("Keyboard layout: {}", kernel::keyboard::layout_name());
 
-    // Load and prepare the init program
-    let init = if init_path.is_empty() { "shell" } else { init_path };
-    let args: Vec<&str> = init.split_whitespace().collect();
-    let cmd = args[0];
-    let path = if cmd.starts_with('/') {
-        String::from(cmd)
-    } else {
-        format!("/initrd/{}", cmd)
-    };
-    log!("init: running {}", path);
-    let data = vfs::lock().read_file(&path)
-        .unwrap_or_else(|| panic!("init: {} not found", path));
-
-    // Load ELF (2MB-aligned by elf::load)
-    let loaded = kernel::elf::load(&data).expect("init: ELF load failed");
-    let elf_alloc_size = (loaded.load_size + PAGE_2M as usize - 1) & !(PAGE_2M as usize - 1);
-    let elf_layout = Layout::from_size_align(elf_alloc_size, PAGE_2M as usize).unwrap();
-
-    let stack_layout = Layout::from_size_align(USER_STACK_SIZE, PAGE_2M as usize).unwrap();
-    let stack_base = unsafe { alloc_zeroed(stack_layout) };
-    assert!(!stack_base.is_null(), "init: stack alloc failed");
-    let stack_top = stack_base as u64 + USER_STACK_SIZE as u64;
-
-    // Create per-process page tables and map ELF + stack
-    let init_pml4 = paging::create_user_pml4();
-    paging::map_user_in(init_pml4, loaded.base_ptr as u64, elf_alloc_size as u64);
-    paging::map_user_in(init_pml4, stack_base as u64, USER_STACK_SIZE as u64);
-    let init_cr3 = init_pml4 as u64;
-
-    let init_syms = kernel::symbols::ProcessSymbols::parse(
-        &data, loaded.base,
-        loaded.base_ptr as u64, loaded.base_ptr as u64 + loaded.load_size as u64,
-        stack_base as u64, stack_top,
-    );
-    log!("init: {} symbols", init_syms.symbol_count());
-
-    let sp = process::write_argv_to_stack(stack_top, &args);
-
-    log!("init: entry={:#x}, stack={:#x}, argc={}", loaded.entry, sp, args.len());
-
     // Initialize VirtIO networking
     virtio_net::init(ecam_base);
 
@@ -220,8 +174,13 @@ fn kernel_main(
         }
     }
 
-    // Signal APs to join the scheduler, then start process 0 (never returns)
+    // Spawn initial userland processes
+    let init = if init_path.is_empty() { "compositor" } else { init_path };
+    let args: Vec<&str> = init.split_whitespace().collect();
+    process::spawn_kernel(&args);
+    process::spawn_kernel(&["/initrd/netd"]);
+
+    // Signal APs and enter the scheduler idle loop (never returns)
     smp::set_ready();
-    process::init_process0(loaded.entry, sp, loaded.base_ptr, elf_layout, stack_base, stack_layout, init_cr3, init_syms, loaded.tls_template, loaded.tls_filesz, loaded.tls_memsz);
-    unreachable!();
+    kernel::scheduler::schedule_no_return();
 }

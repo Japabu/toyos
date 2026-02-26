@@ -613,9 +613,6 @@ fn upload_cursor(cursor_buf: *mut u8, sprite: &sprite::Sprite) {
 fn main() {
     io::register_name("compositor").expect("compositor already running");
 
-    // Start network daemon
-    Command::new("/initrd/netd").spawn().ok();
-
     let kb_fd = io::open_device(io::DeviceType::Keyboard).expect("failed to claim keyboard");
     let mouse_fd = io::open_device(io::DeviceType::Mouse).expect("failed to claim mouse");
     let fb_fd = io::open_device(io::DeviceType::Framebuffer).expect("failed to claim framebuffer");

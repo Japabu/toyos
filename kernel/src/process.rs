@@ -159,89 +159,6 @@ pub fn setup_tls(tls_template: u64, tls_filesz: usize, tls_memsz: usize) -> (*mu
     (block, layout, tp)
 }
 
-/// Initialize process 0 (init). Called from main after all kernel init.
-pub fn init_process0(
-    entry: u64, user_stack_top: u64,
-    elf_base: *mut u8, elf_layout: Layout,
-    stack_base: *mut u8, stack_layout: Layout,
-    cr3: u64,
-    syms: ProcessSymbols,
-    tls_template: u64, tls_filesz: usize, tls_memsz: usize,
-) {
-    // Set up TLS for this process
-    let (tls_block, tls_block_layout, fs_base) = setup_tls(tls_template, tls_filesz, tls_memsz);
-    paging::map_user_in(cr3 as *mut u64, tls_block as u64, tls_block_layout.size() as u64);
-
-    let ks_layout = Layout::from_size_align(KERNEL_STACK_SIZE, 4096).unwrap();
-    let ks_base = unsafe { alloc_zeroed(ks_layout) };
-    assert!(!ks_base.is_null(), "process 0: kernel stack alloc failed");
-    let ks_top = ks_base as u64 + KERNEL_STACK_SIZE as u64;
-
-    let mut fds = FdTable::new();
-    fds.insert_at(0, Descriptor::SerialConsole); // stdin
-    fds.insert_at(1, Descriptor::SerialConsole); // stdout
-    fds.insert_at(2, Descriptor::SerialConsole); // stderr
-
-    // Set up kernel stack so context_switch's `ret` goes to the trampoline
-    // that enters ring 3 via iretq.
-    // context_switch pops: r15, r14, r13, r12, rbx, rbp, then ret.
-    let frame_ptr = (ks_top - 7 * 8) as *mut u64;
-    unsafe {
-        *frame_ptr.add(0) = 0; // r15
-        *frame_ptr.add(1) = 0; // r14
-        *frame_ptr.add(2) = user_stack_top; // r13 = user stack
-        *frame_ptr.add(3) = entry; // r12 = entry point
-        *frame_ptr.add(4) = 0; // rbx
-        *frame_ptr.add(5) = 0; // rbp
-        *frame_ptr.add(6) = process_start as u64;
-    }
-
-    let mut guard = PROCESS_TABLE.lock();
-    let table = guard.as_mut().expect("process table not initialized");
-    let pid = table.procs.insert(Process {
-        pid: 0,
-        state: ProcessState::Running,
-        cr3,
-        kernel_stack_base: ks_base,
-        kernel_stack_layout: ks_layout,
-        kernel_rsp: frame_ptr as u64,
-        fds,
-        user_heap: crate::user_heap::new_heap(),
-        messages: MessageQueue::new(),
-        cwd: String::from("/"),
-        parent_pid: None,
-        thread_parent: None,
-        heap_owner: 0, // will be set to own pid below
-        elf_base,
-        elf_layout,
-        stack_base,
-        stack_layout,
-        fs_base,
-        tls_template,
-        tls_filesz,
-        tls_memsz,
-        tls_block,
-        tls_block_layout,
-        symbols: syms,
-        name: *b"init\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0",
-    });
-    table.procs.get_mut(pid).unwrap().heap_owner = pid;
-    percpu::set_current_pid(pid);
-    unsafe { percpu::set_kernel_stack(ks_top); }
-    percpu::reset_idle(scheduler::idle_unlock_and_loop as u64);
-
-    // Switch to process 0's page tables and set FS base for TLS
-    unsafe { cpu::write_cr3(cr3); }
-    cpu::wrmsr(0xC0000100, fs_base);
-
-    // Hold lock through context_switch — process_start releases it.
-    core::mem::forget(guard);
-
-    let mut dummy_rsp: u64 = 0;
-    unsafe { context_switch(&mut dummy_rsp, frame_ptr as u64); }
-    // Never returns
-}
-
 /// Release the process table lock held across context_switch.
 /// Called by process_start before entering userspace.
 fn scheduler_unlock() {
@@ -562,6 +479,106 @@ pub fn spawn(argv: &[&str], stdin_fd: u64, stdout_fd: u64) -> u64 {
     pid as u64
 }
 
+/// Spawn a process from kernel context (no parent). Used during boot to launch
+/// initial services. The process starts in Ready state with SerialConsole FDs.
+pub fn spawn_kernel(argv: &[&str]) -> u32 {
+    let path = argv[0];
+    let full_path = if path.starts_with('/') {
+        String::from(path)
+    } else {
+        alloc::format!("/initrd/{}", path)
+    };
+
+    let binary = vfs::lock().read_file(&full_path)
+        .unwrap_or_else(|| panic!("spawn_kernel: {} not found", full_path));
+
+    let loaded = elf::load(&binary).expect("spawn_kernel: ELF load failed");
+
+    let child_pml4 = paging::create_user_pml4();
+    let child_cr3 = child_pml4 as u64;
+
+    let elf_alloc_size = ((loaded.load_size + PAGE_2M as usize - 1) & !(PAGE_2M as usize - 1)) as u64;
+    let elf_layout = Layout::from_size_align(elf_alloc_size as usize, PAGE_2M as usize).unwrap();
+    paging::map_user_in(child_pml4, loaded.base_ptr as u64, elf_alloc_size);
+
+    let stack_layout = Layout::from_size_align(USER_STACK_SIZE, PAGE_2M as usize).unwrap();
+    let stack_base = unsafe { alloc_zeroed(stack_layout) };
+    assert!(!stack_base.is_null(), "spawn_kernel: stack alloc failed");
+    let stack_top = stack_base as u64 + USER_STACK_SIZE as u64;
+    paging::map_user_in(child_pml4, stack_base as u64, USER_STACK_SIZE as u64);
+
+    let (tls_block, tls_block_layout, fs_base) = setup_tls(loaded.tls_template, loaded.tls_filesz, loaded.tls_memsz);
+    paging::map_user_in(child_pml4, tls_block as u64, tls_block_layout.size() as u64);
+
+    let sp = write_argv_to_stack(stack_top, argv);
+
+    let syms = ProcessSymbols::parse(
+        &binary, loaded.base,
+        loaded.base_ptr as u64, loaded.base_ptr as u64 + loaded.load_size as u64,
+        stack_base as u64, stack_top,
+    );
+
+    let ks_layout = Layout::from_size_align(KERNEL_STACK_SIZE, 4096).unwrap();
+    let ks_base = unsafe { alloc_zeroed(ks_layout) };
+    assert!(!ks_base.is_null(), "spawn_kernel: kernel stack alloc failed");
+    let ks_top = ks_base as u64 + KERNEL_STACK_SIZE as u64;
+
+    let frame_ptr = (ks_top - 7 * 8) as *mut u64;
+    unsafe {
+        *frame_ptr.add(0) = 0; // r15
+        *frame_ptr.add(1) = 0; // r14
+        *frame_ptr.add(2) = sp; // r13 = user stack
+        *frame_ptr.add(3) = loaded.entry; // r12 = entry
+        *frame_ptr.add(4) = 0; // rbx
+        *frame_ptr.add(5) = 0; // rbp
+        *frame_ptr.add(6) = process_start as u64;
+    }
+
+    let mut fds = FdTable::new();
+    fds.insert_at(0, Descriptor::SerialConsole);
+    fds.insert_at(1, Descriptor::SerialConsole);
+    fds.insert_at(2, Descriptor::SerialConsole);
+
+    let mut guard = PROCESS_TABLE.lock();
+    let table = guard.as_mut().expect("process table not initialized");
+
+    let pid = table.procs.insert(Process {
+        pid: 0,
+        state: ProcessState::Ready,
+        cr3: child_cr3,
+        kernel_stack_base: ks_base,
+        kernel_stack_layout: ks_layout,
+        kernel_rsp: frame_ptr as u64,
+        fds,
+        user_heap: crate::user_heap::new_heap(),
+        messages: MessageQueue::new(),
+        cwd: String::from("/"),
+        parent_pid: None,
+        thread_parent: None,
+        heap_owner: 0,
+        elf_base: loaded.base_ptr,
+        elf_layout,
+        stack_base,
+        stack_layout,
+        fs_base,
+        tls_template: loaded.tls_template,
+        tls_filesz: loaded.tls_filesz,
+        tls_memsz: loaded.tls_memsz,
+        tls_block,
+        tls_block_layout,
+        symbols: syms,
+        name: make_name(&full_path),
+    });
+    let p = table.procs.get_mut(pid).unwrap();
+    p.pid = pid;
+    p.heap_owner = pid;
+
+    log!("spawn: {} pid={} base={:#x} entry={:#x} cr3={:#x} ks={:#x}..{:#x}",
+        full_path, pid, loaded.base_ptr as u64, loaded.entry, child_cr3, ks_base as u64, ks_top);
+
+    pid
+}
+
 /// Exit the current process.
 pub fn exit(code: i32) -> ! {
     {
@@ -726,25 +743,3 @@ pub fn ap_idle() -> ! {
     scheduler::schedule_no_return();
 }
 
-/// context_switch used only for init_process0's initial switch.
-/// The main context_switch lives in scheduler.rs.
-#[unsafe(naked)]
-unsafe extern "C" fn context_switch(old_rsp: *mut u64, new_rsp: u64) {
-    naked_asm!(
-        "push rbp",
-        "push rbx",
-        "push r12",
-        "push r13",
-        "push r14",
-        "push r15",
-        "mov [rdi], rsp",   // save old RSP
-        "mov rsp, rsi",     // load new RSP
-        "pop r15",
-        "pop r14",
-        "pop r13",
-        "pop r12",
-        "pop rbx",
-        "pop rbp",
-        "ret",
-    );
-}
