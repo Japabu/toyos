@@ -16,6 +16,19 @@ const REG_ACQ: u64 = 0x30;
 
 const QUEUE_DEPTH: usize = 16;
 
+/// NVMe Identify Namespace data structure (partial — only fields we use).
+#[repr(C)]
+struct IdentifyNamespace {
+    nsze: u64,            // offset 0: namespace size in LBAs
+    ncap: u64,            // offset 8: namespace capacity
+    nuse: u64,            // offset 16: namespace utilization
+    nsfeat: u8,           // offset 24
+    nlbaf: u8,            // offset 25: number of LBA formats (0-based)
+    flbas: u8,            // offset 26: formatted LBA size
+    _padding: [u8; 101],  // offsets 27..128
+    lba_formats: [u32; 64], // offset 128: LBA format descriptors (4 bytes each)
+}
+
 // NVMe command opcodes
 const ADMIN_CREATE_IO_SQ: u8 = 0x01;
 const ADMIN_CREATE_IO_CQ: u8 = 0x05;
@@ -194,20 +207,12 @@ impl NvmeController {
         cmd.cdw10 = 0; // CNS = 0 (namespace)
         self.admin.submit_and_wait(&self.bar, cmd);
 
-        unsafe {
-            let buf = identify_buf as *const u8;
-            // NSZE (namespace size in LBAs) at offset 0, 8 bytes
-            let nsze = core::ptr::read_unaligned(buf as *const u64);
-            // FLBAS at offset 26
-            let flbas = read_volatile(buf.add(26));
-            let fmt_idx = (flbas & 0x0F) as usize;
-            // LBA format table at offset 128, 4 bytes each; LBA data size power-of-2 in bits [23:16]
-            let lba_fmt = core::ptr::read_unaligned(buf.add(128 + fmt_idx * 4) as *const u32);
-            let lba_ds = ((lba_fmt >> 16) & 0xFF) as u32;
-            self.sector_size = 1 << lba_ds;
-            self.ns_size = nsze;
-            log!("NVMe: NS1 size={} sectors, sector_size={}", nsze, self.sector_size);
-        }
+        let ns = unsafe { &*(identify_buf as *const IdentifyNamespace) };
+        let fmt_idx = (ns.flbas & 0x0F) as usize;
+        let lba_ds = ((ns.lba_formats[fmt_idx] >> 16) & 0xFF) as u32;
+        self.sector_size = 1 << lba_ds;
+        self.ns_size = ns.nsze;
+        log!("NVMe: NS1 size={} sectors, sector_size={}", ns.nsze, self.sector_size);
     }
 
     pub fn sector_size(&self) -> u32 {

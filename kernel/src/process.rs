@@ -13,7 +13,7 @@ use crate::sync::Lock;
 use crate::symbols::ProcessSymbols;
 use crate::{elf, log, pipe, scheduler, shared_memory, vfs};
 
-const USER_STACK_SIZE: usize = PAGE_2M as usize;
+const USER_STACK_SIZE: usize = 4 * PAGE_2M as usize; // 8 MB
 const KERNEL_STACK_SIZE: usize = 64 * 1024;
 
 /// Write argc, argv pointers, and string data onto a user stack. Returns new SP.

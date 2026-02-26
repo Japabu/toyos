@@ -47,7 +47,7 @@ pub unsafe extern "sysv64" fn _start(kernel_args: KernelArgs) -> ! {
     kernel_main(&kernel_args, maps, initrd, kernel_elf, init_path);
 }
 
-const USER_STACK_SIZE: usize = PAGE_2M as usize;
+const USER_STACK_SIZE: usize = 4 * PAGE_2M as usize; // 8 MB
 
 fn kernel_main(
     kernel_args: &KernelArgs,

@@ -49,6 +49,35 @@ const DESC_OFFSET: u64 = 0x000;
 const AVAIL_OFFSET: u64 = 0x100;
 const USED_OFFSET: u64 = 0x200;
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct VirtqDesc {
+    addr: u64,
+    len: u32,
+    flags: u16,
+    next: u16,
+}
+
+#[repr(C)]
+struct VirtqAvail {
+    flags: u16,
+    idx: u16,
+    ring: [u16; QUEUE_SIZE as usize],
+}
+
+#[repr(C)]
+struct VirtqUsedElem {
+    id: u32,
+    len: u32,
+}
+
+#[repr(C)]
+struct VirtqUsed {
+    flags: u16,
+    idx: u16,
+    ring: [VirtqUsedElem; QUEUE_SIZE as usize],
+}
+
 /// Parsed VirtIO PCI capability locations.
 struct VirtioPciConfig {
     common: Mmio,
@@ -129,9 +158,9 @@ impl Virtqueue {
         }
     }
 
-    fn desc_addr(&self) -> u64 { self.base + DESC_OFFSET }
-    fn avail_addr(&self) -> u64 { self.base + AVAIL_OFFSET }
-    fn used_addr(&self) -> u64 { self.base + USED_OFFSET }
+    fn descs(&self) -> *mut VirtqDesc { (self.base + DESC_OFFSET) as *mut VirtqDesc }
+    fn avail(&self) -> *mut VirtqAvail { (self.base + AVAIL_OFFSET) as *mut VirtqAvail }
+    fn used(&self) -> *const VirtqUsed { (self.base + USED_OFFSET) as *const VirtqUsed }
 
     /// Submit a descriptor chain and wait for the device to complete it.
     pub fn submit_and_wait(
@@ -141,13 +170,12 @@ impl Virtqueue {
         notify_multiplier: u32,
         queue_index: u16,
     ) {
-        let desc_base = self.desc_addr() as *mut u8;
+        let descs = self.descs();
 
         // Build descriptor chain
         let first_desc = self.next_desc;
         for (i, (addr, len, dir)) in bufs.iter().enumerate() {
             let desc_idx = (first_desc + i as u16) % QUEUE_SIZE;
-            let desc_ptr = unsafe { desc_base.add(desc_idx as usize * 16) };
             let is_last = i == bufs.len() - 1;
             let next_idx = (desc_idx + 1) % QUEUE_SIZE;
 
@@ -159,22 +187,18 @@ impl Virtqueue {
                 flags |= VIRTQ_DESC_F_NEXT;
             }
 
-            unsafe {
-                write_volatile(desc_ptr as *mut u64, *addr);           // addr
-                write_volatile(desc_ptr.add(8) as *mut u32, *len);     // len
-                write_volatile(desc_ptr.add(12) as *mut u16, flags);   // flags
-                write_volatile(desc_ptr.add(14) as *mut u16, next_idx); // next
-            }
+            let desc = VirtqDesc { addr: *addr, len: *len, flags, next: next_idx };
+            unsafe { write_volatile(descs.add(desc_idx as usize), desc); }
         }
         self.next_desc = (first_desc + bufs.len() as u16) % QUEUE_SIZE;
 
         // Add to available ring
-        let avail_ptr = self.avail_addr() as *mut u16;
-        let avail_idx = unsafe { read_volatile(avail_ptr.add(1)) };
+        let avail = self.avail();
+        let avail_idx = unsafe { read_volatile(&raw const (*avail).idx) };
         unsafe {
-            write_volatile(avail_ptr.add(2 + (avail_idx % QUEUE_SIZE) as usize), first_desc);
+            write_volatile(&raw mut (*avail).ring[(avail_idx % QUEUE_SIZE) as usize], first_desc);
             fence(Ordering::Release);
-            write_volatile(avail_ptr.add(1), avail_idx.wrapping_add(1));
+            write_volatile(&raw mut (*avail).idx, avail_idx.wrapping_add(1));
         }
 
         // Notify device
@@ -183,9 +207,9 @@ impl Virtqueue {
         notify_mmio.write_u16(notify_off, queue_index);
 
         // Poll used ring for completion
-        let used_idx_ptr = unsafe { (self.used_addr() as *const u16).add(1) };
+        let used = self.used();
         loop {
-            let used_idx = unsafe { read_volatile(used_idx_ptr) };
+            let used_idx = unsafe { read_volatile(&raw const (*used).idx) };
             if used_idx != self.last_used_idx {
                 self.last_used_idx = used_idx;
                 break;
@@ -275,9 +299,9 @@ impl VirtioDevice {
         assert!(max_size >= QUEUE_SIZE, "VirtIO: queue {} too small (max={})", index, max_size);
         common.write_u16(COMMON_QUEUE_SIZE, QUEUE_SIZE);
 
-        common.write_u64(COMMON_QUEUE_DESC, queue.desc_addr());
-        common.write_u64(COMMON_QUEUE_DRIVER, queue.avail_addr());
-        common.write_u64(COMMON_QUEUE_DEVICE, queue.used_addr());
+        common.write_u64(COMMON_QUEUE_DESC, queue.descs() as u64);
+        common.write_u64(COMMON_QUEUE_DRIVER, queue.avail() as u64);
+        common.write_u64(COMMON_QUEUE_DEVICE, queue.used() as u64);
 
         queue.notify_offset = common.read_u16(COMMON_QUEUE_NOTIFY_OFF);
 

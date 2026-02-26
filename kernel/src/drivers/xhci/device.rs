@@ -1,3 +1,4 @@
+use core::mem::size_of;
 use core::ptr::{read_volatile, write_volatile, write_bytes};
 
 use crate::log;
@@ -5,6 +6,61 @@ use super::{Mmio, Trb, TrbRing, XhciController, dma_page, RING_SIZE};
 use super::{TRB_ENABLE_SLOT, TRB_ADDRESS_DEVICE, TRB_CONFIGURE_EP, TRB_LINK};
 use super::{OP_PORT_BASE, PORT_REG_SIZE, PORTSC_CCS, PORTSC_PED, PORTSC_PR, PORTSC_PRC, PORTSC_RW1C};
 use super::hid::{HidType, HidDevice};
+
+// Standard USB descriptor structures (packed because they come from hardware)
+
+#[repr(C, packed)]
+struct UsbDeviceDescriptor {
+    b_length: u8,
+    b_descriptor_type: u8,
+    bcd_usb: u16,
+    b_device_class: u8,
+    b_device_sub_class: u8,
+    b_device_protocol: u8,
+    b_max_packet_size0: u8,
+    id_vendor: u16,
+    id_product: u16,
+    bcd_device: u16,
+    i_manufacturer: u8,
+    i_product: u8,
+    i_serial_number: u8,
+    b_num_configurations: u8,
+}
+
+#[repr(C, packed)]
+struct UsbConfigDescriptor {
+    b_length: u8,
+    b_descriptor_type: u8,
+    w_total_length: u16,
+    b_num_interfaces: u8,
+    b_configuration_value: u8,
+    i_configuration: u8,
+    bm_attributes: u8,
+    b_max_power: u8,
+}
+
+#[repr(C, packed)]
+struct UsbInterfaceDescriptor {
+    b_length: u8,
+    b_descriptor_type: u8,
+    b_interface_number: u8,
+    b_alternate_setting: u8,
+    b_num_endpoints: u8,
+    b_interface_class: u8,
+    b_interface_sub_class: u8,
+    b_interface_protocol: u8,
+    i_interface: u8,
+}
+
+#[repr(C, packed)]
+struct UsbEndpointDescriptor {
+    b_length: u8,
+    b_descriptor_type: u8,
+    b_endpoint_address: u8,
+    bm_attributes: u8,
+    w_max_packet_size: u16,
+    b_interval: u8,
+}
 
 /// Result of parsing a USB device's configuration descriptor for HID interfaces.
 struct HidInterfaceInfo {
@@ -40,9 +96,9 @@ fn output_ctx_page(slot_id: u8) -> usize {
 fn parse_hid_config(data_buf: u64) -> Option<HidInterfaceInfo> {
     unsafe {
         let buf = data_buf as *const u8;
-        let total_len = (read_volatile(buf.add(2)) as usize)
-            | (read_volatile(buf.add(3)) as usize) << 8;
-        let config_val = read_volatile(buf.add(5));
+        let config = &*(buf as *const UsbConfigDescriptor);
+        let total_len = (config.w_total_length as usize).min(256);
+        let config_val = config.b_configuration_value;
 
         let mut found_protocol: Option<HidType> = None;
         let mut iface_num: u8 = 0;
@@ -51,37 +107,33 @@ fn parse_hid_config(data_buf: u64) -> Option<HidInterfaceInfo> {
         let mut ep_interval: u8 = 0;
 
         let mut offset = 0usize;
-        let len = total_len.min(256);
-        while offset + 2 <= len {
+        while offset + 2 <= total_len {
             let desc_len = read_volatile(buf.add(offset)) as usize;
             let desc_type = read_volatile(buf.add(offset + 1));
             if desc_len == 0 { break; }
 
             match desc_type {
-                4 if offset + 9 <= len => {
-                    let intf_class = read_volatile(buf.add(offset + 5));
-                    let intf_subclass = read_volatile(buf.add(offset + 6));
-                    let intf_protocol = read_volatile(buf.add(offset + 7));
-                    if intf_class == 3 && intf_subclass == 1 {
-                        found_protocol = match intf_protocol {
+                4 if offset + size_of::<UsbInterfaceDescriptor>() <= total_len => {
+                    let intf = &*(buf.add(offset) as *const UsbInterfaceDescriptor);
+                    if intf.b_interface_class == 3 && intf.b_interface_sub_class == 1 {
+                        found_protocol = match intf.b_interface_protocol {
                             1 => Some(HidType::Keyboard),
                             2 => Some(HidType::Mouse),
                             _ => None,
                         };
                         if found_protocol.is_some() {
-                            iface_num = read_volatile(buf.add(offset + 2));
+                            iface_num = intf.b_interface_number;
                         }
                     } else {
                         found_protocol = None;
                     }
                 }
-                5 if found_protocol.is_some() && offset + 7 <= len => {
-                    let addr = read_volatile(buf.add(offset + 2));
-                    if addr & 0x80 != 0 && ep_addr == 0 {
-                        ep_addr = addr;
-                        ep_max_packet = read_volatile(buf.add(offset + 4)) as u16
-                            | (read_volatile(buf.add(offset + 5)) as u16) << 8;
-                        ep_interval = read_volatile(buf.add(offset + 6));
+                5 if found_protocol.is_some() && offset + size_of::<UsbEndpointDescriptor>() <= total_len => {
+                    let ep = &*(buf.add(offset) as *const UsbEndpointDescriptor);
+                    if ep.b_endpoint_address & 0x80 != 0 && ep_addr == 0 {
+                        ep_addr = ep.b_endpoint_address;
+                        ep_max_packet = ep.w_max_packet_size;
+                        ep_interval = ep.b_interval;
                     }
                 }
                 _ => {}
@@ -188,12 +240,8 @@ pub fn init_device(ctrl: &mut XhciController, op_base: &Mmio, port_idx: u8) {
     }
 
     let (dev_class, vendor_id, product_id) = unsafe {
-        let buf = data_buf as *const u8;
-        (
-            read_volatile(buf.add(4)),
-            read_volatile(buf.add(8)) as u16 | (read_volatile(buf.add(9)) as u16) << 8,
-            read_volatile(buf.add(10)) as u16 | (read_volatile(buf.add(11)) as u16) << 8,
-        )
+        let desc = &*(data_buf as *const UsbDeviceDescriptor);
+        (desc.b_device_class, desc.id_vendor, desc.id_product)
     };
     log!("xHCI: device class={:#x} vendor={:04x} product={:04x}", dev_class, vendor_id, product_id);
 

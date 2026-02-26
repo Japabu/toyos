@@ -9,7 +9,7 @@ use core::alloc::Layout;
 use crate::arch::paging::{self, PAGE_2M};
 use crate::log;
 
-const CHUNK_SIZE: usize = PAGE_2M as usize;
+const CHUNK_SIZE: usize = 8 * PAGE_2M as usize; // 16 MB
 
 /// Create an initial user heap for a new process.
 /// Returns empty — first SYS_ALLOC triggers grow in the correct CR3 context.

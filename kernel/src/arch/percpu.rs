@@ -256,20 +256,29 @@ pub fn idle_stack_top() -> u64 {
     unsafe { (*percpu_ptr()).idle_stack_top }
 }
 
+/// Stack frame layout matching what context_switch pushes/pops.
+#[repr(C)]
+struct SwitchFrame {
+    r15: u64,
+    r14: u64,
+    r13: u64,
+    r12: u64,
+    rbx: u64,
+    rbp: u64,
+    ret_addr: u64,
+}
+
 /// Reset the idle context to a fresh frame with ret → `entry`.
 /// context_switch to idle_rsp will pop zero registers and ret to `entry`.
 pub fn reset_idle(entry: u64) {
     let percpu = percpu_ptr();
     let top = unsafe { (*percpu).idle_stack_top };
-    let frame = (top - 7 * 8) as *mut u64;
+    let frame = (top - size_of::<SwitchFrame>() as u64) as *mut SwitchFrame;
     unsafe {
-        frame.add(0).write(0); // r15
-        frame.add(1).write(0); // r14
-        frame.add(2).write(0); // r13
-        frame.add(3).write(0); // r12
-        frame.add(4).write(0); // rbx
-        frame.add(5).write(0); // rbp
-        frame.add(6).write(entry); // ret addr
+        frame.write(SwitchFrame {
+            r15: 0, r14: 0, r13: 0, r12: 0, rbx: 0, rbp: 0,
+            ret_addr: entry,
+        });
         (*percpu).idle_rsp = frame as u64;
     }
 }

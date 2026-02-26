@@ -99,6 +99,14 @@ const EVENT_CMD_COMPLETE: u32 = 33;
 // ---------------------------------------------------------------------------
 const RING_SIZE: usize = 256; // TRBs per ring (one page = 256 * 16)
 
+/// Event Ring Segment Table entry (16 bytes).
+#[repr(C)]
+struct ErstEntry {
+    ring_base: u64,
+    ring_size: u32,
+    _reserved: u32,
+}
+
 // ---------------------------------------------------------------------------
 // TRB Ring — shared enqueue logic for command, EP0, and interrupt rings
 // ---------------------------------------------------------------------------
@@ -498,10 +506,13 @@ pub fn init(ecam_base: u64) -> Option<XhciController> {
     op_base.write_u64(OP_CRCR, dma_page(1) | 1);
 
     // Event Ring
-    let erst = dma_page(2) as *mut u8;
+    let erst = dma_page(2) as *mut ErstEntry;
     unsafe {
-        write_volatile(erst as *mut u64, dma_page(3));
-        write_volatile(erst.add(8) as *mut u32, RING_SIZE as u32);
+        write_volatile(erst, ErstEntry {
+            ring_base: dma_page(3),
+            ring_size: RING_SIZE as u32,
+            _reserved: 0,
+        });
     }
     rt_base.write_u32(IR0_ERSTSZ, 1);
     rt_base.write_u64(IR0_ERDP, dma_page(3));

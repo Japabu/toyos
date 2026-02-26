@@ -1,4 +1,5 @@
 use alloc::vec::Vec;
+use core::mem::size_of;
 use core::ptr::{read_unaligned, read_volatile};
 use core::sync::atomic::{AtomicU16, Ordering};
 use crate::log;
@@ -8,22 +9,122 @@ pub struct MadtInfo {
     pub apic_ids: Vec<u8>,
 }
 
-// ACPI table structure offsets
-const SDT_LENGTH: usize = 4;         // u32 table length at offset 4
-const SDT_HEADER_SIZE: usize = 36;   // XSDT entries start after 36-byte header
+// ACPI table structures (all packed — tables are not guaranteed aligned)
 
-// RSDP offsets
-const RSDP_XSDT_ADDR: usize = 24;   // u64 XSDT physical address
+#[repr(C, packed)]
+struct SdtHeader {
+    signature: [u8; 4],
+    length: u32,
+    revision: u8,
+    checksum: u8,
+    oem_id: [u8; 6],
+    oem_table_id: [u8; 8],
+    oem_revision: u32,
+    creator_id: u32,
+    creator_revision: u32,
+}
 
-// FADT (FACP) offsets
-const FADT_REVISION: usize = 8;      // u8 revision
-const FADT_DSDT: usize = 40;         // u32 DSDT physical address (ACPI 1.0)
-const FADT_PM1A_CNT_BLK: usize = 64; // u32 PM1a control block port
-const FADT_X_DSDT: usize = 140;      // u64 DSDT physical address (ACPI 2.0+)
+#[repr(C, packed)]
+struct Rsdp {
+    signature: [u8; 8],
+    checksum: u8,
+    oem_id: [u8; 6],
+    revision: u8,
+    rsdt_address: u32,
+    // ACPI 2.0+ fields:
+    length: u32,
+    xsdt_address: u64,
+    extended_checksum: u8,
+    _reserved: [u8; 3],
+}
 
-// MCFG/HPET first entry base address (after 36B header + 8B reserved)
-const MCFG_FIRST_ENTRY_BASE: usize = 44;
-const HPET_BASE_ADDR: usize = 44;    // 36B header + 4B event timer block ID + 4B GAS header
+#[repr(C, packed)]
+struct Fadt {
+    header: SdtHeader,
+    firmware_ctrl: u32,
+    dsdt: u32,
+    _reserved0: u8,
+    preferred_pm_profile: u8,
+    sci_interrupt: u16,
+    smi_command_port: u32,
+    acpi_enable: u8,
+    acpi_disable: u8,
+    s4bios_req: u8,
+    pstate_control: u8,
+    pm1a_event_block: u32,
+    pm1b_event_block: u32,
+    pm1a_control_block: u32,
+    pm1b_control_block: u32,
+    pm2_control_block: u32,
+    pm_timer_block: u32,
+    gpe0_block: u32,
+    gpe1_block: u32,
+    pm1_event_length: u8,
+    pm1_control_length: u8,
+    pm2_control_length: u8,
+    pm_timer_length: u8,
+    gpe0_block_length: u8,
+    gpe1_block_length: u8,
+    gpe1_base: u8,
+    c_state_control: u8,
+    worst_c2_latency: u16,
+    worst_c3_latency: u16,
+    flush_size: u16,
+    flush_stride: u16,
+    duty_offset: u8,
+    duty_width: u8,
+    day_alarm: u8,
+    month_alarm: u8,
+    century: u8,
+    iapc_boot_arch: u16,
+    _reserved1: u8,
+    flags: u32,
+    reset_reg: [u8; 12], // Generic Address Structure
+    reset_value: u8,
+    arm_boot_arch: u16,
+    fadt_minor_version: u8,
+    x_firmware_ctrl: u64,
+    x_dsdt: u64,
+}
+
+#[repr(C, packed)]
+struct Madt {
+    header: SdtHeader,
+    local_apic_address: u32,
+    flags: u32,
+    // variable-length entries follow
+}
+
+#[repr(C, packed)]
+struct MadtEntryHeader {
+    entry_type: u8,
+    length: u8,
+}
+
+#[repr(C, packed)]
+struct MadtLocalApic {
+    header: MadtEntryHeader,
+    processor_id: u8,
+    apic_id: u8,
+    flags: u32,
+}
+
+#[repr(C, packed)]
+struct McfgEntry {
+    base_address: u64,
+    segment_group: u16,
+    start_bus: u8,
+    end_bus: u8,
+    _reserved: u32,
+}
+
+#[repr(C, packed)]
+struct HpetTable {
+    header: SdtHeader,
+    event_timer_block_id: u32,
+    base_address: [u8; 4], // Generic Address Structure prefix (address_space, bit_width, bit_offset, access_size)
+    base_address_value: u64,
+}
 
 const SLP_EN: u16 = 1 << 13;
 
@@ -32,16 +133,16 @@ static SLP_TYPA: AtomicU16 = AtomicU16::new(0);
 
 /// Given the RSDP address from UEFI, parse XSDT -> MCFG -> return ECAM base address.
 pub fn find_ecam_base(rsdp_addr: u64) -> Option<u64> {
-    let rsdp = rsdp_addr as *const u8;
     log!("ACPI: RSDP at {:#x}", rsdp_addr);
 
-    let xsdt = get_xsdt_addr(rsdp);
+    let xsdt = get_xsdt_addr(rsdp_addr);
     log!("ACPI: XSDT at {:#x}", xsdt as u64);
 
     let mcfg = find_table(xsdt, b"MCFG")?;
     log!("ACPI: MCFG found at {:#x}", mcfg as u64);
 
-    let ecam_base = unsafe { read_unaligned(mcfg.add(MCFG_FIRST_ENTRY_BASE) as *const u64) };
+    let entry = unsafe { &*((mcfg as *const u8).add(size_of::<SdtHeader>() + 8) as *const McfgEntry) };
+    let ecam_base = entry.base_address;
     log!("ACPI: ECAM base address: {:#x}", ecam_base);
 
     Some(ecam_base)
@@ -49,33 +150,27 @@ pub fn find_ecam_base(rsdp_addr: u64) -> Option<u64> {
 
 /// Parse FADT and DSDT to prepare for ACPI shutdown.
 pub fn init_power(rsdp_addr: u64) {
-    let rsdp = rsdp_addr as *const u8;
-    let xsdt = get_xsdt_addr(rsdp);
+    let xsdt = get_xsdt_addr(rsdp_addr);
 
-    let fadt = find_table(xsdt, b"FACP").expect("ACPI: FADT not found");
+    let fadt_ptr = find_table(xsdt, b"FACP").expect("ACPI: FADT not found");
+    let fadt = unsafe { &*(fadt_ptr as *const Fadt) };
 
-    let pm1a = unsafe { read_unaligned(fadt.add(FADT_PM1A_CNT_BLK) as *const u32) } as u16;
+    let pm1a = fadt.pm1a_control_block as u16;
     PM1A_CNT_PORT.store(pm1a, Ordering::Relaxed);
 
     // Prefer X_DSDT (64-bit, ACPI 2.0+) over DSDT (32-bit)
-    let revision = unsafe { read_volatile(fadt.add(FADT_REVISION)) };
-    let dsdt_addr = if revision >= 2 {
-        let x_dsdt = unsafe { read_unaligned(fadt.add(FADT_X_DSDT) as *const u64) };
-        if x_dsdt != 0 {
-            x_dsdt
-        } else {
-            (unsafe { read_unaligned(fadt.add(FADT_DSDT) as *const u32) }) as u64
-        }
+    let dsdt_addr = if fadt.header.revision >= 2 && fadt.x_dsdt != 0 {
+        fadt.x_dsdt
     } else {
-        (unsafe { read_unaligned(fadt.add(FADT_DSDT) as *const u32) }) as u64
+        fadt.dsdt as u64
     };
 
     assert!(dsdt_addr != 0, "ACPI: DSDT not found");
 
-    let dsdt = dsdt_addr as *const u8;
-    let dsdt_len = unsafe { read_unaligned(dsdt.add(SDT_LENGTH) as *const u32) } as usize;
+    let dsdt = dsdt_addr as *const SdtHeader;
+    let dsdt_len = unsafe { read_unaligned(&raw const (*dsdt).length) } as usize;
 
-    let slp_typ = find_s5_slp_typ(dsdt, dsdt_len).expect("ACPI: \\_S5_ not found in DSDT");
+    let slp_typ = find_s5_slp_typ(dsdt_addr as *const u8, dsdt_len).expect("ACPI: \\_S5_ not found in DSDT");
     SLP_TYPA.store(slp_typ, Ordering::Relaxed);
     log!("ACPI: PM1a={:#x} SLP_TYPa={}", pm1a, slp_typ);
 }
@@ -94,27 +189,24 @@ pub fn shutdown() -> ! {
 }
 
 /// Read XSDT address from RSDP.
-fn get_xsdt_addr(rsdp: *const u8) -> *const u8 {
-    unsafe { read_unaligned(rsdp.add(RSDP_XSDT_ADDR) as *const u64) as *const u8 }
+fn get_xsdt_addr(rsdp_addr: u64) -> *const u8 {
+    let rsdp = unsafe { &*(rsdp_addr as *const Rsdp) };
+    rsdp.xsdt_address as *const u8
 }
 
 /// Iterate XSDT entries looking for a table with the given 4-byte signature.
 fn find_table(xsdt: *const u8, signature: &[u8; 4]) -> Option<*const u8> {
-    let length = unsafe { read_unaligned(xsdt.add(SDT_LENGTH) as *const u32) } as usize;
-    let entry_count = (length - SDT_HEADER_SIZE) / 8;
+    let header = unsafe { &*(xsdt as *const SdtHeader) };
+    let length = header.length as usize;
+    let entry_count = (length - size_of::<SdtHeader>()) / 8;
 
-    let entries_base = unsafe { xsdt.add(SDT_HEADER_SIZE) };
+    let entries_base = unsafe { xsdt.add(size_of::<SdtHeader>()) } as *const u64;
 
     for i in 0..entry_count {
-        let table_addr =
-            unsafe { read_unaligned(entries_base.add(i * 8) as *const u64) } as *const u8;
+        let table_addr = unsafe { read_unaligned(entries_base.add(i)) } as *const u8;
+        let table_header = unsafe { &*(table_addr as *const SdtHeader) };
 
-        let mut sig = [0u8; 4];
-        for j in 0..4 {
-            sig[j] = unsafe { read_volatile(table_addr.add(j)) };
-        }
-
-        if &sig == signature {
+        if &table_header.signature == signature {
             return Some(table_addr);
         }
     }
@@ -124,36 +216,39 @@ fn find_table(xsdt: *const u8, signature: &[u8; 4]) -> Option<*const u8> {
 
 /// Given the RSDP address, parse XSDT -> HPET table -> return HPET MMIO base address.
 pub fn find_hpet_base(rsdp_addr: u64) -> Option<u64> {
-    let xsdt = get_xsdt_addr(rsdp_addr as *const u8);
-    let hpet = find_table(xsdt, b"HPET")?;
-    let base = unsafe { read_unaligned(hpet.add(HPET_BASE_ADDR) as *const u64) };
+    let xsdt = get_xsdt_addr(rsdp_addr);
+    let hpet_ptr = find_table(xsdt, b"HPET")?;
+    let hpet = unsafe { &*(hpet_ptr as *const HpetTable) };
+    let base = hpet.base_address_value;
     log!("ACPI: HPET at {:#x}", base);
     Some(base)
 }
 
 /// Parse MADT (signature "APIC") to discover Local APIC address and per-CPU APIC IDs.
 pub fn parse_madt(rsdp_addr: u64) -> Option<MadtInfo> {
-    let xsdt = get_xsdt_addr(rsdp_addr as *const u8);
-    let madt = find_table(xsdt, b"APIC")?;
+    let xsdt = get_xsdt_addr(rsdp_addr);
+    let madt_ptr = find_table(xsdt, b"APIC")?;
+    let madt = unsafe { &*(madt_ptr as *const Madt) };
 
-    let length = unsafe { read_unaligned(madt.add(SDT_LENGTH) as *const u32) } as usize;
-    let local_apic_addr = unsafe { read_unaligned(madt.add(36) as *const u32) };
+    let length = madt.header.length as usize;
+    let local_apic_addr = madt.local_apic_address;
 
     let mut apic_ids = Vec::new();
-    let mut offset = 44; // variable-length entries start after 36B header + 4B LAPIC addr + 4B flags
+    let entries_base = unsafe { madt_ptr.add(size_of::<Madt>()) };
+    let mut offset = 0usize;
+    let entries_len = length - size_of::<Madt>();
 
-    while offset + 1 < length {
-        let entry_type = unsafe { read_volatile(madt.add(offset)) };
-        let entry_len = unsafe { read_volatile(madt.add(offset + 1)) } as usize;
+    while offset + size_of::<MadtEntryHeader>() <= entries_len {
+        let entry = unsafe { &*(entries_base.add(offset) as *const MadtEntryHeader) };
+        let entry_len = entry.length as usize;
         if entry_len == 0 { break; }
 
-        // Type 0 = Processor Local APIC (8 bytes: type, len, proc_id, apic_id, flags)
-        if entry_type == 0 && entry_len >= 8 {
-            let apic_id = unsafe { read_volatile(madt.add(offset + 3)) };
-            let flags = unsafe { read_unaligned(madt.add(offset + 4) as *const u32) };
+        // Type 0 = Processor Local APIC
+        if entry.entry_type == 0 && entry_len >= size_of::<MadtLocalApic>() {
+            let lapic = unsafe { &*(entries_base.add(offset) as *const MadtLocalApic) };
             // Bit 0: Processor Enabled, Bit 1: Online Capable
-            if flags & 1 != 0 {
-                apic_ids.push(apic_id);
+            if lapic.flags & 1 != 0 {
+                apic_ids.push(lapic.apic_id);
             }
         }
 
