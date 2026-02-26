@@ -240,16 +240,16 @@ fn draw_icon_centered(
     screen.draw_sprite(icon, ix, iy);
 }
 
-fn hit_test(windows: &[WindowState], x: i32, y: i32, screen_w: i32, screen_h: i32) -> HitZone {
+fn hit_test(windows: &[WindowState], x: i32, y: i32, screen_h: i32) -> HitZone {
     // Taskbar at bottom of screen
     if y >= screen_h - TASKBAR_HEIGHT as i32 {
-        let new_x = screen_w - TASKBAR_HEIGHT as i32;
-        if x >= new_x {
-            return HitZone::TaskbarNew;
-        }
         let tab_x = x as usize / TASKBAR_ITEM_WIDTH;
         if tab_x < windows.len() {
             return HitZone::TaskbarItem(tab_x);
+        }
+        let new_x = windows.len() * TASKBAR_ITEM_WIDTH;
+        if x >= new_x as i32 && x < (new_x + TASKBAR_HEIGHT) as i32 {
+            return HitZone::TaskbarNew;
         }
         return HitZone::Desktop;
     }
@@ -399,6 +399,8 @@ fn redraw(
     let taskbar_y = screen_h - TASKBAR_HEIGHT;
     screen.fill_rect(0, taskbar_y, screen_w, TASKBAR_HEIGHT, TASKBAR_COLOR);
 
+    let text_y = taskbar_y + (TASKBAR_HEIGHT - 16) / 2;
+
     for (i, win) in windows.iter().enumerate() {
         let focused = Some(i) == focused_idx;
         let tab_x = i * TASKBAR_ITEM_WIDTH;
@@ -416,16 +418,14 @@ fn redraw(
             TASKBAR_HEIGHT - TASKBAR_PADDING * 2,
             bg,
         );
-        let text_x = tab_x + 8;
-        let text_y = taskbar_y + (TASKBAR_HEIGHT - 16) / 2;
         let max_chars = (TASKBAR_ITEM_WIDTH - 16) / font.width();
         let title = if win.title.is_empty() { "Window" } else { &win.title };
         let display: String = title.chars().take(max_chars).collect();
-        font.draw_string(screen, text_x, text_y, &display, fg, bg);
+        font.draw_string(screen, tab_x + 8, text_y, &display, fg, bg);
     }
 
-    // "+" button on right
-    let new_x = screen_w - TASKBAR_HEIGHT;
+    // "+" button after window tabs
+    let new_x = windows.len() * TASKBAR_ITEM_WIDTH;
     screen.fill_rect(
         new_x + 1,
         taskbar_y + TASKBAR_PADDING,
@@ -434,8 +434,16 @@ fn redraw(
         TASKBAR_NEW_COLOR,
     );
     let plus_x = new_x + (TASKBAR_HEIGHT - 8) / 2;
-    let plus_y = taskbar_y + (TASKBAR_HEIGHT - 16) / 2;
-    font.draw_char(screen, plus_x, plus_y, '+', TASKBAR_NEW_TEXT, TASKBAR_NEW_COLOR);
+    font.draw_char(screen, plus_x, text_y, '+', TASKBAR_NEW_TEXT, TASKBAR_NEW_COLOR);
+
+    // Clock on the right
+    let time = io::clock_realtime();
+    let hours = (time >> 16) & 0xFF;
+    let minutes = (time >> 8) & 0xFF;
+    let clock_str = format!("{:02}:{:02}", hours, minutes);
+    let clock_w = clock_str.len() * font.width();
+    let clock_x = screen_w - clock_w - 12;
+    font.draw_string(screen, clock_x, text_y, &clock_str, TASKBAR_ACTIVE_TEXT, TASKBAR_COLOR);
 
     screen.draw_cursor(cursor_x, cursor_y, cursor);
 }
@@ -527,7 +535,7 @@ fn main() {
         if dirty {
             let active_cursor = match interaction {
                 Interaction::Resizing { .. } => &cursor_resize,
-                _ => match hit_test(&windows, cursor_x, cursor_y, screen_w, screen_h) {
+                _ => match hit_test(&windows, cursor_x, cursor_y, screen_h) {
                     HitZone::ResizeCorner(_) => &cursor_resize,
                     _ => &cursor_default,
                 },
@@ -668,7 +676,7 @@ fn main() {
 
                 // Left button just pressed
                 if left && !was_left {
-                    match hit_test(&windows, cursor_x, cursor_y, screen_w, screen_h) {
+                    match hit_test(&windows, cursor_x, cursor_y, screen_h) {
                         HitZone::CloseButton(idx) => {
                             let win = windows.remove(idx);
                             message::send(win.pid, Message::signal(window::MSG_WINDOW_CLOSE));
@@ -857,7 +865,7 @@ fn main() {
                 if scroll != 0 {
                     if let Some(idx) = focused_window_idx(&windows) {
                         if let HitZone::Content(_) =
-                            hit_test(&windows, cursor_x, cursor_y, screen_w, screen_h)
+                            hit_test(&windows, cursor_x, cursor_y, screen_h)
                         {
                             let ev =
                                 make_mouse_event(&windows[idx], window::MOUSE_SCROLL, 0, scroll);

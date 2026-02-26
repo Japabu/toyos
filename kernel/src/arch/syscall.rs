@@ -51,6 +51,7 @@ const SYS_MAP_SHARED: u64 = 38;
 const SYS_FREE_SHARED: u64 = 39;
 const SYS_THREAD_SPAWN: u64 = 40;
 const SYS_THREAD_JOIN: u64 = 41;
+const SYS_CLOCK_REALTIME: u64 = 42;
 
 // ---------------------------------------------------------------------------
 // User pointer validation
@@ -221,6 +222,7 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         SYS_FREE_SHARED => sys_free_shared(a1),
         SYS_THREAD_SPAWN => process::spawn_thread(a1, a2, a3),
         SYS_THREAD_JOIN => sys_thread_join(a1),
+        SYS_CLOCK_REALTIME => crate::rtc::read_time(),
         _ => u64::MAX,
     }
 }

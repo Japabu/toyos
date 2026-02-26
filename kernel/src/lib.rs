@@ -20,6 +20,7 @@ pub mod symbols;
 pub mod process;
 pub mod scheduler;
 pub mod clock;
+pub mod rtc;
 pub mod fd;
 pub mod pipe;
 pub mod message;
