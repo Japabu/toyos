@@ -320,18 +320,33 @@ fn main() {
         }
 
         if ready.fd(1) {
-            let mut buf = [0u8; 3];
+            let mut buf = [0u8; 4];
             let n = io::read_fd(mouse_fd, &mut buf);
             if n >= 3 {
                 let buttons = buf[0];
                 let dx = buf[1] as i8;
                 let dy = buf[2] as i8;
+                let scroll = if n >= 4 { buf[3] as i8 } else { 0 };
 
                 cursor_x = (cursor_x + dx as i32).clamp(0, screen_w - 1);
                 cursor_y = (cursor_y + dy as i32).clamp(0, screen_h - 1);
 
                 let left = buttons & 1 != 0;
                 let was_left = prev_buttons & 1 != 0;
+
+                // Helper to build a MouseEvent for the focused window
+                let make_mouse_event = |win: &WindowState, event_type: u8, changed: u8, scroll: i8| {
+                    let local_x = (cursor_x - win.content_x as i32).max(0) as u16;
+                    let local_y = (cursor_y - win.content_y as i32).max(0) as u16;
+                    window::MouseEvent {
+                        x: local_x,
+                        y: local_y,
+                        buttons,
+                        event_type,
+                        changed,
+                        scroll,
+                    }
+                };
 
                 // Left button just pressed — start interaction
                 if left && !was_left {
@@ -358,12 +373,8 @@ fn main() {
                                 windows.push(win);
                             }
                             let win = windows.last().unwrap();
-                            let local_x = (cursor_x - win.content_x as i32).max(0) as u16;
-                            let local_y = (cursor_y - win.content_y as i32).max(0) as u16;
-                            message::send(win.pid, Message::new(
-                                window::MSG_MOUSE_INPUT,
-                                window::MouseEvent { x: local_x, y: local_y, button: 1 },
-                            ));
+                            let ev = make_mouse_event(win, window::MOUSE_PRESS, 1, 0);
+                            message::send(win.pid, Message::new(window::MSG_MOUSE_INPUT, ev));
                         }
                         HitZone::TaskbarItem(idx) => {
                             if idx < windows.len() && idx != windows.len() - 1 {
@@ -378,29 +389,12 @@ fn main() {
                     }
                 }
 
-                // Apply movement while button held
-                if left {
-                    match interaction {
-                        Interaction::Dragging { window_idx } => {
-                            let win = &mut windows[window_idx];
-                            let min_x = BORDER_WIDTH as i32;
-                            let min_y = (BORDER_WIDTH + TITLE_BAR_HEIGHT) as i32;
-                            win.content_x = (win.content_x as i32 + dx as i32).max(min_x) as usize;
-                            win.content_y = (win.content_y as i32 + dy as i32).max(min_y) as usize;
-                        }
-                        Interaction::Resizing { window_idx } => {
-                            let win = &mut windows[window_idx];
-                            win.width = (win.width as i32 + dx as i32)
-                                .max(MIN_CONTENT_WIDTH as i32) as usize;
-                            win.height = (win.height as i32 + dy as i32)
-                                .max(MIN_CONTENT_HEIGHT as i32) as usize;
-                        }
-                        Interaction::None => {}
-                    }
-                }
-
-                // Left button released — finalize interaction
+                // Left button released — send release to focused window + finalize interaction
                 if !left && was_left {
+                    if let Some(win) = windows.last() {
+                        let ev = make_mouse_event(win, window::MOUSE_RELEASE, 1, 0);
+                        message::send(win.pid, Message::new(window::MSG_MOUSE_INPUT, ev));
+                    }
                     if let Interaction::Resizing { window_idx } = interaction {
                         let win = &mut windows[window_idx];
                         io::free_shared(win.token);
@@ -426,6 +420,37 @@ fn main() {
                         ));
                     }
                     interaction = Interaction::None;
+                }
+
+                // Apply movement while button held (drag/resize)
+                if left {
+                    match interaction {
+                        Interaction::Dragging { window_idx } => {
+                            let win = &mut windows[window_idx];
+                            let min_x = BORDER_WIDTH as i32;
+                            let min_y = (BORDER_WIDTH + TITLE_BAR_HEIGHT) as i32;
+                            win.content_x = (win.content_x as i32 + dx as i32).max(min_x) as usize;
+                            win.content_y = (win.content_y as i32 + dy as i32).max(min_y) as usize;
+                        }
+                        Interaction::Resizing { window_idx } => {
+                            let win = &mut windows[window_idx];
+                            win.width = (win.width as i32 + dx as i32)
+                                .max(MIN_CONTENT_WIDTH as i32) as usize;
+                            win.height = (win.height as i32 + dy as i32)
+                                .max(MIN_CONTENT_HEIGHT as i32) as usize;
+                        }
+                        Interaction::None => {}
+                    }
+                }
+
+                // Scroll events — forward to focused window
+                if scroll != 0 {
+                    if let Some(win) = windows.last() {
+                        if let HitZone::Content(_) = hit_test(&windows, cursor_x, cursor_y, screen_w, screen_h) {
+                            let ev = make_mouse_event(win, window::MOUSE_SCROLL, 0, scroll);
+                            message::send(win.pid, Message::new(window::MSG_MOUSE_INPUT, ev));
+                        }
+                    }
                 }
 
                 prev_buttons = buttons;

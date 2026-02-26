@@ -7,6 +7,7 @@ pub struct MouseEvent {
     pub buttons: u8,
     pub dx: i8,
     pub dy: i8,
+    pub scroll: i8,
 }
 
 static MOUSE_BUF: Lock<VecDeque<MouseEvent>> = Lock::new(VecDeque::new());
@@ -16,7 +17,8 @@ pub fn handle_report(report: &[u8]) {
     let buttons = report[0];
     let dx = report[1] as i8;
     let dy = report[2] as i8;
-    MOUSE_BUF.lock().push_back(MouseEvent { buttons, dx, dy });
+    let scroll = if report.len() > 3 { report[3] as i8 } else { 0 };
+    MOUSE_BUF.lock().push_back(MouseEvent { buttons, dx, dy, scroll });
 }
 
 pub fn has_data() -> bool {

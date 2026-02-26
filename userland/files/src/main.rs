@@ -215,7 +215,7 @@ impl FileBrowser {
         loop {
             match self.window.recv_event() {
                 window::Event::MouseInput(ev) => {
-                    if ev.button == 1 {
+                    if ev.event_type == window::MOUSE_PRESS && ev.changed == 1 {
                         if let Some(idx) = self.item_at(ev.x as usize, ev.y as usize) {
                             if self.selected == Some(idx) {
                                 self.open(idx);

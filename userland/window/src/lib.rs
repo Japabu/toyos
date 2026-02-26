@@ -26,12 +26,20 @@ pub struct CreateWindowRequest {
     pub title: [u8; 31],
 }
 
+pub const MOUSE_MOVE: u8 = 0;
+pub const MOUSE_PRESS: u8 = 1;
+pub const MOUSE_RELEASE: u8 = 2;
+pub const MOUSE_SCROLL: u8 = 3;
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct MouseEvent {
     pub x: u16,
     pub y: u16,
-    pub button: u8,
+    pub buttons: u8,
+    pub event_type: u8,
+    pub changed: u8,
+    pub scroll: i8,
 }
 
 #[repr(C)]
