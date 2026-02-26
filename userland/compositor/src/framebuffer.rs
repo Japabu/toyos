@@ -140,17 +140,22 @@ impl Framebuffer {
         }
     }
 
-    /// Overlay cursor sprite onto the back buffer.
-    pub fn draw_cursor(&self, cursor_x: i32, cursor_y: i32, cursor: &sprite::Sprite) {
-        cursor.draw(
+    /// Alpha-blended blit of a sprite onto the back buffer.
+    pub fn draw_sprite(&self, sprite: &sprite::Sprite, x: usize, y: usize) {
+        sprite.draw(
             self.back(),
             self.stride,
             self.width,
             self.height,
             self.pixel_format_raw(),
-            cursor_x.max(0) as usize,
-            cursor_y.max(0) as usize,
+            x,
+            y,
         );
+    }
+
+    /// Overlay cursor sprite onto the back buffer.
+    pub fn draw_cursor(&self, cursor_x: i32, cursor_y: i32, cursor: &sprite::Sprite) {
+        self.draw_sprite(cursor, cursor_x.max(0) as usize, cursor_y.max(0) as usize);
     }
 }
 

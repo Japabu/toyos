@@ -9,7 +9,7 @@ use framebuffer::{Color, Framebuffer};
 const TITLE_BAR_HEIGHT: usize = 28;
 const BORDER_WIDTH: usize = 1;
 const RESIZE_HANDLE_SIZE: usize = 16;
-const CLOSE_BUTTON_WIDTH: usize = 28;
+const BUTTON_WIDTH: usize = 28;
 const MIN_CONTENT_WIDTH: usize = 200;
 const MIN_CONTENT_HEIGHT: usize = 100;
 const INITIAL_MARGIN: usize = 40;
@@ -17,6 +17,7 @@ const CASCADE_OFFSET: usize = 30;
 const TASKBAR_HEIGHT: usize = 32;
 const TASKBAR_ITEM_WIDTH: usize = 160;
 const TASKBAR_PADDING: usize = 4;
+const DOUBLE_CLICK_NS: u64 = 400_000_000;
 
 const DESKTOP_COLOR: Color = Color { r: 0x1a, g: 0x1a, b: 0x2e };
 const FOCUSED_TITLE_COLOR: Color = Color { r: 0x3a, g: 0x3a, b: 0x4e };
@@ -25,7 +26,6 @@ const FOCUSED_BORDER_COLOR: Color = Color { r: 0x58, g: 0x58, b: 0x6e };
 const UNFOCUSED_BORDER_COLOR: Color = Color { r: 0x38, g: 0x38, b: 0x42 };
 const FOCUSED_TITLE_TEXT: Color = Color { r: 0xe0, g: 0xe0, b: 0xe8 };
 const UNFOCUSED_TITLE_TEXT: Color = Color { r: 0x60, g: 0x60, b: 0x70 };
-const CLOSE_BUTTON_COLOR: Color = Color { r: 0xc0, g: 0x40, b: 0x40 };
 const CLOSE_BUTTON_BG: Color = Color { r: 0x50, g: 0x28, b: 0x28 };
 const TASKBAR_COLOR: Color = Color { r: 0x18, g: 0x18, b: 0x25 };
 const TASKBAR_ACTIVE_COLOR: Color = Color { r: 0x30, g: 0x30, b: 0x45 };
@@ -33,6 +33,8 @@ const TASKBAR_TEXT_COLOR: Color = Color { r: 0x80, g: 0x80, b: 0x90 };
 const TASKBAR_ACTIVE_TEXT: Color = Color { r: 0xe0, g: 0xe0, b: 0xe8 };
 const TASKBAR_NEW_COLOR: Color = Color { r: 0x40, g: 0x60, b: 0x40 };
 const TASKBAR_NEW_TEXT: Color = Color { r: 0x80, g: 0xc0, b: 0x80 };
+const TASKBAR_MINIMIZED_COLOR: Color = Color { r: 0x20, g: 0x20, b: 0x30 };
+const TASKBAR_MINIMIZED_TEXT: Color = Color { r: 0x50, g: 0x50, b: 0x60 };
 
 #[repr(C)]
 struct FramebufferInfo {
@@ -77,16 +79,102 @@ struct WindowState {
     buf_width: usize,
     buf_height: usize,
     title: String,
+    minimized: bool,
+    maximized: bool,
+    saved_x: usize,
+    saved_y: usize,
+    saved_w: usize,
+    saved_h: usize,
+}
+
+struct TitleBarIcons {
+    minimize: sprite::Sprite,
+    maximize: sprite::Sprite,
+    close: sprite::Sprite,
 }
 
 enum HitZone {
     Desktop,
     TitleBar(usize),
+    MinimizeButton(usize),
+    MaximizeButton(usize),
     CloseButton(usize),
     Content(usize),
     ResizeCorner(usize),
     TaskbarItem(usize),
     TaskbarNew,
+}
+
+fn focused_window_idx(windows: &[WindowState]) -> Option<usize> {
+    windows
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, w)| !w.minimized)
+        .map(|(i, _)| i)
+}
+
+fn resize_window(win: &mut WindowState, new_w: usize, new_h: usize, pixel_format: u32) {
+    io::free_shared(win.token);
+    let buf_size = new_w * new_h * 4;
+    let token = io::alloc_shared(buf_size);
+    let buffer = io::map_shared(token);
+    io::grant_shared(token, win.pid);
+    win.token = token;
+    win.buffer = buffer;
+    win.buffer_size = buf_size;
+    win.width = new_w;
+    win.height = new_h;
+    win.buf_width = new_w;
+    win.buf_height = new_h;
+    message::send(
+        win.pid,
+        Message::new(
+            window::MSG_WINDOW_RESIZED,
+            window::WindowInfo {
+                token,
+                width: new_w as u32,
+                height: new_h as u32,
+                stride: new_w as u32,
+                pixel_format,
+            },
+        ),
+    );
+}
+
+fn maximize_window(win: &mut WindowState, screen_w: usize, screen_h: usize, pixel_format: u32) {
+    win.saved_x = win.content_x;
+    win.saved_y = win.content_y;
+    win.saved_w = win.width;
+    win.saved_h = win.height;
+    win.maximized = true;
+    win.content_x = BORDER_WIDTH;
+    win.content_y = BORDER_WIDTH + TITLE_BAR_HEIGHT;
+    let new_w = screen_w - BORDER_WIDTH * 2;
+    let new_h = screen_h - TASKBAR_HEIGHT - BORDER_WIDTH * 2 - TITLE_BAR_HEIGHT;
+    resize_window(win, new_w, new_h, pixel_format);
+}
+
+fn restore_window(win: &mut WindowState, pixel_format: u32) {
+    win.maximized = false;
+    win.content_x = win.saved_x;
+    win.content_y = win.saved_y;
+    let w = win.saved_w;
+    let h = win.saved_h;
+    resize_window(win, w, h, pixel_format);
+}
+
+fn draw_icon_centered(
+    screen: &Framebuffer,
+    icon: &sprite::Sprite,
+    area_x: usize,
+    area_y: usize,
+    area_w: usize,
+    area_h: usize,
+) {
+    let ix = area_x + area_w.saturating_sub(icon.width()) / 2;
+    let iy = area_y + area_h.saturating_sub(icon.height()) / 2;
+    screen.draw_sprite(icon, ix, iy);
 }
 
 fn hit_test(windows: &[WindowState], x: i32, y: i32, screen_w: i32, screen_h: i32) -> HitZone {
@@ -104,25 +192,41 @@ fn hit_test(windows: &[WindowState], x: i32, y: i32, screen_w: i32, screen_h: i3
     }
 
     for (idx, win) in windows.iter().enumerate().rev() {
+        if win.minimized {
+            continue;
+        }
+
         let win_x = win.content_x as i32 - BORDER_WIDTH as i32;
         let win_y = win.content_y as i32 - BORDER_WIDTH as i32 - TITLE_BAR_HEIGHT as i32;
         let win_w = win.width as i32 + BORDER_WIDTH as i32 * 2;
         let win_h = win.height as i32 + BORDER_WIDTH as i32 * 2 + TITLE_BAR_HEIGHT as i32;
 
         if x >= win_x && x < win_x + win_w && y >= win_y && y < win_y + win_h {
-            // Close button (right side of title bar)
-            let close_x = win_x + win_w - BORDER_WIDTH as i32 - CLOSE_BUTTON_WIDTH as i32;
             let title_y_end = win_y + BORDER_WIDTH as i32 + TITLE_BAR_HEIGHT as i32;
+
+            // Buttons from right: close, maximize, minimize
+            let close_x = win_x + win_w - BORDER_WIDTH as i32 - BUTTON_WIDTH as i32;
             if x >= close_x && y < title_y_end {
                 return HitZone::CloseButton(idx);
             }
-            // Bottom-right corner = resize handle
-            let corner_x = win_x + win_w - RESIZE_HANDLE_SIZE as i32;
-            let corner_y = win_y + win_h - RESIZE_HANDLE_SIZE as i32;
-            if x >= corner_x && y >= corner_y {
-                return HitZone::ResizeCorner(idx);
+            let max_x = close_x - BUTTON_WIDTH as i32;
+            if x >= max_x && x < close_x && y < title_y_end {
+                return HitZone::MaximizeButton(idx);
             }
-            // Title bar = drag handle
+            let min_x = max_x - BUTTON_WIDTH as i32;
+            if x >= min_x && x < max_x && y < title_y_end {
+                return HitZone::MinimizeButton(idx);
+            }
+
+            // Resize corner (not for maximized windows)
+            if !win.maximized {
+                let corner_x = win_x + win_w - RESIZE_HANDLE_SIZE as i32;
+                let corner_y = win_y + win_h - RESIZE_HANDLE_SIZE as i32;
+                if x >= corner_x && y >= corner_y {
+                    return HitZone::ResizeCorner(idx);
+                }
+            }
+
             if y < title_y_end {
                 return HitZone::TitleBar(idx);
             }
@@ -145,13 +249,18 @@ fn redraw(
     cursor_x: i32,
     cursor_y: i32,
     cursor: &sprite::Sprite,
+    icons: &TitleBarIcons,
 ) {
     screen.clear(DESKTOP_COLOR);
 
-    let focused_idx = windows.len().wrapping_sub(1);
+    let focused_idx = focused_window_idx(windows);
 
     for (i, win) in windows.iter().enumerate() {
-        let focused = i == focused_idx;
+        if win.minimized {
+            continue;
+        }
+
+        let focused = Some(i) == focused_idx;
         let border_color = if focused { FOCUSED_BORDER_COLOR } else { UNFOCUSED_BORDER_COLOR };
         let title_color = if focused { FOCUSED_TITLE_COLOR } else { UNFOCUSED_TITLE_COLOR };
         let text_color = if focused { FOCUSED_TITLE_TEXT } else { UNFOCUSED_TITLE_TEXT };
@@ -176,14 +285,42 @@ fn redraw(
         let title = if win.title.is_empty() { "Window" } else { &win.title };
         font.draw_string(screen, title_x, title_y, title, text_color, title_color);
 
-        // Close button
-        let close_x = win_x + win_w - BORDER_WIDTH - CLOSE_BUTTON_WIDTH;
+        // Close button (rightmost)
+        let close_x = win_x + win_w - BORDER_WIDTH - BUTTON_WIDTH;
         let close_bg = if focused { CLOSE_BUTTON_BG } else { title_color };
-        let close_fg = if focused { CLOSE_BUTTON_COLOR } else { UNFOCUSED_TITLE_TEXT };
-        screen.fill_rect(close_x, win_y + BORDER_WIDTH, CLOSE_BUTTON_WIDTH, TITLE_BAR_HEIGHT, close_bg);
-        let x_char_x = close_x + (CLOSE_BUTTON_WIDTH - 8) / 2;
-        let x_char_y = win_y + BORDER_WIDTH + (TITLE_BAR_HEIGHT - 16) / 2;
-        font.draw_char(screen, x_char_x, x_char_y, 'X', close_fg, close_bg);
+        screen.fill_rect(close_x, win_y + BORDER_WIDTH, BUTTON_WIDTH, TITLE_BAR_HEIGHT, close_bg);
+        draw_icon_centered(
+            screen,
+            &icons.close,
+            close_x,
+            win_y + BORDER_WIDTH,
+            BUTTON_WIDTH,
+            TITLE_BAR_HEIGHT,
+        );
+
+        // Maximize button
+        let max_x = close_x - BUTTON_WIDTH;
+        screen.fill_rect(max_x, win_y + BORDER_WIDTH, BUTTON_WIDTH, TITLE_BAR_HEIGHT, title_color);
+        draw_icon_centered(
+            screen,
+            &icons.maximize,
+            max_x,
+            win_y + BORDER_WIDTH,
+            BUTTON_WIDTH,
+            TITLE_BAR_HEIGHT,
+        );
+
+        // Minimize button
+        let min_x = max_x - BUTTON_WIDTH;
+        screen.fill_rect(min_x, win_y + BORDER_WIDTH, BUTTON_WIDTH, TITLE_BAR_HEIGHT, title_color);
+        draw_icon_centered(
+            screen,
+            &icons.minimize,
+            min_x,
+            win_y + BORDER_WIDTH,
+            BUTTON_WIDTH,
+            TITLE_BAR_HEIGHT,
+        );
 
         // Blit content, clipped to buffer dimensions
         let blit_w = win.width.min(win.buf_width);
@@ -198,11 +335,16 @@ fn redraw(
     let taskbar_y = screen_h - TASKBAR_HEIGHT;
     screen.fill_rect(0, taskbar_y, screen_w, TASKBAR_HEIGHT, TASKBAR_COLOR);
 
-    for (i, _win) in windows.iter().enumerate() {
-        let focused = i == focused_idx;
+    for (i, win) in windows.iter().enumerate() {
+        let focused = Some(i) == focused_idx;
         let tab_x = i * TASKBAR_ITEM_WIDTH;
-        let bg = if focused { TASKBAR_ACTIVE_COLOR } else { TASKBAR_COLOR };
-        let fg = if focused { TASKBAR_ACTIVE_TEXT } else { TASKBAR_TEXT_COLOR };
+        let (bg, fg) = if win.minimized {
+            (TASKBAR_MINIMIZED_COLOR, TASKBAR_MINIMIZED_TEXT)
+        } else if focused {
+            (TASKBAR_ACTIVE_COLOR, TASKBAR_ACTIVE_TEXT)
+        } else {
+            (TASKBAR_COLOR, TASKBAR_TEXT_COLOR)
+        };
         screen.fill_rect(
             tab_x + 1,
             taskbar_y + TASKBAR_PADDING,
@@ -213,7 +355,7 @@ fn redraw(
         let text_x = tab_x + 8;
         let text_y = taskbar_y + (TASKBAR_HEIGHT - 16) / 2;
         let max_chars = (TASKBAR_ITEM_WIDTH - 16) / font.width();
-        let title = if _win.title.is_empty() { "Window" } else { &_win.title };
+        let title = if win.title.is_empty() { "Window" } else { &win.title };
         let display: String = title.chars().take(max_chars).collect();
         font.draw_string(screen, text_x, text_y, &display, fg, bg);
     }
@@ -258,8 +400,27 @@ fn main() {
     let font = font::Font::new(&ttf_data, 8, 16);
     let cursor_svg = std::fs::read("/initrd/cursor-bold.svg").expect("failed to read cursor");
     let cursor_default = sprite::Sprite::from_svg_colored(&cursor_svg, 20, [255, 255, 255]);
-    let resize_svg = std::fs::read("/initrd/arrow-down-right-bold.svg").expect("failed to read resize cursor");
+    let resize_svg =
+        std::fs::read("/initrd/arrow-down-right-bold.svg").expect("failed to read resize cursor");
     let cursor_resize = sprite::Sprite::from_svg_colored(&resize_svg, 20, [255, 255, 255]);
+
+    let icons = TitleBarIcons {
+        minimize: sprite::Sprite::from_svg_colored(
+            &std::fs::read("/initrd/minus-bold.svg").expect("failed to read minimize icon"),
+            14,
+            [255, 255, 255],
+        ),
+        maximize: sprite::Sprite::from_svg_colored(
+            &std::fs::read("/initrd/square-bold.svg").expect("failed to read maximize icon"),
+            14,
+            [255, 255, 255],
+        ),
+        close: sprite::Sprite::from_svg_colored(
+            &std::fs::read("/initrd/x-bold.svg").expect("failed to read close icon"),
+            14,
+            [255, 255, 255],
+        ),
+    };
 
     Command::new("/initrd/terminal")
         .spawn()
@@ -273,6 +434,8 @@ fn main() {
     let mut dirty = true;
     let mut prev_buttons: u8 = 0;
     let mut interaction = Interaction::None;
+    let mut last_title_click_time: u64 = 0;
+    let mut last_title_click_pid: u32 = 0;
 
     loop {
         if dirty {
@@ -283,7 +446,15 @@ fn main() {
                     _ => &cursor_default,
                 },
             };
-            redraw(&screen, &font, &windows, cursor_x, cursor_y, active_cursor);
+            redraw(
+                &screen,
+                &font,
+                &windows,
+                cursor_x,
+                cursor_y,
+                active_cursor,
+                &icons,
+            );
             io::gpu_present();
             screen.swap();
             dirty = false;
@@ -306,14 +477,20 @@ fn main() {
                     if windows.len() > 1 {
                         let win = windows.pop().unwrap();
                         windows.insert(0, win);
+                        if let Some(top) = windows.last_mut() {
+                            top.minimized = false;
+                        }
                         dirty = true;
                     }
                 } else if event.ctrl() && event.keycode == 0x11 {
                     // Ctrl+N: spawn terminal
                     Command::new("/initrd/terminal").spawn().ok();
                 } else if event.len > 0 {
-                    if let Some(win) = windows.last() {
-                        message::send(win.pid, Message::new(window::MSG_KEY_INPUT, *event));
+                    if let Some(idx) = focused_window_idx(&windows) {
+                        message::send(
+                            windows[idx].pid,
+                            Message::new(window::MSG_KEY_INPUT, *event),
+                        );
                     }
                 }
             }
@@ -334,38 +511,100 @@ fn main() {
                 let left = buttons & 1 != 0;
                 let was_left = prev_buttons & 1 != 0;
 
-                // Helper to build a MouseEvent for the focused window
-                let make_mouse_event = |win: &WindowState, event_type: u8, changed: u8, scroll: i8| {
-                    let local_x = (cursor_x - win.content_x as i32).max(0) as u16;
-                    let local_y = (cursor_y - win.content_y as i32).max(0) as u16;
-                    window::MouseEvent {
-                        x: local_x,
-                        y: local_y,
-                        buttons,
-                        event_type,
-                        changed,
-                        scroll,
-                    }
-                };
+                let make_mouse_event =
+                    |win: &WindowState, event_type: u8, changed: u8, scroll: i8| {
+                        let local_x = (cursor_x - win.content_x as i32).max(0) as u16;
+                        let local_y = (cursor_y - win.content_y as i32).max(0) as u16;
+                        window::MouseEvent {
+                            x: local_x,
+                            y: local_y,
+                            buttons,
+                            event_type,
+                            changed,
+                            scroll,
+                        }
+                    };
 
-                // Left button just pressed — start interaction
+                // Left button just pressed
                 if left && !was_left {
                     match hit_test(&windows, cursor_x, cursor_y, screen_w, screen_h) {
                         HitZone::CloseButton(idx) => {
                             let win = windows.remove(idx);
                             message::send(win.pid, Message::signal(window::MSG_WINDOW_CLOSE));
                         }
-                        HitZone::TitleBar(idx) => {
-                            let win = windows.remove(idx);
-                            windows.push(win);
+                        HitZone::MinimizeButton(idx) => {
+                            windows[idx].minimized = true;
+                        }
+                        HitZone::MaximizeButton(idx) => {
+                            if idx != windows.len() - 1 {
+                                let win = windows.remove(idx);
+                                windows.push(win);
+                            }
                             let new_idx = windows.len() - 1;
-                            interaction = Interaction::Dragging { window_idx: new_idx };
+                            let pixel_format = screen.pixel_format_raw();
+                            if windows[new_idx].maximized {
+                                restore_window(&mut windows[new_idx], pixel_format);
+                            } else {
+                                maximize_window(
+                                    &mut windows[new_idx],
+                                    screen_w as usize,
+                                    screen_h as usize,
+                                    pixel_format,
+                                );
+                            }
+                        }
+                        HitZone::TitleBar(idx) => {
+                            if idx != windows.len() - 1 {
+                                let win = windows.remove(idx);
+                                windows.push(win);
+                            }
+                            let new_idx = windows.len() - 1;
+
+                            // Double-click detection
+                            let now = io::clock_nanos();
+                            let pid = windows[new_idx].pid;
+                            if pid == last_title_click_pid
+                                && now.wrapping_sub(last_title_click_time) < DOUBLE_CLICK_NS
+                            {
+                                let pixel_format = screen.pixel_format_raw();
+                                if windows[new_idx].maximized {
+                                    restore_window(&mut windows[new_idx], pixel_format);
+                                } else {
+                                    maximize_window(
+                                        &mut windows[new_idx],
+                                        screen_w as usize,
+                                        screen_h as usize,
+                                        pixel_format,
+                                    );
+                                }
+                                last_title_click_pid = 0;
+                                last_title_click_time = 0;
+                            } else {
+                                last_title_click_pid = pid;
+                                last_title_click_time = now;
+                                // Un-maximize on drag
+                                if windows[new_idx].maximized {
+                                    let pixel_format = screen.pixel_format_raw();
+                                    restore_window(&mut windows[new_idx], pixel_format);
+                                    let win = &mut windows[new_idx];
+                                    win.content_x = (cursor_x as usize)
+                                        .saturating_sub(win.width / 2)
+                                        .max(BORDER_WIDTH);
+                                    win.content_y = (cursor_y as usize)
+                                        .max(BORDER_WIDTH + TITLE_BAR_HEIGHT);
+                                }
+                                interaction = Interaction::Dragging {
+                                    window_idx: new_idx,
+                                };
+                            }
                         }
                         HitZone::ResizeCorner(idx) => {
                             let win = windows.remove(idx);
                             windows.push(win);
                             let new_idx = windows.len() - 1;
-                            interaction = Interaction::Resizing { window_idx: new_idx };
+                            interaction = Interaction::Resizing {
+                                window_idx: new_idx,
+                            };
                         }
                         HitZone::Content(idx) => {
                             if idx != windows.len() - 1 {
@@ -374,12 +613,23 @@ fn main() {
                             }
                             let win = windows.last().unwrap();
                             let ev = make_mouse_event(win, window::MOUSE_PRESS, 1, 0);
-                            message::send(win.pid, Message::new(window::MSG_MOUSE_INPUT, ev));
+                            message::send(
+                                win.pid,
+                                Message::new(window::MSG_MOUSE_INPUT, ev),
+                            );
                         }
                         HitZone::TaskbarItem(idx) => {
-                            if idx < windows.len() && idx != windows.len() - 1 {
-                                let win = windows.remove(idx);
-                                windows.push(win);
+                            if idx < windows.len() {
+                                if windows[idx].minimized {
+                                    windows[idx].minimized = false;
+                                    let win = windows.remove(idx);
+                                    windows.push(win);
+                                } else if Some(idx) == focused_window_idx(&windows) {
+                                    windows[idx].minimized = true;
+                                } else {
+                                    let win = windows.remove(idx);
+                                    windows.push(win);
+                                }
                             }
                         }
                         HitZone::TaskbarNew => {
@@ -389,66 +639,62 @@ fn main() {
                     }
                 }
 
-                // Left button released — send release to focused window + finalize interaction
+                // Left button released
                 if !left && was_left {
-                    if let Some(win) = windows.last() {
-                        let ev = make_mouse_event(win, window::MOUSE_RELEASE, 1, 0);
-                        message::send(win.pid, Message::new(window::MSG_MOUSE_INPUT, ev));
+                    if let Some(idx) = focused_window_idx(&windows) {
+                        let ev = make_mouse_event(&windows[idx], window::MOUSE_RELEASE, 1, 0);
+                        message::send(
+                            windows[idx].pid,
+                            Message::new(window::MSG_MOUSE_INPUT, ev),
+                        );
                     }
                     if let Interaction::Resizing { window_idx } = interaction {
-                        let win = &mut windows[window_idx];
-                        io::free_shared(win.token);
-                        let buf_size = win.width * win.height * 4;
-                        let token = io::alloc_shared(buf_size);
-                        let buffer = io::map_shared(token);
-                        io::grant_shared(token, win.pid);
-                        win.token = token;
-                        win.buffer = buffer;
-                        win.buffer_size = buf_size;
-                        win.buf_width = win.width;
-                        win.buf_height = win.height;
                         let pixel_format = screen.pixel_format_raw();
-                        message::send(win.pid, Message::new(
-                            window::MSG_WINDOW_RESIZED,
-                            window::WindowInfo {
-                                token,
-                                width: win.width as u32,
-                                height: win.height as u32,
-                                stride: win.width as u32,
-                                pixel_format,
-                            },
-                        ));
+                        let win = &mut windows[window_idx];
+                        let new_w = win.width;
+                        let new_h = win.height;
+                        resize_window(win, new_w, new_h, pixel_format);
                     }
                     interaction = Interaction::None;
                 }
 
-                // Apply movement while button held (drag/resize)
+                // Drag / resize while held
                 if left {
                     match interaction {
                         Interaction::Dragging { window_idx } => {
                             let win = &mut windows[window_idx];
                             let min_x = BORDER_WIDTH as i32;
                             let min_y = (BORDER_WIDTH + TITLE_BAR_HEIGHT) as i32;
-                            win.content_x = (win.content_x as i32 + dx as i32).max(min_x) as usize;
-                            win.content_y = (win.content_y as i32 + dy as i32).max(min_y) as usize;
+                            win.content_x =
+                                (win.content_x as i32 + dx as i32).max(min_x) as usize;
+                            win.content_y =
+                                (win.content_y as i32 + dy as i32).max(min_y) as usize;
                         }
                         Interaction::Resizing { window_idx } => {
                             let win = &mut windows[window_idx];
                             win.width = (win.width as i32 + dx as i32)
-                                .max(MIN_CONTENT_WIDTH as i32) as usize;
+                                .max(MIN_CONTENT_WIDTH as i32)
+                                as usize;
                             win.height = (win.height as i32 + dy as i32)
-                                .max(MIN_CONTENT_HEIGHT as i32) as usize;
+                                .max(MIN_CONTENT_HEIGHT as i32)
+                                as usize;
                         }
                         Interaction::None => {}
                     }
                 }
 
-                // Scroll events — forward to focused window
+                // Scroll events
                 if scroll != 0 {
-                    if let Some(win) = windows.last() {
-                        if let HitZone::Content(_) = hit_test(&windows, cursor_x, cursor_y, screen_w, screen_h) {
-                            let ev = make_mouse_event(win, window::MOUSE_SCROLL, 0, scroll);
-                            message::send(win.pid, Message::new(window::MSG_MOUSE_INPUT, ev));
+                    if let Some(idx) = focused_window_idx(&windows) {
+                        if let HitZone::Content(_) =
+                            hit_test(&windows, cursor_x, cursor_y, screen_w, screen_h)
+                        {
+                            let ev =
+                                make_mouse_event(&windows[idx], window::MOUSE_SCROLL, 0, scroll);
+                            message::send(
+                                windows[idx].pid,
+                                Message::new(window::MSG_MOUSE_INPUT, ev),
+                            );
                         }
                     }
                 }
@@ -503,18 +749,27 @@ fn main() {
                         buf_width: content_w,
                         buf_height: content_h,
                         title,
+                        minimized: false,
+                        maximized: false,
+                        saved_x: 0,
+                        saved_y: 0,
+                        saved_w: 0,
+                        saved_h: 0,
                     });
 
-                    message::send(sender, Message::new(
-                        window::MSG_WINDOW_CREATED,
-                        window::WindowInfo {
-                            token,
-                            width: content_w as u32,
-                            height: content_h as u32,
-                            stride: content_w as u32,
-                            pixel_format,
-                        },
-                    ));
+                    message::send(
+                        sender,
+                        Message::new(
+                            window::MSG_WINDOW_CREATED,
+                            window::WindowInfo {
+                                token,
+                                width: content_w as u32,
+                                height: content_h as u32,
+                                stride: content_w as u32,
+                                pixel_format,
+                            },
+                        ),
+                    );
                     dirty = true;
                 }
                 window::MSG_PRESENT => {
