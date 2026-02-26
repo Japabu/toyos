@@ -530,6 +530,7 @@ fn main() {
     let mut interaction = Interaction::None;
     let mut last_title_click_time: u64 = 0;
     let mut last_title_click_pid: u32 = 0;
+    let mut clipboard = String::new();
 
     loop {
         if dirty {
@@ -578,7 +579,6 @@ fn main() {
                         dirty = true;
                     }
                 } else if event.gui() {
-                    // Super+arrow: window snapping
                     if let Some(idx) = focused_window_idx(&windows) {
                         let pixel_format = screen.pixel_format_raw();
                         match event.keycode {
@@ -627,7 +627,25 @@ fn main() {
                                     restore_window(&mut windows[idx], pixel_format);
                                 }
                             }
-                            _ => {}
+                            0x19 => {
+                                // GUI+V: paste clipboard
+                                if !clipboard.is_empty() {
+                                    message::send(
+                                        windows[idx].pid,
+                                        Message::from_bytes(
+                                            window::MSG_CLIPBOARD_PASTE,
+                                            clipboard.as_bytes(),
+                                        ),
+                                    );
+                                }
+                            }
+                            _ => {
+                                // Forward other GUI combos to focused app
+                                message::send(
+                                    windows[idx].pid,
+                                    Message::new(window::MSG_KEY_INPUT, *event),
+                                );
+                            }
                         }
                         dirty = true;
                     }
@@ -857,7 +875,21 @@ fn main() {
                                 .max(MIN_CONTENT_HEIGHT as i32)
                                 as usize;
                         }
-                        Interaction::None => {}
+                        Interaction::None => {
+                            // Forward mouse move to focused app for drag selection
+                            if let Some(idx) = focused_window_idx(&windows) {
+                                let ev = make_mouse_event(
+                                    &windows[idx],
+                                    window::MOUSE_MOVE,
+                                    0,
+                                    0,
+                                );
+                                message::send(
+                                    windows[idx].pid,
+                                    Message::new(window::MSG_MOUSE_INPUT, ev),
+                                );
+                            }
+                        }
                     }
                 }
 
@@ -954,6 +986,10 @@ fn main() {
                     if let Some(_win) = windows.iter().find(|w| w.pid == sender) {
                         dirty = true;
                     }
+                }
+                window::MSG_CLIPBOARD_SET => {
+                    let bytes = msg.take_bytes();
+                    clipboard = String::from_utf8_lossy(&bytes).into_owned();
                 }
                 _ => {}
             }

@@ -49,9 +49,39 @@ fn main() {
         if ready.messages() {
             match window.recv_event() {
                 window::Event::KeyInput(event) => {
-                    shell_stdin.write_all(&event.translated[..event.len as usize]).ok();
+                    if event.gui() && event.keycode == 0x06 {
+                        // Cmd+C: copy selection to clipboard
+                        if let Some(text) = console.get_selection() {
+                            window::clipboard_set(&text);
+                        }
+                    } else if event.len > 0 {
+                        shell_stdin.write_all(&event.translated[..event.len as usize]).ok();
+                    }
                 }
-                window::Event::MouseInput(_) => {}
+                window::Event::ClipboardPaste(data) => {
+                    shell_stdin.write_all(&data).ok();
+                }
+                window::Event::MouseInput(ev) => {
+                    let col = ev.x as usize / console.font_width();
+                    let row = ev.y as usize / console.font_height();
+                    match ev.event_type {
+                        window::MOUSE_PRESS if ev.changed == 1 => {
+                            console.mouse_down(col, row);
+                            window.present();
+                        }
+                        window::MOUSE_MOVE if ev.buttons & 1 != 0 => {
+                            console.mouse_drag(col, row);
+                            window.present();
+                        }
+                        window::MOUSE_RELEASE if ev.changed == 1 => {
+                            if let Some(text) = console.mouse_up(col, row) {
+                                window::clipboard_set(&text);
+                            }
+                            window.present();
+                        }
+                        _ => {}
+                    }
+                }
                 window::Event::Close => break,
                 window::Event::Resized => {
                     io::set_screen_size(window.width(), window.height());

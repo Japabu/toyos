@@ -3,6 +3,8 @@ use crate::framebuffer::{Color, Framebuffer};
 
 const DEFAULT_FG: Color = Color { r: 255, g: 255, b: 255 };
 const DEFAULT_BG: Color = Color { r: 0, g: 0, b: 0 };
+const SEL_FG: Color = Color { r: 255, g: 255, b: 255 };
+const SEL_BG: Color = Color { r: 58, g: 110, b: 165 };
 
 fn ansi_color(index: usize) -> Color {
     match index {
@@ -62,6 +64,8 @@ enum AnsiState {
 
 struct SavedScreen {
     char_buf: Vec<char>,
+    fg_buf: Vec<Color>,
+    bg_buf: Vec<Color>,
     wrapped: Vec<bool>,
     rendered: Vec<u64>,
     cursor_col: usize,
@@ -89,6 +93,8 @@ pub struct Console {
     fg: Color,
     bg: Color,
     char_buf: Vec<char>,
+    fg_buf: Vec<Color>,
+    bg_buf: Vec<Color>,
     /// Per-row flag: true if this row soft-wrapped into the next row.
     wrapped: Vec<bool>,
     rendered: Vec<u64>,
@@ -102,6 +108,8 @@ pub struct Console {
     utf8_buf: [u8; 4],
     utf8_len: usize,
     utf8_needed: usize,
+    sel_anchor: Option<(usize, usize)>,
+    sel_end: Option<(usize, usize)>,
 }
 
 impl Console {
@@ -119,6 +127,8 @@ impl Console {
             fg: DEFAULT_FG,
             bg: DEFAULT_BG,
             char_buf: vec![' '; cols * rows],
+            fg_buf: vec![DEFAULT_FG; cols * rows],
+            bg_buf: vec![DEFAULT_BG; cols * rows],
             wrapped: vec![false; rows],
             rendered: vec![cell_key(' ', DEFAULT_FG, DEFAULT_BG); cols * rows],
             ansi_state: AnsiState::Normal,
@@ -131,6 +141,8 @@ impl Console {
             utf8_buf: [0; 4],
             utf8_len: 0,
             utf8_needed: 0,
+            sel_anchor: None,
+            sel_end: None,
         };
 
         console.fb.clear(DEFAULT_BG);
@@ -146,6 +158,8 @@ impl Console {
         } else {
             (self.fg, self.bg)
         };
+        self.fg_buf[idx] = fg;
+        self.bg_buf[idx] = bg;
         let key = cell_key(ch, fg, bg);
         if self.rendered[idx] == key {
             return;
@@ -190,11 +204,15 @@ impl Console {
         self.fb.scroll_up(self.font.height(), self.bg);
         let row_size = self.cols;
         self.char_buf.copy_within(row_size.., 0);
+        self.fg_buf.copy_within(row_size.., 0);
+        self.bg_buf.copy_within(row_size.., 0);
         self.rendered.copy_within(row_size.., 0);
         self.wrapped.copy_within(1.., 0);
         let last_row = (self.rows - 1) * row_size;
         for i in last_row..last_row + row_size {
             self.char_buf[i] = ' ';
+            self.fg_buf[i] = DEFAULT_FG;
+            self.bg_buf[i] = DEFAULT_BG;
             self.rendered[i] = 0;
         }
         self.wrapped[self.rows - 1] = false;
@@ -213,6 +231,8 @@ impl Console {
     fn clear_screen(&mut self) {
         self.fb.clear(self.bg);
         self.char_buf.fill(' ');
+        self.fg_buf.fill(DEFAULT_FG);
+        self.bg_buf.fill(DEFAULT_BG);
         self.wrapped.fill(false);
         let blank = cell_key(' ', DEFAULT_FG, DEFAULT_BG);
         self.rendered.fill(blank);
@@ -221,17 +241,19 @@ impl Console {
     }
 
     fn redraw_all(&mut self) {
-        self.fb.clear(self.bg);
+        self.fb.clear(DEFAULT_BG);
         self.rendered.fill(0);
         for row in 0..self.rows {
             for col in 0..self.cols {
                 let idx = row * self.cols + col;
                 let ch = self.char_buf[idx];
-                if ch != ' ' {
+                let fg = self.fg_buf[idx];
+                let bg = self.bg_buf[idx];
+                if ch != ' ' || bg != DEFAULT_BG {
                     let px = col * self.font.width();
                     let py = row * self.font.height();
-                    self.rendered[idx] = cell_key(ch, self.fg, self.bg);
-                    self.font.draw_char(&self.fb, px, py, ch, self.fg, self.bg);
+                    self.rendered[idx] = cell_key(ch, fg, bg);
+                    self.font.draw_char(&self.fb, px, py, ch, fg, bg);
                 }
             }
         }
@@ -457,6 +479,8 @@ impl Console {
                 let n = self.cols * self.rows;
                 self.saved_screen = Some(SavedScreen {
                     char_buf: core::mem::replace(&mut self.char_buf, vec![' '; n]),
+                    fg_buf: core::mem::replace(&mut self.fg_buf, vec![DEFAULT_FG; n]),
+                    bg_buf: core::mem::replace(&mut self.bg_buf, vec![DEFAULT_BG; n]),
                     wrapped: core::mem::replace(&mut self.wrapped, vec![false; self.rows]),
                     rendered: core::mem::replace(&mut self.rendered, vec![0; n]),
                     cursor_col: self.cursor_col,
@@ -469,6 +493,8 @@ impl Console {
             (1049, b'l') => {
                 if let Some(saved) = self.saved_screen.take() {
                     self.char_buf = saved.char_buf;
+                    self.fg_buf = saved.fg_buf;
+                    self.bg_buf = saved.bg_buf;
                     self.wrapped = saved.wrapped;
                     self.rendered = saved.rendered;
                     self.cursor_col = saved.cursor_col;
@@ -554,15 +580,143 @@ impl Console {
         self.cols = new_cols;
         self.rows = new_rows;
         self.char_buf = new_char_buf;
+        self.fg_buf = vec![DEFAULT_FG; new_cols * new_rows];
+        self.bg_buf = vec![DEFAULT_BG; new_cols * new_rows];
         self.wrapped = new_wrapped;
         self.rendered = vec![0; new_cols * new_rows];
         self.cursor_row = new_cursor_row.min(new_rows.saturating_sub(1));
         self.cursor_col = new_cursor_col.min(new_cols.saturating_sub(1));
         self.saved_screen = None;
+        self.sel_anchor = None;
+        self.sel_end = None;
         self.redraw_all();
     }
 
+    pub fn font_width(&self) -> usize {
+        self.font.width()
+    }
+
+    pub fn font_height(&self) -> usize {
+        self.font.height()
+    }
+
+    fn selection_range(&self) -> Option<(usize, usize)> {
+        let (ac, ar) = self.sel_anchor?;
+        let (ec, er) = self.sel_end?;
+        let a = ar * self.cols + ac;
+        let b = er * self.cols + ec;
+        if a <= b { Some((a, b)) } else { Some((b, a)) }
+    }
+
+    fn is_selected(&self, idx: usize) -> bool {
+        match self.selection_range() {
+            Some((start, end)) => idx >= start && idx <= end,
+            None => false,
+        }
+    }
+
+    fn redraw_cell(&mut self, col: usize, row: usize) {
+        let idx = row * self.cols + col;
+        let ch = self.char_buf[idx];
+        let (fg, bg) = if self.is_selected(idx) {
+            (SEL_FG, SEL_BG)
+        } else {
+            (self.fg_buf[idx], self.bg_buf[idx])
+        };
+        self.rendered[idx] = 0; // force redraw
+        let px = col * self.font.width();
+        let py = row * self.font.height();
+        self.font.draw_char(&self.fb, px, py, ch, fg, bg);
+    }
+
+    fn redraw_selection_range(&mut self, start: usize, end: usize) {
+        for idx in start..=end.min(self.cols * self.rows - 1) {
+            let col = idx % self.cols;
+            let row = idx / self.cols;
+            self.redraw_cell(col, row);
+        }
+    }
+
+    pub fn mouse_down(&mut self, col: usize, row: usize) {
+        let col = col.min(self.cols.saturating_sub(1));
+        let row = row.min(self.rows.saturating_sub(1));
+        // Clear previous selection
+        if let Some((old_start, old_end)) = self.selection_range() {
+            self.sel_anchor = None;
+            self.sel_end = None;
+            self.redraw_selection_range(old_start, old_end);
+        }
+        self.sel_anchor = Some((col, row));
+        self.sel_end = Some((col, row));
+    }
+
+    pub fn mouse_drag(&mut self, col: usize, row: usize) {
+        if self.sel_anchor.is_none() {
+            return;
+        }
+        let col = col.min(self.cols.saturating_sub(1));
+        let row = row.min(self.rows.saturating_sub(1));
+        let old_range = self.selection_range();
+        self.sel_end = Some((col, row));
+        let new_range = self.selection_range();
+        // Redraw the union of old and new ranges
+        let start = old_range.map_or(0, |(s, _)| s).min(new_range.map_or(0, |(s, _)| s));
+        let end = old_range.map_or(0, |(_, e)| e).max(new_range.map_or(0, |(_, e)| e));
+        self.redraw_selection_range(start, end);
+    }
+
+    pub fn mouse_up(&mut self, col: usize, row: usize) -> Option<String> {
+        if self.sel_anchor.is_none() {
+            return None;
+        }
+        let col = col.min(self.cols.saturating_sub(1));
+        let row = row.min(self.rows.saturating_sub(1));
+        self.sel_end = Some((col, row));
+        self.selected_text()
+    }
+
+    fn selected_text(&self) -> Option<String> {
+        let (start, end) = self.selection_range()?;
+        if start == end {
+            return None;
+        }
+        let mut result = String::new();
+        let start_row = start / self.cols;
+        let end_row = end / self.cols;
+        for row in start_row..=end_row {
+            let row_start = if row == start_row { start % self.cols } else { 0 };
+            let row_end = if row == end_row { end % self.cols } else { self.cols - 1 };
+            let mut line = String::new();
+            for col in row_start..=row_end {
+                let idx = row * self.cols + col;
+                line.push(self.char_buf[idx]);
+            }
+            let trimmed = line.trim_end();
+            result.push_str(trimmed);
+            if row < end_row && !self.wrapped[row] {
+                result.push('\n');
+            }
+        }
+        Some(result)
+    }
+
+    pub fn get_selection(&self) -> Option<String> {
+        self.selected_text()
+    }
+
+    pub fn clear_selection(&mut self) {
+        if let Some((start, end)) = self.selection_range() {
+            self.sel_anchor = None;
+            self.sel_end = None;
+            self.redraw_selection_range(start, end);
+        } else {
+            self.sel_anchor = None;
+            self.sel_end = None;
+        }
+    }
+
     pub fn write_bytes(&mut self, bytes: &[u8]) {
+        self.clear_selection();
         self.erase_cursor();
         for &byte in bytes {
             self.write_byte(byte);

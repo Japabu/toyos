@@ -10,6 +10,7 @@ fn compositor_pid() -> u32 {
 // Client → Compositor
 pub const MSG_CREATE_WINDOW: u32 = 1;
 pub const MSG_PRESENT: u32 = 2;
+pub const MSG_CLIPBOARD_SET: u32 = 3;
 
 // Compositor → Client
 pub const MSG_WINDOW_CREATED: u32 = 1;
@@ -17,6 +18,7 @@ pub const MSG_KEY_INPUT: u32 = 2;
 pub const MSG_WINDOW_RESIZED: u32 = 3;
 pub const MSG_WINDOW_CLOSE: u32 = 4;
 pub const MSG_MOUSE_INPUT: u32 = 5;
+pub const MSG_CLIPBOARD_PASTE: u32 = 6;
 
 #[repr(C)]
 pub struct CreateWindowRequest {
@@ -77,8 +79,14 @@ impl KeyEvent {
 pub enum Event {
     KeyInput(KeyEvent),
     MouseInput(MouseEvent),
+    ClipboardPaste(Vec<u8>),
     Resized,
     Close,
+}
+
+/// Set the system clipboard contents.
+pub fn clipboard_set(text: &str) {
+    message::send(compositor_pid(), Message::from_bytes(MSG_CLIPBOARD_SET, text.as_bytes()));
 }
 
 pub struct Window {
@@ -136,6 +144,7 @@ impl Window {
                 self.pixel_format = info.pixel_format;
                 Event::Resized
             }
+            MSG_CLIPBOARD_PASTE => Event::ClipboardPaste(msg.take_bytes()),
             MSG_WINDOW_CLOSE => Event::Close,
             other => panic!("unknown window event type: {other}"),
         }

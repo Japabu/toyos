@@ -265,6 +265,7 @@ impl FileBrowser {
                     self.redraw();
                     self.window.present();
                 }
+                window::Event::ClipboardPaste(_) => {}
                 window::Event::Close => break,
             }
         }
