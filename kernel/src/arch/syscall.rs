@@ -183,7 +183,7 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         SYS_GRANT_SHARED => sys_grant_shared(a1, a2),
         SYS_MAP_SHARED => sys_map_shared(a1),
         SYS_RELEASE_SHARED => sys_release_shared(a1),
-        SYS_THREAD_SPAWN => process::spawn_thread(a1, a2, a3),
+        SYS_THREAD_SPAWN => process::spawn_thread(a1, a2, a3).map_or(u64::MAX, |t| t as u64),
         SYS_THREAD_JOIN => sys_thread_join(a1),
         SYS_CLOCK_REALTIME => crate::rtc::read_time(),
         SYS_SYSINFO => sys_sysinfo(a1, a2),
@@ -408,7 +408,7 @@ fn sys_spawn(argv_ptr: u64, argv_len: u64, fd_map_ptr: u64, fd_map_count: u64) -
     } else {
         fd::FdTable::new()
     };
-    process::spawn(&args, fds, Some(crate::arch::percpu::current_pid()))
+    process::spawn(&args, fds, Some(crate::arch::percpu::current_pid())).map_or(u64::MAX, |p| p as u64)
 }
 
 fn sys_waitpid(pid: u64) -> u64 {
@@ -634,8 +634,10 @@ fn sys_sysinfo(buf_ptr: u64, buf_len: u64) -> u64 {
             process::ProcessState::Zombie(_) => 3,
             _ => 2, // all Blocked variants
         };
-        let is_thread = proc.thread_parent.is_some() as u8;
-        let parent_pid = proc.parent_pid.unwrap_or(u32::MAX);
+        let (is_thread, parent_pid) = match proc.kind {
+            process::Kind::Thread { parent } => (1u8, parent),
+            process::Kind::Process { parent } => (0u8, parent.unwrap_or(u32::MAX)),
+        };
         let memory = (proc.elf_layout.size() + proc.stack_layout.size()) as u64;
 
         buf[pos..pos + 4].copy_from_slice(&pid.to_le_bytes());

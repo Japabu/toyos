@@ -1,10 +1,8 @@
 use core::arch::{asm, naked_asm};
 
 use crate::arch::{cpu, paging, percpu};
-use crate::process::{ProcessState, ProcessTable, PROCESS_TABLE};
+use crate::process::{ProcessState, ProcessTable, PROCESS_TABLE, KERNEL_STACK_SIZE};
 use crate::{fd, keyboard};
-
-const KERNEL_STACK_SIZE: usize = 64 * 1024;
 const IA32_FS_BASE: u32 = 0xC0000100;
 
 /// Block the current process and switch to the next ready one.

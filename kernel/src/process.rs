@@ -14,7 +14,7 @@ use crate::symbols::ProcessSymbols;
 use crate::{elf, log, pipe, scheduler, shared_memory, vfs};
 
 const USER_STACK_SIZE: usize = 4 * PAGE_2M as usize; // 8 MB
-const KERNEL_STACK_SIZE: usize = 64 * 1024;
+pub const KERNEL_STACK_SIZE: usize = 64 * 1024;
 
 /// Write argc, argv pointers, and string data onto a user stack. Returns new SP.
 pub fn write_argv_to_stack(stack_top: u64, args: &[&str]) -> u64 {
@@ -57,9 +57,18 @@ pub enum ProcessState {
     Zombie(i32),
 }
 
+#[derive(Clone, Copy)]
+pub enum Kind {
+    /// A process (may have a parent process for waitpid).
+    Process { parent: Option<u32> },
+    /// A thread within a process (shares address space with parent).
+    Thread { parent: u32 },
+}
+
 pub struct Process {
     pub pid: u32,
     pub state: ProcessState,
+    pub kind: Kind,
     // Per-process page table (physical address of PML4)
     pub cr3: u64,
     // Kernel context (saved RSP during context switch)
@@ -71,10 +80,6 @@ pub struct Process {
     pub user_heap: Vec<(u64, u64)>,
     pub cwd: String,
     pub messages: MessageQueue,
-    // Hierarchy
-    pub parent_pid: Option<u32>,
-    /// If this is a thread, the PID of the parent process (shares address space).
-    pub thread_parent: Option<u32>,
     /// PID whose user_heap to use for alloc/free. Self for processes, parent for threads.
     pub heap_owner: u32,
     // ELF memory tracking
@@ -141,12 +146,14 @@ pub fn with_current_mut<R>(f: impl FnOnce(&mut Process) -> R) -> R {
 /// [TLS data (.tdata + .tbss)] [TCB: self-pointer]
 ///                              ^-- FS base (thread pointer)
 /// Returns (block_ptr, block_layout, fs_base).
-pub fn setup_tls(tls_template: u64, tls_filesz: usize, tls_memsz: usize) -> (*mut u8, Layout, u64) {
+pub fn setup_tls(tls_template: u64, tls_filesz: usize, tls_memsz: usize) -> Option<(*mut u8, Layout, u64)> {
     let block_size = tls_memsz + 8; // TLS data + self-pointer
     let alloc_size = (block_size + PAGE_2M as usize - 1) & !(PAGE_2M as usize - 1);
     let layout = Layout::from_size_align(alloc_size, PAGE_2M as usize).unwrap();
     let block = unsafe { alloc_zeroed(layout) };
-    assert!(!block.is_null(), "TLS allocation failed");
+    if block.is_null() {
+        return None;
+    }
 
     // Copy initialized data (.tdata)
     if tls_filesz > 0 && tls_template != 0 {
@@ -159,7 +166,34 @@ pub fn setup_tls(tls_template: u64, tls_filesz: usize, tls_memsz: usize) -> (*mu
     // Self-pointer at %fs:0
     unsafe { *(tp as *mut u64) = tp; }
 
-    (block, layout, tp)
+    Some((block, layout, tp))
+}
+
+/// Allocate a kernel stack and set up the initial register frame for context_switch.
+/// Returns (base_ptr, layout, saved_rsp).
+fn alloc_kernel_stack(
+    trampoline: unsafe extern "C" fn(),
+    user_entry: u64,
+    user_sp: u64,
+    arg: u64,
+) -> Option<(*mut u8, Layout, u64)> {
+    let layout = Layout::from_size_align(KERNEL_STACK_SIZE, 4096).unwrap();
+    let base = unsafe { alloc_zeroed(layout) };
+    if base.is_null() {
+        return None;
+    }
+    let top = base as u64 + KERNEL_STACK_SIZE as u64;
+    let frame = (top - 7 * 8) as *mut u64;
+    unsafe {
+        *frame.add(0) = 0;                    // r15
+        *frame.add(1) = arg;                  // r14
+        *frame.add(2) = user_sp;              // r13
+        *frame.add(3) = user_entry;           // r12
+        *frame.add(4) = 0;                    // rbx
+        *frame.add(5) = 0;                    // rbp
+        *frame.add(6) = trampoline as u64;    // return address
+    }
+    Some((base, layout, frame as u64))
 }
 
 /// Release the process table lock held across context_switch.
@@ -219,8 +253,8 @@ extern "C" fn thread_start() {
     );
 }
 
-/// Spawn a thread within the current process. Returns the thread's PID (TID).
-pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64) -> u64 {
+/// Spawn a thread within the current process.
+pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64) -> Option<u32> {
     // Read parent's TLS info (brief lock)
     let (tls_template, tls_filesz, tls_memsz) = {
         let guard = PROCESS_TABLE.lock();
@@ -230,29 +264,16 @@ pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64) -> u64 {
     };
 
     // Allocate TLS for the thread (outside lock — map_user does TLB flush)
-    let (tls_block, tls_block_layout, fs_base) = setup_tls(tls_template, tls_filesz, tls_memsz);
+    let (tls_block, tls_block_layout, fs_base) = setup_tls(tls_template, tls_filesz, tls_memsz)?;
     paging::map_user(tls_block as u64, tls_block_layout.size() as u64);
 
-    // Allocate kernel stack
-    let ks_layout = Layout::from_size_align(KERNEL_STACK_SIZE, 4096).unwrap();
-    let ks_base = unsafe { alloc_zeroed(ks_layout) };
-    if ks_base.is_null() {
-        unsafe { dealloc(tls_block, tls_block_layout); }
-        return u64::MAX;
-    }
-    let ks_top = ks_base as u64 + KERNEL_STACK_SIZE as u64;
-
-    // Set up kernel stack frame: r15, r14=arg, r13=stack, r12=entry, rbx, rbp, ret addr
-    let frame_ptr = (ks_top - 7 * 8) as *mut u64;
-    unsafe {
-        *frame_ptr.add(0) = 0;         // r15
-        *frame_ptr.add(1) = arg;       // r14 = argument
-        *frame_ptr.add(2) = stack_ptr; // r13 = user stack
-        *frame_ptr.add(3) = entry;     // r12 = entry point
-        *frame_ptr.add(4) = 0;         // rbx
-        *frame_ptr.add(5) = 0;         // rbp
-        *frame_ptr.add(6) = thread_start as u64;
-    }
+    let (ks_base, ks_layout, ks_rsp) = match alloc_kernel_stack(thread_start, entry, stack_ptr, arg) {
+        Some(ks) => ks,
+        None => {
+            unsafe { dealloc(tls_block, tls_block_layout); }
+            return None;
+        }
+    };
 
     let mut guard = PROCESS_TABLE.lock();
     let table = guard.as_mut().expect("process table not initialized");
@@ -280,16 +301,15 @@ pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64) -> u64 {
     let tid = table.procs.insert(Process {
         pid: 0,
         state: ProcessState::Ready,
+        kind: Kind::Thread { parent: parent_pid },
         cr3: parent_cr3,
         kernel_stack_base: ks_base,
         kernel_stack_layout: ks_layout,
-        kernel_rsp: frame_ptr as u64,
+        kernel_rsp: ks_rsp,
         fds: child_fds,
         user_heap: Vec::new(), // unused — routes through heap_owner
         messages: MessageQueue::new(),
         cwd: parent_cwd,
-        parent_pid: None,
-        thread_parent: Some(parent_pid),
         heap_owner: parent_heap_owner,
         elf_base: core::ptr::null_mut(),
         elf_layout: Layout::from_size_align(0, 1).unwrap(),
@@ -307,7 +327,7 @@ pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64) -> u64 {
     });
     table.procs.get_mut(tid).unwrap().pid = tid;
 
-    tid as u64
+    Some(tid)
 }
 
 fn make_name(path: &str) -> [u8; 28] {
@@ -333,20 +353,17 @@ pub fn build_child_fds(pairs: &[[u32; 2]]) -> FdTable {
     fds
 }
 
-/// Spawn a new process from an ELF binary. Returns child PID or u64::MAX.
-pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<u32>) -> u64 {
+/// Spawn a new process from an ELF binary.
+pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<u32>) -> Option<u32> {
     let path = argv[0];
 
-    let binary = match vfs::lock().read_file(path) {
-        Some(data) => data,
-        None => return u64::MAX,
-    };
+    let binary = vfs::lock().read_file(path)?;
 
     let loaded = match elf::load(&binary) {
         Ok(l) => l,
         Err(msg) => {
             log!("{}", msg);
-            return u64::MAX;
+            return None;
         }
     };
 
@@ -372,12 +389,12 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<u32>) -> u64 {
     let stack_base = unsafe { alloc_zeroed(stack_layout) };
     if stack_base.is_null() {
         paging::free_user_page_tables(child_pml4);
-        return u64::MAX;
+        return None;
     }
     let stack_top = stack_base as u64 + USER_STACK_SIZE as u64;
     paging::map_user_in(child_pml4, stack_base as u64, USER_STACK_SIZE as u64);
 
-    let (tls_block, tls_block_layout, fs_base) = setup_tls(loaded.tls_template, loaded.tls_filesz, loaded.tls_memsz);
+    let (tls_block, tls_block_layout, fs_base) = setup_tls(loaded.tls_template, loaded.tls_filesz, loaded.tls_memsz)?;
     paging::map_user_in(child_pml4, tls_block as u64, tls_block_layout.size() as u64);
 
     let sp = write_argv_to_stack(stack_top, argv);
@@ -388,24 +405,13 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<u32>) -> u64 {
         stack_base as u64, stack_top,
     );
 
-    let ks_layout = Layout::from_size_align(KERNEL_STACK_SIZE, 4096).unwrap();
-    let ks_base = unsafe { alloc_zeroed(ks_layout) };
-    if ks_base.is_null() {
-        paging::free_user_page_tables(child_pml4);
-        return u64::MAX;
-    }
-    let ks_top = ks_base as u64 + KERNEL_STACK_SIZE as u64;
-
-    let frame_ptr = (ks_top - 7 * 8) as *mut u64;
-    unsafe {
-        *frame_ptr.add(0) = 0; // r15
-        *frame_ptr.add(1) = 0; // r14
-        *frame_ptr.add(2) = sp; // r13 = user stack
-        *frame_ptr.add(3) = loaded.entry; // r12 = entry
-        *frame_ptr.add(4) = 0; // rbx
-        *frame_ptr.add(5) = 0; // rbp
-        *frame_ptr.add(6) = process_start as u64;
-    }
+    let (ks_base, ks_layout, ks_rsp) = match alloc_kernel_stack(process_start, loaded.entry, sp, 0) {
+        Some(ks) => ks,
+        None => {
+            paging::free_user_page_tables(child_pml4);
+            return None;
+        }
+    };
 
     let mut guard = PROCESS_TABLE.lock();
     let table = guard.as_mut().expect("process table not initialized");
@@ -418,16 +424,15 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<u32>) -> u64 {
     let pid = table.procs.insert(Process {
         pid: 0,
         state: ProcessState::Ready,
+        kind: Kind::Process { parent },
         cr3: child_cr3,
         kernel_stack_base: ks_base,
         kernel_stack_layout: ks_layout,
-        kernel_rsp: frame_ptr as u64,
+        kernel_rsp: ks_rsp,
         fds,
         user_heap: crate::user_heap::new_heap(),
         messages: MessageQueue::new(),
         cwd,
-        parent_pid: parent,
-        thread_parent: None,
         heap_owner: 0,
         elf_base: loaded.base_ptr,
         elf_layout,
@@ -448,9 +453,10 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<u32>) -> u64 {
     p.heap_owner = pid;
 
     log!("spawn: {} pid={} base={:#x} entry={:#x} cr3={:#x} ks={:#x}..{:#x}",
-        path, pid, loaded.base_ptr as u64, loaded.entry, child_cr3, ks_base as u64, ks_top);
+        path, pid, loaded.base_ptr as u64, loaded.entry, child_cr3,
+        ks_base as u64, ks_base as u64 + KERNEL_STACK_SIZE as u64);
 
-    pid as u64
+    Some(pid)
 }
 
 /// Spawn a process from kernel context (during boot). Resolves bare names
@@ -469,9 +475,7 @@ pub fn spawn_kernel(argv: &[&str]) -> u32 {
     fds.insert_at(0, Descriptor::SerialConsole);
     fds.insert_at(1, Descriptor::SerialConsole);
     fds.insert_at(2, Descriptor::SerialConsole);
-    let pid = spawn(&full_argv, fds, None);
-    assert!(pid != u64::MAX, "spawn_kernel: failed to spawn {}", full_path);
-    pid as u32
+    spawn(&full_argv, fds, None).expect("spawn_kernel: failed to spawn")
 }
 
 /// Exit the current process.
@@ -481,7 +485,7 @@ pub fn exit(code: i32) -> ! {
         let table = guard.as_mut().expect("process table not initialized");
         let pid = percpu::current_pid();
         let proc = table.procs.get_mut(pid).unwrap();
-        let is_thread = proc.thread_parent.is_some();
+        let kind = proc.kind;
 
         // Close all FDs (acquires VFS lock — correct order: process_table < vfs)
         fd::close_all(&mut proc.fds, &mut *vfs::lock(), proc.pid);
@@ -491,50 +495,38 @@ pub fn exit(code: i32) -> ! {
             unsafe { dealloc(proc.tls_block, proc.tls_block_layout); }
         }
 
-        if is_thread {
-            // Thread: don't free address space (shared with parent).
-            // Just switch to kernel page tables.
-            unsafe { cpu::write_cr3(paging::kernel_cr3()); }
-        } else {
-            let proc_cr3 = proc.cr3;
-            let pml4 = proc_cr3 as *mut u64;
-
-            // Switch to kernel page tables before freeing process page tables
-            unsafe { cpu::write_cr3(paging::kernel_cr3()); }
-
-            // Clean up shared memory (unmap, free owned regions)
-            shared_memory::cleanup_process(pid, pml4);
-
-            // Free user memory
-            unsafe {
-                dealloc(proc.elf_base, proc.elf_layout);
-                dealloc(proc.stack_base, proc.stack_layout);
+        match kind {
+            Kind::Thread { .. } => {
+                // Thread: don't free address space (shared with parent).
+                unsafe { cpu::write_cr3(paging::kernel_cr3()); }
             }
-
-            // Free per-process page table structures
-            paging::free_user_page_tables(pml4);
-            proc.cr3 = 0;
-        }
-
-        // Mark as zombie and extract parent PIDs before releasing the borrow
-        proc.state = ProcessState::Zombie(code);
-        let parent = proc.parent_pid;
-        let thread_parent = proc.thread_parent;
-
-        // Wake parent if blocked on WaitPid for us
-        if let Some(ppid) = parent {
-            if let Some(p) = table.procs.get_mut(ppid) {
-                if p.state == ProcessState::BlockedWaitPid(pid) {
-                    p.state = ProcessState::Ready;
+            Kind::Process { .. } => {
+                let pml4 = proc.cr3 as *mut u64;
+                unsafe { cpu::write_cr3(paging::kernel_cr3()); }
+                shared_memory::cleanup_process(pid, pml4);
+                unsafe {
+                    dealloc(proc.elf_base, proc.elf_layout);
+                    dealloc(proc.stack_base, proc.stack_layout);
                 }
+                paging::free_user_page_tables(pml4);
+                proc.cr3 = 0;
             }
         }
 
-        // Wake thread parent if blocked on ThreadJoin for us
-        if let Some(ppid) = thread_parent {
+        proc.state = ProcessState::Zombie(code);
+
+        // Wake parent waiting on us
+        let wake_pid = match kind {
+            Kind::Process { parent } => parent,
+            Kind::Thread { parent } => Some(parent),
+        };
+        if let Some(ppid) = wake_pid {
             if let Some(p) = table.procs.get_mut(ppid) {
-                if p.state == ProcessState::BlockedThreadJoin(pid) {
-                    p.state = ProcessState::Ready;
+                match p.state {
+                    ProcessState::BlockedWaitPid(child) | ProcessState::BlockedThreadJoin(child) if child == pid => {
+                        p.state = ProcessState::Ready;
+                    }
+                    _ => {}
                 }
             }
         }

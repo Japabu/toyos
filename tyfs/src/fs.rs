@@ -172,7 +172,11 @@ impl<D: Disk> SimpleFs<D> {
         let data_offset = u64::from_le_bytes(entry[24..32].try_into().unwrap());
         let data_len = u64::from_le_bytes(entry[32..40].try_into().unwrap());
 
-        let mut buf = alloc::vec![0u8; data_len as usize];
+        let mut buf = Vec::new();
+        if buf.try_reserve_exact(data_len as usize).is_err() {
+            return None;
+        }
+        buf.resize(data_len as usize, 0u8);
         self.disk.read(data_offset, &mut buf);
         Some(buf)
     }
