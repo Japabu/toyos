@@ -1,13 +1,14 @@
 use std::collections::VecDeque;
 use std::fs;
-use toyos_abi::syscall;
+use std::time::{Duration, Instant};
+
+use rand::Rng;
 
 use window::{Color, Framebuffer, Window};
 
 const CELL: usize = 16;
 const HEADER: usize = 24;
-const TICK_MS: u64 = 150;
-const TICK_NANOS: u64 = TICK_MS * 500_000;
+const TICK: Duration = Duration::from_millis(75);
 
 const BG: Color = Color { r: 0x1a, g: 0x1a, b: 0x2e };
 const GRID_BG: Color = Color { r: 0x22, g: 0x22, b: 0x38 };
@@ -46,34 +47,14 @@ impl Dir {
     }
 }
 
-struct Rng(u64);
-
-impl Rng {
-    fn new() -> Self {
-        let mut seed = syscall::clock_nanos();
-        if seed == 0 {
-            seed = 0xdeadbeef;
-        }
-        Self(seed)
-    }
-
-    fn next(&mut self) -> u64 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        self.0
-    }
-
-    fn range(&mut self, max: usize) -> usize {
-        (self.next() % max as u64) as usize
-    }
+fn random_range(max: usize) -> usize {
+    rand::rng().random_range(0..max)
 }
 
 struct Game {
     window: Window,
     fb: Framebuffer,
     font: font::Font,
-    rng: Rng,
     cols: usize,
     rows: usize,
     snake: VecDeque<(usize, usize)>,
@@ -82,7 +63,7 @@ struct Game {
     food: (usize, usize),
     score: usize,
     game_over: bool,
-    next_tick: u64,
+    next_tick: Instant,
     dirty: bool,
     frame_ready: bool,
 }
@@ -93,7 +74,6 @@ impl Game {
         let fb = window.framebuffer();
         let font_data = fs::read("/initrd/JetBrainsMono-8x16.font").expect("font");
         let font = font::Font::from_prebuilt(&font_data);
-        let rng = Rng::new();
 
         let cols = fb.width() / CELL;
         let rows = (fb.height() - HEADER) / CELL;
@@ -102,7 +82,6 @@ impl Game {
             window,
             fb,
             font,
-            rng,
             cols,
             rows,
             snake: VecDeque::new(),
@@ -111,7 +90,7 @@ impl Game {
             food: (0, 0),
             score: 0,
             game_over: false,
-            next_tick: 0,
+            next_tick: Instant::now(),
             dirty: false,
             frame_ready: true,
         };
@@ -125,7 +104,7 @@ impl Game {
         self.next_dir = Dir::Right;
         self.score = 0;
         self.game_over = false;
-        self.next_tick = syscall::clock_nanos() + TICK_NANOS;
+        self.next_tick = Instant::now() + TICK;
 
         let cx = self.cols / 2;
         let cy = self.rows / 2;
@@ -140,8 +119,8 @@ impl Game {
 
     fn place_food(&mut self) {
         loop {
-            let x = self.rng.range(self.cols);
-            let y = self.rng.range(self.rows);
+            let x = random_range(self.cols);
+            let y = random_range(self.rows);
             if !self.snake.contains(&(x, y)) {
                 self.food = (x, y);
                 return;
@@ -290,12 +269,11 @@ impl Game {
 
     fn run(&mut self) {
         loop {
-            let now = syscall::clock_nanos();
             // timeout=0 means block forever, so use max(1) when game is running
             let timeout = if self.game_over {
                 0
             } else {
-                self.next_tick.saturating_sub(now).max(1)
+                self.next_tick.saturating_duration_since(Instant::now()).as_nanos().max(1) as u64
             };
 
             match self.window.poll_event(timeout) {
@@ -309,9 +287,9 @@ impl Game {
                 _ => {}
             }
 
-            if !self.game_over && syscall::clock_nanos() >= self.next_tick {
+            if !self.game_over && Instant::now() >= self.next_tick {
                 self.step();
-                self.next_tick = syscall::clock_nanos() + TICK_NANOS;
+                self.next_tick = Instant::now() + TICK;
                 self.dirty = true;
             }
 

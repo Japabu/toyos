@@ -6,6 +6,11 @@ use std::path::Path;
 use std::process::Command;
 
 fn build(debug: bool) {
+    let rustflags = match std::env::var("RUSTFLAGS") {
+        Ok(flags) => format!("{flags} -Dwarnings"),
+        Err(_) => "-Dwarnings".to_string(),
+    };
+
     let mut kernel_args = vec!["build"];
     if debug {
         kernel_args.push("--features");
@@ -14,6 +19,7 @@ fn build(debug: bool) {
     if !Command::new("cargo")
         .args(&kernel_args)
         .current_dir("../kernel")
+        .env("RUSTFLAGS", &rustflags)
         .status()
         .expect("Failed to run cargo")
         .success()
@@ -24,6 +30,7 @@ fn build(debug: bool) {
     if !Command::new("cargo")
         .args(&["build"])
         .current_dir("../bootloader")
+        .env("RUSTFLAGS", &rustflags)
         .status()
         .expect("Failed to run cargo")
         .success()
@@ -59,6 +66,7 @@ fn build(debug: bool) {
         if !Command::new("cargo")
             .args(&["build", "--target", "x86_64-unknown-toyos"])
             .env("RUSTUP_TOOLCHAIN", "toyos")
+            .env("RUSTFLAGS", &rustflags)
             .env_remove("RUSTC")
             .current_dir(&path)
             .status()

@@ -1,41 +1,55 @@
-// Monotonic clock using HPET (High Precision Event Timer).
+// Monotonic clock: calibrates TSC against HPET at boot, then uses TSC for fast reads.
 
+use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+use crate::arch::cpu;
 use crate::drivers::mmio::Mmio;
 use crate::log;
-use crate::sync::Lock;
 
 // HPET register offsets
-const HPET_CAP: u64 = 0x000;   // General Capabilities and ID (64-bit, RO)
-const HPET_CFG: u64 = 0x010;   // General Configuration (64-bit, RW)
-const HPET_COUNTER: u64 = 0x0F0; // Main Counter Value (64-bit, RW)
+const HPET_CAP: u64 = 0x000;
+const HPET_CFG: u64 = 0x010;
+const HPET_COUNTER: u64 = 0x0F0;
 
-static HPET: Lock<Option<Mmio>> = Lock::new(None);
-static PERIOD_FS: Lock<u64> = Lock::new(0); // counter period in femtoseconds
+static TSC_BOOT: AtomicU64 = AtomicU64::new(0);
+static TSC_PERIOD_FS: AtomicU64 = AtomicU64::new(0);
 
 pub fn init(hpet_base: u64) {
     let hpet = Mmio::new(hpet_base);
 
     let cap = hpet.read_u64(HPET_CAP);
-    let period_fs = cap >> 32;
-    assert!(period_fs > 0, "HPET: invalid counter period");
+    let hpet_period_fs = cap >> 32;
+    assert!(hpet_period_fs > 0, "HPET: invalid counter period");
 
-    // Enable main counter (bit 0 of configuration register)
+    // Enable HPET main counter
     let cfg = hpet.read_u64(HPET_CFG);
     hpet.write_u64(HPET_CFG, cfg | 1);
 
-    *HPET.lock() = Some(hpet);
-    *PERIOD_FS.lock() = period_fs;
+    // Calibrate TSC: measure TSC ticks over ~50ms of HPET time
+    let calibration_ns: u64 = 50_000_000; // 50ms
+    let calibration_hpet_ticks = calibration_ns * 1_000_000 / hpet_period_fs;
 
-    let freq_hz = 1_000_000_000_000_000u64 / period_fs;
-    log!("HPET: period={}fs freq={}Hz", period_fs, freq_hz);
+    let hpet_start = hpet.read_u64(HPET_COUNTER);
+    let tsc_start = cpu::rdtsc();
+    let hpet_target = hpet_start + calibration_hpet_ticks;
+    while hpet.read_u64(HPET_COUNTER) < hpet_target {}
+    let tsc_end = cpu::rdtsc();
+    let hpet_end = hpet.read_u64(HPET_COUNTER);
+
+    let hpet_elapsed_fs = (hpet_end - hpet_start) as u128 * hpet_period_fs as u128;
+    let tsc_delta = tsc_end - tsc_start;
+    let tsc_period_fs = (hpet_elapsed_fs / tsc_delta as u128) as u64;
+
+    TSC_BOOT.store(tsc_start, Relaxed);
+    TSC_PERIOD_FS.store(tsc_period_fs, Relaxed);
+
+    let tsc_freq_mhz = 1_000_000_000_000_000u64 / tsc_period_fs / 1_000_000;
+    log!("TSC: {}MHz (period={}fs, calibrated over {}ms)", tsc_freq_mhz, tsc_period_fs, calibration_ns / 1_000_000);
 }
 
-/// Returns nanoseconds since HPET was enabled.
+/// Returns nanoseconds since boot. Lock-free, no MMIO.
 pub fn nanos_since_boot() -> u64 {
-    let Some(hpet) = *HPET.lock() else { return 0; };
-    let counter = hpet.read_u64(HPET_COUNTER);
-    let period_fs = *PERIOD_FS.lock();
-    // counter * period_fs gives femtoseconds; divide by 1_000_000 for nanoseconds
-    // Use u128 to avoid overflow
-    ((counter as u128 * period_fs as u128) / 1_000_000) as u64
+    let delta = cpu::rdtsc() - TSC_BOOT.load(Relaxed);
+    let period_fs = TSC_PERIOD_FS.load(Relaxed);
+    ((delta as u128 * period_fs as u128) / 1_000_000) as u64
 }

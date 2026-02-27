@@ -46,7 +46,6 @@ struct LauncherEntry {
 const LAUNCHER_APPS: &[LauncherEntry] = &[
     LauncherEntry { name: "Terminal", path: "/initrd/terminal" },
     LauncherEntry { name: "Files", path: "/initrd/files" },
-    LauncherEntry { name: "Editor", path: "/initrd/kibi" },
     LauncherEntry { name: "Monitor", path: "/initrd/monitor" },
 ];
 

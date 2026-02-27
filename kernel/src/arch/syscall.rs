@@ -294,8 +294,15 @@ fn sys_exit(code: i32) -> u64 {
 
 fn sys_random(buf_ptr: u64, len: u64) -> u64 {
     let Some(buf) = user_slice_mut(buf_ptr, len) else { return u64::MAX };
-    for b in buf.iter_mut() {
-        *b = cpu::rdrand() as u8;
+    let mut i = 0;
+    while i + 8 <= buf.len() {
+        buf[i..i + 8].copy_from_slice(&cpu::rdrand().to_ne_bytes());
+        i += 8;
+    }
+    let remaining = buf.len() - i;
+    if remaining > 0 {
+        let bytes = cpu::rdrand().to_ne_bytes();
+        buf[i..].copy_from_slice(&bytes[..remaining]);
     }
     0
 }

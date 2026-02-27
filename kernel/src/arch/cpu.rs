@@ -20,6 +20,16 @@ pub fn wrmsr(msr: u32, value: u64) {
 }
 
 #[inline]
+pub fn rdtsc() -> u64 {
+    let lo: u32;
+    let hi: u32;
+    unsafe {
+        asm!("rdtsc", out("eax") lo, out("edx") hi, options(nomem, nostack));
+    }
+    (hi as u64) << 32 | lo as u64
+}
+
+#[inline]
 pub fn rdrand() -> u64 {
     let val: u64;
     unsafe {

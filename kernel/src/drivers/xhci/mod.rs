@@ -182,7 +182,6 @@ fn setup_packet(bm_request_type: u8, b_request: u8, w_value: u16, w_index: u16, 
 // ---------------------------------------------------------------------------
 pub struct XhciController {
     // Base addresses (MMIO)
-    op_base: Mmio,
     db_base: Mmio,
     rt_base: Mmio,
 
@@ -537,7 +536,6 @@ pub fn init(ecam_base: u64) -> Option<XhciController> {
     log!("xHCI: controller started");
 
     let mut ctrl = XhciController {
-        op_base,
         db_base,
         rt_base,
         context_size,

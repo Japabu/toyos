@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-toyos-abi = { path = "../../rust/library/toyos-abi" }
 font = { path = "../font" }
+rand = "0.9"
 window = { path = "../window" }
+
+[patch.crates-io]
+getrandom = { path = "../getrandom" }

@@ -2,9 +2,6 @@
 	path = rust
 	url = https://github.com/Japabu/rust.git
 	branch = main
-[submodule "userland/kibi"]
-	path = userland/kibi
-	url = https://github.com/Japabu/kibi
 [submodule "userland/getrandom"]
 	path = userland/getrandom
 	url = https://github.com/Japabu/getrandom.git
