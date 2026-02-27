@@ -297,15 +297,15 @@ pub fn resolve_dynamic_deps(
     base: u64,
     exe_path: &str,
     read_file: impl Fn(&str) -> Option<alloc::vec::Vec<u8>>,
-) -> alloc::vec::Vec<LoadedLib> {
+) -> Result<alloc::vec::Vec<LoadedLib>, alloc::string::String> {
     let elf = match ElfBytes::<AnyEndian>::minimal_parse(data) {
         Ok(e) => e,
-        Err(_) => return alloc::vec::Vec::new(),
+        Err(_) => return Ok(alloc::vec::Vec::new()),
     };
 
     let segments = match elf.segments() {
         Some(s) => s,
-        None => return alloc::vec::Vec::new(),
+        None => return Ok(alloc::vec::Vec::new()),
     };
 
     // Find PT_DYNAMIC and parse dynamic entries
@@ -339,7 +339,7 @@ pub fn resolve_dynamic_deps(
     }
 
     if needed_offsets.is_empty() {
-        return alloc::vec::Vec::new();
+        return Ok(alloc::vec::Vec::new());
     }
 
     // Read DT_NEEDED filenames from .dynstr (loaded in memory at base + strtab_vaddr)
@@ -361,10 +361,7 @@ pub fn resolve_dynamic_deps(
 
         let so_data = match read_file(&lib_path) {
             Some(d) => d,
-            None => {
-                log!("dynamic: {} not found", lib_path);
-                continue;
-            }
+            None => return Err(alloc::format!("failed to load shared library {}", lib_path)),
         };
 
         match load_shared_lib(&so_data) {
@@ -372,7 +369,7 @@ pub fn resolve_dynamic_deps(
                 log!("dynamic: loaded {} at {:#x} ({} syms)", lib_name, lib.base_ptr as u64, lib.sym_count);
                 libs.push(lib);
             }
-            Err(e) => log!("dynamic: failed to load {}: {}", lib_name, e),
+            Err(e) => return Err(alloc::format!("failed to load {}: {}", lib_name, e)),
         }
     }
 
@@ -429,5 +426,5 @@ pub fn resolve_dynamic_deps(
         }
     }
 
-    libs
+    Ok(libs)
 }

@@ -368,9 +368,15 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<u32>) -> Option<u32> {
     };
 
     // Load DT_NEEDED shared libraries and apply GLOB_DAT relocations
-    let loaded_libs = elf::resolve_dynamic_deps(&binary, loaded.base, path, |lib_path| {
+    let loaded_libs = match elf::resolve_dynamic_deps(&binary, loaded.base, path, |lib_path| {
         vfs::lock().read_file(lib_path)
-    });
+    }) {
+        Ok(libs) => libs,
+        Err(msg) => {
+            log!("{}: {}", path, msg);
+            return None;
+        }
+    };
 
     let child_pml4 = paging::create_user_pml4();
     let child_cr3 = child_pml4 as u64;
