@@ -13,6 +13,10 @@
     clippy::return_self_not_must_use,
     clippy::unreadable_literal,
     clippy::upper_case_acronyms,
+    // bootstrap builds with warnings-as-errors
+    elided_lifetimes_in_paths,
+    unreachable_pub,
+    unsafe_op_in_unsafe_fn,
 )]
 
 //! A cross-platform Rust API for memory mapped buffers.

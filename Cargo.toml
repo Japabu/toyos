@@ -1,6 +1,6 @@
 [package]
 name = "memmap2"
-version = "0.9.10"
+version = "0.2.1"
 authors = [
     "Dan Burkert <dan@danburkert.com>",
     "Yevhenii Reizner <razrfalcon@gmail.com>",
