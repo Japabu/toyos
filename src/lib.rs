@@ -40,6 +40,8 @@
     deny(missing_docs, clippy::all, unreachable_pub, unused)
 )]
 #![cfg_attr(libloading_docs, feature(doc_cfg))]
+// Override bootstrap's RUSTFLAGS -W flags (source attrs > command line > [lints] table)
+#![allow(elided_lifetimes_in_paths, unsafe_op_in_unsafe_fn, explicit_outlives_requirements)]
 #![no_std]
 
 extern crate alloc;
@@ -55,13 +57,13 @@ pub use as_symbol_name::AsSymbolName;
 pub mod changelog;
 mod error;
 pub mod os;
-#[cfg(any(unix, windows, libloading_docs))]
+#[cfg(any(unix, windows, target_os = "toyos", libloading_docs))]
 mod safe;
 mod util;
 
 pub use self::error::Error;
 
-#[cfg(any(unix, windows, libloading_docs))]
+#[cfg(any(unix, windows, target_os = "toyos", libloading_docs))]
 pub use self::safe::{Library, Symbol};
 
 /// Converts a library name to a filename generally appropriate for use on the system.

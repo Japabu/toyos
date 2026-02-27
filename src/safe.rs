@@ -2,6 +2,8 @@
 use super::os::unix as imp; // the implementation used here doesn't matter particularly much...
 #[cfg(all(not(libloading_docs), unix))]
 use super::os::unix as imp;
+#[cfg(all(not(libloading_docs), target_os = "toyos"))]
+use super::os::toyos as imp;
 #[cfg(all(not(libloading_docs), windows))]
 use super::os::windows as imp;
 use super::Error;

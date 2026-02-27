@@ -15,6 +15,13 @@ pub(crate) trait Sealed {
         self,
         function: impl FnOnce(*const core::ffi::c_char) -> Result<R, crate::Error>,
     ) -> Result<R, crate::Error>;
+
+    #[cfg(target_os = "toyos")]
+    #[doc(hidden)]
+    fn toyos_filename<R>(
+        self,
+        function: impl FnOnce(*const core::ffi::c_char) -> Result<R, crate::Error>,
+    ) -> Result<R, crate::Error>;
 }
 
 /// This trait is implemented for types that can be used as a filename when loading new
@@ -51,6 +58,19 @@ impl Sealed for &str {
             function(buffer.as_ptr().cast())
         }
     }
+
+    #[cfg(target_os = "toyos")]
+    fn toyos_filename<R>(
+        self,
+        function: impl FnOnce(*const core::ffi::c_char) -> Result<R, Error>,
+    ) -> Result<R, Error> {
+        if crate::util::check_null_bytes(self.as_bytes())? {
+            function(self.as_ptr().cast())
+        } else {
+            let buffer = crate::util::copy_and_push(self.as_bytes(), 0);
+            function(buffer.as_ptr().cast())
+        }
+    }
 }
 
 impl AsFilename for &String {}
@@ -70,6 +90,14 @@ impl Sealed for &String {
     ) -> Result<R, Error> {
         self.as_str().posix_filename(function)
     }
+
+    #[cfg(target_os = "toyos")]
+    fn toyos_filename<R>(
+        self,
+        function: impl FnOnce(*const core::ffi::c_char) -> Result<R, Error>,
+    ) -> Result<R, Error> {
+        self.as_str().toyos_filename(function)
+    }
 }
 
 impl AsFilename for String {}
@@ -84,6 +112,19 @@ impl Sealed for String {
 
     #[cfg(unix)]
     fn posix_filename<R>(
+        mut self,
+        function: impl FnOnce(*const core::ffi::c_char) -> Result<R, Error>,
+    ) -> Result<R, Error> {
+        if crate::util::check_null_bytes(self.as_bytes())? {
+            function(self.as_ptr().cast())
+        } else {
+            self.push('\0');
+            function(self.as_ptr().cast())
+        }
+    }
+
+    #[cfg(target_os = "toyos")]
+    fn toyos_filename<R>(
         mut self,
         function: impl FnOnce(*const core::ffi::c_char) -> Result<R, Error>,
     ) -> Result<R, Error> {
@@ -133,6 +174,20 @@ mod std {
                 function(buffer.as_ptr().cast())
             }
         }
+
+        #[cfg(target_os = "toyos")]
+        fn toyos_filename<R>(
+            self,
+            function: impl FnOnce(*const core::ffi::c_char) -> Result<R, Error>,
+        ) -> Result<R, Error> {
+            let bytes = self.as_encoded_bytes();
+            if crate::util::check_null_bytes(bytes)? {
+                function(bytes.as_ptr().cast())
+            } else {
+                let buffer = crate::util::copy_and_push(bytes, 0);
+                function(buffer.as_ptr().cast())
+            }
+        }
     }
 
     impl AsFilename for &OsString {}
@@ -151,6 +206,14 @@ mod std {
             function: impl FnOnce(*const core::ffi::c_char) -> Result<R, Error>,
         ) -> Result<R, Error> {
             self.as_os_str().posix_filename(function)
+        }
+
+        #[cfg(target_os = "toyos")]
+        fn toyos_filename<R>(
+            self,
+            function: impl FnOnce(*const core::ffi::c_char) -> Result<R, Error>,
+        ) -> Result<R, Error> {
+            self.as_os_str().toyos_filename(function)
         }
     }
 
@@ -181,6 +244,14 @@ mod std {
                 function(bytes.as_ptr().cast())
             }
         }
+
+        #[cfg(target_os = "toyos")]
+        fn toyos_filename<R>(
+            self,
+            function: impl FnOnce(*const core::ffi::c_char) -> Result<R, Error>,
+        ) -> Result<R, Error> {
+            self.as_os_str().toyos_filename(function)
+        }
     }
 
     impl AsFilename for std::path::PathBuf {}
@@ -199,6 +270,14 @@ mod std {
             function: impl FnOnce(*const core::ffi::c_char) -> Result<R, Error>,
         ) -> Result<R, Error> {
             self.into_os_string().posix_filename(function)
+        }
+
+        #[cfg(target_os = "toyos")]
+        fn toyos_filename<R>(
+            self,
+            function: impl FnOnce(*const core::ffi::c_char) -> Result<R, Error>,
+        ) -> Result<R, Error> {
+            self.into_os_string().toyos_filename(function)
         }
     }
 
@@ -219,6 +298,14 @@ mod std {
         ) -> Result<R, Error> {
             self.as_os_str().posix_filename(function)
         }
+
+        #[cfg(target_os = "toyos")]
+        fn toyos_filename<R>(
+            self,
+            function: impl FnOnce(*const core::ffi::c_char) -> Result<R, Error>,
+        ) -> Result<R, Error> {
+            self.as_os_str().toyos_filename(function)
+        }
     }
 
     impl AsFilename for &std::path::Path {}
@@ -237,6 +324,14 @@ mod std {
             function: impl FnOnce(*const core::ffi::c_char) -> Result<R, Error>,
         ) -> Result<R, Error> {
             self.as_os_str().posix_filename(function)
+        }
+
+        #[cfg(target_os = "toyos")]
+        fn toyos_filename<R>(
+            self,
+            function: impl FnOnce(*const core::ffi::c_char) -> Result<R, Error>,
+        ) -> Result<R, Error> {
+            self.as_os_str().toyos_filename(function)
         }
     }
 }

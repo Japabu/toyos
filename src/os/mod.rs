@@ -21,6 +21,10 @@
 #[cfg_attr(libloading_docs, doc(cfg(unix)))]
 pub mod unix;
 
+/// ToyOS implementation of dynamic library loading.
+#[cfg(target_os = "toyos")]
+pub mod toyos;
+
 /// Windows implementation of dynamic library loading.
 #[cfg(any(windows, libloading_docs))]
 #[cfg_attr(libloading_docs, doc(cfg(windows)))]
