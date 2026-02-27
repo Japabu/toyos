@@ -334,4 +334,32 @@ mod std {
             self.as_os_str().toyos_filename(function)
         }
     }
+
+    // 0.8.x compat: rustc passes &&Path via Library::new(&path) where path: &Path
+    impl AsFilename for &&std::path::Path {}
+    impl Sealed for &&std::path::Path {
+        #[cfg(windows)]
+        fn windows_filename<R>(
+            self,
+            function: impl FnOnce(*const u16) -> Result<R, Error>,
+        ) -> Result<R, Error> {
+            (*self).windows_filename(function)
+        }
+
+        #[cfg(unix)]
+        fn posix_filename<R>(
+            self,
+            function: impl FnOnce(*const core::ffi::c_char) -> Result<R, Error>,
+        ) -> Result<R, Error> {
+            (*self).posix_filename(function)
+        }
+
+        #[cfg(target_os = "toyos")]
+        fn toyos_filename<R>(
+            self,
+            function: impl FnOnce(*const core::ffi::c_char) -> Result<R, Error>,
+        ) -> Result<R, Error> {
+            (*self).toyos_filename(function)
+        }
+    }
 }
