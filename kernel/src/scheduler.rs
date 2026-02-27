@@ -223,6 +223,9 @@ fn idle_poll(table: &mut ProcessTable) {
             {
                 proc.state = ProcessState::Ready;
             }
+            ProcessState::BlockedSleep { deadline } if crate::clock::nanos_since_boot() >= deadline => {
+                proc.state = ProcessState::Ready;
+            }
             _ => {}
         }
     }

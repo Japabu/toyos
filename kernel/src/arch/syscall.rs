@@ -194,6 +194,12 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             0
         }
         SYS_NET_RECV => sys_net_recv(a1, a2, a3),
+        SYS_NANOSLEEP => sys_nanosleep(a1),
+        SYS_DUP => sys_dup(a1),
+        SYS_GETPID => crate::arch::percpu::current_pid() as u64,
+        SYS_RENAME => sys_rename(a1, a2, a3, a4),
+        SYS_MKDIR => sys_mkdir(a1, a2),
+        SYS_RMDIR => sys_rmdir(a1, a2),
         _ => u64::MAX,
     }
 }
@@ -667,6 +673,50 @@ fn sys_net_recv(buf_ptr: u64, buf_len: u64, timeout_nanos: u64) -> u64 {
         }
         process::block(process::ProcessState::BlockedNetRecv { deadline });
     }
+}
+
+fn sys_nanosleep(nanos: u64) -> u64 {
+    let deadline = crate::clock::nanos_since_boot() + nanos;
+    process::block(process::ProcessState::BlockedSleep { deadline });
+    0
+}
+
+fn sys_dup(fd_num: u64) -> u64 {
+    process::with_current_mut(|proc| {
+        let desc = match proc.fds.get(fd_num) {
+            Some(d) => fd::dup(d),
+            None => return u64::MAX,
+        };
+        fd::alloc(&mut proc.fds, desc)
+    })
+}
+
+fn sys_rename(old_ptr: u64, old_len: u64, new_ptr: u64, new_len: u64) -> u64 {
+    let Some(old) = user_str(old_ptr, old_len) else { return u64::MAX };
+    let Some(new) = user_str(new_ptr, new_len) else { return u64::MAX };
+    let cwd = process::with_current(|p| p.cwd.clone());
+    let mut vfs = vfs::lock();
+    let old_abs = vfs.resolve_absolute(&cwd, old);
+    let new_abs = vfs.resolve_absolute(&cwd, new);
+    if vfs.rename(&old_abs, &new_abs) { 0 } else { u64::MAX }
+}
+
+fn sys_mkdir(path_ptr: u64, path_len: u64) -> u64 {
+    let Some(path) = user_str(path_ptr, path_len) else { return u64::MAX };
+    let cwd = process::with_current(|p| p.cwd.clone());
+    let mut vfs = vfs::lock();
+    let resolved = vfs.resolve_absolute(&cwd, path);
+    vfs.create_dir(&resolved);
+    0
+}
+
+fn sys_rmdir(path_ptr: u64, path_len: u64) -> u64 {
+    let Some(path) = user_str(path_ptr, path_len) else { return u64::MAX };
+    let cwd = process::with_current(|p| p.cwd.clone());
+    let mut vfs = vfs::lock();
+    let resolved = vfs.resolve_absolute(&cwd, path);
+    vfs.remove_dir(&resolved);
+    0
 }
 
 /// Terminate the current userspace process (called from exception handlers).

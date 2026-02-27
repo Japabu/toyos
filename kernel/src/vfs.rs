@@ -60,6 +60,7 @@ impl<D: tyfs::Disk> FileSystem for tyfs::SimpleFs<D> {
 /// Subdirectories are virtual — TYFS stores flat filenames with `/` separators.
 pub struct Vfs {
     mounts: HashMap<String, Box<dyn FileSystem>>,
+    created_dirs: HashSet<String>,
 }
 
 /// Normalize a path by resolving `.` and `..` components.
@@ -84,6 +85,7 @@ impl Vfs {
     fn new() -> Self {
         Self {
             mounts: HashMap::new(),
+            created_dirs: HashSet::new(),
         }
     }
 
@@ -144,11 +146,18 @@ impl Vfs {
             return Some(format!("/{}", mount));
         }
 
+        let abs = format!("/{}/{}", mount, subdir);
+
+        // Check explicitly created directories
+        if self.created_dirs.contains(&abs) {
+            return Some(abs);
+        }
+
         // Check if any files exist with this subdirectory prefix
         let prefix = format!("{}/", subdir);
         if let Some(fs) = self.mounts.get_mut(&mount) {
             if fs.list().iter().any(|(name, _)| name.starts_with(&prefix)) {
-                return Some(format!("/{}/{}", mount, subdir));
+                return Some(abs);
             }
         }
 
@@ -237,6 +246,29 @@ impl Vfs {
         } else {
             false
         }
+    }
+
+    pub fn rename(&mut self, old_path: &str, new_path: &str) -> bool {
+        let (old_mount, old_file) = self.resolve_path("/", old_path);
+        let (new_mount, new_file) = self.resolve_path("/", new_path);
+        if old_file.is_empty() || new_file.is_empty() { return false; }
+        if old_mount != new_mount { return false; }
+        let Some(fs) = self.mounts.get_mut(&old_mount) else { return false };
+        let Some(data) = fs.read_file(&old_file) else { return false };
+        fs.delete(&new_file);
+        if !fs.create(&new_file, &data) { return false; }
+        fs.delete(&old_file);
+        true
+    }
+
+    pub fn create_dir(&mut self, path: &str) {
+        self.created_dirs.insert(String::from(path));
+    }
+
+    pub fn remove_dir(&mut self, path: &str) {
+        self.created_dirs.remove(path);
+        let prefix = format!("{}/", path);
+        self.created_dirs.retain(|d| !d.starts_with(&prefix));
     }
 
     pub fn delete(&mut self, path: &str) -> bool {

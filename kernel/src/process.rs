@@ -53,6 +53,7 @@ pub enum ProcessState {
     BlockedPoll { fds: [u64; 8], len: u32, deadline: u64 },
     BlockedRecvMsg,
     BlockedNetRecv { deadline: u64 },
+    BlockedSleep { deadline: u64 },
     Zombie(i32),
 }
 
