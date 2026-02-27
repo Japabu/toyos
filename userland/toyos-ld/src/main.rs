@@ -12,6 +12,10 @@ fn main() {
 
     let result = if args.shared {
         toyos_ld::link_shared(&objects)
+    } else if args.pe {
+        toyos_ld::link_pe(&objects, &args.entry, args.subsystem)
+    } else if args.is_static {
+        toyos_ld::link_static(&objects, &args.entry, args.image_base)
     } else {
         toyos_ld::link(&objects, &args.entry)
     };
@@ -36,6 +40,10 @@ struct Args {
     output: PathBuf,
     entry: String,
     shared: bool,
+    is_static: bool,
+    pe: bool,
+    image_base: u64,
+    subsystem: u16,
     inputs: Vec<PathBuf>,
     lib_paths: Vec<PathBuf>,
     libs: Vec<String>,
@@ -46,6 +54,10 @@ fn parse_args() -> Args {
     let mut output = PathBuf::from("a.out");
     let mut entry = String::from("_start");
     let mut shared = false;
+    let mut is_static = false;
+    let mut pe = false;
+    let mut image_base = 0x200000u64;
+    let mut subsystem = 10u16; // EFI_APPLICATION
     let mut inputs = Vec::new();
     let mut lib_paths = Vec::new();
     let mut libs = Vec::new();
@@ -59,6 +71,28 @@ fn parse_args() -> Args {
             s if s.starts_with("-L") => { lib_paths.push(PathBuf::from(&s[2..])); }
             s if s.starts_with("-l") => { libs.push(s[2..].to_string()); }
             "--shared" | "-shared" => { shared = true; }
+            "--static" => { is_static = true; }
+            "--pe" => { pe = true; }
+            s if s.starts_with("--subsystem=") => {
+                subsystem = s["--subsystem=".len()..].parse().unwrap_or_else(|_| {
+                    eprintln!("toyos-ld: invalid --subsystem value: {}", &s["--subsystem=".len()..]);
+                    process::exit(1);
+                });
+            }
+            s if s.starts_with("--image-base=") => {
+                let val = &s["--image-base=".len()..];
+                image_base = if val.starts_with("0x") || val.starts_with("0X") {
+                    u64::from_str_radix(&val[2..], 16).unwrap_or_else(|_| {
+                        eprintln!("toyos-ld: invalid --image-base value: {val}");
+                        process::exit(1);
+                    })
+                } else {
+                    val.parse().unwrap_or_else(|_| {
+                        eprintln!("toyos-ld: invalid --image-base value: {val}");
+                        process::exit(1);
+                    })
+                };
+            }
             "-pie" | "--as-needed" | "--no-as-needed" | "--eh-frame-hdr"
             | "--hash-style=gnu" | "--build-id" | "-Bstatic" | "-static"
             | "--gc-sections" | "--no-gc-sections" | "--no-dynamic-linker" => {}
@@ -70,5 +104,5 @@ fn parse_args() -> Args {
         i += 1;
     }
 
-    Args { output, entry, shared, inputs, lib_paths, libs }
+    Args { output, entry, shared, is_static, pe, image_base, subsystem, inputs, lib_paths, libs }
 }

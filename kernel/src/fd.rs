@@ -10,19 +10,9 @@ const O_WRITE: u64 = 2;
 const O_CREATE: u64 = 4;
 const O_TRUNCATE: u64 = 8;
 
-/// View any `#[repr(C)]` struct as a byte slice.
-///
-/// # Safety
-/// Caller must ensure `T` has no padding that leaks uninitialized memory.
-/// All current uses are `#[repr(C)]` structs with fully initialized fields.
-fn as_bytes<T: Sized>(val: &T) -> &[u8] {
-    unsafe {
-        core::slice::from_raw_parts(val as *const T as *const u8, core::mem::size_of::<T>())
-    }
-}
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct FramebufferInfo {
     pub token: [u32; 2],
     pub cursor_token: u32,
@@ -154,7 +144,7 @@ pub fn try_read(table: &mut FdTable, fd: u64, buf: &mut [u8]) -> Option<u64> {
             let mut count = 0;
             while count + event_size <= buf.len() {
                 if let Some(event) = keyboard::try_read_event() {
-                    let bytes = as_bytes(&event);
+                    let bytes = bytemuck::bytes_of(&event);
                     buf[count..count + event_size].copy_from_slice(bytes);
                     count += event_size;
                 } else {
@@ -169,7 +159,7 @@ pub fn try_read(table: &mut FdTable, fd: u64, buf: &mut [u8]) -> Option<u64> {
             let mut count = 0;
             while count + event_size <= buf.len() {
                 if let Some(event) = mouse::try_read_event() {
-                    let bytes = as_bytes(&event);
+                    let bytes = bytemuck::bytes_of(&event);
                     buf[count..count + event_size].copy_from_slice(bytes);
                     count += event_size;
                 } else {
@@ -179,7 +169,7 @@ pub fn try_read(table: &mut FdTable, fd: u64, buf: &mut [u8]) -> Option<u64> {
             if count > 0 { Some(count as u64) } else { None }
         }
         Descriptor::Framebuffer(info) => {
-            let bytes = as_bytes(info);
+            let bytes = bytemuck::bytes_of(info);
             let count = buf.len().min(bytes.len());
             buf[..count].copy_from_slice(&bytes[..count]);
             Some(count as u64)

@@ -847,3 +847,528 @@ fn dynamic_executable_has_dt_needed_and_glob_dat() {
     let entry = elf.elf_header().e_entry.get(endian);
     assert!(entry > 0, "entry should be non-zero (PLT stub for _start)");
 }
+
+// ── Tests: static ELF output (link_static) ────────────────────────────────
+
+#[test]
+fn static_produces_et_exec() {
+    let code = vec![0x31, 0xFF, 0xB8, 0x3C, 0x00, 0x00, 0x00, 0x0F, 0x05]; // exit(0) stub
+    let obj_data = build_minimal_obj("_start", &code);
+
+    let elf_bytes = toyos_ld::link_static(
+        &[("test.o".into(), obj_data)],
+        "_start",
+        0x200000,
+    ).expect("static linking should succeed");
+
+    let elf = parse_elf(&elf_bytes);
+    let endian = elf.endian();
+
+    assert_eq!(elf.elf_header().e_type.get(endian), 2, "should be ET_EXEC (2), not ET_DYN (3)");
+    assert_eq!(elf.elf_header().e_machine.get(endian), 62, "should be x86_64");
+    let entry = elf.elf_header().e_entry.get(endian);
+    assert!(entry >= 0x200000, "entry should be in virtual address space");
+    assert!(has_phdr(&elf, elf::PT_LOAD), "should have PT_LOAD");
+}
+
+#[test]
+fn static_no_dynamic_section() {
+    let obj_data = build_minimal_obj("_start", &[0xC3]);
+
+    let elf_bytes = toyos_ld::link_static(
+        &[("test.o".into(), obj_data)],
+        "_start",
+        0x200000,
+    ).expect("static linking should succeed");
+
+    let elf = parse_elf(&elf_bytes);
+
+    assert!(!has_phdr(&elf, elf::PT_DYNAMIC), "static ELF must not have PT_DYNAMIC");
+    assert!(find_section(&elf, ".dynsym").is_none(), "static ELF must not have .dynsym");
+    assert!(find_section(&elf, ".dynstr").is_none(), "static ELF must not have .dynstr");
+    assert!(find_section(&elf, ".dynamic").is_none(), "static ELF must not have .dynamic");
+}
+
+#[test]
+fn static_no_relative_relocations() {
+    // R_X86_64_64 in a static executable should be directly patched,
+    // producing NO R_X86_64_RELATIVE entries in the output
+    let mut obj = WriteObject::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
+    let text = obj.section_id(StandardSection::Text);
+    let start_off = obj.append_section_data(text, &[0xC3], 16);
+    let start_sym = obj.add_symbol(Symbol {
+        name: b"_start".to_vec(),
+        value: start_off, size: 1,
+        kind: SymbolKind::Text, scope: SymbolScope::Dynamic,
+        weak: false, section: SymbolSection::Section(text), flags: SymbolFlags::None,
+    });
+
+    let data_sec = obj.section_id(StandardSection::Data);
+    let ptr_off = obj.append_section_data(data_sec, &[0u8; 8], 8);
+    obj.add_relocation(data_sec, object::write::Relocation {
+        offset: ptr_off, symbol: start_sym, addend: 0,
+        flags: RelocationFlags::Elf { r_type: elf::R_X86_64_64 },
+    }).unwrap();
+
+    let elf_bytes = toyos_ld::link_static(
+        &[("test.o".into(), obj.write().unwrap())],
+        "_start",
+        0x200000,
+    ).expect("static linking with R_X86_64_64 should succeed");
+
+    let elf = parse_elf(&elf_bytes);
+
+    // There should be NO .rela.dyn section at all — addresses are absolute
+    assert!(find_section(&elf, ".rela.dyn").is_none(),
+        "static ELF must not have .rela.dyn (all relocations resolved at link time)");
+
+    // Verify the data section contains the absolute address of _start
+    let entry = elf.elf_header().e_entry.get(elf.endian());
+    // The 8-byte pointer in .data should contain the absolute entry address
+    let data_section = elf.sections()
+        .find(|s| s.name().unwrap_or("") == ".data")
+        .expect("should have .data section");
+    let data = data_section.data().unwrap();
+    let stored_addr = u64::from_le_bytes(data[..8].try_into().unwrap());
+    assert_eq!(stored_addr, entry,
+        "R_X86_64_64 should be resolved to absolute address in static ELF");
+}
+
+#[test]
+fn static_high_base_address() {
+    let code = vec![0xC3]; // ret
+    let obj_data = build_minimal_obj("_start", &code);
+
+    let high_base: u64 = 0xFFFF_8000_0000_0000;
+    let elf_bytes = toyos_ld::link_static(
+        &[("test.o".into(), obj_data)],
+        "_start",
+        high_base,
+    ).expect("static linking with high base should succeed");
+
+    let elf = parse_elf(&elf_bytes);
+    let endian = elf.endian();
+
+    assert_eq!(elf.elf_header().e_type.get(endian), 2, "should be ET_EXEC");
+    let entry = elf.elf_header().e_entry.get(endian);
+    assert!(entry >= high_base, "entry {entry:#x} should be above {high_base:#x}");
+
+    // Verify program headers reference high addresses
+    let phdrs = elf.elf_header().program_headers(endian, elf.data()).unwrap();
+    for ph in phdrs.iter() {
+        if ph.p_type.get(endian) == elf::PT_LOAD {
+            let vaddr = ph.p_vaddr.get(endian);
+            assert!(vaddr >= high_base,
+                "PT_LOAD vaddr {vaddr:#x} should be above {high_base:#x}");
+        }
+    }
+}
+
+#[test]
+fn static_cross_object_resolution() {
+    // Object A: defines `helper`
+    let obj_a_data = build_minimal_obj("helper", &[0xC3]);
+
+    // Object B: defines `_start`, calls `helper` via PLT32
+    let mut obj_b = WriteObject::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
+    let text_b = obj_b.section_id(StandardSection::Text);
+    let off_b = obj_b.append_section_data(text_b, &[0xE8, 0, 0, 0, 0, 0xC3], 16);
+    let helper_sym = obj_b.add_symbol(Symbol {
+        name: b"helper".to_vec(),
+        value: 0, size: 0,
+        kind: SymbolKind::Text, scope: SymbolScope::Dynamic,
+        weak: false, section: SymbolSection::Undefined, flags: SymbolFlags::None,
+    });
+    obj_b.add_symbol(Symbol {
+        name: b"_start".to_vec(),
+        value: off_b, size: 6,
+        kind: SymbolKind::Text, scope: SymbolScope::Dynamic,
+        weak: false, section: SymbolSection::Section(text_b), flags: SymbolFlags::None,
+    });
+    obj_b.add_relocation(text_b, object::write::Relocation {
+        offset: off_b + 1, symbol: helper_sym, addend: -4,
+        flags: RelocationFlags::Elf { r_type: elf::R_X86_64_PLT32 },
+    }).unwrap();
+
+    let objects = vec![
+        ("a.o".into(), obj_a_data),
+        ("b.o".into(), obj_b.write().unwrap()),
+    ];
+
+    let elf_bytes = toyos_ld::link_static(&objects, "_start", 0x200000)
+        .expect("cross-object static linking should succeed");
+
+    let elf = parse_elf(&elf_bytes);
+    let endian = elf.endian();
+    assert_eq!(elf.elf_header().e_type.get(endian), 2, "should be ET_EXEC");
+    let entry = elf.elf_header().e_entry.get(endian);
+    assert!(entry >= 0x200000);
+}
+
+#[test]
+fn static_undefined_symbol_error() {
+    let mut obj = WriteObject::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
+    let text = obj.section_id(StandardSection::Text);
+    let off = obj.append_section_data(text, &[0xE8, 0, 0, 0, 0], 16);
+    let undef_sym = obj.add_symbol(Symbol {
+        name: b"nonexistent".to_vec(),
+        value: 0, size: 0,
+        kind: SymbolKind::Text, scope: SymbolScope::Dynamic,
+        weak: false, section: SymbolSection::Undefined, flags: SymbolFlags::None,
+    });
+    obj.add_symbol(Symbol {
+        name: b"_start".to_vec(),
+        value: off, size: 5,
+        kind: SymbolKind::Text, scope: SymbolScope::Dynamic,
+        weak: false, section: SymbolSection::Section(text), flags: SymbolFlags::None,
+    });
+    obj.add_relocation(text, object::write::Relocation {
+        offset: off + 1, symbol: undef_sym, addend: -4,
+        flags: RelocationFlags::Elf { r_type: elf::R_X86_64_PLT32 },
+    }).unwrap();
+
+    let result = toyos_ld::link_static(
+        &[("test.o".into(), obj.write().unwrap())],
+        "_start",
+        0x200000,
+    );
+    let syms = result.expect_err("should fail with undefined symbol");
+    assert!(syms.contains(&"nonexistent".to_string()));
+}
+
+#[test]
+fn static_compiled_nostd_kernel_base() {
+    if !has_rustc() { return; }
+
+    let source = r#"
+#![no_main]
+#![no_std]
+
+use core::panic::PanicInfo;
+
+#[panic_handler]
+fn panic(_: &PanicInfo) -> ! { loop {} }
+
+#[no_mangle]
+pub extern "C" fn _start() -> ! {
+    loop {}
+}
+"#;
+    let obj = compile_to_obj(source);
+    let high_base: u64 = 0xFFFF_8000_0000_0000;
+    let elf_bytes = toyos_ld::link_static(&[("test.o".into(), obj)], "_start", high_base)
+        .expect("no_std static linking at kernel base should succeed");
+
+    let elf = parse_elf(&elf_bytes);
+    let endian = elf.endian();
+    assert_eq!(elf.elf_header().e_type.get(endian), 2, "should be ET_EXEC");
+    let entry = elf.elf_header().e_entry.get(endian);
+    assert!(entry >= high_base, "entry should be in high kernel address space");
+}
+
+#[test]
+fn static_compiled_nostd() {
+    if !has_rustc() { return; }
+
+    let source = r#"
+#![no_main]
+#![no_std]
+
+use core::panic::PanicInfo;
+
+#[panic_handler]
+fn panic(_: &PanicInfo) -> ! { loop {} }
+
+#[no_mangle]
+pub extern "C" fn _start() -> ! {
+    loop {}
+}
+"#;
+    let obj = compile_to_obj(source);
+    let elf_bytes = toyos_ld::link_static(&[("test.o".into(), obj)], "_start", 0x200000)
+        .expect("no_std static linking should succeed");
+
+    let elf = parse_elf(&elf_bytes);
+    let endian = elf.endian();
+    assert_eq!(elf.elf_header().e_type.get(endian), 2, "should be ET_EXEC");
+    assert!(!has_phdr(&elf, elf::PT_DYNAMIC), "must not have PT_DYNAMIC");
+}
+
+// ── Tests: PE/COFF output (link_pe) ─────────────────────────────────────
+
+fn parse_pe_u16(data: &[u8], off: usize) -> u16 {
+    u16::from_le_bytes(data[off..off + 2].try_into().unwrap())
+}
+
+fn parse_pe_u32(data: &[u8], off: usize) -> u32 {
+    u32::from_le_bytes(data[off..off + 4].try_into().unwrap())
+}
+
+fn pe_section_name(data: &[u8], sh_off: usize) -> String {
+    let raw = &data[sh_off..sh_off + 8];
+    let end = raw.iter().position(|&b| b == 0).unwrap_or(8);
+    String::from_utf8_lossy(&raw[..end]).to_string()
+}
+
+fn pe_section_characteristics(data: &[u8], sh_off: usize) -> u32 {
+    parse_pe_u32(data, sh_off + 36)
+}
+
+#[test]
+fn pe_valid_headers() {
+    let obj_data = build_minimal_obj("efi_main", &[0xC3]);
+
+    let pe = toyos_ld::link_pe(
+        &[("test.o".into(), obj_data)],
+        "efi_main",
+        10, // EFI_APPLICATION
+    ).expect("PE linking should succeed");
+
+    // DOS header
+    assert_eq!(parse_pe_u16(&pe, 0), 0x5A4D, "should start with MZ magic");
+    let pe_offset = parse_pe_u32(&pe, 0x3C) as usize;
+    assert_eq!(pe_offset, 0x40, "e_lfanew should point to PE signature");
+
+    // PE signature
+    assert_eq!(parse_pe_u32(&pe, pe_offset), 0x00004550, "should have PE\\0\\0 signature");
+
+    // COFF header
+    let coff = pe_offset + 4;
+    assert_eq!(parse_pe_u16(&pe, coff), 0x8664, "Machine should be AMD64");
+
+    // Optional header
+    let oh = coff + 20;
+    assert_eq!(parse_pe_u16(&pe, oh), 0x020B, "should be PE32+ (0x020B)");
+}
+
+#[test]
+fn pe_sections() {
+    let obj_data = build_minimal_obj("efi_main", &[0xC3]);
+
+    let pe = toyos_ld::link_pe(
+        &[("test.o".into(), obj_data)],
+        "efi_main",
+        10,
+    ).expect("PE linking should succeed");
+
+    let coff = 0x44;
+    let num_sections = parse_pe_u16(&pe, coff + 2) as usize;
+    assert!(num_sections >= 2, "should have at least .text and .reloc sections");
+
+    let sh_base = 0x58 + 240; // after optional header
+    let mut found_text = false;
+    let mut found_reloc = false;
+    for i in 0..num_sections {
+        let sh = sh_base + i * 40;
+        let name = pe_section_name(&pe, sh);
+        let chars = pe_section_characteristics(&pe, sh);
+        match name.as_str() {
+            ".text" => {
+                found_text = true;
+                assert_eq!(chars & 0x60000020, 0x60000020,
+                    ".text should have CODE|EXECUTE|READ");
+            }
+            ".data" => {
+                assert_eq!(chars & 0xC0000040, 0xC0000040,
+                    ".data should have INIT_DATA|READ|WRITE");
+            }
+            ".reloc" => {
+                found_reloc = true;
+                assert_eq!(chars & 0x42000040, 0x42000040,
+                    ".reloc should have INIT_DATA|DISCARDABLE|READ");
+            }
+            _ => {}
+        }
+    }
+    assert!(found_text, "should have .text section");
+    assert!(found_reloc, "should have .reloc section");
+}
+
+#[test]
+fn pe_entry_point() {
+    // Create two functions to verify entry points to the right one
+    let mut obj = WriteObject::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
+    let text = obj.section_id(StandardSection::Text);
+    let off_dummy = obj.append_section_data(text, &[0x90, 0xC3], 16); // nop; ret
+    obj.add_symbol(Symbol {
+        name: b"dummy".to_vec(),
+        value: off_dummy, size: 2,
+        kind: SymbolKind::Text, scope: SymbolScope::Dynamic,
+        weak: false, section: SymbolSection::Section(text), flags: SymbolFlags::None,
+    });
+    let off_entry = obj.append_section_data(text, &[0x31, 0xC0, 0xC3], 16); // xor eax,eax; ret
+    obj.add_symbol(Symbol {
+        name: b"efi_main".to_vec(),
+        value: off_entry, size: 3,
+        kind: SymbolKind::Text, scope: SymbolScope::Dynamic,
+        weak: false, section: SymbolSection::Section(text), flags: SymbolFlags::None,
+    });
+
+    let pe = toyos_ld::link_pe(
+        &[("test.o".into(), obj.write().unwrap())],
+        "efi_main",
+        10,
+    ).expect("PE linking should succeed");
+
+    let oh = 0x58;
+    let entry_rva = parse_pe_u32(&pe, oh + 0x10);
+    assert!(entry_rva > 0, "AddressOfEntryPoint should be non-zero");
+
+    // Entry should NOT be at the very start of .text (dummy is there)
+    let text_rva = parse_pe_u32(&pe, oh + 0x14);
+    assert!(entry_rva > text_rva, "entry should not be at start of .text (dummy func is there)");
+}
+
+#[test]
+fn pe_subsystem() {
+    let obj_data = build_minimal_obj("efi_main", &[0xC3]);
+
+    // Test EFI_APPLICATION (10)
+    let pe = toyos_ld::link_pe(&[("test.o".into(), obj_data.clone())], "efi_main", 10).unwrap();
+    let oh = 0x58;
+    assert_eq!(parse_pe_u16(&pe, oh + 0x44), 10, "subsystem should be EFI_APPLICATION (10)");
+
+    // Test EFI_BOOT_SERVICE_DRIVER (11)
+    let pe = toyos_ld::link_pe(&[("test.o".into(), obj_data.clone())], "efi_main", 11).unwrap();
+    assert_eq!(parse_pe_u16(&pe, oh + 0x44), 11, "subsystem should be EFI_BOOT_SERVICE_DRIVER (11)");
+
+    // Test EFI_RUNTIME_DRIVER (12)
+    let pe = toyos_ld::link_pe(&[("test.o".into(), obj_data)], "efi_main", 12).unwrap();
+    assert_eq!(parse_pe_u16(&pe, oh + 0x44), 12, "subsystem should be EFI_RUNTIME_DRIVER (12)");
+}
+
+#[test]
+fn pe_base_relocations() {
+    // Create an object with R_X86_64_64 (absolute 64-bit) — needs base relocation in PE
+    let mut obj = WriteObject::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
+    let text = obj.section_id(StandardSection::Text);
+    let func_off = obj.append_section_data(text, &[0xC3], 16);
+    let func_sym = obj.add_symbol(Symbol {
+        name: b"efi_main".to_vec(),
+        value: func_off, size: 1,
+        kind: SymbolKind::Text, scope: SymbolScope::Dynamic,
+        weak: false, section: SymbolSection::Section(text), flags: SymbolFlags::None,
+    });
+
+    let data_sec = obj.section_id(StandardSection::Data);
+    let ptr_off = obj.append_section_data(data_sec, &[0u8; 8], 8);
+    obj.add_relocation(data_sec, object::write::Relocation {
+        offset: ptr_off, symbol: func_sym, addend: 0,
+        flags: RelocationFlags::Elf { r_type: elf::R_X86_64_64 },
+    }).unwrap();
+
+    let pe = toyos_ld::link_pe(
+        &[("test.o".into(), obj.write().unwrap())],
+        "efi_main",
+        10,
+    ).expect("PE with R_X86_64_64 should succeed");
+
+    // Find .reloc section
+    let coff = 0x44;
+    let num_sections = parse_pe_u16(&pe, coff + 2) as usize;
+    let sh_base = 0x58 + 240;
+    let mut reloc_file_off = 0u32;
+    let mut reloc_raw_size = 0u32;
+    for i in 0..num_sections {
+        let sh = sh_base + i * 40;
+        if pe_section_name(&pe, sh) == ".reloc" {
+            reloc_file_off = parse_pe_u32(&pe, sh + 20);
+            reloc_raw_size = parse_pe_u32(&pe, sh + 16);
+        }
+    }
+    assert!(reloc_file_off > 0, "should have .reloc section");
+    assert!(reloc_raw_size > 0, ".reloc should have data");
+
+    // Parse base relocation blocks
+    let reloc_data = &pe[reloc_file_off as usize..(reloc_file_off + reloc_raw_size) as usize];
+    assert!(reloc_data.len() >= 12, ".reloc should have at least one block with one entry");
+
+    // First block header
+    let page_rva = parse_pe_u32(reloc_data, 0);
+    let block_size = parse_pe_u32(reloc_data, 4);
+    assert!(block_size >= 12, "block should have header + at least one entry");
+    assert!(page_rva > 0, "page_rva should be non-zero");
+
+    // Check entries contain DIR64 type (type=10 in upper 4 bits)
+    let num_entries = (block_size - 8) / 2;
+    let mut has_dir64 = false;
+    for e in 0..num_entries {
+        let entry = parse_pe_u16(reloc_data, 8 + e as usize * 2);
+        let typ = entry >> 12;
+        if typ == 10 { has_dir64 = true; }
+    }
+    assert!(has_dir64, ".reloc should have IMAGE_REL_BASED_DIR64 entries");
+}
+
+#[test]
+fn pe_no_relocs_for_pc_relative() {
+    // R_X86_64_PLT32 (PC-relative) should NOT produce base relocations
+    let mut obj = WriteObject::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
+    let text = obj.section_id(StandardSection::Text);
+
+    // helper function
+    let off_a = obj.append_section_data(text, &[0xC3], 16);
+    let helper_sym = obj.add_symbol(Symbol {
+        name: b"helper".to_vec(),
+        value: off_a, size: 1,
+        kind: SymbolKind::Text, scope: SymbolScope::Dynamic,
+        weak: false, section: SymbolSection::Section(text), flags: SymbolFlags::None,
+    });
+
+    // efi_main calls helper via PLT32 (PC-relative)
+    let off_b = obj.append_section_data(text, &[0xE8, 0, 0, 0, 0, 0xC3], 16);
+    obj.add_symbol(Symbol {
+        name: b"efi_main".to_vec(),
+        value: off_b, size: 6,
+        kind: SymbolKind::Text, scope: SymbolScope::Dynamic,
+        weak: false, section: SymbolSection::Section(text), flags: SymbolFlags::None,
+    });
+    obj.add_relocation(text, object::write::Relocation {
+        offset: off_b + 1, symbol: helper_sym, addend: -4,
+        flags: RelocationFlags::Elf { r_type: elf::R_X86_64_PLT32 },
+    }).unwrap();
+
+    let pe = toyos_ld::link_pe(
+        &[("test.o".into(), obj.write().unwrap())],
+        "efi_main",
+        10,
+    ).expect("PE with only PC-relative relocs should succeed");
+
+    // .reloc should exist but have no DIR64 entries (only padding or empty)
+    let oh = 0x58;
+    // Data directory 5 (base relocation) should have size 0
+    let dd5 = oh + 0x70 + 5 * 8;
+    let reloc_dir_size = parse_pe_u32(&pe, dd5 + 4);
+    assert_eq!(reloc_dir_size, 0, "no base relocations needed for PC-relative only code");
+}
+
+#[test]
+fn pe_undefined_symbol_error() {
+    let mut obj = WriteObject::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
+    let text = obj.section_id(StandardSection::Text);
+    let off = obj.append_section_data(text, &[0xE8, 0, 0, 0, 0], 16);
+    let undef_sym = obj.add_symbol(Symbol {
+        name: b"missing".to_vec(),
+        value: 0, size: 0,
+        kind: SymbolKind::Text, scope: SymbolScope::Dynamic,
+        weak: false, section: SymbolSection::Undefined, flags: SymbolFlags::None,
+    });
+    obj.add_symbol(Symbol {
+        name: b"efi_main".to_vec(),
+        value: off, size: 5,
+        kind: SymbolKind::Text, scope: SymbolScope::Dynamic,
+        weak: false, section: SymbolSection::Section(text), flags: SymbolFlags::None,
+    });
+    obj.add_relocation(text, object::write::Relocation {
+        offset: off + 1, symbol: undef_sym, addend: -4,
+        flags: RelocationFlags::Elf { r_type: elf::R_X86_64_PLT32 },
+    }).unwrap();
+
+    let result = toyos_ld::link_pe(
+        &[("test.o".into(), obj.write().unwrap())],
+        "efi_main",
+        10,
+    );
+    let syms = result.expect_err("should fail with undefined symbol");
+    assert!(syms.contains(&"missing".to_string()));
+}

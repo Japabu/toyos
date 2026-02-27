@@ -3,7 +3,7 @@ use core::sync::atomic::{AtomicU8, Ordering};
 use crate::sync::Lock;
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct MouseEvent {
     pub buttons: u8,
     pub dx: i8,

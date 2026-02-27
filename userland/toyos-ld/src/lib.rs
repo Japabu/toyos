@@ -18,6 +18,39 @@ const PAGE_SIZE: u64 = 0x1000;
 
 // ── Public API ──────────────────────────────────────────────────────────
 
+/// Link object files and produce a PE32+ executable for UEFI.
+/// Input is ELF .o files; output is PE/COFF.
+/// `entry` is the entry point symbol name (e.g. "efi_main").
+/// `subsystem` is the PE subsystem (10 = EFI_APPLICATION).
+/// Returns the raw PE bytes on success, or a list of undefined symbols on failure.
+pub fn link_pe(
+    objects: &[(String, Vec<u8>)],
+    entry: &str,
+    subsystem: u16,
+) -> Result<Vec<u8>, Vec<String>> {
+    let mut state = collect(objects);
+    synthesize_alloc_shims(&mut state);
+    let pe_layout = layout_pe(&mut state, entry);
+    let base_relocs = apply_relocs_pe(&mut state, &pe_layout)?;
+    Ok(emit_pe_bytes(&state, &pe_layout, entry, subsystem, &base_relocs))
+}
+
+/// Link object files and produce a static ELF executable (ET_EXEC).
+/// Used for bare-metal targets like x86_64-unknown-none (kernel).
+/// `base_addr` sets the load address (e.g. 0xFFFF800000000000 for kernel code model).
+/// Returns the raw ELF bytes on success, or a list of undefined symbols on failure.
+pub fn link_static(
+    objects: &[(String, Vec<u8>)],
+    entry: &str,
+    base_addr: u64,
+) -> Result<Vec<u8>, Vec<String>> {
+    let mut state = collect(objects);
+    synthesize_alloc_shims(&mut state);
+    let layout = layout_static(&mut state, entry, base_addr);
+    apply_relocs_static(&mut state, &layout)?;
+    Ok(emit_static_bytes(&state, &layout, entry))
+}
+
 /// Link object files and produce a PIE ELF executable.
 /// Returns the raw ELF bytes on success, or a list of undefined symbols on failure.
 pub fn link(objects: &[(String, Vec<u8>)], entry: &str) -> Result<Vec<u8>, Vec<String>> {
@@ -1264,6 +1297,867 @@ fn write_shdr(
     buf[44..48].copy_from_slice(&sh_info.to_le_bytes());
     buf[48..56].copy_from_slice(&sh_addralign.to_le_bytes());
     buf[56..64].copy_from_slice(&sh_entsize.to_le_bytes());
+}
+
+// ── PE/COFF output (--pe) ─────────────────────────────────────────────────
+
+const PE_FILE_ALIGNMENT: u32 = 0x200;
+const PE_SECTION_ALIGNMENT: u32 = 0x1000;
+
+struct PeLayout {
+    /// RVA and file offset/size for each PE section
+    text_rva: u32,
+    text_file_off: u32,
+    text_raw_size: u32,
+    text_virt_size: u32,
+    data_rva: u32,
+    data_file_off: u32,
+    data_raw_size: u32,
+    data_virt_size: u32,
+    has_data: bool,
+    reloc_rva: u32,
+    reloc_file_off: u32,
+    size_of_headers: u32,
+    #[allow(dead_code)]
+    size_of_image: u32,
+    got: HashMap<String, u64>,
+}
+
+/// PE section layout: RVAs use PE_SECTION_ALIGNMENT, file uses PE_FILE_ALIGNMENT.
+/// All section vaddrs in LinkState are set relative to text_rva.
+fn layout_pe(state: &mut LinkState, _entry_name: &str) -> PeLayout {
+    // Headers: DOS(64) + PE sig(4) + COFF(20) + OptionalHeader(240) + section headers
+    // We'll have 2 or 3 sections: .text, optionally .data, .reloc
+    // Determine if we have data sections
+    let has_rw = state.sections.iter().any(|s| !is_rx_section(&s.name) && !is_tls_section(&s.name));
+    let num_sections: u32 = if has_rw { 3 } else { 2 }; // .text [.data] .reloc
+    let headers_end = 64 + 4 + 20 + 240 + num_sections * 40;
+    let size_of_headers = pe_align_up(headers_end, PE_FILE_ALIGNMENT);
+
+    let mut rx_sections = Vec::new();
+    let mut rw_sections = Vec::new();
+
+    for (idx, sec) in state.sections.iter().enumerate() {
+        if is_tls_section(&sec.name) {
+            // TLS not supported in UEFI — UEFI is single-threaded
+            continue;
+        } else if is_rx_section(&sec.name) {
+            rx_sections.push(idx);
+        } else {
+            rw_sections.push(idx);
+        }
+    }
+
+    // .text section
+    let text_rva = PE_SECTION_ALIGNMENT; // first section always at 0x1000
+    let mut cursor = text_rva as u64;
+    for &idx in &rx_sections {
+        let sec = &mut state.sections[idx];
+        cursor = align_up(cursor, sec.align);
+        sec.vaddr = cursor;
+        cursor += sec.size;
+    }
+    let text_virt_size = (cursor - text_rva as u64) as u32;
+    let text_raw_size = pe_align_up(text_virt_size, PE_FILE_ALIGNMENT);
+    let text_file_off = size_of_headers;
+
+    // .data section (if any RW sections exist)
+    let data_rva = pe_align_up(text_rva + text_virt_size, PE_SECTION_ALIGNMENT);
+    let mut data_virt_size = 0u32;
+    let has_data = !rw_sections.is_empty();
+    if has_data {
+        cursor = data_rva as u64;
+        for &idx in &rw_sections {
+            let sec = &mut state.sections[idx];
+            cursor = align_up(cursor, sec.align);
+            sec.vaddr = cursor;
+            cursor += sec.size;
+        }
+        data_virt_size = (cursor - data_rva as u64) as u32;
+    }
+
+    // GOT entries needed
+    let mut got_symbols: Vec<String> = Vec::new();
+    for reloc in &state.relocs {
+        match reloc.r_type {
+            elf::R_X86_64_GOTPCREL | elf::R_X86_64_GOTPCRELX
+            | elf::R_X86_64_REX_GOTPCRELX => {
+                if !got_symbols.contains(&reloc.symbol_name) {
+                    got_symbols.push(reloc.symbol_name.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    if has_data && !got_symbols.is_empty() {
+        cursor = align_up(cursor, 8);
+    } else if !has_data && !got_symbols.is_empty() {
+        // GOT goes in the data section area
+        cursor = data_rva as u64;
+    }
+    let mut got = HashMap::new();
+    for sym in &got_symbols {
+        got.insert(sym.clone(), cursor);
+        cursor += 8;
+    }
+    if !got_symbols.is_empty() && !has_data {
+        data_virt_size = (cursor - data_rva as u64) as u32;
+    } else if !got_symbols.is_empty() {
+        data_virt_size = (cursor - data_rva as u64) as u32;
+    }
+
+    let data_raw_size = if has_data || !got_symbols.is_empty() {
+        pe_align_up(data_virt_size, PE_FILE_ALIGNMENT)
+    } else { 0 };
+    let data_file_off = text_file_off + text_raw_size;
+
+    // .reloc section — will be filled later after we know the fixups
+    let reloc_rva = if has_data || !got_symbols.is_empty() {
+        pe_align_up(data_rva + data_virt_size, PE_SECTION_ALIGNMENT)
+    } else {
+        pe_align_up(text_rva + text_virt_size, PE_SECTION_ALIGNMENT)
+    };
+    let reloc_file_off = data_file_off + data_raw_size;
+
+    // size_of_image will be updated after we know reloc size
+    let size_of_image = 0; // placeholder
+
+    PeLayout {
+        text_rva,
+        text_file_off,
+        text_raw_size,
+        text_virt_size,
+        data_rva,
+        data_file_off,
+        data_raw_size,
+        data_virt_size,
+        has_data: has_data || !got_symbols.is_empty(),
+        reloc_rva,
+        reloc_file_off,
+        size_of_headers,
+        size_of_image,
+        got,
+    }
+}
+
+fn pe_align_up(value: u32, alignment: u32) -> u32 {
+    (value + alignment - 1) & !(alignment - 1)
+}
+
+fn resolve_symbol_pe(state: &LinkState, name: &str, from_sec: usize) -> Option<u64> {
+    if let Some(def) = state.globals.get(name) {
+        if def.section_global_idx == DYNAMIC_SYMBOL_SENTINEL {
+            return None;
+        }
+        let sec = &state.sections[def.section_global_idx];
+        return Some(sec.vaddr + def.value);
+    }
+    let obj_idx = state.sections[from_sec].obj_idx;
+    if let Some(def) = state.locals.get(&(obj_idx, name.to_string())) {
+        let sec = &state.sections[def.section_global_idx];
+        return Some(sec.vaddr + def.value);
+    }
+    None
+}
+
+fn apply_relocs_pe(
+    state: &mut LinkState,
+    layout: &PeLayout,
+) -> Result<Vec<u32>, Vec<String>> {
+    let mut undefined = HashSet::new();
+    let mut abs_fixups: Vec<u32> = Vec::new(); // RVAs of absolute 64-bit fixups
+    let relocs: Vec<InputReloc> = state.relocs.clone();
+
+    for reloc in &relocs {
+        // Skip TLS relocations — not supported in UEFI
+        match reloc.r_type {
+            elf::R_X86_64_TLSGD | elf::R_X86_64_TLSLD | elf::R_X86_64_DTPOFF32
+            | elf::R_X86_64_TPOFF32 | elf::R_X86_64_GOTTPOFF => continue,
+            _ => {}
+        }
+
+        let sec = &state.sections[reloc.section_global_idx];
+        let reloc_vaddr = sec.vaddr + reloc.offset;
+
+        let sym_addr = match resolve_symbol_pe(state, &reloc.symbol_name, reloc.section_global_idx) {
+            Some(a) => a,
+            None => {
+                if reloc.symbol_name.is_empty() { 0 }
+                else { undefined.insert(reloc.symbol_name.clone()); continue; }
+            }
+        };
+
+        match reloc.r_type {
+            elf::R_X86_64_64 => {
+                let value = (sym_addr as i64 + reloc.addend) as u64;
+                write_u64(state, reloc.section_global_idx, reloc.offset, value);
+                // Record this as needing a base relocation
+                abs_fixups.push(reloc_vaddr as u32);
+            }
+            elf::R_X86_64_PC32 | elf::R_X86_64_PLT32 => {
+                let value = sym_addr as i64 + reloc.addend - reloc_vaddr as i64;
+                write_i32(state, reloc.section_global_idx, reloc.offset, value as i32);
+                // PC-relative — no base relocation needed
+            }
+            elf::R_X86_64_32 => {
+                let value = (sym_addr as i64 + reloc.addend) as u32;
+                write_u32(state, reloc.section_global_idx, reloc.offset, value);
+            }
+            elf::R_X86_64_32S => {
+                let value = (sym_addr as i64 + reloc.addend) as i32;
+                write_i32(state, reloc.section_global_idx, reloc.offset, value);
+            }
+            elf::R_X86_64_GOTPCREL | elf::R_X86_64_GOTPCRELX
+            | elf::R_X86_64_REX_GOTPCRELX => {
+                let got_slot = layout.got[&reloc.symbol_name];
+                let value = got_slot as i64 + reloc.addend - reloc_vaddr as i64;
+                write_i32(state, reloc.section_global_idx, reloc.offset, value as i32);
+            }
+            other => {
+                eprintln!("toyos-ld: unsupported relocation type {other} in PE mode for symbol {}", reloc.symbol_name);
+            }
+        }
+    }
+
+    // Fill GOT entries
+    for (sym_name, &got_vaddr) in &layout.got {
+        let sym_addr = resolve_symbol_pe(state, sym_name, 0).unwrap_or(0);
+        abs_fixups.push(got_vaddr as u32);
+        // GOT entries written in emit_pe_bytes
+        let _ = (got_vaddr, sym_addr);
+    }
+
+    if !undefined.is_empty() {
+        let mut syms: Vec<String> = undefined.into_iter().collect();
+        syms.sort();
+        return Err(syms);
+    }
+
+    abs_fixups.sort();
+    Ok(abs_fixups)
+}
+
+fn build_base_reloc_table(fixups: &[u32]) -> Vec<u8> {
+    if fixups.is_empty() {
+        return Vec::new();
+    }
+
+    let mut result = Vec::new();
+
+    // Group fixups by page (4KB aligned)
+    let mut i = 0;
+    while i < fixups.len() {
+        let page_rva = fixups[i] & !0xFFF;
+        let block_start = result.len();
+
+        // Reserve space for header (page_rva + block_size)
+        result.extend_from_slice(&page_rva.to_le_bytes());
+        result.extend_from_slice(&0u32.to_le_bytes()); // placeholder for block_size
+
+        let mut count = 0u32;
+        while i < fixups.len() && (fixups[i] & !0xFFF) == page_rva {
+            let offset = fixups[i] & 0xFFF;
+            // Type 10 (IMAGE_REL_BASED_DIR64) in upper 4 bits
+            let entry: u16 = (10 << 12) | (offset as u16);
+            result.extend_from_slice(&entry.to_le_bytes());
+            count += 1;
+            i += 1;
+        }
+
+        // Pad to 4-byte alignment
+        if count % 2 != 0 {
+            result.extend_from_slice(&0u16.to_le_bytes()); // IMAGE_REL_BASED_ABSOLUTE padding
+            count += 1;
+        }
+
+        let block_size = 8 + count * 2;
+        result[block_start + 4..block_start + 8].copy_from_slice(&block_size.to_le_bytes());
+    }
+
+    result
+}
+
+fn emit_pe_bytes(
+    state: &LinkState,
+    layout: &PeLayout,
+    entry_name: &str,
+    subsystem: u16,
+    abs_fixups: &[u32],
+) -> Vec<u8> {
+    let entry_rva = state
+        .globals
+        .get(entry_name)
+        .map(|def| {
+            let sec = &state.sections[def.section_global_idx];
+            (sec.vaddr + def.value) as u32
+        })
+        .unwrap_or_else(|| panic!("toyos-ld: entry symbol '{entry_name}' not found"));
+
+    // Build base relocation table
+    let reloc_data = build_base_reloc_table(abs_fixups);
+    let reloc_virt_size = reloc_data.len() as u32;
+    let reloc_raw_size = pe_align_up(reloc_virt_size.max(1), PE_FILE_ALIGNMENT);
+
+    let size_of_image = pe_align_up(
+        layout.reloc_rva + reloc_virt_size.max(1),
+        PE_SECTION_ALIGNMENT,
+    );
+
+    let num_sections: u32 = if layout.has_data { 3 } else { 2 };
+    let total_file_size = layout.reloc_file_off + reloc_raw_size;
+
+    let mut buf = vec![0u8; total_file_size as usize];
+
+    // ── DOS header ──
+    buf[0..2].copy_from_slice(&0x5A4Du16.to_le_bytes()); // e_magic = "MZ"
+    buf[0x3C..0x40].copy_from_slice(&0x40u32.to_le_bytes()); // e_lfanew
+
+    // ── PE signature ──
+    buf[0x40..0x44].copy_from_slice(&0x00004550u32.to_le_bytes()); // "PE\0\0"
+
+    // ── COFF header ──
+    let coff = &mut buf[0x44..0x58];
+    coff[0..2].copy_from_slice(&0x8664u16.to_le_bytes()); // Machine = AMD64
+    coff[2..4].copy_from_slice(&(num_sections as u16).to_le_bytes());
+    // TimeDateStamp, PointerToSymbolTable, NumberOfSymbols = 0
+    coff[16..18].copy_from_slice(&0x00F0u16.to_le_bytes()); // SizeOfOptionalHeader = 240
+    coff[18..20].copy_from_slice(&0x0022u16.to_le_bytes()); // Characteristics
+
+    // ── Optional header (PE32+) ──
+    let oh = 0x58usize; // optional header start
+    buf[oh..oh + 2].copy_from_slice(&0x020Bu16.to_le_bytes()); // Magic = PE32+
+    // SizeOfCode
+    buf[oh + 4..oh + 8].copy_from_slice(&layout.text_virt_size.to_le_bytes());
+    // SizeOfInitializedData
+    let init_data_size = layout.data_virt_size + reloc_virt_size;
+    buf[oh + 8..oh + 12].copy_from_slice(&init_data_size.to_le_bytes());
+    // AddressOfEntryPoint
+    buf[oh + 0x10..oh + 0x14].copy_from_slice(&entry_rva.to_le_bytes());
+    // BaseOfCode
+    buf[oh + 0x14..oh + 0x18].copy_from_slice(&layout.text_rva.to_le_bytes());
+    // ImageBase = 0 (UEFI will relocate)
+    // SectionAlignment
+    buf[oh + 0x20..oh + 0x24].copy_from_slice(&PE_SECTION_ALIGNMENT.to_le_bytes());
+    // FileAlignment
+    buf[oh + 0x24..oh + 0x28].copy_from_slice(&PE_FILE_ALIGNMENT.to_le_bytes());
+    // SizeOfImage
+    buf[oh + 0x38..oh + 0x3C].copy_from_slice(&size_of_image.to_le_bytes());
+    // SizeOfHeaders
+    buf[oh + 0x3C..oh + 0x40].copy_from_slice(&layout.size_of_headers.to_le_bytes());
+    // Subsystem
+    buf[oh + 0x44..oh + 0x46].copy_from_slice(&subsystem.to_le_bytes());
+    // NumberOfRvaAndSizes = 16
+    buf[oh + 0x6C..oh + 0x70].copy_from_slice(&16u32.to_le_bytes());
+
+    // Data directory index 5: Base Relocation Table
+    let dd5 = oh + 0x70 + 5 * 8; // each data dir entry is 8 bytes
+    buf[dd5..dd5 + 4].copy_from_slice(&layout.reloc_rva.to_le_bytes());
+    buf[dd5 + 4..dd5 + 8].copy_from_slice(&reloc_virt_size.to_le_bytes());
+
+    // ── Section headers ──
+    let sh_base = oh + 240; // after optional header
+
+    // .text
+    let sh = sh_base;
+    buf[sh..sh + 8].copy_from_slice(b".text\0\0\0");
+    buf[sh + 8..sh + 12].copy_from_slice(&layout.text_virt_size.to_le_bytes());
+    buf[sh + 12..sh + 16].copy_from_slice(&layout.text_rva.to_le_bytes());
+    buf[sh + 16..sh + 20].copy_from_slice(&layout.text_raw_size.to_le_bytes());
+    buf[sh + 20..sh + 24].copy_from_slice(&layout.text_file_off.to_le_bytes());
+    buf[sh + 36..sh + 40].copy_from_slice(&0x60000020u32.to_le_bytes()); // CODE|EXEC|READ
+
+    let mut next_sh = sh_base + 40;
+
+    // .data (if present)
+    if layout.has_data {
+        let sh = next_sh;
+        buf[sh..sh + 8].copy_from_slice(b".data\0\0\0");
+        buf[sh + 8..sh + 12].copy_from_slice(&layout.data_virt_size.to_le_bytes());
+        buf[sh + 12..sh + 16].copy_from_slice(&layout.data_rva.to_le_bytes());
+        buf[sh + 16..sh + 20].copy_from_slice(&layout.data_raw_size.to_le_bytes());
+        buf[sh + 20..sh + 24].copy_from_slice(&layout.data_file_off.to_le_bytes());
+        buf[sh + 36..sh + 40].copy_from_slice(&0xC0000040u32.to_le_bytes()); // INIT_DATA|READ|WRITE
+        next_sh += 40;
+    }
+
+    // .reloc
+    {
+        let sh = next_sh;
+        buf[sh..sh + 8].copy_from_slice(b".reloc\0\0");
+        buf[sh + 8..sh + 12].copy_from_slice(&reloc_virt_size.to_le_bytes());
+        buf[sh + 12..sh + 16].copy_from_slice(&layout.reloc_rva.to_le_bytes());
+        buf[sh + 16..sh + 20].copy_from_slice(&reloc_raw_size.to_le_bytes());
+        buf[sh + 20..sh + 24].copy_from_slice(&layout.reloc_file_off.to_le_bytes());
+        buf[sh + 36..sh + 40].copy_from_slice(&0x42000040u32.to_le_bytes()); // INIT_DATA|DISCARDABLE|READ
+    }
+
+    // ── Copy section data ──
+    for sec in &state.sections {
+        if sec.vaddr == 0 || sec.data.is_empty() { continue; }
+        // Determine which PE section this belongs to
+        let rva = sec.vaddr as u32;
+        let (file_off_base, rva_base) = if rva >= layout.data_rva && layout.has_data {
+            (layout.data_file_off, layout.data_rva)
+        } else {
+            (layout.text_file_off, layout.text_rva)
+        };
+        let file_off = (file_off_base + (rva - rva_base)) as usize;
+        if file_off + sec.data.len() <= buf.len() {
+            buf[file_off..file_off + sec.data.len()].copy_from_slice(&sec.data);
+        }
+    }
+
+    // ── Write GOT entries ──
+    for (sym_name, &got_vaddr) in &layout.got {
+        let sym_addr = resolve_symbol_pe(state, sym_name, 0).unwrap_or(0);
+        let rva = got_vaddr as u32;
+        let (file_off_base, rva_base) = if rva >= layout.data_rva && layout.has_data {
+            (layout.data_file_off, layout.data_rva)
+        } else {
+            (layout.text_file_off, layout.text_rva)
+        };
+        let file_off = (file_off_base + (rva - rva_base)) as usize;
+        if file_off + 8 <= buf.len() {
+            buf[file_off..file_off + 8].copy_from_slice(&sym_addr.to_le_bytes());
+        }
+    }
+
+    // ── Write .reloc data ──
+    let reloc_off = layout.reloc_file_off as usize;
+    if !reloc_data.is_empty() {
+        buf[reloc_off..reloc_off + reloc_data.len()].copy_from_slice(&reloc_data);
+    }
+
+    buf
+}
+
+// ── Static ELF output (--static) ──────────────────────────────────────────
+
+struct StaticLayout {
+    base_addr: u64,
+    rx_start: u64,
+    rx_end: u64,
+    rw_start: u64,
+    rw_end: u64,
+    tls_start: u64,
+    tls_filesz: u64,
+    tls_memsz: u64,
+    got: HashMap<String, u64>,
+}
+
+fn layout_static(state: &mut LinkState, _entry_name: &str, base_addr: u64) -> StaticLayout {
+    let headers_size = 0x1000u64;
+
+    let mut rx_sections = Vec::new();
+    let mut rw_sections = Vec::new();
+    let mut tls_sections = Vec::new();
+
+    for (idx, sec) in state.sections.iter().enumerate() {
+        if state.tls_sections.contains(&idx) {
+            tls_sections.push(idx);
+        } else if is_tls_section(&sec.name) {
+            tls_sections.push(idx);
+            state.tls_sections.push(idx);
+        } else if is_rx_section(&sec.name) {
+            rx_sections.push(idx);
+        } else {
+            rw_sections.push(idx);
+        }
+    }
+
+    let mut cursor = base_addr + headers_size;
+
+    let rx_start = cursor;
+    for &idx in &rx_sections {
+        let sec = &mut state.sections[idx];
+        cursor = align_up(cursor, sec.align);
+        sec.vaddr = cursor;
+        cursor += sec.size;
+    }
+    let rx_end = align_up(cursor, PAGE_SIZE);
+
+    cursor = rx_end;
+    let rw_start = cursor;
+    for &idx in &rw_sections {
+        let sec = &mut state.sections[idx];
+        cursor = align_up(cursor, sec.align);
+        sec.vaddr = cursor;
+        cursor += sec.size;
+    }
+
+    // GOT entries (GOTPCREL* and GOTTPOFF)
+    let mut got_symbols: Vec<String> = Vec::new();
+    for reloc in &state.relocs {
+        match reloc.r_type {
+            elf::R_X86_64_GOTPCREL
+            | elf::R_X86_64_GOTPCRELX
+            | elf::R_X86_64_REX_GOTPCRELX
+            | elf::R_X86_64_GOTTPOFF => {
+                if !got_symbols.contains(&reloc.symbol_name) {
+                    got_symbols.push(reloc.symbol_name.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    cursor = align_up(cursor, 8);
+    let mut got = HashMap::new();
+    for sym in &got_symbols {
+        got.insert(sym.clone(), cursor);
+        cursor += 8;
+    }
+
+    let rw_end = align_up(cursor, PAGE_SIZE);
+
+    // TLS layout
+    let tls_start = align_up(rw_end, 64);
+    let mut tls_cursor = tls_start;
+    for &idx in &tls_sections {
+        let sec = &mut state.sections[idx];
+        tls_cursor = align_up(tls_cursor, sec.align);
+        sec.vaddr = tls_cursor;
+        tls_cursor += sec.size;
+    }
+    let tls_filesz = tls_sections
+        .iter()
+        .filter(|&&idx| !state.sections[idx].name.starts_with(".tbss"))
+        .map(|&idx| state.sections[idx].size)
+        .sum::<u64>();
+    let tls_memsz = if tls_sections.is_empty() { 0 } else { tls_cursor - tls_start };
+
+    StaticLayout {
+        base_addr,
+        rx_start,
+        rx_end,
+        rw_start,
+        rw_end,
+        tls_start,
+        tls_filesz,
+        tls_memsz,
+        got,
+    }
+}
+
+fn resolve_symbol_static(state: &LinkState, name: &str, from_sec: usize) -> Option<u64> {
+    if let Some(def) = state.globals.get(name) {
+        if def.section_global_idx == DYNAMIC_SYMBOL_SENTINEL {
+            return None; // Static linking doesn't support dynamic symbols
+        }
+        let sec = &state.sections[def.section_global_idx];
+        return Some(sec.vaddr + def.value);
+    }
+    let obj_idx = state.sections[from_sec].obj_idx;
+    if let Some(def) = state.locals.get(&(obj_idx, name.to_string())) {
+        let sec = &state.sections[def.section_global_idx];
+        return Some(sec.vaddr + def.value);
+    }
+    None
+}
+
+fn tpoff_static(sym_addr: u64, layout: &StaticLayout) -> i64 {
+    sym_addr as i64 - (layout.tls_start as i64 + layout.tls_memsz as i64)
+}
+
+fn apply_relocs_static(
+    state: &mut LinkState,
+    layout: &StaticLayout,
+) -> Result<(), Vec<String>> {
+    let mut undefined = HashSet::new();
+    let relocs: Vec<InputReloc> = state.relocs.clone();
+
+    // Pass 1: TLS GD/LD/DTPOFF relaxations
+    let mut relaxed_calls: HashSet<(usize, u64)> = HashSet::new();
+
+    for reloc in &relocs {
+        match reloc.r_type {
+            elf::R_X86_64_TLSGD => {
+                let sym_addr = resolve_symbol_static(state, &reloc.symbol_name, reloc.section_global_idx)
+                    .unwrap_or(0);
+                let padded = is_padded_tls_sequence(
+                    &state.sections[reloc.section_global_idx].data,
+                    reloc.offset,
+                );
+                if padded {
+                    #[rustfmt::skip]
+                    let inst: [u8; 16] = [
+                        0x64, 0x48, 0x8b, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00,
+                        0x48, 0x8d, 0x80, 0x00, 0x00, 0x00, 0x00,
+                    ];
+                    write_bytes(state, reloc.section_global_idx, reloc.offset - 4, &inst);
+                    write_i32(state, reloc.section_global_idx, reloc.offset + 8,
+                        tpoff_static(sym_addr, layout) as i32);
+                    relaxed_calls.insert((reloc.section_global_idx, reloc.offset + 8));
+                } else {
+                    panic!("toyos-ld: unpadded 12-byte TLSGD sequence not supported");
+                }
+            }
+            elf::R_X86_64_TLSLD => {
+                let padded = is_padded_tls_sequence(
+                    &state.sections[reloc.section_global_idx].data,
+                    reloc.offset,
+                );
+                if padded {
+                    #[rustfmt::skip]
+                    let inst: [u8; 16] = [
+                        0x66, 0x66, 0x66,
+                        0x64, 0x48, 0x8b, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00,
+                        0x0f, 0x1f, 0x40, 0x00,
+                    ];
+                    write_bytes(state, reloc.section_global_idx, reloc.offset - 4, &inst);
+                    relaxed_calls.insert((reloc.section_global_idx, reloc.offset + 8));
+                } else {
+                    #[rustfmt::skip]
+                    let inst: [u8; 12] = [
+                        0x66, 0x66, 0x66,
+                        0x64, 0x48, 0x8b, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00,
+                    ];
+                    write_bytes(state, reloc.section_global_idx, reloc.offset - 3, &inst);
+                    relaxed_calls.insert((reloc.section_global_idx, reloc.offset + 5));
+                }
+            }
+            elf::R_X86_64_DTPOFF32 => {
+                let sym_addr = resolve_symbol_static(state, &reloc.symbol_name, reloc.section_global_idx)
+                    .unwrap_or(0);
+                write_i32(state, reloc.section_global_idx, reloc.offset,
+                    (tpoff_static(sym_addr, layout) + reloc.addend) as i32);
+            }
+            _ => {}
+        }
+    }
+
+    // Pass 2: all other relocations — directly patch, no RELATIVE entries
+    for reloc in &relocs {
+        match reloc.r_type {
+            elf::R_X86_64_TLSGD | elf::R_X86_64_TLSLD | elf::R_X86_64_DTPOFF32 => continue,
+            _ => {}
+        }
+        if relaxed_calls.contains(&(reloc.section_global_idx, reloc.offset)) {
+            continue;
+        }
+
+        let sec = &state.sections[reloc.section_global_idx];
+        let reloc_vaddr = sec.vaddr + reloc.offset;
+
+        let sym_addr = match resolve_symbol_static(state, &reloc.symbol_name, reloc.section_global_idx) {
+            Some(a) => a,
+            None => {
+                if reloc.symbol_name.is_empty() {
+                    0
+                } else {
+                    undefined.insert(reloc.symbol_name.clone());
+                    continue;
+                }
+            }
+        };
+
+        match reloc.r_type {
+            elf::R_X86_64_64 => {
+                let value = (sym_addr as i64 + reloc.addend) as u64;
+                write_u64(state, reloc.section_global_idx, reloc.offset, value);
+                // No RELATIVE — address is absolute and fixed at link time
+            }
+            elf::R_X86_64_PC32 | elf::R_X86_64_PLT32 => {
+                let value = sym_addr as i64 + reloc.addend - reloc_vaddr as i64;
+                write_i32(state, reloc.section_global_idx, reloc.offset, value as i32);
+            }
+            elf::R_X86_64_32 => {
+                let value = (sym_addr as i64 + reloc.addend) as u32;
+                write_u32(state, reloc.section_global_idx, reloc.offset, value);
+            }
+            elf::R_X86_64_32S => {
+                let value = (sym_addr as i64 + reloc.addend) as i32;
+                write_i32(state, reloc.section_global_idx, reloc.offset, value);
+            }
+            elf::R_X86_64_GOTPCREL | elf::R_X86_64_GOTPCRELX
+            | elf::R_X86_64_REX_GOTPCRELX => {
+                let got_slot = layout.got[&reloc.symbol_name];
+                let value = got_slot as i64 + reloc.addend - reloc_vaddr as i64;
+                write_i32(state, reloc.section_global_idx, reloc.offset, value as i32);
+            }
+            elf::R_X86_64_TPOFF32 => {
+                let tp = tpoff_static(sym_addr, layout);
+                write_i32(state, reloc.section_global_idx, reloc.offset,
+                    (tp + reloc.addend) as i32);
+            }
+            elf::R_X86_64_GOTTPOFF => {
+                let got_slot = layout.got[&reloc.symbol_name];
+                let value = got_slot as i64 + reloc.addend - reloc_vaddr as i64;
+                write_i32(state, reloc.section_global_idx, reloc.offset, value as i32);
+            }
+            other => {
+                eprintln!(
+                    "toyos-ld: unsupported relocation type {other} for symbol {}",
+                    reloc.symbol_name
+                );
+            }
+        }
+    }
+
+    // Fill GOT entries with absolute addresses
+    let gottpoff_syms: HashSet<String> = relocs
+        .iter()
+        .filter(|r| r.r_type == elf::R_X86_64_GOTTPOFF)
+        .map(|r| r.symbol_name.clone())
+        .collect();
+
+    for (sym_name, &got_vaddr) in &layout.got {
+        let sym_addr = resolve_symbol_static(state, sym_name, 0).unwrap_or(0);
+        let value = if gottpoff_syms.contains(sym_name) {
+            tpoff_static(sym_addr, layout) as u64
+        } else {
+            sym_addr
+        };
+        // Write GOT entry directly into the RW section data
+        // GOT is at got_vaddr, which is in the RW segment
+        // Find which section contains this address, or we need to handle it differently
+        // For static linking, GOT entries are just absolute values baked in
+        // We handle this by writing to the output buffer in emit_static_bytes
+        // Store in a side table instead
+        let _ = (got_vaddr, value); // handled in emit
+    }
+
+    if !undefined.is_empty() {
+        let mut syms: Vec<String> = undefined.into_iter().collect();
+        syms.sort();
+        return Err(syms);
+    }
+
+    Ok(())
+}
+
+fn emit_static_bytes(
+    state: &LinkState,
+    layout: &StaticLayout,
+    entry_name: &str,
+) -> Vec<u8> {
+    let entry = state
+        .globals
+        .get(entry_name)
+        .map(|def| {
+            state.sections[def.section_global_idx].vaddr + def.value
+        })
+        .unwrap_or_else(|| {
+            panic!("toyos-ld: entry symbol '{entry_name}' not found");
+        });
+
+    let after_rw = layout.rw_end.max(layout.tls_start + layout.tls_memsz);
+
+    // shstrtab
+    let shstrtab = build_static_shstrtab();
+    let shstrtab_file_offset = after_rw - layout.base_addr;
+    let shstrtab_size = shstrtab.len() as u64;
+
+    let num_shdrs: u16 = 4; // NULL + .text + .data + .shstrtab
+    let mut phdr_count = 2u16; // PT_LOAD×2 (RX + RW)
+    if layout.tls_memsz > 0 { phdr_count += 1; }
+    let shdr_offset = align_up(shstrtab_file_offset + shstrtab_size, 8);
+    let total_file_size = shdr_offset + num_shdrs as u64 * 64;
+
+    let mut buf = vec![0u8; total_file_size as usize];
+
+    // ── ELF header ──
+    let ehdr = &mut buf[..64];
+    ehdr[0..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+    ehdr[4] = 2; // ELFCLASS64
+    ehdr[5] = 1; // ELFDATA2LSB
+    ehdr[6] = 1; // EV_CURRENT
+    ehdr[16..18].copy_from_slice(&2u16.to_le_bytes()); // ET_EXEC
+    ehdr[18..20].copy_from_slice(&62u16.to_le_bytes()); // EM_X86_64
+    ehdr[20..24].copy_from_slice(&1u32.to_le_bytes()); // EV_CURRENT
+    ehdr[24..32].copy_from_slice(&entry.to_le_bytes());
+    ehdr[32..40].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+    ehdr[40..48].copy_from_slice(&shdr_offset.to_le_bytes());
+    ehdr[52..54].copy_from_slice(&64u16.to_le_bytes()); // e_ehsize
+    ehdr[54..56].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
+    ehdr[56..58].copy_from_slice(&phdr_count.to_le_bytes());
+    ehdr[58..60].copy_from_slice(&64u16.to_le_bytes()); // e_shentsize
+    ehdr[60..62].copy_from_slice(&num_shdrs.to_le_bytes());
+    ehdr[62..64].copy_from_slice(&(num_shdrs - 1).to_le_bytes()); // e_shstrndx
+
+    // ── Program headers ──
+    // File layout mirrors virtual layout: file_offset = vaddr - base_addr
+    let base = layout.base_addr;
+    let mut ph = 64usize;
+    write_phdr(&mut buf[ph..], elf::PT_LOAD, elf::PF_R | elf::PF_X,
+        base, base,
+        layout.rx_end - base, layout.rx_end - base, PAGE_SIZE);
+    // Fix p_offset for the phdr we just wrote (write_phdr uses BASE_VADDR)
+    buf[ph + 8..ph + 16].copy_from_slice(&0u64.to_le_bytes()); // RX starts at file offset 0
+    ph += 56;
+    let rw_file_off = layout.rw_start - base;
+    write_phdr(&mut buf[ph..], elf::PT_LOAD, elf::PF_R | elf::PF_W,
+        layout.rw_start, layout.rw_start,
+        layout.rw_end - layout.rw_start, layout.rw_end - layout.rw_start, PAGE_SIZE);
+    buf[ph + 8..ph + 16].copy_from_slice(&rw_file_off.to_le_bytes());
+    ph += 56;
+    if layout.tls_memsz > 0 {
+        let tls_file_off = layout.tls_start - base;
+        write_phdr(&mut buf[ph..], elf::PT_TLS, elf::PF_R,
+            layout.tls_start, layout.tls_start,
+            layout.tls_filesz, layout.tls_memsz, 64);
+        buf[ph + 8..ph + 16].copy_from_slice(&tls_file_off.to_le_bytes());
+    }
+
+    // ── Copy section data ──
+    for sec in &state.sections {
+        if sec.vaddr == 0 || sec.data.is_empty() { continue; }
+        let file_off = (sec.vaddr - layout.base_addr) as usize;
+        if file_off + sec.data.len() <= buf.len() {
+            buf[file_off..file_off + sec.data.len()].copy_from_slice(&sec.data);
+        }
+    }
+
+    // ── Write GOT entries ──
+    let gottpoff_syms: HashSet<String> = state.relocs
+        .iter()
+        .filter(|r| r.r_type == elf::R_X86_64_GOTTPOFF)
+        .map(|r| r.symbol_name.clone())
+        .collect();
+    for (sym_name, &got_vaddr) in &layout.got {
+        let sym_addr = resolve_symbol_static(state, sym_name, 0).unwrap_or(0);
+        let value = if gottpoff_syms.contains(sym_name) {
+            tpoff_static(sym_addr, layout) as u64
+        } else {
+            sym_addr
+        };
+        let file_off = (got_vaddr - layout.base_addr) as usize;
+        if file_off + 8 <= buf.len() {
+            buf[file_off..file_off + 8].copy_from_slice(&value.to_le_bytes());
+        }
+    }
+
+    // ── Write .shstrtab ──
+    let shstrtab_off = shstrtab_file_offset as usize;
+    buf[shstrtab_off..shstrtab_off + shstrtab.len()].copy_from_slice(&shstrtab);
+
+    // ── Section headers ──
+    let sh = shdr_offset as usize;
+    // 0: NULL (already zeroed)
+    // 1: .text
+    write_shdr(&mut buf[sh + 64..], 1, elf::SHT_PROGBITS,
+        (elf::SHF_ALLOC | elf::SHF_EXECINSTR) as u64,
+        layout.rx_start, layout.rx_start - layout.base_addr,
+        layout.rx_end - layout.rx_start, 0, 0, 16, 0);
+    // 2: .data
+    write_shdr(&mut buf[sh + 128..], 7, elf::SHT_PROGBITS,
+        (elf::SHF_ALLOC | elf::SHF_WRITE) as u64,
+        layout.rw_start, layout.rw_start - layout.base_addr,
+        layout.rw_end - layout.rw_start, 0, 0, 8, 0);
+    // 3: .shstrtab
+    write_shdr(&mut buf[sh + 192..], 13, elf::SHT_STRTAB,
+        0, 0, shstrtab_file_offset, shstrtab_size, 0, 0, 1, 0);
+
+    buf
+}
+
+fn build_static_shstrtab() -> Vec<u8> {
+    let mut tab = Vec::new();
+    tab.push(0);
+    tab.extend_from_slice(b".text\0");      // offset 1
+    tab.extend_from_slice(b".data\0");      // offset 7
+    tab.extend_from_slice(b".shstrtab\0");  // offset 13
+    tab
 }
 
 // ── Shared library output (--shared) ─────────────────────────────────────

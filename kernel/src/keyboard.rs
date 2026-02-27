@@ -10,7 +10,7 @@ pub const MOD_ALT: u8 = 4;
 pub const MOD_GUI: u8 = 8;
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct RawKeyEvent {
     pub keycode: u8,
     pub modifiers: u8,

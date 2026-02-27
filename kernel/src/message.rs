@@ -13,6 +13,7 @@ pub struct Message {
 /// Layout of the message struct as seen by userland (passed via syscall).
 /// The kernel reads/writes this format at the user-provided pointer.
 #[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct UserMessage {
     pub sender: u32,
     pub msg_type: u32,

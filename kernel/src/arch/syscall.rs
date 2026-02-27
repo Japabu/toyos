@@ -4,6 +4,7 @@ use alloc::vec::Vec;
 use super::{cpu, gdt, paging};
 use crate::drivers::acpi;
 use crate::sync::Lock;
+use crate::user_ptr::SyscallContext;
 use crate::{allocator, device, fd, keyboard, log, message, pipe, process, shared_memory, user_heap, vfs};
 
 // MSR addresses
@@ -13,58 +14,6 @@ const MSR_LSTAR: u32 = 0xC000_0082;
 const MSR_FMASK: u32 = 0xC000_0084;
 
 use toyos_abi::syscall::*;
-
-// ---------------------------------------------------------------------------
-// User pointer validation
-// ---------------------------------------------------------------------------
-
-/// Validate a user pointer range and return a shared slice, or None if invalid.
-fn user_slice(ptr: u64, len: u64) -> Option<&'static [u8]> {
-    let len = len as usize;
-    if len == 0 {
-        return Some(&[]);
-    }
-    if !paging::is_user_mapped(ptr, len as u64) {
-        return None;
-    }
-    Some(unsafe { core::slice::from_raw_parts(ptr as *const u8, len) })
-}
-
-/// Validate a user pointer range and return a mutable slice, or None if invalid.
-fn user_slice_mut(ptr: u64, len: u64) -> Option<&'static mut [u8]> {
-    let len = len as usize;
-    if len == 0 {
-        return Some(&mut []);
-    }
-    if !paging::is_user_mapped(ptr, len as u64) {
-        return None;
-    }
-    Some(unsafe { core::slice::from_raw_parts_mut(ptr as *mut u8, len) })
-}
-
-/// Validate a user pointer range and return it as a UTF-8 str, or None if invalid.
-fn user_str(ptr: u64, len: u64) -> Option<&'static str> {
-    let slice = user_slice(ptr, len)?;
-    core::str::from_utf8(slice).ok()
-}
-
-/// Validate a user pointer to a sized struct, or None if invalid.
-fn user_ref<T>(ptr: u64) -> Option<&'static T> {
-    let size = core::mem::size_of::<T>() as u64;
-    if size == 0 || !paging::is_user_mapped(ptr, size) {
-        return None;
-    }
-    Some(unsafe { &*(ptr as *const T) })
-}
-
-/// Validate a user pointer to a mutable sized struct, or None if invalid.
-fn user_mut<T>(ptr: u64) -> Option<&'static mut T> {
-    let size = core::mem::size_of::<T>() as u64;
-    if size == 0 || !paging::is_user_mapped(ptr, size) {
-        return None;
-    }
-    Some(unsafe { &mut *(ptr as *mut T) })
-}
 
 // ---------------------------------------------------------------------------
 // Heap owner routing (threads share parent's heap)
@@ -133,48 +82,105 @@ extern "C" fn syscall_handler(num: u64, a1: u64, a2: u64, _: u64, a3: u64, a4: u
 }
 
 fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
+    // SAFETY: current process's page tables remain active for the duration of this call.
+    let ctx = unsafe { SyscallContext::new() };
+
     match num {
         SYS_WRITE => {
-            let Some(buf) = user_slice(a2, a3) else { return u64::MAX };
+            let Some(buf) = ctx.user_slice(a2, a3) else { return u64::MAX };
             sys_write(a1, buf)
         }
         SYS_READ => {
-            let Some(buf) = user_slice_mut(a2, a3) else { return u64::MAX };
+            let Some(buf) = ctx.user_slice_mut(a2, a3) else { return u64::MAX };
             sys_read(a1, buf)
         }
         SYS_ALLOC => with_heap_owner(|heap| user_heap::alloc(heap, a1 as usize, a2 as usize)),
         SYS_FREE => { with_heap_owner(|heap| { user_heap::free(heap, a1 as *mut u8, a2 as usize); 0 }) }
         SYS_REALLOC => with_heap_owner(|heap| user_heap::realloc(heap, a1 as *mut u8, a2 as usize, a3 as usize, a4 as usize)),
         SYS_EXIT => sys_exit(a1 as i32),
-        SYS_RANDOM => sys_random(a1, a2),
+        SYS_RANDOM => {
+            let Some(buf) = ctx.user_slice_mut(a1, a2) else { return u64::MAX };
+            sys_random(buf)
+        }
         SYS_SCREEN_SIZE => screen_size(),
         SYS_CLOCK => crate::clock::nanos_since_boot(),
-        SYS_OPEN => sys_open(a1, a2, a3),
+        SYS_OPEN => {
+            let Some(path) = ctx.user_str(a1, a2) else { return u64::MAX };
+            sys_open(path, a3)
+        }
         SYS_CLOSE => sys_close(a1),
         SYS_SEEK => process::with_current_mut(|proc| fd::seek(&mut proc.fds, a1, a2 as i64, a3)),
         SYS_FSTAT => process::with_current_mut(|proc| fd::fstat(&mut proc.fds, a1)),
         SYS_FSYNC => process::with_current_mut(|proc| fd::fsync(&mut proc.fds, &mut *vfs::lock(), a1)),
-        SYS_READDIR => sys_readdir(a1, a2, a3, a4),
-        SYS_DELETE => sys_delete(a1, a2),
+        SYS_READDIR => {
+            let Some(path) = ctx.user_str(a1, a2) else { return u64::MAX };
+            let Some(buf) = ctx.user_slice_mut(a3, a4) else { return u64::MAX };
+            sys_readdir(path, buf)
+        }
+        SYS_DELETE => {
+            let Some(path) = ctx.user_str(a1, a2) else { return u64::MAX };
+            sys_delete(path)
+        }
         SYS_SHUTDOWN => {
             while !pipe::all_empty() {
                 process::yield_now();
             }
             acpi::shutdown();
         }
-        SYS_CHDIR => sys_chdir(a1, a2),
-        SYS_GETCWD => sys_getcwd(a1, a2),
-        SYS_SET_KEYBOARD_LAYOUT => sys_set_keyboard_layout(a1, a2),
+        SYS_CHDIR => {
+            let Some(path) = ctx.user_str(a1, a2) else { return u64::MAX };
+            sys_chdir(path)
+        }
+        SYS_GETCWD => {
+            let Some(buf) = ctx.user_slice_mut(a1, a2) else { return u64::MAX };
+            sys_getcwd(buf)
+        }
+        SYS_SET_KEYBOARD_LAYOUT => {
+            let Some(name) = ctx.user_str(a1, a2) else { return u64::MAX };
+            sys_set_keyboard_layout(name)
+        }
         SYS_PIPE => sys_pipe(),
-        SYS_SPAWN => sys_spawn(a1, a2, a3, a4),
+        SYS_SPAWN => {
+            let Some(text) = ctx.user_str(a1, a2) else { return u64::MAX };
+            let count = a4 as usize;
+            let fds = if count > 0 {
+                let Some(pairs) = ctx.user_pod_slice::<[u32; 2]>(a3, count) else { return u64::MAX };
+                process::build_child_fds(pairs)
+            } else {
+                fd::FdTable::new()
+            };
+            sys_spawn(text, fds)
+        }
         SYS_WAITPID => sys_waitpid(a1),
-        SYS_POLL => sys_poll(a1, a2, a3),
+        SYS_POLL => {
+            if a2 > 63 { return u64::MAX; }
+            let Some(fds) = ctx.user_pod_slice::<u64>(a1, a2 as usize) else { return u64::MAX };
+            sys_poll(fds, a2, a3)
+        }
         SYS_MARK_TTY => process::with_current_mut(|proc| fd::mark_tty(&mut proc.fds, a1)),
-        SYS_SEND_MSG => sys_send_msg(a1, a2),
-        SYS_RECV_MSG => sys_recv_msg(a1),
+        SYS_SEND_MSG => {
+            let Some(user_msg) = ctx.user_ref::<message::UserMessage>(a2) else { return u64::MAX };
+            let payload = if user_msg.data != 0 && user_msg.len != 0 {
+                let Some(data) = ctx.user_slice(user_msg.data, user_msg.len) else { return u64::MAX };
+                data.to_vec()
+            } else {
+                Vec::new()
+            };
+            sys_send_msg(a1, user_msg, payload)
+        }
+        SYS_RECV_MSG => {
+            let Some(out) = ctx.user_mut::<message::UserMessage>(a1) else { return u64::MAX };
+            sys_recv_msg(out)
+        }
         SYS_OPEN_DEVICE => sys_open_device(a1),
-        SYS_REGISTER_NAME => sys_register_name(a1, a2),
-        SYS_FIND_PID => sys_find_pid(a1, a2),
+        SYS_REGISTER_NAME => {
+            let Some(name) = ctx.user_str(a1, a2) else { return u64::MAX };
+            sys_register_name(name)
+        }
+        SYS_FIND_PID => {
+            let Some(name) = ctx.user_str(a1, a2) else { return u64::MAX };
+            sys_find_pid(name)
+        }
         SYS_SET_SCREEN_SIZE => { set_screen_size(a1 as u32, a2 as u32); 0 }
         SYS_GPU_PRESENT => { crate::drivers::virtio_gpu::present_rect(a1 as u32, a2 as u32, a3 as u32, a4 as u32); 0 }
         SYS_GPU_SET_CURSOR => { crate::drivers::virtio_gpu::set_cursor(a1 as u32, a2 as u32); 0 }
@@ -186,22 +192,47 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         SYS_THREAD_SPAWN => process::spawn_thread(a1, a2, a3).map_or(u64::MAX, |t| t as u64),
         SYS_THREAD_JOIN => sys_thread_join(a1),
         SYS_CLOCK_REALTIME => crate::rtc::read_time(),
-        SYS_SYSINFO => sys_sysinfo(a1, a2),
-        SYS_NET_INFO => sys_net_info(a1, a2),
+        SYS_SYSINFO => {
+            let Some(buf) = ctx.user_slice_mut(a1, a2) else { return u64::MAX };
+            sys_sysinfo(buf)
+        }
+        SYS_NET_INFO => {
+            let Some(buf) = ctx.user_slice_mut(a1, a2) else { return u64::MAX };
+            sys_net_info(buf)
+        }
         SYS_NET_SEND => {
-            let Some(buf) = user_slice(a1, a2) else { return u64::MAX };
+            let Some(buf) = ctx.user_slice(a1, a2) else { return u64::MAX };
             crate::net::send(buf);
             0
         }
-        SYS_NET_RECV => sys_net_recv(a1, a2, a3),
+        SYS_NET_RECV => {
+            let Some(buf) = ctx.user_slice_mut(a1, a2) else { return u64::MAX };
+            sys_net_recv(buf, a3)
+        }
         SYS_NANOSLEEP => sys_nanosleep(a1),
         SYS_DUP => sys_dup(a1),
         SYS_GETPID => crate::arch::percpu::current_pid() as u64,
-        SYS_RENAME => sys_rename(a1, a2, a3, a4),
-        SYS_MKDIR => sys_mkdir(a1, a2),
-        SYS_RMDIR => sys_rmdir(a1, a2),
-        SYS_DLOPEN => sys_dlopen(a1, a2),
-        SYS_DLSYM => sys_dlsym(a1, a2, a3),
+        SYS_RENAME => {
+            let Some(old) = ctx.user_str(a1, a2) else { return u64::MAX };
+            let Some(new) = ctx.user_str(a3, a4) else { return u64::MAX };
+            sys_rename(old, new)
+        }
+        SYS_MKDIR => {
+            let Some(path) = ctx.user_str(a1, a2) else { return u64::MAX };
+            sys_mkdir(path)
+        }
+        SYS_RMDIR => {
+            let Some(path) = ctx.user_str(a1, a2) else { return u64::MAX };
+            sys_rmdir(path)
+        }
+        SYS_DLOPEN => {
+            let Some(path) = ctx.user_str(a1, a2) else { return u64::MAX };
+            sys_dlopen(path)
+        }
+        SYS_DLSYM => {
+            let Some(name) = ctx.user_str(a2, a3) else { return u64::MAX };
+            sys_dlsym(a1, name)
+        }
         SYS_DLCLOSE => 0,
         _ => u64::MAX,
     }
@@ -270,8 +301,7 @@ fn sys_read(fd_num: u64, buf: &mut [u8]) -> u64 {
     }
 }
 
-fn sys_open(path_ptr: u64, path_len: u64, flags: u64) -> u64 {
-    let Some(path) = user_str(path_ptr, path_len) else { return u64::MAX };
+fn sys_open(path: &str, flags: u64) -> u64 {
     let cwd = process::with_current(|p| p.cwd.clone());
     let resolved = vfs::lock().resolve_absolute(&cwd, path);
     process::with_current_mut(|proc| fd::open(&mut proc.fds, &mut *vfs::lock(), &resolved, flags))
@@ -301,8 +331,7 @@ fn sys_exit(code: i32) -> u64 {
     process::exit(code);
 }
 
-fn sys_random(buf_ptr: u64, len: u64) -> u64 {
-    let Some(buf) = user_slice_mut(buf_ptr, len) else { return u64::MAX };
+fn sys_random(buf: &mut [u8]) -> u64 {
     let mut i = 0;
     while i + 8 <= buf.len() {
         buf[i..i + 8].copy_from_slice(&cpu::rdrand().to_ne_bytes());
@@ -316,10 +345,7 @@ fn sys_random(buf_ptr: u64, len: u64) -> u64 {
     0
 }
 
-fn sys_readdir(path_ptr: u64, path_len: u64, buf_ptr: u64, buf_len: u64) -> u64 {
-    let Some(path) = user_str(path_ptr, path_len) else { return u64::MAX };
-    let Some(buf) = user_slice_mut(buf_ptr, buf_len) else { return u64::MAX };
-
+fn sys_readdir(path: &str, buf: &mut [u8]) -> u64 {
     let cwd = process::with_current(|p| p.cwd.clone());
     let entries = match vfs::lock().list(&cwd, path) {
         Ok(e) => e,
@@ -346,16 +372,14 @@ fn sys_readdir(path_ptr: u64, path_len: u64, buf_ptr: u64, buf_len: u64) -> u64 
     pos as u64
 }
 
-fn sys_delete(path_ptr: u64, path_len: u64) -> u64 {
-    let Some(path) = user_str(path_ptr, path_len) else { return u64::MAX };
+fn sys_delete(path: &str) -> u64 {
     let cwd = process::with_current(|p| p.cwd.clone());
     let mut vfs = vfs::lock();
     let resolved = vfs.resolve_absolute(&cwd, path);
     if vfs.delete(&resolved) { 0 } else { u64::MAX }
 }
 
-fn sys_chdir(path_ptr: u64, path_len: u64) -> u64 {
-    let Some(path) = user_str(path_ptr, path_len) else { return u64::MAX };
+fn sys_chdir(path: &str) -> u64 {
     let cwd = process::with_current(|p| p.cwd.clone());
     match vfs::lock().cd(&cwd, path) {
         Some(new_cwd) => {
@@ -366,8 +390,7 @@ fn sys_chdir(path_ptr: u64, path_len: u64) -> u64 {
     }
 }
 
-fn sys_getcwd(buf_ptr: u64, buf_len: u64) -> u64 {
-    let Some(buf) = user_slice_mut(buf_ptr, buf_len) else { return u64::MAX };
+fn sys_getcwd(buf: &mut [u8]) -> u64 {
     process::with_current(|proc| {
         let cwd = &proc.cwd;
         let len = cwd.len().min(buf.len());
@@ -376,8 +399,7 @@ fn sys_getcwd(buf_ptr: u64, buf_len: u64) -> u64 {
     })
 }
 
-fn sys_set_keyboard_layout(name_ptr: u64, name_len: u64) -> u64 {
-    let Some(name) = user_str(name_ptr, name_len) else { return u64::MAX };
+fn sys_set_keyboard_layout(name: &str) -> u64 {
     if keyboard::set_layout(name) {
         if !vfs::lock().write_file("/nvme/config/keyboard_layout", name.as_bytes()) {
             log!("warning: failed to persist keyboard layout");
@@ -397,17 +419,8 @@ fn sys_pipe() -> u64 {
     })
 }
 
-fn sys_spawn(argv_ptr: u64, argv_len: u64, fd_map_ptr: u64, fd_map_count: u64) -> u64 {
-    let Some(text) = user_str(argv_ptr, argv_len) else { return u64::MAX };
+fn sys_spawn(text: &str, fds: fd::FdTable) -> u64 {
     let args: Vec<&str> = text.split('\0').filter(|s| !s.is_empty()).collect();
-    let count = fd_map_count as usize;
-    let fds = if count > 0 {
-        let Some(bytes) = user_slice(fd_map_ptr, (count * 8) as u64) else { return u64::MAX };
-        let pairs = unsafe { core::slice::from_raw_parts(bytes.as_ptr() as *const [u32; 2], count) };
-        process::build_child_fds(pairs)
-    } else {
-        fd::FdTable::new()
-    };
     process::spawn(&args, fds, Some(crate::arch::percpu::current_pid())).map_or(u64::MAX, |p| p as u64)
 }
 
@@ -421,12 +434,7 @@ fn sys_waitpid(pid: u64) -> u64 {
     }
 }
 
-fn sys_poll(fds_ptr: u64, fds_len: u64, timeout_nanos: u64) -> u64 {
-    let byte_len = fds_len.checked_mul(8).unwrap_or(u64::MAX);
-    if !paging::is_user_mapped(fds_ptr, byte_len) {
-        return u64::MAX;
-    }
-    let fds = unsafe { core::slice::from_raw_parts(fds_ptr as *const u64, fds_len as usize) };
+fn sys_poll(fds: &[u64], fds_len: u64, timeout_nanos: u64) -> u64 {
     let deadline = if timeout_nanos > 0 {
         crate::clock::nanos_since_boot() + timeout_nanos
     } else {
@@ -459,28 +467,16 @@ fn sys_poll(fds_ptr: u64, fds_len: u64, timeout_nanos: u64) -> u64 {
     }
 }
 
-fn sys_send_msg(target_pid: u64, msg_ptr: u64) -> u64 {
-    let Some(user_msg) = user_ref::<message::UserMessage>(msg_ptr) else { return u64::MAX };
-    let sender = process::current_pid();
-
-    // Copy payload from sender's address space into kernel
-    let payload = if user_msg.data != 0 && user_msg.len != 0 {
-        let Some(data) = user_slice(user_msg.data, user_msg.len) else { return u64::MAX };
-        data.to_vec()
-    } else {
-        Vec::new()
-    };
-
+fn sys_send_msg(target_pid: u64, user_msg: &message::UserMessage, payload: Vec<u8>) -> u64 {
     let msg = message::Message {
-        sender,
+        sender: process::current_pid(),
         msg_type: user_msg.msg_type,
         payload,
     };
     if process::send_message(target_pid as u32, msg) { 0 } else { u64::MAX }
 }
 
-fn sys_recv_msg(msg_ptr: u64) -> u64 {
-    let Some(out) = user_mut::<message::UserMessage>(msg_ptr) else { return u64::MAX };
+fn sys_recv_msg(out: &mut message::UserMessage) -> u64 {
     loop {
         let msg = process::with_current_mut(|proc| proc.messages.pop());
         if let Some(msg) = msg {
@@ -537,14 +533,12 @@ fn sys_open_device(device_type: u64) -> u64 {
     process::with_current_mut(|proc| fd::alloc(&mut proc.fds, desc))
 }
 
-fn sys_register_name(name_ptr: u64, name_len: u64) -> u64 {
-    let Some(name) = user_str(name_ptr, name_len) else { return u64::MAX };
+fn sys_register_name(name: &str) -> u64 {
     let pid = process::current_pid();
     if process::register_name(name, pid) { 0 } else { u64::MAX }
 }
 
-fn sys_find_pid(name_ptr: u64, name_len: u64) -> u64 {
-    let Some(name) = user_str(name_ptr, name_len) else { return u64::MAX };
+fn sys_find_pid(name: &str) -> u64 {
     match process::find_pid(name) {
         Some(pid) => pid as u64,
         None => u64::MAX,
@@ -588,9 +582,7 @@ fn sys_thread_join(tid: u64) -> u64 {
     }
 }
 
-fn sys_sysinfo(buf_ptr: u64, buf_len: u64) -> u64 {
-    let Some(buf) = user_slice_mut(buf_ptr, buf_len) else { return u64::MAX };
-
+fn sys_sysinfo(buf: &mut [u8]) -> u64 {
     const HEADER_SIZE: usize = 48;
     const ENTRY_SIZE: usize = 48;
     if buf.len() < HEADER_SIZE {
@@ -654,16 +646,14 @@ fn sys_sysinfo(buf_ptr: u64, buf_len: u64) -> u64 {
     pos as u64
 }
 
-fn sys_net_info(buf_ptr: u64, buf_len: u64) -> u64 {
-    let Some(buf) = user_slice_mut(buf_ptr, buf_len) else { return u64::MAX };
+fn sys_net_info(buf: &mut [u8]) -> u64 {
     let Some(mac) = crate::net::mac() else { return u64::MAX };
     if buf.len() < 6 { return u64::MAX; }
     buf[..6].copy_from_slice(&mac);
     0
 }
 
-fn sys_net_recv(buf_ptr: u64, buf_len: u64, timeout_nanos: u64) -> u64 {
-    let Some(buf) = user_slice_mut(buf_ptr, buf_len) else { return u64::MAX };
+fn sys_net_recv(buf: &mut [u8], timeout_nanos: u64) -> u64 {
     let deadline = if timeout_nanos > 0 {
         crate::clock::nanos_since_boot() + timeout_nanos
     } else {
@@ -696,9 +686,7 @@ fn sys_dup(fd_num: u64) -> u64 {
     })
 }
 
-fn sys_rename(old_ptr: u64, old_len: u64, new_ptr: u64, new_len: u64) -> u64 {
-    let Some(old) = user_str(old_ptr, old_len) else { return u64::MAX };
-    let Some(new) = user_str(new_ptr, new_len) else { return u64::MAX };
+fn sys_rename(old: &str, new: &str) -> u64 {
     let cwd = process::with_current(|p| p.cwd.clone());
     let mut vfs = vfs::lock();
     let old_abs = vfs.resolve_absolute(&cwd, old);
@@ -706,8 +694,7 @@ fn sys_rename(old_ptr: u64, old_len: u64, new_ptr: u64, new_len: u64) -> u64 {
     if vfs.rename(&old_abs, &new_abs) { 0 } else { u64::MAX }
 }
 
-fn sys_mkdir(path_ptr: u64, path_len: u64) -> u64 {
-    let Some(path) = user_str(path_ptr, path_len) else { return u64::MAX };
+fn sys_mkdir(path: &str) -> u64 {
     let cwd = process::with_current(|p| p.cwd.clone());
     let mut vfs = vfs::lock();
     let resolved = vfs.resolve_absolute(&cwd, path);
@@ -715,8 +702,7 @@ fn sys_mkdir(path_ptr: u64, path_len: u64) -> u64 {
     0
 }
 
-fn sys_rmdir(path_ptr: u64, path_len: u64) -> u64 {
-    let Some(path) = user_str(path_ptr, path_len) else { return u64::MAX };
+fn sys_rmdir(path: &str) -> u64 {
     let cwd = process::with_current(|p| p.cwd.clone());
     let mut vfs = vfs::lock();
     let resolved = vfs.resolve_absolute(&cwd, path);
@@ -724,8 +710,7 @@ fn sys_rmdir(path_ptr: u64, path_len: u64) -> u64 {
     0
 }
 
-fn sys_dlopen(path_ptr: u64, path_len: u64) -> u64 {
-    let Some(path) = user_str(path_ptr, path_len) else { return u64::MAX };
+fn sys_dlopen(path: &str) -> u64 {
     let cwd = process::with_current(|p| p.cwd.clone());
     let resolved = vfs::lock().resolve_absolute(&cwd, path);
 
@@ -758,8 +743,7 @@ fn sys_dlopen(path_ptr: u64, path_len: u64) -> u64 {
     handle
 }
 
-fn sys_dlsym(handle: u64, name_ptr: u64, name_len: u64) -> u64 {
-    let Some(name) = user_str(name_ptr, name_len) else { return u64::MAX };
+fn sys_dlsym(handle: u64, name: &str) -> u64 {
     process::with_current(|proc| {
         let idx = handle as usize;
         if idx >= proc.loaded_libs.len() {

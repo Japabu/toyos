@@ -28,6 +28,7 @@ pub mod device;
 pub mod net;
 pub mod user_heap;
 pub mod shared_memory;
+pub mod user_ptr;
 
 #[repr(C)]
 #[derive(Debug)]
