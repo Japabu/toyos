@@ -1,8 +1,6 @@
 use crate::as_filename::AsFilename;
 use crate::as_symbol_name::AsSymbolName;
 use crate::util::ensure_compatible_types;
-use core::ffi::CStr;
-use core::ptr::null;
 use core::{fmt, marker, mem, ptr};
 
 // ToyOS doesn't use these flags (the kernel ignores them), but libloading's
@@ -12,18 +10,39 @@ pub const RTLD_NOW: core::ffi::c_int = 2;
 pub const RTLD_GLOBAL: core::ffi::c_int = 0x100;
 pub const RTLD_LOCAL: core::ffi::c_int = 0;
 
-fn with_dlerror<T, F, Error>(closure: F, error: fn(&CStr) -> Error) -> Result<T, Option<Error>>
-where
-    F: FnOnce() -> Option<T>,
-{
-    closure().ok_or_else(|| unsafe {
-        let dlerror_str = dlerror();
-        if dlerror_str.is_null() {
-            None
-        } else {
-            Some(error(CStr::from_ptr(dlerror_str)))
-        }
-    })
+unsafe fn cstr_len(s: *const core::ffi::c_char) -> usize {
+    let mut len = 0;
+    while unsafe { *s.add(len) } != 0 {
+        len += 1;
+    }
+    len
+}
+
+fn toyos_dlopen(path: *const core::ffi::c_char) -> *mut core::ffi::c_void {
+    let len = unsafe { cstr_len(path) };
+    let handle = toyos_abi::syscall::dl_open(path as *const u8, len);
+    if handle == u64::MAX {
+        core::ptr::null_mut()
+    } else {
+        // Encode handle as a non-null pointer (add 1 so handle 0 is valid)
+        core::ptr::without_provenance_mut((handle + 1) as usize)
+    }
+}
+
+fn toyos_dlsym(handle: *mut core::ffi::c_void, name: *const core::ffi::c_char) -> *mut core::ffi::c_void {
+    let h = handle as u64 - 1; // Decode handle (undo the +1 from dlopen)
+    let len = unsafe { cstr_len(name) };
+    let addr = toyos_abi::syscall::dl_sym(h, name as *const u8, len);
+    if addr == u64::MAX {
+        core::ptr::null_mut()
+    } else {
+        core::ptr::with_exposed_provenance_mut(addr as usize)
+    }
+}
+
+fn toyos_dlclose(handle: *mut core::ffi::c_void) {
+    let h = handle as u64 - 1;
+    toyos_abi::syscall::dl_close(h);
 }
 
 /// A loaded dynamic library.
@@ -42,42 +61,27 @@ impl Library {
 
     #[inline]
     pub fn this() -> Library {
-        unsafe {
-            Library::open_char_ptr(null(), RTLD_LAZY | RTLD_LOCAL).expect("this should never fail")
-        }
+        panic!("Library::this() is not supported on ToyOS")
     }
 
     pub unsafe fn open<P>(
         filename: Option<P>,
-        flags: core::ffi::c_int,
+        _flags: core::ffi::c_int,
     ) -> Result<Library, crate::Error>
     where
         P: AsFilename,
     {
         let Some(filename) = filename else {
-            return Self::open_char_ptr(null(), flags);
+            return Err(crate::Error::DlOpenUnknown);
         };
-        filename.toyos_filename(|filename| Library::open_char_ptr(filename, flags))
-    }
-
-    unsafe fn open_char_ptr(
-        filename: *const core::ffi::c_char,
-        flags: core::ffi::c_int,
-    ) -> Result<Library, crate::Error> {
-        with_dlerror(
-            move || {
-                let result = dlopen(filename, flags);
-                if result.is_null() {
-                    None
-                } else {
-                    Some(Library { handle: result })
-                }
-            },
-            |desc| crate::Error::DlOpen {
-                source: desc.into(),
-            },
-        )
-        .map_err(|e| e.unwrap_or(crate::Error::DlOpenUnknown))
+        filename.toyos_filename(|cstr| {
+            let handle = toyos_dlopen(cstr);
+            if handle.is_null() {
+                Err(crate::Error::DlOpenUnknown)
+            } else {
+                Ok(Library { handle })
+            }
+        })
     }
 
     unsafe fn get_impl<T, F>(
@@ -89,35 +93,21 @@ impl Library {
         F: FnOnce() -> Result<Symbol<T>, crate::Error>,
     {
         ensure_compatible_types::<T, *mut core::ffi::c_void>()?;
-        symbol.symbol_name(|posix_symbol| {
-            let result = with_dlerror(
-                || {
-                    dlerror();
-                    let symbol = dlsym(self.handle, posix_symbol);
-                    if symbol.is_null() {
-                        None
-                    } else {
-                        Some(Symbol {
-                            pointer: symbol,
-                            pd: marker::PhantomData,
-                        })
-                    }
-                },
-                |desc| crate::Error::DlSym {
-                    source: desc.into(),
-                },
-            );
-            match result {
-                Err(None) => on_null(),
-                Err(Some(e)) => Err(e),
-                Ok(x) => Ok(x),
+        symbol.symbol_name(|cstr| {
+            let pointer = toyos_dlsym(self.handle, cstr);
+            if pointer.is_null() {
+                on_null()
+            } else {
+                Ok(Symbol {
+                    pointer,
+                    pd: marker::PhantomData,
+                })
             }
         })
     }
 
     #[inline(always)]
     pub unsafe fn get<T>(&self, symbol: impl AsSymbolName) -> Result<Symbol<T>, crate::Error> {
-        // ToyOS dlerror is trivially MT-safe (always returns null)
         self.get_singlethreaded(symbol)
     }
 
@@ -145,29 +135,15 @@ impl Library {
     }
 
     pub fn close(self) -> Result<(), crate::Error> {
-        let result = with_dlerror(
-            || {
-                if unsafe { dlclose(self.handle) } == 0 {
-                    Some(())
-                } else {
-                    None
-                }
-            },
-            |desc| crate::Error::DlClose {
-                source: desc.into(),
-            },
-        )
-        .map_err(|e| e.unwrap_or(crate::Error::DlCloseUnknown));
+        toyos_dlclose(self.handle);
         mem::forget(self);
-        result
+        Ok(())
     }
 }
 
 impl Drop for Library {
     fn drop(&mut self) {
-        unsafe {
-            dlclose(self.handle);
-        }
+        toyos_dlclose(self.handle);
     }
 }
 
@@ -226,18 +202,4 @@ impl<T> fmt::Debug for Symbol<T> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.write_fmt(format_args!("Symbol@{:p}", self.pointer))
     }
-}
-
-// Symbols provided by ToyOS std (sys/pal/toyos/dl.rs)
-extern "C" {
-    fn dlopen(
-        filename: *const core::ffi::c_char,
-        flags: core::ffi::c_int,
-    ) -> *mut core::ffi::c_void;
-    fn dlclose(handle: *mut core::ffi::c_void) -> core::ffi::c_int;
-    fn dlsym(
-        handle: *mut core::ffi::c_void,
-        symbol: *const core::ffi::c_char,
-    ) -> *mut core::ffi::c_void;
-    fn dlerror() -> *mut core::ffi::c_char;
 }

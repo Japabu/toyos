@@ -31,6 +31,9 @@ features = ["Win32_Foundation"]
 [target.'cfg(unix)'.dependencies.cfg-if]
 version = "1"
 
+[target.'cfg(target_os = "toyos")'.dependencies.toyos-abi]
+path = "../../rust/library/toyos-abi"
+
 [dev-dependencies]
 libc = "0.2"
 static_assertions = "1.1"
