@@ -12,7 +12,7 @@ use tyfs::Disk;
 
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
-    log!("PANIC: {}", info);
+    log!("KERNEL PANIC: {}", info);
     loop {}
 }
 

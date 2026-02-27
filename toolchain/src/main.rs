@@ -4,7 +4,8 @@ use std::process::Command;
 
 fn main() {
     let toolchain_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let rust_dir = toolchain_dir.parent().unwrap().join("rust");
+    let root_dir = toolchain_dir.parent().unwrap();
+    let rust_dir = root_dir.join("rust");
 
     assert!(
         rust_dir.join("compiler").exists(),
@@ -14,25 +15,34 @@ fn main() {
 
     let host = host_triple();
 
-    // Step 1: Write config.toml
-    write_config(&rust_dir, &host);
+    // Step 1: Build toyos-ld for the host (used as cross-linker)
+    println!("Building toyos-ld for host...");
+    let toyos_ld = build_toyos_ld(root_dir);
+    println!("  Built: {}", toyos_ld.display());
 
-    // Step 2: Build
+    // Step 2: Write bootstrap.toml
+    write_config(&rust_dir, &host, &toyos_ld);
+
+    // Step 3: Build full toolchain via bootstrap
+    //
+    // ToyOS is listed as both host and target, so bootstrap builds the complete
+    // compiler (rustc + cranelift codegen backend) for ToyOS, plus std for both
+    // host and ToyOS targets.
     println!("Building toolchain (this takes a while on first run)...");
     let x = if rust_dir.join("x").exists() { "./x" } else { "./x.py" };
     let status = Command::new(x)
-        .args(["build", "--stage", "2"])
+        .args(["build", "--stage", "2", "--warnings", "warn"])
         .env("BOOTSTRAP_SKIP_TARGET_SANITY", "1")
         .current_dir(&rust_dir)
         .status()
         .expect("Failed to run x build");
     assert!(status.success(), "Toolchain build failed");
 
-    // Step 3: Link the toolchain
+    // Step 4: Link the toolchain so cargo can use it
     let stage2 = find_stage2(&rust_dir);
     run("rustup", &["toolchain", "link", "toyos", stage2.to_str().unwrap()]);
 
-    // Step 4: Write stamp so bootable/build.rs knows to rebuild userland
+    // Step 5: Write stamp so bootable/build.rs knows to rebuild userland
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -48,18 +58,22 @@ fn main() {
 // Config
 // ---------------------------------------------------------------------------
 
-fn write_config(rust_dir: &Path, host: &str) {
+fn write_config(rust_dir: &Path, host: &str, toyos_ld: &Path) {
+    let linker = toyos_ld.display();
     let config = format!(
         r#"change-id = "ignore"
 profile = "compiler"
 
 [build]
-host = ["{host}"]
+host = ["{host}", "x86_64-unknown-toyos"]
 target = ["{host}", "x86_64-unknown-toyos"]
 
 [rust]
 incremental = true
-lld = true
+
+[target.x86_64-unknown-toyos]
+linker = "{linker}"
+codegen-backends = ["cranelift"]
 "#
     );
     fs::write(rust_dir.join("bootstrap.toml"), config).unwrap();
@@ -69,6 +83,18 @@ lld = true
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+fn build_toyos_ld(root_dir: &Path) -> PathBuf {
+    let toyos_ld_dir = root_dir.join("userland/toyos-ld");
+    let host = host_triple();
+    let status = Command::new("cargo")
+        .args(["build", "--release", "--target", &host])
+        .current_dir(&toyos_ld_dir)
+        .status()
+        .expect("Failed to build toyos-ld");
+    assert!(status.success(), "toyos-ld build failed");
+    toyos_ld_dir.join(format!("target/{host}/release/toyos-ld"))
+}
 
 fn find_stage2(rust_dir: &Path) -> PathBuf {
     let build_dir = rust_dir.join("build");

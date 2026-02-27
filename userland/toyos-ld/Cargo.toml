@@ -1,0 +1,10 @@
+[package]
+name = "toyos-ld"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+object = { version = "0.38", default-features = false, features = ["read", "elf", "std"] }
+
+[dev-dependencies]
+object = { version = "0.38", default-features = false, features = ["read", "write", "elf", "std"] }

@@ -4,7 +4,7 @@ use alloc::vec::Vec;
 use crate::disk::Disk;
 
 const MAGIC: [u8; 4] = *b"TYFS";
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 const HEADER_SIZE: u64 = 64;
 const ENTRY_SIZE: u64 = 64;
 
@@ -17,11 +17,12 @@ const ENTRY_SIZE: u64 = 64;
 //   [32..64] reserved
 
 // ToC entry layout (64 bytes each, growing downward from end):
-//   [0]      type (0=free, 1=file, 2=symlink)
-//   [1..32]  name (null-terminated)
-//   [32..40] offset (byte offset of file data)
-//   [40..48] size (file size in bytes)
-//   [48..64] reserved
+//   [0]       type (0=free, 1=file, 2=symlink)
+//   [8..16]   name_offset (byte offset of name in data section)
+//   [16..24]  name_len
+//   [24..32]  data_offset (byte offset of file/symlink data)
+//   [32..40]  data_len
+//   [40..64]  reserved
 
 pub struct SimpleFs<D: Disk> {
     disk: D,
@@ -94,16 +95,20 @@ impl<D: Disk> SimpleFs<D> {
         buf
     }
 
+    fn entry_name(&mut self, entry: &[u8; ENTRY_SIZE as usize]) -> String {
+        let name_offset = u64::from_le_bytes(entry[8..16].try_into().unwrap());
+        let name_len = u64::from_le_bytes(entry[16..24].try_into().unwrap());
+        let mut buf = alloc::vec![0u8; name_len as usize];
+        self.disk.read(name_offset, &mut buf);
+        String::from_utf8(buf).unwrap_or_default()
+    }
+
     fn find_entry(&mut self, name: &str) -> Option<u64> {
-        let name_bytes = name.as_bytes();
         let mut offset = self.toc_start;
         while offset + ENTRY_SIZE <= self.disk_size {
             let entry = self.read_entry(offset);
-            if entry[0] != 0 {
-                let end = entry[1..32].iter().position(|&b| b == 0).unwrap_or(31);
-                if &entry[1..1 + end] == name_bytes {
-                    return Some(offset);
-                }
+            if entry[0] != 0 && self.entry_name(&entry) == name {
+                return Some(offset);
             }
             offset += ENTRY_SIZE;
         }
@@ -124,37 +129,38 @@ impl<D: Disk> SimpleFs<D> {
         if entry[0] != 2 {
             return None;
         }
-        let offset = u64::from_le_bytes(entry[32..40].try_into().unwrap());
-        let size = u64::from_le_bytes(entry[40..48].try_into().unwrap());
-        let mut buf = alloc::vec![0u8; size as usize];
-        self.disk.read(offset, &mut buf);
+        let data_offset = u64::from_le_bytes(entry[24..32].try_into().unwrap());
+        let data_len = u64::from_le_bytes(entry[32..40].try_into().unwrap());
+        let mut buf = alloc::vec![0u8; data_len as usize];
+        self.disk.read(data_offset, &mut buf);
         Some(String::from(core::str::from_utf8(&buf).ok()?))
     }
 
     fn create_entry(&mut self, name: &str, entry_type: u8, data: &[u8]) -> bool {
         let name_bytes = name.as_bytes();
-        if name_bytes.len() > 30 {
-            return false;
-        }
-
-        let needed = data.len() as u64 + ENTRY_SIZE;
+        let total_data = name_bytes.len() as u64 + data.len() as u64;
+        let needed = total_data + ENTRY_SIZE;
         if self.data_end + needed > self.toc_start {
             return false;
         }
 
-        let file_offset = self.data_end;
-        self.disk.write(file_offset, data);
+        // Write name then data into the data section
+        let name_offset = self.data_end;
+        self.disk.write(name_offset, name_bytes);
+        let data_offset = name_offset + name_bytes.len() as u64;
+        self.disk.write(data_offset, data);
 
+        // Write TOC entry
         let new_toc = self.toc_start - ENTRY_SIZE;
         let mut entry = [0u8; ENTRY_SIZE as usize];
         entry[0] = entry_type;
-        entry[1..1 + name_bytes.len()].copy_from_slice(name_bytes);
-        entry[32..40].copy_from_slice(&file_offset.to_le_bytes());
-        entry[40..48].copy_from_slice(&(data.len() as u64).to_le_bytes());
-
+        entry[8..16].copy_from_slice(&name_offset.to_le_bytes());
+        entry[16..24].copy_from_slice(&(name_bytes.len() as u64).to_le_bytes());
+        entry[24..32].copy_from_slice(&data_offset.to_le_bytes());
+        entry[32..40].copy_from_slice(&(data.len() as u64).to_le_bytes());
         self.disk.write(new_toc, &entry);
 
-        self.data_end += data.len() as u64;
+        self.data_end += total_data;
         self.toc_start = new_toc;
         self.write_header();
         true
@@ -163,11 +169,11 @@ impl<D: Disk> SimpleFs<D> {
     pub fn read_file(&mut self, name: &str) -> Option<Vec<u8>> {
         let entry_offset = self.find_entry(name)?;
         let entry = self.read_entry(entry_offset);
-        let offset = u64::from_le_bytes(entry[32..40].try_into().unwrap());
-        let size = u64::from_le_bytes(entry[40..48].try_into().unwrap());
+        let data_offset = u64::from_le_bytes(entry[24..32].try_into().unwrap());
+        let data_len = u64::from_le_bytes(entry[32..40].try_into().unwrap());
 
-        let mut buf = alloc::vec![0u8; size as usize];
-        self.disk.read(offset, &mut buf);
+        let mut buf = alloc::vec![0u8; data_len as usize];
+        self.disk.read(data_offset, &mut buf);
         Some(buf)
     }
 
@@ -187,12 +193,9 @@ impl<D: Disk> SimpleFs<D> {
         while offset + ENTRY_SIZE <= self.disk_size {
             let entry = self.read_entry(offset);
             if entry[0] != 0 {
-                let end = entry[1..32].iter().position(|&b| b == 0).unwrap_or(31);
-                let name = core::str::from_utf8(&entry[1..1 + end])
-                    .unwrap_or("")
-                    .into();
-                let size = u64::from_le_bytes(entry[40..48].try_into().unwrap());
-                result.push((name, size));
+                let name = self.entry_name(&entry);
+                let data_len = u64::from_le_bytes(entry[32..40].try_into().unwrap());
+                result.push((name, data_len));
             }
             offset += ENTRY_SIZE;
         }
@@ -253,6 +256,19 @@ mod tests {
     }
 
     #[test]
+    fn long_filename() {
+        let mut fs = make_fs();
+        let long_name = "librustc_codegen_cranelift-1.95.0-dev.so";
+        assert!(fs.create(long_name, b"elf data here"));
+        let data = fs.read_file(long_name);
+        assert_eq!(data.as_deref(), Some(b"elf data here".as_slice()));
+
+        let files = fs.list();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].0, long_name);
+    }
+
+    #[test]
     fn multiple_files_and_list() {
         let mut fs = make_fs();
         assert!(fs.create("a.txt", b"aaa"));
@@ -287,7 +303,7 @@ mod tests {
         let size = 512;
         let mut fs = SimpleFs::format(MemDisk::new(size), size as u64);
 
-        assert!(fs.create("big.txt", &[0xAA; 384]));
+        assert!(fs.create("big.txt", &[0xAA; 320]));
         assert!(!fs.create("nope.txt", b"x"));
     }
 

@@ -6,6 +6,7 @@ use std::path::Path;
 use std::process::Command;
 
 fn build(debug: bool) {
+    let toyos_ld = find_toyos_ld();
     let rustflags = match std::env::var("RUSTFLAGS") {
         Ok(flags) => format!("{flags} -Dwarnings"),
         Err(_) => "-Dwarnings".to_string(),
@@ -56,17 +57,18 @@ fn build(debug: bool) {
         let name = entry.file_name();
         let name = name.to_str().unwrap();
         if toolchain_changed {
-            eprintln!("toolchain changed: cleaning userland/{name}");
-            Command::new("cargo")
-                .args(&["clean"])
-                .current_dir(&path)
-                .status()
-                .ok();
+            // Only clean the ToyOS target, not host builds (e.g. toyos-ld host binary)
+            let toyos_target_dir = path.join("target/x86_64-unknown-toyos");
+            if toyos_target_dir.exists() {
+                eprintln!("toolchain changed: cleaning userland/{name}");
+                fs::remove_dir_all(&toyos_target_dir).ok();
+            }
         }
         if !Command::new("cargo")
             .args(&["build", "--target", "x86_64-unknown-toyos"])
             .env("RUSTUP_TOOLCHAIN", "toyos")
             .env("RUSTFLAGS", &rustflags)
+            .env("CARGO_TARGET_X86_64_UNKNOWN_TOYOS_LINKER", toyos_ld.to_str().unwrap())
             .env_remove("RUSTC")
             .current_dir(&path)
             .status()
@@ -81,6 +83,35 @@ fn build(debug: bool) {
     }
     if !sysroot_stamp.is_empty() {
         fs::write(last_stamp_path, &sysroot_stamp).ok();
+    }
+
+    // Add rustc compiler from bootstrap sysroot
+    let sysroot = Path::new("../rust/build/x86_64-unknown-toyos/stage2");
+    if sysroot.exists() {
+        // rustc binary
+        let rustc = sysroot.join("bin/rustc");
+        if rustc.exists() {
+            initrd_files.push(("rustc".to_string(), fs::read(&rustc).unwrap()));
+        }
+        // Shared libraries (rustc_driver, proc macros, etc.)
+        for entry in fs::read_dir(sysroot.join("lib")).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|e| e == "so") {
+                let name = path.file_name().unwrap().to_str().unwrap().to_string();
+                initrd_files.push((name, fs::read(&path).unwrap()));
+            }
+        }
+        // Codegen backends
+        let backends = sysroot.join("lib/rustlib/x86_64-unknown-toyos/codegen-backends");
+        if backends.exists() {
+            for entry in fs::read_dir(&backends).unwrap() {
+                let path = entry.unwrap().path();
+                if path.extension().is_some_and(|e| e == "so") {
+                    let name = path.file_name().unwrap().to_str().unwrap().to_string();
+                    initrd_files.push((name, fs::read(&path).unwrap()));
+                }
+            }
+        }
     }
 
     initrd_files.extend(assets::collect());
@@ -163,4 +194,16 @@ fn main() {
     }
 
     qemu.status().expect("failed to execute process");
+}
+
+fn find_toyos_ld() -> std::path::PathBuf {
+    let toyos_ld_dir = std::path::Path::new("../userland/toyos-ld");
+    for entry in fs::read_dir(toyos_ld_dir.join("target")).expect("toyos-ld not built") {
+        let path = entry.unwrap().path();
+        let candidate = path.join("release/toyos-ld");
+        if candidate.exists() {
+            return candidate.canonicalize().unwrap();
+        }
+    }
+    panic!("toyos-ld binary not found. Run: cd toolchain && cargo run");
 }

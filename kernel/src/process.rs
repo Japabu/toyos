@@ -93,6 +93,8 @@ pub struct Process {
     pub symbols: ProcessSymbols,
     // Process name (filename from argv[0], null-terminated)
     pub name: [u8; 28],
+    // Dynamically loaded shared libraries (indexed by dlopen handle)
+    pub loaded_libs: Vec<elf::LoadedLib>,
 }
 
 pub struct ProcessTable {
@@ -301,6 +303,7 @@ pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64) -> u64 {
         tls_block_layout,
         symbols: ProcessSymbols::empty(),
         name: [0; 28],
+        loaded_libs: Vec::new(),
     });
     table.procs.get_mut(tid).unwrap().pid = tid;
 
@@ -347,12 +350,23 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<u32>) -> u64 {
         }
     };
 
+    // Load DT_NEEDED shared libraries and apply GLOB_DAT relocations
+    let loaded_libs = elf::resolve_dynamic_deps(&binary, loaded.base, path, |lib_path| {
+        vfs::lock().read_file(lib_path)
+    });
+
     let child_pml4 = paging::create_user_pml4();
     let child_cr3 = child_pml4 as u64;
 
     let elf_alloc_size = ((loaded.load_size + PAGE_2M as usize - 1) & !(PAGE_2M as usize - 1)) as u64;
     let elf_layout = Layout::from_size_align(elf_alloc_size as usize, PAGE_2M as usize).unwrap();
     paging::map_user_in(child_pml4, loaded.base_ptr as u64, elf_alloc_size);
+
+    // Map loaded shared libraries into the child's address space
+    for lib in &loaded_libs {
+        let lib_size = ((lib.load_size + PAGE_2M as usize - 1) & !(PAGE_2M as usize - 1)) as u64;
+        paging::map_user_in(child_pml4, lib.base_ptr as u64, lib_size);
+    }
 
     let stack_layout = Layout::from_size_align(USER_STACK_SIZE, PAGE_2M as usize).unwrap();
     let stack_base = unsafe { alloc_zeroed(stack_layout) };
@@ -427,6 +441,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<u32>) -> u64 {
         tls_block_layout,
         symbols: syms,
         name: make_name(path),
+        loaded_libs,
     });
     let p = table.procs.get_mut(pid).unwrap();
     p.pid = pid;

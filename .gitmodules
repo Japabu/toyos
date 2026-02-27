@@ -5,4 +5,18 @@
 [submodule "userland/getrandom"]
 	path = userland/getrandom
 	url = https://github.com/Japabu/getrandom.git
-	branch = toyos
+[submodule "userland/libloading"]
+	path = userland/libloading
+	url = https://github.com/Japabu/rust_libloading.git
+[submodule "userland/memmap2"]
+	path = userland/memmap2
+	url = https://github.com/Japabu/memmap2-rs
+[submodule "userland/stacker"]
+	path = userland/stacker
+	url = https://github.com/Japabu/stacker.git
+[submodule "userland/ctrlc"]
+	path = userland/ctrlc
+	url = https://github.com/Japabu/rust-ctrlc.git
+[submodule "userland/target-lexicon"]
+	path = userland/target-lexicon
+	url = https://github.com/Japabu/target-lexicon.git

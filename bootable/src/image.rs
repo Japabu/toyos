@@ -26,8 +26,8 @@ impl tyfs::Disk for VecDisk {
 }
 
 pub fn create_initrd(files: &[(String, Vec<u8>)], symlinks: &[(String, String)]) -> Vec<u8> {
-    let data_size: usize = files.iter().map(|(_, d)| d.len()).sum::<usize>()
-        + symlinks.iter().map(|(_, target)| target.len()).sum::<usize>();
+    let data_size: usize = files.iter().map(|(name, d)| name.len() + d.len()).sum::<usize>()
+        + symlinks.iter().map(|(name, target)| name.len() + target.len()).sum::<usize>();
     let toc_size = (files.len() + symlinks.len()) * 64;
     let size = (64 + data_size + toc_size + 4095) & !4095;
     let size = size.max(4096);

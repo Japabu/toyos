@@ -200,6 +200,9 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         SYS_RENAME => sys_rename(a1, a2, a3, a4),
         SYS_MKDIR => sys_mkdir(a1, a2),
         SYS_RMDIR => sys_rmdir(a1, a2),
+        SYS_DLOPEN => sys_dlopen(a1, a2),
+        SYS_DLSYM => sys_dlsym(a1, a2, a3),
+        SYS_DLCLOSE => 0,
         _ => u64::MAX,
     }
 }
@@ -717,6 +720,52 @@ fn sys_rmdir(path_ptr: u64, path_len: u64) -> u64 {
     let resolved = vfs.resolve_absolute(&cwd, path);
     vfs.remove_dir(&resolved);
     0
+}
+
+fn sys_dlopen(path_ptr: u64, path_len: u64) -> u64 {
+    let Some(path) = user_str(path_ptr, path_len) else { return u64::MAX };
+    let cwd = process::with_current(|p| p.cwd.clone());
+    let resolved = vfs::lock().resolve_absolute(&cwd, path);
+
+    let data = match vfs::lock().read_file(&resolved) {
+        Some(d) => d,
+        None => {
+            log!("dlopen: file not found: {}", resolved);
+            return u64::MAX;
+        }
+    };
+
+    let lib = match crate::elf::load_shared_lib(&data) {
+        Ok(l) => l,
+        Err(msg) => {
+            log!("dlopen: {}", msg);
+            return u64::MAX;
+        }
+    };
+
+    // Map loaded library memory into the current process's address space
+    let alloc_size = ((lib.load_size + paging::PAGE_2M as usize - 1) & !(paging::PAGE_2M as usize - 1)) as u64;
+    paging::map_user(lib.base_ptr as u64, alloc_size);
+
+    // Store in process and return handle (index)
+    let handle = process::with_current_mut(|proc| {
+        let idx = proc.loaded_libs.len();
+        proc.loaded_libs.push(lib);
+        idx as u64
+    });
+    handle
+}
+
+fn sys_dlsym(handle: u64, name_ptr: u64, name_len: u64) -> u64 {
+    let Some(name) = user_str(name_ptr, name_len) else { return u64::MAX };
+    process::with_current(|proc| {
+        let idx = handle as usize;
+        if idx >= proc.loaded_libs.len() {
+            return u64::MAX;
+        }
+        let addr = crate::elf::dlsym(&proc.loaded_libs[idx], name);
+        if addr == 0 { u64::MAX } else { addr }
+    })
 }
 
 /// Terminate the current userspace process (called from exception handlers).
