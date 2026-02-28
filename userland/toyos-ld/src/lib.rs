@@ -9,7 +9,7 @@ use object::read::{self, Object, ObjectSection, ObjectSymbol};
 use object::RelocationFlags;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::{fs, process};
+use std::fs;
 
 const BASE_VADDR: u64 = 0;
 const PAGE_SIZE: u64 = 0x1000;
@@ -28,7 +28,7 @@ pub fn link_pe(
 ) -> Result<Vec<u8>, Vec<String>> {
     let mut state = collect(objects);
     synthesize_alloc_shims(&mut state);
-    let pe_layout = layout_pe(&mut state, entry);
+    let pe_layout = layout_pe(&mut state);
     let base_relocs = apply_relocs_pe(&mut state, &pe_layout)?;
     Ok(emit_pe_bytes(&state, &pe_layout, entry, subsystem, &base_relocs))
 }
@@ -44,8 +44,18 @@ pub fn link_static(
 ) -> Result<Vec<u8>, Vec<String>> {
     let mut state = collect(objects);
     synthesize_alloc_shims(&mut state);
-    let layout = layout_static(&mut state, entry, base_addr);
-    apply_relocs_static(&mut state, &layout)?;
+    let layout = layout_static(&mut state, base_addr);
+    let empty_dyn_got = HashMap::new();
+    let params = ElfRelocParams {
+        got: &layout.got,
+        tls_start: layout.tls_start,
+        tls_memsz: layout.tls_memsz,
+        plt: None,
+        dyn_got: &empty_dyn_got,
+        record_relatives: false,
+        allow_undefined: false,
+    };
+    apply_relocs(&mut state, &params)?;
     Ok(emit_static_bytes(&state, &layout, entry))
 }
 
@@ -55,7 +65,16 @@ pub fn link(objects: &[(String, Vec<u8>)], entry: &str) -> Result<Vec<u8>, Vec<S
     let mut state = collect(objects);
     synthesize_alloc_shims(&mut state);
     let layout = layout(&mut state, Some(entry));
-    let reloc_output = apply_relocs(&mut state, &layout, false)?;
+    let params = ElfRelocParams {
+        got: &layout.got,
+        tls_start: layout.tls_start,
+        tls_memsz: layout.tls_memsz,
+        plt: Some(&layout.plt),
+        dyn_got: &layout.dyn_got,
+        record_relatives: true,
+        allow_undefined: false,
+    };
+    let reloc_output = apply_relocs(&mut state, &params)?;
     Ok(emit_bytes(&state, &layout, &reloc_output, entry))
 }
 
@@ -69,10 +88,8 @@ pub fn resolve_libs(
     let mut objects = Vec::new();
 
     for path in inputs {
-        let data = fs::read(path).unwrap_or_else(|e| {
-            eprintln!("toyos-ld: cannot read {}: {e}", path.display());
-            process::exit(1);
-        });
+        let data = fs::read(path)
+            .unwrap_or_else(|e| panic!("toyos-ld: cannot read {}: {e}", path.display()));
         if is_archive(&data) {
             extract_archive(&path.display().to_string(), &data, &mut objects);
         } else {
@@ -81,12 +98,12 @@ pub fn resolve_libs(
     }
 
     for lib in libs {
-        if let Some((name, data)) = find_lib(lib, lib_paths) {
-            if is_archive(&data) {
-                extract_archive(&name, &data, &mut objects);
-            } else {
-                objects.push((name, data));
-            }
+        let (name, data) = find_lib(lib, lib_paths)
+            .unwrap_or_else(|| panic!("toyos-ld: cannot find -l{lib}"));
+        if is_archive(&data) {
+            extract_archive(&name, &data, &mut objects);
+        } else {
+            objects.push((name, data));
         }
     }
 
@@ -100,26 +117,17 @@ fn is_archive(data: &[u8]) -> bool {
 }
 
 fn extract_archive(name: &str, data: &[u8], out: &mut Vec<(String, Vec<u8>)>) {
-    let archive = match object::read::archive::ArchiveFile::parse(data) {
-        Ok(a) => a,
-        Err(e) => {
-            eprintln!("toyos-ld: cannot parse archive {name}: {e}");
-            return;
-        }
-    };
+    let archive = object::read::archive::ArchiveFile::parse(data)
+        .unwrap_or_else(|e| panic!("toyos-ld: cannot parse archive {name}: {e}"));
     for member in archive.members() {
-        let member = match member {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
+        let member = member
+            .unwrap_or_else(|e| panic!("toyos-ld: bad archive member in {name}: {e}"));
         let member_name = String::from_utf8_lossy(member.name()).to_string();
         if !member_name.ends_with(".o") {
             continue;
         }
-        let member_data = match member.data(data) {
-            Ok(d) => d,
-            Err(_) => continue,
-        };
+        let member_data = member.data(data)
+            .unwrap_or_else(|e| panic!("toyos-ld: cannot read {member_name} in {name}: {e}"));
         out.push((format!("{name}({member_name})"), member_data.to_vec()));
     }
 }
@@ -255,10 +263,8 @@ fn collect(objects: &[(String, Vec<u8>)]) -> LinkState {
         }
 
         // Generic parse: handles both ELF .o and COFF .o
-        let obj = object::File::parse(data.as_slice()).unwrap_or_else(|e| {
-            eprintln!("toyos-ld: cannot parse {name}: {e}");
-            process::exit(1);
-        });
+        let obj = object::File::parse(data.as_slice())
+            .unwrap_or_else(|e| panic!("toyos-ld: cannot parse {name}: {e}"));
 
         collect_object(&mut state, &obj, obj_idx, &mut sec_map);
     }
@@ -482,10 +488,7 @@ fn coff_to_elf_r_type(typ: u16) -> u32 {
         | pe::IMAGE_REL_AMD64_REL32_4
         | pe::IMAGE_REL_AMD64_REL32_5 => elf::R_X86_64_PLT32,
         pe::IMAGE_REL_AMD64_SECREL => elf::R_X86_64_32,
-        other => {
-            eprintln!("toyos-ld: unsupported COFF relocation type 0x{other:04x}");
-            process::exit(1);
-        }
+        other => panic!("toyos-ld: unsupported COFF relocation type 0x{other:04x}"),
     }
 }
 
@@ -644,15 +647,12 @@ fn layout(state: &mut LinkState, entry_name: Option<&str>) -> LayoutResult {
         cursor += sec.size;
     }
     // Collect dynamic symbols referenced by relocations (need PLT stubs)
-    let mut dyn_syms: Vec<String> = Vec::new();
-    for reloc in &state.relocs {
-        if state.dynamic_imports.contains(&reloc.symbol_name) && !dyn_syms.contains(&reloc.symbol_name) {
-            dyn_syms.push(reloc.symbol_name.clone());
-        }
-    }
-    // Entry symbol needs a PLT stub too if it's a dynamic import
+    let mut dyn_syms = collect_unique_symbols(
+        state.relocs.iter(),
+        |r| state.dynamic_imports.contains(&r.symbol_name),
+    );
     if let Some(entry) = entry_name {
-        if state.dynamic_imports.contains(entry) && !dyn_syms.contains(&entry.to_string()) {
+        if state.dynamic_imports.contains(entry) && !dyn_syms.iter().any(|s| s == entry) {
             dyn_syms.push(entry.to_string());
         }
     }
@@ -675,20 +675,11 @@ fn layout(state: &mut LinkState, entry_name: Option<&str>) -> LayoutResult {
     }
 
     // Collect GOT entries needed (GOTPCREL* and GOTTPOFF both need GOT slots)
-    let mut got_symbols: Vec<String> = Vec::new();
-    for reloc in &state.relocs {
-        match reloc.r_type {
-            elf::R_X86_64_GOTPCREL
-            | elf::R_X86_64_GOTPCRELX
-            | elf::R_X86_64_REX_GOTPCRELX
-            | elf::R_X86_64_GOTTPOFF => {
-                if !got_symbols.contains(&reloc.symbol_name) {
-                    got_symbols.push(reloc.symbol_name.clone());
-                }
-            }
-            _ => {}
-        }
-    }
+    let got_symbols = collect_unique_symbols(state.relocs.iter(), |r| {
+        matches!(r.r_type,
+            elf::R_X86_64_GOTPCREL | elf::R_X86_64_GOTPCRELX
+            | elf::R_X86_64_REX_GOTPCRELX | elf::R_X86_64_GOTTPOFF)
+    });
 
     cursor = align_up(cursor, 8);
     let mut got = HashMap::new();
@@ -756,6 +747,21 @@ fn align_up(addr: u64, align: u64) -> u64 {
     (addr + align - 1) & !(align - 1)
 }
 
+/// Collect unique symbols in insertion order (deduplicating with a HashSet).
+fn collect_unique_symbols<'a>(
+    relocs: impl Iterator<Item = &'a InputReloc>,
+    predicate: impl Fn(&InputReloc) -> bool,
+) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut result = Vec::new();
+    for reloc in relocs {
+        if predicate(reloc) && seen.insert(reloc.symbol_name.clone()) {
+            result.push(reloc.symbol_name.clone());
+        }
+    }
+    result
+}
+
 // ── Relocation ───────────────────────────────────────────────────────────
 
 struct RelocOutput {
@@ -764,27 +770,32 @@ struct RelocOutput {
     glob_dats: Vec<(u64, String)>,
 }
 
-fn resolve_symbol(state: &LinkState, layout: &LayoutResult, name: &str, from_sec: usize) -> Option<u64> {
+/// Resolve a symbol to its virtual address.
+/// `plt` provides PLT stubs for dynamic symbols (PIE mode). Pass `None` for
+/// static/PE modes where dynamic symbols are unsupported.
+fn resolve_symbol(
+    state: &LinkState,
+    name: &str,
+    from_sec: usize,
+    plt: Option<&HashMap<String, u64>>,
+) -> Option<u64> {
     if let Some(def) = state.globals.get(name) {
         if def.section_global_idx == DYNAMIC_SYMBOL_SENTINEL {
-            // Dynamic symbol — resolve through PLT stub
-            return layout.plt.get(name).copied();
+            return plt.and_then(|p| p.get(name).copied());
         }
-        let sec = &state.sections[def.section_global_idx];
-        return Some(sec.vaddr + def.value);
+        return Some(state.sections[def.section_global_idx].vaddr + def.value);
     }
     let obj_idx = state.sections[from_sec].obj_idx;
     if let Some(def) = state.locals.get(&(obj_idx, name.to_string())) {
-        let sec = &state.sections[def.section_global_idx];
-        return Some(sec.vaddr + def.value);
+        return Some(state.sections[def.section_global_idx].vaddr + def.value);
     }
     None
 }
 
 /// x86-64 Variant II: TP points to end of TLS block.
 /// TPOFF = symbol_vaddr - (tls_start + tls_memsz)
-fn tpoff(sym_addr: u64, layout: &LayoutResult) -> i64 {
-    sym_addr as i64 - (layout.tls_start as i64 + layout.tls_memsz as i64)
+fn tpoff(sym_addr: u64, tls_start: u64, tls_memsz: u64) -> i64 {
+    sym_addr as i64 - (tls_start as i64 + tls_memsz as i64)
 }
 
 fn write_bytes(state: &mut LinkState, sec_idx: usize, offset: u64, bytes: &[u8]) {
@@ -814,10 +825,22 @@ fn is_padded_tls_sequence(sec_data: &[u8], reloc_offset: u64) -> bool {
     off >= 4 && sec_data[off - 4] == 0x66
 }
 
+/// Parameters for ELF relocation application (shared between PIE and static modes).
+struct ElfRelocParams<'a> {
+    got: &'a HashMap<String, u64>,
+    tls_start: u64,
+    tls_memsz: u64,
+    plt: Option<&'a HashMap<String, u64>>,
+    dyn_got: &'a HashMap<String, u64>,
+    /// PIE mode: record R_X86_64_RELATIVE entries for runtime relocation.
+    /// Static mode: addresses are fixed at link time, no RELATIVE needed.
+    record_relatives: bool,
+    allow_undefined: bool,
+}
+
 fn apply_relocs(
     state: &mut LinkState,
-    layout: &LayoutResult,
-    allow_undefined: bool,
+    params: &ElfRelocParams,
 ) -> Result<RelocOutput, Vec<String>> {
     let mut relatives = Vec::new();
     let mut undefined = HashSet::new();
@@ -832,8 +855,8 @@ fn apply_relocs(
     for reloc in &relocs {
         match reloc.r_type {
             elf::R_X86_64_TLSGD => {
-                let sym_addr = resolve_symbol(state, layout, &reloc.symbol_name, reloc.section_global_idx)
-                    .unwrap_or(0);
+                let sym_addr = resolve_symbol(state, &reloc.symbol_name, reloc.section_global_idx, params.plt)
+                    .unwrap_or_else(|| panic!("toyos-ld: undefined TLS symbol: {}", reloc.symbol_name));
                 let padded = is_padded_tls_sequence(
                     &state.sections[reloc.section_global_idx].data,
                     reloc.offset,
@@ -848,22 +871,9 @@ fn apply_relocs(
                     ];
                     write_bytes(state, reloc.section_global_idx, reloc.offset - 4, &inst);
                     write_i32(state, reloc.section_global_idx, reloc.offset + 8,
-                        tpoff(sym_addr, layout) as i32);
+                        tpoff(sym_addr, params.tls_start, params.tls_memsz) as i32);
                     relaxed_calls.insert((reloc.section_global_idx, reloc.offset + 8));
                 } else {
-                    // GD → LE (12-byte unpadded): `leaq; call`
-                    // → `mov %fs:0,%rax; lea tpoff(%rax),%rax` (overflows into 16 bytes)
-                    // Use IE-style: `addq %fs:0,%rax` doesn't work either.
-                    // For 12-byte: rewrite to `mov %fs:0,%rax; nop; nop; nop`
-                    // and patch the TPOFF inline at the usage site via DTPOFF32.
-                    // Actually, for 12-byte we can use: movq %fs:0,%rax (9); lea off(%rax),%rax
-                    // won't fit. Use: movl %fs:tpoff, %eax (9 bytes); nopl (%rax) (3 bytes)
-                    // = `64 a1 XX XX XX XX 00 00 00 00; 0f 1f 00`
-                    // Wait, that's for 32-bit. For 64-bit, use:
-                    //   mov %fs:0,%rax (9 bytes) + nopw (%rax) (3 bytes) = 12
-                    // The tpoff value is patched by the companion DTPOFF32.
-                    // Actually, in practice LLVM always emits the padded form for GD.
-                    // If we hit unpadded, it's an error.
                     panic!("toyos-ld: unpadded 12-byte TLSGD sequence not supported");
                 }
             }
@@ -873,8 +883,7 @@ fn apply_relocs(
                     reloc.offset,
                 );
                 if padded {
-                    // LD → LE (16-byte padded): `data16; leaq; data16*2; rex64; call`
-                    // → `data16*3; mov %fs:0,%rax; nopl 0(%rax)`
+                    // LD → LE (16-byte padded)
                     #[rustfmt::skip]
                     let inst: [u8; 16] = [
                         0x66, 0x66, 0x66,                                           // 3x data16
@@ -884,8 +893,7 @@ fn apply_relocs(
                     write_bytes(state, reloc.section_global_idx, reloc.offset - 4, &inst);
                     relaxed_calls.insert((reloc.section_global_idx, reloc.offset + 8));
                 } else {
-                    // LD → LE (12-byte unpadded): `leaq; call`
-                    // → `data16; data16; data16; mov %fs:0,%rax`
+                    // LD → LE (12-byte unpadded)
                     #[rustfmt::skip]
                     let inst: [u8; 12] = [
                         0x66, 0x66, 0x66,                                           // 3x data16
@@ -896,11 +904,10 @@ fn apply_relocs(
                 }
             }
             elf::R_X86_64_DTPOFF32 => {
-                // In a static link, DTPOFF → TPOFF.
-                let sym_addr = resolve_symbol(state, layout, &reloc.symbol_name, reloc.section_global_idx)
-                    .unwrap_or(0);
+                let sym_addr = resolve_symbol(state, &reloc.symbol_name, reloc.section_global_idx, params.plt)
+                    .unwrap_or_else(|| panic!("toyos-ld: undefined TLS symbol: {}", reloc.symbol_name));
                 write_i32(state, reloc.section_global_idx, reloc.offset,
-                    (tpoff(sym_addr, layout) + reloc.addend) as i32);
+                    (tpoff(sym_addr, params.tls_start, params.tls_memsz) + reloc.addend) as i32);
             }
             _ => {}
         }
@@ -908,12 +915,10 @@ fn apply_relocs(
 
     // Pass 2: all other relocations
     for reloc in &relocs {
-        // Skip TLS relocations already handled
         match reloc.r_type {
             elf::R_X86_64_TLSGD | elf::R_X86_64_TLSLD | elf::R_X86_64_DTPOFF32 => continue,
             _ => {}
         }
-        // Skip companion __tls_get_addr calls that were overwritten
         if relaxed_calls.contains(&(reloc.section_global_idx, reloc.offset)) {
             continue;
         }
@@ -921,7 +926,7 @@ fn apply_relocs(
         let sec = &state.sections[reloc.section_global_idx];
         let reloc_vaddr = sec.vaddr + reloc.offset;
 
-        let sym_addr = match resolve_symbol(state, layout, &reloc.symbol_name, reloc.section_global_idx) {
+        let sym_addr = match resolve_symbol(state, &reloc.symbol_name, reloc.section_global_idx, params.plt) {
             Some(a) => a,
             None => {
                 if reloc.symbol_name.is_empty() {
@@ -937,7 +942,9 @@ fn apply_relocs(
             elf::R_X86_64_64 => {
                 let value = (sym_addr as i64 + reloc.addend) as u64;
                 write_u64(state, reloc.section_global_idx, reloc.offset, value);
-                relatives.push((reloc_vaddr, sym_addr as i64 + reloc.addend));
+                if params.record_relatives {
+                    relatives.push((reloc_vaddr, sym_addr as i64 + reloc.addend));
+                }
             }
             elf::R_X86_64_PC32 | elf::R_X86_64_PLT32 => {
                 let value = sym_addr as i64 + reloc.addend - reloc_vaddr as i64;
@@ -953,12 +960,12 @@ fn apply_relocs(
             }
             elf::R_X86_64_GOTPCREL | elf::R_X86_64_GOTPCRELX
             | elf::R_X86_64_REX_GOTPCRELX => {
-                let got_slot = layout.got[&reloc.symbol_name];
+                let got_slot = params.got[&reloc.symbol_name];
                 let value = got_slot as i64 + reloc.addend - reloc_vaddr as i64;
                 write_i32(state, reloc.section_global_idx, reloc.offset, value as i32);
             }
             elf::R_X86_64_TPOFF32 => {
-                let tp = tpoff(sym_addr, layout);
+                let tp = tpoff(sym_addr, params.tls_start, params.tls_memsz);
                 write_i32(
                     state,
                     reloc.section_global_idx,
@@ -967,43 +974,44 @@ fn apply_relocs(
                 );
             }
             elf::R_X86_64_GOTTPOFF => {
-                let got_slot = layout.got[&reloc.symbol_name];
+                let got_slot = params.got[&reloc.symbol_name];
                 let value = got_slot as i64 + reloc.addend - reloc_vaddr as i64;
                 write_i32(state, reloc.section_global_idx, reloc.offset, value as i32);
             }
-            other => {
-                eprintln!(
-                    "toyos-ld: unsupported relocation type {other} for symbol {}",
-                    reloc.symbol_name
-                );
-            }
+            other => panic!(
+                "toyos-ld: unsupported relocation type {other} for symbol {}",
+                reloc.symbol_name,
+            ),
         }
     }
 
-    // Fill GOT entries
-    let gottpoff_syms: HashSet<String> = relocs
-        .iter()
-        .filter(|r| r.r_type == elf::R_X86_64_GOTTPOFF)
-        .map(|r| r.symbol_name.clone())
-        .collect();
+    // Fill GOT entries (PIE mode records as RELATIVE; static mode handles in emit)
+    if params.record_relatives {
+        let gottpoff_syms: HashSet<String> = relocs
+            .iter()
+            .filter(|r| r.r_type == elf::R_X86_64_GOTTPOFF)
+            .map(|r| r.symbol_name.clone())
+            .collect();
 
-    for (sym_name, &got_vaddr) in &layout.got {
-        let sym_addr = resolve_symbol(state, layout, sym_name, 0).unwrap_or(0);
-        if gottpoff_syms.contains(sym_name) {
-            let tp = tpoff(sym_addr, layout);
-            relatives.push((got_vaddr, tp));
-        } else {
-            relatives.push((got_vaddr, sym_addr as i64));
+        for (sym_name, &got_vaddr) in params.got {
+            let sym_addr = resolve_symbol(state, sym_name, 0, params.plt)
+                .unwrap_or_else(|| panic!("toyos-ld: undefined GOT symbol: {sym_name}"));
+            if gottpoff_syms.contains(sym_name) {
+                let tp = tpoff(sym_addr, params.tls_start, params.tls_memsz);
+                relatives.push((got_vaddr, tp));
+            } else {
+                relatives.push((got_vaddr, sym_addr as i64));
+            }
         }
     }
 
     // Collect dynamic GOT entries as GLOB_DAT relocations (resolved at load time)
     let mut glob_dats = Vec::new();
-    for (sym_name, &got_vaddr) in &layout.dyn_got {
+    for (sym_name, &got_vaddr) in params.dyn_got {
         glob_dats.push((got_vaddr, sym_name.clone()));
     }
 
-    if !allow_undefined && !undefined.is_empty() {
+    if !params.allow_undefined && !undefined.is_empty() {
         let mut syms: Vec<String> = undefined.into_iter().collect();
         syms.sort();
         return Err(syms);
@@ -1400,14 +1408,12 @@ struct PeLayout {
     reloc_rva: u32,
     reloc_file_off: u32,
     size_of_headers: u32,
-    #[allow(dead_code)]
-    size_of_image: u32,
     got: HashMap<String, u64>,
 }
 
 /// PE section layout: RVAs use PE_SECTION_ALIGNMENT, file uses PE_FILE_ALIGNMENT.
 /// All section vaddrs in LinkState are set relative to text_rva.
-fn layout_pe(state: &mut LinkState, _entry_name: &str) -> PeLayout {
+fn layout_pe(state: &mut LinkState) -> PeLayout {
     // Headers: DOS(64) + PE sig(4) + COFF(20) + OptionalHeader(240) + section headers
     // We'll have 2 or 3 sections: .text, optionally .data, .reloc
     // Determine if we have data sections
@@ -1459,18 +1465,11 @@ fn layout_pe(state: &mut LinkState, _entry_name: &str) -> PeLayout {
     }
 
     // GOT entries needed
-    let mut got_symbols: Vec<String> = Vec::new();
-    for reloc in &state.relocs {
-        match reloc.r_type {
+    let got_symbols = collect_unique_symbols(state.relocs.iter(), |r| {
+        matches!(r.r_type,
             elf::R_X86_64_GOTPCREL | elf::R_X86_64_GOTPCRELX
-            | elf::R_X86_64_REX_GOTPCRELX => {
-                if !got_symbols.contains(&reloc.symbol_name) {
-                    got_symbols.push(reloc.symbol_name.clone());
-                }
-            }
-            _ => {}
-        }
-    }
+            | elf::R_X86_64_REX_GOTPCRELX)
+    });
     if has_data && !got_symbols.is_empty() {
         cursor = align_up(cursor, 8);
     } else if !has_data && !got_symbols.is_empty() {
@@ -1501,9 +1500,6 @@ fn layout_pe(state: &mut LinkState, _entry_name: &str) -> PeLayout {
     };
     let reloc_file_off = data_file_off + data_raw_size;
 
-    // size_of_image will be updated after we know reloc size
-    let size_of_image = 0; // placeholder
-
     PeLayout {
         text_rva,
         text_file_off,
@@ -1517,29 +1513,12 @@ fn layout_pe(state: &mut LinkState, _entry_name: &str) -> PeLayout {
         reloc_rva,
         reloc_file_off,
         size_of_headers,
-        size_of_image,
         got,
     }
 }
 
 fn pe_align_up(value: u32, alignment: u32) -> u32 {
     (value + alignment - 1) & !(alignment - 1)
-}
-
-fn resolve_symbol_pe(state: &LinkState, name: &str, from_sec: usize) -> Option<u64> {
-    if let Some(def) = state.globals.get(name) {
-        if def.section_global_idx == DYNAMIC_SYMBOL_SENTINEL {
-            return None;
-        }
-        let sec = &state.sections[def.section_global_idx];
-        return Some(sec.vaddr + def.value);
-    }
-    let obj_idx = state.sections[from_sec].obj_idx;
-    if let Some(def) = state.locals.get(&(obj_idx, name.to_string())) {
-        let sec = &state.sections[def.section_global_idx];
-        return Some(sec.vaddr + def.value);
-    }
-    None
 }
 
 fn apply_relocs_pe(
@@ -1561,7 +1540,7 @@ fn apply_relocs_pe(
         let sec = &state.sections[reloc.section_global_idx];
         let reloc_vaddr = sec.vaddr + reloc.offset;
 
-        let sym_addr = match resolve_symbol_pe(state, &reloc.symbol_name, reloc.section_global_idx) {
+        let sym_addr = match resolve_symbol(state, &reloc.symbol_name, reloc.section_global_idx, None) {
             Some(a) => a,
             None => {
                 if reloc.symbol_name.is_empty() { 0 }
@@ -1595,18 +1574,16 @@ fn apply_relocs_pe(
                 let value = got_slot as i64 + reloc.addend - reloc_vaddr as i64;
                 write_i32(state, reloc.section_global_idx, reloc.offset, value as i32);
             }
-            other => {
-                eprintln!("toyos-ld: unsupported relocation type {other} in PE mode for symbol {}", reloc.symbol_name);
-            }
+            other => panic!(
+                "toyos-ld: unsupported relocation type {other} in PE mode for symbol {}",
+                reloc.symbol_name,
+            ),
         }
     }
 
     // Fill GOT entries
-    for (sym_name, &got_vaddr) in &layout.got {
-        let sym_addr = resolve_symbol_pe(state, sym_name, 0).unwrap_or(0);
+    for (_, &got_vaddr) in &layout.got {
         abs_fixups.push(got_vaddr as u32);
-        // GOT entries written in emit_pe_bytes
-        let _ = (got_vaddr, sym_addr);
     }
 
     if !undefined.is_empty() {
@@ -1794,14 +1771,13 @@ fn emit_pe_bytes(
             (layout.text_file_off, layout.text_rva)
         };
         let file_off = (file_off_base + (rva - rva_base)) as usize;
-        if file_off + sec.data.len() <= buf.len() {
-            buf[file_off..file_off + sec.data.len()].copy_from_slice(&sec.data);
-        }
+        buf[file_off..file_off + sec.data.len()].copy_from_slice(&sec.data);
     }
 
     // ── Write GOT entries ──
     for (sym_name, &got_vaddr) in &layout.got {
-        let sym_addr = resolve_symbol_pe(state, sym_name, 0).unwrap_or(0);
+        let sym_addr = resolve_symbol(state, sym_name, 0, None)
+            .unwrap_or_else(|| panic!("toyos-ld: undefined GOT symbol: {sym_name}"));
         let rva = got_vaddr as u32;
         let (file_off_base, rva_base) = if rva >= layout.data_rva && layout.has_data {
             (layout.data_file_off, layout.data_rva)
@@ -1809,9 +1785,7 @@ fn emit_pe_bytes(
             (layout.text_file_off, layout.text_rva)
         };
         let file_off = (file_off_base + (rva - rva_base)) as usize;
-        if file_off + 8 <= buf.len() {
-            buf[file_off..file_off + 8].copy_from_slice(&sym_addr.to_le_bytes());
-        }
+        buf[file_off..file_off + 8].copy_from_slice(&sym_addr.to_le_bytes());
     }
 
     // ── Write .reloc data ──
@@ -1837,7 +1811,7 @@ struct StaticLayout {
     got: HashMap<String, u64>,
 }
 
-fn layout_static(state: &mut LinkState, _entry_name: &str, base_addr: u64) -> StaticLayout {
+fn layout_static(state: &mut LinkState, base_addr: u64) -> StaticLayout {
     let headers_size = 0x1000u64;
 
     let mut rx_sections = Vec::new();
@@ -1878,20 +1852,11 @@ fn layout_static(state: &mut LinkState, _entry_name: &str, base_addr: u64) -> St
     }
 
     // GOT entries (GOTPCREL* and GOTTPOFF)
-    let mut got_symbols: Vec<String> = Vec::new();
-    for reloc in &state.relocs {
-        match reloc.r_type {
-            elf::R_X86_64_GOTPCREL
-            | elf::R_X86_64_GOTPCRELX
-            | elf::R_X86_64_REX_GOTPCRELX
-            | elf::R_X86_64_GOTTPOFF => {
-                if !got_symbols.contains(&reloc.symbol_name) {
-                    got_symbols.push(reloc.symbol_name.clone());
-                }
-            }
-            _ => {}
-        }
-    }
+    let got_symbols = collect_unique_symbols(state.relocs.iter(), |r| {
+        matches!(r.r_type,
+            elf::R_X86_64_GOTPCREL | elf::R_X86_64_GOTPCRELX
+            | elf::R_X86_64_REX_GOTPCRELX | elf::R_X86_64_GOTTPOFF)
+    });
 
     cursor = align_up(cursor, 8);
     let mut got = HashMap::new();
@@ -1929,193 +1894,6 @@ fn layout_static(state: &mut LinkState, _entry_name: &str, base_addr: u64) -> St
         tls_memsz,
         got,
     }
-}
-
-fn resolve_symbol_static(state: &LinkState, name: &str, from_sec: usize) -> Option<u64> {
-    if let Some(def) = state.globals.get(name) {
-        if def.section_global_idx == DYNAMIC_SYMBOL_SENTINEL {
-            return None; // Static linking doesn't support dynamic symbols
-        }
-        let sec = &state.sections[def.section_global_idx];
-        return Some(sec.vaddr + def.value);
-    }
-    let obj_idx = state.sections[from_sec].obj_idx;
-    if let Some(def) = state.locals.get(&(obj_idx, name.to_string())) {
-        let sec = &state.sections[def.section_global_idx];
-        return Some(sec.vaddr + def.value);
-    }
-    None
-}
-
-fn tpoff_static(sym_addr: u64, layout: &StaticLayout) -> i64 {
-    sym_addr as i64 - (layout.tls_start as i64 + layout.tls_memsz as i64)
-}
-
-fn apply_relocs_static(
-    state: &mut LinkState,
-    layout: &StaticLayout,
-) -> Result<(), Vec<String>> {
-    let mut undefined = HashSet::new();
-    let relocs: Vec<InputReloc> = state.relocs.clone();
-
-    // Pass 1: TLS GD/LD/DTPOFF relaxations
-    let mut relaxed_calls: HashSet<(usize, u64)> = HashSet::new();
-
-    for reloc in &relocs {
-        match reloc.r_type {
-            elf::R_X86_64_TLSGD => {
-                let sym_addr = resolve_symbol_static(state, &reloc.symbol_name, reloc.section_global_idx)
-                    .unwrap_or(0);
-                let padded = is_padded_tls_sequence(
-                    &state.sections[reloc.section_global_idx].data,
-                    reloc.offset,
-                );
-                if padded {
-                    #[rustfmt::skip]
-                    let inst: [u8; 16] = [
-                        0x64, 0x48, 0x8b, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00,
-                        0x48, 0x8d, 0x80, 0x00, 0x00, 0x00, 0x00,
-                    ];
-                    write_bytes(state, reloc.section_global_idx, reloc.offset - 4, &inst);
-                    write_i32(state, reloc.section_global_idx, reloc.offset + 8,
-                        tpoff_static(sym_addr, layout) as i32);
-                    relaxed_calls.insert((reloc.section_global_idx, reloc.offset + 8));
-                } else {
-                    panic!("toyos-ld: unpadded 12-byte TLSGD sequence not supported");
-                }
-            }
-            elf::R_X86_64_TLSLD => {
-                let padded = is_padded_tls_sequence(
-                    &state.sections[reloc.section_global_idx].data,
-                    reloc.offset,
-                );
-                if padded {
-                    #[rustfmt::skip]
-                    let inst: [u8; 16] = [
-                        0x66, 0x66, 0x66,
-                        0x64, 0x48, 0x8b, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00,
-                        0x0f, 0x1f, 0x40, 0x00,
-                    ];
-                    write_bytes(state, reloc.section_global_idx, reloc.offset - 4, &inst);
-                    relaxed_calls.insert((reloc.section_global_idx, reloc.offset + 8));
-                } else {
-                    #[rustfmt::skip]
-                    let inst: [u8; 12] = [
-                        0x66, 0x66, 0x66,
-                        0x64, 0x48, 0x8b, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00,
-                    ];
-                    write_bytes(state, reloc.section_global_idx, reloc.offset - 3, &inst);
-                    relaxed_calls.insert((reloc.section_global_idx, reloc.offset + 5));
-                }
-            }
-            elf::R_X86_64_DTPOFF32 => {
-                let sym_addr = resolve_symbol_static(state, &reloc.symbol_name, reloc.section_global_idx)
-                    .unwrap_or(0);
-                write_i32(state, reloc.section_global_idx, reloc.offset,
-                    (tpoff_static(sym_addr, layout) + reloc.addend) as i32);
-            }
-            _ => {}
-        }
-    }
-
-    // Pass 2: all other relocations — directly patch, no RELATIVE entries
-    for reloc in &relocs {
-        match reloc.r_type {
-            elf::R_X86_64_TLSGD | elf::R_X86_64_TLSLD | elf::R_X86_64_DTPOFF32 => continue,
-            _ => {}
-        }
-        if relaxed_calls.contains(&(reloc.section_global_idx, reloc.offset)) {
-            continue;
-        }
-
-        let sec = &state.sections[reloc.section_global_idx];
-        let reloc_vaddr = sec.vaddr + reloc.offset;
-
-        let sym_addr = match resolve_symbol_static(state, &reloc.symbol_name, reloc.section_global_idx) {
-            Some(a) => a,
-            None => {
-                if reloc.symbol_name.is_empty() {
-                    0
-                } else {
-                    undefined.insert(reloc.symbol_name.clone());
-                    continue;
-                }
-            }
-        };
-
-        match reloc.r_type {
-            elf::R_X86_64_64 => {
-                let value = (sym_addr as i64 + reloc.addend) as u64;
-                write_u64(state, reloc.section_global_idx, reloc.offset, value);
-                // No RELATIVE — address is absolute and fixed at link time
-            }
-            elf::R_X86_64_PC32 | elf::R_X86_64_PLT32 => {
-                let value = sym_addr as i64 + reloc.addend - reloc_vaddr as i64;
-                write_i32(state, reloc.section_global_idx, reloc.offset, value as i32);
-            }
-            elf::R_X86_64_32 => {
-                let value = (sym_addr as i64 + reloc.addend) as u32;
-                write_u32(state, reloc.section_global_idx, reloc.offset, value);
-            }
-            elf::R_X86_64_32S => {
-                let value = (sym_addr as i64 + reloc.addend) as i32;
-                write_i32(state, reloc.section_global_idx, reloc.offset, value);
-            }
-            elf::R_X86_64_GOTPCREL | elf::R_X86_64_GOTPCRELX
-            | elf::R_X86_64_REX_GOTPCRELX => {
-                let got_slot = layout.got[&reloc.symbol_name];
-                let value = got_slot as i64 + reloc.addend - reloc_vaddr as i64;
-                write_i32(state, reloc.section_global_idx, reloc.offset, value as i32);
-            }
-            elf::R_X86_64_TPOFF32 => {
-                let tp = tpoff_static(sym_addr, layout);
-                write_i32(state, reloc.section_global_idx, reloc.offset,
-                    (tp + reloc.addend) as i32);
-            }
-            elf::R_X86_64_GOTTPOFF => {
-                let got_slot = layout.got[&reloc.symbol_name];
-                let value = got_slot as i64 + reloc.addend - reloc_vaddr as i64;
-                write_i32(state, reloc.section_global_idx, reloc.offset, value as i32);
-            }
-            other => {
-                eprintln!(
-                    "toyos-ld: unsupported relocation type {other} for symbol {}",
-                    reloc.symbol_name
-                );
-            }
-        }
-    }
-
-    // Fill GOT entries with absolute addresses
-    let gottpoff_syms: HashSet<String> = relocs
-        .iter()
-        .filter(|r| r.r_type == elf::R_X86_64_GOTTPOFF)
-        .map(|r| r.symbol_name.clone())
-        .collect();
-
-    for (sym_name, &got_vaddr) in &layout.got {
-        let sym_addr = resolve_symbol_static(state, sym_name, 0).unwrap_or(0);
-        let value = if gottpoff_syms.contains(sym_name) {
-            tpoff_static(sym_addr, layout) as u64
-        } else {
-            sym_addr
-        };
-        // Write GOT entry directly into the RW section data
-        // GOT is at got_vaddr, which is in the RW segment
-        // Find which section contains this address, or we need to handle it differently
-        // For static linking, GOT entries are just absolute values baked in
-        // We handle this by writing to the output buffer in emit_static_bytes
-        // Store in a side table instead
-        let _ = (got_vaddr, value); // handled in emit
-    }
-
-    if !undefined.is_empty() {
-        let mut syms: Vec<String> = undefined.into_iter().collect();
-        syms.sort();
-        return Err(syms);
-    }
-
-    Ok(())
 }
 
 fn emit_static_bytes(
@@ -2195,9 +1973,7 @@ fn emit_static_bytes(
     for sec in &state.sections {
         if sec.vaddr == 0 || sec.data.is_empty() { continue; }
         let file_off = (sec.vaddr - layout.base_addr) as usize;
-        if file_off + sec.data.len() <= buf.len() {
-            buf[file_off..file_off + sec.data.len()].copy_from_slice(&sec.data);
-        }
+        buf[file_off..file_off + sec.data.len()].copy_from_slice(&sec.data);
     }
 
     // ── Write GOT entries ──
@@ -2207,16 +1983,15 @@ fn emit_static_bytes(
         .map(|r| r.symbol_name.clone())
         .collect();
     for (sym_name, &got_vaddr) in &layout.got {
-        let sym_addr = resolve_symbol_static(state, sym_name, 0).unwrap_or(0);
+        let sym_addr = resolve_symbol(state, sym_name, 0, None)
+            .unwrap_or_else(|| panic!("toyos-ld: undefined GOT symbol: {sym_name}"));
         let value = if gottpoff_syms.contains(sym_name) {
-            tpoff_static(sym_addr, layout) as u64
+            tpoff(sym_addr, layout.tls_start, layout.tls_memsz) as u64
         } else {
             sym_addr
         };
         let file_off = (got_vaddr - layout.base_addr) as usize;
-        if file_off + 8 <= buf.len() {
-            buf[file_off..file_off + 8].copy_from_slice(&value.to_le_bytes());
-        }
+        buf[file_off..file_off + 8].copy_from_slice(&value.to_le_bytes());
     }
 
     // ── Write .shstrtab ──
@@ -2259,7 +2034,16 @@ pub fn link_shared(objects: &[(String, Vec<u8>)]) -> Result<Vec<u8>, Vec<String>
     let mut state = collect(objects);
     synthesize_alloc_shims(&mut state);
     let layout = layout(&mut state, None);
-    let reloc_output = apply_relocs(&mut state, &layout, true)?;
+    let params = ElfRelocParams {
+        got: &layout.got,
+        tls_start: layout.tls_start,
+        tls_memsz: layout.tls_memsz,
+        plt: Some(&layout.plt),
+        dyn_got: &layout.dyn_got,
+        record_relatives: true,
+        allow_undefined: true,
+    };
+    let reloc_output = apply_relocs(&mut state, &params)?;
     Ok(emit_shared_bytes(&state, &layout, &reloc_output))
 }
 
