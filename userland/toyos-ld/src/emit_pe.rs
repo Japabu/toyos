@@ -1,6 +1,6 @@
 use crate::collect::{collect_unique_symbols, LinkState};
 use crate::reloc::resolve_symbol;
-use crate::{align_up, classify_sections};
+use crate::{align_up, classify_sections, LinkError};
 use object::write::pe::{NtHeaders, Writer};
 use object::{elf, pe};
 use std::collections::HashMap;
@@ -90,12 +90,12 @@ pub(crate) fn emit_pe_bytes(
     entry_name: &str,
     subsystem: u16,
     abs_fixups: &[u32],
-) -> Vec<u8> {
+) -> Result<Vec<u8>, LinkError> {
     let entry_rva = state
         .globals
         .get(entry_name)
         .map(|def| (state.sections[def.section_global_idx].vaddr + def.value) as u32)
-        .unwrap_or_else(|| panic!("toyos-ld: entry symbol '{entry_name}' not found"));
+        .ok_or_else(|| LinkError::MissingEntry(entry_name.to_string()))?;
 
     let num_sections: u16 = if layout.has_data { 3 } else { 2 }; // .text [.data] .reloc
 
@@ -186,7 +186,7 @@ pub(crate) fn emit_pe_bytes(
         }
         for (sym_name, &got_vaddr) in &layout.got {
             let sym_addr = resolve_symbol(state, sym_name, 0, None)
-                .unwrap_or_else(|| panic!("toyos-ld: undefined GOT symbol: {sym_name}"));
+                .ok_or_else(|| LinkError::UndefinedSymbols(vec![sym_name.clone()]))?;
             let off = (got_vaddr as u32 - layout.data_rva) as usize;
             data_data[off..off + 8].copy_from_slice(&sym_addr.to_le_bytes());
         }
@@ -196,5 +196,5 @@ pub(crate) fn emit_pe_bytes(
     // .reloc
     w.write_reloc_section();
 
-    buf
+    Ok(buf)
 }

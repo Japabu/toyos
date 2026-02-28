@@ -1,9 +1,16 @@
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::{env, fs, process};
 
 fn main() {
     let args = parse_args();
-    let objects = toyos_ld::resolve_libs(&args.inputs, &args.lib_paths, &args.libs);
+    let objects = match toyos_ld::resolve_libs(&args.inputs, &args.lib_paths, &args.libs) {
+        Ok(o) => o,
+        Err(e) => {
+            eprint!("toyos-ld: {e}");
+            process::exit(1);
+        }
+    };
 
     if objects.is_empty() {
         eprintln!("toyos-ld: no input files");
@@ -11,21 +18,28 @@ fn main() {
     }
 
     let result = if args.shared {
-        toyos_ld::link_shared(&objects)
+        toyos_ld::link_shared_full(&objects, args.build_id)
     } else if args.pe {
-        toyos_ld::link_pe(&objects, &args.entry, args.subsystem)
+        toyos_ld::link_pe_with(&objects, &args.entry, args.subsystem, args.gc_sections)
     } else if args.is_static {
-        toyos_ld::link_static(&objects, &args.entry, args.image_base)
+        toyos_ld::link_static_full(&objects, &args.entry, args.image_base, args.gc_sections, args.build_id)
     } else {
-        toyos_ld::link(&objects, &args.entry)
+        toyos_ld::link_full(&objects, &args.entry, args.gc_sections, args.build_id)
     };
 
     match result {
-        Ok(elf) => {
-            fs::write(&args.output, &elf).unwrap_or_else(|e| {
+        Ok(output_bytes) => {
+            fs::write(&args.output, &output_bytes).unwrap_or_else(|e| {
                 eprintln!("toyos-ld: cannot write {}: {e}", args.output.display());
                 process::exit(1);
             });
+            if let Some(map_path) = &args.map_file {
+                let map = generate_map(&output_bytes, &args.output, &objects);
+                fs::write(map_path, map).unwrap_or_else(|e| {
+                    eprintln!("toyos-ld: cannot write map {}: {e}", map_path.display());
+                    process::exit(1);
+                });
+            }
         }
         Err(e) => {
             eprint!("toyos-ld: {e}");
@@ -34,14 +48,61 @@ fn main() {
     }
 }
 
+fn generate_map(output: &[u8], output_path: &PathBuf, inputs: &[(String, Vec<u8>)]) -> String {
+    use object::read::{Object, ObjectSection, ObjectSymbol};
+
+    let mut map = String::new();
+    let _ = writeln!(map, "Linker Map: {}", output_path.display());
+    let _ = writeln!(map);
+
+    // Input files
+    let _ = writeln!(map, "Input files:");
+    for (name, data) in inputs {
+        let _ = writeln!(map, "  {name} ({} bytes)", data.len());
+    }
+    let _ = writeln!(map);
+
+    // Try parsing as ELF
+    if let Ok(elf) = object::read::elf::ElfFile64::<object::Endianness>::parse(output) {
+        // Sections
+        let _ = writeln!(map, "Sections:");
+        let _ = writeln!(map, "  {:>16}  {:>16}  {:>10}  {}", "Address", "Offset", "Size", "Name");
+        for section in elf.sections() {
+            let name = section.name().unwrap_or("<unknown>");
+            if name.is_empty() { continue; }
+            let _ = writeln!(map, "  {:>16x}  {:>16x}  {:>10x}  {}",
+                section.address(), section.file_range().map(|(o, _)| o).unwrap_or(0),
+                section.size(), name);
+        }
+        let _ = writeln!(map);
+
+        // Symbols
+        let _ = writeln!(map, "Symbols:");
+        let _ = writeln!(map, "  {:>16}  {:>8}  {}", "Value", "Bind", "Name");
+        let mut syms: Vec<_> = elf.symbols().collect();
+        syms.sort_by_key(|s| s.address());
+        for sym in syms {
+            let name = sym.name().unwrap_or("");
+            if name.is_empty() { continue; }
+            let bind = if sym.is_global() { "GLOBAL" } else { "LOCAL" };
+            let _ = writeln!(map, "  {:>16x}  {:>8}  {}", sym.address(), bind, name);
+        }
+    }
+
+    map
+}
+
 struct Args {
     output: PathBuf,
     entry: String,
     shared: bool,
     is_static: bool,
     pe: bool,
+    gc_sections: bool,
+    build_id: bool,
     image_base: u64,
     subsystem: u16,
+    map_file: Option<PathBuf>,
     inputs: Vec<PathBuf>,
     lib_paths: Vec<PathBuf>,
     libs: Vec<String>,
@@ -54,6 +115,9 @@ fn parse_args() -> Args {
     let mut shared = false;
     let mut is_static = false;
     let mut pe = false;
+    let mut gc_sections = false;
+    let mut build_id = false;
+    let mut map_file: Option<PathBuf> = None;
     let mut image_base = 0x200000u64;
     let mut subsystem = 10u16; // EFI_APPLICATION
     let mut inputs = Vec::new();
@@ -119,9 +183,14 @@ fn parse_args() -> Args {
                 // Ignore other MSVC flags (/NOLOGO, /DEBUG, /INCREMENTAL:NO, etc.)
             }
             // GNU-style flags
+            "--gc-sections" => { gc_sections = true; }
+            "--no-gc-sections" => { gc_sections = false; }
+            "-Map" => { i += 1; map_file = Some(PathBuf::from(&argv[i])); }
+            s if s.starts_with("-Map=") => { map_file = Some(PathBuf::from(&s[5..])); }
+            "--build-id" => { build_id = true; }
             "-pie" | "--as-needed" | "--no-as-needed" | "--eh-frame-hdr"
-            | "--hash-style=gnu" | "--build-id" | "-Bstatic" | "-static"
-            | "--gc-sections" | "--no-gc-sections" | "--no-dynamic-linker" => {}
+            | "--hash-style=gnu" | "-Bstatic" | "-static"
+            | "--no-dynamic-linker" => {}
             s if s.starts_with("-z") => { if s == "-z" { i += 1; } }
             s if s.starts_with("--") => {}
             s if s.starts_with('-') && s.len() > 1 => {}
@@ -130,5 +199,5 @@ fn parse_args() -> Args {
         i += 1;
     }
 
-    Args { output, entry, shared, is_static, pe, image_base, subsystem, inputs, lib_paths, libs }
+    Args { output, entry, shared, is_static, pe, gc_sections, build_id, map_file, image_base, subsystem, inputs, lib_paths, libs }
 }

@@ -38,6 +38,28 @@ pub(crate) fn tpoff(sym_addr: u64, tls_start: u64, tls_memsz: u64) -> i64 {
     sym_addr as i64 - (tls_start as i64 + tls_memsz as i64)
 }
 
+fn check_i32(value: i64, reloc: &InputReloc) -> Result<(), LinkError> {
+    if value < i32::MIN as i64 || value > i32::MAX as i64 {
+        return Err(LinkError::RelocationOverflow {
+            reloc_type: reloc.r_type,
+            symbol: reloc.symbol_name.clone(),
+            value,
+        });
+    }
+    Ok(())
+}
+
+fn check_u32(value: i64, reloc: &InputReloc) -> Result<(), LinkError> {
+    if value < 0 || value > u32::MAX as i64 {
+        return Err(LinkError::RelocationOverflow {
+            reloc_type: reloc.r_type,
+            symbol: reloc.symbol_name.clone(),
+            value,
+        });
+    }
+    Ok(())
+}
+
 /// Apply a single relocation, returning `true` if it's an absolute reference
 /// (needs a runtime relocation / PE base fixup).
 fn apply_one_reloc(
@@ -46,39 +68,43 @@ fn apply_one_reloc(
     sym_addr: u64,
     reloc_vaddr: u64,
     got: &HashMap<String, u64>,
-) -> bool {
+) -> Result<bool, LinkError> {
     match reloc.r_type {
         elf::R_X86_64_64 => {
             let value = (sym_addr as i64 + reloc.addend) as u64;
             write_u64(state, reloc.section_global_idx, reloc.offset, value);
-            true
+            Ok(true)
         }
         elf::R_X86_64_PC32 | elf::R_X86_64_PLT32 => {
             let value = sym_addr as i64 + reloc.addend - reloc_vaddr as i64;
+            check_i32(value, reloc)?;
             write_i32(state, reloc.section_global_idx, reloc.offset, value as i32);
-            false
+            Ok(false)
         }
         elf::R_X86_64_32 => {
-            let value = (sym_addr as i64 + reloc.addend) as u32;
-            write_u32(state, reloc.section_global_idx, reloc.offset, value);
-            false
+            let value = sym_addr as i64 + reloc.addend;
+            check_u32(value, reloc)?;
+            write_u32(state, reloc.section_global_idx, reloc.offset, value as u32);
+            Ok(false)
         }
         elf::R_X86_64_32S => {
-            let value = (sym_addr as i64 + reloc.addend) as i32;
-            write_i32(state, reloc.section_global_idx, reloc.offset, value);
-            false
+            let value = sym_addr as i64 + reloc.addend;
+            check_i32(value, reloc)?;
+            write_i32(state, reloc.section_global_idx, reloc.offset, value as i32);
+            Ok(false)
         }
         elf::R_X86_64_GOTPCREL | elf::R_X86_64_GOTPCRELX
         | elf::R_X86_64_REX_GOTPCRELX => {
             let got_slot = got[&reloc.symbol_name];
             let value = got_slot as i64 + reloc.addend - reloc_vaddr as i64;
+            check_i32(value, reloc)?;
             write_i32(state, reloc.section_global_idx, reloc.offset, value as i32);
-            false
+            Ok(false)
         }
-        other => panic!(
-            "toyos-ld: unsupported relocation type {other} for symbol {}",
-            reloc.symbol_name,
-        ),
+        other => Err(LinkError::UnsupportedRelocation {
+            reloc_type: other,
+            symbol: reloc.symbol_name.clone(),
+        }),
     }
 }
 
@@ -140,7 +166,7 @@ pub(crate) fn apply_relocs(
         match reloc.r_type {
             elf::R_X86_64_TLSGD => {
                 let sym_addr = resolve_symbol(state, &reloc.symbol_name, reloc.section_global_idx, params.plt)
-                    .unwrap_or_else(|| panic!("toyos-ld: undefined TLS symbol: {}", reloc.symbol_name));
+                    .ok_or_else(|| LinkError::UndefinedSymbols(vec![reloc.symbol_name.clone()]))?;
                 let padded = is_padded_tls_sequence(
                     &state.sections[reloc.section_global_idx].data,
                     reloc.offset,
@@ -154,11 +180,15 @@ pub(crate) fn apply_relocs(
                         0x48, 0x8d, 0x80, 0x00, 0x00, 0x00, 0x00,             // lea 0(%rax),%rax
                     ];
                     write_bytes(state, reloc.section_global_idx, reloc.offset - 4, &inst);
-                    write_i32(state, reloc.section_global_idx, reloc.offset + 8,
-                        tpoff(sym_addr, params.tls_start, params.tls_memsz) as i32);
+                    let tp_value = tpoff(sym_addr, params.tls_start, params.tls_memsz);
+                    check_i32(tp_value, reloc)?;
+                    write_i32(state, reloc.section_global_idx, reloc.offset + 8, tp_value as i32);
                     relaxed_calls.insert((reloc.section_global_idx, reloc.offset + 8));
                 } else {
-                    panic!("toyos-ld: unpadded 12-byte TLSGD sequence not supported");
+                    return Err(LinkError::UnsupportedRelocation {
+                        reloc_type: elf::R_X86_64_TLSGD,
+                        symbol: reloc.symbol_name.clone(),
+                    });
                 }
             }
             elf::R_X86_64_TLSLD => {
@@ -189,9 +219,10 @@ pub(crate) fn apply_relocs(
             }
             elf::R_X86_64_DTPOFF32 => {
                 let sym_addr = resolve_symbol(state, &reloc.symbol_name, reloc.section_global_idx, params.plt)
-                    .unwrap_or_else(|| panic!("toyos-ld: undefined TLS symbol: {}", reloc.symbol_name));
-                write_i32(state, reloc.section_global_idx, reloc.offset,
-                    (tpoff(sym_addr, params.tls_start, params.tls_memsz) + reloc.addend) as i32);
+                    .ok_or_else(|| LinkError::UndefinedSymbols(vec![reloc.symbol_name.clone()]))?;
+                let value = tpoff(sym_addr, params.tls_start, params.tls_memsz) + reloc.addend;
+                check_i32(value, reloc)?;
+                write_i32(state, reloc.section_global_idx, reloc.offset, value as i32);
             }
             _ => {}
         }
@@ -224,17 +255,18 @@ pub(crate) fn apply_relocs(
 
         match reloc.r_type {
             elf::R_X86_64_TPOFF32 => {
-                let tp = tpoff(sym_addr, params.tls_start, params.tls_memsz);
-                write_i32(state, reloc.section_global_idx, reloc.offset,
-                    (tp + reloc.addend) as i32);
+                let value = tpoff(sym_addr, params.tls_start, params.tls_memsz) + reloc.addend;
+                check_i32(value, reloc)?;
+                write_i32(state, reloc.section_global_idx, reloc.offset, value as i32);
             }
             elf::R_X86_64_GOTTPOFF => {
                 let got_slot = params.got[&reloc.symbol_name];
                 let value = got_slot as i64 + reloc.addend - reloc_vaddr as i64;
+                check_i32(value, reloc)?;
                 write_i32(state, reloc.section_global_idx, reloc.offset, value as i32);
             }
             _ => {
-                let is_abs = apply_one_reloc(state, reloc, sym_addr, reloc_vaddr, params.got);
+                let is_abs = apply_one_reloc(state, reloc, sym_addr, reloc_vaddr, params.got)?;
                 if is_abs && params.record_relatives {
                     relatives.push((reloc_vaddr, sym_addr as i64 + reloc.addend));
                 }
@@ -252,7 +284,7 @@ pub(crate) fn apply_relocs(
 
         for (sym_name, &got_vaddr) in params.got {
             let sym_addr = resolve_symbol(state, sym_name, 0, params.plt)
-                .unwrap_or_else(|| panic!("toyos-ld: undefined GOT symbol: {sym_name}"));
+                .ok_or_else(|| LinkError::UndefinedSymbols(vec![sym_name.clone()]))?;
             if gottpoff_syms.contains(sym_name) {
                 let tp = tpoff(sym_addr, params.tls_start, params.tls_memsz);
                 relatives.push((got_vaddr, tp));
@@ -304,7 +336,7 @@ pub(crate) fn apply_relocs_pe(
             }
         };
 
-        let is_abs = apply_one_reloc(state, reloc, sym_addr, reloc_vaddr, &layout.got);
+        let is_abs = apply_one_reloc(state, reloc, sym_addr, reloc_vaddr, &layout.got)?;
         if is_abs {
             abs_fixups.push(reloc_vaddr as u32);
         }
