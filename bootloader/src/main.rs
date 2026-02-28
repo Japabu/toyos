@@ -11,6 +11,7 @@ use elf::{abi, endian::AnyEndian, ElfBytes};
 use uefi::{
     prelude::*,
     CStr16,
+    proto::console::gop::{GraphicsOutput, PixelFormat},
     proto::media::file::{File, FileInfo, FileMode},
     table::{boot::{MemoryType, PAGE_SIZE}, cfg::ACPI2_GUID},
 };
@@ -46,6 +47,12 @@ pub struct KernelArgs {
     pub init_program_len: u64,
     pub kernel_elf_addr: u64,
     pub kernel_elf_size: u64,
+    pub gop_framebuffer: u64,
+    pub gop_framebuffer_size: u64,
+    pub gop_width: u32,
+    pub gop_height: u32,
+    pub gop_stride: u32,
+    pub gop_pixel_format: u32,
 }
 
 #[repr(C)]
@@ -168,7 +175,47 @@ fn load_kernel_elf(kernel_elf_bytes: &[u8]) -> LoadedKernel {
 
 static INIT_PROGRAM: &[u8] = b"compositor";
 
-fn start_kernel(kernel: LoadedKernel, kernel_elf_bytes: vec::Vec<u8>, initrd: vec::Vec<u8>, rsdp_addr: u64, system_table: SystemTable<Boot>) -> ! {
+struct GopInfo {
+    framebuffer: u64,
+    framebuffer_size: u64,
+    width: u32,
+    height: u32,
+    stride: u32,
+    pixel_format: u32,
+}
+
+fn query_gop(system_table: &SystemTable<Boot>) -> Option<GopInfo> {
+    let bs = system_table.boot_services();
+    let gop_handle = bs.get_handle_for_protocol::<GraphicsOutput>().ok()?;
+    let mut gop = bs.open_protocol_exclusive::<GraphicsOutput>(gop_handle).ok()?;
+
+    let mode = gop.current_mode_info();
+    let (width, height) = mode.resolution();
+    let stride = mode.stride();
+    let pixel_format = match mode.pixel_format() {
+        PixelFormat::Rgb => 0,
+        PixelFormat::Bgr => 1,
+        _ => return None, // Bitmask/BltOnly not supported
+    };
+
+    let mut fb = gop.frame_buffer();
+    let framebuffer = fb.as_mut_ptr() as u64;
+    let framebuffer_size = fb.size() as u64;
+
+    println!("GOP: {}x{} stride={} format={} fb={:#x} size={}",
+        width, height, stride, pixel_format, framebuffer, framebuffer_size);
+
+    Some(GopInfo {
+        framebuffer,
+        framebuffer_size,
+        width: width as u32,
+        height: height as u32,
+        stride: stride as u32,
+        pixel_format,
+    })
+}
+
+fn start_kernel(kernel: LoadedKernel, kernel_elf_bytes: vec::Vec<u8>, initrd: vec::Vec<u8>, rsdp_addr: u64, gop: Option<GopInfo>, system_table: SystemTable<Boot>) -> ! {
     // Estimate memory map size
     let mms = system_table.boot_services().memory_map_size();
     let memory_map_entry_count = mms.map_size / mms.entry_size + 8;
@@ -185,6 +232,12 @@ fn start_kernel(kernel: LoadedKernel, kernel_elf_bytes: vec::Vec<u8>, initrd: ve
         });
     });
 
+    let (gop_framebuffer, gop_framebuffer_size, gop_width, gop_height, gop_stride, gop_pixel_format) =
+        match &gop {
+            Some(g) => (g.framebuffer, g.framebuffer_size, g.width, g.height, g.stride, g.pixel_format),
+            None => (0, 0, 0, 0, 0, 0),
+        };
+
     let kernel_args = KernelArgs {
         memory_map_addr: memory_map.as_ptr() as u64,
         memory_map_size: memory_map.len() as u64 * mem::size_of::<MemoryMapEntry>() as u64,
@@ -199,6 +252,12 @@ fn start_kernel(kernel: LoadedKernel, kernel_elf_bytes: vec::Vec<u8>, initrd: ve
         init_program_len: INIT_PROGRAM.len() as u64,
         kernel_elf_addr: kernel_elf_bytes.as_ptr() as u64,
         kernel_elf_size: kernel_elf_bytes.len() as u64,
+        gop_framebuffer,
+        gop_framebuffer_size,
+        gop_width,
+        gop_height,
+        gop_stride,
+        gop_pixel_format,
     };
     let entry_addr = kernel.memory.as_ptr() as usize + kernel.entry_offset;
 
@@ -236,6 +295,9 @@ fn main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
     println!("Loading kernel elf...");
     let loaded_kernel = load_kernel_elf(&kernel_bytes);
 
+    // Query UEFI GOP before exiting boot services
+    let gop = query_gop(&system_table);
+
     println!("Starting kernel...");
-    start_kernel(loaded_kernel, kernel_bytes, initrd, rsdp_addr, system_table);
+    start_kernel(loaded_kernel, kernel_bytes, initrd, rsdp_addr, gop, system_table);
 }

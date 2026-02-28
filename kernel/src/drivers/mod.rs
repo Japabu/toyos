@@ -7,6 +7,7 @@ pub mod xhci;
 pub mod virtio;
 pub mod virtio_gpu;
 pub mod virtio_net;
+pub mod gop;
 
 /// Page-aligned DMA memory pool for device I/O buffers.
 #[repr(C, align(4096))]

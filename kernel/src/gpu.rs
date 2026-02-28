@@ -1,0 +1,62 @@
+use alloc::boxed::Box;
+use crate::sync::Lock;
+
+pub const FLAG_HARDWARE_CURSOR: u32 = 1 << 0;
+
+pub struct GpuInfo {
+    pub tokens: [u32; 2],
+    pub cursor_token: u32,
+    pub width: u32,
+    pub height: u32,
+    pub stride: u32,
+    pub pixel_format: u32,
+    pub flags: u32,
+}
+
+/// Hardware-agnostic GPU interface. Implement this for any display driver
+/// (virtio-gpu, UEFI GOP, etc.) and register it with `gpu::register()`.
+pub trait Gpu: Send {
+    fn present_rect(&mut self, x: u32, y: u32, w: u32, h: u32);
+    fn set_cursor(&mut self, hot_x: u32, hot_y: u32);
+    fn move_cursor(&mut self, x: u32, y: u32);
+}
+
+static GPU: Lock<Option<Box<dyn Gpu>>> = Lock::new(None);
+static INFO: Lock<Option<GpuInfo>> = Lock::new(None);
+
+pub fn register(gpu: Box<dyn Gpu>, info: GpuInfo) {
+    *INFO.lock() = Some(info);
+    *GPU.lock() = Some(gpu);
+}
+
+pub fn info() -> Option<GpuInfo> {
+    let guard = INFO.lock();
+    let info = guard.as_ref()?;
+    Some(GpuInfo {
+        tokens: info.tokens,
+        cursor_token: info.cursor_token,
+        width: info.width,
+        height: info.height,
+        stride: info.stride,
+        pixel_format: info.pixel_format,
+        flags: info.flags,
+    })
+}
+
+pub fn present_rect(x: u32, y: u32, w: u32, h: u32) {
+    if let Some(gpu) = GPU.lock().as_mut() {
+        gpu.present_rect(x, y, w, h);
+    }
+}
+
+pub fn set_cursor(hot_x: u32, hot_y: u32) {
+    if let Some(gpu) = GPU.lock().as_mut() {
+        gpu.set_cursor(hot_x, hot_y);
+    }
+}
+
+pub fn move_cursor(x: u32, y: u32) {
+    if let Some(gpu) = GPU.lock().as_mut() {
+        gpu.move_cursor(x, y);
+    }
+}

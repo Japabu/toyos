@@ -1,4 +1,5 @@
 use alloc::alloc::{alloc_zeroed, Layout};
+use alloc::borrow::Cow;
 
 use crate::arch::paging::PAGE_2M;
 use crate::log;
@@ -296,7 +297,7 @@ pub fn resolve_dynamic_deps(
     data: &[u8],
     base: u64,
     exe_path: &str,
-    read_file: impl Fn(&str) -> Option<alloc::vec::Vec<u8>>,
+    read_file: impl Fn(&str) -> Result<Cow<'static, [u8]>, &'static str>,
 ) -> Result<alloc::vec::Vec<LoadedLib>, alloc::string::String> {
     let elf = match ElfBytes::<AnyEndian>::minimal_parse(data) {
         Ok(e) => e,
@@ -360,8 +361,8 @@ pub fn resolve_dynamic_deps(
         log!("dynamic: loading {} for {}", lib_path, exe_path);
 
         let so_data = match read_file(&lib_path) {
-            Some(d) => d,
-            None => return Err(alloc::format!("failed to load shared library {}", lib_path)),
+            Ok(d) => d,
+            Err(e) => return Err(alloc::format!("{}: {}", lib_path, e)),
         };
 
         match load_shared_lib(&so_data) {

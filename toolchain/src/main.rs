@@ -66,12 +66,20 @@ profile = "compiler"
 
 [build]
 host = ["{host}", "x86_64-unknown-toyos"]
-target = ["{host}", "x86_64-unknown-toyos"]
+target = ["{host}", "x86_64-unknown-toyos", "x86_64-unknown-none", "x86_64-unknown-uefi"]
 
 [rust]
 incremental = true
 
 [target.x86_64-unknown-toyos]
+linker = "{linker}"
+codegen-backends = ["cranelift"]
+
+[target.x86_64-unknown-none]
+linker = "{linker}"
+codegen-backends = ["cranelift"]
+
+[target.x86_64-unknown-uefi]
 linker = "{linker}"
 codegen-backends = ["cranelift"]
 "#

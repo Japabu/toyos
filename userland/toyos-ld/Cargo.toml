@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-object = { version = "0.38", default-features = false, features = ["read", "elf", "std"] }
+object = { version = "0.38", default-features = false, features = ["read", "elf", "coff", "pe", "std"] }
 
 [dev-dependencies]
-object = { version = "0.38", default-features = false, features = ["read", "write", "elf", "std"] }
+object = { version = "0.38", default-features = false, features = ["read", "write", "elf", "coff", "pe", "std"] }

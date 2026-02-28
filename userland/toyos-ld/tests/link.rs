@@ -1,6 +1,6 @@
-use object::elf;
+use object::{elf, pe};
 use object::read::elf::{ElfFile64, FileHeader as _};
-use object::read::{Object, ObjectSection, ObjectSymbol};
+use object::read::{self, Object, ObjectSection, ObjectSymbol};
 use object::write::{Object as WriteObject, StandardSection, Symbol, SymbolSection};
 use object::{
     Architecture, BinaryFormat, Endianness, RelocationFlags, SymbolFlags, SymbolKind, SymbolScope,
@@ -128,7 +128,7 @@ fn basic_single_function() {
     assert_eq!(elf.elf_header().e_type.get(endian), 3, "should be ET_DYN");
     assert_eq!(elf.elf_header().e_machine.get(endian), 62, "should be x86_64");
     let entry = elf.elf_header().e_entry.get(endian);
-    assert!(entry >= 0x200000, "entry should be in virtual address space");
+    assert!(entry > 0, "entry should be nonzero");
     assert!(has_phdr(&elf, elf::PT_LOAD), "should have PT_LOAD");
 }
 
@@ -195,7 +195,7 @@ fn cross_object_symbol_resolution() {
 
     let elf = parse_elf(&elf_bytes);
     let entry = elf.elf_header().e_entry.get(elf.endian());
-    assert!(entry >= 0x200000);
+    assert!(entry > 0, "entry should be nonzero");
 }
 
 #[test]
@@ -1371,4 +1371,857 @@ fn pe_undefined_symbol_error() {
     );
     let syms = result.expect_err("should fail with undefined symbol");
     assert!(syms.contains(&"missing".to_string()));
+}
+
+fn parse_pe_u16_at(data: &[u8], off: usize) -> u16 {
+    u16::from_le_bytes(data[off..off + 2].try_into().unwrap())
+}
+fn parse_pe_u64_at(data: &[u8], off: usize) -> u64 {
+    u64::from_le_bytes(data[off..off + 8].try_into().unwrap())
+}
+
+#[test]
+fn pe_dll_characteristics_dynamic_base() {
+    // UEFI PE must have DYNAMIC_BASE set so firmware applies base relocations
+    let obj_data = build_minimal_obj("efi_main", &[0xC3]);
+    let pe = toyos_ld::link_pe(&[("test.o".into(), obj_data)], "efi_main", 10)
+        .expect("PE linking should succeed");
+
+    let pe_off = parse_pe_u32(&pe, 0x3C) as usize;
+    let oh = pe_off + 4 + 20;
+    let dll_chars = parse_pe_u16_at(&pe, oh + 70);
+
+    let dynamic_base = 0x0040u16;
+    let nx_compat = 0x0100u16;
+    assert!(dll_chars & dynamic_base != 0,
+        "DllCharacteristics should have DYNAMIC_BASE ({dll_chars:#06x})");
+    assert!(dll_chars & nx_compat != 0,
+        "DllCharacteristics should have NX_COMPAT ({dll_chars:#06x})");
+}
+
+#[test]
+fn pe_stack_heap_sizes() {
+    // UEFI PE should have nonzero stack/heap reserve values
+    let obj_data = build_minimal_obj("efi_main", &[0xC3]);
+    let pe = toyos_ld::link_pe(&[("test.o".into(), obj_data)], "efi_main", 10)
+        .expect("PE linking should succeed");
+
+    let pe_off = parse_pe_u32(&pe, 0x3C) as usize;
+    let oh = pe_off + 4 + 20;
+    let stack_reserve = parse_pe_u64_at(&pe, oh + 72);
+    let stack_commit = parse_pe_u64_at(&pe, oh + 80);
+
+    assert!(stack_reserve > 0, "StackReserve should be nonzero");
+    assert!(stack_commit > 0, "StackCommit should be nonzero");
+}
+
+// ── COFF input tests ─────────────────────────────────────────────────────
+
+fn build_minimal_coff(symbol_name: &str, code: &[u8]) -> Vec<u8> {
+    let mut obj = WriteObject::new(BinaryFormat::Coff, Architecture::X86_64, Endianness::Little);
+    let text = obj.section_id(StandardSection::Text);
+    let offset = obj.append_section_data(text, code, 16);
+    obj.add_symbol(Symbol {
+        name: symbol_name.as_bytes().to_vec(),
+        value: offset,
+        size: code.len() as u64,
+        kind: SymbolKind::Text,
+        scope: SymbolScope::Dynamic,
+        weak: false,
+        section: SymbolSection::Section(text),
+        flags: SymbolFlags::None,
+    });
+    obj.write().unwrap()
+}
+
+#[test]
+fn coff_input_link_pie() {
+    // COFF object should work as input for PIE ELF output
+    let code = vec![0x31, 0xFF, 0xB8, 0x3C, 0x00, 0x00, 0x00, 0x0F, 0x05];
+    let obj_data = build_minimal_coff("_start", &code);
+    let result = toyos_ld::link(
+        &[("test.o".into(), obj_data)],
+        "_start",
+    );
+    let elf_bytes = result.expect("linking COFF input should succeed");
+    let elf = parse_elf(&elf_bytes);
+    let endian = elf.endian();
+    assert_eq!(elf.elf_header().e_type.get(endian), 3, "should be ET_DYN");
+    assert_eq!(elf.elf_header().e_machine.get(endian), 62, "should be x86_64");
+    let entry = elf.elf_header().e_entry.get(endian);
+    assert!(entry > 0, "entry should be nonzero");
+}
+
+#[test]
+fn coff_input_link_pe() {
+    // COFF object should work as input for PE output
+    let obj_data = build_minimal_coff("efi_main", &[0xC3]);
+    let result = toyos_ld::link_pe(
+        &[("test.o".into(), obj_data)],
+        "efi_main",
+        10,
+    );
+    let pe = result.expect("linking COFF→PE should succeed");
+    // Verify PE magic
+    assert_eq!(&pe[0..2], b"MZ");
+    let pe_off = parse_pe_u32(&pe, 0x3C) as usize;
+    assert_eq!(&pe[pe_off..pe_off + 4], b"PE\0\0");
+}
+
+#[test]
+fn coff_input_pc_relative_reloc() {
+    // COFF IMAGE_REL_AMD64_REL32 should work like ELF R_X86_64_PLT32
+    let mut obj = WriteObject::new(BinaryFormat::Coff, Architecture::X86_64, Endianness::Little);
+    let text = obj.section_id(StandardSection::Text);
+
+    // callee: single ret
+    let callee_off = obj.append_section_data(text, &[0xC3], 16);
+    obj.add_symbol(Symbol {
+        name: b"callee".to_vec(),
+        value: callee_off, size: 1,
+        kind: SymbolKind::Text, scope: SymbolScope::Dynamic,
+        weak: false, section: SymbolSection::Section(text), flags: SymbolFlags::None,
+    });
+
+    // caller: call callee (E8 rel32), then ret
+    let caller_off = obj.append_section_data(text, &[0xE8, 0, 0, 0, 0, 0xC3], 16);
+    let callee_sym = obj.symbol_id(b"callee").unwrap();
+    obj.add_relocation(text, object::write::Relocation {
+        offset: caller_off + 1,
+        symbol: callee_sym,
+        addend: -4,
+        flags: RelocationFlags::Coff { typ: pe::IMAGE_REL_AMD64_REL32 },
+    }).unwrap();
+    obj.add_symbol(Symbol {
+        name: b"_start".to_vec(),
+        value: caller_off, size: 6,
+        kind: SymbolKind::Text, scope: SymbolScope::Dynamic,
+        weak: false, section: SymbolSection::Section(text), flags: SymbolFlags::None,
+    });
+
+    let result = toyos_ld::link(
+        &[("test.o".into(), obj.write().unwrap())],
+        "_start",
+    );
+    result.expect("COFF with REL32 should link successfully");
+}
+
+#[test]
+fn coff_input_absolute_reloc_pe() {
+    // COFF IMAGE_REL_AMD64_ADDR64 should produce base relocations in PE
+    let mut obj = WriteObject::new(BinaryFormat::Coff, Architecture::X86_64, Endianness::Little);
+    let text = obj.section_id(StandardSection::Text);
+    let data = obj.section_id(StandardSection::Data);
+
+    // data: 8 bytes
+    let data_off = obj.append_section_data(data, &[0x42; 8], 8);
+    let data_sym = obj.add_symbol(Symbol {
+        name: b"my_data".to_vec(),
+        value: data_off, size: 8,
+        kind: SymbolKind::Data, scope: SymbolScope::Dynamic,
+        weak: false, section: SymbolSection::Section(data), flags: SymbolFlags::None,
+    });
+
+    // text: movabs rax, [my_data] — 8 bytes absolute address, then ret
+    let code = [0x48, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, 0xC3];
+    let code_off = obj.append_section_data(text, &code, 16);
+    obj.add_relocation(text, object::write::Relocation {
+        offset: code_off + 2,
+        symbol: data_sym,
+        addend: 0,
+        flags: RelocationFlags::Coff { typ: pe::IMAGE_REL_AMD64_ADDR64 },
+    }).unwrap();
+    obj.add_symbol(Symbol {
+        name: b"efi_main".to_vec(),
+        value: code_off, size: code.len() as u64,
+        kind: SymbolKind::Text, scope: SymbolScope::Dynamic,
+        weak: false, section: SymbolSection::Section(text), flags: SymbolFlags::None,
+    });
+
+    let result = toyos_ld::link_pe(
+        &[("test.o".into(), obj.write().unwrap())],
+        "efi_main",
+        10,
+    );
+    let pe = result.expect("COFF with ADDR64 should link to PE");
+
+    // Verify base relocation directory is non-empty
+    let pe_off = parse_pe_u32(&pe, 0x3C) as usize;
+    let oh = pe_off + 4 + 20; // optional header start
+    let dd5 = oh + 0x70 + 5 * 8; // base relocation data directory
+    let reloc_dir_size = parse_pe_u32(&pe, dd5 + 4);
+    assert!(reloc_dir_size > 0, "ADDR64 should produce base relocations");
+}
+
+#[test]
+fn coff_input_cross_object() {
+    // Two COFF objects linked together — caller references callee in another object
+    let mut obj1 = WriteObject::new(BinaryFormat::Coff, Architecture::X86_64, Endianness::Little);
+    let text1 = obj1.section_id(StandardSection::Text);
+    let callee_off = obj1.append_section_data(text1, &[0xC3], 16);
+    obj1.add_symbol(Symbol {
+        name: b"callee".to_vec(),
+        value: callee_off, size: 1,
+        kind: SymbolKind::Text, scope: SymbolScope::Dynamic,
+        weak: false, section: SymbolSection::Section(text1), flags: SymbolFlags::None,
+    });
+
+    let mut obj2 = WriteObject::new(BinaryFormat::Coff, Architecture::X86_64, Endianness::Little);
+    let text2 = obj2.section_id(StandardSection::Text);
+    let caller_off = obj2.append_section_data(text2, &[0xE8, 0, 0, 0, 0, 0xC3], 16);
+    let callee_sym = obj2.add_symbol(Symbol {
+        name: b"callee".to_vec(),
+        value: 0, size: 0,
+        kind: SymbolKind::Text, scope: SymbolScope::Dynamic,
+        weak: false, section: SymbolSection::Undefined, flags: SymbolFlags::None,
+    });
+    obj2.add_relocation(text2, object::write::Relocation {
+        offset: caller_off + 1,
+        symbol: callee_sym,
+        addend: -4,
+        flags: RelocationFlags::Coff { typ: pe::IMAGE_REL_AMD64_REL32 },
+    }).unwrap();
+    obj2.add_symbol(Symbol {
+        name: b"_start".to_vec(),
+        value: caller_off, size: 6,
+        kind: SymbolKind::Text, scope: SymbolScope::Dynamic,
+        weak: false, section: SymbolSection::Section(text2), flags: SymbolFlags::None,
+    });
+
+    let result = toyos_ld::link(
+        &[
+            ("obj1.o".into(), obj1.write().unwrap()),
+            ("obj2.o".into(), obj2.write().unwrap()),
+        ],
+        "_start",
+    );
+    result.expect("cross-object COFF linking should succeed");
+}
+
+#[test]
+fn coff_input_mixed_with_elf() {
+    // One ELF object + one COFF object linked together
+    let elf_obj = build_minimal_obj("callee", &[0xC3]);
+
+    let mut coff_obj = WriteObject::new(BinaryFormat::Coff, Architecture::X86_64, Endianness::Little);
+    let text = coff_obj.section_id(StandardSection::Text);
+    let caller_off = coff_obj.append_section_data(text, &[0xE8, 0, 0, 0, 0, 0xC3], 16);
+    let callee_sym = coff_obj.add_symbol(Symbol {
+        name: b"callee".to_vec(),
+        value: 0, size: 0,
+        kind: SymbolKind::Text, scope: SymbolScope::Dynamic,
+        weak: false, section: SymbolSection::Undefined, flags: SymbolFlags::None,
+    });
+    coff_obj.add_relocation(text, object::write::Relocation {
+        offset: caller_off + 1,
+        symbol: callee_sym,
+        addend: -4,
+        flags: RelocationFlags::Coff { typ: pe::IMAGE_REL_AMD64_REL32 },
+    }).unwrap();
+    coff_obj.add_symbol(Symbol {
+        name: b"_start".to_vec(),
+        value: caller_off, size: 6,
+        kind: SymbolKind::Text, scope: SymbolScope::Dynamic,
+        weak: false, section: SymbolSection::Section(text), flags: SymbolFlags::None,
+    });
+
+    let result = toyos_ld::link(
+        &[
+            ("elf.o".into(), elf_obj),
+            ("coff.o".into(), coff_obj.write().unwrap()),
+        ],
+        "_start",
+    );
+    result.expect("mixing ELF and COFF objects should link successfully");
+}
+
+/// Build a COFF object with a weak external symbol (the pattern used by LLVM/Cranelift
+/// for compiler_builtins: `.weak.FOO.default` is the actual code, `FOO` is a weak alias).
+/// The `object` crate auto-generates the `.weak.NAME.default` alias when `weak: true`.
+fn build_coff_with_weak_external(weak_name: &str, code: &[u8]) -> Vec<u8> {
+    let mut obj = WriteObject::new(BinaryFormat::Coff, Architecture::X86_64, Endianness::Little);
+    let text = obj.section_id(StandardSection::Text);
+    let offset = obj.append_section_data(text, code, 16);
+
+    // Setting weak: true causes the object crate to emit:
+    //   `.weak.NAME.default` as the actual symbol with the code
+    //   `NAME` as a weak external pointing to `.weak.NAME.default`
+    obj.add_symbol(Symbol {
+        name: weak_name.as_bytes().to_vec(),
+        value: offset,
+        size: code.len() as u64,
+        kind: SymbolKind::Text,
+        scope: SymbolScope::Dynamic,
+        weak: true,
+        section: SymbolSection::Section(text),
+        flags: SymbolFlags::None,
+    });
+
+    obj.write().unwrap()
+}
+
+#[test]
+fn coff_weak_external_resolves() {
+    // A COFF weak external (like `memcpy` → `.weak.memcpy.default`) should be
+    // resolved by the linker. This is how compiler_builtins provides memcpy etc.
+    // on COFF targets.
+    let impl_code = vec![0xC3]; // ret
+    let weak_obj = build_coff_with_weak_external("memcpy", &impl_code);
+
+    // A caller that references memcpy
+    let mut caller = WriteObject::new(BinaryFormat::Coff, Architecture::X86_64, Endianness::Little);
+    let text = caller.section_id(StandardSection::Text);
+    // call memcpy (E8 00000000) + ret (C3) = 6 bytes
+    let call_off = caller.append_section_data(text, &[0xE8, 0x00, 0x00, 0x00, 0x00, 0xC3], 16);
+    let memcpy_sym = caller.add_symbol(Symbol {
+        name: b"memcpy".to_vec(),
+        value: 0, size: 0,
+        kind: SymbolKind::Text, scope: SymbolScope::Dynamic,
+        weak: false, section: SymbolSection::Undefined, flags: SymbolFlags::None,
+    });
+    caller.add_symbol(Symbol {
+        name: b"_start".to_vec(),
+        value: call_off, size: 6,
+        kind: SymbolKind::Text, scope: SymbolScope::Dynamic,
+        weak: false, section: SymbolSection::Section(text), flags: SymbolFlags::None,
+    });
+    let text_idx = caller.section_id(StandardSection::Text);
+    caller.add_relocation(text_idx, object::write::Relocation {
+        offset: call_off + 1,
+        addend: -4,
+        symbol: memcpy_sym,
+        flags: RelocationFlags::Coff { typ: pe::IMAGE_REL_AMD64_REL32 },
+    }).unwrap();
+    let caller_obj = caller.write().unwrap();
+
+    let result = toyos_ld::link(
+        &[
+            ("builtins.o".into(), weak_obj),
+            ("caller.o".into(), caller_obj),
+        ],
+        "_start",
+    );
+    result.expect("COFF weak external memcpy should be resolved");
+}
+
+#[test]
+fn coff_weak_external_pe() {
+    // Same test but for PE output — weak externals must also work for PE linking
+    let weak_obj = build_coff_with_weak_external("efi_main", &[0xC3]);
+    let result = toyos_ld::link_pe(
+        &[("builtins.o".into(), weak_obj)],
+        "efi_main",
+        10,
+    );
+    result.expect("COFF weak external should resolve for PE output");
+}
+
+#[test]
+fn coff_weak_external_multiple_builtins() {
+    // Multiple weak externals (memcpy, memset, __adddf3) should all resolve
+    let memcpy_obj = build_coff_with_weak_external("memcpy", &[0xC3]);
+    let memset_obj = build_coff_with_weak_external("memset", &[0xC3]);
+    let adddf3_obj = build_coff_with_weak_external("__adddf3", &[0xC3]);
+
+    let mut caller = WriteObject::new(BinaryFormat::Coff, Architecture::X86_64, Endianness::Little);
+    let text = caller.section_id(StandardSection::Text);
+    let off = caller.append_section_data(text, &[0xC3], 16);
+    caller.add_symbol(Symbol {
+        name: b"_start".to_vec(),
+        value: off, size: 1,
+        kind: SymbolKind::Text, scope: SymbolScope::Dynamic,
+        weak: false, section: SymbolSection::Section(text), flags: SymbolFlags::None,
+    });
+    // Reference all three
+    for name in &["memcpy", "memset", "__adddf3"] {
+        caller.add_symbol(Symbol {
+            name: name.as_bytes().to_vec(),
+            value: 0, size: 0,
+            kind: SymbolKind::Text, scope: SymbolScope::Dynamic,
+            weak: false, section: SymbolSection::Undefined, flags: SymbolFlags::None,
+        });
+    }
+    let caller_obj = caller.write().unwrap();
+
+    let result = toyos_ld::link(
+        &[
+            ("memcpy.o".into(), memcpy_obj),
+            ("memset.o".into(), memset_obj),
+            ("adddf3.o".into(), adddf3_obj),
+            ("caller.o".into(), caller_obj),
+        ],
+        "_start",
+    );
+    result.expect("multiple COFF weak externals should all resolve");
+}
+
+// ── Tests: PIE ELF base address ──────────────────────────────────────────
+
+#[test]
+fn pie_base_vaddr_is_zero() {
+    // PIE ELF should have LOAD segments starting near vaddr 0, not 0x200000
+    let code = vec![0xC3]; // ret
+    let obj_data = build_minimal_obj("_start", &code);
+
+    let elf_bytes = toyos_ld::link(&[("test.o".into(), obj_data)], "_start")
+        .expect("linking should succeed");
+
+    let elf = parse_elf(&elf_bytes);
+    let endian = elf.endian();
+    let phdrs = elf.elf_header().program_headers(endian, elf.data()).unwrap();
+
+    let first_load = phdrs.iter()
+        .find(|ph| ph.p_type.get(endian) == elf::PT_LOAD)
+        .expect("should have PT_LOAD");
+
+    let vaddr = first_load.p_vaddr.get(endian);
+    assert!(vaddr < 0x10000,
+        "first PT_LOAD vaddr should be near 0 for PIE, got {vaddr:#x}");
+}
+
+#[test]
+fn pie_entry_is_zero_based() {
+    // Entry point should be a small offset (0-based), not 0x200000+offset
+    let code = vec![0xC3]; // ret
+    let obj_data = build_minimal_obj("_start", &code);
+
+    let elf_bytes = toyos_ld::link(&[("test.o".into(), obj_data)], "_start")
+        .expect("linking should succeed");
+
+    let elf = parse_elf(&elf_bytes);
+    let entry = elf.elf_header().e_entry.get(elf.endian());
+    assert!(entry < 0x10000,
+        "entry should be zero-based for PIE, got {entry:#x}");
+}
+
+#[test]
+fn pie_file_offset_equals_vaddr() {
+    // For PIE with base 0, file offset should equal vaddr (p_offset == p_vaddr)
+    let code = vec![0xC3];
+    let obj_data = build_minimal_obj("_start", &code);
+
+    let elf_bytes = toyos_ld::link(&[("test.o".into(), obj_data)], "_start")
+        .expect("linking should succeed");
+
+    let elf = parse_elf(&elf_bytes);
+    let endian = elf.endian();
+    let phdrs = elf.elf_header().program_headers(endian, elf.data()).unwrap();
+
+    for ph in phdrs.iter().filter(|ph| ph.p_type.get(endian) == elf::PT_LOAD) {
+        let vaddr = ph.p_vaddr.get(endian);
+        let offset = ph.p_offset.get(endian);
+        assert_eq!(offset, vaddr,
+            "PT_LOAD p_offset ({offset:#x}) should equal p_vaddr ({vaddr:#x}) for PIE");
+    }
+}
+
+#[test]
+fn pie_relative_relocs_are_zero_based() {
+    // R_X86_64_RELATIVE addends should be 0-based addresses
+    let mut obj = WriteObject::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
+    let text = obj.section_id(StandardSection::Text);
+    let start_off = obj.append_section_data(text, &[0xC3], 16);
+    let start_sym = obj.add_symbol(Symbol {
+        name: b"_start".to_vec(),
+        value: start_off, size: 1,
+        kind: SymbolKind::Text, scope: SymbolScope::Dynamic,
+        weak: false, section: SymbolSection::Section(text), flags: SymbolFlags::None,
+    });
+
+    let data_sec = obj.section_id(StandardSection::Data);
+    let ptr_off = obj.append_section_data(data_sec, &[0u8; 8], 8);
+    obj.add_relocation(
+        data_sec,
+        object::write::Relocation {
+            offset: ptr_off,
+            symbol: start_sym,
+            addend: 0,
+            flags: RelocationFlags::Elf { r_type: elf::R_X86_64_64 },
+        },
+    ).unwrap();
+
+    let elf_bytes = toyos_ld::link(&[("test.o".into(), obj.write().unwrap())], "_start")
+        .expect("linking should succeed");
+
+    let elf = parse_elf(&elf_bytes);
+    let rela_sec = find_section(&elf, ".rela.dyn").expect("should have .rela.dyn");
+    let rela_data = rela_sec.data().unwrap();
+
+    // Parse first RELA entry: offset(8) + info(8) + addend(8)
+    assert!(rela_data.len() >= 24, "should have at least one RELA entry");
+    let addend = i64::from_le_bytes(rela_data[16..24].try_into().unwrap());
+    // Addend should point to _start which should be near 0, not 0x200000+
+    assert!(addend < 0x10000,
+        "RELATIVE addend should be zero-based, got {addend:#x}");
+}
+
+#[test]
+fn pie_bootloader_loadable() {
+    // Simulate bootloader loading: allocate based on max(vaddr+memsz),
+    // copy segments at vaddr offsets, verify entry code is at the right place
+    let code: Vec<u8> = vec![
+        0x48, 0x31, 0xFF, // xor rdi, rdi
+        0xB8, 0x3C, 0x00, 0x00, 0x00, // mov eax, 60
+        0x0F, 0x05, // syscall
+    ];
+    let obj_data = build_minimal_obj("_start", &code);
+
+    let elf_bytes = toyos_ld::link(&[("test.o".into(), obj_data)], "_start")
+        .expect("linking should succeed");
+
+    let elf = parse_elf(&elf_bytes);
+    let endian = elf.endian();
+    let phdrs = elf.elf_header().program_headers(endian, elf.data()).unwrap();
+
+    // Calculate total memory size (like bootloader does)
+    let mut mem_size: usize = 0;
+    for ph in phdrs.iter().filter(|ph| ph.p_type.get(endian) == elf::PT_LOAD) {
+        let end = ph.p_vaddr.get(endian) + ph.p_memsz.get(endian);
+        mem_size = mem_size.max(end as usize);
+    }
+
+    // For PIE, mem_size should be reasonable (not 2MB+ wasted)
+    assert!(mem_size < 0x100000,
+        "total memory for simple PIE should be < 1MB, got {mem_size:#x}");
+
+    // Load segments into simulated memory
+    let mut process_mem = vec![0u8; mem_size];
+    for ph in phdrs.iter().filter(|ph| ph.p_type.get(endian) == elf::PT_LOAD) {
+        let fstart = ph.p_offset.get(endian) as usize;
+        let fend = fstart + ph.p_filesz.get(endian) as usize;
+        let vstart = ph.p_vaddr.get(endian) as usize;
+        let vend = vstart + ph.p_filesz.get(endian) as usize;
+        process_mem[vstart..vend].copy_from_slice(&elf_bytes[fstart..fend]);
+    }
+
+    // Verify entry point code is at the right place in process memory
+    let entry = elf.elf_header().e_entry.get(endian) as usize;
+    assert!(entry + code.len() <= process_mem.len(),
+        "entry ({entry:#x}) + code should fit in process memory");
+    assert_eq!(&process_mem[entry..entry + code.len()], &code,
+        "code at entry point should match original");
+}
+
+// ── Tests: COFF implicit addend and section classification ───────────────
+
+/// Helper: parse PE section info. Returns vec of (name, va, virt_size, raw_ptr, raw_size).
+fn pe_section_list(pe: &[u8]) -> Vec<(String, u32, u32, u32, u32)> {
+    let pe_off = parse_pe_u32(pe, 0x3C) as usize;
+    let coff = pe_off + 4;
+    let num_secs = parse_pe_u16(pe, coff + 2) as usize;
+    let opt_sz = parse_pe_u16(pe, coff + 16) as usize;
+    let sh_start = coff + 20 + opt_sz;
+    (0..num_secs).map(|i| {
+        let sh = sh_start + i * 40;
+        let name = pe_section_name(pe, sh);
+        let vs = parse_pe_u32(pe, sh + 8);
+        let va = parse_pe_u32(pe, sh + 12);
+        let rs = parse_pe_u32(pe, sh + 16);
+        let rp = parse_pe_u32(pe, sh + 20);
+        (name, va, vs, rp, rs)
+    }).collect()
+}
+
+/// Read bytes from a PE at a given RVA, using section headers to map RVA→file offset.
+fn pe_read_at_rva(pe: &[u8], rva: u32, len: usize) -> &[u8] {
+    for (_, va, vs, rp, _) in pe_section_list(pe) {
+        if rva >= va && rva + len as u32 <= va + vs {
+            let off = (rp + (rva - va)) as usize;
+            return &pe[off..off + len];
+        }
+    }
+    panic!("RVA {rva:#x} not in any PE section");
+}
+
+fn pe_read_i32_at_rva(pe: &[u8], rva: u32) -> i32 {
+    let b = pe_read_at_rva(pe, rva, 4);
+    i32::from_le_bytes(b.try_into().unwrap())
+}
+
+fn pe_entry_rva(pe: &[u8]) -> u32 {
+    let pe_off = parse_pe_u32(pe, 0x3C) as usize;
+    parse_pe_u32(pe, pe_off + 4 + 20 + 16) // OptionalHeader.AddressOfEntryPoint
+}
+
+#[test]
+fn coff_cross_object_call_displacement() {
+    // COFF REL32 with implicit addend=0 (standard call instruction).
+    // This works even without the implicit addend fix since the implicit is 0.
+    let callee_obj = build_minimal_coff("callee", &[0xC3]);
+
+    let mut obj2 = WriteObject::new(BinaryFormat::Coff, Architecture::X86_64, Endianness::Little);
+    let text2 = obj2.section_id(StandardSection::Text);
+    let call_off = obj2.append_section_data(text2, &[0xE8, 0, 0, 0, 0, 0xC3], 16);
+    let callee_sym = obj2.add_symbol(Symbol {
+        name: b"callee".to_vec(), value: 0, size: 0,
+        kind: SymbolKind::Text, scope: SymbolScope::Dynamic,
+        weak: false, section: SymbolSection::Undefined, flags: SymbolFlags::None,
+    });
+    obj2.add_relocation(text2, object::write::Relocation {
+        offset: call_off + 1, symbol: callee_sym, addend: -4,
+        flags: RelocationFlags::Coff { typ: pe::IMAGE_REL_AMD64_REL32 },
+    }).unwrap();
+    obj2.add_symbol(Symbol {
+        name: b"efi_main".to_vec(), value: call_off, size: 6,
+        kind: SymbolKind::Text, scope: SymbolScope::Dynamic,
+        weak: false, section: SymbolSection::Section(text2), flags: SymbolFlags::None,
+    });
+
+    let pe = toyos_ld::link_pe(
+        &[("callee.o".into(), callee_obj), ("caller.o".into(), obj2.write().unwrap())],
+        "efi_main", 10,
+    ).expect("linking should succeed");
+
+    let entry_rva = pe_entry_rva(&pe);
+    let disp = pe_read_i32_at_rva(&pe, entry_rva + 1);
+    let target_rva = (entry_rva as i64 + 1 + 4 + disp as i64) as u32;
+
+    // callee is in the first .text (placed before caller's .text)
+    let secs = pe_section_list(&pe);
+    let text_rva = secs[0].1;
+    assert_eq!(pe_read_at_rva(&pe, text_rva, 1), &[0xC3], "callee should be at text_rva");
+    assert_eq!(target_rva, text_rva,
+        "call target should be callee RVA: disp={disp}, got {target_rva:#x}, want {text_rva:#x}");
+}
+
+#[test]
+fn coff_jump_table_implicit_addend() {
+    // Simulates a switch/jump table in .rdata with REL32 relocations.
+    // Each entry has a different implicit addend (compensating for its position
+    // within the table). Without reading the implicit addend from section data,
+    // all entries would compute the same wrong offset.
+    let mut obj = WriteObject::new(BinaryFormat::Coff, Architecture::X86_64, Endianness::Little);
+    let text = obj.section_id(StandardSection::Text);
+    let rdata = obj.add_section(Vec::new(), b".rdata".to_vec(), object::SectionKind::ReadOnlyData);
+
+    // Target basic block in .text — just `ret`
+    let bb_off = obj.append_section_data(text, &[0xC3], 16);
+    let bb_sym = obj.add_symbol(Symbol {
+        name: b"bb0".to_vec(), value: bb_off, size: 1,
+        kind: SymbolKind::Text, scope: SymbolScope::Dynamic,
+        weak: false, section: SymbolSection::Section(text), flags: SymbolFlags::None,
+    });
+
+    // Jump table: 3 entries, each 4 bytes. All point to the same target (bb0),
+    // but with different addends to account for position within the table.
+    // REL32 formula: val = S + A - P, where P = entry address.
+    // We want val = bb0 - jt_base for every entry.
+    // Entry[i] at P = jt_base + i*4: A must be i*4 so the i*4 cancels P's offset.
+    let jt_off = obj.append_section_data(rdata, &[0u8; 12], 4);
+    for i in 0..3u64 {
+        obj.add_relocation(rdata, object::write::Relocation {
+            offset: jt_off + i * 4,
+            symbol: bb_sym,
+            addend: i as i64 * 4,
+            flags: RelocationFlags::Coff { typ: pe::IMAGE_REL_AMD64_REL32 },
+        }).unwrap();
+    }
+
+    // Entry point: just a ret (we need an entry symbol)
+    let entry_off = obj.append_section_data(text, &[0xC3], 16);
+    obj.add_symbol(Symbol {
+        name: b"efi_main".to_vec(), value: entry_off, size: 1,
+        kind: SymbolKind::Text, scope: SymbolScope::Dynamic,
+        weak: false, section: SymbolSection::Section(text), flags: SymbolFlags::None,
+    });
+
+    let pe = toyos_ld::link_pe(
+        &[("test.o".into(), obj.write().unwrap())],
+        "efi_main", 10,
+    ).expect("linking should succeed");
+
+    // Find the jump table and bb0 in the PE
+    // bb0 is at the start of .text PE section
+    let secs = pe_section_list(&pe);
+    let text_rva = secs[0].1;
+    assert_eq!(pe_read_at_rva(&pe, text_rva, 1), &[0xC3], "bb0 should be at start of .text");
+    let bb0_rva = text_rva;
+
+    // The .rdata section goes to .data PE section (or .text if is_rx_section matches .rdata)
+    // Find the jump table: look for 3 consecutive i32 values
+    // The jump table RVA is somewhere after the .text data
+    // All 3 entries should contain the same value: bb0_rva - jt_base_rva
+    let mut jt_rva = 0u32;
+    for (_, va, vs, rp, _) in &secs {
+        // Search this section for our jump table
+        let sec_data = &pe[*rp as usize..(*rp + *vs) as usize];
+        // Jump table entries should all be the same (target - base)
+        for off in (0..=sec_data.len().saturating_sub(12)).step_by(4) {
+            let e0 = i32::from_le_bytes(sec_data[off..off+4].try_into().unwrap());
+            let e1 = i32::from_le_bytes(sec_data[off+4..off+8].try_into().unwrap());
+            let e2 = i32::from_le_bytes(sec_data[off+8..off+12].try_into().unwrap());
+            if e0 != 0 && e0 == e1 && e1 == e2 {
+                jt_rva = va + off as u32;
+                break;
+            }
+        }
+        if jt_rva != 0 { break; }
+    }
+
+    assert!(jt_rva != 0, "should find 3 identical jump table entries in the PE");
+
+    let e0 = pe_read_i32_at_rva(&pe, jt_rva);
+    let expected = bb0_rva as i32 - jt_rva as i32;
+    assert_eq!(e0, expected,
+        "jump table entry should be target - base: got {e0}, expected {expected} \
+         (bb0_rva={bb0_rva:#x}, jt_rva={jt_rva:#x})");
+}
+
+#[test]
+fn coff_rdata_in_text_pe() {
+    // .rdata sections (COFF naming for read-only data) should be placed in the
+    // .text PE section (alongside code), not in .data (writable).
+    let mut obj = WriteObject::new(BinaryFormat::Coff, Architecture::X86_64, Endianness::Little);
+    let text = obj.section_id(StandardSection::Text);
+    let rdata = obj.add_section(Vec::new(), b".rdata".to_vec(), object::SectionKind::ReadOnlyData);
+
+    obj.append_section_data(rdata, &[0xAA; 16], 8);
+    let code_off = obj.append_section_data(text, &[0xC3], 16);
+    obj.add_symbol(Symbol {
+        name: b"efi_main".to_vec(), value: code_off, size: 1,
+        kind: SymbolKind::Text, scope: SymbolScope::Dynamic,
+        weak: false, section: SymbolSection::Section(text), flags: SymbolFlags::None,
+    });
+
+    let pe = toyos_ld::link_pe(
+        &[("test.o".into(), obj.write().unwrap())],
+        "efi_main", 10,
+    ).expect("linking should succeed");
+
+    let secs = pe_section_list(&pe);
+    let (_, text_va, text_vs, text_rp, _) = &secs[0];
+    let text_data = &pe[*text_rp as usize..(*text_rp + *text_vs) as usize];
+    let found = text_data.windows(16).any(|w| w.iter().all(|&b| b == 0xAA));
+    assert!(found,
+        ".rdata data should be in .text PE section, not .data. \
+         .text VA={text_va:#x} VS={text_vs:#x}");
+}
+
+#[test]
+fn coff_multiple_same_named_sections() {
+    // COFF COMDAT sections often share names (e.g. many `.rdata` sections in
+    // one object). Relocations targeting section symbols must resolve to the
+    // correct specific section, not whichever one was registered last.
+    //
+    // We create two `.rdata` sections with distinct data and a `.text` section
+    // with a LEA-style PC-relative relocation into each. The linker must
+    // produce correct displacements for both — not resolve both to the same
+    // section.
+    let coff_bytes = {
+        let mut obj = WriteObject::new(
+            BinaryFormat::Coff, Architecture::X86_64, Endianness::Little,
+        );
+        let text = obj.section_id(StandardSection::Text);
+        let rdata_a = obj.add_section(
+            Vec::new(), b".rdata".to_vec(), object::SectionKind::ReadOnlyData,
+        );
+        let rdata_b = obj.add_section(
+            Vec::new(), b".rdata".to_vec(), object::SectionKind::ReadOnlyData,
+        );
+
+        // Put distinct marker data in each .rdata section
+        obj.append_section_data(rdata_a, &[0xAA; 8], 8);
+        obj.append_section_data(rdata_b, &[0xBB; 8], 8);
+
+        // Create section symbols for each .rdata section
+        let sym_a = obj.add_symbol(Symbol {
+            name: Vec::new(), value: 0, size: 0,
+            kind: SymbolKind::Section, scope: SymbolScope::Compilation,
+            weak: false, section: SymbolSection::Section(rdata_a),
+            flags: SymbolFlags::None,
+        });
+        let sym_b = obj.add_symbol(Symbol {
+            name: Vec::new(), value: 0, size: 0,
+            kind: SymbolKind::Section, scope: SymbolScope::Compilation,
+            weak: false, section: SymbolSection::Section(rdata_b),
+            flags: SymbolFlags::None,
+        });
+
+        // .text: two LEA-like instructions, each with a 4-byte displacement
+        // placeholder targeting a different .rdata section symbol.
+        // LEA rax, [rip+disp] = 48 8d 05 XX XX XX XX
+        let mut code = Vec::new();
+        // LEA #1 → rdata_a
+        code.extend_from_slice(&[0x48, 0x8d, 0x05]);
+        let reloc_off_a = code.len() as u64;
+        code.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // placeholder
+        // LEA #2 → rdata_b
+        code.extend_from_slice(&[0x48, 0x8d, 0x05]);
+        let reloc_off_b = code.len() as u64;
+        code.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // placeholder
+        // ret
+        code.push(0xC3);
+
+        obj.append_section_data(text, &code, 16);
+
+        // Entry point symbol at the start of .text
+        obj.add_symbol(Symbol {
+            name: b"efi_main".to_vec(), value: 0, size: 0,
+            kind: SymbolKind::Text, scope: SymbolScope::Dynamic,
+            weak: false, section: SymbolSection::Section(text),
+            flags: SymbolFlags::None,
+        });
+
+        // REL32 relocations: displacement field → section symbol
+        obj.add_relocation(text, object::write::Relocation {
+            offset: reloc_off_a,
+            symbol: sym_a,
+            addend: -4, // standard REL32: S + A - P, A = -4 compensates for instr size
+            flags: RelocationFlags::Coff { typ: pe::IMAGE_REL_AMD64_REL32 },
+        }).unwrap();
+        obj.add_relocation(text, object::write::Relocation {
+            offset: reloc_off_b,
+            symbol: sym_b,
+            addend: -4,
+            flags: RelocationFlags::Coff { typ: pe::IMAGE_REL_AMD64_REL32 },
+        }).unwrap();
+
+        obj.write().unwrap()
+    };
+
+    // Verify the object actually has two .rdata sections with section symbols
+    let obj = read::File::parse(coff_bytes.as_slice()).unwrap();
+    let rdata_count = obj.sections()
+        .filter(|s| s.name().unwrap_or("") == ".rdata")
+        .count();
+    assert!(rdata_count >= 2, "test object must have multiple .rdata sections, got {rdata_count}");
+
+    let pe = toyos_ld::link_pe(
+        &[("test.o".into(), coff_bytes)],
+        "efi_main", 10,
+    ).expect("linking should succeed");
+
+    // Find marker bytes in the PE output
+    let pe_text = pe_section_list(&pe);
+    let (_, text_va, text_vs, text_rp, _) = &pe_text[0];
+    let text_data = &pe[*text_rp as usize..(*text_rp + *text_vs) as usize];
+
+    // Find the two LEA instructions in .text
+    let lea_pos_a = text_data.windows(3)
+        .position(|w| w == [0x48, 0x8d, 0x05])
+        .expect("first LEA not found");
+    let disp_a = i32::from_le_bytes(
+        text_data[lea_pos_a + 3..lea_pos_a + 7].try_into().unwrap()
+    );
+    let lea_pos_b = lea_pos_a + 7 + text_data[lea_pos_a + 7..].windows(3)
+        .position(|w| w == [0x48, 0x8d, 0x05])
+        .expect("second LEA not found");
+    let disp_b = i32::from_le_bytes(
+        text_data[lea_pos_b + 3..lea_pos_b + 7].try_into().unwrap()
+    );
+
+    // Each LEA should point to a different location (different .rdata sections)
+    let target_rva_a = (*text_va + lea_pos_a as u32 + 7) as i32 + disp_a;
+    let target_rva_b = (*text_va + lea_pos_b as u32 + 7) as i32 + disp_b;
+    assert_ne!(target_rva_a, target_rva_b,
+        "LEAs must target different RVAs (different .rdata sections), \
+         but both point to {target_rva_a:#x}");
+
+    // Verify each target points to the correct marker data
+    let marker_a = pe_read_at_rva(&pe, target_rva_a as u32, 8);
+    let marker_b = pe_read_at_rva(&pe, target_rva_b as u32, 8);
+    assert_eq!(marker_a, &[0xAA; 8],
+        "first LEA should target 0xAA data, got {marker_a:02x?}");
+    assert_eq!(marker_b, &[0xBB; 8],
+        "second LEA should target 0xBB data, got {marker_b:02x?}");
 }

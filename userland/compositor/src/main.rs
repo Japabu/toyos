@@ -49,6 +49,8 @@ const LAUNCHER_APPS: &[LauncherEntry] = &[
     LauncherEntry { name: "Monitor", path: "/initrd/monitor" },
 ];
 
+const FLAG_HARDWARE_CURSOR: u32 = 1 << 0;
+
 #[repr(C)]
 struct FramebufferInfo {
     token: [u32; 2],
@@ -57,6 +59,7 @@ struct FramebufferInfo {
     height: u32,
     stride: u32,
     pixel_format: u32,
+    flags: u32,
 }
 
 fn read_fb_info(fd: u64) -> FramebufferInfo {
@@ -67,6 +70,7 @@ fn read_fb_info(fd: u64) -> FramebufferInfo {
         height: 0,
         stride: 0,
         pixel_format: 0,
+        flags: 0,
     };
     let buf = unsafe {
         std::slice::from_raw_parts_mut(
@@ -586,7 +590,7 @@ fn draw_launcher(screen: &Framebuffer, font: &font::Font, x: usize, y: usize, w:
 }
 
 /// Render the cursor sprite (RGBA) into a 64x64 BGRA hardware cursor buffer.
-fn upload_cursor(cursor_buf: *mut u8, sprite: &sprite::Sprite) {
+fn upload_cursor(cursor_buf: *mut u8, sprite: &sprite::Sprite, hw_cursor: bool) {
     let data = sprite.data();
     let w = sprite.width();
     let h = sprite.height();
@@ -606,7 +610,43 @@ fn upload_cursor(cursor_buf: *mut u8, sprite: &sprite::Sprite) {
             }
         }
     }
-    syscall::gpu_set_cursor(0, 0);
+    if hw_cursor {
+        syscall::gpu_set_cursor(0, 0);
+    }
+}
+
+/// Draw the cursor sprite directly into the framebuffer (software cursor fallback).
+fn draw_software_cursor(screen: &Framebuffer, sprite: &sprite::Sprite, cx: i32, cy: i32) {
+    let data = sprite.data();
+    let sw = sprite.width();
+    let sh = sprite.height();
+    let screen_w = screen.width();
+    let screen_h = screen.height();
+
+    for sy in 0..sh {
+        let py = cy as usize + sy;
+        if py >= screen_h { break; }
+        for sx in 0..sw {
+            let px = cx as usize + sx;
+            if px >= screen_w { break; }
+            let si = (sy * sw + sx) * 4;
+            let alpha = data[si + 3] as u32;
+            if alpha == 0 { continue; }
+            let sr = data[si] as u32;
+            let sg = data[si + 1] as u32;
+            let sb = data[si + 2] as u32;
+            if alpha == 255 {
+                screen.put_pixel(px, py, Color { r: sr as u8, g: sg as u8, b: sb as u8 });
+            } else {
+                let bg = screen.get_pixel(px, py);
+                let inv = 255 - alpha;
+                let r = ((sr * alpha + bg.r as u32 * inv) / 255) as u8;
+                let g = ((sg * alpha + bg.g as u32 * inv) / 255) as u8;
+                let b = ((sb * alpha + bg.b as u32 * inv) / 255) as u8;
+                screen.put_pixel(px, py, Color { r, g, b });
+            }
+        }
+    }
 }
 
 fn main() {
@@ -626,14 +666,15 @@ fn main() {
         fb_info.pixel_format,
     );
 
-    // Set up hardware cursor
+    // Set up cursor
+    let hw_cursor = fb_info.flags & FLAG_HARDWARE_CURSOR != 0;
     let cursor_buf = syscall::map_shared(fb_info.cursor_token);
     let cursor_svg = std::fs::read("/initrd/cursor-bold.svg").expect("failed to read cursor");
     let cursor_default = sprite::Sprite::from_svg_colored(&cursor_svg, 20, [255, 255, 255]);
     let resize_svg =
         std::fs::read("/initrd/arrow-down-right-bold.svg").expect("failed to read resize cursor");
     let cursor_resize = sprite::Sprite::from_svg_colored(&resize_svg, 20, [255, 255, 255]);
-    upload_cursor(cursor_buf, &cursor_default);
+    upload_cursor(cursor_buf, &cursor_default, hw_cursor);
     let mut current_cursor_is_resize = false;
 
     let font_data = std::fs::read("/initrd/JetBrainsMono-8x16.font").expect("failed to read font");
@@ -684,7 +725,9 @@ fn main() {
     let screen_h = screen.height() as i32;
     let mut cursor_x = screen_w / 2;
     let mut cursor_y = screen_h / 2;
-    syscall::gpu_move_cursor(cursor_x as u32, cursor_y as u32);
+    if hw_cursor {
+        syscall::gpu_move_cursor(cursor_x as u32, cursor_y as u32);
+    }
     let mut dirty_rect: Option<DirtyRect> = Some(DirtyRect::full(screen_w as usize, screen_h as usize));
     let mut prev_buttons: u8 = 0;
     let mut interaction = Interaction::None;
@@ -853,9 +896,19 @@ fn main() {
                 // Move cursor once for all accumulated deltas
                 cursor_x = (cursor_x + total_dx).clamp(0, screen_w - 1);
                 cursor_y = (cursor_y + total_dy).clamp(0, screen_h - 1);
-                syscall::gpu_move_cursor(cursor_x as u32, cursor_y as u32);
+                if hw_cursor {
+                    syscall::gpu_move_cursor(cursor_x as u32, cursor_y as u32);
+                } else {
+                    // Software cursor: mark old and new cursor regions dirty
+                    let cw = 20usize;
+                    let ch = 20usize;
+                    let old_cx = (cursor_x - total_dx).clamp(0, screen_w - 1) as usize;
+                    let old_cy = (cursor_y - total_dy).clamp(0, screen_h - 1) as usize;
+                    mark_dirty(&mut dirty_rect, DirtyRect { x: old_cx, y: old_cy, w: cw, h: ch });
+                    mark_dirty(&mut dirty_rect, DirtyRect { x: cursor_x as usize, y: cursor_y as usize, w: cw, h: ch });
+                }
 
-                // Update hardware cursor shape
+                // Update cursor shape
                 let want_resize = match interaction {
                     Interaction::Resizing { .. } => true,
                     _ => matches!(
@@ -866,9 +919,9 @@ fn main() {
                 if want_resize != current_cursor_is_resize {
                     current_cursor_is_resize = want_resize;
                     if want_resize {
-                        upload_cursor(cursor_buf, &cursor_resize);
+                        upload_cursor(cursor_buf, &cursor_resize, hw_cursor);
                     } else {
-                        upload_cursor(cursor_buf, &cursor_default);
+                        upload_cursor(cursor_buf, &cursor_default, hw_cursor);
                     }
                 }
 
@@ -1256,6 +1309,13 @@ fn main() {
             let rect = rect.clamp(screen_w as usize, screen_h as usize);
             if rect.w > 0 && rect.h > 0 {
                 redraw(&screen, &font, &windows, &icons, &wallpaper, launcher_open, &cached_stats, rect);
+
+                // Draw software cursor if no hardware cursor
+                if !hw_cursor {
+                    let sprite = if current_cursor_is_resize { &cursor_resize } else { &cursor_default };
+                    draw_software_cursor(&screen, sprite, cursor_x, cursor_y);
+                }
+
                 syscall::gpu_present(rect.x as u32, rect.y as u32, rect.w as u32, rect.h as u32);
 
                 // Send frame callbacks to windows that presented and were composited

@@ -6,8 +6,8 @@ extern crate alloc;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use kernel::arch::{apic, idt, paging, percpu, smp, syscall};
-use kernel::drivers::{acpi, nvme, pci, serial, virtio_gpu, virtio_net, xhci};
-use kernel::{allocator, clock, fd, log, pipe, process, ramdisk, shared_memory, symbols, vfs, KernelArgs, MemoryMapEntry};
+use kernel::drivers::{acpi, gop, nvme, pci, serial, virtio_gpu, virtio_net, xhci};
+use kernel::{allocator, clock, fd, gpu, log, pipe, process, ramdisk, shared_memory, symbols, vfs, KernelArgs, MemoryMapEntry};
 use tyfs::Disk;
 
 #[panic_handler]
@@ -67,7 +67,7 @@ fn kernel_main(
     assert!(!initrd.is_empty(), "No initrd provided");
     log!("Initrd: addr={:#x} size={} bytes", initrd.as_ptr() as u64, initrd.len());
 
-    let ramdisk = unsafe { ramdisk::RamDisk::new(initrd.as_ptr() as *mut u8, initrd.len()) };
+    let ramdisk = unsafe { ramdisk::RamDisk::new(initrd.as_ptr(), initrd.len()) };
     let mut initrd_fs = tyfs::SimpleFs::mount(ramdisk).expect("Failed to mount initrd");
     log!("TYFS: mounted initrd");
     for (name, size) in initrd_fs.list() {
@@ -140,7 +140,7 @@ fn kernel_main(
     vfs::lock().mount("nvme", Box::new(nvme_fs));
 
     // Load keyboard layout from config
-    if let Some(data) = vfs::lock().read_file("/nvme/config/keyboard_layout") {
+    if let Ok(data) = vfs::lock().read_file("/nvme/config/keyboard_layout") {
         if let Ok(name) = core::str::from_utf8(&data) {
             let name = name.trim();
             kernel::keyboard::set_layout(name);
@@ -151,18 +151,35 @@ fn kernel_main(
     // Initialize VirtIO networking
     virtio_net::init(ecam_base);
 
-    // Initialize VirtIO GPU display
-    let gpu = virtio_gpu::init(ecam_base).expect("VirtIO GPU not found");
+    // Initialize GPU: try VirtIO first, fall back to UEFI GOP
+    let (gpu_driver, gpu_info) = if let Some(result) = virtio_gpu::init(ecam_base) {
+        log!("GPU: using VirtIO");
+        result
+    } else if kernel_args.gop_framebuffer != 0 {
+        log!("GPU: using UEFI GOP");
+        gop::init(
+            kernel_args.gop_framebuffer,
+            kernel_args.gop_framebuffer_size,
+            kernel_args.gop_width,
+            kernel_args.gop_height,
+            kernel_args.gop_stride,
+            kernel_args.gop_pixel_format,
+        )
+    } else {
+        panic!("No GPU found");
+    };
     let fb_info = fd::FramebufferInfo {
-        token: gpu.tokens,
-        cursor_token: gpu.cursor_token,
-        width: gpu.width,
-        height: gpu.height,
-        stride: gpu.width,
-        pixel_format: 1, // BGR (B8G8R8X8_UNORM)
+        token: gpu_info.tokens,
+        cursor_token: gpu_info.cursor_token,
+        width: gpu_info.width,
+        height: gpu_info.height,
+        stride: gpu_info.stride,
+        pixel_format: gpu_info.pixel_format,
+        flags: gpu_info.flags,
     };
     syscall::set_screen_size(fb_info.width, fb_info.height);
     kernel::device::set_framebuffer_info(fb_info);
+    gpu::register(gpu_driver, gpu_info);
 
     #[cfg(feature = "debug-wait")]
     {

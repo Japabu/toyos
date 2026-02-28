@@ -182,9 +182,9 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             sys_find_pid(name)
         }
         SYS_SET_SCREEN_SIZE => { set_screen_size(a1 as u32, a2 as u32); 0 }
-        SYS_GPU_PRESENT => { crate::drivers::virtio_gpu::present_rect(a1 as u32, a2 as u32, a3 as u32, a4 as u32); 0 }
-        SYS_GPU_SET_CURSOR => { crate::drivers::virtio_gpu::set_cursor(a1 as u32, a2 as u32); 0 }
-        SYS_GPU_MOVE_CURSOR => { crate::drivers::virtio_gpu::move_cursor(a1 as u32, a2 as u32); 0 }
+        SYS_GPU_PRESENT => { crate::gpu::present_rect(a1 as u32, a2 as u32, a3 as u32, a4 as u32); 0 }
+        SYS_GPU_SET_CURSOR => { crate::gpu::set_cursor(a1 as u32, a2 as u32); 0 }
+        SYS_GPU_MOVE_CURSOR => { crate::gpu::move_cursor(a1 as u32, a2 as u32); 0 }
         SYS_ALLOC_SHARED => sys_alloc_shared(a1),
         SYS_GRANT_SHARED => sys_grant_shared(a1, a2),
         SYS_MAP_SHARED => sys_map_shared(a1),
@@ -715,9 +715,9 @@ fn sys_dlopen(path: &str) -> u64 {
     let resolved = vfs::lock().resolve_absolute(&cwd, path);
 
     let data = match vfs::lock().read_file(&resolved) {
-        Some(d) => d,
-        None => {
-            log!("dlopen: file not found: {}", resolved);
+        Ok(d) => d,
+        Err(e) => {
+            log!("dlopen: {}: {}", resolved, e);
             return u64::MAX;
         }
     };

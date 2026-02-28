@@ -357,7 +357,13 @@ pub fn build_child_fds(pairs: &[[u32; 2]]) -> FdTable {
 pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<u32>) -> Option<u32> {
     let path = argv[0];
 
-    let binary = vfs::lock().read_file(path)?;
+    let binary = match vfs::lock().read_file(path) {
+        Ok(data) => data,
+        Err(e) => {
+            log!("{}: {}", path, e);
+            return None;
+        }
+    };
 
     let loaded = match elf::load(&binary) {
         Ok(l) => l,

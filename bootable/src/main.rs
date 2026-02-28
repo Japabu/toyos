@@ -12,6 +12,12 @@ fn build(debug: bool) {
         Err(_) => "-Dwarnings".to_string(),
     };
 
+    // Detect toolchain changes — clean userland targets to avoid stale incremental artifacts
+    let sysroot_stamp = fs::read_to_string("../toolchain/.sysroot-stamp").unwrap_or_default();
+    let last_stamp_path = "target/.toolchain-stamp";
+    let last_stamp = fs::read_to_string(last_stamp_path).unwrap_or_default();
+    let toolchain_changed = sysroot_stamp != last_stamp && !sysroot_stamp.is_empty();
+
     let mut kernel_args = vec!["build"];
     if debug {
         kernel_args.push("--features");
@@ -21,6 +27,7 @@ fn build(debug: bool) {
         .args(&kernel_args)
         .current_dir("../kernel")
         .env("RUSTFLAGS", &rustflags)
+        .env("CARGO_TARGET_X86_64_UNKNOWN_NONE_LINKER", toyos_ld.to_str().unwrap())
         .status()
         .expect("Failed to run cargo")
         .success()
@@ -32,18 +39,13 @@ fn build(debug: bool) {
         .args(&["build"])
         .current_dir("../bootloader")
         .env("RUSTFLAGS", &rustflags)
+        .env("CARGO_TARGET_X86_64_UNKNOWN_UEFI_LINKER", toyos_ld.to_str().unwrap())
         .status()
         .expect("Failed to run cargo")
         .success()
     {
         panic!("Failed to build bootloader");
     }
-
-    // Detect toolchain changes — clean userland targets to avoid stale incremental artifacts
-    let sysroot_stamp = fs::read_to_string("../toolchain/.sysroot-stamp").unwrap_or_default();
-    let last_stamp_path = "target/.toolchain-stamp";
-    let last_stamp = fs::read_to_string(last_stamp_path).unwrap_or_default();
-    let toolchain_changed = sysroot_stamp != last_stamp && !sysroot_stamp.is_empty();
 
     let mut initrd_files: Vec<(String, Vec<u8>)> = Vec::new();
 

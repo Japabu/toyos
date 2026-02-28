@@ -1,3 +1,4 @@
+use alloc::borrow::Cow;
 use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::String;
@@ -32,7 +33,7 @@ pub fn lock() -> VfsGuard {
 /// heterogeneous mount points (initrd on SliceDisk, nvme on NvmeDisk).
 pub trait FileSystem {
     fn list(&mut self) -> Vec<(String, u64)>;
-    fn read_file(&mut self, name: &str) -> Option<Vec<u8>>;
+    fn read_file(&mut self, name: &str) -> Result<Cow<'static, [u8]>, &'static str>;
     fn read_link(&mut self, name: &str) -> Option<String>;
     fn create(&mut self, name: &str, data: &[u8]) -> bool;
     fn delete(&mut self, name: &str) -> bool;
@@ -42,8 +43,11 @@ impl<D: tyfs::Disk> FileSystem for tyfs::SimpleFs<D> {
     fn list(&mut self) -> Vec<(String, u64)> {
         tyfs::SimpleFs::list(self)
     }
-    fn read_file(&mut self, name: &str) -> Option<Vec<u8>> {
-        tyfs::SimpleFs::read_file(self, name)
+    fn read_file(&mut self, name: &str) -> Result<Cow<'static, [u8]>, &'static str> {
+        tyfs::SimpleFs::read_file(self, name).map_err(|e| match e {
+            tyfs::ReadError::NotFound => "not found",
+            tyfs::ReadError::OutOfMemory => "out of memory",
+        })
     }
     fn read_link(&mut self, name: &str) -> Option<String> {
         tyfs::SimpleFs::read_link(self, name)
@@ -220,13 +224,13 @@ impl Vfs {
         }
     }
 
-    pub fn read_file(&mut self, path: &str) -> Option<Vec<u8>> {
+    pub fn read_file(&mut self, path: &str) -> Result<Cow<'static, [u8]>, &'static str> {
         // read_file always takes absolute paths
         let (mount, file) = self.resolve_path("/", path);
         if file.is_empty() {
-            return None;
+            return Err("not found");
         }
-        let fs = self.mounts.get_mut(&mount)?;
+        let fs = self.mounts.get_mut(&mount).ok_or("not found")?;
         if let Some(target) = fs.read_link(&file) {
             // Symlink target is resolved within the same mount
             let resolved = format!("/{}/{}", mount, target);
@@ -254,7 +258,7 @@ impl Vfs {
         if old_file.is_empty() || new_file.is_empty() { return false; }
         if old_mount != new_mount { return false; }
         let Some(fs) = self.mounts.get_mut(&old_mount) else { return false };
-        let Some(data) = fs.read_file(&old_file) else { return false };
+        let Ok(data) = fs.read_file(&old_file) else { return false };
         fs.delete(&new_file);
         if !fs.create(&new_file, &data) { return false; }
         fs.delete(&old_file);

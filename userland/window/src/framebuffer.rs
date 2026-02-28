@@ -61,6 +61,21 @@ impl Framebuffer {
     }
 
     #[inline]
+    pub fn get_pixel(&self, x: usize, y: usize) -> Color {
+        if x < self.width && y < self.height {
+            let offset = (y * self.stride + x) * 4;
+            debug_assert!(offset + 4 <= self.len);
+            let pixel = unsafe { core::slice::from_raw_parts(self.buf.add(offset), 4) };
+            match self.pixel_format {
+                PixelFormat::Rgb => Color { r: pixel[0], g: pixel[1], b: pixel[2] },
+                PixelFormat::Bgr => Color { r: pixel[2], g: pixel[1], b: pixel[0] },
+            }
+        } else {
+            Color { r: 0, g: 0, b: 0 }
+        }
+    }
+
+    #[inline]
     pub fn put_pixel(&self, x: usize, y: usize, color: Color) {
         if x < self.width && y < self.height {
             let offset = (y * self.stride + x) * 4;

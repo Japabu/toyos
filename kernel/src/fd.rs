@@ -20,6 +20,7 @@ pub struct FramebufferInfo {
     pub height: u32,
     pub stride: u32,
     pub pixel_format: u32,
+    pub flags: u32,
 }
 
 #[derive(Clone)]
@@ -81,8 +82,8 @@ pub fn open(table: &mut FdTable, vfs: &mut Vfs, path: &str, flags: u64) -> u64 {
         Vec::new()
     } else {
         match vfs.read_file(path) {
-            Some(data) => data,
-            None => {
+            Ok(data) => data.into_owned(),
+            Err(_) => {
                 if create {
                     Vec::new()
                 } else {

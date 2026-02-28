@@ -93,6 +93,34 @@ fn parse_args() -> Args {
                     })
                 };
             }
+            // MSVC-style flags (from rustc MSVC linker flavor)
+            s if s.starts_with("/OUT:") || s.starts_with("/out:") => {
+                output = PathBuf::from(&s[5..]);
+            }
+            s if s.to_ascii_uppercase().starts_with("/ENTRY:") => {
+                entry = s[7..].to_string();
+                pe = true;
+            }
+            s if s.to_ascii_uppercase().starts_with("/SUBSYSTEM:") => {
+                let val = &s[11..];
+                subsystem = match val.to_ascii_lowercase().as_str() {
+                    "efi_application" => 10,
+                    "efi_boot_service_driver" => 11,
+                    "efi_runtime_driver" => 12,
+                    _ => val.parse().unwrap_or_else(|_| {
+                        eprintln!("toyos-ld: invalid /SUBSYSTEM value: {val}");
+                        process::exit(1);
+                    }),
+                };
+                pe = true;
+            }
+            s if s.to_ascii_uppercase().starts_with("/LIBPATH:") => {
+                lib_paths.push(PathBuf::from(&s[9..]));
+            }
+            s if s.starts_with('/') && !s[1..].contains('/') && s.as_bytes().get(1).is_some_and(|c| c.is_ascii_uppercase()) => {
+                // Ignore other MSVC flags (/NOLOGO, /DEBUG, /INCREMENTAL:NO, etc.)
+            }
+            // GNU-style flags
             "-pie" | "--as-needed" | "--no-as-needed" | "--eh-frame-hdr"
             | "--hash-style=gnu" | "--build-id" | "-Bstatic" | "-static"
             | "--gc-sections" | "--no-gc-sections" | "--no-dynamic-linker" => {}

@@ -1,11 +1,13 @@
 use core::ptr::{copy_nonoverlapping, read_volatile};
 
 use alloc::alloc::{alloc_zeroed, Layout};
+use alloc::boxed::Box;
 
 use super::pci::PciDevice;
 use super::virtio::{BufDir, Virtqueue, VirtioDevice, VIRTIO_F_VERSION_1};
 use super::DmaPool;
 use crate::arch::paging::PAGE_2M;
+use crate::gpu::{FLAG_HARDWARE_CURSOR, Gpu, GpuInfo};
 use crate::log;
 use crate::shared_memory;
 use crate::sync::Lock;
@@ -363,19 +365,36 @@ impl GpuController {
     }
 }
 
-// ---- Global state ----
+impl Gpu for GpuController {
+    fn present_rect(&mut self, x: u32, y: u32, w: u32, h: u32) {
+        let rect = if w == 0 || h == 0 {
+            Rect { x: 0, y: 0, width: self.width, height: self.height }
+        } else {
+            let cx = x.min(self.width);
+            let cy = y.min(self.height);
+            let cw = w.min(self.width - cx);
+            let ch = h.min(self.height - cy);
+            if cw == 0 || ch == 0 { return; }
+            Rect { x: cx, y: cy, width: cw, height: ch }
+        };
+        let offset = (rect.y as u64 * self.width as u64 + rect.x as u64) * 4;
+        self.transfer_to_host(self.resource, rect, offset);
+        self.flush(self.resource, rect);
+    }
 
-static GPU: Lock<Option<GpuController>> = Lock::new(None);
+    fn set_cursor(&mut self, hot_x: u32, hot_y: u32) {
+        let rect = Rect { x: 0, y: 0, width: CURSOR_SIZE, height: CURSOR_SIZE };
+        self.transfer_to_host(CURSOR_RESOURCE_ID, rect, 0);
+        self.update_cursor(0, 0, hot_x, hot_y);
+    }
 
-pub struct GpuInfo {
-    pub tokens: [u32; 2],
-    pub cursor_token: u32,
-    pub width: u32,
-    pub height: u32,
+    fn move_cursor(&mut self, x: u32, y: u32) {
+        GpuController::move_cursor(self, x, y);
+    }
 }
 
-/// Initialize the VirtIO GPU. Returns display info on success.
-pub fn init(ecam_base: u64) -> Option<GpuInfo> {
+/// Initialize the VirtIO GPU. Returns the driver and display info on success.
+pub fn init(ecam_base: u64) -> Option<(Box<dyn Gpu>, GpuInfo)> {
     let pci_dev = PciDevice::find_by_id(ecam_base, VIRTIO_VENDOR, VIRTIO_GPU_DEVICE)?;
     log!("VirtIO GPU: found at PCI {:02x}:{:02x}.{}", pci_dev.bus, pci_dev.dev, pci_dev.func);
 
@@ -463,50 +482,15 @@ pub fn init(ecam_base: u64) -> Option<GpuInfo> {
     gpu.width = width;
     gpu.height = height;
 
-    let info = GpuInfo { tokens, cursor_token, width, height };
-    *GPU.lock() = Some(gpu);
+    let info = GpuInfo {
+        tokens,
+        cursor_token,
+        width,
+        height,
+        stride: width,
+        pixel_format: 1, // BGR (B8G8R8X8_UNORM)
+        flags: FLAG_HARDWARE_CURSOR,
+    };
 
-    Some(info)
-}
-
-/// Transfer a region of the framebuffer to the host and flush it.
-/// If w==0 or h==0, transfers the full screen.
-pub fn present_rect(x: u32, y: u32, w: u32, h: u32) {
-    let mut guard = GPU.lock();
-    if let Some(gpu) = guard.as_mut() {
-        let rect = if w == 0 || h == 0 {
-            Rect { x: 0, y: 0, width: gpu.width, height: gpu.height }
-        } else {
-            // Clamp rect to screen bounds
-            let cx = x.min(gpu.width);
-            let cy = y.min(gpu.height);
-            let cw = w.min(gpu.width - cx);
-            let ch = h.min(gpu.height - cy);
-            if cw == 0 || ch == 0 { return; }
-            Rect { x: cx, y: cy, width: cw, height: ch }
-        };
-        // Offset into backing store: the GPU reads from backing[offset] with the
-        // resource's stride, so point it to where the rect starts in the buffer.
-        let offset = (rect.y as u64 * gpu.width as u64 + rect.x as u64) * 4;
-        gpu.transfer_to_host(gpu.resource, rect, offset);
-        gpu.flush(gpu.resource, rect);
-    }
-}
-
-/// Upload cursor image from backing store and enable the hardware cursor.
-pub fn set_cursor(hot_x: u32, hot_y: u32) {
-    let mut guard = GPU.lock();
-    if let Some(gpu) = guard.as_mut() {
-        let rect = Rect { x: 0, y: 0, width: CURSOR_SIZE, height: CURSOR_SIZE };
-        gpu.transfer_to_host(CURSOR_RESOURCE_ID, rect, 0);
-        gpu.update_cursor(0, 0, hot_x, hot_y);
-    }
-}
-
-/// Move the hardware cursor to (x, y).
-pub fn move_cursor(x: u32, y: u32) {
-    let mut guard = GPU.lock();
-    if let Some(gpu) = guard.as_mut() {
-        gpu.move_cursor(x, y);
-    }
+    Some((Box::new(gpu), info))
 }

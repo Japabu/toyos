@@ -1,11 +1,9 @@
-//! toyos-ld: Minimal static ELF linker for ToyOS.
+//! toyos-ld: Minimal linker for ToyOS.
 //!
-//! Produces PIE (ET_DYN) x86-64 ELF executables with only R_X86_64_RELATIVE
-//! relocations, which is what ToyOS's kernel ELF loader expects.
-//!
+//! Reads ELF and COFF object files. Produces PIE ELF, static ELF, or PE32+.
 //! Supports .o object files and .rlib/.a archives (ar format).
 
-use object::elf;
+use object::{elf, pe};
 use object::read::elf::ElfFile64;
 use object::read::{self, Object, ObjectSection, ObjectSymbol};
 use object::RelocationFlags;
@@ -13,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::{fs, process};
 
-const BASE_VADDR: u64 = 0x200000;
+const BASE_VADDR: u64 = 0;
 const PAGE_SIZE: u64 = 0x1000;
 
 // ── Public API ──────────────────────────────────────────────────────────
@@ -201,7 +199,7 @@ struct InputReloc {
     addend: i64,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 struct SymbolDef {
     section_global_idx: usize,
     value: u64,
@@ -239,175 +237,256 @@ fn collect(objects: &[(String, Vec<u8>)]) -> LinkState {
     let mut sec_map: HashMap<(usize, object::SectionIndex), usize> = HashMap::new();
 
     for (obj_idx, (name, data)) in objects.iter().enumerate() {
-        let elf: ElfFile64 = match ElfFile64::parse(data.as_slice()) {
-            Ok(e) => e,
-            Err(e) => {
-                eprintln!("toyos-ld: cannot parse {name}: {e}");
-                process::exit(1);
+        // ELF shared library input: extract dynamic symbols, skip section processing.
+        // Shared libraries are always ELF, so try ELF-specific parse first.
+        if let Ok(elf) = ElfFile64::parse(data.as_slice()) {
+            if elf.elf_header().e_type.get(object::Endianness::Little) == elf::ET_DYN {
+                collect_so_symbols(&elf, &mut state.globals, &mut state.dynamic_imports);
+                let filename = std::path::Path::new(name)
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                if !state.dynamic_libs.contains(&filename) {
+                    state.dynamic_libs.push(filename);
+                }
+                continue;
             }
-        };
+        }
 
-        // Shared library input: extract dynamic symbols, skip section processing
-        if elf.elf_header().e_type.get(object::Endianness::Little) == elf::ET_DYN {
-            collect_so_symbols(&elf, &mut state.globals, &mut state.dynamic_imports);
-            let filename = std::path::Path::new(name)
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
-            if !state.dynamic_libs.contains(&filename) {
-                state.dynamic_libs.push(filename);
+        // Generic parse: handles both ELF .o and COFF .o
+        let obj = object::File::parse(data.as_slice()).unwrap_or_else(|e| {
+            eprintln!("toyos-ld: cannot parse {name}: {e}");
+            process::exit(1);
+        });
+
+        collect_object(&mut state, &obj, obj_idx, &mut sec_map);
+    }
+
+    state
+}
+
+/// Collect sections, symbols, and relocations from a single object file.
+/// Works with both ELF and COFF objects via the generic `Object` trait.
+fn collect_object(
+    state: &mut LinkState,
+    obj: &object::File,
+    obj_idx: usize,
+    sec_map: &mut HashMap<(usize, object::SectionIndex), usize>,
+) {
+    for section in obj.sections() {
+        let sec_name = section.name().unwrap_or("");
+
+        // Capture metadata sections (e.g. .rustc) regardless of SectionKind
+        if sec_name.starts_with(".rustc") {
+            let data = section.data().unwrap_or(&[]).to_vec();
+            if !data.is_empty() {
+                state.metadata.push((sec_name.to_string(), data));
             }
             continue;
         }
 
-        for section in elf.sections() {
-            let sec_name = section.name().unwrap_or("");
-
-            // Capture metadata sections (e.g. .rustc) regardless of SectionKind
-            if sec_name.starts_with(".rustc") {
-                let data = section.data().unwrap_or(&[]).to_vec();
-                if !data.is_empty() {
-                    state.metadata.push((sec_name.to_string(), data));
-                }
-                continue;
-            }
-
-            match section.kind() {
-                read::SectionKind::Text
-                | read::SectionKind::Data
-                | read::SectionKind::ReadOnlyData
-                | read::SectionKind::ReadOnlyDataWithRel
-                | read::SectionKind::ReadOnlyString
-                | read::SectionKind::UninitializedData
-                | read::SectionKind::OtherString
-                | read::SectionKind::Tls
-                | read::SectionKind::UninitializedTls => {}
-                _ => continue,
-            }
-
-            let sec_data = section.data().unwrap_or(&[]).to_vec();
-            let global_idx = state.sections.len();
-            sec_map.insert((obj_idx, section.index()), global_idx);
-
-            let is_tls = matches!(
-                section.kind(),
-                read::SectionKind::Tls | read::SectionKind::UninitializedTls
-            );
-
-            state.sections.push(InputSection {
-                obj_idx,
-                name: sec_name.to_string(),
-                data: sec_data,
-                align: section.align().max(1),
-                size: section.size(),
-                vaddr: 0,
-            });
-
-            if is_tls {
-                state.tls_sections.push(global_idx);
-            }
+        match section.kind() {
+            read::SectionKind::Text
+            | read::SectionKind::Data
+            | read::SectionKind::ReadOnlyData
+            | read::SectionKind::ReadOnlyDataWithRel
+            | read::SectionKind::ReadOnlyString
+            | read::SectionKind::UninitializedData
+            | read::SectionKind::OtherString
+            | read::SectionKind::Tls
+            | read::SectionKind::UninitializedTls => {}
+            _ => continue,
         }
 
-        for symbol in elf.symbols() {
-            let sym_name = match symbol.name() {
-                Ok(n) if !n.is_empty() => n.to_string(),
-                _ => continue,
-            };
-            if symbol.is_undefined() {
-                continue;
-            }
-            let sec_idx = match symbol.section() {
-                read::SymbolSection::Section(idx) => idx,
-                _ => continue,
-            };
-            let global_sec = match sec_map.get(&(obj_idx, sec_idx)) {
-                Some(&g) => g,
-                None => continue,
-            };
-            let def = SymbolDef {
-                section_global_idx: global_sec,
-                value: symbol.address(),
-            };
-            if symbol.is_global() {
-                // Concrete .o definitions always override .so dynamic imports
-                match state.globals.get(&sym_name) {
+        let sec_data = section.data().unwrap_or(&[]).to_vec();
+        let global_idx = state.sections.len();
+        sec_map.insert((obj_idx, section.index()), global_idx);
+
+        let is_tls = matches!(
+            section.kind(),
+            read::SectionKind::Tls | read::SectionKind::UninitializedTls
+        );
+
+        state.sections.push(InputSection {
+            obj_idx,
+            name: sec_name.to_string(),
+            data: sec_data,
+            align: section.align().max(1),
+            size: section.size(),
+            vaddr: 0,
+        });
+
+        if is_tls {
+            state.tls_sections.push(global_idx);
+        }
+    }
+
+    for symbol in obj.symbols() {
+        let sym_name = match symbol.name() {
+            Ok(n) if !n.is_empty() => n.to_string(),
+            _ => continue,
+        };
+        if symbol.is_undefined() {
+            continue;
+        }
+        // Skip section symbols — relocations resolve these via synthetic
+        // names keyed on section index, so they don't belong in locals.
+        if symbol.kind() == read::SymbolKind::Section {
+            continue;
+        }
+        let sec_idx = match symbol.section() {
+            read::SymbolSection::Section(idx) => idx,
+            _ => continue,
+        };
+        let global_sec = match sec_map.get(&(obj_idx, sec_idx)) {
+            Some(&g) => g,
+            None => continue,
+        };
+        let def = SymbolDef {
+            section_global_idx: global_sec,
+            value: symbol.address(),
+        };
+        if symbol.is_global() {
+            // COFF weak externals: `.weak.FOO.default` (LLVM) or `.weak.FOO` (object crate)
+            // provides the actual code for `FOO`. Register the alias as a global too.
+            if let Some(rest) = sym_name.strip_prefix(".weak.") {
+                let alias = rest.strip_suffix(".default").unwrap_or(rest);
+                let alias = alias.to_string();
+                match state.globals.get(&alias) {
                     Some(existing) if existing.section_global_idx != DYNAMIC_SYMBOL_SENTINEL => {}
-                    _ => { state.globals.insert(sym_name, def); }
+                    _ => { state.globals.insert(alias, def); }
                 }
-            } else {
-                state.locals.insert((obj_idx, sym_name), def);
             }
+            // Concrete .o definitions always override .so dynamic imports
+            match state.globals.get(&sym_name) {
+                Some(existing) if existing.section_global_idx != DYNAMIC_SYMBOL_SENTINEL => {}
+                _ => { state.globals.insert(sym_name, def); }
+            }
+        } else {
+            if let Some(existing) = state.locals.get(&(obj_idx, sym_name.clone())) {
+                assert_eq!(
+                    existing.section_global_idx, def.section_global_idx,
+                    "local symbol {sym_name:?} in obj {obj_idx} defined in two \
+                     different sections ({} vs {})",
+                    existing.section_global_idx, def.section_global_idx
+                );
+            }
+            state.locals.insert((obj_idx, sym_name), def);
         }
+    }
 
-        for section in elf.sections() {
-            match section.kind() {
-                read::SectionKind::Text
-                | read::SectionKind::Data
-                | read::SectionKind::ReadOnlyData
-                | read::SectionKind::ReadOnlyDataWithRel
-                | read::SectionKind::ReadOnlyString
-                | read::SectionKind::OtherString
-                | read::SectionKind::Tls => {}
-                _ => continue,
-            }
-            let global_sec = match sec_map.get(&(obj_idx, section.index())) {
-                Some(&g) => g,
-                None => continue,
-            };
+    for section in obj.sections() {
+        match section.kind() {
+            read::SectionKind::Text
+            | read::SectionKind::Data
+            | read::SectionKind::ReadOnlyData
+            | read::SectionKind::ReadOnlyDataWithRel
+            | read::SectionKind::ReadOnlyString
+            | read::SectionKind::OtherString
+            | read::SectionKind::Tls => {}
+            _ => continue,
+        }
+        let global_sec = match sec_map.get(&(obj_idx, section.index())) {
+            Some(&g) => g,
+            None => continue,
+        };
 
-            for (offset, reloc) in section.relocations() {
-                let sym_name = match reloc.target() {
-                    read::RelocationTarget::Symbol(sym_idx) => {
-                        match elf.symbol_by_index(sym_idx) {
-                            Ok(s) => {
-                                let name = s.name().unwrap_or("");
-                                if name.is_empty() {
-                                    // Section symbol — create synthetic name for lookup
-                                    if let read::SymbolSection::Section(si) = s.section() {
-                                        if let Some(&gsec) = sec_map.get(&(obj_idx, si)) {
-                                            let syn =
-                                                format!("__section_sym_{}_{}", obj_idx, gsec);
-                                            state
-                                                .locals
-                                                .entry((obj_idx, syn.clone()))
-                                                .or_insert(SymbolDef {
-                                                    section_global_idx: gsec,
-                                                    value: 0,
-                                                });
-                                            syn
-                                        } else {
-                                            continue;
-                                        }
+        for (offset, reloc) in section.relocations() {
+            let sym_name = match reloc.target() {
+                read::RelocationTarget::Symbol(sym_idx) => {
+                    match obj.symbol_by_index(sym_idx) {
+                        Ok(s) => {
+                            let name = s.name().unwrap_or("");
+                            // Section symbols need unique synthetic names because
+                            // COFF objects can have multiple sections with the same
+                            // name (e.g. many `.rdata` COMDAT sections). ELF section
+                            // symbols have empty names; COFF section symbols have
+                            // the section name. Both cases use the section index to
+                            // create a unique key for correct resolution.
+                            let is_section_sym = name.is_empty()
+                                || s.kind() == read::SymbolKind::Section;
+                            if is_section_sym {
+                                if let read::SymbolSection::Section(si) = s.section() {
+                                    if let Some(&gsec) = sec_map.get(&(obj_idx, si)) {
+                                        let syn =
+                                            format!("__section_sym_{}_{}", obj_idx, gsec);
+                                        state
+                                            .locals
+                                            .entry((obj_idx, syn.clone()))
+                                            .or_insert(SymbolDef {
+                                                section_global_idx: gsec,
+                                                value: s.address(),
+                                            });
+                                        syn
                                     } else {
                                         continue;
                                     }
                                 } else {
-                                    name.to_string()
+                                    continue;
                                 }
+                            } else {
+                                name.to_string()
                             }
-                            Err(_) => continue,
                         }
+                        Err(_) => continue,
                     }
-                    _ => continue,
-                };
-                let r_type = match reloc.flags() {
-                    RelocationFlags::Elf { r_type } => r_type,
-                    _ => continue,
-                };
+                }
+                _ => continue,
+            };
+            let r_type = match reloc.flags() {
+                RelocationFlags::Elf { r_type } => r_type,
+                RelocationFlags::Coff { typ } => coff_to_elf_r_type(typ),
+                _ => continue,
+            };
 
-                state.relocs.push(InputReloc {
-                    section_global_idx: global_sec,
-                    offset,
-                    r_type,
-                    symbol_name: sym_name,
-                    addend: reloc.addend(),
-                });
-            }
+            // COFF uses implicit addends stored in the section data, while ELF RELA
+            // uses explicit addends. The `object` crate returns the COFF-specific
+            // base adjustment (e.g. -4 for REL32) but sets `has_implicit_addend`,
+            // meaning we must also read the value from the section data and add it.
+            let addend = if reloc.has_implicit_addend() {
+                let data = &state.sections[global_sec].data;
+                let off = offset as usize;
+                let implicit = match reloc.size() {
+                    64 => i64::from_le_bytes(data[off..off + 8].try_into().unwrap()),
+                    32 => i32::from_le_bytes(data[off..off + 4].try_into().unwrap()) as i64,
+                    16 => i16::from_le_bytes(data[off..off + 2].try_into().unwrap()) as i64,
+                    _ => 0,
+                };
+                reloc.addend() + implicit
+            } else {
+                reloc.addend()
+            };
+
+            state.relocs.push(InputReloc {
+                section_global_idx: global_sec,
+                offset,
+                r_type,
+                symbol_name: sym_name,
+                addend,
+            });
         }
     }
+}
 
-    state
+/// Map COFF x86_64 relocation types to their ELF equivalents.
+fn coff_to_elf_r_type(typ: u16) -> u32 {
+    match typ {
+        pe::IMAGE_REL_AMD64_ADDR64 => elf::R_X86_64_64,
+        pe::IMAGE_REL_AMD64_ADDR32 => elf::R_X86_64_32,
+        pe::IMAGE_REL_AMD64_ADDR32NB => elf::R_X86_64_32S,
+        pe::IMAGE_REL_AMD64_REL32
+        | pe::IMAGE_REL_AMD64_REL32_1
+        | pe::IMAGE_REL_AMD64_REL32_2
+        | pe::IMAGE_REL_AMD64_REL32_3
+        | pe::IMAGE_REL_AMD64_REL32_4
+        | pe::IMAGE_REL_AMD64_REL32_5 => elf::R_X86_64_PLT32,
+        pe::IMAGE_REL_AMD64_SECREL => elf::R_X86_64_32,
+        other => {
+            eprintln!("toyos-ld: unsupported COFF relocation type 0x{other:04x}");
+            process::exit(1);
+        }
+    }
 }
 
 // ── Allocator shim synthesis ─────────────────────────────────────────────
@@ -508,9 +587,12 @@ fn is_tls_section(name: &str) -> bool {
 fn is_rx_section(name: &str) -> bool {
     name.starts_with(".text")
         || name.starts_with(".rodata")
+        || name.starts_with(".rdata")  // COFF naming for read-only data
         || name.starts_with(".eh_frame")
         || name == ".gcc_except_table"
         || name.starts_with(".data.rel.ro")
+        || name.starts_with(".xdata")  // COFF unwind info (read-only)
+        || name.starts_with(".pdata")  // COFF exception directory (read-only)
 }
 
 struct LayoutResult {
@@ -1646,6 +1728,16 @@ fn emit_pe_bytes(
     buf[oh + 0x3C..oh + 0x40].copy_from_slice(&layout.size_of_headers.to_le_bytes());
     // Subsystem
     buf[oh + 0x44..oh + 0x46].copy_from_slice(&subsystem.to_le_bytes());
+    // DllCharacteristics: DYNAMIC_BASE | HIGH_ENTROPY_VA | NX_COMPAT
+    buf[oh + 0x46..oh + 0x48].copy_from_slice(&0x0160u16.to_le_bytes());
+    // SizeOfStackReserve
+    buf[oh + 0x48..oh + 0x50].copy_from_slice(&0x100000u64.to_le_bytes());
+    // SizeOfStackCommit
+    buf[oh + 0x50..oh + 0x58].copy_from_slice(&0x1000u64.to_le_bytes());
+    // SizeOfHeapReserve
+    buf[oh + 0x58..oh + 0x60].copy_from_slice(&0x100000u64.to_le_bytes());
+    // SizeOfHeapCommit
+    buf[oh + 0x60..oh + 0x68].copy_from_slice(&0x1000u64.to_le_bytes());
     // NumberOfRvaAndSizes = 16
     buf[oh + 0x6C..oh + 0x70].copy_from_slice(&16u32.to_le_bytes());
 

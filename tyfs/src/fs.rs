@@ -1,7 +1,14 @@
+use alloc::borrow::Cow;
 use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::disk::Disk;
+
+#[derive(Debug)]
+pub enum ReadError {
+    NotFound,
+    OutOfMemory,
+}
 
 const MAGIC: [u8; 4] = *b"TYFS";
 const VERSION: u32 = 2;
@@ -166,19 +173,24 @@ impl<D: Disk> SimpleFs<D> {
         true
     }
 
-    pub fn read_file(&mut self, name: &str) -> Option<Vec<u8>> {
-        let entry_offset = self.find_entry(name)?;
+    pub fn read_file(&mut self, name: &str) -> Result<Cow<'static, [u8]>, ReadError> {
+        let entry_offset = self.find_entry(name).ok_or(ReadError::NotFound)?;
         let entry = self.read_entry(entry_offset);
         let data_offset = u64::from_le_bytes(entry[24..32].try_into().unwrap());
-        let data_len = u64::from_le_bytes(entry[32..40].try_into().unwrap());
+        let data_len = u64::from_le_bytes(entry[32..40].try_into().unwrap()) as usize;
 
-        let mut buf = Vec::new();
-        if buf.try_reserve_exact(data_len as usize).is_err() {
-            return None;
+        // Zero-copy path for memory-backed disks (ramdisk)
+        if let Some(bytes) = self.disk.as_static_bytes() {
+            let off = data_offset as usize;
+            return Ok(Cow::Borrowed(&bytes[off..off + data_len]));
         }
-        buf.resize(data_len as usize, 0u8);
+
+        // Copy path for block devices
+        let mut buf = Vec::new();
+        buf.try_reserve_exact(data_len).map_err(|_| ReadError::OutOfMemory)?;
+        buf.resize(data_len, 0u8);
         self.disk.read(data_offset, &mut buf);
-        Some(buf)
+        Ok(Cow::Owned(buf))
     }
 
     pub fn delete(&mut self, name: &str) -> bool {
@@ -255,8 +267,8 @@ mod tests {
     fn create_and_read() {
         let mut fs = make_fs();
         assert!(fs.create("hello.txt", b"Hello, world!"));
-        let data = fs.read_file("hello.txt");
-        assert_eq!(data.as_deref(), Some(b"Hello, world!".as_slice()));
+        let data = fs.read_file("hello.txt").unwrap();
+        assert_eq!(&*data, b"Hello, world!");
     }
 
     #[test]
@@ -264,8 +276,8 @@ mod tests {
         let mut fs = make_fs();
         let long_name = "librustc_codegen_cranelift-1.95.0-dev.so";
         assert!(fs.create(long_name, b"elf data here"));
-        let data = fs.read_file(long_name);
-        assert_eq!(data.as_deref(), Some(b"elf data here".as_slice()));
+        let data = fs.read_file(long_name).unwrap();
+        assert_eq!(&*data, b"elf data here");
 
         let files = fs.list();
         assert_eq!(files.len(), 1);
@@ -287,9 +299,9 @@ mod tests {
         assert!(names.contains(&"b.txt"));
         assert!(names.contains(&"c.txt"));
 
-        assert_eq!(fs.read_file("a.txt").as_deref(), Some(b"aaa".as_slice()));
-        assert_eq!(fs.read_file("b.txt").as_deref(), Some(b"bbbbb".as_slice()));
-        assert_eq!(fs.read_file("c.txt").as_deref(), Some(b"c".as_slice()));
+        assert_eq!(&*fs.read_file("a.txt").unwrap(), b"aaa");
+        assert_eq!(&*fs.read_file("b.txt").unwrap(), b"bbbbb");
+        assert_eq!(&*fs.read_file("c.txt").unwrap(), b"c");
     }
 
     #[test]
@@ -298,7 +310,7 @@ mod tests {
         assert!(fs.create("rm_me.txt", b"gone"));
         assert!(fs.delete("rm_me.txt"));
 
-        assert!(fs.read_file("rm_me.txt").is_none());
+        assert!(fs.read_file("rm_me.txt").is_err());
         assert_eq!(fs.list().len(), 0);
     }
 
@@ -322,7 +334,7 @@ mod tests {
         assert_eq!(fs.read_link("target.txt"), None);
 
         // read_file on a symlink returns the raw target bytes (VFS resolves)
-        assert_eq!(fs.read_file("link.txt").as_deref(), Some(b"target.txt".as_slice()));
+        assert_eq!(&*fs.read_file("link.txt").unwrap(), b"target.txt");
 
         // Both show up in list
         assert_eq!(fs.list().len(), 2);
@@ -334,7 +346,7 @@ mod tests {
         fs.create("persist.txt", b"saved data");
 
         let mut fs2 = SimpleFs::mount(fs.into_disk()).unwrap();
-        let data = fs2.read_file("persist.txt");
-        assert_eq!(data.as_deref(), Some(b"saved data".as_slice()));
+        let data = fs2.read_file("persist.txt").unwrap();
+        assert_eq!(&*data, b"saved data");
     }
 }

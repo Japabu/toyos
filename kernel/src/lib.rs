@@ -26,6 +26,7 @@ pub mod pipe;
 pub mod message;
 pub mod device;
 pub mod net;
+pub mod gpu;
 pub mod user_heap;
 pub mod shared_memory;
 pub mod user_ptr;
@@ -46,6 +47,12 @@ pub struct KernelArgs {
     pub init_program_len: u64,
     pub kernel_elf_addr: u64,
     pub kernel_elf_size: u64,
+    pub gop_framebuffer: u64,
+    pub gop_framebuffer_size: u64,
+    pub gop_width: u32,
+    pub gop_height: u32,
+    pub gop_stride: u32,
+    pub gop_pixel_format: u32,
 }
 
 #[repr(C)]
