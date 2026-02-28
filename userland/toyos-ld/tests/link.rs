@@ -7,7 +7,7 @@ use object::{
 };
 use std::path::PathBuf;
 
-// ── Helpers ──────────────────────────────────────────────────────────────
+// ── Helpers: toolchain ───────────────────────────────────────────────────
 
 fn sysroot_libdir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -21,6 +21,10 @@ fn sysroot() -> PathBuf {
 
 fn rustc() -> PathBuf {
     sysroot().join("bin/rustc")
+}
+
+fn has_rustc() -> bool {
+    rustc().exists() && sysroot_libdir().exists()
 }
 
 fn compile_to_obj(source: &str) -> Vec<u8> {
@@ -66,22 +70,129 @@ fn std_rlibs() -> Vec<String> {
     ].iter().map(|s| s.to_string()).collect()
 }
 
-fn build_minimal_obj(symbol_name: &str, code: &[u8]) -> Vec<u8> {
-    let mut obj = WriteObject::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
-    let text = obj.section_id(StandardSection::Text);
-    let offset = obj.append_section_data(text, code, 16);
-    obj.add_symbol(Symbol {
-        name: symbol_name.as_bytes().to_vec(),
-        value: offset,
-        size: code.len() as u64,
-        kind: SymbolKind::Text,
-        scope: SymbolScope::Dynamic,
-        weak: false,
-        section: SymbolSection::Section(text),
-        flags: SymbolFlags::None,
-    });
-    obj.write().unwrap()
+// ── Helpers: object builder ──────────────────────────────────────────────
+
+/// Fluent builder for constructing test ELF/COFF object files.
+struct ObjBuilder {
+    obj: WriteObject<'static>,
+    text: object::write::SectionId,
 }
+
+impl ObjBuilder {
+    fn elf() -> Self {
+        let mut obj = WriteObject::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
+        let text = obj.section_id(StandardSection::Text);
+        Self { obj, text }
+    }
+
+    fn coff() -> Self {
+        let mut obj = WriteObject::new(BinaryFormat::Coff, Architecture::X86_64, Endianness::Little);
+        let text = obj.section_id(StandardSection::Text);
+        Self { obj, text }
+    }
+
+    /// Add a global function symbol with the given code.
+    fn func(mut self, name: &str, code: &[u8]) -> Self {
+        let off = self.obj.append_section_data(self.text, code, 16);
+        self.obj.add_symbol(Symbol {
+            name: name.as_bytes().to_vec(),
+            value: off, size: code.len() as u64,
+            kind: SymbolKind::Text, scope: SymbolScope::Dynamic,
+            weak: false, section: SymbolSection::Section(self.text), flags: SymbolFlags::None,
+        });
+        self
+    }
+
+    /// Add a function that calls an undefined symbol via PLT32/REL32 relocation.
+    fn func_calling(mut self, name: &str, callee: &str) -> Self {
+        let code = &[0xE8, 0, 0, 0, 0, 0xC3]; // call rel32; ret
+        let off = self.obj.append_section_data(self.text, code, 16);
+        let callee_sym = self.obj.add_symbol(Symbol {
+            name: callee.as_bytes().to_vec(),
+            value: 0, size: 0,
+            kind: SymbolKind::Text, scope: SymbolScope::Dynamic,
+            weak: false, section: SymbolSection::Undefined, flags: SymbolFlags::None,
+        });
+        self.obj.add_symbol(Symbol {
+            name: name.as_bytes().to_vec(),
+            value: off, size: code.len() as u64,
+            kind: SymbolKind::Text, scope: SymbolScope::Dynamic,
+            weak: false, section: SymbolSection::Section(self.text), flags: SymbolFlags::None,
+        });
+        let r_type = if self.obj.format() == BinaryFormat::Coff {
+            RelocationFlags::Coff { typ: pe::IMAGE_REL_AMD64_REL32 }
+        } else {
+            RelocationFlags::Elf { r_type: elf::R_X86_64_PLT32 }
+        };
+        self.obj.add_relocation(self.text, object::write::Relocation {
+            offset: off + 1, symbol: callee_sym, addend: -4, flags: r_type,
+        }).unwrap();
+        self
+    }
+
+    /// Add a data section with a pointer relocation (R_X86_64_64) to the named symbol.
+    fn data_ptr_to(mut self, target_sym_name: &str) -> Self {
+        let data_sec = self.obj.section_id(StandardSection::Data);
+        let ptr_off = self.obj.append_section_data(data_sec, &[0u8; 8], 8);
+        let sym = self.obj.symbol_id(target_sym_name.as_bytes())
+            .unwrap_or_else(|| panic!("symbol `{target_sym_name}` not found in object"));
+        let r_type = if self.obj.format() == BinaryFormat::Coff {
+            RelocationFlags::Coff { typ: pe::IMAGE_REL_AMD64_ADDR64 }
+        } else {
+            RelocationFlags::Elf { r_type: elf::R_X86_64_64 }
+        };
+        self.obj.add_relocation(data_sec, object::write::Relocation {
+            offset: ptr_off, symbol: sym, addend: 0, flags: r_type,
+        }).unwrap();
+        self
+    }
+
+    /// Add a weak function symbol (COFF weak external pattern).
+    fn weak_func(mut self, name: &str, code: &[u8]) -> Self {
+        let off = self.obj.append_section_data(self.text, code, 16);
+        self.obj.add_symbol(Symbol {
+            name: name.as_bytes().to_vec(),
+            value: off, size: code.len() as u64,
+            kind: SymbolKind::Text, scope: SymbolScope::Dynamic,
+            weak: true, section: SymbolSection::Section(self.text), flags: SymbolFlags::None,
+        });
+        self
+    }
+
+    /// Add an undefined symbol reference (no relocation).
+    fn undefined(mut self, name: &str) -> Self {
+        self.obj.add_symbol(Symbol {
+            name: name.as_bytes().to_vec(),
+            value: 0, size: 0,
+            kind: SymbolKind::Text, scope: SymbolScope::Dynamic,
+            weak: false, section: SymbolSection::Undefined, flags: SymbolFlags::None,
+        });
+        self
+    }
+
+    /// Get mutable access to the underlying WriteObject for advanced construction.
+    fn inner_mut(&mut self) -> &mut WriteObject<'static> {
+        &mut self.obj
+    }
+
+    fn build(self) -> Vec<u8> {
+        self.obj.write().unwrap()
+    }
+
+    fn named(self, name: &str) -> (String, Vec<u8>) {
+        (name.into(), self.build())
+    }
+}
+
+fn build_minimal_obj(name: &str, code: &[u8]) -> Vec<u8> {
+    ObjBuilder::elf().func(name, code).build()
+}
+
+fn build_minimal_coff(name: &str, code: &[u8]) -> Vec<u8> {
+    ObjBuilder::coff().func(name, code).build()
+}
+
+// ── Helpers: ELF parsing ─────────────────────────────────────────────────
 
 fn parse_elf(data: &[u8]) -> ElfFile64<'_> {
     ElfFile64::parse(data).expect("output should be valid ELF")
@@ -96,10 +207,6 @@ fn has_phdr(elf: &ElfFile64<'_>, p_type: u32) -> bool {
         .any(|ph| ph.p_type.get(endian) == p_type)
 }
 
-fn has_rustc() -> bool {
-    rustc().exists() && sysroot_libdir().exists()
-}
-
 fn find_section<'a>(elf: &'a ElfFile64<'a>, name: &str) -> Option<object::read::elf::ElfSection64<'a, 'a>> {
     elf.sections().find(|s| s.name().unwrap_or("") == name)
 }
@@ -109,6 +216,39 @@ fn dynsym_names(elf: &ElfFile64<'_>) -> Vec<String> {
         .filter_map(|s| s.name().ok().map(|n| n.to_string()))
         .filter(|n| !n.is_empty())
         .collect()
+}
+
+/// Parse .dynamic section entries, returning (tag, value) pairs.
+fn parse_dynamic(elf: &ElfFile64<'_>) -> Vec<(i64, u64)> {
+    let endian = elf.endian();
+    let phdrs = elf.elf_header().program_headers(endian, elf.data()).unwrap();
+    let dyn_phdr = phdrs.iter().find(|ph| ph.p_type.get(endian) == elf::PT_DYNAMIC)
+        .expect("should have PT_DYNAMIC");
+    let off = dyn_phdr.p_offset.get(endian) as usize;
+    let size = dyn_phdr.p_filesz.get(endian) as usize;
+    let data = &elf.data()[off..off + size];
+    let mut entries = Vec::new();
+    for chunk in data.chunks_exact(16) {
+        let tag = i64::from_le_bytes(chunk[0..8].try_into().unwrap());
+        let val = u64::from_le_bytes(chunk[8..16].try_into().unwrap());
+        entries.push((tag, val));
+        if tag == elf::DT_NULL as i64 { break; }
+    }
+    entries
+}
+
+// ── Helpers: PE parsing ──────────────────────────────────────────────────
+
+fn pe_u16(data: &[u8], off: usize) -> u16 {
+    u16::from_le_bytes(data[off..off + 2].try_into().unwrap())
+}
+
+fn pe_u32(data: &[u8], off: usize) -> u32 {
+    u32::from_le_bytes(data[off..off + 4].try_into().unwrap())
+}
+
+fn pe_u64(data: &[u8], off: usize) -> u64 {
+    u64::from_le_bytes(data[off..off + 8].try_into().unwrap())
 }
 
 // ── Tests: hand-crafted objects ──────────────────────────────────────────
@@ -134,60 +274,9 @@ fn basic_single_function() {
 
 #[test]
 fn cross_object_symbol_resolution() {
-    // Object A: defines `helper`
-    let mut obj_a = WriteObject::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
-    let text_a = obj_a.section_id(StandardSection::Text);
-    let off_a = obj_a.append_section_data(text_a, &[0xC3], 16);
-    obj_a.add_symbol(Symbol {
-        name: b"helper".to_vec(),
-        value: off_a,
-        size: 1,
-        kind: SymbolKind::Text,
-        scope: SymbolScope::Dynamic,
-        weak: false,
-        section: SymbolSection::Section(text_a),
-        flags: SymbolFlags::None,
-    });
-
-    // Object B: defines `_start`, calls `helper` via PLT32
-    let mut obj_b = WriteObject::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
-    let text_b = obj_b.section_id(StandardSection::Text);
-    let off_b = obj_b.append_section_data(text_b, &[0xE8, 0, 0, 0, 0, 0xC3], 16);
-    let helper_sym = obj_b.add_symbol(Symbol {
-        name: b"helper".to_vec(),
-        value: 0,
-        size: 0,
-        kind: SymbolKind::Text,
-        scope: SymbolScope::Dynamic,
-        weak: false,
-        section: SymbolSection::Undefined,
-        flags: SymbolFlags::None,
-    });
-    obj_b.add_symbol(Symbol {
-        name: b"_start".to_vec(),
-        value: off_b,
-        size: 6,
-        kind: SymbolKind::Text,
-        scope: SymbolScope::Dynamic,
-        weak: false,
-        section: SymbolSection::Section(text_b),
-        flags: SymbolFlags::None,
-    });
-    obj_b
-        .add_relocation(
-            text_b,
-            object::write::Relocation {
-                offset: off_b + 1,
-                symbol: helper_sym,
-                addend: -4,
-                flags: RelocationFlags::Elf { r_type: elf::R_X86_64_PLT32 },
-            },
-        )
-        .unwrap();
-
     let objects = vec![
-        ("a.o".into(), obj_a.write().unwrap()),
-        ("b.o".into(), obj_b.write().unwrap()),
+        ObjBuilder::elf().func("helper", &[0xC3]).named("a.o"),
+        ObjBuilder::elf().func_calling("_start", "helper").named("b.o"),
     ];
 
     let elf_bytes =
@@ -200,41 +289,8 @@ fn cross_object_symbol_resolution() {
 
 #[test]
 fn undefined_symbol_error() {
-    let mut obj = WriteObject::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
-    let text = obj.section_id(StandardSection::Text);
-    let off = obj.append_section_data(text, &[0xE8, 0, 0, 0, 0], 16);
-    let undef_sym = obj.add_symbol(Symbol {
-        name: b"nonexistent".to_vec(),
-        value: 0,
-        size: 0,
-        kind: SymbolKind::Text,
-        scope: SymbolScope::Dynamic,
-        weak: false,
-        section: SymbolSection::Undefined,
-        flags: SymbolFlags::None,
-    });
-    obj.add_symbol(Symbol {
-        name: b"_start".to_vec(),
-        value: off,
-        size: 5,
-        kind: SymbolKind::Text,
-        scope: SymbolScope::Dynamic,
-        weak: false,
-        section: SymbolSection::Section(text),
-        flags: SymbolFlags::None,
-    });
-    obj.add_relocation(
-        text,
-        object::write::Relocation {
-            offset: off + 1,
-            symbol: undef_sym,
-            addend: -4,
-            flags: RelocationFlags::Elf { r_type: elf::R_X86_64_PLT32 },
-        },
-    )
-    .unwrap();
-
-    let result = toyos_ld::link(&[("test.o".into(), obj.write().unwrap())], "_start");
+    let obj = ObjBuilder::elf().func_calling("_start", "nonexistent").build();
+    let result = toyos_ld::link(&[("test.o".into(), obj)], "_start");
     let syms = result.expect_err("should fail with undefined symbol");
     assert!(syms.contains(&"nonexistent".to_string()));
 }
@@ -242,40 +298,12 @@ fn undefined_symbol_error() {
 #[test]
 fn absolute_relocation_produces_relative() {
     // R_X86_64_64 relocation should produce R_X86_64_RELATIVE in output
-    let mut obj = WriteObject::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
-    let text = obj.section_id(StandardSection::Text);
-    let start_off = obj.append_section_data(text, &[0xC3], 16);
-    let start_sym = obj.add_symbol(Symbol {
-        name: b"_start".to_vec(),
-        value: start_off,
-        size: 1,
-        kind: SymbolKind::Text,
-        scope: SymbolScope::Dynamic,
-        weak: false,
-        section: SymbolSection::Section(text),
-        flags: SymbolFlags::None,
-    });
-
-    let data_sec = obj.section_id(StandardSection::Data);
-    let ptr_off = obj.append_section_data(data_sec, &[0u8; 8], 8);
-    obj.add_relocation(
-        data_sec,
-        object::write::Relocation {
-            offset: ptr_off,
-            symbol: start_sym,
-            addend: 0,
-            flags: RelocationFlags::Elf { r_type: elf::R_X86_64_64 },
-        },
-    )
-    .unwrap();
-
-    let elf_bytes = toyos_ld::link(&[("test.o".into(), obj.write().unwrap())], "_start")
+    let obj = ObjBuilder::elf().func("_start", &[0xC3]).data_ptr_to("_start").build();
+    let elf_bytes = toyos_ld::link(&[("test.o".into(), obj)], "_start")
         .expect("R_X86_64_64 linking should succeed");
 
     let elf = parse_elf(&elf_bytes);
-    let rela_sec = elf
-        .sections()
-        .find(|s| s.name().unwrap_or("") == ".rela.dyn");
+    let rela_sec = find_section(&elf, ".rela.dyn");
     assert!(rela_sec.is_some(), "should have .rela.dyn section");
     let rela_data = rela_sec.unwrap().data().unwrap();
     assert!(!rela_data.is_empty(), ".rela.dyn should have entries");
@@ -446,26 +474,8 @@ fn shared_has_dynsym_section() {
 
 #[test]
 fn shared_exports_global_symbols() {
-    let mut obj = WriteObject::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
-    let text = obj.section_id(StandardSection::Text);
-
-    // Two functions
-    let off_a = obj.append_section_data(text, &[0xC3], 16);
-    obj.add_symbol(Symbol {
-        name: b"func_alpha".to_vec(),
-        value: off_a, size: 1,
-        kind: SymbolKind::Text, scope: SymbolScope::Dynamic,
-        weak: false, section: SymbolSection::Section(text), flags: SymbolFlags::None,
-    });
-    let off_b = obj.append_section_data(text, &[0xC3], 16);
-    obj.add_symbol(Symbol {
-        name: b"func_beta".to_vec(),
-        value: off_b, size: 1,
-        kind: SymbolKind::Text, scope: SymbolScope::Dynamic,
-        weak: false, section: SymbolSection::Section(text), flags: SymbolFlags::None,
-    });
-
-    let elf_bytes = toyos_ld::link_shared(&[("test.o".into(), obj.write().unwrap())])
+    let obj = ObjBuilder::elf().func("func_alpha", &[0xC3]).func("func_beta", &[0xC3]).build();
+    let elf_bytes = toyos_ld::link_shared(&[("test.o".into(), obj)])
         .expect("shared linking should succeed");
 
     let elf = parse_elf(&elf_bytes);
@@ -476,33 +486,9 @@ fn shared_exports_global_symbols() {
 
 #[test]
 fn shared_cross_object_resolution() {
-    // Object A: defines `helper`
-    let obj_a_data = build_minimal_obj("helper", &[0xC3]);
-
-    // Object B: defines `entry`, calls `helper` via PLT32
-    let mut obj_b = WriteObject::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
-    let text_b = obj_b.section_id(StandardSection::Text);
-    let off_b = obj_b.append_section_data(text_b, &[0xE8, 0, 0, 0, 0, 0xC3], 16);
-    let helper_sym = obj_b.add_symbol(Symbol {
-        name: b"helper".to_vec(),
-        value: 0, size: 0,
-        kind: SymbolKind::Text, scope: SymbolScope::Dynamic,
-        weak: false, section: SymbolSection::Undefined, flags: SymbolFlags::None,
-    });
-    obj_b.add_symbol(Symbol {
-        name: b"entry".to_vec(),
-        value: off_b, size: 6,
-        kind: SymbolKind::Text, scope: SymbolScope::Dynamic,
-        weak: false, section: SymbolSection::Section(text_b), flags: SymbolFlags::None,
-    });
-    obj_b.add_relocation(text_b, object::write::Relocation {
-        offset: off_b + 1, symbol: helper_sym, addend: -4,
-        flags: RelocationFlags::Elf { r_type: elf::R_X86_64_PLT32 },
-    }).unwrap();
-
     let objects = vec![
-        ("a.o".into(), obj_a_data),
-        ("b.o".into(), obj_b.write().unwrap()),
+        ObjBuilder::elf().func("helper", &[0xC3]).named("a.o"),
+        ObjBuilder::elf().func_calling("entry", "helper").named("b.o"),
     ];
 
     let elf_bytes = toyos_ld::link_shared(&objects)
@@ -521,59 +507,19 @@ fn shared_dynamic_has_symtab_strtab() {
         .expect("shared linking should succeed");
 
     let elf = parse_elf(&elf_bytes);
-    let endian = elf.endian();
+    let dyn_entries = parse_dynamic(&elf);
 
-    // Parse PT_DYNAMIC to find DT_SYMTAB and DT_STRTAB entries
-    let phdrs = elf.elf_header().program_headers(endian, elf.data()).unwrap();
-    let dyn_phdr = phdrs.iter().find(|ph| ph.p_type.get(endian) == elf::PT_DYNAMIC);
-    assert!(dyn_phdr.is_some(), "should have PT_DYNAMIC");
-
-    let dyn_phdr = dyn_phdr.unwrap();
-    let dyn_off = dyn_phdr.p_offset.get(endian) as usize;
-    let dyn_size = dyn_phdr.p_filesz.get(endian) as usize;
-    let dyn_data = &elf.data()[dyn_off..dyn_off + dyn_size];
-
-    let mut has_symtab = false;
-    let mut has_strtab = false;
-    let mut has_null = false;
-    let mut offset = 0;
-    while offset + 16 <= dyn_data.len() {
-        let d_tag = i64::from_le_bytes(dyn_data[offset..offset + 8].try_into().unwrap());
-        match d_tag {
-            tag if tag == elf::DT_SYMTAB as i64 => has_symtab = true,
-            tag if tag == elf::DT_STRTAB as i64 => has_strtab = true,
-            tag if tag == elf::DT_NULL as i64 => { has_null = true; break; }
-            _ => {}
-        }
-        offset += 16;
-    }
-
-    assert!(has_symtab, ".dynamic should have DT_SYMTAB");
-    assert!(has_strtab, ".dynamic should have DT_STRTAB");
-    assert!(has_null, ".dynamic should terminate with DT_NULL");
+    let has = |tag: u32| dyn_entries.iter().any(|&(t, _)| t == tag as i64);
+    assert!(has(elf::DT_SYMTAB), ".dynamic should have DT_SYMTAB");
+    assert!(has(elf::DT_STRTAB), ".dynamic should have DT_STRTAB");
+    assert!(has(elf::DT_NULL), ".dynamic should terminate with DT_NULL");
 }
 
 #[test]
 fn shared_relative_relocations() {
     // R_X86_64_64 in shared lib should produce R_X86_64_RELATIVE
-    let mut obj = WriteObject::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
-    let text = obj.section_id(StandardSection::Text);
-    let func_off = obj.append_section_data(text, &[0xC3], 16);
-    let func_sym = obj.add_symbol(Symbol {
-        name: b"my_func".to_vec(),
-        value: func_off, size: 1,
-        kind: SymbolKind::Text, scope: SymbolScope::Dynamic,
-        weak: false, section: SymbolSection::Section(text), flags: SymbolFlags::None,
-    });
-
-    let data_sec = obj.section_id(StandardSection::Data);
-    let ptr_off = obj.append_section_data(data_sec, &[0u8; 8], 8);
-    obj.add_relocation(data_sec, object::write::Relocation {
-        offset: ptr_off, symbol: func_sym, addend: 0,
-        flags: RelocationFlags::Elf { r_type: elf::R_X86_64_64 },
-    }).unwrap();
-
-    let elf_bytes = toyos_ld::link_shared(&[("test.o".into(), obj.write().unwrap())])
+    let obj = ObjBuilder::elf().func("my_func", &[0xC3]).data_ptr_to("my_func").build();
+    let elf_bytes = toyos_ld::link_shared(&[("test.o".into(), obj)])
         .expect("shared lib with R_X86_64_64 should link");
 
     let elf = parse_elf(&elf_bytes);
@@ -584,28 +530,8 @@ fn shared_relative_relocations() {
 
 #[test]
 fn shared_allows_undefined_symbols() {
-    // Shared libraries allow undefined symbols (resolved at load time)
-    let mut obj = WriteObject::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
-    let text = obj.section_id(StandardSection::Text);
-    let off = obj.append_section_data(text, &[0xE8, 0, 0, 0, 0], 16);
-    let undef_sym = obj.add_symbol(Symbol {
-        name: b"main".to_vec(),
-        value: 0, size: 0,
-        kind: SymbolKind::Text, scope: SymbolScope::Dynamic,
-        weak: false, section: SymbolSection::Undefined, flags: SymbolFlags::None,
-    });
-    obj.add_symbol(Symbol {
-        name: b"my_func".to_vec(),
-        value: off, size: 5,
-        kind: SymbolKind::Text, scope: SymbolScope::Dynamic,
-        weak: false, section: SymbolSection::Section(text), flags: SymbolFlags::None,
-    });
-    obj.add_relocation(text, object::write::Relocation {
-        offset: off + 1, symbol: undef_sym, addend: -4,
-        flags: RelocationFlags::Elf { r_type: elf::R_X86_64_PLT32 },
-    }).unwrap();
-
-    let result = toyos_ld::link_shared(&[("test.o".into(), obj.write().unwrap())]);
+    let obj = ObjBuilder::elf().func_calling("my_func", "main").build();
+    let result = toyos_ld::link_shared(&[("test.o".into(), obj)]);
     assert!(result.is_ok(), "shared lib should allow undefined symbols");
 }
 
@@ -613,134 +539,56 @@ fn shared_allows_undefined_symbols() {
 
 #[test]
 fn link_against_so_resolves_symbols() {
-    // Step 1: Build a .so that exports `helper`
-    let helper_obj = build_minimal_obj("helper", &[0xB8, 0x2A, 0x00, 0x00, 0x00, 0xC3]); // mov eax, 42; ret
-    let so_bytes = toyos_ld::link_shared(&[("helper.o".into(), helper_obj)])
+    let so_bytes = toyos_ld::link_shared(&[("helper.o".into(),
+        build_minimal_obj("helper", &[0xB8, 0x2A, 0x00, 0x00, 0x00, 0xC3]))])
         .expect("shared lib should link");
 
-    // Step 2: Build an object that references `helper` (undefined)
-    let mut obj = WriteObject::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
-    let text = obj.section_id(StandardSection::Text);
-    let off = obj.append_section_data(text, &[0xE8, 0, 0, 0, 0, 0xC3], 16);
-    let helper_sym = obj.add_symbol(Symbol {
-        name: b"helper".to_vec(),
-        value: 0, size: 0,
-        kind: SymbolKind::Text, scope: SymbolScope::Dynamic,
-        weak: false, section: SymbolSection::Undefined, flags: SymbolFlags::None,
-    });
-    obj.add_symbol(Symbol {
-        name: b"_start".to_vec(),
-        value: off, size: 6,
-        kind: SymbolKind::Text, scope: SymbolScope::Dynamic,
-        weak: false, section: SymbolSection::Section(text), flags: SymbolFlags::None,
-    });
-    obj.add_relocation(text, object::write::Relocation {
-        offset: off + 1, symbol: helper_sym, addend: -4,
-        flags: RelocationFlags::Elf { r_type: elf::R_X86_64_PLT32 },
-    }).unwrap();
-
-    // Step 3: Link the executable against the .so
-    let objects = vec![
-        ("main.o".into(), obj.write().unwrap()),
-        ("libhelper.so".into(), so_bytes),
-    ];
-    let result = toyos_ld::link(&objects, "_start");
+    let obj = ObjBuilder::elf().func_calling("_start", "helper").build();
+    let result = toyos_ld::link(
+        &[("main.o".into(), obj), ("libhelper.so".into(), so_bytes)], "_start");
     assert!(result.is_ok(), "linking against .so should resolve `helper`: {:?}", result.err());
 }
 
 #[test]
 fn link_against_so_does_not_include_so_content() {
-    // A .so providing `helper` should not be included in the output binary
-    let helper_obj = build_minimal_obj("helper", &[0xB8, 0x2A, 0x00, 0x00, 0x00, 0xC3]);
-    let so_bytes = toyos_ld::link_shared(&[("helper.o".into(), helper_obj)])
+    let so_bytes = toyos_ld::link_shared(&[("helper.o".into(),
+        build_minimal_obj("helper", &[0xB8, 0x2A, 0x00, 0x00, 0x00, 0xC3]))])
         .expect("shared lib should link");
 
-    // Build an executable that references `helper`
-    let mut obj = WriteObject::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
-    let text = obj.section_id(StandardSection::Text);
-    let off = obj.append_section_data(text, &[0xC3], 16); // just ret
-    obj.add_symbol(Symbol {
-        name: b"_start".to_vec(),
-        value: off, size: 1,
-        kind: SymbolKind::Text, scope: SymbolScope::Dynamic,
-        weak: false, section: SymbolSection::Section(text), flags: SymbolFlags::None,
-    });
-
-    // Link without .so — should succeed (no references to helper in relocs)
-    let without_so = toyos_ld::link(&[("main.o".into(), obj.write().unwrap())], "_start")
+    let start_obj = build_minimal_obj("_start", &[0xC3]);
+    let without_so = toyos_ld::link(&[("main.o".into(), start_obj.clone())], "_start")
         .expect("should link without .so");
-
-    // Link with .so — output should be same size (so content not included)
     let with_so = toyos_ld::link(
-        &[("main.o".into(), obj.write().unwrap()), ("libhelper.so".into(), so_bytes)],
-        "_start",
+        &[("main.o".into(), start_obj), ("libhelper.so".into(), so_bytes)], "_start",
     ).expect("should link with .so");
 
-    // With .so, output is larger due to dynamic sections (DT_NEEDED, .dynsym, .dynstr, .dynamic)
-    // but should NOT contain the .so's actual code/data content
     assert!(with_so.len() > without_so.len(),
         "dynamic executable should be larger due to dynamic sections");
-    // The .so's code (0xB8 0x2A ...) should not appear in the output
     let helper_code = [0xB8, 0x2A, 0x00, 0x00, 0x00, 0xC3];
-    let found = with_so.windows(helper_code.len()).any(|w| w == helper_code);
-    assert!(!found, "output should not contain the .so's code");
+    assert!(!with_so.windows(helper_code.len()).any(|w| w == helper_code),
+        "output should not contain the .so's code");
 }
 
 #[test]
 fn link_against_so_still_reports_truly_undefined() {
-    // A .so provides `helper` but not `missing_func`
-    let helper_obj = build_minimal_obj("helper", &[0xC3]);
-    let so_bytes = toyos_ld::link_shared(&[("helper.o".into(), helper_obj)])
+    let so_bytes = toyos_ld::link_shared(&[("helper.o".into(), build_minimal_obj("helper", &[0xC3]))])
         .expect("shared lib should link");
 
-    // Build object referencing `missing_func` (not in the .so)
-    let mut obj = WriteObject::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
-    let text = obj.section_id(StandardSection::Text);
-    let off = obj.append_section_data(text, &[0xE8, 0, 0, 0, 0, 0xC3], 16);
-    let undef_sym = obj.add_symbol(Symbol {
-        name: b"missing_func".to_vec(),
-        value: 0, size: 0,
-        kind: SymbolKind::Text, scope: SymbolScope::Dynamic,
-        weak: false, section: SymbolSection::Undefined, flags: SymbolFlags::None,
-    });
-    obj.add_symbol(Symbol {
-        name: b"_start".to_vec(),
-        value: off, size: 6,
-        kind: SymbolKind::Text, scope: SymbolScope::Dynamic,
-        weak: false, section: SymbolSection::Section(text), flags: SymbolFlags::None,
-    });
-    obj.add_relocation(text, object::write::Relocation {
-        offset: off + 1, symbol: undef_sym, addend: -4,
-        flags: RelocationFlags::Elf { r_type: elf::R_X86_64_PLT32 },
-    }).unwrap();
-
+    let obj = ObjBuilder::elf().func_calling("_start", "missing_func").build();
     let result = toyos_ld::link(
-        &[("main.o".into(), obj.write().unwrap()), ("libhelper.so".into(), so_bytes)],
-        "_start",
-    );
+        &[("main.o".into(), obj), ("libhelper.so".into(), so_bytes)], "_start");
     let err = result.expect_err("should fail for truly undefined symbol");
     assert!(err.contains(&"missing_func".to_string()));
 }
 
 #[test]
 fn shared_preserves_rustc_metadata_section() {
-    // Build an object with a .rustc section
-    let mut obj = WriteObject::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
-    let text = obj.section_id(StandardSection::Text);
-    let off = obj.append_section_data(text, &[0xC3], 16);
-    obj.add_symbol(Symbol {
-        name: b"my_func".to_vec(),
-        value: off, size: 1,
-        kind: SymbolKind::Text, scope: SymbolScope::Dynamic,
-        weak: false, section: SymbolSection::Section(text), flags: SymbolFlags::None,
-    });
-
-    // Add a .rustc section with test metadata
-    let rustc_section = obj.add_section(vec![], b".rustc".to_vec(), object::SectionKind::ReadOnlyData);
+    let mut b = ObjBuilder::elf().func("my_func", &[0xC3]);
+    let rustc_section = b.inner_mut().add_section(vec![], b".rustc".to_vec(), object::SectionKind::ReadOnlyData);
     let metadata = b"RUSTC_METADATA_TEST_1234567890";
-    obj.append_section_data(rustc_section, metadata, 1);
+    b.inner_mut().append_section_data(rustc_section, metadata, 1);
 
-    let elf_bytes = toyos_ld::link_shared(&[("test.o".into(), obj.write().unwrap())])
+    let elf_bytes = toyos_ld::link_shared(&[("test.o".into(), b.build())])
         .expect("shared lib with .rustc should link");
 
     let elf = parse_elf(&elf_bytes);
@@ -752,48 +600,15 @@ fn shared_preserves_rustc_metadata_section() {
 
 #[test]
 fn dynamic_executable_has_dt_needed_and_glob_dat() {
-    // Build a .so exporting `helper` and `_start`
-    let mut so_obj = WriteObject::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
-    let text = so_obj.section_id(StandardSection::Text);
-    let off = so_obj.append_section_data(text, &[0xB8, 0x2A, 0x00, 0x00, 0x00, 0xC3], 16);
-    so_obj.add_symbol(Symbol {
-        name: b"helper".to_vec(), value: off, size: 6,
-        kind: SymbolKind::Text, scope: SymbolScope::Dynamic,
-        weak: false, section: SymbolSection::Section(text), flags: SymbolFlags::None,
-    });
-    let off2 = so_obj.append_section_data(text, &[0xC3], 16);
-    so_obj.add_symbol(Symbol {
-        name: b"_start".to_vec(), value: off2, size: 1,
-        kind: SymbolKind::Text, scope: SymbolScope::Dynamic,
-        weak: false, section: SymbolSection::Section(text), flags: SymbolFlags::None,
-    });
-    let so_bytes = toyos_ld::link_shared(&[("helper.o".into(), so_obj.write().unwrap())])
+    let so_obj = ObjBuilder::elf()
+        .func("helper", &[0xB8, 0x2A, 0x00, 0x00, 0x00, 0xC3])
+        .func("_start", &[0xC3]);
+    let so_bytes = toyos_ld::link_shared(&[so_obj.named("helper.o")])
         .expect("shared lib should link");
 
-    // Build an object that calls `helper` (via PLT32 reloc) but has no _start
-    let mut obj = WriteObject::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
-    let text = obj.section_id(StandardSection::Text);
-    let off = obj.append_section_data(text, &[0xE8, 0x00, 0x00, 0x00, 0x00, 0xC3], 16);
-    obj.add_symbol(Symbol {
-        name: b"main".to_vec(), value: off, size: 6,
-        kind: SymbolKind::Text, scope: SymbolScope::Dynamic,
-        weak: false, section: SymbolSection::Section(text), flags: SymbolFlags::None,
-    });
-    let helper_sym = obj.add_symbol(Symbol {
-        name: b"helper".to_vec(), value: 0, size: 0,
-        kind: SymbolKind::Text, scope: SymbolScope::Dynamic,
-        weak: false, section: SymbolSection::Undefined, flags: SymbolFlags::None,
-    });
-    obj.add_relocation(text, object::write::Relocation {
-        offset: off + 1, symbol: helper_sym, addend: -4,
-        flags: RelocationFlags::Elf { r_type: elf::R_X86_64_PLT32 },
-    }).unwrap();
-
-    // Link executable against the .so — _start comes from .so via PLT
+    let obj = ObjBuilder::elf().func_calling("main", "helper").build();
     let result = toyos_ld::link(
-        &[("main.o".into(), obj.write().unwrap()), ("libmylib.so".into(), so_bytes)],
-        "_start",
-    );
+        &[("main.o".into(), obj), ("libmylib.so".into(), so_bytes)], "_start");
     assert!(result.is_ok(), "should link dynamic executable: {:?}", result.err());
     let elf_bytes = result.unwrap();
     let elf = parse_elf(&elf_bytes);
@@ -801,19 +616,12 @@ fn dynamic_executable_has_dt_needed_and_glob_dat() {
     // Verify PT_DYNAMIC exists
     assert!(has_phdr(&elf, elf::PT_DYNAMIC), "should have PT_DYNAMIC");
 
-    // Verify .dynamic section exists with DT_NEEDED
-    let dynamic_sec = find_section(&elf, ".dynamic");
-    assert!(dynamic_sec.is_some(), "should have .dynamic section");
-    let dyn_data = dynamic_sec.unwrap().data().unwrap();
-    // Parse DT_NEEDED entries (tag=1, each entry is 16 bytes)
-    let mut needed_offsets = Vec::new();
-    for chunk in dyn_data.chunks_exact(16) {
-        let tag = i64::from_le_bytes(chunk[0..8].try_into().unwrap());
-        let val = u64::from_le_bytes(chunk[8..16].try_into().unwrap());
-        if tag == elf::DT_NEEDED as i64 {
-            needed_offsets.push(val);
-        }
-    }
+    // Verify .dynamic section has DT_NEEDED
+    let dyn_entries = parse_dynamic(&elf);
+    let needed_offsets: Vec<u64> = dyn_entries.iter()
+        .filter(|&&(tag, _)| tag == elf::DT_NEEDED as i64)
+        .map(|&(_, val)| val)
+        .collect();
     assert!(!needed_offsets.is_empty(), "should have at least one DT_NEEDED");
 
     // Read the library name from .dynstr
@@ -893,27 +701,9 @@ fn static_no_dynamic_section() {
 fn static_no_relative_relocations() {
     // R_X86_64_64 in a static executable should be directly patched,
     // producing NO R_X86_64_RELATIVE entries in the output
-    let mut obj = WriteObject::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
-    let text = obj.section_id(StandardSection::Text);
-    let start_off = obj.append_section_data(text, &[0xC3], 16);
-    let start_sym = obj.add_symbol(Symbol {
-        name: b"_start".to_vec(),
-        value: start_off, size: 1,
-        kind: SymbolKind::Text, scope: SymbolScope::Dynamic,
-        weak: false, section: SymbolSection::Section(text), flags: SymbolFlags::None,
-    });
-
-    let data_sec = obj.section_id(StandardSection::Data);
-    let ptr_off = obj.append_section_data(data_sec, &[0u8; 8], 8);
-    obj.add_relocation(data_sec, object::write::Relocation {
-        offset: ptr_off, symbol: start_sym, addend: 0,
-        flags: RelocationFlags::Elf { r_type: elf::R_X86_64_64 },
-    }).unwrap();
-
+    let obj = ObjBuilder::elf().func("_start", &[0xC3]).data_ptr_to("_start").build();
     let elf_bytes = toyos_ld::link_static(
-        &[("test.o".into(), obj.write().unwrap())],
-        "_start",
-        0x200000,
+        &[("test.o".into(), obj)], "_start", 0x200000,
     ).expect("static linking with R_X86_64_64 should succeed");
 
     let elf = parse_elf(&elf_bytes);
@@ -966,33 +756,9 @@ fn static_high_base_address() {
 
 #[test]
 fn static_cross_object_resolution() {
-    // Object A: defines `helper`
-    let obj_a_data = build_minimal_obj("helper", &[0xC3]);
-
-    // Object B: defines `_start`, calls `helper` via PLT32
-    let mut obj_b = WriteObject::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
-    let text_b = obj_b.section_id(StandardSection::Text);
-    let off_b = obj_b.append_section_data(text_b, &[0xE8, 0, 0, 0, 0, 0xC3], 16);
-    let helper_sym = obj_b.add_symbol(Symbol {
-        name: b"helper".to_vec(),
-        value: 0, size: 0,
-        kind: SymbolKind::Text, scope: SymbolScope::Dynamic,
-        weak: false, section: SymbolSection::Undefined, flags: SymbolFlags::None,
-    });
-    obj_b.add_symbol(Symbol {
-        name: b"_start".to_vec(),
-        value: off_b, size: 6,
-        kind: SymbolKind::Text, scope: SymbolScope::Dynamic,
-        weak: false, section: SymbolSection::Section(text_b), flags: SymbolFlags::None,
-    });
-    obj_b.add_relocation(text_b, object::write::Relocation {
-        offset: off_b + 1, symbol: helper_sym, addend: -4,
-        flags: RelocationFlags::Elf { r_type: elf::R_X86_64_PLT32 },
-    }).unwrap();
-
     let objects = vec![
-        ("a.o".into(), obj_a_data),
-        ("b.o".into(), obj_b.write().unwrap()),
+        ObjBuilder::elf().func("helper", &[0xC3]).named("a.o"),
+        ObjBuilder::elf().func_calling("_start", "helper").named("b.o"),
     ];
 
     let elf_bytes = toyos_ld::link_static(&objects, "_start", 0x200000)
@@ -1007,31 +773,8 @@ fn static_cross_object_resolution() {
 
 #[test]
 fn static_undefined_symbol_error() {
-    let mut obj = WriteObject::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
-    let text = obj.section_id(StandardSection::Text);
-    let off = obj.append_section_data(text, &[0xE8, 0, 0, 0, 0], 16);
-    let undef_sym = obj.add_symbol(Symbol {
-        name: b"nonexistent".to_vec(),
-        value: 0, size: 0,
-        kind: SymbolKind::Text, scope: SymbolScope::Dynamic,
-        weak: false, section: SymbolSection::Undefined, flags: SymbolFlags::None,
-    });
-    obj.add_symbol(Symbol {
-        name: b"_start".to_vec(),
-        value: off, size: 5,
-        kind: SymbolKind::Text, scope: SymbolScope::Dynamic,
-        weak: false, section: SymbolSection::Section(text), flags: SymbolFlags::None,
-    });
-    obj.add_relocation(text, object::write::Relocation {
-        offset: off + 1, symbol: undef_sym, addend: -4,
-        flags: RelocationFlags::Elf { r_type: elf::R_X86_64_PLT32 },
-    }).unwrap();
-
-    let result = toyos_ld::link_static(
-        &[("test.o".into(), obj.write().unwrap())],
-        "_start",
-        0x200000,
-    );
+    let obj = ObjBuilder::elf().func_calling("_start", "nonexistent").build();
+    let result = toyos_ld::link_static(&[("test.o".into(), obj)], "_start", 0x200000);
     let syms = result.expect_err("should fail with undefined symbol");
     assert!(syms.contains(&"nonexistent".to_string()));
 }
@@ -1096,14 +839,6 @@ pub extern "C" fn _start() -> ! {
 
 // ── Tests: PE/COFF output (link_pe) ─────────────────────────────────────
 
-fn parse_pe_u16(data: &[u8], off: usize) -> u16 {
-    u16::from_le_bytes(data[off..off + 2].try_into().unwrap())
-}
-
-fn parse_pe_u32(data: &[u8], off: usize) -> u32 {
-    u32::from_le_bytes(data[off..off + 4].try_into().unwrap())
-}
-
 fn pe_section_name(data: &[u8], sh_off: usize) -> String {
     let raw = &data[sh_off..sh_off + 8];
     let end = raw.iter().position(|&b| b == 0).unwrap_or(8);
@@ -1111,7 +846,7 @@ fn pe_section_name(data: &[u8], sh_off: usize) -> String {
 }
 
 fn pe_section_characteristics(data: &[u8], sh_off: usize) -> u32 {
-    parse_pe_u32(data, sh_off + 36)
+    pe_u32(data, sh_off + 36)
 }
 
 #[test]
@@ -1125,20 +860,20 @@ fn pe_valid_headers() {
     ).expect("PE linking should succeed");
 
     // DOS header
-    assert_eq!(parse_pe_u16(&pe, 0), 0x5A4D, "should start with MZ magic");
-    let pe_offset = parse_pe_u32(&pe, 0x3C) as usize;
+    assert_eq!(pe_u16(&pe, 0), 0x5A4D, "should start with MZ magic");
+    let pe_offset = pe_u32(&pe, 0x3C) as usize;
     assert_eq!(pe_offset, 0x40, "e_lfanew should point to PE signature");
 
     // PE signature
-    assert_eq!(parse_pe_u32(&pe, pe_offset), 0x00004550, "should have PE\\0\\0 signature");
+    assert_eq!(pe_u32(&pe, pe_offset), 0x00004550, "should have PE\\0\\0 signature");
 
     // COFF header
     let coff = pe_offset + 4;
-    assert_eq!(parse_pe_u16(&pe, coff), 0x8664, "Machine should be AMD64");
+    assert_eq!(pe_u16(&pe, coff), 0x8664, "Machine should be AMD64");
 
     // Optional header
     let oh = coff + 20;
-    assert_eq!(parse_pe_u16(&pe, oh), 0x020B, "should be PE32+ (0x020B)");
+    assert_eq!(pe_u16(&pe, oh), 0x020B, "should be PE32+ (0x020B)");
 }
 
 #[test]
@@ -1152,7 +887,7 @@ fn pe_sections() {
     ).expect("PE linking should succeed");
 
     let coff = 0x44;
-    let num_sections = parse_pe_u16(&pe, coff + 2) as usize;
+    let num_sections = pe_u16(&pe, coff + 2) as usize;
     assert!(num_sections >= 2, "should have at least .text and .reloc sections");
 
     let sh_base = 0x58 + 240; // after optional header
@@ -1186,36 +921,20 @@ fn pe_sections() {
 
 #[test]
 fn pe_entry_point() {
-    // Create two functions to verify entry points to the right one
-    let mut obj = WriteObject::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
-    let text = obj.section_id(StandardSection::Text);
-    let off_dummy = obj.append_section_data(text, &[0x90, 0xC3], 16); // nop; ret
-    obj.add_symbol(Symbol {
-        name: b"dummy".to_vec(),
-        value: off_dummy, size: 2,
-        kind: SymbolKind::Text, scope: SymbolScope::Dynamic,
-        weak: false, section: SymbolSection::Section(text), flags: SymbolFlags::None,
-    });
-    let off_entry = obj.append_section_data(text, &[0x31, 0xC0, 0xC3], 16); // xor eax,eax; ret
-    obj.add_symbol(Symbol {
-        name: b"efi_main".to_vec(),
-        value: off_entry, size: 3,
-        kind: SymbolKind::Text, scope: SymbolScope::Dynamic,
-        weak: false, section: SymbolSection::Section(text), flags: SymbolFlags::None,
-    });
-
-    let pe = toyos_ld::link_pe(
-        &[("test.o".into(), obj.write().unwrap())],
-        "efi_main",
-        10,
-    ).expect("PE linking should succeed");
+    // Two functions to verify entry points to the right one
+    let obj = ObjBuilder::elf()
+        .func("dummy", &[0x90, 0xC3])    // nop; ret
+        .func("efi_main", &[0x31, 0xC0, 0xC3]) // xor eax,eax; ret
+        .build();
+    let pe = toyos_ld::link_pe(&[("test.o".into(), obj)], "efi_main", 10)
+        .expect("PE linking should succeed");
 
     let oh = 0x58;
-    let entry_rva = parse_pe_u32(&pe, oh + 0x10);
+    let entry_rva = pe_u32(&pe, oh + 0x10);
     assert!(entry_rva > 0, "AddressOfEntryPoint should be non-zero");
 
     // Entry should NOT be at the very start of .text (dummy is there)
-    let text_rva = parse_pe_u32(&pe, oh + 0x14);
+    let text_rva = pe_u32(&pe, oh + 0x14);
     assert!(entry_rva > text_rva, "entry should not be at start of .text (dummy func is there)");
 }
 
@@ -1226,54 +945,35 @@ fn pe_subsystem() {
     // Test EFI_APPLICATION (10)
     let pe = toyos_ld::link_pe(&[("test.o".into(), obj_data.clone())], "efi_main", 10).unwrap();
     let oh = 0x58;
-    assert_eq!(parse_pe_u16(&pe, oh + 0x44), 10, "subsystem should be EFI_APPLICATION (10)");
+    assert_eq!(pe_u16(&pe, oh + 0x44), 10, "subsystem should be EFI_APPLICATION (10)");
 
     // Test EFI_BOOT_SERVICE_DRIVER (11)
     let pe = toyos_ld::link_pe(&[("test.o".into(), obj_data.clone())], "efi_main", 11).unwrap();
-    assert_eq!(parse_pe_u16(&pe, oh + 0x44), 11, "subsystem should be EFI_BOOT_SERVICE_DRIVER (11)");
+    assert_eq!(pe_u16(&pe, oh + 0x44), 11, "subsystem should be EFI_BOOT_SERVICE_DRIVER (11)");
 
     // Test EFI_RUNTIME_DRIVER (12)
     let pe = toyos_ld::link_pe(&[("test.o".into(), obj_data)], "efi_main", 12).unwrap();
-    assert_eq!(parse_pe_u16(&pe, oh + 0x44), 12, "subsystem should be EFI_RUNTIME_DRIVER (12)");
+    assert_eq!(pe_u16(&pe, oh + 0x44), 12, "subsystem should be EFI_RUNTIME_DRIVER (12)");
 }
 
 #[test]
 fn pe_base_relocations() {
-    // Create an object with R_X86_64_64 (absolute 64-bit) — needs base relocation in PE
-    let mut obj = WriteObject::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
-    let text = obj.section_id(StandardSection::Text);
-    let func_off = obj.append_section_data(text, &[0xC3], 16);
-    let func_sym = obj.add_symbol(Symbol {
-        name: b"efi_main".to_vec(),
-        value: func_off, size: 1,
-        kind: SymbolKind::Text, scope: SymbolScope::Dynamic,
-        weak: false, section: SymbolSection::Section(text), flags: SymbolFlags::None,
-    });
-
-    let data_sec = obj.section_id(StandardSection::Data);
-    let ptr_off = obj.append_section_data(data_sec, &[0u8; 8], 8);
-    obj.add_relocation(data_sec, object::write::Relocation {
-        offset: ptr_off, symbol: func_sym, addend: 0,
-        flags: RelocationFlags::Elf { r_type: elf::R_X86_64_64 },
-    }).unwrap();
-
-    let pe = toyos_ld::link_pe(
-        &[("test.o".into(), obj.write().unwrap())],
-        "efi_main",
-        10,
-    ).expect("PE with R_X86_64_64 should succeed");
+    // R_X86_64_64 (absolute 64-bit) needs base relocation in PE
+    let obj = ObjBuilder::elf().func("efi_main", &[0xC3]).data_ptr_to("efi_main").build();
+    let pe = toyos_ld::link_pe(&[("test.o".into(), obj)], "efi_main", 10)
+        .expect("PE with R_X86_64_64 should succeed");
 
     // Find .reloc section
     let coff = 0x44;
-    let num_sections = parse_pe_u16(&pe, coff + 2) as usize;
+    let num_sections = pe_u16(&pe, coff + 2) as usize;
     let sh_base = 0x58 + 240;
     let mut reloc_file_off = 0u32;
     let mut reloc_raw_size = 0u32;
     for i in 0..num_sections {
         let sh = sh_base + i * 40;
         if pe_section_name(&pe, sh) == ".reloc" {
-            reloc_file_off = parse_pe_u32(&pe, sh + 20);
-            reloc_raw_size = parse_pe_u32(&pe, sh + 16);
+            reloc_file_off = pe_u32(&pe, sh + 20);
+            reloc_raw_size = pe_u32(&pe, sh + 16);
         }
     }
     assert!(reloc_file_off > 0, "should have .reloc section");
@@ -1284,8 +984,8 @@ fn pe_base_relocations() {
     assert!(reloc_data.len() >= 12, ".reloc should have at least one block with one entry");
 
     // First block header
-    let page_rva = parse_pe_u32(reloc_data, 0);
-    let block_size = parse_pe_u32(reloc_data, 4);
+    let page_rva = pe_u32(reloc_data, 0);
+    let block_size = pe_u32(reloc_data, 4);
     assert!(block_size >= 12, "block should have header + at least one entry");
     assert!(page_rva > 0, "page_rva should be non-zero");
 
@@ -1293,7 +993,7 @@ fn pe_base_relocations() {
     let num_entries = (block_size - 8) / 2;
     let mut has_dir64 = false;
     for e in 0..num_entries {
-        let entry = parse_pe_u16(reloc_data, 8 + e as usize * 2);
+        let entry = pe_u16(reloc_data, 8 + e as usize * 2);
         let typ = entry >> 12;
         if typ == 10 { has_dir64 = true; }
     }
@@ -1303,81 +1003,24 @@ fn pe_base_relocations() {
 #[test]
 fn pe_no_relocs_for_pc_relative() {
     // R_X86_64_PLT32 (PC-relative) should NOT produce base relocations
-    let mut obj = WriteObject::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
-    let text = obj.section_id(StandardSection::Text);
-
-    // helper function
-    let off_a = obj.append_section_data(text, &[0xC3], 16);
-    let helper_sym = obj.add_symbol(Symbol {
-        name: b"helper".to_vec(),
-        value: off_a, size: 1,
-        kind: SymbolKind::Text, scope: SymbolScope::Dynamic,
-        weak: false, section: SymbolSection::Section(text), flags: SymbolFlags::None,
-    });
-
-    // efi_main calls helper via PLT32 (PC-relative)
-    let off_b = obj.append_section_data(text, &[0xE8, 0, 0, 0, 0, 0xC3], 16);
-    obj.add_symbol(Symbol {
-        name: b"efi_main".to_vec(),
-        value: off_b, size: 6,
-        kind: SymbolKind::Text, scope: SymbolScope::Dynamic,
-        weak: false, section: SymbolSection::Section(text), flags: SymbolFlags::None,
-    });
-    obj.add_relocation(text, object::write::Relocation {
-        offset: off_b + 1, symbol: helper_sym, addend: -4,
-        flags: RelocationFlags::Elf { r_type: elf::R_X86_64_PLT32 },
-    }).unwrap();
-
-    let pe = toyos_ld::link_pe(
-        &[("test.o".into(), obj.write().unwrap())],
-        "efi_main",
-        10,
-    ).expect("PE with only PC-relative relocs should succeed");
+    let obj = ObjBuilder::elf().func("helper", &[0xC3]).func_calling("efi_main", "helper").build();
+    let pe = toyos_ld::link_pe(&[("test.o".into(), obj)], "efi_main", 10)
+        .expect("PE with only PC-relative relocs should succeed");
 
     // .reloc should exist but have no DIR64 entries (only padding or empty)
     let oh = 0x58;
     // Data directory 5 (base relocation) should have size 0
     let dd5 = oh + 0x70 + 5 * 8;
-    let reloc_dir_size = parse_pe_u32(&pe, dd5 + 4);
+    let reloc_dir_size = pe_u32(&pe, dd5 + 4);
     assert_eq!(reloc_dir_size, 0, "no base relocations needed for PC-relative only code");
 }
 
 #[test]
 fn pe_undefined_symbol_error() {
-    let mut obj = WriteObject::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
-    let text = obj.section_id(StandardSection::Text);
-    let off = obj.append_section_data(text, &[0xE8, 0, 0, 0, 0], 16);
-    let undef_sym = obj.add_symbol(Symbol {
-        name: b"missing".to_vec(),
-        value: 0, size: 0,
-        kind: SymbolKind::Text, scope: SymbolScope::Dynamic,
-        weak: false, section: SymbolSection::Undefined, flags: SymbolFlags::None,
-    });
-    obj.add_symbol(Symbol {
-        name: b"efi_main".to_vec(),
-        value: off, size: 5,
-        kind: SymbolKind::Text, scope: SymbolScope::Dynamic,
-        weak: false, section: SymbolSection::Section(text), flags: SymbolFlags::None,
-    });
-    obj.add_relocation(text, object::write::Relocation {
-        offset: off + 1, symbol: undef_sym, addend: -4,
-        flags: RelocationFlags::Elf { r_type: elf::R_X86_64_PLT32 },
-    }).unwrap();
-
-    let result = toyos_ld::link_pe(
-        &[("test.o".into(), obj.write().unwrap())],
-        "efi_main",
-        10,
-    );
+    let obj = ObjBuilder::elf().func_calling("efi_main", "missing").build();
+    let result = toyos_ld::link_pe(&[("test.o".into(), obj)], "efi_main", 10);
     let syms = result.expect_err("should fail with undefined symbol");
     assert!(syms.contains(&"missing".to_string()));
-}
-
-fn parse_pe_u16_at(data: &[u8], off: usize) -> u16 {
-    u16::from_le_bytes(data[off..off + 2].try_into().unwrap())
-}
-fn parse_pe_u64_at(data: &[u8], off: usize) -> u64 {
-    u64::from_le_bytes(data[off..off + 8].try_into().unwrap())
 }
 
 #[test]
@@ -1387,9 +1030,9 @@ fn pe_dll_characteristics_dynamic_base() {
     let pe = toyos_ld::link_pe(&[("test.o".into(), obj_data)], "efi_main", 10)
         .expect("PE linking should succeed");
 
-    let pe_off = parse_pe_u32(&pe, 0x3C) as usize;
+    let pe_off = pe_u32(&pe, 0x3C) as usize;
     let oh = pe_off + 4 + 20;
-    let dll_chars = parse_pe_u16_at(&pe, oh + 70);
+    let dll_chars = pe_u16(&pe, oh + 70);
 
     let dynamic_base = 0x0040u16;
     let nx_compat = 0x0100u16;
@@ -1406,33 +1049,16 @@ fn pe_stack_heap_sizes() {
     let pe = toyos_ld::link_pe(&[("test.o".into(), obj_data)], "efi_main", 10)
         .expect("PE linking should succeed");
 
-    let pe_off = parse_pe_u32(&pe, 0x3C) as usize;
+    let pe_off = pe_u32(&pe, 0x3C) as usize;
     let oh = pe_off + 4 + 20;
-    let stack_reserve = parse_pe_u64_at(&pe, oh + 72);
-    let stack_commit = parse_pe_u64_at(&pe, oh + 80);
+    let stack_reserve = pe_u64(&pe, oh + 72);
+    let stack_commit = pe_u64(&pe, oh + 80);
 
     assert!(stack_reserve > 0, "StackReserve should be nonzero");
     assert!(stack_commit > 0, "StackCommit should be nonzero");
 }
 
 // ── COFF input tests ─────────────────────────────────────────────────────
-
-fn build_minimal_coff(symbol_name: &str, code: &[u8]) -> Vec<u8> {
-    let mut obj = WriteObject::new(BinaryFormat::Coff, Architecture::X86_64, Endianness::Little);
-    let text = obj.section_id(StandardSection::Text);
-    let offset = obj.append_section_data(text, code, 16);
-    obj.add_symbol(Symbol {
-        name: symbol_name.as_bytes().to_vec(),
-        value: offset,
-        size: code.len() as u64,
-        kind: SymbolKind::Text,
-        scope: SymbolScope::Dynamic,
-        weak: false,
-        section: SymbolSection::Section(text),
-        flags: SymbolFlags::None,
-    });
-    obj.write().unwrap()
-}
 
 #[test]
 fn coff_input_link_pie() {
@@ -1464,46 +1090,15 @@ fn coff_input_link_pe() {
     let pe = result.expect("linking COFF→PE should succeed");
     // Verify PE magic
     assert_eq!(&pe[0..2], b"MZ");
-    let pe_off = parse_pe_u32(&pe, 0x3C) as usize;
+    let pe_off = pe_u32(&pe, 0x3C) as usize;
     assert_eq!(&pe[pe_off..pe_off + 4], b"PE\0\0");
 }
 
 #[test]
 fn coff_input_pc_relative_reloc() {
-    // COFF IMAGE_REL_AMD64_REL32 should work like ELF R_X86_64_PLT32
-    let mut obj = WriteObject::new(BinaryFormat::Coff, Architecture::X86_64, Endianness::Little);
-    let text = obj.section_id(StandardSection::Text);
-
-    // callee: single ret
-    let callee_off = obj.append_section_data(text, &[0xC3], 16);
-    obj.add_symbol(Symbol {
-        name: b"callee".to_vec(),
-        value: callee_off, size: 1,
-        kind: SymbolKind::Text, scope: SymbolScope::Dynamic,
-        weak: false, section: SymbolSection::Section(text), flags: SymbolFlags::None,
-    });
-
-    // caller: call callee (E8 rel32), then ret
-    let caller_off = obj.append_section_data(text, &[0xE8, 0, 0, 0, 0, 0xC3], 16);
-    let callee_sym = obj.symbol_id(b"callee").unwrap();
-    obj.add_relocation(text, object::write::Relocation {
-        offset: caller_off + 1,
-        symbol: callee_sym,
-        addend: -4,
-        flags: RelocationFlags::Coff { typ: pe::IMAGE_REL_AMD64_REL32 },
-    }).unwrap();
-    obj.add_symbol(Symbol {
-        name: b"_start".to_vec(),
-        value: caller_off, size: 6,
-        kind: SymbolKind::Text, scope: SymbolScope::Dynamic,
-        weak: false, section: SymbolSection::Section(text), flags: SymbolFlags::None,
-    });
-
-    let result = toyos_ld::link(
-        &[("test.o".into(), obj.write().unwrap())],
-        "_start",
-    );
-    result.expect("COFF with REL32 should link successfully");
+    let obj = ObjBuilder::coff().func("callee", &[0xC3]).func_calling("_start", "callee").build();
+    toyos_ld::link(&[("test.o".into(), obj)], "_start")
+        .expect("COFF with REL32 should link successfully");
 }
 
 #[test]
@@ -1546,162 +1141,42 @@ fn coff_input_absolute_reloc_pe() {
     let pe = result.expect("COFF with ADDR64 should link to PE");
 
     // Verify base relocation directory is non-empty
-    let pe_off = parse_pe_u32(&pe, 0x3C) as usize;
+    let pe_off = pe_u32(&pe, 0x3C) as usize;
     let oh = pe_off + 4 + 20; // optional header start
     let dd5 = oh + 0x70 + 5 * 8; // base relocation data directory
-    let reloc_dir_size = parse_pe_u32(&pe, dd5 + 4);
+    let reloc_dir_size = pe_u32(&pe, dd5 + 4);
     assert!(reloc_dir_size > 0, "ADDR64 should produce base relocations");
 }
 
 #[test]
 fn coff_input_cross_object() {
-    // Two COFF objects linked together — caller references callee in another object
-    let mut obj1 = WriteObject::new(BinaryFormat::Coff, Architecture::X86_64, Endianness::Little);
-    let text1 = obj1.section_id(StandardSection::Text);
-    let callee_off = obj1.append_section_data(text1, &[0xC3], 16);
-    obj1.add_symbol(Symbol {
-        name: b"callee".to_vec(),
-        value: callee_off, size: 1,
-        kind: SymbolKind::Text, scope: SymbolScope::Dynamic,
-        weak: false, section: SymbolSection::Section(text1), flags: SymbolFlags::None,
-    });
-
-    let mut obj2 = WriteObject::new(BinaryFormat::Coff, Architecture::X86_64, Endianness::Little);
-    let text2 = obj2.section_id(StandardSection::Text);
-    let caller_off = obj2.append_section_data(text2, &[0xE8, 0, 0, 0, 0, 0xC3], 16);
-    let callee_sym = obj2.add_symbol(Symbol {
-        name: b"callee".to_vec(),
-        value: 0, size: 0,
-        kind: SymbolKind::Text, scope: SymbolScope::Dynamic,
-        weak: false, section: SymbolSection::Undefined, flags: SymbolFlags::None,
-    });
-    obj2.add_relocation(text2, object::write::Relocation {
-        offset: caller_off + 1,
-        symbol: callee_sym,
-        addend: -4,
-        flags: RelocationFlags::Coff { typ: pe::IMAGE_REL_AMD64_REL32 },
-    }).unwrap();
-    obj2.add_symbol(Symbol {
-        name: b"_start".to_vec(),
-        value: caller_off, size: 6,
-        kind: SymbolKind::Text, scope: SymbolScope::Dynamic,
-        weak: false, section: SymbolSection::Section(text2), flags: SymbolFlags::None,
-    });
-
-    let result = toyos_ld::link(
-        &[
-            ("obj1.o".into(), obj1.write().unwrap()),
-            ("obj2.o".into(), obj2.write().unwrap()),
-        ],
-        "_start",
-    );
-    result.expect("cross-object COFF linking should succeed");
+    let objects = vec![
+        ObjBuilder::coff().func("callee", &[0xC3]).named("obj1.o"),
+        ObjBuilder::coff().func_calling("_start", "callee").named("obj2.o"),
+    ];
+    toyos_ld::link(&objects, "_start").expect("cross-object COFF linking should succeed");
 }
 
 #[test]
 fn coff_input_mixed_with_elf() {
-    // One ELF object + one COFF object linked together
-    let elf_obj = build_minimal_obj("callee", &[0xC3]);
-
-    let mut coff_obj = WriteObject::new(BinaryFormat::Coff, Architecture::X86_64, Endianness::Little);
-    let text = coff_obj.section_id(StandardSection::Text);
-    let caller_off = coff_obj.append_section_data(text, &[0xE8, 0, 0, 0, 0, 0xC3], 16);
-    let callee_sym = coff_obj.add_symbol(Symbol {
-        name: b"callee".to_vec(),
-        value: 0, size: 0,
-        kind: SymbolKind::Text, scope: SymbolScope::Dynamic,
-        weak: false, section: SymbolSection::Undefined, flags: SymbolFlags::None,
-    });
-    coff_obj.add_relocation(text, object::write::Relocation {
-        offset: caller_off + 1,
-        symbol: callee_sym,
-        addend: -4,
-        flags: RelocationFlags::Coff { typ: pe::IMAGE_REL_AMD64_REL32 },
-    }).unwrap();
-    coff_obj.add_symbol(Symbol {
-        name: b"_start".to_vec(),
-        value: caller_off, size: 6,
-        kind: SymbolKind::Text, scope: SymbolScope::Dynamic,
-        weak: false, section: SymbolSection::Section(text), flags: SymbolFlags::None,
-    });
-
-    let result = toyos_ld::link(
-        &[
-            ("elf.o".into(), elf_obj),
-            ("coff.o".into(), coff_obj.write().unwrap()),
-        ],
-        "_start",
-    );
-    result.expect("mixing ELF and COFF objects should link successfully");
+    let objects = vec![
+        ObjBuilder::elf().func("callee", &[0xC3]).named("elf.o"),
+        ObjBuilder::coff().func_calling("_start", "callee").named("coff.o"),
+    ];
+    toyos_ld::link(&objects, "_start").expect("mixing ELF and COFF objects should link successfully");
 }
 
-/// Build a COFF object with a weak external symbol (the pattern used by LLVM/Cranelift
-/// for compiler_builtins: `.weak.FOO.default` is the actual code, `FOO` is a weak alias).
-/// The `object` crate auto-generates the `.weak.NAME.default` alias when `weak: true`.
 fn build_coff_with_weak_external(weak_name: &str, code: &[u8]) -> Vec<u8> {
-    let mut obj = WriteObject::new(BinaryFormat::Coff, Architecture::X86_64, Endianness::Little);
-    let text = obj.section_id(StandardSection::Text);
-    let offset = obj.append_section_data(text, code, 16);
-
-    // Setting weak: true causes the object crate to emit:
-    //   `.weak.NAME.default` as the actual symbol with the code
-    //   `NAME` as a weak external pointing to `.weak.NAME.default`
-    obj.add_symbol(Symbol {
-        name: weak_name.as_bytes().to_vec(),
-        value: offset,
-        size: code.len() as u64,
-        kind: SymbolKind::Text,
-        scope: SymbolScope::Dynamic,
-        weak: true,
-        section: SymbolSection::Section(text),
-        flags: SymbolFlags::None,
-    });
-
-    obj.write().unwrap()
+    ObjBuilder::coff().weak_func(weak_name, code).build()
 }
 
 #[test]
 fn coff_weak_external_resolves() {
-    // A COFF weak external (like `memcpy` → `.weak.memcpy.default`) should be
-    // resolved by the linker. This is how compiler_builtins provides memcpy etc.
-    // on COFF targets.
-    let impl_code = vec![0xC3]; // ret
-    let weak_obj = build_coff_with_weak_external("memcpy", &impl_code);
-
-    // A caller that references memcpy
-    let mut caller = WriteObject::new(BinaryFormat::Coff, Architecture::X86_64, Endianness::Little);
-    let text = caller.section_id(StandardSection::Text);
-    // call memcpy (E8 00000000) + ret (C3) = 6 bytes
-    let call_off = caller.append_section_data(text, &[0xE8, 0x00, 0x00, 0x00, 0x00, 0xC3], 16);
-    let memcpy_sym = caller.add_symbol(Symbol {
-        name: b"memcpy".to_vec(),
-        value: 0, size: 0,
-        kind: SymbolKind::Text, scope: SymbolScope::Dynamic,
-        weak: false, section: SymbolSection::Undefined, flags: SymbolFlags::None,
-    });
-    caller.add_symbol(Symbol {
-        name: b"_start".to_vec(),
-        value: call_off, size: 6,
-        kind: SymbolKind::Text, scope: SymbolScope::Dynamic,
-        weak: false, section: SymbolSection::Section(text), flags: SymbolFlags::None,
-    });
-    let text_idx = caller.section_id(StandardSection::Text);
-    caller.add_relocation(text_idx, object::write::Relocation {
-        offset: call_off + 1,
-        addend: -4,
-        symbol: memcpy_sym,
-        flags: RelocationFlags::Coff { typ: pe::IMAGE_REL_AMD64_REL32 },
-    }).unwrap();
-    let caller_obj = caller.write().unwrap();
-
-    let result = toyos_ld::link(
-        &[
-            ("builtins.o".into(), weak_obj),
-            ("caller.o".into(), caller_obj),
-        ],
-        "_start",
-    );
-    result.expect("COFF weak external memcpy should be resolved");
+    let objects = vec![
+        ("builtins.o".into(), build_coff_with_weak_external("memcpy", &[0xC3])),
+        ObjBuilder::coff().func_calling("_start", "memcpy").named("caller.o"),
+    ];
+    toyos_ld::link(&objects, "_start").expect("COFF weak external memcpy should be resolved");
 }
 
 #[test]
@@ -1718,41 +1193,15 @@ fn coff_weak_external_pe() {
 
 #[test]
 fn coff_weak_external_multiple_builtins() {
-    // Multiple weak externals (memcpy, memset, __adddf3) should all resolve
-    let memcpy_obj = build_coff_with_weak_external("memcpy", &[0xC3]);
-    let memset_obj = build_coff_with_weak_external("memset", &[0xC3]);
-    let adddf3_obj = build_coff_with_weak_external("__adddf3", &[0xC3]);
-
-    let mut caller = WriteObject::new(BinaryFormat::Coff, Architecture::X86_64, Endianness::Little);
-    let text = caller.section_id(StandardSection::Text);
-    let off = caller.append_section_data(text, &[0xC3], 16);
-    caller.add_symbol(Symbol {
-        name: b"_start".to_vec(),
-        value: off, size: 1,
-        kind: SymbolKind::Text, scope: SymbolScope::Dynamic,
-        weak: false, section: SymbolSection::Section(text), flags: SymbolFlags::None,
-    });
-    // Reference all three
-    for name in &["memcpy", "memset", "__adddf3"] {
-        caller.add_symbol(Symbol {
-            name: name.as_bytes().to_vec(),
-            value: 0, size: 0,
-            kind: SymbolKind::Text, scope: SymbolScope::Dynamic,
-            weak: false, section: SymbolSection::Undefined, flags: SymbolFlags::None,
-        });
-    }
-    let caller_obj = caller.write().unwrap();
-
-    let result = toyos_ld::link(
-        &[
-            ("memcpy.o".into(), memcpy_obj),
-            ("memset.o".into(), memset_obj),
-            ("adddf3.o".into(), adddf3_obj),
-            ("caller.o".into(), caller_obj),
-        ],
-        "_start",
-    );
-    result.expect("multiple COFF weak externals should all resolve");
+    let caller = ObjBuilder::coff().func("_start", &[0xC3])
+        .undefined("memcpy").undefined("memset").undefined("__adddf3");
+    let objects = vec![
+        ("memcpy.o".into(), build_coff_with_weak_external("memcpy", &[0xC3])),
+        ("memset.o".into(), build_coff_with_weak_external("memset", &[0xC3])),
+        ("adddf3.o".into(), build_coff_with_weak_external("__adddf3", &[0xC3])),
+        caller.named("caller.o"),
+    ];
+    toyos_ld::link(&objects, "_start").expect("multiple COFF weak externals should all resolve");
 }
 
 // ── Tests: PIE ELF base address ──────────────────────────────────────────
@@ -1817,30 +1266,8 @@ fn pie_file_offset_equals_vaddr() {
 
 #[test]
 fn pie_relative_relocs_are_zero_based() {
-    // R_X86_64_RELATIVE addends should be 0-based addresses
-    let mut obj = WriteObject::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
-    let text = obj.section_id(StandardSection::Text);
-    let start_off = obj.append_section_data(text, &[0xC3], 16);
-    let start_sym = obj.add_symbol(Symbol {
-        name: b"_start".to_vec(),
-        value: start_off, size: 1,
-        kind: SymbolKind::Text, scope: SymbolScope::Dynamic,
-        weak: false, section: SymbolSection::Section(text), flags: SymbolFlags::None,
-    });
-
-    let data_sec = obj.section_id(StandardSection::Data);
-    let ptr_off = obj.append_section_data(data_sec, &[0u8; 8], 8);
-    obj.add_relocation(
-        data_sec,
-        object::write::Relocation {
-            offset: ptr_off,
-            symbol: start_sym,
-            addend: 0,
-            flags: RelocationFlags::Elf { r_type: elf::R_X86_64_64 },
-        },
-    ).unwrap();
-
-    let elf_bytes = toyos_ld::link(&[("test.o".into(), obj.write().unwrap())], "_start")
+    let obj = ObjBuilder::elf().func("_start", &[0xC3]).data_ptr_to("_start").build();
+    let elf_bytes = toyos_ld::link(&[("test.o".into(), obj)], "_start")
         .expect("linking should succeed");
 
     let elf = parse_elf(&elf_bytes);
@@ -1906,18 +1333,18 @@ fn pie_bootloader_loadable() {
 
 /// Helper: parse PE section info. Returns vec of (name, va, virt_size, raw_ptr, raw_size).
 fn pe_section_list(pe: &[u8]) -> Vec<(String, u32, u32, u32, u32)> {
-    let pe_off = parse_pe_u32(pe, 0x3C) as usize;
+    let pe_off = pe_u32(pe, 0x3C) as usize;
     let coff = pe_off + 4;
-    let num_secs = parse_pe_u16(pe, coff + 2) as usize;
-    let opt_sz = parse_pe_u16(pe, coff + 16) as usize;
+    let num_secs = pe_u16(pe, coff + 2) as usize;
+    let opt_sz = pe_u16(pe, coff + 16) as usize;
     let sh_start = coff + 20 + opt_sz;
     (0..num_secs).map(|i| {
         let sh = sh_start + i * 40;
         let name = pe_section_name(pe, sh);
-        let vs = parse_pe_u32(pe, sh + 8);
-        let va = parse_pe_u32(pe, sh + 12);
-        let rs = parse_pe_u32(pe, sh + 16);
-        let rp = parse_pe_u32(pe, sh + 20);
+        let vs = pe_u32(pe, sh + 8);
+        let va = pe_u32(pe, sh + 12);
+        let rs = pe_u32(pe, sh + 16);
+        let rp = pe_u32(pe, sh + 20);
         (name, va, vs, rp, rs)
     }).collect()
 }
@@ -1939,38 +1366,17 @@ fn pe_read_i32_at_rva(pe: &[u8], rva: u32) -> i32 {
 }
 
 fn pe_entry_rva(pe: &[u8]) -> u32 {
-    let pe_off = parse_pe_u32(pe, 0x3C) as usize;
-    parse_pe_u32(pe, pe_off + 4 + 20 + 16) // OptionalHeader.AddressOfEntryPoint
+    let pe_off = pe_u32(pe, 0x3C) as usize;
+    pe_u32(pe, pe_off + 4 + 20 + 16) // OptionalHeader.AddressOfEntryPoint
 }
 
 #[test]
 fn coff_cross_object_call_displacement() {
-    // COFF REL32 with implicit addend=0 (standard call instruction).
-    // This works even without the implicit addend fix since the implicit is 0.
-    let callee_obj = build_minimal_coff("callee", &[0xC3]);
-
-    let mut obj2 = WriteObject::new(BinaryFormat::Coff, Architecture::X86_64, Endianness::Little);
-    let text2 = obj2.section_id(StandardSection::Text);
-    let call_off = obj2.append_section_data(text2, &[0xE8, 0, 0, 0, 0, 0xC3], 16);
-    let callee_sym = obj2.add_symbol(Symbol {
-        name: b"callee".to_vec(), value: 0, size: 0,
-        kind: SymbolKind::Text, scope: SymbolScope::Dynamic,
-        weak: false, section: SymbolSection::Undefined, flags: SymbolFlags::None,
-    });
-    obj2.add_relocation(text2, object::write::Relocation {
-        offset: call_off + 1, symbol: callee_sym, addend: -4,
-        flags: RelocationFlags::Coff { typ: pe::IMAGE_REL_AMD64_REL32 },
-    }).unwrap();
-    obj2.add_symbol(Symbol {
-        name: b"efi_main".to_vec(), value: call_off, size: 6,
-        kind: SymbolKind::Text, scope: SymbolScope::Dynamic,
-        weak: false, section: SymbolSection::Section(text2), flags: SymbolFlags::None,
-    });
-
-    let pe = toyos_ld::link_pe(
-        &[("callee.o".into(), callee_obj), ("caller.o".into(), obj2.write().unwrap())],
-        "efi_main", 10,
-    ).expect("linking should succeed");
+    let objects = vec![
+        ("callee.o".into(), build_minimal_coff("callee", &[0xC3])),
+        ObjBuilder::coff().func_calling("efi_main", "callee").named("caller.o"),
+    ];
+    let pe = toyos_ld::link_pe(&objects, "efi_main", 10).expect("linking should succeed");
 
     let entry_rva = pe_entry_rva(&pe);
     let disp = pe_read_i32_at_rva(&pe, entry_rva + 1);

@@ -6,17 +6,30 @@ use std::path::Path;
 use std::process::Command;
 
 fn build(debug: bool) {
-    let toyos_ld = find_toyos_ld();
+    let toyos_ld = build_toyos_ld();
     let rustflags = match std::env::var("RUSTFLAGS") {
         Ok(flags) => format!("{flags} -Dwarnings"),
         Err(_) => "-Dwarnings".to_string(),
     };
 
+    // Detect linker changes — clean all link targets to avoid stale binaries
+    let linker_changed = detect_change(&toyos_ld, "target/.linker-stamp");
+    if linker_changed {
+        for (dir, target) in [
+            ("../kernel", "x86_64-unknown-none"),
+            ("../bootloader", "x86_64-unknown-uefi"),
+        ] {
+            let target_dir = Path::new(dir).join(format!("target/{target}"));
+            if target_dir.exists() {
+                eprintln!("linker changed: cleaning {dir}");
+                fs::remove_dir_all(&target_dir).ok();
+            }
+        }
+    }
+
     // Detect toolchain changes — clean userland targets to avoid stale incremental artifacts
-    let sysroot_stamp = fs::read_to_string("../toolchain/.sysroot-stamp").unwrap_or_default();
-    let last_stamp_path = "target/.toolchain-stamp";
-    let last_stamp = fs::read_to_string(last_stamp_path).unwrap_or_default();
-    let toolchain_changed = sysroot_stamp != last_stamp && !sysroot_stamp.is_empty();
+    let toolchain_stamp = Path::new("../toolchain/.sysroot-stamp");
+    let toolchain_changed = detect_change(&toolchain_stamp, "target/.toolchain-stamp");
 
     let mut kernel_args = vec!["build"];
     if debug {
@@ -58,11 +71,11 @@ fn build(debug: bool) {
         }
         let name = entry.file_name();
         let name = name.to_str().unwrap();
-        if toolchain_changed {
-            // Only clean the ToyOS target, not host builds (e.g. toyos-ld host binary)
+        if toolchain_changed || linker_changed {
             let toyos_target_dir = path.join("target/x86_64-unknown-toyos");
             if toyos_target_dir.exists() {
-                eprintln!("toolchain changed: cleaning userland/{name}");
+                let reason = if toolchain_changed { "toolchain" } else { "linker" };
+                eprintln!("{reason} changed: cleaning userland/{name}");
                 fs::remove_dir_all(&toyos_target_dir).ok();
             }
         }
@@ -83,9 +96,10 @@ fn build(debug: bool) {
         let data = fs::read(&binary).expect("Failed to read binary");
         initrd_files.push((name.to_string(), data));
     }
-    if !sysroot_stamp.is_empty() {
-        fs::write(last_stamp_path, &sysroot_stamp).ok();
-    }
+
+    // Write stamps after successful builds
+    write_stamp(&toyos_ld, "target/.linker-stamp");
+    write_stamp(&toolchain_stamp, "target/.toolchain-stamp");
 
     // Add rustc compiler from bootstrap sysroot
     let sysroot = Path::new("../rust/build/x86_64-unknown-toyos/stage2");
@@ -198,14 +212,61 @@ fn main() {
     qemu.status().expect("failed to execute process");
 }
 
-fn find_toyos_ld() -> std::path::PathBuf {
-    let toyos_ld_dir = std::path::Path::new("../userland/toyos-ld");
-    for entry in fs::read_dir(toyos_ld_dir.join("target")).expect("toyos-ld not built") {
-        let path = entry.unwrap().path();
-        let candidate = path.join("release/toyos-ld");
-        if candidate.exists() {
-            return candidate.canonicalize().unwrap();
+fn build_toyos_ld() -> std::path::PathBuf {
+    let toyos_ld_dir = Path::new("../userland/toyos-ld");
+    let host = host_triple();
+    if !Command::new("cargo")
+        .args(["build", "--release", "--target", &host])
+        .current_dir(toyos_ld_dir)
+        .status()
+        .expect("Failed to run cargo")
+        .success()
+    {
+        panic!("Failed to build toyos-ld");
+    }
+    toyos_ld_dir
+        .join(format!("target/{host}/release/toyos-ld"))
+        .canonicalize()
+        .expect("toyos-ld binary not found after build")
+}
+
+fn host_triple() -> String {
+    let output = Command::new("rustc")
+        .args(["--version", "--verbose"])
+        .output()
+        .expect("Failed to run rustc");
+    let text = String::from_utf8(output.stdout).unwrap();
+    text.lines()
+        .find(|l| l.starts_with("host:"))
+        .map(|l| l.strip_prefix("host: ").unwrap().to_string())
+        .expect("Could not determine host triple")
+}
+
+/// Compare a file's mtime against a stored stamp. Returns true if changed.
+fn detect_change(path: &Path, stamp_path: &str) -> bool {
+    let mtime = fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .map(|t| {
+            t.duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+                .to_string()
+        })
+        .unwrap_or_default();
+    let last = fs::read_to_string(stamp_path).unwrap_or_default();
+    !mtime.is_empty() && mtime != last
+}
+
+fn write_stamp(path: &Path, stamp_path: &str) {
+    if let Ok(meta) = fs::metadata(path) {
+        if let Ok(mtime) = meta.modified() {
+            let stamp = mtime
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+                .to_string();
+            fs::write(stamp_path, stamp).ok();
         }
     }
-    panic!("toyos-ld binary not found. Run: cd toolchain && cargo run");
 }
