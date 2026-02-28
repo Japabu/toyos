@@ -184,6 +184,55 @@ fn write_struct<T: Pod>(buf: &mut [u8], offset: usize, val: &T) {
     buf[offset..offset + bytes.len()].copy_from_slice(bytes);
 }
 
+// ── String table builder ────────────────────────────────────────────────
+
+struct StringTable {
+    data: Vec<u8>,
+}
+
+impl StringTable {
+    fn new() -> Self {
+        Self { data: vec![0] }
+    }
+
+    fn add(&mut self, s: &str) -> u32 {
+        let offset = self.data.len() as u32;
+        self.data.extend_from_slice(s.as_bytes());
+        self.data.push(0);
+        offset
+    }
+}
+
+// ── Error type ──────────────────────────────────────────────────────────
+
+#[derive(Debug)]
+pub enum LinkError {
+    UndefinedSymbols(Vec<String>),
+}
+
+impl LinkError {
+    pub fn undefined_symbols(&self) -> &[String] {
+        match self {
+            LinkError::UndefinedSymbols(syms) => syms,
+        }
+    }
+}
+
+impl std::fmt::Display for LinkError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LinkError::UndefinedSymbols(syms) => {
+                for sym in syms {
+                    writeln!(f, "undefined symbol: {sym}")?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+impl std::error::Error for LinkError {}
+
 // ── Public API ──────────────────────────────────────────────────────────
 
 /// Link object files and produce a PE32+ executable for UEFI.
@@ -195,7 +244,7 @@ pub fn link_pe(
     objects: &[(String, Vec<u8>)],
     entry: &str,
     subsystem: u16,
-) -> Result<Vec<u8>, Vec<String>> {
+) -> Result<Vec<u8>, LinkError> {
     let mut state = collect(objects);
     synthesize_alloc_shims(&mut state);
     let pe_layout = layout_pe(&mut state);
@@ -211,7 +260,7 @@ pub fn link_static(
     objects: &[(String, Vec<u8>)],
     entry: &str,
     base_addr: u64,
-) -> Result<Vec<u8>, Vec<String>> {
+) -> Result<Vec<u8>, LinkError> {
     let mut state = collect(objects);
     synthesize_alloc_shims(&mut state);
     let layout = layout_elf(&mut state, base_addr, None);
@@ -231,7 +280,7 @@ pub fn link_static(
 
 /// Link object files and produce a PIE ELF executable.
 /// Returns the raw ELF bytes on success, or a list of undefined symbols on failure.
-pub fn link(objects: &[(String, Vec<u8>)], entry: &str) -> Result<Vec<u8>, Vec<String>> {
+pub fn link(objects: &[(String, Vec<u8>)], entry: &str) -> Result<Vec<u8>, LinkError> {
     let mut state = collect(objects);
     synthesize_alloc_shims(&mut state);
     let layout = layout_elf(&mut state, BASE_VADDR, Some(entry));
@@ -366,6 +415,7 @@ struct InputSection {
     align: u64,
     size: u64,
     vaddr: u64,
+    writable: bool,
 }
 
 #[derive(Clone)]
@@ -442,6 +492,42 @@ fn collect(objects: &[(String, Vec<u8>)]) -> LinkState {
     state
 }
 
+/// Resolve a relocation's target to a symbol name. Section symbols get synthetic
+/// names keyed on (obj_idx, global_section_idx) for unique resolution.
+fn resolve_reloc_target(
+    obj: &object::File,
+    reloc: &read::Relocation,
+    obj_idx: usize,
+    sec_map: &HashMap<(usize, object::SectionIndex), usize>,
+    state: &mut LinkState,
+) -> Option<String> {
+    let sym_idx = match reloc.target() {
+        read::RelocationTarget::Symbol(idx) => idx,
+        _ => return None,
+    };
+    let sym = obj.symbol_by_index(sym_idx).ok()?;
+    let name = sym.name().unwrap_or("");
+
+    // Section symbols need unique synthetic names because COFF objects can have
+    // multiple sections with the same name (e.g. many `.rdata` COMDAT sections).
+    let is_section_sym = name.is_empty() || sym.kind() == read::SymbolKind::Section;
+    if is_section_sym {
+        let si = match sym.section() {
+            read::SymbolSection::Section(si) => si,
+            _ => return None,
+        };
+        let &gsec = sec_map.get(&(obj_idx, si))?;
+        let syn = format!("__section_sym_{}_{}", obj_idx, gsec);
+        state.locals.entry((obj_idx, syn.clone())).or_insert(SymbolDef {
+            section_global_idx: gsec,
+            value: sym.address(),
+        });
+        Some(syn)
+    } else {
+        Some(name.to_string())
+    }
+}
+
 /// Collect sections, symbols, and relocations from a single object file.
 /// Works with both ELF and COFF objects via the generic `Object` trait.
 fn collect_object(
@@ -483,6 +569,10 @@ fn collect_object(
             section.kind(),
             read::SectionKind::Tls | read::SectionKind::UninitializedTls
         );
+        let writable = matches!(
+            section.kind(),
+            read::SectionKind::Data | read::SectionKind::UninitializedData
+        );
 
         state.sections.push(InputSection {
             obj_idx,
@@ -491,6 +581,7 @@ fn collect_object(
             align: section.align().max(1),
             size: section.size(),
             vaddr: 0,
+            writable,
         });
 
         if is_tls {
@@ -569,46 +660,9 @@ fn collect_object(
         };
 
         for (offset, reloc) in section.relocations() {
-            let sym_name = match reloc.target() {
-                read::RelocationTarget::Symbol(sym_idx) => {
-                    match obj.symbol_by_index(sym_idx) {
-                        Ok(s) => {
-                            let name = s.name().unwrap_or("");
-                            // Section symbols need unique synthetic names because
-                            // COFF objects can have multiple sections with the same
-                            // name (e.g. many `.rdata` COMDAT sections). ELF section
-                            // symbols have empty names; COFF section symbols have
-                            // the section name. Both cases use the section index to
-                            // create a unique key for correct resolution.
-                            let is_section_sym = name.is_empty()
-                                || s.kind() == read::SymbolKind::Section;
-                            if is_section_sym {
-                                if let read::SymbolSection::Section(si) = s.section() {
-                                    if let Some(&gsec) = sec_map.get(&(obj_idx, si)) {
-                                        let syn =
-                                            format!("__section_sym_{}_{}", obj_idx, gsec);
-                                        state
-                                            .locals
-                                            .entry((obj_idx, syn.clone()))
-                                            .or_insert(SymbolDef {
-                                                section_global_idx: gsec,
-                                                value: s.address(),
-                                            });
-                                        syn
-                                    } else {
-                                        continue;
-                                    }
-                                } else {
-                                    continue;
-                                }
-                            } else {
-                                name.to_string()
-                            }
-                        }
-                        Err(_) => continue,
-                    }
-                }
-                _ => continue,
+            let sym_name = match resolve_reloc_target(obj, &reloc, obj_idx, sec_map, state) {
+                Some(name) => name,
+                None => continue,
             };
             let r_type = match reloc.flags() {
                 RelocationFlags::Elf { r_type } => r_type,
@@ -715,6 +769,7 @@ fn synthesize_alloc_shims(state: &mut LinkState) {
             align: 16,
             size: 16,
             vaddr: 0,
+            writable: false,
         });
         state.globals.insert(
             shim_name.to_string(),
@@ -743,6 +798,7 @@ fn synthesize_alloc_shims(state: &mut LinkState) {
             align: 16,
             size: 16,
             vaddr: 0,
+            writable: false,
         });
         state.globals.insert(
             SHIM_NO_ALLOC_UNSTABLE.to_string(),
@@ -755,17 +811,6 @@ fn synthesize_alloc_shims(state: &mut LinkState) {
 
 fn is_tls_section(name: &str) -> bool {
     name.starts_with(".tdata") || name.starts_with(".tbss")
-}
-
-fn is_rx_section(name: &str) -> bool {
-    name.starts_with(".text")
-        || name.starts_with(".rodata")
-        || name.starts_with(".rdata")  // COFF naming for read-only data
-        || name.starts_with(".eh_frame")
-        || name == ".gcc_except_table"
-        || name.starts_with(".data.rel.ro")
-        || name.starts_with(".xdata")  // COFF unwind info (read-only)
-        || name.starts_with(".pdata")  // COFF exception directory (read-only)
 }
 
 struct ElfLayout {
@@ -792,15 +837,15 @@ fn layout_elf(state: &mut LinkState, base_addr: u64, entry_name: Option<&str>) -
     let mut tls_sections = Vec::new();
 
     for (idx, sec) in state.sections.iter().enumerate() {
-        if state.tls_sections.contains(&idx) {
+        if state.tls_sections.contains(&idx) || is_tls_section(&sec.name) {
             tls_sections.push(idx);
-        } else if is_tls_section(&sec.name) {
-            tls_sections.push(idx);
-            state.tls_sections.push(idx);
-        } else if is_rx_section(&sec.name) {
-            rx_sections.push(idx);
-        } else {
+            if !state.tls_sections.contains(&idx) {
+                state.tls_sections.push(idx);
+            }
+        } else if sec.writable {
             rw_sections.push(idx);
+        } else {
+            rx_sections.push(idx);
         }
     }
 
@@ -951,6 +996,50 @@ fn tpoff(sym_addr: u64, tls_start: u64, tls_memsz: u64) -> i64 {
     sym_addr as i64 - (tls_start as i64 + tls_memsz as i64)
 }
 
+/// Apply a single relocation, returning `true` if it's an absolute reference
+/// (needs a runtime relocation / PE base fixup).
+fn apply_one_reloc(
+    state: &mut LinkState,
+    reloc: &InputReloc,
+    sym_addr: u64,
+    reloc_vaddr: u64,
+    got: &HashMap<String, u64>,
+) -> bool {
+    match reloc.r_type {
+        elf::R_X86_64_64 => {
+            let value = (sym_addr as i64 + reloc.addend) as u64;
+            write_u64(state, reloc.section_global_idx, reloc.offset, value);
+            true
+        }
+        elf::R_X86_64_PC32 | elf::R_X86_64_PLT32 => {
+            let value = sym_addr as i64 + reloc.addend - reloc_vaddr as i64;
+            write_i32(state, reloc.section_global_idx, reloc.offset, value as i32);
+            false
+        }
+        elf::R_X86_64_32 => {
+            let value = (sym_addr as i64 + reloc.addend) as u32;
+            write_u32(state, reloc.section_global_idx, reloc.offset, value);
+            false
+        }
+        elf::R_X86_64_32S => {
+            let value = (sym_addr as i64 + reloc.addend) as i32;
+            write_i32(state, reloc.section_global_idx, reloc.offset, value);
+            false
+        }
+        elf::R_X86_64_GOTPCREL | elf::R_X86_64_GOTPCRELX
+        | elf::R_X86_64_REX_GOTPCRELX => {
+            let got_slot = got[&reloc.symbol_name];
+            let value = got_slot as i64 + reloc.addend - reloc_vaddr as i64;
+            write_i32(state, reloc.section_global_idx, reloc.offset, value as i32);
+            false
+        }
+        other => panic!(
+            "toyos-ld: unsupported relocation type {other} for symbol {}",
+            reloc.symbol_name,
+        ),
+    }
+}
+
 fn write_bytes(state: &mut LinkState, sec_idx: usize, offset: u64, bytes: &[u8]) {
     let sec = &mut state.sections[sec_idx];
     let off = offset as usize;
@@ -994,7 +1083,7 @@ struct ElfRelocParams<'a> {
 fn apply_relocs(
     state: &mut LinkState,
     params: &ElfRelocParams,
-) -> Result<RelocOutput, Vec<String>> {
+) -> Result<RelocOutput, LinkError> {
     let mut relatives = Vec::new();
     let mut undefined = HashSet::new();
 
@@ -1092,49 +1181,22 @@ fn apply_relocs(
         };
 
         match reloc.r_type {
-            elf::R_X86_64_64 => {
-                let value = (sym_addr as i64 + reloc.addend) as u64;
-                write_u64(state, reloc.section_global_idx, reloc.offset, value);
-                if params.record_relatives {
-                    relatives.push((reloc_vaddr, sym_addr as i64 + reloc.addend));
-                }
-            }
-            elf::R_X86_64_PC32 | elf::R_X86_64_PLT32 => {
-                let value = sym_addr as i64 + reloc.addend - reloc_vaddr as i64;
-                write_i32(state, reloc.section_global_idx, reloc.offset, value as i32);
-            }
-            elf::R_X86_64_32 => {
-                let value = (sym_addr as i64 + reloc.addend) as u32;
-                write_u32(state, reloc.section_global_idx, reloc.offset, value);
-            }
-            elf::R_X86_64_32S => {
-                let value = (sym_addr as i64 + reloc.addend) as i32;
-                write_i32(state, reloc.section_global_idx, reloc.offset, value);
-            }
-            elf::R_X86_64_GOTPCREL | elf::R_X86_64_GOTPCRELX
-            | elf::R_X86_64_REX_GOTPCRELX => {
-                let got_slot = params.got[&reloc.symbol_name];
-                let value = got_slot as i64 + reloc.addend - reloc_vaddr as i64;
-                write_i32(state, reloc.section_global_idx, reloc.offset, value as i32);
-            }
             elf::R_X86_64_TPOFF32 => {
                 let tp = tpoff(sym_addr, params.tls_start, params.tls_memsz);
-                write_i32(
-                    state,
-                    reloc.section_global_idx,
-                    reloc.offset,
-                    (tp + reloc.addend) as i32,
-                );
+                write_i32(state, reloc.section_global_idx, reloc.offset,
+                    (tp + reloc.addend) as i32);
             }
             elf::R_X86_64_GOTTPOFF => {
                 let got_slot = params.got[&reloc.symbol_name];
                 let value = got_slot as i64 + reloc.addend - reloc_vaddr as i64;
                 write_i32(state, reloc.section_global_idx, reloc.offset, value as i32);
             }
-            other => panic!(
-                "toyos-ld: unsupported relocation type {other} for symbol {}",
-                reloc.symbol_name,
-            ),
+            _ => {
+                let is_abs = apply_one_reloc(state, reloc, sym_addr, reloc_vaddr, params.got);
+                if is_abs && params.record_relatives {
+                    relatives.push((reloc_vaddr, sym_addr as i64 + reloc.addend));
+                }
+            }
         }
     }
 
@@ -1167,7 +1229,7 @@ fn apply_relocs(
     if !params.allow_undefined && !undefined.is_empty() {
         let mut syms: Vec<String> = undefined.into_iter().collect();
         syms.sort();
-        return Err(syms);
+        return Err(LinkError::UndefinedSymbols(syms));
     }
 
     Ok(RelocOutput { relatives, glob_dats })
@@ -1297,9 +1359,84 @@ fn emit_bytes(
         dynamic_data = Vec::new();
     }
 
+    // Build shstrtab and section headers
+    let mut strtab = StringTable::new();
+    let text_name = strtab.add(".text");
+    let data_name = strtab.add(".data");
+
+    let mut shdrs: Vec<Elf64Shdr> = vec![Zeroable::zeroed()]; // null entry
+    shdrs.push(Elf64Shdr {
+        sh_name: text_name, sh_type: elf::SHT_PROGBITS,
+        sh_flags: (elf::SHF_ALLOC | elf::SHF_EXECINSTR) as u64,
+        sh_addr: layout.rx_start, sh_offset: layout.rx_start - BASE_VADDR,
+        sh_size: layout.rx_end - layout.rx_start, ..Zeroable::zeroed()
+    });
+    shdrs.push(Elf64Shdr {
+        sh_name: data_name, sh_type: elf::SHT_PROGBITS,
+        sh_flags: (elf::SHF_ALLOC | elf::SHF_WRITE) as u64,
+        sh_addr: layout.rw_start, sh_offset: layout.rw_start - BASE_VADDR,
+        sh_size: layout.rw_end - layout.rw_start, ..Zeroable::zeroed()
+    });
+
+    let dynstr_shdr_idx;
+    if is_dynamic {
+        let dynsym_name = strtab.add(".dynsym");
+        let dynstr_name_off = strtab.add(".dynstr");
+        let rela_name = strtab.add(".rela.dyn");
+        let dynamic_name = strtab.add(".dynamic");
+
+        dynstr_shdr_idx = shdrs.len() + 1; // dynstr follows dynsym
+        shdrs.push(Elf64Shdr {
+            sh_name: dynsym_name, sh_type: elf::SHT_DYNSYM,
+            sh_flags: elf::SHF_ALLOC as u64,
+            sh_addr: dynsym_vaddr, sh_offset: dynsym_vaddr - BASE_VADDR,
+            sh_size: dynsym_data.len() as u64,
+            sh_link: dynstr_shdr_idx as u32, sh_info: 1,
+            sh_addralign: 8, sh_entsize: 24,
+        });
+        shdrs.push(Elf64Shdr {
+            sh_name: dynstr_name_off, sh_type: elf::SHT_STRTAB,
+            sh_flags: elf::SHF_ALLOC as u64,
+            sh_addr: dynstr_vaddr, sh_offset: dynstr_vaddr - BASE_VADDR,
+            sh_size: dynstr_data.len() as u64, ..Zeroable::zeroed()
+        });
+        shdrs.push(Elf64Shdr {
+            sh_name: rela_name, sh_type: elf::SHT_RELA,
+            sh_flags: elf::SHF_ALLOC as u64,
+            sh_addr: rela_dyn_vaddr, sh_offset: rela_dyn_vaddr - BASE_VADDR,
+            sh_size: rela_dyn_size,
+            sh_link: (dynstr_shdr_idx - 1) as u32, sh_addralign: 8, sh_entsize: 24,
+            ..Zeroable::zeroed()
+        });
+        shdrs.push(Elf64Shdr {
+            sh_name: dynamic_name, sh_type: elf::SHT_DYNAMIC,
+            sh_flags: (elf::SHF_ALLOC | elf::SHF_WRITE) as u64,
+            sh_addr: dynamic_vaddr, sh_offset: dynamic_vaddr - BASE_VADDR,
+            sh_size: dynamic_data.len() as u64,
+            sh_link: dynstr_shdr_idx as u32, sh_addralign: 8, sh_entsize: 16,
+            ..Zeroable::zeroed()
+        });
+    } else {
+        dynstr_shdr_idx = 0;
+        let rela_name = strtab.add(".rela.dyn");
+        shdrs.push(Elf64Shdr {
+            sh_name: rela_name, sh_type: elf::SHT_RELA,
+            sh_flags: elf::SHF_ALLOC as u64,
+            sh_offset: rela_dyn_vaddr, sh_size: rela_dyn_size,
+            sh_addralign: 8, sh_entsize: 24, ..Zeroable::zeroed()
+        });
+    }
+
     let shstrtab_file_offset = if is_dynamic { dyn_segment_end } else { rela_dyn_vaddr + rela_dyn_size };
-    let shstrtab = if is_dynamic { build_dynamic_shstrtab() } else { build_shstrtab() };
-    let num_shdrs: u16 = if is_dynamic { 8 } else { 5 };
+    let shstrtab_name = strtab.add(".shstrtab");
+    let shstrtab = strtab.data;
+    shdrs.push(Elf64Shdr {
+        sh_name: shstrtab_name, sh_type: elf::SHT_STRTAB,
+        sh_offset: shstrtab_file_offset, sh_size: shstrtab.len() as u64,
+        ..Zeroable::zeroed()
+    });
+
+    let num_shdrs = shdrs.len() as u16;
     let shdr_offset = align_up(shstrtab_file_offset + shstrtab.len() as u64, 8);
     let total_size = shdr_offset + num_shdrs as u64 * size_of::<Elf64Shdr>() as u64;
 
@@ -1347,7 +1484,7 @@ fn emit_bytes(
         write_struct(&mut buf, 64 + i * size_of::<Elf64Phdr>(), p);
     }
 
-    // ── Copy section data ──
+    // ── Section data ──
     copy_sections_to_buf(&mut buf, &state.sections, BASE_VADDR);
 
     if !layout.plt_data.is_empty() {
@@ -1361,75 +1498,16 @@ fn emit_bytes(
         copy_to_buf(&mut buf, dynamic_vaddr - BASE_VADDR, &dynamic_data);
     }
 
-    // ── Write .rela.dyn ──
     let rela_file_off = if is_dynamic { rela_dyn_vaddr - BASE_VADDR } else { rela_dyn_vaddr };
     write_rela_entries(&mut buf, rela_file_off as usize, &relocs.relatives, &relocs.glob_dats, &sym_indices);
 
-    // ── Write .shstrtab ──
     copy_to_buf(&mut buf, shstrtab_file_offset, &shstrtab);
-
-    // ── Section headers ──
-    let sh = shdr_offset as usize;
-    if is_dynamic {
-        write_struct(&mut buf, sh + 64, &shdr(1, elf::SHT_PROGBITS,
-            (elf::SHF_ALLOC | elf::SHF_EXECINSTR) as u64,
-            layout.rx_start, layout.rx_start - BASE_VADDR, layout.rx_end - layout.rx_start));
-        write_struct(&mut buf, sh + 128, &shdr(7, elf::SHT_PROGBITS,
-            (elf::SHF_ALLOC | elf::SHF_WRITE) as u64,
-            layout.rw_start, layout.rw_start - BASE_VADDR, layout.rw_end - layout.rw_start));
-        write_struct(&mut buf, sh + 192, &shdr_full(13, elf::SHT_DYNSYM,
-            elf::SHF_ALLOC as u64,
-            dynsym_vaddr, dynsym_vaddr - BASE_VADDR, dynsym_data.len() as u64, 4, 1, 8, 24));
-        write_struct(&mut buf, sh + 256, &shdr(21, elf::SHT_STRTAB,
-            elf::SHF_ALLOC as u64,
-            dynstr_vaddr, dynstr_vaddr - BASE_VADDR, dynstr_data.len() as u64));
-        write_struct(&mut buf, sh + 320, &shdr_full(29, elf::SHT_RELA,
-            elf::SHF_ALLOC as u64,
-            rela_dyn_vaddr, rela_dyn_vaddr - BASE_VADDR, rela_dyn_size, 3, 0, 8, 24));
-        write_struct(&mut buf, sh + 384, &shdr_full(39, elf::SHT_DYNAMIC,
-            (elf::SHF_ALLOC | elf::SHF_WRITE) as u64,
-            dynamic_vaddr, dynamic_vaddr - BASE_VADDR, dynamic_data.len() as u64, 4, 0, 8, 16));
-        write_struct(&mut buf, sh + 448, &shdr(48, elf::SHT_STRTAB,
-            0, 0, shstrtab_file_offset, shstrtab.len() as u64));
-    } else {
-        write_struct(&mut buf, sh + 64, &shdr(1, elf::SHT_PROGBITS,
-            (elf::SHF_ALLOC | elf::SHF_EXECINSTR) as u64,
-            layout.rx_start, layout.rx_start - BASE_VADDR, layout.rx_end - layout.rx_start));
-        write_struct(&mut buf, sh + 128, &shdr(7, elf::SHT_PROGBITS,
-            (elf::SHF_ALLOC | elf::SHF_WRITE) as u64,
-            layout.rw_start, layout.rw_start - BASE_VADDR, layout.rw_end - layout.rw_start));
-        write_struct(&mut buf, sh + 192, &shdr_full(13, elf::SHT_RELA,
-            elf::SHF_ALLOC as u64,
-            0, rela_dyn_vaddr, rela_dyn_size, 0, 0, 8, 24));
-        write_struct(&mut buf, sh + 256, &shdr(23, elf::SHT_STRTAB,
-            0, 0, shstrtab_file_offset, shstrtab.len() as u64));
+    let _ = dynstr_shdr_idx; // used during section header construction above
+    for (i, s) in shdrs.iter().enumerate() {
+        write_struct(&mut buf, shdr_offset as usize + i * size_of::<Elf64Shdr>(), s);
     }
 
     buf
-}
-
-fn build_shstrtab() -> Vec<u8> {
-    let mut tab = Vec::new();
-    tab.push(0);
-    tab.extend_from_slice(b".text\0"); // offset 1
-    tab.extend_from_slice(b".data\0"); // offset 7
-    tab.extend_from_slice(b".rela.dyn\0"); // offset 13
-    tab.extend_from_slice(b".shstrtab\0"); // offset 23
-    tab
-}
-
-/// shstrtab for dynamic executables.
-fn build_dynamic_shstrtab() -> Vec<u8> {
-    let mut tab = Vec::new();
-    tab.push(0);                            // offset 0
-    tab.extend_from_slice(b".text\0");      // offset 1
-    tab.extend_from_slice(b".data\0");      // offset 7
-    tab.extend_from_slice(b".dynsym\0");    // offset 13
-    tab.extend_from_slice(b".dynstr\0");    // offset 21
-    tab.extend_from_slice(b".rela.dyn\0");  // offset 29
-    tab.extend_from_slice(b".dynamic\0");   // offset 39
-    tab.extend_from_slice(b".shstrtab\0");  // offset 48
-    tab
 }
 
 /// Build import .dynsym and .dynstr for a dynamic executable.
@@ -1483,14 +1561,6 @@ fn phdr(p_type: u32, p_flags: u32, p_vaddr: u64, p_filesz: u64, p_memsz: u64, p_
     }
 }
 
-fn shdr(sh_name: u32, sh_type: u32, sh_flags: u64, sh_addr: u64, sh_offset: u64, sh_size: u64) -> Elf64Shdr {
-    Elf64Shdr { sh_name, sh_type, sh_flags, sh_addr, sh_offset, sh_size, ..Zeroable::zeroed() }
-}
-
-fn shdr_full(sh_name: u32, sh_type: u32, sh_flags: u64, sh_addr: u64, sh_offset: u64, sh_size: u64, sh_link: u32, sh_info: u32, sh_addralign: u64, sh_entsize: u64) -> Elf64Shdr {
-    Elf64Shdr { sh_name, sh_type, sh_flags, sh_addr, sh_offset, sh_size, sh_link, sh_info, sh_addralign, sh_entsize }
-}
-
 // ── PE/COFF output (--pe) ─────────────────────────────────────────────────
 
 const PE_FILE_ALIGNMENT: u32 = 0x200;
@@ -1519,7 +1589,7 @@ fn layout_pe(state: &mut LinkState) -> PeLayout {
     // Headers: DOS(64) + PE sig(4) + COFF(20) + OptionalHeader(240) + section headers
     // We'll have 2 or 3 sections: .text, optionally .data, .reloc
     // Determine if we have data sections
-    let has_rw = state.sections.iter().any(|s| !is_rx_section(&s.name) && !is_tls_section(&s.name));
+    let has_rw = state.sections.iter().any(|s| s.writable && !is_tls_section(&s.name));
     let num_sections: u32 = if has_rw { 3 } else { 2 }; // .text [.data] .reloc
     let headers_end = 64 + 4 + 20 + 240 + num_sections * 40;
     let size_of_headers = pe_align_up(headers_end, PE_FILE_ALIGNMENT);
@@ -1529,12 +1599,11 @@ fn layout_pe(state: &mut LinkState) -> PeLayout {
 
     for (idx, sec) in state.sections.iter().enumerate() {
         if is_tls_section(&sec.name) {
-            // TLS not supported in UEFI — UEFI is single-threaded
-            continue;
-        } else if is_rx_section(&sec.name) {
-            rx_sections.push(idx);
-        } else {
+            continue; // TLS not supported in UEFI
+        } else if sec.writable {
             rw_sections.push(idx);
+        } else {
+            rx_sections.push(idx);
         }
     }
 
@@ -1572,20 +1641,15 @@ fn layout_pe(state: &mut LinkState) -> PeLayout {
             elf::R_X86_64_GOTPCREL | elf::R_X86_64_GOTPCRELX
             | elf::R_X86_64_REX_GOTPCRELX)
     });
-    if has_data && !got_symbols.is_empty() {
-        cursor = align_up(cursor, 8);
-    } else if !has_data && !got_symbols.is_empty() {
-        // GOT goes in the data section area
-        cursor = data_rva as u64;
+    if !got_symbols.is_empty() {
+        cursor = if has_data { align_up(cursor, 8) } else { data_rva as u64 };
     }
     let mut got = HashMap::new();
     for sym in &got_symbols {
         got.insert(sym.clone(), cursor);
         cursor += 8;
     }
-    if !got_symbols.is_empty() && !has_data {
-        data_virt_size = (cursor - data_rva as u64) as u32;
-    } else if !got_symbols.is_empty() {
+    if !got_symbols.is_empty() {
         data_virt_size = (cursor - data_rva as u64) as u32;
     }
 
@@ -1626,7 +1690,7 @@ fn pe_align_up(value: u32, alignment: u32) -> u32 {
 fn apply_relocs_pe(
     state: &mut LinkState,
     layout: &PeLayout,
-) -> Result<Vec<u32>, Vec<String>> {
+) -> Result<Vec<u32>, LinkError> {
     let mut undefined = HashSet::new();
     let mut abs_fixups: Vec<u32> = Vec::new(); // RVAs of absolute 64-bit fixups
     let relocs = std::mem::take(&mut state.relocs);
@@ -1650,36 +1714,9 @@ fn apply_relocs_pe(
             }
         };
 
-        match reloc.r_type {
-            elf::R_X86_64_64 => {
-                let value = (sym_addr as i64 + reloc.addend) as u64;
-                write_u64(state, reloc.section_global_idx, reloc.offset, value);
-                // Record this as needing a base relocation
-                abs_fixups.push(reloc_vaddr as u32);
-            }
-            elf::R_X86_64_PC32 | elf::R_X86_64_PLT32 => {
-                let value = sym_addr as i64 + reloc.addend - reloc_vaddr as i64;
-                write_i32(state, reloc.section_global_idx, reloc.offset, value as i32);
-                // PC-relative — no base relocation needed
-            }
-            elf::R_X86_64_32 => {
-                let value = (sym_addr as i64 + reloc.addend) as u32;
-                write_u32(state, reloc.section_global_idx, reloc.offset, value);
-            }
-            elf::R_X86_64_32S => {
-                let value = (sym_addr as i64 + reloc.addend) as i32;
-                write_i32(state, reloc.section_global_idx, reloc.offset, value);
-            }
-            elf::R_X86_64_GOTPCREL | elf::R_X86_64_GOTPCRELX
-            | elf::R_X86_64_REX_GOTPCRELX => {
-                let got_slot = layout.got[&reloc.symbol_name];
-                let value = got_slot as i64 + reloc.addend - reloc_vaddr as i64;
-                write_i32(state, reloc.section_global_idx, reloc.offset, value as i32);
-            }
-            other => panic!(
-                "toyos-ld: unsupported relocation type {other} in PE mode for symbol {}",
-                reloc.symbol_name,
-            ),
+        let is_abs = apply_one_reloc(state, reloc, sym_addr, reloc_vaddr, &layout.got);
+        if is_abs {
+            abs_fixups.push(reloc_vaddr as u32);
         }
     }
 
@@ -1691,7 +1728,7 @@ fn apply_relocs_pe(
     if !undefined.is_empty() {
         let mut syms: Vec<String> = undefined.into_iter().collect();
         syms.sort();
-        return Err(syms);
+        return Err(LinkError::UndefinedSymbols(syms));
     }
 
     abs_fixups.sort();
@@ -1718,8 +1755,7 @@ fn build_base_reloc_table(fixups: &[u32]) -> Vec<u8> {
         let mut count = 0u32;
         while i < fixups.len() && (fixups[i] & !0xFFF) == page_rva {
             let offset = fixups[i] & 0xFFF;
-            // Type 10 (IMAGE_REL_BASED_DIR64) in upper 4 bits
-            let entry: u16 = (10 << 12) | (offset as u16);
+            let entry: u16 = ((pe::IMAGE_REL_BASED_DIR64 as u16) << 12) | (offset as u16);
             result.extend_from_slice(&entry.to_le_bytes());
             count += 1;
             i += 1;
@@ -1762,29 +1798,30 @@ fn emit_pe_bytes(
 
     // ── DOS header ──
     write_struct(&mut buf, 0, &PeDosHeader {
-        e_magic: 0x5A4D, // "MZ"
+        e_magic: pe::IMAGE_DOS_SIGNATURE,
         e_lfanew: 0x40,
         ..Zeroable::zeroed()
     });
 
     // ── PE signature ──
-    buf[0x40..0x44].copy_from_slice(&0x00004550u32.to_le_bytes());
+    buf[0x40..0x44].copy_from_slice(&pe::IMAGE_NT_SIGNATURE.to_le_bytes());
 
     // ── COFF header ──
     write_struct(&mut buf, 0x44, &PeCoffHeader {
-        machine: 0x8664, // AMD64
+        machine: pe::IMAGE_FILE_MACHINE_AMD64,
         number_of_sections: num_sections,
         size_of_optional_header: size_of::<Pe32PlusOptHeader>() as u16,
-        characteristics: 0x0022, // EXECUTABLE_IMAGE | LARGE_ADDRESS_AWARE
+        characteristics: pe::IMAGE_FILE_EXECUTABLE_IMAGE | pe::IMAGE_FILE_LARGE_ADDRESS_AWARE,
         ..Zeroable::zeroed()
     });
 
     // ── Optional header (PE32+) ──
     let mut data_dirs: [PeDataDirectory; 16] = Zeroable::zeroed();
-    data_dirs[5] = PeDataDirectory { virtual_address: layout.reloc_rva, size: reloc_virt_size };
+    data_dirs[pe::IMAGE_DIRECTORY_ENTRY_BASERELOC] =
+        PeDataDirectory { virtual_address: layout.reloc_rva, size: reloc_virt_size };
 
     write_struct(&mut buf, 0x58, &Pe32PlusOptHeader {
-        magic: 0x020B,
+        magic: pe::IMAGE_NT_OPTIONAL_HDR64_MAGIC,
         size_of_code: layout.text_virt_size,
         size_of_initialized_data: layout.data_virt_size + reloc_virt_size,
         address_of_entry_point: entry_rva,
@@ -1794,7 +1831,9 @@ fn emit_pe_bytes(
         size_of_image,
         size_of_headers: layout.size_of_headers,
         subsystem,
-        dll_characteristics: 0x0160, // DYNAMIC_BASE | HIGH_ENTROPY_VA | NX_COMPAT
+        dll_characteristics: pe::IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE
+            | pe::IMAGE_DLLCHARACTERISTICS_HIGH_ENTROPY_VA
+            | pe::IMAGE_DLLCHARACTERISTICS_NX_COMPAT,
         size_of_stack_reserve: 0x100000,
         size_of_stack_commit: 0x1000,
         size_of_heap_reserve: 0x100000,
@@ -1808,39 +1847,37 @@ fn emit_pe_bytes(
     let sh_base = 0x58 + size_of::<Pe32PlusOptHeader>();
     let mut sh_off = sh_base;
 
-    fn pe_sec_name(name: &[u8; 8]) -> [u8; 8] { *name }
-
     write_struct(&mut buf, sh_off, &PeSectionHeader {
-        name: pe_sec_name(b".text\0\0\0"),
+        name: *b".text\0\0\0",
         virtual_size: layout.text_virt_size,
         virtual_address: layout.text_rva,
         size_of_raw_data: layout.text_raw_size,
         pointer_to_raw_data: layout.text_file_off,
-        characteristics: 0x60000020, // CODE|EXEC|READ
+        characteristics: pe::IMAGE_SCN_CNT_CODE | pe::IMAGE_SCN_MEM_EXECUTE | pe::IMAGE_SCN_MEM_READ,
         ..Zeroable::zeroed()
     });
     sh_off += size_of::<PeSectionHeader>();
 
     if layout.has_data {
         write_struct(&mut buf, sh_off, &PeSectionHeader {
-            name: pe_sec_name(b".data\0\0\0"),
+            name: *b".data\0\0\0",
             virtual_size: layout.data_virt_size,
             virtual_address: layout.data_rva,
             size_of_raw_data: layout.data_raw_size,
             pointer_to_raw_data: layout.data_file_off,
-            characteristics: 0xC0000040, // INIT_DATA|READ|WRITE
+            characteristics: pe::IMAGE_SCN_CNT_INITIALIZED_DATA | pe::IMAGE_SCN_MEM_READ | pe::IMAGE_SCN_MEM_WRITE,
             ..Zeroable::zeroed()
         });
         sh_off += size_of::<PeSectionHeader>();
     }
 
     write_struct(&mut buf, sh_off, &PeSectionHeader {
-        name: pe_sec_name(b".reloc\0\0"),
+        name: *b".reloc\0\0",
         virtual_size: reloc_virt_size,
         virtual_address: layout.reloc_rva,
         size_of_raw_data: reloc_raw_size,
         pointer_to_raw_data: layout.reloc_file_off,
-        characteristics: 0x42000040, // INIT_DATA|DISCARDABLE|READ
+        characteristics: pe::IMAGE_SCN_CNT_INITIALIZED_DATA | pe::IMAGE_SCN_MEM_DISCARDABLE | pe::IMAGE_SCN_MEM_READ,
         ..Zeroable::zeroed()
     });
 
@@ -1886,17 +1923,43 @@ fn emit_static_bytes(
     let base = layout.base_addr;
     let after_rw = layout.rw_end.max(layout.tls_start + layout.tls_memsz);
 
-    let shstrtab = build_static_shstrtab();
+    // Build shstrtab
+    let mut strtab = StringTable::new();
+    let text_name = strtab.add(".text");
+    let data_name = strtab.add(".data");
+    let shstrtab_name = strtab.add(".shstrtab");
+    let shstrtab = strtab.data;
+
+    // Build section headers
+    let mut shdrs: Vec<Elf64Shdr> = vec![Zeroable::zeroed()]; // null entry
+    shdrs.push(Elf64Shdr {
+        sh_name: text_name, sh_type: elf::SHT_PROGBITS,
+        sh_flags: (elf::SHF_ALLOC | elf::SHF_EXECINSTR) as u64,
+        sh_addr: layout.rx_start, sh_offset: layout.rx_start - base,
+        sh_size: layout.rx_end - layout.rx_start, ..Zeroable::zeroed()
+    });
+    shdrs.push(Elf64Shdr {
+        sh_name: data_name, sh_type: elf::SHT_PROGBITS,
+        sh_flags: (elf::SHF_ALLOC | elf::SHF_WRITE) as u64,
+        sh_addr: layout.rw_start, sh_offset: layout.rw_start - base,
+        sh_size: layout.rw_end - layout.rw_start, ..Zeroable::zeroed()
+    });
     let shstrtab_file_offset = after_rw - base;
-    let num_shdrs: u16 = 4;
-    let mut phdr_count = 2u16;
-    if layout.tls_memsz > 0 { phdr_count += 1; }
+    shdrs.push(Elf64Shdr {
+        sh_name: shstrtab_name, sh_type: elf::SHT_STRTAB,
+        sh_offset: shstrtab_file_offset, sh_size: shstrtab.len() as u64,
+        ..Zeroable::zeroed()
+    });
+
+    let num_shdrs = shdrs.len() as u16;
     let shdr_offset = align_up(shstrtab_file_offset + shstrtab.len() as u64, 8);
     let total_file_size = shdr_offset + num_shdrs as u64 * size_of::<Elf64Shdr>() as u64;
 
     let mut buf = vec![0u8; total_file_size as usize];
 
     // ── ELF header ──
+    let mut phdr_count = 2u16;
+    if layout.tls_memsz > 0 { phdr_count += 1; }
     write_struct(&mut buf, 0, &Elf64Ehdr {
         e_ident: elf_ident(),
         e_type: elf::ET_EXEC,
@@ -1915,95 +1978,59 @@ fn emit_static_bytes(
     });
 
     // ── Program headers ──
-    // Static ELF: file_offset = vaddr - base_addr
     let mut phdrs = vec![
         Elf64Phdr {
-            p_type: elf::PT_LOAD,
-            p_flags: elf::PF_R | elf::PF_X,
-            p_offset: 0,
-            p_vaddr: base,
-            p_paddr: base,
-            p_filesz: layout.rx_end - base,
-            p_memsz: layout.rx_end - base,
-            p_align: PAGE_SIZE,
+            p_type: elf::PT_LOAD, p_flags: elf::PF_R | elf::PF_X,
+            p_offset: 0, p_vaddr: base, p_paddr: base,
+            p_filesz: layout.rx_end - base, p_memsz: layout.rx_end - base, p_align: PAGE_SIZE,
         },
         Elf64Phdr {
-            p_type: elf::PT_LOAD,
-            p_flags: elf::PF_R | elf::PF_W,
-            p_offset: layout.rw_start - base,
-            p_vaddr: layout.rw_start,
-            p_paddr: layout.rw_start,
-            p_filesz: layout.rw_end - layout.rw_start,
-            p_memsz: layout.rw_end - layout.rw_start,
+            p_type: elf::PT_LOAD, p_flags: elf::PF_R | elf::PF_W,
+            p_offset: layout.rw_start - base, p_vaddr: layout.rw_start, p_paddr: layout.rw_start,
+            p_filesz: layout.rw_end - layout.rw_start, p_memsz: layout.rw_end - layout.rw_start,
             p_align: PAGE_SIZE,
         },
     ];
     if layout.tls_memsz > 0 {
         phdrs.push(Elf64Phdr {
-            p_type: elf::PT_TLS,
-            p_flags: elf::PF_R,
-            p_offset: layout.tls_start - base,
-            p_vaddr: layout.tls_start,
-            p_paddr: layout.tls_start,
-            p_filesz: layout.tls_filesz,
-            p_memsz: layout.tls_memsz,
-            p_align: 64,
+            p_type: elf::PT_TLS, p_flags: elf::PF_R,
+            p_offset: layout.tls_start - base, p_vaddr: layout.tls_start, p_paddr: layout.tls_start,
+            p_filesz: layout.tls_filesz, p_memsz: layout.tls_memsz, p_align: 64,
         });
     }
     for (i, p) in phdrs.iter().enumerate() {
         write_struct(&mut buf, 64 + i * size_of::<Elf64Phdr>(), p);
     }
 
-    // ── Copy section data ──
+    // ── Section data ──
     copy_sections_to_buf(&mut buf, &state.sections, base);
 
-    // ── Write GOT entries ──
-    let gottpoff_syms: HashSet<String> = state.relocs
-        .iter()
+    // GOT entries
+    let gottpoff_syms: HashSet<String> = state.relocs.iter()
         .filter(|r| r.r_type == elf::R_X86_64_GOTTPOFF)
-        .map(|r| r.symbol_name.clone())
-        .collect();
+        .map(|r| r.symbol_name.clone()).collect();
     for (sym_name, &got_vaddr) in &layout.got {
         let sym_addr = resolve_symbol(state, sym_name, 0, None)
             .unwrap_or_else(|| panic!("toyos-ld: undefined GOT symbol: {sym_name}"));
         let value = if gottpoff_syms.contains(sym_name) {
             tpoff(sym_addr, layout.tls_start, layout.tls_memsz) as u64
-        } else {
-            sym_addr
-        };
+        } else { sym_addr };
         let file_off = (got_vaddr - base) as usize;
         buf[file_off..file_off + 8].copy_from_slice(&value.to_le_bytes());
     }
 
     copy_to_buf(&mut buf, shstrtab_file_offset, &shstrtab);
-
-    // ── Section headers ──
-    let sh = shdr_offset as usize;
-    write_struct(&mut buf, sh + 64, &shdr(1, elf::SHT_PROGBITS,
-        (elf::SHF_ALLOC | elf::SHF_EXECINSTR) as u64,
-        layout.rx_start, layout.rx_start - base, layout.rx_end - layout.rx_start));
-    write_struct(&mut buf, sh + 128, &shdr(7, elf::SHT_PROGBITS,
-        (elf::SHF_ALLOC | elf::SHF_WRITE) as u64,
-        layout.rw_start, layout.rw_start - base, layout.rw_end - layout.rw_start));
-    write_struct(&mut buf, sh + 192, &shdr(13, elf::SHT_STRTAB,
-        0, 0, shstrtab_file_offset, shstrtab.len() as u64));
+    for (i, s) in shdrs.iter().enumerate() {
+        write_struct(&mut buf, shdr_offset as usize + i * size_of::<Elf64Shdr>(), s);
+    }
 
     buf
-}
-
-fn build_static_shstrtab() -> Vec<u8> {
-    let mut tab = Vec::new();
-    tab.push(0);
-    tab.extend_from_slice(b".text\0");      // offset 1
-    tab.extend_from_slice(b".data\0");      // offset 7
-    tab.extend_from_slice(b".shstrtab\0");  // offset 13
-    tab
 }
 
 // ── Shared library output (--shared) ─────────────────────────────────────
 
 /// Link object files and produce a shared library (.so) ELF with .dynsym/.dynstr.
-pub fn link_shared(objects: &[(String, Vec<u8>)]) -> Result<Vec<u8>, Vec<String>> {
+pub fn link_shared(objects: &[(String, Vec<u8>)]) -> Result<Vec<u8>, LinkError> {
     let mut state = collect(objects);
     synthesize_alloc_shims(&mut state);
     let layout = layout_elf(&mut state, BASE_VADDR, None);
@@ -2059,25 +2086,6 @@ fn build_dynamic(symtab_vaddr: u64, strtab_vaddr: u64, strsz: u64) -> Vec<u8> {
     data
 }
 
-fn build_shared_shstrtab(metadata: &[(String, Vec<u8>)]) -> (Vec<u8>, Vec<u32>) {
-    let mut tab = Vec::new();
-    tab.push(0);                            // offset 0
-    tab.extend_from_slice(b".text\0");      // offset 1
-    tab.extend_from_slice(b".data\0");      // offset 7
-    tab.extend_from_slice(b".rela.dyn\0");  // offset 13
-    tab.extend_from_slice(b".dynsym\0");    // offset 23
-    tab.extend_from_slice(b".dynstr\0");    // offset 31
-    tab.extend_from_slice(b".dynamic\0");   // offset 39
-    tab.extend_from_slice(b".shstrtab\0");  // offset 48
-    let mut meta_name_offsets = Vec::new();
-    for (name, _) in metadata {
-        meta_name_offsets.push(tab.len() as u32);
-        tab.extend_from_slice(name.as_bytes());
-        tab.push(0);
-    }
-    (tab, meta_name_offsets)
-}
-
 fn emit_shared_bytes(
     state: &LinkState,
     layout: &ElfLayout,
@@ -2104,9 +2112,74 @@ fn emit_shared_bytes(
         meta_offset += data.len() as u64;
     }
 
+    // Build shstrtab and section headers
+    let mut strtab = StringTable::new();
+    let text_name = strtab.add(".text");
+    let data_name = strtab.add(".data");
+    let rela_name = strtab.add(".rela.dyn");
+    let dynsym_name = strtab.add(".dynsym");
+    let dynstr_name_off = strtab.add(".dynstr");
+    let dynamic_name = strtab.add(".dynamic");
+
+    let mut shdrs: Vec<Elf64Shdr> = vec![Zeroable::zeroed()];
+    shdrs.push(Elf64Shdr {
+        sh_name: text_name, sh_type: elf::SHT_PROGBITS,
+        sh_flags: (elf::SHF_ALLOC | elf::SHF_EXECINSTR) as u64,
+        sh_addr: layout.rx_start, sh_offset: layout.rx_start - BASE_VADDR,
+        sh_size: layout.rx_end - layout.rx_start, ..Zeroable::zeroed()
+    });
+    shdrs.push(Elf64Shdr {
+        sh_name: data_name, sh_type: elf::SHT_PROGBITS,
+        sh_flags: (elf::SHF_ALLOC | elf::SHF_WRITE) as u64,
+        sh_addr: layout.rw_start, sh_offset: layout.rw_start - BASE_VADDR,
+        sh_size: layout.rw_end - layout.rw_start, ..Zeroable::zeroed()
+    });
+    shdrs.push(Elf64Shdr {
+        sh_name: rela_name, sh_type: elf::SHT_RELA,
+        sh_flags: elf::SHF_ALLOC as u64,
+        sh_offset: rela_dyn_offset, sh_size: rela_dyn_size,
+        sh_addralign: 8, sh_entsize: 24, ..Zeroable::zeroed()
+    });
+    let dynstr_shdr_idx = shdrs.len() + 1; // dynstr follows dynsym
+    shdrs.push(Elf64Shdr {
+        sh_name: dynsym_name, sh_type: elf::SHT_DYNSYM,
+        sh_flags: elf::SHF_ALLOC as u64,
+        sh_addr: dynsym_vaddr, sh_offset: dynsym_vaddr - BASE_VADDR,
+        sh_size: dynsym_data.len() as u64,
+        sh_link: dynstr_shdr_idx as u32, sh_info: 1, sh_addralign: 8, sh_entsize: 24,
+    });
+    shdrs.push(Elf64Shdr {
+        sh_name: dynstr_name_off, sh_type: elf::SHT_STRTAB,
+        sh_flags: elf::SHF_ALLOC as u64,
+        sh_addr: dynstr_vaddr, sh_offset: dynstr_vaddr - BASE_VADDR,
+        sh_size: dynstr_data.len() as u64, ..Zeroable::zeroed()
+    });
+    shdrs.push(Elf64Shdr {
+        sh_name: dynamic_name, sh_type: elf::SHT_DYNAMIC,
+        sh_flags: (elf::SHF_ALLOC | elf::SHF_WRITE) as u64,
+        sh_addr: dynamic_vaddr, sh_offset: dynamic_vaddr - BASE_VADDR,
+        sh_size: dynamic_data.len() as u64,
+        sh_link: dynstr_shdr_idx as u32, sh_addralign: 8, sh_entsize: 16,
+        ..Zeroable::zeroed()
+    });
+    for (i, (name, data)) in state.metadata.iter().enumerate() {
+        let name_off = strtab.add(name);
+        shdrs.push(Elf64Shdr {
+            sh_name: name_off, sh_type: elf::SHT_PROGBITS,
+            sh_offset: meta_offsets[i], sh_size: data.len() as u64,
+            ..Zeroable::zeroed()
+        });
+    }
     let shstrtab_offset = meta_offset;
-    let (shstrtab, meta_name_offsets) = build_shared_shstrtab(&state.metadata);
-    let num_shdrs = 8u16 + state.metadata.len() as u16;
+    let shstrtab_name = strtab.add(".shstrtab");
+    let shstrtab = strtab.data;
+    shdrs.push(Elf64Shdr {
+        sh_name: shstrtab_name, sh_type: elf::SHT_STRTAB,
+        sh_offset: shstrtab_offset, sh_size: shstrtab.len() as u64,
+        ..Zeroable::zeroed()
+    });
+
+    let num_shdrs = shdrs.len() as u16;
     let shdr_offset = align_up(shstrtab_offset + shstrtab.len() as u64, 8);
     let total_size = shdr_offset + num_shdrs as u64 * size_of::<Elf64Shdr>() as u64;
 
@@ -2156,41 +2229,17 @@ fn emit_shared_bytes(
     copy_to_buf(&mut buf, dynstr_vaddr - BASE_VADDR, &dynstr_data);
     copy_to_buf(&mut buf, dynamic_vaddr - BASE_VADDR, &dynamic_data);
 
-    // .rela.dyn
     let empty = HashMap::new();
     write_rela_entries(&mut buf, rela_dyn_offset as usize, &relocs.relatives, &[], &empty);
 
-    // Metadata sections
     for (i, (_, data)) in state.metadata.iter().enumerate() {
         copy_to_buf(&mut buf, meta_offsets[i], data);
     }
 
     copy_to_buf(&mut buf, shstrtab_offset, &shstrtab);
-
-    // ── Section headers ──
-    let sh = shdr_offset as usize;
-    write_struct(&mut buf, sh + 64, &shdr(1, elf::SHT_PROGBITS,
-        (elf::SHF_ALLOC | elf::SHF_EXECINSTR) as u64,
-        layout.rx_start, layout.rx_start - BASE_VADDR, layout.rx_end - layout.rx_start));
-    write_struct(&mut buf, sh + 128, &shdr(7, elf::SHT_PROGBITS,
-        (elf::SHF_ALLOC | elf::SHF_WRITE) as u64,
-        layout.rw_start, layout.rw_start - BASE_VADDR, layout.rw_end - layout.rw_start));
-    write_struct(&mut buf, sh + 192, &shdr_full(13, elf::SHT_RELA,
-        elf::SHF_ALLOC as u64, 0, rela_dyn_offset, rela_dyn_size, 0, 0, 8, 24));
-    write_struct(&mut buf, sh + 256, &shdr_full(23, elf::SHT_DYNSYM,
-        elf::SHF_ALLOC as u64, dynsym_vaddr, dynsym_vaddr - BASE_VADDR,
-        dynsym_data.len() as u64, 5, 1, 8, 24));
-    write_struct(&mut buf, sh + 320, &shdr(31, elf::SHT_STRTAB,
-        elf::SHF_ALLOC as u64, dynstr_vaddr, dynstr_vaddr - BASE_VADDR, dynstr_data.len() as u64));
-    write_struct(&mut buf, sh + 384, &shdr_full(39, elf::SHT_DYNAMIC,
-        (elf::SHF_ALLOC | elf::SHF_WRITE) as u64,
-        dynamic_vaddr, dynamic_vaddr - BASE_VADDR, dynamic_data.len() as u64, 5, 0, 8, 16));
-    for (i, (_, data)) in state.metadata.iter().enumerate() {
-        write_struct(&mut buf, sh + (7 + i) * 64, &shdr(meta_name_offsets[i], elf::SHT_PROGBITS,
-            0, 0, meta_offsets[i], data.len() as u64));
+    for (i, s) in shdrs.iter().enumerate() {
+        write_struct(&mut buf, shdr_offset as usize + i * size_of::<Elf64Shdr>(), s);
     }
-    write_struct(&mut buf, sh + (num_shdrs - 1) as usize * 64, &shdr(48, elf::SHT_STRTAB,
-        0, 0, shstrtab_offset, shstrtab.len() as u64));
 
     buf
 }

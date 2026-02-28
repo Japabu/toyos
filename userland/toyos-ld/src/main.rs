@@ -27,10 +27,8 @@ fn main() {
                 process::exit(1);
             });
         }
-        Err(syms) => {
-            for sym in &syms {
-                eprintln!("toyos-ld: undefined symbol: {sym}");
-            }
+        Err(e) => {
+            eprint!("toyos-ld: {e}");
             process::exit(1);
         }
     }

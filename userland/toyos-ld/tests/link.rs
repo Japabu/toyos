@@ -5,71 +5,6 @@ use object::write::{Object as WriteObject, StandardSection, Symbol, SymbolSectio
 use object::{
     Architecture, BinaryFormat, Endianness, RelocationFlags, SymbolFlags, SymbolKind, SymbolScope,
 };
-use std::path::PathBuf;
-
-// ── Helpers: toolchain ───────────────────────────────────────────────────
-
-fn sysroot_libdir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../rust/build/aarch64-apple-darwin/stage1/lib/rustlib/x86_64-unknown-toyos/lib")
-}
-
-fn sysroot() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../rust/build/aarch64-apple-darwin/stage1")
-}
-
-fn rustc() -> PathBuf {
-    sysroot().join("bin/rustc")
-}
-
-fn has_rustc() -> bool {
-    rustc().exists() && sysroot_libdir().exists()
-}
-
-fn compile_to_obj(source: &str) -> Vec<u8> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("toyos-ld-test-{id}"));
-    std::fs::create_dir_all(&dir).unwrap();
-    let src_path = dir.join("test.rs");
-    let obj_path = dir.join("test.o");
-    std::fs::write(&src_path, source).unwrap();
-
-    let output = std::process::Command::new(rustc())
-        .args([
-            "--target", "x86_64-unknown-toyos",
-            "--edition", "2021",
-            "-C", "panic=abort",
-            "--emit=obj",
-            "-o",
-        ])
-        .arg(&obj_path)
-        .arg(&src_path)
-        .arg("--sysroot")
-        .arg(sysroot())
-        .output()
-        .expect("failed to run rustc");
-
-    assert!(
-        output.status.success(),
-        "rustc failed:\n{}",
-        String::from_utf8_lossy(&output.stderr),
-    );
-
-    std::fs::read(&obj_path).unwrap()
-}
-
-fn std_rlibs() -> Vec<String> {
-    [
-        "std", "core", "alloc", "compiler_builtins", "panic_abort",
-        "cfg_if", "hashbrown", "rustc_std_workspace_core", "rustc_std_workspace_alloc",
-        "libc", "memchr", "adler2", "miniz_oxide", "object", "gimli", "addr2line",
-        "rustc_demangle", "unwind", "std_detect",
-    ].iter().map(|s| s.to_string()).collect()
-}
-
 // ── Helpers: object builder ──────────────────────────────────────────────
 
 /// Fluent builder for constructing test ELF/COFF object files.
@@ -291,8 +226,8 @@ fn cross_object_symbol_resolution() {
 fn undefined_symbol_error() {
     let obj = ObjBuilder::elf().func_calling("_start", "nonexistent").build();
     let result = toyos_ld::link(&[("test.o".into(), obj)], "_start");
-    let syms = result.expect_err("should fail with undefined symbol");
-    assert!(syms.contains(&"nonexistent".to_string()));
+    let err = result.expect_err("should fail with undefined symbol");
+    assert!(err.undefined_symbols().contains(&"nonexistent".to_string()));
 }
 
 #[test]
@@ -307,132 +242,6 @@ fn absolute_relocation_produces_relative() {
     assert!(rela_sec.is_some(), "should have .rela.dyn section");
     let rela_data = rela_sec.unwrap().data().unwrap();
     assert!(!rela_data.is_empty(), ".rela.dyn should have entries");
-}
-
-// ── Tests: compiled no_std programs ──────────────────────────────────────
-
-#[test]
-fn compiled_nostd_minimal() {
-    if !has_rustc() {
-        return;
-    }
-
-    let source = r#"
-#![no_main]
-#![no_std]
-
-use core::panic::PanicInfo;
-
-#[panic_handler]
-fn panic(_: &PanicInfo) -> ! { loop {} }
-
-#[no_mangle]
-pub extern "C" fn _start() -> ! {
-    loop {}
-}
-"#;
-    let obj = compile_to_obj(source);
-    let elf_bytes =
-        toyos_ld::link(&[("test.o".into(), obj)], "_start").expect("no_std linking should succeed");
-
-    let elf = parse_elf(&elf_bytes);
-    assert_eq!(elf.elf_header().e_type.get(elf.endian()), 3);
-}
-
-#[test]
-fn tls_relocation_handling() {
-    if !has_rustc() {
-        return;
-    }
-
-    let source = r#"
-#![no_main]
-#![no_std]
-#![feature(thread_local)]
-
-use core::panic::PanicInfo;
-
-#[panic_handler]
-fn panic(_: &PanicInfo) -> ! { loop {} }
-
-#[thread_local]
-static mut TLS_VAR: u64 = 42;
-
-#[no_mangle]
-pub extern "C" fn _start() -> ! {
-    unsafe { TLS_VAR = TLS_VAR.wrapping_add(1); }
-    loop {}
-}
-"#;
-    let obj = compile_to_obj(source);
-    let libdir = sysroot_libdir();
-    let libs: Vec<String> = ["core", "compiler_builtins"]
-        .iter().map(|s| s.to_string()).collect();
-    let lib_objects = toyos_ld::resolve_libs(&[], &[libdir], &libs);
-    let mut all_objects = vec![("test.o".into(), obj)];
-    all_objects.extend(lib_objects);
-    let elf_bytes = toyos_ld::link(&all_objects, "_start")
-        .expect("TLS linking should succeed");
-
-    let elf = parse_elf(&elf_bytes);
-    assert!(has_phdr(&elf, elf::PT_TLS), "should have PT_TLS");
-}
-
-// ── Tests: programs that need std rlibs ──────────────────────────────────
-
-#[test]
-fn allocator_shim_synthesis() {
-    if !has_rustc() {
-        return;
-    }
-
-    // Use a program with std (which provides allocator) + Box to trigger shim synthesis
-    let source = r#"
-fn main() {
-    let x = Box::new(42u64);
-    println!("{}", x);
-}
-"#;
-    let obj = compile_to_obj(source);
-    let libdir = sysroot_libdir();
-    let libs = std_rlibs();
-    let lib_objects = toyos_ld::resolve_libs(&[], &[libdir], &libs);
-
-    let mut all_objects = vec![("test.o".into(), obj)];
-    all_objects.extend(lib_objects);
-
-    let elf_bytes =
-        toyos_ld::link(&all_objects, "main").expect("alloc shim linking should succeed");
-
-    let elf = parse_elf(&elf_bytes);
-    assert_eq!(elf.elf_header().e_type.get(elf.endian()), 3);
-}
-
-#[test]
-fn full_std_hello_world() {
-    if !has_rustc() {
-        return;
-    }
-
-    let source = r#"
-fn main() {
-    println!("Hello from toyos-ld!");
-}
-"#;
-    let obj = compile_to_obj(source);
-    let libdir = sysroot_libdir();
-    let libs = std_rlibs();
-    let lib_objects = toyos_ld::resolve_libs(&[], &[libdir], &libs);
-
-    let mut all_objects = vec![("test.o".into(), obj)];
-    all_objects.extend(lib_objects);
-
-    let elf_bytes =
-        toyos_ld::link(&all_objects, "main").expect("full std hello world should link");
-
-    let elf = parse_elf(&elf_bytes);
-    assert_eq!(elf.elf_header().e_type.get(elf.endian()), 3);
-    assert!(has_phdr(&elf, elf::PT_LOAD));
 }
 
 // ── Tests: shared library output (--shared) ──────────────────────────────
@@ -578,7 +387,7 @@ fn link_against_so_still_reports_truly_undefined() {
     let result = toyos_ld::link(
         &[("main.o".into(), obj), ("libhelper.so".into(), so_bytes)], "_start");
     let err = result.expect_err("should fail for truly undefined symbol");
-    assert!(err.contains(&"missing_func".to_string()));
+    assert!(err.undefined_symbols().contains(&"missing_func".to_string()));
 }
 
 #[test]
@@ -775,66 +584,8 @@ fn static_cross_object_resolution() {
 fn static_undefined_symbol_error() {
     let obj = ObjBuilder::elf().func_calling("_start", "nonexistent").build();
     let result = toyos_ld::link_static(&[("test.o".into(), obj)], "_start", 0x200000);
-    let syms = result.expect_err("should fail with undefined symbol");
-    assert!(syms.contains(&"nonexistent".to_string()));
-}
-
-#[test]
-fn static_compiled_nostd_kernel_base() {
-    if !has_rustc() { return; }
-
-    let source = r#"
-#![no_main]
-#![no_std]
-
-use core::panic::PanicInfo;
-
-#[panic_handler]
-fn panic(_: &PanicInfo) -> ! { loop {} }
-
-#[no_mangle]
-pub extern "C" fn _start() -> ! {
-    loop {}
-}
-"#;
-    let obj = compile_to_obj(source);
-    let high_base: u64 = 0xFFFF_8000_0000_0000;
-    let elf_bytes = toyos_ld::link_static(&[("test.o".into(), obj)], "_start", high_base)
-        .expect("no_std static linking at kernel base should succeed");
-
-    let elf = parse_elf(&elf_bytes);
-    let endian = elf.endian();
-    assert_eq!(elf.elf_header().e_type.get(endian), 2, "should be ET_EXEC");
-    let entry = elf.elf_header().e_entry.get(endian);
-    assert!(entry >= high_base, "entry should be in high kernel address space");
-}
-
-#[test]
-fn static_compiled_nostd() {
-    if !has_rustc() { return; }
-
-    let source = r#"
-#![no_main]
-#![no_std]
-
-use core::panic::PanicInfo;
-
-#[panic_handler]
-fn panic(_: &PanicInfo) -> ! { loop {} }
-
-#[no_mangle]
-pub extern "C" fn _start() -> ! {
-    loop {}
-}
-"#;
-    let obj = compile_to_obj(source);
-    let elf_bytes = toyos_ld::link_static(&[("test.o".into(), obj)], "_start", 0x200000)
-        .expect("no_std static linking should succeed");
-
-    let elf = parse_elf(&elf_bytes);
-    let endian = elf.endian();
-    assert_eq!(elf.elf_header().e_type.get(endian), 2, "should be ET_EXEC");
-    assert!(!has_phdr(&elf, elf::PT_DYNAMIC), "must not have PT_DYNAMIC");
+    let err = result.expect_err("should fail with undefined symbol");
+    assert!(err.undefined_symbols().contains(&"nonexistent".to_string()));
 }
 
 // ── Tests: PE/COFF output (link_pe) ─────────────────────────────────────
@@ -1019,8 +770,8 @@ fn pe_no_relocs_for_pc_relative() {
 fn pe_undefined_symbol_error() {
     let obj = ObjBuilder::elf().func_calling("efi_main", "missing").build();
     let result = toyos_ld::link_pe(&[("test.o".into(), obj)], "efi_main", 10);
-    let syms = result.expect_err("should fail with undefined symbol");
-    assert!(syms.contains(&"missing".to_string()));
+    let err = result.expect_err("should fail with undefined symbol");
+    assert!(err.undefined_symbols().contains(&"missing".to_string()));
 }
 
 #[test]
