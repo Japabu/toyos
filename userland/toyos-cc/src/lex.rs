@@ -31,7 +31,7 @@ pub enum TokenKind {
     Short, Signed, Sizeof, Static, Struct, Switch, Typedef, Union,
     Unsigned, Void, Volatile, While, Restrict, Inline, Bool,
     // GNU extensions
-    Typeof, Asm, Attribute, Extension, Builtin,
+    Typeof, Asm, Attribute, Extension, Builtin(String),
     Alignof, Alignas,
     Int128,
     // C99
@@ -252,12 +252,11 @@ impl<'a> Lexer<'a> {
             b'n' => b'\n',
             b't' => b'\t',
             b'r' => b'\r',
-            b'0' => {
-                // Octal
-                let mut val = 0u8;
+            c @ b'0'..=b'7' => {
+                let mut val = c - b'0';
                 for _ in 0..2 {
                     if self.peek().is_some_and(|c| c >= b'0' && c <= b'7') {
-                        val = val * 8 + (self.advance() - b'0');
+                        val = val.wrapping_mul(8).wrapping_add(self.advance() - b'0');
                     }
                 }
                 val
@@ -326,9 +325,46 @@ impl<'a> Lexer<'a> {
                 Some(b'\'') => TokenKind::CharLit(self.read_char_lit()),
                 Some(b'"') => {
                     let mut s = self.read_string_lit();
-                    // Adjacent string concatenation
+                    // Adjacent string concatenation (skip line directives between strings)
                     loop {
                         self.skip_whitespace_and_comments();
+                        // Skip # <num> "file" line directives that appear between strings
+                        if self.peek() == Some(b'#') && self.col == 1 {
+                            let saved = self.pos;
+                            let saved_line = self.line;
+                            let saved_col = self.col;
+                            let saved_file = self.file.clone();
+                            self.advance(); // skip #
+                            self.skip_whitespace_and_comments();
+                            if self.peek().is_some_and(|c| c.is_ascii_digit()) {
+                                // Line directive — process it
+                                let mut line_str = String::new();
+                                while self.peek().is_some_and(|c| c.is_ascii_digit()) {
+                                    line_str.push(self.advance() as char);
+                                }
+                                if let Ok(line) = line_str.parse::<u32>() {
+                                    self.line = line;
+                                }
+                                self.skip_whitespace_and_comments();
+                                if self.peek() == Some(b'"') {
+                                    self.advance();
+                                    let mut fname = String::new();
+                                    while self.peek().is_some_and(|c| c != b'"') {
+                                        fname.push(self.advance() as char);
+                                    }
+                                    if self.peek() == Some(b'"') { self.advance(); }
+                                    self.file = fname;
+                                }
+                                while self.peek().is_some_and(|c| c != b'\n') { self.advance(); }
+                                continue; // retry concatenation after directive
+                            } else {
+                                // Not a line directive — restore position
+                                self.pos = saved;
+                                self.line = saved_line;
+                                self.col = saved_col;
+                                self.file = saved_file;
+                            }
+                        }
                         if self.peek() == Some(b'"') {
                             s.extend(self.read_string_lit());
                         } else {
@@ -387,6 +423,7 @@ impl<'a> Lexer<'a> {
                         "__alignof" | "__alignof__" | "_Alignof" => TokenKind::Alignof,
                         "_Alignas" => TokenKind::Alignas,
                         "__int128" | "__int128_t" => TokenKind::Int128,
+                        "_Float16" => TokenKind::Float, // treat as float
                         // L"..." wide strings - treat as regular strings for now
                         "L" if self.peek() == Some(b'"') => {
                             let s = self.read_string_lit();
@@ -395,7 +432,11 @@ impl<'a> Lexer<'a> {
                         "L" if self.peek() == Some(b'\'') => {
                             TokenKind::CharLit(self.read_char_lit())
                         }
-                        _ if ident.starts_with("__builtin_") => TokenKind::Builtin,
+                        "__builtin_offsetof" | "__builtin_expect" | "__builtin_constant_p"
+                        | "__builtin_choose_expr" | "__builtin_types_compatible_p"
+                        | "__builtin_frame_address" | "__builtin_return_address"
+                        | "__builtin_unreachable" | "__builtin_va_end"
+                        | "__builtin_va_start" | "__builtin_va_copy" => TokenKind::Builtin(ident),
                         _ => TokenKind::Ident(ident),
                     }
                 }
@@ -666,5 +707,18 @@ mod tests {
         let tokens = Lexer::new("int\nmain", "<test>").tokenize();
         assert_eq!(tokens[0].loc.line, 1);
         assert_eq!(tokens[1].loc.line, 2);
+    }
+
+    #[test]
+    fn string_concat_across_line_directive() {
+        // Line directives between adjacent strings must not break concatenation
+        let toks = kinds("\"hello\" \n# 5 \"other.c\"\n\"world\"");
+        assert_eq!(toks[0], TokenKind::StringLit(b"helloworld".to_vec()));
+    }
+
+    #[test]
+    fn octal_escape_in_string() {
+        let toks = kinds("\"\\0\\12\\101\"");
+        assert_eq!(toks[0], TokenKind::StringLit(vec![0, 10, 65])); // NUL, newline, 'A'
     }
 }

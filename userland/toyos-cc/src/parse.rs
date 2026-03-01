@@ -13,6 +13,10 @@ impl Parser {
         Self { tokens, pos: 0, type_env: TypeEnv::new() }
     }
 
+    pub fn eval_const_expr_static(expr: &Expr) -> Option<i64> {
+        Self::eval_const_expr(expr)
+    }
+
     fn eval_const_expr(expr: &Expr) -> Option<i64> {
         match expr {
             Expr::IntLit(v) => Some(*v as i64),
@@ -129,14 +133,17 @@ impl Parser {
         }
 
         // Otherwise it's a declaration
-        let mut declarators = vec![InitDeclarator {
-            declarator,
-            initializer: if self.eat(&TokenKind::Eq) { Some(self.initializer()) } else { None },
-        }];
+        let init = if self.eat(&TokenKind::Eq) { Some(self.initializer()) } else { None };
+        // Skip trailing __attribute__ and __asm("label") after each declarator
+        if matches!(self.peek(), TokenKind::Attribute) { self.parse_attributes(); }
+        self.skip_asm_label();
+        let mut declarators = vec![InitDeclarator { declarator, initializer: init }];
 
         while self.eat(&TokenKind::Comma) {
             let d = self.declarator();
             let init = if self.eat(&TokenKind::Eq) { Some(self.initializer()) } else { None };
+            if matches!(self.peek(), TokenKind::Attribute) { self.parse_attributes(); }
+            self.skip_asm_label();
             declarators.push(InitDeclarator { declarator: d, initializer: init });
         }
         self.expect(&TokenKind::Semi);
@@ -245,14 +252,11 @@ impl Parser {
                     specs.push(DeclSpecifier::TypeSpec(TypeSpec::TypedefName(name)));
                 }
 
-                // __builtin_ types
-                TokenKind::Builtin => {
-                    // Consume and treat as identifier
-                    let tok = self.tokens[self.pos].clone();
+                // __builtin_ types (e.g. __builtin_va_list)
+                TokenKind::Builtin(name) => {
+                    let name = name.clone();
                     self.advance();
-                    if let TokenKind::Ident(name) = &tok.kind {
-                        specs.push(DeclSpecifier::TypeSpec(TypeSpec::Builtin(name.clone())));
-                    }
+                    specs.push(DeclSpecifier::TypeSpec(TypeSpec::Builtin(name)));
                 }
 
                 _ => break,
@@ -382,19 +386,10 @@ impl Parser {
             while self.peek() != &TokenKind::RParen {
                 if let TokenKind::Ident(name) = self.peek().clone() {
                     self.advance();
-                    let args = if self.peek() == &TokenKind::LParen {
-                        self.advance();
-                        let mut a = Vec::new();
-                        while self.peek() != &TokenKind::RParen {
-                            a.push(self.conditional_expr());
-                            if !self.eat(&TokenKind::Comma) { break; }
-                        }
-                        self.expect(&TokenKind::RParen);
-                        a
-                    } else {
-                        Vec::new()
-                    };
-                    attrs.push(Attribute { name, args });
+                    if self.peek() == &TokenKind::LParen {
+                        self.skip_balanced_parens();
+                    }
+                    attrs.push(Attribute { name, args: Vec::new() });
                 } else {
                     self.advance(); // skip unknown
                 }
@@ -404,6 +399,28 @@ impl Parser {
             self.expect(&TokenKind::RParen);
         }
         attrs
+    }
+
+    /// Skip a balanced `(...)` group including nested parens.
+    fn skip_balanced_parens(&mut self) {
+        assert_eq!(self.peek(), &TokenKind::LParen);
+        self.advance();
+        let mut depth = 1u32;
+        while depth > 0 {
+            match self.peek() {
+                TokenKind::LParen => { depth += 1; self.advance(); }
+                TokenKind::RParen => { depth -= 1; self.advance(); }
+                _ => { self.advance(); }
+            }
+        }
+    }
+
+    /// Skip `__asm("symbol")` or `__asm__("symbol")` on declarations (GCC symbol renaming).
+    fn skip_asm_label(&mut self) {
+        if matches!(self.peek(), TokenKind::Asm) {
+            self.advance();
+            self.skip_balanced_parens();
+        }
     }
 
     // Declarator
@@ -446,7 +463,7 @@ impl Parser {
                     DirectDeclarator::Ident(String::new())
                 }
             }
-            TokenKind::Ident(s) => {
+            TokenKind::Ident(s) | TokenKind::Builtin(s) => {
                 let s = s.clone();
                 self.advance();
                 DirectDeclarator::Ident(s)
@@ -477,8 +494,9 @@ impl Parser {
             }
         }
 
-        // Skip trailing __attribute__
+        // Skip trailing __attribute__ and __asm("label")
         if matches!(self.peek(), TokenKind::Attribute) { self.parse_attributes(); }
+        self.skip_asm_label();
 
         dd
     }
@@ -787,8 +805,9 @@ impl Parser {
                 let d = self.declarator();
                 let init = if self.eat(&TokenKind::Eq) { Some(self.initializer()) } else { None };
                 declarators.push(InitDeclarator { declarator: d, initializer: init });
-                // Skip __attribute__
+                // Skip __attribute__ and __asm("label")
                 if matches!(self.peek(), TokenKind::Attribute) { self.parse_attributes(); }
+                self.skip_asm_label();
                 if !self.eat(&TokenKind::Comma) { break; }
             }
         }
@@ -1330,13 +1349,8 @@ impl Parser {
                     e
                 }
             }
-            TokenKind::Builtin => {
-                // Generic builtin handling - consume name and try to parse as function call
-                let name = if let TokenKind::Ident(s) = &self.tokens[self.pos].kind {
-                    s.clone()
-                } else {
-                    "__builtin_unknown".to_string()
-                };
+            TokenKind::Builtin(name) => {
+                let name = name.clone();
                 self.advance();
                 if self.peek() == &TokenKind::LParen {
                     self.advance();
@@ -1368,7 +1382,7 @@ mod tests {
     use crate::preprocess::Preprocessor;
 
     fn parse_str(src: &str) -> TranslationUnit {
-        let mut pp = Preprocessor::new(vec![], vec![]);
+        let mut pp = Preprocessor::new(vec![], vec![], None);
         let preprocessed = pp.preprocess(src, "<test>");
         let tokens = Lexer::new(&preprocessed, "<test>").tokenize();
         let parser = Parser::new(tokens);
@@ -1800,6 +1814,23 @@ mod tests {
         let f = parse_func("void f(void) { int x; x++; ++x; x--; --x; }");
         if let Statement::Compound(items) = &f.body {
             assert!(items.len() >= 5);
+        }
+    }
+
+    #[test]
+    fn function_pointer_typedef() {
+        let tu = parse_str("typedef int (*func_t)(int); func_t f;");
+        // Should parse: first a typedef, then a declaration using that typedef
+        assert!(tu.len() >= 2, "expected typedef + declaration, got {} items", tu.len());
+    }
+
+    #[test]
+    fn statement_expression() {
+        let f = parse_func("int f(void) { int x = ({ int y = 5; y + 1; }); return x; }");
+        if let Statement::Compound(items) = &f.body {
+            assert!(items.len() >= 2, "expected declaration + return, got {:?}", items);
+        } else {
+            panic!("expected compound statement");
         }
     }
 }

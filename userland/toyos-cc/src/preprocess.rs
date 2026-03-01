@@ -31,7 +31,7 @@ pub struct Preprocessor {
 }
 
 impl Preprocessor {
-    pub fn new(include_paths: Vec<PathBuf>, defines: Vec<(String, String)>) -> Self {
+    pub fn new(include_paths: Vec<PathBuf>, defines: Vec<(String, String)>, target: Option<&str>) -> Self {
         let mut pp = Self {
             macros: HashMap::new(),
             include_paths,
@@ -39,23 +39,94 @@ impl Preprocessor {
             expanding: HashSet::new(),
             file_stack: Vec::new(),
         };
-        // Predefined macros
+
+        // Determine target properties
+        let is_toyos = target.map_or(false, |t| t.contains("toyos"));
+        let is_macos = target.map_or(cfg!(target_os = "macos"), |t| t.contains("apple") || t.contains("darwin"));
+        let is_aarch64 = target.map_or(cfg!(target_arch = "aarch64"), |t| t.starts_with("aarch64"));
+
+        // Language standard and compiler identity
         pp.define_object("__STDC__", "1");
         pp.define_object("__STDC_VERSION__", "199901L");
-        pp.define_object("__x86_64__", "1");
-        pp.define_object("__x86_64", "1");
-        pp.define_object("__amd64__", "1");
-        pp.define_object("__amd64", "1");
+        // Claim GCC 4.0 compat — needed for system headers
+        pp.define_object("__GNUC__", "4");
+        pp.define_object("__GNUC_MINOR__", "0");
+        pp.define_object("__GNUC_PATCHLEVEL__", "0");
+
+        // Architecture
         pp.define_object("__LP64__", "1");
         pp.define_object("__SIZEOF_POINTER__", "8");
-        pp.define_object("__SIZEOF_LONG__", "8");
         pp.define_object("__SIZEOF_INT__", "4");
         pp.define_object("__SIZEOF_SHORT__", "2");
         pp.define_object("__CHAR_BIT__", "8");
-        pp.define_object("__TOYOS__", "1");
-        pp.define_object("__unix__", "1");
-        pp.define_object("__ELF__", "1");
+        if is_aarch64 {
+            pp.define_object("__aarch64__", "1");
+            pp.define_object("__arm64__", "1");
+            pp.define_object("__ARM_64BIT_STATE", "1");
+            pp.define_object("__SIZEOF_LONG__", "8");
+        } else {
+            pp.define_object("__x86_64__", "1");
+            pp.define_object("__x86_64", "1");
+            pp.define_object("__amd64__", "1");
+            pp.define_object("__amd64", "1");
+            pp.define_object("__SIZEOF_LONG__", "8");
+        }
+
+        // OS
+        if is_toyos {
+            pp.define_object("__TOYOS__", "1");
+            pp.define_object("__unix__", "1");
+            pp.define_object("__ELF__", "1");
+        } else if is_macos {
+            pp.define_object("__APPLE__", "1");
+            pp.define_object("__APPLE_CC__", "1");
+            pp.define_object("__MACH__", "1");
+        } else {
+            // Default to Linux-like
+            pp.define_object("__linux__", "1");
+            pp.define_object("__unix__", "1");
+            pp.define_object("__ELF__", "1");
+            pp.define_object("__gnu_linux__", "1");
+        }
+
         pp.define_object("NULL", "((void*)0)");
+
+        // GCC builtin type macros
+        pp.define_object("__SIZE_TYPE__", "unsigned long");
+        pp.define_object("__PTRDIFF_TYPE__", "long");
+        pp.define_object("__WCHAR_TYPE__", "int");
+        pp.define_object("__WINT_TYPE__", "int");
+        pp.define_object("__INT8_TYPE__", "signed char");
+        pp.define_object("__INT16_TYPE__", "short");
+        pp.define_object("__INT32_TYPE__", "int");
+        pp.define_object("__INT64_TYPE__", "long long");
+        pp.define_object("__UINT8_TYPE__", "unsigned char");
+        pp.define_object("__UINT16_TYPE__", "unsigned short");
+        pp.define_object("__UINT32_TYPE__", "unsigned int");
+        pp.define_object("__UINT64_TYPE__", "unsigned long long");
+        pp.define_object("__INTPTR_TYPE__", "long");
+        pp.define_object("__UINTPTR_TYPE__", "unsigned long");
+        pp.define_object("__INTMAX_TYPE__", "long");
+        pp.define_object("__UINTMAX_TYPE__", "unsigned long");
+
+        // GCC builtin constants
+        pp.define_object("__FLT_MIN__", "1.17549435e-38F");
+        pp.define_object("__FLT_MAX__", "3.40282347e+38F");
+        pp.define_object("__DBL_MIN__", "2.2250738585072014e-308");
+        pp.define_object("__DBL_MAX__", "1.7976931348623157e+308");
+        pp.define_object("__LDBL_MIN__", "2.2250738585072014e-308L");
+        pp.define_object("__LDBL_MAX__", "1.7976931348623157e+308L");
+        pp.define_object("__FLT_EPSILON__", "1.19209290e-7F");
+        pp.define_object("__DBL_EPSILON__", "2.2204460492503131e-16");
+
+        // GCC builtin functions as macros
+        pp.define_function("__builtin_inf", &[], "(1.0/0.0)");
+        pp.define_function("__builtin_inff", &[], "(1.0F/0.0F)");
+        pp.define_function("__builtin_infl", &[], "(1.0L/0.0L)");
+        pp.define_function("__builtin_fabs", &["x"], "((x)<0?-(x):(x))");
+        pp.define_function("__builtin_fabsf", &["x"], "((x)<0?-(x):(x))");
+        pp.define_function("__builtin_fabsl", &["x"], "((x)<0?-(x):(x))");
+
         // stdarg.h builtins
         pp.define_function("va_start", &["ap", "last"], "__builtin_va_start(ap, last)");
         pp.define_function("va_end", &["ap"], "__builtin_va_end(ap)");
@@ -514,6 +585,13 @@ impl Preprocessor {
     }
 
     fn expand_line(&mut self, line: &str) -> String {
+        // Update __FILE__ and __LINE__ before expansion
+        if let Some((file, line_num)) = self.file_stack.last() {
+            let file_val = format!("\"{}\"", file);
+            let line_val = line_num.to_string();
+            self.define_object("__FILE__", &file_val);
+            self.define_object("__LINE__", &line_val);
+        }
         let tokens = self.tokenize_pp(line);
         let expanded = self.expand_tokens(&tokens);
         self.tokens_to_string(&expanded)
@@ -531,6 +609,28 @@ impl Preprocessor {
                             self.expanding.insert(name.clone());
                             let expanded = self.expand_tokens(&body);
                             self.expanding.remove(name);
+                            // Check if expansion ends with a function-like macro name
+                            // whose arguments come from subsequent tokens in the stream
+                            if let Some(PPToken::Ident(last_name)) = expanded.last() {
+                                if matches!(self.macros.get(last_name), Some(Macro::Function(..)))
+                                    && !self.expanding.contains(last_name)
+                                {
+                                    let mut k = i + 1;
+                                    while k < tokens.len() && tokens[k] == PPToken::Whitespace { k += 1; }
+                                    if k < tokens.len() && tokens[k] == PPToken::Punct("(".to_string()) {
+                                        // Merge: emit everything except last token, then
+                                        // process func_name + remaining tokens together
+                                        let mut exp = expanded;
+                                        let func_tok = exp.pop().unwrap();
+                                        result.extend(exp);
+                                        let mut merged = vec![func_tok];
+                                        merged.extend_from_slice(&tokens[i+1..]);
+                                        let re_expanded = self.expand_tokens(&merged);
+                                        result.extend(re_expanded);
+                                        return result;
+                                    }
+                                }
+                            }
                             result.extend(expanded);
                             i += 1;
                         }
@@ -547,6 +647,26 @@ impl Preprocessor {
                                 self.expanding.insert(name.clone());
                                 let expanded = self.expand_tokens(&substituted);
                                 self.expanding.remove(name);
+                                // Check if expansion ends with a function-like macro name
+                                // whose arguments come from subsequent tokens
+                                if let Some(PPToken::Ident(last_name)) = expanded.last() {
+                                    if matches!(self.macros.get(last_name), Some(Macro::Function(..)))
+                                        && !self.expanding.contains(last_name)
+                                    {
+                                        let mut k = j;
+                                        while k < tokens.len() && tokens[k] == PPToken::Whitespace { k += 1; }
+                                        if k < tokens.len() && tokens[k] == PPToken::Punct("(".to_string()) {
+                                            let mut exp = expanded;
+                                            let func_tok = exp.pop().unwrap();
+                                            result.extend(exp);
+                                            let mut merged = vec![func_tok];
+                                            merged.extend_from_slice(&tokens[j..]);
+                                            let re_expanded = self.expand_tokens(&merged);
+                                            result.extend(re_expanded);
+                                            return result;
+                                        }
+                                    }
+                                }
                                 result.extend(expanded);
                                 i = j;
                             } else {
@@ -697,11 +817,45 @@ impl Preprocessor {
     }
 
     fn eval_constant_expr(&mut self, expr: &str) -> i64 {
-        // First expand macros
-        let expanded = self.expand_line(expr);
+        // Replace defined(X) and defined X with 0 or 1 BEFORE macro expansion
+        let with_defined = self.replace_defined(expr);
+        // Then expand macros
+        let expanded = self.expand_line(&with_defined);
         // Then evaluate
         let mut eval = ConstEval::new(&expanded);
         eval.expr()
+    }
+
+    fn replace_defined(&self, expr: &str) -> String {
+        let mut result = String::new();
+        let bytes = expr.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if i + 7 <= bytes.len() && &bytes[i..i+7] == b"defined" {
+                let before_ok = i == 0 || !bytes[i-1].is_ascii_alphanumeric() && bytes[i-1] != b'_';
+                let after_ok = i + 7 >= bytes.len() || !bytes[i+7].is_ascii_alphanumeric() && bytes[i+7] != b'_';
+                if before_ok && after_ok {
+                    i += 7;
+                    // skip whitespace
+                    while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') { i += 1; }
+                    let has_paren = i < bytes.len() && bytes[i] == b'(';
+                    if has_paren { i += 1; }
+                    while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') { i += 1; }
+                    let name_start = i;
+                    while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') { i += 1; }
+                    let name = std::str::from_utf8(&bytes[name_start..i]).unwrap_or("");
+                    if has_paren {
+                        while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') { i += 1; }
+                        if i < bytes.len() && bytes[i] == b')' { i += 1; }
+                    }
+                    result.push_str(if self.macros.contains_key(name) { "1" } else { "0" });
+                    continue;
+                }
+            }
+            result.push(bytes[i] as char);
+            i += 1;
+        }
+        result
     }
 }
 
@@ -1040,7 +1194,7 @@ mod tests {
     use super::*;
 
     fn pp(src: &str) -> String {
-        let mut p = Preprocessor::new(vec![], vec![]);
+        let mut p = Preprocessor::new(vec![], vec![], None);
         p.preprocess(src, "<test>")
     }
 
@@ -1117,16 +1271,47 @@ mod tests {
     }
 
     #[test]
-    fn predefined_macros() {
+    fn predefined_macros_common() {
         assert_eq!(pp_clean("__STDC__"), "1");
-        assert_eq!(pp_clean("__x86_64__"), "1");
-        assert_eq!(pp_clean("__TOYOS__"), "1");
-        assert_eq!(pp_clean("__ELF__"), "1");
+        assert_eq!(pp_clean("__GNUC__"), "4");
+        assert_eq!(pp_clean("__SIZE_TYPE__"), "unsigned long");
+    }
+
+    #[test]
+    fn predefined_macros_toyos() {
+        let mut p = Preprocessor::new(vec![], vec![], Some("x86_64-unknown-toyos"));
+        let out = p.preprocess("__TOYOS__ __ELF__ __x86_64__ __unix__", "<test>");
+        let clean: String = out.lines().filter(|l| !l.starts_with('#')).collect::<Vec<_>>().join("\n").trim().to_string();
+        assert_eq!(clean, "1 1 1 1");
+    }
+
+    #[test]
+    fn predefined_macros_linux() {
+        let mut p = Preprocessor::new(vec![], vec![], Some("x86_64-unknown-linux-gnu"));
+        let out = p.preprocess("__linux__ __ELF__ __x86_64__ __unix__", "<test>");
+        let clean: String = out.lines().filter(|l| !l.starts_with('#')).collect::<Vec<_>>().join("\n").trim().to_string();
+        assert_eq!(clean, "1 1 1 1");
+    }
+
+    #[test]
+    fn predefined_macros_macos_x86() {
+        let mut p = Preprocessor::new(vec![], vec![], Some("x86_64-apple-darwin"));
+        let out = p.preprocess("__APPLE__ __MACH__ __x86_64__", "<test>");
+        let clean: String = out.lines().filter(|l| !l.starts_with('#')).collect::<Vec<_>>().join("\n").trim().to_string();
+        assert_eq!(clean, "1 1 1");
+    }
+
+    #[test]
+    fn predefined_macros_macos_arm() {
+        let mut p = Preprocessor::new(vec![], vec![], Some("aarch64-apple-darwin"));
+        let out = p.preprocess("__APPLE__ __MACH__ __aarch64__", "<test>");
+        let clean: String = out.lines().filter(|l| !l.starts_with('#')).collect::<Vec<_>>().join("\n").trim().to_string();
+        assert_eq!(clean, "1 1 1");
     }
 
     #[test]
     fn user_defines() {
-        let mut p = Preprocessor::new(vec![], vec![("MY_DEF".into(), "99".into())]);
+        let mut p = Preprocessor::new(vec![], vec![("MY_DEF".into(), "99".into())], None);
         let out = p.preprocess("int x = MY_DEF;", "<test>");
         let clean: String = out.lines()
             .filter(|l| !l.starts_with('#'))
@@ -1287,5 +1472,49 @@ mod tests {
         // #if/#else/#endif inside a multi-line function call
         let out = pp_clean("#define BIG 1\nfoo(\n#if BIG\n42\n#else\n0\n#endif\n)");
         assert_eq!(out, "foo( 42 )");
+    }
+
+    #[test]
+    fn object_macro_alias_to_function() {
+        // Object macro expands to function-like macro name, args come from remaining tokens
+        let out = pp_clean("#define INNER(x) x+1\n#define ALIAS INNER\nALIAS(5)");
+        assert_eq!(out, "5+1");
+    }
+
+    #[test]
+    fn file_macro() {
+        let out = pp_clean("__FILE__");
+        assert_eq!(out, "\"<test>\"");
+    }
+
+    #[test]
+    fn line_macro() {
+        let out = pp_clean("__LINE__");
+        assert_eq!(out, "1");
+        // Second line
+        let out = pp_clean("\n__LINE__");
+        assert_eq!(out, "2");
+    }
+
+    #[test]
+    fn function_macro_result_alias() {
+        // ELFW pattern: function-like macro expands to another function-like macro name
+        let out = pp_clean("#define ELFW(x) ELF64_##x\n#define ELF64_SYM(i) ((i)>>32)\nELFW(SYM)(val)");
+        assert_eq!(out, "((val)>>32)");
+    }
+
+    #[test]
+    fn double_use_same_macro() {
+        // Same macro used twice in one line — expanding set must not block the second use
+        let out = pp_clean("#define T int\nT x; T y;");
+        assert_eq!(out, "int x; int y;");
+    }
+
+    #[test]
+    fn defined_operator_in_if() {
+        let out = pp_clean("#define FOO\n#if defined(FOO)\nyes\n#else\nno\n#endif");
+        assert_eq!(out, "yes");
+        let out = pp_clean("#if defined(BAR)\nyes\n#else\nno\n#endif");
+        assert_eq!(out, "no");
     }
 }

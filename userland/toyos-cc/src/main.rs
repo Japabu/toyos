@@ -19,7 +19,7 @@ fn main() {
         });
 
         // Preprocess
-        let mut pp = preprocess::Preprocessor::new(args.include_paths.clone(), args.defines.clone());
+        let mut pp = preprocess::Preprocessor::new(args.include_paths.clone(), args.defines.clone(), args.target.as_deref());
         let preprocessed = pp.preprocess(&source, &input.to_string_lossy());
 
         if args.preprocess_only {
@@ -66,17 +66,20 @@ fn main() {
                 process::exit(1);
             });
 
-            // Link with toyos-ld (or system linker)
-            let linker = env::var("CC_LINKER").unwrap_or_else(|_| "toyos-ld".to_string());
-            let status = process::Command::new(&linker)
-                .arg("-o")
-                .arg(&output_path)
-                .arg(&tmp_obj)
-                .status()
-                .unwrap_or_else(|e| {
-                    eprintln!("toyos-cc: cannot run linker '{}': {e}", linker);
-                    process::exit(1);
-                });
+            let is_toyos = args.target.as_deref().map_or(false, |t| t.contains("toyos"));
+            let mut cmd = if is_toyos {
+                let mut c = process::Command::new("toyos-ld");
+                c.arg("-o").arg(&output_path).arg(&tmp_obj);
+                c
+            } else {
+                let mut c = process::Command::new("cc");
+                c.arg("-o").arg(&output_path).arg(&tmp_obj);
+                c
+            };
+            let status = cmd.status().unwrap_or_else(|e| {
+                eprintln!("toyos-cc: cannot run linker: {e}");
+                process::exit(1);
+            });
 
             let _ = fs::remove_file(&tmp_obj);
 
