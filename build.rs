@@ -2,6 +2,7 @@
 
 // Allow dead code in triple.rs and targets.rs for our purposes here.
 #![allow(dead_code)]
+#![allow(unexpected_cfgs)]
 
 use std::env;
 use std::fs::File;

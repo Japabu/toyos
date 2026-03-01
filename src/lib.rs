@@ -15,6 +15,7 @@
         clippy::use_self,
     )
 )]
+#![allow(unexpected_cfgs)]
 #![cfg_attr(not(feature = "std"), no_std)]
 
 #[cfg(not(feature = "std"))]
