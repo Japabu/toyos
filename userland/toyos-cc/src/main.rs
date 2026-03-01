@@ -1,13 +1,13 @@
 #[macro_use]
 mod verbose;
-#[allow(dead_code)]
+#[allow(dead_code)] // AST grammar: fields parsed but not all consumed by codegen yet
 mod ast;
 mod codegen;
 mod emit;
 mod lex;
 mod parse;
 mod preprocess;
-#[allow(dead_code)]
+#[allow(dead_code)] // type model: methods defined for completeness
 mod types;
 
 use std::path::PathBuf;

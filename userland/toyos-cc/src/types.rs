@@ -87,17 +87,18 @@ impl CType {
         }
     }
 
-    pub fn is_integer(&self) -> bool {
-        matches!(self, CType::Bool | CType::Char(_) | CType::Short(_) | CType::Int(_)
-            | CType::Long(_) | CType::LongLong(_) | CType::Int128(_) | CType::Enum(_))
+    pub fn is_unsigned(&self) -> bool {
+        match self {
+            CType::Bool => true,
+            CType::Char(signed) | CType::Short(signed) | CType::Int(signed)
+            | CType::Long(signed) | CType::LongLong(signed) | CType::Int128(signed) => !signed,
+            CType::Pointer(_) => true,
+            _ => false,
+        }
     }
 
     pub fn is_float(&self) -> bool {
         matches!(self, CType::Float | CType::Double | CType::LongDouble)
-    }
-
-    pub fn is_arithmetic(&self) -> bool {
-        self.is_integer() || self.is_float()
     }
 
     pub fn is_pointer(&self) -> bool {
@@ -113,13 +114,6 @@ impl CType {
         }
     }
 
-    pub fn pointee(&self) -> &CType {
-        match self {
-            CType::Pointer(inner) => inner,
-            _ => panic!("not a pointer type"),
-        }
-    }
-
     fn struct_size(&self, def: &StructDef) -> usize {
         let mut offset = 0usize;
         for field in &def.fields {
@@ -128,6 +122,10 @@ impl CType {
                 let align = if def.packed { 1 } else { field.ty.align() };
                 offset = (offset + align - 1) & !(align - 1);
                 offset += field.ty.size();
+                continue;
+            }
+            // Flexible array member (incomplete array at end of struct) has size 0
+            if matches!(&field.ty, CType::Array(_, None)) {
                 continue;
             }
             let align = if def.packed { 1 } else { field.ty.align() };
@@ -188,6 +186,53 @@ impl CType {
             }
         }
         None
+    }
+
+    /// Look up a field's bitfield width (None if not a bitfield or field not found).
+    pub fn field_bit_width(&self, name: &str) -> Option<u32> {
+        let def = match self {
+            CType::Struct(def) | CType::Union(def) => def,
+            _ => return None,
+        };
+        for field in &def.fields {
+            if field.name.as_deref() == Some(name) {
+                return field.bit_width;
+            }
+            // Anonymous struct/union - search inside
+            if field.name.is_none() {
+                if let Some(w) = field.ty.field_bit_width(name) {
+                    return Some(w);
+                }
+            }
+        }
+        None
+    }
+
+    /// Apply C integer promotion for a type, considering bitfield width if provided.
+    /// Per C99 6.3.1.1: if int can represent all values, promote to int; else unsigned int.
+    pub fn promote_integer(ty: CType, bit_width: Option<u32>) -> CType {
+        if let Some(w) = bit_width {
+            // Bitfield promotion: width determines result type
+            if w == 0 { return ty; }
+            if w < 32 { return CType::Int(true); }  // fits in int
+            if w == 32 { return CType::Int(false); } // unsigned int
+            return ty; // > 32 bits: keep original type
+        }
+        // Non-bitfield integer promotion: small types promote to int
+        match ty {
+            CType::Char(_) | CType::Short(_) | CType::Bool => CType::Int(true),
+            _ => ty,
+        }
+    }
+
+    /// Number of scalar initializer values consumed by flat/brace-elided initialization.
+    pub fn flat_init_count(&self) -> usize {
+        match self {
+            CType::Array(elem, Some(n)) => elem.flat_init_count() * n,
+            CType::Struct(def) => def.fields.iter().map(|f| f.ty.flat_init_count()).sum(),
+            CType::Union(def) => def.fields.first().map(|f| f.ty.flat_init_count()).unwrap_or(1),
+            _ => 1,
+        }
     }
 
     /// Integer promotion (C99 6.3.1.1)

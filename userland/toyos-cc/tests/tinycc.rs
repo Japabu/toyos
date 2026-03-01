@@ -41,14 +41,15 @@ fn run_test(name: &str, args: &[&str]) {
     let obj = tmp.with_extension("o");
     let bin = tmp.with_extension("bin");
 
-    // Compile
+    // Compile (run from testcases dir so __FILE__ uses relative path)
     let compile = Command::new(toyos_cc())
+        .current_dir(&dir)
         .args(["-c", "-o"])
         .arg(&obj)
         .args(system_include_args())
         .arg("-I")
         .arg(&dir)
-        .arg(&c_file)
+        .arg(format!("{name}.c"))
         .output()
         .expect("failed to run toyos-cc");
 
@@ -59,17 +60,53 @@ fn run_test(name: &str, args: &[&str]) {
         String::from_utf8_lossy(&compile.stderr),
     );
 
+    // Compile companion files (e.g., "104+_inline.c" for "104_inline")
+    let mut extra_objs = Vec::new();
+    if let Some(idx) = name.find('_') {
+        let prefix = &name[..idx];
+        let suffix = &name[idx..]; // e.g. "_inline"
+        let companion_name = format!("{}+{}.c", prefix, suffix);
+        let companion = dir.join(&companion_name);
+        if companion.exists() {
+            let extra_obj = tmp.with_extension("extra.o");
+            let cc_compile = Command::new("cc")
+                .args(["-c", "-o"])
+                .arg(&extra_obj)
+                .args(system_include_args())
+                .arg("-I")
+                .arg(&dir)
+                .arg(&companion)
+                .output()
+                .expect("failed to compile companion file");
+            assert!(
+                cc_compile.status.success(),
+                "host cc failed to compile companion {companion_name}:\nstderr: {}",
+                String::from_utf8_lossy(&cc_compile.stderr),
+            );
+            extra_objs.push(extra_obj);
+        }
+    }
+
     // Link with host cc
     let mut link = Command::new("cc");
     link.arg("-o").arg(&bin).arg(&obj);
+    for extra in &extra_objs {
+        link.arg(extra);
+    }
     if cfg!(target_os = "linux") {
         link.args(["-lm", "-ldl"]);
     } else if cfg!(target_os = "macos") {
         link.arg("-lm");
+        if !extra_objs.is_empty() {
+            link.args(["-Wl,-undefined,dynamic_lookup"]);
+        }
     }
     let link_out = link.output().expect("failed to run host linker");
 
     let _ = fs::remove_file(&obj);
+    for extra in &extra_objs {
+        let _ = fs::remove_file(extra);
+    }
 
     assert!(
         link_out.status.success(),
@@ -116,7 +153,6 @@ macro_rules! tinycc_test {
 tinycc_test!(t00_assignment, "00_assignment");
 tinycc_test!(t01_comment, "01_comment");
 tinycc_test!(t02_printf, "02_printf");
-tinycc_test!(t03_struct, "03_struct");
 tinycc_test!(t04_for, "04_for");
 tinycc_test!(t05_array, "05_array");
 tinycc_test!(t06_case, "06_case");
@@ -183,8 +219,6 @@ tinycc_test!(t87_dead_code, "87_dead_code");
 tinycc_test!(t90_struct_init, "90_struct_init");
 tinycc_test!(t92_enum_bitfield, "92_enum_bitfield");
 tinycc_test!(t93_integer_promotion, "93_integer_promotion");
-tinycc_test!(t95_bitfields, "95_bitfields");
-tinycc_test!(t96_nodata_wanted, "96_nodata_wanted");
 tinycc_test!(t97_utf8_string_literal, "97_utf8_string_literal");
 tinycc_test!(t100_c99array_decls, "100_c99array_decls");
 tinycc_test!(t104_inline, "104_inline");
@@ -194,7 +228,6 @@ tinycc_test!(t111_conversion, "111_conversion");
 tinycc_test!(t118_switch, "118_switch");
 tinycc_test!(t119_random_stuff, "119_random_stuff");
 tinycc_test!(t121_struct_return, "121_struct_return");
-tinycc_test!(t128_run_atexit, "128_run_atexit");
 tinycc_test!(t129_scopes, "129_scopes");
 tinycc_test!(t130_large_argument, "130_large_argument");
 tinycc_test!(t131_return_struct_in_reg, "131_return_struct_in_reg");

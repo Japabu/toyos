@@ -41,6 +41,7 @@ pub struct InitializerItem {
 pub enum Designator {
     Field(String),
     Index(Box<Expr>),
+    IndexRange(Box<Expr>, Box<Expr>),
 }
 
 // Declaration specifiers
@@ -197,6 +198,7 @@ pub enum Statement {
     For(Option<Box<ForInit>>, Option<Box<Expr>>, Option<Box<Expr>>, Box<Statement>),
     Switch(Box<Expr>, Box<Statement>),
     Case(Box<Expr>, Box<Statement>),
+    CaseRange(Box<Expr>, Box<Expr>, Box<Statement>),
     Default(Box<Statement>),
     Break,
     Continue,
@@ -238,9 +240,10 @@ pub struct AsmOperand {
 pub enum Expr {
     IntLit(i128),
     UIntLit(u128),
-    FloatLit(f64),
+    FloatLit(f64, bool), // (value, is_float_suffix)
     CharLit(i8),
     StringLit(Vec<u8>),
+    WideStringLit(Vec<u8>),
     Ident(String),
     Binary(BinOp, Box<Expr>, Box<Expr>),
     Unary(UnaryOp, Box<Expr>),
@@ -258,14 +261,7 @@ pub enum Expr {
     CompoundLiteral(Box<TypeName>, Vec<InitializerItem>),
     StmtExpr(Vec<BlockItem>),
     VaArg(Box<Expr>, Box<TypeName>),
-    Offsetof(Box<TypeName>, Vec<OffsetofField>),
     Builtin(String, Vec<Expr>),
-}
-
-#[derive(Debug, Clone)]
-pub enum OffsetofField {
-    Field(String),
-    Index(Box<Expr>),
 }
 
 #[derive(Debug, Clone)]
@@ -302,4 +298,45 @@ pub enum AssignOp {
     AddAssign, SubAssign,
     ShlAssign, ShrAssign,
     AndAssign, XorAssign, OrAssign,
+}
+
+pub fn eval_const_expr(expr: &Expr, enums: Option<&std::collections::HashMap<String, i64>>) -> Option<i64> {
+    match expr {
+        Expr::IntLit(v) => Some(*v as i64),
+        Expr::UIntLit(v) => Some(*v as i64),
+        Expr::CharLit(v) => Some(*v as i64),
+        Expr::Ident(name) => enums?.get(name).copied(),
+        Expr::Unary(UnaryOp::Neg, e) => eval_const_expr(e, enums).map(|v| -v),
+        Expr::Unary(UnaryOp::BitNot, e) => eval_const_expr(e, enums).map(|v| !v),
+        Expr::Binary(op, l, r) => {
+            let l = eval_const_expr(l, enums)?;
+            let r = eval_const_expr(r, enums)?;
+            Some(match op {
+                BinOp::Add => l + r,
+                BinOp::Sub => l - r,
+                BinOp::Mul => l * r,
+                BinOp::Div => if r != 0 { l / r } else { 0 },
+                BinOp::Mod => if r != 0 { l % r } else { 0 },
+                BinOp::Shl => l << r,
+                BinOp::Shr => l >> r,
+                BinOp::BitAnd => l & r,
+                BinOp::BitOr => l | r,
+                BinOp::BitXor => l ^ r,
+                BinOp::Eq => (l == r) as i64,
+                BinOp::Ne => (l != r) as i64,
+                BinOp::Lt => (l < r) as i64,
+                BinOp::Gt => (l > r) as i64,
+                BinOp::Le => (l <= r) as i64,
+                BinOp::Ge => (l >= r) as i64,
+                BinOp::LogAnd => ((l != 0) && (r != 0)) as i64,
+                BinOp::LogOr => ((l != 0) || (r != 0)) as i64,
+            })
+        }
+        Expr::Conditional(cond, then, els) => {
+            let c = eval_const_expr(cond, enums)?;
+            if c != 0 { eval_const_expr(then, enums) } else { eval_const_expr(els, enums) }
+        }
+        Expr::Cast(_, e) => eval_const_expr(e, enums),
+        _ => None,
+    }
 }

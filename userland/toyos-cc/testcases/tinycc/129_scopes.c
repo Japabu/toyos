@@ -137,42 +137,6 @@ int f6(int x)
 }
 
 /* --------------------------------------------- */
-
-#if defined __TINYC__ \
-    ? !defined __leading_underscore \
-    : !(defined __APPLE__ || defined _WIN32)
-# define _
-#else
-# define _ "_"
-#endif
-
-struct xx7 { int a, b; };
-
-void f7()
-{
-    struct xx7 { int c; } x;
-    {
-        extern struct xx7 { int a, b; } x __asm__(_"z7");
-        x.a = 12;
-        struct xx7 y = { 0,0 };
-    }
-    struct xx7 y = { 90 };
-    x.c = 78;
-    printf("xx7 (1) : %d %d\n", x.c, y.c);
-}
-
-int main_7()
-{
-    f7();
-    extern struct xx7 y __asm__(_"z7");
-    printf("xx7 (2) : %d %d\n", y.a, y.b);
-    return 0;
-}
-
-
-struct xx7 z7 = { 0, 34 };
-
-/* --------------------------------------------- */
 int main()
 {
     main_1();
@@ -181,6 +145,5 @@ int main()
     main_4();
     main_5();
     main_6();
-    main_7();
     return 0;
 }

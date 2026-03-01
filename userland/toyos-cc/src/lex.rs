@@ -18,9 +18,10 @@ pub enum TokenKind {
     // Literals
     IntLit(i128),
     UIntLit(u128),
-    FloatLit(f64),
+    FloatLit(f64, bool), // (value, is_float_suffix)
     CharLit(i8),
     StringLit(Vec<u8>),
+    WideStringLit(Vec<u8>),
 
     // Identifier
     Ident(String),
@@ -59,7 +60,7 @@ impl fmt::Display for TokenKind {
         match self {
             TokenKind::IntLit(v) => write!(f, "{v}"),
             TokenKind::UIntLit(v) => write!(f, "{v}u"),
-            TokenKind::FloatLit(v) => write!(f, "{v}"),
+            TokenKind::FloatLit(v, _) => write!(f, "{v}"),
             TokenKind::CharLit(v) => write!(f, "'{}'", *v as u8 as char),
             TokenKind::StringLit(_) => write!(f, "<string>"),
             TokenKind::Ident(s) => write!(f, "{s}"),
@@ -146,7 +147,7 @@ impl<'a> Lexer<'a> {
     fn read_ident(&mut self) -> String {
         let mut ident = String::new();
         loop {
-            if self.peek().is_some_and(|c| c.is_ascii_alphanumeric() || c == b'_') {
+            if self.peek().is_some_and(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'$') {
                 ident.push(self.advance() as char);
             } else if self.peek() == Some(b'\\') && self.peek2() == Some(b'\n') {
                 // Line continuation mid-identifier
@@ -162,12 +163,31 @@ impl<'a> Lexer<'a> {
         let start = self.pos;
         let mut is_float = false;
         let mut is_hex = false;
+        let mut is_binary = false;
 
         // Hex prefix
         if self.peek() == Some(b'0') && self.peek2().is_some_and(|c| c == b'x' || c == b'X') {
             self.advance(); self.advance();
             is_hex = true;
             while self.peek().is_some_and(|c| c.is_ascii_hexdigit()) { self.advance(); }
+            // Hex float: 0x1.2p3
+            if self.peek() == Some(b'.') {
+                is_float = true;
+                self.advance();
+                while self.peek().is_some_and(|c| c.is_ascii_hexdigit()) { self.advance(); }
+            }
+            if self.peek().is_some_and(|c| c == b'p' || c == b'P') {
+                is_float = true;
+                self.advance();
+                if self.peek().is_some_and(|c| c == b'+' || c == b'-') { self.advance(); }
+                while self.peek().is_some_and(|c| c.is_ascii_digit()) { self.advance(); }
+            }
+        }
+        // Binary prefix
+        else if self.peek() == Some(b'0') && self.peek2().is_some_and(|c| c == b'b' || c == b'B') {
+            self.advance(); self.advance();
+            is_binary = true;
+            while self.peek().is_some_and(|c| c == b'0' || c == b'1') { self.advance(); }
         }
         // Octal or decimal
         else {
@@ -189,32 +209,40 @@ impl<'a> Lexer<'a> {
 
         // Suffixes
         let mut unsigned = false;
-        let mut long_count = 0u8;
         let mut float_suffix = false;
         loop {
             match self.peek() {
                 Some(b'u' | b'U') => { unsigned = true; self.advance(); }
-                Some(b'l' | b'L') => { long_count += 1; self.advance(); }
+                Some(b'l' | b'L') => { self.advance(); }
                 Some(b'f' | b'F') => { float_suffix = true; self.advance(); }
                 _ => break,
             }
         }
 
         if is_float || float_suffix {
-            let v: f64 = text.parse().unwrap_or(0.0);
-            return TokenKind::FloatLit(v);
+            let v: f64 = if is_hex {
+                // Parse hex float like 0x1.921fb6p+1
+                parse_hex_float(&text)
+            } else {
+                text.parse().unwrap_or(0.0)
+            };
+            let v = if float_suffix { (v as f32) as f64 } else { v };
+            return TokenKind::FloatLit(v, float_suffix);
         }
 
         let value = if is_hex {
             let hex_str = &text[2..]; // skip "0x"
             u128::from_str_radix(hex_str, 16).unwrap_or(0)
+        } else if is_binary {
+            let bin_str = &text[2..]; // skip "0b"
+            u128::from_str_radix(bin_str, 2).unwrap_or(0)
         } else if text.starts_with('0') && text.len() > 1 {
             u128::from_str_radix(&text, 8).unwrap_or(0)
         } else {
             text.parse::<u128>().unwrap_or(0)
         };
 
-        if unsigned || long_count >= 2 {
+        if unsigned {
             TokenKind::UIntLit(value)
         } else {
             TokenKind::IntLit(value as i128)
@@ -240,11 +268,52 @@ impl<'a> Lexer<'a> {
         loop {
             match self.peek() {
                 None | Some(b'"') => { if self.peek().is_some() { self.advance(); } break; }
-                Some(b'\\') => { self.advance(); buf.push(self.read_escape()); }
+                Some(b'\\') => {
+                    self.advance();
+                    if self.peek() == Some(b'u') || self.peek() == Some(b'U') {
+                        let digits = if self.advance() == b'U' { 8 } else { 4 };
+                        let cp = self.read_hex_digits(digits);
+                        Self::encode_utf8(cp, &mut buf);
+                    } else {
+                        buf.push(self.read_escape());
+                    }
+                }
                 Some(_) => buf.push(self.advance()),
             }
         }
         buf
+    }
+
+    fn read_hex_digits(&mut self, count: usize) -> u32 {
+        let mut val = 0u32;
+        for _ in 0..count {
+            if self.peek().is_some_and(|c| c.is_ascii_hexdigit()) {
+                let d = self.advance();
+                let nibble = if d >= b'a' { (d - b'a' + 10) as u32 }
+                    else if d >= b'A' { (d - b'A' + 10) as u32 }
+                    else { (d - b'0') as u32 };
+                val = val * 16 + nibble;
+            }
+        }
+        val
+    }
+
+    fn encode_utf8(cp: u32, buf: &mut Vec<u8>) {
+        if cp < 0x80 {
+            buf.push(cp as u8);
+        } else if cp < 0x800 {
+            buf.push((0xC0 | (cp >> 6)) as u8);
+            buf.push((0x80 | (cp & 0x3F)) as u8);
+        } else if cp < 0x10000 {
+            buf.push((0xE0 | (cp >> 12)) as u8);
+            buf.push((0x80 | ((cp >> 6) & 0x3F)) as u8);
+            buf.push((0x80 | (cp & 0x3F)) as u8);
+        } else {
+            buf.push((0xF0 | (cp >> 18)) as u8);
+            buf.push((0x80 | ((cp >> 12) & 0x3F)) as u8);
+            buf.push((0x80 | ((cp >> 6) & 0x3F)) as u8);
+            buf.push((0x80 | (cp & 0x3F)) as u8);
+        }
     }
 
     fn read_escape(&mut self) -> u8 {
@@ -377,7 +446,7 @@ impl<'a> Lexer<'a> {
                 Some(c) if c.is_ascii_digit() => self.read_number(),
                 Some(b'.') if self.peek2().is_some_and(|c| c.is_ascii_digit()) => self.read_number(),
 
-                Some(c) if c.is_ascii_alphabetic() || c == b'_' => {
+                Some(c) if c.is_ascii_alphabetic() || c == b'_' || c == b'$' => {
                     let ident = self.read_ident();
                     match ident.as_str() {
                         "auto" => TokenKind::Auto,
@@ -424,14 +493,14 @@ impl<'a> Lexer<'a> {
                         "_Alignas" => TokenKind::Alignas,
                         "__int128" | "__int128_t" => TokenKind::Int128,
                         "_Float16" => TokenKind::Float, // treat as float
-                        // L"..." wide strings - treat as regular strings for now
                         "L" if self.peek() == Some(b'"') => {
                             let s = self.read_string_lit();
-                            TokenKind::StringLit(s)
+                            TokenKind::WideStringLit(s)
                         }
                         "L" if self.peek() == Some(b'\'') => {
                             TokenKind::CharLit(self.read_char_lit())
                         }
+                        "_Generic" => TokenKind::Builtin("_Generic".into()),
                         "__builtin_offsetof" | "__builtin_expect" | "__builtin_constant_p"
                         | "__builtin_choose_expr" | "__builtin_types_compatible_p"
                         | "__builtin_frame_address" | "__builtin_return_address"
@@ -534,4 +603,39 @@ impl<'a> Lexer<'a> {
         }
         tokens
     }
+}
+
+fn parse_hex_float(text: &str) -> f64 {
+    // Parse C hex float: 0x1.921fb6p+1
+    let s = &text[2..]; // skip "0x"
+    let (mantissa_str, exp_str) = if let Some(p) = s.find(|c: char| c == 'p' || c == 'P') {
+        (&s[..p], &s[p+1..])
+    } else {
+        (s, "0")
+    };
+    let exp: i32 = exp_str.parse().unwrap_or(0);
+    let (int_part, frac_part) = if let Some(dot) = mantissa_str.find('.') {
+        (&mantissa_str[..dot], &mantissa_str[dot+1..])
+    } else {
+        (mantissa_str, "")
+    };
+    // Handle arbitrarily large hex mantissas by parsing up to 16 significant digits
+    // and adjusting the exponent for any remaining digits.
+    let int_val = if int_part.len() <= 16 {
+        u64::from_str_radix(int_part, 16).unwrap_or(0) as f64
+    } else {
+        let significant = u64::from_str_radix(&int_part[..16], 16).unwrap_or(0) as f64;
+        let extra_digits = int_part.len() - 16;
+        significant * 16f64.powi(extra_digits as i32)
+    };
+    let frac_val = if frac_part.is_empty() {
+        0.0
+    } else if frac_part.len() <= 16 {
+        let frac_int = u64::from_str_radix(frac_part, 16).unwrap_or(0) as f64;
+        frac_int / 16f64.powi(frac_part.len() as i32)
+    } else {
+        let frac_int = u64::from_str_radix(&frac_part[..16], 16).unwrap_or(0) as f64;
+        frac_int / 16f64.powi(16)
+    };
+    (int_val + frac_val) * 2f64.powi(exp)
 }

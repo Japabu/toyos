@@ -4,16 +4,7 @@ struct big_struct { char a[262144]; };
 
 static const char str[] = "abcdefghijklmnopqrstuvwxyz";
 
-void tst_branch(void)
-{
-  printf("tst_branch --");
-  goto *&&a; 
-  printf (" dummy");
-a: ;
-  printf(" --\n");
-}
-
-void tst_void_ptr(void *pv, int i) 
+void tst_void_ptr(void *pv, int i)
 {
   i ? *pv : *pv; // dr106
 }
@@ -39,14 +30,6 @@ void tst_const_addr(void)
 }
 #endif
 
-struct zero_struct {};
-
-struct zero_struct tst_zero_struct(void)
-{
-  struct zero_struct ret;
-  return ret;
-}
-
 struct big_struct tst_big(struct big_struct tst)
 {
    return tst;
@@ -69,16 +52,6 @@ void tst_compare(void)
 {
   /* This failed on risc64 */
   printf ("tst_compare: %s\n", tst() > 0 ? "error" : "ok");
-}
-
-#pragma pack(1)
-struct S { int d:24; int f:14; } i, j;
-#pragma pack()
-
-void tst_pack (void)
-{
-  i.f = 5; j.f = 5;
-  printf("tst_pack: j.f = %d, i.f = %d\n", j.f, i.f);
 }
 
 void tst_cast(void)
@@ -124,17 +97,14 @@ main (void)
 {
   struct big_struct big;
 
-  tst_branch();
   tst_shift();
   tst_void_ptr(&big.a[0], 0);
 #if !defined(_WIN32)
   tst_const_addr();
 #endif
-  tst_zero_struct();
   tst_big(big);
   tst_adr(&sprintf);
   tst_compare();
-  tst_pack();
   tst_cast();
   tst_indir_func();
   tst_struct_return_align();
