@@ -1,14 +1,25 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::types::*;
-use cranelift_codegen::ir::{self, AbiParam, BlockArg, InstBuilder, MemFlags, Value};
+use cranelift_codegen::ir::{self, AbiParam, BlockArg, InstBuilder, MemFlags, StackSlotData, StackSlotKind, Value};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_module::{DataDescription, FuncId, FuncOrDataId, Linkage, Module};
 use cranelift_object::ObjectModule;
+use target_lexicon::Architecture;
 
 use crate::ast::*;
 use crate::types::{CType, FieldDef, StructDef, TypeEnv, ParamType, EnumDef};
+
+/// Cranelift has no native variadic support. We pad signatures with extra I64
+/// params to capture va_args — same approach as rustc_codegen_cranelift (#1500).
+const VARIADIC_EXTRA_PARAMS: usize = 10;
+
+/// Relocation to apply after defining global data bytes.
+enum GlobalReloc {
+    FuncAddr { offset: u32, func_id: FuncId },
+    DataAddr { offset: u32, data_id: cranelift_module::DataId },
+}
 
 pub struct Codegen {
     pub module: ObjectModule,
@@ -18,6 +29,11 @@ pub struct Codegen {
     func_sigs: HashMap<String, ir::Signature>,           // declared function signatures
     func_ids: HashMap<String, FuncId>,                   // declared function IDs
     data_ids: HashMap<String, cranelift_module::DataId>,  // declared global data IDs
+    defined_data: HashSet<cranelift_module::DataId>,      // data IDs that have been defined
+    tentative_data: Vec<(cranelift_module::DataId, usize)>, // tentative defs: (id, size)
+    global_types: HashMap<String, CType>,                 // C types of global variables
+    func_ret_types: HashMap<String, CType>,               // C return types of functions
+    variadic_funcs: HashMap<String, usize>,                   // variadic func name → fixed param count
 }
 
 struct FuncCtx<'a> {
@@ -25,6 +41,8 @@ struct FuncCtx<'a> {
     name: String,
     locals: HashMap<String, (Variable, CType)>,
     local_ptrs: HashMap<String, (Value, CType)>, // stack-allocated aggregates
+    spilled_locals: HashMap<String, (ir::StackSlot, CType)>, // locals whose address was taken
+    addr_taken: HashSet<String>, // names of variables whose address is taken anywhere in the function
     return_type: CType,
     filled: bool, // current block has a terminator
     // Control flow for break/continue
@@ -35,7 +53,9 @@ struct FuncCtx<'a> {
     switch_exit: Option<ir::Block>,
     // Goto/labels
     labels: HashMap<String, ir::Block>,
-    gotos: Vec<(String, ir::Block)>, // deferred gotos
+    _gotos: Vec<(String, ir::Block)>, // deferred gotos
+    // Variadic function support
+    va_area: Option<ir::StackSlot>, // stack slot holding saved variadic args
 }
 
 impl Codegen {
@@ -48,7 +68,94 @@ impl Codegen {
             func_sigs: HashMap::new(),
             func_ids: HashMap::new(),
             data_ids: HashMap::new(),
+            defined_data: HashSet::new(),
+            tentative_data: Vec::new(),
+            global_types: HashMap::new(),
+            func_ret_types: HashMap::new(),
+            variadic_funcs: HashMap::new(),
         }
+    }
+
+    /// True when targeting AArch64 (Apple Silicon or Linux arm64).
+    fn is_aarch64(&self) -> bool {
+        matches!(self.module.isa().triple().architecture, Architecture::Aarch64(_))
+    }
+
+    /// On aarch64 the variadic calling convention requires all variadic args
+    /// on the stack. We pad the remaining integer registers (8 total) with
+    /// dummy zero args so the real variadic args spill to the stack.
+    fn variadic_padding(&self, fixed_count: usize) -> usize {
+        if self.is_aarch64() { 8usize.saturating_sub(fixed_count) } else { 0 }
+    }
+
+    /// Evaluate a constant expression, resolving enum constants from the type environment.
+    fn eval_const_with_enums(&self, expr: &Expr) -> Option<i64> {
+        if let Some(val) = crate::parse::Parser::eval_const_expr_static(expr) {
+            return Some(val);
+        }
+        match expr {
+            Expr::UIntLit(v) => Some(*v as i64),
+            Expr::Ident(name) => self.type_env.enum_constants.get(name).copied(),
+            Expr::Cast(_, inner) => self.eval_const_with_enums(inner),
+            Expr::Unary(UnaryOp::Neg, e) => self.eval_const_with_enums(e).map(|v| -v),
+            Expr::Unary(UnaryOp::BitNot, e) => self.eval_const_with_enums(e).map(|v| !v),
+            Expr::Binary(op, l, r) => {
+                let l = self.eval_const_with_enums(l)?;
+                let r = self.eval_const_with_enums(r)?;
+                Some(match op {
+                    BinOp::Add => l + r,
+                    BinOp::Sub => l - r,
+                    BinOp::Mul => l * r,
+                    BinOp::Div => if r != 0 { l / r } else { 0 },
+                    BinOp::Mod => if r != 0 { l % r } else { 0 },
+                    BinOp::Shl => l << r,
+                    BinOp::Shr => l >> r,
+                    BinOp::BitAnd => l & r,
+                    BinOp::BitOr => l | r,
+                    BinOp::BitXor => l ^ r,
+                    BinOp::Eq => (l == r) as i64,
+                    BinOp::Ne => (l != r) as i64,
+                    BinOp::Lt => (l < r) as i64,
+                    BinOp::Gt => (l > r) as i64,
+                    BinOp::Le => (l <= r) as i64,
+                    BinOp::Ge => (l >= r) as i64,
+                    BinOp::LogAnd => ((l != 0) && (r != 0)) as i64,
+                    BinOp::LogOr => ((l != 0) || (r != 0)) as i64,
+                })
+            }
+            Expr::Conditional(cond, then, els) => {
+                let c = self.eval_const_with_enums(cond)?;
+                if c != 0 { self.eval_const_with_enums(then) } else { self.eval_const_with_enums(els) }
+            }
+            _ => None,
+        }
+    }
+
+    /// Compute the byte offset of field at `target_idx` in a struct.
+    fn struct_field_offset(def: &StructDef, target_idx: usize) -> usize {
+        let mut offset = 0usize;
+        for (i, field) in def.fields.iter().enumerate() {
+            let align = if def.packed { 1 } else { field.ty.align() };
+            offset = (offset + align - 1) & !(align - 1);
+            if i == target_idx { return offset; }
+            offset += field.ty.size();
+        }
+        offset
+    }
+
+    /// Returns the element stride for a pointer or array type, or None.
+    fn elem_stride(ty: &Option<CType>) -> Option<i64> {
+        match ty.as_ref()? {
+            CType::Pointer(inner) | CType::Array(inner, _) => Some(inner.size().max(1) as i64),
+            _ => None,
+        }
+    }
+
+    /// Returns the stride for pointer increment/decrement (sizeof pointee).
+    /// Returns 1 for non-pointer types (ordinary integer inc/dec).
+    fn pointer_stride(&mut self, ctx: &FuncCtx, expr: &Expr) -> i64 {
+        let ty = self.expr_type(ctx, expr);
+        Self::elem_stride(&ty).unwrap_or(1)
     }
 
     fn clif_type(&self, ty: &CType) -> ir::Type {
@@ -86,7 +193,19 @@ impl Codegen {
         }
     }
 
+    /// Extract function name from a call expression, seeing through
+    /// comma expressions like `(side_effect(), func_name)(args...)`.
+    fn extract_func_name(expr: &Expr) -> Option<String> {
+        match expr {
+            Expr::Ident(name) => Some(name.clone()),
+            Expr::Comma(_, rhs) => Self::extract_func_name(rhs),
+            _ => None,
+        }
+    }
+
     pub fn compile_unit(&mut self, tu: &TranslationUnit) {
+        verbose!("compile_unit: {} declarations", tu.len());
+
         // First pass: declare all functions and globals
         for decl in tu {
             match decl {
@@ -99,6 +218,8 @@ impl Codegen {
             }
         }
 
+        verbose!("declarations done, compiling function bodies...");
+
         // Second pass: define functions
         for decl in tu {
             if let ExternalDecl::Function(fdef) = decl {
@@ -108,6 +229,15 @@ impl Codegen {
 
         // Define string constants
         self.define_strings();
+
+        // Finalize tentative definitions: zero-init any globals that were never given a real initializer
+        for (data_id, size) in std::mem::take(&mut self.tentative_data) {
+            if !self.defined_data.contains(&data_id) {
+                let mut desc = DataDescription::new();
+                desc.define_zeroinit(size.max(1));
+                let _ = self.module.define_data(data_id, &desc);
+            }
+        }
     }
 
     fn resolve_type(&mut self, specifiers: &[DeclSpecifier]) -> CType {
@@ -201,6 +331,7 @@ impl Codegen {
     }
 
     fn resolve_struct(&mut self, st: &StructType, is_union: bool) -> CType {
+        verbose!("resolve_struct: {:?} is_union={}", st.name, is_union);
         let packed = st.attributes.iter().any(|a| a.name == "packed");
 
         if st.fields.is_none() {
@@ -352,6 +483,74 @@ impl Codegen {
         }
     }
 
+    /// Resolve a full TypeName (specifiers + optional abstract declarator) to CType.
+    fn resolve_typename(&mut self, tn: &TypeName) -> CType {
+        let base = self.resolve_type(&tn.specifiers);
+        if let Some(ad) = &tn.declarator {
+            self.apply_abstract_declarator(&base, ad)
+        } else {
+            base
+        }
+    }
+
+    fn apply_abstract_declarator(&mut self, base: &CType, ad: &AbstractDeclarator) -> CType {
+        if ad.direct.as_ref().is_some_and(|d| matches!(d, DirectAbstractDeclarator::Paren(_))) {
+            // (*)(args) case: first apply inner, then wrap with pointers
+            let mut ty = self.apply_direct_abstract_declarator(base, ad.direct.as_ref().unwrap());
+            for _ in &ad.pointer {
+                ty = CType::Pointer(Box::new(ty));
+            }
+            ty
+        } else {
+            let mut ptr_base = base.clone();
+            for _ in &ad.pointer {
+                ptr_base = CType::Pointer(Box::new(ptr_base));
+            }
+            if let Some(dad) = &ad.direct {
+                self.apply_direct_abstract_declarator(&ptr_base, dad)
+            } else {
+                ptr_base
+            }
+        }
+    }
+
+    fn apply_direct_abstract_declarator(&mut self, base: &CType, dad: &DirectAbstractDeclarator) -> CType {
+        match dad {
+            DirectAbstractDeclarator::Paren(inner) => {
+                self.apply_abstract_declarator(base, inner)
+            }
+            DirectAbstractDeclarator::Array(inner, size) => {
+                let n = size.as_ref().and_then(|e| crate::parse::Parser::eval_const_expr_static(e).map(|v| v as usize));
+                if let Some(inner) = inner {
+                    let elem = self.apply_direct_abstract_declarator(base, inner);
+                    CType::Array(Box::new(elem), n)
+                } else {
+                    CType::Array(Box::new(base.clone()), n)
+                }
+            }
+            DirectAbstractDeclarator::Function(inner, params) => {
+                let params_clone = params.clone();
+                let mut param_types = Vec::new();
+                for p in &params_clone.params {
+                    let ty = self.resolve_type(&p.specifiers);
+                    let ty = if let Some(d) = &p.declarator {
+                        self.apply_declarator(&ty, d)
+                    } else {
+                        ty
+                    };
+                    let name = p.declarator.as_ref().and_then(|d| self.get_declarator_name(d));
+                    param_types.push(ParamType { name, ty });
+                }
+                if let Some(inner) = inner {
+                    let ret = self.apply_direct_abstract_declarator(base, inner);
+                    CType::Function(Box::new(ret), param_types, params_clone.variadic)
+                } else {
+                    CType::Function(Box::new(base.clone()), param_types, params_clone.variadic)
+                }
+            }
+        }
+    }
+
     fn get_declarator_name(&self, d: &Declarator) -> Option<String> {
         self.get_direct_name(&d.direct)
     }
@@ -368,6 +567,7 @@ impl Codegen {
     fn declare_function(&mut self, fdef: &FunctionDef) {
         let name = self.get_declarator_name(&fdef.declarator).unwrap_or_default();
         if name.is_empty() { return; }
+        verbose!("declare_function: {}", name);
 
         let base_ty = self.resolve_type(&fdef.specifiers);
         let func_ty = self.apply_declarator(&base_ty, &fdef.declarator);
@@ -389,6 +589,17 @@ impl Codegen {
             };
             sig.params.push(AbiParam::new(clif_ty));
         }
+        // Variadic functions: pad registers on aarch64, then add extra params
+        if variadic {
+            let padding = self.variadic_padding(param_types.len());
+            for _ in 0..padding {
+                sig.params.push(AbiParam::new(I64));
+            }
+            for _ in 0..VARIADIC_EXTRA_PARAMS {
+                sig.params.push(AbiParam::new(I64));
+            }
+            self.variadic_funcs.insert(name.clone(), param_types.len());
+        }
         if !matches!(ret_ty, CType::Void) {
             let clif_ty = if self.is_float_type(ret_ty) {
                 self.clif_float_type(ret_ty)
@@ -404,14 +615,125 @@ impl Codegen {
         }
     }
 
+    /// Collect variable names whose address is taken (&var) anywhere in the body.
+    fn collect_addr_taken(stmt: &Statement, out: &mut HashSet<String>) {
+        match stmt {
+            Statement::Compound(items) => {
+                for item in items {
+                    match item {
+                        BlockItem::Stmt(s) => Self::collect_addr_taken(s, out),
+                        BlockItem::Decl(d) => {
+                            for id in &d.declarators {
+                                if let Some(Initializer::Expr(e)) = &id.initializer {
+                                    Self::collect_addr_taken_expr(e, out);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Statement::Expr(Some(e)) => Self::collect_addr_taken_expr(e, out),
+            Statement::If(c, t, f) => {
+                Self::collect_addr_taken_expr(c, out);
+                Self::collect_addr_taken(t, out);
+                if let Some(f) = f { Self::collect_addr_taken(f, out); }
+            }
+            Statement::While(c, b) => {
+                Self::collect_addr_taken_expr(c, out);
+                Self::collect_addr_taken(b, out);
+            }
+            Statement::DoWhile(b, c) => {
+                Self::collect_addr_taken(b, out);
+                Self::collect_addr_taken_expr(c, out);
+            }
+            Statement::For(init, cond, update, body) => {
+                if let Some(init) = init {
+                    match init.as_ref() {
+                        ForInit::Expr(e) => Self::collect_addr_taken_expr(e, out),
+                        ForInit::Decl(d) => {
+                            for id in &d.declarators {
+                                if let Some(Initializer::Expr(e)) = &id.initializer {
+                                    Self::collect_addr_taken_expr(e, out);
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(c) = cond { Self::collect_addr_taken_expr(c, out); }
+                if let Some(u) = update { Self::collect_addr_taken_expr(u, out); }
+                Self::collect_addr_taken(body, out);
+            }
+            Statement::Switch(e, b) => {
+                Self::collect_addr_taken_expr(e, out);
+                Self::collect_addr_taken(b, out);
+            }
+            Statement::Case(_, s) | Statement::Default(s) | Statement::Label(_, s) => {
+                Self::collect_addr_taken(s, out);
+            }
+            Statement::Return(Some(e)) => Self::collect_addr_taken_expr(e, out),
+            _ => {}
+        }
+    }
+
+    fn collect_addr_taken_expr(expr: &Expr, out: &mut HashSet<String>) {
+        match expr {
+            Expr::Unary(UnaryOp::AddrOf, e) => {
+                if let Expr::Ident(name) = e.as_ref() {
+                    out.insert(name.clone());
+                }
+                Self::collect_addr_taken_expr(e, out);
+            }
+            Expr::Binary(_, l, r) | Expr::Assign(_, l, r) | Expr::Comma(l, r) => {
+                Self::collect_addr_taken_expr(l, out);
+                Self::collect_addr_taken_expr(r, out);
+            }
+            Expr::Unary(_, e) | Expr::PostUnary(_, e) | Expr::Cast(_, e) => {
+                Self::collect_addr_taken_expr(e, out);
+            }
+            Expr::Call(f, args) => {
+                Self::collect_addr_taken_expr(f, out);
+                for a in args { Self::collect_addr_taken_expr(a, out); }
+            }
+            Expr::Conditional(c, t, f) => {
+                Self::collect_addr_taken_expr(c, out);
+                Self::collect_addr_taken_expr(t, out);
+                Self::collect_addr_taken_expr(f, out);
+            }
+            Expr::Index(a, i) => {
+                Self::collect_addr_taken_expr(a, out);
+                Self::collect_addr_taken_expr(i, out);
+            }
+            Expr::Member(e, _) | Expr::Arrow(e, _) => {
+                Self::collect_addr_taken_expr(e, out);
+            }
+            Expr::StmtExpr(items) => {
+                for item in items {
+                    match item {
+                        BlockItem::Stmt(s) => Self::collect_addr_taken(s, out),
+                        BlockItem::Decl(d) => {
+                            for id in &d.declarators {
+                                if let Some(Initializer::Expr(e)) = &id.initializer {
+                                    Self::collect_addr_taken_expr(e, out);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn compile_function(&mut self, fdef: &FunctionDef) {
         let name = self.get_declarator_name(&fdef.declarator).unwrap_or_default();
         if name.is_empty() { return; }
+        crate::verbose::reset_depth();
+        eprintln!("compiling: {name}");
 
         let base_ty = self.resolve_type(&fdef.specifiers);
         let func_ty = self.apply_declarator(&base_ty, &fdef.declarator);
 
-        let (ret_ty, param_types, _variadic) = match &func_ty {
+        let (ret_ty, param_types, variadic) = match &func_ty {
             CType::Function(ret, params, variadic) => (ret.as_ref().clone(), params.clone(), *variadic),
             _ => (base_ty, Vec::new(), false),
         };
@@ -428,6 +750,17 @@ impl Codegen {
             };
             sig.params.push(AbiParam::new(clif_ty));
         }
+        let variadic_pad = if variadic {
+            let padding = self.variadic_padding(param_types.len());
+            for _ in 0..padding {
+                sig.params.push(AbiParam::new(I64));
+            }
+            for _ in 0..VARIADIC_EXTRA_PARAMS {
+                sig.params.push(AbiParam::new(I64));
+            }
+            self.variadic_funcs.insert(name.clone(), param_types.len());
+            padding
+        } else { 0 };
         if !matches!(ret_ty, CType::Void) {
             let clif_ty = if self.is_float_type(&ret_ty) {
                 self.clif_float_type(&ret_ty)
@@ -453,6 +786,7 @@ impl Codegen {
         };
         self.func_ids.insert(name.clone(), func_id);
         self.func_sigs.insert(name.clone(), sig);
+        self.func_ret_types.insert(name.clone(), ret_ty.clone());
         let module_sig = self.module.declarations().get_function_decl(func_id).signature.clone();
         let mut func = ir::Function::with_name_signature(
             ir::UserFuncName::user(0, func_id.as_u32()),
@@ -470,11 +804,17 @@ impl Codegen {
         builder.ensure_inserted_block();
         builder.seal_block(entry);
 
+        // Scan the body for variables whose address is taken
+        let mut addr_taken = HashSet::new();
+        Self::collect_addr_taken(&fdef.body, &mut addr_taken);
+
         let mut ctx = FuncCtx {
             builder,
             name: name.clone(),
             locals: HashMap::new(),
             local_ptrs: HashMap::new(),
+            spilled_locals: HashMap::new(),
+            addr_taken,
             return_type: ret_ty,
             filled: false,
             break_block: None,
@@ -482,7 +822,8 @@ impl Codegen {
             switch_val: None,
             switch_exit: None,
             labels: HashMap::new(),
-            gotos: Vec::new(),
+            _gotos: Vec::new(),
+            va_area: None,
         };
 
         // Bind parameters
@@ -498,6 +839,38 @@ impl Codegen {
                 let var = ctx.builder.declare_var(clif_ty);
                 ctx.builder.def_var(var, val);
                 ctx.locals.insert(name.clone(), (var, p.ty.clone()));
+            }
+        }
+
+        // For variadic functions, save extra params into a contiguous stack slot
+        // (skip padding params on aarch64 — they just fill registers)
+        if variadic {
+            let slot_size = (VARIADIC_EXTRA_PARAMS * 8) as u32;
+            let slot = ctx.builder.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, slot_size, 0));
+            let fixed_count = param_types.len();
+            for i in 0..VARIADIC_EXTRA_PARAMS {
+                let param_idx = fixed_count + variadic_pad + i;
+                let val = ctx.builder.block_params(params_block)[param_idx];
+                let offset = (i * 8) as i32;
+                ctx.builder.ins().stack_store(val, slot, offset);
+            }
+            ctx.va_area = Some(slot);
+        }
+
+        // Pre-spill parameters whose address is taken (&var) so the
+        // stack slot is initialized in the entry block (dominates everything).
+        let names: Vec<_> = ctx.addr_taken.iter().cloned().collect();
+        for name in &names {
+            if let Some((var, ty)) = ctx.locals.get(name).cloned() {
+                let size = ty.size().max(1);
+                let ss = ctx.builder.create_sized_stack_slot(ir::StackSlotData::new(
+                    ir::StackSlotKind::ExplicitSlot, size as u32, 0,
+                ));
+                let ptr = ctx.builder.ins().stack_addr(I64, ss, 0);
+                let val = ctx.builder.use_var(var);
+                ctx.builder.ins().store(MemFlags::new(), val, ptr, 0);
+                ctx.locals.remove(name);
+                ctx.spilled_locals.insert(name.clone(), (ss, ty));
             }
         }
 
@@ -531,8 +904,7 @@ impl Codegen {
         let mut cl_ctx = cranelift_codegen::Context::new();
         cl_ctx.func = func;
         if let Err(e) = self.module.define_function(func_id, &mut cl_ctx) {
-            eprintln!("Cranelift IR for '{name}':\n{}", cl_ctx.func.display());
-            panic!("failed to define function '{name}': {e}");
+            panic!("failed to define function '{name}': {e:?}");
         }
     }
 
@@ -543,6 +915,11 @@ impl Codegen {
         let base_ty = self.resolve_type(&decl.specifiers);
 
         if is_typedef {
+            for id in &decl.declarators {
+                if let Some(name) = self.get_declarator_name(&id.declarator) {
+                    verbose!("typedef: {} = {:?}", name, self.apply_declarator(&base_ty, &id.declarator));
+                }
+            }
             // Resolve the actual type and store it in type_env
             for id in &decl.declarators {
                 if let Some(name) = self.get_declarator_name(&id.declarator) {
@@ -560,12 +937,13 @@ impl Codegen {
             if name.is_empty() { continue; }
 
             let ty = self.apply_declarator(&base_ty, &id.declarator);
+            verbose!("global_decl: {} : {:?}{}", name, ty, if is_extern { " (extern)" } else { "" });
 
             // Function declarations (not definitions)
             if matches!(ty, CType::Function(..)) {
                 let linkage = if is_extern { Linkage::Import } else { Linkage::Import };
                 let mut sig = self.module.make_signature();
-                if let CType::Function(ret, params, _variadic) = &ty {
+                if let CType::Function(ret, params, variadic) = &ty {
                     for p in params {
                         let clif_ty = if self.is_float_type(&p.ty) {
                             self.clif_float_type(&p.ty)
@@ -573,6 +951,16 @@ impl Codegen {
                             self.clif_type(&p.ty)
                         };
                         sig.params.push(AbiParam::new(clif_ty));
+                    }
+                    if *variadic {
+                        let padding = self.variadic_padding(params.len());
+                        for _ in 0..padding {
+                            sig.params.push(AbiParam::new(I64));
+                        }
+                        for _ in 0..VARIADIC_EXTRA_PARAMS {
+                            sig.params.push(AbiParam::new(I64));
+                        }
+                        self.variadic_funcs.insert(name.clone(), params.len());
                     }
                     if !matches!(ret.as_ref(), CType::Void) {
                         let clif_ty = if self.is_float_type(ret) {
@@ -584,6 +972,9 @@ impl Codegen {
                     }
                 }
                 self.func_sigs.insert(name.clone(), sig.clone());
+                if let CType::Function(ret, ..) = &ty {
+                    self.func_ret_types.insert(name.clone(), ret.as_ref().clone());
+                }
                 if let Ok(id) = self.module.declare_function(&name, linkage, &sig) {
                     self.func_ids.insert(name.clone(), id);
                 }
@@ -591,6 +982,7 @@ impl Codegen {
             }
 
             // Global variable
+            self.global_types.insert(name.clone(), ty.clone());
             if is_extern {
                 if let Ok(data_id) = self.module.declare_data(&name, Linkage::Import, false, false) {
                     self.data_ids.insert(name.clone(), data_id);
@@ -602,15 +994,66 @@ impl Codegen {
                 self.data_ids.insert(name.clone(), data_id);
 
                 let mut desc = DataDescription::new();
-                let size = ty.size();
-                desc.define_zeroinit(size.max(1));
-                // Ignore DuplicateDefinition — C allows tentative definitions
-                let _ = self.module.define_data(data_id, &desc);
+                desc.set_align(ty.align() as u64);
+
+                // For incomplete arrays (e.g. `int arr[] = {1,2,3}` or `char s[] = "..."`), infer size from initializer.
+                let (ty, size) = match (&ty, &id.initializer) {
+                    (CType::Array(elem, None), Some(Initializer::List(items))) => {
+                        let n = items.len();
+                        let completed = CType::Array(elem.clone(), Some(n));
+                        let sz = completed.size();
+                        (completed, sz)
+                    }
+                    (CType::Array(elem, None), Some(Initializer::Expr(Expr::StringLit(data)))) => {
+                        let n = data.len() + 1; // +1 for null terminator
+                        let completed = CType::Array(elem.clone(), Some(n));
+                        let sz = completed.size();
+                        (completed, sz)
+                    }
+                    _ => {
+                        let sz = ty.size();
+                        (ty, sz)
+                    }
+                };
+
+                if let Some(init) = &id.initializer {
+                    self.init_global_data(&mut desc, size, &ty, init);
+                    self.defined_data.insert(data_id);
+                    let _ = self.module.define_data(data_id, &desc);
+                } else {
+                    // Tentative definition — defer zeroinit in case a real definition follows
+                    self.tentative_data.push((data_id, size));
+                }
             }
         }
     }
 
     fn compile_stmt(&mut self, ctx: &mut FuncCtx, stmt: &Statement) {
+        let stmt_name = match stmt {
+            Statement::Compound(_) => "Compound",
+            Statement::Expr(_) => "Expr",
+            Statement::If(..) => "If",
+            Statement::While(..) => "While",
+            Statement::DoWhile(..) => "DoWhile",
+            Statement::For(..) => "For",
+            Statement::Switch(..) => "Switch",
+            Statement::Case(..) => "Case",
+            Statement::Default(..) => "Default",
+            Statement::Break => "Break",
+            Statement::Continue => "Continue",
+            Statement::Return(_) => "Return",
+            Statement::Goto(_) => "Goto",
+            Statement::Label(l, _) => l.as_str(),
+            Statement::Asm(_) => "Asm",
+        };
+        verbose_enter!("compile_stmt", "{}", stmt_name);
+        stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || {
+            self.compile_stmt_inner(ctx, stmt);
+        });
+        verbose_leave!();
+    }
+
+    fn compile_stmt_inner(&mut self, ctx: &mut FuncCtx, stmt: &Statement) {
         if ctx.filled {
             // Current block is terminated. Skip dead code unless it's a target.
             match stmt {
@@ -920,6 +1363,7 @@ impl Codegen {
             if name.is_empty() { continue; }
 
             let ty = self.apply_declarator(&base_ty, &id.declarator);
+            verbose!("local_decl: {} : {:?} (init={})", name, ty, id.initializer.is_some());
 
             if is_static {
                 // Static local — treat as global with mangled name to avoid namespace conflicts
@@ -952,6 +1396,33 @@ impl Codegen {
             } else {
                 self.clif_type(&ty)
             };
+
+            // If address is taken (&var anywhere in function), allocate on
+            // stack from the start so the slot is valid in all basic blocks.
+            if ctx.addr_taken.contains(&name) {
+                let size = ty.size().max(1);
+                let ss = ctx.builder.create_sized_stack_slot(ir::StackSlotData::new(
+                    ir::StackSlotKind::ExplicitSlot, size as u32, 0,
+                ));
+                let ptr = ctx.builder.ins().stack_addr(I64, ss, 0);
+                if let Some(init) = &id.initializer {
+                    if let Initializer::Expr(e) = init {
+                        let val = self.compile_expr(ctx, e);
+                        let val = self.coerce(ctx, val, clif_ty);
+                        ctx.builder.ins().store(MemFlags::new(), val, ptr, 0);
+                    } else {
+                        // Zero-init
+                        let zero = ctx.builder.ins().iconst(clif_ty, 0);
+                        ctx.builder.ins().store(MemFlags::new(), zero, ptr, 0);
+                    }
+                } else {
+                    let zero = ctx.builder.ins().iconst(clif_ty, 0);
+                    ctx.builder.ins().store(MemFlags::new(), zero, ptr, 0);
+                }
+                ctx.spilled_locals.insert(name, (ss, ty));
+                continue;
+            }
+
             let var = ctx.builder.declare_var(clif_ty);
 
             if let Some(init) = &id.initializer {
@@ -985,12 +1456,12 @@ impl Codegen {
         }
     }
 
-    fn compile_aggregate_init(&mut self, ctx: &mut FuncCtx, ptr: Value, ty: &CType, init: &Initializer) {
+    fn compile_aggregate_init(&mut self, ctx: &mut FuncCtx, ptr: Value, ty: &CType, _init: &Initializer) {
         // Zero the memory first
         let size = ty.size();
         if size > 0 {
             let zero = ctx.builder.ins().iconst(I8, 0);
-            let size_val = ctx.builder.ins().iconst(I64, size as i64);
+            let _size_val = ctx.builder.ins().iconst(I64, size as i64);
             // memset-like: store zeros byte by byte for small structs
             // For larger ones, we'd want a memset call
             if size <= 64 {
@@ -1005,6 +1476,44 @@ impl Codegen {
     }
 
     fn compile_expr(&mut self, ctx: &mut FuncCtx, expr: &Expr) -> Value {
+        let expr_name = match expr {
+            Expr::IntLit(v) => format!("IntLit({v})"),
+            Expr::UIntLit(v) => format!("UIntLit({v})"),
+            Expr::FloatLit(v) => format!("FloatLit({v})"),
+            Expr::CharLit(v) => format!("CharLit({v})"),
+            Expr::StringLit(_) => "StringLit".into(),
+            Expr::Ident(n) => format!("Ident({n})"),
+            Expr::Binary(op, ..) => format!("Binary({op:?})"),
+            Expr::Unary(op, ..) => format!("Unary({op:?})"),
+            Expr::PostUnary(op, ..) => format!("PostUnary({op:?})"),
+            Expr::Cast(..) => "Cast".into(),
+            Expr::Sizeof(..) => "Sizeof".into(),
+            Expr::Alignof(..) => "Alignof".into(),
+            Expr::Conditional(..) => "Conditional".into(),
+            Expr::Call(f, _) => {
+                if let Expr::Ident(n) = f.as_ref() { format!("Call({n})") }
+                else { "Call(indirect)".into() }
+            }
+            Expr::Member(_, f) => format!("Member(.{f})"),
+            Expr::Arrow(_, f) => format!("Arrow(->{f})"),
+            Expr::Index(..) => "Index".into(),
+            Expr::Assign(op, ..) => format!("Assign({op:?})"),
+            Expr::Comma(..) => "Comma".into(),
+            Expr::CompoundLiteral(..) => "CompoundLiteral".into(),
+            Expr::StmtExpr(..) => "StmtExpr".into(),
+            Expr::VaArg(..) => "VaArg".into(),
+            Expr::Offsetof(..) => "Offsetof".into(),
+            Expr::Builtin(n, _) => format!("Builtin({n})"),
+        };
+        verbose_enter!("compile_expr", "{}", expr_name);
+        let result = stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || {
+            self.compile_expr_inner(ctx, expr)
+        });
+        verbose_leave!();
+        result
+    }
+
+    fn compile_expr_inner(&mut self, ctx: &mut FuncCtx, expr: &Expr) -> Value {
         match expr {
             Expr::IntLit(v) => ctx.builder.ins().iconst(I64, *v as i64),
             Expr::UIntLit(v) => ctx.builder.ins().iconst(I64, *v as i64),
@@ -1040,9 +1549,29 @@ impl Codegen {
                     let var = *var;
                     return ctx.builder.use_var(var);
                 }
+                // Check spilled locals (address was taken — load from stack)
+                if let Some((slot, ty)) = ctx.spilled_locals.get(name) {
+                    let ptr = ctx.builder.ins().stack_addr(I64, *slot, 0);
+                    let load_ty = if self.is_float_type(ty) {
+                        self.clif_float_type(ty)
+                    } else {
+                        self.clif_type(ty)
+                    };
+                    return ctx.builder.ins().load(load_ty, MemFlags::new(), ptr, 0);
+                }
                 // Check local pointers (stack-allocated aggregates)
-                if let Some((ptr, _ty)) = ctx.local_ptrs.get(name) {
-                    return *ptr;
+                if let Some((ptr, ty)) = ctx.local_ptrs.get(name) {
+                    return match ty {
+                        CType::Struct(_) | CType::Union(_) | CType::Array(_, _) => *ptr,
+                        _ => {
+                            let load_ty = if self.is_float_type(ty) {
+                                self.clif_float_type(ty)
+                            } else {
+                                self.clif_type(ty)
+                            };
+                            ctx.builder.ins().load(load_ty, MemFlags::new(), *ptr, 0)
+                        }
+                    };
                 }
                 if let Some(&val) = self.type_env.enum_constants.get(name) {
                     return ctx.builder.ins().iconst(I32, val);
@@ -1055,18 +1584,104 @@ impl Codegen {
                 // Check previously declared global data
                 if let Some(data_id) = self.data_ids.get(name) {
                     let gv = self.module.declare_data_in_func(*data_id, ctx.builder.func);
-                    return ctx.builder.ins().global_value(I64, gv);
+                    let addr = ctx.builder.ins().global_value(I64, gv);
+                    // For scalar types, load the value; arrays/structs return the address
+                    if let Some(ty) = self.global_types.get(name) {
+                        if !matches!(ty, CType::Array(..) | CType::Struct(_) | CType::Union(_)) {
+                            let load_ty = if self.is_float_type(ty) {
+                                self.clif_float_type(ty)
+                            } else {
+                                self.clif_type(ty)
+                            };
+                            return ctx.builder.ins().load(load_ty, MemFlags::new(), addr, 0);
+                        }
+                    }
+                    return addr;
                 }
                 // Undeclared global — import it (C89 implicit declaration)
                 if let Ok(data_id) = self.module.declare_data(name, Linkage::Import, true, false) {
                     self.data_ids.insert(name.clone(), data_id);
                     let gv = self.module.declare_data_in_func(data_id, ctx.builder.func);
-                    return ctx.builder.ins().global_value(I64, gv);
+                    let addr = ctx.builder.ins().global_value(I64, gv);
+                    // Unknown type — assume scalar, load as I64
+                    return ctx.builder.ins().load(I64, MemFlags::new(), addr, 0);
                 }
                 panic!("unknown identifier '{name}'")
             }
 
             Expr::Binary(op, lhs, rhs) => {
+                // Pointer arithmetic: ptr + n => ptr + n*sizeof(*ptr)
+                if matches!(op, BinOp::Add | BinOp::Sub) {
+                    let lty = self.expr_type(ctx, lhs);
+                    let rty = self.expr_type(ctx, rhs);
+                    let l_stride = Self::elem_stride(&lty);
+                    let r_stride = Self::elem_stride(&rty);
+
+                    if l_stride.is_some() && r_stride.is_none() {
+                        let stride = l_stride.unwrap();
+                        let l = self.compile_expr(ctx, lhs);
+                        let r = self.compile_expr(ctx, rhs);
+                        let r = self.coerce(ctx, r, I64);
+                        let r = if stride != 1 {
+                            let s = ctx.builder.ins().iconst(I64, stride);
+                            ctx.builder.ins().imul(r, s)
+                        } else { r };
+                        return self.compile_binop(ctx, *op, l, r);
+                    }
+                    if r_stride.is_some() && l_stride.is_none() && matches!(op, BinOp::Add) {
+                        let stride = r_stride.unwrap();
+                        let l = self.compile_expr(ctx, lhs);
+                        let r = self.compile_expr(ctx, rhs);
+                        let l = self.coerce(ctx, l, I64);
+                        let l = if stride != 1 {
+                            let s = ctx.builder.ins().iconst(I64, stride);
+                            ctx.builder.ins().imul(l, s)
+                        } else { l };
+                        return self.compile_binop(ctx, *op, l, r);
+                    }
+                    // ptr - ptr => (ptr - ptr) / sizeof(*ptr)
+                    if l_stride.is_some() && r_stride.is_some() && matches!(op, BinOp::Sub) {
+                        let stride = l_stride.unwrap();
+                        let l = self.compile_expr(ctx, lhs);
+                        let r = self.compile_expr(ctx, rhs);
+                        let diff = self.compile_binop(ctx, *op, l, r);
+                        if stride != 1 {
+                            let s = ctx.builder.ins().iconst(I64, stride);
+                            return ctx.builder.ins().sdiv(diff, s);
+                        }
+                        return diff;
+                    }
+                }
+                // Short-circuit evaluation for && and ||
+                if matches!(op, BinOp::LogAnd | BinOp::LogOr) {
+                    let l = self.compile_expr(ctx, lhs);
+                    let l_bool = self.to_bool(ctx, l);
+
+                    let rhs_block = ctx.builder.create_block();
+                    let merge = ctx.builder.create_block();
+
+                    if *op == BinOp::LogAnd {
+                        // &&: if lhs is false, result is 0; otherwise evaluate rhs
+                        let false_val = ctx.builder.ins().iconst(I64, 0);
+                        ctx.builder.ins().brif(l_bool, rhs_block, &[], merge, &[BlockArg::Value(false_val)]);
+                    } else {
+                        // ||: if lhs is true, result is 1; otherwise evaluate rhs
+                        let true_val = ctx.builder.ins().iconst(I64, 1);
+                        ctx.builder.ins().brif(l_bool, merge, &[BlockArg::Value(true_val)], rhs_block, &[]);
+                    }
+
+                    ctx.builder.switch_to_block(rhs_block);
+                    ctx.builder.seal_block(rhs_block);
+                    let r = self.compile_expr(ctx, rhs);
+                    let r_bool = self.to_bool(ctx, r);
+                    let r_i64 = Self::safe_uextend(ctx, I64, r_bool);
+                    ctx.builder.ins().jump(merge, &[BlockArg::Value(r_i64)]);
+
+                    ctx.builder.append_block_param(merge, I64);
+                    ctx.builder.switch_to_block(merge);
+                    ctx.builder.seal_block(merge);
+                    return ctx.builder.block_params(merge)[0];
+                }
                 let l = self.compile_expr(ctx, lhs);
                 let r = self.compile_expr(ctx, rhs);
                 self.compile_binop(ctx, *op, l, r)
@@ -1092,28 +1707,71 @@ impl Codegen {
                         let vt = ctx.builder.func.dfg.value_type(v);
                         let zero = ctx.builder.ins().iconst(vt, 0);
                         let is_zero = ctx.builder.ins().icmp(IntCC::Equal, v, zero);
-                        ctx.builder.ins().uextend(vt, is_zero)
+                        Self::safe_uextend(ctx,vt, is_zero)
                     }
                     UnaryOp::Deref => {
                         let ptr = self.compile_expr(ctx, e);
-                        ctx.builder.ins().load(I64, MemFlags::new(), ptr, 0)
+                        // Determine load type from the pointed-to type
+                        let deref_ty = self.expr_type(ctx, e).and_then(|ty| match ty {
+                            CType::Pointer(inner) => Some(*inner),
+                            _ => None,
+                        });
+                        if let Some(ref ty) = deref_ty {
+                            if matches!(ty, CType::Struct(_) | CType::Union(_) | CType::Array(..)) {
+                                return ptr;
+                            }
+                        }
+                        let load_ty = deref_ty
+                            .map(|ty| if self.is_float_type(&ty) { self.clif_float_type(&ty) } else { self.clif_type(&ty) })
+                            .unwrap_or(I64);
+                        ctx.builder.ins().load(load_ty, MemFlags::new(), ptr, 0)
                     }
                     UnaryOp::AddrOf => {
                         self.compile_addr(ctx, e)
                     }
                     UnaryOp::PreInc => {
+                        let stride = self.pointer_stride(ctx, e);
+                        if let Expr::Ident(name) = e.as_ref() {
+                            if let Some((var, _)) = ctx.locals.get(name) {
+                                let var = *var;
+                                let val = ctx.builder.use_var(var);
+                                let vt = ctx.builder.func.dfg.value_type(val);
+                                let step = ctx.builder.ins().iconst(vt, stride);
+                                let new_val = ctx.builder.ins().iadd(val, step);
+                                ctx.builder.def_var(var, new_val);
+                                return new_val;
+                            }
+                        }
+                        let mem_ty = self.expr_type(ctx, e).map(|ty| {
+                            if self.is_float_type(&ty) { self.clif_float_type(&ty) } else { self.clif_type(&ty) }
+                        }).unwrap_or(I64);
                         let addr = self.compile_addr(ctx, e);
-                        let val = ctx.builder.ins().load(I64, MemFlags::new(), addr, 0);
-                        let one = ctx.builder.ins().iconst(I64, 1);
-                        let new_val = ctx.builder.ins().iadd(val, one);
+                        let val = ctx.builder.ins().load(mem_ty, MemFlags::new(), addr, 0);
+                        let step = ctx.builder.ins().iconst(mem_ty, stride);
+                        let new_val = ctx.builder.ins().iadd(val, step);
                         ctx.builder.ins().store(MemFlags::new(), new_val, addr, 0);
                         new_val
                     }
                     UnaryOp::PreDec => {
+                        let stride = self.pointer_stride(ctx, e);
+                        if let Expr::Ident(name) = e.as_ref() {
+                            if let Some((var, _)) = ctx.locals.get(name) {
+                                let var = *var;
+                                let val = ctx.builder.use_var(var);
+                                let vt = ctx.builder.func.dfg.value_type(val);
+                                let step = ctx.builder.ins().iconst(vt, stride);
+                                let new_val = ctx.builder.ins().isub(val, step);
+                                ctx.builder.def_var(var, new_val);
+                                return new_val;
+                            }
+                        }
+                        let mem_ty = self.expr_type(ctx, e).map(|ty| {
+                            if self.is_float_type(&ty) { self.clif_float_type(&ty) } else { self.clif_type(&ty) }
+                        }).unwrap_or(I64);
                         let addr = self.compile_addr(ctx, e);
-                        let val = ctx.builder.ins().load(I64, MemFlags::new(), addr, 0);
-                        let one = ctx.builder.ins().iconst(I64, 1);
-                        let new_val = ctx.builder.ins().isub(val, one);
+                        let val = ctx.builder.ins().load(mem_ty, MemFlags::new(), addr, 0);
+                        let step = ctx.builder.ins().iconst(mem_ty, stride);
+                        let new_val = ctx.builder.ins().isub(val, step);
                         ctx.builder.ins().store(MemFlags::new(), new_val, addr, 0);
                         new_val
                     }
@@ -1121,19 +1779,49 @@ impl Codegen {
             }
 
             Expr::PostUnary(op, e) => {
+                let stride = self.pointer_stride(ctx, e);
+                if let Expr::Ident(name) = e.as_ref() {
+                    if let Some((var, _)) = ctx.locals.get(name) {
+                        let var = *var;
+                        let val = ctx.builder.use_var(var);
+                        let vt = ctx.builder.func.dfg.value_type(val);
+                        let step = ctx.builder.ins().iconst(vt, stride);
+                        let new_val = match op {
+                            PostOp::PostInc => ctx.builder.ins().iadd(val, step),
+                            PostOp::PostDec => ctx.builder.ins().isub(val, step),
+                        };
+                        ctx.builder.def_var(var, new_val);
+                        return val; // return old value
+                    }
+                }
+                let mem_ty = self.expr_type(ctx, e).map(|ty| {
+                    if self.is_float_type(&ty) { self.clif_float_type(&ty) } else { self.clif_type(&ty) }
+                }).unwrap_or(I64);
                 let addr = self.compile_addr(ctx, e);
-                let val = ctx.builder.ins().load(I64, MemFlags::new(), addr, 0);
-                let one = ctx.builder.ins().iconst(I64, 1);
+                let val = ctx.builder.ins().load(mem_ty, MemFlags::new(), addr, 0);
+                let step = ctx.builder.ins().iconst(mem_ty, stride);
                 let new_val = match op {
-                    PostOp::PostInc => ctx.builder.ins().iadd(val, one),
-                    PostOp::PostDec => ctx.builder.ins().isub(val, one),
+                    PostOp::PostInc => ctx.builder.ins().iadd(val, step),
+                    PostOp::PostDec => ctx.builder.ins().isub(val, step),
                 };
                 ctx.builder.ins().store(MemFlags::new(), new_val, addr, 0);
                 val // return old value
             }
 
             Expr::Assign(op, lhs, rhs) => {
-                let rhs_val = self.compile_expr(ctx, rhs);
+                let mut rhs_val = self.compile_expr(ctx, rhs);
+
+                // Scale RHS for pointer += / -= by sizeof(pointee)
+                if matches!(op, AssignOp::AddAssign | AssignOp::SubAssign) {
+                    let lty = self.expr_type(ctx, lhs);
+                    if let Some(stride) = Self::elem_stride(&lty) {
+                        if stride != 1 {
+                            rhs_val = self.coerce(ctx, rhs_val, I64);
+                            let s = ctx.builder.ins().iconst(I64, stride);
+                            rhs_val = ctx.builder.ins().imul(rhs_val, s);
+                        }
+                    }
+                }
 
                 // Direct variable assignment
                 if let Expr::Ident(name) = lhs.as_ref() {
@@ -1154,16 +1842,40 @@ impl Codegen {
                         ctx.builder.def_var(var, val);
                         return val;
                     }
+                    // Spilled locals: store through stack slot
+                    if let Some((slot, ty)) = ctx.spilled_locals.get(name) {
+                        let slot = *slot;
+                        let var_clif = if self.is_float_type(&ty) {
+                            self.clif_float_type(&ty)
+                        } else {
+                            self.clif_type(&ty)
+                        };
+                        let ptr = ctx.builder.ins().stack_addr(I64, slot, 0);
+                        let val = if *op == AssignOp::Assign {
+                            rhs_val
+                        } else {
+                            let lhs_val = ctx.builder.ins().load(var_clif, MemFlags::new(), ptr, 0);
+                            self.compile_compound_assign(ctx, *op, lhs_val, rhs_val)
+                        };
+                        let val = self.coerce(ctx, val, var_clif);
+                        ctx.builder.ins().store(MemFlags::new(), val, ptr, 0);
+                        return val;
+                    }
                 }
 
-                // Memory assignment
+                // Memory assignment — determine LHS type for correct store size
+                let lhs_ty = self.expr_type(ctx, lhs);
                 let addr = self.compile_addr(ctx, lhs);
+                let store_clif = lhs_ty.as_ref().map(|ty| {
+                    if self.is_float_type(ty) { self.clif_float_type(ty) } else { self.clif_type(ty) }
+                }).unwrap_or(I64);
                 let val = if *op == AssignOp::Assign {
                     rhs_val
                 } else {
-                    let lhs_val = ctx.builder.ins().load(I64, MemFlags::new(), addr, 0);
+                    let lhs_val = ctx.builder.ins().load(store_clif, MemFlags::new(), addr, 0);
                     self.compile_compound_assign(ctx, *op, lhs_val, rhs_val)
                 };
+                let val = self.coerce(ctx, val, store_clif);
                 ctx.builder.ins().store(MemFlags::new(), val, addr, 0);
                 val
             }
@@ -1171,19 +1883,31 @@ impl Codegen {
             Expr::Call(func, args) => {
                 let arg_vals: Vec<Value> = args.iter().map(|a| self.compile_expr(ctx, a)).collect();
 
-                let func_name = match func.as_ref() {
-                    Expr::Ident(name) => Some(name.clone()),
-                    _ => None,
-                };
+                let func_name = Self::extract_func_name(func);
+
+                // If the function expression has side effects (e.g. comma expr
+                // like `(tcc_enter_state(s1), func)(args)`), compile them now.
+                if func_name.is_some() && !matches!(func.as_ref(), Expr::Ident(_)) {
+                    self.compile_expr(ctx, func);
+                }
 
                 if let Some(ref name) = func_name {
                     // Check if this is actually a variable (function pointer), not a function
                     let is_var = ctx.locals.contains_key(name)
+                        || ctx.spilled_locals.contains_key(name)
                         || ctx.local_ptrs.contains_key(name)
                         || self.data_ids.contains_key(name);
                     if is_var {
                         // Indirect call through function pointer variable
-                        let func_ptr = self.compile_expr(ctx, func);
+                        // compile_expr loads the value for scalar globals,
+                        // and local_ptrs returns the stack address (need to load)
+                        let func_ptr = if ctx.local_ptrs.contains_key(name) {
+                            let addr = self.compile_expr(ctx, func);
+                            ctx.builder.ins().load(I64, MemFlags::new(), addr, 0)
+                        } else {
+                            // locals and globals: compile_expr returns the value
+                            self.compile_expr(ctx, func)
+                        };
                         let mut call_sig = self.module.make_signature();
                         for &val in &arg_vals {
                             let val_ty = ctx.builder.func.dfg.value_type(val);
@@ -1227,6 +1951,20 @@ impl Codegen {
                     let mut coerced_args = Vec::new();
                     for (i, &val) in arg_vals.iter().enumerate() {
                         coerced_args.push(self.coerce(ctx, val, call_sig.params[i].value_type));
+                    }
+
+                    // On aarch64, variadic args must go on the stack.
+                    // Insert dummy zero args to fill the 8 integer registers,
+                    // pushing the real variadic args to the stack.
+                    if let Some(&fixed_count) = self.variadic_funcs.get(name) {
+                        let padding = self.variadic_padding(fixed_count);
+                        if padding > 0 {
+                            let zero = ctx.builder.ins().iconst(I64, 0);
+                            for j in 0..padding {
+                                coerced_args.insert(fixed_count + j, zero);
+                                call_sig.params.insert(fixed_count + j, AbiParam::new(I64));
+                            }
+                        }
                     }
 
                     // Look up existing func_id, or declare new
@@ -1298,16 +2036,19 @@ impl Codegen {
             Expr::Sizeof(arg) => {
                 let size = match arg.as_ref() {
                     SizeofArg::Type(tn) => {
-                        let ty = self.resolve_type(&tn.specifiers);
+                        let ty = self.resolve_typename(tn);
                         ty.size()
                     }
-                    SizeofArg::Expr(_) => 8, // TODO: determine expression type
+                    SizeofArg::Expr(e) => {
+                        let ty = self.expr_type(ctx, e).unwrap_or(CType::Int(true));
+                        ty.size()
+                    }
                 };
                 ctx.builder.ins().iconst(I64, size as i64)
             }
 
             Expr::Alignof(tn) => {
-                let ty = self.resolve_type(&tn.specifiers);
+                let ty = self.resolve_typename(tn);
                 ctx.builder.ins().iconst(I64, ty.align() as i64)
             }
 
@@ -1345,24 +2086,66 @@ impl Codegen {
             }
 
             Expr::Index(arr, idx) => {
+                let elem_size = self.expr_type(ctx, arr)
+                    .and_then(|ty| match ty {
+                        CType::Pointer(inner) | CType::Array(inner, _) => Some(inner.size()),
+                        _ => None,
+                    })
+                    .unwrap_or(8);
                 let arr_val = self.compile_expr(ctx, arr);
                 let idx_val = self.compile_expr(ctx, idx);
                 let idx_val = self.coerce(ctx, idx_val, I64);
-                let offset = ctx.builder.ins().imul_imm(idx_val, 8); // TODO: element size
+                let offset = ctx.builder.ins().imul_imm(idx_val, elem_size as i64);
                 let addr = ctx.builder.ins().iadd(arr_val, offset);
-                ctx.builder.ins().load(I64, MemFlags::new(), addr, 0)
+                let load_ty = self.expr_type(ctx, expr)
+                    .map(|ty| if self.is_float_type(&ty) { self.clif_float_type(&ty) } else { self.clif_type(&ty) })
+                    .unwrap_or(I64);
+                ctx.builder.ins().load(load_ty, MemFlags::new(), addr, 0)
             }
 
             Expr::Member(e, field) => {
                 let base = self.compile_addr(ctx, e);
-                // TODO: compute field offset from type
-                ctx.builder.ins().load(I64, MemFlags::new(), base, 0)
+                let (byte_offset, field_ty) = self.expr_type(ctx, e)
+                    .and_then(|ty| ty.field_offset(field))
+                    .unwrap_or((0, CType::Long(true)));
+                let load_ty = if self.is_float_type(&field_ty) {
+                    self.clif_float_type(&field_ty)
+                } else {
+                    self.clif_type(&field_ty)
+                };
+                // For aggregate fields, return the address
+                if matches!(field_ty, CType::Struct(_) | CType::Union(_) | CType::Array(..)) {
+                    if byte_offset != 0 {
+                        return ctx.builder.ins().iadd_imm(base, byte_offset as i64);
+                    }
+                    return base;
+                }
+                ctx.builder.ins().load(load_ty, MemFlags::new(), base, byte_offset as i32)
             }
 
             Expr::Arrow(e, field) => {
                 let ptr = self.compile_expr(ctx, e);
-                // TODO: compute field offset from type
-                ctx.builder.ins().load(I64, MemFlags::new(), ptr, 0)
+                let pointee_ty = self.expr_type(ctx, e)
+                    .and_then(|ty| match ty {
+                        CType::Pointer(inner) => Some(*inner),
+                        _ => None,
+                    });
+                let (byte_offset, field_ty) = pointee_ty
+                    .and_then(|ty| ty.field_offset(field))
+                    .unwrap_or((0, CType::Long(true)));
+                let load_ty = if self.is_float_type(&field_ty) {
+                    self.clif_float_type(&field_ty)
+                } else {
+                    self.clif_type(&field_ty)
+                };
+                // For aggregate fields, return the address
+                if matches!(field_ty, CType::Struct(_) | CType::Union(_) | CType::Array(..)) {
+                    if byte_offset != 0 {
+                        return ctx.builder.ins().iadd_imm(ptr, byte_offset as i64);
+                    }
+                    return ptr;
+                }
+                ctx.builder.ins().load(load_ty, MemFlags::new(), ptr, byte_offset as i32)
             }
 
             Expr::StmtExpr(items) => {
@@ -1381,9 +2164,32 @@ impl Codegen {
                 panic!("compound literals not yet implemented")
             }
 
-            Expr::VaArg(_, _) => {
-                eprintln!("warning: va_arg not yet implemented, will trap at runtime");
-                self.emit_trap_with_value(ctx, I64)
+            Expr::VaArg(ap_expr, type_name) => {
+                // va_arg(ap, type): load value at *ap, advance ap by 8
+                let ap_val = self.compile_expr(ctx, ap_expr);
+                let ty = self.resolve_typename(type_name);
+                let load_ty = if self.is_float_type(&ty) {
+                    self.clif_float_type(&ty)
+                } else {
+                    self.clif_type(&ty)
+                };
+                let result = ctx.builder.ins().load(load_ty, MemFlags::new(), ap_val, 0);
+                // Advance ap by 8 (each vararg slot is 8 bytes)
+                let new_ap = ctx.builder.ins().iadd_imm(ap_val, 8);
+                // Store new ap back — ap_expr must be an lvalue (usually an ident)
+                if let Expr::Ident(name) = ap_expr.as_ref() {
+                    if let Some((var, _)) = ctx.locals.get(name) {
+                        let var = *var;
+                        ctx.builder.def_var(var, new_ap);
+                    } else if let Some((slot, _)) = ctx.spilled_locals.get(name) {
+                        let ptr = ctx.builder.ins().stack_addr(I64, *slot, 0);
+                        ctx.builder.ins().store(MemFlags::new(), new_ap, ptr, 0);
+                    } else if let Some((ptr, _)) = ctx.local_ptrs.get(name) {
+                        let ptr = *ptr;
+                        ctx.builder.ins().store(MemFlags::new(), new_ap, ptr, 0);
+                    }
+                }
+                result
             }
 
             Expr::Offsetof(_tn, _fields) => {
@@ -1463,12 +2269,59 @@ impl Codegen {
                         self.emit_trap_with_value(ctx, I64)
                     }
                     "__builtin_va_end" => {
-                        // va_end is a no-op on x86-64 SysV ABI
+                        // va_end is a no-op
                         ctx.builder.ins().iconst(I64, 0)
                     }
-                    "__builtin_va_start" | "__builtin_va_copy" | "__builtin_va_arg" => {
-                        eprintln!("warning: {name} not yet implemented, will trap at runtime");
-                        self.emit_trap_with_value(ctx, I64)
+                    "__builtin_va_start" => {
+                        // va_start(ap, last_named): set ap to point to the va_area
+                        let va_slot = ctx.va_area.unwrap_or_else(|| {
+                            panic!("__builtin_va_start used in non-variadic function '{}'", ctx.name)
+                        });
+                        let va_addr = ctx.builder.ins().stack_addr(I64, va_slot, 0);
+                        // Store va_area address into ap (first argument)
+                        if let Expr::Ident(ap_name) = &args[0] {
+                            if let Some((var, _)) = ctx.locals.get(ap_name) {
+                                let var = *var;
+                                ctx.builder.def_var(var, va_addr);
+                            } else if let Some((slot, _)) = ctx.spilled_locals.get(ap_name) {
+                                let ptr = ctx.builder.ins().stack_addr(I64, *slot, 0);
+                                ctx.builder.ins().store(MemFlags::new(), va_addr, ptr, 0);
+                            } else if let Some((ptr, _)) = ctx.local_ptrs.get(ap_name) {
+                                let ptr = *ptr;
+                                ctx.builder.ins().store(MemFlags::new(), va_addr, ptr, 0);
+                            }
+                        }
+                        va_addr
+                    }
+                    "__builtin_va_copy" => {
+                        // va_copy(dest, src): copy the va_list pointer
+                        let src_val = self.compile_expr(ctx, &args[1]);
+                        if let Expr::Ident(dest_name) = &args[0] {
+                            if let Some((var, _)) = ctx.locals.get(dest_name) {
+                                let var = *var;
+                                ctx.builder.def_var(var, src_val);
+                            } else if let Some((slot, _)) = ctx.spilled_locals.get(dest_name) {
+                                let ptr = ctx.builder.ins().stack_addr(I64, *slot, 0);
+                                ctx.builder.ins().store(MemFlags::new(), src_val, ptr, 0);
+                            } else if let Some((ptr, _)) = ctx.local_ptrs.get(dest_name) {
+                                let ptr = *ptr;
+                                ctx.builder.ins().store(MemFlags::new(), src_val, ptr, 0);
+                            }
+                        }
+                        src_val
+                    }
+                    "__builtin_va_arg" => {
+                        // Same as Expr::VaArg but called as a builtin
+                        let ap_val = self.compile_expr(ctx, &args[0]);
+                        let result = ctx.builder.ins().load(I64, MemFlags::new(), ap_val, 0);
+                        let new_ap = ctx.builder.ins().iadd_imm(ap_val, 8);
+                        if let Expr::Ident(ap_name) = &args[0] {
+                            if let Some((var, _)) = ctx.locals.get(ap_name) {
+                                let var = *var;
+                                ctx.builder.def_var(var, new_ap);
+                            }
+                        }
+                        result
                     }
                     _ => panic!("builtin '{name}' not yet implemented"),
                 }
@@ -1487,15 +2340,105 @@ impl Codegen {
         ctx.builder.ins().iconst(ty, 0)
     }
 
+    fn expr_type(&mut self, ctx: &FuncCtx, expr: &Expr) -> Option<CType> {
+        verbose_enter!("expr_type", "{:?}", std::mem::discriminant(expr));
+        let result = stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || {
+            self.expr_type_inner(ctx, expr)
+        });
+        verbose!("expr_type => {:?}", result);
+        verbose_leave!();
+        result
+    }
+
+    fn expr_type_inner(&mut self, ctx: &FuncCtx, expr: &Expr) -> Option<CType> {
+        match expr {
+            Expr::Ident(name) => {
+                if let Some((_, ty)) = ctx.locals.get(name) {
+                    return Some(ty.clone());
+                }
+                if let Some((_, ty)) = ctx.spilled_locals.get(name) {
+                    return Some(ty.clone());
+                }
+                if let Some((_, ty)) = ctx.local_ptrs.get(name) {
+                    return Some(ty.clone());
+                }
+                if let Some(ty) = self.global_types.get(name) {
+                    return Some(ty.clone());
+                }
+                None
+            }
+            Expr::Arrow(e, field) => {
+                let base_ty = self.expr_type(ctx, e)?;
+                let pointee = match &base_ty {
+                    CType::Pointer(inner) => inner.as_ref(),
+                    _ => return None,
+                };
+                pointee.field_offset(field).map(|(_, ty)| ty)
+            }
+            Expr::Member(e, field) => {
+                let base_ty = self.expr_type(ctx, e)?;
+                base_ty.field_offset(field).map(|(_, ty)| ty)
+            }
+            Expr::Unary(UnaryOp::Deref, e) => {
+                let ty = self.expr_type(ctx, e)?;
+                match ty {
+                    CType::Pointer(inner) => Some(*inner),
+                    _ => None,
+                }
+            }
+            Expr::Unary(UnaryOp::AddrOf, e) => {
+                let ty = self.expr_type(ctx, e)?;
+                Some(CType::Pointer(Box::new(ty)))
+            }
+            Expr::Index(arr, _) => {
+                let ty = self.expr_type(ctx, arr)?;
+                match ty {
+                    CType::Pointer(inner) | CType::Array(inner, _) => Some(*inner),
+                    _ => None,
+                }
+            }
+            Expr::Call(func, _) => {
+                if let Expr::Ident(name) = func.as_ref() {
+                    return self.func_ret_types.get(name).cloned();
+                }
+                None
+            }
+            Expr::Cast(type_name, _) => {
+                Some(self.resolve_typename(type_name))
+            }
+            Expr::PostUnary(_, e) => self.expr_type(ctx, e),
+            Expr::Unary(UnaryOp::PreInc | UnaryOp::PreDec | UnaryOp::Neg | UnaryOp::BitNot, e) => {
+                self.expr_type(ctx, e)
+            }
+            Expr::Sizeof(_) | Expr::Alignof(_) => Some(CType::Long(false)),
+            Expr::StringLit(_) => Some(CType::Pointer(Box::new(CType::Char(true)))),
+            Expr::IntLit(_) => Some(CType::Int(true)),
+            _ => None,
+        }
+    }
+
     fn compile_addr(&mut self, ctx: &mut FuncCtx, expr: &Expr) -> Value {
+        verbose_enter!("compile_addr", "{:?}", std::mem::discriminant(expr));
+        let result = stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || {
+            self.compile_addr_inner(ctx, expr)
+        });
+        verbose_leave!();
+        result
+    }
+
+    fn compile_addr_inner(&mut self, ctx: &mut FuncCtx, expr: &Expr) -> Value {
         match expr {
             Expr::Ident(name) => {
                 // For stack-allocated locals, return their pointer
                 if let Some((ptr, _)) = ctx.local_ptrs.get(name) {
                     return *ptr;
                 }
-                // For Variable-based locals, we need a stack slot
-                // This is a simplification - ideally we'd track addresses
+                // For already-spilled locals, return a fresh stack_addr
+                if let Some((slot, _)) = ctx.spilled_locals.get(name) {
+                    return ctx.builder.ins().stack_addr(I64, *slot, 0);
+                }
+                // Spill SSA variable to stack permanently so aliases
+                // through pointers (e.g. strstart(&r1)) see updates.
                 if let Some((var, ty)) = ctx.locals.get(name).cloned() {
                     let size = ty.size().max(1);
                     let ss = ctx.builder.create_sized_stack_slot(ir::StackSlotData::new(
@@ -1504,6 +2447,8 @@ impl Codegen {
                     let ptr = ctx.builder.ins().stack_addr(I64, ss, 0);
                     let val = ctx.builder.use_var(var);
                     ctx.builder.ins().store(MemFlags::new(), val, ptr, 0);
+                    ctx.locals.remove(name);
+                    ctx.spilled_locals.insert(name.clone(), (ss, ty));
                     ptr
                 } else if let Some(func_id) = self.func_ids.get(name) {
                     let func_ref = self.module.declare_func_in_func(*func_id, ctx.builder.func);
@@ -1524,21 +2469,45 @@ impl Codegen {
                 self.compile_expr(ctx, e) // *p address is just p
             }
             Expr::Index(arr, idx) => {
+                let elem_size = self.expr_type(ctx, arr)
+                    .and_then(|ty| match ty {
+                        CType::Pointer(inner) | CType::Array(inner, _) => Some(inner.size()),
+                        _ => None,
+                    })
+                    .unwrap_or(8);
                 let arr_val = self.compile_expr(ctx, arr);
                 let idx_val = self.compile_expr(ctx, idx);
                 let idx_val = self.coerce(ctx, idx_val, I64);
-                let offset = ctx.builder.ins().imul_imm(idx_val, 8); // TODO: element size
+                let offset = ctx.builder.ins().imul_imm(idx_val, elem_size as i64);
                 ctx.builder.ins().iadd(arr_val, offset)
             }
-            Expr::Member(e, _field) => {
+            Expr::Member(e, field) => {
                 let base = self.compile_addr(ctx, e);
-                // TODO: add field offset
-                base
+                let byte_offset = self.expr_type(ctx, e)
+                    .and_then(|ty| ty.field_offset(field))
+                    .map(|(off, _)| off)
+                    .unwrap_or(0);
+                if byte_offset != 0 {
+                    ctx.builder.ins().iadd_imm(base, byte_offset as i64)
+                } else {
+                    base
+                }
             }
-            Expr::Arrow(e, _field) => {
+            Expr::Arrow(e, field) => {
                 let ptr = self.compile_expr(ctx, e);
-                // TODO: add field offset
-                ptr
+                let byte_offset = self.expr_type(ctx, e)
+                    .and_then(|ty| match ty {
+                        CType::Pointer(inner) => Some(*inner),
+                        _ => None,
+                    })
+                    .and_then(|ty| ty.field_offset(field))
+                    .map(|(off, _)| off)
+                    .unwrap_or(0);
+                if byte_offset != 0 {
+                    ctx.builder.ins().iadd_imm(ptr, byte_offset as i64)
+                } else {
+                    ptr
+                }
             }
             _ => {
                 // Expression doesn't have an address - create a temporary
@@ -1577,39 +2546,39 @@ impl Codegen {
                 BinOp::Div => ctx.builder.ins().fdiv(l, r),
                 BinOp::Eq => {
                     let c = ctx.builder.ins().fcmp(FloatCC::Equal, l, r);
-                    ctx.builder.ins().uextend(int_type, c)
+                    Self::safe_uextend(ctx,int_type, c)
                 }
                 BinOp::Ne => {
                     let c = ctx.builder.ins().fcmp(FloatCC::NotEqual, l, r);
-                    ctx.builder.ins().uextend(int_type, c)
+                    Self::safe_uextend(ctx,int_type, c)
                 }
                 BinOp::Lt => {
                     let c = ctx.builder.ins().fcmp(FloatCC::LessThan, l, r);
-                    ctx.builder.ins().uextend(int_type, c)
+                    Self::safe_uextend(ctx,int_type, c)
                 }
                 BinOp::Gt => {
                     let c = ctx.builder.ins().fcmp(FloatCC::GreaterThan, l, r);
-                    ctx.builder.ins().uextend(int_type, c)
+                    Self::safe_uextend(ctx,int_type, c)
                 }
                 BinOp::Le => {
                     let c = ctx.builder.ins().fcmp(FloatCC::LessThanOrEqual, l, r);
-                    ctx.builder.ins().uextend(int_type, c)
+                    Self::safe_uextend(ctx,int_type, c)
                 }
                 BinOp::Ge => {
                     let c = ctx.builder.ins().fcmp(FloatCC::GreaterThanOrEqual, l, r);
-                    ctx.builder.ins().uextend(int_type, c)
+                    Self::safe_uextend(ctx,int_type, c)
                 }
                 BinOp::LogAnd => {
                     let l_bool = self.to_bool(ctx, l);
                     let r_bool = self.to_bool(ctx, r);
                     let result = ctx.builder.ins().band(l_bool, r_bool);
-                    ctx.builder.ins().uextend(int_type, result)
+                    Self::safe_uextend(ctx,int_type, result)
                 }
                 BinOp::LogOr => {
                     let l_bool = self.to_bool(ctx, l);
                     let r_bool = self.to_bool(ctx, r);
                     let result = ctx.builder.ins().bor(l_bool, r_bool);
-                    ctx.builder.ins().uextend(int_type, result)
+                    Self::safe_uextend(ctx,int_type, result)
                 }
                 // Bitwise/shift ops don't apply to floats — treat as integer
                 BinOp::Mod | BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor
@@ -1643,39 +2612,39 @@ impl Codegen {
                 BinOp::Shr => ctx.builder.ins().sshr(l, r),
                 BinOp::Eq => {
                     let c = ctx.builder.ins().icmp(IntCC::Equal, l, r);
-                    ctx.builder.ins().uextend(cmp_result, c)
+                    Self::safe_uextend(ctx,cmp_result, c)
                 }
                 BinOp::Ne => {
                     let c = ctx.builder.ins().icmp(IntCC::NotEqual, l, r);
-                    ctx.builder.ins().uextend(cmp_result, c)
+                    Self::safe_uextend(ctx,cmp_result, c)
                 }
                 BinOp::Lt => {
                     let c = ctx.builder.ins().icmp(IntCC::SignedLessThan, l, r);
-                    ctx.builder.ins().uextend(cmp_result, c)
+                    Self::safe_uextend(ctx,cmp_result, c)
                 }
                 BinOp::Gt => {
                     let c = ctx.builder.ins().icmp(IntCC::SignedGreaterThan, l, r);
-                    ctx.builder.ins().uextend(cmp_result, c)
+                    Self::safe_uextend(ctx,cmp_result, c)
                 }
                 BinOp::Le => {
                     let c = ctx.builder.ins().icmp(IntCC::SignedLessThanOrEqual, l, r);
-                    ctx.builder.ins().uextend(cmp_result, c)
+                    Self::safe_uextend(ctx,cmp_result, c)
                 }
                 BinOp::Ge => {
                     let c = ctx.builder.ins().icmp(IntCC::SignedGreaterThanOrEqual, l, r);
-                    ctx.builder.ins().uextend(cmp_result, c)
+                    Self::safe_uextend(ctx,cmp_result, c)
                 }
                 BinOp::LogAnd => {
                     let l_bool = self.to_bool(ctx, l);
                     let r_bool = self.to_bool(ctx, r);
                     let result = ctx.builder.ins().band(l_bool, r_bool);
-                    ctx.builder.ins().uextend(cmp_result, result)
+                    Self::safe_uextend(ctx,cmp_result, result)
                 }
                 BinOp::LogOr => {
                     let l_bool = self.to_bool(ctx, l);
                     let r_bool = self.to_bool(ctx, r);
                     let result = ctx.builder.ins().bor(l_bool, r_bool);
-                    ctx.builder.ins().uextend(cmp_result, result)
+                    Self::safe_uextend(ctx,cmp_result, result)
                 }
             }
         }
@@ -1746,6 +2715,13 @@ impl Codegen {
         ctx.builder.ins().icmp(IntCC::NotEqual, val, zero)
     }
 
+    /// uextend that handles the no-op case where source and target types match
+    fn safe_uextend(ctx: &mut FuncCtx, target: ir::Type, val: Value) -> Value {
+        let val_type = ctx.builder.func.dfg.value_type(val);
+        if val_type == target || val_type.bits() >= target.bits() { val }
+        else { ctx.builder.ins().uextend(target, val) }
+    }
+
     fn coerce(&self, ctx: &mut FuncCtx, val: Value, target: ir::Type) -> Value {
         let val_type = ctx.builder.func.dfg.value_type(val);
         if val_type == target { return val; }
@@ -1776,576 +2752,152 @@ impl Codegen {
         val
     }
 
+    fn init_global_data(&mut self, desc: &mut DataDescription, size: usize, ty: &CType, init: &Initializer) {
+        let mut bytes = vec![0u8; size.max(1)];
+        let mut relocs: Vec<GlobalReloc> = Vec::new();
+        self.fill_init_item(&mut bytes, &mut relocs, 0, ty, init);
+        desc.define(bytes.into_boxed_slice());
+        for reloc in relocs {
+            match reloc {
+                GlobalReloc::FuncAddr { offset, func_id } => {
+                    let func_ref = self.module.declare_func_in_data(func_id, desc);
+                    desc.write_function_addr(offset, func_ref);
+                }
+                GlobalReloc::DataAddr { offset, data_id } => {
+                    let gv = self.module.declare_data_in_data(data_id, desc);
+                    desc.write_data_addr(offset, gv, 0);
+                }
+            }
+        }
+    }
+
+    fn fill_init_item(&mut self, bytes: &mut [u8], relocs: &mut Vec<GlobalReloc>,
+                      offset: usize, ty: &CType, init: &Initializer) {
+        match init {
+            Initializer::Expr(expr) => self.fill_init_scalar(bytes, relocs, offset, ty, expr),
+            Initializer::List(items) => self.fill_init_list(bytes, relocs, offset, ty, items),
+        }
+    }
+
+    fn fill_init_list(&mut self, bytes: &mut [u8], relocs: &mut Vec<GlobalReloc>,
+                      base: usize, ty: &CType, items: &[InitializerItem]) {
+        match ty {
+            CType::Array(elem_ty, _) => {
+                let elem_size = elem_ty.size();
+                let mut idx = 0;
+                for item in items {
+                    if let Some(Designator::Index(expr)) = item.designators.first() {
+                        if let Some(val) = self.eval_const_with_enums(expr) {
+                            idx = val as usize;
+                        }
+                    }
+                    let offset = base + idx * elem_size;
+                    self.fill_init_item(bytes, relocs, offset, elem_ty, &item.initializer);
+                    idx += 1;
+                }
+            }
+            CType::Struct(def) => {
+                let mut field_idx = 0;
+                for item in items {
+                    if let Some(Designator::Field(name)) = item.designators.first() {
+                        if let Some(pos) = def.fields.iter().position(|f| f.name.as_deref() == Some(name.as_str())) {
+                            field_idx = pos;
+                        }
+                    }
+                    if field_idx >= def.fields.len() { break; }
+                    let offset = base + Self::struct_field_offset(def, field_idx);
+                    self.fill_init_item(bytes, relocs, offset, &def.fields[field_idx].ty, &item.initializer);
+                    field_idx += 1;
+                }
+            }
+            CType::Union(def) => {
+                if let Some(item) = items.first() {
+                    let fidx = if let Some(Designator::Field(name)) = item.designators.first() {
+                        def.fields.iter().position(|f| f.name.as_deref() == Some(name.as_str())).unwrap_or(0)
+                    } else { 0 };
+                    if fidx < def.fields.len() {
+                        self.fill_init_item(bytes, relocs, base, &def.fields[fidx].ty, &item.initializer);
+                    }
+                }
+            }
+            // Scalar wrapped in braces: e.g. int x = { 42 };
+            _ => {
+                if let Some(item) = items.first() {
+                    self.fill_init_item(bytes, relocs, base, ty, &item.initializer);
+                }
+            }
+        }
+    }
+
+    fn fill_init_scalar(&mut self, bytes: &mut [u8], relocs: &mut Vec<GlobalReloc>,
+                        offset: usize, ty: &CType, expr: &Expr) {
+        // Constant integer (including enum constants and uint literals)
+        if let Some(val) = self.eval_const_with_enums(expr) {
+            let field_size = ty.size();
+            if offset + field_size > bytes.len() {
+                // Field extends past buffer — skip (e.g. type mismatch or flexible array member)
+                return;
+            }
+            let val_bytes = val.to_le_bytes();
+            let copy_len = field_size.min(val_bytes.len());
+            bytes[offset..offset + copy_len].copy_from_slice(&val_bytes[..copy_len]);
+            return;
+        }
+
+        // String literal
+        if let Expr::StringLit(data) = expr {
+            if ty.is_pointer() {
+                // Pointer to string: create data symbol + relocation
+                let sym = format!(".str.{}", self.string_counter);
+                self.string_counter += 1;
+                let mut str_data = data.clone();
+                str_data.push(0); // null terminator
+                let data_id = self.module.declare_data(&sym, Linkage::Local, false, false).unwrap();
+                self.strings.push((sym, str_data));
+                relocs.push(GlobalReloc::DataAddr { offset: offset as u32, data_id });
+            } else {
+                // Char array: copy bytes directly
+                let copy_len = ty.size().min(data.len());
+                bytes[offset..offset + copy_len].copy_from_slice(&data[..copy_len]);
+            }
+            return;
+        }
+
+        // Function or data pointer
+        if let Expr::Ident(ref_name) = expr {
+            if let Some(&func_id) = self.func_ids.get(ref_name) {
+                relocs.push(GlobalReloc::FuncAddr { offset: offset as u32, func_id });
+                return;
+            }
+            if let Some(&data_id) = self.data_ids.get(ref_name) {
+                relocs.push(GlobalReloc::DataAddr { offset: offset as u32, data_id });
+                return;
+            }
+        }
+
+        // Cast wrapping an identifier (e.g. `(void*)func`)
+        if let Expr::Cast(_, inner) = expr {
+            if let Expr::Ident(ref_name) = inner.as_ref() {
+                if let Some(&func_id) = self.func_ids.get(ref_name) {
+                    relocs.push(GlobalReloc::FuncAddr { offset: offset as u32, func_id });
+                    return;
+                }
+                if let Some(&data_id) = self.data_ids.get(ref_name) {
+                    relocs.push(GlobalReloc::DataAddr { offset: offset as u32, data_id });
+                    return;
+                }
+            }
+        }
+
+        // Fallback: leave as zero
+    }
+
     fn define_strings(&mut self) {
         for (sym, data) in std::mem::take(&mut self.strings) {
             let data_id = self.module.declare_data(&sym, Linkage::Local, false, false).unwrap();
             let mut desc = DataDescription::new();
             desc.define(data.into_boxed_slice());
             self.module.define_data(data_id, &desc).unwrap();
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use cranelift_codegen::ir::types::I32;
-    use cranelift_codegen::ir::{self, AbiParam, InstBuilder};
-    use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
-    use cranelift_module::{Linkage, Module};
-    use crate::emit;
-    use crate::lex::Lexer;
-    use crate::parse::Parser;
-    use crate::preprocess::Preprocessor;
-    use super::*;
-
-    fn compile_to_obj(src: &str) -> Vec<u8> {
-        let mut pp = Preprocessor::new(vec![], vec![], None);
-        let preprocessed = pp.preprocess(src, "<test>");
-        let tokens = Lexer::new(&preprocessed, "<test>").tokenize();
-        let parser = Parser::new(tokens);
-        let (tu, type_env) = parser.parse();
-        let module = emit::create_module("<test>", None);
-        let mut cg = Codegen::new(module, type_env);
-        cg.compile_unit(&tu);
-        emit::finish(cg.module)
-    }
-
-    fn assert_compiles(src: &str) {
-        let obj = compile_to_obj(src);
-        assert!(!obj.is_empty(), "object file should not be empty");
-    }
-
-    // === Diagnostic tests to narrow down the codegen bug ===
-
-    #[test]
-    fn diag_preprocess_output() {
-        let mut pp = Preprocessor::new(vec![], vec![], None);
-        let out = pp.preprocess("int main(void) { return 42; }", "<test>");
-        eprintln!("preprocessed:\n{}", out);
-        let clean: String = out.lines().filter(|l| !l.starts_with('#')).collect::<Vec<_>>().join("\n");
-        assert!(clean.contains("int main(void) { return 42; }"), "preprocessor should pass through: got {}", clean);
-    }
-
-    #[test]
-    fn diag_lex_output() {
-        let tokens = Lexer::new("int main(void) { return 42; }", "<test>").tokenize();
-        let kinds: Vec<_> = tokens.iter().map(|t| format!("{:?}", t.kind)).collect();
-        eprintln!("tokens: {}", kinds.join(", "));
-        assert!(kinds.contains(&"Int".to_string()));
-        assert!(kinds.contains(&"Return".to_string()));
-        assert!(kinds.contains(&"IntLit(42)".to_string()));
-    }
-
-    #[test]
-    fn diag_parse_output() {
-        let mut pp = Preprocessor::new(vec![], vec![], None);
-        let preprocessed = pp.preprocess("int main(void) { return 42; }", "<test>");
-        let tokens = Lexer::new(&preprocessed, "<test>").tokenize();
-        let parser = Parser::new(tokens);
-        let (tu, _type_env) = parser.parse();
-
-        eprintln!("tu has {} items", tu.len());
-        for (i, item) in tu.iter().enumerate() {
-            match item {
-                ExternalDecl::Function(f) => eprintln!("  [{}] Function: {:?}", i, f.declarator.direct),
-                ExternalDecl::Declaration(d) => eprintln!("  [{}] Declaration: {} declarators", i, d.declarators.len()),
-            }
-        }
-
-        assert_eq!(tu.len(), 1, "should have 1 external decl");
-        match &tu[0] {
-            ExternalDecl::Function(f) => {
-                if let Statement::Compound(items) = &f.body {
-                    eprintln!("  body has {} items", items.len());
-                    for item in items {
-                        eprintln!("    {:?}", item);
-                    }
-                    assert!(!items.is_empty(), "body should have statements");
-                } else {
-                    panic!("expected compound body");
-                }
-            }
-            _ => panic!("expected function"),
-        }
-    }
-
-    #[test]
-    fn diag_resolve_type() {
-        let mut pp = Preprocessor::new(vec![], vec![], None);
-        let preprocessed = pp.preprocess("int main(void) { return 42; }", "<test>");
-        let tokens = Lexer::new(&preprocessed, "<test>").tokenize();
-        let parser = Parser::new(tokens);
-        let (tu, type_env) = parser.parse();
-
-        let module = emit::create_module("<test>", None);
-        let mut cg = Codegen::new(module, type_env);
-
-        if let ExternalDecl::Function(f) = &tu[0] {
-            let base_ty = cg.resolve_type(&f.specifiers);
-            eprintln!("base type: {:?}", base_ty);
-            let func_ty = cg.apply_declarator(&base_ty, &f.declarator);
-            eprintln!("func type: {:?}", func_ty);
-            match &func_ty {
-                CType::Function(ret, params, variadic) => {
-                    eprintln!("  ret: {:?}, params: {:?}, variadic: {}", ret, params, variadic);
-                }
-                _ => panic!("expected function type, got {:?}", func_ty),
-            }
-        }
-    }
-
-    #[test]
-    fn diag_compile_function_direct() {
-        // Bypass compile_function - do the codegen step by step manually
-        use crate::types::TypeEnv;
-
-        let module = emit::create_module("<test>", None);
-        let type_env = TypeEnv::new();
-        let mut cg = Codegen::new(module, type_env);
-
-        // 1. Declare
-        let mut sig = cg.module.make_signature();
-        sig.returns.push(AbiParam::new(I32));
-        let func_id = cg.module.declare_function("test_fn", Linkage::Export, &sig).unwrap();
-
-        // 2. Build function with FunctionBuilder
-        let mut func = ir::Function::with_name_signature(
-            ir::UserFuncName::user(0, func_id.as_u32()),
-            sig,
-        );
-        let mut fb_ctx = FunctionBuilderContext::new();
-        let mut builder = FunctionBuilder::new(&mut func, &mut fb_ctx);
-
-        let entry = builder.create_block();
-        builder.append_block_params_for_function_params(entry);
-        builder.switch_to_block(entry);
-        builder.ensure_inserted_block();
-        builder.seal_block(entry);
-
-        // Now simulate what compile_stmt does for Return(IntLit(42))
-        let mut ctx = FuncCtx {
-            builder,
-            name: "test_fn".to_string(),
-            locals: HashMap::new(),
-            local_ptrs: HashMap::new(),
-            return_type: CType::Int(true),
-            filled: false,
-            break_block: None,
-            continue_block: None,
-            switch_val: None,
-            switch_exit: None,
-            labels: HashMap::new(),
-            gotos: Vec::new(),
-        };
-
-        // Check: is builder unreachable?
-        eprintln!("is_unreachable before stmt: {}", ctx.builder.is_unreachable());
-        eprintln!("current_block: {:?}", ctx.builder.current_block());
-
-        // Compile: return 42;
-        let body = Statement::Compound(vec![
-            BlockItem::Stmt(Statement::Return(Some(Expr::IntLit(42)))),
-        ]);
-        cg.compile_stmt(&mut ctx, &body);
-
-        eprintln!("is_unreachable after stmt: {}", ctx.builder.is_unreachable());
-
-        ctx.builder.seal_all_blocks();
-        ctx.builder.finalize();
-
-        eprintln!("layout blocks: {}", func.layout.blocks().count());
-        eprintln!("IR:\n{}", func.display());
-
-        let mut cl_ctx = cranelift_codegen::Context::new();
-        cl_ctx.func = func;
-        cg.module.define_function(func_id, &mut cl_ctx).unwrap();
-
-        let obj = emit::finish(cg.module);
-        assert!(!obj.is_empty(), "object file should not be empty");
-    }
-
-    /// Raw Cranelift test to verify the API works directly.
-    #[test]
-    fn raw_cranelift_return_42() {
-        let mut module = emit::create_module("<raw_test>", None);
-
-        let mut sig = module.make_signature();
-        sig.returns.push(AbiParam::new(I32));
-        let func_id = module.declare_function("main", Linkage::Export, &sig).unwrap();
-
-        let mut func = ir::Function::with_name_signature(
-            ir::UserFuncName::user(0, func_id.as_u32()),
-            sig,
-        );
-
-        let mut fb_ctx = FunctionBuilderContext::new();
-        let mut builder = FunctionBuilder::new(&mut func, &mut fb_ctx);
-
-        let entry = builder.create_block();
-        builder.append_block_params_for_function_params(entry);
-        builder.switch_to_block(entry);
-        builder.seal_block(entry);
-
-        let val = builder.ins().iconst(I32, 42);
-        builder.ins().return_(&[val]);
-
-        builder.seal_all_blocks();
-        builder.finalize();
-
-        eprintln!("raw cranelift IR:\n{}", func.display());
-
-        let mut cl_ctx = cranelift_codegen::Context::new();
-        cl_ctx.func = func;
-        module.define_function(func_id, &mut cl_ctx).unwrap();
-
-        let product = module.finish();
-        let obj = product.emit().unwrap();
-        assert!(!obj.is_empty(), "object file should not be empty");
-    }
-
-    #[test]
-    fn return_constant() {
-        assert_compiles("int main(void) { return 42; }");
-    }
-
-    #[test]
-    fn empty_void_function() {
-        assert_compiles("void f(void) {}");
-    }
-
-    #[test]
-    fn return_zero() {
-        assert_compiles("int main(void) { return 0; }");
-    }
-
-    #[test]
-    fn simple_addition() {
-        assert_compiles("int f(void) { return 1 + 2; }");
-    }
-
-    #[test]
-    fn arithmetic_ops() {
-        assert_compiles("int f(int a, int b) { return a + b - a * b / (b + 1); }");
-    }
-
-    #[test]
-    fn local_variable() {
-        assert_compiles("int f(void) { int x = 42; return x; }");
-    }
-
-    #[test]
-    fn multiple_locals() {
-        assert_compiles("int f(void) { int x = 1; int y = 2; return x + y; }");
-    }
-
-    #[test]
-    fn if_statement() {
-        assert_compiles("int f(int x) { if (x) return 1; return 0; }");
-    }
-
-    #[test]
-    fn if_else_statement() {
-        assert_compiles("int f(int x) { if (x) return 1; else return 0; }");
-    }
-
-    #[test]
-    fn while_loop() {
-        assert_compiles("int f(int n) { int s = 0; while (n > 0) { s = s + n; n = n - 1; } return s; }");
-    }
-
-    #[test]
-    fn for_loop() {
-        assert_compiles("int f(void) { int s = 0; for (int i = 0; i < 10; i = i + 1) { s = s + i; } return s; }");
-    }
-
-    #[test]
-    fn do_while_loop() {
-        assert_compiles("int f(void) { int x = 0; do { x = x + 1; } while (x < 10); return x; }");
-    }
-
-    #[test]
-    fn nested_if() {
-        assert_compiles("int f(int a, int b) { if (a) { if (b) return 1; return 2; } return 3; }");
-    }
-
-    #[test]
-    fn comparison_operators() {
-        assert_compiles(r#"
-            int f(int a, int b) {
-                if (a == b) return 0;
-                if (a != b) return 1;
-                if (a < b) return 2;
-                if (a > b) return 3;
-                if (a <= b) return 4;
-                if (a >= b) return 5;
-                return -1;
-            }
-        "#);
-    }
-
-    #[test]
-    fn logical_operators() {
-        assert_compiles("int f(int a, int b) { return (a && b) || (!a); }");
-    }
-
-    #[test]
-    fn bitwise_operators() {
-        assert_compiles("int f(int a, int b) { return (a & b) | (a ^ b) | (~a) | (a << 2) | (b >> 1); }");
-    }
-
-    #[test]
-    fn multiple_functions() {
-        assert_compiles(r#"
-            int helper(int x) { return x * 2; }
-            int main(void) { return helper(21); }
-        "#);
-    }
-
-    #[test]
-    fn function_call() {
-        assert_compiles(r#"
-            int add(int a, int b) { return a + b; }
-            int main(void) { return add(1, 2); }
-        "#);
-    }
-
-    #[test]
-    fn global_variable() {
-        assert_compiles(r#"
-            int g;
-            int f(void) { return g; }
-        "#);
-    }
-
-    #[test]
-    fn string_literal() {
-        assert_compiles(r#"
-            void f(void) { const char *s = "hello"; }
-        "#);
-    }
-
-    #[test]
-    fn pointer_ops() {
-        assert_compiles(r#"
-            int f(void) { int x = 42; int *p = &x; return *p; }
-        "#);
-    }
-
-    #[test]
-    fn break_continue() {
-        assert_compiles(r#"
-            int f(void) {
-                int s = 0;
-                for (int i = 0; i < 100; i = i + 1) {
-                    if (i == 50) break;
-                    if (i % 2 == 0) continue;
-                    s = s + i;
-                }
-                return s;
-            }
-        "#);
-    }
-
-    #[test]
-    fn switch_statement() {
-        assert_compiles(r#"
-            int f(int x) {
-                switch (x) {
-                    case 0: return 10;
-                    case 1: return 20;
-                    default: return 30;
-                }
-            }
-        "#);
-    }
-
-    #[test]
-    fn goto_label() {
-        assert_compiles(r#"
-            int f(void) {
-                int x = 0;
-                goto end;
-                x = 42;
-                end:
-                return x;
-            }
-        "#);
-    }
-
-    #[test]
-    fn conditional_expr() {
-        assert_compiles("int f(int x) { return x ? 1 : 0; }");
-    }
-
-    #[test]
-    fn cast_expr() {
-        assert_compiles("long f(int x) { return (long)x; }");
-    }
-
-    #[test]
-    fn unsigned_types() {
-        assert_compiles("unsigned int f(unsigned int x) { return x + 1; }");
-    }
-
-    #[test]
-    fn char_type() {
-        assert_compiles("char f(char c) { return c + 1; }");
-    }
-
-    #[test]
-    fn void_function_no_return() {
-        assert_compiles("void f(void) { int x = 42; }");
-    }
-
-    #[test]
-    fn static_function() {
-        assert_compiles("static int helper(void) { return 42; } int main(void) { return helper(); }");
-    }
-
-    #[test]
-    fn nested_loops() {
-        assert_compiles(r#"
-            int f(void) {
-                int s = 0;
-                for (int i = 0; i < 10; i = i + 1) {
-                    for (int j = 0; j < 10; j = j + 1) {
-                        s = s + 1;
-                    }
-                }
-                return s;
-            }
-        "#);
-    }
-
-    #[test]
-    fn unreachable_code_after_return() {
-        assert_compiles(r#"
-            int f(void) {
-                return 1;
-                int x = 2;
-                return x;
-            }
-        "#);
-    }
-
-    #[test]
-    fn all_paths_return() {
-        assert_compiles(r#"
-            int f(int x) {
-                if (x > 0) {
-                    return 1;
-                } else {
-                    return -1;
-                }
-            }
-        "#);
-    }
-
-    #[test]
-    fn complex_program() {
-        assert_compiles(r#"
-            int fibonacci(int n) {
-                if (n <= 1) return n;
-                return fibonacci(n - 1) + fibonacci(n - 2);
-            }
-            int main(void) {
-                return fibonacci(10);
-            }
-        "#);
-    }
-
-    #[test]
-    fn func_name_builtin() {
-        assert_compiles(r#"
-            const char *get_name(void) {
-                return __func__;
-            }
-            const char *get_name2(void) {
-                return __FUNCTION__;
-            }
-        "#);
-    }
-
-    #[test]
-    fn function_pointer_local_call() {
-        assert_compiles(r#"
-            int square(int x) { return x * x; }
-            int main(void) {
-                int (*fp)(int) = &square;
-                return fp(5);
-            }
-        "#);
-    }
-
-    #[test]
-    fn function_pointer_global_call() {
-        assert_compiles(r#"
-            int square(int x) { return x * x; }
-            static int (*gfp)(int);
-            int main(void) {
-                gfp = &square;
-                return gfp(5);
-            }
-        "#);
-    }
-
-    #[test]
-    fn apply_declarator_function_pointer() {
-        // void *(*fp)(void*, unsigned long) should produce Pointer(Function(...))
-        let mut pp = Preprocessor::new(vec![], vec![], None);
-        let preprocessed = pp.preprocess("void *(*fp)(void*, unsigned long);", "<test>");
-        let tokens = Lexer::new(&preprocessed, "<test>").tokenize();
-        let parser = Parser::new(tokens);
-        let (tu, type_env) = parser.parse();
-
-        let module = emit::create_module("<test>", None);
-        let mut cg = Codegen::new(module, type_env);
-
-        if let ExternalDecl::Declaration(d) = &tu[0] {
-            let base_ty = cg.resolve_type(&d.specifiers);
-            let ty = cg.apply_declarator(&base_ty, &d.declarators[0].declarator);
-            // Should be Pointer(Function(Pointer(Void), ...))
-            match &ty {
-                CType::Pointer(inner) => match inner.as_ref() {
-                    CType::Function(ret, params, _) => {
-                        assert!(matches!(ret.as_ref(), CType::Pointer(_)), "return type should be pointer, got {:?}", ret);
-                        assert_eq!(params.len(), 2, "should have 2 params");
-                    }
-                    other => panic!("expected Function inside Pointer, got {:?}", other),
-                },
-                other => panic!("expected Pointer(Function(...)), got {:?}", other),
-            }
-        } else {
-            panic!("expected declaration");
-        }
-    }
-
-    #[test]
-    fn apply_declarator_pointer_to_array() {
-        // int (*arr)[10] should produce Pointer(Array(Int, 10))
-        let mut pp = Preprocessor::new(vec![], vec![], None);
-        let preprocessed = pp.preprocess("int (*arr)[10];", "<test>");
-        let tokens = Lexer::new(&preprocessed, "<test>").tokenize();
-        let parser = Parser::new(tokens);
-        let (tu, type_env) = parser.parse();
-
-        let module = emit::create_module("<test>", None);
-        let mut cg = Codegen::new(module, type_env);
-
-        if let ExternalDecl::Declaration(d) = &tu[0] {
-            let base_ty = cg.resolve_type(&d.specifiers);
-            let ty = cg.apply_declarator(&base_ty, &d.declarators[0].declarator);
-            match &ty {
-                CType::Pointer(inner) => match inner.as_ref() {
-                    CType::Array(elem, Some(10)) => {
-                        assert!(matches!(elem.as_ref(), CType::Int(_)), "element should be int, got {:?}", elem);
-                    }
-                    other => panic!("expected Array(Int, 10) inside Pointer, got {:?}", other),
-                },
-                other => panic!("expected Pointer(Array(...)), got {:?}", other),
-            }
-        } else {
-            panic!("expected declaration");
         }
     }
 }

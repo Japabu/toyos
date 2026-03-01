@@ -128,6 +128,9 @@ fn tcc_defines() -> Vec<&'static str> {
         "-DCONFIG_TCC_LIBPATHS=\"/usr/lib\"",
         "-DCONFIG_TCC_SYSINCLUDEPATHS=\"/usr/include\"",
         "-DCONFIG_LDDIR=\"lib\"",
+        // HACK: defining as 0 still makes #ifdef true in tcc.h, activating
+        // comma-expression wrappers. But without it, tcc.h defaults to 1 which
+        // pulls in <dispatch/dispatch.h> on macOS — unparseable by toyos-cc.
         "-DCONFIG_TCC_SEMLOCK=0",
     ]
 }

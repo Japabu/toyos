@@ -1,16 +1,37 @@
+#[macro_use]
+mod verbose;
+#[allow(dead_code)]
 mod ast;
 mod codegen;
 mod emit;
 mod lex;
 mod parse;
 mod preprocess;
+#[allow(dead_code)]
 mod types;
 
 use std::path::PathBuf;
 use std::{env, fs, process};
 
 fn main() {
+    // TCC has deeply nested expressions; use a larger stack
+    std::thread::Builder::new()
+        .stack_size(128 * 1024 * 1024)
+        .spawn(|| run())
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+fn run() {
     let args = parse_args();
+
+    if args.verbose {
+        verbose::set(true);
+        eprintln!("toyos-cc: verbose mode enabled");
+    }
+
+    eprintln!("toyos-cc: starting");
 
     for input in &args.inputs {
         let source = fs::read_to_string(input).unwrap_or_else(|e| {
@@ -18,24 +39,27 @@ fn main() {
             process::exit(1);
         });
 
-        // Preprocess
+        eprintln!("toyos-cc: preprocessing...");
         let mut pp = preprocess::Preprocessor::new(args.include_paths.clone(), args.defines.clone(), args.target.as_deref());
         let preprocessed = pp.preprocess(&source, &input.to_string_lossy());
+        eprintln!("toyos-cc: preprocessing done, {} bytes", preprocessed.len());
 
         if args.preprocess_only {
             print!("{preprocessed}");
             continue;
         }
 
-        // Lex
+        eprintln!("toyos-cc: lexing...");
         let lexer = lex::Lexer::new(&preprocessed, &input.to_string_lossy());
         let tokens = lexer.tokenize();
+        eprintln!("toyos-cc: lexing done, {} tokens", tokens.len());
 
-        // Parse
+        eprintln!("toyos-cc: parsing...");
         let parser = parse::Parser::new(tokens);
         let (tu, type_env) = parser.parse();
+        eprintln!("toyos-cc: parsing done, {} decls", tu.len());
 
-        // Codegen
+        eprintln!("toyos-cc: codegen...");
         let obj_name = args.output.as_ref()
             .map(|o| o.to_string_lossy().into_owned())
             .unwrap_or_else(|| input.with_extension("o").to_string_lossy().into_owned());
@@ -53,13 +77,11 @@ fn main() {
         };
 
         if args.compile_only {
-            // Write object file
             fs::write(&output_path, &object_bytes).unwrap_or_else(|e| {
                 eprintln!("toyos-cc: cannot write {}: {e}", output_path.display());
                 process::exit(1);
             });
         } else {
-            // Write object file temporarily, then link
             let tmp_obj = input.with_extension("o");
             fs::write(&tmp_obj, &object_bytes).unwrap_or_else(|e| {
                 eprintln!("toyos-cc: cannot write {}: {e}", tmp_obj.display());
@@ -99,6 +121,7 @@ struct Args {
     target: Option<String>,
     compile_only: bool,    // -c
     preprocess_only: bool, // -E
+    verbose: bool,         // -v / --verbose
 }
 
 fn parse_args() -> Args {
@@ -110,6 +133,7 @@ fn parse_args() -> Args {
     let mut target = None;
     let mut compile_only = false;
     let mut preprocess_only = false;
+    let mut verbose = false;
     let mut i = 1;
 
     while i < argv.len() {
@@ -117,6 +141,7 @@ fn parse_args() -> Args {
             "-o" => { i += 1; output = Some(PathBuf::from(&argv[i])); }
             "-c" => compile_only = true,
             "-E" => preprocess_only = true,
+            "-v" | "--verbose" => verbose = true,
             "--target" => { i += 1; target = Some(argv[i].clone()); }
             "-I" => { i += 1; include_paths.push(PathBuf::from(&argv[i])); }
             s if s.starts_with("-I") => include_paths.push(PathBuf::from(&s[2..])),
@@ -158,5 +183,5 @@ fn parse_args() -> Args {
         process::exit(1);
     }
 
-    Args { inputs, output, include_paths, defines, target, compile_only, preprocess_only }
+    Args { inputs, output, include_paths, defines, target, compile_only, preprocess_only, verbose }
 }
