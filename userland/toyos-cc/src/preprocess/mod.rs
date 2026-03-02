@@ -172,8 +172,20 @@ impl Preprocessor {
             if !pending_line.is_empty() {
                 let trimmed_check = line.trim();
                 if trimmed_check.starts_with('#') {
-                    // Directive inside multi-line expression — process it but stay in accumulation
-                    // (e.g., #if/#else/#endif within a function argument list)
+                    // Directive inside multi-line expression.
+                    // #include produces output that must appear after pending_line,
+                    // so flush pending_line first. Other directives (conditionals,
+                    // #define, etc.) don't produce output and can fall through.
+                    let dt = trimmed_check[1..].trim_start();
+                    let dir_end = dt.find(|c: char| !c.is_ascii_alphabetic() && c != '_').unwrap_or(dt.len());
+                    let dir_name = &dt[..dir_end];
+
+                    if self.is_active(&if_stack) && (dir_name == "include" || dir_name == "include_next") {
+                        let expanded = self.expand_line(&pending_line);
+                        self.output.push_str(&expanded);
+                        self.output.push('\n');
+                        pending_line.clear();
+                    }
                     // Fall through to directive processing below
                 } else if !self.is_active(&if_stack) {
                     // Inside inactive #if branch — skip this line

@@ -124,4 +124,5 @@ pp_test!(pp20, "20");
 pp_test!(pp21, "21");
 pp_test!(pp22, "22");
 pp_test!(pp23, "23");
+pp_test!(pp24, "24");
 pp_test!(pp_counter, "pp-counter");

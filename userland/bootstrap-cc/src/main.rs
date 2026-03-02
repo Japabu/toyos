@@ -19,6 +19,7 @@ fn main() {
     } else {
         println!("[stage 0] TinyCC already present, skipping download.");
     }
+    configure_tcc(&tcc_dir);
 
     // ── Build toyos-cc ──────────────────────────────────────────────────
     let toyos_cc_dir = project_dir.join("../toyos-cc");
@@ -59,6 +60,7 @@ fn main() {
         .args(tcc_defines(&tcc_dir))
         .arg("-I").arg(tcc_dir.join("include"))
         .arg("-I").arg(&tcc_dir)
+        .args(system_include_args())
         .arg(tcc_dir.join("tcc.c"))
         .current_dir(&project_dir));
 
@@ -109,16 +111,29 @@ fn download_tcc(dest: &Path) {
 
     fs::rename(&inner, dest).expect("failed to rename extracted directory");
     fs::remove_dir_all(&tmp).ok();
+}
 
+fn configure_tcc(tcc_dir: &Path) {
     // Generate config.h — normally produced by ./configure
-    // CONFIG_TCC_PREDEFS=0: tccdefs.h loaded at runtime (avoids needing tccdefs_.h)
+    // CONFIG_TCC_PREDEFS=1: bake tccdefs into the TCC binary via tccdefs_.h
     // CONFIG_TCC_SEMLOCK=0: defined so #ifdef is true (tcc.h needs it), but #if is false
     //   (avoids pulling in <dispatch/dispatch.h> on macOS)
-    fs::write(dest.join("config.h"), "\
-#define CONFIG_TCC_PREDEFS 0\n\
+    fs::write(tcc_dir.join("config.h"), "\
+#define CONFIG_TCC_PREDEFS 1\n\
 #define GCC_MAJOR 4\n\
 #define GCC_MINOR 0\n\
 ").expect("failed to write config.h");
+
+    // Build c2str and generate tccdefs_.h (string-ified predefs baked into TCC)
+    let c2str = tcc_dir.join("c2str");
+    run(Command::new("cc")
+        .args(["-DC2STR", "-o"])
+        .arg(&c2str)
+        .arg(tcc_dir.join("conftest.c")));
+    run(Command::new(&c2str)
+        .arg(tcc_dir.join("include/tccdefs.h"))
+        .arg(tcc_dir.join("tccdefs_.h")));
+    fs::remove_file(&c2str).ok();
 }
 
 fn tcc_defines(tcc_dir: &Path) -> Vec<String> {

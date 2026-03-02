@@ -244,3 +244,4 @@ tinycc_test!(t144_sizeof_init, "144_sizeof_init");
 tinycc_test!(t145_self_ref_struct, "145_self_ref_struct");
 tinycc_test!(t146_deref_assign, "146_deref_assign");
 tinycc_test!(t147_sizeof_deref_array, "147_sizeof_deref_array");
+tinycc_test!(t148_directive_in_args, "148_directive_in_args");
