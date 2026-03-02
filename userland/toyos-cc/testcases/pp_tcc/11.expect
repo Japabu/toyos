@@ -7,6 +7,5 @@ x a b c y
 x a b y
 x a y
 x  y
-__attribute__((__noreturn__))
 1 2
 D_B_D_A

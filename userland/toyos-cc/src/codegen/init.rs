@@ -36,7 +36,7 @@ impl Codegen {
     fn struct_field_offset(def: &StructDef, target_idx: usize) -> usize {
         let mut offset = 0usize;
         for (i, field) in def.fields.iter().enumerate() {
-            let align = if def.packed { 1 } else { field.ty.align() };
+            let align = field.ty.align();
             offset = (offset + align - 1) & !(align - 1);
             if i == target_idx { return offset; }
             offset += field.ty.size();

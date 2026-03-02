@@ -31,7 +31,6 @@ pub struct ParamType {
 pub struct StructDef {
     pub name: Option<String>,
     pub fields: Vec<FieldDef>,
-    pub packed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -76,14 +75,8 @@ impl CType {
             CType::LongDouble | CType::Int128(_) => 16,
             CType::Array(elem, _) => elem.align(),
             CType::Function(..) => 8,
-            CType::Struct(def) => {
-                if def.packed { 1 }
-                else { def.fields.iter().map(|f| f.ty.align()).max().unwrap_or(1) }
-            }
-            CType::Union(def) => {
-                if def.packed { 1 }
-                else { def.fields.iter().map(|f| f.ty.align()).max().unwrap_or(1) }
-            }
+            CType::Struct(def) => def.fields.iter().map(|f| f.ty.align()).max().unwrap_or(1),
+            CType::Union(def) => def.fields.iter().map(|f| f.ty.align()).max().unwrap_or(1),
         }
     }
 
@@ -119,7 +112,7 @@ impl CType {
         for field in &def.fields {
             if field.bit_width.is_some() {
                 // Simplified bitfield handling - allocate full type size
-                let align = if def.packed { 1 } else { field.ty.align() };
+                let align = field.ty.align();
                 offset = (offset + align - 1) & !(align - 1);
                 offset += field.ty.size();
                 continue;
@@ -128,7 +121,7 @@ impl CType {
             if matches!(&field.ty, CType::Array(_, None)) {
                 continue;
             }
-            let align = if def.packed { 1 } else { field.ty.align() };
+            let align = field.ty.align();
             offset = (offset + align - 1) & !(align - 1);
             offset += field.ty.size();
         }
@@ -151,7 +144,7 @@ impl CType {
         };
         let mut offset = 0usize;
         for field in &def.fields {
-            let align = if def.packed { 1 } else { field.ty.align() };
+            let align = field.ty.align();
             offset = (offset + align - 1) & !(align - 1);
 
             if field.name.as_deref() == Some(name) {
@@ -295,7 +288,7 @@ impl TypeEnv {
         env.typedefs.insert("__uint128_t".into(), CType::Int128(false));
         env.typedefs.insert("va_list".into(), CType::Pointer(Box::new(CType::Void)));
         env.typedefs.insert("__builtin_va_list".into(), CType::Pointer(Box::new(CType::Void)));
-        env.typedefs.insert("FILE".into(), CType::Struct(StructDef { name: Some("_IO_FILE".into()), fields: Vec::new(), packed: false }));
+        env.typedefs.insert("FILE".into(), CType::Struct(StructDef { name: Some("_IO_FILE".into()), fields: Vec::new() }));
         env.typedefs.insert("wchar_t".into(), CType::Int(true));
         // POSIX/system types
         env.typedefs.insert("off_t".into(), CType::Long(true));
@@ -313,11 +306,11 @@ impl TypeEnv {
         env.typedefs.insert("jmp_buf".into(), CType::Array(Box::new(CType::Long(true)), Some(8)));
         env.typedefs.insert("sigjmp_buf".into(), CType::Array(Box::new(CType::Long(true)), Some(8)));
         // Sync/threading types
-        env.typedefs.insert("sem_t".into(), CType::Struct(StructDef { name: Some("sem_t".into()), fields: Vec::new(), packed: false }));
+        env.typedefs.insert("sem_t".into(), CType::Struct(StructDef { name: Some("sem_t".into()), fields: Vec::new() }));
         env.typedefs.insert("dispatch_semaphore_t".into(), CType::Pointer(Box::new(CType::Void)));
         env.typedefs.insert("pthread_t".into(), CType::Long(false));
-        env.typedefs.insert("pthread_mutex_t".into(), CType::Struct(StructDef { name: Some("pthread_mutex_t".into()), fields: Vec::new(), packed: false }));
-        env.typedefs.insert("pthread_cond_t".into(), CType::Struct(StructDef { name: Some("pthread_cond_t".into()), fields: Vec::new(), packed: false }));
+        env.typedefs.insert("pthread_mutex_t".into(), CType::Struct(StructDef { name: Some("pthread_mutex_t".into()), fields: Vec::new() }));
+        env.typedefs.insert("pthread_cond_t".into(), CType::Struct(StructDef { name: Some("pthread_cond_t".into()), fields: Vec::new() }));
         env
     }
 

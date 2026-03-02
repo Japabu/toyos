@@ -121,8 +121,6 @@ impl Parser {
                 let d = self.declarator();
                 let init = if self.eat(&TokenKind::Eq) { Some(self.initializer()) } else { None };
                 declarators.push(InitDeclarator { declarator: d, initializer: init });
-                // Skip __attribute__ and __asm("label")
-                if matches!(self.peek(), TokenKind::Attribute) { self.parse_attributes(); }
                 self.skip_asm_label();
                 if !self.eat(&TokenKind::Comma) { break; }
             }

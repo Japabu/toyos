@@ -51,7 +51,6 @@ pub enum DeclSpecifier {
     TypeSpec(TypeSpec),
     TypeQual(TypeQual),
     FuncSpec(FuncSpec),
-    Attribute(Vec<Attribute>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -89,7 +88,6 @@ pub enum TypeSpec {
 pub struct StructType {
     pub name: Option<String>,
     pub fields: Option<Vec<StructField>>,
-    pub attributes: Vec<Attribute>,
 }
 
 #[derive(Debug, Clone)]
@@ -108,7 +106,6 @@ pub struct StructFieldDeclarator {
 pub struct EnumType {
     pub name: Option<String>,
     pub variants: Option<Vec<Enumerator>>,
-    pub attributes: Vec<Attribute>,
 }
 
 #[derive(Debug, Clone)]
@@ -127,12 +124,6 @@ pub enum TypeQual {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum FuncSpec {
     Inline,
-}
-
-#[derive(Debug, Clone)]
-pub struct Attribute {
-    pub name: String,
-    pub args: Vec<Expr>,
 }
 
 // Declarator

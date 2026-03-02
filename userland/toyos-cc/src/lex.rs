@@ -32,7 +32,7 @@ pub enum TokenKind {
     Short, Signed, Sizeof, Static, Struct, Switch, Typedef, Union,
     Unsigned, Void, Volatile, While, Restrict, Inline, Bool,
     // GNU extensions
-    Typeof, Asm, Attribute, Extension, Builtin(String),
+    Typeof, Asm, Extension, Builtin(String),
     Alignof, Alignas,
     Int128,
     // C99
@@ -486,7 +486,6 @@ impl<'a> Lexer<'a> {
                         "_Bool" => TokenKind::Bool,
                         "typeof" | "__typeof" | "__typeof__" => TokenKind::Typeof,
                         "__asm" | "__asm__" | "asm" => TokenKind::Asm,
-                        "__attribute" | "__attribute__" => TokenKind::Attribute,
                         "__extension__" => TokenKind::Extension,
                         "__builtin_va_arg" | "va_arg" => TokenKind::VaArg,
                         "__alignof" | "__alignof__" | "_Alignof" => TokenKind::Alignof,

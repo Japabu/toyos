@@ -103,13 +103,6 @@ impl Preprocessor {
             pp.define_object("__APPLE__", "1");
             pp.define_object("__APPLE_CC__", "1");
             pp.define_object("__MACH__", "1");
-            // Auto-include Apple compat header (nullability annotations etc.) if present
-            if let Some(compat) = pp.include_paths.iter()
-                .map(|d| d.join("apple_compat.h"))
-                .find(|p| p.exists())
-            {
-                pp.implicit_includes.push(compat);
-            }
         } else {
             // Default to Linux-like
             pp.define_object("__linux__", "1");
@@ -118,30 +111,14 @@ impl Preprocessor {
             pp.define_object("__gnu_linux__", "1");
         }
 
-        pp.define_object("NULL", "((void*)0)");
+        // Auto-include compiler compat header if present in include path
+        if let Some(compat) = pp.include_paths.iter()
+            .map(|d| d.join("compat.h"))
+            .find(|p| p.exists())
+        {
+            pp.implicit_includes.push(compat);
+        }
 
-        // GCC builtin type macros — match clang's exact token spelling
-        pp.define_object("__SIZE_TYPE__", "long unsigned int");
-        pp.define_object("__PTRDIFF_TYPE__", "long int");
-        pp.define_object("__WCHAR_TYPE__", "int");
-        pp.define_object("__WINT_TYPE__", "int");
-        pp.define_object("__INT8_TYPE__", "signed char");
-        pp.define_object("__INT16_TYPE__", "short");
-        pp.define_object("__INT32_TYPE__", "int");
-        pp.define_object("__INT64_TYPE__", "long long int");
-        pp.define_object("__UINT8_TYPE__", "unsigned char");
-        pp.define_object("__UINT16_TYPE__", "unsigned short");
-        pp.define_object("__UINT32_TYPE__", "unsigned int");
-        pp.define_object("__UINT64_TYPE__", "long long unsigned int");
-        pp.define_object("__INTPTR_TYPE__", "long int");
-        pp.define_object("__UINTPTR_TYPE__", "long unsigned int");
-        pp.define_object("__INTMAX_TYPE__", "long int");
-        pp.define_object("__UINTMAX_TYPE__", "long unsigned int");
-
-        // stdarg.h builtins
-        pp.define_function("va_start", &["ap", "last"], "__builtin_va_start(ap, last)");
-        pp.define_function("va_end", &["ap"], "__builtin_va_end(ap)");
-        pp.define_function("va_copy", &["d", "s"], "__builtin_va_copy(d, s)");
         // Define compiler predicate macros as objects so that #ifdef / defined() checks work.
         // The actual function-call evaluation (__has_attribute(x) etc.) is handled by
         // replace_compiler_predicates() in eval_constant_expr, before macro expansion.

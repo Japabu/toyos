@@ -40,14 +40,12 @@ impl Parser {
         }
 
         let init = if self.eat(&TokenKind::Eq) { Some(self.initializer()) } else { None };
-        if matches!(self.peek(), TokenKind::Attribute) { self.parse_attributes(); }
         self.skip_asm_label();
         let mut declarators = vec![InitDeclarator { declarator, initializer: init }];
 
         while self.eat(&TokenKind::Comma) {
             let d = self.declarator();
             let init = if self.eat(&TokenKind::Eq) { Some(self.initializer()) } else { None };
-            if matches!(self.peek(), TokenKind::Attribute) { self.parse_attributes(); }
             self.skip_asm_label();
             declarators.push(InitDeclarator { declarator: d, initializer: init });
         }
@@ -131,7 +129,7 @@ impl Parser {
         match self.peek() {
             t if self.is_type_keyword(t) => true,
             TokenKind::Ident(name) => self.type_env.is_typedef(name),
-            TokenKind::Attribute | TokenKind::Extension => true,
+            TokenKind::Extension => true,
             _ => false,
         }
     }
@@ -146,7 +144,7 @@ impl Parser {
                     false
                 }
             }
-            TokenKind::Attribute | TokenKind::Extension => true,
+            TokenKind::Extension => true,
             _ => false,
         }
     }
@@ -207,12 +205,6 @@ impl Parser {
                 // __extension__
                 TokenKind::Extension => { self.advance(); }
 
-                // __attribute__
-                TokenKind::Attribute => {
-                    let attrs = self.parse_attributes();
-                    specs.push(DeclSpecifier::Attribute(attrs));
-                }
-
                 // Typedef name
                 TokenKind::Ident(name) if self.type_env.is_typedef(name) => {
                     let name = name.clone();
@@ -234,12 +226,6 @@ impl Parser {
     }
 
     fn struct_or_union_type(&mut self) -> StructType {
-        let mut attrs = Vec::new();
-
-        if matches!(self.peek(), TokenKind::Attribute) {
-            attrs = self.parse_attributes();
-        }
-
         let name = if let TokenKind::Ident(s) = self.peek() {
             let s = s.clone();
             self.advance();
@@ -247,10 +233,6 @@ impl Parser {
         } else {
             None
         };
-
-        if matches!(self.peek(), TokenKind::Attribute) {
-            attrs.extend(self.parse_attributes());
-        }
 
         let fields = if self.peek() == &TokenKind::LBrace {
             self.advance();
@@ -277,7 +259,6 @@ impl Parser {
                             };
                             declarators.push(StructFieldDeclarator { declarator: Some(d), bit_width: bw });
                         }
-                        if matches!(self.peek(), TokenKind::Attribute) { self.parse_attributes(); }
                         if !self.eat(&TokenKind::Comma) { break; }
                     }
                 }
@@ -290,19 +271,10 @@ impl Parser {
             None
         };
 
-        if matches!(self.peek(), TokenKind::Attribute) {
-            attrs.extend(self.parse_attributes());
-        }
-
-        StructType { name, fields, attributes: attrs }
+        StructType { name, fields }
     }
 
     fn enum_type(&mut self) -> EnumType {
-        let mut attrs = Vec::new();
-        if matches!(self.peek(), TokenKind::Attribute) {
-            attrs = self.parse_attributes();
-        }
-
         let name = if let TokenKind::Ident(s) = self.peek() {
             let s = s.clone();
             self.advance();
@@ -337,31 +309,7 @@ impl Parser {
             None
         };
 
-        EnumType { name, variants, attributes: attrs }
-    }
-
-    pub(super) fn parse_attributes(&mut self) -> Vec<Attribute> {
-        let mut attrs = Vec::new();
-        while matches!(self.peek(), TokenKind::Attribute) {
-            self.advance();
-            self.expect(&TokenKind::LParen);
-            self.expect(&TokenKind::LParen);
-            while self.peek() != &TokenKind::RParen {
-                if let TokenKind::Ident(name) = self.peek().clone() {
-                    self.advance();
-                    if self.peek() == &TokenKind::LParen {
-                        self.skip_balanced_parens();
-                    }
-                    attrs.push(Attribute { name, args: Vec::new() });
-                } else {
-                    self.advance();
-                }
-                let _ = self.eat(&TokenKind::Comma);
-            }
-            self.expect(&TokenKind::RParen);
-            self.expect(&TokenKind::RParen);
-        }
-        attrs
+        EnumType { name, variants }
     }
 
     fn skip_balanced_parens(&mut self) {
@@ -399,8 +347,6 @@ impl Parser {
             }
             pointer.push(Pointer { qualifiers: quals });
         }
-
-        if matches!(self.peek(), TokenKind::Attribute) { self.parse_attributes(); }
 
         let direct = self.direct_declarator();
         Declarator { pointer, direct }
@@ -454,7 +400,6 @@ impl Parser {
             }
         }
 
-        if matches!(self.peek(), TokenKind::Attribute) { self.parse_attributes(); }
         self.skip_asm_label();
 
         dd
