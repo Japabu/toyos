@@ -100,23 +100,23 @@ impl Preprocessor {
 
         pp.define_object("NULL", "((void*)0)");
 
-        // GCC builtin type macros
-        pp.define_object("__SIZE_TYPE__", "unsigned long");
-        pp.define_object("__PTRDIFF_TYPE__", "long");
+        // GCC builtin type macros — match clang's exact token spelling
+        pp.define_object("__SIZE_TYPE__", "long unsigned int");
+        pp.define_object("__PTRDIFF_TYPE__", "long int");
         pp.define_object("__WCHAR_TYPE__", "int");
         pp.define_object("__WINT_TYPE__", "int");
         pp.define_object("__INT8_TYPE__", "signed char");
         pp.define_object("__INT16_TYPE__", "short");
         pp.define_object("__INT32_TYPE__", "int");
-        pp.define_object("__INT64_TYPE__", "long long");
+        pp.define_object("__INT64_TYPE__", "long long int");
         pp.define_object("__UINT8_TYPE__", "unsigned char");
         pp.define_object("__UINT16_TYPE__", "unsigned short");
         pp.define_object("__UINT32_TYPE__", "unsigned int");
-        pp.define_object("__UINT64_TYPE__", "unsigned long long");
-        pp.define_object("__INTPTR_TYPE__", "long");
-        pp.define_object("__UINTPTR_TYPE__", "unsigned long");
-        pp.define_object("__INTMAX_TYPE__", "long");
-        pp.define_object("__UINTMAX_TYPE__", "unsigned long");
+        pp.define_object("__UINT64_TYPE__", "long long unsigned int");
+        pp.define_object("__INTPTR_TYPE__", "long int");
+        pp.define_object("__UINTPTR_TYPE__", "long unsigned int");
+        pp.define_object("__INTMAX_TYPE__", "long int");
+        pp.define_object("__UINTMAX_TYPE__", "long unsigned int");
 
         // GCC builtin constants
         pp.define_object("__FLT_MIN__", "1.17549435e-38F");
@@ -140,9 +140,15 @@ impl Preprocessor {
         pp.define_function("va_start", &["ap", "last"], "__builtin_va_start(ap, last)");
         pp.define_function("va_end", &["ap"], "__builtin_va_end(ap)");
         pp.define_function("va_copy", &["d", "s"], "__builtin_va_copy(d, s)");
-        // __has_include support (define as macros so #ifdef works)
+        // Define compiler predicate macros as objects so that #ifdef / defined() checks work.
+        // The actual function-call evaluation (__has_attribute(x) etc.) is handled by
+        // replace_compiler_predicates() in eval_constant_expr, before macro expansion.
         pp.define_object("__has_include", "1");
         pp.define_object("__has_include_next", "1");
+        pp.define_object("__has_attribute", "1");
+        pp.define_object("__has_feature", "1");
+        pp.define_object("__has_extension", "1");
+        pp.define_object("__has_builtin", "1");
 
         for (name, val) in defines {
             pp.define_object(&name, &val);
@@ -580,11 +586,86 @@ impl Preprocessor {
         let with_defined = self.replace_defined(expr);
         // Replace __has_include("file") / __has_include(<file>) with 0 or 1
         let with_has_include = self.replace_has_include(&with_defined);
+        // Replace __has_attribute(x), __has_feature(x), __has_builtin(x),
+        // __has_extension(x), __is_target_*(x) with their values
+        let with_predicates = self.replace_compiler_predicates(&with_has_include);
         // Then expand macros
-        let expanded = self.expand_line(&with_has_include);
+        let expanded = self.expand_line(&with_predicates);
         // Then evaluate
         let mut eval = ConstEval::new(&expanded);
         eval.expr()
+    }
+
+    /// Replace compiler builtin predicate calls with their values, before macro expansion.
+    /// Matches clang's behavior on aarch64-apple-macosx for the predicates used by the SDK.
+    fn replace_compiler_predicates(&self, expr: &str) -> String {
+        let predicates: &[(&[u8], fn(&str) -> i64)] = &[
+            // __has_attribute: all GCC/clang attributes used in the macOS SDK return 1
+            (b"__has_attribute(",   |_| 1),
+            // __has_feature: whitelist of features clang enables by default
+            (b"__has_feature(",     |arg| matches!(arg.trim(),
+                "attribute_availability"
+                | "attribute_availability_with_message"
+                | "attribute_availability_app_extension"
+                | "attribute_availability_swift"
+                | "attribute_availability_tvos"
+                | "attribute_availability_watchos"
+                | "nullability"
+            ) as i64),
+            // __has_extension: whitelist matching clang defaults
+            (b"__has_extension(",   |arg| matches!(arg.trim(),
+                "cxx_fixed_enum"
+                | "enumerator_attributes"
+                | "attribute_deprecated_with_message"
+                | "c_static_assert"
+                | "c_generic_selections"
+            ) as i64),
+            // __has_builtin: only the __is_target_* builtins
+            (b"__has_builtin(",     |arg| matches!(arg.trim(),
+                "__is_target_arch" | "__is_target_os" | "__is_target_vendor"
+                | "__is_target_environment" | "__is_target_variant_os"
+                | "__is_target_variant_environment") as i64),
+            // Target predicates for aarch64-apple-macosx
+            (b"__is_target_arch(",  |arg| matches!(arg.trim(), "arm64" | "aarch64") as i64),
+            (b"__is_target_os(",    |arg| (arg.trim() == "macosx") as i64),
+            (b"__is_target_vendor(", |arg| (arg.trim() == "apple") as i64),
+            (b"__is_target_environment(",         |_| 0),
+            (b"__is_target_variant_os(",          |_| 0),
+            (b"__is_target_variant_environment(", |_| 0),
+        ];
+
+        let mut result = String::new();
+        let bytes = expr.as_bytes();
+        let mut i = 0;
+        'outer: while i < bytes.len() {
+            // Word boundary check: don't match in the middle of an identifier
+            let at_word_start = i == 0
+                || (!bytes[i-1].is_ascii_alphanumeric() && bytes[i-1] != b'_');
+            if at_word_start {
+                for (prefix, eval_fn) in predicates {
+                    if bytes[i..].starts_with(prefix) {
+                        let arg_start = i + prefix.len();
+                        let mut j = arg_start;
+                        let mut depth = 1usize;
+                        while j < bytes.len() && depth > 0 {
+                            match bytes[j] {
+                                b'(' => { depth += 1; j += 1; }
+                                b')' => { depth -= 1; if depth > 0 { j += 1; } else { /* leave j at ')' */ } }
+                                _ => { j += 1; }
+                            }
+                        }
+                        let arg = std::str::from_utf8(&bytes[arg_start..j]).unwrap_or("");
+                        let val = eval_fn(arg);
+                        result.push_str(&val.to_string());
+                        i = j + 1; // skip past the closing ')'
+                        continue 'outer;
+                    }
+                }
+            }
+            result.push(bytes[i] as char);
+            i += 1;
+        }
+        result
     }
 
     fn replace_has_include(&self, expr: &str) -> String {

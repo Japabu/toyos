@@ -440,6 +440,28 @@ impl Parser {
                 self.expect(&TokenKind::RParen);
                 result.unwrap_or(Expr::IntLit(0))
             }
+            TokenKind::Builtin(ref name) if name == "__builtin_offsetof" => {
+                self.advance();
+                self.expect(&TokenKind::LParen);
+                // First arg is a type name (e.g. `struct Foo`), parse it properly
+                let tn = self.type_name();
+                // Extract the tag/typedef name for codegen
+                let type_name = tn.specifiers.iter().find_map(|s| {
+                    if let DeclSpecifier::TypeSpec(ts) = s {
+                        match ts {
+                            TypeSpec::TypedefName(n) => Some(n.clone()),
+                            TypeSpec::Struct(st) => st.name.clone(),
+                            TypeSpec::Union(st) => st.name.clone(),
+                            _ => None,
+                        }
+                    } else { None }
+                }).expect("__builtin_offsetof: cannot determine type name");
+                self.expect(&TokenKind::Comma);
+                // Second arg is a field name (possibly nested like `a.b`)
+                let field = self.assignment_expr();
+                self.expect(&TokenKind::RParen);
+                Expr::Builtin("__builtin_offsetof".into(), vec![Expr::Ident(type_name), field])
+            }
             TokenKind::Builtin(name) => {
                 let name = name.clone();
                 self.advance();

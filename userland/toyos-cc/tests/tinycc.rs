@@ -235,3 +235,4 @@ tinycc_test!(t133_old_func, "133_old_func");
 tinycc_test!(t134_double_to_signed, "134_double_to_signed");
 tinycc_test!(t135_func_arg_struct_compare, "135_func_arg_struct_compare");
 tinycc_test!(t137_funcall_struct_args, "137_funcall_struct_args");
+tinycc_test!(t138_offsetof, "138_offsetof");

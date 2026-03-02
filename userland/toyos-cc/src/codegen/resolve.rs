@@ -2,7 +2,153 @@ use super::*;
 
 impl Codegen {
     pub(crate) fn eval_const(&self, expr: &Expr) -> Option<i64> {
-        crate::ast::eval_const_expr(expr, Some(&self.type_env.enum_constants))
+        if let Some(v) = crate::ast::eval_const_expr(expr, Some(&self.type_env.enum_constants)) {
+            return Some(v);
+        }
+        // offsetof pattern: (type)&((StructType*)0)->field
+        self.eval_offsetof(expr)
+    }
+
+    /// Evaluate the classic offsetof pattern: `&((StructType*)0)->field`
+    /// and variants wrapped in casts like `(size_t)&((StructType*)0)->field`.
+    fn eval_offsetof(&self, expr: &Expr) -> Option<i64> {
+        match expr {
+            Expr::Cast(_, inner) => self.eval_offsetof(inner),
+            Expr::Unary(UnaryOp::AddrOf, inner) => self.eval_member_offset(inner),
+            _ => None,
+        }
+    }
+
+    /// Compute the byte offset of a member access chain rooted at a null-pointer cast,
+    /// e.g. `((StructType*)0)->field` or `((StructType*)0)->field.sub`.
+    fn eval_member_offset(&self, expr: &Expr) -> Option<i64> {
+        match expr {
+            Expr::Arrow(base, field) => {
+                // base should be (StructType*)0
+                let struct_ty = self.null_pointer_cast_type(base)?;
+                let (offset, _) = struct_ty.field_offset(field)?;
+                Some(offset as i64)
+            }
+            Expr::Member(base, field) => {
+                // Nested member: base.field — accumulate offset
+                let (base_offset, base_ty) = self.eval_member_with_type(base)?;
+                let (field_offset, _) = base_ty.field_offset(field)?;
+                Some((base_offset + field_offset) as i64)
+            }
+            _ => None,
+        }
+    }
+
+    /// Return (accumulated_offset, resulting_type) for a member access chain.
+    fn eval_member_with_type(&self, expr: &Expr) -> Option<(usize, CType)> {
+        match expr {
+            Expr::Arrow(base, field) => {
+                let struct_ty = self.null_pointer_cast_type(base)?;
+                let (offset, ty) = struct_ty.field_offset(field)?;
+                Some((offset, ty))
+            }
+            Expr::Member(base, field) => {
+                let (base_offset, base_ty) = self.eval_member_with_type(base)?;
+                let (field_offset, ty) = base_ty.field_offset(field)?;
+                Some((base_offset + field_offset, ty))
+            }
+            _ => None,
+        }
+    }
+
+    /// If expr is `(SomeStruct*)0`, resolve and return `SomeStruct`.
+    fn null_pointer_cast_type(&self, expr: &Expr) -> Option<CType> {
+        if let Expr::Cast(tn, inner) = expr {
+            if matches!(inner.as_ref(), Expr::IntLit(0)) {
+                let ty = self.resolve_typename_const(tn)?;
+                // Unwrap the pointer to get the struct type
+                if let CType::Pointer(inner) = ty {
+                    // Resolve incomplete (forward-declared) structs/unions
+                    let resolved = self.resolve_incomplete_type(*inner);
+                    return Some(resolved);
+                }
+            }
+        }
+        None
+    }
+
+    /// Resolve a TypeName without mutating self (for const eval contexts).
+    fn resolve_typename_const(&self, tn: &TypeName) -> Option<CType> {
+        let base = self.resolve_type_const(&tn.specifiers)?;
+        if let Some(ad) = &tn.declarator {
+            Some(self.apply_abstract_declarator_const(&base, ad))
+        } else {
+            Some(base)
+        }
+    }
+
+    fn resolve_type_const(&self, specifiers: &[DeclSpecifier]) -> Option<CType> {
+        let mut is_signed = None;
+        let mut is_unsigned = false;
+        let mut base = None;
+        let mut long_count = 0u8;
+        let mut is_short = false;
+        for spec in specifiers {
+            if let DeclSpecifier::TypeSpec(ts) = spec {
+                match ts {
+                    TypeSpec::Void => base = Some(CType::Void),
+                    TypeSpec::Char => base = Some(CType::Char(true)),
+                    TypeSpec::Short => is_short = true,
+                    TypeSpec::Int => { if base.is_none() { base = Some(CType::Int(true)); } }
+                    TypeSpec::Long => long_count += 1,
+                    TypeSpec::Float => base = Some(CType::Float),
+                    TypeSpec::Double => base = Some(CType::Double),
+                    TypeSpec::Signed => is_signed = Some(true),
+                    TypeSpec::Unsigned => { is_unsigned = true; is_signed = Some(false); }
+                    TypeSpec::Bool => base = Some(CType::Bool),
+                    TypeSpec::Int128 => base = Some(CType::Int128(true)),
+                    TypeSpec::TypedefName(name) => {
+                        base = Some(self.type_env.typedefs.get(name)?.clone());
+                    }
+                    TypeSpec::Struct(st) => {
+                        if st.fields.is_none() {
+                            base = st.name.as_ref().and_then(|n| self.type_env.tags.get(n)).cloned();
+                        } else {
+                            return None; // not handling inline struct defs in const eval
+                        }
+                    }
+                    TypeSpec::Union(st) => {
+                        if st.fields.is_none() {
+                            base = st.name.as_ref().and_then(|n| self.type_env.tags.get(n)).cloned();
+                        } else {
+                            return None;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let signed = is_signed.unwrap_or(true);
+        if is_short { return Some(CType::Short(signed)); }
+        if long_count >= 2 { return Some(CType::LongLong(signed)); }
+        if long_count == 1 {
+            if matches!(base, Some(CType::Double)) { return Some(CType::LongDouble); }
+            return Some(CType::Long(signed));
+        }
+        match base {
+            Some(CType::Char(_)) => Some(CType::Char(signed)),
+            Some(CType::Int(_)) => Some(CType::Int(signed)),
+            Some(CType::Int128(_)) => Some(CType::Int128(signed)),
+            Some(other) => Some(other),
+            None => {
+                if is_unsigned { Some(CType::Int(false)) }
+                else if is_signed.is_some() { Some(CType::Int(true)) }
+                else { Some(CType::Int(true)) }
+            }
+        }
+    }
+
+    fn apply_abstract_declarator_const(&self, base: &CType, ad: &AbstractDeclarator) -> CType {
+        let mut ty = base.clone();
+        for _ in &ad.pointer {
+            ty = CType::Pointer(Box::new(ty));
+        }
+        ty
     }
 
     pub(crate) fn clif_type(&self, ty: &CType) -> ir::Type {

@@ -39,7 +39,7 @@ int main()
 
 #include "18_include2.h"
 #include "./18_include2.h"
-#include "../tests2/18_include2.h"
+#include "../tinycc/18_include2.h"
 
    return 0;
 }

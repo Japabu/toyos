@@ -37,7 +37,7 @@ fn main() {
     run(Command::new(&toyos_cc)
         .args(["-c", "-o"])
         .arg(&stage1_obj)
-        .args(tcc_defines())
+        .args(tcc_defines(&tcc_dir))
         .arg("-I").arg(tcc_dir.join("include"))
         .arg("-I").arg(&tcc_dir)
         .args(system_include_args())
@@ -56,7 +56,8 @@ fn main() {
     run(Command::new(&stage1_bin)
         .args(["-c", "-o"])
         .arg(&stage2_obj)
-        .args(tcc_defines())
+        .args(tcc_defines(&tcc_dir))
+        .arg("-I").arg(tcc_dir.join("include"))
         .arg("-I").arg(&tcc_dir)
         .arg(tcc_dir.join("tcc.c"))
         .current_dir(&project_dir));
@@ -110,6 +111,9 @@ fn download_tcc(dest: &Path) {
     fs::remove_dir_all(&tmp).ok();
 
     // Generate config.h — normally produced by ./configure
+    // CONFIG_TCC_PREDEFS=0: tccdefs.h loaded at runtime (avoids needing tccdefs_.h)
+    // CONFIG_TCC_SEMLOCK=0: defined so #ifdef is true (tcc.h needs it), but #if is false
+    //   (avoids pulling in <dispatch/dispatch.h> on macOS)
     fs::write(dest.join("config.h"), "\
 #define CONFIG_TCC_PREDEFS 0\n\
 #define GCC_MAJOR 4\n\
@@ -117,21 +121,21 @@ fn download_tcc(dest: &Path) {
 ").expect("failed to write config.h");
 }
 
-fn tcc_defines() -> Vec<&'static str> {
+fn tcc_defines(tcc_dir: &Path) -> Vec<String> {
     vec![
-        "-DONE_SOURCE=1",
-        "-DTCC_TARGET_X86_64",
-        "-DCONFIG_TRIPLET=\"x86_64-linux-gnu\"",
-        "-DTCC_VERSION=\"0.9.27\"",
-        "-DCONFIG_TCCDIR=\"/usr/local/lib/tcc\"",
-        "-DCONFIG_TCC_CRTPREFIX=\"/usr/lib\"",
-        "-DCONFIG_TCC_LIBPATHS=\"/usr/lib\"",
-        "-DCONFIG_TCC_SYSINCLUDEPATHS=\"/usr/include\"",
-        "-DCONFIG_LDDIR=\"lib\"",
+        "-DONE_SOURCE=1".into(),
+        "-DTCC_TARGET_X86_64".into(),
+        "-DCONFIG_TRIPLET=\"x86_64-linux-gnu\"".into(),
+        "-DTCC_VERSION=\"0.9.27\"".into(),
+        format!("-DCONFIG_TCCDIR=\"{}\"", tcc_dir.display()),
+        "-DCONFIG_TCC_CRTPREFIX=\"/usr/lib\"".into(),
+        "-DCONFIG_TCC_LIBPATHS=\"/usr/lib\"".into(),
+        "-DCONFIG_TCC_SYSINCLUDEPATHS=\"{B}/include:/usr/include\"".into(),
+        "-DCONFIG_LDDIR=\"lib\"".into(),
         // HACK: defining as 0 still makes #ifdef true in tcc.h, activating
         // comma-expression wrappers. But without it, tcc.h defaults to 1 which
         // pulls in <dispatch/dispatch.h> on macOS — unparseable by toyos-cc.
-        "-DCONFIG_TCC_SEMLOCK=0",
+        "-DCONFIG_TCC_SEMLOCK=0".into(),
     ]
 }
 
