@@ -23,6 +23,11 @@ pub(crate) enum PPToken {
     Whitespace,
     Hash,
     HashHash,
+    /// Internal: marks the boundary between a macro's expanded body and the
+    /// following input tokens.  When the expansion loop or argument collector
+    /// encounters this token it removes `name` from the `expanding` set and
+    /// discards the token (never emitted to output).
+    Barrier(String),
 }
 
 pub struct Preprocessor {
@@ -36,6 +41,12 @@ pub struct Preprocessor {
     pub(crate) counter: u32,
     pragma_once_files: HashSet<String>,
     pub suppress_line_markers: bool,
+    // Tracks __LINE__ / __FILE__ when explicitly redefined by user source.
+    // While in this set, expand_line skips the automatic per-line update.
+    user_redefined_builtins: HashSet<String>,
+    // Set to true while evaluating a #if / #elif constant expression so that
+    // expand_tokens can handle the `defined` operator specially.
+    pub(crate) in_if_eval: bool,
 }
 
 impl Preprocessor {
@@ -51,6 +62,8 @@ impl Preprocessor {
             counter: 0,
             pragma_once_files: HashSet::new(),
             suppress_line_markers: false,
+            user_redefined_builtins: HashSet::new(),
+            in_if_eval: false,
         };
 
         // Determine target properties
@@ -286,6 +299,7 @@ impl Preprocessor {
                     "undef" => {
                         let name = rest.split_whitespace().next().unwrap_or("");
                         self.macros.remove(name);
+                        self.user_redefined_builtins.remove(name);
                     }
                     "ifdef" => {
                         let name = rest.split_whitespace().next().unwrap_or("");
@@ -673,11 +687,16 @@ impl Preprocessor {
             let body_str: String = chars.collect();
             let body = Self::strip_ws_around_hashhash(self.tokenize_pp(body_str.trim()));
             self.warn_redefine(&name, &Macro::Object(body.clone()));
+            if matches!(name.as_str(), "__LINE__" | "__FILE__") {
+                self.user_redefined_builtins.insert(name.clone());
+            }
             self.macros.insert(name, Macro::Object(body));
         }
     }
 
     fn warn_redefine(&self, name: &str, new_mac: &Macro) {
+        // Never warn when the user redefines a predefined builtin like __LINE__ or __FILE__.
+        if matches!(name, "__LINE__" | "__FILE__") { return; }
         let Some(old_mac) = self.macros.get(name) else { return };
         let same = match (old_mac, new_mac) {
             (Macro::Object(a), Macro::Object(b)) => a == b,
@@ -693,12 +712,17 @@ impl Preprocessor {
     }
 
     fn expand_line(&mut self, line: &str) -> String {
-        // Update __FILE__ and __LINE__ before expansion
+        // Update __FILE__ and __LINE__ before expansion, unless the user has
+        // explicitly redefined them with their own #define.
         if let Some((file, line_num, _)) = self.file_stack.last() {
             let file_val = format!("\"{}\"", file);
             let line_val = line_num.to_string();
-            self.define_object("__FILE__", &file_val);
-            self.define_object("__LINE__", &line_val);
+            if !self.user_redefined_builtins.contains("__FILE__") {
+                self.define_object("__FILE__", &file_val);
+            }
+            if !self.user_redefined_builtins.contains("__LINE__") {
+                self.define_object("__LINE__", &line_val);
+            }
         }
         let tokens = self.tokenize_pp(line);
         let expanded = self.expand_tokens(&tokens);
@@ -706,15 +730,16 @@ impl Preprocessor {
     }
 
     fn eval_constant_expr(&mut self, expr: &str) -> i64 {
-        // Replace defined(X) and defined X with 0 or 1 BEFORE macro expansion
-        let with_defined = self.replace_defined(expr);
         // Replace __has_include("file") / __has_include(<file>) with 0 or 1
-        let with_has_include = self.replace_has_include(&with_defined);
+        let with_has_include = self.replace_has_include(expr);
         // Replace __has_attribute(x), __has_feature(x), __has_builtin(x),
         // __has_extension(x), __is_target_*(x) with their values
         let with_predicates = self.replace_compiler_predicates(&with_has_include);
-        // Then expand macros
+        // Expand macros with in_if_eval=true so `defined` is handled as a
+        // keyword inside macro bodies too (handles defined-after-expansion).
+        self.in_if_eval = true;
         let expanded = self.expand_line(&with_predicates);
+        self.in_if_eval = false;
         // Then evaluate
         let mut eval = ConstEval::new(&expanded);
         eval.expr()

@@ -41,6 +41,116 @@ pub(crate) fn split_first_word(s: &str) -> (&str, &str) {
     }
 }
 
+// A value in a preprocessor constant expression.
+// Arithmetic follows C99 intmax_t / uintmax_t rules:
+// - unsigned flag is set when a literal has a U suffix, or when a hex/octal
+//   literal does not fit in i64 (GCC extension, matches TCC behaviour).
+// - If either operand of a binary arithmetic/compare op is unsigned, the
+//   result is unsigned and arithmetic uses wrapping u64 semantics.
+#[derive(Clone, Copy)]
+struct Val {
+    bits: u64,
+    unsigned: bool,
+}
+
+impl Val {
+    fn signed(v: i64) -> Self { Val { bits: v as u64, unsigned: false } }
+    fn unsigned(v: u64) -> Self { Val { bits: v, unsigned: true } }
+    fn zero() -> Self { Val::signed(0) }
+    fn one() -> Self { Val::signed(1) }
+
+    fn is_nonzero(self) -> bool { self.bits != 0 }
+
+    fn as_i64(self) -> i64 { self.bits as i64 }
+
+    fn neg(self) -> Self {
+        Val { bits: 0u64.wrapping_sub(self.bits), unsigned: self.unsigned }
+    }
+    fn bitnot(self) -> Self {
+        Val { bits: !self.bits, unsigned: self.unsigned }
+    }
+
+    fn make_unsigned(a: Val, b: Val) -> (u64, u64, bool) {
+        (a.bits, b.bits, a.unsigned || b.unsigned)
+    }
+
+    fn add(a: Val, b: Val) -> Val {
+        let (av, bv, u) = Self::make_unsigned(a, b);
+        Val { bits: av.wrapping_add(bv), unsigned: u }
+    }
+    fn sub(a: Val, b: Val) -> Val {
+        let (av, bv, u) = Self::make_unsigned(a, b);
+        Val { bits: av.wrapping_sub(bv), unsigned: u }
+    }
+    fn mul(a: Val, b: Val) -> Val {
+        let (av, bv, u) = Self::make_unsigned(a, b);
+        Val { bits: av.wrapping_mul(bv), unsigned: u }
+    }
+    fn div(a: Val, b: Val) -> Val {
+        if b.bits == 0 { return Val::zero(); }
+        let (av, bv, u) = Self::make_unsigned(a, b);
+        if u {
+            Val { bits: av / bv, unsigned: true }
+        } else {
+            Val::signed((av as i64).wrapping_div(bv as i64))
+        }
+    }
+    fn rem(a: Val, b: Val) -> Val {
+        if b.bits == 0 { return Val::zero(); }
+        let (av, bv, u) = Self::make_unsigned(a, b);
+        if u {
+            Val { bits: av % bv, unsigned: true }
+        } else {
+            Val::signed((av as i64).wrapping_rem(bv as i64))
+        }
+    }
+    fn shl(a: Val, b: Val) -> Val {
+        Val { bits: a.bits.wrapping_shl(b.bits as u32), unsigned: a.unsigned }
+    }
+    fn shr(a: Val, b: Val) -> Val {
+        if a.unsigned {
+            Val { bits: a.bits >> (b.bits as u32 & 63), unsigned: true }
+        } else {
+            Val::signed((a.bits as i64).wrapping_shr(b.bits as u32))
+        }
+    }
+    fn bitor(a: Val, b: Val) -> Val {
+        let (av, bv, u) = Self::make_unsigned(a, b);
+        Val { bits: av | bv, unsigned: u }
+    }
+    fn bitxor(a: Val, b: Val) -> Val {
+        let (av, bv, u) = Self::make_unsigned(a, b);
+        Val { bits: av ^ bv, unsigned: u }
+    }
+    fn bitand(a: Val, b: Val) -> Val {
+        let (av, bv, u) = Self::make_unsigned(a, b);
+        Val { bits: av & bv, unsigned: u }
+    }
+
+    fn lt(a: Val, b: Val) -> Val {
+        let res = if a.unsigned || b.unsigned { a.bits < b.bits } else { (a.bits as i64) < (b.bits as i64) };
+        if res { Val::one() } else { Val::zero() }
+    }
+    fn gt(a: Val, b: Val) -> Val {
+        let res = if a.unsigned || b.unsigned { a.bits > b.bits } else { (a.bits as i64) > (b.bits as i64) };
+        if res { Val::one() } else { Val::zero() }
+    }
+    fn le(a: Val, b: Val) -> Val {
+        let res = if a.unsigned || b.unsigned { a.bits <= b.bits } else { (a.bits as i64) <= (b.bits as i64) };
+        if res { Val::one() } else { Val::zero() }
+    }
+    fn ge(a: Val, b: Val) -> Val {
+        let res = if a.unsigned || b.unsigned { a.bits >= b.bits } else { (a.bits as i64) >= (b.bits as i64) };
+        if res { Val::one() } else { Val::zero() }
+    }
+    fn eq(a: Val, b: Val) -> Val {
+        if a.bits == b.bits { Val::one() } else { Val::zero() }
+    }
+    fn ne(a: Val, b: Val) -> Val {
+        if a.bits != b.bits { Val::one() } else { Val::zero() }
+    }
+}
+
 // Constant expression evaluator for #if directives
 pub(crate) struct ConstEval<'a> {
     src: &'a [u8],
@@ -63,189 +173,187 @@ impl<'a> ConstEval<'a> {
     }
 
     pub fn expr(&mut self) -> i64 {
-        self.ternary()
+        self.ternary().as_i64()
     }
 
-    fn ternary(&mut self) -> i64 {
+    fn ternary(&mut self) -> Val {
         let cond = self.logor();
         self.skip_ws();
         if self.peek() == Some(b'?') {
             self.pos += 1;
-            let t = self.expr();
+            let t = self.ternary();
             self.skip_ws();
             if self.peek() == Some(b':') { self.pos += 1; }
-            let f = self.expr();
-            if cond != 0 { t } else { f }
+            let f = self.ternary();
+            if cond.is_nonzero() { t } else { f }
         } else {
             cond
         }
     }
 
-    fn logor(&mut self) -> i64 {
+    fn logor(&mut self) -> Val {
         let mut v = self.logand();
         loop {
             self.skip_ws();
             if self.pos + 1 < self.src.len() && self.src[self.pos] == b'|' && self.src[self.pos + 1] == b'|' {
                 self.pos += 2;
                 let r = self.logand();
-                v = if v != 0 || r != 0 { 1 } else { 0 };
+                v = if v.is_nonzero() || r.is_nonzero() { Val::one() } else { Val::zero() };
             } else { break; }
         }
         v
     }
 
-    fn logand(&mut self) -> i64 {
+    fn logand(&mut self) -> Val {
         let mut v = self.bitor();
         loop {
             self.skip_ws();
             if self.pos + 1 < self.src.len() && self.src[self.pos] == b'&' && self.src[self.pos + 1] == b'&' {
                 self.pos += 2;
                 let r = self.bitor();
-                v = if v != 0 && r != 0 { 1 } else { 0 };
+                v = if v.is_nonzero() && r.is_nonzero() { Val::one() } else { Val::zero() };
             } else { break; }
         }
         v
     }
 
-    fn bitor(&mut self) -> i64 {
+    fn bitor(&mut self) -> Val {
         let mut v = self.bitxor();
         loop {
             self.skip_ws();
             if self.peek() == Some(b'|') && self.src.get(self.pos + 1) != Some(&b'|') {
                 self.pos += 1;
-                v |= self.bitxor();
+                v = Val::bitor(v, self.bitxor());
             } else { break; }
         }
         v
     }
 
-    fn bitxor(&mut self) -> i64 {
+    fn bitxor(&mut self) -> Val {
         let mut v = self.bitand();
         loop {
             self.skip_ws();
             if self.peek() == Some(b'^') {
                 self.pos += 1;
-                v ^= self.bitand();
+                v = Val::bitxor(v, self.bitand());
             } else { break; }
         }
         v
     }
 
-    fn bitand(&mut self) -> i64 {
+    fn bitand(&mut self) -> Val {
         let mut v = self.equality();
         loop {
             self.skip_ws();
             if self.peek() == Some(b'&') && self.src.get(self.pos + 1) != Some(&b'&') {
                 self.pos += 1;
-                v &= self.equality();
+                v = Val::bitand(v, self.equality());
             } else { break; }
         }
         v
     }
 
-    fn equality(&mut self) -> i64 {
+    fn equality(&mut self) -> Val {
         let mut v = self.relational();
         loop {
             self.skip_ws();
             if self.pos + 1 < self.src.len() && self.src[self.pos] == b'=' && self.src[self.pos + 1] == b'=' {
                 self.pos += 2;
-                v = if v == self.relational() { 1 } else { 0 };
+                v = Val::eq(v, self.relational());
             } else if self.pos + 1 < self.src.len() && self.src[self.pos] == b'!' && self.src[self.pos + 1] == b'=' {
                 self.pos += 2;
-                v = if v != self.relational() { 1 } else { 0 };
+                v = Val::ne(v, self.relational());
             } else { break; }
         }
         v
     }
 
-    fn relational(&mut self) -> i64 {
+    fn relational(&mut self) -> Val {
         let mut v = self.shift();
         loop {
             self.skip_ws();
             if self.pos + 1 < self.src.len() && self.src[self.pos] == b'<' && self.src[self.pos + 1] == b'=' {
                 self.pos += 2;
-                v = if v <= self.shift() { 1 } else { 0 };
+                v = Val::le(v, self.shift());
             } else if self.pos + 1 < self.src.len() && self.src[self.pos] == b'>' && self.src[self.pos + 1] == b'=' {
                 self.pos += 2;
-                v = if v >= self.shift() { 1 } else { 0 };
+                v = Val::ge(v, self.shift());
             } else if self.peek() == Some(b'<') && self.src.get(self.pos + 1) != Some(&b'<') {
                 self.pos += 1;
-                v = if v < self.shift() { 1 } else { 0 };
+                v = Val::lt(v, self.shift());
             } else if self.peek() == Some(b'>') && self.src.get(self.pos + 1) != Some(&b'>') {
                 self.pos += 1;
-                v = if v > self.shift() { 1 } else { 0 };
+                v = Val::gt(v, self.shift());
             } else { break; }
         }
         v
     }
 
-    fn shift(&mut self) -> i64 {
+    fn shift(&mut self) -> Val {
         let mut v = self.additive();
         loop {
             self.skip_ws();
             if self.pos + 1 < self.src.len() && self.src[self.pos] == b'<' && self.src[self.pos + 1] == b'<' {
                 self.pos += 2;
-                v = v.wrapping_shl(self.additive() as u32);
+                v = Val::shl(v, self.additive());
             } else if self.pos + 1 < self.src.len() && self.src[self.pos] == b'>' && self.src[self.pos + 1] == b'>' {
                 self.pos += 2;
-                v = v.wrapping_shr(self.additive() as u32);
+                v = Val::shr(v, self.additive());
             } else { break; }
         }
         v
     }
 
-    fn additive(&mut self) -> i64 {
+    fn additive(&mut self) -> Val {
         let mut v = self.multiplicative();
         loop {
             self.skip_ws();
             if self.peek() == Some(b'+') && self.src.get(self.pos + 1) != Some(&b'+') {
                 self.pos += 1;
-                v = v.wrapping_add(self.multiplicative());
+                v = Val::add(v, self.multiplicative());
             } else if self.peek() == Some(b'-') && self.src.get(self.pos + 1) != Some(&b'-') {
                 self.pos += 1;
-                v = v.wrapping_sub(self.multiplicative());
+                v = Val::sub(v, self.multiplicative());
             } else { break; }
         }
         v
     }
 
-    fn multiplicative(&mut self) -> i64 {
+    fn multiplicative(&mut self) -> Val {
         let mut v = self.unary();
         loop {
             self.skip_ws();
             if self.peek() == Some(b'*') {
                 self.pos += 1;
-                v = v.wrapping_mul(self.unary());
+                v = Val::mul(v, self.unary());
             } else if self.peek() == Some(b'/') {
                 self.pos += 1;
-                let r = self.unary();
-                v = if r != 0 { v / r } else { 0 };
+                v = Val::div(v, self.unary());
             } else if self.peek() == Some(b'%') {
                 self.pos += 1;
-                let r = self.unary();
-                v = if r != 0 { v % r } else { 0 };
+                v = Val::rem(v, self.unary());
             } else { break; }
         }
         v
     }
 
-    fn unary(&mut self) -> i64 {
+    fn unary(&mut self) -> Val {
         self.skip_ws();
         match self.peek() {
-            Some(b'!') => { self.pos += 1; if self.unary() == 0 { 1 } else { 0 } }
-            Some(b'~') => { self.pos += 1; !self.unary() }
-            Some(b'-') if self.src.get(self.pos + 1) != Some(&b'-') => { self.pos += 1; -self.unary() }
+            Some(b'!') => { self.pos += 1; if self.unary().is_nonzero() { Val::zero() } else { Val::one() } }
+            Some(b'~') => { self.pos += 1; self.unary().bitnot() }
+            Some(b'-') if self.src.get(self.pos + 1) != Some(&b'-') => { self.pos += 1; self.unary().neg() }
             Some(b'+') if self.src.get(self.pos + 1) != Some(&b'+') => { self.pos += 1; self.unary() }
             _ => self.primary(),
         }
     }
 
-    fn primary(&mut self) -> i64 {
+    fn primary(&mut self) -> Val {
         self.skip_ws();
         match self.peek() {
             Some(b'(') => {
                 self.pos += 1;
-                let v = self.expr();
+                let v = self.ternary();
                 self.skip_ws();
                 if self.peek() == Some(b')') { self.pos += 1; }
                 v
@@ -255,49 +363,24 @@ impl<'a> ConstEval<'a> {
                 let val = if self.peek() == Some(b'\\') {
                     self.pos += 1;
                     match self.src.get(self.pos).copied() {
-                        Some(b'n') => { self.pos += 1; b'\n' as i64 }
-                        Some(b't') => { self.pos += 1; b'\t' as i64 }
+                        Some(b'n') => { self.pos += 1; b'\n' as u64 }
+                        Some(b't') => { self.pos += 1; b'\t' as u64 }
                         Some(b'0') => { self.pos += 1; 0 }
-                        Some(b'\\') => { self.pos += 1; b'\\' as i64 }
-                        Some(b'\'') => { self.pos += 1; b'\'' as i64 }
-                        Some(c) => { self.pos += 1; c as i64 }
+                        Some(b'\\') => { self.pos += 1; b'\\' as u64 }
+                        Some(b'\'') => { self.pos += 1; b'\'' as u64 }
+                        Some(c) => { self.pos += 1; c as u64 }
                         None => 0,
                     }
                 } else {
                     let c = self.src.get(self.pos).copied().unwrap_or(0);
                     self.pos += 1;
-                    c as i64
+                    c as u64
                 };
                 if self.peek() == Some(b'\'') { self.pos += 1; }
-                val
+                Val::signed(val as i64)
             }
             Some(c) if c.is_ascii_digit() => {
-                let start = self.pos;
-                if c == b'0' && self.src.get(self.pos + 1).is_some_and(|c| *c == b'x' || *c == b'X') {
-                    self.pos += 2;
-                    while self.pos < self.src.len() && self.src[self.pos].is_ascii_hexdigit() { self.pos += 1; }
-                    let hex_str = std::str::from_utf8(&self.src[start + 2..self.pos]).unwrap_or("0");
-                    let val = i64::from_str_radix(hex_str, 16).unwrap_or(0);
-                    while self.pos < self.src.len() && matches!(self.src[self.pos], b'u' | b'U' | b'l' | b'L') { self.pos += 1; }
-                    val
-                } else if c == b'0' && self.src.get(self.pos + 1).is_some_and(|c| *c == b'b' || *c == b'B') {
-                    self.pos += 2;
-                    while self.pos < self.src.len() && (self.src[self.pos] == b'0' || self.src[self.pos] == b'1') { self.pos += 1; }
-                    let bin_str = std::str::from_utf8(&self.src[start + 2..self.pos]).unwrap_or("0");
-                    let val = i64::from_str_radix(bin_str, 2).unwrap_or(0);
-                    while self.pos < self.src.len() && matches!(self.src[self.pos], b'u' | b'U' | b'l' | b'L') { self.pos += 1; }
-                    val
-                } else {
-                    while self.pos < self.src.len() && self.src[self.pos].is_ascii_digit() { self.pos += 1; }
-                    let num_str = std::str::from_utf8(&self.src[start..self.pos]).unwrap_or("0");
-                    let val = if num_str.starts_with('0') && num_str.len() > 1 {
-                        i64::from_str_radix(num_str, 8).unwrap_or(0)
-                    } else {
-                        num_str.parse().unwrap_or(0)
-                    };
-                    while self.pos < self.src.len() && matches!(self.src[self.pos], b'u' | b'U' | b'l' | b'L') { self.pos += 1; }
-                    val
-                }
+                self.parse_number()
             }
             Some(c) if c.is_ascii_alphabetic() || c == b'_' || c == b'$' => {
                 let start = self.pos;
@@ -306,30 +389,84 @@ impl<'a> ConstEval<'a> {
                 }
                 let ident = std::str::from_utf8(&self.src[start..self.pos]).unwrap_or("");
                 if ident == "defined" {
-                    // defined(NAME) or defined NAME
+                    // By the time ConstEval runs, expand_tokens has already replaced
+                    // `defined(X)` with 0 or 1 when in_if_eval mode. If we see `defined`
+                    // here it means it appeared in a context where it wasn't processed
+                    // (e.g. disabled #if branch). Handle it defensively.
                     self.skip_ws();
                     let has_paren = self.peek() == Some(b'(');
                     if has_paren { self.pos += 1; }
                     self.skip_ws();
-                    let name_start = self.pos;
-                    while self.pos < self.src.len() && (self.src[self.pos].is_ascii_alphanumeric() || self.src[self.pos] == b'_' || self.src[self.pos] == b'$') {
+                    while self.pos < self.src.len() && (self.src[self.pos].is_ascii_alphanumeric() || self.src[self.pos] == b'_') {
                         self.pos += 1;
                     }
-                    let _name = std::str::from_utf8(&self.src[name_start..self.pos]).unwrap_or("");
                     if has_paren {
                         self.skip_ws();
                         if self.peek() == Some(b')') { self.pos += 1; }
                     }
-                    // We can't check macros from here — the preprocessor expands `defined()` before
-                    // eval. In expanded text, `defined(X)` becomes 0 or 1 already.
-                    // If we see `defined` here, the macro wasn't defined.
-                    0
+                    Val::zero()
                 } else {
-                    // Unknown identifier in constant expression = 0
-                    0
+                    // Unknown identifier = 0
+                    Val::zero()
                 }
             }
-            _ => 0,
+            _ => Val::zero(),
         }
+    }
+
+    fn parse_number(&mut self) -> Val {
+        let start = self.pos;
+        let c = self.src[self.pos];
+
+        let bits: u64;
+        let mut is_unsigned = false;
+
+        if c == b'0' && self.src.get(self.pos + 1).is_some_and(|c| *c == b'x' || *c == b'X') {
+            // Hexadecimal
+            self.pos += 2;
+            let hex_start = self.pos;
+            while self.pos < self.src.len() && self.src[self.pos].is_ascii_hexdigit() { self.pos += 1; }
+            let hex_str = std::str::from_utf8(&self.src[hex_start..self.pos]).unwrap_or("0");
+            // Parse as u64; if it doesn't fit in i64 treat as unsigned (GCC rule)
+            let v = u64::from_str_radix(hex_str, 16).unwrap_or(0);
+            bits = v;
+            if v > i64::MAX as u64 { is_unsigned = true; }
+        } else if c == b'0' && self.src.get(self.pos + 1).is_some_and(|c| *c == b'b' || *c == b'B') {
+            // Binary
+            self.pos += 2;
+            let bin_start = self.pos;
+            while self.pos < self.src.len() && (self.src[self.pos] == b'0' || self.src[self.pos] == b'1') { self.pos += 1; }
+            let bin_str = std::str::from_utf8(&self.src[bin_start..self.pos]).unwrap_or("0");
+            bits = u64::from_str_radix(bin_str, 2).unwrap_or(0);
+        } else if c == b'0' && self.pos + 1 < self.src.len() && self.src[self.pos + 1].is_ascii_digit() {
+            // Octal
+            self.pos += 1;
+            let oct_start = self.pos;
+            while self.pos < self.src.len() && self.src[self.pos].is_ascii_digit() { self.pos += 1; }
+            let oct_str = std::str::from_utf8(&self.src[oct_start..self.pos]).unwrap_or("0");
+            let v = u64::from_str_radix(oct_str, 8).unwrap_or(0);
+            bits = v;
+            if v > i64::MAX as u64 { is_unsigned = true; }
+        } else {
+            // Decimal
+            while self.pos < self.src.len() && self.src[self.pos].is_ascii_digit() { self.pos += 1; }
+            let num_str = std::str::from_utf8(&self.src[start..self.pos]).unwrap_or("0");
+            // Parse as u64; if it overflows i64, treat as unsigned
+            let v: u64 = num_str.parse().unwrap_or(0);
+            bits = v;
+            if v > i64::MAX as u64 { is_unsigned = true; }
+        }
+
+        // Consume type suffixes: u/U makes it unsigned; l/L are ignored
+        while self.pos < self.src.len() {
+            match self.src[self.pos] {
+                b'u' | b'U' => { is_unsigned = true; self.pos += 1; }
+                b'l' | b'L' => { self.pos += 1; }
+                b'f' | b'F' => { self.pos += 1; } // floating suffix, shouldn't appear but be safe
+                _ => break,
+            }
+        }
+
+        Val { bits, unsigned: is_unsigned }
     }
 }

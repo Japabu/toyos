@@ -130,6 +130,27 @@ impl Preprocessor {
                     i += 1;
                     continue;
                 }
+                // Barrier token: remove the named macro from the expanding set and discard.
+                // This implements the C99 §6.10.3.4 hide-set boundary: once the body tokens
+                // have all been processed, the macro name is no longer "in expansion" and can
+                // appear in the remaining input tokens without being suppressed.
+                PPToken::Barrier(name) => {
+                    self.expanding.remove(name);
+                    i += 1;
+                    continue;
+                }
+                // In #if evaluation mode: handle `defined` as a keyword.
+                // Consume its argument without expanding it and push 0 or 1.
+                // This handles `defined(NAME)` and `defined NAME` forms that
+                // appear literally in the token stream (e.g. inside CCC's body).
+                PPToken::Ident(name) if name == "defined" && self.in_if_eval
+                    && matches!(tokens.get(i + 1), Some(PPToken::Whitespace) | Some(PPToken::Punct(_)) | Some(PPToken::Ident(_))) =>
+                {
+                    i += 1; // advance past `defined`
+                    let tok = self.eval_defined_arg(tokens, &mut i);
+                    result.push(tok);
+                    continue;
+                }
                 // Macro is currently being expanded (recursion guard) — blue-paint the token
                 // so it passes through unchanged and is never re-expanded during rescanning.
                 // This implements the C99 §6.10.3.4 hide-set rule without per-token metadata.
@@ -188,18 +209,40 @@ impl Preprocessor {
                                     }
                                 }
                             }
+                            // In #if-eval mode: if the expansion ends with the `defined`
+                            // keyword (e.g. a macro like `#define DEFINED defined`), consume
+                            // its argument from the *outer* token stream without expanding it.
+                            if self.in_if_eval
+                                && matches!(expanded.last(), Some(PPToken::Ident(n)) if n == "defined")
+                            {
+                                // Push all tokens from expanded except the trailing `defined`.
+                                let len = expanded.len();
+                                result.extend_from_slice(&expanded[..len - 1]);
+                                i += 1; // advance past the macro name itself
+                                let tok = self.eval_defined_arg(tokens, &mut i);
+                                result.push(tok);
+                                continue;
+                            }
                             result.extend(expanded);
                             i += 1;
                         }
                         Some(Macro::Function(params, variadic, body)) => {
                             let mut j = i + 1;
-                            while j < tokens.len() && tokens[j] == PPToken::Whitespace { j += 1; }
+                            // Skip whitespace and barriers (process barrier side-effects
+                            // eagerly so that `name` in remaining input can expand freely
+                            // even when a barrier sits between the macro name and its `(`).
+                            while j < tokens.len() {
+                                match &tokens[j] {
+                                    PPToken::Whitespace => { j += 1; }
+                                    PPToken::Barrier(n) => { let n = n.clone(); self.expanding.remove(&n); j += 1; }
+                                    _ => break,
+                                }
+                            }
                             if j < tokens.len() && tokens[j] == PPToken::Punct("(".to_string()) {
                                 j += 1;
                                 let raw_args = self.collect_macro_args(tokens, &mut j, params.len(), variadic);
                                 // Pre-expand args only when the parameter appears in a normal
-                                // (non-#/##) position. Args used solely in # or ## contexts
-                                // must NOT be pre-expanded (avoids side effects like __COUNTER__).
+                                // (non-#/##) position.
                                 let mut expanded_args: Vec<Vec<PPToken>> = Vec::with_capacity(raw_args.len());
                                 for (idx, param) in params.iter().enumerate() {
                                     let arg = raw_args.get(idx).map(|a| a.as_slice()).unwrap_or(&[]);
@@ -219,31 +262,36 @@ impl Preprocessor {
                                 }
                                 let name = name.clone();
                                 let substituted = self.substitute(&params, variadic, &body, &raw_args, &expanded_args);
-                                self.expanding.insert(name.clone());
-                                let expanded = self.expand_tokens(&substituted);
-                                self.expanding.remove(&name);
-                                // Check if expansion ends with a function-like macro name
-                                // whose arguments come from subsequent tokens
-                                if let Some(PPToken::Ident(last_name)) = expanded.last() {
-                                    if matches!(self.macros.get(last_name), Some(Macro::Function(..)))
-                                        && !self.expanding.contains(last_name)
-                                    {
-                                        let mut k = j;
-                                        while k < tokens.len() && tokens[k] == PPToken::Whitespace { k += 1; }
-                                        if k < tokens.len() && tokens[k] == PPToken::Punct("(".to_string()) {
-                                            let mut exp = expanded;
-                                            let func_tok = exp.pop().unwrap();
-                                            result.extend(exp);
-                                            let mut merged = vec![func_tok];
-                                            merged.extend_from_slice(&tokens[j..]);
-                                            let re_expanded = self.expand_tokens(&merged);
-                                            result.extend(re_expanded);
-                                            return result;
-                                        }
+
+                                // C99 §6.10.3.4: after substitution, rescan with the macro name
+                                // added to the hide-set (blue-painted).  We implement this by:
+                                //   1. Blue-painting direct occurrences of `name` in the body.
+                                //   2. Appending a Barrier token that removes `name` from the
+                                //      `expanding` set at the exact boundary between the body
+                                //      and the following input tokens.
+                                //   3. Merging body + barrier + remaining input into one stream
+                                //      so that incomplete function calls in the body (e.g.
+                                //      `f(x` without its closing `)`) can be completed by the
+                                //      remaining tokens — exactly the C99 push-back semantics.
+                                let blue_painted: Vec<PPToken> = substituted.into_iter().map(|t| {
+                                    if matches!(&t, PPToken::Ident(n) if n == &name) {
+                                        PPToken::Ident(format!("\x01{}", name))
+                                    } else {
+                                        t
                                     }
-                                }
+                                }).collect();
+
+                                let mut combined = blue_painted;
+                                combined.push(PPToken::Barrier(name.clone()));
+                                combined.extend_from_slice(&tokens[j..]);
+
+                                self.expanding.insert(name.clone());
+                                let expanded = self.expand_tokens(&combined);
+                                // Safety net: barrier removes it during expansion, but if the
+                                // barrier was consumed inside a nested arg it may already be gone.
+                                self.expanding.remove(&name);
                                 result.extend(expanded);
-                                i = j;
+                                return result;
                             } else {
                                 // No parens — not a function-like invocation
                                 result.push(tokens[i].clone());
@@ -259,13 +307,18 @@ impl Preprocessor {
         result
     }
 
-    fn collect_macro_args(&self, tokens: &[PPToken], pos: &mut usize, param_count: usize, variadic: bool) -> Vec<Vec<PPToken>> {
+    fn collect_macro_args(&mut self, tokens: &[PPToken], pos: &mut usize, param_count: usize, variadic: bool) -> Vec<Vec<PPToken>> {
         let mut args: Vec<Vec<PPToken>> = Vec::new();
         let mut current = Vec::new();
         let mut depth = 0;
 
         while *pos < tokens.len() {
             match &tokens[*pos] {
+                // Barrier: remove from expanding and skip — transparent to argument collection.
+                PPToken::Barrier(name) => {
+                    self.expanding.remove(name);
+                    *pos += 1;
+                }
                 PPToken::Punct(s) if s == "(" => {
                     depth += 1;
                     current.push(tokens[*pos].clone());
@@ -493,6 +546,7 @@ impl Preprocessor {
             PPToken::Whitespace => " ".to_string(),
             PPToken::Hash => "#".to_string(),
             PPToken::HashHash => "##".to_string(),
+            PPToken::Barrier(_) => String::new(),
         }
     }
 
@@ -542,6 +596,41 @@ impl Preprocessor {
         if last == b'|' && first == b'|' { return true; }
         if last == b'/' && (first == b'/' || first == b'*') { return true; }
         false
+    }
+
+    /// Consume the argument to `defined` starting at `tokens[*pos]`, evaluate
+    /// whether the named macro exists, advance `*pos` past the argument, and
+    /// return `Number("1")` or `Number("0")`.
+    ///
+    /// Accepts both `defined(NAME)` and `defined NAME` forms.
+    /// The argument is NOT macro-expanded (C standard requirement).
+    fn eval_defined_arg(&self, tokens: &[PPToken], pos: &mut usize) -> PPToken {
+        // Skip whitespace / barriers
+        while *pos < tokens.len() {
+            match &tokens[*pos] {
+                PPToken::Whitespace => { *pos += 1; }
+                PPToken::Barrier(n) => { *pos += 1; let _ = n; } // skip, side-effect handled elsewhere
+                _ => break,
+            }
+        }
+        let has_paren = matches!(tokens.get(*pos), Some(PPToken::Punct(s)) if s == "(");
+        if has_paren { *pos += 1; }
+        // Skip whitespace after optional paren
+        while matches!(tokens.get(*pos), Some(PPToken::Whitespace)) { *pos += 1; }
+        // Read the macro name (identifier)
+        let name = if let Some(PPToken::Ident(n)) = tokens.get(*pos) {
+            let n = n.trim_start_matches('\x01').to_string();
+            *pos += 1;
+            n
+        } else {
+            String::new()
+        };
+        if has_paren {
+            while matches!(tokens.get(*pos), Some(PPToken::Whitespace)) { *pos += 1; }
+            if matches!(tokens.get(*pos), Some(PPToken::Punct(s)) if s == ")") { *pos += 1; }
+        }
+        let defined = self.macros.contains_key(&name);
+        if defined { PPToken::Number("1".to_string()) } else { PPToken::Number("0".to_string()) }
     }
 
     pub(crate) fn expand_tokens_const(&self, tokens: &[PPToken]) -> Vec<PPToken> {

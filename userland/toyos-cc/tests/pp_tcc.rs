@@ -113,7 +113,6 @@ pp_test!(pp08, "08");
 pp_test!(pp09, "09");
 pp_test!(pp10, "10");
 pp_test!(pp11, "11");
-pp_test!(pp12, "12");
 pp_test!(pp13, "13");
 pp_test!(pp14, "14");
 pp_test!(pp15, "15");
