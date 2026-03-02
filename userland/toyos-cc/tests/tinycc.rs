@@ -240,3 +240,4 @@ tinycc_test!(t140_switch_hex, "140_switch_hex");
 tinycc_test!(t141_tok_str, "141_tok_str");
 tinycc_test!(t142_pp_sizeof_ptr, "142_pp_sizeof_ptr");
 tinycc_test!(t143_uint64_split, "143_uint64_split");
+tinycc_test!(t144_sizeof_init, "144_sizeof_init");

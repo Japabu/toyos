@@ -750,6 +750,9 @@ impl Codegen {
                     ir::StackSlotKind::ExplicitSlot, size as u32, 0,
                 ));
                 let ptr = ctx.builder.ins().stack_addr(I64, ss, 0);
+                // Register type before compiling initializer so sizeof/typeof
+                // can resolve the variable's type in the initializer expression.
+                ctx.spilled_locals.insert(name, (ss, ty));
                 let make_zero = |b: &mut FunctionBuilder| -> Value {
                     if clif_ty == F32 { b.ins().f32const(0.0) }
                     else if clif_ty == F64 { b.ins().f64const(0.0) }
@@ -768,11 +771,13 @@ impl Codegen {
                     let zero = make_zero(&mut ctx.builder);
                     ctx.builder.ins().store(MemFlags::new(), zero, ptr, 0);
                 }
-                ctx.spilled_locals.insert(name, (ss, ty));
                 continue;
             }
 
             let var = ctx.builder.declare_var(clif_ty);
+            // Register type before compiling initializer so sizeof/typeof
+            // can resolve the variable's type in the initializer expression.
+            ctx.locals.insert(name, (var, ty));
 
             if let Some(init) = &id.initializer {
                 if let Initializer::Expr(e) = init {
@@ -800,8 +805,6 @@ impl Codegen {
                 };
                 ctx.builder.def_var(var, zero);
             }
-
-            ctx.locals.insert(name, (var, ty));
         }
     }
 }
