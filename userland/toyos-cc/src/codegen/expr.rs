@@ -1164,13 +1164,8 @@ impl Codegen {
                             self.compile_expr(ctx, &args[2])
                         }
                     }
-                    "__builtin_types_compatible_p" => {
-                        eprintln!("warning: __builtin_types_compatible_p not yet implemented, will trap at runtime");
-                        self.emit_trap_with_value(ctx, I32)
-                    }
-                    "__builtin_frame_address" | "__builtin_return_address" => {
-                        eprintln!("warning: {name} not yet implemented, will trap at runtime");
-                        self.emit_trap_with_value(ctx, I64)
+                    "__builtin_types_compatible_p" | "__builtin_frame_address" | "__builtin_return_address" => {
+                        panic!("unsupported builtin: {name}");
                     }
                     "__builtin_unreachable" => {
                         self.emit_trap_with_value(ctx, I64)

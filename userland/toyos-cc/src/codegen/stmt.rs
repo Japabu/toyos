@@ -713,7 +713,7 @@ impl Codegen {
                 } else {
                     desc.define_zeroinit(ty.size().max(1));
                 }
-                let _ = self.module.define_data(data_id, &desc);
+                self.module.define_data(data_id, &desc).unwrap_or_else(|e| panic!("failed to define data: {e:?}"));
                 let gv = self.module.declare_data_in_func(data_id, ctx.builder.func);
                 let ptr = ctx.builder.ins().global_value(I64, gv);
                 ctx.local_ptrs.insert(name.clone(), (ptr, ty.clone()));

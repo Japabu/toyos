@@ -438,7 +438,7 @@ impl Parser {
                     if !self.eat(&TokenKind::Comma) { break; }
                 }
                 self.expect(&TokenKind::RParen);
-                result.unwrap_or(Expr::IntLit(0))
+                result.expect("_Generic: no matching type association")
             }
             TokenKind::Builtin(ref name) if name == "__builtin_offsetof" => {
                 self.advance();

@@ -45,12 +45,7 @@ impl Parser {
             TokenKind::Goto => {
                 self.advance();
                 if self.peek() == &TokenKind::Star {
-                    // Computed goto: goto *expr;
-                    self.advance();
-                    let _e = self.expr();
-                    self.expect(&TokenKind::Semi);
-                    // Treat as no-op for now (computed gotos are a GCC extension)
-                    Statement::Expr(None)
+                    panic!("computed goto not supported");
                 } else {
                     let label = self.ident();
                     self.expect(&TokenKind::Semi);

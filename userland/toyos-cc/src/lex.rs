@@ -224,7 +224,7 @@ impl<'a> Lexer<'a> {
                 // Parse hex float like 0x1.921fb6p+1
                 parse_hex_float(&text)
             } else {
-                text.parse().unwrap_or(0.0)
+                text.parse().expect("lexer produced invalid float literal")
             };
             let v = if float_suffix { (v as f32) as f64 } else { v };
             return TokenKind::FloatLit(v, float_suffix);
@@ -232,14 +232,14 @@ impl<'a> Lexer<'a> {
 
         let value = if is_hex {
             let hex_str = &text[2..]; // skip "0x"
-            u128::from_str_radix(hex_str, 16).unwrap_or(0)
+            u128::from_str_radix(hex_str, 16).expect("lexer produced invalid hex literal")
         } else if is_binary {
             let bin_str = &text[2..]; // skip "0b"
-            u128::from_str_radix(bin_str, 2).unwrap_or(0)
+            u128::from_str_radix(bin_str, 2).expect("lexer produced invalid binary literal")
         } else if text.starts_with('0') && text.len() > 1 {
-            u128::from_str_radix(&text, 8).unwrap_or(0)
+            u128::from_str_radix(&text, 8).expect("lexer produced invalid octal literal")
         } else {
-            text.parse::<u128>().unwrap_or(0)
+            text.parse::<u128>().expect("lexer produced invalid decimal literal")
         };
 
         if unsigned {

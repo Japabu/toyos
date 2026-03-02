@@ -342,7 +342,7 @@ impl Parser {
         }
     }
 
-    pub(super) fn declarator(&mut self) -> Declarator {
+    fn parse_pointer(&mut self) -> Vec<Pointer> {
         let mut pointer = Vec::new();
         while self.peek() == &TokenKind::Star {
             self.advance();
@@ -357,7 +357,11 @@ impl Parser {
             }
             pointer.push(Pointer { qualifiers: quals });
         }
+        pointer
+    }
 
+    pub(super) fn declarator(&mut self) -> Declarator {
+        let pointer = self.parse_pointer();
         let direct = self.direct_declarator();
         Declarator { pointer, direct }
     }
@@ -488,21 +492,7 @@ impl Parser {
     }
 
     fn abstract_declarator(&mut self) -> AbstractDeclarator {
-        let mut pointer = Vec::new();
-        while self.peek() == &TokenKind::Star {
-            self.advance();
-            let mut quals = Vec::new();
-            loop {
-                match self.peek() {
-                    TokenKind::Const => { self.advance(); quals.push(TypeQual::Const); }
-                    TokenKind::Volatile => { self.advance(); quals.push(TypeQual::Volatile); }
-                    TokenKind::Restrict => { self.advance(); quals.push(TypeQual::Restrict); }
-                    _ => break,
-                }
-            }
-            pointer.push(Pointer { qualifiers: quals });
-        }
-
+        let pointer = self.parse_pointer();
         let direct = self.direct_abstract_declarator();
         AbstractDeclarator { pointer, direct }
     }

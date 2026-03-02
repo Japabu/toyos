@@ -525,7 +525,7 @@ impl Codegen {
         if ty.is_float() {
             if let Some(val) = self.eval_const_float(expr) {
                 let field_size = ty.size();
-                if offset + field_size > bytes.len() { return; }
+                assert!(offset + field_size <= bytes.len(), "initializer overflow: offset {offset} + size {field_size} exceeds {} bytes", bytes.len());
                 match ty {
                     CType::Float => {
                         let bits = (val as f32).to_le_bytes();
@@ -546,9 +546,7 @@ impl Codegen {
         // Constant integer (including enum constants and uint literals)
         if let Some(val) = self.eval_const(expr) {
             let field_size = ty.size();
-            if offset + field_size > bytes.len() {
-                return;
-            }
+            assert!(offset + field_size <= bytes.len(), "initializer overflow: offset {offset} + size {field_size} exceeds {} bytes", bytes.len());
             let val_bytes = val.to_le_bytes();
             let copy_len = field_size.min(val_bytes.len());
             bytes[offset..offset + copy_len].copy_from_slice(&val_bytes[..copy_len]);

@@ -66,7 +66,6 @@ pub(super) struct FuncCtx<'a> {
     switch_case_blocks: Vec<ir::Block>, // blocks to seal after dispatch chain is built
     // Goto/labels
     labels: HashMap<String, ir::Block>,
-    _gotos: Vec<(String, ir::Block)>, // deferred gotos
     // Variadic function support
     va_area: Option<ir::StackSlot>, // stack slot holding saved variadic args
     sret_ptr: Option<Value>,       // hidden return pointer for struct-returning functions
@@ -221,7 +220,7 @@ impl Codegen {
             if !self.defined_data.contains(&data_id) {
                 let mut desc = DataDescription::new();
                 desc.define_zeroinit(size.max(1));
-                let _ = self.module.define_data(data_id, &desc);
+                self.module.define_data(data_id, &desc).unwrap_or_else(|e| panic!("failed to define data: {e:?}"));
             }
         }
     }
@@ -330,7 +329,6 @@ impl Codegen {
             switch_default_block: None,
             switch_case_blocks: Vec::new(),
             labels: HashMap::new(),
-            _gotos: Vec::new(),
             va_area: None,
             sret_ptr: None,
         };
@@ -544,7 +542,7 @@ impl Codegen {
                 if let Some(init) = &id.initializer {
                     self.init_global_data(&mut desc, size, &ty, init);
                     self.defined_data.insert(data_id);
-                    let _ = self.module.define_data(data_id, &desc);
+                    self.module.define_data(data_id, &desc).unwrap_or_else(|e| panic!("failed to define data: {e:?}"));
                 } else {
                     // Tentative definition — defer zeroinit in case a real definition follows
                     self.tentative_data.push((data_id, size));
