@@ -51,10 +51,13 @@ fn run_test(name: &str, ignore_all_whitespace: bool) {
     let expected = fs::read_to_string(&expect_file)
         .unwrap_or_else(|e| panic!("failed to read {}: {e}", expect_file.display()));
 
+    // Run from the testcases dir with just the filename so warnings use short paths.
+    let src_name = src.file_name().unwrap().to_str().unwrap().to_string();
     let out = Command::new(toyos_cc())
         .arg("-E")
         .arg("-P")
-        .arg(&src)
+        .arg(&src_name)
+        .current_dir(&dir)
         .output()
         .unwrap_or_else(|e| panic!("failed to run toyos-cc: {e}"));
 
@@ -65,7 +68,9 @@ fn run_test(name: &str, ignore_all_whitespace: bool) {
         String::from_utf8_lossy(&out.stderr),
     );
 
-    let actual = String::from_utf8_lossy(&out.stdout);
+    // Combine stdout and stderr (warnings like redefinition warnings go to stderr).
+    let actual = String::from_utf8_lossy(&out.stdout).into_owned()
+        + &String::from_utf8_lossy(&out.stderr);
 
     if ignore_all_whitespace {
         assert_eq!(

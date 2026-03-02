@@ -29,11 +29,13 @@ pub struct Preprocessor {
     pub(crate) macros: HashMap<String, Macro>,
     macro_stack: HashMap<String, Vec<Option<Macro>>>,
     include_paths: Vec<PathBuf>,
+    implicit_includes: Vec<PathBuf>, // auto-included before each source file
     output: String,
     pub(crate) expanding: HashSet<String>,
-    pub(crate) file_stack: Vec<(String, u32)>,
+    pub(crate) file_stack: Vec<(String, u32, Option<usize>)>, // (file, line, include_dir_idx)
     pub(crate) counter: u32,
     pragma_once_files: HashSet<String>,
+    pub suppress_line_markers: bool,
 }
 
 impl Preprocessor {
@@ -42,11 +44,13 @@ impl Preprocessor {
             macros: HashMap::new(),
             macro_stack: HashMap::new(),
             include_paths,
+            implicit_includes: Vec::new(),
             output: String::new(),
             expanding: HashSet::new(),
             file_stack: Vec::new(),
             counter: 0,
             pragma_once_files: HashSet::new(),
+            suppress_line_markers: false,
         };
 
         // Determine target properties
@@ -54,13 +58,9 @@ impl Preprocessor {
         let is_macos = target.map_or(cfg!(target_os = "macos"), |t| t.contains("apple") || t.contains("darwin"));
         let is_aarch64 = target.map_or(cfg!(target_arch = "aarch64"), |t| t.starts_with("aarch64"));
 
-        // Language standard and compiler identity
+        // Language standard
         pp.define_object("__STDC__", "1");
         pp.define_object("__STDC_VERSION__", "199901L");
-        // Claim GCC 4.0 compat — needed for system headers
-        pp.define_object("__GNUC__", "4");
-        pp.define_object("__GNUC_MINOR__", "0");
-        pp.define_object("__GNUC_PATCHLEVEL__", "0");
 
         // Architecture
         pp.define_object("__LP64__", "1");
@@ -90,6 +90,13 @@ impl Preprocessor {
             pp.define_object("__APPLE__", "1");
             pp.define_object("__APPLE_CC__", "1");
             pp.define_object("__MACH__", "1");
+            // Auto-include Apple compat header (nullability annotations etc.) if present
+            if let Some(compat) = pp.include_paths.iter()
+                .map(|d| d.join("apple_compat.h"))
+                .find(|p| p.exists())
+            {
+                pp.implicit_includes.push(compat);
+            }
         } else {
             // Default to Linux-like
             pp.define_object("__linux__", "1");
@@ -117,24 +124,6 @@ impl Preprocessor {
         pp.define_object("__UINTPTR_TYPE__", "long unsigned int");
         pp.define_object("__INTMAX_TYPE__", "long int");
         pp.define_object("__UINTMAX_TYPE__", "long unsigned int");
-
-        // GCC builtin constants
-        pp.define_object("__FLT_MIN__", "1.17549435e-38F");
-        pp.define_object("__FLT_MAX__", "3.40282347e+38F");
-        pp.define_object("__DBL_MIN__", "2.2250738585072014e-308");
-        pp.define_object("__DBL_MAX__", "1.7976931348623157e+308");
-        pp.define_object("__LDBL_MIN__", "2.2250738585072014e-308L");
-        pp.define_object("__LDBL_MAX__", "1.7976931348623157e+308L");
-        pp.define_object("__FLT_EPSILON__", "1.19209290e-7F");
-        pp.define_object("__DBL_EPSILON__", "2.2204460492503131e-16");
-
-        // GCC builtin functions as macros
-        pp.define_function("__builtin_inf", &[], "(1.0/0.0)");
-        pp.define_function("__builtin_inff", &[], "(1.0F/0.0F)");
-        pp.define_function("__builtin_infl", &[], "(1.0L/0.0L)");
-        pp.define_function("__builtin_fabs", &["x"], "((x)<0?-(x):(x))");
-        pp.define_function("__builtin_fabsf", &["x"], "((x)<0?-(x):(x))");
-        pp.define_function("__builtin_fabsl", &["x"], "((x)<0?-(x):(x))");
 
         // stdarg.h builtins
         pp.define_function("va_start", &["ap", "last"], "__builtin_va_start(ap, last)");
@@ -169,25 +158,61 @@ impl Preprocessor {
 
     pub fn preprocess(&mut self, source: &str, filename: &str) -> String {
         self.output.clear();
-        self.process_source(source, filename);
+        // Process implicit includes before the source file
+        for path in std::mem::take(&mut self.implicit_includes) {
+            if let Ok(content) = fs::read_to_string(&path) {
+                let resolved = path.to_string_lossy().into_owned();
+                self.process_source(&content, &resolved, None);
+            }
+        }
+        self.process_source(source, filename, None);
         std::mem::take(&mut self.output)
     }
 
-    fn process_source(&mut self, source: &str, filename: &str) {
-        self.file_stack.push((filename.to_string(), 1));
+    // Returns true if `s` (a raw source line) ends with an identifier that is
+    // a defined function-like macro with no `(` following it on the line.
+    fn ends_with_fn_macro(s: &str, macros: &HashMap<String, Macro>) -> bool {
+        let bytes = s.trim_end().as_bytes();
+        let end = bytes.len();
+        let start = bytes[..end]
+            .iter()
+            .rposition(|&b| !b.is_ascii_alphanumeric() && b != b'_')
+            .map(|p| p + 1)
+            .unwrap_or(0);
+        if start >= end { return false; }
+        let last_word = match std::str::from_utf8(&bytes[start..end]) {
+            Ok(w) => w,
+            Err(_) => return false,
+        };
+        matches!(macros.get(last_word), Some(Macro::Function(..)))
+    }
+
+    fn process_source(&mut self, source: &str, filename: &str, include_dir_idx: Option<usize>) {
+        self.file_stack.push((filename.to_string(), 0, include_dir_idx));
         self.emit_line_marker(filename, 1);
 
         let lines = self.split_logical_lines(source);
-        let mut line_num = 0u32;
 
         let mut if_stack: Vec<IfState> = Vec::new();
 
         let mut pending_line = String::new();
+        let mut skip_idx: Option<usize> = None;
 
-        for line in &lines {
-            line_num += line.matches('\n').count() as u32 + 1;
+        for (idx, line) in lines.iter().enumerate() {
+            // When a line was consumed by joining with the previous line, skip it
+            // but still advance the line counter.
+            if skip_idx == Some(idx) {
+                skip_idx = None;
+                let advance = line.matches('\n').count() as u32 + 1;
+                if let Some(last) = self.file_stack.last_mut() {
+                    last.1 += advance;
+                }
+                continue;
+            }
+
+            let advance = line.matches('\n').count() as u32 + 1;
             if let Some(last) = self.file_stack.last_mut() {
-                last.1 = line_num;
+                last.1 += advance;
             }
 
             // If we're accumulating a multi-line expression (unbalanced parens), handle it
@@ -256,6 +281,7 @@ impl Preprocessor {
 
                 match directive {
                     "include" => self.handle_include(rest, filename),
+                    "include_next" => self.handle_include_next(rest, filename),
                     "define" => self.handle_define(rest),
                     "undef" => {
                         let name = rest.split_whitespace().next().unwrap_or("");
@@ -303,11 +329,13 @@ impl Preprocessor {
                     }
                     "endif" => { if_stack.pop(); }
                     "error" => {
-                        eprintln!("{}:{}: #error {}", filename, line_num, rest);
+                        let ln = self.file_stack.last().map(|(_,l,_)| *l).unwrap_or(0);
+                        eprintln!("{}:{}: #error {}", filename, ln, rest);
                         process::exit(1);
                     }
                     "warning" => {
-                        eprintln!("{}:{}: #warning {}", filename, line_num, rest);
+                        let ln = self.file_stack.last().map(|(_,l,_)| *l).unwrap_or(0);
+                        eprintln!("{}:{}: #warning {}", filename, ln, rest);
                     }
                     "pragma" => {
                         let rest = rest.trim();
@@ -329,29 +357,69 @@ impl Preprocessor {
                                 }
                             }
                         } else if rest == "once" || rest.starts_with("once ") || rest.starts_with("once\t") {
-                            if let Some((file, _)) = self.file_stack.last() {
+                            if let Some((file, _, _)) = self.file_stack.last() {
                                 self.pragma_once_files.insert(file.clone());
                             }
                         }
                         // Other pragmas ignored
                     }
-                    "line" => { /* ignore */ }
+                    "line" => {
+                        let expanded = self.expand_line(rest);
+                        let s = expanded.trim();
+                        let n_end = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+                        if let Ok(n) = s[..n_end].parse::<u32>() {
+                            let after_n = s[n_end..].trim();
+                            if let Some(last) = self.file_stack.last_mut() {
+                                last.1 = n.saturating_sub(1);
+                                if after_n.starts_with('"') && after_n.ends_with('"') && after_n.len() >= 2 {
+                                    last.0 = after_n[1..after_n.len()-1].to_string();
+                                }
+                            }
+                        }
+                    }
                     "" => { /* empty # line */ }
+                    _ if filename.ends_with(".S") || filename.ends_with(".s")
+                        || directive.chars().next().map_or(false, |c| c.is_ascii_digit()) =>
+                    {
+                        // Unknown directives in assembly files are silently ignored.
+                        // Numeric directive names (# N or # N "file") are GCC line markers
+                        // or assembly syntax — ignore those too.
+                    }
                     _ => {
-                        panic!("{}:{}: unknown preprocessor directive #{}", filename, line_num, directive);
+                        let ln = self.file_stack.last().map(|(_,l,_)| *l).unwrap_or(0);
+                        panic!("{}:{}: unknown preprocessor directive #{}", filename, ln, directive);
                     }
                 }
 
                 // Emit line marker after include to restore position
-                if directive == "include" {
-                    self.emit_line_marker(filename, line_num);
+                if directive == "include" || directive == "include_next" {
+                    let cur_line = self.file_stack.last().map(|(_,l,_)| *l).unwrap_or(1);
+                    self.emit_line_marker(filename, cur_line);
                 }
             } else if self.is_active(&if_stack) {
                 // Regular line - expand macros
-                if has_unbalanced_parens(trimmed) {
-                    pending_line = trimmed.to_string();
+                // If the line ends with a function-like macro name (no following `(`),
+                // and the next line starts with `(`, join them so the macro can collect
+                // its arguments across the line boundary.
+                let effective = if let Some(next_line) = lines.get(idx + 1) {
+                    let next_trimmed = next_line.trim();
+                    if next_trimmed.starts_with('(') && Self::ends_with_fn_macro(trimmed, &self.macros) {
+                        let next_advance = next_line.matches('\n').count() as u32 + 1;
+                        if let Some(last) = self.file_stack.last_mut() {
+                            last.1 += next_advance;
+                        }
+                        skip_idx = Some(idx + 1);
+                        format!("{} {}", trimmed, next_trimmed)
+                    } else {
+                        trimmed.to_string()
+                    }
                 } else {
-                    let expanded = self.expand_line(trimmed);
+                    trimmed.to_string()
+                };
+                if has_unbalanced_parens(&effective) {
+                    pending_line = effective;
+                } else {
+                    let expanded = self.expand_line(&effective);
                     self.output.push_str(&expanded);
                     self.output.push('\n');
                 }
@@ -366,6 +434,7 @@ impl Preprocessor {
     }
 
     fn emit_line_marker(&mut self, file: &str, line: u32) {
+        if self.suppress_line_markers { return; }
         self.output.push_str(&format!("# {} \"{}\"\n", line, file));
     }
 
@@ -465,22 +534,19 @@ impl Preprocessor {
             if trimmed.starts_with('"') {
                 let end = trimmed[1..].find('"').unwrap_or(trimmed.len() - 1);
                 let path = trimmed[1..1 + end].to_string();
-                if let Some((content, resolved)) = self.find_and_read(&path, current_file, false) {
-                    self.process_source(&content, &resolved);
+                if let Some((content, resolved, idx)) = self.find_and_read(&path, current_file, false) {
+                    self.process_source(&content, &resolved, idx);
                 }
                 return;
             }
             panic!("cannot parse #include {}", arg);
         };
 
-        if let Some((content, resolved)) = self.find_and_read(path_str, current_file, is_system) {
+        if let Some((content, resolved, idx)) = self.find_and_read(path_str, current_file, is_system) {
             if self.pragma_once_files.contains(&resolved) {
                 return;
             }
-            self.process_source(&content, &resolved);
-        } else if matches!(path_str, "stdarg.h" | "stdbool.h" | "stdnoreturn.h" | "stdalign.h"
-                | "ptrcheck.h" | "stdatomic.h") {
-            // Compiler-provided headers: builtins are already defined, nothing to include
+            self.process_source(&content, &resolved, idx);
         } else if is_system {
             // Missing system headers — warn but don't fail
             eprintln!("warning: cannot find system include file: {}", path_str);
@@ -489,22 +555,63 @@ impl Preprocessor {
         }
     }
 
-    fn find_and_read(&self, path: &str, current_file: &str, is_system: bool) -> Option<(String, String)> {
+    fn handle_include_next(&mut self, arg: &str, _current_file: &str) {
+        let arg = arg.trim();
+        // Start searching from one past the include-dir index that provided the current file
+        let current_idx = self.file_stack.last().and_then(|(_, _, idx)| *idx).unwrap_or(0);
+        let start_idx = current_idx + 1;
+
+        let (path_str, is_system) = if arg.starts_with('"') {
+            let end = arg[1..].find('"').unwrap_or(arg.len() - 1);
+            (&arg[1..1 + end], false)
+        } else if arg.starts_with('<') {
+            let end = arg[1..].find('>').unwrap_or(arg.len() - 1);
+            (&arg[1..1 + end], true)
+        } else {
+            eprintln!("warning: cannot parse #include_next {}", arg);
+            return;
+        };
+
+        if let Some((content, resolved, idx)) = self.find_and_read_next(path_str, start_idx) {
+            if self.pragma_once_files.contains(&resolved) {
+                return;
+            }
+            self.process_source(&content, &resolved, idx);
+        } else if is_system {
+            eprintln!("warning: cannot find #include_next file: {}", path_str);
+        } else {
+            panic!("cannot find #include_next file: {}", path_str);
+        }
+    }
+
+    fn find_and_read(&self, path: &str, current_file: &str, is_system: bool) -> Option<(String, String, Option<usize>)> {
         if !is_system {
-            // Search relative to current file first
+            // Search relative to current file first (not associated with any include-path index)
             let current_dir = Path::new(current_file).parent().unwrap_or(Path::new("."));
             let candidate = current_dir.join(path);
             if let Ok(content) = fs::read_to_string(&candidate) {
                 let resolved = candidate.canonicalize().unwrap_or(candidate).to_string_lossy().to_string();
-                return Some((content, resolved));
+                return Some((content, resolved, None));
             }
         }
-        // Search include paths
-        for dir in &self.include_paths {
+        // Search include paths, tracking the index for #include_next support
+        for (i, dir) in self.include_paths.iter().enumerate() {
             let candidate = dir.join(path);
             if let Ok(content) = fs::read_to_string(&candidate) {
                 let resolved = candidate.canonicalize().unwrap_or(candidate).to_string_lossy().to_string();
-                return Some((content, resolved));
+                return Some((content, resolved, Some(i)));
+            }
+        }
+        None
+    }
+
+    fn find_and_read_next(&self, path: &str, start_idx: usize) -> Option<(String, String, Option<usize>)> {
+        // For #include_next: skip include dirs up to (and including) start_idx - 1
+        for (i, dir) in self.include_paths.iter().enumerate().skip(start_idx) {
+            let candidate = dir.join(path);
+            if let Ok(content) = fs::read_to_string(&candidate) {
+                let resolved = candidate.canonicalize().unwrap_or(candidate).to_string_lossy().to_string();
+                return Some((content, resolved, Some(i)));
             }
         }
         None
@@ -528,14 +635,14 @@ impl Preprocessor {
             let mut params = Vec::new();
             let mut variadic = false;
             loop {
-                // Skip whitespace
-                while chars.peek() == Some(&' ') { chars.next(); }
+                // Skip whitespace (including \n from line continuations)
+                while chars.peek().is_some_and(|c| c.is_ascii_whitespace()) { chars.next(); }
                 if chars.peek() == Some(&')') { chars.next(); break; }
                 if chars.peek() == Some(&'.') {
                     // ...
                     chars.next(); chars.next(); chars.next();
                     variadic = true;
-                    while chars.peek() == Some(&' ') { chars.next(); }
+                    while chars.peek().is_some_and(|c| c.is_ascii_whitespace()) { chars.next(); }
                     if chars.peek() == Some(&')') { chars.next(); }
                     break;
                 }
@@ -545,32 +652,49 @@ impl Preprocessor {
                 }
                 if param == "..." {
                     variadic = true;
-                    while chars.peek() == Some(&' ') { chars.next(); }
+                    while chars.peek().is_some_and(|c| c.is_ascii_whitespace()) { chars.next(); }
                     if chars.peek() == Some(&')') { chars.next(); }
                     break;
                 }
                 if !param.is_empty() {
                     params.push(param);
                 }
-                while chars.peek() == Some(&' ') { chars.next(); }
+                while chars.peek().is_some_and(|c| c.is_ascii_whitespace()) { chars.next(); }
                 if chars.peek() == Some(&',') { chars.next(); }
             }
 
             // Rest is the body
             let body_str: String = chars.collect();
             let body = Self::strip_ws_around_hashhash(self.tokenize_pp(body_str.trim()));
+            self.warn_redefine(&name, &Macro::Function(params.clone(), variadic, body.clone()));
             self.macros.insert(name, Macro::Function(params, variadic, body));
         } else {
             // Object-like
             let body_str: String = chars.collect();
             let body = Self::strip_ws_around_hashhash(self.tokenize_pp(body_str.trim()));
+            self.warn_redefine(&name, &Macro::Object(body.clone()));
             self.macros.insert(name, Macro::Object(body));
+        }
+    }
+
+    fn warn_redefine(&self, name: &str, new_mac: &Macro) {
+        let Some(old_mac) = self.macros.get(name) else { return };
+        let same = match (old_mac, new_mac) {
+            (Macro::Object(a), Macro::Object(b)) => a == b,
+            (Macro::Function(ap, av, ab), Macro::Function(bp, bv, bb)) => {
+                ap == bp && av == bv && ab == bb
+            }
+            _ => false,
+        };
+        if !same {
+            let (file, line) = self.file_stack.last().map(|(f, l, _)| (f.as_str(), *l)).unwrap_or(("", 0));
+            eprintln!("{}:{}: warning: {} redefined", file, line, name);
         }
     }
 
     fn expand_line(&mut self, line: &str) -> String {
         // Update __FILE__ and __LINE__ before expansion
-        if let Some((file, line_num)) = self.file_stack.last() {
+        if let Some((file, line_num, _)) = self.file_stack.last() {
             let file_val = format!("\"{}\"", file);
             let line_val = line_num.to_string();
             self.define_object("__FILE__", &file_val);
@@ -701,16 +825,14 @@ impl Preprocessor {
                     } else {
                         trimmed
                     };
-                    let current_file = self.file_stack.last().map(|(f,_)| f.as_str()).unwrap_or("");
-                    let found = self.find_and_read(&path, current_file, false).is_some()
-                        || matches!(path.as_str(), "stdarg.h" | "stdbool.h" | "stdnoreturn.h" | "stdalign.h");
+                    let current_file = self.file_stack.last().map(|(f,_,_)| f.as_str()).unwrap_or("");
+                    let found = self.find_and_read(&path, current_file, false).is_some();
                     result.push_str(if found { "1" } else { "0" });
                     i = j + 1;
                     continue;
                 };
-                let current_file = self.file_stack.last().map(|(f,_)| f.as_str()).unwrap_or("");
-                let found = self.find_and_read(path, current_file, arg.starts_with('<')).is_some()
-                    || matches!(path, "stdarg.h" | "stdbool.h" | "stdnoreturn.h" | "stdalign.h");
+                let current_file = self.file_stack.last().map(|(f,_,_)| f.as_str()).unwrap_or("");
+                let found = self.find_and_read(path, current_file, arg.starts_with('<')).is_some();
                 result.push_str(if found { "1" } else { "0" });
                 i = j + 1;
             } else {

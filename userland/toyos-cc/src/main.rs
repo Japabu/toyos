@@ -24,14 +24,27 @@ fn main() {
 }
 
 fn run() {
-    let args = parse_args();
+    let mut args = parse_args();
+
+    // Auto-add compiler's own include/ dir (lowest priority — after all user -I paths).
+    // Binary is at target/{profile}/toyos-cc; include/ is at project root (two levels up).
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(root) = exe.parent().and_then(|p| p.parent()).and_then(|p| p.parent()) {
+            let include = root.join("include");
+            if include.is_dir() {
+                args.include_paths.push(include);
+            }
+        }
+    }
 
     if args.verbose {
         verbose::set(true);
         eprintln!("toyos-cc: verbose mode enabled");
     }
 
-    eprintln!("toyos-cc: starting");
+    if !args.preprocess_only {
+        eprintln!("toyos-cc: starting");
+    }
 
     for input in &args.inputs {
         let source = fs::read_to_string(input).unwrap_or_else(|e| {
@@ -39,10 +52,15 @@ fn run() {
             process::exit(1);
         });
 
-        eprintln!("toyos-cc: preprocessing...");
+        if !args.preprocess_only {
+            eprintln!("toyos-cc: preprocessing...");
+        }
         let mut pp = preprocess::Preprocessor::new(args.include_paths.clone(), args.defines.clone(), args.target.as_deref());
+        pp.suppress_line_markers = args.suppress_line_markers;
         let preprocessed = pp.preprocess(&source, &input.to_string_lossy());
-        eprintln!("toyos-cc: preprocessing done, {} bytes", preprocessed.len());
+        if !args.preprocess_only {
+            eprintln!("toyos-cc: preprocessing done, {} bytes", preprocessed.len());
+        }
 
         if args.preprocess_only {
             print!("{preprocessed}");
@@ -119,9 +137,10 @@ struct Args {
     include_paths: Vec<PathBuf>,
     defines: Vec<(String, String)>,
     target: Option<String>,
-    compile_only: bool,    // -c
-    preprocess_only: bool, // -E
-    verbose: bool,         // -v / --verbose
+    compile_only: bool,          // -c
+    preprocess_only: bool,       // -E
+    suppress_line_markers: bool, // -P
+    verbose: bool,               // -v / --verbose
 }
 
 fn parse_args() -> Args {
@@ -133,6 +152,7 @@ fn parse_args() -> Args {
     let mut target = None;
     let mut compile_only = false;
     let mut preprocess_only = false;
+    let mut suppress_line_markers = false;
     let mut verbose = false;
     let mut i = 1;
 
@@ -141,6 +161,7 @@ fn parse_args() -> Args {
             "-o" => { i += 1; output = Some(PathBuf::from(&argv[i])); }
             "-c" => compile_only = true,
             "-E" => preprocess_only = true,
+            "-P" => suppress_line_markers = true,
             "-v" | "--verbose" => verbose = true,
             "--target" => { i += 1; target = Some(argv[i].clone()); }
             "-I" => { i += 1; include_paths.push(PathBuf::from(&argv[i])); }
@@ -183,5 +204,5 @@ fn parse_args() -> Args {
         process::exit(1);
     }
 
-    Args { inputs, output, include_paths, defines, target, compile_only, preprocess_only, verbose }
+    Args { inputs, output, include_paths, defines, target, compile_only, preprocess_only, suppress_line_markers, verbose }
 }
