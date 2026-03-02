@@ -321,6 +321,30 @@ impl Codegen {
         }
     }
 
+    /// Compute the required allocation size for a type+initializer pair,
+    /// accounting for flexible array members in structs.
+    pub(crate) fn init_size(ty: &CType, init: &Initializer) -> usize {
+        if let CType::Struct(def) = ty {
+            if let Some(last_field) = def.fields.last() {
+                if let CType::Array(elem, None) = &last_field.ty {
+                    // Struct has a flexible array member — count elements from initializer
+                    if let Initializer::List(items) = init {
+                        let non_flex = def.fields.len() - 1;
+                        if items.len() > non_flex {
+                            let flex_init = &items[non_flex].initializer;
+                            let flex_count = match flex_init {
+                                Initializer::List(sub) => sub.len(),
+                                Initializer::Expr(_) => 1,
+                            };
+                            return ty.size() + flex_count * elem.size();
+                        }
+                    }
+                }
+            }
+        }
+        ty.size()
+    }
+
     pub(crate) fn init_global_data(&mut self, desc: &mut DataDescription, size: usize, ty: &CType, init: &Initializer) {
         let mut bytes = vec![0u8; size.max(1)];
         let mut relocs: Vec<GlobalReloc> = Vec::new();

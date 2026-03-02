@@ -709,7 +709,8 @@ impl Codegen {
                 let mut desc = DataDescription::new();
                 desc.set_align(ty.align() as u64);
                 if let Some(init) = &id.initializer {
-                    self.init_global_data(&mut desc, ty.size().max(1), &ty, init);
+                    let size = Self::init_size(&ty, init).max(1);
+                    self.init_global_data(&mut desc, size, &ty, init);
                 } else {
                     desc.define_zeroinit(ty.size().max(1));
                 }

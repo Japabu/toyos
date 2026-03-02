@@ -221,6 +221,7 @@ impl Codegen {
                 let mut desc = DataDescription::new();
                 desc.define_zeroinit(size.max(1));
                 self.module.define_data(data_id, &desc).unwrap_or_else(|e| panic!("failed to define data: {e:?}"));
+                self.defined_data.insert(data_id);
             }
         }
     }
@@ -531,7 +532,11 @@ impl Codegen {
                         (completed, sz)
                     }
                     _ => {
-                        let sz = ty.size();
+                        let sz = if let Some(init) = &id.initializer {
+                            Self::init_size(&ty, init)
+                        } else {
+                            ty.size()
+                        };
                         (ty, sz)
                     }
                 };
