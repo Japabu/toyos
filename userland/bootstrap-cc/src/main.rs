@@ -11,6 +11,7 @@ fn run(cmd: &mut Command) {
 fn main() {
     let project_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let tcc_dir = project_dir.join("tinycc");
+
     // ── Stage 0: Download TCC ───────────────────────────────────────────
     if !tcc_dir.join("tcc.c").exists() {
         println!("[stage 0] Downloading TinyCC...");
@@ -49,23 +50,32 @@ fn main() {
     link(&stage1_obj, &stage1_bin);
     println!("[stage 1] Done.");
 
+    // ── Build libtcc1.a with stage1 TCC ─────────────────────────────────
+    // TCC needs libtcc1.a at link time. Must be compiled by TCC itself
+    // because TCC's object format may differ from the host compiler's.
+    println!("[stage 2] Building libtcc1.a...");
+    build_libtcc1(&tcc_dir);
+
     // ── Stage 2: Compile TCC with stage1 TCC ────────────────────────────
-    let stage2_obj = project_dir.join("tcc-stage2.o");
+    // TCC links its own objects — compile and link in one step.
+    // -L$TCCDIR so TCC can find libtcc1.a.
     let stage2_bin = project_dir.join("tcc-stage2");
 
     println!("[stage 2] Compiling TCC with tcc-stage1...");
     run(Command::new(&stage1_bin)
-        .args(["-c", "-o"])
-        .arg(&stage2_obj)
+        .arg("-o").arg(&stage2_bin)
         .args(tcc_defines(&tcc_dir))
         .arg("-I").arg(tcc_dir.join("include"))
         .arg("-I").arg(&tcc_dir)
-        .args(system_include_args())
+        .arg("-L").arg(&tcc_dir)
         .arg(tcc_dir.join("tcc.c"))
         .current_dir(&project_dir));
 
-    println!("[stage 2] Linking tcc-stage2...");
-    link(&stage2_obj, &stage2_bin);
+    // On macOS, binaries linked by TCC are not codesigned and will be SIGKILLed.
+    if cfg!(target_os = "macos") {
+        println!("[stage 2] Codesigning tcc-stage2...");
+        run(Command::new("codesign").args(["--sign", "-"]).arg(&stage2_bin));
+    }
     println!("[stage 2] Done.");
 
     // ── Verify ──────────────────────────────────────────────────────────
@@ -137,31 +147,83 @@ fn configure_tcc(tcc_dir: &Path) {
 }
 
 fn tcc_defines(tcc_dir: &Path) -> Vec<String> {
-    vec![
+    let mut defs = vec![
         "-DONE_SOURCE=1".into(),
-        "-DTCC_TARGET_X86_64".into(),
-        "-DCONFIG_TRIPLET=\"x86_64-linux-gnu\"".into(),
         "-DTCC_VERSION=\"0.9.27\"".into(),
         format!("-DCONFIG_TCCDIR=\"{}\"", tcc_dir.display()),
-        "-DCONFIG_TCC_CRTPREFIX=\"/usr/lib\"".into(),
-        "-DCONFIG_TCC_LIBPATHS=\"/usr/lib\"".into(),
-        "-DCONFIG_TCC_SYSINCLUDEPATHS=\"{B}/include:/usr/include\"".into(),
         "-DCONFIG_LDDIR=\"lib\"".into(),
-        // HACK: defining as 0 still makes #ifdef true in tcc.h, activating
-        // comma-expression wrappers. But without it, tcc.h defaults to 1 which
-        // pulls in <dispatch/dispatch.h> on macOS — unparseable by toyos-cc.
+        // Defining as 0 still makes #ifdef true in tcc.h (activating comma-expression
+        // wrappers), but #if is false — avoids pulling in <dispatch/dispatch.h> on macOS.
         "-DCONFIG_TCC_SEMLOCK=0".into(),
-    ]
+    ];
+
+    if cfg!(target_os = "macos") {
+        let sdk = sdk_path();
+        defs.push("-DTCC_TARGET_MACHO".into());
+        defs.push("-DCONFIG_NEW_MACHO=1".into());
+        defs.push(format!("-DCONFIG_TCC_CRTPREFIX=\"{sdk}/usr/lib\""));
+        defs.push(format!("-DCONFIG_TCC_LIBPATHS=\"{sdk}/usr/lib\""));
+        defs.push(format!("-DCONFIG_TCC_SYSINCLUDEPATHS=\"{{B}}/include:{sdk}/usr/include\""));
+        if cfg!(target_arch = "aarch64") {
+            defs.push("-DTCC_TARGET_ARM64".into());
+        } else {
+            defs.push("-DTCC_TARGET_X86_64".into());
+        }
+    } else {
+        // Linux
+        defs.push("-DCONFIG_TCC_CRTPREFIX=\"/usr/lib\"".into());
+        defs.push("-DCONFIG_TCC_LIBPATHS=\"/usr/lib\"".into());
+        defs.push("-DCONFIG_TCC_SYSINCLUDEPATHS=\"{B}/include:/usr/include\"".into());
+        if cfg!(target_arch = "aarch64") {
+            defs.push("-DTCC_TARGET_ARM64".into());
+            defs.push("-DCONFIG_TRIPLET=\"aarch64-linux-gnu\"".into());
+        } else {
+            defs.push("-DTCC_TARGET_X86_64".into());
+            defs.push("-DCONFIG_TRIPLET=\"x86_64-linux-gnu\"".into());
+        }
+    }
+
+    defs
+}
+
+fn sdk_path() -> String {
+    let output = Command::new("xcrun")
+        .args(["--show-sdk-path"])
+        .output()
+        .expect("failed to run xcrun");
+    String::from_utf8(output.stdout).unwrap().trim().to_string()
+}
+
+fn build_libtcc1(tcc_dir: &Path) {
+    // Build with the host cc — libtcc1.a is a standard Mach-O/ELF archive that TCC's
+    // linker can consume. Using the host cc avoids TCC codegen limitations during bootstrap.
+    let include_args: &[&str] = if cfg!(target_os = "macos") {
+        &[]  // host cc knows its own includes
+    } else {
+        &[]
+    };
+
+    let libtcc1_o = tcc_dir.join("libtcc1.o");
+    run(Command::new("cc").args(["-c", "-o"]).arg(&libtcc1_o)
+        .args(include_args)
+        .arg(tcc_dir.join("lib/libtcc1.c")));
+
+    let mut objs = vec![libtcc1_o];
+
+    if cfg!(target_arch = "aarch64") {
+        let lib_arm_o = tcc_dir.join("lib-arm64.o");
+        run(Command::new("cc").args(["-c", "-o"]).arg(&lib_arm_o)
+            .args(include_args)
+            .arg(tcc_dir.join("lib/lib-arm64.c")));
+        objs.push(lib_arm_o);
+    }
+
+    run(Command::new("ar").args(["rcs"]).arg(tcc_dir.join("libtcc1.a")).args(&objs));
 }
 
 fn system_include_args() -> Vec<String> {
     if cfg!(target_os = "macos") {
-        let output = Command::new("xcrun")
-            .args(["--show-sdk-path"])
-            .output()
-            .expect("failed to run xcrun");
-        let sdk = String::from_utf8(output.stdout).unwrap().trim().to_string();
-        vec!["-I".to_string(), format!("{sdk}/usr/include")]
+        vec!["-I".to_string(), format!("{}/usr/include", sdk_path())]
     } else {
         vec!["-I".to_string(), "/usr/include".to_string()]
     }
@@ -170,12 +232,10 @@ fn system_include_args() -> Vec<String> {
 fn link(obj: &Path, out: &Path) {
     let mut cmd = Command::new("cc");
     cmd.arg("-o").arg(out).arg(obj);
-
     if cfg!(target_os = "linux") {
         cmd.args(["-lm", "-ldl"]);
     } else if cfg!(target_os = "macos") {
         cmd.arg("-lm");
     }
-
     run(&mut cmd);
 }
