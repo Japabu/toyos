@@ -241,3 +241,6 @@ tinycc_test!(t141_tok_str, "141_tok_str");
 tinycc_test!(t142_pp_sizeof_ptr, "142_pp_sizeof_ptr");
 tinycc_test!(t143_uint64_split, "143_uint64_split");
 tinycc_test!(t144_sizeof_init, "144_sizeof_init");
+tinycc_test!(t145_self_ref_struct, "145_self_ref_struct");
+tinycc_test!(t146_deref_assign, "146_deref_assign");
+tinycc_test!(t147_sizeof_deref_array, "147_sizeof_deref_array");

@@ -280,7 +280,7 @@ impl Codegen {
         }
     }
 
-    fn resolve_incomplete_type(&self, ty: CType) -> CType {
+    pub(crate) fn resolve_incomplete_type(&self, ty: CType) -> CType {
         match ty {
             // Forward-declared struct/union: try to resolve, keep incomplete if not yet defined (opaque types)
             CType::Struct(ref def) if def.fields.is_empty() => {

@@ -1008,6 +1008,7 @@ impl Codegen {
                 let base = self.compile_addr(ctx, e);
                 let base_ty = self.expr_type(ctx, e)
                     .unwrap_or_else(|| panic!("cannot resolve type of member base '.{field}'"));
+                let base_ty = self.resolve_incomplete_type(base_ty);
                 let (byte_offset, bit_offset, field_ty) = base_ty.field_offset(field)
                     .unwrap_or_else(|| panic!("no field '{field}' in {base_ty:?}"));
                 let bw = base_ty.field_bit_width(field);
@@ -1035,6 +1036,7 @@ impl Codegen {
                     CType::Pointer(inner) => *inner,
                     other => panic!("arrow '->{field}' on non-pointer type {other:?}"),
                 };
+                let pointee_ty = self.resolve_incomplete_type(pointee_ty);
                 let (byte_offset, bit_offset, field_ty) = pointee_ty.field_offset(field)
                     .unwrap_or_else(|| panic!("no field '{field}' in {pointee_ty:?}"));
                 let bw = pointee_ty.field_bit_width(field);
@@ -1290,23 +1292,25 @@ impl Codegen {
             }
             Expr::Arrow(e, field) => {
                 let base_ty = self.expr_type(ctx, e)?;
-                let pointee = match &base_ty {
-                    CType::Pointer(inner) => inner.as_ref(),
-                    CType::Array(inner, _) => inner.as_ref(), // array decays to pointer
+                let pointee = match base_ty {
+                    CType::Pointer(inner) => *inner,
+                    CType::Array(inner, _) => *inner, // array decays to pointer
                     _ => return None,
                 };
+                let pointee = self.resolve_incomplete_type(pointee);
                 let bw = pointee.field_bit_width(field);
                 pointee.field_offset(field).map(|(_, _, ty)| CType::promote_integer(ty, bw))
             }
             Expr::Member(e, field) => {
                 let base_ty = self.expr_type(ctx, e)?;
+                let base_ty = self.resolve_incomplete_type(base_ty);
                 let bw = base_ty.field_bit_width(field);
                 base_ty.field_offset(field).map(|(_, _, ty)| CType::promote_integer(ty, bw))
             }
             Expr::Unary(UnaryOp::Deref, e) => {
                 let ty = self.expr_type(ctx, e)?;
                 match ty {
-                    CType::Pointer(inner) => Some(*inner),
+                    CType::Pointer(inner) | CType::Array(inner, _) => Some(*inner),
                     _ => None,
                 }
             }
@@ -1387,6 +1391,7 @@ impl Codegen {
                     _ => None,
                 }
             }
+            Expr::Assign(_, lhs, _) => self.expr_type(ctx, lhs),
             Expr::CompoundLiteral(tn, items) => {
                 let ty = self.resolve_typename(tn);
                 // For incomplete array types, determine size from initializer count
@@ -1468,6 +1473,7 @@ impl Codegen {
                 let base = self.compile_addr(ctx, e);
                 let base_ty = self.expr_type(ctx, e)
                     .unwrap_or_else(|| panic!("compile_addr: cannot resolve type of member base '.{field}'"));
+                let base_ty = self.resolve_incomplete_type(base_ty);
                 let (byte_offset, _, _) = base_ty.field_offset(field)
                     .unwrap_or_else(|| panic!("compile_addr: no field '{field}' in {base_ty:?}"));
                 if byte_offset != 0 {
@@ -1484,6 +1490,7 @@ impl Codegen {
                     CType::Pointer(inner) => *inner,
                     other => panic!("compile_addr: arrow '->{field}' on non-pointer type {other:?}"),
                 };
+                let pointee_ty = self.resolve_incomplete_type(pointee_ty);
                 let (byte_offset, _, _) = pointee_ty.field_offset(field)
                     .unwrap_or_else(|| panic!("compile_addr: no field '{field}' in {pointee_ty:?}"));
                 if byte_offset != 0 {
