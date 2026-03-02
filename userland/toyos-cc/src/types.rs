@@ -109,14 +109,37 @@ impl CType {
 
     fn struct_size(&self, def: &StructDef) -> usize {
         let mut offset = 0usize;
+        let mut bit_pos = 0u32; // bits used in current bitfield storage unit
+        let mut bit_unit_size = 0usize; // size of current bitfield storage unit (0 = not in bitfield)
         for field in &def.fields {
-            if field.bit_width.is_some() {
-                // Simplified bitfield handling - allocate full type size
+            if let Some(bw) = field.bit_width {
+                let unit_size = field.ty.size();
+                let unit_bits = (unit_size * 8) as u32;
                 let align = field.ty.align();
-                offset = (offset + align - 1) & !(align - 1);
-                offset += field.ty.size();
+                if bw == 0 {
+                    // Zero-width bitfield: flush current unit, align to next boundary
+                    if bit_unit_size > 0 {
+                        offset += bit_unit_size;
+                        bit_pos = 0;
+                        bit_unit_size = 0;
+                    }
+                    offset = (offset + align - 1) & !(align - 1);
+                } else if bit_unit_size == unit_size && bit_pos + bw <= unit_bits {
+                    // Fits in current storage unit
+                    bit_pos += bw;
+                } else {
+                    // Start new storage unit
+                    offset += bit_unit_size;
+                    offset = (offset + align - 1) & !(align - 1);
+                    bit_unit_size = unit_size;
+                    bit_pos = bw;
+                }
                 continue;
             }
+            // Flush any pending bitfield storage unit
+            offset += bit_unit_size;
+            bit_pos = 0;
+            bit_unit_size = 0;
             // Flexible array member (incomplete array at end of struct) has size 0
             if matches!(&field.ty, CType::Array(_, None)) {
                 continue;
@@ -125,6 +148,8 @@ impl CType {
             offset = (offset + align - 1) & !(align - 1);
             offset += field.ty.size();
         }
+        // Flush trailing bitfield unit
+        offset += bit_unit_size;
         let struct_align = self.align();
         (offset + struct_align - 1) & !(struct_align - 1)
     }
@@ -136,25 +161,64 @@ impl CType {
     }
 
     /// Get the field offset within a struct
-    pub fn field_offset(&self, name: &str) -> Option<(usize, CType)> {
+    /// Returns (byte_offset, bit_offset_within_storage_unit, field_type).
+    /// bit_offset is 0 for non-bitfield fields.
+    pub fn field_offset(&self, name: &str) -> Option<(usize, u32, CType)> {
         let def = match self {
             CType::Struct(def) => def,
             CType::Union(_) => return self.union_field(name),
             _ => return None,
         };
         let mut offset = 0usize;
+        let mut bit_pos = 0u32;
+        let mut bit_unit_size = 0usize;
         for field in &def.fields {
+            if let Some(bw) = field.bit_width {
+                let unit_size = field.ty.size();
+                let unit_bits = (unit_size * 8) as u32;
+                let align = field.ty.align();
+                if bw == 0 {
+                    if bit_unit_size > 0 {
+                        offset += bit_unit_size;
+                        bit_pos = 0;
+                        bit_unit_size = 0;
+                    }
+                    offset = (offset + align - 1) & !(align - 1);
+                } else if bit_unit_size == unit_size && bit_pos + bw <= unit_bits {
+                    let field_bit_off = bit_pos;
+                    bit_pos += bw;
+                    if field.name.as_deref() == Some(name) {
+                        return Some((offset, field_bit_off, field.ty.clone()));
+                    }
+                    continue;
+                } else {
+                    offset += bit_unit_size;
+                    offset = (offset + align - 1) & !(align - 1);
+                    bit_unit_size = unit_size;
+                    bit_pos = bw;
+                    if field.name.as_deref() == Some(name) {
+                        return Some((offset, 0, field.ty.clone()));
+                    }
+                    continue;
+                }
+                continue;
+            }
+            // Flush any pending bitfield storage unit
+            offset += bit_unit_size;
+            bit_pos = 0;
+            bit_unit_size = 0;
+
             let align = field.ty.align();
             offset = (offset + align - 1) & !(align - 1);
 
             if field.name.as_deref() == Some(name) {
-                return Some((offset, field.ty.clone()));
+                return Some((offset, 0, field.ty.clone()));
             }
 
             // Anonymous struct/union - search inside
             if field.name.is_none() {
-                if let Some((inner_offset, ty)) = field.ty.field_offset(name) {
-                    return Some((offset + inner_offset, ty));
+                if let Some((inner_offset, inner_bit_off, ty)) = field.ty.field_offset(name) {
+                    return Some((offset + inner_offset, inner_bit_off, ty));
                 }
             }
 
@@ -163,18 +227,18 @@ impl CType {
         None
     }
 
-    fn union_field(&self, name: &str) -> Option<(usize, CType)> {
+    fn union_field(&self, name: &str) -> Option<(usize, u32, CType)> {
         let def = match self {
             CType::Union(def) => def,
             _ => return None,
         };
         for field in &def.fields {
             if field.name.as_deref() == Some(name) {
-                return Some((0, field.ty.clone()));
+                return Some((0, 0, field.ty.clone()));
             }
             if field.name.is_none() {
-                if let Some((inner_offset, ty)) = field.ty.field_offset(name) {
-                    return Some((inner_offset, ty));
+                if let Some((inner_offset, inner_bit_off, ty)) = field.ty.field_offset(name) {
+                    return Some((inner_offset, inner_bit_off, ty));
                 }
             }
         }

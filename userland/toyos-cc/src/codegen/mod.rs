@@ -39,6 +39,7 @@ pub struct Codegen {
     tentative_data: Vec<(cranelift_module::DataId, usize)>, // tentative defs: (id, size)
     global_types: HashMap<String, CType>,                 // C types of global variables
     func_ret_types: HashMap<String, CType>,               // C return types of functions
+    func_ctypes: HashMap<String, CType>,                   // full C function types (for expr_type)
     variadic_funcs: HashMap<String, usize>,                   // variadic func name → fixed param count
     static_funcs: HashSet<String>,                             // functions declared static
     extern_provision: HashSet<String>,                         // functions with non-inline external provision
@@ -87,6 +88,7 @@ impl Codegen {
             tentative_data: Vec::new(),
             global_types: HashMap::new(),
             func_ret_types: HashMap::new(),
+            func_ctypes: HashMap::new(),
             variadic_funcs: HashMap::new(),
             static_funcs: HashSet::new(),
             extern_provision: HashSet::new(),
@@ -236,10 +238,10 @@ impl Codegen {
         let base_ty = self.resolve_type(&fdef.specifiers);
         let func_ty = self.apply_declarator(&base_ty, &fdef.declarator);
 
-        let (ret_ty, param_types, variadic) = match &func_ty {
-            CType::Function(ret, params, variadic) => (ret.as_ref(), params, *variadic),
-            _ => (&base_ty, &Vec::new() as &Vec<ParamType>, false),
+        let CType::Function(ret_ty, param_types, variadic) = &func_ty else {
+            panic!("declare_function '{name}': declarator resolved to non-function type {func_ty:?}");
         };
+        let (ret_ty, param_types, variadic) = (ret_ty.as_ref(), param_types, *variadic);
 
         let linkage = self.function_linkage(&name);
         let sig = self.build_signature(ret_ty, param_types, variadic);
@@ -262,10 +264,10 @@ impl Codegen {
         let base_ty = self.resolve_type(&fdef.specifiers);
         let func_ty = self.apply_declarator(&base_ty, &fdef.declarator);
 
-        let (ret_ty, param_types, variadic) = match &func_ty {
-            CType::Function(ret, params, variadic) => (ret.as_ref().clone(), params.clone(), *variadic),
-            _ => (base_ty, Vec::new(), false),
+        let CType::Function(ref ret_box, ref param_types_ref, variadic) = func_ty else {
+            panic!("compile_function '{name}': declarator resolved to non-function type {func_ty:?}");
         };
+        let (ret_ty, param_types, variadic) = (ret_box.as_ref().clone(), param_types_ref.clone(), variadic);
 
         let linkage = self.function_linkage(&name);
         let sig = self.build_signature(&ret_ty, &param_types, variadic);
@@ -291,6 +293,7 @@ impl Codegen {
         self.func_ids.insert(name.clone(), func_id);
         self.func_sigs.insert(name.clone(), sig);
         self.func_ret_types.insert(name.clone(), ret_ty.clone());
+        self.func_ctypes.insert(name.clone(), func_ty.clone());
         let module_sig = self.module.declarations().get_function_decl(func_id).signature.clone();
         let mut func = ir::Function::with_name_signature(
             ir::UserFuncName::user(0, func_id.as_u32()),
@@ -477,6 +480,7 @@ impl Codegen {
             if matches!(ty, CType::Function(..)) {
                 if let CType::Function(ret, params, _) = &ty {
                     self.func_ret_types.insert(name.clone(), ret.as_ref().clone());
+                    self.func_ctypes.insert(name.clone(), ty.clone());
                     if params.is_empty() {
                         // Unspecified params f() — don't lock in 0-param signature;
                         // the real signature will come from the definition or first call

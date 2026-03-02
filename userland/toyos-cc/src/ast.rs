@@ -328,6 +328,7 @@ pub fn eval_const_expr(expr: &Expr, enums: Option<&std::collections::HashMap<Str
             if c != 0 { eval_const_expr(then, enums) } else { eval_const_expr(els, enums) }
         }
         Expr::Cast(_, e) => eval_const_expr(e, enums),
+        // Non-constant expressions (Call, Index, Member, Assign, etc.) can't be evaluated at compile time
         _ => None,
     }
 }

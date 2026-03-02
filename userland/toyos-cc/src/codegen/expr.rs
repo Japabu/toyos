@@ -13,6 +13,7 @@ impl Codegen {
     /// Returns 1 for non-pointer types (ordinary integer inc/dec).
     fn pointer_stride(&mut self, ctx: &FuncCtx, expr: &Expr) -> i64 {
         let ty = self.expr_type(ctx, expr);
+        // Non-pointer types return None from elem_stride; stride 1 is correct for integer inc/dec
         Self::elem_stride(&ty).unwrap_or(1)
     }
 
@@ -23,6 +24,32 @@ impl Codegen {
             Expr::Ident(name) => Some(name.clone()),
             Expr::Comma(_, rhs) => Self::extract_func_name(rhs),
             _ => None,
+        }
+    }
+
+    /// Extract a bitfield value: shift right by bit_offset, mask to bit_width.
+    /// For non-bitfield fields (bw == None), returns val unchanged.
+    fn extract_bitfield(&self, ctx: &mut FuncCtx, val: Value, bit_offset: u32, bw: Option<u32>, field_ty: &CType) -> Value {
+        let bw = match bw {
+            Some(w) if w > 0 => w,
+            _ => return val,
+        };
+        // Zero-extend storage unit to I64 first
+        let val64 = self.coerce(ctx, val, I64);
+        let shifted = if bit_offset > 0 {
+            ctx.builder.ins().ushr_imm(val64, bit_offset as i64)
+        } else {
+            val64
+        };
+        let mask = if bw >= 64 { u64::MAX } else { (1u64 << bw) - 1 };
+        let masked = ctx.builder.ins().band_imm(shifted, mask as i64);
+        // Sign-extend if the underlying type is signed
+        if field_ty.is_signed() && bw < 64 {
+            let shift = 64 - bw;
+            let shl = ctx.builder.ins().ishl_imm(masked, shift as i64);
+            ctx.builder.ins().sshr_imm(shl, shift as i64)
+        } else {
+            masked
         }
     }
 
@@ -342,7 +369,7 @@ impl Codegen {
                         }
                         let load_ty = deref_ty
                             .map(|ty| if self.is_float_type(&ty) { self.clif_float_type(&ty) } else { self.clif_type(&ty) })
-                            .unwrap_or(I64);
+                            .expect("deref: cannot resolve pointee type");
                         ctx.builder.ins().load(load_ty, MemFlags::new(), ptr, 0)
                     }
                     UnaryOp::AddrOf => {
@@ -363,7 +390,7 @@ impl Codegen {
                         }
                         let mem_ty = self.expr_type(ctx, e).map(|ty| {
                             if self.is_float_type(&ty) { self.clif_float_type(&ty) } else { self.clif_type(&ty) }
-                        }).unwrap_or(I64);
+                        }).expect("pre-increment: cannot resolve type");
                         let addr = self.compile_addr(ctx, e);
                         let val = ctx.builder.ins().load(mem_ty, MemFlags::new(), addr, 0);
                         let step = ctx.builder.ins().iconst(mem_ty, stride);
@@ -386,7 +413,7 @@ impl Codegen {
                         }
                         let mem_ty = self.expr_type(ctx, e).map(|ty| {
                             if self.is_float_type(&ty) { self.clif_float_type(&ty) } else { self.clif_type(&ty) }
-                        }).unwrap_or(I64);
+                        }).expect("pre-decrement: cannot resolve type");
                         let addr = self.compile_addr(ctx, e);
                         let val = ctx.builder.ins().load(mem_ty, MemFlags::new(), addr, 0);
                         let step = ctx.builder.ins().iconst(mem_ty, stride);
@@ -415,7 +442,7 @@ impl Codegen {
                 }
                 let mem_ty = self.expr_type(ctx, e).map(|ty| {
                     if self.is_float_type(&ty) { self.clif_float_type(&ty) } else { self.clif_type(&ty) }
-                }).unwrap_or(I64);
+                }).expect("post-inc/dec: cannot resolve type");
                 let addr = self.compile_addr(ctx, e);
                 let val = ctx.builder.ins().load(mem_ty, MemFlags::new(), addr, 0);
                 let step = ctx.builder.ins().iconst(mem_ty, stride);
@@ -502,7 +529,7 @@ impl Codegen {
                 let addr = self.compile_addr(ctx, lhs);
                 let store_clif = lhs_ty.as_ref().map(|ty| {
                     if self.is_float_type(ty) { self.clif_float_type(ty) } else { self.clif_type(ty) }
-                }).unwrap_or(I64);
+                }).expect("assignment: cannot resolve lhs type");
                 let val = if *op == AssignOp::Assign {
                     rhs_val
                 } else {
@@ -543,85 +570,75 @@ impl Codegen {
                             self.compile_expr(ctx, func)
                         };
                         // Determine return type from function pointer type
-                        let fptr_ty = self.expr_type(ctx, func);
-                        let (ret_cty, param_ctypes, is_variadic) = match &fptr_ty {
-                            Some(CType::Pointer(inner)) => match inner.as_ref() {
-                                CType::Function(ret, params, v) => (Some(ret.as_ref().clone()), Some(params.clone()), *v),
-                                _ => (None, None, false),
+                        let fptr_ty = self.expr_type(ctx, func)
+                            .unwrap_or_else(|| panic!("indirect call: cannot resolve function pointer type"));
+                        let func_ty = match &fptr_ty {
+                            CType::Pointer(inner) => match inner.as_ref() {
+                                CType::Function(ret, params, v) => (ret.as_ref().clone(), params.clone(), *v),
+                                other => panic!("indirect call: pointer to non-function type {other:?}"),
                             },
-                            Some(CType::Function(ret, params, v)) => (Some(ret.as_ref().clone()), Some(params.clone()), *v),
-                            _ => (None, None, false),
+                            CType::Function(ret, params, v) => (ret.as_ref().clone(), params.clone(), *v),
+                            other => panic!("indirect call: expected function pointer, got {other:?}"),
                         };
-                        let is_indirect_sret = ret_cty.as_ref().map(|t| Self::needs_sret(t)).unwrap_or(false);
+                        let (ret_cty, param_ctypes, is_variadic) = func_ty;
+                        let is_indirect_sret = Self::needs_sret(&ret_cty);
                         let mut call_sig = self.module.make_signature();
                         if is_indirect_sret {
                             call_sig.params.push(AbiParam::new(I64));
                         }
-                        if let Some(ref params) = param_ctypes {
-                            for p in params {
-                                let clif_ty = if matches!(&p.ty, CType::Struct(_) | CType::Union(_)) {
-                                    I64
-                                } else if self.is_float_type(&p.ty) {
-                                    self.clif_float_type(&p.ty)
-                                } else {
-                                    self.clif_type(&p.ty)
-                                };
-                                call_sig.params.push(AbiParam::new(clif_ty));
-                            }
-                            if is_variadic {
-                                for _ in arg_vals.iter().skip(params.len()) {
-                                    call_sig.params.push(AbiParam::new(I64));
-                                }
-                            }
-                        } else {
-                            for &val in &arg_vals {
-                                let val_ty = ctx.builder.func.dfg.value_type(val);
-                                call_sig.params.push(AbiParam::new(val_ty));
+                        for p in &param_ctypes {
+                            let clif_ty = if matches!(&p.ty, CType::Struct(_) | CType::Union(_)) {
+                                I64
+                            } else if self.is_float_type(&p.ty) {
+                                self.clif_float_type(&p.ty)
+                            } else {
+                                self.clif_type(&p.ty)
+                            };
+                            call_sig.params.push(AbiParam::new(clif_ty));
+                        }
+                        if is_variadic {
+                            for _ in arg_vals.iter().skip(param_ctypes.len()) {
+                                call_sig.params.push(AbiParam::new(I64));
                             }
                         }
                         if !is_indirect_sret {
-                            let has_return = !matches!(&ret_cty, Some(CType::Void));
+                            let has_return = !matches!(&ret_cty, CType::Void);
                             if has_return {
-                                let ret_clif = match &ret_cty {
-                                    Some(ty) if self.is_float_type(ty) => self.clif_float_type(ty),
-                                    Some(ty) => self.clif_type(ty),
-                                    None => I64,
+                                let ret_clif = if self.is_float_type(&ret_cty) {
+                                    self.clif_float_type(&ret_cty)
+                                } else {
+                                    self.clif_type(&ret_cty)
                                 };
                                 call_sig.returns.push(AbiParam::new(ret_clif));
                             }
                         }
                         let indir_sret_addr = if is_indirect_sret {
-                            let ret_ty = ret_cty.as_ref().unwrap();
-                            let size = ret_ty.size().max(1);
+                            let size = ret_cty.size().max(1);
                             let ss = ctx.builder.create_sized_stack_slot(StackSlotData::new(
                                 StackSlotKind::ExplicitSlot, size as u32, 0));
                             Some(ctx.builder.ins().stack_addr(I64, ss, 0))
                         } else { None };
                         // Coerce args to match declared param types
-                        let fixed_count = param_ctypes.as_ref().map(|p| p.len()).unwrap_or(0);
+                        let fixed_count = param_ctypes.len();
                         let mut coerced_args: Vec<Value> = Vec::new();
                         if let Some(addr) = indir_sret_addr {
                             coerced_args.push(addr);
                         }
                         let sret_off = if is_indirect_sret { 1 } else { 0 };
-                        if let Some(ref params) = param_ctypes {
-                            for (i, &v) in arg_vals.iter().enumerate() {
-                                if i < params.len() {
-                                    coerced_args.push(self.coerce(ctx, v, call_sig.params[i + sret_off].value_type));
+                        for (i, &v) in arg_vals.iter().enumerate() {
+                            if i < param_ctypes.len() {
+                                coerced_args.push(self.coerce(ctx, v, call_sig.params[i + sret_off].value_type));
+                            } else {
+                                let val_ty = ctx.builder.func.dfg.value_type(v);
+                                if val_ty.is_float() {
+                                    let f64_val = if val_ty == F32 {
+                                        ctx.builder.ins().fpromote(F64, v)
+                                    } else { v };
+                                    coerced_args.push(ctx.builder.ins().bitcast(I64, MemFlags::new(), f64_val));
                                 } else {
-                                    let val_ty = ctx.builder.func.dfg.value_type(v);
-                                    if val_ty.is_float() {
-                                        let f64_val = if val_ty == F32 {
-                                            ctx.builder.ins().fpromote(F64, v)
-                                        } else { v };
-                                        coerced_args.push(ctx.builder.ins().bitcast(I64, MemFlags::new(), f64_val));
-                                    } else {
-                                        coerced_args.push(self.coerce(ctx, v, I64));
-                                    }
+                                    coerced_args.push(self.coerce(ctx, v, I64));
                                 }
                             }
-                        } else {
-                            coerced_args.extend_from_slice(&arg_vals);
                         }
                         if is_variadic {
                             let padding = self.variadic_padding(fixed_count);
@@ -640,7 +657,7 @@ impl Codegen {
                             return addr;
                         }
                         let results = ctx.builder.inst_results(call);
-                        let has_return = !matches!(&ret_cty, Some(CType::Void));
+                        let has_return = !matches!(&ret_cty, CType::Void);
                         return if results.is_empty() || !has_return {
                             ctx.builder.ins().iconst(I64, 0)
                         } else {
@@ -649,6 +666,7 @@ impl Codegen {
                     }
 
                     // Detect struct return (uses sret convention)
+                    // Undeclared functions (C89 implicit decl) return int — no sret needed
                     let is_struct_ret = self.func_ret_types.get(name)
                         .map(|t| Self::needs_sret(t))
                         .unwrap_or(false);
@@ -777,64 +795,55 @@ impl Codegen {
                 } else {
                     // Indirect call (function pointer)
                     let func_ptr = self.compile_expr(ctx, func);
-                    // Determine return type from function pointer type
-                    let fptr_ty = self.expr_type(ctx, func);
+                    let fptr_ty = self.expr_type(ctx, func)
+                        .unwrap_or_else(|| panic!("indirect call: cannot resolve function pointer type"));
                     let (ret_cty, param_ctypes, is_variadic_indirect) = match &fptr_ty {
-                        Some(CType::Pointer(inner)) => match inner.as_ref() {
-                            CType::Function(ret, params, v) => (Some(ret.as_ref().clone()), Some(params.clone()), *v),
-                            _ => (None, None, false),
+                        CType::Pointer(inner) => match inner.as_ref() {
+                            CType::Function(ret, params, v) => (ret.as_ref().clone(), params.clone(), *v),
+                            other => panic!("indirect call: pointer to non-function type {other:?}"),
                         },
-                        Some(CType::Function(ret, params, v)) => (Some(ret.as_ref().clone()), Some(params.clone()), *v),
-                        _ => (None, None, false),
+                        CType::Function(ret, params, v) => (ret.as_ref().clone(), params.clone(), *v),
+                        other => panic!("indirect call: expected function pointer, got {other:?}"),
                     };
-                    let is_indir_sret = ret_cty.as_ref().map(|t| Self::needs_sret(t)).unwrap_or(false);
+                    let is_indir_sret = Self::needs_sret(&ret_cty);
                     let mut sig = self.module.make_signature();
                     if is_indir_sret {
                         sig.params.push(AbiParam::new(I64));
                     }
                     let indir_sret = if is_indir_sret {
-                        let ret_ty = ret_cty.as_ref().unwrap();
-                        let size = ret_ty.size().max(1);
+                        let size = ret_cty.size().max(1);
                         let ss = ctx.builder.create_sized_stack_slot(StackSlotData::new(
                             StackSlotKind::ExplicitSlot, size as u32, 0));
                         Some(ctx.builder.ins().stack_addr(I64, ss, 0))
                     } else { None };
-                    let fixed_count = param_ctypes.as_ref().map(|p| p.len()).unwrap_or(0);
+                    let fixed_count = param_ctypes.len();
                     let mut coerced: Vec<Value> = Vec::new();
                     if let Some(addr) = indir_sret {
                         coerced.push(addr);
                     }
-                    if let Some(ref params) = param_ctypes {
-                        for (i, &val) in arg_vals.iter().enumerate() {
-                            if i < params.len() {
-                                let target = if matches!(&params[i].ty, CType::Struct(_) | CType::Union(_)) {
-                                    I64
-                                } else if self.is_float_type(&params[i].ty) {
-                                    self.clif_float_type(&params[i].ty)
-                                } else {
-                                    self.clif_type(&params[i].ty)
-                                };
-                                sig.params.push(AbiParam::new(target));
-                                coerced.push(self.coerce(ctx, val, target));
+                    for (i, &val) in arg_vals.iter().enumerate() {
+                        if i < param_ctypes.len() {
+                            let target = if matches!(&param_ctypes[i].ty, CType::Struct(_) | CType::Union(_)) {
+                                I64
+                            } else if self.is_float_type(&param_ctypes[i].ty) {
+                                self.clif_float_type(&param_ctypes[i].ty)
                             } else {
-                                let val_ty = ctx.builder.func.dfg.value_type(val);
-                                if val_ty.is_float() {
-                                    let f64_val = if val_ty == F32 {
-                                        ctx.builder.ins().fpromote(F64, val)
-                                    } else { val };
-                                    sig.params.push(AbiParam::new(I64));
-                                    coerced.push(ctx.builder.ins().bitcast(I64, MemFlags::new(), f64_val));
-                                } else {
-                                    sig.params.push(AbiParam::new(I64));
-                                    coerced.push(self.coerce(ctx, val, I64));
-                                }
+                                self.clif_type(&param_ctypes[i].ty)
+                            };
+                            sig.params.push(AbiParam::new(target));
+                            coerced.push(self.coerce(ctx, val, target));
+                        } else {
+                            let val_ty = ctx.builder.func.dfg.value_type(val);
+                            if val_ty.is_float() {
+                                let f64_val = if val_ty == F32 {
+                                    ctx.builder.ins().fpromote(F64, val)
+                                } else { val };
+                                sig.params.push(AbiParam::new(I64));
+                                coerced.push(ctx.builder.ins().bitcast(I64, MemFlags::new(), f64_val));
+                            } else {
+                                sig.params.push(AbiParam::new(I64));
+                                coerced.push(self.coerce(ctx, val, I64));
                             }
-                        }
-                    } else {
-                        for &v in &arg_vals {
-                            let vt = ctx.builder.func.dfg.value_type(v);
-                            sig.params.push(AbiParam::new(vt));
-                            coerced.push(v);
                         }
                     }
                     if is_variadic_indirect {
@@ -850,12 +859,12 @@ impl Codegen {
                         }
                     }
                     if !is_indir_sret {
-                        let has_return = !matches!(&ret_cty, Some(CType::Void));
+                        let has_return = !matches!(&ret_cty, CType::Void);
                         if has_return {
-                            let ret_clif = match &ret_cty {
-                                Some(ty) if self.is_float_type(ty) => self.clif_float_type(ty),
-                                Some(ty) => self.clif_type(ty),
-                                None => I64,
+                            let ret_clif = if self.is_float_type(&ret_cty) {
+                                self.clif_float_type(&ret_cty)
+                            } else {
+                                self.clif_type(&ret_cty)
                             };
                             sig.returns.push(AbiParam::new(ret_clif));
                         }
@@ -866,7 +875,7 @@ impl Codegen {
                         return addr;
                     }
                     let results = ctx.builder.inst_results(call);
-                    let has_return = !matches!(&ret_cty, Some(CType::Void));
+                    let has_return = !matches!(&ret_cty, CType::Void);
                     if results.is_empty() || !has_return {
                         ctx.builder.ins().iconst(I64, 0)
                     } else {
@@ -912,7 +921,8 @@ impl Codegen {
                         ty.size()
                     }
                     SizeofArg::Expr(e) => {
-                        let ty = self.expr_type(ctx, e).unwrap_or(CType::Int(true));
+                        let ty = self.expr_type(ctx, e)
+                            .unwrap_or_else(|| panic!("sizeof: cannot resolve type of expression"));
                         ty.size()
                     }
                 };
@@ -973,38 +983,34 @@ impl Codegen {
             }
 
             Expr::Index(arr, idx) => {
-                let elem_size = self.expr_type(ctx, arr)
-                    .and_then(|ty| match ty {
-                        CType::Pointer(inner) | CType::Array(inner, _) => Some(inner.size()),
-                        _ => None,
-                    })
-                    .unwrap_or(8);
+                let arr_ty = self.expr_type(ctx, arr)
+                    .unwrap_or_else(|| panic!("index: cannot resolve array/pointer type"));
+                let elem_size = match &arr_ty {
+                    CType::Pointer(inner) | CType::Array(inner, _) => inner.size(),
+                    other => panic!("index on non-pointer/array type {other:?}"),
+                };
                 let arr_val = self.compile_expr(ctx, arr);
                 let idx_val = self.compile_expr(ctx, idx);
                 let idx_val = self.coerce(ctx, idx_val, I64);
                 let offset = ctx.builder.ins().imul_imm(idx_val, elem_size as i64);
                 let addr = ctx.builder.ins().iadd(arr_val, offset);
                 // If result type is array or struct/union, return address (decay to pointer)
-                let result_ty = self.expr_type(ctx, expr);
-                if matches!(&result_ty, Some(CType::Array(..)) | Some(CType::Struct(_)) | Some(CType::Union(_))) {
+                let result_ty = self.expr_type(ctx, expr)
+                    .expect("index: cannot resolve result type");
+                if matches!(&result_ty, CType::Array(..) | CType::Struct(_) | CType::Union(_)) {
                     return addr;
                 }
-                let load_ty = result_ty
-                    .map(|ty| if self.is_float_type(&ty) { self.clif_float_type(&ty) } else { self.clif_type(&ty) })
-                    .unwrap_or(I64);
+                let load_ty = if self.is_float_type(&result_ty) { self.clif_float_type(&result_ty) } else { self.clif_type(&result_ty) };
                 ctx.builder.ins().load(load_ty, MemFlags::new(), addr, 0)
             }
 
             Expr::Member(e, field) => {
                 let base = self.compile_addr(ctx, e);
-                let (byte_offset, field_ty) = self.expr_type(ctx, e)
-                    .and_then(|ty| ty.field_offset(field))
-                    .unwrap_or((0, CType::Long(true)));
-                let load_ty = if self.is_float_type(&field_ty) {
-                    self.clif_float_type(&field_ty)
-                } else {
-                    self.clif_type(&field_ty)
-                };
+                let base_ty = self.expr_type(ctx, e)
+                    .unwrap_or_else(|| panic!("cannot resolve type of member base '.{field}'"));
+                let (byte_offset, bit_offset, field_ty) = base_ty.field_offset(field)
+                    .unwrap_or_else(|| panic!("no field '{field}' in {base_ty:?}"));
+                let bw = base_ty.field_bit_width(field);
                 // For aggregate fields, return the address
                 if matches!(field_ty, CType::Struct(_) | CType::Union(_) | CType::Array(..)) {
                     if byte_offset != 0 {
@@ -1012,24 +1018,26 @@ impl Codegen {
                     }
                     return base;
                 }
-                ctx.builder.ins().load(load_ty, MemFlags::new(), base, byte_offset as i32)
-            }
-
-            Expr::Arrow(e, field) => {
-                let ptr = self.compile_expr(ctx, e);
-                let pointee_ty = self.expr_type(ctx, e)
-                    .and_then(|ty| match ty {
-                        CType::Pointer(inner) => Some(*inner),
-                        _ => None,
-                    });
-                let (byte_offset, field_ty) = pointee_ty
-                    .and_then(|ty| ty.field_offset(field))
-                    .unwrap_or((0, CType::Long(true)));
                 let load_ty = if self.is_float_type(&field_ty) {
                     self.clif_float_type(&field_ty)
                 } else {
                     self.clif_type(&field_ty)
                 };
+                let val = ctx.builder.ins().load(load_ty, MemFlags::new(), base, byte_offset as i32);
+                self.extract_bitfield(ctx, val, bit_offset, bw, &field_ty)
+            }
+
+            Expr::Arrow(e, field) => {
+                let ptr = self.compile_expr(ctx, e);
+                let ptr_ty = self.expr_type(ctx, e)
+                    .unwrap_or_else(|| panic!("cannot resolve type of arrow base '->{field}'"));
+                let pointee_ty = match ptr_ty {
+                    CType::Pointer(inner) => *inner,
+                    other => panic!("arrow '->{field}' on non-pointer type {other:?}"),
+                };
+                let (byte_offset, bit_offset, field_ty) = pointee_ty.field_offset(field)
+                    .unwrap_or_else(|| panic!("no field '{field}' in {pointee_ty:?}"));
+                let bw = pointee_ty.field_bit_width(field);
                 // For aggregate fields, return the address
                 if matches!(field_ty, CType::Struct(_) | CType::Union(_) | CType::Array(..)) {
                     if byte_offset != 0 {
@@ -1037,7 +1045,13 @@ impl Codegen {
                     }
                     return ptr;
                 }
-                ctx.builder.ins().load(load_ty, MemFlags::new(), ptr, byte_offset as i32)
+                let load_ty = if self.is_float_type(&field_ty) {
+                    self.clif_float_type(&field_ty)
+                } else {
+                    self.clif_type(&field_ty)
+                };
+                let val = ctx.builder.ins().load(load_ty, MemFlags::new(), ptr, byte_offset as i32);
+                self.extract_bitfield(ctx, val, bit_offset, bw, &field_ty)
             }
 
             Expr::StmtExpr(items) => {
@@ -1120,6 +1134,7 @@ impl Codegen {
                             .unwrap_or_else(|| panic!("__builtin_offsetof: unknown type '{type_name}'"))
                             .clone();
                         // Resolve incomplete forward declarations via tag lookup
+                        // Falls back to incomplete type if not yet defined (opaque types)
                         let ty = match &ty {
                             CType::Struct(def) if def.fields.is_empty() => {
                                 def.name.as_ref()
@@ -1135,7 +1150,7 @@ impl Codegen {
                             }
                             _ => ty,
                         };
-                        let (offset, _) = ty.field_offset(&field_name)
+                        let (offset, _, _) = ty.field_offset(&field_name)
                             .unwrap_or_else(|| {
                                 let field_names: Vec<_> = match &ty {
                                     CType::Struct(def) => def.fields.iter().map(|f| f.name.clone().unwrap_or("<anon>".into())).collect(),
@@ -1267,6 +1282,10 @@ impl Codegen {
                 if let Some(ty) = self.global_types.get(name) {
                     return Some(ty.clone());
                 }
+                // Function names: return the Function type (decays to pointer in most contexts)
+                if let Some(fty) = self.func_ctypes.get(name) {
+                    return Some(fty.clone());
+                }
                 None
             }
             Expr::Arrow(e, field) => {
@@ -1277,12 +1296,12 @@ impl Codegen {
                     _ => return None,
                 };
                 let bw = pointee.field_bit_width(field);
-                pointee.field_offset(field).map(|(_, ty)| CType::promote_integer(ty, bw))
+                pointee.field_offset(field).map(|(_, _, ty)| CType::promote_integer(ty, bw))
             }
             Expr::Member(e, field) => {
                 let base_ty = self.expr_type(ctx, e)?;
                 let bw = base_ty.field_bit_width(field);
-                base_ty.field_offset(field).map(|(_, ty)| CType::promote_integer(ty, bw))
+                base_ty.field_offset(field).map(|(_, _, ty)| CType::promote_integer(ty, bw))
             }
             Expr::Unary(UnaryOp::Deref, e) => {
                 let ty = self.expr_type(ctx, e)?;
@@ -1312,6 +1331,7 @@ impl Codegen {
                 Some(self.resolve_typename(type_name))
             }
             Expr::PostUnary(_, e) => self.expr_type(ctx, e),
+            Expr::Unary(UnaryOp::LogNot, _) => Some(CType::Int(true)),
             Expr::Unary(UnaryOp::PreInc | UnaryOp::PreDec | UnaryOp::Neg | UnaryOp::BitNot, e) => {
                 self.expr_type(ctx, e)
             }
@@ -1346,10 +1366,22 @@ impl Codegen {
                 let ft = self.expr_type(ctx, f);
                 match (&tt, &ft) {
                     (Some(l), Some(r)) => {
-                        // If either is a pointer, result is pointer type
-                        if matches!(l, CType::Pointer(_)) { Some(l.clone()) }
-                        else if matches!(r, CType::Pointer(_)) { Some(r.clone()) }
-                        else { Some(CType::common(l, r)) }
+                        // Function types decay to function pointers in ternary context
+                        let l = match l {
+                            CType::Function(..) => CType::Pointer(Box::new(l.clone())),
+                            other => other.clone(),
+                        };
+                        let r = match r {
+                            CType::Function(..) => CType::Pointer(Box::new(r.clone())),
+                            other => other.clone(),
+                        };
+                        // Both pointers: prefer non-void (null pointer constant yields target type per C99 6.5.15)
+                        if let (CType::Pointer(ref li), CType::Pointer(_)) = (&l, &r) {
+                            return if matches!(**li, CType::Void) { Some(r) } else { Some(l) };
+                        }
+                        if matches!(l, CType::Pointer(_)) { Some(l) }
+                        else if matches!(r, CType::Pointer(_)) { Some(r) }
+                        else { Some(CType::common(&l, &r)) }
                     }
                     (Some(t), None) | (None, Some(t)) => Some(t.clone()),
                     _ => None,
@@ -1420,12 +1452,12 @@ impl Codegen {
                 self.compile_expr(ctx, e) // *p address is just p
             }
             Expr::Index(arr, idx) => {
-                let elem_size = self.expr_type(ctx, arr)
-                    .and_then(|ty| match ty {
-                        CType::Pointer(inner) | CType::Array(inner, _) => Some(inner.size()),
-                        _ => None,
-                    })
-                    .unwrap_or(8);
+                let arr_ty = self.expr_type(ctx, arr)
+                    .unwrap_or_else(|| panic!("compile_addr: cannot resolve type of indexed expression"));
+                let elem_size = match &arr_ty {
+                    CType::Pointer(inner) | CType::Array(inner, _) => inner.size(),
+                    other => panic!("compile_addr: index on non-pointer/array type {other:?}"),
+                };
                 let arr_val = self.compile_expr(ctx, arr);
                 let idx_val = self.compile_expr(ctx, idx);
                 let idx_val = self.coerce(ctx, idx_val, I64);
@@ -1434,10 +1466,10 @@ impl Codegen {
             }
             Expr::Member(e, field) => {
                 let base = self.compile_addr(ctx, e);
-                let byte_offset = self.expr_type(ctx, e)
-                    .and_then(|ty| ty.field_offset(field))
-                    .map(|(off, _)| off)
-                    .unwrap_or(0);
+                let base_ty = self.expr_type(ctx, e)
+                    .unwrap_or_else(|| panic!("compile_addr: cannot resolve type of member base '.{field}'"));
+                let (byte_offset, _, _) = base_ty.field_offset(field)
+                    .unwrap_or_else(|| panic!("compile_addr: no field '{field}' in {base_ty:?}"));
                 if byte_offset != 0 {
                     ctx.builder.ins().iadd_imm(base, byte_offset as i64)
                 } else {
@@ -1446,14 +1478,14 @@ impl Codegen {
             }
             Expr::Arrow(e, field) => {
                 let ptr = self.compile_expr(ctx, e);
-                let byte_offset = self.expr_type(ctx, e)
-                    .and_then(|ty| match ty {
-                        CType::Pointer(inner) => Some(*inner),
-                        _ => None,
-                    })
-                    .and_then(|ty| ty.field_offset(field))
-                    .map(|(off, _)| off)
-                    .unwrap_or(0);
+                let ptr_ty = self.expr_type(ctx, e)
+                    .unwrap_or_else(|| panic!("compile_addr: cannot resolve type of arrow base '->{field}'"));
+                let pointee_ty = match ptr_ty {
+                    CType::Pointer(inner) => *inner,
+                    other => panic!("compile_addr: arrow '->{field}' on non-pointer type {other:?}"),
+                };
+                let (byte_offset, _, _) = pointee_ty.field_offset(field)
+                    .unwrap_or_else(|| panic!("compile_addr: no field '{field}' in {pointee_ty:?}"));
                 if byte_offset != 0 {
                     ctx.builder.ins().iadd_imm(ptr, byte_offset as i64)
                 } else {

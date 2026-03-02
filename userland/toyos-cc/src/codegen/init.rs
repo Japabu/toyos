@@ -33,15 +33,49 @@ pub(crate) fn string_lit_elem_count(expr: &Expr) -> usize {
 
 impl Codegen {
     /// Compute the byte offset of field at `target_idx` in a struct.
-    fn struct_field_offset(def: &StructDef, target_idx: usize) -> usize {
+    /// Returns (byte_offset, bit_offset) for a field by index.
+    /// For non-bitfield fields, bit_offset is 0.
+    fn struct_field_offset(def: &StructDef, target_idx: usize) -> (usize, u32) {
         let mut offset = 0usize;
+        let mut bit_pos = 0u32;
+        let mut bit_unit_size = 0usize;
         for (i, field) in def.fields.iter().enumerate() {
+            if let Some(bw) = field.bit_width {
+                let unit_size = field.ty.size();
+                let unit_bits = (unit_size * 8) as u32;
+                let align = field.ty.align();
+                if bw == 0 {
+                    if bit_unit_size > 0 {
+                        offset += bit_unit_size;
+                        bit_pos = 0;
+                        bit_unit_size = 0;
+                    }
+                    offset = (offset + align - 1) & !(align - 1);
+                } else if bit_unit_size == unit_size && bit_pos + bw <= unit_bits {
+                    // Fits in current unit
+                    if i == target_idx { return (offset, bit_pos); }
+                    bit_pos += bw;
+                } else {
+                    // New storage unit
+                    offset += bit_unit_size;
+                    offset = (offset + align - 1) & !(align - 1);
+                    bit_unit_size = unit_size;
+                    if i == target_idx { return (offset, 0); }
+                    bit_pos = bw;
+                }
+                continue;
+            }
+            // Flush bitfield unit
+            offset += bit_unit_size;
+            bit_pos = 0;
+            bit_unit_size = 0;
+
             let align = field.ty.align();
             offset = (offset + align - 1) & !(align - 1);
-            if i == target_idx { return offset; }
+            if i == target_idx { return (offset, 0); }
             offset += field.ty.size();
         }
-        offset
+        (offset, 0)
     }
 
     pub(crate) fn compile_aggregate_init(&mut self, ctx: &mut FuncCtx, ptr: Value, ty: &CType, init: &Initializer) {
@@ -126,12 +160,14 @@ impl Codegen {
                         }
                         // Handle sub-member designators like .a.j = 5
                         if items[*cursor].designators.len() > 1 {
-                            let (mut off, _) = ty.field_offset(fields[field_idx].name.as_deref().unwrap_or("")).unwrap_or((0, CType::Int(true)));
+                            let fname = fields[field_idx].name.as_deref().expect("designator on anonymous field");
+                            let (mut off, _, _) = ty.field_offset(fname)
+                                .unwrap_or_else(|| panic!("init: no field '{fname}' in {ty:?}"));
                             let mut sub_ty = fields[field_idx].ty.clone();
                             for d in &items[*cursor].designators[1..] {
                                 match d {
                                     Designator::Field(sub_name) => {
-                                        let (fo, ft) = sub_ty.field_offset(sub_name).unwrap();
+                                        let (fo, _, ft) = sub_ty.field_offset(sub_name).unwrap();
                                         off += fo;
                                         sub_ty = ft;
                                     }
@@ -169,7 +205,9 @@ impl Codegen {
                         }
                     }
                     if field_idx >= fields.len() { break; }
-                    let (offset, _) = ty.field_offset(fields[field_idx].name.as_deref().unwrap_or("")).unwrap_or((0, CType::Int(true)));
+                    let fname = fields[field_idx].name.as_deref().expect("init: unnamed field in struct init");
+                    let (offset, _, _) = ty.field_offset(fname)
+                        .unwrap_or_else(|| panic!("init: no field '{fname}' in {ty:?}"));
                     let field_ptr = if offset == 0 { base_ptr }
                     else { ctx.builder.ins().iadd_imm(base_ptr, offset as i64) };
                     let field_ty = fields[field_idx].ty.clone();
@@ -181,14 +219,14 @@ impl Codegen {
                 let def = def.clone();
                 if *cursor < items.len() {
                     let fidx = if let Some(Designator::Field(name)) = items[*cursor].designators.first() {
-                        def.fields.iter().position(|f| f.name.as_deref() == Some(name.as_str())).unwrap_or(0)
+                        def.fields.iter().position(|f| f.name.as_deref() == Some(name.as_str()))
+                            .unwrap_or_else(|| panic!("init: no field '{name}' in union"))
                     } else { 0 };
-                    if fidx < def.fields.len() {
-                        let field_ty = def.fields[fidx].ty.clone();
-                        self.compile_init_one(ctx, base_ptr, &field_ty, items, cursor);
-                    }
+                    let field_ty = def.fields[fidx].ty.clone();
+                    self.compile_init_one(ctx, base_ptr, &field_ty, items, cursor);
                 }
             }
+            // Scalar (int, float, pointer, enum, bool) — store single value
             _ => {
                 if *cursor < items.len() {
                     if let Initializer::Expr(e) = &items[*cursor].initializer {
@@ -255,8 +293,8 @@ impl Codegen {
                         // Brace elision: recursively fill sub-aggregate from flat list
                         self.compile_aggregate_init_cursor(ctx, ptr, ty, items, cursor);
                     }
+                    // Scalar (int, float, pointer, enum, bool)
                     _ => {
-                        // Scalar
                         let val = self.compile_expr(ctx, e);
                         let target_ty = if self.is_float_type(ty) {
                             self.clif_float_type(ty)
@@ -414,12 +452,13 @@ impl Codegen {
                         }
                         // Handle sub-member designators like .a.j = 5
                         if items[*cursor].designators.len() > 1 {
-                            let mut off = base + Self::struct_field_offset(&def, field_idx);
+                            let (fo, _) = Self::struct_field_offset(&def, field_idx);
+                            let mut off = base + fo;
                             let mut sub_ty = fields[field_idx].ty.clone();
                             for d in &items[*cursor].designators[1..] {
                                 match d {
                                     Designator::Field(sub_name) => {
-                                        let (fo, ft) = sub_ty.field_offset(sub_name).unwrap();
+                                        let (fo, _, ft) = sub_ty.field_offset(sub_name).unwrap();
                                         off += fo;
                                         sub_ty = ft;
                                     }
@@ -440,9 +479,26 @@ impl Codegen {
                         }
                     }
                     if field_idx >= fields.len() { break; }
-                    let offset = base + Self::struct_field_offset(&def, field_idx);
-                    let field_ty = fields[field_idx].ty.clone();
-                    self.fill_init_one(bytes, relocs, offset, &field_ty, items, cursor);
+                    let (fo, bit_off) = Self::struct_field_offset(&def, field_idx);
+                    let offset = base + fo;
+                    let field = &fields[field_idx];
+                    if let Some(bw) = field.bit_width {
+                        // Bitfield: pack value into storage unit at bit_off
+                        if let Initializer::Expr(expr) = &items[*cursor].initializer {
+                            if let Some(val) = self.eval_const(expr) {
+                                let mask = (1u64 << bw) - 1;
+                                let shifted = (val as u64 & mask) << bit_off;
+                                let unit_size = field.ty.size();
+                                for b in 0..unit_size {
+                                    bytes[offset + b] |= ((shifted >> (b * 8)) & 0xff) as u8;
+                                }
+                            }
+                        }
+                        *cursor += 1;
+                    } else {
+                        let field_ty = field.ty.clone();
+                        self.fill_init_one(bytes, relocs, offset, &field_ty, items, cursor);
+                    }
                     field_idx += 1;
                 }
             }
@@ -450,14 +506,14 @@ impl Codegen {
                 let def = def.clone();
                 if *cursor < items.len() {
                     let fidx = if let Some(Designator::Field(name)) = items[*cursor].designators.first() {
-                        def.fields.iter().position(|f| f.name.as_deref() == Some(name.as_str())).unwrap_or(0)
+                        def.fields.iter().position(|f| f.name.as_deref() == Some(name.as_str()))
+                            .unwrap_or_else(|| panic!("init: no field '{name}' in union"))
                     } else { 0 };
-                    if fidx < def.fields.len() {
-                        let field_ty = def.fields[fidx].ty.clone();
-                        self.fill_init_one(bytes, relocs, base, &field_ty, items, cursor);
-                    }
+                    let field_ty = def.fields[fidx].ty.clone();
+                    self.fill_init_one(bytes, relocs, base, &field_ty, items, cursor);
                 }
             }
+            // Scalar (int, float, pointer, enum, bool) — fill single value
             _ => {
                 if *cursor < items.len() {
                     self.fill_init_item(bytes, relocs, base, ty, &items[*cursor].initializer);
@@ -485,6 +541,7 @@ impl Codegen {
                 let is_whole_value = match e {
                     Expr::StringLit(_) | Expr::WideStringLit(_) => matches!(ty, CType::Array(..)) || ty.is_pointer(),
                     Expr::CompoundLiteral(..) => true,
+                    // Other expressions are not whole-value initializers
                     _ => false,
                 };
                 match ty {
@@ -492,6 +549,7 @@ impl Codegen {
                         // Brace elision: recursively fill sub-aggregate from the flat list
                         self.fill_init_aggregate(bytes, relocs, offset, ty, items, cursor);
                     }
+                    // Scalar, or whole-value aggregate — fill single item
                     _ => {
                         self.fill_init_item(bytes, relocs, offset, ty, &items[*cursor].initializer);
                         *cursor += 1;
@@ -526,6 +584,7 @@ impl Codegen {
                     BinOp::Ge => (l >= r) as i64 as f64,
                     BinOp::LogAnd => ((l != 0.0) && (r != 0.0)) as i64 as f64,
                     BinOp::LogOr => ((l != 0.0) || (r != 0.0)) as i64 as f64,
+                    // Bitwise/shift/mod ops are integer-only, not applicable to float const eval
                     _ => return None,
                 })
             }
@@ -533,6 +592,7 @@ impl Codegen {
                 let c = self.eval_const_float(c)?;
                 if c != 0.0 { self.eval_const_float(t) } else { self.eval_const_float(f) }
             }
+            // Non-constant expressions (Call, Index, Member, etc.) can't be evaluated at compile time
             _ => None,
         }
     }
@@ -555,13 +615,15 @@ impl Codegen {
                         let bits = (val as f32).to_le_bytes();
                         bytes[offset..offset + 4].copy_from_slice(&bits);
                     }
-                    _ => {
+                    // Guard `ty.is_float()` ensures only Float/Double/LongDouble reach here
+                    CType::Double | CType::LongDouble => {
                         let bits = val.to_le_bytes();
                         bytes[offset..offset + 8].copy_from_slice(&bits);
                         if field_size > 8 {
                             for b in &mut bytes[offset + 8..offset + field_size] { *b = 0; }
                         }
                     }
+                    _ => unreachable!(),
                 }
                 return;
             }
@@ -593,8 +655,8 @@ impl Codegen {
                         for b in &mut bytes[offset + 8..offset + field_size] { *b = 0; }
                     }
                 }
+                // Float constant assigned to integer type: C truncation semantics
                 _ => {
-                    // Float assigned to int type: truncate
                     let ival = val as i64;
                     let val_bytes = ival.to_le_bytes();
                     let copy_len = field_size.min(val_bytes.len());

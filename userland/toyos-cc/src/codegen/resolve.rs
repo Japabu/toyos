@@ -26,13 +26,13 @@ impl Codegen {
             Expr::Arrow(base, field) => {
                 // base should be (StructType*)0
                 let struct_ty = self.null_pointer_cast_type(base)?;
-                let (offset, _) = struct_ty.field_offset(field)?;
+                let (offset, _, _) = struct_ty.field_offset(field)?;
                 Some(offset as i64)
             }
             Expr::Member(base, field) => {
                 // Nested member: base.field — accumulate offset
                 let (base_offset, base_ty) = self.eval_member_with_type(base)?;
-                let (field_offset, _) = base_ty.field_offset(field)?;
+                let (field_offset, _, _) = base_ty.field_offset(field)?;
                 Some((base_offset + field_offset) as i64)
             }
             _ => None,
@@ -44,12 +44,12 @@ impl Codegen {
         match expr {
             Expr::Arrow(base, field) => {
                 let struct_ty = self.null_pointer_cast_type(base)?;
-                let (offset, ty) = struct_ty.field_offset(field)?;
+                let (offset, _, ty) = struct_ty.field_offset(field)?;
                 Some((offset, ty))
             }
             Expr::Member(base, field) => {
                 let (base_offset, base_ty) = self.eval_member_with_type(base)?;
-                let (field_offset, ty) = base_ty.field_offset(field)?;
+                let (field_offset, _, ty) = base_ty.field_offset(field)?;
                 Some((base_offset + field_offset, ty))
             }
             _ => None,
@@ -129,6 +129,7 @@ impl Codegen {
                 }
             }
         }
+        // C default: unspecified signedness means signed
         let signed = is_signed.unwrap_or(true);
         if is_short { return Some(CType::Short(signed)); }
         if long_count >= 2 { return Some(CType::LongLong(signed)); }
@@ -250,6 +251,7 @@ impl Codegen {
             }
         }
 
+        // C default: unspecified signedness means signed
         let signed = is_signed.unwrap_or(true);
 
         if is_short {
@@ -280,6 +282,7 @@ impl Codegen {
 
     fn resolve_incomplete_type(&self, ty: CType) -> CType {
         match ty {
+            // Forward-declared struct/union: try to resolve, keep incomplete if not yet defined (opaque types)
             CType::Struct(ref def) if def.fields.is_empty() => {
                 def.name.as_ref()
                     .and_then(|n| self.type_env.tags.get(n))
@@ -326,7 +329,8 @@ impl Codegen {
                 };
                 let name = fd.declarator.as_ref().and_then(|d| self.get_declarator_name(d));
                 let bit_width = fd.bit_width.as_ref().map(|bw| {
-                    crate::ast::eval_const_expr(bw, Some(&self.type_env.enum_constants)).unwrap_or(0) as u32
+                    crate::ast::eval_const_expr(bw, Some(&self.type_env.enum_constants))
+                        .expect("bitfield width must be a constant expression") as u32
                 });
                 fields.push(FieldDef { name, ty: field_ty, bit_width });
             }

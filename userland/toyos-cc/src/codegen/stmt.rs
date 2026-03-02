@@ -15,7 +15,7 @@ impl Codegen {
                 self.resolve_typename(tn);
                 self.preresolve_expr_types(e);
             }
-            Expr::Binary(_, l, r) | Expr::Comma(l, r) => {
+            Expr::Binary(_, l, r) | Expr::Assign(_, l, r) | Expr::Comma(l, r) => {
                 self.preresolve_expr_types(l);
                 self.preresolve_expr_types(r);
             }
@@ -29,13 +29,30 @@ impl Codegen {
                 self.preresolve_expr_types(f);
                 for a in args { self.preresolve_expr_types(a); }
             }
+            Expr::Builtin(_, args) => {
+                for a in args { self.preresolve_expr_types(a); }
+            }
             Expr::Member(e, _) | Expr::Arrow(e, _) => self.preresolve_expr_types(e),
             Expr::Index(a, i) => {
                 self.preresolve_expr_types(a);
                 self.preresolve_expr_types(i);
             }
             Expr::CompoundLiteral(tn, _) => { self.resolve_typename(tn); }
-            _ => {}
+            Expr::VaArg(e, tn) => {
+                self.preresolve_expr_types(e);
+                self.resolve_typename(tn);
+            }
+            Expr::StmtExpr(items) => {
+                for item in items {
+                    if let BlockItem::Stmt(s) = item {
+                        if let Statement::Expr(Some(e)) = s {
+                            self.preresolve_expr_types(e);
+                        }
+                    }
+                }
+            }
+            Expr::IntLit(_) | Expr::UIntLit(_) | Expr::FloatLit(..) | Expr::CharLit(_)
+            | Expr::StringLit(_) | Expr::WideStringLit(_) | Expr::Ident(_) => {}
         }
     }
 
@@ -91,10 +108,11 @@ impl Codegen {
                 Self::collect_addr_taken_expr(e, out);
                 Self::collect_addr_taken(b, out);
             }
-            Statement::Case(_, s) | Statement::Default(s) | Statement::Label(_, s) => {
+            Statement::Case(_, s) | Statement::CaseRange(_, _, s) | Statement::Default(s) | Statement::Label(_, s) => {
                 Self::collect_addr_taken(s, out);
             }
             Statement::Return(Some(e)) => Self::collect_addr_taken_expr(e, out),
+            // Expr(None), Return(None), Break, Continue, Goto, Asm — no sub-expressions
             _ => {}
         }
     }
@@ -144,6 +162,14 @@ impl Codegen {
                     }
                 }
             }
+            Expr::CompoundLiteral(_, items) => {
+                for item in items {
+                    if let Initializer::Expr(e) = &item.initializer {
+                        Self::collect_addr_taken_expr(e, out);
+                    }
+                }
+            }
+            // Literals, Sizeof, Alignof, VaArg, Builtin — no meaningful sub-expressions for addr-taken
             _ => {}
         }
     }
@@ -415,8 +441,8 @@ impl Codegen {
             Statement::Switch(val, body) => {
                 let saved_enums = self.type_env.enum_constants.clone();
                 let is_unsigned = self.expr_type(ctx, val)
-                    .map(|t| t.is_unsigned())
-                    .unwrap_or(false);
+                    .expect("switch: cannot resolve type of switch expression")
+                    .is_unsigned();
                 let switch_val = self.compile_expr(ctx, val);
                 let switch_type = ctx.builder.func.dfg.value_type(switch_val);
                 let exit_block = ctx.builder.create_block();
@@ -518,7 +544,7 @@ impl Codegen {
                     .unwrap_or_else(|| ctx.builder.create_block());
 
                 // Collect dispatch entry (case value evaluated at compile time)
-                let case_val = self.eval_const(val).unwrap_or(0);
+                let case_val = self.eval_const(val).expect("case: non-constant expression");
                 ctx.switch_dispatch_entries.push((case_val as i128, case_block));
                 ctx.switch_case_blocks.push(case_block);
 
@@ -544,8 +570,8 @@ impl Codegen {
                 let case_block = ctx.switch_pending_fallthrough.take()
                     .unwrap_or_else(|| ctx.builder.create_block());
 
-                let lo_val = self.eval_const(lo).unwrap_or(0);
-                let hi_val = self.eval_const(hi).unwrap_or(0);
+                let lo_val = self.eval_const(lo).expect("case range: non-constant low expression");
+                let hi_val = self.eval_const(hi).expect("case range: non-constant high expression");
                 ctx.switch_dispatch_ranges.push((lo_val as i128, hi_val as i128, case_block));
                 ctx.switch_case_blocks.push(case_block);
 
@@ -671,6 +697,7 @@ impl Codegen {
                 ctx.spilled_locals.remove(&name);
                 if let CType::Function(ref ret, ref params, variadic) = ty {
                     self.func_ret_types.insert(name.clone(), ret.as_ref().clone());
+                    self.func_ctypes.insert(name.clone(), ty.clone());
                     if params.is_empty() {
                         // Unspecified params f() — don't lock in 0-param signature
                         continue;
