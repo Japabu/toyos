@@ -152,6 +152,12 @@ impl Parser {
     // Declaration specifiers
     pub(super) fn decl_specifiers(&mut self) -> Vec<DeclSpecifier> {
         let mut specs = Vec::new();
+        // Track whether a base type has been established. Once set, typedef names
+        // are no longer consumed as type specifiers — they must be declarator names.
+        // This resolves the C typedef-name/identifier ambiguity: in `typedef int foo_t[N]`,
+        // if `foo_t` is already a known typedef, it must be parsed as the declarator name,
+        // not as an additional type specifier after `int`.
+        let mut has_base_type = false;
         loop {
             match self.peek() {
                 // Storage class
@@ -170,22 +176,22 @@ impl Parser {
                 TokenKind::Inline => { self.advance(); specs.push(DeclSpecifier::FuncSpec(FuncSpec::Inline)); }
 
                 // Type specifiers
-                TokenKind::Void => { self.advance(); specs.push(DeclSpecifier::TypeSpec(TypeSpec::Void)); }
-                TokenKind::Char => { self.advance(); specs.push(DeclSpecifier::TypeSpec(TypeSpec::Char)); }
+                TokenKind::Void => { self.advance(); specs.push(DeclSpecifier::TypeSpec(TypeSpec::Void)); has_base_type = true; }
+                TokenKind::Char => { self.advance(); specs.push(DeclSpecifier::TypeSpec(TypeSpec::Char)); has_base_type = true; }
                 TokenKind::Short => { self.advance(); specs.push(DeclSpecifier::TypeSpec(TypeSpec::Short)); }
-                TokenKind::Int => { self.advance(); specs.push(DeclSpecifier::TypeSpec(TypeSpec::Int)); }
+                TokenKind::Int => { self.advance(); specs.push(DeclSpecifier::TypeSpec(TypeSpec::Int)); has_base_type = true; }
                 TokenKind::Long => { self.advance(); specs.push(DeclSpecifier::TypeSpec(TypeSpec::Long)); }
-                TokenKind::Float => { self.advance(); specs.push(DeclSpecifier::TypeSpec(TypeSpec::Float)); }
-                TokenKind::Double => { self.advance(); specs.push(DeclSpecifier::TypeSpec(TypeSpec::Double)); }
+                TokenKind::Float => { self.advance(); specs.push(DeclSpecifier::TypeSpec(TypeSpec::Float)); has_base_type = true; }
+                TokenKind::Double => { self.advance(); specs.push(DeclSpecifier::TypeSpec(TypeSpec::Double)); has_base_type = true; }
                 TokenKind::Signed => { self.advance(); specs.push(DeclSpecifier::TypeSpec(TypeSpec::Signed)); }
                 TokenKind::Unsigned => { self.advance(); specs.push(DeclSpecifier::TypeSpec(TypeSpec::Unsigned)); }
-                TokenKind::Bool => { self.advance(); specs.push(DeclSpecifier::TypeSpec(TypeSpec::Bool)); }
-                TokenKind::Int128 => { self.advance(); specs.push(DeclSpecifier::TypeSpec(TypeSpec::Int128)); }
+                TokenKind::Bool => { self.advance(); specs.push(DeclSpecifier::TypeSpec(TypeSpec::Bool)); has_base_type = true; }
+                TokenKind::Int128 => { self.advance(); specs.push(DeclSpecifier::TypeSpec(TypeSpec::Int128)); has_base_type = true; }
 
                 // Struct/union/enum
-                TokenKind::Struct => { self.advance(); specs.push(DeclSpecifier::TypeSpec(TypeSpec::Struct(self.struct_or_union_type()))); }
-                TokenKind::Union => { self.advance(); specs.push(DeclSpecifier::TypeSpec(TypeSpec::Union(self.struct_or_union_type()))); }
-                TokenKind::Enum => { self.advance(); specs.push(DeclSpecifier::TypeSpec(TypeSpec::Enum(self.enum_type()))); }
+                TokenKind::Struct => { self.advance(); specs.push(DeclSpecifier::TypeSpec(TypeSpec::Struct(self.struct_or_union_type()))); has_base_type = true; }
+                TokenKind::Union => { self.advance(); specs.push(DeclSpecifier::TypeSpec(TypeSpec::Union(self.struct_or_union_type()))); has_base_type = true; }
+                TokenKind::Enum => { self.advance(); specs.push(DeclSpecifier::TypeSpec(TypeSpec::Enum(self.enum_type()))); has_base_type = true; }
 
                 // Typeof
                 TokenKind::Typeof => {
@@ -200,16 +206,19 @@ impl Parser {
                         self.expect(&TokenKind::RParen);
                         specs.push(DeclSpecifier::TypeSpec(TypeSpec::Typeof(Box::new(e))));
                     }
+                    has_base_type = true;
                 }
 
                 // __extension__
                 TokenKind::Extension => { self.advance(); }
 
-                // Typedef name
-                TokenKind::Ident(name) if self.type_env.is_typedef(name) => {
+                // Typedef name — only if no base type has been established yet.
+                // Once a base type is known, this identifier must be a declarator name.
+                TokenKind::Ident(name) if self.type_env.is_typedef(name) && !has_base_type => {
                     let name = name.clone();
                     self.advance();
                     specs.push(DeclSpecifier::TypeSpec(TypeSpec::TypedefName(name)));
+                    has_base_type = true;
                 }
 
                 // __builtin_ types (e.g. __builtin_va_list)
@@ -217,6 +226,7 @@ impl Parser {
                     let name = name.clone();
                     self.advance();
                     specs.push(DeclSpecifier::TypeSpec(TypeSpec::Builtin(name)));
+                    has_base_type = true;
                 }
 
                 _ => break,

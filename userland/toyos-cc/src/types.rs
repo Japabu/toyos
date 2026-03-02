@@ -270,47 +270,9 @@ impl TypeEnv {
             tags: HashMap::new(),
             enum_constants: HashMap::new(),
         };
-        // Common typedefs
-        env.typedefs.insert("size_t".into(), CType::Long(false));
-        env.typedefs.insert("ssize_t".into(), CType::Long(true));
-        env.typedefs.insert("ptrdiff_t".into(), CType::Long(true));
-        env.typedefs.insert("intptr_t".into(), CType::Long(true));
-        env.typedefs.insert("uintptr_t".into(), CType::Long(false));
-        env.typedefs.insert("int8_t".into(), CType::Char(true));
-        env.typedefs.insert("uint8_t".into(), CType::Char(false));
-        env.typedefs.insert("int16_t".into(), CType::Short(true));
-        env.typedefs.insert("uint16_t".into(), CType::Short(false));
-        env.typedefs.insert("int32_t".into(), CType::Int(true));
-        env.typedefs.insert("uint32_t".into(), CType::Int(false));
-        env.typedefs.insert("int64_t".into(), CType::Long(true));
-        env.typedefs.insert("uint64_t".into(), CType::Long(false));
-        env.typedefs.insert("__int128_t".into(), CType::Int128(true));
-        env.typedefs.insert("__uint128_t".into(), CType::Int128(false));
-        env.typedefs.insert("va_list".into(), CType::Pointer(Box::new(CType::Void)));
+        // Compiler builtins — no header provides these
         env.typedefs.insert("__builtin_va_list".into(), CType::Pointer(Box::new(CType::Void)));
-        env.typedefs.insert("FILE".into(), CType::Struct(StructDef { name: Some("_IO_FILE".into()), fields: Vec::new() }));
-        env.typedefs.insert("wchar_t".into(), CType::Int(true));
-        // POSIX/system types
-        env.typedefs.insert("off_t".into(), CType::Long(true));
-        env.typedefs.insert("pid_t".into(), CType::Int(true));
-        env.typedefs.insert("mode_t".into(), CType::Int(false));
-        env.typedefs.insert("dev_t".into(), CType::Long(false));
-        env.typedefs.insert("ino_t".into(), CType::Long(false));
-        env.typedefs.insert("nlink_t".into(), CType::Long(false));
-        env.typedefs.insert("uid_t".into(), CType::Int(false));
-        env.typedefs.insert("gid_t".into(), CType::Int(false));
-        env.typedefs.insert("clock_t".into(), CType::Long(true));
-        env.typedefs.insert("time_t".into(), CType::Long(true));
-        env.typedefs.insert("socklen_t".into(), CType::Int(false));
-        // jmp_buf: array of 8 longs (simplified, enough for sizeof)
-        env.typedefs.insert("jmp_buf".into(), CType::Array(Box::new(CType::Long(true)), Some(8)));
-        env.typedefs.insert("sigjmp_buf".into(), CType::Array(Box::new(CType::Long(true)), Some(8)));
-        // Sync/threading types
-        env.typedefs.insert("sem_t".into(), CType::Struct(StructDef { name: Some("sem_t".into()), fields: Vec::new() }));
-        env.typedefs.insert("dispatch_semaphore_t".into(), CType::Pointer(Box::new(CType::Void)));
-        env.typedefs.insert("pthread_t".into(), CType::Long(false));
-        env.typedefs.insert("pthread_mutex_t".into(), CType::Struct(StructDef { name: Some("pthread_mutex_t".into()), fields: Vec::new() }));
-        env.typedefs.insert("pthread_cond_t".into(), CType::Struct(StructDef { name: Some("pthread_cond_t".into()), fields: Vec::new() }));
+        env.typedefs.insert("__uint128_t".into(), CType::Int128(false));
         env
     }
 

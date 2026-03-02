@@ -236,3 +236,7 @@ tinycc_test!(t134_double_to_signed, "134_double_to_signed");
 tinycc_test!(t135_func_arg_struct_compare, "135_func_arg_struct_compare");
 tinycc_test!(t137_funcall_struct_args, "137_funcall_struct_args");
 tinycc_test!(t138_offsetof, "138_offsetof");
+tinycc_test!(t140_switch_hex, "140_switch_hex");
+tinycc_test!(t141_tok_str, "141_tok_str");
+tinycc_test!(t142_pp_sizeof_ptr, "142_pp_sizeof_ptr");
+tinycc_test!(t143_uint64_split, "143_uint64_split");

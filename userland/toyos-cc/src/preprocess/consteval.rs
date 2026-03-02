@@ -55,7 +55,6 @@ struct Val {
 
 impl Val {
     fn signed(v: i64) -> Self { Val { bits: v as u64, unsigned: false } }
-    fn unsigned(v: u64) -> Self { Val { bits: v, unsigned: true } }
     fn zero() -> Self { Val::signed(0) }
     fn one() -> Self { Val::signed(1) }
 

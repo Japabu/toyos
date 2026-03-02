@@ -119,7 +119,13 @@ impl Codegen {
                             return None;
                         }
                     }
-                    _ => {}
+                    TypeSpec::Enum(et) => {
+                        if let Some(tag_name) = &et.name {
+                            base = self.type_env.tags.get(tag_name).cloned();
+                        }
+                    }
+                    TypeSpec::Typeof(_) | TypeSpec::TypeofType(_) => return None,
+                    TypeSpec::Builtin(name) => panic!("unsupported builtin type specifier: {name}"),
                 }
             }
         }
@@ -239,7 +245,7 @@ impl Codegen {
                     TypeSpec::TypeofType(tn) => {
                         base = Some(self.resolve_typename(tn));
                     }
-                    _ => {}
+                    TypeSpec::Builtin(name) => panic!("unsupported builtin type specifier: {name}"),
                 }
             }
         }

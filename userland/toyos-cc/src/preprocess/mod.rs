@@ -30,11 +30,25 @@ pub(crate) enum PPToken {
     Barrier(String),
 }
 
+/// Compiler's own headers, embedded into the binary.
+const BUILTIN_HEADERS: &[(&str, &str)] = &[
+    ("compat.h",      include_str!("../../include/compat.h")),
+    ("float.h",       include_str!("../../include/float.h")),
+    ("stdalign.h",    include_str!("../../include/stdalign.h")),
+    ("stdarg.h",      include_str!("../../include/stdarg.h")),
+    ("stdbool.h",     include_str!("../../include/stdbool.h")),
+    ("stddef.h",      include_str!("../../include/stddef.h")),
+    ("stdnoreturn.h", include_str!("../../include/stdnoreturn.h")),
+];
+
+fn builtin_header(name: &str) -> Option<&'static str> {
+    BUILTIN_HEADERS.iter().find(|(n, _)| *n == name).map(|(_, c)| *c)
+}
+
 pub struct Preprocessor {
     pub(crate) macros: HashMap<String, Macro>,
     macro_stack: HashMap<String, Vec<Option<Macro>>>,
     include_paths: Vec<PathBuf>,
-    implicit_includes: Vec<PathBuf>, // auto-included before each source file
     output: String,
     pub(crate) expanding: HashSet<String>,
     pub(crate) file_stack: Vec<(String, u32, Option<usize>)>, // (file, line, include_dir_idx)
@@ -55,7 +69,6 @@ impl Preprocessor {
             macros: HashMap::new(),
             macro_stack: HashMap::new(),
             include_paths,
-            implicit_includes: Vec::new(),
             output: String::new(),
             expanding: HashSet::new(),
             file_stack: Vec::new(),
@@ -66,68 +79,31 @@ impl Preprocessor {
             in_if_eval: false,
         };
 
-        // Determine target properties
+        // Seed macros: primary arch and OS. Everything else is derived in compat.h.
         let is_toyos = target.map_or(false, |t| t.contains("toyos"));
         let is_macos = target.map_or(cfg!(target_os = "macos"), |t| t.contains("apple") || t.contains("darwin"));
         let is_aarch64 = target.map_or(cfg!(target_arch = "aarch64"), |t| t.starts_with("aarch64"));
 
-        // Language standard
-        pp.define_object("__STDC__", "1");
-        pp.define_object("__STDC_VERSION__", "199901L");
-
-        // Architecture
-        pp.define_object("__LP64__", "1");
-        pp.define_object("__SIZEOF_POINTER__", "8");
-        pp.define_object("__SIZEOF_INT__", "4");
-        pp.define_object("__SIZEOF_SHORT__", "2");
-        pp.define_object("__CHAR_BIT__", "8");
         if is_aarch64 {
             pp.define_object("__aarch64__", "1");
-            pp.define_object("__arm64__", "1");
-            pp.define_object("__ARM_64BIT_STATE", "1");
-            pp.define_object("__SIZEOF_LONG__", "8");
         } else {
             pp.define_object("__x86_64__", "1");
-            pp.define_object("__x86_64", "1");
-            pp.define_object("__amd64__", "1");
-            pp.define_object("__amd64", "1");
-            pp.define_object("__SIZEOF_LONG__", "8");
         }
 
-        // OS
         if is_toyos {
             pp.define_object("__TOYOS__", "1");
-            pp.define_object("__unix__", "1");
-            pp.define_object("__ELF__", "1");
         } else if is_macos {
             pp.define_object("__APPLE__", "1");
-            pp.define_object("__APPLE_CC__", "1");
-            pp.define_object("__MACH__", "1");
         } else {
-            // Default to Linux-like
             pp.define_object("__linux__", "1");
-            pp.define_object("__unix__", "1");
-            pp.define_object("__ELF__", "1");
-            pp.define_object("__gnu_linux__", "1");
         }
 
-        // Auto-include compiler compat header if present in include path
-        if let Some(compat) = pp.include_paths.iter()
-            .map(|d| d.join("compat.h"))
-            .find(|p| p.exists())
-        {
-            pp.implicit_includes.push(compat);
-        }
+        // Process embedded compat.h (defines all predefs derived from the seeds above)
+        pp.process_source(builtin_header("compat.h").unwrap(), "<builtin>/compat.h", None);
 
-        // Define compiler predicate macros as objects so that #ifdef / defined() checks work.
-        // The actual function-call evaluation (__has_attribute(x) etc.) is handled by
-        // replace_compiler_predicates() in eval_constant_expr, before macro expansion.
+        // __has_include needs compiler support (filesystem check)
         pp.define_object("__has_include", "1");
         pp.define_object("__has_include_next", "1");
-        pp.define_object("__has_attribute", "1");
-        pp.define_object("__has_feature", "1");
-        pp.define_object("__has_extension", "1");
-        pp.define_object("__has_builtin", "1");
 
         for (name, val) in defines {
             pp.define_object(&name, &val);
@@ -140,21 +116,8 @@ impl Preprocessor {
         self.macros.insert(name.to_string(), Macro::Object(tokens));
     }
 
-    fn define_function(&mut self, name: &str, params: &[&str], body: &str) {
-        let tokens = self.tokenize_pp(body);
-        let params = params.iter().map(|s| s.to_string()).collect();
-        self.macros.insert(name.to_string(), Macro::Function(params, false, tokens));
-    }
-
     pub fn preprocess(&mut self, source: &str, filename: &str) -> String {
         self.output.clear();
-        // Process implicit includes before the source file
-        for path in std::mem::take(&mut self.implicit_includes) {
-            if let Ok(content) = fs::read_to_string(&path) {
-                let resolved = path.to_string_lossy().into_owned();
-                self.process_source(&content, &resolved, None);
-            }
-        }
         self.process_source(source, filename, None);
         std::mem::take(&mut self.output)
     }
@@ -576,6 +539,10 @@ impl Preprocessor {
     }
 
     fn find_and_read(&self, path: &str, current_file: &str, is_system: bool) -> Option<(String, String, Option<usize>)> {
+        // Builtin headers (embedded in the binary) take priority
+        if let Some(content) = builtin_header(path) {
+            return Some((content.to_string(), format!("<builtin>/{path}"), None));
+        }
         if !is_system {
             // Search relative to current file first (not associated with any include-path index)
             let current_dir = Path::new(current_file).parent().unwrap_or(Path::new("."));
@@ -709,90 +676,18 @@ impl Preprocessor {
     fn eval_constant_expr(&mut self, expr: &str) -> i64 {
         // Replace __has_include("file") / __has_include(<file>) with 0 or 1
         let with_has_include = self.replace_has_include(expr);
-        // Replace __has_attribute(x), __has_feature(x), __has_builtin(x),
-        // __has_extension(x), __is_target_*(x) with their values
-        let with_predicates = self.replace_compiler_predicates(&with_has_include);
         // Expand macros with in_if_eval=true so `defined` is handled as a
         // keyword inside macro bodies too (handles defined-after-expansion).
+        // Other predicates (__has_builtin etc.) are function-like macros from
+        // compat.h that expand to 0 during normal macro expansion.
         self.in_if_eval = true;
-        let expanded = self.expand_line(&with_predicates);
+        let expanded = self.expand_line(&with_has_include);
         self.in_if_eval = false;
         // Then evaluate
         let mut eval = ConstEval::new(&expanded);
         eval.expr()
     }
 
-    /// Replace compiler builtin predicate calls with their values, before macro expansion.
-    /// Matches clang's behavior on aarch64-apple-macosx for the predicates used by the SDK.
-    fn replace_compiler_predicates(&self, expr: &str) -> String {
-        let predicates: &[(&[u8], fn(&str) -> i64)] = &[
-            // __has_attribute: all GCC/clang attributes used in the macOS SDK return 1
-            (b"__has_attribute(",   |_| 1),
-            // __has_feature: whitelist of features clang enables by default
-            (b"__has_feature(",     |arg| matches!(arg.trim(),
-                "attribute_availability"
-                | "attribute_availability_with_message"
-                | "attribute_availability_app_extension"
-                | "attribute_availability_swift"
-                | "attribute_availability_tvos"
-                | "attribute_availability_watchos"
-                | "nullability"
-            ) as i64),
-            // __has_extension: whitelist matching clang defaults
-            (b"__has_extension(",   |arg| matches!(arg.trim(),
-                "cxx_fixed_enum"
-                | "enumerator_attributes"
-                | "attribute_deprecated_with_message"
-                | "c_static_assert"
-                | "c_generic_selections"
-            ) as i64),
-            // __has_builtin: only the __is_target_* builtins
-            (b"__has_builtin(",     |arg| matches!(arg.trim(),
-                "__is_target_arch" | "__is_target_os" | "__is_target_vendor"
-                | "__is_target_environment" | "__is_target_variant_os"
-                | "__is_target_variant_environment") as i64),
-            // Target predicates for aarch64-apple-macosx
-            (b"__is_target_arch(",  |arg| matches!(arg.trim(), "arm64" | "aarch64") as i64),
-            (b"__is_target_os(",    |arg| (arg.trim() == "macosx") as i64),
-            (b"__is_target_vendor(", |arg| (arg.trim() == "apple") as i64),
-            (b"__is_target_environment(",         |_| 0),
-            (b"__is_target_variant_os(",          |_| 0),
-            (b"__is_target_variant_environment(", |_| 0),
-        ];
-
-        let mut result = String::new();
-        let bytes = expr.as_bytes();
-        let mut i = 0;
-        'outer: while i < bytes.len() {
-            // Word boundary check: don't match in the middle of an identifier
-            let at_word_start = i == 0
-                || (!bytes[i-1].is_ascii_alphanumeric() && bytes[i-1] != b'_');
-            if at_word_start {
-                for (prefix, eval_fn) in predicates {
-                    if bytes[i..].starts_with(prefix) {
-                        let arg_start = i + prefix.len();
-                        let mut j = arg_start;
-                        let mut depth = 1usize;
-                        while j < bytes.len() && depth > 0 {
-                            match bytes[j] {
-                                b'(' => { depth += 1; j += 1; }
-                                b')' => { depth -= 1; if depth > 0 { j += 1; } else { /* leave j at ')' */ } }
-                                _ => { j += 1; }
-                            }
-                        }
-                        let arg = std::str::from_utf8(&bytes[arg_start..j]).unwrap_or("");
-                        let val = eval_fn(arg);
-                        result.push_str(&val.to_string());
-                        i = j + 1; // skip past the closing ')'
-                        continue 'outer;
-                    }
-                }
-            }
-            result.push(bytes[i] as char);
-            i += 1;
-        }
-        result
-    }
 
     fn replace_has_include(&self, expr: &str) -> String {
         let mut result = String::new();
@@ -845,35 +740,4 @@ impl Preprocessor {
         result
     }
 
-    fn replace_defined(&self, expr: &str) -> String {
-        let mut result = String::new();
-        let bytes = expr.as_bytes();
-        let mut i = 0;
-        while i < bytes.len() {
-            if i + 7 <= bytes.len() && &bytes[i..i+7] == b"defined" {
-                let before_ok = i == 0 || !bytes[i-1].is_ascii_alphanumeric() && bytes[i-1] != b'_';
-                let after_ok = i + 7 >= bytes.len() || !bytes[i+7].is_ascii_alphanumeric() && bytes[i+7] != b'_';
-                if before_ok && after_ok {
-                    i += 7;
-                    // skip whitespace
-                    while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') { i += 1; }
-                    let has_paren = i < bytes.len() && bytes[i] == b'(';
-                    if has_paren { i += 1; }
-                    while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') { i += 1; }
-                    let name_start = i;
-                    while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b'$') { i += 1; }
-                    let name = std::str::from_utf8(&bytes[name_start..i]).unwrap_or("");
-                    if has_paren {
-                        while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') { i += 1; }
-                        if i < bytes.len() && bytes[i] == b')' { i += 1; }
-                    }
-                    result.push_str(if self.macros.contains_key(name) { "1" } else { "0" });
-                    continue;
-                }
-            }
-            result.push(bytes[i] as char);
-            i += 1;
-        }
-        result
-    }
 }
