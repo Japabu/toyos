@@ -704,7 +704,9 @@ impl Codegen {
 
             if is_static {
                 // Static local — treat as global with mangled name to avoid namespace conflicts
-                let mangled = format!("{}.{}", ctx.name, name);
+                let sid = self.static_counter;
+                self.static_counter += 1;
+                let mangled = format!("{}.{}.{}", ctx.name, name, sid);
                 let data_id = self.module.declare_data(&mangled, Linkage::Local, true, false).unwrap();
                 let mut desc = DataDescription::new();
                 desc.set_align(ty.align() as u64);

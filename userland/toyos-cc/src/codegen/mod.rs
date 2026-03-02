@@ -31,6 +31,7 @@ pub struct Codegen {
     type_env: TypeEnv,
     strings: Vec<(String, Vec<u8>)>, // (symbol name, data)
     string_counter: usize,
+    static_counter: usize,
     func_sigs: HashMap<String, ir::Signature>,           // declared function signatures
     func_ids: HashMap<String, FuncId>,                   // declared function IDs
     data_ids: HashMap<String, cranelift_module::DataId>,  // declared global data IDs
@@ -78,6 +79,7 @@ impl Codegen {
             type_env,
             strings: Vec::new(),
             string_counter: 0,
+            static_counter: 0,
             func_sigs: HashMap::new(),
             func_ids: HashMap::new(),
             data_ids: HashMap::new(),
