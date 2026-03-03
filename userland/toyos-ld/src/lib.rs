@@ -78,6 +78,36 @@ impl Collected {
         gc_sections(&mut self.state, entry);
     }
 
+    /// Mark undefined symbols as dynamic (dylib) imports for Mach-O linking.
+    fn mark_dynamic_symbols(&mut self) {
+        use std::collections::HashSet;
+        let referenced: HashSet<String> = self.state.relocs.iter()
+            .map(|r| r.symbol_name.clone())
+            .collect();
+        let undefined: Vec<String> = referenced.into_iter()
+            .filter(|sym| {
+                !self.state.globals.contains_key(sym)
+                    && !self.state.locals.keys().any(|(_, n)| n == sym)
+            })
+            .collect();
+        for sym in undefined {
+            self.state.globals.insert(sym, SymbolDef::Dynamic);
+        }
+    }
+
+    /// Mark sections with absolute relocations as writable (needed for Mach-O rebasing).
+    fn mark_abs_reloc_sections_writable(&mut self) {
+        let abs_reloc_sections: std::collections::HashSet<SectionIdx> = self.state.relocs.iter()
+            .filter(|r| r.r_type == RelocType::Aarch64Abs64)
+            .map(|r| r.section)
+            .collect();
+        for &idx in &abs_reloc_sections {
+            if !self.state.sections[idx].kind.is_writable() {
+                self.state.sections[idx].kind = SectionKind::Data;
+            }
+        }
+    }
+
     fn layout_elf(mut self, base_addr: u64, entry: Option<&str>, build_id: bool) -> LaidOut<ElfLayout> {
         let layout = layout_elf(&mut self.state, base_addr, entry, build_id);
         LaidOut { state: self.state, layout }
@@ -363,42 +393,9 @@ pub fn link_macho(
     gc: bool,
 ) -> Result<Vec<u8>, LinkError> {
     let mut collected = Collected::new(objects)?;
-
-    // Mark any truly undefined symbols as dynamic (dylib) imports
-    {
-        use std::collections::HashSet;
-        let referenced: HashSet<String> = collected.state.relocs.iter()
-            .map(|r| r.symbol_name.clone())
-            .collect();
-        let undefined: Vec<String> = referenced.into_iter()
-            .filter(|sym| {
-                !collected.state.globals.contains_key(sym)
-                    && !collected.state.locals.keys().any(|(_, n)| n == sym)
-            })
-            .collect();
-        for sym in undefined {
-            collected.state.globals.insert(sym, SymbolDef::Dynamic);
-        }
-    }
-
-    // Create stubs for direct calls (CALL26) to undefined/dynamic symbols.
-    // Each stub loads the target address from a GOT slot and branches to it.
+    collected.mark_dynamic_symbols();
     create_call_stubs(&mut collected.state);
-
-    // Sections with absolute relocations need runtime rebasing, which requires
-    // writable memory. Promote read-only sections to Data for Mach-O rebasing.
-    {
-        let abs_reloc_sections: std::collections::HashSet<SectionIdx> = collected.state.relocs.iter()
-            .filter(|r| r.r_type == RelocType::Aarch64Abs64)
-            .map(|r| r.section)
-            .collect();
-        for &idx in &abs_reloc_sections {
-            if !collected.state.sections[idx].kind.is_writable() {
-                collected.state.sections[idx].kind = SectionKind::Data;
-            }
-        }
-    }
-
+    collected.mark_abs_reloc_sections_writable();
     if gc { collected.gc_sections(entry); }
     collected.layout_macho(entry)
         .relocate_and_emit(entry)
