@@ -659,6 +659,12 @@ impl Codegen {
         self.compile_stmt(ctx, body);
     }
 
+    fn emit_zero(builder: &mut FunctionBuilder, ty: Type) -> Value {
+        if ty == F32 { builder.ins().f32const(0.0) }
+        else if ty == F64 { builder.ins().f64const(0.0) }
+        else { builder.ins().iconst(ty, 0) }
+    }
+
     pub(crate) fn compile_local_decl(&mut self, ctx: &mut FuncCtx, decl: &Declaration) {
         let is_typedef = decl.specifiers.iter().any(|s| matches!(s, DeclSpecifier::StorageClass(StorageClass::Typedef)));
 
@@ -669,7 +675,6 @@ impl Codegen {
         self.ensure_unfilled(ctx);
 
         if is_typedef {
-            // Resolve the actual type and store it in type_env
             for id in &decl.declarators {
                 if let Some(name) = self.get_declarator_name(&id.declarator) {
                     let ty = self.apply_declarator(&base_ty, &id.declarator);
@@ -696,65 +701,18 @@ impl Codegen {
             }
             verbose!("local_decl: {} : {:?} (init={})", name, ty, id.initializer.is_some());
 
-            // Local function declarations (e.g. `float fy();` inside a function body)
-            // are extern function forward declarations, not local variables.
-            if matches!(ty, CType::Function(..)) {
-                // Remove any local variable shadow so calls see the function
-                ctx.locals.remove(&name);
-                ctx.local_ptrs.remove(&name);
-                ctx.spilled_locals.remove(&name);
-                if let CType::Function(ref ret, ref params, variadic) = ty {
-                    self.func_ret_types.insert(name.clone(), ret.as_ref().clone());
-                    self.func_ctypes.insert(name.clone(), ty.clone());
-                    if params.is_empty() {
-                        // Unspecified params f() — don't lock in 0-param signature
-                        continue;
-                    }
-                    let sig = self.build_signature(ret, params, variadic);
-                    if variadic {
-                        self.variadic_funcs.insert(name.clone(), params.len());
-                    }
-                    self.func_sigs.insert(name.clone(), sig.clone());
-                    if let Ok(id) = self.module.declare_function(&name, Linkage::Import, &sig) {
-                        self.func_ids.insert(name.clone(), id);
-                    }
-                }
+            if let CType::Function(..) = ty {
+                self.compile_local_func_decl(ctx, &name, &ty);
                 continue;
             }
 
-            // extern declarations inside a function body refer to globals
-            if is_extern && !matches!(ty, CType::Function(..)) {
-                // Remove any local shadows so compile_addr finds the global
-                ctx.locals.remove(&name);
-                ctx.local_ptrs.remove(&name);
-                ctx.spilled_locals.remove(&name);
-                self.global_types.insert(name.clone(), ty.clone());
-                if !self.data_ids.contains_key(&name) {
-                    if let Ok(data_id) = self.module.declare_data(&name, Linkage::Import, false, false) {
-                        self.data_ids.insert(name.clone(), data_id);
-                    }
-                }
+            if is_extern {
+                self.compile_extern_local(ctx, &name, ty);
                 continue;
             }
 
             if is_static {
-                // Static local — treat as global with mangled name to avoid namespace conflicts
-                let sid = self.static_counter;
-                self.static_counter += 1;
-                let mangled = format!("{}.{}.{}", ctx.name, name, sid);
-                let data_id = self.module.declare_data(&mangled, Linkage::Local, true, false).unwrap();
-                let mut desc = DataDescription::new();
-                desc.set_align(ty.align() as u64);
-                if let Some(init) = &id.initializer {
-                    let size = Self::init_size(&ty, init).max(1);
-                    self.init_global_data(&mut desc, size, &ty, init);
-                } else {
-                    desc.define_zeroinit(ty.size().max(1));
-                }
-                self.module.define_data(data_id, &desc).unwrap_or_else(|e| panic!("failed to define data: {e:?}"));
-                let gv = self.module.declare_data_in_func(data_id, ctx.builder.func);
-                let ptr = ctx.builder.ins().global_value(I64, gv);
-                ctx.local_ptrs.insert(name.clone(), (ptr, ty.clone()));
+                self.compile_static_local(ctx, &name, &ty, id.initializer.as_ref());
                 continue;
             }
 
@@ -764,7 +722,6 @@ impl Codegen {
                 let ss = ctx.builder.create_sized_stack_slot(ir::StackSlotData::new(ir::StackSlotKind::ExplicitSlot, size as u32, 0));
                 let ptr = ctx.builder.ins().stack_addr(I64, ss, 0);
                 ctx.local_ptrs.insert(name.clone(), (ptr, ty.clone()));
-
                 if let Some(init) = &id.initializer {
                     self.compile_aggregate_init(ctx, ptr, &ty, init);
                 }
@@ -776,32 +733,7 @@ impl Codegen {
             // If address is taken (&var anywhere in function), allocate on
             // stack from the start so the slot is valid in all basic blocks.
             if ctx.addr_taken.contains(&name) {
-                let size = ty.size().max(1);
-                let ss = ctx.builder.create_sized_stack_slot(ir::StackSlotData::new(
-                    ir::StackSlotKind::ExplicitSlot, size as u32, 0,
-                ));
-                let ptr = ctx.builder.ins().stack_addr(I64, ss, 0);
-                // Register type before compiling initializer so sizeof/typeof
-                // can resolve the variable's type in the initializer expression.
-                ctx.spilled_locals.insert(name, (ss, ty));
-                let make_zero = |b: &mut FunctionBuilder| -> Value {
-                    if clif_ty == F32 { b.ins().f32const(0.0) }
-                    else if clif_ty == F64 { b.ins().f64const(0.0) }
-                    else { b.ins().iconst(clif_ty, 0) }
-                };
-                if let Some(init) = &id.initializer {
-                    if let Initializer::Expr(e) = init {
-                        let tv = self.compile_expr(ctx, e);
-                        let val = self.coerce_typed(ctx, tv, clif_ty);
-                        ctx.builder.ins().store(MemFlags::new(), val, ptr, 0);
-                    } else {
-                        let zero = make_zero(&mut ctx.builder);
-                        ctx.builder.ins().store(MemFlags::new(), zero, ptr, 0);
-                    }
-                } else {
-                    let zero = make_zero(&mut ctx.builder);
-                    ctx.builder.ins().store(MemFlags::new(), zero, ptr, 0);
-                }
+                self.compile_spilled_local(ctx, name, ty, clif_ty, id.initializer.as_ref());
                 continue;
             }
 
@@ -810,32 +742,93 @@ impl Codegen {
             // can resolve the variable's type in the initializer expression.
             ctx.locals.insert(name, (var, ty));
 
-            if let Some(init) = &id.initializer {
-                if let Initializer::Expr(e) = init {
+            let val = match &id.initializer {
+                Some(Initializer::Expr(e)) => {
                     let tv = self.compile_expr(ctx, e);
-                    let val = self.coerce_typed(ctx, tv, clif_ty);
-                    ctx.builder.def_var(var, val);
-                } else {
-                    // Zero-init for brace initializer on scalars
-                    let zero = if clif_ty == F32 {
-                        ctx.builder.ins().f32const(0.0)
-                    } else if clif_ty == F64 {
-                        ctx.builder.ins().f64const(0.0)
-                    } else {
-                        ctx.builder.ins().iconst(clif_ty, 0)
-                    };
-                    ctx.builder.def_var(var, zero);
+                    self.coerce_typed(ctx, tv, clif_ty)
                 }
-            } else {
-                let zero = if clif_ty == F32 {
-                    ctx.builder.ins().f32const(0.0)
-                } else if clif_ty == F64 {
-                    ctx.builder.ins().f64const(0.0)
-                } else {
-                    ctx.builder.ins().iconst(clif_ty, 0)
-                };
-                ctx.builder.def_var(var, zero);
+                _ => Self::emit_zero(&mut ctx.builder, clif_ty),
+            };
+            ctx.builder.def_var(var, val);
+        }
+    }
+
+    /// Local function declarations (e.g. `float fy();` inside a function body)
+    /// are extern function forward declarations, not local variables.
+    fn compile_local_func_decl(&mut self, ctx: &mut FuncCtx, name: &str, ty: &CType) {
+        // Remove any local variable shadow so calls see the function
+        ctx.locals.remove(name);
+        ctx.local_ptrs.remove(name);
+        ctx.spilled_locals.remove(name);
+        let CType::Function(ref ret, ref params, variadic) = *ty else {
+            unreachable!()
+        };
+        self.func_ret_types.insert(name.to_string(), ret.as_ref().clone());
+        self.func_ctypes.insert(name.to_string(), ty.clone());
+        if params.is_empty() {
+            // Unspecified params f() — don't lock in 0-param signature
+            return;
+        }
+        let sig = self.build_signature(ret, params, variadic);
+        if variadic {
+            self.variadic_funcs.insert(name.to_string(), params.len());
+        }
+        self.func_sigs.insert(name.to_string(), sig.clone());
+        if let Ok(id) = self.module.declare_function(name, Linkage::Import, &sig) {
+            self.func_ids.insert(name.to_string(), id);
+        }
+    }
+
+    /// extern declarations inside a function body refer to globals.
+    fn compile_extern_local(&mut self, ctx: &mut FuncCtx, name: &str, ty: CType) {
+        ctx.locals.remove(name);
+        ctx.local_ptrs.remove(name);
+        ctx.spilled_locals.remove(name);
+        self.global_types.insert(name.to_string(), ty);
+        if !self.data_ids.contains_key(name) {
+            if let Ok(data_id) = self.module.declare_data(name, Linkage::Import, false, false) {
+                self.data_ids.insert(name.to_string(), data_id);
             }
         }
+    }
+
+    /// Static local — treat as global with mangled name to avoid namespace conflicts.
+    fn compile_static_local(&mut self, ctx: &mut FuncCtx, name: &str, ty: &CType, init: Option<&Initializer>) {
+        let sid = self.static_counter;
+        self.static_counter += 1;
+        let mangled = format!("{}.{}.{}", ctx.name, name, sid);
+        let data_id = self.module.declare_data(&mangled, Linkage::Local, true, false).unwrap();
+        let mut desc = DataDescription::new();
+        desc.set_align(ty.align() as u64);
+        if let Some(init) = init {
+            let size = Self::init_size(ty, init).max(1);
+            self.init_global_data(&mut desc, size, ty, init);
+        } else {
+            desc.define_zeroinit(ty.size().max(1));
+        }
+        self.module.define_data(data_id, &desc).unwrap_or_else(|e| panic!("failed to define data: {e:?}"));
+        let gv = self.module.declare_data_in_func(data_id, ctx.builder.func);
+        let ptr = ctx.builder.ins().global_value(I64, gv);
+        ctx.local_ptrs.insert(name.to_string(), (ptr, ty.clone()));
+    }
+
+    /// Address-taken variable — allocate on stack so the slot is valid in all basic blocks.
+    fn compile_spilled_local(&mut self, ctx: &mut FuncCtx, name: String, ty: CType, clif_ty: Type, init: Option<&Initializer>) {
+        let size = ty.size().max(1);
+        let ss = ctx.builder.create_sized_stack_slot(ir::StackSlotData::new(
+            ir::StackSlotKind::ExplicitSlot, size as u32, 0,
+        ));
+        let ptr = ctx.builder.ins().stack_addr(I64, ss, 0);
+        // Register type before compiling initializer so sizeof/typeof
+        // can resolve the variable's type in the initializer expression.
+        ctx.spilled_locals.insert(name, (ss, ty));
+        let val = match init {
+            Some(Initializer::Expr(e)) => {
+                let tv = self.compile_expr(ctx, e);
+                self.coerce_typed(ctx, tv, clif_ty)
+            }
+            _ => Self::emit_zero(&mut ctx.builder, clif_ty),
+        };
+        ctx.builder.ins().store(MemFlags::new(), val, ptr, 0);
     }
 }
