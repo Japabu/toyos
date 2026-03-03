@@ -18,7 +18,7 @@ pub(crate) fn string_lit_bytes(expr: &Expr) -> Vec<u8> {
             bytes.extend_from_slice(&0i32.to_le_bytes());
             bytes
         }
-        _ => unreachable!(),
+        other => panic!("string_lit_bytes: expected StringLit or WideStringLit, got {other:?}"),
     }
 }
 
@@ -27,7 +27,7 @@ pub(crate) fn string_lit_elem_count(expr: &Expr) -> usize {
     match expr {
         Expr::StringLit(data) => data.len() + 1,
         Expr::WideStringLit(data) => std::str::from_utf8(data).unwrap().chars().count() + 1,
-        _ => unreachable!(),
+        other => panic!("string_lit_elem_count: expected StringLit or WideStringLit, got {other:?}"),
     }
 }
 
@@ -225,14 +225,19 @@ impl Codegen {
                     self.compile_init_one(ctx, base_ptr, &field_ty, items, cursor);
                 }
             }
-            // Scalar (int, float, pointer, enum, bool) — store single value
-            _ => {
+            CType::Void | CType::Bool | CType::Char(_) | CType::Short(_) | CType::Int(_)
+            | CType::Long(_) | CType::LongLong(_) | CType::Int128(_) | CType::Float
+            | CType::Double | CType::LongDouble | CType::Pointer(_) | CType::Enum(_)
+            | CType::Function(..) => {
                 if *cursor < items.len() {
-                    if let Initializer::Expr(e) = &items[*cursor].initializer {
-                        let tv = self.compile_expr(ctx, e);
-                        let target_ty = self.clif_type(ty);
-                        let val = self.coerce_typed(ctx, tv, target_ty);
-                        ctx.builder.ins().store(MemFlags::new(), val, base_ptr, 0);
+                    match &items[*cursor].initializer {
+                        Initializer::Expr(e) => {
+                            let tv = self.compile_expr(ctx, e);
+                            let target_ty = self.clif_type(ty);
+                            let val = self.coerce_typed(ctx, tv, target_ty);
+                            ctx.builder.ins().store(MemFlags::new(), val, base_ptr, 0);
+                        }
+                        Initializer::List(_) => panic!("list initializer for scalar type {ty:?}"),
                     }
                     *cursor += 1;
                 }
@@ -288,8 +293,10 @@ impl Codegen {
                         // Brace elision: recursively fill sub-aggregate from flat list
                         self.compile_aggregate_init_cursor(ctx, ptr, ty, items, cursor);
                     }
-                    // Scalar (int, float, pointer, enum, bool)
-                    _ => {
+                    CType::Void | CType::Bool | CType::Char(_) | CType::Short(_) | CType::Int(_)
+                    | CType::Long(_) | CType::LongLong(_) | CType::Int128(_) | CType::Float
+                    | CType::Double | CType::LongDouble | CType::Pointer(_) | CType::Enum(_)
+                    | CType::Function(..) => {
                         let tv = self.compile_expr(ctx, e);
                         let target_ty = self.clif_type(ty);
                         let val = self.coerce_typed(ctx, tv, target_ty);
@@ -385,9 +392,9 @@ impl Codegen {
                     let func_ref = self.module.declare_func_in_data(func_id, desc);
                     desc.write_function_addr(offset, func_ref);
                 }
-                GlobalReloc::DataAddr { offset, data_id } => {
+                GlobalReloc::DataAddr { offset, data_id, addend } => {
                     let gv = self.module.declare_data_in_data(data_id, desc);
-                    desc.write_data_addr(offset, gv, 0);
+                    desc.write_data_addr(offset, gv, addend);
                 }
             }
         }
@@ -476,14 +483,16 @@ impl Codegen {
                     if let Some(bw) = field.bit_width {
                         // Bitfield: pack value into storage unit at bit_off
                         if let Initializer::Expr(expr) = &items[*cursor].initializer {
-                            if let Some(val) = self.eval_const(expr) {
-                                let mask = (1u64 << bw) - 1;
-                                let shifted = (val as u64 & mask) << bit_off;
-                                let unit_size = field.ty.size();
-                                for b in 0..unit_size {
-                                    bytes[offset + b] |= ((shifted >> (b * 8)) & 0xff) as u8;
-                                }
+                            let val = self.eval_const(expr)
+                                .unwrap_or_else(|| panic!("bitfield initializer must be a constant expression: {expr:?}"));
+                            let mask = (1u64 << bw) - 1;
+                            let shifted = (val as u64 & mask) << bit_off;
+                            let unit_size = field.ty.size();
+                            for b in 0..unit_size {
+                                bytes[offset + b] |= ((shifted >> (b * 8)) & 0xff) as u8;
                             }
+                        } else {
+                            panic!("bitfield initializer must be an expression, got list initializer");
                         }
                         *cursor += 1;
                     } else {
@@ -504,8 +513,10 @@ impl Codegen {
                     self.fill_init_one(bytes, relocs, base, &field_ty, items, cursor);
                 }
             }
-            // Scalar (int, float, pointer, enum, bool) — fill single value
-            _ => {
+            CType::Void | CType::Bool | CType::Char(_) | CType::Short(_) | CType::Int(_)
+            | CType::Long(_) | CType::LongLong(_) | CType::Int128(_) | CType::Float
+            | CType::Double | CType::LongDouble | CType::Pointer(_) | CType::Enum(_)
+            | CType::Function(..) => {
                 if *cursor < items.len() {
                     self.fill_init_item(bytes, relocs, base, ty, &items[*cursor].initializer);
                     *cursor += 1;
@@ -529,22 +540,16 @@ impl Codegen {
                 // String literals are whole-value only for array/pointer targets;
                 // for struct targets they should brace-elide into the first array field.
                 // Compound literals are always whole-value.
-                let is_whole_value = match e {
-                    Expr::StringLit(_) | Expr::WideStringLit(_) => matches!(ty, CType::Array(..)) || ty.is_pointer(),
-                    Expr::CompoundLiteral(..) => true,
-                    // Other expressions are not whole-value initializers
-                    _ => false,
-                };
-                match ty {
-                    CType::Array(..) | CType::Struct(_) | CType::Union(_) if !is_whole_value => {
-                        // Brace elision: recursively fill sub-aggregate from the flat list
-                        self.fill_init_aggregate(bytes, relocs, offset, ty, items, cursor);
-                    }
+                let is_whole_value = matches!(e, Expr::CompoundLiteral(..))
+                    || (matches!(e, Expr::StringLit(_) | Expr::WideStringLit(_))
+                        && (matches!(ty, CType::Array(..)) || ty.is_pointer()));
+                if !is_whole_value && matches!(ty, CType::Array(..) | CType::Struct(_) | CType::Union(_)) {
+                    // Brace elision: recursively fill sub-aggregate from the flat list
+                    self.fill_init_aggregate(bytes, relocs, offset, ty, items, cursor);
+                } else {
                     // Scalar, or whole-value aggregate — fill single item
-                    _ => {
-                        self.fill_init_item(bytes, relocs, offset, ty, &items[*cursor].initializer);
-                        *cursor += 1;
-                    }
+                    self.fill_init_item(bytes, relocs, offset, ty, &items[*cursor].initializer);
+                    *cursor += 1;
                 }
             }
         }
@@ -575,16 +580,25 @@ impl Codegen {
                     BinOp::Ge => (l >= r) as i64 as f64,
                     BinOp::LogAnd => ((l != 0.0) && (r != 0.0)) as i64 as f64,
                     BinOp::LogOr => ((l != 0.0) || (r != 0.0)) as i64 as f64,
-                    // Bitwise/shift/mod ops are integer-only, not applicable to float const eval
-                    _ => return None,
+                    // Integer-only ops: evaluate on truncated integer operands
+                    BinOp::Shl => ((l as i64) << (r as i64)) as f64,
+                    BinOp::Shr => ((l as i64) >> (r as i64)) as f64,
+                    BinOp::BitAnd => ((l as i64) & (r as i64)) as f64,
+                    BinOp::BitOr => ((l as i64) | (r as i64)) as f64,
+                    BinOp::BitXor => ((l as i64) ^ (r as i64)) as f64,
+                    BinOp::Mod => { let ri = r as i64; if ri != 0 { ((l as i64) % ri) as f64 } else { 0.0 } }
                 })
             }
             Expr::Conditional(c, t, f) => {
                 let c = self.eval_const_float(c)?;
                 if c != 0.0 { self.eval_const_float(t) } else { self.eval_const_float(f) }
             }
-            // Non-constant expressions (Call, Index, Member, etc.) can't be evaluated at compile time
-            _ => None,
+            Expr::StringLit(_) | Expr::WideStringLit(_) | Expr::Ident(_)
+            | Expr::Unary(UnaryOp::BitNot | UnaryOp::Deref | UnaryOp::AddrOf | UnaryOp::PreInc | UnaryOp::PreDec, _)
+            | Expr::PostUnary(..) | Expr::Sizeof(_) | Expr::Alignof(_)
+            | Expr::Call(..) | Expr::Member(..) | Expr::Arrow(..) | Expr::Index(..)
+            | Expr::Assign(..) | Expr::Comma(..) | Expr::CompoundLiteral(..)
+            | Expr::StmtExpr(_) | Expr::VaArg(..) | Expr::Builtin(..) => None,
         }
     }
 
@@ -606,7 +620,6 @@ impl Codegen {
                         let bits = (val as f32).to_le_bytes();
                         bytes[offset..offset + 4].copy_from_slice(&bits);
                     }
-                    // Guard `ty.is_float()` ensures only Float/Double/LongDouble reach here
                     CType::Double | CType::LongDouble => {
                         let bits = val.to_le_bytes();
                         bytes[offset..offset + 8].copy_from_slice(&bits);
@@ -614,7 +627,10 @@ impl Codegen {
                             for b in &mut bytes[offset + 8..offset + field_size] { *b = 0; }
                         }
                     }
-                    _ => unreachable!(),
+                    CType::Void | CType::Bool | CType::Char(_) | CType::Short(_) | CType::Int(_)
+                    | CType::Long(_) | CType::LongLong(_) | CType::Int128(_) | CType::Pointer(_)
+                    | CType::Array(..) | CType::Function(..) | CType::Enum(_)
+                    | CType::Struct(_) | CType::Union(_) => unreachable!("ty.is_float() guard ensures only Float/Double/LongDouble"),
                 }
                 return;
             }
@@ -633,7 +649,7 @@ impl Codegen {
         // Float constant expression
         if let Some(val) = self.eval_const_float(expr) {
             let field_size = ty.size();
-            if offset + field_size > bytes.len() { return; }
+            assert!(offset + field_size <= bytes.len(), "initializer overflow: offset {offset} + size {field_size} exceeds {} bytes", bytes.len());
             match ty {
                 CType::Float => {
                     let bits = (val as f32).to_le_bytes();
@@ -646,8 +662,10 @@ impl Codegen {
                         for b in &mut bytes[offset + 8..offset + field_size] { *b = 0; }
                     }
                 }
-                // Float constant assigned to integer type: C truncation semantics
-                _ => {
+                CType::Void | CType::Bool | CType::Char(_) | CType::Short(_) | CType::Int(_)
+                | CType::Long(_) | CType::LongLong(_) | CType::Int128(_) | CType::Pointer(_)
+                | CType::Array(..) | CType::Function(..) | CType::Enum(_)
+                | CType::Struct(_) | CType::Union(_) => {
                     let ival = val as i64;
                     let val_bytes = ival.to_le_bytes();
                     let copy_len = field_size.min(val_bytes.len());
@@ -665,7 +683,7 @@ impl Codegen {
                 self.string_counter += 1;
                 let data_id = self.module.declare_data(&sym, Linkage::Local, false, false).unwrap();
                 self.strings.push((sym, str_bytes));
-                relocs.push(GlobalReloc::DataAddr { offset: offset as u32, data_id });
+                relocs.push(GlobalReloc::DataAddr { offset: offset as u32, data_id, addend: 0 });
             } else {
                 let copy_len = ty.size().min(str_bytes.len());
                 bytes[offset..offset + copy_len].copy_from_slice(&str_bytes[..copy_len]);
@@ -680,7 +698,24 @@ impl Codegen {
                 return;
             }
             if let Some(&data_id) = self.data_ids.get(ref_name) {
-                relocs.push(GlobalReloc::DataAddr { offset: offset as u32, data_id });
+                relocs.push(GlobalReloc::DataAddr { offset: offset as u32, data_id, addend: 0 });
+                return;
+            }
+            // Unknown function: declare as import (forward-declared function pointer)
+            if ty.is_pointer() {
+                let sig = if let Some(sig) = self.func_sigs.get(ref_name) {
+                    sig.clone()
+                } else if let Some(CType::Function(ret, params, variadic)) = self.func_ctypes.get(ref_name) {
+                    self.build_signature(ret, params, *variadic)
+                } else {
+                    let mut sig = self.module.make_signature();
+                    sig.returns.push(AbiParam::new(I64));
+                    sig
+                };
+                let func_id = self.module.declare_function(ref_name, Linkage::Import, &sig)
+                    .unwrap_or_else(|e| panic!("failed to declare function '{ref_name}' in global init: {e}"));
+                self.func_ids.insert(ref_name.clone(), func_id);
+                relocs.push(GlobalReloc::FuncAddr { offset: offset as u32, func_id });
                 return;
             }
         }
@@ -693,7 +728,7 @@ impl Codegen {
                     return;
                 }
                 if let Some(&data_id) = self.data_ids.get(ref_name) {
-                    relocs.push(GlobalReloc::DataAddr { offset: offset as u32, data_id });
+                    relocs.push(GlobalReloc::DataAddr { offset: offset as u32, data_id, addend: 0 });
                     return;
                 }
                 // Unknown function: declare as import
@@ -705,6 +740,21 @@ impl Codegen {
                 relocs.push(GlobalReloc::FuncAddr { offset: offset as u32, func_id });
                 return;
             }
+            // &array[index] — data pointer with constant offset
+            if let Expr::Index(base, idx) = inner.as_ref() {
+                if let Expr::Ident(ref_name) = base.as_ref() {
+                    if let Some(&data_id) = self.data_ids.get(ref_name) {
+                        if let Some(idx_val) = self.eval_const(idx) {
+                            let elem_ty = self.global_types.get(ref_name)
+                                .and_then(|t| if let CType::Array(e, _) = t { Some(e.size() as i64) } else { None })
+                                .unwrap_or(1);
+                            let addend = idx_val * elem_ty;
+                            relocs.push(GlobalReloc::DataAddr { offset: offset as u32, data_id, addend });
+                            return;
+                        }
+                    }
+                }
+            }
         }
 
         // Cast wrapping an identifier (e.g. `(void*)func`)
@@ -715,7 +765,7 @@ impl Codegen {
                     return;
                 }
                 if let Some(&data_id) = self.data_ids.get(ref_name) {
-                    relocs.push(GlobalReloc::DataAddr { offset: offset as u32, data_id });
+                    relocs.push(GlobalReloc::DataAddr { offset: offset as u32, data_id, addend: 0 });
                     return;
                 }
             }

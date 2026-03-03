@@ -84,7 +84,9 @@ impl Codegen {
                         BinOp::BitXor => ctx.builder.ins().bxor(l, r),
                         BinOp::Shl => ctx.builder.ins().ishl(l, r),
                         BinOp::Shr => ctx.builder.ins().sshr(l, r),
-                        _ => unreachable!("outer match constrains to Mod|BitAnd|BitOr|BitXor|Shl|Shr"),
+                        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div
+                        | BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge
+                        | BinOp::LogAnd | BinOp::LogOr => unreachable!("outer match constrains to Mod|BitAnd|BitOr|BitXor|Shl|Shr"),
                     }
                 }
             }
@@ -179,7 +181,8 @@ impl Codegen {
                         AssignOp::AndAssign => ctx.builder.ins().band(l, r),
                         AssignOp::XorAssign => ctx.builder.ins().bxor(l, r),
                         AssignOp::OrAssign => ctx.builder.ins().bor(l, r),
-                        _ => unreachable!("outer match constrains to Mod|Shl|Shr|And|Xor|Or Assign"),
+                        AssignOp::AddAssign | AssignOp::SubAssign | AssignOp::MulAssign
+                        | AssignOp::DivAssign | AssignOp::Assign => unreachable!("outer match constrains to Mod|Shl|Shr|And|Xor|Or Assign"),
                     }
                 }
                 AssignOp::Assign => unreachable!(),

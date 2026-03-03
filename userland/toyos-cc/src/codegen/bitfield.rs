@@ -6,8 +6,8 @@ impl Codegen {
     pub(super) fn extract_bitfield(&self, ctx: &mut FuncCtx, val: Value, bit_offset: u32, bw: Option<u32>, field_ty: &CType) -> Value {
         let bw = match bw {
             Some(w) if w > 0 => w,
-            // None = not a bitfield, Some(0) = zero-width: no extraction needed
-            _ => return val,
+            None | Some(0) => return val,
+            Some(_) => unreachable!("w > 0 handled above"),
         };
         // Zero-extend storage unit to I64 first
         let val64 = self.coerce(ctx, val, I64);
@@ -42,14 +42,21 @@ impl Codegen {
                 let ptr_ty = self.expr_type(ctx, e);
                 let pointee = match ptr_ty {
                     CType::Pointer(inner) => *inner,
-                    // only Pointer has fields via Arrow; all other types → no storage type
-                    _ => return None,
+                    CType::Void | CType::Bool | CType::Char(_) | CType::Short(_) | CType::Int(_)
+                    | CType::Long(_) | CType::LongLong(_) | CType::Int128(_) | CType::Float
+                    | CType::Double | CType::LongDouble | CType::Array(..) | CType::Enum(_)
+                    | CType::Function(..) | CType::Struct(_) | CType::Union(_) => return None,
                 };
                 let pointee = self.resolve_incomplete_type(pointee);
                 pointee.field_offset(field).map(|fi| fi.ty)
             }
-            // only Member/Arrow have field storage types
-            _ => None,
+            Expr::IntLit(_) | Expr::UIntLit(_) | Expr::FloatLit(..) | Expr::CharLit(_)
+            | Expr::StringLit(_) | Expr::WideStringLit(_) | Expr::Ident(_)
+            | Expr::Binary(..) | Expr::Unary(..) | Expr::PostUnary(..) | Expr::Cast(..)
+            | Expr::Sizeof(_) | Expr::Alignof(_) | Expr::Conditional(..)
+            | Expr::Call(..) | Expr::Index(..) | Expr::Assign(..) | Expr::Comma(..)
+            | Expr::CompoundLiteral(..) | Expr::StmtExpr(_) | Expr::VaArg(..)
+            | Expr::Builtin(..) => None,
         }
     }
 
@@ -66,14 +73,21 @@ impl Codegen {
                 let ptr_ty = self.expr_type(ctx, e);
                 let pointee_ty = match ptr_ty {
                     CType::Pointer(inner) => *inner,
-                    // only Pointer has fields via Arrow; all other types → not a bitfield
-                    _ => return None,
+                    CType::Void | CType::Bool | CType::Char(_) | CType::Short(_) | CType::Int(_)
+                    | CType::Long(_) | CType::LongLong(_) | CType::Int128(_) | CType::Float
+                    | CType::Double | CType::LongDouble | CType::Array(..) | CType::Enum(_)
+                    | CType::Function(..) | CType::Struct(_) | CType::Union(_) => return None,
                 };
                 let pointee_ty = self.resolve_incomplete_type(pointee_ty);
                 pointee_ty.field_offset(field)?
             }
-            // only Member/Arrow can be bitfield accesses
-            _ => return None,
+            Expr::IntLit(_) | Expr::UIntLit(_) | Expr::FloatLit(..) | Expr::CharLit(_)
+            | Expr::StringLit(_) | Expr::WideStringLit(_) | Expr::Ident(_)
+            | Expr::Binary(..) | Expr::Unary(..) | Expr::PostUnary(..) | Expr::Cast(..)
+            | Expr::Sizeof(_) | Expr::Alignof(_) | Expr::Conditional(..)
+            | Expr::Call(..) | Expr::Index(..) | Expr::Assign(..) | Expr::Comma(..)
+            | Expr::CompoundLiteral(..) | Expr::StmtExpr(_) | Expr::VaArg(..)
+            | Expr::Builtin(..) => return None,
         };
         let bw = fi.bit_width.filter(|&w| w > 0)?;
         Some((fi.bit_offset, bw, fi.ty))

@@ -5,7 +5,10 @@ impl Codegen {
     fn elem_stride(ty: &CType) -> Option<i64> {
         match ty {
             CType::Pointer(inner) | CType::Array(inner, _) => Some(inner.size().max(1) as i64),
-            _ => None, // scalars/structs/functions have no element stride
+            CType::Void | CType::Bool | CType::Char(_) | CType::Short(_) | CType::Int(_)
+            | CType::Long(_) | CType::LongLong(_) | CType::Int128(_) | CType::Float
+            | CType::Double | CType::LongDouble | CType::Enum(_)
+            | CType::Function(..) | CType::Struct(_) | CType::Union(_) => None,
         }
     }
 
@@ -22,7 +25,13 @@ impl Codegen {
         match expr {
             Expr::Ident(name) => Some(name.clone()),
             Expr::Comma(_, rhs) => Self::extract_func_name(rhs),
-            _ => None, // all other Expr variants (Call, Binary, etc.) don't resolve to a function name
+            Expr::IntLit(_) | Expr::UIntLit(_) | Expr::FloatLit(..) | Expr::CharLit(_)
+            | Expr::StringLit(_) | Expr::WideStringLit(_) | Expr::Binary(..)
+            | Expr::Unary(..) | Expr::PostUnary(..) | Expr::Cast(..)
+            | Expr::Sizeof(_) | Expr::Alignof(_) | Expr::Conditional(..)
+            | Expr::Call(..) | Expr::Member(..) | Expr::Arrow(..) | Expr::Index(..)
+            | Expr::Assign(..) | Expr::CompoundLiteral(..) | Expr::StmtExpr(_)
+            | Expr::VaArg(..) | Expr::Builtin(..) => None,
         }
     }
 
@@ -165,7 +174,10 @@ impl Codegen {
             let (ptr, sign) = (*ptr, ty.signedness());
             return match ty {
                 CType::Struct(_) | CType::Union(_) | CType::Array(_, _) => TypedValue::unsigned(ptr),
-                _ => { // all scalar types: load value from pointer
+                CType::Void | CType::Bool | CType::Char(_) | CType::Short(_) | CType::Int(_)
+                | CType::Long(_) | CType::LongLong(_) | CType::Int128(_) | CType::Float
+                | CType::Double | CType::LongDouble | CType::Pointer(_) | CType::Enum(_)
+                | CType::Function(..) => {
                     let load_ty = self.clif_type(ty);
                     TypedValue::new(ctx.builder.ins().load(load_ty, MemFlags::new(), ptr, 0), sign)
                 }
@@ -491,11 +503,25 @@ impl Codegen {
             "__builtin_offsetof" => {
                 let type_name = match &args[0] {
                     Expr::Ident(n) => n.clone(),
-                    _ => panic!("__builtin_offsetof: expected type name"),
+                    Expr::IntLit(_) | Expr::UIntLit(_) | Expr::FloatLit(..) | Expr::CharLit(_)
+                    | Expr::StringLit(_) | Expr::WideStringLit(_) | Expr::Binary(..)
+                    | Expr::Unary(..) | Expr::PostUnary(..) | Expr::Cast(..)
+                    | Expr::Sizeof(_) | Expr::Alignof(_) | Expr::Conditional(..)
+                    | Expr::Call(..) | Expr::Member(..) | Expr::Arrow(..) | Expr::Index(..)
+                    | Expr::Assign(..) | Expr::Comma(..) | Expr::CompoundLiteral(..)
+                    | Expr::StmtExpr(_) | Expr::VaArg(..) | Expr::Builtin(..)
+                    => panic!("__builtin_offsetof: expected type name"),
                 };
                 let field_name = match &args[1] {
                     Expr::Ident(n) => n.clone(),
-                    _ => panic!("__builtin_offsetof: expected field name"),
+                    Expr::IntLit(_) | Expr::UIntLit(_) | Expr::FloatLit(..) | Expr::CharLit(_)
+                    | Expr::StringLit(_) | Expr::WideStringLit(_) | Expr::Binary(..)
+                    | Expr::Unary(..) | Expr::PostUnary(..) | Expr::Cast(..)
+                    | Expr::Sizeof(_) | Expr::Alignof(_) | Expr::Conditional(..)
+                    | Expr::Call(..) | Expr::Member(..) | Expr::Arrow(..) | Expr::Index(..)
+                    | Expr::Assign(..) | Expr::Comma(..) | Expr::CompoundLiteral(..)
+                    | Expr::StmtExpr(_) | Expr::VaArg(..) | Expr::Builtin(..)
+                    => panic!("__builtin_offsetof: expected field name"),
                 };
                 let ty = self.type_env.typedefs.get(&type_name)
                     .or_else(|| self.type_env.tags.get(&type_name))
@@ -514,14 +540,21 @@ impl Codegen {
                             .cloned()
                             .unwrap_or(ty)
                     }
-                    // non-empty structs/unions and all other types: already complete, use as-is
-                    _ => ty,
+                    CType::Struct(_) | CType::Union(_) | CType::Void | CType::Bool
+                    | CType::Char(_) | CType::Short(_) | CType::Int(_) | CType::Long(_)
+                    | CType::LongLong(_) | CType::Int128(_) | CType::Float | CType::Double
+                    | CType::LongDouble | CType::Pointer(_) | CType::Array(..)
+                    | CType::Function(..) | CType::Enum(_) => ty,
                 };
                 let fi = ty.field_offset(&field_name)
                     .unwrap_or_else(|| {
                         let field_names: Vec<_> = match &ty {
                             CType::Struct(def) => def.fields.iter().map(|f| f.name.clone().unwrap_or("<anon>".into())).collect(),
-                            _ => vec!["<not a struct>".into()], // error path: type name for panic message
+                            CType::Union(def) => def.fields.iter().map(|f| f.name.clone().unwrap_or("<anon>".into())).collect(),
+                            CType::Void | CType::Bool | CType::Char(_) | CType::Short(_)
+                            | CType::Int(_) | CType::Long(_) | CType::LongLong(_) | CType::Int128(_)
+                            | CType::Float | CType::Double | CType::LongDouble | CType::Pointer(_)
+                            | CType::Array(..) | CType::Function(..) | CType::Enum(_) => vec!["<not a struct>".into()],
                         };
                         panic!("__builtin_offsetof: no field '{field_name}' in '{type_name}' (type has {} fields: {:?})", field_names.len(), &field_names[..field_names.len().min(10)])
                     });

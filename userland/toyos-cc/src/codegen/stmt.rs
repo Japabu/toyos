@@ -112,8 +112,8 @@ impl Codegen {
                 Self::collect_addr_taken(s, out);
             }
             Statement::Return(Some(e)) => Self::collect_addr_taken_expr(e, out),
-            // Expr(None), Return(None), Break, Continue, Goto, Asm — no sub-expressions
-            _ => {}
+            Statement::Expr(None) | Statement::Return(None) | Statement::Break
+            | Statement::Continue | Statement::Goto(_) | Statement::Asm(_) => {}
         }
     }
 
@@ -169,8 +169,9 @@ impl Codegen {
                     }
                 }
             }
-            // Literals, Sizeof, Alignof, VaArg, Builtin — no meaningful sub-expressions for addr-taken
-            _ => {}
+            Expr::IntLit(_) | Expr::UIntLit(_) | Expr::FloatLit(..) | Expr::CharLit(_)
+            | Expr::StringLit(_) | Expr::WideStringLit(_) | Expr::Ident(_)
+            | Expr::Sizeof(_) | Expr::Alignof(_) | Expr::VaArg(..) | Expr::Builtin(..) => {}
         }
     }
 
@@ -218,7 +219,9 @@ impl Codegen {
                 Statement::Label(..) | Statement::Case(..) | Statement::CaseRange(..) | Statement::Default(..) | Statement::Compound(..) => {}
                 // Inside a switch, if/while/for/do may contain case labels
                 Statement::If(..) | Statement::While(..) | Statement::DoWhile(..) | Statement::For(..) if ctx.switch_val.is_some() => {}
-                _ => return,
+                Statement::Expr(_) | Statement::If(..) | Statement::While(..) | Statement::DoWhile(..)
+                | Statement::For(..) | Statement::Switch(..) | Statement::Break | Statement::Continue
+                | Statement::Return(_) | Statement::Goto(_) | Statement::Asm(_) => return,
             }
         }
 
@@ -265,7 +268,10 @@ impl Codegen {
                     BlockItem::Stmt(Statement::Label(..) | Statement::Case(..) | Statement::CaseRange(..) | Statement::Default(..) | Statement::Compound(..)) => {}
                     BlockItem::Stmt(Statement::If(..) | Statement::While(..) | Statement::DoWhile(..) | Statement::For(..)) if ctx.switch_val.is_some() => {}
                     BlockItem::Decl(_) => {}
-                    _ => continue,
+                    BlockItem::Stmt(Statement::Expr(_) | Statement::If(..) | Statement::While(..)
+                        | Statement::DoWhile(..) | Statement::For(..) | Statement::Switch(..)
+                        | Statement::Break | Statement::Continue | Statement::Return(_)
+                        | Statement::Goto(_) | Statement::Asm(_)) => continue,
                 }
             }
             match item {

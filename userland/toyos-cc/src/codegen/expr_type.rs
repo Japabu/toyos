@@ -84,9 +84,17 @@ impl Codegen {
                     CType::Function(ret, _, _) => ret.as_ref().clone(),
                     CType::Pointer(inner) => match inner.as_ref() {
                         CType::Function(ret, _, _) => ret.as_ref().clone(),
-                        _ => panic!("call through non-function pointer: {callee_ty:?}"),
+                        CType::Void | CType::Bool | CType::Char(_) | CType::Short(_) | CType::Int(_)
+                        | CType::Long(_) | CType::LongLong(_) | CType::Int128(_) | CType::Float
+                        | CType::Double | CType::LongDouble | CType::Pointer(_) | CType::Array(..)
+                        | CType::Enum(_) | CType::Struct(_) | CType::Union(_)
+                        => panic!("call through non-function pointer: {callee_ty:?}"),
                     },
-                    _ => panic!("call on non-function type: {callee_ty:?}"),
+                    CType::Void | CType::Bool | CType::Char(_) | CType::Short(_) | CType::Int(_)
+                    | CType::Long(_) | CType::LongLong(_) | CType::Int128(_) | CType::Float
+                    | CType::Double | CType::LongDouble | CType::Array(..) | CType::Enum(_)
+                    | CType::Struct(_) | CType::Union(_)
+                    => panic!("call on non-function type: {callee_ty:?}"),
                 }
             }
             Expr::Cast(type_name, _) => self.resolve_typename(type_name),
@@ -120,11 +128,17 @@ impl Codegen {
                 // Function types decay to function pointers in ternary context
                 let l = match &tt {
                     CType::Function(..) => CType::Pointer(Box::new(tt)),
-                    _ => tt, // all non-function types pass through unchanged
+                    CType::Void | CType::Bool | CType::Char(_) | CType::Short(_) | CType::Int(_)
+                    | CType::Long(_) | CType::LongLong(_) | CType::Int128(_) | CType::Float
+                    | CType::Double | CType::LongDouble | CType::Pointer(_) | CType::Array(..)
+                    | CType::Struct(_) | CType::Union(_) | CType::Enum(_) => tt,
                 };
                 let r = match &ft {
                     CType::Function(..) => CType::Pointer(Box::new(ft)),
-                    _ => ft, // all non-function types pass through unchanged
+                    CType::Void | CType::Bool | CType::Char(_) | CType::Short(_) | CType::Int(_)
+                    | CType::Long(_) | CType::LongLong(_) | CType::Int128(_) | CType::Float
+                    | CType::Double | CType::LongDouble | CType::Pointer(_) | CType::Array(..)
+                    | CType::Struct(_) | CType::Union(_) | CType::Enum(_) => ft,
                 };
                 if let (CType::Pointer(ref li), CType::Pointer(_)) = (&l, &r) {
                     return if matches!(**li, CType::Void) { r } else { l };
@@ -160,8 +174,8 @@ impl Codegen {
                     let val = crate::ast::eval_const_expr(&args[0], Some(&self.type_env.enum_constants));
                     match val {
                         Some(v) if v != 0 => self.expr_type(ctx, &args[1]),
-                        // zero or non-constant: use the false branch
-                        _ => self.expr_type(ctx, &args[2]),
+                        Some(0) | None => self.expr_type(ctx, &args[2]),
+                        Some(_) => unreachable!("v != 0 handled above"),
                     }
                 }
                 "__builtin_unreachable" => CType::Void,

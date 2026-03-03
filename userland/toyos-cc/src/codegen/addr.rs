@@ -102,8 +102,12 @@ impl Codegen {
                 ctx.builder.seal_block(merge);
                 return ctx.builder.block_params(merge)[0];
             }
-            // all other Expr variants (Call, Binary, Cast, etc.) — no direct address, spill to stack
-            _ => {
+            Expr::IntLit(_) | Expr::UIntLit(_) | Expr::FloatLit(..) | Expr::CharLit(_)
+            | Expr::StringLit(_) | Expr::WideStringLit(_) | Expr::Binary(..)
+            | Expr::PostUnary(..) | Expr::Cast(..) | Expr::Sizeof(_) | Expr::Alignof(_)
+            | Expr::Call(..) | Expr::Assign(..) | Expr::Comma(..)
+            | Expr::CompoundLiteral(..) | Expr::StmtExpr(_) | Expr::VaArg(..)
+            | Expr::Builtin(..) | Expr::Unary(..) => {
                 // For struct/union-typed expressions, compile_expr already returns an address
                 let ty = self.expr_type(ctx, expr);
                 if matches!(ty, CType::Struct(_) | CType::Union(_)) {

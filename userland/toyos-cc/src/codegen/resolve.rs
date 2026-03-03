@@ -5,8 +5,111 @@ impl Codegen {
         if let Some(v) = crate::ast::eval_const_expr(expr, Some(&self.type_env.enum_constants)) {
             return Some(v);
         }
+        // sizeof in constant expressions
+        if let Some(v) = self.eval_const_with_sizeof(expr) {
+            return Some(v);
+        }
         // offsetof pattern: (type)&((StructType*)0)->field
         self.eval_offsetof(expr)
+    }
+
+    /// Evaluate constant expressions that may contain sizeof.
+    fn eval_const_with_sizeof(&self, expr: &Expr) -> Option<i64> {
+        match expr {
+            Expr::Sizeof(arg) => {
+                let size = match arg.as_ref() {
+                    SizeofArg::Type(tn) => self.resolve_typename_const(tn)?.size(),
+                    SizeofArg::Expr(e) => self.const_expr_type(e)?.size(),
+                };
+                Some(size as i64)
+            }
+            Expr::Cast(_, e) => self.eval_const_with_sizeof(e),
+            Expr::Unary(UnaryOp::Neg, e) => self.eval_const_with_sizeof(e).map(|v| -v),
+            Expr::Unary(UnaryOp::BitNot, e) => self.eval_const_with_sizeof(e).map(|v| !v),
+            Expr::Binary(op, l, r) => {
+                let l = self.eval_const(l)?;
+                let r = self.eval_const(r)?;
+                Some(match op {
+                    BinOp::Add => l + r,
+                    BinOp::Sub => l - r,
+                    BinOp::Mul => l * r,
+                    BinOp::Div => if r != 0 { l / r } else { 0 },
+                    BinOp::Mod => if r != 0 { l % r } else { 0 },
+                    BinOp::Shl => l << r,
+                    BinOp::Shr => l >> r,
+                    BinOp::BitAnd => l & r,
+                    BinOp::BitOr => l | r,
+                    BinOp::BitXor => l ^ r,
+                    BinOp::Eq => (l == r) as i64,
+                    BinOp::Ne => (l != r) as i64,
+                    BinOp::Lt => (l < r) as i64,
+                    BinOp::Gt => (l > r) as i64,
+                    BinOp::Le => (l <= r) as i64,
+                    BinOp::Ge => (l >= r) as i64,
+                    BinOp::LogAnd => ((l != 0) && (r != 0)) as i64,
+                    BinOp::LogOr => ((l != 0) || (r != 0)) as i64,
+                })
+            }
+            Expr::IntLit(_) | Expr::UIntLit(_) | Expr::FloatLit(..) | Expr::CharLit(_)
+            | Expr::StringLit(_) | Expr::WideStringLit(_) | Expr::Ident(_)
+            | Expr::Unary(UnaryOp::Deref | UnaryOp::AddrOf | UnaryOp::LogNot | UnaryOp::PreInc | UnaryOp::PreDec, _)
+            | Expr::PostUnary(..) | Expr::Alignof(_) | Expr::Conditional(..)
+            | Expr::Call(..) | Expr::Member(..) | Expr::Arrow(..) | Expr::Index(..)
+            | Expr::Assign(..) | Expr::Comma(..) | Expr::CompoundLiteral(..)
+            | Expr::StmtExpr(_) | Expr::VaArg(..) | Expr::Builtin(..) => None,
+        }
+    }
+
+    /// Get the type of a constant expression (for sizeof(expr)).
+    fn const_expr_type(&self, expr: &Expr) -> Option<CType> {
+        match expr {
+            Expr::StringLit(data) => Some(CType::Array(
+                Box::new(CType::Char(Signedness::Signed)),
+                Some(data.len() + 1),
+            )),
+            Expr::IntLit(_) | Expr::CharLit(_) => Some(CType::Int(Signedness::Signed)),
+            Expr::UIntLit(_) => Some(CType::Long(Signedness::Unsigned)),
+            Expr::FloatLit(_, is_f32) => {
+                if *is_f32 { Some(CType::Float) } else { Some(CType::Double) }
+            }
+            Expr::Ident(name) => self.global_types.get(name).cloned(),
+            Expr::Unary(UnaryOp::Deref, e) => {
+                let ty = self.const_expr_type(e)?;
+                match ty {
+                    CType::Pointer(inner) | CType::Array(inner, _) => Some(*inner),
+                    CType::Void | CType::Bool | CType::Char(_) | CType::Short(_) | CType::Int(_)
+                    | CType::Long(_) | CType::LongLong(_) | CType::Int128(_) | CType::Float
+                    | CType::Double | CType::LongDouble | CType::Enum(_)
+                    | CType::Function(..) | CType::Struct(_) | CType::Union(_) => None,
+                }
+            }
+            Expr::Index(base, _) => {
+                let ty = self.const_expr_type(base)?;
+                match ty {
+                    CType::Array(inner, _) | CType::Pointer(inner) => Some(*inner),
+                    CType::Void | CType::Bool | CType::Char(_) | CType::Short(_) | CType::Int(_)
+                    | CType::Long(_) | CType::LongLong(_) | CType::Int128(_) | CType::Float
+                    | CType::Double | CType::LongDouble | CType::Enum(_)
+                    | CType::Function(..) | CType::Struct(_) | CType::Union(_) => None,
+                }
+            }
+            Expr::Member(base, field) | Expr::Arrow(base, field) => {
+                let ty = if matches!(expr, Expr::Arrow(..)) {
+                    match self.const_expr_type(base)? {
+                        CType::Pointer(inner) => *inner,
+                        t => t,
+                    }
+                } else {
+                    self.const_expr_type(base)?
+                };
+                ty.field_offset(field).map(|fi| fi.ty)
+            }
+            Expr::WideStringLit(_) | Expr::Binary(..) | Expr::Unary(..) | Expr::PostUnary(..)
+            | Expr::Cast(..) | Expr::Sizeof(_) | Expr::Alignof(_) | Expr::Conditional(..)
+            | Expr::Call(..) | Expr::Assign(..) | Expr::Comma(..)
+            | Expr::CompoundLiteral(..) | Expr::StmtExpr(_) | Expr::VaArg(..)
+            | Expr::Builtin(..) => None,
+        }
     }
 
     /// Evaluate the classic offsetof pattern: `&((StructType*)0)->field`
@@ -15,7 +118,14 @@ impl Codegen {
         match expr {
             Expr::Cast(_, inner) => self.eval_offsetof(inner),
             Expr::Unary(UnaryOp::AddrOf, inner) => self.eval_member_offset(inner),
-            _ => None,
+            Expr::IntLit(_) | Expr::UIntLit(_) | Expr::FloatLit(..) | Expr::CharLit(_)
+            | Expr::StringLit(_) | Expr::WideStringLit(_) | Expr::Ident(_)
+            | Expr::Binary(..) | Expr::Unary(UnaryOp::Neg | UnaryOp::BitNot | UnaryOp::LogNot
+                | UnaryOp::Deref | UnaryOp::PreInc | UnaryOp::PreDec, _)
+            | Expr::PostUnary(..) | Expr::Sizeof(_) | Expr::Alignof(_) | Expr::Conditional(..)
+            | Expr::Call(..) | Expr::Member(..) | Expr::Arrow(..) | Expr::Index(..)
+            | Expr::Assign(..) | Expr::Comma(..) | Expr::CompoundLiteral(..)
+            | Expr::StmtExpr(_) | Expr::VaArg(..) | Expr::Builtin(..) => None,
         }
     }
 
@@ -35,7 +145,13 @@ impl Codegen {
                 let fi = base_ty.field_offset(field)?;
                 Some((base_offset + fi.byte_offset) as i64)
             }
-            _ => None,
+            Expr::IntLit(_) | Expr::UIntLit(_) | Expr::FloatLit(..) | Expr::CharLit(_)
+            | Expr::StringLit(_) | Expr::WideStringLit(_) | Expr::Ident(_)
+            | Expr::Binary(..) | Expr::Unary(..) | Expr::PostUnary(..) | Expr::Cast(..)
+            | Expr::Sizeof(_) | Expr::Alignof(_) | Expr::Conditional(..)
+            | Expr::Call(..) | Expr::Index(..) | Expr::Assign(..) | Expr::Comma(..)
+            | Expr::CompoundLiteral(..) | Expr::StmtExpr(_) | Expr::VaArg(..)
+            | Expr::Builtin(..) => None,
         }
     }
 
@@ -52,7 +168,13 @@ impl Codegen {
                 let fi = base_ty.field_offset(field)?;
                 Some((base_offset + fi.byte_offset, fi.ty))
             }
-            _ => None,
+            Expr::IntLit(_) | Expr::UIntLit(_) | Expr::FloatLit(..) | Expr::CharLit(_)
+            | Expr::StringLit(_) | Expr::WideStringLit(_) | Expr::Ident(_)
+            | Expr::Binary(..) | Expr::Unary(..) | Expr::PostUnary(..) | Expr::Cast(..)
+            | Expr::Sizeof(_) | Expr::Alignof(_) | Expr::Conditional(..)
+            | Expr::Call(..) | Expr::Index(..) | Expr::Assign(..) | Expr::Comma(..)
+            | Expr::CompoundLiteral(..) | Expr::StmtExpr(_) | Expr::VaArg(..)
+            | Expr::Builtin(..) => None,
         }
     }
 
@@ -262,7 +384,10 @@ impl Codegen {
                 let resolved = self.resolve_incomplete_type(*inner);
                 CType::Pointer(Box::new(resolved))
             }
-            _ => ty,
+            CType::Void | CType::Bool | CType::Char(_) | CType::Short(_) | CType::Int(_)
+            | CType::Long(_) | CType::LongLong(_) | CType::Int128(_) | CType::Float
+            | CType::Double | CType::LongDouble | CType::Array(..) | CType::Function(..)
+            | CType::Enum(_) | CType::Struct(_) | CType::Union(_) => ty,
         }
     }
 
@@ -383,7 +508,8 @@ impl Codegen {
                         let inner_decl = inner_decl.clone();
                         self.apply_declarator(&arr_type, &inner_decl)
                     }
-                    _ => {
+                    DirectDeclarator::Ident(_) | DirectDeclarator::Array(..)
+                    | DirectDeclarator::Function(..) => {
                         let elem = self.apply_direct_declarator(base, inner);
                         CType::Array(Box::new(elem), n)
                     }
@@ -412,7 +538,8 @@ impl Codegen {
                         let inner_decl = inner_decl.clone();
                         self.apply_declarator(&func_type, &inner_decl)
                     }
-                    _ => {
+                    DirectDeclarator::Ident(_) | DirectDeclarator::Array(..)
+                    | DirectDeclarator::Function(..) => {
                         let ret = self.apply_direct_declarator(base, inner);
                         CType::Function(Box::new(ret), param_types, params_clone.variadic)
                     }
@@ -520,10 +647,20 @@ impl Codegen {
                 let ty = self.expr_type_for_typeof(e);
                 match ty {
                     CType::Pointer(inner) => *inner,
-                    _ => panic!("typeof: deref of non-pointer type {ty:?}"),
+                    CType::Void | CType::Bool | CType::Char(_) | CType::Short(_) | CType::Int(_)
+                    | CType::Long(_) | CType::LongLong(_) | CType::Int128(_) | CType::Float
+                    | CType::Double | CType::LongDouble | CType::Array(..) | CType::Enum(_)
+                    | CType::Function(..) | CType::Struct(_) | CType::Union(_)
+                    => panic!("typeof: deref of non-pointer type {ty:?}"),
                 }
             }
-            _ => panic!("typeof: unhandled expression {expr:?}"),
+            Expr::Binary(..) | Expr::PostUnary(..) | Expr::Cast(..) | Expr::Sizeof(_)
+            | Expr::Alignof(_) | Expr::Conditional(..) | Expr::Call(..) | Expr::Member(..)
+            | Expr::Arrow(..) | Expr::Index(..) | Expr::Assign(..) | Expr::Comma(..)
+            | Expr::CompoundLiteral(..) | Expr::StmtExpr(_) | Expr::VaArg(..)
+            | Expr::Builtin(..) | Expr::CharLit(_)
+            | Expr::Unary(UnaryOp::Neg | UnaryOp::BitNot | UnaryOp::LogNot | UnaryOp::AddrOf | UnaryOp::PreInc | UnaryOp::PreDec, _)
+            => panic!("typeof: unhandled expression {expr:?}"),
         }
     }
 }
