@@ -268,25 +268,6 @@ fn collect_object(
             continue;
         }
 
-        match section.kind() {
-            read::SectionKind::Text
-            | read::SectionKind::Data
-            | read::SectionKind::ReadOnlyData
-            | read::SectionKind::ReadOnlyDataWithRel
-            | read::SectionKind::ReadOnlyString
-            | read::SectionKind::UninitializedData
-            | read::SectionKind::OtherString
-            | read::SectionKind::Tls
-            | read::SectionKind::UninitializedTls => {}
-            read::SectionKind::Elf(elf::SHT_INIT_ARRAY)
-            | read::SectionKind::Elf(elf::SHT_FINI_ARRAY) => {}
-            _ => continue,
-        }
-
-        let sec_data = section.data().unwrap_or(&[]).to_vec();
-        let global_idx = SectionIdx(state.sections.len());
-        sec_map.insert((obj_idx, section.index()), global_idx);
-
         let kind = match section.kind() {
             read::SectionKind::Text => SectionKind::Code,
             read::SectionKind::Data => SectionKind::Data,
@@ -299,8 +280,12 @@ fn collect_object(
             read::SectionKind::UninitializedTls => SectionKind::TlsBss,
             read::SectionKind::Elf(elf::SHT_INIT_ARRAY) => SectionKind::InitArray,
             read::SectionKind::Elf(elf::SHT_FINI_ARRAY) => SectionKind::FiniArray,
-            _ => unreachable!("filtered above"),
+            _ => continue,
         };
+
+        let sec_data = section.data().unwrap_or(&[]).to_vec();
+        let global_idx = SectionIdx(state.sections.len());
+        sec_map.insert((obj_idx, section.index()), global_idx);
 
         // Extract ELF merge/strings flags
         let (merge, strings, entsize) = match section.flags() {
@@ -393,22 +378,12 @@ fn collect_object(
     }
 
     for section in obj.sections() {
-        match section.kind() {
-            read::SectionKind::Text
-            | read::SectionKind::Data
-            | read::SectionKind::ReadOnlyData
-            | read::SectionKind::ReadOnlyDataWithRel
-            | read::SectionKind::ReadOnlyString
-            | read::SectionKind::OtherString
-            | read::SectionKind::Tls
-            | read::SectionKind::Elf(elf::SHT_INIT_ARRAY)
-            | read::SectionKind::Elf(elf::SHT_FINI_ARRAY) => {}
-            _ => continue,
-        }
         let global_sec = match sec_map.get(&(obj_idx, section.index())) {
             Some(&g) => g,
             None => continue,
         };
+        // BSS sections have no data to relocate
+        if state.sections[global_sec].kind.is_nobits() { continue; }
 
         for (offset, reloc) in section.relocations() {
             let sym_name = match resolve_reloc_target(obj, &reloc, obj_idx, sec_map, state) {
