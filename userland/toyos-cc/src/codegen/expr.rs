@@ -482,12 +482,10 @@ impl Codegen {
         )
     }
 
-    fn compile_member(&mut self, ctx: &mut FuncCtx, e: &Expr, field: &str) -> TypedValue {
-        let base = self.compile_addr(ctx, e);
-        let base_ty = self.expr_type(ctx, e);
-        let base_ty = self.resolve_incomplete_type(base_ty);
-        let fi = base_ty.field_offset(field)
-            .unwrap_or_else(|| panic!("no field '{field}' in {base_ty:?}"));
+    /// Shared field access: load a field value from a base address given the struct type.
+    fn compile_field_access(&mut self, ctx: &mut FuncCtx, base: Value, struct_ty: &CType, field: &str) -> TypedValue {
+        let fi = struct_ty.field_offset(field)
+            .unwrap_or_else(|| panic!("no field '{field}' in {struct_ty:?}"));
         if matches!(fi.ty, CType::Struct(_) | CType::Union(_) | CType::Array(..)) {
             if fi.byte_offset != 0 {
                 return TypedValue::unsigned(ctx.builder.ins().iadd_imm(base, fi.byte_offset as i64));
@@ -500,6 +498,24 @@ impl Codegen {
         TypedValue::new(self.extract_bitfield(ctx, val, fi.bit_offset, fi.bit_width, &fi.ty), sign)
     }
 
+    /// Shared field address: compute the address of a field within a struct at base.
+    fn compile_field_addr(&mut self, ctx: &mut FuncCtx, base: Value, struct_ty: &CType, field: &str) -> Value {
+        let fi = struct_ty.field_offset(field)
+            .unwrap_or_else(|| panic!("compile_addr: no field '{field}' in {struct_ty:?}"));
+        if fi.byte_offset != 0 {
+            ctx.builder.ins().iadd_imm(base, fi.byte_offset as i64)
+        } else {
+            base
+        }
+    }
+
+    fn compile_member(&mut self, ctx: &mut FuncCtx, e: &Expr, field: &str) -> TypedValue {
+        let base = self.compile_addr(ctx, e);
+        let base_ty = self.expr_type(ctx, e);
+        let base_ty = self.resolve_incomplete_type(base_ty);
+        self.compile_field_access(ctx, base, &base_ty, field)
+    }
+
     fn compile_arrow(&mut self, ctx: &mut FuncCtx, e: &Expr, field: &str) -> TypedValue {
         let ptr = self.compile_expr(ctx, e).raw();
         let ptr_ty = self.expr_type(ctx, e);
@@ -508,18 +524,7 @@ impl Codegen {
             other => panic!("arrow '->{field}' on non-pointer type {other:?}"),
         };
         let pointee_ty = self.resolve_incomplete_type(pointee_ty);
-        let fi = pointee_ty.field_offset(field)
-            .unwrap_or_else(|| panic!("no field '{field}' in {pointee_ty:?}"));
-        if matches!(fi.ty, CType::Struct(_) | CType::Union(_) | CType::Array(..)) {
-            if fi.byte_offset != 0 {
-                return TypedValue::unsigned(ctx.builder.ins().iadd_imm(ptr, fi.byte_offset as i64));
-            }
-            return TypedValue::unsigned(ptr);
-        }
-        let sign = fi.ty.signedness();
-        let load_ty = self.clif_type(&fi.ty);
-        let val = ctx.builder.ins().load(load_ty, MemFlags::new(), ptr, fi.byte_offset as i32);
-        TypedValue::new(self.extract_bitfield(ctx, val, fi.bit_offset, fi.bit_width, &fi.ty), sign)
+        self.compile_field_access(ctx, ptr, &pointee_ty, field)
     }
 
     fn compile_stmt_expr(&mut self, ctx: &mut FuncCtx, items: &[BlockItem]) -> TypedValue {
@@ -1410,13 +1415,7 @@ impl Codegen {
                 let base = self.compile_addr(ctx, e);
                 let base_ty = self.expr_type(ctx, e);
                 let base_ty = self.resolve_incomplete_type(base_ty);
-                let fi = base_ty.field_offset(field)
-                    .unwrap_or_else(|| panic!("compile_addr: no field '{field}' in {base_ty:?}"));
-                if fi.byte_offset != 0 {
-                    ctx.builder.ins().iadd_imm(base, fi.byte_offset as i64)
-                } else {
-                    base
-                }
+                self.compile_field_addr(ctx, base, &base_ty, field)
             }
             Expr::Arrow(e, field) => {
                 let ptr = self.compile_expr(ctx, e).raw();
@@ -1426,13 +1425,7 @@ impl Codegen {
                     other => panic!("compile_addr: arrow '->{field}' on non-pointer type {other:?}"),
                 };
                 let pointee_ty = self.resolve_incomplete_type(pointee_ty);
-                let fi = pointee_ty.field_offset(field)
-                    .unwrap_or_else(|| panic!("compile_addr: no field '{field}' in {pointee_ty:?}"));
-                if fi.byte_offset != 0 {
-                    ctx.builder.ins().iadd_imm(ptr, fi.byte_offset as i64)
-                } else {
-                    ptr
-                }
+                self.compile_field_addr(ctx, ptr, &pointee_ty, field)
             }
             Expr::Conditional(cond, then, else_) => {
                 // For ternary with struct result, we need to produce an address.
