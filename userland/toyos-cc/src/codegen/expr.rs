@@ -1100,10 +1100,9 @@ impl Codegen {
             };
             sig.params.push(AbiParam::new(clif_ty));
         }
-        if is_variadic {
-            for _ in arg_vals.iter().skip(param_ctypes.len()) {
-                sig.params.push(AbiParam::new(I64));
-            }
+        // Add params for extra args: variadic or C's unspecified-param `()` syntax
+        for _ in arg_vals.iter().skip(param_ctypes.len()) {
+            sig.params.push(AbiParam::new(I64));
         }
         if !is_sret {
             if !matches!(&ret_cty, CType::Void) {

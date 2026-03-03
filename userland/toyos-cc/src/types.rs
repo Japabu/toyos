@@ -101,10 +101,11 @@ impl CType {
     pub fn signedness(&self) -> Signedness {
         use Signedness::*;
         match self {
-            CType::Bool | CType::Pointer(_) => Unsigned,
+            CType::Bool | CType::Pointer(_) | CType::Enum(_) => Unsigned,
             CType::Char(s) | CType::Short(s) | CType::Int(s)
             | CType::Long(s) | CType::LongLong(s) | CType::Int128(s) => *s,
-            _ => Signed, // floats, void, aggregates
+            CType::Void | CType::Float | CType::Double | CType::LongDouble
+            | CType::Array(..) | CType::Function(..) | CType::Struct(_) | CType::Union(_) => Signed,
         }
     }
 
