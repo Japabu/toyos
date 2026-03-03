@@ -1,15 +1,33 @@
 use std::collections::HashMap;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Signedness {
+    Signed,
+    Unsigned,
+}
+
+impl Signedness {
+    pub fn is_unsigned(self) -> bool { self == Signedness::Unsigned }
+    pub fn is_signed(self) -> bool { self == Signedness::Signed }
+}
+
+impl From<bool> for Signedness {
+    /// Convert from the old convention: `true` = signed, `false` = unsigned.
+    fn from(signed: bool) -> Self {
+        if signed { Signedness::Signed } else { Signedness::Unsigned }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum CType {
     Void,
     Bool,
-    Char(bool),       // signed
-    Short(bool),      // signed
-    Int(bool),        // signed
-    Long(bool),       // signed
-    LongLong(bool),   // signed
-    Int128(bool),     // signed
+    Char(Signedness),
+    Short(Signedness),
+    Int(Signedness),
+    Long(Signedness),
+    LongLong(Signedness),
+    Int128(Signedness),
     Float,
     Double,
     LongDouble,
@@ -80,15 +98,19 @@ impl CType {
         }
     }
 
-    pub fn is_unsigned(&self) -> bool {
+    pub fn signedness(&self) -> Signedness {
+        use Signedness::*;
         match self {
-            CType::Bool => true,
-            CType::Char(signed) | CType::Short(signed) | CType::Int(signed)
-            | CType::Long(signed) | CType::LongLong(signed) | CType::Int128(signed) => !signed,
-            CType::Pointer(_) => true,
-            _ => false,
+            CType::Bool | CType::Pointer(_) => Unsigned,
+            CType::Char(s) | CType::Short(s) | CType::Int(s)
+            | CType::Long(s) | CType::LongLong(s) | CType::Int128(s) => *s,
+            _ => Signed, // floats, void, aggregates
         }
     }
+
+    pub fn is_unsigned(&self) -> bool { self.signedness().is_unsigned() }
+
+    pub fn is_signed(&self) -> bool { self.signedness().is_signed() }
 
     pub fn is_float(&self) -> bool {
         matches!(self, CType::Float | CType::Double | CType::LongDouble)
@@ -96,15 +118,6 @@ impl CType {
 
     pub fn is_pointer(&self) -> bool {
         matches!(self, CType::Pointer(_))
-    }
-
-    pub fn is_signed(&self) -> bool {
-        match self {
-            CType::Char(s) | CType::Short(s) | CType::Int(s)
-            | CType::Long(s) | CType::LongLong(s) | CType::Int128(s) => *s,
-            CType::Float | CType::Double | CType::LongDouble => true,
-            _ => false,
-        }
     }
 
     fn struct_size(&self, def: &StructDef) -> usize {
@@ -271,13 +284,13 @@ impl CType {
         if let Some(w) = bit_width {
             // Bitfield promotion: width determines result type
             if w == 0 { return ty; }
-            if w < 32 { return CType::Int(true); }  // fits in int
-            if w == 32 { return CType::Int(false); } // unsigned int
+            if w < 32 { return CType::Int(Signedness::Signed); }  // fits in int
+            if w == 32 { return CType::Int(Signedness::Unsigned); } // unsigned int
             return ty; // > 32 bits: keep original type
         }
         // Non-bitfield integer promotion: small types promote to int
         match ty {
-            CType::Char(_) | CType::Short(_) | CType::Bool => CType::Int(true),
+            CType::Char(_) | CType::Short(_) | CType::Bool => CType::Int(Signedness::Signed),
             _ => ty,
         }
     }
@@ -295,8 +308,8 @@ impl CType {
     /// Integer promotion (C99 6.3.1.1)
     pub fn promote(&self) -> CType {
         match self {
-            CType::Bool | CType::Char(_) | CType::Short(_) => CType::Int(true),
-            CType::Enum(_) => CType::Int(true),
+            CType::Bool | CType::Char(_) | CType::Short(_) => CType::Int(Signedness::Signed),
+            CType::Enum(_) => CType::Int(Signedness::Signed),
             other => other.clone(),
         }
     }
@@ -336,7 +349,7 @@ impl TypeEnv {
         };
         // Compiler builtins — no header provides these
         env.typedefs.insert("__builtin_va_list".into(), CType::Pointer(Box::new(CType::Void)));
-        env.typedefs.insert("__uint128_t".into(), CType::Int128(false));
+        env.typedefs.insert("__uint128_t".into(), CType::Int128(Signedness::Unsigned));
         env
     }
 

@@ -1451,20 +1451,20 @@ impl Codegen {
                 Some(self.resolve_typename(type_name))
             }
             Expr::PostUnary(_, e) => self.expr_type(ctx, e),
-            Expr::Unary(UnaryOp::LogNot, _) => Some(CType::Int(true)),
+            Expr::Unary(UnaryOp::LogNot, _) => Some(CType::Int(Signedness::Signed)),
             Expr::Unary(UnaryOp::PreInc | UnaryOp::PreDec | UnaryOp::Neg | UnaryOp::BitNot, e) => {
                 self.expr_type(ctx, e)
             }
-            Expr::Sizeof(_) | Expr::Alignof(_) => Some(CType::Long(false)),
-            Expr::StringLit(_) => Some(CType::Pointer(Box::new(CType::Char(true)))),
-            Expr::WideStringLit(_) => Some(CType::Pointer(Box::new(CType::Int(true)))),
-            Expr::IntLit(_) | Expr::CharLit(_) => Some(CType::Int(true)),
-            Expr::UIntLit(_) => Some(CType::Long(false)),
+            Expr::Sizeof(_) | Expr::Alignof(_) => Some(CType::Long(Signedness::Unsigned)),
+            Expr::StringLit(_) => Some(CType::Pointer(Box::new(CType::Char(Signedness::Signed)))),
+            Expr::WideStringLit(_) => Some(CType::Pointer(Box::new(CType::Int(Signedness::Signed)))),
+            Expr::IntLit(_) | Expr::CharLit(_) => Some(CType::Int(Signedness::Signed)),
+            Expr::UIntLit(_) => Some(CType::Long(Signedness::Unsigned)),
             Expr::FloatLit(_, is_f32) => Some(if *is_f32 { CType::Float } else { CType::Double }),
             Expr::Binary(op, l, r) => {
                 match op {
                     BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge
-                    | BinOp::LogAnd | BinOp::LogOr => Some(CType::Int(true)),
+                    | BinOp::LogAnd | BinOp::LogOr => Some(CType::Int(Signedness::Signed)),
                     // Shifts: result type is promoted left operand (C99 6.5.7)
                     BinOp::Shl | BinOp::Shr => {
                         self.expr_type(ctx, l).map(|t| t.promote())

@@ -9,7 +9,7 @@ use cranelift_object::ObjectModule;
 use target_lexicon::Architecture;
 
 use crate::ast::*;
-use crate::types::{CType, FieldDef, StructDef, TypeEnv, ParamType, EnumDef};
+use crate::types::{CType, FieldDef, StructDef, TypeEnv, ParamType, EnumDef, Signedness};
 
 mod resolve;
 mod expr;

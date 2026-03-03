@@ -83,8 +83,8 @@ impl Codegen {
     }
 
     fn resolve_type_const(&self, specifiers: &[DeclSpecifier]) -> Option<CType> {
-        let mut is_signed = None;
-        let mut is_unsigned = false;
+        use Signedness::*;
+        let mut explicit_sign: Option<Signedness> = None;
         let mut base = None;
         let mut long_count = 0u8;
         let mut is_short = false;
@@ -92,16 +92,16 @@ impl Codegen {
             if let DeclSpecifier::TypeSpec(ts) = spec {
                 match ts {
                     TypeSpec::Void => base = Some(CType::Void),
-                    TypeSpec::Char => base = Some(CType::Char(true)),
+                    TypeSpec::Char => base = Some(CType::Char(Signed)),
                     TypeSpec::Short => is_short = true,
-                    TypeSpec::Int => { if base.is_none() { base = Some(CType::Int(true)); } }
+                    TypeSpec::Int => { if base.is_none() { base = Some(CType::Int(Signed)); } }
                     TypeSpec::Long => long_count += 1,
                     TypeSpec::Float => base = Some(CType::Float),
                     TypeSpec::Double => base = Some(CType::Double),
-                    TypeSpec::Signed => is_signed = Some(true),
-                    TypeSpec::Unsigned => { is_unsigned = true; is_signed = Some(false); }
+                    TypeSpec::Signed => explicit_sign = Some(Signed),
+                    TypeSpec::Unsigned => explicit_sign = Some(Unsigned),
                     TypeSpec::Bool => base = Some(CType::Bool),
-                    TypeSpec::Int128 => base = Some(CType::Int128(true)),
+                    TypeSpec::Int128 => base = Some(CType::Int128(Signed)),
                     TypeSpec::TypedefName(name) => {
                         base = Some(self.type_env.typedefs.get(name)?.clone());
                     }
@@ -129,24 +129,19 @@ impl Codegen {
                 }
             }
         }
-        // When an explicit signed/unsigned keyword is present, use it.
-        // Otherwise preserve the signedness from a typedef base type.
-        if is_short { return Some(CType::Short(is_signed.unwrap_or(true))); }
-        if long_count >= 2 { return Some(CType::LongLong(is_signed.unwrap_or(true))); }
+        let sign = |default| explicit_sign.unwrap_or(default);
+        if is_short { return Some(CType::Short(sign(Signed))); }
+        if long_count >= 2 { return Some(CType::LongLong(sign(Signed))); }
         if long_count == 1 {
             if matches!(base, Some(CType::Double)) { return Some(CType::LongDouble); }
-            return Some(CType::Long(is_signed.unwrap_or(true)));
+            return Some(CType::Long(sign(Signed)));
         }
         match base {
-            Some(CType::Char(s)) => Some(CType::Char(is_signed.unwrap_or(s))),
-            Some(CType::Int(s)) => Some(CType::Int(is_signed.unwrap_or(s))),
-            Some(CType::Int128(s)) => Some(CType::Int128(is_signed.unwrap_or(s))),
+            Some(CType::Char(s)) => Some(CType::Char(sign(s))),
+            Some(CType::Int(s)) => Some(CType::Int(sign(s))),
+            Some(CType::Int128(s)) => Some(CType::Int128(sign(s))),
             Some(other) => Some(other),
-            None => {
-                if is_unsigned { Some(CType::Int(false)) }
-                else if is_signed.is_some() { Some(CType::Int(true)) }
-                else { Some(CType::Int(true)) }
-            }
+            None => Some(CType::Int(sign(Signed))),
         }
     }
 
@@ -194,8 +189,8 @@ impl Codegen {
     }
 
     pub(crate) fn resolve_type(&mut self, specifiers: &[DeclSpecifier]) -> CType {
-        let mut is_signed = None;
-        let mut is_unsigned = false;
+        use Signedness::*;
+        let mut explicit_sign: Option<Signedness> = None;
         let mut base = None;
         let mut long_count = 0u8;
         let mut is_short = false;
@@ -204,24 +199,20 @@ impl Codegen {
             if let DeclSpecifier::TypeSpec(ts) = spec {
                 match ts {
                     TypeSpec::Void => base = Some(CType::Void),
-                    TypeSpec::Char => base = Some(CType::Char(true)),
+                    TypeSpec::Char => base = Some(CType::Char(Signed)),
                     TypeSpec::Short => is_short = true,
-                    TypeSpec::Int => { if base.is_none() { base = Some(CType::Int(true)); } }
+                    TypeSpec::Int => { if base.is_none() { base = Some(CType::Int(Signed)); } }
                     TypeSpec::Long => long_count += 1,
                     TypeSpec::Float => base = Some(CType::Float),
                     TypeSpec::Double => base = Some(CType::Double),
-                    TypeSpec::Signed => is_signed = Some(true),
-                    TypeSpec::Unsigned => { is_unsigned = true; is_signed = Some(false); }
+                    TypeSpec::Signed => explicit_sign = Some(Signed),
+                    TypeSpec::Unsigned => explicit_sign = Some(Unsigned),
                     TypeSpec::Bool => base = Some(CType::Bool),
-                    TypeSpec::Int128 => base = Some(CType::Int128(true)),
+                    TypeSpec::Int128 => base = Some(CType::Int128(Signed)),
                     TypeSpec::TypedefName(name) => {
                         let ty = self.type_env.typedefs.get(name)
                             .unwrap_or_else(|| panic!("unknown typedef '{name}'"))
                             .clone();
-                        // If the typedef resolves to an incomplete (forward-declared) struct/union,
-                        // look up the tag for the complete definition.
-                        // This handles: typedef struct Foo Foo; ... struct Foo { ... };
-                        // Also handles: typedef union Foo *FooPtr; ... union Foo { ... };
                         let ty = self.resolve_incomplete_type(ty);
                         base = Some(ty);
                     }
@@ -238,7 +229,6 @@ impl Codegen {
                         base = Some(self.resolve_enum(&et));
                     }
                     TypeSpec::Typeof(expr) => {
-                        // typeof(expr) — deduce the type from the expression
                         if let Some(ty) = self.expr_type_for_typeof(expr) {
                             base = Some(ty);
                         }
@@ -251,31 +241,20 @@ impl Codegen {
             }
         }
 
-        // When an explicit signed/unsigned keyword is present, use it.
-        // Otherwise preserve the signedness from a typedef base type.
-        if is_short {
-            return CType::Short(is_signed.unwrap_or(true));
-        }
-        if long_count >= 2 {
-            return CType::LongLong(is_signed.unwrap_or(true));
-        }
+        let sign = |default| explicit_sign.unwrap_or(default);
+        if is_short { return CType::Short(sign(Signed)); }
+        if long_count >= 2 { return CType::LongLong(sign(Signed)); }
         if long_count == 1 {
-            if matches!(base, Some(CType::Double)) {
-                return CType::LongDouble;
-            }
-            return CType::Long(is_signed.unwrap_or(true));
+            if matches!(base, Some(CType::Double)) { return CType::LongDouble; }
+            return CType::Long(sign(Signed));
         }
 
         match base {
-            Some(CType::Char(s)) => CType::Char(is_signed.unwrap_or(s)),
-            Some(CType::Int(s)) => CType::Int(is_signed.unwrap_or(s)),
-            Some(CType::Int128(s)) => CType::Int128(is_signed.unwrap_or(s)),
+            Some(CType::Char(s)) => CType::Char(sign(s)),
+            Some(CType::Int(s)) => CType::Int(sign(s)),
+            Some(CType::Int128(s)) => CType::Int128(sign(s)),
             Some(other) => other,
-            None => {
-                if is_unsigned { CType::Int(false) }
-                else if is_signed.is_some() { CType::Int(true) }
-                else { CType::Int(true) } // default
-            }
+            None => CType::Int(sign(Signed)),
         }
     }
 
@@ -544,11 +523,11 @@ impl Codegen {
             Expr::Ident(name) => {
                 self.global_types.get(name).cloned()
             }
-            Expr::IntLit(_) => Some(CType::Int(true)),
-            Expr::UIntLit(_) => Some(CType::Long(false)),
+            Expr::IntLit(_) => Some(CType::Int(Signedness::Signed)),
+            Expr::UIntLit(_) => Some(CType::Long(Signedness::Unsigned)),
             Expr::FloatLit(_, is_f32) => Some(if *is_f32 { CType::Float } else { CType::Double }),
-            Expr::StringLit(_) => Some(CType::Pointer(Box::new(CType::Char(true)))),
-            Expr::WideStringLit(_) => Some(CType::Pointer(Box::new(CType::Int(true)))),
+            Expr::StringLit(_) => Some(CType::Pointer(Box::new(CType::Char(Signedness::Signed)))),
+            Expr::WideStringLit(_) => Some(CType::Pointer(Box::new(CType::Int(Signedness::Signed)))),
             Expr::Unary(UnaryOp::Deref, e) => {
                 let ty = self.expr_type_for_typeof(e)?;
                 match ty {

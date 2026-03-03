@@ -127,7 +127,7 @@ impl Parser {
         if is_typedef {
             for id in &declarators {
                 if let Some(name) = self.declarator_name(&id.declarator) {
-                    self.type_env.typedefs.insert(name, crate::types::CType::Int(true));
+                    self.type_env.typedefs.insert(name, crate::types::CType::Int(crate::types::Signedness::Signed));
                 }
             }
         }
