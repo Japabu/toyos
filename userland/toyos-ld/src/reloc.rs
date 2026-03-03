@@ -402,45 +402,38 @@ fn apply_one_reloc_aarch64(
     }
 }
 
-/// Patch ADRP instruction's immhi:immlo fields with a page delta.
-fn patch_aarch64_adrp(state: &mut LinkState, sec_idx: SectionIdx, offset: u64, page_delta: i32) {
-    let data = &mut state.sections[sec_idx].data;
+/// Read-modify-write a 32-bit LE instruction in a section.
+fn modify_insn(state: &mut LinkState, sec: SectionIdx, offset: u64, f: impl FnOnce(u32) -> u32) {
+    let data = &mut state.sections[sec].data;
     let off = offset as usize;
-    let mut insn = u32::from_le_bytes(data[off..off + 4].try_into().unwrap());
+    let insn = u32::from_le_bytes(data[off..off + 4].try_into().unwrap());
+    data[off..off + 4].copy_from_slice(&f(insn).to_le_bytes());
+}
+
+/// Patch ADRP instruction's immhi:immlo fields with a page delta.
+fn patch_aarch64_adrp(state: &mut LinkState, sec: SectionIdx, offset: u64, page_delta: i32) {
     let val = page_delta as u32;
-    insn = (insn & 0x9F00_001F)
-        | ((val & 0x3) << 29)       // immlo in bits [30:29]
-        | (((val >> 2) & 0x7FFFF) << 5); // immhi in bits [23:5]
-    data[off..off + 4].copy_from_slice(&insn.to_le_bytes());
+    modify_insn(state, sec, offset, |insn|
+        (insn & 0x9F00_001F) | ((val & 0x3) << 29) | (((val >> 2) & 0x7FFFF) << 5));
 }
 
 /// Patch BL/B instruction's imm26 field.
-fn patch_aarch64_insn_imm26(state: &mut LinkState, sec_idx: SectionIdx, offset: u64, imm26: u32) {
-    let data = &mut state.sections[sec_idx].data;
-    let off = offset as usize;
-    let mut insn = u32::from_le_bytes(data[off..off + 4].try_into().unwrap());
-    insn = (insn & 0xFC00_0000) | (imm26 & 0x03FF_FFFF);
-    data[off..off + 4].copy_from_slice(&insn.to_le_bytes());
+fn patch_aarch64_insn_imm26(state: &mut LinkState, sec: SectionIdx, offset: u64, imm26: u32) {
+    modify_insn(state, sec, offset, |insn| (insn & 0xFC00_0000) | (imm26 & 0x03FF_FFFF));
 }
 
 /// Patch ADD instruction's imm12 field (bits [21:10]).
-fn patch_aarch64_add_imm12(state: &mut LinkState, sec_idx: SectionIdx, offset: u64, value: u32) {
-    let data = &mut state.sections[sec_idx].data;
-    let off = offset as usize;
-    let mut insn = u32::from_le_bytes(data[off..off + 4].try_into().unwrap());
-    insn = (insn & !(0xFFF << 10)) | ((value & 0xFFF) << 10);
-    data[off..off + 4].copy_from_slice(&insn.to_le_bytes());
+fn patch_aarch64_add_imm12(state: &mut LinkState, sec: SectionIdx, offset: u64, value: u32) {
+    modify_insn(state, sec, offset, |insn| (insn & !(0xFFF << 10)) | ((value & 0xFFF) << 10));
 }
 
 /// Patch LDR/STR instruction's scaled imm12 field (bits [21:10]).
 /// `scale` is the log2 of the access size (0=byte, 1=half, 2=word, 3=dword).
-fn patch_aarch64_ldr_imm12(state: &mut LinkState, sec_idx: SectionIdx, offset: u64, value: u32, scale: u32) {
-    let data = &mut state.sections[sec_idx].data;
-    let off = offset as usize;
-    let mut insn = u32::from_le_bytes(data[off..off + 4].try_into().unwrap());
-    let scaled = (value >> scale) & 0xFFF;
-    insn = (insn & !(0xFFF << 10)) | (scaled << 10);
-    data[off..off + 4].copy_from_slice(&insn.to_le_bytes());
+fn patch_aarch64_ldr_imm12(state: &mut LinkState, sec: SectionIdx, offset: u64, value: u32, scale: u32) {
+    modify_insn(state, sec, offset, |insn| {
+        let scaled = (value >> scale) & 0xFFF;
+        (insn & !(0xFFF << 10)) | (scaled << 10)
+    });
 }
 
 /// Parameters for Mach-O relocation application.
