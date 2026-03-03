@@ -353,6 +353,127 @@ impl<'a> Lexer<'a> {
         }
     }
 
+    /// Try to process a preprocessor line directive (`# <line> "file" ...`).
+    /// The `#` must already be consumed. Returns true if a directive was found.
+    fn try_skip_line_directive(&mut self) -> bool {
+        self.skip_whitespace_and_comments();
+        if !self.peek().is_some_and(|c| c.is_ascii_digit()) {
+            return false;
+        }
+        let mut line_str = String::new();
+        while self.peek().is_some_and(|c| c.is_ascii_digit()) {
+            line_str.push(self.advance() as char);
+        }
+        if let Ok(line) = line_str.parse::<u32>() {
+            self.line = line;
+        }
+        self.skip_whitespace_and_comments();
+        if self.peek() == Some(b'"') {
+            self.advance();
+            let mut fname = String::new();
+            while self.peek().is_some_and(|c| c != b'"') {
+                fname.push(self.advance() as char);
+            }
+            if self.peek() == Some(b'"') { self.advance(); }
+            self.file = fname;
+        }
+        while self.peek().is_some_and(|c| c != b'\n') { self.advance(); }
+        true
+    }
+
+    /// Read a string literal with adjacent string concatenation,
+    /// skipping any line directives between concatenated strings.
+    fn read_string_with_concat(&mut self) -> TokenKind {
+        let mut s = self.read_string_lit();
+        loop {
+            self.skip_whitespace_and_comments();
+            // Skip line directives that appear between adjacent strings
+            if self.peek() == Some(b'#') && self.col == 1 {
+                let saved_pos = self.pos;
+                let saved_line = self.line;
+                let saved_col = self.col;
+                let saved_file = self.file.clone();
+                self.advance();
+                if self.try_skip_line_directive() {
+                    continue;
+                }
+                self.pos = saved_pos;
+                self.line = saved_line;
+                self.col = saved_col;
+                self.file = saved_file;
+            }
+            if self.peek() == Some(b'"') {
+                s.extend(self.read_string_lit());
+            } else {
+                break;
+            }
+        }
+        TokenKind::StringLit(s)
+    }
+
+    /// Classify an identifier as a keyword, builtin, or plain identifier.
+    fn classify_ident(&mut self, ident: String) -> TokenKind {
+        match ident.as_str() {
+            "auto" => TokenKind::Auto,
+            "break" => TokenKind::Break,
+            "case" => TokenKind::Case,
+            "char" => TokenKind::Char,
+            "const" => TokenKind::Const,
+            "continue" => TokenKind::Continue,
+            "default" => TokenKind::Default,
+            "do" => TokenKind::Do,
+            "double" => TokenKind::Double,
+            "else" => TokenKind::Else,
+            "enum" => TokenKind::Enum,
+            "extern" => TokenKind::Extern,
+            "float" => TokenKind::Float,
+            "for" => TokenKind::For,
+            "goto" => TokenKind::Goto,
+            "if" => TokenKind::If,
+            "int" => TokenKind::Int,
+            "long" => TokenKind::Long,
+            "register" => TokenKind::Register,
+            "return" => TokenKind::Return,
+            "short" => TokenKind::Short,
+            "signed" => TokenKind::Signed,
+            "sizeof" => TokenKind::Sizeof,
+            "static" => TokenKind::Static,
+            "struct" => TokenKind::Struct,
+            "switch" => TokenKind::Switch,
+            "typedef" => TokenKind::Typedef,
+            "union" => TokenKind::Union,
+            "unsigned" => TokenKind::Unsigned,
+            "void" => TokenKind::Void,
+            "volatile" => TokenKind::Volatile,
+            "while" => TokenKind::While,
+            "restrict" | "__restrict" | "__restrict__" => TokenKind::Restrict,
+            "inline" | "__inline" | "__inline__" => TokenKind::Inline,
+            "_Bool" => TokenKind::Bool,
+            "typeof" | "__typeof" | "__typeof__" => TokenKind::Typeof,
+            "__asm" | "__asm__" | "asm" => TokenKind::Asm,
+            "__extension__" => TokenKind::Extension,
+            "__builtin_va_arg" | "va_arg" => TokenKind::VaArg,
+            "__alignof" | "__alignof__" | "_Alignof" => TokenKind::Alignof,
+            "_Alignas" => TokenKind::Alignas,
+            "__int128" | "__int128_t" => TokenKind::Int128,
+            "_Float16" => TokenKind::Float, // treat as float
+            "L" if self.peek() == Some(b'"') => {
+                let s = self.read_string_lit();
+                TokenKind::WideStringLit(s)
+            }
+            "L" if self.peek() == Some(b'\'') => {
+                TokenKind::CharLit(self.read_char_lit())
+            }
+            "_Generic" => TokenKind::Builtin("_Generic".into()),
+            "__builtin_offsetof" | "__builtin_expect" | "__builtin_constant_p"
+            | "__builtin_choose_expr" | "__builtin_types_compatible_p"
+            | "__builtin_frame_address" | "__builtin_return_address"
+            | "__builtin_unreachable" | "__builtin_va_end"
+            | "__builtin_va_start" | "__builtin_va_copy" => TokenKind::Builtin(ident),
+            _ => TokenKind::Ident(ident),
+        }
+    }
+
     pub fn tokenize(mut self) -> Vec<Token> {
         let mut tokens = Vec::new();
         loop {
@@ -361,152 +482,21 @@ impl<'a> Lexer<'a> {
             let kind = match self.peek() {
                 None => { tokens.push(Token { kind: TokenKind::Eof, loc }); break; }
 
-                // Handle #line directives from preprocessor
                 Some(b'#') if loc.col == 1 => {
                     self.advance();
-                    self.skip_whitespace_and_comments();
-                    // Check for # <line> "file" preprocessor line markers
-                    if self.peek().is_some_and(|c| c.is_ascii_digit()) {
-                        let mut line_str = String::new();
-                        while self.peek().is_some_and(|c| c.is_ascii_digit()) {
-                            line_str.push(self.advance() as char);
-                        }
-                        if let Ok(line) = line_str.parse::<u32>() {
-                            self.line = line;
-                        }
-                        self.skip_whitespace_and_comments();
-                        if self.peek() == Some(b'"') {
-                            self.advance();
-                            let mut fname = String::new();
-                            while self.peek().is_some_and(|c| c != b'"') {
-                                fname.push(self.advance() as char);
-                            }
-                            if self.peek() == Some(b'"') { self.advance(); }
-                            self.file = fname;
-                        }
-                        while self.peek().is_some_and(|c| c != b'\n') { self.advance(); }
-                        continue;
-                    }
-                    // Otherwise just # token
+                    if self.try_skip_line_directive() { continue; }
                     TokenKind::Hash
                 }
 
                 Some(b'\'') => TokenKind::CharLit(self.read_char_lit()),
-                Some(b'"') => {
-                    let mut s = self.read_string_lit();
-                    // Adjacent string concatenation (skip line directives between strings)
-                    loop {
-                        self.skip_whitespace_and_comments();
-                        // Skip # <num> "file" line directives that appear between strings
-                        if self.peek() == Some(b'#') && self.col == 1 {
-                            let saved = self.pos;
-                            let saved_line = self.line;
-                            let saved_col = self.col;
-                            let saved_file = self.file.clone();
-                            self.advance(); // skip #
-                            self.skip_whitespace_and_comments();
-                            if self.peek().is_some_and(|c| c.is_ascii_digit()) {
-                                // Line directive — process it
-                                let mut line_str = String::new();
-                                while self.peek().is_some_and(|c| c.is_ascii_digit()) {
-                                    line_str.push(self.advance() as char);
-                                }
-                                if let Ok(line) = line_str.parse::<u32>() {
-                                    self.line = line;
-                                }
-                                self.skip_whitespace_and_comments();
-                                if self.peek() == Some(b'"') {
-                                    self.advance();
-                                    let mut fname = String::new();
-                                    while self.peek().is_some_and(|c| c != b'"') {
-                                        fname.push(self.advance() as char);
-                                    }
-                                    if self.peek() == Some(b'"') { self.advance(); }
-                                    self.file = fname;
-                                }
-                                while self.peek().is_some_and(|c| c != b'\n') { self.advance(); }
-                                continue; // retry concatenation after directive
-                            } else {
-                                // Not a line directive — restore position
-                                self.pos = saved;
-                                self.line = saved_line;
-                                self.col = saved_col;
-                                self.file = saved_file;
-                            }
-                        }
-                        if self.peek() == Some(b'"') {
-                            s.extend(self.read_string_lit());
-                        } else {
-                            break;
-                        }
-                    }
-                    TokenKind::StringLit(s)
-                }
+                Some(b'"') => self.read_string_with_concat(),
 
                 Some(c) if c.is_ascii_digit() => self.read_number(),
                 Some(b'.') if self.peek2().is_some_and(|c| c.is_ascii_digit()) => self.read_number(),
 
                 Some(c) if c.is_ascii_alphabetic() || c == b'_' || c == b'$' => {
                     let ident = self.read_ident();
-                    match ident.as_str() {
-                        "auto" => TokenKind::Auto,
-                        "break" => TokenKind::Break,
-                        "case" => TokenKind::Case,
-                        "char" => TokenKind::Char,
-                        "const" => TokenKind::Const,
-                        "continue" => TokenKind::Continue,
-                        "default" => TokenKind::Default,
-                        "do" => TokenKind::Do,
-                        "double" => TokenKind::Double,
-                        "else" => TokenKind::Else,
-                        "enum" => TokenKind::Enum,
-                        "extern" => TokenKind::Extern,
-                        "float" => TokenKind::Float,
-                        "for" => TokenKind::For,
-                        "goto" => TokenKind::Goto,
-                        "if" => TokenKind::If,
-                        "int" => TokenKind::Int,
-                        "long" => TokenKind::Long,
-                        "register" => TokenKind::Register,
-                        "return" => TokenKind::Return,
-                        "short" => TokenKind::Short,
-                        "signed" => TokenKind::Signed,
-                        "sizeof" => TokenKind::Sizeof,
-                        "static" => TokenKind::Static,
-                        "struct" => TokenKind::Struct,
-                        "switch" => TokenKind::Switch,
-                        "typedef" => TokenKind::Typedef,
-                        "union" => TokenKind::Union,
-                        "unsigned" => TokenKind::Unsigned,
-                        "void" => TokenKind::Void,
-                        "volatile" => TokenKind::Volatile,
-                        "while" => TokenKind::While,
-                        "restrict" | "__restrict" | "__restrict__" => TokenKind::Restrict,
-                        "inline" | "__inline" | "__inline__" => TokenKind::Inline,
-                        "_Bool" => TokenKind::Bool,
-                        "typeof" | "__typeof" | "__typeof__" => TokenKind::Typeof,
-                        "__asm" | "__asm__" | "asm" => TokenKind::Asm,
-                        "__extension__" => TokenKind::Extension,
-                        "__builtin_va_arg" | "va_arg" => TokenKind::VaArg,
-                        "__alignof" | "__alignof__" | "_Alignof" => TokenKind::Alignof,
-                        "_Alignas" => TokenKind::Alignas,
-                        "__int128" | "__int128_t" => TokenKind::Int128,
-                        "_Float16" => TokenKind::Float, // treat as float
-                        "L" if self.peek() == Some(b'"') => {
-                            let s = self.read_string_lit();
-                            TokenKind::WideStringLit(s)
-                        }
-                        "L" if self.peek() == Some(b'\'') => {
-                            TokenKind::CharLit(self.read_char_lit())
-                        }
-                        "_Generic" => TokenKind::Builtin("_Generic".into()),
-                        "__builtin_offsetof" | "__builtin_expect" | "__builtin_constant_p"
-                        | "__builtin_choose_expr" | "__builtin_types_compatible_p"
-                        | "__builtin_frame_address" | "__builtin_return_address"
-                        | "__builtin_unreachable" | "__builtin_va_end"
-                        | "__builtin_va_start" | "__builtin_va_copy" => TokenKind::Builtin(ident),
-                        _ => TokenKind::Ident(ident),
-                    }
+                    self.classify_ident(ident)
                 }
 
                 // Punctuation
@@ -594,7 +584,7 @@ impl<'a> Lexer<'a> {
 
                 Some(c) => {
                     self.advance();
-                    panic!("warning: unexpected character '{}' (0x{:02x})", c as char, c);
+                    panic!("unexpected character '{}' (0x{:02x})", c as char, c);
                 }
             };
             tokens.push(Token { kind, loc });
