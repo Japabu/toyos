@@ -28,7 +28,7 @@ pub(crate) fn layout_pe(state: &mut LinkState) -> PeLayout {
     let text_rva = PE_SECTION_ALIGNMENT; // first section always at 0x1000
     let mut cursor = text_rva as u64;
     for &idx in &buckets.rx {
-        let sec = &mut state.sections[idx.0];
+        let sec = &mut state.sections[idx];
         cursor = align_up(cursor, sec.align);
         sec.vaddr = Some(cursor);
         cursor += sec.size;
@@ -42,7 +42,7 @@ pub(crate) fn layout_pe(state: &mut LinkState) -> PeLayout {
     if has_data {
         cursor = data_rva as u64;
         for &idx in &buckets.rw {
-            let sec = &mut state.sections[idx.0];
+            let sec = &mut state.sections[idx];
             cursor = align_up(cursor, sec.align);
             sec.vaddr = Some(cursor);
             cursor += sec.size;
@@ -96,7 +96,7 @@ pub(crate) fn emit_pe_bytes(
         .get(entry_name)
         .map(|def| match def {
             SymbolDef::Defined { section, value } => {
-                (state.sections[section.0].vaddr.unwrap() + value) as u32
+                (state.sections[*section].vaddr.unwrap() + value) as u32
             }
             SymbolDef::Dynamic => panic!("entry point cannot be a dynamic symbol"),
         })

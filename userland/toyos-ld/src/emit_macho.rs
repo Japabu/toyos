@@ -366,9 +366,9 @@ pub(crate) fn layout_macho(state: &mut LinkState, _entry: &str) -> MachOLayout {
             | RelocType::X86RexGotpcrelx)
     });
 
-    let has_const = buckets.rx.iter().any(|&i| state.sections[i.0].writable == false && state.sections[i.0].name != ".text");
+    let has_const = buckets.rx.iter().any(|&i| state.sections[i].writable == false && state.sections[i].name != ".text");
     let has_data = !buckets.rw.is_empty();
-    let has_bss = buckets.rw.iter().any(|&i| state.sections[i.0].nobits);
+    let has_bss = buckets.rw.iter().any(|&i| state.sections[i].nobits);
     let has_got = !got_symbols.is_empty();
 
     let text_nsects = 1 + if has_const { 1 } else { 0 };
@@ -405,7 +405,7 @@ pub(crate) fn layout_macho(state: &mut LinkState, _entry: &str) -> MachOLayout {
     let text_sec_vmaddr = cursor;
     let text_sec_offset = cursor - text_vmaddr;
     for &idx in &buckets.rx {
-        let sec = &mut state.sections[idx.0];
+        let sec = &mut state.sections[idx];
         if sec.name.starts_with(".const") || sec.name.starts_with(".rodata") {
             continue;
         }
@@ -420,7 +420,7 @@ pub(crate) fn layout_macho(state: &mut LinkState, _entry: &str) -> MachOLayout {
     let mut actual_has_const = false;
     cursor = const_sec_vmaddr;
     for &idx in &buckets.rx {
-        let sec = &mut state.sections[idx.0];
+        let sec = &mut state.sections[idx];
         if sec.name.starts_with(".const") || sec.name.starts_with(".rodata") {
             cursor = align_up(cursor, sec.align);
             sec.vaddr = Some(cursor);
@@ -440,7 +440,7 @@ pub(crate) fn layout_macho(state: &mut LinkState, _entry: &str) -> MachOLayout {
     let data_sec_vmaddr = data_cursor;
     let data_sec_offset = data_fileoff;
     for &idx in &buckets.rw {
-        let sec = &mut state.sections[idx.0];
+        let sec = &mut state.sections[idx];
         if sec.nobits { continue; }
         data_cursor = align_up(data_cursor, sec.align);
         sec.vaddr = Some(data_cursor);
@@ -470,7 +470,7 @@ pub(crate) fn layout_macho(state: &mut LinkState, _entry: &str) -> MachOLayout {
     let bss_start = bss_sec_vmaddr;
     let mut bss_cursor = bss_sec_vmaddr;
     for &idx in &buckets.rw {
-        let sec = &mut state.sections[idx.0];
+        let sec = &mut state.sections[idx];
         if !sec.nobits { continue; }
         bss_cursor = align_up(bss_cursor, sec.align);
         sec.vaddr = Some(bss_cursor);
@@ -564,7 +564,7 @@ pub(crate) fn emit_macho_bytes(
         .get(entry_name)
         .map(|def| match def {
             SymbolDef::Defined { section, value } => {
-                state.sections[section.0].vaddr.unwrap() + value
+                state.sections[*section].vaddr.unwrap() + value
             }
             SymbolDef::Dynamic => panic!("entry point cannot be a dynamic symbol"),
         })
@@ -1110,7 +1110,7 @@ fn build_symbol_table(
     let mut extdef_syms: Vec<(String, u64, u8)> = Vec::new();
     for (name, def) in &state.globals {
         let SymbolDef::Defined { section, value } = def else { continue; };
-        let sec = &state.sections[section.0];
+        let sec = &state.sections[*section];
         let value = sec.vaddr.unwrap() + value;
         let sect = if value >= layout.text_sec_vmaddr && value < layout.text_sec_vmaddr + layout.text_sec_size {
             text_sect

@@ -262,7 +262,7 @@ pub(crate) fn layout_elf(state: &mut LinkState, base_addr: u64, entry_name: Opti
 
     let rx_start = cursor;
     for &idx in &buckets.rx {
-        let sec = &mut state.sections[idx.0];
+        let sec = &mut state.sections[idx];
         cursor = align_up(cursor, sec.align);
         sec.vaddr = Some(cursor);
         cursor += sec.size;
@@ -287,9 +287,9 @@ pub(crate) fn layout_elf(state: &mut LinkState, base_addr: u64, entry_name: Opti
     let mut eh_frame_vaddr = 0u64;
     let mut fde_count = 0usize;
     for &idx in &buckets.rx {
-        if state.sections[idx.0].name == ".eh_frame" {
-            if fde_count == 0 { eh_frame_vaddr = state.sections[idx.0].vaddr.unwrap(); }
-            fde_count += count_fdes(&state.sections[idx.0].data);
+        if state.sections[idx].name == ".eh_frame" {
+            if fde_count == 0 { eh_frame_vaddr = state.sections[idx].vaddr.unwrap(); }
+            fde_count += count_fdes(&state.sections[idx].data);
         }
     }
     let (eh_frame_hdr_vaddr, eh_frame_hdr_size) = if fde_count > 0 {
@@ -315,8 +315,8 @@ pub(crate) fn layout_elf(state: &mut LinkState, base_addr: u64, entry_name: Opti
 
     // Place PROGBITS RW sections first
     for &idx in &buckets.rw {
-        if state.sections[idx.0].nobits { continue; }
-        let sec = &mut state.sections[idx.0];
+        if state.sections[idx].nobits { continue; }
+        let sec = &mut state.sections[idx];
         cursor = align_up(cursor, sec.align);
         sec.vaddr = Some(cursor);
         cursor += sec.size;
@@ -328,7 +328,7 @@ pub(crate) fn layout_elf(state: &mut LinkState, base_addr: u64, entry_name: Opti
     let mut fini_array_vaddr = 0u64;
     let mut fini_array_size = 0u64;
     for &idx in &buckets.rw {
-        let sec = &state.sections[idx.0];
+        let sec = &state.sections[idx];
         let Some(sec_vaddr) = sec.vaddr else { continue; };
         if sec.name.starts_with(".init_array") {
             if init_array_size == 0 { init_array_vaddr = sec_vaddr; }
@@ -362,8 +362,8 @@ pub(crate) fn layout_elf(state: &mut LinkState, base_addr: u64, entry_name: Opti
 
     // Place NOBITS RW sections (.bss) after all file-backed data
     for &idx in &buckets.rw {
-        if !state.sections[idx.0].nobits { continue; }
-        let sec = &mut state.sections[idx.0];
+        if !state.sections[idx].nobits { continue; }
+        let sec = &mut state.sections[idx];
         cursor = align_up(cursor, sec.align);
         sec.vaddr = Some(cursor);
         cursor += sec.size;
@@ -387,15 +387,15 @@ pub(crate) fn layout_elf(state: &mut LinkState, base_addr: u64, entry_name: Opti
     let tls_start = align_up(rw_end, 64);
     let mut tls_cursor = tls_start;
     for &idx in &buckets.tls {
-        let sec = &mut state.sections[idx.0];
+        let sec = &mut state.sections[idx];
         tls_cursor = align_up(tls_cursor, sec.align);
         sec.vaddr = Some(tls_cursor);
         tls_cursor += sec.size;
     }
     let tls_filesz = buckets.tls
         .iter()
-        .filter(|&&idx| !state.sections[idx.0].name.starts_with(".tbss"))
-        .map(|&idx| state.sections[idx.0].size)
+        .filter(|&&idx| !state.sections[idx].name.starts_with(".tbss"))
+        .map(|&idx| state.sections[idx].size)
         .sum::<u64>();
     let tls_memsz = if buckets.tls.is_empty() { 0 } else { tls_cursor - tls_start };
 
@@ -470,7 +470,7 @@ fn resolve_entry(state: &LinkState, entry_name: &str, plt: Option<&HashMap<Strin
                     .ok_or_else(|| LinkError::MissingEntry(entry_name.to_string()))
             }
             SymbolDef::Defined { section, value } => {
-                Ok(state.sections[section.0].vaddr.unwrap() + value)
+                Ok(state.sections[*section].vaddr.unwrap() + value)
             }
         })
         .unwrap_or_else(|| Err(LinkError::MissingEntry(entry_name.to_string())))
@@ -508,7 +508,7 @@ fn collect_symtab_entries<'a>(
     // Locals
     for ((_, name), def) in &state.locals {
         let SymbolDef::Defined { section, value } = def else { continue; };
-        let sec = &state.sections[section.0];
+        let sec = &state.sections[*section];
         let st_value = sec.vaddr.unwrap() + value;
         let out_idx = output_section_index(sec, text_idx, data_idx);
         let st_type = if sec.writable || sec.nobits || is_tls_section(&sec.name) {
@@ -529,7 +529,7 @@ fn collect_symtab_entries<'a>(
     // Globals
     for (name, def) in &state.globals {
         let SymbolDef::Defined { section, value } = def else { continue; };
-        let sec = &state.sections[section.0];
+        let sec = &state.sections[*section];
         let st_value = sec.vaddr.unwrap() + value;
         let out_idx = output_section_index(sec, text_idx, data_idx);
         let st_type = if sec.writable || sec.nobits || is_tls_section(&sec.name) {
@@ -709,7 +709,7 @@ pub(crate) fn emit_elf(
         for (name, def) in &symbols {
             let SymbolDef::Defined { section, value } = def else { continue; };
             let str_id = w.add_dynamic_string(name.as_bytes());
-            let st_value = state.sections[section.0].vaddr.unwrap() + value;
+            let st_value = state.sections[*section].vaddr.unwrap() + value;
             let hash = gnu_hash(name.as_bytes());
             export_str_ids.push((name.to_string(), str_id, st_value, hash));
         }

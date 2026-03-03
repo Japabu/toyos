@@ -13,6 +13,15 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct SectionIdx(pub usize);
 
+impl std::ops::Index<SectionIdx> for Vec<InputSection> {
+    type Output = InputSection;
+    fn index(&self, idx: SectionIdx) -> &InputSection { &self[idx.0] }
+}
+
+impl std::ops::IndexMut<SectionIdx> for Vec<InputSection> {
+    fn index_mut(&mut self, idx: SectionIdx) -> &mut InputSection { &mut self[idx.0] }
+}
+
 /// Newtype for indices into the input objects slice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct ObjIdx(pub usize);
@@ -424,7 +433,7 @@ fn collect_object(
             let addend = if is_macho_instruction {
                 0
             } else if reloc.has_implicit_addend() {
-                let data = &state.sections[global_sec.0].data;
+                let data = &state.sections[global_sec].data;
                 let off = offset as usize;
                 let implicit = match reloc.size() {
                     64 => i64::from_le_bytes(data[off..off + 8].try_into().unwrap()),
@@ -611,7 +620,7 @@ pub(crate) fn gc_sections(state: &mut LinkState, entry: &str) {
             edges[reloc.section.0].insert(target.0);
         }
         // Also check locals
-        if let Some(obj_idx) = state.sections[reloc.section.0].obj_idx {
+        if let Some(obj_idx) = state.sections[reloc.section].obj_idx {
             if let Some(SymbolDef::Defined { section: target, .. }) = state.locals.get(&(obj_idx, reloc.symbol_name.clone())) {
                 edges[reloc.section.0].insert(target.0);
             }
@@ -814,7 +823,7 @@ pub(crate) fn merge_string_sections(state: &mut LinkState) {
     // Group by section name
     let mut groups: HashMap<String, Vec<SectionIdx>> = HashMap::new();
     for &idx in &merge_indices {
-        groups.entry(state.sections[idx.0].name.clone()).or_default().push(idx);
+        groups.entry(state.sections[idx].name.clone()).or_default().push(idx);
     }
 
     // For each group with more than one section, merge them
@@ -830,7 +839,7 @@ pub(crate) fn merge_string_sections(state: &mut LinkState) {
         let mut merged_data = Vec::new();
 
         for &sec_idx in group {
-            let data = &state.sections[sec_idx.0].data;
+            let data = &state.sections[sec_idx].data;
             let mut pos = 0;
             while pos < data.len() {
                 // Find null terminator
@@ -855,8 +864,8 @@ pub(crate) fn merge_string_sections(state: &mut LinkState) {
 
         // Replace the first section with merged data; mark the rest for removal
         let keep_idx = group[0];
-        state.sections[keep_idx.0].data = merged_data;
-        state.sections[keep_idx.0].size = state.sections[keep_idx.0].data.len() as u64;
+        state.sections[keep_idx].data = merged_data;
+        state.sections[keep_idx].size = state.sections[keep_idx].data.len() as u64;
 
         for &sec_idx in &group[1..] {
             replaced_sections.insert(sec_idx);
@@ -875,7 +884,7 @@ pub(crate) fn merge_string_sections(state: &mut LinkState) {
     for def in state.globals.values_mut() {
         if let SymbolDef::Defined { section, value } = def {
             if let Some(&new_off) = offset_remap.get(&(*section, *value)) {
-                let old_name = &state.sections[section.0].name;
+                let old_name = &state.sections[*section].name;
                 if let Some(group) = groups.get(old_name) {
                     *section = group[0];
                 }
@@ -886,7 +895,7 @@ pub(crate) fn merge_string_sections(state: &mut LinkState) {
     for def in state.locals.values_mut() {
         if let SymbolDef::Defined { section, value } = def {
             if let Some(&new_off) = offset_remap.get(&(*section, *value)) {
-                let old_name = &state.sections[section.0].name;
+                let old_name = &state.sections[*section].name;
                 if let Some(group) = groups.get(old_name) {
                     *section = group[0];
                 }
@@ -898,7 +907,7 @@ pub(crate) fn merge_string_sections(state: &mut LinkState) {
     // Update relocation addends: when a relocation targets a symbol in a merged
     // section, the addend may encode an offset into that section that needs remapping.
     for reloc in &mut state.relocs {
-        let obj_idx = state.sections[reloc.section.0].obj_idx;
+        let obj_idx = state.sections[reloc.section].obj_idx;
         let old_def = old_globals.get(&reloc.symbol_name)
             .or_else(|| obj_idx.and_then(|oi| old_locals.get(&(oi, reloc.symbol_name.clone()))));
         if let Some(SymbolDef::Defined { section: old_sec, value: old_val }) = old_def {

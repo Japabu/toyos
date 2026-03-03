@@ -22,13 +22,13 @@ pub(crate) fn resolve_symbol(
         match def {
             SymbolDef::Dynamic => return plt.and_then(|p| p.get(name).copied()),
             SymbolDef::Defined { section, value } => {
-                return Some(state.sections[section.0].vaddr.unwrap() + value);
+                return Some(state.sections[*section].vaddr.unwrap() + value);
             }
         }
     }
-    if let Some(obj_idx) = state.sections[from_sec.0].obj_idx {
+    if let Some(obj_idx) = state.sections[from_sec].obj_idx {
         if let Some(SymbolDef::Defined { section, value }) = state.locals.get(&(obj_idx, name.to_string())) {
-            return Some(state.sections[section.0].vaddr.unwrap() + value);
+            return Some(state.sections[*section].vaddr.unwrap() + value);
         }
     }
     None
@@ -113,7 +113,7 @@ fn apply_one_reloc(
 }
 
 fn write_bytes(state: &mut LinkState, sec_idx: SectionIdx, offset: u64, bytes: &[u8]) {
-    let sec = &mut state.sections[sec_idx.0];
+    let sec = &mut state.sections[sec_idx];
     let off = offset as usize;
     sec.data[off..off + bytes.len()].copy_from_slice(bytes);
 }
@@ -172,7 +172,7 @@ pub(crate) fn apply_relocs(
                 let sym_addr = resolve_symbol(state, &reloc.symbol_name, reloc.section, params.plt)
                     .ok_or_else(|| LinkError::UndefinedSymbols(vec![reloc.symbol_name.clone()]))?;
                 let padded = is_padded_tls_sequence(
-                    &state.sections[reloc.section.0].data,
+                    &state.sections[reloc.section].data,
                     reloc.offset,
                 );
                 if padded {
@@ -197,7 +197,7 @@ pub(crate) fn apply_relocs(
             }
             RelocType::X86Tlsld => {
                 let padded = is_padded_tls_sequence(
-                    &state.sections[reloc.section.0].data,
+                    &state.sections[reloc.section].data,
                     reloc.offset,
                 );
                 if padded {
@@ -242,7 +242,7 @@ pub(crate) fn apply_relocs(
             continue;
         }
 
-        let sec = &state.sections[reloc.section.0];
+        let sec = &state.sections[reloc.section];
         let reloc_vaddr = sec.vaddr.unwrap() + reloc.offset;
 
         let sym_addr = match resolve_symbol(state, &reloc.symbol_name, reloc.section, params.plt) {
@@ -404,7 +404,7 @@ fn apply_one_reloc_aarch64(
 
 /// Patch ADRP instruction's immhi:immlo fields with a page delta.
 fn patch_aarch64_adrp(state: &mut LinkState, sec_idx: SectionIdx, offset: u64, page_delta: i32) {
-    let data = &mut state.sections[sec_idx.0].data;
+    let data = &mut state.sections[sec_idx].data;
     let off = offset as usize;
     let mut insn = u32::from_le_bytes(data[off..off + 4].try_into().unwrap());
     let val = page_delta as u32;
@@ -416,7 +416,7 @@ fn patch_aarch64_adrp(state: &mut LinkState, sec_idx: SectionIdx, offset: u64, p
 
 /// Patch BL/B instruction's imm26 field.
 fn patch_aarch64_insn_imm26(state: &mut LinkState, sec_idx: SectionIdx, offset: u64, imm26: u32) {
-    let data = &mut state.sections[sec_idx.0].data;
+    let data = &mut state.sections[sec_idx].data;
     let off = offset as usize;
     let mut insn = u32::from_le_bytes(data[off..off + 4].try_into().unwrap());
     insn = (insn & 0xFC00_0000) | (imm26 & 0x03FF_FFFF);
@@ -425,7 +425,7 @@ fn patch_aarch64_insn_imm26(state: &mut LinkState, sec_idx: SectionIdx, offset: 
 
 /// Patch ADD instruction's imm12 field (bits [21:10]).
 fn patch_aarch64_add_imm12(state: &mut LinkState, sec_idx: SectionIdx, offset: u64, value: u32) {
-    let data = &mut state.sections[sec_idx.0].data;
+    let data = &mut state.sections[sec_idx].data;
     let off = offset as usize;
     let mut insn = u32::from_le_bytes(data[off..off + 4].try_into().unwrap());
     insn = (insn & !(0xFFF << 10)) | ((value & 0xFFF) << 10);
@@ -435,7 +435,7 @@ fn patch_aarch64_add_imm12(state: &mut LinkState, sec_idx: SectionIdx, offset: u
 /// Patch LDR/STR instruction's scaled imm12 field (bits [21:10]).
 /// `scale` is the log2 of the access size (0=byte, 1=half, 2=word, 3=dword).
 fn patch_aarch64_ldr_imm12(state: &mut LinkState, sec_idx: SectionIdx, offset: u64, value: u32, scale: u32) {
-    let data = &mut state.sections[sec_idx.0].data;
+    let data = &mut state.sections[sec_idx].data;
     let off = offset as usize;
     let mut insn = u32::from_le_bytes(data[off..off + 4].try_into().unwrap());
     let scaled = (value >> scale) & 0xFFF;
@@ -460,7 +460,7 @@ pub(crate) fn apply_relocs_macho(
     let relocs = std::mem::take(&mut state.relocs);
 
     for reloc in &relocs {
-        let sec = &state.sections[reloc.section.0];
+        let sec = &state.sections[reloc.section];
         let reloc_vaddr = sec.vaddr.unwrap() + reloc.offset;
 
         // GOT relocations don't need the symbol address — they use the GOT
@@ -537,7 +537,7 @@ pub(crate) fn apply_relocs_pe(
             _ => {}
         }
 
-        let sec = &state.sections[reloc.section.0];
+        let sec = &state.sections[reloc.section];
         let reloc_vaddr = sec.vaddr.unwrap() + reloc.offset;
 
         let sym_addr = match resolve_symbol(state, &reloc.symbol_name, reloc.section, None) {

@@ -393,7 +393,7 @@ pub fn link_macho(
             .map(|r| r.section)
             .collect();
         for &idx in &abs_reloc_sections {
-            collected.state.sections[idx.0].writable = true;
+            collected.state.sections[idx].writable = true;
         }
     }
 
@@ -529,10 +529,10 @@ pub(crate) fn classify_sections(state: &mut collect::LinkState) -> SectionBucket
         }
     }
     // Sort RX: .eh_frame at end (grouped for .eh_frame_hdr generation)
-    buckets.rx.sort_by_key(|&idx| if state.sections[idx.0].name == ".eh_frame" { 1u8 } else { 0 });
+    buckets.rx.sort_by_key(|&idx| if state.sections[idx].name == ".eh_frame" { 1u8 } else { 0 });
     // Sort RW: .init_array first, .fini_array second, other PROGBITS, then NOBITS (.bss)
     buckets.rw.sort_by_key(|&idx| {
-        let sec = &state.sections[idx.0];
+        let sec = &state.sections[idx];
         if sec.name.starts_with(".init_array") { 0u8 }
         else if sec.name.starts_with(".fini_array") { 1 }
         else if sec.nobits { 3 }
