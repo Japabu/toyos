@@ -263,9 +263,9 @@ impl Codegen {
         }
 
         self.func_sigs.insert(name.clone(), sig.clone());
-        if let Ok(id) = self.module.declare_function(&name, linkage, &sig) {
-            self.func_ids.insert(name, id);
-        }
+        let id = self.module.declare_function(&name, linkage, &sig)
+            .unwrap_or_else(|e| panic!("failed to declare function '{name}': {e}"));
+        self.func_ids.insert(name, id);
     }
 
     fn compile_function(&mut self, fdef: &FunctionDef) {
@@ -499,9 +499,9 @@ impl Codegen {
                     }
                     self.func_sigs.insert(name.clone(), sig.clone());
                     self.func_ret_types.insert(name.clone(), ret.as_ref().clone());
-                    if let Ok(id) = self.module.declare_function(&name, Linkage::Import, &sig) {
-                        self.func_ids.insert(name.clone(), id);
-                    }
+                    let id = self.module.declare_function(&name, Linkage::Import, &sig)
+                        .unwrap_or_else(|e| panic!("failed to declare function '{name}': {e}"));
+                    self.func_ids.insert(name.clone(), id);
                 }
                 continue;
             }
@@ -509,9 +509,9 @@ impl Codegen {
             // Global variable
             self.global_types.insert(name.clone(), ty.clone());
             if is_extern {
-                if let Ok(data_id) = self.module.declare_data(&name, Linkage::Import, false, false) {
-                    self.data_ids.insert(name.clone(), data_id);
-                }
+                let data_id = self.module.declare_data(&name, Linkage::Import, false, false)
+                    .unwrap_or_else(|e| panic!("failed to declare data '{name}': {e}"));
+                self.data_ids.insert(name.clone(), data_id);
             } else {
                 let is_static = decl.specifiers.iter().any(|s| matches!(s, DeclSpecifier::StorageClass(StorageClass::Static)));
                 let linkage = if is_static { Linkage::Local } else { Linkage::Export };

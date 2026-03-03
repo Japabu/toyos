@@ -774,9 +774,9 @@ impl Codegen {
             self.variadic_funcs.insert(name.to_string(), params.len());
         }
         self.func_sigs.insert(name.to_string(), sig.clone());
-        if let Ok(id) = self.module.declare_function(name, Linkage::Import, &sig) {
-            self.func_ids.insert(name.to_string(), id);
-        }
+        let id = self.module.declare_function(name, Linkage::Import, &sig)
+            .unwrap_or_else(|e| panic!("failed to declare function '{name}': {e}"));
+        self.func_ids.insert(name.to_string(), id);
     }
 
     /// extern declarations inside a function body refer to globals.
@@ -786,9 +786,9 @@ impl Codegen {
         ctx.spilled_locals.remove(name);
         self.global_types.insert(name.to_string(), ty);
         if !self.data_ids.contains_key(name) {
-            if let Ok(data_id) = self.module.declare_data(name, Linkage::Import, false, false) {
-                self.data_ids.insert(name.to_string(), data_id);
-            }
+            let data_id = self.module.declare_data(name, Linkage::Import, false, false)
+                .unwrap_or_else(|e| panic!("failed to declare data '{name}': {e}"));
+            self.data_ids.insert(name.to_string(), data_id);
         }
     }
 
