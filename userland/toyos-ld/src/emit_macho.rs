@@ -935,7 +935,20 @@ pub(crate) fn emit_macho_bytes(
         let is_external = layout.got_entries.iter()
             .any(|(n, ext)| n == sym_name && *ext);
         if is_external { continue; } // filled by dyld
-        let sym_addr = resolve_symbol(state, sym_name, SectionIdx(0), None)
+        // Global symbols resolve from any section context; local symbols need
+        // a section from their defining object so resolve_symbol gets the
+        // correct obj_idx.
+        let from_sec = if state.globals.contains_key(sym_name) {
+            SectionIdx(0)
+        } else {
+            let (oi, _) = state.locals.keys()
+                .find(|(_, n)| n == sym_name)
+                .unwrap_or_else(|| panic!("GOT entry for unknown symbol: {sym_name}"));
+            state.sections.iter().position(|s| s.obj_idx == Some(*oi))
+                .map(SectionIdx)
+                .unwrap_or_else(|| panic!("no section for obj_idx {:?} (symbol {sym_name})", oi))
+        };
+        let sym_addr = resolve_symbol(state, sym_name, from_sec, None)
             .ok_or_else(|| LinkError::UndefinedSymbols(vec![sym_name.clone()]))?;
         let off = (layout.data_fileoff + (got_vaddr - layout.data_vmaddr)) as usize;
         buf[off..off + 8].copy_from_slice(&sym_addr.to_le_bytes());

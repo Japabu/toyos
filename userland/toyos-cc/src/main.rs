@@ -46,7 +46,20 @@ fn run() {
         eprintln!("toyos-cc: starting");
     }
 
+    let mut link_objects: Vec<(String, Vec<u8>)> = Vec::new();
+
     for input in &args.inputs {
+        // .o and .a files pass through to the linker
+        if input.extension().is_some_and(|e| e == "o" || e == "a") {
+            if !args.compile_only {
+                let data = fs::read(input).unwrap_or_else(|e| {
+                    panic!("toyos-cc: cannot read {}: {e}", input.display());
+                });
+                link_objects.push((input.display().to_string(), data));
+            }
+            continue;
+        }
+
         let source = fs::read_to_string(input).unwrap_or_else(|e| {
             panic!("toyos-cc: cannot read {}: {e}", input.display());
         });
@@ -87,18 +100,39 @@ fn run() {
 
         let object_bytes = emit::finish(cg.module);
 
-        let output_path = if args.compile_only {
-            args.output.clone().unwrap_or_else(|| input.with_extension("o"))
-        } else {
-            panic!("linking not supported");
-        };
-
         if args.compile_only {
+            let output_path = args.output.clone().unwrap_or_else(|| input.with_extension("o"));
             fs::write(&output_path, &object_bytes).unwrap_or_else(|e| {
                 panic!("toyos-cc: cannot write {}: {e}", output_path.display());
             });
         } else {
-            panic!("linking not supported");
+            link_objects.push((input.display().to_string(), object_bytes));
+        }
+    }
+
+    if !args.compile_only && !args.preprocess_only {
+        eprintln!("toyos-cc: linking...");
+        let output = args.output.clone().unwrap_or_else(|| PathBuf::from("a.out"));
+        let is_macho = args.target.as_ref()
+            .map_or(cfg!(target_os = "macos"), |t| t.contains("apple"));
+        let entry = if is_macho { "_main" } else { "main" };
+
+        let result = if is_macho {
+            toyos_ld::link_macho(&link_objects, entry, false)
+        } else {
+            toyos_ld::link_full(&link_objects, entry, false, false)
+        };
+
+        match result {
+            Ok(bytes) => {
+                fs::write(&output, bytes).unwrap_or_else(|e| {
+                    panic!("toyos-cc: cannot write {}: {e}", output.display());
+                });
+            }
+            Err(e) => {
+                eprintln!("toyos-cc: link error: {e}");
+                process::exit(1);
+            }
         }
     }
 }
@@ -162,7 +196,7 @@ fn parse_args() -> Args {
             s if s.starts_with("-O") || s.starts_with("-W") || s.starts_with("-f")
               || s.starts_with("-m") || s.starts_with("-std=") || s.starts_with("-march") => {}
             "-pipe" | "-pthread" | "-ldl" | "-lm" | "-lc" => {}
-            s if s.starts_with("-l") || s.starts_with("-L") => {} // linker flags
+            s if s.starts_with("-l") || s.starts_with("-L") => {}
             s if s.starts_with('-') => {
                 eprintln!("toyos-cc: warning: unknown flag: {s}");
                 process::exit(1);

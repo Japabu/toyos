@@ -461,12 +461,13 @@ pub(crate) struct MachORelocParams<'a> {
 }
 
 /// Apply relocations for Mach-O output. Returns rebase entries (internal absolute
-/// pointers) and bind entries (external GOT slots).
+/// pointers) and bind entries (dynamic symbol references for dyld).
 pub(crate) fn apply_relocs_macho(
     state: &mut LinkState,
     params: &MachORelocParams,
 ) -> Result<MachORelocOutput, LinkError> {
     let mut rebase_entries = Vec::new();
+    let mut bind_entries = Vec::new();
     let mut undefined = std::collections::HashSet::new();
 
     let relocs = std::mem::take(&mut state.relocs);
@@ -483,6 +484,11 @@ pub(crate) fn apply_relocs_macho(
         let sym_addr = match resolve_symbol(state, &reloc.symbol_name, reloc.section, None) {
             Some(a) => a,
             None if is_got_reloc && params.got.contains_key(&reloc.symbol_name) => 0,
+            None if matches!(reloc.r_type, RelocType::Aarch64Abs64 | RelocType::X86_64) => {
+                // Absolute pointer to an external symbol — dyld will bind it.
+                bind_entries.push((reloc.symbol_name.clone(), reloc_vaddr));
+                continue;
+            }
             None => {
                 undefined.insert(reloc.symbol_name.clone());
                 continue;
@@ -526,11 +532,12 @@ pub(crate) fn apply_relocs_macho(
         return Err(LinkError::UndefinedSymbols(syms));
     }
 
-    Ok(MachORelocOutput { rebase_entries })
+    Ok(MachORelocOutput { rebase_entries, bind_entries })
 }
 
 pub(crate) struct MachORelocOutput {
     pub(crate) rebase_entries: Vec<(u64, i64)>,
+    pub(crate) bind_entries: Vec<(String, u64)>,
 }
 
 pub(crate) fn apply_relocs_pe(

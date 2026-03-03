@@ -46,7 +46,7 @@ const VARIADIC_EXTRA_PARAMS: usize = 10;
 /// Relocation to apply after defining global data bytes.
 enum GlobalReloc {
     FuncAddr { offset: u32, func_id: FuncId },
-    DataAddr { offset: u32, data_id: cranelift_module::DataId },
+    DataAddr { offset: u32, data_id: cranelift_module::DataId, addend: i64 },
 }
 
 pub struct Codegen {
@@ -511,6 +511,7 @@ impl Codegen {
             }
 
             // Global variable
+            let prior_ty = self.global_types.get(&name).cloned();
             self.global_types.insert(name.clone(), ty.clone());
             if is_extern {
                 let data_id = self.module.declare_data(&name, Linkage::Import, false, false)
@@ -526,34 +527,36 @@ impl Codegen {
                 desc.set_align(ty.align() as u64);
 
                 // For incomplete arrays (e.g. `int arr[] = {1,2,3}` or `char s[] = "..."`), infer size from initializer.
-                let (ty, size) = match (&ty, &id.initializer) {
-                    (CType::Array(elem, None), Some(Initializer::List(items))) => {
-                        // Account for brace elision: if items are flat scalars and
-                        // the element type is aggregate, divide by scalars per element
-                        let scalars_per = elem.flat_init_count();
-                        let n = if scalars_per > 1 && items.iter().all(|it| matches!(&it.initializer, Initializer::Expr(_))) {
-                            (items.len() + scalars_per - 1) / scalars_per
-                        } else {
-                            items.len()
-                        };
-                        let completed = CType::Array(elem.clone(), Some(n));
-                        let sz = completed.size();
-                        (completed, sz)
+                // If a prior declaration gave a larger size (e.g. `extern int arr[10]; int arr[] = {1,2}`),
+                // use the declared size so remaining elements are zero-initialized.
+                let (ty, size) = if let (CType::Array(elem, None), Some(Initializer::List(items))) = (&ty, &id.initializer) {
+                    // Account for brace elision: if items are flat scalars and
+                    // the element type is aggregate, divide by scalars per element
+                    let scalars_per = elem.flat_init_count();
+                    let mut n = if scalars_per > 1 && items.iter().all(|it| matches!(&it.initializer, Initializer::Expr(_))) {
+                        (items.len() + scalars_per - 1) / scalars_per
+                    } else {
+                        items.len()
+                    };
+                    // Use prior declaration size if larger
+                    if let Some(CType::Array(_, Some(prior_n))) = &prior_ty {
+                        n = n.max(*prior_n);
                     }
-                    (CType::Array(elem, None), Some(Initializer::Expr(e @ (Expr::StringLit(_) | Expr::WideStringLit(_))))) => {
-                        let n = init::string_lit_elem_count(e);
-                        let completed = CType::Array(elem.clone(), Some(n));
-                        let sz = completed.size();
-                        (completed, sz)
-                    }
-                    _ => {
-                        let sz = if let Some(init) = &id.initializer {
-                            Self::init_size(&ty, init)
-                        } else {
-                            ty.size()
-                        };
-                        (ty, sz)
-                    }
+                    let completed = CType::Array(elem.clone(), Some(n));
+                    let sz = completed.size();
+                    (completed, sz)
+                } else if let (CType::Array(elem, None), Some(Initializer::Expr(e @ (Expr::StringLit(_) | Expr::WideStringLit(_))))) = (&ty, &id.initializer) {
+                    let n = init::string_lit_elem_count(e);
+                    let completed = CType::Array(elem.clone(), Some(n));
+                    let sz = completed.size();
+                    (completed, sz)
+                } else {
+                    let sz = if let Some(init) = &id.initializer {
+                        Self::init_size(&ty, init)
+                    } else {
+                        ty.size()
+                    };
+                    (ty, sz)
                 };
 
                 // Update global_types with completed array type

@@ -190,10 +190,12 @@ impl LaidOut<MachOLayout> {
         let params = MachORelocParams { got: &self.layout.got };
         let reloc_output = apply_relocs_macho(&mut self.state, &params)?;
 
-        let bind_entries: Vec<(String, u64)> = self.layout.got_entries.iter()
+        let mut bind_entries: Vec<(String, u64)> = self.layout.got_entries.iter()
             .filter(|(_, ext)| *ext)
             .map(|(name, _)| (name.clone(), self.layout.got[name]))
             .collect();
+        // Add non-GOT dynamic binds (e.g. function pointers stored in data)
+        bind_entries.extend(reloc_output.bind_entries);
 
         let mut rebase_entries = reloc_output.rebase_entries;
         for (name, ext) in &self.layout.got_entries {
