@@ -84,8 +84,10 @@ impl Codegen {
                     CType::Function(ret, _, _) => ret.as_ref().clone(),
                     CType::Pointer(inner) => match inner.as_ref() {
                         CType::Function(ret, _, _) => ret.as_ref().clone(),
+                        // C89 implicit int: non-function pointer call
                         _ => CType::Int(Signedness::Signed),
                     },
+                    // C89 implicit int: callee type not resolvable to function
                     _ => CType::Int(Signedness::Signed),
                 }
             }
@@ -106,7 +108,8 @@ impl Codegen {
                     BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge
                     | BinOp::LogAnd | BinOp::LogOr => CType::Int(Signedness::Signed),
                     BinOp::Shl | BinOp::Shr => self.expr_type(ctx, l).promote(),
-                    _ => {
+                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod
+                    | BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => {
                         let lt = self.expr_type(ctx, l);
                         let rt = self.expr_type(ctx, r);
                         CType::common(&lt, &rt)
@@ -119,11 +122,11 @@ impl Codegen {
                 // Function types decay to function pointers in ternary context
                 let l = match &tt {
                     CType::Function(..) => CType::Pointer(Box::new(tt)),
-                    _ => tt,
+                    _ => tt, // all non-function types pass through unchanged
                 };
                 let r = match &ft {
                     CType::Function(..) => CType::Pointer(Box::new(ft)),
-                    _ => ft,
+                    _ => ft, // all non-function types pass through unchanged
                 };
                 if let (CType::Pointer(ref li), CType::Pointer(_)) = (&l, &r) {
                     return if matches!(**li, CType::Void) { r } else { l };
@@ -159,6 +162,7 @@ impl Codegen {
                     let val = crate::ast::eval_const_expr(&args[0], Some(&self.type_env.enum_constants));
                     match val {
                         Some(v) if v != 0 => self.expr_type(ctx, &args[1]),
+                        // zero or non-constant: use the false branch
                         _ => self.expr_type(ctx, &args[2]),
                     }
                 }

@@ -102,6 +102,7 @@ impl Codegen {
                 ctx.builder.seal_block(merge);
                 return ctx.builder.block_params(merge)[0];
             }
+            // all other Expr variants (Call, Binary, Cast, etc.) — no direct address, spill to stack
             _ => {
                 // For struct/union-typed expressions, compile_expr already returns an address
                 let ty = self.expr_type(ctx, expr);

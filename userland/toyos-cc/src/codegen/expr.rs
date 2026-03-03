@@ -5,7 +5,7 @@ impl Codegen {
     fn elem_stride(ty: &CType) -> Option<i64> {
         match ty {
             CType::Pointer(inner) | CType::Array(inner, _) => Some(inner.size().max(1) as i64),
-            _ => None,
+            _ => None, // scalars/structs/functions have no element stride
         }
     }
 
@@ -22,7 +22,7 @@ impl Codegen {
         match expr {
             Expr::Ident(name) => Some(name.clone()),
             Expr::Comma(_, rhs) => Self::extract_func_name(rhs),
-            _ => None,
+            _ => None, // all other Expr variants (Call, Binary, etc.) don't resolve to a function name
         }
     }
 
@@ -165,7 +165,7 @@ impl Codegen {
             let (ptr, sign) = (*ptr, ty.signedness());
             return match ty {
                 CType::Struct(_) | CType::Union(_) | CType::Array(_, _) => TypedValue::unsigned(ptr),
-                _ => {
+                _ => { // all scalar types: load value from pointer
                     let load_ty = self.clif_type(ty);
                     TypedValue::new(ctx.builder.ins().load(load_ty, MemFlags::new(), ptr, 0), sign)
                 }
@@ -477,7 +477,11 @@ impl Codegen {
             } else if let Some((ptr, _)) = ctx.local_ptrs.get(name.as_str()) {
                 let ptr = *ptr;
                 ctx.builder.ins().store(MemFlags::new(), new_ap, ptr, 0);
+            } else {
+                panic!("va_arg: unknown variable '{name}'");
             }
+        } else {
+            panic!("va_arg: expected identifier, got {ap_expr:?}");
         }
         TypedValue::new(result, ty.signedness())
     }
@@ -510,13 +514,14 @@ impl Codegen {
                             .cloned()
                             .unwrap_or(ty)
                     }
+                    // non-empty structs/unions and all other types: already complete, use as-is
                     _ => ty,
                 };
                 let fi = ty.field_offset(&field_name)
                     .unwrap_or_else(|| {
                         let field_names: Vec<_> = match &ty {
                             CType::Struct(def) => def.fields.iter().map(|f| f.name.clone().unwrap_or("<anon>".into())).collect(),
-                            _ => vec!["<not a struct>".into()],
+                            _ => vec!["<not a struct>".into()], // error path: type name for panic message
                         };
                         panic!("__builtin_offsetof: no field '{field_name}' in '{type_name}' (type has {} fields: {:?})", field_names.len(), &field_names[..field_names.len().min(10)])
                     });
@@ -545,33 +550,41 @@ impl Codegen {
                     panic!("__builtin_va_start used in non-variadic function '{}'", ctx.name)
                 });
                 let va_addr = ctx.builder.ins().stack_addr(I64, va_slot, 0);
-                if let Expr::Ident(ap_name) = &args[0] {
-                    if let Some((var, _)) = ctx.locals.get(ap_name) {
-                        let var = *var;
-                        ctx.builder.def_var(var, va_addr);
-                    } else if let Some((slot, _)) = ctx.spilled_locals.get(ap_name) {
-                        let ptr = ctx.builder.ins().stack_addr(I64, *slot, 0);
-                        ctx.builder.ins().store(MemFlags::new(), va_addr, ptr, 0);
-                    } else if let Some((ptr, _)) = ctx.local_ptrs.get(ap_name) {
-                        let ptr = *ptr;
-                        ctx.builder.ins().store(MemFlags::new(), va_addr, ptr, 0);
-                    }
+                let ap_name = match &args[0] {
+                    Expr::Ident(n) => n,
+                    other => panic!("va_start: expected identifier, got {other:?}"),
+                };
+                if let Some((var, _)) = ctx.locals.get(ap_name) {
+                    let var = *var;
+                    ctx.builder.def_var(var, va_addr);
+                } else if let Some((slot, _)) = ctx.spilled_locals.get(ap_name) {
+                    let ptr = ctx.builder.ins().stack_addr(I64, *slot, 0);
+                    ctx.builder.ins().store(MemFlags::new(), va_addr, ptr, 0);
+                } else if let Some((ptr, _)) = ctx.local_ptrs.get(ap_name) {
+                    let ptr = *ptr;
+                    ctx.builder.ins().store(MemFlags::new(), va_addr, ptr, 0);
+                } else {
+                    panic!("va_start: unknown variable '{ap_name}'");
                 }
                 TypedValue::unsigned(va_addr)
             }
             "__builtin_va_copy" => {
                 let src_val = self.compile_expr(ctx, &args[1]).raw();
-                if let Expr::Ident(dest_name) = &args[0] {
-                    if let Some((var, _)) = ctx.locals.get(dest_name) {
-                        let var = *var;
-                        ctx.builder.def_var(var, src_val);
-                    } else if let Some((slot, _)) = ctx.spilled_locals.get(dest_name) {
-                        let ptr = ctx.builder.ins().stack_addr(I64, *slot, 0);
-                        ctx.builder.ins().store(MemFlags::new(), src_val, ptr, 0);
-                    } else if let Some((ptr, _)) = ctx.local_ptrs.get(dest_name) {
-                        let ptr = *ptr;
-                        ctx.builder.ins().store(MemFlags::new(), src_val, ptr, 0);
-                    }
+                let dest_name = match &args[0] {
+                    Expr::Ident(n) => n,
+                    other => panic!("va_copy: expected identifier, got {other:?}"),
+                };
+                if let Some((var, _)) = ctx.locals.get(dest_name) {
+                    let var = *var;
+                    ctx.builder.def_var(var, src_val);
+                } else if let Some((slot, _)) = ctx.spilled_locals.get(dest_name) {
+                    let ptr = ctx.builder.ins().stack_addr(I64, *slot, 0);
+                    ctx.builder.ins().store(MemFlags::new(), src_val, ptr, 0);
+                } else if let Some((ptr, _)) = ctx.local_ptrs.get(dest_name) {
+                    let ptr = *ptr;
+                    ctx.builder.ins().store(MemFlags::new(), src_val, ptr, 0);
+                } else {
+                    panic!("va_copy: unknown variable '{dest_name}'");
                 }
                 TypedValue::unsigned(src_val)
             }
@@ -579,11 +592,21 @@ impl Codegen {
                 let ap_val = self.compile_expr(ctx, &args[0]).raw();
                 let result = ctx.builder.ins().load(I64, MemFlags::new(), ap_val, 0);
                 let new_ap = ctx.builder.ins().iadd_imm(ap_val, 8);
-                if let Expr::Ident(ap_name) = &args[0] {
-                    if let Some((var, _)) = ctx.locals.get(ap_name) {
-                        let var = *var;
-                        ctx.builder.def_var(var, new_ap);
-                    }
+                let ap_name = match &args[0] {
+                    Expr::Ident(n) => n,
+                    other => panic!("va_arg: expected identifier, got {other:?}"),
+                };
+                if let Some((var, _)) = ctx.locals.get(ap_name) {
+                    let var = *var;
+                    ctx.builder.def_var(var, new_ap);
+                } else if let Some((slot, _)) = ctx.spilled_locals.get(ap_name) {
+                    let ptr = ctx.builder.ins().stack_addr(I64, *slot, 0);
+                    ctx.builder.ins().store(MemFlags::new(), new_ap, ptr, 0);
+                } else if let Some((ptr, _)) = ctx.local_ptrs.get(ap_name) {
+                    let ptr = *ptr;
+                    ctx.builder.ins().store(MemFlags::new(), new_ap, ptr, 0);
+                } else {
+                    panic!("va_arg: unknown variable '{ap_name}'");
                 }
                 TypedValue::signed(result)
             }

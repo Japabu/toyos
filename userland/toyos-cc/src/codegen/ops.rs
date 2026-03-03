@@ -22,7 +22,9 @@ impl Codegen {
         let result_sign = match op {
             BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge
             | BinOp::LogAnd | BinOp::LogOr => Signedness::Signed,
-            _ => if is_unsigned { Signedness::Unsigned } else { Signedness::Signed },
+            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod
+            | BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr
+                => if is_unsigned { Signedness::Unsigned } else { Signedness::Signed },
         };
 
         let val = if is_float {
@@ -74,6 +76,7 @@ impl Codegen {
                 | BinOp::Shl | BinOp::Shr => {
                     let l = self.coerce(ctx, l, I64);
                     let r = self.coerce(ctx, r, I64);
+                    // outer match constrains op to exactly these 6 variants
                     match op {
                         BinOp::Mod => ctx.builder.ins().srem(l, r),
                         BinOp::BitAnd => ctx.builder.ins().band(l, r),
@@ -81,7 +84,7 @@ impl Codegen {
                         BinOp::BitXor => ctx.builder.ins().bxor(l, r),
                         BinOp::Shl => ctx.builder.ins().ishl(l, r),
                         BinOp::Shr => ctx.builder.ins().sshr(l, r),
-                        _ => unreachable!(),
+                        _ => unreachable!("outer match constrains to Mod|BitAnd|BitOr|BitXor|Shl|Shr"),
                     }
                 }
             }
@@ -168,6 +171,7 @@ impl Codegen {
                 | AssignOp::AndAssign | AssignOp::XorAssign | AssignOp::OrAssign => {
                     let l = self.coerce(ctx, l, I64);
                     let r = self.coerce(ctx, r, I64);
+                    // outer match constrains op to exactly these 6 variants
                     match op {
                         AssignOp::ModAssign => ctx.builder.ins().srem(l, r),
                         AssignOp::ShlAssign => ctx.builder.ins().ishl(l, r),
@@ -175,7 +179,7 @@ impl Codegen {
                         AssignOp::AndAssign => ctx.builder.ins().band(l, r),
                         AssignOp::XorAssign => ctx.builder.ins().bxor(l, r),
                         AssignOp::OrAssign => ctx.builder.ins().bor(l, r),
-                        _ => unreachable!(),
+                        _ => unreachable!("outer match constrains to Mod|Shl|Shr|And|Xor|Or Assign"),
                     }
                 }
                 AssignOp::Assign => unreachable!(),
