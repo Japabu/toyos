@@ -228,15 +228,23 @@ pub(crate) fn apply_relocs(
                 check_i32(value, reloc)?;
                 write_i32(state, reloc.section, reloc.offset, value as i32);
             }
-            _ => {}
+            // Handled in pass 2
+            RelocType::X86_64 | RelocType::X86Pc32 | RelocType::X86Plt32
+            | RelocType::X86_32 | RelocType::X86_32S
+            | RelocType::X86Gotpcrel | RelocType::X86Gotpcrelx
+            | RelocType::X86RexGotpcrelx
+            | RelocType::X86Tpoff32 | RelocType::X86Gottpoff
+            | RelocType::Aarch64Abs64 | RelocType::Aarch64Call26
+            | RelocType::Aarch64AdrPrelPgHi21 | RelocType::Aarch64AddAbsLo12Nc
+            | RelocType::Aarch64Ldst64AbsLo12Nc
+            | RelocType::Aarch64AdrGotPage | RelocType::Aarch64Ld64GotLo12Nc => {}
         }
     }
 
     // Pass 2: all other relocations
     for reloc in &relocs {
-        match reloc.r_type {
-            RelocType::X86Tlsgd | RelocType::X86Tlsld | RelocType::X86Dtpoff32 => continue,
-            _ => {}
+        if matches!(reloc.r_type, RelocType::X86Tlsgd | RelocType::X86Tlsld | RelocType::X86Dtpoff32) {
+            continue; // handled in pass 1
         }
         if relaxed_calls.contains(&(reloc.section, reloc.offset)) {
             continue;
@@ -271,7 +279,18 @@ pub(crate) fn apply_relocs(
                 check_i32(value, reloc)?;
                 write_i32(state, reloc.section, reloc.offset, value as i32);
             }
-            _ => {
+            // Pass 1 handled these; skipped by continue above
+            RelocType::X86Tlsgd | RelocType::X86Tlsld | RelocType::X86Dtpoff32 => {
+                unreachable!("handled in pass 1")
+            }
+            RelocType::X86_64 | RelocType::X86Pc32 | RelocType::X86Plt32
+            | RelocType::X86_32 | RelocType::X86_32S
+            | RelocType::X86Gotpcrel | RelocType::X86Gotpcrelx
+            | RelocType::X86RexGotpcrelx
+            | RelocType::Aarch64Abs64 | RelocType::Aarch64Call26
+            | RelocType::Aarch64AdrPrelPgHi21 | RelocType::Aarch64AddAbsLo12Nc
+            | RelocType::Aarch64Ldst64AbsLo12Nc
+            | RelocType::Aarch64AdrGotPage | RelocType::Aarch64Ld64GotLo12Nc => {
                 let is_abs = apply_one_reloc(state, reloc, sym_addr, reloc_vaddr, params.got)?;
                 if is_abs && params.record_relatives {
                     relatives.push((reloc_vaddr, sym_addr as i64 + reloc.addend));
@@ -523,11 +542,12 @@ pub(crate) fn apply_relocs_pe(
     let relocs = std::mem::take(&mut state.relocs);
 
     for reloc in &relocs {
-        // Skip TLS relocations — not supported in UEFI
-        match reloc.r_type {
+        // TLS not supported in UEFI PE
+        if matches!(reloc.r_type,
             RelocType::X86Tlsgd | RelocType::X86Tlsld | RelocType::X86Dtpoff32
-            | RelocType::X86Tpoff32 | RelocType::X86Gottpoff => continue,
-            _ => {}
+            | RelocType::X86Tpoff32 | RelocType::X86Gottpoff)
+        {
+            continue;
         }
 
         let sec = &state.sections[reloc.section];

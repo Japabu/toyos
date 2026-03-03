@@ -83,6 +83,8 @@ fn eh_pointer_size(enc: u8) -> usize {
         0x02 | 0x0A => 2, // udata2 / sdata2
         0x03 | 0x0B => 4, // udata4 / sdata4
         0x04 | 0x0C => 8, // udata8 / sdata8
+        // DWARF encoding low nibble: only 0x00-0x04 and 0x0A-0x0C are defined;
+        // remaining values are reserved. GCC/LLVM only emit standard encodings.
         _ => 0,
     }
 }
@@ -128,6 +130,7 @@ fn parse_cie_fde_encoding(cie_data: &[u8]) -> u8 {
             b'R' => {
                 return cie_data[off];
             }
+            // Unknown augmentation char: stop parsing per DWARF spec
             _ => break,
         }
     }

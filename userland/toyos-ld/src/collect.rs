@@ -222,6 +222,7 @@ fn resolve_reloc_target(
 ) -> Option<String> {
     let sym_idx = match reloc.target() {
         read::RelocationTarget::Symbol(idx) => idx,
+        // Absolute/Section targets have no symbol to resolve (non_exhaustive enum)
         _ => return None,
     };
     let sym = obj.symbol_by_index(sym_idx).ok()?;
@@ -233,6 +234,7 @@ fn resolve_reloc_target(
     if is_section_sym {
         let si = match sym.section() {
             read::SymbolSection::Section(si) => si,
+            // Undefined/Absolute/Common symbols have no section (non_exhaustive enum)
             _ => return None,
         };
         let &gsec = sec_map.get(&(obj_idx, si))?;
@@ -280,6 +282,7 @@ fn collect_object(
             read::SectionKind::UninitializedTls => SectionKind::TlsBss,
             read::SectionKind::Elf(elf::SHT_INIT_ARRAY) => SectionKind::InitArray,
             read::SectionKind::Elf(elf::SHT_FINI_ARRAY) => SectionKind::FiniArray,
+            // Skip debug, metadata, and other non-loadable sections (non_exhaustive enum)
             _ => continue,
         };
 
@@ -301,6 +304,7 @@ fn collect_object(
                     if s { 1u64 } else { 0 }
                 }).unwrap_or(0) } else { 0 })
             }
+            // Non-ELF flags (COFF, Mach-O) have no merge/strings concept (non_exhaustive enum)
             _ => (false, false, 0),
         };
 
@@ -337,6 +341,7 @@ fn collect_object(
         }
         let sec_idx = match symbol.section() {
             read::SymbolSection::Section(idx) => idx,
+            // Undefined/Absolute/Common symbols have no section (non_exhaustive enum)
             _ => continue,
         };
         let global_sec = match sec_map.get(&(obj_idx, sec_idx)) {
@@ -416,6 +421,7 @@ fn collect_object(
                         }),
                     }
                 }
+                // Xcoff/Generic/etc. — reject unknown formats (non_exhaustive enum)
                 flags => return Err(LinkError::UnsupportedRawRelocation {
                     raw_type: format!("{flags:?}"),
                     symbol: sym_name,
@@ -434,7 +440,7 @@ fn collect_object(
                     64 => i64::from_le_bytes(data[off..off + 8].try_into().unwrap()),
                     32 => i32::from_le_bytes(data[off..off + 4].try_into().unwrap()) as i64,
                     16 => i16::from_le_bytes(data[off..off + 2].try_into().unwrap()) as i64,
-                    _ => 0,
+                    sz => panic!("unexpected implicit addend size {sz} bits for {sym_name}"),
                 };
                 reloc.addend() + implicit
             } else {

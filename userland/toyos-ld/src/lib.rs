@@ -530,8 +530,11 @@ pub(crate) fn classify_sections(state: &mut collect::LinkState) -> SectionBucket
         match sec.kind {
             SectionKind::InitArray => 0u8,
             SectionKind::FiniArray => 1,
-            _ if sec.kind.is_nobits() => 3,
-            _ => 2,
+            SectionKind::Bss => 3,
+            SectionKind::Data => 2,
+            // classify_sections routes Code/ReadOnly to rx, Tls/TlsBss to tls
+            SectionKind::Code | SectionKind::ReadOnly
+            | SectionKind::Tls | SectionKind::TlsBss => unreachable!(),
         }
     });
     buckets
