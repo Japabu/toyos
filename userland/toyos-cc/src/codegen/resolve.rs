@@ -158,33 +158,20 @@ impl Codegen {
             CType::Void => I64, // void expressions produce dummy i64
             CType::Bool | CType::Char(_) => I8,
             CType::Short(_) => I16,
-            CType::Int(_) | CType::Enum(_) | CType::Float => I32,
-            CType::Long(_) | CType::LongLong(_) | CType::Double | CType::Pointer(_) => I64,
-            CType::LongDouble | CType::Int128(_) => I128,
+            CType::Int(_) | CType::Enum(_) => I32,
+            CType::Float => F32,
+            CType::Long(_) | CType::LongLong(_) | CType::Pointer(_) => I64,
+            CType::Double | CType::LongDouble => F64,
+            CType::Int128(_) => I128,
             CType::Array(..) | CType::Function(..) => I64, // pointer-like
             CType::Struct(_) | CType::Union(_) => {
-                // Small structs can be passed as integers, larger ones by pointer
                 match ty.size() {
-                    0 => I8,
-                    1 => I8,
+                    0..=1 => I8,
                     2 => I16,
                     3..=4 => I32,
-                    5..=8 => I64,
-                    _ => I64, // passed by pointer
+                    _ => I64,
                 }
             }
-        }
-    }
-
-    pub(crate) fn is_float_type(&self, ty: &CType) -> bool {
-        matches!(ty, CType::Float | CType::Double | CType::LongDouble)
-    }
-
-    pub(crate) fn clif_float_type(&self, ty: &CType) -> ir::Type {
-        match ty {
-            CType::Float => F32,
-            CType::Double | CType::LongDouble => F64,
-            _ => panic!("not a float type"),
         }
     }
 

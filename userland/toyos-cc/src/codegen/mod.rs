@@ -135,8 +135,6 @@ impl Codegen {
             // Struct/union params are passed by pointer
             let clif_ty = if matches!(&p.ty, CType::Struct(_) | CType::Union(_)) {
                 I64
-            } else if self.is_float_type(&p.ty) {
-                self.clif_float_type(&p.ty)
             } else {
                 self.clif_type(&p.ty)
             };
@@ -153,11 +151,7 @@ impl Codegen {
         }
         // No return value for sret functions
         if !Self::needs_sret(ret) && !matches!(ret, CType::Void) {
-            let clif_ty = if self.is_float_type(ret) {
-                self.clif_float_type(ret)
-            } else {
-                self.clif_type(ret)
-            };
+            let clif_ty = self.clif_type(ret);
             sig.returns.push(AbiParam::new(clif_ty));
         }
         sig
@@ -367,11 +361,7 @@ impl Codegen {
                     self.emit_memcpy(&mut ctx, local_ptr, val, size_val);
                     ctx.local_ptrs.insert(name.clone(), (local_ptr, p.ty.clone()));
                 } else {
-                    let clif_ty = if self.is_float_type(&p.ty) {
-                        self.clif_float_type(&p.ty)
-                    } else {
-                        self.clif_type(&p.ty)
-                    };
+                    let clif_ty = self.clif_type(&p.ty);
                     let var = ctx.builder.declare_var(clif_ty);
                     ctx.builder.def_var(var, val);
                     ctx.locals.insert(name.clone(), (var, p.ty.clone()));
@@ -419,11 +409,7 @@ impl Codegen {
             if matches!(ctx.return_type, CType::Void) || ctx.sret_ptr.is_some() {
                 ctx.builder.ins().return_(&[]);
             } else {
-                let clif_ty = if self.is_float_type(&ctx.return_type) {
-                    self.clif_float_type(&ctx.return_type)
-                } else {
-                    self.clif_type(&ctx.return_type)
-                };
+                let clif_ty = self.clif_type(&ctx.return_type);
                 let zero = if clif_ty == F32 {
                     ctx.builder.ins().f32const(0.0)
                 } else if clif_ty == F64 {

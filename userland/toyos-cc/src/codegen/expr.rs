@@ -209,11 +209,7 @@ impl Codegen {
                 // Check spilled locals (address was taken — load from stack)
                 if let Some((slot, ty)) = ctx.spilled_locals.get(name) {
                     let ptr = ctx.builder.ins().stack_addr(I64, *slot, 0);
-                    let load_ty = if self.is_float_type(ty) {
-                        self.clif_float_type(ty)
-                    } else {
-                        self.clif_type(ty)
-                    };
+                    let load_ty = self.clif_type(ty);
                     return ctx.builder.ins().load(load_ty, MemFlags::new(), ptr, 0);
                 }
                 // Check local pointers (stack-allocated aggregates)
@@ -221,11 +217,7 @@ impl Codegen {
                     return match ty {
                         CType::Struct(_) | CType::Union(_) | CType::Array(_, _) => *ptr,
                         _ => {
-                            let load_ty = if self.is_float_type(ty) {
-                                self.clif_float_type(ty)
-                            } else {
-                                self.clif_type(ty)
-                            };
+                            let load_ty = self.clif_type(ty);
                             ctx.builder.ins().load(load_ty, MemFlags::new(), *ptr, 0)
                         }
                     };
@@ -245,11 +237,7 @@ impl Codegen {
                     // For scalar types, load the value; arrays/structs return the address
                     if let Some(ty) = self.global_types.get(name) {
                         if !matches!(ty, CType::Array(..) | CType::Struct(_) | CType::Union(_)) {
-                            let load_ty = if self.is_float_type(ty) {
-                                self.clif_float_type(ty)
-                            } else {
-                                self.clif_type(ty)
-                            };
+                            let load_ty = self.clif_type(ty);
                             return ctx.builder.ins().load(load_ty, MemFlags::new(), addr, 0);
                         }
                     }
@@ -443,7 +431,7 @@ impl Codegen {
                             }
                         }
                         let load_ty = deref_ty
-                            .map(|ty| if self.is_float_type(&ty) { self.clif_float_type(&ty) } else { self.clif_type(&ty) })
+                            .map(|ty| self.clif_type(&ty))
                             .expect("deref: cannot resolve pointee type");
                         ctx.builder.ins().load(load_ty, MemFlags::new(), ptr, 0)
                     }
@@ -463,9 +451,8 @@ impl Codegen {
                                 return new_val;
                             }
                         }
-                        let mem_ty = self.expr_type(ctx, e).map(|ty| {
-                            if self.is_float_type(&ty) { self.clif_float_type(&ty) } else { self.clif_type(&ty) }
-                        }).expect("pre-increment: cannot resolve type");
+                        let mem_ty = self.expr_type(ctx, e).map(|ty| self.clif_type(&ty))
+                            .expect("pre-increment: cannot resolve type");
                         let addr = self.compile_addr(ctx, e);
                         let val = ctx.builder.ins().load(mem_ty, MemFlags::new(), addr, 0);
                         let step = ctx.builder.ins().iconst(mem_ty, stride);
@@ -486,9 +473,8 @@ impl Codegen {
                                 return new_val;
                             }
                         }
-                        let mem_ty = self.expr_type(ctx, e).map(|ty| {
-                            if self.is_float_type(&ty) { self.clif_float_type(&ty) } else { self.clif_type(&ty) }
-                        }).expect("pre-decrement: cannot resolve type");
+                        let mem_ty = self.expr_type(ctx, e).map(|ty| self.clif_type(&ty))
+                            .expect("pre-decrement: cannot resolve type");
                         let addr = self.compile_addr(ctx, e);
                         let val = ctx.builder.ins().load(mem_ty, MemFlags::new(), addr, 0);
                         let step = ctx.builder.ins().iconst(mem_ty, stride);
@@ -515,9 +501,8 @@ impl Codegen {
                         return val; // return old value
                     }
                 }
-                let mem_ty = self.expr_type(ctx, e).map(|ty| {
-                    if self.is_float_type(&ty) { self.clif_float_type(&ty) } else { self.clif_type(&ty) }
-                }).expect("post-inc/dec: cannot resolve type");
+                let mem_ty = self.expr_type(ctx, e).map(|ty| self.clif_type(&ty))
+                    .expect("post-inc/dec: cannot resolve type");
                 let addr = self.compile_addr(ctx, e);
                 let val = ctx.builder.ins().load(mem_ty, MemFlags::new(), addr, 0);
                 let step = ctx.builder.ins().iconst(mem_ty, stride);
@@ -549,11 +534,7 @@ impl Codegen {
                 if let Expr::Ident(name) = lhs.as_ref() {
                     if let Some((var, ty)) = ctx.locals.get(name) {
                         let var = *var;
-                        let var_clif = if self.is_float_type(&ty) {
-                            self.clif_float_type(&ty)
-                        } else {
-                            self.clif_type(&ty)
-                        };
+                        let var_clif = self.clif_type(&ty);
                         let val = if *op == AssignOp::Assign {
                             rhs_val
                         } else {
@@ -571,11 +552,7 @@ impl Codegen {
                     // Spilled locals: store through stack slot
                     if let Some((slot, ty)) = ctx.spilled_locals.get(name) {
                         let slot = *slot;
-                        let var_clif = if self.is_float_type(&ty) {
-                            self.clif_float_type(&ty)
-                        } else {
-                            self.clif_type(&ty)
-                        };
+                        let var_clif = self.clif_type(&ty);
                         let ptr = ctx.builder.ins().stack_addr(I64, slot, 0);
                         let val = if *op == AssignOp::Assign {
                             rhs_val
@@ -629,9 +606,8 @@ impl Codegen {
                 // clobbering adjacent fields (e.g. unsigned short promoted to int
                 // would store 4 bytes into a 2-byte field)
                 let store_ty = self.field_storage_type(ctx, lhs).or(lhs_ty);
-                let store_clif = store_ty.as_ref().map(|ty| {
-                    if self.is_float_type(ty) { self.clif_float_type(ty) } else { self.clif_type(ty) }
-                }).expect("assignment: cannot resolve lhs type");
+                let store_clif = store_ty.as_ref().map(|ty| self.clif_type(ty))
+                    .expect("assignment: cannot resolve lhs type");
                 let val = if *op == AssignOp::Assign {
                     rhs_val
                 } else {
@@ -695,8 +671,6 @@ impl Codegen {
                         for p in &param_ctypes {
                             let clif_ty = if matches!(&p.ty, CType::Struct(_) | CType::Union(_)) {
                                 I64
-                            } else if self.is_float_type(&p.ty) {
-                                self.clif_float_type(&p.ty)
                             } else {
                                 self.clif_type(&p.ty)
                             };
@@ -710,11 +684,7 @@ impl Codegen {
                         if !is_indirect_sret {
                             let has_return = !matches!(&ret_cty, CType::Void);
                             if has_return {
-                                let ret_clif = if self.is_float_type(&ret_cty) {
-                                    self.clif_float_type(&ret_cty)
-                                } else {
-                                    self.clif_type(&ret_cty)
-                                };
+                                    let ret_clif = self.clif_type(&ret_cty);
                                 call_sig.returns.push(AbiParam::new(ret_clif));
                             }
                         }
@@ -931,8 +901,6 @@ impl Codegen {
                         if i < param_ctypes.len() {
                             let target = if matches!(&param_ctypes[i].ty, CType::Struct(_) | CType::Union(_)) {
                                 I64
-                            } else if self.is_float_type(&param_ctypes[i].ty) {
-                                self.clif_float_type(&param_ctypes[i].ty)
                             } else {
                                 self.clif_type(&param_ctypes[i].ty)
                             };
@@ -967,11 +935,7 @@ impl Codegen {
                     if !is_indir_sret {
                         let has_return = !matches!(&ret_cty, CType::Void);
                         if has_return {
-                            let ret_clif = if self.is_float_type(&ret_cty) {
-                                self.clif_float_type(&ret_cty)
-                            } else {
-                                self.clif_type(&ret_cty)
-                            };
+                            let ret_clif = self.clif_type(&ret_cty);
                             sig.returns.push(AbiParam::new(ret_clif));
                         }
                     }
@@ -997,11 +961,7 @@ impl Codegen {
                 if matches!(target_ty, CType::Void) { return val; }
                 // Struct/union cast: val is already an address, return as-is
                 if matches!(target_ty, CType::Struct(_) | CType::Union(_)) { return val; }
-                let target_clif = if self.is_float_type(&target_ty) {
-                    self.clif_float_type(&target_ty)
-                } else {
-                    self.clif_type(&target_ty)
-                };
+                let target_clif = self.clif_type(&target_ty);
                 let val_type = ctx.builder.func.dfg.value_type(val);
                 // For float→unsigned int, use fcvt_to_uint to avoid trap on large values
                 if val_type.is_float() && target_clif.is_int() && !target_ty.is_signed() {
@@ -1051,9 +1011,7 @@ impl Codegen {
                         _ => None,
                     }
                 };
-                let merge_ty = common_cty.as_ref().map(|ty| {
-                    if self.is_float_type(ty) { self.clif_float_type(ty) } else { self.clif_type(ty) }
-                });
+                let merge_ty = common_cty.as_ref().map(|ty| self.clif_type(ty));
 
                 let cond_val = self.compile_expr(ctx, cond);
                 let cond_bool = self.to_bool(ctx, cond_val);
@@ -1116,7 +1074,7 @@ impl Codegen {
                 if matches!(&result_ty, CType::Array(..) | CType::Struct(_) | CType::Union(_)) {
                     return addr;
                 }
-                let load_ty = if self.is_float_type(&result_ty) { self.clif_float_type(&result_ty) } else { self.clif_type(&result_ty) };
+                let load_ty = self.clif_type(&result_ty);
                 ctx.builder.ins().load(load_ty, MemFlags::new(), addr, 0)
             }
 
@@ -1135,11 +1093,7 @@ impl Codegen {
                     }
                     return base;
                 }
-                let load_ty = if self.is_float_type(&field_ty) {
-                    self.clif_float_type(&field_ty)
-                } else {
-                    self.clif_type(&field_ty)
-                };
+                let load_ty = self.clif_type(&field_ty);
                 let val = ctx.builder.ins().load(load_ty, MemFlags::new(), base, byte_offset as i32);
                 self.extract_bitfield(ctx, val, bit_offset, bw, &field_ty)
             }
@@ -1163,11 +1117,7 @@ impl Codegen {
                     }
                     return ptr;
                 }
-                let load_ty = if self.is_float_type(&field_ty) {
-                    self.clif_float_type(&field_ty)
-                } else {
-                    self.clif_type(&field_ty)
-                };
+                let load_ty = self.clif_type(&field_ty);
                 let val = ctx.builder.ins().load(load_ty, MemFlags::new(), ptr, byte_offset as i32);
                 self.extract_bitfield(ctx, val, bit_offset, bw, &field_ty)
             }
@@ -1198,11 +1148,7 @@ impl Codegen {
                 if matches!(ty, CType::Struct(_) | CType::Union(_) | CType::Array(..)) {
                     ptr
                 } else {
-                    let load_ty = if self.is_float_type(&ty) {
-                        self.clif_float_type(&ty)
-                    } else {
-                        self.clif_type(&ty)
-                    };
+                    let load_ty = self.clif_type(&ty);
                     ctx.builder.ins().load(load_ty, MemFlags::new(), ptr, 0)
                 }
             }
@@ -1211,11 +1157,7 @@ impl Codegen {
                 // va_arg(ap, type): load value at *ap, advance ap by 8
                 let ap_val = self.compile_expr(ctx, ap_expr);
                 let ty = self.resolve_typename(type_name);
-                let load_ty = if self.is_float_type(&ty) {
-                    self.clif_float_type(&ty)
-                } else {
-                    self.clif_type(&ty)
-                };
+                let load_ty = self.clif_type(&ty);
                 let result = ctx.builder.ins().load(load_ty, MemFlags::new(), ap_val, 0);
                 // Advance ap by 8 (each vararg slot is 8 bytes)
                 let new_ap = ctx.builder.ins().iadd_imm(ap_val, 8);

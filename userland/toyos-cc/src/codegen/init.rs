@@ -187,11 +187,7 @@ impl Codegen {
                             match &items[*cursor].initializer {
                                 Initializer::Expr(e) => {
                                     let val = self.compile_expr(ctx, e);
-                                    let target_ty = if self.is_float_type(&sub_ty) {
-                                        self.clif_float_type(&sub_ty)
-                                    } else {
-                                        self.clif_type(&sub_ty)
-                                    };
+                                    let target_ty = self.clif_type(&sub_ty);
                                     let val = self.coerce(ctx, val, target_ty);
                                     ctx.builder.ins().store(MemFlags::new(), val, sub_ptr, 0);
                                 }
@@ -231,11 +227,7 @@ impl Codegen {
                 if *cursor < items.len() {
                     if let Initializer::Expr(e) = &items[*cursor].initializer {
                         let val = self.compile_expr(ctx, e);
-                        let target_ty = if self.is_float_type(ty) {
-                            self.clif_float_type(ty)
-                        } else {
-                            self.clif_type(ty)
-                        };
+                        let target_ty = self.clif_type(ty);
                         let val = self.coerce(ctx, val, target_ty);
                         ctx.builder.ins().store(MemFlags::new(), val, base_ptr, 0);
                     }
@@ -296,11 +288,7 @@ impl Codegen {
                     // Scalar (int, float, pointer, enum, bool)
                     _ => {
                         let val = self.compile_expr(ctx, e);
-                        let target_ty = if self.is_float_type(ty) {
-                            self.clif_float_type(ty)
-                        } else {
-                            self.clif_type(ty)
-                        };
+                        let target_ty = self.clif_type(ty);
                         let val = self.coerce(ctx, val, target_ty);
                         ctx.builder.ins().store(MemFlags::new(), val, ptr, 0);
                         *cursor += 1;

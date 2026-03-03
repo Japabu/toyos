@@ -272,11 +272,7 @@ impl Codegen {
                         ctx.builder.ins().return_(&[]);
                     } else {
                         let v = self.compile_expr(ctx, e);
-                        let ret_clif = if self.is_float_type(&ctx.return_type) {
-                            self.clif_float_type(&ctx.return_type)
-                        } else {
-                            self.clif_type(&ctx.return_type)
-                        };
+                        let ret_clif = self.clif_type(&ctx.return_type);
                         let v = self.coerce(ctx, v, ret_clif);
                         ctx.builder.ins().return_(&[v]);
                     }
@@ -763,11 +759,7 @@ impl Codegen {
                 continue;
             }
 
-            let clif_ty = if self.is_float_type(&ty) {
-                self.clif_float_type(&ty)
-            } else {
-                self.clif_type(&ty)
-            };
+            let clif_ty = self.clif_type(&ty);
 
             // If address is taken (&var anywhere in function), allocate on
             // stack from the start so the slot is valid in all basic blocks.
