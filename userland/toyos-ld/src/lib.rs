@@ -16,9 +16,9 @@ use std::fs;
 pub use collect::RelocType;
 use collect::{collect, synthesize_alloc_shims, gc_sections, merge_string_sections, is_archive, extract_archive, find_lib, scan_symbols, SectionIdx, SymbolDef};
 use reloc::{ElfRelocParams, apply_relocs, apply_relocs_pe, MachORelocParams, apply_relocs_macho};
-use emit_elf::{layout_elf, build_eh_frame_hdr, emit_bytes, emit_static_bytes, emit_shared_bytes};
-use emit_pe::{layout_pe, emit_pe_bytes};
-use emit_macho::{layout_macho, emit_macho_bytes};
+use emit_elf::{layout_elf, build_eh_frame_hdr, ElfEmitMode, ElfLayout};
+use emit_pe::{layout_pe, emit_pe_bytes, PeLayout};
+use emit_macho::{layout_macho, emit_macho_bytes, MachOLayout};
 
 pub(crate) const BASE_VADDR: u64 = 0;
 pub(crate) const PAGE_SIZE: u64 = 0x1000;
@@ -39,6 +39,141 @@ pub enum LinkError {
     RelocationOverflow { reloc_type: RelocType, symbol: String, value: i64 },
     #[error("entry symbol '{0}' not found")]
     MissingEntry(String),
+}
+
+// ── Pipeline typestate ──────────────────────────────────────────────────
+//
+// The linker pipeline flows:  Collected → LaidOut<L> → Vec<u8>
+//
+// `Collected` bundles collect + synthesize + merge into one step. Format-
+// specific prep (GC, Mach-O stubs) happens via `&mut self` before layout.
+//
+// `layout_*` methods consume `Collected`, producing `LaidOut<L>`. This
+// prevents re-layout or forgetting to collect.
+//
+// `relocate_and_emit*` methods consume `LaidOut<L>`, applying relocations
+// and emitting the final binary. This prevents emitting without layout or
+// relocating twice.
+
+/// Linker state after object collection + preparation. Ready for layout.
+pub(crate) struct Collected {
+    pub(crate) state: collect::LinkState,
+}
+
+/// Linker state after layout. Ready for relocation and emission.
+pub(crate) struct LaidOut<L> {
+    pub(crate) state: collect::LinkState,
+    pub(crate) layout: L,
+}
+
+impl Collected {
+    fn new(objects: &[(String, Vec<u8>)]) -> Result<Self, LinkError> {
+        let mut state = collect(objects)?;
+        synthesize_alloc_shims(&mut state);
+        merge_string_sections(&mut state);
+        Ok(Collected { state })
+    }
+
+    fn gc_sections(&mut self, entry: &str) {
+        gc_sections(&mut self.state, entry);
+    }
+
+    fn layout_elf(mut self, base_addr: u64, entry: Option<&str>, build_id: bool) -> LaidOut<ElfLayout> {
+        let layout = layout_elf(&mut self.state, base_addr, entry, build_id);
+        LaidOut { state: self.state, layout }
+    }
+
+    fn layout_pe(mut self) -> LaidOut<PeLayout> {
+        let layout = layout_pe(&mut self.state);
+        LaidOut { state: self.state, layout }
+    }
+
+    fn layout_macho(mut self, entry: &str) -> LaidOut<MachOLayout> {
+        let layout = layout_macho(&mut self.state, entry);
+        LaidOut { state: self.state, layout }
+    }
+}
+
+impl LaidOut<ElfLayout> {
+    fn relocate_and_emit_pie(mut self, entry: &str) -> Result<Vec<u8>, LinkError> {
+        let params = ElfRelocParams {
+            got: &self.layout.got,
+            tls_start: self.layout.tls_start,
+            tls_memsz: self.layout.tls_memsz,
+            plt: Some(&self.layout.plt),
+            dyn_got: &self.layout.dyn_got,
+            record_relatives: true,
+            allow_undefined: false,
+        };
+        let relocs = apply_relocs(&mut self.state, &params)?;
+        let eh_hdr = build_eh_frame_hdr(&self.state, &self.layout);
+        emit_elf::emit_elf(&self.state, &self.layout, ElfEmitMode::Pie {
+            entry_name: entry,
+            relocs: &relocs,
+            eh_frame_hdr: &eh_hdr,
+        })
+    }
+
+    fn relocate_and_emit_static(mut self, entry: &str) -> Result<Vec<u8>, LinkError> {
+        let empty_dyn_got = HashMap::new();
+        let params = ElfRelocParams {
+            got: &self.layout.got,
+            tls_start: self.layout.tls_start,
+            tls_memsz: self.layout.tls_memsz,
+            plt: None,
+            dyn_got: &empty_dyn_got,
+            record_relatives: false,
+            allow_undefined: false,
+        };
+        apply_relocs(&mut self.state, &params)?;
+        emit_elf::emit_elf(&self.state, &self.layout, ElfEmitMode::Static { entry_name: entry })
+    }
+
+    fn relocate_and_emit_shared(mut self) -> Result<Vec<u8>, LinkError> {
+        let params = ElfRelocParams {
+            got: &self.layout.got,
+            tls_start: self.layout.tls_start,
+            tls_memsz: self.layout.tls_memsz,
+            plt: Some(&self.layout.plt),
+            dyn_got: &self.layout.dyn_got,
+            record_relatives: true,
+            allow_undefined: true,
+        };
+        let relocs = apply_relocs(&mut self.state, &params)?;
+        let eh_hdr = build_eh_frame_hdr(&self.state, &self.layout);
+        emit_elf::emit_elf(&self.state, &self.layout, ElfEmitMode::Shared {
+            relocs: &relocs,
+            eh_frame_hdr: &eh_hdr,
+        })
+    }
+}
+
+impl LaidOut<PeLayout> {
+    fn relocate_and_emit(mut self, entry: &str, subsystem: u16) -> Result<Vec<u8>, LinkError> {
+        let abs_fixups = apply_relocs_pe(&mut self.state, &self.layout)?;
+        emit_pe_bytes(&self.state, &self.layout, entry, subsystem, &abs_fixups)
+    }
+}
+
+impl LaidOut<MachOLayout> {
+    fn relocate_and_emit(mut self, entry: &str) -> Result<Vec<u8>, LinkError> {
+        let params = MachORelocParams { got: &self.layout.got };
+        let reloc_output = apply_relocs_macho(&mut self.state, &params)?;
+
+        let bind_entries: Vec<(String, u64)> = self.layout.got_entries.iter()
+            .filter(|(_, ext)| *ext)
+            .map(|(name, _)| (name.clone(), self.layout.got[name]))
+            .collect();
+
+        let mut rebase_entries = reloc_output.rebase_entries;
+        for (name, ext) in &self.layout.got_entries {
+            if !ext {
+                rebase_entries.push((self.layout.got[name], 0));
+            }
+        }
+
+        emit_macho_bytes(&self.state, &self.layout, entry, &rebase_entries, &bind_entries)
+    }
 }
 
 // ── Public API ──────────────────────────────────────────────────────────
@@ -62,13 +197,9 @@ pub fn link_pe_with(
     subsystem: u16,
     gc: bool,
 ) -> Result<Vec<u8>, LinkError> {
-    let mut state = collect(objects)?;
-    synthesize_alloc_shims(&mut state);
-    merge_string_sections(&mut state);
-    if gc { gc_sections(&mut state, entry); }
-    let pe_layout = layout_pe(&mut state);
-    let base_relocs = apply_relocs_pe(&mut state, &pe_layout)?;
-    emit_pe_bytes(&state, &pe_layout, entry, subsystem, &base_relocs)
+    let mut collected = Collected::new(objects)?;
+    if gc { collected.gc_sections(entry); }
+    collected.layout_pe().relocate_and_emit(entry, subsystem)
 }
 
 /// Link object files and produce a static ELF executable (ET_EXEC).
@@ -80,7 +211,7 @@ pub fn link_static(
     entry: &str,
     base_addr: u64,
 ) -> Result<Vec<u8>, LinkError> {
-    link_static_with(objects, entry, base_addr, false)
+    link_static_full(objects, entry, base_addr, false, false)
 }
 
 pub fn link_static_with(
@@ -99,29 +230,16 @@ pub fn link_static_full(
     gc: bool,
     build_id: bool,
 ) -> Result<Vec<u8>, LinkError> {
-    let mut state = collect(objects)?;
-    synthesize_alloc_shims(&mut state);
-    merge_string_sections(&mut state);
-    if gc { gc_sections(&mut state, entry); }
-    let layout = layout_elf(&mut state, base_addr, None, build_id);
-    let empty_dyn_got = HashMap::new();
-    let params = ElfRelocParams {
-        got: &layout.got,
-        tls_start: layout.tls_start,
-        tls_memsz: layout.tls_memsz,
-        plt: None,
-        dyn_got: &empty_dyn_got,
-        record_relatives: false,
-        allow_undefined: false,
-    };
-    apply_relocs(&mut state, &params)?;
-    emit_static_bytes(&state, &layout, entry)
+    let mut collected = Collected::new(objects)?;
+    if gc { collected.gc_sections(entry); }
+    collected.layout_elf(base_addr, None, build_id)
+        .relocate_and_emit_static(entry)
 }
 
 /// Link object files and produce a PIE ELF executable.
 /// Returns the raw ELF bytes on success, or a list of undefined symbols on failure.
 pub fn link(objects: &[(String, Vec<u8>)], entry: &str) -> Result<Vec<u8>, LinkError> {
-    link_with(objects, entry, false)
+    link_full(objects, entry, false, false)
 }
 
 pub fn link_with(
@@ -138,23 +256,10 @@ pub fn link_full(
     gc: bool,
     build_id: bool,
 ) -> Result<Vec<u8>, LinkError> {
-    let mut state = collect(objects)?;
-    synthesize_alloc_shims(&mut state);
-    merge_string_sections(&mut state);
-    if gc { gc_sections(&mut state, entry); }
-    let layout = layout_elf(&mut state, BASE_VADDR, Some(entry), build_id);
-    let params = ElfRelocParams {
-        got: &layout.got,
-        tls_start: layout.tls_start,
-        tls_memsz: layout.tls_memsz,
-        plt: Some(&layout.plt),
-        dyn_got: &layout.dyn_got,
-        record_relatives: true,
-        allow_undefined: false,
-    };
-    let reloc_output = apply_relocs(&mut state, &params)?;
-    let eh_hdr = build_eh_frame_hdr(&state, &layout);
-    emit_bytes(&state, &layout, &reloc_output, entry, &eh_hdr)
+    let mut collected = Collected::new(objects)?;
+    if gc { collected.gc_sections(entry); }
+    collected.layout_elf(BASE_VADDR, Some(entry), build_id)
+        .relocate_and_emit_pie(entry)
 }
 
 /// Resolve library names (-l flags) against search paths (-L flags),
@@ -245,22 +350,9 @@ pub fn link_shared(objects: &[(String, Vec<u8>)]) -> Result<Vec<u8>, LinkError> 
 }
 
 pub fn link_shared_full(objects: &[(String, Vec<u8>)], build_id: bool) -> Result<Vec<u8>, LinkError> {
-    let mut state = collect(objects)?;
-    synthesize_alloc_shims(&mut state);
-    merge_string_sections(&mut state);
-    let layout = layout_elf(&mut state, BASE_VADDR, None, build_id);
-    let params = ElfRelocParams {
-        got: &layout.got,
-        tls_start: layout.tls_start,
-        tls_memsz: layout.tls_memsz,
-        plt: Some(&layout.plt),
-        dyn_got: &layout.dyn_got,
-        record_relatives: true,
-        allow_undefined: true,
-    };
-    let reloc_output = apply_relocs(&mut state, &params)?;
-    let eh_hdr = build_eh_frame_hdr(&state, &layout);
-    Ok(emit_shared_bytes(&state, &layout, &reloc_output, &eh_hdr))
+    Collected::new(objects)?
+        .layout_elf(BASE_VADDR, None, build_id)
+        .relocate_and_emit_shared()
 }
 
 /// Link object files and produce a Mach-O executable for macOS.
@@ -270,65 +362,44 @@ pub fn link_macho(
     entry: &str,
     gc: bool,
 ) -> Result<Vec<u8>, LinkError> {
-    let mut state = collect(objects)?;
-    synthesize_alloc_shims(&mut state);
-    merge_string_sections(&mut state);
+    let mut collected = Collected::new(objects)?;
 
     // Mark any truly undefined symbols as dynamic (dylib) imports
     {
         use std::collections::HashSet;
-        let referenced: HashSet<String> = state.relocs.iter()
+        let referenced: HashSet<String> = collected.state.relocs.iter()
             .map(|r| r.symbol_name.clone())
             .collect();
         let undefined: Vec<String> = referenced.into_iter()
             .filter(|sym| {
-                !state.globals.contains_key(sym)
-                    && !state.locals.keys().any(|(_, n)| n == sym)
+                !collected.state.globals.contains_key(sym)
+                    && !collected.state.locals.keys().any(|(_, n)| n == sym)
             })
             .collect();
         for sym in undefined {
-            state.globals.insert(sym, SymbolDef::Dynamic);
+            collected.state.globals.insert(sym, SymbolDef::Dynamic);
         }
     }
 
     // Create stubs for direct calls (CALL26) to undefined/dynamic symbols.
     // Each stub loads the target address from a GOT slot and branches to it.
-    create_call_stubs(&mut state);
+    create_call_stubs(&mut collected.state);
 
     // Sections with absolute relocations need runtime rebasing, which requires
     // writable memory. Move read-only data sections (like .data.ro) to __DATA.
     {
-        let abs_reloc_sections: std::collections::HashSet<SectionIdx> = state.relocs.iter()
+        let abs_reloc_sections: std::collections::HashSet<SectionIdx> = collected.state.relocs.iter()
             .filter(|r| r.r_type == RelocType::Aarch64Abs64)
             .map(|r| r.section)
             .collect();
         for &idx in &abs_reloc_sections {
-            state.sections[idx.0].writable = true;
+            collected.state.sections[idx.0].writable = true;
         }
     }
 
-    if gc { gc_sections(&mut state, entry); }
-    let layout = layout_macho(&mut state, entry);
-
-    // Apply relocations
-    let params = MachORelocParams { got: &layout.got };
-    let reloc_output = apply_relocs_macho(&mut state, &params)?;
-
-    // Build bind entries for external GOT slots
-    let bind_entries: Vec<(String, u64)> = layout.got_entries.iter()
-        .filter(|(_, ext)| *ext)
-        .map(|(name, _)| (name.clone(), layout.got[name]))
-        .collect();
-
-    // Rebase entries: internal absolute pointers + internal GOT entries
-    let mut rebase_entries = reloc_output.rebase_entries;
-    for (name, ext) in &layout.got_entries {
-        if !ext {
-            rebase_entries.push((layout.got[name], 0)); // value already written
-        }
-    }
-
-    emit_macho_bytes(&state, &layout, entry, &rebase_entries, &bind_entries)
+    if gc { collected.gc_sections(entry); }
+    collected.layout_macho(entry)
+        .relocate_and_emit(entry)
 }
 
 /// Create call stubs for CALL26 relocations targeting dynamic (undefined) symbols.

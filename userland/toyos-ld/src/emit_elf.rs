@@ -621,38 +621,9 @@ pub(crate) enum ElfEmitMode<'a> {
     },
 }
 
-// Thin wrappers preserving the existing API
-
-pub(crate) fn emit_bytes(
-    state: &LinkState,
-    layout: &ElfLayout,
-    relocs: &RelocOutput,
-    entry_name: &str,
-    eh_frame_hdr: &[u8],
-) -> Result<Vec<u8>, LinkError> {
-    emit_elf(state, layout, ElfEmitMode::Pie { entry_name, relocs, eh_frame_hdr })
-}
-
-pub(crate) fn emit_static_bytes(
-    state: &LinkState,
-    layout: &ElfLayout,
-    entry_name: &str,
-) -> Result<Vec<u8>, LinkError> {
-    emit_elf(state, layout, ElfEmitMode::Static { entry_name })
-}
-
-pub(crate) fn emit_shared_bytes(
-    state: &LinkState,
-    layout: &ElfLayout,
-    relocs: &RelocOutput,
-    eh_frame_hdr: &[u8],
-) -> Vec<u8> {
-    emit_elf(state, layout, ElfEmitMode::Shared { relocs, eh_frame_hdr }).unwrap()
-}
-
 // ── Unified ELF emitter ─────────────────────────────────────────────────
 
-fn emit_elf(
+pub(crate) fn emit_elf(
     state: &LinkState,
     layout: &ElfLayout,
     mode: ElfEmitMode,
