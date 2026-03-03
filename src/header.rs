@@ -768,6 +768,35 @@ impl Header {
         unimplemented!();
     }
 
+    #[cfg(target_os = "toyos")]
+    fn fill_platform_from(&mut self, meta: &fs::Metadata, mode: HeaderMode) {
+        match mode {
+            HeaderMode::Complete => {
+                self.set_uid(0);
+                self.set_gid(0);
+                self.set_mtime(0);
+                let fs_mode = if meta.is_dir() { 0o755 } else { 0o644 };
+                self.set_mode(fs_mode);
+            }
+            HeaderMode::Deterministic => {
+                self.set_uid(0);
+                self.set_gid(0);
+                self.set_mtime(DETERMINISTIC_TIMESTAMP);
+                let fs_mode = if meta.is_dir() { 0o755 } else { 0o644 };
+                self.set_mode(fs_mode);
+            }
+        }
+
+        let ft = meta.file_type();
+        self.set_entry_type(if ft.is_dir() {
+            EntryType::dir()
+        } else if ft.is_file() {
+            EntryType::file()
+        } else {
+            EntryType::new(b' ')
+        });
+    }
+
     #[cfg(all(unix, not(target_arch = "wasm32")))]
     fn fill_platform_from(&mut self, meta: &fs::Metadata, mode: HeaderMode) {
         match mode {
@@ -1634,7 +1663,7 @@ fn copy_path_into_gnu_long(slot: &mut [u8], path: &Path, is_link_name: bool) -> 
     copy_path_into_inner(slot, path, is_link_name, true)
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(target_arch = "wasm32", target_os = "toyos"))]
 fn ends_with_slash(p: &Path) -> bool {
     p.to_string_lossy().ends_with('/')
 }
@@ -1650,7 +1679,7 @@ fn ends_with_slash(p: &Path) -> bool {
     p.as_os_str().as_bytes().ends_with(b"/")
 }
 
-#[cfg(any(windows, target_arch = "wasm32"))]
+#[cfg(any(windows, target_arch = "wasm32", target_os = "toyos"))]
 pub fn path2bytes(p: &Path) -> io::Result<Cow<'_, [u8]>> {
     p.as_os_str()
         .to_str()
@@ -1712,7 +1741,7 @@ pub fn bytes2path(bytes: Cow<[u8]>) -> io::Result<Cow<Path>> {
     })
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(target_arch = "wasm32", target_os = "toyos"))]
 pub fn bytes2path(bytes: Cow<[u8]>) -> io::Result<Cow<Path>> {
     Ok(match bytes {
         Cow::Borrowed(bytes) => {
@@ -1724,7 +1753,7 @@ pub fn bytes2path(bytes: Cow<[u8]>) -> io::Result<Cow<Path>> {
     })
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(target_arch = "wasm32", target_os = "toyos"))]
 fn invalid_utf8<T>(_: T) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, "Invalid utf-8")
 }

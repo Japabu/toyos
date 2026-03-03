@@ -592,7 +592,7 @@ impl<'a> EntryFields<'a> {
             }
             return Ok(Unpacked::__Nonexhaustive);
 
-            #[cfg(target_arch = "wasm32")]
+            #[cfg(any(target_arch = "wasm32", target_os = "toyos"))]
             #[allow(unused_variables)]
             fn symlink(src: &Path, dst: &Path) -> io::Result<()> {
                 Err(io::Error::new(io::ErrorKind::Other, "Not implemented"))
@@ -769,8 +769,8 @@ impl<'a> EntryFields<'a> {
             }
         }
 
-        // Windows does not support posix numeric ownership IDs
-        #[cfg(any(windows, target_arch = "wasm32"))]
+        // Windows/ToyOS do not support posix numeric ownership IDs
+        #[cfg(any(windows, target_arch = "wasm32", target_os = "toyos"))]
         fn _set_ownerships(
             _: &Path,
             _: &Option<&mut std::fs::File>,
@@ -844,7 +844,7 @@ impl<'a> EntryFields<'a> {
             }
         }
 
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(any(target_arch = "wasm32", target_os = "toyos"))]
         #[allow(unused_variables)]
         fn _set_perms(
             dst: &Path,
@@ -853,7 +853,7 @@ impl<'a> EntryFields<'a> {
             mask: u32,
             _preserve: bool,
         ) -> io::Result<()> {
-            Err(io::Error::new(io::ErrorKind::Other, "Not implemented"))
+            Ok(())
         }
 
         #[cfg(all(unix, not(target_arch = "wasm32"), feature = "xattr"))]
@@ -894,7 +894,7 @@ impl<'a> EntryFields<'a> {
         }
         // Windows does not completely support posix xattrs
         // https://en.wikipedia.org/wiki/Extended_file_attributes#Windows_NT
-        #[cfg(any(windows, not(feature = "xattr"), target_arch = "wasm32"))]
+        #[cfg(any(windows, not(feature = "xattr"), target_arch = "wasm32", target_os = "toyos"))]
         fn set_xattrs(_: &mut EntryFields, _: &Path) -> io::Result<()> {
             Ok(())
         }
