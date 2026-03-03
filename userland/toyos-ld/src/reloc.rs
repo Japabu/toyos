@@ -97,7 +97,9 @@ fn apply_one_reloc(
         }
         RelocType::X86Gotpcrel | RelocType::X86Gotpcrelx
         | RelocType::X86RexGotpcrelx => {
-            let got_slot = got[&reloc.symbol_name];
+            let got_slot = *got.get(&reloc.symbol_name).ok_or_else(|| {
+                LinkError::UndefinedSymbols(vec![reloc.symbol_name.clone()])
+            })?;
             let value = got_slot as i64 + reloc.addend - reloc_vaddr as i64;
             check_i32(value, reloc)?;
             write_i32(state, reloc.section, reloc.offset, value as i32);
@@ -262,7 +264,9 @@ pub(crate) fn apply_relocs(
                 write_i32(state, reloc.section, reloc.offset, value as i32);
             }
             RelocType::X86Gottpoff => {
-                let got_slot = params.got[&reloc.symbol_name];
+                let got_slot = *params.got.get(&reloc.symbol_name).ok_or_else(|| {
+                    LinkError::UndefinedSymbols(vec![reloc.symbol_name.clone()])
+                })?;
                 let value = got_slot as i64 + reloc.addend - reloc_vaddr as i64;
                 check_i32(value, reloc)?;
                 write_i32(state, reloc.section, reloc.offset, value as i32);
@@ -375,6 +379,11 @@ fn apply_one_reloc_aarch64(
             let sym_page = got_slot as i64 & !0xFFF;
             let pc_page = reloc_vaddr as i64 & !0xFFF;
             let page_delta = (sym_page - pc_page) >> 12;
+            if page_delta < -(1 << 20) || page_delta >= (1 << 20) {
+                return Err(LinkError::RelocationOverflow {
+                    reloc_type: reloc.r_type, symbol: reloc.symbol_name.clone(), value: page_delta,
+                });
+            }
             patch_aarch64_adrp(state, reloc.section, reloc.offset, page_delta as i32);
             Ok(false)
         }

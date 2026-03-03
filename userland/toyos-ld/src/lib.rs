@@ -25,41 +25,19 @@ pub(crate) const PAGE_SIZE: u64 = 0x1000;
 
 // ── Error type ──────────────────────────────────────────────────────────
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum LinkError {
+    #[error("undefined symbol: {}", .0.join(", "))]
     UndefinedSymbols(Vec<String>),
+    #[error("cannot parse {file}: {message}")]
     Parse { file: String, message: String },
+    #[error("unsupported relocation type {reloc_type} for symbol {symbol}")]
     UnsupportedRelocation { reloc_type: RelocType, symbol: String },
+    #[error("relocation overflow: type {reloc_type} for symbol {symbol} value {value:#x}")]
     RelocationOverflow { reloc_type: RelocType, symbol: String, value: i64 },
+    #[error("entry symbol '{0}' not found")]
     MissingEntry(String),
 }
-
-impl std::fmt::Display for LinkError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            LinkError::UndefinedSymbols(syms) => {
-                for sym in syms {
-                    writeln!(f, "undefined symbol: {sym}")?;
-                }
-                Ok(())
-            }
-            LinkError::Parse { file, message } => {
-                write!(f, "cannot parse {file}: {message}")
-            }
-            LinkError::UnsupportedRelocation { reloc_type, symbol } => {
-                write!(f, "unsupported relocation type {reloc_type} for symbol {symbol}")
-            }
-            LinkError::RelocationOverflow { reloc_type, symbol, value } => {
-                write!(f, "relocation overflow: type {reloc_type} for symbol {symbol} value {value:#x}")
-            }
-            LinkError::MissingEntry(name) => {
-                write!(f, "entry symbol '{name}' not found")
-            }
-        }
-    }
-}
-
-impl std::error::Error for LinkError {}
 
 // ── Public API ──────────────────────────────────────────────────────────
 
