@@ -4,6 +4,6 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-toyos-abi = { path = "../../rust/library/toyos-abi" }
+toyos-abi = { path = "../../toyos-abi" }
 font = { path = "../font" }
 window = { path = "../window" }

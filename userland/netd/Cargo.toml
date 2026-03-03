@@ -3,7 +3,7 @@ name = "netd"
 edition = "2024"
 
 [dependencies]
-toyos-abi = { path = "../../rust/library/toyos-abi" }
+toyos-abi = { path = "../../toyos-abi" }
 
 [dependencies.smoltcp]
 version = "0.12"
