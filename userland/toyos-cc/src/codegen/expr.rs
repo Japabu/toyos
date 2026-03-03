@@ -2,8 +2,8 @@ use super::*;
 
 impl Codegen {
     /// Returns the element stride for a pointer or array type, or None.
-    fn elem_stride(ty: &Option<CType>) -> Option<i64> {
-        match ty.as_ref()? {
+    fn elem_stride(ty: &CType) -> Option<i64> {
+        match ty {
             CType::Pointer(inner) | CType::Array(inner, _) => Some(inner.size().max(1) as i64),
             _ => None,
         }
@@ -13,7 +13,6 @@ impl Codegen {
     /// Returns 1 for non-pointer types (ordinary integer inc/dec).
     fn pointer_stride(&mut self, ctx: &FuncCtx, expr: &Expr) -> i64 {
         let ty = self.expr_type(ctx, expr);
-        // Non-pointer types return None from elem_stride; stride 1 is correct for integer inc/dec
         Self::elem_stride(&ty).unwrap_or(1)
     }
 
@@ -59,12 +58,12 @@ impl Codegen {
     fn field_storage_type(&mut self, ctx: &FuncCtx, expr: &Expr) -> Option<CType> {
         match expr {
             Expr::Member(e, field) => {
-                let base_ty = self.expr_type(ctx, e)?;
+                let base_ty = self.expr_type(ctx, e);
                 let base_ty = self.resolve_incomplete_type(base_ty);
                 base_ty.field_offset(field).map(|(_, _, ty)| ty)
             }
             Expr::Arrow(e, field) => {
-                let ptr_ty = self.expr_type(ctx, e)?;
+                let ptr_ty = self.expr_type(ctx, e);
                 let pointee = match ptr_ty {
                     CType::Pointer(inner) => *inner,
                     _ => return None,
@@ -81,14 +80,14 @@ impl Codegen {
     fn bitfield_info(&mut self, ctx: &FuncCtx, expr: &Expr) -> Option<(u32, u32, CType)> {
         match expr {
             Expr::Member(e, field) => {
-                let base_ty = self.expr_type(ctx, e)?;
+                let base_ty = self.expr_type(ctx, e);
                 let base_ty = self.resolve_incomplete_type(base_ty);
                 let (_, bit_offset, field_ty) = base_ty.field_offset(field)?;
                 let bw = base_ty.field_bit_width(field)?;
                 if bw > 0 { Some((bit_offset, bw, field_ty)) } else { None }
             }
             Expr::Arrow(e, field) => {
-                let ptr_ty = self.expr_type(ctx, e)?;
+                let ptr_ty = self.expr_type(ctx, e);
                 let pointee_ty = match ptr_ty {
                     CType::Pointer(inner) => *inner,
                     _ => return None,
@@ -282,16 +281,13 @@ impl Codegen {
                     }
                     UnaryOp::Deref => {
                         let ptr = self.compile_expr(ctx, e).raw();
-                        let deref_ty = self.expr_type(ctx, e).and_then(|ty| match ty {
-                            CType::Pointer(inner) => Some(*inner),
-                            _ => None,
-                        });
-                        if let Some(ref ty) = deref_ty {
-                            if matches!(ty, CType::Struct(_) | CType::Union(_) | CType::Array(..) | CType::Function(..)) {
-                                return TypedValue::unsigned(ptr);
-                            }
+                        let deref_ty = match self.expr_type(ctx, e) {
+                            CType::Pointer(inner) => *inner,
+                            other => panic!("deref: non-pointer type {other:?}"),
+                        };
+                        if matches!(deref_ty, CType::Struct(_) | CType::Union(_) | CType::Array(..) | CType::Function(..)) {
+                            return TypedValue::unsigned(ptr);
                         }
-                        let deref_ty = deref_ty.expect("deref: cannot resolve pointee type");
                         let load_ty = self.clif_type(&deref_ty);
                         TypedValue::new(
                             ctx.builder.ins().load(load_ty, MemFlags::new(), ptr, 0),
@@ -304,7 +300,8 @@ impl Codegen {
                     UnaryOp::PreInc | UnaryOp::PreDec => {
                         let is_inc = matches!(op, UnaryOp::PreInc);
                         let stride = self.pointer_stride(ctx, e);
-                        let sign = self.expr_type(ctx, e).map(|t| t.signedness()).unwrap_or(Signedness::Signed);
+                        let ety = self.expr_type(ctx, e);
+                        let sign = ety.signedness();
                         if let Expr::Ident(name) = e.as_ref() {
                             if let Some((var, _)) = ctx.locals.get(name) {
                                 let var = *var;
@@ -316,8 +313,7 @@ impl Codegen {
                                 return TypedValue::new(new_val, sign);
                             }
                         }
-                        let mem_ty = self.expr_type(ctx, e).map(|ty| self.clif_type(&ty))
-                            .expect("pre-inc/dec: cannot resolve type");
+                        let mem_ty = self.clif_type(&ety);
                         let addr = self.compile_addr(ctx, e);
                         let val = ctx.builder.ins().load(mem_ty, MemFlags::new(), addr, 0);
                         let step = ctx.builder.ins().iconst(mem_ty, stride);
@@ -330,7 +326,7 @@ impl Codegen {
 
             Expr::PostUnary(op, e) => {
                 let stride = self.pointer_stride(ctx, e);
-                let sign = self.expr_type(ctx, e).map(|t| t.signedness()).unwrap_or(Signedness::Signed);
+                let sign = self.expr_type(ctx, e).signedness();
                 if let Expr::Ident(name) = e.as_ref() {
                     if let Some((var, _)) = ctx.locals.get(name) {
                         let var = *var;
@@ -345,8 +341,8 @@ impl Codegen {
                         return TypedValue::new(val, sign);
                     }
                 }
-                let mem_ty = self.expr_type(ctx, e).map(|ty| self.clif_type(&ty))
-                    .expect("post-inc/dec: cannot resolve type");
+                let ety = self.expr_type(ctx, e);
+                let mem_ty = self.clif_type(&ety);
                 let addr = self.compile_addr(ctx, e);
                 let val = ctx.builder.ins().load(mem_ty, MemFlags::new(), addr, 0);
                 let step = ctx.builder.ins().iconst(mem_ty, stride);
@@ -391,9 +387,7 @@ impl Codegen {
                         ty.size()
                     }
                     SizeofArg::Expr(e) => {
-                        let ty = self.expr_type(ctx, e)
-                            .unwrap_or_else(|| panic!("sizeof: cannot resolve type of expression"));
-                        ty.size()
+                        self.expr_type(ctx, e).size()
                     }
                 };
                 TypedValue::unsigned(ctx.builder.ins().iconst(I64, size as i64))
@@ -409,14 +403,10 @@ impl Codegen {
                 let common_cty = {
                     let tt = self.expr_type(ctx, then);
                     let ft = self.expr_type(ctx, else_);
-                    match (&tt, &ft) {
-                        (Some(l), Some(r)) => Some(CType::common(l, r)),
-                        (Some(t), None) | (None, Some(t)) => Some(t.clone()),
-                        _ => None,
-                    }
+                    CType::common(&tt, &ft)
                 };
-                let common_sign = common_cty.as_ref().map(|t| t.signedness()).unwrap_or(Signedness::Signed);
-                let merge_ty = common_cty.as_ref().map(|ty| self.clif_type(ty));
+                let common_sign = common_cty.signedness();
+                let merge_ty = Some(self.clif_type(&common_cty));
 
                 let cond_val = self.compile_expr(ctx, cond).raw();
                 let cond_bool = self.to_bool(ctx, cond_val);
@@ -452,8 +442,7 @@ impl Codegen {
             }
 
             Expr::Index(arr, idx) => {
-                let arr_ty = self.expr_type(ctx, arr)
-                    .unwrap_or_else(|| panic!("index: cannot resolve array/pointer type"));
+                let arr_ty = self.expr_type(ctx, arr);
                 let elem_size = match &arr_ty {
                     CType::Pointer(inner) | CType::Array(inner, _) => inner.size(),
                     other => panic!("index on non-pointer/array type {other:?}"),
@@ -464,8 +453,7 @@ impl Codegen {
                 let offset = ctx.builder.ins().imul_imm(idx_val, elem_size as i64);
                 let addr = ctx.builder.ins().iadd(arr_val, offset);
                 // If result type is array or struct/union, return address (decay to pointer)
-                let result_ty = self.expr_type(ctx, expr)
-                    .expect("index: cannot resolve result type");
+                let result_ty = self.expr_type(ctx, expr);
                 if matches!(&result_ty, CType::Array(..) | CType::Struct(_) | CType::Union(_)) {
                     return TypedValue::unsigned(addr);
                 }
@@ -478,8 +466,7 @@ impl Codegen {
 
             Expr::Member(e, field) => {
                 let base = self.compile_addr(ctx, e);
-                let base_ty = self.expr_type(ctx, e)
-                    .unwrap_or_else(|| panic!("cannot resolve type of member base '.{field}'"));
+                let base_ty = self.expr_type(ctx, e);
                 let base_ty = self.resolve_incomplete_type(base_ty);
                 let (byte_offset, bit_offset, field_ty) = base_ty.field_offset(field)
                     .unwrap_or_else(|| panic!("no field '{field}' in {base_ty:?}"));
@@ -499,8 +486,7 @@ impl Codegen {
 
             Expr::Arrow(e, field) => {
                 let ptr = self.compile_expr(ctx, e).raw();
-                let ptr_ty = self.expr_type(ctx, e)
-                    .unwrap_or_else(|| panic!("cannot resolve type of arrow base '->{field}'"));
+                let ptr_ty = self.expr_type(ctx, e);
                 let pointee_ty = match ptr_ty {
                     CType::Pointer(inner) => *inner,
                     other => panic!("arrow '->{field}' on non-pointer type {other:?}"),
@@ -785,13 +771,8 @@ impl Codegen {
         // (smaller unsigned types get promoted to signed int per C integer promotion)
         let lty = self.expr_type(ctx, lhs);
         let rty = self.expr_type(ctx, rhs);
-        let is_unsigned = match (&lty, &rty) {
-            (Some(l), Some(r)) => {
-                (l.is_unsigned() && l.size() >= 4) || (r.is_unsigned() && r.size() >= 4)
-            }
-            (Some(t), None) | (None, Some(t)) => t.is_unsigned() && t.size() >= 4,
-            _ => false,
-        };
+        let is_unsigned =
+            (lty.is_unsigned() && lty.size() >= 4) || (rty.is_unsigned() && rty.size() >= 4);
         let l_tv = self.compile_expr(ctx, lhs);
         let r_tv = self.compile_expr(ctx, rhs);
         // C integer promotion: promote narrow types to at least int (I32)
@@ -809,11 +790,9 @@ impl Codegen {
         // For unsigned ops, narrow operands to the correct C type width
         // so that e.g. (unsigned)-1 / -2 operates at 32-bit, not 64-bit
         let (l, r) = if is_unsigned {
-            if let (Some(lt), Some(rt)) = (&lty, &rty) {
-                let common = CType::common(lt, rt);
-                let w = self.clif_type(&common);
-                (self.coerce_unsigned(ctx, l, w), self.coerce_unsigned(ctx, r, w))
-            } else { (l, r) }
+            let common = CType::common(&lty, &rty);
+            let w = self.clif_type(&common);
+            (self.coerce_unsigned(ctx, l, w), self.coerce_unsigned(ctx, r, w))
         } else { (l, r) };
         // Comparison operators always produce signed int
         let result_sign = match op {
@@ -839,7 +818,7 @@ impl Codegen {
             }
         }
 
-        let lhs_sign = self.expr_type(ctx, lhs).map(|t| t.signedness()).unwrap_or(Signedness::Signed);
+        let lhs_sign = self.expr_type(ctx, lhs).signedness();
 
         // Direct variable assignment
         if let Expr::Ident(name) = lhs {
@@ -882,15 +861,13 @@ impl Codegen {
 
         // Array/struct assignment: emit memcpy
         if op == AssignOp::Assign {
-            if let Some(ref ty) = lhs_ty {
-                if matches!(ty, CType::Array(..) | CType::Struct(_) | CType::Union(_)) {
-                    let size = ty.size();
-                    let dst = self.compile_addr(ctx, lhs);
-                    let src = rhs_val; // for aggregates, compile_expr returns address
-                    let size_val = ctx.builder.ins().iconst(I64, size as i64);
-                    self.emit_memcpy(ctx, dst, src, size_val);
-                    return TypedValue::unsigned(dst);
-                }
+            if matches!(&lhs_ty, CType::Array(..) | CType::Struct(_) | CType::Union(_)) {
+                let size = lhs_ty.size();
+                let dst = self.compile_addr(ctx, lhs);
+                let src = rhs_val; // for aggregates, compile_expr returns address
+                let size_val = ctx.builder.ins().iconst(I64, size as i64);
+                self.emit_memcpy(ctx, dst, src, size_val);
+                return TypedValue::unsigned(dst);
             }
         }
 
@@ -916,9 +893,8 @@ impl Codegen {
         let addr = self.compile_addr(ctx, lhs);
         // Use actual field type for stores (not promoted type) to avoid
         // clobbering adjacent fields
-        let store_ty = self.field_storage_type(ctx, lhs).or(lhs_ty);
-        let store_clif = store_ty.as_ref().map(|ty| self.clif_type(ty))
-            .expect("assignment: cannot resolve lhs type");
+        let store_ty = self.field_storage_type(ctx, lhs).unwrap_or(lhs_ty);
+        let store_clif = self.clif_type(&store_ty);
         let val = if op == AssignOp::Assign {
             rhs_val
         } else {
@@ -1111,8 +1087,7 @@ impl Codegen {
     fn compile_indirect_call_common(
         &mut self, ctx: &mut FuncCtx, func: &Expr, func_ptr: Value, arg_vals: &[Value],
     ) -> TypedValue {
-        let fptr_ty = self.expr_type(ctx, func)
-            .unwrap_or_else(|| panic!("indirect call: cannot resolve function pointer type"));
+        let fptr_ty = self.expr_type(ctx, func);
         let (ret_cty, param_ctypes, is_variadic) = match &fptr_ty {
             CType::Pointer(inner) => match inner.as_ref() {
                 CType::Function(ret, params, v) => (ret.as_ref().clone(), params.clone(), *v),
@@ -1213,7 +1188,7 @@ impl Codegen {
         ctx.builder.ins().iconst(ty, 0)
     }
 
-    pub(crate) fn expr_type(&mut self, ctx: &FuncCtx, expr: &Expr) -> Option<CType> {
+    pub(crate) fn expr_type(&mut self, ctx: &FuncCtx, expr: &Expr) -> CType {
         verbose_enter!("expr_type", "{:?}", std::mem::discriminant(expr));
         let result = stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || {
             self.expr_type_inner(ctx, expr)
@@ -1223,139 +1198,164 @@ impl Codegen {
         result
     }
 
-    fn expr_type_inner(&mut self, ctx: &FuncCtx, expr: &Expr) -> Option<CType> {
+    fn expr_type_inner(&mut self, ctx: &FuncCtx, expr: &Expr) -> CType {
         match expr {
             Expr::Ident(name) => {
                 if let Some((_, ty)) = ctx.locals.get(name) {
-                    return Some(ty.clone());
+                    return ty.clone();
                 }
                 if let Some((_, ty)) = ctx.spilled_locals.get(name) {
-                    return Some(ty.clone());
+                    return ty.clone();
                 }
                 if let Some((_, ty)) = ctx.local_ptrs.get(name) {
-                    return Some(ty.clone());
+                    return ty.clone();
                 }
                 if let Some(ty) = self.global_types.get(name) {
-                    return Some(ty.clone());
+                    return ty.clone();
                 }
-                // Function names: return the Function type (decays to pointer in most contexts)
                 if let Some(fty) = self.func_ctypes.get(name) {
-                    return Some(fty.clone());
+                    return fty.clone();
                 }
-                None
+                if self.type_env.enum_constants.contains_key(name) {
+                    return CType::Int(Signedness::Signed);
+                }
+                panic!("expr_type: unknown identifier '{name}'")
             }
             Expr::Arrow(e, field) => {
-                let base_ty = self.expr_type(ctx, e)?;
+                let base_ty = self.expr_type(ctx, e);
                 let pointee = match base_ty {
-                    CType::Pointer(inner) => *inner,
-                    CType::Array(inner, _) => *inner, // array decays to pointer
-                    _ => return None,
+                    CType::Pointer(inner) | CType::Array(inner, _) => *inner,
+                    other => panic!("expr_type: arrow on non-pointer type {other:?}"),
                 };
                 let pointee = self.resolve_incomplete_type(pointee);
                 let bw = pointee.field_bit_width(field);
-                pointee.field_offset(field).map(|(_, _, ty)| CType::promote_integer(ty, bw))
+                let (_, _, ty) = pointee.field_offset(field)
+                    .unwrap_or_else(|| panic!("expr_type: no field '{field}' in {pointee:?}"));
+                CType::promote_integer(ty, bw)
             }
             Expr::Member(e, field) => {
-                let base_ty = self.expr_type(ctx, e)?;
+                let base_ty = self.expr_type(ctx, e);
                 let base_ty = self.resolve_incomplete_type(base_ty);
                 let bw = base_ty.field_bit_width(field);
-                base_ty.field_offset(field).map(|(_, _, ty)| CType::promote_integer(ty, bw))
+                let (_, _, ty) = base_ty.field_offset(field)
+                    .unwrap_or_else(|| panic!("expr_type: no field '{field}' in {base_ty:?}"));
+                CType::promote_integer(ty, bw)
             }
             Expr::Unary(UnaryOp::Deref, e) => {
-                let ty = self.expr_type(ctx, e)?;
+                let ty = self.expr_type(ctx, e);
                 match ty {
-                    CType::Pointer(inner) | CType::Array(inner, _) => Some(*inner),
-                    _ => None,
+                    CType::Pointer(inner) | CType::Array(inner, _) => *inner,
+                    other => panic!("expr_type: deref of non-pointer type {other:?}"),
                 }
             }
             Expr::Unary(UnaryOp::AddrOf, e) => {
-                let ty = self.expr_type(ctx, e)?;
-                Some(CType::Pointer(Box::new(ty)))
+                let ty = self.expr_type(ctx, e);
+                CType::Pointer(Box::new(ty))
             }
             Expr::Index(arr, _) => {
-                let ty = self.expr_type(ctx, arr)?;
+                let ty = self.expr_type(ctx, arr);
                 match ty {
-                    CType::Pointer(inner) | CType::Array(inner, _) => Some(*inner),
-                    _ => None,
+                    CType::Pointer(inner) | CType::Array(inner, _) => *inner,
+                    other => panic!("expr_type: index on non-pointer/array type {other:?}"),
                 }
             }
             Expr::Call(func, _) => {
                 if let Expr::Ident(name) = func.as_ref() {
-                    return self.func_ret_types.get(name).cloned();
+                    if let Some(ret_ty) = self.func_ret_types.get(name) {
+                        return ret_ty.clone();
+                    }
+                    // C89 implicit declaration: assume returns int
+                    return CType::Int(Signedness::Signed);
                 }
-                None
+                // Indirect call: derive return type from callee's function pointer type
+                let callee_ty = self.expr_type(ctx, func);
+                match &callee_ty {
+                    CType::Function(ret, _, _) => ret.as_ref().clone(),
+                    CType::Pointer(inner) => match inner.as_ref() {
+                        CType::Function(ret, _, _) => ret.as_ref().clone(),
+                        _ => CType::Int(Signedness::Signed),
+                    },
+                    _ => CType::Int(Signedness::Signed),
+                }
             }
-            Expr::Cast(type_name, _) => {
-                Some(self.resolve_typename(type_name))
-            }
+            Expr::Cast(type_name, _) => self.resolve_typename(type_name),
             Expr::PostUnary(_, e) => self.expr_type(ctx, e),
-            Expr::Unary(UnaryOp::LogNot, _) => Some(CType::Int(Signedness::Signed)),
+            Expr::Unary(UnaryOp::LogNot, _) => CType::Int(Signedness::Signed),
             Expr::Unary(UnaryOp::PreInc | UnaryOp::PreDec | UnaryOp::Neg | UnaryOp::BitNot, e) => {
                 self.expr_type(ctx, e)
             }
-            Expr::Sizeof(_) | Expr::Alignof(_) => Some(CType::Long(Signedness::Unsigned)),
-            Expr::StringLit(_) => Some(CType::Pointer(Box::new(CType::Char(Signedness::Signed)))),
-            Expr::WideStringLit(_) => Some(CType::Pointer(Box::new(CType::Int(Signedness::Signed)))),
-            Expr::IntLit(_) | Expr::CharLit(_) => Some(CType::Int(Signedness::Signed)),
-            Expr::UIntLit(_) => Some(CType::Long(Signedness::Unsigned)),
-            Expr::FloatLit(_, is_f32) => Some(if *is_f32 { CType::Float } else { CType::Double }),
+            Expr::Sizeof(_) | Expr::Alignof(_) => CType::Long(Signedness::Unsigned),
+            Expr::StringLit(_) => CType::Pointer(Box::new(CType::Char(Signedness::Signed))),
+            Expr::WideStringLit(_) => CType::Pointer(Box::new(CType::Int(Signedness::Signed))),
+            Expr::IntLit(_) | Expr::CharLit(_) => CType::Int(Signedness::Signed),
+            Expr::UIntLit(_) => CType::Long(Signedness::Unsigned),
+            Expr::FloatLit(_, is_f32) => if *is_f32 { CType::Float } else { CType::Double },
             Expr::Binary(op, l, r) => {
                 match op {
                     BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge
-                    | BinOp::LogAnd | BinOp::LogOr => Some(CType::Int(Signedness::Signed)),
-                    // Shifts: result type is promoted left operand (C99 6.5.7)
-                    BinOp::Shl | BinOp::Shr => {
-                        self.expr_type(ctx, l).map(|t| t.promote())
-                    }
-                    // Arithmetic: usual arithmetic conversions (C99 6.3.1.8)
+                    | BinOp::LogAnd | BinOp::LogOr => CType::Int(Signedness::Signed),
+                    BinOp::Shl | BinOp::Shr => self.expr_type(ctx, l).promote(),
                     _ => {
                         let lt = self.expr_type(ctx, l);
                         let rt = self.expr_type(ctx, r);
-                        match (&lt, &rt) {
-                            (Some(l), Some(r)) => Some(CType::common(l, r)),
-                            (Some(t), None) | (None, Some(t)) => Some(t.clone()),
-                            _ => None,
-                        }
+                        CType::common(&lt, &rt)
                     }
                 }
             }
             Expr::Conditional(_, t, f) => {
                 let tt = self.expr_type(ctx, t);
                 let ft = self.expr_type(ctx, f);
-                match (&tt, &ft) {
-                    (Some(l), Some(r)) => {
-                        // Function types decay to function pointers in ternary context
-                        let l = match l {
-                            CType::Function(..) => CType::Pointer(Box::new(l.clone())),
-                            other => other.clone(),
-                        };
-                        let r = match r {
-                            CType::Function(..) => CType::Pointer(Box::new(r.clone())),
-                            other => other.clone(),
-                        };
-                        // Both pointers: prefer non-void (null pointer constant yields target type per C99 6.5.15)
-                        if let (CType::Pointer(ref li), CType::Pointer(_)) = (&l, &r) {
-                            return if matches!(**li, CType::Void) { Some(r) } else { Some(l) };
-                        }
-                        if matches!(l, CType::Pointer(_)) { Some(l) }
-                        else if matches!(r, CType::Pointer(_)) { Some(r) }
-                        else { Some(CType::common(&l, &r)) }
-                    }
-                    (Some(t), None) | (None, Some(t)) => Some(t.clone()),
-                    _ => None,
+                // Function types decay to function pointers in ternary context
+                let l = match &tt {
+                    CType::Function(..) => CType::Pointer(Box::new(tt)),
+                    _ => tt,
+                };
+                let r = match &ft {
+                    CType::Function(..) => CType::Pointer(Box::new(ft)),
+                    _ => ft,
+                };
+                if let (CType::Pointer(ref li), CType::Pointer(_)) = (&l, &r) {
+                    return if matches!(**li, CType::Void) { r } else { l };
                 }
+                if matches!(l, CType::Pointer(_)) { l }
+                else if matches!(r, CType::Pointer(_)) { r }
+                else { CType::common(&l, &r) }
             }
             Expr::Assign(_, lhs, _) => self.expr_type(ctx, lhs),
+            Expr::Comma(_, b) => self.expr_type(ctx, b),
             Expr::CompoundLiteral(tn, items) => {
                 let ty = self.resolve_typename(tn);
-                // For incomplete array types, determine size from initializer count
                 if let CType::Array(elem, None) = ty {
-                    Some(CType::Array(elem, Some(items.len())))
+                    CType::Array(elem, Some(items.len()))
                 } else {
-                    Some(ty)
+                    ty
                 }
             }
-            _ => None,
+            Expr::VaArg(_, type_name) => self.resolve_typename(type_name),
+            Expr::StmtExpr(items) => {
+                for item in items.iter().rev() {
+                    if let BlockItem::Stmt(Statement::Expr(Some(e))) = item {
+                        return self.expr_type(ctx, e);
+                    }
+                }
+                CType::Void
+            }
+            Expr::Builtin(name, args) => match name.as_str() {
+                "__builtin_offsetof" => CType::Long(Signedness::Unsigned),
+                "__builtin_expect" => self.expr_type(ctx, &args[0]),
+                "__builtin_constant_p" => CType::Int(Signedness::Signed),
+                "__builtin_choose_expr" => {
+                    let val = crate::ast::eval_const_expr(&args[0], Some(&self.type_env.enum_constants));
+                    match val {
+                        Some(v) if v != 0 => self.expr_type(ctx, &args[1]),
+                        _ => self.expr_type(ctx, &args[2]),
+                    }
+                }
+                "__builtin_unreachable" => CType::Void,
+                "__builtin_va_start" | "__builtin_va_end" | "__builtin_va_copy" => CType::Void,
+                "__builtin_va_arg" => CType::Long(Signedness::Signed),
+                _ => panic!("expr_type: unknown builtin '{name}'"),
+            },
         }
     }
 
@@ -1411,8 +1411,7 @@ impl Codegen {
                 self.compile_expr(ctx, e).raw() // *p address is just p
             }
             Expr::Index(arr, idx) => {
-                let arr_ty = self.expr_type(ctx, arr)
-                    .unwrap_or_else(|| panic!("compile_addr: cannot resolve type of indexed expression"));
+                let arr_ty = self.expr_type(ctx, arr);
                 let elem_size = match &arr_ty {
                     CType::Pointer(inner) | CType::Array(inner, _) => inner.size(),
                     other => panic!("compile_addr: index on non-pointer/array type {other:?}"),
@@ -1425,8 +1424,7 @@ impl Codegen {
             }
             Expr::Member(e, field) => {
                 let base = self.compile_addr(ctx, e);
-                let base_ty = self.expr_type(ctx, e)
-                    .unwrap_or_else(|| panic!("compile_addr: cannot resolve type of member base '.{field}'"));
+                let base_ty = self.expr_type(ctx, e);
                 let base_ty = self.resolve_incomplete_type(base_ty);
                 let (byte_offset, _, _) = base_ty.field_offset(field)
                     .unwrap_or_else(|| panic!("compile_addr: no field '{field}' in {base_ty:?}"));
@@ -1438,8 +1436,7 @@ impl Codegen {
             }
             Expr::Arrow(e, field) => {
                 let ptr = self.compile_expr(ctx, e).raw();
-                let ptr_ty = self.expr_type(ctx, e)
-                    .unwrap_or_else(|| panic!("compile_addr: cannot resolve type of arrow base '->{field}'"));
+                let ptr_ty = self.expr_type(ctx, e);
                 let pointee_ty = match ptr_ty {
                     CType::Pointer(inner) => *inner,
                     other => panic!("compile_addr: arrow '->{field}' on non-pointer type {other:?}"),
@@ -1478,7 +1475,7 @@ impl Codegen {
             _ => {
                 // For struct/union-typed expressions, compile_expr already returns an address
                 let ty = self.expr_type(ctx, expr);
-                if matches!(ty.as_ref(), Some(CType::Struct(_) | CType::Union(_))) {
+                if matches!(ty, CType::Struct(_) | CType::Union(_)) {
                     return self.compile_expr(ctx, expr).raw();
                 }
                 // Expression doesn't have an address - create a temporary

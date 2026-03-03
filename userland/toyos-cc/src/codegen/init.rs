@@ -258,7 +258,7 @@ impl Codegen {
                 let is_compound_literal = matches!(e, Expr::CompoundLiteral(..));
                 let expr_is_aggregate = is_compound_literal || {
                     let ety = self.expr_type(ctx, e);
-                    ety.as_ref().map_or(false, |t| matches!(t, CType::Struct(_) | CType::Union(_)))
+                    matches!(ety, CType::Struct(_) | CType::Union(_))
                 };
                 match ty {
                     _ if is_string_for_array => {
