@@ -129,18 +129,18 @@ impl Codegen {
                 }
             }
         }
-        // C default: unspecified signedness means signed
-        let signed = is_signed.unwrap_or(true);
-        if is_short { return Some(CType::Short(signed)); }
-        if long_count >= 2 { return Some(CType::LongLong(signed)); }
+        // When an explicit signed/unsigned keyword is present, use it.
+        // Otherwise preserve the signedness from a typedef base type.
+        if is_short { return Some(CType::Short(is_signed.unwrap_or(true))); }
+        if long_count >= 2 { return Some(CType::LongLong(is_signed.unwrap_or(true))); }
         if long_count == 1 {
             if matches!(base, Some(CType::Double)) { return Some(CType::LongDouble); }
-            return Some(CType::Long(signed));
+            return Some(CType::Long(is_signed.unwrap_or(true)));
         }
         match base {
-            Some(CType::Char(_)) => Some(CType::Char(signed)),
-            Some(CType::Int(_)) => Some(CType::Int(signed)),
-            Some(CType::Int128(_)) => Some(CType::Int128(signed)),
+            Some(CType::Char(s)) => Some(CType::Char(is_signed.unwrap_or(s))),
+            Some(CType::Int(s)) => Some(CType::Int(is_signed.unwrap_or(s))),
+            Some(CType::Int128(s)) => Some(CType::Int128(is_signed.unwrap_or(s))),
             Some(other) => Some(other),
             None => {
                 if is_unsigned { Some(CType::Int(false)) }
@@ -251,26 +251,25 @@ impl Codegen {
             }
         }
 
-        // C default: unspecified signedness means signed
-        let signed = is_signed.unwrap_or(true);
-
+        // When an explicit signed/unsigned keyword is present, use it.
+        // Otherwise preserve the signedness from a typedef base type.
         if is_short {
-            return CType::Short(signed);
+            return CType::Short(is_signed.unwrap_or(true));
         }
         if long_count >= 2 {
-            return CType::LongLong(signed);
+            return CType::LongLong(is_signed.unwrap_or(true));
         }
         if long_count == 1 {
             if matches!(base, Some(CType::Double)) {
                 return CType::LongDouble;
             }
-            return CType::Long(signed);
+            return CType::Long(is_signed.unwrap_or(true));
         }
 
         match base {
-            Some(CType::Char(_)) => CType::Char(signed),
-            Some(CType::Int(_)) => CType::Int(signed),
-            Some(CType::Int128(_)) => CType::Int128(signed),
+            Some(CType::Char(s)) => CType::Char(is_signed.unwrap_or(s)),
+            Some(CType::Int(s)) => CType::Int(is_signed.unwrap_or(s)),
+            Some(CType::Int128(s)) => CType::Int128(is_signed.unwrap_or(s)),
             Some(other) => other,
             None => {
                 if is_unsigned { CType::Int(false) }

@@ -530,6 +530,7 @@ impl Codegen {
             }
 
             Expr::Assign(op, lhs, rhs) => {
+                let rhs_unsigned = self.expr_type(ctx, rhs).map_or(false, |t| t.is_unsigned());
                 let mut rhs_val = self.compile_expr(ctx, rhs);
 
                 // Scale RHS for pointer += / -= by sizeof(pointee)
@@ -559,7 +560,11 @@ impl Codegen {
                             let lhs_val = ctx.builder.use_var(var);
                             self.compile_compound_assign(ctx, *op, lhs_val, rhs_val)
                         };
-                        let val = self.coerce(ctx, val, var_clif);
+                        let val = if rhs_unsigned {
+                            self.coerce_unsigned(ctx, val, var_clif)
+                        } else {
+                            self.coerce(ctx, val, var_clif)
+                        };
                         ctx.builder.def_var(var, val);
                         return val;
                     }
@@ -578,7 +583,11 @@ impl Codegen {
                             let lhs_val = ctx.builder.ins().load(var_clif, MemFlags::new(), ptr, 0);
                             self.compile_compound_assign(ctx, *op, lhs_val, rhs_val)
                         };
-                        let val = self.coerce(ctx, val, var_clif);
+                        let val = if rhs_unsigned {
+                            self.coerce_unsigned(ctx, val, var_clif)
+                        } else {
+                            self.coerce(ctx, val, var_clif)
+                        };
                         ctx.builder.ins().store(MemFlags::new(), val, ptr, 0);
                         return val;
                     }
@@ -629,7 +638,11 @@ impl Codegen {
                     let lhs_val = ctx.builder.ins().load(store_clif, MemFlags::new(), addr, 0);
                     self.compile_compound_assign(ctx, *op, lhs_val, rhs_val)
                 };
-                let val = self.coerce(ctx, val, store_clif);
+                let val = if rhs_unsigned {
+                    self.coerce_unsigned(ctx, val, store_clif)
+                } else {
+                    self.coerce(ctx, val, store_clif)
+                };
                 ctx.builder.ins().store(MemFlags::new(), val, addr, 0);
                 val
             }
@@ -1878,7 +1891,7 @@ impl Codegen {
     }
 
     /// Like coerce, but uses zero-extension for integer widening (for unsigned types)
-    fn coerce_unsigned(&self, ctx: &mut FuncCtx, val: Value, target: ir::Type) -> Value {
+    pub(crate) fn coerce_unsigned(&self, ctx: &mut FuncCtx, val: Value, target: ir::Type) -> Value {
         let val_type = ctx.builder.func.dfg.value_type(val);
         if val_type == target { return val; }
         if val_type.is_int() && target.is_int() {

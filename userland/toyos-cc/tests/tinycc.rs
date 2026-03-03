@@ -247,3 +247,4 @@ tinycc_test!(t147_sizeof_deref_array, "147_sizeof_deref_array");
 tinycc_test!(t148_directive_in_args, "148_directive_in_args");
 tinycc_test!(t149_bitfield_write, "149_bitfield_write");
 tinycc_test!(t150_union_short_store, "150_union_short_store");
+tinycc_test!(t151_cast_truncate, "151_cast_truncate");

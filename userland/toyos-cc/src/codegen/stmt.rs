@@ -787,8 +787,13 @@ impl Codegen {
                 };
                 if let Some(init) = &id.initializer {
                     if let Initializer::Expr(e) = init {
+                        let expr_unsigned = self.expr_type(ctx, e).map_or(false, |t| t.is_unsigned());
                         let val = self.compile_expr(ctx, e);
-                        let val = self.coerce(ctx, val, clif_ty);
+                        let val = if expr_unsigned {
+                            self.coerce_unsigned(ctx, val, clif_ty)
+                        } else {
+                            self.coerce(ctx, val, clif_ty)
+                        };
                         ctx.builder.ins().store(MemFlags::new(), val, ptr, 0);
                     } else {
                         let zero = make_zero(&mut ctx.builder);
@@ -808,8 +813,13 @@ impl Codegen {
 
             if let Some(init) = &id.initializer {
                 if let Initializer::Expr(e) = init {
+                    let expr_unsigned = self.expr_type(ctx, e).map_or(false, |t| t.is_unsigned());
                     let val = self.compile_expr(ctx, e);
-                    let val = self.coerce(ctx, val, clif_ty);
+                    let val = if expr_unsigned {
+                        self.coerce_unsigned(ctx, val, clif_ty)
+                    } else {
+                        self.coerce(ctx, val, clif_ty)
+                    };
                     ctx.builder.def_var(var, val);
                 } else {
                     // Zero-init for brace initializer on scalars

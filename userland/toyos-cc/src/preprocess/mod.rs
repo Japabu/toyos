@@ -661,7 +661,7 @@ impl Preprocessor {
         };
         if !same {
             let (file, line) = self.file_stack.last().map(|(f, l, _)| (f.as_str(), *l)).unwrap_or(("", 0));
-            panic!("{}:{}: warning: {} redefined", file, line, name);
+            eprintln!("{}:{}: warning: {} redefined", file, line, name);
         }
     }
 
