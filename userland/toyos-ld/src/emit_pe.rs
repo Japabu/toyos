@@ -1,4 +1,4 @@
-use crate::collect::{collect_unique_symbols, LinkState};
+use crate::collect::{collect_unique_symbols, LinkState, SectionIdx, SymbolDef};
 use crate::reloc::resolve_symbol;
 use crate::{align_up, classify_sections, LinkError};
 use object::write::pe::{NtHeaders, Writer};
@@ -28,9 +28,9 @@ pub(crate) fn layout_pe(state: &mut LinkState) -> PeLayout {
     let text_rva = PE_SECTION_ALIGNMENT; // first section always at 0x1000
     let mut cursor = text_rva as u64;
     for &idx in &buckets.rx {
-        let sec = &mut state.sections[idx];
+        let sec = &mut state.sections[idx.0];
         cursor = align_up(cursor, sec.align);
-        sec.vaddr = cursor;
+        sec.vaddr = Some(cursor);
         cursor += sec.size;
     }
     let text_virt_size = (cursor - text_rva as u64) as u32;
@@ -42,9 +42,9 @@ pub(crate) fn layout_pe(state: &mut LinkState) -> PeLayout {
     if has_data {
         cursor = data_rva as u64;
         for &idx in &buckets.rw {
-            let sec = &mut state.sections[idx];
+            let sec = &mut state.sections[idx.0];
             cursor = align_up(cursor, sec.align);
-            sec.vaddr = cursor;
+            sec.vaddr = Some(cursor);
             cursor += sec.size;
         }
         data_virt_size = (cursor - data_rva as u64) as u32;
@@ -94,7 +94,12 @@ pub(crate) fn emit_pe_bytes(
     let entry_rva = state
         .globals
         .get(entry_name)
-        .map(|def| (state.sections[def.section_global_idx].vaddr + def.value) as u32)
+        .map(|def| match def {
+            SymbolDef::Defined { section, value } => {
+                (state.sections[section.0].vaddr.unwrap() + value) as u32
+            }
+            SymbolDef::Dynamic => panic!("entry point cannot be a dynamic symbol"),
+        })
         .ok_or_else(|| LinkError::MissingEntry(entry_name.to_string()))?;
 
     let num_sections: u16 = if layout.has_data { 3 } else { 2 }; // .text [.data] .reloc
@@ -164,8 +169,9 @@ pub(crate) fn emit_pe_bytes(
     // .text: collect all RX section data
     let mut text_data = vec![0u8; layout.text_virt_size as usize];
     for sec in &state.sections {
-        if sec.vaddr == 0 || sec.data.is_empty() { continue; }
-        let rva = sec.vaddr as u32;
+        let Some(vaddr) = sec.vaddr else { continue; };
+        if sec.data.is_empty() { continue; }
+        let rva = vaddr as u32;
         if rva >= layout.text_rva && rva < layout.text_rva + layout.text_virt_size {
             let off = (rva - layout.text_rva) as usize;
             text_data[off..off + sec.data.len()].copy_from_slice(&sec.data);
@@ -177,15 +183,16 @@ pub(crate) fn emit_pe_bytes(
     if let Some(data_range) = data_range {
         let mut data_data = vec![0u8; layout.data_virt_size as usize];
         for sec in &state.sections {
-            if sec.vaddr == 0 || sec.data.is_empty() { continue; }
-            let rva = sec.vaddr as u32;
+            let Some(vaddr) = sec.vaddr else { continue; };
+            if sec.data.is_empty() { continue; }
+            let rva = vaddr as u32;
             if rva >= layout.data_rva && rva < layout.data_rva + layout.data_virt_size {
                 let off = (rva - layout.data_rva) as usize;
                 data_data[off..off + sec.data.len()].copy_from_slice(&sec.data);
             }
         }
         for (sym_name, &got_vaddr) in &layout.got {
-            let sym_addr = resolve_symbol(state, sym_name, 0, None)
+            let sym_addr = resolve_symbol(state, sym_name, SectionIdx(0), None)
                 .ok_or_else(|| LinkError::UndefinedSymbols(vec![sym_name.clone()]))?;
             let off = (got_vaddr as u32 - layout.data_rva) as usize;
             data_data[off..off + 8].copy_from_slice(&sym_addr.to_le_bytes());

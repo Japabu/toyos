@@ -1,7 +1,7 @@
 use object::write::elf::{FileHeader, ProgramHeader, SectionHeader, SectionIndex, Sym, Rel, Writer, SymbolIndex};
 use object::write::StringId;
 use object::Endianness;
-use crate::collect::{collect_unique_symbols, InputSection, LinkState, DYNAMIC_SYMBOL_SENTINEL};
+use crate::collect::{collect_unique_symbols, InputSection, LinkState, SectionIdx, SymbolDef};
 use crate::reloc::{RelocOutput, resolve_symbol, tpoff};
 use crate::{align_up, classify_sections, is_tls_section, LinkError, BASE_VADDR, PAGE_SIZE};
 use object::elf;
@@ -164,7 +164,7 @@ pub(crate) fn build_eh_frame_hdr(state: &LinkState, layout: &ElfLayout) -> Vec<u
     for sec in &state.sections {
         if sec.name != ".eh_frame" { continue; }
         let data = &sec.data;
-        let base_vaddr = sec.vaddr;
+        let base_vaddr = sec.vaddr.unwrap();
 
         // First pass: build CIE offset → fde_encoding map
         let mut cie_encodings: HashMap<usize, u8> = HashMap::new();
@@ -262,9 +262,9 @@ pub(crate) fn layout_elf(state: &mut LinkState, base_addr: u64, entry_name: Opti
 
     let rx_start = cursor;
     for &idx in &buckets.rx {
-        let sec = &mut state.sections[idx];
+        let sec = &mut state.sections[idx.0];
         cursor = align_up(cursor, sec.align);
-        sec.vaddr = cursor;
+        sec.vaddr = Some(cursor);
         cursor += sec.size;
     }
 
@@ -287,9 +287,9 @@ pub(crate) fn layout_elf(state: &mut LinkState, base_addr: u64, entry_name: Opti
     let mut eh_frame_vaddr = 0u64;
     let mut fde_count = 0usize;
     for &idx in &buckets.rx {
-        if state.sections[idx].name == ".eh_frame" {
-            if fde_count == 0 { eh_frame_vaddr = state.sections[idx].vaddr; }
-            fde_count += count_fdes(&state.sections[idx].data);
+        if state.sections[idx.0].name == ".eh_frame" {
+            if fde_count == 0 { eh_frame_vaddr = state.sections[idx.0].vaddr.unwrap(); }
+            fde_count += count_fdes(&state.sections[idx.0].data);
         }
     }
     let (eh_frame_hdr_vaddr, eh_frame_hdr_size) = if fde_count > 0 {
@@ -315,10 +315,10 @@ pub(crate) fn layout_elf(state: &mut LinkState, base_addr: u64, entry_name: Opti
 
     // Place PROGBITS RW sections first
     for &idx in &buckets.rw {
-        if state.sections[idx].nobits { continue; }
-        let sec = &mut state.sections[idx];
+        if state.sections[idx.0].nobits { continue; }
+        let sec = &mut state.sections[idx.0];
         cursor = align_up(cursor, sec.align);
-        sec.vaddr = cursor;
+        sec.vaddr = Some(cursor);
         cursor += sec.size;
     }
 
@@ -328,13 +328,14 @@ pub(crate) fn layout_elf(state: &mut LinkState, base_addr: u64, entry_name: Opti
     let mut fini_array_vaddr = 0u64;
     let mut fini_array_size = 0u64;
     for &idx in &buckets.rw {
-        let sec = &state.sections[idx];
+        let sec = &state.sections[idx.0];
+        let Some(sec_vaddr) = sec.vaddr else { continue; };
         if sec.name.starts_with(".init_array") {
-            if init_array_size == 0 { init_array_vaddr = sec.vaddr; }
-            init_array_size = (sec.vaddr + sec.size) - init_array_vaddr;
+            if init_array_size == 0 { init_array_vaddr = sec_vaddr; }
+            init_array_size = (sec_vaddr + sec.size) - init_array_vaddr;
         } else if sec.name.starts_with(".fini_array") {
-            if fini_array_size == 0 { fini_array_vaddr = sec.vaddr; }
-            fini_array_size = (sec.vaddr + sec.size) - fini_array_vaddr;
+            if fini_array_size == 0 { fini_array_vaddr = sec_vaddr; }
+            fini_array_size = (sec_vaddr + sec.size) - fini_array_vaddr;
         }
     }
 
@@ -361,10 +362,10 @@ pub(crate) fn layout_elf(state: &mut LinkState, base_addr: u64, entry_name: Opti
 
     // Place NOBITS RW sections (.bss) after all file-backed data
     for &idx in &buckets.rw {
-        if !state.sections[idx].nobits { continue; }
-        let sec = &mut state.sections[idx];
+        if !state.sections[idx.0].nobits { continue; }
+        let sec = &mut state.sections[idx.0];
         cursor = align_up(cursor, sec.align);
-        sec.vaddr = cursor;
+        sec.vaddr = Some(cursor);
         cursor += sec.size;
     }
 
@@ -386,15 +387,15 @@ pub(crate) fn layout_elf(state: &mut LinkState, base_addr: u64, entry_name: Opti
     let tls_start = align_up(rw_end, 64);
     let mut tls_cursor = tls_start;
     for &idx in &buckets.tls {
-        let sec = &mut state.sections[idx];
+        let sec = &mut state.sections[idx.0];
         tls_cursor = align_up(tls_cursor, sec.align);
-        sec.vaddr = tls_cursor;
+        sec.vaddr = Some(tls_cursor);
         tls_cursor += sec.size;
     }
     let tls_filesz = buckets.tls
         .iter()
-        .filter(|&&idx| !state.sections[idx].name.starts_with(".tbss"))
-        .map(|&idx| state.sections[idx].size)
+        .filter(|&&idx| !state.sections[idx.0].name.starts_with(".tbss"))
+        .map(|&idx| state.sections[idx.0].size)
         .sum::<u64>();
     let tls_memsz = if buckets.tls.is_empty() { 0 } else { tls_cursor - tls_start };
 
@@ -463,12 +464,13 @@ fn resolve_entry(state: &LinkState, entry_name: &str, plt: Option<&HashMap<Strin
     state
         .globals
         .get(entry_name)
-        .map(|def| {
-            if def.section_global_idx == DYNAMIC_SYMBOL_SENTINEL {
+        .map(|def| match def {
+            SymbolDef::Dynamic => {
                 plt.and_then(|p| p.get(entry_name).copied())
                     .ok_or_else(|| LinkError::MissingEntry(entry_name.to_string()))
-            } else {
-                Ok(state.sections[def.section_global_idx].vaddr + def.value)
+            }
+            SymbolDef::Defined { section, value } => {
+                Ok(state.sections[section.0].vaddr.unwrap() + value)
             }
         })
         .unwrap_or_else(|| Err(LinkError::MissingEntry(entry_name.to_string())))
@@ -505,9 +507,9 @@ fn collect_symtab_entries<'a>(
 
     // Locals
     for ((_, name), def) in &state.locals {
-        if def.section_global_idx >= state.sections.len() { continue; }
-        let sec = &state.sections[def.section_global_idx];
-        let st_value = sec.vaddr + def.value;
+        let SymbolDef::Defined { section, value } = def else { continue; };
+        let sec = &state.sections[section.0];
+        let st_value = sec.vaddr.unwrap() + value;
         let out_idx = output_section_index(sec, text_idx, data_idx);
         let st_type = if sec.writable || sec.nobits || is_tls_section(&sec.name) {
             elf::STT_OBJECT
@@ -526,10 +528,9 @@ fn collect_symtab_entries<'a>(
 
     // Globals
     for (name, def) in &state.globals {
-        if def.section_global_idx == DYNAMIC_SYMBOL_SENTINEL { continue; }
-        if def.section_global_idx >= state.sections.len() { continue; }
-        let sec = &state.sections[def.section_global_idx];
-        let st_value = sec.vaddr + def.value;
+        let SymbolDef::Defined { section, value } = def else { continue; };
+        let sec = &state.sections[section.0];
+        let st_value = sec.vaddr.unwrap() + value;
         let out_idx = output_section_index(sec, text_idx, data_idx);
         let st_type = if sec.writable || sec.nobits || is_tls_section(&sec.name) {
             elf::STT_OBJECT
@@ -590,11 +591,11 @@ fn write_symtab(w: &mut Writer, entries: &[SymEntry]) {
 /// Write section data to the Writer in file-offset order. Skips NOBITS sections.
 fn write_sections_data(w: &mut Writer, sections: &[InputSection], base: u64) {
     let mut indices: Vec<usize> = (0..sections.len())
-        .filter(|&i| sections[i].vaddr != 0 && !sections[i].data.is_empty() && !sections[i].nobits)
+        .filter(|&i| sections[i].vaddr.is_some() && !sections[i].data.is_empty() && !sections[i].nobits)
         .collect();
-    indices.sort_by_key(|&i| sections[i].vaddr);
+    indices.sort_by_key(|&i| sections[i].vaddr.unwrap());
     for i in indices {
-        let file_off = (sections[i].vaddr - base) as usize;
+        let file_off = (sections[i].vaddr.unwrap() - base) as usize;
         w.pad_until(file_off);
         w.write(&sections[i].data);
     }
@@ -1125,7 +1126,7 @@ pub(crate) fn emit_static_bytes(
     let mut got_entries: Vec<_> = layout.got.iter().collect();
     got_entries.sort_by_key(|(_, &vaddr)| vaddr);
     for (sym_name, &got_vaddr) in got_entries {
-        let sym_addr = resolve_symbol(state, sym_name, 0, None)
+        let sym_addr = resolve_symbol(state, sym_name, SectionIdx(0), None)
             .ok_or_else(|| LinkError::UndefinedSymbols(vec![sym_name.clone()]))?;
         let value = if gottpoff_syms.contains(sym_name) {
             tpoff(sym_addr, layout.tls_start, layout.tls_memsz) as u64
@@ -1216,11 +1217,9 @@ pub(crate) fn emit_shared_bytes(
     symbols.sort_by_key(|(name, _)| *name);
     let mut sym_str_ids: Vec<(String, StringId, u64, u32)> = Vec::new();
     for (name, def) in &symbols {
-        if def.section_global_idx == DYNAMIC_SYMBOL_SENTINEL {
-            continue;
-        }
+        let SymbolDef::Defined { section, value } = def else { continue; };
         let str_id = w.add_dynamic_string(name.as_bytes());
-        let st_value = state.sections[def.section_global_idx].vaddr + def.value;
+        let st_value = state.sections[section.0].vaddr.unwrap() + value;
         let hash = gnu_hash(name.as_bytes());
         sym_str_ids.push((name.to_string(), str_id, st_value, hash));
     }

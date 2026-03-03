@@ -9,14 +9,22 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 
+/// Newtype for indices into `LinkState::sections`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct SectionIdx(pub usize);
+
+/// Newtype for indices into the input objects slice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct ObjIdx(pub usize);
+
 #[derive(Clone)]
 pub(crate) struct InputSection {
-    pub(crate) obj_idx: usize,
+    pub(crate) obj_idx: Option<ObjIdx>,
     pub(crate) name: String,
     pub(crate) data: Vec<u8>,
     pub(crate) align: u64,
     pub(crate) size: u64,
-    pub(crate) vaddr: u64,
+    pub(crate) vaddr: Option<u64>,
     pub(crate) writable: bool,
     pub(crate) nobits: bool,
     /// Section has SHF_MERGE flag (eligible for deduplication)
@@ -29,28 +37,25 @@ pub(crate) struct InputSection {
 
 #[derive(Clone)]
 pub(crate) struct InputReloc {
-    pub(crate) section_global_idx: usize,
+    pub(crate) section: SectionIdx,
     pub(crate) offset: u64,
     pub(crate) r_type: u32,
     pub(crate) symbol_name: String,
     pub(crate) addend: i64,
 }
 
-#[derive(Clone, Copy)]
-pub(crate) struct SymbolDef {
-    pub(crate) section_global_idx: usize,
-    pub(crate) value: u64,
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum SymbolDef {
+    Defined { section: SectionIdx, value: u64 },
+    Dynamic,
 }
-
-/// Sentinel: symbols provided by .so inputs have this section index.
-pub(crate) const DYNAMIC_SYMBOL_SENTINEL: usize = usize::MAX;
 
 pub(crate) struct LinkState {
     pub(crate) sections: Vec<InputSection>,
     pub(crate) relocs: Vec<InputReloc>,
     pub(crate) globals: HashMap<String, SymbolDef>,
-    pub(crate) locals: HashMap<(usize, String), SymbolDef>,
-    pub(crate) tls_sections: Vec<usize>,
+    pub(crate) locals: HashMap<(ObjIdx, String), SymbolDef>,
+    pub(crate) tls_sections: Vec<SectionIdx>,
     /// Non-loadable metadata sections (e.g. .rustc) preserved in shared library output.
     pub(crate) metadata: Vec<(String, Vec<u8>)>,
     /// Symbol names provided by shared library (.so) inputs.
@@ -71,9 +76,10 @@ pub(crate) fn collect(objects: &[(String, Vec<u8>)]) -> Result<LinkState, LinkEr
         dynamic_libs: Vec::new(),
     };
 
-    let mut sec_map: HashMap<(usize, object::SectionIndex), usize> = HashMap::new();
+    let mut sec_map: HashMap<(ObjIdx, object::SectionIndex), SectionIdx> = HashMap::new();
 
     for (obj_idx, (name, data)) in objects.iter().enumerate() {
+        let obj_idx = ObjIdx(obj_idx);
         // ELF shared library input: extract dynamic symbols, skip section processing.
         // Shared libraries are always ELF, so try ELF-specific parse first.
         if let Ok(elf) = ElfFile64::parse(data.as_slice()) {
@@ -115,10 +121,7 @@ fn collect_so_symbols(elf: &ElfFile64, globals: &mut HashMap<String, SymbolDef>,
             continue;
         }
         let name = name.to_string();
-        globals.entry(name.clone()).or_insert(SymbolDef {
-            section_global_idx: DYNAMIC_SYMBOL_SENTINEL,
-            value: 0,
-        });
+        globals.entry(name.clone()).or_insert(SymbolDef::Dynamic);
         dynamic_imports.insert(name);
     }
 }
@@ -128,8 +131,8 @@ fn collect_so_symbols(elf: &ElfFile64, globals: &mut HashMap<String, SymbolDef>,
 fn resolve_reloc_target(
     obj: &object::File,
     reloc: &read::Relocation,
-    obj_idx: usize,
-    sec_map: &HashMap<(usize, object::SectionIndex), usize>,
+    obj_idx: ObjIdx,
+    sec_map: &HashMap<(ObjIdx, object::SectionIndex), SectionIdx>,
     state: &mut LinkState,
 ) -> Option<String> {
     let sym_idx = match reloc.target() {
@@ -148,10 +151,10 @@ fn resolve_reloc_target(
             _ => return None,
         };
         let &gsec = sec_map.get(&(obj_idx, si))?;
-        let syn = format!("__section_sym_{}_{}", obj_idx, gsec);
+        let syn = format!("__section_sym_{}_{}", obj_idx.0, gsec.0);
         let sec_addr = obj.section_by_index(si).map(|s| s.address()).unwrap_or(0);
-        state.locals.entry((obj_idx, syn.clone())).or_insert(SymbolDef {
-            section_global_idx: gsec,
+        state.locals.entry((obj_idx, syn.clone())).or_insert(SymbolDef::Defined {
+            section: gsec,
             value: sym.address() - sec_addr,
         });
         Some(syn)
@@ -165,8 +168,8 @@ fn resolve_reloc_target(
 fn collect_object(
     state: &mut LinkState,
     obj: &object::File,
-    obj_idx: usize,
-    sec_map: &mut HashMap<(usize, object::SectionIndex), usize>,
+    obj_idx: ObjIdx,
+    sec_map: &mut HashMap<(ObjIdx, object::SectionIndex), SectionIdx>,
 ) {
     for section in obj.sections() {
         let sec_name = section.name().unwrap_or("");
@@ -196,7 +199,7 @@ fn collect_object(
         }
 
         let sec_data = section.data().unwrap_or(&[]).to_vec();
-        let global_idx = state.sections.len();
+        let global_idx = SectionIdx(state.sections.len());
         sec_map.insert((obj_idx, section.index()), global_idx);
 
         let is_tls = matches!(
@@ -234,12 +237,12 @@ fn collect_object(
         };
 
         state.sections.push(InputSection {
-            obj_idx,
+            obj_idx: Some(obj_idx),
             name: sec_name.to_string(),
             data: sec_data,
             align: section.align().max(1),
             size: section.size(),
-            vaddr: 0,
+            vaddr: None,
             writable,
             nobits,
             merge,
@@ -274,8 +277,8 @@ fn collect_object(
             None => continue,
         };
         let sec_addr = obj.section_by_index(sec_idx).map(|s| s.address()).unwrap_or(0);
-        let def = SymbolDef {
-            section_global_idx: global_sec,
+        let def = SymbolDef::Defined {
+            section: global_sec,
             value: symbol.address() - sec_addr,
         };
         if symbol.is_global() {
@@ -285,22 +288,22 @@ fn collect_object(
                 let alias = rest.strip_suffix(".default").unwrap_or(rest);
                 let alias = alias.to_string();
                 match state.globals.get(&alias) {
-                    Some(existing) if existing.section_global_idx != DYNAMIC_SYMBOL_SENTINEL => {}
+                    Some(SymbolDef::Defined { .. }) => {}
                     _ => { state.globals.insert(alias, def); }
                 }
             }
             // Concrete .o definitions always override .so dynamic imports
             match state.globals.get(&sym_name) {
-                Some(existing) if existing.section_global_idx != DYNAMIC_SYMBOL_SENTINEL => {}
+                Some(SymbolDef::Defined { .. }) => {}
                 _ => { state.globals.insert(sym_name, def); }
             }
         } else {
-            if let Some(existing) = state.locals.get(&(obj_idx, sym_name.clone())) {
+            if let Some(SymbolDef::Defined { section: existing_sec, .. }) = state.locals.get(&(obj_idx, sym_name.clone())) {
                 assert_eq!(
-                    existing.section_global_idx, def.section_global_idx,
-                    "local symbol {sym_name:?} in obj {obj_idx} defined in two \
+                    *existing_sec, global_sec,
+                    "local symbol {sym_name:?} in obj {} defined in two \
                      different sections ({} vs {})",
-                    existing.section_global_idx, def.section_global_idx
+                    obj_idx.0, existing_sec.0, global_sec.0
                 );
             }
             state.locals.insert((obj_idx, sym_name), def);
@@ -351,7 +354,7 @@ fn collect_object(
             let addend = if is_macho_instruction {
                 0
             } else if reloc.has_implicit_addend() {
-                let data = &state.sections[global_sec].data;
+                let data = &state.sections[global_sec.0].data;
                 let off = offset as usize;
                 let implicit = match reloc.size() {
                     64 => i64::from_le_bytes(data[off..off + 8].try_into().unwrap()),
@@ -365,7 +368,7 @@ fn collect_object(
             };
 
             state.relocs.push(InputReloc {
-                section_global_idx: global_sec,
+                section: global_sec,
                 offset,
                 r_type,
                 symbol_name: sym_name,
@@ -495,11 +498,9 @@ pub(crate) fn gc_sections(state: &mut LinkState, entry: &str) {
     if num_sections == 0 { return; }
 
     // Resolve symbol name → section index
-    let sym_to_section = |name: &str| -> Option<usize> {
-        if let Some(def) = state.globals.get(name) {
-            if def.section_global_idx != DYNAMIC_SYMBOL_SENTINEL {
-                return Some(def.section_global_idx);
-            }
+    let sym_to_section = |name: &str| -> Option<SectionIdx> {
+        if let Some(SymbolDef::Defined { section, .. }) = state.globals.get(name) {
+            return Some(*section);
         }
         None
     };
@@ -508,12 +509,13 @@ pub(crate) fn gc_sections(state: &mut LinkState, entry: &str) {
     let mut edges: Vec<HashSet<usize>> = vec![HashSet::new(); num_sections];
     for reloc in &state.relocs {
         if let Some(target) = sym_to_section(&reloc.symbol_name) {
-            edges[reloc.section_global_idx].insert(target);
+            edges[reloc.section.0].insert(target.0);
         }
         // Also check locals
-        let obj_idx = state.sections[reloc.section_global_idx].obj_idx;
-        if let Some(def) = state.locals.get(&(obj_idx, reloc.symbol_name.clone())) {
-            edges[reloc.section_global_idx].insert(def.section_global_idx);
+        if let Some(obj_idx) = state.sections[reloc.section.0].obj_idx {
+            if let Some(SymbolDef::Defined { section: target, .. }) = state.locals.get(&(obj_idx, reloc.symbol_name.clone())) {
+                edges[reloc.section.0].insert(target.0);
+            }
         }
     }
 
@@ -523,8 +525,8 @@ pub(crate) fn gc_sections(state: &mut LinkState, entry: &str) {
 
     // Entry symbol's section
     if let Some(sec_idx) = sym_to_section(entry) {
-        reachable[sec_idx] = true;
-        queue.push_back(sec_idx);
+        reachable[sec_idx.0] = true;
+        queue.push_back(sec_idx.0);
     }
 
     // .init_array / .fini_array sections are always roots
@@ -548,11 +550,11 @@ pub(crate) fn gc_sections(state: &mut LinkState, entry: &str) {
     }
 
     // Build old→new index mapping
-    let mut remap = vec![0usize; num_sections];
+    let mut remap = vec![SectionIdx(0); num_sections];
     let mut new_idx = 0;
     for old_idx in 0..num_sections {
         if reachable[old_idx] {
-            remap[old_idx] = new_idx;
+            remap[old_idx] = SectionIdx(new_idx);
             new_idx += 1;
         }
     }
@@ -567,31 +569,37 @@ pub(crate) fn gc_sections(state: &mut LinkState, entry: &str) {
     state.sections = new_sections;
 
     // Remap relocs and remove dead ones
-    state.relocs.retain(|r| reachable[r.section_global_idx]);
+    state.relocs.retain(|r| reachable[r.section.0]);
     for reloc in &mut state.relocs {
-        reloc.section_global_idx = remap[reloc.section_global_idx];
+        reloc.section = remap[reloc.section.0];
     }
 
     // Remap globals
-    state.globals.retain(|_, def| {
-        def.section_global_idx == DYNAMIC_SYMBOL_SENTINEL || reachable[def.section_global_idx]
+    state.globals.retain(|_, def| match def {
+        SymbolDef::Dynamic => true,
+        SymbolDef::Defined { section, .. } => reachable[section.0],
     });
     for def in state.globals.values_mut() {
-        if def.section_global_idx != DYNAMIC_SYMBOL_SENTINEL {
-            def.section_global_idx = remap[def.section_global_idx];
+        if let SymbolDef::Defined { section, .. } = def {
+            *section = remap[section.0];
         }
     }
 
     // Remap locals
-    state.locals.retain(|_, def| reachable[def.section_global_idx]);
+    state.locals.retain(|_, def| match def {
+        SymbolDef::Dynamic => true,
+        SymbolDef::Defined { section, .. } => reachable[section.0],
+    });
     for def in state.locals.values_mut() {
-        def.section_global_idx = remap[def.section_global_idx];
+        if let SymbolDef::Defined { section, .. } = def {
+            *section = remap[section.0];
+        }
     }
 
     // Remap tls_sections
-    state.tls_sections.retain(|&idx| reachable[idx]);
+    state.tls_sections.retain(|idx| reachable[idx.0]);
     for idx in &mut state.tls_sections {
-        *idx = remap[*idx];
+        *idx = remap[idx.0];
     }
 }
 
@@ -631,8 +639,6 @@ pub(crate) fn synthesize_alloc_shims(state: &mut LinkState) {
         .filter(|name| !state.globals.contains_key(name))
         .collect();
 
-    let synthetic_obj_idx = usize::MAX;
-
     // Each trampoline is: `jmp rel32` (E9 xx xx xx xx) = 5 bytes, padded to 16
     for &(shim_name, target_name) in ALLOC_SHIMS {
         if !undefined.contains(shim_name) {
@@ -640,14 +646,14 @@ pub(crate) fn synthesize_alloc_shims(state: &mut LinkState) {
         }
         let mut code = vec![0xE9, 0, 0, 0, 0];
         code.resize(16, 0xCC); // pad with int3
-        let sec_idx = state.sections.len();
+        let sec_idx = SectionIdx(state.sections.len());
         state.sections.push(InputSection {
-            obj_idx: synthetic_obj_idx,
+            obj_idx: None,
             name: format!(".text.{shim_name}"),
             data: code,
             align: 16,
             size: 16,
-            vaddr: 0,
+            vaddr: None,
             writable: false,
             nobits: false,
             merge: false,
@@ -656,10 +662,10 @@ pub(crate) fn synthesize_alloc_shims(state: &mut LinkState) {
         });
         state.globals.insert(
             shim_name.to_string(),
-            SymbolDef { section_global_idx: sec_idx, value: 0 },
+            SymbolDef::Defined { section: sec_idx, value: 0 },
         );
         state.relocs.push(InputReloc {
-            section_global_idx: sec_idx,
+            section: sec_idx,
             offset: 1,
             r_type: elf::R_X86_64_PLT32,
             symbol_name: target_name.to_string(),
@@ -673,14 +679,14 @@ pub(crate) fn synthesize_alloc_shims(state: &mut LinkState) {
     {
         let mut code = vec![0xC3];
         code.resize(16, 0xCC);
-        let sec_idx = state.sections.len();
+        let sec_idx = SectionIdx(state.sections.len());
         state.sections.push(InputSection {
-            obj_idx: synthetic_obj_idx,
+            obj_idx: None,
             name: format!(".text.{SHIM_NO_ALLOC_UNSTABLE}"),
             data: code,
             align: 16,
             size: 16,
-            vaddr: 0,
+            vaddr: None,
             writable: false,
             nobits: false,
             merge: false,
@@ -689,7 +695,7 @@ pub(crate) fn synthesize_alloc_shims(state: &mut LinkState) {
         });
         state.globals.insert(
             SHIM_NO_ALLOC_UNSTABLE.to_string(),
-            SymbolDef { section_global_idx: sec_idx, value: 0 },
+            SymbolDef::Defined { section: sec_idx, value: 0 },
         );
     }
 }
@@ -699,22 +705,23 @@ pub(crate) fn synthesize_alloc_shims(state: &mut LinkState) {
 /// Updates symbol values and relocation addends to reflect merged offsets.
 pub(crate) fn merge_string_sections(state: &mut LinkState) {
     // Find sections eligible for string merging
-    let merge_indices: Vec<usize> = (0..state.sections.len())
+    let merge_indices: Vec<SectionIdx> = (0..state.sections.len())
         .filter(|&i| state.sections[i].merge && state.sections[i].strings && state.sections[i].entsize == 1)
+        .map(SectionIdx)
         .collect();
 
     if merge_indices.is_empty() { return; }
 
     // Group by section name
-    let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut groups: HashMap<String, Vec<SectionIdx>> = HashMap::new();
     for &idx in &merge_indices {
-        groups.entry(state.sections[idx].name.clone()).or_default().push(idx);
+        groups.entry(state.sections[idx.0].name.clone()).or_default().push(idx);
     }
 
     // For each group with more than one section, merge them
     // offset_remap: (old_section_idx, old_offset) → new_offset in merged section
-    let mut offset_remap: HashMap<(usize, u64), u64> = HashMap::new();
-    let mut replaced_sections: HashSet<usize> = HashSet::new();
+    let mut offset_remap: HashMap<(SectionIdx, u64), u64> = HashMap::new();
+    let mut replaced_sections: HashSet<SectionIdx> = HashSet::new();
 
     for (_, group) in &groups {
         if group.len() < 2 { continue; }
@@ -724,7 +731,7 @@ pub(crate) fn merge_string_sections(state: &mut LinkState) {
         let mut merged_data = Vec::new();
 
         for &sec_idx in group {
-            let data = &state.sections[sec_idx].data;
+            let data = &state.sections[sec_idx.0].data;
             let mut pos = 0;
             while pos < data.len() {
                 // Find null terminator
@@ -749,8 +756,8 @@ pub(crate) fn merge_string_sections(state: &mut LinkState) {
 
         // Replace the first section with merged data; mark the rest for removal
         let keep_idx = group[0];
-        state.sections[keep_idx].data = merged_data;
-        state.sections[keep_idx].size = state.sections[keep_idx].data.len() as u64;
+        state.sections[keep_idx.0].data = merged_data;
+        state.sections[keep_idx.0].size = state.sections[keep_idx.0].data.len() as u64;
 
         for &sec_idx in &group[1..] {
             replaced_sections.insert(sec_idx);
@@ -759,46 +766,50 @@ pub(crate) fn merge_string_sections(state: &mut LinkState) {
 
     if replaced_sections.is_empty() && offset_remap.is_empty() { return; }
 
-    let merge_set: HashSet<usize> = merge_indices.iter().copied().collect();
+    let merge_set: HashSet<SectionIdx> = merge_indices.iter().copied().collect();
 
     // Save old symbol state before remapping (needed for relocation addend updates)
     let old_globals: HashMap<String, SymbolDef> = state.globals.clone();
-    let old_locals: HashMap<(usize, String), SymbolDef> = state.locals.clone();
+    let old_locals: HashMap<(ObjIdx, String), SymbolDef> = state.locals.clone();
 
     // Update symbol definitions pointing into merged sections
     for def in state.globals.values_mut() {
-        if let Some(&new_off) = offset_remap.get(&(def.section_global_idx, def.value)) {
-            let old_name = &state.sections[def.section_global_idx].name;
-            if let Some(group) = groups.get(old_name) {
-                def.section_global_idx = group[0];
+        if let SymbolDef::Defined { section, value } = def {
+            if let Some(&new_off) = offset_remap.get(&(*section, *value)) {
+                let old_name = &state.sections[section.0].name;
+                if let Some(group) = groups.get(old_name) {
+                    *section = group[0];
+                }
+                *value = new_off;
             }
-            def.value = new_off;
         }
     }
     for def in state.locals.values_mut() {
-        if let Some(&new_off) = offset_remap.get(&(def.section_global_idx, def.value)) {
-            let old_name = &state.sections[def.section_global_idx].name;
-            if let Some(group) = groups.get(old_name) {
-                def.section_global_idx = group[0];
+        if let SymbolDef::Defined { section, value } = def {
+            if let Some(&new_off) = offset_remap.get(&(*section, *value)) {
+                let old_name = &state.sections[section.0].name;
+                if let Some(group) = groups.get(old_name) {
+                    *section = group[0];
+                }
+                *value = new_off;
             }
-            def.value = new_off;
         }
     }
 
     // Update relocation addends: when a relocation targets a symbol in a merged
     // section, the addend may encode an offset into that section that needs remapping.
     for reloc in &mut state.relocs {
-        let obj_idx = state.sections[reloc.section_global_idx].obj_idx;
+        let obj_idx = state.sections[reloc.section.0].obj_idx;
         let old_def = old_globals.get(&reloc.symbol_name)
-            .or_else(|| old_locals.get(&(obj_idx, reloc.symbol_name.clone())));
-        if let Some(old_def) = old_def {
-            if !merge_set.contains(&old_def.section_global_idx) { continue; }
-            let old_offset = old_def.value + reloc.addend as u64;
-            if let Some(&new_offset) = offset_remap.get(&(old_def.section_global_idx, old_offset)) {
+            .or_else(|| obj_idx.and_then(|oi| old_locals.get(&(oi, reloc.symbol_name.clone()))));
+        if let Some(SymbolDef::Defined { section: old_sec, value: old_val }) = old_def {
+            if !merge_set.contains(old_sec) { continue; }
+            let old_offset = old_val + reloc.addend as u64;
+            if let Some(&new_offset) = offset_remap.get(&(*old_sec, old_offset)) {
                 let new_def = state.globals.get(&reloc.symbol_name)
-                    .or_else(|| state.locals.get(&(obj_idx, reloc.symbol_name.clone())));
-                if let Some(new_def) = new_def {
-                    reloc.addend = new_offset as i64 - new_def.value as i64;
+                    .or_else(|| obj_idx.and_then(|oi| state.locals.get(&(oi, reloc.symbol_name.clone()))));
+                if let Some(SymbolDef::Defined { value: new_val, .. }) = new_def {
+                    reloc.addend = new_offset as i64 - *new_val as i64;
                 }
             }
         }
@@ -806,50 +817,52 @@ pub(crate) fn merge_string_sections(state: &mut LinkState) {
 
     // Remove replaced sections and remap all indices
     if !replaced_sections.is_empty() {
-        let mut index_map: Vec<Option<usize>> = Vec::with_capacity(state.sections.len());
+        let mut index_map: Vec<Option<SectionIdx>> = Vec::with_capacity(state.sections.len());
         let mut new_idx = 0;
         for i in 0..state.sections.len() {
-            if replaced_sections.contains(&i) {
+            if replaced_sections.contains(&SectionIdx(i)) {
                 index_map.push(None);
             } else {
-                index_map.push(Some(new_idx));
+                index_map.push(Some(SectionIdx(new_idx)));
                 new_idx += 1;
             }
         }
 
         // Remap section indices in symbols
         for def in state.globals.values_mut() {
-            if def.section_global_idx != DYNAMIC_SYMBOL_SENTINEL {
-                if let Some(new) = index_map.get(def.section_global_idx).and_then(|x| *x) {
-                    def.section_global_idx = new;
+            if let SymbolDef::Defined { section, .. } = def {
+                if let Some(new) = index_map.get(section.0).and_then(|x| *x) {
+                    *section = new;
                 }
             }
         }
         for def in state.locals.values_mut() {
-            if let Some(new) = index_map.get(def.section_global_idx).and_then(|x| *x) {
-                def.section_global_idx = new;
+            if let SymbolDef::Defined { section, .. } = def {
+                if let Some(new) = index_map.get(section.0).and_then(|x| *x) {
+                    *section = new;
+                }
             }
         }
 
         // Remap section indices in relocations, drop relocs targeting removed sections
         state.relocs.retain(|r| {
-            index_map.get(r.section_global_idx).and_then(|x| *x).is_some()
+            index_map.get(r.section.0).and_then(|x| *x).is_some()
         });
         for reloc in &mut state.relocs {
-            if let Some(new) = index_map.get(reloc.section_global_idx).and_then(|x| *x) {
-                reloc.section_global_idx = new;
+            if let Some(new) = index_map.get(reloc.section.0).and_then(|x| *x) {
+                reloc.section = new;
             }
         }
 
         // Remap TLS section indices
         state.tls_sections = state.tls_sections.iter()
-            .filter_map(|&idx| index_map.get(idx).and_then(|x| *x))
+            .filter_map(|idx| index_map.get(idx.0).and_then(|x| *x))
             .collect();
 
         // Remove the sections
         let mut i = 0;
         state.sections.retain(|_| {
-            let keep = !replaced_sections.contains(&i);
+            let keep = !replaced_sections.contains(&SectionIdx(i));
             i += 1;
             keep
         });

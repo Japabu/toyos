@@ -1,4 +1,4 @@
-use crate::collect::{InputReloc, LinkState, DYNAMIC_SYMBOL_SENTINEL};
+use crate::collect::{InputReloc, LinkState, SectionIdx, SymbolDef};
 use crate::emit_pe::PeLayout;
 use crate::LinkError;
 use object::elf;
@@ -16,18 +16,21 @@ pub(crate) struct RelocOutput {
 pub(crate) fn resolve_symbol(
     state: &LinkState,
     name: &str,
-    from_sec: usize,
+    from_sec: SectionIdx,
     plt: Option<&HashMap<String, u64>>,
 ) -> Option<u64> {
     if let Some(def) = state.globals.get(name) {
-        if def.section_global_idx == DYNAMIC_SYMBOL_SENTINEL {
-            return plt.and_then(|p| p.get(name).copied());
+        match def {
+            SymbolDef::Dynamic => return plt.and_then(|p| p.get(name).copied()),
+            SymbolDef::Defined { section, value } => {
+                return Some(state.sections[section.0].vaddr.unwrap() + value);
+            }
         }
-        return Some(state.sections[def.section_global_idx].vaddr + def.value);
     }
-    let obj_idx = state.sections[from_sec].obj_idx;
-    if let Some(def) = state.locals.get(&(obj_idx, name.to_string())) {
-        return Some(state.sections[def.section_global_idx].vaddr + def.value);
+    if let Some(obj_idx) = state.sections[from_sec.0].obj_idx {
+        if let Some(SymbolDef::Defined { section, value }) = state.locals.get(&(obj_idx, name.to_string())) {
+            return Some(state.sections[section.0].vaddr.unwrap() + value);
+        }
     }
     None
 }
@@ -72,25 +75,25 @@ fn apply_one_reloc(
     match reloc.r_type {
         elf::R_X86_64_64 => {
             let value = (sym_addr as i64 + reloc.addend) as u64;
-            write_u64(state, reloc.section_global_idx, reloc.offset, value);
+            write_u64(state, reloc.section, reloc.offset, value);
             Ok(true)
         }
         elf::R_X86_64_PC32 | elf::R_X86_64_PLT32 => {
             let value = sym_addr as i64 + reloc.addend - reloc_vaddr as i64;
             check_i32(value, reloc)?;
-            write_i32(state, reloc.section_global_idx, reloc.offset, value as i32);
+            write_i32(state, reloc.section, reloc.offset, value as i32);
             Ok(false)
         }
         elf::R_X86_64_32 => {
             let value = sym_addr as i64 + reloc.addend;
             check_u32(value, reloc)?;
-            write_u32(state, reloc.section_global_idx, reloc.offset, value as u32);
+            write_u32(state, reloc.section, reloc.offset, value as u32);
             Ok(false)
         }
         elf::R_X86_64_32S => {
             let value = sym_addr as i64 + reloc.addend;
             check_i32(value, reloc)?;
-            write_i32(state, reloc.section_global_idx, reloc.offset, value as i32);
+            write_i32(state, reloc.section, reloc.offset, value as i32);
             Ok(false)
         }
         elf::R_X86_64_GOTPCREL | elf::R_X86_64_GOTPCRELX
@@ -98,7 +101,7 @@ fn apply_one_reloc(
             let got_slot = got[&reloc.symbol_name];
             let value = got_slot as i64 + reloc.addend - reloc_vaddr as i64;
             check_i32(value, reloc)?;
-            write_i32(state, reloc.section_global_idx, reloc.offset, value as i32);
+            write_i32(state, reloc.section, reloc.offset, value as i32);
             Ok(false)
         }
         other => Err(LinkError::UnsupportedRelocation {
@@ -108,21 +111,21 @@ fn apply_one_reloc(
     }
 }
 
-fn write_bytes(state: &mut LinkState, sec_idx: usize, offset: u64, bytes: &[u8]) {
-    let sec = &mut state.sections[sec_idx];
+fn write_bytes(state: &mut LinkState, sec_idx: SectionIdx, offset: u64, bytes: &[u8]) {
+    let sec = &mut state.sections[sec_idx.0];
     let off = offset as usize;
     sec.data[off..off + bytes.len()].copy_from_slice(bytes);
 }
 
-fn write_u64(state: &mut LinkState, sec_idx: usize, offset: u64, value: u64) {
+fn write_u64(state: &mut LinkState, sec_idx: SectionIdx, offset: u64, value: u64) {
     write_bytes(state, sec_idx, offset, &value.to_le_bytes());
 }
 
-fn write_i32(state: &mut LinkState, sec_idx: usize, offset: u64, value: i32) {
+fn write_i32(state: &mut LinkState, sec_idx: SectionIdx, offset: u64, value: i32) {
     write_bytes(state, sec_idx, offset, &value.to_le_bytes());
 }
 
-fn write_u32(state: &mut LinkState, sec_idx: usize, offset: u64, value: u32) {
+fn write_u32(state: &mut LinkState, sec_idx: SectionIdx, offset: u64, value: u32) {
     write_bytes(state, sec_idx, offset, &value.to_le_bytes());
 }
 
@@ -160,15 +163,15 @@ pub(crate) fn apply_relocs(
     // Pass 1: TLS GD/LD/DTPOFF relaxations. These rewrite instruction bytes
     // and overwrite the companion `call __tls_get_addr` instruction, so we
     // track which (section, offset) ranges were relaxed.
-    let mut relaxed_calls: HashSet<(usize, u64)> = HashSet::new();
+    let mut relaxed_calls: HashSet<(SectionIdx, u64)> = HashSet::new();
 
     for reloc in &relocs {
         match reloc.r_type {
             elf::R_X86_64_TLSGD => {
-                let sym_addr = resolve_symbol(state, &reloc.symbol_name, reloc.section_global_idx, params.plt)
+                let sym_addr = resolve_symbol(state, &reloc.symbol_name, reloc.section, params.plt)
                     .ok_or_else(|| LinkError::UndefinedSymbols(vec![reloc.symbol_name.clone()]))?;
                 let padded = is_padded_tls_sequence(
-                    &state.sections[reloc.section_global_idx].data,
+                    &state.sections[reloc.section.0].data,
                     reloc.offset,
                 );
                 if padded {
@@ -179,11 +182,11 @@ pub(crate) fn apply_relocs(
                         0x64, 0x48, 0x8b, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00, // mov %fs:0,%rax
                         0x48, 0x8d, 0x80, 0x00, 0x00, 0x00, 0x00,             // lea 0(%rax),%rax
                     ];
-                    write_bytes(state, reloc.section_global_idx, reloc.offset - 4, &inst);
+                    write_bytes(state, reloc.section, reloc.offset - 4, &inst);
                     let tp_value = tpoff(sym_addr, params.tls_start, params.tls_memsz);
                     check_i32(tp_value, reloc)?;
-                    write_i32(state, reloc.section_global_idx, reloc.offset + 8, tp_value as i32);
-                    relaxed_calls.insert((reloc.section_global_idx, reloc.offset + 8));
+                    write_i32(state, reloc.section, reloc.offset + 8, tp_value as i32);
+                    relaxed_calls.insert((reloc.section, reloc.offset + 8));
                 } else {
                     return Err(LinkError::UnsupportedRelocation {
                         reloc_type: elf::R_X86_64_TLSGD,
@@ -193,7 +196,7 @@ pub(crate) fn apply_relocs(
             }
             elf::R_X86_64_TLSLD => {
                 let padded = is_padded_tls_sequence(
-                    &state.sections[reloc.section_global_idx].data,
+                    &state.sections[reloc.section.0].data,
                     reloc.offset,
                 );
                 if padded {
@@ -204,8 +207,8 @@ pub(crate) fn apply_relocs(
                         0x64, 0x48, 0x8b, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00,     // mov %fs:0,%rax
                         0x0f, 0x1f, 0x40, 0x00,                                     // nopl 0(%rax)
                     ];
-                    write_bytes(state, reloc.section_global_idx, reloc.offset - 4, &inst);
-                    relaxed_calls.insert((reloc.section_global_idx, reloc.offset + 8));
+                    write_bytes(state, reloc.section, reloc.offset - 4, &inst);
+                    relaxed_calls.insert((reloc.section, reloc.offset + 8));
                 } else {
                     // LD → LE (12-byte unpadded)
                     #[rustfmt::skip]
@@ -213,16 +216,16 @@ pub(crate) fn apply_relocs(
                         0x66, 0x66, 0x66,                                           // 3x data16
                         0x64, 0x48, 0x8b, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00,     // mov %fs:0,%rax
                     ];
-                    write_bytes(state, reloc.section_global_idx, reloc.offset - 3, &inst);
-                    relaxed_calls.insert((reloc.section_global_idx, reloc.offset + 5));
+                    write_bytes(state, reloc.section, reloc.offset - 3, &inst);
+                    relaxed_calls.insert((reloc.section, reloc.offset + 5));
                 }
             }
             elf::R_X86_64_DTPOFF32 => {
-                let sym_addr = resolve_symbol(state, &reloc.symbol_name, reloc.section_global_idx, params.plt)
+                let sym_addr = resolve_symbol(state, &reloc.symbol_name, reloc.section, params.plt)
                     .ok_or_else(|| LinkError::UndefinedSymbols(vec![reloc.symbol_name.clone()]))?;
                 let value = tpoff(sym_addr, params.tls_start, params.tls_memsz) + reloc.addend;
                 check_i32(value, reloc)?;
-                write_i32(state, reloc.section_global_idx, reloc.offset, value as i32);
+                write_i32(state, reloc.section, reloc.offset, value as i32);
             }
             _ => {}
         }
@@ -234,14 +237,14 @@ pub(crate) fn apply_relocs(
             elf::R_X86_64_TLSGD | elf::R_X86_64_TLSLD | elf::R_X86_64_DTPOFF32 => continue,
             _ => {}
         }
-        if relaxed_calls.contains(&(reloc.section_global_idx, reloc.offset)) {
+        if relaxed_calls.contains(&(reloc.section, reloc.offset)) {
             continue;
         }
 
-        let sec = &state.sections[reloc.section_global_idx];
-        let reloc_vaddr = sec.vaddr + reloc.offset;
+        let sec = &state.sections[reloc.section.0];
+        let reloc_vaddr = sec.vaddr.unwrap() + reloc.offset;
 
-        let sym_addr = match resolve_symbol(state, &reloc.symbol_name, reloc.section_global_idx, params.plt) {
+        let sym_addr = match resolve_symbol(state, &reloc.symbol_name, reloc.section, params.plt) {
             Some(a) => a,
             None => {
                 if reloc.symbol_name.is_empty() {
@@ -257,13 +260,13 @@ pub(crate) fn apply_relocs(
             elf::R_X86_64_TPOFF32 => {
                 let value = tpoff(sym_addr, params.tls_start, params.tls_memsz) + reloc.addend;
                 check_i32(value, reloc)?;
-                write_i32(state, reloc.section_global_idx, reloc.offset, value as i32);
+                write_i32(state, reloc.section, reloc.offset, value as i32);
             }
             elf::R_X86_64_GOTTPOFF => {
                 let got_slot = params.got[&reloc.symbol_name];
                 let value = got_slot as i64 + reloc.addend - reloc_vaddr as i64;
                 check_i32(value, reloc)?;
-                write_i32(state, reloc.section_global_idx, reloc.offset, value as i32);
+                write_i32(state, reloc.section, reloc.offset, value as i32);
             }
             _ => {
                 let is_abs = apply_one_reloc(state, reloc, sym_addr, reloc_vaddr, params.got)?;
@@ -283,7 +286,7 @@ pub(crate) fn apply_relocs(
             .collect();
 
         for (sym_name, &got_vaddr) in params.got {
-            let sym_addr = resolve_symbol(state, sym_name, 0, params.plt)
+            let sym_addr = resolve_symbol(state, sym_name, SectionIdx(0), params.plt)
                 .ok_or_else(|| LinkError::UndefinedSymbols(vec![sym_name.clone()]))?;
             if gottpoff_syms.contains(sym_name) {
                 let tp = tpoff(sym_addr, params.tls_start, params.tls_memsz);
@@ -324,7 +327,7 @@ fn apply_one_reloc_aarch64(
         // Absolute 64-bit pointer
         elf::R_AARCH64_ABS64 => {
             let value = (sym_addr as i64 + reloc.addend) as u64;
-            write_u64(state, reloc.section_global_idx, reloc.offset, value);
+            write_u64(state, reloc.section, reloc.offset, value);
             Ok(true) // needs rebase
         }
         // BL/B instruction: 26-bit PC-relative
@@ -337,7 +340,7 @@ fn apply_one_reloc_aarch64(
                     reloc_type: reloc.r_type, symbol: reloc.symbol_name.clone(), value,
                 });
             }
-            patch_aarch64_insn_imm26(state, reloc.section_global_idx, reloc.offset, imm26 as u32);
+            patch_aarch64_insn_imm26(state, reloc.section, reloc.offset, imm26 as u32);
             Ok(false)
         }
         // ADRP: 21-bit page-relative
@@ -350,19 +353,19 @@ fn apply_one_reloc_aarch64(
                     reloc_type: reloc.r_type, symbol: reloc.symbol_name.clone(), value: page_delta,
                 });
             }
-            patch_aarch64_adrp(state, reloc.section_global_idx, reloc.offset, page_delta as i32);
+            patch_aarch64_adrp(state, reloc.section, reloc.offset, page_delta as i32);
             Ok(false)
         }
         // ADD immediate: 12-bit page offset
         elf::R_AARCH64_ADD_ABS_LO12_NC => {
             let value = ((sym_addr as i64 + reloc.addend) & 0xFFF) as u32;
-            patch_aarch64_add_imm12(state, reloc.section_global_idx, reloc.offset, value);
+            patch_aarch64_add_imm12(state, reloc.section, reloc.offset, value);
             Ok(false)
         }
         // LDR 64-bit: 12-bit page offset (scaled by 8)
         elf::R_AARCH64_LDST64_ABS_LO12_NC => {
             let value = ((sym_addr as i64 + reloc.addend) & 0xFFF) as u32;
-            patch_aarch64_ldr_imm12(state, reloc.section_global_idx, reloc.offset, value, 3);
+            patch_aarch64_ldr_imm12(state, reloc.section, reloc.offset, value, 3);
             Ok(false)
         }
         // ADRP for GOT entry page
@@ -373,7 +376,7 @@ fn apply_one_reloc_aarch64(
             let sym_page = got_slot as i64 & !0xFFF;
             let pc_page = reloc_vaddr as i64 & !0xFFF;
             let page_delta = (sym_page - pc_page) >> 12;
-            patch_aarch64_adrp(state, reloc.section_global_idx, reloc.offset, page_delta as i32);
+            patch_aarch64_adrp(state, reloc.section, reloc.offset, page_delta as i32);
             Ok(false)
         }
         // LDR for GOT entry page offset
@@ -382,7 +385,7 @@ fn apply_one_reloc_aarch64(
                 LinkError::UndefinedSymbols(vec![reloc.symbol_name.clone()])
             })?;
             let value = (got_slot & 0xFFF) as u32;
-            patch_aarch64_ldr_imm12(state, reloc.section_global_idx, reloc.offset, value, 3);
+            patch_aarch64_ldr_imm12(state, reloc.section, reloc.offset, value, 3);
             Ok(false)
         }
         other => Err(LinkError::UnsupportedRelocation {
@@ -392,8 +395,8 @@ fn apply_one_reloc_aarch64(
 }
 
 /// Patch ADRP instruction's immhi:immlo fields with a page delta.
-fn patch_aarch64_adrp(state: &mut LinkState, sec_idx: usize, offset: u64, page_delta: i32) {
-    let data = &mut state.sections[sec_idx].data;
+fn patch_aarch64_adrp(state: &mut LinkState, sec_idx: SectionIdx, offset: u64, page_delta: i32) {
+    let data = &mut state.sections[sec_idx.0].data;
     let off = offset as usize;
     let mut insn = u32::from_le_bytes(data[off..off + 4].try_into().unwrap());
     let val = page_delta as u32;
@@ -404,8 +407,8 @@ fn patch_aarch64_adrp(state: &mut LinkState, sec_idx: usize, offset: u64, page_d
 }
 
 /// Patch BL/B instruction's imm26 field.
-fn patch_aarch64_insn_imm26(state: &mut LinkState, sec_idx: usize, offset: u64, imm26: u32) {
-    let data = &mut state.sections[sec_idx].data;
+fn patch_aarch64_insn_imm26(state: &mut LinkState, sec_idx: SectionIdx, offset: u64, imm26: u32) {
+    let data = &mut state.sections[sec_idx.0].data;
     let off = offset as usize;
     let mut insn = u32::from_le_bytes(data[off..off + 4].try_into().unwrap());
     insn = (insn & 0xFC00_0000) | (imm26 & 0x03FF_FFFF);
@@ -413,8 +416,8 @@ fn patch_aarch64_insn_imm26(state: &mut LinkState, sec_idx: usize, offset: u64, 
 }
 
 /// Patch ADD instruction's imm12 field (bits [21:10]).
-fn patch_aarch64_add_imm12(state: &mut LinkState, sec_idx: usize, offset: u64, value: u32) {
-    let data = &mut state.sections[sec_idx].data;
+fn patch_aarch64_add_imm12(state: &mut LinkState, sec_idx: SectionIdx, offset: u64, value: u32) {
+    let data = &mut state.sections[sec_idx.0].data;
     let off = offset as usize;
     let mut insn = u32::from_le_bytes(data[off..off + 4].try_into().unwrap());
     insn = (insn & !(0xFFF << 10)) | ((value & 0xFFF) << 10);
@@ -423,8 +426,8 @@ fn patch_aarch64_add_imm12(state: &mut LinkState, sec_idx: usize, offset: u64, v
 
 /// Patch LDR/STR instruction's scaled imm12 field (bits [21:10]).
 /// `scale` is the log2 of the access size (0=byte, 1=half, 2=word, 3=dword).
-fn patch_aarch64_ldr_imm12(state: &mut LinkState, sec_idx: usize, offset: u64, value: u32, scale: u32) {
-    let data = &mut state.sections[sec_idx].data;
+fn patch_aarch64_ldr_imm12(state: &mut LinkState, sec_idx: SectionIdx, offset: u64, value: u32, scale: u32) {
+    let data = &mut state.sections[sec_idx.0].data;
     let off = offset as usize;
     let mut insn = u32::from_le_bytes(data[off..off + 4].try_into().unwrap());
     let scaled = (value >> scale) & 0xFFF;
@@ -449,15 +452,15 @@ pub(crate) fn apply_relocs_macho(
     let relocs = std::mem::take(&mut state.relocs);
 
     for reloc in &relocs {
-        let sec = &state.sections[reloc.section_global_idx];
-        let reloc_vaddr = sec.vaddr + reloc.offset;
+        let sec = &state.sections[reloc.section.0];
+        let reloc_vaddr = sec.vaddr.unwrap() + reloc.offset;
 
         // GOT relocations don't need the symbol address — they use the GOT
         // slot address, which is looked up by name inside the reloc handler.
         let is_got_reloc = matches!(reloc.r_type,
             elf::R_AARCH64_ADR_GOT_PAGE | elf::R_AARCH64_LD64_GOT_LO12_NC);
 
-        let sym_addr = match resolve_symbol(state, &reloc.symbol_name, reloc.section_global_idx, None) {
+        let sym_addr = match resolve_symbol(state, &reloc.symbol_name, reloc.section, None) {
             Some(a) => a,
             None if is_got_reloc && params.got.contains_key(&reloc.symbol_name) => 0,
             None => {
@@ -526,10 +529,10 @@ pub(crate) fn apply_relocs_pe(
             _ => {}
         }
 
-        let sec = &state.sections[reloc.section_global_idx];
-        let reloc_vaddr = sec.vaddr + reloc.offset;
+        let sec = &state.sections[reloc.section.0];
+        let reloc_vaddr = sec.vaddr.unwrap() + reloc.offset;
 
-        let sym_addr = match resolve_symbol(state, &reloc.symbol_name, reloc.section_global_idx, None) {
+        let sym_addr = match resolve_symbol(state, &reloc.symbol_name, reloc.section, None) {
             Some(a) => a,
             None => {
                 if reloc.symbol_name.is_empty() { 0 }

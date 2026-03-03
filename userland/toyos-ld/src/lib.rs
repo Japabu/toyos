@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::fs;
 
-use collect::{collect, synthesize_alloc_shims, gc_sections, merge_string_sections, is_archive, extract_archive, find_lib, scan_symbols};
+use collect::{collect, synthesize_alloc_shims, gc_sections, merge_string_sections, is_archive, extract_archive, find_lib, scan_symbols, SectionIdx, SymbolDef};
 use reloc::{ElfRelocParams, apply_relocs, apply_relocs_pe, MachORelocParams, apply_relocs_macho};
 use emit_elf::{layout_elf, build_eh_frame_hdr, emit_bytes, emit_static_bytes, emit_shared_bytes};
 use emit_pe::{layout_pe, emit_pe_bytes};
@@ -306,10 +306,7 @@ pub fn link_macho(
             })
             .collect();
         for sym in undefined {
-            state.globals.insert(sym, collect::SymbolDef {
-                section_global_idx: collect::DYNAMIC_SYMBOL_SENTINEL,
-                value: 0,
-            });
+            state.globals.insert(sym, SymbolDef::Dynamic);
         }
     }
 
@@ -320,12 +317,12 @@ pub fn link_macho(
     // Sections with absolute relocations need runtime rebasing, which requires
     // writable memory. Move read-only data sections (like .data.ro) to __DATA.
     {
-        let abs_reloc_sections: std::collections::HashSet<usize> = state.relocs.iter()
+        let abs_reloc_sections: std::collections::HashSet<SectionIdx> = state.relocs.iter()
             .filter(|r| r.r_type == object::elf::R_AARCH64_ABS64)
-            .map(|r| r.section_global_idx)
+            .map(|r| r.section)
             .collect();
         for &idx in &abs_reloc_sections {
-            state.sections[idx].writable = true;
+            state.sections[idx.0].writable = true;
         }
     }
 
@@ -370,10 +367,8 @@ fn create_call_stubs(state: &mut collect::LinkState) {
     let mut stub_syms = BTreeSet::new();
     for reloc in &state.relocs {
         if reloc.r_type != elf::R_AARCH64_CALL26 { continue; }
-        if let Some(def) = state.globals.get(&reloc.symbol_name) {
-            if def.section_global_idx == collect::DYNAMIC_SYMBOL_SENTINEL {
-                stub_syms.insert(reloc.symbol_name.clone());
-            }
+        if let Some(SymbolDef::Dynamic) = state.globals.get(&reloc.symbol_name) {
+            stub_syms.insert(reloc.symbol_name.clone());
         }
     }
 
@@ -386,7 +381,7 @@ fn create_call_stubs(state: &mut collect::LinkState) {
     let stub_count = stub_syms.len();
     let mut stub_data = Vec::with_capacity(stub_count * 12);
     let mut stub_relocs = Vec::new();
-    let stub_sec_idx = state.sections.len();
+    let stub_sec_idx = SectionIdx(state.sections.len());
 
     for (i, sym_name) in stub_syms.iter().enumerate() {
         let offset = (i * 12) as u64;
@@ -400,14 +395,14 @@ fn create_call_stubs(state: &mut collect::LinkState) {
 
         // Add GOT relocations for this stub
         stub_relocs.push(collect::InputReloc {
-            section_global_idx: stub_sec_idx,
+            section: stub_sec_idx,
             offset,
             r_type: elf::R_AARCH64_ADR_GOT_PAGE,
             symbol_name: sym_name.clone(),
             addend: 0,
         });
         stub_relocs.push(collect::InputReloc {
-            section_global_idx: stub_sec_idx,
+            section: stub_sec_idx,
             offset: offset + 4,
             r_type: elf::R_AARCH64_LD64_GOT_LO12_NC,
             symbol_name: sym_name.clone(),
@@ -416,20 +411,20 @@ fn create_call_stubs(state: &mut collect::LinkState) {
 
         // Add a global symbol for the stub
         let stub_name = format!("{sym_name}.__stub");
-        state.globals.insert(stub_name, collect::SymbolDef {
-            section_global_idx: stub_sec_idx,
+        state.globals.insert(stub_name, SymbolDef::Defined {
+            section: stub_sec_idx,
             value: offset,
         });
     }
 
     // Add the stubs section
     state.sections.push(collect::InputSection {
-        obj_idx: usize::MAX,
+        obj_idx: None,
         name: ".text".to_string(),
         data: stub_data,
         align: 4,
         size: (stub_count * 12) as u64,
-        vaddr: 0,
+        vaddr: None,
         writable: false,
         nobits: false,
         merge: false,
@@ -462,14 +457,15 @@ pub(crate) fn is_tls_section(name: &str) -> bool {
 }
 
 pub(crate) struct SectionBuckets {
-    pub(crate) rx: Vec<usize>,
-    pub(crate) rw: Vec<usize>,
-    pub(crate) tls: Vec<usize>,
+    pub(crate) rx: Vec<SectionIdx>,
+    pub(crate) rw: Vec<SectionIdx>,
+    pub(crate) tls: Vec<SectionIdx>,
 }
 
 pub(crate) fn classify_sections(state: &mut collect::LinkState) -> SectionBuckets {
     let mut buckets = SectionBuckets { rx: Vec::new(), rw: Vec::new(), tls: Vec::new() };
     for (idx, sec) in state.sections.iter().enumerate() {
+        let idx = SectionIdx(idx);
         if state.tls_sections.contains(&idx) || is_tls_section(&sec.name) {
             buckets.tls.push(idx);
             if !state.tls_sections.contains(&idx) {
@@ -482,10 +478,10 @@ pub(crate) fn classify_sections(state: &mut collect::LinkState) -> SectionBucket
         }
     }
     // Sort RX: .eh_frame at end (grouped for .eh_frame_hdr generation)
-    buckets.rx.sort_by_key(|&idx| if state.sections[idx].name == ".eh_frame" { 1u8 } else { 0 });
+    buckets.rx.sort_by_key(|&idx| if state.sections[idx.0].name == ".eh_frame" { 1u8 } else { 0 });
     // Sort RW: .init_array first, .fini_array second, other PROGBITS, then NOBITS (.bss)
     buckets.rw.sort_by_key(|&idx| {
-        let sec = &state.sections[idx];
+        let sec = &state.sections[idx.0];
         if sec.name.starts_with(".init_array") { 0u8 }
         else if sec.name.starts_with(".fini_array") { 1 }
         else if sec.nobits { 3 }

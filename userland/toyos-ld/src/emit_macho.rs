@@ -1,4 +1,4 @@
-use crate::collect::{collect_unique_symbols, LinkState, DYNAMIC_SYMBOL_SENTINEL};
+use crate::collect::{collect_unique_symbols, LinkState, SectionIdx, SymbolDef};
 use crate::reloc::resolve_symbol;
 use crate::{align_up, classify_sections, LinkError};
 use object::elf;
@@ -108,9 +108,9 @@ pub(crate) fn layout_macho(state: &mut LinkState, _entry: &str) -> MachOLayout {
             | elf::R_X86_64_REX_GOTPCRELX)
     });
 
-    let has_const = buckets.rx.iter().any(|&i| state.sections[i].writable == false && state.sections[i].name != ".text");
+    let has_const = buckets.rx.iter().any(|&i| state.sections[i.0].writable == false && state.sections[i.0].name != ".text");
     let has_data = !buckets.rw.is_empty();
-    let has_bss = buckets.rw.iter().any(|&i| state.sections[i].nobits);
+    let has_bss = buckets.rw.iter().any(|&i| state.sections[i.0].nobits);
     let has_got = !got_symbols.is_empty();
 
     // Count sections per segment
@@ -146,22 +146,14 @@ pub(crate) fn layout_macho(state: &mut LinkState, _entry: &str) -> MachOLayout {
     let mut cursor = text_vmaddr + align_up(header_size, 16);
     let text_sec_vmaddr = cursor;
     let text_sec_offset = cursor - text_vmaddr; // file offset within __TEXT
-    for &idx in &buckets.rx {
-        let sec = &state.sections[idx];
-        if sec.name == ".text" || (!sec.writable && sec.name != ".const") {
-            // This goes in __text
-        } else {
-            continue;
-        }
-    }
     // Place all code sections (RX except .const-like) into __text
     for &idx in &buckets.rx {
-        let sec = &mut state.sections[idx];
+        let sec = &mut state.sections[idx.0];
         if sec.name.starts_with(".const") || sec.name.starts_with(".rodata") {
             continue; // These go in __const
         }
         cursor = align_up(cursor, sec.align);
-        sec.vaddr = cursor;
+        sec.vaddr = Some(cursor);
         cursor += sec.size;
     }
     let text_sec_size = cursor - text_sec_vmaddr;
@@ -172,10 +164,10 @@ pub(crate) fn layout_macho(state: &mut LinkState, _entry: &str) -> MachOLayout {
     let mut actual_has_const = false;
     cursor = const_sec_vmaddr;
     for &idx in &buckets.rx {
-        let sec = &mut state.sections[idx];
+        let sec = &mut state.sections[idx.0];
         if sec.name.starts_with(".const") || sec.name.starts_with(".rodata") {
             cursor = align_up(cursor, sec.align);
-            sec.vaddr = cursor;
+            sec.vaddr = Some(cursor);
             cursor += sec.size;
             actual_has_const = true;
         }
@@ -194,10 +186,10 @@ pub(crate) fn layout_macho(state: &mut LinkState, _entry: &str) -> MachOLayout {
     let data_sec_vmaddr = data_cursor;
     let data_sec_offset = data_fileoff;
     for &idx in &buckets.rw {
-        let sec = &mut state.sections[idx];
+        let sec = &mut state.sections[idx.0];
         if sec.nobits { continue; }
         data_cursor = align_up(data_cursor, sec.align);
-        sec.vaddr = data_cursor;
+        sec.vaddr = Some(data_cursor);
         data_cursor += sec.size;
     }
     let data_sec_size = data_cursor - data_sec_vmaddr;
@@ -212,7 +204,8 @@ pub(crate) fn layout_macho(state: &mut LinkState, _entry: &str) -> MachOLayout {
     let mut got = HashMap::new();
     for sym in &got_symbols {
         let is_external = match state.globals.get(sym) {
-            Some(def) => def.section_global_idx == DYNAMIC_SYMBOL_SENTINEL,
+            Some(SymbolDef::Dynamic) => true,
+            Some(SymbolDef::Defined { .. }) => false,
             None => !state.locals.keys().any(|(_, n)| n == sym),
         };
         got.insert(sym.clone(), data_cursor);
@@ -226,10 +219,10 @@ pub(crate) fn layout_macho(state: &mut LinkState, _entry: &str) -> MachOLayout {
     let bss_start = bss_sec_vmaddr;
     let mut bss_cursor = bss_sec_vmaddr;
     for &idx in &buckets.rw {
-        let sec = &mut state.sections[idx];
+        let sec = &mut state.sections[idx.0];
         if !sec.nobits { continue; }
         bss_cursor = align_up(bss_cursor, sec.align);
-        sec.vaddr = bss_cursor;
+        sec.vaddr = Some(bss_cursor);
         bss_cursor += sec.size;
     }
     let bss_sec_size = bss_cursor - bss_start;
@@ -323,7 +316,12 @@ pub(crate) fn emit_macho_bytes(
     let entry_addr = state
         .globals
         .get(entry_name)
-        .map(|def| state.sections[def.section_global_idx].vaddr + def.value)
+        .map(|def| match def {
+            SymbolDef::Defined { section, value } => {
+                state.sections[section.0].vaddr.unwrap() + value
+            }
+            SymbolDef::Dynamic => panic!("entry point cannot be a dynamic symbol"),
+        })
         .ok_or_else(|| LinkError::MissingEntry(entry_name.to_string()))?;
 
     let entryoff = entry_addr - layout.text_vmaddr;
@@ -571,11 +569,12 @@ pub(crate) fn emit_macho_bytes(
 
     // __TEXT,__text: code sections
     for sec in &state.sections {
-        if sec.vaddr == 0 || sec.data.is_empty() { continue; }
-        if sec.vaddr >= layout.text_sec_vmaddr
-            && sec.vaddr < layout.text_sec_vmaddr + layout.text_sec_size
+        let Some(vaddr) = sec.vaddr else { continue; };
+        if sec.data.is_empty() { continue; }
+        if vaddr >= layout.text_sec_vmaddr
+            && vaddr < layout.text_sec_vmaddr + layout.text_sec_size
         {
-            let off = (sec.vaddr - layout.text_vmaddr) as usize;
+            let off = (vaddr - layout.text_vmaddr) as usize;
             buf[off..off + sec.data.len()].copy_from_slice(&sec.data);
         }
     }
@@ -583,11 +582,12 @@ pub(crate) fn emit_macho_bytes(
     // __TEXT,__const: read-only data sections
     if layout.const_sec_size > 0 {
         for sec in &state.sections {
-            if sec.vaddr == 0 || sec.data.is_empty() { continue; }
-            if sec.vaddr >= layout.const_sec_vmaddr
-                && sec.vaddr < layout.const_sec_vmaddr + layout.const_sec_size
+            let Some(vaddr) = sec.vaddr else { continue; };
+            if sec.data.is_empty() { continue; }
+            if vaddr >= layout.const_sec_vmaddr
+                && vaddr < layout.const_sec_vmaddr + layout.const_sec_size
             {
-                let off = (sec.vaddr - layout.text_vmaddr) as usize;
+                let off = (vaddr - layout.text_vmaddr) as usize;
                 buf[off..off + sec.data.len()].copy_from_slice(&sec.data);
             }
         }
@@ -595,11 +595,12 @@ pub(crate) fn emit_macho_bytes(
 
     // __DATA,__data: writable data sections
     for sec in &state.sections {
-        if sec.vaddr == 0 || sec.data.is_empty() || sec.nobits { continue; }
-        if sec.vaddr >= layout.data_sec_vmaddr
-            && sec.vaddr < layout.data_sec_vmaddr + layout.data_sec_size
+        let Some(vaddr) = sec.vaddr else { continue; };
+        if sec.data.is_empty() || sec.nobits { continue; }
+        if vaddr >= layout.data_sec_vmaddr
+            && vaddr < layout.data_sec_vmaddr + layout.data_sec_size
         {
-            let off = (layout.data_fileoff + (sec.vaddr - layout.data_vmaddr)) as usize;
+            let off = (layout.data_fileoff + (vaddr - layout.data_vmaddr)) as usize;
             if off + sec.data.len() <= buf.len() {
                 buf[off..off + sec.data.len()].copy_from_slice(&sec.data);
             }
@@ -611,7 +612,7 @@ pub(crate) fn emit_macho_bytes(
         let is_external = layout.got_entries.iter()
             .any(|(n, ext)| n == sym_name && *ext);
         if is_external { continue; } // filled by dyld
-        let sym_addr = resolve_symbol(state, sym_name, 0, None)
+        let sym_addr = resolve_symbol(state, sym_name, SectionIdx(0), None)
             .ok_or_else(|| LinkError::UndefinedSymbols(vec![sym_name.clone()]))?;
         let off = (layout.data_fileoff + (got_vaddr - layout.data_vmaddr)) as usize;
         buf[off..off + 8].copy_from_slice(&sym_addr.to_le_bytes());
@@ -787,9 +788,9 @@ fn build_symbol_table(
     // Defined external symbols
     let mut extdef_syms: Vec<(String, u64, u8)> = Vec::new(); // (name, value, section)
     for (name, def) in &state.globals {
-        if def.section_global_idx == DYNAMIC_SYMBOL_SENTINEL { continue; }
-        let sec = &state.sections[def.section_global_idx];
-        let value = sec.vaddr + def.value;
+        let SymbolDef::Defined { section, value } = def else { continue; };
+        let sec = &state.sections[section.0];
+        let value = sec.vaddr.unwrap() + value;
         let sect = if value >= layout.text_sec_vmaddr && value < layout.text_sec_vmaddr + layout.text_sec_size {
             text_sect
         } else if layout.const_sec_size > 0 && value >= layout.const_sec_vmaddr && value < layout.const_sec_vmaddr + layout.const_sec_size {
