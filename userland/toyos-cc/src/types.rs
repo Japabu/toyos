@@ -190,7 +190,7 @@ impl CType {
         let def = match self {
             CType::Struct(def) => def,
             CType::Union(_) => return self.union_field(name),
-            _ => return None,
+            _ => panic!("field_offset called on non-struct/union type: {self:?}"),
         };
         let mut offset = 0usize;
         let mut bit_pos = 0u32;
@@ -254,7 +254,7 @@ impl CType {
     fn union_field(&self, name: &str) -> Option<FieldInfo> {
         let def = match self {
             CType::Union(def) => def,
-            _ => return None,
+            _ => panic!("union_field called on non-union type: {self:?}"),
         };
         for field in &def.fields {
             if field.name.as_deref() == Some(name) {

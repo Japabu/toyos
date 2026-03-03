@@ -249,17 +249,20 @@ impl Preprocessor {
                     "include_next" => self.handle_include_next(rest, filename),
                     "define" => self.handle_define(rest),
                     "undef" => {
-                        let name = rest.split_whitespace().next().unwrap_or("");
+                        let name = rest.split_whitespace().next()
+                            .expect("#undef requires a macro name");
                         self.macros.remove(name);
                         self.user_redefined_builtins.remove(name);
                     }
                     "ifdef" => {
-                        let name = rest.split_whitespace().next().unwrap_or("");
+                        let name = rest.split_whitespace().next()
+                            .expect("#ifdef requires a macro name");
                         let active = self.macros.contains_key(name);
                         if_stack.push(IfState { active, seen_true: active, parent_active: true });
                     }
                     "ifndef" => {
-                        let name = rest.split_whitespace().next().unwrap_or("");
+                        let name = rest.split_whitespace().next()
+                            .expect("#ifndef requires a macro name");
                         let active = !self.macros.contains_key(name);
                         if_stack.push(IfState { active, seen_true: active, parent_active: true });
                     }

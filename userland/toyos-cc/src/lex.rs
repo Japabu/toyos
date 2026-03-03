@@ -601,7 +601,7 @@ fn parse_hex_float(text: &str) -> f64 {
     } else {
         (s, "0")
     };
-    let exp: i32 = exp_str.parse().unwrap_or(0);
+    let exp: i32 = exp_str.parse().expect("invalid hex float exponent");
     let (int_part, frac_part) = if let Some(dot) = mantissa_str.find('.') {
         (&mantissa_str[..dot], &mantissa_str[dot+1..])
     } else {
@@ -609,20 +609,22 @@ fn parse_hex_float(text: &str) -> f64 {
     };
     // Handle arbitrarily large hex mantissas by parsing up to 16 significant digits
     // and adjusting the exponent for any remaining digits.
-    let int_val = if int_part.len() <= 16 {
-        u64::from_str_radix(int_part, 16).unwrap_or(0) as f64
+    let int_val = if int_part.is_empty() {
+        0.0 // e.g. 0x.1p0 — no integer part
+    } else if int_part.len() <= 16 {
+        u64::from_str_radix(int_part, 16).unwrap() as f64
     } else {
-        let significant = u64::from_str_radix(&int_part[..16], 16).unwrap_or(0) as f64;
+        let significant = u64::from_str_radix(&int_part[..16], 16).unwrap() as f64;
         let extra_digits = int_part.len() - 16;
         significant * 16f64.powi(extra_digits as i32)
     };
     let frac_val = if frac_part.is_empty() {
         0.0
     } else if frac_part.len() <= 16 {
-        let frac_int = u64::from_str_radix(frac_part, 16).unwrap_or(0) as f64;
+        let frac_int = u64::from_str_radix(frac_part, 16).unwrap() as f64;
         frac_int / 16f64.powi(frac_part.len() as i32)
     } else {
-        let frac_int = u64::from_str_radix(&frac_part[..16], 16).unwrap_or(0) as f64;
+        let frac_int = u64::from_str_radix(&frac_part[..16], 16).unwrap() as f64;
         frac_int / 16f64.powi(16)
     };
     (int_val + frac_val) * 2f64.powi(exp)

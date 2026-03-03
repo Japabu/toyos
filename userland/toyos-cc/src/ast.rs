@@ -299,6 +299,7 @@ pub fn eval_const_expr(expr: &Expr, enums: Option<&std::collections::HashMap<Str
         Expr::Ident(name) => enums?.get(name).copied(),
         Expr::Unary(UnaryOp::Neg, e) => eval_const_expr(e, enums).map(|v| -v),
         Expr::Unary(UnaryOp::BitNot, e) => eval_const_expr(e, enums).map(|v| !v),
+        Expr::Unary(UnaryOp::LogNot, e) => eval_const_expr(e, enums).map(|v| (v == 0) as i64),
         Expr::Binary(op, l, r) => {
             let l = eval_const_expr(l, enums)?;
             let r = eval_const_expr(r, enums)?;
@@ -329,7 +330,7 @@ pub fn eval_const_expr(expr: &Expr, enums: Option<&std::collections::HashMap<Str
         }
         Expr::Cast(_, e) => eval_const_expr(e, enums),
         Expr::FloatLit(..) | Expr::StringLit(_) | Expr::WideStringLit(_)
-        | Expr::Unary(UnaryOp::Deref | UnaryOp::AddrOf | UnaryOp::LogNot | UnaryOp::PreInc | UnaryOp::PreDec, _)
+        | Expr::Unary(UnaryOp::Deref | UnaryOp::AddrOf | UnaryOp::PreInc | UnaryOp::PreDec, _)
         | Expr::PostUnary(..) | Expr::Sizeof(_) | Expr::Alignof(_)
         | Expr::Call(..) | Expr::Member(..) | Expr::Arrow(..) | Expr::Index(..)
         | Expr::Assign(..) | Expr::Comma(..) | Expr::CompoundLiteral(..)

@@ -95,7 +95,9 @@ impl Parser {
                     }
                 }
                 DirectDeclarator::Paren(inner) => apply_to_direct(&mut inner.direct, kr_types),
-                _ => {}
+                DirectDeclarator::Array(..) | DirectDeclarator::Ident(_) => {
+                    panic!("apply_kr_types: expected function declarator")
+                }
             }
         }
         apply_to_direct(&mut declarator.direct, kr_types);

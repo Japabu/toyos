@@ -386,7 +386,8 @@ impl<'a> ConstEval<'a> {
                 while self.pos < self.src.len() && (self.src[self.pos].is_ascii_alphanumeric() || self.src[self.pos] == b'_' || self.src[self.pos] == b'$') {
                     self.pos += 1;
                 }
-                let ident = std::str::from_utf8(&self.src[start..self.pos]).unwrap_or("");
+                // scan loop only advances over ASCII bytes, so UTF-8 conversion is infallible
+                let ident = std::str::from_utf8(&self.src[start..self.pos]).unwrap();
                 if ident == "defined" {
                     // By the time ConstEval runs, expand_tokens has already replaced
                     // `defined(X)` with 0 or 1 when in_if_eval mode. If we see `defined`
@@ -427,9 +428,9 @@ impl<'a> ConstEval<'a> {
             self.pos += 2;
             let hex_start = self.pos;
             while self.pos < self.src.len() && self.src[self.pos].is_ascii_hexdigit() { self.pos += 1; }
-            let hex_str = std::str::from_utf8(&self.src[hex_start..self.pos]).unwrap_or("0");
+            let hex_str = std::str::from_utf8(&self.src[hex_start..self.pos]).unwrap();
             // Parse as u64; if it doesn't fit in i64 treat as unsigned (GCC rule)
-            let v = u64::from_str_radix(hex_str, 16).unwrap_or(0);
+            let v = u64::from_str_radix(hex_str, 16).expect("invalid hex literal in preprocessor expression");
             bits = v;
             if v > i64::MAX as u64 { is_unsigned = true; }
         } else if c == b'0' && self.src.get(self.pos + 1).is_some_and(|c| *c == b'b' || *c == b'B') {
@@ -437,23 +438,23 @@ impl<'a> ConstEval<'a> {
             self.pos += 2;
             let bin_start = self.pos;
             while self.pos < self.src.len() && (self.src[self.pos] == b'0' || self.src[self.pos] == b'1') { self.pos += 1; }
-            let bin_str = std::str::from_utf8(&self.src[bin_start..self.pos]).unwrap_or("0");
-            bits = u64::from_str_radix(bin_str, 2).unwrap_or(0);
+            let bin_str = std::str::from_utf8(&self.src[bin_start..self.pos]).unwrap();
+            bits = u64::from_str_radix(bin_str, 2).expect("invalid binary literal in preprocessor expression");
         } else if c == b'0' && self.pos + 1 < self.src.len() && self.src[self.pos + 1].is_ascii_digit() {
             // Octal
             self.pos += 1;
             let oct_start = self.pos;
             while self.pos < self.src.len() && self.src[self.pos].is_ascii_digit() { self.pos += 1; }
-            let oct_str = std::str::from_utf8(&self.src[oct_start..self.pos]).unwrap_or("0");
-            let v = u64::from_str_radix(oct_str, 8).unwrap_or(0);
+            let oct_str = std::str::from_utf8(&self.src[oct_start..self.pos]).unwrap();
+            let v = u64::from_str_radix(oct_str, 8).expect("invalid octal literal in preprocessor expression");
             bits = v;
             if v > i64::MAX as u64 { is_unsigned = true; }
         } else {
             // Decimal
             while self.pos < self.src.len() && self.src[self.pos].is_ascii_digit() { self.pos += 1; }
-            let num_str = std::str::from_utf8(&self.src[start..self.pos]).unwrap_or("0");
+            let num_str = std::str::from_utf8(&self.src[start..self.pos]).unwrap();
             // Parse as u64; if it overflows i64, treat as unsigned
-            let v: u64 = num_str.parse().unwrap_or(0);
+            let v: u64 = num_str.parse().expect("invalid decimal literal in preprocessor expression");
             bits = v;
             if v > i64::MAX as u64 { is_unsigned = true; }
         }

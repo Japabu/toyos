@@ -416,29 +416,7 @@ impl Parser {
                 }
             }
             TokenKind::Builtin(ref name) if name == "_Generic" => {
-                self.advance();
-                self.expect(&TokenKind::LParen);
-                // Parse controlling expression
-                let _controlling = self.assignment_expr();
-                self.expect(&TokenKind::Comma);
-                // Parse type associations, pick the first one
-                let mut result = None;
-                loop {
-                    if self.peek() == &TokenKind::RParen { break; }
-                    if matches!(self.peek(), TokenKind::Default) {
-                        self.advance();
-                    } else {
-                        let _tn = self.type_name();
-                    }
-                    self.expect(&TokenKind::Colon);
-                    let e = self.assignment_expr();
-                    if result.is_none() {
-                        result = Some(e);
-                    }
-                    if !self.eat(&TokenKind::Comma) { break; }
-                }
-                self.expect(&TokenKind::RParen);
-                result.expect("_Generic: no matching type association")
+                panic!("_Generic type dispatch is not implemented");
             }
             TokenKind::Builtin(ref name) if name == "__builtin_offsetof" => {
                 self.advance();
@@ -452,7 +430,11 @@ impl Parser {
                             TypeSpec::TypedefName(n) => Some(n.clone()),
                             TypeSpec::Struct(st) => st.name.clone(),
                             TypeSpec::Union(st) => st.name.clone(),
-                            _ => None,
+                            TypeSpec::Void | TypeSpec::Char | TypeSpec::Short | TypeSpec::Int
+                            | TypeSpec::Long | TypeSpec::Float | TypeSpec::Double
+                            | TypeSpec::Signed | TypeSpec::Unsigned | TypeSpec::Bool
+                            | TypeSpec::Enum(_) | TypeSpec::Typeof(_) | TypeSpec::TypeofType(_)
+                            | TypeSpec::Builtin(_) | TypeSpec::Int128 => None,
                         }
                     } else { None }
                 }).expect("__builtin_offsetof: cannot determine type name");

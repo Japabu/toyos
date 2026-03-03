@@ -2,30 +2,15 @@ use super::*;
 
 impl Codegen {
     pub(crate) fn eval_const(&self, expr: &Expr) -> Option<i64> {
-        if let Some(v) = crate::ast::eval_const_expr(expr, Some(&self.type_env.enum_constants)) {
-            return Some(v);
-        }
-        // sizeof in constant expressions
-        if let Some(v) = self.eval_const_with_sizeof(expr) {
-            return Some(v);
-        }
-        // offsetof pattern: (type)&((StructType*)0)->field
-        self.eval_offsetof(expr)
-    }
-
-    /// Evaluate constant expressions that may contain sizeof.
-    fn eval_const_with_sizeof(&self, expr: &Expr) -> Option<i64> {
         match expr {
-            Expr::Sizeof(arg) => {
-                let size = match arg.as_ref() {
-                    SizeofArg::Type(tn) => self.resolve_typename_const(tn)?.size(),
-                    SizeofArg::Expr(e) => self.const_expr_type(e)?.size(),
-                };
-                Some(size as i64)
-            }
-            Expr::Cast(_, e) => self.eval_const_with_sizeof(e),
-            Expr::Unary(UnaryOp::Neg, e) => self.eval_const_with_sizeof(e).map(|v| -v),
-            Expr::Unary(UnaryOp::BitNot, e) => self.eval_const_with_sizeof(e).map(|v| !v),
+            Expr::IntLit(v) => Some(*v as i64),
+            Expr::UIntLit(v) => Some(*v as i64),
+            Expr::CharLit(c) => Some(*c as i64),
+            Expr::Ident(name) => self.type_env.enum_constants.get(name).copied(),
+            Expr::Unary(UnaryOp::Neg, e) => self.eval_const(e).map(|v| -v),
+            Expr::Unary(UnaryOp::BitNot, e) => self.eval_const(e).map(|v| !v),
+            Expr::Unary(UnaryOp::LogNot, e) => self.eval_const(e).map(|v| (v == 0) as i64),
+            Expr::Unary(UnaryOp::AddrOf, inner) => self.eval_member_offset(inner),
             Expr::Binary(op, l, r) => {
                 let l = self.eval_const(l)?;
                 let r = self.eval_const(r)?;
@@ -50,10 +35,21 @@ impl Codegen {
                     BinOp::LogOr => ((l != 0) || (r != 0)) as i64,
                 })
             }
-            Expr::IntLit(_) | Expr::UIntLit(_) | Expr::FloatLit(..) | Expr::CharLit(_)
-            | Expr::StringLit(_) | Expr::WideStringLit(_) | Expr::Ident(_)
-            | Expr::Unary(UnaryOp::Deref | UnaryOp::AddrOf | UnaryOp::LogNot | UnaryOp::PreInc | UnaryOp::PreDec, _)
-            | Expr::PostUnary(..) | Expr::Alignof(_) | Expr::Conditional(..)
+            Expr::Conditional(cond, then_e, else_e) => {
+                let c = self.eval_const(cond)?;
+                if c != 0 { self.eval_const(then_e) } else { self.eval_const(else_e) }
+            }
+            Expr::Cast(_, e) => self.eval_const(e),
+            Expr::Sizeof(arg) => {
+                let size = match arg.as_ref() {
+                    SizeofArg::Type(tn) => self.resolve_typename_const(tn)?.size(),
+                    SizeofArg::Expr(e) => self.const_expr_type(e)?.size(),
+                };
+                Some(size as i64)
+            }
+            Expr::FloatLit(..) | Expr::StringLit(_) | Expr::WideStringLit(_)
+            | Expr::Unary(UnaryOp::Deref | UnaryOp::PreInc | UnaryOp::PreDec, _)
+            | Expr::PostUnary(..) | Expr::Alignof(_)
             | Expr::Call(..) | Expr::Member(..) | Expr::Arrow(..) | Expr::Index(..)
             | Expr::Assign(..) | Expr::Comma(..) | Expr::CompoundLiteral(..)
             | Expr::StmtExpr(_) | Expr::VaArg(..) | Expr::Builtin(..) => None,
@@ -72,7 +68,7 @@ impl Codegen {
             Expr::FloatLit(_, is_f32) => {
                 if *is_f32 { Some(CType::Float) } else { Some(CType::Double) }
             }
-            Expr::Ident(name) => self.global_types.get(name).cloned(),
+            Expr::Ident(name) => self.local_types.get(name).or_else(|| self.global_types.get(name)).cloned(),
             Expr::Unary(UnaryOp::Deref, e) => {
                 let ty = self.const_expr_type(e)?;
                 match ty {
@@ -109,23 +105,6 @@ impl Codegen {
             | Expr::Call(..) | Expr::Assign(..) | Expr::Comma(..)
             | Expr::CompoundLiteral(..) | Expr::StmtExpr(_) | Expr::VaArg(..)
             | Expr::Builtin(..) => None,
-        }
-    }
-
-    /// Evaluate the classic offsetof pattern: `&((StructType*)0)->field`
-    /// and variants wrapped in casts like `(size_t)&((StructType*)0)->field`.
-    fn eval_offsetof(&self, expr: &Expr) -> Option<i64> {
-        match expr {
-            Expr::Cast(_, inner) => self.eval_offsetof(inner),
-            Expr::Unary(UnaryOp::AddrOf, inner) => self.eval_member_offset(inner),
-            Expr::IntLit(_) | Expr::UIntLit(_) | Expr::FloatLit(..) | Expr::CharLit(_)
-            | Expr::StringLit(_) | Expr::WideStringLit(_) | Expr::Ident(_)
-            | Expr::Binary(..) | Expr::Unary(UnaryOp::Neg | UnaryOp::BitNot | UnaryOp::LogNot
-                | UnaryOp::Deref | UnaryOp::PreInc | UnaryOp::PreDec, _)
-            | Expr::PostUnary(..) | Expr::Sizeof(_) | Expr::Alignof(_) | Expr::Conditional(..)
-            | Expr::Call(..) | Expr::Member(..) | Expr::Arrow(..) | Expr::Index(..)
-            | Expr::Assign(..) | Expr::Comma(..) | Expr::CompoundLiteral(..)
-            | Expr::StmtExpr(_) | Expr::VaArg(..) | Expr::Builtin(..) => None,
         }
     }
 
@@ -415,9 +394,9 @@ impl Codegen {
                 } else {
                     ty.clone()
                 };
-                let name = fd.declarator.as_ref().and_then(|d| self.get_declarator_name(d));
+                let name = fd.declarator.as_ref().map(|d| self.get_declarator_name(d)).filter(|n| !n.is_empty());
                 let bit_width = fd.bit_width.as_ref().map(|bw| {
-                    crate::ast::eval_const_expr(bw, Some(&self.type_env.enum_constants))
+                    self.eval_const(bw)
                         .expect("bitfield width must be a constant expression") as u32
                 });
                 fields.push(FieldDef { name, ty: field_ty, bit_width });
@@ -450,7 +429,7 @@ impl Codegen {
         let mut next_val = 0i64;
         for v in et.variants.as_ref().unwrap() {
             if let Some(expr) = &v.value {
-                if let Some(val) = crate::ast::eval_const_expr(expr, Some(&self.type_env.enum_constants)) {
+                if let Some(val) = self.eval_const(expr) {
                     next_val = val;
                 }
             }
@@ -499,7 +478,7 @@ impl Codegen {
                 self.apply_declarator(base, &inner)
             }
             DirectDeclarator::Array(inner, size) => {
-                let n = size.as_ref().and_then(|e| crate::ast::eval_const_expr(e, Some(&self.type_env.enum_constants)).map(|v| v as usize));
+                let n = size.as_ref().and_then(|e| self.eval_const(e).map(|v| v as usize));
                 // Same inside-out logic as Function: for (*arr)[N], the * wraps
                 // the array type (pointer-to-array), not the element type.
                 match inner.as_ref() {
@@ -525,7 +504,7 @@ impl Codegen {
                     } else {
                         ty
                     };
-                    let name = p.declarator.as_ref().and_then(|d| self.get_declarator_name(d));
+                    let name = p.declarator.as_ref().map(|d| self.get_declarator_name(d)).filter(|n| !n.is_empty());
                     param_types.push(ParamType { name, ty });
                 }
                 // C declarators are inside-out: for (*fp)(args), the * inside the
@@ -585,7 +564,7 @@ impl Codegen {
                 self.apply_abstract_declarator(base, inner)
             }
             DirectAbstractDeclarator::Array(inner, size) => {
-                let n = size.as_ref().and_then(|e| crate::ast::eval_const_expr(e, Some(&self.type_env.enum_constants)).map(|v| v as usize));
+                let n = size.as_ref().and_then(|e| self.eval_const(e).map(|v| v as usize));
                 if let Some(inner) = inner {
                     let elem = self.apply_direct_abstract_declarator(base, inner);
                     CType::Array(Box::new(elem), n)
@@ -603,7 +582,7 @@ impl Codegen {
                     } else {
                         ty
                     };
-                    let name = p.declarator.as_ref().and_then(|d| self.get_declarator_name(d));
+                    let name = p.declarator.as_ref().map(|d| self.get_declarator_name(d)).filter(|n| !n.is_empty());
                     param_types.push(ParamType { name, ty });
                 }
                 if let Some(inner) = inner {
@@ -616,14 +595,13 @@ impl Codegen {
         }
     }
 
-    pub(crate) fn get_declarator_name(&self, d: &Declarator) -> Option<String> {
+    pub(crate) fn get_declarator_name(&self, d: &Declarator) -> String {
         self.get_direct_name(&d.direct)
     }
 
-    fn get_direct_name(&self, dd: &DirectDeclarator) -> Option<String> {
+    fn get_direct_name(&self, dd: &DirectDeclarator) -> String {
         match dd {
-            DirectDeclarator::Ident(s) if !s.is_empty() => Some(s.clone()),
-            DirectDeclarator::Ident(_) => None,
+            DirectDeclarator::Ident(s) => s.clone(),
             DirectDeclarator::Paren(inner) => self.get_declarator_name(inner),
             DirectDeclarator::Array(inner, _) | DirectDeclarator::Function(inner, _) => self.get_direct_name(inner),
         }

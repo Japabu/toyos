@@ -1,4 +1,18 @@
 use super::*;
+use crate::ast::{Declarator, DirectDeclarator, Expr};
+
+fn extract_array_size_expr(d: &Declarator) -> Option<Expr> {
+    extract_direct_array_size(&d.direct)
+}
+
+fn extract_direct_array_size(dd: &DirectDeclarator) -> Option<Expr> {
+    match dd {
+        DirectDeclarator::Array(_, Some(expr)) => Some(*expr.clone()),
+        DirectDeclarator::Array(inner, None) => extract_direct_array_size(inner),
+        DirectDeclarator::Ident(_) | DirectDeclarator::Paren(_)
+        | DirectDeclarator::Function(..) => None,
+    }
+}
 
 impl Codegen {
     /// Pre-resolve types in an expression to register enum constants as side effects.
@@ -293,17 +307,26 @@ impl Codegen {
                 let size = ctx.return_type.size();
                 let size_val = ctx.builder.ins().iconst(I64, size as i64);
                 self.emit_memcpy(ctx, sret, src, size_val);
+                self.free_vlas(ctx);
                 ctx.builder.ins().return_(&[]);
             } else {
                 let tv = self.compile_expr(ctx, e);
                 let ret_clif = self.clif_type(&ctx.return_type);
                 let v = self.coerce_typed(ctx, tv, ret_clif);
+                self.free_vlas(ctx);
                 ctx.builder.ins().return_(&[v]);
             }
         } else {
+            self.free_vlas(ctx);
             ctx.builder.ins().return_(&[]);
         }
         ctx.filled = true;
+    }
+
+    fn free_vlas(&mut self, ctx: &mut FuncCtx) {
+        for &ptr in &ctx.vla_allocs.clone() {
+            self.emit_free(ctx, ptr);
+        }
     }
 
     fn compile_if(&mut self, ctx: &mut FuncCtx, cond: &Expr, then: &Statement, else_: Option<&Statement>) {
@@ -682,7 +705,8 @@ impl Codegen {
 
         if is_typedef {
             for id in &decl.declarators {
-                if let Some(name) = self.get_declarator_name(&id.declarator) {
+                let name = self.get_declarator_name(&id.declarator);
+                if !name.is_empty() {
                     let ty = self.apply_declarator(&base_ty, &id.declarator);
                     self.type_env.typedefs.insert(name, ty);
                 }
@@ -694,7 +718,7 @@ impl Codegen {
         let is_extern = decl.specifiers.iter().any(|s| matches!(s, DeclSpecifier::StorageClass(StorageClass::Extern)));
 
         for id in &decl.declarators {
-            let name = self.get_declarator_name(&id.declarator).unwrap_or_default();
+            let name = self.get_declarator_name(&id.declarator);
             if name.is_empty() { continue; }
 
             let mut ty = self.apply_declarator(&base_ty, &id.declarator);
@@ -706,6 +730,27 @@ impl Codegen {
                 }
             }
             verbose!("local_decl: {} : {:?} (init={})", name, ty, id.initializer.is_some());
+            self.local_types.insert(name.clone(), ty.clone());
+
+            // VLA: array with non-constant size expression → heap-allocate
+            if let CType::Array(ref elem, None) = ty {
+                if let Some(size_expr) = extract_array_size_expr(&id.declarator) {
+                    let count_raw = self.compile_expr(ctx, &size_expr).raw();
+                    // Extend to i64 if needed (e.g. int n → i64 for malloc)
+                    let count = if ctx.builder.func.dfg.value_type(count_raw) != I64 {
+                        ctx.builder.ins().uextend(I64, count_raw)
+                    } else {
+                        count_raw
+                    };
+                    let elem_size = ctx.builder.ins().iconst(I64, elem.size() as i64);
+                    let total = ctx.builder.ins().imul(count, elem_size);
+                    let ptr = self.emit_malloc(ctx, total);
+                    ctx.vla_sizes.insert(name.clone(), count);
+                    ctx.vla_allocs.push(ptr);
+                    ctx.local_ptrs.insert(name, (ptr, ty));
+                    continue;
+                }
+            }
 
             if let CType::Function(..) = ty {
                 self.compile_local_func_decl(ctx, &name, &ty);

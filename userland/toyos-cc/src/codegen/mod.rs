@@ -61,6 +61,7 @@ pub struct Codegen {
     defined_data: HashSet<cranelift_module::DataId>,      // data IDs that have been defined
     tentative_data: Vec<(cranelift_module::DataId, usize)>, // tentative defs: (id, size)
     global_types: HashMap<String, CType>,                 // C types of global variables
+    local_types: HashMap<String, CType>,                  // C types of in-scope local variables (for sizeof in array sizes)
     func_ret_types: HashMap<String, CType>,               // C return types of functions
     func_ctypes: HashMap<String, CType>,                   // full C function types (for expr_type)
     variadic_funcs: HashMap<String, usize>,                   // variadic func name → fixed param count
@@ -94,6 +95,9 @@ pub(super) struct FuncCtx<'a> {
     // Variadic function support
     va_area: Option<ir::StackSlot>, // stack slot holding saved variadic args
     sret_ptr: Option<Value>,       // hidden return pointer for struct-returning functions
+    // VLA support
+    vla_sizes: HashMap<String, Value>,  // var name → runtime element count
+    vla_allocs: Vec<Value>,             // malloc'd pointers to free at function exit
 }
 
 impl Codegen {
@@ -110,6 +114,7 @@ impl Codegen {
             defined_data: HashSet::new(),
             tentative_data: Vec::new(),
             global_types: HashMap::new(),
+            local_types: HashMap::new(),
             func_ret_types: HashMap::new(),
             func_ctypes: HashMap::new(),
             variadic_funcs: HashMap::new(),
@@ -189,13 +194,13 @@ impl Codegen {
         for decl in tu {
             let (name, specs) = match decl {
                 ExternalDecl::Function(fdef) => {
-                    let n = self.get_declarator_name(&fdef.declarator).unwrap_or_default();
+                    let n = self.get_declarator_name(&fdef.declarator);
                     (n, &fdef.specifiers)
                 }
                 ExternalDecl::Declaration(d) => {
                     // Check if this is a function declaration
                     if let Some(id) = d.declarators.first() {
-                        let n = self.get_declarator_name(&id.declarator).unwrap_or_default();
+                        let n = self.get_declarator_name(&id.declarator);
                         (n, &d.specifiers)
                     } else { continue; }
                 }
@@ -248,7 +253,7 @@ impl Codegen {
     }
 
     fn declare_function(&mut self, fdef: &FunctionDef) {
-        let name = self.get_declarator_name(&fdef.declarator).unwrap_or_default();
+        let name = self.get_declarator_name(&fdef.declarator);
         if name.is_empty() { return; }
         verbose!("declare_function: {}", name);
 
@@ -273,7 +278,7 @@ impl Codegen {
     }
 
     fn compile_function(&mut self, fdef: &FunctionDef) {
-        let name = self.get_declarator_name(&fdef.declarator).unwrap_or_default();
+        let name = self.get_declarator_name(&fdef.declarator);
         if name.is_empty() { return; }
         crate::verbose::reset_depth();
         eprintln!("compiling: {name}");
@@ -354,6 +359,8 @@ impl Codegen {
             labels: HashMap::new(),
             va_area: None,
             sret_ptr: None,
+            vla_sizes: HashMap::new(),
+            vla_allocs: Vec::new(),
         };
 
         // Bind sret pointer for struct-returning functions
@@ -372,6 +379,7 @@ impl Codegen {
                 break; // forward declaration had fewer params than definition
             }
             if let Some(name) = &p.name {
+                self.local_types.insert(name.clone(), p.ty.clone());
                 let val = ctx.builder.block_params(params_block)[blk_idx];
                 // Struct/union params are passed by pointer: copy to local storage
                 if matches!(&p.ty, CType::Struct(_) | CType::Union(_)) {
@@ -429,6 +437,9 @@ impl Codegen {
 
         // If the function doesn't end with a return, add one
         if !ctx.filled {
+            for &ptr in &ctx.vla_allocs.clone() {
+                self.emit_free(&mut ctx, ptr);
+            }
             if matches!(ctx.return_type, CType::Void) || ctx.sret_ptr.is_some() {
                 ctx.builder.ins().return_(&[]);
             } else {
@@ -446,6 +457,7 @@ impl Codegen {
 
         ctx.builder.seal_all_blocks();
         ctx.builder.finalize();
+        self.local_types.clear();
 
         let mut cl_ctx = cranelift_codegen::Context::new();
         cl_ctx.func = func;
@@ -462,13 +474,15 @@ impl Codegen {
 
         if is_typedef {
             for id in &decl.declarators {
-                if let Some(name) = self.get_declarator_name(&id.declarator) {
+                let name = self.get_declarator_name(&id.declarator);
+                if !name.is_empty() {
                     verbose!("typedef: {} = {:?}", name, self.apply_declarator(&base_ty, &id.declarator));
                 }
             }
             // Resolve the actual type and store it in type_env
             for id in &decl.declarators {
-                if let Some(name) = self.get_declarator_name(&id.declarator) {
+                let name = self.get_declarator_name(&id.declarator);
+                if !name.is_empty() {
                     let ty = self.apply_declarator(&base_ty, &id.declarator);
                     self.type_env.typedefs.insert(name, ty);
                 }
@@ -479,7 +493,7 @@ impl Codegen {
         let is_extern = decl.specifiers.iter().any(|s| matches!(s, DeclSpecifier::StorageClass(StorageClass::Extern)));
 
         for id in &decl.declarators {
-            let name = self.get_declarator_name(&id.declarator).unwrap_or_default();
+            let name = self.get_declarator_name(&id.declarator);
             if name.is_empty() { continue; }
 
             let ty = self.apply_declarator(&base_ty, &id.declarator);

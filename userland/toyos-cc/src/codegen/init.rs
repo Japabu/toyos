@@ -337,6 +337,30 @@ impl Codegen {
         ctx.builder.ins().call(func_ref, &[dst, src, size]);
     }
 
+    pub(crate) fn emit_malloc(&mut self, ctx: &mut FuncCtx, size: Value) -> Value {
+        let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(I64));
+        sig.returns.push(AbiParam::new(I64));
+        let func_id = self.module.declare_function("malloc", Linkage::Import, &sig).unwrap_or_else(|_| {
+            if let Some(FuncOrDataId::Func(id)) = self.module.get_name("malloc") { id }
+            else { panic!("cannot declare malloc") }
+        });
+        let func_ref = self.module.declare_func_in_func(func_id, ctx.builder.func);
+        let call = ctx.builder.ins().call(func_ref, &[size]);
+        ctx.builder.inst_results(call)[0]
+    }
+
+    pub(crate) fn emit_free(&mut self, ctx: &mut FuncCtx, ptr: Value) {
+        let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(I64));
+        let func_id = self.module.declare_function("free", Linkage::Import, &sig).unwrap_or_else(|_| {
+            if let Some(FuncOrDataId::Func(id)) = self.module.get_name("free") { id }
+            else { panic!("cannot declare free") }
+        });
+        let func_ref = self.module.declare_func_in_func(func_id, ctx.builder.func);
+        ctx.builder.ins().call(func_ref, &[ptr]);
+    }
+
     pub(crate) fn count_initializer_elements(&self, init: &Initializer, _elem_ty: &CType) -> usize {
         match init {
             Initializer::List(items) => {
@@ -344,7 +368,7 @@ impl Codegen {
                 for item in items {
                     for d in &item.designators {
                         if let Designator::Index(e) = d {
-                            if let Some(v) = crate::ast::eval_const_expr(e, Some(&self.type_env.enum_constants)) {
+                            if let Some(v) = self.eval_const(e) {
                                 max_idx = max_idx.max(v as usize + 1);
                             }
                         }

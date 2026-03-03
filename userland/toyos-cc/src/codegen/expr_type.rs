@@ -171,7 +171,7 @@ impl Codegen {
                 "__builtin_expect" => self.expr_type(ctx, &args[0]),
                 "__builtin_constant_p" => CType::Int(Signedness::Signed),
                 "__builtin_choose_expr" => {
-                    let val = crate::ast::eval_const_expr(&args[0], Some(&self.type_env.enum_constants));
+                    let val = self.eval_const(&args[0]);
                     match val {
                         Some(v) if v != 0 => self.expr_type(ctx, &args[1]),
                         Some(0) | None => self.expr_type(ctx, &args[2]),

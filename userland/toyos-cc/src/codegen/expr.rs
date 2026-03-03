@@ -101,16 +101,26 @@ impl Codegen {
             Expr::Cast(tn, e) => self.compile_cast(ctx, tn, e),
 
             Expr::Sizeof(arg) => {
-                let size = match arg.as_ref() {
+                match arg.as_ref() {
                     SizeofArg::Type(tn) => {
                         let ty = self.resolve_typename(tn);
-                        ty.size()
+                        TypedValue::unsigned(ctx.builder.ins().iconst(I64, ty.size() as i64))
                     }
                     SizeofArg::Expr(e) => {
-                        self.expr_type(ctx, e).size()
+                        // VLA: sizeof returns runtime element_count * element_size
+                        if let Expr::Ident(name) = e {
+                            if let Some(&count) = ctx.vla_sizes.get(name) {
+                                let ty = self.expr_type(ctx, e);
+                                if let CType::Array(elem, None) = &ty {
+                                    let elem_size = ctx.builder.ins().iconst(I64, elem.size() as i64);
+                                    return TypedValue::unsigned(ctx.builder.ins().imul(count, elem_size));
+                                }
+                            }
+                        }
+                        let size = self.expr_type(ctx, e).size();
+                        TypedValue::unsigned(ctx.builder.ins().iconst(I64, size as i64))
                     }
-                };
-                TypedValue::unsigned(ctx.builder.ins().iconst(I64, size as i64))
+                }
             }
 
             Expr::Alignof(tn) => {
@@ -565,7 +575,7 @@ impl Codegen {
                 TypedValue::signed(ctx.builder.ins().iconst(I32, 0))
             }
             "__builtin_choose_expr" => {
-                let val = crate::ast::eval_const_expr(&args[0], Some(&self.type_env.enum_constants))
+                let val = self.eval_const(&args[0])
                     .expect("__builtin_choose_expr: first argument must be a constant expression");
                 if val != 0 { self.compile_expr(ctx, &args[1]) } else { self.compile_expr(ctx, &args[2]) }
             }
