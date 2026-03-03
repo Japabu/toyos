@@ -163,15 +163,16 @@ impl Codegen {
                         // Handle sub-member designators like .a.j = 5
                         if items[*cursor].designators.len() > 1 {
                             let fname = fields[field_idx].name.as_deref().expect("designator on anonymous field");
-                            let (mut off, _, _) = ty.field_offset(fname)
+                            let fi = ty.field_offset(fname)
                                 .unwrap_or_else(|| panic!("init: no field '{fname}' in {ty:?}"));
+                            let mut off = fi.byte_offset;
                             let mut sub_ty = fields[field_idx].ty.clone();
                             for d in &items[*cursor].designators[1..] {
                                 match d {
                                     Designator::Field(sub_name) => {
-                                        let (fo, _, ft) = sub_ty.field_offset(sub_name).unwrap();
-                                        off += fo;
-                                        sub_ty = ft;
+                                        let fi = sub_ty.field_offset(sub_name).unwrap();
+                                        off += fi.byte_offset;
+                                        sub_ty = fi.ty;
                                     }
                                     Designator::Index(idx_expr) => {
                                         let idx = self.eval_const(idx_expr).unwrap() as usize;
@@ -204,10 +205,10 @@ impl Codegen {
                     }
                     if field_idx >= fields.len() { break; }
                     let fname = fields[field_idx].name.as_deref().expect("init: unnamed field in struct init");
-                    let (offset, _, _) = ty.field_offset(fname)
+                    let fi = ty.field_offset(fname)
                         .unwrap_or_else(|| panic!("init: no field '{fname}' in {ty:?}"));
-                    let field_ptr = if offset == 0 { base_ptr }
-                    else { ctx.builder.ins().iadd_imm(base_ptr, offset as i64) };
+                    let field_ptr = if fi.byte_offset == 0 { base_ptr }
+                    else { ctx.builder.ins().iadd_imm(base_ptr, fi.byte_offset as i64) };
                     let field_ty = fields[field_idx].ty.clone();
                     self.compile_init_one(ctx, field_ptr, &field_ty, items, cursor);
                     field_idx += 1;
@@ -448,9 +449,9 @@ impl Codegen {
                             for d in &items[*cursor].designators[1..] {
                                 match d {
                                     Designator::Field(sub_name) => {
-                                        let (fo, _, ft) = sub_ty.field_offset(sub_name).unwrap();
-                                        off += fo;
-                                        sub_ty = ft;
+                                        let fi = sub_ty.field_offset(sub_name).unwrap();
+                                        off += fi.byte_offset;
+                                        sub_ty = fi.ty;
                                     }
                                     Designator::Index(idx_expr) => {
                                         let idx = self.eval_const(idx_expr).unwrap() as usize;

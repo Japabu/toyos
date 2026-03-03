@@ -60,7 +60,7 @@ impl Codegen {
             Expr::Member(e, field) => {
                 let base_ty = self.expr_type(ctx, e);
                 let base_ty = self.resolve_incomplete_type(base_ty);
-                base_ty.field_offset(field).map(|(_, _, ty)| ty)
+                base_ty.field_offset(field).map(|fi| fi.ty)
             }
             Expr::Arrow(e, field) => {
                 let ptr_ty = self.expr_type(ctx, e);
@@ -69,7 +69,7 @@ impl Codegen {
                     _ => return None,
                 };
                 let pointee = self.resolve_incomplete_type(pointee);
-                pointee.field_offset(field).map(|(_, _, ty)| ty)
+                pointee.field_offset(field).map(|fi| fi.ty)
             }
             _ => None,
         }
@@ -78,13 +78,11 @@ impl Codegen {
     /// Check if an expression is a bitfield member access.
     /// Returns (bit_offset, bit_width, storage_type) if it is.
     fn bitfield_info(&mut self, ctx: &FuncCtx, expr: &Expr) -> Option<(u32, u32, CType)> {
-        match expr {
+        let fi = match expr {
             Expr::Member(e, field) => {
                 let base_ty = self.expr_type(ctx, e);
                 let base_ty = self.resolve_incomplete_type(base_ty);
-                let (_, bit_offset, field_ty) = base_ty.field_offset(field)?;
-                let bw = base_ty.field_bit_width(field)?;
-                if bw > 0 { Some((bit_offset, bw, field_ty)) } else { None }
+                base_ty.field_offset(field)?
             }
             Expr::Arrow(e, field) => {
                 let ptr_ty = self.expr_type(ctx, e);
@@ -93,12 +91,12 @@ impl Codegen {
                     _ => return None,
                 };
                 let pointee_ty = self.resolve_incomplete_type(pointee_ty);
-                let (_, bit_offset, field_ty) = pointee_ty.field_offset(field)?;
-                let bw = pointee_ty.field_bit_width(field)?;
-                if bw > 0 { Some((bit_offset, bw, field_ty)) } else { None }
+                pointee_ty.field_offset(field)?
             }
-            _ => None,
-        }
+            _ => return None,
+        };
+        let bw = fi.bit_width.filter(|&w| w > 0)?;
+        Some((fi.bit_offset, bw, fi.ty))
     }
 
     /// Store a value into a bitfield using read-modify-write.
@@ -488,19 +486,18 @@ impl Codegen {
         let base = self.compile_addr(ctx, e);
         let base_ty = self.expr_type(ctx, e);
         let base_ty = self.resolve_incomplete_type(base_ty);
-        let (byte_offset, bit_offset, field_ty) = base_ty.field_offset(field)
+        let fi = base_ty.field_offset(field)
             .unwrap_or_else(|| panic!("no field '{field}' in {base_ty:?}"));
-        let bw = base_ty.field_bit_width(field);
-        if matches!(field_ty, CType::Struct(_) | CType::Union(_) | CType::Array(..)) {
-            if byte_offset != 0 {
-                return TypedValue::unsigned(ctx.builder.ins().iadd_imm(base, byte_offset as i64));
+        if matches!(fi.ty, CType::Struct(_) | CType::Union(_) | CType::Array(..)) {
+            if fi.byte_offset != 0 {
+                return TypedValue::unsigned(ctx.builder.ins().iadd_imm(base, fi.byte_offset as i64));
             }
             return TypedValue::unsigned(base);
         }
-        let sign = field_ty.signedness();
-        let load_ty = self.clif_type(&field_ty);
-        let val = ctx.builder.ins().load(load_ty, MemFlags::new(), base, byte_offset as i32);
-        TypedValue::new(self.extract_bitfield(ctx, val, bit_offset, bw, &field_ty), sign)
+        let sign = fi.ty.signedness();
+        let load_ty = self.clif_type(&fi.ty);
+        let val = ctx.builder.ins().load(load_ty, MemFlags::new(), base, fi.byte_offset as i32);
+        TypedValue::new(self.extract_bitfield(ctx, val, fi.bit_offset, fi.bit_width, &fi.ty), sign)
     }
 
     fn compile_arrow(&mut self, ctx: &mut FuncCtx, e: &Expr, field: &str) -> TypedValue {
@@ -511,19 +508,18 @@ impl Codegen {
             other => panic!("arrow '->{field}' on non-pointer type {other:?}"),
         };
         let pointee_ty = self.resolve_incomplete_type(pointee_ty);
-        let (byte_offset, bit_offset, field_ty) = pointee_ty.field_offset(field)
+        let fi = pointee_ty.field_offset(field)
             .unwrap_or_else(|| panic!("no field '{field}' in {pointee_ty:?}"));
-        let bw = pointee_ty.field_bit_width(field);
-        if matches!(field_ty, CType::Struct(_) | CType::Union(_) | CType::Array(..)) {
-            if byte_offset != 0 {
-                return TypedValue::unsigned(ctx.builder.ins().iadd_imm(ptr, byte_offset as i64));
+        if matches!(fi.ty, CType::Struct(_) | CType::Union(_) | CType::Array(..)) {
+            if fi.byte_offset != 0 {
+                return TypedValue::unsigned(ctx.builder.ins().iadd_imm(ptr, fi.byte_offset as i64));
             }
             return TypedValue::unsigned(ptr);
         }
-        let sign = field_ty.signedness();
-        let load_ty = self.clif_type(&field_ty);
-        let val = ctx.builder.ins().load(load_ty, MemFlags::new(), ptr, byte_offset as i32);
-        TypedValue::new(self.extract_bitfield(ctx, val, bit_offset, bw, &field_ty), sign)
+        let sign = fi.ty.signedness();
+        let load_ty = self.clif_type(&fi.ty);
+        let val = ctx.builder.ins().load(load_ty, MemFlags::new(), ptr, fi.byte_offset as i32);
+        TypedValue::new(self.extract_bitfield(ctx, val, fi.bit_offset, fi.bit_width, &fi.ty), sign)
     }
 
     fn compile_stmt_expr(&mut self, ctx: &mut FuncCtx, items: &[BlockItem]) -> TypedValue {
@@ -610,7 +606,7 @@ impl Codegen {
                     }
                     _ => ty,
                 };
-                let (offset, _, _) = ty.field_offset(&field_name)
+                let fi = ty.field_offset(&field_name)
                     .unwrap_or_else(|| {
                         let field_names: Vec<_> = match &ty {
                             CType::Struct(def) => def.fields.iter().map(|f| f.name.clone().unwrap_or("<anon>".into())).collect(),
@@ -618,7 +614,7 @@ impl Codegen {
                         };
                         panic!("__builtin_offsetof: no field '{field_name}' in '{type_name}' (type has {} fields: {:?})", field_names.len(), &field_names[..field_names.len().min(10)])
                     });
-                TypedValue::unsigned(ctx.builder.ins().iconst(I64, offset as i64))
+                TypedValue::unsigned(ctx.builder.ins().iconst(I64, fi.byte_offset as i64))
             }
             "__builtin_expect" => self.compile_expr(ctx, &args[0]),
             "__builtin_constant_p" => {
@@ -1218,18 +1214,16 @@ impl Codegen {
                     other => panic!("expr_type: arrow on non-pointer type {other:?}"),
                 };
                 let pointee = self.resolve_incomplete_type(pointee);
-                let bw = pointee.field_bit_width(field);
-                let (_, _, ty) = pointee.field_offset(field)
+                let fi = pointee.field_offset(field)
                     .unwrap_or_else(|| panic!("expr_type: no field '{field}' in {pointee:?}"));
-                CType::promote_integer(ty, bw)
+                CType::promote_integer(fi.ty, fi.bit_width)
             }
             Expr::Member(e, field) => {
                 let base_ty = self.expr_type(ctx, e);
                 let base_ty = self.resolve_incomplete_type(base_ty);
-                let bw = base_ty.field_bit_width(field);
-                let (_, _, ty) = base_ty.field_offset(field)
+                let fi = base_ty.field_offset(field)
                     .unwrap_or_else(|| panic!("expr_type: no field '{field}' in {base_ty:?}"));
-                CType::promote_integer(ty, bw)
+                CType::promote_integer(fi.ty, fi.bit_width)
             }
             Expr::Unary(UnaryOp::Deref, e) => {
                 let ty = self.expr_type(ctx, e);
@@ -1416,10 +1410,10 @@ impl Codegen {
                 let base = self.compile_addr(ctx, e);
                 let base_ty = self.expr_type(ctx, e);
                 let base_ty = self.resolve_incomplete_type(base_ty);
-                let (byte_offset, _, _) = base_ty.field_offset(field)
+                let fi = base_ty.field_offset(field)
                     .unwrap_or_else(|| panic!("compile_addr: no field '{field}' in {base_ty:?}"));
-                if byte_offset != 0 {
-                    ctx.builder.ins().iadd_imm(base, byte_offset as i64)
+                if fi.byte_offset != 0 {
+                    ctx.builder.ins().iadd_imm(base, fi.byte_offset as i64)
                 } else {
                     base
                 }
@@ -1432,10 +1426,10 @@ impl Codegen {
                     other => panic!("compile_addr: arrow '->{field}' on non-pointer type {other:?}"),
                 };
                 let pointee_ty = self.resolve_incomplete_type(pointee_ty);
-                let (byte_offset, _, _) = pointee_ty.field_offset(field)
+                let fi = pointee_ty.field_offset(field)
                     .unwrap_or_else(|| panic!("compile_addr: no field '{field}' in {pointee_ty:?}"));
-                if byte_offset != 0 {
-                    ctx.builder.ins().iadd_imm(ptr, byte_offset as i64)
+                if fi.byte_offset != 0 {
+                    ctx.builder.ins().iadd_imm(ptr, fi.byte_offset as i64)
                 } else {
                     ptr
                 }

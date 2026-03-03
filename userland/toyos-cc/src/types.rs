@@ -64,6 +64,16 @@ pub struct EnumDef {
     pub variants: Vec<(String, i64)>,
 }
 
+/// Result of looking up a field in a struct/union.
+/// Unifies the old `field_offset()` and `field_bit_width()` into a single lookup.
+#[derive(Debug, Clone)]
+pub struct FieldInfo {
+    pub byte_offset: usize,
+    pub bit_offset: u32,
+    pub bit_width: Option<u32>,
+    pub ty: CType,
+}
+
 impl CType {
     pub fn size(&self) -> usize {
         match self {
@@ -174,10 +184,9 @@ impl CType {
         (max_size + align - 1) & !(align - 1)
     }
 
-    /// Get the field offset within a struct
-    /// Returns (byte_offset, bit_offset_within_storage_unit, field_type).
-    /// bit_offset is 0 for non-bitfield fields.
-    pub fn field_offset(&self, name: &str) -> Option<(usize, u32, CType)> {
+    /// Look up a field by name in a struct/union.
+    /// Returns byte offset, bit offset within storage unit, bitfield width, and field type.
+    pub fn field_offset(&self, name: &str) -> Option<FieldInfo> {
         let def = match self {
             CType::Struct(def) => def,
             CType::Union(_) => return self.union_field(name),
@@ -202,7 +211,7 @@ impl CType {
                     let field_bit_off = bit_pos;
                     bit_pos += bw;
                     if field.name.as_deref() == Some(name) {
-                        return Some((offset, field_bit_off, field.ty.clone()));
+                        return Some(FieldInfo { byte_offset: offset, bit_offset: field_bit_off, bit_width: field.bit_width, ty: field.ty.clone() });
                     }
                     continue;
                 } else {
@@ -211,7 +220,7 @@ impl CType {
                     bit_unit_size = unit_size;
                     bit_pos = bw;
                     if field.name.as_deref() == Some(name) {
-                        return Some((offset, 0, field.ty.clone()));
+                        return Some(FieldInfo { byte_offset: offset, bit_offset: 0, bit_width: field.bit_width, ty: field.ty.clone() });
                     }
                     continue;
                 }
@@ -226,13 +235,14 @@ impl CType {
             offset = (offset + align - 1) & !(align - 1);
 
             if field.name.as_deref() == Some(name) {
-                return Some((offset, 0, field.ty.clone()));
+                return Some(FieldInfo { byte_offset: offset, bit_offset: 0, bit_width: None, ty: field.ty.clone() });
             }
 
             // Anonymous struct/union - search inside
             if field.name.is_none() {
-                if let Some((inner_offset, inner_bit_off, ty)) = field.ty.field_offset(name) {
-                    return Some((offset + inner_offset, inner_bit_off, ty));
+                if let Some(mut fi) = field.ty.field_offset(name) {
+                    fi.byte_offset += offset;
+                    return Some(fi);
                 }
             }
 
@@ -241,38 +251,18 @@ impl CType {
         None
     }
 
-    fn union_field(&self, name: &str) -> Option<(usize, u32, CType)> {
+    fn union_field(&self, name: &str) -> Option<FieldInfo> {
         let def = match self {
             CType::Union(def) => def,
             _ => return None,
         };
         for field in &def.fields {
             if field.name.as_deref() == Some(name) {
-                return Some((0, 0, field.ty.clone()));
+                return Some(FieldInfo { byte_offset: 0, bit_offset: 0, bit_width: field.bit_width, ty: field.ty.clone() });
             }
             if field.name.is_none() {
-                if let Some((inner_offset, inner_bit_off, ty)) = field.ty.field_offset(name) {
-                    return Some((inner_offset, inner_bit_off, ty));
-                }
-            }
-        }
-        None
-    }
-
-    /// Look up a field's bitfield width (None if not a bitfield or field not found).
-    pub fn field_bit_width(&self, name: &str) -> Option<u32> {
-        let def = match self {
-            CType::Struct(def) | CType::Union(def) => def,
-            _ => return None,
-        };
-        for field in &def.fields {
-            if field.name.as_deref() == Some(name) {
-                return field.bit_width;
-            }
-            // Anonymous struct/union - search inside
-            if field.name.is_none() {
-                if let Some(w) = field.ty.field_bit_width(name) {
-                    return Some(w);
+                if let Some(fi) = field.ty.field_offset(name) {
+                    return Some(fi);
                 }
             }
         }

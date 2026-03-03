@@ -26,14 +26,14 @@ impl Codegen {
             Expr::Arrow(base, field) => {
                 // base should be (StructType*)0
                 let struct_ty = self.null_pointer_cast_type(base)?;
-                let (offset, _, _) = struct_ty.field_offset(field)?;
-                Some(offset as i64)
+                let fi = struct_ty.field_offset(field)?;
+                Some(fi.byte_offset as i64)
             }
             Expr::Member(base, field) => {
                 // Nested member: base.field — accumulate offset
                 let (base_offset, base_ty) = self.eval_member_with_type(base)?;
-                let (field_offset, _, _) = base_ty.field_offset(field)?;
-                Some((base_offset + field_offset) as i64)
+                let fi = base_ty.field_offset(field)?;
+                Some((base_offset + fi.byte_offset) as i64)
             }
             _ => None,
         }
@@ -44,13 +44,13 @@ impl Codegen {
         match expr {
             Expr::Arrow(base, field) => {
                 let struct_ty = self.null_pointer_cast_type(base)?;
-                let (offset, _, ty) = struct_ty.field_offset(field)?;
-                Some((offset, ty))
+                let fi = struct_ty.field_offset(field)?;
+                Some((fi.byte_offset, fi.ty))
             }
             Expr::Member(base, field) => {
                 let (base_offset, base_ty) = self.eval_member_with_type(base)?;
-                let (field_offset, _, ty) = base_ty.field_offset(field)?;
-                Some((base_offset + field_offset, ty))
+                let fi = base_ty.field_offset(field)?;
+                Some((base_offset + fi.byte_offset, fi.ty))
             }
             _ => None,
         }
