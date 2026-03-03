@@ -850,7 +850,9 @@ impl Codegen {
                     rhs_val
                 } else {
                     let lhs_val = ctx.builder.use_var(var);
-                    self.compile_compound_assign(ctx, op, lhs_val, rhs_val)
+                    self.compile_compound_assign(ctx, op,
+                        TypedValue::new(lhs_val, lhs_sign),
+                        TypedValue::new(rhs_val, rhs_tv.signedness()))
                 };
                 let val = self.coerce_typed(ctx, TypedValue::new(val, rhs_tv.signedness()), var_clif);
                 ctx.builder.def_var(var, val);
@@ -865,7 +867,9 @@ impl Codegen {
                     rhs_val
                 } else {
                     let lhs_val = ctx.builder.ins().load(var_clif, MemFlags::new(), ptr, 0);
-                    self.compile_compound_assign(ctx, op, lhs_val, rhs_val)
+                    self.compile_compound_assign(ctx, op,
+                        TypedValue::new(lhs_val, lhs_sign),
+                        TypedValue::new(rhs_val, rhs_tv.signedness()))
                 };
                 let val = self.coerce_typed(ctx, TypedValue::new(val, rhs_tv.signedness()), var_clif);
                 ctx.builder.ins().store(MemFlags::new(), val, ptr, 0);
@@ -899,7 +903,9 @@ impl Codegen {
                 let store_clif = self.clif_type(&storage_ty);
                 let old = ctx.builder.ins().load(store_clif, MemFlags::new(), addr, 0);
                 let lhs_val = self.extract_bitfield(ctx, old, bit_offset, Some(bw), &storage_ty);
-                self.compile_compound_assign(ctx, op, lhs_val, rhs_val)
+                self.compile_compound_assign(ctx, op,
+                    TypedValue::new(lhs_val, lhs_sign),
+                    TypedValue::new(rhs_val, rhs_tv.signedness()))
             };
             return TypedValue::new(
                 self.store_bitfield(ctx, addr, val, bit_offset, bw, &storage_ty),
@@ -917,7 +923,9 @@ impl Codegen {
             rhs_val
         } else {
             let lhs_val = ctx.builder.ins().load(store_clif, MemFlags::new(), addr, 0);
-            self.compile_compound_assign(ctx, op, lhs_val, rhs_val)
+            self.compile_compound_assign(ctx, op,
+                TypedValue::new(lhs_val, lhs_sign),
+                TypedValue::new(rhs_val, rhs_tv.signedness()))
         };
         let val = self.coerce_typed(ctx, TypedValue::new(val, rhs_tv.signedness()), store_clif);
         ctx.builder.ins().store(MemFlags::new(), val, addr, 0);
@@ -1619,52 +1627,51 @@ impl Codegen {
         }
     }
 
-    fn compile_compound_assign(&mut self, ctx: &mut FuncCtx, op: AssignOp, lhs: Value, rhs: Value) -> Value {
-        // Coerce both operands to the wider type (same as compile_binop)
-        let lt = ctx.builder.func.dfg.value_type(lhs);
-        let rt = ctx.builder.func.dfg.value_type(rhs);
+    fn compile_compound_assign(&mut self, ctx: &mut FuncCtx, op: AssignOp, lhs: TypedValue, rhs: TypedValue) -> Value {
+        let lt = ctx.builder.func.dfg.value_type(lhs.raw());
+        let rt = ctx.builder.func.dfg.value_type(rhs.raw());
         let is_float = lt.is_float() || rt.is_float();
         let common = if is_float {
             if lt == F64 || rt == F64 { F64 } else { F32 }
         } else {
             if lt.bits() >= rt.bits() { lt } else { rt }
         };
-        let lhs = self.coerce(ctx, lhs, common);
-        let rhs = self.coerce(ctx, rhs, common);
+        let l = self.coerce_typed(ctx, lhs, common);
+        let r = self.coerce_typed(ctx, rhs, common);
+        let is_unsigned = lhs.is_unsigned();
 
         if is_float {
             match op {
-                AssignOp::AddAssign => ctx.builder.ins().fadd(lhs, rhs),
-                AssignOp::SubAssign => ctx.builder.ins().fsub(lhs, rhs),
-                AssignOp::MulAssign => ctx.builder.ins().fmul(lhs, rhs),
-                AssignOp::DivAssign => ctx.builder.ins().fdiv(lhs, rhs),
+                AssignOp::AddAssign => ctx.builder.ins().fadd(l, r),
+                AssignOp::SubAssign => ctx.builder.ins().fsub(l, r),
+                AssignOp::MulAssign => ctx.builder.ins().fmul(l, r),
+                AssignOp::DivAssign => ctx.builder.ins().fdiv(l, r),
                 _ => {
-                    // Bitwise/shift/mod ops on floats: convert to int first
-                    let lhs = self.coerce(ctx, lhs, I64);
-                    let rhs = self.coerce(ctx, rhs, I64);
+                    let l = self.coerce(ctx, l, I64);
+                    let r = self.coerce(ctx, r, I64);
                     match op {
-                        AssignOp::ModAssign => ctx.builder.ins().srem(lhs, rhs),
-                        AssignOp::ShlAssign => ctx.builder.ins().ishl(lhs, rhs),
-                        AssignOp::ShrAssign => ctx.builder.ins().sshr(lhs, rhs),
-                        AssignOp::AndAssign => ctx.builder.ins().band(lhs, rhs),
-                        AssignOp::XorAssign => ctx.builder.ins().bxor(lhs, rhs),
-                        AssignOp::OrAssign => ctx.builder.ins().bor(lhs, rhs),
+                        AssignOp::ModAssign => ctx.builder.ins().srem(l, r),
+                        AssignOp::ShlAssign => ctx.builder.ins().ishl(l, r),
+                        AssignOp::ShrAssign => ctx.builder.ins().sshr(l, r),
+                        AssignOp::AndAssign => ctx.builder.ins().band(l, r),
+                        AssignOp::XorAssign => ctx.builder.ins().bxor(l, r),
+                        AssignOp::OrAssign => ctx.builder.ins().bor(l, r),
                         _ => unreachable!(),
                     }
                 }
             }
         } else {
             match op {
-                AssignOp::AddAssign => ctx.builder.ins().iadd(lhs, rhs),
-                AssignOp::SubAssign => ctx.builder.ins().isub(lhs, rhs),
-                AssignOp::MulAssign => ctx.builder.ins().imul(lhs, rhs),
-                AssignOp::DivAssign => ctx.builder.ins().sdiv(lhs, rhs),
-                AssignOp::ModAssign => ctx.builder.ins().srem(lhs, rhs),
-                AssignOp::ShlAssign => ctx.builder.ins().ishl(lhs, rhs),
-                AssignOp::ShrAssign => ctx.builder.ins().sshr(lhs, rhs),
-                AssignOp::AndAssign => ctx.builder.ins().band(lhs, rhs),
-                AssignOp::XorAssign => ctx.builder.ins().bxor(lhs, rhs),
-                AssignOp::OrAssign => ctx.builder.ins().bor(lhs, rhs),
+                AssignOp::AddAssign => ctx.builder.ins().iadd(l, r),
+                AssignOp::SubAssign => ctx.builder.ins().isub(l, r),
+                AssignOp::MulAssign => ctx.builder.ins().imul(l, r),
+                AssignOp::DivAssign => if is_unsigned { ctx.builder.ins().udiv(l, r) } else { ctx.builder.ins().sdiv(l, r) },
+                AssignOp::ModAssign => if is_unsigned { ctx.builder.ins().urem(l, r) } else { ctx.builder.ins().srem(l, r) },
+                AssignOp::ShlAssign => ctx.builder.ins().ishl(l, r),
+                AssignOp::ShrAssign => if is_unsigned { ctx.builder.ins().ushr(l, r) } else { ctx.builder.ins().sshr(l, r) },
+                AssignOp::AndAssign => ctx.builder.ins().band(l, r),
+                AssignOp::XorAssign => ctx.builder.ins().bxor(l, r),
+                AssignOp::OrAssign => ctx.builder.ins().bor(l, r),
                 AssignOp::Assign => unreachable!(),
             }
         }
