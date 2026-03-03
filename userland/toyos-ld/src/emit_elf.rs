@@ -601,7 +601,27 @@ fn write_sections_data(w: &mut Writer, sections: &[InputSection], base: u64) {
     }
 }
 
-// ── PIE ELF output ───────────────────────────────────────────────────────
+// ── ELF emit modes ──────────────────────────────────────────────────────
+
+pub(crate) enum ElfEmitMode<'a> {
+    /// PIE executable (ET_DYN with entry point)
+    Pie {
+        entry_name: &'a str,
+        relocs: &'a RelocOutput,
+        eh_frame_hdr: &'a [u8],
+    },
+    /// Static executable (ET_EXEC, GOT filled directly)
+    Static {
+        entry_name: &'a str,
+    },
+    /// Shared library (ET_DYN, exports symbols, .gnu.hash)
+    Shared {
+        relocs: &'a RelocOutput,
+        eh_frame_hdr: &'a [u8],
+    },
+}
+
+// Thin wrappers preserving the existing API
 
 pub(crate) fn emit_bytes(
     state: &LinkState,
@@ -610,9 +630,63 @@ pub(crate) fn emit_bytes(
     entry_name: &str,
     eh_frame_hdr: &[u8],
 ) -> Result<Vec<u8>, LinkError> {
-    let is_dynamic = !state.dynamic_libs.is_empty();
-    let needs_dynamic = is_dynamic || layout.init_array_size > 0 || layout.fini_array_size > 0;
-    let entry = resolve_entry(state, entry_name, Some(&layout.plt))?;
+    emit_elf(state, layout, ElfEmitMode::Pie { entry_name, relocs, eh_frame_hdr })
+}
+
+pub(crate) fn emit_static_bytes(
+    state: &LinkState,
+    layout: &ElfLayout,
+    entry_name: &str,
+) -> Result<Vec<u8>, LinkError> {
+    emit_elf(state, layout, ElfEmitMode::Static { entry_name })
+}
+
+pub(crate) fn emit_shared_bytes(
+    state: &LinkState,
+    layout: &ElfLayout,
+    relocs: &RelocOutput,
+    eh_frame_hdr: &[u8],
+) -> Vec<u8> {
+    emit_elf(state, layout, ElfEmitMode::Shared { relocs, eh_frame_hdr }).unwrap()
+}
+
+// ── Unified ELF emitter ─────────────────────────────────────────────────
+
+fn emit_elf(
+    state: &LinkState,
+    layout: &ElfLayout,
+    mode: ElfEmitMode,
+) -> Result<Vec<u8>, LinkError> {
+    // ── Derive parameters from mode ──
+
+    let is_pie = matches!(mode, ElfEmitMode::Pie { .. });
+    let is_static = matches!(mode, ElfEmitMode::Static { .. });
+    let is_shared = matches!(mode, ElfEmitMode::Shared { .. });
+
+    let base = if is_static { layout.base_addr } else { BASE_VADDR };
+    let e_type = if is_static { elf::ET_EXEC } else { elf::ET_DYN };
+    let entry = match &mode {
+        ElfEmitMode::Pie { entry_name, .. } => resolve_entry(state, entry_name, Some(&layout.plt))?,
+        ElfEmitMode::Static { entry_name } => resolve_entry(state, entry_name, None)?,
+        ElfEmitMode::Shared { .. } => 0,
+    };
+    let relocs = match &mode {
+        ElfEmitMode::Pie { relocs, .. } | ElfEmitMode::Shared { relocs, .. } => Some(*relocs),
+        ElfEmitMode::Static { .. } => None,
+    };
+    let eh_frame_hdr: &[u8] = match &mode {
+        ElfEmitMode::Pie { eh_frame_hdr, .. } | ElfEmitMode::Shared { eh_frame_hdr, .. } => eh_frame_hdr,
+        ElfEmitMode::Static { .. } => &[],
+    };
+
+    let has_dynamic_libs = is_pie && !state.dynamic_libs.is_empty();
+    let needs_dynamic = is_shared || has_dynamic_libs
+        || (is_pie && (layout.init_array_size > 0 || layout.fini_array_size > 0));
+    let has_eh_frame_hdr = !eh_frame_hdr.is_empty();
+    let has_build_id = layout.build_id_note_vaddr != 0;
+    let has_plt = is_pie && !layout.plt_data.is_empty();
+    let has_rela = relocs.map_or(false, |r| !r.relatives.is_empty())
+        || (has_dynamic_libs && relocs.map_or(false, |r| !r.glob_dats.is_empty()));
     let file_rw_end = layout.rw_start + layout.rw_filesz;
 
     let mut buf = Vec::new();
@@ -620,13 +694,15 @@ pub(crate) fn emit_bytes(
 
     // ── Phase 1: Add strings and reserve ──
 
-    let has_eh_frame_hdr = !eh_frame_hdr.is_empty();
-    let has_build_id = layout.build_id_note_vaddr != 0;
-
-    // Section names (only for sections without convenience methods)
     let text_name = w.add_section_name(b".text");
     let data_name = w.add_section_name(b".data");
-    let rela_name = w.add_section_name(b".rela.dyn");
+    let rela_name = if has_rela || is_pie {
+        Some(w.add_section_name(b".rela.dyn"))
+    } else if is_shared {
+        Some(w.add_section_name(b".rela.dyn"))
+    } else {
+        None
+    };
     let eh_frame_hdr_name = if has_eh_frame_hdr {
         Some(w.add_section_name(b".eh_frame_hdr"))
     } else { None };
@@ -634,22 +710,53 @@ pub(crate) fn emit_bytes(
         Some(w.add_section_name(b".note.gnu.build-id"))
     } else { None };
 
-    // Dynamic strings
+    // Dynamic strings: PIE imports vs shared exports
     let mut needed_str_ids = Vec::new();
-    let mut sym_str_ids: Vec<(String, StringId)> = Vec::new();
+    let mut import_str_ids: Vec<(String, StringId)> = Vec::new(); // PIE: imported symbols
+    let mut export_str_ids: Vec<(String, StringId, u64, u32)> = Vec::new(); // Shared: exported symbols
     let mut sym_to_writer_idx: HashMap<String, SymbolIndex> = HashMap::new();
 
-    if is_dynamic {
+    if has_dynamic_libs {
         for lib in &state.dynamic_libs {
             needed_str_ids.push(w.add_dynamic_string(lib.as_bytes()));
         }
-        for (_, sym_name) in &relocs.glob_dats {
-            if !sym_to_writer_idx.contains_key(sym_name) {
-                let str_id = w.add_dynamic_string(sym_name.as_bytes());
-                sym_str_ids.push((sym_name.clone(), str_id));
-                // placeholder — real index comes from reserve below
-                sym_to_writer_idx.insert(sym_name.clone(), SymbolIndex(0));
+        if let Some(relocs) = relocs {
+            for (_, sym_name) in &relocs.glob_dats {
+                if !sym_to_writer_idx.contains_key(sym_name) {
+                    let str_id = w.add_dynamic_string(sym_name.as_bytes());
+                    import_str_ids.push((sym_name.clone(), str_id));
+                    sym_to_writer_idx.insert(sym_name.clone(), SymbolIndex(0));
+                }
             }
+        }
+    }
+
+    let (gnu_hash_sym_count, gnu_hash_bucket_count, gnu_hash_bloom_count);
+    if is_shared {
+        let mut symbols: Vec<_> = state.globals.iter().collect();
+        symbols.sort_by_key(|(name, _)| *name);
+        for (name, def) in &symbols {
+            let SymbolDef::Defined { section, value } = def else { continue; };
+            let str_id = w.add_dynamic_string(name.as_bytes());
+            let st_value = state.sections[section.0].vaddr.unwrap() + value;
+            let hash = gnu_hash(name.as_bytes());
+            export_str_ids.push((name.to_string(), str_id, st_value, hash));
+        }
+        gnu_hash_sym_count = export_str_ids.len() as u32;
+        gnu_hash_bucket_count = gnu_hash_sym_count.max(1);
+        gnu_hash_bloom_count = 1u32;
+        export_str_ids.sort_by_key(|&(_, _, _, h)| h % gnu_hash_bucket_count);
+    } else {
+        gnu_hash_sym_count = 0;
+        gnu_hash_bucket_count = 0;
+        gnu_hash_bloom_count = 0;
+    }
+
+    // Metadata section names (shared only)
+    let mut meta_names: Vec<StringId> = Vec::new();
+    if is_shared {
+        for (name, _) in &state.metadata {
+            meta_names.push(w.add_section_name(name.as_bytes()));
         }
     }
 
@@ -658,69 +765,111 @@ pub(crate) fn emit_bytes(
     let text_sec_idx = w.reserve_section_index(); // .text
     let data_sec_idx = w.reserve_section_index(); // .data
 
-    let dynsym_sec_idx = if is_dynamic {
-        Some(w.reserve_dynsym_section_index())
-    } else { None };
-    if is_dynamic {
-        w.reserve_dynstr_section_index();
-    }
-    w.reserve_section_index(); // .rela.dyn
-    if needs_dynamic {
-        w.reserve_dynamic_section_index();
-    }
-    if has_eh_frame_hdr {
-        w.reserve_section_index(); // .eh_frame_hdr
-    }
-    if has_build_id {
-        w.reserve_section_index(); // .note.gnu.build-id
+    if rela_name.is_some() && !is_shared {
+        // PIE: .rela.dyn comes before dynsym
     }
 
-    // Symtab: collect symbols and add strings before reserving section indices
+    let dynsym_sec_idx = if has_dynamic_libs {
+        Some(w.reserve_dynsym_section_index())
+    } else if is_shared {
+        w.reserve_section_index(); // .rela.dyn (shared reserves this first)
+        Some(w.reserve_dynsym_section_index())
+    } else {
+        None
+    };
+    if has_dynamic_libs {
+        w.reserve_dynstr_section_index();
+    }
+    if is_pie {
+        w.reserve_section_index(); // .rela.dyn
+    }
+    if has_dynamic_libs || (is_pie && needs_dynamic) {
+        if needs_dynamic && !is_shared {
+            w.reserve_dynamic_section_index();
+        }
+    }
+    if is_shared {
+        w.reserve_dynstr_section_index();
+        w.reserve_dynamic_section_index();
+        w.reserve_gnu_hash_section_index();
+    }
+    if has_eh_frame_hdr {
+        w.reserve_section_index();
+    }
+    if has_build_id {
+        w.reserve_section_index();
+    }
+    if is_shared {
+        for _ in &state.metadata {
+            w.reserve_section_index();
+        }
+    }
+
     let (sym_entries, num_local) = collect_symtab_entries(state, &mut w, text_sec_idx, data_sec_idx);
     reserve_symtab_indices(&mut w, &sym_entries);
 
     w.reserve_shstrtab_section_index();
 
     // Reserve dynamic symbol indices
-    if is_dynamic {
+    let dynsym_count = if has_dynamic_libs {
+        import_str_ids.len()
+    } else if is_shared {
+        export_str_ids.len()
+    } else {
+        0
+    };
+    if dynsym_count > 0 || is_shared {
         w.reserve_null_dynamic_symbol_index();
-        for (sym_name, _) in &sym_str_ids {
+        for i in 0..dynsym_count {
             let idx = w.reserve_dynamic_symbol_index();
-            sym_to_writer_idx.insert(sym_name.clone(), idx);
+            if has_dynamic_libs {
+                sym_to_writer_idx.insert(import_str_ids[i].0.clone(), idx);
+            }
         }
     }
 
     // Reserve file layout
     w.reserve_file_header();
-    let phdr_count = 2 + if layout.tls_memsz > 0 { 1 } else { 0 }
+    let phdr_count = 2
+        + if layout.tls_memsz > 0 { 1 } else { 0 }
         + if needs_dynamic { 2 } else { 0 }
         + if has_eh_frame_hdr { 1 } else { 0 }
         + if has_build_id { 1 } else { 0 };
     w.reserve_program_headers(phdr_count as u32);
 
-    // Reserve section data area (excludes NOBITS/bss)
-    w.reserve_until(file_rw_end as usize);
+    w.reserve_until((file_rw_end - base) as usize);
 
-    // Dynamic metadata
-    let rela_count = relocs.relatives.len() + if is_dynamic { relocs.glob_dats.len() } else { 0 };
+    // Rela count
+    let rela_count = if let Some(relocs) = relocs {
+        relocs.relatives.len() + if has_dynamic_libs { relocs.glob_dats.len() } else { 0 }
+    } else { 0 };
     let rela_size = rela_count as u64 * 24;
 
-    let (dynsym_off, dynstr_off);
-    if is_dynamic {
+    // Dynamic metadata reservations
+    let (dynsym_off, dynstr_off, gnu_hash_off);
+    if has_dynamic_libs || is_shared {
         dynsym_off = w.reserve_dynsym() as u64;
         dynstr_off = w.reserve_dynstr() as u64;
     } else {
         dynsym_off = 0;
         dynstr_off = 0;
     }
-
-    let rela_off = w.reserve_relocations(rela_count, true) as u64;
+    if is_shared {
+        gnu_hash_off = w.reserve_gnu_hash(gnu_hash_bloom_count, gnu_hash_bucket_count, gnu_hash_sym_count) as u64;
+    } else {
+        gnu_hash_off = 0;
+    }
 
     let (dynamic_count, dynamic_off, dyn_segment_end);
     if needs_dynamic {
         let mut dc = 1; // DT_NULL
-        if is_dynamic { dc += needed_str_ids.len() + 4; } // DT_NEEDED * N + SYMTAB/STRTAB/STRSZ/SYMENT
-        if rela_count > 0 { dc += 3; } // DT_RELA + DT_RELASZ + DT_RELAENT
+        if has_dynamic_libs {
+            dc += needed_str_ids.len() + 4; // DT_NEEDED * N + SYMTAB/STRTAB/STRSZ/SYMENT
+        }
+        if is_shared {
+            dc += 5; // SYMTAB + STRTAB + STRSZ + SYMENT + GNU_HASH
+        }
+        if rela_count > 0 && !is_shared { dc += 3; } // DT_RELA + DT_RELASZ + DT_RELAENT
         if layout.init_array_size > 0 { dc += 2; }
         if layout.fini_array_size > 0 { dc += 2; }
         dynamic_count = dc;
@@ -733,332 +882,33 @@ pub(crate) fn emit_bytes(
         dyn_segment_end = 0;
     }
 
+    let rela_off = if rela_count > 0 || is_pie {
+        w.reserve_relocations(rela_count, true) as u64
+    } else if is_shared {
+        w.reserve_relocations(rela_count, true) as u64
+    } else {
+        0
+    };
+
+    // Metadata section data (shared only)
+    let mut meta_offsets = Vec::new();
+    if is_shared {
+        for (_, data) in &state.metadata {
+            let off = w.reserve(data.len(), 8);
+            meta_offsets.push(off as u64);
+        }
+    }
+
     reserve_symtab_data(&mut w);
     w.reserve_shstrtab();
     w.reserve_section_headers();
 
     // ── Phase 2: Write ──
 
-    // File header
     w.write_file_header(&FileHeader {
         os_abi: 0,
         abi_version: 0,
-        e_type: elf::ET_DYN,
-        e_machine: elf::EM_X86_64,
-        e_entry: entry,
-        e_flags: 0,
-    }).unwrap();
-
-    // Program headers
-    w.write_align_program_headers();
-    w.write_program_header(&ProgramHeader {
-        p_type: elf::PT_LOAD,
-        p_flags: elf::PF_R | elf::PF_X,
-        p_offset: BASE_VADDR,
-        p_vaddr: BASE_VADDR,
-        p_paddr: BASE_VADDR,
-        p_filesz: layout.rx_end - BASE_VADDR,
-        p_memsz: layout.rx_end - BASE_VADDR,
-        p_align: PAGE_SIZE,
-    });
-    w.write_program_header(&ProgramHeader {
-        p_type: elf::PT_LOAD,
-        p_flags: elf::PF_R | elf::PF_W,
-        p_offset: layout.rw_start,
-        p_vaddr: layout.rw_start,
-        p_paddr: layout.rw_start,
-        p_filesz: layout.rw_filesz,
-        p_memsz: layout.rw_end - layout.rw_start,
-        p_align: PAGE_SIZE,
-    });
-    if layout.tls_memsz > 0 {
-        w.write_program_header(&ProgramHeader {
-            p_type: elf::PT_TLS,
-            p_flags: elf::PF_R,
-            p_offset: layout.tls_start,
-            p_vaddr: layout.tls_start,
-            p_paddr: layout.tls_start,
-            p_filesz: layout.tls_filesz,
-            p_memsz: layout.tls_memsz,
-            p_align: 64,
-        });
-    }
-    if has_eh_frame_hdr {
-        w.write_program_header(&ProgramHeader {
-            p_type: 0x6474_e550, // PT_GNU_EH_FRAME
-            p_flags: elf::PF_R,
-            p_offset: layout.eh_frame_hdr_vaddr,
-            p_vaddr: layout.eh_frame_hdr_vaddr,
-            p_paddr: layout.eh_frame_hdr_vaddr,
-            p_filesz: layout.eh_frame_hdr_size,
-            p_memsz: layout.eh_frame_hdr_size,
-            p_align: 4,
-        });
-    }
-    if has_build_id {
-        w.write_program_header(&ProgramHeader {
-            p_type: elf::PT_NOTE,
-            p_flags: elf::PF_R,
-            p_offset: layout.build_id_note_vaddr,
-            p_vaddr: layout.build_id_note_vaddr,
-            p_paddr: layout.build_id_note_vaddr,
-            p_filesz: BUILD_ID_NOTE_SIZE,
-            p_memsz: BUILD_ID_NOTE_SIZE,
-            p_align: 4,
-        });
-    }
-    if needs_dynamic {
-        let dyn_load_start = if is_dynamic {
-            dynsym_off
-        } else if rela_count > 0 {
-            rela_off
-        } else {
-            dynamic_off
-        };
-        let dynamic_size = dynamic_count as u64 * 16;
-        w.write_program_header(&ProgramHeader {
-            p_type: elf::PT_LOAD,
-            p_flags: elf::PF_R,
-            p_offset: dyn_load_start,
-            p_vaddr: dyn_load_start,
-            p_paddr: dyn_load_start,
-            p_filesz: dyn_segment_end - dyn_load_start,
-            p_memsz: dyn_segment_end - dyn_load_start,
-            p_align: PAGE_SIZE,
-        });
-        w.write_program_header(&ProgramHeader {
-            p_type: elf::PT_DYNAMIC,
-            p_flags: elf::PF_R,
-            p_offset: dynamic_off,
-            p_vaddr: dynamic_off,
-            p_paddr: dynamic_off,
-            p_filesz: dynamic_size,
-            p_memsz: dynamic_size,
-            p_align: 8,
-        });
-    }
-
-    // Section data
-    write_sections_data(&mut w, &state.sections, BASE_VADDR);
-    if !layout.plt_data.is_empty() {
-        w.pad_until(layout.plt_vaddr as usize);
-        w.write(&layout.plt_data);
-    }
-    if has_eh_frame_hdr {
-        w.pad_until(layout.eh_frame_hdr_vaddr as usize);
-        w.write(eh_frame_hdr);
-    }
-    if has_build_id {
-        w.pad_until(layout.build_id_note_vaddr as usize);
-        w.write(&build_id_note_placeholder());
-    }
-    w.pad_until(file_rw_end as usize);
-
-    // Dynamic symbols
-    if is_dynamic {
-        w.write_null_dynamic_symbol();
-        for (_, str_id) in &sym_str_ids {
-            w.write_dynamic_symbol(&Sym {
-                name: Some(*str_id),
-                section: None,
-                st_info: (elf::STB_GLOBAL << 4) | elf::STT_NOTYPE,
-                st_other: elf::STV_DEFAULT,
-                st_shndx: 0,
-                st_value: 0,
-                st_size: 0,
-            });
-        }
-        w.write_dynstr();
-    }
-
-    // Relocations
-    w.write_align_relocation();
-    for &(offset, addend) in &relocs.relatives {
-        w.write_relocation(true, &Rel {
-            r_offset: offset,
-            r_sym: 0,
-            r_type: elf::R_X86_64_RELATIVE,
-            r_addend: addend,
-        });
-    }
-    if is_dynamic {
-        for (got_vaddr, sym_name) in &relocs.glob_dats {
-            let sym_idx = sym_to_writer_idx[sym_name];
-            w.write_relocation(true, &Rel {
-                r_offset: *got_vaddr,
-                r_sym: sym_idx.0,
-                r_type: elf::R_X86_64_GLOB_DAT,
-                r_addend: 0,
-            });
-        }
-    }
-
-    // Dynamic section
-    if needs_dynamic {
-        w.write_align_dynamic();
-        if is_dynamic {
-            for &str_id in &needed_str_ids {
-                w.write_dynamic_string(elf::DT_NEEDED as u32, str_id);
-            }
-            w.write_dynamic(elf::DT_SYMTAB as u32, dynsym_off);
-            w.write_dynamic(elf::DT_STRTAB as u32, dynstr_off);
-            let strsz = w.dynstr_len() as u64;
-            w.write_dynamic(elf::DT_STRSZ as u32, strsz);
-            w.write_dynamic(elf::DT_SYMENT as u32, 24);
-        }
-        if rela_count > 0 {
-            w.write_dynamic(elf::DT_RELA as u32, rela_off);
-            w.write_dynamic(elf::DT_RELASZ as u32, rela_size);
-            w.write_dynamic(elf::DT_RELAENT as u32, 24);
-        }
-        if layout.init_array_size > 0 {
-            w.write_dynamic(elf::DT_INIT_ARRAY as u32, layout.init_array_vaddr);
-            w.write_dynamic(elf::DT_INIT_ARRAYSZ as u32, layout.init_array_size);
-        }
-        if layout.fini_array_size > 0 {
-            w.write_dynamic(elf::DT_FINI_ARRAY as u32, layout.fini_array_vaddr);
-            w.write_dynamic(elf::DT_FINI_ARRAYSZ as u32, layout.fini_array_size);
-        }
-        w.write_dynamic(elf::DT_NULL as u32, 0);
-        w.pad_until(dyn_segment_end as usize);
-    }
-
-    // Symtab + strtab
-    write_symtab(&mut w, &sym_entries);
-
-    // shstrtab
-    w.write_shstrtab();
-
-    // Section headers
-    w.write_null_section_header();
-    w.write_section_header(&SectionHeader {
-        name: Some(text_name),
-        sh_type: elf::SHT_PROGBITS,
-        sh_flags: (elf::SHF_ALLOC | elf::SHF_EXECINSTR) as u64,
-        sh_addr: layout.rx_start,
-        sh_offset: layout.rx_start - BASE_VADDR,
-        sh_size: layout.rx_end - layout.rx_start,
-        sh_link: 0, sh_info: 0, sh_addralign: 1, sh_entsize: 0,
-    });
-    w.write_section_header(&SectionHeader {
-        name: Some(data_name),
-        sh_type: elf::SHT_PROGBITS,
-        sh_flags: (elf::SHF_ALLOC | elf::SHF_WRITE) as u64,
-        sh_addr: layout.rw_start,
-        sh_offset: layout.rw_start - BASE_VADDR,
-        sh_size: layout.rw_filesz,
-        sh_link: 0, sh_info: 0, sh_addralign: 1, sh_entsize: 0,
-    });
-
-    if is_dynamic {
-        w.write_dynsym_section_header(dynsym_off, 1);
-        w.write_dynstr_section_header(dynstr_off);
-    }
-
-    // .rela.dyn
-    w.write_section_header(&SectionHeader {
-        name: Some(rela_name),
-        sh_type: elf::SHT_RELA,
-        sh_flags: elf::SHF_ALLOC as u64,
-        sh_addr: if needs_dynamic { rela_off } else { 0 },
-        sh_offset: rela_off,
-        sh_size: rela_size,
-        sh_link: if is_dynamic { dynsym_sec_idx.unwrap().0 } else { 0 },
-        sh_info: 0,
-        sh_addralign: 8,
-        sh_entsize: 24,
-    });
-
-    if needs_dynamic {
-        w.write_dynamic_section_header(dynamic_off);
-    }
-    if has_eh_frame_hdr {
-        w.write_section_header(&SectionHeader {
-            name: eh_frame_hdr_name,
-            sh_type: elf::SHT_PROGBITS,
-            sh_flags: elf::SHF_ALLOC as u64,
-            sh_addr: layout.eh_frame_hdr_vaddr,
-            sh_offset: layout.eh_frame_hdr_vaddr,
-            sh_size: layout.eh_frame_hdr_size,
-            sh_link: 0, sh_info: 0, sh_addralign: 4, sh_entsize: 0,
-        });
-    }
-    if has_build_id {
-        w.write_section_header(&SectionHeader {
-            name: build_id_name,
-            sh_type: elf::SHT_NOTE,
-            sh_flags: elf::SHF_ALLOC as u64,
-            sh_addr: layout.build_id_note_vaddr,
-            sh_offset: layout.build_id_note_vaddr,
-            sh_size: BUILD_ID_NOTE_SIZE,
-            sh_link: 0, sh_info: 0, sh_addralign: 4, sh_entsize: 0,
-        });
-    }
-
-    w.write_symtab_section_header(num_local);
-    w.write_strtab_section_header();
-    w.write_shstrtab_section_header();
-
-    // Patch build-id descriptor with computed hash
-    if has_build_id {
-        patch_build_id(&mut buf, layout.build_id_note_vaddr as usize);
-    }
-
-    Ok(buf)
-}
-
-// ── Static ELF output ────────────────────────────────────────────────────
-
-pub(crate) fn emit_static_bytes(
-    state: &LinkState,
-    layout: &ElfLayout,
-    entry_name: &str,
-) -> Result<Vec<u8>, LinkError> {
-    let entry = resolve_entry(state, entry_name, None)?;
-    let base = layout.base_addr;
-    let file_rw_end = layout.rw_start + layout.rw_filesz;
-
-    let mut buf = Vec::new();
-    let mut w = Writer::new(Endianness::Little, true, &mut buf);
-
-    let has_build_id = layout.build_id_note_vaddr != 0;
-
-    // ── Phase 1: Reserve ──
-    let text_name = w.add_section_name(b".text");
-    let data_name = w.add_section_name(b".data");
-    let build_id_name = if has_build_id {
-        Some(w.add_section_name(b".note.gnu.build-id"))
-    } else { None };
-
-    w.reserve_null_section_index();
-    let text_sec_idx = w.reserve_section_index(); // .text
-    let data_sec_idx = w.reserve_section_index(); // .data
-    if has_build_id {
-        w.reserve_section_index(); // .note.gnu.build-id
-    }
-
-    let (sym_entries, num_local) = collect_symtab_entries(state, &mut w, text_sec_idx, data_sec_idx);
-    reserve_symtab_indices(&mut w, &sym_entries);
-
-    w.reserve_shstrtab_section_index();
-
-    w.reserve_file_header();
-    let phdr_count = 2 + if layout.tls_memsz > 0 { 1 } else { 0 }
-        + if has_build_id { 1 } else { 0 };
-    w.reserve_program_headers(phdr_count as u32);
-
-    // Section data + GOT entries (excludes NOBITS/bss)
-    w.reserve_until((file_rw_end - base) as usize);
-
-    reserve_symtab_data(&mut w);
-    w.reserve_shstrtab();
-    w.reserve_section_headers();
-
-    // ── Phase 2: Write ──
-    w.write_file_header(&FileHeader {
-        os_abi: 0,
-        abi_version: 0,
-        e_type: elf::ET_EXEC,
+        e_type,
         e_machine: elf::EM_X86_64,
         e_entry: entry,
         e_flags: 0,
@@ -1098,6 +948,18 @@ pub(crate) fn emit_static_bytes(
             p_align: 64,
         });
     }
+    if has_eh_frame_hdr {
+        w.write_program_header(&ProgramHeader {
+            p_type: 0x6474_e550, // PT_GNU_EH_FRAME
+            p_flags: elf::PF_R,
+            p_offset: layout.eh_frame_hdr_vaddr - base,
+            p_vaddr: layout.eh_frame_hdr_vaddr,
+            p_paddr: layout.eh_frame_hdr_vaddr,
+            p_filesz: layout.eh_frame_hdr_size,
+            p_memsz: layout.eh_frame_hdr_size,
+            p_align: 4,
+        });
+    }
     if has_build_id {
         w.write_program_header(&ProgramHeader {
             p_type: elf::PT_NOTE,
@@ -1110,40 +972,188 @@ pub(crate) fn emit_static_bytes(
             p_align: 4,
         });
     }
+    if needs_dynamic {
+        let dyn_load_start = if has_dynamic_libs {
+            dynsym_off
+        } else if is_shared {
+            dynsym_off
+        } else if rela_count > 0 {
+            rela_off
+        } else {
+            dynamic_off
+        };
+        let dynamic_size = dynamic_count as u64 * 16;
+        w.write_program_header(&ProgramHeader {
+            p_type: elf::PT_LOAD,
+            p_flags: elf::PF_R,
+            p_offset: dyn_load_start,
+            p_vaddr: dyn_load_start,
+            p_paddr: dyn_load_start,
+            p_filesz: dyn_segment_end - dyn_load_start,
+            p_memsz: dyn_segment_end - dyn_load_start,
+            p_align: PAGE_SIZE,
+        });
+        w.write_program_header(&ProgramHeader {
+            p_type: elf::PT_DYNAMIC,
+            p_flags: elf::PF_R,
+            p_offset: dynamic_off,
+            p_vaddr: dynamic_off,
+            p_paddr: dynamic_off,
+            p_filesz: dynamic_size,
+            p_memsz: dynamic_size,
+            p_align: 8,
+        });
+    }
 
     // Section data
     write_sections_data(&mut w, &state.sections, base);
+    if has_plt {
+        w.pad_until((layout.plt_vaddr - base) as usize);
+        w.write(&layout.plt_data);
+    }
+    if has_eh_frame_hdr {
+        w.pad_until((layout.eh_frame_hdr_vaddr - base) as usize);
+        w.write(eh_frame_hdr);
+    }
     if has_build_id {
-        let file_off = (layout.build_id_note_vaddr - base) as usize;
-        w.pad_until(file_off);
+        w.pad_until((layout.build_id_note_vaddr - base) as usize);
         w.write(&build_id_note_placeholder());
     }
 
-    // GOT entries (filled directly in static mode)
-    let gottpoff_syms: HashSet<String> = state.relocs.iter()
-        .filter(|r| r.r_type == RelocType::X86Gottpoff)
-        .map(|r| r.symbol_name.clone()).collect();
-    let mut got_entries: Vec<_> = layout.got.iter().collect();
-    got_entries.sort_by_key(|(_, &vaddr)| vaddr);
-    for (sym_name, &got_vaddr) in got_entries {
-        let sym_addr = resolve_symbol(state, sym_name, SectionIdx(0), None)
-            .ok_or_else(|| LinkError::UndefinedSymbols(vec![sym_name.clone()]))?;
-        let value = if gottpoff_syms.contains(sym_name) {
-            tpoff(sym_addr, layout.tls_start, layout.tls_memsz) as u64
-        } else { sym_addr };
-        let file_off = (got_vaddr - base) as usize;
-        w.pad_until(file_off);
-        w.write(&value.to_le_bytes());
+    // Static mode: fill GOT entries directly
+    if is_static {
+        let gottpoff_syms: HashSet<String> = state.relocs.iter()
+            .filter(|r| r.r_type == RelocType::X86Gottpoff)
+            .map(|r| r.symbol_name.clone()).collect();
+        let mut got_entries: Vec<_> = layout.got.iter().collect();
+        got_entries.sort_by_key(|(_, &vaddr)| vaddr);
+        for (sym_name, &got_vaddr) in got_entries {
+            let sym_addr = resolve_symbol(state, sym_name, SectionIdx(0), None)
+                .ok_or_else(|| LinkError::UndefinedSymbols(vec![sym_name.clone()]))?;
+            let value = if gottpoff_syms.contains(sym_name) {
+                tpoff(sym_addr, layout.tls_start, layout.tls_memsz) as u64
+            } else { sym_addr };
+            let file_off = (got_vaddr - base) as usize;
+            w.pad_until(file_off);
+            w.write(&value.to_le_bytes());
+        }
     }
 
     w.pad_until((file_rw_end - base) as usize);
 
+    // Dynamic symbols
+    if has_dynamic_libs {
+        w.write_null_dynamic_symbol();
+        for (_, str_id) in &import_str_ids {
+            w.write_dynamic_symbol(&Sym {
+                name: Some(*str_id),
+                section: None,
+                st_info: (elf::STB_GLOBAL << 4) | elf::STT_NOTYPE,
+                st_other: elf::STV_DEFAULT,
+                st_shndx: 0,
+                st_value: 0,
+                st_size: 0,
+            });
+        }
+        w.write_dynstr();
+    }
+    if is_shared {
+        w.write_null_dynamic_symbol();
+        for (_, str_id, st_value, _) in &export_str_ids {
+            w.write_dynamic_symbol(&Sym {
+                name: Some(*str_id),
+                section: None,
+                st_info: (elf::STB_GLOBAL << 4) | elf::STT_NOTYPE,
+                st_other: elf::STV_DEFAULT,
+                st_shndx: 1, // defined
+                st_value: *st_value,
+                st_size: 0,
+            });
+        }
+        w.write_dynstr();
+
+        // .gnu.hash
+        let sym_hashes: Vec<u32> = export_str_ids.iter().map(|(_, _, _, h)| *h).collect();
+        w.write_gnu_hash(1, 6, gnu_hash_bloom_count, gnu_hash_bucket_count, gnu_hash_sym_count, |i| sym_hashes[i as usize]);
+    }
+
+    // Dynamic section
+    if needs_dynamic {
+        w.write_align_dynamic();
+        if has_dynamic_libs {
+            for &str_id in &needed_str_ids {
+                w.write_dynamic_string(elf::DT_NEEDED as u32, str_id);
+            }
+            w.write_dynamic(elf::DT_SYMTAB as u32, dynsym_off);
+            w.write_dynamic(elf::DT_STRTAB as u32, dynstr_off);
+            let strsz = w.dynstr_len() as u64;
+            w.write_dynamic(elf::DT_STRSZ as u32, strsz);
+            w.write_dynamic(elf::DT_SYMENT as u32, 24);
+        }
+        if is_shared {
+            w.write_dynamic(elf::DT_SYMTAB as u32, dynsym_off);
+            w.write_dynamic(elf::DT_STRTAB as u32, dynstr_off);
+            let strsz = w.dynstr_len() as u64;
+            w.write_dynamic(elf::DT_STRSZ as u32, strsz);
+            w.write_dynamic(elf::DT_SYMENT as u32, 24);
+            w.write_dynamic(elf::DT_GNU_HASH as u32, gnu_hash_off);
+        }
+        if rela_count > 0 && !is_shared {
+            w.write_dynamic(elf::DT_RELA as u32, rela_off);
+            w.write_dynamic(elf::DT_RELASZ as u32, rela_size);
+            w.write_dynamic(elf::DT_RELAENT as u32, 24);
+        }
+        if layout.init_array_size > 0 {
+            w.write_dynamic(elf::DT_INIT_ARRAY as u32, layout.init_array_vaddr);
+            w.write_dynamic(elf::DT_INIT_ARRAYSZ as u32, layout.init_array_size);
+        }
+        if layout.fini_array_size > 0 {
+            w.write_dynamic(elf::DT_FINI_ARRAY as u32, layout.fini_array_vaddr);
+            w.write_dynamic(elf::DT_FINI_ARRAYSZ as u32, layout.fini_array_size);
+        }
+        w.write_dynamic(elf::DT_NULL as u32, 0);
+        w.pad_until(dyn_segment_end as usize);
+    }
+
+    // Relocations
+    if let Some(relocs) = relocs {
+        w.write_align_relocation();
+        for &(offset, addend) in &relocs.relatives {
+            w.write_relocation(true, &Rel {
+                r_offset: offset,
+                r_sym: 0,
+                r_type: elf::R_X86_64_RELATIVE,
+                r_addend: addend,
+            });
+        }
+        if has_dynamic_libs {
+            for (got_vaddr, sym_name) in &relocs.glob_dats {
+                let sym_idx = sym_to_writer_idx[sym_name];
+                w.write_relocation(true, &Rel {
+                    r_offset: *got_vaddr,
+                    r_sym: sym_idx.0,
+                    r_type: elf::R_X86_64_GLOB_DAT,
+                    r_addend: 0,
+                });
+            }
+        }
+    }
+
+    // Metadata sections (shared only)
+    if is_shared {
+        for (i, (_, data)) in state.metadata.iter().enumerate() {
+            w.pad_until(meta_offsets[i] as usize);
+            w.write(data);
+        }
+    }
+
     // Symtab + strtab
     write_symtab(&mut w, &sym_entries);
 
-    // shstrtab + section headers
+    // shstrtab
     w.write_shstrtab();
 
+    // Section headers
     w.write_null_section_header();
     w.write_section_header(&SectionHeader {
         name: Some(text_name),
@@ -1163,6 +1173,47 @@ pub(crate) fn emit_static_bytes(
         sh_size: layout.rw_filesz,
         sh_link: 0, sh_info: 0, sh_addralign: 1, sh_entsize: 0,
     });
+
+    if has_dynamic_libs {
+        w.write_dynsym_section_header(dynsym_off, 1);
+        w.write_dynstr_section_header(dynstr_off);
+    }
+
+    if let Some(rela_name) = rela_name {
+        w.write_section_header(&SectionHeader {
+            name: Some(rela_name),
+            sh_type: elf::SHT_RELA,
+            sh_flags: elf::SHF_ALLOC as u64,
+            sh_addr: if needs_dynamic && !is_shared { rela_off } else { 0 },
+            sh_offset: rela_off,
+            sh_size: rela_size,
+            sh_link: if has_dynamic_libs { dynsym_sec_idx.unwrap().0 } else { 0 },
+            sh_info: 0,
+            sh_addralign: 8,
+            sh_entsize: 24,
+        });
+    }
+
+    if needs_dynamic && !is_shared {
+        w.write_dynamic_section_header(dynamic_off);
+    }
+    if is_shared {
+        w.write_dynsym_section_header(dynsym_off, 1);
+        w.write_dynstr_section_header(dynstr_off);
+        w.write_dynamic_section_header(dynamic_off);
+        w.write_gnu_hash_section_header(gnu_hash_off);
+    }
+    if has_eh_frame_hdr {
+        w.write_section_header(&SectionHeader {
+            name: eh_frame_hdr_name,
+            sh_type: elf::SHT_PROGBITS,
+            sh_flags: elf::SHF_ALLOC as u64,
+            sh_addr: layout.eh_frame_hdr_vaddr,
+            sh_offset: layout.eh_frame_hdr_vaddr - base,
+            sh_size: layout.eh_frame_hdr_size,
+            sh_link: 0, sh_info: 0, sh_addralign: 4, sh_entsize: 0,
+        });
+    }
     if has_build_id {
         w.write_section_header(&SectionHeader {
             name: build_id_name,
@@ -1174,367 +1225,28 @@ pub(crate) fn emit_static_bytes(
             sh_link: 0, sh_info: 0, sh_addralign: 4, sh_entsize: 0,
         });
     }
+    if is_shared {
+        for (i, (_, data)) in state.metadata.iter().enumerate() {
+            w.write_section_header(&SectionHeader {
+                name: Some(meta_names[i]),
+                sh_type: elf::SHT_PROGBITS,
+                sh_flags: 0,
+                sh_addr: 0,
+                sh_offset: meta_offsets[i],
+                sh_size: data.len() as u64,
+                sh_link: 0, sh_info: 0, sh_addralign: 1, sh_entsize: 0,
+            });
+        }
+    }
+
     w.write_symtab_section_header(num_local);
     w.write_strtab_section_header();
     w.write_shstrtab_section_header();
 
+    // Patch build-id descriptor with computed hash
     if has_build_id {
         patch_build_id(&mut buf, (layout.build_id_note_vaddr - base) as usize);
     }
 
     Ok(buf)
-}
-
-// ── Shared library output ────────────────────────────────────────────────
-
-pub(crate) fn emit_shared_bytes(
-    state: &LinkState,
-    layout: &ElfLayout,
-    relocs: &RelocOutput,
-    eh_frame_hdr: &[u8],
-) -> Vec<u8> {
-    let file_rw_end = layout.rw_start + layout.rw_filesz;
-    let has_eh_frame_hdr = !eh_frame_hdr.is_empty();
-    let has_build_id = layout.build_id_note_vaddr != 0;
-
-    let mut buf = Vec::new();
-    let mut w = Writer::new(Endianness::Little, true, &mut buf);
-
-    // ── Phase 1: Reserve ──
-
-    let text_name = w.add_section_name(b".text");
-    let data_name = w.add_section_name(b".data");
-    let rela_name = w.add_section_name(b".rela.dyn");
-    let eh_frame_hdr_name = if has_eh_frame_hdr {
-        Some(w.add_section_name(b".eh_frame_hdr"))
-    } else { None };
-    let build_id_name = if has_build_id {
-        Some(w.add_section_name(b".note.gnu.build-id"))
-    } else { None };
-
-    // Add dynamic strings for exported symbols, sorted by GNU hash bucket
-    let mut symbols: Vec<_> = state.globals.iter().collect();
-    symbols.sort_by_key(|(name, _)| *name);
-    let mut sym_str_ids: Vec<(String, StringId, u64, u32)> = Vec::new();
-    for (name, def) in &symbols {
-        let SymbolDef::Defined { section, value } = def else { continue; };
-        let str_id = w.add_dynamic_string(name.as_bytes());
-        let st_value = state.sections[section.0].vaddr.unwrap() + value;
-        let hash = gnu_hash(name.as_bytes());
-        sym_str_ids.push((name.to_string(), str_id, st_value, hash));
-    }
-    let gnu_hash_sym_count = sym_str_ids.len() as u32;
-    let gnu_hash_bucket_count = gnu_hash_sym_count.max(1);
-    let gnu_hash_bloom_count = 1u32; // power of 2, sufficient for small tables
-    // Sort by GNU hash bucket for .gnu.hash requirements
-    sym_str_ids.sort_by_key(|&(_, _, _, h)| h % gnu_hash_bucket_count);
-
-    // Metadata section names
-    let mut meta_names: Vec<StringId> = Vec::new();
-    for (name, _) in &state.metadata {
-        meta_names.push(w.add_section_name(name.as_bytes()));
-    }
-
-    // Reserve section indices
-    w.reserve_null_section_index();
-    let text_sec_idx = w.reserve_section_index(); // .text
-    let data_sec_idx = w.reserve_section_index(); // .data
-    w.reserve_section_index(); // .rela.dyn
-    w.reserve_dynsym_section_index();
-    w.reserve_dynstr_section_index();
-    w.reserve_dynamic_section_index();
-    w.reserve_gnu_hash_section_index();
-    if has_eh_frame_hdr {
-        w.reserve_section_index(); // .eh_frame_hdr
-    }
-    if has_build_id {
-        w.reserve_section_index(); // .note.gnu.build-id
-    }
-    for _ in &state.metadata {
-        w.reserve_section_index(); // metadata sections
-    }
-
-    let (sym_entries, num_local) = collect_symtab_entries(state, &mut w, text_sec_idx, data_sec_idx);
-    reserve_symtab_indices(&mut w, &sym_entries);
-
-    w.reserve_shstrtab_section_index();
-
-    // Reserve dynamic symbol indices
-    w.reserve_null_dynamic_symbol_index();
-    for _ in &sym_str_ids {
-        w.reserve_dynamic_symbol_index();
-    }
-
-    // Reserve file layout
-    w.reserve_file_header();
-    let phdr_count = 4 + if layout.tls_memsz > 0 { 1 } else { 0 }
-        + if has_eh_frame_hdr { 1 } else { 0 }
-        + if has_build_id { 1 } else { 0 };
-    w.reserve_program_headers(phdr_count as u32);
-
-    w.reserve_until(file_rw_end as usize);
-
-    let dynsym_off = w.reserve_dynsym() as u64;
-    let dynstr_off = w.reserve_dynstr() as u64;
-    let gnu_hash_off = w.reserve_gnu_hash(gnu_hash_bloom_count, gnu_hash_bucket_count, gnu_hash_sym_count) as u64;
-    let mut dynamic_count = 6; // SYMTAB + STRTAB + STRSZ + SYMENT + GNU_HASH + NULL
-    if layout.init_array_size > 0 { dynamic_count += 2; }
-    if layout.fini_array_size > 0 { dynamic_count += 2; }
-    let dynamic_off = w.reserve_dynamic(dynamic_count) as u64;
-    let dyn_segment_end = align_up(w.reserved_len() as u64, PAGE_SIZE);
-    w.reserve_until(dyn_segment_end as usize);
-
-    let rela_count = relocs.relatives.len();
-    let rela_size = rela_count as u64 * 24;
-    let rela_off = w.reserve_relocations(rela_count, true) as u64;
-
-    // Metadata sections
-    let mut meta_offsets = Vec::new();
-    for (_, data) in &state.metadata {
-        let off = w.reserve(data.len(), 8);
-        meta_offsets.push(off as u64);
-    }
-
-    reserve_symtab_data(&mut w);
-    w.reserve_shstrtab();
-    w.reserve_section_headers();
-
-    // ── Phase 2: Write ──
-
-    w.write_file_header(&FileHeader {
-        os_abi: 0,
-        abi_version: 0,
-        e_type: elf::ET_DYN,
-        e_machine: elf::EM_X86_64,
-        e_entry: 0,
-        e_flags: 0,
-    }).unwrap();
-
-    // Program headers
-    w.write_align_program_headers();
-    w.write_program_header(&ProgramHeader {
-        p_type: elf::PT_LOAD,
-        p_flags: elf::PF_R | elf::PF_X,
-        p_offset: BASE_VADDR,
-        p_vaddr: BASE_VADDR,
-        p_paddr: BASE_VADDR,
-        p_filesz: layout.rx_end - BASE_VADDR,
-        p_memsz: layout.rx_end - BASE_VADDR,
-        p_align: PAGE_SIZE,
-    });
-    w.write_program_header(&ProgramHeader {
-        p_type: elf::PT_LOAD,
-        p_flags: elf::PF_R | elf::PF_W,
-        p_offset: layout.rw_start,
-        p_vaddr: layout.rw_start,
-        p_paddr: layout.rw_start,
-        p_filesz: layout.rw_filesz,
-        p_memsz: layout.rw_end - layout.rw_start,
-        p_align: PAGE_SIZE,
-    });
-    let dynamic_size = dynamic_count as u64 * 16;
-    w.write_program_header(&ProgramHeader {
-        p_type: elf::PT_LOAD,
-        p_flags: elf::PF_R,
-        p_offset: dynsym_off,
-        p_vaddr: dynsym_off,
-        p_paddr: dynsym_off,
-        p_filesz: dyn_segment_end - dynsym_off,
-        p_memsz: dyn_segment_end - dynsym_off,
-        p_align: PAGE_SIZE,
-    });
-    w.write_program_header(&ProgramHeader {
-        p_type: elf::PT_DYNAMIC,
-        p_flags: elf::PF_R,
-        p_offset: dynamic_off,
-        p_vaddr: dynamic_off,
-        p_paddr: dynamic_off,
-        p_filesz: dynamic_size,
-        p_memsz: dynamic_size,
-        p_align: 8,
-    });
-    if layout.tls_memsz > 0 {
-        w.write_program_header(&ProgramHeader {
-            p_type: elf::PT_TLS,
-            p_flags: elf::PF_R,
-            p_offset: layout.tls_start,
-            p_vaddr: layout.tls_start,
-            p_paddr: layout.tls_start,
-            p_filesz: layout.tls_filesz,
-            p_memsz: layout.tls_memsz,
-            p_align: 64,
-        });
-    }
-    if has_eh_frame_hdr {
-        w.write_program_header(&ProgramHeader {
-            p_type: 0x6474_e550, // PT_GNU_EH_FRAME
-            p_flags: elf::PF_R,
-            p_offset: layout.eh_frame_hdr_vaddr,
-            p_vaddr: layout.eh_frame_hdr_vaddr,
-            p_paddr: layout.eh_frame_hdr_vaddr,
-            p_filesz: layout.eh_frame_hdr_size,
-            p_memsz: layout.eh_frame_hdr_size,
-            p_align: 4,
-        });
-    }
-    if has_build_id {
-        w.write_program_header(&ProgramHeader {
-            p_type: elf::PT_NOTE,
-            p_flags: elf::PF_R,
-            p_offset: layout.build_id_note_vaddr,
-            p_vaddr: layout.build_id_note_vaddr,
-            p_paddr: layout.build_id_note_vaddr,
-            p_filesz: BUILD_ID_NOTE_SIZE,
-            p_memsz: BUILD_ID_NOTE_SIZE,
-            p_align: 4,
-        });
-    }
-
-    // Section data
-    write_sections_data(&mut w, &state.sections, BASE_VADDR);
-    if has_eh_frame_hdr {
-        w.pad_until(layout.eh_frame_hdr_vaddr as usize);
-        w.write(eh_frame_hdr);
-    }
-    if has_build_id {
-        w.pad_until(layout.build_id_note_vaddr as usize);
-        w.write(&build_id_note_placeholder());
-    }
-    w.pad_until(file_rw_end as usize);
-
-    // Dynamic symbols (sorted by GNU hash bucket)
-    w.write_null_dynamic_symbol();
-    for (_, str_id, st_value, _) in &sym_str_ids {
-        w.write_dynamic_symbol(&Sym {
-            name: Some(*str_id),
-            section: None,
-            st_info: (elf::STB_GLOBAL << 4) | elf::STT_NOTYPE,
-            st_other: elf::STV_DEFAULT,
-            st_shndx: 1, // defined (non-zero)
-            st_value: *st_value,
-            st_size: 0,
-        });
-    }
-    w.write_dynstr();
-
-    // .gnu.hash
-    let sym_hashes: Vec<u32> = sym_str_ids.iter().map(|(_, _, _, h)| *h).collect();
-    w.write_gnu_hash(1, 6, gnu_hash_bloom_count, gnu_hash_bucket_count, gnu_hash_sym_count, |i| sym_hashes[i as usize]);
-
-    // Dynamic section
-    w.write_align_dynamic();
-    w.write_dynamic(elf::DT_SYMTAB as u32, dynsym_off);
-    w.write_dynamic(elf::DT_STRTAB as u32, dynstr_off);
-    let strsz = w.dynstr_len() as u64;
-    w.write_dynamic(elf::DT_STRSZ as u32, strsz);
-    w.write_dynamic(elf::DT_SYMENT as u32, 24);
-    w.write_dynamic(elf::DT_GNU_HASH as u32, gnu_hash_off);
-    if layout.init_array_size > 0 {
-        w.write_dynamic(elf::DT_INIT_ARRAY as u32, layout.init_array_vaddr);
-        w.write_dynamic(elf::DT_INIT_ARRAYSZ as u32, layout.init_array_size);
-    }
-    if layout.fini_array_size > 0 {
-        w.write_dynamic(elf::DT_FINI_ARRAY as u32, layout.fini_array_vaddr);
-        w.write_dynamic(elf::DT_FINI_ARRAYSZ as u32, layout.fini_array_size);
-    }
-    w.write_dynamic(elf::DT_NULL as u32, 0);
-    w.pad_until(dyn_segment_end as usize);
-
-    // Relocations
-    w.write_align_relocation();
-    for &(offset, addend) in &relocs.relatives {
-        w.write_relocation(true, &Rel {
-            r_offset: offset,
-            r_sym: 0,
-            r_type: elf::R_X86_64_RELATIVE,
-            r_addend: addend,
-        });
-    }
-
-    // Metadata sections
-    for (i, (_, data)) in state.metadata.iter().enumerate() {
-        w.pad_until(meta_offsets[i] as usize);
-        w.write(data);
-    }
-
-    // Symtab + strtab
-    write_symtab(&mut w, &sym_entries);
-
-    // shstrtab + section headers
-    w.write_shstrtab();
-
-    w.write_null_section_header();
-    w.write_section_header(&SectionHeader {
-        name: Some(text_name),
-        sh_type: elf::SHT_PROGBITS,
-        sh_flags: (elf::SHF_ALLOC | elf::SHF_EXECINSTR) as u64,
-        sh_addr: layout.rx_start,
-        sh_offset: layout.rx_start - BASE_VADDR,
-        sh_size: layout.rx_end - layout.rx_start,
-        sh_link: 0, sh_info: 0, sh_addralign: 1, sh_entsize: 0,
-    });
-    w.write_section_header(&SectionHeader {
-        name: Some(data_name),
-        sh_type: elf::SHT_PROGBITS,
-        sh_flags: (elf::SHF_ALLOC | elf::SHF_WRITE) as u64,
-        sh_addr: layout.rw_start,
-        sh_offset: layout.rw_start - BASE_VADDR,
-        sh_size: layout.rw_filesz,
-        sh_link: 0, sh_info: 0, sh_addralign: 1, sh_entsize: 0,
-    });
-    w.write_section_header(&SectionHeader {
-        name: Some(rela_name),
-        sh_type: elf::SHT_RELA,
-        sh_flags: elf::SHF_ALLOC as u64,
-        sh_addr: 0,
-        sh_offset: rela_off,
-        sh_size: rela_size,
-        sh_link: 0, sh_info: 0, sh_addralign: 8, sh_entsize: 24,
-    });
-    w.write_dynsym_section_header(dynsym_off, 1);
-    w.write_dynstr_section_header(dynstr_off);
-    w.write_dynamic_section_header(dynamic_off);
-    w.write_gnu_hash_section_header(gnu_hash_off);
-    if has_eh_frame_hdr {
-        w.write_section_header(&SectionHeader {
-            name: eh_frame_hdr_name,
-            sh_type: elf::SHT_PROGBITS,
-            sh_flags: elf::SHF_ALLOC as u64,
-            sh_addr: layout.eh_frame_hdr_vaddr,
-            sh_offset: layout.eh_frame_hdr_vaddr,
-            sh_size: layout.eh_frame_hdr_size,
-            sh_link: 0, sh_info: 0, sh_addralign: 4, sh_entsize: 0,
-        });
-    }
-    if has_build_id {
-        w.write_section_header(&SectionHeader {
-            name: build_id_name,
-            sh_type: elf::SHT_NOTE,
-            sh_flags: elf::SHF_ALLOC as u64,
-            sh_addr: layout.build_id_note_vaddr,
-            sh_offset: layout.build_id_note_vaddr,
-            sh_size: BUILD_ID_NOTE_SIZE,
-            sh_link: 0, sh_info: 0, sh_addralign: 4, sh_entsize: 0,
-        });
-    }
-    for (i, (_, data)) in state.metadata.iter().enumerate() {
-        w.write_section_header(&SectionHeader {
-            name: Some(meta_names[i]),
-            sh_type: elf::SHT_PROGBITS,
-            sh_flags: 0,
-            sh_addr: 0,
-            sh_offset: meta_offsets[i],
-            sh_size: data.len() as u64,
-            sh_link: 0, sh_info: 0, sh_addralign: 1, sh_entsize: 0,
-        });
-    }
-    w.write_symtab_section_header(num_local);
-    w.write_strtab_section_header();
-    w.write_shstrtab_section_header();
-
-    if has_build_id {
-        patch_build_id(&mut buf, layout.build_id_note_vaddr as usize);
-    }
-
-    buf
 }
