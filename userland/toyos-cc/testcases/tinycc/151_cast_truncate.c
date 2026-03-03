@@ -30,5 +30,12 @@ int main() {
     else
         printf("small: wrong\n");
 
+    // Ternary with unsigned cast in false branch:
+    // must zero-extend, not sign-extend
+    int l = 0;
+    uint64_t val = 0xFFFFFFFF80000000ULL;
+    val = l ? val : (uint32_t)val;
+    printf("ternary: 0x%llx\n", (unsigned long long)val);
+
     return 0;
 }

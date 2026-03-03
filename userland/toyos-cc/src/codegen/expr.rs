@@ -1066,15 +1066,25 @@ impl Codegen {
 
                 ctx.builder.switch_to_block(then_block);
                 ctx.builder.seal_block(then_block);
+                let then_unsigned = self.expr_type(ctx, then).map_or(false, |t| t.is_unsigned());
                 let then_val = self.compile_expr(ctx, then);
                 let val_ty = merge_ty.unwrap_or_else(|| ctx.builder.func.dfg.value_type(then_val));
-                let then_val = self.coerce(ctx, then_val, val_ty);
+                let then_val = if then_unsigned {
+                    self.coerce_unsigned(ctx, then_val, val_ty)
+                } else {
+                    self.coerce(ctx, then_val, val_ty)
+                };
                 ctx.builder.ins().jump(merge, &[BlockArg::Value(then_val)]);
 
                 ctx.builder.switch_to_block(else_block);
                 ctx.builder.seal_block(else_block);
+                let else_unsigned = self.expr_type(ctx, else_).map_or(false, |t| t.is_unsigned());
                 let else_val = self.compile_expr(ctx, else_);
-                let else_val = self.coerce(ctx, else_val, val_ty);
+                let else_val = if else_unsigned {
+                    self.coerce_unsigned(ctx, else_val, val_ty)
+                } else {
+                    self.coerce(ctx, else_val, val_ty)
+                };
                 ctx.builder.ins().jump(merge, &[BlockArg::Value(else_val)]);
 
                 ctx.builder.append_block_param(merge, val_ty);

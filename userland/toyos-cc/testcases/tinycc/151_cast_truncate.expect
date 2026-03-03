@@ -3,3 +3,4 @@ b = 0xffffffe4
 d = 0xffffffff
 s = -1
 large unsigned: correct
+ternary: 0x80000000
