@@ -216,9 +216,7 @@ impl Codegen {
                         base = Some(self.resolve_enum(&et));
                     }
                     TypeSpec::Typeof(expr) => {
-                        if let Some(ty) = self.expr_type_for_typeof(expr) {
-                            base = Some(ty);
-                        }
+                        base = Some(self.expr_type_for_typeof(expr));
                     }
                     TypeSpec::TypeofType(tn) => {
                         base = Some(self.resolve_typename(tn));
@@ -505,24 +503,27 @@ impl Codegen {
     }
 
     /// Resolve the type of an expression for typeof() — works without a FuncCtx
-    fn expr_type_for_typeof(&mut self, expr: &Expr) -> Option<CType> {
+    fn expr_type_for_typeof(&mut self, expr: &Expr) -> CType {
         match expr {
             Expr::Ident(name) => {
-                self.global_types.get(name).cloned()
+                self.global_types.get(name)
+                    .or_else(|| self.func_ctypes.get(name))
+                    .cloned()
+                    .unwrap_or_else(|| panic!("typeof: unknown identifier '{name}'"))
             }
-            Expr::IntLit(_) => Some(CType::Int(Signedness::Signed)),
-            Expr::UIntLit(_) => Some(CType::Long(Signedness::Unsigned)),
-            Expr::FloatLit(_, is_f32) => Some(if *is_f32 { CType::Float } else { CType::Double }),
-            Expr::StringLit(_) => Some(CType::Pointer(Box::new(CType::Char(Signedness::Signed)))),
-            Expr::WideStringLit(_) => Some(CType::Pointer(Box::new(CType::Int(Signedness::Signed)))),
+            Expr::IntLit(_) => CType::Int(Signedness::Signed),
+            Expr::UIntLit(_) => CType::Long(Signedness::Unsigned),
+            Expr::FloatLit(_, is_f32) => if *is_f32 { CType::Float } else { CType::Double },
+            Expr::StringLit(_) => CType::Pointer(Box::new(CType::Char(Signedness::Signed))),
+            Expr::WideStringLit(_) => CType::Pointer(Box::new(CType::Int(Signedness::Signed))),
             Expr::Unary(UnaryOp::Deref, e) => {
-                let ty = self.expr_type_for_typeof(e)?;
+                let ty = self.expr_type_for_typeof(e);
                 match ty {
-                    CType::Pointer(inner) => Some(*inner),
-                    _ => None,
+                    CType::Pointer(inner) => *inner,
+                    _ => panic!("typeof: deref of non-pointer type {ty:?}"),
                 }
             }
-            _ => None,
+            _ => panic!("typeof: unhandled expression {expr:?}"),
         }
     }
 }

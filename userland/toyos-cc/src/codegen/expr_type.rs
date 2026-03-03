@@ -84,11 +84,9 @@ impl Codegen {
                     CType::Function(ret, _, _) => ret.as_ref().clone(),
                     CType::Pointer(inner) => match inner.as_ref() {
                         CType::Function(ret, _, _) => ret.as_ref().clone(),
-                        // C89 implicit int: non-function pointer call
-                        _ => CType::Int(Signedness::Signed),
+                        _ => panic!("call through non-function pointer: {callee_ty:?}"),
                     },
-                    // C89 implicit int: callee type not resolvable to function
-                    _ => CType::Int(Signedness::Signed),
+                    _ => panic!("call on non-function type: {callee_ty:?}"),
                 }
             }
             Expr::Cast(type_name, _) => self.resolve_typename(type_name),

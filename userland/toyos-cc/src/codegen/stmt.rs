@@ -247,7 +247,7 @@ impl Codegen {
             }
             Statement::Goto(label) => self.compile_goto(ctx, label),
             Statement::Label(label, body) => self.compile_label(ctx, label, body),
-            Statement::Asm(_) => {}
+            Statement::Asm(_) => panic!("inline asm not implemented"),
         }
     }
 
@@ -747,7 +747,8 @@ impl Codegen {
                     let tv = self.compile_expr(ctx, e);
                     self.coerce_typed(ctx, tv, clif_ty)
                 }
-                _ => Self::emit_zero(&mut ctx.builder, clif_ty),
+                Some(Initializer::List(_)) => panic!("list initializer in scalar context"),
+                None => Self::emit_zero(&mut ctx.builder, clif_ty),
             };
             ctx.builder.def_var(var, val);
         }
@@ -827,7 +828,8 @@ impl Codegen {
                 let tv = self.compile_expr(ctx, e);
                 self.coerce_typed(ctx, tv, clif_ty)
             }
-            _ => Self::emit_zero(&mut ctx.builder, clif_ty),
+            Some(Initializer::List(_)) => panic!("list initializer in scalar context"),
+            None => Self::emit_zero(&mut ctx.builder, clif_ty),
         };
         ctx.builder.ins().store(MemFlags::new(), val, ptr, 0);
     }

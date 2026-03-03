@@ -699,11 +699,11 @@ impl Codegen {
                 // Unknown function: declare as import
                 let mut sig = self.module.make_signature();
                 sig.returns.push(AbiParam::new(I64));
-                if let Ok(func_id) = self.module.declare_function(ref_name, Linkage::Import, &sig) {
-                    self.func_ids.insert(ref_name.clone(), func_id);
-                    relocs.push(GlobalReloc::FuncAddr { offset: offset as u32, func_id });
-                    return;
-                }
+                let func_id = self.module.declare_function(ref_name, Linkage::Import, &sig)
+                    .unwrap_or_else(|e| panic!("failed to declare function '{ref_name}' in global init: {e}"));
+                self.func_ids.insert(ref_name.clone(), func_id);
+                relocs.push(GlobalReloc::FuncAddr { offset: offset as u32, func_id });
+                return;
             }
         }
 

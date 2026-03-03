@@ -807,8 +807,9 @@ impl Codegen {
         }
 
         let addr = self.compile_addr(ctx, lhs);
-        // Use actual field type for stores (not promoted type) to avoid
-        // clobbering adjacent fields
+        // Use actual field type for stores (not promoted type) to avoid clobbering adjacent
+        // fields. For non-field lvalues (deref, index, plain var), the lhs type IS the storage
+        // type, so unwrap_or is sound — field_storage_type only returns Some for Member/Arrow.
         let store_ty = self.field_storage_type(ctx, lhs).unwrap_or(lhs_ty);
         let store_clif = self.clif_type(&store_ty);
         let val = if op == AssignOp::Assign {

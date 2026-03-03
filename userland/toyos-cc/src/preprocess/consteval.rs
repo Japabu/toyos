@@ -405,10 +405,12 @@ impl<'a> ConstEval<'a> {
                     }
                     Val::zero()
                 } else {
-                    // Unknown identifier = 0
+                    // C spec: undefined identifiers in #if evaluate to 0 (C11 6.10.1p4)
                     Val::zero()
                 }
             }
+            // End-of-input or non-primary tokens (operators, parens handled by callers): zero is
+            // correct because the preprocessor constant expression grammar treats absent primaries as 0
             _ => Val::zero(),
         }
     }
