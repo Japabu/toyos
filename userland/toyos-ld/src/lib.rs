@@ -33,6 +33,8 @@ pub enum LinkError {
     Parse { file: String, message: String },
     #[error("unsupported relocation type {reloc_type} for symbol {symbol}")]
     UnsupportedRelocation { reloc_type: RelocType, symbol: String },
+    #[error("unsupported raw relocation type {raw_type} for symbol {symbol}")]
+    UnsupportedRawRelocation { raw_type: String, symbol: String },
     #[error("relocation overflow: type {reloc_type} for symbol {symbol} value {value:#x}")]
     RelocationOverflow { reloc_type: RelocType, symbol: String, value: i64 },
     #[error("entry symbol '{0}' not found")]

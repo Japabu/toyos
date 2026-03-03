@@ -154,7 +154,7 @@ pub(crate) fn collect(objects: &[(String, Vec<u8>)]) -> Result<LinkState, LinkEr
         let obj = object::File::parse(data.as_slice())
             .map_err(|e| LinkError::Parse { file: name.clone(), message: e.to_string() })?;
 
-        collect_object(&mut state, &obj, obj_idx, &mut sec_map);
+        collect_object(&mut state, &obj, obj_idx, &mut sec_map)?;
     }
 
     Ok(state)
@@ -223,7 +223,7 @@ fn collect_object(
     obj: &object::File,
     obj_idx: ObjIdx,
     sec_map: &mut HashMap<(ObjIdx, object::SectionIndex), SectionIdx>,
-) {
+) -> Result<(), LinkError> {
     for section in obj.sections() {
         let sec_name = section.name().unwrap_or("");
 
@@ -389,19 +389,33 @@ fn collect_object(
             let (r_type, is_macho_instruction) = match reloc.flags() {
                 RelocationFlags::Elf { r_type } => match elf_to_reloc_type(r_type) {
                     Some(r) => (r, false),
-                    None => continue,
+                    // R_*_NONE (0) is a no-op padding relocation
+                    None if r_type == 0 => continue,
+                    None => return Err(LinkError::UnsupportedRawRelocation {
+                        raw_type: format!("ELF {r_type}"),
+                        symbol: sym_name,
+                    }),
                 },
                 RelocationFlags::Coff { typ } => match coff_to_reloc_type(typ) {
                     Some(r) => (r, false),
-                    None => continue,
+                    None => return Err(LinkError::UnsupportedRawRelocation {
+                        raw_type: format!("COFF {typ}"),
+                        symbol: sym_name,
+                    }),
                 },
                 RelocationFlags::MachO { r_type, r_length, .. } => {
                     match macho_arm64_to_reloc_type(r_type, r_length) {
                         Some(r) => (r, macho_arm64_is_instruction_reloc(r_type)),
-                        None => continue,
+                        None => return Err(LinkError::UnsupportedRawRelocation {
+                            raw_type: format!("Mach-O type={r_type} length={r_length}"),
+                            symbol: sym_name,
+                        }),
                     }
                 }
-                _ => continue,
+                flags => return Err(LinkError::UnsupportedRawRelocation {
+                    raw_type: format!("{flags:?}"),
+                    symbol: sym_name,
+                }),
             };
 
             // COFF and Mach-O data relocations use implicit addends stored in
@@ -432,9 +446,12 @@ fn collect_object(
             });
         }
     }
+    Ok(())
 }
 
 fn elf_to_reloc_type(r_type: u32) -> Option<RelocType> {
+    // R_X86_64_NONE (0) is a no-op relocation that can appear in object files.
+    // Other unknown types are rejected at the call site.
     Some(match r_type {
         elf::R_X86_64_64 => RelocType::X86_64,
         elf::R_X86_64_PC32 => RelocType::X86Pc32,

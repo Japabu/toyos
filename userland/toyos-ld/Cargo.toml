@@ -7,3 +7,4 @@ edition = "2021"
 object = { version = "0.38", default-features = false, features = ["read", "write", "elf", "coff", "pe", "macho", "std"] }
 sha2 = "0.10"
 thiserror = "2"
+zerocopy = { version = "0.8", features = ["derive"] }
