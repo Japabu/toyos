@@ -452,35 +452,48 @@ pub(crate) fn apply_relocs_macho(
         let sec = &state.sections[reloc.section_global_idx];
         let reloc_vaddr = sec.vaddr + reloc.offset;
 
+        // GOT relocations don't need the symbol address — they use the GOT
+        // slot address, which is looked up by name inside the reloc handler.
+        let is_got_reloc = matches!(reloc.r_type,
+            elf::R_AARCH64_ADR_GOT_PAGE | elf::R_AARCH64_LD64_GOT_LO12_NC);
+
         let sym_addr = match resolve_symbol(state, &reloc.symbol_name, reloc.section_global_idx, None) {
             Some(a) => a,
+            None if is_got_reloc && params.got.contains_key(&reloc.symbol_name) => 0,
             None => {
-                // For GOT relocations, the symbol might be external — the GOT
-                // slot address is what matters, not the symbol address.
-                if matches!(reloc.r_type, elf::R_AARCH64_ADR_GOT_PAGE | elf::R_AARCH64_LD64_GOT_LO12_NC)
-                    && params.got.contains_key(&reloc.symbol_name)
-                {
-                    0 // sym_addr unused for GOT relocs
-                } else {
-                    undefined.insert(reloc.symbol_name.clone());
-                    continue;
-                }
+                undefined.insert(reloc.symbol_name.clone());
+                continue;
             }
         };
 
-        // Dispatch by architecture
-        if reloc.r_type >= 257 {
-            // AArch64 range
-            let is_abs = apply_one_reloc_aarch64(state, reloc, sym_addr, reloc_vaddr, params.got)?;
-            if is_abs {
-                rebase_entries.push((reloc_vaddr, sym_addr as i64 + reloc.addend));
+        let is_abs = match reloc.r_type {
+            // AArch64 relocations
+            elf::R_AARCH64_ABS64
+            | elf::R_AARCH64_CALL26
+            | elf::R_AARCH64_ADR_PREL_PG_HI21
+            | elf::R_AARCH64_ADD_ABS_LO12_NC
+            | elf::R_AARCH64_LDST64_ABS_LO12_NC
+            | elf::R_AARCH64_ADR_GOT_PAGE
+            | elf::R_AARCH64_LD64_GOT_LO12_NC => {
+                apply_one_reloc_aarch64(state, reloc, sym_addr, reloc_vaddr, params.got)?
             }
-        } else {
-            // x86-64 range
-            let is_abs = apply_one_reloc(state, reloc, sym_addr, reloc_vaddr, params.got)?;
-            if is_abs {
-                rebase_entries.push((reloc_vaddr, sym_addr as i64 + reloc.addend));
+            // x86-64 relocations
+            elf::R_X86_64_64
+            | elf::R_X86_64_PC32
+            | elf::R_X86_64_PLT32
+            | elf::R_X86_64_GOTPCREL
+            | elf::R_X86_64_GOTPCRELX
+            | elf::R_X86_64_REX_GOTPCRELX
+            | elf::R_X86_64_32
+            | elf::R_X86_64_32S => {
+                apply_one_reloc(state, reloc, sym_addr, reloc_vaddr, params.got)?
             }
+            other => return Err(LinkError::UnsupportedRelocation {
+                reloc_type: other, symbol: reloc.symbol_name.clone(),
+            }),
+        };
+        if is_abs {
+            rebase_entries.push((reloc_vaddr, sym_addr as i64 + reloc.addend));
         }
     }
 

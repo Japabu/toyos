@@ -313,6 +313,22 @@ pub fn link_macho(
         }
     }
 
+    // Create stubs for direct calls (CALL26) to undefined/dynamic symbols.
+    // Each stub loads the target address from a GOT slot and branches to it.
+    create_call_stubs(&mut state);
+
+    // Sections with absolute relocations need runtime rebasing, which requires
+    // writable memory. Move read-only data sections (like .data.ro) to __DATA.
+    {
+        let abs_reloc_sections: std::collections::HashSet<usize> = state.relocs.iter()
+            .filter(|r| r.r_type == object::elf::R_AARCH64_ABS64)
+            .map(|r| r.section_global_idx)
+            .collect();
+        for &idx in &abs_reloc_sections {
+            state.sections[idx].writable = true;
+        }
+    }
+
     if gc { gc_sections(&mut state, entry); }
     let layout = layout_macho(&mut state, entry);
 
@@ -335,6 +351,104 @@ pub fn link_macho(
     }
 
     emit_macho_bytes(&state, &layout, entry, &rebase_entries, &bind_entries)
+}
+
+/// Create call stubs for CALL26 relocations targeting dynamic (undefined) symbols.
+/// On arm64 Mach-O, direct `bl` instructions can't reach dylib functions — the
+/// linker must create stubs that load the address from a GOT slot and branch.
+///
+/// For each such symbol, this function:
+/// 1. Appends a 12-byte stub to a synthetic `.text.stubs` section
+/// 2. Adds a global symbol for the stub
+/// 3. Adds GOT relocations (ADR_GOT_PAGE + LD64_GOT_LO12_NC) from the stub
+/// 4. Rewrites the CALL26 relocations to target the stub
+fn create_call_stubs(state: &mut collect::LinkState) {
+    use object::elf;
+    use std::collections::BTreeSet;
+
+    // Find all dynamic symbols that have CALL26 relocations
+    let mut stub_syms = BTreeSet::new();
+    for reloc in &state.relocs {
+        if reloc.r_type != elf::R_AARCH64_CALL26 { continue; }
+        if let Some(def) = state.globals.get(&reloc.symbol_name) {
+            if def.section_global_idx == collect::DYNAMIC_SYMBOL_SENTINEL {
+                stub_syms.insert(reloc.symbol_name.clone());
+            }
+        }
+    }
+
+    if stub_syms.is_empty() { return; }
+
+    // Build stub section: 12 bytes per stub
+    // Each stub:  adrp x16, sym@GOTPAGE       (patched by GOT_PAGE reloc)
+    //             ldr  x16, [x16, sym@GOTLO12] (patched by GOT_LO12 reloc)
+    //             br   x16
+    let stub_count = stub_syms.len();
+    let mut stub_data = Vec::with_capacity(stub_count * 12);
+    let mut stub_relocs = Vec::new();
+    let stub_sec_idx = state.sections.len();
+
+    for (i, sym_name) in stub_syms.iter().enumerate() {
+        let offset = (i * 12) as u64;
+
+        // adrp x16, #0 — placeholder, will be patched by ADR_GOT_PAGE reloc
+        stub_data.extend_from_slice(&0x9000_0010u32.to_le_bytes());
+        // ldr x16, [x16, #0] — placeholder, will be patched by LD64_GOT_LO12_NC reloc
+        stub_data.extend_from_slice(&0xF940_0210u32.to_le_bytes());
+        // br x16
+        stub_data.extend_from_slice(&0xD61F_0200u32.to_le_bytes());
+
+        // Add GOT relocations for this stub
+        stub_relocs.push(collect::InputReloc {
+            section_global_idx: stub_sec_idx,
+            offset,
+            r_type: elf::R_AARCH64_ADR_GOT_PAGE,
+            symbol_name: sym_name.clone(),
+            addend: 0,
+        });
+        stub_relocs.push(collect::InputReloc {
+            section_global_idx: stub_sec_idx,
+            offset: offset + 4,
+            r_type: elf::R_AARCH64_LD64_GOT_LO12_NC,
+            symbol_name: sym_name.clone(),
+            addend: 0,
+        });
+
+        // Add a global symbol for the stub
+        let stub_name = format!("{sym_name}.__stub");
+        state.globals.insert(stub_name, collect::SymbolDef {
+            section_global_idx: stub_sec_idx,
+            value: offset,
+        });
+    }
+
+    // Add the stubs section
+    state.sections.push(collect::InputSection {
+        obj_idx: usize::MAX,
+        name: ".text".to_string(),
+        data: stub_data,
+        align: 4,
+        size: (stub_count * 12) as u64,
+        vaddr: 0,
+        writable: false,
+        nobits: false,
+        merge: false,
+        strings: false,
+        entsize: 0,
+    });
+
+    // Add the GOT relocations
+    state.relocs.extend(stub_relocs);
+
+    // Rewrite CALL26 relocations to target the stub symbols
+    let stub_syms_set: BTreeSet<&str> = stub_syms.iter().map(|s| s.as_str()).collect();
+    for reloc in &mut state.relocs {
+        if reloc.r_type == elf::R_AARCH64_CALL26
+            && stub_syms_set.contains(reloc.symbol_name.as_str())
+        {
+            reloc.symbol_name = format!("{}.__stub", reloc.symbol_name);
+        }
+    }
 }
 
 // ── Shared helpers ──────────────────────────────────────────────────────
