@@ -223,427 +223,440 @@ impl Codegen {
         }
 
         match stmt {
-            Statement::Compound(items) => {
-                // Save scope: locals, local_ptrs, spilled_locals, func_ids, func_sigs, func_ret_types
-                let saved_locals = ctx.locals.clone();
-                let saved_local_ptrs = ctx.local_ptrs.clone();
-                let saved_spilled = ctx.spilled_locals.clone();
-                let saved_enums = self.type_env.enum_constants.clone();
-
-                for item in items {
-                    if ctx.filled {
-                        // Skip dead code after terminator, unless it might contain a label target
-                        // or is a declaration (variables need to exist for code after labels)
-                        match item {
-                            BlockItem::Stmt(Statement::Label(..) | Statement::Case(..) | Statement::CaseRange(..) | Statement::Default(..) | Statement::Compound(..)) => {
-                                // fall through — labels/compounds can be targets
-                            }
-                            BlockItem::Stmt(Statement::If(..) | Statement::While(..) | Statement::DoWhile(..) | Statement::For(..)) if ctx.switch_val.is_some() => {
-                                // Inside a switch, control structures may contain case labels
-                            }
-                            BlockItem::Decl(_) => {
-                                // fall through — declarations need to exist for code after labels
-                            }
-                            _ => continue,
-                        }
-                    }
-                    match item {
-                        BlockItem::Decl(d) => self.compile_local_decl(ctx, d),
-                        BlockItem::Stmt(s) => self.compile_stmt(ctx, s),
-                    }
-                }
-
-                // Restore scope
-                ctx.locals = saved_locals;
-                ctx.local_ptrs = saved_local_ptrs;
-                ctx.spilled_locals = saved_spilled;
-                self.type_env.enum_constants = saved_enums;
-            }
+            Statement::Compound(items) => self.compile_compound(ctx, items),
             Statement::Expr(Some(e)) => { let _ = self.compile_expr(ctx, e); }
             Statement::Expr(None) => {}
-            Statement::Return(val) => {
-                if let Some(e) = val {
-                    if let Some(sret) = ctx.sret_ptr {
-                        // Struct return: copy data to sret pointer
-                        let src = self.compile_expr(ctx, e).raw();
-                        let size = ctx.return_type.size();
-                        let size_val = ctx.builder.ins().iconst(I64, size as i64);
-                        self.emit_memcpy(ctx, sret, src, size_val);
-                        ctx.builder.ins().return_(&[]);
-                    } else {
-                        let tv = self.compile_expr(ctx, e);
-                        let ret_clif = self.clif_type(&ctx.return_type);
-                        let v = self.coerce_typed(ctx, tv, ret_clif);
-                        ctx.builder.ins().return_(&[v]);
-                    }
-                } else {
-                    ctx.builder.ins().return_(&[]);
-                }
-                ctx.filled = true;
-            }
-            Statement::If(cond, then, else_) => {
-                self.ensure_unfilled(ctx);
-                let saved_enums = self.type_env.enum_constants.clone();
-                let cond_val = self.compile_expr(ctx, cond).raw();
-                let cond_bool = self.to_bool(ctx, cond_val);
-
-                let then_block = ctx.builder.create_block();
-                let else_block = ctx.builder.create_block();
-                let merge = ctx.builder.create_block();
-
-                ctx.builder.ins().brif(cond_bool, then_block, &[], else_block, &[]);
-
-                ctx.builder.switch_to_block(then_block);
-                ctx.builder.seal_block(then_block);
-                ctx.filled = false;
-                self.compile_stmt(ctx, then);
-                let then_filled = ctx.filled;
-                if !ctx.filled { ctx.builder.ins().jump(merge, &[]); }
-
-                ctx.builder.switch_to_block(else_block);
-                ctx.builder.seal_block(else_block);
-                ctx.filled = false;
-                if let Some(else_body) = else_ {
-                    self.compile_stmt(ctx, else_body);
-                }
-                let else_filled = ctx.filled;
-                if !ctx.filled { ctx.builder.ins().jump(merge, &[]); }
-
-                ctx.builder.switch_to_block(merge);
-                ctx.builder.seal_block(merge);
-                ctx.filled = then_filled && else_filled;
-                self.type_env.enum_constants = saved_enums;
-            }
-            Statement::While(cond, body) => {
-                let saved_enums = self.type_env.enum_constants.clone();
-                let cond_block = ctx.builder.create_block();
-                let body_block = ctx.builder.create_block();
-                let exit_block = ctx.builder.create_block();
-
-                ctx.builder.ins().jump(cond_block, &[]);
-                ctx.builder.switch_to_block(cond_block);
-                ctx.filled = false;
-
-                let cond_val = self.compile_expr(ctx, cond).raw();
-                let cond_bool = self.to_bool(ctx, cond_val);
-                ctx.builder.ins().brif(cond_bool, body_block, &[], exit_block, &[]);
-
-                let prev_break = ctx.break_block.replace(exit_block);
-                let prev_continue = ctx.continue_block.replace(cond_block);
-
-                ctx.builder.switch_to_block(body_block);
-                ctx.builder.seal_block(body_block);
-                ctx.filled = false;
-                self.compile_stmt(ctx, body);
-                if !ctx.filled { ctx.builder.ins().jump(cond_block, &[]); }
-
-                ctx.break_block = prev_break;
-                ctx.continue_block = prev_continue;
-
-                ctx.builder.seal_block(cond_block);
-                ctx.builder.switch_to_block(exit_block);
-                ctx.builder.seal_block(exit_block);
-                ctx.filled = false;
-                self.type_env.enum_constants = saved_enums;
-            }
-            Statement::DoWhile(body, cond) => {
-                let saved_enums = self.type_env.enum_constants.clone();
-                let body_block = ctx.builder.create_block();
-                let cond_block = ctx.builder.create_block();
-                let exit_block = ctx.builder.create_block();
-
-                ctx.builder.ins().jump(body_block, &[]);
-
-                let prev_break = ctx.break_block.replace(exit_block);
-                let prev_continue = ctx.continue_block.replace(cond_block);
-
-                ctx.builder.switch_to_block(body_block);
-                ctx.filled = false;
-                self.compile_stmt(ctx, body);
-                if !ctx.filled { ctx.builder.ins().jump(cond_block, &[]); }
-
-                ctx.builder.switch_to_block(cond_block);
-                ctx.builder.seal_block(cond_block);
-                ctx.filled = false;
-                let cond_val = self.compile_expr(ctx, cond).raw();
-                let cond_bool = self.to_bool(ctx, cond_val);
-                ctx.builder.ins().brif(cond_bool, body_block, &[], exit_block, &[]);
-
-                ctx.break_block = prev_break;
-                ctx.continue_block = prev_continue;
-
-                ctx.builder.seal_block(body_block);
-                ctx.builder.switch_to_block(exit_block);
-                ctx.builder.seal_block(exit_block);
-                ctx.filled = false;
-                self.type_env.enum_constants = saved_enums;
-            }
-            Statement::For(init, cond, step, body) => {
-                let saved_enums = self.type_env.enum_constants.clone();
-                if let Some(init) = init {
-                    match init.as_ref() {
-                        ForInit::Decl(d) => self.compile_local_decl(ctx, d),
-                        ForInit::Expr(e) => { let _ = self.compile_expr(ctx, e); }
-                    }
-                }
-                // Pre-resolve types in cond/step so enum definitions are
-                // visible in the body (all for parts share the same scope).
-                if let Some(cond) = cond { self.preresolve_expr_types(cond); }
-                if let Some(step) = step { self.preresolve_expr_types(step); }
-
-                let cond_block = ctx.builder.create_block();
-                let body_block = ctx.builder.create_block();
-                let step_block = ctx.builder.create_block();
-                let exit_block = ctx.builder.create_block();
-
-                ctx.builder.ins().jump(cond_block, &[]);
-                ctx.builder.switch_to_block(cond_block);
-                ctx.filled = false;
-
-                if let Some(cond) = cond {
-                    let cond_val = self.compile_expr(ctx, cond).raw();
-                    let cond_bool = self.to_bool(ctx, cond_val);
-                    ctx.builder.ins().brif(cond_bool, body_block, &[], exit_block, &[]);
-                } else {
-                    ctx.builder.ins().jump(body_block, &[]);
-                }
-
-                let prev_break = ctx.break_block.replace(exit_block);
-                let prev_continue = ctx.continue_block.replace(step_block);
-
-                ctx.builder.switch_to_block(body_block);
-                ctx.builder.seal_block(body_block);
-                ctx.filled = false;
-                self.compile_stmt(ctx, body);
-                if !ctx.filled { ctx.builder.ins().jump(step_block, &[]); }
-
-                ctx.builder.switch_to_block(step_block);
-                ctx.builder.seal_block(step_block);
-                ctx.filled = false;
-                if let Some(step) = step {
-                    let _ = self.compile_expr(ctx, step);
-                }
-                ctx.builder.ins().jump(cond_block, &[]);
-
-                ctx.break_block = prev_break;
-                ctx.continue_block = prev_continue;
-
-                ctx.builder.seal_block(cond_block);
-                ctx.builder.switch_to_block(exit_block);
-                ctx.builder.seal_block(exit_block);
-                ctx.filled = false;
-                self.type_env.enum_constants = saved_enums;
-            }
-            Statement::Switch(val, body) => {
-                let saved_enums = self.type_env.enum_constants.clone();
-                let switch_tv = self.compile_expr(ctx, val);
-                let is_unsigned = switch_tv.is_unsigned();
-                let switch_val = switch_tv.raw();
-                let switch_type = ctx.builder.func.dfg.value_type(switch_val);
-                let exit_block = ctx.builder.create_block();
-
-                let prev_break = ctx.break_block.replace(exit_block);
-                let prev_switch = ctx.switch_val.replace(switch_val);
-                let prev_unsigned = ctx.switch_unsigned;
-                ctx.switch_unsigned = is_unsigned;
-                let prev_exit = ctx.switch_exit.replace(exit_block);
-                let prev_fallthrough = ctx.switch_pending_fallthrough.take();
-                let prev_entries = std::mem::take(&mut ctx.switch_dispatch_entries);
-                let prev_ranges = std::mem::take(&mut ctx.switch_dispatch_ranges);
-                let prev_default = ctx.switch_default_block.take();
-                let prev_case_blocks = std::mem::take(&mut ctx.switch_case_blocks);
-
-                // Jump to a placeholder dispatch block (will be filled after body)
-                let dispatch_entry = ctx.builder.create_block();
-                ctx.builder.ins().jump(dispatch_entry, &[]);
-
-                // Switch to an unreachable block for the body — actual code
-                // is reached via case dispatch blocks
-                let body_block = ctx.builder.create_block();
-                ctx.builder.switch_to_block(body_block);
-                ctx.builder.seal_block(body_block);
-                ctx.filled = true; // unreachable until a case label
-
-                self.compile_stmt(ctx, body);
-                if !ctx.filled { ctx.builder.ins().jump(exit_block, &[]); }
-
-                // If last case had a fallthrough, connect it to exit
-                if let Some(ft) = ctx.switch_pending_fallthrough.take() {
-                    ctx.builder.switch_to_block(ft);
-                    ctx.builder.ins().jump(exit_block, &[]);
-                    ctx.builder.seal_block(ft);
-                }
-
-                // Build dispatch chain from collected entries
-                let entries = std::mem::take(&mut ctx.switch_dispatch_entries);
-                let ranges = std::mem::take(&mut ctx.switch_dispatch_ranges);
-                let default_block = ctx.switch_default_block.take();
-
-                let mut current_dispatch = dispatch_entry;
-                for (case_val, case_block) in &entries {
-                    let next_dispatch = ctx.builder.create_block();
-                    ctx.builder.switch_to_block(current_dispatch);
-                    let cv = ctx.builder.ins().iconst(switch_type, *case_val as i64);
-                    let sv = switch_val;
-                    let cmp = ctx.builder.ins().icmp(IntCC::Equal, sv, cv);
-                    ctx.builder.ins().brif(cmp, *case_block, &[], next_dispatch, &[]);
-                    ctx.builder.seal_block(current_dispatch);
-                    current_dispatch = next_dispatch;
-                }
-                for (lo, hi, case_block) in &ranges {
-                    let next_dispatch = ctx.builder.create_block();
-                    ctx.builder.switch_to_block(current_dispatch);
-                    let lo_v = ctx.builder.ins().iconst(switch_type, *lo as i64);
-                    let hi_v = ctx.builder.ins().iconst(switch_type, *hi as i64);
-                    let (ge_cc, le_cc) = if is_unsigned {
-                        (IntCC::UnsignedGreaterThanOrEqual, IntCC::UnsignedLessThanOrEqual)
-                    } else {
-                        (IntCC::SignedGreaterThanOrEqual, IntCC::SignedLessThanOrEqual)
-                    };
-                    let ge = ctx.builder.ins().icmp(ge_cc, switch_val, lo_v);
-                    let le = ctx.builder.ins().icmp(le_cc, switch_val, hi_v);
-                    let in_range = ctx.builder.ins().band(ge, le);
-                    ctx.builder.ins().brif(in_range, *case_block, &[], next_dispatch, &[]);
-                    ctx.builder.seal_block(current_dispatch);
-                    current_dispatch = next_dispatch;
-                }
-                // End of dispatch chain: jump to default or exit
-                ctx.builder.switch_to_block(current_dispatch);
-                ctx.builder.ins().jump(default_block.unwrap_or(exit_block), &[]);
-                ctx.builder.seal_block(current_dispatch);
-
-                // Seal all case/default blocks now that all predecessors are known
-                let case_blocks = std::mem::take(&mut ctx.switch_case_blocks);
-                for block in case_blocks {
-                    ctx.builder.seal_block(block);
-                }
-
-                ctx.break_block = prev_break;
-                ctx.switch_val = prev_switch;
-                ctx.switch_unsigned = prev_unsigned;
-                ctx.switch_exit = prev_exit;
-                ctx.switch_pending_fallthrough = prev_fallthrough;
-                ctx.switch_dispatch_entries = prev_entries;
-                ctx.switch_dispatch_ranges = prev_ranges;
-                ctx.switch_case_blocks = prev_case_blocks;
-                ctx.switch_default_block = prev_default;
-
-                ctx.builder.switch_to_block(exit_block);
-                ctx.builder.seal_block(exit_block);
-                ctx.filled = false;
-                self.type_env.enum_constants = saved_enums;
-            }
-            Statement::Case(val, body) => {
-                // Body block: either from previous case's fallthrough or new
-                let case_block = ctx.switch_pending_fallthrough.take()
-                    .unwrap_or_else(|| ctx.builder.create_block());
-
-                // Collect dispatch entry (case value evaluated at compile time)
-                let case_val = self.eval_const(val).expect("case: non-constant expression");
-                ctx.switch_dispatch_entries.push((case_val as i128, case_block));
-                ctx.switch_case_blocks.push(case_block);
-
-                // Connect fallthrough from previous body code to case_block
-                if !ctx.filled {
-                    ctx.builder.ins().jump(case_block, &[]);
-                    ctx.filled = true;
-                }
-
-                // Don't seal case_block yet — dispatch chain will add predecessors
-                ctx.builder.switch_to_block(case_block);
-                ctx.filled = false;
-                self.compile_stmt(ctx, body);
-
-                if !ctx.filled {
-                    let ft = ctx.builder.create_block();
-                    ctx.builder.ins().jump(ft, &[]);
-                    ctx.switch_pending_fallthrough = Some(ft);
-                }
-                ctx.filled = true;
-            }
-            Statement::CaseRange(lo, hi, body) => {
-                let case_block = ctx.switch_pending_fallthrough.take()
-                    .unwrap_or_else(|| ctx.builder.create_block());
-
-                let lo_val = self.eval_const(lo).expect("case range: non-constant low expression");
-                let hi_val = self.eval_const(hi).expect("case range: non-constant high expression");
-                ctx.switch_dispatch_ranges.push((lo_val as i128, hi_val as i128, case_block));
-                ctx.switch_case_blocks.push(case_block);
-
-                if !ctx.filled {
-                    ctx.builder.ins().jump(case_block, &[]);
-                    ctx.filled = true;
-                }
-
-                ctx.builder.switch_to_block(case_block);
-                ctx.filled = false;
-                self.compile_stmt(ctx, body);
-
-                if !ctx.filled {
-                    let ft = ctx.builder.create_block();
-                    ctx.builder.ins().jump(ft, &[]);
-                    ctx.switch_pending_fallthrough = Some(ft);
-                }
-                ctx.filled = true;
-            }
-            Statement::Default(body) => {
-                let default_block = ctx.switch_pending_fallthrough.take()
-                    .unwrap_or_else(|| ctx.builder.create_block());
-
-                ctx.switch_default_block = Some(default_block);
-                ctx.switch_case_blocks.push(default_block);
-
-                if !ctx.filled {
-                    ctx.builder.ins().jump(default_block, &[]);
-                    ctx.filled = true;
-                }
-
-                ctx.builder.switch_to_block(default_block);
-                ctx.filled = false;
-                self.compile_stmt(ctx, body);
-            }
+            Statement::Return(val) => self.compile_return(ctx, val.as_ref()),
+            Statement::If(cond, then, else_) => self.compile_if(ctx, cond, then, else_.as_deref()),
+            Statement::While(cond, body) => self.compile_while(ctx, cond, body),
+            Statement::DoWhile(body, cond) => self.compile_do_while(ctx, body, cond),
+            Statement::For(init, cond, step, body) => self.compile_for(ctx, init.as_deref(), cond.as_deref(), step.as_deref(), body),
+            Statement::Switch(val, body) => self.compile_switch(ctx, val, body),
+            Statement::Case(val, body) => self.compile_case(ctx, val, body),
+            Statement::CaseRange(lo, hi, body) => self.compile_case_range(ctx, lo, hi, body),
+            Statement::Default(body) => self.compile_default(ctx, body),
             Statement::Break => {
-                if let Some(brk) = ctx.break_block {
-                    ctx.builder.ins().jump(brk, &[]);
-                    ctx.filled = true;
-                }
+                let brk = ctx.break_block.expect("break outside loop/switch");
+                ctx.builder.ins().jump(brk, &[]);
+                ctx.filled = true;
             }
             Statement::Continue => {
-                if let Some(cont) = ctx.continue_block {
-                    ctx.builder.ins().jump(cont, &[]);
-                    ctx.filled = true;
-                }
-            }
-            Statement::Goto(label) => {
-                let block = if let Some(&existing) = ctx.labels.get(label) {
-                    existing
-                } else {
-                    let b = ctx.builder.create_block();
-                    ctx.labels.insert(label.clone(), b);
-                    b
-                };
-                ctx.builder.ins().jump(block, &[]);
+                let cont = ctx.continue_block.expect("continue outside loop");
+                ctx.builder.ins().jump(cont, &[]);
                 ctx.filled = true;
             }
-            Statement::Label(label, body) => {
-                let block = if let Some(existing) = ctx.labels.get(label) {
-                    *existing
-                } else {
-                    let b = ctx.builder.create_block();
-                    ctx.labels.insert(label.clone(), b);
-                    b
-                };
-
-                if !ctx.filled {
-                    ctx.builder.ins().jump(block, &[]);
-                }
-                ctx.builder.switch_to_block(block);
-                ctx.filled = false;
-                // Don't seal yet — might have forward gotos
-                self.compile_stmt(ctx, body);
-            }
+            Statement::Goto(label) => self.compile_goto(ctx, label),
+            Statement::Label(label, body) => self.compile_label(ctx, label, body),
             Statement::Asm(_) => {}
         }
+    }
+
+    fn compile_compound(&mut self, ctx: &mut FuncCtx, items: &[BlockItem]) {
+        let saved_locals = ctx.locals.clone();
+        let saved_local_ptrs = ctx.local_ptrs.clone();
+        let saved_spilled = ctx.spilled_locals.clone();
+        let saved_enums = self.type_env.enum_constants.clone();
+
+        for item in items {
+            if ctx.filled {
+                // Skip dead code after terminator, unless it might contain a label target
+                // or is a declaration (variables need to exist for code after labels)
+                match item {
+                    BlockItem::Stmt(Statement::Label(..) | Statement::Case(..) | Statement::CaseRange(..) | Statement::Default(..) | Statement::Compound(..)) => {}
+                    BlockItem::Stmt(Statement::If(..) | Statement::While(..) | Statement::DoWhile(..) | Statement::For(..)) if ctx.switch_val.is_some() => {}
+                    BlockItem::Decl(_) => {}
+                    _ => continue,
+                }
+            }
+            match item {
+                BlockItem::Decl(d) => self.compile_local_decl(ctx, d),
+                BlockItem::Stmt(s) => self.compile_stmt(ctx, s),
+            }
+        }
+
+        ctx.locals = saved_locals;
+        ctx.local_ptrs = saved_local_ptrs;
+        ctx.spilled_locals = saved_spilled;
+        self.type_env.enum_constants = saved_enums;
+    }
+
+    fn compile_return(&mut self, ctx: &mut FuncCtx, val: Option<&Expr>) {
+        if let Some(e) = val {
+            if let Some(sret) = ctx.sret_ptr {
+                let src = self.compile_expr(ctx, e).raw();
+                let size = ctx.return_type.size();
+                let size_val = ctx.builder.ins().iconst(I64, size as i64);
+                self.emit_memcpy(ctx, sret, src, size_val);
+                ctx.builder.ins().return_(&[]);
+            } else {
+                let tv = self.compile_expr(ctx, e);
+                let ret_clif = self.clif_type(&ctx.return_type);
+                let v = self.coerce_typed(ctx, tv, ret_clif);
+                ctx.builder.ins().return_(&[v]);
+            }
+        } else {
+            ctx.builder.ins().return_(&[]);
+        }
+        ctx.filled = true;
+    }
+
+    fn compile_if(&mut self, ctx: &mut FuncCtx, cond: &Expr, then: &Statement, else_: Option<&Statement>) {
+        self.ensure_unfilled(ctx);
+        let saved_enums = self.type_env.enum_constants.clone();
+        let cond_val = self.compile_expr(ctx, cond).raw();
+        let cond_bool = self.to_bool(ctx, cond_val);
+
+        let then_block = ctx.builder.create_block();
+        let else_block = ctx.builder.create_block();
+        let merge = ctx.builder.create_block();
+
+        ctx.builder.ins().brif(cond_bool, then_block, &[], else_block, &[]);
+
+        ctx.builder.switch_to_block(then_block);
+        ctx.builder.seal_block(then_block);
+        ctx.filled = false;
+        self.compile_stmt(ctx, then);
+        let then_filled = ctx.filled;
+        if !ctx.filled { ctx.builder.ins().jump(merge, &[]); }
+
+        ctx.builder.switch_to_block(else_block);
+        ctx.builder.seal_block(else_block);
+        ctx.filled = false;
+        if let Some(else_body) = else_ {
+            self.compile_stmt(ctx, else_body);
+        }
+        let else_filled = ctx.filled;
+        if !ctx.filled { ctx.builder.ins().jump(merge, &[]); }
+
+        ctx.builder.switch_to_block(merge);
+        ctx.builder.seal_block(merge);
+        ctx.filled = then_filled && else_filled;
+        self.type_env.enum_constants = saved_enums;
+    }
+
+    fn compile_while(&mut self, ctx: &mut FuncCtx, cond: &Expr, body: &Statement) {
+        let saved_enums = self.type_env.enum_constants.clone();
+        let cond_block = ctx.builder.create_block();
+        let body_block = ctx.builder.create_block();
+        let exit_block = ctx.builder.create_block();
+
+        ctx.builder.ins().jump(cond_block, &[]);
+        ctx.builder.switch_to_block(cond_block);
+        ctx.filled = false;
+
+        let cond_val = self.compile_expr(ctx, cond).raw();
+        let cond_bool = self.to_bool(ctx, cond_val);
+        ctx.builder.ins().brif(cond_bool, body_block, &[], exit_block, &[]);
+
+        let prev_break = ctx.break_block.replace(exit_block);
+        let prev_continue = ctx.continue_block.replace(cond_block);
+
+        ctx.builder.switch_to_block(body_block);
+        ctx.builder.seal_block(body_block);
+        ctx.filled = false;
+        self.compile_stmt(ctx, body);
+        if !ctx.filled { ctx.builder.ins().jump(cond_block, &[]); }
+
+        ctx.break_block = prev_break;
+        ctx.continue_block = prev_continue;
+
+        ctx.builder.seal_block(cond_block);
+        ctx.builder.switch_to_block(exit_block);
+        ctx.builder.seal_block(exit_block);
+        ctx.filled = false;
+        self.type_env.enum_constants = saved_enums;
+    }
+
+    fn compile_do_while(&mut self, ctx: &mut FuncCtx, body: &Statement, cond: &Expr) {
+        let saved_enums = self.type_env.enum_constants.clone();
+        let body_block = ctx.builder.create_block();
+        let cond_block = ctx.builder.create_block();
+        let exit_block = ctx.builder.create_block();
+
+        ctx.builder.ins().jump(body_block, &[]);
+
+        let prev_break = ctx.break_block.replace(exit_block);
+        let prev_continue = ctx.continue_block.replace(cond_block);
+
+        ctx.builder.switch_to_block(body_block);
+        ctx.filled = false;
+        self.compile_stmt(ctx, body);
+        if !ctx.filled { ctx.builder.ins().jump(cond_block, &[]); }
+
+        ctx.builder.switch_to_block(cond_block);
+        ctx.builder.seal_block(cond_block);
+        ctx.filled = false;
+        let cond_val = self.compile_expr(ctx, cond).raw();
+        let cond_bool = self.to_bool(ctx, cond_val);
+        ctx.builder.ins().brif(cond_bool, body_block, &[], exit_block, &[]);
+
+        ctx.break_block = prev_break;
+        ctx.continue_block = prev_continue;
+
+        ctx.builder.seal_block(body_block);
+        ctx.builder.switch_to_block(exit_block);
+        ctx.builder.seal_block(exit_block);
+        ctx.filled = false;
+        self.type_env.enum_constants = saved_enums;
+    }
+
+    fn compile_for(&mut self, ctx: &mut FuncCtx, init: Option<&ForInit>, cond: Option<&Expr>, step: Option<&Expr>, body: &Statement) {
+        let saved_enums = self.type_env.enum_constants.clone();
+        if let Some(init) = init {
+            match init {
+                ForInit::Decl(d) => self.compile_local_decl(ctx, d),
+                ForInit::Expr(e) => { let _ = self.compile_expr(ctx, e); }
+            }
+        }
+        // Pre-resolve types in cond/step so enum definitions are
+        // visible in the body (all for parts share the same scope).
+        if let Some(cond) = cond { self.preresolve_expr_types(cond); }
+        if let Some(step) = step { self.preresolve_expr_types(step); }
+
+        let cond_block = ctx.builder.create_block();
+        let body_block = ctx.builder.create_block();
+        let step_block = ctx.builder.create_block();
+        let exit_block = ctx.builder.create_block();
+
+        ctx.builder.ins().jump(cond_block, &[]);
+        ctx.builder.switch_to_block(cond_block);
+        ctx.filled = false;
+
+        if let Some(cond) = cond {
+            let cond_val = self.compile_expr(ctx, cond).raw();
+            let cond_bool = self.to_bool(ctx, cond_val);
+            ctx.builder.ins().brif(cond_bool, body_block, &[], exit_block, &[]);
+        } else {
+            ctx.builder.ins().jump(body_block, &[]);
+        }
+
+        let prev_break = ctx.break_block.replace(exit_block);
+        let prev_continue = ctx.continue_block.replace(step_block);
+
+        ctx.builder.switch_to_block(body_block);
+        ctx.builder.seal_block(body_block);
+        ctx.filled = false;
+        self.compile_stmt(ctx, body);
+        if !ctx.filled { ctx.builder.ins().jump(step_block, &[]); }
+
+        ctx.builder.switch_to_block(step_block);
+        ctx.builder.seal_block(step_block);
+        ctx.filled = false;
+        if let Some(step) = step {
+            let _ = self.compile_expr(ctx, step);
+        }
+        ctx.builder.ins().jump(cond_block, &[]);
+
+        ctx.break_block = prev_break;
+        ctx.continue_block = prev_continue;
+
+        ctx.builder.seal_block(cond_block);
+        ctx.builder.switch_to_block(exit_block);
+        ctx.builder.seal_block(exit_block);
+        ctx.filled = false;
+        self.type_env.enum_constants = saved_enums;
+    }
+
+    fn compile_switch(&mut self, ctx: &mut FuncCtx, val: &Expr, body: &Statement) {
+        let saved_enums = self.type_env.enum_constants.clone();
+        let switch_tv = self.compile_expr(ctx, val);
+        let is_unsigned = switch_tv.is_unsigned();
+        let switch_val = switch_tv.raw();
+        let switch_type = ctx.builder.func.dfg.value_type(switch_val);
+        let exit_block = ctx.builder.create_block();
+
+        let prev_break = ctx.break_block.replace(exit_block);
+        let prev_switch = ctx.switch_val.replace(switch_val);
+        let prev_unsigned = ctx.switch_unsigned;
+        ctx.switch_unsigned = is_unsigned;
+        let prev_exit = ctx.switch_exit.replace(exit_block);
+        let prev_fallthrough = ctx.switch_pending_fallthrough.take();
+        let prev_entries = std::mem::take(&mut ctx.switch_dispatch_entries);
+        let prev_ranges = std::mem::take(&mut ctx.switch_dispatch_ranges);
+        let prev_default = ctx.switch_default_block.take();
+        let prev_case_blocks = std::mem::take(&mut ctx.switch_case_blocks);
+
+        // Jump to a placeholder dispatch block (will be filled after body)
+        let dispatch_entry = ctx.builder.create_block();
+        ctx.builder.ins().jump(dispatch_entry, &[]);
+
+        // Switch to an unreachable block for the body — actual code
+        // is reached via case dispatch blocks
+        let body_block = ctx.builder.create_block();
+        ctx.builder.switch_to_block(body_block);
+        ctx.builder.seal_block(body_block);
+        ctx.filled = true; // unreachable until a case label
+
+        self.compile_stmt(ctx, body);
+        if !ctx.filled { ctx.builder.ins().jump(exit_block, &[]); }
+
+        // If last case had a fallthrough, connect it to exit
+        if let Some(ft) = ctx.switch_pending_fallthrough.take() {
+            ctx.builder.switch_to_block(ft);
+            ctx.builder.ins().jump(exit_block, &[]);
+            ctx.builder.seal_block(ft);
+        }
+
+        // Build dispatch chain from collected entries
+        let entries = std::mem::take(&mut ctx.switch_dispatch_entries);
+        let ranges = std::mem::take(&mut ctx.switch_dispatch_ranges);
+        let default_block = ctx.switch_default_block.take();
+
+        let mut current_dispatch = dispatch_entry;
+        for (case_val, case_block) in &entries {
+            let next_dispatch = ctx.builder.create_block();
+            ctx.builder.switch_to_block(current_dispatch);
+            let cv = ctx.builder.ins().iconst(switch_type, *case_val as i64);
+            let sv = switch_val;
+            let cmp = ctx.builder.ins().icmp(IntCC::Equal, sv, cv);
+            ctx.builder.ins().brif(cmp, *case_block, &[], next_dispatch, &[]);
+            ctx.builder.seal_block(current_dispatch);
+            current_dispatch = next_dispatch;
+        }
+        for (lo, hi, case_block) in &ranges {
+            let next_dispatch = ctx.builder.create_block();
+            ctx.builder.switch_to_block(current_dispatch);
+            let lo_v = ctx.builder.ins().iconst(switch_type, *lo as i64);
+            let hi_v = ctx.builder.ins().iconst(switch_type, *hi as i64);
+            let (ge_cc, le_cc) = if is_unsigned {
+                (IntCC::UnsignedGreaterThanOrEqual, IntCC::UnsignedLessThanOrEqual)
+            } else {
+                (IntCC::SignedGreaterThanOrEqual, IntCC::SignedLessThanOrEqual)
+            };
+            let ge = ctx.builder.ins().icmp(ge_cc, switch_val, lo_v);
+            let le = ctx.builder.ins().icmp(le_cc, switch_val, hi_v);
+            let in_range = ctx.builder.ins().band(ge, le);
+            ctx.builder.ins().brif(in_range, *case_block, &[], next_dispatch, &[]);
+            ctx.builder.seal_block(current_dispatch);
+            current_dispatch = next_dispatch;
+        }
+        // End of dispatch chain: jump to default or exit
+        ctx.builder.switch_to_block(current_dispatch);
+        ctx.builder.ins().jump(default_block.unwrap_or(exit_block), &[]);
+        ctx.builder.seal_block(current_dispatch);
+
+        // Seal all case/default blocks now that all predecessors are known
+        let case_blocks = std::mem::take(&mut ctx.switch_case_blocks);
+        for block in case_blocks {
+            ctx.builder.seal_block(block);
+        }
+
+        ctx.break_block = prev_break;
+        ctx.switch_val = prev_switch;
+        ctx.switch_unsigned = prev_unsigned;
+        ctx.switch_exit = prev_exit;
+        ctx.switch_pending_fallthrough = prev_fallthrough;
+        ctx.switch_dispatch_entries = prev_entries;
+        ctx.switch_dispatch_ranges = prev_ranges;
+        ctx.switch_case_blocks = prev_case_blocks;
+        ctx.switch_default_block = prev_default;
+
+        ctx.builder.switch_to_block(exit_block);
+        ctx.builder.seal_block(exit_block);
+        ctx.filled = false;
+        self.type_env.enum_constants = saved_enums;
+    }
+
+    fn compile_case(&mut self, ctx: &mut FuncCtx, val: &Expr, body: &Statement) {
+        // Body block: either from previous case's fallthrough or new
+        let case_block = ctx.switch_pending_fallthrough.take()
+            .unwrap_or_else(|| ctx.builder.create_block());
+
+        // Collect dispatch entry (case value evaluated at compile time)
+        let case_val = self.eval_const(val).expect("case: non-constant expression");
+        ctx.switch_dispatch_entries.push((case_val as i128, case_block));
+        ctx.switch_case_blocks.push(case_block);
+
+        // Connect fallthrough from previous body code to case_block
+        if !ctx.filled {
+            ctx.builder.ins().jump(case_block, &[]);
+            ctx.filled = true;
+        }
+
+        // Don't seal case_block yet — dispatch chain will add predecessors
+        ctx.builder.switch_to_block(case_block);
+        ctx.filled = false;
+        self.compile_stmt(ctx, body);
+
+        if !ctx.filled {
+            let ft = ctx.builder.create_block();
+            ctx.builder.ins().jump(ft, &[]);
+            ctx.switch_pending_fallthrough = Some(ft);
+        }
+        ctx.filled = true;
+    }
+
+    fn compile_case_range(&mut self, ctx: &mut FuncCtx, lo: &Expr, hi: &Expr, body: &Statement) {
+        let case_block = ctx.switch_pending_fallthrough.take()
+            .unwrap_or_else(|| ctx.builder.create_block());
+
+        let lo_val = self.eval_const(lo).expect("case range: non-constant low expression");
+        let hi_val = self.eval_const(hi).expect("case range: non-constant high expression");
+        ctx.switch_dispatch_ranges.push((lo_val as i128, hi_val as i128, case_block));
+        ctx.switch_case_blocks.push(case_block);
+
+        if !ctx.filled {
+            ctx.builder.ins().jump(case_block, &[]);
+            ctx.filled = true;
+        }
+
+        ctx.builder.switch_to_block(case_block);
+        ctx.filled = false;
+        self.compile_stmt(ctx, body);
+
+        if !ctx.filled {
+            let ft = ctx.builder.create_block();
+            ctx.builder.ins().jump(ft, &[]);
+            ctx.switch_pending_fallthrough = Some(ft);
+        }
+        ctx.filled = true;
+    }
+
+    fn compile_default(&mut self, ctx: &mut FuncCtx, body: &Statement) {
+        let default_block = ctx.switch_pending_fallthrough.take()
+            .unwrap_or_else(|| ctx.builder.create_block());
+
+        ctx.switch_default_block = Some(default_block);
+        ctx.switch_case_blocks.push(default_block);
+
+        if !ctx.filled {
+            ctx.builder.ins().jump(default_block, &[]);
+            ctx.filled = true;
+        }
+
+        ctx.builder.switch_to_block(default_block);
+        ctx.filled = false;
+        self.compile_stmt(ctx, body);
+    }
+
+    fn compile_goto(&mut self, ctx: &mut FuncCtx, label: &str) {
+        let block = if let Some(&existing) = ctx.labels.get(label) {
+            existing
+        } else {
+            let b = ctx.builder.create_block();
+            ctx.labels.insert(label.to_string(), b);
+            b
+        };
+        ctx.builder.ins().jump(block, &[]);
+        ctx.filled = true;
+    }
+
+    fn compile_label(&mut self, ctx: &mut FuncCtx, label: &str, body: &Statement) {
+        let block = if let Some(existing) = ctx.labels.get(label) {
+            *existing
+        } else {
+            let b = ctx.builder.create_block();
+            ctx.labels.insert(label.to_string(), b);
+            b
+        };
+
+        if !ctx.filled {
+            ctx.builder.ins().jump(block, &[]);
+        }
+        ctx.builder.switch_to_block(block);
+        ctx.filled = false;
+        // Don't seal yet — might have forward gotos
+        self.compile_stmt(ctx, body);
     }
 
     pub(crate) fn compile_local_decl(&mut self, ctx: &mut FuncCtx, decl: &Declaration) {
