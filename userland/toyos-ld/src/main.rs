@@ -17,16 +17,12 @@ fn main() {
         process::exit(1);
     }
 
-    let result = if args.shared {
-        toyos_ld::link_shared_full(&objects, args.build_id)
-    } else if args.pe {
-        toyos_ld::link_pe_with(&objects, &args.entry, args.subsystem, args.gc_sections)
-    } else if args.macho {
-        toyos_ld::link_macho(&objects, &args.entry, args.gc_sections)
-    } else if args.is_static {
-        toyos_ld::link_static_full(&objects, &args.entry, args.image_base, args.gc_sections, args.build_id)
-    } else {
-        toyos_ld::link_full(&objects, &args.entry, args.gc_sections, args.build_id)
+    let result = match args.format {
+        OutputFormat::Shared => toyos_ld::link_shared_full(&objects, args.build_id),
+        OutputFormat::Pe { subsystem } => toyos_ld::link_pe_with(&objects, &args.entry, subsystem.to_u16(), args.gc_sections),
+        OutputFormat::Macho => toyos_ld::link_macho(&objects, &args.entry, args.gc_sections),
+        OutputFormat::Static { image_base } => toyos_ld::link_static_full(&objects, &args.entry, image_base, args.gc_sections, args.build_id),
+        OutputFormat::Pie => toyos_ld::link_full(&objects, &args.entry, args.gc_sections, args.build_id),
     };
 
     match result {
@@ -94,17 +90,36 @@ fn generate_map(output: &[u8], output_path: &PathBuf, inputs: &[(String, Vec<u8>
     map
 }
 
+enum PeSubsystem {
+    EfiApplication,
+    EfiBootServiceDriver,
+    EfiRuntimeDriver,
+}
+
+impl PeSubsystem {
+    fn to_u16(self) -> u16 {
+        match self {
+            PeSubsystem::EfiApplication => 10,
+            PeSubsystem::EfiBootServiceDriver => 11,
+            PeSubsystem::EfiRuntimeDriver => 12,
+        }
+    }
+}
+
+enum OutputFormat {
+    Pie,
+    Static { image_base: u64 },
+    Shared,
+    Pe { subsystem: PeSubsystem },
+    Macho,
+}
+
 struct Args {
     output: PathBuf,
     entry: String,
-    shared: bool,
-    is_static: bool,
-    pe: bool,
-    macho: bool,
+    format: OutputFormat,
     gc_sections: bool,
     build_id: bool,
-    image_base: u64,
-    subsystem: u16,
     map_file: Option<PathBuf>,
     inputs: Vec<PathBuf>,
     lib_paths: Vec<PathBuf>,
@@ -123,7 +138,7 @@ fn parse_args() -> Args {
     let mut build_id = false;
     let mut map_file: Option<PathBuf> = None;
     let mut image_base = 0x200000u64;
-    let mut subsystem = 10u16; // EFI_APPLICATION
+    let mut subsystem = PeSubsystem::EfiApplication;
     let mut inputs = Vec::new();
     let mut lib_paths = Vec::new();
     let mut libs = Vec::new();
@@ -141,10 +156,7 @@ fn parse_args() -> Args {
             "--pe" => { pe = true; }
             "--macho" => { macho = true; }
             s if s.starts_with("--subsystem=") => {
-                subsystem = s["--subsystem=".len()..].parse().unwrap_or_else(|_| {
-                    eprintln!("toyos-ld: invalid --subsystem value: {}", &s["--subsystem=".len()..]);
-                    process::exit(1);
-                });
+                subsystem = parse_pe_subsystem(&s["--subsystem=".len()..]);
             }
             s if s.starts_with("--image-base=") => {
                 let val = &s["--image-base=".len()..];
@@ -169,16 +181,7 @@ fn parse_args() -> Args {
                 pe = true;
             }
             s if s.to_ascii_uppercase().starts_with("/SUBSYSTEM:") => {
-                let val = &s[11..];
-                subsystem = match val.to_ascii_lowercase().as_str() {
-                    "efi_application" => 10,
-                    "efi_boot_service_driver" => 11,
-                    "efi_runtime_driver" => 12,
-                    _ => val.parse().unwrap_or_else(|_| {
-                        eprintln!("toyos-ld: invalid /SUBSYSTEM value: {val}");
-                        process::exit(1);
-                    }),
-                };
+                subsystem = parse_pe_subsystem(&s[11..]);
                 pe = true;
             }
             s if s.to_ascii_uppercase().starts_with("/LIBPATH:") => {
@@ -204,5 +207,29 @@ fn parse_args() -> Args {
         i += 1;
     }
 
-    Args { output, entry, shared, is_static, pe, macho, gc_sections, build_id, map_file, image_base, subsystem, inputs, lib_paths, libs }
+    let format = if shared {
+        OutputFormat::Shared
+    } else if pe {
+        OutputFormat::Pe { subsystem }
+    } else if macho {
+        OutputFormat::Macho
+    } else if is_static {
+        OutputFormat::Static { image_base }
+    } else {
+        OutputFormat::Pie
+    };
+
+    Args { output, entry, format, gc_sections, build_id, map_file, inputs, lib_paths, libs }
+}
+
+fn parse_pe_subsystem(val: &str) -> PeSubsystem {
+    match val.to_ascii_lowercase().as_str() {
+        "efi_application" | "10" => PeSubsystem::EfiApplication,
+        "efi_boot_service_driver" | "11" => PeSubsystem::EfiBootServiceDriver,
+        "efi_runtime_driver" | "12" => PeSubsystem::EfiRuntimeDriver,
+        _ => {
+            eprintln!("toyos-ld: invalid subsystem value: {val}");
+            process::exit(1);
+        }
+    }
 }
