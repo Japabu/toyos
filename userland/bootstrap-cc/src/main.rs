@@ -54,21 +54,32 @@ fn main() {
         fs::set_permissions(&stage1_bin, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
-    // ── Stage 2: self-host with TCC ──────────────
+    // ── Stage 2: self-host with TCC (compile), link with toyos-ld ──────────────
+    let stage2_obj = root.join("tcc-stage2.o");
     let stage2 = root.join("tcc-stage2");
 
-    println!("[stage2] self-hosting");
+    println!("[stage2] compiling with stage1 TCC");
 
     run(Command::new(&stage1_bin)
-        .arg("-o").arg(&stage2)
+        .arg("-c")
+        .arg("-B").arg(".")
+        .args(system_include_args())
+        .arg("-o").arg(&stage2_obj)
         .arg("tcc.c")
-        .arg("-one-source")
         .current_dir(&tcc_dir));
 
-    if cfg!(target_os = "macos") {
-        run(Command::new("codesign")
-            .args(["--sign", "-"])
-            .arg(&stage2));
+    println!("[stage2] linking with toyos-ld");
+
+    run(Command::new(&toyos_ld)
+        .arg("--macho")
+        .arg("-e").arg("_main")
+        .arg("-o").arg(&stage2)
+        .arg(&stage2_obj));
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&stage2, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     println!("Bootstrapped TCC: {}", stage2.display());
