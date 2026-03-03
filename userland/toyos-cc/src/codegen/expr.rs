@@ -712,7 +712,8 @@ impl Codegen {
                     let s = ctx.builder.ins().iconst(I64, stride);
                     ctx.builder.ins().imul(r, s)
                 } else { r };
-                return TypedValue::unsigned(self.compile_binop(ctx, op, l, r, false));
+                return self.compile_binop(ctx, op, TypedValue::signed(l), TypedValue::signed(r))
+                    .with_sign(Signedness::Unsigned);
             }
             if r_stride.is_some() && l_stride.is_none() && matches!(op, BinOp::Add) {
                 let stride = r_stride.unwrap();
@@ -723,14 +724,15 @@ impl Codegen {
                     let s = ctx.builder.ins().iconst(I64, stride);
                     ctx.builder.ins().imul(l, s)
                 } else { l };
-                return TypedValue::unsigned(self.compile_binop(ctx, op, l, r, false));
+                return self.compile_binop(ctx, op, TypedValue::signed(l), TypedValue::signed(r))
+                    .with_sign(Signedness::Unsigned);
             }
             // ptr - ptr => (ptr - ptr) / sizeof(*ptr)
             if l_stride.is_some() && r_stride.is_some() && matches!(op, BinOp::Sub) {
                 let stride = l_stride.unwrap();
                 let l = self.compile_expr(ctx, lhs).raw();
                 let r = self.compile_expr(ctx, rhs).raw();
-                let diff = self.compile_binop(ctx, op, l, r, false);
+                let diff = self.compile_binop(ctx, op, TypedValue::signed(l), TypedValue::signed(r)).raw();
                 if stride != 1 {
                     let s = ctx.builder.ins().iconst(I64, stride);
                     return TypedValue::signed(ctx.builder.ins().sdiv(diff, s));
@@ -766,40 +768,35 @@ impl Codegen {
             ctx.builder.seal_block(merge);
             return TypedValue::signed(ctx.builder.block_params(merge)[0]);
         }
-        // Determine if this is an unsigned operation (C usual arithmetic conversions)
-        // Only treat as unsigned when the common type is at least int-sized
+        // C usual arithmetic conversions: determine operation signedness
+        // Only unsigned when the common type is at least int-sized
         // (smaller unsigned types get promoted to signed int per C integer promotion)
         let lty = self.expr_type(ctx, lhs);
         let rty = self.expr_type(ctx, rhs);
         let is_unsigned =
             (lty.is_unsigned() && lty.size() >= 4) || (rty.is_unsigned() && rty.size() >= 4);
+        let op_sign = if is_unsigned { Signedness::Unsigned } else { Signedness::Signed };
         let l_tv = self.compile_expr(ctx, lhs);
         let r_tv = self.compile_expr(ctx, rhs);
         // C integer promotion: promote narrow types to at least int (I32)
         // using TypedValue's signedness for correct extension
-        let mut l = l_tv.raw();
-        let mut r = r_tv.raw();
-        let lv_ty = ctx.builder.func.dfg.value_type(l);
-        if lv_ty.is_int() && lv_ty.bits() < 32 {
-            l = self.coerce_typed(ctx, l_tv, I32);
-        }
-        let rv_ty = ctx.builder.func.dfg.value_type(r);
-        if rv_ty.is_int() && rv_ty.bits() < 32 {
-            r = self.coerce_typed(ctx, r_tv, I32);
-        }
+        let l = if ctx.builder.func.dfg.value_type(l_tv.raw()).is_int()
+            && ctx.builder.func.dfg.value_type(l_tv.raw()).bits() < 32 {
+            TypedValue::new(self.coerce_typed(ctx, l_tv, I32), op_sign)
+        } else { l_tv.with_sign(op_sign) };
+        let r = if ctx.builder.func.dfg.value_type(r_tv.raw()).is_int()
+            && ctx.builder.func.dfg.value_type(r_tv.raw()).bits() < 32 {
+            TypedValue::new(self.coerce_typed(ctx, r_tv, I32), op_sign)
+        } else { r_tv.with_sign(op_sign) };
         // For unsigned ops, narrow operands to the correct C type width
         // so that e.g. (unsigned)-1 / -2 operates at 32-bit, not 64-bit
         let (l, r) = if is_unsigned {
             let common = CType::common(&lty, &rty);
             let w = self.clif_type(&common);
-            (self.coerce_unsigned(ctx, l, w), self.coerce_unsigned(ctx, r, w))
+            (TypedValue::unsigned(self.coerce_unsigned(ctx, l.raw(), w)),
+             TypedValue::unsigned(self.coerce_unsigned(ctx, r.raw(), w)))
         } else { (l, r) };
-        // Comparison operators always produce signed int
-        let result_sign = match op {
-            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge => Signedness::Signed,
-            _ => if is_unsigned { Signedness::Unsigned } else { Signedness::Signed },
-        };
-        TypedValue::new(self.compile_binop(ctx, op, l, r, is_unsigned), result_sign)
+        self.compile_binop(ctx, op, l, r)
     }
 
     fn compile_assign(&mut self, ctx: &mut FuncCtx, op: AssignOp, lhs: &Expr, rhs: &Expr) -> TypedValue {
@@ -1490,10 +1487,11 @@ impl Codegen {
         }
     }
 
-    fn compile_binop(&mut self, ctx: &mut FuncCtx, op: BinOp, l: Value, r: Value, is_unsigned: bool) -> Value {
+    fn compile_binop(&mut self, ctx: &mut FuncCtx, op: BinOp, l: TypedValue, r: TypedValue) -> TypedValue {
+        let is_unsigned = l.is_unsigned() || r.is_unsigned();
         // Coerce both operands to the wider type (C integer promotion)
-        let lt = ctx.builder.func.dfg.value_type(l);
-        let rt = ctx.builder.func.dfg.value_type(r);
+        let lt = ctx.builder.func.dfg.value_type(l.raw());
+        let rt = ctx.builder.func.dfg.value_type(r.raw());
         let is_float = lt.is_float() || rt.is_float();
         let common = if is_float {
             // Float promotion: if either is float, promote both
@@ -1503,10 +1501,17 @@ impl Codegen {
             let wider = if lt.bits() >= rt.bits() { lt } else { rt };
             if wider.bits() < 32 { I32 } else { wider }
         };
-        let l = if is_unsigned && !is_float { self.coerce_unsigned(ctx, l, common) } else { self.coerce(ctx, l, common) };
-        let r = if is_unsigned && !is_float { self.coerce_unsigned(ctx, r, common) } else { self.coerce(ctx, r, common) };
+        let l = if is_unsigned && !is_float { self.coerce_unsigned(ctx, l.raw(), common) } else { self.coerce(ctx, l.raw(), common) };
+        let r = if is_unsigned && !is_float { self.coerce_unsigned(ctx, r.raw(), common) } else { self.coerce(ctx, r.raw(), common) };
 
-        if is_float {
+        // Comparisons and logical ops always produce signed int
+        let result_sign = match op {
+            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge
+            | BinOp::LogAnd | BinOp::LogOr => Signedness::Signed,
+            _ => if is_unsigned { Signedness::Unsigned } else { Signedness::Signed },
+        };
+
+        let val = if is_float {
             // Comparisons return i32 (C int), not float
             let int_type = I32;
             match op {
@@ -1516,39 +1521,39 @@ impl Codegen {
                 BinOp::Div => ctx.builder.ins().fdiv(l, r),
                 BinOp::Eq => {
                     let c = ctx.builder.ins().fcmp(FloatCC::Equal, l, r);
-                    Self::safe_uextend(ctx,int_type, c)
+                    Self::safe_uextend(ctx, int_type, c)
                 }
                 BinOp::Ne => {
                     let c = ctx.builder.ins().fcmp(FloatCC::NotEqual, l, r);
-                    Self::safe_uextend(ctx,int_type, c)
+                    Self::safe_uextend(ctx, int_type, c)
                 }
                 BinOp::Lt => {
                     let c = ctx.builder.ins().fcmp(FloatCC::LessThan, l, r);
-                    Self::safe_uextend(ctx,int_type, c)
+                    Self::safe_uextend(ctx, int_type, c)
                 }
                 BinOp::Gt => {
                     let c = ctx.builder.ins().fcmp(FloatCC::GreaterThan, l, r);
-                    Self::safe_uextend(ctx,int_type, c)
+                    Self::safe_uextend(ctx, int_type, c)
                 }
                 BinOp::Le => {
                     let c = ctx.builder.ins().fcmp(FloatCC::LessThanOrEqual, l, r);
-                    Self::safe_uextend(ctx,int_type, c)
+                    Self::safe_uextend(ctx, int_type, c)
                 }
                 BinOp::Ge => {
                     let c = ctx.builder.ins().fcmp(FloatCC::GreaterThanOrEqual, l, r);
-                    Self::safe_uextend(ctx,int_type, c)
+                    Self::safe_uextend(ctx, int_type, c)
                 }
                 BinOp::LogAnd => {
                     let l_bool = self.to_bool(ctx, l);
                     let r_bool = self.to_bool(ctx, r);
                     let result = ctx.builder.ins().band(l_bool, r_bool);
-                    Self::safe_uextend(ctx,int_type, result)
+                    Self::safe_uextend(ctx, int_type, result)
                 }
                 BinOp::LogOr => {
                     let l_bool = self.to_bool(ctx, l);
                     let r_bool = self.to_bool(ctx, r);
                     let result = ctx.builder.ins().bor(l_bool, r_bool);
-                    Self::safe_uextend(ctx,int_type, result)
+                    Self::safe_uextend(ctx, int_type, result)
                 }
                 // Bitwise/shift ops don't apply to floats — treat as integer
                 BinOp::Mod | BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor
@@ -1582,46 +1587,47 @@ impl Codegen {
                 BinOp::Shr => if is_unsigned { ctx.builder.ins().ushr(l, r) } else { ctx.builder.ins().sshr(l, r) },
                 BinOp::Eq => {
                     let c = ctx.builder.ins().icmp(IntCC::Equal, l, r);
-                    Self::safe_uextend(ctx,cmp_result, c)
+                    Self::safe_uextend(ctx, cmp_result, c)
                 }
                 BinOp::Ne => {
                     let c = ctx.builder.ins().icmp(IntCC::NotEqual, l, r);
-                    Self::safe_uextend(ctx,cmp_result, c)
+                    Self::safe_uextend(ctx, cmp_result, c)
                 }
                 BinOp::Lt => {
                     let cc = if is_unsigned { IntCC::UnsignedLessThan } else { IntCC::SignedLessThan };
                     let c = ctx.builder.ins().icmp(cc, l, r);
-                    Self::safe_uextend(ctx,cmp_result, c)
+                    Self::safe_uextend(ctx, cmp_result, c)
                 }
                 BinOp::Gt => {
                     let cc = if is_unsigned { IntCC::UnsignedGreaterThan } else { IntCC::SignedGreaterThan };
                     let c = ctx.builder.ins().icmp(cc, l, r);
-                    Self::safe_uextend(ctx,cmp_result, c)
+                    Self::safe_uextend(ctx, cmp_result, c)
                 }
                 BinOp::Le => {
                     let cc = if is_unsigned { IntCC::UnsignedLessThanOrEqual } else { IntCC::SignedLessThanOrEqual };
                     let c = ctx.builder.ins().icmp(cc, l, r);
-                    Self::safe_uextend(ctx,cmp_result, c)
+                    Self::safe_uextend(ctx, cmp_result, c)
                 }
                 BinOp::Ge => {
                     let cc = if is_unsigned { IntCC::UnsignedGreaterThanOrEqual } else { IntCC::SignedGreaterThanOrEqual };
                     let c = ctx.builder.ins().icmp(cc, l, r);
-                    Self::safe_uextend(ctx,cmp_result, c)
+                    Self::safe_uextend(ctx, cmp_result, c)
                 }
                 BinOp::LogAnd => {
                     let l_bool = self.to_bool(ctx, l);
                     let r_bool = self.to_bool(ctx, r);
                     let result = ctx.builder.ins().band(l_bool, r_bool);
-                    Self::safe_uextend(ctx,cmp_result, result)
+                    Self::safe_uextend(ctx, cmp_result, result)
                 }
                 BinOp::LogOr => {
                     let l_bool = self.to_bool(ctx, l);
                     let r_bool = self.to_bool(ctx, r);
                     let result = ctx.builder.ins().bor(l_bool, r_bool);
-                    Self::safe_uextend(ctx,cmp_result, result)
+                    Self::safe_uextend(ctx, cmp_result, result)
                 }
             }
-        }
+        };
+        TypedValue::new(val, result_sign)
     }
 
     fn compile_compound_assign(&mut self, ctx: &mut FuncCtx, op: AssignOp, lhs: TypedValue, rhs: TypedValue) -> Value {
