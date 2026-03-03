@@ -44,6 +44,9 @@ cfg_if::cfg_if! {
     if #[cfg(target_os = "redox")] {
         #[path = "redox.rs"]
         mod imp;
+    } else if #[cfg(target_os = "toyos")] {
+        #[path = "toyos.rs"]
+        mod imp;
     } else if #[cfg(windows)] {
         #[path = "windows.rs"]
         mod imp;

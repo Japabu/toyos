@@ -13,6 +13,9 @@ Platform-agnostic accessors of timestamps in File metadata
 """
 edition = "2018"
 
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(emulate_second_only_system)'] }
+
 [dependencies]
 cfg-if = "1.0.0"
 
