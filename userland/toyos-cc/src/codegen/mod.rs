@@ -13,6 +13,10 @@ use crate::types::{CType, FieldDef, StructDef, TypeEnv, ParamType, EnumDef, Sign
 
 mod resolve;
 mod expr;
+mod bitfield;
+mod expr_type;
+mod addr;
+mod ops;
 mod stmt;
 mod init;
 
