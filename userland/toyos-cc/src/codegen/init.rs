@@ -111,12 +111,14 @@ impl Codegen {
             }
             Initializer::Expr(e) => {
                 // Single expression for whole aggregate (e.g., struct copy)
-                let val = self.compile_expr(ctx, e);
+                let tv = self.compile_expr(ctx, e);
                 if matches!(ty, CType::Struct(_) | CType::Union(_)) {
                     // val is an address; copy the struct data
                     let size_val = ctx.builder.ins().iconst(I64, ty.size() as i64);
-                    self.emit_memcpy(ctx, ptr, val, size_val);
+                    self.emit_memcpy(ctx, ptr, tv.raw(), size_val);
                 } else {
+                    let target_ty = self.clif_type(ty);
+                    let val = self.coerce_typed(ctx, tv, target_ty);
                     ctx.builder.ins().store(MemFlags::new(), val, ptr, 0);
                 }
             }
@@ -186,9 +188,9 @@ impl Codegen {
                             // Compile the value and store it
                             match &items[*cursor].initializer {
                                 Initializer::Expr(e) => {
-                                    let val = self.compile_expr(ctx, e);
+                                    let tv = self.compile_expr(ctx, e);
                                     let target_ty = self.clif_type(&sub_ty);
-                                    let val = self.coerce(ctx, val, target_ty);
+                                    let val = self.coerce_typed(ctx, tv, target_ty);
                                     ctx.builder.ins().store(MemFlags::new(), val, sub_ptr, 0);
                                 }
                                 Initializer::List(sub_items) => {
@@ -226,9 +228,9 @@ impl Codegen {
             _ => {
                 if *cursor < items.len() {
                     if let Initializer::Expr(e) = &items[*cursor].initializer {
-                        let val = self.compile_expr(ctx, e);
+                        let tv = self.compile_expr(ctx, e);
                         let target_ty = self.clif_type(ty);
-                        let val = self.coerce(ctx, val, target_ty);
+                        let val = self.coerce_typed(ctx, tv, target_ty);
                         ctx.builder.ins().store(MemFlags::new(), val, base_ptr, 0);
                     }
                     *cursor += 1;
@@ -276,7 +278,7 @@ impl Codegen {
                     }
                     CType::Struct(_) | CType::Union(_) if expr_is_aggregate => {
                         // Whole-value struct init (struct copy, function return, etc.)
-                        let val = self.compile_expr(ctx, e);
+                        let val = self.compile_expr(ctx, e).raw();
                         let size_val = ctx.builder.ins().iconst(I64, ty.size() as i64);
                         self.emit_memcpy(ctx, ptr, val, size_val);
                         *cursor += 1;
@@ -287,9 +289,9 @@ impl Codegen {
                     }
                     // Scalar (int, float, pointer, enum, bool)
                     _ => {
-                        let val = self.compile_expr(ctx, e);
+                        let tv = self.compile_expr(ctx, e);
                         let target_ty = self.clif_type(ty);
-                        let val = self.coerce(ctx, val, target_ty);
+                        let val = self.coerce_typed(ctx, tv, target_ty);
                         ctx.builder.ins().store(MemFlags::new(), val, ptr, 0);
                         *cursor += 1;
                     }

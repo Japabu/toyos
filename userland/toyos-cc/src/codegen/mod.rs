@@ -16,6 +16,25 @@ mod expr;
 mod stmt;
 mod init;
 
+/// Cranelift Value paired with its C-level signedness.
+/// Prevents signedness bugs by carrying the sign through all expression results.
+#[derive(Clone, Copy)]
+#[must_use = "TypedValue carries signedness — use .coerce() or .raw()"]
+pub(crate) struct TypedValue {
+    val: Value,
+    sign: Signedness,
+}
+
+impl TypedValue {
+    pub fn new(val: Value, sign: Signedness) -> Self { Self { val, sign } }
+    pub fn signed(val: Value) -> Self { Self { val, sign: Signedness::Signed } }
+    pub fn unsigned(val: Value) -> Self { Self { val, sign: Signedness::Unsigned } }
+    pub fn raw(self) -> Value { self.val }
+    pub fn signedness(self) -> Signedness { self.sign }
+    pub fn is_unsigned(self) -> bool { self.sign == Signedness::Unsigned }
+    pub fn with_sign(self, sign: Signedness) -> Self { Self { val: self.val, sign } }
+}
+
 /// Cranelift has no native variadic support. We pad signatures with extra I64
 /// params to capture va_args — same approach as rustc_codegen_cranelift (#1500).
 const VARIADIC_EXTRA_PARAMS: usize = 10;

@@ -259,21 +259,21 @@ impl Codegen {
                 ctx.spilled_locals = saved_spilled;
                 self.type_env.enum_constants = saved_enums;
             }
-            Statement::Expr(Some(e)) => { self.compile_expr(ctx, e); }
+            Statement::Expr(Some(e)) => { let _ = self.compile_expr(ctx, e); }
             Statement::Expr(None) => {}
             Statement::Return(val) => {
                 if let Some(e) = val {
                     if let Some(sret) = ctx.sret_ptr {
                         // Struct return: copy data to sret pointer
-                        let src = self.compile_expr(ctx, e);
+                        let src = self.compile_expr(ctx, e).raw();
                         let size = ctx.return_type.size();
                         let size_val = ctx.builder.ins().iconst(I64, size as i64);
                         self.emit_memcpy(ctx, sret, src, size_val);
                         ctx.builder.ins().return_(&[]);
                     } else {
-                        let v = self.compile_expr(ctx, e);
+                        let tv = self.compile_expr(ctx, e);
                         let ret_clif = self.clif_type(&ctx.return_type);
-                        let v = self.coerce(ctx, v, ret_clif);
+                        let v = self.coerce_typed(ctx, tv, ret_clif);
                         ctx.builder.ins().return_(&[v]);
                     }
                 } else {
@@ -284,7 +284,7 @@ impl Codegen {
             Statement::If(cond, then, else_) => {
                 self.ensure_unfilled(ctx);
                 let saved_enums = self.type_env.enum_constants.clone();
-                let cond_val = self.compile_expr(ctx, cond);
+                let cond_val = self.compile_expr(ctx, cond).raw();
                 let cond_bool = self.to_bool(ctx, cond_val);
 
                 let then_block = ctx.builder.create_block();
@@ -324,7 +324,7 @@ impl Codegen {
                 ctx.builder.switch_to_block(cond_block);
                 ctx.filled = false;
 
-                let cond_val = self.compile_expr(ctx, cond);
+                let cond_val = self.compile_expr(ctx, cond).raw();
                 let cond_bool = self.to_bool(ctx, cond_val);
                 ctx.builder.ins().brif(cond_bool, body_block, &[], exit_block, &[]);
 
@@ -365,7 +365,7 @@ impl Codegen {
                 ctx.builder.switch_to_block(cond_block);
                 ctx.builder.seal_block(cond_block);
                 ctx.filled = false;
-                let cond_val = self.compile_expr(ctx, cond);
+                let cond_val = self.compile_expr(ctx, cond).raw();
                 let cond_bool = self.to_bool(ctx, cond_val);
                 ctx.builder.ins().brif(cond_bool, body_block, &[], exit_block, &[]);
 
@@ -383,7 +383,7 @@ impl Codegen {
                 if let Some(init) = init {
                     match init.as_ref() {
                         ForInit::Decl(d) => self.compile_local_decl(ctx, d),
-                        ForInit::Expr(e) => { self.compile_expr(ctx, e); }
+                        ForInit::Expr(e) => { let _ = self.compile_expr(ctx, e); }
                     }
                 }
                 // Pre-resolve types in cond/step so enum definitions are
@@ -401,7 +401,7 @@ impl Codegen {
                 ctx.filled = false;
 
                 if let Some(cond) = cond {
-                    let cond_val = self.compile_expr(ctx, cond);
+                    let cond_val = self.compile_expr(ctx, cond).raw();
                     let cond_bool = self.to_bool(ctx, cond_val);
                     ctx.builder.ins().brif(cond_bool, body_block, &[], exit_block, &[]);
                 } else {
@@ -421,7 +421,7 @@ impl Codegen {
                 ctx.builder.seal_block(step_block);
                 ctx.filled = false;
                 if let Some(step) = step {
-                    self.compile_expr(ctx, step);
+                    let _ = self.compile_expr(ctx, step);
                 }
                 ctx.builder.ins().jump(cond_block, &[]);
 
@@ -436,10 +436,9 @@ impl Codegen {
             }
             Statement::Switch(val, body) => {
                 let saved_enums = self.type_env.enum_constants.clone();
-                let is_unsigned = self.expr_type(ctx, val)
-                    .expect("switch: cannot resolve type of switch expression")
-                    .is_unsigned();
-                let switch_val = self.compile_expr(ctx, val);
+                let switch_tv = self.compile_expr(ctx, val);
+                let is_unsigned = switch_tv.is_unsigned();
+                let switch_val = switch_tv.raw();
                 let switch_type = ctx.builder.func.dfg.value_type(switch_val);
                 let exit_block = ctx.builder.create_block();
 
@@ -779,13 +778,8 @@ impl Codegen {
                 };
                 if let Some(init) = &id.initializer {
                     if let Initializer::Expr(e) = init {
-                        let expr_unsigned = self.expr_type(ctx, e).map_or(false, |t| t.is_unsigned());
-                        let val = self.compile_expr(ctx, e);
-                        let val = if expr_unsigned {
-                            self.coerce_unsigned(ctx, val, clif_ty)
-                        } else {
-                            self.coerce(ctx, val, clif_ty)
-                        };
+                        let tv = self.compile_expr(ctx, e);
+                        let val = self.coerce_typed(ctx, tv, clif_ty);
                         ctx.builder.ins().store(MemFlags::new(), val, ptr, 0);
                     } else {
                         let zero = make_zero(&mut ctx.builder);
@@ -805,13 +799,8 @@ impl Codegen {
 
             if let Some(init) = &id.initializer {
                 if let Initializer::Expr(e) = init {
-                    let expr_unsigned = self.expr_type(ctx, e).map_or(false, |t| t.is_unsigned());
-                    let val = self.compile_expr(ctx, e);
-                    let val = if expr_unsigned {
-                        self.coerce_unsigned(ctx, val, clif_ty)
-                    } else {
-                        self.coerce(ctx, val, clif_ty)
-                    };
+                    let tv = self.compile_expr(ctx, e);
+                    let val = self.coerce_typed(ctx, tv, clif_ty);
                     ctx.builder.def_var(var, val);
                 } else {
                     // Zero-init for brace initializer on scalars
