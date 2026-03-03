@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::fs;
 
+pub use collect::RelocType;
 use collect::{collect, synthesize_alloc_shims, gc_sections, merge_string_sections, is_archive, extract_archive, find_lib, scan_symbols, SectionIdx, SymbolDef};
 use reloc::{ElfRelocParams, apply_relocs, apply_relocs_pe, MachORelocParams, apply_relocs_macho};
 use emit_elf::{layout_elf, build_eh_frame_hdr, emit_bytes, emit_static_bytes, emit_shared_bytes};
@@ -28,8 +29,8 @@ pub(crate) const PAGE_SIZE: u64 = 0x1000;
 pub enum LinkError {
     UndefinedSymbols(Vec<String>),
     Parse { file: String, message: String },
-    UnsupportedRelocation { reloc_type: u32, symbol: String },
-    RelocationOverflow { reloc_type: u32, symbol: String, value: i64 },
+    UnsupportedRelocation { reloc_type: RelocType, symbol: String },
+    RelocationOverflow { reloc_type: RelocType, symbol: String, value: i64 },
     MissingEntry(String),
 }
 
@@ -318,7 +319,7 @@ pub fn link_macho(
     // writable memory. Move read-only data sections (like .data.ro) to __DATA.
     {
         let abs_reloc_sections: std::collections::HashSet<SectionIdx> = state.relocs.iter()
-            .filter(|r| r.r_type == object::elf::R_AARCH64_ABS64)
+            .filter(|r| r.r_type == RelocType::Aarch64Abs64)
             .map(|r| r.section)
             .collect();
         for &idx in &abs_reloc_sections {
@@ -360,13 +361,12 @@ pub fn link_macho(
 /// 3. Adds GOT relocations (ADR_GOT_PAGE + LD64_GOT_LO12_NC) from the stub
 /// 4. Rewrites the CALL26 relocations to target the stub
 fn create_call_stubs(state: &mut collect::LinkState) {
-    use object::elf;
     use std::collections::BTreeSet;
 
     // Find all dynamic symbols that have CALL26 relocations
     let mut stub_syms = BTreeSet::new();
     for reloc in &state.relocs {
-        if reloc.r_type != elf::R_AARCH64_CALL26 { continue; }
+        if reloc.r_type != RelocType::Aarch64Call26 { continue; }
         if let Some(SymbolDef::Dynamic) = state.globals.get(&reloc.symbol_name) {
             stub_syms.insert(reloc.symbol_name.clone());
         }
@@ -397,14 +397,14 @@ fn create_call_stubs(state: &mut collect::LinkState) {
         stub_relocs.push(collect::InputReloc {
             section: stub_sec_idx,
             offset,
-            r_type: elf::R_AARCH64_ADR_GOT_PAGE,
+            r_type: RelocType::Aarch64AdrGotPage,
             symbol_name: sym_name.clone(),
             addend: 0,
         });
         stub_relocs.push(collect::InputReloc {
             section: stub_sec_idx,
             offset: offset + 4,
-            r_type: elf::R_AARCH64_LD64_GOT_LO12_NC,
+            r_type: RelocType::Aarch64Ld64GotLo12Nc,
             symbol_name: sym_name.clone(),
             addend: 0,
         });
@@ -438,7 +438,7 @@ fn create_call_stubs(state: &mut collect::LinkState) {
     // Rewrite CALL26 relocations to target the stub symbols
     let stub_syms_set: BTreeSet<&str> = stub_syms.iter().map(|s| s.as_str()).collect();
     for reloc in &mut state.relocs {
-        if reloc.r_type == elf::R_AARCH64_CALL26
+        if reloc.r_type == RelocType::Aarch64Call26
             && stub_syms_set.contains(reloc.symbol_name.as_str())
         {
             reloc.symbol_name = format!("{}.__stub", reloc.symbol_name);

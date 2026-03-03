@@ -1,8 +1,8 @@
-use crate::collect::{collect_unique_symbols, LinkState, SectionIdx, SymbolDef};
+use crate::collect::{collect_unique_symbols, LinkState, RelocType, SectionIdx, SymbolDef};
 use crate::reloc::resolve_symbol;
 use crate::{align_up, classify_sections, LinkError};
 use object::write::pe::{NtHeaders, Writer};
-use object::{elf, pe};
+use object::pe;
 use std::collections::HashMap;
 
 const PE_FILE_ALIGNMENT: u32 = 0x200;
@@ -53,8 +53,8 @@ pub(crate) fn layout_pe(state: &mut LinkState) -> PeLayout {
     // GOT entries needed
     let got_symbols = collect_unique_symbols(state.relocs.iter(), |r| {
         matches!(r.r_type,
-            elf::R_X86_64_GOTPCREL | elf::R_X86_64_GOTPCRELX
-            | elf::R_X86_64_REX_GOTPCRELX)
+            RelocType::X86Gotpcrel | RelocType::X86Gotpcrelx
+            | RelocType::X86RexGotpcrelx)
     });
     if !got_symbols.is_empty() {
         cursor = if has_data { align_up(cursor, 8) } else { data_rva as u64 };

@@ -1,7 +1,6 @@
-use crate::collect::{InputReloc, LinkState, SectionIdx, SymbolDef};
+use crate::collect::{InputReloc, LinkState, RelocType, SectionIdx, SymbolDef};
 use crate::emit_pe::PeLayout;
 use crate::LinkError;
-use object::elf;
 use std::collections::{HashMap, HashSet};
 
 pub(crate) struct RelocOutput {
@@ -73,31 +72,31 @@ fn apply_one_reloc(
     got: &HashMap<String, u64>,
 ) -> Result<bool, LinkError> {
     match reloc.r_type {
-        elf::R_X86_64_64 => {
+        RelocType::X86_64 => {
             let value = (sym_addr as i64 + reloc.addend) as u64;
             write_u64(state, reloc.section, reloc.offset, value);
             Ok(true)
         }
-        elf::R_X86_64_PC32 | elf::R_X86_64_PLT32 => {
+        RelocType::X86Pc32 | RelocType::X86Plt32 => {
             let value = sym_addr as i64 + reloc.addend - reloc_vaddr as i64;
             check_i32(value, reloc)?;
             write_i32(state, reloc.section, reloc.offset, value as i32);
             Ok(false)
         }
-        elf::R_X86_64_32 => {
+        RelocType::X86_32 => {
             let value = sym_addr as i64 + reloc.addend;
             check_u32(value, reloc)?;
             write_u32(state, reloc.section, reloc.offset, value as u32);
             Ok(false)
         }
-        elf::R_X86_64_32S => {
+        RelocType::X86_32S => {
             let value = sym_addr as i64 + reloc.addend;
             check_i32(value, reloc)?;
             write_i32(state, reloc.section, reloc.offset, value as i32);
             Ok(false)
         }
-        elf::R_X86_64_GOTPCREL | elf::R_X86_64_GOTPCRELX
-        | elf::R_X86_64_REX_GOTPCRELX => {
+        RelocType::X86Gotpcrel | RelocType::X86Gotpcrelx
+        | RelocType::X86RexGotpcrelx => {
             let got_slot = got[&reloc.symbol_name];
             let value = got_slot as i64 + reloc.addend - reloc_vaddr as i64;
             check_i32(value, reloc)?;
@@ -167,7 +166,7 @@ pub(crate) fn apply_relocs(
 
     for reloc in &relocs {
         match reloc.r_type {
-            elf::R_X86_64_TLSGD => {
+            RelocType::X86Tlsgd => {
                 let sym_addr = resolve_symbol(state, &reloc.symbol_name, reloc.section, params.plt)
                     .ok_or_else(|| LinkError::UndefinedSymbols(vec![reloc.symbol_name.clone()]))?;
                 let padded = is_padded_tls_sequence(
@@ -189,12 +188,12 @@ pub(crate) fn apply_relocs(
                     relaxed_calls.insert((reloc.section, reloc.offset + 8));
                 } else {
                     return Err(LinkError::UnsupportedRelocation {
-                        reloc_type: elf::R_X86_64_TLSGD,
+                        reloc_type: RelocType::X86Tlsgd,
                         symbol: reloc.symbol_name.clone(),
                     });
                 }
             }
-            elf::R_X86_64_TLSLD => {
+            RelocType::X86Tlsld => {
                 let padded = is_padded_tls_sequence(
                     &state.sections[reloc.section.0].data,
                     reloc.offset,
@@ -220,7 +219,7 @@ pub(crate) fn apply_relocs(
                     relaxed_calls.insert((reloc.section, reloc.offset + 5));
                 }
             }
-            elf::R_X86_64_DTPOFF32 => {
+            RelocType::X86Dtpoff32 => {
                 let sym_addr = resolve_symbol(state, &reloc.symbol_name, reloc.section, params.plt)
                     .ok_or_else(|| LinkError::UndefinedSymbols(vec![reloc.symbol_name.clone()]))?;
                 let value = tpoff(sym_addr, params.tls_start, params.tls_memsz) + reloc.addend;
@@ -234,7 +233,7 @@ pub(crate) fn apply_relocs(
     // Pass 2: all other relocations
     for reloc in &relocs {
         match reloc.r_type {
-            elf::R_X86_64_TLSGD | elf::R_X86_64_TLSLD | elf::R_X86_64_DTPOFF32 => continue,
+            RelocType::X86Tlsgd | RelocType::X86Tlsld | RelocType::X86Dtpoff32 => continue,
             _ => {}
         }
         if relaxed_calls.contains(&(reloc.section, reloc.offset)) {
@@ -257,12 +256,12 @@ pub(crate) fn apply_relocs(
         };
 
         match reloc.r_type {
-            elf::R_X86_64_TPOFF32 => {
+            RelocType::X86Tpoff32 => {
                 let value = tpoff(sym_addr, params.tls_start, params.tls_memsz) + reloc.addend;
                 check_i32(value, reloc)?;
                 write_i32(state, reloc.section, reloc.offset, value as i32);
             }
-            elf::R_X86_64_GOTTPOFF => {
+            RelocType::X86Gottpoff => {
                 let got_slot = params.got[&reloc.symbol_name];
                 let value = got_slot as i64 + reloc.addend - reloc_vaddr as i64;
                 check_i32(value, reloc)?;
@@ -281,7 +280,7 @@ pub(crate) fn apply_relocs(
     if params.record_relatives {
         let gottpoff_syms: HashSet<String> = relocs
             .iter()
-            .filter(|r| r.r_type == elf::R_X86_64_GOTTPOFF)
+            .filter(|r| r.r_type == RelocType::X86Gottpoff)
             .map(|r| r.symbol_name.clone())
             .collect();
 
@@ -325,13 +324,13 @@ fn apply_one_reloc_aarch64(
 ) -> Result<bool, LinkError> {
     match reloc.r_type {
         // Absolute 64-bit pointer
-        elf::R_AARCH64_ABS64 => {
+        RelocType::Aarch64Abs64 => {
             let value = (sym_addr as i64 + reloc.addend) as u64;
             write_u64(state, reloc.section, reloc.offset, value);
             Ok(true) // needs rebase
         }
         // BL/B instruction: 26-bit PC-relative
-        elf::R_AARCH64_CALL26 => {
+        RelocType::Aarch64Call26 => {
             let value = sym_addr as i64 + reloc.addend - reloc_vaddr as i64;
             // Must be 4-byte aligned and fit in 26-bit signed * 4
             let imm26 = value >> 2;
@@ -344,7 +343,7 @@ fn apply_one_reloc_aarch64(
             Ok(false)
         }
         // ADRP: 21-bit page-relative
-        elf::R_AARCH64_ADR_PREL_PG_HI21 => {
+        RelocType::Aarch64AdrPrelPgHi21 => {
             let sym_page = (sym_addr as i64 + reloc.addend) & !0xFFF;
             let pc_page = reloc_vaddr as i64 & !0xFFF;
             let page_delta = (sym_page - pc_page) >> 12;
@@ -357,19 +356,19 @@ fn apply_one_reloc_aarch64(
             Ok(false)
         }
         // ADD immediate: 12-bit page offset
-        elf::R_AARCH64_ADD_ABS_LO12_NC => {
+        RelocType::Aarch64AddAbsLo12Nc => {
             let value = ((sym_addr as i64 + reloc.addend) & 0xFFF) as u32;
             patch_aarch64_add_imm12(state, reloc.section, reloc.offset, value);
             Ok(false)
         }
         // LDR 64-bit: 12-bit page offset (scaled by 8)
-        elf::R_AARCH64_LDST64_ABS_LO12_NC => {
+        RelocType::Aarch64Ldst64AbsLo12Nc => {
             let value = ((sym_addr as i64 + reloc.addend) & 0xFFF) as u32;
             patch_aarch64_ldr_imm12(state, reloc.section, reloc.offset, value, 3);
             Ok(false)
         }
         // ADRP for GOT entry page
-        elf::R_AARCH64_ADR_GOT_PAGE => {
+        RelocType::Aarch64AdrGotPage => {
             let got_slot = *got.get(&reloc.symbol_name).ok_or_else(|| {
                 LinkError::UndefinedSymbols(vec![reloc.symbol_name.clone()])
             })?;
@@ -380,7 +379,7 @@ fn apply_one_reloc_aarch64(
             Ok(false)
         }
         // LDR for GOT entry page offset
-        elf::R_AARCH64_LD64_GOT_LO12_NC => {
+        RelocType::Aarch64Ld64GotLo12Nc => {
             let got_slot = *got.get(&reloc.symbol_name).ok_or_else(|| {
                 LinkError::UndefinedSymbols(vec![reloc.symbol_name.clone()])
             })?;
@@ -458,7 +457,7 @@ pub(crate) fn apply_relocs_macho(
         // GOT relocations don't need the symbol address — they use the GOT
         // slot address, which is looked up by name inside the reloc handler.
         let is_got_reloc = matches!(reloc.r_type,
-            elf::R_AARCH64_ADR_GOT_PAGE | elf::R_AARCH64_LD64_GOT_LO12_NC);
+            RelocType::Aarch64AdrGotPage | RelocType::Aarch64Ld64GotLo12Nc);
 
         let sym_addr = match resolve_symbol(state, &reloc.symbol_name, reloc.section, None) {
             Some(a) => a,
@@ -471,24 +470,24 @@ pub(crate) fn apply_relocs_macho(
 
         let is_abs = match reloc.r_type {
             // AArch64 relocations
-            elf::R_AARCH64_ABS64
-            | elf::R_AARCH64_CALL26
-            | elf::R_AARCH64_ADR_PREL_PG_HI21
-            | elf::R_AARCH64_ADD_ABS_LO12_NC
-            | elf::R_AARCH64_LDST64_ABS_LO12_NC
-            | elf::R_AARCH64_ADR_GOT_PAGE
-            | elf::R_AARCH64_LD64_GOT_LO12_NC => {
+            RelocType::Aarch64Abs64
+            | RelocType::Aarch64Call26
+            | RelocType::Aarch64AdrPrelPgHi21
+            | RelocType::Aarch64AddAbsLo12Nc
+            | RelocType::Aarch64Ldst64AbsLo12Nc
+            | RelocType::Aarch64AdrGotPage
+            | RelocType::Aarch64Ld64GotLo12Nc => {
                 apply_one_reloc_aarch64(state, reloc, sym_addr, reloc_vaddr, params.got)?
             }
             // x86-64 relocations
-            elf::R_X86_64_64
-            | elf::R_X86_64_PC32
-            | elf::R_X86_64_PLT32
-            | elf::R_X86_64_GOTPCREL
-            | elf::R_X86_64_GOTPCRELX
-            | elf::R_X86_64_REX_GOTPCRELX
-            | elf::R_X86_64_32
-            | elf::R_X86_64_32S => {
+            RelocType::X86_64
+            | RelocType::X86Pc32
+            | RelocType::X86Plt32
+            | RelocType::X86Gotpcrel
+            | RelocType::X86Gotpcrelx
+            | RelocType::X86RexGotpcrelx
+            | RelocType::X86_32
+            | RelocType::X86_32S => {
                 apply_one_reloc(state, reloc, sym_addr, reloc_vaddr, params.got)?
             }
             other => return Err(LinkError::UnsupportedRelocation {
@@ -524,8 +523,8 @@ pub(crate) fn apply_relocs_pe(
     for reloc in &relocs {
         // Skip TLS relocations — not supported in UEFI
         match reloc.r_type {
-            elf::R_X86_64_TLSGD | elf::R_X86_64_TLSLD | elf::R_X86_64_DTPOFF32
-            | elf::R_X86_64_TPOFF32 | elf::R_X86_64_GOTTPOFF => continue,
+            RelocType::X86Tlsgd | RelocType::X86Tlsld | RelocType::X86Dtpoff32
+            | RelocType::X86Tpoff32 | RelocType::X86Gottpoff => continue,
             _ => {}
         }
 

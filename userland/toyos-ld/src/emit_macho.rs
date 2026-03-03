@@ -1,7 +1,6 @@
-use crate::collect::{collect_unique_symbols, LinkState, SectionIdx, SymbolDef};
+use crate::collect::{collect_unique_symbols, LinkState, RelocType, SectionIdx, SymbolDef};
 use crate::reloc::resolve_symbol;
 use crate::{align_up, classify_sections, LinkError};
-use object::elf;
 use sha2::{Sha256, Digest};
 use std::collections::HashMap;
 
@@ -103,9 +102,9 @@ pub(crate) fn layout_macho(state: &mut LinkState, _entry: &str) -> MachOLayout {
     // Phase 1: Figure out what we need to compute sizeofcmds
     let got_symbols = collect_unique_symbols(state.relocs.iter(), |r| {
         matches!(r.r_type,
-            elf::R_AARCH64_ADR_GOT_PAGE | elf::R_AARCH64_LD64_GOT_LO12_NC
-            | elf::R_X86_64_GOTPCREL | elf::R_X86_64_GOTPCRELX
-            | elf::R_X86_64_REX_GOTPCRELX)
+            RelocType::Aarch64AdrGotPage | RelocType::Aarch64Ld64GotLo12Nc
+            | RelocType::X86Gotpcrel | RelocType::X86Gotpcrelx
+            | RelocType::X86RexGotpcrelx)
     });
 
     let has_const = buckets.rx.iter().any(|&i| state.sections[i.0].writable == false && state.sections[i.0].name != ".text");

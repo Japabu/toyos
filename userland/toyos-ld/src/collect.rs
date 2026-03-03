@@ -35,11 +35,64 @@ pub(crate) struct InputSection {
     pub(crate) entsize: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelocType {
+    // x86_64
+    X86_64,
+    X86Pc32,
+    X86Plt32,
+    X86_32,
+    X86_32S,
+    X86Gotpcrel,
+    X86Gotpcrelx,
+    X86RexGotpcrelx,
+    X86Tpoff32,
+    X86Gottpoff,
+    X86Tlsgd,
+    X86Tlsld,
+    X86Dtpoff32,
+    // AArch64
+    Aarch64Abs64,
+    Aarch64Call26,
+    Aarch64AdrPrelPgHi21,
+    Aarch64AddAbsLo12Nc,
+    Aarch64Ldst64AbsLo12Nc,
+    Aarch64AdrGotPage,
+    Aarch64Ld64GotLo12Nc,
+}
+
+impl std::fmt::Display for RelocType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RelocType::X86_64 => write!(f, "R_X86_64_64"),
+            RelocType::X86Pc32 => write!(f, "R_X86_64_PC32"),
+            RelocType::X86Plt32 => write!(f, "R_X86_64_PLT32"),
+            RelocType::X86_32 => write!(f, "R_X86_64_32"),
+            RelocType::X86_32S => write!(f, "R_X86_64_32S"),
+            RelocType::X86Gotpcrel => write!(f, "R_X86_64_GOTPCREL"),
+            RelocType::X86Gotpcrelx => write!(f, "R_X86_64_GOTPCRELX"),
+            RelocType::X86RexGotpcrelx => write!(f, "R_X86_64_REX_GOTPCRELX"),
+            RelocType::X86Tpoff32 => write!(f, "R_X86_64_TPOFF32"),
+            RelocType::X86Gottpoff => write!(f, "R_X86_64_GOTTPOFF"),
+            RelocType::X86Tlsgd => write!(f, "R_X86_64_TLSGD"),
+            RelocType::X86Tlsld => write!(f, "R_X86_64_TLSLD"),
+            RelocType::X86Dtpoff32 => write!(f, "R_X86_64_DTPOFF32"),
+            RelocType::Aarch64Abs64 => write!(f, "R_AARCH64_ABS64"),
+            RelocType::Aarch64Call26 => write!(f, "R_AARCH64_CALL26"),
+            RelocType::Aarch64AdrPrelPgHi21 => write!(f, "R_AARCH64_ADR_PREL_PG_HI21"),
+            RelocType::Aarch64AddAbsLo12Nc => write!(f, "R_AARCH64_ADD_ABS_LO12_NC"),
+            RelocType::Aarch64Ldst64AbsLo12Nc => write!(f, "R_AARCH64_LDST64_ABS_LO12_NC"),
+            RelocType::Aarch64AdrGotPage => write!(f, "R_AARCH64_ADR_GOT_PAGE"),
+            RelocType::Aarch64Ld64GotLo12Nc => write!(f, "R_AARCH64_LD64_GOT_LO12_NC"),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct InputReloc {
     pub(crate) section: SectionIdx,
     pub(crate) offset: u64,
-    pub(crate) r_type: u32,
+    pub(crate) r_type: RelocType,
     pub(crate) symbol_name: String,
     pub(crate) addend: i64,
 }
@@ -334,13 +387,16 @@ fn collect_object(
                 None => continue,
             };
             let (r_type, is_macho_instruction) = match reloc.flags() {
-                RelocationFlags::Elf { r_type } => (r_type, false),
-                RelocationFlags::Coff { typ } => match coff_to_elf_r_type(typ) {
+                RelocationFlags::Elf { r_type } => match elf_to_reloc_type(r_type) {
+                    Some(r) => (r, false),
+                    None => continue,
+                },
+                RelocationFlags::Coff { typ } => match coff_to_reloc_type(typ) {
                     Some(r) => (r, false),
                     None => continue,
                 },
                 RelocationFlags::MachO { r_type, r_length, .. } => {
-                    match macho_arm64_to_elf_r_type(r_type, r_length) {
+                    match macho_arm64_to_reloc_type(r_type, r_length) {
                         Some(r) => (r, macho_arm64_is_instruction_reloc(r_type)),
                         None => continue,
                     }
@@ -378,32 +434,58 @@ fn collect_object(
     }
 }
 
-/// Map COFF x86_64 relocation types to their ELF equivalents.
-fn coff_to_elf_r_type(typ: u16) -> Option<u32> {
+fn elf_to_reloc_type(r_type: u32) -> Option<RelocType> {
+    Some(match r_type {
+        elf::R_X86_64_64 => RelocType::X86_64,
+        elf::R_X86_64_PC32 => RelocType::X86Pc32,
+        elf::R_X86_64_PLT32 => RelocType::X86Plt32,
+        elf::R_X86_64_32 => RelocType::X86_32,
+        elf::R_X86_64_32S => RelocType::X86_32S,
+        elf::R_X86_64_GOTPCREL => RelocType::X86Gotpcrel,
+        elf::R_X86_64_GOTPCRELX => RelocType::X86Gotpcrelx,
+        elf::R_X86_64_REX_GOTPCRELX => RelocType::X86RexGotpcrelx,
+        elf::R_X86_64_TPOFF32 => RelocType::X86Tpoff32,
+        elf::R_X86_64_GOTTPOFF => RelocType::X86Gottpoff,
+        elf::R_X86_64_TLSGD => RelocType::X86Tlsgd,
+        elf::R_X86_64_TLSLD => RelocType::X86Tlsld,
+        elf::R_X86_64_DTPOFF32 => RelocType::X86Dtpoff32,
+        elf::R_AARCH64_ABS64 => RelocType::Aarch64Abs64,
+        elf::R_AARCH64_CALL26 => RelocType::Aarch64Call26,
+        elf::R_AARCH64_ADR_PREL_PG_HI21 => RelocType::Aarch64AdrPrelPgHi21,
+        elf::R_AARCH64_ADD_ABS_LO12_NC => RelocType::Aarch64AddAbsLo12Nc,
+        elf::R_AARCH64_LDST64_ABS_LO12_NC => RelocType::Aarch64Ldst64AbsLo12Nc,
+        elf::R_AARCH64_ADR_GOT_PAGE => RelocType::Aarch64AdrGotPage,
+        elf::R_AARCH64_LD64_GOT_LO12_NC => RelocType::Aarch64Ld64GotLo12Nc,
+        _ => return None,
+    })
+}
+
+/// Map COFF x86_64 relocation types to RelocType.
+fn coff_to_reloc_type(typ: u16) -> Option<RelocType> {
     Some(match typ {
-        pe::IMAGE_REL_AMD64_ADDR64 => elf::R_X86_64_64,
-        pe::IMAGE_REL_AMD64_ADDR32 => elf::R_X86_64_32,
-        pe::IMAGE_REL_AMD64_ADDR32NB => elf::R_X86_64_32S,
+        pe::IMAGE_REL_AMD64_ADDR64 => RelocType::X86_64,
+        pe::IMAGE_REL_AMD64_ADDR32 => RelocType::X86_32,
+        pe::IMAGE_REL_AMD64_ADDR32NB => RelocType::X86_32S,
         pe::IMAGE_REL_AMD64_REL32
         | pe::IMAGE_REL_AMD64_REL32_1
         | pe::IMAGE_REL_AMD64_REL32_2
         | pe::IMAGE_REL_AMD64_REL32_3
         | pe::IMAGE_REL_AMD64_REL32_4
-        | pe::IMAGE_REL_AMD64_REL32_5 => elf::R_X86_64_PLT32,
-        pe::IMAGE_REL_AMD64_SECREL => elf::R_X86_64_32,
+        | pe::IMAGE_REL_AMD64_REL32_5 => RelocType::X86Plt32,
+        pe::IMAGE_REL_AMD64_SECREL => RelocType::X86_32,
         _ => return None,
     })
 }
 
-/// Map Mach-O arm64 relocation types to ELF aarch64 equivalents.
-fn macho_arm64_to_elf_r_type(r_type: u8, r_length: u8) -> Option<u32> {
+/// Map Mach-O arm64 relocation types to RelocType.
+fn macho_arm64_to_reloc_type(r_type: u8, r_length: u8) -> Option<RelocType> {
     Some(match r_type {
-        macho::ARM64_RELOC_UNSIGNED if r_length == 3 => elf::R_AARCH64_ABS64,
-        macho::ARM64_RELOC_BRANCH26 => elf::R_AARCH64_CALL26,
-        macho::ARM64_RELOC_PAGE21 => elf::R_AARCH64_ADR_PREL_PG_HI21,
-        macho::ARM64_RELOC_PAGEOFF12 => elf::R_AARCH64_ADD_ABS_LO12_NC,
-        macho::ARM64_RELOC_GOT_LOAD_PAGE21 => elf::R_AARCH64_ADR_GOT_PAGE,
-        macho::ARM64_RELOC_GOT_LOAD_PAGEOFF12 => elf::R_AARCH64_LD64_GOT_LO12_NC,
+        macho::ARM64_RELOC_UNSIGNED if r_length == 3 => RelocType::Aarch64Abs64,
+        macho::ARM64_RELOC_BRANCH26 => RelocType::Aarch64Call26,
+        macho::ARM64_RELOC_PAGE21 => RelocType::Aarch64AdrPrelPgHi21,
+        macho::ARM64_RELOC_PAGEOFF12 => RelocType::Aarch64AddAbsLo12Nc,
+        macho::ARM64_RELOC_GOT_LOAD_PAGE21 => RelocType::Aarch64AdrGotPage,
+        macho::ARM64_RELOC_GOT_LOAD_PAGEOFF12 => RelocType::Aarch64Ld64GotLo12Nc,
         _ => return None,
     })
 }
@@ -667,7 +749,7 @@ pub(crate) fn synthesize_alloc_shims(state: &mut LinkState) {
         state.relocs.push(InputReloc {
             section: sec_idx,
             offset: 1,
-            r_type: elf::R_X86_64_PLT32,
+            r_type: RelocType::X86Plt32,
             symbol_name: target_name.to_string(),
             addend: -4,
         });

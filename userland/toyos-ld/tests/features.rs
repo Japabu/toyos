@@ -284,7 +284,7 @@ fn relocation_overflow_32s() {
     let result = toyos_ld::link_static(&[("test.o".into(), obj)], "_start", 0x1_0000_0000);
     match result {
         Err(toyos_ld::LinkError::RelocationOverflow { reloc_type, .. }) => {
-            assert_eq!(reloc_type, elf::R_X86_64_32S);
+            assert_eq!(reloc_type, toyos_ld::RelocType::X86_32S);
         }
         Err(other) => panic!("expected RelocationOverflow, got: {other:?}"),
         Ok(_) => panic!("expected RelocationOverflow error, but linking succeeded"),
@@ -297,7 +297,7 @@ fn relocation_overflow_32() {
     let result = toyos_ld::link_static(&[("test.o".into(), obj)], "_start", 0x1_0000_0000);
     match result {
         Err(toyos_ld::LinkError::RelocationOverflow { reloc_type, .. }) => {
-            assert_eq!(reloc_type, elf::R_X86_64_32);
+            assert_eq!(reloc_type, toyos_ld::RelocType::X86_32);
         }
         Err(other) => panic!("expected RelocationOverflow, got: {other:?}"),
         Ok(_) => panic!("expected RelocationOverflow error, but linking succeeded"),

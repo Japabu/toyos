@@ -1,7 +1,7 @@
 use object::write::elf::{FileHeader, ProgramHeader, SectionHeader, SectionIndex, Sym, Rel, Writer, SymbolIndex};
 use object::write::StringId;
 use object::Endianness;
-use crate::collect::{collect_unique_symbols, InputSection, LinkState, SectionIdx, SymbolDef};
+use crate::collect::{collect_unique_symbols, InputSection, LinkState, RelocType, SectionIdx, SymbolDef};
 use crate::reloc::{RelocOutput, resolve_symbol, tpoff};
 use crate::{align_up, classify_sections, is_tls_section, LinkError, BASE_VADDR, PAGE_SIZE};
 use object::elf;
@@ -341,8 +341,8 @@ pub(crate) fn layout_elf(state: &mut LinkState, base_addr: u64, entry_name: Opti
 
     let got_symbols = collect_unique_symbols(state.relocs.iter(), |r| {
         matches!(r.r_type,
-            elf::R_X86_64_GOTPCREL | elf::R_X86_64_GOTPCRELX
-            | elf::R_X86_64_REX_GOTPCRELX | elf::R_X86_64_GOTTPOFF)
+            RelocType::X86Gotpcrel | RelocType::X86Gotpcrelx
+            | RelocType::X86RexGotpcrelx | RelocType::X86Gottpoff)
     });
 
     cursor = align_up(cursor, 8);
@@ -1121,7 +1121,7 @@ pub(crate) fn emit_static_bytes(
 
     // GOT entries (filled directly in static mode)
     let gottpoff_syms: HashSet<String> = state.relocs.iter()
-        .filter(|r| r.r_type == elf::R_X86_64_GOTTPOFF)
+        .filter(|r| r.r_type == RelocType::X86Gottpoff)
         .map(|r| r.symbol_name.clone()).collect();
     let mut got_entries: Vec<_> = layout.got.iter().collect();
     got_entries.sort_by_key(|(_, &vaddr)| vaddr);
