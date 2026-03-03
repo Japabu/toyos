@@ -245,3 +245,5 @@ tinycc_test!(t145_self_ref_struct, "145_self_ref_struct");
 tinycc_test!(t146_deref_assign, "146_deref_assign");
 tinycc_test!(t147_sizeof_deref_array, "147_sizeof_deref_array");
 tinycc_test!(t148_directive_in_args, "148_directive_in_args");
+tinycc_test!(t149_bitfield_write, "149_bitfield_write");
+tinycc_test!(t150_union_short_store, "150_union_short_store");

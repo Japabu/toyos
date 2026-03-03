@@ -53,6 +53,81 @@ impl Codegen {
         }
     }
 
+    /// Returns the actual (unpromoted) storage type for Member/Arrow field access.
+    /// Unlike expr_type which applies integer promotion (correct for arithmetic),
+    /// this returns the real field type so stores use the right width.
+    fn field_storage_type(&mut self, ctx: &FuncCtx, expr: &Expr) -> Option<CType> {
+        match expr {
+            Expr::Member(e, field) => {
+                let base_ty = self.expr_type(ctx, e)?;
+                let base_ty = self.resolve_incomplete_type(base_ty);
+                base_ty.field_offset(field).map(|(_, _, ty)| ty)
+            }
+            Expr::Arrow(e, field) => {
+                let ptr_ty = self.expr_type(ctx, e)?;
+                let pointee = match ptr_ty {
+                    CType::Pointer(inner) => *inner,
+                    _ => return None,
+                };
+                let pointee = self.resolve_incomplete_type(pointee);
+                pointee.field_offset(field).map(|(_, _, ty)| ty)
+            }
+            _ => None,
+        }
+    }
+
+    /// Check if an expression is a bitfield member access.
+    /// Returns (bit_offset, bit_width, storage_type) if it is.
+    fn bitfield_info(&mut self, ctx: &FuncCtx, expr: &Expr) -> Option<(u32, u32, CType)> {
+        match expr {
+            Expr::Member(e, field) => {
+                let base_ty = self.expr_type(ctx, e)?;
+                let base_ty = self.resolve_incomplete_type(base_ty);
+                let (_, bit_offset, field_ty) = base_ty.field_offset(field)?;
+                let bw = base_ty.field_bit_width(field)?;
+                if bw > 0 { Some((bit_offset, bw, field_ty)) } else { None }
+            }
+            Expr::Arrow(e, field) => {
+                let ptr_ty = self.expr_type(ctx, e)?;
+                let pointee_ty = match ptr_ty {
+                    CType::Pointer(inner) => *inner,
+                    _ => return None,
+                };
+                let pointee_ty = self.resolve_incomplete_type(pointee_ty);
+                let (_, bit_offset, field_ty) = pointee_ty.field_offset(field)?;
+                let bw = pointee_ty.field_bit_width(field)?;
+                if bw > 0 { Some((bit_offset, bw, field_ty)) } else { None }
+            }
+            _ => None,
+        }
+    }
+
+    /// Store a value into a bitfield using read-modify-write.
+    fn store_bitfield(&self, ctx: &mut FuncCtx, addr: Value, new_val: Value, bit_offset: u32, bw: u32, storage_ty: &CType) -> Value {
+        let store_clif = self.clif_type(storage_ty);
+        // Load the current storage unit
+        let old = ctx.builder.ins().load(store_clif, MemFlags::new(), addr, 0);
+        let old64 = self.coerce(ctx, old, I64);
+        let new64 = self.coerce(ctx, new_val, I64);
+        // Mask the new value to the bit width
+        let field_mask = (1u64 << bw) - 1;
+        let masked_new = ctx.builder.ins().band_imm(new64, field_mask as i64);
+        // Shift into position
+        let shifted_new = if bit_offset > 0 {
+            ctx.builder.ins().ishl_imm(masked_new, bit_offset as i64)
+        } else {
+            masked_new
+        };
+        // Clear the field bits in the old value
+        let clear_mask = !(field_mask << bit_offset) as i64;
+        let cleared = ctx.builder.ins().band_imm(old64, clear_mask);
+        // Merge
+        let merged = ctx.builder.ins().bor(cleared, shifted_new);
+        let merged = self.coerce(ctx, merged, store_clif);
+        ctx.builder.ins().store(MemFlags::new(), merged, addr, 0);
+        new_val
+    }
+
     pub(crate) fn compile_expr(&mut self, ctx: &mut FuncCtx, expr: &Expr) -> Value {
         let expr_name = match expr {
             Expr::IntLit(v) => format!("IntLit({v})"),
@@ -526,8 +601,26 @@ impl Codegen {
                     }
                 }
 
+                // Bitfield assignment: read-modify-write
+                if let Some((bit_offset, bw, storage_ty)) = self.bitfield_info(ctx, lhs) {
+                    let addr = self.compile_addr(ctx, lhs);
+                    let val = if *op == AssignOp::Assign {
+                        rhs_val
+                    } else {
+                        let store_clif = self.clif_type(&storage_ty);
+                        let old = ctx.builder.ins().load(store_clif, MemFlags::new(), addr, 0);
+                        let lhs_val = self.extract_bitfield(ctx, old, bit_offset, Some(bw), &storage_ty);
+                        self.compile_compound_assign(ctx, *op, lhs_val, rhs_val)
+                    };
+                    return self.store_bitfield(ctx, addr, val, bit_offset, bw, &storage_ty);
+                }
+
                 let addr = self.compile_addr(ctx, lhs);
-                let store_clif = lhs_ty.as_ref().map(|ty| {
+                // Use actual field type for stores (not promoted type) to avoid
+                // clobbering adjacent fields (e.g. unsigned short promoted to int
+                // would store 4 bytes into a 2-byte field)
+                let store_ty = self.field_storage_type(ctx, lhs).or(lhs_ty);
+                let store_clif = store_ty.as_ref().map(|ty| {
                     if self.is_float_type(ty) { self.clif_float_type(ty) } else { self.clif_type(ty) }
                 }).expect("assignment: cannot resolve lhs type");
                 let val = if *op == AssignOp::Assign {
