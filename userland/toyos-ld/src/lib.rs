@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::fs;
 
 pub use collect::RelocType;
-use collect::{collect, synthesize_alloc_shims, gc_sections, merge_string_sections, is_archive, extract_archive, find_lib, scan_symbols, SectionIdx, SymbolDef};
+use collect::{collect, synthesize_alloc_shims, gc_sections, merge_string_sections, is_archive, extract_archive, find_lib, scan_symbols, SectionIdx, SectionKind, SymbolDef};
 use reloc::{ElfRelocParams, apply_relocs, apply_relocs_pe, MachORelocParams, apply_relocs_macho};
 use emit_elf::{layout_elf, build_eh_frame_hdr, ElfEmitMode, ElfLayout};
 use emit_pe::{layout_pe, emit_pe_bytes, PeLayout};
@@ -386,14 +386,16 @@ pub fn link_macho(
     create_call_stubs(&mut collected.state);
 
     // Sections with absolute relocations need runtime rebasing, which requires
-    // writable memory. Move read-only data sections (like .data.ro) to __DATA.
+    // writable memory. Promote read-only sections to Data for Mach-O rebasing.
     {
         let abs_reloc_sections: std::collections::HashSet<SectionIdx> = collected.state.relocs.iter()
             .filter(|r| r.r_type == RelocType::Aarch64Abs64)
             .map(|r| r.section)
             .collect();
         for &idx in &abs_reloc_sections {
-            collected.state.sections[idx].writable = true;
+            if !collected.state.sections[idx].kind.is_writable() {
+                collected.state.sections[idx].kind = SectionKind::Data;
+            }
         }
     }
 
@@ -476,8 +478,7 @@ fn create_call_stubs(state: &mut collect::LinkState) {
         align: 4,
         size: (stub_count * 12) as u64,
         vaddr: None,
-        writable: false,
-        nobits: false,
+        kind: SectionKind::Code,
         merge: false,
         strings: false,
         entsize: 0,
@@ -503,10 +504,6 @@ pub(crate) fn align_up(addr: u64, align: u64) -> u64 {
     (addr + align - 1) & !(align - 1)
 }
 
-pub(crate) fn is_tls_section(name: &str) -> bool {
-    name.starts_with(".tdata") || name.starts_with(".tbss")
-}
-
 pub(crate) struct SectionBuckets {
     pub(crate) rx: Vec<SectionIdx>,
     pub(crate) rw: Vec<SectionIdx>,
@@ -517,12 +514,12 @@ pub(crate) fn classify_sections(state: &mut collect::LinkState) -> SectionBucket
     let mut buckets = SectionBuckets { rx: Vec::new(), rw: Vec::new(), tls: Vec::new() };
     for (idx, sec) in state.sections.iter().enumerate() {
         let idx = SectionIdx(idx);
-        if state.tls_sections.contains(&idx) || is_tls_section(&sec.name) {
+        if sec.kind.is_tls() {
             buckets.tls.push(idx);
             if !state.tls_sections.contains(&idx) {
                 state.tls_sections.push(idx);
             }
-        } else if sec.writable {
+        } else if sec.kind.is_writable() {
             buckets.rw.push(idx);
         } else {
             buckets.rx.push(idx);
@@ -533,10 +530,12 @@ pub(crate) fn classify_sections(state: &mut collect::LinkState) -> SectionBucket
     // Sort RW: .init_array first, .fini_array second, other PROGBITS, then NOBITS (.bss)
     buckets.rw.sort_by_key(|&idx| {
         let sec = &state.sections[idx];
-        if sec.name.starts_with(".init_array") { 0u8 }
-        else if sec.name.starts_with(".fini_array") { 1 }
-        else if sec.nobits { 3 }
-        else { 2 }
+        match sec.kind {
+            SectionKind::InitArray => 0u8,
+            SectionKind::FiniArray => 1,
+            _ if sec.kind.is_nobits() => 3,
+            _ => 2,
+        }
     });
     buckets
 }

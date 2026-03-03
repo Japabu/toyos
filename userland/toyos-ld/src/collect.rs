@@ -26,6 +26,30 @@ impl std::ops::IndexMut<SectionIdx> for Vec<InputSection> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct ObjIdx(pub usize);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SectionKind {
+    Code,
+    ReadOnly,
+    Data,
+    Bss,
+    Tls,
+    TlsBss,
+    InitArray,
+    FiniArray,
+}
+
+impl SectionKind {
+    pub fn is_writable(self) -> bool {
+        matches!(self, Self::Data | Self::Bss | Self::InitArray | Self::FiniArray)
+    }
+    pub fn is_nobits(self) -> bool {
+        matches!(self, Self::Bss | Self::TlsBss)
+    }
+    pub fn is_tls(self) -> bool {
+        matches!(self, Self::Tls | Self::TlsBss)
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct InputSection {
     pub(crate) obj_idx: Option<ObjIdx>,
@@ -34,8 +58,7 @@ pub(crate) struct InputSection {
     pub(crate) align: u64,
     pub(crate) size: u64,
     pub(crate) vaddr: Option<u64>,
-    pub(crate) writable: bool,
-    pub(crate) nobits: bool,
+    pub(crate) kind: SectionKind,
     /// Section has SHF_MERGE flag (eligible for deduplication)
     pub(crate) merge: bool,
     /// Section has SHF_STRINGS flag (null-terminated string entries)
@@ -264,22 +287,20 @@ fn collect_object(
         let global_idx = SectionIdx(state.sections.len());
         sec_map.insert((obj_idx, section.index()), global_idx);
 
-        let is_tls = matches!(
-            section.kind(),
-            read::SectionKind::Tls | read::SectionKind::UninitializedTls
-        );
-        let writable = matches!(
-            section.kind(),
-            read::SectionKind::Data | read::SectionKind::UninitializedData
-        ) || matches!(
-            section.kind(),
-            read::SectionKind::Elf(elf::SHT_INIT_ARRAY)
-            | read::SectionKind::Elf(elf::SHT_FINI_ARRAY)
-        );
-        let nobits = matches!(
-            section.kind(),
-            read::SectionKind::UninitializedData | read::SectionKind::UninitializedTls
-        );
+        let kind = match section.kind() {
+            read::SectionKind::Text => SectionKind::Code,
+            read::SectionKind::Data => SectionKind::Data,
+            read::SectionKind::ReadOnlyData
+            | read::SectionKind::ReadOnlyDataWithRel
+            | read::SectionKind::ReadOnlyString
+            | read::SectionKind::OtherString => SectionKind::ReadOnly,
+            read::SectionKind::UninitializedData => SectionKind::Bss,
+            read::SectionKind::Tls => SectionKind::Tls,
+            read::SectionKind::UninitializedTls => SectionKind::TlsBss,
+            read::SectionKind::Elf(elf::SHT_INIT_ARRAY) => SectionKind::InitArray,
+            read::SectionKind::Elf(elf::SHT_FINI_ARRAY) => SectionKind::FiniArray,
+            _ => unreachable!("filtered above"),
+        };
 
         // Extract ELF merge/strings flags
         let (merge, strings, entsize) = match section.flags() {
@@ -305,14 +326,13 @@ fn collect_object(
             align: section.align().max(1),
             size: section.size(),
             vaddr: None,
-            writable,
-            nobits,
+            kind,
             merge,
             strings,
             entsize,
         });
 
-        if is_tls {
+        if kind.is_tls() {
             state.tls_sections.push(global_idx);
         }
     }
@@ -639,7 +659,7 @@ pub(crate) fn gc_sections(state: &mut LinkState, entry: &str) {
 
     // .init_array / .fini_array sections are always roots
     for (idx, sec) in state.sections.iter().enumerate() {
-        if sec.name.starts_with(".init_array") || sec.name.starts_with(".fini_array") {
+        if sec.kind == SectionKind::InitArray || sec.kind == SectionKind::FiniArray {
             if !reachable[idx] {
                 reachable[idx] = true;
                 queue.push_back(idx);
@@ -762,8 +782,7 @@ pub(crate) fn synthesize_alloc_shims(state: &mut LinkState) {
             align: 16,
             size: 16,
             vaddr: None,
-            writable: false,
-            nobits: false,
+            kind: SectionKind::Code,
             merge: false,
             strings: false,
             entsize: 0,
@@ -795,8 +814,7 @@ pub(crate) fn synthesize_alloc_shims(state: &mut LinkState) {
             align: 16,
             size: 16,
             vaddr: None,
-            writable: false,
-            nobits: false,
+            kind: SectionKind::Code,
             merge: false,
             strings: false,
             entsize: 0,

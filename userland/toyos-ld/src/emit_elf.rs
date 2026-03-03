@@ -1,9 +1,9 @@
 use object::write::elf::{FileHeader, ProgramHeader, SectionHeader, SectionIndex, Sym, Rel, Writer, SymbolIndex};
 use object::write::StringId;
 use object::Endianness;
-use crate::collect::{collect_unique_symbols, InputSection, LinkState, RelocType, SectionIdx, SymbolDef};
+use crate::collect::{collect_unique_symbols, InputSection, LinkState, RelocType, SectionIdx, SectionKind, SymbolDef};
 use crate::reloc::{RelocOutput, resolve_symbol, tpoff};
-use crate::{align_up, classify_sections, is_tls_section, LinkError, BASE_VADDR, PAGE_SIZE};
+use crate::{align_up, classify_sections, LinkError, BASE_VADDR, PAGE_SIZE};
 use object::elf;
 use std::collections::{HashMap, HashSet};
 
@@ -315,7 +315,7 @@ pub(crate) fn layout_elf(state: &mut LinkState, base_addr: u64, entry_name: Opti
 
     // Place PROGBITS RW sections first
     for &idx in &buckets.rw {
-        if state.sections[idx].nobits { continue; }
+        if state.sections[idx].kind.is_nobits() { continue; }
         let sec = &mut state.sections[idx];
         cursor = align_up(cursor, sec.align);
         sec.vaddr = Some(cursor);
@@ -330,10 +330,10 @@ pub(crate) fn layout_elf(state: &mut LinkState, base_addr: u64, entry_name: Opti
     for &idx in &buckets.rw {
         let sec = &state.sections[idx];
         let Some(sec_vaddr) = sec.vaddr else { continue; };
-        if sec.name.starts_with(".init_array") {
+        if sec.kind == SectionKind::InitArray {
             if init_array_size == 0 { init_array_vaddr = sec_vaddr; }
             init_array_size = (sec_vaddr + sec.size) - init_array_vaddr;
-        } else if sec.name.starts_with(".fini_array") {
+        } else if sec.kind == SectionKind::FiniArray {
             if fini_array_size == 0 { fini_array_vaddr = sec_vaddr; }
             fini_array_size = (sec_vaddr + sec.size) - fini_array_vaddr;
         }
@@ -362,7 +362,7 @@ pub(crate) fn layout_elf(state: &mut LinkState, base_addr: u64, entry_name: Opti
 
     // Place NOBITS RW sections (.bss) after all file-backed data
     for &idx in &buckets.rw {
-        if !state.sections[idx].nobits { continue; }
+        if !state.sections[idx].kind.is_nobits() { continue; }
         let sec = &mut state.sections[idx];
         cursor = align_up(cursor, sec.align);
         sec.vaddr = Some(cursor);
@@ -394,7 +394,7 @@ pub(crate) fn layout_elf(state: &mut LinkState, base_addr: u64, entry_name: Opti
     }
     let tls_filesz = buckets.tls
         .iter()
-        .filter(|&&idx| !state.sections[idx].name.starts_with(".tbss"))
+        .filter(|&&idx| state.sections[idx].kind != SectionKind::TlsBss)
         .map(|&idx| state.sections[idx].size)
         .sum::<u64>();
     let tls_memsz = if buckets.tls.is_empty() { 0 } else { tls_cursor - tls_start };
@@ -478,7 +478,7 @@ fn resolve_entry(state: &LinkState, entry_name: &str, plt: Option<&HashMap<Strin
 
 /// Map an input section to an output section index (1 = .text, 2 = .data).
 fn output_section_index(sec: &InputSection, text_idx: SectionIndex, data_idx: SectionIndex) -> SectionIndex {
-    if sec.writable || sec.nobits || is_tls_section(&sec.name) {
+    if sec.kind.is_writable() || sec.kind.is_nobits() || sec.kind.is_tls() {
         data_idx
     } else {
         text_idx
@@ -511,7 +511,7 @@ fn collect_symtab_entries<'a>(
         let sec = &state.sections[*section];
         let st_value = sec.vaddr.unwrap() + value;
         let out_idx = output_section_index(sec, text_idx, data_idx);
-        let st_type = if sec.writable || sec.nobits || is_tls_section(&sec.name) {
+        let st_type = if sec.kind.is_writable() || sec.kind.is_nobits() || sec.kind.is_tls() {
             elf::STT_OBJECT
         } else {
             elf::STT_FUNC
@@ -532,7 +532,7 @@ fn collect_symtab_entries<'a>(
         let sec = &state.sections[*section];
         let st_value = sec.vaddr.unwrap() + value;
         let out_idx = output_section_index(sec, text_idx, data_idx);
-        let st_type = if sec.writable || sec.nobits || is_tls_section(&sec.name) {
+        let st_type = if sec.kind.is_writable() || sec.kind.is_nobits() || sec.kind.is_tls() {
             elf::STT_OBJECT
         } else {
             elf::STT_FUNC
@@ -591,7 +591,7 @@ fn write_symtab(w: &mut Writer, entries: &[SymEntry]) {
 /// Write section data to the Writer in file-offset order. Skips NOBITS sections.
 fn write_sections_data(w: &mut Writer, sections: &[InputSection], base: u64) {
     let mut indices: Vec<usize> = (0..sections.len())
-        .filter(|&i| sections[i].vaddr.is_some() && !sections[i].data.is_empty() && !sections[i].nobits)
+        .filter(|&i| sections[i].vaddr.is_some() && !sections[i].data.is_empty() && !sections[i].kind.is_nobits())
         .collect();
     indices.sort_by_key(|&i| sections[i].vaddr.unwrap());
     for i in indices {

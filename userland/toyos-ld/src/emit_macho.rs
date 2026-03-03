@@ -1,4 +1,4 @@
-use crate::collect::{collect_unique_symbols, LinkState, RelocType, SectionIdx, SymbolDef};
+use crate::collect::{collect_unique_symbols, LinkState, RelocType, SectionIdx, SectionKind, SymbolDef};
 use crate::reloc::resolve_symbol;
 use crate::{align_up, classify_sections, LinkError};
 use sha2::{Sha256, Digest};
@@ -366,9 +366,9 @@ pub(crate) fn layout_macho(state: &mut LinkState, _entry: &str) -> MachOLayout {
             | RelocType::X86RexGotpcrelx)
     });
 
-    let has_const = buckets.rx.iter().any(|&i| state.sections[i].writable == false && state.sections[i].name != ".text");
+    let has_const = buckets.rx.iter().any(|&i| state.sections[i].kind == SectionKind::ReadOnly);
     let has_data = !buckets.rw.is_empty();
-    let has_bss = buckets.rw.iter().any(|&i| state.sections[i].nobits);
+    let has_bss = buckets.rw.iter().any(|&i| state.sections[i].kind.is_nobits());
     let has_got = !got_symbols.is_empty();
 
     let text_nsects = 1 + if has_const { 1 } else { 0 };
@@ -406,7 +406,7 @@ pub(crate) fn layout_macho(state: &mut LinkState, _entry: &str) -> MachOLayout {
     let text_sec_offset = cursor - text_vmaddr;
     for &idx in &buckets.rx {
         let sec = &mut state.sections[idx];
-        if sec.name.starts_with(".const") || sec.name.starts_with(".rodata") {
+        if sec.kind == SectionKind::ReadOnly {
             continue;
         }
         cursor = align_up(cursor, sec.align);
@@ -421,7 +421,7 @@ pub(crate) fn layout_macho(state: &mut LinkState, _entry: &str) -> MachOLayout {
     cursor = const_sec_vmaddr;
     for &idx in &buckets.rx {
         let sec = &mut state.sections[idx];
-        if sec.name.starts_with(".const") || sec.name.starts_with(".rodata") {
+        if sec.kind == SectionKind::ReadOnly {
             cursor = align_up(cursor, sec.align);
             sec.vaddr = Some(cursor);
             cursor += sec.size;
@@ -441,7 +441,7 @@ pub(crate) fn layout_macho(state: &mut LinkState, _entry: &str) -> MachOLayout {
     let data_sec_offset = data_fileoff;
     for &idx in &buckets.rw {
         let sec = &mut state.sections[idx];
-        if sec.nobits { continue; }
+        if sec.kind.is_nobits() { continue; }
         data_cursor = align_up(data_cursor, sec.align);
         sec.vaddr = Some(data_cursor);
         data_cursor += sec.size;
@@ -471,7 +471,7 @@ pub(crate) fn layout_macho(state: &mut LinkState, _entry: &str) -> MachOLayout {
     let mut bss_cursor = bss_sec_vmaddr;
     for &idx in &buckets.rw {
         let sec = &mut state.sections[idx];
-        if !sec.nobits { continue; }
+        if !sec.kind.is_nobits() { continue; }
         bss_cursor = align_up(bss_cursor, sec.align);
         sec.vaddr = Some(bss_cursor);
         bss_cursor += sec.size;
@@ -919,7 +919,7 @@ pub(crate) fn emit_macho_bytes(
     // __DATA,__data: writable data sections
     for sec in &state.sections {
         let Some(vaddr) = sec.vaddr else { continue; };
-        if sec.data.is_empty() || sec.nobits { continue; }
+        if sec.data.is_empty() || sec.kind.is_nobits() { continue; }
         if vaddr >= layout.data_sec_vmaddr
             && vaddr < layout.data_sec_vmaddr + layout.data_sec_size
         {
