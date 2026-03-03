@@ -72,6 +72,7 @@ pub const MOD_SHIFT: u8 = 1;
 pub const MOD_CTRL: u8 = 2;
 pub const MOD_ALT: u8 = 4;
 pub const MOD_GUI: u8 = 8;
+pub const MOD_RELEASED: u8 = 0x10;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -85,6 +86,8 @@ pub struct KeyEvent {
 impl KeyEvent {
     pub const EMPTY: Self = Self { keycode: 0, modifiers: 0, len: 0, translated: [0; 5] };
 
+    pub fn pressed(&self) -> bool { self.modifiers & MOD_RELEASED == 0 }
+    pub fn released(&self) -> bool { self.modifiers & MOD_RELEASED != 0 }
     pub fn shift(&self) -> bool { self.modifiers & MOD_SHIFT != 0 }
     pub fn ctrl(&self) -> bool { self.modifiers & MOD_CTRL != 0 }
     pub fn alt(&self) -> bool { self.modifiers & MOD_ALT != 0 }

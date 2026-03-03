@@ -110,6 +110,10 @@ impl<D: Disk> SimpleFs<D> {
         String::from_utf8(buf).unwrap_or_default()
     }
 
+    fn entry_mtime(entry: &[u8; ENTRY_SIZE as usize]) -> u64 {
+        u64::from_le_bytes(entry[40..48].try_into().unwrap())
+    }
+
     fn find_entry(&mut self, name: &str) -> Option<u64> {
         let mut offset = self.toc_start;
         while offset + ENTRY_SIZE <= self.disk_size {
@@ -122,12 +126,12 @@ impl<D: Disk> SimpleFs<D> {
         None
     }
 
-    pub fn create(&mut self, name: &str, data: &[u8]) -> bool {
-        self.create_entry(name, 1, data)
+    pub fn create(&mut self, name: &str, data: &[u8], mtime: u64) -> bool {
+        self.create_entry(name, 1, data, mtime)
     }
 
     pub fn create_symlink(&mut self, name: &str, target: &str) -> bool {
-        self.create_entry(name, 2, target.as_bytes())
+        self.create_entry(name, 2, target.as_bytes(), 0)
     }
 
     pub fn read_link(&mut self, name: &str) -> Option<String> {
@@ -143,7 +147,13 @@ impl<D: Disk> SimpleFs<D> {
         Some(String::from(core::str::from_utf8(&buf).ok()?))
     }
 
-    fn create_entry(&mut self, name: &str, entry_type: u8, data: &[u8]) -> bool {
+    pub fn file_mtime(&mut self, name: &str) -> Option<u64> {
+        let entry_offset = self.find_entry(name)?;
+        let entry = self.read_entry(entry_offset);
+        Some(Self::entry_mtime(&entry))
+    }
+
+    fn create_entry(&mut self, name: &str, entry_type: u8, data: &[u8], mtime: u64) -> bool {
         let name_bytes = name.as_bytes();
         let total_data = name_bytes.len() as u64 + data.len() as u64;
         let needed = total_data + ENTRY_SIZE;
@@ -165,6 +175,7 @@ impl<D: Disk> SimpleFs<D> {
         entry[16..24].copy_from_slice(&(name_bytes.len() as u64).to_le_bytes());
         entry[24..32].copy_from_slice(&data_offset.to_le_bytes());
         entry[32..40].copy_from_slice(&(data.len() as u64).to_le_bytes());
+        entry[40..48].copy_from_slice(&mtime.to_le_bytes());
         self.disk.write(new_toc, &entry);
 
         self.data_end += total_data;
@@ -212,6 +223,22 @@ impl<D: Disk> SimpleFs<D> {
                 let name = self.entry_name(&entry);
                 let data_len = u64::from_le_bytes(entry[32..40].try_into().unwrap());
                 result.push((name, data_len));
+            }
+            offset += ENTRY_SIZE;
+        }
+        result
+    }
+
+    pub fn list_with_mtime(&mut self) -> Vec<(String, u64, u64)> {
+        let mut result = Vec::new();
+        let mut offset = self.toc_start;
+        while offset + ENTRY_SIZE <= self.disk_size {
+            let entry = self.read_entry(offset);
+            if entry[0] != 0 {
+                let name = self.entry_name(&entry);
+                let data_len = u64::from_le_bytes(entry[32..40].try_into().unwrap());
+                let mtime = Self::entry_mtime(&entry);
+                result.push((name, data_len, mtime));
             }
             offset += ENTRY_SIZE;
         }
@@ -266,7 +293,7 @@ mod tests {
     #[test]
     fn create_and_read() {
         let mut fs = make_fs();
-        assert!(fs.create("hello.txt", b"Hello, world!"));
+        assert!(fs.create("hello.txt", b"Hello, world!", 0));
         let data = fs.read_file("hello.txt").unwrap();
         assert_eq!(&*data, b"Hello, world!");
     }
@@ -275,7 +302,7 @@ mod tests {
     fn long_filename() {
         let mut fs = make_fs();
         let long_name = "librustc_codegen_cranelift-1.95.0-dev.so";
-        assert!(fs.create(long_name, b"elf data here"));
+        assert!(fs.create(long_name, b"elf data here", 0));
         let data = fs.read_file(long_name).unwrap();
         assert_eq!(&*data, b"elf data here");
 
@@ -287,9 +314,9 @@ mod tests {
     #[test]
     fn multiple_files_and_list() {
         let mut fs = make_fs();
-        assert!(fs.create("a.txt", b"aaa"));
-        assert!(fs.create("b.txt", b"bbbbb"));
-        assert!(fs.create("c.txt", b"c"));
+        assert!(fs.create("a.txt", b"aaa", 0));
+        assert!(fs.create("b.txt", b"bbbbb", 0));
+        assert!(fs.create("c.txt", b"c", 0));
 
         let files = fs.list();
         assert_eq!(files.len(), 3);
@@ -307,7 +334,7 @@ mod tests {
     #[test]
     fn delete_file() {
         let mut fs = make_fs();
-        assert!(fs.create("rm_me.txt", b"gone"));
+        assert!(fs.create("rm_me.txt", b"gone", 0));
         assert!(fs.delete("rm_me.txt"));
 
         assert!(fs.read_file("rm_me.txt").is_err());
@@ -319,14 +346,14 @@ mod tests {
         let size = 512;
         let mut fs = SimpleFs::format(MemDisk::new(size), size as u64);
 
-        assert!(fs.create("big.txt", &[0xAA; 320]));
-        assert!(!fs.create("nope.txt", b"x"));
+        assert!(fs.create("big.txt", &[0xAA; 320], 0));
+        assert!(!fs.create("nope.txt", b"x", 0));
     }
 
     #[test]
     fn symlinks() {
         let mut fs = make_fs();
-        assert!(fs.create("target.txt", b"real data"));
+        assert!(fs.create("target.txt", b"real data", 0));
         assert!(fs.create_symlink("link.txt", "target.txt"));
 
         // read_link returns target for symlinks, None for regular files
@@ -343,7 +370,7 @@ mod tests {
     #[test]
     fn mount_reads_existing_files() {
         let mut fs = make_fs();
-        fs.create("persist.txt", b"saved data");
+        fs.create("persist.txt", b"saved data", 0);
 
         let mut fs2 = SimpleFs::mount(fs.into_disk()).unwrap();
         let data = fs2.read_file("persist.txt").unwrap();

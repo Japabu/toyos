@@ -27,8 +27,17 @@ fn main() {
 
     match result {
         Ok(output_bytes) => {
-            fs::write(&args.output, &output_bytes).unwrap_or_else(|e| {
-                eprintln!("toyos-ld: cannot write {}: {e}", args.output.display());
+            // Write to a temp file then atomically rename. On macOS, overwriting
+            // a signed binary in-place leaves a stale code-signature cache on the
+            // old inode, causing the kernel to hang the next launch in _dyld_start.
+            // Rename gives the output a fresh inode every time.
+            let tmp = args.output.with_extension("tmp");
+            fs::write(&tmp, &output_bytes).unwrap_or_else(|e| {
+                eprintln!("toyos-ld: cannot write {}: {e}", tmp.display());
+                process::exit(1);
+            });
+            fs::rename(&tmp, &args.output).unwrap_or_else(|e| {
+                eprintln!("toyos-ld: cannot rename {} -> {}: {e}", tmp.display(), args.output.display());
                 process::exit(1);
             });
             if let Some(map_path) = &args.map_file {

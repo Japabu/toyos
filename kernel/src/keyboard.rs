@@ -8,6 +8,7 @@ pub const MOD_SHIFT: u8 = 1;
 pub const MOD_CTRL: u8 = 2;
 pub const MOD_ALT: u8 = 4;
 pub const MOD_GUI: u8 = 8;
+pub const MOD_RELEASED: u8 = 0x10;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -35,6 +36,23 @@ pub fn handle_report(report: &[u8]) {
         | if alt { MOD_ALT } else { 0 }
         | if gui { MOD_GUI } else { 0 };
 
+    let mut buf = KEY_BUF.lock();
+
+    // Key releases: keys in prev report but not in current report.
+    for i in 2..8 {
+        let keycode = prev[i];
+        if keycode < 4 { continue; }
+        if !report[2..8].contains(&keycode) {
+            buf.push_back(RawKeyEvent {
+                keycode,
+                modifiers: modifiers | MOD_RELEASED,
+                len: 0,
+                translated: [0; 5],
+            });
+        }
+    }
+
+    // Key presses: keys in current report but not in prev report.
     for i in 2..8 {
         let keycode = report[i];
         if keycode < 4 { continue; }
@@ -46,10 +64,11 @@ pub fn handle_report(report: &[u8]) {
                 translated: [0; 5],
             };
             translate(keycode, shift, ctrl, alt, &mut event);
-            KEY_BUF.lock().push_back(event);
+            buf.push_back(event);
         }
     }
 
+    drop(buf);
     PREV_REPORT.lock().copy_from_slice(&report[..8]);
 }
 

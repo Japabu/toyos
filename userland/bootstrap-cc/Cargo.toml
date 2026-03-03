@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-ureq = "2"
-flate2 = "1"
+ureq = { version = "2", default-features = false }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 tar = "0.4"
+
+[patch.crates-io]
+tar = { path = "../tar" }
+filetime = { path = "../filetime" }

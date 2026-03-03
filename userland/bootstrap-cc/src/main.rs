@@ -11,6 +11,10 @@ fn main() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let tcc_dir = root.join("tinycc");
 
+    if !tcc_dir.exists() {
+        download_tinycc(&root);
+    }
+
     write_minimal_config(&tcc_dir);
 
     // ── Build toyos-cc and toyos-ld ──────────────
@@ -85,6 +89,30 @@ fn main() {
     println!("Bootstrapped TCC: {}", stage2.display());
 }
 
+
+fn download_tinycc(root: &Path) {
+    println!("Downloading TinyCC 0.9.27...");
+    let resp = ureq::get("http://repo.or.cz/tinycc.git/snapshot/refs/tags/release_0_9_27.tar.gz")
+        .call()
+        .expect("failed to download TinyCC");
+    let gz = flate2::read::GzDecoder::new(resp.into_reader());
+    let mut archive = tar::Archive::new(gz);
+    let tcc_dir = root.join("tinycc");
+    for entry in archive.entries().expect("failed to read archive") {
+        let mut entry = entry.expect("failed to read entry");
+        let path = entry.path().expect("failed to read path").into_owned();
+        // Strip top-level archive directory (e.g. "tcc-0.9.27/")
+        let stripped: PathBuf = path.components().skip(1).collect();
+        if stripped.as_os_str().is_empty() {
+            continue;
+        }
+        let dest = tcc_dir.join(&stripped);
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent).ok();
+        }
+        entry.unpack(&dest).expect("failed to unpack entry");
+    }
+}
 
 fn write_minimal_config(dir: &Path) {
     fs::write(dir.join("config.h"), r#"

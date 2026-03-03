@@ -110,7 +110,10 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         }
         SYS_CLOSE => sys_close(a1),
         SYS_SEEK => process::with_current_mut(|proc| fd::seek(&mut proc.fds, a1, a2 as i64, a3)),
-        SYS_FSTAT => process::with_current_mut(|proc| fd::fstat(&mut proc.fds, a1)),
+        SYS_FSTAT => {
+            let Some(stat) = ctx.user_mut::<fd::Stat>(a2) else { return u64::MAX };
+            if process::with_current(|proc| fd::fstat(&proc.fds, a1, stat)) { 0 } else { u64::MAX }
+        }
         SYS_FSYNC => process::with_current_mut(|proc| fd::fsync(&mut proc.fds, &mut *vfs::lock(), a1)),
         SYS_READDIR => {
             let Some(path) = ctx.user_str(a1, a2) else { return u64::MAX };
@@ -401,7 +404,7 @@ fn sys_getcwd(buf: &mut [u8]) -> u64 {
 
 fn sys_set_keyboard_layout(name: &str) -> u64 {
     if keyboard::set_layout(name) {
-        if !vfs::lock().write_file("/nvme/config/keyboard_layout", name.as_bytes()) {
+        if !vfs::lock().write_file("/nvme/config/keyboard_layout", name.as_bytes(), crate::clock::nanos_since_boot()) {
             log!("warning: failed to persist keyboard layout");
         }
         0

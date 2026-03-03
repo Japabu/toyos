@@ -37,7 +37,7 @@ pub fn create_initrd(files: &[(String, Vec<u8>)], symlinks: &[(String, String)])
 
     for (name, data) in files {
         eprintln!("initrd: adding '{}' ({} bytes)", name, data.len());
-        if !tyfs.create(name, data) {
+        if !tyfs.create(name, data, 0) {
             panic!("Failed to add '{}' to initrd image", name);
         }
     }

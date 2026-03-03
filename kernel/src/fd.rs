@@ -30,6 +30,7 @@ pub struct OpenFile {
     position: usize,
     writable: bool,
     modified: bool,
+    mtime: u64,
 }
 
 pub enum Descriptor {
@@ -78,14 +79,17 @@ pub fn open(table: &mut FdTable, vfs: &mut Vfs, path: &str, flags: u64) -> u64 {
         }
     }
 
-    let data = if truncate && create {
-        Vec::new()
+    let (data, mtime) = if truncate && create {
+        (Vec::new(), crate::clock::nanos_since_boot())
     } else {
         match vfs.read_file(path) {
-            Ok(data) => data.into_owned(),
+            Ok(data) => {
+                let mtime = vfs.file_mtime(path);
+                (data.into_owned(), mtime)
+            }
             Err(_) => {
                 if create {
-                    Vec::new()
+                    (Vec::new(), crate::clock::nanos_since_boot())
                 } else {
                     return u64::MAX;
                 }
@@ -99,6 +103,7 @@ pub fn open(table: &mut FdTable, vfs: &mut Vfs, path: &str, flags: u64) -> u64 {
         position: 0,
         writable,
         modified: false,
+        mtime,
     };
 
     alloc(table, Descriptor::File(file))
@@ -111,7 +116,7 @@ pub fn close(table: &mut FdTable, vfs: &mut Vfs, fd: u64, pid: u32) -> u64 {
     match &desc {
         Descriptor::File(file) => {
             if file.modified && file.writable {
-                if !vfs.write_file(&file.path, &file.data) {
+                if !vfs.write_file(&file.path, &file.data, file.mtime) {
                     return u64::MAX;
                 }
             }
@@ -193,6 +198,7 @@ pub fn try_write(table: &mut FdTable, fd: u64, buf: &[u8]) -> Option<u64> {
             file.data[file.position..end].copy_from_slice(buf);
             file.position = end;
             file.modified = true;
+            file.mtime = crate::clock::nanos_since_boot();
             Some(buf.len() as u64)
         }
         Descriptor::PipeWrite(id) | Descriptor::TtyWrite(id) => {
@@ -224,18 +230,30 @@ pub fn seek(table: &mut FdTable, fd: u64, offset: i64, whence: u64) -> u64 {
     file.position as u64
 }
 
-/// Returns (type << 32) | payload. Types: 1=file, 2=pipe, 3=keyboard, 4=serial, 5=framebuffer, 6=tty.
-/// Payload: file size for files, 0 otherwise. Returns 0 for invalid FD.
-pub fn fstat(table: &mut FdTable, fd: u64) -> u64 {
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct Stat {
+    pub file_type: u64,
+    pub size: u64,
+    pub mtime: u64,
+}
+
+/// Fill a Stat struct for the given file descriptor. Returns false for invalid FD.
+pub fn fstat(table: &FdTable, fd: u64, stat: &mut Stat) -> bool {
     match table.get(fd) {
-        Some(Descriptor::File(file)) => (1u64 << 32) | file.data.len() as u64,
-        Some(Descriptor::PipeRead(_) | Descriptor::PipeWrite(_)) => 2u64 << 32,
-        Some(Descriptor::Keyboard) => 3u64 << 32,
-        Some(Descriptor::Mouse) => 7u64 << 32,
-        Some(Descriptor::SerialConsole) => 4u64 << 32,
-        Some(Descriptor::Framebuffer(_)) => 5u64 << 32,
-        Some(Descriptor::TtyRead(_) | Descriptor::TtyWrite(_)) => 6u64 << 32,
-        None => 0,
+        Some(Descriptor::File(file)) => {
+            stat.file_type = 1;
+            stat.size = file.data.len() as u64;
+            stat.mtime = file.mtime;
+            true
+        }
+        Some(Descriptor::PipeRead(_) | Descriptor::PipeWrite(_)) => { stat.file_type = 2; true }
+        Some(Descriptor::Keyboard) => { stat.file_type = 3; true }
+        Some(Descriptor::Mouse) => { stat.file_type = 7; true }
+        Some(Descriptor::SerialConsole) => { stat.file_type = 4; true }
+        Some(Descriptor::Framebuffer(_)) => { stat.file_type = 5; true }
+        Some(Descriptor::TtyRead(_) | Descriptor::TtyWrite(_)) => { stat.file_type = 6; true }
+        None => false,
     }
 }
 
@@ -244,7 +262,7 @@ pub fn fsync(table: &mut FdTable, vfs: &mut Vfs, fd: u64) -> u64 {
         return u64::MAX;
     };
     if file.modified && file.writable {
-        if !vfs.write_file(&file.path, &file.data) {
+        if !vfs.write_file(&file.path, &file.data, file.mtime) {
             return u64::MAX;
         }
         file.modified = false;
@@ -257,7 +275,7 @@ pub fn close_all(table: &mut FdTable, vfs: &mut Vfs, pid: u32) {
         match &desc {
             Descriptor::File(file) => {
                 if file.modified && file.writable {
-                    if !vfs.write_file(&file.path, &file.data) {
+                    if !vfs.write_file(&file.path, &file.data, file.mtime) {
                         log!("warning: VFS write failed on process exit: {}", file.path);
                     }
                 }

@@ -35,7 +35,8 @@ pub trait FileSystem {
     fn list(&mut self) -> Vec<(String, u64)>;
     fn read_file(&mut self, name: &str) -> Result<Cow<'static, [u8]>, &'static str>;
     fn read_link(&mut self, name: &str) -> Option<String>;
-    fn create(&mut self, name: &str, data: &[u8]) -> bool;
+    fn file_mtime(&mut self, name: &str) -> u64;
+    fn create(&mut self, name: &str, data: &[u8], mtime: u64) -> bool;
     fn delete(&mut self, name: &str) -> bool;
 }
 
@@ -52,8 +53,11 @@ impl<D: tyfs::Disk> FileSystem for tyfs::SimpleFs<D> {
     fn read_link(&mut self, name: &str) -> Option<String> {
         tyfs::SimpleFs::read_link(self, name)
     }
-    fn create(&mut self, name: &str, data: &[u8]) -> bool {
-        tyfs::SimpleFs::create(self, name, data)
+    fn file_mtime(&mut self, name: &str) -> u64 {
+        tyfs::SimpleFs::file_mtime(self, name).unwrap_or(0)
+    }
+    fn create(&mut self, name: &str, data: &[u8], mtime: u64) -> bool {
+        tyfs::SimpleFs::create(self, name, data, mtime)
     }
     fn delete(&mut self, name: &str) -> bool {
         tyfs::SimpleFs::delete(self, name)
@@ -239,16 +243,28 @@ impl Vfs {
         fs.read_file(&file)
     }
 
-    pub fn write_file(&mut self, path: &str, data: &[u8]) -> bool {
+    pub fn write_file(&mut self, path: &str, data: &[u8], mtime: u64) -> bool {
         let (mount, file) = self.resolve_path("/", path);
         if file.is_empty() {
             return false;
         }
         if let Some(fs) = self.mounts.get_mut(&mount) {
             fs.delete(&file);
-            fs.create(&file, data)
+            fs.create(&file, data, mtime)
         } else {
             false
+        }
+    }
+
+    pub fn file_mtime(&mut self, path: &str) -> u64 {
+        let (mount, file) = self.resolve_path("/", path);
+        if file.is_empty() {
+            return 0;
+        }
+        if let Some(fs) = self.mounts.get_mut(&mount) {
+            fs.file_mtime(&file)
+        } else {
+            0
         }
     }
 
@@ -259,8 +275,9 @@ impl Vfs {
         if old_mount != new_mount { return false; }
         let Some(fs) = self.mounts.get_mut(&old_mount) else { return false };
         let Ok(data) = fs.read_file(&old_file) else { return false };
+        let mtime = fs.file_mtime(&old_file);
         fs.delete(&new_file);
-        if !fs.create(&new_file, &data) { return false; }
+        if !fs.create(&new_file, &data, mtime) { return false; }
         fs.delete(&old_file);
         true
     }

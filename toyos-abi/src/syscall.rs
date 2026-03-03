@@ -179,9 +179,21 @@ pub fn seek(fd: u64, offset: i64, whence: u64) -> u64 {
     syscall(SYS_SEEK, fd, offset as u64, whence, 0)
 }
 
-/// Get file size for a file descriptor.
-pub fn fstat(fd: u64) -> u64 {
-    syscall(SYS_FSTAT, fd, 0, 0, 0)
+/// File metadata returned by [`fstat`].
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Stat {
+    /// File type: 1=file, 2=pipe, 3=keyboard, 4=serial, 5=framebuffer, 6=tty, 7=mouse.
+    pub file_type: u64,
+    /// File size in bytes.
+    pub size: u64,
+    /// Last modification time (nanoseconds since boot).
+    pub mtime: u64,
+}
+
+/// Get file metadata for a file descriptor. Returns 0 on success, u64::MAX on failure.
+pub fn fstat(fd: u64, stat: &mut Stat) -> u64 {
+    syscall(SYS_FSTAT, fd, stat as *mut Stat as u64, 0, 0)
 }
 
 /// Flush file descriptor to disk.

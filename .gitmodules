@@ -20,3 +20,9 @@
 [submodule "userland/target-lexicon"]
 	path = userland/target-lexicon
 	url = https://github.com/Japabu/target-lexicon.git
+[submodule "userland/filetime"]
+	path = userland/filetime
+	url = https://github.com/Japabu/filetime
+[submodule "userland/tar"]
+	path = userland/tar
+	url = https://github.com/Japabu/tar-rs
