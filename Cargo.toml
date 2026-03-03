@@ -32,7 +32,7 @@ features = ["Win32_Foundation"]
 version = "1"
 
 [target.'cfg(target_os = "toyos")'.dependencies.toyos-abi]
-path = "../../rust/library/toyos-abi"
+path = "../../toyos-abi"
 
 [dev-dependencies]
 libc = "0.2"
