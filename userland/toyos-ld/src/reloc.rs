@@ -309,6 +309,194 @@ pub(crate) fn apply_relocs(
     Ok(RelocOutput { relatives, glob_dats })
 }
 
+// ── AArch64 relocation helpers ───────────────────────────────────────────
+
+/// Apply a single AArch64 relocation. Returns `true` if it produced an absolute
+/// reference that needs a Mach-O rebase entry.
+fn apply_one_reloc_aarch64(
+    state: &mut LinkState,
+    reloc: &InputReloc,
+    sym_addr: u64,
+    reloc_vaddr: u64,
+    got: &HashMap<String, u64>,
+) -> Result<bool, LinkError> {
+    match reloc.r_type {
+        // Absolute 64-bit pointer
+        elf::R_AARCH64_ABS64 => {
+            let value = (sym_addr as i64 + reloc.addend) as u64;
+            write_u64(state, reloc.section_global_idx, reloc.offset, value);
+            Ok(true) // needs rebase
+        }
+        // BL/B instruction: 26-bit PC-relative
+        elf::R_AARCH64_CALL26 => {
+            let value = sym_addr as i64 + reloc.addend - reloc_vaddr as i64;
+            // Must be 4-byte aligned and fit in 26-bit signed * 4
+            let imm26 = value >> 2;
+            if imm26 < -(1 << 25) || imm26 >= (1 << 25) {
+                return Err(LinkError::RelocationOverflow {
+                    reloc_type: reloc.r_type, symbol: reloc.symbol_name.clone(), value,
+                });
+            }
+            patch_aarch64_insn_imm26(state, reloc.section_global_idx, reloc.offset, imm26 as u32);
+            Ok(false)
+        }
+        // ADRP: 21-bit page-relative
+        elf::R_AARCH64_ADR_PREL_PG_HI21 => {
+            let sym_page = (sym_addr as i64 + reloc.addend) & !0xFFF;
+            let pc_page = reloc_vaddr as i64 & !0xFFF;
+            let page_delta = (sym_page - pc_page) >> 12;
+            if page_delta < -(1 << 20) || page_delta >= (1 << 20) {
+                return Err(LinkError::RelocationOverflow {
+                    reloc_type: reloc.r_type, symbol: reloc.symbol_name.clone(), value: page_delta,
+                });
+            }
+            patch_aarch64_adrp(state, reloc.section_global_idx, reloc.offset, page_delta as i32);
+            Ok(false)
+        }
+        // ADD immediate: 12-bit page offset
+        elf::R_AARCH64_ADD_ABS_LO12_NC => {
+            let value = ((sym_addr as i64 + reloc.addend) & 0xFFF) as u32;
+            patch_aarch64_add_imm12(state, reloc.section_global_idx, reloc.offset, value);
+            Ok(false)
+        }
+        // LDR 64-bit: 12-bit page offset (scaled by 8)
+        elf::R_AARCH64_LDST64_ABS_LO12_NC => {
+            let value = ((sym_addr as i64 + reloc.addend) & 0xFFF) as u32;
+            patch_aarch64_ldr_imm12(state, reloc.section_global_idx, reloc.offset, value, 3);
+            Ok(false)
+        }
+        // ADRP for GOT entry page
+        elf::R_AARCH64_ADR_GOT_PAGE => {
+            let got_slot = *got.get(&reloc.symbol_name).ok_or_else(|| {
+                LinkError::UndefinedSymbols(vec![reloc.symbol_name.clone()])
+            })?;
+            let sym_page = got_slot as i64 & !0xFFF;
+            let pc_page = reloc_vaddr as i64 & !0xFFF;
+            let page_delta = (sym_page - pc_page) >> 12;
+            patch_aarch64_adrp(state, reloc.section_global_idx, reloc.offset, page_delta as i32);
+            Ok(false)
+        }
+        // LDR for GOT entry page offset
+        elf::R_AARCH64_LD64_GOT_LO12_NC => {
+            let got_slot = *got.get(&reloc.symbol_name).ok_or_else(|| {
+                LinkError::UndefinedSymbols(vec![reloc.symbol_name.clone()])
+            })?;
+            let value = (got_slot & 0xFFF) as u32;
+            patch_aarch64_ldr_imm12(state, reloc.section_global_idx, reloc.offset, value, 3);
+            Ok(false)
+        }
+        other => Err(LinkError::UnsupportedRelocation {
+            reloc_type: other, symbol: reloc.symbol_name.clone(),
+        }),
+    }
+}
+
+/// Patch ADRP instruction's immhi:immlo fields with a page delta.
+fn patch_aarch64_adrp(state: &mut LinkState, sec_idx: usize, offset: u64, page_delta: i32) {
+    let data = &mut state.sections[sec_idx].data;
+    let off = offset as usize;
+    let mut insn = u32::from_le_bytes(data[off..off + 4].try_into().unwrap());
+    let val = page_delta as u32;
+    insn = (insn & 0x9F00_001F)
+        | ((val & 0x3) << 29)       // immlo in bits [30:29]
+        | (((val >> 2) & 0x7FFFF) << 5); // immhi in bits [23:5]
+    data[off..off + 4].copy_from_slice(&insn.to_le_bytes());
+}
+
+/// Patch BL/B instruction's imm26 field.
+fn patch_aarch64_insn_imm26(state: &mut LinkState, sec_idx: usize, offset: u64, imm26: u32) {
+    let data = &mut state.sections[sec_idx].data;
+    let off = offset as usize;
+    let mut insn = u32::from_le_bytes(data[off..off + 4].try_into().unwrap());
+    insn = (insn & 0xFC00_0000) | (imm26 & 0x03FF_FFFF);
+    data[off..off + 4].copy_from_slice(&insn.to_le_bytes());
+}
+
+/// Patch ADD instruction's imm12 field (bits [21:10]).
+fn patch_aarch64_add_imm12(state: &mut LinkState, sec_idx: usize, offset: u64, value: u32) {
+    let data = &mut state.sections[sec_idx].data;
+    let off = offset as usize;
+    let mut insn = u32::from_le_bytes(data[off..off + 4].try_into().unwrap());
+    insn = (insn & !(0xFFF << 10)) | ((value & 0xFFF) << 10);
+    data[off..off + 4].copy_from_slice(&insn.to_le_bytes());
+}
+
+/// Patch LDR/STR instruction's scaled imm12 field (bits [21:10]).
+/// `scale` is the log2 of the access size (0=byte, 1=half, 2=word, 3=dword).
+fn patch_aarch64_ldr_imm12(state: &mut LinkState, sec_idx: usize, offset: u64, value: u32, scale: u32) {
+    let data = &mut state.sections[sec_idx].data;
+    let off = offset as usize;
+    let mut insn = u32::from_le_bytes(data[off..off + 4].try_into().unwrap());
+    let scaled = (value >> scale) & 0xFFF;
+    insn = (insn & !(0xFFF << 10)) | (scaled << 10);
+    data[off..off + 4].copy_from_slice(&insn.to_le_bytes());
+}
+
+/// Parameters for Mach-O relocation application.
+pub(crate) struct MachORelocParams<'a> {
+    pub(crate) got: &'a HashMap<String, u64>,
+}
+
+/// Apply relocations for Mach-O output. Returns rebase entries (internal absolute
+/// pointers) and bind entries (external GOT slots).
+pub(crate) fn apply_relocs_macho(
+    state: &mut LinkState,
+    params: &MachORelocParams,
+) -> Result<MachORelocOutput, LinkError> {
+    let mut rebase_entries = Vec::new();
+    let mut undefined = std::collections::HashSet::new();
+
+    let relocs = std::mem::take(&mut state.relocs);
+
+    for reloc in &relocs {
+        let sec = &state.sections[reloc.section_global_idx];
+        let reloc_vaddr = sec.vaddr + reloc.offset;
+
+        let sym_addr = match resolve_symbol(state, &reloc.symbol_name, reloc.section_global_idx, None) {
+            Some(a) => a,
+            None => {
+                // For GOT relocations, the symbol might be external — the GOT
+                // slot address is what matters, not the symbol address.
+                if matches!(reloc.r_type, elf::R_AARCH64_ADR_GOT_PAGE | elf::R_AARCH64_LD64_GOT_LO12_NC)
+                    && params.got.contains_key(&reloc.symbol_name)
+                {
+                    0 // sym_addr unused for GOT relocs
+                } else {
+                    undefined.insert(reloc.symbol_name.clone());
+                    continue;
+                }
+            }
+        };
+
+        // Dispatch by architecture
+        if reloc.r_type >= 257 {
+            // AArch64 range
+            let is_abs = apply_one_reloc_aarch64(state, reloc, sym_addr, reloc_vaddr, params.got)?;
+            if is_abs {
+                rebase_entries.push((reloc_vaddr, sym_addr as i64 + reloc.addend));
+            }
+        } else {
+            // x86-64 range
+            let is_abs = apply_one_reloc(state, reloc, sym_addr, reloc_vaddr, params.got)?;
+            if is_abs {
+                rebase_entries.push((reloc_vaddr, sym_addr as i64 + reloc.addend));
+            }
+        }
+    }
+
+    if !undefined.is_empty() {
+        let mut syms: Vec<String> = undefined.into_iter().collect();
+        syms.sort();
+        return Err(LinkError::UndefinedSymbols(syms));
+    }
+
+    Ok(MachORelocOutput { rebase_entries })
+}
+
+pub(crate) struct MachORelocOutput {
+    pub(crate) rebase_entries: Vec<(u64, i64)>,
+}
+
 pub(crate) fn apply_relocs_pe(
     state: &mut LinkState,
     layout: &PeLayout,

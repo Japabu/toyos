@@ -1,5 +1,6 @@
 use object::elf;
 use object::pe;
+use object::macho;
 use object::read::elf::ElfFile64;
 use object::read::{self, Object, ObjectSection, ObjectSymbol};
 use object::RelocationFlags;
@@ -148,9 +149,10 @@ fn resolve_reloc_target(
         };
         let &gsec = sec_map.get(&(obj_idx, si))?;
         let syn = format!("__section_sym_{}_{}", obj_idx, gsec);
+        let sec_addr = obj.section_by_index(si).map(|s| s.address()).unwrap_or(0);
         state.locals.entry((obj_idx, syn.clone())).or_insert(SymbolDef {
             section_global_idx: gsec,
-            value: sym.address(),
+            value: sym.address() - sec_addr,
         });
         Some(syn)
     } else {
@@ -271,9 +273,10 @@ fn collect_object(
             Some(&g) => g,
             None => continue,
         };
+        let sec_addr = obj.section_by_index(sec_idx).map(|s| s.address()).unwrap_or(0);
         let def = SymbolDef {
             section_global_idx: global_sec,
-            value: symbol.address(),
+            value: symbol.address() - sec_addr,
         };
         if symbol.is_global() {
             // COFF weak externals: `.weak.FOO.default` (LLVM) or `.weak.FOO` (object crate)
@@ -327,20 +330,27 @@ fn collect_object(
                 Some(name) => name,
                 None => continue,
             };
-            let r_type = match reloc.flags() {
-                RelocationFlags::Elf { r_type } => r_type,
+            let (r_type, is_macho_instruction) = match reloc.flags() {
+                RelocationFlags::Elf { r_type } => (r_type, false),
                 RelocationFlags::Coff { typ } => match coff_to_elf_r_type(typ) {
-                    Some(r) => r,
+                    Some(r) => (r, false),
                     None => continue,
                 },
+                RelocationFlags::MachO { r_type, r_length, .. } => {
+                    match macho_arm64_to_elf_r_type(r_type, r_length) {
+                        Some(r) => (r, macho_arm64_is_instruction_reloc(r_type)),
+                        None => continue,
+                    }
+                }
                 _ => continue,
             };
 
-            // COFF uses implicit addends stored in the section data, while ELF RELA
-            // uses explicit addends. The `object` crate returns the COFF-specific
-            // base adjustment (e.g. -4 for REL32) but sets `has_implicit_addend`,
-            // meaning we must also read the value from the section data and add it.
-            let addend = if reloc.has_implicit_addend() {
+            // COFF and Mach-O data relocations use implicit addends stored in
+            // section data. Mach-O instruction relocations (ADRP, LDR, BL) encode
+            // the immediate in instruction bits — don't read raw bytes as addend.
+            let addend = if is_macho_instruction {
+                0
+            } else if reloc.has_implicit_addend() {
                 let data = &state.sections[global_sec].data;
                 let off = offset as usize;
                 let implicit = match reloc.size() {
@@ -380,6 +390,25 @@ fn coff_to_elf_r_type(typ: u16) -> Option<u32> {
         pe::IMAGE_REL_AMD64_SECREL => elf::R_X86_64_32,
         _ => return None,
     })
+}
+
+/// Map Mach-O arm64 relocation types to ELF aarch64 equivalents.
+fn macho_arm64_to_elf_r_type(r_type: u8, r_length: u8) -> Option<u32> {
+    Some(match r_type {
+        macho::ARM64_RELOC_UNSIGNED if r_length == 3 => elf::R_AARCH64_ABS64,
+        macho::ARM64_RELOC_BRANCH26 => elf::R_AARCH64_CALL26,
+        macho::ARM64_RELOC_PAGE21 => elf::R_AARCH64_ADR_PREL_PG_HI21,
+        macho::ARM64_RELOC_PAGEOFF12 => elf::R_AARCH64_ADD_ABS_LO12_NC,
+        macho::ARM64_RELOC_GOT_LOAD_PAGE21 => elf::R_AARCH64_ADR_GOT_PAGE,
+        macho::ARM64_RELOC_GOT_LOAD_PAGEOFF12 => elf::R_AARCH64_LD64_GOT_LO12_NC,
+        _ => return None,
+    })
+}
+
+/// Returns true if this Mach-O arm64 relocation type encodes its value inside
+/// an instruction (as opposed to a raw data pointer).
+fn macho_arm64_is_instruction_reloc(r_type: u8) -> bool {
+    !matches!(r_type, macho::ARM64_RELOC_UNSIGNED | macho::ARM64_RELOC_SUBTRACTOR)
 }
 
 pub(crate) fn is_archive(data: &[u8]) -> bool {

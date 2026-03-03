@@ -594,8 +594,7 @@ impl<'a> Lexer<'a> {
 
                 Some(c) => {
                     self.advance();
-                    eprintln!("warning: unexpected character '{}' (0x{:02x})", c as char, c);
-                    continue;
+                    panic!("warning: unexpected character '{}' (0x{:02x})", c as char, c);
                 }
             };
             tokens.push(Token { kind, loc });

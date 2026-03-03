@@ -48,8 +48,7 @@ fn run() {
 
     for input in &args.inputs {
         let source = fs::read_to_string(input).unwrap_or_else(|e| {
-            eprintln!("toyos-cc: cannot read {}: {e}", input.display());
-            process::exit(1);
+            panic!("toyos-cc: cannot read {}: {e}", input.display());
         });
 
         if !args.preprocess_only {
@@ -91,42 +90,15 @@ fn run() {
         let output_path = if args.compile_only {
             args.output.clone().unwrap_or_else(|| input.with_extension("o"))
         } else {
-            args.output.clone().unwrap_or_else(|| PathBuf::from("a.out"))
+            panic!("linking not supported");
         };
 
         if args.compile_only {
             fs::write(&output_path, &object_bytes).unwrap_or_else(|e| {
-                eprintln!("toyos-cc: cannot write {}: {e}", output_path.display());
-                process::exit(1);
+                panic!("toyos-cc: cannot write {}: {e}", output_path.display());
             });
         } else {
-            let tmp_obj = input.with_extension("o");
-            fs::write(&tmp_obj, &object_bytes).unwrap_or_else(|e| {
-                eprintln!("toyos-cc: cannot write {}: {e}", tmp_obj.display());
-                process::exit(1);
-            });
-
-            let is_toyos = args.target.as_deref().map_or(false, |t| t.contains("toyos"));
-            let mut cmd = if is_toyos {
-                let mut c = process::Command::new("toyos-ld");
-                c.arg("-o").arg(&output_path).arg(&tmp_obj);
-                c
-            } else {
-                let mut c = process::Command::new("cc");
-                c.arg("-o").arg(&output_path).arg(&tmp_obj);
-                c
-            };
-            let status = cmd.status().unwrap_or_else(|e| {
-                eprintln!("toyos-cc: cannot run linker: {e}");
-                process::exit(1);
-            });
-
-            let _ = fs::remove_file(&tmp_obj);
-
-            if !status.success() {
-                eprintln!("toyos-cc: linker failed");
-                process::exit(1);
-            }
+            panic!("linking not supported");
         }
     }
 }
@@ -193,6 +165,7 @@ fn parse_args() -> Args {
             s if s.starts_with("-l") || s.starts_with("-L") => {} // linker flags
             s if s.starts_with('-') => {
                 eprintln!("toyos-cc: warning: unknown flag: {s}");
+                process::exit(1);
             }
             path => inputs.push(PathBuf::from(path)),
         }

@@ -7,15 +7,17 @@ mod collect;
 mod reloc;
 mod emit_elf;
 mod emit_pe;
+mod emit_macho;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::fs;
 
 use collect::{collect, synthesize_alloc_shims, gc_sections, merge_string_sections, is_archive, extract_archive, find_lib, scan_symbols};
-use reloc::{ElfRelocParams, apply_relocs, apply_relocs_pe};
+use reloc::{ElfRelocParams, apply_relocs, apply_relocs_pe, MachORelocParams, apply_relocs_macho};
 use emit_elf::{layout_elf, build_eh_frame_hdr, emit_bytes, emit_static_bytes, emit_shared_bytes};
 use emit_pe::{layout_pe, emit_pe_bytes};
+use emit_macho::{layout_macho, emit_macho_bytes};
 
 pub(crate) const BASE_VADDR: u64 = 0;
 pub(crate) const PAGE_SIZE: u64 = 0x1000;
@@ -278,6 +280,61 @@ pub fn link_shared_full(objects: &[(String, Vec<u8>)], build_id: bool) -> Result
     let reloc_output = apply_relocs(&mut state, &params)?;
     let eh_hdr = build_eh_frame_hdr(&state, &layout);
     Ok(emit_shared_bytes(&state, &layout, &reloc_output, &eh_hdr))
+}
+
+/// Link object files and produce a Mach-O executable for macOS.
+/// Undefined symbols are resolved against /usr/lib/libSystem.B.dylib at runtime.
+pub fn link_macho(
+    objects: &[(String, Vec<u8>)],
+    entry: &str,
+    gc: bool,
+) -> Result<Vec<u8>, LinkError> {
+    let mut state = collect(objects)?;
+    synthesize_alloc_shims(&mut state);
+    merge_string_sections(&mut state);
+
+    // Mark any truly undefined symbols as dynamic (dylib) imports
+    {
+        use std::collections::HashSet;
+        let referenced: HashSet<String> = state.relocs.iter()
+            .map(|r| r.symbol_name.clone())
+            .collect();
+        let undefined: Vec<String> = referenced.into_iter()
+            .filter(|sym| {
+                !state.globals.contains_key(sym)
+                    && !state.locals.keys().any(|(_, n)| n == sym)
+            })
+            .collect();
+        for sym in undefined {
+            state.globals.insert(sym, collect::SymbolDef {
+                section_global_idx: collect::DYNAMIC_SYMBOL_SENTINEL,
+                value: 0,
+            });
+        }
+    }
+
+    if gc { gc_sections(&mut state, entry); }
+    let layout = layout_macho(&mut state, entry);
+
+    // Apply relocations
+    let params = MachORelocParams { got: &layout.got };
+    let reloc_output = apply_relocs_macho(&mut state, &params)?;
+
+    // Build bind entries for external GOT slots
+    let bind_entries: Vec<(String, u64)> = layout.got_entries.iter()
+        .filter(|(_, ext)| *ext)
+        .map(|(name, _)| (name.clone(), layout.got[name]))
+        .collect();
+
+    // Rebase entries: internal absolute pointers + internal GOT entries
+    let mut rebase_entries = reloc_output.rebase_entries;
+    for (name, ext) in &layout.got_entries {
+        if !ext {
+            rebase_entries.push((layout.got[name], 0)); // value already written
+        }
+    }
+
+    emit_macho_bytes(&state, &layout, entry, &rebase_entries, &bind_entries)
 }
 
 // ── Shared helpers ──────────────────────────────────────────────────────

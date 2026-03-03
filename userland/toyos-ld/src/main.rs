@@ -21,6 +21,8 @@ fn main() {
         toyos_ld::link_shared_full(&objects, args.build_id)
     } else if args.pe {
         toyos_ld::link_pe_with(&objects, &args.entry, args.subsystem, args.gc_sections)
+    } else if args.macho {
+        toyos_ld::link_macho(&objects, &args.entry, args.gc_sections)
     } else if args.is_static {
         toyos_ld::link_static_full(&objects, &args.entry, args.image_base, args.gc_sections, args.build_id)
     } else {
@@ -98,6 +100,7 @@ struct Args {
     shared: bool,
     is_static: bool,
     pe: bool,
+    macho: bool,
     gc_sections: bool,
     build_id: bool,
     image_base: u64,
@@ -115,6 +118,7 @@ fn parse_args() -> Args {
     let mut shared = false;
     let mut is_static = false;
     let mut pe = false;
+    let mut macho = false;
     let mut gc_sections = false;
     let mut build_id = false;
     let mut map_file: Option<PathBuf> = None;
@@ -135,6 +139,7 @@ fn parse_args() -> Args {
             "--shared" | "-shared" => { shared = true; }
             "--static" => { is_static = true; }
             "--pe" => { pe = true; }
+            "--macho" => { macho = true; }
             s if s.starts_with("--subsystem=") => {
                 subsystem = s["--subsystem=".len()..].parse().unwrap_or_else(|_| {
                     eprintln!("toyos-ld: invalid --subsystem value: {}", &s["--subsystem=".len()..]);
@@ -199,5 +204,5 @@ fn parse_args() -> Args {
         i += 1;
     }
 
-    Args { output, entry, shared, is_static, pe, gc_sections, build_id, map_file, image_base, subsystem, inputs, lib_paths, libs }
+    Args { output, entry, shared, is_static, pe, macho, gc_sections, build_id, map_file, image_base, subsystem, inputs, lib_paths, libs }
 }

@@ -514,8 +514,7 @@ impl Preprocessor {
             }
             self.process_source(&content, &resolved, idx);
         } else if is_system {
-            // Missing system headers — warn but don't fail
-            eprintln!("warning: cannot find system include file: {}", path_str);
+            panic!("warning: cannot find system include file: {}", path_str);
         } else {
             panic!("cannot find include file: {}", path_str);
         }
@@ -534,8 +533,7 @@ impl Preprocessor {
             let end = arg[1..].find('>').unwrap_or(arg.len() - 1);
             (&arg[1..1 + end], true)
         } else {
-            eprintln!("warning: cannot parse #include_next {}", arg);
-            return;
+            panic!("warning: cannot parse #include_next {}", arg);
         };
 
         if let Some((content, resolved, idx)) = self.find_and_read_next(path_str, start_idx) {
@@ -544,7 +542,7 @@ impl Preprocessor {
             }
             self.process_source(&content, &resolved, idx);
         } else if is_system {
-            eprintln!("warning: cannot find #include_next file: {}", path_str);
+            panic!("warning: cannot find #include_next file: {}", path_str);
         } else {
             panic!("cannot find #include_next file: {}", path_str);
         }
@@ -663,7 +661,7 @@ impl Preprocessor {
         };
         if !same {
             let (file, line) = self.file_stack.last().map(|(f, l, _)| (f.as_str(), *l)).unwrap_or(("", 0));
-            eprintln!("{}:{}: warning: {} redefined", file, line, name);
+            panic!("{}:{}: warning: {} redefined", file, line, name);
         }
     }
 
