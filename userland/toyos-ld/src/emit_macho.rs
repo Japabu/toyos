@@ -13,6 +13,8 @@ use zerocopy::big_endian::{U32 as U32Be, U64 as U64Be};
 const MH_MAGIC_64: u32 = 0xFEEDFACF;
 const CPU_TYPE_ARM64: u32 = 0x0100000C;
 const CPU_SUBTYPE_ARM64_ALL: u32 = 0;
+const CPU_TYPE_X86_64: u32 = 0x01000007;
+const CPU_SUBTYPE_X86_64_ALL: u32 = 3;
 const MH_EXECUTE: u32 = 2;
 const MH_PIE: u32 = 0x0020_0000;
 const MH_TWOLEVEL: u32 = 0x80;
@@ -62,7 +64,8 @@ const PLATFORM_MACOS: u32 = 1;
 const TOOL_LD: u32 = 3;
 const MACOS_14_0: u32 = 0x000E0000;
 
-const PAGE_SIZE: u64 = 0x4000; // 16KB for arm64
+const PAGE_SIZE_ARM64: u64 = 0x4000; // 16KB
+const PAGE_SIZE_X86_64: u64 = 0x1000; // 4KB
 const PAGEZERO_SIZE: u64 = 0x1_0000_0000; // 4GB
 
 const SEGMENT_CMD_SIZE: u32 = size_of::<SegmentCommand64>() as u32;
@@ -353,17 +356,45 @@ pub(crate) struct MachOLayout {
 
     pub(crate) sizeofcmds: u32,
     pub(crate) ncmds: u32,
+    pub(crate) is_x86_64: bool,
+    pub(crate) page_size: u64,
 }
 
 /// Compute the Mach-O layout: segment placement, GOT allocation.
-pub(crate) fn layout_macho(state: &mut LinkState, _entry: &str) -> MachOLayout {
+pub(crate) fn layout_macho(state: &mut LinkState) -> MachOLayout {
+    // Detect architecture from relocation types present
+    let is_x86_64 = state.relocs.iter().any(|r| matches!(r.r_type,
+        RelocType::X86_64 | RelocType::X86Pc32 | RelocType::X86Plt32
+        | RelocType::X86Gotpcrel | RelocType::X86Gotpcrelx
+        | RelocType::X86RexGotpcrelx | RelocType::X86_32 | RelocType::X86_32S));
+    let page_size = if is_x86_64 { PAGE_SIZE_X86_64 } else { PAGE_SIZE_ARM64 };
     let buckets = classify_sections(state);
 
     let got_symbols = collect_unique_symbols(state.relocs.iter(), |r| {
-        matches!(r.r_type,
+        // Standard GOT relocation types
+        if matches!(r.r_type,
             RelocType::Aarch64AdrGotPage | RelocType::Aarch64Ld64GotLo12Nc
             | RelocType::X86Gotpcrel | RelocType::X86Gotpcrelx
             | RelocType::X86RexGotpcrelx)
+        {
+            return true;
+        }
+        // MOVW relocations targeting dynamic symbols need GOT slots so we can
+        // rewrite MOVZ/MOVK → ADRP+LDR at relocation time.
+        if matches!(r.r_type,
+            RelocType::Aarch64MovwUabsG0Nc | RelocType::Aarch64MovwUabsG1Nc
+            | RelocType::Aarch64MovwUabsG2Nc | RelocType::Aarch64MovwUabsG3)
+        {
+            let is_dynamic = match &r.target {
+                SymbolRef::Global(name) => matches!(
+                    state.globals.get(name),
+                    Some(SymbolDef::Dynamic) | None
+                ),
+                _ => false,
+            };
+            return is_dynamic;
+        }
+        false
     });
 
     let has_const = buckets.rx.iter().any(|&i| state.sections[i].kind == SectionKind::ReadOnly);
@@ -375,7 +406,6 @@ pub(crate) fn layout_macho(state: &mut LinkState, _entry: &str) -> MachOLayout {
     let data_nsects = (if has_data { 1 } else { 0 })
         + (if has_got { 1 } else { 0 })
         + (if has_bss { 1 } else { 0 });
-    let data_nsects = data_nsects.max(if has_got { 1 } else { 0 });
 
     let dylib_name = "/usr/lib/libSystem.B.dylib\0";
     let dylib_cmd_size = align_up((size_of::<DylibCmd>() + dylib_name.len()) as u64, 8) as u32;
@@ -430,7 +460,7 @@ pub(crate) fn layout_macho(state: &mut LinkState, _entry: &str) -> MachOLayout {
     }
     let const_sec_size = cursor - const_sec_vmaddr;
 
-    let text_vmsize = align_up(cursor - text_vmaddr, PAGE_SIZE);
+    let text_vmsize = align_up(cursor - text_vmaddr, page_size);
     let text_filesize = text_vmsize;
 
     let data_vmaddr = text_vmaddr + text_vmsize;
@@ -488,10 +518,10 @@ pub(crate) fn layout_macho(state: &mut LinkState, _entry: &str) -> MachOLayout {
     };
     let data_filesize = data_filesz;
     let data_memsz = bss_cursor - data_vmaddr;
-    let data_vmsize = align_up(data_memsz, PAGE_SIZE);
+    let data_vmsize = align_up(data_memsz, page_size);
 
     let linkedit_vmaddr = data_vmaddr + data_vmsize;
-    let linkedit_fileoff = data_fileoff + align_up(data_filesize, PAGE_SIZE);
+    let linkedit_fileoff = data_fileoff + align_up(data_filesize, page_size);
 
     let actual_data_nsects = (if data_sec_size > 0 { 1 } else { 0 })
         + (if got_sec_size > 0 { 1 } else { 0 })
@@ -550,6 +580,8 @@ pub(crate) fn layout_macho(state: &mut LinkState, _entry: &str) -> MachOLayout {
         got_entries,
         sizeofcmds,
         ncmds,
+        is_x86_64,
+        page_size,
     }
 }
 
@@ -622,7 +654,7 @@ pub(crate) fn emit_macho_bytes(
     linkedit_cursor += codesig_size_aligned as u64;
 
     let linkedit_filesize = linkedit_cursor - layout.linkedit_fileoff;
-    let linkedit_vmsize = align_up(linkedit_filesize, PAGE_SIZE);
+    let linkedit_vmsize = align_up(linkedit_filesize, layout.page_size);
 
     // Build the output buffer
     let total_size = linkedit_cursor as usize;
@@ -631,8 +663,8 @@ pub(crate) fn emit_macho_bytes(
     // ── Mach-O header ──
     let mut off = write_struct(&mut buf, 0, &MachHeader64 {
         magic: U32Le::new(MH_MAGIC_64),
-        cputype: U32Le::new(CPU_TYPE_ARM64),
-        cpusubtype: U32Le::new(CPU_SUBTYPE_ARM64_ALL),
+        cputype: U32Le::new(if layout.is_x86_64 { CPU_TYPE_X86_64 } else { CPU_TYPE_ARM64 }),
+        cpusubtype: U32Le::new(if layout.is_x86_64 { CPU_SUBTYPE_X86_64_ALL } else { CPU_SUBTYPE_ARM64_ALL }),
         filetype: U32Le::new(MH_EXECUTE),
         ncmds: U32Le::new(layout.ncmds),
         sizeofcmds: U32Le::new(layout.sizeofcmds),
@@ -680,7 +712,7 @@ pub(crate) fn emit_macho_bytes(
         addr: U64Le::new(layout.text_sec_vmaddr),
         size: U64Le::new(layout.text_sec_size),
         offset: U32Le::new(layout.text_sec_offset as u32),
-        align: U32Le::new(2), // 2^2 = 4
+        align: U32Le::new(if layout.is_x86_64 { 4 } else { 2 }), // 2^4=16 or 2^2=4
         reloff: U32Le::new(0),
         nreloc: U32Le::new(0),
         flags: U32Le::new(S_REGULAR | S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS),
@@ -927,9 +959,7 @@ pub(crate) fn emit_macho_bytes(
             && vaddr < layout.data_sec_vmaddr + layout.data_sec_size
         {
             let off = (layout.data_fileoff + (vaddr - layout.data_vmaddr)) as usize;
-            if off + sec.data.len() <= buf.len() {
-                buf[off..off + sec.data.len()].copy_from_slice(&sec.data);
-            }
+            buf[off..off + sec.data.len()].copy_from_slice(&sec.data);
         }
     }
 
@@ -959,6 +989,12 @@ pub(crate) fn emit_macho_bytes(
 }
 
 // ── Rebase opcodes ──────────────────────────────────────────────────────
+
+/// Mach-O C symbol names have a leading `_` prefix. ELF names don't.
+/// Prepend `_` unless the name already starts with `_` (from Mach-O input).
+fn macho_mangle(name: &str) -> String {
+    format!("_{name}")
+}
 
 fn build_rebase_opcodes(layout: &MachOLayout, entries: &[(u64, i64)]) -> Vec<u8> {
     let mut ops = Vec::new();
@@ -1018,11 +1054,12 @@ fn build_bind_opcodes(layout: &MachOLayout, entries: &[(String, u64)]) -> Vec<u8
     }
 
     for (sym_name, got_vaddr) in entries {
+        let macho_name = macho_mangle(sym_name);
         // Set dylib ordinal (1 = first LC_LOAD_DYLIB = libSystem)
         ops.push(BIND_OPCODE_SET_DYLIB_ORDINAL_IMM | 1);
         // Set symbol name
         ops.push(BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM | 0);
-        ops.extend_from_slice(sym_name.as_bytes());
+        ops.extend_from_slice(macho_name.as_bytes());
         ops.push(0); // null terminator
         // Set type
         ops.push(BIND_OPCODE_SET_TYPE_IMM | BIND_TYPE_POINTER);
@@ -1052,7 +1089,8 @@ fn build_export_trie(entry_name: &str, entry_offset: u64) -> Vec<u8> {
     trie.push(1); // 1 child
 
     // Edge: entry symbol name → child node
-    trie.extend_from_slice(entry_name.as_bytes());
+    let macho_entry = macho_mangle(entry_name);
+    trie.extend_from_slice(macho_entry.as_bytes());
     trie.push(0); // null terminator
 
     // Child node offset (will be right after this ULEB)
@@ -1122,7 +1160,13 @@ fn build_symbol_table(
         } else if layout.data_sec_size > 0 && value >= layout.data_sec_vmaddr && value < layout.data_sec_vmaddr + layout.data_sec_size {
             data_sect
         } else {
-            1 // fallback
+            panic!(
+                "symbol {name:?} at {value:#x} does not fall in any known Mach-O section \
+                 (text={:#x}..{:#x}, const={:#x}..{:#x}, data={:#x}..{:#x})",
+                layout.text_sec_vmaddr, layout.text_sec_vmaddr + layout.text_sec_size,
+                layout.const_sec_vmaddr, layout.const_sec_vmaddr + layout.const_sec_size,
+                layout.data_sec_vmaddr, layout.data_sec_vmaddr + layout.data_sec_size,
+            )
         };
         extdef_syms.push((name.clone(), value, sect));
     }
@@ -1130,8 +1174,9 @@ fn build_symbol_table(
     let nextdefsym = extdef_syms.len() as u32;
 
     for (name, value, sect) in &extdef_syms {
+        let macho_name = macho_mangle(name);
         let nlist = Nlist64 {
-            n_strx: U32Le::new(add_string(&mut strtab, name)),
+            n_strx: U32Le::new(add_string(&mut strtab, &macho_name)),
             n_type: N_SECT | N_EXT,
             n_sect: *sect,
             n_desc: U16Le::new(0),
@@ -1147,8 +1192,9 @@ fn build_symbol_table(
     let nundefsym = undef_syms.len() as u32;
 
     for name in &undef_syms {
+        let macho_name = macho_mangle(name);
         let nlist = Nlist64 {
-            n_strx: U32Le::new(add_string(&mut strtab, name)),
+            n_strx: U32Le::new(add_string(&mut strtab, &macho_name)),
             n_type: N_EXT, // undefined
             n_sect: 0,     // NO_SECT
             // REFERENCE_FLAG_UNDEFINED_NON_LAZY (0) | SET_LIBRARY_ORDINAL(1)

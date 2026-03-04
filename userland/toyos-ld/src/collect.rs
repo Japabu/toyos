@@ -101,10 +101,21 @@ pub enum RelocType {
     X86Dtpoff32,
     // AArch64
     Aarch64Abs64,
+    Aarch64Abs32,
+    Aarch64Prel32,
     Aarch64Call26,
+    Aarch64Jump26,
     Aarch64AdrPrelPgHi21,
     Aarch64AddAbsLo12Nc,
+    Aarch64Ldst8AbsLo12Nc,
+    Aarch64Ldst16AbsLo12Nc,
+    Aarch64Ldst32AbsLo12Nc,
     Aarch64Ldst64AbsLo12Nc,
+    Aarch64Ldst128AbsLo12Nc,
+    Aarch64MovwUabsG0Nc,
+    Aarch64MovwUabsG1Nc,
+    Aarch64MovwUabsG2Nc,
+    Aarch64MovwUabsG3,
     Aarch64AdrGotPage,
     Aarch64Ld64GotLo12Nc,
 }
@@ -126,10 +137,21 @@ impl std::fmt::Display for RelocType {
             RelocType::X86Tlsld => write!(f, "R_X86_64_TLSLD"),
             RelocType::X86Dtpoff32 => write!(f, "R_X86_64_DTPOFF32"),
             RelocType::Aarch64Abs64 => write!(f, "R_AARCH64_ABS64"),
+            RelocType::Aarch64Abs32 => write!(f, "R_AARCH64_ABS32"),
+            RelocType::Aarch64Prel32 => write!(f, "R_AARCH64_PREL32"),
             RelocType::Aarch64Call26 => write!(f, "R_AARCH64_CALL26"),
+            RelocType::Aarch64Jump26 => write!(f, "R_AARCH64_JUMP26"),
             RelocType::Aarch64AdrPrelPgHi21 => write!(f, "R_AARCH64_ADR_PREL_PG_HI21"),
             RelocType::Aarch64AddAbsLo12Nc => write!(f, "R_AARCH64_ADD_ABS_LO12_NC"),
+            RelocType::Aarch64Ldst8AbsLo12Nc => write!(f, "R_AARCH64_LDST8_ABS_LO12_NC"),
+            RelocType::Aarch64Ldst16AbsLo12Nc => write!(f, "R_AARCH64_LDST16_ABS_LO12_NC"),
+            RelocType::Aarch64Ldst32AbsLo12Nc => write!(f, "R_AARCH64_LDST32_ABS_LO12_NC"),
             RelocType::Aarch64Ldst64AbsLo12Nc => write!(f, "R_AARCH64_LDST64_ABS_LO12_NC"),
+            RelocType::Aarch64Ldst128AbsLo12Nc => write!(f, "R_AARCH64_LDST128_ABS_LO12_NC"),
+            RelocType::Aarch64MovwUabsG0Nc => write!(f, "R_AARCH64_MOVW_UABS_G0_NC"),
+            RelocType::Aarch64MovwUabsG1Nc => write!(f, "R_AARCH64_MOVW_UABS_G1_NC"),
+            RelocType::Aarch64MovwUabsG2Nc => write!(f, "R_AARCH64_MOVW_UABS_G2_NC"),
+            RelocType::Aarch64MovwUabsG3 => write!(f, "R_AARCH64_MOVW_UABS_G3"),
             RelocType::Aarch64AdrGotPage => write!(f, "R_AARCH64_ADR_GOT_PAGE"),
             RelocType::Aarch64Ld64GotLo12Nc => write!(f, "R_AARCH64_LD64_GOT_LO12_NC"),
         }
@@ -230,12 +252,23 @@ fn collect_so_symbols(elf: &ElfFile64, globals: &mut HashMap<String, SymbolDef>,
 /// Resolve a relocation's target to a `SymbolRef`. Section symbols and local
 /// symbols produce `SymbolRef::Local` (carrying the object index), while global
 /// and undefined symbols produce `SymbolRef::Global`.
+/// Strip the Mach-O leading `_` prefix from C symbol names so all internal
+/// names use ELF convention. The prefix is re-added at Mach-O emit time.
+fn demangle_macho(name: &str, is_macho: bool) -> String {
+    if is_macho {
+        name.strip_prefix('_').unwrap_or(name).to_string()
+    } else {
+        name.to_string()
+    }
+}
+
 fn resolve_reloc_target(
     obj: &object::File,
     reloc: &read::Relocation,
     obj_idx: ObjIdx,
     sec_map: &HashMap<(ObjIdx, object::SectionIndex), SectionIdx>,
     state: &mut LinkState,
+    is_macho: bool,
 ) -> Option<SymbolRef> {
     let sym_idx = match reloc.target() {
         read::RelocationTarget::Symbol(idx) => idx,
@@ -244,6 +277,7 @@ fn resolve_reloc_target(
     };
     let sym = obj.symbol_by_index(sym_idx).ok()?;
     let name = sym.name().unwrap_or("");
+    let name = &demangle_macho(name, is_macho);
 
     // Section symbols need unique synthetic names because COFF objects can have
     // multiple sections with the same name (e.g. many `.rdata` COMDAT sections).
@@ -344,9 +378,11 @@ fn collect_object(
         }
     }
 
+    let is_macho = matches!(obj.format(), object::BinaryFormat::MachO);
+
     for symbol in obj.symbols() {
         let sym_name = match symbol.name() {
-            Ok(n) if !n.is_empty() => n.to_string(),
+            Ok(n) if !n.is_empty() => demangle_macho(n, is_macho),
             _ => continue,
         };
         if symbol.is_undefined() {
@@ -409,7 +445,7 @@ fn collect_object(
         if state.sections[global_sec].kind.is_nobits() { continue; }
 
         for (offset, reloc) in section.relocations() {
-            let sym_name = match resolve_reloc_target(obj, &reloc, obj_idx, sec_map, state) {
+            let sym_name = match resolve_reloc_target(obj, &reloc, obj_idx, sec_map, state, is_macho) {
                 Some(name) => name,
                 None => continue,
             };
@@ -495,10 +531,21 @@ fn elf_to_reloc_type(r_type: u32) -> Option<RelocType> {
         elf::R_X86_64_TLSLD => RelocType::X86Tlsld,
         elf::R_X86_64_DTPOFF32 => RelocType::X86Dtpoff32,
         elf::R_AARCH64_ABS64 => RelocType::Aarch64Abs64,
+        elf::R_AARCH64_ABS32 => RelocType::Aarch64Abs32,
+        elf::R_AARCH64_PREL32 => RelocType::Aarch64Prel32,
         elf::R_AARCH64_CALL26 => RelocType::Aarch64Call26,
+        elf::R_AARCH64_JUMP26 => RelocType::Aarch64Jump26,
         elf::R_AARCH64_ADR_PREL_PG_HI21 => RelocType::Aarch64AdrPrelPgHi21,
         elf::R_AARCH64_ADD_ABS_LO12_NC => RelocType::Aarch64AddAbsLo12Nc,
+        elf::R_AARCH64_LDST8_ABS_LO12_NC => RelocType::Aarch64Ldst8AbsLo12Nc,
+        elf::R_AARCH64_LDST16_ABS_LO12_NC => RelocType::Aarch64Ldst16AbsLo12Nc,
+        elf::R_AARCH64_LDST32_ABS_LO12_NC => RelocType::Aarch64Ldst32AbsLo12Nc,
         elf::R_AARCH64_LDST64_ABS_LO12_NC => RelocType::Aarch64Ldst64AbsLo12Nc,
+        elf::R_AARCH64_LDST128_ABS_LO12_NC => RelocType::Aarch64Ldst128AbsLo12Nc,
+        elf::R_AARCH64_MOVW_UABS_G0_NC => RelocType::Aarch64MovwUabsG0Nc,
+        elf::R_AARCH64_MOVW_UABS_G1_NC => RelocType::Aarch64MovwUabsG1Nc,
+        elf::R_AARCH64_MOVW_UABS_G2_NC => RelocType::Aarch64MovwUabsG2Nc,
+        elf::R_AARCH64_MOVW_UABS_G3 => RelocType::Aarch64MovwUabsG3,
         elf::R_AARCH64_ADR_GOT_PAGE => RelocType::Aarch64AdrGotPage,
         elf::R_AARCH64_LD64_GOT_LO12_NC => RelocType::Aarch64Ld64GotLo12Nc,
         _ => return None,
@@ -600,7 +647,7 @@ pub(crate) fn scan_symbols(data: &[u8]) -> (HashSet<String>, HashSet<String>) {
 
     let obj = match read::File::parse(data) {
         Ok(o) => o,
-        Err(_) => return (defined, referenced),
+        Err(e) => panic!("scan_symbols: failed to parse object: {e}"),
     };
 
     for sym in obj.symbols() {

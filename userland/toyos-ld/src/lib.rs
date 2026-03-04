@@ -98,7 +98,7 @@ impl Collected {
     /// Mark sections with absolute relocations as writable (needed for Mach-O rebasing).
     fn mark_abs_reloc_sections_writable(&mut self) {
         let abs_reloc_sections: std::collections::HashSet<SectionIdx> = self.state.relocs.iter()
-            .filter(|r| r.r_type == RelocType::Aarch64Abs64)
+            .filter(|r| matches!(r.r_type, RelocType::Aarch64Abs64 | RelocType::X86_64))
             .map(|r| r.section)
             .collect();
         for &idx in &abs_reloc_sections {
@@ -118,8 +118,8 @@ impl Collected {
         LaidOut { state: self.state, layout }
     }
 
-    fn layout_macho(mut self, entry: &str) -> LaidOut<MachOLayout> {
-        let layout = layout_macho(&mut self.state, entry);
+    fn layout_macho(mut self) -> LaidOut<MachOLayout> {
+        let layout = layout_macho(&mut self.state);
         LaidOut { state: self.state, layout }
     }
 }
@@ -394,31 +394,37 @@ pub fn link_macho(
     entry: &str,
     gc: bool,
 ) -> Result<Vec<u8>, LinkError> {
+    // Internally all symbol names use ELF convention (no `_` prefix).
+    // Accept Mach-O-style `_main` from CLI by stripping the prefix.
+    let entry = entry.strip_prefix('_').unwrap_or(entry);
     let mut collected = Collected::new(objects)?;
     collected.mark_dynamic_symbols();
     create_call_stubs(&mut collected.state);
     collected.mark_abs_reloc_sections_writable();
     if gc { collected.gc_sections(entry); }
-    collected.layout_macho(entry)
+    collected.layout_macho()
         .relocate_and_emit(entry)
 }
 
-/// Create call stubs for CALL26 relocations targeting dynamic (undefined) symbols.
-/// On arm64 Mach-O, direct `bl` instructions can't reach dylib functions — the
+/// Create call stubs for relocations targeting dynamic (undefined) symbols.
+/// On Mach-O, direct call instructions can't reach dylib functions — the
 /// linker must create stubs that load the address from a GOT slot and branch.
-///
-/// For each such symbol, this function:
-/// 1. Appends a 12-byte stub to a synthetic `.text.stubs` section
-/// 2. Adds a global symbol for the stub
-/// 3. Adds GOT relocations (ADR_GOT_PAGE + LD64_GOT_LO12_NC) from the stub
-/// 4. Rewrites the CALL26 relocations to target the stub
 fn create_call_stubs(state: &mut collect::LinkState) {
     use std::collections::BTreeSet;
 
-    // Find all dynamic symbols that have CALL26 relocations
+    let is_aarch64 = state.relocs.iter().any(|r| matches!(r.r_type,
+        RelocType::Aarch64Call26 | RelocType::Aarch64Jump26
+        | RelocType::Aarch64AdrPrelPgHi21 | RelocType::Aarch64AdrGotPage));
+
+    // Find all dynamic symbols with call relocations
     let mut stub_syms = BTreeSet::new();
+    let call_relocs: &[RelocType] = if is_aarch64 {
+        &[RelocType::Aarch64Call26, RelocType::Aarch64Jump26]
+    } else {
+        &[RelocType::X86Plt32, RelocType::X86Pc32]
+    };
     for reloc in &state.relocs {
-        if reloc.r_type != RelocType::Aarch64Call26 { continue; }
+        if !call_relocs.contains(&reloc.r_type) { continue; }
         if let Some(SymbolDef::Dynamic) = state.globals.get(reloc.target.name()) {
             stub_syms.insert(reloc.target.name().to_string());
         }
@@ -426,74 +432,104 @@ fn create_call_stubs(state: &mut collect::LinkState) {
 
     if stub_syms.is_empty() { return; }
 
-    // Build stub section: 12 bytes per stub
-    // Each stub:  adrp x16, sym@GOTPAGE       (patched by GOT_PAGE reloc)
-    //             ldr  x16, [x16, sym@GOTLO12] (patched by GOT_LO12 reloc)
-    //             br   x16
-    let stub_count = stub_syms.len();
-    let mut stub_data = Vec::with_capacity(stub_count * 12);
-    let mut stub_relocs = Vec::new();
     let stub_sec_idx = SectionIdx(state.sections.len());
 
-    for (i, sym_name) in stub_syms.iter().enumerate() {
-        let offset = (i * 12) as u64;
-
-        // adrp x16, #0 — placeholder, will be patched by ADR_GOT_PAGE reloc
-        stub_data.extend_from_slice(&0x9000_0010u32.to_le_bytes());
-        // ldr x16, [x16, #0] — placeholder, will be patched by LD64_GOT_LO12_NC reloc
-        stub_data.extend_from_slice(&0xF940_0210u32.to_le_bytes());
-        // br x16
-        stub_data.extend_from_slice(&0xD61F_0200u32.to_le_bytes());
-
-        // Add GOT relocations for this stub
-        stub_relocs.push(collect::InputReloc {
-            section: stub_sec_idx,
-            offset,
-            r_type: RelocType::Aarch64AdrGotPage,
-            target: SymbolRef::Global(sym_name.clone()),
-            addend: 0,
-        });
-        stub_relocs.push(collect::InputReloc {
-            section: stub_sec_idx,
-            offset: offset + 4,
-            r_type: RelocType::Aarch64Ld64GotLo12Nc,
-            target: SymbolRef::Global(sym_name.clone()),
-            addend: 0,
-        });
-
-        // Add a global symbol for the stub
-        let stub_name = format!("{sym_name}.__stub");
-        state.globals.insert(stub_name, SymbolDef::Defined {
-            section: stub_sec_idx,
-            value: offset,
-        });
+    if is_aarch64 {
+        create_aarch64_stubs(state, &stub_syms, stub_sec_idx);
+    } else {
+        create_x86_64_stubs(state, &stub_syms, stub_sec_idx);
     }
 
-    // Add the stubs section
-    state.sections.push(collect::InputSection {
-        name: ".text".to_string(),
-        data: stub_data,
-        align: 4,
-        size: (stub_count * 12) as u64,
-        vaddr: None,
-        kind: SectionKind::Code,
-        merge: false,
-        strings: false,
-        entsize: 0,
-    });
-
-    // Add the GOT relocations
-    state.relocs.extend(stub_relocs);
-
-    // Rewrite CALL26 relocations to target the stub symbols
+    // Rewrite call relocations to target the stub symbols
     let stub_syms_set: BTreeSet<&str> = stub_syms.iter().map(|s| s.as_str()).collect();
     for reloc in &mut state.relocs {
-        if reloc.r_type == RelocType::Aarch64Call26
+        if call_relocs.contains(&reloc.r_type)
             && stub_syms_set.contains(reloc.target.name())
         {
             reloc.target = SymbolRef::Global(format!("{}.__stub", reloc.target.name()));
         }
     }
+}
+
+fn create_aarch64_stubs(
+    state: &mut collect::LinkState,
+    stub_syms: &std::collections::BTreeSet<String>,
+    stub_sec_idx: SectionIdx,
+) {
+    let stub_count = stub_syms.len();
+    let mut stub_data = Vec::with_capacity(stub_count * 12);
+    let mut stub_relocs = Vec::new();
+
+    for (i, sym_name) in stub_syms.iter().enumerate() {
+        let offset = (i * 12) as u64;
+        // adrp x16, sym@GOTPAGE
+        stub_data.extend_from_slice(&0x9000_0010u32.to_le_bytes());
+        // ldr x16, [x16, sym@GOTLO12]
+        stub_data.extend_from_slice(&0xF940_0210u32.to_le_bytes());
+        // br x16
+        stub_data.extend_from_slice(&0xD61F_0200u32.to_le_bytes());
+
+        stub_relocs.push(collect::InputReloc {
+            section: stub_sec_idx, offset,
+            r_type: RelocType::Aarch64AdrGotPage,
+            target: SymbolRef::Global(sym_name.clone()), addend: 0,
+        });
+        stub_relocs.push(collect::InputReloc {
+            section: stub_sec_idx, offset: offset + 4,
+            r_type: RelocType::Aarch64Ld64GotLo12Nc,
+            target: SymbolRef::Global(sym_name.clone()), addend: 0,
+        });
+
+        state.globals.insert(format!("{sym_name}.__stub"), SymbolDef::Defined {
+            section: stub_sec_idx, value: offset,
+        });
+    }
+
+    state.sections.push(collect::InputSection {
+        name: ".text".to_string(), data: stub_data, align: 4,
+        size: (stub_count * 12) as u64, vaddr: None,
+        kind: SectionKind::Code, merge: false, strings: false, entsize: 0,
+    });
+    state.relocs.extend(stub_relocs);
+}
+
+fn create_x86_64_stubs(
+    state: &mut collect::LinkState,
+    stub_syms: &std::collections::BTreeSet<String>,
+    stub_sec_idx: SectionIdx,
+) {
+    // x86-64 stub: 6 bytes + 2 padding = 8 bytes per stub
+    // Each stub:  jmpq *sym@GOTPCREL(%rip)  [FF 25 xx xx xx xx]
+    //             nop; nop                   [90 90]
+    let stub_count = stub_syms.len();
+    let mut stub_data = Vec::with_capacity(stub_count * 8);
+    let mut stub_relocs = Vec::new();
+
+    for (i, sym_name) in stub_syms.iter().enumerate() {
+        let offset = (i * 8) as u64;
+        // FF 25 00000000 = jmpq *0(%rip) — placeholder, patched by GOTPCREL reloc
+        stub_data.extend_from_slice(&[0xFF, 0x25, 0x00, 0x00, 0x00, 0x00]);
+        // padding
+        stub_data.extend_from_slice(&[0x90, 0x90]);
+
+        // GOTPCREL reloc at offset+2 (the 4-byte displacement after FF 25)
+        stub_relocs.push(collect::InputReloc {
+            section: stub_sec_idx, offset: offset + 2,
+            r_type: RelocType::X86Gotpcrel,
+            target: SymbolRef::Global(sym_name.clone()), addend: -4,
+        });
+
+        state.globals.insert(format!("{sym_name}.__stub"), SymbolDef::Defined {
+            section: stub_sec_idx, value: offset,
+        });
+    }
+
+    state.sections.push(collect::InputSection {
+        name: ".text".to_string(), data: stub_data, align: 8,
+        size: (stub_count * 8) as u64, vaddr: None,
+        kind: SectionKind::Code, merge: false, strings: false, entsize: 0,
+    });
+    state.relocs.extend(stub_relocs);
 }
 
 // ── Shared helpers ──────────────────────────────────────────────────────
