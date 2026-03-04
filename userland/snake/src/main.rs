@@ -48,7 +48,7 @@ impl Dir {
 }
 
 fn random_range(max: usize) -> usize {
-    rand::rng().random_range(0..max)
+    rand::thread_rng().gen_range(0..max)
 }
 
 struct Game {
