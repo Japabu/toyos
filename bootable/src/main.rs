@@ -25,6 +25,7 @@ fn build(debug: bool) {
                 fs::remove_dir_all(&target_dir).ok();
             }
         }
+        write_stamp(&toyos_ld, "target/.linker-stamp");
     }
 
     // Detect toolchain changes — clean userland targets to avoid stale incremental artifacts
@@ -97,8 +98,7 @@ fn build(debug: bool) {
         initrd_files.push((name.to_string(), data));
     }
 
-    // Write stamps after successful builds
-    write_stamp(&toyos_ld, "target/.linker-stamp");
+    // Write toolchain stamp after successful builds
     write_stamp(&toolchain_stamp, "target/.toolchain-stamp");
 
     // Add rustc compiler from bootstrap sysroot

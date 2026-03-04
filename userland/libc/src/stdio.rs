@@ -293,6 +293,32 @@ pub unsafe extern "C" fn atol(s: *const u8) -> i64 {
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn atof(s: *const u8) -> f64 {
+    let mut p = s;
+    while super::ctype::isspace(*p as i32) != 0 { p = p.add(1); }
+
+    let neg = if *p == b'-' { p = p.add(1); true }
+              else if *p == b'+' { p = p.add(1); false }
+              else { false };
+
+    let mut result: f64 = 0.0;
+    while (*p).is_ascii_digit() {
+        result = result * 10.0 + (*p - b'0') as f64;
+        p = p.add(1);
+    }
+    if *p == b'.' {
+        p = p.add(1);
+        let mut frac = 0.1;
+        while (*p).is_ascii_digit() {
+            result += (*p - b'0') as f64 * frac;
+            frac *= 0.1;
+            p = p.add(1);
+        }
+    }
+    if neg { -result } else { result }
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn getenv(_name: *const u8) -> *const u8 {
     ptr::null()
 }
@@ -305,6 +331,11 @@ pub unsafe extern "C" fn setenv(_name: *const u8, _value: *const u8, _overwrite:
 #[no_mangle]
 pub unsafe extern "C" fn unsetenv(_name: *const u8) -> i32 {
     -1
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn system(_command: *const u8) -> i32 {
+    -1 // no shell available
 }
 
 #[no_mangle]
