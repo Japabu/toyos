@@ -579,13 +579,34 @@ impl Codegen {
                 let va_slot = ctx.va_area.unwrap_or_else(|| {
                     panic!("__builtin_va_start used in non-variadic function '{}'", ctx.name)
                 });
-                let va_addr = ctx.builder.ins().stack_addr(I64, va_slot, 0);
                 let ap_name = match &args[0] {
                     Expr::Ident(n) => n,
                     other => panic!("va_start: expected identifier, got {other:?}"),
                 };
-                ctx.store_to_local(ap_name, va_addr);
-                TypedValue::unsigned(va_addr)
+                if self.is_aarch64() {
+                    // aarch64 Apple: va_list is just a pointer to the arg area
+                    let va_addr = ctx.builder.ins().stack_addr(I64, va_slot, 0);
+                    ctx.store_to_local(ap_name, va_addr);
+                    TypedValue::unsigned(va_addr)
+                } else {
+                    // x86_64 SysV: va_list is a pointer to a 24-byte struct:
+                    //   { i32 gp_offset, i32 fp_offset, void *overflow_arg_area, void *reg_save_area }
+                    // Our va_area has 10 sequential 8-byte slots. The first 6 (offsets 0-47)
+                    // serve as the register save area; slots 6-9 (offset 48+) as overflow.
+                    let va_struct = ctx.builder.create_sized_stack_slot(StackSlotData::new(
+                        StackSlotKind::ExplicitSlot, 24, 0));
+                    let zero = ctx.builder.ins().iconst(I32, 0);
+                    ctx.builder.ins().stack_store(zero, va_struct, 0);  // gp_offset = 0
+                    let fp_exhausted = ctx.builder.ins().iconst(I32, 176);
+                    ctx.builder.ins().stack_store(fp_exhausted, va_struct, 4);  // fp_offset = 176
+                    let overflow = ctx.builder.ins().stack_addr(I64, va_slot, 48);
+                    ctx.builder.ins().stack_store(overflow, va_struct, 8);  // overflow_arg_area
+                    let reg_save = ctx.builder.ins().stack_addr(I64, va_slot, 0);
+                    ctx.builder.ins().stack_store(reg_save, va_struct, 16); // reg_save_area
+                    let struct_addr = ctx.builder.ins().stack_addr(I64, va_struct, 0);
+                    ctx.store_to_local(ap_name, struct_addr);
+                    TypedValue::unsigned(struct_addr)
+                }
             }
             "__builtin_va_copy" => {
                 let src_val = self.compile_expr(ctx, &args[1]).raw();
@@ -593,19 +614,79 @@ impl Codegen {
                     Expr::Ident(n) => n,
                     other => panic!("va_copy: expected identifier, got {other:?}"),
                 };
-                ctx.store_to_local(dest_name, src_val);
-                TypedValue::unsigned(src_val)
+                if self.is_aarch64() {
+                    // aarch64: va_list is a pointer, just copy it
+                    ctx.store_to_local(dest_name, src_val);
+                    TypedValue::unsigned(src_val)
+                } else {
+                    // x86_64: allocate new struct, copy 24 bytes from source
+                    let new_struct = ctx.builder.create_sized_stack_slot(StackSlotData::new(
+                        StackSlotKind::ExplicitSlot, 24, 0));
+                    // Copy 3 x i64 (24 bytes)
+                    let v0 = ctx.builder.ins().load(I64, MemFlags::new(), src_val, 0);
+                    let v1 = ctx.builder.ins().load(I64, MemFlags::new(), src_val, 8);
+                    let v2 = ctx.builder.ins().load(I64, MemFlags::new(), src_val, 16);
+                    ctx.builder.ins().stack_store(v0, new_struct, 0);
+                    ctx.builder.ins().stack_store(v1, new_struct, 8);
+                    ctx.builder.ins().stack_store(v2, new_struct, 16);
+                    let new_addr = ctx.builder.ins().stack_addr(I64, new_struct, 0);
+                    ctx.store_to_local(dest_name, new_addr);
+                    TypedValue::unsigned(new_addr)
+                }
             }
             "__builtin_va_arg" => {
-                let ap_val = self.compile_expr(ctx, &args[0]).raw();
-                let result = ctx.builder.ins().load(I64, MemFlags::new(), ap_val, 0);
-                let new_ap = ctx.builder.ins().iadd_imm(ap_val, 8);
                 let ap_name = match &args[0] {
-                    Expr::Ident(n) => n,
+                    Expr::Ident(n) => n.clone(),
                     other => panic!("va_arg: expected identifier, got {other:?}"),
                 };
-                ctx.store_to_local(ap_name, new_ap);
-                TypedValue::signed(result)
+                let ap_val = self.compile_expr(ctx, &args[0]).raw();
+                if self.is_aarch64() {
+                    // aarch64: ap is a pointer, load 8 bytes and advance by 8
+                    let result = ctx.builder.ins().load(I64, MemFlags::new(), ap_val, 0);
+                    let new_ap = ctx.builder.ins().iadd_imm(ap_val, 8);
+                    ctx.store_to_local(&ap_name, new_ap);
+                    TypedValue::signed(result)
+                } else {
+                    // x86_64 SysV: ap points to { i32 gp_offset, i32 fp_offset,
+                    //   void *overflow_arg_area, void *reg_save_area }
+                    // if gp_offset < 48: load from reg_save_area + gp_offset, advance gp_offset
+                    // else: load from overflow_arg_area, advance overflow_arg_area
+                    let gp_offset = ctx.builder.ins().load(I32, MemFlags::new(), ap_val, 0);
+                    let threshold = ctx.builder.ins().iconst(I32, 48);
+                    let in_regs = ctx.builder.ins().icmp(IntCC::SignedLessThan, gp_offset, threshold);
+
+                    let reg_block = ctx.builder.create_block();
+                    let overflow_block = ctx.builder.create_block();
+                    let merge_block = ctx.builder.create_block();
+
+                    ctx.builder.ins().brif(in_regs, reg_block, &[], overflow_block, &[]);
+
+                    // Register path: load from reg_save_area + gp_offset
+                    ctx.builder.switch_to_block(reg_block);
+                    ctx.builder.seal_block(reg_block);
+                    let reg_save = ctx.builder.ins().load(I64, MemFlags::new(), ap_val, 16);
+                    let gp_ext = ctx.builder.ins().uextend(I64, gp_offset);
+                    let reg_addr = ctx.builder.ins().iadd(reg_save, gp_ext);
+                    let reg_val = ctx.builder.ins().load(I64, MemFlags::new(), reg_addr, 0);
+                    let new_gp = ctx.builder.ins().iadd_imm(gp_offset, 8);
+                    ctx.builder.ins().store(MemFlags::new(), new_gp, ap_val, 0);
+                    ctx.builder.ins().jump(merge_block, &[BlockArg::Value(reg_val)]);
+
+                    // Overflow path: load from overflow_arg_area
+                    ctx.builder.switch_to_block(overflow_block);
+                    ctx.builder.seal_block(overflow_block);
+                    let overflow_area = ctx.builder.ins().load(I64, MemFlags::new(), ap_val, 8);
+                    let overflow_val = ctx.builder.ins().load(I64, MemFlags::new(), overflow_area, 0);
+                    let new_overflow = ctx.builder.ins().iadd_imm(overflow_area, 8);
+                    ctx.builder.ins().store(MemFlags::new(), new_overflow, ap_val, 8);
+                    ctx.builder.ins().jump(merge_block, &[BlockArg::Value(overflow_val)]);
+
+                    // Merge
+                    ctx.builder.append_block_param(merge_block, I64);
+                    ctx.builder.switch_to_block(merge_block);
+                    ctx.builder.seal_block(merge_block);
+                    TypedValue::signed(ctx.builder.block_params(merge_block)[0])
+                }
             }
             _ => panic!("builtin '{name}' not yet implemented"),
         }
@@ -695,7 +776,7 @@ impl Codegen {
         let l_tv = self.compile_expr(ctx, lhs);
         let r_tv = self.compile_expr(ctx, rhs);
         // C integer promotion: promote narrow types to at least int (I32)
-        // using TypedValue's signedness for correct extension
+        // using each operand's own signedness for correct extension
         let l = if ctx.builder.func.dfg.value_type(l_tv.raw()).is_int()
             && ctx.builder.func.dfg.value_type(l_tv.raw()).bits() < 32 {
             TypedValue::new(self.coerce_typed(ctx, l_tv, I32), op_sign)
@@ -704,13 +785,14 @@ impl Codegen {
             && ctx.builder.func.dfg.value_type(r_tv.raw()).bits() < 32 {
             TypedValue::new(self.coerce_typed(ctx, r_tv, I32), op_sign)
         } else { r_tv.with_sign(op_sign) };
-        // For unsigned ops, narrow operands to the correct C type width
-        // so that e.g. (unsigned)-1 / -2 operates at 32-bit, not 64-bit
+        // Widen operands to the common type, using each operand's ORIGINAL signedness
+        // for extension: signed int widened to uint64_t must sign-extend to 64 bits first,
+        // then the comparison treats both as unsigned.
         let (l, r) = if is_unsigned {
             let common = CType::common(&lty, &rty);
             let w = self.clif_type(&common);
-            (TypedValue::unsigned(self.coerce_unsigned(ctx, l.raw(), w)),
-             TypedValue::unsigned(self.coerce_unsigned(ctx, r.raw(), w)))
+            (TypedValue::unsigned(self.coerce_typed(ctx, l_tv, w)),
+             TypedValue::unsigned(self.coerce_typed(ctx, r_tv, w)))
         } else { (l, r) };
         self.compile_binop(ctx, op, l, r)
     }

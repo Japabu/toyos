@@ -262,3 +262,4 @@ tinycc_test!(t155_addr_array_elem_init, "155_addr_array_elem_init");
 tinycc_test!(t156_sizeof_array_count, "156_sizeof_array_count");
 tinycc_test!(t157_sizeof_member, "157_sizeof_member");
 tinycc_test!(t158_vla, "158_vla");
+tinycc_test!(t159_va_list, "159_va_list");

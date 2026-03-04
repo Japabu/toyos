@@ -108,7 +108,7 @@ pub(super) struct FuncCtx<'a> {
     // Goto/labels
     labels: HashMap<String, ir::Block>,
     // Variadic function support
-    va_area: Option<ir::StackSlot>, // stack slot holding saved variadic args
+    va_area: Option<ir::StackSlot>,   // stack slot holding saved variadic args
     sret_ptr: Option<Value>,       // hidden return pointer for struct-returning functions
     // VLA support
     vla_sizes: HashMap<String, Value>,  // var name → runtime element count
