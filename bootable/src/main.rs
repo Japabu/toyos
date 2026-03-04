@@ -167,7 +167,7 @@ fn main() {
         .arg("-machine").arg("q35")
         .arg("-cpu").arg("qemu64,+rdrand")
         .arg("-smp").arg("2")
-        .arg("-m").arg("1G")
+        .arg("-m").arg("4G")
         // Flash the OVMF UEFI firmware
         .arg("-drive").arg("if=pflash,format=raw,unit=0,file=ovmf/OVMF_CODE-pure-efi.fd,readonly=on")
         .arg("-drive").arg("if=pflash,format=raw,unit=1,file=ovmf/OVMF_VARS-pure-efi.fd,readonly=on")
