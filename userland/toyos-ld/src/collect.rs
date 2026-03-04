@@ -55,6 +55,13 @@ pub(crate) enum SectionKind {
     FiniArray,
 }
 
+/// Target architecture for the link output, detected from input object metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Arch {
+    Aarch64,
+    X86_64,
+}
+
 impl SectionKind {
     pub fn is_writable(self) -> bool {
         matches!(self, Self::Data | Self::Bss | Self::InitArray | Self::FiniArray)
@@ -185,6 +192,8 @@ pub(crate) struct LinkState {
     pub(crate) dynamic_imports: HashSet<String>,
     /// Bare filenames of .so inputs (for DT_NEEDED entries).
     pub(crate) dynamic_libs: Vec<String>,
+    /// Target architecture, detected from input object file metadata.
+    pub(crate) arch: Arch,
 }
 
 pub(crate) fn collect(objects: &[(String, Vec<u8>)]) -> Result<LinkState, LinkError> {
@@ -197,6 +206,7 @@ pub(crate) fn collect(objects: &[(String, Vec<u8>)]) -> Result<LinkState, LinkEr
         metadata: Vec::new(),
         dynamic_imports: HashSet::new(),
         dynamic_libs: Vec::new(),
+        arch: Arch::Aarch64,
     };
 
     let mut sec_map: HashMap<(ObjIdx, object::SectionIndex), SectionIdx> = HashMap::new();
@@ -311,6 +321,9 @@ fn collect_object(
     obj_idx: ObjIdx,
     sec_map: &mut HashMap<(ObjIdx, object::SectionIndex), SectionIdx>,
 ) -> Result<(), LinkError> {
+    if matches!(obj.architecture(), object::Architecture::X86_64) {
+        state.arch = Arch::X86_64;
+    }
     for section in obj.sections() {
         let sec_name = section.name().unwrap_or("");
 
@@ -467,17 +480,14 @@ fn collect_object(
                     }),
                 },
                 RelocationFlags::MachO { r_type, r_length, .. } => {
-                    let is_x86_64 = matches!(obj.architecture(),
-                        object::Architecture::X86_64);
-                    let mapped = if is_x86_64 {
-                        macho_x86_64_to_reloc_type(r_type, r_length)
-                    } else {
-                        macho_arm64_to_reloc_type(r_type, r_length)
+                    let mapped = match state.arch {
+                        Arch::X86_64 => macho_x86_64_to_reloc_type(r_type, r_length),
+                        Arch::Aarch64 => macho_arm64_to_reloc_type(r_type, r_length),
                     };
                     match mapped {
                         // x86_64 Mach-O stores addends as raw data bytes (not
                         // instruction-encoded like ARM64 ADRP/LDR/BL).
-                        Some(r) => (r, !is_x86_64 && macho_arm64_is_instruction_reloc(r_type)),
+                        Some(r) => (r, matches!(state.arch, Arch::Aarch64) && macho_arm64_is_instruction_reloc(r_type)),
                         None => return Err(LinkError::UnsupportedRawRelocation {
                             raw_type: format!("Mach-O type={r_type} length={r_length}"),
                             symbol: sym_name.name().to_string(),

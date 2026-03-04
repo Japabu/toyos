@@ -6,8 +6,6 @@ use cranelift_codegen::ir::{self, AbiParam, BlockArg, InstBuilder, MemFlags, Sta
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_module::{DataDescription, FuncId, FuncOrDataId, Linkage, Module};
 use cranelift_object::ObjectModule;
-use target_lexicon::Architecture;
-
 use crate::ast::*;
 use crate::types::{CType, FieldDef, StructDef, TypeEnv, ParamType, EnumDef, Signedness};
 
@@ -49,8 +47,15 @@ enum GlobalReloc {
     DataAddr { offset: u32, data_id: cranelift_module::DataId, addend: i64 },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Arch {
+    Aarch64,
+    X86_64,
+}
+
 pub struct Codegen {
     pub module: ObjectModule,
+    arch: Arch,
     type_env: TypeEnv,
     strings: Vec<(String, Vec<u8>)>, // (symbol name, data)
     string_counter: usize,
@@ -136,8 +141,15 @@ impl FuncCtx<'_> {
 
 impl Codegen {
     pub fn new(module: ObjectModule, type_env: TypeEnv) -> Self {
+        use target_lexicon::Architecture;
+        let arch = match module.isa().triple().architecture {
+            Architecture::Aarch64(_) => Arch::Aarch64,
+            Architecture::X86_64 => Arch::X86_64,
+            other => panic!("unsupported architecture: {other}"),
+        };
         Self {
             module,
+            arch,
             type_env,
             strings: Vec::new(),
             string_counter: 0,
@@ -171,16 +183,14 @@ impl Codegen {
         }
     }
 
-    /// True when targeting AArch64 (Apple Silicon or Linux arm64).
-    fn is_aarch64(&self) -> bool {
-        matches!(self.module.isa().triple().architecture, Architecture::Aarch64(_))
-    }
-
     /// On aarch64 the variadic calling convention requires all variadic args
     /// on the stack. We pad the remaining integer registers (8 total) with
     /// dummy zero args so the real variadic args spill to the stack.
     fn variadic_padding(&self, fixed_count: usize) -> usize {
-        if self.is_aarch64() { 8usize.saturating_sub(fixed_count) } else { 0 }
+        match self.arch {
+            Arch::Aarch64 => 8usize.saturating_sub(fixed_count),
+            Arch::X86_64 => 0,
+        }
     }
 
     fn needs_sret(ret: &CType) -> bool {

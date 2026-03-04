@@ -14,7 +14,7 @@ float dot(struct vec v) {
     return 999.5;
 }
 
-void main(void) {
+int main(void) {
         struct vec a;
         a.x = 33.0f;
         a.y = 77.0f;

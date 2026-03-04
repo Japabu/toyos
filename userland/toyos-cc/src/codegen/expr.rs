@@ -485,14 +485,61 @@ impl Codegen {
         let ap_val = self.compile_expr(ctx, ap_expr).raw();
         let ty = self.resolve_typename(type_name);
         let load_ty = self.clif_type(&ty);
-        let result = ctx.builder.ins().load(load_ty, MemFlags::new(), ap_val, 0);
-        let new_ap = ctx.builder.ins().iadd_imm(ap_val, 8);
-        if let Expr::Ident(name) = ap_expr {
-            ctx.store_to_local(name, new_ap);
-        } else {
-            panic!("va_arg: expected identifier, got {ap_expr:?}");
+        let ap_name = match ap_expr {
+            Expr::Ident(n) => n,
+            other => panic!("va_arg: expected identifier, got {other:?}"),
+        };
+
+        match self.arch {
+        Arch::Aarch64 => {
+            // aarch64 Apple: va_list is a pointer to contiguous arg area
+            let result = ctx.builder.ins().load(load_ty, MemFlags::new(), ap_val, 0);
+            let new_ap = ctx.builder.ins().iadd_imm(ap_val, 8);
+            ctx.store_to_local(ap_name, new_ap);
+            TypedValue::new(result, ty.signedness())
         }
-        TypedValue::new(result, ty.signedness())
+        Arch::X86_64 => {
+            // x86_64 SysV: ap points to { i32 gp_offset, i32 fp_offset,
+            //   void *overflow_arg_area, void *reg_save_area }
+            // if gp_offset < 48: load from reg_save_area + gp_offset, advance gp_offset
+            // else: load from overflow_arg_area, advance overflow_arg_area
+            let gp_offset = ctx.builder.ins().load(I32, MemFlags::new(), ap_val, 0);
+            let threshold = ctx.builder.ins().iconst(I32, 48);
+            let in_regs = ctx.builder.ins().icmp(IntCC::SignedLessThan, gp_offset, threshold);
+
+            let reg_block = ctx.builder.create_block();
+            let overflow_block = ctx.builder.create_block();
+            let merge_block = ctx.builder.create_block();
+
+            ctx.builder.ins().brif(in_regs, reg_block, &[], overflow_block, &[]);
+
+            // Register path: load from reg_save_area + gp_offset
+            ctx.builder.switch_to_block(reg_block);
+            ctx.builder.seal_block(reg_block);
+            let reg_save = ctx.builder.ins().load(I64, MemFlags::new(), ap_val, 16);
+            let gp_ext = ctx.builder.ins().uextend(I64, gp_offset);
+            let reg_addr = ctx.builder.ins().iadd(reg_save, gp_ext);
+            let reg_val = ctx.builder.ins().load(load_ty, MemFlags::new(), reg_addr, 0);
+            let new_gp = ctx.builder.ins().iadd_imm(gp_offset, 8);
+            ctx.builder.ins().store(MemFlags::new(), new_gp, ap_val, 0);
+            ctx.builder.ins().jump(merge_block, &[BlockArg::Value(reg_val)]);
+
+            // Overflow path: load from overflow_arg_area
+            ctx.builder.switch_to_block(overflow_block);
+            ctx.builder.seal_block(overflow_block);
+            let overflow_area = ctx.builder.ins().load(I64, MemFlags::new(), ap_val, 8);
+            let overflow_val = ctx.builder.ins().load(load_ty, MemFlags::new(), overflow_area, 0);
+            let new_overflow = ctx.builder.ins().iadd_imm(overflow_area, 8);
+            ctx.builder.ins().store(MemFlags::new(), new_overflow, ap_val, 8);
+            ctx.builder.ins().jump(merge_block, &[BlockArg::Value(overflow_val)]);
+
+            // Merge
+            ctx.builder.append_block_param(merge_block, load_ty);
+            ctx.builder.switch_to_block(merge_block);
+            ctx.builder.seal_block(merge_block);
+            TypedValue::new(ctx.builder.block_params(merge_block)[0], ty.signedness())
+        }
+        }
     }
 
     fn compile_builtin(&mut self, ctx: &mut FuncCtx, name: &str, args: &[Expr]) -> TypedValue {
@@ -583,29 +630,32 @@ impl Codegen {
                     Expr::Ident(n) => n,
                     other => panic!("va_start: expected identifier, got {other:?}"),
                 };
-                if self.is_aarch64() {
-                    // aarch64 Apple: va_list is just a pointer to the arg area
-                    let va_addr = ctx.builder.ins().stack_addr(I64, va_slot, 0);
-                    ctx.store_to_local(ap_name, va_addr);
-                    TypedValue::unsigned(va_addr)
-                } else {
-                    // x86_64 SysV: va_list is a pointer to a 24-byte struct:
-                    //   { i32 gp_offset, i32 fp_offset, void *overflow_arg_area, void *reg_save_area }
-                    // Our va_area has 10 sequential 8-byte slots. The first 6 (offsets 0-47)
-                    // serve as the register save area; slots 6-9 (offset 48+) as overflow.
-                    let va_struct = ctx.builder.create_sized_stack_slot(StackSlotData::new(
-                        StackSlotKind::ExplicitSlot, 24, 0));
-                    let zero = ctx.builder.ins().iconst(I32, 0);
-                    ctx.builder.ins().stack_store(zero, va_struct, 0);  // gp_offset = 0
-                    let fp_exhausted = ctx.builder.ins().iconst(I32, 176);
-                    ctx.builder.ins().stack_store(fp_exhausted, va_struct, 4);  // fp_offset = 176
-                    let overflow = ctx.builder.ins().stack_addr(I64, va_slot, 48);
-                    ctx.builder.ins().stack_store(overflow, va_struct, 8);  // overflow_arg_area
-                    let reg_save = ctx.builder.ins().stack_addr(I64, va_slot, 0);
-                    ctx.builder.ins().stack_store(reg_save, va_struct, 16); // reg_save_area
-                    let struct_addr = ctx.builder.ins().stack_addr(I64, va_struct, 0);
-                    ctx.store_to_local(ap_name, struct_addr);
-                    TypedValue::unsigned(struct_addr)
+                match self.arch {
+                    Arch::Aarch64 => {
+                        // aarch64 Apple: va_list is just a pointer to the arg area
+                        let va_addr = ctx.builder.ins().stack_addr(I64, va_slot, 0);
+                        ctx.store_to_local(ap_name, va_addr);
+                        TypedValue::unsigned(va_addr)
+                    }
+                    Arch::X86_64 => {
+                        // x86_64 SysV: va_list is a pointer to a 24-byte struct:
+                        //   { i32 gp_offset, i32 fp_offset, void *overflow_arg_area, void *reg_save_area }
+                        // Our va_area has 10 sequential 8-byte slots. The first 6 (offsets 0-47)
+                        // serve as the register save area; slots 6-9 (offset 48+) as overflow.
+                        let va_struct = ctx.builder.create_sized_stack_slot(StackSlotData::new(
+                            StackSlotKind::ExplicitSlot, 24, 0));
+                        let zero = ctx.builder.ins().iconst(I32, 0);
+                        ctx.builder.ins().stack_store(zero, va_struct, 0);  // gp_offset = 0
+                        let fp_exhausted = ctx.builder.ins().iconst(I32, 176);
+                        ctx.builder.ins().stack_store(fp_exhausted, va_struct, 4);  // fp_offset = 176
+                        let overflow = ctx.builder.ins().stack_addr(I64, va_slot, 48);
+                        ctx.builder.ins().stack_store(overflow, va_struct, 8);  // overflow_arg_area
+                        let reg_save = ctx.builder.ins().stack_addr(I64, va_slot, 0);
+                        ctx.builder.ins().stack_store(reg_save, va_struct, 16); // reg_save_area
+                        let struct_addr = ctx.builder.ins().stack_addr(I64, va_struct, 0);
+                        ctx.store_to_local(ap_name, struct_addr);
+                        TypedValue::unsigned(struct_addr)
+                    }
                 }
             }
             "__builtin_va_copy" => {
@@ -614,78 +664,27 @@ impl Codegen {
                     Expr::Ident(n) => n,
                     other => panic!("va_copy: expected identifier, got {other:?}"),
                 };
-                if self.is_aarch64() {
-                    // aarch64: va_list is a pointer, just copy it
-                    ctx.store_to_local(dest_name, src_val);
-                    TypedValue::unsigned(src_val)
-                } else {
-                    // x86_64: allocate new struct, copy 24 bytes from source
-                    let new_struct = ctx.builder.create_sized_stack_slot(StackSlotData::new(
-                        StackSlotKind::ExplicitSlot, 24, 0));
-                    // Copy 3 x i64 (24 bytes)
-                    let v0 = ctx.builder.ins().load(I64, MemFlags::new(), src_val, 0);
-                    let v1 = ctx.builder.ins().load(I64, MemFlags::new(), src_val, 8);
-                    let v2 = ctx.builder.ins().load(I64, MemFlags::new(), src_val, 16);
-                    ctx.builder.ins().stack_store(v0, new_struct, 0);
-                    ctx.builder.ins().stack_store(v1, new_struct, 8);
-                    ctx.builder.ins().stack_store(v2, new_struct, 16);
-                    let new_addr = ctx.builder.ins().stack_addr(I64, new_struct, 0);
-                    ctx.store_to_local(dest_name, new_addr);
-                    TypedValue::unsigned(new_addr)
-                }
-            }
-            "__builtin_va_arg" => {
-                let ap_name = match &args[0] {
-                    Expr::Ident(n) => n.clone(),
-                    other => panic!("va_arg: expected identifier, got {other:?}"),
-                };
-                let ap_val = self.compile_expr(ctx, &args[0]).raw();
-                if self.is_aarch64() {
-                    // aarch64: ap is a pointer, load 8 bytes and advance by 8
-                    let result = ctx.builder.ins().load(I64, MemFlags::new(), ap_val, 0);
-                    let new_ap = ctx.builder.ins().iadd_imm(ap_val, 8);
-                    ctx.store_to_local(&ap_name, new_ap);
-                    TypedValue::signed(result)
-                } else {
-                    // x86_64 SysV: ap points to { i32 gp_offset, i32 fp_offset,
-                    //   void *overflow_arg_area, void *reg_save_area }
-                    // if gp_offset < 48: load from reg_save_area + gp_offset, advance gp_offset
-                    // else: load from overflow_arg_area, advance overflow_arg_area
-                    let gp_offset = ctx.builder.ins().load(I32, MemFlags::new(), ap_val, 0);
-                    let threshold = ctx.builder.ins().iconst(I32, 48);
-                    let in_regs = ctx.builder.ins().icmp(IntCC::SignedLessThan, gp_offset, threshold);
-
-                    let reg_block = ctx.builder.create_block();
-                    let overflow_block = ctx.builder.create_block();
-                    let merge_block = ctx.builder.create_block();
-
-                    ctx.builder.ins().brif(in_regs, reg_block, &[], overflow_block, &[]);
-
-                    // Register path: load from reg_save_area + gp_offset
-                    ctx.builder.switch_to_block(reg_block);
-                    ctx.builder.seal_block(reg_block);
-                    let reg_save = ctx.builder.ins().load(I64, MemFlags::new(), ap_val, 16);
-                    let gp_ext = ctx.builder.ins().uextend(I64, gp_offset);
-                    let reg_addr = ctx.builder.ins().iadd(reg_save, gp_ext);
-                    let reg_val = ctx.builder.ins().load(I64, MemFlags::new(), reg_addr, 0);
-                    let new_gp = ctx.builder.ins().iadd_imm(gp_offset, 8);
-                    ctx.builder.ins().store(MemFlags::new(), new_gp, ap_val, 0);
-                    ctx.builder.ins().jump(merge_block, &[BlockArg::Value(reg_val)]);
-
-                    // Overflow path: load from overflow_arg_area
-                    ctx.builder.switch_to_block(overflow_block);
-                    ctx.builder.seal_block(overflow_block);
-                    let overflow_area = ctx.builder.ins().load(I64, MemFlags::new(), ap_val, 8);
-                    let overflow_val = ctx.builder.ins().load(I64, MemFlags::new(), overflow_area, 0);
-                    let new_overflow = ctx.builder.ins().iadd_imm(overflow_area, 8);
-                    ctx.builder.ins().store(MemFlags::new(), new_overflow, ap_val, 8);
-                    ctx.builder.ins().jump(merge_block, &[BlockArg::Value(overflow_val)]);
-
-                    // Merge
-                    ctx.builder.append_block_param(merge_block, I64);
-                    ctx.builder.switch_to_block(merge_block);
-                    ctx.builder.seal_block(merge_block);
-                    TypedValue::signed(ctx.builder.block_params(merge_block)[0])
+                match self.arch {
+                    Arch::Aarch64 => {
+                        // aarch64: va_list is a pointer, just copy it
+                        ctx.store_to_local(dest_name, src_val);
+                        TypedValue::unsigned(src_val)
+                    }
+                    Arch::X86_64 => {
+                        // x86_64: allocate new struct, copy 24 bytes from source
+                        let new_struct = ctx.builder.create_sized_stack_slot(StackSlotData::new(
+                            StackSlotKind::ExplicitSlot, 24, 0));
+                        // Copy 3 x i64 (24 bytes)
+                        let v0 = ctx.builder.ins().load(I64, MemFlags::new(), src_val, 0);
+                        let v1 = ctx.builder.ins().load(I64, MemFlags::new(), src_val, 8);
+                        let v2 = ctx.builder.ins().load(I64, MemFlags::new(), src_val, 16);
+                        ctx.builder.ins().stack_store(v0, new_struct, 0);
+                        ctx.builder.ins().stack_store(v1, new_struct, 8);
+                        ctx.builder.ins().stack_store(v2, new_struct, 16);
+                        let new_addr = ctx.builder.ins().stack_addr(I64, new_struct, 0);
+                        ctx.store_to_local(dest_name, new_addr);
+                        TypedValue::unsigned(new_addr)
+                    }
                 }
             }
             _ => panic!("builtin '{name}' not yet implemented"),
@@ -944,13 +943,19 @@ impl Codegen {
             };
 
             // Build call signature matching actual arguments
+            let fixed_param_count = self.variadic_funcs.get(name).copied();
             let mut call_sig = self.module.make_signature();
             if is_struct_ret {
                 call_sig.params.push(AbiParam::new(I64));
             }
             for (i, &val) in arg_vals.iter().enumerate() {
                 let val_ty = ctx.builder.func.dfg.value_type(val);
-                if let Some(ref us) = user_sig {
+                let is_variadic_arg = fixed_param_count.is_some_and(|n| i >= n);
+                // On x86_64 SysV, variadic float args must be F64 in the signature
+                // so Cranelift places them in XMM registers (not GP registers).
+                if is_variadic_arg && self.arch == Arch::X86_64 && val_ty.is_float() {
+                    call_sig.params.push(AbiParam::new(F64));
+                } else if let Some(ref us) = user_sig {
                     if i < us.params.len() {
                         call_sig.params.push(AbiParam::new(us.params[i].value_type));
                     } else {
@@ -979,7 +984,6 @@ impl Codegen {
 
             // Coerce arguments to match call signature
             let sret_offset = if is_struct_ret { 1 } else { 0 };
-            let fixed_param_count = self.variadic_funcs.get(name).copied();
             let mut coerced_args = Vec::new();
             if let Some(addr) = sret_addr {
                 coerced_args.push(addr);
@@ -991,7 +995,16 @@ impl Codegen {
                     let f64_val = if val_ty == F32 {
                         ctx.builder.ins().fpromote(F64, val)
                     } else { val };
-                    coerced_args.push(ctx.builder.ins().bitcast(I64, MemFlags::new(), f64_val));
+                    match self.arch {
+                        Arch::Aarch64 => {
+                            // ARM64: all variadic args go on the stack as I64 (bitcast preserves bits)
+                            coerced_args.push(ctx.builder.ins().bitcast(I64, MemFlags::new(), f64_val));
+                        }
+                        Arch::X86_64 => {
+                            // x86_64: keep as F64 so it goes in XMM register per SysV ABI
+                            coerced_args.push(f64_val);
+                        }
+                    }
                 } else {
                     coerced_args.push(self.coerce(ctx, val, call_sig.params[i + sret_offset].value_type));
                 }
@@ -1101,8 +1114,16 @@ impl Codegen {
             sig.params.push(AbiParam::new(clif_ty));
         }
         // Add params for extra args: variadic or C's unspecified-param `()` syntax
-        for _ in arg_vals.iter().skip(param_ctypes.len()) {
-            sig.params.push(AbiParam::new(I64));
+        for (i, &val) in arg_vals.iter().enumerate() {
+            if i >= param_ctypes.len() {
+                let val_ty = ctx.builder.func.dfg.value_type(val);
+                // On x86_64 SysV, variadic float args must be F64 in the signature
+                if self.arch == Arch::X86_64 && val_ty.is_float() {
+                    sig.params.push(AbiParam::new(F64));
+                } else {
+                    sig.params.push(AbiParam::new(I64));
+                }
+            }
         }
         if !is_sret {
             if !matches!(&ret_cty, CType::Void) {
@@ -1132,7 +1153,10 @@ impl Codegen {
                     let f64_val = if val_ty == F32 {
                         ctx.builder.ins().fpromote(F64, val)
                     } else { val };
-                    coerced.push(ctx.builder.ins().bitcast(I64, MemFlags::new(), f64_val));
+                    match self.arch {
+                        Arch::Aarch64 => coerced.push(ctx.builder.ins().bitcast(I64, MemFlags::new(), f64_val)),
+                        Arch::X86_64 => coerced.push(f64_val),
+                    }
                 } else {
                     coerced.push(self.coerce(ctx, val, I64));
                 }

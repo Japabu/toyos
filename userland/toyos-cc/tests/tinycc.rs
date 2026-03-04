@@ -30,39 +30,42 @@ fn system_include_args() -> Vec<String> {
     }
 }
 
-fn run_test(name: &str, args: &[&str]) {
+/// Run a test with an optional cross-compilation target.
+/// When `target` is Some, compiles for that target and runs accordingly.
+fn run_test_with_target(name: &str, args: &[&str], target: Option<&str>) {
     let dir = testcases_dir();
     let c_file = dir.join(format!("{name}.c"));
     let expect_file = dir.join(format!("{name}.expect"));
 
     assert!(c_file.exists(), "missing test file: {}", c_file.display());
-    assert!(
-        expect_file.exists(),
-        "missing expect file: {}",
-        expect_file.display()
-    );
+    assert!(expect_file.exists(), "missing expect file: {}", expect_file.display());
 
     let expected = fs::read_to_string(&expect_file).unwrap();
 
-    let tmp = env::temp_dir().join(format!("toyos-cc-test-{name}"));
+    let suffix = target.map_or("".to_string(), |t| format!("-{t}"));
+    let tmp = env::temp_dir().join(format!("toyos-cc-test{suffix}-{name}"));
     let obj = tmp.with_extension("o");
     let bin = tmp.with_extension("bin");
 
     // Compile (run from testcases dir so __FILE__ uses relative path)
-    let compile = Command::new(toyos_cc())
-        .current_dir(&dir)
+    let mut compile_cmd = Command::new(toyos_cc());
+    compile_cmd.current_dir(&dir);
+    if let Some(t) = target {
+        compile_cmd.args(["--target", t]);
+    }
+    compile_cmd
         .args(["-c", "-o"])
         .arg(&obj)
         .args(system_include_args())
         .arg("-I")
         .arg(&dir)
-        .arg(format!("{name}.c"))
-        .output()
-        .expect("failed to run toyos-cc");
+        .arg(format!("{name}.c"));
 
+    let compile = compile_cmd.output().expect("failed to run toyos-cc");
+    let label = target.unwrap_or("native");
     assert!(
         compile.status.success(),
-        "toyos-cc failed to compile {name}.c:\nstdout: {}\nstderr: {}",
+        "toyos-cc ({label}) failed to compile {name}.c:\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&compile.stdout),
         String::from_utf8_lossy(&compile.stderr),
     );
@@ -71,48 +74,51 @@ fn run_test(name: &str, args: &[&str]) {
     let mut extra_objs = Vec::new();
     if let Some(idx) = name.find('_') {
         let prefix = &name[..idx];
-        let suffix = &name[idx..]; // e.g. "_inline"
-        let companion_name = format!("{}+{}.c", prefix, suffix);
+        let file_suffix = &name[idx..];
+        let companion_name = format!("{}+{}.c", prefix, file_suffix);
         let companion = dir.join(&companion_name);
         if companion.exists() {
             let extra_obj = tmp.with_extension("extra.o");
-            let cc_compile = Command::new(toyos_cc())
-                .current_dir(&dir)
+            let mut extra_cmd = Command::new(toyos_cc());
+            extra_cmd.current_dir(&dir);
+            if let Some(t) = target {
+                extra_cmd.args(["--target", t]);
+            }
+            extra_cmd
                 .args(["-c", "-o"])
                 .arg(&extra_obj)
                 .args(system_include_args())
                 .arg("-I")
                 .arg(&dir)
-                .arg(&companion)
-                .output()
-                .expect("failed to compile companion file");
+                .arg(&companion);
+            let cc_compile = extra_cmd.output().expect("failed to compile companion file");
             assert!(
                 cc_compile.status.success(),
-                "toyos-cc failed to compile companion {companion_name}:\nstderr: {}",
+                "toyos-cc ({label}) failed to compile companion {companion_name}:\nstderr: {}",
                 String::from_utf8_lossy(&cc_compile.stderr),
             );
             extra_objs.push(extra_obj);
         }
     }
 
-    // Link with toyos-ld
+    // Link
     let mut objects = vec![read_object(&obj)];
     for extra in &extra_objs {
         objects.push(read_object(extra));
     }
-
     let _ = fs::remove_file(&obj);
     for extra in &extra_objs {
         let _ = fs::remove_file(extra);
     }
 
-    let entry = if cfg!(target_os = "macos") { "_main" } else { "main" };
-    let linked = if cfg!(target_os = "macos") {
+    let is_macho = target.map_or(cfg!(target_os = "macos"), |t| t.contains("apple"));
+    let entry = if is_macho { "_main" } else { "main" };
+    let linked = if is_macho {
         toyos_ld::link_macho(&objects, entry, false)
     } else {
         toyos_ld::link_full(&objects, entry, false, false)
     };
-    let linked = linked.unwrap_or_else(|e| panic!("toyos-ld failed for {name}: {e}"));
+    let linked = linked.unwrap_or_else(|e| panic!("toyos-ld ({label}) failed for {name}: {e}"));
     fs::write(&bin, &linked).unwrap();
     #[cfg(unix)]
     {
@@ -120,28 +126,68 @@ fn run_test(name: &str, args: &[&str]) {
         fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
-    // Run
-    let run = Command::new(&bin)
-        .args(args)
-        .current_dir(&dir)
-        .output()
-        .expect("failed to run test binary");
+    // Run (use arch -x86_64 for x86_64 cross-compilation on ARM64 Mac)
+    let is_x86_64_cross = target.map_or(false, |t| t.starts_with("x86_64"));
+    let mut cmd = if is_x86_64_cross {
+        let mut c = Command::new("arch");
+        c.args(["-x86_64"]).arg(&bin);
+        c
+    } else {
+        Command::new(&bin)
+    };
+    cmd.args(args).current_dir(&dir);
+
+    let run = cmd.output().unwrap_or_else(|e| {
+        panic!("failed to run {name} ({label}): {e}");
+    });
 
     let _ = fs::remove_file(&bin);
 
     let actual = String::from_utf8_lossy(&run.stdout);
 
+    assert!(
+        run.status.success(),
+        "test binary {name} ({label}) failed with status {}:\nstdout: {}\nstderr: {}",
+        run.status,
+        actual,
+        String::from_utf8_lossy(&run.stderr),
+    );
+
     assert_eq!(
         actual.trim_end(),
         expected.trim_end(),
-        "output mismatch for {name}\n--- expected ---\n{}\n--- actual ---\n{}",
+        "output mismatch for {name} ({label})\n--- expected ---\n{}\n--- actual ---\n{}",
         expected.trim_end(),
         actual.trim_end(),
     );
 }
 
+fn run_test(name: &str, args: &[&str]) {
+    run_test_with_target(name, args, None);
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn run_test_x86_64(name: &str, args: &[&str]) {
+    run_test_with_target(name, args, Some("x86_64-apple-darwin"));
+}
+
+/// Each invocation generates a native test plus (on macOS ARM64) an x86_64
+/// Rosetta cross-compilation test in a submodule with the same name.
 macro_rules! tinycc_test {
     ($rust_name:ident, $file:expr) => {
+        #[test]
+        fn $rust_name() {
+            run_test($file, &[]);
+        }
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        mod $rust_name {
+            #[test]
+            fn x86_64() {
+                super::run_test_x86_64($file, &[]);
+            }
+        }
+    };
+    ($rust_name:ident, $file:expr, native_only) => {
         #[test]
         fn $rust_name() {
             run_test($file, &[]);
@@ -151,6 +197,13 @@ macro_rules! tinycc_test {
         #[test]
         fn $rust_name() {
             run_test($file, &[$($arg),*]);
+        }
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        mod $rust_name {
+            #[test]
+            fn x86_64() {
+                super::run_test_x86_64($file, &[$($arg),*]);
+            }
         }
     };
 }
@@ -176,7 +229,8 @@ tinycc_test!(t18_include, "18_include");
 tinycc_test!(t19_pointer_arithmetic, "19_pointer_arithmetic");
 tinycc_test!(t20_pointer_comparison, "20_pointer_comparison");
 tinycc_test!(t21_char_array, "21_char_array");
-tinycc_test!(t22_floating_point, "22_floating_point");
+// x86_64 `long double` is 80-bit; our compiler uses 64-bit double — skip x86_64.
+tinycc_test!(t22_floating_point, "22_floating_point", native_only);
 tinycc_test!(t23_type_coercion, "23_type_coercion");
 tinycc_test!(t24_math_library, "24_math_library");
 tinycc_test!(t25_quicksort, "25_quicksort");
@@ -264,85 +318,3 @@ tinycc_test!(t157_sizeof_member, "157_sizeof_member");
 tinycc_test!(t158_vla, "158_vla");
 tinycc_test!(t159_va_list, "159_va_list");
 tinycc_test!(t160_global_variadic, "160_global_variadic");
-
-// x86_64 cross-compilation tests (run under Rosetta on ARM64 Mac)
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn run_test_x86_64(name: &str, args: &[&str]) {
-    let dir = testcases_dir();
-    let c_file = dir.join(format!("{name}.c"));
-    let expect_file = dir.join(format!("{name}.expect"));
-
-    assert!(c_file.exists(), "missing test file: {}", c_file.display());
-    assert!(expect_file.exists(), "missing expect file: {}", expect_file.display());
-
-    let expected = fs::read_to_string(&expect_file).unwrap();
-
-    let tmp = env::temp_dir().join(format!("toyos-cc-test-x86_64-{name}"));
-    let obj = tmp.with_extension("o");
-    let bin = tmp.with_extension("bin");
-
-    // Compile targeting x86_64
-    let compile = Command::new(toyos_cc())
-        .current_dir(&dir)
-        .args(["--target", "x86_64-apple-darwin", "-c", "-o"])
-        .arg(&obj)
-        .args(system_include_args())
-        .arg("-I").arg(&dir)
-        .arg(format!("{name}.c"))
-        .output()
-        .expect("failed to run toyos-cc");
-
-    assert!(
-        compile.status.success(),
-        "toyos-cc (x86_64) failed to compile {name}.c:\nstdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&compile.stdout),
-        String::from_utf8_lossy(&compile.stderr),
-    );
-
-    // Link as x86_64 Mach-O
-    let objects = vec![read_object(&obj)];
-    let _ = fs::remove_file(&obj);
-    let linked = toyos_ld::link_macho(&objects, "_main", false)
-        .unwrap_or_else(|e| panic!("toyos-ld failed for {name} (x86_64): {e}"));
-    fs::write(&bin, &linked).unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
-    }
-
-    // Run under Rosetta
-    let run = Command::new("arch")
-        .args(["-x86_64"])
-        .arg(&bin)
-        .args(args)
-        .current_dir(&dir)
-        .output()
-        .expect("failed to run test binary under Rosetta");
-
-    let _ = fs::remove_file(&bin);
-
-    let actual = String::from_utf8_lossy(&run.stdout);
-
-    assert!(
-        run.status.success(),
-        "test binary {name} (x86_64) failed with status {}:\nstdout: {}\nstderr: {}",
-        run.status,
-        actual,
-        String::from_utf8_lossy(&run.stderr),
-    );
-
-    assert_eq!(
-        actual.trim_end(),
-        expected.trim_end(),
-        "output mismatch for {name} (x86_64)\n--- expected ---\n{}\n--- actual ---\n{}",
-        expected.trim_end(),
-        actual.trim_end(),
-    );
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[test]
-fn t159_va_list_x86_64() {
-    run_test_x86_64("159_va_list", &[]);
-}

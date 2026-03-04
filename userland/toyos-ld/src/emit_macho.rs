@@ -1,4 +1,4 @@
-use crate::collect::{collect_unique_symbols, LinkState, RelocType, SectionKind, SymbolDef, SymbolRef};
+use crate::collect::{Arch, collect_unique_symbols, LinkState, RelocType, SectionKind, SymbolDef, SymbolRef};
 use crate::reloc::resolve_symbol;
 use crate::{align_up, classify_sections, LinkError};
 use sha2::{Sha256, Digest};
@@ -356,18 +356,14 @@ pub(crate) struct MachOLayout {
 
     pub(crate) sizeofcmds: u32,
     pub(crate) ncmds: u32,
-    pub(crate) is_x86_64: bool,
+    pub(crate) arch: Arch,
     pub(crate) page_size: u64,
 }
 
 /// Compute the Mach-O layout: segment placement, GOT allocation.
 pub(crate) fn layout_macho(state: &mut LinkState) -> MachOLayout {
-    // Detect architecture from relocation types present
-    let is_x86_64 = state.relocs.iter().any(|r| matches!(r.r_type,
-        RelocType::X86_64 | RelocType::X86Pc32 | RelocType::X86Plt32
-        | RelocType::X86Gotpcrel | RelocType::X86Gotpcrelx
-        | RelocType::X86RexGotpcrelx | RelocType::X86_32 | RelocType::X86_32S));
-    let page_size = if is_x86_64 { PAGE_SIZE_X86_64 } else { PAGE_SIZE_ARM64 };
+    let arch = state.arch;
+    let page_size = match arch { Arch::X86_64 => PAGE_SIZE_X86_64, Arch::Aarch64 => PAGE_SIZE_ARM64 };
     let buckets = classify_sections(state);
 
     let got_symbols = collect_unique_symbols(state.relocs.iter(), |r| {
@@ -580,7 +576,7 @@ pub(crate) fn layout_macho(state: &mut LinkState) -> MachOLayout {
         got_entries,
         sizeofcmds,
         ncmds,
-        is_x86_64,
+        arch,
         page_size,
     }
 }
@@ -663,8 +659,8 @@ pub(crate) fn emit_macho_bytes(
     // ── Mach-O header ──
     let mut off = write_struct(&mut buf, 0, &MachHeader64 {
         magic: U32Le::new(MH_MAGIC_64),
-        cputype: U32Le::new(if layout.is_x86_64 { CPU_TYPE_X86_64 } else { CPU_TYPE_ARM64 }),
-        cpusubtype: U32Le::new(if layout.is_x86_64 { CPU_SUBTYPE_X86_64_ALL } else { CPU_SUBTYPE_ARM64_ALL }),
+        cputype: U32Le::new(match layout.arch { Arch::X86_64 => CPU_TYPE_X86_64, Arch::Aarch64 => CPU_TYPE_ARM64 }),
+        cpusubtype: U32Le::new(match layout.arch { Arch::X86_64 => CPU_SUBTYPE_X86_64_ALL, Arch::Aarch64 => CPU_SUBTYPE_ARM64_ALL }),
         filetype: U32Le::new(MH_EXECUTE),
         ncmds: U32Le::new(layout.ncmds),
         sizeofcmds: U32Le::new(layout.sizeofcmds),
@@ -712,7 +708,7 @@ pub(crate) fn emit_macho_bytes(
         addr: U64Le::new(layout.text_sec_vmaddr),
         size: U64Le::new(layout.text_sec_size),
         offset: U32Le::new(layout.text_sec_offset as u32),
-        align: U32Le::new(if layout.is_x86_64 { 4 } else { 2 }), // 2^4=16 or 2^2=4
+        align: U32Le::new(match layout.arch { Arch::X86_64 => 4, Arch::Aarch64 => 2 }), // 2^4=16 or 2^2=4
         reloff: U32Le::new(0),
         nreloc: U32Le::new(0),
         flags: U32Le::new(S_REGULAR | S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS),

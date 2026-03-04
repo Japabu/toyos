@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::fs;
 
 pub use collect::RelocType;
-use collect::{collect, synthesize_alloc_shims, gc_sections, merge_string_sections, is_archive, extract_archive, find_lib, scan_symbols, SectionIdx, SectionKind, SymbolDef, SymbolRef};
+use collect::{Arch, collect, synthesize_alloc_shims, gc_sections, merge_string_sections, is_archive, extract_archive, find_lib, scan_symbols, SectionIdx, SectionKind, SymbolDef, SymbolRef};
 use reloc::{ElfRelocParams, apply_relocs, apply_relocs_pe, MachORelocParams, apply_relocs_macho};
 use emit_elf::{layout_elf, build_eh_frame_hdr, ElfEmitMode, ElfLayout};
 use emit_pe::{layout_pe, emit_pe_bytes, PeLayout};
@@ -412,16 +412,11 @@ pub fn link_macho(
 fn create_call_stubs(state: &mut collect::LinkState) {
     use std::collections::BTreeSet;
 
-    let is_aarch64 = state.relocs.iter().any(|r| matches!(r.r_type,
-        RelocType::Aarch64Call26 | RelocType::Aarch64Jump26
-        | RelocType::Aarch64AdrPrelPgHi21 | RelocType::Aarch64AdrGotPage));
-
     // Find all dynamic symbols with call relocations
     let mut stub_syms = BTreeSet::new();
-    let call_relocs: &[RelocType] = if is_aarch64 {
-        &[RelocType::Aarch64Call26, RelocType::Aarch64Jump26]
-    } else {
-        &[RelocType::X86Plt32, RelocType::X86Pc32]
+    let call_relocs: &[RelocType] = match state.arch {
+        Arch::Aarch64 => &[RelocType::Aarch64Call26, RelocType::Aarch64Jump26],
+        Arch::X86_64 => &[RelocType::X86Plt32, RelocType::X86Pc32],
     };
     for reloc in &state.relocs {
         if !call_relocs.contains(&reloc.r_type) { continue; }
@@ -430,14 +425,20 @@ fn create_call_stubs(state: &mut collect::LinkState) {
         }
     }
 
+    // On x86_64, Cranelift emits `call *sym@GOTPCREL(%rip)` (FF 15 disp32) for
+    // external calls instead of `call sym@PLT`. Detect these and redirect them
+    // through stubs so we can set %al for the x86_64 SysV variadic ABI.
+    if matches!(state.arch, Arch::X86_64) {
+        rewrite_x86_64_got_calls(state, &mut stub_syms);
+    }
+
     if stub_syms.is_empty() { return; }
 
     let stub_sec_idx = SectionIdx(state.sections.len());
 
-    if is_aarch64 {
-        create_aarch64_stubs(state, &stub_syms, stub_sec_idx);
-    } else {
-        create_x86_64_stubs(state, &stub_syms, stub_sec_idx);
+    match state.arch {
+        Arch::Aarch64 => create_aarch64_stubs(state, &stub_syms, stub_sec_idx),
+        Arch::X86_64 => create_x86_64_stubs(state, &stub_syms, stub_sec_idx),
     }
 
     // Rewrite call relocations to target the stub symbols
@@ -448,6 +449,82 @@ fn create_call_stubs(state: &mut collect::LinkState) {
         {
             reloc.target = SymbolRef::Global(format!("{}.__stub", reloc.target.name()));
         }
+    }
+}
+
+/// Rewrite `movq sym@GOTPCREL(%rip), %reg` to `leaq sym.__stub(%rip), %reg`
+/// for dynamic symbols on x86_64. Cranelift loads function addresses from GOT
+/// then does `call *%reg`. By making the register hold the stub address instead,
+/// all calls to dynamic functions go through stubs that set %al for the x86_64
+/// SysV variadic calling convention.
+fn rewrite_x86_64_got_calls(
+    state: &mut collect::LinkState,
+    stub_syms: &mut std::collections::BTreeSet<String>,
+) {
+    // Collect indices of GOT_LOAD relocations targeting dynamic symbols
+    let rewrite_indices: Vec<usize> = state.relocs.iter().enumerate()
+        .filter(|(_, r)| {
+            if !matches!(r.r_type, RelocType::X86Gotpcrel | RelocType::X86Gotpcrelx | RelocType::X86RexGotpcrelx) {
+                return false;
+            }
+            if !matches!(state.globals.get(r.target.name()), Some(SymbolDef::Dynamic)) {
+                return false;
+            }
+            // Verify the instruction is MOV (opcode 8B at offset-2).
+            // Encoding: [REX 48/4C] [8B] [ModRM] [disp32×4]
+            //   REX at off-3, opcode at off-2, ModRM at off-1, disp32 at off..off+3
+            let sec = &state.sections[r.section];
+            let off = r.offset as usize;
+            if off < 2 || sec.data.get(off - 2).copied() != Some(0x8B) {
+                return false;
+            }
+            // Skip if the next instruction dereferences the loaded register.
+            // Cranelift emits `movq sym@GOT(%rip), %reg; movq (%reg), %dst`
+            // for global variable access — rewriting that would break data loads.
+            // Function calls have arg setup or `call *%reg` after the GOT load.
+            let modrm = sec.data[off - 1];
+            let dst_reg = (modrm >> 3) & 7; // register field from ModRM
+            let rex = sec.data.get(off - 3).copied().unwrap_or(0);
+            let dst_reg_full = dst_reg | if rex & 0x04 != 0 { 8 } else { 0 }; // REX.R
+            // Check at off+4 (after disp32): [optional REX] 8B [ModRM with rm=dst_reg, mod=00]
+            let next = off + 4;
+            let (next_rex, next_op_off) = match sec.data.get(next) {
+                Some(&b) if (0x40..=0x4F).contains(&b) => (b, next + 1),
+                _ => (0u8, next),
+            };
+            if sec.data.get(next_op_off).copied() == Some(0x8B) {
+                if let Some(&next_modrm) = sec.data.get(next_op_off + 1) {
+                    let next_mod = next_modrm >> 6;
+                    let next_rm = next_modrm & 7;
+                    let next_rm_full = next_rm | if next_rex & 0x01 != 0 { 8 } else { 0 };
+                    // mod=00 rm=reg means indirect through reg: `movq (%reg), ...`
+                    if next_mod == 0 && next_rm_full == dst_reg_full {
+                        return false; // data access pattern — don't rewrite
+                    }
+                }
+            }
+            true
+        })
+        .map(|(i, _)| i)
+        .collect();
+
+    for &i in &rewrite_indices {
+        let reloc = &state.relocs[i];
+        let sym_name = reloc.target.name().to_string();
+        let sec_idx = reloc.section;
+        let off = reloc.offset as usize;
+
+        // Change opcode from MOV (8B) to LEA (8D) — same encoding otherwise.
+        // This turns `movq *disp(%rip), %reg` (dereference GOT) into
+        // `leaq disp(%rip), %reg` (compute stub address).
+        state.sections[sec_idx].data[off - 2] = 0x8D;
+
+        stub_syms.insert(sym_name.clone());
+
+        // Change relocation from GOTPCREL → PC32 targeting the stub
+        state.relocs[i].r_type = RelocType::X86Pc32;
+        state.relocs[i].target = SymbolRef::Global(format!("{sym_name}.__stub"));
+        state.relocs[i].addend = -4;
     }
 }
 
@@ -498,23 +575,25 @@ fn create_x86_64_stubs(
     stub_syms: &std::collections::BTreeSet<String>,
     stub_sec_idx: SectionIdx,
 ) {
-    // x86-64 stub: 6 bytes + 2 padding = 8 bytes per stub
-    // Each stub:  jmpq *sym@GOTPCREL(%rip)  [FF 25 xx xx xx xx]
-    //             nop; nop                   [90 90]
+    // x86-64 stub: 8 bytes per stub
+    // Each stub:  mov $8, %al              [B0 08]
+    //             jmpq *sym@GOTPCREL(%rip) [FF 25 xx xx xx xx]
+    // The mov sets %al = 8 (max XMM arg count) for x86_64 SysV variadic calls.
+    // Non-variadic callees ignore %al, so this is safe for all dynamic calls.
     let stub_count = stub_syms.len();
     let mut stub_data = Vec::with_capacity(stub_count * 8);
     let mut stub_relocs = Vec::new();
 
     for (i, sym_name) in stub_syms.iter().enumerate() {
         let offset = (i * 8) as u64;
+        // B0 08 = mov $8, %al — conservative upper bound on vector register args
+        stub_data.extend_from_slice(&[0xB0, 0x08]);
         // FF 25 00000000 = jmpq *0(%rip) — placeholder, patched by GOTPCREL reloc
         stub_data.extend_from_slice(&[0xFF, 0x25, 0x00, 0x00, 0x00, 0x00]);
-        // padding
-        stub_data.extend_from_slice(&[0x90, 0x90]);
 
-        // GOTPCREL reloc at offset+2 (the 4-byte displacement after FF 25)
+        // GOTPCREL reloc at offset+4 (the 4-byte displacement after FF 25)
         stub_relocs.push(collect::InputReloc {
-            section: stub_sec_idx, offset: offset + 2,
+            section: stub_sec_idx, offset: offset + 4,
             r_type: RelocType::X86Gotpcrel,
             target: SymbolRef::Global(sym_name.clone()), addend: -4,
         });
