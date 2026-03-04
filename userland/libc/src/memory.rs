@@ -58,34 +58,11 @@ pub unsafe extern "C" fn realloc(ptr: *mut u8, new_size: usize) -> *mut u8 {
     new
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn memcpy(dst: *mut u8, src: *const u8, n: usize) -> *mut u8 {
-    ptr::copy_nonoverlapping(src, dst, n);
-    dst
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn memmove(dst: *mut u8, src: *const u8, n: usize) -> *mut u8 {
-    ptr::copy(src, dst, n);
-    dst
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn memset(s: *mut u8, c: i32, n: usize) -> *mut u8 {
-    ptr::write_bytes(s, c as u8, n);
-    s
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn memcmp(a: *const u8, b: *const u8, n: usize) -> i32 {
-    for i in 0..n {
-        let diff = *a.add(i) as i32 - *b.add(i) as i32;
-        if diff != 0 {
-            return diff;
-        }
-    }
-    0
-}
+// memcpy, memmove, memset, memcmp are provided by compiler-builtins
+// (rust/library/compiler-builtins/compiler-builtins/src/mem/x86_64.rs)
+// using optimized rep movsb/movsq inline asm. Don't redefine them here
+// or ptr::copy_nonoverlapping will call our memcpy which calls
+// ptr::copy_nonoverlapping — infinite recursion.
 
 #[no_mangle]
 pub unsafe extern "C" fn memchr(s: *const u8, c: i32, n: usize) -> *mut u8 {
