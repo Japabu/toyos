@@ -41,6 +41,7 @@ pub struct InitializerItem {
 pub enum Designator {
     Field(String),
     Index(Box<Expr>),
+    #[allow(dead_code)] // GCC range designator: parsed but not yet used in codegen
     IndexRange(Box<Expr>, Box<Expr>),
 }
 
@@ -49,6 +50,7 @@ pub enum Designator {
 pub enum DeclSpecifier {
     StorageClass(StorageClass),
     TypeSpec(TypeSpec),
+    #[allow(dead_code)] // parsed but type qualifiers not yet applied in codegen
     TypeQual(TypeQual),
     FuncSpec(FuncSpec),
 }
@@ -135,6 +137,7 @@ pub struct Declarator {
 
 #[derive(Debug, Clone)]
 pub struct Pointer {
+    #[allow(dead_code)] // parsed but pointer qualifiers not yet applied in codegen
     pub qualifiers: Vec<TypeQual>,
 }
 
@@ -196,6 +199,7 @@ pub enum Statement {
     Return(Option<Expr>),
     Goto(String),
     Label(String, Box<Statement>),
+    #[allow(dead_code)] // parsed but inline asm not yet emitted in codegen
     Asm(AsmStmt),
 }
 
@@ -211,6 +215,7 @@ pub enum BlockItem {
     Stmt(Statement),
 }
 
+#[allow(dead_code)] // parsed but inline asm not yet emitted in codegen
 #[derive(Debug, Clone)]
 pub struct AsmStmt {
     pub volatile: bool,
@@ -220,6 +225,7 @@ pub struct AsmStmt {
     pub clobbers: Vec<String>,
 }
 
+#[allow(dead_code)] // parsed but inline asm not yet emitted in codegen
 #[derive(Debug, Clone)]
 pub struct AsmOperand {
     pub constraint: String,

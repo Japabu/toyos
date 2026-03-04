@@ -104,7 +104,8 @@ impl CType {
     pub fn signedness(&self) -> Signedness {
         use Signedness::*;
         match self {
-            CType::Bool | CType::Pointer(_) | CType::Enum(_) => Unsigned,
+            CType::Bool | CType::Pointer(_) => Unsigned,
+            CType::Enum(_) => Signed,
             CType::Char(s) | CType::Short(s) | CType::Int(s)
             | CType::Long(s) | CType::LongLong(s) | CType::Int128(s) => *s,
             CType::Void | CType::Float | CType::Double | CType::LongDouble
@@ -260,7 +261,10 @@ impl CType {
             // Bitfield promotion: width determines result type
             if w == 0 { return ty; }
             if w < 32 { return CType::Int(Signedness::Signed); }  // fits in int
-            if w == 32 { return CType::Int(Signedness::Unsigned); } // unsigned int
+            if w == 32 {
+                // signed int:32 fits in int; unsigned int:32 stays unsigned
+                return CType::Int(ty.signedness());
+            }
             return ty; // > 32 bits: keep original type
         }
         // Non-bitfield integer promotion: small types promote to int

@@ -59,18 +59,8 @@ impl Codegen {
                     let c = ctx.builder.ins().fcmp(FloatCC::GreaterThanOrEqual, l, r);
                     Self::safe_uextend(ctx, int_type, c)
                 }
-                BinOp::LogAnd => {
-                    let l_bool = self.to_bool(ctx, l);
-                    let r_bool = self.to_bool(ctx, r);
-                    let result = ctx.builder.ins().band(l_bool, r_bool);
-                    Self::safe_uextend(ctx, int_type, result)
-                }
-                BinOp::LogOr => {
-                    let l_bool = self.to_bool(ctx, l);
-                    let r_bool = self.to_bool(ctx, r);
-                    let result = ctx.builder.ins().bor(l_bool, r_bool);
-                    Self::safe_uextend(ctx, int_type, result)
-                }
+                // LogAnd/LogOr are handled with short-circuit in compile_binary
+                BinOp::LogAnd | BinOp::LogOr => unreachable!("short-circuit handled in compile_binary"),
                 // Bitwise/shift ops don't apply to floats — treat as integer
                 BinOp::Mod | BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor
                 | BinOp::Shl | BinOp::Shr => {
@@ -132,18 +122,8 @@ impl Codegen {
                     let c = ctx.builder.ins().icmp(cc, l, r);
                     Self::safe_uextend(ctx, cmp_result, c)
                 }
-                BinOp::LogAnd => {
-                    let l_bool = self.to_bool(ctx, l);
-                    let r_bool = self.to_bool(ctx, r);
-                    let result = ctx.builder.ins().band(l_bool, r_bool);
-                    Self::safe_uextend(ctx, cmp_result, result)
-                }
-                BinOp::LogOr => {
-                    let l_bool = self.to_bool(ctx, l);
-                    let r_bool = self.to_bool(ctx, r);
-                    let result = ctx.builder.ins().bor(l_bool, r_bool);
-                    Self::safe_uextend(ctx, cmp_result, result)
-                }
+                // LogAnd/LogOr are handled with short-circuit in compile_binary
+                BinOp::LogAnd | BinOp::LogOr => unreachable!("short-circuit handled in compile_binary"),
             }
         };
         TypedValue::new(val, result_sign)

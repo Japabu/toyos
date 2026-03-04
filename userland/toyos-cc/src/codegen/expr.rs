@@ -243,10 +243,10 @@ impl Codegen {
             }
             UnaryOp::LogNot => {
                 let v = self.compile_expr(ctx, e).raw();
-                let vt = ctx.builder.func.dfg.value_type(v);
-                let zero = ctx.builder.ins().iconst(vt, 0);
-                let is_zero = ctx.builder.ins().icmp(IntCC::Equal, v, zero);
-                TypedValue::signed(Self::safe_uextend(ctx, vt, is_zero))
+                let is_nonzero = self.to_bool(ctx, v);
+                let zero = ctx.builder.ins().iconst(I8, 0);
+                let is_zero = ctx.builder.ins().icmp(IntCC::Equal, is_nonzero, zero);
+                TypedValue::signed(Self::safe_uextend(ctx, I32, is_zero))
             }
             UnaryOp::Deref => {
                 let ptr = self.compile_expr(ctx, e).raw();
@@ -275,9 +275,7 @@ impl Codegen {
                     if let Some((LocalStorage::Ssa(var), _)) = ctx.locals.get(name.as_str()) {
                         let var = *var;
                         let val = ctx.builder.use_var(var);
-                        let vt = ctx.builder.func.dfg.value_type(val);
-                        let step = ctx.builder.ins().iconst(vt, stride);
-                        let new_val = if is_inc { ctx.builder.ins().iadd(val, step) } else { ctx.builder.ins().isub(val, step) };
+                        let new_val = Self::inc_dec(ctx, val, stride, is_inc);
                         ctx.builder.def_var(var, new_val);
                         return TypedValue::new(new_val, sign);
                     }
@@ -285,8 +283,7 @@ impl Codegen {
                 let mem_ty = self.clif_type(&ety);
                 let addr = self.compile_addr(ctx, e);
                 let val = ctx.builder.ins().load(mem_ty, MemFlags::new(), addr, 0);
-                let step = ctx.builder.ins().iconst(mem_ty, stride);
-                let new_val = if is_inc { ctx.builder.ins().iadd(val, step) } else { ctx.builder.ins().isub(val, step) };
+                let new_val = Self::inc_dec(ctx, val, stride, is_inc);
                 ctx.builder.ins().store(MemFlags::new(), new_val, addr, 0);
                 TypedValue::new(new_val, sign)
             }
@@ -295,17 +292,13 @@ impl Codegen {
 
     fn compile_post_unary(&mut self, ctx: &mut FuncCtx, op: &PostOp, e: &Expr) -> TypedValue {
         let stride = self.pointer_stride(ctx, e);
+        let is_inc = matches!(op, PostOp::PostInc);
         let sign = self.expr_type(ctx, e).signedness();
         if let Expr::Ident(name) = e {
             if let Some((LocalStorage::Ssa(var), _)) = ctx.locals.get(name.as_str()) {
                 let var = *var;
                 let val = ctx.builder.use_var(var);
-                let vt = ctx.builder.func.dfg.value_type(val);
-                let step = ctx.builder.ins().iconst(vt, stride);
-                let new_val = match op {
-                    PostOp::PostInc => ctx.builder.ins().iadd(val, step),
-                    PostOp::PostDec => ctx.builder.ins().isub(val, step),
-                };
+                let new_val = Self::inc_dec(ctx, val, stride, is_inc);
                 ctx.builder.def_var(var, new_val);
                 return TypedValue::new(val, sign);
             }
@@ -314,13 +307,25 @@ impl Codegen {
         let mem_ty = self.clif_type(&ety);
         let addr = self.compile_addr(ctx, e);
         let val = ctx.builder.ins().load(mem_ty, MemFlags::new(), addr, 0);
-        let step = ctx.builder.ins().iconst(mem_ty, stride);
-        let new_val = match op {
-            PostOp::PostInc => ctx.builder.ins().iadd(val, step),
-            PostOp::PostDec => ctx.builder.ins().isub(val, step),
-        };
+        let new_val = Self::inc_dec(ctx, val, stride, is_inc);
         ctx.builder.ins().store(MemFlags::new(), new_val, addr, 0);
         TypedValue::new(val, sign)
+    }
+
+    /// Emit val +/- stride, handling both int and float types.
+    fn inc_dec(ctx: &mut FuncCtx, val: Value, stride: i64, is_inc: bool) -> Value {
+        let vt = ctx.builder.func.dfg.value_type(val);
+        if vt.is_float() {
+            let step = if vt == F32 {
+                ctx.builder.ins().f32const(stride as f32)
+            } else {
+                ctx.builder.ins().f64const(stride as f64)
+            };
+            if is_inc { ctx.builder.ins().fadd(val, step) } else { ctx.builder.ins().fsub(val, step) }
+        } else {
+            let step = ctx.builder.ins().iconst(vt, stride);
+            if is_inc { ctx.builder.ins().iadd(val, step) } else { ctx.builder.ins().isub(val, step) }
+        }
     }
 
     fn compile_cast(&mut self, ctx: &mut FuncCtx, tn: &TypeName, e: &Expr) -> TypedValue {
