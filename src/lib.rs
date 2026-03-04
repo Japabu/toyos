@@ -317,6 +317,8 @@ cfg_if! {
         #[path = "apple-other.rs"] mod imp;
     } else if #[cfg(all(target_arch = "wasm32", target_os = "wasi"))] {
         #[path = "wasi.rs"] mod imp;
+    } else if #[cfg(target_os = "toyos")] {
+        #[path = "toyos.rs"] mod imp;
     } else if #[cfg(target_os = "hermit")] {
         #[path = "hermit.rs"] mod imp;
     } else if #[cfg(target_os = "vxworks")] {
