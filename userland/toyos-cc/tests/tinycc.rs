@@ -263,3 +263,86 @@ tinycc_test!(t156_sizeof_array_count, "156_sizeof_array_count");
 tinycc_test!(t157_sizeof_member, "157_sizeof_member");
 tinycc_test!(t158_vla, "158_vla");
 tinycc_test!(t159_va_list, "159_va_list");
+tinycc_test!(t160_global_variadic, "160_global_variadic");
+
+// x86_64 cross-compilation tests (run under Rosetta on ARM64 Mac)
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn run_test_x86_64(name: &str, args: &[&str]) {
+    let dir = testcases_dir();
+    let c_file = dir.join(format!("{name}.c"));
+    let expect_file = dir.join(format!("{name}.expect"));
+
+    assert!(c_file.exists(), "missing test file: {}", c_file.display());
+    assert!(expect_file.exists(), "missing expect file: {}", expect_file.display());
+
+    let expected = fs::read_to_string(&expect_file).unwrap();
+
+    let tmp = env::temp_dir().join(format!("toyos-cc-test-x86_64-{name}"));
+    let obj = tmp.with_extension("o");
+    let bin = tmp.with_extension("bin");
+
+    // Compile targeting x86_64
+    let compile = Command::new(toyos_cc())
+        .current_dir(&dir)
+        .args(["--target", "x86_64-apple-darwin", "-c", "-o"])
+        .arg(&obj)
+        .args(system_include_args())
+        .arg("-I").arg(&dir)
+        .arg(format!("{name}.c"))
+        .output()
+        .expect("failed to run toyos-cc");
+
+    assert!(
+        compile.status.success(),
+        "toyos-cc (x86_64) failed to compile {name}.c:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&compile.stdout),
+        String::from_utf8_lossy(&compile.stderr),
+    );
+
+    // Link as x86_64 Mach-O
+    let objects = vec![read_object(&obj)];
+    let _ = fs::remove_file(&obj);
+    let linked = toyos_ld::link_macho(&objects, "_main", false)
+        .unwrap_or_else(|e| panic!("toyos-ld failed for {name} (x86_64): {e}"));
+    fs::write(&bin, &linked).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    // Run under Rosetta
+    let run = Command::new("arch")
+        .args(["-x86_64"])
+        .arg(&bin)
+        .args(args)
+        .current_dir(&dir)
+        .output()
+        .expect("failed to run test binary under Rosetta");
+
+    let _ = fs::remove_file(&bin);
+
+    let actual = String::from_utf8_lossy(&run.stdout);
+
+    assert!(
+        run.status.success(),
+        "test binary {name} (x86_64) failed with status {}:\nstdout: {}\nstderr: {}",
+        run.status,
+        actual,
+        String::from_utf8_lossy(&run.stderr),
+    );
+
+    assert_eq!(
+        actual.trim_end(),
+        expected.trim_end(),
+        "output mismatch for {name} (x86_64)\n--- expected ---\n{}\n--- actual ---\n{}",
+        expected.trim_end(),
+        actual.trim_end(),
+    );
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn t159_va_list_x86_64() {
+    run_test_x86_64("159_va_list", &[]);
+}
