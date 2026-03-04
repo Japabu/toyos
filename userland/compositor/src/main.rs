@@ -763,11 +763,11 @@ fn main() {
             };
             let n = syscall::read_fd(kb_fd, buf);
             for event in &events[..n / std::mem::size_of::<window::KeyEvent>()] {
-                if launcher_open && event.keycode == 0x29 {
+                if launcher_open && event.pressed() && event.keycode == 0x29 {
                     // Escape: close launcher
                     launcher_open = false;
                     mark_dirty(&mut dirty_rect, DirtyRect::full(screen_w as usize, screen_h as usize));
-                } else if event.alt() && event.keycode == 0x2B {
+                } else if event.pressed() && event.alt() && event.keycode == 0x2B {
                     // Alt+Tab: rotate focus
                     if windows.len() > 1 {
                         let win = windows.pop().unwrap();
@@ -777,7 +777,7 @@ fn main() {
                         }
                         mark_dirty(&mut dirty_rect, DirtyRect::full(screen_w as usize, screen_h as usize));
                     }
-                } else if event.gui() {
+                } else if event.pressed() && event.gui() {
                     if let Some(idx) = focused_window_idx(&windows) {
                         let pixel_format = screen.pixel_format_raw();
                         match event.keycode {
@@ -848,7 +848,7 @@ fn main() {
                         }
                         mark_dirty(&mut dirty_rect, DirtyRect::full(screen_w as usize, screen_h as usize));
                     }
-                } else if event.ctrl() && event.keycode == 0x11 {
+                } else if event.pressed() && event.ctrl() && event.keycode == 0x11 {
                     // Ctrl+N: spawn terminal
                     Command::new("/initrd/terminal").spawn().ok();
                 } else if event.len > 0 {
