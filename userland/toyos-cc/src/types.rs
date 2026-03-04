@@ -211,6 +211,7 @@ impl CType {
         let def = match self {
             CType::Struct(def) => def,
             CType::Union(_) => return self.union_field(name),
+            CType::Pointer(inner) => return inner.field_offset(name),
             _ => panic!("field_offset called on non-struct/union type: {self:?}"),
         };
         let (_, result) = Self::walk_struct_layout(def, |byte_offset, bit_offset, field| {
