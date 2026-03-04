@@ -63,7 +63,7 @@ fn schedule(cur_state: ProcessState) {
         let new_rsp = new_proc.kernel_rsp;
         let new_cr3 = new_proc.cr3;
         let new_fs_base = new_proc.fs_base;
-        let new_ks_top = new_proc.kernel_stack_base as u64 + KERNEL_STACK_SIZE as u64;
+        let new_ks_top = new_proc.kernel_stack.ptr() as u64 + KERNEL_STACK_SIZE as u64;
 
         table.procs.get_mut(new_pid).unwrap().state = ProcessState::Running;
         percpu::set_current_pid(new_pid);
@@ -135,7 +135,7 @@ fn cpu_idle_loop() -> ! {
                 let new_rsp = new_proc.kernel_rsp;
                 let new_cr3 = new_proc.cr3;
                 let new_fs_base = new_proc.fs_base;
-                let new_ks_top = new_proc.kernel_stack_base as u64 + KERNEL_STACK_SIZE as u64;
+                let new_ks_top = new_proc.kernel_stack.ptr() as u64 + KERNEL_STACK_SIZE as u64;
 
                 table.procs.get_mut(new_pid).unwrap().state = ProcessState::Running;
                 percpu::set_current_pid(new_pid);
@@ -166,7 +166,7 @@ pub fn idle_unlock_and_loop() -> ! {
 }
 
 /// Check whether a BlockedPoll process has any ready FDs.
-fn poll_has_ready_fd(poll_fds: &[u64; 8], len: u32, fds: &fd::FdTable) -> bool {
+fn poll_has_ready_fd(poll_fds: &[u64; 64], len: u32, fds: &fd::FdTable) -> bool {
     poll_fds[..len as usize].iter().any(|&fd_num| fd::has_data(fds, fd_num))
 }
 
@@ -195,7 +195,7 @@ fn idle_poll(table: &mut ProcessTable) {
             ProcessState::BlockedPipeRead(id) if crate::pipe::has_data(id) => {
                 proc.state = ProcessState::Ready;
             }
-            ProcessState::BlockedPipeWrite(_) => {
+            ProcessState::BlockedPipeWrite(id) if crate::pipe::has_space(id) => {
                 proc.state = ProcessState::Ready;
             }
             ProcessState::BlockedWaitPid(child_pid) | ProcessState::BlockedThreadJoin(child_pid) => {

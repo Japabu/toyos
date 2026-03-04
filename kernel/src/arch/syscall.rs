@@ -247,59 +247,61 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
 
 fn sys_write(fd_num: u64, buf: &[u8]) -> u64 {
     loop {
-        let result = process::with_current_mut(|proc| fd::try_write(&mut proc.fds, fd_num, buf));
-        match result {
-            Some(n) => {
-                let pipe_id = process::with_current(|proc| match proc.fds.get(fd_num) {
-                    Some(fd::Descriptor::PipeWrite(id)) | Some(fd::Descriptor::TtyWrite(id)) => Some(*id),
-                    _ => None,
-                });
-                if let Some(pipe_id) = pipe_id {
-                    process::wake_pipe_readers(pipe_id);
+        // Single lock: try write + determine wake/block action
+        let action = process::with_current_mut(|proc| {
+            match fd::try_write(&mut proc.fds, fd_num, buf) {
+                Some(n) => {
+                    let pipe_id = match proc.fds.get(fd_num) {
+                        Some(fd::Descriptor::PipeWrite(id)) | Some(fd::Descriptor::TtyWrite(id)) => Some(*id),
+                        _ => None,
+                    };
+                    Ok((n, pipe_id))
                 }
+                None => match proc.fds.get(fd_num) {
+                    Some(fd::Descriptor::PipeWrite(id)) | Some(fd::Descriptor::TtyWrite(id)) =>
+                        Err(Some(process::ProcessState::BlockedPipeWrite(*id))),
+                    _ => Err(None),
+                },
+            }
+        });
+        match action {
+            Ok((n, pipe_id)) => {
+                if let Some(id) = pipe_id { process::wake_pipe_readers(id); }
                 return n;
             }
-            None => {
-                let reason = process::with_current(|proc| match proc.fds.get(fd_num) {
-                    Some(fd::Descriptor::PipeWrite(id)) | Some(fd::Descriptor::TtyWrite(id)) =>
-                        Some(process::ProcessState::BlockedPipeWrite(*id)),
-                    _ => None,
-                });
-                match reason {
-                    Some(r) => process::block(r),
-                    None => return u64::MAX,
-                }
-            }
+            Err(Some(reason)) => process::block(reason),
+            Err(None) => return u64::MAX,
         }
     }
 }
 
 fn sys_read(fd_num: u64, buf: &mut [u8]) -> u64 {
     loop {
-        let result = process::with_current_mut(|proc| fd::try_read(&mut proc.fds, fd_num, buf));
-        match result {
-            Some(n) => {
-                let pipe_id = process::with_current(|proc| match proc.fds.get(fd_num) {
-                    Some(fd::Descriptor::PipeRead(id)) | Some(fd::Descriptor::TtyRead(id)) => Some(*id),
-                    _ => None,
-                });
-                if let Some(pipe_id) = pipe_id {
-                    process::wake_pipe_writers(pipe_id);
+        // Single lock: try read + determine wake/block action
+        let action = process::with_current_mut(|proc| {
+            match fd::try_read(&mut proc.fds, fd_num, buf) {
+                Some(n) => {
+                    let pipe_id = match proc.fds.get(fd_num) {
+                        Some(fd::Descriptor::PipeRead(id)) | Some(fd::Descriptor::TtyRead(id)) => Some(*id),
+                        _ => None,
+                    };
+                    Ok((n, pipe_id))
                 }
+                None => match proc.fds.get(fd_num) {
+                    Some(fd::Descriptor::Keyboard) => Err(Some(process::ProcessState::BlockedKeyboard)),
+                    Some(fd::Descriptor::PipeRead(id)) | Some(fd::Descriptor::TtyRead(id)) =>
+                        Err(Some(process::ProcessState::BlockedPipeRead(*id))),
+                    _ => Err(None),
+                },
+            }
+        });
+        match action {
+            Ok((n, pipe_id)) => {
+                if let Some(id) = pipe_id { process::wake_pipe_writers(id); }
                 return n;
             }
-            None => {
-                let reason = process::with_current(|proc| match proc.fds.get(fd_num) {
-                    Some(fd::Descriptor::Keyboard) => Some(process::ProcessState::BlockedKeyboard),
-                    Some(fd::Descriptor::PipeRead(id)) | Some(fd::Descriptor::TtyRead(id)) =>
-                        Some(process::ProcessState::BlockedPipeRead(*id)),
-                    _ => None,
-                });
-                match reason {
-                    Some(r) => process::block(r),
-                    None => return u64::MAX,
-                }
-            }
+            Err(Some(reason)) => process::block(reason),
+            Err(None) => return u64::MAX,
         }
     }
 }
@@ -312,20 +314,19 @@ fn sys_open(path: &str, flags: u64) -> u64 {
 
 fn sys_close(fd_num: u64) -> u64 {
     let pid = process::current_pid();
-    let wake = process::with_current(|proc| match proc.fds.get(fd_num) {
-        Some(fd::Descriptor::PipeWrite(id)) | Some(fd::Descriptor::TtyWrite(id)) => Some((true, *id)),
-        Some(fd::Descriptor::PipeRead(id)) | Some(fd::Descriptor::TtyRead(id)) => Some((false, *id)),
-        _ => None,
-    });
-    let result = process::with_current_mut(|proc| {
-        fd::close(&mut proc.fds, &mut *vfs::lock(), fd_num, pid)
+    // Single lock: determine wake target + close
+    let (result, wake) = process::with_current_mut(|proc| {
+        let wake = match proc.fds.get(fd_num) {
+            Some(fd::Descriptor::PipeWrite(id)) | Some(fd::Descriptor::TtyWrite(id)) => Some((true, *id)),
+            Some(fd::Descriptor::PipeRead(id)) | Some(fd::Descriptor::TtyRead(id)) => Some((false, *id)),
+            _ => None,
+        };
+        let r = fd::close(&mut proc.fds, &mut *vfs::lock(), fd_num, pid);
+        (r, wake)
     });
     if let Some((is_write, pipe_id)) = wake {
-        if is_write {
-            process::wake_pipe_readers(pipe_id);
-        } else {
-            process::wake_pipe_writers(pipe_id);
-        }
+        if is_write { process::wake_pipe_readers(pipe_id); }
+        else { process::wake_pipe_writers(pipe_id); }
     }
     result
 }
@@ -429,6 +430,20 @@ fn sys_spawn(text: &str, fds: fd::FdTable) -> u64 {
 
 fn sys_waitpid(pid: u64) -> u64 {
     let child_pid = pid as u32;
+    let caller = crate::arch::percpu::current_pid();
+
+    // Validate that the target is actually our child process
+    let valid = {
+        let guard = process::PROCESS_TABLE.lock();
+        let table = guard.as_ref().expect("process table not initialized");
+        table.procs.get(child_pid).map_or(false, |p| {
+            matches!(p.kind, process::Kind::Process { parent: Some(ppid) } if ppid == caller)
+        })
+    };
+    if !valid {
+        return u64::MAX;
+    }
+
     loop {
         if let Some(code) = process::collect_zombie(child_pid) {
             return code as u64;
@@ -463,8 +478,8 @@ fn sys_poll(fds: &[u64], fds_len: u64, timeout_nanos: u64) -> u64 {
         if deadline > 0 && crate::clock::nanos_since_boot() >= deadline {
             return 0;
         }
-        let mut poll_fds = [0u64; 8];
-        let copy_len = (fds_len as usize).min(8);
+        let mut poll_fds = [0u64; 64];
+        let copy_len = (fds_len as usize).min(64);
         poll_fds[..copy_len].copy_from_slice(&fds[..copy_len]);
         process::block(process::ProcessState::BlockedPoll { fds: poll_fds, len: copy_len as u32, deadline });
     }
@@ -488,14 +503,16 @@ fn sys_recv_msg(out: &mut message::UserMessage) -> u64 {
                 let addr = with_heap_owner(|heap| {
                     user_heap::alloc(heap, msg.payload.len(), 8)
                 });
-                if addr != 0 {
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(
-                            msg.payload.as_ptr(),
-                            addr as *mut u8,
-                            msg.payload.len(),
-                        );
-                    }
+                if addr == 0 {
+                    // Bug 6 fix: OOM — don't deliver corrupt message (data=0, len>0)
+                    return u64::MAX;
+                }
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        msg.payload.as_ptr(),
+                        addr as *mut u8,
+                        msg.payload.len(),
+                    );
                 }
                 (addr, msg.payload.len() as u64)
             } else {
@@ -577,6 +594,20 @@ fn sys_release_shared(token: u64) -> u64 {
 
 fn sys_thread_join(tid: u64) -> u64 {
     let tid = tid as u32;
+    let caller = crate::arch::percpu::current_pid();
+
+    // Validate that the target is actually our child thread
+    let valid = {
+        let guard = process::PROCESS_TABLE.lock();
+        let table = guard.as_ref().expect("process table not initialized");
+        table.procs.get(tid).map_or(false, |p| {
+            matches!(p.kind, process::Kind::Thread { parent } if parent == caller)
+        })
+    };
+    if !valid {
+        return u64::MAX;
+    }
+
     loop {
         if let Some(_code) = process::collect_zombie(tid) {
             return 0;
@@ -633,7 +664,8 @@ fn sys_sysinfo(buf: &mut [u8]) -> u64 {
             process::Kind::Thread { parent } => (1u8, parent),
             process::Kind::Process { parent } => (0u8, parent.unwrap_or(u32::MAX)),
         };
-        let memory = (proc.elf_layout.size() + proc.stack_layout.size()) as u64;
+        let memory = (proc.elf_alloc.as_ref().map_or(0, |a| a.size())
+            + proc.stack_alloc.as_ref().map_or(0, |a| a.size())) as u64;
 
         buf[pos..pos + 4].copy_from_slice(&pid.to_le_bytes());
         buf[pos + 4..pos + 8].copy_from_slice(&parent_pid.to_le_bytes());
@@ -734,16 +766,14 @@ fn sys_dlopen(path: &str) -> u64 {
     };
 
     // Map loaded library memory into the current process's address space
-    let alloc_size = ((lib.load_size + paging::PAGE_2M as usize - 1) & !(paging::PAGE_2M as usize - 1)) as u64;
-    paging::map_user(lib.base_ptr as u64, alloc_size);
+    paging::map_user(lib.alloc.ptr() as u64, lib.alloc.size() as u64);
 
     // Store in process and return handle (index)
-    let handle = process::with_current_mut(|proc| {
+    process::with_current_mut(|proc| {
         let idx = proc.loaded_libs.len();
         proc.loaded_libs.push(lib);
         idx as u64
-    });
-    handle
+    })
 }
 
 fn sys_dlsym(handle: u64, name: &str) -> u64 {

@@ -29,7 +29,7 @@ fn next_token() -> u32 {
 /// Allocate 2MB-aligned shared memory. Maps it as USER in the owner's page tables.
 /// Returns (token, physical address).
 pub fn alloc(size: u64, owner_pid: u32, owner_pml4: *mut u64) -> (u32, u64) {
-    let aligned_size = ((size + PAGE_2M - 1) & !(PAGE_2M - 1)) as usize;
+    let aligned_size = paging::align_2m(size as usize);
     let layout = Layout::from_size_align(aligned_size, PAGE_2M as usize).unwrap();
     let ptr = unsafe { alloc_zeroed(layout) };
     assert!(!ptr.is_null(), "shared_memory: allocation failed");

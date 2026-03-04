@@ -18,7 +18,7 @@ pub fn new_heap() -> Vec<(u64, u64)> {
 }
 
 fn grow(heap: &mut Vec<(u64, u64)>, min_size: usize) -> bool {
-    let size = (min_size.max(CHUNK_SIZE) + PAGE_2M as usize - 1) & !(PAGE_2M as usize - 1);
+    let size = paging::align_2m(min_size.max(CHUNK_SIZE));
     let layout = Layout::from_size_align(size, PAGE_2M as usize).unwrap();
     let ptr = unsafe { alloc_zeroed(layout) };
     if ptr.is_null() {

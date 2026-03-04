@@ -97,6 +97,12 @@ pub fn has_data(pipe_id: usize) -> bool {
     })
 }
 
+pub fn has_space(pipe_id: usize) -> bool {
+    with_pipes(|pipes| {
+        pipes.get(pipe_id).map_or(false, |p| p.space() > 0 || p.readers == 0)
+    })
+}
+
 pub fn all_empty() -> bool {
     with_pipes(|pipes| pipes.iter().all(|(_, pipe)| pipe.available() == 0))
 }

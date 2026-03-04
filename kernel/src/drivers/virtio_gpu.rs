@@ -6,7 +6,7 @@ use alloc::boxed::Box;
 use super::pci::PciDevice;
 use super::virtio::{BufDir, Virtqueue, VirtioDevice, VIRTIO_F_VERSION_1};
 use super::DmaPool;
-use crate::arch::paging::PAGE_2M;
+use crate::arch::paging::{self, PAGE_2M};
 use crate::gpu::{FLAG_HARDWARE_CURSOR, Gpu, GpuInfo};
 use crate::log;
 use crate::shared_memory;
@@ -448,7 +448,7 @@ pub fn init(ecam_base: u64) -> Option<(Box<dyn Gpu>, GpuInfo)> {
     // Allocate framebuffer backing stores (2MB-aligned).
     // We allocate two for kernel FramebufferInfo compatibility but only use buffer 0.
     let fb_size = (width * height * 4) as usize;
-    let fb_aligned = (fb_size + PAGE_2M as usize - 1) & !(PAGE_2M as usize - 1);
+    let fb_aligned = paging::align_2m(fb_size);
     let fb_layout = Layout::from_size_align(fb_aligned, PAGE_2M as usize).unwrap();
     let mut tokens = [0u32; 2];
     for i in 0..2 {
@@ -469,7 +469,7 @@ pub fn init(ecam_base: u64) -> Option<(Box<dyn Gpu>, GpuInfo)> {
 
     // Create cursor resource (64x64, BGRA with alpha)
     let cursor_bytes = (CURSOR_SIZE * CURSOR_SIZE * 4) as usize;
-    let cursor_aligned = (cursor_bytes + PAGE_2M as usize - 1) & !(PAGE_2M as usize - 1);
+    let cursor_aligned = paging::align_2m(cursor_bytes);
     let cursor_layout = Layout::from_size_align(cursor_aligned, PAGE_2M as usize).unwrap();
     let cursor_ptr = unsafe { alloc_zeroed(cursor_layout) };
     assert!(!cursor_ptr.is_null(), "VirtIO GPU: cursor alloc failed");

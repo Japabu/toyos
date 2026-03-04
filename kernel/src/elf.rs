@@ -1,8 +1,8 @@
-use alloc::alloc::{alloc_zeroed, Layout};
 use alloc::borrow::Cow;
 
-use crate::arch::paging::PAGE_2M;
+use crate::arch::paging::{self, PAGE_2M};
 use crate::log;
+use crate::process::OwnedAlloc;
 use elf::ElfBytes;
 use elf::endian::AnyEndian;
 use elf::abi::{
@@ -10,11 +10,10 @@ use elf::abi::{
     DT_SYMTAB, DT_STRTAB, DT_NULL, DT_NEEDED, DT_RELA, DT_RELASZ, SHT_DYNSYM,
 };
 
-pub struct LoadedElf {
+/// Metadata about a loaded ELF binary (no ownership — the OwnedAlloc is separate).
+pub struct LoadedElfInfo {
     pub entry: u64,
     pub base: u64,
-    pub base_ptr: *mut u8,
-    pub load_size: usize,
     /// Runtime address of TLS template data (.tdata) in the loaded image.
     pub tls_template: u64,
     /// Size of initialized TLS data (.tdata).
@@ -26,8 +25,8 @@ pub struct LoadedElf {
 /// Parse, validate, and load an ELF binary into memory.
 ///
 /// Allocates page-aligned memory, copies PT_LOAD segments, and applies relocations.
-/// Returns the entry point and allocation info, or an error message.
-pub fn load(data: &[u8]) -> Result<LoadedElf, &'static str> {
+/// Returns the owning allocation and metadata, or an error message.
+pub fn load(data: &[u8]) -> Result<(OwnedAlloc, LoadedElfInfo), &'static str> {
     let elf = match ElfBytes::<AnyEndian>::minimal_parse(data) {
         Ok(e) => e,
         Err(_) => return Err("ELF: parse error"),
@@ -63,17 +62,14 @@ pub fn load(data: &[u8]) -> Result<LoadedElf, &'static str> {
         return Err("ELF: no loadable segments");
     }
 
-    let load_size = ((vaddr_max - vaddr_min) as usize + PAGE_2M as usize - 1) & !(PAGE_2M as usize - 1);
+    let load_size = paging::align_2m((vaddr_max - vaddr_min) as usize);
 
     // Allocate 2MB-aligned memory for the loaded image
-    let layout = match Layout::from_size_align(load_size, PAGE_2M as usize) {
-        Ok(l) => l,
-        Err(_) => return Err("ELF: invalid layout"),
+    let alloc = match OwnedAlloc::new(load_size, PAGE_2M as usize) {
+        Some(a) => a,
+        None => return Err("ELF: allocation failed"),
     };
-    let base_ptr = unsafe { alloc_zeroed(layout) };
-    if base_ptr.is_null() {
-        return Err("ELF: allocation failed");
-    }
+    let base_ptr = alloc.ptr();
     let base = base_ptr as u64 - vaddr_min;
     log!("ELF: allocated {} bytes at {:#x}, base={:#x}", load_size, base_ptr as u64, base);
 
@@ -121,23 +117,20 @@ pub fn load(data: &[u8]) -> Result<LoadedElf, &'static str> {
         }
     }
 
-    Ok(LoadedElf {
+    Ok((alloc, LoadedElfInfo {
         entry: base + ehdr.e_entry,
         base,
-        base_ptr,
-        load_size,
         tls_template,
         tls_filesz,
         tls_memsz,
-    })
+    }))
 }
 
 // ── Dynamic linking ──────────────────────────────────────────────────────
 
 pub struct LoadedLib {
+    pub alloc: OwnedAlloc,
     pub base: u64,
-    pub base_ptr: *mut u8,
-    pub load_size: usize,
     pub dynsym: u64,
     pub dynstr: u64,
     pub sym_count: usize,
@@ -177,15 +170,12 @@ pub fn load_shared_lib(data: &[u8]) -> Result<LoadedLib, &'static str> {
         return Err("dlopen: no loadable segments");
     }
 
-    let load_size = ((vaddr_max - vaddr_min) as usize + PAGE_2M as usize - 1) & !(PAGE_2M as usize - 1);
-    let layout = match Layout::from_size_align(load_size, PAGE_2M as usize) {
-        Ok(l) => l,
-        Err(_) => return Err("dlopen: invalid layout"),
+    let load_size = paging::align_2m((vaddr_max - vaddr_min) as usize);
+    let alloc = match OwnedAlloc::new(load_size, PAGE_2M as usize) {
+        Some(a) => a,
+        None => return Err("dlopen: allocation failed"),
     };
-    let base_ptr = unsafe { alloc_zeroed(layout) };
-    if base_ptr.is_null() {
-        return Err("dlopen: allocation failed");
-    }
+    let base_ptr = alloc.ptr();
     let base = base_ptr as u64 - vaddr_min;
 
     // Copy PT_LOAD segments
@@ -254,7 +244,7 @@ pub fn load_shared_lib(data: &[u8]) -> Result<LoadedLib, &'static str> {
     log!("dlopen: loaded {} bytes at {:#x}, {} relocs, {} dynsyms",
         load_size, base_ptr as u64, reloc_count, sym_count);
 
-    Ok(LoadedLib { base, base_ptr, load_size, dynsym, dynstr, sym_count })
+    Ok(LoadedLib { alloc, base, dynsym, dynstr, sym_count })
 }
 
 /// Look up a symbol by name in a loaded shared library.
@@ -367,7 +357,7 @@ pub fn resolve_dynamic_deps(
 
         match load_shared_lib(&so_data) {
             Ok(lib) => {
-                log!("dynamic: loaded {} at {:#x} ({} syms)", lib_name, lib.base_ptr as u64, lib.sym_count);
+                log!("dynamic: loaded {} at {:#x} ({} syms)", lib_name, lib.alloc.ptr() as u64, lib.sym_count);
                 libs.push(lib);
             }
             Err(e) => return Err(alloc::format!("failed to load {}: {}", lib_name, e)),

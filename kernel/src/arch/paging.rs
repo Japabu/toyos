@@ -15,6 +15,11 @@ const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 const PAGE_4K: u64 = 4096;
 pub const PAGE_2M: u64 = 2 * 1024 * 1024;
 
+/// Round `size` up to the next 2MB boundary.
+pub const fn align_2m(size: usize) -> usize {
+    (size + PAGE_2M as usize - 1) & !(PAGE_2M as usize - 1)
+}
+
 /// Kernel PML4 template. All per-process PML4s are deep-cloned from this.
 /// Written once during init(), read-only afterwards (except map_kernel at boot).
 static mut KERNEL_PML4: *mut u64 = null_mut();
