@@ -40,6 +40,10 @@ sys_rng = ["dep:rand_core"]
 cfg-if = "1"
 rand_core = { version = "0.10.0", optional = true }
 
+# toyos
+[target.'cfg(target_os = "toyos")'.dependencies]
+toyos-abi = { git = "https://github.com/Japabu/toyos-abi" }
+
 # getrandom / linux_android_with_fallback
 [target.'cfg(all(any(target_os = "linux", target_os = "android"), not(any(all(target_os = "linux", target_env = ""), getrandom_backend = "custom", getrandom_backend = "linux_raw", getrandom_backend = "rdrand", getrandom_backend = "rndr"))))'.dependencies]
 libc = { version = "0.2.154", default-features = false }
