@@ -36,6 +36,30 @@ fn write_padded(w: &mut BufWriter, s: &str, width: usize, pad: char, left: bool)
     }
 }
 
+/// Write an integer string with optional precision (minimum digits, zero-padded).
+/// `prefix_len` is the number of leading non-digit characters (sign: '-', '+', ' ').
+unsafe fn write_int_padded(
+    w: &mut BufWriter, s: &str, prefix_len: usize,
+    width: usize, pad_char: char, left_align: bool, precision: Option<usize>,
+) {
+    if let Some(prec) = precision {
+        let digit_len = s.len() - prefix_len;
+        if digit_len < prec {
+            let mut padded = [0u8; 48];
+            let mut p = 0;
+            for &b in s[..prefix_len].as_bytes() { padded[p] = b; p += 1; }
+            for _ in 0..(prec - digit_len) { padded[p] = b'0'; p += 1; }
+            for &b in s[prefix_len..].as_bytes() { padded[p] = b; p += 1; }
+            let s2 = core::str::from_utf8_unchecked(&padded[..p]);
+            write_padded(w, s2, width, ' ', left_align);
+            return;
+        }
+        write_padded(w, s, width, ' ', left_align);
+    } else {
+        write_padded(w, s, width, pad_char, left_align);
+    }
+}
+
 fn format_signed<'a>(val: i64, buf: &'a mut [u8; 24], plus: bool, space: bool) -> &'a str {
     let negative = val < 0;
     let abs = if negative { (val as i128).unsigned_abs() as u64 } else { val as u64 };
@@ -158,31 +182,32 @@ unsafe fn do_printf(buf: *mut u8, n: usize, fmt: *const u8, ap: &mut VaList<'_>)
                 let val: i64 = if long_long || long { ap.arg::<i64>() } else { ap.arg::<i32>() as i64 };
                 let mut tmp = [0u8; 24];
                 let s = format_signed(val, &mut tmp, plus_sign, space_sign);
-                write_padded(&mut w, s, width, pad_char, left_align);
+                let prefix = s.len() - s.trim_start_matches(|c: char| !c.is_ascii_digit()).len();
+                write_int_padded(&mut w, s, prefix, width, pad_char, left_align, precision);
             }
             b'u' => {
                 let val: u64 = if long_long || long { ap.arg::<u64>() } else { ap.arg::<u32>() as u64 };
                 let mut tmp = [0u8; 24];
                 let s = format_unsigned(val, 10, false, &mut tmp);
-                write_padded(&mut w, s, width, pad_char, left_align);
+                write_int_padded(&mut w, s, 0, width, pad_char, left_align, precision);
             }
             b'x' => {
                 let val: u64 = if long_long || long { ap.arg::<u64>() } else { ap.arg::<u32>() as u64 };
                 let mut tmp = [0u8; 20];
                 let s = format_unsigned(val, 16, false, &mut tmp);
-                write_padded(&mut w, s, width, pad_char, left_align);
+                write_int_padded(&mut w, s, 0, width, pad_char, left_align, precision);
             }
             b'X' => {
                 let val: u64 = if long_long || long { ap.arg::<u64>() } else { ap.arg::<u32>() as u64 };
                 let mut tmp = [0u8; 20];
                 let s = format_unsigned(val, 16, true, &mut tmp);
-                write_padded(&mut w, s, width, pad_char, left_align);
+                write_int_padded(&mut w, s, 0, width, pad_char, left_align, precision);
             }
             b'o' => {
                 let val: u64 = if long_long || long { ap.arg::<u64>() } else { ap.arg::<u32>() as u64 };
                 let mut tmp = [0u8; 24];
                 let s = format_unsigned(val, 8, false, &mut tmp);
-                write_padded(&mut w, s, width, pad_char, left_align);
+                write_int_padded(&mut w, s, 0, width, pad_char, left_align, precision);
             }
             b'c' => {
                 let c = ap.arg::<i32>() as u8;
@@ -273,12 +298,12 @@ pub unsafe extern "C" fn vfprintf(f: *mut super::stdio::FILE, fmt: *const u8, mu
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn vprintf(fmt: *const u8, mut ap: VaList<'_>) -> i32 {
+pub unsafe extern "C" fn vprintf(fmt: *const u8, ap: VaList<'_>) -> i32 {
     vfprintf(super::stdio::stdout, fmt, ap)
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn vsprintf(buf: *mut u8, fmt: *const u8, mut ap: VaList<'_>) -> i32 {
+pub unsafe extern "C" fn vsprintf(buf: *mut u8, fmt: *const u8, ap: VaList<'_>) -> i32 {
     vsnprintf(buf, usize::MAX, fmt, ap)
 }
 

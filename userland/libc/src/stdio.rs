@@ -1,58 +1,83 @@
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::ptr;
-use toyos_abi::syscall;
 
-/// Minimal FILE implementation backed by ToyOS file descriptors.
-#[repr(C)]
+/// FILE backed by std I/O — works on both ToyOS and the host.
 pub struct FILE {
-    fd: u64,
+    kind: FileKind,
     eof: bool,
     error: bool,
 }
 
-static mut STDOUT_FILE: FILE = FILE { fd: 1, eof: false, error: false };
-static mut STDERR_FILE: FILE = FILE { fd: 2, eof: false, error: false };
+enum FileKind {
+    Stdout,
+    Stderr,
+    Stdin,
+    Owned(std::fs::File),
+}
+
+static mut STDOUT_FILE: FILE = FILE { kind: FileKind::Stdout, eof: false, error: false };
+static mut STDERR_FILE: FILE = FILE { kind: FileKind::Stderr, eof: false, error: false };
+static mut STDIN_FILE: FILE = FILE { kind: FileKind::Stdin, eof: false, error: false };
 
 #[no_mangle]
 pub static mut stdout: *mut FILE = &raw mut STDOUT_FILE;
 #[no_mangle]
 pub static mut stderr: *mut FILE = &raw mut STDERR_FILE;
 #[no_mangle]
-pub static mut stdin: *mut FILE = ptr::null_mut();
+pub static mut stdin: *mut FILE = &raw mut STDIN_FILE;
 
 #[no_mangle]
 pub unsafe extern "C" fn fopen(path: *const u8, mode: *const u8) -> *mut FILE {
     let path_len = super::string::strlen(path);
-    let mode_str = mode;
-    let mut flags: u64 = match *mode_str {
-        b'r' => 0, // O_RDONLY
-        b'w' => 1 | 0x40 | 0x200, // O_WRONLY | O_CREAT | O_TRUNC
-        b'a' => 1 | 0x40 | 0x400, // O_WRONLY | O_CREAT | O_APPEND
+    let path_str = core::str::from_utf8_unchecked(core::slice::from_raw_parts(path, path_len));
+
+    let file = match *mode {
+        b'r' => {
+            let mut opts = std::fs::OpenOptions::new();
+            opts.read(true);
+            if *mode.add(1) == b'+' || (*mode.add(1) != 0 && *mode.add(2) == b'+') {
+                opts.write(true);
+            }
+            opts.open(path_str)
+        }
+        b'w' => {
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create(true).truncate(true);
+            if *mode.add(1) == b'+' || (*mode.add(1) != 0 && *mode.add(2) == b'+') {
+                opts.read(true);
+            }
+            opts.open(path_str)
+        }
+        b'a' => {
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create(true).append(true);
+            if *mode.add(1) == b'+' || (*mode.add(1) != 0 && *mode.add(2) == b'+') {
+                opts.read(true);
+            }
+            opts.open(path_str)
+        }
         _ => return ptr::null_mut(),
     };
-    if *mode_str.add(1) == b'+' || (*mode_str.add(1) != 0 && *mode_str.add(2) == b'+') {
-        flags = (flags & !3) | 2; // O_RDWR
-    }
 
-    let fd = syscall::open(path, path_len, flags);
-    if fd == u64::MAX {
-        return ptr::null_mut();
-    }
+    let file = match file {
+        Ok(f) => f,
+        Err(_) => return ptr::null_mut(),
+    };
 
     let f = super::memory::malloc(core::mem::size_of::<FILE>()) as *mut FILE;
     if f.is_null() {
-        syscall::close(fd);
         return ptr::null_mut();
     }
-    ptr::write(f, FILE { fd, eof: false, error: false });
+    ptr::write(f, FILE { kind: FileKind::Owned(file), eof: false, error: false });
     f
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn fclose(f: *mut FILE) -> i32 {
-    if f.is_null() || f == stdout || f == stderr {
+    if f.is_null() || f == stdout || f == stderr || f == stdin {
         return -1;
     }
-    syscall::close((*f).fd);
+    ptr::drop_in_place(f);
     super::memory::free(f as *mut u8);
     0
 }
@@ -63,15 +88,19 @@ pub unsafe extern "C" fn fread(buf: *mut u8, size: usize, count: usize, f: *mut 
         return 0;
     }
     let total = size * count;
+    let slice = core::slice::from_raw_parts_mut(buf, total);
     let mut read_so_far = 0;
     while read_so_far < total {
-        let n = syscall::read((*f).fd, buf.add(read_so_far), total - read_so_far);
-        if n == 0 || n == u64::MAX {
-            if n == 0 { (*f).eof = true; }
-            if n == u64::MAX { (*f).error = true; }
-            break;
+        let result = match &mut (*f).kind {
+            FileKind::Stdin => std::io::stdin().read(&mut slice[read_so_far..]),
+            FileKind::Owned(file) => file.read(&mut slice[read_so_far..]),
+            _ => return read_so_far / size,
+        };
+        match result {
+            Ok(0) => { (*f).eof = true; break; }
+            Ok(n) => read_so_far += n,
+            Err(_) => { (*f).error = true; break; }
         }
-        read_so_far += n as usize;
     }
     read_so_far / size
 }
@@ -82,27 +111,42 @@ pub unsafe extern "C" fn fwrite(buf: *const u8, size: usize, count: usize, f: *m
         return 0;
     }
     let total = size * count;
-    let n = syscall::write((*f).fd, buf, total);
-    if n == u64::MAX {
-        (*f).error = true;
-        return 0;
+    let slice = core::slice::from_raw_parts(buf, total);
+    let result = match &mut (*f).kind {
+        FileKind::Stdout => std::io::stdout().write(slice),
+        FileKind::Stderr => std::io::stderr().write(slice),
+        FileKind::Owned(file) => file.write(slice),
+        FileKind::Stdin => return 0,
+    };
+    match result {
+        Ok(n) => n / size,
+        Err(_) => { (*f).error = true; 0 }
     }
-    n as usize / size
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn fseek(f: *mut FILE, offset: i64, whence: i32) -> i32 {
     if f.is_null() { return -1; }
     (*f).eof = false;
-    let result = syscall::seek((*f).fd, offset, whence as u64);
-    if result == u64::MAX { -1 } else { 0 }
+    let pos = match whence {
+        0 => SeekFrom::Start(offset as u64),
+        1 => SeekFrom::Current(offset),
+        2 => SeekFrom::End(offset),
+        _ => return -1,
+    };
+    match &mut (*f).kind {
+        FileKind::Owned(file) => if file.seek(pos).is_ok() { 0 } else { -1 },
+        _ => -1,
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn ftell(f: *mut FILE) -> i64 {
     if f.is_null() { return -1; }
-    let pos = syscall::seek((*f).fd, 0, 1); // SEEK_CUR
-    if pos == u64::MAX { -1 } else { pos as i64 }
+    match &mut (*f).kind {
+        FileKind::Owned(file) => file.stream_position().map_or(-1, |p| p as i64),
+        _ => -1,
+    }
 }
 
 #[no_mangle]
@@ -139,9 +183,8 @@ pub unsafe extern "C" fn fflush(_f: *mut FILE) -> i32 {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn fileno(f: *mut FILE) -> i32 {
-    if f.is_null() { return -1; }
-    (*f).fd as i32
+pub unsafe extern "C" fn fileno(_f: *mut FILE) -> i32 {
+    -1 // no raw fd access
 }
 
 #[no_mangle]
@@ -224,8 +267,7 @@ pub unsafe extern "C" fn ungetc(_c: i32, _f: *mut FILE) -> i32 {
 #[no_mangle]
 pub unsafe extern "C" fn remove(path: *const u8) -> i32 {
     let path_len = super::string::strlen(path);
-    let path_slice = core::slice::from_raw_parts(path, path_len);
-    let path_str = core::str::from_utf8_unchecked(path_slice);
+    let path_str = core::str::from_utf8_unchecked(core::slice::from_raw_parts(path, path_len));
     if std::fs::remove_file(path_str).is_ok() { 0 } else { -1 }
 }
 
@@ -253,14 +295,11 @@ pub unsafe extern "C" fn perror(s: *const u8) {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn fdopen(fd: i32, _mode: *const u8) -> *mut FILE {
-    let f = super::memory::malloc(core::mem::size_of::<FILE>()) as *mut FILE;
-    if f.is_null() { return ptr::null_mut(); }
-    ptr::write(f, FILE { fd: fd as u64, eof: false, error: false });
-    f
+pub unsafe extern "C" fn fdopen(_fd: i32, _mode: *const u8) -> *mut FILE {
+    ptr::null_mut() // no raw fd support
 }
 
-// Misc stdlib functions that use stdio or syscalls
+// Misc stdlib functions
 
 #[no_mangle]
 pub unsafe extern "C" fn exit(code: i32) -> ! {
@@ -355,13 +394,11 @@ pub unsafe extern "C" fn qsort(
     size: usize,
     cmp: extern "C" fn(*const u8, *const u8) -> i32,
 ) {
-    // Simple insertion sort (good enough for DOOM's small arrays)
     if count <= 1 { return; }
     let tmp = super::memory::malloc(size);
     for i in 1..count {
         let mut j = i;
         while j > 0 && cmp(base.add(j * size), base.add((j - 1) * size)) < 0 {
-            // Swap elements j and j-1
             ptr::copy_nonoverlapping(base.add(j * size), tmp, size);
             ptr::copy_nonoverlapping(base.add((j - 1) * size), base.add(j * size), size);
             ptr::copy_nonoverlapping(tmp, base.add((j - 1) * size), size);

@@ -1,4 +1,5 @@
 use std::fs;
+use std::path::Path;
 
 /// Pre-rasterize a TTF font into a flat bitmap format.
 ///
@@ -87,19 +88,22 @@ pub fn collect() -> Vec<(String, Vec<u8>)> {
     let font_data = rasterize_font(&ttf, 8, 16);
     files.push(("JetBrainsMono-8x16.font".to_string(), font_data));
 
-    let wallpaper = fs::read("assets/wallpaper.jpg").expect("Failed to read wallpaper");
-    files.push(("wallpaper.jpg".to_string(), wallpaper));
-
-    for entry in fs::read_dir("assets/icons").expect("Failed to read assets/icons") {
-        let entry = entry.expect("Failed to read dir entry");
-        let path = entry.path();
-        if path.extension().map_or(false, |e| e == "svg") {
-            let stem = path.file_stem().unwrap().to_str().unwrap();
-            let name = format!("{stem}.svg");
-            let data = fs::read(&path).expect("Failed to read SVG asset");
-            files.push((name, data));
+    // Include all other files in assets/ (recursively, skipping the TTF)
+    fn add_dir(dir: &Path, files: &mut Vec<(String, Vec<u8>)>) {
+        for entry in fs::read_dir(dir).unwrap_or_else(|e| panic!("Failed to read {}: {e}", dir.display())) {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                add_dir(&path, files);
+            } else if path.extension().is_some_and(|e| e == "ttf") {
+                continue; // TTF handled above via rasterization
+            } else {
+                let name = path.file_name().unwrap().to_str().unwrap().to_lowercase();
+                let data = fs::read(&path).unwrap_or_else(|e| panic!("Failed to read {}: {e}", path.display()));
+                files.push((name, data));
+            }
         }
     }
+    add_dir(Path::new("assets"), &mut files);
 
     files
 }
