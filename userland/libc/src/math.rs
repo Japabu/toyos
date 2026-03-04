@@ -1,8 +1,10 @@
 use core::f64::consts::PI;
 
+// --- Transcendentals (hand-rolled: LLVM would emit calls to these same symbols) ---
+
 #[no_mangle]
 pub extern "C" fn sin(x: f64) -> f64 {
-    // Taylor series for sin(x), normalized to [-PI, PI]
+    // Taylor series, reduced to [-PI, PI]
     let mut x = x % (2.0 * PI);
     if x > PI { x -= 2.0 * PI; }
     if x < -PI { x += 2.0 * PI; }
@@ -33,7 +35,6 @@ pub extern "C" fn atan(x: f64) -> f64 {
 
 #[no_mangle]
 pub extern "C" fn atan2(y: f64, x: f64) -> f64 {
-    // CORDIC-style approximation
     if x == 0.0 {
         if y > 0.0 { return PI / 2.0; }
         if y < 0.0 { return -PI / 2.0; }
@@ -49,43 +50,54 @@ pub extern "C" fn atan2(y: f64, x: f64) -> f64 {
 }
 
 #[no_mangle]
-pub extern "C" fn sqrt(x: f64) -> f64 {
-    if x < 0.0 { return f64::NAN; }
-    if x == 0.0 { return 0.0; }
-    let mut guess = x;
-    for _ in 0..64 {
-        guess = (guess + x / guess) * 0.5;
+pub extern "C" fn log(x: f64) -> f64 {
+    if x <= 0.0 { return f64::NAN; }
+    let bits = x.to_bits();
+    let e = ((bits >> 52) & 0x7FF) as i64 - 1023;
+    let m = f64::from_bits((bits & 0x000FFFFFFFFFFFFF) | 0x3FF0000000000000);
+    let t = (m - 1.0) / (m + 1.0);
+    let t2 = t * t;
+    let ln_m = 2.0 * t * (1.0 + t2 / 3.0 + t2 * t2 / 5.0 + t2 * t2 * t2 / 7.0);
+    ln_m + e as f64 * core::f64::consts::LN_2
+}
+
+#[no_mangle]
+pub extern "C" fn log2(x: f64) -> f64 {
+    log(x) / core::f64::consts::LN_2
+}
+
+#[no_mangle]
+pub extern "C" fn log10(x: f64) -> f64 {
+    log(x) / core::f64::consts::LN_10
+}
+
+#[no_mangle]
+pub extern "C" fn exp(x: f64) -> f64 {
+    exp_approx(x)
+}
+
+fn exp_approx(x: f64) -> f64 {
+    if x > 709.0 { return f64::INFINITY; }
+    if x < -709.0 { return 0.0; }
+    let k = (x / core::f64::consts::LN_2) as i64;
+    let r = x - k as f64 * core::f64::consts::LN_2;
+    let mut sum = 1.0;
+    let mut term = 1.0;
+    for i in 1..16 {
+        term *= r / i as f64;
+        sum += term;
     }
-    guess
-}
-
-#[no_mangle]
-pub extern "C" fn fabs(x: f64) -> f64 {
-    if x < 0.0 { -x } else { x }
-}
-
-#[no_mangle]
-pub extern "C" fn ceil(x: f64) -> f64 {
-    let i = x as i64;
-    if x > i as f64 { (i + 1) as f64 } else { i as f64 }
-}
-
-#[no_mangle]
-pub extern "C" fn floor(x: f64) -> f64 {
-    let i = x as i64;
-    if (i as f64) > x { (i - 1) as f64 } else { i as f64 }
-}
-
-#[no_mangle]
-pub extern "C" fn round(x: f64) -> f64 {
-    floor(x + 0.5)
+    // 2^k via IEEE 754 bit manipulation; clamp to valid biased exponent range
+    let biased = k + 1023;
+    if biased <= 0 { return 0.0; }
+    if biased >= 2047 { return f64::INFINITY; }
+    f64::from_bits((biased as u64) << 52) * sum
 }
 
 #[no_mangle]
 pub extern "C" fn pow(base: f64, exp: f64) -> f64 {
     if exp == 0.0 { return 1.0; }
     if base == 0.0 { return 0.0; }
-    // Integer exponent fast path
     let ei = exp as i32;
     if exp == ei as f64 {
         let mut result = 1.0;
@@ -98,47 +110,76 @@ pub extern "C" fn pow(base: f64, exp: f64) -> f64 {
         }
         if ei < 0 { 1.0 / result } else { result }
     } else {
-        // exp(exp * ln(base))
-        let ln_base = log(base);
-        exp_approx(exp * ln_base)
+        exp_approx(exp * log(base))
     }
 }
 
 #[no_mangle]
 pub extern "C" fn fmod(x: f64, y: f64) -> f64 {
-    x - (x / y) as i64 as f64 * y
+    // trunc() compiles to roundsd (hardware instruction), safe to call
+    x - (x / y).trunc() * y
+}
+
+// --- Hardware-backed (LLVM emits inline instructions, no symbol calls) ---
+
+#[no_mangle]
+pub extern "C" fn sqrt(x: f64) -> f64 { x.sqrt() }
+
+#[no_mangle]
+pub extern "C" fn fabs(x: f64) -> f64 { x.abs() }
+
+#[no_mangle]
+pub extern "C" fn ceil(x: f64) -> f64 { x.ceil() }
+
+#[no_mangle]
+pub extern "C" fn floor(x: f64) -> f64 { x.floor() }
+
+#[no_mangle]
+pub extern "C" fn round(x: f64) -> f64 { x.round() }
+
+#[no_mangle]
+pub extern "C" fn trunc(x: f64) -> f64 { x.trunc() }
+
+#[no_mangle]
+pub extern "C" fn sqrtf(x: f32) -> f32 { x.sqrt() }
+
+#[no_mangle]
+pub extern "C" fn fabsf(x: f32) -> f32 { x.abs() }
+
+#[no_mangle]
+pub extern "C" fn floorf(x: f32) -> f32 { x.floor() }
+
+#[no_mangle]
+pub extern "C" fn ceilf(x: f32) -> f32 { x.ceil() }
+
+// --- Utility functions ---
+
+#[no_mangle]
+pub extern "C" fn ldexp(x: f64, exp: i32) -> f64 {
+    // x * 2^exp via bit manipulation
+    x * f64::from_bits(((exp as i64 + 1023) as u64) << 52)
 }
 
 #[no_mangle]
-pub extern "C" fn log(x: f64) -> f64 {
-    if x <= 0.0 { return f64::NAN; }
-    // Reduce x to [1, 2) and compute ln(x) = ln(m * 2^e) = ln(m) + e * ln(2)
+pub unsafe extern "C" fn frexp(x: f64, exp: *mut i32) -> f64 {
+    if x == 0.0 {
+        *exp = 0;
+        return 0.0;
+    }
     let bits = x.to_bits();
-    let e = ((bits >> 52) & 0x7FF) as i64 - 1023;
-    let m = f64::from_bits((bits & 0x000FFFFFFFFFFFFF) | 0x3FF0000000000000);
-    // ln(m) for m in [1, 2): Padé approximation
-    let t = (m - 1.0) / (m + 1.0);
-    let t2 = t * t;
-    let ln_m = 2.0 * t * (1.0 + t2 / 3.0 + t2 * t2 / 5.0 + t2 * t2 * t2 / 7.0);
-    ln_m + e as f64 * core::f64::consts::LN_2
+    let biased = ((bits >> 52) & 0x7FF) as i32;
+    *exp = biased - 1022; // exponent such that x = mantissa * 2^exp, mantissa in [0.5, 1.0)
+    f64::from_bits((bits & 0x800FFFFFFFFFFFFF) | 0x3FE0000000000000)
 }
 
-fn exp_approx(x: f64) -> f64 {
-    if x > 709.0 { return f64::INFINITY; }
-    if x < -709.0 { return 0.0; }
-    // Reduce: e^x = 2^k * e^r where r = x - k*ln2
-    let k = (x / core::f64::consts::LN_2) as i64;
-    let r = x - k as f64 * core::f64::consts::LN_2;
-    // Taylor for e^r, r in [-ln2/2, ln2/2]
-    let mut sum = 1.0;
-    let mut term = 1.0;
-    for i in 1..16 {
-        term *= r / i as f64;
-        sum += term;
-    }
-    // Multiply by 2^k
-    f64::from_bits(((k + 1023) as u64) << 52) * sum
-}
+#[no_mangle]
+pub extern "C" fn isnan(x: f64) -> i32 { x.is_nan() as i32 }
+
+#[no_mangle]
+pub extern "C" fn isinf(x: f64) -> i32 { x.is_infinite() as i32 }
+
+#[no_mangle]
+pub extern "C" fn isfinite(x: f64) -> i32 { x.is_finite() as i32 }
 
 #[inline(never)]
 pub fn _libc_math_init() {}

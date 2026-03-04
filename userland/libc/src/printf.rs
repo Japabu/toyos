@@ -1,20 +1,18 @@
 use core::ffi::VaList;
 use core::fmt::Write;
-use std::ptr;
 
-/// Internal buffer for formatting.
+/// Output buffer for printf family. Writes to a raw C buffer with optional capacity limit.
 struct BufWriter {
     buf: *mut u8,
     pos: usize,
-    cap: usize, // 0 = unlimited (for sprintf without n)
+    cap: usize, // usize::MAX = unlimited (sprintf)
 }
 
 impl Write for BufWriter {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
         for &b in s.as_bytes() {
             if self.cap > 0 && self.pos >= self.cap - 1 {
-                // Leave room for null terminator
-                continue;
+                continue; // leave room for null terminator
             }
             if !self.buf.is_null() {
                 unsafe { *self.buf.add(self.pos) = b; }
@@ -36,21 +34,22 @@ fn write_padded(w: &mut BufWriter, s: &str, width: usize, pad: char, left: bool)
     }
 }
 
-/// Write an integer string with optional precision (minimum digits, zero-padded).
-/// `prefix_len` is the number of leading non-digit characters (sign: '-', '+', ' ').
-unsafe fn write_int_padded(
+/// Write an integer with optional precision (minimum digits, zero-padded).
+fn write_int_padded(
     w: &mut BufWriter, s: &str, prefix_len: usize,
     width: usize, pad_char: char, left_align: bool, precision: Option<usize>,
 ) {
     if let Some(prec) = precision {
         let digit_len = s.len() - prefix_len;
         if digit_len < prec {
-            let mut padded = [0u8; 48];
-            let mut p = 0;
-            for &b in s[..prefix_len].as_bytes() { padded[p] = b; p += 1; }
-            for _ in 0..(prec - digit_len) { padded[p] = b'0'; p += 1; }
-            for &b in s[prefix_len..].as_bytes() { padded[p] = b; p += 1; }
-            let s2 = core::str::from_utf8_unchecked(&padded[..p]);
+            let zeros = prec - digit_len;
+            let mut padded = vec![0u8; prefix_len + zeros + digit_len];
+            let (mut p, bytes) = (0, s.as_bytes());
+            for &b in &bytes[..prefix_len] { padded[p] = b; p += 1; }
+            for _ in 0..zeros { padded[p] = b'0'; p += 1; }
+            for &b in &bytes[prefix_len..] { padded[p] = b; p += 1; }
+            // SAFETY: padded contains only ASCII digits and sign characters
+            let s2 = unsafe { core::str::from_utf8_unchecked(&padded[..p]) };
             write_padded(w, s2, width, ' ', left_align);
             return;
         }
@@ -76,15 +75,13 @@ fn format_signed<'a>(val: i64, buf: &'a mut [u8; 24], plus: bool, space: bool) -
         }
     }
     if negative {
-        pos -= 1;
-        buf[pos] = b'-';
+        pos -= 1; buf[pos] = b'-';
     } else if plus {
-        pos -= 1;
-        buf[pos] = b'+';
+        pos -= 1; buf[pos] = b'+';
     } else if space {
-        pos -= 1;
-        buf[pos] = b' ';
+        pos -= 1; buf[pos] = b' ';
     }
+    // SAFETY: buf contains only ASCII
     unsafe { core::str::from_utf8_unchecked(&buf[pos..]) }
 }
 
@@ -102,17 +99,19 @@ fn format_unsigned<'a>(val: u64, base: u64, upper: bool, buf: &'a mut [u8]) -> &
             v /= base;
         }
     }
+    // SAFETY: buf contains only ASCII hex digits
     unsafe { core::str::from_utf8_unchecked(&buf[pos..]) }
 }
 
-/// Core printf formatting engine.
+/// Core printf engine. Parses the format string as a byte slice.
 unsafe fn do_printf(buf: *mut u8, n: usize, fmt: *const u8, ap: &mut VaList<'_>) -> i32 {
+    let fmt = core::slice::from_raw_parts(fmt, super::string::strlen(fmt));
     let mut w = BufWriter { buf, pos: 0, cap: n };
     let mut i = 0;
 
-    while *fmt.add(i) != 0 {
-        if *fmt.add(i) != b'%' {
-            let _ = w.write_char(*fmt.add(i) as char);
+    while i < fmt.len() {
+        if fmt[i] != b'%' {
+            let _ = w.write_char(fmt[i] as char);
             i += 1;
             continue;
         }
@@ -123,8 +122,8 @@ unsafe fn do_printf(buf: *mut u8, n: usize, fmt: *const u8, ap: &mut VaList<'_>)
         let mut zero_pad = false;
         let mut plus_sign = false;
         let mut space_sign = false;
-        loop {
-            match *fmt.add(i) {
+        while i < fmt.len() {
+            match fmt[i] {
                 b'-' => { left_align = true; i += 1; }
                 b'0' => { zero_pad = true; i += 1; }
                 b'+' => { plus_sign = true; i += 1; }
@@ -136,48 +135,53 @@ unsafe fn do_printf(buf: *mut u8, n: usize, fmt: *const u8, ap: &mut VaList<'_>)
 
         // Width
         let mut width: usize = 0;
-        if *fmt.add(i) == b'*' {
-            width = ap.arg::<i32>() as usize;
+        if i < fmt.len() && fmt[i] == b'*' {
+            let w = ap.arg::<i32>();
+            if w < 0 { left_align = true; width = (-w) as usize; } else { width = w as usize; }
             i += 1;
         } else {
-            while (*fmt.add(i)).is_ascii_digit() {
-                width = width * 10 + (*fmt.add(i) - b'0') as usize;
+            while i < fmt.len() && fmt[i].is_ascii_digit() {
+                width = width * 10 + (fmt[i] - b'0') as usize;
                 i += 1;
             }
         }
 
         // Precision
         let mut precision: Option<usize> = None;
-        if *fmt.add(i) == b'.' {
+        if i < fmt.len() && fmt[i] == b'.' {
             i += 1;
             let mut prec = 0;
-            if *fmt.add(i) == b'*' {
-                prec = ap.arg::<i32>() as usize;
+            if i < fmt.len() && fmt[i] == b'*' {
+                prec = ap.arg::<i32>().max(0) as usize;
                 i += 1;
             } else {
-                while (*fmt.add(i)).is_ascii_digit() {
-                    prec = prec * 10 + (*fmt.add(i) - b'0') as usize;
+                while i < fmt.len() && fmt[i].is_ascii_digit() {
+                    prec = prec * 10 + (fmt[i] - b'0') as usize;
                     i += 1;
                 }
             }
             precision = Some(prec);
         }
 
-        // Length
+        if i >= fmt.len() { break; }
+
+        // Length modifier
         let mut long = false;
         let mut long_long = false;
-        match *fmt.add(i) {
+        match fmt[i] {
             b'l' => {
                 i += 1;
-                if *fmt.add(i) == b'l' { long_long = true; i += 1; } else { long = true; }
+                if i < fmt.len() && fmt[i] == b'l' { long_long = true; i += 1; } else { long = true; }
             }
-            b'h' => { i += 1; if *fmt.add(i) == b'h' { i += 1; } }
+            b'h' => { i += 1; if i < fmt.len() && fmt[i] == b'h' { i += 1; } }
             b'z' | b't' | b'j' => { long = true; i += 1; }
             _ => {}
         }
 
+        if i >= fmt.len() { break; }
+
         let pad_char = if zero_pad && !left_align { '0' } else { ' ' };
-        match *fmt.add(i) {
+        match fmt[i] {
             b'd' | b'i' => {
                 let val: i64 = if long_long || long { ap.arg::<i64>() } else { ap.arg::<i32>() as i64 };
                 let mut tmp = [0u8; 24];
@@ -211,8 +215,7 @@ unsafe fn do_printf(buf: *mut u8, n: usize, fmt: *const u8, ap: &mut VaList<'_>)
             }
             b'c' => {
                 let c = ap.arg::<i32>() as u8;
-                let tmp = [c];
-                let s = core::str::from_utf8_unchecked(&tmp);
+                let s = core::str::from_utf8_unchecked(core::slice::from_ref(&c));
                 write_padded(&mut w, s, width, ' ', left_align);
             }
             b's' => {
@@ -228,18 +231,20 @@ unsafe fn do_printf(buf: *mut u8, n: usize, fmt: *const u8, ap: &mut VaList<'_>)
             }
             b'p' => {
                 let p: *const u8 = ap.arg::<*const u8>();
-                let mut tmp = [0u8; 20];
-                let s = format_unsigned(p as u64, 16, false, &mut tmp);
-                let _ = w.write_str("0x");
-                let _ = w.write_str(s);
+                let mut hex = [0u8; 20];
+                let hex_s = format_unsigned(p as u64, 16, false, &mut hex);
+                let mut tmp = [0u8; 22];
+                tmp[0] = b'0';
+                tmp[1] = b'x';
+                let len = hex_s.len();
+                tmp[2..2 + len].copy_from_slice(hex_s.as_bytes());
+                let s = core::str::from_utf8_unchecked(&tmp[..2 + len]);
+                write_padded(&mut w, s, width, ' ', left_align);
             }
-            b'%' => {
+            b'%' => { let _ = w.write_char('%'); }
+            other => {
                 let _ = w.write_char('%');
-            }
-            0 => break,
-            _ => {
-                let _ = w.write_char('%');
-                let _ = w.write_char(*fmt.add(i) as char);
+                let _ = w.write_char(other as char);
             }
         }
         i += 1;
@@ -308,33 +313,35 @@ pub unsafe extern "C" fn vsprintf(buf: *mut u8, fmt: *const u8, ap: VaList<'_>) 
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn sscanf(str: *const u8, fmt: *const u8, mut args: ...) -> i32 {
-    // Minimal sscanf: only supports %d and %s for DOOM's usage
-    let mut si = 0usize; // position in str
-    let mut fi = 0usize; // position in fmt
+pub unsafe extern "C" fn sscanf(input: *const u8, fmt: *const u8, mut args: ...) -> i32 {
+    let input = core::slice::from_raw_parts(input, super::string::strlen(input));
+    let fmt = core::slice::from_raw_parts(fmt, super::string::strlen(fmt));
+    let mut si = 0usize;
+    let mut fi = 0usize;
     let mut matched = 0i32;
 
-    while *fmt.add(fi) != 0 && *str.add(si) != 0 {
-        if *fmt.add(fi) == b'%' {
+    while fi < fmt.len() && si < input.len() {
+        if fmt[fi] == b'%' {
             fi += 1;
-            match *fmt.add(fi) {
+            if fi >= fmt.len() { break; }
+            match fmt[fi] {
                 b'd' => {
                     let p: *mut i32 = args.arg::<*mut i32>();
-                    // Skip whitespace
-                    while (*str.add(si) as char).is_ascii_whitespace() { si += 1; }
-                    let mut endptr: *mut u8 = ptr::null_mut();
-                    let val = super::string::strtol(str.add(si), &mut endptr, 10);
-                    if endptr as usize == str.add(si) as usize { break; }
+                    while si < input.len() && (input[si] as char).is_ascii_whitespace() { si += 1; }
+                    let mut endptr: *mut u8 = std::ptr::null_mut();
+                    let val = super::string::strtol(input.as_ptr().add(si), &mut endptr, 10);
+                    let consumed = endptr as usize - input.as_ptr().add(si) as usize;
+                    if consumed == 0 { break; }
                     *p = val as i32;
-                    si = endptr as usize - str as usize;
+                    si += consumed;
                     matched += 1;
                 }
                 b's' => {
                     let p: *mut u8 = args.arg::<*mut u8>();
-                    while (*str.add(si) as char).is_ascii_whitespace() { si += 1; }
+                    while si < input.len() && (input[si] as char).is_ascii_whitespace() { si += 1; }
                     let mut j = 0;
-                    while *str.add(si) != 0 && !(*str.add(si) as char).is_ascii_whitespace() {
-                        *p.add(j) = *str.add(si);
+                    while si < input.len() && !(input[si] as char).is_ascii_whitespace() {
+                        *p.add(j) = input[si];
                         j += 1;
                         si += 1;
                     }
@@ -344,11 +351,11 @@ pub unsafe extern "C" fn sscanf(str: *const u8, fmt: *const u8, mut args: ...) -
                 _ => break,
             }
             fi += 1;
-        } else if (*fmt.add(fi) as char).is_ascii_whitespace() {
-            while (*str.add(si) as char).is_ascii_whitespace() { si += 1; }
+        } else if (fmt[fi] as char).is_ascii_whitespace() {
+            while si < input.len() && (input[si] as char).is_ascii_whitespace() { si += 1; }
             fi += 1;
         } else {
-            if *str.add(si) != *fmt.add(fi) { break; }
+            if input[si] != fmt[fi] { break; }
             si += 1;
             fi += 1;
         }

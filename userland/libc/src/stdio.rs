@@ -113,13 +113,13 @@ pub unsafe extern "C" fn fwrite(buf: *const u8, size: usize, count: usize, f: *m
     let total = size * count;
     let slice = core::slice::from_raw_parts(buf, total);
     let result = match &mut (*f).kind {
-        FileKind::Stdout => std::io::stdout().write(slice),
-        FileKind::Stderr => std::io::stderr().write(slice),
-        FileKind::Owned(file) => file.write(slice),
+        FileKind::Stdout => std::io::stdout().write_all(slice),
+        FileKind::Stderr => std::io::stderr().write_all(slice),
+        FileKind::Owned(file) => file.write_all(slice),
         FileKind::Stdin => return 0,
     };
     match result {
-        Ok(n) => n / size,
+        Ok(()) => count,
         Err(_) => { (*f).error = true; 0 }
     }
 }
@@ -335,26 +335,19 @@ pub unsafe extern "C" fn atol(s: *const u8) -> i64 {
 pub unsafe extern "C" fn atof(s: *const u8) -> f64 {
     let mut p = s;
     while super::ctype::isspace(*p as i32) != 0 { p = p.add(1); }
-
-    let neg = if *p == b'-' { p = p.add(1); true }
-              else if *p == b'+' { p = p.add(1); false }
-              else { false };
-
-    let mut result: f64 = 0.0;
-    while (*p).is_ascii_digit() {
-        result = result * 10.0 + (*p - b'0') as f64;
+    // Find the end of the numeric portion (sign, digits, dot, exponent)
+    let start = p;
+    if *p == b'-' || *p == b'+' { p = p.add(1); }
+    while (*p).is_ascii_digit() { p = p.add(1); }
+    if *p == b'.' { p = p.add(1); while (*p).is_ascii_digit() { p = p.add(1); } }
+    if *p == b'e' || *p == b'E' {
         p = p.add(1);
+        if *p == b'-' || *p == b'+' { p = p.add(1); }
+        while (*p).is_ascii_digit() { p = p.add(1); }
     }
-    if *p == b'.' {
-        p = p.add(1);
-        let mut frac = 0.1;
-        while (*p).is_ascii_digit() {
-            result += (*p - b'0') as f64 * frac;
-            frac *= 0.1;
-            p = p.add(1);
-        }
-    }
-    if neg { -result } else { result }
+    let len = p as usize - start as usize;
+    let slice = core::slice::from_raw_parts(start, len);
+    core::str::from_utf8_unchecked(slice).parse::<f64>().unwrap_or(0.0)
 }
 
 #[no_mangle]

@@ -1,5 +1,4 @@
 #![feature(c_variadic)]
-#![allow(non_camel_case_types, dead_code, unused_variables, unused_assignments, unused_unsafe)]
 
 mod ctype;
 mod math;

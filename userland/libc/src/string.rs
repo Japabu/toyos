@@ -219,7 +219,44 @@ pub unsafe extern "C" fn strtol(s: *const u8, endptr: *mut *mut u8, base: i32) -
 
 #[no_mangle]
 pub unsafe extern "C" fn strtoul(s: *const u8, endptr: *mut *mut u8, base: i32) -> u64 {
-    strtol(s, endptr, base) as u64
+    let mut p = s;
+    while *p == b' ' || *p == b'\t' || *p == b'\n' || *p == b'\r' {
+        p = p.add(1);
+    }
+    // strtoul accepts optional sign per C spec
+    let negative = *p == b'-';
+    if *p == b'-' || *p == b'+' {
+        p = p.add(1);
+    }
+    let base = if base == 0 {
+        if *p == b'0' {
+            p = p.add(1);
+            if *p == b'x' || *p == b'X' { p = p.add(1); 16 } else { 8 }
+        } else {
+            10
+        }
+    } else {
+        if base == 16 && *p == b'0' && (*p.add(1) == b'x' || *p.add(1) == b'X') {
+            p = p.add(2);
+        }
+        base as u64
+    };
+    let mut result: u64 = 0;
+    loop {
+        let digit = match *p {
+            b'0'..=b'9' => (*p - b'0') as u64,
+            b'a'..=b'z' => (*p - b'a' + 10) as u64,
+            b'A'..=b'Z' => (*p - b'A' + 10) as u64,
+            _ => break,
+        };
+        if digit >= base { break; }
+        result = result.wrapping_mul(base).wrapping_add(digit);
+        p = p.add(1);
+    }
+    if !endptr.is_null() {
+        *endptr = p as *mut u8;
+    }
+    if negative { result.wrapping_neg() } else { result }
 }
 
 #[no_mangle]

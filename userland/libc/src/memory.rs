@@ -29,7 +29,10 @@ pub unsafe extern "C" fn free(ptr: *mut u8) {
 
 #[no_mangle]
 pub unsafe extern "C" fn calloc(count: usize, size: usize) -> *mut u8 {
-    let total = count.wrapping_mul(size);
+    let total = match count.checked_mul(size) {
+        Some(t) => t,
+        None => return ptr::null_mut(),
+    };
     let p = malloc(total);
     if !p.is_null() {
         ptr::write_bytes(p, 0, total);
