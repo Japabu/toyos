@@ -40,7 +40,7 @@ pub fn init() {
 
     let star = (0x10u64 << 48) | ((gdt::KERNEL_CS as u64) << 32);
     cpu::wrmsr(MSR_STAR, star);
-    cpu::wrmsr(MSR_LSTAR, syscall_entry as u64);
+    cpu::wrmsr(MSR_LSTAR, syscall_entry as *const () as u64);
     cpu::wrmsr(MSR_FMASK, 0x200);
 }
 

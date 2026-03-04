@@ -173,12 +173,12 @@ pub fn init() {
 
     {
         let mut idt = IDT.lock();
-        idt.entries[VECTOR_INVALID_OPCODE as usize] = IdtEntry::new(ud_entry as u64);
-        idt.entries[VECTOR_GPF as usize] = IdtEntry::new(gpf_entry as u64);
-        idt.entries[VECTOR_PAGE_FAULT as usize] = IdtEntry::new(page_fault_entry as u64);
-        idt.entries[VECTOR_TIMER] = IdtEntry::new(timer_entry as u64);
-        idt.entries[VECTOR_XHCI] = IdtEntry::new(xhci_entry as u64);
-        idt.entries[VECTOR_TLB_FLUSH] = IdtEntry::new(tlb_flush_entry as u64);
+        idt.entries[VECTOR_INVALID_OPCODE as usize] = IdtEntry::new(ud_entry as *const () as u64);
+        idt.entries[VECTOR_GPF as usize] = IdtEntry::new(gpf_entry as *const () as u64);
+        idt.entries[VECTOR_PAGE_FAULT as usize] = IdtEntry::new(page_fault_entry as *const () as u64);
+        idt.entries[VECTOR_TIMER] = IdtEntry::new(timer_entry as *const () as u64);
+        idt.entries[VECTOR_XHCI] = IdtEntry::new(xhci_entry as *const () as u64);
+        idt.entries[VECTOR_TLB_FLUSH] = IdtEntry::new(tlb_flush_entry as *const () as u64);
     }
 
     let ptr = IdtPointer {

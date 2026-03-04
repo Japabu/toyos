@@ -111,7 +111,7 @@ pub fn schedule_no_return() -> ! {
             "mov rsp, {sp}",
             "jmp {func}",
             sp = in(reg) sp,
-            func = in(reg) cpu_idle_loop as usize,
+            func = in(reg) cpu_idle_loop as *const () as usize,
             options(noreturn),
         );
     }

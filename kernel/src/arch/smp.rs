@@ -165,7 +165,7 @@ pub fn boot_aps(madt: &MadtInfo) {
         assert!(!stack_base.is_null(), "SMP: failed to allocate AP stack");
 
         data.stack_top = stack_base as u64 + AP_STACK_SIZE as u64;
-        data.entry = ap_entry as u64;
+        data.entry = ap_entry as *const () as u64;
         unsafe { core::ptr::write_unaligned(target, data); }
 
         AP_STARTED.store(false, Ordering::Release);
