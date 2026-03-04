@@ -1,5 +1,7 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{LazyLock, Mutex};
 use std::{env, fs};
 
 fn toyos_cc() -> PathBuf {
@@ -17,22 +19,64 @@ fn read_object(path: &Path) -> (String, Vec<u8>) {
     (path.display().to_string(), data)
 }
 
-fn system_include_args() -> Vec<String> {
-    if cfg!(target_os = "macos") {
-        let output = Command::new("xcrun")
-            .args(["--show-sdk-path"])
-            .output()
-            .expect("failed to run xcrun");
-        let sdk = String::from_utf8(output.stdout).unwrap().trim().to_string();
-        vec!["-I".to_string(), format!("{sdk}/usr/include")]
-    } else {
-        vec!["-I".to_string(), "/usr/include".to_string()]
+/// Path to the toyos-libc directory (sibling of toyos-cc).
+fn libc_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().join("libc")
+}
+
+/// Build toyos-libc for a specific target triple and return path to the .rlib.
+/// Results are cached per-target. Uses `+nightly` to avoid the toyos toolchain
+/// override in the userland directory.
+fn libc_archive(target: &str) -> PathBuf {
+    static CACHE: LazyLock<Mutex<HashMap<String, PathBuf>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+    let mut cache = CACHE.lock().unwrap();
+    if let Some(path) = cache.get(target) {
+        return path.clone();
     }
+    let libc = libc_dir();
+    let target_dir = libc.join("target");
+    let output = Command::new("cargo")
+        .args(["+nightly", "rustc", "--release", "--target", target, "--crate-type", "staticlib"])
+        .arg("--manifest-path")
+        .arg(libc.join("Cargo.toml"))
+        .arg("--target-dir")
+        .arg(&target_dir)
+        .output()
+        .expect("failed to build toyos-libc");
+    assert!(
+        output.status.success(),
+        "toyos-libc build for {target} failed:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let path = target_dir.join(format!("{target}/release/libtoyos_libc.a"));
+    assert!(path.exists(), "expected staticlib at {}", path.display());
+    cache.insert(target.to_string(), path.clone());
+    path
+}
+
+fn host_target() -> &'static str {
+    if cfg!(target_arch = "aarch64") && cfg!(target_os = "macos") {
+        "aarch64-apple-darwin"
+    } else if cfg!(target_arch = "x86_64") && cfg!(target_os = "macos") {
+        "x86_64-apple-darwin"
+    } else if cfg!(target_arch = "x86_64") && cfg!(target_os = "linux") {
+        "x86_64-unknown-linux-gnu"
+    } else if cfg!(target_arch = "aarch64") && cfg!(target_os = "linux") {
+        "aarch64-unknown-linux-gnu"
+    } else {
+        panic!("unsupported host for toyos-libc test")
+    }
+}
+
+fn libc_include_args() -> Vec<String> {
+    vec!["-I".to_string(), libc_dir().join("include").to_string_lossy().to_string()]
 }
 
 /// Run a test with an optional cross-compilation target.
 /// When `target` is Some, compiles for that target and runs accordingly.
 fn run_test_with_target(name: &str, args: &[&str], target: Option<&str>) {
+    let label = target.unwrap_or("native");
     let dir = testcases_dir();
     let c_file = dir.join(format!("{name}.c"));
     let expect_file = dir.join(format!("{name}.expect"));
@@ -56,13 +100,12 @@ fn run_test_with_target(name: &str, args: &[&str], target: Option<&str>) {
     compile_cmd
         .args(["-c", "-o"])
         .arg(&obj)
-        .args(system_include_args())
+        .args(libc_include_args())
         .arg("-I")
         .arg(&dir)
         .arg(format!("{name}.c"));
 
     let compile = compile_cmd.output().expect("failed to run toyos-cc");
-    let label = target.unwrap_or("native");
     assert!(
         compile.status.success(),
         "toyos-cc ({label}) failed to compile {name}.c:\nstdout: {}\nstderr: {}",
@@ -87,7 +130,7 @@ fn run_test_with_target(name: &str, args: &[&str], target: Option<&str>) {
             extra_cmd
                 .args(["-c", "-o"])
                 .arg(&extra_obj)
-                .args(system_include_args())
+                .args(libc_include_args())
                 .arg("-I")
                 .arg(&dir)
                 .arg(&companion);
@@ -101,11 +144,13 @@ fn run_test_with_target(name: &str, args: &[&str], target: Option<&str>) {
         }
     }
 
-    // Link
+    // Link (include toyos-libc staticlib for the matching target)
+    let libc_target = target.unwrap_or(host_target());
     let mut objects = vec![read_object(&obj)];
     for extra in &extra_objs {
         objects.push(read_object(extra));
     }
+    objects.push(read_object(&libc_archive(libc_target)));
     let _ = fs::remove_file(&obj);
     for extra in &extra_objs {
         let _ = fs::remove_file(extra);
@@ -114,9 +159,9 @@ fn run_test_with_target(name: &str, args: &[&str], target: Option<&str>) {
     let is_macho = target.map_or(cfg!(target_os = "macos"), |t| t.contains("apple"));
     let entry = if is_macho { "_main" } else { "main" };
     let linked = if is_macho {
-        toyos_ld::link_macho(&objects, entry, false)
+        toyos_ld::link_macho(&objects, entry, true)
     } else {
-        toyos_ld::link_full(&objects, entry, false, false)
+        toyos_ld::link_full(&objects, entry, true, false)
     };
     let linked = linked.unwrap_or_else(|e| panic!("toyos-ld ({label}) failed for {name}: {e}"));
     fs::write(&bin, &linked).unwrap();
@@ -125,6 +170,9 @@ fn run_test_with_target(name: &str, args: &[&str], target: Option<&str>) {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
     }
+
+    // DEBUG: save binary for inspection
+    let _ = fs::copy(&bin, "/tmp/toyos-cc-debug.bin");
 
     // Run (use arch -x86_64 for x86_64 cross-compilation on ARM64 Mac)
     let is_x86_64_cross = target.map_or(false, |t| t.starts_with("x86_64"));

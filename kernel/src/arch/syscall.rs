@@ -504,7 +504,6 @@ fn sys_recv_msg(out: &mut message::UserMessage) -> u64 {
                     user_heap::alloc(heap, msg.payload.len(), 8)
                 });
                 if addr == 0 {
-                    // Bug 6 fix: OOM — don't deliver corrupt message (data=0, len>0)
                     return u64::MAX;
                 }
                 unsafe {

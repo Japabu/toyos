@@ -424,7 +424,7 @@ pub(crate) fn layout_macho(state: &mut LinkState) -> MachOLayout {
     });
 
     let has_const = buckets.rx.iter().any(|&i| state.sections[i].kind == SectionKind::ReadOnly);
-    let has_data = !buckets.rw.is_empty();
+    let has_data = buckets.rw.iter().any(|&i| !state.sections[i].kind.is_nobits());
     let has_bss = buckets.rw.iter().any(|&i| state.sections[i].kind.is_nobits());
     let has_got = !got_symbols.is_empty();
     let has_thread_vars = buckets.tls.iter().any(|&i| state.sections[i].kind == SectionKind::TlsVariables);
@@ -479,7 +479,6 @@ pub(crate) fn layout_macho(state: &mut LinkState) -> MachOLayout {
 
     let const_sec_vmaddr = align_up(cursor, 8);
     let const_sec_offset = const_sec_vmaddr - text_vmaddr;
-    let mut actual_has_const = false;
     cursor = const_sec_vmaddr;
     for &idx in &buckets.rx {
         let sec = &mut state.sections[idx];
@@ -487,7 +486,6 @@ pub(crate) fn layout_macho(state: &mut LinkState) -> MachOLayout {
             cursor = align_up(cursor, sec.align);
             sec.vaddr = Some(cursor);
             cursor += sec.size;
-            actual_has_const = true;
         }
     }
     let const_sec_size = cursor - const_sec_vmaddr;
@@ -592,7 +590,7 @@ pub(crate) fn layout_macho(state: &mut LinkState) -> MachOLayout {
         align: match arch { Arch::X86_64 => 4, Arch::Aarch64 => 2 },
         flags: S_REGULAR | S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS, reserved1: 0,
     }];
-    if actual_has_const && const_sec_size > 0 {
+    if has_const && const_sec_size > 0 {
         text_sections.push(MachOSection {
             sectname: pad16(b"__const"), segname: pad16(b"__TEXT"),
             vmaddr: const_sec_vmaddr, size: const_sec_size,
@@ -679,11 +677,11 @@ pub(crate) fn layout_macho(state: &mut LinkState) -> MachOLayout {
     ncmds += 1; sizeofcmds += build_version_size;
     ncmds += 1; sizeofcmds += size_of::<LinkeditDataCmd>() as u32;
 
-    let final_header_size = MACHO_HEADER_SIZE as u64 + sizeofcmds as u64;
-    assert!(
-        text_sec_offset >= align_up(final_header_size, 16) || text_sec_size == 0,
-        "sections overlap with headers: header={final_header_size} text_offset={}",
-        text_sec_offset
+    assert_eq!(
+        sizeofcmds, preliminary_sizeofcmds,
+        "load command size mismatch: preliminary {preliminary_sizeofcmds} != final {sizeofcmds} \
+         (text_sections={} data_sections={})",
+        text_sections.len(), data_sections.len(),
     );
 
     MachOLayout {

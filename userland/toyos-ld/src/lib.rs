@@ -104,7 +104,8 @@ impl Collected {
             .map(|r| r.section)
             .collect();
         for &idx in &abs_reloc_sections {
-            if !self.state.sections[idx].kind.is_writable() {
+            let kind = self.state.sections[idx].kind;
+            if !kind.is_writable() && !kind.is_tls() {
                 self.state.sections[idx].kind = SectionKind::Data;
             }
         }

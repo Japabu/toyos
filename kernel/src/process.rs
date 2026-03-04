@@ -547,7 +547,6 @@ pub fn exit(code: i32) -> ! {
                 // RAII: .take() drops OwnedAlloc, freeing the memory
                 proc.elf_alloc.take();
                 proc.stack_alloc.take();
-                // Bug 1 fix: clear loaded_libs (each LoadedLib owns an OwnedAlloc)
                 proc.loaded_libs.clear();
                 paging::free_user_page_tables(pml4);
                 proc.cr3 = 0;
@@ -556,7 +555,6 @@ pub fn exit(code: i32) -> ! {
 
         proc.state = ProcessState::Zombie(code);
 
-        // Bug 3 fix: clean up registered name
         if let Kind::Process { .. } = kind {
             if let Some(names) = NAME_REGISTRY.lock().as_mut() {
                 names.retain(|_, &mut v| v != pid);
