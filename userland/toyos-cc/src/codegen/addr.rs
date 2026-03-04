@@ -13,28 +13,27 @@ impl Codegen {
     fn compile_addr_inner(&mut self, ctx: &mut FuncCtx, expr: &Expr) -> Value {
         match expr {
             Expr::Ident(name) => {
-                // For stack-allocated locals, return their pointer
-                if let Some((ptr, _)) = ctx.local_ptrs.get(name) {
-                    return *ptr;
+                match ctx.locals.get(name).map(|(s, t)| (*s, t.clone())) {
+                    Some((LocalStorage::Ptr(ptr), _)) => return ptr,
+                    Some((LocalStorage::Spilled(slot), _)) => {
+                        return ctx.builder.ins().stack_addr(I64, slot, 0);
+                    }
+                    Some((LocalStorage::Ssa(var), ty)) => {
+                        // Spill SSA variable to stack permanently so aliases
+                        // through pointers (e.g. strstart(&r1)) see updates.
+                        let size = ty.size().max(1);
+                        let ss = ctx.builder.create_sized_stack_slot(ir::StackSlotData::new(
+                            ir::StackSlotKind::ExplicitSlot, size as u32, 0,
+                        ));
+                        let ptr = ctx.builder.ins().stack_addr(I64, ss, 0);
+                        let val = ctx.builder.use_var(var);
+                        ctx.builder.ins().store(MemFlags::new(), val, ptr, 0);
+                        ctx.locals.insert(name.clone(), (LocalStorage::Spilled(ss), ty));
+                        return ptr;
+                    }
+                    None => {}
                 }
-                // For already-spilled locals, return a fresh stack_addr
-                if let Some((slot, _)) = ctx.spilled_locals.get(name) {
-                    return ctx.builder.ins().stack_addr(I64, *slot, 0);
-                }
-                // Spill SSA variable to stack permanently so aliases
-                // through pointers (e.g. strstart(&r1)) see updates.
-                if let Some((var, ty)) = ctx.locals.get(name).cloned() {
-                    let size = ty.size().max(1);
-                    let ss = ctx.builder.create_sized_stack_slot(ir::StackSlotData::new(
-                        ir::StackSlotKind::ExplicitSlot, size as u32, 0,
-                    ));
-                    let ptr = ctx.builder.ins().stack_addr(I64, ss, 0);
-                    let val = ctx.builder.use_var(var);
-                    ctx.builder.ins().store(MemFlags::new(), val, ptr, 0);
-                    ctx.locals.remove(name);
-                    ctx.spilled_locals.insert(name.clone(), (ss, ty));
-                    ptr
-                } else if let Some(func_id) = self.func_ids.get(name) {
+                if let Some(func_id) = self.func_ids.get(name) {
                     let func_ref = self.module.declare_func_in_func(*func_id, ctx.builder.func);
                     ctx.builder.ins().func_addr(I64, func_ref)
                 } else if let Some(data_id) = self.data_ids.get(name) {
@@ -110,7 +109,7 @@ impl Codegen {
             | Expr::Builtin(..) | Expr::Unary(..) => {
                 // For struct/union-typed expressions, compile_expr already returns an address
                 let ty = self.expr_type(ctx, expr);
-                if matches!(ty, CType::Struct(_) | CType::Union(_)) {
+                if ty.is_aggregate() {
                     return self.compile_expr(ctx, expr).raw();
                 }
                 // Expression doesn't have an address - create a temporary

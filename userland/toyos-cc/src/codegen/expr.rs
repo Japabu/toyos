@@ -170,28 +170,25 @@ impl Codegen {
             let gv = self.module.declare_data_in_func(data_id, ctx.builder.func);
             return TypedValue::unsigned(ctx.builder.ins().global_value(I64, gv));
         }
-        if let Some((var, ty)) = ctx.locals.get(name) {
-            let (var, sign) = (*var, ty.signedness());
-            return TypedValue::new(ctx.builder.use_var(var), sign);
-        }
-        if let Some((slot, ty)) = ctx.spilled_locals.get(name) {
-            let (slot, sign) = (*slot, ty.signedness());
-            let ptr = ctx.builder.ins().stack_addr(I64, slot, 0);
-            let load_ty = self.clif_type(ty);
-            return TypedValue::new(ctx.builder.ins().load(load_ty, MemFlags::new(), ptr, 0), sign);
-        }
-        if let Some((ptr, ty)) = ctx.local_ptrs.get(name) {
-            let (ptr, sign) = (*ptr, ty.signedness());
-            return match ty {
-                CType::Struct(_) | CType::Union(_) | CType::Array(_, _) => TypedValue::unsigned(ptr),
-                CType::Void | CType::Bool | CType::Char(_) | CType::Short(_) | CType::Int(_)
-                | CType::Long(_) | CType::LongLong(_) | CType::Int128(_) | CType::Float
-                | CType::Double | CType::LongDouble | CType::Pointer(_) | CType::Enum(_)
-                | CType::Function(..) => {
-                    let load_ty = self.clif_type(ty);
-                    TypedValue::new(ctx.builder.ins().load(load_ty, MemFlags::new(), ptr, 0), sign)
+        if let Some((storage, ty)) = ctx.locals.get(name) {
+            let (storage, sign) = (*storage, ty.signedness());
+            match storage {
+                LocalStorage::Ssa(var) => {
+                    return TypedValue::new(ctx.builder.use_var(var), sign);
                 }
-            };
+                LocalStorage::Spilled(slot) => {
+                    let ptr = ctx.builder.ins().stack_addr(I64, slot, 0);
+                    let load_ty = self.clif_type(ty);
+                    return TypedValue::new(ctx.builder.ins().load(load_ty, MemFlags::new(), ptr, 0), sign);
+                }
+                LocalStorage::Ptr(ptr) => {
+                    if ty.is_aggregate() || matches!(ty, CType::Array(..)) {
+                        return TypedValue::unsigned(ptr);
+                    }
+                    let load_ty = self.clif_type(ty);
+                    return TypedValue::new(ctx.builder.ins().load(load_ty, MemFlags::new(), ptr, 0), sign);
+                }
+            }
         }
         if let Some(&val) = self.type_env.enum_constants.get(name) {
             return TypedValue::signed(ctx.builder.ins().iconst(I32, val));
@@ -204,7 +201,7 @@ impl Codegen {
             let gv = self.module.declare_data_in_func(*data_id, ctx.builder.func);
             let addr = ctx.builder.ins().global_value(I64, gv);
             if let Some(ty) = self.global_types.get(name) {
-                if !matches!(ty, CType::Array(..) | CType::Struct(_) | CType::Union(_)) {
+                if !matches!(ty, CType::Array(..)) && !ty.is_aggregate() {
                     let (load_ty, sign) = (self.clif_type(ty), ty.signedness());
                     return TypedValue::new(ctx.builder.ins().load(load_ty, MemFlags::new(), addr, 0), sign);
                 }
@@ -257,7 +254,7 @@ impl Codegen {
                     CType::Pointer(inner) => *inner,
                     other => panic!("deref: non-pointer type {other:?}"),
                 };
-                if matches!(deref_ty, CType::Struct(_) | CType::Union(_) | CType::Array(..) | CType::Function(..)) {
+                if deref_ty.is_aggregate() || matches!(deref_ty, CType::Array(..) | CType::Function(..)) {
                     return TypedValue::unsigned(ptr);
                 }
                 let load_ty = self.clif_type(&deref_ty);
@@ -275,7 +272,7 @@ impl Codegen {
                 let ety = self.expr_type(ctx, e);
                 let sign = ety.signedness();
                 if let Expr::Ident(name) = e {
-                    if let Some((var, _)) = ctx.locals.get(name.as_str()) {
+                    if let Some((LocalStorage::Ssa(var), _)) = ctx.locals.get(name.as_str()) {
                         let var = *var;
                         let val = ctx.builder.use_var(var);
                         let vt = ctx.builder.func.dfg.value_type(val);
@@ -300,7 +297,7 @@ impl Codegen {
         let stride = self.pointer_stride(ctx, e);
         let sign = self.expr_type(ctx, e).signedness();
         if let Expr::Ident(name) = e {
-            if let Some((var, _)) = ctx.locals.get(name.as_str()) {
+            if let Some((LocalStorage::Ssa(var), _)) = ctx.locals.get(name.as_str()) {
                 let var = *var;
                 let val = ctx.builder.use_var(var);
                 let vt = ctx.builder.func.dfg.value_type(val);
@@ -331,7 +328,7 @@ impl Codegen {
         let target_ty = self.resolve_typename(tn);
         let target_sign = target_ty.signedness();
         if matches!(target_ty, CType::Void) { return tv.with_sign(target_sign); }
-        if matches!(target_ty, CType::Struct(_) | CType::Union(_)) { return tv.with_sign(target_sign); }
+        if target_ty.is_aggregate() { return tv.with_sign(target_sign); }
         let target_clif = self.clif_type(&target_ty);
         let val = tv.raw();
         let val_type = ctx.builder.func.dfg.value_type(val);
@@ -395,7 +392,7 @@ impl Codegen {
         let idx_val = self.coerce(ctx, idx_raw, I64);
         let offset = ctx.builder.ins().imul_imm(idx_val, elem_size as i64);
         let addr = ctx.builder.ins().iadd(arr_val, offset);
-        if matches!(&elem_ty, CType::Array(..) | CType::Struct(_) | CType::Union(_)) {
+        if elem_ty.is_aggregate() || matches!(&elem_ty, CType::Array(..)) {
             return TypedValue::unsigned(addr);
         }
         let load_ty = self.clif_type(&elem_ty);
@@ -409,7 +406,7 @@ impl Codegen {
     pub(super) fn compile_field_access(&mut self, ctx: &mut FuncCtx, base: Value, struct_ty: &CType, field: &str) -> TypedValue {
         let fi = struct_ty.field_offset(field)
             .unwrap_or_else(|| panic!("no field '{field}' in {struct_ty:?}"));
-        if matches!(fi.ty, CType::Struct(_) | CType::Union(_) | CType::Array(..)) {
+        if fi.ty.is_aggregate() || matches!(fi.ty, CType::Array(..)) {
             if fi.byte_offset != 0 {
                 return TypedValue::unsigned(ctx.builder.ins().iadd_imm(base, fi.byte_offset as i64));
             }
@@ -472,7 +469,7 @@ impl Codegen {
         let ptr = ctx.builder.ins().stack_addr(I64, ss, 0);
         let init = Initializer::List(items.to_vec());
         self.compile_aggregate_init(ctx, ptr, &ty, &init);
-        if matches!(ty, CType::Struct(_) | CType::Union(_) | CType::Array(..)) {
+        if ty.is_aggregate() || matches!(ty, CType::Array(..)) {
             TypedValue::unsigned(ptr)
         } else {
             let load_ty = self.clif_type(&ty);
@@ -490,18 +487,7 @@ impl Codegen {
         let result = ctx.builder.ins().load(load_ty, MemFlags::new(), ap_val, 0);
         let new_ap = ctx.builder.ins().iadd_imm(ap_val, 8);
         if let Expr::Ident(name) = ap_expr {
-            if let Some((var, _)) = ctx.locals.get(name.as_str()) {
-                let var = *var;
-                ctx.builder.def_var(var, new_ap);
-            } else if let Some((slot, _)) = ctx.spilled_locals.get(name.as_str()) {
-                let ptr = ctx.builder.ins().stack_addr(I64, *slot, 0);
-                ctx.builder.ins().store(MemFlags::new(), new_ap, ptr, 0);
-            } else if let Some((ptr, _)) = ctx.local_ptrs.get(name.as_str()) {
-                let ptr = *ptr;
-                ctx.builder.ins().store(MemFlags::new(), new_ap, ptr, 0);
-            } else {
-                panic!("va_arg: unknown variable '{name}'");
-            }
+            ctx.store_to_local(name, new_ap);
         } else {
             panic!("va_arg: expected identifier, got {ap_expr:?}");
         }
@@ -597,18 +583,7 @@ impl Codegen {
                     Expr::Ident(n) => n,
                     other => panic!("va_start: expected identifier, got {other:?}"),
                 };
-                if let Some((var, _)) = ctx.locals.get(ap_name) {
-                    let var = *var;
-                    ctx.builder.def_var(var, va_addr);
-                } else if let Some((slot, _)) = ctx.spilled_locals.get(ap_name) {
-                    let ptr = ctx.builder.ins().stack_addr(I64, *slot, 0);
-                    ctx.builder.ins().store(MemFlags::new(), va_addr, ptr, 0);
-                } else if let Some((ptr, _)) = ctx.local_ptrs.get(ap_name) {
-                    let ptr = *ptr;
-                    ctx.builder.ins().store(MemFlags::new(), va_addr, ptr, 0);
-                } else {
-                    panic!("va_start: unknown variable '{ap_name}'");
-                }
+                ctx.store_to_local(ap_name, va_addr);
                 TypedValue::unsigned(va_addr)
             }
             "__builtin_va_copy" => {
@@ -617,18 +592,7 @@ impl Codegen {
                     Expr::Ident(n) => n,
                     other => panic!("va_copy: expected identifier, got {other:?}"),
                 };
-                if let Some((var, _)) = ctx.locals.get(dest_name) {
-                    let var = *var;
-                    ctx.builder.def_var(var, src_val);
-                } else if let Some((slot, _)) = ctx.spilled_locals.get(dest_name) {
-                    let ptr = ctx.builder.ins().stack_addr(I64, *slot, 0);
-                    ctx.builder.ins().store(MemFlags::new(), src_val, ptr, 0);
-                } else if let Some((ptr, _)) = ctx.local_ptrs.get(dest_name) {
-                    let ptr = *ptr;
-                    ctx.builder.ins().store(MemFlags::new(), src_val, ptr, 0);
-                } else {
-                    panic!("va_copy: unknown variable '{dest_name}'");
-                }
+                ctx.store_to_local(dest_name, src_val);
                 TypedValue::unsigned(src_val)
             }
             "__builtin_va_arg" => {
@@ -639,18 +603,7 @@ impl Codegen {
                     Expr::Ident(n) => n,
                     other => panic!("va_arg: expected identifier, got {other:?}"),
                 };
-                if let Some((var, _)) = ctx.locals.get(ap_name) {
-                    let var = *var;
-                    ctx.builder.def_var(var, new_ap);
-                } else if let Some((slot, _)) = ctx.spilled_locals.get(ap_name) {
-                    let ptr = ctx.builder.ins().stack_addr(I64, *slot, 0);
-                    ctx.builder.ins().store(MemFlags::new(), new_ap, ptr, 0);
-                } else if let Some((ptr, _)) = ctx.local_ptrs.get(ap_name) {
-                    let ptr = *ptr;
-                    ctx.builder.ins().store(MemFlags::new(), new_ap, ptr, 0);
-                } else {
-                    panic!("va_arg: unknown variable '{ap_name}'");
-                }
+                ctx.store_to_local(ap_name, new_ap);
                 TypedValue::signed(result)
             }
             _ => panic!("builtin '{name}' not yet implemented"),
@@ -779,39 +732,40 @@ impl Codegen {
 
         let lhs_sign = self.expr_type(ctx, lhs).signedness();
 
-        // Direct variable assignment
+        // Direct variable assignment (SSA or spilled — Ptr falls through to memory path)
         if let Expr::Ident(name) = lhs {
-            if let Some((var, ty)) = ctx.locals.get(name) {
-                let var = *var;
-                let var_clif = self.clif_type(&ty);
-                let val = if op == AssignOp::Assign {
-                    rhs_val
-                } else {
-                    let lhs_val = ctx.builder.use_var(var);
-                    self.compile_compound_assign(ctx, op,
-                        TypedValue::new(lhs_val, lhs_sign),
-                        TypedValue::new(rhs_val, rhs_tv.signedness()))
-                };
-                let val = self.coerce_typed(ctx, TypedValue::new(val, rhs_tv.signedness()), var_clif);
-                ctx.builder.def_var(var, val);
-                return TypedValue::new(val, lhs_sign);
-            }
-            // Spilled locals: store through stack slot
-            if let Some((slot, ty)) = ctx.spilled_locals.get(name) {
-                let slot = *slot;
-                let var_clif = self.clif_type(&ty);
-                let ptr = ctx.builder.ins().stack_addr(I64, slot, 0);
-                let val = if op == AssignOp::Assign {
-                    rhs_val
-                } else {
-                    let lhs_val = ctx.builder.ins().load(var_clif, MemFlags::new(), ptr, 0);
-                    self.compile_compound_assign(ctx, op,
-                        TypedValue::new(lhs_val, lhs_sign),
-                        TypedValue::new(rhs_val, rhs_tv.signedness()))
-                };
-                let val = self.coerce_typed(ctx, TypedValue::new(val, rhs_tv.signedness()), var_clif);
-                ctx.builder.ins().store(MemFlags::new(), val, ptr, 0);
-                return TypedValue::new(val, lhs_sign);
+            if let Some((storage, ty)) = ctx.locals.get(name) {
+                let (storage, var_clif) = (*storage, self.clif_type(ty));
+                match storage {
+                    LocalStorage::Ssa(var) => {
+                        let val = if op == AssignOp::Assign {
+                            rhs_val
+                        } else {
+                            let lhs_val = ctx.builder.use_var(var);
+                            self.compile_compound_assign(ctx, op,
+                                TypedValue::new(lhs_val, lhs_sign),
+                                TypedValue::new(rhs_val, rhs_tv.signedness()))
+                        };
+                        let val = self.coerce_typed(ctx, TypedValue::new(val, rhs_tv.signedness()), var_clif);
+                        ctx.builder.def_var(var, val);
+                        return TypedValue::new(val, lhs_sign);
+                    }
+                    LocalStorage::Spilled(slot) => {
+                        let ptr = ctx.builder.ins().stack_addr(I64, slot, 0);
+                        let val = if op == AssignOp::Assign {
+                            rhs_val
+                        } else {
+                            let lhs_val = ctx.builder.ins().load(var_clif, MemFlags::new(), ptr, 0);
+                            self.compile_compound_assign(ctx, op,
+                                TypedValue::new(lhs_val, lhs_sign),
+                                TypedValue::new(rhs_val, rhs_tv.signedness()))
+                        };
+                        let val = self.coerce_typed(ctx, TypedValue::new(val, rhs_tv.signedness()), var_clif);
+                        ctx.builder.ins().store(MemFlags::new(), val, ptr, 0);
+                        return TypedValue::new(val, lhs_sign);
+                    }
+                    LocalStorage::Ptr(_) => {} // fall through to memory assignment
+                }
             }
         }
 
@@ -820,7 +774,7 @@ impl Codegen {
 
         // Array/struct assignment: emit memcpy
         if op == AssignOp::Assign {
-            if matches!(&lhs_ty, CType::Array(..) | CType::Struct(_) | CType::Union(_)) {
+            if lhs_ty.is_aggregate() || matches!(&lhs_ty, CType::Array(..)) {
                 let size = lhs_ty.size();
                 let dst = self.compile_addr(ctx, lhs);
                 let src = rhs_val; // for aggregates, compile_expr returns address
@@ -881,8 +835,6 @@ impl Codegen {
         if let Some(ref name) = func_name {
             // Check if this is actually a variable (function pointer), not a function
             let is_var = ctx.locals.contains_key(name)
-                || ctx.spilled_locals.contains_key(name)
-                || ctx.local_ptrs.contains_key(name)
                 || self.data_ids.contains_key(name);
             if is_var {
                 return self.compile_indirect_call_var(ctx, func, &arg_vals);
@@ -1025,7 +977,7 @@ impl Codegen {
     /// Indirect call through a named variable that holds a function pointer.
     fn compile_indirect_call_var(&mut self, ctx: &mut FuncCtx, func: &Expr, arg_vals: &[Value]) -> TypedValue {
         let func_ptr = if let Expr::Ident(name) = func {
-            if ctx.local_ptrs.contains_key(name) {
+            if matches!(ctx.locals.get(name), Some((LocalStorage::Ptr(_), _))) {
                 let addr = self.compile_expr(ctx, func).raw();
                 ctx.builder.ins().load(I64, MemFlags::new(), addr, 0)
             } else {
@@ -1062,11 +1014,7 @@ impl Codegen {
             sig.params.push(AbiParam::new(I64));
         }
         for p in &param_ctypes {
-            let clif_ty = if matches!(&p.ty, CType::Struct(_) | CType::Union(_)) {
-                I64
-            } else {
-                self.clif_type(&p.ty)
-            };
+            let clif_ty = if p.ty.is_aggregate() { I64 } else { self.clif_type(&p.ty) };
             sig.params.push(AbiParam::new(clif_ty));
         }
         // Add params for extra args: variadic or C's unspecified-param `()` syntax
@@ -1093,11 +1041,7 @@ impl Codegen {
         }
         for (i, &val) in arg_vals.iter().enumerate() {
             if i < param_ctypes.len() {
-                let target = if matches!(&param_ctypes[i].ty, CType::Struct(_) | CType::Union(_)) {
-                    I64
-                } else {
-                    self.clif_type(&param_ctypes[i].ty)
-                };
+                let target = if param_ctypes[i].ty.is_aggregate() { I64 } else { self.clif_type(&param_ctypes[i].ty) };
                 coerced.push(self.coerce(ctx, val, target));
             } else {
                 let val_ty = ctx.builder.func.dfg.value_type(val);

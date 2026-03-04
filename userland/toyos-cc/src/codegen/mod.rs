@@ -69,12 +69,34 @@ pub struct Codegen {
     extern_provision: HashSet<String>,                         // functions with non-inline external provision
 }
 
+/// How a local variable is stored during code generation.
+/// Unifies the old `locals`, `local_ptrs`, and `spilled_locals` maps into a single
+/// map, eliminating duplicated 3-way lookup chains across the codegen.
+#[derive(Clone, Copy)]
+pub(super) enum LocalStorage {
+    /// SSA variable (cranelift Variable) — scalars that haven't had their address taken
+    Ssa(Variable),
+    /// Stack-allocated pointer (cranelift Value) — aggregates, arrays, VLAs, static locals
+    Ptr(Value),
+    /// Stack slot (address was taken) — scalars spilled because `&var` appears somewhere
+    Spilled(ir::StackSlot),
+}
+
+/// State for compiling a switch statement. Extracted from FuncCtx so that
+/// save/restore on nested switches is a single `take()`/assign, and the
+/// "no switch active" state is unambiguously `None`.
+pub(super) struct SwitchCtx {
+    pub pending_fallthrough: Option<ir::Block>,
+    pub dispatch_entries: Vec<(i128, ir::Block)>,
+    pub dispatch_ranges: Vec<(i128, i128, ir::Block)>,
+    pub default_block: Option<ir::Block>,
+    pub case_blocks: Vec<ir::Block>,
+}
+
 pub(super) struct FuncCtx<'a> {
     builder: FunctionBuilder<'a>,
     name: String,
-    locals: HashMap<String, (Variable, CType)>,
-    local_ptrs: HashMap<String, (Value, CType)>, // stack-allocated aggregates
-    spilled_locals: HashMap<String, (ir::StackSlot, CType)>, // locals whose address was taken
+    locals: HashMap<String, (LocalStorage, CType)>,
     addr_taken: HashSet<String>, // names of variables whose address is taken anywhere in the function
     return_type: CType,
     filled: bool, // current block has a terminator
@@ -82,14 +104,7 @@ pub(super) struct FuncCtx<'a> {
     break_block: Option<ir::Block>,
     continue_block: Option<ir::Block>,
     // Switch support
-    switch_val: Option<Value>,
-    switch_unsigned: bool,
-    switch_exit: Option<ir::Block>,
-    switch_pending_fallthrough: Option<ir::Block>, // pre-created body block for next case (fallthrough)
-    switch_dispatch_entries: Vec<(i128, ir::Block)>, // (case_val, body_block) for dispatch
-    switch_dispatch_ranges: Vec<(i128, i128, ir::Block)>, // (lo, hi, body_block) for case ranges
-    switch_default_block: Option<ir::Block>,
-    switch_case_blocks: Vec<ir::Block>, // blocks to seal after dispatch chain is built
+    switch: Option<SwitchCtx>,
     // Goto/labels
     labels: HashMap<String, ir::Block>,
     // Variadic function support
@@ -98,6 +113,25 @@ pub(super) struct FuncCtx<'a> {
     // VLA support
     vla_sizes: HashMap<String, Value>,  // var name → runtime element count
     vla_allocs: Vec<Value>,             // malloc'd pointers to free at function exit
+}
+
+impl FuncCtx<'_> {
+    /// Store a value into a local variable, regardless of storage kind.
+    pub(super) fn store_to_local(&mut self, name: &str, val: Value) {
+        let storage = self.locals.get(name)
+            .map(|(s, _)| *s)
+            .unwrap_or_else(|| panic!("store_to_local: unknown variable '{name}'"));
+        match storage {
+            LocalStorage::Ssa(var) => self.builder.def_var(var, val),
+            LocalStorage::Spilled(slot) => {
+                let ptr = self.builder.ins().stack_addr(I64, slot, 0);
+                self.builder.ins().store(MemFlags::new(), val, ptr, 0);
+            }
+            LocalStorage::Ptr(ptr) => {
+                self.builder.ins().store(MemFlags::new(), val, ptr, 0);
+            }
+        }
+    }
 }
 
 impl Codegen {
@@ -150,7 +184,7 @@ impl Codegen {
     }
 
     fn needs_sret(ret: &CType) -> bool {
-        matches!(ret, CType::Struct(_) | CType::Union(_))
+        ret.is_aggregate()
     }
 
     fn build_signature(&self, ret: &CType, params: &[ParamType], variadic: bool) -> ir::Signature {
@@ -161,11 +195,7 @@ impl Codegen {
         }
         for p in params {
             // Struct/union params are passed by pointer
-            let clif_ty = if matches!(&p.ty, CType::Struct(_) | CType::Union(_)) {
-                I64
-            } else {
-                self.clif_type(&p.ty)
-            };
+            let clif_ty = if p.ty.is_aggregate() { I64 } else { self.clif_type(&p.ty) };
             sig.params.push(AbiParam::new(clif_ty));
         }
         if variadic {
@@ -341,21 +371,12 @@ impl Codegen {
             builder,
             name: name.clone(),
             locals: HashMap::new(),
-            local_ptrs: HashMap::new(),
-            spilled_locals: HashMap::new(),
             addr_taken,
             return_type: ret_ty,
             filled: false,
             break_block: None,
             continue_block: None,
-            switch_val: None,
-            switch_unsigned: false,
-            switch_exit: None,
-            switch_pending_fallthrough: None,
-            switch_dispatch_entries: Vec::new(),
-            switch_dispatch_ranges: Vec::new(),
-            switch_default_block: None,
-            switch_case_blocks: Vec::new(),
+            switch: None,
             labels: HashMap::new(),
             va_area: None,
             sret_ptr: None,
@@ -382,7 +403,7 @@ impl Codegen {
                 self.local_types.insert(name.clone(), p.ty.clone());
                 let val = ctx.builder.block_params(params_block)[blk_idx];
                 // Struct/union params are passed by pointer: copy to local storage
-                if matches!(&p.ty, CType::Struct(_) | CType::Union(_)) {
+                if p.ty.is_aggregate() {
                     let size = p.ty.size().max(1);
                     let ss = ctx.builder.create_sized_stack_slot(StackSlotData::new(
                         StackSlotKind::ExplicitSlot, size as u32, 0));
@@ -390,12 +411,12 @@ impl Codegen {
                     // Copy from caller's address to local storage
                     let size_val = ctx.builder.ins().iconst(I64, size as i64);
                     self.emit_memcpy(&mut ctx, local_ptr, val, size_val);
-                    ctx.local_ptrs.insert(name.clone(), (local_ptr, p.ty.clone()));
+                    ctx.locals.insert(name.clone(), (LocalStorage::Ptr(local_ptr), p.ty.clone()));
                 } else {
                     let clif_ty = self.clif_type(&p.ty);
                     let var = ctx.builder.declare_var(clif_ty);
                     ctx.builder.def_var(var, val);
-                    ctx.locals.insert(name.clone(), (var, p.ty.clone()));
+                    ctx.locals.insert(name.clone(), (LocalStorage::Ssa(var), p.ty.clone()));
                 }
             }
         }
@@ -419,7 +440,7 @@ impl Codegen {
         // stack slot is initialized in the entry block (dominates everything).
         let names: Vec<_> = ctx.addr_taken.iter().cloned().collect();
         for name in &names {
-            if let Some((var, ty)) = ctx.locals.get(name).cloned() {
+            if let Some((LocalStorage::Ssa(var), ty)) = ctx.locals.get(name).cloned() {
                 let size = ty.size().max(1);
                 let ss = ctx.builder.create_sized_stack_slot(ir::StackSlotData::new(
                     ir::StackSlotKind::ExplicitSlot, size as u32, 0,
@@ -427,8 +448,7 @@ impl Codegen {
                 let ptr = ctx.builder.ins().stack_addr(I64, ss, 0);
                 let val = ctx.builder.use_var(var);
                 ctx.builder.ins().store(MemFlags::new(), val, ptr, 0);
-                ctx.locals.remove(name);
-                ctx.spilled_locals.insert(name.clone(), (ss, ty));
+                ctx.locals.insert(name.clone(), (LocalStorage::Spilled(ss), ty));
             }
         }
 
@@ -500,7 +520,7 @@ impl Codegen {
             verbose!("global_decl: {} : {:?}{}", name, ty, if is_extern { " (extern)" } else { "" });
 
             // Function declarations (not definitions)
-            if matches!(ty, CType::Function(..)) {
+            if ty.is_function() {
                 if let CType::Function(ret, params, _) = &ty {
                     self.func_ret_types.insert(name.clone(), ret.as_ref().clone());
                     self.func_ctypes.insert(name.clone(), ty.clone());

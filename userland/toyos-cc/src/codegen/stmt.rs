@@ -232,7 +232,7 @@ impl Codegen {
             match stmt {
                 Statement::Label(..) | Statement::Case(..) | Statement::CaseRange(..) | Statement::Default(..) | Statement::Compound(..) => {}
                 // Inside a switch, if/while/for/do may contain case labels
-                Statement::If(..) | Statement::While(..) | Statement::DoWhile(..) | Statement::For(..) if ctx.switch_val.is_some() => {}
+                Statement::If(..) | Statement::While(..) | Statement::DoWhile(..) | Statement::For(..) if ctx.switch.is_some() => {}
                 Statement::Expr(_) | Statement::If(..) | Statement::While(..) | Statement::DoWhile(..)
                 | Statement::For(..) | Statement::Switch(..) | Statement::Break | Statement::Continue
                 | Statement::Return(_) | Statement::Goto(_) | Statement::Asm(_) => return,
@@ -270,8 +270,6 @@ impl Codegen {
 
     fn compile_compound(&mut self, ctx: &mut FuncCtx, items: &[BlockItem]) {
         let saved_locals = ctx.locals.clone();
-        let saved_local_ptrs = ctx.local_ptrs.clone();
-        let saved_spilled = ctx.spilled_locals.clone();
         let saved_enums = self.type_env.enum_constants.clone();
 
         for item in items {
@@ -280,7 +278,7 @@ impl Codegen {
                 // or is a declaration (variables need to exist for code after labels)
                 match item {
                     BlockItem::Stmt(Statement::Label(..) | Statement::Case(..) | Statement::CaseRange(..) | Statement::Default(..) | Statement::Compound(..)) => {}
-                    BlockItem::Stmt(Statement::If(..) | Statement::While(..) | Statement::DoWhile(..) | Statement::For(..)) if ctx.switch_val.is_some() => {}
+                    BlockItem::Stmt(Statement::If(..) | Statement::While(..) | Statement::DoWhile(..) | Statement::For(..)) if ctx.switch.is_some() => {}
                     BlockItem::Decl(_) => {}
                     BlockItem::Stmt(Statement::Expr(_) | Statement::If(..) | Statement::While(..)
                         | Statement::DoWhile(..) | Statement::For(..) | Statement::Switch(..)
@@ -295,8 +293,6 @@ impl Codegen {
         }
 
         ctx.locals = saved_locals;
-        ctx.local_ptrs = saved_local_ptrs;
-        ctx.spilled_locals = saved_spilled;
         self.type_env.enum_constants = saved_enums;
     }
 
@@ -495,15 +491,14 @@ impl Codegen {
         let exit_block = ctx.builder.create_block();
 
         let prev_break = ctx.break_block.replace(exit_block);
-        let prev_switch = ctx.switch_val.replace(switch_val);
-        let prev_unsigned = ctx.switch_unsigned;
-        ctx.switch_unsigned = is_unsigned;
-        let prev_exit = ctx.switch_exit.replace(exit_block);
-        let prev_fallthrough = ctx.switch_pending_fallthrough.take();
-        let prev_entries = std::mem::take(&mut ctx.switch_dispatch_entries);
-        let prev_ranges = std::mem::take(&mut ctx.switch_dispatch_ranges);
-        let prev_default = ctx.switch_default_block.take();
-        let prev_case_blocks = std::mem::take(&mut ctx.switch_case_blocks);
+        let prev_switch = ctx.switch.take();
+        ctx.switch = Some(SwitchCtx {
+            pending_fallthrough: None,
+            dispatch_entries: Vec::new(),
+            dispatch_ranges: Vec::new(),
+            default_block: None,
+            case_blocks: Vec::new(),
+        });
 
         // Jump to a placeholder dispatch block (will be filled after body)
         let dispatch_entry = ctx.builder.create_block();
@@ -520,24 +515,25 @@ impl Codegen {
         if !ctx.filled { ctx.builder.ins().jump(exit_block, &[]); }
 
         // If last case had a fallthrough, connect it to exit
-        if let Some(ft) = ctx.switch_pending_fallthrough.take() {
+        let sw = ctx.switch.as_mut().unwrap();
+        if let Some(ft) = sw.pending_fallthrough.take() {
             ctx.builder.switch_to_block(ft);
             ctx.builder.ins().jump(exit_block, &[]);
             ctx.builder.seal_block(ft);
         }
 
         // Build dispatch chain from collected entries
-        let entries = std::mem::take(&mut ctx.switch_dispatch_entries);
-        let ranges = std::mem::take(&mut ctx.switch_dispatch_ranges);
-        let default_block = ctx.switch_default_block.take();
+        let sw = ctx.switch.as_mut().unwrap();
+        let entries = std::mem::take(&mut sw.dispatch_entries);
+        let ranges = std::mem::take(&mut sw.dispatch_ranges);
+        let default_block = sw.default_block.take();
 
         let mut current_dispatch = dispatch_entry;
         for (case_val, case_block) in &entries {
             let next_dispatch = ctx.builder.create_block();
             ctx.builder.switch_to_block(current_dispatch);
             let cv = ctx.builder.ins().iconst(switch_type, *case_val as i64);
-            let sv = switch_val;
-            let cmp = ctx.builder.ins().icmp(IntCC::Equal, sv, cv);
+            let cmp = ctx.builder.ins().icmp(IntCC::Equal, switch_val, cv);
             ctx.builder.ins().brif(cmp, *case_block, &[], next_dispatch, &[]);
             ctx.builder.seal_block(current_dispatch);
             current_dispatch = next_dispatch;
@@ -565,20 +561,14 @@ impl Codegen {
         ctx.builder.seal_block(current_dispatch);
 
         // Seal all case/default blocks now that all predecessors are known
-        let case_blocks = std::mem::take(&mut ctx.switch_case_blocks);
+        let sw = ctx.switch.as_mut().unwrap();
+        let case_blocks = std::mem::take(&mut sw.case_blocks);
         for block in case_blocks {
             ctx.builder.seal_block(block);
         }
 
         ctx.break_block = prev_break;
-        ctx.switch_val = prev_switch;
-        ctx.switch_unsigned = prev_unsigned;
-        ctx.switch_exit = prev_exit;
-        ctx.switch_pending_fallthrough = prev_fallthrough;
-        ctx.switch_dispatch_entries = prev_entries;
-        ctx.switch_dispatch_ranges = prev_ranges;
-        ctx.switch_case_blocks = prev_case_blocks;
-        ctx.switch_default_block = prev_default;
+        ctx.switch = prev_switch;
 
         ctx.builder.switch_to_block(exit_block);
         ctx.builder.seal_block(exit_block);
@@ -587,14 +577,16 @@ impl Codegen {
     }
 
     fn compile_case(&mut self, ctx: &mut FuncCtx, val: &Expr, body: &Statement) {
+        let sw = ctx.switch.as_mut().unwrap();
         // Body block: either from previous case's fallthrough or new
-        let case_block = ctx.switch_pending_fallthrough.take()
+        let case_block = sw.pending_fallthrough.take()
             .unwrap_or_else(|| ctx.builder.create_block());
 
         // Collect dispatch entry (case value evaluated at compile time)
         let case_val = self.eval_const(val).expect("case: non-constant expression");
-        ctx.switch_dispatch_entries.push((case_val as i128, case_block));
-        ctx.switch_case_blocks.push(case_block);
+        let sw = ctx.switch.as_mut().unwrap();
+        sw.dispatch_entries.push((case_val as i128, case_block));
+        sw.case_blocks.push(case_block);
 
         // Connect fallthrough from previous body code to case_block
         if !ctx.filled {
@@ -610,19 +602,21 @@ impl Codegen {
         if !ctx.filled {
             let ft = ctx.builder.create_block();
             ctx.builder.ins().jump(ft, &[]);
-            ctx.switch_pending_fallthrough = Some(ft);
+            ctx.switch.as_mut().unwrap().pending_fallthrough = Some(ft);
         }
         ctx.filled = true;
     }
 
     fn compile_case_range(&mut self, ctx: &mut FuncCtx, lo: &Expr, hi: &Expr, body: &Statement) {
-        let case_block = ctx.switch_pending_fallthrough.take()
+        let sw = ctx.switch.as_mut().unwrap();
+        let case_block = sw.pending_fallthrough.take()
             .unwrap_or_else(|| ctx.builder.create_block());
 
         let lo_val = self.eval_const(lo).expect("case range: non-constant low expression");
         let hi_val = self.eval_const(hi).expect("case range: non-constant high expression");
-        ctx.switch_dispatch_ranges.push((lo_val as i128, hi_val as i128, case_block));
-        ctx.switch_case_blocks.push(case_block);
+        let sw = ctx.switch.as_mut().unwrap();
+        sw.dispatch_ranges.push((lo_val as i128, hi_val as i128, case_block));
+        sw.case_blocks.push(case_block);
 
         if !ctx.filled {
             ctx.builder.ins().jump(case_block, &[]);
@@ -636,17 +630,19 @@ impl Codegen {
         if !ctx.filled {
             let ft = ctx.builder.create_block();
             ctx.builder.ins().jump(ft, &[]);
-            ctx.switch_pending_fallthrough = Some(ft);
+            ctx.switch.as_mut().unwrap().pending_fallthrough = Some(ft);
         }
         ctx.filled = true;
     }
 
     fn compile_default(&mut self, ctx: &mut FuncCtx, body: &Statement) {
-        let default_block = ctx.switch_pending_fallthrough.take()
+        let sw = ctx.switch.as_mut().unwrap();
+        let default_block = sw.pending_fallthrough.take()
             .unwrap_or_else(|| ctx.builder.create_block());
 
-        ctx.switch_default_block = Some(default_block);
-        ctx.switch_case_blocks.push(default_block);
+        let sw = ctx.switch.as_mut().unwrap();
+        sw.default_block = Some(default_block);
+        sw.case_blocks.push(default_block);
 
         if !ctx.filled {
             ctx.builder.ins().jump(default_block, &[]);
@@ -747,7 +743,7 @@ impl Codegen {
                     let ptr = self.emit_malloc(ctx, total);
                     ctx.vla_sizes.insert(name.clone(), count);
                     ctx.vla_allocs.push(ptr);
-                    ctx.local_ptrs.insert(name, (ptr, ty));
+                    ctx.locals.insert(name, (LocalStorage::Ptr(ptr), ty));
                     continue;
                 }
             }
@@ -768,11 +764,11 @@ impl Codegen {
             }
 
             // Aggregates (struct/union/array) get stack-allocated
-            if matches!(ty, CType::Struct(_) | CType::Union(_) | CType::Array(..)) {
+            if ty.is_aggregate() || matches!(ty, CType::Array(..)) {
                 let size = ty.size().max(1);
                 let ss = ctx.builder.create_sized_stack_slot(ir::StackSlotData::new(ir::StackSlotKind::ExplicitSlot, size as u32, 0));
                 let ptr = ctx.builder.ins().stack_addr(I64, ss, 0);
-                ctx.local_ptrs.insert(name.clone(), (ptr, ty.clone()));
+                ctx.locals.insert(name.clone(), (LocalStorage::Ptr(ptr), ty.clone()));
                 if let Some(init) = &id.initializer {
                     self.compile_aggregate_init(ctx, ptr, &ty, init);
                 }
@@ -791,7 +787,7 @@ impl Codegen {
             let var = ctx.builder.declare_var(clif_ty);
             // Register type before compiling initializer so sizeof/typeof
             // can resolve the variable's type in the initializer expression.
-            ctx.locals.insert(name, (var, ty));
+            ctx.locals.insert(name, (LocalStorage::Ssa(var), ty));
 
             let val = match &id.initializer {
                 Some(Initializer::Expr(e)) => {
@@ -810,8 +806,6 @@ impl Codegen {
     fn compile_local_func_decl(&mut self, ctx: &mut FuncCtx, name: &str, ty: &CType) {
         // Remove any local variable shadow so calls see the function
         ctx.locals.remove(name);
-        ctx.local_ptrs.remove(name);
-        ctx.spilled_locals.remove(name);
         let CType::Function(ref ret, ref params, variadic) = *ty else {
             unreachable!()
         };
@@ -834,8 +828,6 @@ impl Codegen {
     /// extern declarations inside a function body refer to globals.
     fn compile_extern_local(&mut self, ctx: &mut FuncCtx, name: &str, ty: CType) {
         ctx.locals.remove(name);
-        ctx.local_ptrs.remove(name);
-        ctx.spilled_locals.remove(name);
         self.global_types.insert(name.to_string(), ty);
         if !self.data_ids.contains_key(name) {
             let data_id = self.module.declare_data(name, Linkage::Import, false, false)
@@ -861,7 +853,7 @@ impl Codegen {
         self.module.define_data(data_id, &desc).unwrap_or_else(|e| panic!("failed to define data: {e:?}"));
         let gv = self.module.declare_data_in_func(data_id, ctx.builder.func);
         let ptr = ctx.builder.ins().global_value(I64, gv);
-        ctx.local_ptrs.insert(name.to_string(), (ptr, ty.clone()));
+        ctx.locals.insert(name.to_string(), (LocalStorage::Ptr(ptr), ty.clone()));
     }
 
     /// Address-taken variable — allocate on stack so the slot is valid in all basic blocks.
@@ -873,7 +865,7 @@ impl Codegen {
         let ptr = ctx.builder.ins().stack_addr(I64, ss, 0);
         // Register type before compiling initializer so sizeof/typeof
         // can resolve the variable's type in the initializer expression.
-        ctx.spilled_locals.insert(name, (ss, ty));
+        ctx.locals.insert(name, (LocalStorage::Spilled(ss), ty));
         let val = match init {
             Some(Initializer::Expr(e)) => {
                 let tv = self.compile_expr(ctx, e);

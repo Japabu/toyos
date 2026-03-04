@@ -17,12 +17,6 @@ impl Codegen {
                 if let Some((_, ty)) = ctx.locals.get(name) {
                     return ty.clone();
                 }
-                if let Some((_, ty)) = ctx.spilled_locals.get(name) {
-                    return ty.clone();
-                }
-                if let Some((_, ty)) = ctx.local_ptrs.get(name) {
-                    return ty.clone();
-                }
                 if let Some(ty) = self.global_types.get(name) {
                     return ty.clone();
                 }
@@ -84,17 +78,9 @@ impl Codegen {
                     CType::Function(ret, _, _) => ret.as_ref().clone(),
                     CType::Pointer(inner) => match inner.as_ref() {
                         CType::Function(ret, _, _) => ret.as_ref().clone(),
-                        CType::Void | CType::Bool | CType::Char(_) | CType::Short(_) | CType::Int(_)
-                        | CType::Long(_) | CType::LongLong(_) | CType::Int128(_) | CType::Float
-                        | CType::Double | CType::LongDouble | CType::Pointer(_) | CType::Array(..)
-                        | CType::Enum(_) | CType::Struct(_) | CType::Union(_)
-                        => panic!("call through non-function pointer: {callee_ty:?}"),
+                        _ => panic!("call through non-function pointer: {callee_ty:?}"),
                     },
-                    CType::Void | CType::Bool | CType::Char(_) | CType::Short(_) | CType::Int(_)
-                    | CType::Long(_) | CType::LongLong(_) | CType::Int128(_) | CType::Float
-                    | CType::Double | CType::LongDouble | CType::Array(..) | CType::Enum(_)
-                    | CType::Struct(_) | CType::Union(_)
-                    => panic!("call on non-function type: {callee_ty:?}"),
+                    _ => panic!("call on non-function type: {callee_ty:?}"),
                 }
             }
             Expr::Cast(type_name, _) => self.resolve_typename(type_name),
@@ -126,20 +112,8 @@ impl Codegen {
                 let tt = self.expr_type(ctx, t);
                 let ft = self.expr_type(ctx, f);
                 // Function types decay to function pointers in ternary context
-                let l = match &tt {
-                    CType::Function(..) => CType::Pointer(Box::new(tt)),
-                    CType::Void | CType::Bool | CType::Char(_) | CType::Short(_) | CType::Int(_)
-                    | CType::Long(_) | CType::LongLong(_) | CType::Int128(_) | CType::Float
-                    | CType::Double | CType::LongDouble | CType::Pointer(_) | CType::Array(..)
-                    | CType::Struct(_) | CType::Union(_) | CType::Enum(_) => tt,
-                };
-                let r = match &ft {
-                    CType::Function(..) => CType::Pointer(Box::new(ft)),
-                    CType::Void | CType::Bool | CType::Char(_) | CType::Short(_) | CType::Int(_)
-                    | CType::Long(_) | CType::LongLong(_) | CType::Int128(_) | CType::Float
-                    | CType::Double | CType::LongDouble | CType::Pointer(_) | CType::Array(..)
-                    | CType::Struct(_) | CType::Union(_) | CType::Enum(_) => ft,
-                };
+                let l = if tt.is_function() { CType::Pointer(Box::new(tt)) } else { tt };
+                let r = if ft.is_function() { CType::Pointer(Box::new(ft)) } else { ft };
                 if let (CType::Pointer(ref li), CType::Pointer(_)) = (&l, &r) {
                     return if matches!(**li, CType::Void) { r } else { l };
                 }

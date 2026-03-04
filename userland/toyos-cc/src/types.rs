@@ -11,13 +11,6 @@ impl Signedness {
     pub fn is_signed(self) -> bool { self == Signedness::Signed }
 }
 
-impl From<bool> for Signedness {
-    /// Convert from the old convention: `true` = signed, `false` = unsigned.
-    fn from(signed: bool) -> Self {
-        if signed { Signedness::Signed } else { Signedness::Unsigned }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub enum CType {
     Void,
@@ -131,67 +124,21 @@ impl CType {
         matches!(self, CType::Pointer(_))
     }
 
-    fn struct_size(&self, def: &StructDef) -> usize {
-        let mut offset = 0usize;
-        let mut bit_pos = 0u32; // bits used in current bitfield storage unit
-        let mut bit_unit_size = 0usize; // size of current bitfield storage unit (0 = not in bitfield)
-        for field in &def.fields {
-            if let Some(bw) = field.bit_width {
-                let unit_size = field.ty.size();
-                let unit_bits = (unit_size * 8) as u32;
-                let align = field.ty.align();
-                if bw == 0 {
-                    // Zero-width bitfield: flush current unit, align to next boundary
-                    if bit_unit_size > 0 {
-                        offset += bit_unit_size;
-                        bit_pos = 0;
-                        bit_unit_size = 0;
-                    }
-                    offset = (offset + align - 1) & !(align - 1);
-                } else if bit_unit_size == unit_size && bit_pos + bw <= unit_bits {
-                    // Fits in current storage unit
-                    bit_pos += bw;
-                } else {
-                    // Start new storage unit
-                    offset += bit_unit_size;
-                    offset = (offset + align - 1) & !(align - 1);
-                    bit_unit_size = unit_size;
-                    bit_pos = bw;
-                }
-                continue;
-            }
-            // Flush any pending bitfield storage unit
-            offset += bit_unit_size;
-            bit_pos = 0;
-            bit_unit_size = 0;
-            // Flexible array member (incomplete array at end of struct) has size 0
-            if matches!(&field.ty, CType::Array(_, None)) {
-                continue;
-            }
-            let align = field.ty.align();
-            offset = (offset + align - 1) & !(align - 1);
-            offset += field.ty.size();
-        }
-        // Flush trailing bitfield unit
-        offset += bit_unit_size;
-        let struct_align = self.align();
-        (offset + struct_align - 1) & !(struct_align - 1)
+    pub fn is_aggregate(&self) -> bool {
+        matches!(self, CType::Struct(_) | CType::Union(_))
     }
 
-    fn union_size(&self, def: &StructDef) -> usize {
-        let max_size = def.fields.iter().map(|f| f.ty.size()).max().unwrap_or(0);
-        let align = self.align();
-        (max_size + align - 1) & !(align - 1)
+    pub fn is_function(&self) -> bool {
+        matches!(self, CType::Function(..))
     }
 
-    /// Look up a field by name in a struct/union.
-    /// Returns byte offset, bit offset within storage unit, bitfield width, and field type.
-    pub fn field_offset(&self, name: &str) -> Option<FieldInfo> {
-        let def = match self {
-            CType::Struct(def) => def,
-            CType::Union(_) => return self.union_field(name),
-            _ => panic!("field_offset called on non-struct/union type: {self:?}"),
-        };
+    /// Walk the layout of a struct, tracking byte offsets and bitfield positions.
+    /// Calls `visitor` for each field with `(byte_offset, bit_offset_in_unit, &FieldDef)`.
+    /// If the visitor returns `Some(R)`, walking stops early and that value is returned.
+    fn walk_struct_layout<R>(
+        def: &StructDef,
+        mut visitor: impl FnMut(usize, u32, &FieldDef) -> Option<R>,
+    ) -> (usize, Option<R>) {
         let mut offset = 0usize;
         let mut bit_pos = 0u32;
         let mut bit_unit_size = 0usize;
@@ -210,19 +157,17 @@ impl CType {
                 } else if bit_unit_size == unit_size && bit_pos + bw <= unit_bits {
                     let field_bit_off = bit_pos;
                     bit_pos += bw;
-                    if field.name.as_deref() == Some(name) {
-                        return Some(FieldInfo { byte_offset: offset, bit_offset: field_bit_off, bit_width: field.bit_width, ty: field.ty.clone() });
+                    if let Some(r) = visitor(offset, field_bit_off, field) {
+                        return (offset, Some(r));
                     }
-                    continue;
                 } else {
                     offset += bit_unit_size;
                     offset = (offset + align - 1) & !(align - 1);
                     bit_unit_size = unit_size;
                     bit_pos = bw;
-                    if field.name.as_deref() == Some(name) {
-                        return Some(FieldInfo { byte_offset: offset, bit_offset: 0, bit_width: field.bit_width, ty: field.ty.clone() });
+                    if let Some(r) = visitor(offset, 0, field) {
+                        return (offset, Some(r));
                     }
-                    continue;
                 }
                 continue;
             }
@@ -230,25 +175,63 @@ impl CType {
             offset += bit_unit_size;
             bit_pos = 0;
             bit_unit_size = 0;
-
+            // Flexible array member (incomplete array at end of struct) has size 0
+            if matches!(&field.ty, CType::Array(_, None)) {
+                if let Some(r) = visitor(offset, 0, field) {
+                    return (offset, Some(r));
+                }
+                continue;
+            }
             let align = field.ty.align();
             offset = (offset + align - 1) & !(align - 1);
-
-            if field.name.as_deref() == Some(name) {
-                return Some(FieldInfo { byte_offset: offset, bit_offset: 0, bit_width: None, ty: field.ty.clone() });
+            if let Some(r) = visitor(offset, 0, field) {
+                return (offset, Some(r));
             }
+            offset += field.ty.size();
+        }
+        offset += bit_unit_size;
+        (offset, None)
+    }
 
-            // Anonymous struct/union - search inside
-            if field.name.is_none() {
+    fn struct_size(&self, def: &StructDef) -> usize {
+        let (offset, _) = Self::walk_struct_layout(def, |_, _, _| None::<()>);
+        let struct_align = self.align();
+        (offset + struct_align - 1) & !(struct_align - 1)
+    }
+
+    fn union_size(&self, def: &StructDef) -> usize {
+        let max_size = def.fields.iter().map(|f| f.ty.size()).max().unwrap_or(0);
+        let align = self.align();
+        (max_size + align - 1) & !(align - 1)
+    }
+
+    /// Look up a field by name in a struct/union.
+    /// Returns byte offset, bit offset within storage unit, bitfield width, and field type.
+    pub fn field_offset(&self, name: &str) -> Option<FieldInfo> {
+        let def = match self {
+            CType::Struct(def) => def,
+            CType::Union(_) => return self.union_field(name),
+            _ => panic!("field_offset called on non-struct/union type: {self:?}"),
+        };
+        let (_, result) = Self::walk_struct_layout(def, |byte_offset, bit_offset, field| {
+            if field.name.as_deref() == Some(name) {
+                return Some(FieldInfo {
+                    byte_offset,
+                    bit_offset,
+                    bit_width: field.bit_width,
+                    ty: field.ty.clone(),
+                });
+            }
+            // Anonymous struct/union — search inside
+            if field.name.is_none() && field.bit_width.is_none() {
                 if let Some(mut fi) = field.ty.field_offset(name) {
-                    fi.byte_offset += offset;
+                    fi.byte_offset += byte_offset;
                     return Some(fi);
                 }
             }
-
-            offset += field.ty.size();
-        }
-        None
+            None
+        });
+        result
     }
 
     fn union_field(&self, name: &str) -> Option<FieldInfo> {
