@@ -80,51 +80,78 @@ fn format_unsigned<'a>(val: u64, base: u64, upper: bool, buf: &'a mut [u8]) -> &
     unsafe { core::str::from_utf8_unchecked(&buf[pos..]) }
 }
 
-// The actual printf entry points. These use Rust's va_list support is not stable,
-// so we implement vsnprintf as the core, and have printf/fprintf/etc call through it
-// via the C side or by manually extracting args.
+// Two sources of variadic args:
+// - VaList from Rust `args: ...` (printf, sprintf, etc. called directly)
+// - Raw pointer to x86_64 SysV va_list struct from C (vsnprintf, vfprintf, etc.)
 //
-// For now, printf/fprintf/sprintf/snprintf are implemented by calling vsnprintf.
-// Since we can't portably access C va_list from Rust, we provide the v* variants
-// as passthroughs and implement the formatting in a C wrapper or use the
-// __builtin_va_* approach.
-//
-// ALTERNATIVE: We implement printf in C using our own mini-printf.c that calls
-// our fwrite/putchar. For now, stub these to at least make things link.
+// VaList<'a> in the ToyOS Rust fork contains VaListInner inline (24 bytes),
+// so it can't be used as an extern "C" parameter for v-functions (C passes
+// an 8-byte pointer, not a 24-byte struct).
+enum VaArgs<'a> {
+    // Pointer to SysV va_list struct: { i32 gp_offset, i32 fp_offset,
+    //   void *overflow_arg_area, void *reg_save_area }
+    Sysv(*mut u8),
+    List(core::ffi::VaList<'a>),
+}
 
-#[no_mangle]
-pub unsafe extern "C" fn printf(fmt: *const u8, args: ...) -> i32 {
-    let mut buf = [0u8; 4096];
-    let n = vsnprintf(buf.as_mut_ptr(), buf.len(), fmt, args);
-    if n > 0 {
-        super::stdio::fwrite(buf.as_ptr(), 1, n as usize, super::stdio::stdout);
+impl VaArgs<'_> {
+    /// Read an 8-byte value from the va_list, following the x86_64 SysV algorithm.
+    unsafe fn next_arg(&mut self) -> u64 {
+        match self {
+            VaArgs::Sysv(va) => {
+                let gp_offset = (*va as *mut i32).read();
+                if gp_offset < 48 {
+                    // Register save area path
+                    let reg_save = (va.add(16) as *mut *mut u8).read();
+                    let val = (reg_save.add(gp_offset as usize) as *mut u64).read();
+                    (*va as *mut i32).write(gp_offset + 8);
+                    val
+                } else {
+                    // Overflow area path
+                    let overflow = (va.add(8) as *mut *mut u8).read();
+                    let val = (overflow as *mut u64).read();
+                    (va.add(8) as *mut *mut u8).write(overflow.add(8));
+                    val
+                }
+            }
+            VaArgs::List(ap) => ap.arg::<u64>(),
+        }
     }
-    n
-}
 
-#[no_mangle]
-pub unsafe extern "C" fn fprintf(f: *mut super::stdio::FILE, fmt: *const u8, args: ...) -> i32 {
-    let mut buf = [0u8; 4096];
-    let n = vsnprintf(buf.as_mut_ptr(), buf.len(), fmt, args);
-    if n > 0 {
-        super::stdio::fwrite(buf.as_ptr(), 1, n as usize, f);
+    unsafe fn arg_i32(&mut self) -> i32 {
+        match self {
+            VaArgs::Sysv(_) => self.next_arg() as i32,
+            VaArgs::List(ap) => ap.arg::<i32>(),
+        }
     }
-    n
+    unsafe fn arg_i64(&mut self) -> i64 {
+        match self {
+            VaArgs::Sysv(_) => self.next_arg() as i64,
+            VaArgs::List(ap) => ap.arg::<i64>(),
+        }
+    }
+    unsafe fn arg_u32(&mut self) -> u32 {
+        match self {
+            VaArgs::Sysv(_) => self.next_arg() as u32,
+            VaArgs::List(ap) => ap.arg::<u32>(),
+        }
+    }
+    unsafe fn arg_u64(&mut self) -> u64 {
+        match self {
+            VaArgs::Sysv(_) => self.next_arg(),
+            VaArgs::List(ap) => ap.arg::<u64>(),
+        }
+    }
+    unsafe fn arg_ptr(&mut self) -> *const u8 {
+        match self {
+            VaArgs::Sysv(_) => self.next_arg() as *const u8,
+            VaArgs::List(ap) => ap.arg::<*const u8>(),
+        }
+    }
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn sprintf(buf: *mut u8, fmt: *const u8, args: ...) -> i32 {
-    vsnprintf(buf, usize::MAX, fmt, args)
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn snprintf(buf: *mut u8, n: usize, fmt: *const u8, args: ...) -> i32 {
-    vsnprintf(buf, n, fmt, args)
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn vsnprintf(buf: *mut u8, n: usize, fmt: *const u8, mut ap: core::ffi::VaList<'_>) -> i32 {
-    // Walk the format string and handle each specifier
+/// Core printf formatting engine.
+unsafe fn do_printf(buf: *mut u8, n: usize, fmt: *const u8, ap: &mut VaArgs) -> i32 {
     let mut w = BufWriter { buf, pos: 0, cap: n };
     let mut i = 0;
 
@@ -155,7 +182,7 @@ pub unsafe extern "C" fn vsnprintf(buf: *mut u8, n: usize, fmt: *const u8, mut a
         // Width
         let mut width: usize = 0;
         if *fmt.add(i) == b'*' {
-            width = ap.arg::<i32>() as usize;
+            width = ap.arg_i32() as usize;
             i += 1;
         } else {
             while (*fmt.add(i)).is_ascii_digit() {
@@ -170,7 +197,7 @@ pub unsafe extern "C" fn vsnprintf(buf: *mut u8, n: usize, fmt: *const u8, mut a
             i += 1;
             let mut prec = 0;
             if *fmt.add(i) == b'*' {
-                prec = ap.arg::<i32>() as usize;
+                prec = ap.arg_i32() as usize;
                 i += 1;
             } else {
                 while (*fmt.add(i)).is_ascii_digit() {
@@ -197,43 +224,43 @@ pub unsafe extern "C" fn vsnprintf(buf: *mut u8, n: usize, fmt: *const u8, mut a
         let pad_char = if zero_pad && !left_align { '0' } else { ' ' };
         match *fmt.add(i) {
             b'd' | b'i' => {
-                let val: i64 = if long_long || long { ap.arg::<i64>() } else { ap.arg::<i32>() as i64 };
+                let val: i64 = if long_long || long { ap.arg_i64() } else { ap.arg_i32() as i64 };
                 let mut tmp = [0u8; 24];
                 let s = format_signed(val, &mut tmp, plus_sign, space_sign);
                 write_padded(&mut w, s, width, pad_char, left_align);
             }
             b'u' => {
-                let val: u64 = if long_long || long { ap.arg::<u64>() } else { ap.arg::<u32>() as u64 };
+                let val: u64 = if long_long || long { ap.arg_u64() } else { ap.arg_u32() as u64 };
                 let mut tmp = [0u8; 24];
                 let s = format_unsigned(val, 10, false, &mut tmp);
                 write_padded(&mut w, s, width, pad_char, left_align);
             }
             b'x' => {
-                let val: u64 = if long_long || long { ap.arg::<u64>() } else { ap.arg::<u32>() as u64 };
+                let val: u64 = if long_long || long { ap.arg_u64() } else { ap.arg_u32() as u64 };
                 let mut tmp = [0u8; 20];
                 let s = format_unsigned(val, 16, false, &mut tmp);
                 write_padded(&mut w, s, width, pad_char, left_align);
             }
             b'X' => {
-                let val: u64 = if long_long || long { ap.arg::<u64>() } else { ap.arg::<u32>() as u64 };
+                let val: u64 = if long_long || long { ap.arg_u64() } else { ap.arg_u32() as u64 };
                 let mut tmp = [0u8; 20];
                 let s = format_unsigned(val, 16, true, &mut tmp);
                 write_padded(&mut w, s, width, pad_char, left_align);
             }
             b'o' => {
-                let val: u64 = if long_long || long { ap.arg::<u64>() } else { ap.arg::<u32>() as u64 };
+                let val: u64 = if long_long || long { ap.arg_u64() } else { ap.arg_u32() as u64 };
                 let mut tmp = [0u8; 24];
                 let s = format_unsigned(val, 8, false, &mut tmp);
                 write_padded(&mut w, s, width, pad_char, left_align);
             }
             b'c' => {
-                let c = ap.arg::<i32>() as u8;
+                let c = ap.arg_i32() as u8;
                 let tmp = [c];
                 let s = core::str::from_utf8_unchecked(&tmp);
                 write_padded(&mut w, s, width, ' ', left_align);
             }
             b's' => {
-                let p: *const u8 = ap.arg::<*const u8>();
+                let p: *const u8 = ap.arg_ptr();
                 if p.is_null() {
                     write_padded(&mut w, "(null)", width, ' ', left_align);
                 } else {
@@ -244,7 +271,7 @@ pub unsafe extern "C" fn vsnprintf(buf: *mut u8, n: usize, fmt: *const u8, mut a
                 }
             }
             b'p' => {
-                let p: *const u8 = ap.arg::<*const u8>();
+                let p: *const u8 = ap.arg_ptr();
                 let mut tmp = [0u8; 20];
                 let s = format_unsigned(p as u64, 16, false, &mut tmp);
                 let _ = w.write_str("0x");
@@ -262,19 +289,27 @@ pub unsafe extern "C" fn vsnprintf(buf: *mut u8, n: usize, fmt: *const u8, mut a
         i += 1;
     }
 
-    if !buf.is_null() {
-        if n > 0 {
-            *buf.add(w.pos.min(n - 1)) = 0;
-        }
+    if !buf.is_null() && n > 0 {
+        *buf.add(w.pos.min(n - 1)) = 0;
     }
 
     w.pos as i32
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn vfprintf(f: *mut super::stdio::FILE, fmt: *const u8, ap: core::ffi::VaList<'_>) -> i32 {
+pub unsafe extern "C" fn printf(fmt: *const u8, args: ...) -> i32 {
     let mut buf = [0u8; 4096];
-    let n = vsnprintf(buf.as_mut_ptr(), buf.len(), fmt, ap);
+    let n = do_printf(buf.as_mut_ptr(), buf.len(), fmt, &mut VaArgs::List(args));
+    if n > 0 {
+        super::stdio::fwrite(buf.as_ptr(), 1, n as usize, super::stdio::stdout);
+    }
+    n
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn fprintf(f: *mut super::stdio::FILE, fmt: *const u8, args: ...) -> i32 {
+    let mut buf = [0u8; 4096];
+    let n = do_printf(buf.as_mut_ptr(), buf.len(), fmt, &mut VaArgs::List(args));
     if n > 0 {
         super::stdio::fwrite(buf.as_ptr(), 1, n as usize, f);
     }
@@ -282,12 +317,41 @@ pub unsafe extern "C" fn vfprintf(f: *mut super::stdio::FILE, fmt: *const u8, ap
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn vprintf(fmt: *const u8, ap: core::ffi::VaList<'_>) -> i32 {
+pub unsafe extern "C" fn sprintf(buf: *mut u8, fmt: *const u8, args: ...) -> i32 {
+    do_printf(buf, usize::MAX, fmt, &mut VaArgs::List(args))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn snprintf(buf: *mut u8, n: usize, fmt: *const u8, args: ...) -> i32 {
+    do_printf(buf, n, fmt, &mut VaArgs::List(args))
+}
+
+// v-entry points: called from C code that passes a va_list (pointer to SysV struct).
+// C's va_list is passed as a pointer (8 bytes), which we receive as *mut u8
+// and read using the SysV va_arg algorithm in VaArgs::Sysv.
+
+#[no_mangle]
+pub unsafe extern "C" fn vsnprintf(buf: *mut u8, n: usize, fmt: *const u8, ap: *mut u8) -> i32 {
+    do_printf(buf, n, fmt, &mut VaArgs::Sysv(ap))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn vfprintf(f: *mut super::stdio::FILE, fmt: *const u8, ap: *mut u8) -> i32 {
+    let mut buf = [0u8; 4096];
+    let n = do_printf(buf.as_mut_ptr(), buf.len(), fmt, &mut VaArgs::Sysv(ap));
+    if n > 0 {
+        super::stdio::fwrite(buf.as_ptr(), 1, n as usize, f);
+    }
+    n
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn vprintf(fmt: *const u8, ap: *mut u8) -> i32 {
     vfprintf(super::stdio::stdout, fmt, ap)
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn vsprintf(buf: *mut u8, fmt: *const u8, ap: core::ffi::VaList<'_>) -> i32 {
+pub unsafe extern "C" fn vsprintf(buf: *mut u8, fmt: *const u8, ap: *mut u8) -> i32 {
     vsnprintf(buf, usize::MAX, fmt, ap)
 }
 
