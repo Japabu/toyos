@@ -62,6 +62,9 @@ cfg_if! {
     ))] {
         mod use_file;
         pub use use_file::*;
+    } else if #[cfg(target_os = "toyos")] {
+        mod toyos;
+        pub use toyos::*;
     } else if #[cfg(any(
         target_os = "macos",
         target_os = "openbsd",
