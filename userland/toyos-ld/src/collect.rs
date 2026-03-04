@@ -51,6 +51,8 @@ pub(crate) enum SectionKind {
     Bss,
     Tls,
     TlsBss,
+    /// Mach-O `__thread_vars`: TLV descriptors (thunk + key + offset).
+    TlsVariables,
     InitArray,
     FiniArray,
 }
@@ -70,7 +72,7 @@ impl SectionKind {
         matches!(self, Self::Bss | Self::TlsBss)
     }
     pub fn is_tls(self) -> bool {
-        matches!(self, Self::Tls | Self::TlsBss)
+        matches!(self, Self::Tls | Self::TlsBss | Self::TlsVariables)
     }
 }
 
@@ -125,6 +127,8 @@ pub enum RelocType {
     Aarch64MovwUabsG3,
     Aarch64AdrGotPage,
     Aarch64Ld64GotLo12Nc,
+    Aarch64GotPcrel32,
+    Aarch64TlvpLoadPage21,
 }
 
 impl std::fmt::Display for RelocType {
@@ -161,6 +165,8 @@ impl std::fmt::Display for RelocType {
             RelocType::Aarch64MovwUabsG3 => write!(f, "R_AARCH64_MOVW_UABS_G3"),
             RelocType::Aarch64AdrGotPage => write!(f, "R_AARCH64_ADR_GOT_PAGE"),
             RelocType::Aarch64Ld64GotLo12Nc => write!(f, "R_AARCH64_LD64_GOT_LO12_NC"),
+            RelocType::Aarch64GotPcrel32 => write!(f, "ARM64_RELOC_POINTER_TO_GOT"),
+            RelocType::Aarch64TlvpLoadPage21 => write!(f, "ARM64_RELOC_TLVP_LOAD_PAGE21"),
         }
     }
 }
@@ -172,6 +178,8 @@ pub(crate) struct InputReloc {
     pub(crate) r_type: RelocType,
     pub(crate) target: SymbolRef,
     pub(crate) addend: i64,
+    /// Mach-O SUBTRACTOR pairs: `target - subtrahend + addend`.
+    pub(crate) subtrahend: Option<SymbolRef>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -197,6 +205,16 @@ pub(crate) struct LinkState {
 }
 
 pub(crate) fn collect(objects: &[(String, Vec<u8>)]) -> Result<LinkState, LinkError> {
+    // Flatten archives into individual object files before processing.
+    let mut flat: Vec<(String, Vec<u8>)> = Vec::new();
+    for (name, data) in objects {
+        if is_archive(data) {
+            extract_archive(name, data, &mut flat)?;
+        } else {
+            flat.push((name.clone(), data.clone()));
+        }
+    }
+
     let mut state = LinkState {
         sections: Vec::new(),
         relocs: Vec::new(),
@@ -211,7 +229,7 @@ pub(crate) fn collect(objects: &[(String, Vec<u8>)]) -> Result<LinkState, LinkEr
 
     let mut sec_map: HashMap<(ObjIdx, object::SectionIndex), SectionIdx> = HashMap::new();
 
-    for (obj_idx, (name, data)) in objects.iter().enumerate() {
+    for (obj_idx, (name, data)) in flat.iter().enumerate() {
         let obj_idx = ObjIdx(obj_idx);
         // ELF shared library input: extract dynamic symbols, skip section processing.
         // Shared libraries are always ELF, so try ELF-specific parse first.
@@ -338,18 +356,32 @@ fn collect_object(
 
         let kind = match section.kind() {
             read::SectionKind::Text => SectionKind::Code,
-            read::SectionKind::Data => SectionKind::Data,
+            read::SectionKind::Data | read::SectionKind::Common => SectionKind::Data,
             read::SectionKind::ReadOnlyData
             | read::SectionKind::ReadOnlyDataWithRel
-            | read::SectionKind::ReadOnlyString
-            | read::SectionKind::OtherString => SectionKind::ReadOnly,
+            | read::SectionKind::ReadOnlyString => SectionKind::ReadOnly,
             read::SectionKind::UninitializedData => SectionKind::Bss,
             read::SectionKind::Tls => SectionKind::Tls,
             read::SectionKind::UninitializedTls => SectionKind::TlsBss,
+            read::SectionKind::TlsVariables => SectionKind::TlsVariables,
             read::SectionKind::Elf(elf::SHT_INIT_ARRAY) => SectionKind::InitArray,
             read::SectionKind::Elf(elf::SHT_FINI_ARRAY) => SectionKind::FiniArray,
-            // Skip debug, metadata, and other non-loadable sections (non_exhaustive enum)
-            _ => continue,
+            // Non-loadable sections — skip
+            read::SectionKind::OtherString
+            | read::SectionKind::Other
+            | read::SectionKind::Debug
+            | read::SectionKind::DebugString
+            | read::SectionKind::Linker
+            | read::SectionKind::Note
+            | read::SectionKind::Metadata => continue,
+            read::SectionKind::Elf(_) => continue,
+            read::SectionKind::Unknown => continue,
+            // non_exhaustive: panic on new variants so we notice them
+            _ => panic!(
+                "unhandled section kind {:?} in section {}",
+                section.kind(),
+                section.name().unwrap_or("<unnamed>"),
+            ),
         };
 
         let sec_data = section.data().unwrap_or(&[]).to_vec();
@@ -457,11 +489,37 @@ fn collect_object(
         // BSS sections have no data to relocate
         if state.sections[global_sec].kind.is_nobits() { continue; }
 
+        // Track pending Mach-O SUBTRACTOR relocation (first half of a
+        // difference pair). The next relocation at the same offset must be
+        // UNSIGNED — together they encode `symbolA - symbolB`.
+        let mut pending_subtractor: Option<(u64, SymbolRef)> = None;
+
         for (offset, reloc) in section.relocations() {
             let sym_name = match resolve_reloc_target(obj, &reloc, obj_idx, sec_map, state, is_macho) {
                 Some(name) => name,
                 None => continue,
             };
+
+            // Mach-O SUBTRACTOR: save the subtrahend and wait for the
+            // paired UNSIGNED relocation at the same offset.
+            if let RelocationFlags::MachO { r_type, .. } = reloc.flags() {
+                if is_macho_subtractor(r_type, state.arch) {
+                    assert!(pending_subtractor.is_none(),
+                        "consecutive SUBTRACTOR without paired UNSIGNED");
+                    pending_subtractor = Some((offset, sym_name));
+                    continue;
+                }
+            }
+
+            // Consume pending SUBTRACTOR: this relocation must be the
+            // paired UNSIGNED at the same offset.
+            let subtrahend = pending_subtractor.take().map(|(sub_offset, sub_sym)| {
+                assert_eq!(sub_offset, offset,
+                    "SUBTRACTOR at offset {sub_offset:#x} not paired with \
+                     relocation at same offset (got {offset:#x})");
+                sub_sym
+            });
+
             let (r_type, is_macho_instruction) = match reloc.flags() {
                 RelocationFlags::Elf { r_type } => match elf_to_reloc_type(r_type) {
                     Some(r) => (r, false),
@@ -482,7 +540,12 @@ fn collect_object(
                 RelocationFlags::MachO { r_type, r_length, .. } => {
                     let mapped = match state.arch {
                         Arch::X86_64 => macho_x86_64_to_reloc_type(r_type, r_length),
-                        Arch::Aarch64 => macho_arm64_to_reloc_type(r_type, r_length),
+                        Arch::Aarch64 => {
+                            let data = &state.sections[global_sec].data;
+                            let off = offset as usize;
+                            let insn = u32::from_le_bytes(data[off..off + 4].try_into().unwrap());
+                            macho_arm64_to_reloc_type(r_type, r_length, insn)
+                        }
                     };
                     match mapped {
                         // x86_64 Mach-O stores addends as raw data bytes (not
@@ -504,7 +567,11 @@ fn collect_object(
             // COFF and Mach-O data relocations use implicit addends stored in
             // section data. Mach-O instruction relocations (ADRP, LDR, BL) encode
             // the immediate in instruction bits — don't read raw bytes as addend.
-            let addend = if is_macho_instruction {
+            // SUBTRACTOR pairs: the data bytes contain the pre-link difference
+            // which is replaced entirely — don't read them as an addend.
+            let addend = if subtrahend.is_some() {
+                0
+            } else if is_macho_instruction {
                 0
             } else if reloc.has_implicit_addend() {
                 let data = &state.sections[global_sec].data;
@@ -526,6 +593,7 @@ fn collect_object(
                 r_type,
                 target: sym_name,
                 addend,
+                subtrahend,
             });
         }
     }
@@ -588,17 +656,58 @@ fn coff_to_reloc_type(typ: u16) -> Option<RelocType> {
     })
 }
 
+/// Check if a Mach-O relocation is a SUBTRACTOR (first half of a difference pair).
+fn is_macho_subtractor(r_type: u8, arch: Arch) -> bool {
+    match arch {
+        Arch::X86_64 => r_type == macho::X86_64_RELOC_SUBTRACTOR,
+        Arch::Aarch64 => r_type == macho::ARM64_RELOC_SUBTRACTOR,
+    }
+}
+
 /// Map Mach-O arm64 relocation types to RelocType.
-fn macho_arm64_to_reloc_type(r_type: u8, r_length: u8) -> Option<RelocType> {
+///
+/// `ARM64_RELOC_PAGEOFF12` is used for both ADD and LDR/STR instructions.
+/// We inspect the instruction opcode to determine the correct ELF-style
+/// relocation type (ADD vs LDST with appropriate scale).
+fn macho_arm64_to_reloc_type(r_type: u8, r_length: u8, insn: u32) -> Option<RelocType> {
     Some(match r_type {
         macho::ARM64_RELOC_UNSIGNED if r_length == 3 => RelocType::Aarch64Abs64,
         macho::ARM64_RELOC_BRANCH26 => RelocType::Aarch64Call26,
         macho::ARM64_RELOC_PAGE21 => RelocType::Aarch64AdrPrelPgHi21,
-        macho::ARM64_RELOC_PAGEOFF12 => RelocType::Aarch64AddAbsLo12Nc,
+        macho::ARM64_RELOC_PAGEOFF12 => classify_pageoff12(insn),
         macho::ARM64_RELOC_GOT_LOAD_PAGE21 => RelocType::Aarch64AdrGotPage,
         macho::ARM64_RELOC_GOT_LOAD_PAGEOFF12 => RelocType::Aarch64Ld64GotLo12Nc,
+        macho::ARM64_RELOC_POINTER_TO_GOT if r_length == 2 => RelocType::Aarch64GotPcrel32,
+        macho::ARM64_RELOC_TLVP_LOAD_PAGE21 => RelocType::Aarch64TlvpLoadPage21,
+        macho::ARM64_RELOC_TLVP_LOAD_PAGEOFF12 => classify_pageoff12(insn),
         _ => return None,
     })
+}
+
+/// Classify a Mach-O `ARM64_RELOC_PAGEOFF12` by inspecting the instruction.
+/// ADD immediate: bits [28:24] = 10001
+/// LDR/STR unsigned immediate: bits [27:24] = 1110 or 1111, bits [29:28] = size
+fn classify_pageoff12(insn: u32) -> RelocType {
+    if (insn >> 24) & 0x1F == 0b10001 {
+        // ADD immediate
+        RelocType::Aarch64AddAbsLo12Nc
+    } else {
+        // LDR/STR: size field in bits [31:30] gives the scale
+        let size = insn >> 30;
+        let is_v = (insn >> 26) & 1; // SIMD/FP bit
+        if is_v == 1 && size == 0 {
+            // 128-bit SIMD load/store: opc[1]=1 with size=0 and V=1
+            RelocType::Aarch64Ldst128AbsLo12Nc
+        } else {
+            match size {
+                0 => RelocType::Aarch64Ldst8AbsLo12Nc,
+                1 => RelocType::Aarch64Ldst16AbsLo12Nc,
+                2 => RelocType::Aarch64Ldst32AbsLo12Nc,
+                3 => RelocType::Aarch64Ldst64AbsLo12Nc,
+                _ => unreachable!(),
+            }
+        }
+    }
 }
 
 /// Returns true if this Mach-O arm64 relocation type encodes its value inside
@@ -717,13 +826,14 @@ pub(crate) fn gc_sections(state: &mut LinkState, entry: &str) {
     // Build adjacency list: source_section → set of target sections
     let mut edges: Vec<HashSet<usize>> = vec![HashSet::new(); num_sections];
     for reloc in &state.relocs {
-        if let Some(target_sec) = sym_to_section(reloc.target.name()) {
-            edges[reloc.section.0].insert(target_sec.0);
-        }
-        // Also check locals
-        if let SymbolRef::Local(obj_idx, name) = &reloc.target {
-            if let Some(SymbolDef::Defined { section: target_sec, .. }) = state.locals.get(&(*obj_idx, name.clone())) {
+        for sym in std::iter::once(&reloc.target).chain(reloc.subtrahend.iter()) {
+            if let Some(target_sec) = sym_to_section(sym.name()) {
                 edges[reloc.section.0].insert(target_sec.0);
+            }
+            if let SymbolRef::Local(obj_idx, name) = sym {
+                if let Some(SymbolDef::Defined { section: target_sec, .. }) = state.locals.get(&(*obj_idx, name.clone())) {
+                    edges[reloc.section.0].insert(target_sec.0);
+                }
             }
         }
     }
@@ -877,6 +987,7 @@ pub(crate) fn synthesize_alloc_shims(state: &mut LinkState) {
             r_type: RelocType::X86Plt32,
             target: SymbolRef::Global(target_name.to_string()),
             addend: -4,
+            subtrahend: None,
         });
     }
 

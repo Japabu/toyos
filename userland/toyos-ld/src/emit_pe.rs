@@ -194,7 +194,7 @@ pub(crate) fn emit_pe_bytes(
         for (sym_ref, &got_vaddr) in &layout.got {
             let sym_addr = resolve_symbol(state, sym_ref, None)
                 .ok_or_else(|| LinkError::UndefinedSymbols(vec![sym_ref.name().to_string()]))?;
-            let off = (got_vaddr as u32 - layout.data_rva) as usize;
+            let off = (got_vaddr - layout.data_rva as u64) as usize;
             data_data[off..off + 8].copy_from_slice(&sym_addr.to_le_bytes());
         }
         w.write_section(data_range.file_offset, &data_data);

@@ -22,7 +22,11 @@ pub(crate) fn resolve_symbol(
             match state.globals.get(name)? {
                 SymbolDef::Dynamic => plt.and_then(|p| p.get(sym).copied()),
                 SymbolDef::Defined { section, value } => {
-                    Some(state.sections[*section].vaddr.unwrap() + value)
+                    let sec = &state.sections[*section];
+                    Some(sec.vaddr.unwrap_or_else(|| panic!(
+                        "symbol {name:?} in section {:?} ({:?}) has no vaddr",
+                        sec.name, sec.kind,
+                    )) + value)
                 }
             }
         }
@@ -32,12 +36,20 @@ pub(crate) fn resolve_symbol(
                 return match def {
                     SymbolDef::Dynamic => plt.and_then(|p| p.get(sym).copied()),
                     SymbolDef::Defined { section, value } => {
-                        Some(state.sections[*section].vaddr.unwrap() + value)
+                        let sec = &state.sections[*section];
+                        Some(sec.vaddr.unwrap_or_else(|| panic!(
+                            "symbol {name:?} in section {:?} ({:?}) has no vaddr",
+                            sec.name, sec.kind,
+                        )) + value)
                     }
                 };
             }
             if let Some(SymbolDef::Defined { section, value }) = state.locals.get(&(*obj_idx, name.clone())) {
-                return Some(state.sections[*section].vaddr.unwrap() + value);
+                let sec = &state.sections[*section];
+                return Some(sec.vaddr.unwrap_or_else(|| panic!(
+                    "symbol {name:?} in section {:?} ({:?}) has no vaddr",
+                    sec.name, sec.kind,
+                )) + value);
             }
             None
         }
@@ -253,7 +265,9 @@ pub(crate) fn apply_relocs(
             | RelocType::Aarch64Ldst128AbsLo12Nc
             | RelocType::Aarch64MovwUabsG0Nc | RelocType::Aarch64MovwUabsG1Nc
             | RelocType::Aarch64MovwUabsG2Nc | RelocType::Aarch64MovwUabsG3
-            | RelocType::Aarch64AdrGotPage | RelocType::Aarch64Ld64GotLo12Nc => {}
+            | RelocType::Aarch64AdrGotPage | RelocType::Aarch64Ld64GotLo12Nc
+            | RelocType::Aarch64GotPcrel32
+            | RelocType::Aarch64TlvpLoadPage21 => {}
         }
     }
 
@@ -267,7 +281,9 @@ pub(crate) fn apply_relocs(
         }
 
         let sec = &state.sections[reloc.section];
-        let reloc_vaddr = sec.vaddr.unwrap() + reloc.offset;
+        let reloc_vaddr = sec.vaddr.unwrap_or_else(|| panic!(
+            "reloc section {:?} ({:?}) has no vaddr", sec.name, sec.kind,
+        )) + reloc.offset;
 
         let sym_addr = match resolve_symbol(state, &reloc.target, params.plt) {
             Some(a) => a,
@@ -308,7 +324,9 @@ pub(crate) fn apply_relocs(
             | RelocType::Aarch64Ldst128AbsLo12Nc
             | RelocType::Aarch64MovwUabsG0Nc | RelocType::Aarch64MovwUabsG1Nc
             | RelocType::Aarch64MovwUabsG2Nc | RelocType::Aarch64MovwUabsG3
-            | RelocType::Aarch64AdrGotPage | RelocType::Aarch64Ld64GotLo12Nc => {
+            | RelocType::Aarch64AdrGotPage | RelocType::Aarch64Ld64GotLo12Nc
+            | RelocType::Aarch64GotPcrel32
+            | RelocType::Aarch64TlvpLoadPage21 => {
                 let is_abs = apply_one_reloc(state, reloc, sym_addr, reloc_vaddr, params.got)?;
                 if is_abs && params.record_relatives {
                     relatives.push((reloc_vaddr, sym_addr as i64 + reloc.addend));
@@ -485,6 +503,30 @@ fn apply_one_reloc_aarch64(
             patch_aarch64_ldr_imm12(state, reloc.section, reloc.offset, value, 3);
             Ok(false)
         }
+        // TLV (thread-local variable) page/offset — same addressing math as
+        // PAGE21/ADD12 but targeting a TLV descriptor in __thread_vars.
+        RelocType::Aarch64TlvpLoadPage21 => {
+            let sym_page = (sym_addr as i64 + reloc.addend) & !0xFFF;
+            let pc_page = reloc_vaddr as i64 & !0xFFF;
+            let page_delta = (sym_page - pc_page) >> 12;
+            if page_delta < -(1 << 20) || page_delta >= (1 << 20) {
+                return Err(LinkError::RelocationOverflow {
+                    reloc_type: reloc.r_type, symbol: reloc.target.name().to_string(), value: page_delta,
+                });
+            }
+            patch_aarch64_adrp(state, reloc.section, reloc.offset, page_delta as i32);
+            Ok(false)
+        }
+        // 32-bit PC-relative GOT pointer (used in .eh_frame for personality)
+        RelocType::Aarch64GotPcrel32 => {
+            let got_slot = *got.get(&reloc.target).ok_or_else(|| {
+                LinkError::UndefinedSymbols(vec![reloc.target.name().to_string()])
+            })?;
+            let value = got_slot as i64 + reloc.addend - reloc_vaddr as i64;
+            check_i32(value, reloc)?;
+            write_i32(state, reloc.section, reloc.offset, value as i32);
+            Ok(false)
+        }
         other => Err(LinkError::UnsupportedRelocation {
             reloc_type: other, symbol: reloc.target.name().to_string(),
         }),
@@ -549,14 +591,50 @@ pub(crate) fn apply_relocs_macho(
 
     for reloc in &relocs {
         let sec = &state.sections[reloc.section];
-        let reloc_vaddr = sec.vaddr.unwrap() + reloc.offset;
+        let reloc_vaddr = sec.vaddr.unwrap_or_else(|| panic!(
+            "reloc section {:?} ({:?}) has no vaddr", sec.name, sec.kind,
+        )) + reloc.offset;
 
         // GOT relocations don't need the symbol address — they use the GOT
         // slot address, which is looked up by name inside the reloc handler.
         let is_got_reloc = matches!(reloc.r_type,
             RelocType::Aarch64AdrGotPage | RelocType::Aarch64Ld64GotLo12Nc
+            | RelocType::Aarch64GotPcrel32
             | RelocType::X86Gotpcrel | RelocType::X86Gotpcrelx
             | RelocType::X86RexGotpcrelx);
+
+        // SUBTRACTOR pair: resolve both symbols and compute the difference.
+        // The result is position-independent (no rebase entry needed).
+        if let Some(ref sub_sym) = reloc.subtrahend {
+            let minuend = match resolve_symbol(state, &reloc.target, None) {
+                Some(a) => a,
+                None => {
+                    undefined.insert(reloc.target.name().to_string());
+                    continue;
+                }
+            };
+            let subtrahend = match resolve_symbol(state, sub_sym, None) {
+                Some(a) => a,
+                None => {
+                    undefined.insert(sub_sym.name().to_string());
+                    continue;
+                }
+            };
+            let value = minuend as i64 - subtrahend as i64 + reloc.addend;
+            match reloc.r_type {
+                RelocType::Aarch64Abs64 | RelocType::X86_64 =>
+                    write_u64(state, reloc.section, reloc.offset, value as u64),
+                RelocType::Aarch64Abs32 | RelocType::X86_32 =>
+                    write_u32(state, reloc.section, reloc.offset, value as u32),
+                RelocType::X86_32S =>
+                    write_i32(state, reloc.section, reloc.offset, value as i32),
+                other => return Err(LinkError::UnsupportedRelocation {
+                    reloc_type: other,
+                    symbol: reloc.target.name().to_string(),
+                }),
+            }
+            continue;
+        }
 
         let sym_addr = match resolve_symbol(state, &reloc.target, None) {
             Some(a) => a,
@@ -589,7 +667,9 @@ pub(crate) fn apply_relocs_macho(
             | RelocType::Aarch64Ldst128AbsLo12Nc
             | RelocType::Aarch64MovwUabsG0Nc | RelocType::Aarch64MovwUabsG1Nc
             | RelocType::Aarch64MovwUabsG2Nc | RelocType::Aarch64MovwUabsG3
-            | RelocType::Aarch64AdrGotPage | RelocType::Aarch64Ld64GotLo12Nc => {
+            | RelocType::Aarch64AdrGotPage | RelocType::Aarch64Ld64GotLo12Nc
+            | RelocType::Aarch64GotPcrel32
+            | RelocType::Aarch64TlvpLoadPage21 => {
                 apply_one_reloc_aarch64(state, reloc, sym_addr, reloc_vaddr, params.got)?
             }
             // x86-64 relocations
@@ -608,7 +688,7 @@ pub(crate) fn apply_relocs_macho(
             }),
         };
         if is_abs {
-            rebase_entries.push((reloc_vaddr, sym_addr as i64 + reloc.addend));
+            rebase_entries.push(reloc_vaddr);
         }
     }
 
@@ -622,7 +702,7 @@ pub(crate) fn apply_relocs_macho(
 }
 
 pub(crate) struct MachORelocOutput {
-    pub(crate) rebase_entries: Vec<(u64, i64)>,
+    pub(crate) rebase_entries: Vec<u64>,
     pub(crate) bind_entries: Vec<(String, u64)>,
 }
 
@@ -698,7 +778,9 @@ pub(crate) fn apply_relocs_pe(
         }
 
         let sec = &state.sections[reloc.section];
-        let reloc_vaddr = sec.vaddr.unwrap() + reloc.offset;
+        let reloc_vaddr = sec.vaddr.unwrap_or_else(|| panic!(
+            "reloc section {:?} ({:?}) has no vaddr", sec.name, sec.kind,
+        )) + reloc.offset;
 
         let sym_addr = match resolve_symbol(state, &reloc.target, None) {
             Some(a) => a,

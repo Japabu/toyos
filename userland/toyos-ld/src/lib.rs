@@ -98,7 +98,9 @@ impl Collected {
     /// Mark sections with absolute relocations as writable (needed for Mach-O rebasing).
     fn mark_abs_reloc_sections_writable(&mut self) {
         let abs_reloc_sections: std::collections::HashSet<SectionIdx> = self.state.relocs.iter()
-            .filter(|r| matches!(r.r_type, RelocType::Aarch64Abs64 | RelocType::X86_64))
+            .filter(|r| matches!(r.r_type,
+                RelocType::Aarch64Abs64 | RelocType::Aarch64Abs32
+                | RelocType::X86_64 | RelocType::X86_32))
             .map(|r| r.section)
             .collect();
         for &idx in &abs_reloc_sections {
@@ -200,7 +202,7 @@ impl LaidOut<MachOLayout> {
         let mut rebase_entries = reloc_output.rebase_entries;
         for (sym, ext) in &self.layout.got_entries {
             if !ext {
-                rebase_entries.push((self.layout.got[sym], 0));
+                rebase_entries.push(self.layout.got[sym]);
             }
         }
 
@@ -550,11 +552,13 @@ fn create_aarch64_stubs(
             section: stub_sec_idx, offset,
             r_type: RelocType::Aarch64AdrGotPage,
             target: SymbolRef::Global(sym_name.clone()), addend: 0,
+            subtrahend: None,
         });
         stub_relocs.push(collect::InputReloc {
             section: stub_sec_idx, offset: offset + 4,
             r_type: RelocType::Aarch64Ld64GotLo12Nc,
             target: SymbolRef::Global(sym_name.clone()), addend: 0,
+            subtrahend: None,
         });
 
         state.globals.insert(format!("{sym_name}.__stub"), SymbolDef::Defined {
@@ -596,6 +600,7 @@ fn create_x86_64_stubs(
             section: stub_sec_idx, offset: offset + 4,
             r_type: RelocType::X86Gotpcrel,
             target: SymbolRef::Global(sym_name.clone()), addend: -4,
+            subtrahend: None,
         });
 
         state.globals.insert(format!("{sym_name}.__stub"), SymbolDef::Defined {
@@ -648,9 +653,10 @@ pub(crate) fn classify_sections(state: &mut collect::LinkState) -> SectionBucket
             SectionKind::FiniArray => 1,
             SectionKind::Bss => 3,
             SectionKind::Data => 2,
-            // classify_sections routes Code/ReadOnly to rx, Tls/TlsBss to tls
+            // classify_sections routes Code/ReadOnly to rx, TLS to tls
             SectionKind::Code | SectionKind::ReadOnly
-            | SectionKind::Tls | SectionKind::TlsBss => unreachable!(),
+            | SectionKind::Tls | SectionKind::TlsBss
+            | SectionKind::TlsVariables => unreachable!(),
         }
     });
     buckets

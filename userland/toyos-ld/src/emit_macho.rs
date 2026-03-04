@@ -45,8 +45,11 @@ const BIND_OPCODE_DO_BIND: u8 = 0x90;
 const BIND_OPCODE_DONE: u8 = 0x00;
 
 const S_REGULAR: u32 = 0x0;
-const S_NON_LAZY_SYMBOL_POINTERS: u32 = 0x6;
 const S_ZEROFILL: u32 = 0x1;
+const S_NON_LAZY_SYMBOL_POINTERS: u32 = 0x6;
+const S_THREAD_LOCAL_REGULAR: u32 = 0x11;
+const S_THREAD_LOCAL_ZEROFILL: u32 = 0x12;
+const S_THREAD_LOCAL_VARIABLES: u32 = 0x13;
 const S_ATTR_PURE_INSTRUCTIONS: u32 = 0x8000_0000;
 const S_ATTR_SOME_INSTRUCTIONS: u32 = 0x0000_0400;
 
@@ -324,29 +327,34 @@ fn uleb_size(mut value: u64) -> usize {
 
 // ── Layout ──────────────────────────────────────────────────────────────
 
+/// A Mach-O output section within a segment.
+#[derive(Clone)]
+pub(crate) struct MachOSection {
+    pub(crate) sectname: [u8; 16],
+    pub(crate) segname: [u8; 16],
+    pub(crate) vmaddr: u64,
+    pub(crate) size: u64,
+    /// File offset (0 for zerofill/nobits sections).
+    pub(crate) offset: u32,
+    pub(crate) align: u32,
+    pub(crate) flags: u32,
+    /// Index into the indirect symbol table (for S_NON_LAZY_SYMBOL_POINTERS etc.).
+    pub(crate) reserved1: u32,
+}
+
 pub(crate) struct MachOLayout {
     pub(crate) text_vmaddr: u64,
     pub(crate) text_vmsize: u64,
     pub(crate) text_filesize: u64,
-    pub(crate) text_sec_offset: u64,
-    pub(crate) text_sec_vmaddr: u64,
-    pub(crate) text_sec_size: u64,
-    pub(crate) const_sec_offset: u64,
-    pub(crate) const_sec_vmaddr: u64,
-    pub(crate) const_sec_size: u64,
+    /// Sections in __TEXT, sorted by vmaddr.
+    pub(crate) text_sections: Vec<MachOSection>,
 
     pub(crate) data_vmaddr: u64,
     pub(crate) data_vmsize: u64,
     pub(crate) data_fileoff: u64,
     pub(crate) data_filesize: u64,
-    pub(crate) data_sec_offset: u64,
-    pub(crate) data_sec_vmaddr: u64,
-    pub(crate) data_sec_size: u64,
-    pub(crate) got_sec_offset: u64,
-    pub(crate) got_sec_vmaddr: u64,
-    pub(crate) got_sec_size: u64,
-    pub(crate) bss_sec_vmaddr: u64,
-    pub(crate) bss_sec_size: u64,
+    /// Sections in __DATA, sorted by vmaddr.
+    pub(crate) data_sections: Vec<MachOSection>,
 
     pub(crate) linkedit_vmaddr: u64,
     pub(crate) linkedit_fileoff: u64,
@@ -360,6 +368,27 @@ pub(crate) struct MachOLayout {
     pub(crate) page_size: u64,
 }
 
+impl MachOLayout {
+    /// Find the 1-based section number for a symbol at `vaddr`.
+    /// Searches both __TEXT and __DATA sections.
+    pub(crate) fn section_for_addr(&self, vaddr: u64) -> Option<u8> {
+        let mut sect_num = 1u8;
+        for sec in &self.text_sections {
+            if sec.size > 0 && vaddr >= sec.vmaddr && vaddr < sec.vmaddr + sec.size {
+                return Some(sect_num);
+            }
+            sect_num += 1;
+        }
+        for sec in &self.data_sections {
+            if sec.size > 0 && vaddr >= sec.vmaddr && vaddr < sec.vmaddr + sec.size {
+                return Some(sect_num);
+            }
+            sect_num += 1;
+        }
+        None
+    }
+}
+
 /// Compute the Mach-O layout: segment placement, GOT allocation.
 pub(crate) fn layout_macho(state: &mut LinkState) -> MachOLayout {
     let arch = state.arch;
@@ -370,6 +399,7 @@ pub(crate) fn layout_macho(state: &mut LinkState) -> MachOLayout {
         // Standard GOT relocation types
         if matches!(r.r_type,
             RelocType::Aarch64AdrGotPage | RelocType::Aarch64Ld64GotLo12Nc
+            | RelocType::Aarch64GotPcrel32
             | RelocType::X86Gotpcrel | RelocType::X86Gotpcrelx
             | RelocType::X86RexGotpcrelx)
         {
@@ -397,11 +427,17 @@ pub(crate) fn layout_macho(state: &mut LinkState) -> MachOLayout {
     let has_data = !buckets.rw.is_empty();
     let has_bss = buckets.rw.iter().any(|&i| state.sections[i].kind.is_nobits());
     let has_got = !got_symbols.is_empty();
+    let has_thread_vars = buckets.tls.iter().any(|&i| state.sections[i].kind == SectionKind::TlsVariables);
+    let has_thread_data = buckets.tls.iter().any(|&i| state.sections[i].kind == SectionKind::Tls);
+    let has_thread_bss = buckets.tls.iter().any(|&i| state.sections[i].kind == SectionKind::TlsBss);
 
     let text_nsects = 1 + if has_const { 1 } else { 0 };
     let data_nsects = (if has_data { 1 } else { 0 })
         + (if has_got { 1 } else { 0 })
-        + (if has_bss { 1 } else { 0 });
+        + (if has_bss { 1 } else { 0 })
+        + (if has_thread_vars { 1 } else { 0 })
+        + (if has_thread_data { 1 } else { 0 })
+        + (if has_thread_bss { 1 } else { 0 });
 
     let dylib_name = "/usr/lib/libSystem.B.dylib\0";
     let dylib_cmd_size = align_up((size_of::<DylibCmd>() + dylib_name.len()) as u64, 8) as u32;
@@ -495,6 +531,35 @@ pub(crate) fn layout_macho(state: &mut LinkState) -> MachOLayout {
     }
     let got_sec_size = data_cursor - got_sec_vmaddr;
 
+    // __thread_vars: TLV descriptors (file-backed)
+    let thread_vars_sec_vmaddr = align_up(data_cursor, 8);
+    let thread_vars_sec_offset = data_fileoff + (thread_vars_sec_vmaddr - data_vmaddr);
+    let mut tv_cursor = thread_vars_sec_vmaddr;
+    for &idx in &buckets.tls {
+        let sec = &mut state.sections[idx];
+        if sec.kind != SectionKind::TlsVariables { continue; }
+        tv_cursor = align_up(tv_cursor, sec.align);
+        sec.vaddr = Some(tv_cursor);
+        tv_cursor += sec.size;
+    }
+    let thread_vars_sec_size = tv_cursor - thread_vars_sec_vmaddr;
+    data_cursor = tv_cursor;
+
+    // __thread_data: initialized TLS data (file-backed)
+    let thread_data_sec_vmaddr = align_up(data_cursor, 8);
+    let thread_data_sec_offset = data_fileoff + (thread_data_sec_vmaddr - data_vmaddr);
+    let mut td_cursor = thread_data_sec_vmaddr;
+    for &idx in &buckets.tls {
+        let sec = &mut state.sections[idx];
+        if sec.kind != SectionKind::Tls { continue; }
+        td_cursor = align_up(td_cursor, sec.align);
+        sec.vaddr = Some(td_cursor);
+        td_cursor += sec.size;
+    }
+    let thread_data_sec_size = td_cursor - thread_data_sec_vmaddr;
+    data_cursor = td_cursor;
+
+    // BSS (regular)
     let bss_sec_vmaddr = align_up(data_cursor, 8);
     let bss_start = bss_sec_vmaddr;
     let mut bss_cursor = bss_sec_vmaddr;
@@ -507,29 +572,102 @@ pub(crate) fn layout_macho(state: &mut LinkState) -> MachOLayout {
     }
     let bss_sec_size = bss_cursor - bss_start;
 
-    let data_filesz = if got_sec_size > 0 {
-        got_sec_vmaddr + got_sec_size - data_vmaddr
-    } else {
-        data_sec_size
-    };
-    let data_filesize = data_filesz;
-    let data_memsz = bss_cursor - data_vmaddr;
+    // __thread_bss: zero-init TLS (nobits)
+    let thread_bss_sec_vmaddr = align_up(bss_cursor, 8);
+    let mut tb_cursor = thread_bss_sec_vmaddr;
+    for &idx in &buckets.tls {
+        let sec = &mut state.sections[idx];
+        if sec.kind != SectionKind::TlsBss { continue; }
+        tb_cursor = align_up(tb_cursor, sec.align);
+        sec.vaddr = Some(tb_cursor);
+        tb_cursor += sec.size;
+    }
+    let thread_bss_sec_size = tb_cursor - thread_bss_sec_vmaddr;
+
+    // Build sorted section lists for __TEXT and __DATA segments
+    let mut text_sections = vec![MachOSection {
+        sectname: pad16(b"__text"), segname: pad16(b"__TEXT"),
+        vmaddr: text_sec_vmaddr, size: text_sec_size,
+        offset: text_sec_offset as u32,
+        align: match arch { Arch::X86_64 => 4, Arch::Aarch64 => 2 },
+        flags: S_REGULAR | S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS, reserved1: 0,
+    }];
+    if actual_has_const && const_sec_size > 0 {
+        text_sections.push(MachOSection {
+            sectname: pad16(b"__const"), segname: pad16(b"__TEXT"),
+            vmaddr: const_sec_vmaddr, size: const_sec_size,
+            offset: const_sec_offset as u32, align: 0, flags: S_REGULAR, reserved1: 0,
+        });
+    }
+    text_sections.sort_by_key(|s| s.vmaddr);
+
+    let mut data_sections = Vec::new();
+    let data_seg = pad16(b"__DATA");
+    if data_sec_size > 0 {
+        data_sections.push(MachOSection {
+            sectname: pad16(b"__data"), segname: data_seg,
+            vmaddr: data_sec_vmaddr, size: data_sec_size,
+            offset: data_sec_offset as u32, align: 3, flags: S_REGULAR, reserved1: 0,
+        });
+    }
+    if got_sec_size > 0 {
+        data_sections.push(MachOSection {
+            sectname: pad16(b"__got"), segname: data_seg,
+            vmaddr: got_sec_vmaddr, size: got_sec_size,
+            offset: got_sec_offset as u32, align: 3, flags: S_NON_LAZY_SYMBOL_POINTERS, reserved1: 0,
+        });
+    }
+    if thread_vars_sec_size > 0 {
+        data_sections.push(MachOSection {
+            sectname: pad16(b"__thread_vars"), segname: data_seg,
+            vmaddr: thread_vars_sec_vmaddr, size: thread_vars_sec_size,
+            offset: thread_vars_sec_offset as u32, align: 3, flags: S_THREAD_LOCAL_VARIABLES, reserved1: 0,
+        });
+    }
+    if thread_data_sec_size > 0 {
+        data_sections.push(MachOSection {
+            sectname: pad16(b"__thread_data"), segname: data_seg,
+            vmaddr: thread_data_sec_vmaddr, size: thread_data_sec_size,
+            offset: thread_data_sec_offset as u32, align: 3, flags: S_THREAD_LOCAL_REGULAR, reserved1: 0,
+        });
+    }
+    if bss_sec_size > 0 {
+        data_sections.push(MachOSection {
+            sectname: pad16(b"__bss"), segname: data_seg,
+            vmaddr: bss_sec_vmaddr, size: bss_sec_size,
+            offset: 0, align: 3, flags: S_ZEROFILL, reserved1: 0,
+        });
+    }
+    if thread_bss_sec_size > 0 {
+        data_sections.push(MachOSection {
+            sectname: pad16(b"__thread_bss"), segname: data_seg,
+            vmaddr: thread_bss_sec_vmaddr, size: thread_bss_sec_size,
+            offset: 0, align: 3, flags: S_THREAD_LOCAL_ZEROFILL, reserved1: 0,
+        });
+    }
+    data_sections.sort_by_key(|s| s.vmaddr);
+
+    // File-backed size: everything up to the end of the last non-nobits section
+    let data_filesize = data_sections.iter()
+        .filter(|s| s.offset > 0)
+        .map(|s| (s.vmaddr + s.size) - data_vmaddr)
+        .max()
+        .unwrap_or(0);
+    let data_memsz = data_sections.iter()
+        .map(|s| (s.vmaddr + s.size) - data_vmaddr)
+        .max()
+        .unwrap_or(0);
     let data_vmsize = align_up(data_memsz, page_size);
 
     let linkedit_vmaddr = data_vmaddr + data_vmsize;
     let linkedit_fileoff = data_fileoff + align_up(data_filesize, page_size);
 
-    let actual_data_nsects = (if data_sec_size > 0 { 1 } else { 0 })
-        + (if got_sec_size > 0 { 1 } else { 0 })
-        + (if bss_sec_size > 0 { 1 } else { 0 });
-
-    let actual_text_nsects = 1 + if actual_has_const && const_sec_size > 0 { 1 } else { 0 };
     let mut ncmds = 0u32;
     let mut sizeofcmds = 0u32;
     ncmds += 1; sizeofcmds += SEGMENT_CMD_SIZE; // __PAGEZERO
-    ncmds += 1; sizeofcmds += SEGMENT_CMD_SIZE + SECTION_HEADER_SIZE * actual_text_nsects as u32;
-    if actual_data_nsects > 0 {
-        ncmds += 1; sizeofcmds += SEGMENT_CMD_SIZE + SECTION_HEADER_SIZE * actual_data_nsects as u32;
+    ncmds += 1; sizeofcmds += SEGMENT_CMD_SIZE + SECTION_HEADER_SIZE * text_sections.len() as u32;
+    if !data_sections.is_empty() {
+        ncmds += 1; sizeofcmds += SEGMENT_CMD_SIZE + SECTION_HEADER_SIZE * data_sections.len() as u32;
     }
     ncmds += 1; sizeofcmds += SEGMENT_CMD_SIZE; // __LINKEDIT
     ncmds += 1; sizeofcmds += dylinker_cmd_size;
@@ -552,24 +690,12 @@ pub(crate) fn layout_macho(state: &mut LinkState) -> MachOLayout {
         text_vmaddr,
         text_vmsize,
         text_filesize,
-        text_sec_offset,
-        text_sec_vmaddr,
-        text_sec_size,
-        const_sec_offset,
-        const_sec_vmaddr,
-        const_sec_size,
+        text_sections,
         data_vmaddr,
         data_vmsize,
         data_fileoff,
         data_filesize,
-        data_sec_offset,
-        data_sec_vmaddr,
-        data_sec_size,
-        got_sec_offset,
-        got_sec_vmaddr,
-        got_sec_size,
-        bss_sec_vmaddr,
-        bss_sec_size,
+        data_sections,
         linkedit_vmaddr,
         linkedit_fileoff,
         got,
@@ -587,7 +713,7 @@ pub(crate) fn emit_macho_bytes(
     state: &LinkState,
     layout: &MachOLayout,
     entry_name: &str,
-    rebase_entries: &[(u64, i64)],
+    rebase_entries: &[u64],
     bind_entries: &[(String, u64)],
 ) -> Result<Vec<u8>, LinkError> {
     let entry_addr = state
@@ -595,7 +721,11 @@ pub(crate) fn emit_macho_bytes(
         .get(entry_name)
         .map(|def| match def {
             SymbolDef::Defined { section, value } => {
-                state.sections[*section].vaddr.unwrap() + value
+                let sec = &state.sections[*section];
+                sec.vaddr.unwrap_or_else(|| panic!(
+                    "entry point in section {:?} ({:?}) has no vaddr",
+                    sec.name, sec.kind,
+                )) + value
             }
             SymbolDef::Dynamic => panic!("entry point cannot be a dynamic symbol"),
         })
@@ -608,8 +738,23 @@ pub(crate) fn emit_macho_bytes(
     let bind_data = build_bind_opcodes(layout, bind_entries);
     let export_data = build_export_trie(entry_name, entryoff);
 
-    let (symtab_data, strtab_data, nlocalsym, nextdefsym, nundefsym) =
+    let (symtab_data, strtab_data, nlocalsym, nextdefsym, nundefsym, undef_syms) =
         build_symbol_table(state, layout, bind_entries);
+
+    // Build indirect symbol table: one u32 entry per GOT slot
+    const INDIRECT_SYMBOL_LOCAL: u32 = 0x8000_0000;
+    let undef_base = nlocalsym + nextdefsym;
+    let mut indirect_symtab = Vec::new();
+    for (sym_ref, is_external) in &layout.got_entries {
+        if *is_external {
+            let name = sym_ref.name();
+            let idx = undef_syms.iter().position(|s| s == name)
+                .unwrap_or_else(|| panic!("GOT symbol {name:?} not in undef_syms"));
+            indirect_symtab.extend_from_slice(&(undef_base + idx as u32).to_le_bytes());
+        } else {
+            indirect_symtab.extend_from_slice(&INDIRECT_SYMBOL_LOCAL.to_le_bytes());
+        }
+    }
 
     // __LINKEDIT layout
     let mut linkedit_cursor = layout.linkedit_fileoff;
@@ -634,6 +779,10 @@ pub(crate) fn emit_macho_bytes(
     let strtab_off = linkedit_cursor;
     let strtab_size = strtab_data.len() as u32;
     linkedit_cursor += align_up(strtab_size as u64, 8);
+
+    let indirect_symtab_off = linkedit_cursor;
+    let nindirectsyms = (indirect_symtab.len() / 4) as u32;
+    linkedit_cursor += align_up(indirect_symtab.len() as u64, 8);
 
     // Code signature: must be 16-byte aligned
     linkedit_cursor = align_up(linkedit_cursor, 16);
@@ -686,10 +835,9 @@ pub(crate) fn emit_macho_bytes(
     });
 
     // LC_SEGMENT_64 __TEXT
-    let text_nsects = 1 + if layout.const_sec_size > 0 { 1u32 } else { 0 };
     off = write_struct(&mut buf, off, &SegmentCommand64 {
         cmd: U32Le::new(LC_SEGMENT_64),
-        cmdsize: U32Le::new(SEGMENT_CMD_SIZE + SECTION_HEADER_SIZE * text_nsects),
+        cmdsize: U32Le::new(SEGMENT_CMD_SIZE + SECTION_HEADER_SIZE * layout.text_sections.len() as u32),
         segname: pad16(b"__TEXT"),
         vmaddr: U64Le::new(layout.text_vmaddr),
         vmsize: U64Le::new(layout.text_vmsize),
@@ -697,52 +845,25 @@ pub(crate) fn emit_macho_bytes(
         filesize: U64Le::new(layout.text_filesize),
         maxprot: U32Le::new(VM_PROT_READ_EXECUTE),
         initprot: U32Le::new(VM_PROT_READ_EXECUTE),
-        nsects: U32Le::new(text_nsects),
+        nsects: U32Le::new(layout.text_sections.len() as u32),
         flags: U32Le::new(0),
     });
-
-    // __text section header
-    off = write_struct(&mut buf, off, &Section64 {
-        sectname: pad16(b"__text"),
-        segname: pad16(b"__TEXT"),
-        addr: U64Le::new(layout.text_sec_vmaddr),
-        size: U64Le::new(layout.text_sec_size),
-        offset: U32Le::new(layout.text_sec_offset as u32),
-        align: U32Le::new(match layout.arch { Arch::X86_64 => 4, Arch::Aarch64 => 2 }), // 2^4=16 or 2^2=4
-        reloff: U32Le::new(0),
-        nreloc: U32Le::new(0),
-        flags: U32Le::new(S_REGULAR | S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS),
-        reserved1: U32Le::new(0),
-        reserved2: U32Le::new(0),
-        reserved3: U32Le::new(0),
-    });
-
-    // __const section header (if present)
-    if layout.const_sec_size > 0 {
+    for sec in &layout.text_sections {
         off = write_struct(&mut buf, off, &Section64 {
-            sectname: pad16(b"__const"),
-            segname: pad16(b"__TEXT"),
-            addr: U64Le::new(layout.const_sec_vmaddr),
-            size: U64Le::new(layout.const_sec_size),
-            offset: U32Le::new(layout.const_sec_offset as u32),
-            align: U32Le::new(0),
-            reloff: U32Le::new(0),
-            nreloc: U32Le::new(0),
-            flags: U32Le::new(S_REGULAR),
-            reserved1: U32Le::new(0),
-            reserved2: U32Le::new(0),
-            reserved3: U32Le::new(0),
+            sectname: sec.sectname, segname: sec.segname,
+            addr: U64Le::new(sec.vmaddr), size: U64Le::new(sec.size),
+            offset: U32Le::new(sec.offset), align: U32Le::new(sec.align),
+            reloff: U32Le::new(0), nreloc: U32Le::new(0),
+            flags: U32Le::new(sec.flags),
+            reserved1: U32Le::new(sec.reserved1), reserved2: U32Le::new(0), reserved3: U32Le::new(0),
         });
     }
 
     // LC_SEGMENT_64 __DATA
-    let data_nsects = (if layout.data_sec_size > 0 { 1u32 } else { 0 })
-        + (if layout.got_sec_size > 0 { 1 } else { 0 })
-        + (if layout.bss_sec_size > 0 { 1 } else { 0 });
-    if data_nsects > 0 {
+    if !layout.data_sections.is_empty() {
         off = write_struct(&mut buf, off, &SegmentCommand64 {
             cmd: U32Le::new(LC_SEGMENT_64),
-            cmdsize: U32Le::new(SEGMENT_CMD_SIZE + SECTION_HEADER_SIZE * data_nsects),
+            cmdsize: U32Le::new(SEGMENT_CMD_SIZE + SECTION_HEADER_SIZE * layout.data_sections.len() as u32),
             segname: pad16(b"__DATA"),
             vmaddr: U64Le::new(layout.data_vmaddr),
             vmsize: U64Le::new(layout.data_vmsize),
@@ -750,56 +871,17 @@ pub(crate) fn emit_macho_bytes(
             filesize: U64Le::new(layout.data_filesize),
             maxprot: U32Le::new(VM_PROT_READ_WRITE),
             initprot: U32Le::new(VM_PROT_READ_WRITE),
-            nsects: U32Le::new(data_nsects),
+            nsects: U32Le::new(layout.data_sections.len() as u32),
             flags: U32Le::new(0),
         });
-
-        if layout.data_sec_size > 0 {
+        for sec in &layout.data_sections {
             off = write_struct(&mut buf, off, &Section64 {
-                sectname: pad16(b"__data"),
-                segname: pad16(b"__DATA"),
-                addr: U64Le::new(layout.data_sec_vmaddr),
-                size: U64Le::new(layout.data_sec_size),
-                offset: U32Le::new(layout.data_sec_offset as u32),
-                align: U32Le::new(3), // 2^3 = 8
-                reloff: U32Le::new(0),
-                nreloc: U32Le::new(0),
-                flags: U32Le::new(S_REGULAR),
-                reserved1: U32Le::new(0),
-                reserved2: U32Le::new(0),
-                reserved3: U32Le::new(0),
-            });
-        }
-        if layout.got_sec_size > 0 {
-            off = write_struct(&mut buf, off, &Section64 {
-                sectname: pad16(b"__got"),
-                segname: pad16(b"__DATA"),
-                addr: U64Le::new(layout.got_sec_vmaddr),
-                size: U64Le::new(layout.got_sec_size),
-                offset: U32Le::new(layout.got_sec_offset as u32),
-                align: U32Le::new(3),
-                reloff: U32Le::new(0),
-                nreloc: U32Le::new(0),
-                flags: U32Le::new(S_NON_LAZY_SYMBOL_POINTERS),
-                reserved1: U32Le::new(0),
-                reserved2: U32Le::new(0),
-                reserved3: U32Le::new(0),
-            });
-        }
-        if layout.bss_sec_size > 0 {
-            off = write_struct(&mut buf, off, &Section64 {
-                sectname: pad16(b"__bss"),
-                segname: pad16(b"__DATA"),
-                addr: U64Le::new(layout.bss_sec_vmaddr),
-                size: U64Le::new(layout.bss_sec_size),
-                offset: U32Le::new(0),
-                align: U32Le::new(3),
-                reloff: U32Le::new(0),
-                nreloc: U32Le::new(0),
-                flags: U32Le::new(S_ZEROFILL),
-                reserved1: U32Le::new(0),
-                reserved2: U32Le::new(0),
-                reserved3: U32Le::new(0),
+                sectname: sec.sectname, segname: sec.segname,
+                addr: U64Le::new(sec.vmaddr), size: U64Le::new(sec.size),
+                offset: U32Le::new(sec.offset), align: U32Le::new(sec.align),
+                reloff: U32Le::new(0), nreloc: U32Le::new(0),
+                flags: U32Le::new(sec.flags),
+                reserved1: U32Le::new(sec.reserved1), reserved2: U32Le::new(0), reserved3: U32Le::new(0),
             });
         }
     }
@@ -891,6 +973,8 @@ pub(crate) fn emit_macho_bytes(
     dysymtab.nextdefsym = U32Le::new(nextdefsym);
     dysymtab.iundefsym = U32Le::new(nlocalsym + nextdefsym);
     dysymtab.nundefsym = U32Le::new(nundefsym);
+    dysymtab.indirectsymoff = U32Le::new(indirect_symtab_off as u32);
+    dysymtab.nindirectsyms = U32Le::new(nindirectsyms);
     off = write_struct(&mut buf, off, &dysymtab);
 
     // LC_BUILD_VERSION (platform = macOS, minos = 14.0)
@@ -920,43 +1004,18 @@ pub(crate) fn emit_macho_bytes(
     let _ = off;
 
     // ── Write section data ──
-
-    // __TEXT,__text: code sections
+    // Every input section with a vaddr gets written at its file offset.
+    // __TEXT sections: file_offset = vaddr - text_vmaddr
+    // __DATA sections: file_offset = data_fileoff + (vaddr - data_vmaddr)
     for sec in &state.sections {
-        let Some(vaddr) = sec.vaddr else { continue; };
-        if sec.data.is_empty() { continue; }
-        if vaddr >= layout.text_sec_vmaddr
-            && vaddr < layout.text_sec_vmaddr + layout.text_sec_size
-        {
-            let off = (vaddr - layout.text_vmaddr) as usize;
-            buf[off..off + sec.data.len()].copy_from_slice(&sec.data);
-        }
-    }
-
-    // __TEXT,__const: read-only data sections
-    if layout.const_sec_size > 0 {
-        for sec in &state.sections {
-            let Some(vaddr) = sec.vaddr else { continue; };
-            if sec.data.is_empty() { continue; }
-            if vaddr >= layout.const_sec_vmaddr
-                && vaddr < layout.const_sec_vmaddr + layout.const_sec_size
-            {
-                let off = (vaddr - layout.text_vmaddr) as usize;
-                buf[off..off + sec.data.len()].copy_from_slice(&sec.data);
-            }
-        }
-    }
-
-    // __DATA,__data: writable data sections
-    for sec in &state.sections {
-        let Some(vaddr) = sec.vaddr else { continue; };
-        if sec.data.is_empty() || sec.kind.is_nobits() { continue; }
-        if vaddr >= layout.data_sec_vmaddr
-            && vaddr < layout.data_sec_vmaddr + layout.data_sec_size
-        {
-            let off = (layout.data_fileoff + (vaddr - layout.data_vmaddr)) as usize;
-            buf[off..off + sec.data.len()].copy_from_slice(&sec.data);
-        }
+        let Some(vaddr) = sec.vaddr else { continue };
+        if sec.data.is_empty() || sec.kind.is_nobits() { continue }
+        let file_off = if vaddr >= layout.data_vmaddr {
+            (layout.data_fileoff + (vaddr - layout.data_vmaddr)) as usize
+        } else {
+            (vaddr - layout.text_vmaddr) as usize
+        };
+        buf[file_off..file_off + sec.data.len()].copy_from_slice(&sec.data);
     }
 
     // __DATA,__got: fill internal GOT entries
@@ -976,6 +1035,7 @@ pub(crate) fn emit_macho_bytes(
     write_at(&mut buf, export_off as usize, &export_data);
     write_at(&mut buf, symtab_off as usize, &symtab_data);
     write_at(&mut buf, strtab_off as usize, &strtab_data);
+    write_at(&mut buf, indirect_symtab_off as usize, &indirect_symtab);
 
     // Build and write ad-hoc code signature
     let codesig = build_code_signature(&buf, code_limit, n_code_slots, layout);
@@ -992,7 +1052,7 @@ fn macho_mangle(name: &str) -> String {
     format!("_{name}")
 }
 
-fn build_rebase_opcodes(layout: &MachOLayout, entries: &[(u64, i64)]) -> Vec<u8> {
+fn build_rebase_opcodes(layout: &MachOLayout, entries: &[u64]) -> Vec<u8> {
     let mut ops = Vec::new();
     if entries.is_empty() {
         ops.push(REBASE_OPCODE_DONE);
@@ -1003,37 +1063,20 @@ fn build_rebase_opcodes(layout: &MachOLayout, entries: &[(u64, i64)]) -> Vec<u8>
 
     // Group rebase entries by segment
     let mut data_entries: Vec<u64> = entries.iter()
-        .filter(|(vaddr, _)| *vaddr >= layout.data_vmaddr && *vaddr < layout.data_vmaddr + layout.data_vmsize)
-        .map(|(vaddr, _)| *vaddr)
+        .filter(|&&vaddr| vaddr >= layout.data_vmaddr && vaddr < layout.data_vmaddr + layout.data_vmsize)
+        .copied()
         .collect();
     data_entries.sort();
 
-    if !data_entries.is_empty() {
-        // __DATA segment ordinal: __PAGEZERO=0, __TEXT=1, __DATA=2
-        let seg_ordinal = 2u8;
-        for &vaddr in &data_entries {
-            let offset = vaddr - layout.data_vmaddr;
-            ops.push(REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB | seg_ordinal);
-            encode_uleb128(&mut ops, offset);
-            ops.push(REBASE_OPCODE_DO_REBASE_IMM_TIMES | 1);
-        }
-    }
-
-    // Also rebase entries in __TEXT (if any absolute data pointers in const)
-    let mut text_entries: Vec<u64> = entries.iter()
-        .filter(|(vaddr, _)| *vaddr >= layout.text_vmaddr && *vaddr < layout.text_vmaddr + layout.text_vmsize)
-        .map(|(vaddr, _)| *vaddr)
-        .collect();
-    text_entries.sort();
-
-    if !text_entries.is_empty() {
-        let seg_ordinal = 1u8; // __TEXT
-        for &vaddr in &text_entries {
-            let offset = vaddr - layout.text_vmaddr;
-            ops.push(REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB | seg_ordinal);
-            encode_uleb128(&mut ops, offset);
-            ops.push(REBASE_OPCODE_DO_REBASE_IMM_TIMES | 1);
-        }
+    // __DATA segment ordinal: __PAGEZERO=0, __TEXT=1, __DATA=2.
+    // All absolute reloc sections are moved to __DATA by mark_abs_reloc_sections_writable,
+    // so rebase entries are always in __DATA.
+    let seg_ordinal = 2u8;
+    for &vaddr in &data_entries {
+        let offset = vaddr - layout.data_vmaddr;
+        ops.push(REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB | seg_ordinal);
+        encode_uleb128(&mut ops, offset);
+        ops.push(REBASE_OPCODE_DO_REBASE_IMM_TIMES | 1);
     }
 
     ops.push(REBASE_OPCODE_DONE);
@@ -1089,16 +1132,21 @@ fn build_export_trie(entry_name: &str, entry_offset: u64) -> Vec<u8> {
     trie.extend_from_slice(macho_entry.as_bytes());
     trie.push(0); // null terminator
 
-    // Child node offset (will be right after this ULEB)
-    let child_offset = trie.len() + 1; // +1 for the ULEB we're about to write
-    // We need to know the size, so let's compute it
+    // Child node info (needed to know terminal_size)
     let mut info = Vec::new();
     info.push(0); // flags: EXPORT_SYMBOL_FLAGS_KIND_REGULAR
     encode_uleb128(&mut info, entry_offset);
     let terminal_size = info.len();
 
-    // ULEB128 for child node offset
-    let child_node_offset = trie.len() + uleb_size(child_offset as u64);
+    // Child node offset: iteratively solve offset = pos + uleb_size(offset)
+    // since the ULEB encoding of the offset may itself change the offset.
+    let pos = trie.len();
+    let mut child_node_offset = pos + 1;
+    loop {
+        let new = pos + uleb_size(child_node_offset as u64);
+        if new == child_node_offset { break; }
+        child_node_offset = new;
+    }
     encode_uleb128(&mut trie, child_node_offset as u64);
 
     // Child node (terminal)
@@ -1121,18 +1169,9 @@ fn build_symbol_table(
     state: &LinkState,
     layout: &MachOLayout,
     bind_entries: &[(String, u64)],
-) -> (Vec<u8>, Vec<u8>, u32, u32, u32) {
+) -> (Vec<u8>, Vec<u8>, u32, u32, u32, Vec<String>) {
     let mut symtab = Vec::new();
     let mut strtab = vec![0u8]; // index 0 = empty string
-
-    // Section numbering (1-based): __text=1, __const=2 (if exists), __data=3, __got=4, __bss=5
-    let mut sect_num = 1u8;
-    let text_sect = sect_num; sect_num += 1;
-    let const_sect = if layout.const_sec_size > 0 { let s = sect_num; sect_num += 1; s } else { 0 };
-    let data_sect = if layout.data_sec_size > 0 { let s = sect_num; sect_num += 1; s } else { 0 };
-    if layout.got_sec_size > 0 { sect_num += 1; }
-    let bss_sect = if layout.bss_sec_size > 0 { let s = sect_num; sect_num += 1; s } else { 0 };
-    let _ = sect_num;
 
     fn add_string(strtab: &mut Vec<u8>, s: &str) -> u32 {
         let offset = strtab.len() as u32;
@@ -1148,25 +1187,13 @@ fn build_symbol_table(
     for (name, def) in &state.globals {
         let SymbolDef::Defined { section, value } = def else { continue; };
         let sec = &state.sections[*section];
-        let value = sec.vaddr.unwrap() + value;
-        let sect = if value >= layout.text_sec_vmaddr && value < layout.text_sec_vmaddr + layout.text_sec_size {
-            text_sect
-        } else if layout.const_sec_size > 0 && value >= layout.const_sec_vmaddr && value < layout.const_sec_vmaddr + layout.const_sec_size {
-            const_sect
-        } else if layout.data_sec_size > 0 && value >= layout.data_sec_vmaddr && value < layout.data_sec_vmaddr + layout.data_sec_size {
-            data_sect
-        } else if layout.bss_sec_size > 0 && value >= layout.bss_sec_vmaddr && value < layout.bss_sec_vmaddr + layout.bss_sec_size {
-            bss_sect
-        } else {
-            panic!(
-                "symbol {name:?} at {value:#x} does not fall in any known Mach-O section \
-                 (text={:#x}..{:#x}, const={:#x}..{:#x}, data={:#x}..{:#x}, bss={:#x}..{:#x})",
-                layout.text_sec_vmaddr, layout.text_sec_vmaddr + layout.text_sec_size,
-                layout.const_sec_vmaddr, layout.const_sec_vmaddr + layout.const_sec_size,
-                layout.data_sec_vmaddr, layout.data_sec_vmaddr + layout.data_sec_size,
-                layout.bss_sec_vmaddr, layout.bss_sec_vmaddr + layout.bss_sec_size,
-            )
-        };
+        let value = sec.vaddr.unwrap_or_else(|| panic!(
+            "symbol {name:?} in section {:?} ({:?}) has no vaddr",
+            sec.name, sec.kind,
+        )) + value;
+        let sect = layout.section_for_addr(value).unwrap_or_else(|| panic!(
+            "symbol {name:?} at {value:#x} does not fall in any Mach-O section",
+        ));
         extdef_syms.push((name.clone(), value, sect));
     }
     extdef_syms.sort_by(|a, b| a.0.cmp(&b.0));
@@ -1203,7 +1230,7 @@ fn build_symbol_table(
         symtab.extend_from_slice(nlist.as_bytes());
     }
 
-    (symtab, strtab, nlocalsym, nextdefsym, nundefsym)
+    (symtab, strtab, nlocalsym, nextdefsym, nundefsym, undef_syms)
 }
 
 // ── Ad-hoc code signature ────────────────────────────────────────────

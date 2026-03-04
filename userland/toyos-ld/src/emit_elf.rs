@@ -362,6 +362,20 @@ pub(crate) fn layout_elf(state: &mut LinkState, base_addr: u64, entry_name: Opti
         cursor += 8;
     }
 
+    // TLS file-backed sections (.tdata) placed within RW segment for correct
+    // PT_TLS p_offset. PT_TLS overlaps with PT_LOAD(RW) in the file.
+    let tls_start = if buckets.tls.is_empty() { cursor } else { align_up(cursor, 64) };
+    let mut tls_cursor = tls_start;
+    for &idx in &buckets.tls {
+        if state.sections[idx].kind == SectionKind::TlsBss { continue; }
+        let sec = &mut state.sections[idx];
+        tls_cursor = align_up(tls_cursor, sec.align);
+        sec.vaddr = Some(tls_cursor);
+        tls_cursor += sec.size;
+    }
+    cursor = tls_cursor;
+    let tls_filesz = if tls_cursor > tls_start { tls_cursor - tls_start } else { 0 };
+
     let rw_filesz = cursor - rw_start;
 
     // Place NOBITS RW sections (.bss) after all file-backed data
@@ -372,6 +386,17 @@ pub(crate) fn layout_elf(state: &mut LinkState, base_addr: u64, entry_name: Opti
         sec.vaddr = Some(cursor);
         cursor += sec.size;
     }
+
+    // TLS BSS (.tbss) after regular BSS
+    for &idx in &buckets.tls {
+        if state.sections[idx].kind != SectionKind::TlsBss { continue; }
+        let sec = &mut state.sections[idx];
+        tls_cursor = align_up(tls_cursor, sec.align);
+        sec.vaddr = Some(tls_cursor);
+        tls_cursor += sec.size;
+        cursor = cursor.max(tls_cursor);
+    }
+    let tls_memsz = if tls_cursor > tls_start { tls_cursor - tls_start } else { 0 };
 
     let rw_end = align_up(cursor, PAGE_SIZE);
 
@@ -386,22 +411,6 @@ pub(crate) fn layout_elf(state: &mut LinkState, base_addr: u64, entry_name: Opti
         plt_data.extend_from_slice(&[0xFF, 0x25]);
         plt_data.extend_from_slice(&offset.to_le_bytes());
     }
-
-    // TLS layout
-    let tls_start = align_up(rw_end, 64);
-    let mut tls_cursor = tls_start;
-    for &idx in &buckets.tls {
-        let sec = &mut state.sections[idx];
-        tls_cursor = align_up(tls_cursor, sec.align);
-        sec.vaddr = Some(tls_cursor);
-        tls_cursor += sec.size;
-    }
-    let tls_filesz = buckets.tls
-        .iter()
-        .filter(|&&idx| state.sections[idx].kind != SectionKind::TlsBss)
-        .map(|&idx| state.sections[idx].size)
-        .sum::<u64>();
-    let tls_memsz = if buckets.tls.is_empty() { 0 } else { tls_cursor - tls_start };
 
     ElfLayout {
         base_addr, rx_start, rx_end, rw_start, rw_filesz, rw_end,
