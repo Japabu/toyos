@@ -1135,7 +1135,7 @@ fn build_symbol_table(
     let const_sect = if layout.const_sec_size > 0 { let s = sect_num; sect_num += 1; s } else { 0 };
     let data_sect = if layout.data_sec_size > 0 { let s = sect_num; sect_num += 1; s } else { 0 };
     if layout.got_sec_size > 0 { sect_num += 1; }
-    if layout.bss_sec_size > 0 { sect_num += 1; }
+    let bss_sect = if layout.bss_sec_size > 0 { let s = sect_num; sect_num += 1; s } else { 0 };
     let _ = sect_num;
 
     fn add_string(strtab: &mut Vec<u8>, s: &str) -> u32 {
@@ -1159,13 +1159,16 @@ fn build_symbol_table(
             const_sect
         } else if layout.data_sec_size > 0 && value >= layout.data_sec_vmaddr && value < layout.data_sec_vmaddr + layout.data_sec_size {
             data_sect
+        } else if layout.bss_sec_size > 0 && value >= layout.bss_sec_vmaddr && value < layout.bss_sec_vmaddr + layout.bss_sec_size {
+            bss_sect
         } else {
             panic!(
                 "symbol {name:?} at {value:#x} does not fall in any known Mach-O section \
-                 (text={:#x}..{:#x}, const={:#x}..{:#x}, data={:#x}..{:#x})",
+                 (text={:#x}..{:#x}, const={:#x}..{:#x}, data={:#x}..{:#x}, bss={:#x}..{:#x})",
                 layout.text_sec_vmaddr, layout.text_sec_vmaddr + layout.text_sec_size,
                 layout.const_sec_vmaddr, layout.const_sec_vmaddr + layout.const_sec_size,
                 layout.data_sec_vmaddr, layout.data_sec_vmaddr + layout.data_sec_size,
+                layout.bss_sec_vmaddr, layout.bss_sec_vmaddr + layout.bss_sec_size,
             )
         };
         extdef_syms.push((name.clone(), value, sect));

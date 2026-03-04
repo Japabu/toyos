@@ -467,8 +467,17 @@ fn collect_object(
                     }),
                 },
                 RelocationFlags::MachO { r_type, r_length, .. } => {
-                    match macho_arm64_to_reloc_type(r_type, r_length) {
-                        Some(r) => (r, macho_arm64_is_instruction_reloc(r_type)),
+                    let is_x86_64 = matches!(obj.architecture(),
+                        object::Architecture::X86_64);
+                    let mapped = if is_x86_64 {
+                        macho_x86_64_to_reloc_type(r_type, r_length)
+                    } else {
+                        macho_arm64_to_reloc_type(r_type, r_length)
+                    };
+                    match mapped {
+                        // x86_64 Mach-O stores addends as raw data bytes (not
+                        // instruction-encoded like ARM64 ADRP/LDR/BL).
+                        Some(r) => (r, !is_x86_64 && macho_arm64_is_instruction_reloc(r_type)),
                         None => return Err(LinkError::UnsupportedRawRelocation {
                             raw_type: format!("Mach-O type={r_type} length={r_length}"),
                             symbol: sym_name.name().to_string(),
@@ -586,6 +595,22 @@ fn macho_arm64_to_reloc_type(r_type: u8, r_length: u8) -> Option<RelocType> {
 /// an instruction (as opposed to a raw data pointer).
 fn macho_arm64_is_instruction_reloc(r_type: u8) -> bool {
     !matches!(r_type, macho::ARM64_RELOC_UNSIGNED | macho::ARM64_RELOC_SUBTRACTOR)
+}
+
+/// Map Mach-O x86_64 relocation types to RelocType.
+fn macho_x86_64_to_reloc_type(r_type: u8, r_length: u8) -> Option<RelocType> {
+    Some(match r_type {
+        macho::X86_64_RELOC_UNSIGNED if r_length == 3 => RelocType::X86_64,
+        macho::X86_64_RELOC_UNSIGNED if r_length == 2 => RelocType::X86_32,
+        macho::X86_64_RELOC_SIGNED
+        | macho::X86_64_RELOC_SIGNED_1
+        | macho::X86_64_RELOC_SIGNED_2
+        | macho::X86_64_RELOC_SIGNED_4 => RelocType::X86Pc32,
+        macho::X86_64_RELOC_BRANCH => RelocType::X86Plt32,
+        macho::X86_64_RELOC_GOT_LOAD => RelocType::X86Gotpcrelx,
+        macho::X86_64_RELOC_GOT => RelocType::X86Gotpcrel,
+        _ => return None,
+    })
 }
 
 pub(crate) fn is_archive(data: &[u8]) -> bool {
