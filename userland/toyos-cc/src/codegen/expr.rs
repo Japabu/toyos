@@ -441,6 +441,7 @@ impl Codegen {
         let ptr_ty = self.expr_type(ctx, e);
         let pointee_ty = match ptr_ty {
             CType::Pointer(inner) => *inner,
+            CType::Array(inner, _) => *inner,
             other => panic!("arrow '->{field}' on non-pointer type {other:?}"),
         };
         let pointee_ty = self.resolve_incomplete_type(pointee_ty);

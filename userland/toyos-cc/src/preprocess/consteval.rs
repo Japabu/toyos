@@ -1,3 +1,5 @@
+use crate::types::Signedness;
+
 pub(crate) struct IfState {
     pub active: bool,
     pub seen_true: bool,
@@ -43,103 +45,105 @@ pub(crate) fn split_first_word(s: &str) -> (&str, &str) {
 
 // A value in a preprocessor constant expression.
 // Arithmetic follows C99 intmax_t / uintmax_t rules:
-// - unsigned flag is set when a literal has a U suffix, or when a hex/octal
+// - Signedness::Unsigned is set when a literal has a U suffix, or when a hex/octal
 //   literal does not fit in i64 (GCC extension, matches TCC behaviour).
 // - If either operand of a binary arithmetic/compare op is unsigned, the
 //   result is unsigned and arithmetic uses wrapping u64 semantics.
 #[derive(Clone, Copy)]
 struct Val {
     bits: u64,
-    unsigned: bool,
+    sign: Signedness,
 }
 
 impl Val {
-    fn signed(v: i64) -> Self { Val { bits: v as u64, unsigned: false } }
+    fn signed(v: i64) -> Self { Val { bits: v as u64, sign: Signedness::Signed } }
     fn zero() -> Self { Val::signed(0) }
     fn one() -> Self { Val::signed(1) }
 
     fn is_nonzero(self) -> bool { self.bits != 0 }
+    fn is_unsigned(self) -> bool { self.sign == Signedness::Unsigned }
 
     fn as_i64(self) -> i64 { self.bits as i64 }
 
     fn neg(self) -> Self {
-        Val { bits: 0u64.wrapping_sub(self.bits), unsigned: self.unsigned }
+        Val { bits: 0u64.wrapping_sub(self.bits), sign: self.sign }
     }
     fn bitnot(self) -> Self {
-        Val { bits: !self.bits, unsigned: self.unsigned }
+        Val { bits: !self.bits, sign: self.sign }
     }
 
-    fn make_unsigned(a: Val, b: Val) -> (u64, u64, bool) {
-        (a.bits, b.bits, a.unsigned || b.unsigned)
+    fn common_sign(a: Val, b: Val) -> (u64, u64, Signedness) {
+        let sign = if a.is_unsigned() || b.is_unsigned() { Signedness::Unsigned } else { Signedness::Signed };
+        (a.bits, b.bits, sign)
     }
 
     fn add(a: Val, b: Val) -> Val {
-        let (av, bv, u) = Self::make_unsigned(a, b);
-        Val { bits: av.wrapping_add(bv), unsigned: u }
+        let (av, bv, sign) = Self::common_sign(a, b);
+        Val { bits: av.wrapping_add(bv), sign }
     }
     fn sub(a: Val, b: Val) -> Val {
-        let (av, bv, u) = Self::make_unsigned(a, b);
-        Val { bits: av.wrapping_sub(bv), unsigned: u }
+        let (av, bv, sign) = Self::common_sign(a, b);
+        Val { bits: av.wrapping_sub(bv), sign }
     }
     fn mul(a: Val, b: Val) -> Val {
-        let (av, bv, u) = Self::make_unsigned(a, b);
-        Val { bits: av.wrapping_mul(bv), unsigned: u }
+        let (av, bv, sign) = Self::common_sign(a, b);
+        Val { bits: av.wrapping_mul(bv), sign }
     }
     fn div(a: Val, b: Val) -> Val {
-        if b.bits == 0 { return Val::zero(); }
-        let (av, bv, u) = Self::make_unsigned(a, b);
-        if u {
-            Val { bits: av / bv, unsigned: true }
+        assert!(b.bits != 0, "division by zero in preprocessor constant expression");
+        let (av, bv, sign) = Self::common_sign(a, b);
+        if sign == Signedness::Unsigned {
+            Val { bits: av / bv, sign: Signedness::Unsigned }
         } else {
             Val::signed((av as i64).wrapping_div(bv as i64))
         }
     }
     fn rem(a: Val, b: Val) -> Val {
-        if b.bits == 0 { return Val::zero(); }
-        let (av, bv, u) = Self::make_unsigned(a, b);
-        if u {
-            Val { bits: av % bv, unsigned: true }
+        assert!(b.bits != 0, "modulo by zero in preprocessor constant expression");
+        let (av, bv, sign) = Self::common_sign(a, b);
+        if sign == Signedness::Unsigned {
+            Val { bits: av % bv, sign: Signedness::Unsigned }
         } else {
             Val::signed((av as i64).wrapping_rem(bv as i64))
         }
     }
     fn shl(a: Val, b: Val) -> Val {
-        Val { bits: a.bits.wrapping_shl(b.bits as u32), unsigned: a.unsigned }
+        Val { bits: a.bits.wrapping_shl(b.bits as u32), sign: a.sign }
     }
     fn shr(a: Val, b: Val) -> Val {
-        if a.unsigned {
-            Val { bits: a.bits >> (b.bits as u32 & 63), unsigned: true }
+        if a.is_unsigned() {
+            Val { bits: a.bits >> (b.bits as u32 & 63), sign: Signedness::Unsigned }
         } else {
             Val::signed((a.bits as i64).wrapping_shr(b.bits as u32))
         }
     }
     fn bitor(a: Val, b: Val) -> Val {
-        let (av, bv, u) = Self::make_unsigned(a, b);
-        Val { bits: av | bv, unsigned: u }
+        let (av, bv, sign) = Self::common_sign(a, b);
+        Val { bits: av | bv, sign }
     }
     fn bitxor(a: Val, b: Val) -> Val {
-        let (av, bv, u) = Self::make_unsigned(a, b);
-        Val { bits: av ^ bv, unsigned: u }
+        let (av, bv, sign) = Self::common_sign(a, b);
+        Val { bits: av ^ bv, sign }
     }
     fn bitand(a: Val, b: Val) -> Val {
-        let (av, bv, u) = Self::make_unsigned(a, b);
-        Val { bits: av & bv, unsigned: u }
+        let (av, bv, sign) = Self::common_sign(a, b);
+        Val { bits: av & bv, sign }
     }
 
     fn lt(a: Val, b: Val) -> Val {
-        let res = if a.unsigned || b.unsigned { a.bits < b.bits } else { (a.bits as i64) < (b.bits as i64) };
+        let res = if a.is_unsigned() || b.is_unsigned() { a.bits < b.bits } else { (a.bits as i64) < (b.bits as i64) };
         if res { Val::one() } else { Val::zero() }
     }
     fn gt(a: Val, b: Val) -> Val {
-        let res = if a.unsigned || b.unsigned { a.bits > b.bits } else { (a.bits as i64) > (b.bits as i64) };
+        let res = if a.is_unsigned() || b.is_unsigned() { a.bits > b.bits } else { (a.bits as i64) > (b.bits as i64) };
         if res { Val::one() } else { Val::zero() }
     }
     fn le(a: Val, b: Val) -> Val {
-        let res = if a.unsigned || b.unsigned { a.bits <= b.bits } else { (a.bits as i64) <= (b.bits as i64) };
+        let res = if a.is_unsigned() || b.is_unsigned() { a.bits <= b.bits } else { (a.bits as i64) <= (b.bits as i64) };
         if res { Val::one() } else { Val::zero() }
     }
     fn ge(a: Val, b: Val) -> Val {
-        let res = if a.unsigned || b.unsigned { a.bits >= b.bits } else { (a.bits as i64) >= (b.bits as i64) };
+        let res = if a.is_unsigned() || b.is_unsigned() { a.bits >= b.bits } else { (a.bits as i64) >= (b.bits as i64) };
         if res { Val::one() } else { Val::zero() }
     }
     fn eq(a: Val, b: Val) -> Val {
@@ -421,7 +425,7 @@ impl<'a> ConstEval<'a> {
         let c = self.src[self.pos];
 
         let bits: u64;
-        let mut is_unsigned = false;
+        let mut sign = Signedness::Signed;
 
         if c == b'0' && self.src.get(self.pos + 1).is_some_and(|c| *c == b'x' || *c == b'X') {
             // Hexadecimal
@@ -432,7 +436,7 @@ impl<'a> ConstEval<'a> {
             // Parse as u64; if it doesn't fit in i64 treat as unsigned (GCC rule)
             let v = u64::from_str_radix(hex_str, 16).expect("invalid hex literal in preprocessor expression");
             bits = v;
-            if v > i64::MAX as u64 { is_unsigned = true; }
+            if v > i64::MAX as u64 { sign = Signedness::Unsigned; }
         } else if c == b'0' && self.src.get(self.pos + 1).is_some_and(|c| *c == b'b' || *c == b'B') {
             // Binary
             self.pos += 2;
@@ -448,7 +452,7 @@ impl<'a> ConstEval<'a> {
             let oct_str = std::str::from_utf8(&self.src[oct_start..self.pos]).unwrap();
             let v = u64::from_str_radix(oct_str, 8).expect("invalid octal literal in preprocessor expression");
             bits = v;
-            if v > i64::MAX as u64 { is_unsigned = true; }
+            if v > i64::MAX as u64 { sign = Signedness::Unsigned; }
         } else {
             // Decimal
             while self.pos < self.src.len() && self.src[self.pos].is_ascii_digit() { self.pos += 1; }
@@ -456,19 +460,19 @@ impl<'a> ConstEval<'a> {
             // Parse as u64; if it overflows i64, treat as unsigned
             let v: u64 = num_str.parse().expect("invalid decimal literal in preprocessor expression");
             bits = v;
-            if v > i64::MAX as u64 { is_unsigned = true; }
+            if v > i64::MAX as u64 { sign = Signedness::Unsigned; }
         }
 
         // Consume type suffixes: u/U makes it unsigned; l/L are ignored
         while self.pos < self.src.len() {
             match self.src[self.pos] {
-                b'u' | b'U' => { is_unsigned = true; self.pos += 1; }
+                b'u' | b'U' => { sign = Signedness::Unsigned; self.pos += 1; }
                 b'l' | b'L' => { self.pos += 1; }
                 b'f' | b'F' => { self.pos += 1; } // floating suffix, shouldn't appear but be safe
                 _ => break,
             }
         }
 
-        Val { bits, unsigned: is_unsigned }
+        Val { bits, sign }
     }
 }
