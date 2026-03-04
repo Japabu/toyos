@@ -26,6 +26,23 @@ impl std::ops::IndexMut<SectionIdx> for Vec<InputSection> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct ObjIdx(pub usize);
 
+/// Type-safe symbol reference that distinguishes global from local symbols.
+/// Local symbols carry their originating object index, ensuring they are never
+/// confused with same-named locals from other objects (e.g. `.str.63`).
+#[derive(Debug, Clone, Hash, Eq, PartialEq)]
+pub(crate) enum SymbolRef {
+    Global(String),
+    Local(ObjIdx, String),
+}
+
+impl SymbolRef {
+    pub(crate) fn name(&self) -> &str {
+        match self {
+            SymbolRef::Global(n) | SymbolRef::Local(_, n) => n,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SectionKind {
     Code,
@@ -52,7 +69,6 @@ impl SectionKind {
 
 #[derive(Clone)]
 pub(crate) struct InputSection {
-    pub(crate) obj_idx: Option<ObjIdx>,
     pub(crate) name: String,
     pub(crate) data: Vec<u8>,
     pub(crate) align: u64,
@@ -125,7 +141,7 @@ pub(crate) struct InputReloc {
     pub(crate) section: SectionIdx,
     pub(crate) offset: u64,
     pub(crate) r_type: RelocType,
-    pub(crate) symbol_name: String,
+    pub(crate) target: SymbolRef,
     pub(crate) addend: i64,
 }
 
@@ -211,15 +227,16 @@ fn collect_so_symbols(elf: &ElfFile64, globals: &mut HashMap<String, SymbolDef>,
     }
 }
 
-/// Resolve a relocation's target to a symbol name. Section symbols get synthetic
-/// names keyed on (obj_idx, global_section_idx) for unique resolution.
+/// Resolve a relocation's target to a `SymbolRef`. Section symbols and local
+/// symbols produce `SymbolRef::Local` (carrying the object index), while global
+/// and undefined symbols produce `SymbolRef::Global`.
 fn resolve_reloc_target(
     obj: &object::File,
     reloc: &read::Relocation,
     obj_idx: ObjIdx,
     sec_map: &HashMap<(ObjIdx, object::SectionIndex), SectionIdx>,
     state: &mut LinkState,
-) -> Option<String> {
+) -> Option<SymbolRef> {
     let sym_idx = match reloc.target() {
         read::RelocationTarget::Symbol(idx) => idx,
         // Absolute/Section targets have no symbol to resolve (non_exhaustive enum)
@@ -244,9 +261,11 @@ fn resolve_reloc_target(
             section: gsec,
             value: sym.address() - sec_addr,
         });
-        Some(syn)
+        Some(SymbolRef::Local(obj_idx, syn))
+    } else if sym.is_global() || sym.is_undefined() {
+        Some(SymbolRef::Global(name.to_string()))
     } else {
-        Some(name.to_string())
+        Some(SymbolRef::Local(obj_idx, name.to_string()))
     }
 }
 
@@ -309,7 +328,6 @@ fn collect_object(
         };
 
         state.sections.push(InputSection {
-            obj_idx: Some(obj_idx),
             name: sec_name.to_string(),
             data: sec_data,
             align: section.align().max(1),
@@ -402,14 +420,14 @@ fn collect_object(
                     None if r_type == 0 => continue,
                     None => return Err(LinkError::UnsupportedRawRelocation {
                         raw_type: format!("ELF {r_type}"),
-                        symbol: sym_name,
+                        symbol: sym_name.name().to_string(),
                     }),
                 },
                 RelocationFlags::Coff { typ } => match coff_to_reloc_type(typ) {
                     Some(r) => (r, false),
                     None => return Err(LinkError::UnsupportedRawRelocation {
                         raw_type: format!("COFF {typ}"),
-                        symbol: sym_name,
+                        symbol: sym_name.name().to_string(),
                     }),
                 },
                 RelocationFlags::MachO { r_type, r_length, .. } => {
@@ -417,14 +435,14 @@ fn collect_object(
                         Some(r) => (r, macho_arm64_is_instruction_reloc(r_type)),
                         None => return Err(LinkError::UnsupportedRawRelocation {
                             raw_type: format!("Mach-O type={r_type} length={r_length}"),
-                            symbol: sym_name,
+                            symbol: sym_name.name().to_string(),
                         }),
                     }
                 }
                 // Xcoff/Generic/etc. — reject unknown formats (non_exhaustive enum)
                 flags => return Err(LinkError::UnsupportedRawRelocation {
                     raw_type: format!("{flags:?}"),
-                    symbol: sym_name,
+                    symbol: sym_name.name().to_string(),
                 }),
             };
 
@@ -440,7 +458,7 @@ fn collect_object(
                     64 => i64::from_le_bytes(data[off..off + 8].try_into().unwrap()),
                     32 => i32::from_le_bytes(data[off..off + 4].try_into().unwrap()) as i64,
                     16 => i16::from_le_bytes(data[off..off + 2].try_into().unwrap()) as i64,
-                    sz => panic!("unexpected implicit addend size {sz} bits for {sym_name}"),
+                    sz => panic!("unexpected implicit addend size {sz} bits for {:?}", sym_name),
                 };
                 reloc.addend() + implicit
             } else {
@@ -451,7 +469,7 @@ fn collect_object(
                 section: global_sec,
                 offset,
                 r_type,
-                symbol_name: sym_name,
+                target: sym_name,
                 addend,
             });
         }
@@ -617,13 +635,13 @@ pub(crate) fn gc_sections(state: &mut LinkState, entry: &str) {
     // Build adjacency list: source_section → set of target sections
     let mut edges: Vec<HashSet<usize>> = vec![HashSet::new(); num_sections];
     for reloc in &state.relocs {
-        if let Some(target) = sym_to_section(&reloc.symbol_name) {
-            edges[reloc.section.0].insert(target.0);
+        if let Some(target_sec) = sym_to_section(reloc.target.name()) {
+            edges[reloc.section.0].insert(target_sec.0);
         }
         // Also check locals
-        if let Some(obj_idx) = state.sections[reloc.section].obj_idx {
-            if let Some(SymbolDef::Defined { section: target, .. }) = state.locals.get(&(obj_idx, reloc.symbol_name.clone())) {
-                edges[reloc.section.0].insert(target.0);
+        if let SymbolRef::Local(obj_idx, name) = &reloc.target {
+            if let Some(SymbolDef::Defined { section: target_sec, .. }) = state.locals.get(&(*obj_idx, name.clone())) {
+                edges[reloc.section.0].insert(target_sec.0);
             }
         }
     }
@@ -744,8 +762,8 @@ pub(crate) fn synthesize_alloc_shims(state: &mut LinkState) {
     let undefined: HashSet<String> = state
         .relocs
         .iter()
-        .map(|r| r.symbol_name.clone())
-        .filter(|name| !state.globals.contains_key(name))
+        .map(|r| r.target.name().to_string())
+        .filter(|name| !state.globals.contains_key(name.as_str()))
         .collect();
 
     // Each trampoline is: `jmp rel32` (E9 xx xx xx xx) = 5 bytes, padded to 16
@@ -757,7 +775,6 @@ pub(crate) fn synthesize_alloc_shims(state: &mut LinkState) {
         code.resize(16, 0xCC); // pad with int3
         let sec_idx = SectionIdx(state.sections.len());
         state.sections.push(InputSection {
-            obj_idx: None,
             name: format!(".text.{shim_name}"),
             data: code,
             align: 16,
@@ -776,7 +793,7 @@ pub(crate) fn synthesize_alloc_shims(state: &mut LinkState) {
             section: sec_idx,
             offset: 1,
             r_type: RelocType::X86Plt32,
-            symbol_name: target_name.to_string(),
+            target: SymbolRef::Global(target_name.to_string()),
             addend: -4,
         });
     }
@@ -789,7 +806,6 @@ pub(crate) fn synthesize_alloc_shims(state: &mut LinkState) {
         code.resize(16, 0xCC);
         let sec_idx = SectionIdx(state.sections.len());
         state.sections.push(InputSection {
-            obj_idx: None,
             name: format!(".text.{SHIM_NO_ALLOC_UNSTABLE}"),
             data: code,
             align: 16,
@@ -906,15 +922,20 @@ pub(crate) fn merge_string_sections(state: &mut LinkState) {
     // Update relocation addends: when a relocation targets a symbol in a merged
     // section, the addend may encode an offset into that section that needs remapping.
     for reloc in &mut state.relocs {
-        let obj_idx = state.sections[reloc.section].obj_idx;
-        let old_def = old_globals.get(&reloc.symbol_name)
-            .or_else(|| obj_idx.and_then(|oi| old_locals.get(&(oi, reloc.symbol_name.clone()))));
+        let old_def = match &reloc.target {
+            SymbolRef::Global(name) => old_globals.get(name),
+            SymbolRef::Local(oi, name) => old_globals.get(name)
+                .or_else(|| old_locals.get(&(*oi, name.clone()))),
+        };
         if let Some(SymbolDef::Defined { section: old_sec, value: old_val }) = old_def {
             if !merge_set.contains(old_sec) { continue; }
             let old_offset = old_val + reloc.addend as u64;
             if let Some(&new_offset) = offset_remap.get(&(*old_sec, old_offset)) {
-                let new_def = state.globals.get(&reloc.symbol_name)
-                    .or_else(|| obj_idx.and_then(|oi| state.locals.get(&(oi, reloc.symbol_name.clone()))));
+                let new_def = match &reloc.target {
+                    SymbolRef::Global(name) => state.globals.get(name),
+                    SymbolRef::Local(oi, name) => state.globals.get(name)
+                        .or_else(|| state.locals.get(&(*oi, name.clone()))),
+                };
                 if let Some(SymbolDef::Defined { value: new_val, .. }) = new_def {
                     reloc.addend = new_offset as i64 - *new_val as i64;
                 }
@@ -980,12 +1001,12 @@ pub(crate) fn merge_string_sections(state: &mut LinkState) {
 pub(crate) fn collect_unique_symbols<'a>(
     relocs: impl Iterator<Item = &'a InputReloc>,
     predicate: impl Fn(&InputReloc) -> bool,
-) -> Vec<String> {
+) -> Vec<SymbolRef> {
     let mut seen = HashSet::new();
     let mut result = Vec::new();
     for reloc in relocs {
-        if predicate(reloc) && seen.insert(reloc.symbol_name.clone()) {
-            result.push(reloc.symbol_name.clone());
+        if predicate(reloc) && seen.insert(reloc.target.clone()) {
+            result.push(reloc.target.clone());
         }
     }
     result

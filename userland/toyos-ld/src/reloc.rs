@@ -1,4 +1,4 @@
-use crate::collect::{InputReloc, LinkState, RelocType, SectionIdx, SymbolDef};
+use crate::collect::{InputReloc, LinkState, RelocType, SectionIdx, SymbolDef, SymbolRef};
 use crate::emit_pe::PeLayout;
 use crate::LinkError;
 use std::collections::{HashMap, HashSet};
@@ -14,24 +14,34 @@ pub(crate) struct RelocOutput {
 /// static/PE modes where dynamic symbols are unsupported.
 pub(crate) fn resolve_symbol(
     state: &LinkState,
-    name: &str,
-    from_sec: SectionIdx,
-    plt: Option<&HashMap<String, u64>>,
+    sym: &SymbolRef,
+    plt: Option<&HashMap<SymbolRef, u64>>,
 ) -> Option<u64> {
-    if let Some(def) = state.globals.get(name) {
-        match def {
-            SymbolDef::Dynamic => return plt.and_then(|p| p.get(name).copied()),
-            SymbolDef::Defined { section, value } => {
-                return Some(state.sections[*section].vaddr.unwrap() + value);
+    match sym {
+        SymbolRef::Global(name) => {
+            match state.globals.get(name)? {
+                SymbolDef::Dynamic => plt.and_then(|p| p.get(sym).copied()),
+                SymbolDef::Defined { section, value } => {
+                    Some(state.sections[*section].vaddr.unwrap() + value)
+                }
             }
         }
-    }
-    if let Some(obj_idx) = state.sections[from_sec].obj_idx {
-        if let Some(SymbolDef::Defined { section, value }) = state.locals.get(&(obj_idx, name.to_string())) {
-            return Some(state.sections[*section].vaddr.unwrap() + value);
+        SymbolRef::Local(obj_idx, name) => {
+            // Global overrides local (e.g., inline function promoted to global)
+            if let Some(def) = state.globals.get(name) {
+                return match def {
+                    SymbolDef::Dynamic => plt.and_then(|p| p.get(sym).copied()),
+                    SymbolDef::Defined { section, value } => {
+                        Some(state.sections[*section].vaddr.unwrap() + value)
+                    }
+                };
+            }
+            if let Some(SymbolDef::Defined { section, value }) = state.locals.get(&(*obj_idx, name.clone())) {
+                return Some(state.sections[*section].vaddr.unwrap() + value);
+            }
+            None
         }
     }
-    None
 }
 
 /// x86-64 Variant II: TP points to end of TLS block.
@@ -44,7 +54,7 @@ fn check_i32(value: i64, reloc: &InputReloc) -> Result<(), LinkError> {
     if value < i32::MIN as i64 || value > i32::MAX as i64 {
         return Err(LinkError::RelocationOverflow {
             reloc_type: reloc.r_type,
-            symbol: reloc.symbol_name.clone(),
+            symbol: reloc.target.name().to_string(),
             value,
         });
     }
@@ -55,7 +65,7 @@ fn check_u32(value: i64, reloc: &InputReloc) -> Result<(), LinkError> {
     if value < 0 || value > u32::MAX as i64 {
         return Err(LinkError::RelocationOverflow {
             reloc_type: reloc.r_type,
-            symbol: reloc.symbol_name.clone(),
+            symbol: reloc.target.name().to_string(),
             value,
         });
     }
@@ -69,7 +79,7 @@ fn apply_one_reloc(
     reloc: &InputReloc,
     sym_addr: u64,
     reloc_vaddr: u64,
-    got: &HashMap<String, u64>,
+    got: &HashMap<SymbolRef, u64>,
 ) -> Result<bool, LinkError> {
     match reloc.r_type {
         RelocType::X86_64 => {
@@ -97,8 +107,8 @@ fn apply_one_reloc(
         }
         RelocType::X86Gotpcrel | RelocType::X86Gotpcrelx
         | RelocType::X86RexGotpcrelx => {
-            let got_slot = *got.get(&reloc.symbol_name).ok_or_else(|| {
-                LinkError::UndefinedSymbols(vec![reloc.symbol_name.clone()])
+            let got_slot = *got.get(&reloc.target).ok_or_else(|| {
+                LinkError::UndefinedSymbols(vec![reloc.target.name().to_string()])
             })?;
             let value = got_slot as i64 + reloc.addend - reloc_vaddr as i64;
             check_i32(value, reloc)?;
@@ -107,7 +117,7 @@ fn apply_one_reloc(
         }
         other => Err(LinkError::UnsupportedRelocation {
             reloc_type: other,
-            symbol: reloc.symbol_name.clone(),
+            symbol: reloc.target.name().to_string(),
         }),
     }
 }
@@ -141,11 +151,11 @@ fn is_padded_tls_sequence(sec_data: &[u8], reloc_offset: u64) -> bool {
 
 /// Parameters for ELF relocation application (shared between PIE and static modes).
 pub(crate) struct ElfRelocParams<'a> {
-    pub(crate) got: &'a HashMap<String, u64>,
+    pub(crate) got: &'a HashMap<SymbolRef, u64>,
     pub(crate) tls_start: u64,
     pub(crate) tls_memsz: u64,
-    pub(crate) plt: Option<&'a HashMap<String, u64>>,
-    pub(crate) dyn_got: &'a HashMap<String, u64>,
+    pub(crate) plt: Option<&'a HashMap<SymbolRef, u64>>,
+    pub(crate) dyn_got: &'a HashMap<SymbolRef, u64>,
     /// PIE mode: record R_X86_64_RELATIVE entries for runtime relocation.
     /// Static mode: addresses are fixed at link time, no RELATIVE needed.
     pub(crate) record_relatives: bool,
@@ -169,8 +179,8 @@ pub(crate) fn apply_relocs(
     for reloc in &relocs {
         match reloc.r_type {
             RelocType::X86Tlsgd => {
-                let sym_addr = resolve_symbol(state, &reloc.symbol_name, reloc.section, params.plt)
-                    .ok_or_else(|| LinkError::UndefinedSymbols(vec![reloc.symbol_name.clone()]))?;
+                let sym_addr = resolve_symbol(state, &reloc.target, params.plt)
+                    .ok_or_else(|| LinkError::UndefinedSymbols(vec![reloc.target.name().to_string()]))?;
                 let padded = is_padded_tls_sequence(
                     &state.sections[reloc.section].data,
                     reloc.offset,
@@ -191,7 +201,7 @@ pub(crate) fn apply_relocs(
                 } else {
                     return Err(LinkError::UnsupportedRelocation {
                         reloc_type: RelocType::X86Tlsgd,
-                        symbol: reloc.symbol_name.clone(),
+                        symbol: reloc.target.name().to_string(),
                     });
                 }
             }
@@ -222,8 +232,8 @@ pub(crate) fn apply_relocs(
                 }
             }
             RelocType::X86Dtpoff32 => {
-                let sym_addr = resolve_symbol(state, &reloc.symbol_name, reloc.section, params.plt)
-                    .ok_or_else(|| LinkError::UndefinedSymbols(vec![reloc.symbol_name.clone()]))?;
+                let sym_addr = resolve_symbol(state, &reloc.target, params.plt)
+                    .ok_or_else(|| LinkError::UndefinedSymbols(vec![reloc.target.name().to_string()]))?;
                 let value = tpoff(sym_addr, params.tls_start, params.tls_memsz) + reloc.addend;
                 check_i32(value, reloc)?;
                 write_i32(state, reloc.section, reloc.offset, value as i32);
@@ -253,13 +263,13 @@ pub(crate) fn apply_relocs(
         let sec = &state.sections[reloc.section];
         let reloc_vaddr = sec.vaddr.unwrap() + reloc.offset;
 
-        let sym_addr = match resolve_symbol(state, &reloc.symbol_name, reloc.section, params.plt) {
+        let sym_addr = match resolve_symbol(state, &reloc.target, params.plt) {
             Some(a) => a,
             None => {
-                if reloc.symbol_name.is_empty() {
+                if reloc.target.name().is_empty() {
                     0
                 } else {
-                    undefined.insert(reloc.symbol_name.clone());
+                    undefined.insert(reloc.target.name().to_string());
                     continue;
                 }
             }
@@ -272,8 +282,8 @@ pub(crate) fn apply_relocs(
                 write_i32(state, reloc.section, reloc.offset, value as i32);
             }
             RelocType::X86Gottpoff => {
-                let got_slot = *params.got.get(&reloc.symbol_name).ok_or_else(|| {
-                    LinkError::UndefinedSymbols(vec![reloc.symbol_name.clone()])
+                let got_slot = *params.got.get(&reloc.target).ok_or_else(|| {
+                    LinkError::UndefinedSymbols(vec![reloc.target.name().to_string()])
                 })?;
                 let value = got_slot as i64 + reloc.addend - reloc_vaddr as i64;
                 check_i32(value, reloc)?;
@@ -301,16 +311,16 @@ pub(crate) fn apply_relocs(
 
     // Fill GOT entries (PIE mode records as RELATIVE; static mode handles in emit)
     if params.record_relatives {
-        let gottpoff_syms: HashSet<String> = relocs
+        let gottpoff_syms: HashSet<SymbolRef> = relocs
             .iter()
             .filter(|r| r.r_type == RelocType::X86Gottpoff)
-            .map(|r| r.symbol_name.clone())
+            .map(|r| r.target.clone())
             .collect();
 
-        for (sym_name, &got_vaddr) in params.got {
-            let sym_addr = resolve_symbol(state, sym_name, SectionIdx(0), params.plt)
-                .ok_or_else(|| LinkError::UndefinedSymbols(vec![sym_name.clone()]))?;
-            if gottpoff_syms.contains(sym_name) {
+        for (sym_ref, &got_vaddr) in params.got {
+            let sym_addr = resolve_symbol(state, sym_ref, params.plt)
+                .ok_or_else(|| LinkError::UndefinedSymbols(vec![sym_ref.name().to_string()]))?;
+            if gottpoff_syms.contains(sym_ref) {
                 let tp = tpoff(sym_addr, params.tls_start, params.tls_memsz);
                 relatives.push((got_vaddr, tp));
             } else {
@@ -321,8 +331,8 @@ pub(crate) fn apply_relocs(
 
     // Collect dynamic GOT entries as GLOB_DAT relocations (resolved at load time)
     let mut glob_dats = Vec::new();
-    for (sym_name, &got_vaddr) in params.dyn_got {
-        glob_dats.push((got_vaddr, sym_name.clone()));
+    for (sym_ref, &got_vaddr) in params.dyn_got {
+        glob_dats.push((got_vaddr, sym_ref.name().to_string()));
     }
 
     if !params.allow_undefined && !undefined.is_empty() {
@@ -343,7 +353,7 @@ fn apply_one_reloc_aarch64(
     reloc: &InputReloc,
     sym_addr: u64,
     reloc_vaddr: u64,
-    got: &HashMap<String, u64>,
+    got: &HashMap<SymbolRef, u64>,
 ) -> Result<bool, LinkError> {
     match reloc.r_type {
         // Absolute 64-bit pointer
@@ -359,7 +369,7 @@ fn apply_one_reloc_aarch64(
             let imm26 = value >> 2;
             if imm26 < -(1 << 25) || imm26 >= (1 << 25) {
                 return Err(LinkError::RelocationOverflow {
-                    reloc_type: reloc.r_type, symbol: reloc.symbol_name.clone(), value,
+                    reloc_type: reloc.r_type, symbol: reloc.target.name().to_string(), value,
                 });
             }
             patch_aarch64_insn_imm26(state, reloc.section, reloc.offset, imm26 as u32);
@@ -372,7 +382,7 @@ fn apply_one_reloc_aarch64(
             let page_delta = (sym_page - pc_page) >> 12;
             if page_delta < -(1 << 20) || page_delta >= (1 << 20) {
                 return Err(LinkError::RelocationOverflow {
-                    reloc_type: reloc.r_type, symbol: reloc.symbol_name.clone(), value: page_delta,
+                    reloc_type: reloc.r_type, symbol: reloc.target.name().to_string(), value: page_delta,
                 });
             }
             patch_aarch64_adrp(state, reloc.section, reloc.offset, page_delta as i32);
@@ -392,15 +402,15 @@ fn apply_one_reloc_aarch64(
         }
         // ADRP for GOT entry page
         RelocType::Aarch64AdrGotPage => {
-            let got_slot = *got.get(&reloc.symbol_name).ok_or_else(|| {
-                LinkError::UndefinedSymbols(vec![reloc.symbol_name.clone()])
+            let got_slot = *got.get(&reloc.target).ok_or_else(|| {
+                LinkError::UndefinedSymbols(vec![reloc.target.name().to_string()])
             })?;
             let sym_page = got_slot as i64 & !0xFFF;
             let pc_page = reloc_vaddr as i64 & !0xFFF;
             let page_delta = (sym_page - pc_page) >> 12;
             if page_delta < -(1 << 20) || page_delta >= (1 << 20) {
                 return Err(LinkError::RelocationOverflow {
-                    reloc_type: reloc.r_type, symbol: reloc.symbol_name.clone(), value: page_delta,
+                    reloc_type: reloc.r_type, symbol: reloc.target.name().to_string(), value: page_delta,
                 });
             }
             patch_aarch64_adrp(state, reloc.section, reloc.offset, page_delta as i32);
@@ -408,15 +418,15 @@ fn apply_one_reloc_aarch64(
         }
         // LDR for GOT entry page offset
         RelocType::Aarch64Ld64GotLo12Nc => {
-            let got_slot = *got.get(&reloc.symbol_name).ok_or_else(|| {
-                LinkError::UndefinedSymbols(vec![reloc.symbol_name.clone()])
+            let got_slot = *got.get(&reloc.target).ok_or_else(|| {
+                LinkError::UndefinedSymbols(vec![reloc.target.name().to_string()])
             })?;
             let value = (got_slot & 0xFFF) as u32;
             patch_aarch64_ldr_imm12(state, reloc.section, reloc.offset, value, 3);
             Ok(false)
         }
         other => Err(LinkError::UnsupportedRelocation {
-            reloc_type: other, symbol: reloc.symbol_name.clone(),
+            reloc_type: other, symbol: reloc.target.name().to_string(),
         }),
     }
 }
@@ -457,7 +467,7 @@ fn patch_aarch64_ldr_imm12(state: &mut LinkState, sec: SectionIdx, offset: u64, 
 
 /// Parameters for Mach-O relocation application.
 pub(crate) struct MachORelocParams<'a> {
-    pub(crate) got: &'a HashMap<String, u64>,
+    pub(crate) got: &'a HashMap<SymbolRef, u64>,
 }
 
 /// Apply relocations for Mach-O output. Returns rebase entries (internal absolute
@@ -481,16 +491,16 @@ pub(crate) fn apply_relocs_macho(
         let is_got_reloc = matches!(reloc.r_type,
             RelocType::Aarch64AdrGotPage | RelocType::Aarch64Ld64GotLo12Nc);
 
-        let sym_addr = match resolve_symbol(state, &reloc.symbol_name, reloc.section, None) {
+        let sym_addr = match resolve_symbol(state, &reloc.target, None) {
             Some(a) => a,
-            None if is_got_reloc && params.got.contains_key(&reloc.symbol_name) => 0,
+            None if is_got_reloc && params.got.contains_key(&reloc.target) => 0,
             None if matches!(reloc.r_type, RelocType::Aarch64Abs64 | RelocType::X86_64) => {
                 // Absolute pointer to an external symbol — dyld will bind it.
-                bind_entries.push((reloc.symbol_name.clone(), reloc_vaddr));
+                bind_entries.push((reloc.target.name().to_string(), reloc_vaddr));
                 continue;
             }
             None => {
-                undefined.insert(reloc.symbol_name.clone());
+                undefined.insert(reloc.target.name().to_string());
                 continue;
             }
         };
@@ -518,7 +528,7 @@ pub(crate) fn apply_relocs_macho(
                 apply_one_reloc(state, reloc, sym_addr, reloc_vaddr, params.got)?
             }
             other => return Err(LinkError::UnsupportedRelocation {
-                reloc_type: other, symbol: reloc.symbol_name.clone(),
+                reloc_type: other, symbol: reloc.target.name().to_string(),
             }),
         };
         if is_abs {
@@ -560,11 +570,11 @@ pub(crate) fn apply_relocs_pe(
         let sec = &state.sections[reloc.section];
         let reloc_vaddr = sec.vaddr.unwrap() + reloc.offset;
 
-        let sym_addr = match resolve_symbol(state, &reloc.symbol_name, reloc.section, None) {
+        let sym_addr = match resolve_symbol(state, &reloc.target, None) {
             Some(a) => a,
             None => {
-                if reloc.symbol_name.is_empty() { 0 }
-                else { undefined.insert(reloc.symbol_name.clone()); continue; }
+                if reloc.target.name().is_empty() { 0 }
+                else { undefined.insert(reloc.target.name().to_string()); continue; }
             }
         };
 

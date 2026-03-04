@@ -1,7 +1,7 @@
 use object::write::elf::{FileHeader, ProgramHeader, SectionHeader, SectionIndex, Sym, Rel, Writer, SymbolIndex};
 use object::write::StringId;
 use object::Endianness;
-use crate::collect::{collect_unique_symbols, InputSection, LinkState, RelocType, SectionIdx, SectionKind, SymbolDef};
+use crate::collect::{collect_unique_symbols, InputSection, LinkState, RelocType, SectionKind, SymbolDef, SymbolRef};
 use crate::reloc::{RelocOutput, resolve_symbol, tpoff};
 use crate::{align_up, classify_sections, LinkError, BASE_VADDR, PAGE_SIZE};
 use object::elf;
@@ -19,11 +19,11 @@ pub(crate) struct ElfLayout {
     pub(crate) tls_start: u64,
     pub(crate) tls_filesz: u64,
     pub(crate) tls_memsz: u64,
-    pub(crate) got: HashMap<String, u64>,
-    pub(crate) plt: HashMap<String, u64>,
+    pub(crate) got: HashMap<SymbolRef, u64>,
+    pub(crate) plt: HashMap<SymbolRef, u64>,
     pub(crate) plt_data: Vec<u8>,
     pub(crate) plt_vaddr: u64,
-    pub(crate) dyn_got: HashMap<String, u64>,
+    pub(crate) dyn_got: HashMap<SymbolRef, u64>,
     pub(crate) init_array_vaddr: u64,
     pub(crate) init_array_size: u64,
     pub(crate) fini_array_vaddr: u64,
@@ -274,11 +274,12 @@ pub(crate) fn layout_elf(state: &mut LinkState, base_addr: u64, entry_name: Opti
     // PLT stubs for dynamic symbols (PIE mode only)
     let mut dyn_syms = collect_unique_symbols(
         state.relocs.iter(),
-        |r| state.dynamic_imports.contains(&r.symbol_name),
+        |r| state.dynamic_imports.contains(r.target.name()),
     );
     if let Some(entry) = entry_name {
-        if state.dynamic_imports.contains(entry) && !dyn_syms.iter().any(|s| s == entry) {
-            dyn_syms.push(entry.to_string());
+        let entry_ref = SymbolRef::Global(entry.to_string());
+        if state.dynamic_imports.contains(entry) && !dyn_syms.contains(&entry_ref) {
+            dyn_syms.push(entry_ref);
         }
     }
 
@@ -463,13 +464,14 @@ pub(crate) fn patch_build_id(buf: &mut [u8], note_file_offset: usize) {
     buf[desc_start..desc_end].copy_from_slice(&hash);
 }
 
-fn resolve_entry(state: &LinkState, entry_name: &str, plt: Option<&HashMap<String, u64>>) -> Result<u64, LinkError> {
+fn resolve_entry(state: &LinkState, entry_name: &str, plt: Option<&HashMap<SymbolRef, u64>>) -> Result<u64, LinkError> {
     state
         .globals
         .get(entry_name)
         .map(|def| match def {
             SymbolDef::Dynamic => {
-                plt.and_then(|p| p.get(entry_name).copied())
+                let entry_ref = SymbolRef::Global(entry_name.to_string());
+                plt.and_then(|p| p.get(&entry_ref).copied())
                     .ok_or_else(|| LinkError::MissingEntry(entry_name.to_string()))
             }
             SymbolDef::Defined { section, value } => {
@@ -996,15 +998,15 @@ pub(crate) fn emit_elf(
 
     // Static mode: fill GOT entries directly
     if is_static {
-        let gottpoff_syms: HashSet<String> = state.relocs.iter()
+        let gottpoff_syms: HashSet<SymbolRef> = state.relocs.iter()
             .filter(|r| r.r_type == RelocType::X86Gottpoff)
-            .map(|r| r.symbol_name.clone()).collect();
+            .map(|r| r.target.clone()).collect();
         let mut got_entries: Vec<_> = layout.got.iter().collect();
         got_entries.sort_by_key(|(_, &vaddr)| vaddr);
-        for (sym_name, &got_vaddr) in got_entries {
-            let sym_addr = resolve_symbol(state, sym_name, SectionIdx(0), None)
-                .ok_or_else(|| LinkError::UndefinedSymbols(vec![sym_name.clone()]))?;
-            let value = if gottpoff_syms.contains(sym_name) {
+        for (sym_ref, &got_vaddr) in got_entries {
+            let sym_addr = resolve_symbol(state, sym_ref, None)
+                .ok_or_else(|| LinkError::UndefinedSymbols(vec![sym_ref.name().to_string()]))?;
+            let value = if gottpoff_syms.contains(sym_ref) {
                 tpoff(sym_addr, layout.tls_start, layout.tls_memsz) as u64
             } else { sym_addr };
             let file_off = (got_vaddr - base) as usize;

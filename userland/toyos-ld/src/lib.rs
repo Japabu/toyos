@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::fs;
 
 pub use collect::RelocType;
-use collect::{collect, synthesize_alloc_shims, gc_sections, merge_string_sections, is_archive, extract_archive, find_lib, scan_symbols, SectionIdx, SectionKind, SymbolDef};
+use collect::{collect, synthesize_alloc_shims, gc_sections, merge_string_sections, is_archive, extract_archive, find_lib, scan_symbols, SectionIdx, SectionKind, SymbolDef, SymbolRef};
 use reloc::{ElfRelocParams, apply_relocs, apply_relocs_pe, MachORelocParams, apply_relocs_macho};
 use emit_elf::{layout_elf, build_eh_frame_hdr, ElfEmitMode, ElfLayout};
 use emit_pe::{layout_pe, emit_pe_bytes, PeLayout};
@@ -82,7 +82,7 @@ impl Collected {
     fn mark_dynamic_symbols(&mut self) {
         use std::collections::HashSet;
         let referenced: HashSet<String> = self.state.relocs.iter()
-            .map(|r| r.symbol_name.clone())
+            .map(|r| r.target.name().to_string())
             .collect();
         let undefined: Vec<String> = referenced.into_iter()
             .filter(|sym| {
@@ -192,15 +192,15 @@ impl LaidOut<MachOLayout> {
 
         let mut bind_entries: Vec<(String, u64)> = self.layout.got_entries.iter()
             .filter(|(_, ext)| *ext)
-            .map(|(name, _)| (name.clone(), self.layout.got[name]))
+            .map(|(sym, _)| (sym.name().to_string(), self.layout.got[sym]))
             .collect();
         // Add non-GOT dynamic binds (e.g. function pointers stored in data)
         bind_entries.extend(reloc_output.bind_entries);
 
         let mut rebase_entries = reloc_output.rebase_entries;
-        for (name, ext) in &self.layout.got_entries {
+        for (sym, ext) in &self.layout.got_entries {
             if !ext {
-                rebase_entries.push((self.layout.got[name], 0));
+                rebase_entries.push((self.layout.got[sym], 0));
             }
         }
 
@@ -419,8 +419,8 @@ fn create_call_stubs(state: &mut collect::LinkState) {
     let mut stub_syms = BTreeSet::new();
     for reloc in &state.relocs {
         if reloc.r_type != RelocType::Aarch64Call26 { continue; }
-        if let Some(SymbolDef::Dynamic) = state.globals.get(&reloc.symbol_name) {
-            stub_syms.insert(reloc.symbol_name.clone());
+        if let Some(SymbolDef::Dynamic) = state.globals.get(reloc.target.name()) {
+            stub_syms.insert(reloc.target.name().to_string());
         }
     }
 
@@ -450,14 +450,14 @@ fn create_call_stubs(state: &mut collect::LinkState) {
             section: stub_sec_idx,
             offset,
             r_type: RelocType::Aarch64AdrGotPage,
-            symbol_name: sym_name.clone(),
+            target: SymbolRef::Global(sym_name.clone()),
             addend: 0,
         });
         stub_relocs.push(collect::InputReloc {
             section: stub_sec_idx,
             offset: offset + 4,
             r_type: RelocType::Aarch64Ld64GotLo12Nc,
-            symbol_name: sym_name.clone(),
+            target: SymbolRef::Global(sym_name.clone()),
             addend: 0,
         });
 
@@ -471,7 +471,6 @@ fn create_call_stubs(state: &mut collect::LinkState) {
 
     // Add the stubs section
     state.sections.push(collect::InputSection {
-        obj_idx: None,
         name: ".text".to_string(),
         data: stub_data,
         align: 4,
@@ -490,9 +489,9 @@ fn create_call_stubs(state: &mut collect::LinkState) {
     let stub_syms_set: BTreeSet<&str> = stub_syms.iter().map(|s| s.as_str()).collect();
     for reloc in &mut state.relocs {
         if reloc.r_type == RelocType::Aarch64Call26
-            && stub_syms_set.contains(reloc.symbol_name.as_str())
+            && stub_syms_set.contains(reloc.target.name())
         {
-            reloc.symbol_name = format!("{}.__stub", reloc.symbol_name);
+            reloc.target = SymbolRef::Global(format!("{}.__stub", reloc.target.name()));
         }
     }
 }

@@ -1,4 +1,4 @@
-use crate::collect::{collect_unique_symbols, LinkState, RelocType, SectionIdx, SectionKind, SymbolDef};
+use crate::collect::{collect_unique_symbols, LinkState, RelocType, SectionKind, SymbolDef, SymbolRef};
 use crate::reloc::resolve_symbol;
 use crate::{align_up, classify_sections, LinkError};
 use sha2::{Sha256, Digest};
@@ -348,8 +348,8 @@ pub(crate) struct MachOLayout {
     pub(crate) linkedit_vmaddr: u64,
     pub(crate) linkedit_fileoff: u64,
 
-    pub(crate) got: HashMap<String, u64>,
-    pub(crate) got_entries: Vec<(String, bool)>,
+    pub(crate) got: HashMap<SymbolRef, u64>,
+    pub(crate) got_entries: Vec<(SymbolRef, bool)>,
 
     pub(crate) sizeofcmds: u32,
     pub(crate) ncmds: u32,
@@ -455,10 +455,13 @@ pub(crate) fn layout_macho(state: &mut LinkState, _entry: &str) -> MachOLayout {
     let mut got_entries = Vec::new();
     let mut got = HashMap::new();
     for sym in &got_symbols {
-        let is_external = match state.globals.get(sym) {
-            Some(SymbolDef::Dynamic) => true,
-            Some(SymbolDef::Defined { .. }) => false,
-            None => !state.locals.keys().any(|(_, n)| n == sym),
+        let is_external = match sym {
+            SymbolRef::Global(name) => match state.globals.get(name) {
+                Some(SymbolDef::Dynamic) => true,
+                Some(SymbolDef::Defined { .. }) => false,
+                None => true,
+            },
+            SymbolRef::Local(_, _) => false,
         };
         got.insert(sym.clone(), data_cursor);
         got_entries.push((sym.clone(), is_external));
@@ -931,25 +934,12 @@ pub(crate) fn emit_macho_bytes(
     }
 
     // __DATA,__got: fill internal GOT entries
-    for (sym_name, &got_vaddr) in &layout.got {
+    for (sym_ref, &got_vaddr) in &layout.got {
         let is_external = layout.got_entries.iter()
-            .any(|(n, ext)| n == sym_name && *ext);
+            .any(|(n, ext)| n == sym_ref && *ext);
         if is_external { continue; } // filled by dyld
-        // Global symbols resolve from any section context; local symbols need
-        // a section from their defining object so resolve_symbol gets the
-        // correct obj_idx.
-        let from_sec = if state.globals.contains_key(sym_name) {
-            SectionIdx(0)
-        } else {
-            let (oi, _) = state.locals.keys()
-                .find(|(_, n)| n == sym_name)
-                .unwrap_or_else(|| panic!("GOT entry for unknown symbol: {sym_name}"));
-            state.sections.iter().position(|s| s.obj_idx == Some(*oi))
-                .map(SectionIdx)
-                .unwrap_or_else(|| panic!("no section for obj_idx {:?} (symbol {sym_name})", oi))
-        };
-        let sym_addr = resolve_symbol(state, sym_name, from_sec, None)
-            .ok_or_else(|| LinkError::UndefinedSymbols(vec![sym_name.clone()]))?;
+        let sym_addr = resolve_symbol(state, sym_ref, None)
+            .ok_or_else(|| LinkError::UndefinedSymbols(vec![sym_ref.name().to_string()]))?;
         let off = (layout.data_fileoff + (got_vaddr - layout.data_vmaddr)) as usize;
         buf[off..off + 8].copy_from_slice(&sym_addr.to_le_bytes());
     }

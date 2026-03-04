@@ -1,4 +1,4 @@
-use crate::collect::{collect_unique_symbols, LinkState, RelocType, SectionIdx, SymbolDef};
+use crate::collect::{collect_unique_symbols, LinkState, RelocType, SymbolDef, SymbolRef};
 use crate::reloc::resolve_symbol;
 use crate::{align_up, classify_sections, LinkError};
 use object::write::pe::{NtHeaders, Writer};
@@ -16,7 +16,7 @@ pub(crate) struct PeLayout {
     pub(crate) data_rva: u32,
     pub(crate) data_virt_size: u32,
     pub(crate) has_data: bool,
-    pub(crate) got: HashMap<String, u64>,
+    pub(crate) got: HashMap<SymbolRef, u64>,
 }
 
 /// PE section layout: RVAs use PE_SECTION_ALIGNMENT, file uses PE_FILE_ALIGNMENT.
@@ -191,9 +191,9 @@ pub(crate) fn emit_pe_bytes(
                 data_data[off..off + sec.data.len()].copy_from_slice(&sec.data);
             }
         }
-        for (sym_name, &got_vaddr) in &layout.got {
-            let sym_addr = resolve_symbol(state, sym_name, SectionIdx(0), None)
-                .ok_or_else(|| LinkError::UndefinedSymbols(vec![sym_name.clone()]))?;
+        for (sym_ref, &got_vaddr) in &layout.got {
+            let sym_addr = resolve_symbol(state, sym_ref, None)
+                .ok_or_else(|| LinkError::UndefinedSymbols(vec![sym_ref.name().to_string()]))?;
             let off = (got_vaddr as u32 - layout.data_rva) as usize;
             data_data[off..off + 8].copy_from_slice(&sym_addr.to_le_bytes());
         }
