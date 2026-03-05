@@ -105,7 +105,7 @@ pub enum Event {
 
 /// Set the system clipboard contents.
 pub fn clipboard_set(text: &str) {
-    message::send(compositor_pid(), Message::from_bytes(MSG_CLIPBOARD_SET, text.as_bytes()));
+    message::send(compositor_pid(), Message::from_bytes(MSG_CLIPBOARD_SET, text.as_bytes())).ok();
 }
 
 pub struct Window {
@@ -133,7 +133,8 @@ impl Window {
         let len = bytes.len().min(31);
         req.title[..len].copy_from_slice(&bytes[..len]);
         req.title_len = len as u8;
-        message::send(compositor_pid(), Message::new(MSG_CREATE_WINDOW, req));
+        message::send(compositor_pid(), Message::new(MSG_CREATE_WINDOW, req))
+            .expect("compositor not running");
 
         let response = message::recv();
         assert_eq!(response.msg_type(), MSG_WINDOW_CREATED, "unexpected message from compositor");
@@ -186,7 +187,7 @@ impl Window {
 
     /// Notify the compositor that the buffer has been updated.
     pub fn present(&self) {
-        message::send(compositor_pid(), Message::signal(MSG_PRESENT));
+        message::send(compositor_pid(), Message::signal(MSG_PRESENT)).ok();
     }
 
     pub fn width(&self) -> u32 {

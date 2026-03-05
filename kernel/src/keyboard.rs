@@ -38,6 +38,41 @@ pub fn handle_report(report: &[u8]) {
 
     let mut buf = KEY_BUF.lock();
 
+    // Modifier key press/release events.
+    // HID boot protocol puts modifiers in report[0] as a bitmask, not as
+    // keycodes in report[2..8]. We synthesize discrete key events so apps
+    // (e.g. DOOM) that need individual modifier press/release work correctly.
+    let prev_mods = prev[0];
+    const MOD_BITS: [(u8, u8, u8); 8] = [
+        (0x01, 0xE0, MOD_CTRL),   // Left Ctrl
+        (0x02, 0xE1, MOD_SHIFT),  // Left Shift
+        (0x04, 0xE2, MOD_ALT),    // Left Alt
+        (0x08, 0xE3, MOD_GUI),    // Left GUI
+        (0x10, 0xE4, MOD_CTRL),   // Right Ctrl
+        (0x20, 0xE5, MOD_SHIFT),  // Right Shift
+        (0x40, 0xE6, MOD_ALT),    // Right Alt
+        (0x80, 0xE7, MOD_GUI),    // Right GUI
+    ];
+    for &(bit, keycode, _) in &MOD_BITS {
+        let was = prev_mods & bit != 0;
+        let now = hid_modifiers & bit != 0;
+        if was && !now {
+            buf.push_back(RawKeyEvent {
+                keycode,
+                modifiers: modifiers | MOD_RELEASED,
+                len: 0,
+                translated: [0; 5],
+            });
+        } else if !was && now {
+            buf.push_back(RawKeyEvent {
+                keycode,
+                modifiers,
+                len: 0,
+                translated: [0; 5],
+            });
+        }
+    }
+
     // Key releases: keys in prev report but not in current report.
     for i in 2..8 {
         let keycode = prev[i];

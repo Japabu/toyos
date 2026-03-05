@@ -169,7 +169,7 @@ fn resize_window(win: &mut WindowState, new_w: usize, new_h: usize, pixel_format
                 pixel_format,
             },
         ),
-    );
+    ).ok();
     syscall::release_shared(old_token);
 }
 
@@ -835,7 +835,7 @@ fn main() {
                                             window::MSG_CLIPBOARD_PASTE,
                                             clipboard.as_bytes(),
                                         ),
-                                    );
+                                    ).ok();
                                 }
                             }
                             _ => {
@@ -843,7 +843,7 @@ fn main() {
                                 message::send(
                                     windows[idx].pid,
                                     Message::new(window::MSG_KEY_INPUT, *event),
-                                );
+                                ).ok();
                             }
                         }
                         mark_dirty(&mut dirty_rect, DirtyRect::full(screen_w as usize, screen_h as usize));
@@ -851,12 +851,12 @@ fn main() {
                 } else if event.pressed() && event.ctrl() && event.keycode == 0x11 {
                     // Ctrl+N: spawn terminal
                     Command::new("/initrd/terminal").spawn().ok();
-                } else if event.len > 0 {
+                } else {
                     if let Some(idx) = focused_window_idx(&windows) {
                         message::send(
                             windows[idx].pid,
                             Message::new(window::MSG_KEY_INPUT, *event),
-                        );
+                        ).ok();
                     }
                 }
             }
@@ -944,7 +944,7 @@ fn main() {
                     match hit_test(&windows, cursor_x, cursor_y, screen_h, launcher_open) {
                         HitZone::CloseButton(idx) => {
                             let win = windows.remove(idx);
-                            message::send(win.pid, Message::signal(window::MSG_WINDOW_CLOSE));
+                            message::send(win.pid, Message::signal(window::MSG_WINDOW_CLOSE)).ok();
                             mark_dirty(&mut dirty_rect, DirtyRect::full(screen_w as usize, screen_h as usize));
                         }
                         HitZone::MinimizeButton(idx) => {
@@ -1037,7 +1037,7 @@ fn main() {
                             message::send(
                                 win.pid,
                                 Message::new(window::MSG_MOUSE_INPUT, ev),
-                            );
+                            ).ok();
                         }
                         HitZone::TaskbarItem(idx) => {
                             if idx < windows.len() {
@@ -1079,7 +1079,7 @@ fn main() {
                         message::send(
                             windows[idx].pid,
                             Message::new(window::MSG_MOUSE_INPUT, ev),
-                        );
+                        ).ok();
                     }
                     match interaction {
                         Interaction::Dragging { window_idx } => {
@@ -1161,7 +1161,7 @@ fn main() {
                                 message::send(
                                     windows[idx].pid,
                                     Message::new(window::MSG_MOUSE_INPUT, ev),
-                                );
+                                ).ok();
                             }
                         }
                     }
@@ -1179,7 +1179,7 @@ fn main() {
                             message::send(
                                 windows[idx].pid,
                                 Message::new(window::MSG_MOUSE_INPUT, ev),
-                            );
+                            ).ok();
                         }
                     }
                 }
@@ -1204,11 +1204,26 @@ fn main() {
                     let screen_w = screen.width();
                     let screen_h = screen.height();
 
-                    let offset = CASCADE_OFFSET * (windows.len() % 10);
-                    let win_x = INITIAL_MARGIN + offset;
-                    let win_y = INITIAL_MARGIN + offset;
-                    let win_w = screen_w - INITIAL_MARGIN * 2;
-                    let win_h = screen_h - INITIAL_MARGIN * 2 - TASKBAR_HEIGHT;
+                    let req_w = req.width as usize;
+                    let req_h = req.height as usize;
+
+                    let (win_x, win_y, win_w, win_h);
+                    if req_w > 0 && req_h > 0 {
+                        // App requested a specific content size — compute window size around it
+                        let chrome_w = BORDER_WIDTH * 2;
+                        let chrome_h = BORDER_WIDTH * 2 + TITLE_BAR_HEIGHT;
+                        win_w = req_w + chrome_w;
+                        win_h = req_h + chrome_h;
+                        // Center on screen
+                        win_x = (screen_w.saturating_sub(win_w)) / 2;
+                        win_y = (screen_h.saturating_sub(win_h + TASKBAR_HEIGHT)) / 2;
+                    } else {
+                        let offset = CASCADE_OFFSET * (windows.len() % 10);
+                        win_x = INITIAL_MARGIN + offset;
+                        win_y = INITIAL_MARGIN + offset;
+                        win_w = screen_w - INITIAL_MARGIN * 2;
+                        win_h = screen_h - INITIAL_MARGIN * 2 - TASKBAR_HEIGHT;
+                    }
 
                     let content_x = win_x + BORDER_WIDTH;
                     let content_y = win_y + BORDER_WIDTH + TITLE_BAR_HEIGHT;
@@ -1254,7 +1269,7 @@ fn main() {
                                 pixel_format,
                             },
                         ),
-                    );
+                    ).ok();
                     mark_dirty(&mut dirty_rect, DirtyRect::full(screen_w, screen_h));
                 }
                 window::MSG_PRESENT => {
@@ -1321,9 +1336,18 @@ fn main() {
                 // Send frame callbacks to windows that presented and were composited
                 for win in windows.iter_mut() {
                     if win.presented && !win.minimized && rect.overlaps(window_screen_rect(win)) {
-                        message::send(win.pid, Message::signal(window::MSG_FRAME));
+                        message::send(win.pid, Message::signal(window::MSG_FRAME)).ok();
                         win.presented = false;
                     }
+                }
+
+                // Reap windows whose processes have exited
+                let count_before = windows.len();
+                windows.retain(|win| {
+                    message::send(win.pid, Message::signal(window::MSG_FRAME)).is_ok()
+                });
+                if windows.len() != count_before {
+                    mark_dirty(&mut dirty_rect, DirtyRect::full(screen_w as usize, screen_h as usize));
                 }
             }
         }

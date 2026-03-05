@@ -1,0 +1,21 @@
+[package]
+name = "doom"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+
+[dependencies]
+window = { path = "../window" }
+toyos-abi = { path = "../../toyos-abi" }
+toyos-libc = { path = "../libc" }
+
+[patch.crates-io]
+getrandom = { path = "../getrandom" }
+
+[build-dependencies]
+cc = "1.1"
+ureq = { version = "3", default-features = false, features = ["rustls-no-provider", "rustls-webpki-roots"] }
+rustls-rustcrypto = "0.0.2-alpha"
+webpki-roots = "1"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+tar = "0.4"
