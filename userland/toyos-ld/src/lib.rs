@@ -295,6 +295,7 @@ pub fn link_full(
     build_id: bool,
 ) -> Result<Vec<u8>, LinkError> {
     let mut collected = Collected::new(objects)?;
+    create_call_stubs(&mut collected.state);
     if gc { collected.gc_sections(entry); }
     collected.layout_elf(BASE_VADDR, Some(entry), build_id)
         .relocate_and_emit_pie(entry)

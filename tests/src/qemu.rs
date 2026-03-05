@@ -24,6 +24,149 @@ pub struct QemuInstance {
     _reader_thread: thread::JoinHandle<String>,
 }
 
+/// Prepare the boot image and return (boot_image_path, nvme_image_path, repo_root).
+fn prepare_boot(
+    c_tests: &[(String, Vec<u8>)],
+    rust_tests: &[(String, Vec<u8>)],
+) -> (PathBuf, PathBuf, PathBuf) {
+    let repo = compile::repo_root();
+
+    build_kernel(&repo);
+    build_bootloader(&repo);
+
+    let toyos_ld = build_toyos_ld(&repo);
+
+    let mut initrd_files: Vec<(String, Vec<u8>)> = Vec::new();
+
+    // test-runner (init process)
+    let (name, data) = build_toyos_crate(&repo, &repo.join("userland/test-runner"), &toyos_ld);
+    initrd_files.push((name, data));
+
+    // Add test binaries
+    for (name, data) in c_tests {
+        initrd_files.push((format!("test_c_{name}"), data.clone()));
+    }
+    for (name, data) in rust_tests {
+        initrd_files.push((format!("test_rs_{name}"), data.clone()));
+    }
+
+    let initrd_bytes = create_initrd(&initrd_files, &[]);
+
+    let kernel_bytes = fs::read(repo.join("kernel/target/x86_64-unknown-none/debug/kernel"))
+        .expect("Failed to read kernel");
+    let bl_bytes = fs::read(repo.join("bootloader/target/x86_64-unknown-uefi/debug/bootloader.efi"))
+        .expect("Failed to read bootloader");
+
+    let esp = create_fat_volume(&kernel_bytes, &bl_bytes, &initrd_bytes);
+    let disk = create_gpt_disk(esp);
+
+    let pid = std::process::id();
+    let test_dir = env::temp_dir().join(format!("toyos-tests-{pid}"));
+    fs::create_dir_all(&test_dir).ok();
+    let boot_image = test_dir.join("test-bootable.img");
+    fs::write(&boot_image, &disk).expect("Failed to write test boot image");
+
+    let nvme_image = test_dir.join("test-nvme.img");
+    if !nvme_image.exists() {
+        fs::write(&nvme_image, vec![0u8; 128 * 1024 * 1024]).expect("Failed to write NVMe image");
+    }
+
+    (boot_image, nvme_image, repo)
+}
+
+/// Build the QEMU command with standard arguments.
+fn qemu_command(boot_image: &Path, nvme_image: &Path, repo: &Path, gdb_stub: bool) -> Command {
+    let ovmf_dir = repo.join("bootable/ovmf");
+
+    let mut qemu = Command::new("qemu-system-x86_64");
+    qemu
+        .arg("-machine").arg("q35")
+        .arg("-cpu").arg("qemu64,+rdrand")
+        .arg("-smp").arg("2")
+        .arg("-m").arg("4G")
+        .arg("-drive").arg(format!("if=pflash,format=raw,unit=0,file={},readonly=on", ovmf_dir.join("OVMF_CODE-pure-efi.fd").display()))
+        .arg("-drive").arg(format!("if=pflash,format=raw,unit=1,file={},readonly=on", ovmf_dir.join("OVMF_VARS-pure-efi.fd").display()))
+        .arg("-device").arg("nec-usb-xhci,id=xhci")
+        .arg("-drive").arg(format!("if=none,id=stick,format=raw,file={}", boot_image.display()))
+        .arg("-device").arg("usb-storage,bus=xhci.0,drive=stick,bootindex=0")
+        .arg("-device").arg("usb-kbd,bus=xhci.0")
+        .arg("-drive").arg(format!("if=none,id=nvme0,format=raw,file={}", nvme_image.display()))
+        .arg("-device").arg("nvme,serial=deadbeef,drive=nvme0")
+        .arg("-vga").arg("none")
+        .arg("-display").arg("none")
+        .arg("-netdev").arg("user,id=net0")
+        .arg("-device").arg("virtio-net-pci-non-transitional,netdev=net0")
+        .arg("-serial").arg("stdio")
+        .arg("-no-reboot");
+
+    if gdb_stub {
+        qemu.arg("-s");
+    }
+
+    qemu
+}
+
+/// Spawn QEMU and wait for the test-runner to signal ===READY===.
+/// Returns the QemuInstance with serial I/O channels.
+fn spawn_and_wait_ready(mut qemu: Command) -> QemuInstance {
+    qemu.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
+
+    eprintln!("[qemu] Launching QEMU...");
+    let mut child = qemu.spawn().expect("Failed to launch QEMU");
+
+    let stdin = BufWriter::new(child.stdin.take().unwrap());
+    let stdout = child.stdout.take().unwrap();
+
+    let (tx, rx) = mpsc::channel::<String>();
+    let reader_thread = thread::spawn(move || {
+        let reader = BufReader::new(stdout);
+        let mut full_log = String::new();
+        for line in reader.lines() {
+            match line {
+                Ok(line) => {
+                    full_log.push_str(&line);
+                    full_log.push('\n');
+                    eprintln!("[serial] {line}");
+                    if tx.send(line).is_err() { break; }
+                }
+                Err(_) => break,
+            }
+        }
+        full_log
+    });
+
+    // Wait for ===READY=== from the test-runner
+    let boot_timeout = Duration::from_secs(120);
+    let start = Instant::now();
+    loop {
+        if start.elapsed() > boot_timeout {
+            let _ = child.kill();
+            panic!("[qemu] Boot timed out waiting for ===READY===");
+        }
+        match rx.recv_timeout(Duration::from_secs(1)) {
+            Ok(line) if line.contains("===READY===") => {
+                eprintln!("[qemu] Test runner ready");
+                break;
+            }
+            Ok(_) => continue,
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => {
+                let status = child.wait();
+                panic!("[qemu] QEMU died before ===READY=== (status: {status:?})");
+            }
+        }
+    }
+
+    QemuInstance {
+        child,
+        stdin,
+        rx,
+        _reader_thread: reader_thread,
+    }
+}
+
 impl QemuInstance {
     /// Build everything and boot QEMU with the given test binaries in the initrd.
     /// Waits for the test-runner to signal ===READY=== before returning.
@@ -31,126 +174,28 @@ impl QemuInstance {
         c_tests: &[(String, Vec<u8>)],
         rust_tests: &[(String, Vec<u8>)],
     ) -> Self {
-        let repo = compile::repo_root();
+        Self::boot_with_options(c_tests, rust_tests, false)
+    }
 
-        build_kernel(&repo);
-        build_bootloader(&repo);
+    /// Boot QEMU with configurable GDB stub.
+    pub fn boot_with_options(
+        c_tests: &[(String, Vec<u8>)],
+        rust_tests: &[(String, Vec<u8>)],
+        gdb_stub: bool,
+    ) -> Self {
+        let (boot_image, nvme_image, repo) = prepare_boot(c_tests, rust_tests);
+        let qemu = qemu_command(&boot_image, &nvme_image, &repo, gdb_stub);
+        spawn_and_wait_ready(qemu)
+    }
 
-        let toyos_ld = build_toyos_ld(&repo);
+    /// Get mutable access to QEMU's stdin (serial input).
+    pub fn stdin_mut(&mut self) -> &mut BufWriter<ChildStdin> {
+        &mut self.stdin
+    }
 
-        let mut initrd_files: Vec<(String, Vec<u8>)> = Vec::new();
-
-        // test-runner (init process)
-        let (name, data) = build_toyos_crate(&repo, &repo.join("userland/test-runner"), &toyos_ld);
-        initrd_files.push((name, data));
-
-        // Add test binaries
-        for (name, data) in c_tests {
-            initrd_files.push((format!("test_c_{name}"), data.clone()));
-        }
-        for (name, data) in rust_tests {
-            initrd_files.push((format!("test_rs_{name}"), data.clone()));
-        }
-
-        let initrd_bytes = create_initrd(&initrd_files, &[]);
-
-        let kernel_bytes = fs::read(repo.join("kernel/target/x86_64-unknown-none/debug/kernel"))
-            .expect("Failed to read kernel");
-        let bl_bytes = fs::read(repo.join("bootloader/target/x86_64-unknown-uefi/debug/bootloader.efi"))
-            .expect("Failed to read bootloader");
-
-        let esp = create_fat_volume(&kernel_bytes, &bl_bytes, &initrd_bytes);
-        let disk = create_gpt_disk(esp);
-
-        let pid = std::process::id();
-        let test_dir = env::temp_dir().join(format!("toyos-tests-{pid}"));
-        fs::create_dir_all(&test_dir).ok();
-        let boot_image = test_dir.join("test-bootable.img");
-        fs::write(&boot_image, &disk).expect("Failed to write test boot image");
-
-        let nvme_image = test_dir.join("test-nvme.img");
-        if !nvme_image.exists() {
-            fs::write(&nvme_image, vec![0u8; 128 * 1024 * 1024]).expect("Failed to write NVMe image");
-        }
-
-        let ovmf_dir = repo.join("bootable/ovmf");
-
-        let mut qemu = Command::new("qemu-system-x86_64");
-        qemu
-            .arg("-machine").arg("q35")
-            .arg("-cpu").arg("qemu64,+rdrand")
-            .arg("-smp").arg("2")
-            .arg("-m").arg("4G")
-            .arg("-drive").arg(format!("if=pflash,format=raw,unit=0,file={},readonly=on", ovmf_dir.join("OVMF_CODE-pure-efi.fd").display()))
-            .arg("-drive").arg(format!("if=pflash,format=raw,unit=1,file={},readonly=on", ovmf_dir.join("OVMF_VARS-pure-efi.fd").display()))
-            .arg("-device").arg("nec-usb-xhci,id=xhci")
-            .arg("-drive").arg(format!("if=none,id=stick,format=raw,file={}", boot_image.display()))
-            .arg("-device").arg("usb-storage,bus=xhci.0,drive=stick,bootindex=0")
-            .arg("-device").arg("usb-kbd,bus=xhci.0")
-            .arg("-drive").arg(format!("if=none,id=nvme0,format=raw,file={}", nvme_image.display()))
-            .arg("-device").arg("nvme,serial=deadbeef,drive=nvme0")
-            .arg("-vga").arg("none")
-            .arg("-display").arg("none")
-            .arg("-netdev").arg("user,id=net0")
-            .arg("-device").arg("virtio-net-pci-non-transitional,netdev=net0")
-            .arg("-serial").arg("stdio")
-            .arg("-no-reboot")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit());
-
-        eprintln!("[qemu] Launching QEMU...");
-        let mut child = qemu.spawn().expect("Failed to launch QEMU");
-
-        let stdin = BufWriter::new(child.stdin.take().unwrap());
-        let stdout = child.stdout.take().unwrap();
-
-        let (tx, rx) = mpsc::channel::<String>();
-        let reader_thread = thread::spawn(move || {
-            let reader = BufReader::new(stdout);
-            let mut full_log = String::new();
-            for line in reader.lines() {
-                match line {
-                    Ok(line) => {
-                        full_log.push_str(&line);
-                        full_log.push('\n');
-                        eprintln!("[serial] {line}");
-                        if tx.send(line).is_err() { break; }
-                    }
-                    Err(_) => break,
-                }
-            }
-            full_log
-        });
-
-        // Wait for ===READY=== from the test-runner
-        let boot_timeout = Duration::from_secs(120);
-        let start = Instant::now();
-        loop {
-            if start.elapsed() > boot_timeout {
-                let _ = child.kill();
-                panic!("[qemu] Boot timed out waiting for ===READY===");
-            }
-            match rx.recv_timeout(Duration::from_secs(1)) {
-                Ok(line) if line.contains("===READY===") => {
-                    eprintln!("[qemu] Test runner ready");
-                    break;
-                }
-                Ok(_) => continue,
-                Err(RecvTimeoutError::Timeout) => continue,
-                Err(RecvTimeoutError::Disconnected) => {
-                    let status = child.wait();
-                    panic!("[qemu] QEMU died before ===READY=== (status: {status:?})");
-                }
-            }
-        }
-
-        QemuInstance {
-            child,
-            stdin,
-            rx,
-            _reader_thread: reader_thread,
-        }
+    /// Flush QEMU's stdin.
+    pub fn flush_stdin(&mut self) {
+        self.stdin.flush().expect("Failed to flush QEMU stdin");
     }
 
     /// Run a single test by sending a `run` command over serial.
@@ -208,9 +253,19 @@ impl QemuInstance {
                             stdout,
                             error: Some(format!("kernel panic: {line}")),
                         };
-                    } else if in_test && !line.starts_with("[kernel] ") {
-                        stdout.push_str(&line);
-                        stdout.push('\n');
+                    } else if in_test {
+                        // Filter kernel log lines; handle partial lines where
+                        // test output and kernel log are merged (no trailing newline)
+                        if line.starts_with("[kernel] ") {
+                            // Pure kernel line, skip
+                        } else if let Some(idx) = line.find("[kernel] ") {
+                            // Test output merged with kernel log on same line
+                            stdout.push_str(&line[..idx]);
+                            stdout.push('\n');
+                        } else {
+                            stdout.push_str(&line);
+                            stdout.push('\n');
+                        }
                     }
                 }
                 Err(RecvTimeoutError::Timeout) => continue,

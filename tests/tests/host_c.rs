@@ -190,3 +190,4 @@ tinycc_test!(t157_sizeof_member, "157_sizeof_member");
 tinycc_test!(t158_vla, "158_vla");
 tinycc_test!(t159_va_list, "159_va_list");
 tinycc_test!(t160_global_variadic, "160_global_variadic");
+tinycc_test!(t200_variadic_float, "200_variadic_float");

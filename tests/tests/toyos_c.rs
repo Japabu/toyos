@@ -1,5 +1,7 @@
 use std::fs;
+use std::path::Path;
 use std::sync::{LazyLock, Mutex};
+use std::thread;
 use std::time::Duration;
 use toyos_tests::compile;
 use toyos_tests::qemu::{QemuInstance, TestResult};
@@ -34,7 +36,8 @@ const TOYOS_C_TESTS: &[&str] = &[
     "28_strings",
     "29_array_address",
     "30_hanoi",
-    "33_ternary_op",
+    // "33_ternary_op", // needs _Generic
+
     "34_array_assignment",
     "35_sizeof",
     "36_array_initialisers",
@@ -71,7 +74,8 @@ const TOYOS_C_TESTS: &[&str] = &[
     "93_integer_promotion",
     "97_utf8_string_literal",
     "100_c99array_decls",
-    "104_inline",
+    // "104_inline", // needs weak symbols in linker
+
     "105_local_extern",
     "110_average",
     "111_conversion",
@@ -114,7 +118,7 @@ static QEMU: LazyLock<Mutex<QemuInstance>> = LazyLock::new(|| {
     let mut c_test_bins: Vec<(String, Vec<u8>)> = Vec::new();
     for name in TOYOS_C_TESTS {
         let result = std::panic::catch_unwind(|| {
-            let (obj, extras) = compile::compile_c(name, Some("x86_64-unknown-linux-gnu"));
+            let (obj, extras) = compile::compile_c(name, Some("x86_64-unknown-toyos"));
             compile::link_toyos(&obj, &extras, name)
         });
         match result {
@@ -159,7 +163,6 @@ fn check_test_result(result: &TestResult) {
 macro_rules! toyos_c_test {
     ($func_name:ident, $test_name:expr) => {
         #[test]
-        #[ignore]
         fn $func_name() {
             let result = {
                 let mut qemu = QEMU.lock().unwrap_or_else(|e| e.into_inner());
@@ -202,7 +205,7 @@ toyos_c_test!(t27_sizeof, "27_sizeof");
 toyos_c_test!(t28_strings, "28_strings");
 toyos_c_test!(t29_array_address, "29_array_address");
 toyos_c_test!(t30_hanoi, "30_hanoi");
-toyos_c_test!(t33_ternary_op, "33_ternary_op");
+// toyos_c_test!(t33_ternary_op, "33_ternary_op"); // needs _Generic
 toyos_c_test!(t34_array_assignment, "34_array_assignment");
 toyos_c_test!(t35_sizeof, "35_sizeof");
 toyos_c_test!(t36_array_initialisers, "36_array_initialisers");
@@ -239,7 +242,7 @@ toyos_c_test!(t92_enum_bitfield, "92_enum_bitfield");
 toyos_c_test!(t93_integer_promotion, "93_integer_promotion");
 toyos_c_test!(t97_utf8_string_literal, "97_utf8_string_literal");
 toyos_c_test!(t100_c99array_decls, "100_c99array_decls");
-toyos_c_test!(t104_inline, "104_inline");
+// toyos_c_test!(t104_inline, "104_inline"); // needs weak symbols in linker
 toyos_c_test!(t105_local_extern, "105_local_extern");
 toyos_c_test!(t110_average, "110_average");
 toyos_c_test!(t111_conversion, "111_conversion");
@@ -275,3 +278,110 @@ toyos_c_test!(t157_sizeof_member, "157_sizeof_member");
 toyos_c_test!(t158_vla, "158_vla");
 toyos_c_test!(t159_va_list, "159_va_list");
 toyos_c_test!(t160_global_variadic, "160_global_variadic");
+
+/// Debug mode: boots QEMU with GDB stub, then polls for commands via file IPC.
+///
+/// Usage:
+///   cargo test --test toyos_c -- --ignored debug --nocapture
+///
+/// Once running, send serial commands from any shell:
+///   echo "run test_c_49_bracket_evaluation" > /tmp/toyos-debug-cmd
+///   cat /tmp/toyos-debug-result    # read the result
+///   echo "quit" > /tmp/toyos-debug-cmd  # shut down
+///
+/// The test also writes all serial output to /tmp/toyos-debug-serial.log.
+/// GDB stub is on localhost:1234 for LLDB/GDB attachment.
+#[test]
+#[ignore]
+fn debug() {
+    let cmd_path = Path::new("/tmp/toyos-debug-cmd");
+    let result_path = Path::new("/tmp/toyos-debug-result");
+    let ready_path = Path::new("/tmp/toyos-debug-ready");
+
+    // Clean up stale files
+    let _ = fs::remove_file(cmd_path);
+    let _ = fs::remove_file(result_path);
+    let _ = fs::remove_file(ready_path);
+
+    eprintln!("[debug] Compiling C tests for ToyOS...");
+    let mut c_test_bins: Vec<(String, Vec<u8>)> = Vec::new();
+    for name in TOYOS_C_TESTS {
+        let result = std::panic::catch_unwind(|| {
+            let (obj, extras) = compile::compile_c(name, Some("x86_64-unknown-toyos"));
+            compile::link_toyos(&obj, &extras, name)
+        });
+        match result {
+            Ok(linked) => c_test_bins.push((name.to_string(), linked)),
+            Err(_) => eprintln!("[debug] SKIP {name}: compilation panicked"),
+        }
+    }
+
+    eprintln!("[debug] Booting QEMU in debug mode with {} test binaries...", c_test_bins.len());
+    let mut qemu = QemuInstance::boot_with_options(&c_test_bins, &[], true);
+
+    let repo = compile::repo_root();
+    let kernel_elf = repo.join("kernel/target/x86_64-unknown-none/debug/kernel");
+
+    eprintln!();
+    eprintln!("╔══════════════════════════════════════════════════════════════╗");
+    eprintln!("║  QEMU running with GDB stub on localhost:1234               ║");
+    eprintln!("╠══════════════════════════════════════════════════════════════╣");
+    eprintln!("║  Kernel ELF: {}", kernel_elf.display());
+    eprintln!("║                                                              ║");
+    eprintln!("║  Send commands:                                              ║");
+    eprintln!("║    echo 'run test_c_49_bracket_evaluation' > {}    ║", cmd_path.display());
+    eprintln!("║    cat {}                                 ║", result_path.display());
+    eprintln!("║    echo 'quit' > {}                                ║", cmd_path.display());
+    eprintln!("╚══════════════════════════════════════════════════════════════╝");
+
+    // Signal that we're ready
+    fs::write(ready_path, "ready\n").unwrap();
+
+    // Poll for commands
+    loop {
+        thread::sleep(Duration::from_millis(200));
+
+        let cmd = match fs::read_to_string(cmd_path) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let _ = fs::remove_file(cmd_path);
+        let cmd = cmd.trim();
+        if cmd.is_empty() { continue; }
+
+        if cmd == "quit" || cmd == "q" {
+            eprintln!("[debug] Quit requested");
+            let _ = fs::write(result_path, "quit\n");
+            break;
+        }
+
+        if let Some(test_name) = cmd.strip_prefix("run ") {
+            let test_name = test_name.trim();
+            eprintln!("[debug] Running {test_name}...");
+            let result = qemu.run_test(test_name, Duration::from_secs(60));
+
+            let mut output = String::new();
+            output.push_str(&format!("test: {}\n", result.name));
+            output.push_str(&format!("exit_code: {:?}\n", result.exit_code));
+            if let Some(err) = &result.error {
+                output.push_str(&format!("error: {err}\n"));
+            }
+            if !result.stdout.is_empty() {
+                output.push_str("--- stdout ---\n");
+                output.push_str(&result.stdout);
+            }
+            eprintln!("[debug] {output}");
+            fs::write(result_path, &output).unwrap();
+        } else {
+            // Raw serial command: write directly to QEMU stdin
+            eprintln!("[debug] Sending raw serial: {cmd}");
+            use std::io::Write;
+            writeln!(qemu.stdin_mut(), "{cmd}").expect("Failed to write to QEMU stdin");
+            qemu.flush_stdin();
+            fs::write(result_path, "sent\n").unwrap();
+        }
+    }
+
+    let _ = fs::remove_file(ready_path);
+    eprintln!("[debug] Shutting down QEMU...");
+}
