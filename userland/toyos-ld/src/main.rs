@@ -4,7 +4,7 @@ use std::{env, fs, process};
 
 fn main() {
     let args = parse_args();
-    let objects = match toyos_ld::resolve_libs(&args.inputs, &args.lib_paths, &args.libs) {
+    let objects = match toyos_ld::resolve_libs_with_entry(&args.inputs, &args.lib_paths, &args.libs, Some(&args.entry)) {
         Ok(o) => o,
         Err(e) => {
             eprint!("toyos-ld: {e}");

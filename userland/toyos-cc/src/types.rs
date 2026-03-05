@@ -105,7 +105,7 @@ impl CType {
         use Signedness::*;
         match self {
             CType::Bool | CType::Pointer(_) => Unsigned,
-            CType::Enum(_) => Signed,
+            CType::Enum(def) => if def.variants.iter().all(|(_, v)| *v >= 0) { Unsigned } else { Signed },
             CType::Char(s) | CType::Short(s) | CType::Int(s)
             | CType::Long(s) | CType::LongLong(s) | CType::Int128(s) => *s,
             CType::Void | CType::Float | CType::Double | CType::LongDouble

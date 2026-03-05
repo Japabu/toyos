@@ -190,7 +190,10 @@ impl LaidOut<PeLayout> {
 
 impl LaidOut<MachOLayout> {
     fn relocate_and_emit(mut self, entry: &str) -> Result<Vec<u8>, LinkError> {
-        let params = MachORelocParams { got: &self.layout.got };
+        let params = MachORelocParams {
+            got: &self.layout.got,
+            tls_template_start: self.layout.tls_template_start,
+        };
         let reloc_output = apply_relocs_macho(&mut self.state, &params)?;
 
         let mut bind_entries: Vec<(String, u64)> = self.layout.got_entries.iter()
@@ -300,10 +303,23 @@ pub fn link_full(
 /// Resolve library names (-l flags) against search paths (-L flags),
 /// reading and extracting archives. Only includes archive members that
 /// define symbols needed by already-included objects (transitive pull-in).
+/// The entry point symbol is treated as an initial undefined, ensuring the
+/// archive member that defines it (e.g. std's `_start`) gets pulled in.
 pub fn resolve_libs(
     inputs: &[PathBuf],
     lib_paths: &[PathBuf],
     libs: &[String],
+) -> Result<Vec<(String, Vec<u8>)>, LinkError> {
+    resolve_libs_with_entry(inputs, lib_paths, libs, None)
+}
+
+/// Like `resolve_libs`, but seeds the undefined symbol set with `entry` so
+/// that archive members providing the entry point are pulled in.
+pub fn resolve_libs_with_entry(
+    inputs: &[PathBuf],
+    lib_paths: &[PathBuf],
+    libs: &[String],
+    entry: Option<&str>,
 ) -> Result<Vec<(String, Vec<u8>)>, LinkError> {
     use std::collections::HashSet;
 
@@ -335,6 +351,11 @@ pub fn resolve_libs(
     // Scan direct objects for defined/referenced symbols
     let mut defined = HashSet::new();
     let mut undefined = HashSet::new();
+    // The entry point is an implicit undefined — ensure its archive member
+    // gets pulled in even if no direct object references it.
+    if let Some(entry) = entry {
+        undefined.insert(entry.to_string());
+    }
     for (_, data) in &objects {
         let (defs, refs) = scan_symbols(data);
         defined.extend(defs);
@@ -456,57 +477,39 @@ fn create_call_stubs(state: &mut collect::LinkState) {
 }
 
 /// Rewrite `movq sym@GOTPCREL(%rip), %reg` to `leaq sym.__stub(%rip), %reg`
-/// for dynamic symbols on x86_64. Cranelift loads function addresses from GOT
+/// for function symbols on x86_64. Cranelift loads function addresses from GOT
 /// then does `call *%reg`. By making the register hold the stub address instead,
-/// all calls to dynamic functions go through stubs that set %al for the x86_64
-/// SysV variadic calling convention.
+/// all calls go through stubs that set %al for the x86_64 SysV variadic ABI.
+/// Non-variadic callees ignore %al, so this is safe for all function calls.
+///
+/// Only function symbols (defined in Code sections or Dynamic imports) are
+/// rewritten. Data/string GOT loads are left untouched.
 fn rewrite_x86_64_got_calls(
     state: &mut collect::LinkState,
     stub_syms: &mut std::collections::BTreeSet<String>,
 ) {
-    // Collect indices of GOT_LOAD relocations targeting dynamic symbols
+    let is_function_symbol = |name: &str| -> bool {
+        match state.globals.get(name) {
+            Some(SymbolDef::Dynamic) => true,
+            Some(SymbolDef::Defined { section, .. }) => {
+                state.sections[*section].kind == SectionKind::Code
+            }
+            None => false,
+        }
+    };
+
     let rewrite_indices: Vec<usize> = state.relocs.iter().enumerate()
         .filter(|(_, r)| {
             if !matches!(r.r_type, RelocType::X86Gotpcrel | RelocType::X86Gotpcrelx | RelocType::X86RexGotpcrelx) {
                 return false;
             }
-            if !matches!(state.globals.get(r.target.name()), Some(SymbolDef::Dynamic)) {
-                return false;
-            }
-            // Verify the instruction is MOV (opcode 8B at offset-2).
-            // Encoding: [REX 48/4C] [8B] [ModRM] [disp32×4]
-            //   REX at off-3, opcode at off-2, ModRM at off-1, disp32 at off..off+3
+            // Only rewrite MOV instructions (opcode 8B at offset-2).
             let sec = &state.sections[r.section];
             let off = r.offset as usize;
             if off < 2 || sec.data.get(off - 2).copied() != Some(0x8B) {
                 return false;
             }
-            // Skip if the next instruction dereferences the loaded register.
-            // Cranelift emits `movq sym@GOT(%rip), %reg; movq (%reg), %dst`
-            // for global variable access — rewriting that would break data loads.
-            // Function calls have arg setup or `call *%reg` after the GOT load.
-            let modrm = sec.data[off - 1];
-            let dst_reg = (modrm >> 3) & 7; // register field from ModRM
-            let rex = sec.data.get(off - 3).copied().unwrap_or(0);
-            let dst_reg_full = dst_reg | if rex & 0x04 != 0 { 8 } else { 0 }; // REX.R
-            // Check at off+4 (after disp32): [optional REX] 8B [ModRM with rm=dst_reg, mod=00]
-            let next = off + 4;
-            let (next_rex, next_op_off) = match sec.data.get(next) {
-                Some(&b) if (0x40..=0x4F).contains(&b) => (b, next + 1),
-                _ => (0u8, next),
-            };
-            if sec.data.get(next_op_off).copied() == Some(0x8B) {
-                if let Some(&next_modrm) = sec.data.get(next_op_off + 1) {
-                    let next_mod = next_modrm >> 6;
-                    let next_rm = next_modrm & 7;
-                    let next_rm_full = next_rm | if next_rex & 0x01 != 0 { 8 } else { 0 };
-                    // mod=00 rm=reg means indirect through reg: `movq (%reg), ...`
-                    if next_mod == 0 && next_rm_full == dst_reg_full {
-                        return false; // data access pattern — don't rewrite
-                    }
-                }
-            }
-            true
+            is_function_symbol(r.target.name())
         })
         .map(|(i, _)| i)
         .collect();

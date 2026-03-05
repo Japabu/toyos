@@ -1,4 +1,4 @@
-use crate::collect::{InputReloc, LinkState, RelocType, SectionIdx, SymbolDef, SymbolRef};
+use crate::collect::{InputReloc, LinkState, RelocType, SectionIdx, SectionKind, SymbolDef, SymbolRef};
 use crate::emit_pe::PeLayout;
 use crate::LinkError;
 use std::collections::{HashMap, HashSet};
@@ -123,6 +123,20 @@ fn apply_one_reloc(
                 LinkError::UndefinedSymbols(vec![reloc.target.name().to_string()])
             })?;
             let value = got_slot as i64 + reloc.addend - reloc_vaddr as i64;
+            check_i32(value, reloc)?;
+            write_i32(state, reloc.section, reloc.offset, value as i32);
+            Ok(false)
+        }
+        RelocType::X86Tlv => {
+            // Mach-O X86_64_RELOC_TLV: rewrite `movq disp(%rip), %reg` to
+            // `leaq disp(%rip), %reg` so the register gets the ADDRESS of the
+            // TLV descriptor, not its contents. Change opcode 0x8B → 0x8D.
+            let sec = &mut state.sections[reloc.section];
+            let op_off = reloc.offset as usize - 2;
+            if sec.data[op_off] == 0x8b {
+                sec.data[op_off] = 0x8d; // movq → leaq
+            }
+            let value = sym_addr as i64 + reloc.addend - reloc_vaddr as i64;
             check_i32(value, reloc)?;
             write_i32(state, reloc.section, reloc.offset, value as i32);
             Ok(false)
@@ -256,6 +270,7 @@ pub(crate) fn apply_relocs(
             | RelocType::X86Gotpcrel | RelocType::X86Gotpcrelx
             | RelocType::X86RexGotpcrelx
             | RelocType::X86Tpoff32 | RelocType::X86Gottpoff
+            | RelocType::X86Tlv
             | RelocType::Aarch64Abs64 | RelocType::Aarch64Abs32
             | RelocType::Aarch64Prel32
             | RelocType::Aarch64Call26 | RelocType::Aarch64Jump26
@@ -267,7 +282,8 @@ pub(crate) fn apply_relocs(
             | RelocType::Aarch64MovwUabsG2Nc | RelocType::Aarch64MovwUabsG3
             | RelocType::Aarch64AdrGotPage | RelocType::Aarch64Ld64GotLo12Nc
             | RelocType::Aarch64GotPcrel32
-            | RelocType::Aarch64TlvpLoadPage21 => {}
+            | RelocType::Aarch64TlvpLoadPage21
+            | RelocType::Aarch64TlvpLoadPageoff12 => {}
         }
     }
 
@@ -315,6 +331,7 @@ pub(crate) fn apply_relocs(
             | RelocType::X86_32 | RelocType::X86_32S
             | RelocType::X86Gotpcrel | RelocType::X86Gotpcrelx
             | RelocType::X86RexGotpcrelx
+            | RelocType::X86Tlv
             | RelocType::Aarch64Abs64 | RelocType::Aarch64Abs32
             | RelocType::Aarch64Prel32
             | RelocType::Aarch64Call26 | RelocType::Aarch64Jump26
@@ -326,7 +343,8 @@ pub(crate) fn apply_relocs(
             | RelocType::Aarch64MovwUabsG2Nc | RelocType::Aarch64MovwUabsG3
             | RelocType::Aarch64AdrGotPage | RelocType::Aarch64Ld64GotLo12Nc
             | RelocType::Aarch64GotPcrel32
-            | RelocType::Aarch64TlvpLoadPage21 => {
+            | RelocType::Aarch64TlvpLoadPage21
+            | RelocType::Aarch64TlvpLoadPageoff12 => {
                 let is_abs = apply_one_reloc(state, reloc, sym_addr, reloc_vaddr, params.got)?;
                 if is_abs && params.record_relatives {
                     relatives.push((reloc_vaddr, sym_addr as i64 + reloc.addend));
@@ -503,8 +521,22 @@ fn apply_one_reloc_aarch64(
             patch_aarch64_ldr_imm12(state, reloc.section, reloc.offset, value, 3);
             Ok(false)
         }
-        // TLV (thread-local variable) page/offset — same addressing math as
-        // PAGE21/ADD12 but targeting a TLV descriptor in __thread_vars.
+        // TLV pageoff12: compiler emits LDR for the descriptor address,
+        // but since the descriptor is in the same image we relax to ADD.
+        RelocType::Aarch64TlvpLoadPageoff12 => {
+            let value = ((sym_addr as i64 + reloc.addend) & 0xFFF) as u32;
+            // Rewrite LDR to ADD Xd, Xn, #imm12
+            let sec = &state.sections[reloc.section.0];
+            let insn_off = reloc.offset as usize;
+            let old_insn = u32::from_le_bytes(sec.data[insn_off..insn_off+4].try_into().unwrap());
+            let rd = old_insn & 0x1F;
+            let rn = (old_insn >> 5) & 0x1F;
+            let new_insn: u32 = 0x91000000 | (value << 10) | (rn << 5) | rd;
+            state.sections[reloc.section.0].data[insn_off..insn_off+4]
+                .copy_from_slice(&new_insn.to_le_bytes());
+            Ok(false)
+        }
+        // TLV page21: same as ADRP but targeting a TLV descriptor.
         RelocType::Aarch64TlvpLoadPage21 => {
             let sym_page = (sym_addr as i64 + reloc.addend) & !0xFFF;
             let pc_page = reloc_vaddr as i64 & !0xFFF;
@@ -575,6 +607,9 @@ fn patch_aarch64_ldr_imm12(state: &mut LinkState, sec: SectionIdx, offset: u64, 
 /// Parameters for Mach-O relocation application.
 pub(crate) struct MachORelocParams<'a> {
     pub(crate) got: &'a HashMap<SymbolRef, u64>,
+    /// Start of the TLS template (__thread_data vmaddr). Pointers from __thread_vars
+    /// into __thread_data/__thread_bss are stored as template-relative offsets.
+    pub(crate) tls_template_start: u64,
 }
 
 /// Apply relocations for Mach-O output. Returns rebase entries (internal absolute
@@ -656,6 +691,36 @@ pub(crate) fn apply_relocs_macho(
             }
         };
 
+        // TLV descriptor offset fixup: pointers from __thread_vars into
+        // __thread_data/__thread_bss must be template-relative offsets,
+        // not absolute virtual addresses.
+        let in_tlv_descriptors = sec.kind == SectionKind::TlsVariables;
+        let target_is_tls_data = match &reloc.target {
+            SymbolRef::Global(name) => matches!(
+                state.globals.get(name),
+                Some(SymbolDef::Defined { section, .. })
+                    if matches!(state.sections[section.0].kind, SectionKind::Tls | SectionKind::TlsBss)
+            ),
+            SymbolRef::Local(oi, name) => {
+                let def = state.globals.get(name)
+                    .or_else(|| state.locals.get(&(*oi, name.clone())));
+                matches!(
+                    def,
+                    Some(SymbolDef::Defined { section, .. })
+                        if matches!(state.sections[section.0].kind, SectionKind::Tls | SectionKind::TlsBss)
+                )
+            }
+        };
+        let sym_addr = if in_tlv_descriptors && target_is_tls_data {
+            // Convert absolute vaddr to TLS template offset
+            let offset = sym_addr - params.tls_template_start;
+            write_u64(state, reloc.section, reloc.offset, (offset as i64 + reloc.addend) as u64);
+            // No rebase — this is a template offset, not a pointer
+            continue;
+        } else {
+            sym_addr
+        };
+
         let is_abs = match reloc.r_type {
             // AArch64 relocations
             RelocType::Aarch64Abs64 | RelocType::Aarch64Abs32
@@ -669,7 +734,8 @@ pub(crate) fn apply_relocs_macho(
             | RelocType::Aarch64MovwUabsG2Nc | RelocType::Aarch64MovwUabsG3
             | RelocType::Aarch64AdrGotPage | RelocType::Aarch64Ld64GotLo12Nc
             | RelocType::Aarch64GotPcrel32
-            | RelocType::Aarch64TlvpLoadPage21 => {
+            | RelocType::Aarch64TlvpLoadPage21
+            | RelocType::Aarch64TlvpLoadPageoff12 => {
                 apply_one_reloc_aarch64(state, reloc, sym_addr, reloc_vaddr, params.got)?
             }
             // x86-64 relocations
@@ -680,7 +746,8 @@ pub(crate) fn apply_relocs_macho(
             | RelocType::X86Gotpcrelx
             | RelocType::X86RexGotpcrelx
             | RelocType::X86_32
-            | RelocType::X86_32S => {
+            | RelocType::X86_32S
+            | RelocType::X86Tlv => {
                 apply_one_reloc(state, reloc, sym_addr, reloc_vaddr, params.got)?
             }
             other => return Err(LinkError::UnsupportedRelocation {

@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{LazyLock, Mutex};
 use std::{env, fs};
@@ -10,13 +10,6 @@ fn toyos_cc() -> PathBuf {
 
 fn testcases_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testcases/tinycc")
-}
-
-fn read_object(path: &Path) -> (String, Vec<u8>) {
-    let data = fs::read(path).unwrap_or_else(|e| {
-        panic!("cannot read {}: {e}", path.display());
-    });
-    (path.display().to_string(), data)
 }
 
 /// Path to the toyos-libc directory (sibling of toyos-cc).
@@ -87,7 +80,8 @@ fn run_test_with_target(name: &str, args: &[&str], target: Option<&str>) {
     let expected = fs::read_to_string(&expect_file).unwrap();
 
     let suffix = target.map_or("".to_string(), |t| format!("-{t}"));
-    let tmp = env::temp_dir().join(format!("toyos-cc-test{suffix}-{name}"));
+    let pid = std::process::id();
+    let tmp = env::temp_dir().join(format!("toyos-cc-test{suffix}-{name}-{pid}"));
     let obj = tmp.with_extension("o");
     let bin = tmp.with_extension("bin");
 
@@ -144,13 +138,15 @@ fn run_test_with_target(name: &str, args: &[&str], target: Option<&str>) {
         }
     }
 
-    // Link (include toyos-libc staticlib for the matching target)
+    // Link
     let libc_target = target.unwrap_or(host_target());
-    let mut objects = vec![read_object(&obj)];
+    let libc_path = libc_archive(libc_target);
+    let libc_data = fs::read(&libc_path).unwrap();
+    let mut objects: Vec<(String, Vec<u8>)> = vec![(obj.display().to_string(), fs::read(&obj).unwrap())];
     for extra in &extra_objs {
-        objects.push(read_object(extra));
+        objects.push((extra.display().to_string(), fs::read(extra).unwrap()));
     }
-    objects.push(read_object(&libc_archive(libc_target)));
+    objects.push((libc_path.display().to_string(), libc_data));
     let _ = fs::remove_file(&obj);
     for extra in &extra_objs {
         let _ = fs::remove_file(extra);
@@ -170,9 +166,6 @@ fn run_test_with_target(name: &str, args: &[&str], target: Option<&str>) {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
     }
-
-    // DEBUG: save binary for inspection
-    let _ = fs::copy(&bin, "/tmp/toyos-cc-debug.bin");
 
     // Run (use arch -x86_64 for x86_64 cross-compilation on ARM64 Mac)
     let is_x86_64_cross = target.map_or(false, |t| t.starts_with("x86_64"));

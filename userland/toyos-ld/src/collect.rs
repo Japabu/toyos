@@ -108,6 +108,7 @@ pub enum RelocType {
     X86Tlsgd,
     X86Tlsld,
     X86Dtpoff32,
+    X86Tlv,
     // AArch64
     Aarch64Abs64,
     Aarch64Abs32,
@@ -129,6 +130,7 @@ pub enum RelocType {
     Aarch64Ld64GotLo12Nc,
     Aarch64GotPcrel32,
     Aarch64TlvpLoadPage21,
+    Aarch64TlvpLoadPageoff12,
 }
 
 impl std::fmt::Display for RelocType {
@@ -147,6 +149,7 @@ impl std::fmt::Display for RelocType {
             RelocType::X86Tlsgd => write!(f, "R_X86_64_TLSGD"),
             RelocType::X86Tlsld => write!(f, "R_X86_64_TLSLD"),
             RelocType::X86Dtpoff32 => write!(f, "R_X86_64_DTPOFF32"),
+            RelocType::X86Tlv => write!(f, "X86_64_RELOC_TLV"),
             RelocType::Aarch64Abs64 => write!(f, "R_AARCH64_ABS64"),
             RelocType::Aarch64Abs32 => write!(f, "R_AARCH64_ABS32"),
             RelocType::Aarch64Prel32 => write!(f, "R_AARCH64_PREL32"),
@@ -167,6 +170,7 @@ impl std::fmt::Display for RelocType {
             RelocType::Aarch64Ld64GotLo12Nc => write!(f, "R_AARCH64_LD64_GOT_LO12_NC"),
             RelocType::Aarch64GotPcrel32 => write!(f, "ARM64_RELOC_POINTER_TO_GOT"),
             RelocType::Aarch64TlvpLoadPage21 => write!(f, "ARM64_RELOC_TLVP_LOAD_PAGE21"),
+            RelocType::Aarch64TlvpLoadPageoff12 => write!(f, "ARM64_RELOC_TLVP_LOAD_PAGEOFF12"),
         }
     }
 }
@@ -298,36 +302,41 @@ fn resolve_reloc_target(
     state: &mut LinkState,
     is_macho: bool,
 ) -> Option<SymbolRef> {
-    let sym_idx = match reloc.target() {
-        read::RelocationTarget::Symbol(idx) => idx,
-        // Absolute/Section targets have no symbol to resolve (non_exhaustive enum)
-        _ => return None,
-    };
-    let sym = obj.symbol_by_index(sym_idx).ok()?;
-    let name = sym.name().unwrap_or("");
-    let name = &demangle_macho(name, is_macho);
-
-    // Section symbols need unique synthetic names because COFF objects can have
-    // multiple sections with the same name (e.g. many `.rdata` COMDAT sections).
-    let is_section_sym = name.is_empty() || sym.kind() == read::SymbolKind::Section;
-    if is_section_sym {
-        let si = match sym.section() {
-            read::SymbolSection::Section(si) => si,
-            // Undefined/Absolute/Common symbols have no section (non_exhaustive enum)
-            _ => return None,
-        };
+    // Helper: create/reuse a synthetic section symbol with value=0 at the section base.
+    let make_section_sym = |si: object::SectionIndex, state: &mut LinkState| -> Option<SymbolRef> {
         let &gsec = sec_map.get(&(obj_idx, si))?;
         let syn = format!("__section_sym_{}_{}", obj_idx.0, gsec.0);
-        let sec_addr = obj.section_by_index(si).map(|s| s.address()).unwrap_or(0);
         state.locals.entry((obj_idx, syn.clone())).or_insert(SymbolDef::Defined {
             section: gsec,
-            value: sym.address() - sec_addr,
+            value: 0,
         });
         Some(SymbolRef::Local(obj_idx, syn))
-    } else if sym.is_global() || sym.is_undefined() {
-        Some(SymbolRef::Global(name.to_string()))
-    } else {
-        Some(SymbolRef::Local(obj_idx, name.to_string()))
+    };
+
+    match reloc.target() {
+        read::RelocationTarget::Symbol(sym_idx) => {
+            let sym = obj.symbol_by_index(sym_idx).ok()?;
+            let name = sym.name().unwrap_or("");
+            let name = &demangle_macho(name, is_macho);
+
+            // Section symbols need unique synthetic names because COFF objects can have
+            // multiple sections with the same name (e.g. many `.rdata` COMDAT sections).
+            let is_section_sym = name.is_empty() || sym.kind() == read::SymbolKind::Section;
+            if is_section_sym {
+                let si = match sym.section() {
+                    read::SymbolSection::Section(si) => si,
+                    _ => return None,
+                };
+                make_section_sym(si, state)
+            } else if sym.is_global() || sym.is_undefined() {
+                Some(SymbolRef::Global(name.to_string()))
+            } else {
+                Some(SymbolRef::Local(obj_idx, name.to_string()))
+            }
+        }
+        // Mach-O r_extern=0: relocation targets a section directly (e.g. __literal8).
+        read::RelocationTarget::Section(si) => make_section_sym(si, state),
+        _ => None,
     }
 }
 
@@ -582,7 +591,27 @@ fn collect_object(
                     16 => i16::from_le_bytes(data[off..off + 2].try_into().unwrap()) as i64,
                     sz => panic!("unexpected implicit addend size {sz} bits for {:?}", sym_name),
                 };
-                reloc.addend() + implicit
+                // Mach-O section-targeted relocations (r_extern=0): the implicit
+                // addend encodes the full pre-link displacement including absolute
+                // section addresses from the object file. Convert to an offset
+                // within the target section so the linker can recompute the
+                // displacement from output vaddrs.
+                if let read::RelocationTarget::Section(target_si) = reloc.target() {
+                    let target_sec_addr = obj.section_by_index(target_si)
+                        .map(|s| s.address()).unwrap_or(0) as i64;
+                    if reloc.kind() == read::RelocationKind::Relative {
+                        // PC-relative: implicit = target_addr - source_addr - correction
+                        // where source_addr = source_sec.addr + reloc_offset.
+                        // Recover offset_in_target, then combine with the object
+                        // crate's addend (which encodes the -correction term).
+                        implicit + section.address() as i64 + offset as i64 - target_sec_addr
+                    } else {
+                        // Absolute: implicit = target_sec.addr + offset_in_target
+                        implicit - target_sec_addr
+                    }
+                } else {
+                    reloc.addend() + implicit
+                }
             } else {
                 reloc.addend()
             };
@@ -679,7 +708,7 @@ fn macho_arm64_to_reloc_type(r_type: u8, r_length: u8, insn: u32) -> Option<Relo
         macho::ARM64_RELOC_GOT_LOAD_PAGEOFF12 => RelocType::Aarch64Ld64GotLo12Nc,
         macho::ARM64_RELOC_POINTER_TO_GOT if r_length == 2 => RelocType::Aarch64GotPcrel32,
         macho::ARM64_RELOC_TLVP_LOAD_PAGE21 => RelocType::Aarch64TlvpLoadPage21,
-        macho::ARM64_RELOC_TLVP_LOAD_PAGEOFF12 => classify_pageoff12(insn),
+        macho::ARM64_RELOC_TLVP_LOAD_PAGEOFF12 => RelocType::Aarch64TlvpLoadPageoff12,
         _ => return None,
     })
 }
@@ -728,6 +757,7 @@ fn macho_x86_64_to_reloc_type(r_type: u8, r_length: u8) -> Option<RelocType> {
         macho::X86_64_RELOC_BRANCH => RelocType::X86Plt32,
         macho::X86_64_RELOC_GOT_LOAD => RelocType::X86Gotpcrelx,
         macho::X86_64_RELOC_GOT => RelocType::X86Gotpcrel,
+        macho::X86_64_RELOC_TLV => RelocType::X86Tlv,
         _ => return None,
     })
 }
@@ -1122,7 +1152,7 @@ pub(crate) fn merge_string_sections(state: &mut LinkState) {
         };
         if let Some(SymbolDef::Defined { section: old_sec, value: old_val }) = old_def {
             if !merge_set.contains(old_sec) { continue; }
-            let old_offset = old_val + reloc.addend as u64;
+            let old_offset = old_val.wrapping_add(reloc.addend as u64);
             if let Some(&new_offset) = offset_remap.get(&(*old_sec, old_offset)) {
                 let new_def = match &reloc.target {
                     SymbolRef::Global(name) => state.globals.get(name),

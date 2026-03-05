@@ -103,6 +103,160 @@ fn format_unsigned<'a>(val: u64, base: u64, upper: bool, buf: &'a mut [u8]) -> &
     unsafe { core::str::from_utf8_unchecked(&buf[pos..]) }
 }
 
+/// Write an unsigned integer into `buf` starting at `pos`, return new pos.
+fn write_u64_at(buf: &mut [u8], pos: usize, val: u64) -> usize {
+    let mut tmp = [0u8; 24];
+    let mut t = tmp.len();
+    if val == 0 {
+        t -= 1;
+        tmp[t] = b'0';
+    } else {
+        let mut v = val;
+        while v > 0 {
+            t -= 1;
+            tmp[t] = b'0' + (v % 10) as u8;
+            v /= 10;
+        }
+    }
+    let len = tmp.len() - t;
+    buf[pos..pos + len].copy_from_slice(&tmp[t..]);
+    pos + len
+}
+
+/// Format a float in %f style into `buf` starting at `pos`. Returns new pos.
+fn write_float_f(buf: &mut [u8], pos: usize, abs_val: f64, precision: usize) -> usize {
+    let mut p = pos;
+    let int_part = abs_val.floor();
+    let frac = abs_val - int_part;
+
+    let mut mul = 1u64;
+    for _ in 0..precision { mul *= 10; }
+    let mut frac_int = (frac * mul as f64 + 0.5) as u64;
+    let mut int_val = int_part as u64;
+    if frac_int >= mul {
+        int_val += 1;
+        frac_int -= mul;
+    }
+
+    p = write_u64_at(buf, p, int_val);
+
+    if precision > 0 {
+        buf[p] = b'.'; p += 1;
+        // Write fractional digits with leading zeros
+        let mut frac_tmp = [0u8; 24];
+        let mut ft = frac_tmp.len();
+        if frac_int == 0 {
+            ft -= 1;
+            frac_tmp[ft] = b'0';
+        } else {
+            let mut v = frac_int;
+            while v > 0 {
+                ft -= 1;
+                frac_tmp[ft] = b'0' + (v % 10) as u8;
+                v /= 10;
+            }
+        }
+        let frac_len = frac_tmp.len() - ft;
+        for _ in 0..(precision - frac_len) { buf[p] = b'0'; p += 1; }
+        buf[p..p + frac_len].copy_from_slice(&frac_tmp[ft..]);
+        p += frac_len;
+    }
+    p
+}
+
+/// Format a float in %e style into `buf` starting at `pos`. Returns new pos.
+fn write_float_e(buf: &mut [u8], pos: usize, abs_val: f64, precision: usize, upper: bool) -> usize {
+    let mut p = pos;
+    if abs_val == 0.0 {
+        p = write_float_f(buf, p, 0.0, precision);
+        buf[p] = if upper { b'E' } else { b'e' }; p += 1;
+        buf[p] = b'+'; p += 1;
+        buf[p] = b'0'; p += 1;
+        buf[p] = b'0'; p += 1;
+        return p;
+    }
+
+    let mut exp = abs_val.log10().floor() as i32;
+    let mut mantissa = abs_val / 10f64.powi(exp);
+    // Correct floating-point imprecision
+    if mantissa >= 10.0 { mantissa /= 10.0; exp += 1; }
+    if mantissa < 1.0 { mantissa *= 10.0; exp -= 1; }
+
+    p = write_float_f(buf, p, mantissa, precision);
+    buf[p] = if upper { b'E' } else { b'e' }; p += 1;
+    buf[p] = if exp < 0 { b'-' } else { b'+' }; p += 1;
+    let abs_exp = exp.unsigned_abs();
+    if abs_exp >= 100 {
+        buf[p] = b'0' + (abs_exp / 100) as u8; p += 1;
+        buf[p] = b'0' + ((abs_exp / 10) % 10) as u8; p += 1;
+        buf[p] = b'0' + (abs_exp % 10) as u8; p += 1;
+    } else {
+        buf[p] = b'0' + (abs_exp / 10) as u8; p += 1;
+        buf[p] = b'0' + (abs_exp % 10) as u8; p += 1;
+    }
+    p
+}
+
+/// Format a float value (handles sign, NaN, inf, then dispatches to f/e/g).
+fn format_float<'a>(
+    val: f64, mode: u8, precision: Option<usize>,
+    plus: bool, space: bool, buf: &'a mut [u8; 512],
+) -> &'a str {
+    let mut p = 0;
+    let upper = mode == b'E' || mode == b'G' || mode == b'F';
+
+    if val.is_nan() {
+        let s = if upper { b"NAN" } else { b"nan" };
+        buf[..3].copy_from_slice(s);
+        return unsafe { core::str::from_utf8_unchecked(&buf[..3]) };
+    }
+
+    let negative = val.is_sign_negative();
+    let abs_val = val.abs();
+
+    if abs_val.is_infinite() {
+        if negative { buf[p] = b'-'; p += 1; }
+        else if plus { buf[p] = b'+'; p += 1; }
+        else if space { buf[p] = b' '; p += 1; }
+        let s = if upper { b"INF" } else { b"inf" };
+        buf[p..p + 3].copy_from_slice(s);
+        return unsafe { core::str::from_utf8_unchecked(&buf[..p + 3]) };
+    }
+
+    if negative { buf[p] = b'-'; p += 1; }
+    else if plus { buf[p] = b'+'; p += 1; }
+    else if space { buf[p] = b' '; p += 1; }
+
+    match mode | 0x20 {
+        b'f' => {
+            let prec = precision.unwrap_or(6);
+            p = write_float_f(buf, p, abs_val, prec);
+        }
+        b'e' => {
+            let prec = precision.unwrap_or(6);
+            p = write_float_e(buf, p, abs_val, prec, upper);
+        }
+        b'g' => {
+            let prec = precision.unwrap_or(6).max(1);
+            let exp = if abs_val == 0.0 { 0 } else { abs_val.log10().floor() as i32 };
+            if exp < -4 || exp >= prec as i32 {
+                p = write_float_e(buf, p, abs_val, prec - 1, upper);
+            } else {
+                let frac_prec = (prec as i32 - 1 - exp).max(0) as usize;
+                p = write_float_f(buf, p, abs_val, frac_prec);
+            }
+            // Strip trailing zeros after decimal point
+            if buf[..p].contains(&b'.') {
+                while p > 0 && buf[p - 1] == b'0' { p -= 1; }
+                if p > 0 && buf[p - 1] == b'.' { p -= 1; }
+            }
+        }
+        _ => unreachable!(),
+    }
+    // SAFETY: buf contains only ASCII
+    unsafe { core::str::from_utf8_unchecked(&buf[..p]) }
+}
+
 /// Core printf engine. Parses the format string as a byte slice.
 unsafe fn do_printf(buf: *mut u8, n: usize, fmt: *const u8, ap: &mut VaList<'_>) -> i32 {
     let fmt = core::slice::from_raw_parts(fmt, super::string::strlen(fmt));
@@ -168,6 +322,7 @@ unsafe fn do_printf(buf: *mut u8, n: usize, fmt: *const u8, ap: &mut VaList<'_>)
         // Length modifier
         let mut long = false;
         let mut long_long = false;
+        let mut long_double = false;
         match fmt[i] {
             b'l' => {
                 i += 1;
@@ -175,8 +330,10 @@ unsafe fn do_printf(buf: *mut u8, n: usize, fmt: *const u8, ap: &mut VaList<'_>)
             }
             b'h' => { i += 1; if i < fmt.len() && fmt[i] == b'h' { i += 1; } }
             b'z' | b't' | b'j' => { long = true; i += 1; }
+            b'L' => { long_double = true; i += 1; }
             _ => {}
         }
+        let _ = long_double; // our long double == double
 
         if i >= fmt.len() { break; }
 
@@ -240,6 +397,12 @@ unsafe fn do_printf(buf: *mut u8, n: usize, fmt: *const u8, ap: &mut VaList<'_>)
                 tmp[2..2 + len].copy_from_slice(hex_s.as_bytes());
                 let s = core::str::from_utf8_unchecked(&tmp[..2 + len]);
                 write_padded(&mut w, s, width, ' ', left_align);
+            }
+            b'f' | b'F' | b'e' | b'E' | b'g' | b'G' => {
+                let val: f64 = ap.arg::<f64>();
+                let mut tmp = [0u8; 512];
+                let s = format_float(val, fmt[i], precision, plus_sign, space_sign, &mut tmp);
+                write_padded(&mut w, s, width, pad_char, left_align);
             }
             b'%' => { let _ = w.write_char('%'); }
             other => {

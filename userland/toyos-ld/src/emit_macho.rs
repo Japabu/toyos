@@ -17,6 +17,7 @@ const CPU_TYPE_X86_64: u32 = 0x01000007;
 const CPU_SUBTYPE_X86_64_ALL: u32 = 3;
 const MH_EXECUTE: u32 = 2;
 const MH_PIE: u32 = 0x0020_0000;
+const MH_HAS_TLV_DESCRIPTORS: u32 = 0x0080_0000;
 const MH_TWOLEVEL: u32 = 0x80;
 const MH_DYLDLINK: u32 = 0x4;
 
@@ -29,7 +30,6 @@ const LC_MAIN: u32 = 0x80000028;
 const LC_DYLD_INFO_ONLY: u32 = 0x80000022;
 const LC_BUILD_VERSION: u32 = 0x32;
 const LC_CODE_SIGNATURE: u32 = 0x1D;
-
 const REBASE_OPCODE_SET_TYPE_IMM: u8 = 0x10;
 const REBASE_TYPE_POINTER: u8 = 1;
 const REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB: u8 = 0x20;
@@ -58,7 +58,6 @@ const VM_PROT_WRITE: u32 = 2;
 const VM_PROT_EXECUTE: u32 = 4;
 const VM_PROT_READ_WRITE: u32 = VM_PROT_READ | VM_PROT_WRITE;
 const VM_PROT_READ_EXECUTE: u32 = VM_PROT_READ | VM_PROT_EXECUTE;
-const VM_PROT_ALL: u32 = VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE;
 
 const N_EXT: u8 = 0x01;
 const N_SECT: u8 = 0x0E;
@@ -241,22 +240,7 @@ struct LinkeditDataCmd {
     datasize: U32Le,
 }
 
-// Code signature structs (big-endian)
-
-#[repr(C)]
-#[derive(IntoBytes, Immutable)]
-struct CsSuperBlob {
-    magic: U32Be,
-    length: U32Be,
-    count: U32Be,
-}
-
-#[repr(C)]
-#[derive(IntoBytes, Immutable)]
-struct CsBlobIndex {
-    typ: U32Be,
-    offset: U32Be,
-}
+// Code signature (big-endian, matching lld's minimal approach)
 
 #[repr(C)]
 #[derive(IntoBytes, Immutable)]
@@ -366,6 +350,11 @@ pub(crate) struct MachOLayout {
     pub(crate) ncmds: u32,
     pub(crate) arch: Arch,
     pub(crate) page_size: u64,
+
+    /// Start of the TLS template (__thread_data vmaddr) for TLV offset computation.
+    pub(crate) tls_template_start: u64,
+    /// Whether the binary has TLV descriptors (sets MH_HAS_TLV_DESCRIPTORS).
+    pub(crate) has_tlv: bool,
 }
 
 impl MachOLayout {
@@ -423,21 +412,22 @@ pub(crate) fn layout_macho(state: &mut LinkState) -> MachOLayout {
         false
     });
 
-    let has_const = buckets.rx.iter().any(|&i| state.sections[i].kind == SectionKind::ReadOnly);
-    let has_data = buckets.rw.iter().any(|&i| !state.sections[i].kind.is_nobits());
-    let has_bss = buckets.rw.iter().any(|&i| state.sections[i].kind.is_nobits());
+    // Determine which output sections will exist by checking for nonzero input content.
+    // These flags are the single source of truth for section counts — used both for
+    // sizeofcmds computation and section vector construction.
+    let has_const = buckets.rx.iter().any(|&i| state.sections[i].kind == SectionKind::ReadOnly && state.sections[i].size > 0);
+    let has_data = buckets.rw.iter().any(|&i| !state.sections[i].kind.is_nobits() && state.sections[i].size > 0);
+    let has_bss = buckets.rw.iter().any(|&i| state.sections[i].kind.is_nobits() && state.sections[i].size > 0);
     let has_got = !got_symbols.is_empty();
-    let has_thread_vars = buckets.tls.iter().any(|&i| state.sections[i].kind == SectionKind::TlsVariables);
-    let has_thread_data = buckets.tls.iter().any(|&i| state.sections[i].kind == SectionKind::Tls);
-    let has_thread_bss = buckets.tls.iter().any(|&i| state.sections[i].kind == SectionKind::TlsBss);
+    let has_thread_vars = buckets.tls.iter().any(|&i| state.sections[i].kind == SectionKind::TlsVariables && state.sections[i].size > 0);
+    let has_thread_data = buckets.tls.iter().any(|&i| state.sections[i].kind == SectionKind::Tls && state.sections[i].size > 0);
+    let has_thread_bss = buckets.tls.iter().any(|&i| state.sections[i].kind == SectionKind::TlsBss && state.sections[i].size > 0);
 
-    let text_nsects = 1 + if has_const { 1 } else { 0 };
-    let data_nsects = (if has_data { 1 } else { 0 })
-        + (if has_got { 1 } else { 0 })
-        + (if has_bss { 1 } else { 0 })
-        + (if has_thread_vars { 1 } else { 0 })
-        + (if has_thread_data { 1 } else { 0 })
-        + (if has_thread_bss { 1 } else { 0 });
+    let has_data_segment = has_data || has_got || has_bss
+        || has_thread_vars || has_thread_data || has_thread_bss;
+    let text_nsects = 1 + has_const as u32;
+    let data_nsects = has_data as u32 + has_got as u32 + has_bss as u32
+        + has_thread_vars as u32 + has_thread_data as u32 + has_thread_bss as u32;
 
     let dylib_name = "/usr/lib/libSystem.B.dylib\0";
     let dylib_cmd_size = align_up((size_of::<DylibCmd>() + dylib_name.len()) as u64, 8) as u32;
@@ -445,10 +435,10 @@ pub(crate) fn layout_macho(state: &mut LinkState) -> MachOLayout {
     let dylinker_cmd_size = align_up((size_of::<LoadDylinkerCmd>() + dylinker_name.len()) as u64, 8) as u32;
     let build_version_size = size_of::<BuildVersionCmd>() as u32 + size_of::<BuildToolVersion>() as u32;
 
-    let preliminary_sizeofcmds: u32 =
+    let sizeofcmds: u32 =
         SEGMENT_CMD_SIZE                                           // __PAGEZERO
-        + SEGMENT_CMD_SIZE + SECTION_HEADER_SIZE * text_nsects as u32  // __TEXT
-        + SEGMENT_CMD_SIZE + SECTION_HEADER_SIZE * data_nsects.max(1) as u32 // __DATA
+        + SEGMENT_CMD_SIZE + SECTION_HEADER_SIZE * text_nsects     // __TEXT
+        + if has_data_segment { SEGMENT_CMD_SIZE + SECTION_HEADER_SIZE * data_nsects } else { 0 }
         + SEGMENT_CMD_SIZE                                         // __LINKEDIT
         + dylinker_cmd_size
         + size_of::<EntryPointCmd>() as u32
@@ -458,7 +448,8 @@ pub(crate) fn layout_macho(state: &mut LinkState) -> MachOLayout {
         + size_of::<DysymtabCmd>() as u32
         + build_version_size
         + size_of::<LinkeditDataCmd>() as u32;
-    let header_size = MACHO_HEADER_SIZE as u64 + preliminary_sizeofcmds as u64;
+    let ncmds: u32 = 11 + has_data_segment as u32;
+    let header_size = MACHO_HEADER_SIZE as u64 + sizeofcmds as u64;
 
     // Phase 2: Layout sections with actual addresses
     let text_vmaddr = PAGEZERO_SIZE;
@@ -555,10 +546,24 @@ pub(crate) fn layout_macho(state: &mut LinkState) -> MachOLayout {
         td_cursor += sec.size;
     }
     let thread_data_sec_size = td_cursor - thread_data_sec_vmaddr;
-    data_cursor = td_cursor;
+    // Don't advance data_cursor yet — thread_bss must follow thread_data
+    // to keep the TLS template contiguous (dyld computes template as
+    // [thread_data_start .. thread_bss_end]).
 
-    // BSS (regular)
-    let bss_sec_vmaddr = align_up(data_cursor, 8);
+    // __thread_bss: zero-init TLS (nobits) — must be adjacent to __thread_data
+    let thread_bss_sec_vmaddr = align_up(td_cursor, 8);
+    let mut tb_cursor = thread_bss_sec_vmaddr;
+    for &idx in &buckets.tls {
+        let sec = &mut state.sections[idx];
+        if sec.kind != SectionKind::TlsBss { continue; }
+        tb_cursor = align_up(tb_cursor, sec.align);
+        sec.vaddr = Some(tb_cursor);
+        tb_cursor += sec.size;
+    }
+    let thread_bss_sec_size = tb_cursor - thread_bss_sec_vmaddr;
+
+    // BSS (regular) — after all TLS sections
+    let bss_sec_vmaddr = align_up(tb_cursor, 8);
     let bss_start = bss_sec_vmaddr;
     let mut bss_cursor = bss_sec_vmaddr;
     for &idx in &buckets.rw {
@@ -570,18 +575,6 @@ pub(crate) fn layout_macho(state: &mut LinkState) -> MachOLayout {
     }
     let bss_sec_size = bss_cursor - bss_start;
 
-    // __thread_bss: zero-init TLS (nobits)
-    let thread_bss_sec_vmaddr = align_up(bss_cursor, 8);
-    let mut tb_cursor = thread_bss_sec_vmaddr;
-    for &idx in &buckets.tls {
-        let sec = &mut state.sections[idx];
-        if sec.kind != SectionKind::TlsBss { continue; }
-        tb_cursor = align_up(tb_cursor, sec.align);
-        sec.vaddr = Some(tb_cursor);
-        tb_cursor += sec.size;
-    }
-    let thread_bss_sec_size = tb_cursor - thread_bss_sec_vmaddr;
-
     // Build sorted section lists for __TEXT and __DATA segments
     let mut text_sections = vec![MachOSection {
         sectname: pad16(b"__text"), segname: pad16(b"__TEXT"),
@@ -590,7 +583,7 @@ pub(crate) fn layout_macho(state: &mut LinkState) -> MachOLayout {
         align: match arch { Arch::X86_64 => 4, Arch::Aarch64 => 2 },
         flags: S_REGULAR | S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS, reserved1: 0,
     }];
-    if has_const && const_sec_size > 0 {
+    if has_const {
         text_sections.push(MachOSection {
             sectname: pad16(b"__const"), segname: pad16(b"__TEXT"),
             vmaddr: const_sec_vmaddr, size: const_sec_size,
@@ -601,42 +594,42 @@ pub(crate) fn layout_macho(state: &mut LinkState) -> MachOLayout {
 
     let mut data_sections = Vec::new();
     let data_seg = pad16(b"__DATA");
-    if data_sec_size > 0 {
+    if has_data {
         data_sections.push(MachOSection {
             sectname: pad16(b"__data"), segname: data_seg,
             vmaddr: data_sec_vmaddr, size: data_sec_size,
             offset: data_sec_offset as u32, align: 3, flags: S_REGULAR, reserved1: 0,
         });
     }
-    if got_sec_size > 0 {
+    if has_got {
         data_sections.push(MachOSection {
             sectname: pad16(b"__got"), segname: data_seg,
             vmaddr: got_sec_vmaddr, size: got_sec_size,
             offset: got_sec_offset as u32, align: 3, flags: S_NON_LAZY_SYMBOL_POINTERS, reserved1: 0,
         });
     }
-    if thread_vars_sec_size > 0 {
+    if has_thread_vars {
         data_sections.push(MachOSection {
             sectname: pad16(b"__thread_vars"), segname: data_seg,
             vmaddr: thread_vars_sec_vmaddr, size: thread_vars_sec_size,
             offset: thread_vars_sec_offset as u32, align: 3, flags: S_THREAD_LOCAL_VARIABLES, reserved1: 0,
         });
     }
-    if thread_data_sec_size > 0 {
+    if has_thread_data {
         data_sections.push(MachOSection {
             sectname: pad16(b"__thread_data"), segname: data_seg,
             vmaddr: thread_data_sec_vmaddr, size: thread_data_sec_size,
             offset: thread_data_sec_offset as u32, align: 3, flags: S_THREAD_LOCAL_REGULAR, reserved1: 0,
         });
     }
-    if bss_sec_size > 0 {
+    if has_bss {
         data_sections.push(MachOSection {
             sectname: pad16(b"__bss"), segname: data_seg,
             vmaddr: bss_sec_vmaddr, size: bss_sec_size,
             offset: 0, align: 3, flags: S_ZEROFILL, reserved1: 0,
         });
     }
-    if thread_bss_sec_size > 0 {
+    if has_thread_bss {
         data_sections.push(MachOSection {
             sectname: pad16(b"__thread_bss"), segname: data_seg,
             vmaddr: thread_bss_sec_vmaddr, size: thread_bss_sec_size,
@@ -645,11 +638,13 @@ pub(crate) fn layout_macho(state: &mut LinkState) -> MachOLayout {
     }
     data_sections.sort_by_key(|s| s.vmaddr);
 
-    // File-backed size: everything up to the end of the last non-nobits section
+    // File-backed size: everything up to the end of the last non-nobits section,
+    // rounded up to page size. macOS dyld hangs on TLS segments with non-page-aligned filesize.
     let data_filesize = data_sections.iter()
         .filter(|s| s.offset > 0)
         .map(|s| (s.vmaddr + s.size) - data_vmaddr)
         .max()
+        .map(|sz| align_up(sz, page_size))
         .unwrap_or(0);
     let data_memsz = data_sections.iter()
         .map(|s| (s.vmaddr + s.size) - data_vmaddr)
@@ -660,29 +655,11 @@ pub(crate) fn layout_macho(state: &mut LinkState) -> MachOLayout {
     let linkedit_vmaddr = data_vmaddr + data_vmsize;
     let linkedit_fileoff = data_fileoff + align_up(data_filesize, page_size);
 
-    let mut ncmds = 0u32;
-    let mut sizeofcmds = 0u32;
-    ncmds += 1; sizeofcmds += SEGMENT_CMD_SIZE; // __PAGEZERO
-    ncmds += 1; sizeofcmds += SEGMENT_CMD_SIZE + SECTION_HEADER_SIZE * text_sections.len() as u32;
-    if !data_sections.is_empty() {
-        ncmds += 1; sizeofcmds += SEGMENT_CMD_SIZE + SECTION_HEADER_SIZE * data_sections.len() as u32;
-    }
-    ncmds += 1; sizeofcmds += SEGMENT_CMD_SIZE; // __LINKEDIT
-    ncmds += 1; sizeofcmds += dylinker_cmd_size;
-    ncmds += 1; sizeofcmds += size_of::<EntryPointCmd>() as u32;
-    ncmds += 1; sizeofcmds += dylib_cmd_size;
-    ncmds += 1; sizeofcmds += size_of::<DyldInfoCmd>() as u32;
-    ncmds += 1; sizeofcmds += size_of::<SymtabCmd>() as u32;
-    ncmds += 1; sizeofcmds += size_of::<DysymtabCmd>() as u32;
-    ncmds += 1; sizeofcmds += build_version_size;
-    ncmds += 1; sizeofcmds += size_of::<LinkeditDataCmd>() as u32;
-
-    assert_eq!(
-        sizeofcmds, preliminary_sizeofcmds,
-        "load command size mismatch: preliminary {preliminary_sizeofcmds} != final {sizeofcmds} \
-         (text_sections={} data_sections={})",
-        text_sections.len(), data_sections.len(),
-    );
+    // Defense-in-depth: verify predicted section counts match actual vectors.
+    assert_eq!(text_sections.len() as u32, text_nsects,
+        "text section count: predicted {text_nsects}, actual {}", text_sections.len());
+    assert_eq!(data_sections.len() as u32, data_nsects,
+        "data section count: predicted {data_nsects}, actual {}", data_sections.len());
 
     MachOLayout {
         text_vmaddr,
@@ -702,6 +679,8 @@ pub(crate) fn layout_macho(state: &mut LinkState) -> MachOLayout {
         ncmds,
         arch,
         page_size,
+        tls_template_start: thread_data_sec_vmaddr,
+        has_tlv: has_thread_vars,
     }
 }
 
@@ -757,16 +736,16 @@ pub(crate) fn emit_macho_bytes(
     // __LINKEDIT layout
     let mut linkedit_cursor = layout.linkedit_fileoff;
 
-    let rebase_off = linkedit_cursor;
     let rebase_size = rebase_data.len() as u32;
+    let rebase_off = if rebase_size > 0 { linkedit_cursor } else { 0 };
     linkedit_cursor += align_up(rebase_size as u64, 8);
 
-    let bind_off = linkedit_cursor;
     let bind_size = bind_data.len() as u32;
+    let bind_off = if bind_size > 0 { linkedit_cursor } else { 0 };
     linkedit_cursor += align_up(bind_size as u64, 8);
 
-    let export_off = linkedit_cursor;
     let export_size = export_data.len() as u32;
+    let export_off = if export_size > 0 { linkedit_cursor } else { 0 };
     linkedit_cursor += align_up(export_size as u64, 8);
 
     let symtab_off = linkedit_cursor;
@@ -778,23 +757,23 @@ pub(crate) fn emit_macho_bytes(
     let strtab_size = strtab_data.len() as u32;
     linkedit_cursor += align_up(strtab_size as u64, 8);
 
-    let indirect_symtab_off = linkedit_cursor;
     let nindirectsyms = (indirect_symtab.len() / 4) as u32;
+    let indirect_symtab_off = if nindirectsyms > 0 { linkedit_cursor } else { 0 };
     linkedit_cursor += align_up(indirect_symtab.len() as u64, 8);
 
-    // Code signature: must be 16-byte aligned
+    // Code signature (16-byte aligned, must be last in __LINKEDIT)
     linkedit_cursor = align_up(linkedit_cursor, 16);
     let codesig_off = linkedit_cursor;
     let code_limit = codesig_off as u32;
-    let cs_page_size: u32 = 4096;
-    let n_code_slots = (code_limit + cs_page_size - 1) / cs_page_size;
-    let ident = "_main\0";
-    let cd_size = size_of::<CsCodeDirectory>() as u32 + ident.len() as u32 + n_code_slots * 32;
-    let codesig_size = size_of::<CsSuperBlob>() as u32
-        + size_of::<CsBlobIndex>() as u32
-        + cd_size;
-    let codesig_size_aligned = align_up(codesig_size as u64, 16) as u32;
-    linkedit_cursor += codesig_size_aligned as u64;
+    let cs_block_size: u32 = 4096;
+    let n_code_slots = (code_limit + cs_block_size - 1) / cs_block_size;
+    let ident = b"_main\0";
+    let all_headers = (size_of::<CsCodeDirectory>() + ident.len() + 15) & !15;
+    let hash_offset = all_headers as u32;
+    let cd_size = hash_offset + n_code_slots * 32;
+    // SuperBlob(12) + BlobIndex(8) + CodeDirectory
+    let codesig_size = 12 + 8 + cd_size;
+    linkedit_cursor += codesig_size as u64;
 
     let linkedit_filesize = linkedit_cursor - layout.linkedit_fileoff;
     let linkedit_vmsize = align_up(linkedit_filesize, layout.page_size);
@@ -811,7 +790,8 @@ pub(crate) fn emit_macho_bytes(
         filetype: U32Le::new(MH_EXECUTE),
         ncmds: U32Le::new(layout.ncmds),
         sizeofcmds: U32Le::new(layout.sizeofcmds),
-        flags: U32Le::new(MH_PIE | MH_TWOLEVEL | MH_DYLDLINK),
+        flags: U32Le::new(MH_PIE | MH_TWOLEVEL | MH_DYLDLINK
+            | if layout.has_tlv { MH_HAS_TLV_DESCRIPTORS } else { 0 }),
         reserved: U32Le::new(0),
     });
 
@@ -893,7 +873,7 @@ pub(crate) fn emit_macho_bytes(
         vmsize: U64Le::new(linkedit_vmsize),
         fileoff: U64Le::new(layout.linkedit_fileoff),
         filesize: U64Le::new(linkedit_filesize),
-        maxprot: U32Le::new(VM_PROT_ALL),
+        maxprot: U32Le::new(VM_PROT_READ),
         initprot: U32Le::new(VM_PROT_READ),
         nsects: U32Le::new(0),
         flags: U32Le::new(0),
@@ -1035,9 +1015,10 @@ pub(crate) fn emit_macho_bytes(
     write_at(&mut buf, strtab_off as usize, &strtab_data);
     write_at(&mut buf, indirect_symtab_off as usize, &indirect_symtab);
 
-    // Build and write ad-hoc code signature
-    let codesig = build_code_signature(&buf, code_limit, n_code_slots, layout);
-    write_at(&mut buf, codesig_off as usize, &codesig);
+    // Build and write ad-hoc code signature (matching lld's minimal approach:
+    // single CodeDirectory blob, no special slots, CS_ADHOC | CS_LINKER_SIGNED)
+    build_code_signature(&mut buf, codesig_off as usize, code_limit, n_code_slots,
+        ident, hash_offset, cd_size, codesig_size, layout);
 
     Ok(buf)
 }
@@ -1053,7 +1034,6 @@ fn macho_mangle(name: &str) -> String {
 fn build_rebase_opcodes(layout: &MachOLayout, entries: &[u64]) -> Vec<u8> {
     let mut ops = Vec::new();
     if entries.is_empty() {
-        ops.push(REBASE_OPCODE_DONE);
         return ops;
     }
 
@@ -1231,7 +1211,7 @@ fn build_symbol_table(
     (symtab, strtab, nlocalsym, nextdefsym, nundefsym, undef_syms)
 }
 
-// ── Ad-hoc code signature ────────────────────────────────────────────
+// ── Ad-hoc code signature (matching lld's minimal approach) ──────────
 
 const CSMAGIC_EMBEDDED_SIGNATURE: u32 = 0xFADE_0CC0;
 const CSMAGIC_CODEDIRECTORY: u32 = 0xFADE_0C02;
@@ -1239,45 +1219,37 @@ const CS_SUPPORTSEXECSEG: u32 = 0x0002_0400;
 const CS_ADHOC: u32 = 0x0000_0002;
 const CS_LINKER_SIGNED: u32 = 0x0002_0000;
 const CS_HASHTYPE_SHA256: u8 = 2;
-const CS_SHA256_LEN: u8 = 32;
 const CS_EXECSEG_MAIN_BINARY: u64 = 1;
-const CS_PAGE_SIZE_LOG2: u8 = 12;
-const CS_PAGE_SIZE: u32 = 4096;
 
+#[allow(clippy::too_many_arguments)]
 fn build_code_signature(
-    file_bytes: &[u8],
+    buf: &mut [u8],
+    codesig_off: usize,
     code_limit: u32,
     n_code_slots: u32,
+    ident: &[u8],
+    hash_offset: u32,
+    cd_size: u32,
+    codesig_size: u32,
     layout: &MachOLayout,
-) -> Vec<u8> {
-    let ident = b"_main\0";
-
-    let hash_offset = size_of::<CsCodeDirectory>() as u32 + ident.len() as u32;
-    let cd_length = hash_offset + n_code_slots * CS_SHA256_LEN as u32;
-
-    let blob_offset = size_of::<CsSuperBlob>() as u32 + size_of::<CsBlobIndex>() as u32;
-    let super_blob_length = blob_offset + cd_length;
-
-    let mut sig = vec![0u8; super_blob_length as usize];
+) {
+    let blob_headers_size: u32 = 12 + 8; // SuperBlob + 1 BlobIndex
 
     // SuperBlob header
-    let mut off = write_struct(&mut sig, 0, &CsSuperBlob {
-        magic: U32Be::new(CSMAGIC_EMBEDDED_SIGNATURE),
-        length: U32Be::new(super_blob_length),
-        count: U32Be::new(1),
-    });
+    let mut off = codesig_off;
+    write_be32(buf, off, CSMAGIC_EMBEDDED_SIGNATURE);
+    write_be32(buf, off + 4, codesig_size);
+    write_be32(buf, off + 8, 1); // count = 1 blob
 
     // BlobIndex[0]: CodeDirectory
-    off = write_struct(&mut sig, off, &CsBlobIndex {
-        typ: U32Be::new(0), // CSSLOT_CODEDIRECTORY
-        offset: U32Be::new(blob_offset),
-    });
+    write_be32(buf, off + 12, 0); // CSSLOT_CODEDIRECTORY
+    write_be32(buf, off + 16, blob_headers_size);
 
     // CodeDirectory
-    let cd_off = off;
-    off = write_struct(&mut sig, off, &CsCodeDirectory {
+    let cd_off = codesig_off + blob_headers_size as usize;
+    off = write_struct(buf, cd_off, &CsCodeDirectory {
         magic: U32Be::new(CSMAGIC_CODEDIRECTORY),
-        length: U32Be::new(cd_length),
+        length: U32Be::new(cd_size),
         version: U32Be::new(CS_SUPPORTSEXECSEG),
         flags: U32Be::new(CS_ADHOC | CS_LINKER_SIGNED),
         hash_offset: U32Be::new(hash_offset),
@@ -1285,32 +1257,37 @@ fn build_code_signature(
         n_special_slots: U32Be::new(0),
         n_code_slots: U32Be::new(n_code_slots),
         code_limit: U32Be::new(code_limit),
-        hash_size: CS_SHA256_LEN,
+        hash_size: 32,
         hash_type: CS_HASHTYPE_SHA256,
         platform: 0,
-        page_size: CS_PAGE_SIZE_LOG2,
+        page_size: 12, // log2(4096)
         spare2: U32Be::new(0),
         scatter_offset: U32Be::new(0),
         team_offset: U32Be::new(0),
         spare3: U32Be::new(0),
         code_limit_64: U64Be::new(0),
-        exec_seg_base: U64Be::new(0), // __TEXT fileoff = 0
+        exec_seg_base: U64Be::new(0),
         exec_seg_limit: U64Be::new(layout.text_filesize),
         exec_seg_flags: U64Be::new(CS_EXECSEG_MAIN_BINARY),
     });
 
-    // Identifier string
-    sig[off..off + ident.len()].copy_from_slice(ident);
+    // Identifier string + padding
+    buf[off..off + ident.len()].copy_from_slice(ident);
+    // padding bytes are already zero
 
-    // Page hashes: SHA-256 of each 4KB page of the file up to code_limit
+    // Code page hashes (SHA-256 of each 4K block)
     let hash_start = cd_off + hash_offset as usize;
     for i in 0..n_code_slots {
-        let page_start = (i * CS_PAGE_SIZE) as usize;
-        let page_end = ((i + 1) * CS_PAGE_SIZE).min(code_limit) as usize;
-        let hash = Sha256::digest(&file_bytes[page_start..page_end]);
+        let page_start = (i * 4096) as usize;
+        let page_end = ((i + 1) * 4096).min(code_limit) as usize;
+        let hash = Sha256::digest(&buf[page_start..page_end]);
         let off = hash_start + (i as usize) * 32;
-        sig[off..off + 32].copy_from_slice(&hash);
+        buf[off..off + 32].copy_from_slice(&hash);
     }
-
-    sig
 }
+
+fn write_be32(buf: &mut [u8], off: usize, val: u32) {
+    buf[off..off + 4].copy_from_slice(&val.to_be_bytes());
+}
+
+

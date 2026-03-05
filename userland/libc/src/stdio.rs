@@ -113,7 +113,10 @@ pub unsafe extern "C" fn fwrite(buf: *const u8, size: usize, count: usize, f: *m
     let total = size * count;
     let slice = core::slice::from_raw_parts(buf, total);
     let result = match &mut (*f).kind {
-        FileKind::Stdout => std::io::stdout().write_all(slice),
+        FileKind::Stdout => {
+            let mut out = std::io::stdout().lock();
+            out.write_all(slice).and_then(|()| out.flush())
+        }
         FileKind::Stderr => std::io::stderr().write_all(slice),
         FileKind::Owned(file) => file.write_all(slice),
         FileKind::Stdin => return 0,
@@ -178,7 +181,15 @@ pub unsafe extern "C" fn clearerr(f: *mut FILE) {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn fflush(_f: *mut FILE) -> i32 {
+pub unsafe extern "C" fn fflush(f: *mut FILE) -> i32 {
+    if !f.is_null() {
+        match &mut (*f).kind {
+            FileKind::Stdout => { let _ = std::io::stdout().flush(); }
+            FileKind::Stderr => { let _ = std::io::stderr().flush(); }
+            FileKind::Owned(file) => { let _ = file.flush(); }
+            FileKind::Stdin => {}
+        }
+    }
     0
 }
 
@@ -301,19 +312,50 @@ pub unsafe extern "C" fn fdopen(_fd: i32, _mode: *const u8) -> *mut FILE {
 
 // Misc stdlib functions
 
+/// Process termination for Unix hosts. std::process::exit calls the C `exit`
+/// symbol — which is us — so we use _Exit to break the recursion.
+#[cfg(unix)]
+#[no_mangle]
+pub unsafe extern "C" fn exit(code: i32) -> ! {
+    unsafe { extern "C" { fn _Exit(code: i32) -> !; } _Exit(code) }
+}
+
+#[cfg(unix)]
+#[no_mangle]
+pub unsafe extern "C" fn _exit(code: i32) -> ! {
+    unsafe { extern "C" { fn _Exit(code: i32) -> !; } _Exit(code) }
+}
+
+/// On ToyOS, std::process::exit goes directly to the exit syscall (no C `exit`
+/// recursion), so we can use it safely for all termination functions.
+#[cfg(target_os = "toyos")]
 #[no_mangle]
 pub unsafe extern "C" fn exit(code: i32) -> ! {
     std::process::exit(code)
 }
 
+#[cfg(target_os = "toyos")]
 #[no_mangle]
 pub unsafe extern "C" fn _exit(code: i32) -> ! {
     std::process::exit(code)
 }
 
+#[cfg(target_os = "toyos")]
+#[no_mangle]
+pub unsafe extern "C" fn _Exit(code: i32) -> ! {
+    std::process::exit(code)
+}
+
+#[cfg(target_os = "toyos")]
 #[no_mangle]
 pub unsafe extern "C" fn abort() -> ! {
     std::process::exit(134)
+}
+
+#[cfg(unix)]
+#[no_mangle]
+pub unsafe extern "C" fn abort() -> ! {
+    unsafe { extern "C" { fn _Exit(code: i32) -> !; } _Exit(134) }
 }
 
 #[no_mangle]

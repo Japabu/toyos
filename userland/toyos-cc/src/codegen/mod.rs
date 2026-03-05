@@ -281,8 +281,15 @@ impl Codegen {
         // Define string constants
         self.define_strings();
 
-        // Finalize tentative definitions: zero-init any globals that were never given a real initializer
+        // Finalize tentative definitions: zero-init any globals that were never given a real initializer.
+        // Use the maximum size across all tentative entries for each data_id (handles incomplete
+        // arrays like `int b[]` later completed by `int b[3]`).
+        let mut tentative_sizes: std::collections::HashMap<_, usize> = std::collections::HashMap::new();
         for (data_id, size) in std::mem::take(&mut self.tentative_data) {
+            let entry = tentative_sizes.entry(data_id).or_default();
+            *entry = (*entry).max(size);
+        }
+        for (data_id, size) in tentative_sizes {
             if !self.defined_data.contains(&data_id) {
                 let mut desc = DataDescription::new();
                 desc.define_zeroinit(size.max(1));

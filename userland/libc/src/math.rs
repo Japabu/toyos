@@ -28,9 +28,32 @@ pub extern "C" fn tan(x: f64) -> f64 {
     sin(x) / cos(x)
 }
 
+/// atan(x) for |x| <= tan(π/8) ≈ 0.4142 — Taylor series converges fast here.
+fn atan_small(x: f64) -> f64 {
+    let x2 = x * x;
+    let mut sum = 0.0;
+    let mut term = x;
+    for i in 0..16 {
+        if i > 0 { term *= -x2; }
+        sum += term / (2 * i + 1) as f64;
+    }
+    sum
+}
+
+/// atan(x) for x >= 0, with range reduction.
+fn atan_positive(x: f64) -> f64 {
+    if x > 1.0 {
+        return PI / 2.0 - atan_positive(1.0 / x);
+    }
+    if x > 0.4142135623730950 {
+        return PI / 4.0 + atan_small((x - 1.0) / (x + 1.0));
+    }
+    atan_small(x)
+}
+
 #[no_mangle]
 pub extern "C" fn atan(x: f64) -> f64 {
-    atan2(x, 1.0)
+    if x >= 0.0 { atan_positive(x) } else { -atan_positive(-x) }
 }
 
 #[no_mangle]
@@ -40,13 +63,43 @@ pub extern "C" fn atan2(y: f64, x: f64) -> f64 {
         if y < 0.0 { return -PI / 2.0; }
         return 0.0;
     }
-    let a = y.abs().min(x.abs()) / y.abs().max(x.abs());
-    let s = a * a;
-    let mut r = ((-0.0464964749 * s + 0.15931422) * s - 0.327622764) * s * a + a;
-    if y.abs() > x.abs() { r = PI / 2.0 - r; }
-    if x < 0.0 { r = PI - r; }
-    if y < 0.0 { r = -r; }
-    r
+    if y == 0.0 {
+        return if x > 0.0 { 0.0 } else { PI };
+    }
+    let mut angle = atan_positive(y.abs() / x.abs());
+    if x < 0.0 { angle = PI - angle; }
+    if y < 0.0 { angle = -angle; }
+    angle
+}
+
+#[no_mangle]
+pub extern "C" fn asin(x: f64) -> f64 {
+    if x < -1.0 || x > 1.0 { return f64::NAN; }
+    atan2(x, (1.0 - x * x).sqrt())
+}
+
+#[no_mangle]
+pub extern "C" fn acos(x: f64) -> f64 {
+    if x < -1.0 || x > 1.0 { return f64::NAN; }
+    atan2((1.0 - x * x).sqrt(), x)
+}
+
+#[no_mangle]
+pub extern "C" fn sinh(x: f64) -> f64 {
+    let ex = exp(x);
+    (ex - 1.0 / ex) * 0.5
+}
+
+#[no_mangle]
+pub extern "C" fn cosh(x: f64) -> f64 {
+    let ex = exp(x);
+    (ex + 1.0 / ex) * 0.5
+}
+
+#[no_mangle]
+pub extern "C" fn tanh(x: f64) -> f64 {
+    let ex = exp(2.0 * x);
+    (ex - 1.0) / (ex + 1.0)
 }
 
 #[no_mangle]
@@ -57,8 +110,13 @@ pub extern "C" fn log(x: f64) -> f64 {
     let m = f64::from_bits((bits & 0x000FFFFFFFFFFFFF) | 0x3FF0000000000000);
     let t = (m - 1.0) / (m + 1.0);
     let t2 = t * t;
-    let ln_m = 2.0 * t * (1.0 + t2 / 3.0 + t2 * t2 / 5.0 + t2 * t2 * t2 / 7.0);
-    ln_m + e as f64 * core::f64::consts::LN_2
+    let mut sum = 1.0;
+    let mut t2k = 1.0;
+    for k in 1..16 {
+        t2k *= t2;
+        sum += t2k / (2 * k + 1) as f64;
+    }
+    2.0 * t * sum + e as f64 * core::f64::consts::LN_2
 }
 
 #[no_mangle]
