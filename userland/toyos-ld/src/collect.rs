@@ -189,7 +189,9 @@ pub(crate) struct InputReloc {
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum SymbolDef {
     Defined { section: SectionIdx, value: u64 },
-    Dynamic,
+    /// Dynamic (shared library) import. `is_func` distinguishes function vs data symbols
+    /// so the linker can create stubs only for functions (not data like __stdoutp).
+    Dynamic { is_func: bool },
 }
 
 pub(crate) struct LinkState {
@@ -276,7 +278,8 @@ fn collect_so_symbols(elf: &ElfFile64, globals: &mut HashMap<String, SymbolDef>,
             continue;
         }
         let name = name.to_string();
-        globals.entry(name.clone()).or_insert(SymbolDef::Dynamic);
+        let is_func = sym.kind() == read::SymbolKind::Text;
+        globals.entry(name.clone()).or_insert(SymbolDef::Dynamic { is_func });
         dynamic_imports.insert(name);
     }
 }
@@ -925,7 +928,7 @@ pub(crate) fn gc_sections(state: &mut LinkState, entry: &str) {
 
     // Remap globals
     state.globals.retain(|_, def| match def {
-        SymbolDef::Dynamic => true,
+        SymbolDef::Dynamic { .. } => true,
         SymbolDef::Defined { section, .. } => reachable[section.0],
     });
     for def in state.globals.values_mut() {
@@ -936,7 +939,7 @@ pub(crate) fn gc_sections(state: &mut LinkState, entry: &str) {
 
     // Remap locals
     state.locals.retain(|_, def| match def {
-        SymbolDef::Dynamic => true,
+        SymbolDef::Dynamic { .. } => true,
         SymbolDef::Defined { section, .. } => reachable[section.0],
     });
     for def in state.locals.values_mut() {

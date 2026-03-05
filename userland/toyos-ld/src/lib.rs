@@ -79,19 +79,29 @@ impl Collected {
     }
 
     /// Mark undefined symbols as dynamic (dylib) imports for Mach-O linking.
+    /// Determines whether each symbol is a function or data by checking if it
+    /// has any call-type relocations (functions) vs only GOT/data relocations (data).
     fn mark_dynamic_symbols(&mut self) {
-        use std::collections::HashSet;
-        let referenced: HashSet<String> = self.state.relocs.iter()
-            .map(|r| r.target.name().to_string())
-            .collect();
-        let undefined: Vec<String> = referenced.into_iter()
-            .filter(|sym| {
-                !self.state.globals.contains_key(sym)
-                    && !self.state.locals.keys().any(|(_, n)| n == sym)
-            })
-            .collect();
-        for sym in undefined {
-            self.state.globals.insert(sym, SymbolDef::Dynamic);
+        use std::collections::HashMap as Map;
+        let call_relocs: &[RelocType] = match self.state.arch {
+            Arch::Aarch64 => &[RelocType::Aarch64Call26, RelocType::Aarch64Jump26],
+            Arch::X86_64 => &[RelocType::X86Plt32, RelocType::X86Pc32],
+        };
+        // Collect referenced symbols and whether they have call relocations
+        let mut referenced: Map<String, bool> = Map::new();
+        for r in &self.state.relocs {
+            let name = r.target.name().to_string();
+            let entry = referenced.entry(name).or_insert(false);
+            if call_relocs.contains(&r.r_type) {
+                *entry = true;
+            }
+        }
+        for (sym, has_call) in referenced {
+            if !self.state.globals.contains_key(&sym)
+                && !self.state.locals.keys().any(|(_, n)| n == &sym)
+            {
+                self.state.globals.insert(sym, SymbolDef::Dynamic { is_func: has_call });
+            }
         }
     }
 
@@ -445,7 +455,7 @@ fn create_call_stubs(state: &mut collect::LinkState) {
     };
     for reloc in &state.relocs {
         if !call_relocs.contains(&reloc.r_type) { continue; }
-        if let Some(SymbolDef::Dynamic) = state.globals.get(reloc.target.name()) {
+        if let Some(SymbolDef::Dynamic { .. }) = state.globals.get(reloc.target.name()) {
             stub_syms.insert(reloc.target.name().to_string());
         }
     }
@@ -491,7 +501,7 @@ fn rewrite_x86_64_got_calls(
 ) {
     let is_function_symbol = |name: &str| -> bool {
         match state.globals.get(name) {
-            Some(SymbolDef::Dynamic) => true,
+            Some(SymbolDef::Dynamic { is_func }) => *is_func,
             Some(SymbolDef::Defined { section, .. }) => {
                 state.sections[*section].kind == SectionKind::Code
             }

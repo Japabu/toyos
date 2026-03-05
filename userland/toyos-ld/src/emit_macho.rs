@@ -403,7 +403,7 @@ pub(crate) fn layout_macho(state: &mut LinkState) -> MachOLayout {
             let is_dynamic = match &r.target {
                 SymbolRef::Global(name) => matches!(
                     state.globals.get(name),
-                    Some(SymbolDef::Dynamic) | None
+                    Some(SymbolDef::Dynamic { .. }) | None
                 ),
                 _ => false,
             };
@@ -508,7 +508,7 @@ pub(crate) fn layout_macho(state: &mut LinkState) -> MachOLayout {
     for sym in &got_symbols {
         let is_external = match sym {
             SymbolRef::Global(name) => match state.globals.get(name) {
-                Some(SymbolDef::Dynamic) => true,
+                Some(SymbolDef::Dynamic { .. }) => true,
                 Some(SymbolDef::Defined { .. }) => false,
                 None => true,
             },
@@ -704,7 +704,7 @@ pub(crate) fn emit_macho_bytes(
                     sec.name, sec.kind,
                 )) + value
             }
-            SymbolDef::Dynamic => panic!("entry point cannot be a dynamic symbol"),
+            SymbolDef::Dynamic { .. } => panic!("entry point cannot be a dynamic symbol"),
         })
         .ok_or_else(|| LinkError::MissingEntry(entry_name.to_string()))?;
 

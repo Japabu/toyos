@@ -71,6 +71,7 @@ pub fn compile_c(name: &str, target: Option<&str>) -> (Vec<u8>, Vec<Vec<u8>>) {
         include_paths,
         defines: Vec::new(),
         target: target.map(|t| t.to_string()),
+        opt_level: 0,
     };
 
     let obj = toyos_cc::compile(&source, &format!("{name}.c"), &opts);

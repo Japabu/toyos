@@ -15,6 +15,7 @@ pub struct CompileOptions {
     pub include_paths: Vec<PathBuf>,
     pub defines: Vec<(String, String)>,
     pub target: Option<String>,
+    pub opt_level: u8,
 }
 
 impl Default for CompileOptions {
@@ -23,6 +24,7 @@ impl Default for CompileOptions {
             include_paths: Vec::new(),
             defines: Vec::new(),
             target: None,
+            opt_level: 0,
         }
     }
 }
@@ -33,20 +35,10 @@ impl Default for CompileOptions {
 /// Thread-safe: can be called from multiple threads concurrently.
 /// Deep recursion is handled by `stacker::maybe_grow` in parsing and codegen.
 pub fn compile(source: &str, filename: &str, options: &CompileOptions) -> Vec<u8> {
-    compile_inner(source, filename, &options.include_paths, &options.defines, options.target.as_deref())
-}
-
-fn compile_inner(
-    source: &str,
-    filename: &str,
-    include_paths: &[PathBuf],
-    defines: &[(String, String)],
-    target: Option<&str>,
-) -> Vec<u8> {
     let mut pp = preprocess::Preprocessor::new(
-        include_paths.to_vec(),
-        defines.to_vec(),
-        target,
+        options.include_paths.clone(),
+        options.defines.clone(),
+        options.target.as_deref(),
     );
     pp.suppress_line_markers = false;
     let preprocessed = pp.preprocess(source, filename);
@@ -61,7 +53,7 @@ fn compile_inner(
         .with_extension("o")
         .to_string_lossy()
         .into_owned();
-    let module = emit::create_module(&obj_name, target);
+    let module = emit::create_module(&obj_name, options.target.as_deref(), options.opt_level);
     let mut cg = codegen::Codegen::new(module, type_env);
     cg.compile_unit(&tu);
     cg.define_variadic_stubs();

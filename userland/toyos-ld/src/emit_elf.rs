@@ -478,7 +478,7 @@ fn resolve_entry(state: &LinkState, entry_name: &str, plt: Option<&HashMap<Symbo
         .globals
         .get(entry_name)
         .map(|def| match def {
-            SymbolDef::Dynamic => {
+            SymbolDef::Dynamic { .. } => {
                 let entry_ref = SymbolRef::Global(entry_name.to_string());
                 plt.and_then(|p| p.get(&entry_ref).copied())
                     .ok_or_else(|| LinkError::MissingEntry(entry_name.to_string()))

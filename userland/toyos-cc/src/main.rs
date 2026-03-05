@@ -37,6 +37,7 @@ fn run() {
         include_paths: args.include_paths.clone(),
         defines: args.defines.clone(),
         target: args.target.clone(),
+        opt_level: args.opt_level,
     };
 
     for input in &args.inputs {
@@ -114,6 +115,7 @@ struct Args {
     compile_only: bool,          // -c
     preprocess_only: bool,       // -E
     suppress_line_markers: bool, // -P
+    opt_level: u8,               // 0-3
 }
 
 fn parse_args() -> Args {
@@ -126,6 +128,7 @@ fn parse_args() -> Args {
     let mut compile_only = false;
     let mut preprocess_only = false;
     let mut suppress_line_markers = false;
+    let mut opt_level: u8 = 0;
     let mut i = 1;
 
     while i < argv.len() {
@@ -157,8 +160,11 @@ fn parse_args() -> Args {
             }
             s if s.starts_with("--target=") => target = Some(s["--target=".len()..].to_string()),
             // Ignore common flags we don't support yet
-            "-w" | "-Wall" | "-Wextra" | "-Werror" | "-pedantic" | "-g" | "-g3"
-            | "-O0" | "-O1" | "-O2" | "-O3" | "-Os" | "-Oz" => {}
+            "-w" | "-Wall" | "-Wextra" | "-Werror" | "-pedantic" | "-g" | "-g3" => {}
+            "-O0" => opt_level = 0,
+            "-O1" => opt_level = 1,
+            "-O2" | "-Os" | "-Oz" => opt_level = 2,
+            "-O3" => opt_level = 3,
             s if s.starts_with("-O") || s.starts_with("-W") || s.starts_with("-f")
               || s.starts_with("-m") || s.starts_with("-std=") || s.starts_with("-march") => {}
             "-pipe" | "-pthread" | "-ldl" | "-lm" | "-lc" => {}
@@ -177,5 +183,5 @@ fn parse_args() -> Args {
         process::exit(1);
     }
 
-    Args { inputs, output, include_paths, defines, target, compile_only, preprocess_only, suppress_line_markers }
+    Args { inputs, output, include_paths, defines, target, compile_only, preprocess_only, suppress_line_markers, opt_level }
 }

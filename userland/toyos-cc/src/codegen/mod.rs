@@ -71,6 +71,7 @@ pub struct Codegen {
     func_ctypes: HashMap<String, CType>,                   // full C function types (for expr_type)
     variadic_funcs: HashMap<String, usize>,                   // variadic func name → fixed param count
     variadic_stubs: HashMap<String, (FuncId, FuncId)>,        // x86_64: variadic func name → (stub_func_id, original_func_id)
+    va_indirect: Option<(FuncId, cranelift_module::DataId)>,  // x86_64: (trampoline func, target global) for indirect variadic calls
     static_funcs: HashSet<String>,                             // functions declared static
     extern_provision: HashSet<String>,                         // functions with non-inline external provision
 }
@@ -166,6 +167,7 @@ impl Codegen {
             func_ctypes: HashMap::new(),
             variadic_funcs: HashMap::new(),
             variadic_stubs: HashMap::new(),
+            va_indirect: None,
             static_funcs: HashSet::new(),
             extern_provision: HashSet::new(),
         }
@@ -309,7 +311,7 @@ impl Codegen {
         use cranelift_codegen::binemit::Reloc;
         use cranelift_module::ModuleRelocTarget;
 
-        if self.arch != Arch::X86_64 || self.variadic_stubs.is_empty() {
+        if self.arch != Arch::X86_64 {
             return;
         }
 
@@ -329,6 +331,55 @@ impl Codegen {
             self.module.define_function_bytes(stub_id, 8, &bytes, &[reloc])
                 .unwrap_or_else(|e| panic!("failed to define variadic stub: {e}"));
         }
+
+        // Define the indirect variadic trampoline if any indirect variadic calls exist.
+        // The trampoline reads the function pointer from a global and jumps to it
+        // with AL=8 set per x86_64 SysV ABI for variadic calls.
+        if let Some((tramp_id, data_id)) = self.va_indirect {
+            // mov $8, %al                                    ; B0 08           (2 bytes)
+            // mov __va_indirect_target@GOTPCREL(%rip), %r11  ; 4C 8B 1D disp32 (7 bytes)
+            // jmp *(%r11)                                    ; 41 FF 23        (3 bytes)
+            let bytes: [u8; 12] = [
+                0xB0, 0x08,                         // mov $8, %al
+                0x4C, 0x8B, 0x1D, 0x00, 0x00, 0x00, 0x00,  // mov disp32(%rip), %r11
+                0x41, 0xFF, 0x23,                   // jmp *(%r11)
+            ];
+            let reloc = cranelift_module::ModuleReloc {
+                offset: 5,  // disp32 starts at byte 5
+                kind: Reloc::X86GOTPCRel4,
+                name: ModuleRelocTarget::User {
+                    namespace: 1,
+                    index: data_id.as_u32(),
+                },
+                addend: -4,
+            };
+            self.module.define_function_bytes(tramp_id, 8, &bytes, &[reloc])
+                .unwrap_or_else(|e| panic!("failed to define indirect variadic trampoline: {e}"));
+        }
+    }
+
+    /// Get or create the indirect variadic call trampoline for x86_64.
+    /// Returns (trampoline FuncId, target global DataId).
+    fn get_va_indirect_trampoline(&mut self) -> (FuncId, cranelift_module::DataId) {
+        if let Some(ids) = self.va_indirect {
+            return ids;
+        }
+        // Create a writable global to hold the function pointer target
+        let data_id = self.module.declare_data(
+            "__va_indirect_target", Linkage::Local, true, false,
+        ).unwrap();
+        let mut desc = DataDescription::new();
+        desc.define_zeroinit(8);
+        self.module.define_data(data_id, &desc).unwrap();
+
+        // Create the trampoline function (defined later in define_variadic_stubs)
+        let mut sig = self.module.make_signature();
+        sig.returns.push(AbiParam::new(I64));
+        let tramp_id = self.module.declare_function(
+            "__va_indirect_trampoline", Linkage::Local, &sig,
+        ).unwrap();
+        self.va_indirect = Some((tramp_id, data_id));
+        (tramp_id, data_id)
     }
 
     /// Get or create a local stub function for a variadic call on x86_64.

@@ -393,8 +393,8 @@ impl Codegen {
         };
         let elem_size = elem_ty.size();
         let arr_val = self.compile_expr(ctx, arr).raw();
-        let idx_raw = self.compile_expr(ctx, idx).raw();
-        let idx_val = self.coerce(ctx, idx_raw, I64);
+        let idx_tv = self.compile_expr(ctx, idx);
+        let idx_val = self.coerce_typed(ctx, idx_tv, I64);
         let offset = ctx.builder.ins().imul_imm(idx_val, elem_size as i64);
         let addr = ctx.builder.ins().iadd(arr_val, offset);
         if elem_ty.is_aggregate() || matches!(&elem_ty, CType::Array(..)) {
@@ -707,8 +707,8 @@ impl Codegen {
             if l_stride.is_some() && r_stride.is_none() {
                 let stride = l_stride.unwrap();
                 let l = self.compile_expr(ctx, lhs).raw();
-                let r = self.compile_expr(ctx, rhs).raw();
-                let r = self.coerce(ctx, r, I64);
+                let r_tv = self.compile_expr(ctx, rhs);
+                let r = self.coerce_typed(ctx, r_tv, I64);
                 let r = if stride != 1 {
                     let s = ctx.builder.ins().iconst(I64, stride);
                     ctx.builder.ins().imul(r, s)
@@ -718,9 +718,9 @@ impl Codegen {
             }
             if r_stride.is_some() && l_stride.is_none() && matches!(op, BinOp::Add) {
                 let stride = r_stride.unwrap();
-                let l = self.compile_expr(ctx, lhs).raw();
+                let l_tv = self.compile_expr(ctx, lhs);
+                let l = self.coerce_typed(ctx, l_tv, I64);
                 let r = self.compile_expr(ctx, rhs).raw();
-                let l = self.coerce(ctx, l, I64);
                 let l = if stride != 1 {
                     let s = ctx.builder.ins().iconst(I64, stride);
                     ctx.builder.ins().imul(l, s)
@@ -810,7 +810,7 @@ impl Codegen {
             let lty = self.expr_type(ctx, lhs);
             if let Some(stride) = Self::elem_stride(&lty) {
                 if stride != 1 {
-                    rhs_val = self.coerce(ctx, rhs_val, I64);
+                    rhs_val = self.coerce_typed(ctx, TypedValue::new(rhs_val, rhs_tv.signedness()), I64);
                     let s = ctx.builder.ins().iconst(I64, stride);
                     rhs_val = ctx.builder.ins().imul(rhs_val, s);
                 }
@@ -1191,7 +1191,20 @@ impl Codegen {
             }
         }
         let sig_ref = ctx.builder.import_signature(sig);
-        let call = ctx.builder.ins().call_indirect(sig_ref, func_ptr, &coerced);
+        // On x86_64, variadic calls must set AL (XMM count). Cranelift can't do
+        // this, so route indirect variadic calls through a trampoline that sets
+        // AL=8 then jumps to the real target (stored in a global).
+        let call = if self.arch == Arch::X86_64 && is_variadic {
+            let (tramp_id, data_id) = self.get_va_indirect_trampoline();
+            let gv = self.module.declare_data_in_func(data_id, ctx.builder.func);
+            let target_addr = ctx.builder.ins().global_value(I64, gv);
+            ctx.builder.ins().store(MemFlags::new(), func_ptr, target_addr, 0);
+            let tramp_ref = self.module.declare_func_in_func(tramp_id, ctx.builder.func);
+            let tramp_addr = ctx.builder.ins().func_addr(I64, tramp_ref);
+            ctx.builder.ins().call_indirect(sig_ref, tramp_addr, &coerced)
+        } else {
+            ctx.builder.ins().call_indirect(sig_ref, func_ptr, &coerced)
+        };
         if let Some(addr) = sret_addr {
             return TypedValue::unsigned(addr);
         }

@@ -20,7 +20,7 @@ pub(crate) fn resolve_symbol(
     match sym {
         SymbolRef::Global(name) => {
             match state.globals.get(name)? {
-                SymbolDef::Dynamic => plt.and_then(|p| p.get(sym).copied()),
+                SymbolDef::Dynamic { .. } => plt.and_then(|p| p.get(sym).copied()),
                 SymbolDef::Defined { section, value } => {
                     let sec = &state.sections[*section];
                     Some(sec.vaddr.unwrap_or_else(|| panic!(
@@ -34,7 +34,7 @@ pub(crate) fn resolve_symbol(
             // Global overrides local (e.g., inline function promoted to global)
             if let Some(def) = state.globals.get(name) {
                 return match def {
-                    SymbolDef::Dynamic => plt.and_then(|p| p.get(sym).copied()),
+                    SymbolDef::Dynamic { .. } => plt.and_then(|p| p.get(sym).copied()),
                     SymbolDef::Defined { section, value } => {
                         let sec = &state.sections[*section];
                         Some(sec.vaddr.unwrap_or_else(|| panic!(

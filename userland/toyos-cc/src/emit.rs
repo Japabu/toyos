@@ -3,9 +3,15 @@ use cranelift_codegen::settings::{self, Configurable};
 use cranelift_object::{ObjectBuilder, ObjectModule};
 use target_lexicon::Triple;
 
-pub fn create_module(output_name: &str, target: Option<&str>) -> ObjectModule {
+pub fn create_module(output_name: &str, target: Option<&str>, opt_level: u8) -> ObjectModule {
     let mut flag_builder = settings::builder();
-    flag_builder.set("opt_level", "none").unwrap();
+    let opt = match opt_level {
+        0 => "none",
+        1 => "speed",
+        2 => "speed",
+        _ => "speed_and_size",
+    };
+    flag_builder.set("opt_level", opt).unwrap();
     flag_builder.set("is_pic", "true").unwrap();
     let flags = settings::Flags::new(flag_builder);
 
