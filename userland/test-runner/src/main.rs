@@ -1,43 +1,54 @@
-use std::process::Command;
+use std::io::{self, BufRead, Write};
+use std::process::{Command, Stdio};
 
 fn main() {
-    let manifest = match std::fs::read_to_string("/initrd/test-manifest") {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("failed to read /initrd/test-manifest: {e}");
-            std::process::exit(1);
-        }
-    };
+    println!("===READY===");
+    let _ = io::stdout().flush();
 
-    let mut passed = 0u32;
-    let mut failed = 0u32;
-
-    for line in manifest.lines() {
-        let name = line.trim();
-        if name.is_empty() || name.starts_with('#') {
+    let stdin = io::stdin();
+    for line in stdin.lock().lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => break,
+        };
+        let cmd = line.trim().to_string();
+        if cmd.is_empty() {
             continue;
         }
 
-        println!("===TEST_START {name}===");
-
-        let path = format!("/initrd/{name}");
-        match Command::new(&path).status() {
-            Ok(status) => {
-                let code = status.code().unwrap_or(-1);
-                println!("===TEST_END {name} exit={code}===");
-                if code == 0 {
-                    passed += 1;
-                } else {
-                    failed += 1;
-                }
-            }
-            Err(e) => {
-                println!("===TEST_END {name} error={e}===");
-                failed += 1;
-            }
+        if cmd == "quit" {
+            std::process::exit(0);
         }
-    }
 
-    println!("===ALL_TESTS_DONE passed={passed} failed={failed}===");
-    std::process::exit(if failed > 0 { 1 } else { 0 });
+        let Some(name) = cmd.strip_prefix("run ") else {
+            eprintln!("unknown command: {cmd}");
+            continue;
+        };
+        let name = name.trim();
+        let path = format!("/initrd/{name}");
+
+        println!("===TEST_START {name}===");
+        let _ = io::stdout().flush();
+
+        match Command::new(&path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => match child.wait_with_output() {
+                Ok(output) => {
+                    if !output.stdout.is_empty() {
+                        io::stdout().write_all(&output.stdout).ok();
+                        let _ = io::stdout().flush();
+                    }
+                    let code = output.status.code().unwrap_or(-1);
+                    println!("===TEST_END {name} exit={code}===");
+                }
+                Err(e) => println!("===TEST_END {name} error={e}==="),
+            },
+            Err(e) => println!("===TEST_END {name} error={e}==="),
+        }
+        let _ = io::stdout().flush();
+    }
 }
