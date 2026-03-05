@@ -1,30 +1,36 @@
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::cell::Cell;
 
 pub static VERBOSE: AtomicBool = AtomicBool::new(false);
-pub static DEPTH: AtomicUsize = AtomicUsize::new(0);
+
+thread_local! {
+    static DEPTH: Cell<usize> = const { Cell::new(0) };
+}
 
 pub fn enabled() -> bool {
     VERBOSE.load(Ordering::Relaxed)
 }
 
-pub fn set(v: bool) {
-    VERBOSE.store(v, Ordering::Relaxed);
-}
-
 pub fn depth() -> usize {
-    DEPTH.load(Ordering::Relaxed)
+    DEPTH.with(|d| d.get())
 }
 
 pub fn enter() -> usize {
-    DEPTH.fetch_add(1, Ordering::Relaxed)
+    DEPTH.with(|d| {
+        let prev = d.get();
+        d.set(prev + 1);
+        prev
+    })
 }
 
 pub fn leave() {
-    DEPTH.fetch_sub(1, Ordering::Relaxed);
+    DEPTH.with(|d| {
+        d.set(d.get().wrapping_sub(1));
+    });
 }
 
 pub fn reset_depth() {
-    DEPTH.store(0, Ordering::Relaxed);
+    DEPTH.with(|d| d.set(0));
 }
 
 /// Print indented verbose message. Indentation matches current depth.

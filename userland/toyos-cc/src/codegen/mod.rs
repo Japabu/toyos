@@ -70,6 +70,7 @@ pub struct Codegen {
     func_ret_types: HashMap<String, CType>,               // C return types of functions
     func_ctypes: HashMap<String, CType>,                   // full C function types (for expr_type)
     variadic_funcs: HashMap<String, usize>,                   // variadic func name → fixed param count
+    variadic_stubs: HashMap<String, (FuncId, FuncId)>,        // x86_64: variadic func name → (stub_func_id, original_func_id)
     static_funcs: HashSet<String>,                             // functions declared static
     extern_provision: HashSet<String>,                         // functions with non-inline external provision
 }
@@ -164,6 +165,7 @@ impl Codegen {
             func_ret_types: HashMap::new(),
             func_ctypes: HashMap::new(),
             variadic_funcs: HashMap::new(),
+            variadic_stubs: HashMap::new(),
             static_funcs: HashSet::new(),
             extern_provision: HashSet::new(),
         }
@@ -297,6 +299,51 @@ impl Codegen {
                 self.defined_data.insert(data_id);
             }
         }
+    }
+
+    /// On x86_64, define raw machine code stubs for variadic function calls.
+    /// Each stub sets AL = 8 (max XMM arg count per SysV ABI) then jumps to
+    /// the real function via GOT. This is needed because Cranelift has no
+    /// native variadic support and cannot set AL itself.
+    pub fn define_variadic_stubs(&mut self) {
+        use cranelift_codegen::binemit::Reloc;
+        use cranelift_module::ModuleRelocTarget;
+
+        if self.arch != Arch::X86_64 || self.variadic_stubs.is_empty() {
+            return;
+        }
+
+        for (_, &(stub_id, original_id)) in &self.variadic_stubs {
+            // mov $8, %al  ; B0 08
+            // jmp *sym@GOTPCREL(%rip) ; FF 25 disp32
+            let bytes: [u8; 8] = [0xB0, 0x08, 0xFF, 0x25, 0x00, 0x00, 0x00, 0x00];
+            let reloc = cranelift_module::ModuleReloc {
+                offset: 4,
+                kind: Reloc::X86GOTPCRel4,
+                name: ModuleRelocTarget::User {
+                    namespace: 0,
+                    index: original_id.as_u32(),
+                },
+                addend: -4,
+            };
+            self.module.define_function_bytes(stub_id, 8, &bytes, &[reloc])
+                .unwrap_or_else(|e| panic!("failed to define variadic stub: {e}"));
+        }
+    }
+
+    /// Get or create a local stub function for a variadic call on x86_64.
+    /// Returns the stub's FuncId.
+    fn get_variadic_stub(&mut self, name: &str, original_id: FuncId) -> FuncId {
+        if let Some(&(stub_id, _)) = self.variadic_stubs.get(name) {
+            return stub_id;
+        }
+        let stub_name = format!("__va_stub_{name}");
+        let mut stub_sig = self.module.make_signature();
+        stub_sig.returns.push(AbiParam::new(I64));
+        let stub_id = self.module.declare_function(&stub_name, Linkage::Local, &stub_sig)
+            .unwrap_or_else(|e| panic!("failed to declare variadic stub '{stub_name}': {e}"));
+        self.variadic_stubs.insert(name.to_string(), (stub_id, original_id));
+        stub_id
     }
 
     fn declare_function(&mut self, fdef: &FunctionDef) {

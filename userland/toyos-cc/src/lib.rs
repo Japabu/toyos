@@ -64,6 +64,7 @@ fn compile_inner(
     let module = emit::create_module(&obj_name, target);
     let mut cg = codegen::Codegen::new(module, type_env);
     cg.compile_unit(&tu);
+    cg.define_variadic_stubs();
 
     emit::finish(cg.module)
 }

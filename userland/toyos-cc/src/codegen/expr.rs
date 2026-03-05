@@ -1042,12 +1042,24 @@ impl Codegen {
             };
             let func_ref = self.module.declare_func_in_func(func_id, ctx.builder.func);
 
+            // On x86_64, variadic calls go through a local stub that sets AL
+            // (number of XMM registers used) per the SysV ABI. Cranelift cannot
+            // set AL natively, so the stub does it with raw machine code.
+            let use_variadic_stub = self.arch == Arch::X86_64
+                && fixed_param_count.is_some();
+            let call_func_ref = if use_variadic_stub {
+                let stub_id = self.get_variadic_stub(name, func_id);
+                self.module.declare_func_in_func(stub_id, ctx.builder.func)
+            } else {
+                func_ref
+            };
+
             // If declared sig doesn't match call args, use indirect call
             let decl_sig = &self.module.declarations().get_function_decl(func_id).signature;
             let declared_param_count = decl_sig.params.len();
-            let call = if declared_param_count != coerced_args.len() {
+            let call = if use_variadic_stub || declared_param_count != coerced_args.len() {
                 let sig_ref = ctx.builder.import_signature(call_sig);
-                let func_addr = ctx.builder.ins().func_addr(I64, func_ref);
+                let func_addr = ctx.builder.ins().func_addr(I64, call_func_ref);
                 ctx.builder.ins().call_indirect(sig_ref, func_addr, &coerced_args)
             } else {
                 let types_match = decl_sig.params.iter().zip(coerced_args.iter())
