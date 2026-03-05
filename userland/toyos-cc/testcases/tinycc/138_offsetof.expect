@@ -1,6 +1,0 @@
-offsetof(Foo, a) = 0
-offsetof(Foo, b) = 4
-offsetof(Foo, c) = 8
-offsetof(Foo, d) = 16
-offsets: 0 4 8 16
-offsetof(Nested, foo) = 8

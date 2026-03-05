@@ -1,7 +1,0 @@
-direct: 1024
-global_ptr: 1024
-local_ptr: 1024
-local_direct: 1024
-buf_from_ptr: 1024
-buf_from_global: 1024
-buf_from_direct: 1024

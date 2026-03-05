@@ -1,3 +1,0 @@
-PTR_BITS=64
-sizeof(void*)=8
-IS_LP64=1

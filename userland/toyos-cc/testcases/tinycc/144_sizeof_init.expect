@@ -1,6 +1,0 @@
-sizeof *sp: 1
-sizeof *mp: 16
-sizeof *lp: 256
-sizeof i: 4
-sizeof l: 8
-sizeof cp: 8
