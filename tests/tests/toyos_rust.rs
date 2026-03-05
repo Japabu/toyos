@@ -1,6 +1,7 @@
 use std::path::Path;
+use std::time::Duration;
 use toyos_tests::compile;
-use toyos_tests::qemu;
+use toyos_tests::qemu::{self, QemuInstance};
 
 #[test]
 #[ignore] // Run with: cargo test --test toyos_rust -- --ignored
@@ -13,47 +14,46 @@ fn toyos_rust_tests() {
         return;
     }
 
-    // Build all Rust test binaries for ToyOS
     let toyos_ld = qemu_toyos_ld(&repo);
-    let rust_bins = qemu::build_toyos_bins_public(&rust_tests_dir, &toyos_ld);
+    let rust_bins = qemu::build_toyos_bins(&rust_tests_dir, &toyos_ld);
 
     if rust_bins.is_empty() {
         eprintln!("No Rust test binaries found, skipping");
         return;
     }
 
-    // Run all tests in QEMU
-    let session = qemu::run_qemu_tests(&[], &rust_bins);
+    let mut qemu = QemuInstance::boot(&[], &rust_bins);
 
-    // Verify results — assert-based, exit 0 = pass
     let mut failures = Vec::new();
-    let total = session.results.len();
     let mut passed = 0usize;
+    let total = rust_bins.len();
 
-    for result in &session.results {
-        let test_name = result.name.strip_prefix("test_rs_").unwrap_or(&result.name);
+    for (name, _) in &rust_bins {
+        let test_name = format!("test_rs_{name}");
+        let result = qemu.run_test(&test_name, Duration::from_secs(30));
+        let display_name = result.name.strip_prefix("test_rs_").unwrap_or(&result.name);
 
         if let Some(err) = &result.error {
-            eprintln!("FAIL {test_name}: error: {err}");
-            failures.push(format!("{test_name}: error: {err}"));
+            eprintln!("FAIL {display_name}: error: {err}");
+            failures.push(format!("{display_name}: error: {err}"));
             continue;
         }
 
         match result.exit_code {
             Some(0) => {
-                eprintln!("PASS {test_name}");
+                eprintln!("PASS {display_name}");
                 passed += 1;
             }
             Some(code) => {
-                eprintln!("FAIL {test_name}: exited with code {code}");
+                eprintln!("FAIL {display_name}: exited with code {code}");
                 failures.push(format!(
-                    "{test_name}: exited with code {code}\nstdout:\n{}",
+                    "{display_name}: exited with code {code}\nstdout:\n{}",
                     result.stdout
                 ));
             }
             None => {
-                eprintln!("FAIL {test_name}: no exit code");
-                failures.push(format!("{test_name}: no exit code\nstdout:\n{}", result.stdout));
+                eprintln!("FAIL {display_name}: no exit code");
+                failures.push(format!("{display_name}: no exit code\nstdout:\n{}", result.stdout));
             }
         }
     }
@@ -76,7 +76,6 @@ fn qemu_toyos_ld(repo: &Path) -> std::path::PathBuf {
     if path.exists() {
         return path;
     }
-    // Build it
     assert!(
         std::process::Command::new("cargo")
             .args(["build", "--release", "--target", host])

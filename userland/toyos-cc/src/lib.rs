@@ -30,22 +30,10 @@ impl Default for CompileOptions {
 /// Compile a C source string to object file bytes.
 ///
 /// `filename` is used for error messages and `__FILE__`.
-/// Uses a large stack internally (128 MB) for deeply nested expressions.
+/// Thread-safe: can be called from multiple threads concurrently.
+/// Deep recursion is handled by `stacker::maybe_grow` in parsing and codegen.
 pub fn compile(source: &str, filename: &str, options: &CompileOptions) -> Vec<u8> {
-    let source = source.to_string();
-    let filename = filename.to_string();
-    let include_paths = options.include_paths.clone();
-    let defines = options.defines.clone();
-    let target = options.target.clone();
-
-    std::thread::Builder::new()
-        .stack_size(128 * 1024 * 1024)
-        .spawn(move || {
-            compile_inner(&source, &filename, &include_paths, &defines, target.as_deref())
-        })
-        .unwrap()
-        .join()
-        .unwrap()
+    compile_inner(source, filename, &options.include_paths, &options.defines, options.target.as_deref())
 }
 
 fn compile_inner(

@@ -1,6 +1,8 @@
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::{env, fs};
+use std::process::{Command, Output, Stdio};
+use std::time::Duration;
+use std::{env, fs, thread};
+use wait_timeout::ChildExt;
 
 /// Root of the repository.
 pub fn repo_root() -> PathBuf {
@@ -187,6 +189,45 @@ fn link_with_system_cc(obj: &[u8], extra_objs: &[Vec<u8>], name: &str, target: O
     bin
 }
 
+const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Run a command with a timeout. Kills the child if it exceeds the deadline.
+fn run_with_timeout(cmd: &mut Command, name: &str, label: &str) -> Output {
+    use std::io::Read;
+
+    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn().unwrap_or_else(|e| {
+        panic!("failed to run {name} ({label}): {e}");
+    });
+    // Drain stdout/stderr in background threads to prevent pipe deadlocks
+    let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let stdout_thread = thread::spawn(move || {
+        let mut buf = Vec::new();
+        let mut r = stdout;
+        r.read_to_end(&mut buf).ok();
+        buf
+    });
+    let stderr_thread = thread::spawn(move || {
+        let mut buf = Vec::new();
+        let mut r = stderr;
+        r.read_to_end(&mut buf).ok();
+        buf
+    });
+    match child.wait_timeout(TEST_TIMEOUT).expect("wait failed") {
+        Some(status) => Output {
+            status,
+            stdout: stdout_thread.join().unwrap_or_default(),
+            stderr: stderr_thread.join().unwrap_or_default(),
+        },
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("test binary {name} ({label}) timed out after {}s", TEST_TIMEOUT.as_secs());
+        }
+    }
+}
+
 /// Compile, link with system libc, run a C test on the host.
 pub fn run_host_test_system_libc(name: &str, args: &[&str], target: Option<&str>) {
     let label = format!("syslibc-{}", target.unwrap_or("native"));
@@ -214,9 +255,7 @@ pub fn run_host_test_system_libc(name: &str, args: &[&str], target: Option<&str>
     };
     cmd.args(args).current_dir(&dir);
 
-    let run = cmd.output().unwrap_or_else(|e| {
-        panic!("failed to run {name} ({label}): {e}");
-    });
+    let run = run_with_timeout(&mut cmd, name, &label);
 
     let _ = fs::remove_file(&bin);
 
@@ -271,9 +310,7 @@ pub fn run_host_test(name: &str, args: &[&str], target: Option<&str>) {
     };
     cmd.args(args).current_dir(&dir);
 
-    let run = cmd.output().unwrap_or_else(|e| {
-        panic!("failed to run {name} ({label}): {e}");
-    });
+    let run = run_with_timeout(&mut cmd, name, label);
 
     let _ = fs::remove_file(&bin);
 

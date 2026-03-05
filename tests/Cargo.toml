@@ -9,6 +9,7 @@ toyos-ld = { path = "../userland/toyos-ld" }
 tyfs = { path = "../tyfs" }
 fatfs = "0.3.6"
 gpt = "3.1.0"
+wait-timeout = "0.2.1"
 
 [patch.crates-io]
 target-lexicon = { path = "../userland/target-lexicon" }
