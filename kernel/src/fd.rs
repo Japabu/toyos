@@ -180,7 +180,24 @@ pub fn try_read(table: &mut FdTable, fd: u64, buf: &mut [u8]) -> Option<u64> {
             buf[..count].copy_from_slice(&bytes[..count]);
             Some(count as u64)
         }
-        Descriptor::PipeWrite(_) | Descriptor::TtyWrite(_) | Descriptor::SerialConsole => Some(u64::MAX),
+        Descriptor::PipeWrite(_) | Descriptor::TtyWrite(_) => Some(u64::MAX),
+        Descriptor::SerialConsole => {
+            // Read from serial port (non-blocking: return None if no data)
+            let mut count = 0usize;
+            while count < buf.len() {
+                if let Some(b) = serial::try_read_byte() {
+                    buf[count] = b;
+                    count += 1;
+                    // Return after each line for interactive use
+                    if b == b'\n' || b == b'\r' { break; }
+                } else if count > 0 {
+                    break;
+                } else {
+                    return None; // No data available, block
+                }
+            }
+            Some(count as u64)
+        }
     }
 }
 
@@ -296,6 +313,7 @@ pub fn has_data(table: &FdTable, fd: u64) -> bool {
         Some(Descriptor::Keyboard) => keyboard::has_data(),
         Some(Descriptor::Mouse) => mouse::has_data(),
         Some(Descriptor::File(_)) | Some(Descriptor::Framebuffer(_)) => true,
+        Some(Descriptor::SerialConsole) => serial::has_data(),
         _ => false,
     }
 }

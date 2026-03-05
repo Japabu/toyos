@@ -38,4 +38,20 @@ fn write_serial(a: char) {
     outb(PORT, a as u8);
 }
 
+/// Check if a byte is available to read from the serial port.
+pub fn has_data() -> bool {
+    inb(PORT + 5) & 0x01 != 0
+}
 
+/// Read one byte from the serial port (blocks until data available).
+pub fn read_byte() -> u8 {
+    while !has_data() {
+        core::hint::spin_loop();
+    }
+    inb(PORT)
+}
+
+/// Try to read one byte without blocking.
+pub fn try_read_byte() -> Option<u8> {
+    if has_data() { Some(inb(PORT)) } else { None }
+}

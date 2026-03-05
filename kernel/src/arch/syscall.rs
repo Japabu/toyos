@@ -291,6 +291,13 @@ fn sys_read(fd_num: u64, buf: &mut [u8]) -> u64 {
                     Some(fd::Descriptor::Keyboard) => Err(Some(process::ProcessState::BlockedKeyboard)),
                     Some(fd::Descriptor::PipeRead(id)) | Some(fd::Descriptor::TtyRead(id)) =>
                         Err(Some(process::ProcessState::BlockedPipeRead(*id))),
+                    Some(fd::Descriptor::SerialConsole) => {
+                        // Poll serial every 10ms
+                        let deadline = crate::clock::nanos_since_boot() + 10_000_000;
+                        let mut poll_fds = [0u64; 64];
+                        poll_fds[0] = fd_num;
+                        Err(Some(process::ProcessState::BlockedPoll { fds: poll_fds, len: 1, deadline }))
+                    }
                     _ => Err(None),
                 },
             }
