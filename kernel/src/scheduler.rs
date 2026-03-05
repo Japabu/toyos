@@ -59,7 +59,10 @@ fn schedule(cur_state: ProcessState) {
         }
 
         // Switch to another process.
-        let new_proc = table.procs.get(new_pid).unwrap();
+        let new_proc = table.procs.get(new_pid).unwrap_or_else(|| {
+            let keys: alloc::vec::Vec<u32> = table.procs.iter().map(|(pid, _)| pid).collect();
+            panic!("schedule: pid {new_pid} vanished after scan (cur={cur_pid}, keys={keys:?})");
+        });
         let new_rsp = new_proc.kernel_rsp;
         let new_cr3 = new_proc.cr3;
         let new_fs_base = new_proc.fs_base;
@@ -131,7 +134,10 @@ fn cpu_idle_loop() -> ! {
                 .map(|(pid, _)| pid);
 
             if let Some(new_pid) = ready {
-                let new_proc = table.procs.get(new_pid).unwrap();
+                let new_proc = table.procs.get(new_pid).unwrap_or_else(|| {
+                    let keys: alloc::vec::Vec<u32> = table.procs.iter().map(|(pid, _)| pid).collect();
+                    panic!("idle: pid {new_pid} vanished after scan (keys={keys:?})");
+                });
                 let new_rsp = new_proc.kernel_rsp;
                 let new_cr3 = new_proc.cr3;
                 let new_fs_base = new_proc.fs_base;

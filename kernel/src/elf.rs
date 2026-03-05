@@ -7,8 +7,22 @@ use elf::ElfBytes;
 use elf::endian::AnyEndian;
 use elf::abi::{
     PT_LOAD, PT_TLS, PT_DYNAMIC, ET_DYN, EM_X86_64, R_X86_64_RELATIVE, R_X86_64_GLOB_DAT,
-    DT_SYMTAB, DT_STRTAB, DT_NULL, DT_NEEDED, DT_RELA, DT_RELASZ, SHT_DYNSYM,
+    DT_SYMTAB, DT_STRTAB, DT_STRSZ, DT_NULL, DT_NEEDED, DT_RELA, DT_RELASZ, SHT_DYNSYM,
 };
+
+/// Read a null-terminated string from `base + offset`, bounded by `max_size`.
+/// Returns `""` if the offset is out of bounds or no null terminator is found.
+fn bounded_cstr(base: u64, offset: u64, max_size: u64) -> &'static str {
+    if offset >= max_size { return ""; }
+    let ptr = (base + offset) as *const u8;
+    let remaining = (max_size - offset) as usize;
+    let mut len = 0;
+    while len < remaining {
+        if unsafe { *ptr.add(len) } == 0 { break; }
+        len += 1;
+    }
+    unsafe { core::str::from_utf8_unchecked(core::slice::from_raw_parts(ptr, len)) }
+}
 
 /// Metadata about a loaded ELF binary (no ownership — the OwnedAlloc is separate).
 pub struct LoadedElfInfo {
@@ -133,6 +147,7 @@ pub struct LoadedLib {
     pub base: u64,
     pub dynsym: u64,
     pub dynstr: u64,
+    pub dynstr_size: u64,
     pub sym_count: usize,
 }
 
@@ -204,12 +219,12 @@ pub fn load_shared_lib(data: &[u8]) -> Result<LoadedLib, &'static str> {
         }
     }
 
-    // Parse PT_DYNAMIC to find DT_SYMTAB and DT_STRTAB (file offsets in the loaded image)
+    // Parse PT_DYNAMIC to find DT_SYMTAB, DT_STRTAB, DT_STRSZ
     let mut symtab_vaddr = 0u64;
     let mut strtab_vaddr = 0u64;
+    let mut strtab_size = 0u64;
     for phdr in segments.iter() {
         if phdr.p_type == PT_DYNAMIC {
-            // Read dynamic entries from loaded memory
             let dyn_addr = (base + phdr.p_vaddr) as *const u8;
             let dyn_size = phdr.p_filesz as usize;
             let mut offset = 0;
@@ -219,6 +234,7 @@ pub fn load_shared_lib(data: &[u8]) -> Result<LoadedLib, &'static str> {
                 match d_tag {
                     DT_SYMTAB => symtab_vaddr = d_val,
                     DT_STRTAB => strtab_vaddr = d_val,
+                    DT_STRSZ => strtab_size = d_val,
                     DT_NULL => break,
                     _ => {}
                 }
@@ -244,7 +260,7 @@ pub fn load_shared_lib(data: &[u8]) -> Result<LoadedLib, &'static str> {
     log!("dlopen: loaded {} bytes at {:#x}, {} relocs, {} dynsyms",
         load_size, base_ptr as u64, reloc_count, sym_count);
 
-    Ok(LoadedLib { alloc, base, dynsym, dynstr, sym_count })
+    Ok(LoadedLib { alloc, base, dynsym, dynstr, dynstr_size: strtab_size, sym_count })
 }
 
 /// Look up a symbol by name in a loaded shared library.
@@ -262,14 +278,8 @@ pub fn dlsym(lib: &LoadedLib, name: &str) -> u64 {
             continue;
         }
 
-        // Read symbol name from dynstr
-        let name_ptr = (lib.dynstr + st_name as u64) as *const u8;
-        let sym_name = unsafe {
-            let mut len = 0;
-            while *name_ptr.add(len) != 0 { len += 1; }
-            core::str::from_utf8_unchecked(core::slice::from_raw_parts(name_ptr, len))
-        };
-
+        // Read symbol name from dynstr (bounded)
+        let sym_name = bounded_cstr(lib.dynstr, st_name as u64, lib.dynstr_size);
         if sym_name == name {
             return lib.base + st_value;
         }
@@ -302,6 +312,7 @@ pub fn resolve_dynamic_deps(
     // Find PT_DYNAMIC and parse dynamic entries
     let mut symtab_vaddr = 0u64;
     let mut strtab_vaddr = 0u64;
+    let mut strtab_size = 0u64;
     let mut rela_vaddr = 0u64;
     let mut rela_size = 0u64;
     let mut needed_offsets = alloc::vec::Vec::new();
@@ -320,6 +331,7 @@ pub fn resolve_dynamic_deps(
                 DT_NEEDED => needed_offsets.push(d_val),
                 DT_SYMTAB => symtab_vaddr = d_val,
                 DT_STRTAB => strtab_vaddr = d_val,
+                DT_STRSZ => strtab_size = d_val,
                 DT_RELA => rela_vaddr = d_val,
                 DT_RELASZ => rela_size = d_val,
                 DT_NULL => break,
@@ -333,19 +345,13 @@ pub fn resolve_dynamic_deps(
         return Ok(alloc::vec::Vec::new());
     }
 
-    // Read DT_NEEDED filenames from .dynstr (loaded in memory at base + strtab_vaddr)
-    let strtab_ptr = (base + strtab_vaddr) as *const u8;
+    let dynstr = base + strtab_vaddr;
     let exe_dir = exe_path.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
 
     let mut libs = alloc::vec::Vec::new();
 
     for &name_offset in &needed_offsets {
-        let name_ptr = unsafe { strtab_ptr.add(name_offset as usize) };
-        let lib_name = unsafe {
-            let mut len = 0;
-            while *name_ptr.add(len) != 0 { len += 1; }
-            core::str::from_utf8_unchecked(core::slice::from_raw_parts(name_ptr, len))
-        };
+        let lib_name = bounded_cstr(dynstr, name_offset, strtab_size);
 
         let lib_path = alloc::format!("{}/{}", exe_dir, lib_name);
         log!("dynamic: loading {} for {}", lib_path, exe_path);
@@ -388,12 +394,7 @@ pub fn resolve_dynamic_deps(
                     // Read symbol name from executable's import .dynsym/.dynstr
                     let sym_entry = unsafe { symtab_ptr.add(sym_idx as usize * 24) };
                     let st_name = unsafe { *(sym_entry as *const u32) };
-                    let name_ptr = unsafe { strtab_ptr.add(st_name as usize) };
-                    let sym_name = unsafe {
-                        let mut len = 0;
-                        while *name_ptr.add(len) != 0 { len += 1; }
-                        core::str::from_utf8_unchecked(core::slice::from_raw_parts(name_ptr, len))
-                    };
+                    let sym_name = bounded_cstr(dynstr, st_name as u64, strtab_size);
 
                     // Search all loaded libs for this symbol
                     let mut resolved = 0u64;

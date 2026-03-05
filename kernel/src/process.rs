@@ -124,7 +124,7 @@ pub struct Process {
     pub kernel_rsp: u64,
     // Per-process state
     pub fds: FdTable,
-    pub user_heap: Vec<(u64, u64)>,
+    pub user_heap: crate::user_heap::UserHeap,
     pub cwd: String,
     pub messages: MessageQueue,
     /// PID whose user_heap to use for alloc/free. Self for processes, parent for threads.
@@ -344,7 +344,7 @@ pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64) -> Option<u32> {
         kernel_stack: ks_alloc,
         kernel_rsp: ks_rsp,
         fds: child_fds,
-        user_heap: Vec::new(), // unused — routes through heap_owner
+        user_heap: crate::user_heap::UserHeap::new(), // unused — routes through heap_owner
         messages: MessageQueue::new(),
         cwd: parent_cwd,
         heap_owner: parent_heap_owner,
@@ -475,7 +475,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<u32>) -> Option<u32> {
         kernel_stack: ks_alloc,
         kernel_rsp: ks_rsp,
         fds,
-        user_heap: crate::user_heap::new_heap(),
+        user_heap: crate::user_heap::UserHeap::new(),
         messages: MessageQueue::new(),
         cwd,
         heap_owner: 0,

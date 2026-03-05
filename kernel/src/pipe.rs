@@ -110,7 +110,7 @@ pub fn all_empty() -> bool {
 pub fn add_reader(pipe_id: usize) {
     with_pipes_mut(|pipes| {
         if let Some(pipe) = pipes.get_mut(pipe_id) {
-            pipe.readers += 1;
+            pipe.readers = pipe.readers.saturating_add(1);
         }
     });
 }
@@ -118,7 +118,7 @@ pub fn add_reader(pipe_id: usize) {
 pub fn add_writer(pipe_id: usize) {
     with_pipes_mut(|pipes| {
         if let Some(pipe) = pipes.get_mut(pipe_id) {
-            pipe.writers += 1;
+            pipe.writers = pipe.writers.saturating_add(1);
         }
     });
 }
@@ -126,7 +126,7 @@ pub fn add_writer(pipe_id: usize) {
 pub fn close_read(pipe_id: usize) {
     with_pipes_mut(|pipes| {
         let should_remove = pipes.get_mut(pipe_id).map(|pipe| {
-            pipe.readers -= 1;
+            pipe.readers = pipe.readers.saturating_sub(1);
             pipe.readers == 0 && pipe.writers == 0
         });
         if should_remove == Some(true) {
@@ -138,7 +138,7 @@ pub fn close_read(pipe_id: usize) {
 pub fn close_write(pipe_id: usize) {
     with_pipes_mut(|pipes| {
         let should_remove = pipes.get_mut(pipe_id).map(|pipe| {
-            pipe.writers -= 1;
+            pipe.writers = pipe.writers.saturating_sub(1);
             pipe.readers == 0 && pipe.writers == 0
         });
         if should_remove == Some(true) {

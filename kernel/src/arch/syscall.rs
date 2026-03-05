@@ -21,7 +21,7 @@ use toyos_abi::syscall::*;
 
 /// Run a closure with the heap owner's user_heap. For normal processes this is
 /// the process itself; for threads it's the parent process.
-fn with_heap_owner<R>(f: impl FnOnce(&mut Vec<(u64, u64)>) -> R) -> R {
+fn with_heap_owner<R>(f: impl FnOnce(&mut user_heap::UserHeap) -> R) -> R {
     let mut guard = process::PROCESS_TABLE.lock();
     let table = guard.as_mut().expect("process table not initialized");
     let pid = crate::arch::percpu::current_pid();
@@ -163,7 +163,9 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         SYS_MARK_TTY => process::with_current_mut(|proc| fd::mark_tty(&mut proc.fds, a1)),
         SYS_SEND_MSG => {
             let Some(user_msg) = ctx.user_ref::<message::UserMessage>(a2) else { return u64::MAX };
+            const MAX_MSG_PAYLOAD: u64 = 64 * 1024;
             let payload = if user_msg.data != 0 && user_msg.len != 0 {
+                if user_msg.len > MAX_MSG_PAYLOAD { return u64::MAX; }
                 let Some(data) = ctx.user_slice(user_msg.data, user_msg.len) else { return u64::MAX };
                 data.to_vec()
             } else {

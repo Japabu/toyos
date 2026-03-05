@@ -229,16 +229,19 @@ impl Vfs {
     }
 
     pub fn read_file(&mut self, path: &str) -> Result<Cow<'static, [u8]>, &'static str> {
-        // read_file always takes absolute paths
+        self.read_file_depth(path, 0)
+    }
+
+    fn read_file_depth(&mut self, path: &str, depth: u32) -> Result<Cow<'static, [u8]>, &'static str> {
+        if depth > 10 { return Err("too many symlinks"); }
         let (mount, file) = self.resolve_path("/", path);
         if file.is_empty() {
             return Err("not found");
         }
         let fs = self.mounts.get_mut(&mount).ok_or("not found")?;
         if let Some(target) = fs.read_link(&file) {
-            // Symlink target is resolved within the same mount
             let resolved = format!("/{}/{}", mount, target);
-            return self.read_file(&resolved);
+            return self.read_file_depth(&resolved, depth + 1);
         }
         fs.read_file(&file)
     }
