@@ -205,7 +205,7 @@ impl Codegen {
         else { ctx.builder.ins().uextend(target, val) }
     }
 
-    pub(crate) fn coerce(&self, ctx: &mut FuncCtx, val: Value, target: ir::Type) -> Value {
+    fn coerce(&self, ctx: &mut FuncCtx, val: Value, target: ir::Type) -> Value {
         let val_type = ctx.builder.func.dfg.value_type(val);
         if val_type == target { return val; }
 
@@ -244,8 +244,7 @@ impl Codegen {
         val
     }
 
-    /// Like coerce, but uses zero-extension for integer widening (for unsigned types)
-    pub(crate) fn coerce_unsigned(&self, ctx: &mut FuncCtx, val: Value, target: ir::Type) -> Value {
+    fn coerce_unsigned(&self, ctx: &mut FuncCtx, val: Value, target: ir::Type) -> Value {
         let val_type = ctx.builder.func.dfg.value_type(val);
         if val_type == target { return val; }
         if val_type.is_int() && target.is_int() {

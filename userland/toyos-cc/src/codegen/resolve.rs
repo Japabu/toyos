@@ -489,8 +489,13 @@ impl Codegen {
                     }
                     DirectDeclarator::Ident(_) | DirectDeclarator::Array(..)
                     | DirectDeclarator::Function(..) => {
-                        let elem = self.apply_direct_declarator(base, inner);
-                        CType::Array(Box::new(elem), n)
+                        // C declarator inside-out: for `int a[6][2]`, the parser
+                        // builds Array(Array(Ident, 6), 2). The rightmost [2] is
+                        // closest to the element type, so we wrap base with our
+                        // dimension first, then let the inner declarator wrap that.
+                        // Result: Array(Array(Int, 2), 6) — array of 6 arrays of 2 ints.
+                        let arr_type = CType::Array(Box::new(base.clone()), n);
+                        self.apply_direct_declarator(&arr_type, inner)
                     }
                 }
             }
@@ -511,16 +516,17 @@ impl Codegen {
                 // parens wraps the function type (pointer-to-function), not the
                 // return type. Build the function type first, then let the Paren's
                 // declarator apply its pointers around it.
+                let unspecified = params_clone.unspecified_params;
                 match inner.as_ref() {
                     DirectDeclarator::Paren(inner_decl) => {
-                        let func_type = CType::Function(Box::new(base.clone()), param_types, params_clone.variadic);
+                        let func_type = CType::Function(Box::new(base.clone()), param_types, params_clone.variadic, unspecified);
                         let inner_decl = inner_decl.clone();
                         self.apply_declarator(&func_type, &inner_decl)
                     }
                     DirectDeclarator::Ident(_) | DirectDeclarator::Array(..)
                     | DirectDeclarator::Function(..) => {
                         let ret = self.apply_direct_declarator(base, inner);
-                        CType::Function(Box::new(ret), param_types, params_clone.variadic)
+                        CType::Function(Box::new(ret), param_types, params_clone.variadic, unspecified)
                     }
                 }
             }
@@ -585,11 +591,12 @@ impl Codegen {
                     let name = p.declarator.as_ref().map(|d| self.get_declarator_name(d)).filter(|n| !n.is_empty());
                     param_types.push(ParamType { name, ty });
                 }
+                let unspecified = params_clone.unspecified_params;
                 if let Some(inner) = inner {
                     let ret = self.apply_direct_abstract_declarator(base, inner);
-                    CType::Function(Box::new(ret), param_types, params_clone.variadic)
+                    CType::Function(Box::new(ret), param_types, params_clone.variadic, unspecified)
                 } else {
-                    CType::Function(Box::new(base.clone()), param_types, params_clone.variadic)
+                    CType::Function(Box::new(base.clone()), param_types, params_clone.variadic, unspecified)
                 }
             }
         }

@@ -75,9 +75,9 @@ impl Codegen {
                 // Indirect call: derive return type from callee's function pointer type
                 let callee_ty = self.expr_type(ctx, func);
                 match &callee_ty {
-                    CType::Function(ret, _, _) => ret.as_ref().clone(),
+                    CType::Function(ret, _, _, _) => ret.as_ref().clone(),
                     CType::Pointer(inner) => match inner.as_ref() {
-                        CType::Function(ret, _, _) => ret.as_ref().clone(),
+                        CType::Function(ret, _, _, _) => ret.as_ref().clone(),
                         _ => panic!("call through non-function pointer: {callee_ty:?}"),
                     },
                     _ => panic!("call on non-function type: {callee_ty:?}"),

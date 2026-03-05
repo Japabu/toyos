@@ -58,8 +58,8 @@ impl Codegen {
                     other => panic!("compile_addr: index on non-pointer/array type {other:?}"),
                 };
                 let arr_val = self.compile_expr(ctx, arr).raw();
-                let idx_raw = self.compile_expr(ctx, idx).raw();
-                let idx_val = self.coerce(ctx, idx_raw, I64);
+                let idx_tv = self.compile_expr(ctx, idx);
+                let idx_val = self.coerce_typed(ctx, idx_tv, I64);
                 let offset = ctx.builder.ins().imul_imm(idx_val, elem_size as i64);
                 ctx.builder.ins().iadd(arr_val, offset)
             }

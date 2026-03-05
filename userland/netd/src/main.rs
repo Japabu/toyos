@@ -175,7 +175,7 @@ impl NetDaemon {
     }
 
     fn send_error(pid: u32, code: u32) {
-        message::send(pid, Message::new(MSG_ERROR, ErrorResponse { code }));
+        message::send(pid, Message::new(MSG_ERROR, ErrorResponse { code })).ok();
     }
 
     fn handle_message(
@@ -264,7 +264,7 @@ impl NetDaemon {
         match socket.send_slice(data) {
             Ok(sent) => {
                 let resp = sent as u32;
-                message::send(sender, Message::new(MSG_RESULT, resp));
+                message::send(sender, Message::new(MSG_RESULT, resp)).ok();
             }
             Err(_) => Self::send_error(sender, ERR_CONNECTION_RESET),
         }
@@ -284,7 +284,7 @@ impl NetDaemon {
             match socket.recv_slice(&mut buf) {
                 Ok(n) => {
                     buf.truncate(n);
-                    message::send(sender, Message::from_bytes(MSG_RESULT, &buf));
+                    message::send(sender, Message::from_bytes(MSG_RESULT, &buf)).ok();
                 }
                 Err(_) => Self::send_error(sender, ERR_CONNECTION_RESET),
             }
@@ -293,7 +293,7 @@ impl NetDaemon {
 
         // EOF: connection closed by remote
         if !socket.may_recv() {
-            message::send(sender, Message::from_bytes(MSG_RESULT, &[]));
+            message::send(sender, Message::from_bytes(MSG_RESULT, &[])).ok();
             return;
         }
 
@@ -325,7 +325,7 @@ impl NetDaemon {
             }
             self.owners.remove(&req.socket_id);
         }
-        message::send(sender, Message::signal(MSG_RESULT));
+        message::send(sender, Message::signal(MSG_RESULT)).ok();
     }
 
     fn handle_tcp_bind(
@@ -354,7 +354,7 @@ impl NetDaemon {
             socket_id,
             bound_port: port,
             _pad: 0,
-        }));
+        })).ok();
     }
 
     fn handle_tcp_accept(
@@ -397,7 +397,7 @@ impl NetDaemon {
                 remote_addr,
                 remote_port: remote.port,
                 local_port,
-            }));
+            })).ok();
             return;
         }
 
@@ -425,7 +425,7 @@ impl NetDaemon {
         if req.how == 1 || req.how == 2 {
             socket.close();
         }
-        message::send(sender, Message::signal(MSG_RESULT));
+        message::send(sender, Message::signal(MSG_RESULT)).ok();
     }
 
     fn handle_udp_bind(
@@ -461,7 +461,7 @@ impl NetDaemon {
             socket_id,
             bound_port: port,
             _pad: 0,
-        }));
+        })).ok();
     }
 
     fn handle_udp_send_to(
@@ -490,7 +490,7 @@ impl NetDaemon {
         match socket.send_slice(data, endpoint) {
             Ok(()) => {
                 let sent = data.len() as u32;
-                message::send(sender, Message::new(MSG_RESULT, sent));
+                message::send(sender, Message::new(MSG_RESULT, sent)).ok();
             }
             Err(_) => Self::send_error(sender, ERR_OTHER),
         }
@@ -523,7 +523,7 @@ impl NetDaemon {
                     resp.extend_from_slice(&port.to_le_bytes());
                     resp.extend_from_slice(&[0, 0]);
                     resp.extend_from_slice(&buf[..n]);
-                    message::send(sender, Message::from_bytes(MSG_RESULT, &resp));
+                    message::send(sender, Message::from_bytes(MSG_RESULT, &resp)).ok();
                 }
                 Err(_) => Self::send_error(sender, ERR_OTHER),
             }
@@ -546,7 +546,7 @@ impl NetDaemon {
             socket_set.remove(handle);
             self.owners.remove(&req.socket_id);
         }
-        message::send(sender, Message::signal(MSG_RESULT));
+        message::send(sender, Message::signal(MSG_RESULT)).ok();
     }
 
     fn handle_dns_lookup(
@@ -571,7 +571,7 @@ impl NetDaemon {
             let mut resp = vec![1u8]; // count=1
             resp.push(4); // type=IPv4
             resp.extend_from_slice(&octets);
-            message::send(sender, Message::from_bytes(MSG_RESULT, &resp));
+            message::send(sender, Message::from_bytes(MSG_RESULT, &resp)).ok();
             return;
         }
 
@@ -602,7 +602,7 @@ impl NetDaemon {
         match req.option {
             OPT_NODELAY => {
                 socket.set_nagle_enabled(req.value == 0);
-                message::send(sender, Message::signal(MSG_RESULT));
+                message::send(sender, Message::signal(MSG_RESULT)).ok();
             }
             _ => Self::send_error(sender, ERR_INVALID_INPUT),
         }
@@ -623,7 +623,7 @@ impl NetDaemon {
         match req.option {
             OPT_NODELAY => {
                 let val = if socket.nagle_enabled() { 0u32 } else { 1u32 };
-                message::send(sender, Message::new(MSG_RESULT, SocketOptionResponse { value: val }));
+                message::send(sender, Message::new(MSG_RESULT, SocketOptionResponse { value: val })).ok();
             }
             _ => Self::send_error(sender, ERR_INVALID_INPUT),
         }
@@ -646,7 +646,7 @@ impl NetDaemon {
                     local_port,
                     _pad: 0,
                 };
-                message::send(pc.client_pid, Message::new(MSG_RESULT, resp));
+                message::send(pc.client_pid, Message::new(MSG_RESULT, resp)).ok();
                 self.pending_connects.swap_remove(i);
                 continue;
             }
@@ -688,7 +688,7 @@ impl NetDaemon {
                 match socket.recv_slice(&mut buf) {
                     Ok(n) => {
                         buf.truncate(n);
-                        message::send(client, Message::from_bytes(MSG_RESULT, &buf));
+                        message::send(client, Message::from_bytes(MSG_RESULT, &buf)).ok();
                     }
                     Err(_) => Self::send_error(client, ERR_CONNECTION_RESET),
                 }
@@ -697,7 +697,7 @@ impl NetDaemon {
             }
             if !socket.may_recv() {
                 // EOF
-                message::send(pr.client_pid, Message::from_bytes(MSG_RESULT, &[]));
+                message::send(pr.client_pid, Message::from_bytes(MSG_RESULT, &[])).ok();
                 self.pending_recvs.swap_remove(i);
                 continue;
             }
@@ -742,7 +742,7 @@ impl NetDaemon {
                     remote_addr,
                     remote_port: remote.port,
                     local_port,
-                }));
+                })).ok();
                 self.pending_accepts.swap_remove(i);
                 continue;
             }
@@ -774,7 +774,7 @@ impl NetDaemon {
                         resp.extend_from_slice(&port.to_le_bytes());
                         resp.extend_from_slice(&[0, 0]);
                         resp.extend_from_slice(&buf[..n]);
-                        message::send(client, Message::from_bytes(MSG_RESULT, &resp));
+                        message::send(client, Message::from_bytes(MSG_RESULT, &resp)).ok();
                     }
                     Err(_) => Self::send_error(client, ERR_OTHER),
                 }
@@ -806,7 +806,7 @@ impl NetDaemon {
                             }
                         }
                     }
-                    message::send(pd.client_pid, Message::from_bytes(MSG_RESULT, &resp));
+                    message::send(pd.client_pid, Message::from_bytes(MSG_RESULT, &resp)).ok();
                     self.pending_dns.swap_remove(i);
                     continue;
                 }

@@ -434,12 +434,12 @@ impl Parser {
         let mut variadic = false;
 
         if self.peek() == &TokenKind::RParen {
-            return ParamList { params, variadic };
+            return ParamList { params, variadic, unspecified_params: true };
         }
 
         if self.peek() == &TokenKind::Void && self.peek2() == &TokenKind::RParen {
             self.advance();
-            return ParamList { params, variadic };
+            return ParamList { params, variadic, unspecified_params: false };
         }
 
         if matches!(self.peek(), TokenKind::Ident(s) if !self.type_env.is_typedef(s)) {
@@ -458,7 +458,7 @@ impl Parser {
                     if !self.eat(&TokenKind::Comma) { break; }
                     if self.peek() == &TokenKind::Ellipsis { variadic = true; self.advance(); break; }
                 }
-                return ParamList { params, variadic };
+                return ParamList { params, variadic, unspecified_params: false };
             }
         }
 
@@ -480,7 +480,7 @@ impl Parser {
             if !self.eat(&TokenKind::Comma) { break; }
         }
 
-        ParamList { params, variadic }
+        ParamList { params, variadic, unspecified_params: false }
     }
 
     pub(super) fn type_name(&mut self) -> TypeName {

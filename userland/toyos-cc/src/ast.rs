@@ -153,6 +153,8 @@ pub enum DirectDeclarator {
 pub struct ParamList {
     pub params: Vec<ParamDecl>,
     pub variadic: bool,
+    /// True when declared with empty `()` (K&R unspecified params), false for `(void)` or explicit params.
+    pub unspecified_params: bool,
 }
 
 #[derive(Debug, Clone)]

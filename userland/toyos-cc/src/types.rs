@@ -26,7 +26,7 @@ pub enum CType {
     LongDouble,
     Pointer(Box<CType>),
     Array(Box<CType>, Option<usize>), // element type, optional size
-    Function(Box<CType>, Vec<ParamType>, bool), // return type, params, variadic
+    Function(Box<CType>, Vec<ParamType>, bool, bool), // return type, params, variadic, unspecified_params
     Struct(StructDef),
     Union(StructDef),
     Enum(EnumDef),

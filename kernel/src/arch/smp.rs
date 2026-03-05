@@ -79,6 +79,10 @@ const _: () = assert!(size_of::<TrampolineData>() == 0x78);
 
 // ---- Trampoline blob (linked into .text, copied to 0x8000 at runtime) ----
 
+// These are assembly labels — we must use inline asm to get their addresses
+// directly, bypassing GOT/PLT stubs that the PIE linker generates for
+// `extern "C" { static }` references (which resolve to stubs in wrong order).
+
 extern "C" {
     static _trampoline_start: u8;
     static _trampoline_end: u8;
@@ -87,10 +91,24 @@ extern "C" {
     static _ap_cs_reload: u8;
 }
 
+/// Get the address of an assembly label directly via LEA, bypassing GOT stubs.
+macro_rules! asm_label_addr {
+    ($label:ident) => {{
+        let addr: usize;
+        core::arch::asm!(
+            "lea {}, [rip + {}]",
+            out(reg) addr,
+            sym $label,
+            options(nostack, nomem),
+        );
+        addr as *const u8
+    }};
+}
+
 /// Copy the trampoline assembly blob to physical page 0x8000.
 fn copy_trampoline() {
-    let start = unsafe { &_trampoline_start as *const u8 };
-    let end = unsafe { &_trampoline_end as *const u8 };
+    let start = unsafe { asm_label_addr!(_trampoline_start) };
+    let end = unsafe { asm_label_addr!(_trampoline_end) };
     let size = end as usize - start as usize;
     assert!(size <= DATA_OFFSET, "trampoline code exceeds data block");
     unsafe {
@@ -100,15 +118,15 @@ fn copy_trampoline() {
 
 /// Compute the runtime physical address of a trampoline label.
 fn label_addr(label: *const u8) -> u32 {
-    let base = unsafe { &_trampoline_start as *const u8 } as usize;
+    let base = unsafe { asm_label_addr!(_trampoline_start) } as usize;
     0x8000u32 + (label as usize - base) as u32
 }
 
 /// Build the TrampolineData struct with all global (non-per-AP) fields filled.
 fn build_trampoline_data() -> TrampolineData {
-    let pm32_addr = label_addr(unsafe { &_ap_pm32 });
-    let lm64_addr = label_addr(unsafe { &_ap_lm64 });
-    let cs_reload_addr = label_addr(unsafe { &_ap_cs_reload }) as u64;
+    let pm32_addr = label_addr(unsafe { asm_label_addr!(_ap_pm32) });
+    let lm64_addr = label_addr(unsafe { asm_label_addr!(_ap_lm64) });
+    let cs_reload_addr = label_addr(unsafe { asm_label_addr!(_ap_cs_reload) }) as u64;
 
     // Read kernel's current GDT and IDT descriptors
     let mut kernel_gdt = DescriptorTablePointer { limit: 0, base: 0 };

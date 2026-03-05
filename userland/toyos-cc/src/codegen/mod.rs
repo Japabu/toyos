@@ -64,7 +64,7 @@ pub struct Codegen {
     func_ids: HashMap<String, FuncId>,                   // declared function IDs
     data_ids: HashMap<String, cranelift_module::DataId>,  // declared global data IDs
     defined_data: HashSet<cranelift_module::DataId>,      // data IDs that have been defined
-    tentative_data: Vec<(cranelift_module::DataId, usize)>, // tentative defs: (id, size)
+    tentative_data: Vec<(cranelift_module::DataId, usize, usize)>, // tentative defs: (id, size, align)
     global_types: HashMap<String, CType>,                 // C types of global variables
     local_types: HashMap<String, CType>,                  // C types of in-scope local variables (for sizeof in array sizes)
     func_ret_types: HashMap<String, CType>,               // C return types of functions
@@ -288,14 +288,16 @@ impl Codegen {
         // Finalize tentative definitions: zero-init any globals that were never given a real initializer.
         // Use the maximum size across all tentative entries for each data_id (handles incomplete
         // arrays like `int b[]` later completed by `int b[3]`).
-        let mut tentative_sizes: std::collections::HashMap<_, usize> = std::collections::HashMap::new();
-        for (data_id, size) in std::mem::take(&mut self.tentative_data) {
-            let entry = tentative_sizes.entry(data_id).or_default();
-            *entry = (*entry).max(size);
+        let mut tentative_info: std::collections::HashMap<_, (usize, usize)> = std::collections::HashMap::new();
+        for (data_id, size, align) in std::mem::take(&mut self.tentative_data) {
+            let entry = tentative_info.entry(data_id).or_insert((0, 1));
+            entry.0 = entry.0.max(size);
+            entry.1 = entry.1.max(align);
         }
-        for (data_id, size) in tentative_sizes {
+        for (data_id, (size, align)) in tentative_info {
             if !self.defined_data.contains(&data_id) {
                 let mut desc = DataDescription::new();
+                desc.set_align(align as u64);
                 desc.define_zeroinit(size.max(1));
                 self.module.define_data(data_id, &desc).unwrap_or_else(|e| panic!("failed to define data: {e:?}"));
                 self.defined_data.insert(data_id);
@@ -405,7 +407,7 @@ impl Codegen {
         let base_ty = self.resolve_type(&fdef.specifiers);
         let func_ty = self.apply_declarator(&base_ty, &fdef.declarator);
 
-        let CType::Function(ret_ty, param_types, variadic) = &func_ty else {
+        let CType::Function(ret_ty, param_types, variadic, _) = &func_ty else {
             panic!("declare_function '{name}': declarator resolved to non-function type {func_ty:?}");
         };
         let (ret_ty, param_types, variadic) = (ret_ty.as_ref(), param_types, *variadic);
@@ -417,8 +419,18 @@ impl Codegen {
         }
 
         self.func_sigs.insert(name.clone(), sig.clone());
-        let id = self.module.declare_function(&name, linkage, &sig)
-            .unwrap_or_else(|e| panic!("failed to declare function '{name}': {e}"));
+        let id = match self.module.declare_function(&name, linkage, &sig) {
+            Ok(id) => id,
+            Err(_) => {
+                // Previous declaration had incompatible sig (e.g. K&R forward decl).
+                // Re-use existing id — compile_function will use the module's locked sig.
+                if let Some(&id) = self.func_ids.get(&name) {
+                    id
+                } else {
+                    panic!("failed to declare function '{name}' and no prior id exists");
+                }
+            }
+        };
         self.func_ids.insert(name, id);
     }
 
@@ -431,7 +443,7 @@ impl Codegen {
         let base_ty = self.resolve_type(&fdef.specifiers);
         let func_ty = self.apply_declarator(&base_ty, &fdef.declarator);
 
-        let CType::Function(ref ret_box, ref param_types_ref, variadic) = func_ty else {
+        let CType::Function(ref ret_box, ref param_types_ref, variadic, _) = func_ty else {
             panic!("compile_function '{name}': declarator resolved to non-function type {func_ty:?}");
         };
         let (ret_ty, param_types, variadic) = (ret_box.as_ref().clone(), param_types_ref.clone(), variadic);
@@ -636,22 +648,20 @@ impl Codegen {
 
             // Function declarations (not definitions)
             if ty.is_function() {
-                if let CType::Function(ret, params, _) = &ty {
+                if let CType::Function(ret, params, variadic, unspecified) = &ty {
                     self.func_ret_types.insert(name.clone(), ret.as_ref().clone());
                     self.func_ctypes.insert(name.clone(), ty.clone());
-                    if params.is_empty() {
-                        // Unspecified params f() — don't lock in 0-param signature;
-                        // the real signature will come from the definition or first call
+                    // K&R empty `()` means unspecified params — don't lock in a
+                    // zero-param Cranelift signature that would conflict with the
+                    // actual definition later.
+                    if *unspecified && params.is_empty() {
                         continue;
                     }
-                }
-                if let CType::Function(ret, params, variadic) = &ty {
                     let sig = self.build_signature(ret, params, *variadic);
                     if *variadic {
                         self.variadic_funcs.insert(name.clone(), params.len());
                     }
                     self.func_sigs.insert(name.clone(), sig.clone());
-                    self.func_ret_types.insert(name.clone(), ret.as_ref().clone());
                     let id = self.module.declare_function(&name, Linkage::Import, &sig)
                         .unwrap_or_else(|e| panic!("failed to declare function '{name}': {e}"));
                     self.func_ids.insert(name.clone(), id);
@@ -717,7 +727,7 @@ impl Codegen {
                     self.module.define_data(data_id, &desc).unwrap_or_else(|e| panic!("failed to define data: {e:?}"));
                 } else {
                     // Tentative definition — defer zeroinit in case a real definition follows
-                    self.tentative_data.push((data_id, size));
+                    self.tentative_data.push((data_id, size, ty.align()));
                 }
             }
         }

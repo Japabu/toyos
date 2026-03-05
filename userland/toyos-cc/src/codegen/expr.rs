@@ -910,7 +910,8 @@ impl Codegen {
     }
 
     fn compile_call(&mut self, ctx: &mut FuncCtx, func: &Expr, args: &[Expr]) -> TypedValue {
-        let arg_vals: Vec<Value> = args.iter().map(|a| self.compile_expr(ctx, a).raw()).collect();
+        let arg_tvs: Vec<TypedValue> = args.iter().map(|a| self.compile_expr(ctx, a)).collect();
+        let arg_vals: Vec<Value> = arg_tvs.iter().map(|tv| tv.raw()).collect();
 
         let func_name = Self::extract_func_name(func);
 
@@ -924,7 +925,7 @@ impl Codegen {
             let is_var = ctx.locals.contains_key(name)
                 || self.data_ids.contains_key(name);
             if is_var {
-                return self.compile_indirect_call_var(ctx, func, &arg_vals);
+                return self.compile_indirect_call_var(ctx, func, &arg_vals, &arg_tvs);
             }
 
             // Detect struct return (uses sret convention)
@@ -1011,7 +1012,7 @@ impl Codegen {
                         }
                     }
                 } else {
-                    coerced_args.push(self.coerce(ctx, val, call_sig.params[i + sret_offset].value_type));
+                    coerced_args.push(self.coerce_typed(ctx, arg_tvs[i], call_sig.params[i + sret_offset].value_type));
                 }
             }
 
@@ -1066,7 +1067,12 @@ impl Codegen {
                     .all(|(p, &a)| p.value_type == ctx.builder.func.dfg.value_type(a));
                 if !types_match {
                     for (i, param) in decl_sig.params.iter().enumerate() {
-                        coerced_args[i] = self.coerce(ctx, coerced_args[i], param.value_type);
+                        let sign = if i >= sret_offset && (i - sret_offset) < arg_tvs.len() {
+                            arg_tvs[i - sret_offset].signedness()
+                        } else {
+                            Signedness::Signed
+                        };
+                        coerced_args[i] = self.coerce_typed(ctx, TypedValue::new(coerced_args[i], sign), param.value_type);
                     }
                 }
                 ctx.builder.ins().call(func_ref, &coerced_args)
@@ -1083,12 +1089,12 @@ impl Codegen {
             }
         } else {
             // Indirect call (function pointer expression, not a named variable)
-            self.compile_indirect_call_expr(ctx, func, &arg_vals)
+            self.compile_indirect_call_expr(ctx, func, &arg_vals, &arg_tvs)
         }
     }
 
     /// Indirect call through a named variable that holds a function pointer.
-    fn compile_indirect_call_var(&mut self, ctx: &mut FuncCtx, func: &Expr, arg_vals: &[Value]) -> TypedValue {
+    fn compile_indirect_call_var(&mut self, ctx: &mut FuncCtx, func: &Expr, arg_vals: &[Value], arg_tvs: &[TypedValue]) -> TypedValue {
         let func_ptr = if let Expr::Ident(name) = func {
             if matches!(ctx.locals.get(name), Some((LocalStorage::Ptr(_), _))) {
                 let addr = self.compile_expr(ctx, func).raw();
@@ -1099,26 +1105,26 @@ impl Codegen {
         } else {
             self.compile_expr(ctx, func).raw()
         };
-        self.compile_indirect_call_common(ctx, func, func_ptr, arg_vals)
+        self.compile_indirect_call_common(ctx, func, func_ptr, arg_vals, arg_tvs)
     }
 
     /// Indirect call through a computed function pointer expression.
-    fn compile_indirect_call_expr(&mut self, ctx: &mut FuncCtx, func: &Expr, arg_vals: &[Value]) -> TypedValue {
+    fn compile_indirect_call_expr(&mut self, ctx: &mut FuncCtx, func: &Expr, arg_vals: &[Value], arg_tvs: &[TypedValue]) -> TypedValue {
         let func_ptr = self.compile_expr(ctx, func).raw();
-        self.compile_indirect_call_common(ctx, func, func_ptr, arg_vals)
+        self.compile_indirect_call_common(ctx, func, func_ptr, arg_vals, arg_tvs)
     }
 
     /// Shared logic for indirect calls (both named-variable and expression-based).
     fn compile_indirect_call_common(
-        &mut self, ctx: &mut FuncCtx, func: &Expr, func_ptr: Value, arg_vals: &[Value],
+        &mut self, ctx: &mut FuncCtx, func: &Expr, func_ptr: Value, arg_vals: &[Value], arg_tvs: &[TypedValue],
     ) -> TypedValue {
         let fptr_ty = self.expr_type(ctx, func);
         let (ret_cty, param_ctypes, is_variadic) = match &fptr_ty {
             CType::Pointer(inner) => match inner.as_ref() {
-                CType::Function(ret, params, v) => (ret.as_ref().clone(), params.clone(), *v),
+                CType::Function(ret, params, v, _) => (ret.as_ref().clone(), params.clone(), *v),
                 other => panic!("indirect call: pointer to non-function type {other:?}"),
             },
-            CType::Function(ret, params, v) => (ret.as_ref().clone(), params.clone(), *v),
+            CType::Function(ret, params, v, _) => (ret.as_ref().clone(), params.clone(), *v),
             other => panic!("indirect call: expected function pointer, got {other:?}"),
         };
         let is_sret = Self::needs_sret(&ret_cty);
@@ -1163,7 +1169,7 @@ impl Codegen {
         for (i, &val) in arg_vals.iter().enumerate() {
             if i < param_ctypes.len() {
                 let target = if param_ctypes[i].ty.is_aggregate() { I64 } else { self.clif_type(&param_ctypes[i].ty) };
-                coerced.push(self.coerce(ctx, val, target));
+                coerced.push(self.coerce_typed(ctx, arg_tvs[i], target));
             } else {
                 let val_ty = ctx.builder.func.dfg.value_type(val);
                 if val_ty.is_float() {
@@ -1175,7 +1181,7 @@ impl Codegen {
                         Arch::X86_64 => coerced.push(f64_val),
                     }
                 } else {
-                    coerced.push(self.coerce(ctx, val, I64));
+                    coerced.push(self.coerce_typed(ctx, arg_tvs[i], I64));
                 }
             }
         }

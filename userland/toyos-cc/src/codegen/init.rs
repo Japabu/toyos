@@ -319,7 +319,7 @@ impl Codegen {
             else { panic!("cannot declare memset") }
         });
         let func_ref = self.module.declare_func_in_func(func_id, ctx.builder.func);
-        let val32 = self.coerce(ctx, val, I32);
+        let val32 = self.coerce_typed(ctx, TypedValue::signed(val), I32);
         ctx.builder.ins().call(func_ref, &[ptr, val32, size]);
     }
 
@@ -729,7 +729,7 @@ impl Codegen {
             if ty.is_pointer() {
                 let sig = if let Some(sig) = self.func_sigs.get(ref_name) {
                     sig.clone()
-                } else if let Some(CType::Function(ret, params, variadic)) = self.func_ctypes.get(ref_name) {
+                } else if let Some(CType::Function(ret, params, variadic, _)) = self.func_ctypes.get(ref_name) {
                     self.build_signature(ret, params, *variadic)
                 } else {
                     let mut sig = self.module.make_signature();

@@ -806,7 +806,7 @@ impl Codegen {
     fn compile_local_func_decl(&mut self, ctx: &mut FuncCtx, name: &str, ty: &CType) {
         // Remove any local variable shadow so calls see the function
         ctx.locals.remove(name);
-        let CType::Function(ref ret, ref params, variadic) = *ty else {
+        let CType::Function(ref ret, ref params, variadic, _) = *ty else {
             unreachable!()
         };
         self.func_ret_types.insert(name.to_string(), ret.as_ref().clone());

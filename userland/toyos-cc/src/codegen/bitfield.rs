@@ -9,8 +9,8 @@ impl Codegen {
             None | Some(0) => return val,
             Some(_) => unreachable!("w > 0 handled above"),
         };
-        // Zero-extend storage unit to I64 first
-        let val64 = self.coerce(ctx, val, I64);
+        // Zero-extend storage unit to I64 first (unsigned for bit manipulation)
+        let val64 = self.coerce_typed(ctx, TypedValue::unsigned(val), I64);
         let shifted = if bit_offset > 0 {
             ctx.builder.ins().ushr_imm(val64, bit_offset as i64)
         } else {
@@ -98,8 +98,8 @@ impl Codegen {
         let store_clif = self.clif_type(storage_ty);
         // Load the current storage unit
         let old = ctx.builder.ins().load(store_clif, MemFlags::new(), addr, 0);
-        let old64 = self.coerce(ctx, old, I64);
-        let new64 = self.coerce(ctx, new_val, I64);
+        let old64 = self.coerce_typed(ctx, TypedValue::unsigned(old), I64);
+        let new64 = self.coerce_typed(ctx, TypedValue::unsigned(new_val), I64);
         // Mask the new value to the bit width
         let field_mask = (1u64 << bw) - 1;
         let masked_new = ctx.builder.ins().band_imm(new64, field_mask as i64);
@@ -114,7 +114,7 @@ impl Codegen {
         let cleared = ctx.builder.ins().band_imm(old64, clear_mask);
         // Merge
         let merged = ctx.builder.ins().bor(cleared, shifted_new);
-        let merged = self.coerce(ctx, merged, store_clif);
+        let merged = self.coerce_typed(ctx, TypedValue::unsigned(merged), store_clif);
         ctx.builder.ins().store(MemFlags::new(), merged, addr, 0);
         new_val
     }
