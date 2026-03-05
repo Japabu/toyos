@@ -35,7 +35,15 @@ fn schedule(cur_state: ProcessState) {
     let table = guard.as_mut().expect("process table not initialized");
     let cur_pid = percpu::current_pid();
 
-    table.procs.get_mut(cur_pid).unwrap().state = cur_state;
+    // If current process was already removed (e.g. race with exit cleanup),
+    // log a warning and fall through to idle — nothing to save.
+    let cur_alive = if let Some(proc) = table.procs.get_mut(cur_pid) {
+        proc.state = cur_state;
+        true
+    } else {
+        crate::log!("schedule: warning: cur_pid {cur_pid} not in table, going to idle");
+        false
+    };
     idle_poll(table);
 
     // Round-robin: find smallest Ready PID > current, or wrap to smallest Ready PID
@@ -53,7 +61,7 @@ fn schedule(cur_state: ProcessState) {
     }
 
     if let Some(new_pid) = best_after.or(best_any) {
-        if new_pid == cur_pid {
+        if cur_alive && new_pid == cur_pid {
             table.procs.get_mut(cur_pid).unwrap().state = ProcessState::Running;
             return;
         }
@@ -71,9 +79,14 @@ fn schedule(cur_state: ProcessState) {
         table.procs.get_mut(new_pid).unwrap().state = ProcessState::Running;
         percpu::set_current_pid(new_pid);
 
-        // Save current FS base (TLS)
-        table.procs.get_mut(cur_pid).unwrap().fs_base = cpu::rdmsr(IA32_FS_BASE);
-        let old_rsp_ptr = &mut table.procs.get_mut(cur_pid).unwrap().kernel_rsp as *mut u64;
+        // Save current process state if it still exists
+        let old_rsp_ptr = if let Some(cur_proc) = table.procs.get_mut(cur_pid) {
+            cur_proc.fs_base = cpu::rdmsr(IA32_FS_BASE);
+            &mut cur_proc.kernel_rsp as *mut u64
+        } else {
+            // Process gone — use a dummy location; we'll never resume it.
+            percpu::idle_rsp_ptr()
+        };
         unsafe { percpu::set_kernel_stack(new_ks_top); }
 
         unsafe { cpu::write_cr3(new_cr3); }
@@ -87,9 +100,13 @@ fn schedule(cur_state: ProcessState) {
     }
 
     // No Ready process — switch to per-CPU idle stack.
-    // Save current FS base (TLS)
-    table.procs.get_mut(cur_pid).unwrap().fs_base = cpu::rdmsr(IA32_FS_BASE);
-    let old_rsp_ptr = &mut table.procs.get_mut(cur_pid).unwrap().kernel_rsp as *mut u64;
+    // Save current process state if it still exists
+    let old_rsp_ptr = if let Some(cur_proc) = table.procs.get_mut(cur_pid) {
+        cur_proc.fs_base = cpu::rdmsr(IA32_FS_BASE);
+        &mut cur_proc.kernel_rsp as *mut u64
+    } else {
+        percpu::idle_rsp_ptr()
+    };
     percpu::set_current_pid(u32::MAX);
     unsafe { percpu::set_kernel_stack(percpu::idle_stack_top()); }
 
