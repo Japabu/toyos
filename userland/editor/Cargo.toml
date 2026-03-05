@@ -1,0 +1,8 @@
+[package]
+name = "editor"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+window = { path = "../window" }
+font = { path = "../font" }
