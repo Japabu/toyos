@@ -11,6 +11,7 @@ impl core::fmt::Write for LogWriter {
 macro_rules! log {
     ($($arg:tt)*) => {{
         use core::fmt::Write;
+        let _ = write!($crate::log::LogWriter, "[kernel] ");
         let _ = writeln!($crate::log::LogWriter, $($arg)*);
     }};
 }

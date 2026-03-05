@@ -1,15 +1,7 @@
-#[macro_use]
-mod verbose;
-mod ast;
-mod codegen;
-mod emit;
-mod lex;
-mod parse;
-mod preprocess;
-mod types;
-
 use std::path::PathBuf;
 use std::{env, fs, process};
+
+use toyos_cc::CompileOptions;
 
 fn main() {
     // TCC has deeply nested expressions; use a larger stack
@@ -35,16 +27,17 @@ fn run() {
         }
     }
 
-    if args.verbose {
-        verbose::set(true);
-        eprintln!("toyos-cc: verbose mode enabled");
-    }
-
     if !args.preprocess_only {
         eprintln!("toyos-cc: starting");
     }
 
     let mut link_objects: Vec<(String, Vec<u8>)> = Vec::new();
+
+    let opts = CompileOptions {
+        include_paths: args.include_paths.clone(),
+        defines: args.defines.clone(),
+        target: args.target.clone(),
+    };
 
     for input in &args.inputs {
         // .o and .a files pass through to the linker
@@ -62,41 +55,18 @@ fn run() {
             panic!("toyos-cc: cannot read {}: {e}", input.display());
         });
 
-        if !args.preprocess_only {
-            eprintln!("toyos-cc: preprocessing...");
-        }
-        let mut pp = preprocess::Preprocessor::new(args.include_paths.clone(), args.defines.clone(), args.target.as_deref());
-        pp.suppress_line_markers = args.suppress_line_markers;
-        let preprocessed = pp.preprocess(&source, &input.to_string_lossy());
-        if !args.preprocess_only {
-            eprintln!("toyos-cc: preprocessing done, {} bytes", preprocessed.len());
-        }
-
         if args.preprocess_only {
+            let preprocessed = toyos_cc::preprocess_source(
+                &source,
+                &input.to_string_lossy(),
+                &opts,
+                args.suppress_line_markers,
+            );
             print!("{preprocessed}");
             continue;
         }
 
-        eprintln!("toyos-cc: lexing...");
-        let lexer = lex::Lexer::new(&preprocessed, &input.to_string_lossy());
-        let tokens = lexer.tokenize();
-        eprintln!("toyos-cc: lexing done, {} tokens", tokens.len());
-
-        eprintln!("toyos-cc: parsing...");
-        let parser = parse::Parser::new(tokens);
-        let (tu, type_env) = parser.parse();
-        eprintln!("toyos-cc: parsing done, {} decls", tu.len());
-
-        eprintln!("toyos-cc: codegen...");
-        let obj_name = args.output.as_ref()
-            .map(|o| o.to_string_lossy().into_owned())
-            .unwrap_or_else(|| input.with_extension("o").to_string_lossy().into_owned());
-
-        let module = emit::create_module(&obj_name, args.target.as_deref());
-        let mut cg = codegen::Codegen::new(module, type_env);
-        cg.compile_unit(&tu);
-
-        let object_bytes = emit::finish(cg.module);
+        let object_bytes = toyos_cc::compile(&source, &input.to_string_lossy(), &opts);
 
         if args.compile_only {
             let output_path = args.output.clone().unwrap_or_else(|| input.with_extension("o"));
@@ -144,7 +114,6 @@ struct Args {
     compile_only: bool,          // -c
     preprocess_only: bool,       // -E
     suppress_line_markers: bool, // -P
-    verbose: bool,               // -v / --verbose
 }
 
 fn parse_args() -> Args {
@@ -157,7 +126,6 @@ fn parse_args() -> Args {
     let mut compile_only = false;
     let mut preprocess_only = false;
     let mut suppress_line_markers = false;
-    let mut verbose = false;
     let mut i = 1;
 
     while i < argv.len() {
@@ -166,7 +134,7 @@ fn parse_args() -> Args {
             "-c" => compile_only = true,
             "-E" => preprocess_only = true,
             "-P" => suppress_line_markers = true,
-            "-v" | "--verbose" => verbose = true,
+            "-v" | "--verbose" => {}
             "--target" => { i += 1; target = Some(argv[i].clone()); }
             "-I" => { i += 1; include_paths.push(PathBuf::from(&argv[i])); }
             s if s.starts_with("-I") => include_paths.push(PathBuf::from(&s[2..])),
@@ -209,5 +177,5 @@ fn parse_args() -> Args {
         process::exit(1);
     }
 
-    Args { inputs, output, include_paths, defines, target, compile_only, preprocess_only, suppress_line_markers, verbose }
+    Args { inputs, output, include_paths, defines, target, compile_only, preprocess_only, suppress_line_markers }
 }

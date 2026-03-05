@@ -520,6 +520,25 @@ pub fn spawn_kernel(argv: &[&str]) -> u32 {
     spawn(&full_argv, fds, None).expect("spawn_kernel: failed to spawn")
 }
 
+/// Like `spawn_kernel`, but returns `None` instead of panicking if the binary
+/// is missing. Used for optional services that may not be present in the initrd.
+pub fn spawn_optional(argv: &[&str]) -> Option<u32> {
+    let path = argv[0];
+    let full_path = if path.starts_with('/') {
+        String::from(path)
+    } else {
+        alloc::format!("/initrd/{}", path)
+    };
+    let mut full_argv: Vec<&str> = Vec::with_capacity(argv.len());
+    full_argv.push(&full_path);
+    full_argv.extend_from_slice(&argv[1..]);
+    let mut fds = FdTable::new();
+    fds.insert_at(0, Descriptor::SerialConsole);
+    fds.insert_at(1, Descriptor::SerialConsole);
+    fds.insert_at(2, Descriptor::SerialConsole);
+    spawn(&full_argv, fds, None)
+}
+
 /// Exit the current process.
 pub fn exit(code: i32) -> ! {
     {
@@ -554,6 +573,8 @@ pub fn exit(code: i32) -> ! {
         }
 
         proc.state = ProcessState::Zombie(code);
+        let name = core::str::from_utf8(&proc.name).unwrap_or("?").trim_end_matches('\0');
+        log!("exit: {name} pid={pid} code={code}");
 
         if let Kind::Process { .. } = kind {
             if let Some(names) = NAME_REGISTRY.lock().as_mut() {

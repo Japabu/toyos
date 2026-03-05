@@ -152,34 +152,45 @@ fn kernel_main(
     virtio_net::init(ecam_base);
 
     // Initialize GPU: try VirtIO first, fall back to UEFI GOP
-    let (gpu_driver, gpu_info) = if let Some(result) = virtio_gpu::init(ecam_base) {
+    if let Some((gpu_driver, gpu_info)) = virtio_gpu::init(ecam_base) {
         log!("GPU: using VirtIO");
-        result
+        let fb_info = fd::FramebufferInfo {
+            token: gpu_info.tokens,
+            cursor_token: gpu_info.cursor_token,
+            width: gpu_info.width,
+            height: gpu_info.height,
+            stride: gpu_info.stride,
+            pixel_format: gpu_info.pixel_format,
+            flags: gpu_info.flags,
+        };
+        syscall::set_screen_size(fb_info.width, fb_info.height);
+        kernel::device::set_framebuffer_info(fb_info);
+        gpu::register(gpu_driver, gpu_info);
     } else if kernel_args.gop_framebuffer != 0 {
         log!("GPU: using UEFI GOP");
-        gop::init(
+        let (gpu_driver, gpu_info) = gop::init(
             kernel_args.gop_framebuffer,
             kernel_args.gop_framebuffer_size,
             kernel_args.gop_width,
             kernel_args.gop_height,
             kernel_args.gop_stride,
             kernel_args.gop_pixel_format,
-        )
+        );
+        let fb_info = fd::FramebufferInfo {
+            token: gpu_info.tokens,
+            cursor_token: gpu_info.cursor_token,
+            width: gpu_info.width,
+            height: gpu_info.height,
+            stride: gpu_info.stride,
+            pixel_format: gpu_info.pixel_format,
+            flags: gpu_info.flags,
+        };
+        syscall::set_screen_size(fb_info.width, fb_info.height);
+        kernel::device::set_framebuffer_info(fb_info);
+        gpu::register(gpu_driver, gpu_info);
     } else {
-        panic!("No GPU found");
+        log!("GPU: none found, running headless");
     };
-    let fb_info = fd::FramebufferInfo {
-        token: gpu_info.tokens,
-        cursor_token: gpu_info.cursor_token,
-        width: gpu_info.width,
-        height: gpu_info.height,
-        stride: gpu_info.stride,
-        pixel_format: gpu_info.pixel_format,
-        flags: gpu_info.flags,
-    };
-    syscall::set_screen_size(fb_info.width, fb_info.height);
-    kernel::device::set_framebuffer_info(fb_info);
-    gpu::register(gpu_driver, gpu_info);
 
     #[cfg(feature = "debug-wait")]
     {
@@ -195,7 +206,11 @@ fn kernel_main(
     assert!(!init_path.is_empty(), "bootloader must provide init_program");
     let args: Vec<&str> = init_path.split_whitespace().collect();
     process::spawn_kernel(&args);
-    process::spawn_kernel(&["/initrd/netd"]);
+
+    // Optional services — skip if binary not present in initrd
+    if let Some(pid) = process::spawn_optional(&["/initrd/netd"]) {
+        log!("spawned netd pid={pid}");
+    }
 
     // Signal APs and enter the scheduler idle loop (never returns)
     smp::set_ready();

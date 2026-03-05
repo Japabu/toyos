@@ -173,6 +173,9 @@ fn load_kernel_elf(kernel_elf_bytes: &[u8]) -> LoadedKernel {
     }
 }
 
+#[cfg(feature = "test-init")]
+static INIT_PROGRAM: &[u8] = b"test-runner";
+#[cfg(not(feature = "test-init"))]
 static INIT_PROGRAM: &[u8] = b"compositor";
 
 struct GopInfo {

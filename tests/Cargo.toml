@@ -1,0 +1,16 @@
+[package]
+name = "toyos-tests"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+toyos-cc = { path = "../userland/toyos-cc" }
+toyos-ld = { path = "../userland/toyos-ld" }
+tyfs = { path = "../tyfs" }
+fatfs = "0.3.6"
+gpt = "3.1.0"
+
+[patch.crates-io]
+target-lexicon = { path = "../userland/target-lexicon" }
+stacker = { path = "../userland/stacker" }
+psm = { path = "../userland/stacker/psm" }
