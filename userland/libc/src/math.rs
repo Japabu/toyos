@@ -178,37 +178,69 @@ pub extern "C" fn fmod(x: f64, y: f64) -> f64 {
     x - (x / y).trunc() * y
 }
 
-// --- Hardware-backed (LLVM emits inline instructions, no symbol calls) ---
+// --- Math primitives ---
+// WARNING: Do NOT delegate to Rust's .floor()/.ceil()/.round()/.trunc() methods!
+// On targets without SSE4.1 (like ToyOS x86-64 base), LLVM lowers the intrinsics
+// to calls to these C symbols, creating infinite recursion.
+
+#[no_mangle]
+pub extern "C" fn floor(x: f64) -> f64 {
+    let bits = x.to_bits();
+    let exp = ((bits >> 52) & 0x7FF) as i32 - 1023;
+    if exp < 0 {
+        return if x < 0.0 { -1.0 } else { 0.0 };
+    }
+    if exp >= 52 { return x; } // already integer (or NaN/inf)
+    let mask = !((1u64 << (52 - exp as u32)) - 1);
+    let truncated = f64::from_bits(bits & mask);
+    if x < 0.0 && truncated != x { truncated - 1.0 } else { truncated }
+}
+
+#[no_mangle]
+pub extern "C" fn ceil(x: f64) -> f64 { -floor(-x) }
+
+#[no_mangle]
+pub extern "C" fn trunc(x: f64) -> f64 {
+    let bits = x.to_bits();
+    let exp = ((bits >> 52) & 0x7FF) as i32 - 1023;
+    if exp < 0 { return if (bits >> 63) != 0 { -0.0 } else { 0.0 }; }
+    if exp >= 52 { return x; }
+    let mask = !((1u64 << (52 - exp as u32)) - 1);
+    f64::from_bits(bits & mask)
+}
+
+#[no_mangle]
+pub extern "C" fn round(x: f64) -> f64 {
+    floor(x + 0.5)
+}
+
+#[no_mangle]
+pub extern "C" fn floorf(x: f32) -> f32 {
+    let bits = x.to_bits();
+    let exp = ((bits >> 23) & 0xFF) as i32 - 127;
+    if exp < 0 {
+        return if x < 0.0 { -1.0 } else { 0.0 };
+    }
+    if exp >= 23 { return x; }
+    let mask = !((1u32 << (23 - exp as u32)) - 1);
+    let truncated = f32::from_bits(bits & mask);
+    if x < 0.0 && truncated != x { truncated - 1.0 } else { truncated }
+}
+
+#[no_mangle]
+pub extern "C" fn ceilf(x: f32) -> f32 { -floorf(-x) }
 
 #[no_mangle]
 pub extern "C" fn sqrt(x: f64) -> f64 { x.sqrt() }
 
 #[no_mangle]
-pub extern "C" fn fabs(x: f64) -> f64 { x.abs() }
-
-#[no_mangle]
-pub extern "C" fn ceil(x: f64) -> f64 { x.ceil() }
-
-#[no_mangle]
-pub extern "C" fn floor(x: f64) -> f64 { x.floor() }
-
-#[no_mangle]
-pub extern "C" fn round(x: f64) -> f64 { x.round() }
-
-#[no_mangle]
-pub extern "C" fn trunc(x: f64) -> f64 { x.trunc() }
-
-#[no_mangle]
 pub extern "C" fn sqrtf(x: f32) -> f32 { x.sqrt() }
 
 #[no_mangle]
-pub extern "C" fn fabsf(x: f32) -> f32 { x.abs() }
+pub extern "C" fn fabs(x: f64) -> f64 { f64::from_bits(x.to_bits() & !(1u64 << 63)) }
 
 #[no_mangle]
-pub extern "C" fn floorf(x: f32) -> f32 { x.floor() }
-
-#[no_mangle]
-pub extern "C" fn ceilf(x: f32) -> f32 { x.ceil() }
+pub extern "C" fn fabsf(x: f32) -> f32 { f32::from_bits(x.to_bits() & !(1u32 << 31)) }
 
 // --- Utility functions ---
 

@@ -126,7 +126,7 @@ fn write_u64_at(buf: &mut [u8], pos: usize, val: u64) -> usize {
 /// Format a float in %f style into `buf` starting at `pos`. Returns new pos.
 fn write_float_f(buf: &mut [u8], pos: usize, abs_val: f64, precision: usize) -> usize {
     let mut p = pos;
-    let int_part = abs_val.floor();
+    let int_part = super::math::floor(abs_val);
     let frac = abs_val - int_part;
 
     let mut mul = 1u64;
@@ -176,7 +176,7 @@ fn write_float_e(buf: &mut [u8], pos: usize, abs_val: f64, precision: usize, upp
         return p;
     }
 
-    let mut exp = abs_val.log10().floor() as i32;
+    let mut exp = super::math::floor(super::math::log10(abs_val)) as i32;
     let mut mantissa = abs_val / 10f64.powi(exp);
     // Correct floating-point imprecision
     if mantissa >= 10.0 { mantissa /= 10.0; exp += 1; }
@@ -212,7 +212,7 @@ fn format_float<'a>(
     }
 
     let negative = val.is_sign_negative();
-    let abs_val = val.abs();
+    let abs_val = super::math::fabs(val);
 
     if abs_val.is_infinite() {
         if negative { buf[p] = b'-'; p += 1; }
@@ -238,7 +238,7 @@ fn format_float<'a>(
         }
         b'g' => {
             let prec = precision.unwrap_or(6).max(1);
-            let exp = if abs_val == 0.0 { 0 } else { abs_val.log10().floor() as i32 };
+            let exp = if abs_val == 0.0 { 0 } else { super::math::floor(super::math::log10(abs_val)) as i32 };
             if exp < -4 || exp >= prec as i32 {
                 p = write_float_e(buf, p, abs_val, prec - 1, upper);
             } else {
