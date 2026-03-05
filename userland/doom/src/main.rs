@@ -145,21 +145,35 @@ pub extern "C" fn DG_DrawFrame() {
         let dst_stride = fb.stride();
         let dst_ptr = fb.ptr();
 
-        // Nearest-neighbor scale DG_ScreenBuffer (640x400 XRGB8888) to framebuffer (RGBA8888).
+        // Nearest-neighbor scale DG_ScreenBuffer (640x400 XRGB8888) to framebuffer.
+        // DOOM's XRGB8888 (0x00RRGGBB) matches the BGR framebuffer layout in
+        // little-endian, so we can copy u32s directly without channel swizzling.
         let dst_pixels = dst_ptr as *mut u32;
+
+        // Precompute X mapping table to avoid per-pixel division.
+        let mut x_map = [0usize; 2560]; // max width we support
+        let map = &mut x_map[..dst_w];
+        for dx in 0..dst_w {
+            map[dx] = dx * SRC_W / dst_w;
+        }
+
+        let mut prev_sy = usize::MAX;
+        let mut prev_dst_row: *mut u32 = core::ptr::null_mut();
         for dy in 0..dst_h {
             let sy = dy * SRC_H / dst_h;
-            let src_row = src.add(sy * SRC_W);
             let dst_row = dst_pixels.add(dy * dst_stride);
-            for dx in 0..dst_w {
-                let sx = dx * SRC_W / dst_w;
-                let xrgb = *src_row.add(sx);
-                // Convert XRGB8888 → RGBA8888: move RGB channels, set alpha to 0xFF
-                let r = (xrgb >> 16) & 0xFF;
-                let g = (xrgb >> 8) & 0xFF;
-                let b = xrgb & 0xFF;
-                *dst_row.add(dx) = r | (g << 8) | (b << 16) | 0xFF000000;
+
+            if sy == prev_sy && !prev_dst_row.is_null() {
+                // Same source row as previous — memcpy the already-scaled row.
+                core::ptr::copy_nonoverlapping(prev_dst_row, dst_row, dst_w);
+            } else {
+                let src_row = src.add(sy * SRC_W);
+                for dx in 0..dst_w {
+                    *dst_row.add(dx) = *src_row.add(*map.get_unchecked(dx));
+                }
             }
+            prev_sy = sy;
+            prev_dst_row = dst_row;
         }
 
         window.present();
