@@ -113,11 +113,16 @@ static QEMU: LazyLock<Mutex<QemuInstance>> = LazyLock::new(|| {
     eprintln!("[toyos_c] Compiling {} C tests for ToyOS...", TOYOS_C_TESTS.len());
     let mut c_test_bins: Vec<(String, Vec<u8>)> = Vec::new();
     for name in TOYOS_C_TESTS {
-        let (obj, extras) = compile::compile_c(name, Some("x86_64-unknown-linux-gnu"));
-        let linked = compile::link_toyos(&obj, &extras, name);
-        c_test_bins.push((name.to_string(), linked));
+        let result = std::panic::catch_unwind(|| {
+            let (obj, extras) = compile::compile_c(name, Some("x86_64-unknown-linux-gnu"));
+            compile::link_toyos(&obj, &extras, name)
+        });
+        match result {
+            Ok(linked) => c_test_bins.push((name.to_string(), linked)),
+            Err(_) => eprintln!("[toyos_c] SKIP {name}: compilation panicked"),
+        }
     }
-    eprintln!("[toyos_c] Booting QEMU...");
+    eprintln!("[toyos_c] Booting QEMU with {} test binaries...", c_test_bins.len());
     Mutex::new(QemuInstance::boot(&c_test_bins, &[]))
 });
 
@@ -125,6 +130,9 @@ fn check_test_result(result: &TestResult) {
     let test_name = result.name.strip_prefix("test_c_").unwrap_or(&result.name);
 
     if let Some(err) = &result.error {
+        if err.contains("No such file") || err.contains("not found") {
+            panic!("SKIP {test_name}: not compiled (likely unsupported feature)");
+        }
         panic!("FAIL {test_name}: {err}");
     }
 

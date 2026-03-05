@@ -22,7 +22,6 @@ pub struct QemuInstance {
     stdin: BufWriter<ChildStdin>,
     rx: Receiver<String>,
     _reader_thread: thread::JoinHandle<String>,
-    _stderr_thread: thread::JoinHandle<String>,
 }
 
 impl QemuInstance {
@@ -63,7 +62,8 @@ impl QemuInstance {
         let esp = create_fat_volume(&kernel_bytes, &bl_bytes, &initrd_bytes);
         let disk = create_gpt_disk(esp);
 
-        let test_dir = env::temp_dir().join("toyos-tests");
+        let pid = std::process::id();
+        let test_dir = env::temp_dir().join(format!("toyos-tests-{pid}"));
         fs::create_dir_all(&test_dir).ok();
         let boot_image = test_dir.join("test-bootable.img");
         fs::write(&boot_image, &disk).expect("Failed to write test boot image");
@@ -95,27 +95,15 @@ impl QemuInstance {
             .arg("-device").arg("virtio-net-pci-non-transitional,netdev=net0")
             .arg("-serial").arg("stdio")
             .arg("-no-reboot")
-            .arg("-s")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::inherit());
 
         eprintln!("[qemu] Launching QEMU...");
         let mut child = qemu.spawn().expect("Failed to launch QEMU");
 
         let stdin = BufWriter::new(child.stdin.take().unwrap());
         let stdout = child.stdout.take().unwrap();
-        let stderr = child.stderr.take().unwrap();
-
-        let stderr_thread = thread::spawn(move || {
-            let reader = BufReader::new(stderr);
-            let mut log = String::new();
-            for line in reader.lines().flatten() {
-                log.push_str(&line);
-                log.push('\n');
-            }
-            log
-        });
 
         let (tx, rx) = mpsc::channel::<String>();
         let reader_thread = thread::spawn(move || {
@@ -151,8 +139,8 @@ impl QemuInstance {
                 Ok(_) => continue,
                 Err(RecvTimeoutError::Timeout) => continue,
                 Err(RecvTimeoutError::Disconnected) => {
-                    let _ = child.kill();
-                    panic!("[qemu] QEMU died before ===READY===");
+                    let status = child.wait();
+                    panic!("[qemu] QEMU died before ===READY=== (status: {status:?})");
                 }
             }
         }
@@ -162,7 +150,6 @@ impl QemuInstance {
             stdin,
             rx,
             _reader_thread: reader_thread,
-            _stderr_thread: stderr_thread,
         }
     }
 

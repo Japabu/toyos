@@ -30,23 +30,20 @@ fn main() {
         println!("===TEST_START {name}===");
         let _ = io::stdout().flush();
 
-        match Command::new(&path)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-        {
-            Ok(child) => match child.wait_with_output() {
-                Ok(output) => {
-                    if !output.stdout.is_empty() {
-                        io::stdout().write_all(&output.stdout).ok();
-                        let _ = io::stdout().flush();
+        // Spawn with piped stdin (so child doesn't consume serial commands)
+        // but inherited stdout/stderr (output goes directly to serial).
+        match Command::new(&path).stdin(Stdio::piped()).spawn() {
+            Ok(mut child) => {
+                // Drop stdin pipe so child gets EOF if it tries to read
+                drop(child.stdin.take());
+                match child.wait() {
+                    Ok(status) => {
+                        let code = status.code().unwrap_or(-1);
+                        println!("===TEST_END {name} exit={code}===");
                     }
-                    let code = output.status.code().unwrap_or(-1);
-                    println!("===TEST_END {name} exit={code}===");
+                    Err(e) => println!("===TEST_END {name} error={e}==="),
                 }
-                Err(e) => println!("===TEST_END {name} error={e}==="),
-            },
+            }
             Err(e) => println!("===TEST_END {name} error={e}==="),
         }
         let _ = io::stdout().flush();
