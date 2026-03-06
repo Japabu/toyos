@@ -5,6 +5,9 @@
     unused_imports,
     dead_code
 )]
+// ToyOS uses custom TCP types that don't go through IoSource, and some
+// platform-generic code ends up unused. Allow these to keep the fork clean.
+#![cfg_attr(target_os = "toyos", allow(dead_code, missing_docs, unused_imports, unused_macros))]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 // Disallow warnings when running tests.
 #![cfg_attr(test, deny(warnings))]
@@ -40,7 +43,7 @@
 //!
 //! The available features are described in the [`features`] module.
 
-#[cfg(all(target_family = "wasm", not(target_os = "wasi")))]
+#[cfg(all(target_family = "wasm", not(target_os = "wasi"), not(target_os = "toyos")))]
 compile_error!("This wasm target is unsupported by mio. If using Tokio, disable the net feature.");
 
 // macros used internally
@@ -51,7 +54,7 @@ mod interest;
 mod poll;
 mod sys;
 mod token;
-#[cfg(not(target_os = "wasi"))]
+#[cfg(any(not(target_os = "wasi"), target_os = "toyos"))]
 mod waker;
 
 pub mod event;
@@ -69,7 +72,7 @@ pub use event::Events;
 pub use interest::Interest;
 pub use poll::{Poll, Registry};
 pub use token::Token;
-#[cfg(not(target_os = "wasi"))]
+#[cfg(any(not(target_os = "wasi"), target_os = "toyos"))]
 pub use waker::Waker;
 
 #[cfg(all(unix, feature = "os-ext"))]

@@ -14,6 +14,7 @@
 //! * `Waker`: see [`crate::Waker`].
 
 cfg_os_poll! {
+    #[allow(unused_macros)]
     macro_rules! debug_detail {
         (
             $type: ident ($event_type: ty), $test: path,
@@ -50,10 +51,19 @@ cfg_os_poll! {
     }
 }
 
-#[cfg(any(
-    unix,
-    target_os = "hermit",
-    all(target_os = "wasi", not(target_env = "p1"))
+#[cfg(target_os = "toyos")]
+cfg_os_poll! {
+    mod toyos;
+    pub(crate) use self::toyos::*;
+}
+
+#[cfg(all(
+    not(target_os = "toyos"),
+    any(
+        unix,
+        target_os = "hermit",
+        all(target_os = "wasi", not(target_env = "p1"))
+    )
 ))]
 cfg_os_poll! {
     mod unix;
@@ -61,18 +71,19 @@ cfg_os_poll! {
     pub use self::unix::*;
 }
 
-#[cfg(windows)]
+#[cfg(all(not(target_os = "toyos"), windows))]
 cfg_os_poll! {
     mod windows;
     pub use self::windows::*;
 }
 
-#[cfg(all(target_os = "wasi", target_env = "p1"))]
+#[cfg(all(not(target_os = "toyos"), target_os = "wasi", target_env = "p1"))]
 cfg_os_poll! {
     mod wasip1;
     pub(crate) use self::wasip1::*;
 }
 
+#[cfg(not(target_os = "toyos"))]
 cfg_not_os_poll! {
     mod shell;
     pub(crate) use self::shell::*;
@@ -138,6 +149,7 @@ pub(crate) const LISTEN_BACKLOG_SIZE: i32 = -1;
 
 #[allow(dead_code)]
 #[cfg(not(any(
+    target_os = "toyos",
     target_os = "windows",
     target_os = "redox",
     target_os = "espidf",
