@@ -1089,9 +1089,10 @@ pub(crate) fn emit_elf(
         w.pad_until((layout.build_id_note_vaddr - base) as usize);
         w.write(&build_id_note_placeholder());
     }
-    write_sections_data(&mut w, &state.sections, base, layout.rx_end, u64::MAX);
+    // Write non-TLS RW sections first (up to TLS start)
+    write_sections_data(&mut w, &state.sections, base, layout.rx_end, layout.tls_start);
 
-    // Static mode: fill GOT entries directly
+    // Static mode: fill GOT entries directly (GOT is before TLS in the layout)
     if is_static {
         let gottpoff_syms: HashSet<SymbolRef> = state.relocs.iter()
             .filter(|r| r.r_type == RelocType::X86Gottpoff)
@@ -1110,7 +1111,7 @@ pub(crate) fn emit_elf(
         }
     }
 
-    // PIE mode: write GOTTPOFF GOT entries directly (raw tpoff, no RELATIVE)
+    // PIE mode: write GOTTPOFF GOT entries directly (GOT is before TLS in the layout)
     if let Some(relocs) = relocs {
         let mut fills: Vec<_> = relocs.tpoff_fills.iter().collect();
         fills.sort_by_key(|&&(vaddr, _)| vaddr);
@@ -1120,6 +1121,9 @@ pub(crate) fn emit_elf(
             w.write(&(tp as u64).to_le_bytes());
         }
     }
+
+    // Now write TLS sections (after GOT fills to avoid truncation)
+    write_sections_data(&mut w, &state.sections, base, layout.tls_start, u64::MAX);
 
     w.pad_until((file_rw_end - base) as usize);
 
