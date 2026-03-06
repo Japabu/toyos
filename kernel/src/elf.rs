@@ -656,12 +656,21 @@ pub fn resolve_dynamic_deps(
     Ok(libs)
 }
 
+/// TLS layout info for cross-library TPOFF resolution.
+pub struct TlsModuleInfo<'a> {
+    pub libs: &'a [LoadedLib],
+    /// (tls_template, tls_filesz, tls_memsz, base_offset) for each TLS module
+    pub modules: &'a [(u64, usize, usize, usize)],
+}
+
 /// Apply R_X86_64_TPOFF64 and R_X86_64_TPOFF32 relocations in a shared library.
 /// `lib_base_offset` is this library's TLS placement within the combined TLS block.
 /// `total_memsz` is the total combined TLS size across all modules.
 /// TPOFF64: fills a GOT slot (u64) with base_offset + addend - total_memsz
 /// TPOFF32: patches an inline immediate (i32) with base_offset + addend - total_memsz
-pub fn apply_tpoff_relocs(lib: &LoadedLib, lib_base_offset: usize, total_memsz: usize) {
+/// When r_sym != 0, the symbol is looked up across all loaded libraries to find the
+/// defining library's TLS base offset.
+pub fn apply_tpoff_relocs(lib: &LoadedLib, lib_base_offset: usize, total_memsz: usize, tls_info: &TlsModuleInfo) {
     let entry_size = 24u64;
     let sections = [
         (lib.rela_addr, lib.rela_size),
@@ -678,13 +687,20 @@ pub fn apply_tpoff_relocs(lib: &LoadedLib, lib_base_offset: usize, total_memsz: 
             let r_info = unsafe { *(rela_ptr.add(8) as *const u64) };
             let r_addend = unsafe { *(rela_ptr.add(16) as *const i64) };
             let r_type = (r_info & 0xFFFF_FFFF) as u32;
-            let tpoff = lib_base_offset as i64 + r_addend - total_memsz as i64;
+            let r_sym = (r_info >> 32) as u32;
 
             if r_type == R_X86_64_TPOFF64 {
+                let tpoff = if r_sym != 0 {
+                    // Named TPOFF: look up symbol across libraries
+                    resolve_cross_lib_tpoff(lib, r_sym, tls_info, total_memsz)
+                } else {
+                    lib_base_offset as i64 + r_addend - total_memsz as i64
+                };
                 let target = (lib.base + r_offset) as *mut u64;
                 unsafe { *target = tpoff as u64; }
                 count64 += 1;
             } else if r_type == R_X86_64_TPOFF32 {
+                let tpoff = lib_base_offset as i64 + r_addend - total_memsz as i64;
                 let target = (lib.base + r_offset) as *mut i32;
                 unsafe { *target = tpoff as i32; }
                 count32 += 1;
@@ -697,24 +713,90 @@ pub fn apply_tpoff_relocs(lib: &LoadedLib, lib_base_offset: usize, total_memsz: 
     }
 }
 
+/// Look up a TLS symbol by name in a library's .dynsym, returning its st_value
+/// (offset within the TLS segment). Returns None if not found.
+fn tls_dlsym(lib: &LoadedLib, name: &str) -> Option<u64> {
+    // Linear scan of dynsym since gnu_hash adds base which is wrong for TLS
+    for idx in 0..lib.sym_count {
+        let sym_ptr = (lib.dynsym + idx as u64 * 24) as *const u8;
+        let st_name = unsafe { *(sym_ptr as *const u32) };
+        let st_info = unsafe { *sym_ptr.add(4) };
+        let st_shndx = unsafe { *(sym_ptr.add(6) as *const u16) };
+        let st_value = unsafe { *(sym_ptr.add(8) as *const u64) };
+        // STT_TLS = 6
+        if st_shndx != 0 && (st_info & 0xf) == 6 {
+            let sym_name = bounded_cstr(lib.dynstr, st_name as u64, lib.dynstr_size);
+            if sym_name == name {
+                return Some(st_value);
+            }
+        }
+    }
+    None
+}
+
+/// Resolve a cross-library TPOFF64 relocation by looking up the symbol name
+/// from `lib`'s dynsym, finding which library defines it, and computing the tpoff.
+fn resolve_cross_lib_tpoff(lib: &LoadedLib, r_sym: u32, tls_info: &TlsModuleInfo, total_memsz: usize) -> i64 {
+    // Read symbol name from lib's dynsym/dynstr
+    let sym_entry = (lib.dynsym + r_sym as u64 * 24) as *const u8;
+    let st_name = unsafe { *(sym_entry as *const u32) };
+    let sym_name = bounded_cstr(lib.dynstr, st_name as u64, lib.dynstr_size);
+
+    // Search all libraries for the defining TLS symbol
+    for other_lib in tls_info.libs {
+        if other_lib.tls_memsz == 0 { continue; }
+        if let Some(sym_tls_offset) = tls_dlsym(other_lib, sym_name) {
+            // Find this library's base offset in the combined layout
+            let other_base_offset = tls_info.modules.iter()
+                .find(|&&(template, _, _, _)| template == other_lib.tls_template)
+                .map(|&(_, _, _, bo)| bo)
+                .unwrap_or(0);
+            return other_base_offset as i64 + sym_tls_offset as i64 - total_memsz as i64;
+        }
+    }
+    log!("tpoff: unresolved TLS symbol: {}", sym_name);
+    0
+}
+
 /// Apply R_X86_64_TPOFF64/TPOFF32 relocations in the main executable's .rela.dyn.
 /// Uses section headers from the raw ELF data to find relocation entries.
-pub fn apply_exe_tpoff_relocs(data: &[u8], base: u64, exe_base_offset: usize, total_memsz: usize) {
+/// When r_sym != 0, looks up the TLS symbol across loaded libraries.
+pub fn apply_exe_tpoff_relocs(data: &[u8], base: u64, exe_base_offset: usize, total_memsz: usize, tls_info: &TlsModuleInfo) {
     let elf = match ElfBytes::<AnyEndian>::minimal_parse(data) {
         Ok(e) => e,
         Err(_) => return,
     };
+
+    // Get dynsym/dynstr for resolving named symbols (r_sym != 0)
+    let (dynsym_data, dynstr_data) = match (
+        elf.section_header_by_name(".dynsym"),
+        elf.section_header_by_name(".dynstr"),
+    ) {
+        (Ok(Some(sym_shdr)), Ok(Some(str_shdr))) => {
+            let sym_data = elf.section_data(&sym_shdr).ok().map(|(d, _)| d);
+            let str_data = elf.section_data(&str_shdr).ok().map(|(d, _)| d);
+            (sym_data, str_data)
+        }
+        _ => (None, None),
+    };
+
     let mut count = 0u64;
     for section_name in &[".rela.dyn", ".rela.plt"] {
         if let Ok(Some(shdr)) = elf.section_header_by_name(section_name) {
             if let Ok(relas) = elf.section_data_as_relas(&shdr) {
                 for rela in relas {
-                    let tpoff = exe_base_offset as i64 + rela.r_addend - total_memsz as i64;
                     if rela.r_type == R_X86_64_TPOFF64 as u32 {
+                        let tpoff = if rela.r_sym != 0 {
+                            // Named TPOFF64: look up symbol across loaded libs
+                            resolve_exe_cross_lib_tpoff(rela.r_sym, &dynsym_data, &dynstr_data, tls_info, total_memsz)
+                        } else {
+                            exe_base_offset as i64 + rela.r_addend - total_memsz as i64
+                        };
                         let target = (base + rela.r_offset) as *mut u64;
                         unsafe { *target = tpoff as u64; }
                         count += 1;
                     } else if rela.r_type == R_X86_64_TPOFF32 as u32 {
+                        let tpoff = exe_base_offset as i64 + rela.r_addend - total_memsz as i64;
                         let target = (base + rela.r_offset) as *mut i32;
                         unsafe { *target = tpoff as i32; }
                         count += 1;
@@ -727,4 +809,38 @@ pub fn apply_exe_tpoff_relocs(data: &[u8], base: u64, exe_base_offset: usize, to
         log!("exe: applied {} TPOFF relocs (base_offset={}, total_memsz={})",
             count, exe_base_offset, total_memsz);
     }
+}
+
+/// Resolve a cross-library TPOFF64 from the main executable by looking up the
+/// symbol name from the exe's dynsym/dynstr tables, then finding which library defines it.
+fn resolve_exe_cross_lib_tpoff(r_sym: u32, dynsym_data: &Option<&[u8]>, dynstr_data: &Option<&[u8]>, tls_info: &TlsModuleInfo, total_memsz: usize) -> i64 {
+    let (Some(dynsym), Some(dynstr)) = (dynsym_data, dynstr_data) else {
+        log!("tpoff: no dynsym/dynstr for exe cross-lib TLS");
+        return 0;
+    };
+    let entry_offset = r_sym as usize * 24;
+    if entry_offset + 24 > dynsym.len() {
+        log!("tpoff: r_sym {} out of bounds", r_sym);
+        return 0;
+    }
+    let st_name = u32::from_le_bytes(dynsym[entry_offset..entry_offset + 4].try_into().unwrap()) as usize;
+    if st_name >= dynstr.len() {
+        log!("tpoff: st_name {} out of bounds", st_name);
+        return 0;
+    }
+    let name_end = dynstr[st_name..].iter().position(|&b| b == 0).unwrap_or(dynstr.len() - st_name);
+    let sym_name = core::str::from_utf8(&dynstr[st_name..st_name + name_end]).unwrap_or("");
+
+    for lib in tls_info.libs {
+        if lib.tls_memsz == 0 { continue; }
+        if let Some(sym_tls_offset) = tls_dlsym(lib, sym_name) {
+            let other_base_offset = tls_info.modules.iter()
+                .find(|&&(template, _, _, _)| template == lib.tls_template)
+                .map(|&(_, _, _, bo)| bo)
+                .unwrap_or(0);
+            return other_base_offset as i64 + sym_tls_offset as i64 - total_memsz as i64;
+        }
+    }
+    log!("tpoff: unresolved exe TLS symbol: {}", sym_name);
+    0
 }

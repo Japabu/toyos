@@ -14,6 +14,10 @@ pub(crate) struct RelocOutput {
     /// The addend is the symbol's offset within its module's TLS segment. At load time,
     /// the kernel adds the module's TLS base tpoff to produce the final tpoff value.
     pub(crate) tpoff64s: Vec<(u64, i64)>,
+    /// Named R_X86_64_TPOFF64 runtime relocations for cross-library TLS references:
+    /// (GOT slot vaddr, symbol name). The kernel looks up the symbol across all loaded
+    /// libraries and computes the correct tpoff.
+    pub(crate) named_tpoff64s: Vec<(u64, String)>,
     /// R_X86_64_TPOFF32 runtime relocations for shared libraries: (vaddr of imm32, addend).
     /// Used for LD→LE relaxation in shared mode where DTPOFF32 immediates need load-time patching.
     pub(crate) tpoff32s: Vec<(u64, i64)>,
@@ -212,6 +216,7 @@ pub(crate) fn apply_relocs(
     let mut relatives = Vec::new();
     let mut undefined = HashSet::new();
     let mut tpoff64_entries: Vec<(u64, i64)> = Vec::new();
+    let mut named_tpoff64_entries: Vec<(u64, String)> = Vec::new();
     let mut tpoff32_entries: Vec<(u64, i64)> = Vec::new();
 
     let relocs = std::mem::take(&mut state.relocs);
@@ -224,8 +229,10 @@ pub(crate) fn apply_relocs(
     for reloc in &relocs {
         match reloc.r_type {
             RelocType::X86Tlsgd => {
-                let sym_addr = resolve_symbol(state, &reloc.target, params.plt)
-                    .ok_or_else(|| LinkError::UndefinedSymbols(vec![reloc.target.name().to_string()]))?;
+                let is_dynamic = matches!(
+                    state.globals.get(reloc.target.name()),
+                    Some(SymbolDef::Dynamic { .. })
+                );
                 let padded = is_padded_tls_sequence(
                     &state.sections[reloc.section].data,
                     reloc.offset,
@@ -236,9 +243,10 @@ pub(crate) fn apply_relocs(
                         symbol: reloc.target.name().to_string(),
                     });
                 }
-                if params.is_shared {
+                if is_dynamic || params.is_shared {
                     // GD → IE (16-byte padded): `data16; leaq; data16*2; rex64; call`
                     // → `mov %fs:0,%rax; add sym@GOTTPOFF(%rip),%rax`
+                    // Used for shared libs (all TLS) and PIE (dynamic TLS only)
                     #[rustfmt::skip]
                     let inst: [u8; 16] = [
                         0x64, 0x48, 0x8b, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00, // mov %fs:0,%rax
@@ -255,10 +263,19 @@ pub(crate) fn apply_relocs(
                     check_i32(disp, reloc)?;
                     write_i32(state, reloc.section, reloc.offset + 8, disp as i32);
                     relaxed_calls.insert((reloc.section, reloc.offset + 8));
-                    // Record that this GOT slot needs a TPOFF64 runtime reloc
-                    let sym_tls_offset = sym_addr as i64 - params.tls_start as i64;
-                    tpoff64_entries.push((got_slot, sym_tls_offset));
+                    if is_dynamic {
+                        // Cross-library TLS: emit named TPOFF64 for kernel to resolve
+                        named_tpoff64_entries.push((got_slot, reloc.target.name().to_string()));
+                    } else {
+                        // Same-library TLS: emit local TPOFF64 with known offset
+                        let sym_addr = resolve_symbol(state, &reloc.target, params.plt)
+                            .ok_or_else(|| LinkError::UndefinedSymbols(vec![reloc.target.name().to_string()]))?;
+                        let sym_tls_offset = sym_addr as i64 - params.tls_start as i64;
+                        tpoff64_entries.push((got_slot, sym_tls_offset));
+                    }
                 } else {
+                    let sym_addr = resolve_symbol(state, &reloc.target, params.plt)
+                        .ok_or_else(|| LinkError::UndefinedSymbols(vec![reloc.target.name().to_string()]))?;
                     // GD → LE (16-byte padded): `data16; leaq; data16*2; rex64; call`
                     // → `mov %fs:0,%rax; lea tpoff(%rax),%rax`
                     #[rustfmt::skip]
@@ -427,8 +444,16 @@ pub(crate) fn apply_relocs(
         for (sym_ref, &got_vaddr) in params.got {
             // Dynamic symbols are in dyn_got, resolved at load time via GLOB_DAT
             if params.dyn_got.contains_key(sym_ref) { continue; }
-            // GD→IE GOT entries are handled via tpoff64_entries (collected in pass 1)
+            // GD→IE GOT entries are handled via tpoff64/named_tpoff64 entries (collected in pass 1)
             if tpoff64_entries.iter().any(|&(v, _)| v == got_vaddr) { continue; }
+            if named_tpoff64_entries.iter().any(|(v, _)| *v == got_vaddr) { continue; }
+            // Dynamic TLS symbols: emit named TPOFF64 for kernel to resolve
+            let is_dynamic_tls = gottpoff_syms.contains(sym_ref)
+                && matches!(state.globals.get(sym_ref.name()), Some(SymbolDef::Dynamic { .. }));
+            if is_dynamic_tls {
+                named_tpoff64_entries.push((got_vaddr, sym_ref.name().to_string()));
+                continue;
+            }
             let sym_addr = resolve_symbol(state, sym_ref, params.plt)
                 .ok_or_else(|| LinkError::UndefinedSymbols(vec![sym_ref.name().to_string()]))?;
             if gottpoff_syms.contains(sym_ref) {
@@ -460,7 +485,7 @@ pub(crate) fn apply_relocs(
         return Err(LinkError::UndefinedSymbols(syms));
     }
 
-    Ok(RelocOutput { relatives, glob_dats, tpoff_fills, tpoff64s: tpoff64_entries, tpoff32s: tpoff32_entries })
+    Ok(RelocOutput { relatives, glob_dats, tpoff_fills, tpoff64s: tpoff64_entries, named_tpoff64s: named_tpoff64_entries, tpoff32s: tpoff32_entries })
 }
 
 // ── AArch64 relocation helpers ───────────────────────────────────────────

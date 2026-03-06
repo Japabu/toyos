@@ -274,9 +274,15 @@ pub(crate) fn layout_elf(state: &mut LinkState, base_addr: u64, entry_name: Opti
     // PLT stubs for dynamic symbols (PIE mode only).
     // Deduplicate by name and normalize to Global, since Local and Global
     // variants of the same symbol name refer to the same dynamic import.
+    // Exclude TLS symbols — they need TPOFF64 runtime relocs, not GLOB_DAT,
+    // so they use the regular GOT instead of dyn_got.
     let dyn_syms_raw = collect_unique_symbols(
         state.relocs.iter(),
-        |r| state.dynamic_imports.contains(r.target.name()),
+        |r| {
+            let name = r.target.name();
+            state.dynamic_imports.contains(name)
+                && !matches!(state.globals.get(name), Some(SymbolDef::Dynamic { is_tls: true, .. }))
+        },
     );
     let mut dyn_seen = std::collections::HashSet::new();
     let mut dyn_syms: Vec<SymbolRef> = Vec::new();
@@ -357,8 +363,9 @@ pub(crate) fn layout_elf(state: &mut LinkState, base_addr: u64, entry_name: Opti
         matches!(r.r_type,
             RelocType::X86Gotpcrel | RelocType::X86Gotpcrelx
             | RelocType::X86RexGotpcrelx | RelocType::X86Gottpoff)
-        // Shared mode: GD→IE relaxation needs a GOT slot for each TLS GD symbol
-        || (is_shared && r.r_type == RelocType::X86Tlsgd)
+        // GD→IE relaxation needs a GOT slot: always in shared mode, or for dynamic TLS in PIE
+        || (r.r_type == RelocType::X86Tlsgd
+            && (is_shared || state.dynamic_imports.contains(r.target.name())))
     });
 
     cursor = align_up(cursor, 8);
@@ -692,6 +699,7 @@ pub(crate) fn emit_elf(
     let has_rela = relocs.map_or(false, |r| !r.relatives.is_empty())
         || relocs.map_or(false, |r| !r.glob_dats.is_empty())
         || relocs.map_or(false, |r| !r.tpoff64s.is_empty())
+        || relocs.map_or(false, |r| !r.named_tpoff64s.is_empty())
         || relocs.map_or(false, |r| !r.tpoff32s.is_empty());
     let file_rw_end = layout.rw_start + layout.rw_filesz;
 
@@ -719,7 +727,7 @@ pub(crate) fn emit_elf(
     // Dynamic strings: PIE imports vs shared exports
     let mut needed_str_ids = Vec::new();
     let mut import_str_ids: Vec<(String, StringId)> = Vec::new(); // PIE: imported symbols
-    let mut export_str_ids: Vec<(String, StringId, u64, u32)> = Vec::new(); // Shared: exported symbols
+    let mut export_str_ids: Vec<(String, StringId, u64, u32, bool)> = Vec::new(); // Shared: exported symbols (name, strid, value, hash, is_tls)
     let mut sym_to_writer_idx: HashMap<String, SymbolIndex> = HashMap::new();
 
     if has_dynamic_libs {
@@ -728,6 +736,13 @@ pub(crate) fn emit_elf(
         }
         if let Some(relocs) = relocs {
             for (_, sym_name) in &relocs.glob_dats {
+                if !sym_to_writer_idx.contains_key(sym_name) {
+                    let str_id = w.add_dynamic_string(sym_name.as_bytes());
+                    import_str_ids.push((sym_name.clone(), str_id));
+                    sym_to_writer_idx.insert(sym_name.clone(), SymbolIndex(0));
+                }
+            }
+            for (_, sym_name) in &relocs.named_tpoff64s {
                 if !sym_to_writer_idx.contains_key(sym_name) {
                     let str_id = w.add_dynamic_string(sym_name.as_bytes());
                     import_str_ids.push((sym_name.clone(), str_id));
@@ -746,13 +761,26 @@ pub(crate) fn emit_elf(
         for (name, def) in &symbols {
             let SymbolDef::Defined { section, value } = def else { continue; };
             let str_id = w.add_dynamic_string(name.as_bytes());
-            let st_value = state.sections[*section].vaddr.unwrap() + value;
+            let is_tls = state.sections[*section].kind.is_tls();
+            let st_value = if is_tls {
+                // TLS symbols: st_value is offset within the TLS segment
+                *value
+            } else {
+                state.sections[*section].vaddr.unwrap() + value
+            };
             let hash = gnu_hash(name.as_bytes());
-            export_str_ids.push((name.to_string(), str_id, st_value, hash));
+            export_str_ids.push((name.to_string(), str_id, st_value, hash, is_tls));
         }
-        // Add undefined (imported) symbols that have GLOB_DAT entries
+        // Add undefined (imported) symbols that have GLOB_DAT or named TPOFF64 entries
         if let Some(relocs) = relocs {
             for (_, sym_name) in &relocs.glob_dats {
+                if !sym_to_writer_idx.contains_key(sym_name) {
+                    let str_id = w.add_dynamic_string(sym_name.as_bytes());
+                    shared_import_str_ids.push((sym_name.clone(), str_id));
+                    sym_to_writer_idx.insert(sym_name.clone(), SymbolIndex(0)); // placeholder
+                }
+            }
+            for (_, sym_name) in &relocs.named_tpoff64s {
                 if !sym_to_writer_idx.contains_key(sym_name) {
                     let str_id = w.add_dynamic_string(sym_name.as_bytes());
                     shared_import_str_ids.push((sym_name.clone(), str_id));
@@ -763,7 +791,7 @@ pub(crate) fn emit_elf(
         gnu_hash_sym_count = export_str_ids.len() as u32;
         gnu_hash_bucket_count = gnu_hash_sym_count.max(1);
         gnu_hash_bloom_count = 1u32;
-        export_str_ids.sort_by_key(|&(_, _, _, h)| h % gnu_hash_bucket_count);
+        export_str_ids.sort_by_key(|&(_, _, _, h, _)| h % gnu_hash_bucket_count);
     } else {
         gnu_hash_sym_count = 0;
         gnu_hash_bucket_count = 0;
@@ -864,7 +892,7 @@ pub(crate) fn emit_elf(
 
     // Rela count
     let rela_count = if let Some(relocs) = relocs {
-        relocs.relatives.len() + relocs.glob_dats.len() + relocs.tpoff64s.len() + relocs.tpoff32s.len()
+        relocs.relatives.len() + relocs.glob_dats.len() + relocs.tpoff64s.len() + relocs.named_tpoff64s.len() + relocs.tpoff32s.len()
     } else { 0 };
     let rela_size = rela_count as u64 * 24;
 
@@ -1119,11 +1147,12 @@ pub(crate) fn emit_elf(
     }
     if is_shared {
         w.write_null_dynamic_symbol();
-        for (_, str_id, st_value, _) in &export_str_ids {
+        for (_, str_id, st_value, _, is_tls) in &export_str_ids {
+            let st_type = if *is_tls { elf::STT_TLS } else { elf::STT_NOTYPE };
             w.write_dynamic_symbol(&Sym {
                 name: Some(*str_id),
                 section: None,
-                st_info: (elf::STB_GLOBAL << 4) | elf::STT_NOTYPE,
+                st_info: (elf::STB_GLOBAL << 4) | st_type,
                 st_other: elf::STV_DEFAULT,
                 st_shndx: 1, // defined
                 st_value: *st_value,
@@ -1145,12 +1174,12 @@ pub(crate) fn emit_elf(
         w.write_dynstr();
 
         // .gnu.hash
-        let sym_hashes: Vec<u32> = export_str_ids.iter().map(|(_, _, _, h)| *h).collect();
+        let sym_hashes: Vec<u32> = export_str_ids.iter().map(|(_, _, _, h, _)| *h).collect();
         w.write_gnu_hash(1, 6, gnu_hash_bloom_count, gnu_hash_bucket_count, gnu_hash_sym_count, |i| sym_hashes[i as usize]);
 
         // Shared library RELA (reserved before dynamic section, must be written here)
         if let Some(relocs) = relocs {
-            if !relocs.relatives.is_empty() || !relocs.glob_dats.is_empty() || !relocs.tpoff64s.is_empty() || !relocs.tpoff32s.is_empty() {
+            if !relocs.relatives.is_empty() || !relocs.glob_dats.is_empty() || !relocs.tpoff64s.is_empty() || !relocs.named_tpoff64s.is_empty() || !relocs.tpoff32s.is_empty() {
                 w.write_align_relocation();
                 for &(offset, addend) in &relocs.relatives {
                     w.write_relocation(true, &Rel {
@@ -1175,6 +1204,15 @@ pub(crate) fn emit_elf(
                         r_sym: 0,
                         r_type: elf::R_X86_64_TPOFF64,
                         r_addend: addend,
+                    });
+                }
+                for (got_vaddr, sym_name) in &relocs.named_tpoff64s {
+                    let sym_idx = sym_to_writer_idx[sym_name];
+                    w.write_relocation(true, &Rel {
+                        r_offset: *got_vaddr,
+                        r_sym: sym_idx.0,
+                        r_type: elf::R_X86_64_TPOFF64,
+                        r_addend: 0,
                     });
                 }
                 for &(vaddr, addend) in &relocs.tpoff32s {
@@ -1245,6 +1283,15 @@ pub(crate) fn emit_elf(
                     r_offset: *got_vaddr,
                     r_sym: sym_idx.0,
                     r_type: elf::R_X86_64_GLOB_DAT,
+                    r_addend: 0,
+                });
+            }
+            for (got_vaddr, sym_name) in &relocs.named_tpoff64s {
+                let sym_idx = sym_to_writer_idx[sym_name];
+                w.write_relocation(true, &Rel {
+                    r_offset: *got_vaddr,
+                    r_sym: sym_idx.0,
+                    r_type: elf::R_X86_64_TPOFF64,
                     r_addend: 0,
                 });
             }

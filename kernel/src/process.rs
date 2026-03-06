@@ -494,22 +494,22 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<u32>) -> Option<u32> {
     let tls_total_memsz = tls_cursor;
 
     // Apply R_X86_64_TPOFF64 relocations in shared libraries now that we know the layout
+    let tls_info = elf::TlsModuleInfo { libs: &loaded_libs, modules: &tls_modules };
     for lib in &loaded_libs {
-        if lib.tls_memsz == 0 { continue; }
         // Find this library's base offset in the combined layout
         let lib_base_offset = tls_modules.iter()
             .find(|&&(template, _, _, _)| template == lib.tls_template)
             .map(|&(_, _, _, base_offset)| base_offset)
             .unwrap_or(0);
-        elf::apply_tpoff_relocs(lib, lib_base_offset, tls_total_memsz);
+        elf::apply_tpoff_relocs(lib, lib_base_offset, tls_total_memsz, &tls_info);
     }
-    // Also apply TPOFF relocs in the exe's relocations (if it has any)
-    if loaded.tls_memsz > 0 {
+    // Also apply TPOFF relocs in the exe's relocations (local or cross-lib TLS)
+    {
         let exe_base_offset = tls_modules.iter()
             .find(|&&(template, _, _, _)| template == loaded.tls_template)
             .map(|&(_, _, _, base_offset)| base_offset)
             .unwrap_or(0);
-        elf::apply_exe_tpoff_relocs(&binary, loaded.base, exe_base_offset, tls_total_memsz);
+        elf::apply_exe_tpoff_relocs(&binary, loaded.base, exe_base_offset, tls_total_memsz, &tls_info);
     }
 
     // For single-module compat (used by spawn_thread)

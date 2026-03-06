@@ -191,7 +191,8 @@ pub(crate) enum SymbolDef {
     Defined { section: SectionIdx, value: u64 },
     /// Dynamic (shared library) import. `is_func` distinguishes function vs data symbols
     /// so the linker can create stubs only for functions (not data like __stdoutp).
-    Dynamic { is_func: bool },
+    /// `is_tls` marks thread-local symbols that need TPOFF64 relocs, not GLOB_DAT.
+    Dynamic { is_func: bool, is_tls: bool },
 }
 
 pub(crate) struct LinkState {
@@ -279,7 +280,8 @@ fn collect_so_symbols(elf: &ElfFile64, globals: &mut HashMap<String, SymbolDef>,
         }
         let name = name.to_string();
         let is_func = sym.kind() == read::SymbolKind::Text;
-        globals.entry(name.clone()).or_insert(SymbolDef::Dynamic { is_func });
+        let is_tls = sym.kind() == read::SymbolKind::Tls;
+        globals.entry(name.clone()).or_insert(SymbolDef::Dynamic { is_func, is_tls });
         dynamic_imports.insert(name);
     }
 }

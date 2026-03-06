@@ -105,7 +105,7 @@ impl Collected {
                 && !self.state.locals.keys().any(|(_, n)| n == &sym)
             {
                 self.state.dynamic_imports.insert(sym.clone());
-                self.state.globals.insert(sym, SymbolDef::Dynamic { is_func: has_call });
+                self.state.globals.insert(sym, SymbolDef::Dynamic { is_func: has_call, is_tls: false });
             }
         }
     }
@@ -511,7 +511,7 @@ fn rewrite_x86_64_got_calls(
 ) {
     let is_function_symbol = |name: &str| -> bool {
         match state.globals.get(name) {
-            Some(SymbolDef::Dynamic { is_func }) => *is_func,
+            Some(SymbolDef::Dynamic { is_func, .. }) => *is_func,
             Some(SymbolDef::Defined { section, .. }) => {
                 state.sections[*section].kind == SectionKind::Code
             }
