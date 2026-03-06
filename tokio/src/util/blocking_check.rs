@@ -21,9 +21,8 @@ pub(crate) fn check_socket_for_blocking<S: AsFd>(s: &S) -> crate::io::Result<()>
 }
 
 #[cfg(not(unix))]
-#[allow(unused_variables)]
+#[allow(unused_variables, dead_code)]
 pub(crate) fn check_socket_for_blocking<S>(s: &S) -> crate::io::Result<()> {
-    // we cannot retrieve the nonblocking status on windows
-    // and i dont know how to support wasi yet
+    // we cannot retrieve the nonblocking status on non-unix platforms
     Ok(())
 }

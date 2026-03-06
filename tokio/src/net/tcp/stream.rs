@@ -1,12 +1,14 @@
 cfg_not_wasi! {
     use crate::net::{to_socket_addrs, ToSocketAddrs};
     use std::future::poll_fn;
+    #[cfg(not(target_os = "toyos"))]
     use std::time::Duration;
 }
 
 use crate::io::{AsyncRead, AsyncWrite, Interest, PollEvented, ReadBuf, Ready};
 use crate::net::tcp::split::{split, ReadHalf, WriteHalf};
 use crate::net::tcp::split_owned::{split_owned, OwnedReadHalf, OwnedWriteHalf};
+#[cfg(not(target_os = "toyos"))]
 use crate::util::check_socket_for_blocking;
 
 use std::fmt;
@@ -203,6 +205,7 @@ impl TcpStream {
     /// The runtime is usually set implicitly when this function is called
     /// from a future driven by a tokio runtime, otherwise runtime can be set
     /// explicitly with [`Runtime::enter`](crate::runtime::Runtime::enter) function.
+    #[cfg(not(target_os = "toyos"))]
     #[track_caller]
     pub fn from_std(stream: std::net::TcpStream) -> io::Result<TcpStream> {
         check_socket_for_blocking(&stream)?;
@@ -251,6 +254,7 @@ impl TcpStream {
     /// [`tokio::net::TcpStream`]: TcpStream
     /// [`std::net::TcpStream`]: std::net::TcpStream
     /// [`set_nonblocking`]: fn@std::net::TcpStream::set_nonblocking
+    #[cfg(not(target_os = "toyos"))]
     pub fn into_std(self) -> io::Result<std::net::TcpStream> {
         #[cfg(unix)]
         {
@@ -1273,6 +1277,7 @@ impl TcpStream {
         /// # Ok(())
         /// # }
         /// ```
+        #[cfg(not(target_os = "toyos"))]
         pub fn linger(&self) -> io::Result<Option<Duration>> {
             socket2::SockRef::from(self).linger()
         }
@@ -1314,6 +1319,7 @@ impl TcpStream {
         /// # Ok(())
         /// # }
         /// ```
+        #[cfg(not(target_os = "toyos"))]
         #[deprecated = "`SO_LINGER` causes the socket to block the thread on drop"]
         pub fn set_linger(&self, dur: Option<Duration>) -> io::Result<()> {
             socket2::SockRef::from(self).set_linger(dur)
@@ -1348,6 +1354,7 @@ impl TcpStream {
         /// # Ok(())
         /// # }
         /// ```
+        #[cfg(not(target_os = "toyos"))]
         pub fn set_zero_linger(&self) -> io::Result<()> {
             socket2::SockRef::from(self).set_linger(Some(Duration::ZERO))
         }
@@ -1457,6 +1464,7 @@ impl TcpStream {
     }
 }
 
+#[cfg(not(target_os = "toyos"))]
 impl TryFrom<std::net::TcpStream> for TcpStream {
     type Error = io::Error;
 

@@ -1,5 +1,6 @@
 use crate::io::{Interest, PollEvented};
 use crate::net::tcp::TcpStream;
+#[cfg(not(target_os = "toyos"))]
 use crate::util::check_socket_for_blocking;
 
 cfg_not_wasi! {
@@ -8,7 +9,9 @@ cfg_not_wasi! {
 
 use std::fmt;
 use std::io;
-use std::net::{self, SocketAddr};
+#[cfg(not(target_os = "toyos"))]
+use std::net;
+use std::net::SocketAddr;
 use std::task::{ready, Context, Poll};
 
 cfg_net! {
@@ -240,6 +243,7 @@ impl TcpListener {
     /// The runtime is usually set implicitly when this function is called
     /// from a future driven by a tokio runtime, otherwise runtime can be set
     /// explicitly with [`Runtime::enter`](crate::runtime::Runtime::enter) function.
+    #[cfg(not(target_os = "toyos"))]
     #[track_caller]
     pub fn from_std(listener: net::TcpListener) -> io::Result<TcpListener> {
         check_socket_for_blocking(&listener)?;
@@ -271,6 +275,7 @@ impl TcpListener {
     /// [`tokio::net::TcpListener`]: TcpListener
     /// [`std::net::TcpListener`]: std::net::TcpListener
     /// [`set_nonblocking`]: fn@std::net::TcpListener::set_nonblocking
+    #[cfg(not(target_os = "toyos"))]
     pub fn into_std(self) -> io::Result<std::net::TcpListener> {
         #[cfg(unix)]
         {
@@ -387,6 +392,7 @@ impl TcpListener {
     }
 }
 
+#[cfg(not(target_os = "toyos"))]
 impl TryFrom<net::TcpListener> for TcpListener {
     type Error = io::Error;
 

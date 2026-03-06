@@ -17,6 +17,7 @@ members = [
 
 [patch.crates-io]
 tokio = { path = "tokio" }
+mio = { path = "../mio" }
 
 [workspace.metadata.spellcheck]
 config = "spellcheck.toml"
@@ -31,5 +32,5 @@ unexpected_cfgs = { level = "warn", check-cfg = [
   'cfg(tokio_no_parking_lot)',
   'cfg(tokio_no_tuning_tests)',
   'cfg(tokio_unstable)',
-  'cfg(target_os, values("cygwin"))',
+  'cfg(target_os, values("cygwin", "toyos"))',
 ] }
