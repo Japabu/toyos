@@ -7,6 +7,9 @@ pub(crate) struct RelocOutput {
     pub(crate) relatives: Vec<(u64, i64)>,
     /// Dynamic GOT entries needing GLOB_DAT relocations: (GOT slot vaddr, symbol name).
     pub(crate) glob_dats: Vec<(u64, String)>,
+    /// GOTTPOFF GOT entries: (GOT slot vaddr, raw tpoff value). Written directly into
+    /// the output (not as RELATIVE) because RELATIVE would incorrectly add the load base.
+    pub(crate) tpoff_fills: Vec<(u64, i64)>,
 }
 
 /// Resolve a symbol to its virtual address.
@@ -20,7 +23,7 @@ pub(crate) fn resolve_symbol(
     match sym {
         SymbolRef::Global(name) => {
             match state.globals.get(name)? {
-                SymbolDef::Dynamic { .. } => plt.and_then(|p| p.get(sym).copied()),
+                SymbolDef::Dynamic { .. } => plt.and_then(|p| p.get(&SymbolRef::Global(name.clone())).copied()),
                 SymbolDef::Defined { section, value } => {
                     let sec = &state.sections[*section];
                     Some(sec.vaddr.unwrap_or_else(|| panic!(
@@ -34,7 +37,7 @@ pub(crate) fn resolve_symbol(
             // Global overrides local (e.g., inline function promoted to global)
             if let Some(def) = state.globals.get(name) {
                 return match def {
-                    SymbolDef::Dynamic { .. } => plt.and_then(|p| p.get(sym).copied()),
+                    SymbolDef::Dynamic { .. } => plt.and_then(|p| p.get(&SymbolRef::Global(name.clone())).copied()),
                     SymbolDef::Defined { section, value } => {
                         let sec = &state.sections[*section];
                         Some(sec.vaddr.unwrap_or_else(|| panic!(
@@ -92,6 +95,7 @@ fn apply_one_reloc(
     sym_addr: u64,
     reloc_vaddr: u64,
     got: &HashMap<SymbolRef, u64>,
+    dyn_got: &HashMap<SymbolRef, u64>,
 ) -> Result<bool, LinkError> {
     match reloc.r_type {
         RelocType::X86_64 => {
@@ -119,10 +123,13 @@ fn apply_one_reloc(
         }
         RelocType::X86Gotpcrel | RelocType::X86Gotpcrelx
         | RelocType::X86RexGotpcrelx => {
-            let got_slot = *got.get(&reloc.target).ok_or_else(|| {
-                LinkError::UndefinedSymbols(vec![reloc.target.name().to_string()])
-            })?;
-            let value = got_slot as i64 + reloc.addend - reloc_vaddr as i64;
+            let got_slot = got.get(&reloc.target)
+                .or_else(|| dyn_got.get(&reloc.target))
+                .or_else(|| dyn_got.get(&SymbolRef::Global(reloc.target.name().to_string())))
+                .ok_or_else(|| {
+                    LinkError::UndefinedSymbols(vec![reloc.target.name().to_string()])
+                })?;
+            let value = *got_slot as i64 + reloc.addend - reloc_vaddr as i64;
             check_i32(value, reloc)?;
             write_i32(state, reloc.section, reloc.offset, value as i32);
             Ok(false)
@@ -345,7 +352,7 @@ pub(crate) fn apply_relocs(
             | RelocType::Aarch64GotPcrel32
             | RelocType::Aarch64TlvpLoadPage21
             | RelocType::Aarch64TlvpLoadPageoff12 => {
-                let is_abs = apply_one_reloc(state, reloc, sym_addr, reloc_vaddr, params.got)?;
+                let is_abs = apply_one_reloc(state, reloc, sym_addr, reloc_vaddr, params.got, params.dyn_got)?;
                 if is_abs && params.record_relatives {
                     relatives.push((reloc_vaddr, sym_addr as i64 + reloc.addend));
                 }
@@ -354,6 +361,7 @@ pub(crate) fn apply_relocs(
     }
 
     // Fill GOT entries (PIE mode records as RELATIVE; static mode handles in emit)
+    let mut tpoff_fills = Vec::new();
     if params.record_relatives {
         let gottpoff_syms: HashSet<SymbolRef> = relocs
             .iter()
@@ -362,11 +370,15 @@ pub(crate) fn apply_relocs(
             .collect();
 
         for (sym_ref, &got_vaddr) in params.got {
+            // Dynamic symbols are in dyn_got, resolved at load time via GLOB_DAT
+            if params.dyn_got.contains_key(sym_ref) { continue; }
             let sym_addr = resolve_symbol(state, sym_ref, params.plt)
                 .ok_or_else(|| LinkError::UndefinedSymbols(vec![sym_ref.name().to_string()]))?;
             if gottpoff_syms.contains(sym_ref) {
+                // Write raw tpoff directly — NOT as RELATIVE (RELATIVE would add
+                // the load base, corrupting the TP-relative offset).
                 let tp = tpoff(sym_addr, params.tls_start, params.tls_memsz);
-                relatives.push((got_vaddr, tp));
+                tpoff_fills.push((got_vaddr, tp));
             } else {
                 relatives.push((got_vaddr, sym_addr as i64));
             }
@@ -385,7 +397,7 @@ pub(crate) fn apply_relocs(
         return Err(LinkError::UndefinedSymbols(syms));
     }
 
-    Ok(RelocOutput { relatives, glob_dats })
+    Ok(RelocOutput { relatives, glob_dats, tpoff_fills })
 }
 
 // ── AArch64 relocation helpers ───────────────────────────────────────────
@@ -748,7 +760,7 @@ pub(crate) fn apply_relocs_macho(
             | RelocType::X86_32
             | RelocType::X86_32S
             | RelocType::X86Tlv => {
-                apply_one_reloc(state, reloc, sym_addr, reloc_vaddr, params.got)?
+                apply_one_reloc(state, reloc, sym_addr, reloc_vaddr, params.got, &HashMap::new())?
             }
             other => return Err(LinkError::UnsupportedRelocation {
                 reloc_type: other, symbol: reloc.target.name().to_string(),
@@ -857,7 +869,7 @@ pub(crate) fn apply_relocs_pe(
             }
         };
 
-        let is_abs = apply_one_reloc(state, reloc, sym_addr, reloc_vaddr, &layout.got)?;
+        let is_abs = apply_one_reloc(state, reloc, sym_addr, reloc_vaddr, &layout.got, &HashMap::new())?;
         if is_abs {
             abs_fixups.push(reloc_vaddr as u32);
         }

@@ -271,11 +271,20 @@ pub(crate) fn layout_elf(state: &mut LinkState, base_addr: u64, entry_name: Opti
         cursor += sec.size;
     }
 
-    // PLT stubs for dynamic symbols (PIE mode only)
-    let mut dyn_syms = collect_unique_symbols(
+    // PLT stubs for dynamic symbols (PIE mode only).
+    // Deduplicate by name and normalize to Global, since Local and Global
+    // variants of the same symbol name refer to the same dynamic import.
+    let dyn_syms_raw = collect_unique_symbols(
         state.relocs.iter(),
         |r| state.dynamic_imports.contains(r.target.name()),
     );
+    let mut dyn_seen = std::collections::HashSet::new();
+    let mut dyn_syms: Vec<SymbolRef> = Vec::new();
+    for sym in &dyn_syms_raw {
+        if dyn_seen.insert(sym.name().to_string()) {
+            dyn_syms.push(SymbolRef::Global(sym.name().to_string()));
+        }
+    }
     if let Some(entry) = entry_name {
         let entry_ref = SymbolRef::Global(entry.to_string());
         if state.dynamic_imports.contains(entry) && !dyn_syms.contains(&entry_ref) {
@@ -351,7 +360,10 @@ pub(crate) fn layout_elf(state: &mut LinkState, base_addr: u64, entry_name: Opti
 
     cursor = align_up(cursor, 8);
     let mut got = HashMap::new();
+    let dyn_sym_names: std::collections::HashSet<&str> = dyn_syms.iter().map(|s| s.name()).collect();
     for sym in &got_symbols {
+        // Dynamic symbols use dyn_got (resolved at load time via GLOB_DAT)
+        if dyn_sym_names.contains(sym.name()) { continue; }
         got.insert(sym.clone(), cursor);
         cursor += 8;
     }
@@ -387,14 +399,13 @@ pub(crate) fn layout_elf(state: &mut LinkState, base_addr: u64, entry_name: Opti
         cursor += sec.size;
     }
 
-    // TLS BSS (.tbss) after regular BSS
+    // TLS BSS (.tbss) — only occupies space in the TLS block, not regular address space
     for &idx in &buckets.tls {
         if state.sections[idx].kind != SectionKind::TlsBss { continue; }
         let sec = &mut state.sections[idx];
         tls_cursor = align_up(tls_cursor, sec.align);
         sec.vaddr = Some(tls_cursor);
         tls_cursor += sec.size;
-        cursor = cursor.max(tls_cursor);
     }
     let tls_memsz = if tls_cursor > tls_start { tls_cursor - tls_start } else { 0 };
 
@@ -603,9 +614,14 @@ fn write_symtab(w: &mut Writer, entries: &[SymEntry]) {
 }
 
 /// Write section data to the Writer in file-offset order. Skips NOBITS sections.
-fn write_sections_data(w: &mut Writer, sections: &[InputSection], base: u64) {
+/// Only writes sections whose vaddr is in [vaddr_min, vaddr_max).
+fn write_sections_data(w: &mut Writer, sections: &[InputSection], base: u64, vaddr_min: u64, vaddr_max: u64) {
     let mut indices: Vec<usize> = (0..sections.len())
-        .filter(|&i| sections[i].vaddr.is_some() && !sections[i].data.is_empty() && !sections[i].kind.is_nobits())
+        .filter(|&i| {
+            let Some(vaddr) = sections[i].vaddr else { return false };
+            !sections[i].data.is_empty() && !sections[i].kind.is_nobits()
+                && vaddr >= vaddr_min && vaddr < vaddr_max
+        })
         .collect();
     indices.sort_by_key(|&i| sections[i].vaddr.unwrap());
     for i in indices {
@@ -669,9 +685,9 @@ pub(crate) fn emit_elf(
         || (is_pie && (layout.init_array_size > 0 || layout.fini_array_size > 0));
     let has_eh_frame_hdr = !eh_frame_hdr.is_empty();
     let has_build_id = layout.build_id_note_vaddr != 0;
-    let has_plt = is_pie && !layout.plt_data.is_empty();
+    let has_plt = (is_pie || is_shared) && !layout.plt_data.is_empty();
     let has_rela = relocs.map_or(false, |r| !r.relatives.is_empty())
-        || (has_dynamic_libs && relocs.map_or(false, |r| !r.glob_dats.is_empty()));
+        || relocs.map_or(false, |r| !r.glob_dats.is_empty());
     let file_rw_end = layout.rw_start + layout.rw_filesz;
 
     let mut buf = Vec::new();
@@ -717,6 +733,8 @@ pub(crate) fn emit_elf(
     }
 
     let (gnu_hash_sym_count, gnu_hash_bucket_count, gnu_hash_bloom_count);
+    // Shared library import symbols (for GLOB_DAT — resolved at load time)
+    let mut shared_import_str_ids: Vec<(String, StringId)> = Vec::new();
     if is_shared {
         let mut symbols: Vec<_> = state.globals.iter().collect();
         symbols.sort_by_key(|(name, _)| *name);
@@ -726,6 +744,16 @@ pub(crate) fn emit_elf(
             let st_value = state.sections[*section].vaddr.unwrap() + value;
             let hash = gnu_hash(name.as_bytes());
             export_str_ids.push((name.to_string(), str_id, st_value, hash));
+        }
+        // Add undefined (imported) symbols that have GLOB_DAT entries
+        if let Some(relocs) = relocs {
+            for (_, sym_name) in &relocs.glob_dats {
+                if !sym_to_writer_idx.contains_key(sym_name) {
+                    let str_id = w.add_dynamic_string(sym_name.as_bytes());
+                    shared_import_str_ids.push((sym_name.clone(), str_id));
+                    sym_to_writer_idx.insert(sym_name.clone(), SymbolIndex(0)); // placeholder
+                }
+            }
         }
         gnu_hash_sym_count = export_str_ids.len() as u32;
         gnu_hash_bucket_count = gnu_hash_sym_count.max(1);
@@ -799,7 +827,7 @@ pub(crate) fn emit_elf(
     let dynsym_count = if has_dynamic_libs {
         import_str_ids.len()
     } else if is_shared {
-        export_str_ids.len()
+        export_str_ids.len() + shared_import_str_ids.len()
     } else {
         0
     };
@@ -809,6 +837,11 @@ pub(crate) fn emit_elf(
             let idx = w.reserve_dynamic_symbol_index();
             if has_dynamic_libs {
                 sym_to_writer_idx.insert(import_str_ids[i].0.clone(), idx);
+            }
+            // Track writer indices for shared library import symbols
+            if is_shared && i >= export_str_ids.len() {
+                let import_i = i - export_str_ids.len();
+                sym_to_writer_idx.insert(shared_import_str_ids[import_i].0.clone(), idx);
             }
         }
     }
@@ -826,9 +859,18 @@ pub(crate) fn emit_elf(
 
     // Rela count
     let rela_count = if let Some(relocs) = relocs {
-        relocs.relatives.len() + if has_dynamic_libs { relocs.glob_dats.len() } else { 0 }
+        relocs.relatives.len() + relocs.glob_dats.len()
     } else { 0 };
     let rela_size = rela_count as u64 * 24;
+
+    // Pad file so dynamic metadata starts past rw_end, avoiding virtual address
+    // overlap between the RW segment's .bss and the R segment's dynsym/dynstr/dynamic.
+    if needs_dynamic {
+        let rw_end_off = (layout.rw_end - base) as usize;
+        if w.reserved_len() < rw_end_off {
+            w.reserve_until(rw_end_off);
+        }
+    }
 
     // Dynamic metadata reservations
     let (dynsym_off, dynstr_off, gnu_hash_off);
@@ -845,6 +887,14 @@ pub(crate) fn emit_elf(
         gnu_hash_off = 0;
     }
 
+    // For shared libraries, reserve RELA before the dynamic section so it's
+    // within the R PT_LOAD segment and accessible from the loaded image.
+    let rela_off_shared = if is_shared && rela_count > 0 {
+        w.reserve_relocations(rela_count, true) as u64
+    } else {
+        0
+    };
+
     let (dynamic_count, dynamic_off, dyn_segment_end);
     if needs_dynamic {
         let mut dc = 1; // DT_NULL
@@ -854,7 +904,7 @@ pub(crate) fn emit_elf(
         if is_shared {
             dc += 5; // SYMTAB + STRTAB + STRSZ + SYMENT + GNU_HASH
         }
-        if rela_count > 0 && !is_shared { dc += 3; } // DT_RELA + DT_RELASZ + DT_RELAENT
+        if rela_count > 0 { dc += 3; } // DT_RELA + DT_RELASZ + DT_RELAENT
         if layout.init_array_size > 0 { dc += 2; }
         if layout.fini_array_size > 0 { dc += 2; }
         dynamic_count = dc;
@@ -867,9 +917,9 @@ pub(crate) fn emit_elf(
         dyn_segment_end = 0;
     }
 
-    let rela_off = if rela_count > 0 || is_pie {
-        w.reserve_relocations(rela_count, true) as u64
-    } else if is_shared {
+    let rela_off = if is_shared {
+        rela_off_shared
+    } else if rela_count > 0 || is_pie {
         w.reserve_relocations(rela_count, true) as u64
     } else {
         0
@@ -990,8 +1040,10 @@ pub(crate) fn emit_elf(
         });
     }
 
-    // Section data
-    write_sections_data(&mut w, &state.sections, base);
+    // Write RX (text) segment sections, then PLT/eh_frame_hdr/build_id (also in
+    // the RX range), then RW (data) segment sections. Everything must be written
+    // in ascending vaddr order because the Writer only supports forward appending.
+    write_sections_data(&mut w, &state.sections, base, base, layout.rx_end);
     if has_plt {
         w.pad_until((layout.plt_vaddr - base) as usize);
         w.write(&layout.plt_data);
@@ -1004,6 +1056,7 @@ pub(crate) fn emit_elf(
         w.pad_until((layout.build_id_note_vaddr - base) as usize);
         w.write(&build_id_note_placeholder());
     }
+    write_sections_data(&mut w, &state.sections, base, layout.rx_end, u64::MAX);
 
     // Static mode: fill GOT entries directly
     if is_static {
@@ -1024,7 +1077,24 @@ pub(crate) fn emit_elf(
         }
     }
 
+    // PIE mode: write GOTTPOFF GOT entries directly (raw tpoff, no RELATIVE)
+    if let Some(relocs) = relocs {
+        let mut fills: Vec<_> = relocs.tpoff_fills.iter().collect();
+        fills.sort_by_key(|&&(vaddr, _)| vaddr);
+        for &(got_vaddr, tp) in fills {
+            let file_off = (got_vaddr - base) as usize;
+            w.pad_until(file_off);
+            w.write(&(tp as u64).to_le_bytes());
+        }
+    }
+
     w.pad_until((file_rw_end - base) as usize);
+
+    // Pad to rw_end so dynamic metadata starts past .bss virtual addresses
+    if needs_dynamic {
+        let rw_end_off = (layout.rw_end - base) as usize;
+        w.pad_until(rw_end_off);
+    }
 
     // Dynamic symbols
     if has_dynamic_libs {
@@ -1055,11 +1125,47 @@ pub(crate) fn emit_elf(
                 st_size: 0,
             });
         }
+        // Undefined (imported) symbols — resolved at load time via GLOB_DAT
+        for (_, str_id) in &shared_import_str_ids {
+            w.write_dynamic_symbol(&Sym {
+                name: Some(*str_id),
+                section: None,
+                st_info: (elf::STB_GLOBAL << 4) | elf::STT_NOTYPE,
+                st_other: elf::STV_DEFAULT,
+                st_shndx: 0, // undefined
+                st_value: 0,
+                st_size: 0,
+            });
+        }
         w.write_dynstr();
 
         // .gnu.hash
         let sym_hashes: Vec<u32> = export_str_ids.iter().map(|(_, _, _, h)| *h).collect();
         w.write_gnu_hash(1, 6, gnu_hash_bloom_count, gnu_hash_bucket_count, gnu_hash_sym_count, |i| sym_hashes[i as usize]);
+
+        // Shared library RELA (reserved before dynamic section, must be written here)
+        if let Some(relocs) = relocs {
+            if !relocs.relatives.is_empty() || !relocs.glob_dats.is_empty() {
+                w.write_align_relocation();
+                for &(offset, addend) in &relocs.relatives {
+                    w.write_relocation(true, &Rel {
+                        r_offset: offset,
+                        r_sym: 0,
+                        r_type: elf::R_X86_64_RELATIVE,
+                        r_addend: addend,
+                    });
+                }
+                for (got_vaddr, sym_name) in &relocs.glob_dats {
+                    let sym_idx = sym_to_writer_idx[sym_name];
+                    w.write_relocation(true, &Rel {
+                        r_offset: *got_vaddr,
+                        r_sym: sym_idx.0,
+                        r_type: elf::R_X86_64_GLOB_DAT,
+                        r_addend: 0,
+                    });
+                }
+            }
+        }
     }
 
     // Dynamic section
@@ -1083,7 +1189,7 @@ pub(crate) fn emit_elf(
             w.write_dynamic(elf::DT_SYMENT as u32, 24);
             w.write_dynamic(elf::DT_GNU_HASH as u32, gnu_hash_off);
         }
-        if rela_count > 0 && !is_shared {
+        if rela_count > 0 {
             w.write_dynamic(elf::DT_RELA as u32, rela_off);
             w.write_dynamic(elf::DT_RELASZ as u32, rela_size);
             w.write_dynamic(elf::DT_RELAENT as u32, 24);
@@ -1100,18 +1206,18 @@ pub(crate) fn emit_elf(
         w.pad_until(dyn_segment_end as usize);
     }
 
-    // Relocations
-    if let Some(relocs) = relocs {
-        w.write_align_relocation();
-        for &(offset, addend) in &relocs.relatives {
-            w.write_relocation(true, &Rel {
-                r_offset: offset,
-                r_sym: 0,
-                r_type: elf::R_X86_64_RELATIVE,
-                r_addend: addend,
-            });
-        }
-        if has_dynamic_libs {
+    // Relocations (PIE / non-shared — shared writes RELA before dynamic section)
+    if !is_shared {
+        if let Some(relocs) = relocs {
+            w.write_align_relocation();
+            for &(offset, addend) in &relocs.relatives {
+                w.write_relocation(true, &Rel {
+                    r_offset: offset,
+                    r_sym: 0,
+                    r_type: elf::R_X86_64_RELATIVE,
+                    r_addend: addend,
+                });
+            }
             for (got_vaddr, sym_name) in &relocs.glob_dats {
                 let sym_idx = sym_to_writer_idx[sym_name];
                 w.write_relocation(true, &Rel {
@@ -1169,10 +1275,10 @@ pub(crate) fn emit_elf(
             name: Some(rela_name),
             sh_type: elf::SHT_RELA,
             sh_flags: elf::SHF_ALLOC as u64,
-            sh_addr: if needs_dynamic && !is_shared { rela_off } else { 0 },
+            sh_addr: if needs_dynamic { rela_off } else { 0 },
             sh_offset: rela_off,
             sh_size: rela_size,
-            sh_link: if has_dynamic_libs { dynsym_sec_idx.unwrap().0 } else { 0 },
+            sh_link: if dynsym_sec_idx.is_some() { dynsym_sec_idx.unwrap().0 } else { 0 },
             sh_info: 0,
             sh_addralign: 8,
             sh_entsize: 24,

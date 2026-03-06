@@ -97,9 +97,14 @@ impl Collected {
             }
         }
         for (sym, has_call) in referenced {
+            // __tls_get_addr is called via TLS GD/LD sequences which are always
+            // relaxed to LE/IE (local exec). The call gets overwritten, so this
+            // symbol is never actually needed at runtime.
+            if sym == "__tls_get_addr" { continue; }
             if !self.state.globals.contains_key(&sym)
                 && !self.state.locals.keys().any(|(_, n)| n == &sym)
             {
+                self.state.dynamic_imports.insert(sym.clone());
                 self.state.globals.insert(sym, SymbolDef::Dynamic { is_func: has_call });
             }
         }
@@ -417,8 +422,10 @@ pub fn link_shared(objects: &[(String, Vec<u8>)]) -> Result<Vec<u8>, LinkError> 
 }
 
 pub fn link_shared_full(objects: &[(String, Vec<u8>)], build_id: bool) -> Result<Vec<u8>, LinkError> {
-    Collected::new(objects)?
-        .layout_elf(BASE_VADDR, None, build_id)
+    let mut collected = Collected::new(objects)?;
+    collected.mark_dynamic_symbols();
+    create_call_stubs(&mut collected.state);
+    collected.layout_elf(BASE_VADDR, None, build_id)
         .relocate_and_emit_shared()
 }
 

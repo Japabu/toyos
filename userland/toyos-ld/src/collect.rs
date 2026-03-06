@@ -881,6 +881,17 @@ pub(crate) fn gc_sections(state: &mut LinkState, entry: &str) {
         queue.push_back(sec_idx.0);
     }
 
+    // `main` is always a root — it's called by `_start` (which may be in a
+    // shared library and thus invisible to GC).
+    if entry != "main" {
+        if let Some(sec_idx) = sym_to_section("main") {
+            if !reachable[sec_idx.0] {
+                reachable[sec_idx.0] = true;
+                queue.push_back(sec_idx.0);
+            }
+        }
+    }
+
     // .init_array / .fini_array sections are always roots
     for (idx, sec) in state.sections.iter().enumerate() {
         if sec.kind == SectionKind::InitArray || sec.kind == SectionKind::FiniArray {
