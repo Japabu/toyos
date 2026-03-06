@@ -572,6 +572,19 @@ pub fn exit(code: i32) -> ! {
                 unsafe { cpu::write_cr3(paging::kernel_cr3()); }
             }
             Kind::Process { .. } => {
+                // Kill all child threads before freeing resources they depend on
+                let child_tids: alloc::vec::Vec<u32> = table.procs.iter()
+                    .filter(|(_tid, p)| matches!(p.kind, Kind::Thread { parent } if parent == pid))
+                    .map(|(tid, _)| tid)
+                    .collect();
+                for tid in &child_tids {
+                    let child = table.procs.get_mut(*tid).unwrap();
+                    child.tls_alloc.take();
+                    child.state = ProcessState::Zombie(-1);
+                    let name = core::str::from_utf8(&child.name).unwrap_or("?").trim_end_matches('\0');
+                    log!("exit: killing child thread {name} pid={tid}");
+                }
+
                 let pml4 = proc.cr3 as *mut u64;
                 unsafe { cpu::write_cr3(paging::kernel_cr3()); }
                 shared_memory::cleanup_process(pid, pml4);

@@ -21,13 +21,15 @@ use toyos_abi::syscall::*;
 
 /// Run a closure with the heap owner's user_heap. For normal processes this is
 /// the process itself; for threads it's the parent process.
-fn with_heap_owner<R>(f: impl FnOnce(&mut user_heap::UserHeap) -> R) -> R {
+/// Returns None if the current process or heap owner no longer exists
+/// (e.g., parent exited while thread is still running).
+fn with_heap_owner<R>(f: impl FnOnce(&mut user_heap::UserHeap) -> R) -> Option<R> {
     let mut guard = process::PROCESS_TABLE.lock();
     let table = guard.as_mut().expect("process table not initialized");
     let pid = crate::arch::percpu::current_pid();
-    let owner_pid = table.procs.get(pid).unwrap().heap_owner;
-    let owner = table.procs.get_mut(owner_pid).unwrap();
-    f(&mut owner.user_heap)
+    let owner_pid = table.procs.get(pid)?.heap_owner;
+    let owner = table.procs.get_mut(owner_pid)?;
+    Some(f(&mut owner.user_heap))
 }
 
 // ---------------------------------------------------------------------------
@@ -94,9 +96,9 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             let Some(buf) = ctx.user_slice_mut(a2, a3) else { return u64::MAX };
             sys_read(a1, buf)
         }
-        SYS_ALLOC => with_heap_owner(|heap| user_heap::alloc(heap, a1 as usize, a2 as usize)),
-        SYS_FREE => { with_heap_owner(|heap| { user_heap::free(heap, a1 as *mut u8, a2 as usize); 0 }) }
-        SYS_REALLOC => with_heap_owner(|heap| user_heap::realloc(heap, a1 as *mut u8, a2 as usize, a3 as usize, a4 as usize)),
+        SYS_ALLOC => with_heap_owner(|heap| user_heap::alloc(heap, a1 as usize, a2 as usize)).unwrap_or(0),
+        SYS_FREE => { with_heap_owner(|heap| { user_heap::free(heap, a1 as *mut u8, a2 as usize); 0 }).unwrap_or(0) }
+        SYS_REALLOC => with_heap_owner(|heap| user_heap::realloc(heap, a1 as *mut u8, a2 as usize, a3 as usize, a4 as usize)).unwrap_or(0),
         SYS_EXIT => sys_exit(a1 as i32),
         SYS_RANDOM => {
             let Some(buf) = ctx.user_slice_mut(a1, a2) else { return u64::MAX };
@@ -511,7 +513,7 @@ fn sys_recv_msg(out: &mut message::UserMessage) -> u64 {
                 // Allocate in receiver's user heap and copy payload
                 let addr = with_heap_owner(|heap| {
                     user_heap::alloc(heap, msg.payload.len(), 8)
-                });
+                }).unwrap_or(0);
                 if addr == 0 {
                     return u64::MAX;
                 }
