@@ -15,176 +15,403 @@
 
 // http://cvsweb.openbsd.org/cgi-bin/cvsweb/src/usr.bin/ssh/PROTOCOL.chacha20poly1305?annotate=HEAD
 
-use std::convert::TryInto;
+#[cfg(any(feature = "ring", feature = "aws-lc-rs"))]
+mod ring_or_aws {
+    use std::convert::TryInto;
 
-#[cfg(feature = "aws-lc-rs")]
-use aws_lc_rs::{
-    aead::{
-        Aad, Algorithm, BoundKey, NONCE_LEN, Nonce as AeadNonce, NonceSequence,
-        OpeningKey as AeadOpeningKey, SealingKey as AeadSealingKey, UnboundKey,
-    },
-    error::Unspecified,
-};
-use rand::RngCore;
-#[cfg(all(not(feature = "aws-lc-rs"), feature = "ring"))]
-use ring::{
-    aead::{
-        Aad, Algorithm, BoundKey, NONCE_LEN, Nonce as AeadNonce, NonceSequence,
-        OpeningKey as AeadOpeningKey, SealingKey as AeadSealingKey, UnboundKey,
-    },
-    error::Unspecified,
-};
+    #[cfg(feature = "aws-lc-rs")]
+    use aws_lc_rs::{
+        aead::{
+            Aad, Algorithm, BoundKey, NONCE_LEN, Nonce as AeadNonce, NonceSequence,
+            OpeningKey as AeadOpeningKey, SealingKey as AeadSealingKey, UnboundKey,
+        },
+        error::Unspecified,
+    };
+    use rand::RngCore;
+    #[cfg(all(not(feature = "aws-lc-rs"), feature = "ring"))]
+    use ring::{
+        aead::{
+            Aad, Algorithm, BoundKey, NONCE_LEN, Nonce as AeadNonce, NonceSequence,
+            OpeningKey as AeadOpeningKey, SealingKey as AeadSealingKey, UnboundKey,
+        },
+        error::Unspecified,
+    };
 
-use super::super::Error;
-use crate::keys::key::safe_rng;
-use crate::mac::MacAlgorithm;
+    use super::super::super::Error;
+    use crate::keys::key::safe_rng;
+    use crate::mac::MacAlgorithm;
 
-pub struct GcmCipher(pub(crate) &'static Algorithm);
+    pub struct GcmCipher(pub(crate) &'static Algorithm);
 
-impl super::Cipher for GcmCipher {
-    fn key_len(&self) -> usize {
-        self.0.key_len()
+    impl super::super::Cipher for GcmCipher {
+        fn key_len(&self) -> usize {
+            self.0.key_len()
+        }
+
+        fn nonce_len(&self) -> usize {
+            self.0.nonce_len()
+        }
+
+        fn make_opening_key(
+            &self,
+            k: &[u8],
+            n: &[u8],
+            _: &[u8],
+            _: &dyn MacAlgorithm,
+        ) -> Box<dyn super::super::OpeningKey + Send> {
+            #[allow(clippy::unwrap_used)]
+            Box::new(OpeningKey(AeadOpeningKey::new(
+                UnboundKey::new(self.0, k).unwrap(),
+                Nonce(n.try_into().unwrap()),
+            )))
+        }
+
+        fn make_sealing_key(
+            &self,
+            k: &[u8],
+            n: &[u8],
+            _: &[u8],
+            _: &dyn MacAlgorithm,
+        ) -> Box<dyn super::super::SealingKey + Send> {
+            #[allow(clippy::unwrap_used)]
+            Box::new(SealingKey(AeadSealingKey::new(
+                UnboundKey::new(self.0, k).unwrap(),
+                Nonce(n.try_into().unwrap()),
+            )))
+        }
     }
 
-    fn nonce_len(&self) -> usize {
-        self.0.nonce_len()
+    pub struct OpeningKey<N: NonceSequence>(AeadOpeningKey<N>);
+
+    pub struct SealingKey<N: NonceSequence>(AeadSealingKey<N>);
+
+    struct Nonce([u8; NONCE_LEN]);
+
+    impl NonceSequence for Nonce {
+        fn advance(&mut self) -> Result<AeadNonce, Unspecified> {
+            let mut previous_nonce = [0u8; NONCE_LEN];
+            #[allow(clippy::indexing_slicing)] // length checked
+            previous_nonce.clone_from_slice(&self.0[..]);
+            let mut carry = 1;
+            #[allow(clippy::indexing_slicing)] // length checked
+            for i in (0..NONCE_LEN).rev() {
+                let n = self.0[i] as u16 + carry;
+                self.0[i] = n as u8;
+                carry = n >> 8;
+            }
+            Ok(AeadNonce::assume_unique_for_key(previous_nonce))
+        }
     }
 
-    fn make_opening_key(
-        &self,
-        k: &[u8],
-        n: &[u8],
-        _: &[u8],
-        _: &dyn MacAlgorithm,
-    ) -> Box<dyn super::OpeningKey + Send> {
-        #[allow(clippy::unwrap_used)]
-        Box::new(OpeningKey(AeadOpeningKey::new(
-            UnboundKey::new(self.0, k).unwrap(),
-            Nonce(n.try_into().unwrap()),
-        )))
+    impl<N: NonceSequence> super::super::OpeningKey for OpeningKey<N> {
+        fn decrypt_packet_length(
+            &self,
+            _sequence_number: u32,
+            encrypted_packet_length: &[u8],
+        ) -> [u8; 4] {
+            // Fine because of self.packet_length_to_read_for_block_length()
+            #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+            encrypted_packet_length.try_into().unwrap()
+        }
+
+        fn tag_len(&self) -> usize {
+            self.0.algorithm().tag_len()
+        }
+
+        fn open<'a>(
+            &mut self,
+            _sequence_number: u32,
+            ciphertext_and_tag: &'a mut [u8],
+        ) -> Result<&'a [u8], Error> {
+            // Packet length is sent unencrypted
+            let mut packet_length = [0; super::super::PACKET_LENGTH_LEN];
+
+            #[allow(clippy::indexing_slicing)] // length checked
+            packet_length.clone_from_slice(&ciphertext_and_tag[..super::super::PACKET_LENGTH_LEN]);
+
+            let buf = self
+                .0
+                .open_in_place(
+                    Aad::from(&packet_length),
+                    #[allow(clippy::indexing_slicing)] // length checked
+                    &mut ciphertext_and_tag[super::super::PACKET_LENGTH_LEN..],
+                )
+                .map_err(|_| Error::DecryptionError)?;
+
+            Ok(buf)
+        }
     }
 
-    fn make_sealing_key(
-        &self,
-        k: &[u8],
-        n: &[u8],
-        _: &[u8],
-        _: &dyn MacAlgorithm,
-    ) -> Box<dyn super::SealingKey + Send> {
-        #[allow(clippy::unwrap_used)]
-        Box::new(SealingKey(AeadSealingKey::new(
-            UnboundKey::new(self.0, k).unwrap(),
-            Nonce(n.try_into().unwrap()),
-        )))
+    impl<N: NonceSequence> super::super::SealingKey for SealingKey<N> {
+        fn padding_length(&self, payload: &[u8]) -> usize {
+            let block_size = 16;
+            let extra_len = super::super::PACKET_LENGTH_LEN + super::super::PADDING_LENGTH_LEN;
+            let padding_len = if payload.len() + extra_len <= super::super::MINIMUM_PACKET_LEN {
+                super::super::MINIMUM_PACKET_LEN - payload.len() - super::super::PADDING_LENGTH_LEN
+            } else {
+                block_size - ((super::super::PADDING_LENGTH_LEN + payload.len()) % block_size)
+            };
+            if padding_len < super::super::PACKET_LENGTH_LEN {
+                padding_len + block_size
+            } else {
+                padding_len
+            }
+        }
+
+        fn fill_padding(&self, padding_out: &mut [u8]) {
+            safe_rng().fill_bytes(padding_out);
+        }
+
+        fn tag_len(&self) -> usize {
+            self.0.algorithm().tag_len()
+        }
+
+        fn seal(
+            &mut self,
+            _sequence_number: u32,
+            plaintext_in_ciphertext_out: &mut [u8],
+            tag: &mut [u8],
+        ) {
+            // Packet length is received unencrypted
+            let mut packet_length = [0; super::super::PACKET_LENGTH_LEN];
+            #[allow(clippy::indexing_slicing)] // length checked
+            packet_length
+                .clone_from_slice(&plaintext_in_ciphertext_out[..super::super::PACKET_LENGTH_LEN]);
+
+            #[allow(clippy::unwrap_used)]
+            let tag_out = self
+                .0
+                .seal_in_place_separate_tag(
+                    Aad::from(&packet_length),
+                    #[allow(clippy::indexing_slicing)]
+                    &mut plaintext_in_ciphertext_out[super::super::PACKET_LENGTH_LEN..],
+                )
+                .unwrap();
+
+            tag.clone_from_slice(tag_out.as_ref());
+        }
     }
 }
 
-pub struct OpeningKey<N: NonceSequence>(AeadOpeningKey<N>);
+#[cfg(any(feature = "ring", feature = "aws-lc-rs"))]
+pub use ring_or_aws::GcmCipher;
 
-pub struct SealingKey<N: NonceSequence>(AeadSealingKey<N>);
+// --- Pure-Rust rustcrypto backend ---
 
-struct Nonce([u8; NONCE_LEN]);
+#[cfg(all(feature = "rustcrypto", not(any(feature = "ring", feature = "aws-lc-rs"))))]
+mod pure_rust {
+    use std::convert::TryInto;
 
-impl NonceSequence for Nonce {
-    fn advance(&mut self) -> Result<AeadNonce, Unspecified> {
-        let mut previous_nonce = [0u8; NONCE_LEN];
-        #[allow(clippy::indexing_slicing)] // length checked
-        previous_nonce.clone_from_slice(&self.0[..]);
-        let mut carry = 1;
-        #[allow(clippy::indexing_slicing)] // length checked
+    use aes_gcm::aead::generic_array::GenericArray;
+    use aes_gcm::{AeadInPlace, Aes128Gcm, Aes256Gcm, KeyInit, Tag};
+    use rand::RngCore;
+
+    use super::super::super::Error;
+    use crate::keys::key::safe_rng;
+    use crate::mac::MacAlgorithm;
+
+    const NONCE_LEN: usize = 12;
+    const TAG_LEN: usize = 16;
+
+    pub enum GcmVariant {
+        Aes128,
+        Aes256,
+    }
+
+    pub struct GcmCipher(pub GcmVariant);
+
+    enum CipherInstance {
+        Aes128(Aes128Gcm),
+        Aes256(Aes256Gcm),
+    }
+
+    impl CipherInstance {
+        fn decrypt_in_place_detached(
+            &self,
+            nonce: &GenericArray<u8, aes_gcm::aead::consts::U12>,
+            aad: &[u8],
+            buffer: &mut [u8],
+            tag: &Tag,
+        ) -> Result<(), aes_gcm::Error> {
+            match self {
+                CipherInstance::Aes128(c) => c.decrypt_in_place_detached(nonce, aad, buffer, tag),
+                CipherInstance::Aes256(c) => c.decrypt_in_place_detached(nonce, aad, buffer, tag),
+            }
+        }
+
+        fn encrypt_in_place_detached(
+            &self,
+            nonce: &GenericArray<u8, aes_gcm::aead::consts::U12>,
+            aad: &[u8],
+            buffer: &mut [u8],
+        ) -> Result<Tag, aes_gcm::Error> {
+            match self {
+                CipherInstance::Aes128(c) => c.encrypt_in_place_detached(nonce, aad, buffer),
+                CipherInstance::Aes256(c) => c.encrypt_in_place_detached(nonce, aad, buffer),
+            }
+        }
+    }
+
+    impl super::super::Cipher for GcmCipher {
+        fn key_len(&self) -> usize {
+            match self.0 {
+                GcmVariant::Aes128 => 16,
+                GcmVariant::Aes256 => 32,
+            }
+        }
+
+        fn nonce_len(&self) -> usize {
+            NONCE_LEN
+        }
+
+        fn make_opening_key(
+            &self,
+            k: &[u8],
+            n: &[u8],
+            _: &[u8],
+            _: &dyn MacAlgorithm,
+        ) -> Box<dyn super::super::OpeningKey + Send> {
+            #[allow(clippy::unwrap_used)]
+            let nonce: [u8; NONCE_LEN] = n.try_into().unwrap();
+            let cipher = match self.0 {
+                GcmVariant::Aes128 => CipherInstance::Aes128(Aes128Gcm::new(GenericArray::from_slice(k))),
+                GcmVariant::Aes256 => CipherInstance::Aes256(Aes256Gcm::new(GenericArray::from_slice(k))),
+            };
+            Box::new(OpeningKey { cipher, nonce })
+        }
+
+        fn make_sealing_key(
+            &self,
+            k: &[u8],
+            n: &[u8],
+            _: &[u8],
+            _: &dyn MacAlgorithm,
+        ) -> Box<dyn super::super::SealingKey + Send> {
+            #[allow(clippy::unwrap_used)]
+            let nonce: [u8; NONCE_LEN] = n.try_into().unwrap();
+            let cipher = match self.0 {
+                GcmVariant::Aes128 => CipherInstance::Aes128(Aes128Gcm::new(GenericArray::from_slice(k))),
+                GcmVariant::Aes256 => CipherInstance::Aes256(Aes256Gcm::new(GenericArray::from_slice(k))),
+            };
+            Box::new(SealingKey { cipher, nonce })
+        }
+    }
+
+    fn advance_nonce(nonce: &mut [u8; NONCE_LEN]) -> [u8; NONCE_LEN] {
+        let previous = *nonce;
+        let mut carry = 1u16;
+        #[allow(clippy::indexing_slicing)]
         for i in (0..NONCE_LEN).rev() {
-            let n = self.0[i] as u16 + carry;
-            self.0[i] = n as u8;
+            let n = nonce[i] as u16 + carry;
+            nonce[i] = n as u8;
             carry = n >> 8;
         }
-        Ok(AeadNonce::assume_unique_for_key(previous_nonce))
-    }
-}
-
-impl<N: NonceSequence> super::OpeningKey for OpeningKey<N> {
-    fn decrypt_packet_length(
-        &self,
-        _sequence_number: u32,
-        encrypted_packet_length: &[u8],
-    ) -> [u8; 4] {
-        // Fine because of self.packet_length_to_read_for_block_length()
-        #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
-        encrypted_packet_length.try_into().unwrap()
+        previous
     }
 
-    fn tag_len(&self) -> usize {
-        self.0.algorithm().tag_len()
+    pub struct OpeningKey {
+        cipher: CipherInstance,
+        nonce: [u8; NONCE_LEN],
     }
 
-    fn open<'a>(
-        &mut self,
-        _sequence_number: u32,
-        ciphertext_and_tag: &'a mut [u8],
-    ) -> Result<&'a [u8], Error> {
-        // Packet length is sent unencrypted
-        let mut packet_length = [0; super::PACKET_LENGTH_LEN];
-
-        #[allow(clippy::indexing_slicing)] // length checked
-        packet_length.clone_from_slice(&ciphertext_and_tag[..super::PACKET_LENGTH_LEN]);
-
-        let buf = self
-            .0
-            .open_in_place(
-                Aad::from(&packet_length),
-                #[allow(clippy::indexing_slicing)] // length checked
-                &mut ciphertext_and_tag[super::PACKET_LENGTH_LEN..],
-            )
-            .map_err(|_| Error::DecryptionError)?;
-
-        Ok(buf)
+    pub struct SealingKey {
+        cipher: CipherInstance,
+        nonce: [u8; NONCE_LEN],
     }
-}
 
-impl<N: NonceSequence> super::SealingKey for SealingKey<N> {
-    fn padding_length(&self, payload: &[u8]) -> usize {
-        let block_size = 16;
-        let extra_len = super::PACKET_LENGTH_LEN + super::PADDING_LENGTH_LEN;
-        let padding_len = if payload.len() + extra_len <= super::MINIMUM_PACKET_LEN {
-            super::MINIMUM_PACKET_LEN - payload.len() - super::PADDING_LENGTH_LEN
-        } else {
-            block_size - ((super::PADDING_LENGTH_LEN + payload.len()) % block_size)
-        };
-        if padding_len < super::PACKET_LENGTH_LEN {
-            padding_len + block_size
-        } else {
-            padding_len
+    impl super::super::OpeningKey for OpeningKey {
+        fn decrypt_packet_length(
+            &self,
+            _sequence_number: u32,
+            encrypted_packet_length: &[u8],
+        ) -> [u8; 4] {
+            #[allow(clippy::unwrap_used)]
+            encrypted_packet_length.try_into().unwrap()
+        }
+
+        fn tag_len(&self) -> usize {
+            TAG_LEN
+        }
+
+        fn open<'a>(
+            &mut self,
+            _sequence_number: u32,
+            ciphertext_and_tag: &'a mut [u8],
+        ) -> Result<&'a [u8], Error> {
+            let mut packet_length = [0; super::super::PACKET_LENGTH_LEN];
+            #[allow(clippy::indexing_slicing)]
+            packet_length.clone_from_slice(&ciphertext_and_tag[..super::super::PACKET_LENGTH_LEN]);
+
+            let nonce_bytes = advance_nonce(&mut self.nonce);
+            let nonce = GenericArray::from_slice(&nonce_bytes);
+
+            let tag_start = ciphertext_and_tag.len() - TAG_LEN;
+            #[allow(clippy::indexing_slicing)]
+            let tag = Tag::clone_from_slice(&ciphertext_and_tag[tag_start..]);
+            #[allow(clippy::indexing_slicing)]
+            let ciphertext =
+                &mut ciphertext_and_tag[super::super::PACKET_LENGTH_LEN..tag_start];
+
+            self.cipher
+                .decrypt_in_place_detached(nonce, &packet_length, ciphertext, &tag)
+                .map_err(|_| Error::DecryptionError)?;
+
+            Ok(ciphertext)
         }
     }
 
-    fn fill_padding(&self, padding_out: &mut [u8]) {
-        safe_rng().fill_bytes(padding_out);
-    }
+    impl super::super::SealingKey for SealingKey {
+        fn padding_length(&self, payload: &[u8]) -> usize {
+            let block_size = 16;
+            let extra_len = super::super::PACKET_LENGTH_LEN + super::super::PADDING_LENGTH_LEN;
+            let padding_len = if payload.len() + extra_len <= super::super::MINIMUM_PACKET_LEN {
+                super::super::MINIMUM_PACKET_LEN - payload.len() - super::super::PADDING_LENGTH_LEN
+            } else {
+                block_size - ((super::super::PADDING_LENGTH_LEN + payload.len()) % block_size)
+            };
+            if padding_len < super::super::PACKET_LENGTH_LEN {
+                padding_len + block_size
+            } else {
+                padding_len
+            }
+        }
 
-    fn tag_len(&self) -> usize {
-        self.0.algorithm().tag_len()
-    }
+        fn fill_padding(&self, padding_out: &mut [u8]) {
+            safe_rng().fill_bytes(padding_out);
+        }
 
-    fn seal(
-        &mut self,
-        _sequence_number: u32,
-        plaintext_in_ciphertext_out: &mut [u8],
-        tag: &mut [u8],
-    ) {
-        // Packet length is received unencrypted
-        let mut packet_length = [0; super::PACKET_LENGTH_LEN];
-        #[allow(clippy::indexing_slicing)] // length checked
-        packet_length.clone_from_slice(&plaintext_in_ciphertext_out[..super::PACKET_LENGTH_LEN]);
+        fn tag_len(&self) -> usize {
+            TAG_LEN
+        }
 
-        #[allow(clippy::unwrap_used)]
-        let tag_out = self
-            .0
-            .seal_in_place_separate_tag(
-                Aad::from(&packet_length),
-                #[allow(clippy::indexing_slicing)]
-                &mut plaintext_in_ciphertext_out[super::PACKET_LENGTH_LEN..],
-            )
-            .unwrap();
+        fn seal(
+            &mut self,
+            _sequence_number: u32,
+            plaintext_in_ciphertext_out: &mut [u8],
+            tag_out: &mut [u8],
+        ) {
+            let mut packet_length = [0; super::super::PACKET_LENGTH_LEN];
+            #[allow(clippy::indexing_slicing)]
+            packet_length
+                .clone_from_slice(&plaintext_in_ciphertext_out[..super::super::PACKET_LENGTH_LEN]);
 
-        tag.clone_from_slice(tag_out.as_ref());
+            let nonce_bytes = advance_nonce(&mut self.nonce);
+            let nonce = GenericArray::from_slice(&nonce_bytes);
+
+            #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+            let tag = self
+                .cipher
+                .encrypt_in_place_detached(
+                    nonce,
+                    &packet_length,
+                    &mut plaintext_in_ciphertext_out[super::super::PACKET_LENGTH_LEN..],
+                )
+                .unwrap();
+
+            tag_out.clone_from_slice(tag.as_ref());
+        }
     }
 }
+
+#[cfg(all(feature = "rustcrypto", not(any(feature = "ring", feature = "aws-lc-rs"))))]
+pub use pure_rust::{GcmCipher, GcmVariant};

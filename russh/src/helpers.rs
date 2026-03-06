@@ -63,7 +63,7 @@ pub(crate) mod macros {
     pub(crate) use map_err;
 }
 
-#[cfg(any(feature = "ring", feature = "aws-lc-rs"))]
+#[cfg(any(feature = "ring", feature = "aws-lc-rs", feature = "rustcrypto"))]
 pub(crate) use macros::map_err;
 
 #[doc(hidden)]

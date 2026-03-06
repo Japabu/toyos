@@ -1,23 +1,26 @@
 #[cfg(windows)]
 mod windows;
 
-#[cfg(not(windows))]
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(any(windows, target_arch = "wasm32", target_os = "toyos")))]
 mod unix;
+
+#[cfg(target_os = "toyos")]
+mod toyos;
 
 #[cfg(target_arch = "wasm32")]
 mod wasm;
 
 // Re-export functions based on the platform
-#[cfg(not(windows))]
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(any(windows, target_arch = "wasm32", target_os = "toyos")))]
 pub use unix::{mlock, munlock};
+#[cfg(target_os = "toyos")]
+pub use toyos::{mlock, munlock};
 #[cfg(target_arch = "wasm32")]
 pub use wasm::{mlock, munlock};
 #[cfg(windows)]
 pub use windows::{mlock, munlock};
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(any(target_arch = "wasm32", target_os = "toyos")))]
 mod error {
     use std::error::Error;
     use std::fmt::Display;
@@ -56,5 +59,5 @@ mod error {
     impl Error for MemoryLockError {}
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(any(target_arch = "wasm32", target_os = "toyos")))]
 pub use error::MemoryLockError;

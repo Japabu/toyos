@@ -31,6 +31,8 @@ use delegate::delegate;
 use log::trace;
 #[cfg(all(not(feature = "aws-lc-rs"), feature = "ring"))]
 use ring::aead::{AES_128_GCM as ALGORITHM_AES_128_GCM, AES_256_GCM as ALGORITHM_AES_256_GCM};
+#[cfg(all(feature = "rustcrypto", not(any(feature = "ring", feature = "aws-lc-rs"))))]
+use gcm::GcmVariant;
 use ssh_encoding::Encode;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
@@ -106,7 +108,9 @@ static _3DES_CBC: SshBlockCipher<CbcWrapper<des::TdesEde3>> = SshBlockCipher(Pha
 static _AES_128_CTR: SshBlockCipher<Ctr128BE<Aes128>> = SshBlockCipher(PhantomData);
 static _AES_192_CTR: SshBlockCipher<Ctr128BE<Aes192>> = SshBlockCipher(PhantomData);
 static _AES_256_CTR: SshBlockCipher<Ctr128BE<Aes256>> = SshBlockCipher(PhantomData);
+#[cfg(any(feature = "ring", feature = "aws-lc-rs"))]
 static _AES_128_GCM: GcmCipher = GcmCipher(&ALGORITHM_AES_128_GCM);
+#[cfg(any(feature = "ring", feature = "aws-lc-rs"))]
 static _AES_256_GCM: GcmCipher = GcmCipher(&ALGORITHM_AES_256_GCM);
 static _AES_128_CBC: SshBlockCipher<CbcWrapper<Aes128>> = SshBlockCipher(PhantomData);
 static _AES_192_CBC: SshBlockCipher<CbcWrapper<Aes192>> = SshBlockCipher(PhantomData);
@@ -139,8 +143,17 @@ pub(crate) static CIPHERS: LazyLock<HashMap<&'static Name, &(dyn Cipher + Send +
         h.insert(&AES_128_CTR, &_AES_128_CTR);
         h.insert(&AES_192_CTR, &_AES_192_CTR);
         h.insert(&AES_256_CTR, &_AES_256_CTR);
+        #[cfg(any(feature = "ring", feature = "aws-lc-rs"))]
         h.insert(&AES_128_GCM, &_AES_128_GCM);
+        #[cfg(any(feature = "ring", feature = "aws-lc-rs"))]
         h.insert(&AES_256_GCM, &_AES_256_GCM);
+        #[cfg(all(feature = "rustcrypto", not(any(feature = "ring", feature = "aws-lc-rs"))))]
+        {
+            static RC_AES_128_GCM: GcmCipher = GcmCipher(GcmVariant::Aes128);
+            static RC_AES_256_GCM: GcmCipher = GcmCipher(GcmVariant::Aes256);
+            h.insert(&AES_128_GCM, &RC_AES_128_GCM);
+            h.insert(&AES_256_GCM, &RC_AES_256_GCM);
+        }
         h.insert(&AES_128_CBC, &_AES_128_CBC);
         h.insert(&AES_192_CBC, &_AES_192_CBC);
         h.insert(&AES_256_CBC, &_AES_256_CBC);

@@ -47,10 +47,16 @@ pub fn check_known_hosts_path<P: AsRef<Path>>(
     Ok(check)
 }
 
+#[cfg(not(target_os = "toyos"))]
 fn known_hosts_path() -> Result<PathBuf, Error> {
     home::home_dir()
         .map(|home_dir| home_dir.join(".ssh").join("known_hosts"))
         .ok_or(Error::NoHomeDir)
+}
+
+#[cfg(target_os = "toyos")]
+fn known_hosts_path() -> Result<PathBuf, Error> {
+    Err(Error::NoHomeDir)
 }
 
 /// Get the server key that matches the one recorded in the user's known_hosts file.
