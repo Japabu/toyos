@@ -1,37 +1,48 @@
 [submodule "rust"]
 	path = rust
 	url = https://github.com/Japabu/rust.git
-	branch = main
+	shallow = true
 [submodule "userland/getrandom"]
 	path = userland/getrandom
 	url = https://github.com/Japabu/getrandom.git
+	shallow = true
 [submodule "userland/libloading"]
 	path = userland/libloading
 	url = https://github.com/Japabu/rust_libloading.git
+	shallow = true
 [submodule "userland/memmap2"]
 	path = userland/memmap2
 	url = https://github.com/Japabu/memmap2-rs
+	shallow = true
 [submodule "userland/stacker"]
 	path = userland/stacker
 	url = https://github.com/Japabu/stacker.git
+	shallow = true
 [submodule "userland/ctrlc"]
 	path = userland/ctrlc
 	url = https://github.com/Japabu/rust-ctrlc.git
+	shallow = true
 [submodule "userland/target-lexicon"]
 	path = userland/target-lexicon
 	url = https://github.com/Japabu/target-lexicon.git
+	shallow = true
 [submodule "userland/filetime"]
 	path = userland/filetime
 	url = https://github.com/Japabu/filetime
+	shallow = true
 [submodule "userland/tar"]
 	path = userland/tar
 	url = https://github.com/Japabu/tar-rs
+	shallow = true
 [submodule "userland/mio"]
 	path = userland/mio
 	url = https://github.com/Japabu/mio.git
+	shallow = true
 [submodule "userland/tokio"]
 	path = userland/tokio
 	url = https://github.com/Japabu/tokio.git
+	shallow = true
 [submodule "userland/russh"]
 	path = userland/russh
 	url = https://github.com/Japabu/russh
+	shallow = true
