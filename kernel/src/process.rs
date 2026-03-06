@@ -659,156 +659,109 @@ pub fn spawn_optional(argv: &[&str]) -> Option<u32> {
     spawn(&full_argv, fds, None)
 }
 
-/// Exit the entire process group (like Linux's exit_group).
-/// If called from a thread, kills the parent process (and all sibling threads).
-/// If called from a process, same as exit().
-pub fn exit_group(code: i32) -> ! {
-    let mut guard = PROCESS_TABLE.lock();
-    let table = guard.as_mut().expect("process table not initialized");
-    let pid = percpu::current_pid();
-
-    let kind = table.procs.get(pid).unwrap().kind;
-    if let Kind::Thread { parent } = kind {
-        // We're a thread — kill the parent process (which cascades to all threads).
-        // Zombie ourselves first.
-        let proc = table.procs.get_mut(pid).unwrap();
-        proc.tls_alloc.take();
-        proc.state = ProcessState::Zombie(code);
-        unsafe { crate::arch::cpu::write_cr3(crate::arch::paging::kernel_cr3()); }
-
-        // Kill all sibling threads
-        let sibling_tids: alloc::vec::Vec<u32> = table.procs.iter()
-            .filter(|(tid, p)| *tid != pid && matches!(p.kind, Kind::Thread { parent: pp } if pp == parent))
-            .map(|(tid, _)| tid)
-            .collect();
-        for tid in &sibling_tids {
-            let sibling = table.procs.get_mut(*tid).unwrap();
-            sibling.tls_alloc.take();
-            sibling.state = ProcessState::Zombie(-1);
-        }
-
-        // Kill the parent process and free its resources
-        let parent_proc = table.procs.get_mut(parent).unwrap();
-        fd::close_all(&mut parent_proc.fds, &mut *vfs::lock(), parent);
-        parent_proc.tls_alloc.take();
-        let pml4 = parent_proc.cr3 as *mut u64;
-        shared_memory::cleanup_process(parent, pml4);
-        parent_proc.elf_alloc.take();
-        parent_proc.stack_alloc.take();
-        parent_proc.loaded_libs.clear();
-        parent_proc.mmap_regions.clear();
-        crate::arch::paging::free_user_page_tables(pml4);
-        parent_proc.cr3 = 0;
-        parent_proc.state = ProcessState::Zombie(code);
-        let name = core::str::from_utf8(&parent_proc.name).unwrap_or("?").trim_end_matches('\0');
-        log!("exit_group: {name} pid={parent} code={code}");
-
-        // Wake grandparent if blocked on waitpid for parent
-        if let Kind::Process { parent: grandparent } = table.procs.get(parent).unwrap().kind {
-            if let Some(gp) = grandparent.and_then(|gp| table.procs.get_mut(gp)) {
-                if let ProcessState::BlockedWaitPid(child) = gp.state {
-                    if child == parent {
-                        gp.state = ProcessState::Ready;
-                    }
-                }
-            }
-        }
-
-        if let Some(names) = NAME_REGISTRY.lock().as_mut() {
-            names.retain(|_, &mut v| v != parent);
-        }
-
-        scheduler::schedule_no_return_locked(guard);
-    }
-    drop(guard);
-    // If we're already a process (not a thread), just do a normal exit
-    exit(code);
-}
-
-/// Exit the current process.
-pub fn exit(code: i32) -> ! {
-    // No scoped block — we hold the lock through schedule_no_return_locked()
-    // to prevent another CPU from collecting the zombie (and freeing our
-    // kernel stack) before we've switched to the idle stack.
-    let mut guard = PROCESS_TABLE.lock();
-    let table = guard.as_mut().expect("process table not initialized");
-    let pid = percpu::current_pid();
-
-    // Extract what we need, then drop the proc borrow so we can iterate
-    // the table to kill child threads.
-    let kind = {
-        let proc = table.procs.get_mut(pid).unwrap();
-        let kind = proc.kind;
-        // Close all FDs (acquires VFS lock — correct order: process_table < vfs)
-        fd::close_all(&mut proc.fds, &mut *vfs::lock(), proc.pid);
-        // Free TLS (RAII: .take() drops the OwnedAlloc)
-        proc.tls_alloc.take();
-        kind
-    };
-
-    match kind {
-        Kind::Thread { .. } => {
-            // Thread: don't free address space (shared with parent).
-            unsafe { cpu::write_cr3(paging::kernel_cr3()); }
-        }
-        Kind::Process { .. } => {
-            // Kill all child threads before freeing resources they depend on
-            let child_tids: alloc::vec::Vec<u32> = table.procs.iter()
-                .filter(|(tid, p)| *tid != pid && matches!(p.kind, Kind::Thread { parent } if parent == pid))
-                .map(|(tid, _)| tid)
-                .collect();
-            for tid in &child_tids {
-                let child = table.procs.get_mut(*tid).unwrap();
-                child.tls_alloc.take();
-                child.state = ProcessState::Zombie(-1);
-                let name = core::str::from_utf8(&child.name).unwrap_or("?").trim_end_matches('\0');
-                log!("exit: killing child thread {name} pid={tid}");
-            }
-
-            let proc = table.procs.get_mut(pid).unwrap();
-            let pml4 = proc.cr3 as *mut u64;
-            unsafe { cpu::write_cr3(paging::kernel_cr3()); }
-            shared_memory::cleanup_process(pid, pml4);
-            // RAII: .take() drops OwnedAlloc, freeing the memory
-            proc.elf_alloc.take();
-            proc.stack_alloc.take();
-            proc.loaded_libs.clear();
-            proc.mmap_regions.clear();
-            paging::free_user_page_tables(pml4);
-            proc.cr3 = 0;
-        }
+/// Tear down a process: zombie all its threads, free all resources, wake parent.
+/// Caller must hold PROCESS_TABLE lock and have already switched to kernel CR3.
+fn teardown_process(table: &mut ProcessTable, pid: u32, code: i32) {
+    // Kill all child threads before freeing resources they depend on
+    let child_tids: alloc::vec::Vec<u32> = table.procs.iter()
+        .filter(|(tid, p)| *tid != pid && matches!(p.kind, Kind::Thread { parent } if parent == pid))
+        .map(|(tid, _)| tid)
+        .collect();
+    for tid in &child_tids {
+        let child = table.procs.get_mut(*tid).unwrap();
+        child.tls_alloc.take();
+        child.state = ProcessState::Zombie(-1);
     }
 
     let proc = table.procs.get_mut(pid).unwrap();
+    fd::close_all(&mut proc.fds, &mut *vfs::lock(), pid);
+    proc.tls_alloc.take();
+    let pml4 = proc.cr3 as *mut u64;
+    shared_memory::cleanup_process(pid, pml4);
+    proc.elf_alloc.take();
+    proc.stack_alloc.take();
+    proc.loaded_libs.clear();
+    proc.mmap_regions.clear();
+    paging::free_user_page_tables(pml4);
+    proc.cr3 = 0;
     proc.state = ProcessState::Zombie(code);
     let name = core::str::from_utf8(&proc.name).unwrap_or("?").trim_end_matches('\0');
     log!("exit: {name} pid={pid} code={code}");
 
-    if let Kind::Process { .. } = kind {
-        if let Some(names) = NAME_REGISTRY.lock().as_mut() {
-            names.retain(|_, &mut v| v != pid);
-        }
+    if let Some(names) = NAME_REGISTRY.lock().as_mut() {
+        names.retain(|_, &mut v| v != pid);
     }
 
-    // Wake parent waiting on us
-    let wake_pid = match kind {
-        Kind::Process { parent } => parent,
-        Kind::Thread { parent } => Some(parent),
-    };
-    if let Some(ppid) = wake_pid {
+    // Wake parent if blocked on waitpid
+    if let Kind::Process { parent: Some(ppid) } = table.procs.get(pid).unwrap().kind {
         if let Some(p) = table.procs.get_mut(ppid) {
-            match p.state {
-                ProcessState::BlockedWaitPid(child) | ProcessState::BlockedThreadJoin(child) if child == pid => {
+            if let ProcessState::BlockedWaitPid(child) = p.state {
+                if child == pid {
                     p.state = ProcessState::Ready;
                 }
-                _ => {}
             }
         }
     }
+}
 
-    // Pass the lock guard to schedule_no_return_locked, which holds it
-    // through the stack switch so no other CPU can collect our zombie
-    // (and free our kernel stack) while we're still on it.
+/// Exit the entire process (all threads). If called from a thread, kills the
+/// parent process and all siblings. If called from a process, same as exit().
+pub fn exit_group(code: i32) -> ! {
+    let mut guard = PROCESS_TABLE.lock();
+    let table = guard.as_mut().expect("process table not initialized");
+    let pid = percpu::current_pid();
+    let kind = table.procs.get(pid).unwrap().kind;
+
+    unsafe { cpu::write_cr3(paging::kernel_cr3()); }
+
+    let process_pid = match kind {
+        Kind::Thread { parent } => {
+            // Zombie ourselves, then kill the parent process (cascades to siblings)
+            let proc = table.procs.get_mut(pid).unwrap();
+            proc.tls_alloc.take();
+            proc.state = ProcessState::Zombie(code);
+            parent
+        }
+        Kind::Process { .. } => pid,
+    };
+
+    teardown_process(table, process_pid, code);
+    scheduler::schedule_no_return_locked(guard);
+}
+
+/// Exit the current process or thread.
+pub fn exit(code: i32) -> ! {
+    let mut guard = PROCESS_TABLE.lock();
+    let table = guard.as_mut().expect("process table not initialized");
+    let pid = percpu::current_pid();
+    let kind = table.procs.get(pid).unwrap().kind;
+
+    unsafe { cpu::write_cr3(paging::kernel_cr3()); }
+
+    match kind {
+        Kind::Thread { parent } => {
+            // Thread exit: zombie ourselves, wake parent for thread_join.
+            // Don't free address space (shared with parent).
+            let proc = table.procs.get_mut(pid).unwrap();
+            fd::close_all(&mut proc.fds, &mut *vfs::lock(), pid);
+            proc.tls_alloc.take();
+            proc.state = ProcessState::Zombie(code);
+            let name = core::str::from_utf8(&proc.name).unwrap_or("?").trim_end_matches('\0');
+            log!("exit: {name} pid={pid} code={code}");
+
+            if let Some(p) = table.procs.get_mut(parent) {
+                if let ProcessState::BlockedThreadJoin(child) = p.state {
+                    if child == pid {
+                        p.state = ProcessState::Ready;
+                    }
+                }
+            }
+        }
+        Kind::Process { .. } => {
+            teardown_process(table, pid, code);
+        }
+    }
+
     scheduler::schedule_no_return_locked(guard);
 }
 
