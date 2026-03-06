@@ -1,6 +1,5 @@
 use std::fmt;
 use std::io::{self, Read, Write};
-use std::mem::size_of;
 use std::net::{Shutdown, SocketAddr};
 
 use crate::{event, Interest, Registry, Token};
@@ -260,25 +259,19 @@ pub(crate) fn find_netd() -> io::Result<u64> {
 }
 
 pub(crate) fn send_netd_msg<T: Copy>(netd_pid: u64, msg_type: u32, payload: &T) -> io::Result<()> {
-    let mut buf = [0u8; 256];
-    let payload_bytes =
-        unsafe { core::slice::from_raw_parts(payload as *const T as *const u8, size_of::<T>()) };
-    buf[0..4].copy_from_slice(&msg_type.to_ne_bytes());
-    buf[4..4 + payload_bytes.len()].copy_from_slice(payload_bytes);
-    syscall::send_msg(netd_pid, buf.as_ptr() as u64);
+    let msg = toyos_abi::message::Message::new(msg_type, payload);
+    toyos_abi::message::send(netd_pid, msg);
     Ok(())
 }
 
 pub(crate) fn recv_netd_response<T: Copy>() -> io::Result<T> {
     use toyos_abi::net::*;
 
-    let mut buf = [0u8; 256];
-    syscall::recv_msg(buf.as_mut_ptr() as u64);
-    let msg_type = u32::from_ne_bytes(buf[0..4].try_into().unwrap());
+    let msg = toyos_abi::message::recv();
 
-    if msg_type == MSG_ERROR {
-        let error_code = u32::from_ne_bytes(buf[4..8].try_into().unwrap());
-        let kind = match error_code {
+    if msg.msg_type == MSG_ERROR {
+        let error_code: ErrorResponse = msg.take_payload();
+        let kind = match error_code.code {
             ERR_CONNECTION_REFUSED => io::ErrorKind::ConnectionRefused,
             ERR_CONNECTION_RESET => io::ErrorKind::ConnectionReset,
             ERR_TIMED_OUT => io::ErrorKind::TimedOut,
@@ -290,13 +283,10 @@ pub(crate) fn recv_netd_response<T: Copy>() -> io::Result<T> {
         return Err(io::Error::new(kind, "netd error"));
     }
 
-    if msg_type != MSG_RESULT {
+    if msg.msg_type != MSG_RESULT {
+        msg.free_payload();
         return Err(io::Error::new(io::ErrorKind::Other, "unexpected netd response"));
     }
 
-    if size_of::<T>() == 0 {
-        return Ok(unsafe { core::mem::zeroed() });
-    }
-
-    Ok(unsafe { core::ptr::read_unaligned(buf[4..].as_ptr() as *const T) })
+    Ok(msg.take_payload())
 }
