@@ -259,8 +259,7 @@ pub(crate) fn find_netd() -> io::Result<u64> {
 }
 
 pub(crate) fn send_netd_msg<T: Copy>(netd_pid: u64, msg_type: u32, payload: &T) -> io::Result<()> {
-    let msg = toyos_abi::message::Message::new(msg_type, payload);
-    toyos_abi::message::send(netd_pid, msg);
+    toyos_abi::message::send(netd_pid, msg_type, payload);
     Ok(())
 }
 
@@ -270,8 +269,8 @@ pub(crate) fn recv_netd_response<T: Copy>() -> io::Result<T> {
     let msg = toyos_abi::message::recv();
 
     if msg.msg_type == MSG_ERROR {
-        let error_code: ErrorResponse = msg.take_payload();
-        let kind = match error_code.code {
+        let error: ErrorResponse = msg.payload();
+        let kind = match error.code {
             ERR_CONNECTION_REFUSED => io::ErrorKind::ConnectionRefused,
             ERR_CONNECTION_RESET => io::ErrorKind::ConnectionReset,
             ERR_TIMED_OUT => io::ErrorKind::TimedOut,
@@ -284,9 +283,8 @@ pub(crate) fn recv_netd_response<T: Copy>() -> io::Result<T> {
     }
 
     if msg.msg_type != MSG_RESULT {
-        msg.free_payload();
         return Err(io::Error::new(io::ErrorKind::Other, "unexpected netd response"));
     }
 
-    Ok(msg.take_payload())
+    Ok(msg.payload())
 }
