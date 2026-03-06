@@ -11,7 +11,7 @@ use crate::id_map::IdMap;
 use crate::message::MessageQueue;
 use crate::sync::Lock;
 use crate::symbols::ProcessSymbols;
-use crate::{elf, log, pipe, scheduler, shared_memory, vfs};
+use crate::{elf, log, scheduler, shared_memory, vfs};
 
 // ---------------------------------------------------------------------------
 // OwnedAlloc — RAII wrapper for page-aligned allocations
@@ -200,6 +200,34 @@ pub fn with_current_mut<R>(f: impl FnOnce(&mut Process) -> R) -> R {
     f(table.procs.get_mut(pid).unwrap())
 }
 
+/// Access the fd table owner for the current thread/process.
+/// Threads share their parent process's fd table.
+pub fn with_fd_owner<R>(f: impl FnOnce(&Process) -> R) -> R {
+    let guard = PROCESS_TABLE.lock();
+    let table = guard.as_ref().expect("process table not initialized");
+    let pid = percpu::current_pid();
+    let proc = table.procs.get(pid).unwrap();
+    let fd_pid = match proc.kind {
+        Kind::Thread { parent } => parent,
+        Kind::Process { .. } => pid,
+    };
+    f(table.procs.get(fd_pid).unwrap())
+}
+
+/// Access the fd table owner mutably for the current thread/process.
+/// Threads share their parent process's fd table.
+pub fn with_fd_owner_mut<R>(f: impl FnOnce(&mut Process) -> R) -> R {
+    let mut guard = PROCESS_TABLE.lock();
+    let table = guard.as_mut().expect("process table not initialized");
+    let pid = percpu::current_pid();
+    let proc = table.procs.get(pid).unwrap();
+    let fd_pid = match proc.kind {
+        Kind::Thread { parent } => parent,
+        Kind::Process { .. } => pid,
+    };
+    f(table.procs.get_mut(fd_pid).unwrap())
+}
+
 /// Allocate a TLS area using the x86-64 variant II layout:
 /// [TLS data (.tdata + .tbss)] [TCB: self-pointer]
 ///                              ^-- FS base (thread pointer)
@@ -357,22 +385,8 @@ pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64) -> Option<u32> {
     let parent_cr3 = parent.cr3;
     let parent_heap_owner = parent.heap_owner;
     let parent_cwd = parent.cwd.clone();
-    // Inherit stderr so panics are visible
-    let mut child_fds = FdTable::new();
-    let stderr_desc = match parent.fds.get(2) {
-        Some(Descriptor::PipeWrite(id)) => {
-            pipe::add_writer(*id);
-            Descriptor::PipeWrite(*id)
-        }
-        Some(Descriptor::TtyWrite(id)) => {
-            pipe::add_writer(*id);
-            Descriptor::TtyWrite(*id)
-        }
-        Some(Descriptor::File(file)) => Descriptor::File(file.clone()),
-        _ => Descriptor::SerialConsole,
-    };
-    child_fds.insert_at(2, stderr_desc);
-
+    // Threads share the parent's fd table via with_fd_owner routing.
+    // No per-thread fd table needed — all fd ops resolve through parent.
     let tid = table.procs.insert(Process {
         pid: 0,
         state: ProcessState::Ready,
@@ -380,7 +394,7 @@ pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64) -> Option<u32> {
         cr3: parent_cr3,
         kernel_stack: ks_alloc,
         kernel_rsp: ks_rsp,
-        fds: child_fds,
+        fds: FdTable::new(),
         user_heap: crate::user_heap::UserHeap::new(), // unused — routes through heap_owner
         messages: MessageQueue::new(),
         cwd: parent_cwd,
@@ -417,10 +431,17 @@ fn make_name(path: &str) -> [u8; 28] {
 pub fn build_child_fds(pairs: &[[u32; 2]]) -> FdTable {
     let guard = PROCESS_TABLE.lock();
     let table = guard.as_ref().expect("process table not initialized");
-    let parent = table.procs.get(percpu::current_pid()).unwrap();
+    let pid = percpu::current_pid();
+    let proc = table.procs.get(pid).unwrap();
+    // Threads share parent's fd table, so resolve through fd owner
+    let fd_pid = match proc.kind {
+        Kind::Thread { parent } => parent,
+        Kind::Process { .. } => pid,
+    };
+    let fd_owner = table.procs.get(fd_pid).unwrap();
     let mut fds = FdTable::new();
     for &[child_fd, parent_fd] in pairs {
-        if let Some(desc) = parent.fds.get(parent_fd as u64) {
+        if let Some(desc) = fd_owner.fds.get(parent_fd as u64) {
             fds.insert_at(child_fd as u64, fd::dup(desc));
         }
     }

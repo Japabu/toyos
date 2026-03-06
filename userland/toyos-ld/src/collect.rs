@@ -1290,6 +1290,9 @@ pub(crate) fn merge_string_sections(state: &mut LinkState) {
 
     // Update relocation addends: when a relocation targets a symbol in a merged
     // section, the addend may encode an offset into that section that needs remapping.
+    // PC-relative relocations (PC32, PLT32) include a -4 adjustment in the addend
+    // (for the 4-byte displacement size), so we must compensate when computing the
+    // logical offset into the section.
     for reloc in &mut state.relocs {
         let old_sv = match &reloc.target {
             SymbolRef::Global(name) => old_global_defs.get(name),
@@ -1297,15 +1300,19 @@ pub(crate) fn merge_string_sections(state: &mut LinkState) {
                 .or_else(|| old_local_defs.get(&(*oi, name.clone()))),
         };
         let Some(&(old_sec, old_val)) = old_sv else { continue; };
-        let old_offset = old_val.wrapping_add(reloc.addend as u64);
-        if let Some(&new_offset) = offset_remap.get(&(old_sec, old_offset)) {
+        let pc_adjust: i64 = match reloc.r_type {
+            RelocType::X86Pc32 | RelocType::X86Plt32 => 4,
+            _ => 0,
+        };
+        let logical_offset = (old_val as i64 + reloc.addend + pc_adjust) as u64;
+        if let Some(&new_offset) = offset_remap.get(&(old_sec, logical_offset)) {
             let new_def = match &reloc.target {
                 SymbolRef::Global(name) => state.globals.get(name),
                 SymbolRef::Local(oi, name) => state.globals.get(name)
                     .or_else(|| state.locals.get(&(*oi, name.clone()))),
             };
             if let Some(SymbolDef::Defined { value: new_val, .. }) = new_def {
-                reloc.addend = new_offset as i64 - *new_val as i64;
+                reloc.addend = new_offset as i64 - *new_val as i64 - pc_adjust;
             }
         }
     }

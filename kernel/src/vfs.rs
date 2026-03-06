@@ -71,8 +71,6 @@ pub struct Vfs {
     created_dirs: HashSet<String>,
 }
 
-/// Normalize a path by resolving `.` and `..` components.
-/// Always returns an absolute path starting with `/`.
 fn normalize(path: &str) -> String {
     let mut parts: Vec<&str> = Vec::new();
     for part in path.split('/') {
