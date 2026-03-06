@@ -140,9 +140,9 @@ pub struct Process {
     tls_memsz: usize,
     pub tls_alloc: Option<OwnedAlloc>,
     /// Multi-module TLS: (template_addr, filesz, memsz, base_offset) per module.
-    tls_modules: Vec<(u64, usize, usize, usize)>,
+    pub tls_modules: Vec<(u64, usize, usize, usize)>,
     /// Total combined TLS size across all modules.
-    tls_total_memsz: usize,
+    pub tls_total_memsz: usize,
     // Crash diagnostics
     pub symbols: ProcessSymbols,
     // Process name (filename from argv[0], null-terminated)
@@ -203,7 +203,7 @@ pub fn setup_tls(tls_template: u64, tls_filesz: usize, tls_memsz: usize) -> Opti
 /// Each module's template is copied at its base_offset within the block.
 /// Layout: [module0 TLS][module1 TLS]...[moduleN TLS][TCB: self-pointer]
 ///                                                    ^-- FS base (thread pointer)
-fn setup_combined_tls(
+pub fn setup_combined_tls(
     modules: &[(u64, usize, usize, usize)], // (template, filesz, memsz, base_offset)
     total_memsz: usize,
 ) -> Option<(OwnedAlloc, u64)> {

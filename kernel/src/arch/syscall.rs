@@ -778,9 +778,13 @@ fn sys_dlopen(path: &str) -> u64 {
     // Map loaded library memory into the current process's address space
     paging::map_user(lib.alloc.ptr() as u64, lib.alloc.size() as u64);
 
-    // Resolve GLOB_DAT/JUMP_SLOT in the new lib against already-loaded libs.
+    // Resolve GLOB_DAT/JUMP_SLOT and TLS relocations, then store the lib.
     // Threads have empty loaded_libs — use the parent process's libs instead.
-    {
+    let lib_has_tls = lib.tls_memsz > 0;
+    let lib_tls_memsz = lib.tls_memsz;
+
+    // Phase 1: resolve relocations (needs process table lock)
+    let (new_total, modules) = {
         let mut guard = crate::process::PROCESS_TABLE.lock();
         let table = guard.as_mut().expect("process table");
         let current_pid = crate::process::current_pid();
@@ -789,13 +793,77 @@ fn sys_dlopen(path: &str) -> u64 {
             crate::process::Kind::Thread { parent } => parent,
             _ => current_pid,
         };
-        let owner = table.procs.get(owner_pid).expect("owner process");
+        let owner = table.procs.get_mut(owner_pid).expect("owner process");
         log!("dlopen: pid={} owner={} resolving against {} existing libs",
             current_pid, owner_pid, owner.loaded_libs.len());
         crate::elf::resolve_dlopen_relocs(&lib, &owner.loaded_libs);
+
+        // If the new lib has its own TLS, insert at offset 0 and shift existing
+        // modules up. This preserves all existing TPOFF values since:
+        // TPOFF = (old_base + shift) + sym_offset - (old_total + shift) = old TPOFF
+        let lib_base_offset = if lib_has_tls {
+            let new_memsz = lib.tls_memsz;
+            // Shift all existing modules up by new_memsz
+            for module in owner.tls_modules.iter_mut() {
+                module.3 += new_memsz;
+            }
+            // Insert new module at offset 0
+            owner.tls_modules.insert(0, (lib.tls_template, lib.tls_filesz, lib.tls_memsz, 0));
+            owner.tls_total_memsz += new_memsz;
+            log!("dlopen: new TLS module at offset 0, memsz={}, total_memsz={}",
+                new_memsz, owner.tls_total_memsz);
+            0
+        } else {
+            0
+        };
+
+        // Apply TPOFF relocations for cross-library and own TLS references
+        if owner.tls_total_memsz > 0 {
+            let tls_info = crate::elf::TlsModuleInfo {
+                libs: &owner.loaded_libs,
+                modules: &owner.tls_modules,
+            };
+            crate::elf::apply_tpoff_relocs(&lib, lib_base_offset, owner.tls_total_memsz, &tls_info);
+        }
+
+        (owner.tls_total_memsz, owner.tls_modules.clone())
+    }; // guard dropped here
+
+    // Phase 2: reallocate TLS if the new lib added a TLS module (no lock held)
+    // New module is at offset 0, existing modules shifted up by lib_tls_memsz.
+    // Copy existing TLS data to the shifted position in the new block.
+    if lib_has_tls {
+        if let Some((new_alloc, new_tp)) = crate::process::setup_combined_tls(&modules, new_total) {
+            crate::arch::paging::map_user(new_alloc.ptr() as u64, new_alloc.size() as u64);
+            // Copy existing TLS data shifted up by lib_tls_memsz
+            let old_tp = crate::arch::read_fs_base();
+            let old_total = new_total - lib_tls_memsz;
+            if old_total > 0 {
+                unsafe {
+                    // Old data: [old_tp - old_total .. old_tp)
+                    // New position: shifted up by lib_tls_memsz within new block
+                    // New block: [new_tp - new_total .. new_tp)
+                    // New module at [new_tp - new_total .. new_tp - new_total + lib_tls_memsz)
+                    // Existing data at [new_tp - new_total + lib_tls_memsz .. new_tp)
+                    core::ptr::copy_nonoverlapping(
+                        (old_tp - old_total as u64) as *const u8,
+                        (new_tp - new_total as u64 + lib_tls_memsz as u64) as *mut u8,
+                        old_total,
+                    );
+                }
+            }
+            // Set new FS base
+            crate::arch::set_fs_base(new_tp);
+            // Store new TLS alloc, free old one
+            crate::process::with_current_mut(|p| {
+                p.tls_alloc = Some(new_alloc);
+                p.tls_total_memsz = new_total;
+                p.tls_modules = modules;
+            });
+        }
     }
 
-    // Store in the owner process (for threads, use the parent process)
+    // Phase 3: store the lib in the owner process
     {
         let mut guard = crate::process::PROCESS_TABLE.lock();
         let table = guard.as_mut().expect("process table");
