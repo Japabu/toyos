@@ -53,6 +53,11 @@ macro_rules! extern_item {
     };
 }
 
+// ToyOS: PSM functions provided as naked Rust functions (no C assembler).
+#[cfg(all(target_os = "toyos", target_arch = "x86_64"))]
+#[path = "arch/toyos_x86_64.rs"]
+mod toyos_asm;
+
 // NB: this could be nicer across multiple blocks but we cannot do it because of
 // https://github.com/rust-lang/rust/issues/65847
 extern_item! { {

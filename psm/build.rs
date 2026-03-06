@@ -72,6 +72,14 @@ fn main() {
     let os = var("CARGO_CFG_TARGET_OS").unwrap();
     let endian = var("CARGO_CFG_TARGET_ENDIAN").unwrap();
 
+    // ToyOS: provide PSM functions via naked Rust functions (no C assembler needed).
+    if os == "toyos" && arch == "x86_64" {
+        println!("cargo:rustc-cfg=asm");
+        println!("cargo:rustc-cfg=switchable_stack");
+        // Don't set link_asm — functions are provided in Rust, not a C-compiled archive.
+        return;
+    }
+
     let mut cfg = cc::Build::new();
 
     let msvc = cfg.get_compiler().is_like_msvc();
