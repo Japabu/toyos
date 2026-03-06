@@ -20,23 +20,20 @@ unsafe fn cstr_len(s: *const core::ffi::c_char) -> usize {
 
 fn toyos_dlopen(path: *const core::ffi::c_char) -> *mut core::ffi::c_void {
     let len = unsafe { cstr_len(path) };
-    let handle = toyos_abi::syscall::dl_open(path as *const u8, len);
-    if handle == u64::MAX {
-        core::ptr::null_mut()
-    } else {
-        // Encode handle as a non-null pointer (add 1 so handle 0 is valid)
-        core::ptr::without_provenance_mut((handle + 1) as usize)
+    let bytes = unsafe { core::slice::from_raw_parts(path as *const u8, len) };
+    match toyos_abi::syscall::dl_open(bytes) {
+        Ok(handle) => core::ptr::without_provenance_mut((handle + 1) as usize),
+        Err(_) => core::ptr::null_mut(),
     }
 }
 
 fn toyos_dlsym(handle: *mut core::ffi::c_void, name: *const core::ffi::c_char) -> *mut core::ffi::c_void {
     let h = handle as u64 - 1; // Decode handle (undo the +1 from dlopen)
     let len = unsafe { cstr_len(name) };
-    let addr = toyos_abi::syscall::dl_sym(h, name as *const u8, len);
-    if addr == u64::MAX {
-        core::ptr::null_mut()
-    } else {
-        core::ptr::with_exposed_provenance_mut(addr as usize)
+    let bytes = unsafe { core::slice::from_raw_parts(name as *const u8, len) };
+    match toyos_abi::syscall::dl_sym(h, bytes) {
+        Ok(addr) => core::ptr::with_exposed_provenance_mut(addr as usize),
+        Err(_) => core::ptr::null_mut(),
     }
 }
 
