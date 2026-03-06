@@ -21,6 +21,9 @@ cfg_if! {
     } else if #[cfg(target_os = "macos")] {
         mod macos;
         pub use macos::guess_os_stack_limit;
+    } else if #[cfg(target_os = "toyos")] {
+        mod toyos;
+        pub use toyos::guess_os_stack_limit;
     } else {
         mod fallback;
         pub use fallback::guess_os_stack_limit;
