@@ -5,6 +5,7 @@ use object::read::elf::ElfFile64;
 use object::read::{self, Object, ObjectSection, ObjectSymbol};
 use object::RelocationFlags;
 use crate::LinkError;
+use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
@@ -211,6 +212,52 @@ pub(crate) struct LinkState {
     pub(crate) arch: Arch,
 }
 
+/// Index within a single parsed object's local section list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct LocalSectionIdx(usize);
+
+/// Intermediate result from parsing a single object file. Uses local section
+/// indices that get remapped to global `SectionIdx` during merge.
+enum ParsedInput {
+    /// A regular .o object file with sections, symbols, and relocations.
+    Object(ParsedObject),
+    /// A shared library (.so) providing dynamic symbols.
+    SharedLib {
+        globals: Vec<(String, SymbolDef)>,
+        dynamic_imports: Vec<String>,
+        filename: String,
+    },
+}
+
+struct ParsedObject {
+    arch: Arch,
+    sections: Vec<InputSection>,
+    tls_local_indices: Vec<LocalSectionIdx>,
+    metadata: Vec<(String, Vec<u8>)>,
+    globals: Vec<(String, SymbolDef, LocalSectionIdx)>,
+    /// (sym_name, local_section_idx, value)
+    locals: Vec<(String, LocalSectionIdx, u64)>,
+    relocs: Vec<LocalReloc>,
+}
+
+/// Relocation with local section indices (not yet remapped to global).
+struct LocalReloc {
+    section: LocalSectionIdx,
+    offset: u64,
+    r_type: RelocType,
+    target: LocalSymbolRef,
+    addend: i64,
+    subtrahend: Option<LocalSymbolRef>,
+}
+
+/// Symbol reference using local section indices for section-synthetic symbols.
+enum LocalSymbolRef {
+    Global(String),
+    Local(String),
+    /// Synthetic section symbol referencing a local section index.
+    SectionSym(LocalSectionIdx),
+}
+
 pub(crate) fn collect(objects: &[(String, Vec<u8>)]) -> Result<LinkState, LinkError> {
     // Flatten archives into individual object files before processing.
     let mut flat: Vec<(String, Vec<u8>)> = Vec::new();
@@ -222,6 +269,12 @@ pub(crate) fn collect(objects: &[(String, Vec<u8>)]) -> Result<LinkState, LinkEr
         }
     }
 
+    // Phase 1: parse all objects in parallel
+    let parsed: Vec<ParsedInput> = flat.par_iter()
+        .map(|(name, data)| parse_single_input(name, data))
+        .collect::<Result<_, LinkError>>()?;
+
+    // Phase 2: merge results sequentially (fast — just extends vecs and inserts into hashmaps)
     let mut state = LinkState {
         sections: Vec::new(),
         relocs: Vec::new(),
@@ -234,136 +287,85 @@ pub(crate) fn collect(objects: &[(String, Vec<u8>)]) -> Result<LinkState, LinkEr
         arch: Arch::Aarch64,
     };
 
-    let mut sec_map: HashMap<(ObjIdx, object::SectionIndex), SectionIdx> = HashMap::new();
-
-    for (obj_idx, (name, data)) in flat.iter().enumerate() {
-        let obj_idx = ObjIdx(obj_idx);
-        // ELF shared library input: extract dynamic symbols, skip section processing.
-        // Shared libraries are always ELF, so try ELF-specific parse first.
-        if let Ok(elf) = ElfFile64::parse(data.as_slice()) {
-            if elf.elf_header().e_type.get(object::Endianness::Little) == elf::ET_DYN {
-                collect_so_symbols(&elf, &mut state.globals, &mut state.dynamic_imports);
-                let filename = std::path::Path::new(name)
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string();
+    for (obj_idx, input) in parsed.into_iter().enumerate() {
+        match input {
+            ParsedInput::SharedLib { globals, dynamic_imports, filename } => {
+                for (name, def) in globals {
+                    state.globals.entry(name).or_insert(def);
+                }
+                state.dynamic_imports.extend(dynamic_imports);
                 if !state.dynamic_libs.contains(&filename) {
                     state.dynamic_libs.push(filename);
                 }
-                continue;
+            }
+            ParsedInput::Object(parsed) => {
+                merge_parsed_object(&mut state, parsed, ObjIdx(obj_idx));
             }
         }
-
-        // Generic parse: handles both ELF .o and COFF .o
-        let obj = object::File::parse(data.as_slice())
-            .map_err(|e| LinkError::Parse { file: name.clone(), message: e.to_string() })?;
-
-        collect_object(&mut state, &obj, obj_idx, &mut sec_map)?;
     }
 
     Ok(state)
 }
 
-/// Extract exported dynamic symbols from an ET_DYN ELF (.so) and add them
-/// to `globals` with a sentinel section index. These symbols satisfy undefined
-/// references without contributing any code/data to the output.
-fn collect_so_symbols(elf: &ElfFile64, globals: &mut HashMap<String, SymbolDef>, dynamic_imports: &mut HashSet<String>) {
-    for sym in elf.dynamic_symbols() {
-        let name = match sym.name() {
-            Ok(n) if !n.is_empty() => n,
-            _ => continue,
-        };
-        // Only defined symbols (not UND)
-        if sym.is_undefined() {
-            continue;
+/// Parse a single input file (object or shared library) without shared state.
+fn parse_single_input(name: &str, data: &[u8]) -> Result<ParsedInput, LinkError> {
+    // ELF shared library: extract dynamic symbols only.
+    if let Ok(elf) = ElfFile64::parse(data) {
+        if elf.elf_header().e_type.get(object::Endianness::Little) == elf::ET_DYN {
+            let mut globals = Vec::new();
+            let mut dynamic_imports = Vec::new();
+            for sym in elf.dynamic_symbols() {
+                let sym_name = match sym.name() {
+                    Ok(n) if !n.is_empty() => n,
+                    _ => continue,
+                };
+                if sym.is_undefined() { continue; }
+                let sym_name = sym_name.to_string();
+                let is_func = sym.kind() == read::SymbolKind::Text;
+                let is_tls = sym.kind() == read::SymbolKind::Tls;
+                dynamic_imports.push(sym_name.clone());
+                globals.push((sym_name, SymbolDef::Dynamic { is_func, is_tls }));
+            }
+            let filename = std::path::Path::new(name)
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            return Ok(ParsedInput::SharedLib { globals, dynamic_imports, filename });
         }
-        let name = name.to_string();
-        let is_func = sym.kind() == read::SymbolKind::Text;
-        let is_tls = sym.kind() == read::SymbolKind::Tls;
-        globals.entry(name.clone()).or_insert(SymbolDef::Dynamic { is_func, is_tls });
-        dynamic_imports.insert(name);
     }
+
+    // Generic parse: ELF .o or COFF .o
+    let obj = object::File::parse(data)
+        .map_err(|e| LinkError::Parse { file: name.to_string(), message: e.to_string() })?;
+
+    parse_object(&obj, name).map(ParsedInput::Object)
 }
 
-/// Resolve a relocation's target to a `SymbolRef`. Section symbols and local
-/// symbols produce `SymbolRef::Local` (carrying the object index), while global
-/// and undefined symbols produce `SymbolRef::Global`.
-/// Strip the Mach-O leading `_` prefix from C symbol names so all internal
-/// names use ELF convention. The prefix is re-added at Mach-O emit time.
-fn demangle_macho(name: &str, is_macho: bool) -> String {
-    if is_macho {
-        name.strip_prefix('_').unwrap_or(name).to_string()
+/// Parse a single object file into a `ParsedObject` with local section indices.
+fn parse_object(obj: &object::File, _name: &str) -> Result<ParsedObject, LinkError> {
+    let arch = if matches!(obj.architecture(), object::Architecture::X86_64) {
+        Arch::X86_64
     } else {
-        name.to_string()
-    }
-}
-
-fn resolve_reloc_target(
-    obj: &object::File,
-    reloc: &read::Relocation,
-    obj_idx: ObjIdx,
-    sec_map: &HashMap<(ObjIdx, object::SectionIndex), SectionIdx>,
-    state: &mut LinkState,
-    is_macho: bool,
-) -> Option<SymbolRef> {
-    // Helper: create/reuse a synthetic section symbol with value=0 at the section base.
-    let make_section_sym = |si: object::SectionIndex, state: &mut LinkState| -> Option<SymbolRef> {
-        let &gsec = sec_map.get(&(obj_idx, si))?;
-        let syn = format!("__section_sym_{}_{}", obj_idx.0, gsec.0);
-        state.locals.entry((obj_idx, syn.clone())).or_insert(SymbolDef::Defined {
-            section: gsec,
-            value: 0,
-        });
-        Some(SymbolRef::Local(obj_idx, syn))
+        Arch::Aarch64
     };
 
-    match reloc.target() {
-        read::RelocationTarget::Symbol(sym_idx) => {
-            let sym = obj.symbol_by_index(sym_idx).ok()?;
-            let name = sym.name().unwrap_or("");
-            let name = &demangle_macho(name, is_macho);
+    let mut sections = Vec::new();
+    let mut tls_local_indices = Vec::new();
+    let mut metadata = Vec::new();
+    let mut globals = Vec::new();
+    let mut locals = Vec::new();
+    let mut relocs = Vec::new();
+    // Map from object's section index to local index in our sections vec
+    let mut sec_map: HashMap<object::SectionIndex, LocalSectionIdx> = HashMap::new();
 
-            // Section symbols need unique synthetic names because COFF objects can have
-            // multiple sections with the same name (e.g. many `.rdata` COMDAT sections).
-            let is_section_sym = name.is_empty() || sym.kind() == read::SymbolKind::Section;
-            if is_section_sym {
-                let si = match sym.section() {
-                    read::SymbolSection::Section(si) => si,
-                    _ => return None,
-                };
-                make_section_sym(si, state)
-            } else if sym.is_global() || sym.is_undefined() {
-                Some(SymbolRef::Global(name.to_string()))
-            } else {
-                Some(SymbolRef::Local(obj_idx, name.to_string()))
-            }
-        }
-        // Mach-O r_extern=0: relocation targets a section directly (e.g. __literal8).
-        read::RelocationTarget::Section(si) => make_section_sym(si, state),
-        _ => None,
-    }
-}
-
-/// Collect sections, symbols, and relocations from a single object file.
-/// Works with both ELF and COFF objects via the generic `Object` trait.
-fn collect_object(
-    state: &mut LinkState,
-    obj: &object::File,
-    obj_idx: ObjIdx,
-    sec_map: &mut HashMap<(ObjIdx, object::SectionIndex), SectionIdx>,
-) -> Result<(), LinkError> {
-    if matches!(obj.architecture(), object::Architecture::X86_64) {
-        state.arch = Arch::X86_64;
-    }
     for section in obj.sections() {
         let sec_name = section.name().unwrap_or("");
 
-        // Capture metadata sections (e.g. .rustc) regardless of SectionKind
         if sec_name.starts_with(".rustc") {
             let data = section.data().unwrap_or(&[]).to_vec();
             if !data.is_empty() {
-                state.metadata.push((sec_name.to_string(), data));
+                metadata.push((sec_name.to_string(), data));
             }
             continue;
         }
@@ -380,7 +382,6 @@ fn collect_object(
             read::SectionKind::TlsVariables => SectionKind::TlsVariables,
             read::SectionKind::Elf(elf::SHT_INIT_ARRAY) => SectionKind::InitArray,
             read::SectionKind::Elf(elf::SHT_FINI_ARRAY) => SectionKind::FiniArray,
-            // Non-loadable sections — skip
             read::SectionKind::OtherString
             | read::SectionKind::Other
             | read::SectionKind::Debug
@@ -390,7 +391,6 @@ fn collect_object(
             | read::SectionKind::Metadata => continue,
             read::SectionKind::Elf(_) => continue,
             read::SectionKind::Unknown => continue,
-            // non_exhaustive: panic on new variants so we notice them
             _ => panic!(
                 "unhandled section kind {:?} in section {}",
                 section.kind(),
@@ -399,28 +399,21 @@ fn collect_object(
         };
 
         let sec_data = section.data().unwrap_or(&[]).to_vec();
-        let global_idx = SectionIdx(state.sections.len());
-        sec_map.insert((obj_idx, section.index()), global_idx);
+        let local_idx = LocalSectionIdx(sections.len());
+        sec_map.insert(section.index(), local_idx);
 
-        // Extract ELF merge/strings flags
         let (merge, strings, entsize) = match section.flags() {
             read::SectionFlags::Elf { sh_flags } => {
                 let m = (sh_flags & elf::SHF_MERGE as u64) != 0;
                 let s = (sh_flags & elf::SHF_STRINGS as u64) != 0;
                 (m, s, if m { section.file_range().map(|_| {
-                    // entsize from ELF section header — parse from raw header
-                    // For ReadOnlyString, the object crate detects SHF_STRINGS
-                    // but doesn't directly expose entsize via ObjectSection.
-                    // Common convention: section name .rodata.str1.N → entsize = N
-                    // Fallback to 1 for string sections
                     if s { 1u64 } else { 0 }
                 }).unwrap_or(0) } else { 0 })
             }
-            // Non-ELF flags (COFF, Mach-O) have no merge/strings concept (non_exhaustive enum)
             _ => (false, false, 0),
         };
 
-        state.sections.push(InputSection {
+        sections.push(InputSection {
             name: sec_name.to_string(),
             data: sec_data,
             align: section.align().max(1),
@@ -433,100 +426,74 @@ fn collect_object(
         });
 
         if kind.is_tls() {
-            state.tls_sections.push(global_idx);
+            tls_local_indices.push(local_idx);
         }
     }
 
     let is_macho = matches!(obj.format(), object::BinaryFormat::MachO);
 
+    // Collect symbols
     for symbol in obj.symbols() {
         let sym_name = match symbol.name() {
             Ok(n) if !n.is_empty() => demangle_macho(n, is_macho),
             _ => continue,
         };
-        if symbol.is_undefined() {
-            continue;
-        }
-        // Skip section symbols — relocations resolve these via synthetic
-        // names keyed on section index, so they don't belong in locals.
-        if symbol.kind() == read::SymbolKind::Section {
-            continue;
-        }
+        if symbol.is_undefined() { continue; }
+        if symbol.kind() == read::SymbolKind::Section { continue; }
         let sec_idx = match symbol.section() {
             read::SymbolSection::Section(idx) => idx,
-            // Undefined/Absolute/Common symbols have no section (non_exhaustive enum)
             _ => continue,
         };
-        let global_sec = match sec_map.get(&(obj_idx, sec_idx)) {
+        let local_sec = match sec_map.get(&sec_idx) {
             Some(&g) => g,
             None => continue,
         };
         let sec_addr = obj.section_by_index(sec_idx).map(|s| s.address()).unwrap_or(0);
-        let def = SymbolDef::Defined {
-            section: global_sec,
-            value: symbol.address() - sec_addr,
-        };
+        let value = symbol.address() - sec_addr;
+
         if symbol.is_global() {
-            // COFF weak externals: `.weak.FOO.default` (LLVM) or `.weak.FOO` (object crate)
-            // provides the actual code for `FOO`. Register the alias as a global too.
+            // COFF weak externals
             if let Some(rest) = sym_name.strip_prefix(".weak.") {
-                let alias = rest.strip_suffix(".default").unwrap_or(rest);
-                let alias = alias.to_string();
-                match state.globals.get(&alias) {
-                    Some(SymbolDef::Defined { .. }) => {}
-                    _ => { state.globals.insert(alias, def); }
-                }
+                let alias = rest.strip_suffix(".default").unwrap_or(rest).to_string();
+                globals.push((alias, SymbolDef::Defined {
+                    section: SectionIdx(0), // placeholder, remapped during merge
+                    value,
+                }, local_sec));
             }
-            // Concrete .o definitions always override .so dynamic imports
-            match state.globals.get(&sym_name) {
-                Some(SymbolDef::Defined { .. }) => {}
-                _ => { state.globals.insert(sym_name, def); }
-            }
+            globals.push((sym_name, SymbolDef::Defined {
+                section: SectionIdx(0), // placeholder
+                value,
+            }, local_sec));
         } else {
-            if let Some(SymbolDef::Defined { section: existing_sec, .. }) = state.locals.get(&(obj_idx, sym_name.clone())) {
-                assert_eq!(
-                    *existing_sec, global_sec,
-                    "local symbol {sym_name:?} in obj {} defined in two \
-                     different sections ({} vs {})",
-                    obj_idx.0, existing_sec.0, global_sec.0
-                );
-            }
-            state.locals.insert((obj_idx, sym_name), def);
+            locals.push((sym_name, local_sec, value));
         }
     }
 
+    // Collect relocations
     for section in obj.sections() {
-        let global_sec = match sec_map.get(&(obj_idx, section.index())) {
+        let local_sec = match sec_map.get(&section.index()) {
             Some(&g) => g,
             None => continue,
         };
-        // BSS sections have no data to relocate
-        if state.sections[global_sec].kind.is_nobits() { continue; }
+        if sections[local_sec.0].kind.is_nobits() { continue; }
 
-        // Track pending Mach-O SUBTRACTOR relocation (first half of a
-        // difference pair). The next relocation at the same offset must be
-        // UNSIGNED — together they encode `symbolA - symbolB`.
-        let mut pending_subtractor: Option<(u64, SymbolRef)> = None;
+        let mut pending_subtractor: Option<(u64, LocalSymbolRef)> = None;
 
         for (offset, reloc) in section.relocations() {
-            let sym_name = match resolve_reloc_target(obj, &reloc, obj_idx, sec_map, state, is_macho) {
-                Some(name) => name,
+            let target = match resolve_reloc_target_local(obj, &reloc, &sec_map, &sections, arch, is_macho) {
+                Some(t) => t,
                 None => continue,
             };
 
-            // Mach-O SUBTRACTOR: save the subtrahend and wait for the
-            // paired UNSIGNED relocation at the same offset.
             if let RelocationFlags::MachO { r_type, .. } = reloc.flags() {
-                if is_macho_subtractor(r_type, state.arch) {
+                if is_macho_subtractor(r_type, arch) {
                     assert!(pending_subtractor.is_none(),
                         "consecutive SUBTRACTOR without paired UNSIGNED");
-                    pending_subtractor = Some((offset, sym_name));
+                    pending_subtractor = Some((offset, target));
                     continue;
                 }
             }
 
-            // Consume pending SUBTRACTOR: this relocation must be the
-            // paired UNSIGNED at the same offset.
             let subtrahend = pending_subtractor.take().map(|(sub_offset, sub_sym)| {
                 assert_eq!(sub_offset, offset,
                     "SUBTRACTOR at offset {sub_offset:#x} not paired with \
@@ -537,81 +504,62 @@ fn collect_object(
             let (r_type, is_macho_instruction) = match reloc.flags() {
                 RelocationFlags::Elf { r_type } => match elf_to_reloc_type(r_type) {
                     Some(r) => (r, false),
-                    // R_*_NONE (0) is a no-op padding relocation
                     None if r_type == 0 => continue,
                     None => return Err(LinkError::UnsupportedRawRelocation {
                         raw_type: format!("ELF {r_type}"),
-                        symbol: sym_name.name().to_string(),
+                        symbol: local_sym_name(&target),
                     }),
                 },
                 RelocationFlags::Coff { typ } => match coff_to_reloc_type(typ) {
                     Some(r) => (r, false),
                     None => return Err(LinkError::UnsupportedRawRelocation {
                         raw_type: format!("COFF {typ}"),
-                        symbol: sym_name.name().to_string(),
+                        symbol: local_sym_name(&target),
                     }),
                 },
                 RelocationFlags::MachO { r_type, r_length, .. } => {
-                    let mapped = match state.arch {
+                    let mapped = match arch {
                         Arch::X86_64 => macho_x86_64_to_reloc_type(r_type, r_length),
                         Arch::Aarch64 => {
-                            let data = &state.sections[global_sec].data;
+                            let data = &sections[local_sec.0].data;
                             let off = offset as usize;
                             let insn = u32::from_le_bytes(data[off..off + 4].try_into().unwrap());
                             macho_arm64_to_reloc_type(r_type, r_length, insn)
                         }
                     };
                     match mapped {
-                        // x86_64 Mach-O stores addends as raw data bytes (not
-                        // instruction-encoded like ARM64 ADRP/LDR/BL).
-                        Some(r) => (r, matches!(state.arch, Arch::Aarch64) && macho_arm64_is_instruction_reloc(r_type)),
+                        Some(r) => (r, matches!(arch, Arch::Aarch64) && macho_arm64_is_instruction_reloc(r_type)),
                         None => return Err(LinkError::UnsupportedRawRelocation {
                             raw_type: format!("Mach-O type={r_type} length={r_length}"),
-                            symbol: sym_name.name().to_string(),
+                            symbol: local_sym_name(&target),
                         }),
                     }
                 }
-                // Xcoff/Generic/etc. — reject unknown formats (non_exhaustive enum)
                 flags => return Err(LinkError::UnsupportedRawRelocation {
                     raw_type: format!("{flags:?}"),
-                    symbol: sym_name.name().to_string(),
+                    symbol: local_sym_name(&target),
                 }),
             };
 
-            // COFF and Mach-O data relocations use implicit addends stored in
-            // section data. Mach-O instruction relocations (ADRP, LDR, BL) encode
-            // the immediate in instruction bits — don't read raw bytes as addend.
-            // SUBTRACTOR pairs: the data bytes contain the pre-link difference
-            // which is replaced entirely — don't read them as an addend.
             let addend = if subtrahend.is_some() {
                 0
             } else if is_macho_instruction {
                 0
             } else if reloc.has_implicit_addend() {
-                let data = &state.sections[global_sec].data;
+                let data = &sections[local_sec.0].data;
                 let off = offset as usize;
                 let implicit = match reloc.size() {
                     64 => i64::from_le_bytes(data[off..off + 8].try_into().unwrap()),
                     32 => i32::from_le_bytes(data[off..off + 4].try_into().unwrap()) as i64,
                     16 => i16::from_le_bytes(data[off..off + 2].try_into().unwrap()) as i64,
-                    sz => panic!("unexpected implicit addend size {sz} bits for {:?}", sym_name),
+                    sz => panic!("unexpected implicit addend size {sz} bits for {:?}", local_sym_name(&target)),
                 };
-                // Mach-O section-targeted relocations (r_extern=0): the implicit
-                // addend encodes the full pre-link displacement including absolute
-                // section addresses from the object file. Convert to an offset
-                // within the target section so the linker can recompute the
-                // displacement from output vaddrs.
                 if let read::RelocationTarget::Section(target_si) = reloc.target() {
                     let target_sec_addr = obj.section_by_index(target_si)
                         .map(|s| s.address()).unwrap_or(0) as i64;
                     if reloc.kind() == read::RelocationKind::Relative {
-                        // PC-relative: implicit = target_addr - source_addr - correction
-                        // where source_addr = source_sec.addr + reloc_offset.
-                        // Recover offset_in_target, then combine with the object
-                        // crate's addend (which encodes the -correction term).
                         implicit + section.address() as i64 + offset as i64 - target_sec_addr
                     } else {
-                        // Absolute: implicit = target_sec.addr + offset_in_target
                         implicit - target_sec_addr
                     }
                 } else {
@@ -621,17 +569,171 @@ fn collect_object(
                 reloc.addend()
             };
 
-            state.relocs.push(InputReloc {
-                section: global_sec,
+            relocs.push(LocalReloc {
+                section: local_sec,
                 offset,
                 r_type,
-                target: sym_name,
+                target,
                 addend,
                 subtrahend,
             });
         }
     }
-    Ok(())
+
+    Ok(ParsedObject {
+        arch,
+        sections,
+        tls_local_indices,
+        metadata,
+        globals,
+        locals,
+        relocs,
+    })
+}
+
+/// Resolve a relocation target to a `LocalSymbolRef` (no shared state needed).
+fn resolve_reloc_target_local(
+    obj: &object::File,
+    reloc: &read::Relocation,
+    sec_map: &HashMap<object::SectionIndex, LocalSectionIdx>,
+    _sections: &[InputSection],
+    _arch: Arch,
+    is_macho: bool,
+) -> Option<LocalSymbolRef> {
+    match reloc.target() {
+        read::RelocationTarget::Symbol(sym_idx) => {
+            let sym = obj.symbol_by_index(sym_idx).ok()?;
+            let name = sym.name().unwrap_or("");
+            let name = &demangle_macho(name, is_macho);
+
+            let is_section_sym = name.is_empty() || sym.kind() == read::SymbolKind::Section;
+            if is_section_sym {
+                let si = match sym.section() {
+                    read::SymbolSection::Section(si) => si,
+                    _ => return None,
+                };
+                let &local_idx = sec_map.get(&si)?;
+                Some(LocalSymbolRef::SectionSym(local_idx))
+            } else if sym.is_global() || sym.is_undefined() {
+                Some(LocalSymbolRef::Global(name.to_string()))
+            } else {
+                Some(LocalSymbolRef::Local(name.to_string()))
+            }
+        }
+        read::RelocationTarget::Section(si) => {
+            let &local_idx = sec_map.get(&si)?;
+            Some(LocalSymbolRef::SectionSym(local_idx))
+        }
+        _ => None,
+    }
+}
+
+fn local_sym_name(sym: &LocalSymbolRef) -> String {
+    match sym {
+        LocalSymbolRef::Global(n) | LocalSymbolRef::Local(n) => n.clone(),
+        LocalSymbolRef::SectionSym(idx) => format!("__section_sym_{}", idx.0),
+    }
+}
+
+/// Merge a parsed object into the global LinkState, remapping local section indices.
+fn merge_parsed_object(state: &mut LinkState, parsed: ParsedObject, obj_idx: ObjIdx) {
+    if matches!(parsed.arch, Arch::X86_64) {
+        state.arch = Arch::X86_64;
+    }
+
+    let base = state.sections.len();
+    let remap = |local: LocalSectionIdx| -> SectionIdx { SectionIdx(base + local.0) };
+
+    // Merge sections
+    state.sections.extend(parsed.sections);
+
+    // Merge TLS section indices
+    for local_idx in parsed.tls_local_indices {
+        state.tls_sections.push(remap(local_idx));
+    }
+
+    // Merge metadata
+    state.metadata.extend(parsed.metadata);
+
+    // Merge globals
+    for (name, mut def, local_sec) in parsed.globals {
+        if let SymbolDef::Defined { ref mut section, .. } = def {
+            *section = remap(local_sec);
+        }
+        match state.globals.get(&name) {
+            Some(SymbolDef::Defined { .. }) => {}
+            _ => { state.globals.insert(name, def); }
+        }
+    }
+
+    // Merge locals
+    for (name, local_sec, value) in parsed.locals {
+        let global_sec = remap(local_sec);
+        if let Some(SymbolDef::Defined { section: existing_sec, .. }) = state.locals.get(&(obj_idx, name.clone())) {
+            assert_eq!(
+                *existing_sec, global_sec,
+                "local symbol {name:?} in obj {} defined in two \
+                 different sections ({} vs {})",
+                obj_idx.0, existing_sec.0, global_sec.0
+            );
+        }
+        state.locals.insert((obj_idx, name), SymbolDef::Defined {
+            section: global_sec,
+            value,
+        });
+    }
+
+    // Merge relocations, remapping local indices to global
+    for local_reloc in parsed.relocs {
+        let section = remap(local_reloc.section);
+        let target = remap_sym_ref_and_register(local_reloc.target, obj_idx, &remap, &mut state.locals);
+        let subtrahend = local_reloc.subtrahend.map(|s| remap_sym_ref_and_register(s, obj_idx, &remap, &mut state.locals));
+
+        state.relocs.push(InputReloc {
+            section,
+            offset: local_reloc.offset,
+            r_type: local_reloc.r_type,
+            target,
+            addend: local_reloc.addend,
+            subtrahend,
+        });
+    }
+}
+
+/// Convert a `LocalSymbolRef` to a global `SymbolRef`, registering synthetic
+/// section symbols in `locals` as needed.
+fn remap_sym_ref_and_register(
+    sym: LocalSymbolRef,
+    obj_idx: ObjIdx,
+    remap: &dyn Fn(LocalSectionIdx) -> SectionIdx,
+    locals: &mut HashMap<(ObjIdx, String), SymbolDef>,
+) -> SymbolRef {
+    match sym {
+        LocalSymbolRef::Global(name) => SymbolRef::Global(name),
+        LocalSymbolRef::Local(name) => SymbolRef::Local(obj_idx, name),
+        LocalSymbolRef::SectionSym(local_idx) => {
+            let global_idx = remap(local_idx);
+            let syn = format!("__section_sym_{}_{}", obj_idx.0, global_idx.0);
+            locals.entry((obj_idx, syn.clone())).or_insert(SymbolDef::Defined {
+                section: global_idx,
+                value: 0,
+            });
+            SymbolRef::Local(obj_idx, syn)
+        }
+    }
+}
+
+/// Extract exported dynamic symbols from an ET_DYN ELF (.so) and add them
+/// to `globals` with a sentinel section index. These symbols satisfy undefined
+/// references without contributing any code/data to the output.
+/// Strip the Mach-O leading `_` prefix from C symbol names so all internal
+/// names use ELF convention. The prefix is re-added at Mach-O emit time.
+fn demangle_macho(name: &str, is_macho: bool) -> String {
+    if is_macho {
+        name.strip_prefix('_').unwrap_or(name).to_string()
+    } else {
+        name.to_string()
+    }
 }
 
 fn elf_to_reloc_type(r_type: u32) -> Option<RelocType> {

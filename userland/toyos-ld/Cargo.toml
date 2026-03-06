@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 object = { version = "0.38", default-features = false, features = ["read", "write", "elf", "coff", "pe", "macho", "std"] }
+rayon = "1"
 sha2 = "0.10"
 thiserror = "2"
 zerocopy = { version = "0.8", features = ["derive"] }

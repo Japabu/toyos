@@ -13,6 +13,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::fs;
 
+use rayon::prelude::*;
+
 pub use collect::RelocType;
 use collect::{Arch, collect, synthesize_alloc_shims, gc_sections, merge_string_sections, is_archive, extract_archive, find_lib, scan_symbols, SectionIdx, SectionKind, SymbolDef, SymbolRef};
 use reloc::{ElfRelocParams, apply_relocs, apply_relocs_pe, MachORelocParams, apply_relocs_macho};
@@ -375,8 +377,10 @@ pub fn resolve_libs_with_entry(
     if let Some(entry) = entry {
         undefined.insert(entry.to_string());
     }
-    for (_, data) in &objects {
-        let (defs, refs) = scan_symbols(data);
+    let obj_scans: Vec<_> = objects.par_iter()
+        .map(|(_, data)| scan_symbols(data))
+        .collect();
+    for (defs, refs) in obj_scans {
         defined.extend(defs);
         undefined.extend(refs);
     }
@@ -384,10 +388,12 @@ pub fn resolve_libs_with_entry(
     undefined.retain(|s| !defined.contains(s));
 
     // Build index: for each archive member, what symbols does it define?
+    let member_scans: Vec<_> = archive_members.par_iter()
+        .map(|(_, data)| scan_symbols(data))
+        .collect();
     let mut member_defs: Vec<HashSet<String>> = Vec::with_capacity(archive_members.len());
     let mut member_refs: Vec<HashSet<String>> = Vec::with_capacity(archive_members.len());
-    for (_, data) in &archive_members {
-        let (defs, refs) = scan_symbols(data);
+    for (defs, refs) in member_scans {
         member_defs.push(defs);
         member_refs.push(refs);
     }
