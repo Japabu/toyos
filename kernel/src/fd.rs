@@ -80,7 +80,13 @@ pub fn open(table: &mut FdTable, vfs: &mut Vfs, path: &str, flags: u64) -> u64 {
     }
 
     let (data, mtime) = if truncate && create {
-        (Vec::new(), crate::clock::nanos_since_boot())
+        // Persist the empty/truncated file to disk immediately so it exists
+        // even if this fd is closed without any writes. This also prevents
+        // the parent's unmodified fd from overwriting a child's data when
+        // file descriptors are duplicated for subprocess redirection.
+        let mtime = crate::clock::nanos_since_boot();
+        vfs.write_file(path, &[], mtime);
+        (Vec::new(), mtime)
     } else {
         match vfs.read_file(path) {
             Ok(data) => {
@@ -89,7 +95,9 @@ pub fn open(table: &mut FdTable, vfs: &mut Vfs, path: &str, flags: u64) -> u64 {
             }
             Err(_) => {
                 if create {
-                    (Vec::new(), crate::clock::nanos_since_boot())
+                    let mtime = crate::clock::nanos_since_boot();
+                    vfs.write_file(path, &[], mtime);
+                    (Vec::new(), mtime)
                 } else {
                     return u64::MAX;
                 }
