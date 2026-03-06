@@ -66,6 +66,7 @@ pub const SYS_WRITE_NONBLOCK: u64 = 67;
 pub const SYS_PIPE_OPEN: u64 = 68;
 pub const SYS_PIPE_WITH_CAPACITY: u64 = 69;
 pub const SYS_PIPE_ID: u64 = 70;
+pub const SYS_AUDIO_WRITE: u64 = 71;
 
 pub const WNOHANG: u64 = 1;
 
@@ -775,4 +776,11 @@ pub fn pipe_with_capacity(capacity: usize) -> PipeFds {
 /// Used to share pipe access across processes via `pipe_open`.
 pub fn pipe_id(fd: Fd) -> Result<u64, SyscallError> {
     check(syscall(SYS_PIPE_ID, fd.0, 0, 0, 0))
+}
+
+// --- Audio ---
+
+/// Write PCM audio samples (s16le stereo 44100Hz) to the sound device.
+pub fn audio_write(samples: &[u8]) {
+    syscall(SYS_AUDIO_WRITE, samples.as_ptr() as u64, samples.len() as u64, 0, 0);
 }

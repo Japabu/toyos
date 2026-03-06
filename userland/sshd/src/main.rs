@@ -81,20 +81,30 @@ impl russh::server::Handler for SshSession {
     }
 }
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() {
-    let config = russh::server::Config {
-        auth_rejection_time: std::time::Duration::from_secs(1),
-        keys: vec![
-            russh::keys::PrivateKey::random(&mut OsRng, russh::keys::Algorithm::Ed25519).unwrap(),
-        ],
-        ..Default::default()
-    };
-    let config = Arc::new(config);
+fn main() {
+    println!("sshd: building tokio runtime...");
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build tokio runtime");
+    println!("sshd: runtime built, calling block_on...");
+    rt.block_on(async {
+        println!("sshd: inside async block, configuring...");
+        let config = russh::server::Config {
+            auth_rejection_time: std::time::Duration::from_secs(1),
+            keys: vec![
+                russh::keys::PrivateKey::random(&mut OsRng, russh::keys::Algorithm::Ed25519)
+                    .unwrap(),
+            ],
+            ..Default::default()
+        };
+        let config = Arc::new(config);
 
-    let mut server = SshServer;
-    server
-        .run_on_address(config, ("0.0.0.0", 22))
-        .await
-        .unwrap();
+        println!("sshd: starting server on 0.0.0.0:22...");
+        let mut server = SshServer;
+        server
+            .run_on_address(config, ("0.0.0.0", 22))
+            .await
+            .unwrap();
+    });
 }

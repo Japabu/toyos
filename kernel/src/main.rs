@@ -6,7 +6,7 @@ extern crate alloc;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use kernel::arch::{apic, idt, paging, percpu, smp, syscall};
-use kernel::drivers::{acpi, gop, nvme, pci, serial, virtio_gpu, virtio_net, xhci};
+use kernel::drivers::{acpi, gop, nvme, pci, serial, virtio_gpu, virtio_net, virtio_sound, xhci};
 use kernel::{allocator, clock, fd, gpu, log, pipe, process, ramdisk, shared_memory, symbols, vfs, KernelArgs, MemoryMapEntry};
 use tyfs::Disk;
 
@@ -151,6 +151,11 @@ fn kernel_main(
     // Initialize VirtIO networking
     virtio_net::init(ecam_base);
 
+    // Initialize VirtIO sound
+    if let Some(sound) = virtio_sound::init(ecam_base) {
+        kernel::audio::register(sound);
+    }
+
     // Initialize GPU: try VirtIO first, fall back to UEFI GOP
     if let Some((gpu_driver, gpu_info)) = virtio_gpu::init(ecam_base) {
         log!("GPU: using VirtIO");
@@ -210,6 +215,9 @@ fn kernel_main(
     // Optional services — skip if binary not present in initrd
     if let Some(pid) = process::spawn_optional(&["/initrd/netd"]) {
         log!("spawned netd pid={pid}");
+    }
+    if let Some(pid) = process::spawn_optional(&["/initrd/sshd"]) {
+        log!("spawned sshd pid={pid}");
     }
 
     // Signal APs and enter the scheduler idle loop (never returns)

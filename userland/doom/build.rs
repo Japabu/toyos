@@ -33,7 +33,9 @@ fn main() {
     build
         .compiler(&toyos_cc)
         .include("../libc/include")
+        .include("include")
         .include("doomgeneric")
+        .define("FEATURE_SOUND", None)
         .warnings(false)
         .opt_level(2)
         .flag(&format!("--target={target}"));

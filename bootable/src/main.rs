@@ -228,6 +228,10 @@ fn main() {
         .arg("-netdev").arg("user,id=net0,hostfwd=tcp::2222-:22")
         .arg("-device").arg("virtio-net-pci-non-transitional,netdev=net0")
 
+        // VirtIO sound
+        .arg("-audiodev").arg("coreaudio,id=audio0")
+        .arg("-device").arg("virtio-sound-pci,audiodev=audio0")
+
         .arg("-serial").arg("stdio")
 
         .arg("-no-reboot")

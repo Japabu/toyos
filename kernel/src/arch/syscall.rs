@@ -280,6 +280,11 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         SYS_PIPE_OPEN => sys_pipe_open(a1, a2),
         SYS_PIPE_WITH_CAPACITY => sys_pipe_with_capacity(a1 as usize),
         SYS_PIPE_ID => sys_pipe_id(a1),
+        SYS_AUDIO_WRITE => {
+            let Some(buf) = ctx.user_slice(a1, a2) else { return bad_addr };
+            crate::audio::write_samples(buf);
+            0
+        }
         _ => SyscallError::InvalidArgument.to_u64(),
     }
 }
