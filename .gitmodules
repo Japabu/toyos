@@ -1,7 +1,6 @@
 [submodule "rust"]
 	path = rust
 	url = https://github.com/Japabu/rust.git
-	shallow = true
 [submodule "userland/getrandom"]
 	path = userland/getrandom
 	url = https://github.com/Japabu/getrandom.git
