@@ -13,7 +13,6 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::fs;
 
-use rayon::prelude::*;
 
 pub use collect::RelocType;
 use collect::{Arch, collect, synthesize_alloc_shims, gc_sections, merge_string_sections, is_archive, extract_archive, find_lib, scan_symbols, SectionIdx, SectionKind, SymbolDef, SymbolRef};
@@ -377,7 +376,7 @@ pub fn resolve_libs_with_entry(
     if let Some(entry) = entry {
         undefined.insert(entry.to_string());
     }
-    let obj_scans: Vec<_> = objects.par_iter()
+    let obj_scans: Vec<_> = objects.iter()
         .map(|(_, data)| scan_symbols(data))
         .collect();
     for (defs, refs) in obj_scans {
@@ -387,32 +386,35 @@ pub fn resolve_libs_with_entry(
     // Only truly undefined: referenced but not yet defined
     undefined.retain(|s| !defined.contains(s));
 
-    // Build index: for each archive member, what symbols does it define?
-    let member_scans: Vec<_> = archive_members.par_iter()
-        .map(|(_, data)| scan_symbols(data))
-        .collect();
+    // Scan archive members and build a symbol → member index for O(1) lookup.
     let mut member_defs: Vec<HashSet<String>> = Vec::with_capacity(archive_members.len());
     let mut member_refs: Vec<HashSet<String>> = Vec::with_capacity(archive_members.len());
-    for (defs, refs) in member_scans {
+    let mut sym_to_members: HashMap<String, Vec<usize>> = HashMap::new();
+    for (i, (_, data)) in archive_members.iter().enumerate() {
+        let (defs, refs) = scan_symbols(data);
+        for sym in &defs {
+            sym_to_members.entry(sym.clone()).or_default().push(i);
+        }
         member_defs.push(defs);
         member_refs.push(refs);
     }
 
-    // Iteratively pull in archive members that satisfy undefined symbols
+    // Worklist-driven pull-in: process each undefined symbol once
     let mut included = vec![false; archive_members.len()];
-    loop {
-        let mut changed = false;
-        for i in 0..archive_members.len() {
-            if included[i] { continue; }
-            if member_defs[i].iter().any(|sym| undefined.contains(sym)) {
+    let mut worklist: Vec<String> = undefined.iter().cloned().collect();
+    while let Some(sym) = worklist.pop() {
+        if let Some(members) = sym_to_members.get(&sym) {
+            for &i in members {
+                if included[i] { continue; }
                 included[i] = true;
-                changed = true;
                 defined.extend(member_defs[i].iter().cloned());
-                undefined.extend(member_refs[i].iter().cloned());
-                undefined.retain(|s| !defined.contains(s));
+                for r in &member_refs[i] {
+                    if !defined.contains(r) && undefined.insert(r.clone()) {
+                        worklist.push(r.clone());
+                    }
+                }
             }
         }
-        if !changed { break; }
     }
 
     // Collect the selected archive members in order

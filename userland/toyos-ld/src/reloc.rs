@@ -1,58 +1,8 @@
-use crate::collect::{InputReloc, InputSection, LinkState, RelocType, SectionIdx, SectionKind, SymbolDef, SymbolRef};
+use crate::collect::{InputReloc, LinkState, RelocType, SectionIdx, SectionKind, SymbolDef, SymbolRef};
 use crate::emit_pe::PeLayout;
 use crate::LinkError;
-use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 
-/// Read-only context for parallel symbol resolution.
-/// Borrows the symbol tables and section metadata (for vaddr lookups)
-/// without holding a mutable reference to section data.
-struct ResolveCtx<'a> {
-    sections: &'a [InputSection],
-    globals: &'a HashMap<String, SymbolDef>,
-    locals: &'a HashMap<(crate::collect::ObjIdx, String), SymbolDef>,
-}
-
-impl<'a> ResolveCtx<'a> {
-    fn resolve(&self, sym: &SymbolRef, plt: Option<&HashMap<SymbolRef, u64>>) -> Option<u64> {
-        match sym {
-            SymbolRef::Global(name) => {
-                match self.globals.get(name)? {
-                    SymbolDef::Dynamic { .. } => plt.and_then(|p| p.get(&SymbolRef::Global(name.clone())).copied()),
-                    SymbolDef::Defined { section, value } => {
-                        let sec = &self.sections[section.0];
-                        Some(sec.vaddr.unwrap_or_else(|| panic!(
-                            "symbol {name:?} in section {:?} ({:?}) has no vaddr",
-                            sec.name, sec.kind,
-                        )) + value)
-                    }
-                }
-            }
-            SymbolRef::Local(obj_idx, name) => {
-                if let Some(def) = self.globals.get(name) {
-                    return match def {
-                        SymbolDef::Dynamic { .. } => plt.and_then(|p| p.get(&SymbolRef::Global(name.clone())).copied()),
-                        SymbolDef::Defined { section, value } => {
-                            let sec = &self.sections[section.0];
-                            Some(sec.vaddr.unwrap_or_else(|| panic!(
-                                "symbol {name:?} in section {:?} ({:?}) has no vaddr",
-                                sec.name, sec.kind,
-                            )) + value)
-                        }
-                    };
-                }
-                if let Some(SymbolDef::Defined { section, value }) = self.locals.get(&(*obj_idx, name.clone())) {
-                    let sec = &self.sections[section.0];
-                    return Some(sec.vaddr.unwrap_or_else(|| panic!(
-                        "symbol {name:?} in section {:?} ({:?}) has no vaddr",
-                        sec.name, sec.kind,
-                    )) + value);
-                }
-                None
-            }
-        }
-    }
-}
 
 pub(crate) struct RelocOutput {
     pub(crate) relatives: Vec<(u64, i64)>,
@@ -424,183 +374,93 @@ pub(crate) fn apply_relocs(
         }
     }
 
-    // Pass 2: all other relocations — processed in parallel by section.
-    // Group pass-2 relocations by section index.
-    let pass2_relocs: Vec<&InputReloc> = relocs.iter()
-        .filter(|r| !matches!(r.r_type, RelocType::X86Tlsgd | RelocType::X86Tlsld | RelocType::X86Dtpoff32))
-        .filter(|r| !relaxed_calls.contains(&(r.section, r.offset)))
-        .collect();
+    // Pass 2: all other relocations.
+    for reloc in &relocs {
+        if matches!(reloc.r_type, RelocType::X86Tlsgd | RelocType::X86Tlsld | RelocType::X86Dtpoff32) {
+            continue;
+        }
+        if relaxed_calls.contains(&(reloc.section, reloc.offset)) {
+            continue;
+        }
 
-    let mut by_section: HashMap<usize, Vec<&InputReloc>> = HashMap::new();
-    for reloc in &pass2_relocs {
-        by_section.entry(reloc.section.0).or_default().push(reloc);
-    }
+        let sec_vaddr = state.sections[reloc.section].vaddr.unwrap_or_else(|| panic!(
+            "reloc section {:?} ({:?}) has no vaddr",
+            state.sections[reloc.section].name, state.sections[reloc.section].kind,
+        ));
+        let reloc_vaddr = sec_vaddr + reloc.offset;
 
-    // Take sections out so we can give each section exclusive &mut access in parallel,
-    // while the resolve context borrows the symbol tables immutably.
-    let sections = std::mem::take(&mut state.sections);
+        // Gottpoff relocations only need the GOT slot, not the symbol address.
+        if reloc.r_type == RelocType::X86Gottpoff {
+            let got_slot = params.got.get(&reloc.target)
+                .ok_or_else(|| LinkError::UndefinedSymbols(vec![reloc.target.name().to_string()]))?;
+            let value = *got_slot as i64 + reloc.addend - reloc_vaddr as i64;
+            check_i32(value, reloc)?;
+            write_i32(state, reloc.section, reloc.offset, value as i32);
+            continue;
+        }
 
-    // Build vaddr lookup table (read-only) from section metadata before we split borrows.
-    let section_vaddrs: Vec<Option<u64>> = sections.iter()
-        .map(|s| s.vaddr)
-        .collect();
-    let section_meta: Vec<(String, SectionKind)> = sections.iter()
-        .map(|s| (s.name.clone(), s.kind))
-        .collect();
+        let sym_addr = match resolve_symbol(state, &reloc.target, params.plt) {
+            Some(a) => a,
+            None => {
+                undefined.insert(reloc.target.name().to_string());
+                continue;
+            }
+        };
 
-    let ctx = ResolveCtx {
-        sections: &sections,
-        globals: &state.globals,
-        locals: &state.locals,
-    };
-
-    // Per-section results collected in parallel
-    struct SectionResult {
-        relatives: Vec<(u64, i64)>,
-        undefined: Vec<String>,
-        tpoff32_entries: Vec<(u64, i64)>,
-        error: Option<LinkError>,
-    }
-
-    let section_indices: Vec<usize> = by_section.keys().copied().collect();
-    let section_results: Vec<(usize, SectionResult)> = section_indices.par_iter()
-        .map(|&sec_idx| {
-            let sec_relocs = &by_section[&sec_idx];
-            let mut result = SectionResult {
-                relatives: Vec::new(),
-                undefined: Vec::new(),
-                tpoff32_entries: Vec::new(),
-                error: None,
-            };
-
-            let sec_vaddr = match section_vaddrs[sec_idx] {
-                Some(v) => v,
-                None => {
-                    let (ref name, kind) = section_meta[sec_idx];
-                    panic!("reloc section {name:?} ({kind:?}) has no vaddr");
-                }
-            };
-
-            // SAFETY: each thread processes a distinct sec_idx, so the
-            // mutable access to sections[sec_idx].data does not alias.
-            let data: &mut [u8] = unsafe {
-                let ptr = sections.as_ptr().cast_mut().add(sec_idx);
-                &mut (*ptr).data
-            };
-
-            for reloc in sec_relocs {
-                let reloc_vaddr = sec_vaddr + reloc.offset;
-
-                // Gottpoff relocations only need the GOT slot, not the symbol address.
-                // Dynamic TLS symbols (from shared libraries) can't be resolved via
-                // resolve_symbol — they have no PLT entry — but their GOT slot is
-                // filled at load time via TPOFF64 runtime relocs.
-                if reloc.r_type == RelocType::X86Gottpoff {
-                    let got_slot = match params.got.get(&reloc.target) {
-                        Some(&v) => v,
-                        None => {
-                            result.error = Some(LinkError::UndefinedSymbols(vec![reloc.target.name().to_string()]));
-                            return (sec_idx, result);
-                        }
-                    };
-                    let value = got_slot as i64 + reloc.addend - reloc_vaddr as i64;
-                    if let Err(e) = check_i32(value, reloc) {
-                        result.error = Some(e);
-                        return (sec_idx, result);
-                    }
+        let data = &mut state.sections[reloc.section].data;
+        match reloc.r_type {
+            RelocType::X86Tpoff32 => {
+                if params.is_shared {
+                    let sym_tls_offset = sym_addr as i64 - params.tls_start as i64 + reloc.addend;
+                    write_i32_data(data, reloc.offset, 0);
+                    tpoff32_entries.push((reloc_vaddr, sym_tls_offset));
+                } else {
+                    let value = tpoff(sym_addr, params.tls_start, params.tls_memsz) + reloc.addend;
+                    check_i32(value, reloc)?;
                     write_i32_data(data, reloc.offset, value as i32);
-                    continue;
-                }
-
-                let sym_addr = match ctx.resolve(&reloc.target, params.plt) {
-                    Some(a) => a,
-                    None => {
-                        result.undefined.push(reloc.target.name().to_string());
-                        continue;
-                    }
-                };
-
-                match reloc.r_type {
-                    RelocType::X86Tpoff32 => {
-                        if params.is_shared {
-                            let sym_tls_offset = sym_addr as i64 - params.tls_start as i64 + reloc.addend;
-                            write_i32_data(data, reloc.offset, 0);
-                            result.tpoff32_entries.push((reloc_vaddr, sym_tls_offset));
-                        } else {
-                            let value = tpoff(sym_addr, params.tls_start, params.tls_memsz) + reloc.addend;
-                            if let Err(e) = check_i32(value, reloc) {
-                                result.error = Some(e);
-                                return (sec_idx, result);
-                            }
-                            write_i32_data(data, reloc.offset, value as i32);
-                        }
-                    }
-                    RelocType::X86Gottpoff => unreachable!("handled above"),
-                    RelocType::X86Tlsgd | RelocType::X86Tlsld | RelocType::X86Dtpoff32 => {
-                        unreachable!("handled in pass 1")
-                    }
-                    RelocType::X86_64 | RelocType::X86Pc32 | RelocType::X86Plt32
-                    | RelocType::X86_32 | RelocType::X86_32S
-                    | RelocType::X86Gotpcrel | RelocType::X86Gotpcrelx
-                    | RelocType::X86RexGotpcrelx
-                    | RelocType::X86Tlv => {
-                        match apply_one_reloc_x86(data, reloc, sym_addr, reloc_vaddr, params.got, params.dyn_got) {
-                            Ok(is_abs) => {
-                                if is_abs && params.record_relatives {
-                                    result.relatives.push((reloc_vaddr, sym_addr as i64 + reloc.addend));
-                                }
-                            }
-                            Err(e) => {
-                                result.error = Some(e);
-                                return (sec_idx, result);
-                            }
-                        }
-                    }
-                    RelocType::Aarch64Abs64 | RelocType::Aarch64Abs32
-                    | RelocType::Aarch64Prel32
-                    | RelocType::Aarch64Call26 | RelocType::Aarch64Jump26
-                    | RelocType::Aarch64AdrPrelPgHi21 | RelocType::Aarch64AddAbsLo12Nc
-                    | RelocType::Aarch64Ldst8AbsLo12Nc | RelocType::Aarch64Ldst16AbsLo12Nc
-                    | RelocType::Aarch64Ldst32AbsLo12Nc | RelocType::Aarch64Ldst64AbsLo12Nc
-                    | RelocType::Aarch64Ldst128AbsLo12Nc
-                    | RelocType::Aarch64MovwUabsG0Nc | RelocType::Aarch64MovwUabsG1Nc
-                    | RelocType::Aarch64MovwUabsG2Nc | RelocType::Aarch64MovwUabsG3
-                    | RelocType::Aarch64AdrGotPage | RelocType::Aarch64Ld64GotLo12Nc
-                    | RelocType::Aarch64GotPcrel32
-                    | RelocType::Aarch64TlvpLoadPage21
-                    | RelocType::Aarch64TlvpLoadPageoff12 => {
-                        match apply_one_reloc_aarch64(data, reloc, sym_addr, reloc_vaddr, params.got) {
-                            Ok(is_abs) => {
-                                if is_abs && params.record_relatives {
-                                    result.relatives.push((reloc_vaddr, sym_addr as i64 + reloc.addend));
-                                }
-                            }
-                            Err(e) => {
-                                result.error = Some(e);
-                                return (sec_idx, result);
-                            }
-                        }
-                    }
                 }
             }
-
-            (sec_idx, result)
-        })
-        .collect();
-
-    // Put sections back
-    state.sections = sections;
-
-    // Merge parallel results
-    for (_, result) in section_results {
-        if let Some(e) = result.error {
-            return Err(e);
+            RelocType::X86Gottpoff => unreachable!("handled above"),
+            RelocType::X86Tlsgd | RelocType::X86Tlsld | RelocType::X86Dtpoff32 => {
+                unreachable!("handled in pass 1")
+            }
+            RelocType::X86_64 | RelocType::X86Pc32 | RelocType::X86Plt32
+            | RelocType::X86_32 | RelocType::X86_32S
+            | RelocType::X86Gotpcrel | RelocType::X86Gotpcrelx
+            | RelocType::X86RexGotpcrelx
+            | RelocType::X86Tlv => {
+                match apply_one_reloc_x86(data, reloc, sym_addr, reloc_vaddr, params.got, params.dyn_got) {
+                    Ok(is_abs) => {
+                        if is_abs && params.record_relatives {
+                            relatives.push((reloc_vaddr, sym_addr as i64 + reloc.addend));
+                        }
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            RelocType::Aarch64Abs64 | RelocType::Aarch64Abs32
+            | RelocType::Aarch64Prel32
+            | RelocType::Aarch64Call26 | RelocType::Aarch64Jump26
+            | RelocType::Aarch64AdrPrelPgHi21 | RelocType::Aarch64AddAbsLo12Nc
+            | RelocType::Aarch64Ldst8AbsLo12Nc | RelocType::Aarch64Ldst16AbsLo12Nc
+            | RelocType::Aarch64Ldst32AbsLo12Nc | RelocType::Aarch64Ldst64AbsLo12Nc
+            | RelocType::Aarch64Ldst128AbsLo12Nc
+            | RelocType::Aarch64MovwUabsG0Nc | RelocType::Aarch64MovwUabsG1Nc
+            | RelocType::Aarch64MovwUabsG2Nc | RelocType::Aarch64MovwUabsG3
+            | RelocType::Aarch64AdrGotPage | RelocType::Aarch64Ld64GotLo12Nc
+            | RelocType::Aarch64GotPcrel32
+            | RelocType::Aarch64TlvpLoadPage21
+            | RelocType::Aarch64TlvpLoadPageoff12 => {
+                match apply_one_reloc_aarch64(data, reloc, sym_addr, reloc_vaddr, params.got) {
+                    Ok(is_abs) => {
+                        if is_abs && params.record_relatives {
+                            relatives.push((reloc_vaddr, sym_addr as i64 + reloc.addend));
+                        }
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
         }
-        relatives.extend(result.relatives);
-        for sym in result.undefined {
-            undefined.insert(sym);
-        }
-        tpoff32_entries.extend(result.tpoff32_entries);
     }
 
     // Fill GOT entries (PIE mode records as RELATIVE; static mode handles in emit)

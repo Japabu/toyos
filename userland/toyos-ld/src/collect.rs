@@ -5,7 +5,6 @@ use object::read::elf::ElfFile64;
 use object::read::{self, Object, ObjectSection, ObjectSymbol};
 use object::RelocationFlags;
 use crate::LinkError;
-use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
@@ -259,18 +258,29 @@ enum LocalSymbolRef {
 }
 
 pub(crate) fn collect(objects: &[(String, Vec<u8>)]) -> Result<LinkState, LinkError> {
-    // Flatten archives into individual object files before processing.
-    let mut flat: Vec<(String, Vec<u8>)> = Vec::new();
+    // Flatten archives into individual object files, borrowing data from inputs.
+    let mut flat: Vec<(String, &[u8])> = Vec::new();
     for (name, data) in objects {
         if is_archive(data) {
-            extract_archive(name, data, &mut flat)?;
+            let data: &[u8] = data;
+            let archive = object::read::archive::ArchiveFile::parse(data)
+                .map_err(|e| LinkError::Parse { file: name.clone(), message: e.to_string() })?;
+            for member in archive.members() {
+                let member = member
+                    .map_err(|e| LinkError::Parse { file: name.clone(), message: e.to_string() })?;
+                let member_name = String::from_utf8_lossy(member.name()).to_string();
+                if !member_name.ends_with(".o") { continue; }
+                let member_data = member.data(data)
+                    .map_err(|e| LinkError::Parse { file: format!("{name}({member_name})"), message: e.to_string() })?;
+                flat.push((format!("{name}({member_name})"), member_data));
+            }
         } else {
-            flat.push((name.clone(), data.clone()));
+            flat.push((name.clone(), data));
         }
     }
 
-    // Phase 1: parse all objects in parallel
-    let parsed: Vec<ParsedInput> = flat.par_iter()
+    // Phase 1: parse all objects
+    let parsed: Vec<ParsedInput> = flat.iter()
         .map(|(name, data)| parse_single_input(name, data))
         .collect::<Result<_, LinkError>>()?;
 
@@ -1191,8 +1201,9 @@ pub(crate) fn merge_string_sections(state: &mut LinkState) {
     for (_, group) in &groups {
         if group.len() < 2 { continue; }
 
-        // Parse strings from all sections and intern them
-        let mut string_map: HashMap<Vec<u8>, u64> = HashMap::new(); // string → offset in merged data
+        // Parse strings from all sections and intern them.
+        // Keys borrow from section data (not modified until after the loop).
+        let mut string_map: HashMap<&[u8], u64> = HashMap::new();
         let mut merged_data = Vec::new();
 
         for &sec_idx in group {
@@ -1209,7 +1220,7 @@ pub(crate) fn merge_string_sections(state: &mut LinkState) {
                     existing_off
                 } else {
                     let off = merged_data.len() as u64;
-                    string_map.insert(string.to_vec(), off);
+                    string_map.insert(string, off);
                     merged_data.extend_from_slice(string);
                     off
                 };
@@ -1218,6 +1229,7 @@ pub(crate) fn merge_string_sections(state: &mut LinkState) {
                 pos = end;
             }
         }
+        drop(string_map);
 
         // Replace the first section with merged data; mark the rest for removal
         let keep_idx = group[0];
