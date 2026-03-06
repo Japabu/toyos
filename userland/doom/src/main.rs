@@ -442,7 +442,7 @@ fn to_doom_key(ev: &KeyEvent) -> Option<u8> {
         0x29 => return Some(KEY_ESCAPE),
         0x2A => return Some(KEY_BACKSPACE),
         0x2B => return Some(KEY_TAB),
-        0x2C => return Some(b' '),
+        0x2C => return Some(KEY_USE),
         // Arrow keys
         0x4F => return Some(KEY_RIGHTARROW),
         0x50 => return Some(KEY_LEFTARROW),
