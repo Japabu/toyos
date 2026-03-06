@@ -140,7 +140,7 @@ fn build(debug: bool) {
         let host_rlibs = find_host_rlibs();
         for entry in fs::read_dir(&host_rlibs).into_iter().flatten() {
             let path = entry.unwrap().path();
-            if path.extension().is_some_and(|e| e == "rlib") {
+            if path.extension().is_some_and(|e| e == "rlib" || e == "rmeta") {
                 let name = path.file_name().unwrap().to_str().unwrap().to_string();
                 initrd_files.push((
                     format!("sysroot/lib/rustlib/x86_64-unknown-toyos/lib/{name}"),
