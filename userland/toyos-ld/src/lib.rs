@@ -152,6 +152,7 @@ impl LaidOut<ElfLayout> {
             dyn_got: &self.layout.dyn_got,
             record_relatives: true,
             allow_undefined: false,
+            is_shared: false,
         };
         let relocs = apply_relocs(&mut self.state, &params)?;
         let eh_hdr = build_eh_frame_hdr(&self.state, &self.layout);
@@ -172,6 +173,7 @@ impl LaidOut<ElfLayout> {
             dyn_got: &empty_dyn_got,
             record_relatives: false,
             allow_undefined: false,
+            is_shared: false,
         };
         apply_relocs(&mut self.state, &params)?;
         emit_elf::emit_elf(&self.state, &self.layout, ElfEmitMode::Static { entry_name: entry })
@@ -186,6 +188,7 @@ impl LaidOut<ElfLayout> {
             dyn_got: &self.layout.dyn_got,
             record_relatives: true,
             allow_undefined: true,
+            is_shared: true,
         };
         let relocs = apply_relocs(&mut self.state, &params)?;
         let eh_hdr = build_eh_frame_hdr(&self.state, &self.layout);

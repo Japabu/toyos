@@ -139,6 +139,10 @@ pub struct Process {
     tls_filesz: usize,
     tls_memsz: usize,
     pub tls_alloc: Option<OwnedAlloc>,
+    /// Multi-module TLS: (template_addr, filesz, memsz, base_offset) per module.
+    tls_modules: Vec<(u64, usize, usize, usize)>,
+    /// Total combined TLS size across all modules.
+    tls_total_memsz: usize,
     // Crash diagnostics
     pub symbols: ProcessSymbols,
     // Process name (filename from argv[0], null-terminated)
@@ -192,19 +196,38 @@ pub fn with_current_mut<R>(f: impl FnOnce(&mut Process) -> R) -> R {
 ///                              ^-- FS base (thread pointer)
 /// Returns (alloc, fs_base).
 pub fn setup_tls(tls_template: u64, tls_filesz: usize, tls_memsz: usize) -> Option<(OwnedAlloc, u64)> {
-    let block_size = tls_memsz + 8; // TLS data + self-pointer
+    setup_combined_tls(&[(tls_template, tls_filesz, tls_memsz, 0)], tls_memsz)
+}
+
+/// Allocate a combined TLS area for multiple modules (exe + shared libraries).
+/// Each module's template is copied at its base_offset within the block.
+/// Layout: [module0 TLS][module1 TLS]...[moduleN TLS][TCB: self-pointer]
+///                                                    ^-- FS base (thread pointer)
+fn setup_combined_tls(
+    modules: &[(u64, usize, usize, usize)], // (template, filesz, memsz, base_offset)
+    total_memsz: usize,
+) -> Option<(OwnedAlloc, u64)> {
+    let block_size = total_memsz + 8; // TLS data + self-pointer
     let alloc_size = paging::align_2m(block_size);
     let alloc = OwnedAlloc::new(alloc_size, PAGE_2M as usize)?;
     let block = alloc.ptr();
 
-    // Copy initialized data (.tdata)
-    if tls_filesz > 0 && tls_template != 0 {
-        unsafe { core::ptr::copy_nonoverlapping(tls_template as *const u8, block, tls_filesz); }
+    // Copy each module's initialized data (.tdata) at its offset
+    for &(template, filesz, _memsz, base_offset) in modules {
+        if filesz > 0 && template != 0 {
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    template as *const u8,
+                    block.add(base_offset),
+                    filesz,
+                );
+            }
+        }
     }
     // .tbss already zeroed by alloc_zeroed
 
     // Thread pointer = address past TLS block
-    let tp = block as u64 + tls_memsz as u64;
+    let tp = block as u64 + total_memsz as u64;
     // Self-pointer at %fs:0
     unsafe { *(tp as *mut u64) = tp; }
 
@@ -294,15 +317,20 @@ extern "C" fn thread_start() {
 /// Spawn a thread within the current process.
 pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64) -> Option<u32> {
     // Read parent's TLS info (brief lock)
-    let (tls_template, tls_filesz, tls_memsz) = {
+    let (tls_template, tls_filesz, tls_memsz, tls_modules, tls_total_memsz) = {
         let guard = PROCESS_TABLE.lock();
         let table = guard.as_ref().expect("process table not initialized");
         let parent = table.procs.get(percpu::current_pid()).unwrap();
-        (parent.tls_template, parent.tls_filesz, parent.tls_memsz)
+        (parent.tls_template, parent.tls_filesz, parent.tls_memsz,
+         parent.tls_modules.clone(), parent.tls_total_memsz)
     };
 
     // Allocate TLS for the thread (outside lock — map_user does TLB flush)
-    let (tls_alloc, fs_base) = setup_tls(tls_template, tls_filesz, tls_memsz)?;
+    let (tls_alloc, fs_base) = if !tls_modules.is_empty() {
+        setup_combined_tls(&tls_modules, tls_total_memsz)?
+    } else {
+        setup_tls(tls_template, tls_filesz, tls_memsz)?
+    };
     paging::map_user(tls_alloc.ptr() as u64, tls_alloc.size() as u64);
 
     let (ks_alloc, ks_rsp) = match alloc_kernel_stack(thread_start, entry, stack_ptr, arg) {
@@ -355,6 +383,8 @@ pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64) -> Option<u32> {
         tls_filesz,
         tls_memsz,
         tls_alloc: Some(tls_alloc),
+        tls_modules,
+        tls_total_memsz,
         symbols: ProcessSymbols::empty(),
         name: [0; 28],
         loaded_libs: Vec::new(),
@@ -438,19 +468,63 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<u32>) -> Option<u32> {
     let stack_top = stack_alloc.ptr() as u64 + USER_STACK_SIZE as u64;
     paging::map_user_in(child_pml4, stack_alloc.ptr() as u64, USER_STACK_SIZE as u64);
 
-    // Use shared library TLS if the executable has none
-    let (tls_template, tls_filesz, tls_memsz) = if loaded.tls_memsz > 0 {
-        (loaded.tls_template, loaded.tls_filesz, loaded.tls_memsz)
+    // Build combined TLS layout: libraries first, exe last (right before TP).
+    // The exe must be last because its inline tpoff values are baked in at link
+    // time assuming the exe's TLS ends at the TP. Placing it last preserves those values.
+    let mut tls_modules: Vec<(u64, usize, usize, usize)> = Vec::new();
+    let mut tls_cursor = 0usize;
+
+    for lib in &loaded_libs {
+        if lib.tls_memsz > 0 {
+            if tls_cursor > 0 {
+                tls_cursor = (tls_cursor + 15) & !15;
+            }
+            tls_modules.push((lib.tls_template, lib.tls_filesz, lib.tls_memsz, tls_cursor));
+            tls_cursor += lib.tls_memsz;
+        }
+    }
+    if loaded.tls_memsz > 0 {
+        if tls_cursor > 0 {
+            tls_cursor = (tls_cursor + 15) & !15;
+        }
+        let exe_base_offset = tls_cursor;
+        tls_modules.push((loaded.tls_template, loaded.tls_filesz, loaded.tls_memsz, exe_base_offset));
+        tls_cursor += loaded.tls_memsz;
+    }
+    let tls_total_memsz = tls_cursor;
+
+    // Apply R_X86_64_TPOFF64 relocations in shared libraries now that we know the layout
+    for lib in &loaded_libs {
+        if lib.tls_memsz == 0 { continue; }
+        // Find this library's base offset in the combined layout
+        let lib_base_offset = tls_modules.iter()
+            .find(|&&(template, _, _, _)| template == lib.tls_template)
+            .map(|&(_, _, _, base_offset)| base_offset)
+            .unwrap_or(0);
+        elf::apply_tpoff_relocs(lib, lib_base_offset, tls_total_memsz);
+    }
+    // Also apply TPOFF relocs in the exe's relocations (if it has any)
+    if loaded.tls_memsz > 0 {
+        let exe_base_offset = tls_modules.iter()
+            .find(|&&(template, _, _, _)| template == loaded.tls_template)
+            .map(|&(_, _, _, base_offset)| base_offset)
+            .unwrap_or(0);
+        elf::apply_exe_tpoff_relocs(&binary, loaded.base, exe_base_offset, tls_total_memsz);
+    }
+
+    // For single-module compat (used by spawn_thread)
+    let (tls_template, tls_filesz, tls_memsz) = if !tls_modules.is_empty() {
+        (tls_modules[0].0, tls_modules[0].1, tls_modules[0].2)
     } else {
-        // Find the first loaded lib with TLS
-        loaded_libs.iter()
-            .find(|lib| lib.tls_memsz > 0)
-            .map(|lib| (lib.tls_template, lib.tls_filesz, lib.tls_memsz))
-            .unwrap_or((0, 0, 0))
+        (0, 0, 0)
     };
-    log!("spawn: TLS template={:#x} filesz={} memsz={} (from {})", tls_template, tls_filesz, tls_memsz,
-        if loaded.tls_memsz > 0 { "exe" } else { "lib" });
-    let (tls_alloc, fs_base) = setup_tls(tls_template, tls_filesz, tls_memsz)?;
+
+    log!("spawn: TLS {} modules, total_memsz={}", tls_modules.len(), tls_total_memsz);
+    let (tls_alloc, fs_base) = if tls_total_memsz > 0 {
+        setup_combined_tls(&tls_modules, tls_total_memsz)?
+    } else {
+        setup_tls(0, 0, 0)?
+    };
     paging::map_user_in(child_pml4, tls_alloc.ptr() as u64, tls_alloc.size() as u64);
 
     let sp = write_argv_to_stack(stack_top, argv);
@@ -498,6 +572,8 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<u32>) -> Option<u32> {
         tls_filesz,
         tls_memsz,
         tls_alloc: Some(tls_alloc),
+        tls_modules,
+        tls_total_memsz,
         symbols: syms,
         name: make_name(path),
         loaded_libs,
@@ -557,14 +633,18 @@ pub fn exit(code: i32) -> ! {
         let mut guard = PROCESS_TABLE.lock();
         let table = guard.as_mut().expect("process table not initialized");
         let pid = percpu::current_pid();
-        let proc = table.procs.get_mut(pid).unwrap();
-        let kind = proc.kind;
 
-        // Close all FDs (acquires VFS lock — correct order: process_table < vfs)
-        fd::close_all(&mut proc.fds, &mut *vfs::lock(), proc.pid);
-
-        // Free TLS (RAII: .take() drops the OwnedAlloc)
-        proc.tls_alloc.take();
+        // Extract what we need, then drop the proc borrow so we can iterate
+        // the table to kill child threads.
+        let kind = {
+            let proc = table.procs.get_mut(pid).unwrap();
+            let kind = proc.kind;
+            // Close all FDs (acquires VFS lock — correct order: process_table < vfs)
+            fd::close_all(&mut proc.fds, &mut *vfs::lock(), proc.pid);
+            // Free TLS (RAII: .take() drops the OwnedAlloc)
+            proc.tls_alloc.take();
+            kind
+        };
 
         match kind {
             Kind::Thread { .. } => {
@@ -574,7 +654,7 @@ pub fn exit(code: i32) -> ! {
             Kind::Process { .. } => {
                 // Kill all child threads before freeing resources they depend on
                 let child_tids: alloc::vec::Vec<u32> = table.procs.iter()
-                    .filter(|(_tid, p)| matches!(p.kind, Kind::Thread { parent } if parent == pid))
+                    .filter(|(tid, p)| *tid != pid && matches!(p.kind, Kind::Thread { parent } if parent == pid))
                     .map(|(tid, _)| tid)
                     .collect();
                 for tid in &child_tids {
@@ -585,6 +665,7 @@ pub fn exit(code: i32) -> ! {
                     log!("exit: killing child thread {name} pid={tid}");
                 }
 
+                let proc = table.procs.get_mut(pid).unwrap();
                 let pml4 = proc.cr3 as *mut u64;
                 unsafe { cpu::write_cr3(paging::kernel_cr3()); }
                 shared_memory::cleanup_process(pid, pml4);
@@ -597,6 +678,7 @@ pub fn exit(code: i32) -> ! {
             }
         }
 
+        let proc = table.procs.get_mut(pid).unwrap();
         proc.state = ProcessState::Zombie(code);
         let name = core::str::from_utf8(&proc.name).unwrap_or("?").trim_end_matches('\0');
         log!("exit: {name} pid={pid} code={code}");

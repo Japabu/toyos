@@ -10,6 +10,9 @@ use elf::abi::{
     DT_SYMTAB, DT_STRTAB, DT_STRSZ, DT_NULL, DT_NEEDED, SHT_DYNSYM,
 };
 
+const R_X86_64_TPOFF64: u32 = 18;
+const R_X86_64_TPOFF32: u32 = 23;
+
 /// Read a null-terminated string from `base + offset`, bounded by `max_size`.
 /// Returns `""` if the offset is out of bounds or no null terminator is found.
 fn bounded_cstr(base: u64, offset: u64, max_size: u64) -> &'static str {
@@ -651,4 +654,77 @@ pub fn resolve_dynamic_deps(
     }
 
     Ok(libs)
+}
+
+/// Apply R_X86_64_TPOFF64 and R_X86_64_TPOFF32 relocations in a shared library.
+/// `lib_base_offset` is this library's TLS placement within the combined TLS block.
+/// `total_memsz` is the total combined TLS size across all modules.
+/// TPOFF64: fills a GOT slot (u64) with base_offset + addend - total_memsz
+/// TPOFF32: patches an inline immediate (i32) with base_offset + addend - total_memsz
+pub fn apply_tpoff_relocs(lib: &LoadedLib, lib_base_offset: usize, total_memsz: usize) {
+    let entry_size = 24u64;
+    let sections = [
+        (lib.rela_addr, lib.rela_size),
+        (lib.jmprel_addr, lib.jmprel_size),
+    ];
+    let mut count64 = 0u64;
+    let mut count32 = 0u64;
+    for (rela_addr, rela_size) in sections {
+        if rela_size == 0 { continue; }
+        let num = rela_size / entry_size;
+        for i in 0..num {
+            let rela_ptr = (rela_addr + i * entry_size) as *const u8;
+            let r_offset = unsafe { *(rela_ptr as *const u64) };
+            let r_info = unsafe { *(rela_ptr.add(8) as *const u64) };
+            let r_addend = unsafe { *(rela_ptr.add(16) as *const i64) };
+            let r_type = (r_info & 0xFFFF_FFFF) as u32;
+            let tpoff = lib_base_offset as i64 + r_addend - total_memsz as i64;
+
+            if r_type == R_X86_64_TPOFF64 {
+                let target = (lib.base + r_offset) as *mut u64;
+                unsafe { *target = tpoff as u64; }
+                count64 += 1;
+            } else if r_type == R_X86_64_TPOFF32 {
+                let target = (lib.base + r_offset) as *mut i32;
+                unsafe { *target = tpoff as i32; }
+                count32 += 1;
+            }
+        }
+    }
+    if count64 > 0 || count32 > 0 {
+        log!("dlopen: applied {} TPOFF64 + {} TPOFF32 relocs (base_offset={}, total_memsz={})",
+            count64, count32, lib_base_offset, total_memsz);
+    }
+}
+
+/// Apply R_X86_64_TPOFF64/TPOFF32 relocations in the main executable's .rela.dyn.
+/// Uses section headers from the raw ELF data to find relocation entries.
+pub fn apply_exe_tpoff_relocs(data: &[u8], base: u64, exe_base_offset: usize, total_memsz: usize) {
+    let elf = match ElfBytes::<AnyEndian>::minimal_parse(data) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    let mut count = 0u64;
+    for section_name in &[".rela.dyn", ".rela.plt"] {
+        if let Ok(Some(shdr)) = elf.section_header_by_name(section_name) {
+            if let Ok(relas) = elf.section_data_as_relas(&shdr) {
+                for rela in relas {
+                    let tpoff = exe_base_offset as i64 + rela.r_addend - total_memsz as i64;
+                    if rela.r_type == R_X86_64_TPOFF64 as u32 {
+                        let target = (base + rela.r_offset) as *mut u64;
+                        unsafe { *target = tpoff as u64; }
+                        count += 1;
+                    } else if rela.r_type == R_X86_64_TPOFF32 as u32 {
+                        let target = (base + rela.r_offset) as *mut i32;
+                        unsafe { *target = tpoff as i32; }
+                        count += 1;
+                    }
+                }
+            }
+        }
+    }
+    if count > 0 {
+        log!("exe: applied {} TPOFF relocs (base_offset={}, total_memsz={})",
+            count, exe_base_offset, total_memsz);
+    }
 }

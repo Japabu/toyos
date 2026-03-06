@@ -47,7 +47,12 @@ fn prepare_boot(
         initrd_files.push((format!("test_c_{name}"), data.clone()));
     }
     for (name, data) in rust_tests {
-        initrd_files.push((format!("test_rs_{name}"), data.clone()));
+        if name.ends_with(".so") {
+            // Shared libraries go into initrd with their original name
+            initrd_files.push((name.clone(), data.clone()));
+        } else {
+            initrd_files.push((format!("test_rs_{name}"), data.clone()));
+        }
     }
 
     let initrd_bytes = create_initrd(&initrd_files, &[]);
@@ -383,12 +388,63 @@ fn build_toyos_crate(_repo: &Path, crate_path: &Path, toyos_ld: &Path) -> (Strin
 }
 
 /// Build all binaries in a multi-binary crate. Returns vec of (binary_name, bytes).
+/// Also builds any cdylib subcrates and includes their .so files.
 pub fn build_toyos_bins(crate_path: &Path, toyos_ld: &Path) -> Vec<(String, Vec<u8>)> {
+    let bin_dir = crate_path.join("target/x86_64-unknown-toyos/debug");
+    let mut results = Vec::new();
+
+    // Build cdylib subcrates first (test shared libraries)
+    let mut lib_search_dirs = Vec::new();
+    for entry in fs::read_dir(crate_path).unwrap() {
+        let entry = entry.unwrap();
+        let sub_path = entry.path();
+        if !sub_path.is_dir() { continue; }
+        let cargo_toml = sub_path.join("Cargo.toml");
+        if !cargo_toml.exists() { continue; }
+        let toml_text = fs::read_to_string(&cargo_toml).unwrap();
+        if !toml_text.contains("cdylib") { continue; }
+
+        let lib_name = sub_path.file_name().unwrap().to_str().unwrap();
+        eprintln!("[build] Building cdylib subcrate: {lib_name}");
+        assert!(
+            Command::new("cargo")
+                .args(["build", "--target", "x86_64-unknown-toyos"])
+                .env("RUSTUP_TOOLCHAIN", "toyos")
+                .env("CARGO_TARGET_X86_64_UNKNOWN_TOYOS_LINKER", toyos_ld.to_str().unwrap())
+                .env_remove("RUSTC")
+                .current_dir(&sub_path)
+                .status()
+                .expect("Failed to run cargo")
+                .success(),
+            "Failed to build cdylib {lib_name}"
+        );
+
+        let lib_out = sub_path.join("target/x86_64-unknown-toyos/debug");
+        lib_search_dirs.push(lib_out.clone());
+
+        // Collect .so files from the output
+        for so_entry in fs::read_dir(&lib_out).unwrap() {
+            let so_entry = so_entry.unwrap();
+            let name = so_entry.file_name().to_str().unwrap().to_string();
+            if name.ends_with(".so") {
+                let data = fs::read(so_entry.path()).unwrap();
+                results.push((name, data));
+            }
+        }
+    }
+
+    // Build test binaries, linking against cdylib outputs
+    let mut rustflags = String::new();
+    for dir in &lib_search_dirs {
+        rustflags.push_str(&format!("-L {} ", dir.display()));
+    }
+
     assert!(
         Command::new("cargo")
             .args(["build", "--target", "x86_64-unknown-toyos", "--bins"])
             .env("RUSTUP_TOOLCHAIN", "toyos")
             .env("CARGO_TARGET_X86_64_UNKNOWN_TOYOS_LINKER", toyos_ld.to_str().unwrap())
+            .env("RUSTFLAGS", &rustflags)
             .env_remove("RUSTC")
             .current_dir(crate_path)
             .status()
@@ -396,9 +452,6 @@ pub fn build_toyos_bins(crate_path: &Path, toyos_ld: &Path) -> Vec<(String, Vec<
             .success(),
         "Failed to build toyos-rust-tests"
     );
-
-    let bin_dir = crate_path.join("target/x86_64-unknown-toyos/debug");
-    let mut results = Vec::new();
 
     let bin_src = crate_path.join("src/bin");
     if bin_src.exists() {

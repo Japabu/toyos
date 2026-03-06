@@ -4,7 +4,6 @@ use toyos_tests::compile;
 use toyos_tests::qemu::{self, QemuInstance};
 
 #[test]
-#[ignore] // Run with: cargo test --test toyos_rust -- --ignored
 fn toyos_rust_tests() {
     let repo = compile::repo_root();
     let rust_tests_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("toyos-rust-tests");
@@ -26,9 +25,10 @@ fn toyos_rust_tests() {
 
     let mut failures = Vec::new();
     let mut passed = 0usize;
-    let total = rust_bins.len();
+    let test_bins: Vec<_> = rust_bins.iter().filter(|(name, _)| !name.ends_with(".so")).collect();
+    let total = test_bins.len();
 
-    for (name, _) in &rust_bins {
+    for (name, _) in &test_bins {
         let test_name = format!("test_rs_{name}");
         let result = qemu.run_test(&test_name, Duration::from_secs(30));
         let display_name = result.name.strip_prefix("test_rs_").unwrap_or(&result.name);

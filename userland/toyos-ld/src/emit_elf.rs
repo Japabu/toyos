@@ -352,10 +352,13 @@ pub(crate) fn layout_elf(state: &mut LinkState, base_addr: u64, entry_name: Opti
         }
     }
 
+    let is_shared = entry_name.is_none();
     let got_symbols = collect_unique_symbols(state.relocs.iter(), |r| {
         matches!(r.r_type,
             RelocType::X86Gotpcrel | RelocType::X86Gotpcrelx
             | RelocType::X86RexGotpcrelx | RelocType::X86Gottpoff)
+        // Shared mode: GD→IE relaxation needs a GOT slot for each TLS GD symbol
+        || (is_shared && r.r_type == RelocType::X86Tlsgd)
     });
 
     cursor = align_up(cursor, 8);
@@ -687,7 +690,9 @@ pub(crate) fn emit_elf(
     let has_build_id = layout.build_id_note_vaddr != 0;
     let has_plt = (is_pie || is_shared) && !layout.plt_data.is_empty();
     let has_rela = relocs.map_or(false, |r| !r.relatives.is_empty())
-        || relocs.map_or(false, |r| !r.glob_dats.is_empty());
+        || relocs.map_or(false, |r| !r.glob_dats.is_empty())
+        || relocs.map_or(false, |r| !r.tpoff64s.is_empty())
+        || relocs.map_or(false, |r| !r.tpoff32s.is_empty());
     let file_rw_end = layout.rw_start + layout.rw_filesz;
 
     let mut buf = Vec::new();
@@ -859,7 +864,7 @@ pub(crate) fn emit_elf(
 
     // Rela count
     let rela_count = if let Some(relocs) = relocs {
-        relocs.relatives.len() + relocs.glob_dats.len()
+        relocs.relatives.len() + relocs.glob_dats.len() + relocs.tpoff64s.len() + relocs.tpoff32s.len()
     } else { 0 };
     let rela_size = rela_count as u64 * 24;
 
@@ -1145,7 +1150,7 @@ pub(crate) fn emit_elf(
 
         // Shared library RELA (reserved before dynamic section, must be written here)
         if let Some(relocs) = relocs {
-            if !relocs.relatives.is_empty() || !relocs.glob_dats.is_empty() {
+            if !relocs.relatives.is_empty() || !relocs.glob_dats.is_empty() || !relocs.tpoff64s.is_empty() || !relocs.tpoff32s.is_empty() {
                 w.write_align_relocation();
                 for &(offset, addend) in &relocs.relatives {
                     w.write_relocation(true, &Rel {
@@ -1162,6 +1167,22 @@ pub(crate) fn emit_elf(
                         r_sym: sym_idx.0,
                         r_type: elf::R_X86_64_GLOB_DAT,
                         r_addend: 0,
+                    });
+                }
+                for &(got_vaddr, addend) in &relocs.tpoff64s {
+                    w.write_relocation(true, &Rel {
+                        r_offset: got_vaddr,
+                        r_sym: 0,
+                        r_type: elf::R_X86_64_TPOFF64,
+                        r_addend: addend,
+                    });
+                }
+                for &(vaddr, addend) in &relocs.tpoff32s {
+                    w.write_relocation(true, &Rel {
+                        r_offset: vaddr,
+                        r_sym: 0,
+                        r_type: elf::R_X86_64_TPOFF32,
+                        r_addend: addend,
                     });
                 }
             }

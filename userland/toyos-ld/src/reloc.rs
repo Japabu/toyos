@@ -10,6 +10,13 @@ pub(crate) struct RelocOutput {
     /// GOTTPOFF GOT entries: (GOT slot vaddr, raw tpoff value). Written directly into
     /// the output (not as RELATIVE) because RELATIVE would incorrectly add the load base.
     pub(crate) tpoff_fills: Vec<(u64, i64)>,
+    /// R_X86_64_TPOFF64 runtime relocations for shared libraries: (GOT slot vaddr, addend).
+    /// The addend is the symbol's offset within its module's TLS segment. At load time,
+    /// the kernel adds the module's TLS base tpoff to produce the final tpoff value.
+    pub(crate) tpoff64s: Vec<(u64, i64)>,
+    /// R_X86_64_TPOFF32 runtime relocations for shared libraries: (vaddr of imm32, addend).
+    /// Used for LD→LE relaxation in shared mode where DTPOFF32 immediates need load-time patching.
+    pub(crate) tpoff32s: Vec<(u64, i64)>,
 }
 
 /// Resolve a symbol to its virtual address.
@@ -193,6 +200,9 @@ pub(crate) struct ElfRelocParams<'a> {
     /// Static mode: addresses are fixed at link time, no RELATIVE needed.
     pub(crate) record_relatives: bool,
     pub(crate) allow_undefined: bool,
+    /// Shared library mode: TLS offsets are not known at link time. GD→IE relaxation
+    /// is used instead of GD→LE, and R_X86_64_TPOFF64 runtime relocs are emitted.
+    pub(crate) is_shared: bool,
 }
 
 pub(crate) fn apply_relocs(
@@ -201,6 +211,8 @@ pub(crate) fn apply_relocs(
 ) -> Result<RelocOutput, LinkError> {
     let mut relatives = Vec::new();
     let mut undefined = HashSet::new();
+    let mut tpoff64_entries: Vec<(u64, i64)> = Vec::new();
+    let mut tpoff32_entries: Vec<(u64, i64)> = Vec::new();
 
     let relocs = std::mem::take(&mut state.relocs);
 
@@ -218,7 +230,35 @@ pub(crate) fn apply_relocs(
                     &state.sections[reloc.section].data,
                     reloc.offset,
                 );
-                if padded {
+                if !padded {
+                    return Err(LinkError::UnsupportedRelocation {
+                        reloc_type: RelocType::X86Tlsgd,
+                        symbol: reloc.target.name().to_string(),
+                    });
+                }
+                if params.is_shared {
+                    // GD → IE (16-byte padded): `data16; leaq; data16*2; rex64; call`
+                    // → `mov %fs:0,%rax; add sym@GOTTPOFF(%rip),%rax`
+                    #[rustfmt::skip]
+                    let inst: [u8; 16] = [
+                        0x64, 0x48, 0x8b, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00, // mov %fs:0,%rax
+                        0x48, 0x03, 0x05, 0x00, 0x00, 0x00, 0x00,             // add 0(%rip),%rax
+                    ];
+                    write_bytes(state, reloc.section, reloc.offset - 4, &inst);
+                    // Compute RIP-relative offset to GOT slot
+                    let got_slot = *params.got.get(&reloc.target).ok_or_else(|| {
+                        LinkError::UndefinedSymbols(vec![reloc.target.name().to_string()])
+                    })?;
+                    let sec_vaddr = state.sections[reloc.section].vaddr.unwrap();
+                    let rip = sec_vaddr + reloc.offset + 12; // end of `add` instruction
+                    let disp = got_slot as i64 - rip as i64;
+                    check_i32(disp, reloc)?;
+                    write_i32(state, reloc.section, reloc.offset + 8, disp as i32);
+                    relaxed_calls.insert((reloc.section, reloc.offset + 8));
+                    // Record that this GOT slot needs a TPOFF64 runtime reloc
+                    let sym_tls_offset = sym_addr as i64 - params.tls_start as i64;
+                    tpoff64_entries.push((got_slot, sym_tls_offset));
+                } else {
                     // GD → LE (16-byte padded): `data16; leaq; data16*2; rex64; call`
                     // → `mov %fs:0,%rax; lea tpoff(%rax),%rax`
                     #[rustfmt::skip]
@@ -231,14 +271,11 @@ pub(crate) fn apply_relocs(
                     check_i32(tp_value, reloc)?;
                     write_i32(state, reloc.section, reloc.offset + 8, tp_value as i32);
                     relaxed_calls.insert((reloc.section, reloc.offset + 8));
-                } else {
-                    return Err(LinkError::UnsupportedRelocation {
-                        reloc_type: RelocType::X86Tlsgd,
-                        symbol: reloc.target.name().to_string(),
-                    });
                 }
             }
             RelocType::X86Tlsld => {
+                // LD → LE: get thread pointer. In shared mode, subsequent DTPOFF32
+                // accesses emit R_X86_64_TPOFF32 runtime relocs for load-time patching.
                 let padded = is_padded_tls_sequence(
                     &state.sections[reloc.section].data,
                     reloc.offset,
@@ -267,9 +304,20 @@ pub(crate) fn apply_relocs(
             RelocType::X86Dtpoff32 => {
                 let sym_addr = resolve_symbol(state, &reloc.target, params.plt)
                     .ok_or_else(|| LinkError::UndefinedSymbols(vec![reloc.target.name().to_string()]))?;
-                let value = tpoff(sym_addr, params.tls_start, params.tls_memsz) + reloc.addend;
-                check_i32(value, reloc)?;
-                write_i32(state, reloc.section, reloc.offset, value as i32);
+                if params.is_shared {
+                    // Shared mode: TLSLD relaxation gave us `mov %fs:0, %rax`, so
+                    // DTPOFF32 must produce a tpoff. We don't know the final tpoff
+                    // at link time, so write a placeholder and emit R_X86_64_TPOFF32.
+                    let sec_vaddr = state.sections[reloc.section].vaddr.unwrap();
+                    let imm_vaddr = sec_vaddr + reloc.offset;
+                    let sym_tls_offset = sym_addr as i64 - params.tls_start as i64 + reloc.addend;
+                    write_i32(state, reloc.section, reloc.offset, 0);
+                    tpoff32_entries.push((imm_vaddr, sym_tls_offset));
+                } else {
+                    let value = tpoff(sym_addr, params.tls_start, params.tls_memsz) + reloc.addend;
+                    check_i32(value, reloc)?;
+                    write_i32(state, reloc.section, reloc.offset, value as i32);
+                }
             }
             // Handled in pass 2
             RelocType::X86_64 | RelocType::X86Pc32 | RelocType::X86Plt32
@@ -318,9 +366,16 @@ pub(crate) fn apply_relocs(
 
         match reloc.r_type {
             RelocType::X86Tpoff32 => {
-                let value = tpoff(sym_addr, params.tls_start, params.tls_memsz) + reloc.addend;
-                check_i32(value, reloc)?;
-                write_i32(state, reloc.section, reloc.offset, value as i32);
+                if params.is_shared {
+                    // Shared mode: emit R_X86_64_TPOFF32 runtime reloc
+                    let sym_tls_offset = sym_addr as i64 - params.tls_start as i64 + reloc.addend;
+                    write_i32(state, reloc.section, reloc.offset, 0);
+                    tpoff32_entries.push((reloc_vaddr, sym_tls_offset));
+                } else {
+                    let value = tpoff(sym_addr, params.tls_start, params.tls_memsz) + reloc.addend;
+                    check_i32(value, reloc)?;
+                    write_i32(state, reloc.section, reloc.offset, value as i32);
+                }
             }
             RelocType::X86Gottpoff => {
                 let got_slot = *params.got.get(&reloc.target).ok_or_else(|| {
@@ -372,13 +427,21 @@ pub(crate) fn apply_relocs(
         for (sym_ref, &got_vaddr) in params.got {
             // Dynamic symbols are in dyn_got, resolved at load time via GLOB_DAT
             if params.dyn_got.contains_key(sym_ref) { continue; }
+            // GD→IE GOT entries are handled via tpoff64_entries (collected in pass 1)
+            if tpoff64_entries.iter().any(|&(v, _)| v == got_vaddr) { continue; }
             let sym_addr = resolve_symbol(state, sym_ref, params.plt)
                 .ok_or_else(|| LinkError::UndefinedSymbols(vec![sym_ref.name().to_string()]))?;
             if gottpoff_syms.contains(sym_ref) {
-                // Write raw tpoff directly — NOT as RELATIVE (RELATIVE would add
-                // the load base, corrupting the TP-relative offset).
-                let tp = tpoff(sym_addr, params.tls_start, params.tls_memsz);
-                tpoff_fills.push((got_vaddr, tp));
+                if params.is_shared {
+                    // Shared mode: emit TPOFF64 runtime reloc instead of filling at link time
+                    let sym_tls_offset = sym_addr as i64 - params.tls_start as i64;
+                    tpoff64_entries.push((got_vaddr, sym_tls_offset));
+                } else {
+                    // PIE mode: write raw tpoff directly — NOT as RELATIVE (RELATIVE
+                    // would add the load base, corrupting the TP-relative offset).
+                    let tp = tpoff(sym_addr, params.tls_start, params.tls_memsz);
+                    tpoff_fills.push((got_vaddr, tp));
+                }
             } else {
                 relatives.push((got_vaddr, sym_addr as i64));
             }
@@ -397,7 +460,7 @@ pub(crate) fn apply_relocs(
         return Err(LinkError::UndefinedSymbols(syms));
     }
 
-    Ok(RelocOutput { relatives, glob_dats, tpoff_fills })
+    Ok(RelocOutput { relatives, glob_dats, tpoff_fills, tpoff64s: tpoff64_entries, tpoff32s: tpoff32_entries })
 }
 
 // ── AArch64 relocation helpers ───────────────────────────────────────────
