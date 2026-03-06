@@ -517,9 +517,11 @@ impl Preprocessor {
             }
             self.process_source(&content, &resolved, idx);
         } else if is_system {
-            panic!("warning: cannot find system include file: {}", path_str);
+            eprintln!("fatal error: cannot find system include file: {}", path_str);
+            std::process::exit(1);
         } else {
-            panic!("cannot find include file: {}", path_str);
+            eprintln!("fatal error: cannot find include file: {}", path_str);
+            std::process::exit(1);
         }
     }
 

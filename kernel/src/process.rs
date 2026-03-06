@@ -659,6 +659,72 @@ pub fn spawn_optional(argv: &[&str]) -> Option<u32> {
     spawn(&full_argv, fds, None)
 }
 
+/// Exit the entire process group (like Linux's exit_group).
+/// If called from a thread, kills the parent process (and all sibling threads).
+/// If called from a process, same as exit().
+pub fn exit_group(code: i32) -> ! {
+    let mut guard = PROCESS_TABLE.lock();
+    let table = guard.as_mut().expect("process table not initialized");
+    let pid = percpu::current_pid();
+
+    let kind = table.procs.get(pid).unwrap().kind;
+    if let Kind::Thread { parent } = kind {
+        // We're a thread — kill the parent process (which cascades to all threads).
+        // Zombie ourselves first.
+        let proc = table.procs.get_mut(pid).unwrap();
+        proc.tls_alloc.take();
+        proc.state = ProcessState::Zombie(code);
+        unsafe { crate::arch::cpu::write_cr3(crate::arch::paging::kernel_cr3()); }
+
+        // Kill all sibling threads
+        let sibling_tids: alloc::vec::Vec<u32> = table.procs.iter()
+            .filter(|(tid, p)| *tid != pid && matches!(p.kind, Kind::Thread { parent: pp } if pp == parent))
+            .map(|(tid, _)| tid)
+            .collect();
+        for tid in &sibling_tids {
+            let sibling = table.procs.get_mut(*tid).unwrap();
+            sibling.tls_alloc.take();
+            sibling.state = ProcessState::Zombie(-1);
+        }
+
+        // Kill the parent process and free its resources
+        let parent_proc = table.procs.get_mut(parent).unwrap();
+        fd::close_all(&mut parent_proc.fds, &mut *vfs::lock(), parent);
+        parent_proc.tls_alloc.take();
+        let pml4 = parent_proc.cr3 as *mut u64;
+        shared_memory::cleanup_process(parent, pml4);
+        parent_proc.elf_alloc.take();
+        parent_proc.stack_alloc.take();
+        parent_proc.loaded_libs.clear();
+        parent_proc.mmap_regions.clear();
+        crate::arch::paging::free_user_page_tables(pml4);
+        parent_proc.cr3 = 0;
+        parent_proc.state = ProcessState::Zombie(code);
+        let name = core::str::from_utf8(&parent_proc.name).unwrap_or("?").trim_end_matches('\0');
+        log!("exit_group: {name} pid={parent} code={code}");
+
+        // Wake grandparent if blocked on waitpid for parent
+        if let Kind::Process { parent: grandparent } = table.procs.get(parent).unwrap().kind {
+            if let Some(gp) = grandparent.and_then(|gp| table.procs.get_mut(gp)) {
+                if let ProcessState::BlockedWaitPid(child) = gp.state {
+                    if child == parent {
+                        gp.state = ProcessState::Ready;
+                    }
+                }
+            }
+        }
+
+        if let Some(names) = NAME_REGISTRY.lock().as_mut() {
+            names.retain(|_, &mut v| v != parent);
+        }
+
+        scheduler::schedule_no_return_locked(guard);
+    }
+    drop(guard);
+    // If we're already a process (not a thread), just do a normal exit
+    exit(code);
+}
+
 /// Exit the current process.
 pub fn exit(code: i32) -> ! {
     // No scoped block — we hold the lock through schedule_no_return_locked()

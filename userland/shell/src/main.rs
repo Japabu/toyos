@@ -39,6 +39,7 @@ fn main() {
             match cmd.as_str() {
                 "help" => print_help(),
                 "clear" => print!("\x1b[2J\x1b[H"),
+                "exit" => std::process::exit(0),
                 "cd" => cmd_cd(&arg),
                 "run" => cmd_run(&arg, redirect.as_deref()),
                 _ => cmd_exec(&cmd, &arg, redirect.as_deref()),

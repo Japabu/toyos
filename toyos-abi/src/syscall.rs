@@ -67,6 +67,7 @@ pub const SYS_PIPE_OPEN: u64 = 68;
 pub const SYS_PIPE_WITH_CAPACITY: u64 = 69;
 pub const SYS_PIPE_ID: u64 = 70;
 pub const SYS_AUDIO_WRITE: u64 = 71;
+pub const SYS_EXIT_GROUP: u64 = 72;
 
 pub const WNOHANG: u64 = 1;
 
@@ -329,6 +330,12 @@ pub fn realloc(ptr: *mut u8, size: usize, align: usize, new_size: usize) -> *mut
 /// Exit the process with `code`. Does not return.
 pub fn exit(code: i32) -> ! {
     loop { syscall(SYS_EXIT, code as u64, 0, 0, 0); }
+}
+
+/// Exit the entire process (all threads) with `code`. Does not return.
+/// Like Linux's exit_group — if called from a thread, kills the parent process too.
+pub fn exit_group(code: i32) -> ! {
+    loop { syscall(SYS_EXIT_GROUP, code as u64, 0, 0, 0); }
 }
 
 /// Create a pipe. Returns the read and write file descriptors.

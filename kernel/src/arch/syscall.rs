@@ -285,6 +285,7 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             crate::audio::write_samples(buf);
             0
         }
+        SYS_EXIT_GROUP => sys_exit_group(a1 as i32),
         _ => SyscallError::InvalidArgument.to_u64(),
     }
 }
@@ -388,6 +389,10 @@ fn sys_close(fd_num: u64) -> u64 {
 
 fn sys_exit(code: i32) -> u64 {
     process::exit(code);
+}
+
+fn sys_exit_group(code: i32) -> u64 {
+    process::exit_group(code);
 }
 
 fn sys_random(buf: &mut [u8]) -> u64 {
