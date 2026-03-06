@@ -101,10 +101,32 @@ fn main() {
         let config = Arc::new(config);
 
         println!("sshd: starting server on 0.0.0.0:22...");
-        let mut server = SshServer;
-        server
-            .run_on_address(config, ("0.0.0.0", 22))
-            .await
-            .unwrap();
+        let listener = tokio::net::TcpListener::bind("0.0.0.0:22").await.unwrap();
+        println!("sshd: bound, waiting for connections...");
+        loop {
+            match listener.accept().await {
+                Ok((stream, addr)) => {
+                    println!("sshd: accepted connection from {}", addr);
+                    let config = config.clone();
+                    let handler = SshServer.new_client(Some(addr));
+                    tokio::spawn(async move {
+                        match russh::server::run_stream(config, stream, handler).await {
+                            Ok(session) => {
+                                println!("sshd: session started for {}", addr);
+                                if let Err(e) = session.await {
+                                    println!("sshd: session error: {:?}", e);
+                                }
+                            }
+                            Err(e) => {
+                                println!("sshd: run_stream error: {:?}", e);
+                            }
+                        }
+                    });
+                }
+                Err(e) => {
+                    println!("sshd: accept error: {:?}", e);
+                }
+            }
+        }
     });
 }
