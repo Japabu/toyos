@@ -102,6 +102,7 @@ pub enum ProcessState {
     BlockedRecvMsg,
     BlockedNetRecv { deadline: u64 },
     BlockedSleep { deadline: u64 },
+    BlockedFutex { addr: u64, deadline: u64 },
     Zombie(i32),
 }
 
@@ -149,6 +150,14 @@ pub struct Process {
     pub name: [u8; 28],
     // Dynamically loaded shared libraries (indexed by dlopen handle)
     pub loaded_libs: Vec<elf::LoadedLib>,
+    // Anonymous memory mappings (mmap)
+    pub mmap_regions: Vec<MmapRegion>,
+}
+
+pub struct MmapRegion {
+    pub addr: u64,
+    pub size: usize,
+    pub alloc: OwnedAlloc,
 }
 
 pub struct ProcessTable {
@@ -388,6 +397,7 @@ pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64) -> Option<u32> {
         symbols: ProcessSymbols::empty(),
         name: [0; 28],
         loaded_libs: Vec::new(),
+        mmap_regions: Vec::new(),
     });
     table.procs.get_mut(tid).unwrap().pid = tid;
 
@@ -577,6 +587,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<u32>) -> Option<u32> {
         symbols: syms,
         name: make_name(path),
         loaded_libs,
+        mmap_regions: Vec::new(),
     });
     let p = table.procs.get_mut(pid).unwrap();
     p.pid = pid;
@@ -675,6 +686,7 @@ pub fn exit(code: i32) -> ! {
             proc.elf_alloc.take();
             proc.stack_alloc.take();
             proc.loaded_libs.clear();
+            proc.mmap_regions.clear();
             paging::free_user_page_tables(pml4);
             proc.cr3 = 0;
         }
@@ -739,6 +751,53 @@ pub fn send_message(target_pid: u32, msg: crate::message::Message) -> bool {
     } else {
         false
     }
+}
+
+/// Atomically check a user futex word and block if it matches the expected value.
+/// Returns 0 if woken normally, 1 if timed out (handled by idle_poll), u64::MAX on error.
+/// The check-and-block is atomic w.r.t. futex_wake because both hold the process table lock.
+pub fn futex_wait(addr: u64, expected: u32, timeout_ns: u64) -> u64 {
+    let deadline = if timeout_ns != u64::MAX {
+        crate::clock::nanos_since_boot().saturating_add(timeout_ns)
+    } else {
+        0
+    };
+    let mut guard = PROCESS_TABLE.lock();
+    let table = guard.as_mut().expect("process table not initialized");
+    let pid = percpu::current_pid();
+    let proc = table.procs.get_mut(pid).unwrap();
+
+    // Atomic check: read the user value under the lock
+    let current = unsafe { core::ptr::read_volatile(addr as *const u32) };
+    if current != expected {
+        return 0;
+    }
+
+    proc.state = ProcessState::BlockedFutex { addr, deadline };
+    // Pass the held lock to the scheduler so it can context-switch atomically
+    scheduler::schedule_already_blocked(guard);
+    0
+}
+
+/// Wake up to `count` threads blocked on `addr` in the same address space as the caller.
+pub fn futex_wake(addr: u64, count: u64) -> u64 {
+    let mut guard = PROCESS_TABLE.lock();
+    let table = guard.as_mut().expect("process table not initialized");
+    let pid = percpu::current_pid();
+    let caller_cr3 = table.procs.get(pid).map_or(0, |p| p.cr3);
+    let mut woken = 0u64;
+    for (_, proc) in table.procs.iter_mut() {
+        if woken >= count { break; }
+        if proc.cr3 == caller_cr3 {
+            if let ProcessState::BlockedFutex { addr: a, .. } = proc.state {
+                if a == addr {
+                    proc.state = ProcessState::Ready;
+                    woken += 1;
+                }
+            }
+        }
+    }
+    woken
 }
 
 /// Wake processes blocked on reading from a pipe that now has data.
@@ -820,6 +879,76 @@ pub fn is_valid_user_addr(addr: u64) -> bool {
         Some(proc) => proc.symbols.is_valid_user_addr(addr),
         None => false,
     }
+}
+
+/// Kill a child process. Only the parent can kill its children.
+/// Returns 0 on success, error code on failure.
+pub fn kill_process(target_pid: u32) -> u64 {
+    use toyos_abi::syscall::SyscallError;
+    let caller = percpu::current_pid();
+    let mut guard = PROCESS_TABLE.lock();
+    let table = guard.as_mut().expect("process table not initialized");
+
+    let Some(proc) = table.procs.get(target_pid) else { return SyscallError::NotFound.to_u64() };
+
+    // Only allow killing our own children
+    if !matches!(proc.kind, Kind::Process { parent: Some(ppid) } if ppid == caller) {
+        return SyscallError::PermissionDenied.to_u64();
+    }
+    // Can't kill a process currently Running on another CPU
+    if proc.state == ProcessState::Running {
+        return SyscallError::WouldBlock.to_u64();
+    }
+    // Already a zombie — nothing to do
+    if matches!(proc.state, ProcessState::Zombie(_)) {
+        return 0;
+    }
+
+    // Clean up the target's resources
+    let proc = table.procs.get_mut(target_pid).unwrap();
+    fd::close_all(&mut proc.fds, &mut *vfs::lock(), target_pid);
+    proc.tls_alloc.take();
+
+    // Kill child threads of the target
+    let child_tids: alloc::vec::Vec<u32> = table.procs.iter()
+        .filter(|(tid, p)| *tid != target_pid && matches!(p.kind, Kind::Thread { parent } if parent == target_pid))
+        .map(|(tid, _)| tid)
+        .collect();
+    for tid in &child_tids {
+        let child = table.procs.get_mut(*tid).unwrap();
+        child.tls_alloc.take();
+        child.state = ProcessState::Zombie(-1);
+    }
+
+    let proc = table.procs.get_mut(target_pid).unwrap();
+    let pml4 = proc.cr3 as *mut u64;
+    shared_memory::cleanup_process(target_pid, pml4);
+    proc.elf_alloc.take();
+    proc.stack_alloc.take();
+    proc.loaded_libs.clear();
+    proc.mmap_regions.clear();
+    paging::free_user_page_tables(pml4);
+    proc.cr3 = 0;
+
+    proc.state = ProcessState::Zombie(137); // 128 + 9 (SIGKILL-like)
+    let name = core::str::from_utf8(&proc.name).unwrap_or("?").trim_end_matches('\0');
+    log!("kill: {name} pid={target_pid}");
+
+    // Unregister name
+    if let Some(names) = NAME_REGISTRY.lock().as_mut() {
+        names.retain(|_, &mut v| v != target_pid);
+    }
+
+    // Wake parent if blocked on waitpid for this process
+    if let Some(parent) = table.procs.get_mut(caller) {
+        if let ProcessState::BlockedWaitPid(child) = parent.state {
+            if child == target_pid {
+                parent.state = ProcessState::Ready;
+            }
+        }
+    }
+
+    0
 }
 
 /// AP entry into the scheduler. Called from smp::ap_entry after SMP_READY.

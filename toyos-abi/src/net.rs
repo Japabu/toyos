@@ -13,6 +13,9 @@ pub const MSG_UDP_CLOSE: u32 = 11;
 pub const MSG_DNS_LOOKUP: u32 = 12;
 pub const MSG_TCP_SET_OPTION: u32 = 13;
 pub const MSG_TCP_GET_OPTION: u32 = 14;
+pub const MSG_TCP_CONNECT_PIPED: u32 = 20;
+pub const MSG_TCP_BIND_PIPED: u32 = 21;
+pub const MSG_TCP_ACCEPT_PIPED: u32 = 22;
 
 // netd -> client
 pub const MSG_RESULT: u32 = 128;
@@ -133,6 +136,47 @@ pub struct SocketOptionRequest {
 #[derive(Clone, Copy)]
 pub struct SocketOptionResponse {
     pub value: u32,
+}
+
+// --- Piped socket types ---
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct TcpConnectPipedRequest {
+    pub addr: [u8; 4],
+    pub port: u16,
+    pub _pad: u16,
+    pub timeout_ms: u32,
+    pub _pad2: u32,
+    pub rx_pipe_id: u64,
+    pub tx_pipe_id: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct TcpBindPipedRequest {
+    pub addr: [u8; 4],
+    pub port: u16,
+    pub _pad: u16,
+    pub notify_pipe_id: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct TcpAcceptPipedRequest {
+    pub socket_id: u32,
+    pub _pad: u32,
+    pub rx_pipe_id: u64,
+    pub tx_pipe_id: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct TcpAcceptPipedResponse {
+    pub socket_id: u32,
+    pub remote_addr: [u8; 4],
+    pub remote_port: u16,
+    pub local_port: u16,
 }
 
 #[repr(C)]

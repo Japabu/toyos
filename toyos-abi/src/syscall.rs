@@ -53,6 +53,214 @@ pub const SYS_RMDIR: u64 = 54;
 pub const SYS_DLOPEN: u64 = 55;
 pub const SYS_DLSYM: u64 = 56;
 pub const SYS_DLCLOSE: u64 = 57;
+pub const SYS_FUTEX_WAIT: u64 = 58;
+pub const SYS_FUTEX_WAKE: u64 = 59;
+pub const SYS_FTRUNCATE: u64 = 60;
+pub const SYS_STACK_INFO: u64 = 61;
+pub const SYS_CPU_COUNT: u64 = 62;
+pub const SYS_MMAP: u64 = 63;
+pub const SYS_MUNMAP: u64 = 64;
+pub const SYS_KILL: u64 = 65;
+pub const SYS_READ_NONBLOCK: u64 = 66;
+pub const SYS_WRITE_NONBLOCK: u64 = 67;
+pub const SYS_PIPE_OPEN: u64 = 68;
+pub const SYS_PIPE_WITH_CAPACITY: u64 = 69;
+pub const SYS_PIPE_ID: u64 = 70;
+
+pub const WNOHANG: u64 = 1;
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+/// A file descriptor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Fd(pub u64);
+
+/// A process ID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Pid(pub u32);
+
+/// Syscall error with a specific code. Values occupy the top of the u64 range:
+/// error code N is encoded as `u64::MAX - N`. Any return value `>= u64::MAX - 255`
+/// is an error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u64)]
+pub enum SyscallError {
+    Unknown = 0,
+    NotFound = 1,
+    PermissionDenied = 2,
+    AlreadyExists = 3,
+    InvalidArgument = 4,
+    BadAddress = 5,
+    WouldBlock = 6,
+}
+
+impl SyscallError {
+    pub const fn to_u64(self) -> u64 {
+        u64::MAX - self as u64
+    }
+
+    pub fn from_u64(val: u64) -> Option<Self> {
+        if val < u64::MAX - 255 {
+            return None;
+        }
+        let code = u64::MAX - val;
+        match code {
+            0 => Some(Self::Unknown),
+            1 => Some(Self::NotFound),
+            2 => Some(Self::PermissionDenied),
+            3 => Some(Self::AlreadyExists),
+            4 => Some(Self::InvalidArgument),
+            5 => Some(Self::BadAddress),
+            6 => Some(Self::WouldBlock),
+            _ => Some(Self::Unknown),
+        }
+    }
+}
+
+impl core::fmt::Display for SyscallError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Unknown => f.write_str("unknown error"),
+            Self::NotFound => f.write_str("not found"),
+            Self::PermissionDenied => f.write_str("permission denied"),
+            Self::AlreadyExists => f.write_str("already exists"),
+            Self::InvalidArgument => f.write_str("invalid argument"),
+            Self::BadAddress => f.write_str("bad address"),
+            Self::WouldBlock => f.write_str("would block"),
+        }
+    }
+}
+
+/// Check a raw syscall return value: if it's an error, return Err; otherwise Ok(val).
+fn check(val: u64) -> Result<u64, SyscallError> {
+    match SyscallError::from_u64(val) {
+        Some(e) => Err(e),
+        None => Ok(val),
+    }
+}
+
+/// Check a raw syscall return for success (0) or error.
+fn check_unit(val: u64) -> Result<(), SyscallError> {
+    check(val).map(|_| ())
+}
+
+/// File type for file descriptors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u64)]
+pub enum FileType {
+    #[default]
+    Unknown = 0,
+    File = 1,
+    Pipe = 2,
+    Keyboard = 3,
+    Serial = 4,
+    Framebuffer = 5,
+    Tty = 6,
+    Mouse = 7,
+}
+
+impl FileType {
+    pub fn from_u64(val: u64) -> Option<Self> {
+        match val {
+            0 => Some(Self::Unknown),
+            1 => Some(Self::File),
+            2 => Some(Self::Pipe),
+            3 => Some(Self::Keyboard),
+            4 => Some(Self::Serial),
+            5 => Some(Self::Framebuffer),
+            6 => Some(Self::Tty),
+            7 => Some(Self::Mouse),
+            _ => None,
+        }
+    }
+}
+
+/// Seek position for [`seek`].
+pub enum SeekFrom {
+    Start(u64),
+    Current(i64),
+    End(i64),
+}
+
+/// Flags for [`open`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpenFlags(pub u64);
+
+impl OpenFlags {
+    pub const READ: Self = Self(1);
+    pub const WRITE: Self = Self(2);
+    pub const CREATE: Self = Self(4);
+    pub const TRUNCATE: Self = Self(8);
+}
+
+impl core::ops::BitOr for OpenFlags {
+    type Output = Self;
+    fn bitor(self, rhs: Self) -> Self { Self(self.0 | rhs.0) }
+}
+
+impl core::ops::BitOrAssign for OpenFlags {
+    fn bitor_assign(&mut self, rhs: Self) { self.0 |= rhs.0; }
+}
+
+/// Memory protection flags for [`mmap`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MmapProt(pub u64);
+
+impl MmapProt {
+    pub const NONE: Self = Self(0);
+    pub const READ: Self = Self(1);
+    pub const WRITE: Self = Self(2);
+}
+
+impl core::ops::BitOr for MmapProt {
+    type Output = Self;
+    fn bitor(self, rhs: Self) -> Self { Self(self.0 | rhs.0) }
+}
+
+/// Memory mapping flags for [`mmap`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MmapFlags(pub u64);
+
+impl MmapFlags {
+    pub const ANONYMOUS: Self = Self(1);
+    pub const PRIVATE: Self = Self(2);
+}
+
+impl core::ops::BitOr for MmapFlags {
+    type Output = Self;
+    fn bitor(self, rhs: Self) -> Self { Self(self.0 | rhs.0) }
+}
+
+/// Result of [`pipe`]: the read and write ends.
+#[derive(Debug, Clone, Copy)]
+pub struct PipeFds {
+    pub read: Fd,
+    pub write: Fd,
+}
+
+/// Wall-clock time from RTC.
+#[derive(Debug, Clone, Copy)]
+pub struct RealTime {
+    pub hours: u8,
+    pub minutes: u8,
+    pub seconds: u8,
+}
+
+/// File metadata returned by [`fstat`].
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Stat {
+    pub file_type: FileType,
+    pub size: u64,
+    /// Last modification time (nanoseconds since boot).
+    pub mtime: u64,
+}
+
+// ---------------------------------------------------------------------------
+// Raw syscall
+// ---------------------------------------------------------------------------
 
 #[inline(always)]
 fn syscall(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
@@ -73,25 +281,29 @@ fn syscall(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
     ret
 }
 
+/// Encode an optional timeout for the kernel ABI.
+/// `None` = wait forever (u64::MAX), `Some(n)` = timeout after `n` nanoseconds.
+fn encode_timeout(timeout: Option<u64>) -> u64 {
+    match timeout {
+        None => u64::MAX,
+        Some(n) => n,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Wrappers
 // ---------------------------------------------------------------------------
 
 // --- I/O ---
 
-/// Write `len` bytes from `buf` to file descriptor `fd`. Returns bytes written.
-pub fn write(fd: u64, buf: *const u8, len: usize) -> u64 {
-    syscall(SYS_WRITE, fd, buf as u64, len as u64, 0)
+/// Write bytes to a file descriptor. Returns number of bytes written.
+pub fn write(fd: Fd, buf: &[u8]) -> Result<usize, SyscallError> {
+    check(syscall(SYS_WRITE, fd.0, buf.as_ptr() as u64, buf.len() as u64, 0)).map(|n| n as usize)
 }
 
-/// Read up to `len` bytes from file descriptor `fd` into `buf`. Returns bytes read.
-pub fn read(fd: u64, buf: *mut u8, len: usize) -> u64 {
-    syscall(SYS_READ, fd, buf as u64, len as u64, 0)
-}
-
-/// Read from a file descriptor into a slice. Returns bytes read.
-pub fn read_fd(fd: u64, buf: &mut [u8]) -> usize {
-    syscall(SYS_READ, fd, buf.as_mut_ptr() as u64, buf.len() as u64, 0) as usize
+/// Read bytes from a file descriptor. Returns number of bytes read.
+pub fn read(fd: Fd, buf: &mut [u8]) -> Result<usize, SyscallError> {
+    check(syscall(SYS_READ, fd.0, buf.as_mut_ptr() as u64, buf.len() as u64, 0)).map(|n| n as usize)
 }
 
 // --- Memory ---
@@ -118,24 +330,35 @@ pub fn exit(code: i32) -> ! {
     loop { syscall(SYS_EXIT, code as u64, 0, 0, 0); }
 }
 
-/// Create a pipe. Returns packed (read_fd, write_fd) as u64.
-pub fn pipe() -> u64 {
-    syscall(SYS_PIPE, 0, 0, 0, 0)
+/// Create a pipe. Returns the read and write file descriptors.
+pub fn pipe() -> PipeFds {
+    let raw = syscall(SYS_PIPE, 0, 0, 0, 0);
+    PipeFds {
+        read: Fd(raw >> 32),
+        write: Fd(raw & 0xFFFF_FFFF),
+    }
 }
 
-/// Spawn a new process. Returns pid on success, u64::MAX on failure.
-pub fn spawn(argv: *const u8, len: usize, fd_map: *const [u32; 2], fd_map_count: usize) -> u64 {
-    syscall(SYS_SPAWN, argv as u64, len as u64, fd_map as u64, fd_map_count as u64)
+/// Spawn a new process.
+pub fn spawn(argv: &[u8], fd_map: &[[u32; 2]]) -> Result<Pid, SyscallError> {
+    check(syscall(SYS_SPAWN, argv.as_ptr() as u64, argv.len() as u64, fd_map.as_ptr() as u64, fd_map.len() as u64))
+        .map(|pid| Pid(pid as u32))
 }
 
-/// Wait for process `pid` to exit. Returns exit code.
-pub fn waitpid(pid: u64) -> u64 {
-    syscall(SYS_WAITPID, pid, 0, 0, 0)
+/// Wait for process to exit. Returns exit code (blocking).
+pub fn waitpid(pid: Pid) -> u64 {
+    syscall(SYS_WAITPID, pid.0 as u64, 0, 0, 0)
 }
 
-/// Mark file descriptor `fd` as the controlling TTY for this process.
-pub fn mark_tty(fd: u64) -> u64 {
-    syscall(SYS_MARK_TTY, fd, 0, 0, 0)
+/// Wait for process with flags. Returns exit code, or `Err(WouldBlock)` with WNOHANG
+/// if the child has not exited yet.
+pub fn waitpid_flags(pid: Pid, flags: u64) -> Result<u64, SyscallError> {
+    check(syscall(SYS_WAITPID, pid.0 as u64, flags, 0, 0))
+}
+
+/// Mark file descriptor as the controlling TTY for this process.
+pub fn mark_tty(fd: Fd) {
+    syscall(SYS_MARK_TTY, fd.0, 0, 0, 0);
 }
 
 // --- Threads ---
@@ -164,61 +387,58 @@ pub fn recv_msg(msg_ptr: u64) -> u64 {
 
 // --- Filesystem ---
 
-/// Open a file. Returns fd on success, u64::MAX on failure.
-pub fn open(path: *const u8, path_len: usize, flags: u64) -> u64 {
-    syscall(SYS_OPEN, path as u64, path_len as u64, flags, 0)
+/// Open a file.
+pub fn open(path: &[u8], flags: OpenFlags) -> Result<Fd, SyscallError> {
+    check(syscall(SYS_OPEN, path.as_ptr() as u64, path.len() as u64, flags.0, 0)).map(Fd)
 }
 
 /// Close a file descriptor.
-pub fn close(fd: u64) -> u64 {
-    syscall(SYS_CLOSE, fd, 0, 0, 0)
+pub fn close(fd: Fd) {
+    syscall(SYS_CLOSE, fd.0, 0, 0, 0);
 }
 
 /// Seek within a file descriptor. Returns new offset.
-pub fn seek(fd: u64, offset: i64, whence: u64) -> u64 {
-    syscall(SYS_SEEK, fd, offset as u64, whence, 0)
+pub fn seek(fd: Fd, pos: SeekFrom) -> Result<u64, SyscallError> {
+    let (offset, whence) = match pos {
+        SeekFrom::Start(n) => (n as i64, 0u64),
+        SeekFrom::Current(n) => (n, 1u64),
+        SeekFrom::End(n) => (n, 2u64),
+    };
+    check(syscall(SYS_SEEK, fd.0, offset as u64, whence, 0))
 }
 
-/// File metadata returned by [`fstat`].
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Stat {
-    /// File type: 1=file, 2=pipe, 3=keyboard, 4=serial, 5=framebuffer, 6=tty, 7=mouse.
-    pub file_type: u64,
-    /// File size in bytes.
-    pub size: u64,
-    /// Last modification time (nanoseconds since boot).
-    pub mtime: u64,
-}
-
-/// Get file metadata for a file descriptor. Returns 0 on success, u64::MAX on failure.
-pub fn fstat(fd: u64, stat: &mut Stat) -> u64 {
-    syscall(SYS_FSTAT, fd, stat as *mut Stat as u64, 0, 0)
+/// Get file metadata for a file descriptor.
+pub fn fstat(fd: Fd) -> Result<Stat, SyscallError> {
+    let mut stat = Stat { file_type: FileType::Unknown, size: 0, mtime: 0 };
+    check_unit(syscall(SYS_FSTAT, fd.0, &mut stat as *mut Stat as u64, 0, 0))?;
+    Ok(stat)
 }
 
 /// Flush file descriptor to disk.
-pub fn fsync(fd: u64) -> u64 {
-    syscall(SYS_FSYNC, fd, 0, 0, 0)
+pub fn fsync(fd: Fd) -> Result<(), SyscallError> {
+    check_unit(syscall(SYS_FSYNC, fd.0, 0, 0, 0))
 }
 
 /// Read directory entries. Returns bytes written to `buf`.
-pub fn readdir(path: *const u8, path_len: usize, buf: *mut u8, buf_len: usize) -> u64 {
-    syscall(SYS_READDIR, path as u64, path_len as u64, buf as u64, buf_len as u64)
+pub fn readdir(path: &[u8], buf: &mut [u8]) -> usize {
+    let n = syscall(SYS_READDIR, path.as_ptr() as u64, path.len() as u64, buf.as_mut_ptr() as u64, buf.len() as u64);
+    if SyscallError::from_u64(n).is_some() { 0 } else { n as usize }
 }
 
 /// Delete a file or directory.
-pub fn delete(path: *const u8, path_len: usize) -> u64 {
-    syscall(SYS_DELETE, path as u64, path_len as u64, 0, 0)
+pub fn delete(path: &[u8]) -> Result<(), SyscallError> {
+    check_unit(syscall(SYS_DELETE, path.as_ptr() as u64, path.len() as u64, 0, 0))
 }
 
 /// Change current working directory.
-pub fn chdir(path: *const u8, path_len: usize) -> u64 {
-    syscall(SYS_CHDIR, path as u64, path_len as u64, 0, 0)
+pub fn chdir(path: &[u8]) -> Result<(), SyscallError> {
+    check_unit(syscall(SYS_CHDIR, path.as_ptr() as u64, path.len() as u64, 0, 0))
 }
 
 /// Get current working directory. Returns bytes written to `buf`.
-pub fn getcwd(buf: *mut u8, buf_len: usize) -> u64 {
-    syscall(SYS_GETCWD, buf as u64, buf_len as u64, 0, 0)
+pub fn getcwd(buf: &mut [u8]) -> usize {
+    let n = syscall(SYS_GETCWD, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0);
+    if SyscallError::from_u64(n).is_some() { 0 } else { n as usize }
 }
 
 // --- Random ---
@@ -236,9 +456,13 @@ pub fn clock_nanos() -> u64 {
 }
 
 /// Read wall-clock time from RTC.
-/// Returns packed: (hours << 16) | (minutes << 8) | seconds.
-pub fn clock_realtime() -> u64 {
-    syscall(SYS_CLOCK_REALTIME, 0, 0, 0, 0)
+pub fn clock_realtime() -> RealTime {
+    let raw = syscall(SYS_CLOCK_REALTIME, 0, 0, 0, 0);
+    RealTime {
+        hours: ((raw >> 16) & 0xFF) as u8,
+        minutes: ((raw >> 8) & 0xFF) as u8,
+        seconds: (raw & 0xFF) as u8,
+    }
 }
 
 // --- Screen / GPU ---
@@ -250,7 +474,6 @@ pub fn screen_size() -> (usize, usize) {
 }
 
 /// Set the screen size from pixel dimensions (width, height).
-/// The kernel computes rows/columns assuming an 8x16 font.
 pub fn set_screen_size(width: u32, height: u32) {
     syscall(SYS_SET_SCREEN_SIZE, width as u64, height as u64, 0, 0);
 }
@@ -284,6 +507,11 @@ pub fn shutdown() -> ! {
 
 // --- Poll ---
 
+/// Poll interest flags — encode in the high bits of each fd entry passed to poll.
+/// If neither bit is set, defaults to read interest.
+pub const POLL_READABLE: u64 = 1 << 62;
+pub const POLL_WRITABLE: u64 = 1 << 63;
+
 /// Result of a [`poll`] or [`poll_timeout`] call.
 pub struct PollResult {
     mask: u64,
@@ -304,15 +532,14 @@ impl PollResult {
 
 /// Poll file descriptors and the message queue for readiness.
 /// Blocks until at least one source has data.
-pub fn poll(fds: &[u64]) -> PollResult {
-    poll_timeout(fds, 0)
+pub fn poll(fds: &[Fd]) -> PollResult {
+    poll_timeout(fds, None)
 }
 
 /// Poll file descriptors and the message queue for readiness.
-/// Returns when at least one source has data, or after `timeout_nanos`
-/// nanoseconds (whichever comes first). Pass 0 to block indefinitely.
-pub fn poll_timeout(fds: &[u64], timeout_nanos: u64) -> PollResult {
-    let mask = syscall(SYS_POLL, fds.as_ptr() as u64, fds.len() as u64, timeout_nanos, 0);
+/// `None` = block forever, `Some(nanos)` = timeout after `nanos` nanoseconds.
+pub fn poll_timeout(fds: &[Fd], timeout: Option<u64>) -> PollResult {
+    let mask = syscall(SYS_POLL, fds.as_ptr() as u64, fds.len() as u64, encode_timeout(timeout), 0);
     PollResult { mask, fd_count: fds.len() }
 }
 
@@ -327,65 +554,47 @@ pub enum DeviceType {
     Framebuffer = 2,
 }
 
-/// Claim exclusive access to a device. Returns the FD number on success.
-/// Fails if the device is already claimed by another process.
-pub fn open_device(device: DeviceType) -> Option<u64> {
-    let fd = syscall(SYS_OPEN_DEVICE, device as u64, 0, 0, 0);
-    if fd == u64::MAX { None } else { Some(fd) }
+/// Claim exclusive access to a device.
+pub fn open_device(device: DeviceType) -> Result<Fd, SyscallError> {
+    check(syscall(SYS_OPEN_DEVICE, device as u64, 0, 0, 0)).map(Fd)
 }
 
 // --- Name registry ---
 
-/// Error returned when [`register_name`] fails because the name is already registered.
-#[derive(Debug)]
-pub struct NameTaken;
-
-impl core::fmt::Display for NameTaken {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("name already registered")
-    }
-}
-
 /// Register the current process under the given name.
-/// Fails if the name is already taken by another process.
-/// Other processes can discover this process via [`find_pid`].
-pub fn register_name(name: &str) -> Result<(), NameTaken> {
-    let result = syscall(SYS_REGISTER_NAME, name.as_ptr() as u64, name.len() as u64, 0, 0);
-    if result == 0 { Ok(()) } else { Err(NameTaken) }
+pub fn register_name(name: &str) -> Result<(), SyscallError> {
+    check_unit(syscall(SYS_REGISTER_NAME, name.as_ptr() as u64, name.len() as u64, 0, 0))
 }
 
 /// Find the PID of a process registered under the given name.
-pub fn find_pid(name: &str) -> Option<u32> {
+pub fn find_pid(name: &str) -> Option<Pid> {
     let pid = syscall(SYS_FIND_PID, name.as_ptr() as u64, name.len() as u64, 0, 0);
-    if pid == u64::MAX { None } else { Some(pid as u32) }
+    if SyscallError::from_u64(pid).is_some() { None } else { Some(Pid(pid as u32)) }
 }
 
 // --- Shared memory ---
 
 /// Allocate a 2MB-aligned shared memory region. Returns an opaque token.
-/// The region is mapped into the caller's address space automatically.
 pub fn alloc_shared(size: usize) -> u32 {
     let token = syscall(SYS_ALLOC_SHARED, size as u64, 0, 0, 0);
-    assert!(token != u64::MAX, "alloc_shared failed");
+    assert!(SyscallError::from_u64(token).is_none(), "alloc_shared failed");
     token as u32
 }
 
 /// Grant another process permission to map a shared memory region.
-pub fn grant_shared(token: u32, target_pid: u32) {
-    let result = syscall(SYS_GRANT_SHARED, token as u64, target_pid as u64, 0, 0);
+pub fn grant_shared(token: u32, target_pid: Pid) {
+    let result = syscall(SYS_GRANT_SHARED, token as u64, target_pid.0 as u64, 0, 0);
     assert_eq!(result, 0, "grant_shared failed");
 }
 
 /// Map a shared memory region into this process's address space.
-/// Returns a pointer to the mapped memory.
 pub fn map_shared(token: u32) -> *mut u8 {
     let addr = syscall(SYS_MAP_SHARED, token as u64, 0, 0, 0);
-    assert!(addr != u64::MAX, "map_shared failed");
+    assert!(SyscallError::from_u64(addr).is_none(), "map_shared failed");
     core::ptr::with_exposed_provenance_mut(addr as usize)
 }
 
 /// Release this process's mapping of a shared memory region.
-/// Unmaps only from the caller's address space. Deallocates when no mappings remain.
 pub fn release_shared(token: u32) {
     let result = syscall(SYS_RELEASE_SHARED, token as u64, 0, 0, 0);
     assert_eq!(result, 0, "release_shared failed");
@@ -394,21 +603,19 @@ pub fn release_shared(token: u32) {
 // --- System info ---
 
 /// Query system information (memory, CPUs, processes).
-/// Fills `buf` with a header followed by per-process entries.
-/// Returns the number of bytes written.
+/// Returns the number of bytes written to `buf`.
 pub fn sysinfo(buf: &mut [u8]) -> usize {
     let n = syscall(SYS_SYSINFO, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0);
-    if n == u64::MAX { 0 } else { n as usize }
+    if SyscallError::from_u64(n).is_some() { 0 } else { n as usize }
 }
 
 // --- Networking ---
 
 /// Get the MAC address of the network interface.
-/// Returns `None` if no NIC is present.
 pub fn net_mac() -> Option<[u8; 6]> {
     let mut buf = [0u8; 6];
     let r = syscall(SYS_NET_INFO, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0);
-    if r == u64::MAX { None } else { Some(buf) }
+    if SyscallError::from_u64(r).is_some() { None } else { Some(buf) }
 }
 
 /// Send a raw Ethernet frame.
@@ -417,15 +624,14 @@ pub fn net_send(frame: &[u8]) {
 }
 
 /// Receive a raw Ethernet frame. Blocks until a frame arrives.
-/// Returns the number of bytes written to `buf`.
 pub fn net_recv(buf: &mut [u8]) -> usize {
-    syscall(SYS_NET_RECV, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0) as usize
+    syscall(SYS_NET_RECV, buf.as_mut_ptr() as u64, buf.len() as u64, encode_timeout(None), 0) as usize
 }
 
 /// Receive a raw Ethernet frame with a timeout.
-/// Returns the number of bytes written, or 0 on timeout.
-pub fn net_recv_timeout(buf: &mut [u8], timeout_nanos: u64) -> usize {
-    syscall(SYS_NET_RECV, buf.as_mut_ptr() as u64, buf.len() as u64, timeout_nanos, 0) as usize
+/// `None` = block forever, `Some(nanos)` = timeout. Returns 0 on timeout.
+pub fn net_recv_timeout(buf: &mut [u8], timeout: Option<u64>) -> usize {
+    syscall(SYS_NET_RECV, buf.as_mut_ptr() as u64, buf.len() as u64, encode_timeout(timeout), 0) as usize
 }
 
 // --- Process / OS ---
@@ -435,44 +641,138 @@ pub fn nanosleep(nanos: u64) {
     syscall(SYS_NANOSLEEP, nanos, 0, 0, 0);
 }
 
-/// Duplicate a file descriptor. Returns the new fd, or u64::MAX on failure.
-pub fn dup(fd: u64) -> u64 {
-    syscall(SYS_DUP, fd, 0, 0, 0)
+/// Duplicate a file descriptor.
+pub fn dup(fd: Fd) -> Result<Fd, SyscallError> {
+    check(syscall(SYS_DUP, fd.0, 0, 0, 0)).map(Fd)
 }
 
 /// Get the current process ID.
-pub fn getpid() -> u64 {
-    syscall(SYS_GETPID, 0, 0, 0, 0)
+pub fn getpid() -> Pid {
+    Pid(syscall(SYS_GETPID, 0, 0, 0, 0) as u32)
 }
 
-/// Rename a file. Returns 0 on success, u64::MAX on failure.
-pub fn rename(old: *const u8, old_len: usize, new: *const u8, new_len: usize) -> u64 {
-    syscall(SYS_RENAME, old as u64, old_len as u64, new as u64, new_len as u64)
+/// Rename a file.
+pub fn rename(old: &[u8], new: &[u8]) -> Result<(), SyscallError> {
+    check_unit(syscall(SYS_RENAME, old.as_ptr() as u64, old.len() as u64, new.as_ptr() as u64, new.len() as u64))
 }
 
-/// Create a directory. Returns 0 on success, u64::MAX on failure.
-pub fn mkdir(path: *const u8, path_len: usize) -> u64 {
-    syscall(SYS_MKDIR, path as u64, path_len as u64, 0, 0)
+/// Create a directory.
+pub fn mkdir(path: &[u8]) -> Result<(), SyscallError> {
+    check_unit(syscall(SYS_MKDIR, path.as_ptr() as u64, path.len() as u64, 0, 0))
 }
 
-/// Remove a directory. Returns 0 on success, u64::MAX on failure.
-pub fn rmdir(path: *const u8, path_len: usize) -> u64 {
-    syscall(SYS_RMDIR, path as u64, path_len as u64, 0, 0)
+/// Remove a directory.
+pub fn rmdir(path: &[u8]) -> Result<(), SyscallError> {
+    check_unit(syscall(SYS_RMDIR, path.as_ptr() as u64, path.len() as u64, 0, 0))
 }
 
 // --- Dynamic linking ---
 
-/// Load a shared library (.so) into the current process. Returns a handle, or u64::MAX on failure.
-pub fn dl_open(path: *const u8, path_len: usize) -> u64 {
-    syscall(SYS_DLOPEN, path as u64, path_len as u64, 0, 0)
+/// Load a shared library (.so) into the current process.
+pub fn dl_open(path: &[u8]) -> Result<u64, SyscallError> {
+    check(syscall(SYS_DLOPEN, path.as_ptr() as u64, path.len() as u64, 0, 0))
 }
 
-/// Look up a symbol in a loaded shared library. Returns the address, or u64::MAX on failure.
-pub fn dl_sym(handle: u64, name: *const u8, name_len: usize) -> u64 {
-    syscall(SYS_DLSYM, handle, name as u64, name_len as u64, 0)
+/// Look up a symbol in a loaded shared library. Returns the address.
+pub fn dl_sym(handle: u64, name: &[u8]) -> Result<u64, SyscallError> {
+    check(syscall(SYS_DLSYM, handle, name.as_ptr() as u64, name.len() as u64, 0))
 }
 
 /// Close a loaded shared library handle.
 pub fn dl_close(handle: u64) -> u64 {
     syscall(SYS_DLCLOSE, handle, 0, 0, 0)
+}
+
+// --- Futex ---
+
+/// Block if `*addr == expected`. Returns 0 on wake, 1 on timeout.
+/// `None` = wait forever, `Some(nanos)` = timeout.
+pub fn futex_wait(addr: *const u32, expected: u32, timeout: Option<u64>) -> u64 {
+    syscall(SYS_FUTEX_WAIT, addr as u64, expected as u64, encode_timeout(timeout), 0)
+}
+
+/// Wake up to `count` threads waiting on `addr`. Returns number of threads woken.
+pub fn futex_wake(addr: *const u32, count: u32) -> u64 {
+    syscall(SYS_FUTEX_WAKE, addr as u64, count as u64, 0, 0)
+}
+
+// --- File truncate ---
+
+/// Truncate file descriptor to `size` bytes.
+pub fn ftruncate(fd: Fd, size: u64) -> Result<(), SyscallError> {
+    check_unit(syscall(SYS_FTRUNCATE, fd.0, size, 0, 0))
+}
+
+// --- Stack info ---
+
+/// Get the current thread's stack base address and size.
+pub fn stack_info() -> Option<(u64, u64)> {
+    let mut base: u64 = 0;
+    let mut size: u64 = 0;
+    let r = syscall(SYS_STACK_INFO, &mut base as *mut u64 as u64, &mut size as *mut u64 as u64, 0, 0);
+    if SyscallError::from_u64(r).is_some() { None } else { Some((base, size)) }
+}
+
+// --- CPU count ---
+
+/// Return the number of available CPUs.
+pub fn cpu_count() -> u32 {
+    syscall(SYS_CPU_COUNT, 0, 0, 0, 0) as u32
+}
+
+// --- Memory mapping ---
+
+/// Map anonymous memory. Returns pointer on success, null on failure.
+pub fn mmap(size: usize, prot: MmapProt, flags: MmapFlags) -> *mut u8 {
+    let addr = syscall(SYS_MMAP, size as u64, prot.0, flags.0, 0);
+    if SyscallError::from_u64(addr).is_some() { core::ptr::null_mut() } else {
+        core::ptr::with_exposed_provenance_mut(addr as usize)
+    }
+}
+
+/// Unmap a previously mapped region.
+pub fn munmap(addr: *mut u8, size: usize) -> Result<(), SyscallError> {
+    check_unit(syscall(SYS_MUNMAP, addr as u64, size as u64, 0, 0))
+}
+
+// --- Kill ---
+
+/// Terminate a child process.
+pub fn kill(pid: Pid) -> Result<(), SyscallError> {
+    check_unit(syscall(SYS_KILL, pid.0 as u64, 0, 0, 0))
+}
+
+// --- Non-blocking I/O ---
+
+/// Non-blocking read. Returns bytes read, or `Err(WouldBlock)` if no data available.
+pub fn read_nonblock(fd: Fd, buf: &mut [u8]) -> Result<usize, SyscallError> {
+    check(syscall(SYS_READ_NONBLOCK, fd.0, buf.as_mut_ptr() as u64, buf.len() as u64, 0)).map(|n| n as usize)
+}
+
+/// Non-blocking write. Returns bytes written, or `Err(WouldBlock)` if no space available.
+pub fn write_nonblock(fd: Fd, buf: &[u8]) -> Result<usize, SyscallError> {
+    check(syscall(SYS_WRITE_NONBLOCK, fd.0, buf.as_ptr() as u64, buf.len() as u64, 0)).map(|n| n as usize)
+}
+
+// --- Pipe operations ---
+
+/// Open an existing pipe by internal ID. `mode`: 0 = read, 1 = write.
+/// Returns a new file descriptor for the pipe.
+pub fn pipe_open(pipe_id: u64, mode: u64) -> Result<Fd, SyscallError> {
+    check(syscall(SYS_PIPE_OPEN, pipe_id, mode, 0, 0)).map(Fd)
+}
+
+/// Create a pipe with a specific buffer capacity. Returns read and write fds.
+pub fn pipe_with_capacity(capacity: usize) -> PipeFds {
+    let raw = syscall(SYS_PIPE_WITH_CAPACITY, capacity as u64, 0, 0, 0);
+    PipeFds {
+        read: Fd(raw >> 32),
+        write: Fd(raw & 0xFFFF_FFFF),
+    }
+}
+
+/// Get the internal pipe ID for a pipe/tty file descriptor.
+/// Used to share pipe access across processes via `pipe_open`.
+pub fn pipe_id(fd: Fd) -> Result<u64, SyscallError> {
+    check(syscall(SYS_PIPE_ID, fd.0, 0, 0, 0))
 }

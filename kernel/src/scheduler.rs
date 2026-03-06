@@ -37,13 +37,25 @@ fn schedule(cur_state: ProcessState) {
 
     // If current process was already removed (e.g. race with exit cleanup),
     // log a warning and fall through to idle — nothing to save.
-    let cur_alive = if let Some(proc) = table.procs.get_mut(cur_pid) {
+    if let Some(proc) = table.procs.get_mut(cur_pid) {
         proc.state = cur_state;
-        true
     } else {
         crate::log!("schedule: warning: cur_pid {cur_pid} not in table, going to idle");
-        false
-    };
+    }
+    schedule_inner(guard);
+}
+
+/// Schedule with a pre-held lock where the caller has already set the process state.
+/// Used by futex_wait to make the value-check + block atomic.
+pub fn schedule_already_blocked(guard: crate::sync::LockGuard<'_, Option<ProcessTable>>) {
+    schedule_inner(guard);
+}
+
+fn schedule_inner(mut guard: crate::sync::LockGuard<'_, Option<ProcessTable>>) {
+    let table = guard.as_mut().expect("process table not initialized");
+    let cur_pid = percpu::current_pid();
+    let cur_alive = table.procs.get(cur_pid).is_some();
+
     idle_poll(table);
 
     // Round-robin: find smallest Ready PID > current, or wrap to smallest Ready PID
@@ -213,8 +225,15 @@ pub fn idle_unlock_and_loop() -> ! {
 }
 
 /// Check whether a BlockedPoll process has any ready FDs.
+/// Poll entries encode interest bits in the high bits (POLL_READABLE=bit62, POLL_WRITABLE=bit63).
 fn poll_has_ready_fd(poll_fds: &[u64; 64], len: u32, fds: &fd::FdTable) -> bool {
-    poll_fds[..len as usize].iter().any(|&fd_num| fd::has_data(fds, fd_num))
+    use toyos_abi::syscall::{POLL_READABLE, POLL_WRITABLE};
+    poll_fds[..len as usize].iter().any(|&entry| {
+        let fd_num = entry & !((1u64 << 63) | (1u64 << 62));
+        let want_write = entry & POLL_WRITABLE != 0;
+        let want_read = entry & POLL_READABLE != 0 || !want_write;
+        (want_read && fd::has_data(fds, fd_num)) || (want_write && fd::has_space(fds, fd_num))
+    })
 }
 
 /// Poll for I/O and wake blocked processes.
@@ -271,6 +290,9 @@ fn idle_poll(table: &mut ProcessTable) {
             ProcessState::BlockedSleep { deadline } if crate::clock::nanos_since_boot() >= deadline => {
                 proc.state = ProcessState::Ready;
             }
+            ProcessState::BlockedFutex { deadline, .. } if deadline > 0 && crate::clock::nanos_since_boot() >= deadline => {
+                proc.state = ProcessState::Ready;
+            }
             _ => {}
         }
     }
@@ -300,8 +322,16 @@ pub fn wake_pipe_writers(pipe_id: usize) {
     let mut guard = PROCESS_TABLE.lock();
     let table = guard.as_mut().expect("process table not initialized");
     for (_, proc) in table.procs.iter_mut() {
-        if proc.state == ProcessState::BlockedPipeWrite(pipe_id) {
-            proc.state = ProcessState::Ready;
+        match proc.state {
+            ProcessState::BlockedPipeWrite(id) if id == pipe_id => {
+                proc.state = ProcessState::Ready;
+            }
+            ProcessState::BlockedPoll { fds: ref poll_fds, len, .. } => {
+                if poll_has_ready_fd(poll_fds, len, &proc.fds) {
+                    proc.state = ProcessState::Ready;
+                }
+            }
+            _ => {}
         }
     }
 }

@@ -3,18 +3,24 @@ use alloc::collections::VecDeque;
 use crate::id_map::IdMap;
 use crate::sync::Lock;
 
-const PIPE_BUF_SIZE: usize = 4096;
+const DEFAULT_PIPE_CAPACITY: usize = 4096;
 
 struct Pipe {
     buffer: VecDeque<u8>,
+    capacity: usize,
     readers: u32,
     writers: u32,
 }
 
 impl Pipe {
     fn new() -> Self {
+        Self::with_capacity(DEFAULT_PIPE_CAPACITY)
+    }
+
+    fn with_capacity(capacity: usize) -> Self {
         Self {
-            buffer: VecDeque::with_capacity(PIPE_BUF_SIZE),
+            buffer: VecDeque::with_capacity(capacity),
+            capacity,
             readers: 1,
             writers: 1,
         }
@@ -25,7 +31,7 @@ impl Pipe {
     }
 
     fn space(&self) -> usize {
-        PIPE_BUF_SIZE - self.buffer.len()
+        self.capacity - self.buffer.len()
     }
 
     fn read(&mut self, buf: &mut [u8]) -> usize {
@@ -61,6 +67,14 @@ pub fn init() {
 
 pub fn create() -> usize {
     with_pipes_mut(|pipes| pipes.insert(Pipe::new()))
+}
+
+pub fn create_with_capacity(capacity: usize) -> usize {
+    with_pipes_mut(|pipes| pipes.insert(Pipe::with_capacity(capacity)))
+}
+
+pub fn exists(pipe_id: usize) -> bool {
+    with_pipes(|pipes| pipes.get(pipe_id).is_some())
 }
 
 /// Returns bytes read, 0 for EOF, None if would block.

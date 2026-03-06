@@ -31,8 +31,7 @@ impl ToyNic {
         if self.pending_rx.is_some() {
             return;
         }
-        // 1ns timeout = effectively non-blocking (syscall overhead > 1ns)
-        let n = syscall::net_recv_timeout(&mut self.rx_buf, 1);
+        let n = syscall::net_recv_timeout(&mut self.rx_buf, Some(0));
         if n > 0 {
             self.pending_rx = Some(n);
         }
@@ -133,6 +132,30 @@ struct PendingDns {
     query: dns::QueryHandle,
 }
 
+/// A piped TCP connection: data flows through kernel pipes instead of IPC messages.
+struct PipedConnection {
+    handle: SocketHandle,
+    rx_write_fd: syscall::Fd, // netd writes received TCP data here
+    tx_read_fd: syscall::Fd,  // netd reads outgoing TCP data from here
+}
+
+/// A piped TCP listener: netd writes 1 byte to notify pipe on new connection.
+struct PipedListener {
+    handle: SocketHandle,
+    #[allow(dead_code)]
+    local_port: u16,
+    notify_write_fd: syscall::Fd,
+}
+
+struct PendingPipedConnect {
+    client_pid: u32,
+    socket_id: u32,
+    handle: SocketHandle,
+    rx_pipe_id: u64,
+    tx_pipe_id: u64,
+    deadline: u64,
+}
+
 struct NetDaemon {
     sockets: HashMap<u32, SocketKind>,
     owners: HashMap<u32, u32>, // socket_id -> owner pid
@@ -144,6 +167,9 @@ struct NetDaemon {
     pending_udp_recvs: Vec<PendingUdpRecv>,
     pending_dns: Vec<PendingDns>,
     dns_handle: SocketHandle,
+    piped_connections: Vec<PipedConnection>,
+    piped_listeners: HashMap<u32, PipedListener>,
+    pending_piped_connects: Vec<PendingPipedConnect>,
 }
 
 impl NetDaemon {
@@ -159,6 +185,9 @@ impl NetDaemon {
             pending_udp_recvs: Vec::new(),
             pending_dns: Vec::new(),
             dns_handle,
+            piped_connections: Vec::new(),
+            piped_listeners: HashMap::new(),
+            pending_piped_connects: Vec::new(),
         }
     }
 
@@ -200,6 +229,9 @@ impl NetDaemon {
             MSG_DNS_LOOKUP => self.handle_dns_lookup(sender, msg, socket_set, iface),
             MSG_TCP_SET_OPTION => self.handle_tcp_set_option(sender, msg, socket_set),
             MSG_TCP_GET_OPTION => self.handle_tcp_get_option(sender, msg, socket_set),
+            MSG_TCP_CONNECT_PIPED => self.handle_tcp_connect_piped(sender, msg, socket_set, iface),
+            MSG_TCP_BIND_PIPED => self.handle_tcp_bind_piped(sender, msg, socket_set),
+            MSG_TCP_ACCEPT_PIPED => self.handle_tcp_accept_piped(sender, msg, socket_set),
             other => {
                 eprintln!("netd: unknown message type {other} from pid {sender}");
             }
@@ -629,6 +661,222 @@ impl NetDaemon {
         }
     }
 
+    // --- Piped socket handlers ---
+
+    fn handle_tcp_connect_piped(
+        &mut self,
+        sender: u32,
+        msg: Message,
+        socket_set: &mut SocketSet<'_>,
+        iface: &mut Interface,
+    ) {
+        let req: TcpConnectPipedRequest = msg.take_payload();
+        let remote = IpEndpoint::new(
+            IpAddress::Ipv4(Ipv4Addr::from(req.addr)),
+            req.port,
+        );
+        let local_port = self.alloc_port();
+
+        let rx_buf = tcp::SocketBuffer::new(vec![0u8; 65536]);
+        let tx_buf = tcp::SocketBuffer::new(vec![0u8; 65536]);
+        let mut socket = tcp::Socket::new(rx_buf, tx_buf);
+        if socket.connect(iface.context(), remote, local_port).is_err() {
+            Self::send_error(sender, ERR_CONNECTION_REFUSED);
+            return;
+        }
+
+        let handle = socket_set.add(socket);
+        let socket_id = self.alloc_id();
+        self.sockets.insert(socket_id, SocketKind::TcpStream(handle));
+        self.owners.insert(socket_id, sender);
+
+        let deadline = if req.timeout_ms > 0 {
+            syscall::clock_nanos() + req.timeout_ms as u64 * 1_000_000
+        } else {
+            0
+        };
+
+        self.pending_piped_connects.push(PendingPipedConnect {
+            client_pid: sender,
+            socket_id,
+            handle,
+            rx_pipe_id: req.rx_pipe_id,
+            tx_pipe_id: req.tx_pipe_id,
+            deadline,
+        });
+    }
+
+    fn handle_tcp_bind_piped(
+        &mut self,
+        sender: u32,
+        msg: Message,
+        socket_set: &mut SocketSet<'_>,
+    ) {
+        let req: TcpBindPipedRequest = msg.take_payload();
+        let port = if req.port == 0 { self.alloc_port() } else { req.port };
+
+        let rx_buf = tcp::SocketBuffer::new(vec![0u8; 65536]);
+        let tx_buf = tcp::SocketBuffer::new(vec![0u8; 65536]);
+        let mut socket = tcp::Socket::new(rx_buf, tx_buf);
+        if socket.listen(port).is_err() {
+            Self::send_error(sender, ERR_ADDR_IN_USE);
+            return;
+        }
+
+        let handle = socket_set.add(socket);
+        let socket_id = self.alloc_id();
+        self.sockets.insert(socket_id, SocketKind::TcpListener(handle));
+        self.owners.insert(socket_id, sender);
+
+        // Open the notify pipe write end
+        let notify_fd = match syscall::pipe_open(req.notify_pipe_id, 1) {
+            Ok(fd) => fd,
+            Err(_) => {
+                Self::send_error(sender, ERR_INVALID_INPUT);
+                return;
+            }
+        };
+
+        self.piped_listeners.insert(socket_id, PipedListener {
+            handle,
+            local_port: port,
+            notify_write_fd: notify_fd,
+        });
+
+        message::send(sender, Message::new(MSG_RESULT, TcpBindResponse {
+            socket_id,
+            bound_port: port,
+            _pad: 0,
+        })).ok();
+    }
+
+    fn handle_tcp_accept_piped(
+        &mut self,
+        sender: u32,
+        msg: Message,
+        socket_set: &mut SocketSet<'_>,
+    ) {
+        let req: TcpAcceptPipedRequest = msg.take_payload();
+        let Some(listener) = self.piped_listeners.get(&req.socket_id) else {
+            Self::send_error(sender, ERR_NOT_CONNECTED);
+            return;
+        };
+
+        let socket = socket_set.get_mut::<tcp::Socket>(listener.handle);
+        if !socket.is_active() {
+            Self::send_error(sender, ERR_NOT_CONNECTED);
+            return;
+        }
+
+        let remote = socket.remote_endpoint().unwrap();
+        let local_port = socket.local_endpoint().unwrap().port;
+        let remote_addr = match remote.addr {
+            IpAddress::Ipv4(a) => a.octets(),
+        };
+
+        // Move listener socket to a piped stream
+        let old_handle = listener.handle;
+        let stream_id = self.alloc_id();
+        self.sockets.insert(stream_id, SocketKind::TcpStream(old_handle));
+        self.owners.insert(stream_id, sender);
+
+        // Open pipe fds for this connection
+        let rx_write_fd = match syscall::pipe_open(req.rx_pipe_id, 1) {
+            Ok(fd) => fd,
+            Err(_) => {
+                Self::send_error(sender, ERR_INVALID_INPUT);
+                return;
+            }
+        };
+        let tx_read_fd = match syscall::pipe_open(req.tx_pipe_id, 0) {
+            Ok(fd) => fd,
+            Err(_) => {
+                syscall::close(rx_write_fd);
+                Self::send_error(sender, ERR_INVALID_INPUT);
+                return;
+            }
+        };
+
+        self.piped_connections.push(PipedConnection {
+            handle: old_handle,
+            rx_write_fd,
+            tx_read_fd,
+        });
+
+        // Create replacement listener
+        let rx_buf = tcp::SocketBuffer::new(vec![0u8; 65536]);
+        let tx_buf = tcp::SocketBuffer::new(vec![0u8; 65536]);
+        let mut new_listener = tcp::Socket::new(rx_buf, tx_buf);
+        new_listener.listen(local_port).ok();
+        let new_handle = socket_set.add(new_listener);
+        self.sockets.insert(req.socket_id, SocketKind::TcpListener(new_handle));
+
+        // Update the piped listener's handle
+        if let Some(pl) = self.piped_listeners.get_mut(&req.socket_id) {
+            pl.handle = new_handle;
+        }
+
+        message::send(sender, Message::new(MSG_RESULT, TcpAcceptPipedResponse {
+            socket_id: stream_id,
+            remote_addr,
+            remote_port: remote.port,
+            local_port,
+        })).ok();
+    }
+
+    /// Bridge data between smoltcp sockets and kernel pipes for piped connections.
+    fn bridge_piped(&mut self, socket_set: &mut SocketSet<'_>) {
+        let mut closed = Vec::new();
+        for (i, conn) in self.piped_connections.iter().enumerate() {
+            let socket = socket_set.get_mut::<tcp::Socket>(conn.handle);
+
+            // smoltcp rx → pipe write (netd pushes received data to client)
+            if socket.can_recv() {
+                let mut buf = [0u8; 4096];
+                if let Ok(n) = socket.recv_slice(&mut buf) {
+                    if n > 0 {
+                        // Non-blocking write to client's rx pipe
+                        let _ = syscall::write_nonblock(conn.rx_write_fd, &buf[..n]);
+                    }
+                }
+            }
+
+            // pipe read → smoltcp tx (netd reads client's outgoing data)
+            if socket.can_send() {
+                let mut buf = [0u8; 4096];
+                match syscall::read_nonblock(conn.tx_read_fd, &mut buf) {
+                    Ok(n) if n > 0 => {
+                        let _ = socket.send_slice(&buf[..n]);
+                    }
+                    _ => {}
+                }
+            }
+
+            // Detect closed connections (both sides)
+            if !socket.is_open() && !socket.may_recv() && !socket.may_send() {
+                closed.push(i);
+            }
+        }
+
+        // Clean up closed piped connections (reverse order to preserve indices)
+        for &i in closed.iter().rev() {
+            let conn = self.piped_connections.swap_remove(i);
+            syscall::close(conn.rx_write_fd);
+            syscall::close(conn.tx_read_fd);
+        }
+    }
+
+    /// Check piped listeners for new connections and notify via pipe.
+    fn check_piped_listeners(&self, socket_set: &mut SocketSet<'_>) {
+        for (_, listener) in &self.piped_listeners {
+            let socket = socket_set.get_mut::<tcp::Socket>(listener.handle);
+            if socket.is_active() {
+                // New connection arrived — notify client by writing 1 byte
+                let _ = syscall::write_nonblock(listener.notify_write_fd, &[1]);
+            }
+        }
+    }
+
     /// Process pending async operations (connects, recvs, accepts, DNS).
     fn process_pending(&mut self, socket_set: &mut SocketSet<'_>) {
         let now = syscall::clock_nanos();
@@ -821,6 +1069,67 @@ impl NetDaemon {
                 }
             }
         }
+
+        // Pending piped connects
+        let mut i = 0;
+        while i < self.pending_piped_connects.len() {
+            let pc = &self.pending_piped_connects[i];
+            let socket = socket_set.get_mut::<tcp::Socket>(pc.handle);
+            if socket.may_send() {
+                // Connected — open pipe fds and register piped connection
+                let local_port = socket.local_endpoint().map(|e| e.port).unwrap_or(0);
+                let rx_write_fd = match syscall::pipe_open(pc.rx_pipe_id, 1) {
+                    Ok(fd) => fd,
+                    Err(_) => {
+                        Self::send_error(pc.client_pid, ERR_OTHER);
+                        self.pending_piped_connects.swap_remove(i);
+                        continue;
+                    }
+                };
+                let tx_read_fd = match syscall::pipe_open(pc.tx_pipe_id, 0) {
+                    Ok(fd) => fd,
+                    Err(_) => {
+                        syscall::close(rx_write_fd);
+                        Self::send_error(pc.client_pid, ERR_OTHER);
+                        self.pending_piped_connects.swap_remove(i);
+                        continue;
+                    }
+                };
+
+                self.piped_connections.push(PipedConnection {
+                    handle: pc.handle,
+                    rx_write_fd,
+                    tx_read_fd,
+                });
+
+                let resp = TcpConnectResponse {
+                    socket_id: pc.socket_id,
+                    local_port,
+                    _pad: 0,
+                };
+                message::send(pc.client_pid, Message::new(MSG_RESULT, resp)).ok();
+                self.pending_piped_connects.swap_remove(i);
+                continue;
+            }
+            if socket.state() == tcp::State::Closed {
+                Self::send_error(pc.client_pid, ERR_CONNECTION_REFUSED);
+                self.sockets.remove(&pc.socket_id);
+                self.owners.remove(&pc.socket_id);
+                socket_set.remove(pc.handle);
+                self.pending_piped_connects.swap_remove(i);
+                continue;
+            }
+            if pc.deadline > 0 && now >= pc.deadline {
+                Self::send_error(pc.client_pid, ERR_TIMED_OUT);
+                socket.abort();
+                self.sockets.remove(&pc.socket_id);
+                self.owners.remove(&pc.socket_id);
+                socket_set.remove(pc.handle);
+                self.pending_piped_connects.swap_remove(i);
+                continue;
+            }
+            i += 1;
+        }
     }
 }
 
@@ -875,6 +1184,10 @@ fn main() {
         // Process completed async operations
         daemon.process_pending(&mut socket_set);
 
+        // Bridge piped connections (smoltcp ↔ pipes)
+        daemon.bridge_piped(&mut socket_set);
+        daemon.check_piped_listeners(&mut socket_set);
+
         // Calculate sleep time
         let delay = iface.poll_delay(now, &socket_set);
         let timeout_ns = match delay {
@@ -883,20 +1196,22 @@ fn main() {
             None => 50_000_000,   // 50ms default
         };
 
-        // If there are pending operations, poll more aggressively
-        let timeout_ns = if daemon.pending_connects.is_empty()
-            && daemon.pending_recvs.is_empty()
-            && daemon.pending_accepts.is_empty()
-            && daemon.pending_udp_recvs.is_empty()
-            && daemon.pending_dns.is_empty()
-        {
-            timeout_ns
+        // If there are pending operations or active piped connections, poll more aggressively
+        let has_pending = !daemon.pending_connects.is_empty()
+            || !daemon.pending_recvs.is_empty()
+            || !daemon.pending_accepts.is_empty()
+            || !daemon.pending_udp_recvs.is_empty()
+            || !daemon.pending_dns.is_empty()
+            || !daemon.pending_piped_connects.is_empty()
+            || !daemon.piped_connections.is_empty();
+        let timeout_ns = if has_pending {
+            timeout_ns.min(1_000_000) // 1ms when piped connections active
         } else {
-            timeout_ns.min(5_000_000) // 5ms when operations pending
+            timeout_ns
         };
 
         // Wait for IPC messages or timeout
-        let result = syscall::poll_timeout(&[], timeout_ns);
+        let result = syscall::poll_timeout(&[], Some(timeout_ns));
 
         if result.messages() {
             // Drain all messages
@@ -905,7 +1220,7 @@ fn main() {
                 daemon.handle_message(msg, &mut socket_set, &mut iface);
 
                 // Check for more messages (non-blocking)
-                let check = syscall::poll_timeout(&[], 1);
+                let check = syscall::poll_timeout(&[], Some(0));
                 if !check.messages() {
                     break;
                 }

@@ -28,7 +28,7 @@ fn main() {
     let shell_stdout_fd = shell_stdout.as_raw_fd();
 
     loop {
-        let ready = syscall::poll(&[shell_stdout_fd]);
+        let ready = syscall::poll(&[syscall::Fd(shell_stdout_fd)]);
 
         if ready.fd(0) {
             let mut buf = [0u8; 4096];

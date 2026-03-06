@@ -26,3 +26,12 @@
 [submodule "userland/tar"]
 	path = userland/tar
 	url = https://github.com/Japabu/tar-rs
+[submodule "userland/mio"]
+	path = userland/mio
+	url = https://github.com/Japabu/mio.git
+[submodule "userland/tokio"]
+	path = userland/tokio
+	url = https://github.com/Japabu/tokio.git
+[submodule "userland/ring"]
+	path = userland/ring
+	url = https://github.com/Japabu/ring.git

@@ -8,7 +8,7 @@ use std::sync::OnceLock;
 
 fn compositor_pid() -> u32 {
     static PID: OnceLock<u32> = OnceLock::new();
-    *PID.get_or_init(|| syscall::find_pid("compositor").expect("no compositor running"))
+    *PID.get_or_init(|| syscall::find_pid("compositor").expect("no compositor running").0)
 }
 
 // Window flags
@@ -171,7 +171,7 @@ impl Window {
 
     /// Wait up to `timeout_nanos` for an event. Returns `None` on timeout.
     pub fn poll_event(&mut self, timeout_nanos: u64) -> Option<Event> {
-        let result = syscall::poll_timeout(&[], timeout_nanos);
+        let result = syscall::poll_timeout(&[], Some(timeout_nanos));
         if result.messages() {
             Some(self.recv_event())
         } else {

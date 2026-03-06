@@ -62,7 +62,7 @@ struct FramebufferInfo {
     flags: u32,
 }
 
-fn read_fb_info(fd: u64) -> FramebufferInfo {
+fn read_fb_info(fd: syscall::Fd) -> FramebufferInfo {
     let mut info = FramebufferInfo {
         token: [0; 2],
         cursor_token: 0,
@@ -78,7 +78,7 @@ fn read_fb_info(fd: u64) -> FramebufferInfo {
             std::mem::size_of::<FramebufferInfo>(),
         )
     };
-    let n = syscall::read_fd(fd, buf);
+    let n = syscall::read(fd, buf).expect("failed to read framebuffer info");
     assert!(
         n == std::mem::size_of::<FramebufferInfo>(),
         "failed to read framebuffer info"
@@ -168,7 +168,7 @@ fn resize_window(win: &mut WindowState, new_w: usize, new_h: usize, pixel_format
     let buf_size = new_w * new_h * 4;
     let token = syscall::alloc_shared(buf_size);
     let buffer = syscall::map_shared(token);
-    syscall::grant_shared(token, win.pid);
+    syscall::grant_shared(token, syscall::Pid(win.pid));
     win.token = token;
     win.buffer = buffer;
     win.buffer_size = buf_size;
@@ -587,8 +587,8 @@ fn draw_taskbar(
 
     // System stats + clock on the right
     let time = syscall::clock_realtime();
-    let hours = (time >> 16) & 0xFF;
-    let minutes = (time >> 8) & 0xFF;
+    let hours = time.hours;
+    let minutes = time.minutes;
 
     let status_str = format!(
         "{}M/{}M  CPU {}%  {:02}:{:02}",
@@ -767,7 +767,7 @@ fn main() {
         let mut waited = false;
         loop {
             let timeout = if waited { 1 } else { FRAME_INTERVAL_NS };
-            let ready = syscall::poll_timeout(&[kb_fd, mouse_fd], timeout);
+            let ready = syscall::poll_timeout(&[kb_fd, mouse_fd], Some(timeout));
 
             if !ready.fd(0) && !ready.fd(1) && !ready.messages() {
                 break;
@@ -782,7 +782,7 @@ fn main() {
                     std::mem::size_of_val(&events),
                 )
             };
-            let n = syscall::read_fd(kb_fd, buf);
+            let n = syscall::read(kb_fd, buf).unwrap_or(0);
             for event in &events[..n / std::mem::size_of::<window::KeyEvent>()] {
                 if launcher_open && event.pressed() && event.keycode == 0x29 {
                     // Escape: close launcher
@@ -895,7 +895,7 @@ fn main() {
         if ready.fd(1) {
             // Drain all pending mouse events in one read
             let mut buf = [0u8; 512];
-            let n = syscall::read_fd(mouse_fd, &mut buf);
+            let n = syscall::read(mouse_fd, &mut buf).unwrap_or(0);
             let event_count = n / 4;
 
             // Accumulate deltas and track button transitions
@@ -1250,7 +1250,7 @@ fn main() {
                     let buf_size = content_w * content_h * 4;
                     let token = syscall::alloc_shared(buf_size);
                     let buffer = syscall::map_shared(token);
-                    syscall::grant_shared(token, sender);
+                    syscall::grant_shared(token, syscall::Pid(sender));
                     let pixel_format = screen.pixel_format_raw();
 
                     let topmost = req.flags & window::WINDOW_FLAG_TOPMOST != 0;
