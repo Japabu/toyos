@@ -166,12 +166,12 @@ fn parse_args() -> Args {
             "-O2" | "-Os" | "-Oz" => opt_level = 2,
             "-O3" => opt_level = 3,
             s if s.starts_with("-O") || s.starts_with("-W") || s.starts_with("-f")
-              || s.starts_with("-m") || s.starts_with("-std=") || s.starts_with("-march") => {}
+              || s.starts_with("-m") || s.starts_with("-std=") || s.starts_with("-march")
+              || s.starts_with("-x") => {}
             "-pipe" | "-pthread" | "-ldl" | "-lm" | "-lc" => {}
             s if s.starts_with("-l") || s.starts_with("-L") => {}
             s if s.starts_with('-') => {
-                eprintln!("toyos-cc: warning: unknown flag: {s}");
-                process::exit(1);
+                eprintln!("toyos-cc: warning: ignoring unknown flag: {s}");
             }
             path => inputs.push(PathBuf::from(path)),
         }

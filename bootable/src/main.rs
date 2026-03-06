@@ -61,6 +61,11 @@ fn build(debug: bool) {
         panic!("Failed to build bootloader");
     }
 
+    // Ensure the ToyOS sysroot has host target libraries so proc-macros can compile.
+    // The ToyOS toolchain only ships x86_64-unknown-toyos libs; proc-macro crates need
+    // host-architecture libs (e.g. libproc_macro). Symlink from the stable toolchain.
+    ensure_host_target_in_sysroot();
+
     let mut initrd_files: Vec<(String, Vec<u8>)> = Vec::new();
     let mut symlinks: Vec<(String, String)> = Vec::new();
 
@@ -74,11 +79,20 @@ fn build(debug: bool) {
         let name = entry.file_name();
         let name = name.to_str().unwrap();
         if toolchain_changed || linker_changed {
+            let reason = if toolchain_changed { "toolchain" } else { "linker" };
             let toyos_target_dir = path.join("target/x86_64-unknown-toyos");
             if toyos_target_dir.exists() {
-                let reason = if toolchain_changed { "toolchain" } else { "linker" };
-                eprintln!("{reason} changed: cleaning userland/{name}");
+                eprintln!("{reason} changed: cleaning userland/{name} (target)");
                 fs::remove_dir_all(&toyos_target_dir).ok();
+            }
+            // Also clean host deps — proc-macro crates compiled by the old toolchain
+            // have incompatible metadata hashes.
+            if toolchain_changed {
+                let host_deps_dir = path.join("target/debug");
+                if host_deps_dir.exists() {
+                    eprintln!("toolchain changed: cleaning userland/{name} (host deps)");
+                    fs::remove_dir_all(&host_deps_dir).ok();
+                }
             }
         }
         if !Command::new("cargo")
@@ -211,7 +225,7 @@ fn main() {
         .arg("-device").arg("virtio-gpu-pci")
 
         // VirtIO networking with user-mode (SLIRP) backend
-        .arg("-netdev").arg("user,id=net0")
+        .arg("-netdev").arg("user,id=net0,hostfwd=tcp::2222-:22")
         .arg("-device").arg("virtio-net-pci-non-transitional,netdev=net0")
 
         .arg("-serial").arg("stdio")
@@ -247,6 +261,52 @@ fn find_host_rlibs() -> std::path::PathBuf {
         }
     }
     panic!("Could not find host sysroot with ToyOS .rlib files in rust/build/");
+}
+
+/// Ensure the ToyOS sysroot contains host target libraries for proc-macro compilation.
+/// The ToyOS toolchain only ships x86_64-unknown-toyos libs, but cargo needs host libs
+/// (like libproc_macro, libstd) to compile proc-macro crates. Symlink from the stable toolchain.
+fn ensure_host_target_in_sysroot() {
+    let host = host_triple();
+    let toyos_sysroot = Path::new("../rust/build/x86_64-unknown-toyos/stage2/lib/rustlib");
+    let host_target_dir = toyos_sysroot.join(&host);
+    if host_target_dir.exists() {
+        return;
+    }
+
+    // Find the stable toolchain's rustlib for the host triple
+    let output = Command::new("rustc")
+        .args(["--print", "sysroot"])
+        .output()
+        .expect("Failed to run rustc");
+    let stable_sysroot = String::from_utf8(output.stdout).unwrap();
+    let stable_sysroot = stable_sysroot.trim();
+    let source = Path::new(stable_sysroot)
+        .join("lib/rustlib")
+        .join(&host);
+    assert!(
+        source.exists(),
+        "Host target {} not found in stable toolchain at {}",
+        host,
+        source.display()
+    );
+
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&source, &host_target_dir).unwrap_or_else(|e| {
+        panic!(
+            "Failed to symlink {} -> {}: {}",
+            host_target_dir.display(),
+            source.display(),
+            e
+        )
+    });
+    #[cfg(not(unix))]
+    panic!("Symlinking host target not supported on this platform");
+
+    eprintln!(
+        "Symlinked host target {} into ToyOS sysroot",
+        host
+    );
 }
 
 fn build_toyos_ld() -> std::path::PathBuf {

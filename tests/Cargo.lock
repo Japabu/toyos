@@ -695,6 +695,7 @@ dependencies = [
  "cfg-if",
  "libc",
  "psm",
+ "toyos-abi",
  "windows-sys",
 ]
 
@@ -732,6 +733,10 @@ dependencies = [
  "quote",
  "syn",
 ]
+
+[[package]]
+name = "toyos-abi"
+version = "0.1.0"
 
 [[package]]
 name = "toyos-cc"

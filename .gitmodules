@@ -35,3 +35,6 @@
 [submodule "userland/ring"]
 	path = userland/ring
 	url = https://github.com/Japabu/ring.git
+[submodule "userland/russh"]
+	path = userland/russh
+	url = https://github.com/Japabu/russh

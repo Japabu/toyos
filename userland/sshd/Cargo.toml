@@ -1,0 +1,16 @@
+[package]
+name = "sshd"
+edition = "2024"
+
+[dependencies]
+toyos-abi = { path = "../../toyos-abi" }
+russh = { version = "0.57", default-features = false, features = ["rustcrypto", "flate2", "rsa"] }
+tokio = { version = "1", features = ["rt", "net", "macros", "io-util", "sync", "time"] }
+
+[patch.crates-io]
+mio = { path = "../mio" }
+tokio = { path = "../tokio/tokio" }
+getrandom_02 = { path = "../getrandom", package = "getrandom" }
+getrandom_03 = { path = "../getrandom3", package = "getrandom" }
+russh = { path = "../russh/russh" }
+russh-cryptovec = { path = "../russh/cryptovec" }
