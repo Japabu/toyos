@@ -11,12 +11,17 @@ fn main() {
         download_doomgeneric(&root);
     }
 
-    // Build toyos-cc
+    // Build toyos-cc as a host tool. It needs the stable host toolchain,
+    // not the toyos cross-toolchain from userland/rust-toolchain.toml.
+    // Setting RUSTUP_TOOLCHAIN overrides the toml file.
     let toyos_cc_dir = root.join("../toyos-cc");
     let status = Command::new("cargo")
         .args(["build", "--quiet"])
         .current_dir(&toyos_cc_dir)
-        .env_remove("RUSTUP_TOOLCHAIN")
+        .env("RUSTUP_TOOLCHAIN", "stable")
+        .env_remove("RUSTC")
+        .env_remove("RUSTFLAGS")
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
         .status()
         .expect("failed to build toyos-cc");
     assert!(status.success(), "toyos-cc build failed");

@@ -62,6 +62,7 @@ fn build(debug: bool) {
     }
 
     let mut initrd_files: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut symlinks: Vec<(String, String)> = Vec::new();
 
     // Build all userland apps (any directory under ../userland with a Cargo.toml and main.rs)
     for entry in fs::read_dir("../userland").expect("Failed to read userland") {
@@ -101,31 +102,50 @@ fn build(debug: bool) {
     // Write toolchain stamp after successful builds
     write_stamp(&toolchain_stamp, "target/.toolchain-stamp");
 
-    // Add rustc compiler from bootstrap sysroot
+    // Add rustc compiler with sysroot directory structure.
+    // The rustc binary and .so libraries go in the initrd root (kernel dynamic linker
+    // resolves DT_NEEDED from the same directory as the executable). The sysroot
+    // directory tree holds rlibs and codegen backends that rustc finds at compile time.
     let sysroot = Path::new("../rust/build/x86_64-unknown-toyos/stage2");
     if sysroot.exists() {
-        // rustc binary
         let rustc = sysroot.join("bin/rustc");
         if rustc.exists() {
             initrd_files.push(("rustc".to_string(), fs::read(&rustc).unwrap()));
         }
-        // Shared libraries (rustc_driver, proc macros, etc.)
+        // Shared libraries in initrd root (for dynamic linker) and sysroot/lib/ (for rustc)
         for entry in fs::read_dir(sysroot.join("lib")).unwrap() {
             let path = entry.unwrap().path();
             if path.extension().is_some_and(|e| e == "so") {
                 let name = path.file_name().unwrap().to_str().unwrap().to_string();
-                initrd_files.push((name, fs::read(&path).unwrap()));
+                let data = fs::read(&path).unwrap();
+                initrd_files.push((name.clone(), data));
             }
         }
-        // Codegen backends
+        // Codegen backends in sysroot/lib/rustlib/<target>/codegen-backends/
         let backends = sysroot.join("lib/rustlib/x86_64-unknown-toyos/codegen-backends");
         if backends.exists() {
             for entry in fs::read_dir(&backends).unwrap() {
                 let path = entry.unwrap().path();
                 if path.extension().is_some_and(|e| e == "so") {
                     let name = path.file_name().unwrap().to_str().unwrap().to_string();
-                    initrd_files.push((name, fs::read(&path).unwrap()));
+                    let data = fs::read(&path).unwrap();
+                    initrd_files.push((
+                        format!("sysroot/lib/rustlib/x86_64-unknown-toyos/codegen-backends/{name}"),
+                        data,
+                    ));
                 }
+            }
+        }
+        // Target .rlib files — bootstrap puts these in the host sysroot, not the ToyOS one
+        let host_rlibs = find_host_rlibs();
+        for entry in fs::read_dir(&host_rlibs).into_iter().flatten() {
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|e| e == "rlib") {
+                let name = path.file_name().unwrap().to_str().unwrap().to_string();
+                initrd_files.push((
+                    format!("sysroot/lib/rustlib/x86_64-unknown-toyos/lib/{name}"),
+                    fs::read(&path).unwrap(),
+                ));
             }
         }
     }
@@ -133,7 +153,6 @@ fn build(debug: bool) {
     initrd_files.extend(assets::collect());
 
     // Generate symlinks for toybox commands by scanning its source modules
-    let mut symlinks: Vec<(String, String)> = Vec::new();
     for entry in fs::read_dir("../userland/toybox/src").expect("Failed to read toybox/src") {
         let entry = entry.expect("Failed to read dir entry");
         let name = entry.file_name();
@@ -153,7 +172,7 @@ fn build(debug: bool) {
     // Create empty NVMe disk image if it doesn't already exist (persistent across rebuilds)
     let nvme_path = "target/nvme.img";
     if !Path::new(nvme_path).exists() {
-        let nvme_bytes = vec![0u8; 128 * 1024 * 1024];
+        let nvme_bytes = vec![0u8; 1024 * 1024 * 1024];
         fs::write(nvme_path, nvme_bytes).expect("Failed to write NVMe image");
     }
 }
@@ -167,7 +186,7 @@ fn main() {
         .arg("-machine").arg("q35")
         .arg("-cpu").arg("qemu64,+rdrand")
         .arg("-smp").arg("2")
-        .arg("-m").arg("4G")
+        .arg("-m").arg("8G")
         // Flash the OVMF UEFI firmware
         .arg("-drive").arg("if=pflash,format=raw,unit=0,file=ovmf/OVMF_CODE-pure-efi.fd,readonly=on")
         .arg("-drive").arg("if=pflash,format=raw,unit=1,file=ovmf/OVMF_VARS-pure-efi.fd,readonly=on")
@@ -210,6 +229,24 @@ fn main() {
     }
 
     qemu.status().expect("failed to execute process");
+}
+
+/// Find the .rlib files for x86_64-unknown-toyos in the host sysroot.
+/// Bootstrap places target libraries in the host's sysroot, not the ToyOS-hosted one.
+fn find_host_rlibs() -> std::path::PathBuf {
+    let build_dir = Path::new("../rust/build");
+    for entry in fs::read_dir(build_dir).expect("rust/build/ not found") {
+        let path = entry.unwrap().path();
+        // Skip the ToyOS-hosted sysroot (its lib dir is empty)
+        if path.file_name().is_some_and(|n| n == "x86_64-unknown-toyos") {
+            continue;
+        }
+        let rlib_dir = path.join("stage2/lib/rustlib/x86_64-unknown-toyos/lib");
+        if rlib_dir.exists() {
+            return rlib_dir;
+        }
+    }
+    panic!("Could not find host sysroot with ToyOS .rlib files in rust/build/");
 }
 
 fn build_toyos_ld() -> std::path::PathBuf {

@@ -12,6 +12,9 @@ toyos-libc = { path = "../libc" }
 [patch.crates-io]
 getrandom = { path = "../getrandom" }
 
+[profile.dev]
+opt-level = 2
+
 [build-dependencies]
 cc = "1.1"
 ureq = { version = "3", default-features = false, features = ["rustls-no-provider", "rustls-webpki-roots"] }

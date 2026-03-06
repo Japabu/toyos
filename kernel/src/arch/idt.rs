@@ -457,31 +457,26 @@ extern "C" fn exception_handler(
         rbp = saved_rbp;
     }
 
-    // Stack dump
+    // Stack dump — dump raw values from RSP and around RBP
     let dump_rsp = frame.rsp;
-    if dump_rsp % 8 == 0 {
-        log!("  Stack:");
-        for i in 0..16u64 {
+    if dump_rsp % 8 == 0 && dump_rsp > 0 && dump_rsp < 0x1_0000_0000 {
+        log!("  Stack (from RSP):");
+        for i in 0..8u64 {
             let addr = dump_rsp + i * 8;
-            let valid = if is_user {
-                process::is_valid_user_addr(addr)
-            } else {
-                is_kernel_addr(addr)
-            };
-            if !valid { break; }
+            if addr > 0x1_0000_0000 { break; }
             let val = unsafe { *(addr as *const u64) };
-            let sym = if is_user {
-                if let Some((name, off)) = process::resolve_symbol(val) {
-                    format!("  <{}+{:#x}>", name, off)
-                } else {
-                    alloc::string::String::new()
-                }
-            } else if let Some((name, off)) = symbols::resolve_kernel(val) {
-                format!("  <{}+{:#x}>", name, off)
-            } else {
-                alloc::string::String::new()
-            };
-            log!("    [{:#x}] = {:#018x}{}", addr, val, sym);
+            log!("    [{:#x}] = {:#018x}", addr, val);
+        }
+    }
+    // Dump around RBP (caller's frame)
+    let dump_rbp = regs.rbp;
+    if dump_rbp % 8 == 0 && dump_rbp > 0 && dump_rbp < 0x1_0000_0000 {
+        log!("  Frame (around RBP={:#x}):", dump_rbp);
+        for offset in [-0x30i64, -0x28, -0x20, -0x18, -0x10, -0x8, 0, 8, 0x10, 0x18, 0x20, 0x28] {
+            let addr = (dump_rbp as i64 + offset) as u64;
+            if addr > 0x1_0000_0000 { continue; }
+            let val = unsafe { *(addr as *const u64) };
+            log!("    [RBP{:+}] = {:#018x}", offset, val);
         }
     }
 

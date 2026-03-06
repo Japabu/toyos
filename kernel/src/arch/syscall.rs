@@ -776,23 +776,56 @@ fn sys_dlopen(path: &str) -> u64 {
     // Map loaded library memory into the current process's address space
     paging::map_user(lib.alloc.ptr() as u64, lib.alloc.size() as u64);
 
-    // Store in process and return handle (index)
-    process::with_current_mut(|proc| {
-        let idx = proc.loaded_libs.len();
-        proc.loaded_libs.push(lib);
+    // Resolve GLOB_DAT/JUMP_SLOT in the new lib against already-loaded libs.
+    // Threads have empty loaded_libs — use the parent process's libs instead.
+    {
+        let mut guard = crate::process::PROCESS_TABLE.lock();
+        let table = guard.as_mut().expect("process table");
+        let current_pid = crate::process::current_pid();
+        let proc = table.procs.get(current_pid).expect("current process");
+        let owner_pid = match proc.kind {
+            crate::process::Kind::Thread { parent } => parent,
+            _ => current_pid,
+        };
+        let owner = table.procs.get(owner_pid).expect("owner process");
+        log!("dlopen: pid={} owner={} resolving against {} existing libs",
+            current_pid, owner_pid, owner.loaded_libs.len());
+        crate::elf::resolve_dlopen_relocs(&lib, &owner.loaded_libs);
+    }
+
+    // Store in the owner process (for threads, use the parent process)
+    {
+        let mut guard = crate::process::PROCESS_TABLE.lock();
+        let table = guard.as_mut().expect("process table");
+        let current_pid = crate::process::current_pid();
+        let proc = table.procs.get(current_pid).expect("current process");
+        let owner_pid = match proc.kind {
+            crate::process::Kind::Thread { parent } => parent,
+            _ => current_pid,
+        };
+        let owner = table.procs.get_mut(owner_pid).expect("owner process");
+        let idx = owner.loaded_libs.len();
+        owner.loaded_libs.push(lib);
         idx as u64
-    })
+    }
 }
 
 fn sys_dlsym(handle: u64, name: &str) -> u64 {
-    process::with_current(|proc| {
-        let idx = handle as usize;
-        if idx >= proc.loaded_libs.len() {
-            return u64::MAX;
-        }
-        let addr = crate::elf::dlsym(&proc.loaded_libs[idx], name);
-        if addr == 0 { u64::MAX } else { addr }
-    })
+    let mut guard = crate::process::PROCESS_TABLE.lock();
+    let table = guard.as_mut().expect("process table");
+    let current_pid = crate::process::current_pid();
+    let proc = table.procs.get(current_pid).expect("current process");
+    let owner_pid = match proc.kind {
+        crate::process::Kind::Thread { parent } => parent,
+        _ => current_pid,
+    };
+    let owner = table.procs.get(owner_pid).expect("owner process");
+    let idx = handle as usize;
+    if idx >= owner.loaded_libs.len() {
+        return u64::MAX;
+    }
+    let addr = crate::elf::dlsym(&owner.loaded_libs[idx], name);
+    if addr == 0 { u64::MAX } else { addr }
 }
 
 /// Terminate the current userspace process (called from exception handlers).

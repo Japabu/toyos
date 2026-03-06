@@ -1,3 +1,4 @@
+use filepicker_api::PickerMode;
 use font::Font;
 use std::env;
 use std::fs;
@@ -559,24 +560,6 @@ impl GoToLine {
     }
 }
 
-// --- Save-as dialog ---
-
-struct SaveAs {
-    active: bool,
-    input: String,
-    cursor: usize,
-}
-
-impl SaveAs {
-    fn new() -> Self {
-        Self {
-            active: false,
-            input: String::new(),
-            cursor: 0,
-        }
-    }
-}
-
 // --- Editor state ---
 
 struct Editor {
@@ -589,7 +572,6 @@ struct Editor {
     scroll_col: usize,
     finder: Finder,
     goto_line: GoToLine,
-    save_as: SaveAs,
 
     // Layout
     font_w: usize,
@@ -612,7 +594,6 @@ impl Editor {
             scroll_col: 0,
             finder: Finder::new(),
             goto_line: GoToLine::new(),
-            save_as: SaveAs::new(),
             font_w,
             font_h,
             gutter_width,
@@ -884,32 +865,35 @@ impl Editor {
     }
 
     fn dedent(&mut self) {
-        if let Some(((r1, _), (r2, _))) = self.selection_ordered() {
-            let mut edits = Vec::new();
-            for row in r1..=r2 {
-                let line = &self.buffer.lines[row];
-                let spaces = line.len() - line.trim_start_matches(' ').len();
-                let remove = spaces.min(4);
-                if remove > 0 {
-                    edits.push(Edit::Delete {
-                        row,
-                        col: 0,
-                        text: " ".repeat(remove),
-                    });
-                }
+        let (r1, r2) = if let Some(((r1, _), (r2, _))) = self.selection_ordered() {
+            (r1, r2)
+        } else {
+            (self.cursor_row, self.cursor_row)
+        };
+        let mut edits = Vec::new();
+        for row in r1..=r2 {
+            let line = &self.buffer.lines[row];
+            let spaces = line.len() - line.trim_start_matches(' ').len();
+            let remove = spaces.min(4);
+            if remove > 0 {
+                edits.push(Edit::Delete {
+                    row,
+                    col: 0,
+                    text: " ".repeat(remove),
+                });
             }
-            if edits.is_empty() {
-                return;
-            }
-            for edit in edits.iter().rev() {
-                edit.apply(&mut self.buffer.lines);
-            }
-            self.buffer.undo_stack.push(Edit::Batch(edits));
-            self.buffer.redo_stack.clear();
-            self.buffer.dirty = true;
-            self.clamp_cursor();
-            self.desired_col = self.cursor_col;
         }
+        if edits.is_empty() {
+            return;
+        }
+        for edit in edits.iter().rev() {
+            edit.apply(&mut self.buffer.lines);
+        }
+        self.buffer.undo_stack.push(Edit::Batch(edits));
+        self.buffer.redo_stack.clear();
+        self.buffer.dirty = true;
+        self.clamp_cursor();
+        self.desired_col = self.cursor_col;
     }
 
     fn duplicate_line(&mut self) {
@@ -1587,12 +1571,6 @@ fn reset_blink(visible: &mut bool, last: &mut Instant) {
 }
 
 fn handle_key(editor: &mut Editor, key: &KeyEvent, fb: &mut Framebuffer) {
-    // Save-as dialog
-    if editor.save_as.active {
-        handle_save_as_key(editor, key);
-        return;
-    }
-
     // Go-to-line dialog
     if editor.goto_line.active {
         handle_goto_line_key(editor, key);
@@ -1620,11 +1598,26 @@ fn handle_key(editor: &mut Editor, key: &KeyEvent, fb: &mut Framebuffer) {
         match ch {
             Some('s') => {
                 if editor.buffer.path.is_none() {
-                    editor.save_as.active = true;
-                    editor.save_as.input.clear();
-                    editor.save_as.cursor = 0;
-                } else if let Err(e) = editor.buffer.save() {
-                    eprintln!("Save error: {}", e);
+                    if let Some(path) = filepicker_api::pick_file(PickerMode::Save, "/") {
+                        editor.buffer.path = Some(path);
+                    }
+                }
+                if editor.buffer.path.is_some() {
+                    if let Err(e) = editor.buffer.save() {
+                        eprintln!("Save error: {}", e);
+                    }
+                }
+            }
+            Some('o') => {
+                if let Some(path) = filepicker_api::pick_file(PickerMode::Open, "/") {
+                    editor.buffer = Buffer::from_file(&path);
+                    editor.cursor_row = 0;
+                    editor.cursor_col = 0;
+                    editor.desired_col = 0;
+                    editor.anchor = None;
+                    editor.scroll_row = 0;
+                    editor.scroll_col = 0;
+                    editor.update_gutter();
                 }
             }
             Some('z') => {

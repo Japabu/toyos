@@ -6,8 +6,16 @@ version = 4
 name = "editor"
 version = "0.1.0"
 dependencies = [
+ "filepicker-api",
  "font",
  "window",
+]
+
+[[package]]
+name = "filepicker-api"
+version = "0.1.0"
+dependencies = [
+ "toyos-abi",
 ]
 
 [[package]]

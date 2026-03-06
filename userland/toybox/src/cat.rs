@@ -10,6 +10,9 @@ pub fn main(args: Vec<String>) {
             Ok(data) => {
                 if let Ok(text) = std::str::from_utf8(&data) {
                     print!("{}", text);
+                    if !text.ends_with('\n') {
+                        println!();
+                    }
                 } else {
                     eprintln!("{}: {} bytes (binary)", path, data.len());
                 }

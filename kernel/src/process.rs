@@ -438,7 +438,19 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<u32>) -> Option<u32> {
     let stack_top = stack_alloc.ptr() as u64 + USER_STACK_SIZE as u64;
     paging::map_user_in(child_pml4, stack_alloc.ptr() as u64, USER_STACK_SIZE as u64);
 
-    let (tls_alloc, fs_base) = setup_tls(loaded.tls_template, loaded.tls_filesz, loaded.tls_memsz)?;
+    // Use shared library TLS if the executable has none
+    let (tls_template, tls_filesz, tls_memsz) = if loaded.tls_memsz > 0 {
+        (loaded.tls_template, loaded.tls_filesz, loaded.tls_memsz)
+    } else {
+        // Find the first loaded lib with TLS
+        loaded_libs.iter()
+            .find(|lib| lib.tls_memsz > 0)
+            .map(|lib| (lib.tls_template, lib.tls_filesz, lib.tls_memsz))
+            .unwrap_or((0, 0, 0))
+    };
+    log!("spawn: TLS template={:#x} filesz={} memsz={} (from {})", tls_template, tls_filesz, tls_memsz,
+        if loaded.tls_memsz > 0 { "exe" } else { "lib" });
+    let (tls_alloc, fs_base) = setup_tls(tls_template, tls_filesz, tls_memsz)?;
     paging::map_user_in(child_pml4, tls_alloc.ptr() as u64, tls_alloc.size() as u64);
 
     let sp = write_argv_to_stack(stack_top, argv);
@@ -482,9 +494,9 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<u32>) -> Option<u32> {
         elf_alloc: Some(elf_alloc),
         stack_alloc: Some(stack_alloc),
         fs_base,
-        tls_template: loaded.tls_template,
-        tls_filesz: loaded.tls_filesz,
-        tls_memsz: loaded.tls_memsz,
+        tls_template,
+        tls_filesz,
+        tls_memsz,
         tls_alloc: Some(tls_alloc),
         symbols: syms,
         name: make_name(path),

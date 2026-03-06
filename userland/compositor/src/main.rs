@@ -99,6 +99,7 @@ struct WindowState {
     buf_height: usize,
     title: String,
     minimized: bool,
+    topmost: bool,
     mode: WindowMode,
     saved_x: usize,
     saved_y: usize,
@@ -141,6 +142,25 @@ fn focused_window_idx(windows: &[WindowState]) -> Option<usize> {
         .rev()
         .find(|(_, w)| !w.minimized)
         .map(|(i, _)| i)
+}
+
+/// Bring window at `idx` to front, keeping topmost windows always on top.
+/// Returns the new index of the moved window.
+fn bring_to_front(windows: &mut Vec<WindowState>, idx: usize) -> usize {
+    if idx == windows.len() - 1 {
+        return idx;
+    }
+    let win = windows.remove(idx);
+    if win.topmost {
+        // Topmost windows go to the very end
+        windows.push(win);
+        windows.len() - 1
+    } else {
+        // Non-topmost windows go before the first topmost window
+        let insert_at = windows.iter().position(|w| w.topmost).unwrap_or(windows.len());
+        windows.insert(insert_at, win);
+        insert_at
+    }
 }
 
 fn resize_window(win: &mut WindowState, new_w: usize, new_h: usize, pixel_format: u32) {
@@ -734,6 +754,7 @@ fn main() {
     let mut last_title_click_time: u64 = 0;
     let mut last_title_click_pid: u32 = 0;
     let mut clipboard = String::new();
+    Command::new("/initrd/filepicker").spawn().ok();
     let mut launcher_open = false;
     let mut prev_busy_ticks: u64 = 0;
     let mut prev_total_ticks: u64 = 0;
@@ -768,12 +789,14 @@ fn main() {
                     launcher_open = false;
                     mark_dirty(&mut dirty_rect, DirtyRect::full(screen_w as usize, screen_h as usize));
                 } else if event.pressed() && event.alt() && event.keycode == 0x2B {
-                    // Alt+Tab: rotate focus
-                    if windows.len() > 1 {
-                        let win = windows.pop().unwrap();
+                    // Alt+Tab: rotate focus among non-topmost windows
+                    let first_topmost = windows.iter().position(|w| w.topmost).unwrap_or(windows.len());
+                    if first_topmost > 1 {
+                        let win = windows.remove(first_topmost - 1);
                         windows.insert(0, win);
-                        if let Some(top) = windows.last_mut() {
-                            top.minimized = false;
+                        let first_topmost = windows.iter().position(|w| w.topmost).unwrap_or(windows.len());
+                        if first_topmost > 0 {
+                            windows[first_topmost - 1].minimized = false;
                         }
                         mark_dirty(&mut dirty_rect, DirtyRect::full(screen_w as usize, screen_h as usize));
                     }
@@ -821,10 +844,17 @@ fn main() {
                                 }
                             }
                             0x51 => {
-                                // Super+Down: restore
+                                // Super+Down: restore or minimize
                                 if windows[idx].mode != WindowMode::Normal {
                                     restore_window(&mut windows[idx], pixel_format);
+                                } else {
+                                    windows[idx].minimized = true;
                                 }
+                            }
+                            0x14 => {
+                                // GUI+Q: close focused window
+                                let win = windows.remove(idx);
+                                message::send(win.pid, Message::signal(window::MSG_WINDOW_CLOSE)).ok();
                             }
                             0x19 => {
                                 // GUI+V: paste clipboard
@@ -952,11 +982,7 @@ fn main() {
                             mark_dirty(&mut dirty_rect, DirtyRect::full(screen_w as usize, screen_h as usize));
                         }
                         HitZone::MaximizeButton(idx) => {
-                            if idx != windows.len() - 1 {
-                                let win = windows.remove(idx);
-                                windows.push(win);
-                            }
-                            let new_idx = windows.len() - 1;
+                            let new_idx = bring_to_front(&mut windows, idx);
                             let pixel_format = screen.pixel_format_raw();
                             if windows[new_idx].mode != WindowMode::Normal {
                                 restore_window(&mut windows[new_idx], pixel_format);
@@ -971,11 +997,7 @@ fn main() {
                             mark_dirty(&mut dirty_rect, DirtyRect::full(screen_w as usize, screen_h as usize));
                         }
                         HitZone::TitleBar(idx) => {
-                            if idx != windows.len() - 1 {
-                                let win = windows.remove(idx);
-                                windows.push(win);
-                            }
-                            let new_idx = windows.len() - 1;
+                            let new_idx = bring_to_front(&mut windows, idx);
 
                             // Double-click detection
                             let now = syscall::clock_nanos();
@@ -1017,9 +1039,7 @@ fn main() {
                             mark_dirty(&mut dirty_rect, DirtyRect::full(screen_w as usize, screen_h as usize));
                         }
                         HitZone::ResizeCorner(idx) => {
-                            let win = windows.remove(idx);
-                            windows.push(win);
-                            let new_idx = windows.len() - 1;
+                            let new_idx = bring_to_front(&mut windows, idx);
                             interaction = Interaction::Resizing {
                                 window_idx: new_idx,
                             };
@@ -1027,12 +1047,11 @@ fn main() {
                         }
                         HitZone::Content(idx) => {
                             launcher_open = false;
-                            if idx != windows.len() - 1 {
-                                let win = windows.remove(idx);
-                                windows.push(win);
+                            let new_idx = bring_to_front(&mut windows, idx);
+                            if new_idx != idx {
                                 mark_dirty(&mut dirty_rect, DirtyRect::full(screen_w as usize, screen_h as usize));
                             }
-                            let win = windows.last().unwrap();
+                            let win = &windows[new_idx];
                             let ev = make_mouse_event(win, window::MOUSE_PRESS, 1, 0);
                             message::send(
                                 win.pid,
@@ -1043,13 +1062,11 @@ fn main() {
                             if idx < windows.len() {
                                 if windows[idx].minimized {
                                     windows[idx].minimized = false;
-                                    let win = windows.remove(idx);
-                                    windows.push(win);
+                                    bring_to_front(&mut windows, idx);
                                 } else if Some(idx) == focused_window_idx(&windows) {
                                     windows[idx].minimized = true;
                                 } else {
-                                    let win = windows.remove(idx);
-                                    windows.push(win);
+                                    bring_to_front(&mut windows, idx);
                                 }
                                 mark_dirty(&mut dirty_rect, DirtyRect::full(screen_w as usize, screen_h as usize));
                             }
@@ -1195,7 +1212,7 @@ fn main() {
                 window::MSG_CREATE_WINDOW => {
                     let req: window::CreateWindowRequest = msg.take_payload();
                     let title = if req.title_len > 0 {
-                        let len = (req.title_len as usize).min(31);
+                        let len = (req.title_len as usize).min(30);
                         String::from_utf8_lossy(&req.title[..len]).into_owned()
                     } else {
                         String::new()
@@ -1236,6 +1253,7 @@ fn main() {
                     syscall::grant_shared(token, sender);
                     let pixel_format = screen.pixel_format_raw();
 
+                    let topmost = req.flags & window::WINDOW_FLAG_TOPMOST != 0;
                     windows.push(WindowState {
                         pid: sender,
                         token,
@@ -1249,6 +1267,7 @@ fn main() {
                         buf_height: content_h,
                         title,
                         minimized: false,
+                        topmost,
                         mode: WindowMode::Normal,
                         saved_x: 0,
                         saved_y: 0,
@@ -1276,6 +1295,12 @@ fn main() {
                     if let Some(win) = windows.iter_mut().find(|w| w.pid == sender) {
                         win.presented = true;
                         mark_dirty(&mut dirty_rect, window_screen_rect(win));
+                    }
+                }
+                window::MSG_DESTROY_WINDOW => {
+                    if let Some(idx) = windows.iter().position(|w| w.pid == sender) {
+                        windows.remove(idx);
+                        mark_dirty(&mut dirty_rect, DirtyRect::full(screen_w as usize, screen_h as usize));
                     }
                 }
                 window::MSG_CLIPBOARD_SET => {

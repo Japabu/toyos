@@ -11,10 +11,14 @@ fn compositor_pid() -> u32 {
     *PID.get_or_init(|| syscall::find_pid("compositor").expect("no compositor running"))
 }
 
+// Window flags
+pub const WINDOW_FLAG_TOPMOST: u8 = 1;
+
 // Client → Compositor
 pub const MSG_CREATE_WINDOW: u32 = 1;
 pub const MSG_PRESENT: u32 = 2;
 pub const MSG_CLIPBOARD_SET: u32 = 3;
+pub const MSG_DESTROY_WINDOW: u32 = 4;
 
 // Compositor → Client
 pub const MSG_WINDOW_CREATED: u32 = 1;
@@ -29,8 +33,9 @@ pub const MSG_FRAME: u32 = 7;
 pub struct CreateWindowRequest {
     pub width: u32,
     pub height: u32,
+    pub flags: u8,
     pub title_len: u8,
-    pub title: [u8; 31],
+    pub title: [u8; 30],
 }
 
 pub const MOUSE_MOVE: u8 = 0;
@@ -123,14 +128,23 @@ impl Window {
     }
 
     pub fn create_with_title(width: u32, height: u32, title: &str) -> Self {
+        Self::create_with_flags(width, height, title, 0)
+    }
+
+    pub fn create_topmost(width: u32, height: u32, title: &str) -> Self {
+        Self::create_with_flags(width, height, title, WINDOW_FLAG_TOPMOST)
+    }
+
+    fn create_with_flags(width: u32, height: u32, title: &str, flags: u8) -> Self {
         let mut req = CreateWindowRequest {
             width,
             height,
+            flags,
             title_len: 0,
-            title: [0; 31],
+            title: [0; 30],
         };
         let bytes = title.as_bytes();
-        let len = bytes.len().min(31);
+        let len = bytes.len().min(30);
         req.title[..len].copy_from_slice(&bytes[..len]);
         req.title_len = len as u8;
         message::send(compositor_pid(), Message::new(MSG_CREATE_WINDOW, req))
@@ -206,5 +220,11 @@ impl Window {
             self.width as usize,
             self.pixel_format,
         )
+    }
+}
+
+impl Drop for Window {
+    fn drop(&mut self) {
+        message::send(compositor_pid(), Message::signal(MSG_DESTROY_WINDOW)).ok();
     }
 }

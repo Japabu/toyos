@@ -7,7 +7,7 @@ use elf::ElfBytes;
 use elf::endian::AnyEndian;
 use elf::abi::{
     PT_LOAD, PT_TLS, PT_DYNAMIC, ET_DYN, EM_X86_64, R_X86_64_RELATIVE, R_X86_64_GLOB_DAT,
-    DT_SYMTAB, DT_STRTAB, DT_STRSZ, DT_NULL, DT_NEEDED, DT_RELA, DT_RELASZ, SHT_DYNSYM,
+    DT_SYMTAB, DT_STRTAB, DT_STRSZ, DT_NULL, DT_NEEDED, SHT_DYNSYM,
 };
 
 /// Read a null-terminated string from `base + offset`, bounded by `max_size`.
@@ -87,7 +87,7 @@ pub fn load(data: &[u8]) -> Result<(OwnedAlloc, LoadedElfInfo), &'static str> {
     let base = base_ptr as u64 - vaddr_min;
     log!("ELF: allocated {} bytes at {:#x}, base={:#x}", load_size, base_ptr as u64, base);
 
-    // Load PT_LOAD segments
+    // Load PT_LOAD segments (BSS is already zero from alloc_zeroed)
     for phdr in segments.iter() {
         if phdr.p_type == PT_LOAD {
             let dst = (base + phdr.p_vaddr) as *mut u8;
@@ -95,7 +95,6 @@ pub fn load(data: &[u8]) -> Result<(OwnedAlloc, LoadedElfInfo), &'static str> {
             unsafe {
                 core::ptr::copy_nonoverlapping(src.as_ptr(), dst, phdr.p_filesz as usize);
             }
-            // BSS (memsz > filesz) is already zero from alloc_zeroed
         }
     }
 
@@ -149,6 +148,89 @@ pub struct LoadedLib {
     pub dynstr: u64,
     pub dynstr_size: u64,
     pub sym_count: usize,
+    pub tls_template: u64,
+    pub tls_filesz: usize,
+    pub tls_memsz: usize,
+    /// Runtime address of .rela.dyn (RELA entries for GLOB_DAT etc.)
+    pub rela_addr: u64,
+    /// Size of .rela.dyn in bytes.
+    pub rela_size: u64,
+    /// Runtime address of .rela.plt (JUMP_SLOT entries).
+    pub jmprel_addr: u64,
+    /// Size of .rela.plt in bytes.
+    pub jmprel_size: u64,
+    /// Runtime address of .gnu.hash table (0 if absent).
+    pub gnu_hash: u64,
+}
+
+/// Compute the GNU hash of a symbol name (DJB hash variant).
+fn gnu_hash(name: &str) -> u32 {
+    let mut h: u32 = 5381;
+    for &b in name.as_bytes() {
+        h = h.wrapping_mul(33).wrapping_add(b as u32);
+    }
+    h
+}
+
+/// Fast symbol lookup using .gnu.hash table. Returns runtime address or 0.
+fn gnu_dlsym(lib: &LoadedLib, name: &str) -> u64 {
+    if lib.gnu_hash == 0 {
+        return dlsym(lib, name);
+    }
+    let hash_addr = lib.gnu_hash;
+    let h = gnu_hash(name);
+
+    // Parse header: nbuckets, symoffset, bloom_size, bloom_shift
+    let nbuckets = unsafe { *((hash_addr) as *const u32) };
+    let symoffset = unsafe { *((hash_addr + 4) as *const u32) };
+    let bloom_size = unsafe { *((hash_addr + 8) as *const u32) };
+    let bloom_shift = unsafe { *((hash_addr + 12) as *const u32) };
+
+    // Bloom filter check (64-bit words)
+    let bloom_base = hash_addr + 16;
+    let bloom_word = unsafe {
+        *((bloom_base + ((h as u64 / 64) % bloom_size as u64) * 8) as *const u64)
+    };
+    let mask = (1u64 << (h % 64)) | (1u64 << ((h >> bloom_shift) % 64));
+    if bloom_word & mask != mask {
+        return 0; // Definitely not present
+    }
+
+    // Bucket lookup
+    let buckets_base = bloom_base + bloom_size as u64 * 8;
+    let bucket_idx = h % nbuckets;
+    let sym_idx = unsafe { *((buckets_base + bucket_idx as u64 * 4) as *const u32) };
+    if sym_idx == 0 {
+        return 0;
+    }
+
+    // Chain walk
+    let chains_base = buckets_base + nbuckets as u64 * 4;
+    let mut i = sym_idx;
+    loop {
+        let chain_val = unsafe {
+            *((chains_base + (i - symoffset) as u64 * 4) as *const u32)
+        };
+        // Compare hash values (ignoring lowest bit which is the chain-end flag)
+        if (chain_val | 1) == (h | 1) {
+            // Hash matches — verify with string compare
+            let sym_ptr = (lib.dynsym + i as u64 * 24) as *const u8;
+            let st_name = unsafe { *(sym_ptr as *const u32) };
+            let st_shndx = unsafe { *(sym_ptr.add(6) as *const u16) };
+            let st_value = unsafe { *(sym_ptr.add(8) as *const u64) };
+            if st_shndx != 0 {
+                let sym_name = bounded_cstr(lib.dynstr, st_name as u64, lib.dynstr_size);
+                if sym_name == name {
+                    return lib.base + st_value;
+                }
+            }
+        }
+        if chain_val & 1 != 0 {
+            break; // End of chain
+        }
+        i += 1;
+    }
+    0
 }
 
 /// Load a shared library (.so) into memory for dynamic linking.
@@ -193,7 +275,7 @@ pub fn load_shared_lib(data: &[u8]) -> Result<LoadedLib, &'static str> {
     let base_ptr = alloc.ptr();
     let base = base_ptr as u64 - vaddr_min;
 
-    // Copy PT_LOAD segments
+    // Copy PT_LOAD segments (BSS is already zero from alloc_zeroed)
     for phdr in segments.iter() {
         if phdr.p_type == PT_LOAD {
             let dst = (base + phdr.p_vaddr) as *mut u8;
@@ -219,10 +301,20 @@ pub fn load_shared_lib(data: &[u8]) -> Result<LoadedLib, &'static str> {
         }
     }
 
-    // Parse PT_DYNAMIC to find DT_SYMTAB, DT_STRTAB, DT_STRSZ
+    // Parse PT_DYNAMIC to find DT_SYMTAB, DT_STRTAB, DT_STRSZ, DT_RELA, DT_RELASZ, DT_JMPREL, DT_PLTRELSZ
     let mut symtab_vaddr = 0u64;
     let mut strtab_vaddr = 0u64;
     let mut strtab_size = 0u64;
+    let mut rela_vaddr = 0u64;
+    let mut rela_size = 0u64;
+    let mut jmprel_vaddr = 0u64;
+    let mut jmprel_size = 0u64;
+    const DT_RELA: i64 = 7;
+    const DT_RELASZ: i64 = 8;
+    const DT_JMPREL: i64 = 23;
+    const DT_PLTRELSZ: i64 = 2;
+    const DT_GNU_HASH: i64 = 0x6ffffef5u64 as i64;
+    let mut gnu_hash_vaddr = 0u64;
     for phdr in segments.iter() {
         if phdr.p_type == PT_DYNAMIC {
             let dyn_addr = (base + phdr.p_vaddr) as *const u8;
@@ -235,6 +327,11 @@ pub fn load_shared_lib(data: &[u8]) -> Result<LoadedLib, &'static str> {
                     DT_SYMTAB => symtab_vaddr = d_val,
                     DT_STRTAB => strtab_vaddr = d_val,
                     DT_STRSZ => strtab_size = d_val,
+                    DT_RELA => rela_vaddr = d_val,
+                    DT_RELASZ => rela_size = d_val,
+                    DT_JMPREL => jmprel_vaddr = d_val,
+                    DT_PLTRELSZ => jmprel_size = d_val,
+                    DT_GNU_HASH => gnu_hash_vaddr = d_val,
                     DT_NULL => break,
                     _ => {}
                 }
@@ -257,10 +354,26 @@ pub fn load_shared_lib(data: &[u8]) -> Result<LoadedLib, &'static str> {
     let dynsym = base + symtab_vaddr;
     let dynstr = base + strtab_vaddr;
 
+    // Parse PT_TLS for thread-local storage
+    let mut tls_template = 0u64;
+    let mut tls_filesz = 0usize;
+    let mut tls_memsz = 0usize;
+    for phdr in segments.iter() {
+        if phdr.p_type == PT_TLS {
+            tls_template = base + phdr.p_vaddr;
+            tls_filesz = phdr.p_filesz as usize;
+            tls_memsz = phdr.p_memsz as usize;
+        }
+    }
+
     log!("dlopen: loaded {} bytes at {:#x}, {} relocs, {} dynsyms",
         load_size, base_ptr as u64, reloc_count, sym_count);
 
-    Ok(LoadedLib { alloc, base, dynsym, dynstr, dynstr_size: strtab_size, sym_count })
+    Ok(LoadedLib { alloc, base, dynsym, dynstr, dynstr_size: strtab_size, sym_count,
+        tls_template, tls_filesz, tls_memsz,
+        rela_addr: base + rela_vaddr, rela_size,
+        jmprel_addr: base + jmprel_vaddr, jmprel_size,
+        gnu_hash: if gnu_hash_vaddr != 0 { base + gnu_hash_vaddr } else { 0 } })
 }
 
 /// Look up a symbol by name in a loaded shared library.
@@ -285,6 +398,62 @@ pub fn dlsym(lib: &LoadedLib, name: &str) -> u64 {
         }
     }
     0
+}
+
+/// Resolve GLOB_DAT and JUMP_SLOT relocations in a dlopen'd library by looking
+/// up symbols from already-loaded libraries.
+pub fn resolve_dlopen_relocs(lib: &LoadedLib, other_libs: &[LoadedLib]) {
+    let entry_size = 24u64; // sizeof(Elf64_Rela)
+    let mut resolved_count = 0u64;
+    let mut unresolved_count = 0u64;
+
+    // Process both .rela.dyn and .rela.plt sections
+    let sections = [
+        (lib.rela_addr, lib.rela_size),
+        (lib.jmprel_addr, lib.jmprel_size),
+    ];
+
+    for (rela_addr, rela_size) in sections {
+        if rela_size == 0 { continue; }
+        let count = rela_size / entry_size;
+        for i in 0..count {
+            let rela_ptr = (rela_addr + i * entry_size) as *const u8;
+            let r_offset = unsafe { *(rela_ptr as *const u64) };
+            let r_info = unsafe { *(rela_ptr.add(8) as *const u64) };
+            let r_type = (r_info & 0xFFFF_FFFF) as u32;
+            let r_sym = (r_info >> 32) as u32;
+
+            match r_type {
+                7 /* R_X86_64_JUMP_SLOT */ | 6 /* R_X86_64_GLOB_DAT */ => {
+                    let sym_entry = (lib.dynsym + r_sym as u64 * 24) as *const u8;
+                    let st_name = unsafe { *(sym_entry as *const u32) };
+                    let sym_name = bounded_cstr(lib.dynstr, st_name as u64, lib.dynstr_size);
+
+                    let mut resolved = 0u64;
+                    for other in other_libs {
+                        let addr = gnu_dlsym(other, sym_name);
+                        if addr != 0 {
+                            resolved = addr;
+                            break;
+                        }
+                    }
+
+                    if resolved != 0 {
+                        let target = (lib.base + r_offset) as *mut u64;
+                        unsafe { *target = resolved; }
+                        resolved_count += 1;
+                    } else {
+                        if unresolved_count < 5 {
+                            log!("dlopen: unresolved: {}", sym_name);
+                        }
+                        unresolved_count += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    log!("dlopen: resolved {} relocs, {} unresolved", resolved_count, unresolved_count);
 }
 
 /// Load DT_NEEDED shared libraries and apply GLOB_DAT relocations for a
@@ -313,8 +482,6 @@ pub fn resolve_dynamic_deps(
     let mut symtab_vaddr = 0u64;
     let mut strtab_vaddr = 0u64;
     let mut strtab_size = 0u64;
-    let mut rela_vaddr = 0u64;
-    let mut rela_size = 0u64;
     let mut needed_offsets = alloc::vec::Vec::new();
 
     for phdr in segments.iter() {
@@ -332,8 +499,6 @@ pub fn resolve_dynamic_deps(
                 DT_SYMTAB => symtab_vaddr = d_val,
                 DT_STRTAB => strtab_vaddr = d_val,
                 DT_STRSZ => strtab_size = d_val,
-                DT_RELA => rela_vaddr = d_val,
-                DT_RELASZ => rela_size = d_val,
                 DT_NULL => break,
                 _ => {}
             }
@@ -370,52 +535,119 @@ pub fn resolve_dynamic_deps(
         }
     }
 
-    // Apply GLOB_DAT relocations: resolve imported symbols from loaded libs
-    if rela_vaddr != 0 && rela_size > 0 {
-        let rela_ptr = (base + rela_vaddr) as *const u8;
-        let num_entries = rela_size / 24;
-        let symtab_ptr = (base + symtab_vaddr) as *const u8;
+    // Apply GLOB_DAT relocations: resolve imported symbols from loaded libs.
+    // Read RELA entries from the raw file data (not loaded image) because
+    // .rela.dyn may not be covered by any PT_LOAD segment.
+    let symtab_ptr = (base + symtab_vaddr) as *const u8;
+    for section_name in &[".rela.dyn", ".rela.plt"] {
+        if let Ok(Some(shdr)) = elf.section_header_by_name(section_name) {
+            if let Ok(relas) = elf.section_data_as_relas(&shdr) {
+                for rela in relas {
+                    match rela.r_type {
+                        R_X86_64_RELATIVE => {
+                            let target = (base + rela.r_offset) as *mut u64;
+                            unsafe { *target = (base as i64 + rela.r_addend) as u64; }
+                        }
+                        R_X86_64_GLOB_DAT => {
+                            let sym_idx = rela.r_sym as u64;
+                            let sym_entry = unsafe { symtab_ptr.add(sym_idx as usize * 24) };
+                            let st_name = unsafe { *(sym_entry as *const u32) };
+                            let sym_name = bounded_cstr(dynstr, st_name as u64, strtab_size);
 
-        for i in 0..num_entries {
-            let entry = unsafe { rela_ptr.add(i as usize * 24) };
-            let r_offset = unsafe { *(entry as *const u64) };
-            let r_info = unsafe { *(entry.add(8) as *const u64) };
-            let r_type = (r_info & 0xFFFFFFFF) as u32;
+                            let mut resolved = 0u64;
+                            for lib in &libs {
+                                let addr = gnu_dlsym(lib, sym_name);
+                                if addr != 0 {
+                                    resolved = addr;
+                                    break;
+                                }
+                            }
+
+                            if resolved == 0 {
+                                log!("dynamic: unresolved symbol: {}", sym_name);
+                            }
+
+                            let target = (base + rela.r_offset) as *mut u64;
+                            unsafe { *target = resolved; }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    // Resolve GLOB_DAT in shared libraries — look up symbols from the
+    // executable and from other loaded libraries. This enables shared libraries
+    // to call back into the executable (e.g., _start calling main).
+    let exe_dlsym = |name: &str| -> u64 {
+        // Look up in the executable's .symtab (full symbol table, available from raw data)
+        if let Ok(Some((symtab, strtab))) = elf.symbol_table() {
+            for sym in symtab.iter() {
+                if sym.st_shndx == 0 { continue; }
+                if let Ok(sym_name) = strtab.get(sym.st_name as usize) {
+                    if sym_name == name {
+                        return base + sym.st_value;
+                    }
+                }
+            }
+        }
+        0
+    };
+
+    for lib in &libs {
+        let sections = [
+            (lib.rela_addr, lib.rela_size),
+            (lib.jmprel_addr, lib.jmprel_size),
+        ];
+        let entry_size = 24u64; // sizeof(Elf64_Rela)
+        for (rela_addr, rela_size) in sections {
+        if rela_size == 0 { continue; }
+        let count = rela_size / entry_size;
+        for i in 0..count {
+            let rela_ptr = (rela_addr + i * entry_size) as *const u8;
+            let r_offset = unsafe { *(rela_ptr as *const u64) };
+            let r_info = unsafe { *(rela_ptr.add(8) as *const u64) };
+            let r_addend = unsafe { *(rela_ptr.add(16) as *const i64) };
+            let r_type = (r_info & 0xFFFF_FFFF) as u32;
+            let r_sym = (r_info >> 32) as u32;
 
             match r_type {
-                R_X86_64_RELATIVE => {
-                    // Already handled by load(), but handle here too for completeness
-                    let r_addend = unsafe { *(entry.add(16) as *const i64) };
-                    let target = (base + r_offset) as *mut u64;
-                    unsafe { *target = (base as i64 + r_addend) as u64; }
-                }
-                R_X86_64_GLOB_DAT => {
-                    let sym_idx = (r_info >> 32) as u64;
-                    // Read symbol name from executable's import .dynsym/.dynstr
-                    let sym_entry = unsafe { symtab_ptr.add(sym_idx as usize * 24) };
+                7 /* R_X86_64_JUMP_SLOT */ | 6 /* R_X86_64_GLOB_DAT */ => {
+                    let sym_entry = (lib.dynsym + r_sym as u64 * 24) as *const u8;
                     let st_name = unsafe { *(sym_entry as *const u32) };
-                    let sym_name = bounded_cstr(dynstr, st_name as u64, strtab_size);
+                    let sym_name = bounded_cstr(lib.dynstr, st_name as u64, lib.dynstr_size);
 
-                    // Search all loaded libs for this symbol
-                    let mut resolved = 0u64;
-                    for lib in &libs {
-                        let addr = dlsym(lib, sym_name);
-                        if addr != 0 {
-                            resolved = addr;
-                            break;
+                    // Search: executable first, then other libraries
+                    let mut resolved = exe_dlsym(sym_name);
+                    if resolved == 0 {
+                        for other in &libs {
+                            let addr = gnu_dlsym(other, sym_name);
+                            if addr != 0 {
+                                resolved = addr;
+                                break;
+                            }
                         }
                     }
 
-                    if resolved == 0 {
-                        log!("dynamic: unresolved symbol: {}", sym_name);
+                    if resolved != 0 {
+                        let target = (lib.base + r_offset) as *mut u64;
+                        unsafe { *target = resolved; }
+                        if sym_name == "main" {
+                            log!("dynamic: resolved main -> {:#x}", resolved);
+                        }
+                    } else {
+                        log!("dynamic: lib unresolved symbol: {}", sym_name);
                     }
-
-                    let target = (base + r_offset) as *mut u64;
-                    unsafe { *target = resolved; }
+                }
+                8 /* R_X86_64_RELATIVE */ => {
+                    let target = (lib.base + r_offset) as *mut u64;
+                    unsafe { *target = (lib.base as i64 + r_addend) as u64; }
                 }
                 _ => {}
             }
         }
+        } // for sections
     }
 
     Ok(libs)
