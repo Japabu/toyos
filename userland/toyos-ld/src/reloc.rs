@@ -1,7 +1,58 @@
-use crate::collect::{InputReloc, LinkState, RelocType, SectionIdx, SectionKind, SymbolDef, SymbolRef};
+use crate::collect::{InputReloc, InputSection, LinkState, RelocType, SectionIdx, SectionKind, SymbolDef, SymbolRef};
 use crate::emit_pe::PeLayout;
 use crate::LinkError;
+use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
+
+/// Read-only context for parallel symbol resolution.
+/// Borrows the symbol tables and section metadata (for vaddr lookups)
+/// without holding a mutable reference to section data.
+struct ResolveCtx<'a> {
+    sections: &'a [InputSection],
+    globals: &'a HashMap<String, SymbolDef>,
+    locals: &'a HashMap<(crate::collect::ObjIdx, String), SymbolDef>,
+}
+
+impl<'a> ResolveCtx<'a> {
+    fn resolve(&self, sym: &SymbolRef, plt: Option<&HashMap<SymbolRef, u64>>) -> Option<u64> {
+        match sym {
+            SymbolRef::Global(name) => {
+                match self.globals.get(name)? {
+                    SymbolDef::Dynamic { .. } => plt.and_then(|p| p.get(&SymbolRef::Global(name.clone())).copied()),
+                    SymbolDef::Defined { section, value } => {
+                        let sec = &self.sections[section.0];
+                        Some(sec.vaddr.unwrap_or_else(|| panic!(
+                            "symbol {name:?} in section {:?} ({:?}) has no vaddr",
+                            sec.name, sec.kind,
+                        )) + value)
+                    }
+                }
+            }
+            SymbolRef::Local(obj_idx, name) => {
+                if let Some(def) = self.globals.get(name) {
+                    return match def {
+                        SymbolDef::Dynamic { .. } => plt.and_then(|p| p.get(&SymbolRef::Global(name.clone())).copied()),
+                        SymbolDef::Defined { section, value } => {
+                            let sec = &self.sections[section.0];
+                            Some(sec.vaddr.unwrap_or_else(|| panic!(
+                                "symbol {name:?} in section {:?} ({:?}) has no vaddr",
+                                sec.name, sec.kind,
+                            )) + value)
+                        }
+                    };
+                }
+                if let Some(SymbolDef::Defined { section, value }) = self.locals.get(&(*obj_idx, name.clone())) {
+                    let sec = &self.sections[section.0];
+                    return Some(sec.vaddr.unwrap_or_else(|| panic!(
+                        "symbol {name:?} in section {:?} ({:?}) has no vaddr",
+                        sec.name, sec.kind,
+                    )) + value);
+                }
+                None
+            }
+        }
+    }
+}
 
 pub(crate) struct RelocOutput {
     pub(crate) relatives: Vec<(u64, i64)>,
@@ -98,10 +149,10 @@ fn check_u32(value: i64, reloc: &InputReloc) -> Result<(), LinkError> {
     Ok(())
 }
 
-/// Apply a single relocation, returning `true` if it's an absolute reference
-/// (needs a runtime relocation / PE base fixup).
-fn apply_one_reloc(
-    state: &mut LinkState,
+/// Apply a single relocation to section data, returning `true` if it's an absolute
+/// reference (needs a runtime relocation / PE base fixup).
+fn apply_one_reloc_x86(
+    data: &mut [u8],
     reloc: &InputReloc,
     sym_addr: u64,
     reloc_vaddr: u64,
@@ -111,25 +162,25 @@ fn apply_one_reloc(
     match reloc.r_type {
         RelocType::X86_64 => {
             let value = (sym_addr as i64 + reloc.addend) as u64;
-            write_u64(state, reloc.section, reloc.offset, value);
+            write_u64_data(data, reloc.offset, value);
             Ok(true)
         }
         RelocType::X86Pc32 | RelocType::X86Plt32 => {
             let value = sym_addr as i64 + reloc.addend - reloc_vaddr as i64;
             check_i32(value, reloc)?;
-            write_i32(state, reloc.section, reloc.offset, value as i32);
+            write_i32_data(data, reloc.offset, value as i32);
             Ok(false)
         }
         RelocType::X86_32 => {
             let value = sym_addr as i64 + reloc.addend;
             check_u32(value, reloc)?;
-            write_u32(state, reloc.section, reloc.offset, value as u32);
+            write_u32_data(data, reloc.offset, value as u32);
             Ok(false)
         }
         RelocType::X86_32S => {
             let value = sym_addr as i64 + reloc.addend;
             check_i32(value, reloc)?;
-            write_i32(state, reloc.section, reloc.offset, value as i32);
+            write_i32_data(data, reloc.offset, value as i32);
             Ok(false)
         }
         RelocType::X86Gotpcrel | RelocType::X86Gotpcrelx
@@ -142,21 +193,20 @@ fn apply_one_reloc(
                 })?;
             let value = *got_slot as i64 + reloc.addend - reloc_vaddr as i64;
             check_i32(value, reloc)?;
-            write_i32(state, reloc.section, reloc.offset, value as i32);
+            write_i32_data(data, reloc.offset, value as i32);
             Ok(false)
         }
         RelocType::X86Tlv => {
             // Mach-O X86_64_RELOC_TLV: rewrite `movq disp(%rip), %reg` to
             // `leaq disp(%rip), %reg` so the register gets the ADDRESS of the
             // TLV descriptor, not its contents. Change opcode 0x8B → 0x8D.
-            let sec = &mut state.sections[reloc.section];
             let op_off = reloc.offset as usize - 2;
-            if sec.data[op_off] == 0x8b {
-                sec.data[op_off] = 0x8d; // movq → leaq
+            if data[op_off] == 0x8b {
+                data[op_off] = 0x8d; // movq → leaq
             }
             let value = sym_addr as i64 + reloc.addend - reloc_vaddr as i64;
             check_i32(value, reloc)?;
-            write_i32(state, reloc.section, reloc.offset, value as i32);
+            write_i32_data(data, reloc.offset, value as i32);
             Ok(false)
         }
         other => Err(LinkError::UnsupportedRelocation {
@@ -166,22 +216,37 @@ fn apply_one_reloc(
     }
 }
 
-fn write_bytes(state: &mut LinkState, sec_idx: SectionIdx, offset: u64, bytes: &[u8]) {
-    let sec = &mut state.sections[sec_idx];
+fn write_bytes_data(data: &mut [u8], offset: u64, bytes: &[u8]) {
     let off = offset as usize;
-    sec.data[off..off + bytes.len()].copy_from_slice(bytes);
+    data[off..off + bytes.len()].copy_from_slice(bytes);
 }
 
-fn write_u64(state: &mut LinkState, sec_idx: SectionIdx, offset: u64, value: u64) {
-    write_bytes(state, sec_idx, offset, &value.to_le_bytes());
+fn write_u64_data(data: &mut [u8], offset: u64, value: u64) {
+    write_bytes_data(data, offset, &value.to_le_bytes());
+}
+
+fn write_i32_data(data: &mut [u8], offset: u64, value: i32) {
+    write_bytes_data(data, offset, &value.to_le_bytes());
+}
+
+fn write_u32_data(data: &mut [u8], offset: u64, value: u32) {
+    write_bytes_data(data, offset, &value.to_le_bytes());
+}
+
+fn write_bytes(state: &mut LinkState, sec_idx: SectionIdx, offset: u64, bytes: &[u8]) {
+    write_bytes_data(&mut state.sections[sec_idx].data, offset, bytes);
 }
 
 fn write_i32(state: &mut LinkState, sec_idx: SectionIdx, offset: u64, value: i32) {
-    write_bytes(state, sec_idx, offset, &value.to_le_bytes());
+    write_i32_data(&mut state.sections[sec_idx].data, offset, value);
 }
 
 fn write_u32(state: &mut LinkState, sec_idx: SectionIdx, offset: u64, value: u32) {
-    write_bytes(state, sec_idx, offset, &value.to_le_bytes());
+    write_u32_data(&mut state.sections[sec_idx].data, offset, value);
+}
+
+fn write_u64(state: &mut LinkState, sec_idx: SectionIdx, offset: u64, value: u64) {
+    write_u64_data(&mut state.sections[sec_idx].data, offset, value);
 }
 
 /// Detect whether a TLS GD/LD relocation uses the 16-byte padded or 12-byte
@@ -359,77 +424,183 @@ pub(crate) fn apply_relocs(
         }
     }
 
-    // Pass 2: all other relocations
-    for reloc in &relocs {
-        if matches!(reloc.r_type, RelocType::X86Tlsgd | RelocType::X86Tlsld | RelocType::X86Dtpoff32) {
-            continue; // handled in pass 1
-        }
-        if relaxed_calls.contains(&(reloc.section, reloc.offset)) {
-            continue;
-        }
+    // Pass 2: all other relocations — processed in parallel by section.
+    // Group pass-2 relocations by section index.
+    let pass2_relocs: Vec<&InputReloc> = relocs.iter()
+        .filter(|r| !matches!(r.r_type, RelocType::X86Tlsgd | RelocType::X86Tlsld | RelocType::X86Dtpoff32))
+        .filter(|r| !relaxed_calls.contains(&(r.section, r.offset)))
+        .collect();
 
-        let sec = &state.sections[reloc.section];
-        let reloc_vaddr = sec.vaddr.unwrap_or_else(|| panic!(
-            "reloc section {:?} ({:?}) has no vaddr", sec.name, sec.kind,
-        )) + reloc.offset;
+    let mut by_section: HashMap<usize, Vec<&InputReloc>> = HashMap::new();
+    for reloc in &pass2_relocs {
+        by_section.entry(reloc.section.0).or_default().push(reloc);
+    }
 
-        let sym_addr = match resolve_symbol(state, &reloc.target, params.plt) {
-            Some(a) => a,
-            None => {
-                undefined.insert(reloc.target.name().to_string());
-                continue;
-            }
-        };
+    // Take sections out so we can give each section exclusive &mut access in parallel,
+    // while the resolve context borrows the symbol tables immutably.
+    let sections = std::mem::take(&mut state.sections);
 
-        match reloc.r_type {
-            RelocType::X86Tpoff32 => {
-                if params.is_shared {
-                    // Shared mode: emit R_X86_64_TPOFF32 runtime reloc
-                    let sym_tls_offset = sym_addr as i64 - params.tls_start as i64 + reloc.addend;
-                    write_i32(state, reloc.section, reloc.offset, 0);
-                    tpoff32_entries.push((reloc_vaddr, sym_tls_offset));
-                } else {
-                    let value = tpoff(sym_addr, params.tls_start, params.tls_memsz) + reloc.addend;
-                    check_i32(value, reloc)?;
-                    write_i32(state, reloc.section, reloc.offset, value as i32);
+    // Build vaddr lookup table (read-only) from section metadata before we split borrows.
+    let section_vaddrs: Vec<Option<u64>> = sections.iter()
+        .map(|s| s.vaddr)
+        .collect();
+    let section_meta: Vec<(String, SectionKind)> = sections.iter()
+        .map(|s| (s.name.clone(), s.kind))
+        .collect();
+
+    let ctx = ResolveCtx {
+        sections: &sections,
+        globals: &state.globals,
+        locals: &state.locals,
+    };
+
+    // Per-section results collected in parallel
+    struct SectionResult {
+        relatives: Vec<(u64, i64)>,
+        undefined: Vec<String>,
+        tpoff32_entries: Vec<(u64, i64)>,
+        error: Option<LinkError>,
+    }
+
+    let section_indices: Vec<usize> = by_section.keys().copied().collect();
+    let section_results: Vec<(usize, SectionResult)> = section_indices.par_iter()
+        .map(|&sec_idx| {
+            let sec_relocs = &by_section[&sec_idx];
+            let mut result = SectionResult {
+                relatives: Vec::new(),
+                undefined: Vec::new(),
+                tpoff32_entries: Vec::new(),
+                error: None,
+            };
+
+            let sec_vaddr = match section_vaddrs[sec_idx] {
+                Some(v) => v,
+                None => {
+                    let (ref name, kind) = section_meta[sec_idx];
+                    panic!("reloc section {name:?} ({kind:?}) has no vaddr");
+                }
+            };
+
+            // SAFETY: each thread processes a distinct sec_idx, so the
+            // mutable access to sections[sec_idx].data does not alias.
+            let data: &mut [u8] = unsafe {
+                let ptr = sections.as_ptr().cast_mut().add(sec_idx);
+                &mut (*ptr).data
+            };
+
+            for reloc in sec_relocs {
+                let reloc_vaddr = sec_vaddr + reloc.offset;
+
+                // Gottpoff relocations only need the GOT slot, not the symbol address.
+                // Dynamic TLS symbols (from shared libraries) can't be resolved via
+                // resolve_symbol — they have no PLT entry — but their GOT slot is
+                // filled at load time via TPOFF64 runtime relocs.
+                if reloc.r_type == RelocType::X86Gottpoff {
+                    let got_slot = match params.got.get(&reloc.target) {
+                        Some(&v) => v,
+                        None => {
+                            result.error = Some(LinkError::UndefinedSymbols(vec![reloc.target.name().to_string()]));
+                            return (sec_idx, result);
+                        }
+                    };
+                    let value = got_slot as i64 + reloc.addend - reloc_vaddr as i64;
+                    if let Err(e) = check_i32(value, reloc) {
+                        result.error = Some(e);
+                        return (sec_idx, result);
+                    }
+                    write_i32_data(data, reloc.offset, value as i32);
+                    continue;
+                }
+
+                let sym_addr = match ctx.resolve(&reloc.target, params.plt) {
+                    Some(a) => a,
+                    None => {
+                        result.undefined.push(reloc.target.name().to_string());
+                        continue;
+                    }
+                };
+
+                match reloc.r_type {
+                    RelocType::X86Tpoff32 => {
+                        if params.is_shared {
+                            let sym_tls_offset = sym_addr as i64 - params.tls_start as i64 + reloc.addend;
+                            write_i32_data(data, reloc.offset, 0);
+                            result.tpoff32_entries.push((reloc_vaddr, sym_tls_offset));
+                        } else {
+                            let value = tpoff(sym_addr, params.tls_start, params.tls_memsz) + reloc.addend;
+                            if let Err(e) = check_i32(value, reloc) {
+                                result.error = Some(e);
+                                return (sec_idx, result);
+                            }
+                            write_i32_data(data, reloc.offset, value as i32);
+                        }
+                    }
+                    RelocType::X86Gottpoff => unreachable!("handled above"),
+                    RelocType::X86Tlsgd | RelocType::X86Tlsld | RelocType::X86Dtpoff32 => {
+                        unreachable!("handled in pass 1")
+                    }
+                    RelocType::X86_64 | RelocType::X86Pc32 | RelocType::X86Plt32
+                    | RelocType::X86_32 | RelocType::X86_32S
+                    | RelocType::X86Gotpcrel | RelocType::X86Gotpcrelx
+                    | RelocType::X86RexGotpcrelx
+                    | RelocType::X86Tlv => {
+                        match apply_one_reloc_x86(data, reloc, sym_addr, reloc_vaddr, params.got, params.dyn_got) {
+                            Ok(is_abs) => {
+                                if is_abs && params.record_relatives {
+                                    result.relatives.push((reloc_vaddr, sym_addr as i64 + reloc.addend));
+                                }
+                            }
+                            Err(e) => {
+                                result.error = Some(e);
+                                return (sec_idx, result);
+                            }
+                        }
+                    }
+                    RelocType::Aarch64Abs64 | RelocType::Aarch64Abs32
+                    | RelocType::Aarch64Prel32
+                    | RelocType::Aarch64Call26 | RelocType::Aarch64Jump26
+                    | RelocType::Aarch64AdrPrelPgHi21 | RelocType::Aarch64AddAbsLo12Nc
+                    | RelocType::Aarch64Ldst8AbsLo12Nc | RelocType::Aarch64Ldst16AbsLo12Nc
+                    | RelocType::Aarch64Ldst32AbsLo12Nc | RelocType::Aarch64Ldst64AbsLo12Nc
+                    | RelocType::Aarch64Ldst128AbsLo12Nc
+                    | RelocType::Aarch64MovwUabsG0Nc | RelocType::Aarch64MovwUabsG1Nc
+                    | RelocType::Aarch64MovwUabsG2Nc | RelocType::Aarch64MovwUabsG3
+                    | RelocType::Aarch64AdrGotPage | RelocType::Aarch64Ld64GotLo12Nc
+                    | RelocType::Aarch64GotPcrel32
+                    | RelocType::Aarch64TlvpLoadPage21
+                    | RelocType::Aarch64TlvpLoadPageoff12 => {
+                        match apply_one_reloc_aarch64(data, reloc, sym_addr, reloc_vaddr, params.got) {
+                            Ok(is_abs) => {
+                                if is_abs && params.record_relatives {
+                                    result.relatives.push((reloc_vaddr, sym_addr as i64 + reloc.addend));
+                                }
+                            }
+                            Err(e) => {
+                                result.error = Some(e);
+                                return (sec_idx, result);
+                            }
+                        }
+                    }
                 }
             }
-            RelocType::X86Gottpoff => {
-                let got_slot = *params.got.get(&reloc.target).ok_or_else(|| {
-                    LinkError::UndefinedSymbols(vec![reloc.target.name().to_string()])
-                })?;
-                let value = got_slot as i64 + reloc.addend - reloc_vaddr as i64;
-                check_i32(value, reloc)?;
-                write_i32(state, reloc.section, reloc.offset, value as i32);
-            }
-            // Pass 1 handled these; skipped by continue above
-            RelocType::X86Tlsgd | RelocType::X86Tlsld | RelocType::X86Dtpoff32 => {
-                unreachable!("handled in pass 1")
-            }
-            RelocType::X86_64 | RelocType::X86Pc32 | RelocType::X86Plt32
-            | RelocType::X86_32 | RelocType::X86_32S
-            | RelocType::X86Gotpcrel | RelocType::X86Gotpcrelx
-            | RelocType::X86RexGotpcrelx
-            | RelocType::X86Tlv
-            | RelocType::Aarch64Abs64 | RelocType::Aarch64Abs32
-            | RelocType::Aarch64Prel32
-            | RelocType::Aarch64Call26 | RelocType::Aarch64Jump26
-            | RelocType::Aarch64AdrPrelPgHi21 | RelocType::Aarch64AddAbsLo12Nc
-            | RelocType::Aarch64Ldst8AbsLo12Nc | RelocType::Aarch64Ldst16AbsLo12Nc
-            | RelocType::Aarch64Ldst32AbsLo12Nc | RelocType::Aarch64Ldst64AbsLo12Nc
-            | RelocType::Aarch64Ldst128AbsLo12Nc
-            | RelocType::Aarch64MovwUabsG0Nc | RelocType::Aarch64MovwUabsG1Nc
-            | RelocType::Aarch64MovwUabsG2Nc | RelocType::Aarch64MovwUabsG3
-            | RelocType::Aarch64AdrGotPage | RelocType::Aarch64Ld64GotLo12Nc
-            | RelocType::Aarch64GotPcrel32
-            | RelocType::Aarch64TlvpLoadPage21
-            | RelocType::Aarch64TlvpLoadPageoff12 => {
-                let is_abs = apply_one_reloc(state, reloc, sym_addr, reloc_vaddr, params.got, params.dyn_got)?;
-                if is_abs && params.record_relatives {
-                    relatives.push((reloc_vaddr, sym_addr as i64 + reloc.addend));
-                }
-            }
+
+            (sec_idx, result)
+        })
+        .collect();
+
+    // Put sections back
+    state.sections = sections;
+
+    // Merge parallel results
+    for (_, result) in section_results {
+        if let Some(e) = result.error {
+            return Err(e);
         }
+        relatives.extend(result.relatives);
+        for sym in result.undefined {
+            undefined.insert(sym);
+        }
+        tpoff32_entries.extend(result.tpoff32_entries);
     }
 
     // Fill GOT entries (PIE mode records as RELATIVE; static mode handles in emit)
@@ -490,35 +661,31 @@ pub(crate) fn apply_relocs(
 
 // ── AArch64 relocation helpers ───────────────────────────────────────────
 
-/// Apply a single AArch64 relocation. Returns `true` if it produced an absolute
-/// reference that needs a Mach-O rebase entry.
+/// Apply a single AArch64 relocation to section data. Returns `true` if it
+/// produced an absolute reference that needs a Mach-O rebase entry.
 fn apply_one_reloc_aarch64(
-    state: &mut LinkState,
+    data: &mut [u8],
     reloc: &InputReloc,
     sym_addr: u64,
     reloc_vaddr: u64,
     got: &HashMap<SymbolRef, u64>,
 ) -> Result<bool, LinkError> {
     match reloc.r_type {
-        // Absolute 64-bit pointer
         RelocType::Aarch64Abs64 => {
             let value = (sym_addr as i64 + reloc.addend) as u64;
-            write_u64(state, reloc.section, reloc.offset, value);
-            Ok(true) // needs rebase
+            write_u64_data(data, reloc.offset, value);
+            Ok(true)
         }
-        // Absolute 32-bit
         RelocType::Aarch64Abs32 => {
             let value = sym_addr as i64 + reloc.addend;
-            write_u32(state, reloc.section, reloc.offset, value as u32);
+            write_u32_data(data, reloc.offset, value as u32);
             Ok(false)
         }
-        // PC-relative 32-bit
         RelocType::Aarch64Prel32 => {
             let value = sym_addr as i64 + reloc.addend - reloc_vaddr as i64;
-            write_i32(state, reloc.section, reloc.offset, value as i32);
+            write_i32_data(data, reloc.offset, value as i32);
             Ok(false)
         }
-        // BL/B instruction: 26-bit PC-relative
         RelocType::Aarch64Call26 | RelocType::Aarch64Jump26 => {
             let value = sym_addr as i64 + reloc.addend - reloc_vaddr as i64;
             let imm26 = value >> 2;
@@ -527,31 +694,29 @@ fn apply_one_reloc_aarch64(
                     reloc_type: reloc.r_type, symbol: reloc.target.name().to_string(), value,
                 });
             }
-            patch_aarch64_insn_imm26(state, reloc.section, reloc.offset, imm26 as u32);
+            patch_aarch64_insn_imm26_data(data, reloc.offset, imm26 as u32);
             Ok(false)
         }
-        // MOVZ/MOVK: 16-bit absolute value slices
         RelocType::Aarch64MovwUabsG0Nc => {
             let value = ((sym_addr as i64 + reloc.addend) & 0xFFFF) as u32;
-            patch_aarch64_movw(state, reloc.section, reloc.offset, value);
+            patch_aarch64_movw_data(data, reloc.offset, value);
             Ok(false)
         }
         RelocType::Aarch64MovwUabsG1Nc => {
             let value = (((sym_addr as i64 + reloc.addend) >> 16) & 0xFFFF) as u32;
-            patch_aarch64_movw(state, reloc.section, reloc.offset, value);
+            patch_aarch64_movw_data(data, reloc.offset, value);
             Ok(false)
         }
         RelocType::Aarch64MovwUabsG2Nc => {
             let value = (((sym_addr as i64 + reloc.addend) >> 32) & 0xFFFF) as u32;
-            patch_aarch64_movw(state, reloc.section, reloc.offset, value);
+            patch_aarch64_movw_data(data, reloc.offset, value);
             Ok(false)
         }
         RelocType::Aarch64MovwUabsG3 => {
             let value = (((sym_addr as i64 + reloc.addend) >> 48) & 0xFFFF) as u32;
-            patch_aarch64_movw(state, reloc.section, reloc.offset, value);
+            patch_aarch64_movw_data(data, reloc.offset, value);
             Ok(false)
         }
-        // ADRP: 21-bit page-relative
         RelocType::Aarch64AdrPrelPgHi21 => {
             let sym_page = (sym_addr as i64 + reloc.addend) & !0xFFF;
             let pc_page = reloc_vaddr as i64 & !0xFFF;
@@ -561,42 +726,39 @@ fn apply_one_reloc_aarch64(
                     reloc_type: reloc.r_type, symbol: reloc.target.name().to_string(), value: page_delta,
                 });
             }
-            patch_aarch64_adrp(state, reloc.section, reloc.offset, page_delta as i32);
+            patch_aarch64_adrp_data(data, reloc.offset, page_delta as i32);
             Ok(false)
         }
-        // ADD immediate: 12-bit page offset
         RelocType::Aarch64AddAbsLo12Nc => {
             let value = ((sym_addr as i64 + reloc.addend) & 0xFFF) as u32;
-            patch_aarch64_add_imm12(state, reloc.section, reloc.offset, value);
+            patch_aarch64_add_imm12_data(data, reloc.offset, value);
             Ok(false)
         }
-        // LDR/STR: 12-bit page offset, scaled by access size
         RelocType::Aarch64Ldst8AbsLo12Nc => {
             let value = ((sym_addr as i64 + reloc.addend) & 0xFFF) as u32;
-            patch_aarch64_ldr_imm12(state, reloc.section, reloc.offset, value, 0);
+            patch_aarch64_ldr_imm12_data(data, reloc.offset, value, 0);
             Ok(false)
         }
         RelocType::Aarch64Ldst16AbsLo12Nc => {
             let value = ((sym_addr as i64 + reloc.addend) & 0xFFF) as u32;
-            patch_aarch64_ldr_imm12(state, reloc.section, reloc.offset, value, 1);
+            patch_aarch64_ldr_imm12_data(data, reloc.offset, value, 1);
             Ok(false)
         }
         RelocType::Aarch64Ldst32AbsLo12Nc => {
             let value = ((sym_addr as i64 + reloc.addend) & 0xFFF) as u32;
-            patch_aarch64_ldr_imm12(state, reloc.section, reloc.offset, value, 2);
+            patch_aarch64_ldr_imm12_data(data, reloc.offset, value, 2);
             Ok(false)
         }
         RelocType::Aarch64Ldst64AbsLo12Nc => {
             let value = ((sym_addr as i64 + reloc.addend) & 0xFFF) as u32;
-            patch_aarch64_ldr_imm12(state, reloc.section, reloc.offset, value, 3);
+            patch_aarch64_ldr_imm12_data(data, reloc.offset, value, 3);
             Ok(false)
         }
         RelocType::Aarch64Ldst128AbsLo12Nc => {
             let value = ((sym_addr as i64 + reloc.addend) & 0xFFF) as u32;
-            patch_aarch64_ldr_imm12(state, reloc.section, reloc.offset, value, 4);
+            patch_aarch64_ldr_imm12_data(data, reloc.offset, value, 4);
             Ok(false)
         }
-        // ADRP for GOT entry page
         RelocType::Aarch64AdrGotPage => {
             let got_slot = *got.get(&reloc.target).ok_or_else(|| {
                 LinkError::UndefinedSymbols(vec![reloc.target.name().to_string()])
@@ -609,34 +771,27 @@ fn apply_one_reloc_aarch64(
                     reloc_type: reloc.r_type, symbol: reloc.target.name().to_string(), value: page_delta,
                 });
             }
-            patch_aarch64_adrp(state, reloc.section, reloc.offset, page_delta as i32);
+            patch_aarch64_adrp_data(data, reloc.offset, page_delta as i32);
             Ok(false)
         }
-        // LDR for GOT entry page offset
         RelocType::Aarch64Ld64GotLo12Nc => {
             let got_slot = *got.get(&reloc.target).ok_or_else(|| {
                 LinkError::UndefinedSymbols(vec![reloc.target.name().to_string()])
             })?;
             let value = (got_slot & 0xFFF) as u32;
-            patch_aarch64_ldr_imm12(state, reloc.section, reloc.offset, value, 3);
+            patch_aarch64_ldr_imm12_data(data, reloc.offset, value, 3);
             Ok(false)
         }
-        // TLV pageoff12: compiler emits LDR for the descriptor address,
-        // but since the descriptor is in the same image we relax to ADD.
         RelocType::Aarch64TlvpLoadPageoff12 => {
             let value = ((sym_addr as i64 + reloc.addend) & 0xFFF) as u32;
-            // Rewrite LDR to ADD Xd, Xn, #imm12
-            let sec = &state.sections[reloc.section.0];
             let insn_off = reloc.offset as usize;
-            let old_insn = u32::from_le_bytes(sec.data[insn_off..insn_off+4].try_into().unwrap());
+            let old_insn = u32::from_le_bytes(data[insn_off..insn_off+4].try_into().unwrap());
             let rd = old_insn & 0x1F;
             let rn = (old_insn >> 5) & 0x1F;
             let new_insn: u32 = 0x91000000 | (value << 10) | (rn << 5) | rd;
-            state.sections[reloc.section.0].data[insn_off..insn_off+4]
-                .copy_from_slice(&new_insn.to_le_bytes());
+            data[insn_off..insn_off+4].copy_from_slice(&new_insn.to_le_bytes());
             Ok(false)
         }
-        // TLV page21: same as ADRP but targeting a TLV descriptor.
         RelocType::Aarch64TlvpLoadPage21 => {
             let sym_page = (sym_addr as i64 + reloc.addend) & !0xFFF;
             let pc_page = reloc_vaddr as i64 & !0xFFF;
@@ -646,17 +801,16 @@ fn apply_one_reloc_aarch64(
                     reloc_type: reloc.r_type, symbol: reloc.target.name().to_string(), value: page_delta,
                 });
             }
-            patch_aarch64_adrp(state, reloc.section, reloc.offset, page_delta as i32);
+            patch_aarch64_adrp_data(data, reloc.offset, page_delta as i32);
             Ok(false)
         }
-        // 32-bit PC-relative GOT pointer (used in .eh_frame for personality)
         RelocType::Aarch64GotPcrel32 => {
             let got_slot = *got.get(&reloc.target).ok_or_else(|| {
                 LinkError::UndefinedSymbols(vec![reloc.target.name().to_string()])
             })?;
             let value = got_slot as i64 + reloc.addend - reloc_vaddr as i64;
             check_i32(value, reloc)?;
-            write_i32(state, reloc.section, reloc.offset, value as i32);
+            write_i32_data(data, reloc.offset, value as i32);
             Ok(false)
         }
         other => Err(LinkError::UnsupportedRelocation {
@@ -665,40 +819,33 @@ fn apply_one_reloc_aarch64(
     }
 }
 
-/// Read-modify-write a 32-bit LE instruction in a section.
-fn modify_insn(state: &mut LinkState, sec: SectionIdx, offset: u64, f: impl FnOnce(u32) -> u32) {
-    let data = &mut state.sections[sec].data;
+/// Read-modify-write a 32-bit LE instruction in section data.
+fn modify_insn_data(data: &mut [u8], offset: u64, f: impl FnOnce(u32) -> u32) {
     let off = offset as usize;
     let insn = u32::from_le_bytes(data[off..off + 4].try_into().unwrap());
     data[off..off + 4].copy_from_slice(&f(insn).to_le_bytes());
 }
 
-/// Patch ADRP instruction's immhi:immlo fields with a page delta.
-fn patch_aarch64_adrp(state: &mut LinkState, sec: SectionIdx, offset: u64, page_delta: i32) {
+fn patch_aarch64_adrp_data(data: &mut [u8], offset: u64, page_delta: i32) {
     let val = page_delta as u32;
-    modify_insn(state, sec, offset, |insn|
+    modify_insn_data(data, offset, |insn|
         (insn & 0x9F00_001F) | ((val & 0x3) << 29) | (((val >> 2) & 0x7FFFF) << 5));
 }
 
-/// Patch BL/B instruction's imm26 field.
-fn patch_aarch64_insn_imm26(state: &mut LinkState, sec: SectionIdx, offset: u64, imm26: u32) {
-    modify_insn(state, sec, offset, |insn| (insn & 0xFC00_0000) | (imm26 & 0x03FF_FFFF));
+fn patch_aarch64_insn_imm26_data(data: &mut [u8], offset: u64, imm26: u32) {
+    modify_insn_data(data, offset, |insn| (insn & 0xFC00_0000) | (imm26 & 0x03FF_FFFF));
 }
 
-/// Patch MOVZ/MOVK instruction's imm16 field (bits [20:5]).
-fn patch_aarch64_movw(state: &mut LinkState, sec: SectionIdx, offset: u64, value: u32) {
-    modify_insn(state, sec, offset, |insn| (insn & !(0xFFFF << 5)) | ((value & 0xFFFF) << 5));
+fn patch_aarch64_movw_data(data: &mut [u8], offset: u64, value: u32) {
+    modify_insn_data(data, offset, |insn| (insn & !(0xFFFF << 5)) | ((value & 0xFFFF) << 5));
 }
 
-/// Patch ADD instruction's imm12 field (bits [21:10]).
-fn patch_aarch64_add_imm12(state: &mut LinkState, sec: SectionIdx, offset: u64, value: u32) {
-    modify_insn(state, sec, offset, |insn| (insn & !(0xFFF << 10)) | ((value & 0xFFF) << 10));
+fn patch_aarch64_add_imm12_data(data: &mut [u8], offset: u64, value: u32) {
+    modify_insn_data(data, offset, |insn| (insn & !(0xFFF << 10)) | ((value & 0xFFF) << 10));
 }
 
-/// Patch LDR/STR instruction's scaled imm12 field (bits [21:10]).
-/// `scale` is the log2 of the access size (0=byte, 1=half, 2=word, 3=dword).
-fn patch_aarch64_ldr_imm12(state: &mut LinkState, sec: SectionIdx, offset: u64, value: u32, scale: u32) {
-    modify_insn(state, sec, offset, |insn| {
+fn patch_aarch64_ldr_imm12_data(data: &mut [u8], offset: u64, value: u32, scale: u32) {
+    modify_insn_data(data, offset, |insn| {
         let scaled = (value >> scale) & 0xFFF;
         (insn & !(0xFFF << 10)) | (scaled << 10)
     });
@@ -836,7 +983,7 @@ pub(crate) fn apply_relocs_macho(
             | RelocType::Aarch64GotPcrel32
             | RelocType::Aarch64TlvpLoadPage21
             | RelocType::Aarch64TlvpLoadPageoff12 => {
-                apply_one_reloc_aarch64(state, reloc, sym_addr, reloc_vaddr, params.got)?
+                apply_one_reloc_aarch64(&mut state.sections[reloc.section].data, reloc, sym_addr, reloc_vaddr, params.got)?
             }
             // x86-64 relocations
             RelocType::X86_64
@@ -848,7 +995,7 @@ pub(crate) fn apply_relocs_macho(
             | RelocType::X86_32
             | RelocType::X86_32S
             | RelocType::X86Tlv => {
-                apply_one_reloc(state, reloc, sym_addr, reloc_vaddr, params.got, &HashMap::new())?
+                apply_one_reloc_x86(&mut state.sections[reloc.section].data, reloc, sym_addr, reloc_vaddr, params.got, &HashMap::new())?
             }
             other => return Err(LinkError::UnsupportedRelocation {
                 reloc_type: other, symbol: reloc.target.name().to_string(),
@@ -894,31 +1041,31 @@ fn rewrite_movw_to_got(
     let got_slot = *got.get(&reloc.target).unwrap();
 
     // Read the current instruction to extract the destination register
-    let sec_data = &state.sections[reloc.section].data;
+    let data = &mut state.sections[reloc.section].data;
     let off = reloc.offset as usize;
-    let insn = u32::from_le_bytes(sec_data[off..off + 4].try_into().unwrap());
+    let insn = u32::from_le_bytes(data[off..off + 4].try_into().unwrap());
     let rd = insn & 0x1F; // destination register in bits [4:0]
 
     match reloc.r_type {
         RelocType::Aarch64MovwUabsG0Nc => {
             // MOVZ → ADRP xN, got_page
             let adrp = 0x9000_0000 | rd; // ADRP template
-            write_u32(state, reloc.section, reloc.offset, adrp);
+            write_u32_data(data, reloc.offset, adrp);
             let sym_page = got_slot as i64 & !0xFFF;
             let pc_page = reloc_vaddr as i64 & !0xFFF;
             let page_delta = (sym_page - pc_page) >> 12;
-            patch_aarch64_adrp(state, reloc.section, reloc.offset, page_delta as i32);
+            patch_aarch64_adrp_data(data, reloc.offset, page_delta as i32);
         }
         RelocType::Aarch64MovwUabsG1Nc => {
             // MOVK → LDR xN, [xN, #got_lo12]   (64-bit load, scale=3)
             let ldr = 0xF940_0000 | (rd << 5) | rd; // LDR X template: Rt=Rd, Rn=Rd
-            write_u32(state, reloc.section, reloc.offset, ldr);
+            write_u32_data(data, reloc.offset, ldr);
             let value = (got_slot & 0xFFF) as u32;
-            patch_aarch64_ldr_imm12(state, reloc.section, reloc.offset, value, 3);
+            patch_aarch64_ldr_imm12_data(data, reloc.offset, value, 3);
         }
         RelocType::Aarch64MovwUabsG2Nc | RelocType::Aarch64MovwUabsG3 => {
             // NOP
-            write_u32(state, reloc.section, reloc.offset, 0xD503_201F);
+            write_u32_data(data, reloc.offset, 0xD503_201F);
         }
         _ => unreachable!(),
     }
@@ -957,7 +1104,7 @@ pub(crate) fn apply_relocs_pe(
             }
         };
 
-        let is_abs = apply_one_reloc(state, reloc, sym_addr, reloc_vaddr, &layout.got, &HashMap::new())?;
+        let is_abs = apply_one_reloc_x86(&mut state.sections[reloc.section].data, reloc, sym_addr, reloc_vaddr, &layout.got, &HashMap::new())?;
         if is_abs {
             abs_fixups.push(reloc_vaddr as u32);
         }

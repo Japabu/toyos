@@ -960,16 +960,17 @@ pub(crate) fn gc_sections(state: &mut LinkState, entry: &str) {
         None
     };
 
-    // Build adjacency list: source_section → set of target sections
-    let mut edges: Vec<HashSet<usize>> = vec![HashSet::new(); num_sections];
+    // Build adjacency list: source_section → target sections
+    // Uses Vec instead of HashSet — BFS already skips visited nodes via `reachable[]`.
+    let mut edges: Vec<Vec<usize>> = vec![Vec::new(); num_sections];
     for reloc in &state.relocs {
         for sym in std::iter::once(&reloc.target).chain(reloc.subtrahend.iter()) {
             if let Some(target_sec) = sym_to_section(sym.name()) {
-                edges[reloc.section.0].insert(target_sec.0);
+                edges[reloc.section.0].push(target_sec.0);
             }
             if let SymbolRef::Local(obj_idx, name) = sym {
                 if let Some(SymbolDef::Defined { section: target_sec, .. }) = state.locals.get(&(*obj_idx, name.clone())) {
-                    edges[reloc.section.0].insert(target_sec.0);
+                    edges[reloc.section.0].push(target_sec.0);
                 }
             }
         }
@@ -1232,9 +1233,24 @@ pub(crate) fn merge_string_sections(state: &mut LinkState) {
 
     let merge_set: HashSet<SectionIdx> = merge_indices.iter().copied().collect();
 
-    // Save old symbol state before remapping (needed for relocation addend updates)
-    let old_globals: HashMap<String, SymbolDef> = state.globals.clone();
-    let old_locals: HashMap<(ObjIdx, String), SymbolDef> = state.locals.clone();
+    // Save old (section, value) for symbols in merge sections before remapping.
+    // Only these are needed for relocation addend updates below.
+    let mut old_global_defs: HashMap<String, (SectionIdx, u64)> = HashMap::new();
+    for (name, def) in &state.globals {
+        if let SymbolDef::Defined { section, value } = def {
+            if merge_set.contains(section) {
+                old_global_defs.insert(name.clone(), (*section, *value));
+            }
+        }
+    }
+    let mut old_local_defs: HashMap<(ObjIdx, String), (SectionIdx, u64)> = HashMap::new();
+    for ((oi, name), def) in &state.locals {
+        if let SymbolDef::Defined { section, value } = def {
+            if merge_set.contains(section) {
+                old_local_defs.insert((*oi, name.clone()), (*section, *value));
+            }
+        }
+    }
 
     // Update symbol definitions pointing into merged sections
     for def in state.globals.values_mut() {
@@ -1263,23 +1279,21 @@ pub(crate) fn merge_string_sections(state: &mut LinkState) {
     // Update relocation addends: when a relocation targets a symbol in a merged
     // section, the addend may encode an offset into that section that needs remapping.
     for reloc in &mut state.relocs {
-        let old_def = match &reloc.target {
-            SymbolRef::Global(name) => old_globals.get(name),
-            SymbolRef::Local(oi, name) => old_globals.get(name)
-                .or_else(|| old_locals.get(&(*oi, name.clone()))),
+        let old_sv = match &reloc.target {
+            SymbolRef::Global(name) => old_global_defs.get(name),
+            SymbolRef::Local(oi, name) => old_global_defs.get(name)
+                .or_else(|| old_local_defs.get(&(*oi, name.clone()))),
         };
-        if let Some(SymbolDef::Defined { section: old_sec, value: old_val }) = old_def {
-            if !merge_set.contains(old_sec) { continue; }
-            let old_offset = old_val.wrapping_add(reloc.addend as u64);
-            if let Some(&new_offset) = offset_remap.get(&(*old_sec, old_offset)) {
-                let new_def = match &reloc.target {
-                    SymbolRef::Global(name) => state.globals.get(name),
-                    SymbolRef::Local(oi, name) => state.globals.get(name)
-                        .or_else(|| state.locals.get(&(*oi, name.clone()))),
-                };
-                if let Some(SymbolDef::Defined { value: new_val, .. }) = new_def {
-                    reloc.addend = new_offset as i64 - *new_val as i64;
-                }
+        let Some(&(old_sec, old_val)) = old_sv else { continue; };
+        let old_offset = old_val.wrapping_add(reloc.addend as u64);
+        if let Some(&new_offset) = offset_remap.get(&(old_sec, old_offset)) {
+            let new_def = match &reloc.target {
+                SymbolRef::Global(name) => state.globals.get(name),
+                SymbolRef::Local(oi, name) => state.globals.get(name)
+                    .or_else(|| state.locals.get(&(*oi, name.clone()))),
+            };
+            if let Some(SymbolDef::Defined { value: new_val, .. }) = new_def {
+                reloc.addend = new_offset as i64 - *new_val as i64;
             }
         }
     }
