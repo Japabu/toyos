@@ -629,85 +629,88 @@ pub fn spawn_optional(argv: &[&str]) -> Option<u32> {
 
 /// Exit the current process.
 pub fn exit(code: i32) -> ! {
-    {
-        let mut guard = PROCESS_TABLE.lock();
-        let table = guard.as_mut().expect("process table not initialized");
-        let pid = percpu::current_pid();
+    // No scoped block — we hold the lock through schedule_no_return_locked()
+    // to prevent another CPU from collecting the zombie (and freeing our
+    // kernel stack) before we've switched to the idle stack.
+    let mut guard = PROCESS_TABLE.lock();
+    let table = guard.as_mut().expect("process table not initialized");
+    let pid = percpu::current_pid();
 
-        // Extract what we need, then drop the proc borrow so we can iterate
-        // the table to kill child threads.
-        let kind = {
-            let proc = table.procs.get_mut(pid).unwrap();
-            let kind = proc.kind;
-            // Close all FDs (acquires VFS lock — correct order: process_table < vfs)
-            fd::close_all(&mut proc.fds, &mut *vfs::lock(), proc.pid);
-            // Free TLS (RAII: .take() drops the OwnedAlloc)
-            proc.tls_alloc.take();
-            kind
-        };
-
-        match kind {
-            Kind::Thread { .. } => {
-                // Thread: don't free address space (shared with parent).
-                unsafe { cpu::write_cr3(paging::kernel_cr3()); }
-            }
-            Kind::Process { .. } => {
-                // Kill all child threads before freeing resources they depend on
-                let child_tids: alloc::vec::Vec<u32> = table.procs.iter()
-                    .filter(|(tid, p)| *tid != pid && matches!(p.kind, Kind::Thread { parent } if parent == pid))
-                    .map(|(tid, _)| tid)
-                    .collect();
-                for tid in &child_tids {
-                    let child = table.procs.get_mut(*tid).unwrap();
-                    child.tls_alloc.take();
-                    child.state = ProcessState::Zombie(-1);
-                    let name = core::str::from_utf8(&child.name).unwrap_or("?").trim_end_matches('\0');
-                    log!("exit: killing child thread {name} pid={tid}");
-                }
-
-                let proc = table.procs.get_mut(pid).unwrap();
-                let pml4 = proc.cr3 as *mut u64;
-                unsafe { cpu::write_cr3(paging::kernel_cr3()); }
-                shared_memory::cleanup_process(pid, pml4);
-                // RAII: .take() drops OwnedAlloc, freeing the memory
-                proc.elf_alloc.take();
-                proc.stack_alloc.take();
-                proc.loaded_libs.clear();
-                paging::free_user_page_tables(pml4);
-                proc.cr3 = 0;
-            }
-        }
-
+    // Extract what we need, then drop the proc borrow so we can iterate
+    // the table to kill child threads.
+    let kind = {
         let proc = table.procs.get_mut(pid).unwrap();
-        proc.state = ProcessState::Zombie(code);
-        let name = core::str::from_utf8(&proc.name).unwrap_or("?").trim_end_matches('\0');
-        log!("exit: {name} pid={pid} code={code}");
+        let kind = proc.kind;
+        // Close all FDs (acquires VFS lock — correct order: process_table < vfs)
+        fd::close_all(&mut proc.fds, &mut *vfs::lock(), proc.pid);
+        // Free TLS (RAII: .take() drops the OwnedAlloc)
+        proc.tls_alloc.take();
+        kind
+    };
 
-        if let Kind::Process { .. } = kind {
-            if let Some(names) = NAME_REGISTRY.lock().as_mut() {
-                names.retain(|_, &mut v| v != pid);
-            }
+    match kind {
+        Kind::Thread { .. } => {
+            // Thread: don't free address space (shared with parent).
+            unsafe { cpu::write_cr3(paging::kernel_cr3()); }
         }
+        Kind::Process { .. } => {
+            // Kill all child threads before freeing resources they depend on
+            let child_tids: alloc::vec::Vec<u32> = table.procs.iter()
+                .filter(|(tid, p)| *tid != pid && matches!(p.kind, Kind::Thread { parent } if parent == pid))
+                .map(|(tid, _)| tid)
+                .collect();
+            for tid in &child_tids {
+                let child = table.procs.get_mut(*tid).unwrap();
+                child.tls_alloc.take();
+                child.state = ProcessState::Zombie(-1);
+                let name = core::str::from_utf8(&child.name).unwrap_or("?").trim_end_matches('\0');
+                log!("exit: killing child thread {name} pid={tid}");
+            }
 
-        // Wake parent waiting on us
-        let wake_pid = match kind {
-            Kind::Process { parent } => parent,
-            Kind::Thread { parent } => Some(parent),
-        };
-        if let Some(ppid) = wake_pid {
-            if let Some(p) = table.procs.get_mut(ppid) {
-                match p.state {
-                    ProcessState::BlockedWaitPid(child) | ProcessState::BlockedThreadJoin(child) if child == pid => {
-                        p.state = ProcessState::Ready;
-                    }
-                    _ => {}
+            let proc = table.procs.get_mut(pid).unwrap();
+            let pml4 = proc.cr3 as *mut u64;
+            unsafe { cpu::write_cr3(paging::kernel_cr3()); }
+            shared_memory::cleanup_process(pid, pml4);
+            // RAII: .take() drops OwnedAlloc, freeing the memory
+            proc.elf_alloc.take();
+            proc.stack_alloc.take();
+            proc.loaded_libs.clear();
+            paging::free_user_page_tables(pml4);
+            proc.cr3 = 0;
+        }
+    }
+
+    let proc = table.procs.get_mut(pid).unwrap();
+    proc.state = ProcessState::Zombie(code);
+    let name = core::str::from_utf8(&proc.name).unwrap_or("?").trim_end_matches('\0');
+    log!("exit: {name} pid={pid} code={code}");
+
+    if let Kind::Process { .. } = kind {
+        if let Some(names) = NAME_REGISTRY.lock().as_mut() {
+            names.retain(|_, &mut v| v != pid);
+        }
+    }
+
+    // Wake parent waiting on us
+    let wake_pid = match kind {
+        Kind::Process { parent } => parent,
+        Kind::Thread { parent } => Some(parent),
+    };
+    if let Some(ppid) = wake_pid {
+        if let Some(p) = table.procs.get_mut(ppid) {
+            match p.state {
+                ProcessState::BlockedWaitPid(child) | ProcessState::BlockedThreadJoin(child) if child == pid => {
+                    p.state = ProcessState::Ready;
                 }
+                _ => {}
             }
         }
     }
 
-    // Switch away (never save our context)
-    scheduler::schedule_no_return();
+    // Pass the lock guard to schedule_no_return_locked, which holds it
+    // through the stack switch so no other CPU can collect our zombie
+    // (and free our kernel stack) while we're still on it.
+    scheduler::schedule_no_return_locked(guard);
 }
 
 /// Block the current process and switch to the next ready one.
@@ -748,18 +751,39 @@ pub fn wake_pipe_writers(pipe_id: usize) {
     scheduler::wake_pipe_writers(pipe_id);
 }
 
-/// Collect a zombie child. Returns exit code, or None if not a zombie yet.
-/// Removing from the table drops the Process, whose OwnedAlloc fields
-/// (kernel_stack) are freed automatically by Drop.
-pub fn collect_zombie(child_pid: u32) -> Option<i32> {
+/// Atomically validate parent-child relationship and collect a zombie child process.
+/// Returns Ok(Some(code)) if collected, Ok(None) if child exists but not zombie,
+/// Err(()) if child doesn't exist or isn't ours.
+/// Combining validation and collection under one lock prevents TOCTOU races.
+pub fn collect_child_zombie(child_pid: u32, parent_pid: u32) -> Result<Option<i32>, ()> {
     let mut guard = PROCESS_TABLE.lock();
     let table = guard.as_mut().expect("process table not initialized");
-    let proc = table.procs.get(child_pid)?;
+    let proc = table.procs.get(child_pid).ok_or(())?;
+    if !matches!(proc.kind, Kind::Process { parent: Some(ppid) } if ppid == parent_pid) {
+        return Err(());
+    }
     if let ProcessState::Zombie(code) = proc.state {
         table.procs.remove(child_pid);
-        Some(code)
+        Ok(Some(code))
     } else {
-        None
+        Ok(None)
+    }
+}
+
+/// Atomically validate parent-thread relationship and collect a zombie thread.
+/// Same atomic guarantees as `collect_child_zombie`.
+pub fn collect_thread_zombie(tid: u32, parent_pid: u32) -> Result<Option<i32>, ()> {
+    let mut guard = PROCESS_TABLE.lock();
+    let table = guard.as_mut().expect("process table not initialized");
+    let proc = table.procs.get(tid).ok_or(())?;
+    if !matches!(proc.kind, Kind::Thread { parent } if parent == parent_pid) {
+        return Err(());
+    }
+    if let ProcessState::Zombie(code) = proc.state {
+        table.procs.remove(tid);
+        Ok(Some(code))
+    } else {
+        Ok(None)
     }
 }
 

@@ -70,15 +70,19 @@ pub fn register(phys_addr: u64, size: u64) -> u32 {
 }
 
 /// Grant a process permission to map a shared region.
-/// Caller must be the owner (or kernel-owned regions can be granted by anyone with the token).
+/// Caller must be the owner. For kernel-owned regions, caller must already
+/// be in the allowed list (prevents unauthorized grant chains).
 pub fn grant(token: u32, caller_pid: u32, target_pid: u32) -> bool {
     let mut guard = REGIONS.lock();
     let regions = guard.as_mut().expect("shared_memory not initialized");
     let Some((_, region)) = regions.iter_mut().find(|(t, _)| *t == token) else {
         return false;
     };
-    // Only owner can grant (kernel-owned regions: any granted process can re-grant)
-    if region.owner_pid != u32::MAX && region.owner_pid != caller_pid {
+    if region.owner_pid == u32::MAX {
+        if !region.allowed.contains(&caller_pid) {
+            return false;
+        }
+    } else if region.owner_pid != caller_pid {
         return false;
     }
     if !region.allowed.contains(&target_pid) {

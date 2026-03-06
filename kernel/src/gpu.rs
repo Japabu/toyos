@@ -44,6 +44,16 @@ pub fn info() -> Option<GpuInfo> {
 }
 
 pub fn present_rect(x: u32, y: u32, w: u32, h: u32) {
+    let (x, y, w, h) = {
+        let info = INFO.lock();
+        let Some(info) = info.as_ref() else { return };
+        let x = x.min(info.width);
+        let y = y.min(info.height);
+        let w = w.min(info.width.saturating_sub(x));
+        let h = h.min(info.height.saturating_sub(y));
+        (x, y, w, h)
+    };
+    if w == 0 || h == 0 { return; }
     if let Some(gpu) = GPU.lock().as_mut() {
         gpu.present_rect(x, y, w, h);
     }
@@ -56,7 +66,14 @@ pub fn set_cursor(hot_x: u32, hot_y: u32) {
 }
 
 pub fn move_cursor(x: u32, y: u32) {
+    let (max_x, max_y) = {
+        let info = INFO.lock();
+        match info.as_ref() {
+            Some(i) => (i.width, i.height),
+            None => return,
+        }
+    };
     if let Some(gpu) = GPU.lock().as_mut() {
-        gpu.move_cursor(x, y);
+        gpu.move_cursor(x.min(max_x), y.min(max_y));
     }
 }

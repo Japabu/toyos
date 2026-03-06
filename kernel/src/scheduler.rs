@@ -119,7 +119,7 @@ fn schedule(cur_state: ProcessState) {
     unsafe { PROCESS_TABLE.force_unlock(); }
 }
 
-/// Schedule without saving current context (used by exit and ap_idle).
+/// Schedule without saving current context (used by ap_idle and BSP boot).
 /// Switches to the per-CPU idle stack and enters the idle loop.
 pub fn schedule_no_return() -> ! {
     percpu::set_current_pid(u32::MAX);
@@ -132,6 +132,30 @@ pub fn schedule_no_return() -> ! {
             "jmp {func}",
             sp = in(reg) sp,
             func = in(reg) cpu_idle_loop as *const () as usize,
+            options(noreturn),
+        );
+    }
+}
+
+/// Like `schedule_no_return`, but consumes a held PROCESS_TABLE lock guard.
+/// Used by `exit()` to keep the lock held through the stack switch, preventing
+/// another CPU from collecting the zombie (and freeing the kernel stack) before
+/// we've switched off it. The lock is released by `idle_unlock_and_loop` after
+/// the stack pointer has moved to the per-CPU idle stack.
+///
+/// Taking the guard by value ensures callers can't accidentally drop it first.
+pub fn schedule_no_return_locked(guard: crate::sync::LockGuard<'_, Option<ProcessTable>>) -> ! {
+    core::mem::forget(guard);
+    percpu::set_current_pid(u32::MAX);
+    unsafe { percpu::set_kernel_stack(percpu::idle_stack_top()); }
+    unsafe { cpu::write_cr3(paging::kernel_cr3()); }
+    let sp = percpu::idle_stack_top();
+    unsafe {
+        asm!(
+            "mov rsp, {sp}",
+            "jmp {func}",
+            sp = in(reg) sp,
+            func = in(reg) idle_unlock_and_loop as *const () as usize,
             options(noreturn),
         );
     }

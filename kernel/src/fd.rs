@@ -246,12 +246,13 @@ pub fn seek(table: &mut FdTable, fd: u64, offset: i64, whence: u64) -> u64 {
         return u64::MAX;
     };
     let new_pos = match whence {
-        0 => offset as usize,
-        1 => (file.position as i64 + offset) as usize,
-        2 => (file.data.len() as i64 + offset) as usize,
+        0 => offset,
+        1 => (file.position as i64).checked_add(offset).unwrap_or(-1),
+        2 => (file.data.len() as i64).checked_add(offset).unwrap_or(-1),
         _ => return u64::MAX,
     };
-    file.position = new_pos.min(file.data.len());
+    if new_pos < 0 { return u64::MAX; }
+    file.position = (new_pos as usize).min(file.data.len());
     file.position as u64
 }
 

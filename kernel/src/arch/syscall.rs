@@ -442,30 +442,18 @@ fn sys_spawn(text: &str, fds: fd::FdTable) -> u64 {
 fn sys_waitpid(pid: u64) -> u64 {
     let child_pid = pid as u32;
     let caller = crate::arch::percpu::current_pid();
-
-    // Validate that the target is actually our child process
-    let valid = {
-        let guard = process::PROCESS_TABLE.lock();
-        let table = guard.as_ref().expect("process table not initialized");
-        table.procs.get(child_pid).map_or(false, |p| {
-            matches!(p.kind, process::Kind::Process { parent: Some(ppid) } if ppid == caller)
-        })
-    };
-    if !valid {
-        return u64::MAX;
-    }
-
     loop {
-        if let Some(code) = process::collect_zombie(child_pid) {
-            return code as u64;
+        match process::collect_child_zombie(child_pid, caller) {
+            Ok(Some(code)) => return code as u64,
+            Ok(None) => process::block(process::ProcessState::BlockedWaitPid(child_pid)),
+            Err(()) => return u64::MAX,
         }
-        process::block(process::ProcessState::BlockedWaitPid(child_pid));
     }
 }
 
 fn sys_poll(fds: &[u64], fds_len: u64, timeout_nanos: u64) -> u64 {
     let deadline = if timeout_nanos > 0 {
-        crate::clock::nanos_since_boot() + timeout_nanos
+        crate::clock::nanos_since_boot().saturating_add(timeout_nanos)
     } else {
         0
     };
@@ -605,24 +593,12 @@ fn sys_release_shared(token: u64) -> u64 {
 fn sys_thread_join(tid: u64) -> u64 {
     let tid = tid as u32;
     let caller = crate::arch::percpu::current_pid();
-
-    // Validate that the target is actually our child thread
-    let valid = {
-        let guard = process::PROCESS_TABLE.lock();
-        let table = guard.as_ref().expect("process table not initialized");
-        table.procs.get(tid).map_or(false, |p| {
-            matches!(p.kind, process::Kind::Thread { parent } if parent == caller)
-        })
-    };
-    if !valid {
-        return u64::MAX;
-    }
-
     loop {
-        if let Some(_code) = process::collect_zombie(tid) {
-            return 0;
+        match process::collect_thread_zombie(tid, caller) {
+            Ok(Some(_)) => return 0,
+            Ok(None) => process::block(process::ProcessState::BlockedThreadJoin(tid)),
+            Err(()) => return u64::MAX,
         }
-        process::block(process::ProcessState::BlockedThreadJoin(tid));
     }
 }
 
@@ -662,7 +638,7 @@ fn sys_sysinfo(buf: &mut [u8]) -> u64 {
         if i >= max_entries {
             break;
         }
-        let proc = table.procs.get(pid).unwrap();
+        let Some(proc) = table.procs.get(pid) else { continue };
 
         let state: u8 = match proc.state {
             process::ProcessState::Running => 0,
@@ -700,7 +676,7 @@ fn sys_net_info(buf: &mut [u8]) -> u64 {
 
 fn sys_net_recv(buf: &mut [u8], timeout_nanos: u64) -> u64 {
     let deadline = if timeout_nanos > 0 {
-        crate::clock::nanos_since_boot() + timeout_nanos
+        crate::clock::nanos_since_boot().saturating_add(timeout_nanos)
     } else {
         0
     };
@@ -716,7 +692,7 @@ fn sys_net_recv(buf: &mut [u8], timeout_nanos: u64) -> u64 {
 }
 
 fn sys_nanosleep(nanos: u64) -> u64 {
-    let deadline = crate::clock::nanos_since_boot() + nanos;
+    let deadline = crate::clock::nanos_since_boot().saturating_add(nanos);
     process::block(process::ProcessState::BlockedSleep { deadline });
     0
 }
@@ -793,7 +769,7 @@ fn sys_dlopen(path: &str) -> u64 {
             crate::process::Kind::Thread { parent } => parent,
             _ => current_pid,
         };
-        let owner = table.procs.get_mut(owner_pid).expect("owner process");
+        let Some(owner) = table.procs.get_mut(owner_pid) else { return u64::MAX };
         log!("dlopen: pid={} owner={} resolving against {} existing libs",
             current_pid, owner_pid, owner.loaded_libs.len());
         crate::elf::resolve_dlopen_relocs(&lib, &owner.loaded_libs);
@@ -859,6 +835,7 @@ fn sys_dlopen(path: &str) -> u64 {
                 p.tls_alloc = Some(new_alloc);
                 p.tls_total_memsz = new_total;
                 p.tls_modules = modules;
+                p.fs_base = new_tp;
             });
         }
     }
@@ -873,7 +850,7 @@ fn sys_dlopen(path: &str) -> u64 {
             crate::process::Kind::Thread { parent } => parent,
             _ => current_pid,
         };
-        let owner = table.procs.get_mut(owner_pid).expect("owner process");
+        let Some(owner) = table.procs.get_mut(owner_pid) else { return u64::MAX };
         let idx = owner.loaded_libs.len();
         owner.loaded_libs.push(lib);
         idx as u64
@@ -889,7 +866,7 @@ fn sys_dlsym(handle: u64, name: &str) -> u64 {
         crate::process::Kind::Thread { parent } => parent,
         _ => current_pid,
     };
-    let owner = table.procs.get(owner_pid).expect("owner process");
+    let Some(owner) = table.procs.get(owner_pid) else { return u64::MAX };
     let idx = handle as usize;
     if idx >= owner.loaded_libs.len() {
         return u64::MAX;

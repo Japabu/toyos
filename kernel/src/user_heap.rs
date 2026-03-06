@@ -90,6 +90,8 @@ pub fn free(heap: &mut UserHeap, ptr: *mut u8, size: usize) {
     let addr = ptr as u64;
     let Some(end) = addr.checked_add(size as u64) else { return };
     if !heap.is_valid_range(addr, size as u64) { return; }
+    // Reject if range overlaps any existing free region (double-free or bad pointer)
+    if heap.free.iter().any(|&(fs, fe)| addr < fe && end > fs) { return; }
     let pos = heap.free.iter().position(|&(s, _)| s > addr).unwrap_or(heap.free.len());
     heap.free.insert(pos, (addr, end));
     // Merge with next
