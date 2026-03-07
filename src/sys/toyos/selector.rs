@@ -4,12 +4,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::{Interest, Token};
+use toyos_abi::syscall::Fd;
 
 static NEXT_SELECTOR_ID: AtomicUsize = AtomicUsize::new(1);
 
 #[derive(Clone, Debug)]
 struct Registration {
-    fd: u64,
+    fd: Fd,
     interest: Interest,
     token: Token,
 }
@@ -54,7 +55,7 @@ impl Selector {
     }
 
     pub fn select(&self, events: &mut Events, timeout: Option<Duration>) -> io::Result<()> {
-        use toyos_abi::syscall::{Fd, POLL_READABLE, POLL_WRITABLE};
+        use toyos_abi::syscall::{POLL_READABLE, POLL_WRITABLE};
 
         events.clear();
 
@@ -72,17 +73,17 @@ impl Selector {
         }
 
         let len = regs.len().min(63);
-        let poll_fds: Vec<Fd> = regs[..len]
+        let poll_fds: Vec<u64> = regs[..len]
             .iter()
             .map(|reg| {
-                let mut val = reg.fd;
+                let mut val = reg.fd.0 as u64;
                 if reg.interest.is_readable() {
                     val |= POLL_READABLE;
                 }
                 if reg.interest.is_writable() {
                     val |= POLL_WRITABLE;
                 }
-                Fd(val)
+                val
             })
             .collect();
 
@@ -116,7 +117,7 @@ impl Selector {
         Ok(())
     }
 
-    pub fn register_fd(&self, fd: u64, token: Token, interest: Interest) -> io::Result<()> {
+    pub fn register_fd(&self, fd: Fd, token: Token, interest: Interest) -> io::Result<()> {
         let mut inner = self.inner.lock().unwrap();
         inner.registrations.push(Registration {
             fd,
@@ -126,7 +127,7 @@ impl Selector {
         Ok(())
     }
 
-    pub fn reregister_fd(&self, fd: u64, token: Token, interest: Interest) -> io::Result<()> {
+    pub fn reregister_fd(&self, fd: Fd, token: Token, interest: Interest) -> io::Result<()> {
         let mut inner = self.inner.lock().unwrap();
         if let Some(reg) = inner.registrations.iter_mut().find(|r| r.fd == fd) {
             reg.token = token;
@@ -141,7 +142,7 @@ impl Selector {
         Ok(())
     }
 
-    pub fn deregister_fd(&self, fd: u64) -> io::Result<()> {
+    pub fn deregister_fd(&self, fd: Fd) -> io::Result<()> {
         let mut inner = self.inner.lock().unwrap();
         inner.registrations.retain(|r| r.fd != fd);
         Ok(())

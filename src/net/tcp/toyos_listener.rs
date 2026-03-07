@@ -12,22 +12,13 @@ use toyos_abi::syscall::{self, Fd};
 /// Polling the notify_fd for readability indicates a connection is ready to accept.
 pub struct TcpListener {
     socket_id: u32,
-    notify_fd: u64,
+    notify_fd: Fd,
     local_addr: SocketAddr,
 }
 
 impl TcpListener {
     /// Bind a TCP listener to the given address.
     pub fn bind(addr: SocketAddr) -> io::Result<TcpListener> {
-        use toyos_abi::net::*;
-
-        let netd_pid = super::toyos_stream::find_netd()?;
-
-        // Create notify pipe for connection arrival notifications
-        let notify_pipe = syscall::pipe();
-        let notify_pipe_id = syscall::pipe_id(notify_pipe.write)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-
         let ip = match addr {
             SocketAddr::V4(v4) => v4.ip().octets(),
             SocketAddr::V6(_) => {
@@ -35,24 +26,14 @@ impl TcpListener {
             }
         };
 
-        let req = TcpBindPipedRequest {
-            addr: ip,
-            port: addr.port(),
-            _pad: 0,
-            notify_pipe_id,
-        };
+        let bound = toyos_net::tcp_bind(ip, addr.port())
+            .map_err(super::toyos_stream::net_err_to_io)?;
 
-        super::toyos_stream::send_netd_msg(netd_pid, MSG_TCP_BIND_PIPED, &req)?;
-        let resp: TcpBindResponse = super::toyos_stream::recv_netd_response()?;
-
-        // Close write end — netd opened it via pipe_open
-        syscall::close(notify_pipe.write);
-
-        let bound_addr = SocketAddr::from((ip, resp.bound_port));
+        let bound_addr = SocketAddr::from((ip, bound.bound_port));
 
         Ok(TcpListener {
-            socket_id: resp.socket_id,
-            notify_fd: notify_pipe.read.0,
+            socket_id: bound.socket_id,
+            notify_fd: bound.notify_fd,
             local_addr: bound_addr,
         })
     }
@@ -61,11 +42,9 @@ impl TcpListener {
     ///
     /// Returns `WouldBlock` if no connections are pending.
     pub fn accept(&self) -> io::Result<(TcpStream, SocketAddr)> {
-        use toyos_abi::net::*;
-
         // Try to read a notification byte (non-blocking)
         let mut byte = [0u8; 1];
-        match syscall::read_nonblock(Fd(self.notify_fd), &mut byte) {
+        match syscall::read_nonblock(self.notify_fd, &mut byte) {
             Err(toyos_abi::syscall::SyscallError::WouldBlock) => {
                 return Err(io::ErrorKind::WouldBlock.into());
             }
@@ -75,40 +54,11 @@ impl TcpListener {
             Ok(_) => {} // notification received, proceed with accept
         }
 
-        let netd_pid = super::toyos_stream::find_netd()?;
+        let accepted = toyos_net::tcp_accept(self.socket_id)
+            .map_err(super::toyos_stream::net_err_to_io)?;
 
-        // Create pipes for the new connection
-        let rx_pipe = syscall::pipe_with_capacity(65536);
-        let tx_pipe = syscall::pipe_with_capacity(65536);
-
-        let rx_pipe_id = syscall::pipe_id(rx_pipe.write)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-        let tx_pipe_id = syscall::pipe_id(tx_pipe.read)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-
-        let req = TcpAcceptPipedRequest {
-            socket_id: self.socket_id,
-            _pad: 0,
-            rx_pipe_id,
-            tx_pipe_id,
-        };
-
-        super::toyos_stream::send_netd_msg(netd_pid, MSG_TCP_ACCEPT_PIPED, &req)?;
-        let resp: TcpAcceptPipedResponse = super::toyos_stream::recv_netd_response()?;
-
-        // Close pipe ends we don't use
-        syscall::close(rx_pipe.write);
-        syscall::close(tx_pipe.read);
-
-        let peer_addr = SocketAddr::from((resp.remote_addr, resp.remote_port));
-
-        let stream = TcpStream::from_piped(
-            rx_pipe.read.0,
-            tx_pipe.write.0,
-            peer_addr,
-            resp.local_port,
-            resp.socket_id,
-        );
+        let peer_addr = SocketAddr::from((accepted.remote_addr, accepted.remote_port));
+        let stream = TcpStream::from_accepted(accepted, self.local_addr.port());
 
         Ok((stream, peer_addr))
     }
@@ -137,7 +87,6 @@ impl event::Source for TcpListener {
         token: Token,
         interests: Interest,
     ) -> io::Result<()> {
-        // Only readable interest makes sense for a listener (connection ready)
         let _ = interests;
         registry
             .selector()
@@ -163,16 +112,8 @@ impl event::Source for TcpListener {
 
 impl Drop for TcpListener {
     fn drop(&mut self) {
-        // Close the listener socket via netd
-        use toyos_abi::net::*;
-        if let Ok(netd_pid) = super::toyos_stream::find_netd() {
-            let req = TcpCloseRequest {
-                socket_id: self.socket_id,
-            };
-            let _ = super::toyos_stream::send_netd_msg(netd_pid, MSG_TCP_CLOSE, &req);
-            let _ = super::toyos_stream::recv_netd_response::<[u8; 0]>();
-        }
-        syscall::close(Fd(self.notify_fd));
+        toyos_net::tcp_close(self.socket_id);
+        syscall::close(self.notify_fd);
     }
 }
 

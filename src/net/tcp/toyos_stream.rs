@@ -4,32 +4,34 @@ use std::net::{Shutdown, SocketAddr};
 
 use crate::{event, Interest, Registry, Token};
 use toyos_abi::syscall::{self, Fd, SyscallError};
+use toyos_net::NetError;
 
 /// A non-blocking TCP stream backed by kernel pipes via netd.
 pub struct TcpStream {
-    rx_fd: u64,
-    tx_fd: u64,
+    rx_fd: Fd,
+    tx_fd: Fd,
     peer_addr: SocketAddr,
     local_port: u16,
     socket_id: u32,
 }
 
+pub(crate) fn net_err_to_io(e: NetError) -> io::Error {
+    let kind = match e {
+        NetError::ConnectionRefused => io::ErrorKind::ConnectionRefused,
+        NetError::ConnectionReset => io::ErrorKind::ConnectionReset,
+        NetError::TimedOut => io::ErrorKind::TimedOut,
+        NetError::AddrInUse => io::ErrorKind::AddrInUse,
+        NetError::NotConnected => io::ErrorKind::NotConnected,
+        NetError::InvalidInput => io::ErrorKind::InvalidInput,
+        NetError::NetdNotFound => io::ErrorKind::NotConnected,
+        _ => io::ErrorKind::Other,
+    };
+    io::Error::new(kind, "netd error")
+}
+
 impl TcpStream {
     /// Issue a non-blocking connect to the specified address via netd.
     pub fn connect(addr: SocketAddr) -> io::Result<TcpStream> {
-        use toyos_abi::net::*;
-
-        let netd_pid = find_netd()?;
-
-        // Create pipes for rx (netd->client) and tx (client->netd)
-        let rx_pipe = syscall::pipe_with_capacity(65536);
-        let tx_pipe = syscall::pipe_with_capacity(65536);
-
-        let rx_pipe_id = syscall::pipe_id(rx_pipe.write)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-        let tx_pipe_id = syscall::pipe_id(tx_pipe.read)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-
         let ip = match addr {
             SocketAddr::V4(v4) => v4.ip().octets(),
             SocketAddr::V6(_) => {
@@ -37,46 +39,26 @@ impl TcpStream {
             }
         };
 
-        let req = TcpConnectPipedRequest {
-            addr: ip,
-            port: addr.port(),
-            _pad: 0,
-            timeout_ms: 30000,
-            _pad2: 0,
-            rx_pipe_id,
-            tx_pipe_id,
-        };
-
-        send_netd_msg(netd_pid, MSG_TCP_CONNECT_PIPED, &req)?;
-        let resp: TcpConnectResponse = recv_netd_response()?;
-
-        // Close pipe ends we don't use (netd opened them via pipe_open)
-        syscall::close(rx_pipe.write);
-        syscall::close(tx_pipe.read);
+        let conn = toyos_net::tcp_connect(ip, addr.port(), 30000).map_err(net_err_to_io)?;
 
         Ok(TcpStream {
-            rx_fd: rx_pipe.read.0,
-            tx_fd: tx_pipe.write.0,
+            rx_fd: conn.rx_fd,
+            tx_fd: conn.tx_fd,
             peer_addr: addr,
-            local_port: resp.local_port,
-            socket_id: resp.socket_id,
+            local_port: conn.local_port,
+            socket_id: conn.socket_id,
         })
     }
 
     /// Create a TcpStream from pre-existing pipe FDs (used by TcpListener::accept).
-    pub(crate) fn from_piped(
-        rx_fd: u64,
-        tx_fd: u64,
-        peer_addr: SocketAddr,
-        local_port: u16,
-        socket_id: u32,
-    ) -> TcpStream {
+    pub(crate) fn from_accepted(accepted: toyos_net::TcpAccepted, local_port: u16) -> TcpStream {
+        let peer_addr = SocketAddr::from((accepted.remote_addr, accepted.remote_port));
         TcpStream {
-            rx_fd,
-            tx_fd,
+            rx_fd: accepted.rx_fd,
+            tx_fd: accepted.tx_fd,
             peer_addr,
             local_port,
-            socket_id,
+            socket_id: accepted.socket_id,
         }
     }
 
@@ -89,21 +71,12 @@ impl TcpStream {
     }
 
     pub fn shutdown(&self, how: Shutdown) -> io::Result<()> {
-        use toyos_abi::net::*;
-
-        let netd_pid = find_netd()?;
         let how_val: u32 = match how {
             Shutdown::Read => 0,
             Shutdown::Write => 1,
             Shutdown::Both => 2,
         };
-        let req = TcpShutdownRequest {
-            socket_id: self.socket_id,
-            how: how_val,
-        };
-        send_netd_msg(netd_pid, MSG_TCP_SHUTDOWN, &req)?;
-        let _: [u8; 0] = recv_netd_response()?;
-        Ok(())
+        toyos_net::tcp_shutdown(self.socket_id, how_val).map_err(net_err_to_io)
     }
 
     pub fn set_nodelay(&self, _nodelay: bool) -> io::Result<()> {
@@ -140,8 +113,8 @@ impl TcpStream {
 
 impl Read for TcpStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        match syscall::read_nonblock(Fd(self.rx_fd), buf) {
-            Ok(0) => Ok(0), // EOF
+        match syscall::read_nonblock(self.rx_fd, buf) {
+            Ok(0) => Ok(0),
             Ok(n) => Ok(n),
             Err(SyscallError::WouldBlock) => Err(io::ErrorKind::WouldBlock.into()),
             Err(e) => Err(io::Error::new(io::ErrorKind::Other, e.to_string())),
@@ -151,7 +124,7 @@ impl Read for TcpStream {
 
 impl Read for &'_ TcpStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        match syscall::read_nonblock(Fd(self.rx_fd), buf) {
+        match syscall::read_nonblock(self.rx_fd, buf) {
             Ok(0) => Ok(0),
             Ok(n) => Ok(n),
             Err(SyscallError::WouldBlock) => Err(io::ErrorKind::WouldBlock.into()),
@@ -162,7 +135,7 @@ impl Read for &'_ TcpStream {
 
 impl Write for TcpStream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        match syscall::write_nonblock(Fd(self.tx_fd), buf) {
+        match syscall::write_nonblock(self.tx_fd, buf) {
             Ok(n) => Ok(n),
             Err(SyscallError::WouldBlock) => Err(io::ErrorKind::WouldBlock.into()),
             Err(e) => Err(io::Error::new(io::ErrorKind::Other, e.to_string())),
@@ -176,7 +149,7 @@ impl Write for TcpStream {
 
 impl Write for &'_ TcpStream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        match syscall::write_nonblock(Fd(self.tx_fd), buf) {
+        match syscall::write_nonblock(self.tx_fd, buf) {
             Ok(n) => Ok(n),
             Err(SyscallError::WouldBlock) => Err(io::ErrorKind::WouldBlock.into()),
             Err(e) => Err(io::Error::new(io::ErrorKind::Other, e.to_string())),
@@ -212,10 +185,8 @@ impl event::Source for TcpStream {
         interests: Interest,
     ) -> io::Result<()> {
         let sel = registry.selector();
-        // Remove old registrations
         sel.deregister_fd(self.rx_fd)?;
         sel.deregister_fd(self.tx_fd)?;
-        // Re-add with new interests
         if interests.is_readable() {
             sel.register_fd(self.rx_fd, token, Interest::READABLE)?;
         }
@@ -235,8 +206,9 @@ impl event::Source for TcpStream {
 
 impl Drop for TcpStream {
     fn drop(&mut self) {
-        syscall::close(Fd(self.rx_fd));
-        syscall::close(Fd(self.tx_fd));
+        toyos_net::tcp_close(self.socket_id);
+        syscall::close(self.rx_fd);
+        syscall::close(self.tx_fd);
     }
 }
 
@@ -248,43 +220,4 @@ impl fmt::Debug for TcpStream {
             .field("peer_addr", &self.peer_addr)
             .finish()
     }
-}
-
-// --- netd IPC helpers (pub(crate) for use by toyos_listener) ---
-
-pub(crate) fn find_netd() -> io::Result<u64> {
-    syscall::find_pid("netd")
-        .map(|pid| pid.0 as u64)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "netd not found"))
-}
-
-pub(crate) fn send_netd_msg<T: Copy>(netd_pid: u64, msg_type: u32, payload: &T) -> io::Result<()> {
-    toyos_abi::message::send(netd_pid, msg_type, payload);
-    Ok(())
-}
-
-pub(crate) fn recv_netd_response<T: Copy>() -> io::Result<T> {
-    use toyos_abi::net::*;
-
-    let msg = toyos_abi::message::recv();
-
-    if msg.msg_type == MSG_ERROR {
-        let error: ErrorResponse = msg.payload();
-        let kind = match error.code {
-            ERR_CONNECTION_REFUSED => io::ErrorKind::ConnectionRefused,
-            ERR_CONNECTION_RESET => io::ErrorKind::ConnectionReset,
-            ERR_TIMED_OUT => io::ErrorKind::TimedOut,
-            ERR_ADDR_IN_USE => io::ErrorKind::AddrInUse,
-            ERR_NOT_CONNECTED => io::ErrorKind::NotConnected,
-            ERR_INVALID_INPUT => io::ErrorKind::InvalidInput,
-            _ => io::ErrorKind::Other,
-        };
-        return Err(io::Error::new(kind, "netd error"));
-    }
-
-    if msg.msg_type != MSG_RESULT {
-        return Err(io::Error::new(io::ErrorKind::Other, "unexpected netd response"));
-    }
-
-    Ok(msg.payload())
 }

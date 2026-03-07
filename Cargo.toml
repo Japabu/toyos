@@ -72,6 +72,7 @@ libc = "0.2.178"
 
 [target.'cfg(target_os = "toyos")'.dependencies]
 toyos-abi = { path = "../../toyos-abi" }
+toyos-net = { path = "../toyos-net" }
 
 [dev-dependencies]
 env_logger = { version = "0.11", default-features = false }
