@@ -519,6 +519,7 @@ pub fn shutdown() -> ! {
 /// If neither bit is set, defaults to read interest.
 pub const POLL_READABLE: u64 = 1 << 62;
 pub const POLL_WRITABLE: u64 = 1 << 63;
+pub const POLL_FD_MASK: u64 = !(POLL_READABLE | POLL_WRITABLE);
 
 /// Result of a [`poll`] or [`poll_timeout`] call.
 pub struct PollResult {

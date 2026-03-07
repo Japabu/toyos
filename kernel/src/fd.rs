@@ -227,8 +227,8 @@ pub fn try_write(table: &mut FdTable, fd: u64, buf: &[u8]) -> Option<u64> {
         }
         Descriptor::PipeWrite(id) | Descriptor::TtyWrite(id) => {
             match pipe::try_write(*id, buf) {
-                Some(usize::MAX) => Some(SyscallError::NotFound.to_u64()),
-                Some(n) => Some(n as u64),
+                Some(pipe::PipeWrite::BrokenPipe) => Some(SyscallError::NotFound.to_u64()),
+                Some(pipe::PipeWrite::Wrote(n)) => Some(n as u64),
                 None => None,
             }
         }

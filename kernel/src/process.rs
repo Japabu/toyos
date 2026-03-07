@@ -873,6 +873,7 @@ pub fn block(reason: ProcessState) {
 }
 
 pub fn block_poll(fds: [u64; 64], len: u32, deadline: u64) {
+    debug_assert!(len <= 64, "poll_len {} exceeds array size", len);
     {
         let mut guard = PROCESS_TABLE.lock();
         let table = guard.as_mut().unwrap();
@@ -893,7 +894,9 @@ pub fn send_message(target_pid: Pid, msg: crate::message::Message) -> bool {
     let mut guard = PROCESS_TABLE.lock();
     let table = guard.as_mut().unwrap();
     if let Some(proc) = table.procs.get_mut(target_pid) {
-        proc.messages.push(msg);
+        if !proc.messages.push(msg) {
+            return false;
+        }
         match proc.state {
             ProcessState::BlockedRecvMsg | ProcessState::BlockedPoll { .. } => {
                 proc.set_state(ProcessState::Ready);

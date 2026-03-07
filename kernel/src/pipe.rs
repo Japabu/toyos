@@ -111,14 +111,19 @@ pub fn try_read(pipe_id: PipeId, buf: &mut [u8]) -> Option<usize> {
     })
 }
 
-/// Returns bytes written, usize::MAX for broken pipe, None if would block.
-pub fn try_write(pipe_id: PipeId, buf: &[u8]) -> Option<usize> {
+pub enum PipeWrite {
+    Wrote(usize),
+    BrokenPipe,
+}
+
+/// Returns Wrote(n), BrokenPipe, or None if would block.
+pub fn try_write(pipe_id: PipeId, buf: &[u8]) -> Option<PipeWrite> {
     with_pipes_mut(|pipes| {
         let pipe = pipes.get_mut(pipe_id)?;
         if pipe.readers == 0 {
-            Some(usize::MAX)
+            Some(PipeWrite::BrokenPipe)
         } else if pipe.space() > 0 {
-            Some(pipe.write(buf))
+            Some(PipeWrite::Wrote(pipe.write(buf)))
         } else {
             None
         }

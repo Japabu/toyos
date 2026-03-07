@@ -73,6 +73,7 @@ fn try_alloc(free: &mut Vec<(u64, u64)>, size: u64, align: u64) -> Option<u64> {
 
 pub fn alloc(heap: &mut UserHeap, size: usize, align: usize) -> u64 {
     if size == 0 { return 0; }
+    debug_assert!(align == 0 || align.is_power_of_two(), "alignment must be power of 2, got {}", align);
     let align = align.max(1) as u64;
     let sz = size as u64;
 

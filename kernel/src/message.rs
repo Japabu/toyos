@@ -1,11 +1,13 @@
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 
+use crate::process::Pid;
+
 /// Kernel-side message. Payload bytes are copied from the sender's address space
 /// and will be copied into the receiver's user heap during recv.
 #[derive(Clone)]
 pub struct Message {
-    pub sender: u32,
+    pub sender: Pid,
     pub msg_type: u32,
     pub payload: Vec<u8>,
 }
@@ -25,6 +27,8 @@ pub struct MessageQueue {
     queue: VecDeque<Message>,
 }
 
+const MAX_MESSAGES: usize = 256;
+
 impl MessageQueue {
     pub fn new() -> Self {
         Self {
@@ -32,8 +36,13 @@ impl MessageQueue {
         }
     }
 
-    pub fn push(&mut self, msg: Message) {
+    /// Push a message. Returns false if the queue is full.
+    pub fn push(&mut self, msg: Message) -> bool {
+        if self.queue.len() >= MAX_MESSAGES {
+            return false;
+        }
         self.queue.push_back(msg);
+        true
     }
 
     pub fn pop(&mut self) -> Option<Message> {

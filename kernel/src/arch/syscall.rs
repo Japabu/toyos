@@ -593,7 +593,7 @@ fn sys_waitpid(pid: u64, flags: u64) -> u64 {
 
 /// Extract the raw fd number from a poll entry (strip interest bits).
 fn poll_fd_num(entry: u64) -> u64 {
-    entry & !((1u64 << 63) | (1u64 << 62))
+    entry & POLL_FD_MASK
 }
 
 /// Check if a poll entry is ready, respecting interest bits.
@@ -651,7 +651,7 @@ fn sys_poll(fds: &[u64], fds_len: u64, timeout_nanos: u64) -> u64 {
 
 fn sys_send_msg(target_pid: u64, user_msg: &message::UserMessage, payload: Vec<u8>) -> u64 {
     let msg = message::Message {
-        sender: process::current_pid().raw(),
+        sender: process::current_pid(),
         msg_type: user_msg.msg_type,
         payload,
     };
@@ -682,7 +682,7 @@ fn sys_recv_msg(out: &mut message::UserMessage) -> u64 {
                 (0, 0)
             };
 
-            out.sender = msg.sender;
+            out.sender = msg.sender.raw();
             out.msg_type = msg.msg_type;
             out.data = data;
             out.len = len;
