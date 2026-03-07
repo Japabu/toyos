@@ -68,6 +68,14 @@ pub const SYS_PIPE_WITH_CAPACITY: u64 = 69;
 pub const SYS_PIPE_ID: u64 = 70;
 pub const SYS_AUDIO_WRITE: u64 = 71;
 pub const SYS_EXIT: u64 = 72;
+pub const SYS_GET_ENV: u64 = 73;
+pub const SYS_DUP2: u64 = 74;
+pub const SYS_CLOCK_EPOCH: u64 = 75;
+pub const SYS_SOCKET_CREATE: u64 = 76;
+pub const SYS_PIPE_MAP: u64 = 77;
+pub const SYS_NIC_RX_POLL: u64 = 78;
+pub const SYS_NIC_RX_DONE: u64 = 79;
+pub const SYS_NIC_TX: u64 = 80;
 
 pub const WNOHANG: u64 = 1;
 
@@ -75,13 +83,42 @@ pub const WNOHANG: u64 = 1;
 // Types
 // ---------------------------------------------------------------------------
 
+/// Arguments for the `SYS_SPAWN` syscall, passed as a single pointer.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SpawnArgs {
+    pub argv_ptr: u64,
+    pub argv_len: u64,
+    pub fd_map_ptr: u64,
+    pub fd_map_count: u64,
+    pub env_ptr: u64,
+    pub env_len: u64,
+}
+
 /// A file descriptor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Fd(pub u64);
+pub struct Fd(pub i32);
 
 /// A process ID.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Pid(pub u32);
+
+impl Pid {
+    pub const MAX: Self = Pid(u32::MAX);
+    pub fn raw(self) -> u32 { self.0 }
+    pub fn from_raw(v: u32) -> Self { Pid(v) }
+}
+
+impl core::fmt::Display for Pid {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl core::ops::Add for Pid {
+    type Output = Self;
+    fn add(self, rhs: Self) -> Self { Pid(self.0 + rhs.0) }
+}
 
 /// Syscall error with a specific code. Values occupy the top of the u64 range:
 /// error code N is encoded as `u64::MAX - N`. Any return value `>= u64::MAX - 255`
@@ -161,6 +198,8 @@ pub enum FileType {
     Framebuffer = 5,
     Tty = 6,
     Mouse = 7,
+    Socket = 8,
+    Nic = 9,
 }
 
 impl FileType {
@@ -174,6 +213,8 @@ impl FileType {
             5 => Some(Self::Framebuffer),
             6 => Some(Self::Tty),
             7 => Some(Self::Mouse),
+            8 => Some(Self::Socket),
+            9 => Some(Self::Nic),
             _ => None,
         }
     }
@@ -195,6 +236,7 @@ impl OpenFlags {
     pub const WRITE: Self = Self(2);
     pub const CREATE: Self = Self(4);
     pub const TRUNCATE: Self = Self(8);
+    pub const APPEND: Self = Self(16);
 }
 
 impl core::ops::BitOr for OpenFlags {
@@ -228,6 +270,7 @@ pub struct MmapFlags(pub u64);
 impl MmapFlags {
     pub const ANONYMOUS: Self = Self(1);
     pub const PRIVATE: Self = Self(2);
+    pub const FIXED: Self = Self(4);
 }
 
 impl core::ops::BitOr for MmapFlags {
@@ -300,28 +343,37 @@ fn encode_timeout(timeout: Option<u64>) -> u64 {
 
 /// Write bytes to a file descriptor. Returns number of bytes written.
 pub fn write(fd: Fd, buf: &[u8]) -> Result<usize, SyscallError> {
-    check(syscall(SYS_WRITE, fd.0, buf.as_ptr() as u64, buf.len() as u64, 0)).map(|n| n as usize)
+    check(syscall(SYS_WRITE, fd.0 as u64, buf.as_ptr() as u64, buf.len() as u64, 0)).map(|n| n as usize)
 }
 
 /// Read bytes from a file descriptor. Returns number of bytes read.
 pub fn read(fd: Fd, buf: &mut [u8]) -> Result<usize, SyscallError> {
-    check(syscall(SYS_READ, fd.0, buf.as_mut_ptr() as u64, buf.len() as u64, 0)).map(|n| n as usize)
+    check(syscall(SYS_READ, fd.0 as u64, buf.as_mut_ptr() as u64, buf.len() as u64, 0)).map(|n| n as usize)
 }
 
 // --- Memory ---
 
 /// Allocate `size` bytes with `align` alignment.
-pub fn alloc(size: usize, align: usize) -> *mut u8 {
+///
+/// # Safety
+/// Caller must use the correct size/align when freeing the returned pointer.
+pub unsafe fn alloc(size: usize, align: usize) -> *mut u8 {
     core::ptr::with_exposed_provenance_mut(syscall(SYS_ALLOC, size as u64, align as u64, 0, 0) as usize)
 }
 
 /// Free an allocation at `ptr` with original `size` and `align`.
-pub fn free(ptr: *mut u8, size: usize, align: usize) {
+///
+/// # Safety
+/// `ptr` must have been returned by `alloc` or `realloc` with matching `size` and `align`.
+pub unsafe fn free(ptr: *mut u8, size: usize, align: usize) {
     syscall(SYS_FREE, ptr as u64, size as u64, align as u64, 0);
 }
 
 /// Reallocate `ptr` (with original `size`/`align`) to `new_size`.
-pub fn realloc(ptr: *mut u8, size: usize, align: usize, new_size: usize) -> *mut u8 {
+///
+/// # Safety
+/// `ptr` must have been returned by `alloc` or `realloc` with matching `size` and `align`.
+pub unsafe fn realloc(ptr: *mut u8, size: usize, align: usize, new_size: usize) -> *mut u8 {
     core::ptr::with_exposed_provenance_mut(syscall(SYS_REALLOC, ptr as u64, size as u64, align as u64, new_size as u64) as usize)
 }
 
@@ -342,14 +394,23 @@ pub fn exit(code: i32) -> ! {
 pub fn pipe() -> PipeFds {
     let raw = syscall(SYS_PIPE, 0, 0, 0, 0);
     PipeFds {
-        read: Fd(raw >> 32),
-        write: Fd(raw & 0xFFFF_FFFF),
+        read: Fd((raw >> 32) as i32),
+        write: Fd((raw & 0xFFFF_FFFF) as i32),
     }
 }
 
-/// Spawn a new process.
-pub fn spawn(argv: &[u8], fd_map: &[[u32; 2]]) -> Result<Pid, SyscallError> {
-    check(syscall(SYS_SPAWN, argv.as_ptr() as u64, argv.len() as u64, fd_map.as_ptr() as u64, fd_map.len() as u64))
+/// Read the inherited environment variables into `buf`.
+/// Returns the number of bytes written, or the required size if buf is too small.
+pub fn get_env(buf: &mut [u8]) -> usize {
+    syscall(SYS_GET_ENV, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0) as usize
+}
+
+/// Spawn a new process. The `SpawnArgs` struct contains argv, fd_map, and env.
+///
+/// # Safety
+/// The raw pointer fields in `SpawnArgs` must point to valid memory.
+pub unsafe fn spawn(args: &SpawnArgs) -> Result<Pid, SyscallError> {
+    check(syscall(SYS_SPAWN, args as *const SpawnArgs as u64, 0, 0, 0))
         .map(|pid| Pid(pid as u32))
 }
 
@@ -366,14 +427,18 @@ pub fn waitpid_flags(pid: Pid, flags: u64) -> Result<u64, SyscallError> {
 
 /// Mark file descriptor as the controlling TTY for this process.
 pub fn mark_tty(fd: Fd) {
-    syscall(SYS_MARK_TTY, fd.0, 0, 0, 0);
+    syscall(SYS_MARK_TTY, fd.0 as u64, 0, 0, 0);
 }
 
 // --- Threads ---
 
 /// Spawn a new thread with the given entry point, stack pointer, argument, and stack base.
 /// `stack_base` is the bottom of the user stack (for stack info queries).
-pub fn thread_spawn(entry: u64, stack: u64, arg: u64, stack_base: u64) -> u64 {
+///
+/// # Safety
+/// `entry` must be a valid function pointer and `stack`/`stack_base` must
+/// describe a valid, correctly-sized stack region.
+pub unsafe fn thread_spawn(entry: u64, stack: u64, arg: u64, stack_base: u64) -> u64 {
     syscall(SYS_THREAD_SPAWN, entry, stack, arg, stack_base)
 }
 
@@ -385,12 +450,18 @@ pub fn thread_join(tid: u64) -> u64 {
 // --- IPC ---
 
 /// Send a message to process `target_pid`.
-pub fn send_msg(target_pid: u64, msg_ptr: u64) -> u64 {
+///
+/// # Safety
+/// `msg_ptr` must point to a valid `ReceivedMessage`-layout struct.
+pub unsafe fn send_msg(target_pid: u64, msg_ptr: u64) -> u64 {
     syscall(SYS_SEND_MSG, target_pid, msg_ptr, 0, 0)
 }
 
 /// Receive a message into the buffer at `msg_ptr`.
-pub fn recv_msg(msg_ptr: u64) -> u64 {
+///
+/// # Safety
+/// `msg_ptr` must point to a valid, writable `ReceivedMessage`-layout struct.
+pub unsafe fn recv_msg(msg_ptr: u64) -> u64 {
     syscall(SYS_RECV_MSG, msg_ptr, 0, 0, 0)
 }
 
@@ -398,12 +469,12 @@ pub fn recv_msg(msg_ptr: u64) -> u64 {
 
 /// Open a file.
 pub fn open(path: &[u8], flags: OpenFlags) -> Result<Fd, SyscallError> {
-    check(syscall(SYS_OPEN, path.as_ptr() as u64, path.len() as u64, flags.0, 0)).map(Fd)
+    check(syscall(SYS_OPEN, path.as_ptr() as u64, path.len() as u64, flags.0, 0)).map(|v| Fd(v as i32))
 }
 
 /// Close a file descriptor.
 pub fn close(fd: Fd) {
-    syscall(SYS_CLOSE, fd.0, 0, 0, 0);
+    syscall(SYS_CLOSE, fd.0 as u64, 0, 0, 0);
 }
 
 /// Seek within a file descriptor. Returns new offset.
@@ -413,19 +484,19 @@ pub fn seek(fd: Fd, pos: SeekFrom) -> Result<u64, SyscallError> {
         SeekFrom::Current(n) => (n, 1u64),
         SeekFrom::End(n) => (n, 2u64),
     };
-    check(syscall(SYS_SEEK, fd.0, offset as u64, whence, 0))
+    check(syscall(SYS_SEEK, fd.0 as u64, offset as u64, whence, 0))
 }
 
 /// Get file metadata for a file descriptor.
 pub fn fstat(fd: Fd) -> Result<Stat, SyscallError> {
     let mut stat = Stat { file_type: FileType::Unknown, size: 0, mtime: 0 };
-    check_unit(syscall(SYS_FSTAT, fd.0, &mut stat as *mut Stat as u64, 0, 0))?;
+    check_unit(syscall(SYS_FSTAT, fd.0 as u64, &mut stat as *mut Stat as u64, 0, 0))?;
     Ok(stat)
 }
 
 /// Flush file descriptor to disk.
 pub fn fsync(fd: Fd) -> Result<(), SyscallError> {
-    check_unit(syscall(SYS_FSYNC, fd.0, 0, 0, 0))
+    check_unit(syscall(SYS_FSYNC, fd.0 as u64, 0, 0, 0))
 }
 
 /// Read directory entries. Returns bytes written to `buf`.
@@ -472,6 +543,11 @@ pub fn clock_realtime() -> RealTime {
         minutes: ((raw >> 8) & 0xFF) as u8,
         seconds: (raw & 0xFF) as u8,
     }
+}
+
+/// Seconds since Unix epoch (1970-01-01 00:00:00 UTC), read from CMOS RTC.
+pub fn clock_epoch() -> u64 {
+    syscall(SYS_CLOCK_EPOCH, 0, 0, 0, 0)
 }
 
 // --- Screen / GPU ---
@@ -542,13 +618,17 @@ impl PollResult {
 
 /// Poll file descriptors and the message queue for readiness.
 /// Blocks until at least one source has data.
-pub fn poll(fds: &[Fd]) -> PollResult {
+///
+/// Each entry is a fd number (as u64), optionally OR'd with POLL_READABLE/POLL_WRITABLE.
+pub fn poll(fds: &[u64]) -> PollResult {
     poll_timeout(fds, None)
 }
 
 /// Poll file descriptors and the message queue for readiness.
 /// `None` = block forever, `Some(nanos)` = timeout after `nanos` nanoseconds.
-pub fn poll_timeout(fds: &[Fd], timeout: Option<u64>) -> PollResult {
+///
+/// Each entry is a fd number (as u64), optionally OR'd with POLL_READABLE/POLL_WRITABLE.
+pub fn poll_timeout(fds: &[u64], timeout: Option<u64>) -> PollResult {
     let mask = syscall(SYS_POLL, fds.as_ptr() as u64, fds.len() as u64, encode_timeout(timeout), 0);
     PollResult { mask, fd_count: fds.len() }
 }
@@ -562,11 +642,12 @@ pub enum DeviceType {
     Keyboard = 0,
     Mouse = 1,
     Framebuffer = 2,
+    Nic = 3,
 }
 
 /// Claim exclusive access to a device.
 pub fn open_device(device: DeviceType) -> Result<Fd, SyscallError> {
-    check(syscall(SYS_OPEN_DEVICE, device as u64, 0, 0, 0)).map(Fd)
+    check(syscall(SYS_OPEN_DEVICE, device as u64, 0, 0, 0)).map(|v| Fd(v as i32))
 }
 
 // --- Name registry ---
@@ -598,7 +679,10 @@ pub fn grant_shared(token: u32, target_pid: Pid) {
 }
 
 /// Map a shared memory region into this process's address space.
-pub fn map_shared(token: u32) -> *mut u8 {
+///
+/// # Safety
+/// Caller must ensure the token is valid and manage the returned pointer.
+pub unsafe fn map_shared(token: u32) -> *mut u8 {
     let addr = syscall(SYS_MAP_SHARED, token as u64, 0, 0, 0);
     assert!(SyscallError::from_u64(addr).is_none(), "map_shared failed");
     core::ptr::with_exposed_provenance_mut(addr as usize)
@@ -653,7 +737,13 @@ pub fn nanosleep(nanos: u64) {
 
 /// Duplicate a file descriptor.
 pub fn dup(fd: Fd) -> Result<Fd, SyscallError> {
-    check(syscall(SYS_DUP, fd.0, 0, 0, 0)).map(Fd)
+    check(syscall(SYS_DUP, fd.0 as u64, 0, 0, 0)).map(|v| Fd(v as i32))
+}
+
+/// Duplicate a file descriptor to a specific fd number.
+/// If `new_fd` is already open, it is closed first.
+pub fn dup2(old_fd: Fd, new_fd: Fd) -> Result<Fd, SyscallError> {
+    check(syscall(SYS_DUP2, old_fd.0 as u64, new_fd.0 as u64, 0, 0)).map(|v| Fd(v as i32))
 }
 
 /// Get the current process ID.
@@ -684,7 +774,10 @@ pub fn dl_open(path: &[u8]) -> Result<u64, SyscallError> {
 }
 
 /// Look up a symbol in a loaded shared library. Returns the address.
-pub fn dl_sym(handle: u64, name: &[u8]) -> Result<u64, SyscallError> {
+///
+/// # Safety
+/// The returned address must only be transmuted to the correct function signature.
+pub unsafe fn dl_sym(handle: u64, name: &[u8]) -> Result<u64, SyscallError> {
     check(syscall(SYS_DLSYM, handle, name.as_ptr() as u64, name.len() as u64, 0))
 }
 
@@ -697,12 +790,18 @@ pub fn dl_close(handle: u64) -> u64 {
 
 /// Block if `*addr == expected`. Returns 0 on wake, 1 on timeout.
 /// `None` = wait forever, `Some(nanos)` = timeout.
-pub fn futex_wait(addr: *const u32, expected: u32, timeout: Option<u64>) -> u64 {
+///
+/// # Safety
+/// `addr` must point to a valid, aligned `u32`.
+pub unsafe fn futex_wait(addr: *const u32, expected: u32, timeout: Option<u64>) -> u64 {
     syscall(SYS_FUTEX_WAIT, addr as u64, expected as u64, encode_timeout(timeout), 0)
 }
 
 /// Wake up to `count` threads waiting on `addr`. Returns number of threads woken.
-pub fn futex_wake(addr: *const u32, count: u32) -> u64 {
+///
+/// # Safety
+/// `addr` must point to a valid, aligned `u32`.
+pub unsafe fn futex_wake(addr: *const u32, count: u32) -> u64 {
     syscall(SYS_FUTEX_WAKE, addr as u64, count as u64, 0, 0)
 }
 
@@ -710,7 +809,7 @@ pub fn futex_wake(addr: *const u32, count: u32) -> u64 {
 
 /// Truncate file descriptor to `size` bytes.
 pub fn ftruncate(fd: Fd, size: u64) -> Result<(), SyscallError> {
-    check_unit(syscall(SYS_FTRUNCATE, fd.0, size, 0, 0))
+    check_unit(syscall(SYS_FTRUNCATE, fd.0 as u64, size, 0, 0))
 }
 
 // --- Stack info ---
@@ -733,15 +832,25 @@ pub fn cpu_count() -> u32 {
 // --- Memory mapping ---
 
 /// Map anonymous memory. Returns pointer on success, null on failure.
-pub fn mmap(size: usize, prot: MmapProt, flags: MmapFlags) -> *mut u8 {
-    let addr = syscall(SYS_MMAP, size as u64, prot.0, flags.0, 0);
-    if SyscallError::from_u64(addr).is_some() { core::ptr::null_mut() } else {
-        core::ptr::with_exposed_provenance_mut(addr as usize)
+///
+/// If `addr` is non-null and `flags` includes `MmapFlags::FIXED`, the mapping
+/// is placed at exactly that address (must be 2MB-aligned).
+/// If `addr` is null, the kernel chooses the address.
+///
+/// # Safety
+/// Caller is responsible for managing the returned memory region.
+pub unsafe fn mmap(addr: *mut u8, size: usize, prot: MmapProt, flags: MmapFlags) -> *mut u8 {
+    let result = syscall(SYS_MMAP, addr as u64, size as u64, prot.0, flags.0);
+    if SyscallError::from_u64(result).is_some() { core::ptr::null_mut() } else {
+        core::ptr::with_exposed_provenance_mut(result as usize)
     }
 }
 
 /// Unmap a previously mapped region.
-pub fn munmap(addr: *mut u8, size: usize) -> Result<(), SyscallError> {
+///
+/// # Safety
+/// `addr` and `size` must describe a region previously returned by `mmap`.
+pub unsafe fn munmap(addr: *mut u8, size: usize) -> Result<(), SyscallError> {
     check_unit(syscall(SYS_MUNMAP, addr as u64, size as u64, 0, 0))
 }
 
@@ -756,12 +865,12 @@ pub fn kill(pid: Pid) -> Result<(), SyscallError> {
 
 /// Non-blocking read. Returns bytes read, or `Err(WouldBlock)` if no data available.
 pub fn read_nonblock(fd: Fd, buf: &mut [u8]) -> Result<usize, SyscallError> {
-    check(syscall(SYS_READ_NONBLOCK, fd.0, buf.as_mut_ptr() as u64, buf.len() as u64, 0)).map(|n| n as usize)
+    check(syscall(SYS_READ_NONBLOCK, fd.0 as u64, buf.as_mut_ptr() as u64, buf.len() as u64, 0)).map(|n| n as usize)
 }
 
 /// Non-blocking write. Returns bytes written, or `Err(WouldBlock)` if no space available.
 pub fn write_nonblock(fd: Fd, buf: &[u8]) -> Result<usize, SyscallError> {
-    check(syscall(SYS_WRITE_NONBLOCK, fd.0, buf.as_ptr() as u64, buf.len() as u64, 0)).map(|n| n as usize)
+    check(syscall(SYS_WRITE_NONBLOCK, fd.0 as u64, buf.as_ptr() as u64, buf.len() as u64, 0)).map(|n| n as usize)
 }
 
 // --- Pipe operations ---
@@ -769,22 +878,51 @@ pub fn write_nonblock(fd: Fd, buf: &[u8]) -> Result<usize, SyscallError> {
 /// Open an existing pipe by internal ID. `mode`: 0 = read, 1 = write.
 /// Returns a new file descriptor for the pipe.
 pub fn pipe_open(pipe_id: u64, mode: u64) -> Result<Fd, SyscallError> {
-    check(syscall(SYS_PIPE_OPEN, pipe_id, mode, 0, 0)).map(Fd)
+    check(syscall(SYS_PIPE_OPEN, pipe_id, mode, 0, 0)).map(|v| Fd(v as i32))
 }
 
 /// Create a pipe with a specific buffer capacity. Returns read and write fds.
 pub fn pipe_with_capacity(capacity: usize) -> PipeFds {
     let raw = syscall(SYS_PIPE_WITH_CAPACITY, capacity as u64, 0, 0, 0);
     PipeFds {
-        read: Fd(raw >> 32),
-        write: Fd(raw & 0xFFFF_FFFF),
+        read: Fd((raw >> 32) as i32),
+        write: Fd((raw & 0xFFFF_FFFF) as i32),
     }
 }
 
 /// Get the internal pipe ID for a pipe/tty file descriptor.
 /// Used to share pipe access across processes via `pipe_open`.
 pub fn pipe_id(fd: Fd) -> Result<u64, SyscallError> {
-    check(syscall(SYS_PIPE_ID, fd.0, 0, 0, 0))
+    check(syscall(SYS_PIPE_ID, fd.0 as u64, 0, 0, 0))
+}
+
+/// Create a socket file descriptor from two pipe IDs (rx for reading, tx for writing).
+/// The kernel bumps refcounts on both pipes. Caller should close original pipe fds after this.
+pub fn socket_create(rx_pipe_id: u64, tx_pipe_id: u64) -> Result<Fd, SyscallError> {
+    check(syscall(SYS_SOCKET_CREATE, rx_pipe_id, tx_pipe_id, 0, 0)).map(|v| Fd(v as i32))
+}
+
+/// Map a pipe's shared-memory ring buffer into this process's address space.
+/// Returns a pointer to the `RingHeader` at the start of the mapped region.
+pub fn pipe_map(fd: Fd) -> Result<*mut u8, SyscallError> {
+    check(syscall(SYS_PIPE_MAP, fd.0 as u64, 0, 0, 0)).map(|v| v as *mut u8)
+}
+
+// --- NIC DMA control ---
+
+/// Poll for a received frame. Returns `(buf_index << 16) | frame_len`, or 0 if none.
+pub fn nic_rx_poll() -> u64 {
+    syscall(SYS_NIC_RX_POLL, 0, 0, 0, 0)
+}
+
+/// Tell the kernel to refill RX buffer `buf_index` after consuming the frame.
+pub fn nic_rx_done(buf_index: u64) {
+    syscall(SYS_NIC_RX_DONE, buf_index, 0, 0, 0);
+}
+
+/// Submit the TX DMA buffer to hardware. `total_len` includes the net header.
+pub fn nic_tx(total_len: u64) {
+    syscall(SYS_NIC_TX, total_len, 0, 0, 0);
 }
 
 // --- Audio ---
