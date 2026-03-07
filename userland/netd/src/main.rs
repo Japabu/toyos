@@ -273,10 +273,20 @@ impl NetDaemon {
                 SocketKind::TcpStream(handle) => {
                     socket_set.get_mut::<tcp::Socket>(handle).close();
                     socket_set.remove(handle);
+                    // Clean up any piped connection using this handle
+                    if let Some(pos) = self.piped_connections.iter().position(|c| c.handle == handle) {
+                        let conn = self.piped_connections.swap_remove(pos);
+                        if conn.rx_write_fd >= 0 { toyos_io::close(conn.rx_write_fd); }
+                        if conn.tx_read_fd >= 0 { toyos_io::close(conn.tx_read_fd); }
+                    }
                 }
                 SocketKind::TcpListener(handle) => {
                     socket_set.get_mut::<tcp::Socket>(handle).abort();
                     socket_set.remove(handle);
+                    // Clean up piped listener
+                    if let Some(listener) = self.piped_listeners.remove(&req.socket_id) {
+                        toyos_io::close(listener.notify_write_fd);
+                    }
                 }
                 SocketKind::Udp(handle) => {
                     socket_set.get_mut::<udp::Socket>(handle).close();
@@ -685,7 +695,8 @@ impl NetDaemon {
     /// Bridge data between smoltcp sockets and kernel pipes for piped connections.
     fn bridge_piped(&mut self, socket_set: &mut SocketSet<'_>) {
         let mut closed = Vec::new();
-        for (i, conn) in self.piped_connections.iter().enumerate() {
+        for i in 0..self.piped_connections.len() {
+            let conn = &mut self.piped_connections[i];
             let socket = socket_set.get_mut::<tcp::Socket>(conn.handle);
             let rx_ring = unsafe { &*conn.rx_ring };
             let tx_ring = unsafe { &*conn.tx_ring };
@@ -709,17 +720,27 @@ impl NetDaemon {
                 }
             }
 
-            // Detect closed connections (both sides)
-            if !socket.is_open() && !socket.may_recv() && !socket.may_send() {
+            // Signal EOF to client when remote has closed and all data is drained
+            if !socket.may_recv() && !socket.can_recv() && conn.rx_write_fd >= 0 {
+                toyos_io::close(conn.rx_write_fd);
+                conn.rx_write_fd = -1;
+            }
+
+            // Signal broken pipe when client has stopped reading
+            if conn.tx_read_fd >= 0 && tx_ring.is_reader_closed() {
+                toyos_io::close(conn.tx_read_fd);
+                conn.tx_read_fd = -1;
+            }
+
+            // Fully clean up when both sides are done
+            if conn.rx_write_fd < 0 && conn.tx_read_fd < 0 && !socket.is_open() {
                 closed.push(i);
             }
         }
 
-        // Clean up closed piped connections (reverse order to preserve indices)
+        // Clean up fully closed piped connections (reverse order to preserve indices)
         for &i in closed.iter().rev() {
-            let conn = self.piped_connections.swap_remove(i);
-            toyos_io::close(conn.rx_write_fd);
-            toyos_io::close(conn.tx_read_fd);
+            self.piped_connections.swap_remove(i);
         }
     }
 

@@ -161,7 +161,9 @@ pub fn close_read(pipe_id: PipeId) {
     with_pipes_mut(|pipes| {
         let pipe = pipes.get_mut(pipe_id).expect("close_read: pipe not found");
         pipe.readers = pipe.readers.checked_sub(1).expect("pipe reader underflow");
-        pipe.header().close_reader();
+        if pipe.readers == 0 {
+            pipe.header().close_reader();
+        }
         if pipe.readers == 0 && pipe.writers == 0 {
             let pipe = pipes.remove(pipe_id).unwrap();
             free_pipe(pipe);
@@ -173,7 +175,9 @@ pub fn close_write(pipe_id: PipeId) {
     with_pipes_mut(|pipes| {
         let pipe = pipes.get_mut(pipe_id).expect("close_write: pipe not found");
         pipe.writers = pipe.writers.checked_sub(1).expect("pipe writer underflow");
-        pipe.header().close_writer();
+        if pipe.writers == 0 {
+            pipe.header().close_writer();
+        }
         if pipe.readers == 0 && pipe.writers == 0 {
             let pipe = pipes.remove(pipe_id).unwrap();
             free_pipe(pipe);
