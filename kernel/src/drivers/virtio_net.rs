@@ -5,6 +5,8 @@ use super::pci::PciDevice;
 use super::virtio::{BufDir, Virtqueue, VirtioDevice, VIRTIO_F_VERSION_1};
 use super::DmaPool;
 use crate::log;
+use crate::net::NicInfo;
+use crate::shared_memory;
 use crate::sync::Lock;
 
 const VIRTIO_VENDOR: u16 = 0x1AF4;
@@ -104,6 +106,32 @@ impl crate::net::Nic for VirtioNic {
         self.refill_rx(buf_idx);
         Some(copy_len)
     }
+
+    fn poll_rx(&mut self) -> Option<(usize, usize)> {
+        let (desc_id, written_len) = self.rxq.poll_used()?;
+        let buf_idx = self.desc_to_buf[desc_id as usize];
+        let total = written_len as usize;
+        if total <= NET_HDR_SIZE {
+            self.refill_rx(buf_idx);
+            return None;
+        }
+        Some((buf_idx, total - NET_HDR_SIZE))
+    }
+
+    fn refill_rx_buf(&mut self, buf_index: usize) {
+        if buf_index < RX_BUF_COUNT {
+            self.refill_rx(buf_index);
+        }
+    }
+
+    fn submit_tx(&mut self, total_len: usize) {
+        self.txq.submit_and_wait(
+            &[(self.tx_buf, total_len as u32, BufDir::Readable)],
+            self.device.notify_mmio(),
+            self.device.notify_off_multiplier(),
+            1,
+        );
+    }
 }
 
 pub fn init(ecam_base: u64) {
@@ -140,6 +168,20 @@ pub fn init(ecam_base: u64) {
         dma_addr(PAGE_RX_BUFS + 2),
     ];
     let tx_buf = dma_addr(PAGE_TX_BUF);
+
+    // Register DMA buffers as shared memory for direct userland access
+    let rx_tokens: [u32; 3] = core::array::from_fn(|i| {
+        shared_memory::register(rx_bufs[i], 4096).raw()
+    });
+    let tx_token = shared_memory::register(tx_buf, 4096).raw();
+
+    crate::net::set_nic_info(NicInfo {
+        rx_buf_tokens: rx_tokens,
+        tx_buf_token: tx_token,
+        mac,
+        rx_buf_count: RX_BUF_COUNT as u8,
+        net_hdr_size: NET_HDR_SIZE as u8,
+    });
 
     let mut nic = VirtioNic {
         device, rxq, txq, mac, rx_bufs, tx_buf,

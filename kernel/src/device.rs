@@ -6,10 +6,12 @@ use crate::sync::Lock;
 pub const DEVICE_KEYBOARD: u64 = 0;
 pub const DEVICE_MOUSE: u64 = 1;
 pub const DEVICE_FRAMEBUFFER: u64 = 2;
+pub const DEVICE_NIC: u64 = 3;
 
 static KEYBOARD_OWNER: Lock<Option<Pid>> = Lock::new(None);
 static MOUSE_OWNER: Lock<Option<Pid>> = Lock::new(None);
 static FRAMEBUFFER_OWNER: Lock<Option<Pid>> = Lock::new(None);
+static NIC_OWNER: Lock<Option<Pid>> = Lock::new(None);
 static FB_INFO: Lock<Option<FramebufferInfo>> = Lock::new(None);
 
 pub fn set_framebuffer_info(info: FramebufferInfo) {
@@ -51,6 +53,20 @@ pub fn try_claim(device_type: u64, pid: Pid) -> Option<Descriptor> {
                 "failed to grant cursor token");
             Some(Descriptor::Framebuffer(info))
         }
+        DEVICE_NIC => {
+            let mut owner = NIC_OWNER.lock();
+            if owner.is_some() {
+                return None;
+            }
+            let info = crate::net::nic_info()?;
+            *owner = Some(pid);
+            // Grant all DMA buffer tokens to the claiming process
+            for &token in &info.rx_buf_tokens {
+                let _ = shared_memory::grant(shared_memory::SharedToken::from_raw(token), Pid::MAX, pid);
+            }
+            let _ = shared_memory::grant(shared_memory::SharedToken::from_raw(info.tx_buf_token), Pid::MAX, pid);
+            Some(Descriptor::Nic(info))
+        }
         _ => None,
     }
 }
@@ -61,6 +77,7 @@ pub fn release(device_type: u64, pid: Pid) {
         DEVICE_KEYBOARD => KEYBOARD_OWNER.lock(),
         DEVICE_MOUSE => MOUSE_OWNER.lock(),
         DEVICE_FRAMEBUFFER => FRAMEBUFFER_OWNER.lock(),
+        DEVICE_NIC => NIC_OWNER.lock(),
         _ => return,
     };
     if *owner == Some(pid) {
@@ -74,6 +91,7 @@ pub fn release_descriptor(desc: &Descriptor, pid: Pid) {
         Descriptor::Keyboard => release(DEVICE_KEYBOARD, pid),
         Descriptor::Mouse => release(DEVICE_MOUSE, pid),
         Descriptor::Framebuffer(_) => release(DEVICE_FRAMEBUFFER, pid),
+        Descriptor::Nic(_) => release(DEVICE_NIC, pid),
         _ => {}
     }
 }

@@ -74,6 +74,35 @@ impl<'a> SyscallContext<'a> {
         Some(unsafe { &mut *(ptr as *mut T) })
     }
 
+    /// Validate a user pointer to a single `Pod` struct.
+    pub fn user_pod<T: Pod>(&self, ptr: u64) -> Option<&'a T> {
+        let size = core::mem::size_of::<T>();
+        if !paging::is_user_mapped(ptr, size as u64) {
+            return None;
+        }
+        if ptr as usize % core::mem::align_of::<T>() != 0 {
+            return None;
+        }
+        Some(unsafe { &*(ptr as *const T) })
+    }
+
+    /// Validate a user pointer and read a `Copy` struct.
+    /// Like `user_pod` but doesn't require `Pod` — caller asserts the type is
+    /// `#[repr(C)]` with no padding invariants.
+    ///
+    /// # Safety
+    /// `T` must be `#[repr(C)]` and valid for any bit pattern (no padding traps).
+    pub unsafe fn user_read<T: Copy>(&self, ptr: u64) -> Option<T> {
+        let size = core::mem::size_of::<T>();
+        if size == 0 || !paging::is_user_mapped(ptr, size as u64) {
+            return None;
+        }
+        if ptr as usize % core::mem::align_of::<T>() != 0 {
+            return None;
+        }
+        Some(core::ptr::read(ptr as *const T))
+    }
+
     /// Validate a user pointer to a slice of `Pod` structs.
     /// Checks mapping, alignment, and arithmetic overflow.
     pub fn user_pod_slice<T: Pod>(&self, ptr: u64, count: usize) -> Option<&'a [T]> {

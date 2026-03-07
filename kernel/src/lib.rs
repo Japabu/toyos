@@ -14,6 +14,7 @@ pub mod allocator;
 pub mod keyboard;
 pub mod mouse;
 pub mod ramdisk;
+pub mod tmpfs;
 pub mod vfs;
 pub mod elf;
 pub mod symbols;

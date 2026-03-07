@@ -14,29 +14,7 @@ use crate::sync::Lock;
 use crate::symbols::ProcessSymbols;
 use crate::{elf, log, pipe, scheduler, shared_memory, vfs};
 
-// ---------------------------------------------------------------------------
-// Pid — newtype for process/thread IDs (compile-time separation from raw u32)
-// ---------------------------------------------------------------------------
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct Pid(u32);
-
-impl Pid {
-    pub const MAX: Self = Pid(u32::MAX);
-    pub fn raw(self) -> u32 { self.0 }
-    pub fn from_raw(v: u32) -> Self { Pid(v) }
-}
-
-impl core::fmt::Display for Pid {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl core::ops::Add for Pid {
-    type Output = Self;
-    fn add(self, rhs: Self) -> Self { Pid(self.0 + rhs.0) }
-}
+pub use toyos_abi::Pid;
 
 impl crate::id_map::IdKey for Pid {
     const ZERO: Self = Pid(0);
@@ -144,7 +122,7 @@ pub enum ProcessState {
     BlockedRecvMsg,
     BlockedNetRecv { deadline: u64 },
     BlockedSleep { deadline: u64 },
-    BlockedFutex { addr: u64, deadline: u64 },
+    BlockedFutex { phys_addr: u64, deadline: u64 },
     Zombie(i32),
 }
 
@@ -240,6 +218,8 @@ pub struct Process {
     // User stack location (for SYS_STACK_INFO — works for both processes and threads)
     pub user_stack_base: u64,
     pub user_stack_size: u64,
+    /// Inherited environment variables (KEY=VALUE\0KEY2=VALUE2\0...)
+    pub env: Vec<u8>,
 }
 
 impl Process {
@@ -258,6 +238,8 @@ pub struct MmapRegion {
     pub addr: u64,
     pub size: usize,
     pub alloc: OwnedAlloc,
+    /// True if this is a MAP_FIXED mapping (virt addr != phys addr).
+    pub fixed: bool,
 }
 
 pub struct ProcessTable {
@@ -512,6 +494,7 @@ pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64, stack_base: u64) -> Op
         mmap_regions: Vec::new(),
         user_stack_base: stack_base,
         user_stack_size: if stack_base > 0 { stack_ptr - stack_base } else { 0 },
+        env: Vec::new(),
     });
     table.procs.get_mut(tid).unwrap().pid = tid;
 
@@ -541,15 +524,15 @@ pub fn build_child_fds(pairs: &[[u32; 2]]) -> FdTable {
     let fd_owner = table.procs.get(fd_pid).unwrap();
     let mut fds = FdTable::new();
     for &[child_fd, parent_fd] in pairs {
-        if let Some(desc) = fd_owner.fds.get(parent_fd as u64) {
-            fds.insert_at(child_fd as u64, fd::dup(desc));
+        if let Some(desc) = fd_owner.fds.get(parent_fd) {
+            fds.insert_at(child_fd, fd::dup(desc));
         }
     }
     fds
 }
 
 /// Spawn a new process from an ELF binary.
-pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>) -> Option<Pid> {
+pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> Option<Pid> {
     let path = argv[0];
 
     let binary = match vfs::lock().read_file(path) {
@@ -714,6 +697,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>) -> Option<Pid> {
         mmap_regions: Vec::new(),
         user_stack_base: stack_base,
         user_stack_size: USER_STACK_SIZE as u64,
+        env,
     });
     let p = table.procs.get_mut(pid).unwrap();
     p.pid = pid;
@@ -742,7 +726,7 @@ pub fn spawn_kernel(argv: &[&str]) -> Pid {
     fds.insert_at(0, Descriptor::SerialConsole);
     fds.insert_at(1, Descriptor::SerialConsole);
     fds.insert_at(2, Descriptor::SerialConsole);
-    spawn(&full_argv, fds, None).expect("spawn_kernel: failed to spawn")
+    spawn(&full_argv, fds, None, Vec::new()).expect("spawn_kernel: failed to spawn")
 }
 
 /// Like `spawn_kernel`, but returns `None` instead of panicking if the binary
@@ -761,7 +745,7 @@ pub fn spawn_optional(argv: &[&str]) -> Option<Pid> {
     fds.insert_at(0, Descriptor::SerialConsole);
     fds.insert_at(1, Descriptor::SerialConsole);
     fds.insert_at(2, Descriptor::SerialConsole);
-    spawn(&full_argv, fds, None)
+    spawn(&full_argv, fds, None, Vec::new())
 }
 
 /// Tear down a process: zombie all its threads, free all resources, wake parent.
@@ -927,33 +911,46 @@ pub fn futex_wait(addr: u64, expected: u32, timeout_ns: u64) -> u64 {
     let pid = current_pid();
     let proc = table.procs.get_mut(pid).unwrap();
 
+    // Translate virtual → physical so cross-process futex works on shared memory
+    let pml4 = proc.cr3.map(|r| r.as_ptr() as *const u64)
+        .unwrap_or(crate::arch::paging::kernel_cr3() as *const u64);
+    let phys_addr = match crate::arch::paging::virt_to_phys(pml4, addr) {
+        Some(pa) => pa,
+        None => return u64::MAX,
+    };
+
     // Atomic check: read the user value under the lock
     let current = unsafe { core::ptr::read_volatile(addr as *const u32) };
     if current != expected {
         return 0;
     }
 
-    proc.set_state(ProcessState::BlockedFutex { addr, deadline });
+    proc.set_state(ProcessState::BlockedFutex { phys_addr, deadline });
     // Pass the held lock to the scheduler so it can context-switch atomically
     scheduler::schedule_already_blocked(guard);
     0
 }
 
-/// Wake up to `count` threads blocked on `addr` in the same address space as the caller.
+/// Wake up to `count` threads blocked on the same physical address as `addr`.
 pub fn futex_wake(addr: u64, count: u64) -> u64 {
     let mut guard = PROCESS_TABLE.lock();
     let table = guard.as_mut().unwrap();
     let pid = current_pid();
-    let caller_cr3 = table.procs.get(pid).and_then(|p| p.cr3);
+    let caller_cr3 = table.procs.get(pid).map(|p| {
+        p.cr3.map(|r| r.as_ptr() as *const u64)
+            .unwrap_or(crate::arch::paging::kernel_cr3() as *const u64)
+    }).unwrap();
+    let caller_phys = match crate::arch::paging::virt_to_phys(caller_cr3, addr) {
+        Some(pa) => pa,
+        None => return 0,
+    };
     let mut woken = 0u64;
     for (_, proc) in table.procs.iter_mut() {
         if woken >= count { break; }
-        if caller_cr3.is_some() && proc.cr3 == caller_cr3 {
-            if let ProcessState::BlockedFutex { addr: a, .. } = proc.state {
-                if a == addr {
-                    proc.set_state(ProcessState::Ready);
-                    woken += 1;
-                }
+        if let ProcessState::BlockedFutex { phys_addr, .. } = proc.state {
+            if phys_addr == caller_phys {
+                proc.set_state(ProcessState::Ready);
+                woken += 1;
             }
         }
     }

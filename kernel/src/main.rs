@@ -67,8 +67,8 @@ fn kernel_main(
     assert!(!initrd.is_empty(), "No initrd provided");
     log!("Initrd: addr={:#x} size={} bytes", initrd.as_ptr() as u64, initrd.len());
 
-    let ramdisk = unsafe { ramdisk::RamDisk::new(initrd.as_ptr(), initrd.len()) };
-    let mut initrd_fs = tyfs::SimpleFs::mount(ramdisk).expect("Failed to mount initrd");
+    let initrd_disk = unsafe { ramdisk::InitrdDisk::new(initrd.as_ptr(), initrd.len()) };
+    let mut initrd_fs = tyfs::SimpleFs::mount(initrd_disk).expect("Failed to mount initrd");
     log!("TYFS: mounted initrd");
     for (name, size) in initrd_fs.list() {
         log!("  {} ({} bytes)", name, size);
@@ -138,6 +138,9 @@ fn kernel_main(
     // Mount filesystems
     vfs::lock().mount("initrd", Box::new(initrd_fs));
     vfs::lock().mount("nvme", Box::new(nvme_fs));
+
+    // Mount tmpfs
+    vfs::lock().mount("tmp", Box::new(kernel::tmpfs::TmpFs::new()));
 
     // Load keyboard layout from config
     if let Ok(data) = vfs::lock().read_file("/nvme/config/keyboard_layout") {

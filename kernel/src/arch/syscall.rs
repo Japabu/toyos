@@ -139,11 +139,11 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
     match num {
         SYS_WRITE => {
             let Some(buf) = ctx.user_slice(a2, a3) else { return bad_addr };
-            sys_write(a1, buf)
+            sys_write(a1 as u32, buf)
         }
         SYS_READ => {
             let Some(buf) = ctx.user_slice_mut(a2, a3) else { return bad_addr };
-            sys_read(a1, buf)
+            sys_read(a1 as u32, buf)
         }
         SYS_ALLOC => with_heap_owner(|heap| user_heap::alloc(heap, a1 as usize, a2 as usize)).unwrap_or(0),
         SYS_FREE => { with_heap_owner(|heap| { user_heap::free(heap, a1 as *mut u8, a2 as usize); 0 }).unwrap_or(0) }
@@ -159,13 +159,13 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             let Some(path) = ctx.user_str(a1, a2) else { return bad_addr };
             sys_open(path, a3)
         }
-        SYS_CLOSE => sys_close(a1),
-        SYS_SEEK => process::with_fd_owner_mut(|proc| fd::seek(&mut proc.fds, a1, a2 as i64, a3)),
+        SYS_CLOSE => sys_close(a1 as u32),
+        SYS_SEEK => process::with_fd_owner_mut(|proc| fd::seek(&mut proc.fds, a1 as u32, a2 as i64, a3)),
         SYS_FSTAT => {
             let Some(stat) = ctx.user_mut::<fd::Stat>(a2) else { return bad_addr };
-            if process::with_fd_owner(|proc| fd::fstat(&proc.fds, a1, stat)) { 0 } else { SyscallError::NotFound.to_u64() }
+            if process::with_fd_owner(|proc| fd::fstat(&proc.fds, a1 as u32, stat)) { 0 } else { SyscallError::NotFound.to_u64() }
         }
-        SYS_FSYNC => process::with_fd_owner_mut(|proc| fd::fsync(&mut proc.fds, &mut *vfs::lock(), a1)),
+        SYS_FSYNC => process::with_fd_owner_mut(|proc| fd::fsync(&mut proc.fds, &mut *vfs::lock(), a1 as u32)),
         SYS_READDIR => {
             let Some(path) = ctx.user_str(a1, a2) else { return bad_addr };
             let Some(buf) = ctx.user_slice_mut(a3, a4) else { return bad_addr };
@@ -195,15 +195,23 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         }
         SYS_PIPE => sys_pipe(),
         SYS_SPAWN => {
-            let Some(text) = ctx.user_str(a1, a2) else { return bad_addr };
-            let count = a4 as usize;
-            let fds = if count > 0 {
-                let Some(pairs) = ctx.user_pod_slice::<[u32; 2]>(a3, count) else { return bad_addr };
+            // SAFETY: SpawnArgs is #[repr(C)] with only u64 fields — no padding, valid for any bit pattern.
+            let Some(args) = (unsafe { ctx.user_read::<SpawnArgs>(a1) }) else { return bad_addr };
+            let Some(text) = ctx.user_str(args.argv_ptr, args.argv_len) else { return bad_addr };
+            let fd_count = args.fd_map_count as usize;
+            let fds = if fd_count > 0 {
+                let Some(pairs) = ctx.user_pod_slice::<[u32; 2]>(args.fd_map_ptr, fd_count) else { return bad_addr };
                 process::build_child_fds(pairs)
             } else {
                 fd::FdTable::new()
             };
-            sys_spawn(text, fds)
+            let env = if args.env_len > 0 {
+                let Some(env_bytes) = ctx.user_slice(args.env_ptr, args.env_len) else { return bad_addr };
+                env_bytes.to_vec()
+            } else {
+                alloc::vec::Vec::new()
+            };
+            sys_spawn(text, fds, env)
         }
         SYS_WAITPID => sys_waitpid(a1, a2),
         SYS_POLL => {
@@ -211,7 +219,7 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             let Some(fds) = ctx.user_pod_slice::<u64>(a1, a2 as usize) else { return bad_addr };
             sys_poll(fds, a2, a3)
         }
-        SYS_MARK_TTY => process::with_fd_owner_mut(|proc| fd::mark_tty(&mut proc.fds, a1)),
+        SYS_MARK_TTY => process::with_fd_owner_mut(|proc| fd::mark_tty(&mut proc.fds, a1 as u32)),
         SYS_SEND_MSG => {
             let Some(user_msg) = ctx.user_ref::<message::UserMessage>(a2) else { return bad_addr };
             const MAX_MSG_PAYLOAD: u64 = 64 * 1024;
@@ -248,6 +256,7 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         SYS_THREAD_SPAWN => process::spawn_thread(a1, a2, a3, a4).map_or(SyscallError::Unknown.to_u64(), |t| t.raw() as u64),
         SYS_THREAD_JOIN => sys_thread_join(a1),
         SYS_CLOCK_REALTIME => crate::rtc::read_time(),
+        SYS_CLOCK_EPOCH => crate::rtc::read_epoch_secs(),
         SYS_SYSINFO => {
             let Some(buf) = ctx.user_slice_mut(a1, a2) else { return bad_addr };
             sys_sysinfo(buf)
@@ -266,7 +275,8 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             sys_net_recv(buf, a3)
         }
         SYS_NANOSLEEP => sys_nanosleep(a1),
-        SYS_DUP => sys_dup(a1),
+        SYS_DUP => sys_dup(a1 as u32),
+        SYS_DUP2 => sys_dup2(a1 as u32, a2 as u32),
         SYS_GETPID => process::current_pid().raw() as u64,
         SYS_RENAME => {
             let Some(old) = ctx.user_str(a1, a2) else { return bad_addr };
@@ -290,7 +300,7 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             sys_dlsym(a1, name)
         }
         SYS_DLCLOSE => 0,
-        SYS_FTRUNCATE => process::with_fd_owner_mut(|proc| fd::ftruncate(&mut proc.fds, a1, a2)),
+        SYS_FTRUNCATE => process::with_fd_owner_mut(|proc| fd::ftruncate(&mut proc.fds, a1 as u32, a2)),
         SYS_STACK_INFO => {
             let Some(base_out) = ctx.user_mut::<u64>(a1) else { return bad_addr };
             let Some(size_out) = ctx.user_mut::<u64>(a2) else { return bad_addr };
@@ -313,26 +323,48 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             if !paging::is_user_mapped(a1, 4) { return bad_addr; }
             process::futex_wake(a1, a2)
         }
-        SYS_MMAP => sys_mmap(a1, a2, a3),
+        SYS_MMAP => sys_mmap(a1, a2, a3, a4),
         SYS_MUNMAP => sys_munmap(a1, a2),
         SYS_KILL => process::kill_process(process::Pid::from_raw(a1 as u32)),
         SYS_READ_NONBLOCK => {
             let Some(buf) = ctx.user_slice_mut(a2, a3) else { return bad_addr };
-            sys_read_nonblock(a1, buf)
+            sys_read_nonblock(a1 as u32, buf)
         }
         SYS_WRITE_NONBLOCK => {
             let Some(buf) = ctx.user_slice(a2, a3) else { return bad_addr };
-            sys_write_nonblock(a1, buf)
+            sys_write_nonblock(a1 as u32, buf)
         }
         SYS_PIPE_OPEN => sys_pipe_open(a1, a2),
         SYS_PIPE_WITH_CAPACITY => sys_pipe_with_capacity(a1 as usize),
-        SYS_PIPE_ID => sys_pipe_id(a1),
+        SYS_PIPE_ID => sys_pipe_id(a1 as u32),
         SYS_AUDIO_WRITE => {
             let Some(buf) = ctx.user_slice(a1, a2) else { return bad_addr };
             crate::audio::write_samples(buf);
             0
         }
         SYS_EXIT => sys_exit(a1 as i32),
+        SYS_GET_ENV => {
+            let env = process::with_current(|p| p.env.clone());
+            if a2 == 0 {
+                // Query size
+                env.len() as u64
+            } else {
+                let Some(buf) = ctx.user_slice_mut(a1, a2) else { return bad_addr };
+                let copy_len = env.len().min(buf.len());
+                buf[..copy_len].copy_from_slice(&env[..copy_len]);
+                copy_len as u64
+            }
+        }
+        SYS_SOCKET_CREATE => sys_socket_create(a1, a2),
+        SYS_PIPE_MAP => sys_pipe_map(a1 as u32),
+        SYS_NIC_RX_POLL => {
+            match crate::net::poll_rx() {
+                Some((buf_idx, frame_len)) => ((buf_idx as u64) << 16) | (frame_len as u64),
+                None => 0,
+            }
+        }
+        SYS_NIC_RX_DONE => { crate::net::refill_rx_buf(a1 as usize); 0 }
+        SYS_NIC_TX => { crate::net::submit_tx(a1 as usize); 0 }
         _ => SyscallError::InvalidArgument.to_u64(),
     }
 }
@@ -341,20 +373,22 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
 // Syscall implementations
 // ---------------------------------------------------------------------------
 
-fn sys_write(fd_num: u64, buf: &[u8]) -> u64 {
+fn sys_write(fd_num: u32, buf: &[u8]) -> u64 {
     loop {
         // Single lock: try write + determine wake/block action
         let action = process::with_fd_owner_mut(|proc| {
             match fd::try_write(&mut proc.fds, fd_num, buf) {
                 Some(n) => {
                     let pipe_id = match proc.fds.get(fd_num) {
-                        Some(fd::Descriptor::PipeWrite(id)) | Some(fd::Descriptor::TtyWrite(id)) => Some(*id),
+                        Some(fd::Descriptor::PipeWrite(id)) | Some(fd::Descriptor::TtyWrite(id))
+                        | Some(fd::Descriptor::Socket { tx: id, .. }) => Some(*id),
                         _ => None,
                     };
                     Ok((n, pipe_id))
                 }
                 None => match proc.fds.get(fd_num) {
-                    Some(fd::Descriptor::PipeWrite(id)) | Some(fd::Descriptor::TtyWrite(id)) =>
+                    Some(fd::Descriptor::PipeWrite(id)) | Some(fd::Descriptor::TtyWrite(id))
+                    | Some(fd::Descriptor::Socket { tx: id, .. }) =>
                         Err(Some(process::ProcessState::BlockedPipeWrite(*id))),
                     _ => Err(None),
                 },
@@ -376,27 +410,29 @@ enum ReadBlock {
     Poll { fds: [u64; 64], len: u32, deadline: u64 },
 }
 
-fn sys_read(fd_num: u64, buf: &mut [u8]) -> u64 {
+fn sys_read(fd_num: u32, buf: &mut [u8]) -> u64 {
     loop {
         // Single lock: try read + determine wake/block action
         let action = process::with_fd_owner_mut(|proc| {
             match fd::try_read(&mut proc.fds, fd_num, buf) {
                 Some(n) => {
                     let pipe_id = match proc.fds.get(fd_num) {
-                        Some(fd::Descriptor::PipeRead(id)) | Some(fd::Descriptor::TtyRead(id)) => Some(*id),
+                        Some(fd::Descriptor::PipeRead(id)) | Some(fd::Descriptor::TtyRead(id))
+                        | Some(fd::Descriptor::Socket { rx: id, .. }) => Some(*id),
                         _ => None,
                     };
                     Ok((n, pipe_id))
                 }
                 None => match proc.fds.get(fd_num) {
                     Some(fd::Descriptor::Keyboard) => Err(Some(ReadBlock::State(process::ProcessState::BlockedKeyboard))),
-                    Some(fd::Descriptor::PipeRead(id)) | Some(fd::Descriptor::TtyRead(id)) =>
+                    Some(fd::Descriptor::PipeRead(id)) | Some(fd::Descriptor::TtyRead(id))
+                    | Some(fd::Descriptor::Socket { rx: id, .. }) =>
                         Err(Some(ReadBlock::State(process::ProcessState::BlockedPipeRead(*id)))),
                     Some(fd::Descriptor::SerialConsole) => {
                         // Poll serial every 10ms
                         let deadline = crate::clock::nanos_since_boot() + 10_000_000;
                         let mut fds = [0u64; 64];
-                        fds[0] = fd_num;
+                        fds[0] = fd_num as u64;
                         Err(Some(ReadBlock::Poll { fds, len: 1, deadline }))
                     }
                     _ => Err(None),
@@ -421,22 +457,21 @@ fn sys_open(path: &str, flags: u64) -> u64 {
     process::with_fd_owner_mut(|proc| fd::open(&mut proc.fds, &mut *vfs::lock(), &resolved, flags))
 }
 
-fn sys_close(fd_num: u64) -> u64 {
+fn sys_close(fd_num: u32) -> u64 {
     let pid = process::current_pid();
     // Single lock: determine wake target + close
-    let (result, wake) = process::with_fd_owner_mut(|proc| {
-        let wake = match proc.fds.get(fd_num) {
-            Some(fd::Descriptor::PipeWrite(id)) | Some(fd::Descriptor::TtyWrite(id)) => Some((true, *id)),
-            Some(fd::Descriptor::PipeRead(id)) | Some(fd::Descriptor::TtyRead(id)) => Some((false, *id)),
-            _ => None,
+    let (result, wake_readers, wake_writers) = process::with_fd_owner_mut(|proc| {
+        let (wake_r, wake_w) = match proc.fds.get(fd_num) {
+            Some(fd::Descriptor::PipeWrite(id)) | Some(fd::Descriptor::TtyWrite(id)) => (Some(*id), None),
+            Some(fd::Descriptor::PipeRead(id)) | Some(fd::Descriptor::TtyRead(id)) => (None, Some(*id)),
+            Some(fd::Descriptor::Socket { rx, tx }) => (Some(*tx), Some(*rx)),
+            _ => (None, None),
         };
         let r = fd::close(&mut proc.fds, &mut *vfs::lock(), fd_num, pid);
-        (r, wake)
+        (r, wake_r, wake_w)
     });
-    if let Some((is_write, pipe_id)) = wake {
-        if is_write { process::wake_pipe_readers(pipe_id); }
-        else { process::wake_pipe_writers(pipe_id); }
-    }
+    if let Some(id) = wake_readers { process::wake_pipe_readers(id); }
+    if let Some(id) = wake_writers { process::wake_pipe_writers(id); }
     result
 }
 
@@ -530,8 +565,8 @@ fn sys_set_keyboard_layout(name: &str) -> u64 {
 fn sys_pipe() -> u64 {
     let pipe_id = pipe::create();
     process::with_fd_owner_mut(|proc| {
-        let read_fd = fd::alloc(&mut proc.fds, fd::Descriptor::PipeRead(pipe_id));
-        let write_fd = fd::alloc(&mut proc.fds, fd::Descriptor::PipeWrite(pipe_id));
+        let read_fd = fd::alloc(&mut proc.fds, fd::Descriptor::PipeRead(pipe_id)) as u64;
+        let write_fd = fd::alloc(&mut proc.fds, fd::Descriptor::PipeWrite(pipe_id)) as u64;
         (read_fd << 32) | write_fd
     })
 }
@@ -539,8 +574,8 @@ fn sys_pipe() -> u64 {
 fn sys_pipe_with_capacity(capacity: usize) -> u64 {
     let pipe_id = pipe::create_with_capacity(capacity);
     process::with_fd_owner_mut(|proc| {
-        let read_fd = fd::alloc(&mut proc.fds, fd::Descriptor::PipeRead(pipe_id));
-        let write_fd = fd::alloc(&mut proc.fds, fd::Descriptor::PipeWrite(pipe_id));
+        let read_fd = fd::alloc(&mut proc.fds, fd::Descriptor::PipeRead(pipe_id)) as u64;
+        let write_fd = fd::alloc(&mut proc.fds, fd::Descriptor::PipeWrite(pipe_id)) as u64;
         (read_fd << 32) | write_fd
     })
 }
@@ -553,17 +588,17 @@ fn sys_pipe_open(pipe_id: u64, mode: u64) -> u64 {
     match mode {
         0 => {
             pipe::add_reader(pipe_id);
-            process::with_fd_owner_mut(|proc| fd::alloc(&mut proc.fds, fd::Descriptor::PipeRead(pipe_id)))
+            process::with_fd_owner_mut(|proc| fd::alloc(&mut proc.fds, fd::Descriptor::PipeRead(pipe_id)) as u64)
         }
         1 => {
             pipe::add_writer(pipe_id);
-            process::with_fd_owner_mut(|proc| fd::alloc(&mut proc.fds, fd::Descriptor::PipeWrite(pipe_id)))
+            process::with_fd_owner_mut(|proc| fd::alloc(&mut proc.fds, fd::Descriptor::PipeWrite(pipe_id)) as u64)
         }
         _ => SyscallError::InvalidArgument.to_u64(),
     }
 }
 
-fn sys_pipe_id(fd_num: u64) -> u64 {
+fn sys_pipe_id(fd_num: u32) -> u64 {
     process::with_fd_owner(|proc| {
         match proc.fds.get(fd_num) {
             Some(fd::Descriptor::PipeRead(id))
@@ -575,7 +610,40 @@ fn sys_pipe_id(fd_num: u64) -> u64 {
     })
 }
 
-fn sys_read_nonblock(fd_num: u64, buf: &mut [u8]) -> u64 {
+fn sys_pipe_map(fd_num: u32) -> u64 {
+    let pipe_id = process::with_fd_owner(|proc| {
+        match proc.fds.get(fd_num) {
+            Some(fd::Descriptor::PipeRead(id))
+            | Some(fd::Descriptor::PipeWrite(id))
+            | Some(fd::Descriptor::TtyRead(id))
+            | Some(fd::Descriptor::TtyWrite(id)) => Some(*id),
+            _ => None,
+        }
+    });
+    let Some(pipe_id) = pipe_id else {
+        return SyscallError::InvalidArgument.to_u64();
+    };
+    let pml4 = cpu::read_cr3() as *mut u64;
+    match pipe::map_into(pipe_id, pml4) {
+        Some(addr) => addr,
+        None => SyscallError::NotFound.to_u64(),
+    }
+}
+
+fn sys_socket_create(rx_pipe_id_raw: u64, tx_pipe_id_raw: u64) -> u64 {
+    let rx = pipe::PipeId::from_raw(rx_pipe_id_raw as usize);
+    let tx = pipe::PipeId::from_raw(tx_pipe_id_raw as usize);
+    if !pipe::exists(rx) || !pipe::exists(tx) {
+        return SyscallError::NotFound.to_u64();
+    }
+    pipe::add_reader(rx);
+    pipe::add_writer(tx);
+    process::with_fd_owner_mut(|proc| {
+        fd::alloc(&mut proc.fds, fd::Descriptor::Socket { rx, tx }) as u64
+    })
+}
+
+fn sys_read_nonblock(fd_num: u32, buf: &mut [u8]) -> u64 {
     let result = process::with_fd_owner_mut(|proc| {
         fd::try_read(&mut proc.fds, fd_num, buf)
     });
@@ -584,7 +652,8 @@ fn sys_read_nonblock(fd_num: u64, buf: &mut [u8]) -> u64 {
             // Wake writers if we read from a pipe
             let pipe_id = process::with_fd_owner(|proc| {
                 match proc.fds.get(fd_num) {
-                    Some(fd::Descriptor::PipeRead(id)) | Some(fd::Descriptor::TtyRead(id)) => Some(*id),
+                    Some(fd::Descriptor::PipeRead(id)) | Some(fd::Descriptor::TtyRead(id))
+                    | Some(fd::Descriptor::Socket { rx: id, .. }) => Some(*id),
                     _ => None,
                 }
             });
@@ -595,7 +664,7 @@ fn sys_read_nonblock(fd_num: u64, buf: &mut [u8]) -> u64 {
     }
 }
 
-fn sys_write_nonblock(fd_num: u64, buf: &[u8]) -> u64 {
+fn sys_write_nonblock(fd_num: u32, buf: &[u8]) -> u64 {
     let result = process::with_fd_owner_mut(|proc| {
         fd::try_write(&mut proc.fds, fd_num, buf)
     });
@@ -604,7 +673,8 @@ fn sys_write_nonblock(fd_num: u64, buf: &[u8]) -> u64 {
             // Wake readers if we wrote to a pipe
             let pipe_id = process::with_fd_owner(|proc| {
                 match proc.fds.get(fd_num) {
-                    Some(fd::Descriptor::PipeWrite(id)) | Some(fd::Descriptor::TtyWrite(id)) => Some(*id),
+                    Some(fd::Descriptor::PipeWrite(id)) | Some(fd::Descriptor::TtyWrite(id))
+                    | Some(fd::Descriptor::Socket { tx: id, .. }) => Some(*id),
                     _ => None,
                 }
             });
@@ -615,9 +685,13 @@ fn sys_write_nonblock(fd_num: u64, buf: &[u8]) -> u64 {
     }
 }
 
-fn sys_spawn(text: &str, fds: fd::FdTable) -> u64 {
+fn sys_spawn(text: &str, fds: fd::FdTable, env: alloc::vec::Vec<u8>) -> u64 {
     let args: Vec<&str> = text.split('\0').filter(|s| !s.is_empty()).collect();
-    process::spawn(&args, fds, Some(process::current_pid())).map_or(SyscallError::NotFound.to_u64(), |p| p.raw() as u64)
+    let parent = process::current_pid();
+    match process::spawn(&args, fds, Some(parent), env) {
+        Some(pid) => pid.raw() as u64,
+        None => SyscallError::NotFound.to_u64(),
+    }
 }
 
 fn sys_waitpid(pid: u64, flags: u64) -> u64 {
@@ -639,8 +713,8 @@ fn sys_waitpid(pid: u64, flags: u64) -> u64 {
 }
 
 /// Extract the raw fd number from a poll entry (strip interest bits).
-fn poll_fd_num(entry: u64) -> u64 {
-    entry & POLL_FD_MASK
+fn poll_fd_num(entry: u64) -> u32 {
+    (entry & POLL_FD_MASK) as u32
 }
 
 /// Check if a poll entry is ready, respecting interest bits.
@@ -760,7 +834,7 @@ fn sys_open_device(device_type: u64) -> u64 {
         Some(d) => d,
         None => return SyscallError::NotFound.to_u64(),
     };
-    process::with_fd_owner_mut(|proc| fd::alloc(&mut proc.fds, desc))
+    process::with_fd_owner_mut(|proc| fd::alloc(&mut proc.fds, desc) as u64)
 }
 
 fn sys_register_name(name: &str) -> u64 {
@@ -803,17 +877,53 @@ fn sys_release_shared(token: u64) -> u64 {
     if shared_memory::release(token, pid, pml4) { 0 } else { SyscallError::NotFound.to_u64() }
 }
 
-fn sys_mmap(size: u64, _prot: u64, _flags: u64) -> u64 {
+fn sys_mmap(req_addr: u64, size: u64, _prot: u64, flags: u64) -> u64 {
     let aligned = paging::align_2m(size as usize);
+    let fixed = flags & 4 != 0; // MmapFlags::FIXED
+
     let Some(alloc) = process::OwnedAlloc::new(aligned, paging::PAGE_2M as usize) else {
         return SyscallError::Unknown.to_u64();
     };
-    let addr = alloc.ptr() as u64;
-    paging::map_user(addr, aligned as u64);
-    process::with_current_mut(|proc| {
-        proc.mmap_regions.push(process::MmapRegion { addr, size: aligned, alloc });
-    });
-    addr
+
+    if fixed && req_addr != 0 {
+        // MAP_FIXED: map the allocated physical memory at the requested virtual address
+        let phys_addr = alloc.ptr() as u64;
+        let ok = process::with_current_mut(|proc| {
+            let pml4 = proc.cr3.unwrap().as_ptr();
+            let start = req_addr & !(paging::PAGE_2M - 1);
+            let end = (req_addr + aligned as u64 + paging::PAGE_2M - 1) & !(paging::PAGE_2M - 1);
+            let mut cur = start;
+            let mut offset = 0u64;
+            while cur < end {
+                if !paging::remap_user_2m(pml4, cur, phys_addr + offset) {
+                    // Undo any remaps we already did
+                    let mut undo = start;
+                    while undo < cur {
+                        paging::restore_identity_2m(pml4, undo);
+                        undo += paging::PAGE_2M;
+                    }
+                    return false;
+                }
+                cur += paging::PAGE_2M;
+                offset += paging::PAGE_2M;
+            }
+            proc.mmap_regions.push(process::MmapRegion {
+                addr: start, size: aligned, alloc, fixed: true,
+            });
+            true
+        });
+        if ok { req_addr } else { SyscallError::InvalidArgument.to_u64() }
+    } else {
+        // Non-fixed: use the physical address as the virtual address (identity mapping)
+        let addr = alloc.ptr() as u64;
+        paging::map_user(addr, aligned as u64);
+        process::with_current_mut(|proc| {
+            proc.mmap_regions.push(process::MmapRegion {
+                addr, size: aligned, alloc, fixed: false,
+            });
+        });
+        addr
+    }
 }
 
 fn sys_munmap(addr: u64, _size: u64) -> u64 {
@@ -822,7 +932,16 @@ fn sys_munmap(addr: u64, _size: u64) -> u64 {
         let idx = proc.mmap_regions.iter().position(|r| r.addr == addr);
         if let Some(idx) = idx {
             let region = proc.mmap_regions.swap_remove(idx);
-            paging::unmap_user(pml4, region.addr, region.size as u64);
+            if region.fixed {
+                let mut cur = region.addr;
+                let end = region.addr + region.size as u64;
+                while cur < end {
+                    paging::restore_identity_2m(pml4, cur);
+                    cur += paging::PAGE_2M;
+                }
+            } else {
+                paging::unmap_user(pml4, region.addr, region.size as u64);
+            }
             // OwnedAlloc drops here, freeing physical memory
             0
         } else {
@@ -938,13 +1057,29 @@ fn sys_nanosleep(nanos: u64) -> u64 {
     0
 }
 
-fn sys_dup(fd_num: u64) -> u64 {
+fn sys_dup(fd_num: u32) -> u64 {
     process::with_fd_owner_mut(|proc| {
         let desc = match proc.fds.get(fd_num) {
             Some(d) => fd::dup(d),
             None => return SyscallError::NotFound.to_u64(),
         };
-        fd::alloc(&mut proc.fds, desc)
+        fd::alloc(&mut proc.fds, desc) as u64
+    })
+}
+
+fn sys_dup2(old_fd: u32, new_fd: u32) -> u64 {
+    process::with_fd_owner_mut(|proc| {
+        let desc = match proc.fds.get(old_fd) {
+            Some(d) => fd::dup(d),
+            None => return SyscallError::NotFound.to_u64(),
+        };
+        // If new_fd is already open, close it first
+        if proc.fds.get(new_fd).is_some() {
+            let mut vfs = vfs::lock();
+            fd::close(&mut proc.fds, &mut vfs, new_fd, process::current_pid());
+        }
+        proc.fds.insert_at(new_fd, desc);
+        new_fd as u64
     })
 }
 

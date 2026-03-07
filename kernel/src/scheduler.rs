@@ -238,7 +238,7 @@ pub fn idle_unlock_and_loop() -> ! {
 fn poll_has_ready_fd(poll_fds: &[u64; 64], len: u32, fds: &fd::FdTable) -> bool {
     use toyos_abi::syscall::{POLL_FD_MASK, POLL_READABLE, POLL_WRITABLE};
     poll_fds[..len as usize].iter().any(|&entry| {
-        let fd_num = entry & POLL_FD_MASK;
+        let fd_num = (entry & POLL_FD_MASK) as u32;
         let want_write = entry & POLL_WRITABLE != 0;
         let want_read = entry & POLL_READABLE != 0 || !want_write;
         (want_read && fd::has_data(fds, fd_num)) || (want_write && fd::has_space(fds, fd_num))

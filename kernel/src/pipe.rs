@@ -1,5 +1,9 @@
-use alloc::collections::VecDeque;
+use alloc::alloc::{alloc_zeroed, dealloc};
+use core::alloc::Layout;
 
+use toyos_abi::ring::RingHeader;
+
+use crate::arch::paging::{self, PAGE_2M};
 use crate::id_map::{IdKey, IdMap};
 use crate::sync::Lock;
 
@@ -21,49 +25,31 @@ impl IdKey for PipeId {
     const ONE: Self = PipeId(1);
 }
 
-const DEFAULT_PIPE_CAPACITY: usize = 4096;
+const PIPE_SIZE: usize = PAGE_2M as usize;
 
 struct Pipe {
-    buffer: VecDeque<u8>,
-    capacity: usize,
+    phys_addr: u64,
+    layout: Layout,
     readers: u32,
     writers: u32,
 }
 
 impl Pipe {
     fn new() -> Self {
-        Self::with_capacity(DEFAULT_PIPE_CAPACITY)
-    }
-
-    fn with_capacity(capacity: usize) -> Self {
+        let layout = Layout::from_size_align(PIPE_SIZE, PIPE_SIZE).unwrap();
+        let ptr = unsafe { alloc_zeroed(layout) };
+        assert!(!ptr.is_null(), "pipe: allocation failed");
+        RingHeader::init(ptr, PIPE_SIZE);
         Self {
-            buffer: VecDeque::with_capacity(capacity),
-            capacity,
+            phys_addr: ptr as u64,
+            layout,
             readers: 1,
             writers: 1,
         }
     }
 
-    fn available(&self) -> usize {
-        self.buffer.len()
-    }
-
-    fn space(&self) -> usize {
-        self.capacity - self.buffer.len()
-    }
-
-    fn read(&mut self, buf: &mut [u8]) -> usize {
-        let count = buf.len().min(self.available());
-        for b in &mut buf[..count] {
-            *b = self.buffer.pop_front().unwrap();
-        }
-        count
-    }
-
-    fn write(&mut self, buf: &[u8]) -> usize {
-        let count = buf.len().min(self.space());
-        self.buffer.extend(&buf[..count]);
-        count
+    fn header(&self) -> &RingHeader {
+        unsafe { &*(self.phys_addr as *const RingHeader) }
     }
 }
 
@@ -89,8 +75,9 @@ pub fn create() -> PipeId {
 }
 
 #[must_use]
-pub fn create_with_capacity(capacity: usize) -> PipeId {
-    with_pipes_mut(|pipes| pipes.insert(Pipe::with_capacity(capacity)))
+pub fn create_with_capacity(_capacity: usize) -> PipeId {
+    // All pipes now use a 2MB shared-memory ring buffer
+    create()
 }
 
 pub fn exists(pipe_id: PipeId) -> bool {
@@ -99,11 +86,12 @@ pub fn exists(pipe_id: PipeId) -> bool {
 
 /// Returns bytes read, 0 for EOF, None if would block.
 pub fn try_read(pipe_id: PipeId, buf: &mut [u8]) -> Option<usize> {
-    with_pipes_mut(|pipes| {
-        let pipe = pipes.get_mut(pipe_id)?;
-        if pipe.available() > 0 {
-            Some(pipe.read(buf))
-        } else if pipe.writers == 0 {
+    with_pipes(|pipes| {
+        let pipe = pipes.get(pipe_id)?;
+        let header = pipe.header();
+        if header.available() > 0 {
+            Some(header.read(buf))
+        } else if pipe.writers == 0 || header.is_writer_closed() {
             Some(0)
         } else {
             None
@@ -118,12 +106,13 @@ pub enum PipeWrite {
 
 /// Returns Wrote(n), BrokenPipe, or None if would block.
 pub fn try_write(pipe_id: PipeId, buf: &[u8]) -> Option<PipeWrite> {
-    with_pipes_mut(|pipes| {
-        let pipe = pipes.get_mut(pipe_id)?;
-        if pipe.readers == 0 {
+    with_pipes(|pipes| {
+        let pipe = pipes.get(pipe_id)?;
+        let header = pipe.header();
+        if pipe.readers == 0 || header.is_reader_closed() {
             Some(PipeWrite::BrokenPipe)
-        } else if pipe.space() > 0 {
-            Some(PipeWrite::Wrote(pipe.write(buf)))
+        } else if header.space() > 0 {
+            Some(PipeWrite::Wrote(header.write(buf)))
         } else {
             None
         }
@@ -132,18 +121,22 @@ pub fn try_write(pipe_id: PipeId, buf: &[u8]) -> Option<PipeWrite> {
 
 pub fn has_data(pipe_id: PipeId) -> bool {
     with_pipes(|pipes| {
-        pipes.get(pipe_id).map_or(false, |p| p.available() > 0 || p.writers == 0)
+        pipes.get(pipe_id).map_or(false, |p| {
+            p.header().available() > 0 || p.writers == 0 || p.header().is_writer_closed()
+        })
     })
 }
 
 pub fn has_space(pipe_id: PipeId) -> bool {
     with_pipes(|pipes| {
-        pipes.get(pipe_id).map_or(false, |p| p.space() > 0 || p.readers == 0)
+        pipes.get(pipe_id).map_or(false, |p| {
+            p.header().space() > 0 || p.readers == 0 || p.header().is_reader_closed()
+        })
     })
 }
 
 pub fn all_empty() -> bool {
-    with_pipes(|pipes| pipes.iter().all(|(_, pipe)| pipe.available() == 0))
+    with_pipes(|pipes| pipes.iter().all(|(_, pipe)| pipe.header().available() == 0))
 }
 
 pub fn add_reader(pipe_id: PipeId) {
@@ -160,12 +153,18 @@ pub fn add_writer(pipe_id: PipeId) {
     });
 }
 
+fn free_pipe(pipe: Pipe) {
+    unsafe { dealloc(pipe.phys_addr as *mut u8, pipe.layout); }
+}
+
 pub fn close_read(pipe_id: PipeId) {
     with_pipes_mut(|pipes| {
         let pipe = pipes.get_mut(pipe_id).expect("close_read: pipe not found");
         pipe.readers = pipe.readers.checked_sub(1).expect("pipe reader underflow");
+        pipe.header().close_reader();
         if pipe.readers == 0 && pipe.writers == 0 {
-            pipes.remove(pipe_id);
+            let pipe = pipes.remove(pipe_id).unwrap();
+            free_pipe(pipe);
         }
     });
 }
@@ -174,8 +173,20 @@ pub fn close_write(pipe_id: PipeId) {
     with_pipes_mut(|pipes| {
         let pipe = pipes.get_mut(pipe_id).expect("close_write: pipe not found");
         pipe.writers = pipe.writers.checked_sub(1).expect("pipe writer underflow");
+        pipe.header().close_writer();
         if pipe.readers == 0 && pipe.writers == 0 {
-            pipes.remove(pipe_id);
+            let pipe = pipes.remove(pipe_id).unwrap();
+            free_pipe(pipe);
         }
     });
+}
+
+/// Map a pipe's shared memory into a process's address space.
+/// Returns the physical address (which is the mapping address due to identity mapping).
+pub fn map_into(pipe_id: PipeId, pml4: *mut u64) -> Option<u64> {
+    with_pipes(|pipes| {
+        let pipe = pipes.get(pipe_id)?;
+        paging::map_user_in(pml4, pipe.phys_addr, PIPE_SIZE as u64);
+        Some(pipe.phys_addr)
+    })
 }

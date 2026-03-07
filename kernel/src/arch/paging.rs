@@ -205,6 +205,57 @@ pub fn map_user(addr: u64, size: u64) {
     apic::tlb_shootdown();
 }
 
+/// Remap a 2MB-aligned virtual address to point to different physical memory.
+/// Sets the PDE to `phys_addr` with PRESENT|WRITE|USER|PS bits.
+/// Returns false if the address is not 2MB-aligned or page table entries are missing.
+pub fn remap_user_2m(pml4: *mut u64, virt_addr: u64, phys_addr: u64) -> bool {
+    if virt_addr & (PAGE_2M - 1) != 0 || phys_addr & (PAGE_2M - 1) != 0 {
+        return false;
+    }
+
+    let pml4_idx = ((virt_addr >> 39) & 0x1FF) as usize;
+    let pdpt_idx = ((virt_addr >> 30) & 0x1FF) as usize;
+    let pd_idx = ((virt_addr >> 21) & 0x1FF) as usize;
+
+    unsafe {
+        let pml4e = pml4.add(pml4_idx).read();
+        if pml4e & PAGE_PRESENT == 0 { return false; }
+        pml4.add(pml4_idx).write(pml4e | PAGE_USER);
+
+        let pdpt = (pml4e & ADDR_MASK) as *mut u64;
+        let pdpte = pdpt.add(pdpt_idx).read();
+        if pdpte & PAGE_PRESENT == 0 { return false; }
+        pdpt.add(pdpt_idx).write(pdpte | PAGE_USER);
+
+        let pd = (pdpte & ADDR_MASK) as *mut u64;
+        pd.add(pd_idx).write(phys_addr | PAGE_PRESENT | PAGE_WRITE | PAGE_USER | PAGE_SIZE_BIT);
+    }
+
+    cpu::flush_tlb();
+    apic::tlb_shootdown();
+    true
+}
+
+/// Restore a 2MB PDE to its identity-mapped value (phys == virt, no USER bit).
+pub fn restore_identity_2m(pml4: *mut u64, virt_addr: u64) {
+    let pml4_idx = ((virt_addr >> 39) & 0x1FF) as usize;
+    let pdpt_idx = ((virt_addr >> 30) & 0x1FF) as usize;
+    let pd_idx = ((virt_addr >> 21) & 0x1FF) as usize;
+
+    unsafe {
+        let pml4e = pml4.add(pml4_idx).read();
+        if pml4e & PAGE_PRESENT == 0 { return; }
+        let pdpt = (pml4e & ADDR_MASK) as *mut u64;
+        let pdpte = pdpt.add(pdpt_idx).read();
+        if pdpte & PAGE_PRESENT == 0 { return; }
+        let pd = (pdpte & ADDR_MASK) as *mut u64;
+        pd.add(pd_idx).write(virt_addr | PAGE_PRESENT | PAGE_WRITE | PAGE_SIZE_BIT);
+    }
+
+    cpu::flush_tlb();
+    apic::tlb_shootdown();
+}
+
 /// Clear USER bit on 2MB pages in a specific PML4.
 pub fn unmap_user(pml4: *mut u64, addr: u64, size: u64) {
     let start = addr & !(PAGE_2M - 1);
@@ -306,6 +357,26 @@ pub fn map_kernel(addr: u64, size: u64) {
 
     cpu::flush_tlb();
     apic::tlb_shootdown();
+}
+
+/// Translate a virtual address to its physical address by walking the page tables.
+/// Returns `None` if any level is not present.
+pub fn virt_to_phys(pml4: *const u64, virt_addr: u64) -> Option<u64> {
+    let pml4_idx = ((virt_addr >> 39) & 0x1FF) as usize;
+    let pdpt_idx = ((virt_addr >> 30) & 0x1FF) as usize;
+    let pd_idx = ((virt_addr >> 21) & 0x1FF) as usize;
+
+    unsafe {
+        let pml4e = pml4.add(pml4_idx).read();
+        if pml4e & PAGE_PRESENT == 0 { return None; }
+        let pdpt = (pml4e & ADDR_MASK) as *const u64;
+        let pdpte = pdpt.add(pdpt_idx).read();
+        if pdpte & PAGE_PRESENT == 0 { return None; }
+        let pd = (pdpte & ADDR_MASK) as *const u64;
+        let pde = pd.add(pd_idx).read();
+        if pde & PAGE_PRESENT == 0 { return None; }
+        Some((pde & ADDR_MASK) + (virt_addr & (PAGE_2M - 1)))
+    }
 }
 
 fn has(entry: u64, flag: u64) -> u8 {
