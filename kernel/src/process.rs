@@ -306,11 +306,7 @@ pub fn with_fd_owner<R>(f: impl FnOnce(&Process) -> R) -> R {
     let guard = PROCESS_TABLE.lock();
     let table = guard.as_ref().unwrap();
     let pid = current_pid();
-    let proc = table.procs.get(pid).unwrap();
-    let fd_pid = match proc.kind {
-        Kind::Thread { parent } => parent,
-        Kind::Process { .. } => pid,
-    };
+    let fd_pid = table.procs.get(pid).unwrap().heap_owner;
     f(table.procs.get(fd_pid).unwrap())
 }
 
@@ -320,11 +316,7 @@ pub fn with_fd_owner_mut<R>(f: impl FnOnce(&mut Process) -> R) -> R {
     let mut guard = PROCESS_TABLE.lock();
     let table = guard.as_mut().unwrap();
     let pid = current_pid();
-    let proc = table.procs.get(pid).unwrap();
-    let fd_pid = match proc.kind {
-        Kind::Thread { parent } => parent,
-        Kind::Process { .. } => pid,
-    };
+    let fd_pid = table.procs.get(pid).unwrap().heap_owner;
     f(table.procs.get_mut(fd_pid).unwrap())
 }
 
