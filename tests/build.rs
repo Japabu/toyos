@@ -26,6 +26,10 @@ fn main() {
     // Re-run if libc source changes
     println!("cargo:rerun-if-changed={}", libc_dir.join("src").display());
     println!("cargo:rerun-if-changed={}", libc_dir.join("Cargo.toml").display());
+
+    // Re-run if the built artifacts disappear (e.g. libc target/ was cleaned)
+    println!("cargo:rerun-if-changed={}", host_archive.display());
+    println!("cargo:rerun-if-changed={}", toyos_archive.display());
 }
 
 fn host_target() -> &'static str {

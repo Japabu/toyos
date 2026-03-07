@@ -1,4 +1,4 @@
 # Limit test threads to avoid SIGABRT from concurrent stacker::maybe_grow calls
 # in toyos-cc's codegen (psm crate has a concurrency issue on macOS).
 [env]
-RUST_TEST_THREADS = "2"
+# RUST_TEST_THREADS = "2"

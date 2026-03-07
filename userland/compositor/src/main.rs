@@ -106,6 +106,7 @@ struct WindowState {
     saved_w: usize,
     saved_h: usize,
     presented: bool,
+    cursor_style: u8,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -694,8 +695,11 @@ fn main() {
     let resize_svg =
         std::fs::read("/initrd/arrow-down-right-bold.svg").expect("failed to read resize cursor");
     let cursor_resize = sprite::Sprite::from_svg_colored(&resize_svg, 20, [255, 255, 255]);
+    let crosshair_svg =
+        std::fs::read("/initrd/crosshair-simple-bold.svg").expect("failed to read crosshair cursor");
+    let cursor_crosshair = sprite::Sprite::from_svg_colored(&crosshair_svg, 20, [0, 0, 0]);
     upload_cursor(cursor_buf, &cursor_default, hw_cursor);
-    let mut current_cursor_is_resize = false;
+    let mut current_cursor_style: u8 = window::CURSOR_DEFAULT;
 
     let font_data = std::fs::read("/initrd/JetBrainsMono-8x16.font").expect("failed to read font");
     let font = font::Font::from_prebuilt(&font_data);
@@ -946,13 +950,26 @@ fn main() {
                         HitZone::ResizeCorner(_)
                     ),
                 };
-                if want_resize != current_cursor_is_resize {
-                    current_cursor_is_resize = want_resize;
-                    if want_resize {
-                        upload_cursor(cursor_buf, &cursor_resize, hw_cursor);
+                let wanted_cursor = if want_resize {
+                    window::CURSOR_RESIZE
+                } else if let Some(idx) = focused_window_idx(&windows) {
+                    let hz = hit_test(&windows, cursor_x, cursor_y, screen_h, launcher_open);
+                    if matches!(hz, HitZone::Content(_)) {
+                        windows[idx].cursor_style
                     } else {
-                        upload_cursor(cursor_buf, &cursor_default, hw_cursor);
+                        window::CURSOR_DEFAULT
                     }
+                } else {
+                    window::CURSOR_DEFAULT
+                };
+                if wanted_cursor != current_cursor_style {
+                    current_cursor_style = wanted_cursor;
+                    let sprite = match wanted_cursor {
+                        window::CURSOR_CROSSHAIR => &cursor_crosshair,
+                        window::CURSOR_RESIZE => &cursor_resize,
+                        _ => &cursor_default,
+                    };
+                    upload_cursor(cursor_buf, sprite, hw_cursor);
                 }
 
                 let make_mouse_event =
@@ -1274,6 +1291,7 @@ fn main() {
                         saved_w: 0,
                         saved_h: 0,
                         presented: false,
+                        cursor_style: window::CURSOR_DEFAULT,
                     });
 
                     message::send(
@@ -1306,6 +1324,12 @@ fn main() {
                 window::MSG_CLIPBOARD_SET => {
                     let bytes = msg.take_bytes();
                     clipboard = String::from_utf8_lossy(&bytes).into_owned();
+                }
+                window::MSG_SET_CURSOR => {
+                    let style: u32 = msg.take_payload();
+                    if let Some(win) = windows.iter_mut().find(|w| w.pid == sender) {
+                        win.cursor_style = style as u8;
+                    }
                 }
                 _ => {}
             }
@@ -1352,7 +1376,11 @@ fn main() {
 
                 // Draw software cursor if no hardware cursor
                 if !hw_cursor {
-                    let sprite = if current_cursor_is_resize { &cursor_resize } else { &cursor_default };
+                    let sprite = match current_cursor_style {
+                        window::CURSOR_CROSSHAIR => &cursor_crosshair,
+                        window::CURSOR_RESIZE => &cursor_resize,
+                        _ => &cursor_default,
+                    };
                     draw_software_cursor(&screen, sprite, cursor_x, cursor_y);
                 }
 

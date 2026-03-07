@@ -19,6 +19,12 @@ pub const MSG_CREATE_WINDOW: u32 = 1;
 pub const MSG_PRESENT: u32 = 2;
 pub const MSG_CLIPBOARD_SET: u32 = 3;
 pub const MSG_DESTROY_WINDOW: u32 = 4;
+pub const MSG_SET_CURSOR: u32 = 5;
+
+// Cursor styles
+pub const CURSOR_DEFAULT: u8 = 0;
+pub const CURSOR_CROSSHAIR: u8 = 1;
+pub const CURSOR_RESIZE: u8 = 2;
 
 // Compositor → Client
 pub const MSG_WINDOW_CREATED: u32 = 1;
@@ -111,6 +117,11 @@ pub enum Event {
 /// Set the system clipboard contents.
 pub fn clipboard_set(text: &str) {
     message::send(compositor_pid(), Message::from_bytes(MSG_CLIPBOARD_SET, text.as_bytes())).ok();
+}
+
+/// Request a cursor style for the current window.
+pub fn set_cursor(style: u8) {
+    message::send(compositor_pid(), Message::new(MSG_SET_CURSOR, style as u32)).ok();
 }
 
 pub struct Window {
