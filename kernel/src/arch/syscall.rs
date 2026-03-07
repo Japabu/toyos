@@ -25,8 +25,8 @@ use toyos_abi::syscall::*;
 /// (e.g., parent exited while thread is still running).
 fn with_heap_owner<R>(f: impl FnOnce(&mut user_heap::UserHeap) -> R) -> Option<R> {
     let mut guard = process::PROCESS_TABLE.lock();
-    let table = guard.as_mut().expect("process table not initialized");
-    let pid = crate::arch::percpu::current_pid();
+    let table = guard.as_mut().unwrap();
+    let pid = process::current_pid();
     let owner_pid = table.procs.get(pid)?.heap_owner;
     let owner = table.procs.get_mut(owner_pid)?;
     Some(f(&mut owner.user_heap))
@@ -101,7 +101,7 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         SYS_ALLOC => with_heap_owner(|heap| user_heap::alloc(heap, a1 as usize, a2 as usize)).unwrap_or(0),
         SYS_FREE => { with_heap_owner(|heap| { user_heap::free(heap, a1 as *mut u8, a2 as usize); 0 }).unwrap_or(0) }
         SYS_REALLOC => with_heap_owner(|heap| user_heap::realloc(heap, a1 as *mut u8, a2 as usize, a3 as usize, a4 as usize)).unwrap_or(0),
-        SYS_EXIT => sys_exit(a1 as i32),
+        SYS_THREAD_EXIT => sys_thread_exit(a1 as i32),
         SYS_RANDOM => {
             let Some(buf) = ctx.user_slice_mut(a1, a2) else { return bad_addr };
             sys_random(buf)
@@ -198,7 +198,7 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         SYS_GRANT_SHARED => sys_grant_shared(a1, a2),
         SYS_MAP_SHARED => sys_map_shared(a1),
         SYS_RELEASE_SHARED => sys_release_shared(a1),
-        SYS_THREAD_SPAWN => process::spawn_thread(a1, a2, a3).map_or(SyscallError::Unknown.to_u64(), |t| t as u64),
+        SYS_THREAD_SPAWN => process::spawn_thread(a1, a2, a3).map_or(SyscallError::Unknown.to_u64(), |t| t.raw() as u64),
         SYS_THREAD_JOIN => sys_thread_join(a1),
         SYS_CLOCK_REALTIME => crate::rtc::read_time(),
         SYS_SYSINFO => {
@@ -220,7 +220,7 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         }
         SYS_NANOSLEEP => sys_nanosleep(a1),
         SYS_DUP => sys_dup(a1),
-        SYS_GETPID => crate::arch::percpu::current_pid() as u64,
+        SYS_GETPID => process::current_pid().raw() as u64,
         SYS_RENAME => {
             let Some(old) = ctx.user_str(a1, a2) else { return bad_addr };
             let Some(new) = ctx.user_str(a3, a4) else { return bad_addr };
@@ -268,7 +268,7 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         }
         SYS_MMAP => sys_mmap(a1, a2, a3),
         SYS_MUNMAP => sys_munmap(a1, a2),
-        SYS_KILL => process::kill_process(a1 as u32),
+        SYS_KILL => process::kill_process(process::Pid::from_raw(a1 as u32)),
         SYS_READ_NONBLOCK => {
             let Some(buf) = ctx.user_slice_mut(a2, a3) else { return bad_addr };
             sys_read_nonblock(a1, buf)
@@ -285,7 +285,7 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             crate::audio::write_samples(buf);
             0
         }
-        SYS_EXIT_GROUP => sys_exit_group(a1 as i32),
+        SYS_EXIT => sys_exit(a1 as i32),
         _ => SyscallError::InvalidArgument.to_u64(),
     }
 }
@@ -387,12 +387,12 @@ fn sys_close(fd_num: u64) -> u64 {
     result
 }
 
-fn sys_exit(code: i32) -> u64 {
-    process::exit(code);
+fn sys_thread_exit(code: i32) -> u64 {
+    process::thread_exit(code);
 }
 
-fn sys_exit_group(code: i32) -> u64 {
-    process::exit_group(code);
+fn sys_exit(code: i32) -> u64 {
+    process::exit(code);
 }
 
 fn sys_random(buf: &mut [u8]) -> u64 {
@@ -493,7 +493,7 @@ fn sys_pipe_with_capacity(capacity: usize) -> u64 {
 }
 
 fn sys_pipe_open(pipe_id: u64, mode: u64) -> u64 {
-    let pipe_id = pipe_id as usize;
+    let pipe_id = pipe::PipeId::from_raw(pipe_id as usize);
     if !pipe::exists(pipe_id) {
         return SyscallError::NotFound.to_u64();
     }
@@ -516,7 +516,7 @@ fn sys_pipe_id(fd_num: u64) -> u64 {
             Some(fd::Descriptor::PipeRead(id))
             | Some(fd::Descriptor::PipeWrite(id))
             | Some(fd::Descriptor::TtyRead(id))
-            | Some(fd::Descriptor::TtyWrite(id)) => *id as u64,
+            | Some(fd::Descriptor::TtyWrite(id)) => id.raw() as u64,
             _ => SyscallError::InvalidArgument.to_u64(),
         }
     })
@@ -564,13 +564,13 @@ fn sys_write_nonblock(fd_num: u64, buf: &[u8]) -> u64 {
 
 fn sys_spawn(text: &str, fds: fd::FdTable) -> u64 {
     let args: Vec<&str> = text.split('\0').filter(|s| !s.is_empty()).collect();
-    process::spawn(&args, fds, Some(crate::arch::percpu::current_pid())).map_or(SyscallError::NotFound.to_u64(), |p| p as u64)
+    process::spawn(&args, fds, Some(process::current_pid())).map_or(SyscallError::NotFound.to_u64(), |p| p.raw() as u64)
 }
 
 fn sys_waitpid(pid: u64, flags: u64) -> u64 {
     const WNOHANG: u64 = 1;
-    let child_pid = pid as u32;
-    let caller = crate::arch::percpu::current_pid();
+    let child_pid = process::Pid::from_raw(pid as u32);
+    let caller = process::current_pid();
     loop {
         match process::collect_child_zombie(child_pid, caller) {
             Ok(Some(code)) => return code as u64,
@@ -611,8 +611,8 @@ fn sys_poll(fds: &[u64], fds_len: u64, timeout_nanos: u64) -> u64 {
         // but messages are per-process/thread.
         let result = {
             let guard = process::PROCESS_TABLE.lock();
-            let table = guard.as_ref().expect("process table not initialized");
-            let pid = crate::arch::percpu::current_pid();
+            let table = guard.as_ref().unwrap();
+            let pid = process::current_pid();
             let proc = table.procs.get(pid).unwrap();
             let fd_pid = match proc.kind {
                 process::Kind::Thread { parent } => parent,
@@ -645,11 +645,11 @@ fn sys_poll(fds: &[u64], fds_len: u64, timeout_nanos: u64) -> u64 {
 
 fn sys_send_msg(target_pid: u64, user_msg: &message::UserMessage, payload: Vec<u8>) -> u64 {
     let msg = message::Message {
-        sender: process::current_pid(),
+        sender: process::current_pid().raw(),
         msg_type: user_msg.msg_type,
         payload,
     };
-    if process::send_message(target_pid as u32, msg) { 0 } else { SyscallError::NotFound.to_u64() }
+    if process::send_message(process::Pid::from_raw(target_pid as u32), msg) { 0 } else { SyscallError::NotFound.to_u64() }
 }
 
 fn sys_recv_msg(out: &mut message::UserMessage) -> u64 {
@@ -717,27 +717,27 @@ fn sys_register_name(name: &str) -> u64 {
 
 fn sys_find_pid(name: &str) -> u64 {
     match process::find_pid(name) {
-        Some(pid) => pid as u64,
+        Some(pid) => pid.raw() as u64,
         None => SyscallError::NotFound.to_u64(),
     }
 }
 
 fn sys_alloc_shared(size: u64) -> u64 {
     let pid = process::current_pid();
-    let pml4 = process::with_current(|p| p.cr3 as *mut u64);
-    let (token, _addr) = shared_memory::alloc(size, pid, pml4);
-    token as u64
+    let pml4 = process::with_current(|p| p.cr3.unwrap().as_ptr());
+    shared_memory::alloc(size, pid, pml4).raw() as u64
 }
 
 fn sys_grant_shared(token: u64, target_pid: u64) -> u64 {
     let pid = process::current_pid();
-    if shared_memory::grant(token as u32, pid, target_pid as u32) { 0 } else { SyscallError::PermissionDenied.to_u64() }
+    let token = shared_memory::SharedToken::from_raw(token as u32);
+    if shared_memory::grant(token, pid, process::Pid::from_raw(target_pid as u32)) { 0 } else { SyscallError::PermissionDenied.to_u64() }
 }
 
 fn sys_map_shared(token: u64) -> u64 {
     let pid = process::current_pid();
-    let pml4 = process::with_current(|p| p.cr3 as *mut u64);
-    match shared_memory::map(token as u32, pid, pml4) {
+    let pml4 = process::with_current(|p| p.cr3.unwrap().as_ptr());
+    match shared_memory::map(shared_memory::SharedToken::from_raw(token as u32), pid, pml4) {
         Some(addr) => addr,
         None => SyscallError::PermissionDenied.to_u64(),
     }
@@ -745,8 +745,9 @@ fn sys_map_shared(token: u64) -> u64 {
 
 fn sys_release_shared(token: u64) -> u64 {
     let pid = process::current_pid();
-    let pml4 = process::with_current(|p| p.cr3 as *mut u64);
-    if shared_memory::release(token as u32, pid, pml4) { 0 } else { SyscallError::NotFound.to_u64() }
+    let pml4 = process::with_current(|p| p.cr3.unwrap().as_ptr());
+    let token = shared_memory::SharedToken::from_raw(token as u32);
+    if shared_memory::release(token, pid, pml4) { 0 } else { SyscallError::NotFound.to_u64() }
 }
 
 fn sys_mmap(size: u64, _prot: u64, _flags: u64) -> u64 {
@@ -764,7 +765,7 @@ fn sys_mmap(size: u64, _prot: u64, _flags: u64) -> u64 {
 
 fn sys_munmap(addr: u64, _size: u64) -> u64 {
     process::with_current_mut(|proc| {
-        let pml4 = proc.cr3 as *mut u64;
+        let pml4 = proc.cr3.unwrap().as_ptr();
         let idx = proc.mmap_regions.iter().position(|r| r.addr == addr);
         if let Some(idx) = idx {
             let region = proc.mmap_regions.swap_remove(idx);
@@ -778,8 +779,8 @@ fn sys_munmap(addr: u64, _size: u64) -> u64 {
 }
 
 fn sys_thread_join(tid: u64) -> u64 {
-    let tid = tid as u32;
-    let caller = crate::arch::percpu::current_pid();
+    let tid = process::Pid::from_raw(tid as u32);
+    let caller = process::current_pid();
     loop {
         match process::collect_thread_zombie(tid, caller) {
             Ok(Some(_)) => return 0,
@@ -802,7 +803,7 @@ fn sys_sysinfo(buf: &mut [u8]) -> u64 {
     let (busy_ticks, total_ticks) = super::idt::cpu_ticks();
 
     let guard = process::PROCESS_TABLE.lock();
-    let table = guard.as_ref().expect("process table not initialized");
+    let table = guard.as_ref().unwrap();
 
     let process_count = table.procs.iter().count() as u32;
 
@@ -817,7 +818,7 @@ fn sys_sysinfo(buf: &mut [u8]) -> u64 {
 
     // Write process entries
     let max_entries = (buf.len() - HEADER_SIZE) / ENTRY_SIZE;
-    let mut sorted_pids: Vec<u32> = table.procs.iter().map(|(pid, _)| pid).collect();
+    let mut sorted_pids: Vec<process::Pid> = table.procs.iter().map(|(pid, _)| pid).collect();
     sorted_pids.sort();
 
     let mut pos = HEADER_SIZE;
@@ -835,13 +836,13 @@ fn sys_sysinfo(buf: &mut [u8]) -> u64 {
         };
         let (is_thread, parent_pid) = match proc.kind {
             process::Kind::Thread { parent } => (1u8, parent),
-            process::Kind::Process { parent } => (0u8, parent.unwrap_or(u32::MAX)),
+            process::Kind::Process { parent } => (0u8, parent.unwrap_or(process::Pid::MAX)),
         };
         let memory = (proc.elf_alloc.as_ref().map_or(0, |a| a.size())
             + proc.stack_alloc.as_ref().map_or(0, |a| a.size())) as u64;
 
-        buf[pos..pos + 4].copy_from_slice(&pid.to_le_bytes());
-        buf[pos + 4..pos + 8].copy_from_slice(&parent_pid.to_le_bytes());
+        buf[pos..pos + 4].copy_from_slice(&pid.raw().to_le_bytes());
+        buf[pos + 4..pos + 8].copy_from_slice(&parent_pid.raw().to_le_bytes());
         buf[pos + 8] = state;
         buf[pos + 9] = is_thread;
         buf[pos + 10..pos + 12].copy_from_slice(&[0, 0]); // padding
@@ -949,7 +950,7 @@ fn sys_dlopen(path: &str) -> u64 {
     // Phase 1: resolve relocations (needs process table lock)
     let (new_total, modules) = {
         let mut guard = crate::process::PROCESS_TABLE.lock();
-        let table = guard.as_mut().expect("process table");
+        let table = guard.as_mut().unwrap();
         let current_pid = crate::process::current_pid();
         let proc = table.procs.get(current_pid).expect("current process");
         let owner_pid = match proc.kind {
@@ -1030,7 +1031,7 @@ fn sys_dlopen(path: &str) -> u64 {
     // Phase 3: store the lib in the owner process
     {
         let mut guard = crate::process::PROCESS_TABLE.lock();
-        let table = guard.as_mut().expect("process table");
+        let table = guard.as_mut().unwrap();
         let current_pid = crate::process::current_pid();
         let proc = table.procs.get(current_pid).expect("current process");
         let owner_pid = match proc.kind {
@@ -1045,8 +1046,8 @@ fn sys_dlopen(path: &str) -> u64 {
 }
 
 fn sys_dlsym(handle: u64, name: &str) -> u64 {
-    let mut guard = crate::process::PROCESS_TABLE.lock();
-    let table = guard.as_mut().expect("process table");
+    let guard = crate::process::PROCESS_TABLE.lock();
+    let table = guard.as_ref().unwrap();
     let current_pid = crate::process::current_pid();
     let proc = table.procs.get(current_pid).expect("current process");
     let owner_pid = match proc.kind {
@@ -1064,5 +1065,5 @@ fn sys_dlsym(handle: u64, name: &str) -> u64 {
 
 /// Terminate the current userspace process (called from exception handlers).
 pub fn kill_process(code: i32) -> ! {
-    process::exit(code);
+    process::exit(code); // process-wide exit — kills all threads
 }

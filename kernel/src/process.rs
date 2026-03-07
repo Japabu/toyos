@@ -2,6 +2,7 @@ use alloc::alloc::{alloc_zeroed, dealloc, Layout};
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::arch::naked_asm;
+use core::ptr::NonNull;
 use hashbrown::HashMap;
 
 use crate::arch::{cpu, paging, percpu};
@@ -11,7 +12,54 @@ use crate::id_map::IdMap;
 use crate::message::MessageQueue;
 use crate::sync::Lock;
 use crate::symbols::ProcessSymbols;
-use crate::{elf, log, scheduler, shared_memory, vfs};
+use crate::{elf, log, pipe, scheduler, shared_memory, vfs};
+
+// ---------------------------------------------------------------------------
+// Pid — newtype for process/thread IDs (compile-time separation from raw u32)
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Pid(u32);
+
+impl Pid {
+    pub const MAX: Self = Pid(u32::MAX);
+    pub fn raw(self) -> u32 { self.0 }
+    pub fn from_raw(v: u32) -> Self { Pid(v) }
+}
+
+impl core::fmt::Display for Pid {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl core::ops::Add for Pid {
+    type Output = Self;
+    fn add(self, rhs: Self) -> Self { Pid(self.0 + rhs.0) }
+}
+
+impl crate::id_map::IdKey for Pid {
+    const ZERO: Self = Pid(0);
+    const ONE: Self = Pid(1);
+}
+
+// ---------------------------------------------------------------------------
+// PageTableRoot — type-safe PML4 pointer (prevents double-free via Option::take)
+// ---------------------------------------------------------------------------
+
+/// Physical address of a PML4 page table. Used as `Option<PageTableRoot>` in Process
+/// so that `take()` makes double-free of page tables impossible at compile time.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct PageTableRoot(NonNull<u64>);
+
+impl PageTableRoot {
+    pub fn new(ptr: *mut u64) -> Self {
+        Self(NonNull::new(ptr).expect("PageTableRoot::new with null"))
+    }
+
+    pub fn as_ptr(self) -> *mut u64 { self.0.as_ptr() }
+    pub fn as_u64(self) -> u64 { self.0.as_ptr() as u64 }
+}
 
 // ---------------------------------------------------------------------------
 // OwnedAlloc — RAII wrapper for page-aligned allocations
@@ -21,7 +69,7 @@ use crate::{elf, log, scheduler, shared_memory, vfs};
 /// `Drop` calls `dealloc`, so forgetting to free memory is a compile-time error
 /// (you'd have to actively `mem::forget` it).
 pub struct OwnedAlloc {
-    ptr: *mut u8,
+    ptr: NonNull<u8>,
     layout: Layout,
 }
 
@@ -30,31 +78,31 @@ impl OwnedAlloc {
     /// Returns `None` if the allocator returns null.
     pub fn new(size: usize, align: usize) -> Option<Self> {
         let layout = Layout::from_size_align(size, align).ok()?;
-        let ptr = unsafe { alloc_zeroed(layout) };
-        if ptr.is_null() { None } else { Some(Self { ptr, layout }) }
+        let ptr = NonNull::new(unsafe { alloc_zeroed(layout) })?;
+        Some(Self { ptr, layout })
     }
 
     /// Wrap an existing allocation. Caller must guarantee that `(ptr, layout)`
     /// was returned by `alloc_zeroed` (or equivalent) and is not aliased.
     pub unsafe fn from_raw(ptr: *mut u8, layout: Layout) -> Self {
-        Self { ptr, layout }
+        Self { ptr: NonNull::new(ptr).expect("OwnedAlloc::from_raw with null"), layout }
     }
 
     /// Consume `self` without running `Drop`, returning the raw parts.
     /// The caller takes ownership of the allocation.
     pub fn into_raw(self) -> (*mut u8, Layout) {
-        let parts = (self.ptr, self.layout);
+        let parts = (self.ptr.as_ptr(), self.layout);
         core::mem::forget(self);
         parts
     }
 
-    pub fn ptr(&self) -> *mut u8 { self.ptr }
+    pub fn ptr(&self) -> *mut u8 { self.ptr.as_ptr() }
     pub fn size(&self) -> usize { self.layout.size() }
 }
 
 impl Drop for OwnedAlloc {
     fn drop(&mut self) {
-        unsafe { dealloc(self.ptr, self.layout); }
+        unsafe { dealloc(self.ptr.as_ptr(), self.layout); }
     }
 }
 
@@ -94,10 +142,10 @@ pub enum ProcessState {
     Running,
     Ready,
     BlockedKeyboard,
-    BlockedPipeRead(usize),
-    BlockedPipeWrite(usize),
-    BlockedWaitPid(u32),
-    BlockedThreadJoin(u32),
+    BlockedPipeRead(pipe::PipeId),
+    BlockedPipeWrite(pipe::PipeId),
+    BlockedWaitPid(Pid),
+    BlockedThreadJoin(Pid),
     BlockedPoll { fds: [u64; 64], len: u32, deadline: u64 },
     BlockedRecvMsg,
     BlockedNetRecv { deadline: u64 },
@@ -106,20 +154,61 @@ pub enum ProcessState {
     Zombie(i32),
 }
 
+impl ProcessState {
+    fn is_blocked(&self) -> bool {
+        matches!(self, Self::BlockedKeyboard | Self::BlockedPipeRead(_) | Self::BlockedPipeWrite(_)
+            | Self::BlockedWaitPid(_) | Self::BlockedThreadJoin(_) | Self::BlockedPoll { .. }
+            | Self::BlockedRecvMsg | Self::BlockedNetRecv { .. } | Self::BlockedSleep { .. }
+            | Self::BlockedFutex { .. })
+    }
+
+    fn can_transition_to(&self, new: &Self) -> bool {
+        match (self, new) {
+            (Self::Zombie(_), _) => false,
+            (_, Self::Zombie(_)) => true,
+            (Self::Running, Self::Ready) => true,
+            (Self::Running, _) if new.is_blocked() => true,
+            (Self::Ready, Self::Running) => true,
+            (s, Self::Ready) if s.is_blocked() => true,
+            _ => false,
+        }
+    }
+
+    /// Short name for debug messages (avoids printing large BlockedPoll data).
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Running => "Running",
+            Self::Ready => "Ready",
+            Self::BlockedKeyboard => "BlockedKeyboard",
+            Self::BlockedPipeRead(_) => "BlockedPipeRead",
+            Self::BlockedPipeWrite(_) => "BlockedPipeWrite",
+            Self::BlockedWaitPid(_) => "BlockedWaitPid",
+            Self::BlockedThreadJoin(_) => "BlockedThreadJoin",
+            Self::BlockedPoll { .. } => "BlockedPoll",
+            Self::BlockedRecvMsg => "BlockedRecvMsg",
+            Self::BlockedNetRecv { .. } => "BlockedNetRecv",
+            Self::BlockedSleep { .. } => "BlockedSleep",
+            Self::BlockedFutex { .. } => "BlockedFutex",
+            Self::Zombie(_) => "Zombie",
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub enum Kind {
     /// A process (may have a parent process for waitpid).
-    Process { parent: Option<u32> },
+    Process { parent: Option<Pid> },
     /// A thread within a process (shares address space with parent).
-    Thread { parent: u32 },
+    Thread { parent: Pid },
 }
 
 pub struct Process {
-    pub pid: u32,
+    pub pid: Pid,
     pub state: ProcessState,
     pub kind: Kind,
-    // Per-process page table (physical address of PML4)
-    pub cr3: u64,
+    // Per-process page table (physical address of PML4).
+    // Option so teardown can take() it, making double-free impossible.
+    pub cr3: Option<PageTableRoot>,
     // Kernel context (saved RSP during context switch)
     pub kernel_stack: OwnedAlloc,
     pub kernel_rsp: u64,
@@ -129,7 +218,7 @@ pub struct Process {
     pub cwd: String,
     pub messages: MessageQueue,
     /// PID whose user_heap to use for alloc/free. Self for processes, parent for threads.
-    pub heap_owner: u32,
+    pub heap_owner: Pid,
     // ELF memory (owned; .take() in exit frees immediately)
     pub elf_alloc: Option<OwnedAlloc>,
     // User stack (owned; .take() in exit frees immediately)
@@ -154,6 +243,18 @@ pub struct Process {
     pub mmap_regions: Vec<MmapRegion>,
 }
 
+impl Process {
+    pub fn set_state(&mut self, new: ProcessState) {
+        debug_assert!(self.state.can_transition_to(&new),
+            "invalid state transition pid={}: {} -> {}", self.pid, self.state.name(), new.name());
+        self.state = new;
+    }
+
+    fn zombify(&mut self, code: i32) {
+        self.set_state(ProcessState::Zombie(code));
+    }
+}
+
 pub struct MmapRegion {
     pub addr: u64,
     pub size: usize,
@@ -161,7 +262,7 @@ pub struct MmapRegion {
 }
 
 pub struct ProcessTable {
-    pub procs: IdMap<u32, Process>,
+    pub procs: IdMap<Pid, Process>,
 }
 
 impl ProcessTable {
@@ -171,15 +272,15 @@ impl ProcessTable {
 }
 
 pub static PROCESS_TABLE: Lock<Option<ProcessTable>> = Lock::new(None);
-static NAME_REGISTRY: Lock<Option<HashMap<String, u32>>> = Lock::new(None);
+static NAME_REGISTRY: Lock<Option<HashMap<String, Pid>>> = Lock::new(None);
 
 pub fn init() {
     *PROCESS_TABLE.lock() = Some(ProcessTable::new());
     *NAME_REGISTRY.lock() = Some(HashMap::new());
 }
 
-pub fn current_pid() -> u32 {
-    percpu::current_pid()
+pub fn current_pid() -> Pid {
+    Pid::from_raw(percpu::current_pid())
 }
 
 /// Access the current process immutably. The process table lock is held for
@@ -187,16 +288,16 @@ pub fn current_pid() -> u32 {
 /// process_table in the ordering (vfs, pipes, keyboard, device, allocator).
 pub fn with_current<R>(f: impl FnOnce(&Process) -> R) -> R {
     let guard = PROCESS_TABLE.lock();
-    let table = guard.as_ref().expect("process table not initialized");
-    let pid = percpu::current_pid();
+    let table = guard.as_ref().unwrap();
+    let pid = current_pid();
     f(table.procs.get(pid).unwrap())
 }
 
 /// Access the current process mutably. Same lock ordering rules as with_current.
 pub fn with_current_mut<R>(f: impl FnOnce(&mut Process) -> R) -> R {
     let mut guard = PROCESS_TABLE.lock();
-    let table = guard.as_mut().expect("process table not initialized");
-    let pid = percpu::current_pid();
+    let table = guard.as_mut().unwrap();
+    let pid = current_pid();
     f(table.procs.get_mut(pid).unwrap())
 }
 
@@ -204,8 +305,8 @@ pub fn with_current_mut<R>(f: impl FnOnce(&mut Process) -> R) -> R {
 /// Threads share their parent process's fd table.
 pub fn with_fd_owner<R>(f: impl FnOnce(&Process) -> R) -> R {
     let guard = PROCESS_TABLE.lock();
-    let table = guard.as_ref().expect("process table not initialized");
-    let pid = percpu::current_pid();
+    let table = guard.as_ref().unwrap();
+    let pid = current_pid();
     let proc = table.procs.get(pid).unwrap();
     let fd_pid = match proc.kind {
         Kind::Thread { parent } => parent,
@@ -218,8 +319,8 @@ pub fn with_fd_owner<R>(f: impl FnOnce(&Process) -> R) -> R {
 /// Threads share their parent process's fd table.
 pub fn with_fd_owner_mut<R>(f: impl FnOnce(&mut Process) -> R) -> R {
     let mut guard = PROCESS_TABLE.lock();
-    let table = guard.as_mut().expect("process table not initialized");
-    let pid = percpu::current_pid();
+    let table = guard.as_mut().unwrap();
+    let pid = current_pid();
     let proc = table.procs.get(pid).unwrap();
     let fd_pid = match proc.kind {
         Kind::Thread { parent } => parent,
@@ -352,12 +453,12 @@ extern "C" fn thread_start() {
 }
 
 /// Spawn a thread within the current process.
-pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64) -> Option<u32> {
+pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64) -> Option<Pid> {
     // Read parent's TLS info (brief lock)
     let (tls_template, tls_filesz, tls_memsz, tls_modules, tls_total_memsz) = {
         let guard = PROCESS_TABLE.lock();
-        let table = guard.as_ref().expect("process table not initialized");
-        let parent = table.procs.get(percpu::current_pid()).unwrap();
+        let table = guard.as_ref().unwrap();
+        let parent = table.procs.get(current_pid()).unwrap();
         (parent.tls_template, parent.tls_filesz, parent.tls_memsz,
          parent.tls_modules.clone(), parent.tls_total_memsz)
     };
@@ -379,8 +480,8 @@ pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64) -> Option<u32> {
     };
 
     let mut guard = PROCESS_TABLE.lock();
-    let table = guard.as_mut().expect("process table not initialized");
-    let parent_pid = percpu::current_pid();
+    let table = guard.as_mut().unwrap();
+    let parent_pid = current_pid();
     let parent = table.procs.get(parent_pid).unwrap();
     let parent_cr3 = parent.cr3;
     let parent_heap_owner = parent.heap_owner;
@@ -388,7 +489,7 @@ pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64) -> Option<u32> {
     // Threads share the parent's fd table via with_fd_owner routing.
     // No per-thread fd table needed — all fd ops resolve through parent.
     let tid = table.procs.insert(Process {
-        pid: 0,
+        pid: Pid::from_raw(0),
         state: ProcessState::Ready,
         kind: Kind::Thread { parent: parent_pid },
         cr3: parent_cr3,
@@ -430,8 +531,8 @@ fn make_name(path: &str) -> [u8; 28] {
 /// Duplicates each referenced parent descriptor into the child table.
 pub fn build_child_fds(pairs: &[[u32; 2]]) -> FdTable {
     let guard = PROCESS_TABLE.lock();
-    let table = guard.as_ref().expect("process table not initialized");
-    let pid = percpu::current_pid();
+    let table = guard.as_ref().unwrap();
+    let pid = current_pid();
     let proc = table.procs.get(pid).unwrap();
     // Threads share parent's fd table, so resolve through fd owner
     let fd_pid = match proc.kind {
@@ -449,7 +550,7 @@ pub fn build_child_fds(pairs: &[[u32; 2]]) -> FdTable {
 }
 
 /// Spawn a new process from an ELF binary.
-pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<u32>) -> Option<u32> {
+pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>) -> Option<Pid> {
     let path = argv[0];
 
     let binary = match vfs::lock().read_file(path) {
@@ -480,7 +581,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<u32>) -> Option<u32> {
     };
 
     let child_pml4 = paging::create_user_pml4();
-    let child_cr3 = child_pml4 as u64;
+    let child_cr3 = Some(PageTableRoot::new(child_pml4));
 
     paging::map_user_in(child_pml4, elf_alloc.ptr() as u64, elf_alloc.size() as u64);
 
@@ -577,7 +678,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<u32>) -> Option<u32> {
     let ks_base = ks_alloc.ptr() as u64;
 
     let mut guard = PROCESS_TABLE.lock();
-    let table = guard.as_mut().expect("process table not initialized");
+    let table = guard.as_mut().unwrap();
 
     let cwd = match parent {
         Some(ppid) => table.procs.get(ppid).unwrap().cwd.clone(),
@@ -585,7 +686,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<u32>) -> Option<u32> {
     };
 
     let pid = table.procs.insert(Process {
-        pid: 0,
+        pid: Pid::from_raw(0),
         state: ProcessState::Ready,
         kind: Kind::Process { parent },
         cr3: child_cr3,
@@ -595,7 +696,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<u32>) -> Option<u32> {
         user_heap: crate::user_heap::UserHeap::new(),
         messages: MessageQueue::new(),
         cwd,
-        heap_owner: 0,
+        heap_owner: Pid::from_raw(0),
         elf_alloc: Some(elf_alloc),
         stack_alloc: Some(stack_alloc),
         fs_base,
@@ -615,7 +716,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<u32>) -> Option<u32> {
     p.heap_owner = pid;
 
     log!("spawn: {} pid={} base={:#x} entry={:#x} cr3={:#x} ks={:#x}..{:#x}",
-        path, pid, loaded.base as u64, loaded.entry, child_cr3,
+        path, pid, loaded.base as u64, loaded.entry, child_cr3.unwrap().as_u64(),
         ks_base, ks_base + KERNEL_STACK_SIZE as u64);
 
     Some(pid)
@@ -623,7 +724,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<u32>) -> Option<u32> {
 
 /// Spawn a process from kernel context (during boot). Resolves bare names
 /// to `/initrd/<name>`. Panics on failure.
-pub fn spawn_kernel(argv: &[&str]) -> u32 {
+pub fn spawn_kernel(argv: &[&str]) -> Pid {
     let path = argv[0];
     let full_path = if path.starts_with('/') {
         String::from(path)
@@ -642,7 +743,7 @@ pub fn spawn_kernel(argv: &[&str]) -> u32 {
 
 /// Like `spawn_kernel`, but returns `None` instead of panicking if the binary
 /// is missing. Used for optional services that may not be present in the initrd.
-pub fn spawn_optional(argv: &[&str]) -> Option<u32> {
+pub fn spawn_optional(argv: &[&str]) -> Option<Pid> {
     let path = argv[0];
     let full_path = if path.starts_with('/') {
         String::from(path)
@@ -661,43 +762,43 @@ pub fn spawn_optional(argv: &[&str]) -> Option<u32> {
 
 /// Tear down a process: zombie all its threads, free all resources, wake parent.
 /// Caller must hold PROCESS_TABLE lock and have already switched to kernel CR3.
-fn teardown_process(table: &mut ProcessTable, pid: u32, code: i32) {
+fn teardown_process(table: &mut ProcessTable, pid: Pid, code: i32) {
     // Kill all child threads before freeing resources they depend on
-    let child_tids: alloc::vec::Vec<u32> = table.procs.iter()
+    let child_tids: Vec<Pid> = table.procs.iter()
         .filter(|(tid, p)| *tid != pid && matches!(p.kind, Kind::Thread { parent } if parent == pid))
         .map(|(tid, _)| tid)
         .collect();
     for tid in &child_tids {
         let child = table.procs.get_mut(*tid).unwrap();
         child.tls_alloc.take();
-        child.state = ProcessState::Zombie(-1);
+        if !matches!(child.state, ProcessState::Zombie(_)) {
+            child.zombify(-1);
+        }
     }
 
     let proc = table.procs.get_mut(pid).unwrap();
     fd::close_all(&mut proc.fds, &mut *vfs::lock(), pid);
     proc.tls_alloc.take();
-    let pml4 = proc.cr3 as *mut u64;
+    let root = proc.cr3.take().expect("teardown_process: cr3 already taken");
+    let pml4 = root.as_ptr();
     shared_memory::cleanup_process(pid, pml4);
     proc.elf_alloc.take();
     proc.stack_alloc.take();
     proc.loaded_libs.clear();
     proc.mmap_regions.clear();
     paging::free_user_page_tables(pml4);
-    proc.cr3 = 0;
-    proc.state = ProcessState::Zombie(code);
+    proc.zombify(code);
     let name = core::str::from_utf8(&proc.name).unwrap_or("?").trim_end_matches('\0');
     log!("exit: {name} pid={pid} code={code}");
 
-    if let Some(names) = NAME_REGISTRY.lock().as_mut() {
-        names.retain(|_, &mut v| v != pid);
-    }
+    if let Some(names) = NAME_REGISTRY.lock().as_mut() { names.retain(|_, &mut v| v != pid); }
 
     // Wake parent if blocked on waitpid
     if let Kind::Process { parent: Some(ppid) } = table.procs.get(pid).unwrap().kind {
         if let Some(p) = table.procs.get_mut(ppid) {
             if let ProcessState::BlockedWaitPid(child) = p.state {
                 if child == pid {
-                    p.state = ProcessState::Ready;
+                    p.set_state(ProcessState::Ready);
                 }
             }
         }
@@ -705,11 +806,11 @@ fn teardown_process(table: &mut ProcessTable, pid: u32, code: i32) {
 }
 
 /// Exit the entire process (all threads). If called from a thread, kills the
-/// parent process and all siblings. If called from a process, same as exit().
-pub fn exit_group(code: i32) -> ! {
+/// parent process and all siblings.
+pub fn exit(code: i32) -> ! {
     let mut guard = PROCESS_TABLE.lock();
-    let table = guard.as_mut().expect("process table not initialized");
-    let pid = percpu::current_pid();
+    let table = guard.as_mut().unwrap();
+    let pid = current_pid();
     let kind = table.procs.get(pid).unwrap().kind;
 
     unsafe { cpu::write_cr3(paging::kernel_cr3()); }
@@ -719,7 +820,7 @@ pub fn exit_group(code: i32) -> ! {
             // Zombie ourselves, then kill the parent process (cascades to siblings)
             let proc = table.procs.get_mut(pid).unwrap();
             proc.tls_alloc.take();
-            proc.state = ProcessState::Zombie(code);
+            proc.zombify(code);
             parent
         }
         Kind::Process { .. } => pid,
@@ -729,11 +830,12 @@ pub fn exit_group(code: i32) -> ! {
     scheduler::schedule_no_return_locked(guard);
 }
 
-/// Exit the current process or thread.
-pub fn exit(code: i32) -> ! {
+/// Exit the current thread only. For processes without threads, tears down
+/// the process. For threads, zombifies without freeing the address space.
+pub fn thread_exit(code: i32) -> ! {
     let mut guard = PROCESS_TABLE.lock();
-    let table = guard.as_mut().expect("process table not initialized");
-    let pid = percpu::current_pid();
+    let table = guard.as_mut().unwrap();
+    let pid = current_pid();
     let kind = table.procs.get(pid).unwrap().kind;
 
     unsafe { cpu::write_cr3(paging::kernel_cr3()); }
@@ -745,14 +847,14 @@ pub fn exit(code: i32) -> ! {
             let proc = table.procs.get_mut(pid).unwrap();
             fd::close_all(&mut proc.fds, &mut *vfs::lock(), pid);
             proc.tls_alloc.take();
-            proc.state = ProcessState::Zombie(code);
+            proc.zombify(code);
             let name = core::str::from_utf8(&proc.name).unwrap_or("?").trim_end_matches('\0');
             log!("exit: {name} pid={pid} code={code}");
 
             if let Some(p) = table.procs.get_mut(parent) {
                 if let ProcessState::BlockedThreadJoin(child) = p.state {
                     if child == pid {
-                        p.state = ProcessState::Ready;
+                        p.set_state(ProcessState::Ready);
                     }
                 }
             }
@@ -776,14 +878,14 @@ pub fn yield_now() {
 }
 
 /// Send a message to a target process. Wakes the target if blocked.
-pub fn send_message(target_pid: u32, msg: crate::message::Message) -> bool {
+pub fn send_message(target_pid: Pid, msg: crate::message::Message) -> bool {
     let mut guard = PROCESS_TABLE.lock();
-    let table = guard.as_mut().expect("process table not initialized");
+    let table = guard.as_mut().unwrap();
     if let Some(proc) = table.procs.get_mut(target_pid) {
         proc.messages.push(msg);
         match proc.state {
             ProcessState::BlockedRecvMsg | ProcessState::BlockedPoll { .. } => {
-                proc.state = ProcessState::Ready;
+                proc.set_state(ProcessState::Ready);
             }
             _ => {}
         }
@@ -803,8 +905,8 @@ pub fn futex_wait(addr: u64, expected: u32, timeout_ns: u64) -> u64 {
         0
     };
     let mut guard = PROCESS_TABLE.lock();
-    let table = guard.as_mut().expect("process table not initialized");
-    let pid = percpu::current_pid();
+    let table = guard.as_mut().unwrap();
+    let pid = current_pid();
     let proc = table.procs.get_mut(pid).unwrap();
 
     // Atomic check: read the user value under the lock
@@ -813,7 +915,7 @@ pub fn futex_wait(addr: u64, expected: u32, timeout_ns: u64) -> u64 {
         return 0;
     }
 
-    proc.state = ProcessState::BlockedFutex { addr, deadline };
+    proc.set_state(ProcessState::BlockedFutex { addr, deadline });
     // Pass the held lock to the scheduler so it can context-switch atomically
     scheduler::schedule_already_blocked(guard);
     0
@@ -822,16 +924,16 @@ pub fn futex_wait(addr: u64, expected: u32, timeout_ns: u64) -> u64 {
 /// Wake up to `count` threads blocked on `addr` in the same address space as the caller.
 pub fn futex_wake(addr: u64, count: u64) -> u64 {
     let mut guard = PROCESS_TABLE.lock();
-    let table = guard.as_mut().expect("process table not initialized");
-    let pid = percpu::current_pid();
-    let caller_cr3 = table.procs.get(pid).map_or(0, |p| p.cr3);
+    let table = guard.as_mut().unwrap();
+    let pid = current_pid();
+    let caller_cr3 = table.procs.get(pid).and_then(|p| p.cr3);
     let mut woken = 0u64;
     for (_, proc) in table.procs.iter_mut() {
         if woken >= count { break; }
-        if proc.cr3 == caller_cr3 {
+        if caller_cr3.is_some() && proc.cr3 == caller_cr3 {
             if let ProcessState::BlockedFutex { addr: a, .. } = proc.state {
                 if a == addr {
-                    proc.state = ProcessState::Ready;
+                    proc.set_state(ProcessState::Ready);
                     woken += 1;
                 }
             }
@@ -841,12 +943,12 @@ pub fn futex_wake(addr: u64, count: u64) -> u64 {
 }
 
 /// Wake processes blocked on reading from a pipe that now has data.
-pub fn wake_pipe_readers(pipe_id: usize) {
+pub fn wake_pipe_readers(pipe_id: pipe::PipeId) {
     scheduler::wake_pipe_readers(pipe_id);
 }
 
 /// Wake processes blocked on writing to a pipe that now has space.
-pub fn wake_pipe_writers(pipe_id: usize) {
+pub fn wake_pipe_writers(pipe_id: pipe::PipeId) {
     scheduler::wake_pipe_writers(pipe_id);
 }
 
@@ -854,9 +956,9 @@ pub fn wake_pipe_writers(pipe_id: usize) {
 /// Returns Ok(Some(code)) if collected, Ok(None) if child exists but not zombie,
 /// Err(()) if child doesn't exist or isn't ours.
 /// Combining validation and collection under one lock prevents TOCTOU races.
-pub fn collect_child_zombie(child_pid: u32, parent_pid: u32) -> Result<Option<i32>, ()> {
+pub fn collect_child_zombie(child_pid: Pid, parent_pid: Pid) -> Result<Option<i32>, ()> {
     let mut guard = PROCESS_TABLE.lock();
-    let table = guard.as_mut().expect("process table not initialized");
+    let table = guard.as_mut().unwrap();
     let proc = table.procs.get(child_pid).ok_or(())?;
     if !matches!(proc.kind, Kind::Process { parent: Some(ppid) } if ppid == parent_pid) {
         return Err(());
@@ -871,9 +973,9 @@ pub fn collect_child_zombie(child_pid: u32, parent_pid: u32) -> Result<Option<i3
 
 /// Atomically validate parent-thread relationship and collect a zombie thread.
 /// Same atomic guarantees as `collect_child_zombie`.
-pub fn collect_thread_zombie(tid: u32, parent_pid: u32) -> Result<Option<i32>, ()> {
+pub fn collect_thread_zombie(tid: Pid, parent_pid: Pid) -> Result<Option<i32>, ()> {
     let mut guard = PROCESS_TABLE.lock();
-    let table = guard.as_mut().expect("process table not initialized");
+    let table = guard.as_mut().unwrap();
     let proc = table.procs.get(tid).ok_or(())?;
     if !matches!(proc.kind, Kind::Thread { parent } if parent == parent_pid) {
         return Err(());
@@ -886,9 +988,9 @@ pub fn collect_thread_zombie(tid: u32, parent_pid: u32) -> Result<Option<i32>, (
     }
 }
 
-pub fn register_name(name: &str, pid: u32) -> bool {
+pub fn register_name(name: &str, pid: Pid) -> bool {
     let mut guard = NAME_REGISTRY.lock();
-    let names = guard.as_mut().expect("name registry not initialized");
+    let names = guard.as_mut().unwrap();
     if names.contains_key(name) {
         return false;
     }
@@ -896,14 +998,14 @@ pub fn register_name(name: &str, pid: u32) -> bool {
     true
 }
 
-pub fn find_pid(name: &str) -> Option<u32> {
-    NAME_REGISTRY.lock().as_ref().expect("name registry not initialized").get(name).copied()
+pub fn find_pid(name: &str) -> Option<Pid> {
+    NAME_REGISTRY.lock().as_ref().unwrap().get(name).copied()
 }
 
 /// Resolve an address using the current process's symbols. Lock-safe (brief hold).
 pub fn resolve_symbol(addr: u64) -> Option<(String, u64)> {
-    let pid = percpu::current_pid();
-    if pid == u32::MAX { return None; }
+    let pid = current_pid();
+    if pid == Pid::MAX { return None; }
     let guard = PROCESS_TABLE.lock();
     let table = guard.as_ref()?;
     table.procs.get(pid)?.symbols.resolve(addr)
@@ -911,10 +1013,10 @@ pub fn resolve_symbol(addr: u64) -> Option<(String, u64)> {
 
 /// Check if an address is in the current process's valid memory ranges.
 pub fn is_valid_user_addr(addr: u64) -> bool {
-    let pid = percpu::current_pid();
-    if pid == u32::MAX { return false; }
+    let pid = current_pid();
+    if pid == Pid::MAX { return false; }
     let guard = PROCESS_TABLE.lock();
-    let table = match guard.as_ref() { Some(t) => t, None => return false };
+    let Some(table) = guard.as_ref() else { return false };
     match table.procs.get(pid) {
         Some(proc) => proc.symbols.is_valid_user_addr(addr),
         None => false,
@@ -923,11 +1025,11 @@ pub fn is_valid_user_addr(addr: u64) -> bool {
 
 /// Kill a child process. Only the parent can kill its children.
 /// Returns 0 on success, error code on failure.
-pub fn kill_process(target_pid: u32) -> u64 {
+pub fn kill_process(target_pid: Pid) -> u64 {
     use toyos_abi::syscall::SyscallError;
-    let caller = percpu::current_pid();
+    let caller = current_pid();
     let mut guard = PROCESS_TABLE.lock();
-    let table = guard.as_mut().expect("process table not initialized");
+    let table = guard.as_mut().unwrap();
 
     let Some(proc) = table.procs.get(target_pid) else { return SyscallError::NotFound.to_u64() };
 
@@ -950,40 +1052,40 @@ pub fn kill_process(target_pid: u32) -> u64 {
     proc.tls_alloc.take();
 
     // Kill child threads of the target
-    let child_tids: alloc::vec::Vec<u32> = table.procs.iter()
+    let child_tids: Vec<Pid> = table.procs.iter()
         .filter(|(tid, p)| *tid != target_pid && matches!(p.kind, Kind::Thread { parent } if parent == target_pid))
         .map(|(tid, _)| tid)
         .collect();
     for tid in &child_tids {
         let child = table.procs.get_mut(*tid).unwrap();
         child.tls_alloc.take();
-        child.state = ProcessState::Zombie(-1);
+        if !matches!(child.state, ProcessState::Zombie(_)) {
+            child.zombify(-1);
+        }
     }
 
     let proc = table.procs.get_mut(target_pid).unwrap();
-    let pml4 = proc.cr3 as *mut u64;
+    let root = proc.cr3.take().expect("kill_process: cr3 already taken");
+    let pml4 = root.as_ptr();
     shared_memory::cleanup_process(target_pid, pml4);
     proc.elf_alloc.take();
     proc.stack_alloc.take();
     proc.loaded_libs.clear();
     proc.mmap_regions.clear();
     paging::free_user_page_tables(pml4);
-    proc.cr3 = 0;
 
-    proc.state = ProcessState::Zombie(137); // 128 + 9 (SIGKILL-like)
+    proc.zombify(137); // 128 + 9 (SIGKILL-like)
     let name = core::str::from_utf8(&proc.name).unwrap_or("?").trim_end_matches('\0');
     log!("kill: {name} pid={target_pid}");
 
     // Unregister name
-    if let Some(names) = NAME_REGISTRY.lock().as_mut() {
-        names.retain(|_, &mut v| v != target_pid);
-    }
+    if let Some(names) = NAME_REGISTRY.lock().as_mut() { names.retain(|_, &mut v| v != target_pid); }
 
     // Wake parent if blocked on waitpid for this process
     if let Some(parent) = table.procs.get_mut(caller) {
         if let ProcessState::BlockedWaitPid(child) = parent.state {
             if child == target_pid {
-                parent.state = ProcessState::Ready;
+                parent.set_state(ProcessState::Ready);
             }
         }
     }

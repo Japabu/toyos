@@ -1,11 +1,12 @@
 use alloc::boxed::Box;
+use crate::shared_memory::SharedToken;
 use crate::sync::Lock;
 
 pub const FLAG_HARDWARE_CURSOR: u32 = 1 << 0;
 
 pub struct GpuInfo {
-    pub tokens: [u32; 2],
-    pub cursor_token: u32,
+    pub tokens: [SharedToken; 2],
+    pub cursor_token: SharedToken,
     pub width: u32,
     pub height: u32,
     pub stride: u32,

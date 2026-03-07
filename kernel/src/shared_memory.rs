@@ -4,31 +4,41 @@ use core::alloc::Layout;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::arch::paging::{self, PAGE_2M};
+use crate::process::Pid;
 use crate::sync::Lock;
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct SharedToken(u32);
+
+impl SharedToken {
+    pub fn raw(self) -> u32 { self.0 }
+    pub fn from_raw(v: u32) -> Self { Self(v) }
+}
 
 struct SharedRegion {
     phys_addr: u64,
     size: u64,
-    owner_pid: u32,                  // u32::MAX for kernel-owned
-    allowed: Vec<u32>,                // PIDs allowed to map
-    mapped_in: Vec<(u32, *mut u64)>,  // (PID, PML4) for processes that have mapped it
+    owner_pid: Pid,
+    allowed: Vec<Pid>,                // PIDs allowed to map
+    mapped_in: Vec<(Pid, *mut u64)>,  // (PID, PML4) for processes that have mapped it
     layout: Option<Layout>,           // for freeing; None = kernel-owned
 }
 
-static REGIONS: Lock<Option<Vec<(u32, SharedRegion)>>> = Lock::new(None);
+static REGIONS: Lock<Option<Vec<(SharedToken, SharedRegion)>>> = Lock::new(None);
 static NEXT_TOKEN: AtomicU32 = AtomicU32::new(1);
 
 pub fn init() {
     *REGIONS.lock() = Some(Vec::new());
 }
 
-fn next_token() -> u32 {
-    NEXT_TOKEN.fetch_add(1, Ordering::Relaxed)
+fn next_token() -> SharedToken {
+    SharedToken(NEXT_TOKEN.fetch_add(1, Ordering::Relaxed))
 }
 
-/// Allocate 2MB-aligned shared memory. Maps it as USER in the owner's page tables.
-/// Returns (token, physical address).
-pub fn alloc(size: u64, owner_pid: u32, owner_pml4: *mut u64) -> (u32, u64) {
+/// Allocate 2MB-aligned shared memory. Maps it into the owner's page tables.
+/// Returns a token; the owner can retrieve the address via `map()`.
+#[must_use]
+pub fn alloc(size: u64, owner_pid: Pid, owner_pml4: *mut u64) -> SharedToken {
     let aligned_size = paging::align_2m(size as usize);
     let layout = Layout::from_size_align(aligned_size, PAGE_2M as usize).unwrap();
     let ptr = unsafe { alloc_zeroed(layout) };
@@ -49,19 +59,20 @@ pub fn alloc(size: u64, owner_pid: u32, owner_pml4: *mut u64) -> (u32, u64) {
         layout: Some(layout),
     }));
 
-    (token, phys_addr)
+    token
 }
 
 /// Register an existing kernel-owned allocation as a shared region.
 /// Used for GPU framebuffers. Not freeable, no initial owner.
-pub fn register(phys_addr: u64, size: u64) -> u32 {
+#[must_use]
+pub fn register(phys_addr: u64, size: u64) -> SharedToken {
     let token = next_token();
     let mut guard = REGIONS.lock();
     let regions = guard.as_mut().expect("shared_memory not initialized");
     regions.push((token, SharedRegion {
         phys_addr,
         size,
-        owner_pid: u32::MAX,
+        owner_pid: Pid::MAX,
         allowed: Vec::new(),
         mapped_in: Vec::new(),
         layout: None,
@@ -71,7 +82,8 @@ pub fn register(phys_addr: u64, size: u64) -> u32 {
 
 /// Grant a process permission to map a shared region.
 /// Caller must be the owner, or for kernel-owned regions, already in the allowed list.
-pub fn grant(token: u32, caller_pid: u32, target_pid: u32) -> bool {
+#[must_use]
+pub fn grant(token: SharedToken, caller_pid: Pid, target_pid: Pid) -> bool {
     let mut guard = REGIONS.lock();
     let regions = guard.as_mut().expect("shared_memory not initialized");
     let Some((_, region)) = regions.iter_mut().find(|(t, _)| *t == token) else {
@@ -88,7 +100,8 @@ pub fn grant(token: u32, caller_pid: u32, target_pid: u32) -> bool {
 
 /// Map a shared region into the caller's address space.
 /// Returns the physical address, or None if not allowed.
-pub fn map(token: u32, caller_pid: u32, caller_pml4: *mut u64) -> Option<u64> {
+#[must_use]
+pub fn map(token: SharedToken, caller_pid: Pid, caller_pml4: *mut u64) -> Option<u64> {
     let mut guard = REGIONS.lock();
     let regions = guard.as_mut().expect("shared_memory not initialized");
     let (_, region) = regions.iter_mut().find(|(t, _)| *t == token)?;
@@ -107,7 +120,8 @@ pub fn map(token: u32, caller_pid: u32, caller_pml4: *mut u64) -> Option<u64> {
 
 /// Release a process's mapping of a shared region. Any mapped process can call this.
 /// Unmaps only from the caller's page tables. If no mappings remain, deallocates.
-pub fn release(token: u32, caller_pid: u32, caller_pml4: *mut u64) -> bool {
+#[must_use]
+pub fn release(token: SharedToken, caller_pid: Pid, caller_pml4: *mut u64) -> bool {
     let mut guard = REGIONS.lock();
     let regions = guard.as_mut().expect("shared_memory not initialized");
     let Some(pos) = regions.iter().position(|(t, _)| *t == token) else {
@@ -140,7 +154,7 @@ pub fn release(token: u32, caller_pid: u32, caller_pml4: *mut u64) -> bool {
 
 /// Clean up all shared memory state for an exiting process.
 /// Unmaps from all regions, frees owned regions, removes from allowed lists.
-pub fn cleanup_process(pid: u32, pml4: *mut u64) {
+pub fn cleanup_process(pid: Pid, pml4: *mut u64) {
     let mut guard = REGIONS.lock();
     let regions = guard.as_mut().expect("shared_memory not initialized");
 

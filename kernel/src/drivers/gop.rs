@@ -39,7 +39,7 @@ pub fn init(
     // Register framebuffer as shared memory (same buffer for both tokens)
     let token0 = shared_memory::register(addr, aligned_size);
     let token1 = shared_memory::register(addr, aligned_size);
-    log!("GOP: {}x{} stride={} format={} at {:#x} tokens=[{}, {}]",
+    log!("GOP: {}x{} stride={} format={} at {:#x} tokens=[{:?}, {:?}]",
         width, height, stride, pixel_format, addr, token0, token1);
 
     // Allocate cursor buffer (unused but required by FramebufferInfo)

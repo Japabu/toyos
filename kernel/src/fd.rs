@@ -2,8 +2,10 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::id_map::IdMap;
+use crate::process::Pid;
 use crate::vfs::Vfs;
 use crate::{device, keyboard, mouse, log, pipe};
+use crate::pipe::PipeId;
 use crate::drivers::serial;
 use toyos_abi::syscall::{FileType, SyscallError};
 
@@ -36,10 +38,10 @@ pub struct OpenFile {
 
 pub enum Descriptor {
     File(OpenFile),
-    PipeRead(usize),
-    PipeWrite(usize),
-    TtyRead(usize),
-    TtyWrite(usize),
+    PipeRead(PipeId),
+    PipeWrite(PipeId),
+    TtyRead(PipeId),
+    TtyWrite(PipeId),
     Keyboard,
     Mouse,
     SerialConsole,
@@ -114,7 +116,7 @@ pub fn open(table: &mut FdTable, vfs: &mut Vfs, path: &str, flags: u64) -> u64 {
     alloc(table, Descriptor::File(file))
 }
 
-pub fn close(table: &mut FdTable, vfs: &mut Vfs, fd: u64, pid: u32) -> u64 {
+pub fn close(table: &mut FdTable, vfs: &mut Vfs, fd: u64, pid: Pid) -> u64 {
     let Some(desc) = table.remove(fd) else {
         return SyscallError::NotFound.to_u64();
     };
@@ -306,7 +308,7 @@ pub fn ftruncate(table: &mut FdTable, fd: u64, size: u64) -> u64 {
     0
 }
 
-pub fn close_all(table: &mut FdTable, vfs: &mut Vfs, pid: u32) {
+pub fn close_all(table: &mut FdTable, vfs: &mut Vfs, pid: Pid) {
     for (_, desc) in table.drain() {
         match &desc {
             Descriptor::File(file) => {

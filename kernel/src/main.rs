@@ -160,8 +160,8 @@ fn kernel_main(
     if let Some((gpu_driver, gpu_info)) = virtio_gpu::init(ecam_base) {
         log!("GPU: using VirtIO");
         let fb_info = fd::FramebufferInfo {
-            token: gpu_info.tokens,
-            cursor_token: gpu_info.cursor_token,
+            token: [gpu_info.tokens[0].raw(), gpu_info.tokens[1].raw()],
+            cursor_token: gpu_info.cursor_token.raw(),
             width: gpu_info.width,
             height: gpu_info.height,
             stride: gpu_info.stride,
@@ -182,8 +182,8 @@ fn kernel_main(
             kernel_args.gop_pixel_format,
         );
         let fb_info = fd::FramebufferInfo {
-            token: gpu_info.tokens,
-            cursor_token: gpu_info.cursor_token,
+            token: [gpu_info.tokens[0].raw(), gpu_info.tokens[1].raw()],
+            cursor_token: gpu_info.cursor_token.raw(),
             width: gpu_info.width,
             height: gpu_info.height,
             stride: gpu_info.stride,

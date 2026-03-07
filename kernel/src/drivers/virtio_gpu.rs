@@ -450,7 +450,7 @@ pub fn init(ecam_base: u64) -> Option<(Box<dyn Gpu>, GpuInfo)> {
     let fb_size = (width * height * 4) as usize;
     let fb_aligned = paging::align_2m(fb_size);
     let fb_layout = Layout::from_size_align(fb_aligned, PAGE_2M as usize).unwrap();
-    let mut tokens = [0u32; 2];
+    let mut tokens = [shared_memory::SharedToken::from_raw(0); 2];
     for i in 0..2 {
         let ptr = unsafe { alloc_zeroed(fb_layout) };
         assert!(!ptr.is_null(), "VirtIO GPU: framebuffer alloc failed");
@@ -460,7 +460,7 @@ pub fn init(ecam_base: u64) -> Option<(Box<dyn Gpu>, GpuInfo)> {
             gpu.create_resource(gpu.resource, FORMAT_B8G8R8X8_UNORM, width, height);
             gpu.attach_backing(gpu.resource, addr, fb_size as u32);
         }
-        log!("VirtIO GPU: buffer {} at {:#x} ({} bytes) token={}", i, addr, fb_size, tokens[i]);
+        log!("VirtIO GPU: buffer {} at {:#x} ({} bytes) token={:?}", i, addr, fb_size, tokens[i]);
     }
 
     // Set scanout to the single resource
@@ -477,7 +477,7 @@ pub fn init(ecam_base: u64) -> Option<(Box<dyn Gpu>, GpuInfo)> {
     let cursor_token = shared_memory::register(cursor_addr, cursor_aligned as u64);
     gpu.create_resource(CURSOR_RESOURCE_ID, FORMAT_B8G8R8A8_UNORM, CURSOR_SIZE, CURSOR_SIZE);
     gpu.attach_backing(CURSOR_RESOURCE_ID, cursor_addr, cursor_bytes as u32);
-    log!("VirtIO GPU: cursor resource at {:#x} token={}", cursor_addr, cursor_token);
+    log!("VirtIO GPU: cursor resource at {:#x} token={:?}", cursor_addr, cursor_token);
 
     gpu.width = width;
     gpu.height = height;

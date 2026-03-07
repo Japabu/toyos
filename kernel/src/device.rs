@@ -1,4 +1,5 @@
 use crate::fd::{Descriptor, FramebufferInfo};
+use crate::process::Pid;
 use crate::shared_memory;
 use crate::sync::Lock;
 
@@ -6,9 +7,9 @@ pub const DEVICE_KEYBOARD: u64 = 0;
 pub const DEVICE_MOUSE: u64 = 1;
 pub const DEVICE_FRAMEBUFFER: u64 = 2;
 
-static KEYBOARD_OWNER: Lock<Option<u32>> = Lock::new(None);
-static MOUSE_OWNER: Lock<Option<u32>> = Lock::new(None);
-static FRAMEBUFFER_OWNER: Lock<Option<u32>> = Lock::new(None);
+static KEYBOARD_OWNER: Lock<Option<Pid>> = Lock::new(None);
+static MOUSE_OWNER: Lock<Option<Pid>> = Lock::new(None);
+static FRAMEBUFFER_OWNER: Lock<Option<Pid>> = Lock::new(None);
 static FB_INFO: Lock<Option<FramebufferInfo>> = Lock::new(None);
 
 pub fn set_framebuffer_info(info: FramebufferInfo) {
@@ -16,7 +17,7 @@ pub fn set_framebuffer_info(info: FramebufferInfo) {
 }
 
 /// Try to claim exclusive access to a device. Returns the Descriptor if unclaimed.
-pub fn try_claim(device_type: u64, pid: u32) -> Option<Descriptor> {
+pub fn try_claim(device_type: u64, pid: Pid) -> Option<Descriptor> {
     match device_type {
         DEVICE_KEYBOARD => {
             let mut owner = KEYBOARD_OWNER.lock();
@@ -43,9 +44,11 @@ pub fn try_claim(device_type: u64, pid: u32) -> Option<Descriptor> {
             *owner = Some(pid);
             // Grant GPU buffer and cursor tokens to the claiming process
             for &token in &info.token {
-                shared_memory::grant(token, u32::MAX, pid);
+                assert!(shared_memory::grant(shared_memory::SharedToken::from_raw(token), Pid::MAX, pid),
+                    "failed to grant framebuffer token");
             }
-            shared_memory::grant(info.cursor_token, u32::MAX, pid);
+            assert!(shared_memory::grant(shared_memory::SharedToken::from_raw(info.cursor_token), Pid::MAX, pid),
+                "failed to grant cursor token");
             Some(Descriptor::Framebuffer(info))
         }
         _ => None,
@@ -53,7 +56,7 @@ pub fn try_claim(device_type: u64, pid: u32) -> Option<Descriptor> {
 }
 
 /// Release a device owned by the given PID.
-pub fn release(device_type: u64, pid: u32) {
+pub fn release(device_type: u64, pid: Pid) {
     let mut owner = match device_type {
         DEVICE_KEYBOARD => KEYBOARD_OWNER.lock(),
         DEVICE_MOUSE => MOUSE_OWNER.lock(),
@@ -66,7 +69,7 @@ pub fn release(device_type: u64, pid: u32) {
 }
 
 /// Release a device descriptor, determining the type from the descriptor variant.
-pub fn release_descriptor(desc: &Descriptor, pid: u32) {
+pub fn release_descriptor(desc: &Descriptor, pid: Pid) {
     match desc {
         Descriptor::Keyboard => release(DEVICE_KEYBOARD, pid),
         Descriptor::Mouse => release(DEVICE_MOUSE, pid),
