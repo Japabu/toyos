@@ -22,7 +22,8 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-use toyos_abi::syscall::{self, Fd, SyscallError};
+use toyos_abi::Fd;
+use toyos_abi::syscall::{self, SyscallError};
 use toyos_net::{self, NetError};
 
 use crate::{SockAddr, TcpKeepalive};
