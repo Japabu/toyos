@@ -1,51 +1,14 @@
-use std::ptr;
+use core::ptr;
 
-// --- Platform-specific allocator backends ---
-
-// macOS: Use the zone allocator directly to avoid infinite recursion.
-// Our `malloc` symbol overrides the system `malloc`, so `std::alloc::alloc`
-// → system allocator → our `malloc` → infinite loop.
-// `malloc_zone_malloc`/`malloc_zone_free` bypass the `malloc` symbol entirely.
-#[cfg(target_os = "macos")]
+// ToyOS: Call toyos-abi's kernel allocator directly.
+// We store the allocation size in a header so C's free(ptr) can reconstruct it.
 mod backend {
-    extern "C" {
-        fn malloc_default_zone() -> *mut u8;
-        fn malloc_zone_malloc(zone: *mut u8, size: usize) -> *mut u8;
-        fn malloc_zone_free(zone: *mut u8, ptr: *mut u8);
-        fn malloc_zone_realloc(zone: *mut u8, ptr: *mut u8, size: usize) -> *mut u8;
-    }
-
-    unsafe fn zone() -> *mut u8 {
-        unsafe { malloc_default_zone() }
-    }
-
-    pub unsafe fn alloc(size: usize) -> *mut u8 {
-        unsafe { malloc_zone_malloc(zone(), size) }
-    }
-
-    pub unsafe fn dealloc(ptr: *mut u8) {
-        unsafe { malloc_zone_free(zone(), ptr) }
-    }
-
-    pub unsafe fn realloc(ptr: *mut u8, new_size: usize) -> *mut u8 {
-        unsafe { malloc_zone_realloc(zone(), ptr, new_size) }
-    }
-}
-
-// ToyOS: Use std::alloc (the global allocator), which goes through the kernel
-// syscall-based allocator — no risk of recursion since there's no symbol override.
-#[cfg(target_os = "toyos")]
-mod backend {
-    use std::alloc::{self, Layout};
-
-    // We store the allocation size in the 8 bytes before the returned pointer
-    // so we can reconstruct the Layout for dealloc/realloc.
     const HEADER: usize = 16; // 16 for alignment
 
     pub unsafe fn alloc(size: usize) -> *mut u8 {
         let total = HEADER + size;
-        let layout = Layout::from_size_align_unchecked(total, 16);
-        let raw = unsafe { alloc::alloc(layout) };
+        // SAFETY: total > 0 (HEADER is 16), alignment is valid
+        let raw = unsafe { toyos_abi::syscall::alloc(total, 16) };
         if raw.is_null() {
             return raw;
         }
@@ -57,8 +20,8 @@ mod backend {
         let raw = unsafe { ptr.sub(HEADER) };
         let size = unsafe { *(raw as *const usize) };
         let total = HEADER + size;
-        let layout = unsafe { Layout::from_size_align_unchecked(total, 16) };
-        unsafe { alloc::dealloc(raw, layout); }
+        // SAFETY: raw was returned by alloc with the same total size and alignment
+        unsafe { toyos_abi::syscall::free(raw, total, 16) };
     }
 
     pub unsafe fn realloc(ptr: *mut u8, new_size: usize) -> *mut u8 {
@@ -66,8 +29,8 @@ mod backend {
         let old_size = unsafe { *(raw as *const usize) };
         let old_total = HEADER + old_size;
         let new_total = HEADER + new_size;
-        let old_layout = unsafe { Layout::from_size_align_unchecked(old_total, 16) };
-        let new_raw = unsafe { alloc::realloc(raw, old_layout, new_total) };
+        // SAFETY: raw was returned by alloc with old_total size and alignment 16
+        let new_raw = unsafe { toyos_abi::syscall::realloc(raw, old_total, 16, new_total) };
         if new_raw.is_null() {
             return new_raw;
         }
@@ -119,11 +82,63 @@ pub unsafe extern "C" fn realloc(p: *mut u8, new_size: usize) -> *mut u8 {
     unsafe { backend::realloc(p, new_size) }
 }
 
-// memcpy, memmove, memset, memcmp are provided by compiler-builtins
-// (rust/library/compiler-builtins/compiler-builtins/src/mem/x86_64.rs)
-// using optimized rep movsb/movsq inline asm. Don't redefine them here
-// or ptr::copy_nonoverlapping will call our memcpy which calls
-// ptr::copy_nonoverlapping — infinite recursion.
+// memcpy, memmove, memset, memcmp — implemented in inline asm to avoid
+// infinite recursion (Rust's ptr::copy_nonoverlapping emits calls to memcpy).
+
+#[no_mangle]
+pub unsafe extern "C" fn memcpy(dest: *mut u8, src: *const u8, n: usize) -> *mut u8 {
+    core::arch::asm!(
+        "rep movsb",
+        inout("rdi") dest => _,
+        inout("rsi") src => _,
+        inout("rcx") n => _,
+        options(nostack),
+    );
+    dest
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn memmove(dest: *mut u8, src: *const u8, n: usize) -> *mut u8 {
+    if (dest as usize) <= (src as usize) || (dest as usize) >= (src as usize) + n {
+        memcpy(dest, src, n);
+    } else {
+        // Overlap with dest after src — copy backwards
+        core::arch::asm!(
+            "std",
+            "rep movsb",
+            "cld",
+            inout("rdi") dest.add(n - 1) => _,
+            inout("rsi") src.add(n - 1) => _,
+            inout("rcx") n => _,
+            options(nostack),
+        );
+    }
+    dest
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn memset(dest: *mut u8, c: i32, n: usize) -> *mut u8 {
+    core::arch::asm!(
+        "rep stosb",
+        inout("rdi") dest => _,
+        in("al") c as u8,
+        inout("rcx") n => _,
+        options(nostack),
+    );
+    dest
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn memcmp(s1: *const u8, s2: *const u8, n: usize) -> i32 {
+    for i in 0..n {
+        let a = *s1.add(i);
+        let b = *s2.add(i);
+        if a != b {
+            return a as i32 - b as i32;
+        }
+    }
+    0
+}
 
 #[no_mangle]
 pub unsafe extern "C" fn memchr(s: *const u8, c: i32, n: usize) -> *mut u8 {
@@ -135,29 +150,3 @@ pub unsafe extern "C" fn memchr(s: *const u8, c: i32, n: usize) -> *mut u8 {
     }
     ptr::null_mut()
 }
-
-// mmap/munmap stubs — ToyOS doesn't have mmap, but some parts of std reference it.
-// These are no-ops that return failure, which is safe since the actual allocator
-// goes through the kernel's alloc syscall, not mmap.
-#[cfg(target_os = "toyos")]
-#[no_mangle]
-pub unsafe extern "C" fn mmap(
-    _addr: *mut u8,
-    _len: usize,
-    _prot: i32,
-    _flags: i32,
-    _fd: i32,
-    _offset: i64,
-) -> *mut u8 {
-    // MAP_FAILED = (void*)-1
-    usize::MAX as *mut u8
-}
-
-#[cfg(target_os = "toyos")]
-#[no_mangle]
-pub unsafe extern "C" fn munmap(_addr: *mut u8, _len: usize) -> i32 {
-    -1
-}
-
-#[inline(never)]
-pub fn _libc_memory_init() {}

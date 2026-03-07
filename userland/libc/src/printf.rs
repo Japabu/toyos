@@ -1,3 +1,4 @@
+use alloc::vec;
 use core::ffi::VaList;
 use core::fmt::Write;
 
@@ -177,7 +178,7 @@ fn write_float_e(buf: &mut [u8], pos: usize, abs_val: f64, precision: usize, upp
     }
 
     let mut exp = super::math::floor(super::math::log10(abs_val)) as i32;
-    let mut mantissa = abs_val / 10f64.powi(exp);
+    let mut mantissa = abs_val / super::math::pow(10.0, exp as f64);
     // Correct floating-point imprecision
     if mantissa >= 10.0 { mantissa /= 10.0; exp += 1; }
     if mantissa < 1.0 { mantissa *= 10.0; exp -= 1; }
@@ -491,8 +492,8 @@ pub unsafe extern "C" fn sscanf(input: *const u8, fmt: *const u8, mut args: ...)
                 b'd' => {
                     let p: *mut i32 = args.arg::<*mut i32>();
                     while si < input.len() && (input[si] as char).is_ascii_whitespace() { si += 1; }
-                    let mut endptr: *mut u8 = std::ptr::null_mut();
-                    let val = super::string::strtol(input.as_ptr().add(si), &mut endptr, 10);
+                    let mut endptr: *mut u8 = core::ptr::null_mut();
+                    let val = super::misc::strtol(input.as_ptr().add(si), &mut endptr, 10);
                     let consumed = endptr as usize - input.as_ptr().add(si) as usize;
                     if consumed == 0 { break; }
                     *p = val as i32;
@@ -525,6 +526,3 @@ pub unsafe extern "C" fn sscanf(input: *const u8, fmt: *const u8, mut args: ...)
     }
     matched
 }
-
-#[inline(never)]
-pub fn _libc_printf_init() {}

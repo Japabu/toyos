@@ -37,6 +37,24 @@ extern int errno;
 #define ENOSYS  38
 #define ELOOP   40
 #define ENAMETOOLONG 36
-#define ENOTEMPTY 39
+#define ENOTEMPTY    39
+#define EWOULDBLOCK  EAGAIN
+#define EINPROGRESS  115
+#define EALREADY     114
+#define ENOTSOCK     88
+#define EMSGSIZE     90
+#define EPROTOTYPE   91
+#define ENOPROTOOPT  92
+#define EAFNOSUPPORT 97
+#define EADDRINUSE   98
+#define EADDRNOTAVAIL 99
+#define ENETUNREACH  101
+#define ECONNABORTED 103
+#define ECONNRESET   104
+#define ENOBUFS      105
+#define EISCONN      106
+#define ENOTCONN     107
+#define ETIMEDOUT    110
+#define ECONNREFUSED 111
 
 #endif

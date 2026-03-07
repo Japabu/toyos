@@ -50,6 +50,3 @@ pub extern "C" fn toupper(c: i32) -> i32 {
 pub extern "C" fn tolower(c: i32) -> i32 {
     if isupper(c) != 0 { c + 32 } else { c }
 }
-
-#[inline(never)]
-pub fn _libc_ctype_init() {}

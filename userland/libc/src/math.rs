@@ -75,13 +75,13 @@ pub extern "C" fn atan2(y: f64, x: f64) -> f64 {
 #[no_mangle]
 pub extern "C" fn asin(x: f64) -> f64 {
     if x < -1.0 || x > 1.0 { return f64::NAN; }
-    atan2(x, (1.0 - x * x).sqrt())
+    atan2(x, sqrt(1.0 - x * x))
 }
 
 #[no_mangle]
 pub extern "C" fn acos(x: f64) -> f64 {
     if x < -1.0 || x > 1.0 { return f64::NAN; }
-    atan2((1.0 - x * x).sqrt(), x)
+    atan2(sqrt(1.0 - x * x), x)
 }
 
 #[no_mangle]
@@ -174,8 +174,7 @@ pub extern "C" fn pow(base: f64, exp: f64) -> f64 {
 
 #[no_mangle]
 pub extern "C" fn fmod(x: f64, y: f64) -> f64 {
-    // trunc() compiles to roundsd (hardware instruction), safe to call
-    x - (x / y).trunc() * y
+    x - trunc(x / y) * y
 }
 
 // --- Math primitives ---
@@ -231,10 +230,36 @@ pub extern "C" fn floorf(x: f32) -> f32 {
 pub extern "C" fn ceilf(x: f32) -> f32 { -floorf(-x) }
 
 #[no_mangle]
-pub extern "C" fn sqrt(x: f64) -> f64 { x.sqrt() }
+pub extern "C" fn sqrt(x: f64) -> f64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let result: f64;
+        unsafe { core::arch::asm!("sqrtsd {0}, {0}", inout(xmm_reg) x => result); }
+        return result;
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        let result: f64;
+        unsafe { core::arch::asm!("fsqrt {0:d}, {0:d}", inout(vreg) x => result); }
+        return result;
+    }
+}
 
 #[no_mangle]
-pub extern "C" fn sqrtf(x: f32) -> f32 { x.sqrt() }
+pub extern "C" fn sqrtf(x: f32) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let result: f32;
+        unsafe { core::arch::asm!("sqrtss {0}, {0}", inout(xmm_reg) x => result); }
+        return result;
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        let result: f32;
+        unsafe { core::arch::asm!("fsqrt {0:s}, {0:s}", inout(vreg) x => result); }
+        return result;
+    }
+}
 
 #[no_mangle]
 pub extern "C" fn fabs(x: f64) -> f64 { f64::from_bits(x.to_bits() & !(1u64 << 63)) }
@@ -270,6 +295,3 @@ pub extern "C" fn isinf(x: f64) -> i32 { x.is_infinite() as i32 }
 
 #[no_mangle]
 pub extern "C" fn isfinite(x: f64) -> i32 { x.is_finite() as i32 }
-
-#[inline(never)]
-pub fn _libc_math_init() {}

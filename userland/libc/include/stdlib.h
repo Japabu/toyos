@@ -14,8 +14,10 @@ void free(void *ptr);
 
 void exit(int status);
 void _exit(int status);
+void _Exit(int status);
 void abort(void);
 int atexit(void (*func)(void));
+int system(const char *command);
 
 int atoi(const char *s);
 long atol(const char *s);
