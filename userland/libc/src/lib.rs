@@ -50,7 +50,7 @@ mod runtime {
 
     impl core::fmt::Write for Stderr {
         fn write_str(&mut self, s: &str) -> core::fmt::Result {
-            let _ = toyos_abi::syscall::write(toyos_abi::syscall::Fd(2), s.as_bytes());
+            let _ = toyos_abi::syscall::write(toyos_abi::Fd(2), s.as_bytes());
             Ok(())
         }
     }

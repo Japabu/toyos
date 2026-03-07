@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::os::fd::AsRawFd;
-use std::os::toyos::io as toyos_io;
+use toyos_abi::Fd;
 use std::os::toyos::message::{self, Message};
 use std::os::toyos::net as toyos_nic;
 use std::os::toyos::pipe as toyos_pipe;
@@ -35,20 +35,17 @@ impl DmaNic {
     fn new() -> Self {
         use std::io::Read;
 
-        // Claim the NIC device
         let mut nic_file = toyos_device::open_nic().expect("netd: failed to claim NIC device");
 
-        // Read NicInfo from the device fd
         let mut info_bytes = [0u8; core::mem::size_of::<toyos_abi::net::NicInfo>()];
         nic_file.read_exact(&mut info_bytes).expect("netd: failed to read NicInfo");
         let info: toyos_abi::net::NicInfo = unsafe { core::ptr::read(info_bytes.as_ptr() as *const _) };
 
-        // Map all DMA buffers into our address space (each is one 4096-byte page)
         let mut rx_bufs = [core::ptr::null::<u8>(); 3];
         for i in 0..info.rx_buf_count as usize {
             let region = shm::SharedMemory::map(info.rx_buf_tokens[i], 4096);
             rx_bufs[i] = region.as_ptr() as *const u8;
-            std::mem::forget(region); // keep mapped for lifetime of process
+            std::mem::forget(region);
         }
         let tx_region = shm::SharedMemory::map(info.tx_buf_token, 4096);
         let tx_ptr = tx_region.as_ptr();
@@ -129,7 +126,6 @@ impl<'a> phy::TxToken for DmaTxToken<'a> {
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        // Zero the net header, then let smoltcp write the frame after it
         unsafe {
             core::ptr::write_bytes(self.tx_buf, 0, self.net_hdr_size);
             let frame = core::slice::from_raw_parts_mut(
@@ -166,23 +162,39 @@ struct PendingDns {
 /// A piped TCP connection: data flows through kernel pipes instead of IPC messages.
 struct PipedConnection {
     handle: SocketHandle,
-    rx_write_fd: i32,
-    tx_read_fd: i32,
+    rx_write_fd: Option<Fd>,
+    tx_read_fd: Option<Fd>,
     rx_ring: *const toyos_abi::ring::RingHeader,
     tx_ring: *const toyos_abi::ring::RingHeader,
 }
 
-fn map_pipe_ring(fd: i32) -> *const toyos_abi::ring::RingHeader {
-    toyos_abi::syscall::pipe_map(toyos_abi::syscall::Fd(fd))
-        .expect("pipe_map failed") as *const toyos_abi::ring::RingHeader
+impl PipedConnection {
+    fn close_rx(&mut self) {
+        if let Some(fd) = self.rx_write_fd.take() {
+            toyos_abi::syscall::close(fd);
+        }
+    }
+
+    fn close_tx(&mut self) {
+        if let Some(fd) = self.tx_read_fd.take() {
+            toyos_abi::syscall::close(fd);
+        }
+    }
+
+    fn close_all(&mut self) {
+        self.close_rx();
+        self.close_tx();
+    }
+
+    fn is_fully_closed(&self) -> bool {
+        self.rx_write_fd.is_none() && self.tx_read_fd.is_none()
+    }
 }
 
 /// A piped TCP listener: netd writes 1 byte to notify pipe on new connection.
 struct PipedListener {
     handle: SocketHandle,
-    #[allow(dead_code)]
-    local_port: u16,
-    notify_write_fd: i32,
+    notify_write_fd: Fd,
     notified: bool,
 }
 
@@ -193,6 +205,52 @@ struct PendingPipedConnect {
     rx_pipe_id: u64,
     tx_pipe_id: u64,
     deadline: Option<Instant>,
+}
+
+/// Convert a std::fs::File into an Fd, consuming ownership without running the destructor.
+fn file_into_fd(file: std::fs::File) -> Fd {
+    let fd = Fd(file.as_raw_fd());
+    std::mem::forget(file);
+    fd
+}
+
+fn map_pipe_ring(fd: Fd) -> *const toyos_abi::ring::RingHeader {
+    toyos_abi::syscall::pipe_map(fd)
+        .expect("pipe_map failed") as *const toyos_abi::ring::RingHeader
+}
+
+/// Open a pipe by ID and return the fd. `read_end=true` opens for reading, false for writing.
+fn open_pipe_fd(pipe_id: u64, read_end: bool) -> Option<Fd> {
+    toyos_pipe::open_by_id(pipe_id, read_end).ok().map(file_into_fd)
+}
+
+/// Open rx (write) and tx (read) pipe fds and create a PipedConnection.
+fn open_piped_connection(handle: SocketHandle, rx_pipe_id: u64, tx_pipe_id: u64) -> Option<PipedConnection> {
+    let rx_write_fd = open_pipe_fd(rx_pipe_id, false)?;
+    let tx_read_fd = match open_pipe_fd(tx_pipe_id, true) {
+        Some(fd) => fd,
+        None => {
+            toyos_abi::syscall::close(rx_write_fd);
+            return None;
+        }
+    };
+    Some(PipedConnection {
+        handle,
+        rx_write_fd: Some(rx_write_fd),
+        tx_read_fd: Some(tx_read_fd),
+        rx_ring: map_pipe_ring(rx_write_fd),
+        tx_ring: map_pipe_ring(tx_read_fd),
+    })
+}
+
+/// Build a UDP recv response: [addr:4][port:2][pad:2][data:n]
+fn build_udp_recv_response(addr: [u8; 4], port: u16, data: &[u8]) -> Vec<u8> {
+    let mut resp = Vec::with_capacity(8 + data.len());
+    resp.extend_from_slice(&addr);
+    resp.extend_from_slice(&port.to_le_bytes());
+    resp.extend_from_slice(&[0, 0]);
+    resp.extend_from_slice(data);
+    resp
 }
 
 struct NetDaemon {
@@ -214,7 +272,7 @@ impl NetDaemon {
             sockets: HashMap::new(),
             owners: HashMap::new(),
             next_id: 1,
-            next_local_port: 49152, // start of ephemeral range
+            next_local_port: 49152,
             pending_udp_recvs: Vec::new(),
             pending_dns: Vec::new(),
             dns_handle,
@@ -267,25 +325,21 @@ impl NetDaemon {
     }
 
     fn handle_tcp_close(&mut self, sender: u32, msg: Message, socket_set: &mut SocketSet<'_>) {
-        let req: TcpCloseRequest = msg.take_payload();
+        let req: SocketCloseRequest = msg.take_payload();
         if let Some(kind) = self.sockets.remove(&req.socket_id) {
             match kind {
                 SocketKind::TcpStream(handle) => {
                     socket_set.get_mut::<tcp::Socket>(handle).close();
                     socket_set.remove(handle);
-                    // Clean up any piped connection using this handle
                     if let Some(pos) = self.piped_connections.iter().position(|c| c.handle == handle) {
-                        let conn = self.piped_connections.swap_remove(pos);
-                        if conn.rx_write_fd >= 0 { toyos_io::close(conn.rx_write_fd); }
-                        if conn.tx_read_fd >= 0 { toyos_io::close(conn.tx_read_fd); }
+                        self.piped_connections.swap_remove(pos).close_all();
                     }
                 }
                 SocketKind::TcpListener(handle) => {
                     socket_set.get_mut::<tcp::Socket>(handle).abort();
                     socket_set.remove(handle);
-                    // Clean up piped listener
                     if let Some(listener) = self.piped_listeners.remove(&req.socket_id) {
-                        toyos_io::close(listener.notify_write_fd);
+                        toyos_abi::syscall::close(listener.notify_write_fd);
                     }
                 }
                 SocketKind::Udp(handle) => {
@@ -310,7 +364,6 @@ impl NetDaemon {
             return;
         };
         let socket = socket_set.get_mut::<tcp::Socket>(*handle);
-        // smoltcp only supports closing the write side (FIN)
         if req.how == 1 || req.how == 2 {
             socket.close();
         }
@@ -359,7 +412,6 @@ impl NetDaemon {
         msg: Message,
         socket_set: &mut SocketSet<'_>,
     ) {
-        // Format: [socket_id:4][addr:4][port:2][pad:2][data...]
         let bytes = msg.take_bytes();
         if bytes.len() < 12 {
             Self::send_error(sender, ERR_INVALID_INPUT);
@@ -385,6 +437,24 @@ impl NetDaemon {
         }
     }
 
+    fn send_udp_recv_response(pid: u32, socket: &mut udp::Socket, max_len: u32) -> bool {
+        if !socket.can_recv() {
+            return false;
+        }
+        let mut buf = vec![0u8; max_len as usize];
+        match socket.recv_slice(&mut buf) {
+            Ok((n, endpoint)) => {
+                let addr = match endpoint.endpoint.addr {
+                    IpAddress::Ipv4(a) => a.octets(),
+                };
+                let resp = build_udp_recv_response(addr, endpoint.endpoint.port, &buf[..n]);
+                message::send(pid, Message::from_bytes(MSG_RESULT, &resp)).ok();
+            }
+            Err(_) => Self::send_error(pid, ERR_OTHER),
+        }
+        true
+    }
+
     fn handle_udp_recv_from(
         &mut self,
         sender: u32,
@@ -398,28 +468,10 @@ impl NetDaemon {
         };
         let socket = socket_set.get_mut::<udp::Socket>(*handle);
 
-        if socket.can_recv() {
-            let mut buf = vec![0u8; req.max_len as usize];
-            match socket.recv_slice(&mut buf) {
-                Ok((n, endpoint)) => {
-                    let addr = match endpoint.endpoint.addr {
-                        IpAddress::Ipv4(a) => a.octets(),
-                    };
-                    let port = endpoint.endpoint.port;
-                    // Response: [addr:4][port:2][pad:2][data:n]
-                    let mut resp = Vec::with_capacity(8 + n);
-                    resp.extend_from_slice(&addr);
-                    resp.extend_from_slice(&port.to_le_bytes());
-                    resp.extend_from_slice(&[0, 0]);
-                    resp.extend_from_slice(&buf[..n]);
-                    message::send(sender, Message::from_bytes(MSG_RESULT, &resp)).ok();
-                }
-                Err(_) => Self::send_error(sender, ERR_OTHER),
-            }
+        if Self::send_udp_recv_response(sender, socket, req.max_len) {
             return;
         }
 
-        // No data — queue for later
         self.pending_udp_recvs.push(PendingUdpRecv {
             client_pid: sender,
             socket_id: req.socket_id,
@@ -429,7 +481,7 @@ impl NetDaemon {
     }
 
     fn handle_udp_close(&mut self, sender: u32, msg: Message, socket_set: &mut SocketSet<'_>) {
-        let req: TcpCloseRequest = msg.take_payload();
+        let req: SocketCloseRequest = msg.take_payload();
         if let Some(SocketKind::Udp(handle)) = self.sockets.remove(&req.socket_id) {
             socket_set.get_mut::<udp::Socket>(handle).close();
             socket_set.remove(handle);
@@ -454,11 +506,10 @@ impl NetDaemon {
             }
         };
 
-        // Try parsing as IP literal first
         if let Ok(ip) = hostname.parse::<std::net::Ipv4Addr>() {
             let octets = ip.octets();
-            let mut resp = vec![1u8]; // count=1
-            resp.push(4); // type=IPv4
+            let mut resp = vec![1u8];
+            resp.push(4);
             resp.extend_from_slice(&octets);
             message::send(sender, Message::from_bytes(MSG_RESULT, &resp)).ok();
             return;
@@ -585,20 +636,13 @@ impl NetDaemon {
         self.sockets.insert(socket_id, SocketKind::TcpListener(handle));
         self.owners.insert(socket_id, sender);
 
-        // Open the notify pipe write end
-        let notify_file = match toyos_pipe::open_by_id(req.notify_pipe_id, false) {
-            Ok(f) => f,
-            Err(_) => {
-                Self::send_error(sender, ERR_INVALID_INPUT);
-                return;
-            }
+        let Some(notify_write_fd) = open_pipe_fd(req.notify_pipe_id, false) else {
+            Self::send_error(sender, ERR_INVALID_INPUT);
+            return;
         };
-        let notify_write_fd = notify_file.as_raw_fd();
-        std::mem::forget(notify_file); // keep fd open, managed manually
 
         self.piped_listeners.insert(socket_id, PipedListener {
             handle,
-            local_port: port,
             notify_write_fd,
             notified: false,
         });
@@ -634,41 +678,16 @@ impl NetDaemon {
             IpAddress::Ipv4(a) => a.octets(),
         };
 
-        // Move listener socket to a piped stream
         let old_handle = listener.handle;
         let stream_id = self.alloc_id();
         self.sockets.insert(stream_id, SocketKind::TcpStream(old_handle));
         self.owners.insert(stream_id, sender);
 
-        // Open pipe fds for this connection
-        let rx_write_file = match toyos_pipe::open_by_id(req.rx_pipe_id, false) {
-            Ok(f) => f,
-            Err(_) => {
-                Self::send_error(sender, ERR_INVALID_INPUT);
-                return;
-            }
+        let Some(conn) = open_piped_connection(old_handle, req.rx_pipe_id, req.tx_pipe_id) else {
+            Self::send_error(sender, ERR_INVALID_INPUT);
+            return;
         };
-        let rx_write_fd = rx_write_file.as_raw_fd();
-        std::mem::forget(rx_write_file);
-
-        let tx_read_file = match toyos_pipe::open_by_id(req.tx_pipe_id, true) {
-            Ok(f) => f,
-            Err(_) => {
-                toyos_io::close(rx_write_fd);
-                Self::send_error(sender, ERR_INVALID_INPUT);
-                return;
-            }
-        };
-        let tx_read_fd = tx_read_file.as_raw_fd();
-        std::mem::forget(tx_read_file);
-
-        self.piped_connections.push(PipedConnection {
-            handle: old_handle,
-            rx_write_fd,
-            tx_read_fd,
-            rx_ring: map_pipe_ring(rx_write_fd),
-            tx_ring: map_pipe_ring(tx_read_fd),
-        });
+        self.piped_connections.push(conn);
 
         // Create replacement listener
         let rx_buf = tcp::SocketBuffer::new(vec![0u8; 65536]);
@@ -678,7 +697,6 @@ impl NetDaemon {
         let new_handle = socket_set.add(new_listener);
         self.sockets.insert(req.socket_id, SocketKind::TcpListener(new_handle));
 
-        // Update the piped listener's handle and reset notification flag
         if let Some(pl) = self.piped_listeners.get_mut(&req.socket_id) {
             pl.handle = new_handle;
             pl.notified = false;
@@ -721,24 +739,21 @@ impl NetDaemon {
             }
 
             // Signal EOF to client when remote has closed and all data is drained
-            if !socket.may_recv() && !socket.can_recv() && conn.rx_write_fd >= 0 {
-                toyos_io::close(conn.rx_write_fd);
-                conn.rx_write_fd = -1;
+            if !socket.may_recv() && !socket.can_recv() && conn.rx_write_fd.is_some() {
+                conn.close_rx();
             }
 
             // Signal broken pipe when client has stopped reading
-            if conn.tx_read_fd >= 0 && tx_ring.is_reader_closed() {
-                toyos_io::close(conn.tx_read_fd);
-                conn.tx_read_fd = -1;
+            if conn.tx_read_fd.is_some() && tx_ring.is_reader_closed() {
+                conn.close_tx();
             }
 
             // Fully clean up when both sides are done
-            if conn.rx_write_fd < 0 && conn.tx_read_fd < 0 && !socket.is_open() {
+            if conn.is_fully_closed() && !socket.is_open() {
                 closed.push(i);
             }
         }
 
-        // Clean up fully closed piped connections (reverse order to preserve indices)
         for &i in closed.iter().rev() {
             self.piped_connections.swap_remove(i);
         }
@@ -749,8 +764,7 @@ impl NetDaemon {
         for (_, listener) in &mut self.piped_listeners {
             let socket = socket_set.get_mut::<tcp::Socket>(listener.handle);
             if socket.is_active() && !listener.notified {
-                // New connection arrived — notify client by writing 1 byte
-                let _ = toyos_io::write_nonblock(listener.notify_write_fd, &[1]);
+                let _ = toyos_abi::syscall::write_nonblock(listener.notify_write_fd, &[1]);
                 listener.notified = true;
             }
         }
@@ -771,24 +785,9 @@ impl NetDaemon {
             };
             let handle = *handle;
             let socket = socket_set.get_mut::<udp::Socket>(handle);
-            if socket.can_recv() {
-                let mut buf = vec![0u8; pr.max_len as usize];
-                let client = pr.client_pid;
-                match socket.recv_slice(&mut buf) {
-                    Ok((n, endpoint)) => {
-                        let addr = match endpoint.endpoint.addr {
-                            IpAddress::Ipv4(a) => a.octets(),
-                        };
-                        let port = endpoint.endpoint.port;
-                        let mut resp = Vec::with_capacity(8 + n);
-                        resp.extend_from_slice(&addr);
-                        resp.extend_from_slice(&port.to_le_bytes());
-                        resp.extend_from_slice(&[0, 0]);
-                        resp.extend_from_slice(&buf[..n]);
-                        message::send(client, Message::from_bytes(MSG_RESULT, &resp)).ok();
-                    }
-                    Err(_) => Self::send_error(client, ERR_OTHER),
-                }
+            let client = pr.client_pid;
+            let max_len = pr.max_len;
+            if Self::send_udp_recv_response(client, socket, max_len) {
                 self.pending_udp_recvs.swap_remove(i);
                 continue;
             }
@@ -839,38 +838,13 @@ impl NetDaemon {
             let pc = &self.pending_piped_connects[i];
             let socket = socket_set.get_mut::<tcp::Socket>(pc.handle);
             if socket.may_send() {
-                // Connected — open pipe fds and register piped connection
                 let local_port = socket.local_endpoint().map(|e| e.port).unwrap_or(0);
-                let rx_write_file = match toyos_pipe::open_by_id(pc.rx_pipe_id, false) {
-                    Ok(f) => f,
-                    Err(_) => {
-                        Self::send_error(pc.client_pid, ERR_OTHER);
-                        self.pending_piped_connects.swap_remove(i);
-                        continue;
-                    }
+                let Some(conn) = open_piped_connection(pc.handle, pc.rx_pipe_id, pc.tx_pipe_id) else {
+                    Self::send_error(pc.client_pid, ERR_OTHER);
+                    self.pending_piped_connects.swap_remove(i);
+                    continue;
                 };
-                let rx_write_fd = rx_write_file.as_raw_fd();
-                std::mem::forget(rx_write_file);
-
-                let tx_read_file = match toyos_pipe::open_by_id(pc.tx_pipe_id, true) {
-                    Ok(f) => f,
-                    Err(_) => {
-                        toyos_io::close(rx_write_fd);
-                        Self::send_error(pc.client_pid, ERR_OTHER);
-                        self.pending_piped_connects.swap_remove(i);
-                        continue;
-                    }
-                };
-                let tx_read_fd = tx_read_file.as_raw_fd();
-                std::mem::forget(tx_read_file);
-
-                self.piped_connections.push(PipedConnection {
-                    handle: pc.handle,
-                    rx_write_fd,
-                    tx_read_fd,
-                    rx_ring: map_pipe_ring(rx_write_fd),
-                    tx_ring: map_pipe_ring(tx_read_fd),
-                });
+                self.piped_connections.push(conn);
 
                 let resp = TcpConnectResponse {
                     socket_id: pc.socket_id,
@@ -927,7 +901,6 @@ fn main() {
 
     let mut socket_set = SocketSet::new(vec![]);
 
-    // DNS socket
     let dns_servers = &[IpAddress::v4(10, 0, 2, 3)];
     let dns_socket = dns::Socket::new(dns_servers, vec![]);
     let dns_handle = socket_set.add(dns_socket);
@@ -939,20 +912,13 @@ fn main() {
     loop {
         let now = SmoltcpInstant::from_millis(epoch.elapsed().as_millis() as i64);
 
-        // Try to receive a frame
         device.try_recv();
-
-        // Drive the stack
         iface.poll(now, &mut device, &mut socket_set);
 
-        // Process completed async operations
         daemon.process_pending(&mut socket_set);
-
-        // Bridge piped connections (smoltcp ↔ pipes)
         daemon.bridge_piped(&mut socket_set);
         daemon.check_piped_listeners(&mut socket_set);
 
-        // Calculate sleep time
         let delay = iface.poll_delay(now, &socket_set);
         let mut timeout = match delay {
             Some(d) if d.total_millis() > 0 => Duration::from_millis(d.total_millis() as u64).min(Duration::from_millis(50)),
@@ -960,7 +926,6 @@ fn main() {
             None => Duration::from_millis(50),
         };
 
-        // If there are pending operations or active piped connections, poll more aggressively
         let has_pending = !daemon.pending_udp_recvs.is_empty()
             || !daemon.pending_dns.is_empty()
             || !daemon.pending_piped_connects.is_empty()
@@ -969,16 +934,13 @@ fn main() {
             timeout = timeout.min(Duration::from_millis(1));
         }
 
-        // Wait for IPC messages or timeout
         let result = toyos_poll::poll(&[], Some(timeout));
 
         if result.has_messages() {
-            // Drain all messages
             loop {
                 let msg = message::recv();
                 daemon.handle_message(msg, &mut socket_set, &mut iface);
 
-                // Check for more messages (non-blocking)
                 let check = toyos_poll::poll(&[], Some(Duration::ZERO));
                 if !check.has_messages() {
                     break;

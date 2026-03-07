@@ -335,7 +335,6 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             sys_write_nonblock(a1 as u32, buf)
         }
         SYS_PIPE_OPEN => sys_pipe_open(a1, a2),
-        SYS_PIPE_WITH_CAPACITY => sys_pipe_with_capacity(a1 as usize),
         SYS_PIPE_ID => sys_pipe_id(a1 as u32),
         SYS_AUDIO_WRITE => {
             let Some(buf) = ctx.user_slice(a1, a2) else { return bad_addr };
@@ -564,15 +563,6 @@ fn sys_set_keyboard_layout(name: &str) -> u64 {
 
 fn sys_pipe() -> u64 {
     let pipe_id = pipe::create();
-    process::with_fd_owner_mut(|proc| {
-        let read_fd = fd::alloc(&mut proc.fds, fd::Descriptor::PipeRead(pipe_id)) as u64;
-        let write_fd = fd::alloc(&mut proc.fds, fd::Descriptor::PipeWrite(pipe_id)) as u64;
-        (read_fd << 32) | write_fd
-    })
-}
-
-fn sys_pipe_with_capacity(capacity: usize) -> u64 {
-    let pipe_id = pipe::create_with_capacity(capacity);
     process::with_fd_owner_mut(|proc| {
         let read_fd = fd::alloc(&mut proc.fds, fd::Descriptor::PipeRead(pipe_id)) as u64;
         let write_fd = fd::alloc(&mut proc.fds, fd::Descriptor::PipeWrite(pipe_id)) as u64;

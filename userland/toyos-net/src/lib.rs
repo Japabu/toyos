@@ -8,7 +8,8 @@
 
 use core::sync::atomic::{AtomicU32, Ordering};
 use toyos_abi::message::{self, ReceivedMessage};
-use toyos_abi::syscall::{self, Fd, Pid};
+use toyos_abi::{Fd, Pid};
+use toyos_abi::syscall;
 
 // ---------------------------------------------------------------------------
 // netd IPC protocol — message types
@@ -76,7 +77,7 @@ pub struct TcpConnectResponse {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub struct TcpCloseRequest {
+pub struct SocketCloseRequest {
     pub socket_id: u32,
 }
 
@@ -292,15 +293,13 @@ fn request<Req: Copy, Resp: Copy>(msg_type: u32, payload: &Req) -> Result<Resp, 
 // TCP client functions
 // ---------------------------------------------------------------------------
 
-const TCP_PIPE_CAPACITY: usize = 65536;
-
 pub fn tcp_connect(
     addr: [u8; 4],
     port: u16,
     timeout_ms: u32,
 ) -> Result<TcpConnection, NetError> {
-    let rx_pipe = syscall::pipe_with_capacity(TCP_PIPE_CAPACITY);
-    let tx_pipe = syscall::pipe_with_capacity(TCP_PIPE_CAPACITY);
+    let rx_pipe = syscall::pipe();
+    let tx_pipe = syscall::pipe();
 
     let rx_pipe_id = syscall::pipe_id(rx_pipe.write).map_err(|_| NetError::Syscall)?;
     let tx_pipe_id = syscall::pipe_id(tx_pipe.read).map_err(|_| NetError::Syscall)?;
@@ -369,8 +368,8 @@ pub fn tcp_bind(addr: [u8; 4], port: u16) -> Result<TcpBound, NetError> {
 }
 
 pub fn tcp_accept(socket_id: u32) -> Result<TcpAccepted, NetError> {
-    let rx_pipe = syscall::pipe_with_capacity(TCP_PIPE_CAPACITY);
-    let tx_pipe = syscall::pipe_with_capacity(TCP_PIPE_CAPACITY);
+    let rx_pipe = syscall::pipe();
+    let tx_pipe = syscall::pipe();
 
     let rx_pipe_id = syscall::pipe_id(rx_pipe.write).map_err(|_| NetError::Syscall)?;
     let tx_pipe_id = syscall::pipe_id(tx_pipe.read).map_err(|_| NetError::Syscall)?;
@@ -413,7 +412,7 @@ pub fn tcp_shutdown(socket_id: u32, how: u32) -> Result<(), NetError> {
 }
 
 pub fn tcp_close(socket_id: u32) {
-    let _ = request::<_, [u8; 0]>(MSG_TCP_CLOSE, &TcpCloseRequest { socket_id });
+    let _ = request::<_, [u8; 0]>(MSG_TCP_CLOSE, &SocketCloseRequest { socket_id });
 }
 
 pub fn tcp_set_option(socket_id: u32, option: u32, value: u32) -> Result<(), NetError> {
@@ -449,5 +448,5 @@ pub fn udp_bind(addr: [u8; 4], port: u16) -> Result<UdpBound, NetError> {
 }
 
 pub fn udp_close(socket_id: u32) {
-    let _ = request::<_, [u8; 0]>(MSG_UDP_CLOSE, &TcpCloseRequest { socket_id });
+    let _ = request::<_, [u8; 0]>(MSG_UDP_CLOSE, &SocketCloseRequest { socket_id });
 }

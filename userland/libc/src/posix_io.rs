@@ -4,7 +4,8 @@
 
 use core::ptr;
 
-use toyos_abi::syscall::{self, Fd, OpenFlags, SeekFrom};
+use toyos_abi::Fd;
+use toyos_abi::syscall::{self, OpenFlags, SeekFrom};
 
 // ---------------------------------------------------------------------------
 // Constants (matching POSIX / Linux values)

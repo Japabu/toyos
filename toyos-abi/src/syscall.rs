@@ -64,7 +64,6 @@ pub const SYS_KILL: u64 = 65;
 pub const SYS_READ_NONBLOCK: u64 = 66;
 pub const SYS_WRITE_NONBLOCK: u64 = 67;
 pub const SYS_PIPE_OPEN: u64 = 68;
-pub const SYS_PIPE_WITH_CAPACITY: u64 = 69;
 pub const SYS_PIPE_ID: u64 = 70;
 pub const SYS_AUDIO_WRITE: u64 = 71;
 pub const SYS_EXIT: u64 = 72;
@@ -95,30 +94,7 @@ pub struct SpawnArgs {
     pub env_len: u64,
 }
 
-/// A file descriptor.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Fd(pub i32);
-
-/// A process ID.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct Pid(pub u32);
-
-impl Pid {
-    pub const MAX: Self = Pid(u32::MAX);
-    pub fn raw(self) -> u32 { self.0 }
-    pub fn from_raw(v: u32) -> Self { Pid(v) }
-}
-
-impl core::fmt::Display for Pid {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl core::ops::Add for Pid {
-    type Output = Self;
-    fn add(self, rhs: Self) -> Self { Pid(self.0 + rhs.0) }
-}
+use crate::{Fd, Pid};
 
 /// Syscall error with a specific code. Values occupy the top of the u64 range:
 /// error code N is encoded as `u64::MAX - N`. Any return value `>= u64::MAX - 255`
@@ -879,15 +855,6 @@ pub fn write_nonblock(fd: Fd, buf: &[u8]) -> Result<usize, SyscallError> {
 /// Returns a new file descriptor for the pipe.
 pub fn pipe_open(pipe_id: u64, mode: u64) -> Result<Fd, SyscallError> {
     check(syscall(SYS_PIPE_OPEN, pipe_id, mode, 0, 0)).map(|v| Fd(v as i32))
-}
-
-/// Create a pipe with a specific buffer capacity. Returns read and write fds.
-pub fn pipe_with_capacity(capacity: usize) -> PipeFds {
-    let raw = syscall(SYS_PIPE_WITH_CAPACITY, capacity as u64, 0, 0, 0);
-    PipeFds {
-        read: Fd((raw >> 32) as i32),
-        write: Fd((raw & 0xFFFF_FFFF) as i32),
-    }
 }
 
 /// Get the internal pipe ID for a pipe/tty file descriptor.

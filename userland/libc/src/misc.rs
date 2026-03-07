@@ -3,6 +3,7 @@
 use core::ptr;
 use core::sync::atomic::{AtomicU32, Ordering};
 
+use toyos_abi::Pid;
 use toyos_abi::syscall;
 
 // ---------------------------------------------------------------------------
@@ -117,7 +118,7 @@ pub unsafe extern "C" fn waitpid(pid: i32, status: *mut i32, _options: i32) -> i
         super::stdio::errno = ECHILD;
         return -1;
     }
-    let code = syscall::waitpid(syscall::Pid(pid as u32));
+    let code = syscall::waitpid(Pid(pid as u32));
     if !status.is_null() {
         // Encode exit code in wait status format (exit_code << 8)
         *status = (code as i32) << 8;

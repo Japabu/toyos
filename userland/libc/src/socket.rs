@@ -3,7 +3,8 @@
 use alloc::alloc::{alloc as heap_alloc, dealloc as heap_dealloc};
 use alloc::vec::Vec;
 use core::ptr;
-use toyos_abi::syscall::{self, Fd};
+use toyos_abi::Fd;
+use toyos_abi::syscall;
 use toyos_net::*;
 
 // ---------------------------------------------------------------------------

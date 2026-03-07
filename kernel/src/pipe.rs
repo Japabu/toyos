@@ -74,12 +74,6 @@ pub fn create() -> PipeId {
     with_pipes_mut(|pipes| pipes.insert(Pipe::new()))
 }
 
-#[must_use]
-pub fn create_with_capacity(_capacity: usize) -> PipeId {
-    // All pipes now use a 2MB shared-memory ring buffer
-    create()
-}
-
 pub fn exists(pipe_id: PipeId) -> bool {
     with_pipes(|pipes| pipes.get(pipe_id).is_some())
 }
