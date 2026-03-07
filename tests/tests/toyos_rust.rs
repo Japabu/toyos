@@ -1,71 +1,43 @@
 use std::path::Path;
+use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 use toyos_tests::compile;
-use toyos_tests::qemu::{self, QemuInstance};
+use toyos_tests::qemu::{self, QemuInstance, TestResult};
 
-#[test]
-fn toyos_rust_tests() {
+static QEMU: LazyLock<Mutex<QemuInstance>> = LazyLock::new(|| {
     let repo = compile::repo_root();
     let rust_tests_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("toyos-rust-tests");
 
-    if !rust_tests_dir.join("Cargo.toml").exists() {
-        eprintln!("No toyos-rust-tests crate found, skipping");
-        return;
-    }
+    assert!(
+        rust_tests_dir.join("Cargo.toml").exists(),
+        "No toyos-rust-tests crate found"
+    );
 
     let toyos_ld = qemu_toyos_ld(&repo);
     let rust_bins = qemu::build_toyos_bins(&rust_tests_dir, &toyos_ld);
 
-    if rust_bins.is_empty() {
-        eprintln!("No Rust test binaries found, skipping");
-        return;
+    assert!(!rust_bins.is_empty(), "No Rust test binaries found");
+
+    Mutex::new(QemuInstance::boot(&[], &rust_bins))
+});
+
+fn check_test_result(result: &TestResult) {
+    let test_name = result.name.strip_prefix("test_rs_").unwrap_or(&result.name);
+
+    if let Some(err) = &result.error {
+        panic!("FAIL {test_name}: {err}");
     }
 
-    let mut qemu = QemuInstance::boot(&[], &rust_bins);
-
-    let mut failures = Vec::new();
-    let mut passed = 0usize;
-    let test_bins: Vec<_> = rust_bins.iter().filter(|(name, _)| !name.ends_with(".so")).collect();
-    let total = test_bins.len();
-
-    for (name, _) in &test_bins {
-        let test_name = format!("test_rs_{name}");
-        let result = qemu.run_test(&test_name, Duration::from_secs(30));
-        let display_name = result.name.strip_prefix("test_rs_").unwrap_or(&result.name);
-
-        if let Some(err) = &result.error {
-            eprintln!("FAIL {display_name}: error: {err}");
-            failures.push(format!("{display_name}: error: {err}"));
-            continue;
-        }
-
-        match result.exit_code {
-            Some(0) => {
-                eprintln!("PASS {display_name}");
-                passed += 1;
-            }
-            Some(code) => {
-                eprintln!("FAIL {display_name}: exited with code {code}");
-                failures.push(format!(
-                    "{display_name}: exited with code {code}\nstdout:\n{}",
-                    result.stdout
-                ));
-            }
-            None => {
-                eprintln!("FAIL {display_name}: no exit code");
-                failures.push(format!("{display_name}: no exit code\nstdout:\n{}", result.stdout));
-            }
-        }
-    }
-
-    eprintln!("\n{passed}/{total} Rust tests passed");
-
-    if !failures.is_empty() {
-        panic!(
-            "{} Rust test(s) failed:\n\n{}",
-            failures.len(),
-            failures.join("\n\n")
-        );
+    match result.exit_code {
+        Some(0) => {}
+        Some(code) => panic!(
+            "FAIL {test_name}: exited with code {code}\nstdout:\n{}",
+            result.stdout
+        ),
+        None => panic!(
+            "FAIL {test_name}: no exit code\nstdout:\n{}",
+            result.stdout
+        ),
     }
 }
 
@@ -87,3 +59,33 @@ fn qemu_toyos_ld(repo: &Path) -> std::path::PathBuf {
     );
     path.canonicalize().expect("toyos-ld binary not found")
 }
+
+macro_rules! toyos_rust_tests {
+    ($($name:ident),* $(,)?) => {
+        $(
+            #[test]
+            fn $name() {
+                let result = {
+                    let mut qemu = QEMU.lock().unwrap_or_else(|e| e.into_inner());
+                    qemu.run_test(
+                        &format!("test_rs_{}", stringify!($name)),
+                        Duration::from_secs(30),
+                    )
+                };
+                check_test_result(&result);
+            }
+        )*
+    };
+}
+
+toyos_rust_tests!(
+    std_alloc,
+    std_fs,
+    std_fs_write,
+    std_io,
+    std_mmap,
+    std_process,
+    std_sync,
+    std_threading,
+    std_tls,
+);

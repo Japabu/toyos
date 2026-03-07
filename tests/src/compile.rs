@@ -229,16 +229,17 @@ fn run_with_timeout(cmd: &mut Command, name: &str, label: &str) -> Output {
     }
 }
 
-/// Compile, link with system libc, run a C test on the host.
-pub fn run_host_test_system_libc(name: &str, args: &[&str], target: Option<&str>) {
+/// Link, run, and check a pre-compiled C test against system libc.
+pub fn run_host_test_system_libc_with_objs(
+    obj: &[u8], extras: &[Vec<u8>], name: &str, args: &[&str], target: Option<&str>,
+) {
     let label = format!("syslibc-{}", target.unwrap_or("native"));
     let dir = testcases_dir();
     let expect_file = dir.join(format!("{name}.expect"));
     assert!(expect_file.exists(), "missing expect file: {}", expect_file.display());
     let expected = fs::read_to_string(&expect_file).unwrap();
 
-    let (obj, extras) = compile_c(name, target);
-    let bin = link_with_system_cc(&obj, &extras, name, target);
+    let bin = link_with_system_cc(obj, extras, name, target);
 
     #[cfg(unix)]
     {
@@ -278,16 +279,23 @@ pub fn run_host_test_system_libc(name: &str, args: &[&str], target: Option<&str>
     );
 }
 
-/// Compile, link, and run a C test on the host. Compares output against .expect file.
-pub fn run_host_test(name: &str, args: &[&str], target: Option<&str>) {
+/// Compile, link with system libc, run a C test on the host.
+pub fn run_host_test_system_libc(name: &str, args: &[&str], target: Option<&str>) {
+    let (obj, extras) = compile_c(name, target);
+    run_host_test_system_libc_with_objs(&obj, &extras, name, args, target);
+}
+
+/// Link, run, and check a pre-compiled C test against toyos-libc.
+pub fn run_host_test_with_objs(
+    obj: &[u8], extras: &[Vec<u8>], name: &str, args: &[&str], target: Option<&str>,
+) {
     let label = target.unwrap_or("native");
     let dir = testcases_dir();
     let expect_file = dir.join(format!("{name}.expect"));
     assert!(expect_file.exists(), "missing expect file: {}", expect_file.display());
     let expected = fs::read_to_string(&expect_file).unwrap();
 
-    let (obj, extras) = compile_c(name, target);
-    let linked = link_host(&obj, &extras, name, target);
+    let linked = link_host(obj, extras, name, target);
 
     // Write binary
     let pid = std::process::id();
@@ -331,4 +339,10 @@ pub fn run_host_test(name: &str, args: &[&str], target: Option<&str>) {
         expected.trim_end(),
         actual.trim_end(),
     );
+}
+
+/// Compile, link, and run a C test on the host. Compares output against .expect file.
+pub fn run_host_test(name: &str, args: &[&str], target: Option<&str>) {
+    let (obj, extras) = compile_c(name, target);
+    run_host_test_with_objs(&obj, &extras, name, args, target);
 }
