@@ -19,9 +19,7 @@ pub fn http_proxy(http: &CargoHttpConfig) -> Option<String> {
     if let Some(s) = &http.proxy {
         return Some(s.into());
     }
-    git2::Config::open_default()
-        .and_then(|cfg| cfg.get_string("http.proxy"))
-        .ok()
+    crate::sources::git::backend::git_config_string("http.proxy")
 }
 
 /// Determine if an http proxy exists.

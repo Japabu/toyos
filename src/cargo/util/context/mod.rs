@@ -86,8 +86,8 @@ use crate::sources::CRATES_IO_REGISTRY;
 use crate::util::OnceExt as _;
 use crate::util::cache_lock::{CacheLock, CacheLockMode, CacheLocker};
 use crate::util::errors::CargoResult;
-use crate::util::network::http::configure_http_handle;
-use crate::util::network::http::http_handle;
+#[cfg(feature = "curl-backend")]
+use crate::util::network::backend::{configure_http_handle, create_http_handle};
 use crate::util::restricted_names::is_glob_pattern;
 use crate::util::{CanonicalUrl, closest_msg, internal};
 use crate::util::{Filesystem, IntoUrl, IntoUrlWithBase, Rustc};
@@ -97,6 +97,7 @@ use anyhow::{Context as _, anyhow, bail, format_err};
 use cargo_credential::Secret;
 use cargo_util::paths;
 use cargo_util_schemas::manifest::RegistryName;
+#[cfg(feature = "curl-backend")]
 use curl::easy::Easy;
 use itertools::Itertools;
 use serde::Deserialize;
@@ -245,6 +246,7 @@ pub struct GlobalContext {
     /// Cli flags of the form "-Z something"
     unstable_flags_cli: Option<Vec<String>>,
     /// A handle on curl easy mode for http calls
+    #[cfg(feature = "curl-backend")]
     easy: OnceLock<Mutex<Easy>>,
     /// Cache of the `SourceId` for crates.io
     crates_io_source_id: OnceLock<SourceId>,
@@ -350,6 +352,7 @@ impl GlobalContext {
             },
             unstable_flags: CliUnstable::default(),
             unstable_flags_cli: None,
+            #[cfg(feature = "curl-backend")]
             easy: Default::default(),
             crates_io_source_id: Default::default(),
             cache_rustc_info,
@@ -1881,10 +1884,11 @@ impl GlobalContext {
         self.jobserver.as_ref()
     }
 
+    #[cfg(feature = "curl-backend")]
     pub fn http(&self) -> CargoResult<&Mutex<Easy>> {
         let http = self
             .easy
-            .try_borrow_with(|| http_handle(self).map(Into::into))?;
+            .try_borrow_with(|| create_http_handle(self).map(Into::into))?;
         {
             let mut http = http.lock().unwrap();
             http.reset();
@@ -1897,8 +1901,9 @@ impl GlobalContext {
     pub fn http_config(&self) -> CargoResult<&CargoHttpConfig> {
         self.http_config.try_borrow_with(|| {
             let mut http = self.get::<CargoHttpConfig>("http")?;
-            let curl_v = curl::Version::get();
-            disables_multiplexing_for_bad_curl(curl_v.version(), &mut http, self);
+            crate::util::network::backend::maybe_disable_multiplexing_for_bad_version(
+                &mut http, self,
+            );
             Ok(http)
         })
     }
@@ -2496,14 +2501,8 @@ impl Tool {
 }
 
 /// Disable HTTP/2 multiplexing for some broken versions of libcurl.
-///
-/// In certain versions of libcurl when proxy is in use with HTTP/2
-/// multiplexing, connections will continue stacking up. This was
-/// fixed in libcurl 8.0.0 in curl/curl@821f6e2a89de8aec1c7da3c0f381b92b2b801efc
-///
-/// However, Cargo can still link against old system libcurl if it is from a
-/// custom built one or on macOS. For those cases, multiplexing needs to be
-/// disabled when those versions are detected.
+/// This is kept for testing; the runtime call goes through the network backend.
+#[cfg(feature = "curl-backend")]
 fn disables_multiplexing_for_bad_curl(
     curl_version: &str,
     http: &mut CargoHttpConfig,
@@ -2528,10 +2527,11 @@ mod tests {
     use super::CargoHttpConfig;
     use super::GlobalContext;
     use super::Shell;
-    use super::disables_multiplexing_for_bad_curl;
 
+    #[cfg(feature = "curl-backend")]
     #[test]
     fn disables_multiplexing() {
+        use super::disables_multiplexing_for_bad_curl;
         let mut gctx = GlobalContext::new(Shell::new(), "".into(), "".into());
         gctx.set_search_stop_path(std::path::PathBuf::new());
         gctx.set_env(Default::default());

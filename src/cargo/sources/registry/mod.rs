@@ -450,10 +450,12 @@ pub enum MaybeLock {
 }
 
 mod download;
+#[cfg(feature = "curl-backend")]
 mod http_remote;
 pub(crate) mod index;
 pub use index::IndexSummary;
 mod local;
+#[cfg(feature = "git2-backend")]
 mod remote;
 
 /// Generates a unique name for [`SourceId`] to have a unique path to put their
@@ -492,10 +494,30 @@ impl<'gctx> RegistrySource<'gctx> {
                 .map_or(false, |features| features.shallow_index)
                 && !source_id.is_sparse(),
         );
-        let ops = if source_id.is_sparse() {
-            Box::new(http_remote::HttpRegistry::new(source_id, gctx, &name)?) as Box<_>
+        let ops: Box<dyn RegistryData + '_> = if source_id.is_sparse() {
+            #[cfg(feature = "curl-backend")]
+            {
+                Box::new(http_remote::HttpRegistry::new(source_id, gctx, &name)?)
+            }
+            #[cfg(not(feature = "curl-backend"))]
+            {
+                anyhow::bail!(
+                    "sparse registry `{}` requires the curl-backend feature",
+                    source_id
+                );
+            }
         } else {
-            Box::new(remote::RemoteRegistry::new(source_id, gctx, &name)) as Box<_>
+            #[cfg(feature = "git2-backend")]
+            {
+                Box::new(remote::RemoteRegistry::new(source_id, gctx, &name))
+            }
+            #[cfg(not(feature = "git2-backend"))]
+            {
+                anyhow::bail!(
+                    "git-based registry `{}` requires the git2-backend feature",
+                    source_id
+                );
+            }
         };
 
         Ok(RegistrySource::new(

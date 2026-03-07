@@ -7,12 +7,29 @@
 //!
 //! [CVE-2022-46176]: https://blog.rust-lang.org/2023/01/10/cve-2022-46176.html
 
-pub use self::source::GitSource;
-pub use self::utils::{GitCheckout, GitDatabase, GitRemote, fetch, resolve_ref};
+// Backend-agnostic git utilities (init, discover, config, version, etc.)
+// Callers use these instead of git2/gix directly.
+pub mod backend;
+
+// git2-based full implementation (clone, checkout, fetch, auth, submodules)
+#[cfg(feature = "git2-backend")]
 mod known_hosts;
-mod oxide;
+#[cfg(feature = "git2-backend")]
 mod source;
-mod utils;
+#[cfg(feature = "git2-backend")]
+pub(crate) mod utils;
+
+pub(crate) mod oxide;
+
+// Re-export core types. With git2-backend, these come from the real
+// implementation. Without it, they come from the backend module stubs.
+#[cfg(feature = "git2-backend")]
+pub use self::source::GitSource;
+#[cfg(feature = "git2-backend")]
+pub use self::utils::{GitCheckout, GitDatabase, GitRemote, GitShortID, fetch, resolve_ref};
+
+#[cfg(not(feature = "git2-backend"))]
+pub use self::backend::{GitSource, GitCheckout, GitDatabase, GitRemote, GitShortID, fetch, resolve_ref};
 
 /// For `-Zgitoxide` integration.
 pub mod fetch {
@@ -29,9 +46,8 @@ pub mod fetch {
     }
 
     impl RemoteKind {
-        /// Obtain the kind of history we would want for a fetch from our remote knowing if the target repo is already shallow
-        /// via `repo_is_shallow` along with gitoxide-specific feature configuration via `config`.
-        /// `rev_and_ref` is additional information that affects whether or not we may be shallow.
+        /// Obtain the kind of history we would want for a fetch from our remote
+        /// knowing if the target repo is already shallow via `repo_is_shallow`.
         pub(crate) fn to_shallow_setting(
             &self,
             repo_is_shallow: bool,
@@ -43,7 +59,6 @@ pub mod fetch {
                     .map_or(false, |features| cb(features))
             };
 
-            // maintain shallow-ness and keep downloading single commits, or see if we can do shallow clones
             if !repo_is_shallow {
                 match self {
                     RemoteKind::GitDependency if has_feature(&|features| features.shallow_deps) => {

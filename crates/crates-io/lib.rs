@@ -4,33 +4,131 @@
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::prelude::*;
-use std::io::{Cursor, SeekFrom};
+use std::io::SeekFrom;
 use std::time::Instant;
 
-use curl::easy::{Easy, List};
 use percent_encoding::{NON_ALPHANUMERIC, percent_encode};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-pub struct Registry {
-    /// The base URL for issuing API requests.
-    host: String,
-    /// Optional authorization token.
-    /// If None, commands requiring authorization will fail.
-    token: Option<String>,
-    /// Curl handle for issuing requests.
-    handle: Easy,
-    /// Whether to include the authorization token with all requests.
-    auth_required: bool,
+// ---------------------------------------------------------------------------
+// HTTP transport abstraction
+// ---------------------------------------------------------------------------
+
+/// Response from an HTTP request.
+pub struct HttpResponse {
+    pub status: u32,
+    pub headers: Vec<String>,
+    pub body: Vec<u8>,
 }
 
-#[derive(PartialEq, Clone, Copy)]
-pub enum Auth {
-    Authorized,
-    Unauthorized,
+/// HTTP method for requests.
+pub enum HttpMethod {
+    Get,
+    Put,
+    Delete,
 }
+
+/// Trait for pluggable HTTP backends (curl, reqwest, ureq, etc.).
+///
+/// Implementors handle the actual HTTP transport. The `Registry` struct
+/// uses this trait to remain backend-agnostic.
+pub trait HttpHandle {
+    /// Perform an HTTP request.
+    ///
+    /// `url`: full URL to request
+    /// `headers`: list of "Name: Value" header strings
+    /// `method`: GET, PUT, or DELETE
+    /// `body`: optional request body
+    fn request(
+        &mut self,
+        url: &str,
+        headers: &[String],
+        method: HttpMethod,
+        body: Option<&[u8]>,
+    ) -> Result<HttpResponse>;
+}
+
+// curl-based HttpHandle implementation
+#[cfg(feature = "curl")]
+mod curl_handle {
+    use curl::easy::{Easy, List};
+
+    use super::*;
+
+    /// Wraps a `curl::easy::Easy` as an `HttpHandle`.
+    pub struct CurlHttpHandle(pub Easy);
+
+    impl HttpHandle for CurlHttpHandle {
+        fn request(
+            &mut self,
+            url: &str,
+            headers: &[String],
+            method: HttpMethod,
+            body: Option<&[u8]>,
+        ) -> Result<HttpResponse> {
+            self.0.url(url)?;
+
+            let mut list = List::new();
+            for h in headers {
+                list.append(h)?;
+            }
+            self.0.http_headers(list)?;
+
+            match method {
+                HttpMethod::Get => self.0.get(true)?,
+                HttpMethod::Put => self.0.put(true)?,
+                HttpMethod::Delete => self.0.custom_request("DELETE")?,
+            }
+
+            if let Some(body) = body {
+                self.0.upload(true)?;
+                self.0.in_filesize(body.len() as u64)?;
+            }
+
+            let mut resp_headers = Vec::new();
+            let mut resp_body = Vec::new();
+            let mut body_to_send = body.unwrap_or(&[]);
+            {
+                let mut transfer = self.0.transfer();
+                transfer.read_function(|buf| {
+                    let n = std::cmp::min(buf.len(), body_to_send.len());
+                    buf[..n].copy_from_slice(&body_to_send[..n]);
+                    body_to_send = &body_to_send[n..];
+                    Ok(n)
+                })?;
+                transfer.write_function(|data| {
+                    resp_body.extend_from_slice(data);
+                    Ok(data.len())
+                })?;
+                transfer.header_function(|data| {
+                    let s = String::from_utf8_lossy(data).trim().to_string();
+                    if !s.contains('\n') {
+                        resp_headers.push(s);
+                    }
+                    true
+                })?;
+                transfer.perform()?;
+            }
+
+            let status = self.0.response_code()?;
+            Ok(HttpResponse {
+                status,
+                headers: resp_headers,
+                body: resp_body,
+            })
+        }
+    }
+}
+
+#[cfg(feature = "curl")]
+pub use curl_handle::CurlHttpHandle;
+
+// ---------------------------------------------------------------------------
+// Data types (backend-agnostic)
+// ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
 pub struct Crate {
@@ -101,45 +199,21 @@ pub struct Warnings {
     pub other: Vec<String>,
 }
 
-#[derive(Deserialize)]
-struct R {
-    ok: bool,
+#[derive(PartialEq, Clone, Copy)]
+pub enum Auth {
+    Authorized,
+    Unauthorized,
 }
-#[derive(Deserialize)]
-struct OwnerResponse {
-    ok: bool,
-    msg: String,
-}
-#[derive(Deserialize)]
-struct ApiErrorList {
-    errors: Vec<ApiError>,
-}
-#[derive(Deserialize)]
-struct ApiError {
-    detail: String,
-}
-#[derive(Serialize)]
-struct OwnersReq<'a> {
-    users: &'a [&'a str],
-}
-#[derive(Deserialize)]
-struct Users {
-    users: Vec<User>,
-}
-#[derive(Deserialize)]
-struct TotalCrates {
-    total: u32,
-}
-#[derive(Deserialize)]
-struct Crates {
-    crates: Vec<Crate>,
-    meta: TotalCrates,
-}
+
+// ---------------------------------------------------------------------------
+// Error
+// ---------------------------------------------------------------------------
 
 /// Error returned when interacting with a registry.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// Error from libcurl.
+    #[cfg(feature = "curl")]
     #[error(transparent)]
     Curl(#[from] curl::Error),
 
@@ -194,24 +268,90 @@ pub enum Error {
     Timeout(u64),
 }
 
+// ---------------------------------------------------------------------------
+// Registry — backend-agnostic HTTP client for crate registries
+// ---------------------------------------------------------------------------
+
+pub struct Registry {
+    /// The base URL for issuing API requests.
+    host: String,
+    /// Optional authorization token.
+    /// If None, commands requiring authorization will fail.
+    token: Option<String>,
+    /// Pluggable HTTP transport.
+    handle: Box<dyn HttpHandle>,
+    /// Whether to include the authorization token with all requests.
+    auth_required: bool,
+}
+
+#[derive(Deserialize)]
+struct ApiErrorList {
+    errors: Vec<ApiError>,
+}
+#[derive(Deserialize)]
+struct ApiError {
+    detail: String,
+}
+#[derive(Deserialize)]
+struct R {
+    ok: bool,
+}
+#[derive(Deserialize)]
+struct OwnerResponse {
+    ok: bool,
+    msg: String,
+}
+#[derive(Serialize)]
+struct OwnersReq<'a> {
+    users: &'a [&'a str],
+}
+#[derive(Deserialize)]
+struct Users {
+    users: Vec<User>,
+}
+#[derive(Deserialize)]
+struct TotalCrates {
+    total: u32,
+}
+#[derive(Deserialize)]
+struct Crates {
+    crates: Vec<Crate>,
+    meta: TotalCrates,
+}
+
 impl Registry {
-    /// Creates a new `Registry`.
+    /// Creates a new `Registry` with the given HTTP handle.
     ///
-    /// ## Example
+    /// ## Example (with curl)
     ///
-    /// ```rust
+    /// ```rust,ignore
     /// use curl::easy::Easy;
-    /// use crates_io::Registry;
+    /// use crates_io::{CurlHttpHandle, Registry};
     ///
-    /// let mut handle = Easy::new();
-    /// // If connecting to crates.io, a user-agent is required.
-    /// handle.useragent("my_crawler (example.com/info)");
-    /// let mut reg = Registry::new_handle(String::from("https://crates.io"), None, handle, true);
+    /// let mut easy = Easy::new();
+    /// easy.useragent("my_crawler (example.com/info)");
+    /// let handle = CurlHttpHandle(easy);
+    /// let mut reg = Registry::new(String::from("https://crates.io"), None, handle, true);
     /// ```
+    pub fn new(
+        host: String,
+        token: Option<String>,
+        handle: impl HttpHandle + 'static,
+        auth_required: bool,
+    ) -> Registry {
+        Registry {
+            host,
+            token,
+            handle: Box::new(handle),
+            auth_required,
+        }
+    }
+
+    /// Creates a new `Registry` from a pre-boxed handle.
     pub fn new_handle(
         host: String,
         token: Option<String>,
-        handle: Easy,
+        handle: Box<dyn HttpHandle>,
         auth_required: bool,
     ) -> Registry {
         Registry {
@@ -284,22 +424,19 @@ impl Registry {
             w.extend(&(tarball_len as u32).to_le_bytes());
             w
         };
-        let size = tarball_len as usize + header.len();
-        let mut body = Cursor::new(header).chain(tarball);
+        let mut body = Vec::from(header);
+        tarball.read_to_end(&mut body)?;
 
         let url = format!("{}/api/v1/crates/new", self.host);
-
-        self.handle.put(true)?;
-        self.handle.url(&url)?;
-        self.handle.in_filesize(size as u64)?;
-        let mut headers = List::new();
-        headers.append("Accept: application/json")?;
-        headers.append(&format!("Authorization: {}", self.token()?))?;
-        self.handle.http_headers(headers)?;
+        let headers = vec![
+            "Accept: application/json".to_string(),
+            format!("Authorization: {}", self.token()?),
+        ];
 
         let started = Instant::now();
-        let body = self
-            .handle(&mut |buf| body.read(buf).unwrap_or(0))
+        let resp = self
+            .handle
+            .request(&url, &headers, HttpMethod::Put, Some(&body))
             .map_err(|e| match e {
                 Error::Code { code, .. }
                     if code == 503
@@ -308,8 +445,10 @@ impl Registry {
                 {
                     Error::Timeout(tarball_len)
                 }
-                _ => e.into(),
+                _ => e,
             })?;
+
+        let body = parse_response(resp)?;
 
         let response = if body.is_empty() {
             "{}".parse()?
@@ -370,88 +509,72 @@ impl Registry {
     }
 
     fn put(&mut self, path: &str, b: &[u8]) -> Result<String> {
-        self.handle.put(true)?;
         self.req(path, Some(b), Auth::Authorized)
     }
 
     fn get(&mut self, path: &str) -> Result<String> {
-        self.handle.get(true)?;
         self.req(path, None, Auth::Authorized)
     }
 
     fn delete(&mut self, path: &str, b: Option<&[u8]>) -> Result<String> {
-        self.handle.custom_request("DELETE")?;
-        self.req(path, b, Auth::Authorized)
+        self.req_method(path, b, Auth::Authorized, HttpMethod::Delete)
     }
 
     fn req(&mut self, path: &str, body: Option<&[u8]>, authorized: Auth) -> Result<String> {
-        self.handle.url(&format!("{}/api/v1{}", self.host, path))?;
-        let mut headers = List::new();
-        headers.append("Accept: application/json")?;
-        if body.is_some() {
-            headers.append("Content-Type: application/json")?;
-        }
-
-        if self.auth_required || authorized == Auth::Authorized {
-            headers.append(&format!("Authorization: {}", self.token()?))?;
-        }
-        self.handle.http_headers(headers)?;
-        match body {
-            Some(mut body) => {
-                self.handle.upload(true)?;
-                self.handle.in_filesize(body.len() as u64)?;
-                self.handle(&mut |buf| body.read(buf).unwrap_or(0))
-                    .map_err(|e| e.into())
-            }
-            None => self.handle(&mut |_| 0).map_err(|e| e.into()),
-        }
+        let method = if body.is_some() {
+            HttpMethod::Put
+        } else {
+            HttpMethod::Get
+        };
+        self.req_method(path, body, authorized, method)
     }
 
-    fn handle(&mut self, read: &mut dyn FnMut(&mut [u8]) -> usize) -> Result<String> {
-        let mut headers = Vec::new();
-        let mut body = Vec::new();
-        {
-            let mut handle = self.handle.transfer();
-            handle.read_function(|buf| Ok(read(buf)))?;
-            handle.write_function(|data| {
-                body.extend_from_slice(data);
-                Ok(data.len())
-            })?;
-            handle.header_function(|data| {
-                // Headers contain trailing \r\n, trim them to make it easier
-                // to work with.
-                let s = String::from_utf8_lossy(data).trim().to_string();
-                // Don't let server sneak extra lines anywhere.
-                if s.contains('\n') {
-                    return true;
-                }
-                headers.push(s);
-                true
-            })?;
-            handle.perform()?;
+    fn req_method(
+        &mut self,
+        path: &str,
+        body: Option<&[u8]>,
+        authorized: Auth,
+        method: HttpMethod,
+    ) -> Result<String> {
+        let url = format!("{}/api/v1{}", self.host, path);
+        let mut headers = vec!["Accept: application/json".to_string()];
+        if body.is_some() {
+            headers.push("Content-Type: application/json".to_string());
+        }
+        if self.auth_required || authorized == Auth::Authorized {
+            headers.push(format!("Authorization: {}", self.token()?));
         }
 
-        let body = String::from_utf8(body)?;
-        let errors = serde_json::from_str::<ApiErrorList>(&body)
-            .ok()
-            .map(|s| s.errors.into_iter().map(|s| s.detail).collect::<Vec<_>>());
-
-        match (self.handle.response_code()?, errors) {
-            (0, None) => Ok(body),
-            (code, None) if is_success(code) => Ok(body),
-            (code, Some(errors)) => Err(Error::Api {
-                code,
-                headers,
-                errors,
-            }),
-            (code, None) => Err(Error::Code {
-                code,
-                headers,
-                body,
-            }),
-        }
+        let resp = self.handle.request(&url, &headers, method, body)?;
+        parse_response(resp)
     }
 }
+
+fn parse_response(resp: HttpResponse) -> Result<String> {
+    let body = String::from_utf8(resp.body)?;
+    let errors = serde_json::from_str::<ApiErrorList>(&body)
+        .ok()
+        .map(|s| s.errors.into_iter().map(|s| s.detail).collect::<Vec<_>>());
+
+    match (resp.status, errors) {
+        (0, None) => Ok(body),
+        (code, None) if is_success(code) => Ok(body),
+        (code, Some(errors)) => Err(Error::Api {
+            code,
+            headers: resp.headers,
+            errors,
+        }),
+        (code, None) => Err(Error::Code {
+            code,
+            headers: resp.headers,
+            body,
+        }),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Utility functions
+// ---------------------------------------------------------------------------
 
 fn is_success(code: u32) -> bool {
     code >= 200 && code < 300

@@ -26,7 +26,8 @@ use crate::util::auth;
 use crate::util::cache_lock::CacheLockMode;
 use crate::util::context::{GlobalContext, PathAndArgs};
 use crate::util::errors::CargoResult;
-use crate::util::network::http::http_handle;
+#[cfg(feature = "curl-backend")]
+use crate::util::network::http_curl::http_handle;
 
 pub use self::info::info;
 pub use self::login::registry_login;
@@ -169,11 +170,17 @@ fn registry<'gctx>(
     } else {
         None
     };
-    let handle = http_handle(gctx)?;
-    Ok((
-        Registry::new_handle(api_host, token, handle, cfg.auth_required),
-        src,
-    ))
+    #[cfg(not(feature = "curl-backend"))]
+    anyhow::bail!("registry operations require the curl-backend feature");
+    #[cfg(feature = "curl-backend")]
+    {
+        let handle = http_handle(gctx)?;
+        let http = crates_io::CurlHttpHandle(handle);
+        Ok((
+            Registry::new(api_host, token, http, cfg.auth_required),
+            src,
+        ))
+    }
 }
 
 /// Gets the `SourceId` for an index or registry setting.

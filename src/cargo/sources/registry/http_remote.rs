@@ -8,7 +8,7 @@ use crate::sources::registry::{LoadResponse, RegistryConfig, RegistryData};
 use crate::util::cache_lock::CacheLockMode;
 use crate::util::errors::{CargoResult, HttpNotSuccessful};
 use crate::util::interning::InternedString;
-use crate::util::network::http::http_handle;
+use crate::util::network::http_curl::http_handle;
 use crate::util::network::retry::{Retry, RetryResult};
 use crate::util::network::sleep::SleepTracker;
 use crate::util::{Filesystem, GlobalContext, IntoUrl, Progress, ProgressStyle, auth};

@@ -185,29 +185,11 @@ impl<'a> Retry<'a> {
 }
 
 fn maybe_spurious(err: &Error) -> bool {
-    if let Some(git_err) = err.downcast_ref::<git2::Error>() {
-        match git_err.class() {
-            git2::ErrorClass::Net
-            | git2::ErrorClass::Os
-            | git2::ErrorClass::Zlib
-            | git2::ErrorClass::Http => return git_err.code() != git2::ErrorCode::Certificate,
-            _ => (),
-        }
+    if let Some(spurious) = crate::sources::git::backend::is_spurious_git_error(err) {
+        return spurious;
     }
-    if let Some(curl_err) = err.downcast_ref::<curl::Error>() {
-        if curl_err.is_couldnt_connect()
-            || curl_err.is_couldnt_resolve_proxy()
-            || curl_err.is_couldnt_resolve_host()
-            || curl_err.is_operation_timedout()
-            || curl_err.is_recv_error()
-            || curl_err.is_send_error()
-            || curl_err.is_http2_error()
-            || curl_err.is_http2_stream_error()
-            || curl_err.is_ssl_connect_error()
-            || curl_err.is_partial_file()
-        {
-            return true;
-        }
+    if let Some(spurious) = super::backend::is_spurious_http_error(err) {
+        return spurious;
     }
     if let Some(not_200) = err.downcast_ref::<HttpNotSuccessful>() {
         if 500 <= not_200.code && not_200.code < 600 || not_200.code == 429 {
@@ -358,6 +340,7 @@ fn default_retry_schedule() {
     }
 }
 
+#[cfg(feature = "curl-backend")]
 #[test]
 fn curle_http2_stream_is_spurious() {
     let code = curl_sys::CURLE_HTTP2_STREAM;

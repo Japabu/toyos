@@ -237,29 +237,21 @@ fn check_version_control(gctx: &GlobalContext, opts: &FixOptions) -> CargoResult
 
     let mut dirty_files = Vec::new();
     let mut staged_files = Vec::new();
-    if let Ok(repo) = git2::Repository::discover(gctx.cwd()) {
-        let mut repo_opts = git2::StatusOptions::new();
-        repo_opts.include_ignored(false);
-        repo_opts.include_untracked(true);
-        for status in repo.statuses(Some(&mut repo_opts))?.iter() {
-            if let Some(path) = status.path() {
-                match status.status() {
-                    git2::Status::CURRENT => (),
-                    git2::Status::INDEX_NEW
-                    | git2::Status::INDEX_MODIFIED
-                    | git2::Status::INDEX_DELETED
-                    | git2::Status::INDEX_RENAMED
-                    | git2::Status::INDEX_TYPECHANGE => {
-                        if !opts.allow_staged {
-                            staged_files.push(path.to_string())
-                        }
+    {
+        use crate::sources::git::backend::{self, FileStatus};
+        for status in backend::repo_statuses(gctx.cwd())? {
+            match status {
+                FileStatus::Current => (),
+                FileStatus::Staged(path) => {
+                    if !opts.allow_staged {
+                        staged_files.push(path);
                     }
-                    _ => {
-                        if !opts.allow_dirty {
-                            dirty_files.push(path.to_string())
-                        }
+                }
+                FileStatus::Dirty(path) => {
+                    if !opts.allow_dirty {
+                        dirty_files.push(path);
                     }
-                };
+                }
             }
         }
     }

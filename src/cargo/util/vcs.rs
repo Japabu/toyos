@@ -1,3 +1,4 @@
+use crate::sources::git::backend;
 use crate::util::CargoResult;
 use cargo_util::ProcessBuilder;
 use cargo_util::paths;
@@ -9,13 +10,13 @@ use std::path::Path;
 //    path in that repo.
 // 2. We are in an HG repo.
 pub fn existing_vcs_repo(path: &Path, cwd: &Path) -> bool {
-    fn in_git_repo(path: &Path, cwd: &Path) -> bool {
-        if let Ok(repo) = GitRepo::discover(path, cwd) {
+    fn in_git_repo(path: &Path, _cwd: &Path) -> bool {
+        if let Ok(repo) = backend::discover_repo(path) {
             // Don't check if the working directory itself is ignored.
             if repo.workdir().map_or(false, |workdir| workdir == path) {
                 true
             } else {
-                !repo.is_path_ignored(path).unwrap_or(false)
+                !repo.is_path_ignored(path)
             }
         } else {
             false
@@ -32,11 +33,11 @@ pub struct FossilRepo;
 
 impl GitRepo {
     pub fn init(path: &Path, _: &Path) -> CargoResult<GitRepo> {
-        git2::Repository::init(path)?;
+        backend::init_repo(path)?;
         Ok(GitRepo)
     }
-    pub fn discover(path: &Path, _: &Path) -> Result<git2::Repository, git2::Error> {
-        git2::Repository::discover(path)
+    pub fn discover(path: &Path, _: &Path) -> Result<backend::Repository, anyhow::Error> {
+        backend::discover_repo(path)
     }
 }
 

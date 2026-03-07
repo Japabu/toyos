@@ -223,39 +223,19 @@ pub fn get_version_string(is_verbose: bool) -> String {
 }
 
 fn add_libgit2(version_string: &mut String) {
-    let git2_v = git2::Version::get();
-    let lib_v = git2_v.libgit2_version();
-    let vendored = if git2_v.vendored() {
-        format!("vendored")
-    } else {
-        format!("system")
-    };
     writeln!(
         version_string,
-        "libgit2: {}.{}.{} (sys:{} {})",
-        lib_v.0,
-        lib_v.1,
-        lib_v.2,
-        git2_v.crate_version(),
-        vendored
+        "{}",
+        cargo::sources::git::backend::version_info()
     )
     .unwrap();
 }
 
 fn add_curl(version_string: &mut String) {
-    let curl_v = curl::Version::get();
-    let vendored = if curl_v.vendored() {
-        format!("vendored")
-    } else {
-        format!("system")
-    };
     writeln!(
         version_string,
-        "libcurl: {} (sys:{} {} ssl:{})",
-        curl_v.version(),
-        curl_sys::rust_crate_version(),
-        vendored,
-        curl_v.ssl_version().unwrap_or("none")
+        "{}",
+        cargo::util::network::backend::http_version_info()
     )
     .unwrap();
 }

@@ -23,6 +23,7 @@ pub mod gc;
 pub mod global_cache_tracker;
 pub mod manifest;
 pub mod package;
+pub(crate) mod package_downloads;
 pub mod package_id;
 mod package_id_spec;
 pub mod profiles;

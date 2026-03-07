@@ -213,7 +213,7 @@ fn amend_authentication_hints(
                         "https://doc.rust-lang.org/cargo/reference/config.html#netgit-fetch-with-cli",
                         "{}"
                     ),
-                    super::utils::note_github_pull_request(remote_url).unwrap_or_default()
+                    note_github_pull_request(remote_url).unwrap_or_default()
                 );
                 return Err(anyhow::Error::from(err).context(msg));
             }
@@ -365,14 +365,7 @@ pub fn cargo_config_to_gitoxide_overrides(gctx: &GlobalContext) -> CargoResult<V
 /// seems corrupted, and we want to start over.
 pub fn reinitialize(git_dir: &Path) -> CargoResult<()> {
     fn init(path: &Path, bare: bool) -> CargoResult<()> {
-        let mut opts = git2::RepositoryInitOptions::new();
-        // Skip anything related to templates, they just call all sorts of issues as
-        // we really don't want to use them yet they insist on being used. See #6240
-        // for an example issue that comes up.
-        opts.external_template(false);
-        opts.bare(bare);
-        git2::Repository::init_opts(&path, &opts)?;
-        Ok(())
+        super::backend::reinitialize_repo(path, bare)
     }
     // Here we want to drop the current repository object pointed to by `repo`,
     // so we initialize temporary repository in a sub-folder, blow away the
@@ -393,4 +386,26 @@ pub fn reinitialize(git_dir: &Path) -> CargoResult<()> {
     init(git_dir, bare)?;
     paths::remove_dir_all(&tmp)?;
     Ok(())
+}
+
+fn note_github_pull_request(url: &str) -> Option<String> {
+    let url = url.parse::<url::Url>().ok()?;
+    if url.host_str() != Some("github.com") {
+        return None;
+    }
+    let path_segments: Vec<_> = url.path_segments()?.collect();
+    if let [owner, repo, "pull", pr_number, ..] = path_segments[..] {
+        let repo_url = format!("https://github.com/{owner}/{repo}.git");
+        let rev = format!("refs/pull/{pr_number}/head");
+        return Some(format!(
+            concat!(
+                "\n\nnote: GitHub url {} is not a repository. \n",
+                "help: Replace the dependency with \n",
+                "       `git = \"{}\" rev = \"{}\"` \n",
+                "   to specify pull requests as dependencies' revision."
+            ),
+            url, repo_url, rev
+        ));
+    }
+    None
 }
