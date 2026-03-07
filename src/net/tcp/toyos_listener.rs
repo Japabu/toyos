@@ -4,7 +4,8 @@ use std::net::SocketAddr;
 
 use crate::net::TcpStream;
 use crate::{event, Interest, Registry, Token};
-use toyos_abi::syscall::{self, Fd};
+use toyos_abi::Fd;
+use toyos_abi::syscall;
 
 /// A TCP listener backed by kernel pipes via netd.
 ///

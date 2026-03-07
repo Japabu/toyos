@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::{Interest, Token};
-use toyos_abi::syscall::Fd;
+use toyos_abi::Fd;
 
 static NEXT_SELECTOR_ID: AtomicUsize = AtomicUsize::new(1);
 

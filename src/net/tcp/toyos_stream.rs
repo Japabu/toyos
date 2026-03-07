@@ -3,7 +3,8 @@ use std::io::{self, Read, Write};
 use std::net::{Shutdown, SocketAddr};
 
 use crate::{event, Interest, Registry, Token};
-use toyos_abi::syscall::{self, Fd, SyscallError};
+use toyos_abi::Fd;
+use toyos_abi::syscall::{self, SyscallError};
 use toyos_net::NetError;
 
 /// A non-blocking TCP stream backed by kernel pipes via netd.

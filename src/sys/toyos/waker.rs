@@ -1,7 +1,7 @@
 use crate::sys::Selector;
 use crate::Token;
 use std::io;
-use toyos_abi::syscall::Fd;
+use toyos_abi::Fd;
 
 #[derive(Debug)]
 pub struct Waker {
