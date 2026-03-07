@@ -1,0 +1,11 @@
+[package]
+name = "toyos-net"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+rustc-dep-of-std = ["core", "toyos-abi/rustc-dep-of-std"]
+
+[dependencies]
+core = { version = "1.0.0", optional = true, package = "rustc-std-workspace-core" }
+toyos-abi = { path = "../../toyos-abi", default-features = false }
