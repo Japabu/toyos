@@ -34,12 +34,10 @@ fn prepare_boot(
     build_kernel(&repo);
     build_bootloader(&repo);
 
-    let toyos_ld = build_toyos_ld(&repo);
-
     let mut initrd_files: Vec<(String, Vec<u8>)> = Vec::new();
 
     // test-runner (init process)
-    let (name, data) = build_toyos_crate(&repo, &repo.join("userland/test-runner"), &toyos_ld);
+    let (name, data) = build_toyos_crate(&repo.join("userland/test-runner"));
     initrd_files.push((name, data));
 
     // Add test binaries
@@ -366,13 +364,13 @@ fn host_triple() -> String {
 }
 
 /// Build a ToyOS userland crate. Returns (binary_name, binary_bytes).
-fn build_toyos_crate(_repo: &Path, crate_path: &Path, toyos_ld: &Path) -> (String, Vec<u8>) {
+fn build_toyos_crate(crate_path: &Path) -> (String, Vec<u8>) {
     let name = crate_path.file_name().unwrap().to_str().unwrap().to_string();
     assert!(
         Command::new("cargo")
             .args(["build", "--target", "x86_64-unknown-toyos"])
             .env("RUSTUP_TOOLCHAIN", "toyos")
-            .env("CARGO_TARGET_X86_64_UNKNOWN_TOYOS_LINKER", toyos_ld.to_str().unwrap())
+
             .env_remove("RUSTC")
             .current_dir(crate_path)
             .status()
@@ -389,7 +387,7 @@ fn build_toyos_crate(_repo: &Path, crate_path: &Path, toyos_ld: &Path) -> (Strin
 
 /// Build all binaries in a multi-binary crate. Returns vec of (binary_name, bytes).
 /// Also builds any cdylib subcrates and includes their .so files.
-pub fn build_toyos_bins(crate_path: &Path, toyos_ld: &Path) -> Vec<(String, Vec<u8>)> {
+pub fn build_toyos_bins(crate_path: &Path) -> Vec<(String, Vec<u8>)> {
     let bin_dir = crate_path.join("target/x86_64-unknown-toyos/debug");
     let mut results = Vec::new();
 
@@ -410,7 +408,7 @@ pub fn build_toyos_bins(crate_path: &Path, toyos_ld: &Path) -> Vec<(String, Vec<
             Command::new("cargo")
                 .args(["build", "--target", "x86_64-unknown-toyos"])
                 .env("RUSTUP_TOOLCHAIN", "toyos")
-                .env("CARGO_TARGET_X86_64_UNKNOWN_TOYOS_LINKER", toyos_ld.to_str().unwrap())
+    
                 .env_remove("RUSTC")
                 .current_dir(&sub_path)
                 .status()
@@ -443,7 +441,7 @@ pub fn build_toyos_bins(crate_path: &Path, toyos_ld: &Path) -> Vec<(String, Vec<
         Command::new("cargo")
             .args(["build", "--target", "x86_64-unknown-toyos", "--bins"])
             .env("RUSTUP_TOOLCHAIN", "toyos")
-            .env("CARGO_TARGET_X86_64_UNKNOWN_TOYOS_LINKER", toyos_ld.to_str().unwrap())
+
             .env("RUSTFLAGS", &rustflags)
             .env_remove("RUSTC")
             .current_dir(crate_path)

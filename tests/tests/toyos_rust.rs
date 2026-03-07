@@ -1,11 +1,9 @@
 use std::path::Path;
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
-use toyos_tests::compile;
 use toyos_tests::qemu::{self, QemuInstance, TestResult};
 
 static QEMU: LazyLock<Mutex<QemuInstance>> = LazyLock::new(|| {
-    let repo = compile::repo_root();
     let rust_tests_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("toyos-rust-tests");
 
     assert!(
@@ -13,8 +11,7 @@ static QEMU: LazyLock<Mutex<QemuInstance>> = LazyLock::new(|| {
         "No toyos-rust-tests crate found"
     );
 
-    let toyos_ld = qemu_toyos_ld(&repo);
-    let rust_bins = qemu::build_toyos_bins(&rust_tests_dir, &toyos_ld);
+    let rust_bins = qemu::build_toyos_bins(&rust_tests_dir);
 
     assert!(!rust_bins.is_empty(), "No Rust test binaries found");
 
@@ -39,25 +36,6 @@ fn check_test_result(result: &TestResult) {
             result.stdout
         ),
     }
-}
-
-fn qemu_toyos_ld(repo: &Path) -> std::path::PathBuf {
-    let toyos_ld_dir = repo.join("userland/toyos-ld");
-    let host = compile::host_target();
-    let path = toyos_ld_dir.join(format!("target/{host}/release/toyos-ld"));
-    if path.exists() {
-        return path;
-    }
-    assert!(
-        std::process::Command::new("cargo")
-            .args(["build", "--release", "--target", host])
-            .current_dir(&toyos_ld_dir)
-            .status()
-            .expect("Failed to run cargo")
-            .success(),
-        "Failed to build toyos-ld"
-    );
-    path.canonicalize().expect("toyos-ld binary not found")
 }
 
 macro_rules! toyos_rust_tests {

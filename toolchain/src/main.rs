@@ -52,11 +52,20 @@ fn main() {
         println!("Note: rustdoc for ToyOS failed to link (expected), but rustc built successfully.");
     }
 
-    // Step 4: Link the toolchain so cargo can use it
-    let stage2 = find_stage2(&rust_dir);
+    // Step 4: Install toyos-ld into the sysroot so rustc can find it.
+    // Rustc prepends <sysroot>/lib/rustlib/<host>/bin/ to PATH when invoking
+    // the linker, so placing toyos-ld there makes it discoverable automatically.
+    let stage2 = rust_dir.join(format!("build/{host}/stage2"));
+    let sysroot_bin = stage2.join(format!("lib/rustlib/{host}/bin"));
+    fs::create_dir_all(&sysroot_bin).expect("failed to create sysroot bin dir");
+    let dest = sysroot_bin.join("toyos-ld");
+    fs::copy(&toyos_ld, &dest).expect("failed to copy toyos-ld into sysroot");
+    println!("  Installed toyos-ld into sysroot: {}", dest.display());
+
+    // Step 5: Link the toolchain so cargo can use it
     run("rustup", &["toolchain", "link", "toyos", stage2.to_str().unwrap()]);
 
-    // Step 5: Write stamp so bootable/build.rs knows to rebuild userland
+    // Step 6: Write stamp so bootable/build.rs knows to rebuild userland
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -89,13 +98,6 @@ incremental = true
 linker = "{linker}"
 codegen-backends = ["cranelift"]
 
-[target.x86_64-unknown-none]
-linker = "{linker}"
-codegen-backends = ["cranelift"]
-
-[target.x86_64-unknown-uefi]
-linker = "{linker}"
-codegen-backends = ["cranelift"]
 "#
     );
     fs::write(rust_dir.join("bootstrap.toml"), config).unwrap();
@@ -116,18 +118,6 @@ fn build_toyos_ld(root_dir: &Path) -> PathBuf {
         .expect("Failed to build toyos-ld");
     assert!(status.success(), "toyos-ld build failed");
     toyos_ld_dir.join(format!("target/{host}/release/toyos-ld"))
-}
-
-fn find_stage2(rust_dir: &Path) -> PathBuf {
-    let build_dir = rust_dir.join("build");
-    for entry in fs::read_dir(&build_dir).expect("build/ not found") {
-        let path = entry.unwrap().path();
-        let stage2 = path.join("stage2");
-        if stage2.exists() {
-            return stage2;
-        }
-    }
-    panic!("stage2 sysroot not found in {}", build_dir.display());
 }
 
 fn run(cmd: &str, args: &[&str]) {

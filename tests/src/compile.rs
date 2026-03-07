@@ -19,44 +19,39 @@ pub fn libc_dir() -> PathBuf {
     repo_root().join("userland/libc")
 }
 
-/// Get the pre-built libc archive for the given target.
-/// Archives are built during `cargo test` compilation (build.rs).
-pub fn libc_archive(target: &str) -> PathBuf {
-    let path = if target.contains("toyos") {
-        PathBuf::from(env!("TOYOS_LIBC_TOYOS"))
-    } else if target == "x86_64-apple-darwin" && cfg!(target_arch = "aarch64") {
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        { PathBuf::from(env!("TOYOS_LIBC_X86_64_APPLE")) }
-        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-        { panic!("x86_64-apple-darwin libc not available on this platform") }
-    } else {
-        PathBuf::from(env!("TOYOS_LIBC_HOST"))
-    };
+/// Get the pre-built toyos libc archive.
+pub fn libc_archive_toyos() -> PathBuf {
+    let path = PathBuf::from(env!("TOYOS_LIBC_TOYOS"));
     assert!(path.exists(), "pre-built libc not found at {}", path.display());
     path
 }
 
-/// Detect the host target triple.
-pub fn host_target() -> &'static str {
-    if cfg!(target_arch = "aarch64") && cfg!(target_os = "macos") {
-        "aarch64-apple-darwin"
-    } else if cfg!(target_arch = "x86_64") && cfg!(target_os = "macos") {
-        "x86_64-apple-darwin"
-    } else if cfg!(target_arch = "x86_64") && cfg!(target_os = "linux") {
-        "x86_64-unknown-linux-gnu"
-    } else if cfg!(target_arch = "aarch64") && cfg!(target_os = "linux") {
-        "aarch64-unknown-linux-gnu"
-    } else {
-        panic!("unsupported host")
-    }
-}
-
 /// Include paths for toyos-libc headers.
-pub fn libc_include_paths() -> Vec<PathBuf> {
+pub fn toyos_include_paths() -> Vec<PathBuf> {
     vec![libc_dir().join("include")]
 }
 
-/// Compile a C test file to object bytes using toyos-cc as a library.
+/// Include paths for system (host) headers.
+fn system_include_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    #[cfg(target_os = "macos")]
+    {
+        let sdk = Command::new("xcrun")
+            .args(["--show-sdk-path"])
+            .output()
+            .expect("xcrun failed");
+        let sdk_path = String::from_utf8(sdk.stdout).unwrap();
+        paths.push(PathBuf::from(format!("{}/usr/include", sdk_path.trim())));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        paths.push(PathBuf::from("/usr/include"));
+    }
+    paths
+}
+
+/// Compile a C test file to object bytes using toyos-cc.
+/// Uses system headers for host targets, toyos-libc headers for ToyOS.
 /// Returns (main object bytes, companion object bytes).
 pub fn compile_c(name: &str, target: Option<&str>) -> (Vec<u8>, Vec<Vec<u8>>) {
     let dir = testcases_dir();
@@ -64,7 +59,12 @@ pub fn compile_c(name: &str, target: Option<&str>) -> (Vec<u8>, Vec<Vec<u8>>) {
     let source = fs::read_to_string(&c_file)
         .unwrap_or_else(|e| panic!("cannot read {}: {e}", c_file.display()));
 
-    let mut include_paths = libc_include_paths();
+    let is_toyos = target.map_or(false, |t| t.contains("toyos"));
+    let mut include_paths = if is_toyos {
+        toyos_include_paths()
+    } else {
+        system_include_paths()
+    };
     include_paths.push(dir.clone());
 
     let opts = toyos_cc::CompileOptions {
@@ -94,44 +94,19 @@ pub fn compile_c(name: &str, target: Option<&str>) -> (Vec<u8>, Vec<Vec<u8>>) {
     (obj, extras)
 }
 
-/// Link object bytes for host execution. Returns the linked binary bytes.
-pub fn link_host(obj: &[u8], extra_objs: &[Vec<u8>], name: &str, target: Option<&str>) -> Vec<u8> {
-    let label = target.unwrap_or("native");
-    let libc_target = target.unwrap_or(host_target());
-    let libc_path = libc_archive(libc_target);
-    let libc_data = fs::read(&libc_path).unwrap();
-
-    let mut objects: Vec<(String, Vec<u8>)> = vec![(format!("{name}.o"), obj.to_vec())];
-    for (i, extra) in extra_objs.iter().enumerate() {
-        objects.push((format!("{name}-extra{i}.o"), extra.clone()));
-    }
-    objects.push((libc_path.display().to_string(), libc_data));
-
-    let is_macho = target.map_or(cfg!(target_os = "macos"), |t| t.contains("apple"));
-    let entry = if is_macho { "_main" } else { "main" };
-
-    let linked = if is_macho {
-        toyos_ld::link_macho(&objects, entry, true)
-    } else {
-        toyos_ld::link_full(&objects, entry, true, false)
-    };
-    linked.unwrap_or_else(|e| panic!("toyos-ld ({label}) link failed: {e}"))
-}
-
 /// Link object bytes as a PIE ELF for ToyOS. Returns the linked binary bytes.
 pub fn link_toyos(obj: &[u8], extra_objs: &[Vec<u8>], name: &str) -> Vec<u8> {
-    let libc_path = libc_archive("x86_64-unknown-toyos");
+    let libc_path = libc_archive_toyos();
     let lib_dir = libc_path.parent().unwrap().to_path_buf();
 
-    // Write objects to temp files for resolve_libs_with_entry
     let pid = std::process::id();
-    let obj_path = env::temp_dir().join(format!("toyos-test-toyos-{name}-{pid}.o"));
+    let obj_path = env::temp_dir().join(format!("toyos-test-{name}-{pid}.o"));
     fs::write(&obj_path, obj).unwrap();
 
     let mut inputs: Vec<PathBuf> = vec![obj_path.clone()];
     let mut extra_paths = Vec::new();
     for (i, extra) in extra_objs.iter().enumerate() {
-        let p = env::temp_dir().join(format!("toyos-test-toyos-{name}-{pid}-extra{i}.o"));
+        let p = env::temp_dir().join(format!("toyos-test-{name}-{pid}-extra{i}.o"));
         fs::write(&p, extra).unwrap();
         inputs.push(p.clone());
         extra_paths.push(p);
@@ -143,33 +118,32 @@ pub fn link_toyos(obj: &[u8], extra_objs: &[Vec<u8>], name: &str) -> Vec<u8> {
         &["toyos_libc".to_string()],
         Some("_start"),
     )
-    .unwrap_or_else(|e| panic!("resolve_libs (toyos) failed: {e}"));
+    .unwrap_or_else(|e| panic!("resolve_libs failed: {e}"));
 
-    // Clean up temp files
     let _ = fs::remove_file(&obj_path);
     for p in &extra_paths {
         let _ = fs::remove_file(p);
     }
 
     toyos_ld::link_full(&objects, "_start", true, false)
-        .unwrap_or_else(|e| panic!("toyos-ld (toyos) link failed: {e}"))
+        .unwrap_or_else(|e| panic!("toyos-ld link failed: {e}"))
 }
 
 /// Link object bytes using the system linker and system libc. Returns path to the binary.
-fn link_with_system_cc(obj: &[u8], extra_objs: &[Vec<u8>], name: &str, target: Option<&str>) -> PathBuf {
+fn link_host(obj: &[u8], extra_objs: &[Vec<u8>], name: &str, target: Option<&str>) -> PathBuf {
     let pid = std::process::id();
     let suffix = target.map_or("".to_string(), |t| format!("-{t}"));
-    let obj_path = env::temp_dir().join(format!("toyos-syslibc-{name}{suffix}-{pid}.o"));
+    let obj_path = env::temp_dir().join(format!("toyos-host-{name}{suffix}-{pid}.o"));
     fs::write(&obj_path, obj).unwrap();
 
     let mut extra_paths = Vec::new();
     for (i, extra) in extra_objs.iter().enumerate() {
-        let p = env::temp_dir().join(format!("toyos-syslibc-{name}{suffix}-{pid}-extra{i}.o"));
+        let p = env::temp_dir().join(format!("toyos-host-{name}{suffix}-{pid}-extra{i}.o"));
         fs::write(&p, extra).unwrap();
         extra_paths.push(p);
     }
 
-    let bin = env::temp_dir().join(format!("toyos-syslibc{suffix}-{name}-{pid}.bin"));
+    let bin = env::temp_dir().join(format!("toyos-host-{name}{suffix}-{pid}.bin"));
 
     let mut cmd = Command::new("cc");
     cmd.arg(&obj_path);
@@ -193,14 +167,13 @@ fn link_with_system_cc(obj: &[u8], extra_objs: &[Vec<u8>], name: &str, target: O
 const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Run a command with a timeout. Kills the child if it exceeds the deadline.
-fn run_with_timeout(cmd: &mut Command, name: &str, label: &str) -> Output {
+fn run_with_timeout(cmd: &mut Command, name: &str) -> Output {
     use std::io::Read;
 
     cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd.spawn().unwrap_or_else(|e| {
-        panic!("failed to run {name} ({label}): {e}");
+        panic!("failed to run {name}: {e}");
     });
-    // Drain stdout/stderr in background threads to prevent pipe deadlocks
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
     let stdout_thread = thread::spawn(move || {
@@ -224,22 +197,21 @@ fn run_with_timeout(cmd: &mut Command, name: &str, label: &str) -> Output {
         None => {
             let _ = child.kill();
             let _ = child.wait();
-            panic!("test binary {name} ({label}) timed out after {}s", TEST_TIMEOUT.as_secs());
+            panic!("test binary {name} timed out after {}s", TEST_TIMEOUT.as_secs());
         }
     }
 }
 
-/// Link, run, and check a pre-compiled C test against system libc.
-pub fn run_host_test_system_libc_with_objs(
+/// Compile with toyos-cc, link with system cc, run, and check output.
+pub fn run_host_test(
     obj: &[u8], extras: &[Vec<u8>], name: &str, args: &[&str], target: Option<&str>,
 ) {
-    let label = format!("syslibc-{}", target.unwrap_or("native"));
     let dir = testcases_dir();
     let expect_file = dir.join(format!("{name}.expect"));
     assert!(expect_file.exists(), "missing expect file: {}", expect_file.display());
     let expected = fs::read_to_string(&expect_file).unwrap();
 
-    let bin = link_with_system_cc(obj, extras, name, target);
+    let bin = link_host(obj, extras, name, target);
 
     #[cfg(unix)]
     {
@@ -257,14 +229,14 @@ pub fn run_host_test_system_libc_with_objs(
     };
     cmd.args(args).current_dir(&dir);
 
-    let run = run_with_timeout(&mut cmd, name, &label);
+    let run = run_with_timeout(&mut cmd, name);
 
     let _ = fs::remove_file(&bin);
 
     let actual = String::from_utf8_lossy(&run.stdout);
     assert!(
         run.status.success(),
-        "test binary {name} ({label}) failed with status {}:\nstdout: {}\nstderr: {}",
+        "test {name} failed with status {}:\nstdout: {}\nstderr: {}",
         run.status,
         actual,
         String::from_utf8_lossy(&run.stderr),
@@ -273,76 +245,8 @@ pub fn run_host_test_system_libc_with_objs(
     assert_eq!(
         actual.trim_end(),
         expected.trim_end(),
-        "output mismatch for {name} ({label})\n--- expected ---\n{}\n--- actual ---\n{}",
+        "output mismatch for {name}\n--- expected ---\n{}\n--- actual ---\n{}",
         expected.trim_end(),
         actual.trim_end(),
     );
-}
-
-/// Compile, link with system libc, run a C test on the host.
-pub fn run_host_test_system_libc(name: &str, args: &[&str], target: Option<&str>) {
-    let (obj, extras) = compile_c(name, target);
-    run_host_test_system_libc_with_objs(&obj, &extras, name, args, target);
-}
-
-/// Link, run, and check a pre-compiled C test against toyos-libc.
-pub fn run_host_test_with_objs(
-    obj: &[u8], extras: &[Vec<u8>], name: &str, args: &[&str], target: Option<&str>,
-) {
-    let label = target.unwrap_or("native");
-    let dir = testcases_dir();
-    let expect_file = dir.join(format!("{name}.expect"));
-    assert!(expect_file.exists(), "missing expect file: {}", expect_file.display());
-    let expected = fs::read_to_string(&expect_file).unwrap();
-
-    let linked = link_host(obj, extras, name, target);
-
-    // Write binary
-    let pid = std::process::id();
-    let suffix = target.map_or("".to_string(), |t| format!("-{t}"));
-    let bin = env::temp_dir().join(format!("toyos-test{suffix}-{name}-{pid}.bin"));
-    fs::write(&bin, &linked).unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
-    }
-
-    // Run
-    let is_x86_64_cross = target.map_or(false, |t| t.starts_with("x86_64"));
-    let mut cmd = if is_x86_64_cross {
-        let mut c = Command::new("arch");
-        c.args(["-x86_64"]).arg(&bin);
-        c
-    } else {
-        Command::new(&bin)
-    };
-    cmd.args(args).current_dir(&dir);
-
-    let run = run_with_timeout(&mut cmd, name, label);
-
-    let _ = fs::remove_file(&bin);
-
-    let actual = String::from_utf8_lossy(&run.stdout);
-    assert!(
-        run.status.success(),
-        "test binary {name} ({label}) failed with status {}:\nstdout: {}\nstderr: {}",
-        run.status,
-        actual,
-        String::from_utf8_lossy(&run.stderr),
-    );
-
-    assert_eq!(
-        actual.trim_end(),
-        expected.trim_end(),
-        "output mismatch for {name} ({label})\n--- expected ---\n{}\n--- actual ---\n{}",
-        expected.trim_end(),
-        actual.trim_end(),
-    );
-}
-
-/// Compile, link, and run a C test on the host. Compares output against .expect file.
-pub fn run_host_test(name: &str, args: &[&str], target: Option<&str>) {
-    let (obj, extras) = compile_c(name, target);
-    run_host_test_with_objs(&obj, &extras, name, args, target);
 }

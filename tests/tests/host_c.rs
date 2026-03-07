@@ -6,11 +6,10 @@ type CompiledObjs = (Vec<u8>, Vec<Vec<u8>>);
 
 fn compile_all(target: Option<&str>) -> HashMap<&'static str, CompiledObjs> {
     let label = target.unwrap_or("native");
-    eprintln!("[host_c] Compiling {} C tests for {label}...", HOST_C_TESTS.len());
+    eprintln!("[host_c] Compiling {} C tests for {label}...", TESTS.len());
     let mut cache = HashMap::new();
-    for &name in HOST_C_TESTS {
-        let (obj, extras) = compile::compile_c(name, target);
-        cache.insert(name, (obj, extras));
+    for &name in TESTS {
+        cache.insert(name, compile::compile_c(name, target));
     }
     eprintln!("[host_c] Done compiling for {label}.");
     cache
@@ -23,87 +22,50 @@ static NATIVE_CACHE: LazyLock<HashMap<&str, CompiledObjs>> =
 static X86_64_CACHE: LazyLock<HashMap<&str, CompiledObjs>> =
     LazyLock::new(|| compile_all(Some("x86_64-apple-darwin")));
 
-fn get_native(name: &str) -> &'static CompiledObjs {
-    NATIVE_CACHE.get(name).unwrap_or_else(|| panic!("test {name} not in cache"))
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn get_x86_64(name: &str) -> &'static CompiledObjs {
-    X86_64_CACHE.get(name).unwrap_or_else(|| panic!("test {name} not in cache"))
-}
-
 fn run_test(name: &str, args: &[&str]) {
-    let (obj, extras) = get_native(name);
-    compile::run_host_test_with_objs(obj, extras, name, args, None);
+    let (obj, extras) = NATIVE_CACHE.get(name).unwrap_or_else(|| panic!("test {name} not in cache"));
+    compile::run_host_test(obj, extras, name, args, None);
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn run_test_x86_64(name: &str, args: &[&str]) {
-    let (obj, extras) = get_x86_64(name);
-    compile::run_host_test_with_objs(obj, extras, name, args, Some("x86_64-apple-darwin"));
+    let (obj, extras) = X86_64_CACHE.get(name).unwrap_or_else(|| panic!("test {name} not in cache"));
+    compile::run_host_test(obj, extras, name, args, Some("x86_64-apple-darwin"));
 }
 
-fn run_test_syslibc(name: &str, args: &[&str]) {
-    let (obj, extras) = get_native(name);
-    compile::run_host_test_system_libc_with_objs(obj, extras, name, args, None);
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn run_test_syslibc_x86_64(name: &str, args: &[&str]) {
-    let (obj, extras) = get_x86_64(name);
-    compile::run_host_test_system_libc_with_objs(
-        obj, extras, name, args, Some("x86_64-apple-darwin"),
-    );
-}
-
-/// Single macro that generates both HOST_C_TESTS and all test functions.
+/// Macro that generates TESTS list and test functions.
 ///
 /// Each entry is one of:
 ///   ($func, $name)                          — standard test (all variants)
-///   ($func, $name, native_only)             — skip x86_64 variants
+///   ($func, $name, native_only)             — skip x86_64 variant
 ///   ($func, $name, args: [..])              — test with arguments
 macro_rules! host_c_tests {
     ($( ($func:ident, $name:expr $(, $($modifier:tt)* )? ) ),* $(,)?) => {
-        const HOST_C_TESTS: &[&str] = &[$($name),*];
+        const TESTS: &[&str] = &[$($name),*];
 
         $( host_c_tests!(@test $func, $name $(, $($modifier)* )? ); )*
     };
 
-    // Standard test: all variants
+    // Standard test
     (@test $func:ident, $file:expr) => {
         #[test]
         fn $func() {
             run_test($file, &[]);
         }
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         mod $func {
-            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             #[test]
             fn x86_64() {
                 super::run_test_x86_64($file, &[]);
             }
-            #[test]
-            fn syslibc() {
-                super::run_test_syslibc($file, &[]);
-            }
-            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            #[test]
-            fn syslibc_x86_64() {
-                super::run_test_syslibc_x86_64($file, &[]);
-            }
         }
     };
 
-    // Native-only test: skip x86_64 variants
+    // Native-only test: skip x86_64 variant
     (@test $func:ident, $file:expr, native_only) => {
         #[test]
         fn $func() {
             run_test($file, &[]);
-        }
-        mod $func {
-            #[test]
-            fn syslibc() {
-                super::run_test_syslibc($file, &[]);
-            }
         }
     };
 
@@ -113,20 +75,11 @@ macro_rules! host_c_tests {
         fn $func() {
             run_test($file, &[$($arg),*]);
         }
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         mod $func {
-            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             #[test]
             fn x86_64() {
                 super::run_test_x86_64($file, &[$($arg),*]);
-            }
-            #[test]
-            fn syslibc() {
-                super::run_test_syslibc($file, &[$($arg),*]);
-            }
-            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            #[test]
-            fn syslibc_x86_64() {
-                super::run_test_syslibc_x86_64($file, &[$($arg),*]);
             }
         }
     };

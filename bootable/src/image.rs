@@ -52,10 +52,10 @@ pub fn create_initrd(files: &[(String, Vec<u8>)], symlinks: &[(String, String)])
     tyfs.into_disk().data
 }
 
-pub fn create_boot_image(initrd_bytes: &[u8]) -> Vec<u8> {
-    let kernel_bytes = fs::read("../kernel/target/x86_64-unknown-none/debug/kernel")
+pub fn create_boot_image(initrd_bytes: &[u8], profile: &str) -> Vec<u8> {
+    let kernel_bytes = fs::read(format!("../kernel/target/x86_64-unknown-none/{profile}/kernel"))
         .expect("Failed to read kernel");
-    let bl_bytes = fs::read("../bootloader/target/x86_64-unknown-uefi/debug/bootloader.efi")
+    let bl_bytes = fs::read(format!("../bootloader/target/x86_64-unknown-uefi/{profile}/bootloader.efi"))
         .expect("Failed to read bootloader");
 
     let esp_volume = create_fat_volume(&kernel_bytes, &bl_bytes, initrd_bytes);

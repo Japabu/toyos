@@ -5,34 +5,21 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
-fn build(debug: bool) {
-    let toyos_ld = build_toyos_ld();
+fn build(debug: bool, release: bool) {
+    let profile = if release { "release" } else { "debug" };
     let rustflags = match std::env::var("RUSTFLAGS") {
         Ok(flags) => format!("{flags} -Dwarnings"),
         Err(_) => "-Dwarnings".to_string(),
     };
 
-    // Detect linker changes — clean all link targets to avoid stale binaries
-    let linker_changed = detect_change(&toyos_ld, "target/.linker-stamp");
-    if linker_changed {
-        for (dir, target) in [
-            ("../kernel", "x86_64-unknown-none"),
-            ("../bootloader", "x86_64-unknown-uefi"),
-        ] {
-            let target_dir = Path::new(dir).join(format!("target/{target}"));
-            if target_dir.exists() {
-                eprintln!("linker changed: cleaning {dir}");
-                fs::remove_dir_all(&target_dir).ok();
-            }
-        }
-        write_stamp(&toyos_ld, "target/.linker-stamp");
-    }
-
-    // Detect toolchain changes — clean userland targets to avoid stale incremental artifacts
+    // Detect toolchain changes — clean all targets to avoid stale incremental artifacts
     let toolchain_stamp = Path::new("../toolchain/.sysroot-stamp");
     let toolchain_changed = detect_change(&toolchain_stamp, "target/.toolchain-stamp");
 
-    let mut kernel_args = vec!["build"];
+    let mut kernel_args = vec!["build", "--target", "x86_64-unknown-none"];
+    if release {
+        kernel_args.push("--release");
+    }
     if debug {
         kernel_args.push("--features");
         kernel_args.push("debug-wait");
@@ -40,8 +27,9 @@ fn build(debug: bool) {
     if !Command::new("cargo")
         .args(&kernel_args)
         .current_dir("../kernel")
+        .env("RUSTUP_TOOLCHAIN", "toyos")
         .env("RUSTFLAGS", &rustflags)
-        .env("CARGO_TARGET_X86_64_UNKNOWN_NONE_LINKER", toyos_ld.to_str().unwrap())
+        .env_remove("RUSTC")
         .status()
         .expect("Failed to run cargo")
         .success()
@@ -49,11 +37,16 @@ fn build(debug: bool) {
         panic!("Failed to build kernel");
     }
 
+    let mut bl_args = vec!["build", "--target", "x86_64-unknown-uefi"];
+    if release {
+        bl_args.push("--release");
+    }
     if !Command::new("cargo")
-        .args(&["build"])
+        .args(&bl_args)
         .current_dir("../bootloader")
+        .env("RUSTUP_TOOLCHAIN", "toyos")
         .env("RUSTFLAGS", &rustflags)
-        .env("CARGO_TARGET_X86_64_UNKNOWN_UEFI_LINKER", toyos_ld.to_str().unwrap())
+        .env_remove("RUSTC")
         .status()
         .expect("Failed to run cargo")
         .success()
@@ -62,8 +55,6 @@ fn build(debug: bool) {
     }
 
     // Ensure the ToyOS sysroot has host target libraries so proc-macros can compile.
-    // The ToyOS toolchain only ships x86_64-unknown-toyos libs; proc-macro crates need
-    // host-architecture libs (e.g. libproc_macro). Symlink from the stable toolchain.
     ensure_host_target_in_sysroot();
 
     let mut initrd_files: Vec<(String, Vec<u8>)> = Vec::new();
@@ -78,28 +69,26 @@ fn build(debug: bool) {
         }
         let name = entry.file_name();
         let name = name.to_str().unwrap();
-        if toolchain_changed || linker_changed {
-            let reason = if toolchain_changed { "toolchain" } else { "linker" };
+        if toolchain_changed {
             let toyos_target_dir = path.join("target/x86_64-unknown-toyos");
             if toyos_target_dir.exists() {
-                eprintln!("{reason} changed: cleaning userland/{name} (target)");
+                eprintln!("toolchain changed: cleaning userland/{name} (target)");
                 fs::remove_dir_all(&toyos_target_dir).ok();
             }
-            // Also clean host deps — proc-macro crates compiled by the old toolchain
-            // have incompatible metadata hashes.
-            if toolchain_changed {
-                let host_deps_dir = path.join("target/debug");
-                if host_deps_dir.exists() {
-                    eprintln!("toolchain changed: cleaning userland/{name} (host deps)");
-                    fs::remove_dir_all(&host_deps_dir).ok();
-                }
+            let host_deps_dir = path.join("target/debug");
+            if host_deps_dir.exists() {
+                eprintln!("toolchain changed: cleaning userland/{name} (host deps)");
+                fs::remove_dir_all(&host_deps_dir).ok();
             }
         }
+        let mut ul_args = vec!["build", "--target", "x86_64-unknown-toyos"];
+        if release {
+            ul_args.push("--release");
+        }
         if !Command::new("cargo")
-            .args(&["build", "--target", "x86_64-unknown-toyos"])
+            .args(&ul_args)
             .env("RUSTUP_TOOLCHAIN", "toyos")
             .env("RUSTFLAGS", &rustflags)
-            .env("CARGO_TARGET_X86_64_UNKNOWN_TOYOS_LINKER", toyos_ld.to_str().unwrap())
             .env_remove("RUSTC")
             .current_dir(&path)
             .status()
@@ -108,7 +97,7 @@ fn build(debug: bool) {
         {
             panic!("Failed to build userland/{name}");
         }
-        let binary = path.join(format!("target/x86_64-unknown-toyos/debug/{name}"));
+        let binary = path.join(format!("target/x86_64-unknown-toyos/{profile}/{name}"));
         let data = fs::read(&binary).expect("Failed to read binary");
         initrd_files.push((name.to_string(), data));
     }
@@ -117,16 +106,13 @@ fn build(debug: bool) {
     write_stamp(&toolchain_stamp, "target/.toolchain-stamp");
 
     // Add rustc compiler with sysroot directory structure.
-    // The rustc binary and .so libraries go in the initrd root (kernel dynamic linker
-    // resolves DT_NEEDED from the same directory as the executable). The sysroot
-    // directory tree holds rlibs and codegen backends that rustc finds at compile time.
     let sysroot = Path::new("../rust/build/x86_64-unknown-toyos/stage2");
     if sysroot.exists() {
         let rustc = sysroot.join("bin/rustc");
         if rustc.exists() {
             initrd_files.push(("rustc".to_string(), fs::read(&rustc).unwrap()));
         }
-        // Shared libraries in initrd root (for dynamic linker) and sysroot/lib/ (for rustc)
+        // Shared libraries in initrd root (for dynamic linker)
         for entry in fs::read_dir(sysroot.join("lib")).unwrap() {
             let path = entry.unwrap().path();
             if path.extension().is_some_and(|e| e == "so") {
@@ -135,7 +121,7 @@ fn build(debug: bool) {
                 initrd_files.push((name.clone(), data));
             }
         }
-        // Codegen backends in sysroot/lib/rustlib/<target>/codegen-backends/
+        // Codegen backends
         let backends = sysroot.join("lib/rustlib/x86_64-unknown-toyos/codegen-backends");
         if backends.exists() {
             for entry in fs::read_dir(&backends).unwrap() {
@@ -179,7 +165,7 @@ fn build(debug: bool) {
     }
 
     let initrd_bytes = image::create_initrd(&initrd_files, &symlinks);
-    let disk_bytes = image::create_boot_image(&initrd_bytes);
+    let disk_bytes = image::create_boot_image(&initrd_bytes, profile);
 
     fs::write("target/bootable.img", disk_bytes).expect("Failed to write image");
 
@@ -192,8 +178,9 @@ fn build(debug: bool) {
 }
 
 fn main() {
-    let debug = std::env::args().any(|a| a == "--debug");
-    build(debug);
+    let args: Vec<String> = std::env::args().collect();
+    let debug = args.iter().any(|a| a == "--debug");
+    build(debug, cfg!(release));
 
     let mut qemu = Command::new("qemu-system-x86_64");
     qemu
@@ -268,8 +255,6 @@ fn find_host_rlibs() -> std::path::PathBuf {
 }
 
 /// Ensure the ToyOS sysroot contains host target libraries for proc-macro compilation.
-/// The ToyOS toolchain only ships x86_64-unknown-toyos libs, but cargo needs host libs
-/// (like libproc_macro, libstd) to compile proc-macro crates. Symlink from the stable toolchain.
 fn ensure_host_target_in_sysroot() {
     let host = host_triple();
     let toyos_sysroot = Path::new("../rust/build/x86_64-unknown-toyos/stage2/lib/rustlib");
@@ -278,7 +263,6 @@ fn ensure_host_target_in_sysroot() {
         return;
     }
 
-    // Find the stable toolchain's rustlib for the host triple
     let output = Command::new("rustc")
         .args(["--print", "sysroot"])
         .output()
@@ -311,24 +295,6 @@ fn ensure_host_target_in_sysroot() {
         "Symlinked host target {} into ToyOS sysroot",
         host
     );
-}
-
-fn build_toyos_ld() -> std::path::PathBuf {
-    let toyos_ld_dir = Path::new("../userland/toyos-ld");
-    let host = host_triple();
-    if !Command::new("cargo")
-        .args(["build", "--release", "--target", &host])
-        .current_dir(toyos_ld_dir)
-        .status()
-        .expect("Failed to run cargo")
-        .success()
-    {
-        panic!("Failed to build toyos-ld");
-    }
-    toyos_ld_dir
-        .join(format!("target/{host}/release/toyos-ld"))
-        .canonicalize()
-        .expect("toyos-ld binary not found after build")
 }
 
 fn host_triple() -> String {
