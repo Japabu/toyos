@@ -48,6 +48,8 @@ pub fn init() {
 
 // Syscall entry: swapgs to get kernel GS, use GS-relative kernel/user RSP.
 // PerCpu layout: offset 16 = kernel_rsp, offset 24 = user_rsp.
+// Saves/restores XMM registers because blocking syscalls context-switch,
+// and kernel Rust code is free to clobber caller-saved XMM registers.
 #[unsafe(naked)]
 extern "C" fn syscall_entry() {
     naked_asm!(
@@ -63,7 +65,52 @@ extern "C" fn syscall_entry() {
         "push r8",
         "push r9",
         "push r10",
+
+        // Save SSE state — kernel code may clobber XMM registers,
+        // and blocking syscalls context-switch away.
+        "sub rsp, 8",
+        "stmxcsr [rsp]",
+        "sub rsp, 256",
+        "movdqu [rsp + 0*16], xmm0",
+        "movdqu [rsp + 1*16], xmm1",
+        "movdqu [rsp + 2*16], xmm2",
+        "movdqu [rsp + 3*16], xmm3",
+        "movdqu [rsp + 4*16], xmm4",
+        "movdqu [rsp + 5*16], xmm5",
+        "movdqu [rsp + 6*16], xmm6",
+        "movdqu [rsp + 7*16], xmm7",
+        "movdqu [rsp + 8*16], xmm8",
+        "movdqu [rsp + 9*16], xmm9",
+        "movdqu [rsp + 10*16], xmm10",
+        "movdqu [rsp + 11*16], xmm11",
+        "movdqu [rsp + 12*16], xmm12",
+        "movdqu [rsp + 13*16], xmm13",
+        "movdqu [rsp + 14*16], xmm14",
+        "movdqu [rsp + 15*16], xmm15",
+
         "call {handler}",
+
+        // Restore SSE state
+        "movdqu xmm0,  [rsp + 0*16]",
+        "movdqu xmm1,  [rsp + 1*16]",
+        "movdqu xmm2,  [rsp + 2*16]",
+        "movdqu xmm3,  [rsp + 3*16]",
+        "movdqu xmm4,  [rsp + 4*16]",
+        "movdqu xmm5,  [rsp + 5*16]",
+        "movdqu xmm6,  [rsp + 6*16]",
+        "movdqu xmm7,  [rsp + 7*16]",
+        "movdqu xmm8,  [rsp + 8*16]",
+        "movdqu xmm9,  [rsp + 9*16]",
+        "movdqu xmm10, [rsp + 10*16]",
+        "movdqu xmm11, [rsp + 11*16]",
+        "movdqu xmm12, [rsp + 12*16]",
+        "movdqu xmm13, [rsp + 13*16]",
+        "movdqu xmm14, [rsp + 14*16]",
+        "movdqu xmm15, [rsp + 15*16]",
+        "add rsp, 256",
+        "ldmxcsr [rsp]",
+        "add rsp, 8",
+
         "pop r10",
         "pop r9",
         "pop r8",
@@ -198,7 +245,7 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         SYS_GRANT_SHARED => sys_grant_shared(a1, a2),
         SYS_MAP_SHARED => sys_map_shared(a1),
         SYS_RELEASE_SHARED => sys_release_shared(a1),
-        SYS_THREAD_SPAWN => process::spawn_thread(a1, a2, a3).map_or(SyscallError::Unknown.to_u64(), |t| t.raw() as u64),
+        SYS_THREAD_SPAWN => process::spawn_thread(a1, a2, a3, a4).map_or(SyscallError::Unknown.to_u64(), |t| t.raw() as u64),
         SYS_THREAD_JOIN => sys_thread_join(a1),
         SYS_CLOCK_REALTIME => crate::rtc::read_time(),
         SYS_SYSINFO => {
@@ -248,9 +295,9 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             let Some(base_out) = ctx.user_mut::<u64>(a1) else { return bad_addr };
             let Some(size_out) = ctx.user_mut::<u64>(a2) else { return bad_addr };
             process::with_current(|proc| {
-                if let Some(ref alloc) = proc.stack_alloc {
-                    *base_out = alloc.ptr() as u64;
-                    *size_out = alloc.size() as u64;
+                if proc.user_stack_base > 0 {
+                    *base_out = proc.user_stack_base;
+                    *size_out = proc.user_stack_size;
                     0
                 } else {
                     SyscallError::NotFound.to_u64()
@@ -951,7 +998,6 @@ fn sys_dlopen(path: &str) -> u64 {
     // Resolve GLOB_DAT/JUMP_SLOT and TLS relocations, then store the lib.
     // Threads have empty loaded_libs — use the parent process's libs instead.
     let lib_has_tls = lib.tls_memsz > 0;
-    let lib_tls_memsz = lib.tls_memsz;
 
     // Phase 1: resolve relocations (needs process table lock)
     let (new_total, modules) = {
@@ -964,8 +1010,6 @@ fn sys_dlopen(path: &str) -> u64 {
             _ => current_pid,
         };
         let Some(owner) = table.procs.get_mut(owner_pid) else { return SyscallError::NotFound.to_u64() };
-        log!("dlopen: pid={} owner={} resolving against {} existing libs",
-            current_pid, owner_pid, owner.loaded_libs.len());
         crate::elf::resolve_dlopen_relocs(&lib, &owner.loaded_libs);
 
         // If the new lib has its own TLS, insert at offset 0 and shift existing
@@ -980,8 +1024,6 @@ fn sys_dlopen(path: &str) -> u64 {
             // Insert new module at offset 0
             owner.tls_modules.insert(0, (lib.tls_template, lib.tls_filesz, lib.tls_memsz, 0));
             owner.tls_total_memsz += new_memsz;
-            log!("dlopen: new TLS module at offset 0, memsz={}, total_memsz={}",
-                new_memsz, owner.tls_total_memsz);
             0
         } else {
             0
@@ -999,38 +1041,72 @@ fn sys_dlopen(path: &str) -> u64 {
         (owner.tls_total_memsz, owner.tls_modules.clone())
     }; // guard dropped here
 
-    // Phase 2: reallocate TLS if the new lib added a TLS module (no lock held)
-    // New module is at offset 0, existing modules shifted up by lib_tls_memsz.
-    // Copy existing TLS data to the shifted position in the new block.
+    // Phase 2: extend TLS in-place for ALL threads of this process.
+    // TLS blocks are placed at the end of their 2MB allocation, so new modules
+    // extend downward into unused padding. FS base stays the same — no pointer fixups.
     if lib_has_tls {
-        if let Some((new_alloc, new_tp)) = crate::process::setup_combined_tls(&modules, new_total) {
-            crate::arch::paging::map_user(new_alloc.ptr() as u64, new_alloc.size() as u64);
-            // Copy existing TLS data shifted up by lib_tls_memsz
-            let old_tp = crate::arch::read_fs_base();
-            let old_total = new_total - lib_tls_memsz;
-            if old_total > 0 {
+        let cur_pid = crate::process::current_pid();
+
+        // Collect all pids sharing this address space
+        let pids_to_update: alloc::vec::Vec<crate::process::Pid> = {
+            let guard = crate::process::PROCESS_TABLE.lock();
+            let table = guard.as_ref().unwrap();
+            let proc = table.procs.get(cur_pid).expect("current process");
+            let owner_pid = proc.heap_owner;
+            table.procs.iter()
+                .filter(|(_, p)| p.heap_owner == owner_pid)
+                .map(|(pid, _)| pid)
+                .collect()
+        };
+
+        for pid in &pids_to_update {
+            let (tp, alloc_start) = if *pid == cur_pid {
+                let tp = crate::arch::read_fs_base();
+                let guard = crate::process::PROCESS_TABLE.lock();
+                let table = guard.as_ref().unwrap();
+                let start = table.procs.get(*pid).map(|p| {
+                    p.tls_alloc.as_ref().map(|a| a.ptr() as u64).unwrap_or(0)
+                }).unwrap_or(0);
+                (tp, start)
+            } else {
+                let guard = crate::process::PROCESS_TABLE.lock();
+                let table = guard.as_ref().unwrap();
+                let p = table.procs.get(*pid).unwrap();
+                let tp = p.fs_base;
+                let start = p.tls_alloc.as_ref().map(|a| a.ptr() as u64).unwrap_or(0);
+                (tp, start)
+            };
+
+            if tp == 0 || alloc_start == 0 { continue; }
+
+            // The new module's TLS goes at FS - new_total (below old data at FS - old_total).
+            // Check that this falls within the existing allocation.
+            let new_tls_start = tp - new_total as u64;
+            if new_tls_start < alloc_start {
+                log!("dlopen: TLS extension overflow for pid={} (need {:#x}, alloc starts {:#x})",
+                    pid, new_tls_start, alloc_start);
+                continue;
+            }
+
+            // Write the new module's .tdata template (first module in the list, offset 0)
+            let &(template, filesz, _memsz, base_offset) = &modules[0];
+            let dest = (new_tls_start + base_offset as u64) as *mut u8;
+            if filesz > 0 && template != 0 {
                 unsafe {
-                    // Old data: [old_tp - old_total .. old_tp)
-                    // New position: shifted up by lib_tls_memsz within new block
-                    // New block: [new_tp - new_total .. new_tp)
-                    // New module at [new_tp - new_total .. new_tp - new_total + lib_tls_memsz)
-                    // Existing data at [new_tp - new_total + lib_tls_memsz .. new_tp)
-                    core::ptr::copy_nonoverlapping(
-                        (old_tp - old_total as u64) as *const u8,
-                        (new_tp - new_total as u64 + lib_tls_memsz as u64) as *mut u8,
-                        old_total,
-                    );
+                    core::ptr::copy_nonoverlapping(template as *const u8, dest, filesz);
                 }
             }
-            // Set new FS base
-            crate::arch::set_fs_base(new_tp);
-            // Store new TLS alloc, free old one
-            crate::process::with_current_mut(|p| {
-                p.tls_alloc = Some(new_alloc);
-                p.tls_total_memsz = new_total;
-                p.tls_modules = modules;
-                p.fs_base = new_tp;
-            });
+            // .tbss area is already zeroed (alloc_zeroed)
+
+            // Update process table (FS base stays the same, only bookkeeping changes)
+            {
+                let mut guard = crate::process::PROCESS_TABLE.lock();
+                let table = guard.as_mut().unwrap();
+                if let Some(p) = table.procs.get_mut(*pid) {
+                    p.tls_total_memsz = new_total;
+                    p.tls_modules = modules.clone();
+                }
+            }
         }
     }
 

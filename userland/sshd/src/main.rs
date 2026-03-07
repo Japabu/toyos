@@ -177,9 +177,8 @@ impl russh::server::Handler for SshSession {
     ) -> Result<(), Self::Error> {
         session.channel_success(channel_id)?;
         let cmd = std::str::from_utf8(data).unwrap_or("").trim();
-        let parts: Vec<&str> = cmd.split_whitespace().collect();
-        let program = parts.first().copied().unwrap_or("/initrd/shell");
-        self.spawn_shell(program, &parts[1..]);
+        // Run through shell so redirects, pipes, etc. work
+        self.spawn_shell("/initrd/shell", &["-c", cmd]);
         Ok(())
     }
 

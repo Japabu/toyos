@@ -7,6 +7,15 @@ const HISTORY_PATH: &str = "/nvme/config/shell_history";
 const HISTORY_MAX: usize = 200;
 
 fn main() {
+    let args: Vec<String> = env::args().collect();
+    if args.len() >= 3 && args[1] == "-c" {
+        // Non-interactive: execute the command string and exit
+        let input = args[2..].join(" ");
+        let _ = env::set_current_dir("/");
+        execute_line(&input);
+        return;
+    }
+
     let _ = env::set_current_dir("/");
     let mut history = load_history();
     std::os::toyos::io::set_stdin_raw(true);
@@ -30,20 +39,24 @@ fn main() {
             save_history(&history);
         }
 
-        let segments: Vec<&str> = input.split('|').collect();
-        if segments.len() > 1 {
-            run_pipeline(&segments);
-        } else {
-            let (input, redirect) = parse_redirect(&input);
-            let (cmd, arg) = parse_cmd_arg(&input);
-            match cmd.as_str() {
-                "help" => print_help(),
-                "clear" => print!("\x1b[2J\x1b[H"),
-                "exit" => std::process::exit(0),
-                "cd" => cmd_cd(&arg),
-                "run" => cmd_run(&arg, redirect.as_deref()),
-                _ => cmd_exec(&cmd, &arg, redirect.as_deref()),
-            }
+        execute_line(&input);
+    }
+}
+
+fn execute_line(input: &str) {
+    let segments: Vec<&str> = input.split('|').collect();
+    if segments.len() > 1 {
+        run_pipeline(&segments);
+    } else {
+        let (input, redirect) = parse_redirect(input);
+        let (cmd, arg) = parse_cmd_arg(&input);
+        match cmd.as_str() {
+            "help" => print_help(),
+            "clear" => print!("\x1b[2J\x1b[H"),
+            "exit" => std::process::exit(0),
+            "cd" => cmd_cd(&arg),
+            "run" => cmd_run(&arg, redirect.as_deref()),
+            _ => cmd_exec(&cmd, &arg, redirect.as_deref()),
         }
     }
 }

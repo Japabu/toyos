@@ -237,6 +237,9 @@ pub struct Process {
     pub loaded_libs: Vec<elf::LoadedLib>,
     // Anonymous memory mappings (mmap)
     pub mmap_regions: Vec<MmapRegion>,
+    // User stack location (for SYS_STACK_INFO — works for both processes and threads)
+    pub user_stack_base: u64,
+    pub user_stack_size: u64,
 }
 
 impl Process {
@@ -346,13 +349,17 @@ pub fn setup_combined_tls(
     let alloc = OwnedAlloc::new(alloc_size, PAGE_2M as usize)?;
     let block = alloc.ptr();
 
-    // Copy each module's initialized data (.tdata) at its offset
+    // Place TLS data at the END of the allocation so dlopen can extend downward.
+    // Layout: [unused padding] [TLS data (total_memsz)] [self-pointer (8 bytes)]
+    let tls_start = alloc_size - block_size;
+
+    // Copy each module's initialized data (.tdata) at its offset within the TLS area
     for &(template, filesz, _memsz, base_offset) in modules {
         if filesz > 0 && template != 0 {
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     template as *const u8,
-                    block.add(base_offset),
+                    block.add(tls_start + base_offset),
                     filesz,
                 );
             }
@@ -361,7 +368,7 @@ pub fn setup_combined_tls(
     // .tbss already zeroed by alloc_zeroed
 
     // Thread pointer = address past TLS block
-    let tp = block as u64 + total_memsz as u64;
+    let tp = block as u64 + (tls_start + total_memsz) as u64;
     // Self-pointer at %fs:0
     unsafe { *(tp as *mut u64) = tp; }
 
@@ -449,7 +456,7 @@ extern "C" fn thread_start() {
 }
 
 /// Spawn a thread within the current process.
-pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64) -> Option<Pid> {
+pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64, stack_base: u64) -> Option<Pid> {
     // Read parent's TLS info (brief lock)
     let (tls_template, tls_filesz, tls_memsz, tls_modules, tls_total_memsz) = {
         let guard = PROCESS_TABLE.lock();
@@ -511,6 +518,8 @@ pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64) -> Option<Pid> {
         name: [0; 28],
         loaded_libs: Vec::new(),
         mmap_regions: Vec::new(),
+        user_stack_base: stack_base,
+        user_stack_size: if stack_base > 0 { stack_ptr - stack_base } else { 0 },
     });
     table.procs.get_mut(tid).unwrap().pid = tid;
 
@@ -595,8 +604,9 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>) -> Option<Pid> {
             return None;
         }
     };
-    let stack_top = stack_alloc.ptr() as u64 + USER_STACK_SIZE as u64;
-    paging::map_user_in(child_pml4, stack_alloc.ptr() as u64, USER_STACK_SIZE as u64);
+    let stack_base = stack_alloc.ptr() as u64;
+    let stack_top = stack_base + USER_STACK_SIZE as u64;
+    paging::map_user_in(child_pml4, stack_base, USER_STACK_SIZE as u64);
 
     // Build combined TLS layout: libraries first, exe last (right before TP).
     // The exe must be last because its inline tpoff values are baked in at link
@@ -662,7 +672,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>) -> Option<Pid> {
     let syms = ProcessSymbols::parse(
         &binary, loaded.base,
         elf_alloc.ptr() as u64, elf_alloc.ptr() as u64 + elf_alloc.size() as u64,
-        stack_alloc.ptr() as u64, stack_top,
+        stack_base, stack_top,
     );
 
     let (ks_alloc, ks_rsp) = match alloc_kernel_stack(process_start, loaded.entry, sp, 0) {
@@ -710,6 +720,8 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>) -> Option<Pid> {
         name: make_name(path),
         loaded_libs,
         mmap_regions: Vec::new(),
+        user_stack_base: stack_base,
+        user_stack_size: USER_STACK_SIZE as u64,
     });
     let p = table.procs.get_mut(pid).unwrap();
     p.pid = pid;

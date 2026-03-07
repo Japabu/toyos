@@ -371,9 +371,10 @@ pub fn mark_tty(fd: Fd) {
 
 // --- Threads ---
 
-/// Spawn a new thread with the given entry point, stack pointer, and argument.
-pub fn thread_spawn(entry: u64, stack: u64, arg: u64) -> u64 {
-    syscall(SYS_THREAD_SPAWN, entry, stack, arg, 0)
+/// Spawn a new thread with the given entry point, stack pointer, argument, and stack base.
+/// `stack_base` is the bottom of the user stack (for stack info queries).
+pub fn thread_spawn(entry: u64, stack: u64, arg: u64, stack_base: u64) -> u64 {
+    syscall(SYS_THREAD_SPAWN, entry, stack, arg, stack_base)
 }
 
 /// Wait for thread `tid` to exit.

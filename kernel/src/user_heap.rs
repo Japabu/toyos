@@ -71,6 +71,18 @@ fn try_alloc(free: &mut Vec<(u64, u64)>, size: u64, align: u64) -> Option<u64> {
     None
 }
 
+fn validate_free_list(free: &[(u64, u64)]) {
+    for i in 0..free.len() {
+        let (s, e) = free[i];
+        assert!(s < e, "user_heap: invalid free region {:#x}..{:#x}", s, e);
+        if i + 1 < free.len() {
+            let (ns, _) = free[i + 1];
+            assert!(e <= ns, "user_heap: overlapping free regions {:#x}..{:#x} and {:#x}..{:#x}",
+                s, e, free[i+1].0, free[i+1].1);
+        }
+    }
+}
+
 pub fn alloc(heap: &mut UserHeap, size: usize, align: usize) -> u64 {
     if size == 0 { return 0; }
     debug_assert!(align == 0 || align.is_power_of_two(), "alignment must be power of 2, got {}", align);
@@ -78,12 +90,17 @@ pub fn alloc(heap: &mut UserHeap, size: usize, align: usize) -> u64 {
     let sz = size as u64;
 
     if let Some(addr) = try_alloc(&mut heap.free, sz, align) {
+        validate_free_list(&heap.free);
+        // Zero recycled memory to prevent stale data corruption
+        unsafe { core::ptr::write_bytes(addr as *mut u8, 0, size); }
         return addr;
     }
     if !grow(heap, size + align as usize) {
         return 0;
     }
-    try_alloc(&mut heap.free, sz, align).unwrap_or(0)
+    let addr = try_alloc(&mut heap.free, sz, align).unwrap_or(0);
+    if addr != 0 { validate_free_list(&heap.free); }
+    addr
 }
 
 pub fn free(heap: &mut UserHeap, ptr: *mut u8, size: usize) {
@@ -105,6 +122,7 @@ pub fn free(heap: &mut UserHeap, ptr: *mut u8, size: usize) {
         heap.free[pos - 1].1 = heap.free[pos].1;
         heap.free.remove(pos);
     }
+    validate_free_list(&heap.free);
 }
 
 pub fn realloc(heap: &mut UserHeap, ptr: *mut u8, size: usize, align: usize, new_size: usize) -> u64 {
