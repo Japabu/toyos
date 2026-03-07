@@ -223,16 +223,17 @@ pub fn cpu_id() -> u32 {
     id
 }
 
-/// Read the PID of the process currently running on this CPU. u32::MAX means idle.
-pub fn current_pid() -> u32 {
-    let pid: u32;
-    unsafe { core::arch::asm!("mov {:e}, gs:[136]", out(reg) pid, options(nomem, nostack, preserves_flags)); }
-    pid
+/// Read the PID of the process currently running on this CPU. None means idle.
+pub fn current_pid() -> Option<crate::process::Pid> {
+    let raw: u32;
+    unsafe { core::arch::asm!("mov {:e}, gs:[136]", out(reg) raw, options(nomem, nostack, preserves_flags)); }
+    if raw == u32::MAX { None } else { Some(crate::process::Pid::from_raw(raw)) }
 }
 
-/// Set the PID of the process running on this CPU.
-pub fn set_current_pid(pid: u32) {
-    unsafe { core::arch::asm!("mov gs:[136], {:e}", in(reg) pid, options(nostack, preserves_flags)); }
+/// Set the PID of the process running on this CPU. None sets idle (u32::MAX).
+pub fn set_current_pid(pid: Option<crate::process::Pid>) {
+    let raw = pid.map_or(u32::MAX, |p| p.raw());
+    unsafe { core::arch::asm!("mov gs:[136], {:e}", in(reg) raw, options(nostack, preserves_flags)); }
 }
 
 fn percpu_ptr() -> *mut PerCpu {

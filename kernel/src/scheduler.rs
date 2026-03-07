@@ -36,7 +36,7 @@ fn schedule(cur_state: ProcessState) {
 
     let mut guard = PROCESS_TABLE.lock();
     let table = guard.as_mut().unwrap();
-    let cur_pid = Pid::from_raw(percpu::current_pid());
+    let cur_pid = percpu::current_pid().expect("schedule() called during idle");
 
     // If current process was already removed (e.g. race with exit cleanup),
     // log a warning and fall through to idle — nothing to save.
@@ -56,7 +56,7 @@ pub fn schedule_already_blocked(guard: crate::sync::LockGuard<'_, Option<Process
 
 fn schedule_inner(mut guard: crate::sync::LockGuard<'_, Option<ProcessTable>>) {
     let table = guard.as_mut().unwrap();
-    let cur_pid = Pid::from_raw(percpu::current_pid());
+    let cur_pid = percpu::current_pid().expect("schedule_inner() called during idle");
     let cur_alive = table.procs.get(cur_pid).is_some();
 
     idle_poll(table);
@@ -96,7 +96,7 @@ fn schedule_inner(mut guard: crate::sync::LockGuard<'_, Option<ProcessTable>>) {
         let new_ks_top = new_proc.kernel_stack.ptr() as u64 + KERNEL_STACK_SIZE as u64;
 
         table.procs.get_mut(new_pid).unwrap().set_state(ProcessState::Running);
-        percpu::set_current_pid(new_pid.raw());
+        percpu::set_current_pid(Some(new_pid));
 
         // Save current process state if it still exists
         let old_rsp_ptr = if let Some(cur_proc) = table.procs.get_mut(cur_pid) {
@@ -126,7 +126,7 @@ fn schedule_inner(mut guard: crate::sync::LockGuard<'_, Option<ProcessTable>>) {
     } else {
         percpu::idle_rsp_ptr()
     };
-    percpu::set_current_pid(u32::MAX);
+    percpu::set_current_pid(None);
     unsafe { percpu::set_kernel_stack(percpu::idle_stack_top()); }
 
     unsafe { cpu::write_cr3(paging::kernel_cr3()); }
@@ -141,7 +141,7 @@ fn schedule_inner(mut guard: crate::sync::LockGuard<'_, Option<ProcessTable>>) {
 /// Schedule without saving current context (used by ap_idle and BSP boot).
 /// Switches to the per-CPU idle stack and enters the idle loop.
 pub fn schedule_no_return() -> ! {
-    percpu::set_current_pid(u32::MAX);
+    percpu::set_current_pid(None);
     unsafe { percpu::set_kernel_stack(percpu::idle_stack_top()); }
     unsafe { cpu::write_cr3(paging::kernel_cr3()); }
     let sp = percpu::idle_stack_top();
@@ -165,7 +165,7 @@ pub fn schedule_no_return() -> ! {
 /// Taking the guard by value ensures callers can't accidentally drop it first.
 pub fn schedule_no_return_locked(guard: crate::sync::LockGuard<'_, Option<ProcessTable>>) -> ! {
     core::mem::forget(guard);
-    percpu::set_current_pid(u32::MAX);
+    percpu::set_current_pid(None);
     unsafe { percpu::set_kernel_stack(percpu::idle_stack_top()); }
     unsafe { cpu::write_cr3(paging::kernel_cr3()); }
     let sp = percpu::idle_stack_top();
@@ -206,7 +206,7 @@ fn cpu_idle_loop() -> ! {
                 let new_ks_top = new_proc.kernel_stack.ptr() as u64 + KERNEL_STACK_SIZE as u64;
 
                 table.procs.get_mut(new_pid).unwrap().set_state(ProcessState::Running);
-                percpu::set_current_pid(new_pid.raw());
+                percpu::set_current_pid(Some(new_pid));
                 unsafe { percpu::set_kernel_stack(new_ks_top); }
 
                 unsafe { cpu::write_cr3(new_cr3); }
@@ -278,8 +278,8 @@ fn idle_poll(table: &mut ProcessTable) {
                     proc.set_state(ProcessState::Ready);
                 }
             }
-            ProcessState::BlockedPoll { fds: ref poll_fds, len, deadline } => {
-                if poll_has_ready_fd(poll_fds, len, &proc.fds)
+            ProcessState::BlockedPoll { deadline } => {
+                if poll_has_ready_fd(&proc.poll_fds, proc.poll_len, &proc.fds)
                     || proc.messages.has_messages()
                     || (deadline > 0 && crate::clock::nanos_since_boot() >= deadline)
                 {
@@ -316,8 +316,8 @@ pub fn wake_pipe_readers(pipe_id: crate::pipe::PipeId) {
             ProcessState::BlockedPipeRead(id) if id == pipe_id => {
                 proc.set_state(ProcessState::Ready);
             }
-            ProcessState::BlockedPoll { fds: ref poll_fds, len, .. } => {
-                if poll_has_ready_fd(poll_fds, len, &proc.fds) {
+            ProcessState::BlockedPoll { .. } => {
+                if poll_has_ready_fd(&proc.poll_fds, proc.poll_len, &proc.fds) {
                     proc.set_state(ProcessState::Ready);
                 }
             }
@@ -335,8 +335,8 @@ pub fn wake_pipe_writers(pipe_id: crate::pipe::PipeId) {
             ProcessState::BlockedPipeWrite(id) if id == pipe_id => {
                 proc.set_state(ProcessState::Ready);
             }
-            ProcessState::BlockedPoll { fds: ref poll_fds, len, .. } => {
-                if poll_has_ready_fd(poll_fds, len, &proc.fds) {
+            ProcessState::BlockedPoll { .. } => {
+                if poll_has_ready_fd(&proc.poll_fds, proc.poll_len, &proc.fds) {
                     proc.set_state(ProcessState::Ready);
                 }
             }

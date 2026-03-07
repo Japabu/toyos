@@ -82,12 +82,6 @@ impl OwnedAlloc {
         Some(Self { ptr, layout })
     }
 
-    /// Wrap an existing allocation. Caller must guarantee that `(ptr, layout)`
-    /// was returned by `alloc_zeroed` (or equivalent) and is not aliased.
-    pub unsafe fn from_raw(ptr: *mut u8, layout: Layout) -> Self {
-        Self { ptr: NonNull::new(ptr).expect("OwnedAlloc::from_raw with null"), layout }
-    }
-
     /// Consume `self` without running `Drop`, returning the raw parts.
     /// The caller takes ownership of the allocation.
     pub fn into_raw(self) -> (*mut u8, Layout) {
@@ -146,7 +140,7 @@ pub enum ProcessState {
     BlockedPipeWrite(pipe::PipeId),
     BlockedWaitPid(Pid),
     BlockedThreadJoin(Pid),
-    BlockedPoll { fds: [u64; 64], len: u32, deadline: u64 },
+    BlockedPoll { deadline: u64 },
     BlockedRecvMsg,
     BlockedNetRecv { deadline: u64 },
     BlockedSleep { deadline: u64 },
@@ -217,6 +211,8 @@ pub struct Process {
     pub user_heap: crate::user_heap::UserHeap,
     pub cwd: String,
     pub messages: MessageQueue,
+    pub poll_fds: [u64; 64],
+    pub poll_len: u32,
     /// PID whose user_heap to use for alloc/free. Self for processes, parent for threads.
     pub heap_owner: Pid,
     // ELF memory (owned; .take() in exit frees immediately)
@@ -280,7 +276,7 @@ pub fn init() {
 }
 
 pub fn current_pid() -> Pid {
-    Pid::from_raw(percpu::current_pid())
+    percpu::current_pid().expect("current_pid() called during idle (no process running)")
 }
 
 /// Access the current process immutably. The process table lock is held for
@@ -498,6 +494,8 @@ pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64) -> Option<Pid> {
         fds: FdTable::new(),
         user_heap: crate::user_heap::UserHeap::new(), // unused — routes through heap_owner
         messages: MessageQueue::new(),
+        poll_fds: [0; 64],
+        poll_len: 0,
         cwd: parent_cwd,
         heap_owner: parent_heap_owner,
         elf_alloc: None,
@@ -695,6 +693,8 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>) -> Option<Pid> {
         fds,
         user_heap: crate::user_heap::UserHeap::new(),
         messages: MessageQueue::new(),
+        poll_fds: [0; 64],
+        poll_len: 0,
         cwd,
         heap_owner: Pid::from_raw(0),
         elf_alloc: Some(elf_alloc),
@@ -870,6 +870,17 @@ pub fn thread_exit(code: i32) -> ! {
 /// Block the current process and switch to the next ready one.
 pub fn block(reason: ProcessState) {
     scheduler::block(reason);
+}
+
+pub fn block_poll(fds: [u64; 64], len: u32, deadline: u64) {
+    {
+        let mut guard = PROCESS_TABLE.lock();
+        let table = guard.as_mut().unwrap();
+        let proc = table.procs.get_mut(current_pid()).unwrap();
+        proc.poll_fds = fds;
+        proc.poll_len = len;
+    }
+    scheduler::block(ProcessState::BlockedPoll { deadline });
 }
 
 /// Cooperative yield: mark current as Ready, switch to next.

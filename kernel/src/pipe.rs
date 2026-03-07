@@ -143,27 +143,23 @@ pub fn all_empty() -> bool {
 
 pub fn add_reader(pipe_id: PipeId) {
     with_pipes_mut(|pipes| {
-        if let Some(pipe) = pipes.get_mut(pipe_id) {
-            pipe.readers = pipe.readers.saturating_add(1);
-        }
+        let pipe = pipes.get_mut(pipe_id).expect("add_reader: pipe not found");
+        pipe.readers = pipe.readers.checked_add(1).expect("pipe reader overflow");
     });
 }
 
 pub fn add_writer(pipe_id: PipeId) {
     with_pipes_mut(|pipes| {
-        if let Some(pipe) = pipes.get_mut(pipe_id) {
-            pipe.writers = pipe.writers.saturating_add(1);
-        }
+        let pipe = pipes.get_mut(pipe_id).expect("add_writer: pipe not found");
+        pipe.writers = pipe.writers.checked_add(1).expect("pipe writer overflow");
     });
 }
 
 pub fn close_read(pipe_id: PipeId) {
     with_pipes_mut(|pipes| {
-        let should_remove = pipes.get_mut(pipe_id).map(|pipe| {
-            pipe.readers = pipe.readers.saturating_sub(1);
-            pipe.readers == 0 && pipe.writers == 0
-        });
-        if should_remove == Some(true) {
+        let pipe = pipes.get_mut(pipe_id).expect("close_read: pipe not found");
+        pipe.readers = pipe.readers.checked_sub(1).expect("pipe reader underflow");
+        if pipe.readers == 0 && pipe.writers == 0 {
             pipes.remove(pipe_id);
         }
     });
@@ -171,11 +167,9 @@ pub fn close_read(pipe_id: PipeId) {
 
 pub fn close_write(pipe_id: PipeId) {
     with_pipes_mut(|pipes| {
-        let should_remove = pipes.get_mut(pipe_id).map(|pipe| {
-            pipe.writers = pipe.writers.saturating_sub(1);
-            pipe.readers == 0 && pipe.writers == 0
-        });
-        if should_remove == Some(true) {
+        let pipe = pipes.get_mut(pipe_id).expect("close_write: pipe not found");
+        pipe.writers = pipe.writers.checked_sub(1).expect("pipe writer underflow");
+        if pipe.readers == 0 && pipe.writers == 0 {
             pipes.remove(pipe_id);
         }
     });

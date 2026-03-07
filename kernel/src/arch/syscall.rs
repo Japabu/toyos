@@ -324,6 +324,11 @@ fn sys_write(fd_num: u64, buf: &[u8]) -> u64 {
     }
 }
 
+enum ReadBlock {
+    State(process::ProcessState),
+    Poll { fds: [u64; 64], len: u32, deadline: u64 },
+}
+
 fn sys_read(fd_num: u64, buf: &mut [u8]) -> u64 {
     loop {
         // Single lock: try read + determine wake/block action
@@ -337,15 +342,15 @@ fn sys_read(fd_num: u64, buf: &mut [u8]) -> u64 {
                     Ok((n, pipe_id))
                 }
                 None => match proc.fds.get(fd_num) {
-                    Some(fd::Descriptor::Keyboard) => Err(Some(process::ProcessState::BlockedKeyboard)),
+                    Some(fd::Descriptor::Keyboard) => Err(Some(ReadBlock::State(process::ProcessState::BlockedKeyboard))),
                     Some(fd::Descriptor::PipeRead(id)) | Some(fd::Descriptor::TtyRead(id)) =>
-                        Err(Some(process::ProcessState::BlockedPipeRead(*id))),
+                        Err(Some(ReadBlock::State(process::ProcessState::BlockedPipeRead(*id)))),
                     Some(fd::Descriptor::SerialConsole) => {
                         // Poll serial every 10ms
                         let deadline = crate::clock::nanos_since_boot() + 10_000_000;
-                        let mut poll_fds = [0u64; 64];
-                        poll_fds[0] = fd_num;
-                        Err(Some(process::ProcessState::BlockedPoll { fds: poll_fds, len: 1, deadline }))
+                        let mut fds = [0u64; 64];
+                        fds[0] = fd_num;
+                        Err(Some(ReadBlock::Poll { fds, len: 1, deadline }))
                     }
                     _ => Err(None),
                 },
@@ -356,7 +361,8 @@ fn sys_read(fd_num: u64, buf: &mut [u8]) -> u64 {
                 if let Some(id) = pipe_id { process::wake_pipe_writers(id); }
                 return n;
             }
-            Err(Some(reason)) => process::block(reason),
+            Err(Some(ReadBlock::State(reason))) => process::block(reason),
+            Err(Some(ReadBlock::Poll { fds, len, deadline })) => process::block_poll(fds, len, deadline),
             Err(None) => return SyscallError::NotFound.to_u64(),
         }
     }
@@ -639,7 +645,7 @@ fn sys_poll(fds: &[u64], fds_len: u64, timeout_nanos: u64) -> u64 {
         let mut poll_fds = [0u64; 64];
         let copy_len = (fds_len as usize).min(64);
         poll_fds[..copy_len].copy_from_slice(&fds[..copy_len]);
-        process::block(process::ProcessState::BlockedPoll { fds: poll_fds, len: copy_len as u32, deadline });
+        process::block_poll(poll_fds, copy_len as u32, deadline);
     }
 }
 

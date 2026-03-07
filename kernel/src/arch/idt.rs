@@ -411,12 +411,14 @@ extern "C" fn exception_handler(
     };
 
     if is_user {
-        let pid = percpu::current_pid();
+        let pid = percpu::current_pid().expect("user-mode fault with no current process");
         log!("Process {} crashed: {}", pid, detail);
     } else {
         let cpu = percpu::cpu_id();
-        let pid = percpu::current_pid();
-        let pid_str = if pid == u32::MAX { format!("idle") } else { format!("{}", pid) };
+        let pid_str = match percpu::current_pid() {
+            Some(pid) => format!("{}", pid),
+            None => format!("idle"),
+        };
         log!("KERNEL PANIC on CPU {} (pid={}): {}", cpu, pid_str, detail);
     }
     log!("  rip: {}", format_addr(rip, is_user));
