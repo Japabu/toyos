@@ -1,3 +1,7 @@
+// Force-link toyos-libc so its C symbols (malloc, printf, etc.) are
+// available to the C code compiled by the build script.
+extern crate toyos_libc;
+
 use core::ffi::c_void;
 use std::ptr::addr_of_mut;
 use std::time::Instant;
@@ -297,7 +301,7 @@ unsafe extern "C" fn toyos_update_sound() {
         core::ptr::addr_of!(OUT_BUF) as *const u8,
         MIX_BUF_SAMPLES * 2,
     );
-    toyos_abi::syscall::audio_write(bytes);
+    std::os::toyos::audio::write_samples(bytes);
 }
 
 unsafe extern "C" fn toyos_update_sound_params(handle: i32, vol: i32, sep: i32) {
@@ -572,18 +576,10 @@ pub extern "C" fn DG_AudioWrite(buf: *const u8, len: u32) {
         return;
     }
     let samples = unsafe { core::slice::from_raw_parts(buf, len as usize) };
-    toyos_abi::syscall::audio_write(samples);
+    std::os::toyos::audio::write_samples(samples);
 }
 
 fn main() {
-    // Force toyos-libc symbols to be linked in
-    toyos_libc::_libc_ctype_init();
-    toyos_libc::_libc_math_init();
-    toyos_libc::_libc_memory_init();
-    toyos_libc::_libc_printf_init();
-    toyos_libc::_libc_stdio_init();
-    toyos_libc::_libc_string_init();
-
     // Build argv with default WAD path
     let args: Vec<&[u8]> = vec![
         b"doom\0",

@@ -3,9 +3,7 @@ use super::*;
 impl Codegen {
     pub(crate) fn expr_type(&mut self, ctx: &FuncCtx, expr: &Expr) -> CType {
         verbose_enter!("expr_type", "{:?}", std::mem::discriminant(expr));
-        let result = stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || {
-            self.expr_type_inner(ctx, expr)
-        });
+        let result = self.expr_type_inner(ctx, expr);
         verbose!("expr_type => {:?}", result);
         verbose_leave!();
         result

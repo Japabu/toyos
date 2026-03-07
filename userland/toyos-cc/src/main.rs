@@ -27,9 +27,7 @@ fn run() {
         }
     }
 
-    if !args.preprocess_only {
-        eprintln!("toyos-cc: starting");
-    }
+
 
     let mut link_objects: Vec<(String, Vec<u8>)> = Vec::new();
 

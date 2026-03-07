@@ -5,10 +5,3 @@ version = 4
 [[package]]
 name = "filepicker-api"
 version = "0.1.0"
-dependencies = [
- "toyos-abi",
-]
-
-[[package]]
-name = "toyos-abi"
-version = "0.1.0"

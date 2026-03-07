@@ -32,8 +32,6 @@ impl Default for CompileOptions {
 /// Compile a C source string to object file bytes.
 ///
 /// `filename` is used for error messages and `__FILE__`.
-/// Thread-safe: can be called from multiple threads concurrently.
-/// Deep recursion is handled by `stacker::maybe_grow` in parsing and codegen.
 pub fn compile(source: &str, filename: &str, options: &CompileOptions) -> Vec<u8> {
     let mut pp = preprocess::Preprocessor::new(
         options.include_paths.clone(),

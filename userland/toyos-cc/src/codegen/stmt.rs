@@ -209,9 +209,7 @@ impl Codegen {
             Statement::Asm(_) => "Asm",
         };
         verbose_enter!("compile_stmt", "{}", stmt_name);
-        stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || {
-            self.compile_stmt_inner(ctx, stmt);
-        });
+        self.compile_stmt_inner(ctx, stmt);
         verbose_leave!();
     }
 

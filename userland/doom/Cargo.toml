@@ -6,8 +6,7 @@ build = "build.rs"
 
 [dependencies]
 window = { path = "../window" }
-toyos-abi = { path = "../../toyos-abi" }
-toyos-libc = { path = "../libc" }
+toyos-libc = { path = "../libc", features = ["std-runtime"] }
 
 [patch.crates-io]
 getrandom = { path = "../getrandom" }

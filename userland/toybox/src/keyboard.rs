@@ -7,7 +7,7 @@ pub fn main(args: Vec<String>) {
             return;
         }
     };
-    if toyos_abi::syscall::set_keyboard_layout(name) {
+    if std::os::toyos::system::set_keyboard_layout(name) {
         println!("Keyboard layout set to '{}'", name);
     } else {
         eprintln!("keyboard: unknown layout '{}'", name);

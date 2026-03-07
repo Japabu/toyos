@@ -32,6 +32,7 @@ fn main() {
     let mut build = cc::Build::new();
     build
         .compiler(&toyos_cc)
+        .cargo_warnings(false)
         .include("../libc/include")
         .include("include")
         .include("doomgeneric")

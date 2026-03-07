@@ -65,9 +65,7 @@ impl Codegen {
             Expr::Builtin(n, _) => format!("Builtin({n})"),
         };
         verbose_enter!("compile_expr", "{}", expr_name);
-        let result = stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || {
-            self.compile_expr_inner(ctx, expr)
-        });
+        let result = self.compile_expr_inner(ctx, expr);
         verbose_leave!();
         result
     }

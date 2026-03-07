@@ -438,7 +438,6 @@ impl Codegen {
         let name = self.get_declarator_name(&fdef.declarator);
         if name.is_empty() { return; }
         crate::verbose::reset_depth();
-        eprintln!("compiling: {name}");
 
         let base_ty = self.resolve_type(&fdef.specifiers);
         let func_ty = self.apply_declarator(&base_ty, &fdef.declarator);

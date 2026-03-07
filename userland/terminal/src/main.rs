@@ -1,8 +1,9 @@
 mod console;
 
 use std::io::{Read, Write};
-use std::os::toyos::io::AsRawFd;
-use toyos_abi::syscall;
+use std::os::toyos::gpu;
+use std::os::fd::AsRawFd;
+use std::os::toyos::poll;
 use std::os::toyos::process;
 use std::process::Command;
 
@@ -17,7 +18,7 @@ fn main() {
         .expect("failed to spawn shell");
 
     let mut window = Window::create_with_title(0, 0, "Terminal");
-    syscall::set_screen_size(window.width(), window.height());
+    gpu::set_screen_size(window.width(), window.height());
     let fb = window.framebuffer();
     let font_data = std::fs::read("/initrd/JetBrainsMono-8x16.font").expect("failed to read font");
     let font = font::Font::from_prebuilt(&font_data);
@@ -25,12 +26,12 @@ fn main() {
 
     let mut shell_stdin = child.stdin.take().unwrap();
     let mut shell_stdout = child.stdout.take().unwrap();
-    let shell_stdout_fd = shell_stdout.as_raw_fd();
+    let shell_stdout_fd = shell_stdout.as_raw_fd() as u64;
 
     loop {
-        let ready = syscall::poll(&[syscall::Fd(shell_stdout_fd)]);
+        let ready = poll::poll(&[shell_stdout_fd], None);
 
-        if ready.fd(0) {
+        if ready.fd_ready(0) {
             let mut buf = [0u8; 4096];
             let n = shell_stdout.read(&mut buf).unwrap_or(0);
             if n == 0 {
@@ -41,7 +42,7 @@ fn main() {
             window.present();
         }
 
-        if ready.messages() {
+        if ready.has_messages() {
             match window.recv_event() {
                 window::Event::KeyInput(event) => {
                     if event.gui() && event.keycode == 0x06 {
@@ -88,7 +89,7 @@ fn main() {
                 }
                 window::Event::Close => break,
                 window::Event::Resized => {
-                    syscall::set_screen_size(window.width(), window.height());
+                    gpu::set_screen_size(window.width(), window.height());
                     console.resize(window.framebuffer());
                     window.present();
                 }

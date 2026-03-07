@@ -901,7 +901,7 @@ pub(crate) fn extract_archive(name: &str, data: &[u8], out: &mut Vec<(String, Ve
 }
 
 pub(crate) fn find_lib(name: &str, paths: &[PathBuf]) -> Option<(String, Vec<u8>)> {
-    let exact = [format!("lib{name}.so"), format!("lib{name}.rlib"), format!("lib{name}.a")];
+    let exact = [format!("lib{name}.so"), format!("lib{name}.a"), format!("lib{name}.rlib")];
     for dir in paths {
         for candidate in &exact {
             let path = dir.join(candidate);

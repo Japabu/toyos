@@ -2,8 +2,8 @@ use filepicker_api::{FilePickerRequest, PickerMode, MSG_FILEPICKER_REQUEST, MSG_
 use font::Font;
 use std::fs;
 use std::os::toyos::message::{self, Message};
+use std::os::toyos::services;
 use std::path::{Path, PathBuf};
-use toyos_abi::syscall;
 use window::{Color, Event, Framebuffer, KeyEvent, MouseEvent, Window};
 
 // --- Colors (matching editor theme) ---
@@ -460,7 +460,7 @@ fn run_picker(mode: PickerMode, start_dir: &str, client_pid: u32) {
 // --- Main daemon loop ---
 
 fn main() {
-    syscall::register_name("filepicker").expect("filepicker: name already taken");
+    services::register("filepicker").expect("filepicker: name already taken");
 
     loop {
         let msg = message::recv();

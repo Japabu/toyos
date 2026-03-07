@@ -2,13 +2,16 @@ pub mod framebuffer;
 
 pub use framebuffer::{Color, Framebuffer};
 
-use toyos_abi::syscall;
 use std::os::toyos::message::{self, Message};
+use std::os::toyos::poll;
+use std::os::toyos::services;
+use std::os::toyos::shm::SharedMemory;
 use std::sync::OnceLock;
+use std::time::Duration;
 
 fn compositor_pid() -> u32 {
     static PID: OnceLock<u32> = OnceLock::new();
-    *PID.get_or_init(|| syscall::find_pid("compositor").expect("no compositor running").0)
+    *PID.get_or_init(|| services::find("compositor").expect("no compositor running"))
 }
 
 // Window flags
@@ -125,7 +128,7 @@ pub fn set_cursor(style: u8) {
 }
 
 pub struct Window {
-    buffer: *mut u8,
+    shm: SharedMemory,
     width: u32,
     height: u32,
     pixel_format: u32,
@@ -164,10 +167,11 @@ impl Window {
         let response = message::recv();
         assert_eq!(response.msg_type(), MSG_WINDOW_CREATED, "unexpected message from compositor");
         let info: WindowInfo = response.take_payload();
-        let buffer = syscall::map_shared(info.token);
+        let buf_size = info.stride as usize * info.height as usize * 4;
+        let shm = SharedMemory::map(info.token, buf_size);
 
         Self {
-            buffer,
+            shm,
             width: info.width,
             height: info.height,
             pixel_format: info.pixel_format,
@@ -182,8 +186,8 @@ impl Window {
 
     /// Wait up to `timeout_nanos` for an event. Returns `None` on timeout.
     pub fn poll_event(&mut self, timeout_nanos: u64) -> Option<Event> {
-        let result = syscall::poll_timeout(&[], Some(timeout_nanos));
-        if result.messages() {
+        let result = poll::poll(&[], Some(Duration::from_nanos(timeout_nanos)));
+        if result.has_messages() {
             Some(self.recv_event())
         } else {
             None
@@ -196,8 +200,8 @@ impl Window {
             MSG_MOUSE_INPUT => Event::MouseInput(msg.take_payload()),
             MSG_WINDOW_RESIZED => {
                 let info: ResizeInfo = msg.take_payload();
-                syscall::release_shared(info.old_token);
-                self.buffer = syscall::map_shared(info.token);
+                let buf_size = info.stride as usize * info.height as usize * 4;
+                self.shm = SharedMemory::map(info.token, buf_size);
                 self.width = info.width;
                 self.height = info.height;
                 self.pixel_format = info.pixel_format;
@@ -225,7 +229,7 @@ impl Window {
 
     pub fn framebuffer(&self) -> Framebuffer {
         Framebuffer::new(
-            self.buffer,
+            self.shm.as_ptr(),
             self.width as usize,
             self.height as usize,
             self.width as usize,

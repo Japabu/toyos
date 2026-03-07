@@ -1,6 +1,11 @@
+use std::fs::File;
+use std::io::Read;
+use std::os::fd::AsRawFd;
 use std::os::toyos::message::{self, Message};
-use toyos_abi::syscall;
+use std::os::toyos::shm::SharedMemory;
+use std::os::toyos::{device, gpu, poll, services, system};
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 use window::{Color, Framebuffer};
 
@@ -15,8 +20,8 @@ const CASCADE_OFFSET: usize = 30;
 const TASKBAR_HEIGHT: usize = 32;
 const TASKBAR_ITEM_WIDTH: usize = 160;
 const TASKBAR_PADDING: usize = 4;
-const DOUBLE_CLICK_NS: u64 = 400_000_000;
-const FRAME_INTERVAL_NS: u64 = 16_666_667; // ~60fps
+const DOUBLE_CLICK_TIME: Duration = Duration::from_millis(400);
+const FRAME_INTERVAL: Duration = Duration::from_nanos(16_666_667); // ~60fps
 
 const FOCUSED_TITLE_COLOR: Color = Color { r: 0x3a, g: 0x3a, b: 0x4e };
 const UNFOCUSED_TITLE_COLOR: Color = Color { r: 0x28, g: 0x28, b: 0x32 };
@@ -62,7 +67,7 @@ struct FramebufferInfo {
     flags: u32,
 }
 
-fn read_fb_info(fd: syscall::Fd) -> FramebufferInfo {
+fn read_fb_info(file: &mut File) -> FramebufferInfo {
     let mut info = FramebufferInfo {
         token: [0; 2],
         cursor_token: 0,
@@ -78,7 +83,7 @@ fn read_fb_info(fd: syscall::Fd) -> FramebufferInfo {
             std::mem::size_of::<FramebufferInfo>(),
         )
     };
-    let n = syscall::read(fd, buf).expect("failed to read framebuffer info");
+    let n = file.read(buf).expect("failed to read framebuffer info");
     assert!(
         n == std::mem::size_of::<FramebufferInfo>(),
         "failed to read framebuffer info"
@@ -88,9 +93,7 @@ fn read_fb_info(fd: syscall::Fd) -> FramebufferInfo {
 
 struct WindowState {
     pid: u32,
-    token: u32,
-    buffer: *mut u8,
-    buffer_size: usize,
+    shm: SharedMemory,
     content_x: usize,
     content_y: usize,
     width: usize,
@@ -165,14 +168,13 @@ fn bring_to_front(windows: &mut Vec<WindowState>, idx: usize) -> usize {
 }
 
 fn resize_window(win: &mut WindowState, new_w: usize, new_h: usize, pixel_format: u32) {
-    let old_token = win.token;
+    let old_token = win.shm.token();
     let buf_size = new_w * new_h * 4;
-    let token = syscall::alloc_shared(buf_size);
-    let buffer = syscall::map_shared(token);
-    syscall::grant_shared(token, syscall::Pid(win.pid));
-    win.token = token;
-    win.buffer = buffer;
-    win.buffer_size = buf_size;
+    let new_shm = SharedMemory::allocate(buf_size);
+    new_shm.grant(win.pid);
+    let token = new_shm.token();
+    // Replace the old SharedMemory (drops it, releasing the old mapping)
+    win.shm = new_shm;
     win.width = new_w;
     win.height = new_h;
     win.buf_width = new_w;
@@ -191,7 +193,6 @@ fn resize_window(win: &mut WindowState, new_w: usize, new_h: usize, pixel_format
             },
         ),
     ).ok();
-    syscall::release_shared(old_token);
 }
 
 fn save_if_normal(win: &mut WindowState) {
@@ -526,7 +527,7 @@ fn draw_window(
         let src_x = cx - win.content_x;
         let src_y = cy - win.content_y;
         let src_offset = (src_y * win.buf_width + src_x) * 4;
-        let buffer_slice = unsafe { std::slice::from_raw_parts(win.buffer, win.buffer_size) };
+        let buffer_slice = unsafe { std::slice::from_raw_parts(win.shm.as_ptr(), win.shm.len()) };
         screen.blit(cx, cy, cr - cx, cb - cy, win.buf_width, &buffer_slice[src_offset..]);
     }
 }
@@ -587,7 +588,7 @@ fn draw_taskbar(
     font.draw_char(screen, plus_x, text_y, '+', TASKBAR_NEW_TEXT, TASKBAR_NEW_COLOR);
 
     // System stats + clock on the right
-    let time = syscall::clock_realtime();
+    let time = system::clock_realtime();
     let hours = time.hours;
     let minutes = time.minutes;
 
@@ -632,7 +633,7 @@ fn upload_cursor(cursor_buf: *mut u8, sprite: &sprite::Sprite, hw_cursor: bool) 
         }
     }
     if hw_cursor {
-        syscall::gpu_set_cursor(0, 0);
+        gpu::set_cursor(0, 0);
     }
 }
 
@@ -671,16 +672,17 @@ fn draw_software_cursor(screen: &Framebuffer, sprite: &sprite::Sprite, cx: i32, 
 }
 
 fn main() {
-    syscall::register_name("compositor").expect("compositor already running");
+    services::register("compositor").expect("compositor already running");
 
-    let kb_fd = syscall::open_device(syscall::DeviceType::Keyboard).expect("failed to claim keyboard");
-    let mouse_fd = syscall::open_device(syscall::DeviceType::Mouse).expect("failed to claim mouse");
-    let fb_fd = syscall::open_device(syscall::DeviceType::Framebuffer).expect("failed to claim framebuffer");
+    let mut kb_file = device::open_keyboard().expect("failed to claim keyboard");
+    let mut mouse_file = device::open_mouse().expect("failed to claim mouse");
+    let mut fb_file = device::open_framebuffer().expect("failed to claim framebuffer");
 
-    let fb_info = read_fb_info(fb_fd);
-    let fb_addr = syscall::map_shared(fb_info.token[0]);
+    let fb_info = read_fb_info(&mut fb_file);
+    let fb_size = fb_info.stride as usize * fb_info.height as usize * 4;
+    let fb_shm = SharedMemory::map(fb_info.token[0], fb_size);
     let screen = Framebuffer::new(
-        fb_addr,
+        fb_shm.as_ptr(),
         fb_info.width as usize,
         fb_info.height as usize,
         fb_info.stride as usize,
@@ -689,7 +691,8 @@ fn main() {
 
     // Set up cursor
     let hw_cursor = fb_info.flags & FLAG_HARDWARE_CURSOR != 0;
-    let cursor_buf = syscall::map_shared(fb_info.cursor_token);
+    let cursor_shm = SharedMemory::map(fb_info.cursor_token, 64 * 64 * 4);
+    let cursor_buf = cursor_shm.as_ptr();
     let cursor_svg = std::fs::read("/initrd/cursor-bold.svg").expect("failed to read cursor");
     let cursor_default = sprite::Sprite::from_svg_colored(&cursor_svg, 20, [255, 255, 255]);
     let resize_svg =
@@ -750,12 +753,12 @@ fn main() {
     let mut cursor_x = screen_w / 2;
     let mut cursor_y = screen_h / 2;
     if hw_cursor {
-        syscall::gpu_move_cursor(cursor_x as u32, cursor_y as u32);
+        gpu::move_cursor(cursor_x as u32, cursor_y as u32);
     }
     let mut dirty_rect: Option<DirtyRect> = Some(DirtyRect::full(screen_w as usize, screen_h as usize));
     let mut prev_buttons: u8 = 0;
     let mut interaction = Interaction::None;
-    let mut last_title_click_time: u64 = 0;
+    let mut last_title_click_time = Instant::now();
     let mut last_title_click_pid: u32 = 0;
     let mut clipboard = String::new();
     Command::new("/initrd/filepicker").spawn().ok();
@@ -763,22 +766,25 @@ fn main() {
     let mut prev_busy_ticks: u64 = 0;
     let mut prev_total_ticks: u64 = 0;
     let mut cpu_pct: u64 = 0;
-    let mut last_taskbar_update: u64 = 0;
+    let mut last_taskbar_update = Instant::now();
     let mut cached_stats = SystemStats { used_mb: 0, total_mb: 0, cpu_pct: 0 };
 
     loop {
         // Drain all pending events before compositing
         let mut waited = false;
         loop {
-            let timeout = if waited { 1 } else { FRAME_INTERVAL_NS };
-            let ready = syscall::poll_timeout(&[kb_fd, mouse_fd], Some(timeout));
+            let timeout = if waited { Duration::from_nanos(1) } else { FRAME_INTERVAL };
+            let ready = poll::poll(
+                &[kb_file.as_raw_fd() as u64, mouse_file.as_raw_fd() as u64],
+                Some(timeout),
+            );
 
-            if !ready.fd(0) && !ready.fd(1) && !ready.messages() {
+            if !ready.fd_ready(0) && !ready.fd_ready(1) && !ready.has_messages() {
                 break;
             }
             waited = true;
 
-        if ready.fd(0) {
+        if ready.fd_ready(0) {
             let mut events = [window::KeyEvent::EMPTY; 8];
             let buf = unsafe {
                 std::slice::from_raw_parts_mut(
@@ -786,7 +792,7 @@ fn main() {
                     std::mem::size_of_val(&events),
                 )
             };
-            let n = syscall::read(kb_fd, buf).unwrap_or(0);
+            let n = kb_file.read(buf).unwrap_or(0);
             for event in &events[..n / std::mem::size_of::<window::KeyEvent>()] {
                 if launcher_open && event.pressed() && event.keycode == 0x29 {
                     // Escape: close launcher
@@ -896,10 +902,10 @@ fn main() {
             }
         }
 
-        if ready.fd(1) {
+        if ready.fd_ready(1) {
             // Drain all pending mouse events in one read
             let mut buf = [0u8; 512];
-            let n = syscall::read(mouse_fd, &mut buf).unwrap_or(0);
+            let n = mouse_file.read(&mut buf).unwrap_or(0);
             let event_count = n / 4;
 
             // Accumulate deltas and track button transitions
@@ -931,7 +937,7 @@ fn main() {
                 cursor_x = (cursor_x + total_dx).clamp(0, screen_w - 1);
                 cursor_y = (cursor_y + total_dy).clamp(0, screen_h - 1);
                 if hw_cursor {
-                    syscall::gpu_move_cursor(cursor_x as u32, cursor_y as u32);
+                    gpu::move_cursor(cursor_x as u32, cursor_y as u32);
                 } else {
                     // Software cursor: mark old and new cursor regions dirty
                     let cw = 20usize;
@@ -1017,10 +1023,10 @@ fn main() {
                             let new_idx = bring_to_front(&mut windows, idx);
 
                             // Double-click detection
-                            let now = syscall::clock_nanos();
+                            let now = Instant::now();
                             let pid = windows[new_idx].pid;
                             if pid == last_title_click_pid
-                                && now.wrapping_sub(last_title_click_time) < DOUBLE_CLICK_NS
+                                && now.duration_since(last_title_click_time) < DOUBLE_CLICK_TIME
                             {
                                 let pixel_format = screen.pixel_format_raw();
                                 if windows[new_idx].mode != WindowMode::Normal {
@@ -1034,7 +1040,7 @@ fn main() {
                                     );
                                 }
                                 last_title_click_pid = 0;
-                                last_title_click_time = 0;
+                                last_title_click_time = now - DOUBLE_CLICK_TIME;
                             } else {
                                 last_title_click_pid = pid;
                                 last_title_click_time = now;
@@ -1222,7 +1228,7 @@ fn main() {
             }
         }
 
-        if ready.messages() {
+        if ready.has_messages() {
             let msg = message::recv();
             let sender = msg.sender();
             match msg.msg_type() {
@@ -1265,17 +1271,15 @@ fn main() {
                     let content_h = win_h - BORDER_WIDTH * 2 - TITLE_BAR_HEIGHT;
 
                     let buf_size = content_w * content_h * 4;
-                    let token = syscall::alloc_shared(buf_size);
-                    let buffer = syscall::map_shared(token);
-                    syscall::grant_shared(token, syscall::Pid(sender));
+                    let shm = SharedMemory::allocate(buf_size);
+                    shm.grant(sender);
+                    let token = shm.token();
                     let pixel_format = screen.pixel_format_raw();
 
                     let topmost = req.flags & window::WINDOW_FLAG_TOPMOST != 0;
                     windows.push(WindowState {
                         pid: sender,
-                        token,
-                        buffer,
-                        buffer_size: buf_size,
+                        shm,
                         content_x,
                         content_y,
                         width: content_w,
@@ -1337,12 +1341,12 @@ fn main() {
         } // end inner drain loop
 
         // Refresh taskbar once per second for clock + stats
-        let now = syscall::clock_nanos();
-        if now - last_taskbar_update >= 1_000_000_000 {
+        let now = Instant::now();
+        if now.duration_since(last_taskbar_update) >= Duration::from_secs(1) {
             last_taskbar_update = now;
 
             let mut si = [0u8; 48];
-            if syscall::sysinfo(&mut si) >= 48 {
+            if system::sysinfo(&mut si) >= 48 {
                 let total_mem = u64::from_le_bytes(si[0..8].try_into().unwrap());
                 let used_mem = u64::from_le_bytes(si[8..16].try_into().unwrap());
                 let busy = u64::from_le_bytes(si[32..40].try_into().unwrap());
@@ -1384,7 +1388,7 @@ fn main() {
                     draw_software_cursor(&screen, sprite, cursor_x, cursor_y);
                 }
 
-                syscall::gpu_present(rect.x as u32, rect.y as u32, rect.w as u32, rect.h as u32);
+                gpu::present(rect.x as u32, rect.y as u32, rect.w as u32, rect.h as u32);
 
                 // Send frame callbacks to windows that presented and were composited
                 for win in windows.iter_mut() {

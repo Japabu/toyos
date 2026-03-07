@@ -1,60 +1,97 @@
 use std::collections::HashMap;
+use std::os::fd::AsRawFd;
+use std::os::toyos::io as toyos_io;
 use std::os::toyos::message::{self, Message};
-use toyos_abi::net::*;
-use toyos_abi::syscall;
+use std::os::toyos::net as toyos_nic;
+use std::os::toyos::pipe as toyos_pipe;
+use std::os::toyos::poll as toyos_poll;
+use std::os::toyos::services;
+use std::time::{Duration, Instant};
+use toyos_net::*;
 
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{self, Device, DeviceCapabilities, Medium};
 use smoltcp::socket::{dns, tcp, udp};
-use smoltcp::time::Instant;
+use smoltcp::time::Instant as SmoltcpInstant;
 use smoltcp::wire::{DnsQueryType, EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint};
 
 use std::net::Ipv4Addr;
 
+use std::os::toyos::device as toyos_device;
+use std::os::toyos::shm;
+
 // --- smoltcp Device wrapper ---
 
-struct ToyNic {
-    rx_buf: [u8; 1514],
-    pending_rx: Option<usize>, // length of received frame in rx_buf
+struct DmaNic {
+    rx_bufs: [*const u8; 3],
+    tx_buf: *mut u8,
+    net_hdr_size: usize,
+    mac: [u8; 6],
+    pending_rx: Option<(usize, usize)>,
+    _nic_file: std::fs::File,
 }
 
-impl ToyNic {
+impl DmaNic {
     fn new() -> Self {
+        use std::io::Read;
+
+        // Claim the NIC device
+        let mut nic_file = toyos_device::open_nic().expect("netd: failed to claim NIC device");
+
+        // Read NicInfo from the device fd
+        let mut info_bytes = [0u8; core::mem::size_of::<toyos_abi::net::NicInfo>()];
+        nic_file.read_exact(&mut info_bytes).expect("netd: failed to read NicInfo");
+        let info: toyos_abi::net::NicInfo = unsafe { core::ptr::read(info_bytes.as_ptr() as *const _) };
+
+        // Map all DMA buffers into our address space (each is one 4096-byte page)
+        let mut rx_bufs = [core::ptr::null::<u8>(); 3];
+        for i in 0..info.rx_buf_count as usize {
+            let region = shm::SharedMemory::map(info.rx_buf_tokens[i], 4096);
+            rx_bufs[i] = region.as_ptr() as *const u8;
+            std::mem::forget(region); // keep mapped for lifetime of process
+        }
+        let tx_region = shm::SharedMemory::map(info.tx_buf_token, 4096);
+        let tx_ptr = tx_region.as_ptr();
+        std::mem::forget(tx_region);
+
         Self {
-            rx_buf: [0; 1514],
+            rx_bufs,
+            tx_buf: tx_ptr,
+            net_hdr_size: info.net_hdr_size as usize,
+            mac: info.mac,
             pending_rx: None,
+            _nic_file: nic_file,
         }
     }
 
-    /// Try to receive a frame. Must be called before iface.poll().
     fn try_recv(&mut self) {
         if self.pending_rx.is_some() {
             return;
         }
-        let n = syscall::net_recv_timeout(&mut self.rx_buf, Some(0));
-        if n > 0 {
-            self.pending_rx = Some(n);
-        }
+        self.pending_rx = toyos_nic::nic_rx_poll();
     }
 }
 
-impl Device for ToyNic {
-    type RxToken<'a> = ToyRxToken<'a>;
-    type TxToken<'a> = ToyTxToken;
+impl Device for DmaNic {
+    type RxToken<'a> = DmaRxToken<'a>;
+    type TxToken<'a> = DmaTxToken<'a>;
 
-    fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        if let Some(len) = self.pending_rx.take() {
-            Some((
-                ToyRxToken { buf: &self.rx_buf[..len] },
-                ToyTxToken,
-            ))
-        } else {
-            None
-        }
+    fn receive(&mut self, _timestamp: SmoltcpInstant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        let (buf_idx, frame_len) = self.pending_rx.take()?;
+        let data = unsafe {
+            core::slice::from_raw_parts(
+                self.rx_bufs[buf_idx].add(self.net_hdr_size),
+                frame_len,
+            )
+        };
+        Some((
+            DmaRxToken { data, buf_idx },
+            DmaTxToken { tx_buf: self.tx_buf, net_hdr_size: self.net_hdr_size, _phantom: core::marker::PhantomData },
+        ))
     }
 
-    fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
-        Some(ToyTxToken)
+    fn transmit(&mut self, _timestamp: SmoltcpInstant) -> Option<Self::TxToken<'_>> {
+        Some(DmaTxToken { tx_buf: self.tx_buf, net_hdr_size: self.net_hdr_size, _phantom: core::marker::PhantomData })
     }
 
     fn capabilities(&self) -> DeviceCapabilities {
@@ -65,30 +102,44 @@ impl Device for ToyNic {
     }
 }
 
-struct ToyRxToken<'a> {
-    buf: &'a [u8],
+struct DmaRxToken<'a> {
+    data: &'a [u8],
+    buf_idx: usize,
 }
 
-impl<'a> phy::RxToken for ToyRxToken<'a> {
+impl<'a> phy::RxToken for DmaRxToken<'a> {
     fn consume<R, F>(self, f: F) -> R
     where
         F: FnOnce(&[u8]) -> R,
     {
-        f(self.buf)
+        let result = f(self.data);
+        toyos_nic::nic_rx_done(self.buf_idx);
+        result
     }
 }
 
-struct ToyTxToken;
+struct DmaTxToken<'a> {
+    tx_buf: *mut u8,
+    net_hdr_size: usize,
+    _phantom: core::marker::PhantomData<&'a ()>,
+}
 
-impl phy::TxToken for ToyTxToken {
+impl<'a> phy::TxToken for DmaTxToken<'a> {
     fn consume<R, F>(self, len: usize, f: F) -> R
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        let mut buf = vec![0u8; len];
-        let result = f(&mut buf);
-        syscall::net_send(&buf);
-        result
+        // Zero the net header, then let smoltcp write the frame after it
+        unsafe {
+            core::ptr::write_bytes(self.tx_buf, 0, self.net_hdr_size);
+            let frame = core::slice::from_raw_parts_mut(
+                self.tx_buf.add(self.net_hdr_size),
+                len,
+            );
+            let result = f(frame);
+            toyos_nic::nic_tx(self.net_hdr_size + len);
+            result
+        }
     }
 }
 
@@ -100,31 +151,11 @@ enum SocketKind {
     Udp(SocketHandle),
 }
 
-struct PendingConnect {
-    client_pid: u32,
-    socket_id: u32,
-    handle: SocketHandle,
-    deadline: u64, // 0 = no timeout
-}
-
-struct PendingRecv {
-    client_pid: u32,
-    socket_id: u32,
-    max_len: u32,
-    deadline: u64,
-}
-
-struct PendingAccept {
-    client_pid: u32,
-    listener_id: u32,
-    listener_handle: SocketHandle,
-}
-
 struct PendingUdpRecv {
     client_pid: u32,
     socket_id: u32,
     max_len: u32,
-    deadline: u64,
+    deadline: Option<Instant>,
 }
 
 struct PendingDns {
@@ -135,8 +166,15 @@ struct PendingDns {
 /// A piped TCP connection: data flows through kernel pipes instead of IPC messages.
 struct PipedConnection {
     handle: SocketHandle,
-    rx_write_fd: syscall::Fd, // netd writes received TCP data here
-    tx_read_fd: syscall::Fd,  // netd reads outgoing TCP data from here
+    rx_write_fd: i32,
+    tx_read_fd: i32,
+    rx_ring: *const toyos_abi::ring::RingHeader,
+    tx_ring: *const toyos_abi::ring::RingHeader,
+}
+
+fn map_pipe_ring(fd: i32) -> *const toyos_abi::ring::RingHeader {
+    toyos_abi::syscall::pipe_map(toyos_abi::syscall::Fd(fd))
+        .expect("pipe_map failed") as *const toyos_abi::ring::RingHeader
 }
 
 /// A piped TCP listener: netd writes 1 byte to notify pipe on new connection.
@@ -144,7 +182,8 @@ struct PipedListener {
     handle: SocketHandle,
     #[allow(dead_code)]
     local_port: u16,
-    notify_write_fd: syscall::Fd,
+    notify_write_fd: i32,
+    notified: bool,
 }
 
 struct PendingPipedConnect {
@@ -153,7 +192,7 @@ struct PendingPipedConnect {
     handle: SocketHandle,
     rx_pipe_id: u64,
     tx_pipe_id: u64,
-    deadline: u64,
+    deadline: Option<Instant>,
 }
 
 struct NetDaemon {
@@ -161,9 +200,6 @@ struct NetDaemon {
     owners: HashMap<u32, u32>, // socket_id -> owner pid
     next_id: u32,
     next_local_port: u16,
-    pending_connects: Vec<PendingConnect>,
-    pending_recvs: Vec<PendingRecv>,
-    pending_accepts: Vec<PendingAccept>,
     pending_udp_recvs: Vec<PendingUdpRecv>,
     pending_dns: Vec<PendingDns>,
     dns_handle: SocketHandle,
@@ -179,9 +215,6 @@ impl NetDaemon {
             owners: HashMap::new(),
             next_id: 1,
             next_local_port: 49152, // start of ephemeral range
-            pending_connects: Vec::new(),
-            pending_recvs: Vec::new(),
-            pending_accepts: Vec::new(),
             pending_udp_recvs: Vec::new(),
             pending_dns: Vec::new(),
             dns_handle,
@@ -215,12 +248,7 @@ impl NetDaemon {
     ) {
         let sender = msg.sender();
         match msg.msg_type() {
-            MSG_TCP_CONNECT => self.handle_tcp_connect(sender, msg, socket_set, iface),
-            MSG_TCP_SEND => self.handle_tcp_send(sender, msg, socket_set),
-            MSG_TCP_RECV => self.handle_tcp_recv(sender, msg, socket_set),
             MSG_TCP_CLOSE => self.handle_tcp_close(sender, msg, socket_set),
-            MSG_TCP_BIND => self.handle_tcp_bind(sender, msg, socket_set),
-            MSG_TCP_ACCEPT => self.handle_tcp_accept(sender, msg, socket_set),
             MSG_TCP_SHUTDOWN => self.handle_tcp_shutdown(sender, msg, socket_set),
             MSG_UDP_BIND => self.handle_udp_bind(sender, msg, socket_set),
             MSG_UDP_SEND_TO => self.handle_udp_send_to(sender, msg, socket_set),
@@ -236,106 +264,6 @@ impl NetDaemon {
                 eprintln!("netd: unknown message type {other} from pid {sender}");
             }
         }
-    }
-
-    fn handle_tcp_connect(
-        &mut self,
-        sender: u32,
-        msg: Message,
-        socket_set: &mut SocketSet<'_>,
-        iface: &mut Interface,
-    ) {
-        let req: TcpConnectRequest = msg.take_payload();
-        let remote = IpEndpoint::new(
-            IpAddress::Ipv4(Ipv4Addr::from(req.addr)),
-            req.port,
-        );
-        let local_port = self.alloc_port();
-
-        let rx_buf = tcp::SocketBuffer::new(vec![0u8; 65536]);
-        let tx_buf = tcp::SocketBuffer::new(vec![0u8; 65536]);
-        let mut socket = tcp::Socket::new(rx_buf, tx_buf);
-        if socket.connect(iface.context(), remote, local_port).is_err() {
-            Self::send_error(sender, ERR_CONNECTION_REFUSED);
-            return;
-        }
-
-        let handle = socket_set.add(socket);
-        let socket_id = self.alloc_id();
-        self.sockets.insert(socket_id, SocketKind::TcpStream(handle));
-        self.owners.insert(socket_id, sender);
-
-        let deadline = if req.timeout_ms > 0 {
-            syscall::clock_nanos() + req.timeout_ms as u64 * 1_000_000
-        } else {
-            0
-        };
-
-        self.pending_connects.push(PendingConnect {
-            client_pid: sender,
-            socket_id,
-            handle,
-            deadline,
-        });
-    }
-
-    fn handle_tcp_send(&mut self, sender: u32, msg: Message, socket_set: &mut SocketSet<'_>) {
-        let bytes = msg.take_bytes();
-        if bytes.len() < 4 {
-            Self::send_error(sender, ERR_INVALID_INPUT);
-            return;
-        }
-        let socket_id = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-        let data = &bytes[4..];
-
-        let Some(SocketKind::TcpStream(handle)) = self.sockets.get(&socket_id) else {
-            Self::send_error(sender, ERR_NOT_CONNECTED);
-            return;
-        };
-        let socket = socket_set.get_mut::<tcp::Socket>(*handle);
-        match socket.send_slice(data) {
-            Ok(sent) => {
-                let resp = sent as u32;
-                message::send(sender, Message::new(MSG_RESULT, resp)).ok();
-            }
-            Err(_) => Self::send_error(sender, ERR_CONNECTION_RESET),
-        }
-    }
-
-    fn handle_tcp_recv(&mut self, sender: u32, msg: Message, socket_set: &mut SocketSet<'_>) {
-        let req: TcpRecvRequest = msg.take_payload();
-        let Some(SocketKind::TcpStream(handle)) = self.sockets.get(&req.socket_id) else {
-            Self::send_error(sender, ERR_NOT_CONNECTED);
-            return;
-        };
-        let socket = socket_set.get_mut::<tcp::Socket>(*handle);
-
-        // Try immediate recv
-        if socket.can_recv() {
-            let mut buf = vec![0u8; req.max_len as usize];
-            match socket.recv_slice(&mut buf) {
-                Ok(n) => {
-                    buf.truncate(n);
-                    message::send(sender, Message::from_bytes(MSG_RESULT, &buf)).ok();
-                }
-                Err(_) => Self::send_error(sender, ERR_CONNECTION_RESET),
-            }
-            return;
-        }
-
-        // EOF: connection closed by remote
-        if !socket.may_recv() {
-            message::send(sender, Message::from_bytes(MSG_RESULT, &[])).ok();
-            return;
-        }
-
-        // No data yet — queue for later
-        self.pending_recvs.push(PendingRecv {
-            client_pid: sender,
-            socket_id: req.socket_id,
-            max_len: req.max_len,
-            deadline: 0,
-        });
     }
 
     fn handle_tcp_close(&mut self, sender: u32, msg: Message, socket_set: &mut SocketSet<'_>) {
@@ -358,87 +286,6 @@ impl NetDaemon {
             self.owners.remove(&req.socket_id);
         }
         message::send(sender, Message::signal(MSG_RESULT)).ok();
-    }
-
-    fn handle_tcp_bind(
-        &mut self,
-        sender: u32,
-        msg: Message,
-        socket_set: &mut SocketSet<'_>,
-    ) {
-        let req: TcpBindRequest = msg.take_payload();
-        let port = if req.port == 0 { self.alloc_port() } else { req.port };
-
-        let rx_buf = tcp::SocketBuffer::new(vec![0u8; 65536]);
-        let tx_buf = tcp::SocketBuffer::new(vec![0u8; 65536]);
-        let mut socket = tcp::Socket::new(rx_buf, tx_buf);
-        if socket.listen(port).is_err() {
-            Self::send_error(sender, ERR_ADDR_IN_USE);
-            return;
-        }
-
-        let handle = socket_set.add(socket);
-        let socket_id = self.alloc_id();
-        self.sockets.insert(socket_id, SocketKind::TcpListener(handle));
-        self.owners.insert(socket_id, sender);
-
-        message::send(sender, Message::new(MSG_RESULT, TcpBindResponse {
-            socket_id,
-            bound_port: port,
-            _pad: 0,
-        })).ok();
-    }
-
-    fn handle_tcp_accept(
-        &mut self,
-        sender: u32,
-        msg: Message,
-        socket_set: &mut SocketSet<'_>,
-    ) {
-        let req: TcpAcceptRequest = msg.take_payload();
-        let Some(SocketKind::TcpListener(handle)) = self.sockets.get(&req.socket_id) else {
-            Self::send_error(sender, ERR_NOT_CONNECTED);
-            return;
-        };
-
-        let socket = socket_set.get_mut::<tcp::Socket>(*handle);
-        if socket.is_active() {
-            // Connection already established on the listener socket — deliver it
-            let remote = socket.remote_endpoint().unwrap();
-            let local_port = socket.local_endpoint().unwrap().port;
-            let remote_addr = match remote.addr {
-                IpAddress::Ipv4(a) => a.octets(),
-            };
-
-            // Move this socket to a stream, create a new listener
-            let old_handle = *handle;
-            let stream_id = self.alloc_id();
-            self.sockets.insert(stream_id, SocketKind::TcpStream(old_handle));
-            self.owners.insert(stream_id, sender);
-
-            // Create replacement listener
-            let rx_buf = tcp::SocketBuffer::new(vec![0u8; 65536]);
-            let tx_buf = tcp::SocketBuffer::new(vec![0u8; 65536]);
-            let mut new_listener = tcp::Socket::new(rx_buf, tx_buf);
-            new_listener.listen(local_port).ok();
-            let new_handle = socket_set.add(new_listener);
-            self.sockets.insert(req.socket_id, SocketKind::TcpListener(new_handle));
-
-            message::send(sender, Message::new(MSG_RESULT, TcpAcceptResponse {
-                socket_id: stream_id,
-                remote_addr,
-                remote_port: remote.port,
-                local_port,
-            })).ok();
-            return;
-        }
-
-        // Not yet connected — queue for later
-        self.pending_accepts.push(PendingAccept {
-            client_pid: sender,
-            listener_id: req.socket_id,
-            listener_handle: *handle,
-        });
     }
 
     fn handle_tcp_shutdown(
@@ -567,7 +414,7 @@ impl NetDaemon {
             client_pid: sender,
             socket_id: req.socket_id,
             max_len: req.max_len,
-            deadline: 0,
+            deadline: None,
         });
     }
 
@@ -691,9 +538,9 @@ impl NetDaemon {
         self.owners.insert(socket_id, sender);
 
         let deadline = if req.timeout_ms > 0 {
-            syscall::clock_nanos() + req.timeout_ms as u64 * 1_000_000
+            Some(Instant::now() + Duration::from_millis(req.timeout_ms as u64))
         } else {
-            0
+            None
         };
 
         self.pending_piped_connects.push(PendingPipedConnect {
@@ -729,18 +576,21 @@ impl NetDaemon {
         self.owners.insert(socket_id, sender);
 
         // Open the notify pipe write end
-        let notify_fd = match syscall::pipe_open(req.notify_pipe_id, 1) {
-            Ok(fd) => fd,
+        let notify_file = match toyos_pipe::open_by_id(req.notify_pipe_id, false) {
+            Ok(f) => f,
             Err(_) => {
                 Self::send_error(sender, ERR_INVALID_INPUT);
                 return;
             }
         };
+        let notify_write_fd = notify_file.as_raw_fd();
+        std::mem::forget(notify_file); // keep fd open, managed manually
 
         self.piped_listeners.insert(socket_id, PipedListener {
             handle,
             local_port: port,
-            notify_write_fd: notify_fd,
+            notify_write_fd,
+            notified: false,
         });
 
         message::send(sender, Message::new(MSG_RESULT, TcpBindResponse {
@@ -781,26 +631,33 @@ impl NetDaemon {
         self.owners.insert(stream_id, sender);
 
         // Open pipe fds for this connection
-        let rx_write_fd = match syscall::pipe_open(req.rx_pipe_id, 1) {
-            Ok(fd) => fd,
+        let rx_write_file = match toyos_pipe::open_by_id(req.rx_pipe_id, false) {
+            Ok(f) => f,
             Err(_) => {
                 Self::send_error(sender, ERR_INVALID_INPUT);
                 return;
             }
         };
-        let tx_read_fd = match syscall::pipe_open(req.tx_pipe_id, 0) {
-            Ok(fd) => fd,
+        let rx_write_fd = rx_write_file.as_raw_fd();
+        std::mem::forget(rx_write_file);
+
+        let tx_read_file = match toyos_pipe::open_by_id(req.tx_pipe_id, true) {
+            Ok(f) => f,
             Err(_) => {
-                syscall::close(rx_write_fd);
+                toyos_io::close(rx_write_fd);
                 Self::send_error(sender, ERR_INVALID_INPUT);
                 return;
             }
         };
+        let tx_read_fd = tx_read_file.as_raw_fd();
+        std::mem::forget(tx_read_file);
 
         self.piped_connections.push(PipedConnection {
             handle: old_handle,
             rx_write_fd,
             tx_read_fd,
+            rx_ring: map_pipe_ring(rx_write_fd),
+            tx_ring: map_pipe_ring(tx_read_fd),
         });
 
         // Create replacement listener
@@ -811,9 +668,10 @@ impl NetDaemon {
         let new_handle = socket_set.add(new_listener);
         self.sockets.insert(req.socket_id, SocketKind::TcpListener(new_handle));
 
-        // Update the piped listener's handle
+        // Update the piped listener's handle and reset notification flag
         if let Some(pl) = self.piped_listeners.get_mut(&req.socket_id) {
             pl.handle = new_handle;
+            pl.notified = false;
         }
 
         message::send(sender, Message::new(MSG_RESULT, TcpAcceptPipedResponse {
@@ -829,26 +687,25 @@ impl NetDaemon {
         let mut closed = Vec::new();
         for (i, conn) in self.piped_connections.iter().enumerate() {
             let socket = socket_set.get_mut::<tcp::Socket>(conn.handle);
+            let rx_ring = unsafe { &*conn.rx_ring };
+            let tx_ring = unsafe { &*conn.tx_ring };
 
             // smoltcp rx → pipe write (netd pushes received data to client)
-            if socket.can_recv() {
+            if socket.can_recv() && rx_ring.space() > 0 {
                 let mut buf = [0u8; 4096];
                 if let Ok(n) = socket.recv_slice(&mut buf) {
                     if n > 0 {
-                        // Non-blocking write to client's rx pipe
-                        let _ = syscall::write_nonblock(conn.rx_write_fd, &buf[..n]);
+                        rx_ring.write(&buf[..n]);
                     }
                 }
             }
 
             // pipe read → smoltcp tx (netd reads client's outgoing data)
-            if socket.can_send() {
+            if socket.can_send() && tx_ring.available() > 0 {
                 let mut buf = [0u8; 4096];
-                match syscall::read_nonblock(conn.tx_read_fd, &mut buf) {
-                    Ok(n) if n > 0 => {
-                        let _ = socket.send_slice(&buf[..n]);
-                    }
-                    _ => {}
+                let n = tx_ring.read(&mut buf);
+                if n > 0 {
+                    let _ = socket.send_slice(&buf[..n]);
                 }
             }
 
@@ -861,141 +718,26 @@ impl NetDaemon {
         // Clean up closed piped connections (reverse order to preserve indices)
         for &i in closed.iter().rev() {
             let conn = self.piped_connections.swap_remove(i);
-            syscall::close(conn.rx_write_fd);
-            syscall::close(conn.tx_read_fd);
+            toyos_io::close(conn.rx_write_fd);
+            toyos_io::close(conn.tx_read_fd);
         }
     }
 
     /// Check piped listeners for new connections and notify via pipe.
-    fn check_piped_listeners(&self, socket_set: &mut SocketSet<'_>) {
-        for (_, listener) in &self.piped_listeners {
+    fn check_piped_listeners(&mut self, socket_set: &mut SocketSet<'_>) {
+        for (_, listener) in &mut self.piped_listeners {
             let socket = socket_set.get_mut::<tcp::Socket>(listener.handle);
-            if socket.is_active() {
+            if socket.is_active() && !listener.notified {
                 // New connection arrived — notify client by writing 1 byte
-                let _ = syscall::write_nonblock(listener.notify_write_fd, &[1]);
+                let _ = toyos_io::write_nonblock(listener.notify_write_fd, &[1]);
+                listener.notified = true;
             }
         }
     }
 
-    /// Process pending async operations (connects, recvs, accepts, DNS).
+    /// Process pending async operations (UDP recvs, DNS, piped connects).
     fn process_pending(&mut self, socket_set: &mut SocketSet<'_>) {
-        let now = syscall::clock_nanos();
-
-        // Pending connects
-        let mut i = 0;
-        while i < self.pending_connects.len() {
-            let pc = &self.pending_connects[i];
-            let socket = socket_set.get_mut::<tcp::Socket>(pc.handle);
-            if socket.may_send() {
-                // Connected
-                let local_port = socket.local_endpoint().map(|e| e.port).unwrap_or(0);
-                let resp = TcpConnectResponse {
-                    socket_id: pc.socket_id,
-                    local_port,
-                    _pad: 0,
-                };
-                message::send(pc.client_pid, Message::new(MSG_RESULT, resp)).ok();
-                self.pending_connects.swap_remove(i);
-                continue;
-            }
-            if socket.state() == tcp::State::Closed {
-                Self::send_error(pc.client_pid, ERR_CONNECTION_REFUSED);
-                self.sockets.remove(&pc.socket_id);
-                self.owners.remove(&pc.socket_id);
-                socket_set.remove(pc.handle);
-                self.pending_connects.swap_remove(i);
-                continue;
-            }
-            if pc.deadline > 0 && now >= pc.deadline {
-                Self::send_error(pc.client_pid, ERR_TIMED_OUT);
-                socket.abort();
-                self.sockets.remove(&pc.socket_id);
-                self.owners.remove(&pc.socket_id);
-                socket_set.remove(pc.handle);
-                self.pending_connects.swap_remove(i);
-                continue;
-            }
-            i += 1;
-        }
-
-        // Pending recvs
-        let mut i = 0;
-        while i < self.pending_recvs.len() {
-            let pr = &self.pending_recvs[i];
-            let Some(SocketKind::TcpStream(handle)) = self.sockets.get(&pr.socket_id) else {
-                Self::send_error(pr.client_pid, ERR_NOT_CONNECTED);
-                self.pending_recvs.swap_remove(i);
-                continue;
-            };
-            let handle = *handle;
-            let socket = socket_set.get_mut::<tcp::Socket>(handle);
-            if socket.can_recv() {
-                let max = pr.max_len as usize;
-                let client = pr.client_pid;
-                let mut buf = vec![0u8; max];
-                match socket.recv_slice(&mut buf) {
-                    Ok(n) => {
-                        buf.truncate(n);
-                        message::send(client, Message::from_bytes(MSG_RESULT, &buf)).ok();
-                    }
-                    Err(_) => Self::send_error(client, ERR_CONNECTION_RESET),
-                }
-                self.pending_recvs.swap_remove(i);
-                continue;
-            }
-            if !socket.may_recv() {
-                // EOF
-                message::send(pr.client_pid, Message::from_bytes(MSG_RESULT, &[])).ok();
-                self.pending_recvs.swap_remove(i);
-                continue;
-            }
-            if pr.deadline > 0 && now >= pr.deadline {
-                Self::send_error(pr.client_pid, ERR_TIMED_OUT);
-                self.pending_recvs.swap_remove(i);
-                continue;
-            }
-            i += 1;
-        }
-
-        // Pending accepts
-        let mut i = 0;
-        while i < self.pending_accepts.len() {
-            let client_pid = self.pending_accepts[i].client_pid;
-            let listener_id = self.pending_accepts[i].listener_id;
-            let listener_handle = self.pending_accepts[i].listener_handle;
-            let socket = socket_set.get_mut::<tcp::Socket>(listener_handle);
-            if socket.is_active() {
-                let remote = socket.remote_endpoint().unwrap();
-                let local_port = socket.local_endpoint().unwrap().port;
-                let remote_addr = match remote.addr {
-                    IpAddress::Ipv4(a) => a.octets(),
-                };
-
-                let stream_id = self.alloc_id();
-                let old_handle = listener_handle;
-
-                self.sockets.insert(stream_id, SocketKind::TcpStream(old_handle));
-                self.owners.insert(stream_id, client_pid);
-
-                // Create replacement listener
-                let rx_buf = tcp::SocketBuffer::new(vec![0u8; 65536]);
-                let tx_buf = tcp::SocketBuffer::new(vec![0u8; 65536]);
-                let mut new_listener = tcp::Socket::new(rx_buf, tx_buf);
-                new_listener.listen(local_port).ok();
-                let new_handle = socket_set.add(new_listener);
-                self.sockets.insert(listener_id, SocketKind::TcpListener(new_handle));
-
-                message::send(client_pid, Message::new(MSG_RESULT, TcpAcceptResponse {
-                    socket_id: stream_id,
-                    remote_addr,
-                    remote_port: remote.port,
-                    local_port,
-                })).ok();
-                self.pending_accepts.swap_remove(i);
-                continue;
-            }
-            i += 1;
-        }
+        let now = Instant::now();
 
         // Pending UDP recvs
         let mut i = 0;
@@ -1029,7 +771,7 @@ impl NetDaemon {
                 self.pending_udp_recvs.swap_remove(i);
                 continue;
             }
-            if pr.deadline > 0 && now >= pr.deadline {
+            if pr.deadline.is_some_and(|d| now >= d) {
                 Self::send_error(pr.client_pid, ERR_TIMED_OUT);
                 self.pending_udp_recvs.swap_remove(i);
                 continue;
@@ -1078,28 +820,35 @@ impl NetDaemon {
             if socket.may_send() {
                 // Connected — open pipe fds and register piped connection
                 let local_port = socket.local_endpoint().map(|e| e.port).unwrap_or(0);
-                let rx_write_fd = match syscall::pipe_open(pc.rx_pipe_id, 1) {
-                    Ok(fd) => fd,
+                let rx_write_file = match toyos_pipe::open_by_id(pc.rx_pipe_id, false) {
+                    Ok(f) => f,
                     Err(_) => {
                         Self::send_error(pc.client_pid, ERR_OTHER);
                         self.pending_piped_connects.swap_remove(i);
                         continue;
                     }
                 };
-                let tx_read_fd = match syscall::pipe_open(pc.tx_pipe_id, 0) {
-                    Ok(fd) => fd,
+                let rx_write_fd = rx_write_file.as_raw_fd();
+                std::mem::forget(rx_write_file);
+
+                let tx_read_file = match toyos_pipe::open_by_id(pc.tx_pipe_id, true) {
+                    Ok(f) => f,
                     Err(_) => {
-                        syscall::close(rx_write_fd);
+                        toyos_io::close(rx_write_fd);
                         Self::send_error(pc.client_pid, ERR_OTHER);
                         self.pending_piped_connects.swap_remove(i);
                         continue;
                     }
                 };
+                let tx_read_fd = tx_read_file.as_raw_fd();
+                std::mem::forget(tx_read_file);
 
                 self.piped_connections.push(PipedConnection {
                     handle: pc.handle,
                     rx_write_fd,
                     tx_read_fd,
+                    rx_ring: map_pipe_ring(rx_write_fd),
+                    tx_ring: map_pipe_ring(tx_read_fd),
                 });
 
                 let resp = TcpConnectResponse {
@@ -1119,7 +868,7 @@ impl NetDaemon {
                 self.pending_piped_connects.swap_remove(i);
                 continue;
             }
-            if pc.deadline > 0 && now >= pc.deadline {
+            if pc.deadline.is_some_and(|d| now >= d) {
                 Self::send_error(pc.client_pid, ERR_TIMED_OUT);
                 socket.abort();
                 self.sockets.remove(&pc.socket_id);
@@ -1134,24 +883,18 @@ impl NetDaemon {
 }
 
 fn main() {
-    syscall::register_name("netd").expect("netd already running");
+    services::register("netd").expect("netd already running");
 
-    let mac = match syscall::net_mac() {
-        Some(m) => m,
-        None => {
-            eprintln!("netd: no network interface");
-            return;
-        }
-    };
+    let mut device = DmaNic::new();
+    let mac = device.mac;
 
     eprintln!(
         "netd: MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
     );
-
-    let mut device = ToyNic::new();
     let config = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
-    let now = Instant::from_millis((syscall::clock_nanos() / 1_000_000) as i64);
+    let epoch = Instant::now();
+    let now = SmoltcpInstant::from_millis(0);
     let mut iface = Interface::new(config, &mut device, now);
 
     iface.update_ip_addrs(|addrs| {
@@ -1173,7 +916,7 @@ fn main() {
     eprintln!("netd: ready");
 
     loop {
-        let now = Instant::from_millis((syscall::clock_nanos() / 1_000_000) as i64);
+        let now = SmoltcpInstant::from_millis(epoch.elapsed().as_millis() as i64);
 
         // Try to receive a frame
         device.try_recv();
@@ -1190,38 +933,33 @@ fn main() {
 
         // Calculate sleep time
         let delay = iface.poll_delay(now, &socket_set);
-        let timeout_ns = match delay {
-            Some(d) if d.total_millis() > 0 => (d.total_millis() as u64 * 1_000_000).min(50_000_000),
-            Some(_) => 1_000_000, // 1ms minimum
-            None => 50_000_000,   // 50ms default
+        let mut timeout = match delay {
+            Some(d) if d.total_millis() > 0 => Duration::from_millis(d.total_millis() as u64).min(Duration::from_millis(50)),
+            Some(_) => Duration::from_millis(1),
+            None => Duration::from_millis(50),
         };
 
         // If there are pending operations or active piped connections, poll more aggressively
-        let has_pending = !daemon.pending_connects.is_empty()
-            || !daemon.pending_recvs.is_empty()
-            || !daemon.pending_accepts.is_empty()
-            || !daemon.pending_udp_recvs.is_empty()
+        let has_pending = !daemon.pending_udp_recvs.is_empty()
             || !daemon.pending_dns.is_empty()
             || !daemon.pending_piped_connects.is_empty()
             || !daemon.piped_connections.is_empty();
-        let timeout_ns = if has_pending {
-            timeout_ns.min(1_000_000) // 1ms when piped connections active
-        } else {
-            timeout_ns
-        };
+        if has_pending {
+            timeout = timeout.min(Duration::from_millis(1));
+        }
 
         // Wait for IPC messages or timeout
-        let result = syscall::poll_timeout(&[], Some(timeout_ns));
+        let result = toyos_poll::poll(&[], Some(timeout));
 
-        if result.messages() {
+        if result.has_messages() {
             // Drain all messages
             loop {
                 let msg = message::recv();
                 daemon.handle_message(msg, &mut socket_set, &mut iface);
 
                 // Check for more messages (non-blocking)
-                let check = syscall::poll_timeout(&[], Some(0));
-                if !check.messages() {
+                let check = toyos_poll::poll(&[], Some(Duration::ZERO));
+                if !check.has_messages() {
                     break;
                 }
             }

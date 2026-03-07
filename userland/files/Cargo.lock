@@ -291,10 +291,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "toyos-abi"
-version = "0.1.0"
-
-[[package]]
 name = "usvg"
 version = "0.47.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -321,7 +317,6 @@ name = "window"
 version = "0.1.0"
 dependencies = [
  "font",
- "toyos-abi",
 ]
 
 [[package]]

@@ -3,9 +3,7 @@ use super::*;
 impl Codegen {
     pub(super) fn compile_addr(&mut self, ctx: &mut FuncCtx, expr: &Expr) -> Value {
         verbose_enter!("compile_addr", "{:?}", std::mem::discriminant(expr));
-        let result = stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || {
-            self.compile_addr_inner(ctx, expr)
-        });
+        let result = self.compile_addr_inner(ctx, expr);
         verbose_leave!();
         result
     }
