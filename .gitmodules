@@ -17,10 +17,6 @@
 	path = userland/stacker
 	url = https://github.com/Japabu/stacker.git
 	shallow = true
-[submodule "userland/ctrlc"]
-	path = userland/ctrlc
-	url = https://github.com/Japabu/rust-ctrlc.git
-	shallow = true
 [submodule "userland/target-lexicon"]
 	path = userland/target-lexicon
 	url = https://github.com/Japabu/target-lexicon.git
@@ -45,3 +41,12 @@
 	path = userland/russh
 	url = https://github.com/Japabu/russh
 	shallow = true
+[submodule "userland/cargo"]
+	path = userland/cargo
+	url = https://github.com/Japabu/cargo.git
+[submodule "userland/socket2"]
+	path = userland/socket2
+	url = https://github.com/Japabu/socket2
+[submodule "userland/gitoxide"]
+	path = userland/gitoxide
+	url = https://github.com/Japabu/gitoxide
