@@ -31,7 +31,8 @@ fn toyos_dlsym(handle: *mut core::ffi::c_void, name: *const core::ffi::c_char) -
     let h = handle as u64 - 1; // Decode handle (undo the +1 from dlopen)
     let len = unsafe { cstr_len(name) };
     let bytes = unsafe { core::slice::from_raw_parts(name as *const u8, len) };
-    match toyos_abi::syscall::dl_sym(h, bytes) {
+    // SAFETY: h is a valid handle from dl_open, bytes is a valid symbol name
+    match unsafe { toyos_abi::syscall::dl_sym(h, bytes) } {
         Ok(addr) => core::ptr::with_exposed_provenance_mut(addr as usize),
         Err(_) => core::ptr::null_mut(),
     }
