@@ -1,14 +1,14 @@
 use std::hash::Hash;
 use std::mem::{self, size_of};
 use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
-#[cfg(not(target_os = "wasi"))]
+#[cfg(not(any(target_os = "toyos", target_os = "wasi")))]
 use std::path::Path;
 use std::{fmt, io, ptr};
 
 #[cfg(windows)]
 use windows_sys::Win32::Networking::WinSock::SOCKADDR_IN6_0;
 
-#[cfg(not(target_os = "wasi"))]
+#[cfg(not(any(target_os = "toyos", target_os = "wasi")))]
 use crate::sys::AF_UNIX;
 use crate::sys::{c_int, sockaddr_in, sockaddr_in6, sockaddr_storage, AF_INET, AF_INET6};
 use crate::Domain;
@@ -215,7 +215,7 @@ impl SockAddr {
     /// Constructs a `SockAddr` with the family `AF_UNIX` and the provided path.
     ///
     /// Returns an error if the path is longer than `SUN_LEN`.
-    #[cfg(not(target_os = "wasi"))]
+    #[cfg(not(any(target_os = "toyos", target_os = "wasi")))]
     pub fn unix<P>(path: P) -> io::Result<SockAddr>
     where
         P: AsRef<Path>,
@@ -273,7 +273,7 @@ impl SockAddr {
 
     /// Returns true if this address is of a unix socket (for local interprocess communication),
     /// i.e. it is from the `AF_UNIX` family, false otherwise.
-    #[cfg(not(target_os = "wasi"))]
+    #[cfg(not(any(target_os = "toyos", target_os = "wasi")))]
     pub fn is_unix(&self) -> bool {
         self.storage.ss_family == AF_UNIX as sa_family_t
     }
@@ -298,7 +298,7 @@ impl SockAddr {
                 ip,
                 port,
                 addr.sin6_flowinfo,
-                #[cfg(any(unix, all(target_os = "wasi", not(target_env = "p1"))))]
+                #[cfg(any(unix, target_os = "toyos", all(target_os = "wasi", not(target_env = "p1"))))]
                 addr.sin6_scope_id,
                 #[cfg(windows)]
                 unsafe {

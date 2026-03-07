@@ -107,6 +107,7 @@ macro_rules! impl_debug {
 /// Macro to convert from one network type to another.
 macro_rules! from {
     ($from: ty, $for: ty) => {
+        #[cfg(not(target_os = "toyos"))]
         impl From<$from> for $for {
             fn from(socket: $from) -> $for {
                 #[cfg(any(unix, all(target_os = "wasi", not(target_env = "p1"))))]
@@ -181,9 +182,15 @@ mod sockref;
     path = "sys/unix.rs"
 )]
 #[cfg_attr(windows, path = "sys/windows.rs")]
+#[cfg_attr(target_os = "toyos", path = "sys/toyos.rs")]
 mod sys;
 
-#[cfg(not(any(windows, unix, all(target_os = "wasi", not(target_env = "p1")))))]
+#[cfg(not(any(
+    windows,
+    unix,
+    target_os = "toyos",
+    all(target_os = "wasi", not(target_env = "p1")),
+)))]
 compile_error!("Socket2 doesn't support the compile target");
 
 use sys::c_int;
@@ -195,6 +202,7 @@ pub use sockaddr::{sa_family_t, socklen_t, SockAddr, SockAddrStorage};
     target_os = "netbsd",
     target_os = "redox",
     target_os = "solaris",
+    target_os = "toyos",
     target_os = "wasi",
 )))]
 pub use socket::InterfaceIndexOrAddress;
@@ -225,7 +233,7 @@ impl Domain {
     pub const IPV6: Domain = Domain(sys::AF_INET6);
 
     /// Domain for Unix socket communication, corresponding to `AF_UNIX`.
-    #[cfg(not(target_os = "wasi"))]
+    #[cfg(not(any(target_os = "toyos", target_os = "wasi")))]
     pub const UNIX: Domain = Domain(sys::AF_UNIX);
 
     /// Returns the correct domain for `address`.

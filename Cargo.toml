@@ -62,6 +62,10 @@ features = [
   "Win32_System_WindowsProgramming",
 ]
 
+[target.'cfg(target_os = "toyos")'.dependencies]
+toyos-abi = { path = "../../toyos-abi" }
+toyos-net = { path = "../toyos-net" }
+
 [features]
 # Enable all API, even ones not available on all OSs.
 all = []

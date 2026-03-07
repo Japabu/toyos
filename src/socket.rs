@@ -21,7 +21,7 @@ use std::os::windows::io::{FromRawSocket, IntoRawSocket};
 use std::time::Duration;
 
 use crate::sys::{self, c_int, getsockopt, setsockopt, Bool};
-#[cfg(all(unix, not(target_os = "redox")))]
+#[cfg(not(any(target_os = "redox", target_os = "wasi")))]
 use crate::MsgHdrMut;
 use crate::{Domain, Protocol, SockAddr, TcpKeepalive, Type};
 #[cfg(not(any(target_os = "redox", target_os = "wasi")))]
@@ -632,7 +632,7 @@ impl Socket {
     /// <https://github.com/microsoft/Windows-classic-samples/blob/7cbd99ac1d2b4a0beffbaba29ea63d024ceff700/Samples/Win7Samples/netds/winsock/recvmsg/rmmc.cpp>
     /// for an example (in C++).
     #[doc = man_links!(recvmsg(2))]
-    #[cfg(all(unix, not(target_os = "redox")))]
+    #[cfg(not(any(target_os = "redox", target_os = "wasi")))]
     pub fn recvmsg(&self, msg: &mut MsgHdrMut<'_, '_, '_>, flags: sys::c_int) -> io::Result<usize> {
         sys::recvmsg(self.as_raw(), msg, flags)
     }
@@ -1339,6 +1339,7 @@ impl Socket {
         target_os = "openbsd",
         target_os = "redox",
         target_os = "solaris",
+        target_os = "toyos",
         target_os = "nto",
         target_os = "espidf",
         target_os = "vita",
@@ -1374,6 +1375,7 @@ impl Socket {
         target_os = "openbsd",
         target_os = "redox",
         target_os = "solaris",
+        target_os = "toyos",
         target_os = "nto",
         target_os = "espidf",
         target_os = "vita",
@@ -1411,6 +1413,7 @@ impl Socket {
         target_os = "openbsd",
         target_os = "redox",
         target_os = "fuchsia",
+        target_os = "toyos",
         target_os = "nto",
         target_os = "espidf",
         target_os = "vita",
@@ -1450,6 +1453,7 @@ impl Socket {
         target_os = "openbsd",
         target_os = "redox",
         target_os = "fuchsia",
+        target_os = "toyos",
         target_os = "nto",
         target_os = "espidf",
         target_os = "vita",
@@ -1671,6 +1675,7 @@ impl Socket {
         target_os = "openbsd",
         target_os = "redox",
         target_os = "solaris",
+        target_os = "toyos",
         target_os = "haiku",
         target_os = "nto",
         target_os = "espidf",
@@ -1704,6 +1709,7 @@ impl Socket {
         target_os = "openbsd",
         target_os = "redox",
         target_os = "solaris",
+        target_os = "toyos",
         target_os = "haiku",
         target_os = "nto",
         target_os = "espidf",
@@ -2079,6 +2085,7 @@ impl Socket {
         target_os = "openbsd",
         target_os = "redox",
         target_os = "solaris",
+        target_os = "toyos",
         target_os = "haiku",
         target_os = "hurd",
         target_os = "espidf",
@@ -2105,6 +2112,7 @@ impl Socket {
         target_os = "openbsd",
         target_os = "redox",
         target_os = "solaris",
+        target_os = "toyos",
         target_os = "haiku",
         target_os = "hurd",
         target_os = "espidf",
