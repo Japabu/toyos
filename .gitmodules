@@ -44,9 +44,12 @@
 [submodule "userland/cargo"]
 	path = userland/cargo
 	url = https://github.com/Japabu/cargo.git
+	shallow = true
 [submodule "userland/socket2"]
 	path = userland/socket2
 	url = https://github.com/Japabu/socket2
+	shallow = true
 [submodule "userland/gitoxide"]
 	path = userland/gitoxide
 	url = https://github.com/Japabu/gitoxide
+	shallow = true
