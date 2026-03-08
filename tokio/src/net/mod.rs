@@ -45,7 +45,6 @@ cfg_net! {
     pub use tcp::listener::TcpListener;
     pub use tcp::stream::TcpStream;
     cfg_not_wasi! {
-        #[cfg(not(target_os = "toyos"))]
         pub use tcp::socket::TcpSocket;
 
         #[cfg(not(target_os = "toyos"))]
