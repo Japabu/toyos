@@ -1,5 +1,5 @@
 use std::net::{self, SocketAddr};
-#[cfg(any(unix, target_os = "wasi"))]
+#[cfg(any(unix, target_os = "wasi", target_os = "toyos"))]
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 // TODO: once <https://github.com/rust-lang/rust/issues/126198> is fixed this
 // can use `std::os::fd` and be merged with the above.
@@ -69,7 +69,7 @@ impl TcpListener {
     #[cfg(not(all(target_os = "wasi", target_env = "p1")))]
     pub fn bind(addr: SocketAddr) -> io::Result<TcpListener> {
         let socket = new_for_addr(addr)?;
-        #[cfg(any(unix, target_os = "hermit", target_os = "wasi"))]
+        #[cfg(any(unix, target_os = "hermit", target_os = "wasi", target_os = "toyos"))]
         let listener = unsafe { TcpListener::from_raw_fd(socket) };
         #[cfg(windows)]
         let listener = unsafe { TcpListener::from_raw_socket(socket as _) };
@@ -177,21 +177,21 @@ impl fmt::Debug for TcpListener {
     }
 }
 
-#[cfg(any(unix, target_os = "hermit", target_os = "wasi"))]
+#[cfg(any(unix, target_os = "hermit", target_os = "wasi", target_os = "toyos"))]
 impl IntoRawFd for TcpListener {
     fn into_raw_fd(self) -> RawFd {
         self.inner.into_inner().into_raw_fd()
     }
 }
 
-#[cfg(any(unix, target_os = "hermit", target_os = "wasi"))]
+#[cfg(any(unix, target_os = "hermit", target_os = "wasi", target_os = "toyos"))]
 impl AsRawFd for TcpListener {
     fn as_raw_fd(&self) -> RawFd {
         self.inner.as_raw_fd()
     }
 }
 
-#[cfg(any(unix, target_os = "hermit", target_os = "wasi"))]
+#[cfg(any(unix, target_os = "hermit", target_os = "wasi", target_os = "toyos"))]
 impl FromRawFd for TcpListener {
     /// Converts a `RawFd` to a `TcpListener`.
     ///
@@ -204,21 +204,21 @@ impl FromRawFd for TcpListener {
     }
 }
 
-#[cfg(any(unix, target_os = "hermit", target_os = "wasi"))]
+#[cfg(any(unix, target_os = "hermit", target_os = "wasi", target_os = "toyos"))]
 impl From<TcpListener> for OwnedFd {
     fn from(tcp_listener: TcpListener) -> Self {
         tcp_listener.inner.into_inner().into()
     }
 }
 
-#[cfg(any(unix, target_os = "hermit", target_os = "wasi"))]
+#[cfg(any(unix, target_os = "hermit", target_os = "wasi", target_os = "toyos"))]
 impl AsFd for TcpListener {
     fn as_fd(&self) -> BorrowedFd<'_> {
         self.inner.as_fd()
     }
 }
 
-#[cfg(any(unix, target_os = "hermit", target_os = "wasi"))]
+#[cfg(any(unix, target_os = "hermit", target_os = "wasi", target_os = "toyos"))]
 impl From<OwnedFd> for TcpListener {
     /// Converts a `RawFd` to a `TcpListener`.
     ///
@@ -291,7 +291,7 @@ impl From<TcpListener> for net::TcpListener {
         // mio::net::TcpListener which ensures that we actually pass in a valid file
         // descriptor/socket
         unsafe {
-            #[cfg(any(unix, target_os = "hermit", target_os = "wasi"))]
+            #[cfg(any(unix, target_os = "hermit", target_os = "wasi", target_os = "toyos"))]
             {
                 net::TcpListener::from_raw_fd(listener.into_raw_fd())
             }
