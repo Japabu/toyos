@@ -52,9 +52,11 @@ pub mod interpolate {
     /// It can be used as `home_for_user` parameter in [`Path::interpolate()`][crate::Path::interpolate()].
     #[cfg_attr(windows, allow(unused_variables))]
     #[cfg_attr(all(target_family = "wasm", not(target_os = "emscripten")), allow(unused_variables))]
+    #[cfg_attr(target_os = "toyos", allow(unused_variables))]
     pub fn home_for_user(name: &str) -> Option<PathBuf> {
         #[cfg(not(any(
             target_os = "android",
+            target_os = "toyos",
             target_os = "windows",
             all(target_family = "wasm", not(target_os = "emscripten"))
         )))]
@@ -77,6 +79,7 @@ pub mod interpolate {
         }
         #[cfg(any(
             target_os = "android",
+            target_os = "toyos",
             target_os = "windows",
             all(target_family = "wasm", not(target_os = "emscripten"))
         ))]
@@ -194,7 +197,7 @@ impl<'a> Path<'a> {
         }
     }
 
-    #[cfg(any(target_os = "windows", target_os = "android"))]
+    #[cfg(any(target_os = "windows", target_os = "android", target_os = "toyos"))]
     fn interpolate_user(
         self,
         _home_for_user: fn(&str) -> Option<PathBuf>,
@@ -202,7 +205,7 @@ impl<'a> Path<'a> {
         Err(interpolate::Error::UserInterpolationUnsupported)
     }
 
-    #[cfg(not(any(target_os = "windows", target_os = "android")))]
+    #[cfg(not(any(target_os = "windows", target_os = "android", target_os = "toyos")))]
     fn interpolate_user(
         self,
         home_for_user: fn(&str) -> Option<PathBuf>,

@@ -3,15 +3,24 @@ use std::{io, io::ErrorKind::AlreadyExists, path::Path};
 /// Create a new symlink at `link` which points to `original`.
 ///
 /// Note that `original` doesn't have to exist.
-#[cfg(not(windows))]
+#[cfg(unix)]
 pub fn create(original: &Path, link: &Path) -> io::Result<()> {
     std::os::unix::fs::symlink(original, link)
+}
+
+/// Create a new symlink at `link` which points to `original`.
+///
+/// Note that `original` doesn't have to exist.
+#[cfg(target_os = "toyos")]
+#[allow(deprecated)]
+pub fn create(original: &Path, link: &Path) -> io::Result<()> {
+    std::fs::soft_link(original, link)
 }
 
 /// Remove a symlink.
 ///
 /// Note that on only on windows this is special.
-#[cfg(not(windows))]
+#[cfg(any(unix, target_os = "toyos"))]
 pub fn remove(path: &Path) -> io::Result<()> {
     std::fs::remove_file(path)
 }
@@ -50,7 +59,7 @@ pub fn create(original: &Path, link: &Path) -> io::Result<()> {
 
 /// Return true if `err` indicates that a file collision happened, i.e. a symlink couldn't be created as the `link`
 /// already exists as filesystem object.
-#[cfg(not(windows))]
+#[cfg(any(unix, target_os = "toyos"))]
 pub fn is_collision_error(err: &std::io::Error) -> bool {
     // TODO: use ::IsDirectory as well when stabilized instead of raw_os_error(), and ::FileSystemLoop respectively
     err.kind() == AlreadyExists

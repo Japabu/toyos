@@ -39,6 +39,18 @@ impl Default for Capabilities {
     }
 }
 
+#[cfg(target_os = "toyos")]
+impl Default for Capabilities {
+    fn default() -> Self {
+        Capabilities {
+            precompose_unicode: false,
+            ignore_case: false,
+            executable_bit: false,
+            symlink: true,
+        }
+    }
+}
+
 enum Dir {
     IsGit,
     IsArbitrary,

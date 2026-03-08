@@ -7,32 +7,32 @@
 use std::{path::Path, time::SystemTime};
 
 /// A structure to partially mirror [`std::fs::Metadata`].
-#[cfg(not(windows))]
+#[cfg(unix)]
 pub struct Metadata(rustix::fs::Stat);
 
-#[cfg(windows)]
 /// A structure to partially mirror [`std::fs::Metadata`].
+#[cfg(any(windows, target_os = "toyos"))]
 pub struct Metadata(std::fs::Metadata);
 
 /// Lifecycle
 impl Metadata {
     /// Obtain the metadata at `path` without following symlinks.
     pub fn from_path_no_follow(path: &Path) -> Result<Self, std::io::Error> {
-        #[cfg(not(windows))]
+        #[cfg(unix)]
         {
             rustix::fs::lstat(path).map(Metadata).map_err(Into::into)
         }
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "toyos"))]
         path.symlink_metadata().map(Metadata)
     }
 
     /// Obtain the metadata at `path` without following symlinks.
     pub fn from_file(file: &std::fs::File) -> Result<Self, std::io::Error> {
-        #[cfg(not(windows))]
+        #[cfg(unix)]
         {
             rustix::fs::fstat(file).map(Metadata).map_err(Into::into)
         }
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "toyos"))]
         file.metadata().map(Metadata)
     }
 }
@@ -42,17 +42,17 @@ impl Metadata {
 impl Metadata {
     /// Return true if the metadata belongs to a directory
     pub fn is_dir(&self) -> bool {
-        #[cfg(not(windows))]
+        #[cfg(unix)]
         {
             (self.0.st_mode as u32 & libc::S_IFMT as u32) == libc::S_IFDIR as u32
         }
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "toyos"))]
         self.0.is_dir()
     }
 
     /// Return the time at which the underlying file was modified.
     pub fn modified(&self) -> Option<SystemTime> {
-        #[cfg(not(windows))]
+        #[cfg(unix)]
         {
             #[cfg(not(any(
                 target_os = "aix",
@@ -86,7 +86,7 @@ impl Metadata {
             let seconds = seconds as i64;
             system_time_from_secs_nanos(seconds, nanoseconds.try_into().ok()?)
         }
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "toyos"))]
         self.0.modified().ok()
     }
 
@@ -95,7 +95,7 @@ impl Metadata {
     /// Note that this differs from [`std::fs::Metadata::created()`] which would return
     /// the inode birth time, which is notably different to what `git` does.
     pub fn created(&self) -> Option<SystemTime> {
-        #[cfg(not(windows))]
+        #[cfg(unix)]
         {
             #[cfg(not(any(
                 target_os = "aix",
@@ -130,92 +130,118 @@ impl Metadata {
             system_time_from_secs_nanos(seconds, nanoseconds.try_into().ok()?)
         }
         #[cfg(windows)]
-        self.0.created().ok()
+        {
+            self.0.created().ok()
+        }
+        #[cfg(target_os = "toyos")]
+        {
+            self.0.modified().ok()
+        }
     }
 
     /// Return the size of the file in bytes.
     pub fn len(&self) -> u64 {
-        #[cfg(not(windows))]
+        #[cfg(unix)]
         {
             self.0.st_size as u64
         }
-        #[cfg(windows)]
-        self.0.len()
+        #[cfg(any(windows, target_os = "toyos"))]
+        {
+            self.0.len()
+        }
     }
 
     /// Return the device id on which the file is located, or 0 on windows.
     pub fn dev(&self) -> u64 {
-        #[cfg(not(windows))]
+        #[cfg(unix)]
         {
             self.0.st_dev as u64
         }
-        #[cfg(windows)]
-        0
+        #[cfg(any(windows, target_os = "toyos"))]
+        {
+            0
+        }
     }
 
     /// Return the inode id tracking the file, or 0 on windows.
     pub fn ino(&self) -> u64 {
-        #[cfg(not(windows))]
+        #[cfg(unix)]
         {
             self.0.st_ino as u64
         }
-        #[cfg(windows)]
-        0
+        #[cfg(any(windows, target_os = "toyos"))]
+        {
+            0
+        }
     }
 
     /// Return the user-id of the file or 0 on windows.
     pub fn uid(&self) -> u32 {
-        #[cfg(not(windows))]
+        #[cfg(unix)]
         {
             self.0.st_uid as u32
         }
-        #[cfg(windows)]
-        0
+        #[cfg(any(windows, target_os = "toyos"))]
+        {
+            0
+        }
     }
 
     /// Return the group-id of the file or 0 on windows.
     pub fn gid(&self) -> u32 {
-        #[cfg(not(windows))]
+        #[cfg(unix)]
         {
             self.0.st_gid as u32
         }
-        #[cfg(windows)]
-        0
+        #[cfg(any(windows, target_os = "toyos"))]
+        {
+            0
+        }
     }
 
     /// Return `true` if the file's executable bit is set, or `false` on windows.
     pub fn is_executable(&self) -> bool {
-        #[cfg(not(windows))]
+        #[cfg(unix)]
         {
             (self.0.st_mode as u32 & libc::S_IFMT as u32) == libc::S_IFREG as u32
                 && self.0.st_mode as u32 & libc::S_IXUSR as u32 == libc::S_IXUSR as u32
         }
         #[cfg(windows)]
-        gix_fs::is_executable(&self.0)
+        {
+            gix_fs::is_executable(&self.0)
+        }
+        #[cfg(target_os = "toyos")]
+        {
+            false
+        }
     }
 
     /// Return `true` if the file's is a symbolic link.
     pub fn is_symlink(&self) -> bool {
-        #[cfg(not(windows))]
+        #[cfg(unix)]
         {
             (self.0.st_mode as u32 & libc::S_IFMT as u32) == libc::S_IFLNK as u32
         }
-        #[cfg(windows)]
-        self.0.is_symlink()
+        #[cfg(any(windows, target_os = "toyos"))]
+        {
+            self.0.is_symlink()
+        }
     }
 
     /// Return `true` if this is a regular file, executable or not.
     pub fn is_file(&self) -> bool {
-        #[cfg(not(windows))]
+        #[cfg(unix)]
         {
             (self.0.st_mode as u32 & libc::S_IFMT as u32) == libc::S_IFREG as u32
         }
-        #[cfg(windows)]
-        self.0.is_file()
+        #[cfg(any(windows, target_os = "toyos"))]
+        {
+            self.0.is_file()
+        }
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(unix)]
 fn system_time_from_secs_nanos(secs: i64, nanos: i32) -> Option<SystemTime> {
     // Copied from https://github.com/rust-lang/rust at a8ece1190bf6b340175bc5b688e52bd29924f483, MIT licensed, and adapted.
     // On Apple OS, dates before epoch are represented differently than on other
