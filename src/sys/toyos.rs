@@ -13,6 +13,7 @@
 //! implements socket2's sys interface by translating socket operations into
 //! netd IPC calls.
 
+
 use std::collections::HashMap;
 use std::io::{self, IoSlice};
 use std::marker::PhantomData;
@@ -53,6 +54,8 @@ pub(crate) const AF_UNIX: c_int = 1;
 
 pub(crate) const SOCK_STREAM: c_int = 1;
 pub(crate) const SOCK_DGRAM: c_int = 2;
+pub(crate) const SOCK_RAW: c_int = 3;
+pub(crate) const SOCK_SEQPACKET: c_int = 5;
 
 // ---------------------------------------------------------------------------
 // Protocol constants
@@ -99,6 +102,7 @@ pub(crate) const IP_MULTICAST_LOOP: c_int = 34;
 pub(crate) const IP_ADD_MEMBERSHIP: c_int = 35;
 pub(crate) const IP_DROP_MEMBERSHIP: c_int = 36;
 pub(crate) const IP_MULTICAST_IF: c_int = 32;
+pub(crate) const IP_HDRINCL: c_int = 3;
 
 // ---------------------------------------------------------------------------
 // IPv6 option constants
@@ -111,6 +115,7 @@ pub(crate) const IPV6_MULTICAST_HOPS: c_int = 18;
 pub(crate) const IPV6_MULTICAST_IF: c_int = 17;
 pub(crate) const IPV6_ADD_MEMBERSHIP: c_int = 20;
 pub(crate) const IPV6_DROP_MEMBERSHIP: c_int = 21;
+pub(crate) const IPV6_RECVHOPLIMIT: c_int = 51;
 
 // ---------------------------------------------------------------------------
 // Message flag constants
@@ -1086,6 +1091,11 @@ pub(crate) fn set_timeout_opt(
 // ---------------------------------------------------------------------------
 // TCP keepalive (no-op on ToyOS)
 // ---------------------------------------------------------------------------
+
+pub(crate) fn tcp_keepalive_time(_fd: RawSocket) -> io::Result<Duration> {
+    // ToyOS doesn't support TCP keepalive, return a sensible default
+    Ok(Duration::from_secs(7200))
+}
 
 pub(crate) fn set_tcp_keepalive(
     _fd: RawSocket,

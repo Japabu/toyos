@@ -7,6 +7,11 @@
 // except according to those terms.
 
 #![allow(clippy::needless_lifetimes)]
+// ToyOS doesn't use all socket features yet — suppress dead code warnings
+#![cfg_attr(
+    target_os = "toyos",
+    allow(dead_code, non_camel_case_types, unused_imports, unused_macros)
+)]
 
 //! Utilities for creating and using sockets.
 //!
