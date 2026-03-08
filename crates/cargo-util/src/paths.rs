@@ -396,6 +396,11 @@ pub fn path2bytes(path: &Path) -> Result<&[u8]> {
         use std::os::unix::prelude::*;
         Ok(path.as_os_str().as_bytes())
     }
+    #[cfg(target_os = "toyos")]
+    {
+        // OsStr on ToyOS is UTF-8 bytes, same as unix
+        Ok(path.as_os_str().as_encoded_bytes())
+    }
     #[cfg(windows)]
     {
         match path.as_os_str().to_str() {
@@ -414,6 +419,14 @@ pub fn bytes2path(bytes: &[u8]) -> Result<PathBuf> {
     {
         use std::os::unix::prelude::*;
         Ok(PathBuf::from(OsStr::from_bytes(bytes)))
+    }
+    #[cfg(target_os = "toyos")]
+    {
+        // OsStr on ToyOS is UTF-8 bytes, same as unix
+        // SAFETY: ToyOS paths are always valid UTF-8 encoded bytes
+        Ok(PathBuf::from(unsafe {
+            std::ffi::OsStr::from_encoded_bytes_unchecked(bytes)
+        }))
     }
     #[cfg(windows)]
     {
@@ -621,9 +634,12 @@ fn _link_or_copy(src: &Path, dst: &Path) -> Result<()> {
         remove_file(&dst)?;
     }
 
+    #[allow(deprecated)]
     let link_result = if src.is_dir() {
         #[cfg(unix)]
         use std::os::unix::fs::symlink;
+        #[cfg(target_os = "toyos")]
+        use std::fs::soft_link as symlink;
         #[cfg(windows)]
         // FIXME: This should probably panic or have a copy fallback. Symlinks
         // are not supported in all windows environments. Currently symlinking

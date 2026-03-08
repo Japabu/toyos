@@ -351,6 +351,10 @@ fn is_executable<P: AsRef<Path>>(path: P) -> bool {
 fn is_executable<P: AsRef<Path>>(path: P) -> bool {
     path.as_ref().is_file()
 }
+#[cfg(target_os = "toyos")]
+fn is_executable<P: AsRef<Path>>(path: P) -> bool {
+    path.as_ref().is_file()
+}
 
 fn search_directories(gctx: &GlobalContext) -> Vec<PathBuf> {
     let mut path_dirs = if let Some(val) = gctx.get_env_os("PATH") {

@@ -81,6 +81,66 @@ mod imp {
     }
 }
 
+#[cfg(target_os = "toyos")]
+mod imp {
+    use std::io;
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    use std::os::toyos::poll;
+    use std::process::{ChildStderr, ChildStdout};
+
+    pub fn read2(
+        mut out_pipe: ChildStdout,
+        mut err_pipe: ChildStderr,
+        data: &mut dyn FnMut(bool, &mut Vec<u8>, bool),
+    ) -> io::Result<()> {
+        let mut out_done = false;
+        let mut err_done = false;
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+
+        while !out_done || !err_done {
+            let mut fds = Vec::new();
+            if !out_done {
+                fds.push(out_pipe.as_raw_fd() as u64 | poll::READABLE);
+            }
+            if !err_done {
+                fds.push(err_pipe.as_raw_fd() as u64 | poll::READABLE);
+            }
+
+            let result = poll::poll(&fds, None);
+
+            // Use single read() calls — poll guarantees data is available,
+            // so a single read won't block. read_to_end would block until EOF.
+            let mut idx = 0;
+            if !out_done {
+                if result.fd_ready(idx) {
+                    let mut buf = [0u8; 8192];
+                    match out_pipe.read(&mut buf) {
+                        Ok(0) => out_done = true,
+                        Ok(n) => out.extend_from_slice(&buf[..n]),
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                        Err(e) => return Err(e),
+                    }
+                    data(true, &mut out, out_done);
+                }
+                idx += 1;
+            }
+            if !err_done && result.fd_ready(idx) {
+                let mut buf = [0u8; 8192];
+                match err_pipe.read(&mut buf) {
+                    Ok(0) => err_done = true,
+                    Ok(n) => err.extend_from_slice(&buf[..n]),
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(e) => return Err(e),
+                }
+                data(false, &mut err, err_done);
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(windows)]
 mod imp {
     use std::io;

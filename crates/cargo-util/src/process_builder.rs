@@ -620,6 +620,52 @@ mod imp {
     }
 }
 
+#[cfg(target_os = "toyos")]
+mod imp {
+    use super::{ProcessBuilder, ProcessError, close_tempfile_and_log_error, debug_force_argfile};
+    use anyhow::Result;
+    use std::io;
+
+    pub fn exec_replace(process_builder: &ProcessBuilder) -> Result<()> {
+        // ToyOS has no execvp, so spawn and wait instead.
+        let status = if debug_force_argfile(process_builder.retry_with_argfile) {
+            let (mut command, argfile) = process_builder.build_command_with_argfile()?;
+            let result = command.status();
+            close_tempfile_and_log_error(argfile);
+            result
+        } else {
+            let mut command = process_builder.build_command();
+            match command.status() {
+                Err(ref e) if process_builder.should_retry_with_argfile(e) => {
+                    let (mut command, argfile) = process_builder.build_command_with_argfile()?;
+                    let result = command.status();
+                    close_tempfile_and_log_error(argfile);
+                    result
+                }
+                other => other,
+            }
+        };
+        match status {
+            Ok(exit) if exit.success() => std::process::exit(0),
+            Ok(exit) => Err(ProcessError::new(
+                &format!("process didn't exit successfully: {}", process_builder),
+                Some(exit),
+                None,
+            )
+            .into()),
+            Err(e) => Err(anyhow::Error::from(e).context(ProcessError::new(
+                &format!("could not execute process {}", process_builder),
+                None,
+                None,
+            ))),
+        }
+    }
+
+    pub fn command_line_too_big(_err: &io::Error) -> bool {
+        false
+    }
+}
+
 #[cfg(windows)]
 mod imp {
     use super::{ProcessBuilder, ProcessError};

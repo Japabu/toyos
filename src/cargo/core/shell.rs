@@ -738,6 +738,17 @@ mod imp {
     }
 }
 
+#[cfg(target_os = "toyos")]
+mod imp {
+    use super::{Shell, TtyWidth};
+
+    pub fn stderr_width() -> TtyWidth {
+        TtyWidth::NoTty
+    }
+
+    pub fn err_erase_line(_shell: &mut Shell) {}
+}
+
 #[cfg(windows)]
 mod imp {
     use std::{cmp, mem, ptr};

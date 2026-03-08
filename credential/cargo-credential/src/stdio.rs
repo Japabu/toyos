@@ -133,6 +133,62 @@ mod imp {
     }
 }
 
+#[cfg(target_os = "toyos")]
+mod imp {
+    use super::Stdio;
+    use std::{fs::File, io::Error, os::fd::AsRawFd};
+
+    const STDIN_FILENO: i32 = 0;
+    const STDOUT_FILENO: i32 = 1;
+
+    unsafe extern "C" {
+        fn dup(oldfd: i32) -> i32;
+        fn dup2(oldfd: i32, newfd: i32) -> i32;
+        fn close(fd: i32) -> i32;
+    }
+
+    pub const IN_DEVICE: &str = "/dev/tty";
+    pub const OUT_DEVICE: &str = "/dev/tty";
+    pub const NULL_DEVICE: &str = "/dev/null";
+
+    pub struct ReplacementGuard {
+        std_fileno: i32,
+        previous: i32,
+    }
+
+    impl ReplacementGuard {
+        pub(super) fn new(stdio: Stdio, replacement: &mut File) -> Result<ReplacementGuard, Error> {
+            let std_fileno = match stdio {
+                Stdio::Stdin => STDIN_FILENO,
+                Stdio::Stdout => STDOUT_FILENO,
+            };
+            let previous;
+            unsafe {
+                previous = dup(std_fileno);
+                if previous == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if dup2(replacement.as_raw_fd(), std_fileno) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(ReplacementGuard {
+                previous,
+                std_fileno,
+            })
+        }
+    }
+
+    impl Drop for ReplacementGuard {
+        fn drop(&mut self) {
+            unsafe {
+                dup2(self.previous, self.std_fileno);
+                close(self.previous);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod test {
     use std::fs::OpenOptions;

@@ -50,7 +50,7 @@ flate2 = { version = "1.1.9", default-features = false, features = ["zlib-rs"] }
 git2 = "0.20.4"
 git2-curl = "0.21.0"
 # When updating this, also see if `gix-transport` further down needs updating or some auth-related tests will fail.
-gix = { version = "0.80.0", default-features = false, features = ["progress-tree", "parallel", "dirwalk", "status", "revision"] }
+gix = { version = "0.80.0", default-features = false, features = ["progress-tree", "parallel", "dirwalk", "status", "revision", "sha1", "blocking-network-client"] }
 gix-transport = "0.55.0"
 glob = "0.3.3"
 handlebars = { version = "6.4.0", features = ["dir_source"] }
@@ -197,7 +197,7 @@ pasetors.workspace = true
 pathdiff.workspace = true
 rand.workspace = true
 regex.workspace = true
-rusqlite = { workspace = true, features = ["fallible_uint"] }
+rusqlite = { workspace = true, features = ["fallible_uint"], optional = true }
 rustc-hash.workspace = true
 rustc-stable-hash.workspace = true
 rustfix.workspace = true
@@ -280,9 +280,10 @@ test = false
 doc = false
 
 [features]
-default = ["git2-backend", "curl-backend", "http-transport-curl"]
+default = ["git2-backend", "curl-backend", "http-transport-curl", "sqlite"]
 # C library backends (optional — disable for pure Rust build)
 git2-backend = ["dep:git2", "dep:git2-curl", "dep:libgit2-sys"]
+sqlite = ["dep:rusqlite"]
 curl-backend = ["dep:curl", "dep:curl-sys", "crates-io/curl"]
 vendored-openssl = ["openssl/vendored"]
 vendored-libgit2 = ["libgit2-sys?/vendored"]
@@ -297,7 +298,23 @@ http-transport-reqwest = ["gix/blocking-http-transport-reqwest"]
 mio = { path = "../mio" }
 tokio = { path = "../tokio/tokio" }
 tokio-util = { path = "../tokio/tokio-util" }
-getrandom = { path = "../getrandom" }
+getrandom = { git = "https://github.com/Japabu/getrandom", branch = "toyos-v0.2", package = "getrandom" }
+getrandom_03 = { git = "https://github.com/Japabu/getrandom", branch = "toyos-v0.3", package = "getrandom" }
+getrandom_04 = { git = "https://github.com/Japabu/getrandom", branch = "toyos-v0.4", package = "getrandom" }
+errno = { path = "../errno" }
+filetime = { path = "../filetime" }
+gix = { path = "../gitoxide/gix" }
+gix-sec = { path = "../gitoxide/gix-sec" }
+gix-fs = { path = "../gitoxide/gix-fs" }
+gix-hash = { path = "../gitoxide/gix-hash" }
+gix-index = { path = "../gitoxide/gix-index" }
+gix-config-value = { path = "../gitoxide/gix-config-value" }
+socket2 = { path = "../socket2" }
+is_executable = { path = "../is_executable" }
+tar = { path = "../tar" }
+url = { path = "../rust-url/url" }
+home = { path = "crates/home" }
+jobserver = { path = "../jobserver" }
 
 [lints]
 workspace = true

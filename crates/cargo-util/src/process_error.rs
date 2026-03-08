@@ -138,6 +138,11 @@ pub fn exit_status_to_string(status: ExitStatus) -> String {
         }
     }
 
+    #[cfg(target_os = "toyos")]
+    fn status_to_string(status: ExitStatus) -> String {
+        status.to_string()
+    }
+
     #[cfg(windows)]
     fn status_to_string(status: ExitStatus) -> String {
         use windows_sys::Win32::Foundation::*;

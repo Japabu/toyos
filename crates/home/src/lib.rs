@@ -75,6 +75,11 @@ fn home_dir_inner() -> Option<PathBuf> {
     std::env::home_dir()
 }
 
+#[cfg(target_os = "toyos")]
+fn home_dir_inner() -> Option<PathBuf> {
+    std::env::var("HOME").ok().map(PathBuf::from)
+}
+
 /// Returns the storage directory used by Cargo, often known as
 /// `.cargo` or `CARGO_HOME`.
 ///

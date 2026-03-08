@@ -46,6 +46,15 @@ mod imp {
     }
 }
 
+#[cfg(target_os = "toyos")]
+mod imp {
+    pub type Setup = ();
+
+    pub unsafe fn setup() -> Option<()> {
+        Some(())
+    }
+}
+
 #[cfg(windows)]
 mod imp {
     use std::io;

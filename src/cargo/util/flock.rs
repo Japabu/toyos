@@ -467,6 +467,11 @@ fn error_unsupported(err: &std::io::Error) -> bool {
     }
 }
 
+#[cfg(target_os = "toyos")]
+fn error_unsupported(err: &std::io::Error) -> bool {
+    err.kind() == std::io::ErrorKind::Unsupported
+}
+
 #[cfg(windows)]
 fn error_unsupported(err: &std::io::Error) -> bool {
     use windows_sys::Win32::Foundation::ERROR_INVALID_FUNCTION;
