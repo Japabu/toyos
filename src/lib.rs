@@ -122,7 +122,7 @@ mod windows {
 // Since wasm and wasi
 //  is not supposed to add executables ideologically,
 // specify them collectively
-#[cfg(any(target_os = "wasi", target_family = "wasm"))]
+#[cfg(any(target_os = "wasi", target_os = "toyos", target_family = "wasm"))]
 mod wasm {
     use std::path::Path;
 
