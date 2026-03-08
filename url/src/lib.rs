@@ -170,7 +170,8 @@ use crate::net::IpAddr;
     windows,
     target_os = "redox",
     target_os = "wasi",
-    target_os = "hermit"
+    target_os = "hermit",
+    target_os = "toyos"
 ))]
 use crate::net::{SocketAddr, ToSocketAddrs};
 use crate::parser::{to_u32, Context, Parser, SchemeType, USERINFO};
@@ -190,7 +191,8 @@ use percent_encoding::utf8_percent_encode;
     windows,
     target_os = "redox",
     target_os = "wasi",
-    target_os = "hermit"
+    target_os = "hermit",
+    target_os = "toyos"
 ))]
 use std::io;
 #[cfg(feature = "std")]
@@ -1335,7 +1337,8 @@ impl Url {
         windows,
         target_os = "redox",
         target_os = "wasi",
-        target_os = "hermit"
+        target_os = "hermit",
+        target_os = "toyos"
     ))]
     pub fn socket_addrs(
         &self,
@@ -2546,7 +2549,8 @@ impl Url {
             windows,
             target_os = "redox",
             target_os = "wasi",
-            target_os = "hermit"
+            target_os = "hermit",
+            target_os = "toyos"
         )
     ))]
     #[allow(clippy::result_unit_err)]
@@ -2594,7 +2598,8 @@ impl Url {
             windows,
             target_os = "redox",
             target_os = "wasi",
-            target_os = "hermit"
+            target_os = "hermit",
+            target_os = "toyos"
         )
     ))]
     #[allow(clippy::result_unit_err)]
@@ -2719,7 +2724,8 @@ impl Url {
             windows,
             target_os = "redox",
             target_os = "wasi",
-            target_os = "hermit"
+            target_os = "hermit",
+            target_os = "toyos"
         )
     ))]
     #[allow(clippy::result_unit_err)]
@@ -2943,7 +2949,7 @@ impl<'de> serde::Deserialize<'de> for Url {
 
 #[cfg(all(
     feature = "std",
-    any(unix, target_os = "redox", target_os = "wasi", target_os = "hermit")
+    any(unix, target_os = "redox", target_os = "wasi", target_os = "hermit", target_os = "toyos")
 ))]
 fn path_to_file_url_segments(
     path: &Path,
@@ -2951,10 +2957,6 @@ fn path_to_file_url_segments(
 ) -> Result<(u32, HostInternal), ()> {
     use parser::SPECIAL_PATH_SEGMENT;
     use percent_encoding::percent_encode;
-    #[cfg(target_os = "hermit")]
-    use std::os::hermit::ffi::OsStrExt;
-    #[cfg(any(unix, target_os = "redox"))]
-    use std::os::unix::prelude::OsStrExt;
     if !path.is_absolute() {
         return Err(());
     }
@@ -2964,9 +2966,20 @@ fn path_to_file_url_segments(
     for component in path.components().skip(1) {
         empty = false;
         serialization.push('/');
-        #[cfg(not(target_os = "wasi"))]
+        #[cfg(not(any(target_os = "wasi", target_os = "toyos")))]
+        {
+            #[cfg(target_os = "hermit")]
+            use std::os::hermit::ffi::OsStrExt;
+            #[cfg(any(unix, target_os = "redox"))]
+            use std::os::unix::prelude::OsStrExt;
+            serialization.extend(percent_encode(
+                component.as_os_str().as_bytes(),
+                SPECIAL_PATH_SEGMENT,
+            ));
+        }
+        #[cfg(target_os = "toyos")]
         serialization.extend(percent_encode(
-            component.as_os_str().as_bytes(),
+            component.as_os_str().as_encoded_bytes(),
             SPECIAL_PATH_SEGMENT,
         ));
         #[cfg(target_os = "wasi")]
@@ -3059,7 +3072,7 @@ fn path_to_file_url_segments_windows(
 
 #[cfg(all(
     feature = "std",
-    any(unix, target_os = "redox", target_os = "wasi", target_os = "hermit")
+    any(unix, target_os = "redox", target_os = "wasi", target_os = "hermit", target_os = "toyos")
 ))]
 fn file_url_segments_to_pathbuf(
     estimated_capacity: usize,
@@ -3068,12 +3081,8 @@ fn file_url_segments_to_pathbuf(
 ) -> Result<PathBuf, ()> {
     use alloc::vec::Vec;
     use percent_encoding::percent_decode;
-    #[cfg(not(target_os = "wasi"))]
+    #[cfg(not(any(target_os = "wasi", target_os = "toyos")))]
     use std::ffi::OsStr;
-    #[cfg(target_os = "hermit")]
-    use std::os::hermit::ffi::OsStrExt;
-    #[cfg(any(unix, target_os = "redox"))]
-    use std::os::unix::prelude::OsStrExt;
 
     if host.is_some() {
         return Err(());
@@ -3098,8 +3107,20 @@ fn file_url_segments_to_pathbuf(
         bytes.push(b'/');
     }
 
-    #[cfg(not(target_os = "wasi"))]
-    let path = PathBuf::from(OsStr::from_bytes(&bytes));
+    #[cfg(not(any(target_os = "wasi", target_os = "toyos")))]
+    let path = {
+        #[cfg(target_os = "hermit")]
+        use std::os::hermit::ffi::OsStrExt;
+        #[cfg(any(unix, target_os = "redox"))]
+        use std::os::unix::prelude::OsStrExt;
+        PathBuf::from(OsStr::from_bytes(&bytes))
+    };
+    #[cfg(target_os = "toyos")]
+    let path = {
+        // SAFETY: ToyOS paths are always valid UTF-8 encoded bytes
+        let os_str = unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(&bytes) };
+        PathBuf::from(os_str)
+    };
     #[cfg(target_os = "wasi")]
     let path = String::from_utf8(bytes)
         .map(|path| PathBuf::from(path))
