@@ -24,7 +24,8 @@ fn bounded_cstr(base: u64, offset: u64, max_size: u64) -> &'static str {
         if unsafe { *ptr.add(len) } == 0 { break; }
         len += 1;
     }
-    unsafe { core::str::from_utf8_unchecked(core::slice::from_raw_parts(ptr, len)) }
+    let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
+    core::str::from_utf8(bytes).unwrap_or("")
 }
 
 /// Metadata about a loaded ELF binary (no ownership — the OwnedAlloc is separate).
@@ -65,19 +66,16 @@ pub fn load(data: &[u8]) -> Result<(OwnedAlloc, LoadedElfInfo), &'static str> {
     log!("ELF: valid header, entry={:#x}, {} phdrs", ehdr.e_entry, ehdr.e_phnum);
 
     // Scan PT_LOAD segments to find total virtual address range
-    let mut vaddr_min: u64 = u64::MAX;
-    let mut vaddr_max: u64 = 0;
-
-    for phdr in segments.iter() {
-        if phdr.p_type == PT_LOAD {
-            vaddr_min = vaddr_min.min(phdr.p_vaddr);
-            vaddr_max = vaddr_max.max(phdr.p_vaddr + phdr.p_memsz);
-        }
+    let mut vaddr_range: Option<(u64, u64)> = None;
+    for phdr in segments.iter().filter(|p| p.p_type == PT_LOAD) {
+        let lo = phdr.p_vaddr;
+        let hi = phdr.p_vaddr + phdr.p_memsz;
+        vaddr_range = Some(match vaddr_range {
+            None => (lo, hi),
+            Some((min, max)) => (min.min(lo), max.max(hi)),
+        });
     }
-
-    if vaddr_min == u64::MAX {
-        return Err("ELF: no loadable segments");
-    }
+    let (vaddr_min, vaddr_max) = vaddr_range.ok_or("ELF: no loadable segments")?;
 
     let load_size = paging::align_2m((vaddr_max - vaddr_min) as usize);
 
@@ -175,8 +173,8 @@ fn gnu_hash(name: &str) -> u32 {
     h
 }
 
-/// Fast symbol lookup using .gnu.hash table. Returns runtime address or 0.
-fn gnu_dlsym(lib: &LoadedLib, name: &str) -> u64 {
+/// Fast symbol lookup using .gnu.hash table.
+fn gnu_dlsym(lib: &LoadedLib, name: &str) -> Option<u64> {
     if lib.gnu_hash == 0 {
         return dlsym(lib, name);
     }
@@ -196,7 +194,7 @@ fn gnu_dlsym(lib: &LoadedLib, name: &str) -> u64 {
     };
     let mask = (1u64 << (h % 64)) | (1u64 << ((h >> bloom_shift) % 64));
     if bloom_word & mask != mask {
-        return 0; // Definitely not present
+        return None;
     }
 
     // Bucket lookup
@@ -204,7 +202,7 @@ fn gnu_dlsym(lib: &LoadedLib, name: &str) -> u64 {
     let bucket_idx = h % nbuckets;
     let sym_idx = unsafe { *((buckets_base + bucket_idx as u64 * 4) as *const u32) };
     if sym_idx == 0 {
-        return 0;
+        return None;
     }
 
     // Chain walk
@@ -224,7 +222,7 @@ fn gnu_dlsym(lib: &LoadedLib, name: &str) -> u64 {
             if st_shndx != 0 {
                 let sym_name = bounded_cstr(lib.dynstr, st_name as u64, lib.dynstr_size);
                 if sym_name == name {
-                    return lib.base + st_value;
+                    return Some(lib.base + st_value);
                 }
             }
         }
@@ -233,7 +231,7 @@ fn gnu_dlsym(lib: &LoadedLib, name: &str) -> u64 {
         }
         i += 1;
     }
-    0
+    None
 }
 
 /// Load a shared library (.so) into memory for dynamic linking.
@@ -258,17 +256,16 @@ pub fn load_shared_lib(data: &[u8]) -> Result<LoadedLib, &'static str> {
     };
 
     // Scan PT_LOAD for address range
-    let mut vaddr_min: u64 = u64::MAX;
-    let mut vaddr_max: u64 = 0;
-    for phdr in segments.iter() {
-        if phdr.p_type == PT_LOAD {
-            vaddr_min = vaddr_min.min(phdr.p_vaddr);
-            vaddr_max = vaddr_max.max(phdr.p_vaddr + phdr.p_memsz);
-        }
+    let mut vaddr_range: Option<(u64, u64)> = None;
+    for phdr in segments.iter().filter(|p| p.p_type == PT_LOAD) {
+        let lo = phdr.p_vaddr;
+        let hi = phdr.p_vaddr + phdr.p_memsz;
+        vaddr_range = Some(match vaddr_range {
+            None => (lo, hi),
+            Some((min, max)) => (min.min(lo), max.max(hi)),
+        });
     }
-    if vaddr_min == u64::MAX {
-        return Err("dlopen: no loadable segments");
-    }
+    let (vaddr_min, vaddr_max) = vaddr_range.ok_or("dlopen: no loadable segments")?;
 
     let load_size = paging::align_2m((vaddr_max - vaddr_min) as usize);
     let alloc = match OwnedAlloc::new(load_size, PAGE_2M as usize) {
@@ -380,8 +377,7 @@ pub fn load_shared_lib(data: &[u8]) -> Result<LoadedLib, &'static str> {
 }
 
 /// Look up a symbol by name in a loaded shared library.
-/// Returns the runtime address, or 0 if not found.
-pub fn dlsym(lib: &LoadedLib, name: &str) -> u64 {
+pub fn dlsym(lib: &LoadedLib, name: &str) -> Option<u64> {
     // Each Elf64_Sym is 24 bytes: st_name(4), st_info(1), st_other(1), st_shndx(2), st_value(8), st_size(8)
     for i in 1..lib.sym_count {
         let sym_ptr = (lib.dynsym + i as u64 * 24) as *const u8;
@@ -389,18 +385,16 @@ pub fn dlsym(lib: &LoadedLib, name: &str) -> u64 {
         let st_shndx = unsafe { *(sym_ptr.add(6) as *const u16) };
         let st_value = unsafe { *(sym_ptr.add(8) as *const u64) };
 
-        // Skip undefined symbols (st_shndx == 0)
         if st_shndx == 0 {
             continue;
         }
 
-        // Read symbol name from dynstr (bounded)
         let sym_name = bounded_cstr(lib.dynstr, st_name as u64, lib.dynstr_size);
         if sym_name == name {
-            return lib.base + st_value;
+            return Some(lib.base + st_value);
         }
     }
-    0
+    None
 }
 
 /// Resolve GLOB_DAT and JUMP_SLOT relocations in a dlopen'd library by looking
@@ -432,16 +426,15 @@ pub fn resolve_dlopen_relocs(lib: &LoadedLib, other_libs: &[LoadedLib]) {
                     let st_name = unsafe { *(sym_entry as *const u32) };
                     let sym_name = bounded_cstr(lib.dynstr, st_name as u64, lib.dynstr_size);
 
-                    let mut resolved = 0u64;
+                    let mut resolved = None;
                     for other in other_libs {
-                        let addr = gnu_dlsym(other, sym_name);
-                        if addr != 0 {
-                            resolved = addr;
+                        if let Some(addr) = gnu_dlsym(other, sym_name) {
+                            resolved = Some(addr);
                             break;
                         }
                     }
 
-                    if resolved != 0 {
+                    if let Some(resolved) = resolved {
                         let target = (lib.base + r_offset) as *mut u64;
                         unsafe { *target = resolved; }
                         resolved_count += 1;
@@ -526,7 +519,15 @@ pub fn resolve_dynamic_deps(
 
         let so_data = match read_file(&lib_path) {
             Ok(d) => d,
-            Err(e) => return Err(alloc::format!("{}: {}", lib_path, e)),
+            Err(_) => {
+                // Fall back to /lib/ for shared libraries
+                let fallback = alloc::format!("/lib/{}", lib_name);
+                log!("dynamic: fallback to {}", fallback);
+                match read_file(&fallback) {
+                    Ok(d) => d,
+                    Err(e) => return Err(alloc::format!("{}: {}", lib_name, e)),
+                }
+            }
         };
 
         match load_shared_lib(&so_data) {
@@ -557,21 +558,16 @@ pub fn resolve_dynamic_deps(
                             let st_name = unsafe { *(sym_entry as *const u32) };
                             let sym_name = bounded_cstr(dynstr, st_name as u64, strtab_size);
 
-                            let mut resolved = 0u64;
-                            for lib in &libs {
-                                let addr = gnu_dlsym(lib, sym_name);
-                                if addr != 0 {
-                                    resolved = addr;
-                                    break;
+                            let resolved = libs.iter()
+                                .find_map(|lib| gnu_dlsym(lib, sym_name));
+
+                            match resolved {
+                                Some(addr) => {
+                                    let target = (base + rela.r_offset) as *mut u64;
+                                    unsafe { *target = addr; }
                                 }
+                                None => log!("dynamic: unresolved symbol: {}", sym_name),
                             }
-
-                            if resolved == 0 {
-                                log!("dynamic: unresolved symbol: {}", sym_name);
-                            }
-
-                            let target = (base + rela.r_offset) as *mut u64;
-                            unsafe { *target = resolved; }
                         }
                         _ => {}
                     }
@@ -583,19 +579,18 @@ pub fn resolve_dynamic_deps(
     // Resolve GLOB_DAT in shared libraries — look up symbols from the
     // executable and from other loaded libraries. This enables shared libraries
     // to call back into the executable (e.g., _start calling main).
-    let exe_dlsym = |name: &str| -> u64 {
-        // Look up in the executable's .symtab (full symbol table, available from raw data)
+    let exe_dlsym = |name: &str| -> Option<u64> {
         if let Ok(Some((symtab, strtab))) = elf.symbol_table() {
             for sym in symtab.iter() {
                 if sym.st_shndx == 0 { continue; }
                 if let Ok(sym_name) = strtab.get(sym.st_name as usize) {
                     if sym_name == name {
-                        return base + sym.st_value;
+                        return Some(base + sym.st_value);
                     }
                 }
             }
         }
-        0
+        None
     };
 
     for lib in &libs {
@@ -622,22 +617,14 @@ pub fn resolve_dynamic_deps(
                     let sym_name = bounded_cstr(lib.dynstr, st_name as u64, lib.dynstr_size);
 
                     // Search: executable first, then other libraries
-                    let mut resolved = exe_dlsym(sym_name);
-                    if resolved == 0 {
-                        for other in &libs {
-                            let addr = gnu_dlsym(other, sym_name);
-                            if addr != 0 {
-                                resolved = addr;
-                                break;
-                            }
-                        }
-                    }
+                    let resolved = exe_dlsym(sym_name)
+                        .or_else(|| libs.iter().find_map(|other| gnu_dlsym(other, sym_name)));
 
-                    if resolved != 0 {
+                    if let Some(addr) = resolved {
                         let target = (lib.base + r_offset) as *mut u64;
-                        unsafe { *target = resolved; }
+                        unsafe { *target = addr; }
                         if sym_name == "main" {
-                            log!("dynamic: resolved main -> {:#x}", resolved);
+                            log!("dynamic: resolved main -> {:#x}", addr);
                         }
                     } else {
                         log!("dynamic: lib unresolved symbol: {}", sym_name);
@@ -691,8 +678,17 @@ pub fn apply_tpoff_relocs(lib: &LoadedLib, lib_base_offset: usize, total_memsz: 
 
             if r_type == R_X86_64_TPOFF64 {
                 let tpoff = if r_sym != 0 {
-                    // Named TPOFF: look up symbol across libraries
-                    resolve_cross_lib_tpoff(lib, r_sym, tls_info, total_memsz)
+                    // Check if symbol is locally defined (st_shndx != 0)
+                    let sym_entry = (lib.dynsym + r_sym as u64 * 24) as *const u8;
+                    let st_shndx = unsafe { *(sym_entry.add(6) as *const u16) };
+                    if st_shndx != 0 {
+                        // Locally defined TLS symbol — use this library's offset
+                        let st_value = unsafe { *(sym_entry.add(8) as *const u64) };
+                        lib_base_offset as i64 + st_value as i64 + r_addend - total_memsz as i64
+                    } else {
+                        // Undefined — resolve from other loaded libraries
+                        resolve_cross_lib_tpoff(lib, r_sym, tls_info, total_memsz)
+                    }
                 } else {
                     lib_base_offset as i64 + r_addend - total_memsz as i64
                 };
@@ -700,7 +696,18 @@ pub fn apply_tpoff_relocs(lib: &LoadedLib, lib_base_offset: usize, total_memsz: 
                 unsafe { *target = tpoff as u64; }
                 count64 += 1;
             } else if r_type == R_X86_64_TPOFF32 {
-                let tpoff = lib_base_offset as i64 + r_addend - total_memsz as i64;
+                let tpoff = if r_sym != 0 {
+                    let sym_entry = (lib.dynsym + r_sym as u64 * 24) as *const u8;
+                    let st_shndx = unsafe { *(sym_entry.add(6) as *const u16) };
+                    if st_shndx != 0 {
+                        let st_value = unsafe { *(sym_entry.add(8) as *const u64) };
+                        lib_base_offset as i64 + st_value as i64 + r_addend - total_memsz as i64
+                    } else {
+                        resolve_cross_lib_tpoff(lib, r_sym, tls_info, total_memsz)
+                    }
+                } else {
+                    lib_base_offset as i64 + r_addend - total_memsz as i64
+                };
                 let target = (lib.base + r_offset) as *mut i32;
                 unsafe { *target = tpoff as i32; }
                 count32 += 1;
@@ -787,8 +794,19 @@ pub fn apply_exe_tpoff_relocs(data: &[u8], base: u64, exe_base_offset: usize, to
                 for rela in relas {
                     if rela.r_type == R_X86_64_TPOFF64 as u32 {
                         let tpoff = if rela.r_sym != 0 {
-                            // Named TPOFF64: look up symbol across loaded libs
-                            resolve_exe_cross_lib_tpoff(rela.r_sym, &dynsym_data, &dynstr_data, tls_info, total_memsz)
+                            // Check if locally defined before searching other libs
+                            let locally_defined = dynsym_data.map(|d| {
+                                let off = rela.r_sym as usize * 24;
+                                off + 24 <= d.len() && u16::from_le_bytes(d[off + 6..off + 8].try_into().unwrap()) != 0
+                            }).unwrap_or(false);
+                            if locally_defined {
+                                let d = dynsym_data.unwrap();
+                                let off = rela.r_sym as usize * 24;
+                                let st_value = u64::from_le_bytes(d[off + 8..off + 16].try_into().unwrap());
+                                exe_base_offset as i64 + st_value as i64 + rela.r_addend - total_memsz as i64
+                            } else {
+                                resolve_exe_cross_lib_tpoff(rela.r_sym, &dynsym_data, &dynstr_data, tls_info, total_memsz)
+                            }
                         } else {
                             exe_base_offset as i64 + rela.r_addend - total_memsz as i64
                         };
@@ -796,7 +814,22 @@ pub fn apply_exe_tpoff_relocs(data: &[u8], base: u64, exe_base_offset: usize, to
                         unsafe { *target = tpoff as u64; }
                         count += 1;
                     } else if rela.r_type == R_X86_64_TPOFF32 as u32 {
-                        let tpoff = exe_base_offset as i64 + rela.r_addend - total_memsz as i64;
+                        let tpoff = if rela.r_sym != 0 {
+                            let locally_defined = dynsym_data.map(|d| {
+                                let off = rela.r_sym as usize * 24;
+                                off + 24 <= d.len() && u16::from_le_bytes(d[off + 6..off + 8].try_into().unwrap()) != 0
+                            }).unwrap_or(false);
+                            if locally_defined {
+                                let d = dynsym_data.unwrap();
+                                let off = rela.r_sym as usize * 24;
+                                let st_value = u64::from_le_bytes(d[off + 8..off + 16].try_into().unwrap());
+                                exe_base_offset as i64 + st_value as i64 + rela.r_addend - total_memsz as i64
+                            } else {
+                                resolve_exe_cross_lib_tpoff(rela.r_sym, &dynsym_data, &dynstr_data, tls_info, total_memsz)
+                            }
+                        } else {
+                            exe_base_offset as i64 + rela.r_addend - total_memsz as i64
+                        };
                         let target = (base + rela.r_offset) as *mut i32;
                         unsafe { *target = tpoff as i32; }
                         count += 1;

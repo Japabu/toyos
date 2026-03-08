@@ -23,6 +23,8 @@ pub struct UserMessage {
     pub len: u64,
 }
 
+pub struct QueueFull;
+
 pub struct MessageQueue {
     queue: VecDeque<Message>,
 }
@@ -36,13 +38,13 @@ impl MessageQueue {
         }
     }
 
-    /// Push a message. Returns false if the queue is full.
-    pub fn push(&mut self, msg: Message) -> bool {
+    /// Push a message. Returns Err if the queue is full.
+    pub fn push(&mut self, msg: Message) -> Result<(), QueueFull> {
         if self.queue.len() >= MAX_MESSAGES {
-            return false;
+            return Err(QueueFull);
         }
         self.queue.push_back(msg);
-        true
+        Ok(())
     }
 
     pub fn pop(&mut self) -> Option<Message> {

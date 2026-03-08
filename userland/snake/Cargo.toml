@@ -9,4 +9,4 @@ rand = "0.8"
 window = { path = "../window" }
 
 [patch.crates-io]
-getrandom = { path = "../getrandom" }
+getrandom = { git = "https://github.com/Japabu/getrandom", branch = "toyos-v0.2", package = "getrandom" }

@@ -1,5 +1,4 @@
 #![no_std]
-#![feature(allocator_api)]
 extern crate alloc;
 
 pub mod sync;
@@ -13,8 +12,11 @@ pub mod allocator;
 
 pub mod keyboard;
 pub mod mouse;
+pub mod block;
+pub mod page_cache;
 pub mod ramdisk;
 pub mod tmpfs;
+pub mod toyfs;
 pub mod vfs;
 pub mod elf;
 pub mod symbols;

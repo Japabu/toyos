@@ -2,7 +2,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 
 fn main() {
-    let path = "/nvme/test_truncate";
+    let path = "/tmp/test_truncate";
 
     // Write 1000 bytes of pattern data
     {

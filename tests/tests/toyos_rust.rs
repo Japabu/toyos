@@ -57,6 +57,7 @@ macro_rules! toyos_rust_tests {
 }
 
 toyos_rust_tests!(
+    allocator_stress,
     std_alloc,
     std_fs,
     std_fs_write,

@@ -10,6 +10,11 @@ pub enum ReadError {
     OutOfMemory,
 }
 
+#[derive(Debug)]
+pub enum WriteError {
+    DiskFull { needed: u64, available: u64 },
+}
+
 const MAGIC: [u8; 4] = *b"TYFS";
 const VERSION: u32 = 2;
 const HEADER_SIZE: u64 = 64;
@@ -36,6 +41,7 @@ pub struct SimpleFs<D: Disk> {
     disk_size: u64,
     data_end: u64,
     toc_start: u64,
+    dirty: bool,
 }
 
 impl<D: Disk> SimpleFs<D> {
@@ -54,6 +60,7 @@ impl<D: Disk> SimpleFs<D> {
             disk_size,
             data_end: HEADER_SIZE,
             toc_start: disk_size,
+            dirty: false,
         }
     }
 
@@ -78,11 +85,22 @@ impl<D: Disk> SimpleFs<D> {
             disk_size,
             data_end,
             toc_start,
+            dirty: false,
         })
     }
 
-    pub fn into_disk(self) -> D {
+    pub fn into_disk(mut self) -> D {
+        self.sync();
         self.disk
+    }
+
+    /// Flush dirty state to disk (header + disk cache).
+    pub fn sync(&mut self) {
+        if self.dirty {
+            self.write_header();
+            self.dirty = false;
+        }
+        self.disk.flush();
     }
 
     fn write_header(&mut self) {
@@ -126,11 +144,11 @@ impl<D: Disk> SimpleFs<D> {
         None
     }
 
-    pub fn create(&mut self, name: &str, data: &[u8], mtime: u64) -> bool {
+    pub fn create(&mut self, name: &str, data: &[u8], mtime: u64) -> Result<(), WriteError> {
         self.create_entry(name, 1, data, mtime)
     }
 
-    pub fn create_symlink(&mut self, name: &str, target: &str) -> bool {
+    pub fn create_symlink(&mut self, name: &str, target: &str) -> Result<(), WriteError> {
         self.create_entry(name, 2, target.as_bytes(), 0)
     }
 
@@ -153,12 +171,13 @@ impl<D: Disk> SimpleFs<D> {
         Some(Self::entry_mtime(&entry))
     }
 
-    fn create_entry(&mut self, name: &str, entry_type: u8, data: &[u8], mtime: u64) -> bool {
+    fn create_entry(&mut self, name: &str, entry_type: u8, data: &[u8], mtime: u64) -> Result<(), WriteError> {
         let name_bytes = name.as_bytes();
         let total_data = name_bytes.len() as u64 + data.len() as u64;
         let needed = total_data + ENTRY_SIZE;
-        if self.data_end + needed > self.toc_start {
-            return false;
+        let available = self.toc_start.saturating_sub(self.data_end);
+        if needed > available {
+            return Err(WriteError::DiskFull { needed, available });
         }
 
         // Write name then data into the data section
@@ -180,8 +199,8 @@ impl<D: Disk> SimpleFs<D> {
 
         self.data_end += total_data;
         self.toc_start = new_toc;
-        self.write_header();
-        true
+        self.dirty = true;
+        Ok(())
     }
 
     pub fn read_file(&mut self, name: &str) -> Result<Cow<'static, [u8]>, ReadError> {
@@ -207,11 +226,89 @@ impl<D: Disk> SimpleFs<D> {
     pub fn delete(&mut self, name: &str) -> bool {
         if let Some(entry_offset) = self.find_entry(name) {
             self.disk.write(entry_offset, &[0u8; 1]);
-            self.disk.flush();
+            self.dirty = true;
             true
         } else {
             false
         }
+    }
+
+    /// Delete all entries whose names start with `prefix`.
+    pub fn delete_prefix(&mut self, prefix: &str) {
+        let mut offset = self.toc_start;
+        while offset + ENTRY_SIZE <= self.disk_size {
+            let entry = self.read_entry(offset);
+            if entry[0] != 0 && self.entry_name(&entry).starts_with(prefix) {
+                self.disk.write(offset, &[0u8; 1]);
+                self.dirty = true;
+            }
+            offset += ENTRY_SIZE;
+        }
+    }
+
+    /// Rebuild the filesystem in-place, reclaiming space from deleted entries.
+    /// Reads all live entries into memory, rewrites data contiguously, rebuilds TOC.
+    pub fn compact(&mut self) {
+        // Collect all live entries: (type, name_bytes, data_bytes, mtime)
+        let mut live: Vec<(u8, Vec<u8>, Vec<u8>, u64)> = Vec::new();
+        let mut offset = self.toc_start;
+        while offset + ENTRY_SIZE <= self.disk_size {
+            let entry = self.read_entry(offset);
+            let entry_type = entry[0];
+            if entry_type != 0 {
+                let name_offset = u64::from_le_bytes(entry[8..16].try_into().unwrap());
+                let name_len = u64::from_le_bytes(entry[16..24].try_into().unwrap()) as usize;
+                let data_offset = u64::from_le_bytes(entry[24..32].try_into().unwrap());
+                let data_len = u64::from_le_bytes(entry[32..40].try_into().unwrap()) as usize;
+                let mtime = Self::entry_mtime(&entry);
+
+                let mut name_buf = alloc::vec![0u8; name_len];
+                self.disk.read(name_offset, &mut name_buf);
+                let mut data_buf = alloc::vec![0u8; data_len];
+                self.disk.read(data_offset, &mut data_buf);
+
+                live.push((entry_type, name_buf, data_buf, mtime));
+            }
+            offset += ENTRY_SIZE;
+        }
+
+        // Rewrite: data from HEADER_SIZE upward, TOC from disk_size downward
+        let mut data_end = HEADER_SIZE;
+        let mut toc_start = self.disk_size;
+
+        for (entry_type, name_bytes, data_bytes, mtime) in &live {
+            // Write name + data contiguously
+            let name_offset = data_end;
+            self.disk.write(name_offset, name_bytes);
+            let data_offset = name_offset + name_bytes.len() as u64;
+            self.disk.write(data_offset, data_bytes);
+            data_end = data_offset + data_bytes.len() as u64;
+
+            // Write TOC entry
+            toc_start -= ENTRY_SIZE;
+            let mut entry = [0u8; ENTRY_SIZE as usize];
+            entry[0] = *entry_type;
+            entry[8..16].copy_from_slice(&name_offset.to_le_bytes());
+            entry[16..24].copy_from_slice(&(name_bytes.len() as u64).to_le_bytes());
+            entry[24..32].copy_from_slice(&data_offset.to_le_bytes());
+            entry[32..40].copy_from_slice(&(data_bytes.len() as u64).to_le_bytes());
+            entry[40..48].copy_from_slice(&mtime.to_le_bytes());
+            self.disk.write(toc_start, &entry);
+        }
+
+        // Zero out any old TOC entries beyond what we just wrote
+        let old_toc_end = self.toc_start;
+        let mut clear_offset = old_toc_end;
+        while clear_offset < toc_start {
+            self.disk.write(clear_offset, &[0u8; ENTRY_SIZE as usize]);
+            clear_offset += ENTRY_SIZE;
+        }
+
+        self.data_end = data_end;
+        self.toc_start = toc_start;
+        self.write_header();
+        self.disk.flush();
+        self.dirty = false;
     }
 
     pub fn list(&mut self) -> Vec<(String, u64)> {
@@ -293,7 +390,7 @@ mod tests {
     #[test]
     fn create_and_read() {
         let mut fs = make_fs();
-        assert!(fs.create("hello.txt", b"Hello, world!", 0));
+        fs.create("hello.txt", b"Hello, world!", 0).unwrap();
         let data = fs.read_file("hello.txt").unwrap();
         assert_eq!(&*data, b"Hello, world!");
     }
@@ -302,7 +399,7 @@ mod tests {
     fn long_filename() {
         let mut fs = make_fs();
         let long_name = "librustc_codegen_cranelift-1.95.0-dev.so";
-        assert!(fs.create(long_name, b"elf data here", 0));
+        fs.create(long_name, b"elf data here", 0).unwrap();
         let data = fs.read_file(long_name).unwrap();
         assert_eq!(&*data, b"elf data here");
 
@@ -314,9 +411,9 @@ mod tests {
     #[test]
     fn multiple_files_and_list() {
         let mut fs = make_fs();
-        assert!(fs.create("a.txt", b"aaa", 0));
-        assert!(fs.create("b.txt", b"bbbbb", 0));
-        assert!(fs.create("c.txt", b"c", 0));
+        fs.create("a.txt", b"aaa", 0).unwrap();
+        fs.create("b.txt", b"bbbbb", 0).unwrap();
+        fs.create("c.txt", b"c", 0).unwrap();
 
         let files = fs.list();
         assert_eq!(files.len(), 3);
@@ -334,7 +431,7 @@ mod tests {
     #[test]
     fn delete_file() {
         let mut fs = make_fs();
-        assert!(fs.create("rm_me.txt", b"gone", 0));
+        fs.create("rm_me.txt", b"gone", 0).unwrap();
         assert!(fs.delete("rm_me.txt"));
 
         assert!(fs.read_file("rm_me.txt").is_err());
@@ -346,15 +443,15 @@ mod tests {
         let size = 512;
         let mut fs = SimpleFs::format(MemDisk::new(size), size as u64);
 
-        assert!(fs.create("big.txt", &[0xAA; 320], 0));
-        assert!(!fs.create("nope.txt", b"x", 0));
+        fs.create("big.txt", &[0xAA; 320], 0).unwrap();
+        assert!(matches!(fs.create("nope.txt", b"x", 0), Err(WriteError::DiskFull { .. })));
     }
 
     #[test]
     fn symlinks() {
         let mut fs = make_fs();
-        assert!(fs.create("target.txt", b"real data", 0));
-        assert!(fs.create_symlink("link.txt", "target.txt"));
+        fs.create("target.txt", b"real data", 0).unwrap();
+        fs.create_symlink("link.txt", "target.txt").unwrap();
 
         // read_link returns target for symlinks, None for regular files
         assert_eq!(fs.read_link("link.txt").as_deref(), Some("target.txt"));
@@ -370,7 +467,7 @@ mod tests {
     #[test]
     fn mount_reads_existing_files() {
         let mut fs = make_fs();
-        fs.create("persist.txt", b"saved data", 0);
+        fs.create("persist.txt", b"saved data", 0).unwrap();
 
         let mut fs2 = SimpleFs::mount(fs.into_disk()).unwrap();
         let data = fs2.read_file("persist.txt").unwrap();

@@ -49,9 +49,8 @@ struct LauncherEntry {
 }
 
 const LAUNCHER_APPS: &[LauncherEntry] = &[
-    LauncherEntry { name: "Terminal", path: "/initrd/terminal" },
-    LauncherEntry { name: "Files", path: "/initrd/files" },
-    LauncherEntry { name: "Monitor", path: "/initrd/monitor" },
+    LauncherEntry { name: "Terminal", path: "/bin/terminal" },
+    LauncherEntry { name: "Files", path: "/bin/files" },
 ];
 
 const FLAG_HARDWARE_CURSOR: u32 = 1 << 0;
@@ -693,23 +692,23 @@ fn main() {
     let hw_cursor = fb_info.flags & FLAG_HARDWARE_CURSOR != 0;
     let cursor_shm = SharedMemory::map(fb_info.cursor_token, 64 * 64 * 4);
     let cursor_buf = cursor_shm.as_ptr();
-    let cursor_svg = std::fs::read("/initrd/cursor-bold.svg").expect("failed to read cursor");
+    let cursor_svg = std::fs::read("/share/icons/cursor-bold.svg").expect("failed to read cursor");
     let cursor_default = sprite::Sprite::from_svg_colored(&cursor_svg, 20, [255, 255, 255]);
     let resize_svg =
-        std::fs::read("/initrd/arrow-down-right-bold.svg").expect("failed to read resize cursor");
+        std::fs::read("/share/icons/arrow-down-right-bold.svg").expect("failed to read resize cursor");
     let cursor_resize = sprite::Sprite::from_svg_colored(&resize_svg, 20, [255, 255, 255]);
     let crosshair_svg =
-        std::fs::read("/initrd/crosshair-simple-bold.svg").expect("failed to read crosshair cursor");
+        std::fs::read("/share/icons/crosshair-simple-bold.svg").expect("failed to read crosshair cursor");
     let cursor_crosshair = sprite::Sprite::from_svg_colored(&crosshair_svg, 20, [0, 0, 0]);
     upload_cursor(cursor_buf, &cursor_default, hw_cursor);
     let mut current_cursor_style: u8 = window::CURSOR_DEFAULT;
 
-    let font_data = std::fs::read("/initrd/JetBrainsMono-8x16.font").expect("failed to read font");
+    let font_data = std::fs::read("/share/fonts/JetBrainsMono-8x16.font").expect("failed to read font");
     let font = font::Font::from_prebuilt(&font_data);
 
     eprintln!("compositor: decoding wallpaper...");
     let wallpaper = {
-        let jpg_data = std::fs::read("/initrd/wallpaper.jpg").expect("failed to read wallpaper");
+        let jpg_data = std::fs::read("/share/wallpaper.jpg").expect("failed to read wallpaper");
         let img = image::load_from_memory_with_format(&jpg_data, image::ImageFormat::Jpeg)
             .expect("failed to decode wallpaper");
         let rgb = img.to_rgb8();
@@ -729,17 +728,17 @@ fn main() {
 
     let icons = TitleBarIcons {
         minimize: sprite::Sprite::from_svg_colored(
-            &std::fs::read("/initrd/minus-bold.svg").expect("failed to read minimize icon"),
+            &std::fs::read("/share/icons/minus-bold.svg").expect("failed to read minimize icon"),
             14,
             [255, 255, 255],
         ),
         maximize: sprite::Sprite::from_svg_colored(
-            &std::fs::read("/initrd/square-bold.svg").expect("failed to read maximize icon"),
+            &std::fs::read("/share/icons/square-bold.svg").expect("failed to read maximize icon"),
             14,
             [255, 255, 255],
         ),
         close: sprite::Sprite::from_svg_colored(
-            &std::fs::read("/initrd/x-bold.svg").expect("failed to read close icon"),
+            &std::fs::read("/share/icons/x-bold.svg").expect("failed to read close icon"),
             14,
             [255, 255, 255],
         ),
@@ -761,7 +760,7 @@ fn main() {
     let mut last_title_click_time = Instant::now();
     let mut last_title_click_pid: u32 = 0;
     let mut clipboard = String::new();
-    Command::new("/initrd/filepicker").spawn().ok();
+    Command::new("/bin/filepicker").spawn().ok();
     let mut launcher_open = false;
     let mut prev_busy_ticks: u64 = 0;
     let mut prev_total_ticks: u64 = 0;
@@ -890,7 +889,7 @@ fn main() {
                     }
                 } else if event.pressed() && event.ctrl() && event.keycode == 0x11 {
                     // Ctrl+N: spawn terminal
-                    Command::new("/initrd/terminal").spawn().ok();
+                    Command::new("/bin/terminal").spawn().ok();
                 } else {
                     if let Some(idx) = focused_window_idx(&windows) {
                         message::send(

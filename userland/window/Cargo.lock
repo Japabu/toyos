@@ -7,13 +7,8 @@ name = "font"
 version = "0.1.0"
 
 [[package]]
-name = "toyos-abi"
-version = "0.1.0"
-
-[[package]]
 name = "window"
 version = "0.1.0"
 dependencies = [
  "font",
- "toyos-abi",
 ]

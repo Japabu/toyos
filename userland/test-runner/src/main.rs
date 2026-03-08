@@ -25,7 +25,7 @@ fn main() {
             continue;
         };
         let name = name.trim();
-        let path = format!("/initrd/{name}");
+        let path = format!("/bin/{name}");
 
         println!("===TEST_START {name}===");
         let _ = io::stdout().flush();

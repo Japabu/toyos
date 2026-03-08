@@ -38,22 +38,35 @@ fn prepare_boot(
 
     // test-runner (init process)
     let (name, data) = build_toyos_crate(&repo.join("userland/test-runner"));
-    initrd_files.push((name, data));
+    initrd_files.push((format!("bin/{name}"), data));
 
-    // Add test binaries
-    for (name, data) in c_tests {
-        initrd_files.push((format!("test_c_{name}"), data.clone()));
-    }
-    for (name, data) in rust_tests {
-        if name.ends_with(".so") {
-            // Shared libraries go into initrd with their original name
-            initrd_files.push((name.clone(), data.clone()));
-        } else {
-            initrd_files.push((format!("test_rs_{name}"), data.clone()));
+    // toybox (provides echo, cat, etc. for process tests)
+    let (name, data) = build_toyos_crate(&repo.join("userland/toybox"));
+    initrd_files.push((format!("bin/{name}"), data));
+    let mut symlinks = Vec::new();
+    for entry in fs::read_dir(repo.join("userland/toybox/src")).unwrap() {
+        let entry = entry.unwrap();
+        let fname = entry.file_name().to_string_lossy().to_string();
+        if fname.ends_with(".rs") && fname != "main.rs" {
+            let cmd = fname.strip_suffix(".rs").unwrap();
+            symlinks.push((format!("bin/{cmd}"), "bin/toybox".to_string()));
         }
     }
 
-    let initrd_bytes = create_initrd(&initrd_files, &[]);
+    // Add test binaries
+    for (name, data) in c_tests {
+        initrd_files.push((format!("bin/test_c_{name}"), data.clone()));
+    }
+    for (name, data) in rust_tests {
+        if name.ends_with(".so") {
+            // Shared libraries go into /lib/
+            initrd_files.push((format!("lib/{name}"), data.clone()));
+        } else {
+            initrd_files.push((format!("bin/test_rs_{name}"), data.clone()));
+        }
+    }
+
+    let initrd_bytes = create_initrd(&initrd_files, &symlinks);
 
     let kernel_bytes = fs::read(repo.join("kernel/target/x86_64-unknown-none/debug/kernel"))
         .expect("Failed to read kernel");
@@ -309,18 +322,19 @@ fn build_kernel(repo: &Path) {
     );
 }
 
-/// Build the bootloader with test-init feature.
+/// Build the bootloader with test-runner as init.
 fn build_bootloader(repo: &Path) {
     let toyos_ld = build_toyos_ld(repo);
     assert!(
         Command::new("cargo")
-            .args(["build", "--features", "test-init"])
+            .args(["build"])
             .current_dir(repo.join("bootloader"))
             .env("CARGO_TARGET_X86_64_UNKNOWN_UEFI_LINKER", toyos_ld.to_str().unwrap())
+            .env("INIT_PROGRAMS", "/bin/test-runner")
             .status()
             .expect("Failed to run cargo")
             .success(),
-        "Failed to build bootloader with test-init"
+        "Failed to build bootloader"
     );
 }
 
@@ -494,14 +508,12 @@ fn create_initrd(files: &[(String, Vec<u8>)], symlinks: &[(String, String)]) -> 
     let mut tyfs = SimpleFs::format(disk, size as u64);
 
     for (name, data) in files {
-        if !tyfs.create(name, data, 0) {
-            panic!("Failed to add '{name}' to test initrd");
-        }
+        tyfs.create(name, data, 0)
+            .unwrap_or_else(|e| panic!("failed to add '{name}' to test initrd: {e:?}"));
     }
     for (name, target) in symlinks {
-        if !tyfs.create_symlink(name, target) {
-            panic!("Failed to add symlink '{name}' -> '{target}' to test initrd");
-        }
+        tyfs.create_symlink(name, target)
+            .unwrap_or_else(|e| panic!("failed to add symlink '{name}' -> '{target}' to test initrd: {e:?}"));
     }
 
     tyfs.into_disk().data

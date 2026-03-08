@@ -9,7 +9,7 @@ window = { path = "../window" }
 toyos-libc = { path = "../libc", features = ["std-runtime"] }
 
 [patch.crates-io]
-getrandom = { path = "../getrandom" }
+getrandom = { git = "https://github.com/Japabu/getrandom", branch = "toyos-v0.2", package = "getrandom" }
 
 [profile.dev]
 opt-level = 2

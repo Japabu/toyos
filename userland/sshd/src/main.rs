@@ -16,6 +16,7 @@ impl Server for SshServer {
         SshSession {
             channel: None,
             child_stdin: None,
+            is_pty: false,
         }
     }
 }
@@ -23,21 +24,23 @@ impl Server for SshServer {
 struct SshSession {
     channel: Option<Channel<Msg>>,
     child_stdin: Option<std::process::ChildStdin>,
+    is_pty: bool,
 }
 
 impl SshSession {
-    /// Resolve a command name to a full path. Bare names resolve to /initrd/<name>.
+    /// Resolve a command name to a full path. Bare names resolve to /bin/<name>.
     fn resolve_program(name: &str) -> String {
         if name.starts_with('/') {
             name.to_string()
         } else {
-            format!("/initrd/{}", name)
+            format!("/bin/{}", name)
         }
     }
 
     fn spawn_shell(&mut self, program: &str, args: &[&str]) {
         let channel = self.channel.take().unwrap();
         let (_, write_half) = channel.split();
+        let translate_newlines = self.is_pty;
 
         let path = Self::resolve_program(program);
         let mut child = match Command::new(&path)
@@ -65,11 +68,11 @@ impl SshSession {
         let mut stderr = child.stderr.take().unwrap();
 
         // Reader threads: blocking reads from child stdout/stderr → shared mpsc channel
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
         let tx2 = tx.clone();
         std::thread::spawn(move || {
             use std::io::Read;
-            let mut buf = [0u8; 4096];
+            let mut buf = [0u8; 65536];
             loop {
                 match stdout.read(&mut buf) {
                     Ok(0) | Err(_) => break,
@@ -83,7 +86,7 @@ impl SshSession {
         });
         std::thread::spawn(move || {
             use std::io::Read;
-            let mut buf = [0u8; 4096];
+            let mut buf = [0u8; 65536];
             loop {
                 match stderr.read(&mut buf) {
                     Ok(0) | Err(_) => break,
@@ -97,18 +100,25 @@ impl SshSession {
         });
 
         // Forwarder task: mpsc → SSH channel
-        // Translate \n → \r\n for the SSH terminal (no PTY layer to do this)
         tokio::spawn(async move {
             while let Some(data) = rx.recv().await {
-                let mut out = Vec::with_capacity(data.len() * 2);
-                for &b in &data {
-                    if b == b'\n' {
-                        out.push(b'\r');
+                if translate_newlines {
+                    // Translate \n → \r\n for SSH terminal (no PTY layer to do this)
+                    let mut out = Vec::with_capacity(data.len() * 2);
+                    for &b in &data {
+                        if b == b'\n' {
+                            out.push(b'\r');
+                        }
+                        out.push(b);
                     }
-                    out.push(b);
-                }
-                if write_half.data(&out[..]).await.is_err() {
-                    break;
+                    if write_half.data(&out[..]).await.is_err() {
+                        break;
+                    }
+                } else {
+                    // Binary-safe: send data as-is (SCP, SFTP, etc.)
+                    if write_half.data(&data[..]).await.is_err() {
+                        break;
+                    }
                 }
             }
             let status = child.wait().map(|s| s.code().unwrap_or(1) as u32).unwrap_or(1);
@@ -165,7 +175,7 @@ impl russh::server::Handler for SshSession {
         session: &mut Session,
     ) -> Result<(), Self::Error> {
         session.channel_success(channel_id)?;
-        self.spawn_shell("/initrd/shell", &[]);
+        self.spawn_shell("/bin/shell", &[]);
         Ok(())
     }
 
@@ -178,7 +188,7 @@ impl russh::server::Handler for SshSession {
         session.channel_success(channel_id)?;
         let cmd = std::str::from_utf8(data).unwrap_or("").trim();
         // Run through shell so redirects, pipes, etc. work
-        self.spawn_shell("/initrd/shell", &["-c", cmd]);
+        self.spawn_shell("/bin/shell", &["-c", cmd]);
         Ok(())
     }
 
@@ -193,6 +203,7 @@ impl russh::server::Handler for SshSession {
         _modes: &[(russh::Pty, u32)],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
+        self.is_pty = true;
         session.channel_success(channel)?;
         Ok(())
     }
@@ -207,6 +218,7 @@ fn main() {
     rt.block_on(async {
         let config = russh::server::Config {
             auth_rejection_time: std::time::Duration::from_secs(1),
+            nodelay: true,
             keys: vec![
                 russh::keys::PrivateKey::random(&mut OsRng, russh::keys::Algorithm::Ed25519)
                     .unwrap(),

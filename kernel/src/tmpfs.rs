@@ -8,11 +8,12 @@ use crate::vfs::FileSystem;
 /// In-memory filesystem for /tmp and similar ephemeral mounts.
 pub struct TmpFs {
     files: BTreeMap<String, (Vec<u8>, u64)>,
+    symlinks: BTreeMap<String, String>,
 }
 
 impl TmpFs {
     pub fn new() -> Self {
-        Self { files: BTreeMap::new() }
+        Self { files: BTreeMap::new(), symlinks: BTreeMap::new() }
     }
 }
 
@@ -28,20 +29,32 @@ impl FileSystem for TmpFs {
         }
     }
 
-    fn read_link(&mut self, _name: &str) -> Option<String> {
-        None
+    fn read_link(&mut self, name: &str) -> Option<String> {
+        self.symlinks.get(name).cloned()
     }
 
     fn file_mtime(&mut self, name: &str) -> u64 {
         self.files.get(name).map_or(0, |(_, mtime)| *mtime)
     }
 
-    fn create(&mut self, name: &str, data: &[u8], mtime: u64) -> bool {
+    fn create(&mut self, name: &str, data: &[u8], mtime: u64) -> Result<(), &'static str> {
         self.files.insert(String::from(name), (Vec::from(data), mtime));
-        true
+        Ok(())
     }
 
     fn delete(&mut self, name: &str) -> bool {
-        self.files.remove(name).is_some()
+        self.symlinks.remove(name).is_some() || self.files.remove(name).is_some()
     }
+
+    fn delete_prefix(&mut self, prefix: &str) {
+        self.files.retain(|k, _| !k.starts_with(prefix));
+        self.symlinks.retain(|k, _| !k.starts_with(prefix));
+    }
+
+    fn create_symlink(&mut self, name: &str, target: &str) -> Result<(), &'static str> {
+        self.symlinks.insert(String::from(name), String::from(target));
+        Ok(())
+    }
+
+    fn sync(&mut self) {}
 }

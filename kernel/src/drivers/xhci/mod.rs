@@ -180,6 +180,10 @@ fn setup_packet(bm_request_type: u8, b_request: u8, w_value: u16, w_index: u16, 
 // ---------------------------------------------------------------------------
 // XhciController
 // ---------------------------------------------------------------------------
+// SAFETY: XhciController contains raw pointers to DMA memory that is valid
+// for the lifetime of the controller. Access is serialized by the Lock.
+unsafe impl Send for XhciController {}
+
 pub struct XhciController {
     // Base addresses (MMIO)
     db_base: Mmio,

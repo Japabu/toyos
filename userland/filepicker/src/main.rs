@@ -404,7 +404,7 @@ fn run_picker(mode: PickerMode, start_dir: &str, client_pid: u32) {
     let mut window = Window::create_topmost(500, 400, title);
     let mut fb = window.framebuffer();
 
-    let font_data = fs::read("/initrd/JetBrainsMono-8x16.font").expect("Failed to load font");
+    let font_data = fs::read("/share/fonts/JetBrainsMono-8x16.font").expect("Failed to load font");
     let font = Font::from_prebuilt(&font_data);
 
     let mut picker = Picker::new(mode, start_dir, font.width(), font.height());

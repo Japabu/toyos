@@ -15,13 +15,22 @@ impl SharedToken {
     pub fn from_raw(v: u32) -> Self { Self(v) }
 }
 
+// SAFETY: SharedRegion contains raw PML4 pointers in mapped_in.
+// These are physical memory addresses valid across all CPUs.
+// Access is serialized by the REGIONS lock.
+unsafe impl Send for SharedRegion {}
+
 struct SharedRegion {
     phys_addr: u64,
     size: u64,
     owner_pid: Pid,
     allowed: Vec<Pid>,                // PIDs allowed to map
     mapped_in: Vec<(Pid, *mut u64)>,  // (PID, PML4) for processes that have mapped it
-    layout: Option<Layout>,           // for freeing; None = kernel-owned
+    layout: Option<Layout>,
+}
+
+impl SharedRegion {
+    fn is_permanent(&self) -> bool { self.layout.is_none() }
 }
 
 static REGIONS: Lock<Option<Vec<(SharedToken, SharedRegion)>>> = Lock::new(None);
@@ -68,7 +77,7 @@ pub fn alloc(size: u64, owner_pid: Pid, owner_pml4: *mut u64) -> SharedToken {
 }
 
 /// Register an existing kernel-owned allocation as a shared region.
-/// Used for GPU framebuffers. Not freeable, no initial owner.
+/// Permanent: never auto-removed. Used for GPU framebuffers and DMA buffers.
 #[must_use]
 pub fn register(phys_addr: u64, size: u64) -> SharedToken {
     let token = next_token();
@@ -145,8 +154,7 @@ pub fn release(token: SharedToken, caller_pid: Pid, caller_pml4: *mut u64) -> bo
             region.allowed.swap_remove(idx);
         }
 
-        // If no mappings remain, deallocate
-        if region.mapped_in.is_empty() {
+        if region.mapped_in.is_empty() && !region.is_permanent() {
             let (_, region) = regions.swap_remove(pos);
             if let Some(layout) = region.layout {
                 unsafe { dealloc(region.phys_addr as *mut u8, layout); }
@@ -184,7 +192,7 @@ pub fn cleanup_process(pid: Pid, pml4: *mut u64) {
                 if let Some(layout) = region.layout {
                     unsafe { dealloc(region.phys_addr as *mut u8, layout); }
                 }
-            } else if regions[i].1.mapped_in.is_empty() {
+            } else if regions[i].1.mapped_in.is_empty() && !regions[i].1.is_permanent() {
                 let (_, region) = regions.swap_remove(i);
                 if let Some(layout) = region.layout {
                     unsafe { dealloc(region.phys_addr as *mut u8, layout); }

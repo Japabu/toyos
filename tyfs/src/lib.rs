@@ -5,4 +5,4 @@ mod disk;
 mod fs;
 
 pub use disk::Disk;
-pub use fs::{ReadError, SimpleFs};
+pub use fs::{ReadError, WriteError, SimpleFs};

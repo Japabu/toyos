@@ -4,9 +4,7 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use super::cpu;
 use super::cpu::{outb, io_wait};
 use crate::arch::{paging, syscall, percpu};
-use crate::{symbols, process, log};
-
-use alloc::format;
+use crate::{process, log};
 
 use crate::sync::Lock;
 
@@ -405,14 +403,10 @@ exception_entry!(page_fault_entry, "14", error_code_cr2);
 
 // --- Exception handler ---
 
-/// Resolve an address: process symbols (via process table), then kernel symbols.
-fn format_addr(addr: u64, is_user: bool) -> alloc::string::String {
-    if is_user {
-        if let Some((name, offset)) = process::resolve_symbol(addr) {
-            return format!("{:#x}  {}+{:#x}", addr, name, offset);
-        }
-    }
-    symbols::format_kernel_addr(addr)
+/// Log an address with symbol resolution (allocation-free).
+fn log_addr(addr: u64, _is_user: bool) {
+    // Use the non-allocating raw resolver. It prints directly via log!.
+    crate::symbols::resolve_kernel_raw(addr);
 }
 
 /// Check if addr is a plausible kernel pointer (in identity-mapped RAM).
@@ -431,6 +425,10 @@ extern "C" fn exception_handler(
     let is_user = cs & RPL_MASK != 0;
     let regs = unsafe { &*regs };
 
+    // All logging in this handler MUST be allocation-free (log! uses stack-based
+    // formatting). format!() is forbidden — it allocates and will deadlock if the
+    // exception occurred while the allocator lock was held.
+
     let name = match vector {
         VECTOR_INVALID_OPCODE => "Invalid Opcode",
         VECTOR_GPF => "General Protection Fault",
@@ -438,7 +436,7 @@ extern "C" fn exception_handler(
         _ => "Exception",
     };
 
-    let detail = if vector == VECTOR_PAGE_FAULT {
+    if vector == VECTOR_PAGE_FAULT {
         let action = if error_code & PF_INSTRUCTION_FETCH != 0 {
             "execute"
         } else if error_code & PF_WRITE != 0 {
@@ -451,23 +449,27 @@ extern "C" fn exception_handler(
         } else {
             "page not mapped"
         };
-        format!("{}: {} at {:#x} ({})", name, action, fault_addr, cause)
+        if is_user {
+            let pid = percpu::current_pid().unwrap_or(crate::process::Pid(0));
+            log!("Process {} crashed: {}: {} at {:#x} ({})", pid, name, action, fault_addr, cause);
+        } else {
+            let cpu = percpu::cpu_id();
+            log!("KERNEL PANIC on CPU {} (pid={:?}): {}: {} at {:#x} ({})",
+                cpu, percpu::current_pid(), name, action, fault_addr, cause);
+        }
     } else {
-        format!("{} (error_code={:#x})", name, error_code)
-    };
-
-    if is_user {
-        let pid = percpu::current_pid().expect("user-mode fault with no current process");
-        log!("Process {} crashed: {}", pid, detail);
-    } else {
-        let cpu = percpu::cpu_id();
-        let pid_str = match percpu::current_pid() {
-            Some(pid) => format!("{}", pid),
-            None => format!("idle"),
-        };
-        log!("KERNEL PANIC on CPU {} (pid={}): {}", cpu, pid_str, detail);
+        if is_user {
+            let pid = percpu::current_pid().unwrap_or(crate::process::Pid(0));
+            log!("Process {} crashed: {} (error_code={:#x})", pid, name, error_code);
+        } else {
+            let cpu = percpu::cpu_id();
+            log!("KERNEL PANIC on CPU {} (pid={:?}): {} (error_code={:#x})",
+                cpu, percpu::current_pid(), name, error_code);
+        }
     }
-    log!("  rip: {}", format_addr(rip, is_user));
+
+    log!("  rip:");
+    log_addr(rip, is_user);
 
     if vector == VECTOR_PAGE_FAULT {
         paging::debug_page_walk(fault_addr);
@@ -488,9 +490,9 @@ extern "C" fn exception_handler(
 
     // Backtrace
     log!("  Backtrace:");
-    log!("    0: {}", format_addr(rip, is_user));
+    log_addr(rip, is_user);
     let mut rbp = regs.rbp;
-    for i in 1..20 {
+    for _i in 1..20 {
         if rbp == 0 || rbp % 8 != 0 { break; }
         let valid = if is_user {
             process::is_valid_user_addr(rbp) && process::is_valid_user_addr(rbp + 8)
@@ -501,7 +503,7 @@ extern "C" fn exception_handler(
         let saved_rbp = unsafe { *(rbp as *const u64) };
         let return_addr = unsafe { *((rbp + 8) as *const u64) };
         if return_addr == 0 { break; }
-        log!("    {}: {}", i, format_addr(return_addr, is_user));
+        log_addr(return_addr, is_user);
         rbp = saved_rbp;
     }
 

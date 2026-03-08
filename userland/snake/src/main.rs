@@ -72,7 +72,7 @@ impl Game {
     fn new() -> Self {
         let window = Window::create_with_title(0, 0, "Snake");
         let fb = window.framebuffer();
-        let font_data = fs::read("/initrd/JetBrainsMono-8x16.font").expect("font");
+        let font_data = fs::read("/share/fonts/JetBrainsMono-8x16.font").expect("font");
         let font = font::Font::from_prebuilt(&font_data);
 
         let cols = fb.width() / CELL;

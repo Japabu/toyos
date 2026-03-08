@@ -685,11 +685,12 @@ dependencies = [
 [[package]]
 name = "getrandom"
 version = "0.2.17"
+source = "git+https://github.com/Japabu/getrandom?branch=toyos-v0.2#c473bb1022335e22fb5e997f69d5c00c8ac0b2c5"
 dependencies = [
  "cfg-if",
  "js-sys",
  "libc",
- "toyos-abi",
+ "toyos-abi 0.1.0 (git+https://github.com/Japabu/toyos-abi)",
  "wasi",
  "wasm-bindgen",
 ]
@@ -697,11 +698,12 @@ dependencies = [
 [[package]]
 name = "getrandom"
 version = "0.3.4"
+source = "git+https://github.com/Japabu/getrandom?branch=toyos-v0.3#bb423bc0173b1548fff892e4fdb9843bebe1083f"
 dependencies = [
  "cfg-if",
  "libc",
  "r-efi 5.3.0",
- "toyos-abi",
+ "toyos-abi 0.1.0 (git+https://github.com/Japabu/toyos-abi)",
  "wasip2",
 ]
 
@@ -1070,7 +1072,7 @@ name = "mio"
 version = "1.1.1"
 dependencies = [
  "libc",
- "toyos-abi",
+ "toyos-abi 0.1.0",
  "toyos-net",
  "wasi",
  "windows-sys",
@@ -1788,10 +1790,10 @@ checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 [[package]]
 name = "socket2"
 version = "0.6.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3a766e1110788c36f4fa1c2b71b387a7815aa65f88ce0229841826633d93723e"
 dependencies = [
  "libc",
+ "toyos-abi 0.1.0",
+ "toyos-net",
  "windows-sys",
 ]
 
@@ -1945,10 +1947,15 @@ name = "toyos-abi"
 version = "0.1.0"
 
 [[package]]
+name = "toyos-abi"
+version = "0.1.0"
+source = "git+https://github.com/Japabu/toyos-abi#4331c3580174b75b22c3a36023664e99e9a6dadd"
+
+[[package]]
 name = "toyos-net"
 version = "0.1.0"
 dependencies = [
- "toyos-abi",
+ "toyos-abi 0.1.0",
 ]
 
 [[package]]

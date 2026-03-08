@@ -1,8 +1,8 @@
 use core::arch::{asm, naked_asm};
 
 use crate::arch::{cpu, paging, percpu};
-use crate::process::{Pid, ProcessState, ProcessTable, PROCESS_TABLE, KERNEL_STACK_SIZE};
-use crate::{fd, keyboard};
+use crate::process::{IdleProof, Pid, ProcessState, ProcessTable, PROCESS_TABLE};
+use crate::keyboard;
 const IA32_FS_BASE: u32 = 0xC0000100;
 
 /// Block the current process and switch to the next ready one.
@@ -15,9 +15,12 @@ pub fn yield_now() {
     schedule(ProcessState::Ready);
 }
 
-/// Timer preemption: called from the timer interrupt handler when a process
-/// is interrupted in user mode. Same as yield — mark Ready, switch to next.
+/// Timer preemption: called from the timer interrupt handler.
+/// No-op if no process is running on this CPU (e.g. AP during early boot or idle).
 pub fn preempt() {
+    if percpu::current_pid().is_none() {
+        return;
+    }
     yield_now();
 }
 
@@ -38,10 +41,8 @@ fn schedule(cur_state: ProcessState) {
     let table = guard.as_mut().unwrap();
     let cur_pid = percpu::current_pid().expect("schedule() called during idle");
 
-    // If current process was already removed (e.g. race with exit cleanup),
-    // log a warning and fall through to idle — nothing to save.
-    if let Some(proc) = table.procs.get_mut(cur_pid) {
-        proc.set_state(cur_state);
+    if let Some(entry) = table.get_mut(cur_pid) {
+        entry.set_state(cur_state);
     } else {
         crate::log!("schedule: warning: cur_pid {cur_pid} not in table, going to idle");
     }
@@ -57,15 +58,15 @@ pub fn schedule_already_blocked(guard: crate::sync::LockGuard<'_, Option<Process
 fn schedule_inner(mut guard: crate::sync::LockGuard<'_, Option<ProcessTable>>) {
     let table = guard.as_mut().unwrap();
     let cur_pid = percpu::current_pid().expect("schedule_inner() called during idle");
-    let cur_alive = table.procs.get(cur_pid).is_some();
+    let cur_alive = table.get(cur_pid).is_some();
 
     idle_poll(table);
 
     // Round-robin: find smallest Ready PID > current, or wrap to smallest Ready PID
     let mut best_after: Option<Pid> = None;
     let mut best_any: Option<Pid> = None;
-    for (pid, proc) in table.procs.iter() {
-        if proc.state == ProcessState::Ready {
+    for (pid, entry) in table.iter() {
+        if *entry.state() == ProcessState::Ready {
             if pid > cur_pid && best_after.map_or(true, |b| pid < b) {
                 best_after = Some(pid);
             }
@@ -77,33 +78,30 @@ fn schedule_inner(mut guard: crate::sync::LockGuard<'_, Option<ProcessTable>>) {
 
     if let Some(new_pid) = best_after.or(best_any) {
         if cur_alive && new_pid == cur_pid {
-            table.procs.get_mut(cur_pid).unwrap().set_state(ProcessState::Running);
+            table.get_mut(cur_pid).unwrap().set_state(ProcessState::Running);
             return;
         }
 
-        // Switch to another process.
-        let new_proc = table.procs.get(new_pid).unwrap_or_else(|| {
-            let keys: alloc::vec::Vec<Pid> = table.procs.iter().map(|(pid, _)| pid).collect();
+        let new_entry = table.get(new_pid).unwrap_or_else(|| {
+            let keys: alloc::vec::Vec<Pid> = table.iter().map(|(pid, _)| pid).collect();
             panic!("schedule: pid {new_pid} vanished after scan (cur={cur_pid}, keys={keys:?})");
         });
-        debug_assert!(new_proc.state == ProcessState::Ready,
-            "scheduling non-Ready pid={new_pid}: {}", new_proc.state.name());
-        debug_assert!(new_proc.cr3.is_some(),
+        assert!(*new_entry.state() == ProcessState::Ready,
+            "scheduling non-Ready pid={new_pid}: {}", new_entry.state().name());
+        assert!(new_entry.cr3().is_some(),
             "scheduling pid={new_pid} with no page tables");
-        let new_rsp = new_proc.kernel_rsp;
-        let new_cr3 = new_proc.cr3.unwrap().as_u64();
-        let new_fs_base = new_proc.fs_base;
-        let new_ks_top = new_proc.kernel_stack.ptr() as u64 + KERNEL_STACK_SIZE as u64;
+        let new_rsp = new_entry.kernel_rsp();
+        let new_cr3 = new_entry.cr3().unwrap().as_u64();
+        let new_fs_base = new_entry.fs_base();
+        let new_ks_top = new_entry.kernel_stack_top();
 
-        table.procs.get_mut(new_pid).unwrap().set_state(ProcessState::Running);
+        table.get_mut(new_pid).unwrap().set_state(ProcessState::Running);
         percpu::set_current_pid(Some(new_pid));
 
-        // Save current process state if it still exists
-        let old_rsp_ptr = if let Some(cur_proc) = table.procs.get_mut(cur_pid) {
-            cur_proc.fs_base = cpu::rdmsr(IA32_FS_BASE);
-            &mut cur_proc.kernel_rsp as *mut u64
+        let old_rsp_ptr = if let Some(cur_entry) = table.get_mut(cur_pid) {
+            cur_entry.set_fs_base(cpu::rdmsr(IA32_FS_BASE));
+            cur_entry.kernel_rsp_mut() as *mut u64
         } else {
-            // Process gone — use a dummy location; we'll never resume it.
             percpu::idle_rsp_ptr()
         };
         unsafe { percpu::set_kernel_stack(new_ks_top); }
@@ -119,10 +117,9 @@ fn schedule_inner(mut guard: crate::sync::LockGuard<'_, Option<ProcessTable>>) {
     }
 
     // No Ready process — switch to per-CPU idle stack.
-    // Save current process state if it still exists
-    let old_rsp_ptr = if let Some(cur_proc) = table.procs.get_mut(cur_pid) {
-        cur_proc.fs_base = cpu::rdmsr(IA32_FS_BASE);
-        &mut cur_proc.kernel_rsp as *mut u64
+    let old_rsp_ptr = if let Some(cur_entry) = table.get_mut(cur_pid) {
+        cur_entry.set_fs_base(cpu::rdmsr(IA32_FS_BASE));
+        cur_entry.kernel_rsp_mut() as *mut u64
     } else {
         percpu::idle_rsp_ptr()
     };
@@ -131,7 +128,6 @@ fn schedule_inner(mut guard: crate::sync::LockGuard<'_, Option<ProcessTable>>) {
 
     unsafe { cpu::write_cr3(paging::kernel_cr3()); }
 
-    // Hold lock through context_switch — idle_unlock_and_loop releases it.
     core::mem::forget(guard);
     unsafe { context_switch(old_rsp_ptr, percpu::idle_rsp()); }
     // Resumed by cpu_idle_loop — it held the lock for us.
@@ -139,7 +135,6 @@ fn schedule_inner(mut guard: crate::sync::LockGuard<'_, Option<ProcessTable>>) {
 }
 
 /// Schedule without saving current context (used by ap_idle and BSP boot).
-/// Switches to the per-CPU idle stack and enters the idle loop.
 pub fn schedule_no_return() -> ! {
     percpu::set_current_pid(None);
     unsafe { percpu::set_kernel_stack(percpu::idle_stack_top()); }
@@ -159,10 +154,7 @@ pub fn schedule_no_return() -> ! {
 /// Like `schedule_no_return`, but consumes a held PROCESS_TABLE lock guard.
 /// Used by `exit()` to keep the lock held through the stack switch, preventing
 /// another CPU from collecting the zombie (and freeing the kernel stack) before
-/// we've switched off it. The lock is released by `idle_unlock_and_loop` after
-/// the stack pointer has moved to the per-CPU idle stack.
-///
-/// Taking the guard by value ensures callers can't accidentally drop it first.
+/// we've switched off it.
 pub fn schedule_no_return_locked(guard: crate::sync::LockGuard<'_, Option<ProcessTable>>) -> ! {
     core::mem::forget(guard);
     percpu::set_current_pid(None);
@@ -183,29 +175,32 @@ pub fn schedule_no_return_locked(guard: crate::sync::LockGuard<'_, Option<Proces
 /// Idle loop running on the per-CPU idle stack. Polls for I/O and dispatches
 /// Ready processes via context_switch.
 fn cpu_idle_loop() -> ! {
+    // SAFETY: cpu_idle_loop runs on the per-CPU idle stack (set up by schedule_no_return).
+    let idle_proof = unsafe { IdleProof::new_unchecked() };
     loop {
         {
             let mut guard = PROCESS_TABLE.lock();
             let table = guard.as_mut().unwrap();
             idle_poll(table);
+            table.collect_orphan_zombies(idle_proof);
 
-            let ready = table.procs.iter()
-                .find(|(_, p)| p.state == ProcessState::Ready)
+            let ready = table.iter()
+                .find(|(_, e)| *e.state() == ProcessState::Ready)
                 .map(|(pid, _)| pid);
 
             if let Some(new_pid) = ready {
-                let new_proc = table.procs.get(new_pid).unwrap_or_else(|| {
-                    let keys: alloc::vec::Vec<Pid> = table.procs.iter().map(|(pid, _)| pid).collect();
+                let new_entry = table.get(new_pid).unwrap_or_else(|| {
+                    let keys: alloc::vec::Vec<Pid> = table.iter().map(|(pid, _)| pid).collect();
                     panic!("idle: pid {new_pid} vanished after scan (keys={keys:?})");
                 });
-                debug_assert!(new_proc.cr3.is_some(),
+                assert!(new_entry.cr3().is_some(),
                     "idle: scheduling pid={new_pid} with no page tables");
-                let new_rsp = new_proc.kernel_rsp;
-                let new_cr3 = new_proc.cr3.unwrap().as_u64();
-                let new_fs_base = new_proc.fs_base;
-                let new_ks_top = new_proc.kernel_stack.ptr() as u64 + KERNEL_STACK_SIZE as u64;
+                let new_rsp = new_entry.kernel_rsp();
+                let new_cr3 = new_entry.cr3().unwrap().as_u64();
+                let new_fs_base = new_entry.fs_base();
+                let new_ks_top = new_entry.kernel_stack_top();
 
-                table.procs.get_mut(new_pid).unwrap().set_state(ProcessState::Running);
+                table.get_mut(new_pid).unwrap().set_state(ProcessState::Running);
                 percpu::set_current_pid(Some(new_pid));
                 unsafe { percpu::set_kernel_stack(new_ks_top); }
 
@@ -214,38 +209,26 @@ fn cpu_idle_loop() -> ! {
 
                 core::mem::forget(guard);
                 unsafe { context_switch(percpu::idle_rsp_ptr(), new_rsp); }
-                // Resumed — schedule() held the lock when switching back to idle.
                 unsafe { PROCESS_TABLE.force_unlock(); }
                 continue;
             }
         }
         // Halt until next interrupt (timer at 100Hz or xHCI MSI-X).
-        // `sti; hlt` atomically enables interrupts and halts — any pending
-        // interrupt will wake the CPU immediately.
         unsafe { core::arch::asm!("sti; hlt", options(nomem, nostack)); }
     }
 }
 
 /// Entry point for the idle stack when first reached via context_switch from schedule().
-/// schedule() held the lock via mem::forget — release it, then enter the idle loop.
 pub fn idle_unlock_and_loop() -> ! {
     unsafe { PROCESS_TABLE.force_unlock(); }
     cpu_idle_loop()
 }
 
-/// Check whether a BlockedPoll process has any ready FDs.
-/// Poll entries encode interest bits in the high bits (POLL_READABLE=bit62, POLL_WRITABLE=bit63).
-fn poll_has_ready_fd(poll_fds: &[u64; 64], len: u32, fds: &fd::FdTable) -> bool {
-    use toyos_abi::syscall::{POLL_FD_MASK, POLL_READABLE, POLL_WRITABLE};
-    poll_fds[..len as usize].iter().any(|&entry| {
-        let fd_num = (entry & POLL_FD_MASK) as u32;
-        let want_write = entry & POLL_WRITABLE != 0;
-        let want_read = entry & POLL_READABLE != 0 || !want_write;
-        (want_read && fd::has_data(fds, fd_num)) || (want_write && fd::has_space(fds, fd_num))
-    })
-}
-
 /// Poll for I/O and wake blocked processes.
+/// Only accesses SchedEntry data — never locks ProcessData.
+/// BlockedPoll and BlockedRecvMsg use spurious wakeups: explicit wake calls
+/// from pipe/message/keyboard/network subsystems handle the fast path,
+/// and idle_poll only checks timeouts and global readiness flags.
 fn idle_poll(table: &mut ProcessTable) {
     // Process USB events only when MSI-X interrupt fired (BSP only)
     if percpu::cpu_id() == 0 {
@@ -256,51 +239,52 @@ fn idle_poll(table: &mut ProcessTable) {
     let net_ready = crate::net::has_packet();
 
     let mut zombie_pids = alloc::vec::Vec::new();
-    for (_, proc) in table.procs.iter() {
-        if matches!(proc.state, ProcessState::Zombie(_)) {
-            zombie_pids.push(proc.pid);
+    for (_, entry) in table.iter() {
+        if matches!(entry.state(), ProcessState::Zombie(_)) {
+            zombie_pids.push(entry.pid());
         }
     }
 
-    for (_, proc) in table.procs.iter_mut() {
-        match proc.state {
+    for (_, entry) in table.iter_mut() {
+        match *entry.state() {
             ProcessState::BlockedKeyboard if kb_ready => {
-                proc.set_state(ProcessState::Ready);
+                entry.set_state(ProcessState::Ready);
             }
             ProcessState::BlockedPipeRead(id) if crate::pipe::has_data(id) => {
-                proc.set_state(ProcessState::Ready);
+                entry.set_state(ProcessState::Ready);
             }
             ProcessState::BlockedPipeWrite(id) if crate::pipe::has_space(id) => {
-                proc.set_state(ProcessState::Ready);
+                entry.set_state(ProcessState::Ready);
             }
             ProcessState::BlockedWaitPid(child_pid) | ProcessState::BlockedThreadJoin(child_pid) => {
                 if zombie_pids.contains(&child_pid) {
-                    proc.set_state(ProcessState::Ready);
+                    entry.set_state(ProcessState::Ready);
                 }
             }
             ProcessState::BlockedPoll { deadline } => {
-                if poll_has_ready_fd(&proc.poll_fds, proc.poll_len, &proc.fds)
-                    || proc.messages.has_messages()
+                // Spurious wakeup: wake on any global event or timeout.
+                // The poll syscall rechecks and re-blocks if nothing is ready.
+                // Keyboard and network don't have explicit wake calls for
+                // BlockedPoll (unlike pipes), so idle_poll handles them here.
+                if kb_ready || net_ready
                     || (deadline > 0 && crate::clock::nanos_since_boot() >= deadline)
                 {
-                    proc.set_state(ProcessState::Ready);
+                    entry.set_state(ProcessState::Ready);
                 }
             }
             ProcessState::BlockedRecvMsg => {
-                if proc.messages.has_messages() {
-                    proc.set_state(ProcessState::Ready);
-                }
+                // No polling needed — send_message wakes directly.
             }
             ProcessState::BlockedNetRecv { deadline } if net_ready
                 || (deadline > 0 && crate::clock::nanos_since_boot() >= deadline) =>
             {
-                proc.set_state(ProcessState::Ready);
+                entry.set_state(ProcessState::Ready);
             }
             ProcessState::BlockedSleep { deadline } if crate::clock::nanos_since_boot() >= deadline => {
-                proc.set_state(ProcessState::Ready);
+                entry.set_state(ProcessState::Ready);
             }
             ProcessState::BlockedFutex { deadline, .. } if deadline > 0 && crate::clock::nanos_since_boot() >= deadline => {
-                proc.set_state(ProcessState::Ready);
+                entry.set_state(ProcessState::Ready);
             }
             _ => {}
         }
@@ -308,18 +292,18 @@ fn idle_poll(table: &mut ProcessTable) {
 }
 
 /// Wake processes blocked on reading from a pipe that now has data.
+/// Uses spurious wakeups for BlockedPoll — the poll syscall will recheck.
 pub fn wake_pipe_readers(pipe_id: crate::pipe::PipeId) {
     let mut guard = PROCESS_TABLE.lock();
     let table = guard.as_mut().unwrap();
-    for (_, proc) in table.procs.iter_mut() {
-        match proc.state {
+    for (_, entry) in table.iter_mut() {
+        match *entry.state() {
             ProcessState::BlockedPipeRead(id) if id == pipe_id => {
-                proc.set_state(ProcessState::Ready);
+                entry.set_state(ProcessState::Ready);
             }
             ProcessState::BlockedPoll { .. } => {
-                if poll_has_ready_fd(&proc.poll_fds, proc.poll_len, &proc.fds) {
-                    proc.set_state(ProcessState::Ready);
-                }
+                // Spurious wakeup — poll syscall will recheck FD readiness.
+                entry.set_state(ProcessState::Ready);
             }
             _ => {}
         }
@@ -327,18 +311,18 @@ pub fn wake_pipe_readers(pipe_id: crate::pipe::PipeId) {
 }
 
 /// Wake processes blocked on writing to a pipe that now has space.
+/// Uses spurious wakeups for BlockedPoll — the poll syscall will recheck.
 pub fn wake_pipe_writers(pipe_id: crate::pipe::PipeId) {
     let mut guard = PROCESS_TABLE.lock();
     let table = guard.as_mut().unwrap();
-    for (_, proc) in table.procs.iter_mut() {
-        match proc.state {
+    for (_, entry) in table.iter_mut() {
+        match *entry.state() {
             ProcessState::BlockedPipeWrite(id) if id == pipe_id => {
-                proc.set_state(ProcessState::Ready);
+                entry.set_state(ProcessState::Ready);
             }
             ProcessState::BlockedPoll { .. } => {
-                if poll_has_ready_fd(&proc.poll_fds, proc.poll_len, &proc.fds) {
-                    proc.set_state(ProcessState::Ready);
-                }
+                // Spurious wakeup — poll syscall will recheck FD readiness.
+                entry.set_state(ProcessState::Ready);
             }
             _ => {}
         }

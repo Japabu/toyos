@@ -86,24 +86,25 @@ pub fn collect() -> Vec<(String, Vec<u8>)> {
     // Pre-rasterize the font at build time so userland gets instant font loading
     let ttf = fs::read("assets/JetBrainsMono-Regular.ttf").expect("Failed to read font TTF");
     let font_data = rasterize_font(&ttf, 8, 16);
-    files.push(("JetBrainsMono-8x16.font".to_string(), font_data));
+    files.push(("share/fonts/JetBrainsMono-8x16.font".to_string(), font_data));
 
     // Include all other files in assets/ (recursively, skipping the TTF)
-    fn add_dir(dir: &Path, files: &mut Vec<(String, Vec<u8>)>) {
+    fn add_dir(dir: &Path, prefix: &str, files: &mut Vec<(String, Vec<u8>)>) {
         for entry in fs::read_dir(dir).unwrap_or_else(|e| panic!("Failed to read {}: {e}", dir.display())) {
             let path = entry.unwrap().path();
             if path.is_dir() {
-                add_dir(&path, files);
+                let subdir = path.file_name().unwrap().to_str().unwrap();
+                add_dir(&path, &format!("{prefix}{subdir}/"), files);
             } else if path.extension().is_some_and(|e| e == "ttf") {
                 continue; // TTF handled above via rasterization
             } else {
                 let name = path.file_name().unwrap().to_str().unwrap().to_lowercase();
                 let data = fs::read(&path).unwrap_or_else(|e| panic!("Failed to read {}: {e}", path.display()));
-                files.push((name, data));
+                files.push((format!("{prefix}{name}"), data));
             }
         }
     }
-    add_dir(Path::new("assets"), &mut files);
+    add_dir(Path::new("assets"), "share/", &mut files);
 
     files
 }

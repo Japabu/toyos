@@ -3,14 +3,17 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::process::{Command, ExitStatus, Stdio};
 
-const HISTORY_PATH: &str = "/nvme/config/shell_history";
+const HISTORY_PATH: &str = "/home/root/.config/shell_history";
 const HISTORY_MAX: usize = 200;
 
 static mut LAST_STATUS: i32 = 0;
 
 fn main() {
     if env::var_os("PATH").is_none() {
-        env::set_var("PATH", "/initrd:/nvme/bin");
+        env::set_var("PATH", "/bin");
+    }
+    if env::var_os("HOME").is_none() {
+        env::set_var("HOME", "/home/root");
     }
 
     let args: Vec<String> = env::args().collect();
@@ -21,7 +24,8 @@ fn main() {
         std::process::exit(unsafe { LAST_STATUS });
     }
 
-    let _ = env::set_current_dir("/");
+    let home = env::var("HOME").unwrap_or_else(|_| "/".into());
+    let _ = env::set_current_dir(&home);
     let mut history = load_history();
     std::os::toyos::io::set_stdin_raw(true);
 
@@ -466,7 +470,7 @@ fn print_help() {
     println!("Variables: $VAR, ${{VAR}}, $? (exit status)");
     println!("Quoting: 'literal', \"with $expansion\"");
     println!();
-    println!("Programs in /initrd/ are available by name.");
+    println!("Programs in /bin/ are available by name.");
 }
 
 // --- History ---

@@ -54,15 +54,15 @@ impl FileBrowser {
         let window = Window::create_with_title(0, 0, "Files");
         let fb = window.framebuffer();
 
-        let font_data = fs::read("/initrd/JetBrainsMono-8x16.font").expect("failed to read font");
+        let font_data = fs::read("/share/fonts/JetBrainsMono-8x16.font").expect("failed to read font");
         let font = font::Font::from_prebuilt(&font_data);
 
-        let folder_svg = fs::read("/initrd/folder-bold.svg").expect("failed to read folder icon");
-        let file_svg = fs::read("/initrd/file-bold.svg").expect("failed to read file icon");
+        let folder_svg = fs::read("/share/icons/folder-bold.svg").expect("failed to read folder icon");
+        let file_svg = fs::read("/share/icons/file-bold.svg").expect("failed to read file icon");
         let folder_icon = Sprite::from_svg_colored(&folder_svg, ICON_SIZE as u32, [0xf0, 0xc8, 0x50]);
         let file_icon = Sprite::from_svg_colored(&file_svg, ICON_SIZE as u32, [0xd0, 0xd0, 0xd8]);
 
-        let current_dir = PathBuf::from("/initrd");
+        let current_dir = PathBuf::from("/home/root");
 
         let mut browser = Self {
             window,

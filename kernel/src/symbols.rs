@@ -25,6 +25,12 @@ impl SymbolTable {
     }
 
     fn resolve(&self, addr: u64) -> Option<(String, u64)> {
+        let (raw, offset) = self.resolve_raw(addr)?;
+        Some((demangle(raw), offset))
+    }
+
+    /// Resolve an address without allocating. Returns the raw (mangled) symbol name.
+    fn resolve_raw(&self, addr: u64) -> Option<(&str, u64)> {
         if self.symbols.is_empty() { return None; }
 
         let mut lo = 0usize;
@@ -49,7 +55,7 @@ impl SymbolTable {
             .map(|i| name_start + i)
             .unwrap_or(self.names.len());
         let raw = unsafe { core::str::from_utf8_unchecked(&self.names[name_start..name_end]) };
-        Some((demangle(raw), offset))
+        Some((raw, offset))
     }
 }
 
@@ -109,6 +115,27 @@ fn demangle(mangled: &str) -> String {
 /// Resolve an address against kernel symbols only.
 pub fn resolve_kernel(addr: u64) -> Option<(String, u64)> {
     KERNEL_SYMS.lock().resolve(addr)
+}
+
+/// Resolve an address against kernel symbols without allocating.
+/// Returns the raw (mangled) symbol name. Safe to call from exception handlers.
+pub fn resolve_kernel_raw(addr: u64) -> Option<u64> {
+    // We can't return a &str because it borrows the lock guard.
+    // Instead, print directly here.
+    let guard = KERNEL_SYMS.lock();
+    if let Some((raw, offset)) = guard.resolve_raw(addr) {
+        // Use log! (stack-based formatting) to print
+        crate::log!("  {:#x}  {}+{:#x}", addr, raw, offset);
+        Some(offset)
+    } else {
+        let kernel_base = *KERNEL_BASE.lock();
+        if kernel_base != 0 && addr >= kernel_base {
+            crate::log!("  {:#x}  [kernel+{:#x}]", addr, addr - kernel_base);
+        } else {
+            crate::log!("  {:#x}", addr);
+        }
+        None
+    }
 }
 
 /// Format an address with kernel symbol info if available.

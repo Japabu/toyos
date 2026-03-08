@@ -37,16 +37,14 @@ pub fn create_initrd(files: &[(String, Vec<u8>)], symlinks: &[(String, String)])
 
     for (name, data) in files {
         eprintln!("initrd: adding '{}' ({} bytes)", name, data.len());
-        if !tyfs.create(name, data, 0) {
-            panic!("Failed to add '{}' to initrd image", name);
-        }
+        tyfs.create(name, data, 0)
+            .unwrap_or_else(|e| panic!("initrd: failed to add '{}': {:?}", name, e));
     }
 
     for (name, target) in symlinks {
         eprintln!("initrd: symlink '{}' -> '{}'", name, target);
-        if !tyfs.create_symlink(name, target) {
-            panic!("Failed to add symlink '{}' -> '{}' to initrd image", name, target);
-        }
+        tyfs.create_symlink(name, target)
+            .unwrap_or_else(|e| panic!("initrd: failed to add symlink '{}' -> '{}': {:?}", name, target, e));
     }
 
     tyfs.into_disk().data

@@ -1,0 +1,5 @@
+[toolchain]
+channel = "toyos"
+
+[build]
+target = "x86_64-unknown-toyos"

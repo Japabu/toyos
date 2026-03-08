@@ -31,42 +31,23 @@ pub fn lock() -> VfsGuard {
 
 /// Trait abstracting filesystem operations so the VFS can hold
 /// heterogeneous mount points (initrd on SliceDisk, nvme on NvmeDisk).
-pub trait FileSystem {
+pub trait FileSystem: Send {
     fn list(&mut self) -> Vec<(String, u64)>;
     fn read_file(&mut self, name: &str) -> Result<Cow<'static, [u8]>, &'static str>;
     fn read_link(&mut self, name: &str) -> Option<String>;
     fn file_mtime(&mut self, name: &str) -> u64;
-    fn create(&mut self, name: &str, data: &[u8], mtime: u64) -> bool;
+    fn create(&mut self, name: &str, data: &[u8], mtime: u64) -> Result<(), &'static str>;
     fn delete(&mut self, name: &str) -> bool;
+    fn delete_prefix(&mut self, prefix: &str);
+    fn create_symlink(&mut self, name: &str, target: &str) -> Result<(), &'static str>;
+    fn sync(&mut self);
 }
 
-impl<D: tyfs::Disk> FileSystem for tyfs::SimpleFs<D> {
-    fn list(&mut self) -> Vec<(String, u64)> {
-        tyfs::SimpleFs::list(self)
-    }
-    fn read_file(&mut self, name: &str) -> Result<Cow<'static, [u8]>, &'static str> {
-        tyfs::SimpleFs::read_file(self, name).map_err(|e| match e {
-            tyfs::ReadError::NotFound => "not found",
-            tyfs::ReadError::OutOfMemory => "out of memory",
-        })
-    }
-    fn read_link(&mut self, name: &str) -> Option<String> {
-        tyfs::SimpleFs::read_link(self, name)
-    }
-    fn file_mtime(&mut self, name: &str) -> u64 {
-        tyfs::SimpleFs::file_mtime(self, name).unwrap_or(0)
-    }
-    fn create(&mut self, name: &str, data: &[u8], mtime: u64) -> bool {
-        tyfs::SimpleFs::create(self, name, data, mtime)
-    }
-    fn delete(&mut self, name: &str) -> bool {
-        tyfs::SimpleFs::delete(self, name)
-    }
-}
 
 /// Virtual filesystem that dispatches to named mount points.
 /// Subdirectories are virtual — TYFS stores flat filenames with `/` separators.
 pub struct Vfs {
+    root: Option<Box<dyn FileSystem>>,
     mounts: HashMap<String, Box<dyn FileSystem>>,
     created_dirs: HashSet<String>,
 }
@@ -90,13 +71,39 @@ fn normalize(path: &str) -> String {
 impl Vfs {
     fn new() -> Self {
         Self {
+            root: None,
             mounts: HashMap::new(),
             created_dirs: HashSet::new(),
         }
     }
 
+    pub fn set_root(&mut self, fs: Box<dyn FileSystem>) {
+        self.root = Some(fs);
+    }
+
+    pub fn root_mut(&mut self) -> &mut dyn FileSystem {
+        self.root.as_deref_mut().expect("no root filesystem")
+    }
+
     pub fn mount(&mut self, name: &str, fs: Box<dyn FileSystem>) {
         self.mounts.insert(String::from(name), fs);
+    }
+
+    /// Get the filesystem for a mount name: named mounts take priority, then root.
+    /// Returns the filesystem and the path to use within it.
+    fn resolve_fs(&mut self, mount: &str, file: &str) -> Option<(&mut dyn FileSystem, String)> {
+        if let Some(fs) = self.mounts.get_mut(mount) {
+            return Some((fs.as_mut(), String::from(file)));
+        }
+        if let Some(root) = self.root.as_deref_mut() {
+            let root_path = if file.is_empty() {
+                String::from(mount)
+            } else {
+                alloc::format!("{}/{}", mount, file)
+            };
+            return Some((root, root_path));
+        }
+        None
     }
 
     /// Resolve a (possibly relative) path against the given cwd.
@@ -144,25 +151,27 @@ impl Vfs {
             return Some(String::from("/"));
         }
 
-        if !self.mounts.contains_key(&mount) {
-            return None;
-        }
-
-        if subdir.is_empty() {
-            return Some(format!("/{}", mount));
-        }
-
-        let abs = format!("/{}/{}", mount, subdir);
+        let abs = if subdir.is_empty() {
+            format!("/{}", mount)
+        } else {
+            format!("/{}/{}", mount, subdir)
+        };
 
         // Check explicitly created directories
         if self.created_dirs.contains(&abs) {
             return Some(abs);
         }
 
-        // Check if any files exist with this subdirectory prefix
-        let prefix = format!("{}/", subdir);
-        if let Some(fs) = self.mounts.get_mut(&mount) {
-            if fs.list().iter().any(|(name, _)| name.starts_with(&prefix)) {
+        // Named mount with no subdir always exists
+        let is_named = self.mounts.contains_key(&mount);
+        if subdir.is_empty() && is_named {
+            return Some(abs);
+        }
+
+        if let Some((fs, fs_path)) = self.resolve_fs(&mount, &subdir) {
+            // Check if any files exist with this subdirectory prefix
+            let prefix = format!("{}/", fs_path);
+            if fs.list().iter().any(|(name, _)| name.starts_with(&prefix) || *name == fs_path) {
                 return Some(abs);
             }
         }
@@ -179,22 +188,42 @@ impl Vfs {
         };
 
         if mount.is_empty() {
-            let names: Vec<(String, u64)> = self
-                .mounts
-                .keys()
-                .map(|name| (format!("{}/", name), 0))
-                .collect();
-            return Ok(names);
+            // Root listing: top-level dirs from root fs + named mount names
+            let mut result = Vec::new();
+            let mut seen_dirs = HashSet::new();
+
+            // Named mounts
+            for name in self.mounts.keys() {
+                let dir_name = format!("{}/", name);
+                if seen_dirs.insert(dir_name.clone()) {
+                    result.push((dir_name, 0));
+                }
+            }
+
+            // Top-level entries from root filesystem
+            if let Some(root) = self.root.as_deref_mut() {
+                for (name, _size) in root.list() {
+                    if let Some(slash_pos) = name.find('/') {
+                        let dir_name = format!("{}/", &name[..slash_pos]);
+                        if seen_dirs.insert(dir_name.clone()) {
+                            result.push((dir_name, 0));
+                        }
+                    }
+                    // Don't show root-level files (there shouldn't be any)
+                }
+            }
+
+            return Ok(result);
         }
 
-        let fs = self.mounts.get_mut(&mount)
+        let (fs, fs_path) = self.resolve_fs(&mount, &subdir)
             .ok_or("no such directory")?;
         let all_files = fs.list();
 
-        let prefix = if subdir.is_empty() {
+        let prefix = if fs_path.is_empty() {
             String::new()
         } else {
-            format!("{}/", subdir)
+            format!("{}/", fs_path)
         };
 
         let mut result = Vec::new();
@@ -233,54 +262,72 @@ impl Vfs {
     fn read_file_depth(&mut self, path: &str, depth: u32) -> Result<Cow<'static, [u8]>, &'static str> {
         if depth > 10 { return Err("too many symlinks"); }
         let (mount, file) = self.resolve_path("/", path);
-        if file.is_empty() {
+        if mount.is_empty() {
             return Err("not found");
         }
-        let fs = self.mounts.get_mut(&mount).ok_or("not found")?;
-        if let Some(target) = fs.read_link(&file) {
-            let resolved = format!("/{}/{}", mount, target);
+        let is_named = self.mounts.contains_key(&mount);
+        let (fs, fs_path) = self.resolve_fs(&mount, &file).ok_or("not found")?;
+        if fs_path.is_empty() {
+            return Err("not found");
+        }
+        if let Some(target) = fs.read_link(&fs_path) {
+            // For named mounts, resolve relative to the mount point.
+            // For root fs, the target is already a root-relative path.
+            let resolved = if is_named {
+                format!("/{}/{}", mount, target)
+            } else {
+                format!("/{}", target)
+            };
             return self.read_file_depth(&resolved, depth + 1);
         }
-        fs.read_file(&file)
+        fs.read_file(&fs_path)
     }
 
-    pub fn write_file(&mut self, path: &str, data: &[u8], mtime: u64) -> bool {
+    pub fn write_file(&mut self, path: &str, data: &[u8], mtime: u64) -> Result<(), &'static str> {
         let (mount, file) = self.resolve_path("/", path);
-        if file.is_empty() {
-            return false;
+        if mount.is_empty() {
+            return Err("cannot write to root");
         }
-        if let Some(fs) = self.mounts.get_mut(&mount) {
-            fs.delete(&file);
-            fs.create(&file, data, mtime)
-        } else {
-            false
-        }
+        let (fs, fs_path) = self.resolve_fs(&mount, &file).ok_or("no filesystem")?;
+        if fs_path.is_empty() { return Err("invalid path"); }
+        fs.delete(&fs_path);
+        fs.create(&fs_path, data, mtime)
     }
 
     pub fn file_mtime(&mut self, path: &str) -> u64 {
         let (mount, file) = self.resolve_path("/", path);
-        if file.is_empty() {
+        if mount.is_empty() {
             return 0;
         }
-        if let Some(fs) = self.mounts.get_mut(&mount) {
-            fs.file_mtime(&file)
+        if let Some((fs, fs_path)) = self.resolve_fs(&mount, &file) {
+            if fs_path.is_empty() { return 0; }
+            fs.file_mtime(&fs_path)
         } else {
             0
         }
     }
 
-    pub fn rename(&mut self, old_path: &str, new_path: &str) -> bool {
+    pub fn rename(&mut self, old_path: &str, new_path: &str) -> Result<(), &'static str> {
         let (old_mount, old_file) = self.resolve_path("/", old_path);
         let (new_mount, new_file) = self.resolve_path("/", new_path);
-        if old_file.is_empty() || new_file.is_empty() { return false; }
-        if old_mount != new_mount { return false; }
-        let Some(fs) = self.mounts.get_mut(&old_mount) else { return false };
-        let Ok(data) = fs.read_file(&old_file) else { return false };
-        let mtime = fs.file_mtime(&old_file);
-        fs.delete(&new_file);
-        if !fs.create(&new_file, &data, mtime) { return false; }
-        fs.delete(&old_file);
-        true
+        if old_mount.is_empty() || new_mount.is_empty() { return Err("invalid path"); }
+        if old_mount != new_mount { return Err("cross-mount rename"); }
+        let is_named = self.mounts.contains_key(&old_mount);
+        let Some((fs, old_fs_path)) = self.resolve_fs(&old_mount, &old_file) else { return Err("no filesystem") };
+        let new_fs_path = if is_named {
+            String::from(&new_file)
+        } else if new_file.is_empty() {
+            String::from(&new_mount)
+        } else {
+            alloc::format!("{}/{}", new_mount, new_file)
+        };
+        if old_fs_path.is_empty() || new_fs_path.is_empty() { return Err("invalid path"); }
+        let data = fs.read_file(&old_fs_path)?;
+        let mtime = fs.file_mtime(&old_fs_path);
+        fs.delete(&new_fs_path);
+        fs.create(&new_fs_path, &data, mtime)?;
+        fs.delete(&old_fs_path);
+        Ok(())
     }
 
     pub fn create_dir(&mut self, path: &str) {
@@ -293,13 +340,34 @@ impl Vfs {
         self.created_dirs.retain(|d| !d.starts_with(&prefix));
     }
 
+    pub fn create_symlink(&mut self, path: &str, target: &str) -> Result<(), &'static str> {
+        let (mount, file) = self.resolve_path("/", path);
+        if mount.is_empty() {
+            return Err("cannot create symlink at root");
+        }
+        let (fs, fs_path) = self.resolve_fs(&mount, &file).ok_or("no filesystem")?;
+        if fs_path.is_empty() { return Err("invalid path"); }
+        fs.create_symlink(&fs_path, target)
+    }
+
+    pub fn read_link(&mut self, path: &str) -> Option<String> {
+        let (mount, file) = self.resolve_path("/", path);
+        if mount.is_empty() {
+            return None;
+        }
+        let (fs, fs_path) = self.resolve_fs(&mount, &file)?;
+        if fs_path.is_empty() { return None; }
+        fs.read_link(&fs_path)
+    }
+
     pub fn delete(&mut self, path: &str) -> bool {
         let (mount, file) = self.resolve_path("/", path);
-        if file.is_empty() {
+        if mount.is_empty() {
             return false;
         }
-        if let Some(fs) = self.mounts.get_mut(&mount) {
-            fs.delete(&file)
+        if let Some((fs, fs_path)) = self.resolve_fs(&mount, &file) {
+            if fs_path.is_empty() { return false; }
+            fs.delete(&fs_path)
         } else {
             false
         }

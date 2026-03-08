@@ -1,5 +1,6 @@
 use core::arch::naked_asm;
 
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use super::{cpu, gdt, paging};
 use crate::drivers::acpi;
@@ -19,17 +20,11 @@ use toyos_abi::syscall::*;
 // Heap owner routing (threads share parent's heap)
 // ---------------------------------------------------------------------------
 
-/// Run a closure with the heap owner's user_heap. For normal processes this is
-/// the process itself; for threads it's the parent process.
-/// Returns None if the current process or heap owner no longer exists
-/// (e.g., parent exited while thread is still running).
+/// Run a closure with the heap owner's user_heap.
 fn with_heap_owner<R>(f: impl FnOnce(&mut user_heap::UserHeap) -> R) -> Option<R> {
-    let mut guard = process::PROCESS_TABLE.lock();
-    let table = guard.as_mut().unwrap();
-    let pid = process::current_pid();
-    let owner_pid = table.procs.get(pid)?.heap_owner;
-    let owner = table.procs.get_mut(owner_pid)?;
-    Some(f(&mut owner.user_heap))
+    let data = process::fd_owner_data();
+    let mut guard = data.lock();
+    Some(f(&mut guard.user_heap))
 }
 
 // ---------------------------------------------------------------------------
@@ -145,9 +140,9 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             let Some(buf) = ctx.user_slice_mut(a2, a3) else { return bad_addr };
             sys_read(a1 as u32, buf)
         }
-        SYS_ALLOC => with_heap_owner(|heap| user_heap::alloc(heap, a1 as usize, a2 as usize)).unwrap_or(0),
+        SYS_ALLOC => with_heap_owner(|heap| user_heap::alloc(heap, a1 as usize, a2 as usize)).flatten().unwrap_or(0),
         SYS_FREE => { with_heap_owner(|heap| { user_heap::free(heap, a1 as *mut u8, a2 as usize); 0 }).unwrap_or(0) }
-        SYS_REALLOC => with_heap_owner(|heap| user_heap::realloc(heap, a1 as *mut u8, a2 as usize, a3 as usize, a4 as usize)).unwrap_or(0),
+        SYS_REALLOC => with_heap_owner(|heap| user_heap::realloc(heap, a1 as *mut u8, a2 as usize, a3 as usize, a4 as usize)).flatten().unwrap_or(0),
         SYS_THREAD_EXIT => sys_thread_exit(a1 as i32),
         SYS_RANDOM => {
             let Some(buf) = ctx.user_slice_mut(a1, a2) else { return bad_addr };
@@ -157,15 +152,23 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         SYS_CLOCK => crate::clock::nanos_since_boot(),
         SYS_OPEN => {
             let Some(path) = ctx.user_str(a1, a2) else { return bad_addr };
-            sys_open(path, a3)
+            sys_open(path, OpenFlags(a3))
         }
         SYS_CLOSE => sys_close(a1 as u32),
-        SYS_SEEK => process::with_fd_owner_mut(|proc| fd::seek(&mut proc.fds, a1 as u32, a2 as i64, a3)),
+        SYS_SEEK => {
+            let pos = match a3 {
+                0 => SeekFrom::Start(a2),
+                1 => SeekFrom::Current(a2 as i64),
+                2 => SeekFrom::End(a2 as i64),
+                _ => return SyscallError::InvalidArgument.to_u64(),
+            };
+            process::with_fd_owner_data(|data| fd::seek(&mut data.fds, a1 as u32, pos))
+        }
         SYS_FSTAT => {
             let Some(stat) = ctx.user_mut::<fd::Stat>(a2) else { return bad_addr };
-            if process::with_fd_owner(|proc| fd::fstat(&proc.fds, a1 as u32, stat)) { 0 } else { SyscallError::NotFound.to_u64() }
+            if process::with_fd_owner_data(|data| fd::fstat(&data.fds, a1 as u32, stat)) { 0 } else { SyscallError::NotFound.to_u64() }
         }
-        SYS_FSYNC => process::with_fd_owner_mut(|proc| fd::fsync(&mut proc.fds, &mut *vfs::lock(), a1 as u32)),
+        SYS_FSYNC => process::with_fd_owner_data(|data| fd::fsync(&mut data.fds, &mut *vfs::lock(), a1 as u32)),
         SYS_READDIR => {
             let Some(path) = ctx.user_str(a1, a2) else { return bad_addr };
             let Some(buf) = ctx.user_slice_mut(a3, a4) else { return bad_addr };
@@ -219,7 +222,7 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             let Some(fds) = ctx.user_pod_slice::<u64>(a1, a2 as usize) else { return bad_addr };
             sys_poll(fds, a2, a3)
         }
-        SYS_MARK_TTY => process::with_fd_owner_mut(|proc| fd::mark_tty(&mut proc.fds, a1 as u32)),
+        SYS_MARK_TTY => process::with_fd_owner_data(|data| fd::mark_tty(&mut data.fds, a1 as u32)),
         SYS_SEND_MSG => {
             let Some(user_msg) = ctx.user_ref::<message::UserMessage>(a2) else { return bad_addr };
             const MAX_MSG_PAYLOAD: u64 = 64 * 1024;
@@ -300,14 +303,14 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             sys_dlsym(a1, name)
         }
         SYS_DLCLOSE => 0,
-        SYS_FTRUNCATE => process::with_fd_owner_mut(|proc| fd::ftruncate(&mut proc.fds, a1 as u32, a2)),
+        SYS_FTRUNCATE => process::with_fd_owner_data(|data| fd::ftruncate(&mut data.fds, a1 as u32, a2)),
         SYS_STACK_INFO => {
             let Some(base_out) = ctx.user_mut::<u64>(a1) else { return bad_addr };
             let Some(size_out) = ctx.user_mut::<u64>(a2) else { return bad_addr };
-            process::with_current(|proc| {
-                if proc.user_stack_base > 0 {
-                    *base_out = proc.user_stack_base;
-                    *size_out = proc.user_stack_size;
+            process::with_current_data(|data| {
+                if data.user_stack_base > 0 {
+                    *base_out = data.user_stack_base;
+                    *size_out = data.user_stack_size;
                     0
                 } else {
                     SyscallError::NotFound.to_u64()
@@ -343,9 +346,8 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         }
         SYS_EXIT => sys_exit(a1 as i32),
         SYS_GET_ENV => {
-            let env = process::with_current(|p| p.env.clone());
+            let env = process::with_current_data(|d| d.env.clone());
             if a2 == 0 {
-                // Query size
                 env.len() as u64
             } else {
                 let Some(buf) = ctx.user_slice_mut(a1, a2) else { return bad_addr };
@@ -364,6 +366,16 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         }
         SYS_NIC_RX_DONE => { crate::net::refill_rx_buf(a1 as usize); 0 }
         SYS_NIC_TX => { crate::net::submit_tx(a1 as usize); 0 }
+        SYS_SYMLINK => {
+            let Some(target) = ctx.user_str(a1, a2) else { return bad_addr };
+            let Some(link) = ctx.user_str(a3, a4) else { return bad_addr };
+            sys_symlink(target, link)
+        }
+        SYS_READLINK => {
+            let Some(path) = ctx.user_str(a1, a2) else { return bad_addr };
+            let Some(buf) = ctx.user_slice_mut(a3, a4) else { return bad_addr };
+            sys_readlink(path, buf)
+        }
         _ => SyscallError::InvalidArgument.to_u64(),
     }
 }
@@ -374,18 +386,17 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
 
 fn sys_write(fd_num: u32, buf: &[u8]) -> u64 {
     loop {
-        // Single lock: try write + determine wake/block action
-        let action = process::with_fd_owner_mut(|proc| {
-            match fd::try_write(&mut proc.fds, fd_num, buf) {
+        let action = process::with_fd_owner_data(|data| {
+            match fd::try_write(&mut data.fds, fd_num, buf) {
                 Some(n) => {
-                    let pipe_id = match proc.fds.get(fd_num) {
+                    let pipe_id = match data.fds.get(fd_num) {
                         Some(fd::Descriptor::PipeWrite(id)) | Some(fd::Descriptor::TtyWrite(id))
                         | Some(fd::Descriptor::Socket { tx: id, .. }) => Some(*id),
                         _ => None,
                     };
                     Ok((n, pipe_id))
                 }
-                None => match proc.fds.get(fd_num) {
+                None => match data.fds.get(fd_num) {
                     Some(fd::Descriptor::PipeWrite(id)) | Some(fd::Descriptor::TtyWrite(id))
                     | Some(fd::Descriptor::Socket { tx: id, .. }) =>
                         Err(Some(process::ProcessState::BlockedPipeWrite(*id))),
@@ -411,24 +422,22 @@ enum ReadBlock {
 
 fn sys_read(fd_num: u32, buf: &mut [u8]) -> u64 {
     loop {
-        // Single lock: try read + determine wake/block action
-        let action = process::with_fd_owner_mut(|proc| {
-            match fd::try_read(&mut proc.fds, fd_num, buf) {
+        let action = process::with_fd_owner_data(|data| {
+            match fd::try_read(&mut data.fds, fd_num, buf) {
                 Some(n) => {
-                    let pipe_id = match proc.fds.get(fd_num) {
+                    let pipe_id = match data.fds.get(fd_num) {
                         Some(fd::Descriptor::PipeRead(id)) | Some(fd::Descriptor::TtyRead(id))
                         | Some(fd::Descriptor::Socket { rx: id, .. }) => Some(*id),
                         _ => None,
                     };
                     Ok((n, pipe_id))
                 }
-                None => match proc.fds.get(fd_num) {
+                None => match data.fds.get(fd_num) {
                     Some(fd::Descriptor::Keyboard) => Err(Some(ReadBlock::State(process::ProcessState::BlockedKeyboard))),
                     Some(fd::Descriptor::PipeRead(id)) | Some(fd::Descriptor::TtyRead(id))
                     | Some(fd::Descriptor::Socket { rx: id, .. }) =>
                         Err(Some(ReadBlock::State(process::ProcessState::BlockedPipeRead(*id)))),
                     Some(fd::Descriptor::SerialConsole) => {
-                        // Poll serial every 10ms
                         let deadline = crate::clock::nanos_since_boot() + 10_000_000;
                         let mut fds = [0u64; 64];
                         fds[0] = fd_num as u64;
@@ -450,23 +459,22 @@ fn sys_read(fd_num: u32, buf: &mut [u8]) -> u64 {
     }
 }
 
-fn sys_open(path: &str, flags: u64) -> u64 {
-    let cwd = process::with_current(|p| p.cwd.clone());
+fn sys_open(path: &str, flags: OpenFlags) -> u64 {
+    let cwd = process::with_current_data(|d| d.cwd.clone());
     let resolved = vfs::lock().resolve_absolute(&cwd, path);
-    process::with_fd_owner_mut(|proc| fd::open(&mut proc.fds, &mut *vfs::lock(), &resolved, flags))
+    process::with_fd_owner_data(|data| fd::open(&mut data.fds, &mut *vfs::lock(), &resolved, flags))
 }
 
 fn sys_close(fd_num: u32) -> u64 {
     let pid = process::current_pid();
-    // Single lock: determine wake target + close
-    let (result, wake_readers, wake_writers) = process::with_fd_owner_mut(|proc| {
-        let (wake_r, wake_w) = match proc.fds.get(fd_num) {
+    let (result, wake_readers, wake_writers) = process::with_fd_owner_data(|data| {
+        let (wake_r, wake_w) = match data.fds.get(fd_num) {
             Some(fd::Descriptor::PipeWrite(id)) | Some(fd::Descriptor::TtyWrite(id)) => (Some(*id), None),
             Some(fd::Descriptor::PipeRead(id)) | Some(fd::Descriptor::TtyRead(id)) => (None, Some(*id)),
             Some(fd::Descriptor::Socket { rx, tx }) => (Some(*tx), Some(*rx)),
             _ => (None, None),
         };
-        let r = fd::close(&mut proc.fds, &mut *vfs::lock(), fd_num, pid);
+        let r = fd::close(&mut data.fds, &mut *vfs::lock(), fd_num, pid);
         (r, wake_r, wake_w)
     });
     if let Some(id) = wake_readers { process::wake_pipe_readers(id); }
@@ -497,7 +505,7 @@ fn sys_random(buf: &mut [u8]) -> u64 {
 }
 
 fn sys_readdir(path: &str, buf: &mut [u8]) -> u64 {
-    let cwd = process::with_current(|p| p.cwd.clone());
+    let cwd = process::with_current_data(|d| d.cwd.clone());
     let entries = match vfs::lock().list(&cwd, path) {
         Ok(e) => e,
         Err(_) => return SyscallError::NotFound.to_u64(),
@@ -524,17 +532,17 @@ fn sys_readdir(path: &str, buf: &mut [u8]) -> u64 {
 }
 
 fn sys_delete(path: &str) -> u64 {
-    let cwd = process::with_current(|p| p.cwd.clone());
+    let cwd = process::with_current_data(|d| d.cwd.clone());
     let mut vfs = vfs::lock();
     let resolved = vfs.resolve_absolute(&cwd, path);
     if vfs.delete(&resolved) { 0 } else { SyscallError::NotFound.to_u64() }
 }
 
 fn sys_chdir(path: &str) -> u64 {
-    let cwd = process::with_current(|p| p.cwd.clone());
+    let cwd = process::with_current_data(|d| d.cwd.clone());
     match vfs::lock().cd(&cwd, path) {
         Some(new_cwd) => {
-            process::with_current_mut(|p| p.cwd = new_cwd);
+            process::with_current_data(|d| d.cwd = new_cwd);
             0
         }
         None => SyscallError::NotFound.to_u64(),
@@ -542,8 +550,8 @@ fn sys_chdir(path: &str) -> u64 {
 }
 
 fn sys_getcwd(buf: &mut [u8]) -> u64 {
-    process::with_current(|proc| {
-        let cwd = &proc.cwd;
+    process::with_current_data(|data| {
+        let cwd = &data.cwd;
         let len = cwd.len().min(buf.len());
         buf[..len].copy_from_slice(&cwd.as_bytes()[..len]);
         len as u64
@@ -552,21 +560,29 @@ fn sys_getcwd(buf: &mut [u8]) -> u64 {
 
 fn sys_set_keyboard_layout(name: &str) -> u64 {
     if keyboard::set_layout(name) {
-        if !vfs::lock().write_file("/nvme/config/keyboard_layout", name.as_bytes(), crate::clock::nanos_since_boot()) {
-            log!("warning: failed to persist keyboard layout");
-        }
         0
     } else {
         SyscallError::NotFound.to_u64()
     }
 }
 
+fn fd_result(r: Result<u32, SyscallError>) -> u64 {
+    match r {
+        Ok(fd) => fd as u64,
+        Err(e) => e.to_u64(),
+    }
+}
+
 fn sys_pipe() -> u64 {
     let pipe_id = pipe::create();
-    process::with_fd_owner_mut(|proc| {
-        let read_fd = fd::alloc(&mut proc.fds, fd::Descriptor::PipeRead(pipe_id)) as u64;
-        let write_fd = fd::alloc(&mut proc.fds, fd::Descriptor::PipeWrite(pipe_id)) as u64;
-        (read_fd << 32) | write_fd
+    process::with_fd_owner_data(|data| {
+        let Ok(read_fd) = fd::alloc(&mut data.fds, fd::Descriptor::PipeRead(pipe_id)) else {
+            return SyscallError::ResourceExhausted.to_u64();
+        };
+        let Ok(write_fd) = fd::alloc(&mut data.fds, fd::Descriptor::PipeWrite(pipe_id)) else {
+            return SyscallError::ResourceExhausted.to_u64();
+        };
+        ((read_fd as u64) << 32) | write_fd as u64
     })
 }
 
@@ -578,19 +594,19 @@ fn sys_pipe_open(pipe_id: u64, mode: u64) -> u64 {
     match mode {
         0 => {
             pipe::add_reader(pipe_id);
-            process::with_fd_owner_mut(|proc| fd::alloc(&mut proc.fds, fd::Descriptor::PipeRead(pipe_id)) as u64)
+            process::with_fd_owner_data(|data| fd_result(fd::alloc(&mut data.fds, fd::Descriptor::PipeRead(pipe_id))))
         }
         1 => {
             pipe::add_writer(pipe_id);
-            process::with_fd_owner_mut(|proc| fd::alloc(&mut proc.fds, fd::Descriptor::PipeWrite(pipe_id)) as u64)
+            process::with_fd_owner_data(|data| fd_result(fd::alloc(&mut data.fds, fd::Descriptor::PipeWrite(pipe_id))))
         }
         _ => SyscallError::InvalidArgument.to_u64(),
     }
 }
 
 fn sys_pipe_id(fd_num: u32) -> u64 {
-    process::with_fd_owner(|proc| {
-        match proc.fds.get(fd_num) {
+    process::with_fd_owner_data(|data| {
+        match data.fds.get(fd_num) {
             Some(fd::Descriptor::PipeRead(id))
             | Some(fd::Descriptor::PipeWrite(id))
             | Some(fd::Descriptor::TtyRead(id))
@@ -601,8 +617,8 @@ fn sys_pipe_id(fd_num: u32) -> u64 {
 }
 
 fn sys_pipe_map(fd_num: u32) -> u64 {
-    let pipe_id = process::with_fd_owner(|proc| {
-        match proc.fds.get(fd_num) {
+    let pipe_id = process::with_fd_owner_data(|data| {
+        match data.fds.get(fd_num) {
             Some(fd::Descriptor::PipeRead(id))
             | Some(fd::Descriptor::PipeWrite(id))
             | Some(fd::Descriptor::TtyRead(id))
@@ -628,20 +644,19 @@ fn sys_socket_create(rx_pipe_id_raw: u64, tx_pipe_id_raw: u64) -> u64 {
     }
     pipe::add_reader(rx);
     pipe::add_writer(tx);
-    process::with_fd_owner_mut(|proc| {
-        fd::alloc(&mut proc.fds, fd::Descriptor::Socket { rx, tx }) as u64
+    process::with_fd_owner_data(|data| {
+        fd_result(fd::alloc(&mut data.fds, fd::Descriptor::Socket { rx, tx }))
     })
 }
 
 fn sys_read_nonblock(fd_num: u32, buf: &mut [u8]) -> u64 {
-    let result = process::with_fd_owner_mut(|proc| {
-        fd::try_read(&mut proc.fds, fd_num, buf)
+    let result = process::with_fd_owner_data(|data| {
+        fd::try_read(&mut data.fds, fd_num, buf)
     });
     match result {
         Some(n) => {
-            // Wake writers if we read from a pipe
-            let pipe_id = process::with_fd_owner(|proc| {
-                match proc.fds.get(fd_num) {
+            let pipe_id = process::with_fd_owner_data(|data| {
+                match data.fds.get(fd_num) {
                     Some(fd::Descriptor::PipeRead(id)) | Some(fd::Descriptor::TtyRead(id))
                     | Some(fd::Descriptor::Socket { rx: id, .. }) => Some(*id),
                     _ => None,
@@ -655,14 +670,13 @@ fn sys_read_nonblock(fd_num: u32, buf: &mut [u8]) -> u64 {
 }
 
 fn sys_write_nonblock(fd_num: u32, buf: &[u8]) -> u64 {
-    let result = process::with_fd_owner_mut(|proc| {
-        fd::try_write(&mut proc.fds, fd_num, buf)
+    let result = process::with_fd_owner_data(|data| {
+        fd::try_write(&mut data.fds, fd_num, buf)
     });
     match result {
         Some(n) => {
-            // Wake readers if we wrote to a pipe
-            let pipe_id = process::with_fd_owner(|proc| {
-                match proc.fds.get(fd_num) {
+            let pipe_id = process::with_fd_owner_data(|data| {
+                match data.fds.get(fd_num) {
                     Some(fd::Descriptor::PipeWrite(id)) | Some(fd::Descriptor::TtyWrite(id))
                     | Some(fd::Descriptor::Socket { tx: id, .. }) => Some(*id),
                     _ => None,
@@ -708,7 +722,6 @@ fn poll_fd_num(entry: u64) -> u32 {
 }
 
 /// Check if a poll entry is ready, respecting interest bits.
-/// If neither POLL_READABLE nor POLL_WRITABLE is set, defaults to read.
 fn poll_entry_ready(fds: &fd::FdTable, entry: u64) -> bool {
     let fd_num = poll_fd_num(entry);
     let want_write = entry & POLL_WRITABLE != 0;
@@ -722,33 +735,55 @@ fn sys_poll(fds: &[u64], fds_len: u64, timeout_nanos: u64) -> u64 {
     } else {
         0
     };
+
+    // Get the fd owner's data Arc and current process's data Arc (brief table lock).
+    let (fd_data_arc, cur_data_arc) = {
+        let guard = process::PROCESS_TABLE.lock();
+        let table = guard.as_ref().unwrap();
+        let pid = process::current_pid();
+        let sched = table.get(pid).unwrap();
+        let fd_pid = sched.heap_owner();
+        (Arc::clone(table.get(fd_pid).unwrap().data()),
+         Arc::clone(sched.data()))
+    };
+
     loop {
         crate::drivers::xhci::poll_if_pending();
-        // fd readiness checks go through the fd owner (parent for threads),
-        // but messages are per-process/thread.
-        let result = {
-            let guard = process::PROCESS_TABLE.lock();
-            let table = guard.as_ref().unwrap();
-            let pid = process::current_pid();
-            let proc = table.procs.get(pid).unwrap();
-            let fd_pid = match proc.kind {
-                process::Kind::Thread { parent } => parent,
-                process::Kind::Process { .. } => pid,
-            };
-            let fd_owner = table.procs.get(fd_pid).unwrap();
-            let mut mask: u64 = 0;
+
+        let mut mask: u64 = 0;
+
+        // Check FD readiness + messages. Handle the common case (process, not thread)
+        // where fd_data_arc and cur_data_arc are the same Arc.
+        if Arc::ptr_eq(&fd_data_arc, &cur_data_arc) {
+            let data = fd_data_arc.lock();
             for (i, &entry) in fds.iter().enumerate() {
-                if poll_entry_ready(&fd_owner.fds, entry) {
+                if poll_entry_ready(&data.fds, entry) {
                     mask |= 1 << i;
                 }
             }
-            if proc.messages.has_messages() {
+            if data.messages.has_messages() {
                 mask |= 1 << fds_len;
             }
-            mask
-        };
-        if result != 0 {
-            return result;
+        } else {
+            // Thread: check FDs on parent's data, messages on own data
+            {
+                let fd_data = fd_data_arc.lock();
+                for (i, &entry) in fds.iter().enumerate() {
+                    if poll_entry_ready(&fd_data.fds, entry) {
+                        mask |= 1 << i;
+                    }
+                }
+            }
+            {
+                let cur_data = cur_data_arc.lock();
+                if cur_data.messages.has_messages() {
+                    mask |= 1 << fds_len;
+                }
+            }
+        }
+
+        if mask != 0 {
+            return mask;
         }
         if deadline > 0 && crate::clock::nanos_since_boot() >= deadline {
             return 0;
@@ -771,16 +806,14 @@ fn sys_send_msg(target_pid: u64, user_msg: &message::UserMessage, payload: Vec<u
 
 fn sys_recv_msg(out: &mut message::UserMessage) -> u64 {
     loop {
-        let msg = process::with_current_mut(|proc| proc.messages.pop());
+        let msg = process::with_current_data(|data| data.messages.pop());
         if let Some(msg) = msg {
             let (data, len) = if !msg.payload.is_empty() {
-                // Allocate in receiver's user heap and copy payload
-                let addr = with_heap_owner(|heap| {
+                let Some(addr) = with_heap_owner(|heap| {
                     user_heap::alloc(heap, msg.payload.len(), 8)
-                }).unwrap_or(0);
-                if addr == 0 {
+                }).flatten() else {
                     return SyscallError::Unknown.to_u64();
-                }
+                };
                 unsafe {
                     core::ptr::copy_nonoverlapping(
                         msg.payload.as_ptr(),
@@ -799,7 +832,7 @@ fn sys_recv_msg(out: &mut message::UserMessage) -> u64 {
             out.len = len;
             return 0;
         }
-        process::block(process::ProcessState::BlockedRecvMsg);
+        process::block_recv_msg();
     }
 }
 
@@ -824,7 +857,7 @@ fn sys_open_device(device_type: u64) -> u64 {
         Some(d) => d,
         None => return SyscallError::NotFound.to_u64(),
     };
-    process::with_fd_owner_mut(|proc| fd::alloc(&mut proc.fds, desc) as u64)
+    process::with_fd_owner_data(|data| fd_result(fd::alloc(&mut data.fds, desc)))
 }
 
 fn sys_register_name(name: &str) -> u64 {
@@ -841,7 +874,7 @@ fn sys_find_pid(name: &str) -> u64 {
 
 fn sys_alloc_shared(size: u64) -> u64 {
     let pid = process::current_pid();
-    let pml4 = process::with_current(|p| p.cr3.unwrap().as_ptr());
+    let pml4 = process::with_current_sched(|s| s.cr3().unwrap().as_ptr());
     shared_memory::alloc(size, pid, pml4).raw() as u64
 }
 
@@ -853,7 +886,7 @@ fn sys_grant_shared(token: u64, target_pid: u64) -> u64 {
 
 fn sys_map_shared(token: u64) -> u64 {
     let pid = process::current_pid();
-    let pml4 = process::with_current(|p| p.cr3.unwrap().as_ptr());
+    let pml4 = process::with_current_sched(|s| s.cr3().unwrap().as_ptr());
     match shared_memory::map(shared_memory::SharedToken::from_raw(token as u32), pid, pml4) {
         Some(addr) => addr,
         None => SyscallError::PermissionDenied.to_u64(),
@@ -862,7 +895,7 @@ fn sys_map_shared(token: u64) -> u64 {
 
 fn sys_release_shared(token: u64) -> u64 {
     let pid = process::current_pid();
-    let pml4 = process::with_current(|p| p.cr3.unwrap().as_ptr());
+    let pml4 = process::with_current_sched(|s| s.cr3().unwrap().as_ptr());
     let token = shared_memory::SharedToken::from_raw(token as u32);
     if shared_memory::release(token, pid, pml4) { 0 } else { SyscallError::NotFound.to_u64() }
 }
@@ -878,37 +911,41 @@ fn sys_mmap(req_addr: u64, size: u64, _prot: u64, flags: u64) -> u64 {
     if fixed && req_addr != 0 {
         // MAP_FIXED: map the allocated physical memory at the requested virtual address
         let phys_addr = alloc.ptr() as u64;
-        let ok = process::with_current_mut(|proc| {
-            let pml4 = proc.cr3.unwrap().as_ptr();
-            let start = req_addr & !(paging::PAGE_2M - 1);
-            let end = (req_addr + aligned as u64 + paging::PAGE_2M - 1) & !(paging::PAGE_2M - 1);
-            let mut cur = start;
-            let mut offset = 0u64;
-            while cur < end {
-                if !paging::remap_user_2m(pml4, cur, phys_addr + offset) {
-                    // Undo any remaps we already did
-                    let mut undo = start;
-                    while undo < cur {
-                        paging::restore_identity_2m(pml4, undo);
-                        undo += paging::PAGE_2M;
-                    }
-                    return false;
+        // Get cr3 from SchedEntry (brief table lock)
+        let pml4 = process::with_current_sched(|s| s.cr3().unwrap().as_ptr());
+        let start = req_addr & !(paging::PAGE_2M - 1);
+        let end = (req_addr + aligned as u64 + paging::PAGE_2M - 1) & !(paging::PAGE_2M - 1);
+        let mut cur = start;
+        let mut offset = 0u64;
+        let mut ok = true;
+        while cur < end {
+            if !paging::remap_user_2m(pml4, cur, phys_addr + offset) {
+                let mut undo = start;
+                while undo < cur {
+                    paging::restore_identity_2m(pml4, undo);
+                    undo += paging::PAGE_2M;
                 }
-                cur += paging::PAGE_2M;
-                offset += paging::PAGE_2M;
+                ok = false;
+                break;
             }
-            proc.mmap_regions.push(process::MmapRegion {
-                addr: start, size: aligned, alloc, fixed: true,
+            cur += paging::PAGE_2M;
+            offset += paging::PAGE_2M;
+        }
+        if ok {
+            process::with_current_data(|data| {
+                data.mmap_regions.push(process::MmapRegion {
+                    addr: start, size: aligned, alloc, fixed: true,
+                });
             });
-            true
-        });
-        if ok { req_addr } else { SyscallError::InvalidArgument.to_u64() }
+            req_addr
+        } else {
+            SyscallError::InvalidArgument.to_u64()
+        }
     } else {
-        // Non-fixed: use the physical address as the virtual address (identity mapping)
         let addr = alloc.ptr() as u64;
         paging::map_user(addr, aligned as u64);
-        process::with_current_mut(|proc| {
-            proc.mmap_regions.push(process::MmapRegion {
+        process::with_current_data(|data| {
+            data.mmap_regions.push(process::MmapRegion {
                 addr, size: aligned, alloc, fixed: false,
             });
         });
@@ -917,11 +954,11 @@ fn sys_mmap(req_addr: u64, size: u64, _prot: u64, flags: u64) -> u64 {
 }
 
 fn sys_munmap(addr: u64, _size: u64) -> u64 {
-    process::with_current_mut(|proc| {
-        let pml4 = proc.cr3.unwrap().as_ptr();
-        let idx = proc.mmap_regions.iter().position(|r| r.addr == addr);
+    let pml4 = process::with_current_sched(|s| s.cr3().unwrap().as_ptr());
+    process::with_current_data(|data| {
+        let idx = data.mmap_regions.iter().position(|r| r.addr == addr);
         if let Some(idx) = idx {
-            let region = proc.mmap_regions.swap_remove(idx);
+            let region = data.mmap_regions.swap_remove(idx);
             if region.fixed {
                 let mut cur = region.addr;
                 let end = region.addr + region.size as u64;
@@ -932,7 +969,6 @@ fn sys_munmap(addr: u64, _size: u64) -> u64 {
             } else {
                 paging::unmap_user(pml4, region.addr, region.size as u64);
             }
-            // OwnedAlloc drops here, freeing physical memory
             0
         } else {
             SyscallError::NotFound.to_u64()
@@ -967,9 +1003,8 @@ fn sys_sysinfo(buf: &mut [u8]) -> u64 {
     let guard = process::PROCESS_TABLE.lock();
     let table = guard.as_ref().unwrap();
 
-    let process_count = table.procs.iter().count() as u32;
+    let process_count = table.iter().count() as u32;
 
-    // Write header
     buf[0..8].copy_from_slice(&total_mem.to_le_bytes());
     buf[8..16].copy_from_slice(&used_mem.to_le_bytes());
     buf[16..20].copy_from_slice(&cpu_count.to_le_bytes());
@@ -978,9 +1013,8 @@ fn sys_sysinfo(buf: &mut [u8]) -> u64 {
     buf[32..40].copy_from_slice(&busy_ticks.to_le_bytes());
     buf[40..48].copy_from_slice(&total_ticks.to_le_bytes());
 
-    // Write process entries
     let max_entries = (buf.len() - HEADER_SIZE) / ENTRY_SIZE;
-    let mut sorted_pids: Vec<process::Pid> = table.procs.iter().map(|(pid, _)| pid).collect();
+    let mut sorted_pids: Vec<process::Pid> = table.iter().map(|(pid, _)| pid).collect();
     sorted_pids.sort();
 
     let mut pos = HEADER_SIZE;
@@ -988,28 +1022,27 @@ fn sys_sysinfo(buf: &mut [u8]) -> u64 {
         if i >= max_entries {
             break;
         }
-        let Some(proc) = table.procs.get(pid) else { continue };
+        let Some(entry) = table.get(pid) else { continue };
 
-        let state: u8 = match proc.state {
+        let state: u8 = match entry.state() {
             process::ProcessState::Running => 0,
             process::ProcessState::Ready => 1,
             process::ProcessState::Zombie(_) => 3,
             _ => 2, // all Blocked variants
         };
-        let (is_thread, parent_pid) = match proc.kind {
-            process::Kind::Thread { parent } => (1u8, parent),
+        let (is_thread, parent_pid) = match entry.kind() {
+            process::Kind::Thread { parent } => (1u8, *parent),
             process::Kind::Process { parent } => (0u8, parent.unwrap_or(process::Pid::MAX)),
         };
-        let memory = (proc.elf_alloc.as_ref().map_or(0, |a| a.size())
-            + proc.stack_alloc.as_ref().map_or(0, |a| a.size())) as u64;
+        let memory = entry.memory_size();
 
         buf[pos..pos + 4].copy_from_slice(&pid.raw().to_le_bytes());
         buf[pos + 4..pos + 8].copy_from_slice(&parent_pid.raw().to_le_bytes());
         buf[pos + 8] = state;
         buf[pos + 9] = is_thread;
-        buf[pos + 10..pos + 12].copy_from_slice(&[0, 0]); // padding
+        buf[pos + 10..pos + 12].copy_from_slice(&[0, 0]);
         buf[pos + 12..pos + 20].copy_from_slice(&memory.to_le_bytes());
-        buf[pos + 20..pos + 48].copy_from_slice(&proc.name);
+        buf[pos + 20..pos + 48].copy_from_slice(entry.name());
 
         pos += ENTRY_SIZE;
     }
@@ -1048,41 +1081,43 @@ fn sys_nanosleep(nanos: u64) -> u64 {
 }
 
 fn sys_dup(fd_num: u32) -> u64 {
-    process::with_fd_owner_mut(|proc| {
-        let desc = match proc.fds.get(fd_num) {
+    process::with_fd_owner_data(|data| {
+        let desc = match data.fds.get(fd_num) {
             Some(d) => fd::dup(d),
             None => return SyscallError::NotFound.to_u64(),
         };
-        fd::alloc(&mut proc.fds, desc) as u64
+        fd_result(fd::alloc(&mut data.fds, desc))
     })
 }
 
 fn sys_dup2(old_fd: u32, new_fd: u32) -> u64 {
-    process::with_fd_owner_mut(|proc| {
-        let desc = match proc.fds.get(old_fd) {
+    process::with_fd_owner_data(|data| {
+        let desc = match data.fds.get(old_fd) {
             Some(d) => fd::dup(d),
             None => return SyscallError::NotFound.to_u64(),
         };
-        // If new_fd is already open, close it first
-        if proc.fds.get(new_fd).is_some() {
+        if data.fds.get(new_fd).is_some() {
             let mut vfs = vfs::lock();
-            fd::close(&mut proc.fds, &mut vfs, new_fd, process::current_pid());
+            fd::close(&mut data.fds, &mut vfs, new_fd, process::current_pid());
         }
-        proc.fds.insert_at(new_fd, desc);
+        data.fds.insert_at(new_fd, desc);
         new_fd as u64
     })
 }
 
 fn sys_rename(old: &str, new: &str) -> u64 {
-    let cwd = process::with_current(|p| p.cwd.clone());
+    let cwd = process::with_current_data(|d| d.cwd.clone());
     let mut vfs = vfs::lock();
     let old_abs = vfs.resolve_absolute(&cwd, old);
     let new_abs = vfs.resolve_absolute(&cwd, new);
-    if vfs.rename(&old_abs, &new_abs) { 0 } else { SyscallError::NotFound.to_u64() }
+    match vfs.rename(&old_abs, &new_abs) {
+        Ok(()) => 0,
+        Err(_) => SyscallError::NotFound.to_u64(),
+    }
 }
 
 fn sys_mkdir(path: &str) -> u64 {
-    let cwd = process::with_current(|p| p.cwd.clone());
+    let cwd = process::with_current_data(|d| d.cwd.clone());
     let mut vfs = vfs::lock();
     let resolved = vfs.resolve_absolute(&cwd, path);
     vfs.create_dir(&resolved);
@@ -1090,18 +1125,43 @@ fn sys_mkdir(path: &str) -> u64 {
 }
 
 fn sys_rmdir(path: &str) -> u64 {
-    let cwd = process::with_current(|p| p.cwd.clone());
+    let cwd = process::with_current_data(|d| d.cwd.clone());
     let mut vfs = vfs::lock();
     let resolved = vfs.resolve_absolute(&cwd, path);
     vfs.remove_dir(&resolved);
     0
 }
 
+fn sys_symlink(target: &str, link: &str) -> u64 {
+    let cwd = process::with_current_data(|d| d.cwd.clone());
+    let mut vfs = vfs::lock();
+    let resolved = vfs.resolve_absolute(&cwd, link);
+    match vfs.create_symlink(&resolved, target) {
+        Ok(()) => 0,
+        Err(_) => SyscallError::Unknown.to_u64(),
+    }
+}
+
+fn sys_readlink(path: &str, buf: &mut [u8]) -> u64 {
+    let cwd = process::with_current_data(|d| d.cwd.clone());
+    let mut vfs = vfs::lock();
+    let resolved = vfs.resolve_absolute(&cwd, path);
+    match vfs.read_link(&resolved) {
+        Some(target) => {
+            let bytes = target.as_bytes();
+            let len = bytes.len().min(buf.len());
+            buf[..len].copy_from_slice(&bytes[..len]);
+            len as u64
+        }
+        None => SyscallError::NotFound.to_u64(),
+    }
+}
+
 fn sys_dlopen(path: &str) -> u64 {
-    let cwd = process::with_current(|p| p.cwd.clone());
+    let cwd = process::with_current_data(|d| d.cwd.clone());
     let resolved = vfs::lock().resolve_absolute(&cwd, path);
 
-    let data = match vfs::lock().read_file(&resolved) {
+    let binary = match vfs::lock().read_file(&resolved) {
         Ok(d) => d,
         Err(e) => {
             log!("dlopen: {}: {}", resolved, e);
@@ -1109,7 +1169,7 @@ fn sys_dlopen(path: &str) -> u64 {
         }
     };
 
-    let lib = match crate::elf::load_shared_lib(&data) {
+    let lib = match crate::elf::load_shared_lib(&binary) {
         Ok(l) => l,
         Err(msg) => {
             log!("dlopen: {}", msg);
@@ -1117,95 +1177,73 @@ fn sys_dlopen(path: &str) -> u64 {
         }
     };
 
-    // Map loaded library memory into the current process's address space
     paging::map_user(lib.alloc.ptr() as u64, lib.alloc.size() as u64);
 
-    // Resolve GLOB_DAT/JUMP_SLOT and TLS relocations, then store the lib.
-    // Threads have empty loaded_libs — use the parent process's libs instead.
     let lib_has_tls = lib.tls_memsz > 0;
 
-    // Phase 1: resolve relocations (needs process table lock)
+    // Phase 1: resolve relocations (ProcessData lock)
+    let data_arc = process::fd_owner_data();
     let (new_total, modules) = {
-        let mut guard = crate::process::PROCESS_TABLE.lock();
-        let table = guard.as_mut().unwrap();
-        let current_pid = crate::process::current_pid();
-        let proc = table.procs.get(current_pid).expect("current process");
-        let owner_pid = match proc.kind {
-            crate::process::Kind::Thread { parent } => parent,
-            _ => current_pid,
-        };
-        let Some(owner) = table.procs.get_mut(owner_pid) else { return SyscallError::NotFound.to_u64() };
-        crate::elf::resolve_dlopen_relocs(&lib, &owner.loaded_libs);
+        let mut data = data_arc.lock();
+        crate::elf::resolve_dlopen_relocs(&lib, &data.loaded_libs);
 
-        // If the new lib has its own TLS, insert at offset 0 and shift existing
-        // modules up. This preserves all existing TPOFF values since:
-        // TPOFF = (old_base + shift) + sym_offset - (old_total + shift) = old TPOFF
-        let lib_base_offset = if lib_has_tls {
+        if lib_has_tls {
             let new_memsz = lib.tls_memsz;
-            // Shift all existing modules up by new_memsz
-            for module in owner.tls_modules.iter_mut() {
+            for module in data.tls_modules.iter_mut() {
                 module.3 += new_memsz;
             }
-            // Insert new module at offset 0
-            owner.tls_modules.insert(0, (lib.tls_template, lib.tls_filesz, lib.tls_memsz, 0));
-            owner.tls_total_memsz += new_memsz;
-            0
-        } else {
-            0
-        };
-
-        // Apply TPOFF relocations for cross-library and own TLS references
-        if owner.tls_total_memsz > 0 {
-            let tls_info = crate::elf::TlsModuleInfo {
-                libs: &owner.loaded_libs,
-                modules: &owner.tls_modules,
-            };
-            crate::elf::apply_tpoff_relocs(&lib, lib_base_offset, owner.tls_total_memsz, &tls_info);
+            data.tls_modules.insert(0, (lib.tls_template, lib.tls_filesz, lib.tls_memsz, 0));
+            data.tls_total_memsz += new_memsz;
         }
 
-        (owner.tls_total_memsz, owner.tls_modules.clone())
-    }; // guard dropped here
+        if data.tls_total_memsz > 0 {
+            let tls_info = crate::elf::TlsModuleInfo {
+                libs: &data.loaded_libs,
+                modules: &data.tls_modules,
+            };
+            let lib_base_offset = if lib_has_tls { 0 } else { 0 };
+            crate::elf::apply_tpoff_relocs(&lib, lib_base_offset, data.tls_total_memsz, &tls_info);
+        }
+
+        (data.tls_total_memsz, data.tls_modules.clone())
+    };
 
     // Phase 2: extend TLS in-place for ALL threads of this process.
-    // TLS blocks are placed at the end of their 2MB allocation, so new modules
-    // extend downward into unused padding. FS base stays the same — no pointer fixups.
     if lib_has_tls {
-        let cur_pid = crate::process::current_pid();
+        let cur_pid = process::current_pid();
 
-        // Collect all pids sharing this address space
-        let pids_to_update: alloc::vec::Vec<crate::process::Pid> = {
-            let guard = crate::process::PROCESS_TABLE.lock();
+        // Collect all pids sharing this address space (brief table lock)
+        let pids_to_update: Vec<(process::Pid, Arc<Lock<process::ProcessData>>)> = {
+            let guard = process::PROCESS_TABLE.lock();
             let table = guard.as_ref().unwrap();
-            let proc = table.procs.get(cur_pid).expect("current process");
-            let owner_pid = proc.heap_owner;
-            table.procs.iter()
-                .filter(|(_, p)| p.heap_owner == owner_pid)
-                .map(|(pid, _)| pid)
+            let entry = table.get(cur_pid).expect("current process");
+            let owner_pid = entry.heap_owner();
+            table.iter()
+                .filter(|(_, e)| e.heap_owner() == owner_pid)
+                .map(|(pid, e)| (pid, Arc::clone(e.data())))
                 .collect()
         };
 
-        for pid in &pids_to_update {
+        for (pid, pid_data_arc) in &pids_to_update {
             let (tp, alloc_start) = if *pid == cur_pid {
                 let tp = crate::arch::read_fs_base();
-                let guard = crate::process::PROCESS_TABLE.lock();
-                let table = guard.as_ref().unwrap();
-                let start = table.procs.get(*pid).map(|p| {
-                    p.tls_alloc.as_ref().map(|a| a.ptr() as u64).unwrap_or(0)
-                }).unwrap_or(0);
+                let data = pid_data_arc.lock();
+                let start = data.tls_alloc.as_ref().map(|a| a.ptr() as u64).unwrap_or(0);
                 (tp, start)
             } else {
-                let guard = crate::process::PROCESS_TABLE.lock();
-                let table = guard.as_ref().unwrap();
-                let p = table.procs.get(*pid).unwrap();
-                let tp = p.fs_base;
-                let start = p.tls_alloc.as_ref().map(|a| a.ptr() as u64).unwrap_or(0);
-                (tp, start)
+                // For other threads: get fs_base from SchedEntry, tls_alloc from ProcessData
+                let fs_base = {
+                    let guard = process::PROCESS_TABLE.lock();
+                    let table = guard.as_ref().unwrap();
+                    table.get(*pid).map(|e| e.fs_base()).unwrap_or(0)
+                };
+                let data = pid_data_arc.lock();
+                let start = data.tls_alloc.as_ref().map(|a| a.ptr() as u64).unwrap_or(0);
+                (fs_base, start)
             };
 
             if tp == 0 || alloc_start == 0 { continue; }
 
-            // The new module's TLS goes at FS - new_total (below old data at FS - old_total).
-            // Check that this falls within the existing allocation.
             let new_tls_start = tp - new_total as u64;
             if new_tls_start < alloc_start {
                 log!("dlopen: TLS extension overflow for pid={} (need {:#x}, alloc starts {:#x})",
@@ -1213,7 +1251,6 @@ fn sys_dlopen(path: &str) -> u64 {
                 continue;
             }
 
-            // Write the new module's .tdata template (first module in the list, offset 0)
             let &(template, filesz, _memsz, base_offset) = &modules[0];
             let dest = (new_tls_start + base_offset as u64) as *mut u8;
             if filesz > 0 && template != 0 {
@@ -1221,56 +1258,37 @@ fn sys_dlopen(path: &str) -> u64 {
                     core::ptr::copy_nonoverlapping(template as *const u8, dest, filesz);
                 }
             }
-            // .tbss area is already zeroed (alloc_zeroed)
 
-            // Update process table (FS base stays the same, only bookkeeping changes)
+            // Update ProcessData bookkeeping
             {
-                let mut guard = crate::process::PROCESS_TABLE.lock();
-                let table = guard.as_mut().unwrap();
-                if let Some(p) = table.procs.get_mut(*pid) {
-                    p.tls_total_memsz = new_total;
-                    p.tls_modules = modules.clone();
-                }
+                let mut data = pid_data_arc.lock();
+                data.tls_total_memsz = new_total;
+                data.tls_modules = modules.clone();
             }
         }
     }
 
     // Phase 3: store the lib in the owner process
-    {
-        let mut guard = crate::process::PROCESS_TABLE.lock();
-        let table = guard.as_mut().unwrap();
-        let current_pid = crate::process::current_pid();
-        let proc = table.procs.get(current_pid).expect("current process");
-        let owner_pid = match proc.kind {
-            crate::process::Kind::Thread { parent } => parent,
-            _ => current_pid,
-        };
-        let Some(owner) = table.procs.get_mut(owner_pid) else { return SyscallError::NotFound.to_u64() };
-        let idx = owner.loaded_libs.len();
-        owner.loaded_libs.push(lib);
-        idx as u64
-    }
+    let mut data = data_arc.lock();
+    let idx = data.loaded_libs.len();
+    data.loaded_libs.push(lib);
+    idx as u64
 }
 
 fn sys_dlsym(handle: u64, name: &str) -> u64 {
-    let guard = crate::process::PROCESS_TABLE.lock();
-    let table = guard.as_ref().unwrap();
-    let current_pid = crate::process::current_pid();
-    let proc = table.procs.get(current_pid).expect("current process");
-    let owner_pid = match proc.kind {
-        crate::process::Kind::Thread { parent } => parent,
-        _ => current_pid,
-    };
-    let Some(owner) = table.procs.get(owner_pid) else { return SyscallError::NotFound.to_u64() };
+    let data_arc = process::fd_owner_data();
+    let data = data_arc.lock();
     let idx = handle as usize;
-    if idx >= owner.loaded_libs.len() {
+    if idx >= data.loaded_libs.len() {
         return SyscallError::NotFound.to_u64();
     }
-    let addr = crate::elf::dlsym(&owner.loaded_libs[idx], name);
-    if addr == 0 { u64::MAX } else { addr }
+    match crate::elf::dlsym(&data.loaded_libs[idx], name) {
+        Some(addr) => addr,
+        None => u64::MAX,
+    }
 }
 
 /// Terminate the current userspace process (called from exception handlers).
 pub fn kill_process(code: i32) -> ! {
-    process::exit(code); // process-wide exit — kills all threads
+    process::exit(code);
 }

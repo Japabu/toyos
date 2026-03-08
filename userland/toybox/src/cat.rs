@@ -1,8 +1,11 @@
 use std::fs;
+use std::io::{self, Read};
 
 pub fn main(args: Vec<String>) {
     if args.is_empty() {
-        eprintln!("Usage: cat <file>");
+        let mut buf = String::new();
+        io::stdin().read_to_string(&mut buf).unwrap();
+        print!("{buf}");
         return;
     }
     for path in &args {
@@ -17,7 +20,10 @@ pub fn main(args: Vec<String>) {
                     eprintln!("{}: {} bytes (binary)", path, data.len());
                 }
             }
-            Err(_) => eprintln!("{}: file not found", path),
+            Err(_) => {
+                eprintln!("{}: file not found", path);
+                std::process::exit(1);
+            }
         }
     }
 }

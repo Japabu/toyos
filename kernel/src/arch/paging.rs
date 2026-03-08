@@ -1,5 +1,5 @@
 use core::alloc::Layout;
-use core::ptr::null_mut;
+use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
 use alloc::alloc::{alloc_zeroed, dealloc};
 
@@ -22,10 +22,10 @@ pub const fn align_2m(size: usize) -> usize {
 
 /// Kernel PML4 template. All per-process PML4s are deep-cloned from this.
 /// Written once during init(), read-only afterwards (except map_kernel at boot).
-static mut KERNEL_PML4: *mut u64 = null_mut();
+static KERNEL_PML4: AtomicPtr<u64> = AtomicPtr::new(core::ptr::null_mut());
 
 /// How many PML4 entries the kernel identity map uses (set during init).
-static mut KERNEL_PML4_ENTRIES: usize = 0;
+static KERNEL_PML4_ENTRIES: AtomicUsize = AtomicUsize::new(0);
 
 /// Allocate a zeroed, page-aligned 4KB page for page table structures.
 fn alloc_page() -> *mut u64 {
@@ -69,11 +69,9 @@ pub fn init(memory_map: &[MemoryMapEntry]) {
     }
 
     let entries = ((max_addr + (1u64 << 39) - 1) >> 39) as usize;
-    unsafe {
-        KERNEL_PML4 = pml4;
-        KERNEL_PML4_ENTRIES = entries;
-        cpu::write_cr3(pml4 as u64);
-    }
+    KERNEL_PML4.store(pml4, Ordering::Release);
+    KERNEL_PML4_ENTRIES.store(entries, Ordering::Release);
+    unsafe { cpu::write_cr3(pml4 as u64); }
 }
 
 /// Get or create a next-level page table at the given index.
@@ -94,14 +92,14 @@ unsafe fn get_or_create(table: *mut u64, index: usize, flags: u64) -> *mut u64 {
 
 /// Physical address of the kernel PML4 template. Used for idle/exit CR3.
 pub fn kernel_cr3() -> u64 {
-    unsafe { KERNEL_PML4 as u64 }
+    KERNEL_PML4.load(Ordering::Acquire) as u64
 }
 
 /// Create a per-process PML4 by deep-cloning the kernel page table hierarchy.
 /// Each process gets its own PML4 -> PDPT -> PD chain so USER bits are independent.
 pub fn create_user_pml4() -> *mut u64 {
-    let kernel_pml4 = unsafe { KERNEL_PML4 };
-    let entries = unsafe { KERNEL_PML4_ENTRIES };
+    let kernel_pml4 = KERNEL_PML4.load(Ordering::Acquire);
+    let entries = KERNEL_PML4_ENTRIES.load(Ordering::Acquire);
     assert!(!kernel_pml4.is_null(), "paging: not initialized");
 
     let pml4 = alloc_page();
@@ -141,7 +139,7 @@ pub fn create_user_pml4() -> *mut u64 {
 /// Free a per-process PML4 and all its cloned PDPT/PD tables.
 /// Does NOT free the underlying 2MB physical pages.
 pub fn free_user_page_tables(pml4: *mut u64) {
-    let entries = unsafe { KERNEL_PML4_ENTRIES };
+    let entries = KERNEL_PML4_ENTRIES.load(Ordering::Acquire);
 
     for pml4_idx in 0..entries {
         let pml4e = unsafe { pml4.add(pml4_idx).read() };
@@ -331,7 +329,7 @@ pub fn is_user_mapped(addr: u64, size: u64) -> bool {
 /// Identity-map an MMIO region as kernel-only using 2MB large pages.
 /// Only call during boot before any processes exist.
 pub fn map_kernel(addr: u64, size: u64) {
-    let pml4 = unsafe { KERNEL_PML4 };
+    let pml4 = KERNEL_PML4.load(Ordering::Acquire);
     assert!(!pml4.is_null(), "paging: not initialized");
 
     let start = addr & !(PAGE_2M - 1);

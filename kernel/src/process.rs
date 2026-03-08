@@ -1,5 +1,6 @@
 use alloc::alloc::{alloc_zeroed, dealloc, Layout};
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::arch::naked_asm;
 use core::ptr::NonNull;
@@ -25,10 +26,14 @@ impl crate::id_map::IdKey for Pid {
 // PageTableRoot — type-safe PML4 pointer (prevents double-free via Option::take)
 // ---------------------------------------------------------------------------
 
-/// Physical address of a PML4 page table. Used as `Option<PageTableRoot>` in Process
+/// Physical address of a PML4 page table. Used as `Option<PageTableRoot>` in SchedEntry
 /// so that `take()` makes double-free of page tables impossible at compile time.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct PageTableRoot(NonNull<u64>);
+
+// SAFETY: PageTableRoot points to a PML4 page table in physical memory.
+// Page tables are not tied to any specific thread — they are hardware structures.
+unsafe impl Send for PageTableRoot {}
 
 impl PageTableRoot {
     pub fn new(ptr: *mut u64) -> Self {
@@ -174,57 +179,78 @@ pub enum Kind {
     Thread { parent: Pid },
 }
 
-pub struct Process {
-    pub pid: Pid,
-    pub state: ProcessState,
-    pub kind: Kind,
-    // Per-process page table (physical address of PML4).
-    // Option so teardown can take() it, making double-free impossible.
-    pub cr3: Option<PageTableRoot>,
-    // Kernel context (saved RSP during context switch)
-    pub kernel_stack: OwnedAlloc,
-    pub kernel_rsp: u64,
-    // Per-process state
-    pub fds: FdTable,
-    pub user_heap: crate::user_heap::UserHeap,
-    pub cwd: String,
-    pub messages: MessageQueue,
-    pub poll_fds: [u64; 64],
-    pub poll_len: u32,
-    /// PID whose user_heap to use for alloc/free. Self for processes, parent for threads.
-    pub heap_owner: Pid,
-    // ELF memory (owned; .take() in exit frees immediately)
-    pub elf_alloc: Option<OwnedAlloc>,
-    // User stack (owned; .take() in exit frees immediately)
-    pub stack_alloc: Option<OwnedAlloc>,
-    // Thread-local storage
-    pub fs_base: u64,
-    tls_template: u64,
-    tls_filesz: usize,
-    tls_memsz: usize,
-    pub tls_alloc: Option<OwnedAlloc>,
-    /// Multi-module TLS: (template_addr, filesz, memsz, base_offset) per module.
-    pub tls_modules: Vec<(u64, usize, usize, usize)>,
-    /// Total combined TLS size across all modules.
-    pub tls_total_memsz: usize,
-    // Crash diagnostics
-    pub symbols: ProcessSymbols,
-    // Process name (filename from argv[0], null-terminated)
-    pub name: [u8; 28],
-    // Dynamically loaded shared libraries (indexed by dlopen handle)
-    pub loaded_libs: Vec<elf::LoadedLib>,
-    // Anonymous memory mappings (mmap)
-    pub mmap_regions: Vec<MmapRegion>,
-    // User stack location (for SYS_STACK_INFO — works for both processes and threads)
-    pub user_stack_base: u64,
-    pub user_stack_size: u64,
-    /// Inherited environment variables (KEY=VALUE\0KEY2=VALUE2\0...)
-    pub env: Vec<u8>,
+// ---------------------------------------------------------------------------
+// SchedEntry — scheduling metadata under the global PROCESS_TABLE lock
+// ---------------------------------------------------------------------------
+
+/// Scheduling metadata protected by the global PROCESS_TABLE lock.
+/// All fields are private — access only through getters and state-machine methods.
+/// This prevents accidental drops of `kernel_stack` (use-after-free) and
+/// invalid state transitions.
+pub struct SchedEntry {
+    pid: Pid,
+    state: ProcessState,
+    kind: Kind,
+    /// Per-process page table (physical address of PML4).
+    /// Option so teardown can take() it, making double-free impossible.
+    cr3: Option<PageTableRoot>,
+    /// Kernel stack allocation. Dropping this frees the stack — only safe when
+    /// the process is NOT running on it (i.e. from the idle loop).
+    kernel_stack: OwnedAlloc,
+    kernel_rsp: u64,
+    fs_base: u64,
+    /// PID whose ProcessData to use for FD/heap ops. Self for processes, parent for threads.
+    heap_owner: Pid,
+    name: [u8; 28],
+    /// Snapshot of allocated memory size (elf + stack) for sysinfo reporting.
+    memory_size: u64,
+    /// Per-process data behind its own lock. Syscalls clone this Arc, drop the
+    /// table lock, then lock ProcessData — so different processes never contend.
+    data: Arc<Lock<ProcessData>>,
 }
 
-impl Process {
+impl SchedEntry {
+    fn new(
+        pid: Pid,
+        state: ProcessState,
+        kind: Kind,
+        cr3: Option<PageTableRoot>,
+        kernel_stack: OwnedAlloc,
+        kernel_rsp: u64,
+        fs_base: u64,
+        heap_owner: Pid,
+        name: [u8; 28],
+        memory_size: u64,
+        data: Arc<Lock<ProcessData>>,
+    ) -> Self {
+        Self { pid, state, kind, cr3, kernel_stack, kernel_rsp, fs_base, heap_owner, name, memory_size, data }
+    }
+
+    // --- Read-only getters ---
+
+    pub fn pid(&self) -> Pid { self.pid }
+    pub fn state(&self) -> &ProcessState { &self.state }
+    pub fn kind(&self) -> &Kind { &self.kind }
+    pub fn heap_owner(&self) -> Pid { self.heap_owner }
+    pub fn name(&self) -> &[u8; 28] { &self.name }
+    pub fn memory_size(&self) -> u64 { self.memory_size }
+    pub fn data(&self) -> &Arc<Lock<ProcessData>> { &self.data }
+    pub fn cr3(&self) -> Option<PageTableRoot> { self.cr3 }
+    pub fn fs_base(&self) -> u64 { self.fs_base }
+
+    // --- Scheduler-only accessors ---
+
+    pub fn kernel_stack_top(&self) -> u64 {
+        self.kernel_stack.ptr() as u64 + KERNEL_STACK_SIZE as u64
+    }
+    pub fn kernel_rsp(&self) -> u64 { self.kernel_rsp }
+    pub fn kernel_rsp_mut(&mut self) -> &mut u64 { &mut self.kernel_rsp }
+    pub fn set_fs_base(&mut self, val: u64) { self.fs_base = val; }
+
+    // --- State machine ---
+
     pub fn set_state(&mut self, new: ProcessState) {
-        debug_assert!(self.state.can_transition_to(&new),
+        assert!(self.state.can_transition_to(&new),
             "invalid state transition pid={}: {} -> {}", self.pid, self.state.name(), new.name());
         self.state = new;
     }
@@ -232,6 +258,56 @@ impl Process {
     fn zombify(&mut self, code: i32) {
         self.set_state(ProcessState::Zombie(code));
     }
+
+    /// Consume the page table root. Panics if already taken.
+    pub fn take_cr3(&mut self) -> PageTableRoot {
+        self.cr3.take().expect("take_cr3: already taken")
+    }
+
+    /// Detach this process from its parent (orphan it).
+    pub fn detach_from_parent(&mut self) {
+        assert!(matches!(self.kind, Kind::Process { parent: Some(_) }),
+            "detach_from_parent: pid={} is not a parented process", self.pid);
+        self.kind = Kind::Process { parent: None };
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ProcessData — per-process data behind Arc<Lock<ProcessData>>
+// ---------------------------------------------------------------------------
+
+/// Per-process data independently lockable via `Arc<Lock<ProcessData>>`.
+/// Syscalls clone the Arc from SchedEntry, drop the table lock, then lock this.
+pub struct ProcessData {
+    pub pid: Pid,
+    pub fds: FdTable,
+    pub user_heap: crate::user_heap::UserHeap,
+    pub cwd: String,
+    pub messages: MessageQueue,
+    pub poll_fds: [u64; 64],
+    pub poll_len: u32,
+    pub elf_alloc: Option<OwnedAlloc>,
+    pub stack_alloc: Option<OwnedAlloc>,
+    // Thread-local storage
+    pub tls_template: u64,
+    pub tls_filesz: usize,
+    pub tls_memsz: usize,
+    pub tls_alloc: Option<OwnedAlloc>,
+    /// Multi-module TLS: (template_addr, filesz, memsz, base_offset) per module.
+    pub tls_modules: Vec<(u64, usize, usize, usize)>,
+    /// Total combined TLS size across all modules.
+    pub tls_total_memsz: usize,
+    // Crash diagnostics
+    pub symbols: ProcessSymbols,
+    // Dynamically loaded shared libraries (indexed by dlopen handle)
+    pub loaded_libs: Vec<elf::LoadedLib>,
+    // Anonymous memory mappings (mmap)
+    pub mmap_regions: Vec<MmapRegion>,
+    // User stack location (for SYS_STACK_INFO)
+    pub user_stack_base: u64,
+    pub user_stack_size: u64,
+    /// Inherited environment variables (KEY=VALUE\0KEY2=VALUE2\0...)
+    pub env: Vec<u8>,
 }
 
 pub struct MmapRegion {
@@ -242,13 +318,129 @@ pub struct MmapRegion {
     pub fixed: bool,
 }
 
+// ---------------------------------------------------------------------------
+// IdleProof — zero-cost proof that code runs on the per-CPU idle stack
+// ---------------------------------------------------------------------------
+
+/// Zero-sized proof that we are on the per-CPU idle stack.
+/// Required by `ProcessTable::collect_orphan_zombies` to prevent calling it
+/// from a process's kernel stack (which would be use-after-free if we drop
+/// the SchedEntry we're running on).
+#[derive(Clone, Copy)]
+pub struct IdleProof(());
+
+impl IdleProof {
+    /// Only call from `cpu_idle_loop` (which runs on the per-CPU idle stack).
+    ///
+    /// # Safety
+    /// Caller must actually be running on the idle stack.
+    pub(crate) unsafe fn new_unchecked() -> Self { Self(()) }
+}
+
+// ---------------------------------------------------------------------------
+// Process table
+// ---------------------------------------------------------------------------
+
 pub struct ProcessTable {
-    pub procs: IdMap<Pid, Process>,
+    procs: IdMap<Pid, SchedEntry>,
 }
 
 impl ProcessTable {
     fn new() -> Self {
         Self { procs: IdMap::new() }
+    }
+
+    // --- Passthrough accessors ---
+
+    pub fn insert_with(&mut self, f: impl FnOnce(Pid) -> SchedEntry) -> Pid {
+        self.procs.insert_with(f)
+    }
+
+    pub fn get(&self, pid: Pid) -> Option<&SchedEntry> {
+        self.procs.get(pid)
+    }
+
+    pub fn get_mut(&mut self, pid: Pid) -> Option<&mut SchedEntry> {
+        self.procs.get_mut(pid)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (Pid, &SchedEntry)> {
+        self.procs.iter()
+    }
+
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = (Pid, &mut SchedEntry)> {
+        self.procs.iter_mut()
+    }
+
+    // --- Safe removal methods (each validates preconditions) ---
+
+    /// Waitpid: collect a zombie child process. Validates parent relationship.
+    pub fn collect_child_zombie(&mut self, child_pid: Pid, parent_pid: Pid) -> Result<Option<i32>, ()> {
+        let entry = self.procs.get(child_pid).ok_or(())?;
+        if !matches!(entry.kind, Kind::Process { parent: Some(ppid) } if ppid == parent_pid) {
+            return Err(());
+        }
+        if let ProcessState::Zombie(code) = entry.state {
+            self.procs.remove(child_pid);
+            Ok(Some(code))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Thread join: collect a zombie thread. Validates parent relationship.
+    pub fn collect_thread_zombie(&mut self, tid: Pid, parent_pid: Pid) -> Result<Option<i32>, ()> {
+        let entry = self.procs.get(tid).ok_or(())?;
+        if !matches!(entry.kind, Kind::Thread { parent } if parent == parent_pid) {
+            return Err(());
+        }
+        if let ProcessState::Zombie(code) = entry.state {
+            self.procs.remove(tid);
+            Ok(Some(code))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Remove a zombie orphan child during parent teardown.
+    /// Asserts the child is a zombie (safe to drop kernel stack since zombies aren't running).
+    fn remove_orphan_zombie_child(&mut self, child_pid: Pid) {
+        let entry = self.procs.get(child_pid).expect("remove_orphan_zombie_child: child not found");
+        assert!(matches!(entry.state, ProcessState::Zombie(_)),
+            "remove_orphan_zombie_child: pid={} is not a zombie (state={})", child_pid, entry.state.name());
+        self.procs.remove(child_pid);
+    }
+
+    /// Sweep all reclaimable zombies. Requires `IdleProof` — only callable from
+    /// the idle loop, which runs on the per-CPU idle stack (safe to drop kernel stacks).
+    ///
+    /// Collects:
+    /// - Parentless zombie processes (orphans)
+    /// - Zombie threads whose parent process is zombie or gone
+    pub fn collect_orphan_zombies(&mut self, _proof: IdleProof) {
+        // First pass: find zombie parent pids (for thread collection)
+        let zombie_pids: Vec<Pid> = self.procs.iter()
+            .filter(|(_, e)| matches!(e.state, ProcessState::Zombie(_)))
+            .map(|(pid, _)| pid)
+            .collect();
+
+        // Second pass: collect reclaimable zombies
+        let orphans: Vec<Pid> = self.procs.iter()
+            .filter(|(_, e)| {
+                if !matches!(e.state, ProcessState::Zombie(_)) {
+                    return false;
+                }
+                match e.kind {
+                    Kind::Process { parent: None } => true,
+                    Kind::Thread { parent } => zombie_pids.contains(&parent),
+                    _ => false,
+                }
+            })
+            .map(|(pid, _)| pid)
+            .collect();
+        for pid in orphans {
+            self.procs.remove(pid);
+        }
     }
 }
 
@@ -264,43 +456,64 @@ pub fn current_pid() -> Pid {
     percpu::current_pid().expect("current_pid() called during idle (no process running)")
 }
 
-/// Access the current process immutably. The process table lock is held for
-/// the duration of the closure. The closure may acquire locks that come AFTER
-/// process_table in the ordering (vfs, pipes, keyboard, device, allocator).
-pub fn with_current<R>(f: impl FnOnce(&Process) -> R) -> R {
+// ---------------------------------------------------------------------------
+// Access patterns — SchedEntry (brief table lock)
+// ---------------------------------------------------------------------------
+
+/// Access the current process's SchedEntry immutably (table lock held for closure).
+pub fn with_current_sched<R>(f: impl FnOnce(&SchedEntry) -> R) -> R {
+    let guard = PROCESS_TABLE.lock();
+    let table = guard.as_ref().unwrap();
+    f(table.get(current_pid()).unwrap())
+}
+
+/// Access the current process's SchedEntry mutably (table lock held for closure).
+pub fn with_current_sched_mut<R>(f: impl FnOnce(&mut SchedEntry) -> R) -> R {
+    let mut guard = PROCESS_TABLE.lock();
+    let table = guard.as_mut().unwrap();
+    f(table.get_mut(current_pid()).unwrap())
+}
+
+// ---------------------------------------------------------------------------
+// Access patterns — ProcessData (clone Arc, drop table lock, lock ProcessData)
+// ---------------------------------------------------------------------------
+
+/// Get the current process's ProcessData Arc (brief table lock).
+pub fn current_data() -> Arc<Lock<ProcessData>> {
+    let guard = PROCESS_TABLE.lock();
+    let table = guard.as_ref().unwrap();
+    Arc::clone(table.get(current_pid()).unwrap().data())
+}
+
+/// Get the FD/heap owner's ProcessData Arc (brief table lock).
+/// For processes this is self; for threads it's the parent process.
+pub fn fd_owner_data() -> Arc<Lock<ProcessData>> {
     let guard = PROCESS_TABLE.lock();
     let table = guard.as_ref().unwrap();
     let pid = current_pid();
-    f(table.procs.get(pid).unwrap())
+    let owner_pid = table.get(pid).unwrap().heap_owner();
+    Arc::clone(table.get(owner_pid).unwrap().data())
 }
 
-/// Access the current process mutably. Same lock ordering rules as with_current.
-pub fn with_current_mut<R>(f: impl FnOnce(&mut Process) -> R) -> R {
-    let mut guard = PROCESS_TABLE.lock();
-    let table = guard.as_mut().unwrap();
-    let pid = current_pid();
-    f(table.procs.get_mut(pid).unwrap())
+/// Access the current process's ProcessData mutably.
+/// Table lock is NOT held during the closure — only the per-process lock.
+pub fn with_current_data<R>(f: impl FnOnce(&mut ProcessData) -> R) -> R {
+    let arc = current_data();
+    let mut guard = arc.lock();
+    f(&mut guard)
 }
 
-/// Access the fd table owner for the current thread/process.
-/// Threads share their parent process's fd table.
-pub fn with_fd_owner<R>(f: impl FnOnce(&Process) -> R) -> R {
-    let guard = PROCESS_TABLE.lock();
-    let table = guard.as_ref().unwrap();
-    let pid = current_pid();
-    let fd_pid = table.procs.get(pid).unwrap().heap_owner;
-    f(table.procs.get(fd_pid).unwrap())
+/// Access the FD/heap owner's ProcessData mutably.
+/// Table lock is NOT held during the closure — only the per-process lock.
+pub fn with_fd_owner_data<R>(f: impl FnOnce(&mut ProcessData) -> R) -> R {
+    let arc = fd_owner_data();
+    let mut guard = arc.lock();
+    f(&mut guard)
 }
 
-/// Access the fd table owner mutably for the current thread/process.
-/// Threads share their parent process's fd table.
-pub fn with_fd_owner_mut<R>(f: impl FnOnce(&mut Process) -> R) -> R {
-    let mut guard = PROCESS_TABLE.lock();
-    let table = guard.as_mut().unwrap();
-    let pid = current_pid();
-    let fd_pid = table.procs.get(pid).unwrap().heap_owner;
-    f(table.procs.get_mut(fd_pid).unwrap())
-}
+// ---------------------------------------------------------------------------
+// TLS setup
+// ---------------------------------------------------------------------------
 
 /// Allocate a TLS area using the x86-64 variant II layout:
 /// [TLS data (.tdata + .tbss)] [TCB: self-pointer]
@@ -324,10 +537,8 @@ pub fn setup_combined_tls(
     let block = alloc.ptr();
 
     // Place TLS data at the END of the allocation so dlopen can extend downward.
-    // Layout: [unused padding] [TLS data (total_memsz)] [self-pointer (8 bytes)]
     let tls_start = alloc_size - block_size;
 
-    // Copy each module's initialized data (.tdata) at its offset within the TLS area
     for &(template, filesz, _memsz, base_offset) in modules {
         if filesz > 0 && template != 0 {
             unsafe {
@@ -339,15 +550,16 @@ pub fn setup_combined_tls(
             }
         }
     }
-    // .tbss already zeroed by alloc_zeroed
 
-    // Thread pointer = address past TLS block
     let tp = block as u64 + (tls_start + total_memsz) as u64;
-    // Self-pointer at %fs:0
     unsafe { *(tp as *mut u64) = tp; }
 
     Some((alloc, tp))
 }
+
+// ---------------------------------------------------------------------------
+// Kernel stack allocation
+// ---------------------------------------------------------------------------
 
 /// Allocate a kernel stack and set up the initial register frame for context_switch.
 /// Returns (alloc, saved_rsp).
@@ -384,13 +596,11 @@ fn scheduler_unlock() {
 #[unsafe(naked)]
 extern "C" fn process_start() {
     naked_asm!(
-        // Save r12/r13 across the Rust call
         "push r12",
         "push r13",
         "call {unlock}",
         "pop r13",
         "pop r12",
-        // Enter userspace
         "push 0x1B",        // SS: user_data | RPL=3
         "push r13",         // RSP: user stack
         "push 0x202",       // RFLAGS: IF=1
@@ -415,7 +625,6 @@ extern "C" fn thread_start() {
         "pop r14",
         "pop r13",
         "pop r12",
-        // Enter userspace with arg in rdi
         "mov rdi, r14",
         "sub r13, 8",       // ABI: RSP must be 16n+8 at function entry
         "push 0x1B",        // SS: user_data | RPL=3
@@ -429,18 +638,26 @@ extern "C" fn thread_start() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Spawn
+// ---------------------------------------------------------------------------
+
 /// Spawn a thread within the current process.
 pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64, stack_base: u64) -> Option<Pid> {
-    // Read parent's TLS info (brief lock)
-    let (tls_template, tls_filesz, tls_memsz, tls_modules, tls_total_memsz) = {
+    // Phase 1: Get parent's SchedEntry data + ProcessData (never held simultaneously)
+    let (parent_cr3, parent_heap_owner, data_arc) = {
         let guard = PROCESS_TABLE.lock();
         let table = guard.as_ref().unwrap();
-        let parent = table.procs.get(current_pid()).unwrap();
-        (parent.tls_template, parent.tls_filesz, parent.tls_memsz,
-         parent.tls_modules.clone(), parent.tls_total_memsz)
+        let parent = table.get(current_pid()).unwrap();
+        (parent.cr3(), parent.heap_owner(), Arc::clone(parent.data()))
+    };
+    let (tls_template, tls_filesz, tls_memsz, tls_modules, tls_total_memsz, parent_cwd) = {
+        let data = data_arc.lock();
+        (data.tls_template, data.tls_filesz, data.tls_memsz,
+         data.tls_modules.clone(), data.tls_total_memsz, data.cwd.clone())
     };
 
-    // Allocate TLS for the thread (outside lock — map_user does TLB flush)
+    // Phase 2: Allocate TLS (outside any lock — map_user does TLB flush)
     let (tls_alloc, fs_base) = if !tls_modules.is_empty() {
         setup_combined_tls(&tls_modules, tls_total_memsz)?
     } else {
@@ -456,32 +673,17 @@ pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64, stack_base: u64) -> Op
         }
     };
 
-    let mut guard = PROCESS_TABLE.lock();
-    let table = guard.as_mut().unwrap();
-    let parent_pid = current_pid();
-    let parent = table.procs.get(parent_pid).unwrap();
-    let parent_cr3 = parent.cr3;
-    let parent_heap_owner = parent.heap_owner;
-    let parent_cwd = parent.cwd.clone();
-    // Threads share the parent's fd table via with_fd_owner routing.
-    // No per-thread fd table needed — all fd ops resolve through parent.
-    let tid = table.procs.insert(Process {
+    // Phase 3: Insert into table (brief table lock)
+    let thread_data = Arc::new(Lock::new(ProcessData {
         pid: Pid::from_raw(0),
-        state: ProcessState::Ready,
-        kind: Kind::Thread { parent: parent_pid },
-        cr3: parent_cr3,
-        kernel_stack: ks_alloc,
-        kernel_rsp: ks_rsp,
         fds: FdTable::new(),
         user_heap: crate::user_heap::UserHeap::new(), // unused — routes through heap_owner
         messages: MessageQueue::new(),
         poll_fds: [0; 64],
         poll_len: 0,
         cwd: parent_cwd,
-        heap_owner: parent_heap_owner,
         elf_alloc: None,
         stack_alloc: None,
-        fs_base,
         tls_template,
         tls_filesz,
         tls_memsz,
@@ -489,14 +691,24 @@ pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64, stack_base: u64) -> Op
         tls_modules,
         tls_total_memsz,
         symbols: ProcessSymbols::empty(),
-        name: [0; 28],
         loaded_libs: Vec::new(),
         mmap_regions: Vec::new(),
         user_stack_base: stack_base,
         user_stack_size: if stack_base > 0 { stack_ptr - stack_base } else { 0 },
         env: Vec::new(),
+    }));
+
+    let mut guard = PROCESS_TABLE.lock();
+    let table = guard.as_mut().unwrap();
+    let parent_pid = current_pid();
+    let tid = table.insert_with(|tid| {
+        thread_data.lock().pid = tid;
+        SchedEntry::new(
+            tid, ProcessState::Ready, Kind::Thread { parent: parent_pid },
+            parent_cr3, ks_alloc, ks_rsp, fs_base, parent_heap_owner,
+            [0; 28], 0, thread_data,
+        )
     });
-    table.procs.get_mut(tid).unwrap().pid = tid;
 
     Some(tid)
 }
@@ -512,19 +724,11 @@ fn make_name(path: &str) -> [u8; 28] {
 /// Build a child's FdTable from (child_fd, parent_fd) pairs.
 /// Duplicates each referenced parent descriptor into the child table.
 pub fn build_child_fds(pairs: &[[u32; 2]]) -> FdTable {
-    let guard = PROCESS_TABLE.lock();
-    let table = guard.as_ref().unwrap();
-    let pid = current_pid();
-    let proc = table.procs.get(pid).unwrap();
-    // Threads share parent's fd table, so resolve through fd owner
-    let fd_pid = match proc.kind {
-        Kind::Thread { parent } => parent,
-        Kind::Process { .. } => pid,
-    };
-    let fd_owner = table.procs.get(fd_pid).unwrap();
+    let data_arc = fd_owner_data();
+    let data = data_arc.lock();
     let mut fds = FdTable::new();
     for &[child_fd, parent_fd] in pairs {
-        if let Some(desc) = fd_owner.fds.get(parent_fd) {
+        if let Some(desc) = data.fds.get(parent_fd) {
             fds.insert_at(child_fd, fd::dup(desc));
         }
     }
@@ -567,7 +771,6 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
 
     paging::map_user_in(child_pml4, elf_alloc.ptr() as u64, elf_alloc.size() as u64);
 
-    // Map loaded shared libraries into the child's address space
     for lib in &loaded_libs {
         paging::map_user_in(child_pml4, lib.alloc.ptr() as u64, lib.alloc.size() as u64);
     }
@@ -584,8 +787,6 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
     paging::map_user_in(child_pml4, stack_base, USER_STACK_SIZE as u64);
 
     // Build combined TLS layout: libraries first, exe last (right before TP).
-    // The exe must be last because its inline tpoff values are baked in at link
-    // time assuming the exe's TLS ends at the TP. Placing it last preserves those values.
     let mut tls_modules: Vec<(u64, usize, usize, usize)> = Vec::new();
     let mut tls_cursor = 0usize;
 
@@ -608,17 +809,14 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
     }
     let tls_total_memsz = tls_cursor;
 
-    // Apply R_X86_64_TPOFF64 relocations in shared libraries now that we know the layout
     let tls_info = elf::TlsModuleInfo { libs: &loaded_libs, modules: &tls_modules };
     for lib in &loaded_libs {
-        // Find this library's base offset in the combined layout
         let lib_base_offset = tls_modules.iter()
             .find(|&&(template, _, _, _)| template == lib.tls_template)
             .map(|&(_, _, _, base_offset)| base_offset)
             .unwrap_or(0);
         elf::apply_tpoff_relocs(lib, lib_base_offset, tls_total_memsz, &tls_info);
     }
-    // Also apply TPOFF relocs in the exe's relocations (local or cross-lib TLS)
     {
         let exe_base_offset = tls_modules.iter()
             .find(|&&(template, _, _, _)| template == loaded.tls_template)
@@ -627,7 +825,6 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
         elf::apply_exe_tpoff_relocs(&binary, loaded.base, exe_base_offset, tls_total_memsz, &tls_info);
     }
 
-    // For single-module compat (used by spawn_thread)
     let (tls_template, tls_filesz, tls_memsz) = if !tls_modules.is_empty() {
         (tls_modules[0].0, tls_modules[0].1, tls_modules[0].2)
     } else {
@@ -660,31 +857,32 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
 
     let ks_base = ks_alloc.ptr() as u64;
 
-    let mut guard = PROCESS_TABLE.lock();
-    let table = guard.as_mut().unwrap();
-
+    // Get parent's cwd (brief table lock + ProcessData lock, before insertion)
     let cwd = match parent {
-        Some(ppid) => table.procs.get(ppid).unwrap().cwd.clone(),
+        Some(ppid) => {
+            let arc = {
+                let guard = PROCESS_TABLE.lock();
+                let table = guard.as_ref().unwrap();
+                Arc::clone(table.get(ppid).unwrap().data())
+            };
+            let guard = arc.lock();
+            guard.cwd.clone()
+        }
         None => String::from("/"),
     };
 
-    let pid = table.procs.insert(Process {
+    let memory_size = (elf_alloc.size() + USER_STACK_SIZE) as u64;
+
+    let proc_data = Arc::new(Lock::new(ProcessData {
         pid: Pid::from_raw(0),
-        state: ProcessState::Ready,
-        kind: Kind::Process { parent },
-        cr3: child_cr3,
-        kernel_stack: ks_alloc,
-        kernel_rsp: ks_rsp,
         fds,
         user_heap: crate::user_heap::UserHeap::new(),
+        cwd,
         messages: MessageQueue::new(),
         poll_fds: [0; 64],
         poll_len: 0,
-        cwd,
-        heap_owner: Pid::from_raw(0),
         elf_alloc: Some(elf_alloc),
         stack_alloc: Some(stack_alloc),
-        fs_base,
         tls_template,
         tls_filesz,
         tls_memsz,
@@ -692,16 +890,24 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
         tls_modules,
         tls_total_memsz,
         symbols: syms,
-        name: make_name(path),
         loaded_libs,
         mmap_regions: Vec::new(),
         user_stack_base: stack_base,
         user_stack_size: USER_STACK_SIZE as u64,
         env,
+    }));
+
+    let mut guard = PROCESS_TABLE.lock();
+    let table = guard.as_mut().unwrap();
+
+    let pid = table.insert_with(|pid| {
+        proc_data.lock().pid = pid;
+        SchedEntry::new(
+            pid, ProcessState::Ready, Kind::Process { parent },
+            child_cr3, ks_alloc, ks_rsp, fs_base, pid,
+            make_name(path), memory_size, proc_data,
+        )
     });
-    let p = table.procs.get_mut(pid).unwrap();
-    p.pid = pid;
-    p.heap_owner = pid;
 
     log!("spawn: {} pid={} base={:#x} entry={:#x} cr3={:#x} ks={:#x}..{:#x}",
         path, pid, loaded.base as u64, loaded.entry, child_cr3.unwrap().as_u64(),
@@ -711,149 +917,180 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
 }
 
 /// Spawn a process from kernel context (during boot). Resolves bare names
-/// to `/initrd/<name>`. Panics on failure.
+/// to `/bin/<name>`. Panics on failure.
 pub fn spawn_kernel(argv: &[&str]) -> Pid {
-    let path = argv[0];
-    let full_path = if path.starts_with('/') {
-        String::from(path)
-    } else {
-        alloc::format!("/initrd/{}", path)
-    };
-    let mut full_argv: Vec<&str> = Vec::with_capacity(argv.len());
-    full_argv.push(&full_path);
-    full_argv.extend_from_slice(&argv[1..]);
     let mut fds = FdTable::new();
     fds.insert_at(0, Descriptor::SerialConsole);
     fds.insert_at(1, Descriptor::SerialConsole);
     fds.insert_at(2, Descriptor::SerialConsole);
-    spawn(&full_argv, fds, None, Vec::new()).expect("spawn_kernel: failed to spawn")
+    spawn(argv, fds, None, Vec::new()).expect("spawn_kernel: failed to spawn")
 }
 
-/// Like `spawn_kernel`, but returns `None` instead of panicking if the binary
-/// is missing. Used for optional services that may not be present in the initrd.
-pub fn spawn_optional(argv: &[&str]) -> Option<Pid> {
-    let path = argv[0];
-    let full_path = if path.starts_with('/') {
-        String::from(path)
-    } else {
-        alloc::format!("/initrd/{}", path)
-    };
-    let mut full_argv: Vec<&str> = Vec::with_capacity(argv.len());
-    full_argv.push(&full_path);
-    full_argv.extend_from_slice(&argv[1..]);
-    let mut fds = FdTable::new();
-    fds.insert_at(0, Descriptor::SerialConsole);
-    fds.insert_at(1, Descriptor::SerialConsole);
-    fds.insert_at(2, Descriptor::SerialConsole);
-    spawn(&full_argv, fds, None, Vec::new())
-}
+// ---------------------------------------------------------------------------
+// Exit / teardown
+// ---------------------------------------------------------------------------
 
 /// Tear down a process: zombie all its threads, free all resources, wake parent.
+/// Called in two phases:
+/// - Phase 1 (resource cleanup): ProcessData lock held, table lock NOT held.
+/// - Phase 2 (scheduling): table lock held through context switch.
+fn teardown_resources(data_arc: &Arc<Lock<ProcessData>>, pid: Pid) {
+    let mut data = data_arc.lock();
+    fd::close_all(&mut data.fds, &mut *vfs::lock(), pid);
+    data.tls_alloc.take();
+    data.elf_alloc.take();
+    data.stack_alloc.take();
+    data.loaded_libs.clear();
+    data.mmap_regions.clear();
+    data.user_heap = crate::user_heap::UserHeap::new();
+}
+
+/// Phase 2 of teardown: zombie threads, free page tables, set zombie state.
 /// Caller must hold PROCESS_TABLE lock and have already switched to kernel CR3.
-fn teardown_process(table: &mut ProcessTable, pid: Pid, code: i32) {
-    // Kill all child threads before freeing resources they depend on
-    let child_tids: Vec<Pid> = table.procs.iter()
-        .filter(|(tid, p)| *tid != pid && matches!(p.kind, Kind::Thread { parent } if parent == pid))
+fn teardown_scheduling(table: &mut ProcessTable, pid: Pid, code: i32) {
+    // Kill all child threads
+    let child_tids: Vec<Pid> = table.iter()
+        .filter(|(tid, e)| *tid != pid && matches!(e.kind(), Kind::Thread { parent } if *parent == pid))
         .map(|(tid, _)| tid)
         .collect();
     for tid in &child_tids {
-        let child = table.procs.get_mut(*tid).unwrap();
-        child.tls_alloc.take();
-        if !matches!(child.state, ProcessState::Zombie(_)) {
+        let child = table.get_mut(*tid).unwrap();
+        if !matches!(child.state(), ProcessState::Zombie(_)) {
             child.zombify(-1);
         }
     }
+    // Note: zombie threads are NOT removed here — they may still be running
+    // on another CPU. They'll be collected by collect_orphan_zombies in the
+    // idle loop (which runs on the per-CPU idle stack).
 
-    let proc = table.procs.get_mut(pid).unwrap();
-    fd::close_all(&mut proc.fds, &mut *vfs::lock(), pid);
-    proc.tls_alloc.take();
-    let root = proc.cr3.take().expect("teardown_process: cr3 already taken");
+    let entry = table.get_mut(pid).unwrap();
+    let root = entry.take_cr3();
     let pml4 = root.as_ptr();
     shared_memory::cleanup_process(pid, pml4);
-    proc.elf_alloc.take();
-    proc.stack_alloc.take();
-    proc.loaded_libs.clear();
-    proc.mmap_regions.clear();
     paging::free_user_page_tables(pml4);
-    proc.zombify(code);
-    let name = core::str::from_utf8(&proc.name).unwrap_or("?").trim_end_matches('\0');
+    let has_parent = matches!(entry.kind(), Kind::Process { parent: Some(_) });
+    entry.zombify(code);
+    let name = core::str::from_utf8(entry.name()).unwrap_or("?").trim_end_matches('\0');
     log!("exit: {name} pid={pid} code={code}");
 
     if let Some(names) = NAME_REGISTRY.lock().as_mut() { names.retain(|_, &mut v| v != pid); }
 
-    // Wake parent if blocked on waitpid
-    if let Kind::Process { parent: Some(ppid) } = table.procs.get(pid).unwrap().kind {
-        if let Some(p) = table.procs.get_mut(ppid) {
-            if let ProcessState::BlockedWaitPid(child) = p.state {
-                if child == pid {
-                    p.set_state(ProcessState::Ready);
-                }
-            }
+    // Collect orphaned child processes: remove zombies, detach running ones.
+    let orphans: Vec<Pid> = table.iter()
+        .filter(|(_, e)| matches!(e.kind(), Kind::Process { parent: Some(ppid) } if *ppid == pid))
+        .map(|(cpid, _)| cpid)
+        .collect();
+    for cpid in orphans {
+        if matches!(table.get(cpid).unwrap().state(), ProcessState::Zombie(_)) {
+            table.remove_orphan_zombie_child(cpid);
+        } else {
+            table.get_mut(cpid).unwrap().detach_from_parent();
         }
     }
-}
 
-/// Exit the entire process (all threads). If called from a thread, kills the
-/// parent process and all siblings.
-pub fn exit(code: i32) -> ! {
-    let mut guard = PROCESS_TABLE.lock();
-    let table = guard.as_mut().unwrap();
-    let pid = current_pid();
-    let kind = table.procs.get(pid).unwrap().kind;
-
-    unsafe { cpu::write_cr3(paging::kernel_cr3()); }
-
-    let process_pid = match kind {
-        Kind::Thread { parent } => {
-            // Zombie ourselves, then kill the parent process (cascades to siblings)
-            let proc = table.procs.get_mut(pid).unwrap();
-            proc.tls_alloc.take();
-            proc.zombify(code);
-            parent
-        }
-        Kind::Process { .. } => pid,
-    };
-
-    teardown_process(table, process_pid, code);
-    scheduler::schedule_no_return_locked(guard);
-}
-
-/// Exit the current thread only. For processes without threads, tears down
-/// the process. For threads, zombifies without freeing the address space.
-pub fn thread_exit(code: i32) -> ! {
-    let mut guard = PROCESS_TABLE.lock();
-    let table = guard.as_mut().unwrap();
-    let pid = current_pid();
-    let kind = table.procs.get(pid).unwrap().kind;
-
-    unsafe { cpu::write_cr3(paging::kernel_cr3()); }
-
-    match kind {
-        Kind::Thread { parent } => {
-            // Thread exit: zombie ourselves, wake parent for thread_join.
-            // Don't free address space (shared with parent).
-            let proc = table.procs.get_mut(pid).unwrap();
-            fd::close_all(&mut proc.fds, &mut *vfs::lock(), pid);
-            proc.tls_alloc.take();
-            proc.zombify(code);
-            let name = core::str::from_utf8(&proc.name).unwrap_or("?").trim_end_matches('\0');
-            log!("exit: {name} pid={pid} code={code}");
-
-            if let Some(p) = table.procs.get_mut(parent) {
-                if let ProcessState::BlockedThreadJoin(child) = p.state {
+    if has_parent {
+        // Wake parent if blocked on waitpid
+        if let Kind::Process { parent: Some(ppid) } = table.get(pid).unwrap().kind() {
+            if let Some(p) = table.get_mut(*ppid) {
+                if let ProcessState::BlockedWaitPid(child) = *p.state() {
                     if child == pid {
                         p.set_state(ProcessState::Ready);
                     }
                 }
             }
         }
-        Kind::Process { .. } => {
-            teardown_process(table, pid, code);
-        }
+    }
+    // Parentless zombies are cleaned up by collect_orphan_zombies() in the idle loop,
+    // NOT here — we're still running on this process's kernel stack.
+}
+
+/// Exit the entire process (all threads). If called from a thread, kills the
+/// parent process and all siblings.
+pub fn exit(code: i32) -> ! {
+    // Phase 1: Determine process pid and get data Arc (brief table lock)
+    let (process_pid, data_arc) = {
+        let guard = PROCESS_TABLE.lock();
+        let table = guard.as_ref().unwrap();
+        let pid = current_pid();
+        let entry = table.get(pid).unwrap();
+        let process_pid = match entry.kind() {
+            Kind::Thread { parent } => *parent,
+            Kind::Process { .. } => pid,
+        };
+        (process_pid, Arc::clone(table.get(process_pid).unwrap().data()))
+    };
+
+    // Switch to kernel CR3 before freeing resources
+    unsafe { cpu::write_cr3(paging::kernel_cr3()); }
+
+    // Phase 2: Resource cleanup (ProcessData lock, no table lock)
+    teardown_resources(&data_arc, process_pid);
+
+    // Phase 3: Scheduling teardown (table lock held through context switch)
+    let mut guard = PROCESS_TABLE.lock();
+    let table = guard.as_mut().unwrap();
+    let pid = current_pid();
+
+    // If we're a thread, zombie ourselves first
+    if let Kind::Thread { .. } = table.get(pid).unwrap().kind() {
+        table.get_mut(pid).unwrap().zombify(code);
     }
 
+    teardown_scheduling(table, process_pid, code);
     scheduler::schedule_no_return_locked(guard);
 }
+
+/// Exit the current thread only. For processes without threads, tears down
+/// the process. For threads, zombifies without freeing the address space.
+pub fn thread_exit(code: i32) -> ! {
+    let kind = with_current_sched(|s| *s.kind());
+
+    unsafe { cpu::write_cr3(paging::kernel_cr3()); }
+
+    match kind {
+        Kind::Thread { parent } => {
+            // Thread exit: close our FDs, free TLS, zombie ourselves
+            {
+                let data_arc = current_data();
+                let mut data = data_arc.lock();
+                fd::close_all(&mut data.fds, &mut *vfs::lock(), current_pid());
+                data.tls_alloc.take();
+            }
+
+            let mut guard = PROCESS_TABLE.lock();
+            let table = guard.as_mut().unwrap();
+            let pid = current_pid();
+            table.get_mut(pid).unwrap().zombify(code);
+            let name = core::str::from_utf8(table.get(pid).unwrap().name()).unwrap_or("?").trim_end_matches('\0');
+            log!("exit: {name} pid={pid} code={code}");
+
+            // Wake parent if blocked on thread_join
+            if let Some(p) = table.get_mut(parent) {
+                if let ProcessState::BlockedThreadJoin(child) = *p.state() {
+                    if child == pid {
+                        p.set_state(ProcessState::Ready);
+                    }
+                }
+            }
+
+            scheduler::schedule_no_return_locked(guard);
+        }
+        Kind::Process { .. } => {
+            // Process exit — full teardown
+            let data_arc = current_data();
+            teardown_resources(&data_arc, current_pid());
+
+            let mut guard = PROCESS_TABLE.lock();
+            let table = guard.as_mut().unwrap();
+            teardown_scheduling(table, current_pid(), code);
+            scheduler::schedule_no_return_locked(guard);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Blocking / scheduling
+// ---------------------------------------------------------------------------
 
 /// Block the current process and switch to the next ready one.
 pub fn block(reason: ProcessState) {
@@ -863,13 +1100,36 @@ pub fn block(reason: ProcessState) {
 pub fn block_poll(fds: [u64; 64], len: u32, deadline: u64) {
     debug_assert!(len <= 64, "poll_len {} exceeds array size", len);
     {
-        let mut guard = PROCESS_TABLE.lock();
-        let table = guard.as_mut().unwrap();
-        let proc = table.procs.get_mut(current_pid()).unwrap();
-        proc.poll_fds = fds;
-        proc.poll_len = len;
+        let data_arc = current_data();
+        let mut data = data_arc.lock();
+        data.poll_fds = fds;
+        data.poll_len = len;
     }
     scheduler::block(ProcessState::BlockedPoll { deadline });
+}
+
+/// Block waiting for a message, with an atomic recheck to prevent TOCTOU races.
+///
+/// The race: `sys_recv_msg` pops from the queue (empty), then `send_message`
+/// pushes a message and checks state (still Running, so no wake), then the
+/// receiver blocks — message sits in the queue with nobody to wake it.
+///
+/// Fix: hold the table lock, briefly lock ProcessData to check the queue,
+/// and only transition to BlockedRecvMsg if the queue is truly empty.
+/// Lock ordering: PROCESS_TABLE > ProcessData (same direction as idle_poll).
+pub fn block_recv_msg() {
+    let mut guard = PROCESS_TABLE.lock();
+    let table = guard.as_mut().unwrap();
+    let pid = percpu::current_pid().expect("block_recv_msg() called during idle");
+    let data_arc = Arc::clone(table.get(pid).unwrap().data());
+
+    // Brief ProcessData lock under table lock to check for messages.
+    if data_arc.lock().messages.has_messages() {
+        return; // Message arrived between pop and block — retry the loop.
+    }
+
+    table.get_mut(pid).unwrap().set_state(ProcessState::BlockedRecvMsg);
+    scheduler::schedule_already_blocked(guard);
 }
 
 /// Cooperative yield: mark current as Ready, switch to next.
@@ -877,28 +1137,44 @@ pub fn yield_now() {
     scheduler::yield_now();
 }
 
+// ---------------------------------------------------------------------------
+// Message passing
+// ---------------------------------------------------------------------------
+
 /// Send a message to a target process. Wakes the target if blocked.
+/// Three-phase lock discipline: no lock nesting between table and ProcessData.
 pub fn send_message(target_pid: Pid, msg: crate::message::Message) -> bool {
-    let mut guard = PROCESS_TABLE.lock();
-    let table = guard.as_mut().unwrap();
-    if let Some(proc) = table.procs.get_mut(target_pid) {
-        if !proc.messages.push(msg) {
+    // Phase 1: Get target's data Arc (brief table lock)
+    let data_arc = {
+        let guard = PROCESS_TABLE.lock();
+        match guard.as_ref().unwrap().get(target_pid) {
+            Some(entry) => Arc::clone(entry.data()),
+            None => return false,
+        }
+    };
+    // Phase 2: Push message (per-process lock, no table lock held)
+    {
+        let mut data = data_arc.lock();
+        if data.messages.push(msg).is_err() {
             return false;
         }
-        match proc.state {
-            ProcessState::BlockedRecvMsg | ProcessState::BlockedPoll { .. } => {
-                proc.set_state(ProcessState::Ready);
-            }
-            _ => {}
-        }
-        true
-    } else {
-        false
     }
+    // Phase 3: Wake target (brief table lock, no process lock held)
+    let mut guard = PROCESS_TABLE.lock();
+    if let Some(entry) = guard.as_mut().unwrap().get_mut(target_pid) {
+        if matches!(entry.state(), ProcessState::BlockedRecvMsg | ProcessState::BlockedPoll { .. }) {
+            entry.set_state(ProcessState::Ready);
+        }
+    }
+    true
 }
 
+// ---------------------------------------------------------------------------
+// Futex
+// ---------------------------------------------------------------------------
+
 /// Atomically check a user futex word and block if it matches the expected value.
-/// Returns 0 if woken normally, 1 if timed out (handled by idle_poll), u64::MAX on error.
+/// Returns 0 if woken normally, 1 if timed out, u64::MAX on error.
 /// The check-and-block is atomic w.r.t. futex_wake because both hold the process table lock.
 pub fn futex_wait(addr: u64, expected: u32, timeout_ns: u64) -> u64 {
     let deadline = if timeout_ns != u64::MAX {
@@ -909,10 +1185,10 @@ pub fn futex_wait(addr: u64, expected: u32, timeout_ns: u64) -> u64 {
     let mut guard = PROCESS_TABLE.lock();
     let table = guard.as_mut().unwrap();
     let pid = current_pid();
-    let proc = table.procs.get_mut(pid).unwrap();
+    let entry = table.get_mut(pid).unwrap();
 
     // Translate virtual → physical so cross-process futex works on shared memory
-    let pml4 = proc.cr3.map(|r| r.as_ptr() as *const u64)
+    let pml4 = entry.cr3().map(|r| r.as_ptr() as *const u64)
         .unwrap_or(crate::arch::paging::kernel_cr3() as *const u64);
     let phys_addr = match crate::arch::paging::virt_to_phys(pml4, addr) {
         Some(pa) => pa,
@@ -925,8 +1201,7 @@ pub fn futex_wait(addr: u64, expected: u32, timeout_ns: u64) -> u64 {
         return 0;
     }
 
-    proc.set_state(ProcessState::BlockedFutex { phys_addr, deadline });
-    // Pass the held lock to the scheduler so it can context-switch atomically
+    entry.set_state(ProcessState::BlockedFutex { phys_addr, deadline });
     scheduler::schedule_already_blocked(guard);
     0
 }
@@ -936,8 +1211,8 @@ pub fn futex_wake(addr: u64, count: u64) -> u64 {
     let mut guard = PROCESS_TABLE.lock();
     let table = guard.as_mut().unwrap();
     let pid = current_pid();
-    let caller_cr3 = table.procs.get(pid).map(|p| {
-        p.cr3.map(|r| r.as_ptr() as *const u64)
+    let caller_cr3 = table.get(pid).map(|e| {
+        e.cr3().map(|r| r.as_ptr() as *const u64)
             .unwrap_or(crate::arch::paging::kernel_cr3() as *const u64)
     }).unwrap();
     let caller_phys = match crate::arch::paging::virt_to_phys(caller_cr3, addr) {
@@ -945,17 +1220,21 @@ pub fn futex_wake(addr: u64, count: u64) -> u64 {
         None => return 0,
     };
     let mut woken = 0u64;
-    for (_, proc) in table.procs.iter_mut() {
+    for (_, entry) in table.iter_mut() {
         if woken >= count { break; }
-        if let ProcessState::BlockedFutex { phys_addr, .. } = proc.state {
+        if let ProcessState::BlockedFutex { phys_addr, .. } = *entry.state() {
             if phys_addr == caller_phys {
-                proc.set_state(ProcessState::Ready);
+                entry.set_state(ProcessState::Ready);
                 woken += 1;
             }
         }
     }
     woken
 }
+
+// ---------------------------------------------------------------------------
+// Pipe wake helpers
+// ---------------------------------------------------------------------------
 
 /// Wake processes blocked on reading from a pipe that now has data.
 pub fn wake_pipe_readers(pipe_id: pipe::PipeId) {
@@ -967,41 +1246,29 @@ pub fn wake_pipe_writers(pipe_id: pipe::PipeId) {
     scheduler::wake_pipe_writers(pipe_id);
 }
 
+// ---------------------------------------------------------------------------
+// Zombie collection
+// ---------------------------------------------------------------------------
+
 /// Atomically validate parent-child relationship and collect a zombie child process.
-/// Returns Ok(Some(code)) if collected, Ok(None) if child exists but not zombie,
-/// Err(()) if child doesn't exist or isn't ours.
-/// Combining validation and collection under one lock prevents TOCTOU races.
+/// Thin wrapper that locks PROCESS_TABLE and delegates to ProcessTable method.
 pub fn collect_child_zombie(child_pid: Pid, parent_pid: Pid) -> Result<Option<i32>, ()> {
     let mut guard = PROCESS_TABLE.lock();
     let table = guard.as_mut().unwrap();
-    let proc = table.procs.get(child_pid).ok_or(())?;
-    if !matches!(proc.kind, Kind::Process { parent: Some(ppid) } if ppid == parent_pid) {
-        return Err(());
-    }
-    if let ProcessState::Zombie(code) = proc.state {
-        table.procs.remove(child_pid);
-        Ok(Some(code))
-    } else {
-        Ok(None)
-    }
+    table.collect_child_zombie(child_pid, parent_pid)
 }
 
 /// Atomically validate parent-thread relationship and collect a zombie thread.
-/// Same atomic guarantees as `collect_child_zombie`.
+/// Thin wrapper that locks PROCESS_TABLE and delegates to ProcessTable method.
 pub fn collect_thread_zombie(tid: Pid, parent_pid: Pid) -> Result<Option<i32>, ()> {
     let mut guard = PROCESS_TABLE.lock();
     let table = guard.as_mut().unwrap();
-    let proc = table.procs.get(tid).ok_or(())?;
-    if !matches!(proc.kind, Kind::Thread { parent } if parent == parent_pid) {
-        return Err(());
-    }
-    if let ProcessState::Zombie(code) = proc.state {
-        table.procs.remove(tid);
-        Ok(Some(code))
-    } else {
-        Ok(None)
-    }
+    table.collect_thread_zombie(tid, parent_pid)
 }
+
+// ---------------------------------------------------------------------------
+// Name registry
+// ---------------------------------------------------------------------------
 
 pub fn register_name(name: &str, pid: Pid) -> bool {
     let mut guard = NAME_REGISTRY.lock();
@@ -1017,88 +1284,114 @@ pub fn find_pid(name: &str) -> Option<Pid> {
     NAME_REGISTRY.lock().as_ref().unwrap().get(name).copied()
 }
 
+// ---------------------------------------------------------------------------
+// Symbol resolution / address validation
+// ---------------------------------------------------------------------------
+
 /// Resolve an address using the current process's symbols. Lock-safe (brief hold).
 pub fn resolve_symbol(addr: u64) -> Option<(String, u64)> {
     let pid = current_pid();
     if pid == Pid::MAX { return None; }
-    let guard = PROCESS_TABLE.lock();
-    let table = guard.as_ref()?;
-    table.procs.get(pid)?.symbols.resolve(addr)
+    let data_arc = {
+        let guard = PROCESS_TABLE.lock();
+        let table = guard.as_ref()?;
+        Arc::clone(table.get(pid)?.data())
+    };
+    let guard = data_arc.lock();
+    guard.symbols.resolve(addr)
 }
 
 /// Check if an address is in the current process's valid memory ranges.
 pub fn is_valid_user_addr(addr: u64) -> bool {
     let pid = current_pid();
     if pid == Pid::MAX { return false; }
-    let guard = PROCESS_TABLE.lock();
-    let Some(table) = guard.as_ref() else { return false };
-    match table.procs.get(pid) {
-        Some(proc) => proc.symbols.is_valid_user_addr(addr),
-        None => false,
-    }
+    let data_arc = {
+        let guard = PROCESS_TABLE.lock();
+        let Some(table) = guard.as_ref() else { return false };
+        match table.get(pid) {
+            Some(entry) => Arc::clone(entry.data()),
+            None => return false,
+        }
+    };
+    let guard = data_arc.lock();
+    guard.symbols.is_valid_user_addr(addr)
 }
+
+// ---------------------------------------------------------------------------
+// Kill
+// ---------------------------------------------------------------------------
 
 /// Kill a child process. Only the parent can kill its children.
 /// Returns 0 on success, error code on failure.
 pub fn kill_process(target_pid: Pid) -> u64 {
     use toyos_abi::syscall::SyscallError;
     let caller = current_pid();
+
+    // Phase 1: Validate and get data Arc (brief table lock)
+    let data_arc = {
+        let guard = PROCESS_TABLE.lock();
+        let table = guard.as_ref().unwrap();
+
+        let Some(entry) = table.get(target_pid) else { return SyscallError::NotFound.to_u64() };
+        if !matches!(entry.kind(), Kind::Process { parent: Some(ppid) } if *ppid == caller) {
+            return SyscallError::PermissionDenied.to_u64();
+        }
+        if *entry.state() == ProcessState::Running {
+            return SyscallError::WouldBlock.to_u64();
+        }
+        if matches!(entry.state(), ProcessState::Zombie(_)) {
+            return 0;
+        }
+        Arc::clone(entry.data())
+    };
+
+    // Phase 2: Resource cleanup (ProcessData lock, no table lock)
+    {
+        let mut data = data_arc.lock();
+        fd::close_all(&mut data.fds, &mut *vfs::lock(), target_pid);
+        data.tls_alloc.take();
+        data.elf_alloc.take();
+        data.stack_alloc.take();
+        data.loaded_libs.clear();
+        data.mmap_regions.clear();
+        data.user_heap = crate::user_heap::UserHeap::new();
+    }
+
+    // Phase 3: Scheduling teardown (table lock)
     let mut guard = PROCESS_TABLE.lock();
     let table = guard.as_mut().unwrap();
 
-    let Some(proc) = table.procs.get(target_pid) else { return SyscallError::NotFound.to_u64() };
-
-    // Only allow killing our own children
-    if !matches!(proc.kind, Kind::Process { parent: Some(ppid) } if ppid == caller) {
-        return SyscallError::PermissionDenied.to_u64();
-    }
-    // Can't kill a process currently Running on another CPU
-    if proc.state == ProcessState::Running {
-        return SyscallError::WouldBlock.to_u64();
-    }
-    // Already a zombie — nothing to do
-    if matches!(proc.state, ProcessState::Zombie(_)) {
-        return 0;
-    }
-
-    // Clean up the target's resources
-    let proc = table.procs.get_mut(target_pid).unwrap();
-    fd::close_all(&mut proc.fds, &mut *vfs::lock(), target_pid);
-    proc.tls_alloc.take();
+    // Re-check the target is still there and not zombie (might have exited between phases)
+    let Some(entry) = table.get(target_pid) else { return 0 };
+    if matches!(entry.state(), ProcessState::Zombie(_)) { return 0; }
 
     // Kill child threads of the target
-    let child_tids: Vec<Pid> = table.procs.iter()
-        .filter(|(tid, p)| *tid != target_pid && matches!(p.kind, Kind::Thread { parent } if parent == target_pid))
+    let child_tids: Vec<Pid> = table.iter()
+        .filter(|(tid, e)| *tid != target_pid && matches!(e.kind(), Kind::Thread { parent } if *parent == target_pid))
         .map(|(tid, _)| tid)
         .collect();
     for tid in &child_tids {
-        let child = table.procs.get_mut(*tid).unwrap();
-        child.tls_alloc.take();
-        if !matches!(child.state, ProcessState::Zombie(_)) {
+        let child = table.get_mut(*tid).unwrap();
+        if !matches!(child.state(), ProcessState::Zombie(_)) {
             child.zombify(-1);
         }
     }
 
-    let proc = table.procs.get_mut(target_pid).unwrap();
-    let root = proc.cr3.take().expect("kill_process: cr3 already taken");
+    let entry = table.get_mut(target_pid).unwrap();
+    let root = entry.take_cr3();
     let pml4 = root.as_ptr();
     shared_memory::cleanup_process(target_pid, pml4);
-    proc.elf_alloc.take();
-    proc.stack_alloc.take();
-    proc.loaded_libs.clear();
-    proc.mmap_regions.clear();
     paging::free_user_page_tables(pml4);
 
-    proc.zombify(137); // 128 + 9 (SIGKILL-like)
-    let name = core::str::from_utf8(&proc.name).unwrap_or("?").trim_end_matches('\0');
+    entry.zombify(137); // 128 + 9 (SIGKILL-like)
+    let name = core::str::from_utf8(entry.name()).unwrap_or("?").trim_end_matches('\0');
     log!("kill: {name} pid={target_pid}");
 
-    // Unregister name
     if let Some(names) = NAME_REGISTRY.lock().as_mut() { names.retain(|_, &mut v| v != target_pid); }
 
     // Wake parent if blocked on waitpid for this process
-    if let Some(parent) = table.procs.get_mut(caller) {
-        if let ProcessState::BlockedWaitPid(child) = parent.state {
+    if let Some(parent) = table.get_mut(caller) {
+        if let ProcessState::BlockedWaitPid(child) = *parent.state() {
             if child == target_pid {
                 parent.set_state(ProcessState::Ready);
             }
@@ -1112,4 +1405,3 @@ pub fn kill_process(target_pid: Pid) -> u64 {
 pub fn ap_idle() -> ! {
     scheduler::schedule_no_return();
 }
-

@@ -3,6 +3,7 @@ use core::sync::atomic::{fence, Ordering};
 use super::mmio::Mmio;
 use super::pci::PciDevice;
 use super::DmaPool;
+use crate::block::{BlockDevice, DeviceId};
 use crate::log;
 use crate::sync::Lock;
 
@@ -73,26 +74,22 @@ struct CqEntry {
     status: u16, // bit 0 = phase, bits [15:1] = status
 }
 
-// Submission/completion queue pair with doorbell management
 struct NvmeQueue {
     sq: *mut SqEntry,
     cq: *mut CqEntry,
     sq_tail: u16,
     cq_head: u16,
     phase: bool,
-    sq_doorbell: u64, // BAR offset for SQ tail doorbell
-    cq_doorbell: u64, // BAR offset for CQ head doorbell
+    sq_doorbell: u64,
+    cq_doorbell: u64,
 }
 
 impl NvmeQueue {
     fn new(sq: *mut SqEntry, cq: *mut CqEntry, qid: u16, stride: u32) -> Self {
         let doorbell_stride = 4u64 << stride;
         Self {
-            sq,
-            cq,
-            sq_tail: 0,
-            cq_head: 0,
-            phase: true,
+            sq, cq,
+            sq_tail: 0, cq_head: 0, phase: true,
             sq_doorbell: 0x1000 + (2 * qid as u64) * doorbell_stride,
             cq_doorbell: 0x1000 + (2 * qid as u64 + 1) * doorbell_stride,
         }
@@ -108,8 +105,7 @@ impl NvmeQueue {
     fn wait_completion(&mut self, bar: &Mmio) -> u16 {
         loop {
             let cq = unsafe { read_volatile(self.cq.add(self.cq_head as usize)) };
-            let phase = (cq.status & 1) != 0;
-            if phase == self.phase {
+            if ((cq.status & 1) != 0) == self.phase {
                 let status = cq.status >> 1;
                 self.cq_head = (self.cq_head + 1) % QUEUE_DEPTH as u16;
                 if self.cq_head == 0 {
@@ -128,28 +124,28 @@ impl NvmeQueue {
     }
 }
 
-// DMA memory pool
-//   Page 0: Admin SQ (16 * 64 = 1024 bytes)
-//   Page 1: Admin CQ (16 * 16 = 256 bytes)
-//   Page 2: I/O SQ
-//   Page 3: I/O CQ
-//   Page 4: Identify buffer (4096 bytes)
-//   Page 5: Data buffer (4096 bytes)
-const DMA_PAGES: usize = 6;
+// DMA memory pool layout:
+//   Pages 0-4:  Queues + identify buffer
+//   Page 5:     PRP list (for multi-page transfers)
+//   Pages 6-37: Data buffer (32 pages = 128KB)
+const DMA_PAGES: usize = 38;
+const PRP_LIST_PAGE: usize = 5;
+const DATA_PAGE_START: usize = 6;
+const MAX_DATA_PAGES: usize = 32; // 128KB max per transfer
+
 static DMA_POOL: Lock<DmaPool<DMA_PAGES>> = Lock::new(DmaPool::new());
 
 fn dma_page(index: usize) -> u64 {
     DMA_POOL.lock().page_addr(index)
 }
 
-pub struct NvmeController {
+struct NvmeController {
     bar: Mmio,
     admin: NvmeQueue,
     io: NvmeQueue,
-    data_buf: *mut u8,
     next_cid: u16,
     sector_size: u32,
-    ns_size: u64, // namespace size in sectors
+    ns_size: u64,
 }
 
 impl NvmeController {
@@ -165,7 +161,7 @@ impl NvmeController {
         let mut cmd = SqEntry::ZERO;
         cmd.cdw0 = (cid as u32) << 16 | ADMIN_IDENTIFY as u32;
         cmd.prp1 = identify_buf;
-        cmd.cdw10 = 1; // CNS = 1 (controller)
+        cmd.cdw10 = 1;
         self.admin.submit_and_wait(&self.bar, cmd);
         log!("NVMe: Identify Controller OK");
     }
@@ -177,10 +173,9 @@ impl NvmeController {
         let mut cmd = SqEntry::ZERO;
         cmd.cdw0 = (cid as u32) << 16 | ADMIN_CREATE_IO_CQ as u32;
         cmd.prp1 = io_cq_phys;
-        cmd.cdw10 = ((QUEUE_DEPTH as u32 - 1) << 16) | 1; // size (0-based) | QID=1
-        cmd.cdw11 = 1; // physically contiguous
+        cmd.cdw10 = ((QUEUE_DEPTH as u32 - 1) << 16) | 1;
+        cmd.cdw11 = 1;
         self.admin.submit_and_wait(&self.bar, cmd);
-        log!("NVMe: I/O CQ created");
     }
 
     fn create_io_sq(&mut self) {
@@ -190,10 +185,9 @@ impl NvmeController {
         let mut cmd = SqEntry::ZERO;
         cmd.cdw0 = (cid as u32) << 16 | ADMIN_CREATE_IO_SQ as u32;
         cmd.prp1 = io_sq_phys;
-        cmd.cdw10 = ((QUEUE_DEPTH as u32 - 1) << 16) | 1; // size (0-based) | QID=1
-        cmd.cdw11 = (1 << 16) | 1; // CQID=1 | physically contiguous
+        cmd.cdw10 = ((QUEUE_DEPTH as u32 - 1) << 16) | 1;
+        cmd.cdw11 = (1 << 16) | 1;
         self.admin.submit_and_wait(&self.bar, cmd);
-        log!("NVMe: I/O SQ created");
     }
 
     fn identify_namespace(&mut self) {
@@ -204,7 +198,7 @@ impl NvmeController {
         cmd.cdw0 = (cid as u32) << 16 | ADMIN_IDENTIFY as u32;
         cmd.nsid = 1;
         cmd.prp1 = identify_buf;
-        cmd.cdw10 = 0; // CNS = 0 (namespace)
+        cmd.cdw10 = 0;
         self.admin.submit_and_wait(&self.bar, cmd);
 
         let ns = unsafe { &*(identify_buf as *const IdentifyNamespace) };
@@ -215,156 +209,160 @@ impl NvmeController {
         log!("NVMe: NS1 size={} sectors, sector_size={}", ns.nsze, self.sector_size);
     }
 
-    pub fn sector_size(&self) -> u32 {
-        self.sector_size
-    }
+    /// Read `sector_count` contiguous sectors starting at `lba` into `buf`.
+    /// Handles PRP list setup for multi-page transfers.
+    fn read_sectors(&mut self, lba: u64, sector_count: u32, buf: &mut [u8]) {
+        let total_bytes = sector_count as usize * self.sector_size as usize;
+        assert!(buf.len() >= total_bytes);
+        assert!(total_bytes <= MAX_DATA_PAGES * 4096);
 
-    pub fn total_bytes(&self) -> u64 {
-        self.ns_size * self.sector_size as u64
-    }
+        let pages = (total_bytes + 4095) / 4096;
+        let data_base = dma_page(DATA_PAGE_START);
 
-    pub fn read(&mut self, lba: u64, buf: &mut [u8]) {
         let cid = self.alloc_cid();
         let mut cmd = SqEntry::ZERO;
         cmd.cdw0 = (cid as u32) << 16 | IO_READ as u32;
         cmd.nsid = 1;
-        cmd.prp1 = self.data_buf as u64;
+        cmd.prp1 = data_base;
         cmd.cdw10 = lba as u32;
         cmd.cdw11 = (lba >> 32) as u32;
-        cmd.cdw12 = 0; // read 1 sector (NLB is 0-based)
+        cmd.cdw12 = sector_count - 1; // NLB is 0-based
+
+        if pages == 2 {
+            cmd.prp2 = dma_page(DATA_PAGE_START + 1);
+        } else if pages > 2 {
+            // Build PRP list: entries for pages 1..N (page 0 is in PRP1)
+            let prp_list = dma_page(PRP_LIST_PAGE) as *mut u64;
+            for i in 1..pages {
+                unsafe { prp_list.add(i - 1).write(dma_page(DATA_PAGE_START + i)); }
+            }
+            cmd.prp2 = dma_page(PRP_LIST_PAGE);
+        }
+
         self.io.submit_and_wait(&self.bar, cmd);
 
-        let len = buf.len().min(self.sector_size as usize);
-        unsafe {
-            copy_nonoverlapping(self.data_buf, buf.as_mut_ptr(), len);
-        }
+        unsafe { copy_nonoverlapping(data_base as *const u8, buf.as_mut_ptr(), total_bytes); }
     }
 
-    pub fn write(&mut self, lba: u64, buf: &[u8]) {
-        let len = buf.len().min(self.sector_size as usize);
-        unsafe {
-            write_bytes(self.data_buf, 0, self.sector_size as usize);
-            copy_nonoverlapping(buf.as_ptr(), self.data_buf, len);
-        }
+    /// Write `sector_count` contiguous sectors starting at `lba` from `buf`.
+    fn write_sectors(&mut self, lba: u64, sector_count: u32, buf: &[u8]) {
+        let total_bytes = sector_count as usize * self.sector_size as usize;
+        assert!(buf.len() >= total_bytes);
+        assert!(total_bytes <= MAX_DATA_PAGES * 4096);
+
+        let pages = (total_bytes + 4095) / 4096;
+        let data_base = dma_page(DATA_PAGE_START);
+
+        unsafe { copy_nonoverlapping(buf.as_ptr(), data_base as *mut u8, total_bytes); }
 
         let cid = self.alloc_cid();
         let mut cmd = SqEntry::ZERO;
         cmd.cdw0 = (cid as u32) << 16 | IO_WRITE as u32;
         cmd.nsid = 1;
-        cmd.prp1 = self.data_buf as u64;
+        cmd.prp1 = data_base;
         cmd.cdw10 = lba as u32;
         cmd.cdw11 = (lba >> 32) as u32;
-        cmd.cdw12 = 0; // write 1 sector (NLB is 0-based)
+        cmd.cdw12 = sector_count - 1;
+
+        if pages == 2 {
+            cmd.prp2 = dma_page(DATA_PAGE_START + 1);
+        } else if pages > 2 {
+            let prp_list = dma_page(PRP_LIST_PAGE) as *mut u64;
+            for i in 1..pages {
+                unsafe { prp_list.add(i - 1).write(dma_page(DATA_PAGE_START + i)); }
+            }
+            cmd.prp2 = dma_page(PRP_LIST_PAGE);
+        }
+
         self.io.submit_and_wait(&self.bar, cmd);
     }
 }
 
-/// Byte-addressable disk backed by an NVMe controller, with single-sector write cache.
-pub struct NvmeDisk {
+/// NVMe block device exposing 4KB block I/O through the BlockDevice trait.
+///
+/// # Safety
+/// Raw pointers in NvmeController point to DMA memory owned by this device.
+/// The device is only accessed by a single owner (the VFS root filesystem).
+unsafe impl Send for NvmeBlockDevice {}
+
+pub struct NvmeBlockDevice {
     ctrl: NvmeController,
-    sector_size: u64,
-    cache_lba: Option<u64>,
-    cache_buf: alloc::vec::Vec<u8>,
-    cache_dirty: bool,
+    id: DeviceId,
+    sectors_per_block: u32,
+    block_count: u64,
 }
 
-impl NvmeDisk {
-    pub fn new(ctrl: NvmeController) -> Self {
-        let sector_size = ctrl.sector_size() as u64;
-        Self {
-            cache_buf: alloc::vec![0u8; sector_size as usize],
-            ctrl,
-            sector_size,
-            cache_lba: None,
-            cache_dirty: false,
-        }
-    }
-
-    pub fn total_bytes(&self) -> u64 {
-        self.ctrl.total_bytes()
-    }
-
-    fn ensure_sector(&mut self, lba: u64) {
-        if self.cache_lba == Some(lba) {
-            return;
-        }
-        self.flush_cache();
-        self.ctrl.read(lba, &mut self.cache_buf);
-        self.cache_lba = Some(lba);
-        self.cache_dirty = false;
-    }
-
-    fn flush_cache(&mut self) {
-        if self.cache_dirty {
-            if let Some(lba) = self.cache_lba {
-                self.ctrl.write(lba, &self.cache_buf);
-                self.cache_dirty = false;
-            }
-        }
+impl NvmeBlockDevice {
+    fn new(ctrl: NvmeController, id: DeviceId) -> Self {
+        let sectors_per_block = 4096 / ctrl.sector_size;
+        let block_count = ctrl.ns_size / sectors_per_block as u64;
+        log!("NVMe: block device id={} blocks={} ({}MB)",
+            id, block_count, block_count * 4096 / (1024 * 1024));
+        Self { ctrl, id, sectors_per_block, block_count }
     }
 }
 
-impl tyfs::Disk for NvmeDisk {
-    fn read(&mut self, offset: u64, buf: &mut [u8]) {
-        let mut remaining = buf.len() as u64;
-        let mut pos = offset;
-        let mut buf_off: usize = 0;
+impl BlockDevice for NvmeBlockDevice {
+    fn device_id(&self) -> DeviceId { self.id }
+    fn block_size(&self) -> u32 { 4096 }
+    fn block_count(&self) -> u64 { self.block_count }
+
+    fn read_blocks(&mut self, lba: u64, count: u32, buf: &mut [u8]) {
+        assert_eq!(buf.len(), count as usize * 4096);
+        let mut remaining = count;
+        let mut block = lba;
+        let mut offset = 0usize;
 
         while remaining > 0 {
-            let lba = pos / self.sector_size;
-            let sector_off = (pos % self.sector_size) as usize;
-            let chunk = core::cmp::min(remaining, self.sector_size - sector_off as u64) as usize;
+            let batch = remaining.min(MAX_DATA_PAGES as u32);
+            let sector_lba = block * self.sectors_per_block as u64;
+            let sector_count = batch * self.sectors_per_block;
+            let bytes = batch as usize * 4096;
 
-            self.ensure_sector(lba);
-            buf[buf_off..buf_off + chunk]
-                .copy_from_slice(&self.cache_buf[sector_off..sector_off + chunk]);
+            self.ctrl.read_sectors(sector_lba, sector_count, &mut buf[offset..offset + bytes]);
 
-            pos += chunk as u64;
-            buf_off += chunk;
-            remaining -= chunk as u64;
+            block += batch as u64;
+            offset += bytes;
+            remaining -= batch;
         }
     }
 
-    fn write(&mut self, offset: u64, buf: &[u8]) {
-        let mut remaining = buf.len() as u64;
-        let mut pos = offset;
-        let mut buf_off: usize = 0;
+    fn write_blocks(&mut self, lba: u64, count: u32, buf: &[u8]) {
+        assert_eq!(buf.len(), count as usize * 4096);
+        let mut remaining = count;
+        let mut block = lba;
+        let mut offset = 0usize;
 
         while remaining > 0 {
-            let lba = pos / self.sector_size;
-            let sector_off = (pos % self.sector_size) as usize;
-            let chunk = core::cmp::min(remaining, self.sector_size - sector_off as u64) as usize;
+            let batch = remaining.min(MAX_DATA_PAGES as u32);
+            let sector_lba = block * self.sectors_per_block as u64;
+            let sector_count = batch * self.sectors_per_block;
+            let bytes = batch as usize * 4096;
 
-            self.ensure_sector(lba);
-            self.cache_buf[sector_off..sector_off + chunk]
-                .copy_from_slice(&buf[buf_off..buf_off + chunk]);
-            self.cache_dirty = true;
+            self.ctrl.write_sectors(sector_lba, sector_count, &buf[offset..offset + bytes]);
 
-            pos += chunk as u64;
-            buf_off += chunk;
-            remaining -= chunk as u64;
+            block += batch as u64;
+            offset += bytes;
+            remaining -= batch;
         }
     }
 
     fn flush(&mut self) {
-        self.flush_cache();
+        // NVMe writes are synchronous (submit_and_wait), so data is on disk
+        // after write_blocks returns. Nothing to flush.
     }
 }
 
-pub fn init(ecam_base: u64) -> Option<NvmeController> {
-    // Find NVMe controller (class=01 Mass Storage, subclass=08 NVM)
+pub fn init(ecam_base: u64) -> Option<NvmeBlockDevice> {
     let pci_dev = PciDevice::find(ecam_base, 0x01, 0x08, None)?;
     log!("NVMe: found at PCI {:02x}:{:02x}.{}", pci_dev.bus, pci_dev.dev, pci_dev.func);
 
-    // Read BAR0 and enable bus mastering
     let bar = Mmio::new(pci_dev.read_bar_64(0));
     pci_dev.enable_bus_master();
     log!("NVMe: BAR0={:#x}", bar.addr());
 
-    // Map BAR MMIO region into our page tables
-    crate::arch::paging::map_kernel(bar.addr(), 0x4000); // NVMe register space
+    crate::arch::paging::map_kernel(bar.addr(), 0x4000);
 
-    // Read capabilities
     let cap = bar.read_u64(REG_CAP);
     let stride = ((cap >> 32) & 0xF) as u32;
 
@@ -376,35 +374,25 @@ pub fn init(ecam_base: u64) -> Option<NvmeController> {
             core::hint::spin_loop();
         }
     }
-    log!("NVMe: controller disabled");
 
-    // Set up DMA pointers (page-aligned from static pool)
     let admin_sq = dma_page(0) as *mut SqEntry;
     let admin_cq = dma_page(1) as *mut CqEntry;
     let io_sq = dma_page(2) as *mut SqEntry;
     let io_cq = dma_page(3) as *mut CqEntry;
-    let data_buf = dma_page(5) as *mut u8;
 
-    // Zero admin queue memory
     unsafe {
         write_bytes(admin_sq as *mut u8, 0, 4096);
         write_bytes(admin_cq as *mut u8, 0, 4096);
     }
 
-    // Set admin queue attributes (ACQS | ASQS, both 0-based)
     let aqa = ((QUEUE_DEPTH as u32 - 1) << 16) | (QUEUE_DEPTH as u32 - 1);
     bar.write_u32(REG_AQA, aqa);
-
-    // Set admin queue base addresses (physical = virtual, identity mapped)
     bar.write_u64(REG_ASQ, admin_sq as u64);
     bar.write_u64(REG_ACQ, admin_cq as u64);
-    log!("NVMe: ASQ={:#x} ACQ={:#x}", admin_sq as u64, admin_cq as u64);
 
-    // Enable controller: EN=1, CSS=0 (NVM), MPS=0 (4KB), IOSQES=6 (64B), IOCQES=4 (16B)
     let cc = 1 | (6 << 16) | (4 << 20);
     bar.write_u32(REG_CC, cc);
 
-    // Wait for ready
     while bar.read_u32(REG_CSTS) & 1 == 0 {
         core::hint::spin_loop();
     }
@@ -414,9 +402,8 @@ pub fn init(ecam_base: u64) -> Option<NvmeController> {
         bar,
         admin: NvmeQueue::new(admin_sq, admin_cq, 0, stride),
         io: NvmeQueue::new(io_sq, io_cq, 1, stride),
-        data_buf,
         next_cid: 0,
-        sector_size: 512, // default, overwritten by identify_namespace
+        sector_size: 512,
         ns_size: 0,
     };
 
@@ -425,5 +412,5 @@ pub fn init(ecam_base: u64) -> Option<NvmeController> {
     ctrl.create_io_sq();
     ctrl.identify_namespace();
 
-    Some(ctrl)
+    Some(NvmeBlockDevice::new(ctrl, 1))
 }

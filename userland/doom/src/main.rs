@@ -584,7 +584,7 @@ fn main() {
     let args: Vec<&[u8]> = vec![
         b"doom\0",
         b"-iwad\0",
-        b"/initrd/doom1.wad\0",
+        b"/share/doom1.wad\0",
     ];
     let argv: Vec<*const u8> = args.iter().map(|a| a.as_ptr()).collect();
 

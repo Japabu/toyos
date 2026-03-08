@@ -1,10 +1,6 @@
 [submodule "rust"]
 	path = rust
 	url = https://github.com/Japabu/rust.git
-[submodule "userland/getrandom"]
-	path = userland/getrandom
-	url = https://github.com/Japabu/getrandom.git
-	shallow = true
 [submodule "userland/libloading"]
 	path = userland/libloading
 	url = https://github.com/Japabu/rust_libloading.git
@@ -53,3 +49,18 @@
 	path = userland/gitoxide
 	url = https://github.com/Japabu/gitoxide
 	shallow = true
+[submodule "userland/errno"]
+	path = userland/errno
+	url = https://github.com/Japabu/rust-errno
+[submodule "toyos-abi"]
+	path = toyos-abi
+	url = https://github.com/Japabu/toyos-abi.git
+[submodule "userland/is_executable"]
+	path = userland/is_executable
+	url = https://github.com/Japabu/is_executable
+[submodule "userland/rust-url"]
+	path = userland/rust-url
+	url = https://github.com/Japabu/rust-url
+[submodule "userland/ctrlc"]
+	path = userland/ctrlc
+	url = https://github.com/Japabu/rust-ctrlc

@@ -46,6 +46,7 @@ fn build(debug: bool, release: bool) {
         .current_dir("../bootloader")
         .env("RUSTUP_TOOLCHAIN", "toyos")
         .env("RUSTFLAGS", &rustflags)
+        .env("INIT_PROGRAMS", "/bin/locale --load;/bin/compositor;/bin/netd;/bin/sshd")
         .env_remove("RUSTC")
         .status()
         .expect("Failed to run cargo")
@@ -99,7 +100,43 @@ fn build(debug: bool, release: bool) {
         }
         let binary = path.join(format!("target/x86_64-unknown-toyos/{profile}/{name}"));
         let data = fs::read(&binary).expect("Failed to read binary");
-        initrd_files.push((name.to_string(), data));
+        initrd_files.push((format!("bin/{name}"), data));
+    }
+
+    // Build cargo (non-standard layout: src/bin/cargo/main.rs, needs --no-default-features)
+    {
+        let cargo_dir = Path::new("../userland/cargo");
+        if toolchain_changed {
+            let toyos_target_dir = cargo_dir.join("target/x86_64-unknown-toyos");
+            if toyos_target_dir.exists() {
+                eprintln!("toolchain changed: cleaning userland/cargo (target)");
+                fs::remove_dir_all(&toyos_target_dir).ok();
+            }
+        }
+        let mut cargo_args = vec![
+            "build",
+            "--target", "x86_64-unknown-toyos",
+            "--no-default-features",
+        ];
+        if release {
+            cargo_args.push("--release");
+        }
+        // Cargo is a large upstream codebase — don't use -Dwarnings
+        if !Command::new("cargo")
+            .args(&cargo_args)
+            .env("RUSTUP_TOOLCHAIN", "toyos")
+            .env_remove("RUSTFLAGS")
+            .env_remove("RUSTC")
+            .current_dir(cargo_dir)
+            .status()
+            .expect("Failed to run cargo")
+            .success()
+        {
+            panic!("Failed to build userland/cargo");
+        }
+        let binary = cargo_dir.join(format!("target/x86_64-unknown-toyos/{profile}/cargo"));
+        let data = fs::read(&binary).expect("Failed to read cargo binary");
+        initrd_files.push(("bin/cargo".to_string(), data));
     }
 
     // Write toolchain stamp after successful builds
@@ -110,15 +147,15 @@ fn build(debug: bool, release: bool) {
     if sysroot.exists() {
         let rustc = sysroot.join("bin/rustc");
         if rustc.exists() {
-            initrd_files.push(("rustc".to_string(), fs::read(&rustc).unwrap()));
+            initrd_files.push(("bin/rustc".to_string(), fs::read(&rustc).unwrap()));
         }
-        // Shared libraries in initrd root (for dynamic linker)
+        // Shared libraries
         for entry in fs::read_dir(sysroot.join("lib")).unwrap() {
             let path = entry.unwrap().path();
             if path.extension().is_some_and(|e| e == "so") {
                 let name = path.file_name().unwrap().to_str().unwrap().to_string();
                 let data = fs::read(&path).unwrap();
-                initrd_files.push((name.clone(), data));
+                initrd_files.push((format!("lib/{name}"), data));
             }
         }
         // Codegen backends
@@ -130,7 +167,7 @@ fn build(debug: bool, release: bool) {
                     let name = path.file_name().unwrap().to_str().unwrap().to_string();
                     let data = fs::read(&path).unwrap();
                     initrd_files.push((
-                        format!("sysroot/lib/rustlib/x86_64-unknown-toyos/codegen-backends/{name}"),
+                        format!("lib/rustlib/x86_64-unknown-toyos/codegen-backends/{name}"),
                         data,
                     ));
                 }
@@ -143,7 +180,7 @@ fn build(debug: bool, release: bool) {
             if path.extension().is_some_and(|e| e == "rlib" || e == "rmeta") {
                 let name = path.file_name().unwrap().to_str().unwrap().to_string();
                 initrd_files.push((
-                    format!("sysroot/lib/rustlib/x86_64-unknown-toyos/lib/{name}"),
+                    format!("lib/rustlib/x86_64-unknown-toyos/lib/{name}"),
                     fs::read(&path).unwrap(),
                 ));
             }
@@ -161,8 +198,26 @@ fn build(debug: bool, release: bool) {
             continue;
         }
         let cmd = name.strip_suffix(".rs").unwrap().to_string();
-        symlinks.push((cmd, "toybox".to_string()));
+        symlinks.push((format!("bin/{cmd}"), "bin/toybox".to_string()));
     }
+
+    // Write initrd contents to target/initrd/ for inspection
+    let initrd_dir = Path::new("target/initrd");
+    if initrd_dir.exists() {
+        fs::remove_dir_all(initrd_dir).expect("Failed to clean initrd dir");
+    }
+    for (name, data) in &initrd_files {
+        let path = initrd_dir.join(name);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, data).unwrap();
+    }
+    for (name, target) in &symlinks {
+        let path = initrd_dir.join(name);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, &path).unwrap();
+    }
+    eprintln!("initrd contents written to target/initrd/");
 
     let initrd_bytes = image::create_initrd(&initrd_files, &symlinks);
     let disk_bytes = image::create_boot_image(&initrd_bytes, profile);
@@ -217,7 +272,7 @@ fn main() {
 
         // VirtIO sound
         .arg("-audiodev").arg("coreaudio,id=audio0")
-        .arg("-device").arg("virtio-sound-pci,audiodev=audio0")
+        .arg("-device").arg("virtio-sound-pci,audiodev=audio0,streams=1")
 
         .arg("-serial").arg("stdio")
 

@@ -388,10 +388,11 @@ dependencies = [
 [[package]]
 name = "getrandom"
 version = "0.2.17"
+source = "git+https://github.com/Japabu/getrandom?branch=toyos-v0.2#c473bb1022335e22fb5e997f69d5c00c8ac0b2c5"
 dependencies = [
  "cfg-if",
  "libc",
- "toyos-abi",
+ "toyos-abi 0.1.0 (git+https://github.com/Japabu/toyos-abi)",
  "wasi",
 ]
 
@@ -1037,10 +1038,15 @@ name = "toyos-abi"
 version = "0.1.0"
 
 [[package]]
+name = "toyos-abi"
+version = "0.1.0"
+source = "git+https://github.com/Japabu/toyos-abi#4331c3580174b75b22c3a36023664e99e9a6dadd"
+
+[[package]]
 name = "toyos-libc"
 version = "0.1.0"
 dependencies = [
- "toyos-abi",
+ "toyos-abi 0.1.0",
  "toyos-net",
 ]
 
@@ -1048,7 +1054,7 @@ dependencies = [
 name = "toyos-net"
 version = "0.1.0"
 dependencies = [
- "toyos-abi",
+ "toyos-abi 0.1.0",
 ]
 
 [[package]]

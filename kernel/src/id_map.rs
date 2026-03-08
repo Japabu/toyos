@@ -30,6 +30,16 @@ impl<K: IdKey, V> IdMap<K, V> {
         id
     }
 
+    /// Insert with auto-assigned ID, providing the ID to a closure that constructs the value.
+    /// Eliminates the need for temporary invalid state (e.g. `pid: 0`).
+    pub fn insert_with(&mut self, f: impl FnOnce(K) -> V) -> K {
+        let id = self.next;
+        self.next = self.next + K::ONE;
+        let value = f(id);
+        self.map.insert(id, value);
+        id
+    }
+
     /// Insert at a specific ID (e.g. FDs 0/1/2). Advances counter past it.
     pub fn insert_at(&mut self, id: K, value: V) {
         self.map.insert(id, value);
@@ -37,6 +47,10 @@ impl<K: IdKey, V> IdMap<K, V> {
         if after > self.next {
             self.next = after;
         }
+    }
+
+    pub fn len(&self) -> usize {
+        self.map.len()
     }
 
     pub fn get(&self, id: K) -> Option<&V> {

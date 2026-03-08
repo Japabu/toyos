@@ -173,10 +173,7 @@ fn load_kernel_elf(kernel_elf_bytes: &[u8]) -> LoadedKernel {
     }
 }
 
-#[cfg(feature = "test-init")]
-static INIT_PROGRAM: &[u8] = b"test-runner";
-#[cfg(not(feature = "test-init"))]
-static INIT_PROGRAM: &[u8] = b"compositor";
+static INIT_PROGRAMS: &[u8] = env!("INIT_PROGRAMS").as_bytes();
 
 struct GopInfo {
     framebuffer: u64,
@@ -251,8 +248,8 @@ fn start_kernel(kernel: LoadedKernel, kernel_elf_bytes: vec::Vec<u8>, initrd: ve
         rsdp_addr,
         initrd_addr: initrd.as_ptr() as u64,
         initrd_size: initrd.len() as u64,
-        init_program_addr: INIT_PROGRAM.as_ptr() as u64,
-        init_program_len: INIT_PROGRAM.len() as u64,
+        init_program_addr: INIT_PROGRAMS.as_ptr() as u64,
+        init_program_len: INIT_PROGRAMS.len() as u64,
         kernel_elf_addr: kernel_elf_bytes.as_ptr() as u64,
         kernel_elf_size: kernel_elf_bytes.len() as u64,
         gop_framebuffer,

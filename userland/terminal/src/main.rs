@@ -11,7 +11,7 @@ use window::Window;
 
 fn main() {
     // Spawn shell first so it initializes while we load the font
-    let mut child = Command::new("/initrd/shell")
+    let mut child = Command::new("/bin/shell")
         .stdin(process::tty_piped())
         .stdout(process::tty_piped())
         .spawn()
@@ -20,7 +20,7 @@ fn main() {
     let mut window = Window::create_with_title(0, 0, "Terminal");
     gpu::set_screen_size(window.width(), window.height());
     let fb = window.framebuffer();
-    let font_data = std::fs::read("/initrd/JetBrainsMono-8x16.font").expect("failed to read font");
+    let font_data = std::fs::read("/share/fonts/JetBrainsMono-8x16.font").expect("failed to read font");
     let font = font::Font::from_prebuilt(&font_data);
     let mut console = console::Console::new(fb, font);
 

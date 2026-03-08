@@ -7,12 +7,7 @@ use crate::vfs::Vfs;
 use crate::{device, keyboard, mouse, log, pipe};
 use crate::pipe::PipeId;
 use crate::drivers::serial;
-use toyos_abi::syscall::{FileType, SyscallError};
-
-const O_WRITE: u64 = 2;
-const O_CREATE: u64 = 4;
-const O_TRUNCATE: u64 = 8;
-const O_APPEND: u64 = 16;
+use toyos_abi::syscall::{FileType, OpenFlags, SeekFrom, SyscallError};
 
 
 #[repr(C)]
@@ -70,15 +65,20 @@ pub fn dup(desc: &Descriptor) -> Descriptor {
     }
 }
 
-pub fn alloc(table: &mut FdTable, desc: Descriptor) -> u32 {
-    table.insert(desc)
+const MAX_FDS: usize = 1024;
+
+pub fn alloc(table: &mut FdTable, desc: Descriptor) -> Result<u32, SyscallError> {
+    if table.len() >= MAX_FDS {
+        return Err(SyscallError::ResourceExhausted);
+    }
+    Ok(table.insert(desc))
 }
 
-pub fn open(table: &mut FdTable, vfs: &mut Vfs, path: &str, flags: u64) -> u64 {
-    let writable = flags & O_WRITE != 0;
-    let create = flags & O_CREATE != 0;
-    let truncate = flags & O_TRUNCATE != 0;
-    let append = flags & O_APPEND != 0;
+pub fn open(table: &mut FdTable, vfs: &mut Vfs, path: &str, flags: OpenFlags) -> u64 {
+    let writable = flags.contains(OpenFlags::WRITE);
+    let create = flags.contains(OpenFlags::CREATE);
+    let truncate = flags.contains(OpenFlags::TRUNCATE);
+    let append = flags.contains(OpenFlags::APPEND);
 
     // Validate path resolves to a real mount + filename
     if create {
@@ -90,7 +90,9 @@ pub fn open(table: &mut FdTable, vfs: &mut Vfs, path: &str, flags: u64) -> u64 {
 
     let (data, mtime) = if truncate && create {
         let mtime = crate::clock::nanos_since_boot();
-        vfs.write_file(path, &[], mtime);
+        if let Err(_) = vfs.write_file(path, &[], mtime) {
+            return SyscallError::Unknown.to_u64();
+        }
         (Vec::new(), mtime)
     } else {
         match vfs.read_file(path) {
@@ -101,7 +103,9 @@ pub fn open(table: &mut FdTable, vfs: &mut Vfs, path: &str, flags: u64) -> u64 {
             Err(_) => {
                 if create {
                     let mtime = crate::clock::nanos_since_boot();
-                    vfs.write_file(path, &[], mtime);
+                    if let Err(_) = vfs.write_file(path, &[], mtime) {
+                        return SyscallError::Unknown.to_u64();
+                    }
                     (Vec::new(), mtime)
                 } else {
                     return SyscallError::NotFound.to_u64();
@@ -120,7 +124,10 @@ pub fn open(table: &mut FdTable, vfs: &mut Vfs, path: &str, flags: u64) -> u64 {
         mtime,
     };
 
-    alloc(table, Descriptor::File(file)) as u64
+    match alloc(table, Descriptor::File(file)) {
+        Ok(fd) => fd as u64,
+        Err(e) => e.to_u64(),
+    }
 }
 
 pub fn close(table: &mut FdTable, vfs: &mut Vfs, fd: u32, pid: Pid) -> u64 {
@@ -130,7 +137,7 @@ pub fn close(table: &mut FdTable, vfs: &mut Vfs, fd: u32, pid: Pid) -> u64 {
     match &desc {
         Descriptor::File(file) => {
             if file.modified && file.writable {
-                if !vfs.write_file(&file.path, &file.data, file.mtime) {
+                if let Err(_) = vfs.write_file(&file.path, &file.data, file.mtime) {
                     return SyscallError::Unknown.to_u64();
                 }
             }
@@ -256,15 +263,14 @@ pub fn try_write(table: &mut FdTable, fd: u32, buf: &[u8]) -> Option<u64> {
     }
 }
 
-pub fn seek(table: &mut FdTable, fd: u32, offset: i64, whence: u64) -> u64 {
+pub fn seek(table: &mut FdTable, fd: u32, pos: SeekFrom) -> u64 {
     let Some(Descriptor::File(file)) = table.get_mut(fd) else {
         return SyscallError::NotFound.to_u64();
     };
-    let new_pos = match whence {
-        0 => offset,
-        1 => (file.position as i64).checked_add(offset).unwrap_or(-1),
-        2 => (file.data.len() as i64).checked_add(offset).unwrap_or(-1),
-        _ => return SyscallError::InvalidArgument.to_u64(),
+    let new_pos = match pos {
+        SeekFrom::Start(n) => n as i64,
+        SeekFrom::Current(n) => (file.position as i64).checked_add(n).unwrap_or(-1),
+        SeekFrom::End(n) => (file.data.len() as i64).checked_add(n).unwrap_or(-1),
     };
     if new_pos < 0 { return SyscallError::InvalidArgument.to_u64(); }
     file.position = (new_pos as usize).min(file.data.len());
@@ -306,7 +312,7 @@ pub fn fsync(table: &mut FdTable, vfs: &mut Vfs, fd: u32) -> u64 {
         return SyscallError::NotFound.to_u64();
     };
     if file.modified && file.writable {
-        if !vfs.write_file(&file.path, &file.data, file.mtime) {
+        if let Err(_) = vfs.write_file(&file.path, &file.data, file.mtime) {
             return SyscallError::Unknown.to_u64();
         }
         file.modified = false;
@@ -331,8 +337,8 @@ pub fn close_all(table: &mut FdTable, vfs: &mut Vfs, pid: Pid) {
         match &desc {
             Descriptor::File(file) => {
                 if file.modified && file.writable {
-                    if !vfs.write_file(&file.path, &file.data, file.mtime) {
-                        log!("warning: VFS write failed on process exit: {}", file.path);
+                    if let Err(e) = vfs.write_file(&file.path, &file.data, file.mtime) {
+                        log!("warning: VFS write failed on process exit: {}: {}", file.path, e);
                     }
                 }
             }
