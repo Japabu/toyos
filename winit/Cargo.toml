@@ -105,6 +105,9 @@ winit-x11 = { workspace = true, optional = true }
 [target.'cfg(target_os = "redox")'.dependencies]
 winit-orbital.workspace = true
 
+[target.'cfg(target_os = "toyos")'.dependencies]
+winit-toyos.workspace = true
+
 [target.'cfg(target_family = "wasm")'.dependencies]
 winit-web.workspace = true
 

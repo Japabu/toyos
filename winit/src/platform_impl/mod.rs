@@ -6,6 +6,8 @@ pub(crate) use winit_appkit as platform;
 mod linux;
 #[cfg(orbital_platform)]
 pub(crate) use winit_orbital as platform;
+#[cfg(toyos_platform)]
+pub(crate) use winit_toyos as platform;
 #[cfg(ios_platform)]
 pub(crate) use winit_uikit as platform;
 #[cfg(web_platform)]
@@ -27,5 +29,6 @@ pub use self::platform::*;
     not(wayland_platform),
     not(web_platform),
     not(orbital_platform),
+    not(toyos_platform),
 ))]
 compile_error!("The platform you're compiling for is not supported by winit");

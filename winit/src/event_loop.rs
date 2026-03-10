@@ -225,6 +225,7 @@ impl EventLoop {
             orbital_platform,
             x11_platform,
             wayland_platform,
+            toyos_platform,
         ))]
         {
             let result = self.event_loop.run_app_on_demand(&mut app);

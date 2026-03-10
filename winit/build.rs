@@ -14,11 +14,13 @@ fn main() {
         windows_platform: { target_os = "windows" },
         free_unix: { all(unix, not(target_vendor = "apple"), not(android_platform), not(target_os = "emscripten")) },
         redox: { target_os = "redox" },
+        toyos: { target_os = "toyos" },
 
         // Native displays.
         x11_platform: { all(feature = "x11", free_unix, not(redox)) },
         wayland_platform: { all(feature = "wayland", free_unix, not(redox)) },
         orbital_platform: { redox },
+        toyos_platform: { toyos },
     }
 
     // Winit defined cfgs.

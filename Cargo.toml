@@ -19,6 +19,7 @@ winit-appkit = { version = "=0.31.0-beta.2", path = "winit-appkit" }
 winit-common = { version = "=0.31.0-beta.2", path = "winit-common" }
 winit-core = { version = "=0.31.0-beta.2", path = "winit-core" }
 winit-orbital = { version = "=0.31.0-beta.2", path = "winit-orbital" }
+winit-toyos = { version = "=0.31.0-beta.2", path = "winit-toyos" }
 winit-uikit = { version = "=0.31.0-beta.2", path = "winit-uikit" }
 winit-wayland = { version = "=0.31.0-beta.2", path = "winit-wayland", default-features = false }
 winit-web = { version = "=0.31.0-beta.2", path = "winit-web" }
@@ -95,3 +96,6 @@ wasm-bindgen-futures = "0.4.43"
 wasm-bindgen-test = "0.3"
 web-time = "1"
 web_sys = { package = "web-sys", version = "0.3.70" }
+
+[patch.crates-io]
+raw-window-handle = { path = "../raw-window-handle" }
