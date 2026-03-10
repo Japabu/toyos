@@ -18,6 +18,8 @@ pub(crate) mod cg;
 pub(crate) mod kms;
 #[cfg(target_os = "redox")]
 pub(crate) mod orbital;
+#[cfg(target_os = "toyos")]
+pub(crate) mod toyos;
 #[cfg(all(
     feature = "wayland",
     not(any(

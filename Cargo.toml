@@ -142,6 +142,13 @@ web-sys = { version = "0.3.55", features = [
 [target.'cfg(target_os = "redox")'.dependencies]
 redox_syscall = "0.7"
 
+# ToyOS dependencies.
+[target.'cfg(target_os = "toyos")'.dependencies]
+window = { path = "../window" }
+
+[patch.crates-io]
+raw-window-handle = { path = "../raw-window-handle" }
+
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]

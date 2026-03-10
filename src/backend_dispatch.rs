@@ -275,4 +275,6 @@ make_dispatch! {
     Web(backends::web::WebDisplayImpl<D>, backends::web::WebImpl<D, W>, backends::web::BufferImpl<'surface>),
     #[cfg(target_os = "redox")]
     Orbital(D, backends::orbital::OrbitalImpl<D, W>, backends::orbital::BufferImpl<'surface>),
+    #[cfg(target_os = "toyos")]
+    ToyOs(D, backends::toyos::ToyOsImpl<D, W>, backends::toyos::BufferImpl<'surface>),
 }
