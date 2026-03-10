@@ -48,6 +48,7 @@ mod gbm;
 mod haiku;
 mod ohos;
 mod redox;
+mod toyos;
 mod uikit;
 mod wayland;
 mod web;
@@ -62,6 +63,7 @@ pub use gbm::{GbmDisplayHandle, GbmWindowHandle};
 pub use haiku::{HaikuDisplayHandle, HaikuWindowHandle};
 pub use ohos::{OhosDisplayHandle, OhosNdkWindowHandle};
 pub use redox::{OrbitalDisplayHandle, OrbitalWindowHandle};
+pub use toyos::{ToyOsDisplayHandle, ToyOsWindowHandle};
 pub use uikit::{UiKitDisplayHandle, UiKitWindowHandle};
 pub use wayland::{WaylandDisplayHandle, WaylandWindowHandle};
 pub use web::{WebCanvasWindowHandle, WebDisplayHandle, WebOffscreenCanvasWindowHandle};
@@ -189,6 +191,11 @@ pub enum RawWindowHandle {
     /// ## Availability Hints
     /// This variant is used on HaikuOS.
     Haiku(HaikuWindowHandle),
+    /// A raw window handle for ToyOS.
+    ///
+    /// ## Availability Hints
+    /// This variant is used on ToyOS (`target_os = "toyos"`).
+    ToyOs(ToyOsWindowHandle),
 }
 
 /// A display server handle for a particular windowing system.
@@ -302,6 +309,11 @@ pub enum RawDisplayHandle {
     /// ## Availability Hints
     /// This variant is used on HaikuOS.
     Haiku(HaikuDisplayHandle),
+    /// A raw display handle for ToyOS.
+    ///
+    /// ## Availability Hints
+    /// This variant is used on ToyOS (`target_os = "toyos"`).
+    ToyOs(ToyOsDisplayHandle),
 }
 
 /// An error that can occur while fetching a display or window handle.
@@ -374,6 +386,7 @@ from_impl!(RawDisplayHandle, Windows, WindowsDisplayHandle);
 from_impl!(RawDisplayHandle, Web, WebDisplayHandle);
 from_impl!(RawDisplayHandle, Android, AndroidDisplayHandle);
 from_impl!(RawDisplayHandle, Haiku, HaikuDisplayHandle);
+from_impl!(RawDisplayHandle, ToyOs, ToyOsDisplayHandle);
 
 from_impl!(RawWindowHandle, UiKit, UiKitWindowHandle);
 from_impl!(RawWindowHandle, AppKit, AppKitWindowHandle);
@@ -394,6 +407,7 @@ from_impl!(
 );
 from_impl!(RawWindowHandle, AndroidNdk, AndroidNdkWindowHandle);
 from_impl!(RawWindowHandle, Haiku, HaikuWindowHandle);
+from_impl!(RawWindowHandle, ToyOs, ToyOsWindowHandle);
 
 #[cfg(test)]
 mod tests {
@@ -429,6 +443,7 @@ mod tests {
         assert_not_impl_any!(WebDisplayHandle: Send, Sync);
         assert_impl_all!(AndroidDisplayHandle: Send, Sync);
         assert_impl_all!(HaikuDisplayHandle: Send, Sync);
+        assert_impl_all!(ToyOsDisplayHandle: Send, Sync);
 
         // TODO: Unsure if some of these should not actually be Send + Sync
         assert_not_impl_any!(UiKitWindowHandle: Send, Sync);
@@ -449,6 +464,7 @@ mod tests {
         assert_not_impl_any!(WebOffscreenCanvasWindowHandle: Send, Sync);
         assert_impl_all!(AndroidNdkWindowHandle: Send, Sync);
         assert_impl_all!(HaikuWindowHandle: Send, Sync);
+        assert_impl_all!(ToyOsWindowHandle: Send, Sync);
     }
 
     #[allow(unused)]
