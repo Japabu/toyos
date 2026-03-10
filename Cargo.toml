@@ -176,6 +176,9 @@ web-sys = { version = "0.3", features = [
     "AudioContextState",
 ] }
 
+[target.'cfg(target_os = "toyos")'.dependencies]
+toyos-abi = { path = "../../toyos-abi" }
+
 [target.'cfg(target_os = "android")'.dependencies]
 ndk = { version = "0.9", default-features = false, features = [
     "audio",
