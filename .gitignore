@@ -21,3 +21,4 @@ $**/fuzz/Cargo.lock
 
 # Instead of adding more environment-specific ignores here, like for the IDE in use, prefer Git's user-global
 # `core.excludesFile` mechanism, see https://git-scm.com/docs/git-config#Documentation/git-config.txt-coreexcludesFile.
+.DS_Store
