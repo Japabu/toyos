@@ -58,6 +58,7 @@ macro_rules! toyos_rust_tests {
 
 toyos_rust_tests!(
     allocator_stress,
+    demand_paging_sse,
     std_alloc,
     std_fs,
     std_fs_write,

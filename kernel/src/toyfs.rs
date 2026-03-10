@@ -443,6 +443,24 @@ impl ToyFs {
         Ok(())
     }
 
+    /// Return the disk block numbers for every 4KB block of a file.
+    /// Does NOT read file data — only traverses block pointers.
+    pub fn file_block_map(&self, cache: &mut PageCache, dev: &mut dyn BlockDevice,
+                          name: &str) -> Result<Vec<u64>, &'static str> {
+        let idx = self.find_entry(cache, dev, name).ok_or("not found")?;
+        let entry = self.read_entry(cache, dev, idx);
+        let size = read_u64(&entry, 8) as usize;
+        let block_count = (size + 4095) / 4096;
+
+        let mut blocks = Vec::with_capacity(block_count);
+        for i in 0..block_count {
+            let b = self.get_data_block(cache, dev, &entry, i);
+            if b == 0 { break; }
+            blocks.push(b);
+        }
+        Ok(blocks)
+    }
+
     pub fn read_file(&self, cache: &mut PageCache, dev: &mut dyn BlockDevice,
                      name: &str) -> Result<Vec<u8>, &'static str> {
         let idx = self.find_entry(cache, dev, name).ok_or("not found")?;
@@ -531,62 +549,108 @@ impl ToyFs {
 
 // -- VFS integration --
 
-/// Adapter that bundles ToyFs + BlockDevice and implements the VFS FileSystem trait.
-/// Acquires the page cache lock internally for each operation.
+/// Adapter that wraps ToyFs and implements the VFS FileSystem trait.
+/// Acquires the page cache lock (which also provides the block device) for each operation.
 pub struct ToyFsAdapter {
     fs: ToyFs,
-    dev: crate::drivers::nvme::NvmeBlockDevice,
 }
 
 impl ToyFsAdapter {
-    pub fn new(fs: ToyFs, dev: crate::drivers::nvme::NvmeBlockDevice) -> Self {
-        Self { fs, dev }
+    pub fn new(fs: ToyFs) -> Self {
+        Self { fs }
     }
 }
 
 impl FileSystem for ToyFsAdapter {
     fn list(&mut self) -> Vec<(String, u64)> {
-        let mut cache = crate::page_cache::lock();
-        self.fs.list(&mut *cache, &mut self.dev)
+        let mut guard = crate::page_cache::lock();
+        let (cache, dev) = guard.cache_and_dev();
+        self.fs.list(cache, dev)
     }
 
     fn read_file(&mut self, name: &str) -> Result<Cow<'static, [u8]>, &'static str> {
-        let mut cache = crate::page_cache::lock();
-        self.fs.read_file(&mut *cache, &mut self.dev, name).map(Cow::Owned)
+        // Phase 1: get block list and file size (lock held briefly)
+        let (blocks, size) = {
+            let mut guard = crate::page_cache::lock();
+            let (cache, dev) = guard.cache_and_dev();
+            let idx = self.fs.find_entry(cache, dev, name).ok_or("not found")?;
+            let entry = self.fs.read_entry(cache, dev, idx);
+            let size = read_u64(&entry, 8) as usize;
+            let block_count = (size + 4095) / 4096;
+            let mut blocks = Vec::with_capacity(block_count);
+            for i in 0..block_count {
+                let b = self.fs.get_data_block(cache, dev, &entry, i);
+                if b == 0 { break; }
+                blocks.push(b);
+            }
+            (blocks, size)
+        };
+
+        // Phase 2: prefetch (lock held briefly)
+        {
+            let mut guard = crate::page_cache::lock();
+            let (cache, dev) = guard.cache_and_dev();
+            cache.prefetch(dev, &blocks);
+        }
+
+        // Phase 3: read blocks one at a time, releasing lock between reads
+        let mut result = vec![0u8; size];
+        for (i, &b) in blocks.iter().enumerate() {
+            let mut guard = crate::page_cache::lock();
+            let (cache, dev) = guard.cache_and_dev();
+            let page = cache.read(dev, b);
+            let start = i * 4096;
+            let end = cmp::min(start + 4096, size);
+            result[start..end].copy_from_slice(&page[..end - start]);
+        }
+        Ok(Cow::Owned(result))
     }
 
     fn read_link(&mut self, name: &str) -> Option<String> {
-        let mut cache = crate::page_cache::lock();
-        self.fs.read_link(&mut *cache, &mut self.dev, name)
+        let mut guard = crate::page_cache::lock();
+        let (cache, dev) = guard.cache_and_dev();
+        self.fs.read_link(cache, dev, name)
     }
 
     fn file_mtime(&mut self, name: &str) -> u64 {
-        let mut cache = crate::page_cache::lock();
-        self.fs.file_mtime(&mut *cache, &mut self.dev, name)
+        let mut guard = crate::page_cache::lock();
+        let (cache, dev) = guard.cache_and_dev();
+        self.fs.file_mtime(cache, dev, name)
     }
 
     fn create(&mut self, name: &str, data: &[u8], mtime: u64) -> Result<(), &'static str> {
-        let mut cache = crate::page_cache::lock();
-        self.fs.create_file(&mut *cache, &mut self.dev, name, data, mtime, 1)
+        let mut guard = crate::page_cache::lock();
+        let (cache, dev) = guard.cache_and_dev();
+        self.fs.create_file(cache, dev, name, data, mtime, 1)
     }
 
     fn delete(&mut self, name: &str) -> bool {
-        let mut cache = crate::page_cache::lock();
-        self.fs.delete(&mut *cache, &mut self.dev, name)
+        let mut guard = crate::page_cache::lock();
+        let (cache, dev) = guard.cache_and_dev();
+        self.fs.delete(cache, dev, name)
     }
 
     fn delete_prefix(&mut self, prefix: &str) {
-        let mut cache = crate::page_cache::lock();
-        self.fs.delete_prefix(&mut *cache, &mut self.dev, prefix)
+        let mut guard = crate::page_cache::lock();
+        let (cache, dev) = guard.cache_and_dev();
+        self.fs.delete_prefix(cache, dev, prefix)
     }
 
     fn create_symlink(&mut self, name: &str, target: &str) -> Result<(), &'static str> {
-        let mut cache = crate::page_cache::lock();
-        self.fs.create_file(&mut *cache, &mut self.dev, name, target.as_bytes(), 0, 2)
+        let mut guard = crate::page_cache::lock();
+        let (cache, dev) = guard.cache_and_dev();
+        self.fs.create_file(cache, dev, name, target.as_bytes(), 0, 2)
     }
 
     fn sync(&mut self) {
-        let mut cache = crate::page_cache::lock();
-        self.fs.sync(&mut *cache, &mut self.dev)
+        let mut guard = crate::page_cache::lock();
+        let (cache, dev) = guard.cache_and_dev();
+        self.fs.sync(cache, dev)
+    }
+
+    fn file_block_map(&mut self, name: &str) -> Option<Vec<u64>> {
+        let mut guard = crate::page_cache::lock();
+        let (cache, dev) = guard.cache_and_dev();
+        self.fs.file_block_map(cache, dev, name).ok()
     }
 }

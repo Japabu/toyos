@@ -5,27 +5,43 @@ use alloc::vec::Vec;
 use crate::block::{BlockDevice, DeviceId};
 use crate::sync::Lock;
 
-static PAGE_CACHE: Lock<Option<PageCache>> = Lock::new(None);
+struct PageCacheWithDev {
+    cache: PageCache,
+    dev: Box<dyn BlockDevice>,
+}
 
-/// Initialize the page cache for a specific block device.
-pub fn init(dev: &dyn BlockDevice) {
+static PAGE_CACHE: Lock<Option<PageCacheWithDev>> = Lock::new(None);
+
+/// Initialize the page cache, taking ownership of the block device.
+pub fn init(dev: Box<dyn BlockDevice>) {
     let block_count = dev.block_count() as usize;
-    *PAGE_CACHE.lock() = Some(PageCache::new(block_count, dev.device_id()));
+    let device_id = dev.device_id();
+    *PAGE_CACHE.lock() = Some(PageCacheWithDev {
+        cache: PageCache::new(block_count, device_id),
+        dev,
+    });
 }
 
 pub fn lock() -> PageCacheGuard {
     PageCacheGuard(PAGE_CACHE.lock())
 }
 
-pub struct PageCacheGuard(crate::sync::LockGuard<'static, Option<PageCache>>);
+pub struct PageCacheGuard(crate::sync::LockGuard<'static, Option<PageCacheWithDev>>);
+
+impl PageCacheGuard {
+    pub fn cache_and_dev(&mut self) -> (&mut PageCache, &mut dyn BlockDevice) {
+        let inner = self.0.as_mut().expect("page cache not initialized");
+        (&mut inner.cache, inner.dev.as_mut())
+    }
+}
 
 impl core::ops::Deref for PageCacheGuard {
     type Target = PageCache;
-    fn deref(&self) -> &PageCache { self.0.as_ref().expect("page cache not initialized") }
+    fn deref(&self) -> &PageCache { &self.0.as_ref().expect("page cache not initialized").cache }
 }
 
 impl core::ops::DerefMut for PageCacheGuard {
-    fn deref_mut(&mut self) -> &mut PageCache { self.0.as_mut().expect("page cache not initialized") }
+    fn deref_mut(&mut self) -> &mut PageCache { &mut self.0.as_mut().expect("page cache not initialized").cache }
 }
 
 const NOT_CACHED: u32 = u32::MAX;
@@ -85,6 +101,20 @@ impl PageCache {
         let page_in_chunk = slot as usize % PAGES_PER_CHUNK;
         let off = page_in_chunk * 4096;
         &mut self.chunks[chunk_idx][off..off + 4096]
+    }
+
+    /// Get the physical address of a cached block's 4KB page.
+    /// Identity mapping: virtual pointer IS physical address.
+    pub fn phys_addr(&self, block: u64) -> Option<u64> {
+        let slot = self.block_to_slot[block as usize];
+        if slot == NOT_CACHED { return None; }
+        Some(self.slot_data(slot).as_ptr() as u64)
+    }
+
+    /// Ensure a block is cached (loading from device if needed) and return its physical address.
+    pub fn ensure_cached(&mut self, dev: &mut dyn BlockDevice, block: u64) -> u64 {
+        self.read(dev, block);
+        self.phys_addr(block).unwrap()
     }
 
     /// Read a block, returning a reference to the cached 4KB page.

@@ -41,6 +41,9 @@ pub trait FileSystem: Send {
     fn delete_prefix(&mut self, prefix: &str);
     fn create_symlink(&mut self, name: &str, target: &str) -> Result<(), &'static str>;
     fn sync(&mut self);
+    /// Return disk block numbers for each 4KB block of a file.
+    /// Only supported by block-device-backed filesystems (ToyFS).
+    fn file_block_map(&mut self, _name: &str) -> Option<Vec<u64>> { None }
 }
 
 
@@ -295,12 +298,24 @@ impl Vfs {
     }
 
     pub fn file_mtime(&mut self, path: &str) -> u64 {
+        self.file_mtime_depth(path, 0)
+    }
+
+    fn file_mtime_depth(&mut self, path: &str, depth: u32) -> u64 {
+        if depth > 10 { return 0; }
         let (mount, file) = self.resolve_path("/", path);
-        if mount.is_empty() {
-            return 0;
-        }
+        if mount.is_empty() { return 0; }
+        let is_named = self.mounts.contains_key(&mount);
         if let Some((fs, fs_path)) = self.resolve_fs(&mount, &file) {
             if fs_path.is_empty() { return 0; }
+            if let Some(target) = fs.read_link(&fs_path) {
+                let resolved = if is_named {
+                    format!("/{}/{}", mount, target)
+                } else {
+                    format!("/{}", target)
+                };
+                return self.file_mtime_depth(&resolved, depth + 1);
+            }
             fs.file_mtime(&fs_path)
         } else {
             0
@@ -371,6 +386,30 @@ impl Vfs {
         } else {
             false
         }
+    }
+
+    /// Return disk block numbers for a file. Only works for block-device-backed files.
+    /// Follows symlinks (up to 10 levels).
+    pub fn file_block_map(&mut self, path: &str) -> Option<Vec<u64>> {
+        self.file_block_map_depth(path, 0)
+    }
+
+    fn file_block_map_depth(&mut self, path: &str, depth: u32) -> Option<Vec<u64>> {
+        if depth > 10 { return None; }
+        let (mount, file) = self.resolve_path("/", path);
+        if mount.is_empty() { return None; }
+        let is_named = self.mounts.contains_key(&mount);
+        let (fs, fs_path) = self.resolve_fs(&mount, &file)?;
+        if fs_path.is_empty() { return None; }
+        if let Some(target) = fs.read_link(&fs_path) {
+            let resolved = if is_named {
+                format!("/{}/{}", mount, target)
+            } else {
+                format!("/{}", target)
+            };
+            return self.file_block_map_depth(&resolved, depth + 1);
+        }
+        fs.file_block_map(&fs_path)
     }
 
 }

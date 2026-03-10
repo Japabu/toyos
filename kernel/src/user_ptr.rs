@@ -1,5 +1,4 @@
 use core::marker::PhantomData;
-use crate::arch::paging;
 
 /// Marker for types safe to interpret from / write to validated user pointers.
 ///
@@ -20,6 +19,16 @@ unsafe impl UserSafe for toyos_abi::syscall::SpawnArgs {}
 unsafe impl UserSafe for toyos_abi::message::RawMessage {}
 unsafe impl UserSafe for toyos_abi::input::RawKeyEvent {}
 unsafe impl UserSafe for toyos_abi::input::MouseEvent {}
+
+/// Check that all pages in [ptr..ptr+size) are in the user half of the address space.
+/// Pages may not yet be mapped (demand paging); the kernel-mode page fault handler
+/// will map them when the kernel dereferences the validated pointer.
+fn check_user_range(ptr: u64, size: u64) -> bool {
+    if size == 0 { return true; }
+    let Some(end) = ptr.checked_add(size) else { return false };
+    // Reject kernel-space pointers (above canonical hole)
+    end <= 0x0000_8000_0000_0000
+}
 
 /// Context for a single syscall invocation. All user pointer access goes
 /// through this type, tying reference lifetimes to the syscall scope.
@@ -44,7 +53,7 @@ impl<'a> SyscallContext<'a> {
         if len == 0 {
             return Some(&[]);
         }
-        if !paging::is_user_mapped(ptr, len as u64) {
+        if !check_user_range(ptr, len as u64) {
             return None;
         }
         Some(unsafe { core::slice::from_raw_parts(ptr as *const u8, len) })
@@ -56,7 +65,7 @@ impl<'a> SyscallContext<'a> {
         if len == 0 {
             return Some(&mut []);
         }
-        if !paging::is_user_mapped(ptr, len as u64) {
+        if !check_user_range(ptr, len as u64) {
             return None;
         }
         Some(unsafe { core::slice::from_raw_parts_mut(ptr as *mut u8, len) })
@@ -71,7 +80,7 @@ impl<'a> SyscallContext<'a> {
     /// Validate a user pointer to a typed struct (immutable).
     pub fn user_ref<T: UserSafe>(&self, ptr: u64) -> Option<&'a T> {
         let size = core::mem::size_of::<T>() as u64;
-        if size == 0 || !paging::is_user_mapped(ptr, size) {
+        if size == 0 || !check_user_range(ptr, size) {
             return None;
         }
         if ptr as usize % core::mem::align_of::<T>() != 0 {
@@ -83,7 +92,7 @@ impl<'a> SyscallContext<'a> {
     /// Validate a user pointer to a typed struct (mutable).
     pub fn user_mut<T: UserSafe>(&self, ptr: u64) -> Option<&'a mut T> {
         let size = core::mem::size_of::<T>() as u64;
-        if size == 0 || !paging::is_user_mapped(ptr, size) {
+        if size == 0 || !check_user_range(ptr, size) {
             return None;
         }
         if ptr as usize % core::mem::align_of::<T>() != 0 {
@@ -98,7 +107,7 @@ impl<'a> SyscallContext<'a> {
             return Some(&[]);
         }
         let byte_len = count.checked_mul(core::mem::size_of::<T>())?;
-        if !paging::is_user_mapped(ptr, byte_len as u64) {
+        if !check_user_range(ptr, byte_len as u64) {
             return None;
         }
         if ptr as usize % core::mem::align_of::<T>() != 0 {

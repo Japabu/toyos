@@ -1,14 +1,18 @@
+use core::alloc::Layout;
 use core::ptr;
 
-// ToyOS: Call toyos-abi's kernel allocator directly.
-// We store the allocation size in a header so C's free(ptr) can reconstruct it.
+// C malloc/free/calloc/realloc route through the Rust global allocator (dlmalloc).
+// We store the allocation size in a header so C's free(ptr) can recover it.
 mod backend {
+    use super::*;
+
     const HEADER: usize = 16; // 16 for alignment
+    const ALIGN: usize = 16;
 
     pub unsafe fn alloc(size: usize) -> *mut u8 {
         let total = HEADER + size;
-        // SAFETY: total > 0 (HEADER is 16), alignment is valid
-        let raw = unsafe { toyos_abi::syscall::alloc(total, 16) };
+        let layout = unsafe { Layout::from_size_align_unchecked(total, ALIGN) };
+        let raw = unsafe { alloc::alloc::alloc(layout) };
         if raw.is_null() {
             return raw;
         }
@@ -20,8 +24,8 @@ mod backend {
         let raw = unsafe { ptr.sub(HEADER) };
         let size = unsafe { *(raw as *const usize) };
         let total = HEADER + size;
-        // SAFETY: raw was returned by alloc with the same total size and alignment
-        unsafe { toyos_abi::syscall::free(raw, total, 16) };
+        let layout = unsafe { Layout::from_size_align_unchecked(total, ALIGN) };
+        unsafe { alloc::alloc::dealloc(raw, layout) };
     }
 
     pub unsafe fn realloc(ptr: *mut u8, new_size: usize) -> *mut u8 {
@@ -29,8 +33,8 @@ mod backend {
         let old_size = unsafe { *(raw as *const usize) };
         let old_total = HEADER + old_size;
         let new_total = HEADER + new_size;
-        // SAFETY: raw was returned by alloc with old_total size and alignment 16
-        let new_raw = unsafe { toyos_abi::syscall::realloc(raw, old_total, 16, new_total) };
+        let layout = unsafe { Layout::from_size_align_unchecked(old_total, ALIGN) };
+        let new_raw = unsafe { alloc::alloc::realloc(raw, layout, new_total) };
         if new_raw.is_null() {
             return new_raw;
         }

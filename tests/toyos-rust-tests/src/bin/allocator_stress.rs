@@ -37,37 +37,44 @@ fn test_slab_all_size_classes() {
     println!("  slab size classes: ok");
 }
 
-/// Verify slab free list reuse: alloc, free, alloc again should reuse memory.
+/// Verify freed memory is reused: alloc, free, alloc again should reuse the
+/// same address range (not grow the heap).
 fn test_slab_reuse() {
     let mut ptrs = Vec::new();
 
-    // Allocate 100 boxes, record pointers
+    // Allocate 100 boxes, record address range
     for i in 0u64..100 {
         let b = Box::new(i);
-        ptrs.push(Box::into_raw(b));
+        ptrs.push(Box::into_raw(b) as usize);
     }
+    let old_min = *ptrs.iter().min().unwrap();
+    let old_max = *ptrs.iter().max().unwrap();
 
     // Free all
     for &ptr in &ptrs {
-        drop(unsafe { Box::from_raw(ptr) });
+        drop(unsafe { Box::from_raw(ptr as *mut u64) });
     }
 
-    // Allocate again — should reuse freed slots (not grow heap)
+    // Allocate again — should reuse freed memory (not grow heap)
     let mut ptrs2 = Vec::new();
     for i in 0u64..100 {
         let b = Box::new(i);
-        ptrs2.push(Box::into_raw(b));
+        ptrs2.push(Box::into_raw(b) as usize);
     }
+    let new_min = *ptrs2.iter().min().unwrap();
+    let new_max = *ptrs2.iter().max().unwrap();
 
-    // At least some pointers should be reused from the free list
-    let reused = ptrs2.iter().filter(|p| ptrs.contains(p)).count();
-    assert!(reused > 0, "slab did not reuse any freed slots (reused={reused})");
+    // New allocations should fall within (or near) the original address range,
+    // proving freed memory was reused rather than the heap growing.
+    let in_range = ptrs2.iter().filter(|&&p| p >= old_min && p <= old_max + 8).count();
+    assert!(in_range > 50, "freed memory not reused: only {in_range}/100 in original range \
+        (old={old_min:#x}..{old_max:#x}, new={new_min:#x}..{new_max:#x})");
 
     // Clean up
     for &ptr in &ptrs2 {
-        drop(unsafe { Box::from_raw(ptr) });
+        drop(unsafe { Box::from_raw(ptr as *mut u64) });
     }
-    println!("  slab reuse: ok ({reused}/100 reused)");
+    println!("  free-list reuse: ok ({in_range}/100 in original range)");
 }
 
 /// Test buddy allocator with page-sized allocations (>2048 bytes).

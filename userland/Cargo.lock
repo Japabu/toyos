@@ -905,6 +905,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "dlmalloc"
+version = "0.2.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6738d2e996274e499bc7b0d693c858b7720b9cd2543a0643a3087e6cb0a4fa16"
+dependencies = [
+ "cfg-if",
+ "libc",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "doom"
 version = "0.1.0"
 dependencies = [
@@ -3508,7 +3519,7 @@ dependencies = [
 [[package]]
 name = "toyos-abi"
 version = "0.1.0"
-source = "git+https://github.com/Japabu/toyos-abi#53df9d909dd531b969935b4b66e28cd9d0ef1387"
+source = "git+https://github.com/Japabu/toyos-abi#0274833a44ac4bf7f38979906f04528ce8b29154"
 
 [[package]]
 name = "toyos-cc"
@@ -3536,6 +3547,7 @@ dependencies = [
 name = "toyos-libc"
 version = "0.1.0"
 dependencies = [
+ "dlmalloc",
  "toyos-abi 0.1.0",
  "toyos-net",
 ]

@@ -75,12 +75,41 @@ fn merge_rlibs(rlib_paths: &[std::path::PathBuf]) -> Vec<u8> {
         extract_rlib_objects(&data, &mut members);
     }
 
+    // Build GNU string table for names > 15 chars
+    let mut string_table = Vec::new();
+    let mut name_refs: Vec<String> = Vec::new();
+    for (name, _) in &members {
+        let ar_name = format!("{name}/");
+        if ar_name.len() <= 16 {
+            name_refs.push(ar_name);
+        } else {
+            let offset = string_table.len();
+            string_table.extend_from_slice(ar_name.as_bytes());
+            string_table.push(b'\n');
+            name_refs.push(format!("/{offset}"));
+        }
+    }
+
     let mut buf = Vec::new();
     buf.extend_from_slice(b"!<arch>\n");
-    for (name, data) in &members {
+
+    // Write string table if needed
+    if !string_table.is_empty() {
         let header = format!(
             "{:<16}{:<12}{:<6}{:<6}{:<8}{:<10}`\n",
-            format!("{name}/"), "0", "0", "0", "100644", data.len()
+            "//", "0", "0", "0", "100644", string_table.len()
+        );
+        buf.extend_from_slice(header.as_bytes());
+        buf.extend_from_slice(&string_table);
+        if string_table.len() % 2 == 1 {
+            buf.push(b'\n');
+        }
+    }
+
+    for (i, (_name, data)) in members.iter().enumerate() {
+        let header = format!(
+            "{:<16}{:<12}{:<6}{:<6}{:<8}{:<10}`\n",
+            &name_refs[i], "0", "0", "0", "100644", data.len()
         );
         buf.extend_from_slice(header.as_bytes());
         buf.extend_from_slice(data);

@@ -1,8 +1,10 @@
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use elf::ElfBytes;
 use elf::endian::AnyEndian;
-use elf::abi::STT_FUNC;
+use elf::section::SectionHeaderTable;
+use elf::abi::{STT_FUNC, SHT_SYMTAB, SHT_STRTAB};
 use crate::log;
 use crate::sync::Lock;
 
@@ -52,9 +54,21 @@ impl SymbolTable {
     }
 }
 
+/// Info needed to lazily load symbols from disk on first crash.
+struct LazySymbolSource {
+    block_map: Arc<Vec<u64>>,
+    sh_off: u64,
+    sh_num: usize,
+    sh_entsize: usize,
+    base: u64,
+}
+
 /// Per-process symbol info: parsed function symbols + valid memory ranges.
+/// Symbols are loaded lazily on first resolve (crash backtrace).
 pub struct ProcessSymbols {
     table: SymbolTable,
+    loaded: bool,
+    lazy_source: Option<LazySymbolSource>,
     prog_base: u64,
     prog_end: u64,
     stack_base: u64,
@@ -65,6 +79,8 @@ impl ProcessSymbols {
     pub fn empty() -> Self {
         Self {
             table: SymbolTable::new(),
+            loaded: true,
+            lazy_source: None,
             prog_base: 0,
             prog_end: 0,
             stack_base: 0,
@@ -72,12 +88,33 @@ impl ProcessSymbols {
         }
     }
 
-    /// Create empty symbols with memory bounds (for crash addr validation).
+    /// Create with memory bounds but no symbols (no section headers available).
     pub fn empty_with_bounds(
         prog_base: u64, prog_end: u64,
         stack_base: u64, stack_end: u64,
     ) -> Self {
-        Self { table: SymbolTable::new(), prog_base, prog_end, stack_base, stack_end }
+        Self {
+            table: SymbolTable::new(),
+            loaded: true,
+            lazy_source: None,
+            prog_base, prog_end, stack_base, stack_end,
+        }
+    }
+
+    /// Create lazy symbols — stores metadata for on-demand loading.
+    pub fn lazy(
+        block_map: Arc<Vec<u64>>,
+        sh_off: u64, sh_num: usize, sh_entsize: usize,
+        base: u64,
+        prog_base: u64, prog_end: u64,
+        stack_base: u64, stack_end: u64,
+    ) -> Self {
+        Self {
+            table: SymbolTable::new(),
+            loaded: false,
+            lazy_source: Some(LazySymbolSource { block_map, sh_off, sh_num, sh_entsize, base }),
+            prog_base, prog_end, stack_base, stack_end,
+        }
     }
 
     /// Parse symbols from ELF bytes and record memory ranges.
@@ -88,12 +125,35 @@ impl ProcessSymbols {
     ) -> Self {
         let mut table = SymbolTable::new();
         parse_symtab(data, base, &mut table);
-        Self { table, prog_base, prog_end, stack_base, stack_end }
+        Self {
+            table, loaded: true, lazy_source: None,
+            prog_base, prog_end, stack_base, stack_end,
+        }
+    }
+
+    /// Ensure symbols are loaded (does disk I/O on first call).
+    fn ensure_loaded(&mut self) {
+        if self.loaded { return; }
+        self.loaded = true;
+        let Some(src) = self.lazy_source.take() else { return };
+        load_from_source(&src, &mut self.table);
+        log!("symbols: loaded {} user symbols (lazy)", self.table.symbols.len());
     }
 
     pub fn is_valid_user_addr(&self, addr: u64) -> bool {
         (addr >= self.prog_base && addr < self.prog_end)
             || (addr >= self.stack_base && addr < self.stack_end)
+    }
+
+    /// Resolve a user address to (mangled_name, offset).
+    /// Triggers lazy loading on first call.
+    pub fn resolve(&mut self, addr: u64) -> Option<(&str, u64)> {
+        self.ensure_loaded();
+        self.table.resolve(addr)
+    }
+
+    pub fn prog_base(&self) -> u64 {
+        self.prog_base
     }
 
     pub fn symbol_count(&self) -> usize {
@@ -182,11 +242,94 @@ fn parse_symtab(data: &[u8], base: u64, table: &mut SymbolTable) {
     table.symbols.sort_unstable_by_key(|s| s.addr);
 }
 
+/// Load symbols from a lazy source (block map + section headers).
+fn load_from_source(src: &LazySymbolSource, table: &mut SymbolTable) {
+    use crate::process::read_file_range;
+
+    let shdr_size = src.sh_num * src.sh_entsize;
+    let shdr_data = read_file_range(&src.block_map, src.sh_off, shdr_size);
+
+    let class = elf::file::Class::ELF64;
+    let endian = AnyEndian::Little;
+    let shdrs = SectionHeaderTable::new(endian, class, &shdr_data);
+
+    // Find .symtab and its associated .strtab
+    let mut symtab_shdr = None;
+    let mut symtab_link = 0u32;
+    for shdr in shdrs.iter() {
+        if shdr.sh_type == SHT_SYMTAB {
+            symtab_link = shdr.sh_link;
+            symtab_shdr = Some(shdr);
+            break;
+        }
+    }
+    let Some(sym_shdr) = symtab_shdr else { return };
+
+    let mut strtab_shdr = None;
+    for (i, shdr) in shdrs.iter().enumerate() {
+        if i as u32 == symtab_link && shdr.sh_type == SHT_STRTAB {
+            strtab_shdr = Some(shdr);
+            break;
+        }
+    }
+    let Some(str_shdr) = strtab_shdr else { return };
+
+    // Read .symtab and .strtab data from disk
+    let sym_data = read_file_range(&src.block_map, sym_shdr.sh_offset, sym_shdr.sh_size as usize);
+    let str_data = read_file_range(&src.block_map, str_shdr.sh_offset, str_shdr.sh_size as usize);
+
+    let entry_size = if sym_shdr.sh_entsize > 0 { sym_shdr.sh_entsize as usize } else { 24 };
+    let count = sym_data.len() / entry_size;
+
+    for i in 0..count {
+        let off = i * entry_size;
+        if off + 24 > sym_data.len() { break; }
+        let st_name = u32::from_le_bytes(sym_data[off..off + 4].try_into().unwrap()) as usize;
+        let st_info = sym_data[off + 4];
+        let st_value = u64::from_le_bytes(sym_data[off + 8..off + 16].try_into().unwrap());
+        let st_size = u64::from_le_bytes(sym_data[off + 16..off + 24].try_into().unwrap());
+
+        if (st_info & 0xf) != 2 || st_value == 0 { continue; }
+        if st_name >= str_data.len() { continue; }
+
+        let name_end = str_data[st_name..].iter().position(|&b| b == 0)
+            .unwrap_or(str_data.len() - st_name);
+        let name = &str_data[st_name..st_name + name_end];
+
+        let name_start = table.names.len() as u32;
+        table.names.extend_from_slice(name);
+        table.names.push(0);
+        table.symbols.push(Symbol {
+            addr: src.base + st_value,
+            size: st_size,
+            name_start,
+        });
+    }
+
+    table.symbols.sort_unstable_by_key(|s| s.addr);
+}
+
 /// Load kernel symbols from raw ELF bytes. Called once at boot.
 pub fn load_kernel(data: &[u8], base: u64) {
     let mut table = KERNEL_SYMS.lock();
     parse_symtab(data, base, &mut table);
     log!("symbols: loaded {} kernel symbols", table.symbols.len());
+}
+
+/// Resolve and log a user address against a process's symbol table.
+/// Returns true if the address could be identified.
+/// Triggers lazy symbol loading on first call.
+pub fn resolve_user(syms: &mut ProcessSymbols, addr: u64) -> bool {
+    if let Some((name, offset)) = syms.resolve(addr) {
+        log!("    {:#x}  {:#}+{:#x}", addr, rustc_demangle::demangle(name), offset);
+        true
+    } else if syms.is_valid_user_addr(addr) {
+        let base_offset = addr.saturating_sub(syms.prog_base());
+        log!("    {:#x}  [exe+{:#x}]", addr, base_offset);
+        true
+    } else {
+        false
+    }
 }
 
 /// Set the kernel base address for crash diagnostics.

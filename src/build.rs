@@ -38,11 +38,19 @@ pub fn build(root: &Path, debug: bool, release: bool, toolchain_changed: bool) {
         kernel_args.push("--features");
         kernel_args.push("debug-wait");
     }
+    // Add sysroot bin dir to PATH so the kernel linker (toyos-ld) is found
+    let host = toolchain::host_triple();
+    let sysroot_bin = root.join(format!("rust/build/{host}/stage2/lib/rustlib/{host}/bin"));
+    let path_env = match std::env::var("PATH") {
+        Ok(p) => format!("{}:{p}", sysroot_bin.display()),
+        Err(_) => sysroot_bin.display().to_string(),
+    };
     if !Command::new("cargo")
         .args(&kernel_args)
         .current_dir(root.join("kernel"))
         .env("RUSTUP_TOOLCHAIN", "toyos")
         .env("RUSTFLAGS", &rustflags)
+        .env("PATH", &path_env)
         .env_remove("RUSTC")
         .status()
         .expect("Failed to run cargo")

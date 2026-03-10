@@ -378,35 +378,64 @@ macro_rules! exception_entry {
             );
         }
     };
-    ($name:ident, $vector:literal, error_code_cr2) => {
-        #[unsafe(naked)]
-        extern "C" fn $name() {
-            naked_asm!(
-                "test dword ptr [rsp + 16], 3",
-                "jz 1f",
-                "swapgs",
-                "1:",
-                "push r15", "push r14", "push r13", "push r12",
-                "push r11", "push r10", "push r9",  "push r8",
-                "push rbp", "push rdi", "push rsi", "push rdx",
-                "push rcx", "push rbx", "push rax",
-                concat!("mov rdi, ", $vector),
-                "mov rsi, rsp",
-                "mov rdx, [rsp + 15*8]",
-                "mov rcx, [rsp + 16*8]",
-                "mov r8,  [rsp + 17*8]",
-                "mov r9, cr2",
-                "sub rsp, 8",
-                "call {handler}", "cli", "hlt",
-                handler = sym exception_handler,
-            );
-        }
-    };
 }
 
 exception_entry!(ud_entry,         "6",  no_error_code);
 exception_entry!(gpf_entry,        "13", error_code);
-exception_entry!(page_fault_entry, "14", error_code_cr2);
+
+/// Page fault entry — can return to userspace if the fault is resolved by demand paging.
+/// The kernel is compiled with +soft-float (no SSE), so the handler cannot clobber XMM.
+/// GPR save/restore is still required since the handler uses general-purpose registers.
+#[unsafe(naked)]
+extern "C" fn page_fault_entry() {
+    naked_asm!(
+        // Error code is on stack. CS is at [rsp + 16].
+        "test dword ptr [rsp + 16], 3",
+        "jz 1f",
+        "swapgs",
+        "1:",
+        "push r15", "push r14", "push r13", "push r12",
+        "push r11", "push r10", "push r9",  "push r8",
+        "push rbp", "push rdi", "push rsi", "push rdx",
+        "push rcx", "push rbx", "push rax",
+
+        // Args: rdi=error_code, rsi=rip, rdx=cs, rcx=cr2
+        // 15 GPR pushes on stack, then error_code at [rsp + 15*8]
+        "mov rdi, [rsp + 15*8]",  // error_code
+        "mov rsi, [rsp + 16*8]",  // rip
+        "mov rdx, [rsp + 17*8]",  // cs
+        "mov rcx, cr2",           // fault_addr
+        "call {handler}",
+        "test eax, eax",
+        "jnz 2f",
+
+        // Resolved: restore GPRs and return
+        "pop rax",  "pop rbx",  "pop rcx",  "pop rdx",
+        "pop rsi",  "pop rdi",  "pop rbp",
+        "pop r8",   "pop r9",   "pop r10",  "pop r11",
+        "pop r12",  "pop r13",  "pop r14",  "pop r15",
+        "add rsp, 8",  // skip error code
+        "test dword ptr [rsp + 8], 3",
+        "jz 3f",
+        "swapgs",
+        "3:",
+        "iretq",
+
+        // Fatal: fall through to exception_handler
+        "2:",
+        "mov rdi, 14",            // vector
+        "mov rsi, rsp",           // regs (SavedRegs pointer)
+        "mov rdx, [rsp + 15*8]",  // error_code
+        "mov rcx, [rsp + 16*8]",  // rip
+        "mov r8,  [rsp + 17*8]",  // cs
+        "mov r9, cr2",
+        "sub rsp, 8",             // 16-byte align for call
+        "call {exc_handler}",
+        "cli", "hlt",
+        handler = sym page_fault_handler,
+        exc_handler = sym exception_handler,
+    );
+}
 
 /// Double fault handler — runs on IST1 with a dedicated stack.
 /// Minimal: just log and halt. The original stack is unusable.
@@ -451,12 +480,53 @@ extern "C" fn double_fault_handler(regs: *const SavedRegs, rip: u64, cr2: u64) {
     cpu::halt();
 }
 
+// --- Page fault handler (demand paging) ---
+
+/// Returns 0 if the fault was resolved (demand page mapped), nonzero if fatal.
+extern "C" fn page_fault_handler(error_code: u64, _rip: u64, cs: u64, fault_addr: u64) -> u32 {
+    let is_user = cs & RPL_MASK != 0;
+    let not_present = error_code & PF_PRESENT == 0;
+
+    // Only handle not-present faults via demand paging
+    if !not_present {
+        return 1;
+    }
+
+    // User-mode fault: resolve via VMA demand paging
+    if is_user {
+        if process::handle_page_fault(fault_addr, error_code) {
+            return 0;
+        }
+        return 1;
+    }
+
+    // Kernel-mode fault on user address: syscall dereferencing a demand-paged user pointer.
+    // Check if the faulting address is in the current process's VMA list.
+    if percpu::current_pid().is_some() {
+        if process::handle_page_fault(fault_addr, error_code) {
+            return 0;
+        }
+    }
+
+    1 // fatal
+}
+
 // --- Exception handler ---
 
 /// Log an address with symbol resolution (allocation-free).
-fn log_addr(addr: u64, _is_user: bool) {
-    // Use the non-allocating raw resolver. It prints directly via log!.
-    crate::symbols::resolve_kernel(addr);
+fn log_addr(addr: u64, is_user: bool) {
+    if is_user {
+        // Try resolving against the current process's symbols first
+        if let Some(pid) = percpu::current_pid() {
+            if process::resolve_user_symbol(pid, addr) {
+                return;
+            }
+        }
+        // No user symbols available — just print the raw address
+        crate::log!("    {:#x}", addr);
+    } else {
+        crate::symbols::resolve_kernel(addr);
+    }
 }
 
 /// Check if addr is a plausible kernel pointer (in identity-mapped RAM).
@@ -559,28 +629,33 @@ extern "C" fn exception_handler(
 
     // Stack dump — dump raw values from RSP and around RBP
     let dump_rsp = frame.rsp;
-    if dump_rsp % 8 == 0 && dump_rsp > 0 && dump_rsp < 0x1_0000_0000 {
+    let addr_valid = |a: u64| -> bool {
+        a % 8 == 0 && a > 0 && (is_kernel_addr(a) || (is_user && process::is_valid_user_addr(a)))
+    };
+    if addr_valid(dump_rsp) {
         log!("  Stack (from RSP):");
         for i in 0..8u64 {
             let addr = dump_rsp + i * 8;
-            if addr > 0x1_0000_0000 { break; }
+            if !addr_valid(addr) { break; }
             let val = unsafe { *(addr as *const u64) };
             log!("    [{:#x}] = {:#018x}", addr, val);
         }
     }
     // Dump around RBP (caller's frame)
     let dump_rbp = regs.rbp;
-    if dump_rbp % 8 == 0 && dump_rbp > 0 && dump_rbp < 0x1_0000_0000 {
+    if addr_valid(dump_rbp) {
         log!("  Frame (around RBP={:#x}):", dump_rbp);
         for offset in [-0x30i64, -0x28, -0x20, -0x18, -0x10, -0x8, 0, 8, 0x10, 0x18, 0x20, 0x28] {
             let addr = (dump_rbp as i64 + offset) as u64;
-            if addr > 0x1_0000_0000 { continue; }
+            if !addr_valid(addr) { continue; }
             let val = unsafe { *(addr as *const u64) };
             log!("    [RBP{:+}] = {:#018x}", offset, val);
         }
     }
 
     if is_user {
+        let crash_addr = if vector == VECTOR_PAGE_FAULT { fault_addr } else { 0 };
+        process::dump_crash_diagnostics(crash_addr, rip);
         syscall::kill_process(-1);
     } else {
         cpu::halt();

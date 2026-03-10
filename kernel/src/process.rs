@@ -16,6 +16,7 @@ use crate::symbols::ProcessSymbols;
 use crate::{elf, log, pipe, scheduler, shared_memory, vfs};
 
 pub use toyos_abi::Pid;
+use toyos_abi::syscall::SyscallError;
 
 impl crate::id_map::IdKey for Pid {
     const ZERO: Self = Pid(0);
@@ -284,12 +285,56 @@ impl SchedEntry {
 // ProcessData — per-process data behind Arc<Lock<ProcessData>>
 // ---------------------------------------------------------------------------
 
+/// Record of a single demand-paged fault, stored in a ring buffer for crash diagnostics.
+#[derive(Clone, Copy)]
+pub struct PageFaultRecord {
+    pub fault_addr: u64,
+    pub page_elf_offset: u64,
+    pub block_idx: u32,
+    pub reloc_count: u16,
+    pub flags: u16, // bit 0: writable, bit 1: has_relocs, bit 2: anonymous, bit 3: beyond_extent
+}
+
+/// Fixed-size ring buffer of recent page fault events for crash diagnostics.
+pub struct PageFaultTrace {
+    entries: [PageFaultRecord; 32],
+    write_pos: usize,
+    total: u64,
+}
+
+impl PageFaultTrace {
+    pub fn new() -> Self {
+        Self {
+            entries: [PageFaultRecord {
+                fault_addr: 0, page_elf_offset: 0, block_idx: 0,
+                reloc_count: 0, flags: 0,
+            }; 32],
+            write_pos: 0,
+            total: 0,
+        }
+    }
+
+    pub fn push(&mut self, record: PageFaultRecord) {
+        self.entries[self.write_pos] = record;
+        self.write_pos = (self.write_pos + 1) % 32;
+        self.total += 1;
+    }
+
+    /// Iterate entries in chronological order (oldest first).
+    pub fn iter_chronological(&self) -> impl Iterator<Item = &PageFaultRecord> {
+        let count = self.total.min(32) as usize;
+        let start = if self.total >= 32 { self.write_pos } else { 0 };
+        (0..count).map(move |i| &self.entries[(start + i) % 32])
+    }
+
+    pub fn total(&self) -> u64 { self.total }
+}
+
 /// Per-process data independently lockable via `Arc<Lock<ProcessData>>`.
 /// Syscalls clone the Arc from SchedEntry, drop the table lock, then lock this.
 pub struct ProcessData {
     pub pid: Pid,
     pub fds: FdTable,
-    pub user_heap: crate::user_heap::UserHeap,
     pub cwd: String,
     pub messages: MessageQueue,
     pub poll_fds: [u64; 64],
@@ -305,6 +350,8 @@ pub struct ProcessData {
     pub tls_modules: Vec<(u64, usize, usize, usize)>,
     /// Total combined TLS size across all modules.
     pub tls_total_memsz: usize,
+    /// Maximum TLS alignment across all modules.
+    pub tls_max_align: usize,
     // Crash diagnostics
     pub symbols: ProcessSymbols,
     // Dynamically loaded shared libraries (indexed by dlopen handle)
@@ -319,6 +366,17 @@ pub struct ProcessData {
     /// Syscall counts per syscall number (for profiling)
     pub syscall_counts: [u32; 64],
     pub syscall_total: u64,
+    /// Virtual memory areas for demand paging.
+    pub vmas: crate::vma::VmaList,
+    /// Private 4KB physical pages allocated for demand-paged RW/COW pages.
+    /// Freed on process exit.
+    pub demand_pages: Vec<u64>,
+    /// RELATIVE relocation index for demand-paged ELF (applied per-page on fault).
+    pub reloc_index: Option<Arc<elf::RelocationIndex>>,
+    /// Runtime base address for the demand-paged ELF (for relocation computation).
+    pub elf_base: u64,
+    /// Ring buffer of recent page faults for crash diagnostics.
+    pub fault_trace: PageFaultTrace,
 }
 
 pub struct MmapRegion {
@@ -530,25 +588,44 @@ pub fn with_fd_owner_data<R>(f: impl FnOnce(&mut ProcessData) -> R) -> R {
 /// [TLS data (.tdata + .tbss)] [TCB: self-pointer]
 ///                              ^-- FS base (thread pointer)
 /// Returns (alloc, fs_base).
-pub fn setup_tls(tls_template: u64, tls_filesz: usize, tls_memsz: usize) -> Option<(OwnedAlloc, u64)> {
-    setup_combined_tls(&[(tls_template, tls_filesz, tls_memsz, 0)], tls_memsz)
+pub fn setup_tls(tls_template: u64, tls_filesz: usize, tls_memsz: usize, tls_align: usize) -> Option<(OwnedAlloc, u64)> {
+    setup_combined_tls(&[(tls_template, tls_filesz, tls_memsz, 0)], tls_memsz, tls_align)
 }
 
 /// Allocate a combined TLS area for multiple modules (exe + shared libraries).
 /// Each module's template is copied at its base_offset within the block.
-/// Layout: [module0 TLS][module1 TLS]...[moduleN TLS][TCB: self-pointer]
-///                                                    ^-- FS base (thread pointer)
+///
+/// x86-64 TLS Variant II layout:
+///   [alignment padding] [TLS data (.tdata + .tbss)] [TCB (64 bytes)]
+///                                                    ^-- TP (FS base)
+///
+/// The linker (LLD) computes TPOFF = sym_offset - memsz (raw, NOT rounded).
+/// TP must be placed at data_start + memsz to match.
+/// data_start must be aligned to tls_align so variable offsets work correctly.
+///
+/// TCB layout:
+///   TP+0x00: self-pointer
+///   TP+0x08: DTV pointer (unused, zero)
+///   TP+0x10..0x3F: reserved (zero)
+const TCB_SIZE: usize = 64;
+
 pub fn setup_combined_tls(
     modules: &[(u64, usize, usize, usize)], // (template, filesz, memsz, base_offset)
     total_memsz: usize,
+    tls_align: usize,
 ) -> Option<(OwnedAlloc, u64)> {
-    let block_size = total_memsz + 8; // TLS data + self-pointer
-    let alloc_size = paging::align_2m(block_size);
-    let alloc = OwnedAlloc::new(alloc_size, PAGE_2M as usize)?;
+    let block_size = total_memsz + TCB_SIZE;
+    let alloc_size = paging::align_2m(block_size + tls_align);
+    let alloc = OwnedAlloc::new_uninit(alloc_size, PAGE_2M as usize)?;
     let block = alloc.ptr();
 
-    // Place TLS data at the END of the allocation so dlopen can extend downward.
-    let tls_start = alloc_size - block_size;
+    // Place TLS data near the END of the allocation so dlopen can extend downward.
+    // Align tls_start so that data_start (= block + tls_start) has tls_align alignment.
+    let align = if tls_align > 1 { tls_align } else { 8 };
+    let tls_start = (alloc_size - block_size) & !(align - 1);
+
+    // Zero the TLS block area (BSS must be zero).
+    unsafe { core::ptr::write_bytes(block.add(tls_start), 0, block_size); }
 
     for &(template, filesz, _memsz, base_offset) in modules {
         if filesz > 0 && template != 0 {
@@ -662,17 +739,17 @@ pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64, stack_base: u64) -> Op
         let parent = table.get(current_pid()).unwrap();
         (parent.cr3(), parent.heap_owner(), Arc::clone(parent.data()))
     };
-    let (tls_template, tls_filesz, tls_memsz, tls_modules, tls_total_memsz, parent_cwd) = {
+    let (tls_template, tls_filesz, tls_memsz, tls_modules, tls_total_memsz, tls_max_align, parent_cwd) = {
         let data = data_arc.lock();
         (data.tls_template, data.tls_filesz, data.tls_memsz,
-         data.tls_modules.clone(), data.tls_total_memsz, data.cwd.clone())
+         data.tls_modules.clone(), data.tls_total_memsz, data.tls_max_align, data.cwd.clone())
     };
 
     // Phase 2: Allocate TLS (outside any lock — map_user does TLB flush)
     let (tls_alloc, fs_base) = if !tls_modules.is_empty() {
-        setup_combined_tls(&tls_modules, tls_total_memsz)?
+        setup_combined_tls(&tls_modules, tls_total_memsz, tls_max_align)?
     } else {
-        setup_tls(tls_template, tls_filesz, tls_memsz)?
+        setup_tls(tls_template, tls_filesz, tls_memsz, tls_max_align)?
     };
     paging::map_user(tls_alloc.ptr() as u64, tls_alloc.size() as u64);
 
@@ -688,7 +765,6 @@ pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64, stack_base: u64) -> Op
     let thread_data = Arc::new(Lock::new(ProcessData {
         pid: Pid::from_raw(0),
         fds: FdTable::new(),
-        user_heap: crate::user_heap::UserHeap::new(), // unused — routes through heap_owner
         messages: MessageQueue::new(),
         poll_fds: [0; 64],
         poll_len: 0,
@@ -701,6 +777,7 @@ pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64, stack_base: u64) -> Op
         tls_alloc: Some(tls_alloc),
         tls_modules,
         tls_total_memsz,
+        tls_max_align,
         symbols: ProcessSymbols::empty(),
         loaded_libs: Vec::new(),
         mmap_regions: Vec::new(),
@@ -709,6 +786,11 @@ pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64, stack_base: u64) -> Op
         env: Vec::new(),
         syscall_counts: [0; 64],
         syscall_total: 0,
+        vmas: crate::vma::VmaList::new(),
+        demand_pages: Vec::new(),
+        reloc_index: None,
+        elf_base: 0,
+        fault_trace: PageFaultTrace::new(),
     }));
 
     let mut guard = PROCESS_TABLE.lock();
@@ -748,59 +830,391 @@ pub fn build_child_fds(pairs: &[[u32; 2]]) -> FdTable {
     fds
 }
 
-/// Spawn a new process from an ELF binary.
-pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> Option<Pid> {
+/// User virtual address space starts at 1TB — well above any identity-mapped physical RAM.
+const USER_VM_BASE: u64 = 0x100_0000_0000;
+
+/// Convert an ELF virtual address to a file offset by searching PT_LOAD segments.
+/// Falls back to extrapolating from the nearest segment for vaddrs outside all segments
+/// (e.g. `.rela.dyn` sections the linker places outside PT_LOAD).
+fn vaddr_to_file_offset(segments: &[elf::ElfSegment], vaddr: u64) -> u64 {
+    for seg in segments {
+        if vaddr >= seg.vaddr && vaddr < seg.vaddr + seg.filesz {
+            return seg.file_offset + (vaddr - seg.vaddr);
+        }
+    }
+    // Extrapolate from the nearest segment below this vaddr.
+    // Works for PIE binaries where file_offset == vaddr (common pattern).
+    let mut best: Option<&elf::ElfSegment> = None;
+    for seg in segments {
+        if seg.vaddr <= vaddr {
+            if best.map_or(true, |b| seg.vaddr > b.vaddr) {
+                best = Some(seg);
+            }
+        }
+    }
+    match best {
+        Some(seg) => seg.file_offset + (vaddr - seg.vaddr),
+        None => panic!("vaddr_to_file_offset: {:#x} not in or near any PT_LOAD segment", vaddr),
+    }
+}
+
+/// Read a byte range from a file using its block map via the page cache.
+pub(crate) fn read_file_range(block_map: &[u64], offset: u64, len: usize) -> Vec<u8> {
+    let mut result = Vec::with_capacity(len);
+    let mut remaining = len;
+    let mut file_off = offset;
+
+    while remaining > 0 {
+        let block_idx = (file_off / 4096) as usize;
+        let off_in_block = (file_off % 4096) as usize;
+        let chunk = (4096 - off_in_block).min(remaining);
+
+        if block_idx < block_map.len() {
+            let mut cache_guard = crate::page_cache::lock();
+            let (cache, dev) = cache_guard.cache_and_dev();
+            let page = cache.read(dev, block_map[block_idx]);
+            result.extend_from_slice(&page[off_in_block..off_in_block + chunk]);
+        } else {
+            // Beyond file: zero fill
+            result.resize(result.len() + chunk, 0);
+        }
+
+        file_off += chunk as u64;
+        remaining -= chunk;
+    }
+
+    result
+}
+
+/// Resolve a single exe TPOFF relocation entry to a pre-computed i64 value.
+/// Handles both r_sym == 0 (simple offset) and r_sym != 0 (cross-library lookup).
+fn resolve_exe_tpoff(
+    r_sym: u32,
+    r_addend: i64,
+    exe_base_offset: usize,
+    total_memsz: usize,
+    segments: &[elf::ElfSegment],
+    symtab_vaddr: u64,
+    block_map: &[u64],
+    dynstr_data: &[u8],
+    tls_info: &elf::TlsModuleInfo,
+) -> i64 {
+    if r_sym == 0 {
+        return exe_base_offset as i64 + r_addend - total_memsz as i64;
+    }
+
+    // Read the dynsym entry for r_sym from block map
+    let symtab_file_off = vaddr_to_file_offset(segments, symtab_vaddr);
+    let sym_off = r_sym as usize * 24;
+    let sym_entry = read_file_range(block_map, symtab_file_off + sym_off as u64, 24);
+    if sym_entry.len() < 24 {
+        return exe_base_offset as i64 + r_addend - total_memsz as i64;
+    }
+
+    let st_shndx = u16::from_le_bytes(sym_entry[6..8].try_into().unwrap());
+    let st_value = u64::from_le_bytes(sym_entry[8..16].try_into().unwrap());
+
+    if st_shndx != 0 {
+        // Locally defined TLS symbol
+        exe_base_offset as i64 + st_value as i64 + r_addend - total_memsz as i64
+    } else {
+        // Cross-library TLS symbol — look up by name
+        let st_name = u32::from_le_bytes(sym_entry[0..4].try_into().unwrap()) as usize;
+        if st_name >= dynstr_data.len() {
+            log!("tpoff: st_name {} out of bounds", st_name);
+            return 0;
+        }
+        let name_end = dynstr_data[st_name..].iter().position(|&b| b == 0)
+            .unwrap_or(dynstr_data.len() - st_name);
+        let sym_name = core::str::from_utf8(&dynstr_data[st_name..st_name + name_end]).unwrap_or("");
+
+        // Search loaded libraries for the defining TLS symbol
+        for lib in tls_info.libs {
+            if lib.tls_memsz == 0 { continue; }
+            if let Some(sym_tls_offset) = elf::tls_dlsym_pub(lib, sym_name) {
+                let other_base_offset = tls_info.modules.iter()
+                    .find(|&&(template, _, _, _)| template == lib.tls_template)
+                    .map(|&(_, _, _, bo)| bo)
+                    .unwrap_or(0);
+                return other_base_offset as i64 + sym_tls_offset as i64 - total_memsz as i64;
+            }
+        }
+        log!("tpoff: unresolved exe TLS symbol: {}", sym_name);
+        0
+    }
+}
+
+/// Spawn a new process from an ELF binary using demand paging.
+/// Only reads ELF headers and metadata from disk — PT_LOAD segments are faulted in on access.
+pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> Result<Pid, SyscallError> {
     let path = argv[0];
     let t0 = crate::clock::nanos_since_boot();
 
-    let binary = match vfs::lock().read_file(path) {
-        Ok(data) => data,
-        Err(e) => {
-            log!("{}: {}", path, e);
-            return None;
+    // 1. Get block map from VFS (follows symlinks, traverses inode structure, no data read)
+    let block_map = match vfs::lock().file_block_map(path) {
+        Some(bm) if !bm.is_empty() => bm,
+        Some(_) => {
+            log!("spawn: {}: empty block map", path);
+            return Err(SyscallError::NotFound);
+        }
+        None => {
+            log!("spawn: {}: not found or filesystem does not support block maps", path);
+            return Err(SyscallError::NotFound);
         }
     };
-    let t1 = crate::clock::nanos_since_boot();
+    let block_map = Arc::new(block_map);
 
-    let (elf_alloc, loaded) = match elf::load(&binary) {
+    // 3. Read first few blocks for ELF headers (typically 1-2 blocks suffice)
+    let header_size = 4096.min(block_map.len() * 4096); // at least first block
+    let header_data = read_file_range(&block_map, 0, header_size);
+
+    // 3. Parse ELF layout from headers
+    let layout = match elf::parse_layout(&header_data) {
         Ok(l) => l,
         Err(msg) => {
-            log!("{}", msg);
-            return None;
+            log!("spawn: {}: {}", path, msg);
+            return Err(SyscallError::InvalidArgument);
         }
     };
+
+    // 3b. Parse PT_DYNAMIC from block map (not available in the header buffer)
+    let dyn_info = if let Some((dyn_off, dyn_size)) = layout.dynamic {
+        let dyn_data = read_file_range(&block_map, dyn_off, dyn_size as usize);
+        elf::parse_dynamic(&dyn_data)
+    } else {
+        elf::DynamicInfo::empty()
+    };
+
+    let t1 = crate::clock::nanos_since_boot();
+
+    // 4. Choose base address in user virtual space
+    let base = USER_VM_BASE - layout.vaddr_min;
+
+    // 5. Create VMAs for each PT_LOAD segment
+    let mut vmas = crate::vma::VmaList::new();
+    for seg in &layout.segments {
+        let seg_start = (base + seg.vaddr) & !0xFFF;
+        let seg_end = (base + seg.vaddr + seg.memsz + 0xFFF) & !0xFFF;
+
+        // File-backed portion: compute which file blocks back this segment
+        let file_block_start = seg.file_offset / 4096;
+        let file_blocks_needed = ((seg.filesz + (seg.file_offset % 4096) + 4095) / 4096) as usize;
+        let file_backed_end = seg_start + file_blocks_needed as u64 * 4096;
+
+        if file_blocks_needed > 0 && file_backed_end > seg_start {
+            // File-backed region
+            vmas.insert(crate::vma::Vma {
+                start: seg_start,
+                end: file_backed_end.min(seg_end),
+                writable: seg.writable,
+                kind: crate::vma::VmaKind::FileBacked {
+                    block_map: Arc::clone(&block_map),
+                    file_offset: file_block_start * 4096,
+                    file_size: seg.filesz + (seg.file_offset % 4096),
+                },
+            });
+        }
+
+        if file_backed_end < seg_end {
+            // BSS / anonymous portion (memsz > filesz)
+            vmas.insert(crate::vma::Vma {
+                start: file_backed_end.max(seg_start),
+                end: seg_end,
+                writable: seg.writable,
+                kind: crate::vma::VmaKind::Anonymous,
+            });
+        }
+    }
+
+    // 6. Read and parse relocation tables from block map
+    let rela_data = if dyn_info.rela_size > 0 {
+        let rela_file_off = vaddr_to_file_offset(&layout.segments, dyn_info.rela_vaddr);
+        read_file_range(&block_map, rela_file_off, dyn_info.rela_size as usize)
+    } else if layout.dynamic.is_none() {
+        // No PT_DYNAMIC — fall back to finding .rela.dyn from section headers
+        if let Some((shoff, shnum, shentsize)) = layout.section_headers {
+            let shdr_data = read_file_range(&block_map, shoff, shnum as usize * shentsize as usize);
+            let bm = &block_map;
+            if let Some((rela_off, rela_size)) = elf::find_rela_dyn_from_sections(
+                &shdr_data, shentsize, &|off, len| read_file_range(bm, off, len),
+            ) {
+                read_file_range(&block_map, rela_off, rela_size as usize)
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
+    let jmprel_data = if dyn_info.jmprel_size > 0 {
+        let jmprel_file_off = vaddr_to_file_offset(&layout.segments, dyn_info.jmprel_vaddr);
+        read_file_range(&block_map, jmprel_file_off, dyn_info.jmprel_size as usize)
+    } else {
+        Vec::new()
+    };
+    let parsed_relas = elf::parse_rela_entries(&rela_data, &jmprel_data);
+
+    // Start building the relocation index with RELATIVE entries (pre-computed: base + addend)
+    let mut reloc_index = elf::RelocationIndex::new();
+    for &(r_offset, r_addend) in &parsed_relas.relative {
+        reloc_index.add_u64(r_offset, (base as i64 + r_addend) as u64);
+    }
+
     let t2 = crate::clock::nanos_since_boot();
 
-    // Load DT_NEEDED shared libraries and apply GLOB_DAT relocations
-    let loaded_libs = match elf::resolve_dynamic_deps(&binary, loaded.base, path, |lib_path| {
-        vfs::lock().read_file(lib_path)
-    }) {
-        Ok(libs) => libs,
-        Err(msg) => {
-            log!("{}: {}", path, msg);
-            return None;
+    // 7. Load shared libraries from block map (no full binary read)
+    // Read DT_STRTAB from block map to get library names
+    let loaded_libs = if !dyn_info.needed_strtab_offsets.is_empty() && dyn_info.strsz > 0 {
+        let strtab_file_off = vaddr_to_file_offset(&layout.segments, dyn_info.strtab_vaddr);
+        let strtab_data = read_file_range(&block_map, strtab_file_off, dyn_info.strsz as usize);
+
+        let exe_dir = path.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
+        let mut libs = Vec::new();
+
+        for &name_offset in &dyn_info.needed_strtab_offsets {
+            let name_off = name_offset as usize;
+            if name_off >= strtab_data.len() { continue; }
+            let name_end = strtab_data[name_off..].iter().position(|&b| b == 0)
+                .unwrap_or(strtab_data.len() - name_off);
+            let lib_name = core::str::from_utf8(&strtab_data[name_off..name_off + name_end]).unwrap_or("");
+            if lib_name.is_empty() { continue; }
+
+            let lib_path = alloc::format!("{}/{}", exe_dir, lib_name);
+            let t_load0 = crate::clock::nanos_since_boot();
+
+            // Check the shared library cache first
+            if let Some(lib) = elf::try_clone_cached(&lib_path) {
+                libs.push(lib);
+                continue;
+            }
+
+            let so_data = {
+                let result = vfs::lock().read_file(&lib_path);
+                match result {
+                    Ok(d) => d,
+                    Err(_) => {
+                        let fallback = alloc::format!("/lib/{}", lib_name);
+                        match vfs::lock().read_file(&fallback) {
+                            Ok(d) => d,
+                            Err(e) => {
+                                log!("spawn: {}: failed to load {}: {}", path, lib_name, e);
+                                return Err(SyscallError::NotFound);
+                            }
+                        }
+                    }
+                }
+            };
+            let t_load1 = crate::clock::nanos_since_boot();
+
+            match elf::load_shared_lib(&so_data) {
+                Ok((lib, rw_vaddr, rw_end_vaddr)) => {
+                    let t_load2 = crate::clock::nanos_since_boot();
+                    log!("dynamic: loaded {} ({} syms, read={}ms load={}ms)",
+                        lib_name, lib.sym_count,
+                        (t_load1 - t_load0) / 1_000_000, (t_load2 - t_load1) / 1_000_000);
+                    let lib = elf::cache_loaded_lib_pub(&lib_path, lib, rw_vaddr, rw_end_vaddr);
+                    libs.push(lib);
+                }
+                Err(e) => {
+                    log!("spawn: {}: failed to load {}: {}", path, lib_name, e);
+                    return Err(SyscallError::NotFound);
+                }
+            }
         }
+
+        // 7b. Read exe .dynsym/.dynstr from block map for exe sym map
+        if !libs.is_empty() {
+            let dynstr_file_off = vaddr_to_file_offset(&layout.segments, dyn_info.strtab_vaddr);
+            let dynstr_data = read_file_range(&block_map, dynstr_file_off, dyn_info.strsz as usize);
+
+            // Determine .dynsym entry count via GNU hash table or SYMTAB/STRTAB gap
+            let sym_count = if dyn_info.gnu_hash_vaddr != 0 {
+                let gnu_hash_file_off = vaddr_to_file_offset(&layout.segments, dyn_info.gnu_hash_vaddr);
+                // Read enough for the hash table (header + bloom + buckets + chains)
+                // Start with a generous read; typical .dynsym for executables is small
+                let gnu_hash_data = read_file_range(&block_map, gnu_hash_file_off,
+                    64 * 1024); // 64KB should cover most exe gnu_hash tables
+                elf::gnu_hash_sym_count_from_data(&gnu_hash_data)
+            } else if dyn_info.symtab_vaddr != 0 && dyn_info.strtab_vaddr > dyn_info.symtab_vaddr {
+                // No GNU hash: infer from SYMTAB-to-STRTAB gap (24 bytes per entry)
+                ((dyn_info.strtab_vaddr - dyn_info.symtab_vaddr) / 24) as usize
+            } else {
+                0
+            };
+
+            let mut exe_sym_map = if sym_count > 0 {
+                let symtab_file_off = vaddr_to_file_offset(&layout.segments, dyn_info.symtab_vaddr);
+                let dynsym_data = read_file_range(&block_map, symtab_file_off, sym_count * 24);
+                elf::build_exe_sym_map(&dynsym_data, &dynstr_data, sym_count, base)
+            } else {
+                hashbrown::HashMap::new()
+            };
+
+            // If .dynsym has no defined symbols, fall back to .symtab from section headers.
+            // This handles PIE executables that don't export symbols via --export-dynamic.
+            if exe_sym_map.is_empty() {
+                if let Some((shoff, shnum, shentsize)) = layout.section_headers {
+                    let shdr_data = read_file_range(&block_map, shoff, shnum as usize * shentsize as usize);
+                    if let Some(m) = elf::build_symtab_map(&shdr_data, shentsize, &block_map, base) {
+                        exe_sym_map = m;
+                    }
+                }
+            }
+
+            let t_syms = crate::clock::nanos_since_boot();
+            log!("dynamic: {} exe syms hashed from block map in {}ms",
+                exe_sym_map.len(), (t_syms - t2) / 1_000_000);
+
+            // Resolve lib bind relocs against exe symbols
+            for lib in &libs {
+                elf::resolve_lib_bind_relocs_pub(lib, &exe_sym_map, &libs);
+            }
+
+            // 7c. Resolve exe GLOB_DAT entries against loaded libs → add to reloc index
+            for &(r_offset, r_sym, _r_addend) in &parsed_relas.glob_dat {
+                if r_sym == 0 { continue; }
+                // Look up the symbol name from exe .dynsym/.dynstr
+                let sym_off = r_sym as usize * 24;
+                let symtab_file_off = vaddr_to_file_offset(&layout.segments, dyn_info.symtab_vaddr);
+                let sym_entry = read_file_range(&block_map, symtab_file_off + sym_off as u64, 24);
+                if sym_entry.len() < 24 { continue; }
+                let st_name = u32::from_le_bytes(sym_entry[0..4].try_into().unwrap()) as usize;
+                if st_name >= dynstr_data.len() { continue; }
+                let name_end = dynstr_data[st_name..].iter().position(|&b| b == 0)
+                    .unwrap_or(dynstr_data.len() - st_name);
+                let sym_name = core::str::from_utf8(&dynstr_data[st_name..st_name + name_end]).unwrap_or("");
+                let resolved = libs.iter().find_map(|lib| elf::gnu_dlsym_pub(lib, sym_name));
+                match resolved {
+                    Some(addr) => reloc_index.add_u64(r_offset, addr),
+                    None => log!("dynamic: unresolved exe symbol: {}", sym_name),
+                }
+            }
+        }
+
+        libs
+    } else {
+        Vec::new()
     };
 
     let t_deps = crate::clock::nanos_since_boot();
 
+    // 8. Create user PML4 — no pages mapped for ELF segments (all demand-faulted)
     let child_pml4 = paging::create_user_pml4();
     let child_cr3 = Some(PageTableRoot::new(child_pml4));
 
-    paging::map_user_in(child_pml4, elf_alloc.ptr() as u64, elf_alloc.size() as u64);
-
+    // Map shared libraries (still identity-mapped, eager)
     for lib in &loaded_libs {
         match &lib.memory {
             elf::LibMemory::Owned(alloc) => {
                 paging::map_user_in(child_pml4, alloc.ptr() as u64, alloc.size() as u64);
             }
-            elf::LibMemory::Shared { rw_alloc, shared_addr, shared_size, total_cached_size, .. } => {
-                // Map entire cached range as user-readable (code + rodata)
-                paging::map_user_readonly_in(child_pml4, *shared_addr, *total_cached_size as u64);
-                // Remap private RW pages over the shared range
-                let num_rw_pages = paging::align_2m(rw_alloc.size()) / paging::PAGE_2M as usize;
+            elf::LibMemory::Shared { rw_alloc, cached_addr, cached_size, rw_offset, .. } => {
+                paging::map_user_readonly_in(child_pml4, *cached_addr, *cached_size as u64);
+                let num_rw_pages = rw_alloc.size() / paging::PAGE_2M as usize;
                 for i in 0..num_rw_pages {
-                    let virt = *shared_addr + *shared_size as u64 + i as u64 * paging::PAGE_2M;
+                    let virt = *cached_addr + *rw_offset as u64 + i as u64 * paging::PAGE_2M;
                     let phys = rw_alloc.ptr() as u64 + i as u64 * paging::PAGE_2M;
                     paging::remap_user_2m_in(child_pml4, virt, phys);
                 }
@@ -808,20 +1222,23 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
         }
     }
 
+    // 9. Stack (eager, identity-mapped)
     let stack_alloc = match OwnedAlloc::new(USER_STACK_SIZE, PAGE_2M as usize) {
         Some(a) => a,
         None => {
+            log!("spawn: {}: failed to allocate user stack ({} bytes)", path, USER_STACK_SIZE);
             paging::free_user_page_tables(child_pml4);
-            return None;
+            return Err(SyscallError::ResourceExhausted);
         }
     };
     let stack_base = stack_alloc.ptr() as u64;
     let stack_top = stack_base + USER_STACK_SIZE as u64;
     paging::map_user_in(child_pml4, stack_base, USER_STACK_SIZE as u64);
 
-    // Build combined TLS layout: libraries first, exe last (right before TP).
+    // 10. TLS setup
     let mut tls_modules: Vec<(u64, usize, usize, usize)> = Vec::new();
     let mut tls_cursor = 0usize;
+    let mut max_tls_align = 1usize;
 
     for lib in &loaded_libs {
         if lib.tls_memsz > 0 {
@@ -830,18 +1247,45 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
             }
             tls_modules.push((lib.tls_template, lib.tls_filesz, lib.tls_memsz, tls_cursor));
             tls_cursor += lib.tls_memsz;
+            if lib.tls_align > max_tls_align { max_tls_align = lib.tls_align; }
         }
     }
-    if loaded.tls_memsz > 0 {
+
+    // For exe TLS with demand paging: read TLS template data from page cache
+    let exe_tls_template = if layout.tls_memsz > 0 {
+        let tls_file_off = vaddr_to_file_offset(&layout.segments, layout.tls_vaddr);
+        let tls_data = read_file_range(&block_map, tls_file_off, layout.tls_filesz);
+        // Allocate a persistent buffer for the TLS template
+        let tls_buf = OwnedAlloc::new(layout.tls_memsz, 16).expect("TLS template alloc");
+        unsafe {
+            core::ptr::copy_nonoverlapping(tls_data.as_ptr(), tls_buf.ptr(), layout.tls_filesz);
+            // Zero BSS portion
+            if layout.tls_memsz > layout.tls_filesz {
+                core::ptr::write_bytes(
+                    tls_buf.ptr().add(layout.tls_filesz), 0,
+                    layout.tls_memsz - layout.tls_filesz);
+            }
+        }
+        Some(tls_buf)
+    } else {
+        None
+    };
+
+    if layout.tls_memsz > 0 {
         if tls_cursor > 0 {
             tls_cursor = (tls_cursor + 15) & !15;
         }
-        let exe_base_offset = tls_cursor;
-        tls_modules.push((loaded.tls_template, loaded.tls_filesz, loaded.tls_memsz, exe_base_offset));
-        tls_cursor += loaded.tls_memsz;
+        let template_addr = exe_tls_template.as_ref().unwrap().ptr() as u64;
+        tls_modules.push((template_addr, layout.tls_filesz, layout.tls_memsz, tls_cursor));
+        tls_cursor += layout.tls_memsz;
+        if layout.tls_align > max_tls_align { max_tls_align = layout.tls_align; }
     }
+    // x86-64 TLS Variant II: the linker (LLD) computes TPOFF = sym_offset - memsz,
+    // using the RAW memsz (not rounded up to alignment). TP must be placed at
+    // data_start + memsz to match. Alignment of data_start is handled in setup_combined_tls.
     let tls_total_memsz = tls_cursor;
 
+    // Apply TPOFF relocations for shared libraries
     let tls_info = elf::TlsModuleInfo { libs: &loaded_libs, modules: &tls_modules };
     for lib in &loaded_libs {
         let lib_base_offset = tls_modules.iter()
@@ -850,13 +1294,47 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
             .unwrap_or(0);
         elf::apply_tpoff_relocs(lib, lib_base_offset, tls_total_memsz, &tls_info);
     }
+    // Resolve exe TPOFF relocations → add pre-computed values to reloc index
     {
         let exe_base_offset = tls_modules.iter()
-            .find(|&&(template, _, _, _)| template == loaded.tls_template)
-            .map(|&(_, _, _, base_offset)| base_offset)
+            .find(|&&(template, _, _, _)| {
+                exe_tls_template.as_ref().map_or(false, |buf| template == buf.ptr() as u64)
+            })
+            .map(|&(_, _, _, bo)| bo)
             .unwrap_or(0);
-        elf::apply_exe_tpoff_relocs(&binary, loaded.base, exe_base_offset, tls_total_memsz, &tls_info);
+
+        // Read exe .dynsym/.dynstr for resolving named TPOFF symbols
+        let dynstr_data = if dyn_info.strsz > 0 {
+            let dynstr_file_off = vaddr_to_file_offset(&layout.segments, dyn_info.strtab_vaddr);
+            read_file_range(&block_map, dynstr_file_off, dyn_info.strsz as usize)
+        } else {
+            Vec::new()
+        };
+
+        for &(r_offset, r_sym, r_addend) in &parsed_relas.tpoff64 {
+            let tpoff = resolve_exe_tpoff(
+                r_sym, r_addend, exe_base_offset, tls_total_memsz,
+                &layout.segments, dyn_info.symtab_vaddr, &block_map, &dynstr_data, &tls_info,
+            );
+            reloc_index.add_u64(r_offset, tpoff as u64);
+        }
+        for &(r_offset, r_sym, r_addend) in &parsed_relas.tpoff32 {
+            let tpoff = resolve_exe_tpoff(
+                r_sym, r_addend, exe_base_offset, tls_total_memsz,
+                &layout.segments, dyn_info.symtab_vaddr, &block_map, &dynstr_data, &tls_info,
+            );
+            reloc_index.add_i32(r_offset, tpoff as i32);
+        }
     }
+
+    // Finalize reloc index (sort all entries)
+    reloc_index.finalize();
+    let reloc_index = if reloc_index.len() > 0 {
+        log!("ELF: {} relocations indexed (RELATIVE + GLOB_DAT + TPOFF)", reloc_index.len());
+        Some(Arc::new(reloc_index))
+    } else {
+        None
+    };
 
     let (tls_template, tls_filesz, tls_memsz) = if !tls_modules.is_empty() {
         (tls_modules[0].0, tls_modules[0].1, tls_modules[0].2)
@@ -866,41 +1344,56 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
 
     log!("spawn: TLS {} modules, total_memsz={}", tls_modules.len(), tls_total_memsz);
     let (tls_alloc, fs_base) = if tls_total_memsz > 0 {
-        setup_combined_tls(&tls_modules, tls_total_memsz)?
+        match setup_combined_tls(&tls_modules, tls_total_memsz, max_tls_align) {
+            Some(v) => v,
+            None => {
+                log!("spawn: {}: failed to allocate TLS ({} bytes)", path, tls_total_memsz);
+                paging::free_user_page_tables(child_pml4);
+                return Err(SyscallError::ResourceExhausted);
+            }
+        }
     } else {
-        setup_tls(0, 0, 0)?
+        match setup_tls(0, 0, 0, 1) {
+            Some(v) => v,
+            None => {
+                log!("spawn: {}: failed to allocate TLS (empty)", path);
+                paging::free_user_page_tables(child_pml4);
+                return Err(SyscallError::ResourceExhausted);
+            }
+        }
     };
     paging::map_user_in(child_pml4, tls_alloc.ptr() as u64, tls_alloc.size() as u64);
 
+    let entry = base + layout.entry_vaddr;
     let sp = write_argv_to_stack(stack_top, argv);
 
     let t_tls = crate::clock::nanos_since_boot();
-    // Skip full symbol parsing for large binaries (>5MB) — too slow for debug info
-    let syms = if binary.len() > 5 * 1024 * 1024 {
-        ProcessSymbols::empty_with_bounds(
-            elf_alloc.ptr() as u64, elf_alloc.ptr() as u64 + elf_alloc.size() as u64,
+
+    // Store info for lazy symbol loading (deferred until a crash backtrace)
+    let syms = if let Some((sh_off, sh_num, sh_entsize)) = layout.section_headers {
+        ProcessSymbols::lazy(
+            Arc::clone(&block_map),
+            sh_off, sh_num as usize, sh_entsize as usize,
+            base,
+            base + layout.vaddr_min, base + layout.vaddr_max,
             stack_base, stack_top,
         )
     } else {
-        ProcessSymbols::parse(
-            &binary, loaded.base,
-            elf_alloc.ptr() as u64, elf_alloc.ptr() as u64 + elf_alloc.size() as u64,
+        ProcessSymbols::empty_with_bounds(
+            base + layout.vaddr_min, base + layout.vaddr_max,
             stack_base, stack_top,
         )
     };
-    let t_syms = crate::clock::nanos_since_boot();
 
-    let (ks_alloc, ks_rsp) = match alloc_kernel_stack(process_start, loaded.entry, sp, 0) {
+    let (ks_alloc, ks_rsp) = match alloc_kernel_stack(process_start, entry, sp, 0) {
         Some(ks) => ks,
         None => {
+            log!("spawn: {}: failed to allocate kernel stack", path);
             paging::free_user_page_tables(child_pml4);
-            return None;
+            return Err(SyscallError::ResourceExhausted);
         }
     };
 
-    let ks_base = ks_alloc.ptr() as u64;
-
-    // Get parent's cwd (brief table lock + ProcessData lock, before insertion)
     let cwd = match parent {
         Some(ppid) => {
             let arc = {
@@ -908,23 +1401,22 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
                 let table = guard.as_ref().unwrap();
                 Arc::clone(table.get(ppid).unwrap().data())
             };
-            let guard = arc.lock();
-            guard.cwd.clone()
+            let cwd = arc.lock().cwd.clone();
+            cwd
         }
         None => String::from("/"),
     };
 
-    let memory_size = (elf_alloc.size() + USER_STACK_SIZE) as u64;
+    let memory_size = USER_STACK_SIZE as u64;
 
     let proc_data = Arc::new(Lock::new(ProcessData {
         pid: Pid::from_raw(0),
         fds,
-        user_heap: crate::user_heap::UserHeap::new(),
         cwd,
         messages: MessageQueue::new(),
         poll_fds: [0; 64],
         poll_len: 0,
-        elf_alloc: Some(elf_alloc),
+        elf_alloc: exe_tls_template, // TLS template allocation (if any)
         stack_alloc: Some(stack_alloc),
         tls_template,
         tls_filesz,
@@ -932,6 +1424,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
         tls_alloc: Some(tls_alloc),
         tls_modules,
         tls_total_memsz,
+        tls_max_align: max_tls_align,
         symbols: syms,
         loaded_libs,
         mmap_regions: Vec::new(),
@@ -940,6 +1433,11 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
         env,
         syscall_counts: [0; 64],
         syscall_total: 0,
+        vmas,
+        demand_pages: Vec::new(),
+        reloc_index,
+        elf_base: base,
+        fault_trace: PageFaultTrace::new(),
     }));
 
     let mut guard = PROCESS_TABLE.lock();
@@ -955,14 +1453,12 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
     });
 
     let t3 = crate::clock::nanos_since_boot();
-    log!("spawn: {} pid={} base={:#x} entry={:#x} cr3={:#x} ks={:#x}..{:#x} (read={}ms elf={}ms deps={}ms tls={}ms syms={}ms rest={}ms)",
-        path, pid, loaded.base as u64, loaded.entry, child_cr3.unwrap().as_u64(),
-        ks_base, ks_base + KERNEL_STACK_SIZE as u64,
+    log!("spawn: {} pid={} base={:#x} entry={:#x} cr3={:#x} (layout={}ms relocs={}ms deps={}ms tls={}ms total={}ms)",
+        path, pid, base, entry, child_cr3.unwrap().as_u64(),
         (t1 - t0) / 1_000_000, (t2 - t1) / 1_000_000, (t_deps - t2) / 1_000_000,
-        (t_tls - t_deps) / 1_000_000, (t_syms - t_tls) / 1_000_000,
-        (t3 - t_syms) / 1_000_000);
+        (t_tls - t_deps) / 1_000_000, (t3 - t0) / 1_000_000);
 
-    Some(pid)
+    Ok(pid)
 }
 
 /// Spawn a process from kernel context (during boot). Resolves bare names
@@ -1005,7 +1501,14 @@ fn teardown_resources(data_arc: &Arc<Lock<ProcessData>>, pid: Pid) {
     data.stack_alloc.take();
     data.loaded_libs.clear();
     data.mmap_regions.clear();
-    data.user_heap = crate::user_heap::UserHeap::new();
+
+    // Free private demand-paged 4KB pages (RW/COW copies).
+    // RO pages mapped from the page cache are NOT freed — the page cache owns them.
+    for phys in data.demand_pages.drain(..) {
+        free_4k(phys);
+    }
+    data.vmas.clear();
+    data.reloc_index = None;
 }
 
 /// Phase 2 of teardown: zombie threads, free page tables, set zombie state.
@@ -1348,6 +1851,282 @@ pub fn find_pid(name: &str) -> Option<Pid> {
 }
 
 // ---------------------------------------------------------------------------
+// Demand paging
+// ---------------------------------------------------------------------------
+
+/// Handle a page fault at `fault_addr` by looking up the current process's VMAs.
+/// Returns true if the fault was resolved (a page was mapped), false if fatal.
+pub fn handle_page_fault(fault_addr: u64, _error_code: u64) -> bool {
+    let pid = current_pid();
+    if pid == Pid::MAX { return false; }
+    // Get the process's data Arc, CR3, and for threads the parent's data Arc.
+    // Threads share the parent's address space (VMAs, relocations) but have their own ProcessData.
+    let (data_arc, pml4) = {
+        let guard = PROCESS_TABLE.lock();
+        let Some(table) = guard.as_ref() else { return false };
+        let Some(entry) = table.get(pid) else { return false };
+        let Some(cr3) = entry.cr3() else { return false };
+        // For threads, use the parent's data (which has the VMAs and relocation index)
+        let data = match entry.kind() {
+            Kind::Thread { parent } => {
+                match table.get(*parent) {
+                    Some(parent_entry) => Arc::clone(parent_entry.data()),
+                    None => return false,
+                }
+            }
+            _ => Arc::clone(entry.data()),
+        };
+        (data, cr3.as_ptr())
+    };
+
+    let mut data = data_arc.lock();
+
+    // Extract VMA info before borrowing other fields
+    let (vma_start, vma_writable, vma_kind_info) = {
+        let vma = match data.vmas.find(fault_addr) {
+            Some(v) => v,
+            None => return false,
+        };
+        let kind_info = match &vma.kind {
+            crate::vma::VmaKind::Anonymous => None,
+            crate::vma::VmaKind::FileBacked { block_map, file_offset, file_size } => {
+                Some((Arc::clone(block_map), *file_offset, *file_size))
+            }
+        };
+        (vma.start, vma.writable, kind_info)
+    };
+
+    let page_vaddr = fault_addr & !0xFFF;
+    let reloc_index = data.reloc_index.clone();
+    let elf_base = data.elf_base;
+
+    match vma_kind_info {
+        None => {
+            // Anonymous: zeroed page
+            let phys = alloc_4k_zeroed();
+            paging::map_4k_in(pml4, page_vaddr, phys, vma_writable);
+            cpu::invlpg(page_vaddr);
+            data.fault_trace.push(PageFaultRecord {
+                fault_addr, page_elf_offset: page_vaddr.wrapping_sub(elf_base),
+                block_idx: 0, reloc_count: 0,
+                flags: (vma_writable as u16) | 0x4, // bit 2 = anonymous
+            });
+            data.demand_pages.push(phys);
+        }
+        Some((block_map, file_offset, file_size)) => {
+            let byte_offset = (page_vaddr - vma_start) + file_offset;
+            let block_idx = (byte_offset / 4096) as usize;
+
+            // How many valid file bytes are in this page?
+            // vma_offset = page_vaddr - vma_start (byte offset of this page within VMA)
+            let vma_offset = page_vaddr - vma_start;
+            let valid_in_page = if vma_offset + 4096 <= file_size {
+                4096usize // entirely within file data
+            } else if vma_offset < file_size {
+                (file_size - vma_offset) as usize // partial page
+            } else {
+                0 // entirely beyond file data (BSS)
+            };
+
+            if block_idx < block_map.len() {
+                let disk_block = block_map[block_idx];
+                let mut cache_guard = crate::page_cache::lock();
+                let (cache, dev) = cache_guard.cache_and_dev();
+                let cache_phys = cache.ensure_cached(dev, disk_block);
+
+                let page_elf_offset = page_vaddr.wrapping_sub(elf_base);
+                let has_relocs = reloc_index.as_ref()
+                    .map_or(false, |ri| ri.has_relocs_in_page(page_elf_offset));
+
+                let reloc_count = if has_relocs {
+                    reloc_index.as_ref().map_or(0, |ri| ri.count_in_page(page_elf_offset))
+                } else { 0 };
+
+                // Partial page: need private copy to zero BSS tail
+                let needs_private = vma_writable || has_relocs || valid_in_page < 4096;
+
+                if needs_private {
+                    let private = alloc_4k_uninit();
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            cache_phys as *const u8, private as *mut u8, valid_in_page);
+                        // Zero BSS portion (bytes beyond file data)
+                        if valid_in_page < 4096 {
+                            core::ptr::write_bytes(
+                                (private as *mut u8).add(valid_in_page), 0, 4096 - valid_in_page);
+                        }
+                    }
+                    drop(cache_guard);
+
+                    if let Some(ref ri) = reloc_index {
+                        ri.apply_to_page(page_elf_offset, private as *mut u8);
+                    }
+
+                    paging::map_4k_in(pml4, page_vaddr, private, vma_writable || has_relocs);
+                    cpu::invlpg(page_vaddr);
+                    data.fault_trace.push(PageFaultRecord {
+                        fault_addr, page_elf_offset,
+                        block_idx: block_idx as u32, reloc_count: reloc_count as u16,
+                        flags: (vma_writable as u16) | ((has_relocs as u16) << 1),
+                    });
+                    data.demand_pages.push(private);
+                } else {
+                    drop(cache_guard);
+                    paging::map_4k_in(pml4, page_vaddr, cache_phys, false);
+                    cpu::invlpg(page_vaddr);
+                    data.fault_trace.push(PageFaultRecord {
+                        fault_addr, page_elf_offset,
+                        block_idx: block_idx as u32, reloc_count: 0,
+                        flags: 0,
+                    });
+                }
+            } else {
+                let phys = alloc_4k_zeroed();
+                paging::map_4k_in(pml4, page_vaddr, phys, vma_writable);
+                cpu::invlpg(page_vaddr);
+                data.fault_trace.push(PageFaultRecord {
+                    fault_addr, page_elf_offset: page_vaddr.wrapping_sub(elf_base),
+                    block_idx: block_idx as u32, reloc_count: 0,
+                    flags: (vma_writable as u16) | 0x8, // bit 3 = beyond extent
+                });
+                data.demand_pages.push(phys);
+            }
+        }
+    }
+
+    true
+}
+
+/// Allocate a zeroed 4KB page, returning its physical address (= virtual address under identity mapping).
+fn alloc_4k_zeroed() -> u64 {
+    let layout = Layout::from_size_align(4096, 4096).unwrap();
+    let ptr = unsafe { alloc_zeroed(layout) };
+    assert!(!ptr.is_null(), "alloc_4k_zeroed: out of memory");
+    ptr as u64
+}
+
+/// Allocate an uninitialized 4KB page, returning its physical address.
+fn alloc_4k_uninit() -> u64 {
+    let layout = Layout::from_size_align(4096, 4096).unwrap();
+    let ptr = unsafe { alloc(layout) };
+    assert!(!ptr.is_null(), "alloc_4k_uninit: out of memory");
+    ptr as u64
+}
+
+/// Free a 4KB page at the given physical address.
+pub fn free_4k(phys: u64) {
+    let layout = Layout::from_size_align(4096, 4096).unwrap();
+    unsafe { dealloc(phys as *mut u8, layout) };
+}
+
+// ---------------------------------------------------------------------------
+// Crash diagnostics
+// ---------------------------------------------------------------------------
+
+/// Dump the page fault trace and memory around `fault_addr` for the current process.
+/// Called from the exception handler on user-mode crashes.
+pub fn dump_crash_diagnostics(fault_addr: u64, rip: u64) {
+    let pid = current_pid();
+    if pid == Pid::MAX { return; }
+
+    let data_arc = {
+        let guard = PROCESS_TABLE.lock();
+        let Some(table) = guard.as_ref() else { return };
+        match table.get(pid) {
+            Some(entry) => Arc::clone(entry.data()),
+            None => return,
+        }
+    };
+    let data = data_arc.lock();
+
+    // Dump page fault trace
+    let trace = &data.fault_trace;
+    let count = trace.total().min(32);
+    if count > 0 {
+        log!("  Page fault trace ({} total, last {}):", trace.total(), count);
+        for rec in trace.iter_chronological() {
+            if rec.fault_addr == 0 { continue; }
+            let mut flag_str = [b' '; 4];
+            if rec.flags & 1 != 0 { flag_str[0] = b'W'; } // writable
+            if rec.flags & 2 != 0 { flag_str[1] = b'R'; } // has_relocs
+            if rec.flags & 4 != 0 { flag_str[2] = b'A'; } // anonymous
+            if rec.flags & 8 != 0 { flag_str[3] = b'Z'; } // beyond extent (zero)
+            let flags = core::str::from_utf8(&flag_str).unwrap_or("????");
+            log!("    fault={:#x} elf_off={:#x} blk={} relocs={} [{}]",
+                rec.fault_addr, rec.page_elf_offset, rec.block_idx,
+                rec.reloc_count, flags);
+        }
+    }
+
+    // Dump memory around given addresses (if mapped in the process page tables)
+    let pml4 = {
+        let guard = PROCESS_TABLE.lock();
+        let Some(table) = guard.as_ref() else { return };
+        let Some(entry) = table.get(pid) else { return };
+        entry.cr3().map(|cr3| cr3.as_ptr())
+    };
+    let Some(pml4) = pml4 else { return };
+
+    let dump_region = |label: &str, addr: u64| {
+        if paging::virt_to_phys(pml4 as *const u64, addr).is_none() { return; }
+        let start = (addr & !0x7).saturating_sub(32);
+        log!("  Memory around {} ({:#x}):", label, addr);
+        for i in 0..8u64 {
+            let a = start + i * 8;
+            if paging::virt_to_phys(pml4 as *const u64, a).is_none() { break; }
+            let val = unsafe { *(a as *const u64) };
+            let marker = if a == (addr & !0x7) { " <--" } else { "" };
+            log!("    [{:#x}] = {:#018x}{}", a, val, marker);
+        }
+    };
+
+    if fault_addr != 0 {
+        dump_region("fault_addr", fault_addr);
+    }
+    dump_region("rip", rip);
+
+    // Dump TLS self-pointer at FS base
+    // Read the ACTUAL FS_BASE MSR (swapgs doesn't affect FS, only GS)
+    let fs_base_msr = crate::arch::read_fs_base();
+    let fs_base_saved = {
+        let guard = PROCESS_TABLE.lock();
+        let Some(table) = guard.as_ref() else { return };
+        table.get(pid).map(|e| e.fs_base()).unwrap_or(0)
+    };
+    let fs_base = fs_base_msr;
+    if fs_base_msr != fs_base_saved {
+        log!("  FS base: MSR={:#x} saved={:#x} (MISMATCH!)", fs_base_msr, fs_base_saved);
+    }
+    if fs_base != 0 {
+        log!("  FS base: {:#x}", fs_base);
+        if paging::virt_to_phys(pml4 as *const u64, fs_base).is_some() {
+            let self_ptr = unsafe { *(fs_base as *const u64) };
+            log!("  fs:[0] = {:#x} (expected {:#x})", self_ptr, fs_base);
+            // Dump 8 qwords at TP
+            for i in 0..8u64 {
+                let addr = fs_base + i * 8;
+                if paging::virt_to_phys(pml4 as *const u64, addr).is_none() { break; }
+                let val = unsafe { *(addr as *const u64) };
+                log!("    TP+{:#x} = {:#018x}", i * 8, val);
+            }
+            // Also dump 4 qwords before TP (TLS data area)
+            log!("  TLS data before TP:");
+            for i in 1..=4u64 {
+                let addr = fs_base - i * 8;
+                if paging::virt_to_phys(pml4 as *const u64, addr).is_none() { break; }
+                let val = unsafe { *(addr as *const u64) };
+                log!("    TP-{:#x} = {:#018x}", i * 8, val);
+            }
+        } else {
+            log!("  FS base {:#x} NOT MAPPED!", fs_base);
+        }
+        // Also dump TLS alloc info
+        let tls_info = data.tls_alloc.as_ref().map(|a| (a.ptr() as u64, a.size()));
+        log!("  TLS alloc: {:?}", tls_info);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Symbol resolution / address validation
 // ---------------------------------------------------------------------------
 
@@ -1365,6 +2144,21 @@ pub fn is_valid_user_addr(addr: u64) -> bool {
     };
     let guard = data_arc.lock();
     guard.symbols.is_valid_user_addr(addr)
+}
+
+/// Resolve and log a user-mode address against the process's symbol table.
+/// Returns true if the address was resolved and logged.
+pub fn resolve_user_symbol(pid: Pid, addr: u64) -> bool {
+    let data_arc = {
+        let guard = PROCESS_TABLE.lock();
+        let Some(table) = guard.as_ref() else { return false };
+        match table.get(pid) {
+            Some(entry) => Arc::clone(entry.data()),
+            None => return false,
+        }
+    };
+    let mut data = data_arc.lock();
+    crate::symbols::resolve_user(&mut data.symbols, addr)
 }
 
 // ---------------------------------------------------------------------------
@@ -1404,7 +2198,6 @@ pub fn kill_process(target_pid: Pid) -> u64 {
         data.stack_alloc.take();
         data.loaded_libs.clear();
         data.mmap_regions.clear();
-        data.user_heap = crate::user_heap::UserHeap::new();
     }
 
     // Phase 3: Scheduling teardown (table lock)

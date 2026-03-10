@@ -62,6 +62,68 @@ mod runtime {
         toyos_abi::syscall::exit(134) // SIGABRT-like
     }
 
+    struct MmapAllocator;
+
+    unsafe impl dlmalloc::Allocator for MmapAllocator {
+        fn alloc(&self, size: usize) -> (*mut u8, usize, u32) {
+            use toyos_abi::syscall::{MmapProt, MmapFlags};
+            let ptr = unsafe {
+                toyos_abi::syscall::mmap(
+                    core::ptr::null_mut(),
+                    size,
+                    MmapProt::READ | MmapProt::WRITE,
+                    MmapFlags::ANONYMOUS,
+                )
+            };
+            if ptr.is_null() { (core::ptr::null_mut(), 0, 0) } else { (ptr, size, 0) }
+        }
+
+        fn remap(&self, _ptr: *mut u8, _old: usize, _new: usize, _can_move: bool) -> *mut u8 {
+            core::ptr::null_mut()
+        }
+
+        fn free_part(&self, _ptr: *mut u8, _old: usize, _new: usize) -> bool {
+            false
+        }
+
+        fn free(&self, ptr: *mut u8, size: usize) -> bool {
+            unsafe { toyos_abi::syscall::munmap(ptr, size).is_ok() }
+        }
+
+        fn can_release_part(&self, _flags: u32) -> bool {
+            false
+        }
+
+        fn allocates_zeros(&self) -> bool {
+            true
+        }
+
+        fn page_size(&self) -> usize {
+            0x1000
+        }
+    }
+
+    struct SyncDlmalloc(core::cell::UnsafeCell<dlmalloc::Dlmalloc<MmapAllocator>>);
+    unsafe impl Sync for SyncDlmalloc {}
+
+    static DLMALLOC: SyncDlmalloc =
+        SyncDlmalloc(core::cell::UnsafeCell::new(dlmalloc::Dlmalloc::new_with_allocator(MmapAllocator)));
+    static LOCKED: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(0);
+
+    fn lock() -> DropLock {
+        while LOCKED.swap(1, core::sync::atomic::Ordering::Acquire) != 0 {
+            core::hint::spin_loop();
+        }
+        DropLock
+    }
+
+    struct DropLock;
+    impl Drop for DropLock {
+        fn drop(&mut self) {
+            LOCKED.store(0, core::sync::atomic::Ordering::Release);
+        }
+    }
+
     struct LibcAllocator;
 
     #[global_allocator]
@@ -69,16 +131,16 @@ mod runtime {
 
     unsafe impl core::alloc::GlobalAlloc for LibcAllocator {
         unsafe fn alloc(&self, layout: core::alloc::Layout) -> *mut u8 {
-            // SAFETY: layout constraints (non-zero size, valid alignment) upheld by GlobalAlloc contract
-            unsafe { toyos_abi::syscall::alloc(layout.size(), layout.align()) }
+            let _lock = lock();
+            unsafe { (*DLMALLOC.0.get()).malloc(layout.size(), layout.align()) }
         }
         unsafe fn dealloc(&self, ptr: *mut u8, layout: core::alloc::Layout) {
-            // SAFETY: ptr was returned by alloc with the same layout
-            unsafe { toyos_abi::syscall::free(ptr, layout.size(), layout.align()) };
+            let _lock = lock();
+            unsafe { (*DLMALLOC.0.get()).free(ptr, layout.size(), layout.align()) }
         }
         unsafe fn realloc(&self, ptr: *mut u8, layout: core::alloc::Layout, new_size: usize) -> *mut u8 {
-            // SAFETY: ptr was returned by alloc with the same layout
-            unsafe { toyos_abi::syscall::realloc(ptr, layout.size(), layout.align(), new_size) }
+            let _lock = lock();
+            unsafe { (*DLMALLOC.0.get()).realloc(ptr, layout.size(), layout.align(), new_size) }
         }
     }
 }

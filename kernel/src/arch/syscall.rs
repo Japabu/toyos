@@ -6,7 +6,7 @@ use super::{apic, cpu, gdt, paging};
 use crate::drivers::acpi;
 use crate::sync::Lock;
 use crate::user_ptr::SyscallContext;
-use crate::{allocator, device, fd, keyboard, log, message, pipe, process, shared_memory, user_heap, vfs};
+use crate::{allocator, device, fd, keyboard, log, message, pipe, process, shared_memory, vfs};
 
 // MSR addresses
 const MSR_EFER: u32 = 0xC000_0080;
@@ -15,17 +15,6 @@ const MSR_LSTAR: u32 = 0xC000_0082;
 const MSR_FMASK: u32 = 0xC000_0084;
 
 use toyos_abi::syscall::*;
-
-// ---------------------------------------------------------------------------
-// Heap owner routing (threads share parent's heap)
-// ---------------------------------------------------------------------------
-
-/// Run a closure with the heap owner's user_heap.
-fn with_heap_owner<R>(f: impl FnOnce(&mut user_heap::UserHeap) -> R) -> Option<R> {
-    let data = process::fd_owner_data();
-    let mut guard = data.lock();
-    Some(f(&mut guard.user_heap))
-}
 
 // ---------------------------------------------------------------------------
 // Syscall entry point
@@ -148,9 +137,6 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             let Some(buf) = ctx.user_slice_mut(a2, a3) else { return bad_addr };
             sys_read(a1 as u32, buf)
         }
-        SYS_ALLOC => with_heap_owner(|heap| user_heap::alloc(heap, a1 as usize, a2 as usize)).flatten().unwrap_or(0),
-        SYS_FREE => { with_heap_owner(|heap| { user_heap::free(heap, a1 as *mut u8, a2 as usize); 0 }).unwrap_or(0) }
-        SYS_REALLOC => with_heap_owner(|heap| user_heap::realloc(heap, a1 as *mut u8, a2 as usize, a3 as usize, a4 as usize)).flatten().unwrap_or(0),
         SYS_THREAD_EXIT => sys_thread_exit(a1 as i32),
         SYS_RANDOM => {
             let Some(buf) = ctx.user_slice_mut(a1, a2) else { return bad_addr };
@@ -244,7 +230,7 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         }
         SYS_RECV_MSG => {
             let Some(out) = ctx.user_mut::<message::RawMessage>(a1) else { return bad_addr };
-            sys_recv_msg(out)
+            sys_recv_msg(out, a2, a3)
         }
         SYS_OPEN_DEVICE => sys_open_device(a1),
         SYS_REGISTER_NAME => {
@@ -731,8 +717,8 @@ fn sys_spawn(text: &str, fds: fd::FdTable, env: alloc::vec::Vec<u8>) -> u64 {
     let args: Vec<&str> = text.split('\0').filter(|s| !s.is_empty()).collect();
     let parent = process::current_pid();
     match process::spawn(&args, fds, Some(parent), env) {
-        Some(pid) => pid.raw() as u64,
-        None => SyscallError::NotFound.to_u64(),
+        Ok(pid) => pid.raw() as u64,
+        Err(e) => e.to_u64(),
     }
 }
 
@@ -842,32 +828,24 @@ fn sys_send_msg(target_pid: u64, user_msg: &message::RawMessage, payload: Vec<u8
     if process::send_message(process::Pid::from_raw(target_pid as u32), msg) { 0 } else { SyscallError::NotFound.to_u64() }
 }
 
-fn sys_recv_msg(out: &mut message::RawMessage) -> u64 {
+fn sys_recv_msg(out: &mut message::RawMessage, buf_ptr: u64, buf_len: u64) -> u64 {
     loop {
         let msg = process::with_current_data(|data| data.messages.pop());
         if let Some(msg) = msg {
-            let (data, len) = if !msg.payload.is_empty() {
-                let Some(addr) = with_heap_owner(|heap| {
-                    user_heap::alloc(heap, msg.payload.len(), 8)
-                }).flatten() else {
-                    return SyscallError::Unknown.to_u64();
-                };
+            let copy_len = msg.payload.len().min(buf_len as usize);
+            if copy_len > 0 && buf_ptr != 0 {
                 unsafe {
                     core::ptr::copy_nonoverlapping(
                         msg.payload.as_ptr(),
-                        addr as *mut u8,
-                        msg.payload.len(),
+                        buf_ptr as *mut u8,
+                        copy_len,
                     );
                 }
-                (addr, msg.payload.len() as u64)
-            } else {
-                (0, 0)
-            };
-
+            }
             out.sender = msg.sender.raw();
             out.msg_type = msg.msg_type;
-            out.data = data;
-            out.len = len;
+            out.data = buf_ptr;
+            out.len = msg.payload.len() as u64;
             return 0;
         }
         process::block_recv_msg();
@@ -1185,7 +1163,10 @@ fn sys_symlink(target: &str, link: &str) -> u64 {
     let resolved = vfs.resolve_absolute(&cwd, link);
     match vfs.create_symlink(&resolved, target) {
         Ok(()) => 0,
-        Err(_) => SyscallError::Unknown.to_u64(),
+        Err(e) => {
+            log!("symlink({target} -> {link}): {e}");
+            SyscallError::Unknown.to_u64()
+        }
     }
 }
 
@@ -1208,19 +1189,28 @@ fn sys_dlopen(path: &str) -> u64 {
     let cwd = process::with_current_data(|d| d.cwd.clone());
     let resolved = vfs::lock().resolve_absolute(&cwd, path);
 
-    let binary = match vfs::lock().read_file(&resolved) {
-        Ok(d) => d,
-        Err(e) => {
-            log!("dlopen: {}: {}", resolved, e);
-            return SyscallError::NotFound.to_u64();
-        }
-    };
+    // Check shared library cache first
+    let lib = crate::elf::try_clone_cached(&resolved);
+    let lib = match lib {
+        Some(lib) => lib,
+        None => {
+            let binary = match vfs::lock().read_file(&resolved) {
+                Ok(d) => d,
+                Err(e) => {
+                    log!("dlopen: {}: {}", resolved, e);
+                    return SyscallError::NotFound.to_u64();
+                }
+            };
 
-    let (lib, _rw_vaddr) = match crate::elf::load_shared_lib(&binary) {
-        Ok(result) => result,
-        Err(msg) => {
-            log!("dlopen: {}", msg);
-            return SyscallError::Unknown.to_u64();
+            let (lib, rw_vaddr, rw_end_vaddr) = match crate::elf::load_shared_lib(&binary) {
+                Ok(result) => result,
+                Err(msg) => {
+                    log!("dlopen: {}", msg);
+                    return SyscallError::Unknown.to_u64();
+                }
+            };
+
+            crate::elf::cache_loaded_lib_pub(&resolved, lib, rw_vaddr, rw_end_vaddr)
         }
     };
 
@@ -1228,12 +1218,12 @@ fn sys_dlopen(path: &str) -> u64 {
         crate::elf::LibMemory::Owned(alloc) => {
             paging::map_user(alloc.ptr() as u64, alloc.size() as u64);
         }
-        crate::elf::LibMemory::Shared { rw_alloc, shared_addr, shared_size, total_cached_size, .. } => {
+        crate::elf::LibMemory::Shared { rw_alloc, cached_addr, cached_size, rw_offset, .. } => {
             let pml4 = cpu::read_cr3() as *mut u64;
-            paging::map_user_readonly_in(pml4, *shared_addr, *total_cached_size as u64);
-            let num_rw_pages = paging::align_2m(rw_alloc.size()) / paging::PAGE_2M as usize;
+            paging::map_user_readonly_in(pml4, *cached_addr, *cached_size as u64);
+            let num_rw_pages = rw_alloc.size() / paging::PAGE_2M as usize;
             for i in 0..num_rw_pages {
-                let virt = *shared_addr + *shared_size as u64 + i as u64 * paging::PAGE_2M;
+                let virt = *cached_addr + *rw_offset as u64 + i as u64 * paging::PAGE_2M;
                 let phys = rw_alloc.ptr() as u64 + i as u64 * paging::PAGE_2M;
                 paging::remap_user_2m_in(pml4, virt, phys);
             }
@@ -1256,7 +1246,15 @@ fn sys_dlopen(path: &str) -> u64 {
                 module.3 += new_memsz;
             }
             data.tls_modules.insert(0, (lib.tls_template, lib.tls_filesz, lib.tls_memsz, 0));
-            data.tls_total_memsz += new_memsz;
+            // Recompute: raw extent is the end of the last module.
+            // Use raw memsz (NOT rounded up) — the linker computes TPOFF = sym_offset - memsz.
+            let raw_total = data.tls_modules.iter()
+                .map(|&(_, _, memsz, base_offset)| base_offset + memsz)
+                .max().unwrap_or(0);
+            data.tls_total_memsz = raw_total;
+            if lib.tls_align > data.tls_max_align {
+                data.tls_max_align = lib.tls_align;
+            }
         }
 
         if data.tls_total_memsz > 0 {

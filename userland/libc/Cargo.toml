@@ -10,3 +10,4 @@ std-runtime = []
 [dependencies]
 toyos-abi = { path = "../../toyos-abi" }
 toyos-net = { path = "../toyos-net" }
+dlmalloc = "0.2.7"

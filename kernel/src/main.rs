@@ -114,14 +114,15 @@ fn kernel_main(
     let ecam_base = acpi::find_ecam_base(kernel_args.rsdp_addr)
         .expect("ACPI: failed to find ECAM base address");
     pci::enumerate(ecam_base);
-    let mut nvme_dev = nvme::init(ecam_base).expect("NVMe: no controller found");
-    page_cache::init(&nvme_dev);
+    let nvme_dev = nvme::init(ecam_base).expect("NVMe: no controller found");
+    page_cache::init(Box::new(nvme_dev));
 
     let toyfs_instance = {
-        let mut cache = page_cache::lock();
-        match toyfs::ToyFs::mount(&mut cache, &mut nvme_dev) {
+        let mut guard = page_cache::lock();
+        let (cache, dev) = guard.cache_and_dev();
+        match toyfs::ToyFs::mount(cache, dev) {
             Some(fs) => fs,
-            None => toyfs::ToyFs::format(&mut cache, &mut nvme_dev),
+            None => toyfs::ToyFs::format(cache, dev),
         }
     };
 
@@ -151,7 +152,7 @@ fn kernel_main(
     let mut initrd_fs = tyfs::SimpleFs::mount(initrd_disk).expect("Failed to mount initrd");
 
     // Mount root filesystem (ToyFs on NVMe) and tmpfs
-    vfs::lock().set_root(Box::new(toyfs::ToyFsAdapter::new(toyfs_instance, nvme_dev)));
+    vfs::lock().set_root(Box::new(toyfs::ToyFsAdapter::new(toyfs_instance)));
     vfs::lock().mount("tmp", Box::new(kernel::tmpfs::TmpFs::new()));
 
     // Extract initrd into root filesystem (fresh binaries every boot)

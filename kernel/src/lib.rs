@@ -8,6 +8,7 @@ pub mod arch;
 pub mod drivers;
 
 pub mod log;
+pub mod pmm;
 pub mod allocator;
 
 pub mod keyboard;
@@ -31,9 +32,9 @@ pub mod device;
 pub mod net;
 pub mod gpu;
 pub mod audio;
-pub mod user_heap;
 pub mod shared_memory;
 pub mod user_ptr;
+pub mod vma;
 
 #[repr(C)]
 #[derive(Debug)]

@@ -73,6 +73,14 @@ pub fn flush_tlb() {
     }
 }
 
+/// Invalidate a single TLB entry for the given virtual address.
+#[inline]
+pub fn invlpg(addr: u64) {
+    unsafe {
+        asm!("invlpg [{}]", in(reg) addr, options(nostack));
+    }
+}
+
 /// # Safety
 /// The pointer must reference a valid IDT descriptor.
 #[inline]
