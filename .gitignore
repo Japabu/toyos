@@ -2,4 +2,5 @@ target/
 .claude/
 .vscode/
 .mcp.json
+.DS_Store
 phosphor-icons
