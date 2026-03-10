@@ -549,6 +549,7 @@ dependencies = [
  "sha2",
  "shell-escape",
  "tempfile",
+ "toyos-abi 0.1.0",
  "tracing",
  "walkdir",
  "windows-sys 0.61.2",

@@ -30,5 +30,8 @@ libc.workspace = true
 miow.workspace = true
 windows-sys = { workspace = true, features = ["Win32_Storage_FileSystem", "Win32_Foundation", "Win32_System_Console"] }
 
+[target.'cfg(target_os = "toyos")'.dependencies]
+toyos-abi = { path = "../../../../toyos-abi" }
+
 [lints]
 workspace = true

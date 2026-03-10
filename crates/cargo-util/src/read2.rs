@@ -86,7 +86,7 @@ mod imp {
     use std::io;
     use std::io::Read;
     use std::os::fd::AsRawFd;
-    use std::os::toyos::poll;
+    use toyos_abi::poll;
     use std::process::{ChildStderr, ChildStdout};
 
     pub fn read2(
@@ -102,19 +102,19 @@ mod imp {
         while !out_done || !err_done {
             let mut fds = Vec::new();
             if !out_done {
-                fds.push(out_pipe.as_raw_fd() as u64 | poll::READABLE);
+                fds.push(out_pipe.as_raw_fd() as u64 | poll::POLL_READABLE);
             }
             if !err_done {
-                fds.push(err_pipe.as_raw_fd() as u64 | poll::READABLE);
+                fds.push(err_pipe.as_raw_fd() as u64 | poll::POLL_READABLE);
             }
 
-            let result = poll::poll(&fds, None);
+            let result = poll::poll(&fds);
 
             // Use single read() calls — poll guarantees data is available,
             // so a single read won't block. read_to_end would block until EOF.
             let mut idx = 0;
             if !out_done {
-                if result.fd_ready(idx) {
+                if result.fd(idx) {
                     let mut buf = [0u8; 8192];
                     match out_pipe.read(&mut buf) {
                         Ok(0) => out_done = true,
@@ -126,7 +126,7 @@ mod imp {
                 }
                 idx += 1;
             }
-            if !err_done && result.fd_ready(idx) {
+            if !err_done && result.fd(idx) {
                 let mut buf = [0u8; 8192];
                 match err_pipe.read(&mut buf) {
                     Ok(0) => err_done = true,
