@@ -1,6 +1,4 @@
-use alloc::string::String;
 use alloc::vec::Vec;
-use alloc::format;
 
 use elf::ElfBytes;
 use elf::endian::AnyEndian;
@@ -24,13 +22,8 @@ impl SymbolTable {
         Self { symbols: Vec::new(), names: Vec::new() }
     }
 
-    fn resolve(&self, addr: u64) -> Option<(String, u64)> {
-        let (raw, offset) = self.resolve_raw(addr)?;
-        Some((demangle(raw), offset))
-    }
-
-    /// Resolve an address without allocating. Returns the raw (mangled) symbol name.
-    fn resolve_raw(&self, addr: u64) -> Option<(&str, u64)> {
+    /// Resolve an address without allocating. Returns the mangled symbol name.
+    fn resolve(&self, addr: u64) -> Option<(&str, u64)> {
         if self.symbols.is_empty() { return None; }
 
         let mut lo = 0usize;
@@ -79,6 +72,14 @@ impl ProcessSymbols {
         }
     }
 
+    /// Create empty symbols with memory bounds (for crash addr validation).
+    pub fn empty_with_bounds(
+        prog_base: u64, prog_end: u64,
+        stack_base: u64, stack_end: u64,
+    ) -> Self {
+        Self { table: SymbolTable::new(), prog_base, prog_end, stack_base, stack_end }
+    }
+
     /// Parse symbols from ELF bytes and record memory ranges.
     pub fn parse(
         data: &[u8], base: u64,
@@ -88,10 +89,6 @@ impl ProcessSymbols {
         let mut table = SymbolTable::new();
         parse_symtab(data, base, &mut table);
         Self { table, prog_base, prog_end, stack_base, stack_end }
-    }
-
-    pub fn resolve(&self, addr: u64) -> Option<(String, u64)> {
-        self.table.resolve(addr)
     }
 
     pub fn is_valid_user_addr(&self, addr: u64) -> bool {
@@ -108,63 +105,45 @@ impl ProcessSymbols {
 static KERNEL_SYMS: Lock<SymbolTable> = Lock::new(SymbolTable::new());
 static KERNEL_BASE: Lock<u64> = Lock::new(0);
 
-fn demangle(mangled: &str) -> String {
-    format!("{:#}", rustc_demangle::demangle(mangled))
+/// Resolve and log an address against kernel symbols without allocating.
+/// Demangles directly to serial via fmt::Write. Safe to call from exception handlers.
+pub fn resolve_kernel(addr: u64) -> Option<u64> {
+    resolve_kernel_inner(addr, false)
 }
 
-/// Resolve an address against kernel symbols only.
-pub fn resolve_kernel(addr: u64) -> Option<(String, u64)> {
-    KERNEL_SYMS.lock().resolve(addr)
+/// Like `resolve_kernel`, but uses try_lock to avoid deadlock.
+/// Safe to call from double fault / NMI handlers where locks may already be held.
+pub fn resolve_kernel_nonblocking(addr: u64) -> Option<u64> {
+    resolve_kernel_inner(addr, true)
 }
 
-/// Resolve an address against kernel symbols without allocating.
-/// Returns the raw (mangled) symbol name. Safe to call from exception handlers.
-pub fn resolve_kernel_raw(addr: u64) -> Option<u64> {
-    // We can't return a &str because it borrows the lock guard.
-    // Instead, print directly here.
-    let guard = KERNEL_SYMS.lock();
-    if let Some((raw, offset)) = guard.resolve_raw(addr) {
-        // Use log! (stack-based formatting) to print
-        crate::log!("  {:#x}  {}+{:#x}", addr, raw, offset);
+fn resolve_kernel_inner(addr: u64, nonblocking: bool) -> Option<u64> {
+    let guard = if nonblocking { KERNEL_SYMS.try_lock() } else { Some(KERNEL_SYMS.lock()) };
+    let Some(guard) = guard else {
+        crate::log!("    {:#x}  [symbols locked]", addr);
+        return None;
+    };
+    if let Some((raw, offset)) = guard.resolve(addr) {
+        // Demangle directly to serial via fmt::Write — no allocation.
+        crate::log!("    {:#x}  {:#}+{:#x}", addr, rustc_demangle::demangle(raw), offset);
         Some(offset)
     } else {
-        let kernel_base = *KERNEL_BASE.lock();
-        if kernel_base != 0 && addr >= kernel_base {
-            crate::log!("  {:#x}  [kernel+{:#x}]", addr, addr - kernel_base);
+        drop(guard);
+        let kernel_base = if nonblocking {
+            KERNEL_BASE.try_lock().map(|g| *g)
         } else {
-            crate::log!("  {:#x}", addr);
+            Some(*KERNEL_BASE.lock())
+        };
+        if let Some(kb) = kernel_base {
+            if kb != 0 && addr >= kb {
+                crate::log!("    {:#x}  [kernel+{:#x}]", addr, addr - kb);
+            } else {
+                crate::log!("    {:#x}", addr);
+            }
+        } else {
+            crate::log!("    {:#x}", addr);
         }
         None
-    }
-}
-
-/// Format an address with kernel symbol info if available.
-pub fn format_kernel_addr(addr: u64) -> String {
-    if let Some((name, offset)) = resolve_kernel(addr) {
-        format!("{:#x}  {}+{:#x}", addr, name, offset)
-    } else {
-        let kernel_base = *KERNEL_BASE.lock();
-        if kernel_base != 0 && addr >= kernel_base {
-            format!("{:#x}  [kernel+{:#x}]", addr, addr - kernel_base)
-        } else {
-            format!("{:#x}", addr)
-        }
-    }
-}
-
-/// Format an address: try process symbols first, then kernel.
-pub fn format_addr(addr: u64, proc_syms: &ProcessSymbols) -> String {
-    if let Some((name, offset)) = proc_syms.resolve(addr) {
-        format!("{:#x}  {}+{:#x}", addr, name, offset)
-    } else if let Some((name, offset)) = resolve_kernel(addr) {
-        format!("{:#x}  {}+{:#x}", addr, name, offset)
-    } else {
-        let kernel_base = *KERNEL_BASE.lock();
-        if kernel_base != 0 && addr >= kernel_base {
-            format!("{:#x}  [kernel+{:#x}]", addr, addr - kernel_base)
-        } else {
-            format!("{:#x}", addr)
-        }
     }
 }
 

@@ -64,3 +64,15 @@
 [submodule "userland/ctrlc"]
 	path = userland/ctrlc
 	url = https://github.com/Japabu/rust-ctrlc
+[submodule "userland/cpal"]
+	path = userland/cpal
+	url = https://github.com/Japabu/cpal.git
+[submodule "userland/winit"]
+	path = userland/winit
+	url = https://github.com/Japabu/winit.git
+[submodule "userland/softbuffer"]
+	path = userland/softbuffer
+	url = https://github.com/Japabu/softbuffer.git
+[submodule "userland/raw-window-handle"]
+	path = userland/raw-window-handle
+	url = https://github.com/Japabu/raw-window-handle.git

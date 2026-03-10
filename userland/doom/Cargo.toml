@@ -5,14 +5,9 @@ edition = "2021"
 build = "build.rs"
 
 [dependencies]
-window = { path = "../window" }
-toyos-libc = { path = "../libc", features = ["std-runtime"] }
-
-[patch.crates-io]
-getrandom = { git = "https://github.com/Japabu/getrandom", branch = "toyos-v0.2", package = "getrandom" }
-
-[profile.dev]
-opt-level = 2
+cpal = { path = "../cpal" }
+winit = { path = "../winit/winit", default-features = false }
+softbuffer = { path = "../softbuffer", default-features = false }
 
 [build-dependencies]
 cc = "1.1"

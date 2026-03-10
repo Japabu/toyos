@@ -2,7 +2,7 @@ use core::arch::naked_asm;
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use super::{cpu, gdt, paging};
+use super::{apic, cpu, gdt, paging};
 use crate::drivers::acpi;
 use crate::sync::Lock;
 use crate::user_ptr::SyscallContext;
@@ -126,6 +126,14 @@ extern "C" fn syscall_handler(num: u64, a1: u64, a2: u64, _: u64, a3: u64, a4: u
 }
 
 fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
+    // Count syscalls per process
+    process::with_current_data(|data| {
+        data.syscall_total += 1;
+        if (num as usize) < data.syscall_counts.len() {
+            data.syscall_counts[num as usize] += 1;
+        }
+    });
+
     // SAFETY: current process's page tables remain active for the duration of this call.
     let ctx = unsafe { SyscallContext::new() };
 
@@ -198,12 +206,11 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         }
         SYS_PIPE => sys_pipe(),
         SYS_SPAWN => {
-            // SAFETY: SpawnArgs is #[repr(C)] with only u64 fields — no padding, valid for any bit pattern.
-            let Some(args) = (unsafe { ctx.user_read::<SpawnArgs>(a1) }) else { return bad_addr };
+            let Some(args) = ctx.user_ref::<SpawnArgs>(a1) else { return bad_addr };
             let Some(text) = ctx.user_str(args.argv_ptr, args.argv_len) else { return bad_addr };
             let fd_count = args.fd_map_count as usize;
             let fds = if fd_count > 0 {
-                let Some(pairs) = ctx.user_pod_slice::<[u32; 2]>(args.fd_map_ptr, fd_count) else { return bad_addr };
+                let Some(pairs) = ctx.user_slice_of::<[u32; 2]>(args.fd_map_ptr, fd_count) else { return bad_addr };
                 process::build_child_fds(pairs)
             } else {
                 fd::FdTable::new()
@@ -219,12 +226,12 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         SYS_WAITPID => sys_waitpid(a1, a2),
         SYS_POLL => {
             if a2 > 63 { return SyscallError::InvalidArgument.to_u64(); }
-            let Some(fds) = ctx.user_pod_slice::<u64>(a1, a2 as usize) else { return bad_addr };
+            let Some(fds) = ctx.user_slice_of::<u64>(a1, a2 as usize) else { return bad_addr };
             sys_poll(fds, a2, a3)
         }
         SYS_MARK_TTY => process::with_fd_owner_data(|data| fd::mark_tty(&mut data.fds, a1 as u32)),
         SYS_SEND_MSG => {
-            let Some(user_msg) = ctx.user_ref::<message::UserMessage>(a2) else { return bad_addr };
+            let Some(user_msg) = ctx.user_ref::<message::RawMessage>(a2) else { return bad_addr };
             const MAX_MSG_PAYLOAD: u64 = 64 * 1024;
             let payload = if user_msg.data != 0 && user_msg.len != 0 {
                 if user_msg.len > MAX_MSG_PAYLOAD { return SyscallError::InvalidArgument.to_u64(); }
@@ -236,7 +243,7 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             sys_send_msg(a1, user_msg, payload)
         }
         SYS_RECV_MSG => {
-            let Some(out) = ctx.user_mut::<message::UserMessage>(a1) else { return bad_addr };
+            let Some(out) = ctx.user_mut::<message::RawMessage>(a1) else { return bad_addr };
             sys_recv_msg(out)
         }
         SYS_OPEN_DEVICE => sys_open_device(a1),
@@ -319,11 +326,11 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         }
         SYS_CPU_COUNT => super::smp::cpu_count() as u64,
         SYS_FUTEX_WAIT => {
-            if !paging::is_user_mapped(a1, 4) { return bad_addr; }
+            if ctx.user_ref::<u32>(a1).is_none() { return bad_addr; }
             process::futex_wait(a1, a2 as u32, a3)
         }
         SYS_FUTEX_WAKE => {
-            if !paging::is_user_mapped(a1, 4) { return bad_addr; }
+            if ctx.user_ref::<u32>(a1).is_none() { return bad_addr; }
             process::futex_wake(a1, a2)
         }
         SYS_MMAP => sys_mmap(a1, a2, a3, a4),
@@ -375,6 +382,37 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             let Some(path) = ctx.user_str(a1, a2) else { return bad_addr };
             let Some(buf) = ctx.user_slice_mut(a3, a4) else { return bad_addr };
             sys_readlink(path, buf)
+        }
+        SYS_GPU_SET_RESOLUTION => {
+            let info_size = core::mem::size_of::<fd::FramebufferInfo>() as u64;
+            let Some(out_buf) = ctx.user_slice_mut(a3, info_size) else { return bad_addr };
+            match crate::gpu::set_resolution(a1 as u32, a2 as u32) {
+                Ok(gpu_info) => {
+                    let fb_info = fd::FramebufferInfo {
+                        token: [gpu_info.tokens[0].raw(), gpu_info.tokens[1].raw()],
+                        cursor_token: gpu_info.cursor_token.raw(),
+                        width: gpu_info.width,
+                        height: gpu_info.height,
+                        stride: gpu_info.stride,
+                        pixel_format: gpu_info.pixel_format,
+                        flags: gpu_info.flags,
+                    };
+                    device::set_framebuffer_info(fb_info);
+                    set_screen_size(gpu_info.width, gpu_info.height);
+                    let pid = process::current_pid();
+                    for &token in &gpu_info.tokens {
+                        if shared_memory::grant_kernel(token, pid).is_err() {
+                            return SyscallError::Unknown.to_u64();
+                        }
+                    }
+                    if shared_memory::grant_kernel(gpu_info.cursor_token, pid).is_err() {
+                        return SyscallError::Unknown.to_u64();
+                    }
+                    out_buf.copy_from_slice(fb_info.as_bytes());
+                    0
+                }
+                Err(()) => SyscallError::NotSupported.to_u64(),
+            }
         }
         _ => SyscallError::InvalidArgument.to_u64(),
     }
@@ -795,7 +833,7 @@ fn sys_poll(fds: &[u64], fds_len: u64, timeout_nanos: u64) -> u64 {
     }
 }
 
-fn sys_send_msg(target_pid: u64, user_msg: &message::UserMessage, payload: Vec<u8>) -> u64 {
+fn sys_send_msg(target_pid: u64, user_msg: &message::RawMessage, payload: Vec<u8>) -> u64 {
     let msg = message::Message {
         sender: process::current_pid(),
         msg_type: user_msg.msg_type,
@@ -804,7 +842,7 @@ fn sys_send_msg(target_pid: u64, user_msg: &message::UserMessage, payload: Vec<u
     if process::send_message(process::Pid::from_raw(target_pid as u32), msg) { 0 } else { SyscallError::NotFound.to_u64() }
 }
 
-fn sys_recv_msg(out: &mut message::UserMessage) -> u64 {
+fn sys_recv_msg(out: &mut message::RawMessage) -> u64 {
     loop {
         let msg = process::with_current_data(|data| data.messages.pop());
         if let Some(msg) = msg {
@@ -881,23 +919,30 @@ fn sys_alloc_shared(size: u64) -> u64 {
 fn sys_grant_shared(token: u64, target_pid: u64) -> u64 {
     let pid = process::current_pid();
     let token = shared_memory::SharedToken::from_raw(token as u32);
-    if shared_memory::grant(token, pid, process::Pid::from_raw(target_pid as u32)) { 0 } else { SyscallError::PermissionDenied.to_u64() }
+    match shared_memory::grant(token, pid, process::Pid::from_raw(target_pid as u32)) {
+        Ok(()) => 0,
+        Err(shared_memory::Error::NotFound) => SyscallError::NotFound.to_u64(),
+        Err(shared_memory::Error::PermissionDenied) => SyscallError::PermissionDenied.to_u64(),
+    }
 }
 
 fn sys_map_shared(token: u64) -> u64 {
     let pid = process::current_pid();
     let pml4 = process::with_current_sched(|s| s.cr3().unwrap().as_ptr());
     match shared_memory::map(shared_memory::SharedToken::from_raw(token as u32), pid, pml4) {
-        Some(addr) => addr,
-        None => SyscallError::PermissionDenied.to_u64(),
+        Ok(addr) => addr,
+        Err(shared_memory::Error::NotFound) => SyscallError::NotFound.to_u64(),
+        Err(shared_memory::Error::PermissionDenied) => SyscallError::PermissionDenied.to_u64(),
     }
 }
 
 fn sys_release_shared(token: u64) -> u64 {
     let pid = process::current_pid();
-    let pml4 = process::with_current_sched(|s| s.cr3().unwrap().as_ptr());
     let token = shared_memory::SharedToken::from_raw(token as u32);
-    if shared_memory::release(token, pid, pml4) { 0 } else { SyscallError::NotFound.to_u64() }
+    match shared_memory::release(token, pid) {
+        Ok(()) => 0,
+        Err(_) => SyscallError::NotFound.to_u64(),
+    }
 }
 
 fn sys_mmap(req_addr: u64, size: u64, _prot: u64, flags: u64) -> u64 {
@@ -919,7 +964,7 @@ fn sys_mmap(req_addr: u64, size: u64, _prot: u64, flags: u64) -> u64 {
         let mut offset = 0u64;
         let mut ok = true;
         while cur < end {
-            if !paging::remap_user_2m(pml4, cur, phys_addr + offset) {
+            if !paging::remap_user_2m_in(pml4, cur, phys_addr + offset) {
                 let mut undo = start;
                 while undo < cur {
                     paging::restore_identity_2m(pml4, undo);
@@ -932,6 +977,8 @@ fn sys_mmap(req_addr: u64, size: u64, _prot: u64, flags: u64) -> u64 {
             offset += paging::PAGE_2M;
         }
         if ok {
+            cpu::flush_tlb();
+            apic::tlb_shootdown();
             process::with_current_data(|data| {
                 data.mmap_regions.push(process::MmapRegion {
                     addr: start, size: aligned, alloc, fixed: true,
@@ -1169,15 +1216,31 @@ fn sys_dlopen(path: &str) -> u64 {
         }
     };
 
-    let lib = match crate::elf::load_shared_lib(&binary) {
-        Ok(l) => l,
+    let (lib, _rw_vaddr) = match crate::elf::load_shared_lib(&binary) {
+        Ok(result) => result,
         Err(msg) => {
             log!("dlopen: {}", msg);
             return SyscallError::Unknown.to_u64();
         }
     };
 
-    paging::map_user(lib.alloc.ptr() as u64, lib.alloc.size() as u64);
+    match &lib.memory {
+        crate::elf::LibMemory::Owned(alloc) => {
+            paging::map_user(alloc.ptr() as u64, alloc.size() as u64);
+        }
+        crate::elf::LibMemory::Shared { rw_alloc, shared_addr, shared_size, total_cached_size, .. } => {
+            let pml4 = cpu::read_cr3() as *mut u64;
+            paging::map_user_readonly_in(pml4, *shared_addr, *total_cached_size as u64);
+            let num_rw_pages = paging::align_2m(rw_alloc.size()) / paging::PAGE_2M as usize;
+            for i in 0..num_rw_pages {
+                let virt = *shared_addr + *shared_size as u64 + i as u64 * paging::PAGE_2M;
+                let phys = rw_alloc.ptr() as u64 + i as u64 * paging::PAGE_2M;
+                paging::remap_user_2m_in(pml4, virt, phys);
+            }
+            cpu::flush_tlb();
+            apic::tlb_shootdown();
+        }
+    }
 
     let lib_has_tls = lib.tls_memsz > 0;
 

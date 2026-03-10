@@ -1,4 +1,4 @@
-use std::os::toyos::system;
+use toyos_abi::system;
 
 pub fn main(_args: Vec<String>) {
     let mut buf = [0u8; 48];

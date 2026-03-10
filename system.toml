@@ -1,0 +1,25 @@
+# Init programs (run at boot, in order)
+init = [
+    "/bin/toybox --install",
+    "/bin/toybox locale --load",
+    "/bin/compositor",
+    "/bin/netd",
+    "/bin/sshd",
+]
+
+[programs]
+shell = {}
+terminal = {}
+compositor = {}
+netd = {}
+sshd = {}
+doom = {}
+snake = {}
+editor = {}
+paint = {}
+files = {}
+filepicker = {}
+toybox = {}
+input-test = {}
+proctest = {}
+cargo = { no-default-features = true, warnings = false }

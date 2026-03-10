@@ -271,11 +271,11 @@ pub fn recv_from_netd() -> ReceivedMessage {
 }
 
 pub fn check_response(msg: &ReceivedMessage) -> Result<(), NetError> {
-    if msg.msg_type == MSG_ERROR {
+    if msg.msg_type() == MSG_ERROR {
         let err: ErrorResponse = msg.payload();
         return Err(NetError::from_error_code(err.code));
     }
-    if msg.msg_type != MSG_RESULT {
+    if msg.msg_type() != MSG_RESULT {
         return Err(NetError::UnexpectedResponse);
     }
     Ok(())

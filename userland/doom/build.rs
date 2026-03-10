@@ -15,8 +15,9 @@ fn main() {
     // not the toyos cross-toolchain from userland/rust-toolchain.toml.
     // Setting RUSTUP_TOOLCHAIN overrides the toml file.
     let toyos_cc_dir = root.join("../toyos-cc");
+    let host = std::env::var("HOST").unwrap();
     let status = Command::new("cargo")
-        .args(["build", "--quiet"])
+        .args(["build", "--quiet", "--release", "--target", &host])
         .current_dir(&toyos_cc_dir)
         .env("RUSTUP_TOOLCHAIN", "stable")
         .env_remove("RUSTC")
@@ -25,7 +26,8 @@ fn main() {
         .status()
         .expect("failed to build toyos-cc");
     assert!(status.success(), "toyos-cc build failed");
-    let toyos_cc = toyos_cc_dir.join("target/debug/toyos-cc");
+    // toyos-cc is a workspace member — output goes to the workspace target dir
+    let toyos_cc = root.join(format!("../target/{host}/release/toyos-cc"));
 
     let target = std::env::var("TARGET").unwrap();
 

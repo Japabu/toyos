@@ -691,8 +691,12 @@ pub(crate) fn emit_elf(
     };
 
     let has_dynamic_libs = is_pie && !state.dynamic_libs.is_empty();
+    let has_relocs = relocs.as_ref().is_some_and(|r| {
+        !r.relatives.is_empty() || !r.glob_dats.is_empty() || !r.tpoff64s.is_empty()
+            || !r.named_tpoff64s.is_empty() || !r.tpoff32s.is_empty()
+    });
     let needs_dynamic = is_shared || has_dynamic_libs
-        || (is_pie && (layout.init_array_size > 0 || layout.fini_array_size > 0));
+        || (is_pie && (layout.init_array_size > 0 || layout.fini_array_size > 0 || has_relocs));
     let has_eh_frame_hdr = !eh_frame_hdr.is_empty();
     let has_build_id = layout.build_id_note_vaddr != 0;
     let has_plt = (is_pie || is_shared) && !layout.plt_data.is_empty();
@@ -764,7 +768,7 @@ pub(crate) fn emit_elf(
             let is_tls = state.sections[*section].kind.is_tls();
             let st_value = if is_tls {
                 // TLS symbols: st_value is offset within the TLS segment
-                *value
+                state.sections[*section].vaddr.unwrap() - layout.tls_start + *value
             } else {
                 state.sections[*section].vaddr.unwrap() + value
             };
@@ -929,6 +933,14 @@ pub(crate) fn emit_elf(
     };
 
     let (dynamic_count, dynamic_off, dyn_segment_end);
+    // For non-shared dynamic binaries, reserve relocations before the dynamic
+    // section so they're in the same PT_LOAD segment and accessible at runtime.
+    let rela_before_dynamic = !is_shared && !has_dynamic_libs && needs_dynamic && rela_count > 0;
+    let rela_off_pre = if rela_before_dynamic {
+        w.reserve_relocations(rela_count, true) as u64
+    } else {
+        0
+    };
     if needs_dynamic {
         let mut dc = 1; // DT_NULL
         if has_dynamic_libs {
@@ -952,6 +964,8 @@ pub(crate) fn emit_elf(
 
     let rela_off = if is_shared {
         rela_off_shared
+    } else if rela_off_pre != 0 {
+        rela_off_pre
     } else if rela_count > 0 || is_pie {
         w.reserve_relocations(rela_count, true) as u64
     } else {
@@ -1231,6 +1245,56 @@ pub(crate) fn emit_elf(
         }
     }
 
+    // For non-shared dynamic binaries without DT_NEEDED, write RELA before dynamic
+    // section so relocations are within the PT_LOAD segment for the dynamic area.
+    if rela_before_dynamic {
+        if let Some(relocs) = relocs {
+            w.write_align_relocation();
+            for &(offset, addend) in &relocs.relatives {
+                w.write_relocation(true, &Rel {
+                    r_offset: offset,
+                    r_sym: 0,
+                    r_type: elf::R_X86_64_RELATIVE,
+                    r_addend: addend,
+                });
+            }
+            for (got_vaddr, sym_name) in &relocs.glob_dats {
+                let sym_idx = sym_to_writer_idx[sym_name];
+                w.write_relocation(true, &Rel {
+                    r_offset: *got_vaddr,
+                    r_sym: sym_idx.0,
+                    r_type: elf::R_X86_64_GLOB_DAT,
+                    r_addend: 0,
+                });
+            }
+            for &(got_vaddr, addend) in &relocs.tpoff64s {
+                w.write_relocation(true, &Rel {
+                    r_offset: got_vaddr,
+                    r_sym: 0,
+                    r_type: elf::R_X86_64_TPOFF64,
+                    r_addend: addend,
+                });
+            }
+            for (got_vaddr, sym_name) in &relocs.named_tpoff64s {
+                let sym_idx = sym_to_writer_idx[sym_name];
+                w.write_relocation(true, &Rel {
+                    r_offset: *got_vaddr,
+                    r_sym: sym_idx.0,
+                    r_type: elf::R_X86_64_TPOFF64,
+                    r_addend: 0,
+                });
+            }
+            for &(vaddr, addend) in &relocs.tpoff32s {
+                w.write_relocation(true, &Rel {
+                    r_offset: vaddr,
+                    r_sym: 0,
+                    r_type: elf::R_X86_64_TPOFF32,
+                    r_addend: addend,
+                });
+            }
+        }
+    }
+
     // Dynamic section
     if needs_dynamic {
         w.write_align_dynamic();
@@ -1270,7 +1334,7 @@ pub(crate) fn emit_elf(
     }
 
     // Relocations (PIE / non-shared — shared writes RELA before dynamic section)
-    if !is_shared {
+    if !is_shared && !rela_before_dynamic {
         if let Some(relocs) = relocs {
             w.write_align_relocation();
             for &(offset, addend) in &relocs.relatives {
@@ -1290,6 +1354,14 @@ pub(crate) fn emit_elf(
                     r_addend: 0,
                 });
             }
+            for &(got_vaddr, addend) in &relocs.tpoff64s {
+                w.write_relocation(true, &Rel {
+                    r_offset: got_vaddr,
+                    r_sym: 0,
+                    r_type: elf::R_X86_64_TPOFF64,
+                    r_addend: addend,
+                });
+            }
             for (got_vaddr, sym_name) in &relocs.named_tpoff64s {
                 let sym_idx = sym_to_writer_idx[sym_name];
                 w.write_relocation(true, &Rel {
@@ -1297,6 +1369,14 @@ pub(crate) fn emit_elf(
                     r_sym: sym_idx.0,
                     r_type: elf::R_X86_64_TPOFF64,
                     r_addend: 0,
+                });
+            }
+            for &(vaddr, addend) in &relocs.tpoff32s {
+                w.write_relocation(true, &Rel {
+                    r_offset: vaddr,
+                    r_sym: 0,
+                    r_type: elf::R_X86_64_TPOFF32,
+                    r_addend: addend,
                 });
             }
         }

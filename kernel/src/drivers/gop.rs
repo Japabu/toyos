@@ -20,6 +20,10 @@ impl Gpu for GopGpu {
     fn move_cursor(&mut self, _x: u32, _y: u32) {
         // No hardware cursor on GOP.
     }
+
+    fn set_resolution(&mut self, _width: u32, _height: u32) -> Result<GpuInfo, ()> {
+        Err(()) // GOP cannot change resolution after UEFI boot services exit
+    }
 }
 
 /// Initialize the UEFI GOP framebuffer driver.

@@ -1,0 +1,56 @@
+use std::process::Command;
+
+pub fn launch(debug: bool) {
+    let mut qemu = Command::new("qemu-system-x86_64");
+    qemu
+        .arg("-machine").arg("q35")
+        .arg("-cpu").arg("qemu64,+rdrand")
+        .arg("-smp").arg("1")
+        .arg("-m").arg("8G")
+        // Flash the OVMF UEFI firmware
+        .arg("-drive").arg("if=pflash,format=raw,unit=0,file=ovmf/OVMF_CODE-pure-efi.fd,readonly=on")
+        .arg("-drive").arg("if=pflash,format=raw,unit=1,file=ovmf/OVMF_VARS-pure-efi.fd,readonly=on")
+
+        // Create xHCI controller for USB
+        .arg("-device").arg("nec-usb-xhci,id=xhci")
+
+        // Create a USB stick with the bootable image
+        .arg("-drive").arg("if=none,id=stick,format=raw,file=target/bootable.img")
+        .arg("-device").arg("usb-storage,bus=xhci.0,drive=stick,bootindex=0")
+
+        // USB keyboard + mouse
+        .arg("-device").arg("usb-kbd,bus=xhci.0")
+        .arg("-device").arg("usb-mouse,bus=xhci.0")
+
+        // NVMe SSD
+        .arg("-drive").arg("if=none,id=nvme0,format=raw,file=target/nvme.img")
+        .arg("-device").arg("nvme,serial=deadbeef,drive=nvme0")
+
+        // VirtIO GPU (no legacy VGA)
+        .arg("-vga").arg("none")
+        .arg("-device").arg("virtio-gpu-pci,xres=1280,yres=720")
+
+        // VirtIO networking with user-mode (SLIRP) backend
+        .arg("-netdev").arg("user,id=net0,hostfwd=tcp::2222-:22")
+        .arg("-device").arg("virtio-net-pci-non-transitional,netdev=net0")
+
+        // VirtIO sound
+        .arg("-audiodev").arg("coreaudio,id=audio0")
+        .arg("-device").arg("virtio-sound-pci,audiodev=audio0,streams=1")
+
+        .arg("-serial").arg("stdio")
+
+        .arg("-no-reboot")
+
+        // Enable gdb at port 1234
+        .arg("-s")
+
+        // QMP socket for programmatic control
+        .arg("-qmp").arg("unix:/tmp/toyos-qmp.sock,server,nowait");
+
+    if debug {
+        eprintln!("Debug mode: kernel will wait for debugger before entering userland");
+    }
+
+    qemu.status().expect("failed to execute QEMU");
+}

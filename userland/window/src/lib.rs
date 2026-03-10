@@ -3,15 +3,14 @@ pub mod framebuffer;
 pub use framebuffer::{Color, Framebuffer};
 
 use std::os::toyos::message::{self, Message};
-use std::os::toyos::poll;
-use std::os::toyos::services;
-use std::os::toyos::shm::SharedMemory;
+use toyos_abi::poll;
+use toyos_abi::services;
+use toyos_abi::shm::SharedMemory;
 use std::sync::OnceLock;
-use std::time::Duration;
 
 fn compositor_pid() -> u32 {
     static PID: OnceLock<u32> = OnceLock::new();
-    *PID.get_or_init(|| services::find("compositor").expect("no compositor running"))
+    *PID.get_or_init(|| services::find("compositor").expect("no compositor running").0)
 }
 
 // Window flags
@@ -23,6 +22,8 @@ pub const MSG_PRESENT: u32 = 2;
 pub const MSG_CLIPBOARD_SET: u32 = 3;
 pub const MSG_DESTROY_WINDOW: u32 = 4;
 pub const MSG_SET_CURSOR: u32 = 5;
+pub const MSG_SET_RESOLUTION: u32 = 6;
+pub const MSG_GET_RESOLUTION: u32 = 7;
 
 // Cursor styles
 pub const CURSOR_DEFAULT: u8 = 0;
@@ -37,6 +38,20 @@ pub const MSG_WINDOW_CLOSE: u32 = 4;
 pub const MSG_MOUSE_INPUT: u32 = 5;
 pub const MSG_CLIPBOARD_PASTE: u32 = 6;
 pub const MSG_FRAME: u32 = 7;
+pub const MSG_RESOLUTION_CHANGED: u32 = 8;
+
+#[repr(C)]
+pub struct ResolutionRequest {
+    pub width: u32,
+    pub height: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ResolutionInfo {
+    pub width: u32,
+    pub height: u32,
+}
 
 #[repr(C)]
 pub struct CreateWindowRequest {
@@ -186,8 +201,8 @@ impl Window {
 
     /// Wait up to `timeout_nanos` for an event. Returns `None` on timeout.
     pub fn poll_event(&mut self, timeout_nanos: u64) -> Option<Event> {
-        let result = poll::poll(&[], Some(Duration::from_nanos(timeout_nanos)));
-        if result.has_messages() {
+        let result = poll::poll_timeout(&[], Some(timeout_nanos));
+        if result.messages() {
             Some(self.recv_event())
         } else {
             None
@@ -235,6 +250,15 @@ impl Window {
             self.width as usize,
             self.pixel_format,
         )
+    }
+}
+
+impl std::fmt::Debug for Window {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Window")
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .finish_non_exhaustive()
     }
 }
 

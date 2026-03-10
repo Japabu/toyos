@@ -7,20 +7,8 @@ use crate::vfs::Vfs;
 use crate::{device, keyboard, mouse, log, pipe};
 use crate::pipe::PipeId;
 use crate::drivers::serial;
+pub use toyos_abi::FramebufferInfo;
 use toyos_abi::syscall::{FileType, OpenFlags, SeekFrom, SyscallError};
-
-
-#[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct FramebufferInfo {
-    pub token: [u32; 2],
-    pub cursor_token: u32,
-    pub width: u32,
-    pub height: u32,
-    pub stride: u32,
-    pub pixel_format: u32,
-    pub flags: u32,
-}
 
 #[derive(Clone)]
 pub struct OpenFile {
@@ -172,7 +160,7 @@ pub fn try_read(table: &mut FdTable, fd: u32, buf: &mut [u8]) -> Option<u64> {
             let mut count = 0;
             while count + event_size <= buf.len() {
                 if let Some(event) = keyboard::try_read_event() {
-                    let bytes = bytemuck::bytes_of(&event);
+                    let bytes = event.as_bytes();
                     buf[count..count + event_size].copy_from_slice(bytes);
                     count += event_size;
                 } else {
@@ -187,7 +175,7 @@ pub fn try_read(table: &mut FdTable, fd: u32, buf: &mut [u8]) -> Option<u64> {
             let mut count = 0;
             while count + event_size <= buf.len() {
                 if let Some(event) = mouse::try_read_event() {
-                    let bytes = bytemuck::bytes_of(&event);
+                    let bytes = event.as_bytes();
                     buf[count..count + event_size].copy_from_slice(bytes);
                     count += event_size;
                 } else {
@@ -197,15 +185,13 @@ pub fn try_read(table: &mut FdTable, fd: u32, buf: &mut [u8]) -> Option<u64> {
             if count > 0 { Some(count as u64) } else { None }
         }
         Descriptor::Framebuffer(info) => {
-            let bytes = bytemuck::bytes_of(info);
+            let bytes = info.as_bytes();
             let count = buf.len().min(bytes.len());
             buf[..count].copy_from_slice(&bytes[..count]);
             Some(count as u64)
         }
         Descriptor::Nic(info) => {
-            let bytes = unsafe {
-                core::slice::from_raw_parts(info as *const _ as *const u8, core::mem::size_of_val(info))
-            };
+            let bytes = info.as_bytes();
             let count = buf.len().min(bytes.len());
             buf[..count].copy_from_slice(&bytes[..count]);
             Some(count as u64)
@@ -277,9 +263,11 @@ pub fn seek(table: &mut FdTable, fd: u32, pos: SeekFrom) -> u64 {
     file.position as u64
 }
 
-/// Raw stat struct for the syscall boundary (must be Pod for user pointer access).
+/// Raw stat struct for the syscall boundary.
+/// Uses `u64` for file_type (not `FileType` enum) so `user_mut` can safely
+/// point at uninitialized user memory without creating an invalid enum reference.
 #[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+#[derive(Clone, Copy)]
 pub struct Stat {
     pub file_type: u64,
     pub size: u64,

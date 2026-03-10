@@ -1,0 +1,333 @@
+use std::collections::HashMap;
+use std::fs;
+use std::path::Path;
+use std::process::Command;
+
+use serde::Deserialize;
+
+use crate::assets;
+use crate::image;
+use crate::toolchain;
+
+#[derive(Deserialize)]
+struct SystemConfig {
+    programs: HashMap<String, ProgramConfig>,
+    init: Vec<String>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default, rename_all = "kebab-case")]
+struct ProgramConfig {
+    no_default_features: bool,
+    warnings: Option<bool>,
+}
+
+pub fn build(root: &Path, debug: bool, release: bool, toolchain_changed: bool) {
+    let profile = if release { "release" } else { "debug" };
+    let rustflags = match std::env::var("RUSTFLAGS") {
+        Ok(flags) => format!("{flags} -Dwarnings"),
+        Err(_) => "-Dwarnings".to_string(),
+    };
+
+    // Build kernel
+    let mut kernel_args = vec!["build", "--target", "x86_64-unknown-none"];
+    if release {
+        kernel_args.push("--release");
+    }
+    if debug {
+        kernel_args.push("--features");
+        kernel_args.push("debug-wait");
+    }
+    if !Command::new("cargo")
+        .args(&kernel_args)
+        .current_dir(root.join("kernel"))
+        .env("RUSTUP_TOOLCHAIN", "toyos")
+        .env("RUSTFLAGS", &rustflags)
+        .env_remove("RUSTC")
+        .status()
+        .expect("Failed to run cargo")
+        .success()
+    {
+        panic!("Failed to build kernel");
+    }
+
+    // Build bootloader
+    let config: SystemConfig = toml::from_str(
+        &fs::read_to_string(root.join("system.toml")).expect("Failed to read system.toml"),
+    )
+    .expect("Failed to parse system.toml");
+
+    let init_programs = config.init.join(";");
+    let mut bl_args = vec!["build", "--target", "x86_64-unknown-uefi"];
+    if release {
+        bl_args.push("--release");
+    }
+    if !Command::new("cargo")
+        .args(&bl_args)
+        .current_dir(root.join("bootloader"))
+        .env("RUSTUP_TOOLCHAIN", "toyos")
+        .env("RUSTFLAGS", &rustflags)
+        .env("INIT_PROGRAMS", &init_programs)
+        .env_remove("RUSTC")
+        .status()
+        .expect("Failed to run cargo")
+        .success()
+    {
+        panic!("Failed to build bootloader");
+    }
+
+    // Ensure the ToyOS sysroot has host target libraries so proc-macros can compile
+    ensure_host_target_in_sysroot(root);
+
+    let userland_dir = root.join("userland");
+
+    // Clean workspace target on toolchain change
+    if toolchain_changed {
+        for subdir in ["target/x86_64-unknown-toyos", "target/debug"] {
+            let dir = userland_dir.join(subdir);
+            if dir.exists() {
+                eprintln!("toolchain changed: cleaning userland/{subdir}");
+                fs::remove_dir_all(&dir).ok();
+            }
+        }
+    }
+
+    // Partition programs into workspace members vs standalone (own workspace / special config)
+    let mut workspace_packages: Vec<&String> = Vec::new();
+    let mut standalone: Vec<(&String, &ProgramConfig)> = Vec::new();
+    for (name, prog_config) in &config.programs {
+        let path = userland_dir.join(name);
+        assert!(
+            path.join("Cargo.toml").exists(),
+            "Program '{name}' listed in system.toml but userland/{name}/Cargo.toml not found"
+        );
+        if prog_config.no_default_features || prog_config.warnings == Some(false) {
+            standalone.push((name, prog_config));
+        } else {
+            workspace_packages.push(name);
+        }
+    }
+
+    // Build workspace programs in one shot
+    if !workspace_packages.is_empty() {
+        let mut args = vec!["build", "--target", "x86_64-unknown-toyos"];
+        if release {
+            args.push("--release");
+        }
+        for pkg in &workspace_packages {
+            args.push("-p");
+            args.push(pkg);
+        }
+        if !Command::new("cargo")
+            .args(&args)
+            .current_dir(&userland_dir)
+            .env("RUSTUP_TOOLCHAIN", "toyos")
+            .env("RUSTFLAGS", &rustflags)
+            .env_remove("RUSTC")
+            .status()
+            .expect("Failed to run cargo")
+            .success()
+        {
+            panic!("Failed to build userland workspace");
+        }
+    }
+
+    // Build standalone programs individually (e.g. cargo — own workspace, special flags)
+    for (name, prog_config) in &standalone {
+        let path = userland_dir.join(name);
+
+        if toolchain_changed {
+            for subdir in ["target/x86_64-unknown-toyos", "target/debug"] {
+                let dir = path.join(subdir);
+                if dir.exists() {
+                    eprintln!("toolchain changed: cleaning userland/{name}/{subdir}");
+                    fs::remove_dir_all(&dir).ok();
+                }
+            }
+        }
+
+        let mut args = vec!["build", "--target", "x86_64-unknown-toyos"];
+        if release {
+            args.push("--release");
+        }
+        if prog_config.no_default_features {
+            args.push("--no-default-features");
+        }
+        let env_rustflags = if prog_config.warnings.unwrap_or(true) {
+            rustflags.as_str()
+        } else {
+            ""
+        };
+        if !Command::new("cargo")
+            .args(&args)
+            .current_dir(&path)
+            .env("RUSTUP_TOOLCHAIN", "toyos")
+            .env("RUSTFLAGS", env_rustflags)
+            .env_remove("RUSTC")
+            .status()
+            .expect("Failed to run cargo")
+            .success()
+        {
+            panic!("Failed to build userland/{name}");
+        }
+    }
+
+    // Collect binaries into initrd
+    let mut initrd_files: Vec<(String, Vec<u8>)> = Vec::new();
+    let workspace_target = userland_dir.join(format!("target/x86_64-unknown-toyos/{profile}"));
+
+    for (name, prog_config) in &config.programs {
+        let binary = if prog_config.no_default_features || prog_config.warnings == Some(false) {
+            userland_dir.join(name).join(format!("target/x86_64-unknown-toyos/{profile}/{name}"))
+        } else {
+            workspace_target.join(name)
+        };
+        let data =
+            fs::read(&binary).unwrap_or_else(|_| panic!("Failed to read binary for {name}"));
+        initrd_files.push((format!("bin/{name}"), data));
+    }
+
+    // Add hosted rustc sysroot if it exists
+    collect_hosted_rustc(root, &mut initrd_files);
+
+    // Add assets
+    initrd_files.extend(assets::collect());
+
+    // Write initrd contents to target/initrd/ for inspection
+    let initrd_dir = root.join("target/initrd");
+    if initrd_dir.exists() {
+        fs::remove_dir_all(&initrd_dir).expect("Failed to clean initrd dir");
+    }
+    for (name, data) in &initrd_files {
+        let path = initrd_dir.join(name);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, data).unwrap();
+    }
+    eprintln!("initrd contents written to target/initrd/");
+
+    let initrd_bytes = image::create_initrd(&initrd_files);
+    let disk_bytes = image::create_boot_image(&initrd_bytes, profile);
+
+    fs::write(root.join("target/bootable.img"), disk_bytes).expect("Failed to write image");
+
+    // Create empty NVMe disk image if it doesn't already exist
+    let nvme_path = root.join("target/nvme.img");
+    if !nvme_path.exists() {
+        let nvme_bytes = vec![0u8; 1024 * 1024 * 1024];
+        fs::write(&nvme_path, nvme_bytes).expect("Failed to write NVMe image");
+    }
+}
+
+fn collect_hosted_rustc(root: &Path, initrd_files: &mut Vec<(String, Vec<u8>)>) {
+    let sysroot = root.join("rust/build/x86_64-unknown-toyos/stage2");
+    if !sysroot.exists() {
+        return;
+    }
+
+    let rustc = sysroot.join("bin/rustc");
+    if rustc.exists() {
+        initrd_files.push(("bin/rustc".to_string(), fs::read(&rustc).unwrap()));
+    }
+
+    // Shared libraries
+    if let Ok(entries) = fs::read_dir(sysroot.join("lib")) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e == "so") {
+                let name = path.file_name().unwrap().to_str().unwrap().to_string();
+                let data = fs::read(&path).unwrap();
+                initrd_files.push((format!("lib/{name}"), data));
+            }
+        }
+    }
+
+    // Codegen backends
+    let backends = sysroot.join("lib/rustlib/x86_64-unknown-toyos/codegen-backends");
+    if backends.exists() {
+        for entry in fs::read_dir(&backends).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e == "so") {
+                let name = path.file_name().unwrap().to_str().unwrap().to_string();
+                let data = fs::read(&path).unwrap();
+                initrd_files.push((
+                    format!("lib/rustlib/x86_64-unknown-toyos/codegen-backends/{name}"),
+                    data,
+                ));
+            }
+        }
+    }
+
+    // Target .rlib files
+    if let Some(host_rlibs) = find_host_rlibs(root) {
+        for entry in fs::read_dir(&host_rlibs).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path
+                .extension()
+                .is_some_and(|e| e == "rlib" || e == "rmeta")
+            {
+                let name = path.file_name().unwrap().to_str().unwrap().to_string();
+                initrd_files.push((
+                    format!("lib/rustlib/x86_64-unknown-toyos/lib/{name}"),
+                    fs::read(&path).unwrap(),
+                ));
+            }
+        }
+    }
+}
+
+fn find_host_rlibs(root: &Path) -> Option<std::path::PathBuf> {
+    let build_dir = root.join("rust/build");
+    let entries = fs::read_dir(&build_dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path
+            .file_name()
+            .is_some_and(|n| n == "x86_64-unknown-toyos")
+        {
+            continue;
+        }
+        let rlib_dir = path.join("stage2/lib/rustlib/x86_64-unknown-toyos/lib");
+        if rlib_dir.exists() {
+            return Some(rlib_dir);
+        }
+    }
+    None
+}
+
+fn ensure_host_target_in_sysroot(root: &Path) {
+    let host = toolchain::host_triple();
+    let toyos_sysroot = root.join("rust/build/x86_64-unknown-toyos/stage2/lib/rustlib");
+    if !toyos_sysroot.exists() {
+        return;
+    }
+    let host_target_dir = toyos_sysroot.join(&host);
+    if host_target_dir.exists() {
+        return;
+    }
+
+    let output = Command::new("rustc")
+        .args(["--print", "sysroot"])
+        .output()
+        .expect("Failed to run rustc");
+    let stable_sysroot = String::from_utf8(output.stdout).unwrap();
+    let stable_sysroot = stable_sysroot.trim();
+    let source = Path::new(stable_sysroot).join("lib/rustlib").join(&host);
+    assert!(
+        source.exists(),
+        "Host target {} not found in stable toolchain at {}",
+        host,
+        source.display()
+    );
+
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&source, &host_target_dir).unwrap_or_else(|e| {
+        panic!(
+            "Failed to symlink {} -> {}: {}",
+            host_target_dir.display(),
+            source.display(),
+            e
+        )
+    });
+    #[cfg(not(unix))]
+    panic!("Symlinking host target not supported on this platform");
+}

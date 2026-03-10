@@ -1,5 +1,5 @@
 use std::os::toyos::message::{self, Message};
-use std::os::toyos::services;
+use toyos_abi::services;
 
 // Message types for filepicker protocol
 pub const MSG_FILEPICKER_REQUEST: u32 = 1;
@@ -22,7 +22,7 @@ pub struct FilePickerRequest {
 /// Request the system file picker. Blocks until the user picks a file or cancels.
 /// Returns `Some(path)` if a file was chosen, `None` if cancelled.
 pub fn pick_file(mode: PickerMode, start_dir: &str) -> Option<String> {
-    let pid = services::find("filepicker")?;
+    let pid = services::find("filepicker")?.0;
 
     let mut req = FilePickerRequest {
         mode: mode as u8,

@@ -1,6 +1,6 @@
 # ToyOS
 
-A bootloader, bootable image creator and kernel attempt from scratch
+A custom OS with bootloader, kernel, and userland built from scratch in Rust.
 
 ## Prerequisites
 
@@ -10,9 +10,9 @@ A bootloader, bootable image creator and kernel attempt from scratch
 ## How to run
 
 ```
-git submodule update --init
-cd toolchain && cargo run
-cd ../bootable && cargo run
+cargo run
 ```
 
-The toolchain step builds a custom Rust compiler+std from the `rust/` submodule and links it as `+toyos`. Only needed once (or after modifying `rust/`).
+This automatically initializes git submodules, bootstraps the custom Rust toolchain (on first run), builds the kernel, bootloader, and userland, then launches QEMU.
+
+Subsequent runs detect changes and only rebuild what's needed. Std-only changes rebuild in ~8 seconds.

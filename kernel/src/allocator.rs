@@ -140,8 +140,18 @@ impl BuddyAllocator {
             self.list_insert(buddy_pfn, k);
         }
 
-        // Mark pages as allocated in bitmap
+        // Verify pages are NOT already allocated (catch double-alloc / corruption)
         let page_count = 1usize << order;
+        for i in 0..page_count {
+            if self.is_allocated(pfn as usize + i) {
+                panic!(
+                    "buddy alloc: page {} already allocated (pfn={:#x}, order={}, i={})",
+                    pfn as usize + i, pfn, order, i
+                );
+            }
+        }
+
+        // Mark pages as allocated in bitmap
         for i in 0..page_count {
             self.set_allocated(pfn as usize + i);
         }
@@ -152,6 +162,16 @@ impl BuddyAllocator {
 
     fn free(&mut self, pfn: u64, order: usize) {
         let page_count = 1usize << order;
+
+        // Verify pages ARE allocated (catch double-free)
+        for i in 0..page_count {
+            if !self.is_allocated(pfn as usize + i) {
+                panic!(
+                    "buddy free: page {} not allocated (pfn={:#x}, order={}, i={})",
+                    pfn as usize + i, pfn, order, i
+                );
+            }
+        }
 
         // Clear bitmap bits
         for i in 0..page_count {

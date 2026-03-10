@@ -1,14 +1,44 @@
 use std::fs;
 
 pub fn main(args: Vec<String>) {
-    if args.is_empty() {
-        eprintln!("Usage: rm <file>");
+    let mut recursive = false;
+    let mut paths = Vec::new();
+
+    for arg in &args {
+        match arg.as_str() {
+            "-r" | "-rf" | "-fr" => recursive = true,
+            _ => paths.push(arg.as_str()),
+        }
+    }
+
+    if paths.is_empty() {
+        eprintln!("Usage: rm [-r] <path>...");
         return;
     }
-    for path in &args {
-        match fs::remove_file(path) {
+
+    for path in paths {
+        let meta = match fs::metadata(path) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("rm: {}: {}", path, e);
+                continue;
+            }
+        };
+
+        let result = if meta.is_dir() {
+            if recursive {
+                fs::remove_dir_all(path)
+            } else {
+                eprintln!("rm: {}: is a directory (use -r)", path);
+                continue;
+            }
+        } else {
+            fs::remove_file(path)
+        };
+
+        match result {
             Ok(()) => println!("{}: deleted", path),
-            Err(_) => eprintln!("{}: file not found", path),
+            Err(e) => eprintln!("rm: {}: {}", path, e),
         }
     }
 }

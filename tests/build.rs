@@ -15,7 +15,7 @@ fn main() {
         "userland/toyos-cc/src",
         "toyos-abi/src",
         "kernel/src",
-        "bootable/src",
+        "src",
     ] {
         println!("cargo:rerun-if-changed={}", repo_root.join(dir).display());
     }

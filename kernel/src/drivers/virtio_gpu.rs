@@ -1,6 +1,7 @@
+use core::alloc::Layout;
 use core::ptr::{copy_nonoverlapping, read_volatile};
 
-use alloc::alloc::{alloc_zeroed, Layout};
+use alloc::alloc::{alloc_zeroed, dealloc};
 use alloc::boxed::Box;
 
 use super::pci::PciDevice;
@@ -9,7 +10,7 @@ use super::DmaPool;
 use crate::arch::paging::{self, PAGE_2M};
 use crate::gpu::{FLAG_HARDWARE_CURSOR, Gpu, GpuInfo};
 use crate::log;
-use crate::shared_memory;
+use crate::shared_memory::{self, SharedToken};
 use crate::sync::Lock;
 
 // VirtIO GPU PCI identity
@@ -19,6 +20,7 @@ const VIRTIO_GPU_DEVICE: u16 = 0x1050; // 0x1040 + device_id 16
 // GPU command types
 const CMD_GET_DISPLAY_INFO: u32 = 0x0100;
 const CMD_RESOURCE_CREATE_2D: u32 = 0x0101;
+const CMD_RESOURCE_UNREF: u32 = 0x0102;
 const CMD_SET_SCANOUT: u32 = 0x0103;
 const CMD_RESOURCE_FLUSH: u32 = 0x0104;
 const CMD_TRANSFER_TO_HOST_2D: u32 = 0x0105;
@@ -107,6 +109,14 @@ struct ResourceCreate2d {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+struct ResourceUnref {
+    hdr: CtrlHeader,
+    resource_id: u32,
+    padding: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 struct SetScanout {
     hdr: CtrlHeader,
     r: Rect,
@@ -169,6 +179,14 @@ struct UpdateCursor {
     padding: u32,
 }
 
+// ---- Framebuffer allocation tracking ----
+
+struct FbAlloc {
+    tokens: [SharedToken; 2],
+    addrs: [u64; 2],
+    layout: Layout,
+}
+
 // ---- GPU Controller ----
 
 struct GpuController {
@@ -182,6 +200,8 @@ struct GpuController {
     width: u32,
     height: u32,
     resource: u32,
+    fb: FbAlloc,
+    cursor_token: SharedToken,
 }
 
 impl GpuController {
@@ -247,6 +267,16 @@ impl GpuController {
         };
         let resp = self.command(&cmd);
         assert!(resp == RESP_OK_NODATA, "VirtIO GPU: RESOURCE_CREATE_2D failed: {:#x}", resp);
+    }
+
+    fn destroy_resource(&mut self, id: u32) {
+        let cmd = ResourceUnref {
+            hdr: CtrlHeader::new(CMD_RESOURCE_UNREF),
+            resource_id: id,
+            padding: 0,
+        };
+        let resp = self.command(&cmd);
+        assert!(resp == RESP_OK_NODATA, "VirtIO GPU: RESOURCE_UNREF failed: {:#x}", resp);
     }
 
     fn attach_backing(&mut self, id: u32, addr: u64, len: u32) {
@@ -363,6 +393,43 @@ impl GpuController {
         };
         self.cursor_command(&cmd);
     }
+
+    /// Allocate framebuffer backing stores and register as shared memory.
+    fn alloc_framebuffer(&mut self, width: u32, height: u32) -> FbAlloc {
+        let fb_size = (width * height * 4) as usize;
+        let fb_aligned = paging::align_2m(fb_size);
+        let fb_layout = Layout::from_size_align(fb_aligned, PAGE_2M as usize).unwrap();
+        let mut tokens = [SharedToken::from_raw(0); 2];
+        let mut addrs = [0u64; 2];
+        for i in 0..2 {
+            let ptr = unsafe { alloc_zeroed(fb_layout) };
+            assert!(!ptr.is_null(), "VirtIO GPU: framebuffer alloc failed");
+            addrs[i] = ptr as u64;
+            tokens[i] = shared_memory::register(addrs[i], fb_aligned as u64);
+            log!("VirtIO GPU: buffer {} at {:#x} ({} bytes) token={:?}", i, addrs[i], fb_size, tokens[i]);
+        }
+        FbAlloc { tokens, addrs, layout: fb_layout }
+    }
+
+    /// Free old framebuffer backing stores and unregister shared memory.
+    fn free_framebuffer(&mut self, fb: FbAlloc) {
+        for i in 0..2 {
+            shared_memory::unregister(fb.tokens[i]);
+            unsafe { dealloc(fb.addrs[i] as *mut u8, fb.layout); }
+        }
+    }
+
+    fn build_gpu_info(&self) -> GpuInfo {
+        GpuInfo {
+            tokens: self.fb.tokens,
+            cursor_token: self.cursor_token,
+            width: self.width,
+            height: self.height,
+            stride: self.width,
+            pixel_format: 1, // BGR (B8G8R8X8_UNORM)
+            flags: FLAG_HARDWARE_CURSOR,
+        }
+    }
 }
 
 impl Gpu for GpuController {
@@ -390,6 +457,40 @@ impl Gpu for GpuController {
 
     fn move_cursor(&mut self, x: u32, y: u32) {
         GpuController::move_cursor(self, x, y);
+    }
+
+    fn set_resolution(&mut self, width: u32, height: u32) -> Result<GpuInfo, ()> {
+        if width == self.width && height == self.height {
+            return Ok(self.build_gpu_info());
+        }
+
+        log!("VirtIO GPU: changing resolution {}x{} -> {}x{}", self.width, self.height, width, height);
+
+        // Allocate new framebuffer backing
+        let new_fb = self.alloc_framebuffer(width, height);
+        let fb_size = (width * height * 4) as usize;
+
+        // Create new GPU resource
+        let old_resource = self.resource;
+        self.resource += 1;
+        self.create_resource(self.resource, FORMAT_B8G8R8X8_UNORM, width, height);
+        self.attach_backing(self.resource, new_fb.addrs[0], fb_size as u32);
+
+        // Switch scanout to new resource
+        let rect = Rect { x: 0, y: 0, width, height };
+        self.set_scanout(0, self.resource, rect);
+
+        // Destroy old resource and free old framebuffer
+        self.destroy_resource(old_resource);
+        let old_fb = core::mem::replace(&mut self.fb, new_fb);
+        self.free_framebuffer(old_fb);
+
+        self.width = width;
+        self.height = height;
+
+        log!("VirtIO GPU: resolution set to {}x{}", width, height);
+
+        Ok(self.build_gpu_info())
     }
 }
 
@@ -423,6 +524,12 @@ pub fn init(ecam_base: u64) -> Option<(Box<dyn Gpu>, GpuInfo)> {
         width: 0,
         height: 0,
         resource: 1,
+        fb: FbAlloc {
+            tokens: [SharedToken::from_raw(0); 2],
+            addrs: [0; 2],
+            layout: Layout::from_size_align(PAGE_2M as usize, PAGE_2M as usize).unwrap(),
+        },
+        cursor_token: SharedToken::from_raw(0),
     };
 
     // Query display info
@@ -445,23 +552,12 @@ pub fn init(ecam_base: u64) -> Option<(Box<dyn Gpu>, GpuInfo)> {
     };
     log!("VirtIO GPU: display {}x{}", width, height);
 
-    // Allocate framebuffer backing stores (2MB-aligned).
-    // We allocate two for kernel FramebufferInfo compatibility but only use buffer 0.
+    // Allocate framebuffer backing stores (2MB-aligned)
+    gpu.fb = gpu.alloc_framebuffer(width, height);
     let fb_size = (width * height * 4) as usize;
-    let fb_aligned = paging::align_2m(fb_size);
-    let fb_layout = Layout::from_size_align(fb_aligned, PAGE_2M as usize).unwrap();
-    let mut tokens = [shared_memory::SharedToken::from_raw(0); 2];
-    for i in 0..2 {
-        let ptr = unsafe { alloc_zeroed(fb_layout) };
-        assert!(!ptr.is_null(), "VirtIO GPU: framebuffer alloc failed");
-        let addr = ptr as u64;
-        tokens[i] = shared_memory::register(addr, fb_aligned as u64);
-        if i == 0 {
-            gpu.create_resource(gpu.resource, FORMAT_B8G8R8X8_UNORM, width, height);
-            gpu.attach_backing(gpu.resource, addr, fb_size as u32);
-        }
-        log!("VirtIO GPU: buffer {} at {:#x} ({} bytes) token={:?}", i, addr, fb_size, tokens[i]);
-    }
+
+    gpu.create_resource(gpu.resource, FORMAT_B8G8R8X8_UNORM, width, height);
+    gpu.attach_backing(gpu.resource, gpu.fb.addrs[0], fb_size as u32);
 
     // Set scanout to the single resource
     let rect = Rect { x: 0, y: 0, width, height };
@@ -474,23 +570,15 @@ pub fn init(ecam_base: u64) -> Option<(Box<dyn Gpu>, GpuInfo)> {
     let cursor_ptr = unsafe { alloc_zeroed(cursor_layout) };
     assert!(!cursor_ptr.is_null(), "VirtIO GPU: cursor alloc failed");
     let cursor_addr = cursor_ptr as u64;
-    let cursor_token = shared_memory::register(cursor_addr, cursor_aligned as u64);
+    gpu.cursor_token = shared_memory::register(cursor_addr, cursor_aligned as u64);
     gpu.create_resource(CURSOR_RESOURCE_ID, FORMAT_B8G8R8A8_UNORM, CURSOR_SIZE, CURSOR_SIZE);
     gpu.attach_backing(CURSOR_RESOURCE_ID, cursor_addr, cursor_bytes as u32);
-    log!("VirtIO GPU: cursor resource at {:#x} token={:?}", cursor_addr, cursor_token);
+    log!("VirtIO GPU: cursor resource at {:#x} token={:?}", cursor_addr, gpu.cursor_token);
 
     gpu.width = width;
     gpu.height = height;
 
-    let info = GpuInfo {
-        tokens,
-        cursor_token,
-        width,
-        height,
-        stride: width,
-        pixel_format: 1, // BGR (B8G8R8X8_UNORM)
-        flags: FLAG_HARDWARE_CURSOR,
-    };
+    let info = gpu.build_gpu_info();
 
     Some((Box::new(gpu), info))
 }

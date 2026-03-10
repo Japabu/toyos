@@ -1,15 +1,7 @@
 use alloc::collections::VecDeque;
 use core::sync::atomic::{AtomicU8, Ordering};
 use crate::sync::Lock;
-
-#[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct MouseEvent {
-    pub buttons: u8,
-    pub dx: i8,
-    pub dy: i8,
-    pub scroll: i8,
-}
+pub use toyos_abi::input::MouseEvent;
 
 static MOUSE_BUF: Lock<VecDeque<MouseEvent>> = Lock::new(VecDeque::new());
 static LAST_BUTTONS: AtomicU8 = AtomicU8::new(0);

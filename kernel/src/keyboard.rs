@@ -3,21 +3,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::sync::Lock;
-
-pub const MOD_SHIFT: u8 = 1;
-pub const MOD_CTRL: u8 = 2;
-pub const MOD_ALT: u8 = 4;
-pub const MOD_GUI: u8 = 8;
-pub const MOD_RELEASED: u8 = 0x10;
-
-#[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct RawKeyEvent {
-    pub keycode: u8,
-    pub modifiers: u8,
-    pub len: u8,
-    pub translated: [u8; 5],
-}
+pub use toyos_abi::input::{RawKeyEvent, MOD_SHIFT, MOD_CTRL, MOD_ALT, MOD_GUI, MOD_RELEASED};
 
 static KEY_BUF: Lock<VecDeque<RawKeyEvent>> = Lock::new(VecDeque::new());
 static PREV_REPORT: Lock<[u8; 8]> = Lock::new([0; 8]);

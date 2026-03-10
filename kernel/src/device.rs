@@ -46,11 +46,15 @@ pub fn try_claim(device_type: u64, pid: Pid) -> Option<Descriptor> {
             *owner = Some(pid);
             // Grant GPU buffer and cursor tokens to the claiming process
             for &token in &info.token {
-                assert!(shared_memory::grant(shared_memory::SharedToken::from_raw(token), Pid::MAX, pid),
-                    "failed to grant framebuffer token");
+                if shared_memory::grant_kernel(shared_memory::SharedToken::from_raw(token), pid).is_err() {
+                    *owner = None;
+                    return None;
+                }
             }
-            assert!(shared_memory::grant(shared_memory::SharedToken::from_raw(info.cursor_token), Pid::MAX, pid),
-                "failed to grant cursor token");
+            if shared_memory::grant_kernel(shared_memory::SharedToken::from_raw(info.cursor_token), pid).is_err() {
+                *owner = None;
+                return None;
+            }
             Some(Descriptor::Framebuffer(info))
         }
         DEVICE_NIC => {
@@ -62,9 +66,15 @@ pub fn try_claim(device_type: u64, pid: Pid) -> Option<Descriptor> {
             *owner = Some(pid);
             // Grant all DMA buffer tokens to the claiming process
             for &token in &info.rx_buf_tokens {
-                let _ = shared_memory::grant(shared_memory::SharedToken::from_raw(token), Pid::MAX, pid);
+                if shared_memory::grant_kernel(shared_memory::SharedToken::from_raw(token), pid).is_err() {
+                    *owner = None;
+                    return None;
+                }
             }
-            let _ = shared_memory::grant(shared_memory::SharedToken::from_raw(info.tx_buf_token), Pid::MAX, pid);
+            if shared_memory::grant_kernel(shared_memory::SharedToken::from_raw(info.tx_buf_token), pid).is_err() {
+                *owner = None;
+                return None;
+            }
             Some(Descriptor::Nic(info))
         }
         _ => None,

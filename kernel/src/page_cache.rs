@@ -101,6 +101,61 @@ impl PageCache {
         self.slot_data(slot)
     }
 
+    /// Prefetch a contiguous range of blocks into the cache with batched I/O.
+    /// Skips blocks already cached. Reads up to 32 blocks per device call.
+    pub fn prefetch(&mut self, dev: &mut dyn BlockDevice, blocks: &[u64]) {
+        // Find runs of contiguous uncached blocks and batch-read them.
+        let mut i = 0;
+        while i < blocks.len() {
+            // Skip already-cached blocks
+            if self.block_to_slot[blocks[i] as usize] != NOT_CACHED {
+                i += 1;
+                continue;
+            }
+
+            // Start a contiguous run of uncached blocks
+            let run_start = i;
+            let first_block = blocks[i];
+            i += 1;
+            while i < blocks.len()
+                && i - run_start < 32
+                && blocks[i] == first_block + (i - run_start) as u64
+                && self.block_to_slot[blocks[i] as usize] == NOT_CACHED
+            {
+                i += 1;
+            }
+            let run_len = i - run_start;
+
+            // Allocate slots for the entire run
+            let first_slot = self.next_slot;
+            for j in 0..run_len {
+                self.alloc_slot(first_block + j as u64);
+            }
+
+            // Check if all slots land in the same chunk (common case for sequential alloc)
+            let first_chunk = first_slot as usize / PAGES_PER_CHUNK;
+            let last_chunk = (first_slot as usize + run_len - 1) / PAGES_PER_CHUNK;
+
+            if first_chunk == last_chunk {
+                // All pages are contiguous in memory — read directly into chunk
+                let page_in_chunk = first_slot as usize % PAGES_PER_CHUNK;
+                let off = page_in_chunk * 4096;
+                let end = off + run_len * 4096;
+                let buf = &mut self.chunks[first_chunk][off..end];
+                dev.read_blocks(first_block, run_len as u32, buf);
+            } else {
+                // Pages span chunks — read into temp buffer, then scatter
+                let mut buf = vec![0u8; run_len * 4096];
+                dev.read_blocks(first_block, run_len as u32, &mut buf);
+                for j in 0..run_len {
+                    let slot = first_slot + j as u32;
+                    let page = self.slot_data_mut(slot);
+                    page.copy_from_slice(&buf[j * 4096..(j + 1) * 4096]);
+                }
+            }
+        }
+    }
+
     /// Get a mutable reference to a cached block for modification.
     /// Loads from device on cache miss, marks page dirty.
     pub fn write(&mut self, dev: &mut dyn BlockDevice, block: u64) -> &mut [u8] {

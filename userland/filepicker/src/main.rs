@@ -2,7 +2,7 @@ use filepicker_api::{FilePickerRequest, PickerMode, MSG_FILEPICKER_REQUEST, MSG_
 use font::Font;
 use std::fs;
 use std::os::toyos::message::{self, Message};
-use std::os::toyos::services;
+use toyos_abi::services;
 use std::path::{Path, PathBuf};
 use window::{Color, Event, Framebuffer, KeyEvent, MouseEvent, Window};
 

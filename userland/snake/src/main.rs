@@ -1,23 +1,32 @@
 use std::collections::VecDeque;
-use std::fs;
+use std::num::NonZeroU32;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rand::Rng;
-
-use window::{Color, Framebuffer, Window};
+use softbuffer::{Context, Pixel, Surface};
+use winit::application::ApplicationHandler;
+use winit::event::{ElementState, WindowEvent};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, OwnedDisplayHandle};
+use winit::keyboard::{KeyCode, PhysicalKey};
+use winit::window::{Window, WindowAttributes, WindowId};
 
 const CELL: usize = 16;
 const HEADER: usize = 24;
 const TICK: Duration = Duration::from_millis(75);
 
-const BG: Color = Color { r: 0x1a, g: 0x1a, b: 0x2e };
-const GRID_BG: Color = Color { r: 0x22, g: 0x22, b: 0x38 };
-const GRID_LINE: Color = Color { r: 0x28, g: 0x28, b: 0x40 };
-const SNAKE_HEAD: Color = Color { r: 0x50, g: 0xe0, b: 0x50 };
-const SNAKE_BODY: Color = Color { r: 0x40, g: 0xb0, b: 0x40 };
-const FOOD: Color = Color { r: 0xe0, g: 0x40, b: 0x40 };
-const TEXT: Color = Color { r: 0xe0, g: 0xe0, b: 0xe8 };
-const DIM: Color = Color { r: 0x70, g: 0x70, b: 0x80 };
+const BG: Pixel = Pixel::new_rgb(0x1a, 0x1a, 0x2e);
+const GRID_BG: Pixel = Pixel::new_rgb(0x22, 0x22, 0x38);
+const GRID_LINE: Pixel = Pixel::new_rgb(0x28, 0x28, 0x40);
+const SNAKE_HEAD: Pixel = Pixel::new_rgb(0x50, 0xe0, 0x50);
+const SNAKE_BODY: Pixel = Pixel::new_rgb(0x40, 0xb0, 0x40);
+const FOOD: Pixel = Pixel::new_rgb(0xe0, 0x40, 0x40);
+const TEXT: font::Color = font::Color { r: 0xe0, g: 0xe0, b: 0xe8 };
+const DIM: font::Color = font::Color { r: 0x70, g: 0x70, b: 0x80 };
+
+fn pixel_to_font_color(p: Pixel) -> font::Color {
+    font::Color { r: p.r, g: p.g, b: p.b }
+}
 
 #[derive(Clone, Copy, PartialEq)]
 enum Dir {
@@ -47,14 +56,35 @@ impl Dir {
     }
 }
 
-fn random_range(max: usize) -> usize {
-    rand::thread_rng().gen_range(0..max)
+/// Adapter so `font::Font::draw_string` can write into a softbuffer pixel slice.
+///
+/// Uses a raw pointer because `Canvas::put_pixel` takes `&self` but we need mutation.
+struct PixelCanvas {
+    ptr: *mut Pixel,
+    width: usize,
+    height: usize,
+}
+
+impl PixelCanvas {
+    fn new(pixels: &mut [Pixel], width: usize, height: usize) -> Self {
+        Self { ptr: pixels.as_mut_ptr(), width, height }
+    }
+}
+
+impl font::Canvas for PixelCanvas {
+    fn put_pixel(&self, x: usize, y: usize, color: font::Color) {
+        if x < self.width && y < self.height {
+            unsafe { *self.ptr.add(y * self.width + x) = Pixel::new_rgb(color.r, color.g, color.b) };
+        }
+    }
 }
 
 struct Game {
-    window: Window,
-    fb: Framebuffer,
+    window: Arc<dyn Window>,
+    surface: Surface<OwnedDisplayHandle, Arc<dyn Window>>,
     font: font::Font,
+    width: u32,
+    height: u32,
     cols: usize,
     rows: usize,
     snake: VecDeque<(usize, usize)>,
@@ -64,24 +94,32 @@ struct Game {
     score: usize,
     game_over: bool,
     next_tick: Instant,
-    dirty: bool,
-    frame_ready: bool,
 }
 
 impl Game {
-    fn new() -> Self {
-        let window = Window::create_with_title(0, 0, "Snake");
-        let fb = window.framebuffer();
-        let font_data = fs::read("/share/fonts/JetBrainsMono-8x16.font").expect("font");
-        let font = font::Font::from_prebuilt(&font_data);
+    fn new(elwt: &dyn ActiveEventLoop, context: &Context<OwnedDisplayHandle>) -> Self {
+        let attrs = WindowAttributes::default().with_title("Snake");
+        let window: Arc<dyn Window> = elwt.create_window(attrs).unwrap().into();
+        let size = window.surface_size();
+        let mut surface = Surface::new(context, window.clone()).unwrap();
+        surface
+            .resize(
+                NonZeroU32::new(size.width).unwrap(),
+                NonZeroU32::new(size.height).unwrap(),
+            )
+            .unwrap();
 
-        let cols = fb.width() / CELL;
-        let rows = (fb.height() - HEADER) / CELL;
+        let font = font::Font::from_prebuilt(include_bytes!(concat!(env!("OUT_DIR"), "/JetBrainsMono-8x16.font")));
+
+        let cols = size.width as usize / CELL;
+        let rows = (size.height as usize).saturating_sub(HEADER) / CELL;
 
         let mut game = Game {
             window,
-            fb,
+            surface,
             font,
+            width: size.width,
+            height: size.height,
             cols,
             rows,
             snake: VecDeque::new(),
@@ -91,8 +129,6 @@ impl Game {
             score: 0,
             game_over: false,
             next_tick: Instant::now(),
-            dirty: false,
-            frame_ready: true,
         };
         game.reset();
         game
@@ -113,14 +149,13 @@ impl Game {
         self.snake.push_back((cx - 2, cy));
 
         self.place_food();
-        self.dirty = true;
-        self.frame_ready = true;
     }
 
     fn place_food(&mut self) {
+        let mut rng = rand::thread_rng();
         loop {
-            let x = random_range(self.cols);
-            let y = random_range(self.rows);
+            let x = rng.gen_range(0..self.cols);
+            let y = rng.gen_range(0..self.rows);
             if !self.snake.contains(&(x, y)) {
                 self.food = (x, y);
                 return;
@@ -136,7 +171,6 @@ impl Game {
         let nx = hx as isize + dx;
         let ny = hy as isize + dy;
 
-        // Wall collision
         if nx < 0 || ny < 0 || nx >= self.cols as isize || ny >= self.rows as isize {
             self.game_over = true;
             return;
@@ -144,7 +178,6 @@ impl Game {
 
         let new_head = (nx as usize, ny as usize);
 
-        // Self collision
         if self.snake.contains(&new_head) {
             self.game_over = true;
             return;
@@ -160,50 +193,58 @@ impl Game {
         }
     }
 
-    fn redraw(&self) {
-        let w = self.fb.width();
-        let h = self.fb.height();
+    fn redraw(&mut self) {
+        let mut buffer = self.surface.next_buffer().unwrap();
+        let w = self.width as usize;
+        let h = self.height as usize;
+        let pixels = buffer.pixels();
+
+        fill_rect(pixels, w, h, 0, 0, w, h, BG);
 
         // Header
-        self.fb.fill_rect(0, 0, w, HEADER, BG);
-        let score_str = format!("Score: {}", self.score);
-        self.font.draw_string(&self.fb, 8, 4, &score_str, TEXT, BG);
+        {
+            let score_str = format!("Score: {}", self.score);
+            let canvas = PixelCanvas::new(pixels, w, h);
+            let bg_color = pixel_to_font_color(BG);
+            self.font.draw_string(&canvas, 8, 4, &score_str, TEXT, bg_color);
+        }
 
-        // Grid background
+        // Grid
         let grid_y = HEADER;
         let grid_w = self.cols * CELL;
         let grid_h = self.rows * CELL;
-        self.fb.fill_rect(0, grid_y, w, h - grid_y, BG);
-        self.fb.fill_rect(0, grid_y, grid_w, grid_h, GRID_BG);
+        fill_rect(pixels, w, h, 0, grid_y, grid_w, grid_h, GRID_BG);
 
         // Grid lines
         for col in 0..=self.cols {
             let x = col * CELL;
             if x < w {
-                self.fb.fill_rect(x, grid_y, 1, grid_h, GRID_LINE);
+                fill_rect(pixels, w, h, x, grid_y, 1, grid_h, GRID_LINE);
             }
         }
         for row in 0..=self.rows {
             let y = grid_y + row * CELL;
             if y < h {
-                self.fb.fill_rect(0, y, grid_w, 1, GRID_LINE);
+                fill_rect(pixels, w, h, 0, y, grid_w, 1, GRID_LINE);
             }
         }
 
         // Food
         let (fx, fy) = self.food;
-        self.fb.fill_rect(fx * CELL + 2, grid_y + fy * CELL + 2, CELL - 4, CELL - 4, FOOD);
+        fill_rect(
+            pixels, w, h,
+            fx * CELL + 2, grid_y + fy * CELL + 2,
+            CELL - 4, CELL - 4, FOOD,
+        );
 
         // Snake
         for (i, &(sx, sy)) in self.snake.iter().enumerate() {
             let color = if i == 0 { SNAKE_HEAD } else { SNAKE_BODY };
             let inset = if i == 0 { 1 } else { 2 };
-            self.fb.fill_rect(
-                sx * CELL + inset,
-                grid_y + sy * CELL + inset,
-                CELL - inset * 2,
-                CELL - inset * 2,
-                color,
+            fill_rect(
+                pixels, w, h,
+                sx * CELL + inset, grid_y + sy * CELL + inset,
+                CELL - inset * 2, CELL - inset * 2, color,
             );
         }
 
@@ -211,28 +252,38 @@ impl Game {
         if self.game_over {
             let overlay_w = 200;
             let overlay_h = 60;
-            let ox = (grid_w.saturating_sub(overlay_w)) / 2;
-            let oy = grid_y + (grid_h.saturating_sub(overlay_h)) / 2;
-            self.fb.fill_rect(ox, oy, overlay_w, overlay_h, BG);
+            let ox = grid_w.saturating_sub(overlay_w) / 2;
+            let oy = grid_y + grid_h.saturating_sub(overlay_h) / 2;
+            fill_rect(pixels, w, h, ox, oy, overlay_w, overlay_h, BG);
+
+            let bg_color = pixel_to_font_color(BG);
+            let food_color = pixel_to_font_color(FOOD);
+            let canvas = PixelCanvas::new(pixels, w, h);
 
             let msg = "GAME OVER";
-            let msg_x = ox + (overlay_w.saturating_sub(msg.len() * self.font.width())) / 2;
-            self.font.draw_string(&self.fb, msg_x, oy + 8, msg, FOOD, BG);
+            let msg_x = ox + overlay_w.saturating_sub(msg.len() * self.font.width()) / 2;
+            self.font.draw_string(&canvas, msg_x, oy + 8, msg, food_color, bg_color);
 
             let score_msg = format!("Score: {}", self.score);
-            let sx = ox + (overlay_w.saturating_sub(score_msg.len() * self.font.width())) / 2;
-            self.font.draw_string(&self.fb, sx, oy + 24, &score_msg, TEXT, BG);
+            let sx = ox + overlay_w.saturating_sub(score_msg.len() * self.font.width()) / 2;
+            self.font.draw_string(&canvas, sx, oy + 24, &score_msg, TEXT, bg_color);
 
             let restart = "Space to restart";
-            let rx = ox + (overlay_w.saturating_sub(restart.len() * self.font.width())) / 2;
-            self.font.draw_string(&self.fb, rx, oy + 40, restart, DIM, BG);
+            let rx = ox + overlay_w.saturating_sub(restart.len() * self.font.width()) / 2;
+            self.font.draw_string(&canvas, rx, oy + 40, restart, DIM, bg_color);
         }
+
+        buffer.present().unwrap();
     }
 
-    fn handle_resize(&mut self) {
-        self.fb = self.window.framebuffer();
-        self.cols = self.fb.width() / CELL;
-        self.rows = (self.fb.height() - HEADER) / CELL;
+    fn handle_resize(&mut self, width: u32, height: u32) {
+        self.width = width;
+        self.height = height;
+        if let (Some(w), Some(h)) = (NonZeroU32::new(width), NonZeroU32::new(height)) {
+            self.surface.resize(w, h).unwrap();
+        }
+        self.cols = width as usize / CELL;
+        self.rows = (height as usize).saturating_sub(HEADER) / CELL;
         let snake_oob = self.snake.iter().any(|&(x, y)| x >= self.cols || y >= self.rows);
         if snake_oob {
             self.reset();
@@ -244,19 +295,23 @@ impl Game {
         }
     }
 
-    fn handle_key(&mut self, ev: window::KeyEvent) {
+    fn handle_key(&mut self, key: KeyCode, state: ElementState) {
+        if state != ElementState::Pressed {
+            return;
+        }
+
         if self.game_over {
-            if ev.keycode == 0x2C || ev.keycode == 0x28 {
+            if matches!(key, KeyCode::Space | KeyCode::Enter) {
                 self.reset();
             }
             return;
         }
 
-        let new_dir = match ev.keycode {
-            0x52 => Some(Dir::Up),
-            0x51 => Some(Dir::Down),
-            0x50 => Some(Dir::Left),
-            0x4F => Some(Dir::Right),
+        let new_dir = match key {
+            KeyCode::ArrowUp => Some(Dir::Up),
+            KeyCode::ArrowDown => Some(Dir::Down),
+            KeyCode::ArrowLeft => Some(Dir::Left),
+            KeyCode::ArrowRight => Some(Dir::Right),
             _ => None,
         };
 
@@ -266,44 +321,70 @@ impl Game {
             }
         }
     }
+}
 
-    fn run(&mut self) {
-        loop {
-            // timeout=0 means block forever, so use max(1) when game is running
-            let timeout = if self.game_over {
-                0
-            } else {
-                self.next_tick.saturating_duration_since(Instant::now()).as_nanos().max(1) as u64
-            };
+fn fill_rect(pixels: &mut [Pixel], buf_w: usize, buf_h: usize, x: usize, y: usize, w: usize, h: usize, color: Pixel) {
+    let x_end = (x + w).min(buf_w);
+    let y_end = (y + h).min(buf_h);
+    for row in y..y_end {
+        let start = row * buf_w + x;
+        let end = row * buf_w + x_end;
+        pixels[start..end].fill(color);
+    }
+}
 
-            match self.window.poll_event(timeout) {
-                Some(window::Event::KeyInput(ev)) => self.handle_key(ev),
-                Some(window::Event::Resized) => {
-                    self.handle_resize();
-                    self.dirty = true;
+struct App {
+    context: Context<OwnedDisplayHandle>,
+    game: Option<Game>,
+}
+
+impl ApplicationHandler for App {
+    fn can_create_surfaces(&mut self, event_loop: &dyn ActiveEventLoop) {
+        if self.game.is_none() {
+            self.game = Some(Game::new(event_loop, &self.context));
+        }
+    }
+
+    fn about_to_wait(&mut self, event_loop: &dyn ActiveEventLoop) {
+        let game = self.game.as_mut().unwrap();
+        if game.game_over {
+            event_loop.set_control_flow(ControlFlow::Wait);
+        } else {
+            let now = Instant::now();
+            if now >= game.next_tick {
+                game.step();
+                game.next_tick = now + TICK;
+                game.window.request_redraw();
+            }
+            event_loop.set_control_flow(ControlFlow::WaitUntil(game.next_tick));
+        }
+    }
+
+    fn window_event(&mut self, event_loop: &dyn ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        let game = self.game.as_mut().unwrap();
+        match event {
+            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::SurfaceResized(size) => {
+                game.handle_resize(size.width, size.height);
+                game.window.request_redraw();
+            }
+            WindowEvent::KeyboardInput { event, .. } => {
+                if let PhysicalKey::Code(key) = event.physical_key {
+                    game.handle_key(key, event.state);
+                    if game.game_over || matches!(key, KeyCode::ArrowUp | KeyCode::ArrowDown | KeyCode::ArrowLeft | KeyCode::ArrowRight) {
+                        game.window.request_redraw();
+                    }
                 }
-                Some(window::Event::Frame) => self.frame_ready = true,
-                Some(window::Event::Close) => break,
-                _ => {}
             }
-
-            if !self.game_over && Instant::now() >= self.next_tick {
-                self.step();
-                self.next_tick = Instant::now() + TICK;
-                self.dirty = true;
-            }
-
-            if self.dirty && self.frame_ready {
-                self.redraw();
-                self.window.present();
-                self.dirty = false;
-                self.frame_ready = false;
-            }
+            WindowEvent::RedrawRequested => game.redraw(),
+            _ => {}
         }
     }
 }
 
 fn main() {
-    let mut game = Game::new();
-    game.run();
+    let event_loop = EventLoop::new().unwrap();
+    let context = Context::new(event_loop.owned_display_handle()).unwrap();
+    let app = App { context, game: None };
+    event_loop.run_app(app).unwrap();
 }

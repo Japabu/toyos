@@ -15,7 +15,7 @@ use std::fs;
 
 
 pub use collect::RelocType;
-use collect::{Arch, collect, synthesize_alloc_shims, gc_sections, merge_string_sections, is_archive, extract_archive, find_lib, scan_symbols, SectionIdx, SectionKind, SymbolDef, SymbolRef};
+use collect::{Arch, collect, synthesize_alloc_shims, gc_sections, merge_string_sections, is_archive, extract_archive, find_lib, has_toyos_libc_note, scan_symbols, SectionIdx, SectionKind, SymbolDef, SymbolRef};
 use reloc::{ElfRelocParams, apply_relocs, apply_relocs_pe, MachORelocParams, apply_relocs_macho};
 use emit_elf::{layout_elf, build_eh_frame_hdr, ElfEmitMode, ElfLayout};
 use emit_pe::{layout_pe, emit_pe_bytes, PeLayout};
@@ -365,6 +365,20 @@ pub fn resolve_libs_with_entry(
             extract_archive(&name, &data, &mut archive_members)?;
         } else {
             objects.push((name, data));
+        }
+    }
+
+    // If any object was compiled by toyos-cc (has .note.toyos.libc section),
+    // implicitly add libtoyos_c from -L paths to provide C standard library symbols.
+    let needs_libc = objects.iter().chain(archive_members.iter())
+        .any(|(_, data)| has_toyos_libc_note(data));
+    if needs_libc {
+        if let Some((name, data)) = find_lib("toyos_c", lib_paths) {
+            if is_archive(&data) {
+                extract_archive(&name, &data, &mut archive_members)?;
+            } else {
+                objects.push((name, data));
+            }
         }
     }
 

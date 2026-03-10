@@ -450,10 +450,19 @@ impl ToyFs {
         let size = read_u64(&entry, 8) as usize;
         let block_count = (size + 4095) / 4096;
 
-        let mut result = vec![0u8; size];
+        // Collect all block numbers for prefetching
+        let mut blocks = Vec::with_capacity(block_count);
         for i in 0..block_count {
             let b = self.get_data_block(cache, dev, &entry, i);
             if b == 0 { break; }
+            blocks.push(b);
+        }
+
+        // Prefetch all blocks with batched I/O (up to 32 blocks per device call)
+        cache.prefetch(dev, &blocks);
+
+        let mut result = vec![0u8; size];
+        for (i, &b) in blocks.iter().enumerate() {
             let page = cache.read(dev, b);
             let start = i * 4096;
             let end = cmp::min(start + 4096, size);

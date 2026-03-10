@@ -195,6 +195,39 @@ pub fn map_user_in(pml4: *mut u64, addr: u64, size: u64) {
     }
 }
 
+/// Set USER bit and clear WRITE bit on 2MB pages in a specific PML4.
+/// Used for shared read-only library pages (code/rodata).
+pub fn map_user_readonly_in(pml4: *mut u64, addr: u64, size: u64) {
+    let start = addr & !(PAGE_2M - 1);
+    let end = (addr + size + PAGE_2M - 1) & !(PAGE_2M - 1);
+    let mut cur = start;
+
+    while cur < end {
+        let pml4_idx = ((cur >> 39) & 0x1FF) as usize;
+        let pdpt_idx = ((cur >> 30) & 0x1FF) as usize;
+        let pd_idx = ((cur >> 21) & 0x1FF) as usize;
+
+        unsafe {
+            let pml4e = pml4.add(pml4_idx).read();
+            assert!(pml4e & PAGE_PRESENT != 0, "map_user_ro: PML4 not present for {:#x}", cur);
+            pml4.add(pml4_idx).write(pml4e | PAGE_USER);
+
+            let pdpt = (pml4e & ADDR_MASK) as *mut u64;
+            let pdpte = pdpt.add(pdpt_idx).read();
+            assert!(pdpte & PAGE_PRESENT != 0, "map_user_ro: PDPT not present for {:#x}", cur);
+            pdpt.add(pdpt_idx).write(pdpte | PAGE_USER);
+
+            let pd = (pdpte & ADDR_MASK) as *mut u64;
+            let pde = pd.add(pd_idx).read();
+            assert!(pde & PAGE_PRESENT != 0, "map_user_ro: PD not present for {:#x}", cur);
+            assert!(pde & PAGE_SIZE_BIT != 0, "map_user_ro: expected 2MB page at {:#x}", cur);
+            pd.add(pd_idx).write((pde | PAGE_USER) & !PAGE_WRITE);
+        }
+
+        cur += PAGE_2M;
+    }
+}
+
 /// Set USER bit on 2MB pages in the current process's page tables (via CR3).
 pub fn map_user(addr: u64, size: u64) {
     let pml4 = cpu::read_cr3() as *mut u64;
@@ -203,10 +236,10 @@ pub fn map_user(addr: u64, size: u64) {
     apic::tlb_shootdown();
 }
 
-/// Remap a 2MB-aligned virtual address to point to different physical memory.
+/// Remap a 2MB-aligned virtual address to point to different physical memory
+/// in a specific page table. No TLB flush — caller is responsible.
 /// Sets the PDE to `phys_addr` with PRESENT|WRITE|USER|PS bits.
-/// Returns false if the address is not 2MB-aligned or page table entries are missing.
-pub fn remap_user_2m(pml4: *mut u64, virt_addr: u64, phys_addr: u64) -> bool {
+pub fn remap_user_2m_in(pml4: *mut u64, virt_addr: u64, phys_addr: u64) -> bool {
     if virt_addr & (PAGE_2M - 1) != 0 || phys_addr & (PAGE_2M - 1) != 0 {
         return false;
     }
@@ -229,9 +262,19 @@ pub fn remap_user_2m(pml4: *mut u64, virt_addr: u64, phys_addr: u64) -> bool {
         pd.add(pd_idx).write(phys_addr | PAGE_PRESENT | PAGE_WRITE | PAGE_USER | PAGE_SIZE_BIT);
     }
 
-    cpu::flush_tlb();
-    apic::tlb_shootdown();
     true
+}
+
+/// Remap a 2MB-aligned virtual address in the current page table with TLB flush.
+pub fn remap_user_2m(virt_addr: u64, phys_addr: u64) -> bool {
+    let pml4 = cpu::read_cr3() as *mut u64;
+    if remap_user_2m_in(pml4, virt_addr, phys_addr) {
+        cpu::flush_tlb();
+        apic::tlb_shootdown();
+        true
+    } else {
+        false
+    }
 }
 
 /// Restore a 2MB PDE to its identity-mapped value (phys == virt, no USER bit).

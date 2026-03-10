@@ -6,7 +6,8 @@ edition = "2021"
 [dependencies]
 font = { path = "../font" }
 rand = "0.8"
-window = { path = "../window" }
+winit = { path = "../winit/winit", default-features = false }
+softbuffer = { path = "../softbuffer", default-features = false }
 
-[patch.crates-io]
-getrandom = { git = "https://github.com/Japabu/getrandom", branch = "toyos-v0.2", package = "getrandom" }
+[build-dependencies]
+fontdue = "0.9"

@@ -7,12 +7,27 @@ use crate::arch::paging::{self, PAGE_2M};
 use crate::process::Pid;
 use crate::sync::Lock;
 
+#[derive(Clone, Copy, Debug)]
+pub enum Error {
+    NotFound,
+    PermissionDenied,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct SharedToken(u32);
 
 impl SharedToken {
     pub fn raw(self) -> u32 { self.0 }
     pub fn from_raw(v: u32) -> Self { Self(v) }
+}
+
+/// Who owns the backing memory and how it should be cleaned up.
+enum Ownership {
+    /// Kernel-owned (e.g. GPU framebuffers, DMA buffers).
+    /// Never freed by shared_memory — the kernel subsystem manages the lifetime.
+    Kernel,
+    /// Process-owned. Freed when the owning process exits and no mappings remain.
+    Process { pid: Pid, layout: Layout },
 }
 
 // SAFETY: SharedRegion contains raw PML4 pointers in mapped_in.
@@ -23,14 +38,9 @@ unsafe impl Send for SharedRegion {}
 struct SharedRegion {
     phys_addr: u64,
     size: u64,
-    owner_pid: Pid,
+    ownership: Ownership,
     allowed: Vec<Pid>,                // PIDs allowed to map
     mapped_in: Vec<(Pid, *mut u64)>,  // (PID, PML4) for processes that have mapped it
-    layout: Option<Layout>,
-}
-
-impl SharedRegion {
-    fn is_permanent(&self) -> bool { self.layout.is_none() }
 }
 
 static REGIONS: Lock<Option<Vec<(SharedToken, SharedRegion)>>> = Lock::new(None);
@@ -66,10 +76,9 @@ pub fn alloc(size: u64, owner_pid: Pid, owner_pml4: *mut u64) -> SharedToken {
         regions.push((token, SharedRegion {
             phys_addr,
             size: aligned_size as u64,
-            owner_pid,
+            ownership: Ownership::Process { pid: owner_pid, layout },
             allowed: alloc::vec![owner_pid],
             mapped_in: alloc::vec![(owner_pid, owner_pml4)],
-            layout: Some(layout),
         }));
     });
 
@@ -85,121 +94,110 @@ pub fn register(phys_addr: u64, size: u64) -> SharedToken {
         regions.push((token, SharedRegion {
             phys_addr,
             size,
-            owner_pid: Pid::MAX,
+            ownership: Ownership::Kernel,
             allowed: Vec::new(),
             mapped_in: Vec::new(),
-            layout: None,
         }));
     });
     token
 }
 
-/// Grant a process permission to map a shared region.
-/// Caller must be the owner, or for kernel-owned regions, already in the allowed list.
-#[must_use]
-pub fn grant(token: SharedToken, caller_pid: Pid, target_pid: Pid) -> bool {
+/// Unregister a kernel-owned shared region, unmapping it from all processes.
+/// Returns `(phys_addr, size)` so the caller can free the backing memory.
+pub fn unregister(token: SharedToken) -> Option<(u64, u64)> {
     with_regions_mut(|regions| {
-        let Some((_, region)) = regions.iter_mut().find(|(t, _)| *t == token) else {
-            return false;
-        };
-        if caller_pid != region.owner_pid && !region.allowed.contains(&caller_pid) {
-            return false;
+        let pos = regions.iter().position(|(t, _)| *t == token)?;
+        let (_, region) = regions.swap_remove(pos);
+        for &(_, pml4) in &region.mapped_in {
+            paging::unmap_user(pml4, region.phys_addr, region.size);
         }
-        if !region.allowed.contains(&target_pid) {
-            region.allowed.push(target_pid);
+        Some((region.phys_addr, region.size))
+    })
+}
+
+/// Grant a process permission to map a shared region.
+/// The caller must be the owner, or already in the allowed list.
+pub fn grant(token: SharedToken, caller: Pid, target: Pid) -> Result<(), Error> {
+    with_regions_mut(|regions| {
+        let (_, region) = regions.iter_mut().find(|(t, _)| *t == token)
+            .ok_or(Error::NotFound)?;
+        let is_owner = matches!(region.ownership, Ownership::Process { pid, .. } if pid == caller);
+        if !is_owner && !region.allowed.contains(&caller) {
+            return Err(Error::PermissionDenied);
         }
-        true
+        if !region.allowed.contains(&target) {
+            region.allowed.push(target);
+        }
+        Ok(())
+    })
+}
+
+/// Grant permission on a kernel-owned region. Only works for regions with no owner.
+pub fn grant_kernel(token: SharedToken, target: Pid) -> Result<(), Error> {
+    with_regions_mut(|regions| {
+        let (_, region) = regions.iter_mut().find(|(t, _)| *t == token)
+            .ok_or(Error::NotFound)?;
+        if !matches!(region.ownership, Ownership::Kernel) {
+            return Err(Error::PermissionDenied);
+        }
+        if !region.allowed.contains(&target) {
+            region.allowed.push(target);
+        }
+        Ok(())
     })
 }
 
 /// Map a shared region into the caller's address space.
-/// Returns the physical address, or None if not allowed.
-#[must_use]
-pub fn map(token: SharedToken, caller_pid: Pid, caller_pml4: *mut u64) -> Option<u64> {
+pub fn map(token: SharedToken, pid: Pid, pml4: *mut u64) -> Result<u64, Error> {
     with_regions_mut(|regions| {
-        let (_, region) = regions.iter_mut().find(|(t, _)| *t == token)?;
-
-        if !region.allowed.contains(&caller_pid) {
-            return None;
+        let (_, region) = regions.iter_mut().find(|(t, _)| *t == token)
+            .ok_or(Error::NotFound)?;
+        if !region.allowed.contains(&pid) {
+            return Err(Error::PermissionDenied);
         }
-
-        if !region.mapped_in.iter().any(|&(pid, _)| pid == caller_pid) {
-            paging::map_user_in(caller_pml4, region.phys_addr, region.size);
-            region.mapped_in.push((caller_pid, caller_pml4));
+        if !region.mapped_in.iter().any(|(p, _)| *p == pid) {
+            paging::map_user_in(pml4, region.phys_addr, region.size);
+            region.mapped_in.push((pid, pml4));
         }
-
-        Some(region.phys_addr)
+        Ok(region.phys_addr)
     })
 }
 
-/// Release a process's mapping of a shared region. Any mapped process can call this.
-/// Unmaps only from the caller's page tables. If no mappings remain, deallocates.
-#[must_use]
-pub fn release(token: SharedToken, caller_pid: Pid, caller_pml4: *mut u64) -> bool {
+/// Release a shared region for a process (unmap, revoke permission).
+pub fn release(token: SharedToken, pid: Pid) -> Result<(), Error> {
     with_regions_mut(|regions| {
-        let Some(pos) = regions.iter().position(|(t, _)| *t == token) else {
-            return false;
-        };
-
-        let region = &mut regions[pos].1;
-
-        // Unmap from caller's page tables
-        if let Some(idx) = region.mapped_in.iter().position(|&(p, _)| p == caller_pid) {
-            paging::unmap_user(caller_pml4, region.phys_addr, region.size);
-            region.mapped_in.swap_remove(idx);
+        let (_, region) = regions.iter_mut().find(|(t, _)| *t == token)
+            .ok_or(Error::NotFound)?;
+        region.allowed.retain(|p| *p != pid);
+        if let Some(pos) = region.mapped_in.iter().position(|(p, _)| *p == pid) {
+            let (_, pml4) = region.mapped_in.swap_remove(pos);
+            paging::unmap_user(pml4, region.phys_addr, region.size);
         }
-
-        // Remove from allowed list
-        if let Some(idx) = region.allowed.iter().position(|&p| p == caller_pid) {
-            region.allowed.swap_remove(idx);
-        }
-
-        if region.mapped_in.is_empty() && !region.is_permanent() {
-            let (_, region) = regions.swap_remove(pos);
-            if let Some(layout) = region.layout {
-                unsafe { dealloc(region.phys_addr as *mut u8, layout); }
-            }
-        }
-
-        true
+        Ok(())
     })
 }
 
-/// Clean up all shared memory state for an exiting process.
-/// Unmaps from all regions, frees owned regions, removes from allowed lists.
-pub fn cleanup_process(pid: Pid, pml4: *mut u64) {
+/// Remove all mappings and permissions for a given PID.
+/// Also frees process-owned regions (non-permanent) that become empty.
+pub fn cleanup_process(pid: Pid) {
     with_regions_mut(|regions| {
-        // Unmap this process from all regions it has mapped
-        for (_, region) in regions.iter_mut() {
-            if let Some(pos) = region.mapped_in.iter().position(|&(p, _)| p == pid) {
+        regions.retain_mut(|(_, region)| {
+            // Unmap from this process
+            if let Some(pos) = region.mapped_in.iter().position(|(p, _)| *p == pid) {
+                let (_, pml4) = region.mapped_in.swap_remove(pos);
                 paging::unmap_user(pml4, region.phys_addr, region.size);
-                region.mapped_in.swap_remove(pos);
             }
-            if let Some(pos) = region.allowed.iter().position(|&p| p == pid) {
-                region.allowed.swap_remove(pos);
-            }
-        }
+            region.allowed.retain(|p| *p != pid);
 
-        // Free regions owned by this process (unmapping all other processes),
-        // and deallocate any regions left with no mappings (owner already released).
-        let mut i = 0;
-        while i < regions.len() {
-            if regions[i].1.owner_pid == pid {
-                let (_, region) = regions.swap_remove(i);
-                for &(_, mapped_pml4) in &region.mapped_in {
-                    paging::unmap_user(mapped_pml4, region.phys_addr, region.size);
-                }
-                if let Some(layout) = region.layout {
+            // If process-owned and no mappings remain, free the backing memory.
+            if let Ownership::Process { pid: owner, layout } = region.ownership {
+                if owner == pid && region.mapped_in.is_empty() {
                     unsafe { dealloc(region.phys_addr as *mut u8, layout); }
+                    return false; // remove from list
                 }
-            } else if regions[i].1.mapped_in.is_empty() && !regions[i].1.is_permanent() {
-                let (_, region) = regions.swap_remove(i);
-                if let Some(layout) = region.layout {
-                    unsafe { dealloc(region.phys_addr as *mut u8, layout); }
-                }
-            } else {
-                i += 1;
             }
-        }
-    });
+            // Kernel-owned regions are never freed here.
+            true
+        });
+    })
 }

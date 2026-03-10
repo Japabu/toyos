@@ -20,6 +20,7 @@ pub trait Gpu: Send {
     fn present_rect(&mut self, x: u32, y: u32, w: u32, h: u32);
     fn set_cursor(&mut self, hot_x: u32, hot_y: u32);
     fn move_cursor(&mut self, x: u32, y: u32);
+    fn set_resolution(&mut self, width: u32, height: u32) -> Result<GpuInfo, ()>;
 }
 
 static GPU: Lock<Option<Box<dyn Gpu>>> = Lock::new(None);
@@ -64,6 +65,25 @@ pub fn set_cursor(hot_x: u32, hot_y: u32) {
     if let Some(gpu) = GPU.lock().as_mut() {
         gpu.set_cursor(hot_x, hot_y);
     }
+}
+
+pub fn set_resolution(width: u32, height: u32) -> Result<GpuInfo, ()> {
+    let new_info = {
+        let mut gpu = GPU.lock();
+        let gpu = gpu.as_mut().ok_or(())?;
+        gpu.set_resolution(width, height)?
+    };
+    let mut info = INFO.lock();
+    *info = Some(GpuInfo {
+        tokens: new_info.tokens,
+        cursor_token: new_info.cursor_token,
+        width: new_info.width,
+        height: new_info.height,
+        stride: new_info.stride,
+        pixel_format: new_info.pixel_format,
+        flags: new_info.flags,
+    });
+    Ok(new_info)
 }
 
 pub fn move_cursor(x: u32, y: u32) {

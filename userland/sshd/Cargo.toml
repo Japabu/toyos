@@ -5,12 +5,3 @@ edition = "2024"
 [dependencies]
 russh = { version = "0.57", default-features = false, features = ["rustcrypto", "flate2", "rsa"] }
 tokio = { version = "1", features = ["rt", "net", "macros", "io-util", "sync", "time"] }
-
-[patch.crates-io]
-mio = { path = "../mio" }
-tokio = { path = "../tokio/tokio" }
-getrandom_02 = { git = "https://github.com/Japabu/getrandom", branch = "toyos-v0.2", package = "getrandom" }
-getrandom_03 = { git = "https://github.com/Japabu/getrandom", branch = "toyos-v0.3", package = "getrandom" }
-russh = { path = "../russh/russh" }
-russh-cryptovec = { path = "../russh/cryptovec" }
-socket2 = { path = "../socket2" }

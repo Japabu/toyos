@@ -1,4 +1,4 @@
-use alloc::alloc::{alloc_zeroed, dealloc, Layout};
+use alloc::alloc::{alloc, alloc_zeroed, dealloc, Layout};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -65,6 +65,14 @@ impl OwnedAlloc {
         Some(Self { ptr, layout })
     }
 
+    /// Allocate uninitialized memory with the given size and alignment.
+    /// The caller must initialize all bytes before reading them.
+    pub fn new_uninit(size: usize, align: usize) -> Option<Self> {
+        let layout = Layout::from_size_align(size, align).ok()?;
+        let ptr = NonNull::new(unsafe { alloc(layout) })?;
+        Some(Self { ptr, layout })
+    }
+
     /// Consume `self` without running `Drop`, returning the raw parts.
     /// The caller takes ownership of the allocation.
     pub fn into_raw(self) -> (*mut u8, Layout) {
@@ -87,7 +95,7 @@ impl Drop for OwnedAlloc {
 unsafe impl Send for OwnedAlloc {}
 
 const USER_STACK_SIZE: usize = 4 * PAGE_2M as usize; // 8 MB
-pub const KERNEL_STACK_SIZE: usize = 64 * 1024;
+pub const KERNEL_STACK_SIZE: usize = 128 * 1024;
 
 /// Write argc, argv pointers, and string data onto a user stack. Returns new SP.
 pub fn write_argv_to_stack(stack_top: u64, args: &[&str]) -> u64 {
@@ -308,6 +316,9 @@ pub struct ProcessData {
     pub user_stack_size: u64,
     /// Inherited environment variables (KEY=VALUE\0KEY2=VALUE2\0...)
     pub env: Vec<u8>,
+    /// Syscall counts per syscall number (for profiling)
+    pub syscall_counts: [u32; 64],
+    pub syscall_total: u64,
 }
 
 pub struct MmapRegion {
@@ -696,6 +707,8 @@ pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64, stack_base: u64) -> Op
         user_stack_base: stack_base,
         user_stack_size: if stack_base > 0 { stack_ptr - stack_base } else { 0 },
         env: Vec::new(),
+        syscall_counts: [0; 64],
+        syscall_total: 0,
     }));
 
     let mut guard = PROCESS_TABLE.lock();
@@ -738,6 +751,7 @@ pub fn build_child_fds(pairs: &[[u32; 2]]) -> FdTable {
 /// Spawn a new process from an ELF binary.
 pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> Option<Pid> {
     let path = argv[0];
+    let t0 = crate::clock::nanos_since_boot();
 
     let binary = match vfs::lock().read_file(path) {
         Ok(data) => data,
@@ -746,6 +760,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
             return None;
         }
     };
+    let t1 = crate::clock::nanos_since_boot();
 
     let (elf_alloc, loaded) = match elf::load(&binary) {
         Ok(l) => l,
@@ -754,6 +769,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
             return None;
         }
     };
+    let t2 = crate::clock::nanos_since_boot();
 
     // Load DT_NEEDED shared libraries and apply GLOB_DAT relocations
     let loaded_libs = match elf::resolve_dynamic_deps(&binary, loaded.base, path, |lib_path| {
@@ -766,13 +782,30 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
         }
     };
 
+    let t_deps = crate::clock::nanos_since_boot();
+
     let child_pml4 = paging::create_user_pml4();
     let child_cr3 = Some(PageTableRoot::new(child_pml4));
 
     paging::map_user_in(child_pml4, elf_alloc.ptr() as u64, elf_alloc.size() as u64);
 
     for lib in &loaded_libs {
-        paging::map_user_in(child_pml4, lib.alloc.ptr() as u64, lib.alloc.size() as u64);
+        match &lib.memory {
+            elf::LibMemory::Owned(alloc) => {
+                paging::map_user_in(child_pml4, alloc.ptr() as u64, alloc.size() as u64);
+            }
+            elf::LibMemory::Shared { rw_alloc, shared_addr, shared_size, total_cached_size, .. } => {
+                // Map entire cached range as user-readable (code + rodata)
+                paging::map_user_readonly_in(child_pml4, *shared_addr, *total_cached_size as u64);
+                // Remap private RW pages over the shared range
+                let num_rw_pages = paging::align_2m(rw_alloc.size()) / paging::PAGE_2M as usize;
+                for i in 0..num_rw_pages {
+                    let virt = *shared_addr + *shared_size as u64 + i as u64 * paging::PAGE_2M;
+                    let phys = rw_alloc.ptr() as u64 + i as u64 * paging::PAGE_2M;
+                    paging::remap_user_2m_in(child_pml4, virt, phys);
+                }
+            }
+        }
     }
 
     let stack_alloc = match OwnedAlloc::new(USER_STACK_SIZE, PAGE_2M as usize) {
@@ -841,11 +874,21 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
 
     let sp = write_argv_to_stack(stack_top, argv);
 
-    let syms = ProcessSymbols::parse(
-        &binary, loaded.base,
-        elf_alloc.ptr() as u64, elf_alloc.ptr() as u64 + elf_alloc.size() as u64,
-        stack_base, stack_top,
-    );
+    let t_tls = crate::clock::nanos_since_boot();
+    // Skip full symbol parsing for large binaries (>5MB) — too slow for debug info
+    let syms = if binary.len() > 5 * 1024 * 1024 {
+        ProcessSymbols::empty_with_bounds(
+            elf_alloc.ptr() as u64, elf_alloc.ptr() as u64 + elf_alloc.size() as u64,
+            stack_base, stack_top,
+        )
+    } else {
+        ProcessSymbols::parse(
+            &binary, loaded.base,
+            elf_alloc.ptr() as u64, elf_alloc.ptr() as u64 + elf_alloc.size() as u64,
+            stack_base, stack_top,
+        )
+    };
+    let t_syms = crate::clock::nanos_since_boot();
 
     let (ks_alloc, ks_rsp) = match alloc_kernel_stack(process_start, loaded.entry, sp, 0) {
         Some(ks) => ks,
@@ -895,6 +938,8 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
         user_stack_base: stack_base,
         user_stack_size: USER_STACK_SIZE as u64,
         env,
+        syscall_counts: [0; 64],
+        syscall_total: 0,
     }));
 
     let mut guard = PROCESS_TABLE.lock();
@@ -909,9 +954,13 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
         )
     });
 
-    log!("spawn: {} pid={} base={:#x} entry={:#x} cr3={:#x} ks={:#x}..{:#x}",
+    let t3 = crate::clock::nanos_since_boot();
+    log!("spawn: {} pid={} base={:#x} entry={:#x} cr3={:#x} ks={:#x}..{:#x} (read={}ms elf={}ms deps={}ms tls={}ms syms={}ms rest={}ms)",
         path, pid, loaded.base as u64, loaded.entry, child_cr3.unwrap().as_u64(),
-        ks_base, ks_base + KERNEL_STACK_SIZE as u64);
+        ks_base, ks_base + KERNEL_STACK_SIZE as u64,
+        (t1 - t0) / 1_000_000, (t2 - t1) / 1_000_000, (t_deps - t2) / 1_000_000,
+        (t_tls - t_deps) / 1_000_000, (t_syms - t_tls) / 1_000_000,
+        (t3 - t_syms) / 1_000_000);
 
     Some(pid)
 }
@@ -936,6 +985,20 @@ pub fn spawn_kernel(argv: &[&str]) -> Pid {
 /// - Phase 2 (scheduling): table lock held through context switch.
 fn teardown_resources(data_arc: &Arc<Lock<ProcessData>>, pid: Pid) {
     let mut data = data_arc.lock();
+
+    // Print syscall profile for processes with significant activity
+    if data.syscall_total > 0 {
+        use alloc::string::String;
+        use core::fmt::Write;
+        let mut profile = String::new();
+        for (i, &count) in data.syscall_counts.iter().enumerate() {
+            if count > 0 {
+                let _ = write!(profile, " {}={}", i, count);
+            }
+        }
+        log!("syscalls: pid={pid} total={}{profile}", data.syscall_total);
+    }
+
     fd::close_all(&mut data.fds, &mut *vfs::lock(), pid);
     data.tls_alloc.take();
     data.elf_alloc.take();
@@ -966,7 +1029,7 @@ fn teardown_scheduling(table: &mut ProcessTable, pid: Pid, code: i32) {
     let entry = table.get_mut(pid).unwrap();
     let root = entry.take_cr3();
     let pml4 = root.as_ptr();
-    shared_memory::cleanup_process(pid, pml4);
+    shared_memory::cleanup_process(pid);
     paging::free_user_page_tables(pml4);
     let has_parent = matches!(entry.kind(), Kind::Process { parent: Some(_) });
     entry.zombify(code);
@@ -1288,19 +1351,6 @@ pub fn find_pid(name: &str) -> Option<Pid> {
 // Symbol resolution / address validation
 // ---------------------------------------------------------------------------
 
-/// Resolve an address using the current process's symbols. Lock-safe (brief hold).
-pub fn resolve_symbol(addr: u64) -> Option<(String, u64)> {
-    let pid = current_pid();
-    if pid == Pid::MAX { return None; }
-    let data_arc = {
-        let guard = PROCESS_TABLE.lock();
-        let table = guard.as_ref()?;
-        Arc::clone(table.get(pid)?.data())
-    };
-    let guard = data_arc.lock();
-    guard.symbols.resolve(addr)
-}
-
 /// Check if an address is in the current process's valid memory ranges.
 pub fn is_valid_user_addr(addr: u64) -> bool {
     let pid = current_pid();
@@ -1380,7 +1430,7 @@ pub fn kill_process(target_pid: Pid) -> u64 {
     let entry = table.get_mut(target_pid).unwrap();
     let root = entry.take_cr3();
     let pml4 = root.as_ptr();
-    shared_memory::cleanup_process(target_pid, pml4);
+    shared_memory::cleanup_process(target_pid);
     paging::free_user_page_tables(pml4);
 
     entry.zombify(137); // 128 + 9 (SIGKILL-like)

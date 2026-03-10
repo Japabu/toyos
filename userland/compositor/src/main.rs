@@ -2,11 +2,12 @@ use std::fs::File;
 use std::io::Read;
 use std::os::fd::AsRawFd;
 use std::os::toyos::message::{self, Message};
-use std::os::toyos::shm::SharedMemory;
-use std::os::toyos::{device, gpu, poll, services, system};
+use std::os::toyos::device;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+use toyos_abi::shm::SharedMemory;
+use toyos_abi::{gpu, poll, services, system, FramebufferInfo};
 use window::{Color, Framebuffer};
 
 const TITLE_BAR_HEIGHT: usize = 28;
@@ -55,39 +56,11 @@ const LAUNCHER_APPS: &[LauncherEntry] = &[
 
 const FLAG_HARDWARE_CURSOR: u32 = 1 << 0;
 
-#[repr(C)]
-struct FramebufferInfo {
-    token: [u32; 2],
-    cursor_token: u32,
-    width: u32,
-    height: u32,
-    stride: u32,
-    pixel_format: u32,
-    flags: u32,
-}
-
 fn read_fb_info(file: &mut File) -> FramebufferInfo {
-    let mut info = FramebufferInfo {
-        token: [0; 2],
-        cursor_token: 0,
-        width: 0,
-        height: 0,
-        stride: 0,
-        pixel_format: 0,
-        flags: 0,
-    };
-    let buf = unsafe {
-        std::slice::from_raw_parts_mut(
-            &mut info as *mut FramebufferInfo as *mut u8,
-            std::mem::size_of::<FramebufferInfo>(),
-        )
-    };
-    let n = file.read(buf).expect("failed to read framebuffer info");
-    assert!(
-        n == std::mem::size_of::<FramebufferInfo>(),
-        "failed to read framebuffer info"
-    );
-    info
+    let mut buf = [0u8; std::mem::size_of::<FramebufferInfo>()];
+    let n = file.read(&mut buf).expect("failed to read framebuffer info");
+    assert_eq!(n, buf.len(), "failed to read framebuffer info");
+    unsafe { std::ptr::read(buf.as_ptr() as *const FramebufferInfo) }
 }
 
 struct WindowState {
@@ -414,9 +387,17 @@ fn hit_test(windows: &[WindowState], x: i32, y: i32, screen_h: i32, launcher_ope
 
 enum Interaction {
     None,
+    DragPending {
+        window_idx: usize,
+        start_x: i32,
+        start_y: i32,
+        was_maximized: bool,
+    },
     Dragging { window_idx: usize },
     Resizing { window_idx: usize },
 }
+
+const DRAG_THRESHOLD: i32 = 5;
 
 fn redraw(
     screen: &Framebuffer,
@@ -677,10 +658,10 @@ fn main() {
     let mut mouse_file = device::open_mouse().expect("failed to claim mouse");
     let mut fb_file = device::open_framebuffer().expect("failed to claim framebuffer");
 
-    let fb_info = read_fb_info(&mut fb_file);
+    let mut fb_info = read_fb_info(&mut fb_file);
     let fb_size = fb_info.stride as usize * fb_info.height as usize * 4;
-    let fb_shm = SharedMemory::map(fb_info.token[0], fb_size);
-    let screen = Framebuffer::new(
+    let mut fb_shm = SharedMemory::map(fb_info.token[0], fb_size);
+    let mut screen = Framebuffer::new(
         fb_shm.as_ptr(),
         fb_info.width as usize,
         fb_info.height as usize,
@@ -707,24 +688,25 @@ fn main() {
     let font = font::Font::from_prebuilt(&font_data);
 
     eprintln!("compositor: decoding wallpaper...");
-    let wallpaper = {
-        let jpg_data = std::fs::read("/share/wallpaper.jpg").expect("failed to read wallpaper");
+    let jpg_data = std::fs::read("/share/wallpaper.jpg").expect("failed to read wallpaper");
+    let wallpaper_img = {
         let img = image::load_from_memory_with_format(&jpg_data, image::ImageFormat::Jpeg)
             .expect("failed to decode wallpaper");
-        let rgb = img.to_rgb8();
-        eprintln!(
-            "compositor: wallpaper decoded {}x{}, scaling to {}x{}",
-            rgb.width(), rgb.height(), screen.width(), screen.height()
-        );
-        scale_wallpaper(
-            rgb.as_raw(),
-            rgb.width() as usize,
-            rgb.height() as usize,
-            screen.width(),
-            screen.height(),
-            screen.pixel_format_raw() != 0,
-        )
+        img.to_rgb8()
     };
+    drop(jpg_data);
+    eprintln!(
+        "compositor: wallpaper decoded {}x{}, scaling to {}x{}",
+        wallpaper_img.width(), wallpaper_img.height(), screen.width(), screen.height()
+    );
+    let mut wallpaper = scale_wallpaper(
+        wallpaper_img.as_raw(),
+        wallpaper_img.width() as usize,
+        wallpaper_img.height() as usize,
+        screen.width(),
+        screen.height(),
+        screen.pixel_format_raw() != 0,
+    );
 
     let icons = TitleBarIcons {
         minimize: sprite::Sprite::from_svg_colored(
@@ -747,8 +729,8 @@ fn main() {
     eprintln!("compositor: ready");
 
     let mut windows: Vec<WindowState> = Vec::new();
-    let screen_w = screen.width() as i32;
-    let screen_h = screen.height() as i32;
+    let mut screen_w = screen.width() as i32;
+    let mut screen_h = screen.height() as i32;
     let mut cursor_x = screen_w / 2;
     let mut cursor_y = screen_h / 2;
     if hw_cursor {
@@ -773,17 +755,17 @@ fn main() {
         let mut waited = false;
         loop {
             let timeout = if waited { Duration::from_nanos(1) } else { FRAME_INTERVAL };
-            let ready = poll::poll(
+            let ready = poll::poll_timeout(
                 &[kb_file.as_raw_fd() as u64, mouse_file.as_raw_fd() as u64],
-                Some(timeout),
+                Some(timeout.as_nanos() as u64),
             );
 
-            if !ready.fd_ready(0) && !ready.fd_ready(1) && !ready.has_messages() {
+            if !ready.fd(0) && !ready.fd(1) && !ready.messages() {
                 break;
             }
             waited = true;
 
-        if ready.fd_ready(0) {
+        if ready.fd(0) {
             let mut events = [window::KeyEvent::EMPTY; 8];
             let buf = unsafe {
                 std::slice::from_raw_parts_mut(
@@ -901,7 +883,7 @@ fn main() {
             }
         }
 
-        if ready.fd_ready(1) {
+        if ready.fd(1) {
             // Drain all pending mouse events in one read
             let mut buf = [0u8; 512];
             let n = mouse_file.read(&mut buf).unwrap_or(0);
@@ -1043,20 +1025,19 @@ fn main() {
                             } else {
                                 last_title_click_pid = pid;
                                 last_title_click_time = now;
-                                // Un-snap/maximize on drag
                                 if windows[new_idx].mode != WindowMode::Normal {
-                                    let pixel_format = screen.pixel_format_raw();
-                                    restore_window(&mut windows[new_idx], pixel_format);
-                                    let win = &mut windows[new_idx];
-                                    win.content_x = (cursor_x as usize)
-                                        .saturating_sub(win.width / 2)
-                                        .max(BORDER_WIDTH);
-                                    win.content_y = (cursor_y as usize)
-                                        .max(BORDER_WIDTH + TITLE_BAR_HEIGHT);
+                                    // Defer unmaximize until drag threshold is exceeded
+                                    interaction = Interaction::DragPending {
+                                        window_idx: new_idx,
+                                        start_x: cursor_x,
+                                        start_y: cursor_y,
+                                        was_maximized: true,
+                                    };
+                                } else {
+                                    interaction = Interaction::Dragging {
+                                        window_idx: new_idx,
+                                    };
                                 }
-                                interaction = Interaction::Dragging {
-                                    window_idx: new_idx,
-                                };
                             }
                             mark_dirty(&mut dirty_rect, DirtyRect::full(screen_w as usize, screen_h as usize));
                         }
@@ -1121,6 +1102,9 @@ fn main() {
                         ).ok();
                     }
                     match interaction {
+                        Interaction::DragPending { .. } => {
+                            // Click without dragging — just focus, don't unmaximize
+                        }
                         Interaction::Dragging { window_idx } => {
                             // Snap detection on drag release
                             let pixel_format = screen.pixel_format_raw();
@@ -1164,6 +1148,39 @@ fn main() {
                 // Drag / resize with accumulated deltas
                 if left {
                     match interaction {
+                        Interaction::DragPending {
+                            window_idx,
+                            start_x,
+                            start_y,
+                            was_maximized,
+                        } => {
+                            let dx = cursor_x - start_x;
+                            let dy = cursor_y - start_y;
+                            if dx.abs() > DRAG_THRESHOLD || dy.abs() > DRAG_THRESHOLD {
+                                if was_maximized {
+                                    let pixel_format = screen.pixel_format_raw();
+                                    let win = &mut windows[window_idx];
+                                    // Remember old maximized width for proportional cursor placement
+                                    let old_width = win.width + 2 * BORDER_WIDTH;
+                                    restore_window(win, pixel_format);
+                                    let win = &mut windows[window_idx];
+                                    let new_width = win.width + 2 * BORDER_WIDTH;
+                                    // Place cursor proportionally on the restored title bar
+                                    let ratio = (start_x as usize).min(old_width) as f32
+                                        / old_width as f32;
+                                    win.content_x = (cursor_x as usize)
+                                        .saturating_sub((new_width as f32 * ratio) as usize)
+                                        .max(BORDER_WIDTH);
+                                    win.content_y = (cursor_y as usize)
+                                        .max(BORDER_WIDTH + TITLE_BAR_HEIGHT);
+                                    mark_dirty(
+                                        &mut dirty_rect,
+                                        DirtyRect::full(screen_w as usize, screen_h as usize),
+                                    );
+                                }
+                                interaction = Interaction::Dragging { window_idx };
+                            }
+                        }
                         Interaction::Dragging { window_idx } => {
                             let old_rect = window_screen_rect(&windows[window_idx]);
                             let win = &mut windows[window_idx];
@@ -1227,7 +1244,7 @@ fn main() {
             }
         }
 
-        if ready.has_messages() {
+        if ready.messages() {
             let msg = message::recv();
             let sender = msg.sender();
             match msg.msg_type() {
@@ -1333,6 +1350,82 @@ fn main() {
                     if let Some(win) = windows.iter_mut().find(|w| w.pid == sender) {
                         win.cursor_style = style as u8;
                     }
+                }
+                window::MSG_SET_RESOLUTION => {
+                    let req: window::ResolutionRequest = msg.take_payload();
+                    match gpu::set_resolution(req.width, req.height) {
+                        Ok(new_fb_info) => {
+                            fb_info = new_fb_info;
+                            let new_fb_size = fb_info.stride as usize * fb_info.height as usize * 4;
+                            fb_shm = SharedMemory::map(fb_info.token[0], new_fb_size);
+                            screen = Framebuffer::new(
+                                fb_shm.as_ptr(),
+                                fb_info.width as usize,
+                                fb_info.height as usize,
+                                fb_info.stride as usize,
+                                fb_info.pixel_format,
+                            );
+                            screen_w = screen.width() as i32;
+                            screen_h = screen.height() as i32;
+                            wallpaper = scale_wallpaper(
+                                wallpaper_img.as_raw(),
+                                wallpaper_img.width() as usize,
+                                wallpaper_img.height() as usize,
+                                screen.width(),
+                                screen.height(),
+                                screen.pixel_format_raw() != 0,
+                            );
+
+                            let sw = screen_w as usize;
+                            let sh = screen_h as usize;
+                            let pf = screen.pixel_format_raw();
+                            for win in &mut windows {
+                                match win.mode {
+                                    WindowMode::Maximized => maximize_window(win, sw, sh, pf),
+                                    WindowMode::SnappedLeft => snap_left(win, sw, sh, pf),
+                                    WindowMode::SnappedRight => snap_right(win, sw, sh, pf),
+                                    WindowMode::Normal => {
+                                        // Clamp position so window stays visible
+                                        let win_w = win.width + BORDER_WIDTH * 2;
+                                        let win_h = win.height + BORDER_WIDTH * 2 + TITLE_BAR_HEIGHT;
+                                        let max_x = sw.saturating_sub(win_w);
+                                        let max_y = sh.saturating_sub(win_h + TASKBAR_HEIGHT);
+                                        let cx = win.content_x.saturating_sub(BORDER_WIDTH);
+                                        let cy = win.content_y.saturating_sub(BORDER_WIDTH + TITLE_BAR_HEIGHT);
+                                        win.content_x = cx.min(max_x) + BORDER_WIDTH;
+                                        win.content_y = cy.min(max_y) + BORDER_WIDTH + TITLE_BAR_HEIGHT;
+                                    }
+                                }
+                            }
+
+                            // Clamp cursor position
+                            cursor_x = cursor_x.min(screen_w - 1);
+                            cursor_y = cursor_y.min(screen_h - 1);
+
+                            mark_dirty(&mut dirty_rect, DirtyRect::full(sw, sh));
+
+                            let reply = window::ResolutionInfo {
+                                width: fb_info.width,
+                                height: fb_info.height,
+                            };
+                            message::send(sender, Message::new(window::MSG_RESOLUTION_CHANGED, reply)).ok();
+                        }
+                        Err(_) => {
+                            // Resolution change not supported — reply with current
+                            let reply = window::ResolutionInfo {
+                                width: fb_info.width,
+                                height: fb_info.height,
+                            };
+                            message::send(sender, Message::new(window::MSG_RESOLUTION_CHANGED, reply)).ok();
+                        }
+                    }
+                }
+                window::MSG_GET_RESOLUTION => {
+                    let reply = window::ResolutionInfo {
+                        width: fb_info.width,
+                        height: fb_info.height,
+                    };
+                    message::send(sender, Message::new(window::MSG_RESOLUTION_CHANGED, reply)).ok();
                 }
                 _ => {}
             }

@@ -145,6 +145,7 @@ const _: () = assert!(core::mem::offset_of!(PerCpu, tss) == 32);
 const _: () = assert!(core::mem::offset_of!(PerCpu, current_pid) == 136);
 
 const IDLE_STACK_SIZE: usize = 16384; // 16KB
+const IST1_STACK_SIZE: usize = 4096;  // 4KB — only used by double fault handler
 
 /// Allocate and initialize PerCpu for a CPU. Returns a raw pointer (lives forever).
 fn alloc_percpu(cpu_id: u32, lapic_id: u32) -> *mut PerCpu {
@@ -171,6 +172,14 @@ fn alloc_idle_stack(percpu: &mut PerCpu) {
     percpu.idle_rsp = percpu.idle_stack_top;
 }
 
+fn alloc_ist1_stack(percpu: &mut PerCpu) {
+    let layout = Layout::from_size_align(IST1_STACK_SIZE, 4096).unwrap();
+    let base = unsafe { alloc_zeroed(layout) };
+    assert!(!base.is_null(), "percpu: IST1 stack alloc failed");
+    let top = base as u64 + IST1_STACK_SIZE as u64;
+    unsafe { core::ptr::write_unaligned(&raw mut percpu.tss.ist[0], top); }
+}
+
 /// Initialize per-CPU data for the BSP. Call after paging + allocator but before IDT/syscall.
 pub fn init_bsp(lapic_id: u32) {
     let ptr = alloc_percpu(0, lapic_id);
@@ -179,6 +188,7 @@ pub fn init_bsp(lapic_id: u32) {
     percpu.kernel_rsp = cpu::read_rsp();
     unsafe { core::ptr::write_unaligned(&raw mut percpu.tss.rsp0, cpu::read_rsp()); }
     alloc_idle_stack(percpu);
+    alloc_ist1_stack(percpu);
 
     unsafe { percpu.load_gdt(); }
     cpu::enable_sse();
@@ -195,6 +205,7 @@ pub fn init_ap(cpu_id: u32, lapic_id: u32) {
     let percpu = unsafe { &mut *ptr };
 
     alloc_idle_stack(percpu);
+    alloc_ist1_stack(percpu);
     unsafe { percpu.load_gdt(); }
     cpu::enable_sse();
 

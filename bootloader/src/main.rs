@@ -189,13 +189,35 @@ fn query_gop(system_table: &SystemTable<Boot>) -> Option<GopInfo> {
     let gop_handle = bs.get_handle_for_protocol::<GraphicsOutput>().ok()?;
     let mut gop = bs.open_protocol_exclusive::<GraphicsOutput>(gop_handle).ok()?;
 
+    // Find the highest-resolution mode with a supported pixel format
+    let mut best_mode = None;
+    let mut best_pixels = 0usize;
+    for mode in gop.modes(bs) {
+        let info = mode.info();
+        match info.pixel_format() {
+            PixelFormat::Rgb | PixelFormat::Bgr => {}
+            _ => continue,
+        }
+        let (w, h) = info.resolution();
+        if w * h > best_pixels {
+            best_pixels = w * h;
+            best_mode = Some(mode);
+        }
+    }
+
+    // Switch to best mode
+    if let Some(target) = best_mode {
+        println!("GOP: selecting best mode ({}x{})", target.info().resolution().0, target.info().resolution().1);
+        gop.set_mode(&target).expect("failed to set GOP mode");
+    }
+
     let mode = gop.current_mode_info();
     let (width, height) = mode.resolution();
     let stride = mode.stride();
     let pixel_format = match mode.pixel_format() {
         PixelFormat::Rgb => 0,
         PixelFormat::Bgr => 1,
-        _ => return None, // Bitmask/BltOnly not supported
+        _ => return None,
     };
 
     let mut fb = gop.frame_buffer();

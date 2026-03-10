@@ -31,6 +31,7 @@ const PIC2_DATA: u16 = 0xA1;
 
 // Exception vectors
 const VECTOR_INVALID_OPCODE: u64 = 6;
+const VECTOR_DOUBLE_FAULT: u64 = 8;
 const VECTOR_GPF: u64 = 13;
 const VECTOR_PAGE_FAULT: u64 = 14;
 
@@ -85,6 +86,11 @@ impl IdtEntry {
             offset_high: (handler >> 32) as u32,
             reserved: 0,
         }
+    }
+
+    fn with_ist(mut self, ist_index: u8) -> Self {
+        self.ist = ist_index;
+        self
     }
 }
 
@@ -172,6 +178,7 @@ pub fn init() {
     {
         let mut idt = IDT.lock();
         idt.entries[VECTOR_INVALID_OPCODE as usize] = IdtEntry::new(ud_entry as *const () as u64);
+        idt.entries[VECTOR_DOUBLE_FAULT as usize] = IdtEntry::new(double_fault_entry as *const () as u64).with_ist(1);
         idt.entries[VECTOR_GPF as usize] = IdtEntry::new(gpf_entry as *const () as u64);
         idt.entries[VECTOR_PAGE_FAULT as usize] = IdtEntry::new(page_fault_entry as *const () as u64);
         idt.entries[VECTOR_TIMER] = IdtEntry::new(timer_entry as *const () as u64);
@@ -401,12 +408,55 @@ exception_entry!(ud_entry,         "6",  no_error_code);
 exception_entry!(gpf_entry,        "13", error_code);
 exception_entry!(page_fault_entry, "14", error_code_cr2);
 
+/// Double fault handler — runs on IST1 with a dedicated stack.
+/// Minimal: just log and halt. The original stack is unusable.
+#[unsafe(naked)]
+extern "C" fn double_fault_entry() {
+    naked_asm!(
+        // Double fault always comes from kernel (ring 0) — no swapgs needed.
+        // CPU pushes error code (always 0) for #DF.
+        "push r15", "push r14", "push r13", "push r12",
+        "push r11", "push r10", "push r9",  "push r8",
+        "push rbp", "push rdi", "push rsi", "push rdx",
+        "push rcx", "push rbx", "push rax",
+        "mov rdi, rsp",       // pointer to saved regs
+        "mov rsi, [rsp + 16*8]", // RIP from interrupt frame
+        "mov rdx, cr2",       // faulting address (if page-fault triggered this)
+        "call {handler}",
+        "cli", "hlt",
+        handler = sym double_fault_handler,
+    );
+}
+
+// --- Double fault handler ---
+
+extern "C" fn double_fault_handler(regs: *const SavedRegs, rip: u64, cr2: u64) {
+    let regs = unsafe { &*regs };
+    let frame = regs.interrupt_frame();
+    let cpu = percpu::cpu_id();
+    log!("DOUBLE FAULT on CPU {} (pid={:?})", cpu, percpu::current_pid());
+    log!("  Likely cause: kernel stack overflow");
+    log!("  rip={:#018x}  cr2={:#018x}", rip, cr2);
+    log!("  rsp={:#018x}  rbp={:#018x}", frame.rsp, regs.rbp);
+    log!("  Backtrace:");
+    crate::symbols::resolve_kernel_nonblocking(rip);
+    let mut rbp = regs.rbp;
+    for _ in 0..20 {
+        if rbp == 0 || rbp % 8 != 0 || !is_kernel_addr(rbp) { break; }
+        let return_addr = unsafe { *((rbp + 8) as *const u64) };
+        if return_addr == 0 { break; }
+        crate::symbols::resolve_kernel_nonblocking(return_addr);
+        rbp = unsafe { *(rbp as *const u64) };
+    }
+    cpu::halt();
+}
+
 // --- Exception handler ---
 
 /// Log an address with symbol resolution (allocation-free).
 fn log_addr(addr: u64, _is_user: bool) {
     // Use the non-allocating raw resolver. It prints directly via log!.
-    crate::symbols::resolve_kernel_raw(addr);
+    crate::symbols::resolve_kernel(addr);
 }
 
 /// Check if addr is a plausible kernel pointer (in identity-mapped RAM).

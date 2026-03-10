@@ -92,7 +92,7 @@ fn prepare_boot(
 
 /// Build the QEMU command with standard arguments.
 fn qemu_command(boot_image: &Path, nvme_image: &Path, repo: &Path, gdb_stub: bool) -> Command {
-    let ovmf_dir = repo.join("bootable/ovmf");
+    let ovmf_dir = repo.join("ovmf");
 
     let mut qemu = Command::new("qemu-system-x86_64");
     qemu
@@ -482,7 +482,7 @@ pub fn build_toyos_bins(crate_path: &Path) -> Vec<(String, Vec<u8>)> {
 }
 
 /// Create a TyFS initrd image from files and symlinks.
-fn create_initrd(files: &[(String, Vec<u8>)], symlinks: &[(String, String)]) -> Vec<u8> {
+fn create_initrd(files: &[(String, Vec<u8>)]) -> Vec<u8> {
     use tyfs::SimpleFs;
 
     struct VecDisk { data: Vec<u8> }
@@ -510,10 +510,6 @@ fn create_initrd(files: &[(String, Vec<u8>)], symlinks: &[(String, String)]) -> 
     for (name, data) in files {
         tyfs.create(name, data, 0)
             .unwrap_or_else(|e| panic!("failed to add '{name}' to test initrd: {e:?}"));
-    }
-    for (name, target) in symlinks {
-        tyfs.create_symlink(name, target)
-            .unwrap_or_else(|e| panic!("failed to add symlink '{name}' -> '{target}' to test initrd: {e:?}"));
     }
 
     tyfs.into_disk().data

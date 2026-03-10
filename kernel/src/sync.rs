@@ -30,6 +30,13 @@ impl<T> Lock<T> {
         LockGuard { lock: self }
     }
 
+    pub fn try_lock(&self) -> Option<LockGuard<'_, T>> {
+        let current = self.now.load(Ordering::Relaxed);
+        self.ticket.compare_exchange(current, current + 1, Ordering::Acquire, Ordering::Relaxed)
+            .ok()
+            .map(|_| LockGuard { lock: self })
+    }
+
     /// Raw pointer to the underlying data. Does not acquire the lock.
     /// Only for statics that need a stable address for asm (GDT, TSS, IDT).
     pub fn data_ptr(&self) -> *mut T {

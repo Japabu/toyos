@@ -10,6 +10,3 @@ cranelift-module = "0.128"
 cranelift-object = "0.128"
 target-lexicon = { path = "../target-lexicon" }
 toyos-ld = { path = "../toyos-ld" }
-
-[patch.crates-io]
-target-lexicon = { path = "../target-lexicon" }

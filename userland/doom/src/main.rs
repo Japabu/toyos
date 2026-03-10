@@ -1,11 +1,16 @@
-// Force-link toyos-libc so its C symbols (malloc, printf, etc.) are
-// available to the C code compiled by the build script.
-extern crate toyos_libc;
-
 use core::ffi::c_void;
+use std::collections::VecDeque;
+use std::num::NonZeroU32;
 use std::ptr::addr_of_mut;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use window::{Event, KeyEvent, Window};
+
+use softbuffer::Surface;
+use winit::application::ApplicationHandler;
+use winit::event::{ElementState, KeyEvent, WindowEvent};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::keyboard::{KeyCode, PhysicalKey};
+use winit::window::{Window, WindowAttributes, WindowId};
 
 // doomgeneric C interface
 extern "C" {
@@ -168,6 +173,10 @@ static mut SND_USE_SFX_PREFIX: bool = false;
 static mut MIX_BUF: [i32; MIX_BUF_SAMPLES] = [0; MIX_BUF_SAMPLES];
 static mut OUT_BUF: [i16; MIX_BUF_SAMPLES] = [0; MIX_BUF_SAMPLES];
 
+static mut AUDIO_RING: Option<Arc<Mutex<VecDeque<i16>>>> = None;
+// Keep the stream alive — dropping it stops playback.
+static mut _AUDIO_STREAM: Option<cpal::Stream> = None;
+
 unsafe fn cache_sfx(sfxinfo: *mut SfxInfo) -> *const CachedSound {
     if !(*sfxinfo).driver_data.is_null() {
         return (*sfxinfo).driver_data as *const CachedSound;
@@ -230,8 +239,33 @@ unsafe fn cache_sfx(sfxinfo: *mut SfxInfo) -> *const CachedSound {
 }
 
 unsafe extern "C" fn toyos_init_sound(use_sfx_prefix: bool) -> bool {
+    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+
     SND_USE_SFX_PREFIX = use_sfx_prefix;
     SND_CHANNELS = [EMPTY_CHANNEL; NUM_SFX_CHANNELS];
+
+    let ring = Arc::new(Mutex::new(VecDeque::<i16>::with_capacity(OUTPUT_RATE as usize)));
+    AUDIO_RING = Some(ring.clone());
+
+    let host = cpal::default_host();
+    let device = host.default_output_device().expect("no audio output device");
+    let config = device.default_output_config().expect("no audio config");
+    let stream = device
+        .build_output_stream(
+            config.into(),
+            move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
+                let mut ring = ring.lock().unwrap();
+                for sample in data.iter_mut() {
+                    *sample = ring.pop_front().unwrap_or(0);
+                }
+            },
+            |err| eprintln!("audio stream error: {err}"),
+            None,
+        )
+        .expect("failed to build audio stream");
+    stream.play().expect("failed to start audio stream");
+    _AUDIO_STREAM = Some(stream);
+
     SND_INITIALIZED = true;
     true
 }
@@ -297,11 +331,15 @@ unsafe extern "C" fn toyos_update_sound() {
         OUT_BUF[i] = MIX_BUF[i].clamp(-32768, 32767) as i16;
     }
 
-    let bytes = core::slice::from_raw_parts(
-        core::ptr::addr_of!(OUT_BUF) as *const u8,
-        MIX_BUF_SAMPLES * 2,
-    );
-    std::os::toyos::audio::write_samples(bytes);
+    if let Some(ring) = &*addr_of_mut!(AUDIO_RING) {
+        let mut ring = ring.lock().unwrap();
+        // Cap the ring buffer to ~100ms to avoid growing unbounded
+        const MAX_SAMPLES: usize = 44100 / 10 * 2;
+        if ring.len() < MAX_SAMPLES {
+            let out = core::ptr::addr_of!(OUT_BUF).read();
+            ring.extend(out.iter().copied());
+        }
+    }
 }
 
 unsafe extern "C" fn toyos_update_sound_params(handle: i32, vol: i32, sep: i32) {
@@ -370,7 +408,8 @@ unsafe extern "C" fn toyos_play_song(_handle: *mut c_void, _looping: bool) {}
 unsafe extern "C" fn toyos_stop_song() {}
 unsafe extern "C" fn toyos_music_is_playing() -> bool { false }
 
-static mut WINDOW: Option<Window> = None;
+// ── Globals for C callback access ──
+
 static mut START_TIME: Option<Instant> = None;
 
 // Key event ring buffer
@@ -379,8 +418,7 @@ static mut KEY_QUEUE: [(i32, u8); KEY_QUEUE_SIZE] = [(0, 0); KEY_QUEUE_SIZE];
 static mut KEY_QUEUE_READ: usize = 0;
 static mut KEY_QUEUE_WRITE: usize = 0;
 
-// Track which doom_key was sent for each HID keycode so releases match presses.
-// Key releases have no translated character data, so we replay the press mapping.
+// Track which doom_key was sent for each KeyCode so releases match presses.
 static mut KEYCODE_TO_DOOM: [u8; 256] = [0; 256];
 
 fn enqueue_key(pressed: bool, doom_key: u8) {
@@ -393,39 +431,8 @@ fn enqueue_key(pressed: bool, doom_key: u8) {
     }
 }
 
-fn poll_input() {
-    unsafe {
-        let window = (*addr_of_mut!(WINDOW)).as_mut().unwrap();
-        loop {
-            match window.poll_event(1) {
-                Some(Event::KeyInput(ev)) => handle_key(ev),
-                Some(Event::Close) => std::process::exit(0),
-                Some(Event::Frame) => {}
-                Some(_) => {}
-                None => break,
-            }
-        }
-    }
-}
+// ── DOOM key constants (from doomkeys.h) ──
 
-fn handle_key(ev: KeyEvent) {
-    unsafe {
-        if ev.pressed() {
-            if let Some(doom_key) = to_doom_key(&ev) {
-                KEYCODE_TO_DOOM[ev.keycode as usize] = doom_key;
-                enqueue_key(true, doom_key);
-            }
-        } else {
-            let doom_key = KEYCODE_TO_DOOM[ev.keycode as usize];
-            if doom_key != 0 {
-                KEYCODE_TO_DOOM[ev.keycode as usize] = 0;
-                enqueue_key(false, doom_key);
-            }
-        }
-    }
-}
-
-// DOOM key constants (from doomkeys.h)
 const KEY_RIGHTARROW: u8 = 0xae;
 const KEY_LEFTARROW: u8 = 0xac;
 const KEY_UPARROW: u8 = 0xad;
@@ -439,106 +446,238 @@ const KEY_USE: u8 = 0xa2;
 const KEY_RSHIFT: u8 = 0x80 + 0x36;
 const KEY_F1: u8 = 0x80 + 0x3b;
 
-fn to_doom_key(ev: &KeyEvent) -> Option<u8> {
-    // Special keys by HID keycode (not affected by layout)
-    match ev.keycode {
-        0x28 => return Some(KEY_ENTER),
-        0x29 => return Some(KEY_ESCAPE),
-        0x2A => return Some(KEY_BACKSPACE),
-        0x2B => return Some(KEY_TAB),
-        0x2C => return Some(KEY_USE),
-        // Arrow keys
-        0x4F => return Some(KEY_RIGHTARROW),
-        0x50 => return Some(KEY_LEFTARROW),
-        0x51 => return Some(KEY_DOWNARROW),
-        0x52 => return Some(KEY_UPARROW),
-        // F keys (HID 0x3A-0x45 -> F1-F12)
-        0x3A..=0x45 => return Some(KEY_F1 + (ev.keycode - 0x3A)),
-        // Modifier keys: map to DOOM action keys (like other doomgeneric backends)
-        0xE0 | 0xE4 => return Some(KEY_FIRE),   // Ctrl = fire
-        0xE1 | 0xE5 => return Some(KEY_RSHIFT),  // Shift = run
-        0xE2 | 0xE6 => return Some(KEY_USE),     // Alt = use/open
-        _ => {}
+fn keycode_to_doom(code: KeyCode) -> Option<u8> {
+    match code {
+        KeyCode::Enter => Some(KEY_ENTER),
+        KeyCode::Escape => Some(KEY_ESCAPE),
+        KeyCode::Backspace => Some(KEY_BACKSPACE),
+        KeyCode::Tab => Some(KEY_TAB),
+        KeyCode::Space => Some(KEY_USE),
+        KeyCode::ArrowRight => Some(KEY_RIGHTARROW),
+        KeyCode::ArrowLeft => Some(KEY_LEFTARROW),
+        KeyCode::ArrowDown => Some(KEY_DOWNARROW),
+        KeyCode::ArrowUp => Some(KEY_UPARROW),
+        KeyCode::F1 => Some(KEY_F1),
+        KeyCode::F2 => Some(KEY_F1 + 1),
+        KeyCode::F3 => Some(KEY_F1 + 2),
+        KeyCode::F4 => Some(KEY_F1 + 3),
+        KeyCode::F5 => Some(KEY_F1 + 4),
+        KeyCode::F6 => Some(KEY_F1 + 5),
+        KeyCode::F7 => Some(KEY_F1 + 6),
+        KeyCode::F8 => Some(KEY_F1 + 7),
+        KeyCode::F9 => Some(KEY_F1 + 8),
+        KeyCode::F10 => Some(KEY_F1 + 9),
+        KeyCode::F11 => Some(KEY_F1 + 10),
+        KeyCode::F12 => Some(KEY_F1 + 11),
+        KeyCode::ControlLeft | KeyCode::ControlRight => Some(KEY_FIRE),
+        KeyCode::ShiftLeft | KeyCode::ShiftRight => Some(KEY_RSHIFT),
+        KeyCode::AltLeft | KeyCode::AltRight => Some(KEY_USE),
+        // Letter keys (QWERTY physical layout)
+        KeyCode::KeyA => Some(b'a'),
+        KeyCode::KeyB => Some(b'b'),
+        KeyCode::KeyC => Some(b'c'),
+        KeyCode::KeyD => Some(b'd'),
+        KeyCode::KeyE => Some(b'e'),
+        KeyCode::KeyF => Some(b'f'),
+        KeyCode::KeyG => Some(b'g'),
+        KeyCode::KeyH => Some(b'h'),
+        KeyCode::KeyI => Some(b'i'),
+        KeyCode::KeyJ => Some(b'j'),
+        KeyCode::KeyK => Some(b'k'),
+        KeyCode::KeyL => Some(b'l'),
+        KeyCode::KeyM => Some(b'm'),
+        KeyCode::KeyN => Some(b'n'),
+        KeyCode::KeyO => Some(b'o'),
+        KeyCode::KeyP => Some(b'p'),
+        KeyCode::KeyQ => Some(b'q'),
+        KeyCode::KeyR => Some(b'r'),
+        KeyCode::KeyS => Some(b's'),
+        KeyCode::KeyT => Some(b't'),
+        KeyCode::KeyU => Some(b'u'),
+        KeyCode::KeyV => Some(b'v'),
+        KeyCode::KeyW => Some(b'w'),
+        KeyCode::KeyX => Some(b'x'),
+        KeyCode::KeyY => Some(b'y'),
+        KeyCode::KeyZ => Some(b'z'),
+        // Number keys
+        KeyCode::Digit0 => Some(b'0'),
+        KeyCode::Digit1 => Some(b'1'),
+        KeyCode::Digit2 => Some(b'2'),
+        KeyCode::Digit3 => Some(b'3'),
+        KeyCode::Digit4 => Some(b'4'),
+        KeyCode::Digit5 => Some(b'5'),
+        KeyCode::Digit6 => Some(b'6'),
+        KeyCode::Digit7 => Some(b'7'),
+        KeyCode::Digit8 => Some(b'8'),
+        KeyCode::Digit9 => Some(b'9'),
+        KeyCode::Minus => Some(b'-'),
+        KeyCode::Equal => Some(b'='),
+        KeyCode::Comma => Some(b','),
+        KeyCode::Period => Some(b'.'),
+        _ => None,
     }
-    // Use the keyboard-layout-translated character for printable keys.
-    // DOOM expects lowercase ASCII for letter keys.
-    if ev.len > 0 {
-        let ch = ev.translated[0];
-        match ch {
-            b'A'..=b'Z' => return Some(ch - b'A' + b'a'),
-            b'a'..=b'z' | b'0'..=b'9' | b' '..=b'/' | b':'..=b'@' | b'['..=b'`' | b'{'..=b'~' => {
-                return Some(ch);
-            }
-            _ => {}
-        }
-    }
-    None
 }
 
-// ── DG_* implementations ──
+// ── Winit application ──
 
 const SRC_W: usize = 640;
 const SRC_H: usize = 400;
 
+struct DoomApp {
+    window: Option<Arc<dyn Window>>,
+    surface: Option<Surface<winit::event_loop::OwnedDisplayHandle, Arc<dyn Window>>>,
+    context: Option<softbuffer::Context<winit::event_loop::OwnedDisplayHandle>>,
+}
+
+impl ApplicationHandler for DoomApp {
+    fn can_create_surfaces(&mut self, event_loop: &dyn ActiveEventLoop) {
+        event_loop.set_control_flow(ControlFlow::Poll);
+
+        let attrs = WindowAttributes::default()
+            .with_title("DOOM")
+            .with_surface_size(winit::dpi::LogicalSize::new(960, 600));
+        let window: Arc<dyn Window> = event_loop.create_window(attrs).expect("failed to create window").into();
+
+        let display = event_loop.owned_display_handle();
+        let context = softbuffer::Context::new(display).expect("failed to create softbuffer context");
+        let surface = Surface::new(&context, window.clone()).expect("failed to create surface");
+
+        self.window = Some(window);
+        self.surface = Some(surface);
+        self.context = Some(context);
+
+        // Initialize doom — this calls DG_Init() which just sets START_TIME
+        let args: Vec<&[u8]> = vec![b"doom\0", b"-iwad\0", b"/share/doom1.wad\0"];
+        let argv: Vec<*const u8> = args.iter().map(|a| a.as_ptr()).collect();
+        unsafe {
+            doomgeneric_Create(argv.len() as i32, argv.as_ptr());
+        }
+    }
+
+    fn window_event(
+        &mut self,
+        _event_loop: &dyn ActiveEventLoop,
+        _window_id: WindowId,
+        event: WindowEvent,
+    ) {
+        match event {
+            WindowEvent::CloseRequested => std::process::exit(0),
+            WindowEvent::KeyboardInput { event, .. } => {
+                handle_winit_key(&event);
+            }
+            WindowEvent::RedrawRequested => {
+                self.draw_frame();
+            }
+            _ => {}
+        }
+    }
+
+    fn about_to_wait(&mut self, _event_loop: &dyn ActiveEventLoop) {
+        if self.window.is_some() {
+            unsafe { doomgeneric_Tick(); }
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
+        }
+    }
+}
+
+impl DoomApp {
+    fn draw_frame(&mut self) {
+        let surface = match self.surface.as_mut() {
+            Some(s) => s,
+            None => return,
+        };
+
+        let window = self.window.as_ref().unwrap();
+        let size = window.surface_size();
+        let dst_w = size.width as usize;
+        let dst_h = size.height as usize;
+        if dst_w == 0 || dst_h == 0 {
+            return;
+        }
+
+        surface
+            .resize(NonZeroU32::new(size.width).unwrap(), NonZeroU32::new(size.height).unwrap())
+            .expect("failed to resize surface");
+
+        let mut buffer = surface.next_buffer().expect("failed to get buffer");
+        let stride = buffer.byte_stride().get() as usize / 4;
+
+        unsafe {
+            let src = DG_ScreenBuffer;
+            if src.is_null() {
+                return;
+            }
+
+            // Precompute X mapping table for nearest-neighbor scaling
+            let mut x_map = [0usize; 2560];
+            let map = &mut x_map[..dst_w];
+            for dx in 0..dst_w {
+                map[dx] = dx * SRC_W / dst_w;
+            }
+
+            let dst = buffer.pixels().as_mut_ptr() as *mut u32;
+            let mut prev_sy = usize::MAX;
+            for dy in 0..dst_h {
+                let sy = dy * SRC_H / dst_h;
+                let dst_row = dst.add(dy * stride);
+
+                if sy == prev_sy && dy > 0 {
+                    // Same source row — memcpy the already-scaled row
+                    core::ptr::copy_nonoverlapping(dst.add((dy - 1) * stride), dst_row, dst_w);
+                } else {
+                    let src_row = src.add(sy * SRC_W);
+                    for dx in 0..dst_w {
+                        // DOOM's XRGB (0x00RRGGBB) → softbuffer pixel with alpha=0xFF
+                        *dst_row.add(dx) = *src_row.add(*map.get_unchecked(dx)) | 0xFF000000;
+                    }
+                }
+                prev_sy = sy;
+            }
+        }
+
+        window.pre_present_notify();
+        buffer.present().expect("failed to present buffer");
+    }
+}
+
+fn handle_winit_key(event: &KeyEvent) {
+    let PhysicalKey::Code(code) = event.physical_key else { return };
+    let code_idx = code as usize;
+    if code_idx >= 256 {
+        return;
+    }
+
+    unsafe {
+        if event.state == ElementState::Pressed {
+            if let Some(doom_key) = keycode_to_doom(code) {
+                KEYCODE_TO_DOOM[code_idx] = doom_key;
+                enqueue_key(true, doom_key);
+            }
+        } else {
+            let doom_key = KEYCODE_TO_DOOM[code_idx];
+            if doom_key != 0 {
+                KEYCODE_TO_DOOM[code_idx] = 0;
+                enqueue_key(false, doom_key);
+            }
+        }
+    }
+}
+
+// ── DG_* implementations (called by C code) ──
+
 #[no_mangle]
 pub extern "C" fn DG_Init() {
-    let window = Window::create_with_title(960, 600, "DOOM");
     unsafe {
-        WINDOW = Some(window);
         START_TIME = Some(Instant::now());
     }
 }
 
 #[no_mangle]
 pub extern "C" fn DG_DrawFrame() {
-    poll_input();
-
-    unsafe {
-        let window = (*addr_of_mut!(WINDOW)).as_mut().unwrap();
-        let fb = window.framebuffer();
-        let src = DG_ScreenBuffer;
-        if src.is_null() {
-            return;
-        }
-
-        let dst_w = fb.width();
-        let dst_h = fb.height();
-        let dst_stride = fb.stride();
-        let dst_ptr = fb.ptr();
-
-        // Nearest-neighbor scale DG_ScreenBuffer (640x400 XRGB8888) to framebuffer.
-        // DOOM's XRGB8888 (0x00RRGGBB) matches the BGR framebuffer layout in
-        // little-endian, so we can copy u32s directly without channel swizzling.
-        let dst_pixels = dst_ptr as *mut u32;
-
-        // Precompute X mapping table to avoid per-pixel division.
-        let mut x_map = [0usize; 2560]; // max width we support
-        let map = &mut x_map[..dst_w];
-        for dx in 0..dst_w {
-            map[dx] = dx * SRC_W / dst_w;
-        }
-
-        let mut prev_sy = usize::MAX;
-        let mut prev_dst_row: *mut u32 = core::ptr::null_mut();
-        for dy in 0..dst_h {
-            let sy = dy * SRC_H / dst_h;
-            let dst_row = dst_pixels.add(dy * dst_stride);
-
-            if sy == prev_sy && !prev_dst_row.is_null() {
-                // Same source row as previous — memcpy the already-scaled row.
-                core::ptr::copy_nonoverlapping(prev_dst_row, dst_row, dst_w);
-            } else {
-                let src_row = src.add(sy * SRC_W);
-                for dx in 0..dst_w {
-                    *dst_row.add(dx) = *src_row.add(*map.get_unchecked(dx));
-                }
-            }
-            prev_sy = sy;
-            prev_dst_row = dst_row;
-        }
-
-        window.present();
-    }
+    // Drawing is handled by the winit event loop (RedrawRequested).
+    // This C callback is a no-op — the actual frame blit happens in DoomApp::draw_frame().
 }
 
 #[no_mangle]
@@ -575,24 +714,21 @@ pub extern "C" fn DG_AudioWrite(buf: *const u8, len: u32) {
     if buf.is_null() || len == 0 {
         return;
     }
-    let samples = unsafe { core::slice::from_raw_parts(buf, len as usize) };
-    std::os::toyos::audio::write_samples(samples);
+    unsafe {
+        if let Some(ring) = &*addr_of_mut!(AUDIO_RING) {
+            let samples = core::slice::from_raw_parts(buf as *const i16, len as usize / 2);
+            let mut ring = ring.lock().unwrap();
+            ring.extend(samples.iter().copied());
+        }
+    }
 }
 
 fn main() {
-    // Build argv with default WAD path
-    let args: Vec<&[u8]> = vec![
-        b"doom\0",
-        b"-iwad\0",
-        b"/share/doom1.wad\0",
-    ];
-    let argv: Vec<*const u8> = args.iter().map(|a| a.as_ptr()).collect();
-
-    unsafe {
-        doomgeneric_Create(argv.len() as i32, argv.as_ptr());
-
-        loop {
-            doomgeneric_Tick();
-        }
-    }
+    let event_loop = EventLoop::new().expect("failed to create event loop");
+    let app = DoomApp {
+        window: None,
+        surface: None,
+        context: None,
+    };
+    event_loop.run_app(app).expect("event loop error");
 }

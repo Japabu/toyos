@@ -2,11 +2,13 @@ use std::collections::HashMap;
 use std::os::fd::AsRawFd;
 use toyos_abi::Fd;
 use std::os::toyos::message::{self, Message};
-use std::os::toyos::net as toyos_nic;
+use std::os::toyos::device as toyos_device;
 use std::os::toyos::pipe as toyos_pipe;
-use std::os::toyos::poll as toyos_poll;
-use std::os::toyos::services;
 use std::time::{Duration, Instant};
+use toyos_abi::poll as toyos_poll;
+use toyos_abi::raw_net as toyos_nic;
+use toyos_abi::services;
+use toyos_abi::shm;
 use toyos_net::*;
 
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
@@ -16,9 +18,6 @@ use smoltcp::time::Instant as SmoltcpInstant;
 use smoltcp::wire::{DnsQueryType, EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint};
 
 use std::net::Ipv4Addr;
-
-use std::os::toyos::device as toyos_device;
-use std::os::toyos::shm;
 
 // --- smoltcp Device wrapper ---
 
@@ -934,15 +933,15 @@ fn main() {
             timeout = timeout.min(Duration::from_millis(1));
         }
 
-        let result = toyos_poll::poll(&[], Some(timeout));
+        let result = toyos_poll::poll_timeout(&[], Some(timeout.as_nanos() as u64));
 
-        if result.has_messages() {
+        if result.messages() {
             loop {
                 let msg = message::recv();
                 daemon.handle_message(msg, &mut socket_set, &mut iface);
 
-                let check = toyos_poll::poll(&[], Some(Duration::ZERO));
-                if !check.has_messages() {
+                let check = toyos_poll::poll_timeout(&[], Some(0));
+                if !check.messages() {
                     break;
                 }
             }

@@ -45,6 +45,21 @@ pub unsafe extern "sysv64" fn _start(kernel_args: KernelArgs) -> ! {
     kernel_main(&kernel_args, maps, initrd, kernel_elf, init_programs);
 }
 
+fn register_gpu(driver: Box<dyn gpu::Gpu>, info: gpu::GpuInfo) {
+    let fb_info = fd::FramebufferInfo {
+        token: [info.tokens[0].raw(), info.tokens[1].raw()],
+        cursor_token: info.cursor_token.raw(),
+        width: info.width,
+        height: info.height,
+        stride: info.stride,
+        pixel_format: info.pixel_format,
+        flags: info.flags,
+    };
+    syscall::set_screen_size(fb_info.width, fb_info.height);
+    kernel::device::set_framebuffer_info(fb_info);
+    gpu::register(driver, info);
+}
+
 fn kernel_main(
     kernel_args: &KernelArgs,
     maps: &[MemoryMapEntry],
@@ -203,18 +218,7 @@ fn kernel_main(
     // Initialize GPU: try VirtIO first, fall back to UEFI GOP
     if let Some((gpu_driver, gpu_info)) = virtio_gpu::init(ecam_base) {
         log!("GPU: using VirtIO");
-        let fb_info = fd::FramebufferInfo {
-            token: [gpu_info.tokens[0].raw(), gpu_info.tokens[1].raw()],
-            cursor_token: gpu_info.cursor_token.raw(),
-            width: gpu_info.width,
-            height: gpu_info.height,
-            stride: gpu_info.stride,
-            pixel_format: gpu_info.pixel_format,
-            flags: gpu_info.flags,
-        };
-        syscall::set_screen_size(fb_info.width, fb_info.height);
-        kernel::device::set_framebuffer_info(fb_info);
-        gpu::register(gpu_driver, gpu_info);
+        register_gpu(gpu_driver, gpu_info);
     } else if kernel_args.gop_framebuffer != 0 {
         log!("GPU: using UEFI GOP");
         let (gpu_driver, gpu_info) = gop::init(
@@ -225,18 +229,7 @@ fn kernel_main(
             kernel_args.gop_stride,
             kernel_args.gop_pixel_format,
         );
-        let fb_info = fd::FramebufferInfo {
-            token: [gpu_info.tokens[0].raw(), gpu_info.tokens[1].raw()],
-            cursor_token: gpu_info.cursor_token.raw(),
-            width: gpu_info.width,
-            height: gpu_info.height,
-            stride: gpu_info.stride,
-            pixel_format: gpu_info.pixel_format,
-            flags: gpu_info.flags,
-        };
-        syscall::set_screen_size(fb_info.width, fb_info.height);
-        kernel::device::set_framebuffer_info(fb_info);
-        gpu::register(gpu_driver, gpu_info);
+        register_gpu(gpu_driver, gpu_info);
     } else {
         log!("GPU: none found, running headless");
     };
