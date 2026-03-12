@@ -7,7 +7,6 @@ pub type DeviceId = u32;
 /// filesystem's job. The page cache sits between the filesystem and this trait.
 pub trait BlockDevice: Send {
     fn device_id(&self) -> DeviceId;
-    fn block_size(&self) -> u32;
     fn block_count(&self) -> u64;
 
     /// Read `count` contiguous blocks starting at `lba` into `buf`.

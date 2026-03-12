@@ -5,6 +5,7 @@ use crate::arch::paging::{self, PAGE_2M};
 use crate::gpu::{Gpu, GpuInfo};
 use crate::log;
 use crate::shared_memory;
+use crate::PhysAddr;
 
 struct GopGpu;
 
@@ -38,11 +39,11 @@ pub fn init(
 ) -> (Box<dyn Gpu>, GpuInfo) {
     // Map the GOP framebuffer into kernel address space
     let aligned_size = paging::align_2m(size as usize) as u64;
-    paging::map_kernel(addr, aligned_size);
+    paging::map_kernel(PhysAddr::new(addr), aligned_size);
 
     // Register framebuffer as shared memory (same buffer for both tokens)
-    let token0 = shared_memory::register(addr, aligned_size);
-    let token1 = shared_memory::register(addr, aligned_size);
+    let token0 = shared_memory::register(PhysAddr::new(addr), aligned_size);
+    let token1 = shared_memory::register(PhysAddr::new(addr), aligned_size);
     log!("GOP: {}x{} stride={} format={} at {:#x} tokens=[{:?}, {:?}]",
         width, height, stride, pixel_format, addr, token0, token1);
 
@@ -52,7 +53,7 @@ pub fn init(
     let cursor_layout = Layout::from_size_align(cursor_aligned, PAGE_2M as usize).unwrap();
     let cursor_ptr = unsafe { alloc_zeroed(cursor_layout) };
     assert!(!cursor_ptr.is_null(), "GOP: cursor alloc failed");
-    let cursor_token = shared_memory::register(cursor_ptr as u64, cursor_aligned as u64);
+    let cursor_token = shared_memory::register(PhysAddr::from_ptr(cursor_ptr), cursor_aligned as u64);
 
     let info = GpuInfo {
         tokens: [token0, token1],

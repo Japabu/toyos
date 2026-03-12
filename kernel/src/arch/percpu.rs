@@ -192,6 +192,7 @@ pub fn init_bsp(lapic_id: u32) {
 
     unsafe { percpu.load_gdt(); }
     cpu::enable_sse();
+    cpu::enable_smap();
 
     cpu::wrmsr(MSR_GS_BASE, ptr as u64);
     cpu::wrmsr(MSR_KERNEL_GS_BASE, ptr as u64);
@@ -208,6 +209,7 @@ pub fn init_ap(cpu_id: u32, lapic_id: u32) {
     alloc_ist1_stack(percpu);
     unsafe { percpu.load_gdt(); }
     cpu::enable_sse();
+    cpu::enable_smap();
 
     cpu::wrmsr(MSR_GS_BASE, ptr as u64);
     cpu::wrmsr(MSR_KERNEL_GS_BASE, ptr as u64);
@@ -268,29 +270,3 @@ pub fn idle_stack_top() -> u64 {
     unsafe { (*percpu_ptr()).idle_stack_top }
 }
 
-/// Stack frame layout matching what context_switch pushes/pops.
-#[repr(C)]
-struct SwitchFrame {
-    r15: u64,
-    r14: u64,
-    r13: u64,
-    r12: u64,
-    rbx: u64,
-    rbp: u64,
-    ret_addr: u64,
-}
-
-/// Reset the idle context to a fresh frame with ret → `entry`.
-/// context_switch to idle_rsp will pop zero registers and ret to `entry`.
-pub fn reset_idle(entry: u64) {
-    let percpu = percpu_ptr();
-    let top = unsafe { (*percpu).idle_stack_top };
-    let frame = (top - size_of::<SwitchFrame>() as u64) as *mut SwitchFrame;
-    unsafe {
-        frame.write(SwitchFrame {
-            r15: 0, r14: 0, r13: 0, r12: 0, rbx: 0, rbp: 0,
-            ret_addr: entry,
-        });
-        (*percpu).idle_rsp = frame as u64;
-    }
-}

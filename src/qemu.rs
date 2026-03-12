@@ -4,7 +4,7 @@ pub fn launch(debug: bool) {
     let mut qemu = Command::new("qemu-system-x86_64");
     qemu
         .arg("-machine").arg("q35")
-        .arg("-cpu").arg("qemu64,+rdrand")
+        .arg("-cpu").arg("qemu64,+rdrand,+smap")
         .arg("-smp").arg("1")
         .arg("-m").arg("8G")
         // Flash the OVMF UEFI firmware

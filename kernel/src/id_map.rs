@@ -73,14 +73,6 @@ impl<K: IdKey, V> IdMap<K, V> {
         self.map.iter_mut().map(|(&k, v)| (k, v))
     }
 
-    pub fn values(&self) -> impl Iterator<Item = &V> {
-        self.map.values()
-    }
-
-    pub fn values_mut(&mut self) -> impl Iterator<Item = &mut V> {
-        self.map.values_mut()
-    }
-
     pub fn drain(&mut self) -> impl Iterator<Item = (K, V)> + '_ {
         self.map.drain()
     }

@@ -1,6 +1,8 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
+use crate::UserAddr;
+
 /// What a virtual memory area is backed by.
 pub enum VmaKind {
     /// File-backed region. On RO fault: map page cache page directly (zero copy).
@@ -21,9 +23,9 @@ pub enum VmaKind {
 /// A contiguous region of virtual address space with uniform permissions.
 pub struct Vma {
     /// Start virtual address (4KB-aligned).
-    pub start: u64,
+    pub start: UserAddr,
     /// End virtual address, exclusive (4KB-aligned).
-    pub end: u64,
+    pub end: UserAddr,
     /// Whether userspace can write to this region.
     pub writable: bool,
     /// What backs this region.
@@ -41,23 +43,18 @@ impl VmaList {
     }
 
     /// Find the VMA containing `addr`, if any.
-    pub fn find(&self, addr: u64) -> Option<&Vma> {
+    pub fn find(&self, addr: UserAddr) -> Option<&Vma> {
         // Binary search: find rightmost VMA where start <= addr
-        let idx = self.vmas.partition_point(|v| v.start <= addr);
+        let idx = self.vmas.partition_point(|v| v.start.raw() <= addr.raw());
         if idx == 0 { return None; }
         let vma = &self.vmas[idx - 1];
-        if addr < vma.end { Some(vma) } else { None }
+        if addr.raw() < vma.end.raw() { Some(vma) } else { None }
     }
 
     /// Insert a VMA, maintaining sorted order by start address.
     pub fn insert(&mut self, vma: Vma) {
-        let idx = self.vmas.partition_point(|v| v.start < vma.start);
+        let idx = self.vmas.partition_point(|v| v.start.raw() < vma.start.raw());
         self.vmas.insert(idx, vma);
-    }
-
-    /// Iterate over all VMAs.
-    pub fn iter(&self) -> impl Iterator<Item = &Vma> {
-        self.vmas.iter()
     }
 
     /// Remove all VMAs.

@@ -5,7 +5,6 @@ use elf::ElfBytes;
 use elf::endian::AnyEndian;
 use elf::section::SectionHeaderTable;
 use elf::abi::{STT_FUNC, SHT_SYMTAB, SHT_STRTAB};
-use crate::log;
 use crate::sync::Lock;
 
 struct Symbol {
@@ -117,20 +116,6 @@ impl ProcessSymbols {
         }
     }
 
-    /// Parse symbols from ELF bytes and record memory ranges.
-    pub fn parse(
-        data: &[u8], base: u64,
-        prog_base: u64, prog_end: u64,
-        stack_base: u64, stack_end: u64,
-    ) -> Self {
-        let mut table = SymbolTable::new();
-        parse_symtab(data, base, &mut table);
-        Self {
-            table, loaded: true, lazy_source: None,
-            prog_base, prog_end, stack_base, stack_end,
-        }
-    }
-
     /// Ensure symbols are loaded (does disk I/O on first call).
     fn ensure_loaded(&mut self) {
         if self.loaded { return; }
@@ -156,9 +141,6 @@ impl ProcessSymbols {
         self.prog_base
     }
 
-    pub fn symbol_count(&self) -> usize {
-        self.table.symbols.len()
-    }
 }
 
 // Kernel symbols (loaded once at boot, never cleared)

@@ -91,7 +91,7 @@ fn schedule_inner(mut guard: crate::sync::LockGuard<'_, Option<ProcessTable>>) {
         assert!(new_entry.cr3().is_some(),
             "scheduling pid={new_pid} with no page tables");
         let new_rsp = new_entry.kernel_rsp();
-        let new_cr3 = new_entry.cr3().unwrap().as_u64();
+        let new_cr3 = new_entry.cr3().unwrap().phys();
         let new_fs_base = new_entry.fs_base();
         let new_ks_top = new_entry.kernel_stack_top();
 
@@ -113,6 +113,7 @@ fn schedule_inner(mut guard: crate::sync::LockGuard<'_, Option<ProcessTable>>) {
         core::mem::forget(guard);
         unsafe { context_switch(old_rsp_ptr, new_rsp); }
         unsafe { PROCESS_TABLE.force_unlock(); }
+        unsafe { cpu::stac(); }
         return;
     }
 
@@ -130,8 +131,8 @@ fn schedule_inner(mut guard: crate::sync::LockGuard<'_, Option<ProcessTable>>) {
 
     core::mem::forget(guard);
     unsafe { context_switch(old_rsp_ptr, percpu::idle_rsp()); }
-    // Resumed by cpu_idle_loop — it held the lock for us.
     unsafe { PROCESS_TABLE.force_unlock(); }
+    unsafe { cpu::stac(); }
 }
 
 /// Schedule without saving current context (used by ap_idle and BSP boot).
@@ -196,7 +197,7 @@ fn cpu_idle_loop() -> ! {
                 assert!(new_entry.cr3().is_some(),
                     "idle: scheduling pid={new_pid} with no page tables");
                 let new_rsp = new_entry.kernel_rsp();
-                let new_cr3 = new_entry.cr3().unwrap().as_u64();
+                let new_cr3 = new_entry.cr3().unwrap().phys();
                 let new_fs_base = new_entry.fs_base();
                 let new_ks_top = new_entry.kernel_stack_top();
 
@@ -210,6 +211,7 @@ fn cpu_idle_loop() -> ! {
                 core::mem::forget(guard);
                 unsafe { context_switch(percpu::idle_rsp_ptr(), new_rsp); }
                 unsafe { PROCESS_TABLE.force_unlock(); }
+                unsafe { cpu::stac(); }
                 continue;
             }
         }

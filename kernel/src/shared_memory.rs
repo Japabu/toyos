@@ -6,6 +6,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use crate::arch::paging::{self, PAGE_2M};
 use crate::process::Pid;
 use crate::sync::Lock;
+use crate::PhysAddr;
 
 #[derive(Clone, Copy, Debug)]
 pub enum Error {
@@ -36,7 +37,7 @@ enum Ownership {
 unsafe impl Send for SharedRegion {}
 
 struct SharedRegion {
-    phys_addr: u64,
+    phys_addr: PhysAddr,
     size: u64,
     ownership: Ownership,
     allowed: Vec<Pid>,                // PIDs allowed to map
@@ -67,7 +68,7 @@ pub fn alloc(size: u64, owner_pid: Pid, owner_pml4: *mut u64) -> SharedToken {
     let layout = Layout::from_size_align(aligned_size, PAGE_2M as usize).unwrap();
     let ptr = unsafe { alloc_zeroed(layout) };
     assert!(!ptr.is_null(), "shared_memory: allocation failed");
-    let phys_addr = ptr as u64;
+    let phys_addr = PhysAddr::from_ptr(ptr);
 
     paging::map_user_in(owner_pml4, phys_addr, aligned_size as u64);
 
@@ -88,7 +89,7 @@ pub fn alloc(size: u64, owner_pid: Pid, owner_pml4: *mut u64) -> SharedToken {
 /// Register an existing kernel-owned allocation as a shared region.
 /// Permanent: never auto-removed. Used for GPU framebuffers and DMA buffers.
 #[must_use]
-pub fn register(phys_addr: u64, size: u64) -> SharedToken {
+pub fn register(phys_addr: PhysAddr, size: u64) -> SharedToken {
     let token = next_token();
     with_regions_mut(|regions| {
         regions.push((token, SharedRegion {
@@ -104,7 +105,7 @@ pub fn register(phys_addr: u64, size: u64) -> SharedToken {
 
 /// Unregister a kernel-owned shared region, unmapping it from all processes.
 /// Returns `(phys_addr, size)` so the caller can free the backing memory.
-pub fn unregister(token: SharedToken) -> Option<(u64, u64)> {
+pub fn unregister(token: SharedToken) -> Option<(PhysAddr, u64)> {
     with_regions_mut(|regions| {
         let pos = regions.iter().position(|(t, _)| *t == token)?;
         let (_, region) = regions.swap_remove(pos);
@@ -159,7 +160,7 @@ pub fn map(token: SharedToken, pid: Pid, pml4: *mut u64) -> Result<u64, Error> {
             paging::map_user_in(pml4, region.phys_addr, region.size);
             region.mapped_in.push((pid, pml4));
         }
-        Ok(region.phys_addr)
+        Ok(region.phys_addr.raw())
     })
 }
 
@@ -192,7 +193,7 @@ pub fn cleanup_process(pid: Pid) {
             // If process-owned and no mappings remain, free the backing memory.
             if let Ownership::Process { pid: owner, layout } = region.ownership {
                 if owner == pid && region.mapped_in.is_empty() {
-                    unsafe { dealloc(region.phys_addr as *mut u8, layout); }
+                    unsafe { dealloc(region.phys_addr.as_mut_ptr(), layout); }
                     return false; // remove from list
                 }
             }

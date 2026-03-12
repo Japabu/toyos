@@ -139,7 +139,7 @@ fn build_trampoline_data() -> TrampolineData {
     let data_base = (TRAMPOLINE_PAGE + DATA_OFFSET as u64) as u32;
 
     TrampolineData {
-        cr3: cpu::read_cr3(),
+        cr3: cpu::read_cr3().raw(),
         stack_top: 0, // filled per-AP
         entry: 0,     // filled per-AP
         kernel_gdt,

@@ -1,5 +1,7 @@
 use core::arch::asm;
 
+use crate::{PhysAddr, VirtAddr};
+
 #[inline]
 pub fn rdmsr(msr: u32) -> u64 {
     let low: u32;
@@ -53,17 +55,24 @@ pub fn read_rsp() -> u64 {
 }
 
 #[inline]
-pub fn read_cr3() -> u64 {
+pub fn read_cr2() -> VirtAddr {
+    let value: u64;
+    unsafe { asm!("mov {}, cr2", out(reg) value, options(nomem, nostack)); }
+    VirtAddr::new(value)
+}
+
+#[inline]
+pub fn read_cr3() -> PhysAddr {
     let value: u64;
     unsafe { asm!("mov {}, cr3", out(reg) value, options(nomem, nostack)); }
-    value
+    PhysAddr::new(value)
 }
 
 /// # Safety
 /// The caller must ensure the value is a valid PML4 physical address.
 #[inline]
-pub unsafe fn write_cr3(value: u64) {
-    asm!("mov cr3, {}", in(reg) value, options(nostack));
+pub unsafe fn write_cr3(addr: PhysAddr) {
+    asm!("mov cr3, {}", in(reg) addr.raw(), options(nostack));
 }
 
 #[inline]
@@ -75,9 +84,9 @@ pub fn flush_tlb() {
 
 /// Invalidate a single TLB entry for the given virtual address.
 #[inline]
-pub fn invlpg(addr: u64) {
+pub fn invlpg(addr: VirtAddr) {
     unsafe {
-        asm!("invlpg [{}]", in(reg) addr, options(nostack));
+        asm!("invlpg [{}]", in(reg) addr.raw(), options(nostack));
     }
 }
 
@@ -114,6 +123,52 @@ pub fn enable_sse() {
             options(nostack),
         );
     }
+}
+
+/// Enable SMAP (Supervisor Mode Access Prevention).
+/// When enabled, kernel code cannot access user pages unless RFLAGS.AC=1 (set by STAC).
+/// Must be called on each CPU during init.
+pub fn enable_smap() {
+    // Check CPUID leaf 7, subleaf 0, EBX bit 20
+    // rbx cannot be used as an inline asm operand in Rust, so save/restore manually.
+    let ebx: u32;
+    unsafe {
+        asm!(
+            "push rbx",
+            "mov eax, 7",
+            "xor ecx, ecx",
+            "cpuid",
+            "mov {0:e}, ebx",
+            "pop rbx",
+            out(reg) ebx,
+            out("eax") _,
+            out("ecx") _,
+            out("edx") _,
+            options(nomem),
+        );
+    }
+    if ebx & (1 << 20) == 0 {
+        crate::log!("cpu: SMAP not supported, skipping");
+        return;
+    }
+    unsafe {
+        asm!(
+            "mov {0}, cr4",
+            "or {0}, 1 << 21",  // CR4.SMAP
+            "mov cr4, {0}",
+            "clac",             // clear AC — kernel cannot access user pages by default
+            out(reg) _,
+            options(nostack),
+        );
+    }
+    crate::log!("cpu: SMAP enabled");
+}
+
+/// Allow kernel access to user pages (set RFLAGS.AC).
+/// Must be paired with `clac()`. Only use during syscall handling.
+#[inline(always)]
+pub unsafe fn stac() {
+    asm!("stac", options(nomem, nostack));
 }
 
 pub fn halt() -> ! {

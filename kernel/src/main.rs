@@ -2,11 +2,50 @@
 #![no_main]
 extern crate alloc;
 
+mod addr;
+pub use addr::{PhysAddr, VirtAddr, UserAddr};
+
+mod sync;
+mod id_map;
+
+mod arch;
+mod drivers;
+
+#[macro_use]
+mod log;
+mod pmm;
+mod allocator;
+
+mod keyboard;
+mod mouse;
+mod block;
+mod page_cache;
+mod ramdisk;
+mod tmpfs;
+mod toyfs;
+mod vfs;
+mod elf;
+mod symbols;
+mod process;
+mod scheduler;
+mod clock;
+mod rtc;
+mod fd;
+mod pipe;
+mod message;
+mod device;
+mod net;
+mod gpu;
+mod audio;
+mod shared_memory;
+mod user_ptr;
+mod vma;
+
 use alloc::boxed::Box;
 use alloc::vec::Vec;
-use kernel::arch::{apic, cpu, idt, paging, percpu, smp, syscall};
-use kernel::drivers::{acpi, gop, nvme, pci, serial, virtio_gpu, virtio_net, virtio_sound, xhci};
-use kernel::{allocator, clock, fd, gpu, log, page_cache, pipe, process, ramdisk, shared_memory, symbols, toyfs, vfs, KernelArgs, MemoryMapEntry};
+use arch::{apic, cpu, idt, paging, percpu, smp, syscall};
+use drivers::{acpi, gop, nvme, pci, serial, virtio_gpu, virtio_net, virtio_sound, xhci};
+use toyos_abi::boot::{KernelArgs, MemoryMapEntry};
 
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
@@ -56,7 +95,7 @@ fn register_gpu(driver: Box<dyn gpu::Gpu>, info: gpu::GpuInfo) {
         flags: info.flags,
     };
     syscall::set_screen_size(fb_info.width, fb_info.height);
-    kernel::device::set_framebuffer_info(fb_info);
+    crate::device::set_framebuffer_info(fb_info);
     gpu::register(driver, info);
 }
 
@@ -102,7 +141,7 @@ fn kernel_main(
     // HPET clock — enables profiling for everything from here on
     let hpet_base = acpi::find_hpet_base(kernel_args.rsdp_addr)
         .expect("ACPI: HPET not found");
-    paging::map_kernel(hpet_base, 0x1000);
+    paging::map_kernel(PhysAddr::new(hpet_base), 0x1000);
     clock::init(hpet_base);
     apic::init_timer();
 
@@ -153,7 +192,7 @@ fn kernel_main(
 
     // Mount root filesystem (ToyFs on NVMe) and tmpfs
     vfs::lock().set_root(Box::new(toyfs::ToyFsAdapter::new(toyfs_instance)));
-    vfs::lock().mount("tmp", Box::new(kernel::tmpfs::TmpFs::new()));
+    vfs::lock().mount("tmp", Box::new(crate::tmpfs::TmpFs::new()));
 
     // Extract initrd into root filesystem (fresh binaries every boot)
     {
@@ -213,7 +252,7 @@ fn kernel_main(
     virtio_net::init(ecam_base);
 
     if let Some(sound) = virtio_sound::init(ecam_base) {
-        kernel::audio::register(sound);
+        crate::audio::register(sound);
     }
 
     // Initialize GPU: try VirtIO first, fall back to UEFI GOP
@@ -257,8 +296,8 @@ fn kernel_main(
     }
 
     log!("Boot: complete ({}ms total)", clock::nanos_since_boot() / 1_000_000);
-    log!("Keyboard layout: {}", kernel::keyboard::layout_name());
+    log!("Keyboard layout: {}", crate::keyboard::layout_name());
 
     smp::set_ready();
-    kernel::scheduler::schedule_no_return();
+    crate::scheduler::schedule_no_return();
 }

@@ -4,7 +4,7 @@ use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use alloc::alloc::{alloc_zeroed, dealloc};
 
 use super::{apic, cpu};
-use crate::MemoryMapEntry;
+use crate::{MemoryMapEntry, PhysAddr, UserAddr};
 
 const PAGE_PRESENT: u64 = 1 << 0;
 const PAGE_WRITE: u64 = 1 << 1;
@@ -26,6 +26,12 @@ static KERNEL_PML4: AtomicPtr<u64> = AtomicPtr::new(core::ptr::null_mut());
 
 /// How many PML4 entries the kernel identity map uses (set during init).
 static KERNEL_PML4_ENTRIES: AtomicUsize = AtomicUsize::new(0);
+
+/// Whether addr falls within the kernel's identity-mapped physical RAM.
+pub fn is_kernel_addr(addr: u64) -> bool {
+    let limit = (KERNEL_PML4_ENTRIES.load(Ordering::Relaxed) as u64) << 39; // 512GB per PML4 entry
+    addr > 0x1000 && addr < limit
+}
 
 /// Allocate a zeroed, page-aligned 4KB page for page table structures.
 fn alloc_page() -> *mut u64 {
@@ -71,7 +77,7 @@ pub fn init(memory_map: &[MemoryMapEntry]) {
     let entries = ((max_addr + (1u64 << 39) - 1) >> 39) as usize;
     KERNEL_PML4.store(pml4, Ordering::Release);
     KERNEL_PML4_ENTRIES.store(entries, Ordering::Release);
-    unsafe { cpu::write_cr3(pml4 as u64); }
+    unsafe { cpu::write_cr3(PhysAddr::from_ptr(pml4)); }
 }
 
 /// Get or create a next-level page table at the given index.
@@ -91,13 +97,13 @@ unsafe fn get_or_create(table: *mut u64, index: usize, flags: u64) -> *mut u64 {
 }
 
 /// Physical address of the kernel PML4 template. Used for idle/exit CR3.
-pub fn kernel_cr3() -> u64 {
-    KERNEL_PML4.load(Ordering::Acquire) as u64
+pub fn kernel_cr3() -> PhysAddr {
+    PhysAddr::from_ptr(KERNEL_PML4.load(Ordering::Acquire))
 }
 
 /// Create a per-process PML4 by deep-cloning the kernel page table hierarchy.
 /// Each process gets its own PML4 -> PDPT -> PD chain so USER bits are independent.
-pub fn create_user_pml4() -> *mut u64 {
+pub fn create_user_pml4() -> PhysAddr {
     let kernel_pml4 = KERNEL_PML4.load(Ordering::Acquire);
     let entries = KERNEL_PML4_ENTRIES.load(Ordering::Acquire);
     assert!(!kernel_pml4.is_null(), "paging: not initialized");
@@ -133,7 +139,7 @@ pub fn create_user_pml4() -> *mut u64 {
         }
     }
 
-    pml4
+    PhysAddr::from_ptr(pml4)
 }
 
 /// Free a per-process PML4 and all its cloned PDPT/PD/PT tables.
@@ -201,73 +207,107 @@ pub fn free_user_page_tables(pml4: *mut u64) {
 }
 
 /// Set USER bit on 2MB pages in a specific PML4. Also sets USER on parent entries.
-pub fn map_user_in(pml4: *mut u64, addr: u64, size: u64) {
-    let start = addr & !(PAGE_2M - 1);
-    let end = (addr + size + PAGE_2M - 1) & !(PAGE_2M - 1);
-    let mut cur = start;
+/// Set USER bit on pages in a specific PML4. Uses 4KB granularity for
+/// identity-mapped addresses (PML4 indices in the kernel range) to avoid
+/// contaminating neighboring kernel pages in the same 2MB region with SMAP.
+/// For user virtual addresses (above the identity map), uses 2MB granularity.
+pub fn map_user_in(pml4: *mut u64, addr: PhysAddr, size: u64) {
+    let entries = KERNEL_PML4_ENTRIES.load(Ordering::Acquire);
+    let raw = addr.raw();
+    let pml4_idx = ((raw >> 39) & 0x1FF) as usize;
 
-    while cur < end {
-        let pml4_idx = ((cur >> 39) & 0x1FF) as usize;
-        let pdpt_idx = ((cur >> 30) & 0x1FF) as usize;
-        let pd_idx = ((cur >> 21) & 0x1FF) as usize;
-
-        unsafe {
-            let pml4e = pml4.add(pml4_idx).read();
-            assert!(pml4e & PAGE_PRESENT != 0, "map_user: PML4 not present for {:#x}", cur);
-            pml4.add(pml4_idx).write(pml4e | PAGE_USER);
-
-            let pdpt = (pml4e & ADDR_MASK) as *mut u64;
-            let pdpte = pdpt.add(pdpt_idx).read();
-            assert!(pdpte & PAGE_PRESENT != 0, "map_user: PDPT not present for {:#x}", cur);
-            pdpt.add(pdpt_idx).write(pdpte | PAGE_USER);
-
-            let pd = (pdpte & ADDR_MASK) as *mut u64;
-            let pde = pd.add(pd_idx).read();
-            assert!(pde & PAGE_PRESENT != 0, "map_user: PD not present for {:#x}", cur);
-            assert!(pde & PAGE_SIZE_BIT != 0, "map_user: expected 2MB page at {:#x}", cur);
-            pd.add(pd_idx).write(pde | PAGE_USER);
+    if pml4_idx < entries {
+        // Identity-mapped range: use 4KB granularity to set USER only on
+        // the specific pages, preserving kernel pages as supervisor.
+        let start = raw & !(PAGE_4K - 1);
+        let end = (raw + size + PAGE_4K - 1) & !(PAGE_4K - 1);
+        let mut cur = start;
+        while cur < end {
+            map_4k_in(pml4, UserAddr::new(cur), PhysAddr::new(cur), true);
+            cur += PAGE_4K;
         }
-
-        cur += PAGE_2M;
+    } else {
+        // User virtual address space: entire region is user-only, use 2MB.
+        let start = raw & !(PAGE_2M - 1);
+        let end = (raw + size + PAGE_2M - 1) & !(PAGE_2M - 1);
+        let mut cur = start;
+        while cur < end {
+            map_user_2m(pml4, cur);
+            cur += PAGE_2M;
+        }
     }
 }
 
-/// Set USER bit and clear WRITE bit on 2MB pages in a specific PML4.
-/// Used for shared read-only library pages (code/rodata).
-pub fn map_user_readonly_in(pml4: *mut u64, addr: u64, size: u64) {
-    let start = addr & !(PAGE_2M - 1);
-    let end = (addr + size + PAGE_2M - 1) & !(PAGE_2M - 1);
-    let mut cur = start;
+/// Set USER on a single 2MB PDE and its parent entries.
+fn map_user_2m(pml4: *mut u64, addr: u64) {
+    let pml4_idx = ((addr >> 39) & 0x1FF) as usize;
+    let pdpt_idx = ((addr >> 30) & 0x1FF) as usize;
+    let pd_idx = ((addr >> 21) & 0x1FF) as usize;
 
-    while cur < end {
-        let pml4_idx = ((cur >> 39) & 0x1FF) as usize;
-        let pdpt_idx = ((cur >> 30) & 0x1FF) as usize;
-        let pd_idx = ((cur >> 21) & 0x1FF) as usize;
+    unsafe {
+        let pml4e = pml4.add(pml4_idx).read();
+        assert!(pml4e & PAGE_PRESENT != 0, "map_user: PML4 not present for {:#x}", addr);
+        pml4.add(pml4_idx).write(pml4e | PAGE_USER);
 
-        unsafe {
-            let pml4e = pml4.add(pml4_idx).read();
-            assert!(pml4e & PAGE_PRESENT != 0, "map_user_ro: PML4 not present for {:#x}", cur);
-            pml4.add(pml4_idx).write(pml4e | PAGE_USER);
+        let pdpt = (pml4e & ADDR_MASK) as *mut u64;
+        let pdpte = pdpt.add(pdpt_idx).read();
+        assert!(pdpte & PAGE_PRESENT != 0, "map_user: PDPT not present for {:#x}", addr);
+        pdpt.add(pdpt_idx).write(pdpte | PAGE_USER);
 
-            let pdpt = (pml4e & ADDR_MASK) as *mut u64;
-            let pdpte = pdpt.add(pdpt_idx).read();
-            assert!(pdpte & PAGE_PRESENT != 0, "map_user_ro: PDPT not present for {:#x}", cur);
-            pdpt.add(pdpt_idx).write(pdpte | PAGE_USER);
+        let pd = (pdpte & ADDR_MASK) as *mut u64;
+        let pde = pd.add(pd_idx).read();
+        assert!(pde & PAGE_PRESENT != 0, "map_user: PD not present for {:#x}", addr);
+        assert!(pde & PAGE_SIZE_BIT != 0, "map_user: expected 2MB page at {:#x}", addr);
+        pd.add(pd_idx).write(pde | PAGE_USER);
+    }
+}
 
-            let pd = (pdpte & ADDR_MASK) as *mut u64;
-            let pde = pd.add(pd_idx).read();
-            assert!(pde & PAGE_PRESENT != 0, "map_user_ro: PD not present for {:#x}", cur);
-            assert!(pde & PAGE_SIZE_BIT != 0, "map_user_ro: expected 2MB page at {:#x}", cur);
-            pd.add(pd_idx).write((pde | PAGE_USER) & !PAGE_WRITE);
+/// Set USER bit and clear WRITE bit on pages in a specific PML4.
+/// Uses 4KB granularity for identity-mapped addresses, 2MB for user virtual.
+pub fn map_user_readonly_in(pml4: *mut u64, addr: PhysAddr, size: u64) {
+    let entries = KERNEL_PML4_ENTRIES.load(Ordering::Acquire);
+    let raw = addr.raw();
+    let pml4_idx = ((raw >> 39) & 0x1FF) as usize;
+
+    if pml4_idx < entries {
+        // Identity-mapped: 4KB granularity, read-only
+        let start = raw & !(PAGE_4K - 1);
+        let end = (raw + size + PAGE_4K - 1) & !(PAGE_4K - 1);
+        let mut cur = start;
+        while cur < end {
+            map_4k_in(pml4, UserAddr::new(cur), PhysAddr::new(cur), false);
+            cur += PAGE_4K;
         }
-
-        cur += PAGE_2M;
+    } else {
+        // User virtual: 2MB granularity
+        let start = raw & !(PAGE_2M - 1);
+        let end = (raw + size + PAGE_2M - 1) & !(PAGE_2M - 1);
+        let mut cur = start;
+        while cur < end {
+            let pdpt_idx = ((cur >> 30) & 0x1FF) as usize;
+            let pd_idx = ((cur >> 21) & 0x1FF) as usize;
+            unsafe {
+                let pml4e = pml4.add(pml4_idx).read();
+                assert!(pml4e & PAGE_PRESENT != 0, "map_user_ro: PML4 not present for {:#x}", cur);
+                pml4.add(pml4_idx).write(pml4e | PAGE_USER);
+                let pdpt = (pml4e & ADDR_MASK) as *mut u64;
+                let pdpte = pdpt.add(pdpt_idx).read();
+                assert!(pdpte & PAGE_PRESENT != 0, "map_user_ro: PDPT not present for {:#x}", cur);
+                pdpt.add(pdpt_idx).write(pdpte | PAGE_USER);
+                let pd = (pdpte & ADDR_MASK) as *mut u64;
+                let pde = pd.add(pd_idx).read();
+                assert!(pde & PAGE_PRESENT != 0, "map_user_ro: PD not present for {:#x}", cur);
+                assert!(pde & PAGE_SIZE_BIT != 0, "map_user_ro: expected 2MB page at {:#x}", cur);
+                pd.add(pd_idx).write((pde | PAGE_USER) & !PAGE_WRITE);
+            }
+            cur += PAGE_2M;
+        }
     }
 }
 
 /// Set USER bit on 2MB pages in the current process's page tables (via CR3).
-pub fn map_user(addr: u64, size: u64) {
-    let pml4 = cpu::read_cr3() as *mut u64;
+pub fn map_user(addr: PhysAddr, size: u64) {
+    let pml4 = cpu::read_cr3().as_mut_ptr();
     map_user_in(pml4, addr, size);
     cpu::flush_tlb();
     apic::tlb_shootdown();
@@ -276,14 +316,15 @@ pub fn map_user(addr: u64, size: u64) {
 /// Remap a 2MB-aligned virtual address to point to different physical memory
 /// in a specific page table. No TLB flush — caller is responsible.
 /// Sets the PDE to `phys_addr` with PRESENT|WRITE|USER|PS bits.
-pub fn remap_user_2m_in(pml4: *mut u64, virt_addr: u64, phys_addr: u64) -> bool {
-    if virt_addr & (PAGE_2M - 1) != 0 || phys_addr & (PAGE_2M - 1) != 0 {
+pub fn remap_user_2m_in(pml4: *mut u64, virt_addr: UserAddr, phys_addr: PhysAddr) -> bool {
+    let va = virt_addr.raw();
+    if va & (PAGE_2M - 1) != 0 || phys_addr.raw() & (PAGE_2M - 1) != 0 {
         return false;
     }
 
-    let pml4_idx = ((virt_addr >> 39) & 0x1FF) as usize;
-    let pdpt_idx = ((virt_addr >> 30) & 0x1FF) as usize;
-    let pd_idx = ((virt_addr >> 21) & 0x1FF) as usize;
+    let pml4_idx = ((va >> 39) & 0x1FF) as usize;
+    let pdpt_idx = ((va >> 30) & 0x1FF) as usize;
+    let pd_idx = ((va >> 21) & 0x1FF) as usize;
 
     unsafe {
         let pml4e = pml4.add(pml4_idx).read();
@@ -296,29 +337,18 @@ pub fn remap_user_2m_in(pml4: *mut u64, virt_addr: u64, phys_addr: u64) -> bool 
         pdpt.add(pdpt_idx).write(pdpte | PAGE_USER);
 
         let pd = (pdpte & ADDR_MASK) as *mut u64;
-        pd.add(pd_idx).write(phys_addr | PAGE_PRESENT | PAGE_WRITE | PAGE_USER | PAGE_SIZE_BIT);
+        pd.add(pd_idx).write(phys_addr.raw() | PAGE_PRESENT | PAGE_WRITE | PAGE_USER | PAGE_SIZE_BIT);
     }
 
     true
 }
 
-/// Remap a 2MB-aligned virtual address in the current page table with TLB flush.
-pub fn remap_user_2m(virt_addr: u64, phys_addr: u64) -> bool {
-    let pml4 = cpu::read_cr3() as *mut u64;
-    if remap_user_2m_in(pml4, virt_addr, phys_addr) {
-        cpu::flush_tlb();
-        apic::tlb_shootdown();
-        true
-    } else {
-        false
-    }
-}
-
 /// Restore a 2MB PDE to its identity-mapped value (phys == virt, no USER bit).
-pub fn restore_identity_2m(pml4: *mut u64, virt_addr: u64) {
-    let pml4_idx = ((virt_addr >> 39) & 0x1FF) as usize;
-    let pdpt_idx = ((virt_addr >> 30) & 0x1FF) as usize;
-    let pd_idx = ((virt_addr >> 21) & 0x1FF) as usize;
+pub fn restore_identity_2m(pml4: *mut u64, virt_addr: UserAddr) {
+    let va = virt_addr.raw();
+    let pml4_idx = ((va >> 39) & 0x1FF) as usize;
+    let pdpt_idx = ((va >> 30) & 0x1FF) as usize;
+    let pd_idx = ((va >> 21) & 0x1FF) as usize;
 
     unsafe {
         let pml4e = pml4.add(pml4_idx).read();
@@ -327,104 +357,91 @@ pub fn restore_identity_2m(pml4: *mut u64, virt_addr: u64) {
         let pdpte = pdpt.add(pdpt_idx).read();
         if pdpte & PAGE_PRESENT == 0 { return; }
         let pd = (pdpte & ADDR_MASK) as *mut u64;
-        pd.add(pd_idx).write(virt_addr | PAGE_PRESENT | PAGE_WRITE | PAGE_SIZE_BIT);
+        pd.add(pd_idx).write(va | PAGE_PRESENT | PAGE_WRITE | PAGE_SIZE_BIT);
     }
 
     cpu::flush_tlb();
     apic::tlb_shootdown();
 }
 
-/// Clear USER bit on 2MB pages in a specific PML4.
-pub fn unmap_user(pml4: *mut u64, addr: u64, size: u64) {
-    let start = addr & !(PAGE_2M - 1);
-    let end = (addr + size + PAGE_2M - 1) & !(PAGE_2M - 1);
-    let mut cur = start;
+/// Clear USER bit on pages in a specific PML4.
+/// Handles both 2MB large pages and 4KB page tables (from split pages).
+pub fn unmap_user(pml4: *mut u64, addr: PhysAddr, size: u64) {
+    let entries = KERNEL_PML4_ENTRIES.load(Ordering::Acquire);
+    let raw = addr.raw();
+    let pml4_idx = ((raw >> 39) & 0x1FF) as usize;
 
-    while cur < end {
-        let pml4_idx = ((cur >> 39) & 0x1FF) as usize;
-        let pdpt_idx = ((cur >> 30) & 0x1FF) as usize;
-        let pd_idx = ((cur >> 21) & 0x1FF) as usize;
-
-        unsafe {
-            let pml4e = pml4.add(pml4_idx).read();
-            if pml4e & PAGE_PRESENT == 0 { cur += PAGE_2M; continue; }
-            let pdpt = (pml4e & ADDR_MASK) as *mut u64;
-
-            let pdpte = pdpt.add(pdpt_idx).read();
-            if pdpte & PAGE_PRESENT == 0 { cur += PAGE_2M; continue; }
-            let pd = (pdpte & ADDR_MASK) as *mut u64;
-
-            let pde = pd.add(pd_idx).read();
-            if pde & PAGE_PRESENT != 0 && pde & PAGE_SIZE_BIT != 0 {
-                pd.add(pd_idx).write(pde & !PAGE_USER);
-            }
+    if pml4_idx < entries {
+        // Identity-mapped: clear USER on individual 4KB PTEs
+        let start = raw & !(PAGE_4K - 1);
+        let end = (raw + size + PAGE_4K - 1) & !(PAGE_4K - 1);
+        let mut cur = start;
+        while cur < end {
+            unmap_user_4k(pml4, cur);
+            cur += PAGE_4K;
         }
-
-        cur += PAGE_2M;
+    } else {
+        // User virtual: clear USER on 2MB PDEs
+        let start = raw & !(PAGE_2M - 1);
+        let end = (raw + size + PAGE_2M - 1) & !(PAGE_2M - 1);
+        let mut cur = start;
+        while cur < end {
+            let pml4_idx = ((cur >> 39) & 0x1FF) as usize;
+            let pdpt_idx = ((cur >> 30) & 0x1FF) as usize;
+            let pd_idx = ((cur >> 21) & 0x1FF) as usize;
+            unsafe {
+                let pml4e = pml4.add(pml4_idx).read();
+                if pml4e & PAGE_PRESENT == 0 { cur += PAGE_2M; continue; }
+                let pdpt = (pml4e & ADDR_MASK) as *mut u64;
+                let pdpte = pdpt.add(pdpt_idx).read();
+                if pdpte & PAGE_PRESENT == 0 { cur += PAGE_2M; continue; }
+                let pd = (pdpte & ADDR_MASK) as *mut u64;
+                let pde = pd.add(pd_idx).read();
+                if pde & PAGE_PRESENT != 0 && pde & PAGE_SIZE_BIT != 0 {
+                    pd.add(pd_idx).write(pde & !PAGE_USER);
+                }
+            }
+            cur += PAGE_2M;
+        }
     }
 }
 
-/// Check if every page in a range has PAGE_USER set in the current CR3.
-/// Handles both 2MB large pages and 4KB page tables.
-pub fn is_user_mapped(addr: u64, size: u64) -> bool {
-    if size == 0 {
-        return true;
-    }
-    let Some(end_addr) = addr.checked_add(size) else { return false };
+/// Clear USER on a single 4KB PTE.
+fn unmap_user_4k(pml4: *mut u64, addr: u64) {
+    let pml4_idx = ((addr >> 39) & 0x1FF) as usize;
+    let pdpt_idx = ((addr >> 30) & 0x1FF) as usize;
+    let pd_idx = ((addr >> 21) & 0x1FF) as usize;
+    let pt_idx = ((addr >> 12) & 0x1FF) as usize;
 
-    let pml4 = cpu::read_cr3() as *const u64;
-    let mut cur = addr & !0xFFF; // 4KB-align down
-
-    while cur < end_addr {
-        let pml4_idx = ((cur >> 39) & 0x1FF) as usize;
-        let pdpt_idx = ((cur >> 30) & 0x1FF) as usize;
-        let pd_idx = ((cur >> 21) & 0x1FF) as usize;
-
-        unsafe {
-            let pml4e = pml4.add(pml4_idx).read();
-            if pml4e & PAGE_PRESENT == 0 || pml4e & PAGE_USER == 0 {
-                return false;
-            }
-            let pdpt = (pml4e & ADDR_MASK) as *const u64;
-
-            let pdpte = pdpt.add(pdpt_idx).read();
-            if pdpte & PAGE_PRESENT == 0 || pdpte & PAGE_USER == 0 {
-                return false;
-            }
-            let pd = (pdpte & ADDR_MASK) as *const u64;
-
-            let pde = pd.add(pd_idx).read();
-            if pde & PAGE_PRESENT == 0 || pde & PAGE_USER == 0 {
-                return false;
-            }
-
-            if pde & PAGE_SIZE_BIT != 0 {
-                // 2MB large page — skip to next 2MB boundary
-                cur = (cur + PAGE_2M) & !(PAGE_2M - 1);
-            } else {
-                // 4KB page table — check individual PTE
-                let pt = (pde & ADDR_MASK) as *const u64;
-                let pt_idx = ((cur >> 12) & 0x1FF) as usize;
-                let pte = pt.add(pt_idx).read();
-                if pte & PAGE_PRESENT == 0 || pte & PAGE_USER == 0 {
-                    return false;
-                }
-                cur += PAGE_4K;
-            }
+    unsafe {
+        let pml4e = pml4.add(pml4_idx).read();
+        if pml4e & PAGE_PRESENT == 0 { return; }
+        let pdpt = (pml4e & ADDR_MASK) as *mut u64;
+        let pdpte = pdpt.add(pdpt_idx).read();
+        if pdpte & PAGE_PRESENT == 0 { return; }
+        let pd = (pdpte & ADDR_MASK) as *mut u64;
+        let pde = pd.add(pd_idx).read();
+        if pde & PAGE_PRESENT == 0 { return; }
+        if pde & PAGE_SIZE_BIT != 0 {
+            return; // 2MB page, not split — nothing to clear at 4KB level
+        }
+        let pt = (pde & ADDR_MASK) as *mut u64;
+        let pte = pt.add(pt_idx).read();
+        if pte & PAGE_PRESENT != 0 {
+            pt.add(pt_idx).write(pte & !PAGE_USER);
         }
     }
-
-    true
 }
 
 /// Identity-map an MMIO region as kernel-only using 2MB large pages.
 /// Only call during boot before any processes exist.
-pub fn map_kernel(addr: u64, size: u64) {
+pub fn map_kernel(addr: PhysAddr, size: u64) {
     let pml4 = KERNEL_PML4.load(Ordering::Acquire);
     assert!(!pml4.is_null(), "paging: not initialized");
 
-    let start = addr & !(PAGE_2M - 1);
-    let end = (addr + size + PAGE_2M - 1) & !(PAGE_2M - 1);
+    let raw = addr.raw();
+    let start = raw & !(PAGE_2M - 1);
+    let end = (raw + size + PAGE_2M - 1) & !(PAGE_2M - 1);
     let mut cur = start;
 
     while cur < end {
@@ -451,11 +468,12 @@ pub fn map_kernel(addr: u64, size: u64) {
 /// Map a 4KB page at `virt_addr` pointing to `phys_addr` in the given PML4.
 /// Creates intermediate page table levels (PDPT, PD, PT) as needed.
 /// If the PD entry is a 2MB large page, it is split into 512 identity-mapped 4KB PTEs first.
-pub fn map_4k_in(pml4: *mut u64, virt_addr: u64, phys_addr: u64, writable: bool) {
-    let pml4_idx = ((virt_addr >> 39) & 0x1FF) as usize;
-    let pdpt_idx = ((virt_addr >> 30) & 0x1FF) as usize;
-    let pd_idx = ((virt_addr >> 21) & 0x1FF) as usize;
-    let pt_idx = ((virt_addr >> 12) & 0x1FF) as usize;
+pub fn map_4k_in(pml4: *mut u64, virt_addr: UserAddr, phys_addr: PhysAddr, writable: bool) {
+    let va = virt_addr.raw();
+    let pml4_idx = ((va >> 39) & 0x1FF) as usize;
+    let pdpt_idx = ((va >> 30) & 0x1FF) as usize;
+    let pd_idx = ((va >> 21) & 0x1FF) as usize;
+    let pt_idx = ((va >> 12) & 0x1FF) as usize;
 
     let user_flags = PAGE_PRESENT | PAGE_WRITE | PAGE_USER;
 
@@ -486,37 +504,17 @@ pub fn map_4k_in(pml4: *mut u64, virt_addr: u64, phys_addr: u64, writable: bool)
 
         let mut flags = PAGE_PRESENT | PAGE_USER;
         if writable { flags |= PAGE_WRITE; }
-        pt.add(pt_idx).write((phys_addr & ADDR_MASK) | flags);
-    }
-}
-
-/// Clear a 4KB PTE at `virt_addr`. Does NOT free the physical page.
-pub fn unmap_4k_in(pml4: *mut u64, virt_addr: u64) {
-    let pml4_idx = ((virt_addr >> 39) & 0x1FF) as usize;
-    let pdpt_idx = ((virt_addr >> 30) & 0x1FF) as usize;
-    let pd_idx = ((virt_addr >> 21) & 0x1FF) as usize;
-    let pt_idx = ((virt_addr >> 12) & 0x1FF) as usize;
-
-    unsafe {
-        let pml4e = pml4.add(pml4_idx).read();
-        if pml4e & PAGE_PRESENT == 0 { return; }
-        let pdpt = (pml4e & ADDR_MASK) as *mut u64;
-        let pdpte = pdpt.add(pdpt_idx).read();
-        if pdpte & PAGE_PRESENT == 0 { return; }
-        let pd = (pdpte & ADDR_MASK) as *mut u64;
-        let pde = pd.add(pd_idx).read();
-        if pde & PAGE_PRESENT == 0 || pde & PAGE_SIZE_BIT != 0 { return; }
-        let pt = (pde & ADDR_MASK) as *mut u64;
-        pt.add(pt_idx).write(0);
+        pt.add(pt_idx).write((phys_addr.raw() & ADDR_MASK) | flags);
     }
 }
 
 /// Translate a virtual address to its physical address by walking the page tables.
 /// Returns `None` if any level is not present.
-pub fn virt_to_phys(pml4: *const u64, virt_addr: u64) -> Option<u64> {
-    let pml4_idx = ((virt_addr >> 39) & 0x1FF) as usize;
-    let pdpt_idx = ((virt_addr >> 30) & 0x1FF) as usize;
-    let pd_idx = ((virt_addr >> 21) & 0x1FF) as usize;
+pub fn virt_to_phys(pml4: *const u64, virt_addr: UserAddr) -> Option<PhysAddr> {
+    let va = virt_addr.raw();
+    let pml4_idx = ((va >> 39) & 0x1FF) as usize;
+    let pdpt_idx = ((va >> 30) & 0x1FF) as usize;
+    let pd_idx = ((va >> 21) & 0x1FF) as usize;
 
     unsafe {
         let pml4e = pml4.add(pml4_idx).read();
@@ -530,14 +528,14 @@ pub fn virt_to_phys(pml4: *const u64, virt_addr: u64) -> Option<u64> {
 
         if pde & PAGE_SIZE_BIT != 0 {
             // 2MB large page
-            Some((pde & ADDR_MASK) + (virt_addr & (PAGE_2M - 1)))
+            Some(PhysAddr::new((pde & ADDR_MASK) + (va & (PAGE_2M - 1))))
         } else {
             // 4KB page table
             let pt = (pde & ADDR_MASK) as *const u64;
-            let pt_idx = ((virt_addr >> 12) & 0x1FF) as usize;
+            let pt_idx = ((va >> 12) & 0x1FF) as usize;
             let pte = pt.add(pt_idx).read();
             if pte & PAGE_PRESENT == 0 { return None; }
-            Some((pte & ADDR_MASK) + (virt_addr & 0xFFF))
+            Some(PhysAddr::new((pte & ADDR_MASK) + (va & 0xFFF)))
         }
     }
 }
@@ -550,7 +548,7 @@ fn has(entry: u64, flag: u64) -> u8 {
 pub fn debug_page_walk(addr: u64) {
     use crate::log;
 
-    let pml4 = cpu::read_cr3() as *const u64;
+    let pml4: *const u64 = cpu::read_cr3().as_ptr();
     let pml4_idx = ((addr >> 39) & 0x1FF) as usize;
     let pdpt_idx = ((addr >> 30) & 0x1FF) as usize;
     let pd_idx = ((addr >> 21) & 0x1FF) as usize;

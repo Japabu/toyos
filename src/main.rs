@@ -15,6 +15,7 @@ fn main() {
     let debug = args.iter().any(|a| a == "--debug");
     let release = args.iter().any(|a| a == "--release");
     let build_only = args.iter().any(|a| a == "--build-only");
+    let rebuild_toolchain = args.iter().any(|a| a == "--rebuild-toolchain");
 
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     env::set_current_dir(&root).expect("Failed to cd to project root");
@@ -30,7 +31,7 @@ fn main() {
     }
 
     // Ensure toolchain is up to date
-    let toolchain_changed = toolchain::ensure(&root);
+    let toolchain_changed = toolchain::ensure(&root, rebuild_toolchain);
 
     // Build everything
     build::build(&root, debug, release, toolchain_changed);

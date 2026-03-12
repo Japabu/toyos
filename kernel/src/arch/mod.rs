@@ -12,7 +12,3 @@ const IA32_FS_BASE: u32 = 0xC000_0100;
 pub fn read_fs_base() -> u64 {
     cpu::rdmsr(IA32_FS_BASE)
 }
-
-pub fn set_fs_base(value: u64) {
-    cpu::wrmsr(IA32_FS_BASE, value);
-}

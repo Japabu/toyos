@@ -1,5 +1,7 @@
 use core::marker::PhantomData;
 
+use crate::UserAddr;
+
 /// Marker for types safe to interpret from / write to validated user pointers.
 ///
 /// # Safety
@@ -23,9 +25,10 @@ unsafe impl UserSafe for toyos_abi::input::MouseEvent {}
 /// Check that all pages in [ptr..ptr+size) are in the user half of the address space.
 /// Pages may not yet be mapped (demand paging); the kernel-mode page fault handler
 /// will map them when the kernel dereferences the validated pointer.
-fn check_user_range(ptr: u64, size: u64) -> bool {
+fn check_user_range(ptr: UserAddr, size: u64) -> bool {
     if size == 0 { return true; }
-    let Some(end) = ptr.checked_add(size) else { return false };
+    let raw = ptr.raw();
+    let Some(end) = raw.checked_add(size) else { return false };
     // Reject kernel-space pointers (above canonical hole)
     end <= 0x0000_8000_0000_0000
 }
@@ -48,7 +51,7 @@ impl<'a> SyscallContext<'a> {
     }
 
     /// Validate a user pointer range and return a shared byte slice.
-    pub fn user_slice(&self, ptr: u64, len: u64) -> Option<&'a [u8]> {
+    pub fn user_slice(&self, ptr: UserAddr, len: u64) -> Option<&'a [u8]> {
         let len = len as usize;
         if len == 0 {
             return Some(&[]);
@@ -56,11 +59,11 @@ impl<'a> SyscallContext<'a> {
         if !check_user_range(ptr, len as u64) {
             return None;
         }
-        Some(unsafe { core::slice::from_raw_parts(ptr as *const u8, len) })
+        Some(unsafe { core::slice::from_raw_parts(ptr.raw() as *const u8, len) })
     }
 
     /// Validate a user pointer range and return a mutable byte slice.
-    pub fn user_slice_mut(&self, ptr: u64, len: u64) -> Option<&'a mut [u8]> {
+    pub fn user_slice_mut(&self, ptr: UserAddr, len: u64) -> Option<&'a mut [u8]> {
         let len = len as usize;
         if len == 0 {
             return Some(&mut []);
@@ -68,41 +71,41 @@ impl<'a> SyscallContext<'a> {
         if !check_user_range(ptr, len as u64) {
             return None;
         }
-        Some(unsafe { core::slice::from_raw_parts_mut(ptr as *mut u8, len) })
+        Some(unsafe { core::slice::from_raw_parts_mut(ptr.raw() as *mut u8, len) })
     }
 
     /// Validate a user pointer range as a UTF-8 string.
-    pub fn user_str(&self, ptr: u64, len: u64) -> Option<&'a str> {
+    pub fn user_str(&self, ptr: UserAddr, len: u64) -> Option<&'a str> {
         let slice = self.user_slice(ptr, len)?;
         core::str::from_utf8(slice).ok()
     }
 
     /// Validate a user pointer to a typed struct (immutable).
-    pub fn user_ref<T: UserSafe>(&self, ptr: u64) -> Option<&'a T> {
+    pub fn user_ref<T: UserSafe>(&self, ptr: UserAddr) -> Option<&'a T> {
         let size = core::mem::size_of::<T>() as u64;
         if size == 0 || !check_user_range(ptr, size) {
             return None;
         }
-        if ptr as usize % core::mem::align_of::<T>() != 0 {
+        if ptr.raw() as usize % core::mem::align_of::<T>() != 0 {
             return None;
         }
-        Some(unsafe { &*(ptr as *const T) })
+        Some(unsafe { &*(ptr.raw() as *const T) })
     }
 
     /// Validate a user pointer to a typed struct (mutable).
-    pub fn user_mut<T: UserSafe>(&self, ptr: u64) -> Option<&'a mut T> {
+    pub fn user_mut<T: UserSafe>(&self, ptr: UserAddr) -> Option<&'a mut T> {
         let size = core::mem::size_of::<T>() as u64;
         if size == 0 || !check_user_range(ptr, size) {
             return None;
         }
-        if ptr as usize % core::mem::align_of::<T>() != 0 {
+        if ptr.raw() as usize % core::mem::align_of::<T>() != 0 {
             return None;
         }
-        Some(unsafe { &mut *(ptr as *mut T) })
+        Some(unsafe { &mut *(ptr.raw() as *mut T) })
     }
 
     /// Validate a user pointer to a slice of typed structs.
-    pub fn user_slice_of<T: UserSafe>(&self, ptr: u64, count: usize) -> Option<&'a [T]> {
+    pub fn user_slice_of<T: UserSafe>(&self, ptr: UserAddr, count: usize) -> Option<&'a [T]> {
         if count == 0 {
             return Some(&[]);
         }
@@ -110,9 +113,9 @@ impl<'a> SyscallContext<'a> {
         if !check_user_range(ptr, byte_len as u64) {
             return None;
         }
-        if ptr as usize % core::mem::align_of::<T>() != 0 {
+        if ptr.raw() as usize % core::mem::align_of::<T>() != 0 {
             return None;
         }
-        Some(unsafe { core::slice::from_raw_parts(ptr as *const T, count) })
+        Some(unsafe { core::slice::from_raw_parts(ptr.raw() as *const T, count) })
     }
 }

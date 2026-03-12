@@ -1,359 +1,13 @@
 use core::arch::naked_asm;
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use super::cpu;
-use super::cpu::{outb, io_wait};
-use crate::arch::{paging, syscall, percpu};
-use crate::{process, log};
+use crate::arch::{cpu, paging, syscall, percpu};
+use crate::{process, log, UserAddr};
 
-use crate::sync::Lock;
-
-static CPU_BUSY_TICKS: AtomicU64 = AtomicU64::new(0);
-static CPU_TOTAL_TICKS: AtomicU64 = AtomicU64::new(0);
-
-pub fn cpu_ticks() -> (u64, u64) {
-    (CPU_BUSY_TICKS.load(Ordering::Relaxed), CPU_TOTAL_TICKS.load(Ordering::Relaxed))
-}
-
-/// Atomically check and clear the xHCI interrupt pending flag.
-pub fn xhci_irq_pending() -> bool {
-    XHCI_IRQ_PENDING.swap(0, Ordering::Acquire) != 0
-}
-
-#[no_mangle]
-static XHCI_IRQ_PENDING: AtomicU32 = AtomicU32::new(0);
-
-// PIC ports
-const PIC1_CMD: u16 = 0x20;
-const PIC1_DATA: u16 = 0x21;
-const PIC2_CMD: u16 = 0xA0;
-const PIC2_DATA: u16 = 0xA1;
-
-/// IDT vector assignments — CPU exceptions and hardware interrupts.
-#[repr(usize)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Vector {
-    InvalidOpcode = 0x06,
-    DoubleFault = 0x08,
-    GeneralProtection = 0x0D,
-    PageFault = 0x0E,
-    Timer = 0x20,
-    Xhci = 0x21,
-    TlbFlush = 0xFE,
-}
-
-impl Vector {
-    fn from_raw(v: u64) -> Self {
-        match v {
-            0x06 => Self::InvalidOpcode,
-            0x08 => Self::DoubleFault,
-            0x0D => Self::GeneralProtection,
-            0x0E => Self::PageFault,
-            _ => panic!("unhandled exception vector {:#x}", v),
-        }
-    }
-}
-
-// Page fault error code bits
-const PF_PRESENT: u64 = 1 << 0;
-const PF_WRITE: u64 = 1 << 1;
-const PF_INSTRUCTION_FETCH: u64 = 1 << 4;
-
-// CS ring mask
-const RPL_MASK: u64 = 3;
-
-// IDT entry (16 bytes in 64-bit mode)
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct IdtEntry {
-    offset_low: u16,
-    selector: u16,
-    ist: u8,
-    type_attr: u8,
-    offset_mid: u16,
-    offset_high: u32,
-    reserved: u32,
-}
-
-impl IdtEntry {
-    const EMPTY: Self = Self {
-        offset_low: 0,
-        selector: 0,
-        ist: 0,
-        type_attr: 0,
-        offset_mid: 0,
-        offset_high: 0,
-        reserved: 0,
-    };
-
-    fn new(handler: u64) -> Self {
-        Self {
-            offset_low: handler as u16,
-            selector: 0x08, // kernel CS
-            ist: 0,
-            type_attr: 0x8E, // interrupt gate, DPL=0, present
-            offset_mid: (handler >> 16) as u16,
-            offset_high: (handler >> 32) as u32,
-            reserved: 0,
-        }
-    }
-
-    fn with_ist(mut self, ist_index: u8) -> Self {
-        self.ist = ist_index;
-        self
-    }
-}
-
-#[repr(C, align(16))]
-struct Idt {
-    entries: [IdtEntry; 256],
-}
-
-static IDT: Lock<Idt> = Lock::new(Idt {
-    entries: [IdtEntry::EMPTY; 256],
-});
-
-#[repr(C, packed)]
-struct IdtPointer {
-    limit: u16,
-    base: u64,
-}
-
-/// GPRs saved by exception/interrupt entry stubs.
-/// Push order: rax, rbx, rcx, rdx, rsi, rdi, rbp, r8..r15 (lowest address first).
-#[repr(C)]
-pub struct SavedRegs {
-    pub rax: u64,
-    pub rbx: u64,
-    pub rcx: u64,
-    pub rdx: u64,
-    pub rsi: u64,
-    pub rdi: u64,
-    pub rbp: u64,
-    pub r8: u64,
-    pub r9: u64,
-    pub r10: u64,
-    pub r11: u64,
-    pub r12: u64,
-    pub r13: u64,
-    pub r14: u64,
-    pub r15: u64,
-}
-
-
-/// CPU-pushed interrupt/exception frame, sitting above the saved GPRs + error code.
-#[repr(C)]
-pub struct InterruptFrame {
-    error_code: u64,
-    rip: u64,
-    cs: u64,
-    rflags: u64,
-    rsp: u64,
-    ss: u64,
-}
-
-impl SavedRegs {
-    fn interrupt_frame(&self) -> &InterruptFrame {
-        unsafe { &*((self as *const SavedRegs).add(1) as *const InterruptFrame) }
-    }
-}
-
-/// Disable the legacy 8259 PIC.
-fn disable_pic() {
-    outb(PIC1_CMD, 0x11);
-    io_wait();
-    outb(PIC2_CMD, 0x11);
-    io_wait();
-
-    outb(PIC1_DATA, 32);
-    io_wait();
-    outb(PIC2_DATA, 40);
-    io_wait();
-
-    outb(PIC1_DATA, 4);
-    io_wait();
-    outb(PIC2_DATA, 2);
-    io_wait();
-
-    outb(PIC1_DATA, 0x01);
-    io_wait();
-    outb(PIC2_DATA, 0x01);
-    io_wait();
-
-    outb(PIC1_DATA, 0xFF);
-    outb(PIC2_DATA, 0xFF);
-}
-
-pub fn init() {
-    disable_pic();
-
-    {
-        let mut idt = IDT.lock();
-        idt.entries[Vector::InvalidOpcode as usize] = IdtEntry::new(ud_entry as *const () as u64);
-        idt.entries[Vector::DoubleFault as usize] = IdtEntry::new(double_fault_entry as *const () as u64).with_ist(1);
-        idt.entries[Vector::GeneralProtection as usize] = IdtEntry::new(gpf_entry as *const () as u64);
-        idt.entries[Vector::PageFault as usize] = IdtEntry::new(page_fault_entry as *const () as u64);
-        idt.entries[Vector::Timer as usize] = IdtEntry::new(timer_entry as *const () as u64);
-        idt.entries[Vector::Xhci as usize] = IdtEntry::new(xhci_entry as *const () as u64);
-        idt.entries[Vector::TlbFlush as usize] = IdtEntry::new(tlb_flush_entry as *const () as u64);
-    }
-
-    let ptr = IdtPointer {
-        limit: (core::mem::size_of::<Idt>() - 1) as u16,
-        base: IDT.data_ptr() as u64,
-    };
-
-    unsafe {
-        cpu::lidt(&ptr as *const IdtPointer as *const u8);
-        cpu::enable_interrupts();
-    }
-}
-
-// --- Minimal asm stubs ---
-//
-// Each stub does only what hardware requires in asm:
-//   1. Ring check + swapgs (user ↔ kernel GS base)
-//   2. Save/restore GPRs
-//   3. Call a single Rust handler with a pointer to the saved state
-//   4. iretq
-//
-// All logic, argument reading, and branching lives in Rust.
-
-// --- xHCI MSI-X handler (vector 0x21) ---
-// Minimal: set atomic flag + EOI. No Rust call needed.
-#[unsafe(naked)]
-extern "sysv64" fn xhci_entry() {
-    naked_asm!(
-        "push rax",
-        "push rdx",
-        "lock bts dword ptr [rip + {flag}], 0",
-        "mov rdx, [rip + LAPIC_BASE]",
-        "mov dword ptr [rdx + 0xB0], 0",
-        "pop rdx",
-        "pop rax",
-        "iretq",
-        flag = sym XHCI_IRQ_PENDING,
-    );
-}
-
-// --- TLB flush IPI handler (vector 0xFE) ---
-#[unsafe(naked)]
-extern "sysv64" fn tlb_flush_entry() {
-    naked_asm!(
-        "push rax",
-        "push rdx",
-        "mov rax, cr3",
-        "mov cr3, rax",
-        "mov rdx, [rip + LAPIC_BASE]",
-        "mov dword ptr [rdx + 0xB0], 0",
-        "pop rdx",
-        "pop rax",
-        "iretq",
-    );
-}
-
-// --- Timer interrupt (vector 0x20) ---
-// Ring 3: save all registers (GPR + SSE/XMM), call Rust handler (preempt), restore, iretq.
-// Ring 0: just EOI and return (no preemption while kernel code runs).
-#[unsafe(naked)]
-extern "sysv64" fn timer_entry() {
-    naked_asm!(
-        // No error code for interrupts. CS is at [rsp + 8].
-        "test dword ptr [rsp + 8], 3",
-        "jz 2f",
-
-        // Ring 3: preempt — save GPRs
-        "swapgs",
-        "push 0", // dummy error code for stack layout consistency
-        "push r15", "push r14", "push r13", "push r12",
-        "push r11", "push r10", "push r9",  "push r8",
-        "push rbp", "push rdi", "push rsi", "push rdx",
-        "push rcx", "push rbx", "push rax",
-
-        // Save SSE state (XMM0-XMM15 + MXCSR) — must happen before any Rust
-        // code runs, since XMM registers are caller-saved in the System V ABI.
-        "sub rsp, 8",           // MXCSR (4 bytes, padded to 8 for alignment)
-        "stmxcsr [rsp]",
-        "sub rsp, 256",         // 16 × 16 bytes for XMM0-XMM15
-        "movdqu [rsp + 0*16], xmm0",
-        "movdqu [rsp + 1*16], xmm1",
-        "movdqu [rsp + 2*16], xmm2",
-        "movdqu [rsp + 3*16], xmm3",
-        "movdqu [rsp + 4*16], xmm4",
-        "movdqu [rsp + 5*16], xmm5",
-        "movdqu [rsp + 6*16], xmm6",
-        "movdqu [rsp + 7*16], xmm7",
-        "movdqu [rsp + 8*16], xmm8",
-        "movdqu [rsp + 9*16], xmm9",
-        "movdqu [rsp + 10*16], xmm10",
-        "movdqu [rsp + 11*16], xmm11",
-        "movdqu [rsp + 12*16], xmm12",
-        "movdqu [rsp + 13*16], xmm13",
-        "movdqu [rsp + 14*16], xmm14",
-        "movdqu [rsp + 15*16], xmm15",
-
-        "call {handler}",
-
-        // Restore SSE state
-        "movdqu xmm0,  [rsp + 0*16]",
-        "movdqu xmm1,  [rsp + 1*16]",
-        "movdqu xmm2,  [rsp + 2*16]",
-        "movdqu xmm3,  [rsp + 3*16]",
-        "movdqu xmm4,  [rsp + 4*16]",
-        "movdqu xmm5,  [rsp + 5*16]",
-        "movdqu xmm6,  [rsp + 6*16]",
-        "movdqu xmm7,  [rsp + 7*16]",
-        "movdqu xmm8,  [rsp + 8*16]",
-        "movdqu xmm9,  [rsp + 9*16]",
-        "movdqu xmm10, [rsp + 10*16]",
-        "movdqu xmm11, [rsp + 11*16]",
-        "movdqu xmm12, [rsp + 12*16]",
-        "movdqu xmm13, [rsp + 13*16]",
-        "movdqu xmm14, [rsp + 14*16]",
-        "movdqu xmm15, [rsp + 15*16]",
-        "add rsp, 256",
-        "ldmxcsr [rsp]",
-        "add rsp, 8",
-
-        // Restore GPRs
-        "pop rax",  "pop rbx",  "pop rcx",  "pop rdx",
-        "pop rsi",  "pop rdi",  "pop rbp",
-        "pop r8",   "pop r9",   "pop r10",  "pop r11",
-        "pop r12",  "pop r13",  "pop r14",  "pop r15",
-        "add rsp, 8", // pop dummy error code
-        "swapgs",
-        "iretq",
-
-        // Ring 0: EOI + count idle tick
-        "2:",
-        "push rax",
-        "push rdx",
-        "mov rdx, [rip + LAPIC_BASE]",
-        "mov dword ptr [rdx + 0xB0], 0",
-        "lock inc qword ptr [rip + {total_ticks}]",
-        "pop rdx",
-        "pop rax",
-        "iretq",
-        handler = sym timer_handler,
-        total_ticks = sym CPU_TOTAL_TICKS,
-    );
-}
-
-extern "sysv64" fn timer_handler() {
-    crate::arch::apic::eoi();
-    CPU_BUSY_TICKS.fetch_add(1, Ordering::Relaxed);
-    CPU_TOTAL_TICKS.fetch_add(1, Ordering::Relaxed);
-    crate::scheduler::preempt();
-}
-
-// --- Exception entry stubs ---
-//
-// Asm: ring check + swapgs + save GPRs + call Rust handler(vector, regs_ptr).
-// Rust handler never returns (kills process or halts kernel).
+use super::{Vector, SavedRegs, InterruptFrame, RPL_MASK, PF_PRESENT, PF_WRITE, PF_INSTRUCTION_FETCH};
 
 /// #UD — no error code pushed by CPU, so CS is at [rsp + 8].
 #[unsafe(naked)]
-extern "sysv64" fn ud_entry() {
+pub(super) extern "sysv64" fn ud_entry() {
     naked_asm!(
         "test dword ptr [rsp + 8], 3",
         "jz 1f",
@@ -375,7 +29,7 @@ extern "sysv64" fn ud_entry() {
 
 /// #GP — CPU pushes error code, so CS is at [rsp + 16].
 #[unsafe(naked)]
-extern "sysv64" fn gpf_entry() {
+pub(super) extern "sysv64" fn gpf_entry() {
     naked_asm!(
         "test dword ptr [rsp + 16], 3",
         "jz 1f",
@@ -394,11 +48,10 @@ extern "sysv64" fn gpf_entry() {
     );
 }
 
-/// Page fault entry — asm only does: ring check, swapgs, save GPRs, call Rust, restore, iretq.
-/// All logic (demand paging vs fatal) lives in the Rust handler.
+/// Page fault entry — ring check, swapgs, save GPRs, call Rust, restore, iretq.
 /// If the Rust handler returns, the fault was resolved. If fatal, it diverges.
 #[unsafe(naked)]
-extern "sysv64" fn page_fault_entry() {
+pub(super) extern "sysv64" fn page_fault_entry() {
     naked_asm!(
         // Error code on stack. CS is at [rsp + 16].
         "test dword ptr [rsp + 16], 3",
@@ -433,7 +86,7 @@ extern "sysv64" fn page_fault_entry() {
 
 /// Double fault — runs on IST1 with a dedicated stack. Always from kernel (no swapgs).
 #[unsafe(naked)]
-extern "sysv64" fn double_fault_entry() {
+pub(super) extern "sysv64" fn double_fault_entry() {
     naked_asm!(
         // CPU pushes error code (always 0) for #DF.
         "push r15", "push r14", "push r13", "push r12",
@@ -462,7 +115,7 @@ extern "sysv64" fn double_fault_entry() {
 /// Safe kernel memory read for the double fault handler.
 /// Only reads identity-mapped kernel addresses. Returns None for anything suspect.
 fn safe_read_kernel(addr: u64) -> Option<u64> {
-    if addr % 8 != 0 || !is_kernel_addr(addr) {
+    if addr % 8 != 0 || !paging::is_kernel_addr(addr) {
         return None;
     }
     Some(unsafe { core::ptr::read_volatile(addr as *const u64) })
@@ -471,7 +124,7 @@ fn safe_read_kernel(addr: u64) -> Option<u64> {
 extern "sysv64" fn double_fault_handler(regs: *const SavedRegs) -> ! {
     let regs = unsafe { &*regs };
     let frame = regs.interrupt_frame();
-    let cr2 = cpu::read_cr2();
+    let cr2 = cpu::read_cr2().raw();
     let cpu_id = percpu::cpu_id();
     let pid = percpu::current_pid();
 
@@ -540,7 +193,7 @@ extern "sysv64" fn double_fault_handler(regs: *const SavedRegs) -> ! {
                     log!("    rip={:#018x}  rsp={:#018x}  rbp={:#018x}", maybe_rip, maybe_rsp, user_rbp);
 
                     // Walk user backtrace through page tables
-                    let pml4 = cpu::read_cr3() as *const u64;
+                    let pml4 = cpu::read_cr3().as_ptr::<u64>();
                     log!("  User backtrace:");
                     if let Some(p) = pid {
                         if !process::resolve_user_symbol(p, maybe_rip) {
@@ -598,7 +251,7 @@ extern "sysv64" fn double_fault_handler(regs: *const SavedRegs) -> ! {
 extern "sysv64" fn page_fault_handler(regs: *const SavedRegs) {
     let regs = unsafe { &*regs };
     let frame = regs.interrupt_frame();
-    let fault_addr = cpu::read_cr2();
+    let fault_addr = cpu::read_cr2().raw();
 
     // SMAP violation detection: kernel-mode protection fault on user address
     if frame.error_code & PF_PRESENT != 0 && frame.cs & RPL_MASK == 0
@@ -660,7 +313,7 @@ impl ExceptionContext<'_> {
     /// to avoid nested demand-paging faults inside the exception handler.
     fn pml4(&self) -> *const u64 {
         if self.is_user_fault() {
-            cpu::read_cr3() as *const u64
+            cpu::read_cr3().as_ptr::<u64>()
         } else {
             core::ptr::null()
         }
@@ -681,11 +334,6 @@ fn log_addr(addr: u64, is_user: bool) {
     }
 }
 
-/// Check if addr is a plausible kernel pointer (in identity-mapped RAM).
-fn is_kernel_addr(addr: u64) -> bool {
-    addr > 0x1000 && addr < 0x1_0000_0000_0000
-}
-
 /// Safely read a u64 from memory. For user addresses, translates through page
 /// tables to avoid triggering demand-paging faults inside exception handlers.
 /// For kernel addresses, reads directly via identity mapping.
@@ -694,9 +342,9 @@ fn safe_read_u64(addr: u64, user_pml4: *const u64) -> Option<u64> {
         return None;
     }
     if !user_pml4.is_null() {
-        let phys = paging::virt_to_phys(user_pml4, addr)?;
-        Some(unsafe { *(phys as *const u64) })
-    } else if is_kernel_addr(addr) {
+        let phys = paging::virt_to_phys(user_pml4, UserAddr::new(addr))?;
+        Some(unsafe { *phys.as_ptr::<u64>() })
+    } else if paging::is_kernel_addr(addr) {
         Some(unsafe { *(addr as *const u64) })
     } else {
         None
@@ -747,7 +395,7 @@ extern "sysv64" fn exception_handler(raw_vector: u64, regs: *const SavedRegs) ->
     let regs = unsafe { &*regs };
     let vector = Vector::from_raw(raw_vector);
     let frame = regs.interrupt_frame();
-    let cr2 = if vector == Vector::PageFault { cpu::read_cr2() } else { 0 };
+    let cr2 = if vector == Vector::PageFault { cpu::read_cr2().raw() } else { 0 };
     let ctx = ExceptionContext { vector, regs, frame, cr2 };
     fatal_exception(&ctx);
 }
