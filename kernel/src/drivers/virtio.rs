@@ -5,6 +5,7 @@ use super::mmio::Mmio;
 use super::pci::PciDevice;
 use crate::arch::paging;
 use crate::log;
+use crate::PhysAddr;
 
 // VirtIO PCI capability types
 const VIRTIO_PCI_CAP_COMMON_CFG: u8 = 1;
@@ -105,7 +106,7 @@ impl VirtioPciConfig {
             let offset = cap.read_u32(8) as u64;
 
             let bar_addr = pci_dev.read_bar_64(bar_idx);
-            let mmio = Mmio::new(bar_addr + offset);
+            let mmio = Mmio::new(crate::PhysAddr::new(bar_addr + offset));
 
             match cfg_type {
                 VIRTIO_PCI_CAP_COMMON_CFG if common.is_none() => common = Some(mmio),
@@ -267,7 +268,7 @@ impl VirtioDevice {
             let bar_idx = cap.read_u8(4);
             let bar_addr = pci_dev.read_bar_64(bar_idx);
             if bar_addr != 0 {
-                paging::map_kernel(bar_addr, 0x4000);
+                paging::map_kernel(PhysAddr::new(bar_addr), 0x4000);
             }
         }
 

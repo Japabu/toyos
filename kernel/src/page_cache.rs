@@ -4,6 +4,7 @@ use alloc::vec::Vec;
 
 use crate::block::{BlockDevice, DeviceId};
 use crate::sync::Lock;
+use crate::PhysAddr;
 
 struct PageCacheWithDev {
     cache: PageCache,
@@ -105,14 +106,14 @@ impl PageCache {
 
     /// Get the physical address of a cached block's 4KB page.
     /// Identity mapping: virtual pointer IS physical address.
-    pub fn phys_addr(&self, block: u64) -> Option<u64> {
+    pub fn phys_addr(&self, block: u64) -> Option<PhysAddr> {
         let slot = self.block_to_slot[block as usize];
         if slot == NOT_CACHED { return None; }
-        Some(self.slot_data(slot).as_ptr() as u64)
+        Some(PhysAddr::from_ptr(self.slot_data(slot).as_ptr()))
     }
 
     /// Ensure a block is cached (loading from device if needed) and return its physical address.
-    pub fn ensure_cached(&mut self, dev: &mut dyn BlockDevice, block: u64) -> u64 {
+    pub fn ensure_cached(&mut self, dev: &mut dyn BlockDevice, block: u64) -> PhysAddr {
         self.read(dev, block);
         self.phys_addr(block).unwrap()
     }

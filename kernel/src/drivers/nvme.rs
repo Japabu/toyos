@@ -304,7 +304,6 @@ impl NvmeBlockDevice {
 
 impl BlockDevice for NvmeBlockDevice {
     fn device_id(&self) -> DeviceId { self.id }
-    fn block_size(&self) -> u32 { 4096 }
     fn block_count(&self) -> u64 { self.block_count }
 
     fn read_blocks(&mut self, lba: u64, count: u32, buf: &mut [u8]) {
@@ -357,7 +356,7 @@ pub fn init(ecam_base: u64) -> Option<NvmeBlockDevice> {
     let pci_dev = PciDevice::find(ecam_base, 0x01, 0x08, None)?;
     log!("NVMe: found at PCI {:02x}:{:02x}.{}", pci_dev.bus, pci_dev.dev, pci_dev.func);
 
-    let bar = Mmio::new(pci_dev.read_bar_64(0));
+    let bar = Mmio::new(crate::PhysAddr::new(pci_dev.read_bar_64(0)));
     pci_dev.enable_bus_master();
     log!("NVMe: BAR0={:#x}", bar.addr());
 

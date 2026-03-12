@@ -25,7 +25,4 @@ impl<const N: usize> DmaPool<N> {
         self.pages[index].as_ptr() as u64
     }
 
-    pub fn page_ptr<T>(&self, index: usize) -> *mut T {
-        self.pages[index].as_ptr() as *mut T
-    }
 }

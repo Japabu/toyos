@@ -410,6 +410,7 @@ fn setup_msix(pci_dev: &PciDevice) {
     let table_bar = pci_dev.read_bar_64(table_bir);
     let table_addr = table_bar + table_offset;
 
+    let table_addr = crate::PhysAddr::new(table_addr);
     crate::arch::paging::map_kernel(table_addr, 0x1000);
     let table = Mmio::new(table_addr);
 
@@ -434,7 +435,7 @@ pub fn init(ecam_base: u64) -> Option<XhciController> {
     let pci_dev = PciDevice::find(ecam_base, 0x0C, 0x03, Some(0x30))?;
     log!("xHCI: found at PCI {:02x}:{:02x}.{}", pci_dev.bus, pci_dev.dev, pci_dev.func);
 
-    let bar = Mmio::new(pci_dev.read_bar_64(0));
+    let bar = Mmio::new(crate::PhysAddr::new(pci_dev.read_bar_64(0)));
     pci_dev.enable_bus_master();
     log!("xHCI: BAR0={:#x}", bar.addr());
 

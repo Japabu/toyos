@@ -4,7 +4,7 @@ use alloc::vec::Vec;
 use crate::id_map::IdMap;
 use crate::process::Pid;
 use crate::vfs::Vfs;
-use crate::{device, keyboard, mouse, log, pipe};
+use crate::{device, keyboard, mouse, pipe};
 use crate::pipe::PipeId;
 use crate::drivers::serial;
 pub use toyos_abi::FramebufferInfo;

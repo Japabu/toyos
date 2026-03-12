@@ -4,7 +4,6 @@ use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 use crate::arch::cpu;
 use crate::drivers::mmio::Mmio;
-use crate::log;
 
 // HPET register offsets
 const HPET_CAP: u64 = 0x000;
@@ -15,7 +14,7 @@ static TSC_BOOT: AtomicU64 = AtomicU64::new(0);
 static TSC_PERIOD_FS: AtomicU64 = AtomicU64::new(0);
 
 pub fn init(hpet_base: u64) {
-    let hpet = Mmio::new(hpet_base);
+    let hpet = Mmio::new(crate::PhysAddr::new(hpet_base));
 
     let cap = hpet.read_u64(HPET_CAP);
     let hpet_period_fs = cap >> 32;

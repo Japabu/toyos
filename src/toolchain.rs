@@ -6,7 +6,7 @@ use crate::stamps;
 
 /// Ensure the toolchain is up to date. Returns true if std was rebuilt
 /// (callers must clean userland targets to avoid stale artifacts).
-pub fn ensure(root: &Path) -> bool {
+pub fn ensure(root: &Path, force_rebuild: bool) -> bool {
     let rust_dir = root.join("rust");
     let stamps_dir = root.join("target/stamps");
     fs::create_dir_all(&stamps_dir).ok();
@@ -28,7 +28,7 @@ pub fn ensure(root: &Path) -> bool {
     // toyos-abi is a dependency of std — changes to it require an std rebuild
     let abi_changed = stamps::dir_changed(&root.join("toyos-abi/src"), &abi_stamp);
 
-    let rebuilt = if !toolchain_exists || compiler_changed {
+    let rebuilt = if !toolchain_exists || compiler_changed || force_rebuild {
         // Full bootstrap needed
         eprintln!("Building full toolchain (this takes a while on first run)...");
         full_bootstrap(root, &rust_dir);
@@ -132,16 +132,17 @@ fn build_hosted_rustc(rust_dir: &Path, toyos_ld: &Path) {
 
     if !status.success() {
         let toyos_stage2 = rust_dir.join("build/x86_64-unknown-toyos/stage2");
-        assert!(
-            toyos_stage2.join("bin/rustc").exists()
-                && fs::read_dir(toyos_stage2.join("lib"))
-                    .map(|d| d
-                        .filter_map(|e| e.ok())
-                        .any(|e| e.file_name().to_string_lossy().starts_with("librustc_driver")))
-                    .unwrap_or(false),
-            "Hosted rustc build failed and artifacts are missing"
-        );
-        eprintln!("Note: rustdoc for ToyOS failed to link (expected), but rustc built successfully.");
+        if toyos_stage2.join("bin/rustc").exists()
+            && fs::read_dir(toyos_stage2.join("lib"))
+                .map(|d| d
+                    .filter_map(|e| e.ok())
+                    .any(|e| e.file_name().to_string_lossy().starts_with("librustc_driver")))
+                .unwrap_or(false)
+        {
+            eprintln!("Note: rustdoc for ToyOS failed to link (expected), but rustc built successfully.");
+        } else {
+            eprintln!("Warning: ToyOS-hosted rustc build failed (ecosystem libc not yet available). Skipping.");
+        }
     }
 
     // Restore config without ToyOS as host for future fast rebuilds

@@ -2,7 +2,6 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::arch::paging::{self, PAGE_2M};
-use crate::log;
 use crate::process::OwnedAlloc;
 use crate::sync::Lock;
 use elf::ElfBytes;
@@ -35,8 +34,6 @@ pub enum LibMemory {
         cached_size: usize,
         /// 2MB-aligned offset within cached alloc where private RW region starts.
         rw_offset: usize,
-        /// 2MB-aligned size of the private RW region.
-        rw_size: usize,
         /// Delta to translate cached RW addresses to private physical addresses.
         /// kernel_write_addr = cached_addr + rw_delta
         rw_delta: i64,
@@ -198,7 +195,7 @@ fn cache_loaded_lib(path: &str, lib: LoadedLib, rw_vaddr: u64, rw_end_vaddr: u64
 
     LoadedLib {
         memory: LibMemory::Shared {
-            rw_alloc, cached_addr, cached_size: size, rw_offset, rw_size, rw_delta,
+            rw_alloc, cached_addr, cached_size: size, rw_offset, rw_delta,
         },
         base, dynsym, dynstr, dynstr_size, sym_count,
         tls_template, tls_filesz, tls_memsz, tls_align,
@@ -245,7 +242,6 @@ fn clone_from_cache(cached: &CachedLib) -> Option<LoadedLib> {
             cached_addr: cached_ptr,
             cached_size: cached.alloc_size,
             rw_offset: cached.rw_offset,
-            rw_size: cached.rw_size,
             rw_delta,
         },
         base,
@@ -1317,118 +1313,5 @@ fn resolve_cross_lib_tpoff(lib: &LoadedLib, r_sym: u32, tls_info: &TlsModuleInfo
         }
     }
     log!("tpoff: unresolved TLS symbol: {}", sym_name);
-    0
-}
-
-/// Apply R_X86_64_TPOFF64/TPOFF32 relocations in the main executable's .rela.dyn.
-/// Uses section headers from the raw ELF data to find relocation entries.
-/// When r_sym != 0, looks up the TLS symbol across loaded libraries.
-pub fn apply_exe_tpoff_relocs(data: &[u8], base: u64, exe_base_offset: usize, total_memsz: usize, tls_info: &TlsModuleInfo) {
-    let elf = match ElfBytes::<AnyEndian>::minimal_parse(data) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-
-    // Get dynsym/dynstr for resolving named symbols (r_sym != 0)
-    let (dynsym_data, dynstr_data) = match (
-        elf.section_header_by_name(".dynsym"),
-        elf.section_header_by_name(".dynstr"),
-    ) {
-        (Ok(Some(sym_shdr)), Ok(Some(str_shdr))) => {
-            let sym_data = elf.section_data(&sym_shdr).ok().map(|(d, _)| d);
-            let str_data = elf.section_data(&str_shdr).ok().map(|(d, _)| d);
-            (sym_data, str_data)
-        }
-        _ => (None, None),
-    };
-
-    let mut count = 0u64;
-    for section_name in &[".rela.dyn", ".rela.plt"] {
-        if let Ok(Some(shdr)) = elf.section_header_by_name(section_name) {
-            if let Ok(relas) = elf.section_data_as_relas(&shdr) {
-                for rela in relas {
-                    if rela.r_type == R_X86_64_TPOFF64 as u32 {
-                        let tpoff = if rela.r_sym != 0 {
-                            // Check if locally defined before searching other libs
-                            let locally_defined = dynsym_data.map(|d| {
-                                let off = rela.r_sym as usize * 24;
-                                off + 24 <= d.len() && u16::from_le_bytes(d[off + 6..off + 8].try_into().unwrap()) != 0
-                            }).unwrap_or(false);
-                            if locally_defined {
-                                let d = dynsym_data.unwrap();
-                                let off = rela.r_sym as usize * 24;
-                                let st_value = u64::from_le_bytes(d[off + 8..off + 16].try_into().unwrap());
-                                exe_base_offset as i64 + st_value as i64 + rela.r_addend - total_memsz as i64
-                            } else {
-                                resolve_exe_cross_lib_tpoff(rela.r_sym, &dynsym_data, &dynstr_data, tls_info, total_memsz)
-                            }
-                        } else {
-                            exe_base_offset as i64 + rela.r_addend - total_memsz as i64
-                        };
-                        let target = (base + rela.r_offset) as *mut u64;
-                        unsafe { *target = tpoff as u64; }
-                        count += 1;
-                    } else if rela.r_type == R_X86_64_TPOFF32 as u32 {
-                        let tpoff = if rela.r_sym != 0 {
-                            let locally_defined = dynsym_data.map(|d| {
-                                let off = rela.r_sym as usize * 24;
-                                off + 24 <= d.len() && u16::from_le_bytes(d[off + 6..off + 8].try_into().unwrap()) != 0
-                            }).unwrap_or(false);
-                            if locally_defined {
-                                let d = dynsym_data.unwrap();
-                                let off = rela.r_sym as usize * 24;
-                                let st_value = u64::from_le_bytes(d[off + 8..off + 16].try_into().unwrap());
-                                exe_base_offset as i64 + st_value as i64 + rela.r_addend - total_memsz as i64
-                            } else {
-                                resolve_exe_cross_lib_tpoff(rela.r_sym, &dynsym_data, &dynstr_data, tls_info, total_memsz)
-                            }
-                        } else {
-                            exe_base_offset as i64 + rela.r_addend - total_memsz as i64
-                        };
-                        let target = (base + rela.r_offset) as *mut i32;
-                        unsafe { *target = tpoff as i32; }
-                        count += 1;
-                    }
-                }
-            }
-        }
-    }
-    if count > 0 {
-        log!("exe: applied {} TPOFF relocs (base_offset={}, total_memsz={})",
-            count, exe_base_offset, total_memsz);
-    }
-}
-
-/// Resolve a cross-library TPOFF64 from the main executable by looking up the
-/// symbol name from the exe's dynsym/dynstr tables, then finding which library defines it.
-fn resolve_exe_cross_lib_tpoff(r_sym: u32, dynsym_data: &Option<&[u8]>, dynstr_data: &Option<&[u8]>, tls_info: &TlsModuleInfo, total_memsz: usize) -> i64 {
-    let (Some(dynsym), Some(dynstr)) = (dynsym_data, dynstr_data) else {
-        log!("tpoff: no dynsym/dynstr for exe cross-lib TLS");
-        return 0;
-    };
-    let entry_offset = r_sym as usize * 24;
-    if entry_offset + 24 > dynsym.len() {
-        log!("tpoff: r_sym {} out of bounds", r_sym);
-        return 0;
-    }
-    let st_name = u32::from_le_bytes(dynsym[entry_offset..entry_offset + 4].try_into().unwrap()) as usize;
-    if st_name >= dynstr.len() {
-        log!("tpoff: st_name {} out of bounds", st_name);
-        return 0;
-    }
-    let name_end = dynstr[st_name..].iter().position(|&b| b == 0).unwrap_or(dynstr.len() - st_name);
-    let sym_name = core::str::from_utf8(&dynstr[st_name..st_name + name_end]).unwrap_or("");
-
-    for lib in tls_info.libs {
-        if lib.tls_memsz == 0 { continue; }
-        if let Some(sym_tls_offset) = tls_dlsym(lib, sym_name) {
-            let other_base_offset = tls_info.modules.iter()
-                .find(|&&(template, _, _, _)| template == lib.tls_template)
-                .map(|&(_, _, _, bo)| bo)
-                .unwrap_or(0);
-            return other_base_offset as i64 + sym_tls_offset as i64 - total_memsz as i64;
-        }
-    }
-    log!("tpoff: unresolved exe TLS symbol: {}", sym_name);
     0
 }

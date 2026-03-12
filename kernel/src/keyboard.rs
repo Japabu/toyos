@@ -1,6 +1,4 @@
 use alloc::collections::VecDeque;
-use alloc::string::String;
-use alloc::vec::Vec;
 
 use crate::sync::Lock;
 pub use toyos_abi::input::{RawKeyEvent, MOD_SHIFT, MOD_CTRL, MOD_ALT, MOD_GUI, MOD_RELEASED};
@@ -187,11 +185,6 @@ pub fn set_layout(name: &str) -> bool {
 
 pub fn layout_name() -> &'static str {
     active_layout().name
-}
-
-pub fn available_layouts() -> String {
-    let names: Vec<&str> = LAYOUTS.iter().map(|l| l.name).collect();
-    names.join(", ")
 }
 
 const K: KeyEntry = KeyEntry { normal: &[], shift: &[], option: &[], shift_option: &[] };

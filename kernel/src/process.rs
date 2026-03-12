@@ -13,7 +13,8 @@ use crate::id_map::IdMap;
 use crate::message::MessageQueue;
 use crate::sync::Lock;
 use crate::symbols::ProcessSymbols;
-use crate::{elf, log, pipe, scheduler, shared_memory, vfs};
+use crate::{elf, pipe, scheduler, shared_memory, vfs};
+use crate::{PhysAddr, UserAddr};
 
 pub use toyos_abi::Pid;
 use toyos_abi::syscall::SyscallError;
@@ -30,19 +31,17 @@ impl crate::id_map::IdKey for Pid {
 /// Physical address of a PML4 page table. Used as `Option<PageTableRoot>` in SchedEntry
 /// so that `take()` makes double-free of page tables impossible at compile time.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub struct PageTableRoot(NonNull<u64>);
+pub struct PageTableRoot(PhysAddr);
 
 // SAFETY: PageTableRoot points to a PML4 page table in physical memory.
 // Page tables are not tied to any specific thread — they are hardware structures.
 unsafe impl Send for PageTableRoot {}
 
 impl PageTableRoot {
-    pub fn new(ptr: *mut u64) -> Self {
-        Self(NonNull::new(ptr).expect("PageTableRoot::new with null"))
-    }
-
-    pub fn as_ptr(self) -> *mut u64 { self.0.as_ptr() }
-    pub fn as_u64(self) -> u64 { self.0.as_ptr() as u64 }
+    pub fn new(addr: PhysAddr) -> Self { Self(addr) }
+    pub fn phys(self) -> PhysAddr { self.0 }
+    pub fn as_ptr(self) -> *mut u64 { self.0.as_mut_ptr() }
+    pub fn as_u64(self) -> u64 { self.0.raw() }
 }
 
 // ---------------------------------------------------------------------------
@@ -72,14 +71,6 @@ impl OwnedAlloc {
         let layout = Layout::from_size_align(size, align).ok()?;
         let ptr = NonNull::new(unsafe { alloc(layout) })?;
         Some(Self { ptr, layout })
-    }
-
-    /// Consume `self` without running `Drop`, returning the raw parts.
-    /// The caller takes ownership of the allocation.
-    pub fn into_raw(self) -> (*mut u8, Layout) {
-        let parts = (self.ptr.as_ptr(), self.layout);
-        core::mem::forget(self);
-        parts
     }
 
     pub fn ptr(&self) -> *mut u8 { self.ptr.as_ptr() }
@@ -136,7 +127,7 @@ pub enum ProcessState {
     BlockedRecvMsg,
     BlockedNetRecv { deadline: u64 },
     BlockedSleep { deadline: u64 },
-    BlockedFutex { phys_addr: u64, deadline: u64 },
+    BlockedFutex { phys_addr: PhysAddr, deadline: u64 },
     Zombie(i32),
 }
 
@@ -359,7 +350,7 @@ pub struct ProcessData {
     // Anonymous memory mappings (mmap)
     pub mmap_regions: Vec<MmapRegion>,
     // User stack location (for SYS_STACK_INFO)
-    pub user_stack_base: u64,
+    pub user_stack_base: UserAddr,
     pub user_stack_size: u64,
     /// Inherited environment variables (KEY=VALUE\0KEY2=VALUE2\0...)
     pub env: Vec<u8>,
@@ -370,19 +361,19 @@ pub struct ProcessData {
     pub vmas: crate::vma::VmaList,
     /// Private 4KB physical pages allocated for demand-paged RW/COW pages.
     /// Freed on process exit.
-    pub demand_pages: Vec<u64>,
+    pub demand_pages: Vec<PhysAddr>,
     /// RELATIVE relocation index for demand-paged ELF (applied per-page on fault).
     pub reloc_index: Option<Arc<elf::RelocationIndex>>,
     /// Runtime base address for the demand-paged ELF (for relocation computation).
-    pub elf_base: u64,
+    pub elf_base: UserAddr,
     /// Ring buffer of recent page faults for crash diagnostics.
     pub fault_trace: PageFaultTrace,
 }
 
 pub struct MmapRegion {
-    pub addr: u64,
+    pub addr: UserAddr,
     pub size: usize,
-    pub alloc: OwnedAlloc,
+    pub _alloc: OwnedAlloc,
     /// True if this is a MAP_FIXED mapping (virt addr != phys addr).
     pub fixed: bool,
 }
@@ -534,13 +525,6 @@ pub fn with_current_sched<R>(f: impl FnOnce(&SchedEntry) -> R) -> R {
     let guard = PROCESS_TABLE.lock();
     let table = guard.as_ref().unwrap();
     f(table.get(current_pid()).unwrap())
-}
-
-/// Access the current process's SchedEntry mutably (table lock held for closure).
-pub fn with_current_sched_mut<R>(f: impl FnOnce(&mut SchedEntry) -> R) -> R {
-    let mut guard = PROCESS_TABLE.lock();
-    let table = guard.as_mut().unwrap();
-    f(table.get_mut(current_pid()).unwrap())
 }
 
 // ---------------------------------------------------------------------------
@@ -751,7 +735,7 @@ pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64, stack_base: u64) -> Op
     } else {
         setup_tls(tls_template, tls_filesz, tls_memsz, tls_max_align)?
     };
-    paging::map_user(tls_alloc.ptr() as u64, tls_alloc.size() as u64);
+    paging::map_user(PhysAddr::from_ptr(tls_alloc.ptr()), tls_alloc.size() as u64);
 
     let (ks_alloc, ks_rsp) = match alloc_kernel_stack(thread_start, entry, stack_ptr, arg) {
         Some(ks) => ks,
@@ -781,7 +765,7 @@ pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64, stack_base: u64) -> Op
         symbols: ProcessSymbols::empty(),
         loaded_libs: Vec::new(),
         mmap_regions: Vec::new(),
-        user_stack_base: stack_base,
+        user_stack_base: UserAddr::new(stack_base),
         user_stack_size: if stack_base > 0 { stack_ptr - stack_base } else { 0 },
         env: Vec::new(),
         syscall_counts: [0; 64],
@@ -789,7 +773,7 @@ pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64, stack_base: u64) -> Op
         vmas: crate::vma::VmaList::new(),
         demand_pages: Vec::new(),
         reloc_index: None,
-        elf_base: 0,
+        elf_base: UserAddr::new(0),
         fault_trace: PageFaultTrace::new(),
     }));
 
@@ -1004,8 +988,8 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
         if file_blocks_needed > 0 && file_backed_end > seg_start {
             // File-backed region
             vmas.insert(crate::vma::Vma {
-                start: seg_start,
-                end: file_backed_end.min(seg_end),
+                start: UserAddr::new(seg_start),
+                end: UserAddr::new(file_backed_end.min(seg_end)),
                 writable: seg.writable,
                 kind: crate::vma::VmaKind::FileBacked {
                     block_map: Arc::clone(&block_map),
@@ -1018,8 +1002,8 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
         if file_backed_end < seg_end {
             // BSS / anonymous portion (memsz > filesz)
             vmas.insert(crate::vma::Vma {
-                start: file_backed_end.max(seg_start),
-                end: seg_end,
+                start: UserAddr::new(file_backed_end.max(seg_start)),
+                end: UserAddr::new(seg_end),
                 writable: seg.writable,
                 kind: crate::vma::VmaKind::Anonymous,
             });
@@ -1201,22 +1185,23 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
     let t_deps = crate::clock::nanos_since_boot();
 
     // 8. Create user PML4 — no pages mapped for ELF segments (all demand-faulted)
-    let child_pml4 = paging::create_user_pml4();
-    let child_cr3 = Some(PageTableRoot::new(child_pml4));
+    let child_pml4_addr = paging::create_user_pml4();
+    let child_pml4 = child_pml4_addr.as_mut_ptr();
+    let child_cr3 = Some(PageTableRoot::new(child_pml4_addr));
 
     // Map shared libraries (still identity-mapped, eager)
     for lib in &loaded_libs {
         match &lib.memory {
             elf::LibMemory::Owned(alloc) => {
-                paging::map_user_in(child_pml4, alloc.ptr() as u64, alloc.size() as u64);
+                paging::map_user_in(child_pml4, PhysAddr::from_ptr(alloc.ptr()), alloc.size() as u64);
             }
             elf::LibMemory::Shared { rw_alloc, cached_addr, cached_size, rw_offset, .. } => {
-                paging::map_user_readonly_in(child_pml4, *cached_addr, *cached_size as u64);
+                paging::map_user_readonly_in(child_pml4, PhysAddr::new(*cached_addr), *cached_size as u64);
                 let num_rw_pages = rw_alloc.size() / paging::PAGE_2M as usize;
                 for i in 0..num_rw_pages {
                     let virt = *cached_addr + *rw_offset as u64 + i as u64 * paging::PAGE_2M;
                     let phys = rw_alloc.ptr() as u64 + i as u64 * paging::PAGE_2M;
-                    paging::remap_user_2m_in(child_pml4, virt, phys);
+                    paging::remap_user_2m_in(child_pml4, UserAddr::new(virt), PhysAddr::new(phys));
                 }
             }
         }
@@ -1233,7 +1218,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
     };
     let stack_base = stack_alloc.ptr() as u64;
     let stack_top = stack_base + USER_STACK_SIZE as u64;
-    paging::map_user_in(child_pml4, stack_base, USER_STACK_SIZE as u64);
+    paging::map_user_in(child_pml4, PhysAddr::new(stack_base), USER_STACK_SIZE as u64);
 
     // 10. TLS setup
     let mut tls_modules: Vec<(u64, usize, usize, usize)> = Vec::new();
@@ -1362,7 +1347,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
             }
         }
     };
-    paging::map_user_in(child_pml4, tls_alloc.ptr() as u64, tls_alloc.size() as u64);
+    paging::map_user_in(child_pml4, PhysAddr::from_ptr(tls_alloc.ptr()), tls_alloc.size() as u64);
 
     let entry = base + layout.entry_vaddr;
     let sp = write_argv_to_stack(stack_top, argv);
@@ -1428,7 +1413,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
         symbols: syms,
         loaded_libs,
         mmap_regions: Vec::new(),
-        user_stack_base: stack_base,
+        user_stack_base: UserAddr::new(stack_base),
         user_stack_size: USER_STACK_SIZE as u64,
         env,
         syscall_counts: [0; 64],
@@ -1436,7 +1421,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
         vmas,
         demand_pages: Vec::new(),
         reloc_index,
-        elf_base: base,
+        elf_base: UserAddr::new(base),
         fault_trace: PageFaultTrace::new(),
     }));
 
@@ -1755,8 +1740,8 @@ pub fn futex_wait(addr: u64, expected: u32, timeout_ns: u64) -> u64 {
 
     // Translate virtual → physical so cross-process futex works on shared memory
     let pml4 = entry.cr3().map(|r| r.as_ptr() as *const u64)
-        .unwrap_or(crate::arch::paging::kernel_cr3() as *const u64);
-    let phys_addr = match crate::arch::paging::virt_to_phys(pml4, addr) {
+        .unwrap_or(paging::kernel_cr3().as_ptr());
+    let phys_addr = match paging::virt_to_phys(pml4, UserAddr::new(addr)) {
         Some(pa) => pa,
         None => return u64::MAX,
     };
@@ -1779,9 +1764,9 @@ pub fn futex_wake(addr: u64, count: u64) -> u64 {
     let pid = current_pid();
     let caller_cr3 = table.get(pid).map(|e| {
         e.cr3().map(|r| r.as_ptr() as *const u64)
-            .unwrap_or(crate::arch::paging::kernel_cr3() as *const u64)
+            .unwrap_or(paging::kernel_cr3().as_ptr())
     }).unwrap();
-    let caller_phys = match crate::arch::paging::virt_to_phys(caller_cr3, addr) {
+    let caller_phys = match paging::virt_to_phys(caller_cr3, UserAddr::new(addr)) {
         Some(pa) => pa,
         None => return 0,
     };
@@ -1883,7 +1868,7 @@ pub fn handle_page_fault(fault_addr: u64, _error_code: u64) -> bool {
 
     // Extract VMA info before borrowing other fields
     let (vma_start, vma_writable, vma_kind_info) = {
-        let vma = match data.vmas.find(fault_addr) {
+        let vma = match data.vmas.find(UserAddr::new(fault_addr)) {
             Some(v) => v,
             None => return false,
         };
@@ -1893,19 +1878,19 @@ pub fn handle_page_fault(fault_addr: u64, _error_code: u64) -> bool {
                 Some((Arc::clone(block_map), *file_offset, *file_size))
             }
         };
-        (vma.start, vma.writable, kind_info)
+        (vma.start.raw(), vma.writable, kind_info)
     };
 
     let page_vaddr = fault_addr & !0xFFF;
     let reloc_index = data.reloc_index.clone();
-    let elf_base = data.elf_base;
+    let elf_base = data.elf_base.raw();
 
     match vma_kind_info {
         None => {
             // Anonymous: zeroed page
             let phys = alloc_4k_zeroed();
-            paging::map_4k_in(pml4, page_vaddr, phys, vma_writable);
-            cpu::invlpg(page_vaddr);
+            paging::map_4k_in(pml4, UserAddr::new(page_vaddr), phys, vma_writable);
+            cpu::invlpg(crate::VirtAddr::new(page_vaddr));
             data.fault_trace.push(PageFaultRecord {
                 fault_addr, page_elf_offset: page_vaddr.wrapping_sub(elf_base),
                 block_idx: 0, reloc_count: 0,
@@ -1949,21 +1934,21 @@ pub fn handle_page_fault(fault_addr: u64, _error_code: u64) -> bool {
                     let private = alloc_4k_uninit();
                     unsafe {
                         core::ptr::copy_nonoverlapping(
-                            cache_phys as *const u8, private as *mut u8, valid_in_page);
+                            cache_phys.as_ptr::<u8>(), private.as_mut_ptr::<u8>(), valid_in_page);
                         // Zero BSS portion (bytes beyond file data)
                         if valid_in_page < 4096 {
                             core::ptr::write_bytes(
-                                (private as *mut u8).add(valid_in_page), 0, 4096 - valid_in_page);
+                                private.as_mut_ptr::<u8>().add(valid_in_page), 0, 4096 - valid_in_page);
                         }
                     }
                     drop(cache_guard);
 
                     if let Some(ref ri) = reloc_index {
-                        ri.apply_to_page(page_elf_offset, private as *mut u8);
+                        ri.apply_to_page(page_elf_offset, private.as_mut_ptr::<u8>());
                     }
 
-                    paging::map_4k_in(pml4, page_vaddr, private, vma_writable || has_relocs);
-                    cpu::invlpg(page_vaddr);
+                    paging::map_4k_in(pml4, UserAddr::new(page_vaddr), private, vma_writable || has_relocs);
+                    cpu::invlpg(crate::VirtAddr::new(page_vaddr));
                     data.fault_trace.push(PageFaultRecord {
                         fault_addr, page_elf_offset,
                         block_idx: block_idx as u32, reloc_count: reloc_count as u16,
@@ -1972,8 +1957,8 @@ pub fn handle_page_fault(fault_addr: u64, _error_code: u64) -> bool {
                     data.demand_pages.push(private);
                 } else {
                     drop(cache_guard);
-                    paging::map_4k_in(pml4, page_vaddr, cache_phys, false);
-                    cpu::invlpg(page_vaddr);
+                    paging::map_4k_in(pml4, UserAddr::new(page_vaddr), cache_phys, false);
+                    cpu::invlpg(crate::VirtAddr::new(page_vaddr));
                     data.fault_trace.push(PageFaultRecord {
                         fault_addr, page_elf_offset,
                         block_idx: block_idx as u32, reloc_count: 0,
@@ -1982,8 +1967,8 @@ pub fn handle_page_fault(fault_addr: u64, _error_code: u64) -> bool {
                 }
             } else {
                 let phys = alloc_4k_zeroed();
-                paging::map_4k_in(pml4, page_vaddr, phys, vma_writable);
-                cpu::invlpg(page_vaddr);
+                paging::map_4k_in(pml4, UserAddr::new(page_vaddr), phys, vma_writable);
+                cpu::invlpg(crate::VirtAddr::new(page_vaddr));
                 data.fault_trace.push(PageFaultRecord {
                     fault_addr, page_elf_offset: page_vaddr.wrapping_sub(elf_base),
                     block_idx: block_idx as u32, reloc_count: 0,
@@ -1998,25 +1983,25 @@ pub fn handle_page_fault(fault_addr: u64, _error_code: u64) -> bool {
 }
 
 /// Allocate a zeroed 4KB page, returning its physical address (= virtual address under identity mapping).
-fn alloc_4k_zeroed() -> u64 {
+fn alloc_4k_zeroed() -> PhysAddr {
     let layout = Layout::from_size_align(4096, 4096).unwrap();
     let ptr = unsafe { alloc_zeroed(layout) };
     assert!(!ptr.is_null(), "alloc_4k_zeroed: out of memory");
-    ptr as u64
+    PhysAddr::from_ptr(ptr)
 }
 
 /// Allocate an uninitialized 4KB page, returning its physical address.
-fn alloc_4k_uninit() -> u64 {
+fn alloc_4k_uninit() -> PhysAddr {
     let layout = Layout::from_size_align(4096, 4096).unwrap();
     let ptr = unsafe { alloc(layout) };
     assert!(!ptr.is_null(), "alloc_4k_uninit: out of memory");
-    ptr as u64
+    PhysAddr::from_ptr(ptr)
 }
 
 /// Free a 4KB page at the given physical address.
-pub fn free_4k(phys: u64) {
+pub fn free_4k(phys: PhysAddr) {
     let layout = Layout::from_size_align(4096, 4096).unwrap();
-    unsafe { dealloc(phys as *mut u8, layout) };
+    unsafe { dealloc(phys.as_mut_ptr(), layout) };
 }
 
 // ---------------------------------------------------------------------------
@@ -2067,14 +2052,20 @@ pub fn dump_crash_diagnostics(fault_addr: u64, rip: u64) {
     };
     let Some(pml4) = pml4 else { return };
 
+    // Read a u64 from a user virtual address via page table translation.
+    // Uses the physical address (identity-mapped without USER bit) to avoid SMAP faults.
+    let read_user = |virt: u64| -> Option<u64> {
+        let phys = paging::virt_to_phys(pml4 as *const u64, UserAddr::new(virt))?;
+        Some(unsafe { *phys.as_ptr::<u64>() })
+    };
+
     let dump_region = |label: &str, addr: u64| {
-        if paging::virt_to_phys(pml4 as *const u64, addr).is_none() { return; }
+        if read_user(addr).is_none() { return; }
         let start = (addr & !0x7).saturating_sub(32);
         log!("  Memory around {} ({:#x}):", label, addr);
         for i in 0..8u64 {
             let a = start + i * 8;
-            if paging::virt_to_phys(pml4 as *const u64, a).is_none() { break; }
-            let val = unsafe { *(a as *const u64) };
+            let Some(val) = read_user(a) else { break };
             let marker = if a == (addr & !0x7) { " <--" } else { "" };
             log!("    [{:#x}] = {:#018x}{}", a, val, marker);
         }
@@ -2099,22 +2090,19 @@ pub fn dump_crash_diagnostics(fault_addr: u64, rip: u64) {
     }
     if fs_base != 0 {
         log!("  FS base: {:#x}", fs_base);
-        if paging::virt_to_phys(pml4 as *const u64, fs_base).is_some() {
-            let self_ptr = unsafe { *(fs_base as *const u64) };
+        if let Some(self_ptr) = read_user(fs_base) {
             log!("  fs:[0] = {:#x} (expected {:#x})", self_ptr, fs_base);
             // Dump 8 qwords at TP
             for i in 0..8u64 {
                 let addr = fs_base + i * 8;
-                if paging::virt_to_phys(pml4 as *const u64, addr).is_none() { break; }
-                let val = unsafe { *(addr as *const u64) };
+                let Some(val) = read_user(addr) else { break };
                 log!("    TP+{:#x} = {:#018x}", i * 8, val);
             }
             // Also dump 4 qwords before TP (TLS data area)
             log!("  TLS data before TP:");
             for i in 1..=4u64 {
                 let addr = fs_base - i * 8;
-                if paging::virt_to_phys(pml4 as *const u64, addr).is_none() { break; }
-                let val = unsafe { *(addr as *const u64) };
+                let Some(val) = read_user(addr) else { break };
                 log!("    TP-{:#x} = {:#018x}", i * 8, val);
             }
         } else {
@@ -2129,22 +2117,6 @@ pub fn dump_crash_diagnostics(fault_addr: u64, rip: u64) {
 // ---------------------------------------------------------------------------
 // Symbol resolution / address validation
 // ---------------------------------------------------------------------------
-
-/// Check if an address is in the current process's valid memory ranges.
-pub fn is_valid_user_addr(addr: u64) -> bool {
-    let pid = current_pid();
-    if pid == Pid::MAX { return false; }
-    let data_arc = {
-        let guard = PROCESS_TABLE.lock();
-        let Some(table) = guard.as_ref() else { return false };
-        match table.get(pid) {
-            Some(entry) => Arc::clone(entry.data()),
-            None => return false,
-        }
-    };
-    let guard = data_arc.lock();
-    guard.symbols.is_valid_user_addr(addr)
-}
 
 /// Resolve and log a user-mode address against the process's symbol table.
 /// Returns true if the address was resolved and logged.

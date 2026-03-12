@@ -405,7 +405,7 @@ impl GpuController {
             let ptr = unsafe { alloc_zeroed(fb_layout) };
             assert!(!ptr.is_null(), "VirtIO GPU: framebuffer alloc failed");
             addrs[i] = ptr as u64;
-            tokens[i] = shared_memory::register(addrs[i], fb_aligned as u64);
+            tokens[i] = shared_memory::register(crate::PhysAddr::new(addrs[i]), fb_aligned as u64);
             log!("VirtIO GPU: buffer {} at {:#x} ({} bytes) token={:?}", i, addrs[i], fb_size, tokens[i]);
         }
         FbAlloc { tokens, addrs, layout: fb_layout }
@@ -570,7 +570,7 @@ pub fn init(ecam_base: u64) -> Option<(Box<dyn Gpu>, GpuInfo)> {
     let cursor_ptr = unsafe { alloc_zeroed(cursor_layout) };
     assert!(!cursor_ptr.is_null(), "VirtIO GPU: cursor alloc failed");
     let cursor_addr = cursor_ptr as u64;
-    gpu.cursor_token = shared_memory::register(cursor_addr, cursor_aligned as u64);
+    gpu.cursor_token = shared_memory::register(crate::PhysAddr::new(cursor_addr), cursor_aligned as u64);
     gpu.create_resource(CURSOR_RESOURCE_ID, FORMAT_B8G8R8A8_UNORM, CURSOR_SIZE, CURSOR_SIZE);
     gpu.attach_backing(CURSOR_RESOURCE_ID, cursor_addr, cursor_bytes as u32);
     log!("VirtIO GPU: cursor resource at {:#x} token={:?}", cursor_addr, gpu.cursor_token);

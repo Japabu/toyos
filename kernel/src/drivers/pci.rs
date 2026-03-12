@@ -57,7 +57,7 @@ impl PciDevice {
             | ((bus as u64) << 20)
             | ((dev as u64) << 15)
             | ((func as u64) << 12);
-        Self { mmio: Mmio::new(addr), bus, dev, func }
+        Self { mmio: Mmio::new(crate::PhysAddr::new(addr)), bus, dev, func }
     }
 
     pub fn vendor_id(&self) -> u16 {
@@ -87,10 +87,6 @@ impl PciDevice {
 
     pub fn write_config_u16(&self, offset: u64, val: u16) {
         self.mmio.write_u16(offset, val)
-    }
-
-    pub fn write_config_u32(&self, offset: u64, val: u32) {
-        self.mmio.write_u32(offset, val)
     }
 
     /// Enable memory space access and bus mastering in PCI command register.

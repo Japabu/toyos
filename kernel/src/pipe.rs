@@ -6,6 +6,7 @@ use toyos_abi::ring::RingHeader;
 use crate::arch::paging::{self, PAGE_2M};
 use crate::id_map::{IdKey, IdMap};
 use crate::sync::Lock;
+use crate::PhysAddr;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct PipeId(usize);
@@ -28,7 +29,7 @@ impl IdKey for PipeId {
 const PIPE_SIZE: usize = PAGE_2M as usize;
 
 struct Pipe {
-    phys_addr: u64,
+    phys_addr: PhysAddr,
     layout: Layout,
     readers: u32,
     writers: u32,
@@ -41,7 +42,7 @@ impl Pipe {
         assert!(!ptr.is_null(), "pipe: allocation failed");
         RingHeader::init(ptr, PIPE_SIZE);
         Self {
-            phys_addr: ptr as u64,
+            phys_addr: PhysAddr::from_ptr(ptr),
             layout,
             readers: 1,
             writers: 1,
@@ -49,7 +50,7 @@ impl Pipe {
     }
 
     fn header(&self) -> &RingHeader {
-        unsafe { &*(self.phys_addr as *const RingHeader) }
+        unsafe { &*self.phys_addr.as_ptr::<RingHeader>() }
     }
 }
 
@@ -148,7 +149,7 @@ pub fn add_writer(pipe_id: PipeId) {
 }
 
 fn free_pipe(pipe: Pipe) {
-    unsafe { dealloc(pipe.phys_addr as *mut u8, pipe.layout); }
+    unsafe { dealloc(pipe.phys_addr.as_mut_ptr(), pipe.layout); }
 }
 
 pub fn close_read(pipe_id: PipeId) {
@@ -185,6 +186,6 @@ pub fn map_into(pipe_id: PipeId, pml4: *mut u64) -> Option<u64> {
     with_pipes(|pipes| {
         let pipe = pipes.get(pipe_id)?;
         paging::map_user_in(pml4, pipe.phys_addr, PIPE_SIZE as u64);
-        Some(pipe.phys_addr)
+        Some(pipe.phys_addr.raw())
     })
 }

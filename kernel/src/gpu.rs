@@ -31,20 +31,6 @@ pub fn register(gpu: Box<dyn Gpu>, info: GpuInfo) {
     *GPU.lock() = Some(gpu);
 }
 
-pub fn info() -> Option<GpuInfo> {
-    let guard = INFO.lock();
-    let info = guard.as_ref()?;
-    Some(GpuInfo {
-        tokens: info.tokens,
-        cursor_token: info.cursor_token,
-        width: info.width,
-        height: info.height,
-        stride: info.stride,
-        pixel_format: info.pixel_format,
-        flags: info.flags,
-    })
-}
-
 pub fn present_rect(x: u32, y: u32, w: u32, h: u32) {
     let (x, y, w, h) = {
         let info = INFO.lock();

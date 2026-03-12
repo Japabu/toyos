@@ -171,9 +171,9 @@ pub fn init(ecam_base: u64) {
 
     // Register DMA buffers as shared memory for direct userland access
     let rx_tokens: [u32; 3] = core::array::from_fn(|i| {
-        shared_memory::register(rx_bufs[i], 4096).raw()
+        shared_memory::register(crate::PhysAddr::new(rx_bufs[i]), 4096).raw()
     });
-    let tx_token = shared_memory::register(tx_buf, 4096).raw();
+    let tx_token = shared_memory::register(crate::PhysAddr::new(tx_buf), 4096).raw();
 
     crate::net::set_nic_info(NicInfo {
         rx_buf_tokens: rx_tokens,
