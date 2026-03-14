@@ -52,9 +52,6 @@
 [submodule "userland/errno"]
 	path = userland/errno
 	url = https://github.com/Japabu/rust-errno
-[submodule "toyos-abi"]
-	path = toyos-abi
-	url = https://github.com/Japabu/toyos-abi.git
 [submodule "userland/is_executable"]
 	path = userland/is_executable
 	url = https://github.com/Japabu/is_executable
