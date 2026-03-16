@@ -310,12 +310,6 @@ impl PageFaultTrace {
         }
     }
 
-    #[allow(dead_code)]
-    pub fn push(&mut self, record: PageFaultRecord) {
-        self.entries[self.write_pos] = record;
-        self.write_pos = (self.write_pos + 1) % 32;
-        self.total += 1;
-    }
 
     /// Iterate entries in chronological order (oldest first).
     pub fn iter_chronological(&self) -> impl Iterator<Item = &PageFaultRecord> {
@@ -628,7 +622,7 @@ pub fn setup_combined_tls(
         }
     }
 
-    // TP must be a user-visible address (physical, identity-mapped with USER bit).
+    // TP must be a user-visible physical address (mapped with USER bit in user page tables).
     let block_phys = PhysAddr::from_ptr(block).raw();
     let tp_user = block_phys + (tls_start + total_memsz) as u64;
     // Write self-pointer via kernel direct map
@@ -825,7 +819,7 @@ pub fn build_child_fds(pairs: &[[u32; 2]]) -> FdTable {
     fds
 }
 
-/// User virtual address space starts at 1TB — well above any identity-mapped physical RAM.
+/// User virtual address space starts at 1TB — well above any direct-mapped physical RAM.
 const USER_VM_BASE: u64 = 0x100_0000_0000;
 
 /// Convert an ELF virtual address to a file offset by searching PT_LOAD segments.
@@ -1200,7 +1194,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
     let child_pml4 = child_pml4_addr.as_mut_ptr();
     let child_cr3 = Some(PageTableRoot::new(child_pml4_addr));
 
-    // Map shared libraries (still identity-mapped, eager)
+    // Map shared libraries (physical pages mapped into user address space, eager)
     for lib in &loaded_libs {
         match &lib.memory {
             elf::LibMemory::Owned(alloc) => {
@@ -1218,7 +1212,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
         }
     }
 
-    // 9. Stack (eager, identity-mapped)
+    // 9. Stack (eager, physically contiguous)
     let stack_alloc = match OwnedAlloc::new(USER_STACK_SIZE, PAGE_2M as usize) {
         Some(a) => a,
         None => {
@@ -1909,7 +1903,10 @@ pub fn handle_page_fault(fault_addr: u64, _error_code: u64) -> bool {
 
     // Fill the 2MB page from ALL VMAs that overlap this region.
     // Multiple segments (e.g. .text and .rodata) can share a 2MB range.
+    // If ANY overlapping VMA is writable, map the entire 2MB as writable.
     let region_end_full = region_start + page_2m;
+    let writable = data.vmas.overlapping(UserAddr::new(region_start), UserAddr::new(region_end_full))
+        .any(|v| v.writable);
 
     for vma in data.vmas.overlapping(UserAddr::new(region_start), UserAddr::new(region_end_full)) {
         let vma_s = vma.start.raw();
@@ -1963,8 +1960,8 @@ pub fn handle_page_fault(fault_addr: u64, _error_code: u64) -> bool {
         }
     }
 
-    // Map the 2MB page
-    paging::remap_user_2m_in(pml4, UserAddr::new(region_start), phys);
+    // Map the 2MB page (writable if any overlapping VMA is writable)
+    paging::remap_user_2m(pml4, UserAddr::new(region_start), phys, writable);
     cpu::flush_tlb();
 
     data.demand_allocs.push(alloc);
@@ -2022,7 +2019,7 @@ pub fn dump_crash_diagnostics(fault_addr: u64, rip: u64) {
     let Some(pml4) = pml4 else { return };
 
     // Read a u64 from a user virtual address via page table translation.
-    // Uses the physical address (identity-mapped without USER bit) to avoid SMAP faults.
+    // Reads via the kernel direct map (no USER bit) to avoid SMAP faults.
     let read_user = |virt: u64| -> Option<u64> {
         if virt % 8 != 0 { return None; }
         let phys = paging::virt_to_phys(pml4 as *const u64, UserAddr::new(virt))?;

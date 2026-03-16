@@ -228,7 +228,7 @@ pub(super) extern "sysv64" fn double_fault_entry() {
 // interrupt frame that triggered the chain, recovering the user context if present.
 
 /// Safe kernel memory read for the double fault handler.
-/// Only reads identity-mapped kernel addresses. Returns None for anything suspect.
+/// Only reads kernel direct-map addresses. Returns None for anything suspect.
 fn safe_read_kernel(addr: u64) -> Option<u64> {
     if addr % 8 != 0 || !paging::is_kernel_addr(addr) {
         return None;
@@ -369,7 +369,7 @@ extern "sysv64" fn page_fault_handler(regs: *const SavedRegs) {
     let frame = regs.interrupt_frame();
     let fault_addr = cpu::read_cr2().raw();
 
-    // SMAP violation detection: kernel-mode protection fault on identity-mapped address.
+    // SMAP violation detection: kernel-mode protection fault on a kernel direct-map address.
     // Enable stac immediately so diagnostics don't cascade into another SMAP fault.
     if frame.error_code & PF_PRESENT != 0 && frame.cs & RPL_MASK == 0
         && paging::is_kernel_addr(fault_addr)
@@ -464,7 +464,7 @@ fn log_addr(addr: u64, is_user: bool) {
 
 /// Safely read a u64 from memory. For user addresses, translates through page
 /// tables to avoid triggering demand-paging faults inside exception handlers.
-/// For kernel addresses, reads directly via identity mapping.
+/// For kernel addresses, reads directly via the kernel direct map.
 fn safe_read_u64(addr: u64, user_pml4: *const u64) -> Option<u64> {
     if addr % 8 != 0 || addr == 0 {
         return None;
@@ -533,7 +533,7 @@ extern "sysv64" fn exception_handler(raw_vector: u64, regs: *const SavedRegs) ->
 fn fatal_exception(ctx: &ExceptionContext) -> ! {
     // SMAP: allow kernel access to user pages for diagnostics (backtrace,
     // stack dump). Exception entries don't set AC like syscall entry does,
-    // so identity-mapped user pages would trigger SMAP without this.
+    // so user-accessible pages would trigger SMAP without this.
     // No matching clac — this function never returns (kills process or halts).
     let is_user = ctx.is_user_fault();
     let pml4 = ctx.pml4();

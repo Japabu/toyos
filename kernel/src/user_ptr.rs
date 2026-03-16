@@ -82,8 +82,8 @@ impl<'a> SyscallContext<'a> {
             return None;
         }
         // For slices that may span multiple pages, we need to check that
-        // the physical pages are contiguous. In ToyOS, identity-mapped
-        // allocations (stack, TLS, pipes) ARE contiguous. ELF segments
+        // the physical pages are contiguous. In ToyOS, physically contiguous
+        // 2MB allocations (stack, TLS, pipes) ARE contiguous. ELF segments
         // mapped via demand paging are also contiguous (allocated as
         // contiguous physical blocks).
         let kptr = translate(ptr.raw())?;

@@ -205,7 +205,7 @@ pub fn cleanup_pml4(pml4: *mut u64) {
 }
 
 /// Map a pipe's shared memory into a process's address space.
-/// Returns the physical address (which is the mapping address due to identity mapping).
+/// Returns the physical address (user processes see this as their virtual address).
 pub fn map_into(pipe_id: PipeId, pml4: *mut u64) -> Option<u64> {
     with_pipes_mut(|pipes| {
         let pipe = pipes.get_mut(pipe_id)?;

@@ -244,7 +244,7 @@ pub unsafe fn init(
 }
 
 /// Phase 2: Switch to the buddy + slab allocator.
-/// Called after paging::init() has set up identity mapping (all physical RAM writable).
+/// Called after paging::init() has set up the high-half direct map (all physical RAM writable).
 pub unsafe fn init_buddy(
     entries: &[MemoryMapEntry],
     reserved_regions: &[Region],

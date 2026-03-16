@@ -27,7 +27,6 @@ pub struct Vma {
     /// End virtual address, exclusive (4KB-aligned).
     pub end: UserAddr,
     /// Whether userspace can write to this region.
-    #[allow(dead_code)]
     pub writable: bool,
     /// What backs this region.
     pub kind: VmaKind,

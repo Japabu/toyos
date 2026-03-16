@@ -26,6 +26,17 @@ fn ptr_to_phys(ptr: *mut u64) -> u64 {
 
 const PAGE_4K: u64 = 4096;
 pub const PAGE_2M: u64 = 2 * 1024 * 1024;
+const MIN_PHYS_MAP: u64 = 4 * 1024 * 1024 * 1024; // 4GB minimum (covers MMIO regions)
+
+/// Extract PML4, PDPT, and PD indices from a virtual address.
+#[inline]
+fn page_indices(addr: u64) -> (usize, usize, usize) {
+    (
+        ((addr >> 39) & 0x1FF) as usize,
+        ((addr >> 30) & 0x1FF) as usize,
+        ((addr >> 21) & 0x1FF) as usize,
+    )
+}
 
 /// Round `size` up to the next 2MB boundary.
 pub const fn align_2m(size: usize) -> usize {
@@ -57,7 +68,7 @@ fn free_page(ptr: *mut u64) {
 /// Build kernel page tables: map all physical memory in the high half
 /// (PML4[256+]) using 2MB large pages. No identity map — PML4[0..255] is empty.
 pub fn init(memory_map: &[MemoryMapEntry]) {
-    let mut max_addr: u64 = 4 * 1024 * 1024 * 1024; // 4GB minimum for MMIO
+    let mut max_addr: u64 = MIN_PHYS_MAP;
     for entry in memory_map {
         if entry.end > max_addr {
             max_addr = entry.end;
@@ -70,11 +81,7 @@ pub fn init(memory_map: &[MemoryMapEntry]) {
     // High-half direct map only: physical addr P → virtual addr PHYS_OFFSET + P
     let mut addr: u64 = 0;
     while addr < max_addr {
-        let virt = PHYS_OFFSET + addr;
-        let pml4_idx = ((virt >> 39) & 0x1FF) as usize;
-        let pdpt_idx = ((virt >> 30) & 0x1FF) as usize;
-        let pd_idx = ((virt >> 21) & 0x1FF) as usize;
-
+        let (pml4_idx, pdpt_idx, pd_idx) = page_indices(PHYS_OFFSET + addr);
         let pdpt = unsafe { get_or_create(pml4, pml4_idx, PAGE_PRESENT | PAGE_WRITE) };
         let pd = unsafe { get_or_create(pdpt, pdpt_idx, PAGE_PRESENT | PAGE_WRITE) };
         unsafe {
@@ -161,9 +168,7 @@ pub fn map_user_in(pml4: *mut u64, addr: PhysAddr, size: u64) {
     let end = (raw + size + PAGE_2M - 1) & !(PAGE_2M - 1);
     let mut cur = start;
     while cur < end {
-        let pml4_idx = ((cur >> 39) & 0x1FF) as usize;
-        let pdpt_idx = ((cur >> 30) & 0x1FF) as usize;
-        let pd_idx = ((cur >> 21) & 0x1FF) as usize;
+        let (pml4_idx, pdpt_idx, pd_idx) = page_indices(cur);
         unsafe {
             let pdpt = get_or_create(pml4, pml4_idx, PAGE_PRESENT | PAGE_WRITE | PAGE_USER);
             let pd = get_or_create(pdpt, pdpt_idx, PAGE_PRESENT | PAGE_WRITE | PAGE_USER);
@@ -180,9 +185,7 @@ pub fn map_user_readonly_in(pml4: *mut u64, addr: PhysAddr, size: u64) {
     let end = (raw + size + PAGE_2M - 1) & !(PAGE_2M - 1);
     let mut cur = start;
     while cur < end {
-        let pml4_idx = ((cur >> 39) & 0x1FF) as usize;
-        let pdpt_idx = ((cur >> 30) & 0x1FF) as usize;
-        let pd_idx = ((cur >> 21) & 0x1FF) as usize;
+        let (pml4_idx, pdpt_idx, pd_idx) = page_indices(cur);
         unsafe {
             let pdpt = get_or_create(pml4, pml4_idx, PAGE_PRESENT | PAGE_WRITE | PAGE_USER);
             let pd = get_or_create(pdpt, pdpt_idx, PAGE_PRESENT | PAGE_WRITE | PAGE_USER);
@@ -200,22 +203,26 @@ pub fn map_user(addr: PhysAddr, size: u64) {
     apic::tlb_shootdown();
 }
 
-/// Remap a 2MB-aligned virtual address to point to different physical memory.
+/// Map a 2MB page at `virt_addr` pointing to `phys_addr` in a user PML4.
 /// Creates page table structures on demand. No TLB flush — caller is responsible.
 pub fn remap_user_2m_in(pml4: *mut u64, virt_addr: UserAddr, phys_addr: PhysAddr) -> bool {
+    remap_user_2m(pml4, virt_addr, phys_addr, true)
+}
+
+/// Map a 2MB page at `virt_addr` pointing to `phys_addr` with explicit write control.
+pub fn remap_user_2m(pml4: *mut u64, virt_addr: UserAddr, phys_addr: PhysAddr, writable: bool) -> bool {
     let va = virt_addr.raw();
     if va & (PAGE_2M - 1) != 0 || phys_addr.raw() & (PAGE_2M - 1) != 0 {
         return false;
     }
 
-    let pml4_idx = ((va >> 39) & 0x1FF) as usize;
-    let pdpt_idx = ((va >> 30) & 0x1FF) as usize;
-    let pd_idx = ((va >> 21) & 0x1FF) as usize;
-
+    let (pml4_idx, pdpt_idx, pd_idx) = page_indices(va);
+    let mut flags = PAGE_PRESENT | PAGE_USER | PAGE_SIZE_BIT;
+    if writable { flags |= PAGE_WRITE; }
     unsafe {
         let pdpt = get_or_create(pml4, pml4_idx, PAGE_PRESENT | PAGE_WRITE | PAGE_USER);
         let pd = get_or_create(pdpt, pdpt_idx, PAGE_PRESENT | PAGE_WRITE | PAGE_USER);
-        pd.add(pd_idx).write(phys_addr.raw() | PAGE_PRESENT | PAGE_WRITE | PAGE_USER | PAGE_SIZE_BIT);
+        pd.add(pd_idx).write(phys_addr.raw() | flags);
     }
 
     true
@@ -223,11 +230,7 @@ pub fn remap_user_2m_in(pml4: *mut u64, virt_addr: UserAddr, phys_addr: PhysAddr
 
 /// Clear a 2MB user PDE (unmap the page).
 pub fn clear_user_2m(pml4: *mut u64, virt_addr: UserAddr) {
-    let va = virt_addr.raw();
-    let pml4_idx = ((va >> 39) & 0x1FF) as usize;
-    let pdpt_idx = ((va >> 30) & 0x1FF) as usize;
-    let pd_idx = ((va >> 21) & 0x1FF) as usize;
-
+    let (pml4_idx, pdpt_idx, pd_idx) = page_indices(virt_addr.raw());
     unsafe {
         let pml4e = pml4.add(pml4_idx).read();
         if pml4e & PAGE_PRESENT == 0 { return; }
@@ -249,9 +252,7 @@ pub fn unmap_user(pml4: *mut u64, addr: PhysAddr, size: u64) {
     let end = (raw + size + PAGE_2M - 1) & !(PAGE_2M - 1);
     let mut cur = start;
     while cur < end {
-        let pml4_idx = ((cur >> 39) & 0x1FF) as usize;
-        let pdpt_idx = ((cur >> 30) & 0x1FF) as usize;
-        let pd_idx = ((cur >> 21) & 0x1FF) as usize;
+        let (pml4_idx, pdpt_idx, pd_idx) = page_indices(cur);
         unsafe {
             let pml4e = pml4.add(pml4_idx).read();
             if pml4e & PAGE_PRESENT == 0 { cur += PAGE_2M; continue; }
@@ -277,12 +278,7 @@ pub fn map_kernel(addr: PhysAddr, size: u64) {
     let mut cur = start;
 
     while cur < end {
-        // Map in the high-half direct map: virtual = PHYS_OFFSET + physical
-        let virt = PHYS_OFFSET + cur;
-        let pml4_idx = ((virt >> 39) & 0x1FF) as usize;
-        let pdpt_idx = ((virt >> 30) & 0x1FF) as usize;
-        let pd_idx = ((virt >> 21) & 0x1FF) as usize;
-
+        let (pml4_idx, pdpt_idx, pd_idx) = page_indices(PHYS_OFFSET + cur);
         unsafe {
             let pdpt = get_or_create(pml4, pml4_idx, PAGE_PRESENT | PAGE_WRITE);
             let pd = get_or_create(pdpt, pdpt_idx, PAGE_PRESENT | PAGE_WRITE);
@@ -303,10 +299,7 @@ pub fn map_kernel(addr: PhysAddr, size: u64) {
 /// All user mappings use 2MB pages.
 pub fn virt_to_phys(pml4: *const u64, virt_addr: UserAddr) -> Option<PhysAddr> {
     let va = virt_addr.raw();
-    let pml4_idx = ((va >> 39) & 0x1FF) as usize;
-    let pdpt_idx = ((va >> 30) & 0x1FF) as usize;
-    let pd_idx = ((va >> 21) & 0x1FF) as usize;
-
+    let (pml4_idx, pdpt_idx, pd_idx) = page_indices(va);
     unsafe {
         let pml4e = pml4.add(pml4_idx).read();
         if pml4e & PAGE_PRESENT == 0 { return None; }
