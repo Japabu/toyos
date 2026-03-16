@@ -921,6 +921,80 @@ fn resolve_exe_tpoff(
 
 /// Spawn a new process from an ELF binary using demand paging.
 /// Only reads ELF headers and metadata from disk — PT_LOAD segments are faulted in on access.
+/// Build VMAs for each PT_LOAD segment in the ELF layout.
+fn build_vmas(layout: &elf::ElfLayout, base: u64, block_map: &Arc<Vec<u64>>) -> crate::vma::VmaList {
+    let mut vmas = crate::vma::VmaList::new();
+    for seg in &layout.segments {
+        let seg_start = (base + seg.vaddr) & !0xFFF;
+        let seg_end = (base + seg.vaddr + seg.memsz + 0xFFF) & !0xFFF;
+
+        let file_block_start = seg.file_offset / 4096;
+        let file_blocks_needed = ((seg.filesz + (seg.file_offset % 4096) + 4095) / 4096) as usize;
+        let file_backed_end = seg_start + file_blocks_needed as u64 * 4096;
+
+        if file_blocks_needed > 0 && file_backed_end > seg_start {
+            vmas.insert(crate::vma::Vma {
+                start: UserAddr::new(seg_start),
+                end: UserAddr::new(file_backed_end.min(seg_end)),
+                writable: seg.writable,
+                kind: crate::vma::VmaKind::FileBacked {
+                    block_map: Arc::clone(block_map),
+                    file_offset: file_block_start * 4096,
+                    file_size: seg.filesz + (seg.file_offset % 4096),
+                },
+            });
+        }
+
+        if file_backed_end < seg_end {
+            vmas.insert(crate::vma::Vma {
+                start: UserAddr::new(file_backed_end.max(seg_start)),
+                end: UserAddr::new(seg_end),
+                writable: seg.writable,
+                kind: crate::vma::VmaKind::Anonymous,
+            });
+        }
+    }
+    vmas
+}
+
+/// Build TLS module layout from loaded shared libraries and the exe's TLS segment.
+fn build_tls_layout(
+    loaded_libs: &[elf::LoadedLib],
+    layout: &elf::ElfLayout,
+    exe_tls_template: Option<&OwnedAlloc>,
+) -> (Vec<elf::TlsModule>, usize, usize) {
+    let mut modules = Vec::new();
+    let mut cursor = 0usize;
+    let mut max_align = 1usize;
+
+    for lib in loaded_libs {
+        if lib.tls_memsz > 0 {
+            if cursor > 0 { cursor = (cursor + 15) & !15; }
+            modules.push(elf::TlsModule {
+                template: lib.tls_template, filesz: lib.tls_filesz,
+                memsz: lib.tls_memsz, base_offset: cursor,
+            });
+            cursor += lib.tls_memsz;
+            if lib.tls_align > max_align { max_align = lib.tls_align; }
+        }
+    }
+
+    if layout.tls_memsz > 0 {
+        if cursor > 0 { cursor = (cursor + 15) & !15; }
+        let template_addr = exe_tls_template
+            .map(|buf| KernelAddr::from_ptr(buf.ptr()))
+            .unwrap_or(KernelAddr::null());
+        modules.push(elf::TlsModule {
+            template: template_addr, filesz: layout.tls_filesz,
+            memsz: layout.tls_memsz, base_offset: cursor,
+        });
+        cursor += layout.tls_memsz;
+        if layout.tls_align > max_align { max_align = layout.tls_align; }
+    }
+
+    (modules, cursor, max_align)
+}
+
 pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> Result<Pid, SyscallError> {
     let path = argv[0];
     let t0 = crate::clock::nanos_since_boot();
@@ -966,40 +1040,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
     let base = USER_VM_BASE - layout.vaddr_min;
 
     // 5. Create VMAs for each PT_LOAD segment
-    let mut vmas = crate::vma::VmaList::new();
-    for seg in &layout.segments {
-        let seg_start = (base + seg.vaddr) & !0xFFF;
-        let seg_end = (base + seg.vaddr + seg.memsz + 0xFFF) & !0xFFF;
-
-        // File-backed portion: compute which file blocks back this segment
-        let file_block_start = seg.file_offset / 4096;
-        let file_blocks_needed = ((seg.filesz + (seg.file_offset % 4096) + 4095) / 4096) as usize;
-        let file_backed_end = seg_start + file_blocks_needed as u64 * 4096;
-
-        if file_blocks_needed > 0 && file_backed_end > seg_start {
-            // File-backed region
-            vmas.insert(crate::vma::Vma {
-                start: UserAddr::new(seg_start),
-                end: UserAddr::new(file_backed_end.min(seg_end)),
-                writable: seg.writable,
-                kind: crate::vma::VmaKind::FileBacked {
-                    block_map: Arc::clone(&block_map),
-                    file_offset: file_block_start * 4096,
-                    file_size: seg.filesz + (seg.file_offset % 4096),
-                },
-            });
-        }
-
-        if file_backed_end < seg_end {
-            // BSS / anonymous portion (memsz > filesz)
-            vmas.insert(crate::vma::Vma {
-                start: UserAddr::new(file_backed_end.max(seg_start)),
-                end: UserAddr::new(seg_end),
-                writable: seg.writable,
-                kind: crate::vma::VmaKind::Anonymous,
-            });
-        }
-    }
+    let vmas = build_vmas(&layout, base, &block_map);
 
     // 6. Read and parse relocation tables from block map
     let rela_data = if dyn_info.rela_size > 0 {
@@ -1207,35 +1248,15 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
     let stack_top = stack_base + USER_STACK_SIZE as u64;
     paging::map_user_in(child_pml4, stack_phys, USER_STACK_SIZE as u64);
 
-    // 10. TLS setup
-    let mut tls_modules: Vec<elf::TlsModule> = Vec::new();
-    let mut tls_cursor = 0usize;
-    let mut max_tls_align = 1usize;
-
-    for lib in &loaded_libs {
-        if lib.tls_memsz > 0 {
-            if tls_cursor > 0 {
-                tls_cursor = (tls_cursor + 15) & !15;
-            }
-            tls_modules.push(elf::TlsModule { template: lib.tls_template, filesz: lib.tls_filesz, memsz: lib.tls_memsz, base_offset: tls_cursor });
-            tls_cursor += lib.tls_memsz;
-            if lib.tls_align > max_tls_align { max_tls_align = lib.tls_align; }
-        }
-    }
-
-    // For exe TLS with demand paging: read TLS template data from page cache
+    // 10. TLS setup — read exe TLS template from page cache, build multi-module layout
     let exe_tls_template = if layout.tls_memsz > 0 {
         let tls_file_off = vaddr_to_file_offset(&layout.segments, layout.tls_vaddr);
         let tls_data = read_file_range(&block_map, tls_file_off, layout.tls_filesz);
-        // Allocate a persistent buffer for the TLS template
         let tls_buf = OwnedAlloc::new(layout.tls_memsz, 16).expect("TLS template alloc");
         unsafe {
             core::ptr::copy_nonoverlapping(tls_data.as_ptr(), tls_buf.ptr(), layout.tls_filesz);
-            // Zero BSS portion
             if layout.tls_memsz > layout.tls_filesz {
-                core::ptr::write_bytes(
-                    tls_buf.ptr().add(layout.tls_filesz), 0,
-                    layout.tls_memsz - layout.tls_filesz);
+                core::ptr::write_bytes(tls_buf.ptr().add(layout.tls_filesz), 0, layout.tls_memsz - layout.tls_filesz);
             }
         }
         Some(tls_buf)
@@ -1243,19 +1264,8 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
         None
     };
 
-    if layout.tls_memsz > 0 {
-        if tls_cursor > 0 {
-            tls_cursor = (tls_cursor + 15) & !15;
-        }
-        let template_addr = KernelAddr::from_ptr(exe_tls_template.as_ref().unwrap().ptr());
-        tls_modules.push(elf::TlsModule { template: template_addr, filesz: layout.tls_filesz, memsz: layout.tls_memsz, base_offset: tls_cursor });
-        tls_cursor += layout.tls_memsz;
-        if layout.tls_align > max_tls_align { max_tls_align = layout.tls_align; }
-    }
-    // x86-64 TLS Variant II: the linker (LLD) computes TPOFF = sym_offset - memsz,
-    // using the RAW memsz (not rounded up to alignment). TP must be placed at
-    // data_start + memsz to match. Alignment of data_start is handled in setup_combined_tls.
-    let tls_total_memsz = tls_cursor;
+    let (tls_modules, tls_total_memsz, max_tls_align) =
+        build_tls_layout(&loaded_libs, &layout, exe_tls_template.as_ref());
 
     // Apply TPOFF relocations for shared libraries
     let tls_info = elf::TlsModuleInfo { libs: &loaded_libs, modules: &tls_modules };
