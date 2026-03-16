@@ -340,6 +340,10 @@ type _Opcode = c::c_int;
 #[cfg(target_os = "espidf")]
 type _Opcode = c::c_uint;
 
+// ToyOS uses `unsigned long`.
+#[cfg(target_os = "toyos")]
+type _Opcode = c::c_ulong;
+
 // Windows has `ioctlsocket`, which uses `i32`.
 #[cfg(windows)]
 type _Opcode = i32;
