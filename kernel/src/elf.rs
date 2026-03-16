@@ -27,16 +27,32 @@ const R_X86_64_TPOFF32: u32 = 23;
 /// ELF64 symbol table entry (24 bytes).
 #[derive(Clone, Copy)]
 #[repr(C)]
-struct Elf64Sym {
-    st_name: u32,
-    st_info: u8,
-    st_other: u8,
-    st_shndx: u16,
-    st_value: u64,
-    st_size: u64,
+pub struct Elf64Sym {
+    pub st_name: u32,
+    pub st_info: u8,
+    pub st_other: u8,
+    pub st_shndx: u16,
+    pub st_value: u64,
+    pub st_size: u64,
 }
 
-const SYM_SIZE: u64 = core::mem::size_of::<Elf64Sym>() as u64; // 24
+pub const SYM_SIZE: usize = core::mem::size_of::<Elf64Sym>(); // 24
+
+impl Elf64Sym {
+    /// Parse from a byte slice at the given index. Panics if out of bounds.
+    pub fn from_slice(data: &[u8], index: usize) -> Self {
+        let off = index * SYM_SIZE;
+        unsafe { core::ptr::read_unaligned(data[off..].as_ptr() as *const Self) }
+    }
+
+    /// Look up this symbol's name in a string table byte slice.
+    pub fn name<'a>(&self, strtab: &'a [u8]) -> &'a str {
+        let start = self.st_name as usize;
+        if start >= strtab.len() { return ""; }
+        let len = strtab[start..].iter().position(|&b| b == 0).unwrap_or(strtab.len() - start);
+        core::str::from_utf8(&strtab[start..start + len]).unwrap_or("")
+    }
+}
 
 /// ELF64 relocation entry with addend.
 #[derive(Clone, Copy)]
@@ -696,18 +712,12 @@ pub fn build_exe_sym_map<'a>(
 ) -> hashbrown::HashMap<&'a str, PhysAddr> {
     let mut map = hashbrown::HashMap::with_capacity(sym_count);
     for i in 1..sym_count {
-        let off = i * 24;
-        if off + 24 > dynsym_data.len() { break; }
-        let st_name = u32::from_le_bytes(dynsym_data[off..off + 4].try_into().unwrap()) as usize;
-        let st_shndx = u16::from_le_bytes(dynsym_data[off + 6..off + 8].try_into().unwrap());
-        let st_value = u64::from_le_bytes(dynsym_data[off + 8..off + 16].try_into().unwrap());
-        if st_shndx == 0 { continue; }
-        if st_name >= dynstr_data.len() { continue; }
-        let name_end = dynstr_data[st_name..].iter().position(|&b| b == 0)
-            .unwrap_or(dynstr_data.len() - st_name);
-        let name = core::str::from_utf8(&dynstr_data[st_name..st_name + name_end]).unwrap_or("");
+        if (i + 1) * SYM_SIZE > dynsym_data.len() { break; }
+        let sym = Elf64Sym::from_slice(dynsym_data, i);
+        if sym.st_shndx == 0 { continue; }
+        let name = sym.name(dynstr_data);
         if !name.is_empty() {
-            map.insert(name, base + st_value);
+            map.insert(name, base + sym.st_value);
         }
     }
     map
@@ -756,24 +766,16 @@ pub fn build_symtab_map(
     // Leak the strtab data so we can return &'static str references
     let strtab_leaked: &'static [u8] = alloc::vec::Vec::leak(strtab_data);
 
-    let sym_count = symtab_data.len() / 24;
+    let sym_count = symtab_data.len() / SYM_SIZE;
     let mut map = hashbrown::HashMap::with_capacity(sym_count);
     for i in 1..sym_count {
-        let off = i * 24;
-        if off + 24 > symtab_data.len() { break; }
-        let st_name = u32::from_le_bytes(symtab_data[off..off + 4].try_into().unwrap()) as usize;
-        let st_info = symtab_data[off + 4];
-        let st_shndx = u16::from_le_bytes(symtab_data[off + 6..off + 8].try_into().unwrap());
-        let st_value = u64::from_le_bytes(symtab_data[off + 8..off + 16].try_into().unwrap());
+        let sym = Elf64Sym::from_slice(&symtab_data, i);
         // Only export GLOBAL or WEAK symbols that are defined (st_shndx != 0)
-        let bind = st_info >> 4;
-        if st_shndx == 0 || (bind != 1 && bind != 2) { continue; } // STB_GLOBAL=1, STB_WEAK=2
-        if st_name >= strtab_leaked.len() { continue; }
-        let name_end = strtab_leaked[st_name..].iter().position(|&b| b == 0)
-            .unwrap_or(strtab_leaked.len() - st_name);
-        let name = core::str::from_utf8(&strtab_leaked[st_name..st_name + name_end]).unwrap_or("");
+        let bind = sym.st_info >> 4;
+        if sym.st_shndx == 0 || (bind != 1 && bind != 2) { continue; }
+        let name = sym.name(strtab_leaked);
         if !name.is_empty() {
-            map.insert(name, base + st_value);
+            map.insert(name, base + sym.st_value);
         }
     }
     Some(map)
@@ -810,7 +812,7 @@ pub struct LoadedLib {
 impl LoadedLib {
     /// Read the i-th symbol table entry.
     fn sym(&self, i: usize) -> Elf64Sym {
-        unsafe { (self.dynsym + i as u64 * SYM_SIZE).read_at::<Elf64Sym>(0) }
+        unsafe { self.dynsym.add(i * SYM_SIZE).read_at::<Elf64Sym>(0) }
     }
 
     /// Get the name of the i-th symbol.
@@ -1015,7 +1017,7 @@ pub fn load_shared_lib(data: &[u8]) -> Result<(LoadedLib, u64, u64), &'static st
         if let Some(shdrs) = elf.section_headers() {
             for shdr in shdrs.iter() {
                 if shdr.sh_type == SHT_DYNSYM {
-                    count = (shdr.sh_size / shdr.sh_entsize.max(SYM_SIZE)) as usize;
+                    count = (shdr.sh_size / shdr.sh_entsize.max(SYM_SIZE as u64)) as usize;
                     break;
                 }
             }

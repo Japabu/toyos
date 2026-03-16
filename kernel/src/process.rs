@@ -891,30 +891,17 @@ fn resolve_exe_tpoff(
         return exe_base_offset as i64 + r_addend - total_memsz as i64;
     }
 
-    // Read the dynsym entry for r_sym from block map
     let symtab_file_off = vaddr_to_file_offset(segments, symtab_vaddr);
-    let sym_off = r_sym as usize * 24;
-    let sym_entry = read_file_range(block_map, symtab_file_off + sym_off as u64, 24);
-    if sym_entry.len() < 24 {
+    let sym_data = read_file_range(block_map, symtab_file_off + r_sym as u64 * elf::SYM_SIZE as u64, elf::SYM_SIZE);
+    if sym_data.len() < elf::SYM_SIZE {
         return exe_base_offset as i64 + r_addend - total_memsz as i64;
     }
+    let sym = elf::Elf64Sym::from_slice(&sym_data, 0);
 
-    let st_shndx = u16::from_le_bytes(sym_entry[6..8].try_into().unwrap());
-    let st_value = u64::from_le_bytes(sym_entry[8..16].try_into().unwrap());
-
-    if st_shndx != 0 {
-        // Locally defined TLS symbol
-        exe_base_offset as i64 + st_value as i64 + r_addend - total_memsz as i64
+    if sym.st_shndx != 0 {
+        exe_base_offset as i64 + sym.st_value as i64 + r_addend - total_memsz as i64
     } else {
-        // Cross-library TLS symbol — look up by name
-        let st_name = u32::from_le_bytes(sym_entry[0..4].try_into().unwrap()) as usize;
-        if st_name >= dynstr_data.len() {
-            log!("tpoff: st_name {} out of bounds", st_name);
-            return 0;
-        }
-        let name_end = dynstr_data[st_name..].iter().position(|&b| b == 0)
-            .unwrap_or(dynstr_data.len() - st_name);
-        let sym_name = core::str::from_utf8(&dynstr_data[st_name..st_name + name_end]).unwrap_or("");
+        let sym_name = sym.name(dynstr_data);
 
         // Search loaded libraries for the defining TLS symbol
         for lib in tls_info.libs {
@@ -1134,7 +1121,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
 
             let mut exe_sym_map = if sym_count > 0 {
                 let symtab_file_off = vaddr_to_file_offset(&layout.segments, dyn_info.symtab_vaddr);
-                let dynsym_data = read_file_range(&block_map, symtab_file_off, sym_count * 24);
+                let dynsym_data = read_file_range(&block_map, symtab_file_off, sym_count * elf::SYM_SIZE);
                 elf::build_exe_sym_map(&dynsym_data, &dynstr_data, sym_count, PhysAddr::new(base))
             } else {
                 hashbrown::HashMap::new()
@@ -1161,18 +1148,12 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
             }
 
             // 7c. Resolve exe GLOB_DAT entries against loaded libs → add to reloc index
+            let symtab_file_off = vaddr_to_file_offset(&layout.segments, dyn_info.symtab_vaddr);
             for &(r_offset, r_sym, _r_addend) in &parsed_relas.glob_dat {
                 if r_sym == 0 { continue; }
-                // Look up the symbol name from exe .dynsym/.dynstr
-                let sym_off = r_sym as usize * 24;
-                let symtab_file_off = vaddr_to_file_offset(&layout.segments, dyn_info.symtab_vaddr);
-                let sym_entry = read_file_range(&block_map, symtab_file_off + sym_off as u64, 24);
-                if sym_entry.len() < 24 { continue; }
-                let st_name = u32::from_le_bytes(sym_entry[0..4].try_into().unwrap()) as usize;
-                if st_name >= dynstr_data.len() { continue; }
-                let name_end = dynstr_data[st_name..].iter().position(|&b| b == 0)
-                    .unwrap_or(dynstr_data.len() - st_name);
-                let sym_name = core::str::from_utf8(&dynstr_data[st_name..st_name + name_end]).unwrap_or("");
+                let sym_data = read_file_range(&block_map, symtab_file_off + r_sym as u64 * elf::SYM_SIZE as u64, elf::SYM_SIZE);
+                if sym_data.len() < elf::SYM_SIZE { continue; }
+                let sym_name = elf::Elf64Sym::from_slice(&sym_data, 0).name(&dynstr_data);
                 let resolved = libs.iter().find_map(|lib| elf::gnu_dlsym_pub(lib, sym_name));
                 match resolved {
                     Some(addr) => reloc_index.add_u64(r_offset, addr.raw()),
