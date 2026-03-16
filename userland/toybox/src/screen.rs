@@ -1,5 +1,6 @@
-use std::os::toyos::message::{self, Message};
+use toyos_abi::message;
 use toyos_abi::services;
+use toyos_abi::Pid;
 
 fn compositor_pid() -> u32 {
     services::find("compositor").expect("compositor not running").0
@@ -8,11 +9,10 @@ fn compositor_pid() -> u32 {
 pub fn main(args: Vec<String>) {
     if args.is_empty() {
         // Query current resolution
-        message::send(compositor_pid(), Message::signal(window::MSG_GET_RESOLUTION))
-            .expect("failed to send message");
+        message::signal(Pid(compositor_pid()), window::MSG_GET_RESOLUTION);
         let reply = message::recv();
-        assert_eq!(reply.msg_type(), window::MSG_RESOLUTION_CHANGED);
-        let info: window::ResolutionInfo = reply.take_payload();
+        assert_eq!(reply.msg_type, window::MSG_RESOLUTION_CHANGED);
+        let info: window::ResolutionInfo = reply.payload();
         println!("{}x{}", info.width, info.height);
         return;
     }
@@ -34,10 +34,9 @@ pub fn main(args: Vec<String>) {
     };
 
     let req = window::ResolutionRequest { width, height };
-    message::send(compositor_pid(), Message::new(window::MSG_SET_RESOLUTION, req))
-        .expect("failed to send message");
+    message::send(Pid(compositor_pid()), window::MSG_SET_RESOLUTION, &req);
     let reply = message::recv();
-    assert_eq!(reply.msg_type(), window::MSG_RESOLUTION_CHANGED);
-    let info: window::ResolutionInfo = reply.take_payload();
+    assert_eq!(reply.msg_type, window::MSG_RESOLUTION_CHANGED);
+    let info: window::ResolutionInfo = reply.payload();
     println!("{}x{}", info.width, info.height);
 }

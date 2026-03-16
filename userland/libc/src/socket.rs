@@ -1,4 +1,4 @@
-// BSD sockets — TCP uses pipe-backed connections via netd, UDP uses message IPC.
+// BSD sockets — TCP and UDP use pipe-backed data transfer via netd.
 
 use alloc::alloc::{alloc as heap_alloc, dealloc as heap_dealloc};
 use alloc::vec::Vec;
@@ -275,6 +275,8 @@ pub unsafe extern "C" fn bind(fd: i32, addr: *const Sockaddr, addrlen: SocklenT)
             entry.netd_id = bound.socket_id;
             entry.local_port = bound.bound_port;
             entry.bound = true;
+            entry.tx_fd = bound.tx_fd.0;
+            entry.rx_fd = bound.rx_fd.0;
             0
         }
     }
@@ -431,16 +433,19 @@ pub unsafe extern "C" fn sendto(
                 Some(v) => v,
                 None => { set_errno(EINVAL); return -1; }
             };
-            // Format: [socket_id:4][addr:4][port:2 LE][pad:2][data...]
-            let total = 4 + 4 + 2 + 2 + len;
-            let mut data = Vec::with_capacity(total);
-            data.extend_from_slice(&entry.netd_id.to_le_bytes());
-            data.extend_from_slice(&ip);
-            data.extend_from_slice(&port.to_le_bytes());
-            data.extend_from_slice(&[0u8; 2]); // padding
-            data.extend_from_slice(core::slice::from_raw_parts(buf, len));
-
-            if let Err(_) = send_bytes_to_netd(MSG_UDP_SEND_TO, &data) {
+            // Write data to tx pipe
+            let data = core::slice::from_raw_parts(buf, len);
+            if let Err(_) = syscall::write(Fd(entry.tx_fd), data) {
+                set_errno(EIO);
+                return -1;
+            }
+            // Send control message with metadata
+            if let Err(_) = send_to_netd(MSG_UDP_SEND_TO, &UdpSendToRequest {
+                socket_id: entry.netd_id,
+                addr: ip,
+                port,
+                len: len as u16,
+            }) {
                 set_errno(EIO);
                 return -1;
             }
@@ -482,35 +487,36 @@ pub unsafe extern "C" fn recvfrom(
             recv(fd, buf, len, _flags)
         }
         SocketKind::Udp => {
-            send_to_netd(MSG_UDP_RECV_FROM, &UdpRecvFromRequest {
+            // Send control message requesting data
+            if let Err(_) = send_to_netd(MSG_UDP_RECV_FROM, &UdpRecvFromRequest {
                 socket_id: entry.netd_id,
                 max_len: len as u32,
-            }).ok();
+            }) {
+                set_errno(EIO);
+                return -1;
+            }
             let resp = recv_from_netd();
             if let Err(e) = check_response(&resp) {
                 set_errno(net_err_to_errno(e));
                 return -1;
             }
-            // Response: [addr:4][port:2 LE][pad:2][data...]
-            let data_len = resp.data_len();
-            if data_len < 8 {
-                return 0; // No data
-            }
-            let resp_ptr = resp.data_ptr();
-            let mut remote_ip = [0u8; 4];
-            ptr::copy_nonoverlapping(resp_ptr, remote_ip.as_mut_ptr(), 4);
-            let remote_port = u16::from_le_bytes([*resp_ptr.add(4), *resp_ptr.add(5)]);
+            let recv_resp: UdpRecvResponse = resp.payload();
 
             if !src_addr.is_null() && !addrlen.is_null() {
-                fill_sockaddr(src_addr, addrlen, remote_ip, remote_port);
+                fill_sockaddr(src_addr, addrlen, recv_resp.addr, recv_resp.port);
             }
 
-            let payload_len = data_len - 8;
-            let n = payload_len.min(len);
+            let n = (recv_resp.len as usize).min(len);
             if n > 0 {
-                ptr::copy_nonoverlapping(resp_ptr.add(8), buf, n);
+                // Read data from rx pipe
+                let data = core::slice::from_raw_parts_mut(buf, n);
+                match syscall::read(Fd(entry.rx_fd), data) {
+                    Ok(bytes_read) => bytes_read as isize,
+                    Err(_) => { set_errno(EIO); -1 }
+                }
+            } else {
+                0
             }
-            n as isize
         }
     }
 }
@@ -726,12 +732,11 @@ pub unsafe extern "C" fn getaddrinfo(
         return -1; // EAI_FAIL
     }
 
-    let data_len = resp.data_len();
-    if data_len < 1 {
+    let resp_bytes = resp.bytes();
+    if resp_bytes.is_empty() {
         return -1;
     }
-    let data_ptr = resp.data_ptr();
-    let count = *data_ptr as usize;
+    let count = resp_bytes[0] as usize;
     if count == 0 {
         return -1; // EAI_NONAME
     }
@@ -739,14 +744,14 @@ pub unsafe extern "C" fn getaddrinfo(
     let mut addrs = Vec::new();
     let mut offset = 1usize;
     for _ in 0..count {
-        if offset + 5 > data_len {
+        if offset + 5 > resp_bytes.len() {
             break;
         }
-        let addr_type = *data_ptr.add(offset);
+        let addr_type = resp_bytes[offset];
         offset += 1;
-        if addr_type == 4 && offset + 4 <= data_len {
+        if addr_type == 4 && offset + 4 <= resp_bytes.len() {
             let mut ip = [0u8; 4];
-            ptr::copy_nonoverlapping(data_ptr.add(offset), ip.as_mut_ptr(), 4);
+            ip.copy_from_slice(&resp_bytes[offset..offset + 4]);
             offset += 4;
             addrs.push((ip, 0u16));
         }

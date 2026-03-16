@@ -1,10 +1,9 @@
 use std::collections::HashMap;
-use std::os::fd::AsRawFd;
-use toyos_abi::Fd;
-use std::os::toyos::message::{self, Message};
-use std::os::toyos::device as toyos_device;
-use std::os::toyos::pipe as toyos_pipe;
 use std::time::{Duration, Instant};
+use toyos_abi::{Fd, Pid};
+use toyos_abi::device;
+use toyos_abi::message;
+use toyos_abi::pipe;
 use toyos_abi::poll as toyos_poll;
 use toyos_abi::raw_net as toyos_nic;
 use toyos_abi::services;
@@ -27,17 +26,16 @@ struct DmaNic {
     net_hdr_size: usize,
     mac: [u8; 6],
     pending_rx: Option<(usize, usize)>,
-    _nic_file: std::fs::File,
+    _nic_fd: Fd,
 }
 
 impl DmaNic {
     fn new() -> Self {
-        use std::io::Read;
-
-        let mut nic_file = toyos_device::open_nic().expect("netd: failed to claim NIC device");
+        let nic_fd = device::open_nic().expect("netd: failed to claim NIC device");
 
         let mut info_bytes = [0u8; core::mem::size_of::<toyos_abi::net::NicInfo>()];
-        nic_file.read_exact(&mut info_bytes).expect("netd: failed to read NicInfo");
+        let n = toyos_abi::syscall::read(nic_fd, &mut info_bytes).expect("netd: failed to read NicInfo");
+        assert_eq!(n, info_bytes.len(), "netd: NicInfo size mismatch");
         let info: toyos_abi::net::NicInfo = unsafe { core::ptr::read(info_bytes.as_ptr() as *const _) };
 
         let mut rx_bufs = [core::ptr::null::<u8>(); 3];
@@ -56,7 +54,7 @@ impl DmaNic {
             net_hdr_size: info.net_hdr_size as usize,
             mac: info.mac,
             pending_rx: None,
-            _nic_file: nic_file,
+            _nic_fd: nic_fd,
         }
     }
 
@@ -146,6 +144,11 @@ enum SocketKind {
     Udp(SocketHandle),
 }
 
+struct UdpPipes {
+    tx_read_fd: Fd,
+    rx_write_fd: Fd,
+}
+
 struct PendingUdpRecv {
     client_pid: u32,
     socket_id: u32,
@@ -206,13 +209,6 @@ struct PendingPipedConnect {
     deadline: Option<Instant>,
 }
 
-/// Convert a std::fs::File into an Fd, consuming ownership without running the destructor.
-fn file_into_fd(file: std::fs::File) -> Fd {
-    let fd = Fd(file.as_raw_fd());
-    std::mem::forget(file);
-    fd
-}
-
 fn map_pipe_ring(fd: Fd) -> *const toyos_abi::ring::RingHeader {
     toyos_abi::syscall::pipe_map(fd)
         .expect("pipe_map failed") as *const toyos_abi::ring::RingHeader
@@ -220,7 +216,7 @@ fn map_pipe_ring(fd: Fd) -> *const toyos_abi::ring::RingHeader {
 
 /// Open a pipe by ID and return the fd. `read_end=true` opens for reading, false for writing.
 fn open_pipe_fd(pipe_id: u64, read_end: bool) -> Option<Fd> {
-    toyos_pipe::open_by_id(pipe_id, read_end).ok().map(file_into_fd)
+    pipe::open_by_id(pipe_id, read_end).ok()
 }
 
 /// Open rx (write) and tx (read) pipe fds and create a PipedConnection.
@@ -242,16 +238,6 @@ fn open_piped_connection(handle: SocketHandle, rx_pipe_id: u64, tx_pipe_id: u64)
     })
 }
 
-/// Build a UDP recv response: [addr:4][port:2][pad:2][data:n]
-fn build_udp_recv_response(addr: [u8; 4], port: u16, data: &[u8]) -> Vec<u8> {
-    let mut resp = Vec::with_capacity(8 + data.len());
-    resp.extend_from_slice(&addr);
-    resp.extend_from_slice(&port.to_le_bytes());
-    resp.extend_from_slice(&[0, 0]);
-    resp.extend_from_slice(data);
-    resp
-}
-
 struct NetDaemon {
     sockets: HashMap<u32, SocketKind>,
     owners: HashMap<u32, u32>, // socket_id -> owner pid
@@ -263,6 +249,7 @@ struct NetDaemon {
     piped_connections: Vec<PipedConnection>,
     piped_listeners: HashMap<u32, PipedListener>,
     pending_piped_connects: Vec<PendingPipedConnect>,
+    udp_pipes: HashMap<u32, UdpPipes>,
 }
 
 impl NetDaemon {
@@ -278,6 +265,7 @@ impl NetDaemon {
             piped_connections: Vec::new(),
             piped_listeners: HashMap::new(),
             pending_piped_connects: Vec::new(),
+            udp_pipes: HashMap::new(),
         }
     }
 
@@ -294,17 +282,17 @@ impl NetDaemon {
     }
 
     fn send_error(pid: u32, code: u32) {
-        message::send(pid, Message::new(MSG_ERROR, ErrorResponse { code })).ok();
+        message::send(Pid(pid), MSG_ERROR, &ErrorResponse { code });
     }
 
     fn handle_message(
         &mut self,
-        msg: Message,
+        msg: message::Message,
         socket_set: &mut SocketSet<'_>,
         iface: &mut Interface,
     ) {
-        let sender = msg.sender();
-        match msg.msg_type() {
+        let sender = msg.sender;
+        match msg.msg_type {
             MSG_TCP_CLOSE => self.handle_tcp_close(sender, msg, socket_set),
             MSG_TCP_SHUTDOWN => self.handle_tcp_shutdown(sender, msg, socket_set),
             MSG_UDP_BIND => self.handle_udp_bind(sender, msg, socket_set),
@@ -323,8 +311,8 @@ impl NetDaemon {
         }
     }
 
-    fn handle_tcp_close(&mut self, sender: u32, msg: Message, socket_set: &mut SocketSet<'_>) {
-        let req: SocketCloseRequest = msg.take_payload();
+    fn handle_tcp_close(&mut self, sender: u32, msg: message::Message, socket_set: &mut SocketSet<'_>) {
+        let req: SocketCloseRequest = msg.payload();
         if let Some(kind) = self.sockets.remove(&req.socket_id) {
             match kind {
                 SocketKind::TcpStream(handle) => {
@@ -344,20 +332,24 @@ impl NetDaemon {
                 SocketKind::Udp(handle) => {
                     socket_set.get_mut::<udp::Socket>(handle).close();
                     socket_set.remove(handle);
+                    if let Some(pipes) = self.udp_pipes.remove(&req.socket_id) {
+                        toyos_abi::syscall::close(pipes.tx_read_fd);
+                        toyos_abi::syscall::close(pipes.rx_write_fd);
+                    }
                 }
             }
             self.owners.remove(&req.socket_id);
         }
-        message::send(sender, Message::signal(MSG_RESULT)).ok();
+        message::signal(Pid(sender), MSG_RESULT);
     }
 
     fn handle_tcp_shutdown(
         &mut self,
         sender: u32,
-        msg: Message,
+        msg: message::Message,
         socket_set: &mut SocketSet<'_>,
     ) {
-        let req: TcpShutdownRequest = msg.take_payload();
+        let req: TcpShutdownRequest = msg.payload();
         let Some(SocketKind::TcpStream(handle)) = self.sockets.get(&req.socket_id) else {
             Self::send_error(sender, ERR_NOT_CONNECTED);
             return;
@@ -366,17 +358,28 @@ impl NetDaemon {
         if req.how == 1 || req.how == 2 {
             socket.close();
         }
-        message::send(sender, Message::signal(MSG_RESULT)).ok();
+        message::signal(Pid(sender), MSG_RESULT);
     }
 
     fn handle_udp_bind(
         &mut self,
         sender: u32,
-        msg: Message,
+        msg: message::Message,
         socket_set: &mut SocketSet<'_>,
     ) {
-        let req: UdpBindRequest = msg.take_payload();
+        let req: UdpBindRequest = msg.payload();
         let port = if req.port == 0 { self.alloc_port() } else { req.port };
+
+        // Open pipe fds from client-provided pipe IDs
+        let Some(tx_read_fd) = open_pipe_fd(req.tx_pipe_id, true) else {
+            Self::send_error(sender, ERR_INVALID_INPUT);
+            return;
+        };
+        let Some(rx_write_fd) = open_pipe_fd(req.rx_pipe_id, false) else {
+            toyos_abi::syscall::close(tx_read_fd);
+            Self::send_error(sender, ERR_INVALID_INPUT);
+            return;
+        };
 
         let rx_buf = udp::PacketBuffer::new(
             vec![udp::PacketMetadata::EMPTY; 16],
@@ -389,6 +392,8 @@ impl NetDaemon {
         let mut socket = udp::Socket::new(rx_buf, tx_buf);
         let endpoint = IpEndpoint::new(IpAddress::Ipv4(Ipv4Addr::from(req.addr)), port);
         if socket.bind(endpoint).is_err() {
+            toyos_abi::syscall::close(tx_read_fd);
+            toyos_abi::syscall::close(rx_write_fd);
             Self::send_error(sender, ERR_ADDR_IN_USE);
             return;
         }
@@ -397,46 +402,57 @@ impl NetDaemon {
         let socket_id = self.alloc_id();
         self.sockets.insert(socket_id, SocketKind::Udp(handle));
         self.owners.insert(socket_id, sender);
+        self.udp_pipes.insert(socket_id, UdpPipes { tx_read_fd, rx_write_fd });
 
-        message::send(sender, Message::new(MSG_RESULT, UdpBindResponse {
+        message::send(Pid(sender), MSG_RESULT, &UdpBindResponse {
             socket_id,
             bound_port: port,
             _pad: 0,
-        })).ok();
+        });
     }
 
     fn handle_udp_send_to(
         &mut self,
         sender: u32,
-        msg: Message,
+        msg: message::Message,
         socket_set: &mut SocketSet<'_>,
     ) {
-        let bytes = msg.take_bytes();
-        if bytes.len() < 12 {
-            Self::send_error(sender, ERR_INVALID_INPUT);
-            return;
-        }
-        let socket_id = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-        let addr = Ipv4Addr::new(bytes[4], bytes[5], bytes[6], bytes[7]);
-        let port = u16::from_le_bytes([bytes[8], bytes[9]]);
-        let data = &bytes[12..];
+        let req: UdpSendToRequest = msg.payload();
 
-        let Some(SocketKind::Udp(handle)) = self.sockets.get(&socket_id) else {
+        let Some(SocketKind::Udp(handle)) = self.sockets.get(&req.socket_id) else {
             Self::send_error(sender, ERR_NOT_CONNECTED);
             return;
         };
-        let socket = socket_set.get_mut::<udp::Socket>(*handle);
-        let endpoint = IpEndpoint::new(IpAddress::Ipv4(addr), port);
-        match socket.send_slice(data, endpoint) {
+        let handle = *handle;
+
+        let Some(pipes) = self.udp_pipes.get(&req.socket_id) else {
+            Self::send_error(sender, ERR_NOT_CONNECTED);
+            return;
+        };
+
+        // Read data from client's tx pipe
+        let mut buf = vec![0u8; req.len as usize];
+        let n = match toyos_abi::syscall::read(pipes.tx_read_fd, &mut buf) {
+            Ok(n) => n,
+            Err(_) => {
+                Self::send_error(sender, ERR_OTHER);
+                return;
+            }
+        };
+
+        let addr = Ipv4Addr::from(req.addr);
+        let endpoint = IpEndpoint::new(IpAddress::Ipv4(addr), req.port);
+        let socket = socket_set.get_mut::<udp::Socket>(handle);
+        match socket.send_slice(&buf[..n], endpoint) {
             Ok(()) => {
-                let sent = data.len() as u32;
-                message::send(sender, Message::new(MSG_RESULT, sent)).ok();
+                let sent = n as u32;
+                message::send(Pid(sender), MSG_RESULT, &sent);
             }
             Err(_) => Self::send_error(sender, ERR_OTHER),
         }
     }
 
-    fn send_udp_recv_response(pid: u32, socket: &mut udp::Socket, max_len: u32) -> bool {
+    fn send_udp_recv_response(pid: u32, socket: &mut udp::Socket, max_len: u32, rx_write_fd: Fd) -> bool {
         if !socket.can_recv() {
             return false;
         }
@@ -446,8 +462,14 @@ impl NetDaemon {
                 let addr = match endpoint.endpoint.addr {
                     IpAddress::Ipv4(a) => a.octets(),
                 };
-                let resp = build_udp_recv_response(addr, endpoint.endpoint.port, &buf[..n]);
-                message::send(pid, Message::from_bytes(MSG_RESULT, &resp)).ok();
+                // Write data to client's rx pipe
+                let _ = toyos_abi::syscall::write(rx_write_fd, &buf[..n]);
+                // Send metadata in control message
+                message::send(Pid(pid), MSG_RESULT, &UdpRecvResponse {
+                    addr,
+                    port: endpoint.endpoint.port,
+                    len: n as u16,
+                });
             }
             Err(_) => Self::send_error(pid, ERR_OTHER),
         }
@@ -457,17 +479,23 @@ impl NetDaemon {
     fn handle_udp_recv_from(
         &mut self,
         sender: u32,
-        msg: Message,
+        msg: message::Message,
         socket_set: &mut SocketSet<'_>,
     ) {
-        let req: UdpRecvFromRequest = msg.take_payload();
+        let req: UdpRecvFromRequest = msg.payload();
         let Some(SocketKind::Udp(handle)) = self.sockets.get(&req.socket_id) else {
             Self::send_error(sender, ERR_NOT_CONNECTED);
             return;
         };
-        let socket = socket_set.get_mut::<udp::Socket>(*handle);
+        let handle = *handle;
+        let Some(pipes) = self.udp_pipes.get(&req.socket_id) else {
+            Self::send_error(sender, ERR_NOT_CONNECTED);
+            return;
+        };
+        let rx_write_fd = pipes.rx_write_fd;
+        let socket = socket_set.get_mut::<udp::Socket>(handle);
 
-        if Self::send_udp_recv_response(sender, socket, req.max_len) {
+        if Self::send_udp_recv_response(sender, socket, req.max_len, rx_write_fd) {
             return;
         }
 
@@ -479,24 +507,28 @@ impl NetDaemon {
         });
     }
 
-    fn handle_udp_close(&mut self, sender: u32, msg: Message, socket_set: &mut SocketSet<'_>) {
-        let req: SocketCloseRequest = msg.take_payload();
+    fn handle_udp_close(&mut self, sender: u32, msg: message::Message, socket_set: &mut SocketSet<'_>) {
+        let req: SocketCloseRequest = msg.payload();
         if let Some(SocketKind::Udp(handle)) = self.sockets.remove(&req.socket_id) {
             socket_set.get_mut::<udp::Socket>(handle).close();
             socket_set.remove(handle);
             self.owners.remove(&req.socket_id);
+            if let Some(pipes) = self.udp_pipes.remove(&req.socket_id) {
+                toyos_abi::syscall::close(pipes.tx_read_fd);
+                toyos_abi::syscall::close(pipes.rx_write_fd);
+            }
         }
-        message::send(sender, Message::signal(MSG_RESULT)).ok();
+        message::signal(Pid(sender), MSG_RESULT);
     }
 
     fn handle_dns_lookup(
         &mut self,
         sender: u32,
-        msg: Message,
+        msg: message::Message,
         socket_set: &mut SocketSet<'_>,
         iface: &mut Interface,
     ) {
-        let hostname = msg.take_bytes();
+        let hostname = msg.bytes().to_vec();
         let hostname = match std::str::from_utf8(&hostname) {
             Ok(s) => s,
             Err(_) => {
@@ -510,7 +542,7 @@ impl NetDaemon {
             let mut resp = vec![1u8];
             resp.push(4);
             resp.extend_from_slice(&octets);
-            message::send(sender, Message::from_bytes(MSG_RESULT, &resp)).ok();
+            message::send_bytes(Pid(sender), MSG_RESULT, &resp);
             return;
         }
 
@@ -529,10 +561,10 @@ impl NetDaemon {
     fn handle_tcp_set_option(
         &mut self,
         sender: u32,
-        msg: Message,
+        msg: message::Message,
         socket_set: &mut SocketSet<'_>,
     ) {
-        let req: SocketOptionRequest = msg.take_payload();
+        let req: SocketOptionRequest = msg.payload();
         let Some(SocketKind::TcpStream(handle)) = self.sockets.get(&req.socket_id) else {
             Self::send_error(sender, ERR_NOT_CONNECTED);
             return;
@@ -541,7 +573,7 @@ impl NetDaemon {
         match req.option {
             OPT_NODELAY => {
                 socket.set_nagle_enabled(req.value == 0);
-                message::send(sender, Message::signal(MSG_RESULT)).ok();
+                message::signal(Pid(sender), MSG_RESULT);
             }
             _ => Self::send_error(sender, ERR_INVALID_INPUT),
         }
@@ -550,10 +582,10 @@ impl NetDaemon {
     fn handle_tcp_get_option(
         &mut self,
         sender: u32,
-        msg: Message,
+        msg: message::Message,
         socket_set: &mut SocketSet<'_>,
     ) {
-        let req: SocketOptionRequest = msg.take_payload();
+        let req: SocketOptionRequest = msg.payload();
         let Some(SocketKind::TcpStream(handle)) = self.sockets.get(&req.socket_id) else {
             Self::send_error(sender, ERR_NOT_CONNECTED);
             return;
@@ -562,7 +594,7 @@ impl NetDaemon {
         match req.option {
             OPT_NODELAY => {
                 let val = if socket.nagle_enabled() { 0u32 } else { 1u32 };
-                message::send(sender, Message::new(MSG_RESULT, SocketOptionResponse { value: val })).ok();
+                message::send(Pid(sender), MSG_RESULT, &SocketOptionResponse { value: val });
             }
             _ => Self::send_error(sender, ERR_INVALID_INPUT),
         }
@@ -573,11 +605,11 @@ impl NetDaemon {
     fn handle_tcp_connect_piped(
         &mut self,
         sender: u32,
-        msg: Message,
+        msg: message::Message,
         socket_set: &mut SocketSet<'_>,
         iface: &mut Interface,
     ) {
-        let req: TcpConnectPipedRequest = msg.take_payload();
+        let req: TcpConnectPipedRequest = msg.payload();
         let remote = IpEndpoint::new(
             IpAddress::Ipv4(Ipv4Addr::from(req.addr)),
             req.port,
@@ -616,10 +648,10 @@ impl NetDaemon {
     fn handle_tcp_bind_piped(
         &mut self,
         sender: u32,
-        msg: Message,
+        msg: message::Message,
         socket_set: &mut SocketSet<'_>,
     ) {
-        let req: TcpBindPipedRequest = msg.take_payload();
+        let req: TcpBindPipedRequest = msg.payload();
         let port = if req.port == 0 { self.alloc_port() } else { req.port };
 
         let rx_buf = tcp::SocketBuffer::new(vec![0u8; 65536]);
@@ -646,20 +678,20 @@ impl NetDaemon {
             notified: false,
         });
 
-        message::send(sender, Message::new(MSG_RESULT, TcpBindResponse {
+        message::send(Pid(sender), MSG_RESULT, &TcpBindResponse {
             socket_id,
             bound_port: port,
             _pad: 0,
-        })).ok();
+        });
     }
 
     fn handle_tcp_accept_piped(
         &mut self,
         sender: u32,
-        msg: Message,
+        msg: message::Message,
         socket_set: &mut SocketSet<'_>,
     ) {
-        let req: TcpAcceptPipedRequest = msg.take_payload();
+        let req: TcpAcceptPipedRequest = msg.payload();
         let Some(listener) = self.piped_listeners.get(&req.socket_id) else {
             Self::send_error(sender, ERR_NOT_CONNECTED);
             return;
@@ -701,12 +733,12 @@ impl NetDaemon {
             pl.notified = false;
         }
 
-        message::send(sender, Message::new(MSG_RESULT, TcpAcceptPipedResponse {
+        message::send(Pid(sender), MSG_RESULT, &TcpAcceptPipedResponse {
             socket_id: stream_id,
             remote_addr,
             remote_port: remote.port,
             local_port,
-        })).ok();
+        });
     }
 
     /// Bridge data between smoltcp sockets and kernel pipes for piped connections.
@@ -783,10 +815,16 @@ impl NetDaemon {
                 continue;
             };
             let handle = *handle;
+            let Some(pipes) = self.udp_pipes.get(&pr.socket_id) else {
+                Self::send_error(pr.client_pid, ERR_NOT_CONNECTED);
+                self.pending_udp_recvs.swap_remove(i);
+                continue;
+            };
+            let rx_write_fd = pipes.rx_write_fd;
             let socket = socket_set.get_mut::<udp::Socket>(handle);
             let client = pr.client_pid;
             let max_len = pr.max_len;
-            if Self::send_udp_recv_response(client, socket, max_len) {
+            if Self::send_udp_recv_response(client, socket, max_len, rx_write_fd) {
                 self.pending_udp_recvs.swap_remove(i);
                 continue;
             }
@@ -815,7 +853,7 @@ impl NetDaemon {
                             }
                         }
                     }
-                    message::send(pd.client_pid, Message::from_bytes(MSG_RESULT, &resp)).ok();
+                    message::send_bytes(Pid(pd.client_pid), MSG_RESULT, &resp);
                     self.pending_dns.swap_remove(i);
                     continue;
                 }
@@ -850,7 +888,7 @@ impl NetDaemon {
                     local_port,
                     _pad: 0,
                 };
-                message::send(pc.client_pid, Message::new(MSG_RESULT, resp)).ok();
+                message::send(Pid(pc.client_pid), MSG_RESULT, &resp);
                 self.pending_piped_connects.swap_remove(i);
                 continue;
             }

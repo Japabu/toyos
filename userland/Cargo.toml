@@ -15,6 +15,7 @@ members = [
     "proctest",
     "shell",
     "snake",
+    "soundd",
     "sprite",
     "sshd",
     "terminal",

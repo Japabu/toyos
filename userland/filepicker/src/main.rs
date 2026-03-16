@@ -1,7 +1,8 @@
-use filepicker_api::{FilePickerRequest, PickerMode, MSG_FILEPICKER_REQUEST, MSG_FILEPICKER_RESULT};
+use filepicker_api::{PickerMode, MSG_FILEPICKER_REQUEST, MSG_FILEPICKER_RESULT};
 use font::Font;
 use std::fs;
-use std::os::toyos::message::{self, Message};
+use toyos_abi::message;
+use toyos_abi::Pid;
 use toyos_abi::services;
 use std::path::{Path, PathBuf};
 use window::{Color, Event, Framebuffer, KeyEvent, MouseEvent, Window};
@@ -436,15 +437,11 @@ fn run_picker(mode: PickerMode, start_dir: &str, client_pid: u32) {
 
         match result {
             PickerResult::Pick(path) => {
-                message::send(
-                    client_pid,
-                    Message::from_bytes(MSG_FILEPICKER_RESULT, path.as_bytes()),
-                )
-                .ok();
+                message::send_bytes(Pid(client_pid), MSG_FILEPICKER_RESULT, path.as_bytes());
                 return;
             }
             PickerResult::Cancel => {
-                message::send(client_pid, Message::from_bytes(MSG_FILEPICKER_RESULT, &[])).ok();
+                message::send_bytes(Pid(client_pid), MSG_FILEPICKER_RESULT, &[]);
                 return;
             }
             PickerResult::Continue => {}
@@ -464,21 +461,18 @@ fn main() {
 
     loop {
         let msg = message::recv();
-        if msg.msg_type() != MSG_FILEPICKER_REQUEST {
+        if msg.msg_type != MSG_FILEPICKER_REQUEST {
             continue;
         }
 
-        let client_pid = msg.sender();
-        let req: FilePickerRequest = msg.take_payload();
-
-        let mode = if req.mode == PickerMode::Save as u8 {
+        let client_pid = msg.sender;
+        let data = msg.bytes();
+        let mode = if data[0] == PickerMode::Save as u8 {
             PickerMode::Save
         } else {
             PickerMode::Open
         };
-
-        let dir_len = req.start_dir_len as usize;
-        let start_dir = std::str::from_utf8(&req.start_dir[..dir_len]).unwrap_or("/");
+        let start_dir = core::str::from_utf8(&data[1..]).unwrap_or("/");
 
         run_picker(mode, start_dir, client_pid);
     }

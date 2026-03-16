@@ -7,7 +7,7 @@
 #![no_std]
 
 use core::sync::atomic::{AtomicU32, Ordering};
-use toyos_abi::message::{self, ReceivedMessage};
+use toyos_abi::message::{self, Message};
 use toyos_abi::{Fd, Pid};
 use toyos_abi::syscall;
 
@@ -129,6 +129,8 @@ pub struct UdpBindRequest {
     pub addr: [u8; 4],
     pub port: u16,
     pub _pad: u16,
+    pub tx_pipe_id: u64,
+    pub rx_pipe_id: u64,
 }
 
 #[repr(C)]
@@ -141,9 +143,26 @@ pub struct UdpBindResponse {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+pub struct UdpSendToRequest {
+    pub socket_id: u32,
+    pub addr: [u8; 4],
+    pub port: u16,
+    pub len: u16,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 pub struct UdpRecvFromRequest {
     pub socket_id: u32,
     pub max_len: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct UdpRecvResponse {
+    pub addr: [u8; 4],
+    pub port: u16,
+    pub len: u16,
 }
 
 #[repr(C)]
@@ -227,6 +246,8 @@ pub struct TcpAccepted {
 pub struct UdpBound {
     pub socket_id: u32,
     pub bound_port: u16,
+    pub tx_fd: Fd,
+    pub rx_fd: Fd,
 }
 
 // ---------------------------------------------------------------------------
@@ -266,16 +287,16 @@ pub fn send_bytes_to_netd(msg_type: u32, data: &[u8]) -> Result<(), NetError> {
     Ok(())
 }
 
-pub fn recv_from_netd() -> ReceivedMessage {
+pub fn recv_from_netd() -> Message {
     message::recv()
 }
 
-pub fn check_response(msg: &ReceivedMessage) -> Result<(), NetError> {
-    if msg.msg_type() == MSG_ERROR {
+pub fn check_response(msg: &Message) -> Result<(), NetError> {
+    if msg.msg_type == MSG_ERROR {
         let err: ErrorResponse = msg.payload();
         return Err(NetError::from_error_code(err.code));
     }
-    if msg.msg_type() != MSG_RESULT {
+    if msg.msg_type != MSG_RESULT {
         return Err(NetError::UnexpectedResponse);
     }
     Ok(())
@@ -436,14 +457,40 @@ pub fn tcp_get_option(socket_id: u32, option: u32) -> Result<u32, NetError> {
 // ---------------------------------------------------------------------------
 
 pub fn udp_bind(addr: [u8; 4], port: u16) -> Result<UdpBound, NetError> {
-    let resp: UdpBindResponse = request(MSG_UDP_BIND, &UdpBindRequest {
+    let tx_pipe = syscall::pipe();
+    let rx_pipe = syscall::pipe();
+
+    let tx_pipe_id = syscall::pipe_id(tx_pipe.read).map_err(|_| NetError::Syscall)?;
+    let rx_pipe_id = syscall::pipe_id(rx_pipe.write).map_err(|_| NetError::Syscall)?;
+
+    send_to_netd(MSG_UDP_BIND, &UdpBindRequest {
         addr,
         port,
         _pad: 0,
+        tx_pipe_id,
+        rx_pipe_id,
     })?;
+    let msg = recv_from_netd();
+
+    if let Err(e) = check_response(&msg) {
+        syscall::close(tx_pipe.read);
+        syscall::close(tx_pipe.write);
+        syscall::close(rx_pipe.read);
+        syscall::close(rx_pipe.write);
+        return Err(e);
+    }
+
+    let resp: UdpBindResponse = msg.payload();
+
+    // Close the ends netd opened via pipe_open
+    syscall::close(tx_pipe.read);
+    syscall::close(rx_pipe.write);
+
     Ok(UdpBound {
         socket_id: resp.socket_id,
         bound_port: resp.bound_port,
+        tx_fd: tx_pipe.write,
+        rx_fd: rx_pipe.read,
     })
 }
 

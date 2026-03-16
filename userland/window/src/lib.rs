@@ -2,9 +2,10 @@ pub mod framebuffer;
 
 pub use framebuffer::{Color, Framebuffer};
 
-use std::os::toyos::message::{self, Message};
+use toyos_abi::message::{self, Message};
 use toyos_abi::poll;
 use toyos_abi::services;
+use toyos_abi::Pid;
 use toyos_abi::shm::SharedMemory;
 use std::sync::OnceLock;
 
@@ -40,7 +41,19 @@ pub const MSG_CLIPBOARD_PASTE: u32 = 6;
 pub const MSG_FRAME: u32 = 7;
 pub const MSG_RESOLUTION_CHANGED: u32 = 8;
 
+// Shared-memory clipboard (for payloads > 116 bytes)
+pub const MSG_CLIPBOARD_SET_SHM: u32 = 10;
+pub const MSG_CLIPBOARD_PASTE_SHM: u32 = 11;
+
 #[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ClipboardShmMsg {
+    pub token: u32,
+    pub len: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 pub struct ResolutionRequest {
     pub width: u32,
     pub height: u32,
@@ -54,6 +67,7 @@ pub struct ResolutionInfo {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct CreateWindowRequest {
     pub width: u32,
     pub height: u32,
@@ -79,6 +93,7 @@ pub struct MouseEvent {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct WindowInfo {
     pub token: u32,
     pub width: u32,
@@ -88,6 +103,7 @@ pub struct WindowInfo {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct ResizeInfo {
     pub token: u32,
     pub old_token: u32,
@@ -134,12 +150,27 @@ pub enum Event {
 
 /// Set the system clipboard contents.
 pub fn clipboard_set(text: &str) {
-    message::send(compositor_pid(), Message::from_bytes(MSG_CLIPBOARD_SET, text.as_bytes())).ok();
+    use std::sync::Mutex;
+    static CLIPBOARD_SHM: Mutex<Option<SharedMemory>> = Mutex::new(None);
+
+    let bytes = text.as_bytes();
+    if bytes.len() <= message::MAX_PAYLOAD {
+        message::send_bytes(Pid(compositor_pid()), MSG_CLIPBOARD_SET, bytes);
+    } else {
+        let mut shm = SharedMemory::allocate(bytes.len());
+        shm.as_mut_slice()[..bytes.len()].copy_from_slice(bytes);
+        message::send(
+            Pid(compositor_pid()),
+            MSG_CLIPBOARD_SET_SHM,
+            &ClipboardShmMsg { token: shm.token(), len: bytes.len() as u32 },
+        );
+        *CLIPBOARD_SHM.lock().unwrap() = Some(shm);
+    }
 }
 
 /// Request a cursor style for the current window.
 pub fn set_cursor(style: u8) {
-    message::send(compositor_pid(), Message::new(MSG_SET_CURSOR, style as u32)).ok();
+    message::send(Pid(compositor_pid()), MSG_SET_CURSOR, &(style as u32));
 }
 
 pub struct Window {
@@ -176,12 +207,11 @@ impl Window {
         let len = bytes.len().min(30);
         req.title[..len].copy_from_slice(&bytes[..len]);
         req.title_len = len as u8;
-        message::send(compositor_pid(), Message::new(MSG_CREATE_WINDOW, req))
-            .expect("compositor not running");
+        message::send(Pid(compositor_pid()), MSG_CREATE_WINDOW, &req);
 
         let response = message::recv();
-        assert_eq!(response.msg_type(), MSG_WINDOW_CREATED, "unexpected message from compositor");
-        let info: WindowInfo = response.take_payload();
+        assert_eq!(response.msg_type, MSG_WINDOW_CREATED, "unexpected message from compositor");
+        let info: WindowInfo = response.payload();
         let buf_size = info.stride as usize * info.height as usize * 4;
         let shm = SharedMemory::map(info.token, buf_size);
 
@@ -210,11 +240,11 @@ impl Window {
     }
 
     fn decode_event(&mut self, msg: Message) -> Event {
-        match msg.msg_type() {
-            MSG_KEY_INPUT => Event::KeyInput(msg.take_payload()),
-            MSG_MOUSE_INPUT => Event::MouseInput(msg.take_payload()),
+        match msg.msg_type {
+            MSG_KEY_INPUT => Event::KeyInput(msg.payload()),
+            MSG_MOUSE_INPUT => Event::MouseInput(msg.payload()),
             MSG_WINDOW_RESIZED => {
-                let info: ResizeInfo = msg.take_payload();
+                let info: ResizeInfo = msg.payload();
                 let buf_size = info.stride as usize * info.height as usize * 4;
                 self.shm = SharedMemory::map(info.token, buf_size);
                 self.width = info.width;
@@ -222,7 +252,13 @@ impl Window {
                 self.pixel_format = info.pixel_format;
                 Event::Resized
             }
-            MSG_CLIPBOARD_PASTE => Event::ClipboardPaste(msg.take_bytes()),
+            MSG_CLIPBOARD_PASTE => Event::ClipboardPaste(msg.bytes().to_vec()),
+            MSG_CLIPBOARD_PASTE_SHM => {
+                let info: ClipboardShmMsg = msg.payload();
+                let shm = SharedMemory::map(info.token, info.len as usize);
+                let data = shm.as_slice()[..info.len as usize].to_vec();
+                Event::ClipboardPaste(data)
+            }
             MSG_WINDOW_CLOSE => Event::Close,
             MSG_FRAME => Event::Frame,
             other => panic!("unknown window event type: {other}"),
@@ -231,7 +267,7 @@ impl Window {
 
     /// Notify the compositor that the buffer has been updated.
     pub fn present(&self) {
-        message::send(compositor_pid(), Message::signal(MSG_PRESENT)).ok();
+        message::signal(Pid(compositor_pid()), MSG_PRESENT);
     }
 
     pub fn width(&self) -> u32 {
@@ -264,6 +300,6 @@ impl std::fmt::Debug for Window {
 
 impl Drop for Window {
     fn drop(&mut self) {
-        message::send(compositor_pid(), Message::signal(MSG_DESTROY_WINDOW)).ok();
+        message::signal(Pid(compositor_pid()), MSG_DESTROY_WINDOW);
     }
 }

@@ -1,0 +1,6 @@
+[package]
+name = "soundd"
+edition = "2024"
+
+[dependencies]
+toyos-abi = { path = "../../toyos-abi" }

@@ -1,13 +1,9 @@
-use std::fs::File;
-use std::io::Read;
-use std::os::fd::AsRawFd;
-use std::os::toyos::message::{self, Message};
-use std::os::toyos::device;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
 use toyos_abi::shm::SharedMemory;
-use toyos_abi::{gpu, poll, services, system, FramebufferInfo};
+use toyos_abi::{gpu, poll, services, system, FramebufferInfo, Fd, Pid};
+use toyos_abi::{device, message, syscall};
 use window::{Color, Framebuffer};
 
 const TITLE_BAR_HEIGHT: usize = 28;
@@ -56,9 +52,9 @@ const LAUNCHER_APPS: &[LauncherEntry] = &[
 
 const FLAG_HARDWARE_CURSOR: u32 = 1 << 0;
 
-fn read_fb_info(file: &mut File) -> FramebufferInfo {
+fn read_fb_info(fd: Fd) -> FramebufferInfo {
     let mut buf = [0u8; std::mem::size_of::<FramebufferInfo>()];
-    let n = file.read(&mut buf).expect("failed to read framebuffer info");
+    let n = syscall::read(fd, &mut buf).expect("failed to read framebuffer info");
     assert_eq!(n, buf.len(), "failed to read framebuffer info");
     unsafe { std::ptr::read(buf.as_ptr() as *const FramebufferInfo) }
 }
@@ -152,19 +148,17 @@ fn resize_window(win: &mut WindowState, new_w: usize, new_h: usize, pixel_format
     win.buf_width = new_w;
     win.buf_height = new_h;
     message::send(
-        win.pid,
-        Message::new(
-            window::MSG_WINDOW_RESIZED,
-            window::ResizeInfo {
-                token,
-                old_token,
-                width: new_w as u32,
-                height: new_h as u32,
-                stride: new_w as u32,
-                pixel_format,
-            },
-        ),
-    ).ok();
+        Pid(win.pid),
+        window::MSG_WINDOW_RESIZED,
+        &window::ResizeInfo {
+            token,
+            old_token,
+            width: new_w as u32,
+            height: new_h as u32,
+            stride: new_w as u32,
+            pixel_format,
+        },
+    );
 }
 
 fn save_if_normal(win: &mut WindowState) {
@@ -654,11 +648,11 @@ fn draw_software_cursor(screen: &Framebuffer, sprite: &sprite::Sprite, cx: i32, 
 fn main() {
     services::register("compositor").expect("compositor already running");
 
-    let mut kb_file = device::open_keyboard().expect("failed to claim keyboard");
-    let mut mouse_file = device::open_mouse().expect("failed to claim mouse");
-    let mut fb_file = device::open_framebuffer().expect("failed to claim framebuffer");
+    let kb_fd = device::open_keyboard().expect("failed to claim keyboard");
+    let mouse_fd = device::open_mouse().expect("failed to claim mouse");
+    let fb_fd = device::open_framebuffer().expect("failed to claim framebuffer");
 
-    let mut fb_info = read_fb_info(&mut fb_file);
+    let mut fb_info = read_fb_info(fb_fd);
     let fb_size = fb_info.stride as usize * fb_info.height as usize * 4;
     let mut fb_shm = SharedMemory::map(fb_info.token[0], fb_size);
     let mut screen = Framebuffer::new(
@@ -756,7 +750,7 @@ fn main() {
         loop {
             let timeout = if waited { Duration::from_nanos(1) } else { FRAME_INTERVAL };
             let ready = poll::poll_timeout(
-                &[kb_file.as_raw_fd() as u64, mouse_file.as_raw_fd() as u64],
+                &[kb_fd.0 as u64, mouse_fd.0 as u64],
                 Some(timeout.as_nanos() as u64),
             );
 
@@ -773,7 +767,7 @@ fn main() {
                     std::mem::size_of_val(&events),
                 )
             };
-            let n = kb_file.read(buf).unwrap_or(0);
+            let n = syscall::read(kb_fd, buf).unwrap_or(0);
             for event in &events[..n / std::mem::size_of::<window::KeyEvent>()] {
                 if launcher_open && event.pressed() && event.keycode == 0x29 {
                     // Escape: close launcher
@@ -845,26 +839,42 @@ fn main() {
                             0x14 => {
                                 // GUI+Q: close focused window
                                 let win = windows.remove(idx);
-                                message::send(win.pid, Message::signal(window::MSG_WINDOW_CLOSE)).ok();
+                                message::signal(Pid(win.pid), window::MSG_WINDOW_CLOSE);
                             }
                             0x19 => {
                                 // GUI+V: paste clipboard
                                 if !clipboard.is_empty() {
-                                    message::send(
-                                        windows[idx].pid,
-                                        Message::from_bytes(
+                                    if clipboard.len() <= message::MAX_PAYLOAD {
+                                        message::send_bytes(
+                                            Pid(windows[idx].pid),
                                             window::MSG_CLIPBOARD_PASTE,
                                             clipboard.as_bytes(),
-                                        ),
-                                    ).ok();
+                                        );
+                                    } else {
+                                        static PASTE_SHM: std::sync::Mutex<Option<SharedMemory>> =
+                                            std::sync::Mutex::new(None);
+                                        let mut shm = SharedMemory::allocate(clipboard.len());
+                                        shm.as_mut_slice()[..clipboard.len()]
+                                            .copy_from_slice(clipboard.as_bytes());
+                                        message::send(
+                                            Pid(windows[idx].pid),
+                                            window::MSG_CLIPBOARD_PASTE_SHM,
+                                            &window::ClipboardShmMsg {
+                                                token: shm.token(),
+                                                len: clipboard.len() as u32,
+                                            },
+                                        );
+                                        *PASTE_SHM.lock().unwrap() = Some(shm);
+                                    }
                                 }
                             }
                             _ => {
                                 // Forward other GUI combos to focused app
                                 message::send(
-                                    windows[idx].pid,
-                                    Message::new(window::MSG_KEY_INPUT, *event),
-                                ).ok();
+                                    Pid(windows[idx].pid),
+                                    window::MSG_KEY_INPUT,
+                                    event,
+                                );
                             }
                         }
                         mark_dirty(&mut dirty_rect, DirtyRect::full(screen_w as usize, screen_h as usize));
@@ -875,9 +885,10 @@ fn main() {
                 } else {
                     if let Some(idx) = focused_window_idx(&windows) {
                         message::send(
-                            windows[idx].pid,
-                            Message::new(window::MSG_KEY_INPUT, *event),
-                        ).ok();
+                            Pid(windows[idx].pid),
+                            window::MSG_KEY_INPUT,
+                            event,
+                        );
                     }
                 }
             }
@@ -886,7 +897,7 @@ fn main() {
         if ready.fd(1) {
             // Drain all pending mouse events in one read
             let mut buf = [0u8; 512];
-            let n = mouse_file.read(&mut buf).unwrap_or(0);
+            let n = syscall::read(mouse_fd, &mut buf).unwrap_or(0);
             let event_count = n / 4;
 
             // Accumulate deltas and track button transitions
@@ -978,7 +989,7 @@ fn main() {
                     match hit_test(&windows, cursor_x, cursor_y, screen_h, launcher_open) {
                         HitZone::CloseButton(idx) => {
                             let win = windows.remove(idx);
-                            message::send(win.pid, Message::signal(window::MSG_WINDOW_CLOSE)).ok();
+                            message::signal(Pid(win.pid), window::MSG_WINDOW_CLOSE);
                             mark_dirty(&mut dirty_rect, DirtyRect::full(screen_w as usize, screen_h as usize));
                         }
                         HitZone::MinimizeButton(idx) => {
@@ -1057,9 +1068,10 @@ fn main() {
                             let win = &windows[new_idx];
                             let ev = make_mouse_event(win, window::MOUSE_PRESS, 1, 0);
                             message::send(
-                                win.pid,
-                                Message::new(window::MSG_MOUSE_INPUT, ev),
-                            ).ok();
+                                Pid(win.pid),
+                                window::MSG_MOUSE_INPUT,
+                                &ev,
+                            );
                         }
                         HitZone::TaskbarItem(idx) => {
                             if idx < windows.len() {
@@ -1097,9 +1109,10 @@ fn main() {
                     if let Some(idx) = focused_window_idx(&windows) {
                         let ev = make_mouse_event(&windows[idx], window::MOUSE_RELEASE, 1, 0);
                         message::send(
-                            windows[idx].pid,
-                            Message::new(window::MSG_MOUSE_INPUT, ev),
-                        ).ok();
+                            Pid(windows[idx].pid),
+                            window::MSG_MOUSE_INPUT,
+                            &ev,
+                        );
                     }
                     match interaction {
                         Interaction::DragPending { .. } => {
@@ -1215,9 +1228,10 @@ fn main() {
                                     0,
                                 );
                                 message::send(
-                                    windows[idx].pid,
-                                    Message::new(window::MSG_MOUSE_INPUT, ev),
-                                ).ok();
+                                    Pid(windows[idx].pid),
+                                    window::MSG_MOUSE_INPUT,
+                                    &ev,
+                                );
                             }
                         }
                     }
@@ -1233,9 +1247,10 @@ fn main() {
                             let ev =
                                 make_mouse_event(&windows[idx], window::MOUSE_SCROLL, 0, clamped_scroll);
                             message::send(
-                                windows[idx].pid,
-                                Message::new(window::MSG_MOUSE_INPUT, ev),
-                            ).ok();
+                                Pid(windows[idx].pid),
+                                window::MSG_MOUSE_INPUT,
+                                &ev,
+                            );
                         }
                     }
                 }
@@ -1246,10 +1261,10 @@ fn main() {
 
         if ready.messages() {
             let msg = message::recv();
-            let sender = msg.sender();
-            match msg.msg_type() {
+            let sender = msg.sender;
+            match msg.msg_type {
                 window::MSG_CREATE_WINDOW => {
-                    let req: window::CreateWindowRequest = msg.take_payload();
+                    let req: window::CreateWindowRequest = msg.payload();
                     let title = if req.title_len > 0 {
                         let len = (req.title_len as usize).min(30);
                         String::from_utf8_lossy(&req.title[..len]).into_owned()
@@ -1315,18 +1330,16 @@ fn main() {
                     });
 
                     message::send(
-                        sender,
-                        Message::new(
-                            window::MSG_WINDOW_CREATED,
-                            window::WindowInfo {
-                                token,
-                                width: content_w as u32,
-                                height: content_h as u32,
-                                stride: content_w as u32,
-                                pixel_format,
-                            },
-                        ),
-                    ).ok();
+                        Pid(sender),
+                        window::MSG_WINDOW_CREATED,
+                        &window::WindowInfo {
+                            token,
+                            width: content_w as u32,
+                            height: content_h as u32,
+                            stride: content_w as u32,
+                            pixel_format,
+                        },
+                    );
                     mark_dirty(&mut dirty_rect, DirtyRect::full(screen_w, screen_h));
                 }
                 window::MSG_PRESENT => {
@@ -1342,17 +1355,22 @@ fn main() {
                     }
                 }
                 window::MSG_CLIPBOARD_SET => {
-                    let bytes = msg.take_bytes();
+                    let bytes = msg.bytes().to_vec();
                     clipboard = String::from_utf8_lossy(&bytes).into_owned();
                 }
+                window::MSG_CLIPBOARD_SET_SHM => {
+                    let info: window::ClipboardShmMsg = msg.payload();
+                    let shm = SharedMemory::map(info.token, info.len as usize);
+                    clipboard = String::from_utf8_lossy(&shm.as_slice()[..info.len as usize]).into_owned();
+                }
                 window::MSG_SET_CURSOR => {
-                    let style: u32 = msg.take_payload();
+                    let style: u32 = msg.payload();
                     if let Some(win) = windows.iter_mut().find(|w| w.pid == sender) {
                         win.cursor_style = style as u8;
                     }
                 }
                 window::MSG_SET_RESOLUTION => {
-                    let req: window::ResolutionRequest = msg.take_payload();
+                    let req: window::ResolutionRequest = msg.payload();
                     match gpu::set_resolution(req.width, req.height) {
                         Ok(new_fb_info) => {
                             fb_info = new_fb_info;
@@ -1408,7 +1426,7 @@ fn main() {
                                 width: fb_info.width,
                                 height: fb_info.height,
                             };
-                            message::send(sender, Message::new(window::MSG_RESOLUTION_CHANGED, reply)).ok();
+                            message::send(Pid(sender), window::MSG_RESOLUTION_CHANGED, &reply);
                         }
                         Err(_) => {
                             // Resolution change not supported — reply with current
@@ -1416,7 +1434,7 @@ fn main() {
                                 width: fb_info.width,
                                 height: fb_info.height,
                             };
-                            message::send(sender, Message::new(window::MSG_RESOLUTION_CHANGED, reply)).ok();
+                            message::send(Pid(sender), window::MSG_RESOLUTION_CHANGED, &reply);
                         }
                     }
                 }
@@ -1425,7 +1443,7 @@ fn main() {
                         width: fb_info.width,
                         height: fb_info.height,
                     };
-                    message::send(sender, Message::new(window::MSG_RESOLUTION_CHANGED, reply)).ok();
+                    message::send(Pid(sender), window::MSG_RESOLUTION_CHANGED, &reply);
                 }
                 _ => {}
             }
@@ -1485,7 +1503,7 @@ fn main() {
                 // Send frame callbacks to windows that presented and were composited
                 for win in windows.iter_mut() {
                     if win.presented && !win.minimized && rect.overlaps(window_screen_rect(win)) {
-                        message::send(win.pid, Message::signal(window::MSG_FRAME)).ok();
+                        message::signal(Pid(win.pid), window::MSG_FRAME);
                         win.presented = false;
                     }
                 }
@@ -1493,7 +1511,8 @@ fn main() {
                 // Reap windows whose processes have exited
                 let count_before = windows.len();
                 windows.retain(|win| {
-                    message::send(win.pid, Message::signal(window::MSG_FRAME)).is_ok()
+                    message::signal(Pid(win.pid), window::MSG_FRAME);
+                    true
                 });
                 if windows.len() != count_before {
                     mark_dirty(&mut dirty_rect, DirtyRect::full(screen_w as usize, screen_h as usize));
