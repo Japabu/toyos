@@ -80,9 +80,20 @@ impl PciDevice {
         self.mmio.read_u32(offset)
     }
 
-    /// Read a 64-bit Base Address Register by index (0–5).
+    /// Read a Base Address Register by index (0–5).
+    /// Handles both 32-bit and 64-bit BARs correctly.
     pub fn read_bar_64(&self, index: u8) -> u64 {
-        self.mmio.read_u64(BAR_BASE + index as u64 * 4) & !0xF
+        let offset = BAR_BASE + index as u64 * 4;
+        let low = self.mmio.read_u32(offset) as u64;
+        let bar_type = (low >> 1) & 0x3;
+        if bar_type == 2 {
+            // 64-bit BAR: combine low and high 32-bit registers
+            let high = self.mmio.read_u32(offset + 4) as u64;
+            ((high << 32) | low) & !0xF
+        } else {
+            // 32-bit BAR
+            low & !0xF
+        }
     }
 
     pub fn write_config_u16(&self, offset: u64, val: u16) {

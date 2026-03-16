@@ -2,7 +2,7 @@ use core::mem::size_of;
 use core::ptr::{read_volatile, write_volatile, write_bytes};
 
 use crate::log;
-use super::{Mmio, Trb, TrbRing, XhciController, dma_page, RING_SIZE};
+use super::{Mmio, Trb, TrbRing, XhciController, dma_phys, dma_ptr, RING_SIZE};
 use super::{TRB_ENABLE_SLOT, TRB_ADDRESS_DEVICE, TRB_CONFIGURE_EP, TRB_LINK};
 use super::{OP_PORT_BASE, PORT_REG_SIZE, PORTSC_CCS, PORTSC_PED, PORTSC_PR, PORTSC_PRC, PORTSC_RW1C};
 use super::hid::{HidType, HidDevice};
@@ -93,9 +93,9 @@ fn output_ctx_page(slot_id: u8) -> usize {
 }
 
 /// Parse the configuration descriptor for a HID boot-protocol interface.
-fn parse_hid_config(data_buf: u64) -> Option<HidInterfaceInfo> {
+fn parse_hid_config(data_buf: *const u8) -> Option<HidInterfaceInfo> {
     unsafe {
-        let buf = data_buf as *const u8;
+        let buf = data_buf;
         let config = &*(buf as *const UsbConfigDescriptor);
         let total_len = (config.w_total_length as usize).min(256);
         let config_val = config.b_configuration_value;
@@ -196,31 +196,32 @@ pub fn init_device(ctrl: &mut XhciController, op_base: &Mmio, port_idx: u8) {
     ctrl.reset_ep0_ring();
 
     // Address Device
-    let input_ctx = dma_page(5);
-    unsafe { write_bytes(input_ctx as *mut u8, 0, 4096); }
+    let input_ctx_ptr = dma_ptr(5);
+    let input_ctx_phys = dma_phys(5);
+    unsafe { write_bytes(input_ctx_ptr, 0, 4096); }
 
-    ctrl.write_ctx32(input_ctx, 0, 1, 0x3); // Add Slot + EP0
+    ctrl.write_ctx32(input_ctx_ptr, 0, 1, 0x3); // Add Slot + EP0
     let slot_dw0 = ((speed as u32) << 20) | (1u32 << 27);
-    ctrl.write_ctx32(input_ctx, 1, 0, slot_dw0);
-    ctrl.write_ctx32(input_ctx, 1, 1, (port_idx as u32 + 1) << 16);
+    ctrl.write_ctx32(input_ctx_ptr, 1, 0, slot_dw0);
+    ctrl.write_ctx32(input_ctx_ptr, 1, 1, (port_idx as u32 + 1) << 16);
 
     let max_packet = max_packet_for_speed(speed);
     let ep0_dw1 = (3u32 << 1) | (4u32 << 3) | ((max_packet as u32) << 16);
-    ctrl.write_ctx32(input_ctx, 2, 1, ep0_dw1);
-    let ep0_dequeue = dma_page(6) | 1;
-    ctrl.write_ctx32(input_ctx, 2, 2, ep0_dequeue as u32);
-    ctrl.write_ctx32(input_ctx, 2, 3, (ep0_dequeue >> 32) as u32);
-    ctrl.write_ctx32(input_ctx, 2, 4, 8);
+    ctrl.write_ctx32(input_ctx_ptr, 2, 1, ep0_dw1);
+    let ep0_dequeue = dma_phys(6) | 1;
+    ctrl.write_ctx32(input_ctx_ptr, 2, 2, ep0_dequeue as u32);
+    ctrl.write_ctx32(input_ctx_ptr, 2, 3, (ep0_dequeue >> 32) as u32);
+    ctrl.write_ctx32(input_ctx_ptr, 2, 4, 8);
 
-    let output_ctx = dma_page(output_ctx_page(slot_id));
-    unsafe { write_bytes(output_ctx as *mut u8, 0, 4096); }
+    let output_ctx_page = output_ctx_page(slot_id);
+    unsafe { write_bytes(dma_ptr(output_ctx_page), 0, 4096); }
     unsafe {
-        let dcbaa = dma_page(0) as *mut u64;
-        write_volatile(dcbaa.add(slot_id as usize), output_ctx);
+        let dcbaa = dma_ptr(0) as *mut u64;
+        write_volatile(dcbaa.add(slot_id as usize), dma_phys(output_ctx_page));
     }
 
     let mut addr_dev = Trb::ZERO;
-    addr_dev.param = input_ctx;
+    addr_dev.param = input_ctx_phys;
     addr_dev.control = TRB_ADDRESS_DEVICE | ((slot_id as u32) << 24);
     ctrl.submit_command(addr_dev);
     let (code, _) = ctrl.wait_command();
@@ -231,29 +232,30 @@ pub fn init_device(ctrl: &mut XhciController, op_base: &Mmio, port_idx: u8) {
     log!("xHCI: device addressed");
 
     // GET_DESCRIPTOR (Device)
-    let data_buf = dma_page(8);
-    unsafe { write_bytes(data_buf as *mut u8, 0, 256); }
-    let code = ctrl.control_transfer(0x80, 0x06, 0x0100, 0, Some(data_buf), 18);
+    let data_buf_ptr = dma_ptr(8);
+    let data_buf_phys = dma_phys(8);
+    unsafe { write_bytes(data_buf_ptr, 0, 256); }
+    let code = ctrl.control_transfer(0x80, 0x06, 0x0100, 0, Some(data_buf_phys), 18);
     if code != 1 && code != 13 {
         log!("xHCI: GET_DESCRIPTOR(Device) failed, code={}", code);
         return;
     }
 
     let (dev_class, vendor_id, product_id) = unsafe {
-        let desc = &*(data_buf as *const UsbDeviceDescriptor);
+        let desc = &*(data_buf_ptr as *const UsbDeviceDescriptor);
         (desc.b_device_class, desc.id_vendor, desc.id_product)
     };
     log!("xHCI: device class={:#x} vendor={:04x} product={:04x}", dev_class, vendor_id, product_id);
 
     // GET_DESCRIPTOR (Configuration)
-    unsafe { write_bytes(data_buf as *mut u8, 0, 256); }
-    let code = ctrl.control_transfer(0x80, 0x06, 0x0200, 0, Some(data_buf), 256);
+    unsafe { write_bytes(data_buf_ptr, 0, 256); }
+    let code = ctrl.control_transfer(0x80, 0x06, 0x0200, 0, Some(data_buf_phys), 256);
     if code != 1 && code != 13 {
         log!("xHCI: GET_DESCRIPTOR(Config) failed, code={}", code);
         return;
     }
 
-    let info = match parse_hid_config(data_buf) {
+    let info = match parse_hid_config(data_buf_ptr) {
         Some(i) => i,
         None => {
             log!("xHCI: no HID boot interface found, skipping");
@@ -285,28 +287,31 @@ pub fn init_device(ctrl: &mut XhciController, op_base: &Mmio, port_idx: u8) {
     }
 
     // Choose interrupt ring and report buffer based on device type
-    let (int_ring_page, report_buf) = match info.protocol {
-        HidType::Keyboard => (7, dma_page(8) + 512),
-        HidType::Mouse => (11, dma_page(8) + 1024),
+    let (int_ring_page, report_buf_offset): (usize, usize) = match info.protocol {
+        HidType::Keyboard => (7, 512),
+        HidType::Mouse => (11, 1024),
     };
+    let report_phys = dma_phys(8) + report_buf_offset as u64;
+    let report_ptr = unsafe { dma_ptr(8).add(report_buf_offset) };
 
     // Set up interrupt ring link TRB
-    let int_ring_ptr = dma_page(int_ring_page) as *mut Trb;
-    unsafe { write_bytes(int_ring_ptr as *mut u8, 0, 4096); }
+    let int_ring_ptr = dma_ptr(int_ring_page) as *mut Trb;
+    unsafe { write_bytes(dma_ptr(int_ring_page), 0, 4096); }
     let mut int_link = Trb::ZERO;
-    int_link.param = dma_page(int_ring_page);
+    int_link.param = dma_phys(int_ring_page);
     int_link.control = TRB_LINK | (1 << 1);
     unsafe { write_volatile(int_ring_ptr.add(RING_SIZE - 1), int_link); }
 
     // Configure Endpoint
-    let input_ctx = dma_page(5);
-    unsafe { write_bytes(input_ctx as *mut u8, 0, 4096); }
+    let input_ctx_ptr = dma_ptr(5);
+    let input_ctx_phys = dma_phys(5);
+    unsafe { write_bytes(input_ctx_ptr, 0, 4096); }
 
-    ctrl.write_ctx32(input_ctx, 0, 1, (1u32 << (int_ep_dci as u32)) | 1);
+    ctrl.write_ctx32(input_ctx_ptr, 0, 1, (1u32 << (int_ep_dci as u32)) | 1);
 
     let slot_dw0 = ((speed as u32) << 20) | ((int_ep_dci as u32) << 27);
-    ctrl.write_ctx32(input_ctx, 1, 0, slot_dw0);
-    ctrl.write_ctx32(input_ctx, 1, 1, (port_idx as u32 + 1) << 16);
+    ctrl.write_ctx32(input_ctx_ptr, 1, 0, slot_dw0);
+    ctrl.write_ctx32(input_ctx_ptr, 1, 1, (port_idx as u32 + 1) << 16);
 
     let ep_ctx_index = int_ep_dci as usize + 1;
     let interval_val = if info.ep_interval == 0 { 0u32 } else if speed <= 2 {
@@ -318,18 +323,18 @@ pub fn init_device(ctrl: &mut XhciController, op_base: &Mmio, port_idx: u8) {
     } else {
         (info.ep_interval - 1) as u32
     };
-    ctrl.write_ctx32(input_ctx, ep_ctx_index, 0, interval_val << 16);
+    ctrl.write_ctx32(input_ctx_ptr, ep_ctx_index, 0, interval_val << 16);
 
     let ep_dw1 = (3u32 << 1) | (7u32 << 3) | ((info.ep_max_packet as u32) << 16);
-    ctrl.write_ctx32(input_ctx, ep_ctx_index, 1, ep_dw1);
+    ctrl.write_ctx32(input_ctx_ptr, ep_ctx_index, 1, ep_dw1);
 
-    let int_dequeue = dma_page(int_ring_page) | 1;
-    ctrl.write_ctx32(input_ctx, ep_ctx_index, 2, int_dequeue as u32);
-    ctrl.write_ctx32(input_ctx, ep_ctx_index, 3, (int_dequeue >> 32) as u32);
-    ctrl.write_ctx32(input_ctx, ep_ctx_index, 4, 8);
+    let int_dequeue = dma_phys(int_ring_page) | 1;
+    ctrl.write_ctx32(input_ctx_ptr, ep_ctx_index, 2, int_dequeue as u32);
+    ctrl.write_ctx32(input_ctx_ptr, ep_ctx_index, 3, (int_dequeue >> 32) as u32);
+    ctrl.write_ctx32(input_ctx_ptr, ep_ctx_index, 4, 8);
 
     let mut config_ep = Trb::ZERO;
-    config_ep.param = input_ctx;
+    config_ep.param = input_ctx_phys;
     config_ep.control = TRB_CONFIGURE_EP | ((slot_id as u32) << 24);
     ctrl.submit_command(config_ep);
     let (code, _) = ctrl.wait_command();
@@ -347,8 +352,9 @@ pub fn init_device(ctrl: &mut XhciController, op_base: &Mmio, port_idx: u8) {
     let mut dev = HidDevice {
         slot_id,
         int_ep_dci,
-        int_ring: TrbRing::new(int_ring_ptr, dma_page(int_ring_page)),
-        report_buf,
+        int_ring: TrbRing::new(int_ring_ptr, dma_phys(int_ring_page)),
+        report_phys,
+        report_ptr,
         report_size,
         hid_type: info.protocol,
     };

@@ -21,8 +21,13 @@ impl<const N: usize> DmaPool<N> {
         Self { pages: [[0; 4096]; N] }
     }
 
-    pub fn page_addr(&self, index: usize) -> u64 {
-        self.pages[index].as_ptr() as u64
+    /// Physical address of a DMA page (for device descriptors and registers).
+    pub fn page_phys(&self, index: usize) -> u64 {
+        self.pages[index].as_ptr() as u64 - crate::PHYS_OFFSET
     }
 
+    /// Virtual pointer to a DMA page (for kernel read/write).
+    pub fn page_ptr(&self, index: usize) -> *mut u8 {
+        self.pages[index].as_ptr() as *mut u8
+    }
 }

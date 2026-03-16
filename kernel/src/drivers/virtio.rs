@@ -132,7 +132,8 @@ impl VirtioPciConfig {
 
 /// A VirtIO split virtqueue backed by a single DMA page.
 pub struct Virtqueue {
-    base: u64,
+    base_phys: u64,
+    base_virt: *mut u8,
     next_desc: u16,
     last_used_idx: u16,
     notify_offset: u16,
@@ -148,20 +149,27 @@ pub enum BufDir {
 
 impl Virtqueue {
     /// Create a new virtqueue backed by the given DMA page.
-    /// The page is zeroed and laid out with desc/avail/used regions.
-    pub fn new(dma_page_addr: u64) -> Self {
-        unsafe { write_bytes(dma_page_addr as *mut u8, 0, 4096); }
+    /// `phys` is the physical address (for device registers), `virt` is the kernel pointer.
+    pub fn new(phys: u64, virt: *mut u8) -> Self {
+        unsafe { write_bytes(virt, 0, 4096); }
         Self {
-            base: dma_page_addr,
+            base_phys: phys,
+            base_virt: virt,
             next_desc: 0,
             last_used_idx: 0,
             notify_offset: 0,
         }
     }
 
-    fn descs(&self) -> *mut VirtqDesc { (self.base + DESC_OFFSET) as *mut VirtqDesc }
-    fn avail(&self) -> *mut VirtqAvail { (self.base + AVAIL_OFFSET) as *mut VirtqAvail }
-    fn used(&self) -> *const VirtqUsed { (self.base + USED_OFFSET) as *const VirtqUsed }
+    /// Virtual pointers for kernel read/write access.
+    fn descs(&self) -> *mut VirtqDesc { unsafe { self.base_virt.add(DESC_OFFSET as usize) as *mut VirtqDesc } }
+    fn avail(&self) -> *mut VirtqAvail { unsafe { self.base_virt.add(AVAIL_OFFSET as usize) as *mut VirtqAvail } }
+    fn used(&self) -> *const VirtqUsed { unsafe { self.base_virt.add(USED_OFFSET as usize) as *const VirtqUsed } }
+
+    /// Physical addresses for device register programming.
+    fn descs_phys(&self) -> u64 { self.base_phys + DESC_OFFSET }
+    fn avail_phys(&self) -> u64 { self.base_phys + AVAIL_OFFSET }
+    fn used_phys(&self) -> u64 { self.base_phys + USED_OFFSET }
 
     /// Submit a descriptor chain and notify the device (non-blocking).
     /// Returns the first descriptor index of the chain.
@@ -328,9 +336,9 @@ impl VirtioDevice {
         assert!(max_size >= QUEUE_SIZE, "VirtIO: queue {} too small (max={})", index, max_size);
         common.write_u16(COMMON_QUEUE_SIZE, QUEUE_SIZE);
 
-        common.write_u64(COMMON_QUEUE_DESC, queue.descs() as u64);
-        common.write_u64(COMMON_QUEUE_DRIVER, queue.avail() as u64);
-        common.write_u64(COMMON_QUEUE_DEVICE, queue.used() as u64);
+        common.write_u64(COMMON_QUEUE_DESC, queue.descs_phys());
+        common.write_u64(COMMON_QUEUE_DRIVER, queue.avail_phys());
+        common.write_u64(COMMON_QUEUE_DEVICE, queue.used_phys());
 
         queue.notify_offset = common.read_u16(COMMON_QUEUE_NOTIFY_OFF);
 

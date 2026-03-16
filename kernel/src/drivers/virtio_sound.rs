@@ -5,6 +5,8 @@ use super::virtio::{BufDir, Virtqueue, VirtioDevice, VIRTIO_F_VERSION_1};
 use super::DmaPool;
 use crate::log;
 use crate::sync::Lock;
+use crate::{shared_memory, PhysAddr};
+use toyos_abi::audio::AudioInfo;
 
 // VirtIO sound PCI identity
 const VIRTIO_VENDOR: u16 = 0x1AF4;
@@ -29,20 +31,30 @@ const VIRTIO_SND_PCM_RATE_44100: u8 = 6;
 const VIRTIO_SND_PCM_RATE_48000: u8 = 7;
 
 // DMA page assignments
+//   0: control queue
+//   1: event queue
+//   2: TX queue
+//   3: control request/response buffers
+//   4: TX xfer headers + status structs (kernel-only, not shared)
+//   5-9: TX data pages (shared with soundd for direct DMA writes)
 const PAGE_CONTROLQ: usize = 0;
 const PAGE_EVENTQ: usize = 1;
 const PAGE_TXQ: usize = 2;
 const PAGE_CTRL_BUFS: usize = 3;
-const PAGE_TX_BUFS: usize = 4; // 5 pages: 4..8
-const PAGE_TX_STATUS: usize = 9;
+const PAGE_TX_META: usize = 4;
+const PAGE_TX_DATA: usize = 5; // 5 pages: 5..9
 
 const REQ_OFFSET: usize = 0x000;
 const RESP_OFFSET: usize = 0x800;
 
 static DMA: Lock<DmaPool<10>> = Lock::new(DmaPool::new());
 
-fn dma_addr(page: usize) -> u64 {
-    DMA.lock().page_addr(page)
+fn dma_phys(page: usize) -> u64 {
+    DMA.lock().page_phys(page)
+}
+
+fn dma_ptr(page: usize) -> *mut u8 {
+    DMA.lock().page_ptr(page)
 }
 
 // ---- VirtIO sound structs (per VirtIO 1.2 spec, section 5.14) ----
@@ -115,16 +127,32 @@ struct VirtioSndPcmStatus {
 /// Each uses 3 descriptors from the 16-slot virtqueue, so max 5 in flight.
 const TX_INFLIGHT_MAX: usize = 5;
 
+/// Stride between xfer headers within PAGE_TX_META (aligned to 16 bytes)
+const XFER_STRIDE: u64 = 16;
+/// Offset where status structs start within PAGE_TX_META
+const STATUS_OFFSET: u64 = XFER_STRIDE * TX_INFLIGHT_MAX as u64;
+/// Stride between status structs
+const STATUS_STRIDE: u64 = core::mem::size_of::<VirtioSndPcmStatus>() as u64;
+
 pub struct SoundController {
     device: VirtioDevice,
     controlq: Virtqueue,
     txq: Virtqueue,
-    req_buf: u64,
-    resp_buf: u64,
-    tx_buf_addrs: [u64; TX_INFLIGHT_MAX],
-    tx_status_addrs: [u64; TX_INFLIGHT_MAX],
-    tx_buf_idx: usize,
+    /// Physical addresses for virtqueue descriptors.
+    req_phys: u64,
+    resp_phys: u64,
+    /// Virtual pointers for kernel read/write.
+    req_ptr: *mut u8,
+    resp_ptr: *mut u8,
+    /// Physical base of PAGE_TX_META (for descriptor addresses).
+    meta_phys: u64,
+    /// Virtual base of PAGE_TX_META (for kernel write_volatile).
+    meta_ptr: *mut u8,
+    /// Physical addresses of the 5 TX data pages (for device DMA descriptors).
+    tx_data_phys: [u64; TX_INFLIGHT_MAX],
     tx_inflight: usize,
+    /// Bitmask of buffers currently in-flight (submitted but not yet completed)
+    inflight_mask: u32,
     started: bool,
 }
 
@@ -136,20 +164,20 @@ impl SoundController {
             core::slice::from_raw_parts(req as *const T as *const u8, core::mem::size_of::<T>())
         };
         unsafe {
-            copy_nonoverlapping(bytes.as_ptr(), self.req_buf as *mut u8, bytes.len());
+            copy_nonoverlapping(bytes.as_ptr(), self.req_ptr, bytes.len());
         }
 
         self.controlq.submit_and_wait(
             &[
-                (self.req_buf, bytes.len() as u32, BufDir::Readable),
-                (self.resp_buf, resp_size, BufDir::Writable),
+                (self.req_phys, bytes.len() as u32, BufDir::Readable),
+                (self.resp_phys, resp_size, BufDir::Writable),
             ],
             self.device.notify_mmio(),
             self.device.notify_off_multiplier(),
             0, // controlq index
         );
 
-        unsafe { read_volatile(self.resp_buf as *const u32) }
+        unsafe { read_volatile(self.resp_ptr as *const u32) }
     }
 
     fn simple_ctrl(&mut self, code: u32, stream_id: u32) -> u32 {
@@ -167,12 +195,11 @@ impl SoundController {
             _ => VIRTIO_SND_PCM_RATE_44100,
         };
 
-        // Set parameters for stream 0
         let cmd = VirtioSndPcmSetParams {
             hdr: VirtioSndHdr { code: VIRTIO_SND_R_PCM_SET_PARAMS },
             stream_id: 0,
-            buffer_bytes: 4096 * 4, // 16KB total buffer
-            period_bytes: 4096,      // 4KB per period (~23ms at 44100Hz stereo s16)
+            buffer_bytes: 4096 * 4,
+            period_bytes: 4096,
             features: 0,
             channels,
             format: VIRTIO_SND_PCM_FMT_S16,
@@ -182,7 +209,6 @@ impl SoundController {
         let status = self.ctrl_command(&cmd, core::mem::size_of::<VirtioSndHdr>() as u32);
         assert!(status == VIRTIO_SND_S_OK, "virtio-sound: SET_PARAMS failed: {:#x}", status);
 
-        // Prepare stream
         let status = self.simple_ctrl(VIRTIO_SND_R_PCM_PREPARE, 0);
         assert!(status == VIRTIO_SND_S_OK, "virtio-sound: PREPARE failed: {:#x}", status);
 
@@ -197,85 +223,75 @@ impl SoundController {
         log!("virtio-sound: stream 0 started");
     }
 
-    /// Drain any completed TX buffers from the used ring.
-    fn drain_tx(&mut self) -> usize {
-        let mut drained = 0;
+    /// Drain completed TX buffers. Returns bitmask of newly completed buffer indices.
+    fn drain_tx(&mut self) -> u32 {
+        let mut completed = 0u32;
         while self.tx_inflight > 0 {
-            if self.txq.poll_used().is_some() {
+            if let Some((desc_id, _)) = self.txq.poll_used() {
+                // Each submission uses 3 descriptors; desc_id is the first.
+                // Buffer index = desc_id / 3.
+                let idx = desc_id as usize / 3;
+                completed |= 1 << idx;
+                self.inflight_mask &= !(1 << idx);
                 self.tx_inflight -= 1;
-                drained += 1;
             } else {
                 break;
             }
         }
-        drained
+        completed
     }
 
-    /// Write PCM samples to the TX queue (non-blocking). Data must be s16le.
-    /// Max ~4000 bytes per call (DMA page minus header overhead).
-    /// If the TX queue is full, the buffer is silently dropped.
-    pub fn write_samples(&mut self, data: &[u8]) {
-        if data.is_empty() { return; }
+    /// Submit a TX data buffer to the VirtIO device.
+    /// `idx`: buffer index (0..4), `len`: bytes of PCM data in the buffer.
+    /// The data page must already be filled by soundd via shared memory.
+    /// Returns true on success, false if the slot is in-flight.
+    pub fn submit_buffer(&mut self, idx: usize, len: u32) -> bool {
+        if idx >= TX_INFLIGHT_MAX { return false; }
+        if self.inflight_mask & (1 << idx) != 0 { return false; }
         if !self.started {
             self.start();
         }
 
-        // Drain any completed buffers
-        self.drain_tx();
+        let hdr_phys = self.meta_phys + idx as u64 * XFER_STRIDE;
+        let data_phys = self.tx_data_phys[idx];
+        let status_phys = self.meta_phys + STATUS_OFFSET + idx as u64 * STATUS_STRIDE;
 
-        // If all slots are in use, drop this buffer (audio tolerates gaps)
-        if self.tx_inflight >= TX_INFLIGHT_MAX {
-            return;
-        }
-
-        let idx = self.tx_buf_idx;
-        self.tx_buf_idx = (self.tx_buf_idx + 1) % TX_INFLIGHT_MAX;
-
-        let buf_addr = self.tx_buf_addrs[idx];
-        let status_addr = self.tx_status_addrs[idx];
-
-        // Write xfer header at start of buffer
+        // Write xfer header via virtual pointer (kernel-owned page, not shared)
+        let hdr_ptr = unsafe { self.meta_ptr.add(idx * XFER_STRIDE as usize) };
         let xfer = VirtioSndPcmXfer { stream_id: 0 };
-        let hdr_size = core::mem::size_of::<VirtioSndPcmXfer>();
+        unsafe { write_volatile(hdr_ptr as *mut VirtioSndPcmXfer, xfer); }
+
+        let hdr_size = core::mem::size_of::<VirtioSndPcmXfer>() as u32;
         let status_size = core::mem::size_of::<VirtioSndPcmStatus>() as u32;
 
-        // Max payload is page size minus header
-        let max_payload = 4096 - hdr_size;
-        let payload_len = data.len().min(max_payload);
-
-        unsafe {
-            write_volatile(buf_addr as *mut VirtioSndPcmXfer, xfer);
-            copy_nonoverlapping(
-                data.as_ptr(),
-                (buf_addr as *mut u8).add(hdr_size),
-                payload_len,
-            );
-        }
-
-        // 3 descriptors: xfer header (readable), PCM data (readable), status (writable)
-        let data_addr = buf_addr + hdr_size as u64;
         self.txq.submit(
             &[
-                (buf_addr, hdr_size as u32, BufDir::Readable),
-                (data_addr, payload_len as u32, BufDir::Readable),
-                (status_addr, status_size, BufDir::Writable),
+                (hdr_phys, hdr_size, BufDir::Readable),
+                (data_phys, len, BufDir::Readable),
+                (status_phys, status_size, BufDir::Writable),
             ],
             self.device.notify_mmio(),
             self.device.notify_off_multiplier(),
             2, // txq index
         );
+        self.inflight_mask |= 1 << idx;
         self.tx_inflight += 1;
+        true
+    }
+
+    /// Poll for completed buffers. Returns bitmask of buffer indices that are now free.
+    pub fn poll_completed(&mut self) -> u32 {
+        self.drain_tx()
     }
 }
 
-/// Initialize the VirtIO sound device. Returns the controller on success.
-pub fn init(ecam_base: u64) -> Option<SoundController> {
+/// Initialize the VirtIO sound device. Returns the controller and AudioInfo on success.
+pub fn init(ecam_base: u64) -> Option<(SoundController, AudioInfo)> {
     let pci_dev = PciDevice::find_by_id(ecam_base, VIRTIO_VENDOR, VIRTIO_SND_DEVICE)?;
     log!("virtio-sound: found at PCI {:02x}:{:02x}.{}", pci_dev.bus, pci_dev.dev, pci_dev.func);
 
     let device = VirtioDevice::init(&pci_dev, VIRTIO_F_VERSION_1);
 
-    // Read device config: jacks, streams, chmaps
     let cfg = device.device_config();
     let jacks = cfg.read_u32(0);
     let streams = cfg.read_u32(4);
@@ -284,36 +300,43 @@ pub fn init(ecam_base: u64) -> Option<SoundController> {
 
     assert!(streams > 0, "virtio-sound: no PCM streams available");
 
-    let mut controlq = Virtqueue::new(dma_addr(PAGE_CONTROLQ));
-    let mut eventq = Virtqueue::new(dma_addr(PAGE_EVENTQ));
-    let mut txq = Virtqueue::new(dma_addr(PAGE_TXQ));
+    let mut controlq = Virtqueue::new(dma_phys(PAGE_CONTROLQ), dma_ptr(PAGE_CONTROLQ));
+    let mut eventq = Virtqueue::new(dma_phys(PAGE_EVENTQ), dma_ptr(PAGE_EVENTQ));
+    let mut txq = Virtqueue::new(dma_phys(PAGE_TXQ), dma_ptr(PAGE_TXQ));
 
     device.setup_queue(0, &mut controlq);
     device.setup_queue(1, &mut eventq);
     device.setup_queue(2, &mut txq);
     device.activate();
 
-    let req_buf = dma_addr(PAGE_CTRL_BUFS) + REQ_OFFSET as u64;
-    let resp_buf = dma_addr(PAGE_CTRL_BUFS) + RESP_OFFSET as u64;
+    let req_phys = dma_phys(PAGE_CTRL_BUFS) + REQ_OFFSET as u64;
+    let resp_phys = dma_phys(PAGE_CTRL_BUFS) + RESP_OFFSET as u64;
+    let req_ptr = unsafe { dma_ptr(PAGE_CTRL_BUFS).add(REQ_OFFSET) };
+    let resp_ptr = unsafe { dma_ptr(PAGE_CTRL_BUFS).add(RESP_OFFSET) };
+    let meta_phys = dma_phys(PAGE_TX_META);
+    let meta_ptr = dma_ptr(PAGE_TX_META);
 
-    let status_base = dma_addr(PAGE_TX_STATUS);
-    let status_stride = core::mem::size_of::<VirtioSndPcmStatus>() as u64;
-    let mut tx_buf_addrs = [0u64; TX_INFLIGHT_MAX];
-    let mut tx_status_addrs = [0u64; TX_INFLIGHT_MAX];
+    let mut tx_data_phys = [0u64; TX_INFLIGHT_MAX];
+    let mut buf_tokens = [0u32; TX_INFLIGHT_MAX];
     for i in 0..TX_INFLIGHT_MAX {
-        tx_buf_addrs[i] = dma_addr(PAGE_TX_BUFS + i);
-        tx_status_addrs[i] = status_base + i as u64 * status_stride;
+        tx_data_phys[i] = dma_phys(PAGE_TX_DATA + i);
+        // Register each TX data page as shared memory so soundd can map it
+        buf_tokens[i] = shared_memory::register(PhysAddr::new(tx_data_phys[i]), 4096).raw();
     }
+
     let mut ctrl = SoundController {
         device,
         controlq,
         txq,
-        req_buf,
-        resp_buf,
-        tx_buf_addrs,
-        tx_status_addrs,
-        tx_buf_idx: 0,
+        req_phys,
+        resp_phys,
+        req_ptr,
+        resp_ptr,
+        meta_phys,
+        meta_ptr,
+        tx_data_phys,
         tx_inflight: 0,
+        inflight_mask: 0,
         started: false,
     };
 
@@ -330,15 +353,22 @@ pub fn init(ecam_base: u64) -> Option<SoundController> {
     assert!(status == VIRTIO_SND_S_OK, "virtio-sound: PCM_INFO failed: {:#x}", status);
 
     let pcm_info = unsafe {
-        core::ptr::read_unaligned((ctrl.resp_buf + core::mem::size_of::<VirtioSndHdr>() as u64) as *const VirtioSndPcmInfo)
+        core::ptr::read_unaligned(ctrl.resp_ptr.add(core::mem::size_of::<VirtioSndHdr>()) as *const VirtioSndPcmInfo)
     };
     log!("virtio-sound: stream 0: dir={} ch={}-{} fmts={:#x} rates={:#x}",
         pcm_info.direction, pcm_info.channels_min, pcm_info.channels_max,
         pcm_info.formats, pcm_info.rates);
 
-    // Auto-configure: stereo s16le 44100Hz (start deferred to first write)
     ctrl.configure(44100, 2);
 
-    log!("virtio-sound: initialized (playback starts on first write)");
-    Some(ctrl)
+    let info = AudioInfo {
+        buf_tokens,
+        num_buffers: TX_INFLIGHT_MAX as u8,
+        sample_rate: 44100,
+        channels: 2,
+        period_bytes: 4096,
+    };
+
+    log!("virtio-sound: initialized ({} DMA buffers, playback starts on first submit)", TX_INFLIGHT_MAX);
+    Some((ctrl, info))
 }

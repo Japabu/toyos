@@ -135,8 +135,12 @@ const MAX_DATA_PAGES: usize = 32; // 128KB max per transfer
 
 static DMA_POOL: Lock<DmaPool<DMA_PAGES>> = Lock::new(DmaPool::new());
 
-fn dma_page(index: usize) -> u64 {
-    DMA_POOL.lock().page_addr(index)
+fn dma_phys(index: usize) -> u64 {
+    DMA_POOL.lock().page_phys(index)
+}
+
+fn dma_ptr(index: usize) -> *mut u8 {
+    DMA_POOL.lock().page_ptr(index)
 }
 
 struct NvmeController {
@@ -156,52 +160,49 @@ impl NvmeController {
     }
 
     fn identify_controller(&mut self) {
-        let identify_buf = dma_page(4);
         let cid = self.alloc_cid();
         let mut cmd = SqEntry::ZERO;
         cmd.cdw0 = (cid as u32) << 16 | ADMIN_IDENTIFY as u32;
-        cmd.prp1 = identify_buf;
+        cmd.prp1 = dma_phys(4);
         cmd.cdw10 = 1;
         self.admin.submit_and_wait(&self.bar, cmd);
         log!("NVMe: Identify Controller OK");
     }
 
     fn create_io_cq(&mut self) {
-        let io_cq_phys = self.io.cq as u64;
         unsafe { write_bytes(self.io.cq as *mut u8, 0, QUEUE_DEPTH * core::mem::size_of::<CqEntry>()); }
         let cid = self.alloc_cid();
         let mut cmd = SqEntry::ZERO;
         cmd.cdw0 = (cid as u32) << 16 | ADMIN_CREATE_IO_CQ as u32;
-        cmd.prp1 = io_cq_phys;
+        cmd.prp1 = dma_phys(3); // IO CQ physical address for device
         cmd.cdw10 = ((QUEUE_DEPTH as u32 - 1) << 16) | 1;
         cmd.cdw11 = 1;
         self.admin.submit_and_wait(&self.bar, cmd);
     }
 
     fn create_io_sq(&mut self) {
-        let io_sq_phys = self.io.sq as u64;
         unsafe { write_bytes(self.io.sq as *mut u8, 0, QUEUE_DEPTH * core::mem::size_of::<SqEntry>()); }
         let cid = self.alloc_cid();
         let mut cmd = SqEntry::ZERO;
         cmd.cdw0 = (cid as u32) << 16 | ADMIN_CREATE_IO_SQ as u32;
-        cmd.prp1 = io_sq_phys;
+        cmd.prp1 = dma_phys(2); // IO SQ physical address for device
         cmd.cdw10 = ((QUEUE_DEPTH as u32 - 1) << 16) | 1;
         cmd.cdw11 = (1 << 16) | 1;
         self.admin.submit_and_wait(&self.bar, cmd);
     }
 
     fn identify_namespace(&mut self) {
-        let identify_buf = dma_page(4);
-        unsafe { write_bytes(identify_buf as *mut u8, 0, 4096); }
+        let identify_ptr = dma_ptr(4);
+        unsafe { write_bytes(identify_ptr, 0, 4096); }
         let cid = self.alloc_cid();
         let mut cmd = SqEntry::ZERO;
         cmd.cdw0 = (cid as u32) << 16 | ADMIN_IDENTIFY as u32;
         cmd.nsid = 1;
-        cmd.prp1 = identify_buf;
+        cmd.prp1 = dma_phys(4);
         cmd.cdw10 = 0;
         self.admin.submit_and_wait(&self.bar, cmd);
 
-        let ns = unsafe { &*(identify_buf as *const IdentifyNamespace) };
+        let ns = unsafe { &*(identify_ptr as *const IdentifyNamespace) };
         let fmt_idx = (ns.flbas & 0x0F) as usize;
         let lba_ds = ((ns.lba_formats[fmt_idx] >> 16) & 0xFF) as u32;
         self.sector_size = 1 << lba_ds;
@@ -217,31 +218,31 @@ impl NvmeController {
         assert!(total_bytes <= MAX_DATA_PAGES * 4096);
 
         let pages = (total_bytes + 4095) / 4096;
-        let data_base = dma_page(DATA_PAGE_START);
 
         let cid = self.alloc_cid();
         let mut cmd = SqEntry::ZERO;
         cmd.cdw0 = (cid as u32) << 16 | IO_READ as u32;
         cmd.nsid = 1;
-        cmd.prp1 = data_base;
+        cmd.prp1 = dma_phys(DATA_PAGE_START);
         cmd.cdw10 = lba as u32;
         cmd.cdw11 = (lba >> 32) as u32;
         cmd.cdw12 = sector_count - 1; // NLB is 0-based
 
         if pages == 2 {
-            cmd.prp2 = dma_page(DATA_PAGE_START + 1);
+            cmd.prp2 = dma_phys(DATA_PAGE_START + 1);
         } else if pages > 2 {
             // Build PRP list: entries for pages 1..N (page 0 is in PRP1)
-            let prp_list = dma_page(PRP_LIST_PAGE) as *mut u64;
+            let prp_list = dma_ptr(PRP_LIST_PAGE) as *mut u64;
             for i in 1..pages {
-                unsafe { prp_list.add(i - 1).write(dma_page(DATA_PAGE_START + i)); }
+                unsafe { prp_list.add(i - 1).write(dma_phys(DATA_PAGE_START + i)); }
             }
-            cmd.prp2 = dma_page(PRP_LIST_PAGE);
+            cmd.prp2 = dma_phys(PRP_LIST_PAGE);
         }
 
         self.io.submit_and_wait(&self.bar, cmd);
 
-        unsafe { copy_nonoverlapping(data_base as *const u8, buf.as_mut_ptr(), total_bytes); }
+        let data_ptr = dma_ptr(DATA_PAGE_START);
+        unsafe { copy_nonoverlapping(data_ptr as *const u8, buf.as_mut_ptr(), total_bytes); }
     }
 
     /// Write `sector_count` contiguous sectors starting at `lba` from `buf`.
@@ -251,27 +252,27 @@ impl NvmeController {
         assert!(total_bytes <= MAX_DATA_PAGES * 4096);
 
         let pages = (total_bytes + 4095) / 4096;
-        let data_base = dma_page(DATA_PAGE_START);
+        let data_ptr = dma_ptr(DATA_PAGE_START);
 
-        unsafe { copy_nonoverlapping(buf.as_ptr(), data_base as *mut u8, total_bytes); }
+        unsafe { copy_nonoverlapping(buf.as_ptr(), data_ptr, total_bytes); }
 
         let cid = self.alloc_cid();
         let mut cmd = SqEntry::ZERO;
         cmd.cdw0 = (cid as u32) << 16 | IO_WRITE as u32;
         cmd.nsid = 1;
-        cmd.prp1 = data_base;
+        cmd.prp1 = dma_phys(DATA_PAGE_START);
         cmd.cdw10 = lba as u32;
         cmd.cdw11 = (lba >> 32) as u32;
         cmd.cdw12 = sector_count - 1;
 
         if pages == 2 {
-            cmd.prp2 = dma_page(DATA_PAGE_START + 1);
+            cmd.prp2 = dma_phys(DATA_PAGE_START + 1);
         } else if pages > 2 {
-            let prp_list = dma_page(PRP_LIST_PAGE) as *mut u64;
+            let prp_list = dma_ptr(PRP_LIST_PAGE) as *mut u64;
             for i in 1..pages {
-                unsafe { prp_list.add(i - 1).write(dma_page(DATA_PAGE_START + i)); }
+                unsafe { prp_list.add(i - 1).write(dma_phys(DATA_PAGE_START + i)); }
             }
-            cmd.prp2 = dma_page(PRP_LIST_PAGE);
+            cmd.prp2 = dma_phys(PRP_LIST_PAGE);
         }
 
         self.io.submit_and_wait(&self.bar, cmd);
@@ -374,10 +375,10 @@ pub fn init(ecam_base: u64) -> Option<NvmeBlockDevice> {
         }
     }
 
-    let admin_sq = dma_page(0) as *mut SqEntry;
-    let admin_cq = dma_page(1) as *mut CqEntry;
-    let io_sq = dma_page(2) as *mut SqEntry;
-    let io_cq = dma_page(3) as *mut CqEntry;
+    let admin_sq = dma_ptr(0) as *mut SqEntry;
+    let admin_cq = dma_ptr(1) as *mut CqEntry;
+    let io_sq = dma_ptr(2) as *mut SqEntry;
+    let io_cq = dma_ptr(3) as *mut CqEntry;
 
     unsafe {
         write_bytes(admin_sq as *mut u8, 0, 4096);
@@ -386,8 +387,8 @@ pub fn init(ecam_base: u64) -> Option<NvmeBlockDevice> {
 
     let aqa = ((QUEUE_DEPTH as u32 - 1) << 16) | (QUEUE_DEPTH as u32 - 1);
     bar.write_u32(REG_AQA, aqa);
-    bar.write_u64(REG_ASQ, admin_sq as u64);
-    bar.write_u64(REG_ACQ, admin_cq as u64);
+    bar.write_u64(REG_ASQ, dma_phys(0));
+    bar.write_u64(REG_ACQ, dma_phys(1));
 
     let cc = 1 | (6 << 16) | (4 << 20);
     bar.write_u32(REG_CC, cc);

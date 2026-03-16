@@ -28,8 +28,12 @@ const RX_BUF_SIZE: u32 = 4096;
 
 static DMA: Lock<DmaPool<6>> = Lock::new(DmaPool::new());
 
-fn dma_addr(page: usize) -> u64 {
-    DMA.lock().page_addr(page)
+fn dma_phys(page: usize) -> u64 {
+    DMA.lock().page_phys(page)
+}
+
+fn dma_ptr(page: usize) -> *mut u8 {
+    DMA.lock().page_ptr(page)
 }
 
 struct VirtioNic {
@@ -37,8 +41,12 @@ struct VirtioNic {
     rxq: Virtqueue,
     txq: Virtqueue,
     mac: [u8; 6],
-    rx_bufs: [u64; RX_BUF_COUNT],
-    tx_buf: u64,
+    /// Physical addresses for device DMA descriptors.
+    rx_phys: [u64; RX_BUF_COUNT],
+    tx_phys: u64,
+    /// Virtual pointers for kernel read/write.
+    rx_ptrs: [*mut u8; RX_BUF_COUNT],
+    tx_ptr: *mut u8,
     // Maps virtqueue descriptor index -> rx_bufs index
     desc_to_buf: [usize; 16],
 }
@@ -47,10 +55,9 @@ unsafe impl Send for VirtioNic {}
 
 impl VirtioNic {
     fn refill_rx(&mut self, buf_idx: usize) {
-        let buf_addr = self.rx_bufs[buf_idx];
-        unsafe { write_bytes(buf_addr as *mut u8, 0, NET_HDR_SIZE); }
+        unsafe { write_bytes(self.rx_ptrs[buf_idx], 0, NET_HDR_SIZE); }
         let desc_id = self.rxq.submit(
-            &[(buf_addr, RX_BUF_SIZE, BufDir::Writable)],
+            &[(self.rx_phys[buf_idx], RX_BUF_SIZE, BufDir::Writable)],
             self.device.notify_mmio(),
             self.device.notify_off_multiplier(),
             0,
@@ -69,16 +76,16 @@ impl crate::net::Nic for VirtioNic {
         let len = frame.len().min(max_frame);
 
         unsafe {
-            write_bytes(self.tx_buf as *mut u8, 0, NET_HDR_SIZE);
+            write_bytes(self.tx_ptr, 0, NET_HDR_SIZE);
             copy_nonoverlapping(
                 frame.as_ptr(),
-                (self.tx_buf as *mut u8).add(NET_HDR_SIZE),
+                self.tx_ptr.add(NET_HDR_SIZE),
                 len,
             );
         }
 
         self.txq.submit_and_wait(
-            &[(self.tx_buf, (NET_HDR_SIZE + len) as u32, BufDir::Readable)],
+            &[(self.tx_phys, (NET_HDR_SIZE + len) as u32, BufDir::Readable)],
             self.device.notify_mmio(),
             self.device.notify_off_multiplier(),
             1,
@@ -99,9 +106,9 @@ impl crate::net::Nic for VirtioNic {
         }
         let frame_len = total - NET_HDR_SIZE;
         let copy_len = frame_len.min(buf.len());
-        let src = self.rx_bufs[buf_idx] + NET_HDR_SIZE as u64;
+        let src = unsafe { self.rx_ptrs[buf_idx].add(NET_HDR_SIZE) };
         unsafe {
-            copy_nonoverlapping(src as *const u8, buf.as_mut_ptr(), copy_len);
+            copy_nonoverlapping(src, buf.as_mut_ptr(), copy_len);
         }
         self.refill_rx(buf_idx);
         Some(copy_len)
@@ -126,7 +133,7 @@ impl crate::net::Nic for VirtioNic {
 
     fn submit_tx(&mut self, total_len: usize) {
         self.txq.submit_and_wait(
-            &[(self.tx_buf, total_len as u32, BufDir::Readable)],
+            &[(self.tx_phys, total_len as u32, BufDir::Readable)],
             self.device.notify_mmio(),
             self.device.notify_off_multiplier(),
             1,
@@ -146,8 +153,8 @@ pub fn init(ecam_base: u64) {
 
     let device = VirtioDevice::init(&pci_dev, VIRTIO_F_VERSION_1 | VIRTIO_NET_F_MAC);
 
-    let mut rxq = Virtqueue::new(dma_addr(PAGE_RXQ));
-    let mut txq = Virtqueue::new(dma_addr(PAGE_TXQ));
+    let mut rxq = Virtqueue::new(dma_phys(PAGE_RXQ), dma_ptr(PAGE_RXQ));
+    let mut txq = Virtqueue::new(dma_phys(PAGE_TXQ), dma_ptr(PAGE_TXQ));
 
     device.setup_queue(0, &mut rxq);
     device.setup_queue(1, &mut txq);
@@ -162,18 +169,24 @@ pub fn init(ecam_base: u64) {
     log!("VirtIO net: MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 
-    let rx_bufs = [
-        dma_addr(PAGE_RX_BUFS),
-        dma_addr(PAGE_RX_BUFS + 1),
-        dma_addr(PAGE_RX_BUFS + 2),
+    let rx_phys = [
+        dma_phys(PAGE_RX_BUFS),
+        dma_phys(PAGE_RX_BUFS + 1),
+        dma_phys(PAGE_RX_BUFS + 2),
     ];
-    let tx_buf = dma_addr(PAGE_TX_BUF);
+    let rx_ptrs = [
+        dma_ptr(PAGE_RX_BUFS),
+        dma_ptr(PAGE_RX_BUFS + 1),
+        dma_ptr(PAGE_RX_BUFS + 2),
+    ];
+    let tx_phys = dma_phys(PAGE_TX_BUF);
+    let tx_ptr = dma_ptr(PAGE_TX_BUF);
 
     // Register DMA buffers as shared memory for direct userland access
     let rx_tokens: [u32; 3] = core::array::from_fn(|i| {
-        shared_memory::register(crate::PhysAddr::new(rx_bufs[i]), 4096).raw()
+        shared_memory::register(crate::PhysAddr::new(rx_phys[i]), 4096).raw()
     });
-    let tx_token = shared_memory::register(crate::PhysAddr::new(tx_buf), 4096).raw();
+    let tx_token = shared_memory::register(crate::PhysAddr::new(tx_phys), 4096).raw();
 
     crate::net::set_nic_info(NicInfo {
         rx_buf_tokens: rx_tokens,
@@ -184,7 +197,7 @@ pub fn init(ecam_base: u64) {
     });
 
     let mut nic = VirtioNic {
-        device, rxq, txq, mac, rx_bufs, tx_buf,
+        device, rxq, txq, mac, rx_phys, tx_phys, rx_ptrs, tx_ptr,
         desc_to_buf: [0; 16],
     };
 

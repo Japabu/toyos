@@ -50,8 +50,12 @@ const RESP_OFFSET: usize = 0x800;
 
 static DMA: Lock<DmaPool<4>> = Lock::new(DmaPool::new());
 
-fn dma_addr(page: usize) -> u64 {
-    DMA.lock().page_addr(page)
+fn dma_phys(page: usize) -> u64 {
+    DMA.lock().page_phys(page)
+}
+
+fn dma_ptr(page: usize) -> *mut u8 {
+    DMA.lock().page_ptr(page)
 }
 
 // ---- GPU command/response structs ----
@@ -183,20 +187,30 @@ struct UpdateCursor {
 
 struct FbAlloc {
     tokens: [SharedToken; 2],
-    addrs: [u64; 2],
+    /// Physical addresses (for device DMA / attach_backing).
+    phys_addrs: [u64; 2],
+    /// Virtual pointers (for kernel dealloc).
+    ptrs: [*mut u8; 2],
     layout: Layout,
 }
 
 // ---- GPU Controller ----
 
+unsafe impl Send for GpuController {}
+
 struct GpuController {
     device: VirtioDevice,
     controlq: Virtqueue,
     cursorq: Virtqueue,
-    req_buf: u64,
-    resp_buf: u64,
-    cursor_req_buf: u64,
-    cursor_resp_buf: u64,
+    /// Physical addresses for virtqueue descriptors (device DMA).
+    req_phys: u64,
+    resp_phys: u64,
+    cursor_req_phys: u64,
+    cursor_resp_phys: u64,
+    /// Virtual pointers for kernel read/write.
+    req_ptr: *mut u8,
+    resp_ptr: *mut u8,
+    cursor_req_ptr: *mut u8,
     width: u32,
     height: u32,
     resource: u32,
@@ -209,13 +223,13 @@ impl GpuController {
     /// Returns the response header's type field.
     fn command_raw(&mut self, req_bytes: &[u8], resp_size: u32) -> u32 {
         unsafe {
-            copy_nonoverlapping(req_bytes.as_ptr(), self.req_buf as *mut u8, req_bytes.len());
+            copy_nonoverlapping(req_bytes.as_ptr(), self.req_ptr, req_bytes.len());
         }
 
         self.controlq.submit_and_wait(
             &[
-                (self.req_buf, req_bytes.len() as u32, BufDir::Readable),
-                (self.resp_buf, resp_size, BufDir::Writable),
+                (self.req_phys, req_bytes.len() as u32, BufDir::Readable),
+                (self.resp_phys, resp_size, BufDir::Writable),
             ],
             self.device.notify_mmio(),
             self.device.notify_off_multiplier(),
@@ -223,7 +237,7 @@ impl GpuController {
         );
 
         // Read response type from header
-        unsafe { read_volatile(self.resp_buf as *const u32) }
+        unsafe { read_volatile(self.resp_ptr as *const u32) }
     }
 
     fn command<T: Copy>(&mut self, req: &T) -> u32 {
@@ -241,20 +255,20 @@ impl GpuController {
         let resp_size = core::mem::size_of::<RespDisplayInfo>() as u32;
 
         unsafe {
-            copy_nonoverlapping(bytes.as_ptr(), self.req_buf as *mut u8, bytes.len());
+            copy_nonoverlapping(bytes.as_ptr(), self.req_ptr, bytes.len());
         }
 
         self.controlq.submit_and_wait(
             &[
-                (self.req_buf, bytes.len() as u32, BufDir::Readable),
-                (self.resp_buf, resp_size, BufDir::Writable),
+                (self.req_phys, bytes.len() as u32, BufDir::Readable),
+                (self.resp_phys, resp_size, BufDir::Writable),
             ],
             self.device.notify_mmio(),
             self.device.notify_off_multiplier(),
             0,
         );
 
-        unsafe { read_volatile(self.resp_buf as *const RespDisplayInfo) }
+        unsafe { read_volatile(self.resp_ptr as *const RespDisplayInfo) }
     }
 
     fn create_resource(&mut self, id: u32, format: u32, width: u32, height: u32) {
@@ -294,27 +308,27 @@ impl GpuController {
         unsafe {
             copy_nonoverlapping(
                 &cmd as *const _ as *const u8,
-                self.req_buf as *mut u8,
+                self.req_ptr,
                 cmd_size,
             );
             copy_nonoverlapping(
                 &entry as *const _ as *const u8,
-                (self.req_buf as *mut u8).add(cmd_size),
+                self.req_ptr.add(cmd_size),
                 entry_size,
             );
         }
 
         self.controlq.submit_and_wait(
             &[
-                (self.req_buf, (cmd_size + entry_size) as u32, BufDir::Readable),
-                (self.resp_buf, core::mem::size_of::<CtrlHeader>() as u32, BufDir::Writable),
+                (self.req_phys, (cmd_size + entry_size) as u32, BufDir::Readable),
+                (self.resp_phys, core::mem::size_of::<CtrlHeader>() as u32, BufDir::Writable),
             ],
             self.device.notify_mmio(),
             self.device.notify_off_multiplier(),
             0,
         );
 
-        let resp = unsafe { read_volatile(self.resp_buf as *const u32) };
+        let resp = unsafe { read_volatile(self.resp_ptr as *const u32) };
         assert!(resp == RESP_OK_NODATA, "VirtIO GPU: RESOURCE_ATTACH_BACKING failed: {:#x}", resp);
     }
 
@@ -357,12 +371,12 @@ impl GpuController {
             core::slice::from_raw_parts(req as *const T as *const u8, core::mem::size_of::<T>())
         };
         unsafe {
-            copy_nonoverlapping(bytes.as_ptr(), self.cursor_req_buf as *mut u8, bytes.len());
+            copy_nonoverlapping(bytes.as_ptr(), self.cursor_req_ptr, bytes.len());
         }
         self.cursorq.submit_and_wait(
             &[
-                (self.cursor_req_buf, bytes.len() as u32, BufDir::Readable),
-                (self.cursor_resp_buf, core::mem::size_of::<CtrlHeader>() as u32, BufDir::Writable),
+                (self.cursor_req_phys, bytes.len() as u32, BufDir::Readable),
+                (self.cursor_resp_phys, core::mem::size_of::<CtrlHeader>() as u32, BufDir::Writable),
             ],
             self.device.notify_mmio(),
             self.device.notify_off_multiplier(),
@@ -400,22 +414,25 @@ impl GpuController {
         let fb_aligned = paging::align_2m(fb_size);
         let fb_layout = Layout::from_size_align(fb_aligned, PAGE_2M as usize).unwrap();
         let mut tokens = [SharedToken::from_raw(0); 2];
-        let mut addrs = [0u64; 2];
+        let mut phys_addrs = [0u64; 2];
+        let mut ptrs = [core::ptr::null_mut(); 2];
         for i in 0..2 {
             let ptr = unsafe { alloc_zeroed(fb_layout) };
             assert!(!ptr.is_null(), "VirtIO GPU: framebuffer alloc failed");
-            addrs[i] = ptr as u64;
-            tokens[i] = shared_memory::register(crate::PhysAddr::new(addrs[i]), fb_aligned as u64);
-            log!("VirtIO GPU: buffer {} at {:#x} ({} bytes) token={:?}", i, addrs[i], fb_size, tokens[i]);
+            let phys = crate::PhysAddr::from_ptr(ptr);
+            ptrs[i] = ptr;
+            phys_addrs[i] = phys.raw();
+            tokens[i] = shared_memory::register(phys, fb_aligned as u64);
+            log!("VirtIO GPU: buffer {} at {:?} phys={:#x} ({} bytes) token={:?}", i, ptr, phys_addrs[i], fb_size, tokens[i]);
         }
-        FbAlloc { tokens, addrs, layout: fb_layout }
+        FbAlloc { tokens, phys_addrs, ptrs, layout: fb_layout }
     }
 
     /// Free old framebuffer backing stores and unregister shared memory.
     fn free_framebuffer(&mut self, fb: FbAlloc) {
         for i in 0..2 {
             shared_memory::unregister(fb.tokens[i]);
-            unsafe { dealloc(fb.addrs[i] as *mut u8, fb.layout); }
+            unsafe { dealloc(fb.ptrs[i], fb.layout); }
         }
     }
 
@@ -474,7 +491,7 @@ impl Gpu for GpuController {
         let old_resource = self.resource;
         self.resource += 1;
         self.create_resource(self.resource, FORMAT_B8G8R8X8_UNORM, width, height);
-        self.attach_backing(self.resource, new_fb.addrs[0], fb_size as u32);
+        self.attach_backing(self.resource, new_fb.phys_addrs[0], fb_size as u32);
 
         // Switch scanout to new resource
         let rect = Rect { x: 0, y: 0, width, height };
@@ -501,32 +518,39 @@ pub fn init(ecam_base: u64) -> Option<(Box<dyn Gpu>, GpuInfo)> {
 
     let device = VirtioDevice::init(&pci_dev, VIRTIO_F_VERSION_1);
 
-    let mut controlq = Virtqueue::new(dma_addr(PAGE_CONTROLQ));
-    let mut cursorq = Virtqueue::new(dma_addr(PAGE_CURSORQ));
+    let mut controlq = Virtqueue::new(dma_phys(PAGE_CONTROLQ), dma_ptr(PAGE_CONTROLQ));
+    let mut cursorq = Virtqueue::new(dma_phys(PAGE_CURSORQ), dma_ptr(PAGE_CURSORQ));
 
     device.setup_queue(0, &mut controlq);
     device.setup_queue(1, &mut cursorq);
     device.activate();
 
-    let req_buf = dma_addr(PAGE_CONTROLQ_BUFS) + REQ_OFFSET as u64;
-    let resp_buf = dma_addr(PAGE_CONTROLQ_BUFS) + RESP_OFFSET as u64;
-    let cursor_req_buf = dma_addr(PAGE_CURSORQ_BUFS) + REQ_OFFSET as u64;
-    let cursor_resp_buf = dma_addr(PAGE_CURSORQ_BUFS) + RESP_OFFSET as u64;
+    let req_phys = dma_phys(PAGE_CONTROLQ_BUFS) + REQ_OFFSET as u64;
+    let resp_phys = dma_phys(PAGE_CONTROLQ_BUFS) + RESP_OFFSET as u64;
+    let cursor_req_phys = dma_phys(PAGE_CURSORQ_BUFS) + REQ_OFFSET as u64;
+    let cursor_resp_phys = dma_phys(PAGE_CURSORQ_BUFS) + RESP_OFFSET as u64;
+    let req_ptr = unsafe { dma_ptr(PAGE_CONTROLQ_BUFS).add(REQ_OFFSET) };
+    let resp_ptr = unsafe { dma_ptr(PAGE_CONTROLQ_BUFS).add(RESP_OFFSET) };
+    let cursor_req_ptr = unsafe { dma_ptr(PAGE_CURSORQ_BUFS).add(REQ_OFFSET) };
 
     let mut gpu = GpuController {
         device,
         controlq,
         cursorq,
-        req_buf,
-        resp_buf,
-        cursor_req_buf,
-        cursor_resp_buf,
+        req_phys,
+        resp_phys,
+        cursor_req_phys,
+        cursor_resp_phys,
+        req_ptr,
+        resp_ptr,
+        cursor_req_ptr,
         width: 0,
         height: 0,
         resource: 1,
         fb: FbAlloc {
             tokens: [SharedToken::from_raw(0); 2],
-            addrs: [0; 2],
+            phys_addrs: [0; 2],
+            ptrs: [core::ptr::null_mut(); 2],
             layout: Layout::from_size_align(PAGE_2M as usize, PAGE_2M as usize).unwrap(),
         },
         cursor_token: SharedToken::from_raw(0),
@@ -557,7 +581,7 @@ pub fn init(ecam_base: u64) -> Option<(Box<dyn Gpu>, GpuInfo)> {
     let fb_size = (width * height * 4) as usize;
 
     gpu.create_resource(gpu.resource, FORMAT_B8G8R8X8_UNORM, width, height);
-    gpu.attach_backing(gpu.resource, gpu.fb.addrs[0], fb_size as u32);
+    gpu.attach_backing(gpu.resource, gpu.fb.phys_addrs[0], fb_size as u32);
 
     // Set scanout to the single resource
     let rect = Rect { x: 0, y: 0, width, height };
@@ -569,11 +593,11 @@ pub fn init(ecam_base: u64) -> Option<(Box<dyn Gpu>, GpuInfo)> {
     let cursor_layout = Layout::from_size_align(cursor_aligned, PAGE_2M as usize).unwrap();
     let cursor_ptr = unsafe { alloc_zeroed(cursor_layout) };
     assert!(!cursor_ptr.is_null(), "VirtIO GPU: cursor alloc failed");
-    let cursor_addr = cursor_ptr as u64;
-    gpu.cursor_token = shared_memory::register(crate::PhysAddr::new(cursor_addr), cursor_aligned as u64);
+    let cursor_phys = crate::PhysAddr::from_ptr(cursor_ptr);
+    gpu.cursor_token = shared_memory::register(cursor_phys, cursor_aligned as u64);
     gpu.create_resource(CURSOR_RESOURCE_ID, FORMAT_B8G8R8A8_UNORM, CURSOR_SIZE, CURSOR_SIZE);
-    gpu.attach_backing(CURSOR_RESOURCE_ID, cursor_addr, cursor_bytes as u32);
-    log!("VirtIO GPU: cursor resource at {:#x} token={:?}", cursor_addr, gpu.cursor_token);
+    gpu.attach_backing(CURSOR_RESOURCE_ID, cursor_phys.raw(), cursor_bytes as u32);
+    log!("VirtIO GPU: cursor resource at {:?} phys={:#x} token={:?}", cursor_ptr, cursor_phys.raw(), gpu.cursor_token);
 
     gpu.width = width;
     gpu.height = height;
