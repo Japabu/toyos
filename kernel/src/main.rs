@@ -3,7 +3,7 @@
 extern crate alloc;
 
 mod addr;
-pub use addr::{PhysAddr, VirtAddr, UserAddr, DmaAddr, PHYS_OFFSET};
+pub use addr::{PhysAddr, VirtAddr, UserAddr, KernelAddr, DmaAddr, PHYS_OFFSET};
 
 mod sync;
 mod id_map;

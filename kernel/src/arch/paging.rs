@@ -91,8 +91,34 @@ pub fn init(memory_map: &[MemoryMapEntry]) {
         addr += PAGE_2M;
     }
 
+    // Log the PD page address for PDPT[0] (first 1GB of direct map) for debugging
+    let pdpt0 = unsafe { get_or_create(pml4, 256, PAGE_PRESENT | PAGE_WRITE) };
+    let pd0 = unsafe { get_or_create(pdpt0, 0, PAGE_PRESENT | PAGE_WRITE) };
+    crate::log!("paging: PD for first 1GB direct map at virt={:#x} phys={:#x} early_buf={:#x}..{:#x}",
+        pd0 as u64, ptr_to_phys(pd0),
+        crate::allocator::early_buf_range().0,
+        crate::allocator::early_buf_range().1);
+    let pde228 = unsafe { pd0.add(228).read() };
+    crate::log!("paging: PDE[228]={:#018x} (should be 0x1c8000e3)", pde228);
+
     KERNEL_PML4.store(pml4, Ordering::Release);
     unsafe { cpu::write_cr3(PhysAddr::from_ptr(pml4)); }
+}
+
+/// DEBUG: verify a kernel direct-map PDE hasn't been corrupted with a virtual address.
+pub fn check_kernel_pde(pd_idx: usize, context: &str) {
+    let pml4 = KERNEL_PML4.load(Ordering::Acquire);
+    if pml4.is_null() { return; }
+    let pml4e = unsafe { pml4.add(256).read() };
+    if pml4e & PAGE_PRESENT == 0 { return; }
+    let pdpt = phys_to_ptr(pml4e & ADDR_MASK);
+    let pdpte = unsafe { pdpt.read() };
+    if pdpte & PAGE_PRESENT == 0 { return; }
+    let pd = phys_to_ptr(pdpte & ADDR_MASK);
+    let pde = unsafe { pd.add(pd_idx).read() };
+    if pde & PAGE_PRESENT != 0 && (pde & ADDR_MASK) >= PHYS_OFFSET {
+        panic!("kernel PDE[{}] corrupted: {:#018x} (has PHYS_OFFSET!) at {}", pd_idx, pde, context);
+    }
 }
 
 /// Get or create a next-level page table at the given index.
@@ -163,6 +189,7 @@ pub fn free_user_page_tables(pml4: *mut u64) {
 /// Map physical memory as user-accessible (2MB pages) in a specific PML4.
 /// Creates page table structures (PDPT, PD) on demand.
 pub fn map_user_in(pml4: *mut u64, addr: PhysAddr, size: u64) {
+    debug_assert!(addr.raw() < PHYS_OFFSET, "map_user_in: addr {:#x} looks like a virtual address", addr.raw());
     let raw = addr.raw();
     let start = raw & !(PAGE_2M - 1);
     let end = (raw + size + PAGE_2M - 1) & !(PAGE_2M - 1);
@@ -172,14 +199,32 @@ pub fn map_user_in(pml4: *mut u64, addr: PhysAddr, size: u64) {
         unsafe {
             let pdpt = get_or_create(pml4, pml4_idx, PAGE_PRESENT | PAGE_WRITE | PAGE_USER);
             let pd = get_or_create(pdpt, pdpt_idx, PAGE_PRESENT | PAGE_WRITE | PAGE_USER);
+            // DEBUG: check if this pd is the kernel's PD for first 1GB
+            let kernel_pml4 = KERNEL_PML4.load(core::sync::atomic::Ordering::Acquire);
+            if !kernel_pml4.is_null() {
+                let k256 = kernel_pml4.add(256).read();
+                if k256 & PAGE_PRESENT != 0 {
+                    let k_pdpt = phys_to_ptr(k256 & ADDR_MASK);
+                    let k_pdpte0 = k_pdpt.read();
+                    if k_pdpte0 & PAGE_PRESENT != 0 {
+                        let k_pd = phys_to_ptr(k_pdpte0 & ADDR_MASK);
+                        if pd == k_pd {
+                            panic!("map_user_in: pd == kernel PD! addr={:#x} pml4_idx={} pdpt_idx={} pd_idx={}",
+                                cur, pml4_idx, pdpt_idx, pd_idx);
+                        }
+                    }
+                }
+            }
             pd.add(pd_idx).write(cur | PAGE_PRESENT | PAGE_WRITE | PAGE_USER | PAGE_SIZE_BIT);
         }
         cur += PAGE_2M;
     }
+    check_kernel_pde(228, "after map_user_in");
 }
 
 /// Map physical memory as user-accessible read-only (2MB pages) in a specific PML4.
 pub fn map_user_readonly_in(pml4: *mut u64, addr: PhysAddr, size: u64) {
+    debug_assert!(addr.raw() < PHYS_OFFSET, "map_user_readonly_in: addr {:#x} looks like a virtual address", addr.raw());
     let raw = addr.raw();
     let start = raw & !(PAGE_2M - 1);
     let end = (raw + size + PAGE_2M - 1) & !(PAGE_2M - 1);

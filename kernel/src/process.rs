@@ -14,7 +14,7 @@ use crate::message::MessageQueue;
 use crate::sync::Lock;
 use crate::symbols::ProcessSymbols;
 use crate::{elf, pipe, scheduler, shared_memory, vfs};
-use crate::{PhysAddr, UserAddr};
+use crate::{KernelAddr, PhysAddr, UserAddr};
 
 pub use toyos_abi::Pid;
 use toyos_abi::syscall::SyscallError;
@@ -333,12 +333,12 @@ pub struct ProcessData {
     pub elf_alloc: Option<OwnedAlloc>,
     pub stack_alloc: Option<OwnedAlloc>,
     // Thread-local storage
-    pub tls_template: u64,
+    pub tls_template: KernelAddr,
     pub tls_filesz: usize,
     pub tls_memsz: usize,
     pub tls_alloc: Option<OwnedAlloc>,
     /// Multi-module TLS: (template_addr, filesz, memsz, base_offset) per module.
-    pub tls_modules: Vec<(u64, usize, usize, usize)>,
+    pub tls_modules: Vec<(KernelAddr, usize, usize, usize)>,
     /// Total combined TLS size across all modules.
     pub tls_total_memsz: usize,
     /// Maximum TLS alignment across all modules.
@@ -571,7 +571,7 @@ pub fn with_fd_owner_data<R>(f: impl FnOnce(&mut ProcessData) -> R) -> R {
 /// [TLS data (.tdata + .tbss)] [TCB: self-pointer]
 ///                              ^-- FS base (thread pointer)
 /// Returns (alloc, fs_base).
-pub fn setup_tls(tls_template: u64, tls_filesz: usize, tls_memsz: usize, tls_align: usize) -> Option<(OwnedAlloc, u64)> {
+pub fn setup_tls(tls_template: KernelAddr, tls_filesz: usize, tls_memsz: usize, tls_align: usize) -> Option<(OwnedAlloc, u64)> {
     setup_combined_tls(&[(tls_template, tls_filesz, tls_memsz, 0)], tls_memsz, tls_align)
 }
 
@@ -593,7 +593,7 @@ pub fn setup_tls(tls_template: u64, tls_filesz: usize, tls_memsz: usize, tls_ali
 const TCB_SIZE: usize = 64;
 
 pub fn setup_combined_tls(
-    modules: &[(u64, usize, usize, usize)], // (template, filesz, memsz, base_offset)
+    modules: &[(KernelAddr, usize, usize, usize)], // (template, filesz, memsz, base_offset)
     total_memsz: usize,
     tls_align: usize,
 ) -> Option<(OwnedAlloc, u64)> {
@@ -610,11 +610,33 @@ pub fn setup_combined_tls(
     // Zero the TLS block area (BSS must be zero).
     unsafe { core::ptr::write_bytes(block.add(tls_start), 0, block_size); }
 
-    for &(template, filesz, _memsz, base_offset) in modules {
-        if filesz > 0 && template != 0 {
+    for (i, &(template, filesz, _memsz, base_offset)) in modules.iter().enumerate() {
+        if filesz > 0 && !template.is_null() {
+            // Verify the template is accessible via direct map page walk
+            let template_raw = template.raw();
+            let pml4_ptr = paging::kernel_cr3().as_ptr::<u64>();
+            let pml4_idx = ((template_raw >> 39) & 0x1FF) as usize;
+            let pdpt_idx = ((template_raw >> 30) & 0x1FF) as usize;
+            let pd_idx = ((template_raw >> 21) & 0x1FF) as usize;
+            let pml4e = unsafe { *pml4_ptr.add(pml4_idx) };
+            let pdpt_ptr = ((pml4e & 0x000F_FFFF_FFFF_F000) + crate::PHYS_OFFSET) as *const u64;
+            let pdpte = unsafe { *pdpt_ptr.add(pdpt_idx) };
+            let pd_ptr = ((pdpte & 0x000F_FFFF_FFFF_F000) + crate::PHYS_OFFSET) as *const u64;
+            let pde = unsafe { *pd_ptr.add(pd_idx) };
+            let is_2m = (pde >> 7) & 1;
+            crate::log!("TLS[{}]: template={} PDE[{}]={:#018x} PS={} filesz={} pd_page_phys={:#x}",
+                i, template, pd_idx, pde, is_2m, filesz,
+                pdpte & 0x000F_FFFF_FFFF_F000);
+            if is_2m == 0 && pde != 0 {
+                // PDE points to a PT — walk one more level
+                let pt_idx = ((template_raw >> 12) & 0x1FF) as usize;
+                let pt_ptr = ((pde & 0x000F_FFFF_FFFF_F000) + crate::PHYS_OFFSET) as *const u64;
+                let pte = unsafe { *pt_ptr.add(pt_idx) };
+                crate::log!("  PT[{}]={:#018x} P={}", pt_idx, pte, pte & 1);
+            }
             unsafe {
                 core::ptr::copy_nonoverlapping(
-                    template as *const u8,
+                    template.as_ptr::<u8>(),
                     block.add(tls_start + base_offset),
                     filesz,
                 );
@@ -1176,7 +1198,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
                 let sym_name = core::str::from_utf8(&dynstr_data[st_name..st_name + name_end]).unwrap_or("");
                 let resolved = libs.iter().find_map(|lib| elf::gnu_dlsym_pub(lib, sym_name));
                 match resolved {
-                    Some(addr) => reloc_index.add_u64(r_offset, addr),
+                    Some(addr) => reloc_index.add_u64(r_offset, addr.raw()),
                     None => log!("dynamic: unresolved exe symbol: {}", sym_name),
                 }
             }
@@ -1201,12 +1223,13 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
                 paging::map_user_in(child_pml4, PhysAddr::from_ptr(alloc.ptr()), alloc.size() as u64);
             }
             elf::LibMemory::Shared { rw_alloc, cached_addr, cached_size, rw_offset, .. } => {
-                paging::map_user_readonly_in(child_pml4, PhysAddr::new(*cached_addr), *cached_size as u64);
+                let cached_phys = *cached_addr;
+                paging::map_user_readonly_in(child_pml4, cached_phys, *cached_size as u64);
                 let num_rw_pages = rw_alloc.size() / paging::PAGE_2M as usize;
                 for i in 0..num_rw_pages {
-                    let virt = *cached_addr + *rw_offset as u64 + i as u64 * paging::PAGE_2M;
-                    let phys = rw_alloc.ptr() as u64 + i as u64 * paging::PAGE_2M;
-                    paging::remap_user_2m_in(child_pml4, UserAddr::new(virt), PhysAddr::new(phys));
+                    let user_virt = cached_phys.raw() + *rw_offset as u64 + i as u64 * paging::PAGE_2M;
+                    let phys = PhysAddr::from_ptr(rw_alloc.ptr()) + i as u64 * paging::PAGE_2M;
+                    paging::remap_user_2m_in(child_pml4, UserAddr::new(user_virt), phys);
                 }
             }
         }
@@ -1227,7 +1250,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
     paging::map_user_in(child_pml4, stack_phys, USER_STACK_SIZE as u64);
 
     // 10. TLS setup
-    let mut tls_modules: Vec<(u64, usize, usize, usize)> = Vec::new();
+    let mut tls_modules: Vec<(KernelAddr, usize, usize, usize)> = Vec::new();
     let mut tls_cursor = 0usize;
     let mut max_tls_align = 1usize;
 
@@ -1266,7 +1289,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
         if tls_cursor > 0 {
             tls_cursor = (tls_cursor + 15) & !15;
         }
-        let template_addr = exe_tls_template.as_ref().unwrap().ptr() as u64;
+        let template_addr = KernelAddr::from_ptr(exe_tls_template.as_ref().unwrap().ptr());
         tls_modules.push((template_addr, layout.tls_filesz, layout.tls_memsz, tls_cursor));
         tls_cursor += layout.tls_memsz;
         if layout.tls_align > max_tls_align { max_tls_align = layout.tls_align; }
@@ -1289,7 +1312,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
     {
         let exe_base_offset = tls_modules.iter()
             .find(|&&(template, _, _, _)| {
-                exe_tls_template.as_ref().map_or(false, |buf| template == buf.ptr() as u64)
+                exe_tls_template.as_ref().map_or(false, |buf| template == KernelAddr::from_ptr(buf.ptr()))
             })
             .map(|&(_, _, _, bo)| bo)
             .unwrap_or(0);
@@ -1330,7 +1353,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
     let (tls_template, tls_filesz, tls_memsz) = if !tls_modules.is_empty() {
         (tls_modules[0].0, tls_modules[0].1, tls_modules[0].2)
     } else {
-        (0, 0, 0)
+        (KernelAddr::null(), 0, 0)
     };
 
     log!("spawn: TLS {} modules, total_memsz={}", tls_modules.len(), tls_total_memsz);
@@ -1344,7 +1367,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
             }
         }
     } else {
-        match setup_tls(0, 0, 0, 1) {
+        match setup_tls(KernelAddr::null(), 0, 0, 1) {
             Some(v) => v,
             None => {
                 log!("spawn: {}: failed to allocate TLS (empty)", path);

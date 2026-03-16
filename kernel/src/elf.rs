@@ -3,6 +3,7 @@ use alloc::vec::Vec;
 
 use crate::arch::paging::{self, PAGE_2M};
 use crate::process::OwnedAlloc;
+use crate::{PhysAddr, KernelAddr};
 use crate::sync::Lock;
 use elf::ElfBytes;
 use elf::endian::AnyEndian;
@@ -28,8 +29,8 @@ pub enum LibMemory {
     Shared {
         /// Private copy of the RW segment pages.
         rw_alloc: OwnedAlloc,
-        /// Start address of the cached allocation.
-        cached_addr: u64,
+        /// Physical start address of the cached allocation.
+        cached_addr: PhysAddr,
         /// Total size of the cached allocation.
         cached_size: usize,
         /// 2MB-aligned offset within cached alloc where private RW region starts.
@@ -55,7 +56,7 @@ pub struct CachedRelocs {
 }
 
 /// Scan rela/jmprel tables and extract non-RELATIVE entries.
-fn prescan_relocs(rela_addr: u64, rela_size: u64, jmprel_addr: u64, jmprel_size: u64) -> CachedRelocs {
+fn prescan_relocs(rela_addr: KernelAddr, rela_size: u64, jmprel_addr: KernelAddr, jmprel_size: u64) -> CachedRelocs {
     let mut relocs = CachedRelocs {
         bind: alloc::vec::Vec::new(),
         tpoff64: alloc::vec::Vec::new(),
@@ -63,13 +64,13 @@ fn prescan_relocs(rela_addr: u64, rela_size: u64, jmprel_addr: u64, jmprel_size:
     };
     let entry_size = 24u64;
     for (addr, size) in [(rela_addr, rela_size), (jmprel_addr, jmprel_size)] {
-        if size == 0 { continue; }
+        if size == 0 || addr.is_null() { continue; }
         let count = size / entry_size;
         for i in 0..count {
-            let ptr = (addr + i * entry_size) as *const u8;
-            let r_offset = unsafe { *(ptr as *const u64) };
-            let r_info = unsafe { *(ptr.add(8) as *const u64) };
-            let r_addend = unsafe { *(ptr.add(16) as *const i64) };
+            let entry = addr + (i * entry_size);
+            let r_offset = unsafe { entry.read_at::<u64>(0) };
+            let r_info = unsafe { entry.read_at::<u64>(8) };
+            let r_addend = unsafe { entry.read_at::<i64>(16) };
             let r_type = (r_info & 0xFFFF_FFFF) as u32;
             let r_sym = (r_info >> 32) as u32;
             match r_type {
@@ -140,11 +141,12 @@ fn cache_loaded_lib(path: &str, lib: LoadedLib, rw_vaddr: u64, rw_end_vaddr: u64
     };
     let size = alloc.size();
     let alloc_ptr = alloc.ptr();
-    let vaddr_min = alloc_ptr as u64 - base;
+    let vaddr_min = alloc_ptr as u64 - base.to_kernel().raw();
 
     // Compute the 2MB-aligned RW region within the allocation.
-    let rw_start_in_alloc = (base + rw_vaddr) as usize - alloc_ptr as usize;
-    let rw_end_in_alloc = (base + rw_end_vaddr) as usize - alloc_ptr as usize;
+    let base_kern = base.to_kernel();
+    let rw_start_in_alloc = (base_kern + rw_vaddr).raw() as usize - alloc_ptr as usize;
+    let rw_end_in_alloc = (base_kern + rw_end_vaddr).raw() as usize - alloc_ptr as usize;
     let rw_offset = rw_start_in_alloc & !(PAGE_2M as usize - 1);
     let rw_size = paging::align_2m(rw_end_in_alloc) - rw_offset;
 
@@ -154,7 +156,8 @@ fn cache_loaded_lib(path: &str, lib: LoadedLib, rw_vaddr: u64, rw_end_vaddr: u64
         path, relocs.bind.len(), relocs.tpoff64.len(), relocs.tpoff32.len());
 
     // Allocate private RW pages for the first user.
-    let cached_addr = alloc_ptr as u64;
+    // Store as physical address — user processes see physical addresses
+    let cached_addr = crate::PhysAddr::from_ptr(alloc_ptr);
     let rw_alloc = match OwnedAlloc::new_uninit(rw_size, PAGE_2M as usize) {
         Some(a) => a,
         None => {
@@ -168,7 +171,9 @@ fn cache_loaded_lib(path: &str, lib: LoadedLib, rw_vaddr: u64, rw_end_vaddr: u64
     };
     let src = unsafe { alloc_ptr.add(rw_offset) };
     unsafe { core::ptr::copy_nonoverlapping(src, rw_alloc.ptr(), rw_size); }
-    let rw_delta = rw_alloc.ptr() as i64 - (cached_addr as i64 + rw_offset as i64);
+    // rw_delta: from (phys + PHYS_OFFSET + rw_offset) → rw_alloc.ptr()
+    let cached_virt = cached_addr.to_kernel().raw();
+    let rw_delta = rw_alloc.ptr() as i64 - (cached_virt as i64 + rw_offset as i64);
 
     let cached = CachedLib {
         alloc,
@@ -176,19 +181,19 @@ fn cache_loaded_lib(path: &str, lib: LoadedLib, rw_vaddr: u64, rw_end_vaddr: u64
         vaddr_min,
         rw_offset,
         rw_size,
-        dynsym_off: dynsym - base,
-        dynstr_off: dynstr - base,
+        dynsym_off: dynsym - base_kern,
+        dynstr_off: dynstr - base_kern,
         dynstr_size,
         sym_count,
-        tls_vaddr: if tls_memsz > 0 { tls_template - base } else { 0 },
+        tls_vaddr: if tls_memsz > 0 { tls_template - base_kern } else { 0 },
         tls_filesz,
         tls_memsz,
         tls_align,
-        rela_off: rela_addr - base,
+        rela_off: rela_addr - base_kern,
         rela_size,
-        jmprel_off: jmprel_addr - base,
+        jmprel_off: jmprel_addr - base_kern,
         jmprel_size,
-        gnu_hash_off: if gnu_hash != 0 { gnu_hash - base } else { 0 },
+        gnu_hash_off: if !gnu_hash.is_null() { gnu_hash - base_kern } else { 0 },
         relocs: relocs.clone(),
     };
     SO_CACHE.lock().push((String::from(path), cached));
@@ -221,8 +226,8 @@ pub fn try_clone_cached(path: &str) -> Option<LoadedLib> {
 fn clone_from_cache(cached: &CachedLib) -> Option<LoadedLib> {
     let t0 = crate::clock::nanos_since_boot();
 
-    let cached_ptr = cached.alloc.ptr() as u64;
-    let base = cached_ptr - cached.vaddr_min;
+    let cached_phys = crate::PhysAddr::from_ptr(cached.alloc.ptr());
+    let base = cached_phys - cached.vaddr_min;
 
     // Allocate and copy only the private (RW) portion
     let rw_alloc = OwnedAlloc::new_uninit(cached.rw_size, PAGE_2M as usize)?;
@@ -230,34 +235,40 @@ fn clone_from_cache(cached: &CachedLib) -> Option<LoadedLib> {
     unsafe { core::ptr::copy_nonoverlapping(src, rw_alloc.ptr(), cached.rw_size); }
 
     let t1 = crate::clock::nanos_since_boot();
-    let rw_delta = rw_alloc.ptr() as i64 - (cached_ptr as i64 + cached.rw_offset as i64);
+    // rw_delta: from (phys + PHYS_OFFSET + rw_offset) → rw_alloc.ptr()
+    let cached_virt = cached.alloc.ptr() as i64;
+    let rw_delta = rw_alloc.ptr() as i64 - (cached_virt + cached.rw_offset as i64);
 
     log!("dlopen: cache hit (shared), {}MB total, {}MB private RW, copy={}ms",
         cached.alloc_size / (1024*1024), cached.rw_size / (1024*1024),
         (t1 - t0) / 1_000_000);
 
+    let base_kern = base.to_kernel();
     Some(LoadedLib {
         memory: LibMemory::Shared {
             rw_alloc,
-            cached_addr: cached_ptr,
+            cached_addr: cached_phys,
             cached_size: cached.alloc_size,
             rw_offset: cached.rw_offset,
             rw_delta,
         },
         base,
-        dynsym: base + cached.dynsym_off,
-        dynstr: base + cached.dynstr_off,
+        // dynsym/dynstr/rela/jmprel are kernel-read addresses → KernelAddr
+        dynsym: base_kern + cached.dynsym_off,
+        dynstr: base_kern + cached.dynstr_off,
         dynstr_size: cached.dynstr_size,
         sym_count: cached.sym_count,
-        tls_template: if cached.tls_memsz > 0 { base + cached.tls_vaddr } else { 0 },
+        tls_template: if cached.tls_memsz > 0 {
+            base_kern + cached.tls_vaddr
+        } else { KernelAddr::null() },
         tls_filesz: cached.tls_filesz,
         tls_memsz: cached.tls_memsz,
         tls_align: cached.tls_align,
-        rela_addr: base + cached.rela_off,
+        rela_addr: base_kern + cached.rela_off,
         rela_size: cached.rela_size,
-        jmprel_addr: base + cached.jmprel_off,
+        jmprel_addr: base_kern + cached.jmprel_off,
         jmprel_size: cached.jmprel_size,
-        gnu_hash: if cached.gnu_hash_off != 0 { base + cached.gnu_hash_off } else { 0 },
+        gnu_hash: if cached.gnu_hash_off != 0 { base_kern + cached.gnu_hash_off } else { KernelAddr::null() },
         cached_relocs: Some(cached.relocs.clone()),
     })
 }
@@ -265,8 +276,8 @@ fn clone_from_cache(cached: &CachedLib) -> Option<LoadedLib> {
 /// Derive total symbol count from a GNU hash table.
 /// The table is: [nbuckets, symoffset, bloom_size, bloom_shift, bloom[], buckets[], chain[]]
 /// Each bucket holds the lowest symbol index; each chain entry's bit 0 marks the end of a chain.
-fn gnu_hash_sym_count(addr: u64) -> usize {
-    let ptr = addr as *const u32;
+fn gnu_hash_sym_count(addr: KernelAddr) -> usize {
+    let ptr = addr.as_ptr::<u32>();
     let nbuckets = unsafe { *ptr } as usize;
     let symoffset = unsafe { *ptr.add(1) } as usize;
     let bloom_size = unsafe { *ptr.add(2) } as usize;
@@ -292,9 +303,9 @@ fn gnu_hash_sym_count(addr: u64) -> usize {
 
 /// Read a null-terminated string from `base + offset`, bounded by `max_size`.
 /// Returns `""` if the offset is out of bounds or no null terminator is found.
-fn bounded_cstr(base: u64, offset: u64, max_size: u64) -> &'static str {
+fn bounded_cstr(base: KernelAddr, offset: u64, max_size: u64) -> &'static str {
     if offset >= max_size { return ""; }
-    let ptr = (base + offset) as *const u8;
+    let ptr = (base + offset).as_ptr::<u8>();
     let remaining = (max_size - offset) as usize;
     let mut len = 0;
     while len < remaining {
@@ -745,25 +756,26 @@ pub fn build_symtab_map(
 
 pub struct LoadedLib {
     pub memory: LibMemory,
-    pub base: u64,
-    pub dynsym: u64,
-    pub dynstr: u64,
+    /// Physical base address (user-visible). User entry points and relocation
+    /// values are computed as base + ELF offset.
+    pub base: PhysAddr,
+    /// Kernel-readable pointers for symbol/relocation tables.
+    pub dynsym: KernelAddr,
+    pub dynstr: KernelAddr,
     pub dynstr_size: u64,
     pub sym_count: usize,
-    pub tls_template: u64,
+    /// Kernel-readable TLS template pointer for copy_nonoverlapping.
+    pub tls_template: KernelAddr,
     pub tls_filesz: usize,
     pub tls_memsz: usize,
     pub tls_align: usize,
-    /// Runtime address of .rela.dyn (RELA entries for GLOB_DAT etc.)
-    pub rela_addr: u64,
-    /// Size of .rela.dyn in bytes.
+    /// Kernel-readable relocation table pointers.
+    pub rela_addr: KernelAddr,
     pub rela_size: u64,
-    /// Runtime address of .rela.plt (JUMP_SLOT entries).
-    pub jmprel_addr: u64,
-    /// Size of .rela.plt in bytes.
+    pub jmprel_addr: KernelAddr,
     pub jmprel_size: u64,
-    /// Runtime address of .gnu.hash table (0 if absent).
-    pub gnu_hash: u64,
+    /// Kernel-readable .gnu.hash table pointer, or null.
+    pub gnu_hash: KernelAddr,
     /// Pre-scanned non-RELATIVE relocs (only for cached/shared libs).
     pub cached_relocs: Option<CachedRelocs>,
 }
@@ -774,11 +786,16 @@ impl LoadedLib {
     /// translated to the private physical pages via rw_delta.
     /// Write a value at a relocation target address.
     /// Uses unaligned writes because ELF relocation offsets aren't guaranteed aligned.
-    pub unsafe fn rw_write<T: Copy>(&self, cached_addr: u64, value: T) {
+    /// Write a value at a relocation target.
+    /// `phys_addr` is `lib.base + r_offset` (a physical/user-visible address).
+    /// Converts to a kernel-writable virtual pointer before writing.
+    pub unsafe fn rw_write<T: Copy>(&self, addr: PhysAddr, value: T) {
         let ptr = match &self.memory {
-            LibMemory::Owned(_) => cached_addr as *mut T,
+            LibMemory::Owned(_) => addr.as_mut_ptr::<T>(),
             LibMemory::Shared { rw_delta, .. } => {
-                (cached_addr as i64 + rw_delta) as *mut T
+                // addr.to_kernel() = virtual in cached alloc
+                // + rw_delta = virtual in private RW copy
+                (addr.to_kernel().raw() as i64 + rw_delta) as *mut T
             }
         };
         ptr.write_unaligned(value);
@@ -795,23 +812,23 @@ fn gnu_hash(name: &str) -> u32 {
 }
 
 /// Fast symbol lookup using .gnu.hash table.
-fn gnu_dlsym(lib: &LoadedLib, name: &str) -> Option<u64> {
-    if lib.gnu_hash == 0 {
+fn gnu_dlsym(lib: &LoadedLib, name: &str) -> Option<PhysAddr> {
+    if lib.gnu_hash.is_null() {
         return dlsym(lib, name);
     }
     let hash_addr = lib.gnu_hash;
     let h = gnu_hash(name);
 
     // Parse header: nbuckets, symoffset, bloom_size, bloom_shift
-    let nbuckets = unsafe { *((hash_addr) as *const u32) };
-    let symoffset = unsafe { *((hash_addr + 4) as *const u32) };
-    let bloom_size = unsafe { *((hash_addr + 8) as *const u32) };
-    let bloom_shift = unsafe { *((hash_addr + 12) as *const u32) };
+    let nbuckets = unsafe { hash_addr.read_at::<u32>(0) };
+    let symoffset = unsafe { hash_addr.read_at::<u32>(4) };
+    let bloom_size = unsafe { hash_addr.read_at::<u32>(8) };
+    let bloom_shift = unsafe { hash_addr.read_at::<u32>(12) };
 
     // Bloom filter check (64-bit words)
     let bloom_base = hash_addr + 16;
     let bloom_word = unsafe {
-        *((bloom_base + ((h as u64 / 64) % bloom_size as u64) * 8) as *const u64)
+        (bloom_base + ((h as u64 / 64) % bloom_size as u64) * 8).read_at::<u64>(0)
     };
     let mask = (1u64 << (h % 64)) | (1u64 << ((h >> bloom_shift) % 64));
     if bloom_word & mask != mask {
@@ -821,7 +838,7 @@ fn gnu_dlsym(lib: &LoadedLib, name: &str) -> Option<u64> {
     // Bucket lookup
     let buckets_base = bloom_base + bloom_size as u64 * 8;
     let bucket_idx = h % nbuckets;
-    let sym_idx = unsafe { *((buckets_base + bucket_idx as u64 * 4) as *const u32) };
+    let sym_idx = unsafe { (buckets_base + bucket_idx as u64 * 4).read_at::<u32>(0) };
     if sym_idx == 0 {
         return None;
     }
@@ -831,15 +848,15 @@ fn gnu_dlsym(lib: &LoadedLib, name: &str) -> Option<u64> {
     let mut i = sym_idx;
     loop {
         let chain_val = unsafe {
-            *((chains_base + (i - symoffset) as u64 * 4) as *const u32)
+            (chains_base + (i - symoffset) as u64 * 4).read_at::<u32>(0)
         };
         // Compare hash values (ignoring lowest bit which is the chain-end flag)
         if (chain_val | 1) == (h | 1) {
             // Hash matches — verify with string compare
-            let sym_ptr = (lib.dynsym + i as u64 * 24) as *const u8;
-            let st_name = unsafe { *(sym_ptr as *const u32) };
-            let st_shndx = unsafe { *(sym_ptr.add(6) as *const u16) };
-            let st_value = unsafe { *(sym_ptr.add(8) as *const u64) };
+            let sym_addr = lib.dynsym + i as u64 * 24;
+            let st_name = unsafe { sym_addr.read_at::<u32>(0) };
+            let st_shndx = unsafe { sym_addr.read_at::<u16>(6) };
+            let st_value = unsafe { sym_addr.read_at::<u64>(8) };
             if st_shndx != 0 {
                 let sym_name = bounded_cstr(lib.dynstr, st_name as u64, lib.dynstr_size);
                 if sym_name == name {
@@ -906,7 +923,8 @@ pub fn load_shared_lib(data: &[u8]) -> Result<(LoadedLib, u64, u64), &'static st
     };
     let t1 = crate::clock::nanos_since_boot();
     let base_ptr = alloc.ptr();
-    let base = base_ptr as u64 - vaddr_min;
+    let base_kern = KernelAddr::from_ptr(base_ptr as *const u8).raw() - vaddr_min; // kernel virtual base for loading
+    let base_phys = PhysAddr::from_ptr(base_ptr) - vaddr_min; // physical, for user-visible addresses
 
     // Copy PT_LOAD segments and zero BSS gaps.
     // Zero the entire range first to handle gaps between segments safely.
@@ -914,7 +932,7 @@ pub fn load_shared_lib(data: &[u8]) -> Result<(LoadedLib, u64, u64), &'static st
     let t2 = crate::clock::nanos_since_boot();
     for phdr in segments.iter() {
         if phdr.p_type == PT_LOAD {
-            let dst = (base + phdr.p_vaddr) as *mut u8;
+            let dst = (base_kern + phdr.p_vaddr) as *mut u8;
             let src = &data[phdr.p_offset as usize..][..phdr.p_filesz as usize];
             unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), dst, phdr.p_filesz as usize); }
         }
@@ -937,7 +955,7 @@ pub fn load_shared_lib(data: &[u8]) -> Result<(LoadedLib, u64, u64), &'static st
     let mut gnu_hash_vaddr = 0u64;
     for phdr in segments.iter() {
         if phdr.p_type == PT_DYNAMIC {
-            let dyn_addr = (base + phdr.p_vaddr) as *const u8;
+            let dyn_addr = (base_kern + phdr.p_vaddr) as *const u8;
             let dyn_size = phdr.p_filesz as usize;
             let mut offset = 0;
             while offset + 16 <= dyn_size {
@@ -962,7 +980,7 @@ pub fn load_shared_lib(data: &[u8]) -> Result<(LoadedLib, u64, u64), &'static st
 
     // Count .dynsym entries from GNU hash (avoids parsing section headers)
     let sym_count = if gnu_hash_vaddr != 0 {
-        gnu_hash_sym_count(base + gnu_hash_vaddr)
+        gnu_hash_sym_count(KernelAddr::from_ptr((base_kern + gnu_hash_vaddr) as *const u8))
     } else {
         // Fallback: parse section headers
         let mut count = 0;
@@ -977,25 +995,32 @@ pub fn load_shared_lib(data: &[u8]) -> Result<(LoadedLib, u64, u64), &'static st
         count
     };
 
-    let dynsym = base + symtab_vaddr;
-    let dynstr = base + strtab_vaddr;
+    let dynsym = KernelAddr::from_ptr((base_kern + symtab_vaddr) as *const u8);
+    let dynstr = KernelAddr::from_ptr((base_kern + strtab_vaddr) as *const u8);
 
     // Apply R_X86_64_RELATIVE relocations using DT_RELA/DT_JMPREL from PT_DYNAMIC
     // (much faster than parsing section headers for .rela.dyn/.rela.plt)
     let entry_size = 24u64;
     let mut reloc_count = 0u64;
-    for &(rela_addr, rela_sz) in &[(base + rela_vaddr, rela_size), (base + jmprel_vaddr, jmprel_size)] {
+    for &(rela_off, rela_sz) in &[(base_kern + rela_vaddr, rela_size), (base_kern + jmprel_vaddr, jmprel_size)] {
         if rela_sz == 0 { continue; }
         let num = rela_sz / entry_size;
         for i in 0..num {
-            let rela_ptr = (rela_addr + i * entry_size) as *const u8;
+            let rela_ptr = (rela_off + i * entry_size) as *const u8;
             let r_offset = unsafe { *(rela_ptr as *const u64) };
             let r_info = unsafe { *(rela_ptr.add(8) as *const u64) };
             let r_addend = unsafe { *(rela_ptr.add(16) as *const i64) };
             let r_type = (r_info & 0xFFFF_FFFF) as u32;
             if r_type == R_X86_64_RELATIVE {
-                let target = (base + r_offset) as *mut u64;
-                let value = (base as i64 + r_addend) as u64;
+                let target_addr = base_kern + r_offset;
+                let alloc_start = base_ptr as u64;
+                let alloc_end = alloc_start + load_size as u64;
+                if target_addr < alloc_start || target_addr + 8 > alloc_end {
+                    panic!("RELATIVE reloc out of bounds: target={:#x} alloc=[{:#x}..{:#x}] r_offset={:#x} base={:#x}",
+                        target_addr, alloc_start, alloc_end, r_offset, base_kern);
+                }
+                let target = target_addr as *mut u64;
+                let value = (base_phys.raw() as i64 + r_addend) as u64;
                 unsafe { *target = value; }
                 reloc_count += 1;
             }
@@ -1003,16 +1028,19 @@ pub fn load_shared_lib(data: &[u8]) -> Result<(LoadedLib, u64, u64), &'static st
     }
 
     // Parse PT_TLS for thread-local storage
-    let mut tls_template = 0u64;
+    let mut tls_template = KernelAddr::null();
     let mut tls_filesz = 0usize;
     let mut tls_memsz = 0usize;
     let mut tls_align = 0usize;
     for phdr in segments.iter() {
         if phdr.p_type == PT_TLS {
-            tls_template = base + phdr.p_vaddr;
+            tls_template = KernelAddr::from_ptr((base_kern + phdr.p_vaddr) as *const u8);
             tls_filesz = phdr.p_filesz as usize;
             tls_memsz = phdr.p_memsz as usize;
             tls_align = phdr.p_align as usize;
+            let alloc_end = base_ptr as u64 + load_size as u64;
+            crate::log!("dlopen TLS: base={:#x} base_ptr={:#x} vaddr_min={:#x} p_vaddr={:#x} template={} alloc=[{:#x}..{:#x}]",
+                base_kern, base_ptr as u64, vaddr_min, phdr.p_vaddr, tls_template, base_ptr as u64, alloc_end);
         }
     }
 
@@ -1022,22 +1050,29 @@ pub fn load_shared_lib(data: &[u8]) -> Result<(LoadedLib, u64, u64), &'static st
         (t1 - t0) / 1_000_000, (t2 - t1) / 1_000_000, (t3 - t2) / 1_000_000,
         (t4 - t3) / 1_000_000, reloc_count, sym_count);
 
-    Ok((LoadedLib { memory: LibMemory::Owned(alloc), base, dynsym, dynstr, dynstr_size: strtab_size, sym_count,
+    let rela_addr_kern = KernelAddr::from_ptr((base_kern + rela_vaddr) as *const u8);
+    let jmprel_addr_kern = KernelAddr::from_ptr((base_kern + jmprel_vaddr) as *const u8);
+    let gnu_hash_kern = if gnu_hash_vaddr != 0 {
+        KernelAddr::from_ptr((base_kern + gnu_hash_vaddr) as *const u8)
+    } else { KernelAddr::null() };
+
+    Ok((LoadedLib { memory: LibMemory::Owned(alloc), base: base_phys,
+        dynsym, dynstr, dynstr_size: strtab_size, sym_count,
         tls_template, tls_filesz, tls_memsz, tls_align,
-        rela_addr: base + rela_vaddr, rela_size,
-        jmprel_addr: base + jmprel_vaddr, jmprel_size,
-        gnu_hash: if gnu_hash_vaddr != 0 { base + gnu_hash_vaddr } else { 0 },
+        rela_addr: rela_addr_kern, rela_size,
+        jmprel_addr: jmprel_addr_kern, jmprel_size,
+        gnu_hash: gnu_hash_kern,
         cached_relocs: None }, rw_vaddr, rw_end_vaddr))
 }
 
 /// Look up a symbol by name in a loaded shared library.
-pub fn dlsym(lib: &LoadedLib, name: &str) -> Option<u64> {
+pub fn dlsym(lib: &LoadedLib, name: &str) -> Option<PhysAddr> {
     // Each Elf64_Sym is 24 bytes: st_name(4), st_info(1), st_other(1), st_shndx(2), st_value(8), st_size(8)
     for i in 1..lib.sym_count {
-        let sym_ptr = (lib.dynsym + i as u64 * 24) as *const u8;
-        let st_name = unsafe { *(sym_ptr as *const u32) };
-        let st_shndx = unsafe { *(sym_ptr.add(6) as *const u16) };
-        let st_value = unsafe { *(sym_ptr.add(8) as *const u64) };
+        let sym_addr = lib.dynsym + i as u64 * 24;
+        let st_name = unsafe { sym_addr.read_at::<u32>(0) };
+        let st_shndx = unsafe { sym_addr.read_at::<u16>(6) };
+        let st_value = unsafe { sym_addr.read_at::<u64>(8) };
 
         if st_shndx == 0 {
             continue;
@@ -1058,12 +1093,12 @@ pub fn resolve_dlopen_relocs(lib: &LoadedLib, other_libs: &[LoadedLib]) {
     let mut unresolved_count = 0u64;
 
     let resolve_one = |r_offset: u64, r_sym: u32, resolved_count: &mut u64, unresolved_count: &mut u64| {
-        let sym_entry = (lib.dynsym + r_sym as u64 * 24) as *const u8;
-        let st_name = unsafe { *(sym_entry as *const u32) };
+        let sym_entry = lib.dynsym + r_sym as u64 * 24;
+        let st_name = unsafe { sym_entry.read_at::<u32>(0) };
         let sym_name = bounded_cstr(lib.dynstr, st_name as u64, lib.dynstr_size);
         let resolved = other_libs.iter().find_map(|other| gnu_dlsym(other, sym_name));
         if let Some(addr) = resolved {
-            unsafe { lib.rw_write::<u64>(lib.base + r_offset, addr); }
+            unsafe { lib.rw_write::<u64>(lib.base + r_offset, addr.raw()); }
             *resolved_count += 1;
         } else {
             if *unresolved_count < 5 {
@@ -1080,12 +1115,12 @@ pub fn resolve_dlopen_relocs(lib: &LoadedLib, other_libs: &[LoadedLib]) {
     } else {
         let entry_size = 24u64;
         for (rela_addr, rela_size) in [(lib.rela_addr, lib.rela_size), (lib.jmprel_addr, lib.jmprel_size)] {
-            if rela_size == 0 { continue; }
+            if rela_size == 0 || rela_addr.is_null() { continue; }
             let count = rela_size / entry_size;
             for i in 0..count {
-                let rela_ptr = (rela_addr + i * entry_size) as *const u8;
-                let r_offset = unsafe { *(rela_ptr as *const u64) };
-                let r_info = unsafe { *(rela_ptr.add(8) as *const u64) };
+                let entry = rela_addr + i * entry_size;
+                let r_offset = unsafe { entry.read_at::<u64>(0) };
+                let r_info = unsafe { entry.read_at::<u64>(8) };
                 let r_type = (r_info & 0xFFFF_FFFF) as u32;
                 let r_sym = (r_info >> 32) as u32;
                 if r_type == 6 || r_type == 7 {
@@ -1107,7 +1142,7 @@ pub fn resolve_lib_bind_relocs_pub(
 }
 
 /// Public wrapper for gnu_dlsym.
-pub fn gnu_dlsym_pub(lib: &LoadedLib, name: &str) -> Option<u64> {
+pub fn gnu_dlsym_pub(lib: &LoadedLib, name: &str) -> Option<PhysAddr> {
     gnu_dlsym(lib, name)
 }
 
@@ -1121,11 +1156,11 @@ fn resolve_lib_bind_relocs(
     if let Some(relocs) = &lib.cached_relocs {
         // Fast path: only iterate the pre-scanned GLOB_DAT/JUMP_SLOT entries
         for &(r_offset, r_sym) in &relocs.bind {
-            let sym_entry = (lib.dynsym + r_sym as u64 * 24) as *const u8;
-            let st_name = unsafe { *(sym_entry as *const u32) };
+            let sym_entry = lib.dynsym + r_sym as u64 * 24;
+            let st_name = unsafe { sym_entry.read_at::<u32>(0) };
             let sym_name = bounded_cstr(lib.dynstr, st_name as u64, lib.dynstr_size);
             let resolved = exe_sym_map.get(sym_name).copied()
-                .or_else(|| libs.iter().find_map(|other| gnu_dlsym(other, sym_name)));
+                .or_else(|| libs.iter().find_map(|other| gnu_dlsym(other, sym_name).map(|a| a.raw())));
             if let Some(addr) = resolved {
                 unsafe { lib.rw_write::<u64>(lib.base + r_offset, addr); }
                 if sym_name == "main" {
@@ -1139,22 +1174,22 @@ fn resolve_lib_bind_relocs(
         // Slow path: scan all relocation entries (fresh load, not cached)
         let entry_size = 24u64;
         for (rela_addr, rela_size) in [(lib.rela_addr, lib.rela_size), (lib.jmprel_addr, lib.jmprel_size)] {
-            if rela_size == 0 { continue; }
+            if rela_size == 0 || rela_addr.is_null() { continue; }
             let count = rela_size / entry_size;
             for i in 0..count {
-                let rela_ptr = (rela_addr + i * entry_size) as *const u8;
-                let r_offset = unsafe { *(rela_ptr as *const u64) };
-                let r_info = unsafe { *(rela_ptr.add(8) as *const u64) };
-                let r_addend = unsafe { *(rela_ptr.add(16) as *const i64) };
+                let entry = rela_addr + i * entry_size;
+                let r_offset = unsafe { entry.read_at::<u64>(0) };
+                let r_info = unsafe { entry.read_at::<u64>(8) };
+                let r_addend = unsafe { entry.read_at::<i64>(16) };
                 let r_type = (r_info & 0xFFFF_FFFF) as u32;
                 let r_sym = (r_info >> 32) as u32;
                 match r_type {
                     6 | 7 => {
-                        let sym_entry = (lib.dynsym + r_sym as u64 * 24) as *const u8;
-                        let st_name = unsafe { *(sym_entry as *const u32) };
+                        let sym_entry = lib.dynsym + r_sym as u64 * 24;
+                        let st_name = unsafe { sym_entry.read_at::<u32>(0) };
                         let sym_name = bounded_cstr(lib.dynstr, st_name as u64, lib.dynstr_size);
                         let resolved = exe_sym_map.get(sym_name).copied()
-                            .or_else(|| libs.iter().find_map(|other| gnu_dlsym(other, sym_name)));
+                            .or_else(|| libs.iter().find_map(|other| gnu_dlsym(other, sym_name).map(|a| a.raw())));
                         if let Some(addr) = resolved {
                             unsafe { lib.rw_write::<u64>(lib.base + r_offset, addr); }
                             if sym_name == "main" {
@@ -1165,7 +1200,7 @@ fn resolve_lib_bind_relocs(
                         }
                     }
                     8 => {
-                        unsafe { lib.rw_write::<u64>(lib.base + r_offset, (lib.base as i64 + r_addend) as u64); }
+                        unsafe { lib.rw_write::<u64>(lib.base + r_offset, (lib.base.raw() as i64 + r_addend) as u64); }
                     }
                     _ => {}
                 }
@@ -1178,7 +1213,7 @@ fn resolve_lib_bind_relocs(
 pub struct TlsModuleInfo<'a> {
     pub libs: &'a [LoadedLib],
     /// (tls_template, tls_filesz, tls_memsz, base_offset) for each TLS module
-    pub modules: &'a [(u64, usize, usize, usize)],
+    pub modules: &'a [(KernelAddr, usize, usize, usize)],
 }
 
 /// Apply R_X86_64_TPOFF64 and R_X86_64_TPOFF32 relocations in a shared library.
@@ -1209,13 +1244,13 @@ pub fn apply_tpoff_relocs(lib: &LoadedLib, lib_base_offset: usize, total_memsz: 
         let mut count64 = 0u64;
         let mut count32 = 0u64;
         for (rela_addr, rela_size) in [(lib.rela_addr, lib.rela_size), (lib.jmprel_addr, lib.jmprel_size)] {
-            if rela_size == 0 { continue; }
+            if rela_size == 0 || rela_addr.is_null() { continue; }
             let num = rela_size / entry_size;
             for i in 0..num {
-                let rela_ptr = (rela_addr + i * entry_size) as *const u8;
-                let r_offset = unsafe { *(rela_ptr as *const u64) };
-                let r_info = unsafe { *(rela_ptr.add(8) as *const u64) };
-                let r_addend = unsafe { *(rela_ptr.add(16) as *const i64) };
+                let entry = rela_addr + i * entry_size;
+                let r_offset = unsafe { entry.read_at::<u64>(0) };
+                let r_info = unsafe { entry.read_at::<u64>(8) };
+                let r_addend = unsafe { entry.read_at::<i64>(16) };
                 let r_type = (r_info & 0xFFFF_FFFF) as u32;
                 let r_sym = (r_info >> 32) as u32;
                 if r_type == R_X86_64_TPOFF64 {
@@ -1239,10 +1274,10 @@ pub fn apply_tpoff_relocs(lib: &LoadedLib, lib_base_offset: usize, total_memsz: 
 /// Compute a TPOFF value for a relocation entry.
 fn compute_tpoff(lib: &LoadedLib, r_sym: u32, r_addend: i64, lib_base_offset: usize, total_memsz: usize, tls_info: &TlsModuleInfo) -> i64 {
     if r_sym != 0 {
-        let sym_entry = (lib.dynsym + r_sym as u64 * 24) as *const u8;
-        let st_shndx = unsafe { *(sym_entry.add(6) as *const u16) };
+        let sym_entry = lib.dynsym + r_sym as u64 * 24;
+        let st_shndx = unsafe { sym_entry.read_at::<u16>(6) };
         if st_shndx != 0 {
-            let st_value = unsafe { *(sym_entry.add(8) as *const u64) };
+            let st_value = unsafe { sym_entry.read_at::<u64>(8) };
             lib_base_offset as i64 + st_value as i64 + r_addend - total_memsz as i64
         } else {
             resolve_cross_lib_tpoff(lib, r_sym, tls_info, total_memsz)
@@ -1262,11 +1297,11 @@ pub fn tls_dlsym_pub(lib: &LoadedLib, name: &str) -> Option<u64> {
 fn tls_dlsym(lib: &LoadedLib, name: &str) -> Option<u64> {
     // Linear scan of dynsym since gnu_hash adds base which is wrong for TLS
     for idx in 0..lib.sym_count {
-        let sym_ptr = (lib.dynsym + idx as u64 * 24) as *const u8;
-        let st_name = unsafe { *(sym_ptr as *const u32) };
-        let st_info = unsafe { *sym_ptr.add(4) };
-        let st_shndx = unsafe { *(sym_ptr.add(6) as *const u16) };
-        let st_value = unsafe { *(sym_ptr.add(8) as *const u64) };
+        let sym_addr = lib.dynsym + idx as u64 * 24;
+        let st_name = unsafe { sym_addr.read_at::<u32>(0) };
+        let st_info = unsafe { sym_addr.read_at::<u8>(4) };
+        let st_shndx = unsafe { sym_addr.read_at::<u16>(6) };
+        let st_value = unsafe { sym_addr.read_at::<u64>(8) };
         // STT_TLS = 6
         if st_shndx != 0 && (st_info & 0xf) == 6 {
             let sym_name = bounded_cstr(lib.dynstr, st_name as u64, lib.dynstr_size);
@@ -1282,8 +1317,8 @@ fn tls_dlsym(lib: &LoadedLib, name: &str) -> Option<u64> {
 /// from `lib`'s dynsym, finding which library defines it, and computing the tpoff.
 fn resolve_cross_lib_tpoff(lib: &LoadedLib, r_sym: u32, tls_info: &TlsModuleInfo, total_memsz: usize) -> i64 {
     // Read symbol name from lib's dynsym/dynstr
-    let sym_entry = (lib.dynsym + r_sym as u64 * 24) as *const u8;
-    let st_name = unsafe { *(sym_entry as *const u32) };
+    let sym_entry = lib.dynsym + r_sym as u64 * 24;
+    let st_name = unsafe { sym_entry.read_at::<u32>(0) };
     let sym_name = bounded_cstr(lib.dynstr, st_name as u64, lib.dynstr_size);
 
     // Search all libraries for the defining TLS symbol

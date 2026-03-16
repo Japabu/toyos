@@ -1201,7 +1201,7 @@ fn sys_dlopen(path: &str) -> u64 {
         }
         crate::elf::LibMemory::Shared { rw_alloc, cached_addr, cached_size, rw_offset, .. } => {
             let pml4 = cpu::read_cr3().as_mut_ptr();
-            let cached_phys = PhysAddr::from_ptr(*cached_addr as *const u8);
+            let cached_phys = *cached_addr;
             paging::map_user_readonly_in(pml4, cached_phys, *cached_size as u64);
             let num_rw_pages = rw_alloc.size() / paging::PAGE_2M as usize;
             for i in 0..num_rw_pages {
@@ -1296,9 +1296,9 @@ fn sys_dlopen(path: &str) -> u64 {
 
             let &(template, filesz, _memsz, base_offset) = &modules[0];
             let dest = (new_tls_start + base_offset as u64) as *mut u8;
-            if filesz > 0 && template != 0 {
+            if filesz > 0 && !template.is_null() {
                 unsafe {
-                    core::ptr::copy_nonoverlapping(template as *const u8, dest, filesz);
+                    core::ptr::copy_nonoverlapping(template.as_ptr::<u8>(), dest, filesz);
                 }
             }
 
@@ -1326,7 +1326,7 @@ fn sys_dlsym(handle: u64, name: &str) -> u64 {
         return SyscallError::NotFound.to_u64();
     }
     match crate::elf::dlsym(&data.loaded_libs[idx], name) {
-        Some(addr) => addr,
+        Some(addr) => addr.raw(),
         None => u64::MAX,
     }
 }

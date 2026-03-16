@@ -40,6 +40,11 @@ impl PhysAddr {
         VirtAddr(self.0 + PHYS_OFFSET)
     }
 
+    /// Convert to a KernelAddr for structured memory access.
+    pub const fn to_kernel(self) -> KernelAddr {
+        KernelAddr((self.0 + PHYS_OFFSET) as *const u8)
+    }
+
     /// Dereferenceable pointer via the high-half direct map.
     pub const fn as_ptr<T>(self) -> *const T {
         (self.0 + PHYS_OFFSET) as *const T
@@ -291,6 +296,100 @@ impl fmt::Display for UserAddr {
 impl fmt::LowerHex for UserAddr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::LowerHex::fmt(&self.0, f)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// KernelAddr
+// ---------------------------------------------------------------------------
+
+/// Kernel virtual pointer into the high-half direct map. Wraps a raw pointer
+/// with arithmetic helpers for ELF parsing and other structured memory access.
+/// Created from `PhysAddr::to_kernel()` — cannot be constructed from user addresses.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(transparent)]
+pub struct KernelAddr(*const u8);
+
+// SAFETY: KernelAddr points into the kernel direct map which is globally accessible.
+unsafe impl Send for KernelAddr {}
+unsafe impl Sync for KernelAddr {}
+
+impl KernelAddr {
+    pub const fn null() -> Self {
+        Self(core::ptr::null())
+    }
+
+    pub const fn is_null(self) -> bool {
+        self.0.is_null()
+    }
+
+    pub fn raw(self) -> u64 {
+        self.0 as u64
+    }
+
+    pub const fn as_ptr<T>(self) -> *const T {
+        self.0 as *const T
+    }
+
+    pub const fn as_mut_ptr<T>(self) -> *mut T {
+        self.0 as *mut T
+    }
+
+    /// Read a value at byte offset from this address.
+    pub unsafe fn read_at<T: Copy>(self, byte_offset: usize) -> T {
+        (self.0.add(byte_offset) as *const T).read_unaligned()
+    }
+
+    /// Offset by bytes, returning a new KernelAddr.
+    pub const fn add(self, bytes: usize) -> Self {
+        Self(unsafe { self.0.add(bytes) })
+    }
+
+    /// Convert back to physical address.
+    pub fn to_phys(self) -> PhysAddr {
+        PhysAddr::from_ptr(self.0)
+    }
+
+    /// Create from a raw kernel virtual pointer.
+    pub fn from_ptr<T>(ptr: *const T) -> Self {
+        debug_assert!(
+            ptr as u64 >= PHYS_OFFSET || ptr.is_null(),
+            "KernelAddr::from_ptr: {:#x} is not a direct-map address",
+            ptr as u64,
+        );
+        Self(ptr as *const u8)
+    }
+}
+
+impl Add<u64> for KernelAddr {
+    type Output = Self;
+    fn add(self, rhs: u64) -> Self {
+        Self(unsafe { self.0.add(rhs as usize) })
+    }
+}
+
+impl Sub<KernelAddr> for KernelAddr {
+    type Output = u64;
+    fn sub(self, rhs: Self) -> u64 {
+        self.0 as u64 - rhs.0 as u64
+    }
+}
+
+impl fmt::Debug for KernelAddr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "KernelAddr({:#018x})", self.0 as u64)
+    }
+}
+
+impl fmt::Display for KernelAddr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:#018x}", self.0 as u64)
+    }
+}
+
+impl fmt::LowerHex for KernelAddr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::LowerHex::fmt(&(self.0 as u64), f)
     }
 }
 

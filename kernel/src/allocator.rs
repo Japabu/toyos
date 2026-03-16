@@ -186,6 +186,11 @@ fn is_early_ptr(ptr: *mut u8) -> bool {
     p >= buf_start && p < buf_start + EARLY_SIZE
 }
 
+pub fn early_buf_range() -> (u64, u64) {
+    let start = EARLY_BUF.0.get() as u64;
+    (start, start + EARLY_SIZE as u64)
+}
+
 unsafe impl GlobalAlloc for KernelAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let phase = *self.phase.get();
