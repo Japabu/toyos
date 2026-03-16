@@ -1,4 +1,5 @@
 use alloc::alloc::{alloc_zeroed, dealloc};
+use alloc::vec::Vec;
 use core::alloc::Layout;
 
 use toyos_abi::ring::RingHeader;
@@ -33,7 +34,13 @@ struct Pipe {
     layout: Layout,
     readers: u32,
     writers: u32,
+    /// PML4 pointers of processes that have this pipe mapped (for unmap on free).
+    mapped_in: Vec<*mut u64>,
 }
+
+// SAFETY: mapped_in contains raw PML4 pointers — physical addresses valid across CPUs.
+// Access is serialized by the PIPES lock.
+unsafe impl Send for Pipe {}
 
 impl Pipe {
     fn new() -> Self {
@@ -46,6 +53,7 @@ impl Pipe {
             layout,
             readers: 1,
             writers: 1,
+            mapped_in: Vec::new(),
         }
     }
 
@@ -149,6 +157,12 @@ pub fn add_writer(pipe_id: PipeId) {
 }
 
 fn free_pipe(pipe: Pipe) {
+    // Unmap USER bit from all processes' page tables before freeing memory.
+    // Without this, the freed pages retain USER bit, and if the heap reuses
+    // this memory for kernel stacks, SMAP violations occur during context_switch.
+    for &pml4 in &pipe.mapped_in {
+        paging::unmap_user(pml4, pipe.phys_addr, PIPE_SIZE as u64);
+    }
     unsafe { dealloc(pipe.phys_addr.as_mut_ptr(), pipe.layout); }
 }
 
@@ -180,12 +194,25 @@ pub fn close_write(pipe_id: PipeId) {
     });
 }
 
+/// Remove a PML4 from all pipes' mapped_in lists (called during process exit).
+/// Does NOT unmap — the page tables are about to be freed anyway.
+pub fn cleanup_pml4(pml4: *mut u64) {
+    with_pipes_mut(|pipes| {
+        for (_, pipe) in pipes.iter_mut() {
+            pipe.mapped_in.retain(|p| *p != pml4);
+        }
+    });
+}
+
 /// Map a pipe's shared memory into a process's address space.
 /// Returns the physical address (which is the mapping address due to identity mapping).
 pub fn map_into(pipe_id: PipeId, pml4: *mut u64) -> Option<u64> {
-    with_pipes(|pipes| {
-        let pipe = pipes.get(pipe_id)?;
+    with_pipes_mut(|pipes| {
+        let pipe = pipes.get_mut(pipe_id)?;
         paging::map_user_in(pml4, pipe.phys_addr, PIPE_SIZE as u64);
+        if !pipe.mapped_in.contains(&pml4) {
+            pipe.mapped_in.push(pml4);
+        }
         Some(pipe.phys_addr.raw())
     })
 }

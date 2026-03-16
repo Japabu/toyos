@@ -113,7 +113,6 @@ fn schedule_inner(mut guard: crate::sync::LockGuard<'_, Option<ProcessTable>>) {
         core::mem::forget(guard);
         unsafe { context_switch(old_rsp_ptr, new_rsp); }
         unsafe { PROCESS_TABLE.force_unlock(); }
-        unsafe { cpu::stac(); }
         return;
     }
 
@@ -132,7 +131,6 @@ fn schedule_inner(mut guard: crate::sync::LockGuard<'_, Option<ProcessTable>>) {
     core::mem::forget(guard);
     unsafe { context_switch(old_rsp_ptr, percpu::idle_rsp()); }
     unsafe { PROCESS_TABLE.force_unlock(); }
-    unsafe { cpu::stac(); }
 }
 
 /// Schedule without saving current context (used by ap_idle and BSP boot).
@@ -211,7 +209,6 @@ fn cpu_idle_loop() -> ! {
                 core::mem::forget(guard);
                 unsafe { context_switch(percpu::idle_rsp_ptr(), new_rsp); }
                 unsafe { PROCESS_TABLE.force_unlock(); }
-                unsafe { cpu::stac(); }
                 continue;
             }
         }
@@ -332,10 +329,13 @@ pub fn wake_pipe_writers(pipe_id: crate::pipe::PipeId) {
 }
 
 /// Naked assembly context switch.
-/// Saves callee-saved regs to old stack, loads new stack, restores regs, returns.
+/// Saves callee-saved regs + RFLAGS to old stack, loads new stack, restores.
+/// RFLAGS must be preserved so the AC bit (SMAP override via stac) survives
+/// context switches during blocking syscalls.
 #[unsafe(naked)]
 unsafe extern "C" fn context_switch(old_rsp: *mut u64, new_rsp: u64) {
     naked_asm!(
+        "pushfq",
         "push rbp",
         "push rbx",
         "push r12",
@@ -350,6 +350,7 @@ unsafe extern "C" fn context_switch(old_rsp: *mut u64, new_rsp: u64) {
         "pop r12",
         "pop rbx",
         "pop rbp",
+        "popfq",
         "ret",
     );
 }

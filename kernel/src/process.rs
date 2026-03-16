@@ -90,26 +90,31 @@ const USER_STACK_SIZE: usize = 4 * PAGE_2M as usize; // 8 MB
 pub const KERNEL_STACK_SIZE: usize = 128 * 1024;
 
 /// Write argc, argv pointers, and string data onto a user stack. Returns new SP.
+/// Write argv onto a user stack. `stack_top` is the user-visible (physical) address.
+/// Returns the new user-visible stack pointer.
 pub fn write_argv_to_stack(stack_top: u64, args: &[&str]) -> u64 {
     let mut sp = stack_top;
     let mut argv_ptrs: Vec<u64> = Vec::with_capacity(args.len());
     for arg in args.iter().rev() {
         sp -= (arg.len() + 1) as u64;
+        // Write to user memory via the kernel direct map
+        let kptr = (sp + crate::PHYS_OFFSET) as *mut u8;
         unsafe {
-            core::ptr::copy_nonoverlapping(arg.as_ptr(), sp as *mut u8, arg.len());
-            *((sp + arg.len() as u64) as *mut u8) = 0;
+            core::ptr::copy_nonoverlapping(arg.as_ptr(), kptr, arg.len());
+            *kptr.add(arg.len()) = 0;
         }
-        argv_ptrs.push(sp);
+        argv_ptrs.push(sp); // user-visible address
     }
     argv_ptrs.reverse();
     let metadata_qwords = args.len() + 2;
     sp = (sp - metadata_qwords as u64 * 8) & !15;
     unsafe {
-        *(sp as *mut u64) = args.len() as u64;
+        let ksp = (sp + crate::PHYS_OFFSET) as *mut u64;
+        *ksp = args.len() as u64;
         for (i, ptr) in argv_ptrs.iter().enumerate() {
-            *((sp + 8 + i as u64 * 8) as *mut u64) = *ptr;
+            *ksp.add(1 + i) = *ptr;
         }
-        *((sp + 8 + args.len() as u64 * 8) as *mut u64) = 0;
+        *ksp.add(1 + args.len()) = 0;
     }
     sp
 }
@@ -623,10 +628,14 @@ pub fn setup_combined_tls(
         }
     }
 
-    let tp = block as u64 + (tls_start + total_memsz) as u64;
-    unsafe { *(tp as *mut u64) = tp; }
+    // TP must be a user-visible address (physical, identity-mapped with USER bit).
+    let block_phys = PhysAddr::from_ptr(block).raw();
+    let tp_user = block_phys + (tls_start + total_memsz) as u64;
+    // Write self-pointer via kernel direct map
+    let tp_kernel = block as u64 + (tls_start + total_memsz) as u64;
+    unsafe { *(tp_kernel as *mut u64) = tp_user; }
 
-    Some((alloc, tp))
+    Some((alloc, tp_user))
 }
 
 // ---------------------------------------------------------------------------
@@ -643,7 +652,8 @@ fn alloc_kernel_stack(
 ) -> Option<(OwnedAlloc, u64)> {
     let alloc = OwnedAlloc::new(KERNEL_STACK_SIZE, 4096)?;
     let top = alloc.ptr() as u64 + KERNEL_STACK_SIZE as u64;
-    let frame = (top - 7 * 8) as *mut u64;
+    // Must match context_switch layout: pushfq, push rbp..r15 (8 values) + return address
+    let frame = (top - 8 * 8) as *mut u64;
     unsafe {
         *frame.add(0) = 0;                    // r15
         *frame.add(1) = arg;                  // r14
@@ -651,7 +661,8 @@ fn alloc_kernel_stack(
         *frame.add(3) = user_entry;           // r12
         *frame.add(4) = 0;                    // rbx
         *frame.add(5) = 0;                    // rbp
-        *frame.add(6) = trampoline as u64;    // return address
+        *frame.add(6) = 0x002;                // RFLAGS (IF=0, AC=0)
+        *frame.add(7) = trampoline as u64;    // return address
     }
     Some((alloc, frame as u64))
 }
@@ -1216,9 +1227,10 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
             return Err(SyscallError::ResourceExhausted);
         }
     };
-    let stack_base = stack_alloc.ptr() as u64;
+    let stack_phys = PhysAddr::from_ptr(stack_alloc.ptr());
+    let stack_base = stack_phys.raw();
     let stack_top = stack_base + USER_STACK_SIZE as u64;
-    paging::map_user_in(child_pml4, PhysAddr::new(stack_base), USER_STACK_SIZE as u64);
+    paging::map_user_in(child_pml4, stack_phys, USER_STACK_SIZE as u64);
 
     // 10. TLS setup
     let mut tls_modules: Vec<(u64, usize, usize, usize)> = Vec::new();
@@ -1379,6 +1391,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
         }
     };
 
+
     let cwd = match parent {
         Some(ppid) => {
             let arc = {
@@ -1518,6 +1531,7 @@ fn teardown_scheduling(table: &mut ProcessTable, pid: Pid, code: i32) {
     let root = entry.take_cr3();
     let pml4 = root.as_ptr();
     shared_memory::cleanup_process(pid);
+    crate::pipe::cleanup_pml4(pml4);
     paging::free_user_page_tables(pml4);
     let has_parent = matches!(entry.kind(), Kind::Process { parent: Some(_) });
     entry.zombify(code);
@@ -1595,6 +1609,7 @@ pub fn exit(code: i32) -> ! {
 /// the process. For threads, zombifies without freeing the address space.
 pub fn thread_exit(code: i32) -> ! {
     let kind = with_current_sched(|s| *s.kind());
+    let process_pml4 = with_current_sched(|s| s.cr3().map(|c| c.as_ptr()));
 
     unsafe { cpu::write_cr3(paging::kernel_cr3()); }
 
@@ -1605,6 +1620,11 @@ pub fn thread_exit(code: i32) -> ! {
                 let data_arc = current_data();
                 let mut data = data_arc.lock();
                 fd::close_all(&mut data.fds, &mut *vfs::lock(), current_pid());
+                // Clear USER bits from shared page tables before freeing TLS,
+                // so the freed memory doesn't have stale USER PTEs.
+                if let (Some(tls), Some(pml4)) = (data.tls_alloc.as_ref(), process_pml4) {
+                    paging::unmap_user(pml4, PhysAddr::from_ptr(tls.ptr()), tls.size() as u64);
+                }
                 data.tls_alloc.take();
             }
 
@@ -1746,8 +1766,8 @@ pub fn futex_wait(addr: u64, expected: u32, timeout_ns: u64) -> u64 {
         None => return u64::MAX,
     };
 
-    // Atomic check: read the user value under the lock
-    let current = unsafe { core::ptr::read_volatile(addr as *const u32) };
+    // Atomic check: read the user value via the kernel direct map (no stac needed)
+    let current = unsafe { core::ptr::read_volatile((phys_addr.raw() + crate::PHYS_OFFSET) as *const u32) };
     if current != expected {
         return 0;
     }
@@ -2055,6 +2075,7 @@ pub fn dump_crash_diagnostics(fault_addr: u64, rip: u64) {
     // Read a u64 from a user virtual address via page table translation.
     // Uses the physical address (identity-mapped without USER bit) to avoid SMAP faults.
     let read_user = |virt: u64| -> Option<u64> {
+        if virt % 8 != 0 { return None; }
         let phys = paging::virt_to_phys(pml4 as *const u64, UserAddr::new(virt))?;
         Some(unsafe { *phys.as_ptr::<u64>() })
     };
@@ -2196,6 +2217,7 @@ pub fn kill_process(target_pid: Pid) -> u64 {
     let root = entry.take_cr3();
     let pml4 = root.as_ptr();
     shared_memory::cleanup_process(target_pid);
+    crate::pipe::cleanup_pml4(pml4);
     paging::free_user_page_tables(pml4);
 
     entry.zombify(137); // 128 + 9 (SIGKILL-like)
