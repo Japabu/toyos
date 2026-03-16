@@ -132,7 +132,7 @@ impl VirtioPciConfig {
 
 /// A VirtIO split virtqueue backed by a single DMA page.
 pub struct Virtqueue {
-    base_phys: u64,
+    base_phys: crate::DmaAddr,
     base_virt: *mut u8,
     next_desc: u16,
     last_used_idx: u16,
@@ -150,7 +150,7 @@ pub enum BufDir {
 impl Virtqueue {
     /// Create a new virtqueue backed by the given DMA page.
     /// `phys` is the physical address (for device registers), `virt` is the kernel pointer.
-    pub fn new(phys: u64, virt: *mut u8) -> Self {
+    pub fn new(phys: crate::DmaAddr, virt: *mut u8) -> Self {
         unsafe { write_bytes(virt, 0, 4096); }
         Self {
             base_phys: phys,
@@ -167,9 +167,9 @@ impl Virtqueue {
     fn used(&self) -> *const VirtqUsed { unsafe { self.base_virt.add(USED_OFFSET as usize) as *const VirtqUsed } }
 
     /// Physical addresses for device register programming.
-    fn descs_phys(&self) -> u64 { self.base_phys + DESC_OFFSET }
-    fn avail_phys(&self) -> u64 { self.base_phys + AVAIL_OFFSET }
-    fn used_phys(&self) -> u64 { self.base_phys + USED_OFFSET }
+    fn descs_phys(&self) -> u64 { self.base_phys.raw() + DESC_OFFSET }
+    fn avail_phys(&self) -> u64 { self.base_phys.raw() + AVAIL_OFFSET }
+    fn used_phys(&self) -> u64 { self.base_phys.raw() + USED_OFFSET }
 
     /// Submit a descriptor chain and notify the device (non-blocking).
     /// Returns the first descriptor index of the chain.

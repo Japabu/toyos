@@ -197,7 +197,7 @@ pub fn init_device(ctrl: &mut XhciController, op_base: &Mmio, port_idx: u8) {
 
     // Address Device
     let input_ctx_ptr = dma_ptr(5);
-    let input_ctx_phys = dma_phys(5);
+    let input_ctx_phys = dma_phys(5).raw();
     unsafe { write_bytes(input_ctx_ptr, 0, 4096); }
 
     ctrl.write_ctx32(input_ctx_ptr, 0, 1, 0x3); // Add Slot + EP0
@@ -208,7 +208,7 @@ pub fn init_device(ctrl: &mut XhciController, op_base: &Mmio, port_idx: u8) {
     let max_packet = max_packet_for_speed(speed);
     let ep0_dw1 = (3u32 << 1) | (4u32 << 3) | ((max_packet as u32) << 16);
     ctrl.write_ctx32(input_ctx_ptr, 2, 1, ep0_dw1);
-    let ep0_dequeue = dma_phys(6) | 1;
+    let ep0_dequeue = dma_phys(6).raw() | 1;
     ctrl.write_ctx32(input_ctx_ptr, 2, 2, ep0_dequeue as u32);
     ctrl.write_ctx32(input_ctx_ptr, 2, 3, (ep0_dequeue >> 32) as u32);
     ctrl.write_ctx32(input_ctx_ptr, 2, 4, 8);
@@ -217,7 +217,7 @@ pub fn init_device(ctrl: &mut XhciController, op_base: &Mmio, port_idx: u8) {
     unsafe { write_bytes(dma_ptr(output_ctx_page), 0, 4096); }
     unsafe {
         let dcbaa = dma_ptr(0) as *mut u64;
-        write_volatile(dcbaa.add(slot_id as usize), dma_phys(output_ctx_page));
+        write_volatile(dcbaa.add(slot_id as usize), dma_phys(output_ctx_page).raw());
     }
 
     let mut addr_dev = Trb::ZERO;
@@ -233,7 +233,7 @@ pub fn init_device(ctrl: &mut XhciController, op_base: &Mmio, port_idx: u8) {
 
     // GET_DESCRIPTOR (Device)
     let data_buf_ptr = dma_ptr(8);
-    let data_buf_phys = dma_phys(8);
+    let data_buf_phys = dma_phys(8).raw();
     unsafe { write_bytes(data_buf_ptr, 0, 256); }
     let code = ctrl.control_transfer(0x80, 0x06, 0x0100, 0, Some(data_buf_phys), 18);
     if code != 1 && code != 13 {
@@ -291,20 +291,20 @@ pub fn init_device(ctrl: &mut XhciController, op_base: &Mmio, port_idx: u8) {
         HidType::Keyboard => (7, 512),
         HidType::Mouse => (11, 1024),
     };
-    let report_phys = dma_phys(8) + report_buf_offset as u64;
+    let report_phys = dma_phys(8).raw() + report_buf_offset as u64;
     let report_ptr = unsafe { dma_ptr(8).add(report_buf_offset) };
 
     // Set up interrupt ring link TRB
     let int_ring_ptr = dma_ptr(int_ring_page) as *mut Trb;
     unsafe { write_bytes(dma_ptr(int_ring_page), 0, 4096); }
     let mut int_link = Trb::ZERO;
-    int_link.param = dma_phys(int_ring_page);
+    int_link.param = dma_phys(int_ring_page).raw();
     int_link.control = TRB_LINK | (1 << 1);
     unsafe { write_volatile(int_ring_ptr.add(RING_SIZE - 1), int_link); }
 
     // Configure Endpoint
     let input_ctx_ptr = dma_ptr(5);
-    let input_ctx_phys = dma_phys(5);
+    let input_ctx_phys = dma_phys(5).raw();
     unsafe { write_bytes(input_ctx_ptr, 0, 4096); }
 
     ctrl.write_ctx32(input_ctx_ptr, 0, 1, (1u32 << (int_ep_dci as u32)) | 1);
@@ -328,7 +328,7 @@ pub fn init_device(ctrl: &mut XhciController, op_base: &Mmio, port_idx: u8) {
     let ep_dw1 = (3u32 << 1) | (7u32 << 3) | ((info.ep_max_packet as u32) << 16);
     ctrl.write_ctx32(input_ctx_ptr, ep_ctx_index, 1, ep_dw1);
 
-    let int_dequeue = dma_phys(int_ring_page) | 1;
+    let int_dequeue = dma_phys(int_ring_page).raw() | 1;
     ctrl.write_ctx32(input_ctx_ptr, ep_ctx_index, 2, int_dequeue as u32);
     ctrl.write_ctx32(input_ctx_ptr, ep_ctx_index, 3, (int_dequeue >> 32) as u32);
     ctrl.write_ctx32(input_ctx_ptr, ep_ctx_index, 4, 8);

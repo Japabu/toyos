@@ -50,7 +50,7 @@ const RESP_OFFSET: usize = 0x800;
 
 static DMA: Lock<DmaPool<4>> = Lock::new(DmaPool::new());
 
-fn dma_phys(page: usize) -> u64 {
+fn dma_phys(page: usize) -> crate::DmaAddr {
     DMA.lock().page_phys(page)
 }
 
@@ -525,10 +525,10 @@ pub fn init(ecam_base: u64) -> Option<(Box<dyn Gpu>, GpuInfo)> {
     device.setup_queue(1, &mut cursorq);
     device.activate();
 
-    let req_phys = dma_phys(PAGE_CONTROLQ_BUFS) + REQ_OFFSET as u64;
-    let resp_phys = dma_phys(PAGE_CONTROLQ_BUFS) + RESP_OFFSET as u64;
-    let cursor_req_phys = dma_phys(PAGE_CURSORQ_BUFS) + REQ_OFFSET as u64;
-    let cursor_resp_phys = dma_phys(PAGE_CURSORQ_BUFS) + RESP_OFFSET as u64;
+    let req_phys = dma_phys(PAGE_CONTROLQ_BUFS).raw() + REQ_OFFSET as u64;
+    let resp_phys = dma_phys(PAGE_CONTROLQ_BUFS).raw() + RESP_OFFSET as u64;
+    let cursor_req_phys = dma_phys(PAGE_CURSORQ_BUFS).raw() + REQ_OFFSET as u64;
+    let cursor_resp_phys = dma_phys(PAGE_CURSORQ_BUFS).raw() + RESP_OFFSET as u64;
     let req_ptr = unsafe { dma_ptr(PAGE_CONTROLQ_BUFS).add(REQ_OFFSET) };
     let resp_ptr = unsafe { dma_ptr(PAGE_CONTROLQ_BUFS).add(RESP_OFFSET) };
     let cursor_req_ptr = unsafe { dma_ptr(PAGE_CURSORQ_BUFS).add(REQ_OFFSET) };

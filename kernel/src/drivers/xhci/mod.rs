@@ -118,8 +118,8 @@ struct TrbRing {
 }
 
 impl TrbRing {
-    fn new(base: *mut Trb, base_phys: u64) -> Self {
-        Self { base, base_phys, tail: 0, cycle: true }
+    fn new(base: *mut Trb, base_phys: crate::DmaAddr) -> Self {
+        Self { base, base_phys: base_phys.raw(), tail: 0, cycle: true }
     }
 
     fn enqueue(&mut self, mut trb: Trb) {
@@ -162,7 +162,7 @@ impl TrbRing {
 const DMA_PAGES: usize = 13;
 static XHCI_DMA_POOL: Lock<DmaPool<DMA_PAGES>> = Lock::new(DmaPool::new());
 
-fn dma_phys(index: usize) -> u64 {
+fn dma_phys(index: usize) -> crate::DmaAddr {
     XHCI_DMA_POOL.lock().page_phys(index)
 }
 
@@ -251,7 +251,7 @@ impl XhciController {
         if self.event_head == 0 {
             self.event_phase = !self.event_phase;
         }
-        let erdp = dma_phys(3) + (self.event_head as u64) * 16;
+        let erdp = dma_phys(3).raw() + (self.event_head as u64) * 16;
         self.rt_base.write_u64(IR0_ERDP, erdp | (1 << 3)); // EHB clears interrupt pending
         self.rt_base.write_u32(IR0_IMAN, 3); // clear IP (W1C) + keep IE
     }
@@ -333,7 +333,7 @@ impl XhciController {
     fn reset_ep0_ring(&mut self) {
         unsafe { write_bytes(dma_ptr(6), 0, 4096); }
         let mut link = Trb::ZERO;
-        link.param = dma_phys(6);
+        link.param = dma_phys(6).raw();
         link.control = TRB_LINK | (1 << 1);
         unsafe { write_volatile((dma_ptr(6) as *mut Trb).add(RING_SIZE - 1), link); }
         self.ep0_ring = TrbRing::new(dma_ptr(6) as *mut Trb, dma_phys(6));
@@ -498,33 +498,33 @@ pub fn init(ecam_base: u64) -> Option<XhciController> {
     let max_scratchpad = (max_sp_hi << 5) | max_sp_lo;
     if max_scratchpad > 0 {
         let sp_array = dma_ptr(9) as *mut u64;
-        unsafe { write_volatile(sp_array, dma_phys(9) + 2048); }
-        unsafe { write_volatile(dma_ptr(0) as *mut u64, dma_phys(9)); }
+        unsafe { write_volatile(sp_array, dma_phys(9).raw() + 2048); }
+        unsafe { write_volatile(dma_ptr(0) as *mut u64, dma_phys(9).raw()); }
         log!("xHCI: {} scratchpad buffers configured", max_scratchpad);
     }
 
-    op_base.write_u64(OP_DCBAAP, dma_phys(0));
+    op_base.write_u64(OP_DCBAAP, dma_phys(0).raw());
 
     // Command Ring
     let cmd_ring = dma_ptr(1) as *mut Trb;
     let mut link = Trb::ZERO;
-    link.param = dma_phys(1);
+    link.param = dma_phys(1).raw();
     link.control = TRB_LINK | (1 << 1);
     unsafe { write_volatile(cmd_ring.add(RING_SIZE - 1), link); }
-    op_base.write_u64(OP_CRCR, dma_phys(1) | 1);
+    op_base.write_u64(OP_CRCR, dma_phys(1).raw() | 1);
 
     // Event Ring
     let erst = dma_ptr(2) as *mut ErstEntry;
     unsafe {
         write_volatile(erst, ErstEntry {
-            ring_base: dma_phys(3),
+            ring_base: dma_phys(3).raw(),
             ring_size: RING_SIZE as u32,
             _reserved: 0,
         });
     }
     rt_base.write_u32(IR0_ERSTSZ, 1);
-    rt_base.write_u64(IR0_ERDP, dma_phys(3));
-    rt_base.write_u64(IR0_ERSTBA, dma_phys(2));
+    rt_base.write_u64(IR0_ERDP, dma_phys(3).raw());
+    rt_base.write_u64(IR0_ERSTBA, dma_phys(2).raw());
 
     // Enable interrupter 0: set IE (bit 1) in IMAN, no moderation
     rt_base.write_u32(IR0_IMOD, 0);
@@ -533,7 +533,7 @@ pub fn init(ecam_base: u64) -> Option<XhciController> {
     // EP0 Ring (will be reset per device)
     let ep0_ring = dma_ptr(6) as *mut Trb;
     let mut ep0_link = Trb::ZERO;
-    ep0_link.param = dma_phys(6);
+    ep0_link.param = dma_phys(6).raw();
     ep0_link.control = TRB_LINK | (1 << 1);
     unsafe { write_volatile(ep0_ring.add(RING_SIZE - 1), ep0_link); }
 

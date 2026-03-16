@@ -28,7 +28,7 @@ const RX_BUF_SIZE: u32 = 4096;
 
 static DMA: Lock<DmaPool<6>> = Lock::new(DmaPool::new());
 
-fn dma_phys(page: usize) -> u64 {
+fn dma_phys(page: usize) -> crate::DmaAddr {
     DMA.lock().page_phys(page)
 }
 
@@ -170,16 +170,16 @@ pub fn init(ecam_base: u64) {
         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 
     let rx_phys = [
-        dma_phys(PAGE_RX_BUFS),
-        dma_phys(PAGE_RX_BUFS + 1),
-        dma_phys(PAGE_RX_BUFS + 2),
+        dma_phys(PAGE_RX_BUFS).raw(),
+        dma_phys(PAGE_RX_BUFS + 1).raw(),
+        dma_phys(PAGE_RX_BUFS + 2).raw(),
     ];
     let rx_ptrs = [
         dma_ptr(PAGE_RX_BUFS),
         dma_ptr(PAGE_RX_BUFS + 1),
         dma_ptr(PAGE_RX_BUFS + 2),
     ];
-    let tx_phys = dma_phys(PAGE_TX_BUF);
+    let tx_phys = dma_phys(PAGE_TX_BUF).raw();
     let tx_ptr = dma_ptr(PAGE_TX_BUF);
 
     // Register DMA buffers as shared memory for direct userland access

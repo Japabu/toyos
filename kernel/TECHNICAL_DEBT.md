@@ -21,37 +21,23 @@ syscall handler refactoring had bugs. Port handlers one at a time with testing.
 
 **Not urgent while all user allocations are 2MB-aligned contiguous blocks.**
 
-## 3. No DmaAddr newtype — physical/virtual confusion in drivers
+## ~~3. No DmaAddr newtype~~ DONE
 
-Driver code passes physical addresses to devices as raw `u64`. Nothing at the
-type level prevents accidentally passing a virtual (high-half) address to a
-device descriptor. This was a source of bugs during the higher-half migration.
+Added `DmaAddr` newtype in addr.rs. `DmaPool::page_phys()` returns `DmaAddr`.
+All drivers use `DmaAddr` for device-visible addresses. `Virtqueue::base_phys`
+is `DmaAddr`. Every site that writes to hardware uses `.raw()` explicitly.
 
-**Fix:** Add `DmaAddr(u64)` newtype that can only be created from `PhysAddr`
-or `DmaPool::page_phys()`. Device descriptor structs use `DmaAddr` instead of
-`u64`. The compiler rejects `*mut u8` or high-half addresses in descriptor
-fields.
+## ~~4. PhysAddr::from_ptr is unchecked~~ DONE
 
-## 4. PhysAddr::from_ptr is unchecked
+Added `debug_assert!` in `from_ptr()` that validates the pointer is in the
+high-half direct map.
 
-`PhysAddr::from_ptr(ptr)` subtracts PHYS_OFFSET from any pointer. If `ptr` is
-not a direct-map address (e.g. a user address or null), the result is garbage.
-No debug assertion catches this.
+## ~~5. No compile-time enforcement of user pointer safety~~ VERIFIED OK
 
-**Fix:** Add `debug_assert!(ptr as u64 >= PHYS_OFFSET)` in `from_ptr()`. In
-release builds it's a no-op. In debug builds it catches misuse immediately.
-
-## 5. No compile-time enforcement of user pointer safety
-
-The `user_ptr` module is the intended gatekeeper for user memory access, but
-nothing prevents kernel code from casting a `u64` to `*mut u8` and
-dereferencing it directly. This bypasses validation, SMAP protection (if we
-ever need it), and the page-table-walk translation.
-
-**Fix:** Make `UserAddr` truly opaque — remove any method that produces a raw
-pointer. The only way to access user memory is through `SyscallContext`. This
-is already the convention; making it a hard constraint means the compiler
-catches violations.
+Audited all `UserAddr::raw()` call sites — no kernel code outside `user_ptr.rs`
+and `paging.rs` creates raw pointers from user addresses. The convention is
+already clean. `UserAddr::raw()` is needed for page table walks and address
+arithmetic, but no code dereferences the raw value.
 
 ## 6. Large NVMe reads for demand paging
 

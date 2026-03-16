@@ -49,7 +49,7 @@ const RESP_OFFSET: usize = 0x800;
 
 static DMA: Lock<DmaPool<10>> = Lock::new(DmaPool::new());
 
-fn dma_phys(page: usize) -> u64 {
+fn dma_phys(page: usize) -> crate::DmaAddr {
     DMA.lock().page_phys(page)
 }
 
@@ -309,17 +309,17 @@ pub fn init(ecam_base: u64) -> Option<(SoundController, AudioInfo)> {
     device.setup_queue(2, &mut txq);
     device.activate();
 
-    let req_phys = dma_phys(PAGE_CTRL_BUFS) + REQ_OFFSET as u64;
-    let resp_phys = dma_phys(PAGE_CTRL_BUFS) + RESP_OFFSET as u64;
+    let req_phys = dma_phys(PAGE_CTRL_BUFS).raw() + REQ_OFFSET as u64;
+    let resp_phys = dma_phys(PAGE_CTRL_BUFS).raw() + RESP_OFFSET as u64;
     let req_ptr = unsafe { dma_ptr(PAGE_CTRL_BUFS).add(REQ_OFFSET) };
     let resp_ptr = unsafe { dma_ptr(PAGE_CTRL_BUFS).add(RESP_OFFSET) };
-    let meta_phys = dma_phys(PAGE_TX_META);
+    let meta_phys = dma_phys(PAGE_TX_META).raw();
     let meta_ptr = dma_ptr(PAGE_TX_META);
 
     let mut tx_data_phys = [0u64; TX_INFLIGHT_MAX];
     let mut buf_tokens = [0u32; TX_INFLIGHT_MAX];
     for i in 0..TX_INFLIGHT_MAX {
-        tx_data_phys[i] = dma_phys(PAGE_TX_DATA + i);
+        tx_data_phys[i] = dma_phys(PAGE_TX_DATA + i).raw();
         // Register each TX data page as shared memory so soundd can map it
         buf_tokens[i] = shared_memory::register(PhysAddr::new(tx_data_phys[i]), 4096).raw();
     }

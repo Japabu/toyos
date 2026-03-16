@@ -51,7 +51,13 @@ impl PhysAddr {
     }
 
     /// Convert a kernel virtual pointer back to a physical address.
+    /// The pointer must be in the high-half direct map (>= PHYS_OFFSET).
     pub fn from_ptr<T>(ptr: *const T) -> Self {
+        debug_assert!(
+            ptr as u64 >= PHYS_OFFSET,
+            "PhysAddr::from_ptr: {:#x} is not a direct-map address",
+            ptr as u64,
+        );
         Self(ptr as u64 - PHYS_OFFSET)
     }
 
@@ -285,5 +291,35 @@ impl fmt::Display for UserAddr {
 impl fmt::LowerHex for UserAddr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::LowerHex::fmt(&self.0, f)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DmaAddr
+// ---------------------------------------------------------------------------
+
+/// Physical address for DMA device access. Cannot be accidentally created from
+/// a virtual pointer — only from `PhysAddr` (which validates the source).
+/// Use `.raw()` when writing to hardware descriptor fields.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(transparent)]
+pub struct DmaAddr(u64);
+
+impl DmaAddr {
+    /// The raw physical address for hardware descriptor fields.
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+}
+
+impl From<PhysAddr> for DmaAddr {
+    fn from(addr: PhysAddr) -> Self {
+        Self(addr.raw())
+    }
+}
+
+impl fmt::Debug for DmaAddr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "DmaAddr({:#018x})", self.0)
     }
 }
