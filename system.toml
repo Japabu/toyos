@@ -3,6 +3,7 @@ init = [
     "/bin/toybox --install",
     "/bin/toybox locale --load",
     "/bin/compositor",
+    "/bin/soundd",
     "/bin/netd",
     "/bin/sshd",
 ]
@@ -11,6 +12,7 @@ init = [
 shell = {}
 terminal = {}
 compositor = {}
+soundd = {}
 netd = {}
 sshd = {}
 doom = {}

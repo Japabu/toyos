@@ -32,6 +32,7 @@ pub enum Descriptor {
     Framebuffer(FramebufferInfo),
     Socket { rx: PipeId, tx: PipeId },
     Nic(crate::net::NicInfo),
+    Audio(toyos_abi::audio::AudioInfo),
 }
 
 pub type FdTable = IdMap<u32, Descriptor>;
@@ -50,6 +51,7 @@ pub fn dup(desc: &Descriptor) -> Descriptor {
         Descriptor::Framebuffer(info) => Descriptor::Framebuffer(*info),
         Descriptor::Socket { rx, tx } => { pipe::add_reader(*rx); pipe::add_writer(*tx); Descriptor::Socket { rx: *rx, tx: *tx } }
         Descriptor::Nic(info) => Descriptor::Nic(*info),
+        Descriptor::Audio(info) => Descriptor::Audio(*info),
     }
 }
 
@@ -133,7 +135,7 @@ pub fn close(table: &mut FdTable, vfs: &mut Vfs, fd: u32, pid: Pid) -> u64 {
         Descriptor::PipeRead(id) | Descriptor::TtyRead(id) => pipe::close_read(*id),
         Descriptor::PipeWrite(id) | Descriptor::TtyWrite(id) => pipe::close_write(*id),
         Descriptor::Socket { rx, tx } => { pipe::close_read(*rx); pipe::close_write(*tx); }
-        Descriptor::Keyboard | Descriptor::Mouse | Descriptor::Framebuffer(_) | Descriptor::Nic(_) => {
+        Descriptor::Keyboard | Descriptor::Mouse | Descriptor::Framebuffer(_) | Descriptor::Nic(_) | Descriptor::Audio(_) => {
             device::release_descriptor(&desc, pid);
         }
         Descriptor::SerialConsole => {}
@@ -196,6 +198,12 @@ pub fn try_read(table: &mut FdTable, fd: u32, buf: &mut [u8]) -> Option<u64> {
             buf[..count].copy_from_slice(&bytes[..count]);
             Some(count as u64)
         }
+        Descriptor::Audio(info) => {
+            let bytes = info.as_bytes();
+            let count = buf.len().min(bytes.len());
+            buf[..count].copy_from_slice(&bytes[..count]);
+            Some(count as u64)
+        }
         Descriptor::PipeWrite(_) | Descriptor::TtyWrite(_) => Some(SyscallError::PermissionDenied.to_u64()),
         Descriptor::SerialConsole => {
             // Read from serial port (non-blocking: return None if no data)
@@ -245,7 +253,7 @@ pub fn try_write(table: &mut FdTable, fd: u32, buf: &[u8]) -> Option<u64> {
             serial_write_plain(buf);
             Some(buf.len() as u64)
         }
-        Descriptor::Keyboard | Descriptor::Mouse | Descriptor::PipeRead(_) | Descriptor::TtyRead(_) | Descriptor::Framebuffer(_) | Descriptor::Nic(_) => Some(SyscallError::PermissionDenied.to_u64()),
+        Descriptor::Keyboard | Descriptor::Mouse | Descriptor::PipeRead(_) | Descriptor::TtyRead(_) | Descriptor::Framebuffer(_) | Descriptor::Nic(_) | Descriptor::Audio(_) => Some(SyscallError::PermissionDenied.to_u64()),
     }
 }
 
@@ -291,6 +299,7 @@ pub fn fstat(table: &FdTable, fd: u32, stat: &mut Stat) -> bool {
         Some(Descriptor::TtyRead(_) | Descriptor::TtyWrite(_)) => { stat.file_type = FileType::Tty as u64; true }
         Some(Descriptor::Socket { .. }) => { stat.file_type = FileType::Socket as u64; true }
         Some(Descriptor::Nic(_)) => { stat.file_type = FileType::Nic as u64; true }
+        Some(Descriptor::Audio(_)) => { stat.file_type = FileType::Nic as u64; true } // reuse Nic type for now
         None => false,
     }
 }
@@ -333,7 +342,7 @@ pub fn close_all(table: &mut FdTable, vfs: &mut Vfs, pid: Pid) {
             Descriptor::PipeRead(id) | Descriptor::TtyRead(id) => pipe::close_read(*id),
             Descriptor::PipeWrite(id) | Descriptor::TtyWrite(id) => pipe::close_write(*id),
             Descriptor::Socket { rx, tx } => { pipe::close_read(*rx); pipe::close_write(*tx); }
-            Descriptor::Keyboard | Descriptor::Mouse | Descriptor::Framebuffer(_) | Descriptor::Nic(_) => {
+            Descriptor::Keyboard | Descriptor::Mouse | Descriptor::Framebuffer(_) | Descriptor::Nic(_) | Descriptor::Audio(_) => {
                 device::release_descriptor(&desc, pid);
             }
             Descriptor::SerialConsole => {}
@@ -346,7 +355,7 @@ pub fn has_data(table: &FdTable, fd: u32) -> bool {
         Some(Descriptor::PipeRead(id)) | Some(Descriptor::TtyRead(id)) | Some(Descriptor::Socket { rx: id, .. }) => pipe::has_data(*id),
         Some(Descriptor::Keyboard) => keyboard::has_data(),
         Some(Descriptor::Mouse) => mouse::has_data(),
-        Some(Descriptor::File(_)) | Some(Descriptor::Framebuffer(_)) | Some(Descriptor::Nic(_)) => true,
+        Some(Descriptor::File(_)) | Some(Descriptor::Framebuffer(_)) | Some(Descriptor::Nic(_)) | Some(Descriptor::Audio(_)) => true,
         Some(Descriptor::SerialConsole) => serial::has_data(),
         _ => false,
     }

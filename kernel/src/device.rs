@@ -7,11 +7,13 @@ pub const DEVICE_KEYBOARD: u64 = 0;
 pub const DEVICE_MOUSE: u64 = 1;
 pub const DEVICE_FRAMEBUFFER: u64 = 2;
 pub const DEVICE_NIC: u64 = 3;
+pub const DEVICE_AUDIO: u64 = 4;
 
 static KEYBOARD_OWNER: Lock<Option<Pid>> = Lock::new(None);
 static MOUSE_OWNER: Lock<Option<Pid>> = Lock::new(None);
 static FRAMEBUFFER_OWNER: Lock<Option<Pid>> = Lock::new(None);
 static NIC_OWNER: Lock<Option<Pid>> = Lock::new(None);
+static AUDIO_OWNER: Lock<Option<Pid>> = Lock::new(None);
 static FB_INFO: Lock<Option<FramebufferInfo>> = Lock::new(None);
 
 pub fn set_framebuffer_info(info: FramebufferInfo) {
@@ -77,6 +79,21 @@ pub fn try_claim(device_type: u64, pid: Pid) -> Option<Descriptor> {
             }
             Some(Descriptor::Nic(info))
         }
+        DEVICE_AUDIO => {
+            let mut owner = AUDIO_OWNER.lock();
+            if owner.is_some() {
+                return None;
+            }
+            let info = crate::audio::audio_info()?;
+            *owner = Some(pid);
+            for &token in &info.buf_tokens[..info.num_buffers as usize] {
+                if shared_memory::grant_kernel(shared_memory::SharedToken::from_raw(token), pid).is_err() {
+                    *owner = None;
+                    return None;
+                }
+            }
+            Some(Descriptor::Audio(info))
+        }
         _ => None,
     }
 }
@@ -88,6 +105,7 @@ pub fn release(device_type: u64, pid: Pid) {
         DEVICE_MOUSE => MOUSE_OWNER.lock(),
         DEVICE_FRAMEBUFFER => FRAMEBUFFER_OWNER.lock(),
         DEVICE_NIC => NIC_OWNER.lock(),
+        DEVICE_AUDIO => AUDIO_OWNER.lock(),
         _ => return,
     };
     if *owner == Some(pid) {
@@ -102,6 +120,7 @@ pub fn release_descriptor(desc: &Descriptor, pid: Pid) {
         Descriptor::Mouse => release(DEVICE_MOUSE, pid),
         Descriptor::Framebuffer(_) => release(DEVICE_FRAMEBUFFER, pid),
         Descriptor::Nic(_) => release(DEVICE_NIC, pid),
+        Descriptor::Audio(_) => release(DEVICE_AUDIO, pid),
         _ => {}
     }
 }

@@ -73,13 +73,7 @@ extern "sysv64" fn syscall_entry() {
         "movdqu [rsp + 14*16], xmm14",
         "movdqu [rsp + 15*16], xmm15",
 
-        // SMAP: allow kernel access to user pages for the duration of the syscall.
-        "stac",
-
         "call {handler}",
-
-        // SMAP: revoke kernel access to user pages before returning.
-        "clac",
 
         // Restore SSE state
         "movdqu xmm0,  [rsp + 0*16]",
@@ -228,20 +222,12 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         }
         SYS_MARK_TTY => process::with_fd_owner_data(|data| fd::mark_tty(&mut data.fds, a1 as u32)),
         SYS_SEND_MSG => {
-            let Some(user_msg) = ctx.user_ref::<message::RawMessage>(UserAddr::new(a2)) else { return bad_addr };
-            const MAX_MSG_PAYLOAD: u64 = 64 * 1024;
-            let payload = if user_msg.data != 0 && user_msg.len != 0 {
-                if user_msg.len > MAX_MSG_PAYLOAD { return SyscallError::InvalidArgument.to_u64(); }
-                let Some(data) = ctx.user_slice(UserAddr::new(user_msg.data), user_msg.len) else { return bad_addr };
-                data.to_vec()
-            } else {
-                Vec::new()
-            };
-            sys_send_msg(a1, user_msg, payload)
+            let Some(msg) = ctx.user_ref::<message::Message>(UserAddr::new(a2)) else { return bad_addr };
+            sys_send_msg(a1, *msg)
         }
         SYS_RECV_MSG => {
-            let Some(out) = ctx.user_mut::<message::RawMessage>(UserAddr::new(a1)) else { return bad_addr };
-            sys_recv_msg(out, a2, a3)
+            let Some(out) = ctx.user_mut::<message::Message>(UserAddr::new(a1)) else { return bad_addr };
+            sys_recv_msg(out)
         }
         SYS_OPEN_DEVICE => sys_open_device(a1),
         SYS_REGISTER_NAME => {
@@ -343,10 +329,11 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         }
         SYS_PIPE_OPEN => sys_pipe_open(a1, a2),
         SYS_PIPE_ID => sys_pipe_id(a1 as u32),
-        SYS_AUDIO_WRITE => {
-            let Some(buf) = ctx.user_slice(UserAddr::new(a1), a2) else { return bad_addr };
-            crate::audio::write_samples(buf);
-            0
+        SYS_AUDIO_SUBMIT => {
+            if crate::audio::submit_buffer(a1 as usize, a2 as u32) { 0 } else { SyscallError::InvalidArgument.to_u64() }
+        }
+        SYS_AUDIO_POLL => {
+            crate::audio::poll_completed() as u64
         }
         SYS_EXIT => sys_exit(a1 as i32),
         SYS_GET_ENV => {
@@ -830,33 +817,16 @@ fn sys_poll(fds: &[u64], fds_len: u64, timeout_nanos: u64) -> u64 {
     }
 }
 
-fn sys_send_msg(target_pid: u64, user_msg: &message::RawMessage, payload: Vec<u8>) -> u64 {
-    let msg = message::Message {
-        sender: process::current_pid(),
-        msg_type: user_msg.msg_type,
-        payload,
-    };
+fn sys_send_msg(target_pid: u64, mut msg: message::Message) -> u64 {
+    msg.sender = process::current_pid().raw();
     if process::send_message(process::Pid::from_raw(target_pid as u32), msg) { 0 } else { SyscallError::NotFound.to_u64() }
 }
 
-fn sys_recv_msg(out: &mut message::RawMessage, buf_ptr: u64, buf_len: u64) -> u64 {
+fn sys_recv_msg(out: &mut message::Message) -> u64 {
     loop {
         let msg = process::with_current_data(|data| data.messages.pop());
         if let Some(msg) = msg {
-            let copy_len = msg.payload.len().min(buf_len as usize);
-            if copy_len > 0 && buf_ptr != 0 {
-                unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        msg.payload.as_ptr(),
-                        buf_ptr as *mut u8,
-                        copy_len,
-                    );
-                }
-            }
-            out.sender = msg.sender.raw();
-            out.msg_type = msg.msg_type;
-            out.data = buf_ptr;
-            out.len = msg.payload.len() as u64;
+            *out = msg;
             return 0;
         }
         process::block_recv_msg();

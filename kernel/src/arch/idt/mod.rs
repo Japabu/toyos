@@ -17,6 +17,7 @@ const PIC2_DATA: u16 = 0xA1;
 #[repr(usize)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Vector {
+    Debug = 0x01,
     InvalidOpcode = 0x06,
     DoubleFault = 0x08,
     GeneralProtection = 0x0D,
@@ -29,6 +30,7 @@ enum Vector {
 impl Vector {
     fn from_raw(v: u64) -> Self {
         match v {
+            0x01 => Self::Debug,
             0x06 => Self::InvalidOpcode,
             0x08 => Self::DoubleFault,
             0x0D => Self::GeneralProtection,
@@ -175,6 +177,7 @@ pub fn init() {
 
     {
         let mut idt = IDT.lock();
+        idt.entries[Vector::Debug as usize] = IdtEntry::new(exceptions::db_entry as *const () as u64);
         idt.entries[Vector::InvalidOpcode as usize] = IdtEntry::new(exceptions::ud_entry as *const () as u64);
         idt.entries[Vector::DoubleFault as usize] = IdtEntry::new(exceptions::double_fault_entry as *const () as u64).with_ist(1);
         idt.entries[Vector::GeneralProtection as usize] = IdtEntry::new(exceptions::gpf_entry as *const () as u64);
