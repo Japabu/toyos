@@ -112,7 +112,7 @@ fn copy_trampoline() {
     let end = unsafe { asm_label_addr!(_trampoline_end) };
     let size = end as usize - start as usize;
     assert!(size <= DATA_OFFSET, "trampoline code exceeds data block");
-    let dest = (TRAMPOLINE_PAGE + crate::PHYS_OFFSET) as *mut u8;
+    let dest = crate::PhysAddr::new(TRAMPOLINE_PAGE).as_mut_ptr::<u8>();
     unsafe {
         core::ptr::copy_nonoverlapping(start, dest, size);
     }
@@ -179,7 +179,7 @@ pub fn boot_aps(madt: &MadtInfo, boot_cr3: u64) {
 
     let mut data = build_trampoline_data();
     data.cr3 = boot_cr3;
-    let target = (TRAMPOLINE_PAGE + DATA_OFFSET as u64 + crate::PHYS_OFFSET) as *mut TrampolineData;
+    let target = crate::PhysAddr::new(TRAMPOLINE_PAGE + DATA_OFFSET as u64).as_mut_ptr::<TrampolineData>();
 
     for &ap_id in &madt.apic_ids {
         if ap_id == bsp_id { continue; }

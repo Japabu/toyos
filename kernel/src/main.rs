@@ -62,23 +62,22 @@ pub unsafe extern "sysv64" fn _start(kernel_args: KernelArgs) -> ! {
     serial::init();
     log!("{:?}", kernel_args);
 
-    // KernelArgs contains physical addresses from the bootloader.
-    // Add PHYS_OFFSET to get dereferenceable kernel virtual addresses.
+    // KernelArgs contains physical addresses — convert via PhysAddr to get kernel pointers.
     let entry_count = kernel_args.memory_map_size as usize / core::mem::size_of::<MemoryMapEntry>();
     let maps = core::slice::from_raw_parts(
-        (kernel_args.memory_map_addr + PHYS_OFFSET) as *const MemoryMapEntry,
+        PhysAddr::new(kernel_args.memory_map_addr).as_ptr::<MemoryMapEntry>(),
         entry_count,
     );
     let initrd = core::slice::from_raw_parts(
-        (kernel_args.initrd_addr + PHYS_OFFSET) as *const u8,
+        PhysAddr::new(kernel_args.initrd_addr).as_ptr::<u8>(),
         kernel_args.initrd_size as usize,
     );
     let kernel_elf = core::slice::from_raw_parts(
-        (kernel_args.kernel_elf_addr + PHYS_OFFSET) as *const u8,
+        PhysAddr::new(kernel_args.kernel_elf_addr).as_ptr::<u8>(),
         kernel_args.kernel_elf_size as usize,
     );
     let init_bytes = core::slice::from_raw_parts(
-        (kernel_args.init_program_addr + PHYS_OFFSET) as *const u8,
+        PhysAddr::new(kernel_args.init_program_addr).as_ptr::<u8>(),
         kernel_args.init_program_len as usize,
     );
     let init_programs = core::str::from_utf8(init_bytes).expect("init_programs: invalid UTF-8");

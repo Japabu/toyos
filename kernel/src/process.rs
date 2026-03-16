@@ -97,8 +97,7 @@ pub fn write_argv_to_stack(stack_top: u64, args: &[&str]) -> u64 {
     let mut argv_ptrs: Vec<u64> = Vec::with_capacity(args.len());
     for arg in args.iter().rev() {
         sp -= (arg.len() + 1) as u64;
-        // Write to user memory via the kernel direct map
-        let kptr = (sp + crate::PHYS_OFFSET) as *mut u8;
+        let kptr = PhysAddr::new(sp).as_mut_ptr::<u8>();
         unsafe {
             core::ptr::copy_nonoverlapping(arg.as_ptr(), kptr, arg.len());
             *kptr.add(arg.len()) = 0;
@@ -109,7 +108,7 @@ pub fn write_argv_to_stack(stack_top: u64, args: &[&str]) -> u64 {
     let metadata_qwords = args.len() + 2;
     sp = (sp - metadata_qwords as u64 * 8) & !15;
     unsafe {
-        let ksp = (sp + crate::PHYS_OFFSET) as *mut u64;
+        let ksp = PhysAddr::new(sp).as_mut_ptr::<u64>();
         *ksp = args.len() as u64;
         for (i, ptr) in argv_ptrs.iter().enumerate() {
             *ksp.add(1 + i) = *ptr;
@@ -610,38 +609,13 @@ pub fn setup_combined_tls(
     // Zero the TLS block area (BSS must be zero).
     unsafe { core::ptr::write_bytes(block.add(tls_start), 0, block_size); }
 
-    for (i, module) in modules.iter().enumerate() {
+    for module in modules {
         if module.filesz > 0 && !module.template.is_null() {
-            let template = module.template;
-            let filesz = module.filesz;
-            let base_offset = module.base_offset;
-            // Verify the template is accessible via direct map page walk
-            let template_raw = template.raw();
-            let pml4_ptr = paging::kernel_cr3().as_ptr::<u64>();
-            let pml4_idx = ((template_raw >> 39) & 0x1FF) as usize;
-            let pdpt_idx = ((template_raw >> 30) & 0x1FF) as usize;
-            let pd_idx = ((template_raw >> 21) & 0x1FF) as usize;
-            let pml4e = unsafe { *pml4_ptr.add(pml4_idx) };
-            let pdpt_ptr = ((pml4e & 0x000F_FFFF_FFFF_F000) + crate::PHYS_OFFSET) as *const u64;
-            let pdpte = unsafe { *pdpt_ptr.add(pdpt_idx) };
-            let pd_ptr = ((pdpte & 0x000F_FFFF_FFFF_F000) + crate::PHYS_OFFSET) as *const u64;
-            let pde = unsafe { *pd_ptr.add(pd_idx) };
-            let is_2m = (pde >> 7) & 1;
-            crate::log!("TLS[{}]: template={} PDE[{}]={:#018x} PS={} filesz={} pd_page_phys={:#x}",
-                i, template, pd_idx, pde, is_2m, filesz,
-                pdpte & 0x000F_FFFF_FFFF_F000);
-            if is_2m == 0 && pde != 0 {
-                // PDE points to a PT — walk one more level
-                let pt_idx = ((template_raw >> 12) & 0x1FF) as usize;
-                let pt_ptr = ((pde & 0x000F_FFFF_FFFF_F000) + crate::PHYS_OFFSET) as *const u64;
-                let pte = unsafe { *pt_ptr.add(pt_idx) };
-                crate::log!("  PT[{}]={:#018x} P={}", pt_idx, pte, pte & 1);
-            }
             unsafe {
                 core::ptr::copy_nonoverlapping(
-                    template.as_ptr::<u8>(),
-                    block.add(tls_start + base_offset),
-                    filesz,
+                    module.template.as_ptr::<u8>(),
+                    block.add(tls_start + module.base_offset),
+                    module.filesz,
                 );
             }
         }
@@ -1783,8 +1757,7 @@ pub fn futex_wait(addr: u64, expected: u32, timeout_ns: u64) -> u64 {
         None => return u64::MAX,
     };
 
-    // Atomic check: read the user value via the kernel direct map (no stac needed)
-    let current = unsafe { core::ptr::read_volatile((phys_addr.raw() + crate::PHYS_OFFSET) as *const u32) };
+    let current = unsafe { core::ptr::read_volatile(phys_addr.as_ptr::<u32>()) };
     if current != expected {
         return 0;
     }
