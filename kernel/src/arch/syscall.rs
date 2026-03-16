@@ -926,7 +926,7 @@ fn sys_mmap(req_addr: u64, size: u64, _prot: u64, flags: u64) -> u64 {
             if !paging::remap_user_2m_in(pml4, UserAddr::new(cur), phys_addr + offset) {
                 let mut undo = start;
                 while undo < cur {
-                    paging::restore_identity_2m(pml4, UserAddr::new(undo));
+                    paging::clear_user_2m(pml4, UserAddr::new(undo));
                     undo += paging::PAGE_2M;
                 }
                 ok = false;
@@ -969,7 +969,7 @@ fn sys_munmap(addr: u64, _size: u64) -> u64 {
                 let mut cur = region.addr.raw();
                 let end = region.addr.raw() + region.size as u64;
                 while cur < end {
-                    paging::restore_identity_2m(pml4, UserAddr::new(cur));
+                    paging::clear_user_2m(pml4, UserAddr::new(cur));
                     cur += paging::PAGE_2M;
                 }
             } else {

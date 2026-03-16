@@ -269,7 +269,7 @@ impl VirtioDevice {
         let config = VirtioPciConfig::parse(pci_dev);
 
         // Map the BAR regions used by capabilities
-        // The BAR addresses are already physical; we need them identity-mapped.
+        // The BAR addresses are physical; we access them via the kernel direct map.
         // Map a generous region covering all capability offsets.
         for cap in pci_dev.capabilities() {
             if cap.id() != PCI_CAP_ID_VENDOR { continue; }
