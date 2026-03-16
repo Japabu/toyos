@@ -65,6 +65,9 @@ fn load_file_bytes(handle: Handle, system_table: &SystemTable<Boot>, path: &CStr
     bytes
 }
 
+/// Kernel virtual base: all physical memory is mapped here in the kernel's address space.
+const PHYS_OFFSET: u64 = 0xFFFF_8000_0000_0000;
+
 fn load_kernel_elf(kernel_elf_bytes: &[u8]) -> LoadedKernel {
     let elf = ElfBytes::<AnyEndian>::minimal_parse(&kernel_elf_bytes)
         .expect("Failed to parse kernel elf");
@@ -123,12 +126,13 @@ fn load_kernel_elf(kernel_elf_bytes: &[u8]) -> LoadedKernel {
                         abi::R_X86_64_RELATIVE => {
                             let offset = rela.r_offset as isize;
                             let addend = rela.r_addend as isize;
+                            // Relocate to high-half: kernel symbols live at PHYS_OFFSET + phys
                             unsafe {
                                 process_mem
                                     .as_mut_ptr()
                                     .byte_offset(offset)
                                     .cast::<u64>()
-                                    .write(process_mem.as_ptr().byte_offset(addend) as u64);
+                                    .write(PHYS_OFFSET + process_mem.as_ptr().byte_offset(addend) as u64);
                             }
                         }
                         _ => panic!("Unsupported relocation type"),
@@ -208,11 +212,73 @@ fn query_gop(system_table: &SystemTable<Boot>) -> Option<GopInfo> {
     })
 }
 
+/// Build minimal page tables for the kernel transition to the high half.
+/// Returns the physical address of the PML4.
+///
+/// Maps:
+/// - Identity map: first `identity_size` bytes (PML4[0]) for boot transition
+/// - High-half map: first `identity_size` bytes at PHYS_OFFSET (PML4[256+]) for kernel
+///
+/// Uses 2MB large pages. Page table pages are allocated from `pool` (a slice of
+/// pre-allocated zeroed pages).
+/// Build minimal boot page tables for kernel transition to high half.
+/// `pt_mem` is a pointer to PT_PAGES * 4096 bytes of zeroed memory.
+/// Returns the physical address of the PML4.
+///
+/// Maps first `size` bytes of physical memory at both identity (PML4[0]) and
+/// high-half (PML4[256] = PHYS_OFFSET). Uses 2MB large pages.
+unsafe fn build_boot_page_tables(pt_mem: *mut u8, size: u64) -> u64 {
+    const PAGE_PRESENT: u64 = 1 << 0;
+    const PAGE_WRITE: u64 = 1 << 1;
+    const PAGE_SIZE_BIT: u64 = 1 << 7;
+    const PAGE_2M: u64 = 2 * 1024 * 1024;
+    const GB: u64 = 1 << 30;
+
+    let mut next_page = 0usize;
+    let mut alloc_page = |pt_mem: *mut u8| -> *mut u64 {
+        let p = pt_mem.add(next_page * 4096) as *mut u64;
+        next_page += 1;
+        p
+    };
+
+    let pml4 = alloc_page(pt_mem);
+    let identity_pdpt = alloc_page(pt_mem);
+    let high_pdpt = alloc_page(pt_mem);
+
+    let num_gb = ((size + GB - 1) / GB) as usize;
+    for gi in 0..num_gb {
+        let pd = alloc_page(pt_mem);
+        for pdi in 0..512u64 {
+            let phys = gi as u64 * GB + pdi * PAGE_2M;
+            if phys < size {
+                *pd.add(pdi as usize) = phys | PAGE_PRESENT | PAGE_WRITE | PAGE_SIZE_BIT;
+            }
+        }
+        let pd_phys = pd as u64;
+        *identity_pdpt.add(gi) = pd_phys | PAGE_PRESENT | PAGE_WRITE;
+        *high_pdpt.add(gi) = pd_phys | PAGE_PRESENT | PAGE_WRITE;
+    }
+
+    // PML4[0] = identity, PML4[256] = high-half (PHYS_OFFSET >> 39 = 256)
+    *pml4.add(0) = identity_pdpt as u64 | PAGE_PRESENT | PAGE_WRITE;
+    *pml4.add(256) = high_pdpt as u64 | PAGE_PRESENT | PAGE_WRITE;
+
+    pml4 as u64
+}
+
 fn start_kernel(kernel: LoadedKernel, kernel_elf_bytes: vec::Vec<u8>, initrd: vec::Vec<u8>, rsdp_addr: u64, gop: Option<GopInfo>, system_table: SystemTable<Boot>) -> ! {
     // Estimate memory map size
     let mms = system_table.boot_services().memory_map_size();
     let memory_map_entry_count = mms.map_size / mms.entry_size + 8;
     let mut memory_map = vec::Vec::<MemoryMapEntry>::with_capacity(memory_map_entry_count);
+
+    // Pre-allocate page table pages before exiting boot services.
+    // We need: 1 PML4 + 2 PDPTs + up to 8 PDs (for 8GB) = ~11 pages max.
+    // Allocate as a flat array and split into 512-entry pages.
+    const PT_PAGES: usize = 12;
+    let pt_layout = Layout::from_size_align(PT_PAGES * 4096, 4096).unwrap();
+    let pt_mem = unsafe { alloc::alloc::alloc_zeroed(pt_layout) };
+    assert!(!pt_mem.is_null(), "page table allocation failed");
 
     let (_system_table, uefi_memory_map) = system_table.exit_boot_services(MemoryType::LOADER_DATA);
 
@@ -231,10 +297,12 @@ fn start_kernel(kernel: LoadedKernel, kernel_elf_bytes: vec::Vec<u8>, initrd: ve
             None => (0, 0, 0, 0, 0, 0),
         };
 
+    // KernelArgs: all addresses are PHYSICAL (kernel translates to virtual)
+    let kernel_phys = kernel.memory.as_ptr() as u64;
     let kernel_args = KernelArgs {
         memory_map_addr: memory_map.as_ptr() as u64,
         memory_map_size: memory_map.len() as u64 * mem::size_of::<MemoryMapEntry>() as u64,
-        kernel_memory_addr: kernel.memory.as_ptr() as u64,
+        kernel_memory_addr: kernel_phys,
         kernel_memory_size: kernel.memory.len() as u64,
         kernel_stack_addr: kernel.stack_offset as u64,
         kernel_stack_size: kernel.stack_size as u64,
@@ -252,15 +320,55 @@ fn start_kernel(kernel: LoadedKernel, kernel_elf_bytes: vec::Vec<u8>, initrd: ve
         gop_stride,
         gop_pixel_format,
     };
-    let entry_addr = kernel.memory.as_ptr() as usize + kernel.entry_offset;
 
     mem::forget(memory_map);
     mem::forget(kernel.memory);
     mem::forget(kernel_elf_bytes);
     mem::forget(initrd);
 
-    let entry: extern "sysv64" fn(KernelArgs) -> ! = unsafe { mem::transmute(entry_addr) };
-    entry(kernel_args);
+    // Copy KernelArgs to the TOP of the kernel stack, just below RSP.
+    // The inline asm will set RSP, subtract space for KernelArgs, copy it,
+    // then pass a pointer in rdi.
+    let stack_top_phys = kernel_phys + kernel.stack_offset as u64 + kernel.stack_size as u64;
+
+    // Build boot page tables: identity map + high-half map for first 4GB.
+    let pml4_phys = unsafe { build_boot_page_tables(pt_mem, 4 * 1024 * 1024 * 1024) };
+
+    // Switch to new page tables (identity map keeps us alive)
+    unsafe { core::arch::asm!("mov cr3, {}", in(reg) pml4_phys, options(nostack)) };
+
+    // Compute high-half addresses.
+    let entry_virt = PHYS_OFFSET + kernel_phys + kernel.entry_offset as u64;
+    let stack_top_virt = PHYS_OFFSET + stack_top_phys;
+    let args_src = &kernel_args as *const KernelArgs as u64;
+    let args_size = mem::size_of::<KernelArgs>() as u64;
+
+    // Copy KernelArgs onto the high-half kernel stack, then call _start.
+    // We copy KernelArgs AFTER setting RSP so it's right below the stack top.
+    // rdi = pointer to the copy (sysv64 invisible reference for large structs).
+    unsafe {
+        core::arch::asm!(
+            // Switch to high-half kernel stack
+            "mov rsp, {stack}",
+            // Reserve space for KernelArgs (rounded up to 16-byte alignment)
+            "sub rsp, {size}",
+            "and rsp, -16",
+            // Copy KernelArgs from bootloader stack (identity-mapped) to kernel stack (high-half)
+            "mov rdi, rsp",
+            "mov rsi, {src}",
+            "mov rcx, {size}",
+            "rep movsb",
+            // rdi = pointer to KernelArgs copy on kernel stack
+            "mov rdi, rsp",
+            // Call kernel entry
+            "call {entry}",
+            stack = in(reg) stack_top_virt,
+            size = in(reg) args_size,
+            src = in(reg) args_src,
+            entry = in(reg) entry_virt,
+            options(noreturn),
+        );
+    }
 }
 
 #[entry]

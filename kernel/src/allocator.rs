@@ -223,7 +223,7 @@ unsafe impl GlobalAlloc for KernelAllocator {
             slab.free(ptr, size_class(effective));
         } else {
             let order = order_for(layout.size(), layout.align());
-            buddy.free(ptr as u64 / PAGE_SIZE as u64, order);
+            buddy.free((ptr as u64 - crate::PHYS_OFFSET) / PAGE_SIZE as u64, order);
         }
         self.release(flags);
     }

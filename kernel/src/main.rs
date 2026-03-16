@@ -3,7 +3,7 @@
 extern crate alloc;
 
 mod addr;
-pub use addr::{PhysAddr, VirtAddr, UserAddr};
+pub use addr::{PhysAddr, VirtAddr, UserAddr, PHYS_OFFSET};
 
 mod sync;
 mod id_map;
@@ -62,21 +62,23 @@ pub unsafe extern "sysv64" fn _start(kernel_args: KernelArgs) -> ! {
     serial::init();
     log!("{:?}", kernel_args);
 
+    // KernelArgs contains physical addresses from the bootloader.
+    // Add PHYS_OFFSET to get dereferenceable kernel virtual addresses.
     let entry_count = kernel_args.memory_map_size as usize / core::mem::size_of::<MemoryMapEntry>();
     let maps = core::slice::from_raw_parts(
-        kernel_args.memory_map_addr as *const MemoryMapEntry,
+        (kernel_args.memory_map_addr + PHYS_OFFSET) as *const MemoryMapEntry,
         entry_count,
     );
     let initrd = core::slice::from_raw_parts(
-        kernel_args.initrd_addr as *const u8,
+        (kernel_args.initrd_addr + PHYS_OFFSET) as *const u8,
         kernel_args.initrd_size as usize,
     );
     let kernel_elf = core::slice::from_raw_parts(
-        kernel_args.kernel_elf_addr as *const u8,
+        (kernel_args.kernel_elf_addr + PHYS_OFFSET) as *const u8,
         kernel_args.kernel_elf_size as usize,
     );
     let init_bytes = core::slice::from_raw_parts(
-        kernel_args.init_program_addr as *const u8,
+        (kernel_args.init_program_addr + PHYS_OFFSET) as *const u8,
         kernel_args.init_program_len as usize,
     );
     let init_programs = core::str::from_utf8(init_bytes).expect("init_programs: invalid UTF-8");
@@ -251,8 +253,8 @@ fn kernel_main(
 
     virtio_net::init(ecam_base);
 
-    if let Some(sound) = virtio_sound::init(ecam_base) {
-        crate::audio::register(sound);
+    if let Some((sound, audio_info)) = virtio_sound::init(ecam_base) {
+        crate::audio::register(sound, audio_info);
     }
 
     // Initialize GPU: try VirtIO first, fall back to UEFI GOP

@@ -1,13 +1,16 @@
 use core::fmt;
 use core::ops::{Add, Sub};
 
-/// Physical memory address. Under the kernel's identity map, numerically equal
-/// to the corresponding kernel virtual address. Can be dereferenced via `as_ptr`.
+/// All physical memory is mapped at this virtual offset in the kernel's address space.
+/// Physical address P is accessible at virtual address P + PHYS_OFFSET.
+pub const PHYS_OFFSET: u64 = 0xFFFF_8000_0000_0000;
+
+/// Physical memory address. Dereferenceable via `as_ptr()` which adds PHYS_OFFSET.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
 pub struct PhysAddr(u64);
 
-/// Kernel virtual address (identity-mapped region). Can be dereferenced via `as_ptr`.
+/// Kernel virtual address (in the high-half direct map). Can be dereferenced via `as_ptr`.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
 pub struct VirtAddr(u64);
@@ -32,21 +35,24 @@ impl PhysAddr {
         self.0
     }
 
-    /// Identity-map conversion to kernel virtual address (no-op).
+    /// Convert to kernel virtual address via the high-half direct map.
     pub const fn to_virt(self) -> VirtAddr {
-        VirtAddr(self.0)
+        VirtAddr(self.0 + PHYS_OFFSET)
     }
 
+    /// Dereferenceable pointer via the high-half direct map.
     pub const fn as_ptr<T>(self) -> *const T {
-        self.0 as *const T
+        (self.0 + PHYS_OFFSET) as *const T
     }
 
+    /// Dereferenceable mutable pointer via the high-half direct map.
     pub const fn as_mut_ptr<T>(self) -> *mut T {
-        self.0 as *mut T
+        (self.0 + PHYS_OFFSET) as *mut T
     }
 
+    /// Convert a kernel virtual pointer back to a physical address.
     pub fn from_ptr<T>(ptr: *const T) -> Self {
-        Self(ptr as u64)
+        Self(ptr as u64 - PHYS_OFFSET)
     }
 
     /// Page frame number (address / 4096).
@@ -131,9 +137,9 @@ impl VirtAddr {
         self.0
     }
 
-    /// Identity-map conversion to physical address (no-op).
+    /// Convert high-half virtual address back to physical.
     pub const fn to_phys(self) -> PhysAddr {
-        PhysAddr(self.0)
+        PhysAddr(self.0 - PHYS_OFFSET)
     }
 
     pub const fn as_ptr<T>(self) -> *const T {

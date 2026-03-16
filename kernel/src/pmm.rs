@@ -63,7 +63,7 @@ impl BuddyAllocator {
     }
 
     fn block_ptr(&self, pfn: u64) -> *mut FreeBlock {
-        (pfn as usize * PAGE_SIZE) as *mut FreeBlock
+        (pfn as usize * PAGE_SIZE + crate::PHYS_OFFSET as usize) as *mut FreeBlock
     }
 
     fn list_insert(&mut self, pfn: u64, order: usize) {
@@ -133,7 +133,7 @@ impl BuddyAllocator {
         }
         self.free_pages -= page_count;
 
-        (pfn as usize * PAGE_SIZE) as *mut u8
+        (pfn as usize * PAGE_SIZE + crate::PHYS_OFFSET as usize) as *mut u8
     }
 
     pub(crate) fn free(&mut self, pfn: u64, order: usize) {
@@ -241,7 +241,7 @@ pub(crate) unsafe fn init_buddy(
     // Find contiguous usable region for bitmap (skip reserved regions)
     let bitmap_addr = find_bitmap_placement(entries, reserved_regions, bitmap_pages)
         .expect("no space for allocator bitmap");
-    buddy.bitmap = bitmap_addr as *mut u64;
+    buddy.bitmap = (bitmap_addr as u64 + crate::PHYS_OFFSET) as *mut u64;
 
     // Initialize bitmap: all bits = 1 (everything allocated)
     let bitmap_slice = core::slice::from_raw_parts_mut(buddy.bitmap, bitmap_words);
