@@ -144,17 +144,7 @@ pub fn free_user_page_tables(pml4: *mut u64) {
         for pdpt_idx in 0..512 {
             let pdpte = unsafe { pdpt.add(pdpt_idx).read() };
             if pdpte & PAGE_PRESENT == 0 { continue; }
-            let pd = phys_to_ptr(pdpte & ADDR_MASK);
-
-            // Free 4KB page tables under this PD (from demand paging)
-            for pd_idx in 0..512 {
-                let pde = unsafe { pd.add(pd_idx).read() };
-                if pde & PAGE_PRESENT != 0 && pde & PAGE_SIZE_BIT == 0 {
-                    free_page(phys_to_ptr(pde & ADDR_MASK));
-                }
-            }
-
-            free_page(pd);
+            free_page(phys_to_ptr(pdpte & ADDR_MASK));
         }
 
         free_page(pdpt);
@@ -309,41 +299,8 @@ pub fn map_kernel(addr: PhysAddr, size: u64) {
     apic::tlb_shootdown();
 }
 
-/// Map a single 4KB page at `virt_addr` → `phys_addr` in the given PML4.
-/// Creates page table structures (PDPT, PD, PT) on demand.
-/// Used by demand paging for ELF segments.
-pub fn map_4k_in(pml4: *mut u64, virt_addr: UserAddr, phys_addr: PhysAddr, writable: bool) {
-    let va = virt_addr.raw();
-    let pml4_idx = ((va >> 39) & 0x1FF) as usize;
-    let pdpt_idx = ((va >> 30) & 0x1FF) as usize;
-    let pd_idx = ((va >> 21) & 0x1FF) as usize;
-    let pt_idx = ((va >> 12) & 0x1FF) as usize;
-
-    let user_flags = PAGE_PRESENT | PAGE_WRITE | PAGE_USER;
-
-    unsafe {
-        let pdpt = get_or_create(pml4, pml4_idx, user_flags);
-        let pd = get_or_create(pdpt, pdpt_idx, user_flags);
-
-        let pde = pd.add(pd_idx).read();
-        let pt = if pde & PAGE_PRESENT != 0 && pde & PAGE_SIZE_BIT == 0 {
-            // Already a 4KB page table
-            phys_to_ptr(pde & ADDR_MASK)
-        } else {
-            // Create new 4KB page table (or replace 2MB page)
-            let pt = alloc_page();
-            pd.add(pd_idx).write(ptr_to_phys(pt) | user_flags);
-            pt
-        };
-
-        let mut flags = PAGE_PRESENT | PAGE_USER;
-        if writable { flags |= PAGE_WRITE; }
-        pt.add(pt_idx).write((phys_addr.raw() & ADDR_MASK) | flags);
-    }
-}
-
 /// Translate a virtual address to its physical address by walking the page tables.
-/// Returns `None` if any level is not present.
+/// All user mappings use 2MB pages.
 pub fn virt_to_phys(pml4: *const u64, virt_addr: UserAddr) -> Option<PhysAddr> {
     let va = virt_addr.raw();
     let pml4_idx = ((va >> 39) & 0x1FF) as usize;
@@ -359,41 +316,7 @@ pub fn virt_to_phys(pml4: *const u64, virt_addr: UserAddr) -> Option<PhysAddr> {
         let pd = phys_to_ptr(pdpte & ADDR_MASK) as *const u64;
         let pde = pd.add(pd_idx).read();
         if pde & PAGE_PRESENT == 0 { return None; }
-
-        if pde & PAGE_SIZE_BIT != 0 {
-            // 2MB large page
-            Some(PhysAddr::new((pde & ADDR_MASK) + (va & (PAGE_2M - 1))))
-        } else {
-            // 4KB page table
-            let pt = phys_to_ptr(pde & ADDR_MASK) as *const u64;
-            let pt_idx = ((va >> 12) & 0x1FF) as usize;
-            let pte = pt.add(pt_idx).read();
-            if pte & PAGE_PRESENT == 0 { return None; }
-            Some(PhysAddr::new((pte & ADDR_MASK) + (va & 0xFFF)))
-        }
-    }
-}
-
-/// Return the address of the PTE for a 4KB-mapped virtual address.
-/// Returns None if any level is missing or if the PD entry is a 2MB page.
-#[allow(dead_code)]
-pub fn pte_addr(pml4: *const u64, virt_addr: u64) -> Option<u64> {
-    let pml4_idx = ((virt_addr >> 39) & 0x1FF) as usize;
-    let pdpt_idx = ((virt_addr >> 30) & 0x1FF) as usize;
-    let pd_idx = ((virt_addr >> 21) & 0x1FF) as usize;
-    let pt_idx = ((virt_addr >> 12) & 0x1FF) as usize;
-
-    unsafe {
-        let pml4e = pml4.add(pml4_idx).read();
-        if pml4e & PAGE_PRESENT == 0 { return None; }
-        let pdpt = phys_to_ptr(pml4e & ADDR_MASK) as *const u64;
-        let pdpte = pdpt.add(pdpt_idx).read();
-        if pdpte & PAGE_PRESENT == 0 { return None; }
-        let pd = phys_to_ptr(pdpte & ADDR_MASK) as *const u64;
-        let pde = pd.add(pd_idx).read();
-        if pde & PAGE_PRESENT == 0 || pde & PAGE_SIZE_BIT != 0 { return None; }
-        let pt = phys_to_ptr(pde & ADDR_MASK) as *const u64;
-        Some(pt.add(pt_idx) as u64)
+        Some(PhysAddr::new((pde & ADDR_MASK) + (va & (PAGE_2M - 1))))
     }
 }
 

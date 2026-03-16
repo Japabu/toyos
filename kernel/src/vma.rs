@@ -27,6 +27,7 @@ pub struct Vma {
     /// End virtual address, exclusive (4KB-aligned).
     pub end: UserAddr,
     /// Whether userspace can write to this region.
+    #[allow(dead_code)]
     pub writable: bool,
     /// What backs this region.
     pub kind: VmaKind,
@@ -55,6 +56,11 @@ impl VmaList {
     pub fn insert(&mut self, vma: Vma) {
         let idx = self.vmas.partition_point(|v| v.start.raw() < vma.start.raw());
         self.vmas.insert(idx, vma);
+    }
+
+    /// Iterate all VMAs that overlap the range [start, end).
+    pub fn overlapping(&self, start: UserAddr, end: UserAddr) -> impl Iterator<Item = &Vma> {
+        self.vmas.iter().filter(move |v| v.start.raw() < end.raw() && v.end.raw() > start.raw())
     }
 
     /// Remove all VMAs.

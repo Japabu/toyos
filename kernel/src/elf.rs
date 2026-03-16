@@ -571,15 +571,6 @@ impl RelocationIndex {
         start_i32 < self.entries_i32.len() && self.entries_i32[start_i32].0 < end_offset
     }
 
-    /// Count how many relocations fall within [page_offset, page_offset + 4096).
-    pub fn count_in_page(&self, page_offset: u64) -> usize {
-        let end_offset = page_offset + 4096;
-        let s64 = self.entries_u64.partition_point(|&(off, _)| off < page_offset);
-        let e64 = self.entries_u64.partition_point(|&(off, _)| off < end_offset);
-        let s32 = self.entries_i32.partition_point(|&(off, _)| off < page_offset);
-        let e32 = self.entries_i32.partition_point(|&(off, _)| off < end_offset);
-        (e64 - s64) + (e32 - s32)
-    }
 
     pub fn len(&self) -> usize { self.entries_u64.len() + self.entries_i32.len() }
 }

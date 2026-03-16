@@ -310,6 +310,7 @@ impl PageFaultTrace {
         }
     }
 
+    #[allow(dead_code)]
     pub fn push(&mut self, record: PageFaultRecord) {
         self.entries[self.write_pos] = record;
         self.write_pos = (self.write_pos + 1) % 32;
@@ -364,9 +365,8 @@ pub struct ProcessData {
     pub syscall_total: u64,
     /// Virtual memory areas for demand paging.
     pub vmas: crate::vma::VmaList,
-    /// Private 4KB physical pages allocated for demand-paged RW/COW pages.
-    /// Freed on process exit.
-    pub demand_pages: Vec<PhysAddr>,
+    /// 2MB allocations for demand-paged pages. Freed on process exit.
+    pub demand_allocs: Vec<OwnedAlloc>,
     /// RELATIVE relocation index for demand-paged ELF (applied per-page on fault).
     pub reloc_index: Option<Arc<elf::RelocationIndex>>,
     /// Runtime base address for the demand-paged ELF (for relocation computation).
@@ -782,7 +782,7 @@ pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64, stack_base: u64) -> Op
         syscall_counts: [0; 64],
         syscall_total: 0,
         vmas: crate::vma::VmaList::new(),
-        demand_pages: Vec::new(),
+        demand_allocs: Vec::new(),
         reloc_index: None,
         elf_base: UserAddr::new(0),
         fault_trace: PageFaultTrace::new(),
@@ -1432,7 +1432,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
         syscall_counts: [0; 64],
         syscall_total: 0,
         vmas,
-        demand_pages: Vec::new(),
+        demand_allocs: Vec::new(),
         reloc_index,
         elf_base: UserAddr::new(base),
         fault_trace: PageFaultTrace::new(),
@@ -1500,11 +1500,8 @@ fn teardown_resources(data_arc: &Arc<Lock<ProcessData>>, pid: Pid) {
     data.loaded_libs.clear();
     data.mmap_regions.clear();
 
-    // Free private demand-paged 4KB pages (RW/COW copies).
-    // RO pages mapped from the page cache are NOT freed — the page cache owns them.
-    for phys in data.demand_pages.drain(..) {
-        free_4k(phys);
-    }
+    // Free demand-paged 2MB allocations (dropped automatically by OwnedAlloc).
+    data.demand_allocs.clear();
     data.vmas.clear();
     data.reloc_index = None;
 }
@@ -1864,14 +1861,12 @@ pub fn find_pid(name: &str) -> Option<Pid> {
 pub fn handle_page_fault(fault_addr: u64, _error_code: u64) -> bool {
     let pid = current_pid();
     if pid == Pid::MAX { return false; }
-    // Get the process's data Arc, CR3, and for threads the parent's data Arc.
-    // Threads share the parent's address space (VMAs, relocations) but have their own ProcessData.
+
     let (data_arc, pml4) = {
         let guard = PROCESS_TABLE.lock();
         let Some(table) = guard.as_ref() else { return false };
         let Some(entry) = table.get(pid) else { return false };
         let Some(cr3) = entry.cr3() else { return false };
-        // For threads, use the parent's data (which has the VMAs and relocation index)
         let data = match entry.kind() {
             Kind::Thread { parent } => {
                 match table.get(*parent) {
@@ -1886,144 +1881,98 @@ pub fn handle_page_fault(fault_addr: u64, _error_code: u64) -> bool {
 
     let mut data = data_arc.lock();
 
-    // Extract VMA info before borrowing other fields
-    let (vma_start, vma_writable, vma_kind_info) = {
-        let vma = match data.vmas.find(UserAddr::new(fault_addr)) {
-            Some(v) => v,
-            None => return false,
-        };
-        let kind_info = match &vma.kind {
-            crate::vma::VmaKind::Anonymous => None,
-            crate::vma::VmaKind::FileBacked { block_map, file_offset, file_size } => {
-                Some((Arc::clone(block_map), *file_offset, *file_size))
-            }
-        };
-        (vma.start.raw(), vma.writable, kind_info)
-    };
+    // Verify the fault address is within a valid VMA
+    if data.vmas.find(UserAddr::new(fault_addr)).is_none() {
+        return false;
+    }
 
-    let page_vaddr = fault_addr & !0xFFF;
+    // Round down to 2MB boundary
+    let page_2m = paging::PAGE_2M;
+    let region_start = fault_addr & !(page_2m - 1);
+
     let reloc_index = data.reloc_index.clone();
     let elf_base = data.elf_base.raw();
 
-    match vma_kind_info {
-        None => {
-            // Anonymous: zeroed page
-            let phys = alloc_4k_zeroed();
-            paging::map_4k_in(pml4, UserAddr::new(page_vaddr), phys, vma_writable);
-            cpu::invlpg(crate::VirtAddr::new(page_vaddr));
-            data.fault_trace.push(PageFaultRecord {
-                fault_addr, page_elf_offset: page_vaddr.wrapping_sub(elf_base),
-                block_idx: 0, reloc_count: 0,
-                flags: (vma_writable as u16) | 0x4, // bit 2 = anonymous
-            });
-            data.demand_pages.push(phys);
-        }
-        Some((block_map, file_offset, file_size)) => {
-            let byte_offset = (page_vaddr - vma_start) + file_offset;
-            let block_idx = (byte_offset / 4096) as usize;
+    // If a 2MB page is already mapped at this region (from a previous fault
+    // in a different VMA that shares the same 2MB range), just return success.
+    if paging::virt_to_phys(pml4 as *const u64, UserAddr::new(region_start)).is_some() {
+        return true;
+    }
 
-            // How many valid file bytes are in this page?
-            // vma_offset = page_vaddr - vma_start (byte offset of this page within VMA)
-            let vma_offset = page_vaddr - vma_start;
-            let valid_in_page = if vma_offset + 4096 <= file_size {
-                4096usize // entirely within file data
-            } else if vma_offset < file_size {
-                (file_size - vma_offset) as usize // partial page
-            } else {
-                0 // entirely beyond file data (BSS)
-            };
+    // Allocate a zeroed 2MB physical page
+    let alloc = match OwnedAlloc::new(page_2m as usize, page_2m as usize) {
+        Some(a) => a,
+        None => return false,
+    };
+    let phys = PhysAddr::from_ptr(alloc.ptr());
+    let page_ptr = alloc.ptr();
 
-            if block_idx < block_map.len() {
-                let disk_block = block_map[block_idx];
+    // Fill the 2MB page from ALL VMAs that overlap this region.
+    // Multiple segments (e.g. .text and .rodata) can share a 2MB range.
+    let region_end_full = region_start + page_2m;
+
+    for vma in data.vmas.overlapping(UserAddr::new(region_start), UserAddr::new(region_end_full)) {
+        let vma_s = vma.start.raw();
+        let vma_e = vma.end.raw();
+
+        match &vma.kind {
+            crate::vma::VmaKind::Anonymous => {
+                // Already zeroed by OwnedAlloc::new
+            }
+            crate::vma::VmaKind::FileBacked { block_map, file_offset, file_size } => {
                 let mut cache_guard = crate::page_cache::lock();
                 let (cache, dev) = cache_guard.cache_and_dev();
-                let cache_phys = cache.ensure_cached(dev, disk_block);
 
-                let page_elf_offset = page_vaddr.wrapping_sub(elf_base);
-                let has_relocs = reloc_index.as_ref()
-                    .map_or(false, |ri| ri.has_relocs_in_page(page_elf_offset));
+                // Walk 4KB blocks within the overlap of [region_start..region_end_full] and [vma_s..vma_e]
+                let fill_start = region_start.max(vma_s);
+                let fill_end = region_end_full.min(vma_e);
+                let mut vaddr = fill_start & !0xFFF;
 
-                let reloc_count = if has_relocs {
-                    reloc_index.as_ref().map_or(0, |ri| ri.count_in_page(page_elf_offset))
-                } else { 0 };
+                while vaddr < fill_end {
+                    let vma_offset = vaddr - vma_s;
+                    let byte_offset = vma_offset + file_offset;
+                    let block_idx = (byte_offset / 4096) as usize;
+                    let page_offset = (vaddr - region_start) as usize;
 
-                // Partial page: need private copy to zero BSS tail
-                let needs_private = vma_writable || has_relocs || valid_in_page < 4096;
-
-                if needs_private {
-                    let private = alloc_4k_uninit();
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(
-                            cache_phys.as_ptr::<u8>(), private.as_mut_ptr::<u8>(), valid_in_page);
-                        // Zero BSS portion (bytes beyond file data)
-                        if valid_in_page < 4096 {
-                            core::ptr::write_bytes(
-                                private.as_mut_ptr::<u8>().add(valid_in_page), 0, 4096 - valid_in_page);
+                    if vma_offset < *file_size && block_idx < block_map.len() {
+                        let cache_phys = cache.ensure_cached(dev, block_map[block_idx]);
+                        let valid = if vma_offset + 4096 <= *file_size { 4096 } else { (*file_size - vma_offset) as usize };
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(
+                                cache_phys.as_ptr::<u8>(),
+                                page_ptr.add(page_offset),
+                                valid,
+                            );
                         }
                     }
-                    drop(cache_guard);
-
-                    if let Some(ref ri) = reloc_index {
-                        ri.apply_to_page(page_elf_offset, private.as_mut_ptr::<u8>());
-                    }
-
-                    paging::map_4k_in(pml4, UserAddr::new(page_vaddr), private, vma_writable || has_relocs);
-                    cpu::invlpg(crate::VirtAddr::new(page_vaddr));
-                    data.fault_trace.push(PageFaultRecord {
-                        fault_addr, page_elf_offset,
-                        block_idx: block_idx as u32, reloc_count: reloc_count as u16,
-                        flags: (vma_writable as u16) | ((has_relocs as u16) << 1),
-                    });
-                    data.demand_pages.push(private);
-                } else {
-                    drop(cache_guard);
-                    paging::map_4k_in(pml4, UserAddr::new(page_vaddr), cache_phys, false);
-                    cpu::invlpg(crate::VirtAddr::new(page_vaddr));
-                    data.fault_trace.push(PageFaultRecord {
-                        fault_addr, page_elf_offset,
-                        block_idx: block_idx as u32, reloc_count: 0,
-                        flags: 0,
-                    });
+                    vaddr += 4096;
                 }
-            } else {
-                let phys = alloc_4k_zeroed();
-                paging::map_4k_in(pml4, UserAddr::new(page_vaddr), phys, vma_writable);
-                cpu::invlpg(crate::VirtAddr::new(page_vaddr));
-                data.fault_trace.push(PageFaultRecord {
-                    fault_addr, page_elf_offset: page_vaddr.wrapping_sub(elf_base),
-                    block_idx: block_idx as u32, reloc_count: 0,
-                    flags: (vma_writable as u16) | 0x8, // bit 3 = beyond extent
-                });
-                data.demand_pages.push(phys);
             }
         }
     }
 
+    // Apply relocations across the entire 2MB region
+    if let Some(ref ri) = reloc_index {
+        let mut offset = 0u64;
+        while offset < page_2m {
+            let page_elf_offset = (region_start + offset).wrapping_sub(elf_base);
+            if ri.has_relocs_in_page(page_elf_offset) {
+                ri.apply_to_page(page_elf_offset, unsafe { page_ptr.add(offset as usize) });
+            }
+            offset += 4096;
+        }
+    }
+
+    // Map the 2MB page
+    paging::remap_user_2m_in(pml4, UserAddr::new(region_start), phys);
+    cpu::flush_tlb();
+
+    data.demand_allocs.push(alloc);
+
     true
 }
 
-/// Allocate a zeroed 4KB page, returning its physical address (= virtual address under identity mapping).
-fn alloc_4k_zeroed() -> PhysAddr {
-    let layout = Layout::from_size_align(4096, 4096).unwrap();
-    let ptr = unsafe { alloc_zeroed(layout) };
-    assert!(!ptr.is_null(), "alloc_4k_zeroed: out of memory");
-    PhysAddr::from_ptr(ptr)
-}
-
-/// Allocate an uninitialized 4KB page, returning its physical address.
-fn alloc_4k_uninit() -> PhysAddr {
-    let layout = Layout::from_size_align(4096, 4096).unwrap();
-    let ptr = unsafe { alloc(layout) };
-    assert!(!ptr.is_null(), "alloc_4k_uninit: out of memory");
-    PhysAddr::from_ptr(ptr)
-}
-
 /// Free a 4KB page at the given physical address.
-pub fn free_4k(phys: PhysAddr) {
-    let layout = Layout::from_size_align(4096, 4096).unwrap();
-    unsafe { dealloc(phys.as_mut_ptr(), layout) };
-}
-
 // ---------------------------------------------------------------------------
 // Crash diagnostics
 // ---------------------------------------------------------------------------
