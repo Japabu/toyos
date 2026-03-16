@@ -15,6 +15,19 @@ const CHANNELS: u16 = 2;
 const SAMPLE_RATE: SampleRate = 44100;
 const BUFFER_FRAMES: u32 = 1024;
 
+/// soundd protocol constants (must match toyos_abi::audio).
+const MSG_AUDIO_OPEN: u32 = 1;
+const MSG_AUDIO_OPENED: u32 = 2;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct AudioOpenRequest {
+    pipe_id: u64,
+    sample_rate: u32,
+    channels: u16,
+    format: u16,
+}
+
 pub struct Host;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -155,8 +168,33 @@ impl DeviceTrait for Device {
         let sample_size = sample_format.sample_size();
         let buffer_samples = buffer_frames as usize * channels;
         let buffer_bytes = buffer_samples * sample_size;
-        let period = Duration::from_secs_f64(buffer_frames as f64 / sample_rate as f64);
 
+        // Find soundd and open a stream via pipe
+        let soundd_pid = find_soundd();
+        let pipe = toyos_abi::syscall::pipe();
+        let pipe_id = toyos_abi::syscall::pipe_id(pipe.read)
+            .expect("pipe_id failed");
+        // We don't need the read end — soundd reads from it
+        toyos_abi::syscall::close(pipe.read);
+
+        // Send open request to soundd
+        let req = AudioOpenRequest {
+            pipe_id,
+            sample_rate: sample_rate as u32,
+            channels: channels as u16,
+            format: 0, // S16LE
+        };
+        toyos_abi::message::send_bytes(
+            toyos_abi::Pid(soundd_pid),
+            MSG_AUDIO_OPEN,
+            unsafe { core::slice::from_raw_parts(&req as *const _ as *const u8, core::mem::size_of::<AudioOpenRequest>()) },
+        );
+
+        // Wait for response
+        let msg = toyos_abi::message::recv();
+        assert_eq!(msg.msg_type, MSG_AUDIO_OPENED, "unexpected response from soundd");
+
+        let write_fd = pipe.write;
         let playing = Arc::new(AtomicBool::new(false));
         let alive = Arc::new(AtomicBool::new(true));
         let playing2 = playing.clone();
@@ -193,11 +231,13 @@ impl DeviceTrait for Device {
                     };
                     data_callback(&mut data, &info);
 
-                    // Write to the audio device
-                    toyos_abi::syscall::audio_write(&buffer);
-
-                    std::thread::sleep(period);
+                    // Write to pipe — blocks when pipe buffer is full.
+                    // soundd drains at hardware rate, providing natural backpressure.
+                    let _ = toyos_abi::syscall::write(write_fd, &buffer);
                 }
+
+                // Close pipe to signal soundd
+                toyos_abi::syscall::close(write_fd);
             })
             .map_err(|e| BuildStreamError::BackendSpecific {
                 err: crate::BackendSpecificError {
@@ -211,6 +251,17 @@ impl DeviceTrait for Device {
             thread: Some(thread),
         })
     }
+}
+
+/// Find soundd's PID via the service registry. Retries briefly if not yet started.
+fn find_soundd() -> u32 {
+    for _ in 0..100 {
+        if let Some(pid) = toyos_abi::syscall::find_pid("soundd") {
+            return pid.raw();
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("soundd not found");
 }
 
 impl StreamTrait for Stream {
