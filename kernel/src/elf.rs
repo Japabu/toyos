@@ -189,9 +189,9 @@ fn cache_loaded_lib(path: &str, lib: LoadedLib, rw_vaddr: u64, rw_end_vaddr: u64
         tls_filesz,
         tls_memsz,
         tls_align,
-        rela_off: rela_addr - base_kern,
+        rela_off: if !rela_addr.is_null() { rela_addr - base_kern } else { 0 },
         rela_size,
-        jmprel_off: jmprel_addr - base_kern,
+        jmprel_off: if !jmprel_addr.is_null() { jmprel_addr - base_kern } else { 0 },
         jmprel_size,
         gnu_hash_off: if !gnu_hash.is_null() { gnu_hash - base_kern } else { 0 },
         relocs: relocs.clone(),
@@ -264,9 +264,9 @@ fn clone_from_cache(cached: &CachedLib) -> Option<LoadedLib> {
         tls_filesz: cached.tls_filesz,
         tls_memsz: cached.tls_memsz,
         tls_align: cached.tls_align,
-        rela_addr: base_kern + cached.rela_off,
+        rela_addr: if cached.rela_off != 0 { base_kern + cached.rela_off } else { KernelAddr::null() },
         rela_size: cached.rela_size,
-        jmprel_addr: base_kern + cached.jmprel_off,
+        jmprel_addr: if cached.jmprel_off != 0 { base_kern + cached.jmprel_off } else { KernelAddr::null() },
         jmprel_size: cached.jmprel_size,
         gnu_hash: if cached.gnu_hash_off != 0 { base_kern + cached.gnu_hash_off } else { KernelAddr::null() },
         cached_relocs: Some(cached.relocs.clone()),
@@ -664,8 +664,8 @@ pub fn build_exe_sym_map<'a>(
     dynsym_data: &[u8],
     dynstr_data: &'a [u8],
     sym_count: usize,
-    base: u64,
-) -> hashbrown::HashMap<&'a str, u64> {
+    base: PhysAddr,
+) -> hashbrown::HashMap<&'a str, PhysAddr> {
     let mut map = hashbrown::HashMap::with_capacity(sym_count);
     for i in 1..sym_count {
         let off = i * 24;
@@ -675,7 +675,6 @@ pub fn build_exe_sym_map<'a>(
         let st_value = u64::from_le_bytes(dynsym_data[off + 8..off + 16].try_into().unwrap());
         if st_shndx == 0 { continue; }
         if st_name >= dynstr_data.len() { continue; }
-        // Find null terminator
         let name_end = dynstr_data[st_name..].iter().position(|&b| b == 0)
             .unwrap_or(dynstr_data.len() - st_name);
         let name = core::str::from_utf8(&dynstr_data[st_name..st_name + name_end]).unwrap_or("");
@@ -692,8 +691,8 @@ pub fn build_symtab_map(
     shdr_data: &[u8],
     shentsize: u16,
     block_map: &[u64],
-    base: u64,
-) -> Option<hashbrown::HashMap<&'static str, u64>> {
+    base: PhysAddr,
+) -> Option<hashbrown::HashMap<&'static str, PhysAddr>> {
     let shent = shentsize as usize;
     let shnum = shdr_data.len() / shent;
 
@@ -923,8 +922,8 @@ pub fn load_shared_lib(data: &[u8]) -> Result<(LoadedLib, u64, u64), &'static st
     };
     let t1 = crate::clock::nanos_since_boot();
     let base_ptr = alloc.ptr();
-    let base_kern = KernelAddr::from_ptr(base_ptr as *const u8).raw() - vaddr_min; // kernel virtual base for loading
-    let base_phys = PhysAddr::from_ptr(base_ptr) - vaddr_min; // physical, for user-visible addresses
+    let base_kern = KernelAddr::from_ptr(base_ptr as *const u8) - vaddr_min;
+    let base_phys = PhysAddr::from_ptr(base_ptr) - vaddr_min;
 
     // Copy PT_LOAD segments and zero BSS gaps.
     // Zero the entire range first to handle gaps between segments safely.
@@ -932,14 +931,14 @@ pub fn load_shared_lib(data: &[u8]) -> Result<(LoadedLib, u64, u64), &'static st
     let t2 = crate::clock::nanos_since_boot();
     for phdr in segments.iter() {
         if phdr.p_type == PT_LOAD {
-            let dst = (base_kern + phdr.p_vaddr) as *mut u8;
+            let dst = (base_kern + phdr.p_vaddr).as_mut_ptr::<u8>();
             let src = &data[phdr.p_offset as usize..][..phdr.p_filesz as usize];
             unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), dst, phdr.p_filesz as usize); }
         }
     }
     let t3 = crate::clock::nanos_since_boot();
 
-    // Parse PT_DYNAMIC to find DT_SYMTAB, DT_STRTAB, DT_STRSZ, DT_RELA, DT_RELASZ, DT_JMPREL, DT_PLTRELSZ
+    // Parse PT_DYNAMIC
     let mut symtab_vaddr = 0u64;
     let mut strtab_vaddr = 0u64;
     let mut strtab_size = 0u64;
@@ -955,12 +954,12 @@ pub fn load_shared_lib(data: &[u8]) -> Result<(LoadedLib, u64, u64), &'static st
     let mut gnu_hash_vaddr = 0u64;
     for phdr in segments.iter() {
         if phdr.p_type == PT_DYNAMIC {
-            let dyn_addr = (base_kern + phdr.p_vaddr) as *const u8;
+            let dyn_start = base_kern + phdr.p_vaddr;
             let dyn_size = phdr.p_filesz as usize;
             let mut offset = 0;
             while offset + 16 <= dyn_size {
-                let d_tag = unsafe { *(dyn_addr.add(offset) as *const i64) };
-                let d_val = unsafe { *(dyn_addr.add(offset + 8) as *const u64) };
+                let d_tag = unsafe { dyn_start.read_at::<i64>(offset) };
+                let d_val = unsafe { dyn_start.read_at::<u64>(offset + 8) };
                 match d_tag {
                     DT_SYMTAB => symtab_vaddr = d_val,
                     DT_STRTAB => strtab_vaddr = d_val,
@@ -980,9 +979,8 @@ pub fn load_shared_lib(data: &[u8]) -> Result<(LoadedLib, u64, u64), &'static st
 
     // Count .dynsym entries from GNU hash (avoids parsing section headers)
     let sym_count = if gnu_hash_vaddr != 0 {
-        gnu_hash_sym_count(KernelAddr::from_ptr((base_kern + gnu_hash_vaddr) as *const u8))
+        gnu_hash_sym_count(base_kern + gnu_hash_vaddr)
     } else {
-        // Fallback: parse section headers
         let mut count = 0;
         if let Some(shdrs) = elf.section_headers() {
             for shdr in shdrs.iter() {
@@ -995,33 +993,31 @@ pub fn load_shared_lib(data: &[u8]) -> Result<(LoadedLib, u64, u64), &'static st
         count
     };
 
-    let dynsym = KernelAddr::from_ptr((base_kern + symtab_vaddr) as *const u8);
-    let dynstr = KernelAddr::from_ptr((base_kern + strtab_vaddr) as *const u8);
+    let dynsym = base_kern + symtab_vaddr;
+    let dynstr = base_kern + strtab_vaddr;
 
-    // Apply R_X86_64_RELATIVE relocations using DT_RELA/DT_JMPREL from PT_DYNAMIC
-    // (much faster than parsing section headers for .rela.dyn/.rela.plt)
+    // Apply R_X86_64_RELATIVE relocations
     let entry_size = 24u64;
     let mut reloc_count = 0u64;
-    for &(rela_off, rela_sz) in &[(base_kern + rela_vaddr, rela_size), (base_kern + jmprel_vaddr, jmprel_size)] {
+    let alloc_kern = KernelAddr::from_ptr(base_ptr as *const u8);
+    for &(rela_start, rela_sz) in &[(base_kern + rela_vaddr, rela_size), (base_kern + jmprel_vaddr, jmprel_size)] {
         if rela_sz == 0 { continue; }
         let num = rela_sz / entry_size;
         for i in 0..num {
-            let rela_ptr = (rela_off + i * entry_size) as *const u8;
-            let r_offset = unsafe { *(rela_ptr as *const u64) };
-            let r_info = unsafe { *(rela_ptr.add(8) as *const u64) };
-            let r_addend = unsafe { *(rela_ptr.add(16) as *const i64) };
+            let entry = rela_start + i * entry_size;
+            let r_offset = unsafe { entry.read_at::<u64>(0) };
+            let r_info = unsafe { entry.read_at::<u64>(8) };
+            let r_addend = unsafe { entry.read_at::<i64>(16) };
             let r_type = (r_info & 0xFFFF_FFFF) as u32;
             if r_type == R_X86_64_RELATIVE {
-                let target_addr = base_kern + r_offset;
-                let alloc_start = base_ptr as u64;
-                let alloc_end = alloc_start + load_size as u64;
-                if target_addr < alloc_start || target_addr + 8 > alloc_end {
-                    panic!("RELATIVE reloc out of bounds: target={:#x} alloc=[{:#x}..{:#x}] r_offset={:#x} base={:#x}",
-                        target_addr, alloc_start, alloc_end, r_offset, base_kern);
-                }
-                let target = target_addr as *mut u64;
+                let target = base_kern + r_offset;
+                debug_assert!(
+                    target.raw() >= alloc_kern.raw() && target.raw() + 8 <= alloc_kern.raw() + load_size as u64,
+                    "RELATIVE reloc out of bounds: target={} alloc=[{}..+{:#x}] r_offset={:#x}",
+                    target, alloc_kern, load_size, r_offset,
+                );
                 let value = (base_phys.raw() as i64 + r_addend) as u64;
-                unsafe { *target = value; }
+                unsafe { target.as_mut_ptr::<u64>().write_unaligned(value); }
                 reloc_count += 1;
             }
         }
@@ -1034,13 +1030,10 @@ pub fn load_shared_lib(data: &[u8]) -> Result<(LoadedLib, u64, u64), &'static st
     let mut tls_align = 0usize;
     for phdr in segments.iter() {
         if phdr.p_type == PT_TLS {
-            tls_template = KernelAddr::from_ptr((base_kern + phdr.p_vaddr) as *const u8);
+            tls_template = base_kern + phdr.p_vaddr;
             tls_filesz = phdr.p_filesz as usize;
             tls_memsz = phdr.p_memsz as usize;
             tls_align = phdr.p_align as usize;
-            let alloc_end = base_ptr as u64 + load_size as u64;
-            crate::log!("dlopen TLS: base={:#x} base_ptr={:#x} vaddr_min={:#x} p_vaddr={:#x} template={} alloc=[{:#x}..{:#x}]",
-                base_kern, base_ptr as u64, vaddr_min, phdr.p_vaddr, tls_template, base_ptr as u64, alloc_end);
         }
     }
 
@@ -1050,18 +1043,14 @@ pub fn load_shared_lib(data: &[u8]) -> Result<(LoadedLib, u64, u64), &'static st
         (t1 - t0) / 1_000_000, (t2 - t1) / 1_000_000, (t3 - t2) / 1_000_000,
         (t4 - t3) / 1_000_000, reloc_count, sym_count);
 
-    let rela_addr_kern = KernelAddr::from_ptr((base_kern + rela_vaddr) as *const u8);
-    let jmprel_addr_kern = KernelAddr::from_ptr((base_kern + jmprel_vaddr) as *const u8);
-    let gnu_hash_kern = if gnu_hash_vaddr != 0 {
-        KernelAddr::from_ptr((base_kern + gnu_hash_vaddr) as *const u8)
-    } else { KernelAddr::null() };
+    let rela_addr = if rela_size > 0 { base_kern + rela_vaddr } else { KernelAddr::null() };
+    let jmprel_addr = if jmprel_size > 0 { base_kern + jmprel_vaddr } else { KernelAddr::null() };
+    let gnu_hash = if gnu_hash_vaddr != 0 { base_kern + gnu_hash_vaddr } else { KernelAddr::null() };
 
     Ok((LoadedLib { memory: LibMemory::Owned(alloc), base: base_phys,
         dynsym, dynstr, dynstr_size: strtab_size, sym_count,
         tls_template, tls_filesz, tls_memsz, tls_align,
-        rela_addr: rela_addr_kern, rela_size,
-        jmprel_addr: jmprel_addr_kern, jmprel_size,
-        gnu_hash: gnu_hash_kern,
+        rela_addr, rela_size, jmprel_addr, jmprel_size, gnu_hash,
         cached_relocs: None }, rw_vaddr, rw_end_vaddr))
 }
 
@@ -1135,7 +1124,7 @@ pub fn resolve_dlopen_relocs(lib: &LoadedLib, other_libs: &[LoadedLib]) {
 /// Public wrapper for resolve_lib_bind_relocs.
 pub fn resolve_lib_bind_relocs_pub(
     lib: &LoadedLib,
-    exe_sym_map: &hashbrown::HashMap<&str, u64>,
+    exe_sym_map: &hashbrown::HashMap<&str, PhysAddr>,
     libs: &[LoadedLib],
 ) {
     resolve_lib_bind_relocs(lib, exe_sym_map, libs);
@@ -1150,7 +1139,7 @@ pub fn gnu_dlsym_pub(lib: &LoadedLib, name: &str) -> Option<PhysAddr> {
 /// Uses pre-scanned reloc data when available (cached libs) to avoid iterating all entries.
 fn resolve_lib_bind_relocs(
     lib: &LoadedLib,
-    exe_sym_map: &hashbrown::HashMap<&str, u64>,
+    exe_sym_map: &hashbrown::HashMap<&str, PhysAddr>,
     libs: &[LoadedLib],
 ) {
     if let Some(relocs) = &lib.cached_relocs {
@@ -1160,9 +1149,9 @@ fn resolve_lib_bind_relocs(
             let st_name = unsafe { sym_entry.read_at::<u32>(0) };
             let sym_name = bounded_cstr(lib.dynstr, st_name as u64, lib.dynstr_size);
             let resolved = exe_sym_map.get(sym_name).copied()
-                .or_else(|| libs.iter().find_map(|other| gnu_dlsym(other, sym_name).map(|a| a.raw())));
+                .or_else(|| libs.iter().find_map(|other| gnu_dlsym(other, sym_name)));
             if let Some(addr) = resolved {
-                unsafe { lib.rw_write::<u64>(lib.base + r_offset, addr); }
+                unsafe { lib.rw_write::<u64>(lib.base + r_offset, addr.raw()); }
                 if sym_name == "main" {
                     log!("dynamic: resolved main -> {:#x}", addr);
                 }
@@ -1189,11 +1178,11 @@ fn resolve_lib_bind_relocs(
                         let st_name = unsafe { sym_entry.read_at::<u32>(0) };
                         let sym_name = bounded_cstr(lib.dynstr, st_name as u64, lib.dynstr_size);
                         let resolved = exe_sym_map.get(sym_name).copied()
-                            .or_else(|| libs.iter().find_map(|other| gnu_dlsym(other, sym_name).map(|a| a.raw())));
+                            .or_else(|| libs.iter().find_map(|other| gnu_dlsym(other, sym_name)));
                         if let Some(addr) = resolved {
-                            unsafe { lib.rw_write::<u64>(lib.base + r_offset, addr); }
+                            unsafe { lib.rw_write::<u64>(lib.base + r_offset, addr.raw()); }
                             if sym_name == "main" {
-                                log!("dynamic: resolved main -> {:#x}", addr);
+                                log!("dynamic: resolved main -> {}", addr);
                             }
                         } else {
                             log!("dynamic: lib unresolved symbol: {}", sym_name);
@@ -1209,11 +1198,23 @@ fn resolve_lib_bind_relocs(
     }
 }
 
+/// A single TLS module's layout within the combined TLS block.
+#[derive(Clone)]
+pub struct TlsModule {
+    /// Kernel pointer to the TLS template data (initial values).
+    pub template: KernelAddr,
+    /// Size of initialized TLS data (copied from template).
+    pub filesz: usize,
+    /// Total TLS size including BSS (zeroed beyond filesz).
+    pub memsz: usize,
+    /// Byte offset of this module within the combined TLS block.
+    pub base_offset: usize,
+}
+
 /// TLS layout info for cross-library TPOFF resolution.
 pub struct TlsModuleInfo<'a> {
     pub libs: &'a [LoadedLib],
-    /// (tls_template, tls_filesz, tls_memsz, base_offset) for each TLS module
-    pub modules: &'a [(KernelAddr, usize, usize, usize)],
+    pub modules: &'a [TlsModule],
 }
 
 /// Apply R_X86_64_TPOFF64 and R_X86_64_TPOFF32 relocations in a shared library.
@@ -1327,8 +1328,8 @@ fn resolve_cross_lib_tpoff(lib: &LoadedLib, r_sym: u32, tls_info: &TlsModuleInfo
         if let Some(sym_tls_offset) = tls_dlsym(other_lib, sym_name) {
             // Find this library's base offset in the combined layout
             let other_base_offset = tls_info.modules.iter()
-                .find(|&&(template, _, _, _)| template == other_lib.tls_template)
-                .map(|&(_, _, _, bo)| bo)
+                .find(|m| m.template == other_lib.tls_template)
+                .map(|m| m.base_offset)
                 .unwrap_or(0);
             return other_base_offset as i64 + sym_tls_offset as i64 - total_memsz as i64;
         }

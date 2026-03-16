@@ -106,21 +106,6 @@ pub fn init(memory_map: &[MemoryMapEntry]) {
 }
 
 /// DEBUG: verify a kernel direct-map PDE hasn't been corrupted with a virtual address.
-pub fn check_kernel_pde(pd_idx: usize, context: &str) {
-    let pml4 = KERNEL_PML4.load(Ordering::Acquire);
-    if pml4.is_null() { return; }
-    let pml4e = unsafe { pml4.add(256).read() };
-    if pml4e & PAGE_PRESENT == 0 { return; }
-    let pdpt = phys_to_ptr(pml4e & ADDR_MASK);
-    let pdpte = unsafe { pdpt.read() };
-    if pdpte & PAGE_PRESENT == 0 { return; }
-    let pd = phys_to_ptr(pdpte & ADDR_MASK);
-    let pde = unsafe { pd.add(pd_idx).read() };
-    if pde & PAGE_PRESENT != 0 && (pde & ADDR_MASK) >= PHYS_OFFSET {
-        panic!("kernel PDE[{}] corrupted: {:#018x} (has PHYS_OFFSET!) at {}", pd_idx, pde, context);
-    }
-}
-
 /// Get or create a next-level page table at the given index.
 /// `table` is a virtual pointer. PTEs store physical addresses.
 unsafe fn get_or_create(table: *mut u64, index: usize, flags: u64) -> *mut u64 {
@@ -219,7 +204,6 @@ pub fn map_user_in(pml4: *mut u64, addr: PhysAddr, size: u64) {
         }
         cur += PAGE_2M;
     }
-    check_kernel_pde(228, "after map_user_in");
 }
 
 /// Map physical memory as user-accessible read-only (2MB pages) in a specific PML4.

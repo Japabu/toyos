@@ -1225,13 +1225,14 @@ fn sys_dlopen(path: &str) -> u64 {
         if lib_has_tls {
             let new_memsz = lib.tls_memsz;
             for module in data.tls_modules.iter_mut() {
-                module.3 += new_memsz;
+                module.base_offset += new_memsz;
             }
-            data.tls_modules.insert(0, (lib.tls_template, lib.tls_filesz, lib.tls_memsz, 0));
-            // Recompute: raw extent is the end of the last module.
-            // Use raw memsz (NOT rounded up) — the linker computes TPOFF = sym_offset - memsz.
+            data.tls_modules.insert(0, crate::elf::TlsModule {
+                template: lib.tls_template, filesz: lib.tls_filesz,
+                memsz: lib.tls_memsz, base_offset: 0,
+            });
             let raw_total = data.tls_modules.iter()
-                .map(|&(_, _, memsz, base_offset)| base_offset + memsz)
+                .map(|m| m.base_offset + m.memsz)
                 .max().unwrap_or(0);
             data.tls_total_memsz = raw_total;
             if lib.tls_align > data.tls_max_align {
@@ -1294,11 +1295,11 @@ fn sys_dlopen(path: &str) -> u64 {
                 continue;
             }
 
-            let &(template, filesz, _memsz, base_offset) = &modules[0];
-            let dest = (new_tls_start + base_offset as u64) as *mut u8;
-            if filesz > 0 && !template.is_null() {
+            let m = &modules[0];
+            let dest = (new_tls_start + m.base_offset as u64) as *mut u8;
+            if m.filesz > 0 && !m.template.is_null() {
                 unsafe {
-                    core::ptr::copy_nonoverlapping(template.as_ptr::<u8>(), dest, filesz);
+                    core::ptr::copy_nonoverlapping(m.template.as_ptr::<u8>(), dest, m.filesz);
                 }
             }
 

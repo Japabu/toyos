@@ -27,7 +27,16 @@ pub struct UserAddr(u64);
 // ---------------------------------------------------------------------------
 
 impl PhysAddr {
+    /// Create from a raw physical address. Use `new` only in const contexts;
+    /// prefer runtime code paths where `from_ptr` or `checked` catch mistakes.
     pub const fn new(v: u64) -> Self {
+        Self(v)
+    }
+
+    /// Runtime-checked constructor. Panics in debug builds if the value looks
+    /// like a kernel virtual address (>= PHYS_OFFSET).
+    pub fn checked(v: u64) -> Self {
+        debug_assert!(v < PHYS_OFFSET, "PhysAddr::checked({:#x}): looks like a virtual address", v);
         Self(v)
     }
 
@@ -365,6 +374,13 @@ impl Add<u64> for KernelAddr {
     type Output = Self;
     fn add(self, rhs: u64) -> Self {
         Self(unsafe { self.0.add(rhs as usize) })
+    }
+}
+
+impl Sub<u64> for KernelAddr {
+    type Output = Self;
+    fn sub(self, rhs: u64) -> Self {
+        Self(unsafe { self.0.sub(rhs as usize) })
     }
 }
 

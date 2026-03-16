@@ -337,8 +337,8 @@ pub struct ProcessData {
     pub tls_filesz: usize,
     pub tls_memsz: usize,
     pub tls_alloc: Option<OwnedAlloc>,
-    /// Multi-module TLS: (template_addr, filesz, memsz, base_offset) per module.
-    pub tls_modules: Vec<(KernelAddr, usize, usize, usize)>,
+    /// Multi-module TLS layout per loaded library.
+    pub tls_modules: Vec<crate::elf::TlsModule>,
     /// Total combined TLS size across all modules.
     pub tls_total_memsz: usize,
     /// Maximum TLS alignment across all modules.
@@ -572,7 +572,7 @@ pub fn with_fd_owner_data<R>(f: impl FnOnce(&mut ProcessData) -> R) -> R {
 ///                              ^-- FS base (thread pointer)
 /// Returns (alloc, fs_base).
 pub fn setup_tls(tls_template: KernelAddr, tls_filesz: usize, tls_memsz: usize, tls_align: usize) -> Option<(OwnedAlloc, u64)> {
-    setup_combined_tls(&[(tls_template, tls_filesz, tls_memsz, 0)], tls_memsz, tls_align)
+    setup_combined_tls(&[elf::TlsModule { template: tls_template, filesz: tls_filesz, memsz: tls_memsz, base_offset: 0 }], tls_memsz, tls_align)
 }
 
 /// Allocate a combined TLS area for multiple modules (exe + shared libraries).
@@ -593,7 +593,7 @@ pub fn setup_tls(tls_template: KernelAddr, tls_filesz: usize, tls_memsz: usize, 
 const TCB_SIZE: usize = 64;
 
 pub fn setup_combined_tls(
-    modules: &[(KernelAddr, usize, usize, usize)], // (template, filesz, memsz, base_offset)
+    modules: &[crate::elf::TlsModule],
     total_memsz: usize,
     tls_align: usize,
 ) -> Option<(OwnedAlloc, u64)> {
@@ -610,8 +610,11 @@ pub fn setup_combined_tls(
     // Zero the TLS block area (BSS must be zero).
     unsafe { core::ptr::write_bytes(block.add(tls_start), 0, block_size); }
 
-    for (i, &(template, filesz, _memsz, base_offset)) in modules.iter().enumerate() {
-        if filesz > 0 && !template.is_null() {
+    for (i, module) in modules.iter().enumerate() {
+        if module.filesz > 0 && !module.template.is_null() {
+            let template = module.template;
+            let filesz = module.filesz;
+            let base_offset = module.base_offset;
             // Verify the template is accessible via direct map page walk
             let template_raw = template.raw();
             let pml4_ptr = paging::kernel_cr3().as_ptr::<u64>();
@@ -944,8 +947,8 @@ fn resolve_exe_tpoff(
             if lib.tls_memsz == 0 { continue; }
             if let Some(sym_tls_offset) = elf::tls_dlsym_pub(lib, sym_name) {
                 let other_base_offset = tls_info.modules.iter()
-                    .find(|&&(template, _, _, _)| template == lib.tls_template)
-                    .map(|&(_, _, _, bo)| bo)
+                    .find(|m| m.template == lib.tls_template)
+                    .map(|m| m.base_offset)
                     .unwrap_or(0);
                 return other_base_offset as i64 + sym_tls_offset as i64 - total_memsz as i64;
             }
@@ -1158,7 +1161,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
             let mut exe_sym_map = if sym_count > 0 {
                 let symtab_file_off = vaddr_to_file_offset(&layout.segments, dyn_info.symtab_vaddr);
                 let dynsym_data = read_file_range(&block_map, symtab_file_off, sym_count * 24);
-                elf::build_exe_sym_map(&dynsym_data, &dynstr_data, sym_count, base)
+                elf::build_exe_sym_map(&dynsym_data, &dynstr_data, sym_count, PhysAddr::new(base))
             } else {
                 hashbrown::HashMap::new()
             };
@@ -1168,7 +1171,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
             if exe_sym_map.is_empty() {
                 if let Some((shoff, shnum, shentsize)) = layout.section_headers {
                     let shdr_data = read_file_range(&block_map, shoff, shnum as usize * shentsize as usize);
-                    if let Some(m) = elf::build_symtab_map(&shdr_data, shentsize, &block_map, base) {
+                    if let Some(m) = elf::build_symtab_map(&shdr_data, shentsize, &block_map, PhysAddr::new(base)) {
                         exe_sym_map = m;
                     }
                 }
@@ -1250,7 +1253,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
     paging::map_user_in(child_pml4, stack_phys, USER_STACK_SIZE as u64);
 
     // 10. TLS setup
-    let mut tls_modules: Vec<(KernelAddr, usize, usize, usize)> = Vec::new();
+    let mut tls_modules: Vec<elf::TlsModule> = Vec::new();
     let mut tls_cursor = 0usize;
     let mut max_tls_align = 1usize;
 
@@ -1259,7 +1262,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
             if tls_cursor > 0 {
                 tls_cursor = (tls_cursor + 15) & !15;
             }
-            tls_modules.push((lib.tls_template, lib.tls_filesz, lib.tls_memsz, tls_cursor));
+            tls_modules.push(elf::TlsModule { template: lib.tls_template, filesz: lib.tls_filesz, memsz: lib.tls_memsz, base_offset: tls_cursor });
             tls_cursor += lib.tls_memsz;
             if lib.tls_align > max_tls_align { max_tls_align = lib.tls_align; }
         }
@@ -1290,7 +1293,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
             tls_cursor = (tls_cursor + 15) & !15;
         }
         let template_addr = KernelAddr::from_ptr(exe_tls_template.as_ref().unwrap().ptr());
-        tls_modules.push((template_addr, layout.tls_filesz, layout.tls_memsz, tls_cursor));
+        tls_modules.push(elf::TlsModule { template: template_addr, filesz: layout.tls_filesz, memsz: layout.tls_memsz, base_offset: tls_cursor });
         tls_cursor += layout.tls_memsz;
         if layout.tls_align > max_tls_align { max_tls_align = layout.tls_align; }
     }
@@ -1303,18 +1306,18 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
     let tls_info = elf::TlsModuleInfo { libs: &loaded_libs, modules: &tls_modules };
     for lib in &loaded_libs {
         let lib_base_offset = tls_modules.iter()
-            .find(|&&(template, _, _, _)| template == lib.tls_template)
-            .map(|&(_, _, _, base_offset)| base_offset)
+            .find(|m| m.template == lib.tls_template)
+            .map(|m| m.base_offset)
             .unwrap_or(0);
         elf::apply_tpoff_relocs(lib, lib_base_offset, tls_total_memsz, &tls_info);
     }
     // Resolve exe TPOFF relocations → add pre-computed values to reloc index
     {
         let exe_base_offset = tls_modules.iter()
-            .find(|&&(template, _, _, _)| {
-                exe_tls_template.as_ref().map_or(false, |buf| template == KernelAddr::from_ptr(buf.ptr()))
+            .find(|m| {
+                exe_tls_template.as_ref().map_or(false, |buf| m.template == KernelAddr::from_ptr(buf.ptr()))
             })
-            .map(|&(_, _, _, bo)| bo)
+            .map(|m| m.base_offset)
             .unwrap_or(0);
 
         // Read exe .dynsym/.dynstr for resolving named TPOFF symbols
@@ -1351,7 +1354,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
     };
 
     let (tls_template, tls_filesz, tls_memsz) = if !tls_modules.is_empty() {
-        (tls_modules[0].0, tls_modules[0].1, tls_modules[0].2)
+        (tls_modules[0].template, tls_modules[0].filesz, tls_modules[0].memsz)
     } else {
         (KernelAddr::null(), 0, 0)
     };
