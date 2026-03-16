@@ -63,7 +63,8 @@ pub const SYS_READ_NONBLOCK: u64 = 66;
 pub const SYS_WRITE_NONBLOCK: u64 = 67;
 pub const SYS_PIPE_OPEN: u64 = 68;
 pub const SYS_PIPE_ID: u64 = 70;
-pub const SYS_AUDIO_WRITE: u64 = 71;
+pub const SYS_AUDIO_SUBMIT: u64 = 71;
+pub const SYS_AUDIO_POLL: u64 = 84;
 pub const SYS_EXIT: u64 = 72;
 pub const SYS_GET_ENV: u64 = 73;
 pub const SYS_DUP2: u64 = 74;
@@ -427,22 +428,20 @@ pub fn thread_join(tid: u64) -> u64 {
 
 // --- IPC ---
 
-/// Send a message to process `target_pid`.
+/// Send a 128-byte `Message` to process `target_pid`.
 ///
 /// # Safety
-/// `msg_ptr` must point to a valid `RawMessage`-layout struct.
+/// `msg_ptr` must point to a valid `Message`.
 pub unsafe fn send_msg(target_pid: u64, msg_ptr: u64) -> u64 {
     syscall(SYS_SEND_MSG, target_pid, msg_ptr, 0, 0)
 }
 
-/// Receive a message. The kernel fills `msg_ptr` (a `RawMessage`) with
-/// metadata and copies the payload into `buf_ptr[..buf_len]`.
+/// Receive a 128-byte `Message`. Blocks if the queue is empty.
 ///
 /// # Safety
-/// `msg_ptr` must point to a valid, writable `RawMessage`.
-/// `buf_ptr` must point to `buf_len` writable bytes.
-pub unsafe fn recv_msg(msg_ptr: u64, buf_ptr: u64, buf_len: u64) -> u64 {
-    syscall(SYS_RECV_MSG, msg_ptr, buf_ptr, buf_len, 0)
+/// `msg_ptr` must point to a writable `Message`.
+pub unsafe fn recv_msg(msg_ptr: u64) -> u64 {
+    syscall(SYS_RECV_MSG, msg_ptr, 0, 0, 0)
 }
 
 // --- Filesystem ---
@@ -633,6 +632,7 @@ pub enum DeviceType {
     Mouse = 1,
     Framebuffer = 2,
     Nic = 3,
+    Audio = 4,
 }
 
 /// Claim exclusive access to a device.
@@ -918,7 +918,15 @@ pub fn nic_tx(total_len: u64) {
 
 // --- Audio ---
 
-/// Write PCM audio samples (s16le stereo 44100Hz) to the sound device.
-pub fn audio_write(samples: &[u8]) {
-    syscall(SYS_AUDIO_WRITE, samples.as_ptr() as u64, samples.len() as u64, 0, 0);
+/// Submit a filled DMA buffer to the audio device.
+/// `buf_idx`: index of the DMA buffer (0..num_buffers).
+/// `len`: number of bytes of PCM data written to the buffer.
+pub fn audio_submit(buf_idx: u32, len: u32) {
+    syscall(SYS_AUDIO_SUBMIT, buf_idx as u64, len as u64, 0, 0);
+}
+
+/// Poll for completed audio DMA buffers.
+/// Returns a bitmask where bit N is set if buffer N has been consumed and is reusable.
+pub fn audio_poll() -> u32 {
+    syscall(SYS_AUDIO_POLL, 0, 0, 0, 0) as u32
 }

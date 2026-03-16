@@ -2,10 +2,12 @@
 
 pub mod audio;
 pub mod boot;
+pub mod device;
 pub mod gpu;
 pub mod input;
 pub mod message;
 pub mod net;
+pub mod pipe;
 pub mod poll;
 pub mod raw_net;
 pub mod ring;
