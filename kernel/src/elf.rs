@@ -19,6 +19,41 @@ use elf::abi::{
 const R_X86_64_TPOFF64: u32 = 18;
 const R_X86_64_TPOFF32: u32 = 23;
 
+// ── ELF binary structures ───────────────────────────────────────────────
+// These match the on-disk/in-memory ELF64 layout (repr(C)). The `elf` crate's
+// Symbol/Rela types reorder fields during parsing, so they can't be used for
+// raw pointer reads via KernelAddr::read_at.
+
+/// ELF64 symbol table entry (24 bytes).
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct Elf64Sym {
+    st_name: u32,
+    st_info: u8,
+    st_other: u8,
+    st_shndx: u16,
+    st_value: u64,
+    st_size: u64,
+}
+
+const SYM_SIZE: u64 = core::mem::size_of::<Elf64Sym>() as u64; // 24
+
+/// ELF64 relocation entry with addend.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct Elf64Rela {
+    r_offset: u64,
+    r_info: u64,
+    r_addend: i64,
+}
+
+const RELA_SIZE: u64 = core::mem::size_of::<Elf64Rela>() as u64; // 24
+
+impl Elf64Rela {
+    fn r_type(self) -> u32 { (self.r_info & 0xFFFF_FFFF) as u32 }
+    fn r_sym(self) -> u32 { (self.r_info >> 32) as u32 }
+}
+
 // ── Shared library memory ownership ──────────────────────────────────────
 
 /// Ownership model for a loaded shared library's memory.
@@ -62,21 +97,14 @@ fn prescan_relocs(rela_addr: KernelAddr, rela_size: u64, jmprel_addr: KernelAddr
         tpoff64: alloc::vec::Vec::new(),
         tpoff32: alloc::vec::Vec::new(),
     };
-    let entry_size = 24u64;
     for (addr, size) in [(rela_addr, rela_size), (jmprel_addr, jmprel_size)] {
         if size == 0 || addr.is_null() { continue; }
-        let count = size / entry_size;
-        for i in 0..count {
-            let entry = addr + (i * entry_size);
-            let r_offset = unsafe { entry.read_at::<u64>(0) };
-            let r_info = unsafe { entry.read_at::<u64>(8) };
-            let r_addend = unsafe { entry.read_at::<i64>(16) };
-            let r_type = (r_info & 0xFFFF_FFFF) as u32;
-            let r_sym = (r_info >> 32) as u32;
-            match r_type {
-                6 | 7 => relocs.bind.push((r_offset, r_sym)),
-                R_X86_64_TPOFF64 => relocs.tpoff64.push((r_offset, r_sym, r_addend)),
-                R_X86_64_TPOFF32 => relocs.tpoff32.push((r_offset, r_sym, r_addend)),
+        for i in 0..size / RELA_SIZE {
+            let rela = unsafe { (addr + i * RELA_SIZE).read_at::<Elf64Rela>(0) };
+            match rela.r_type() {
+                6 | 7 => relocs.bind.push((rela.r_offset, rela.r_sym())),
+                R_X86_64_TPOFF64 => relocs.tpoff64.push((rela.r_offset, rela.r_sym(), rela.r_addend)),
+                R_X86_64_TPOFF32 => relocs.tpoff32.push((rela.r_offset, rela.r_sym(), rela.r_addend)),
                 _ => {}
             }
         }
@@ -780,13 +808,19 @@ pub struct LoadedLib {
 }
 
 impl LoadedLib {
-    /// Translate a cached virtual address to the kernel-writable physical address.
-    /// For Owned memory, this is identity. For Shared memory, RW addresses are
-    /// translated to the private physical pages via rw_delta.
-    /// Write a value at a relocation target address.
-    /// Uses unaligned writes because ELF relocation offsets aren't guaranteed aligned.
+    /// Read the i-th symbol table entry.
+    fn sym(&self, i: usize) -> Elf64Sym {
+        unsafe { (self.dynsym + i as u64 * SYM_SIZE).read_at::<Elf64Sym>(0) }
+    }
+
+    /// Get the name of the i-th symbol.
+    fn sym_name(&self, i: usize) -> &str {
+        let st_name = self.sym(i).st_name;
+        bounded_cstr(self.dynstr, st_name as u64, self.dynstr_size)
+    }
+
     /// Write a value at a relocation target.
-    /// `phys_addr` is `lib.base + r_offset` (a physical/user-visible address).
+    /// `addr` is `self.base + r_offset` (a physical/user-visible address).
     /// Converts to a kernel-writable virtual pointer before writing.
     pub unsafe fn rw_write<T: Copy>(&self, addr: PhysAddr, value: T) {
         let ptr = match &self.memory {
@@ -852,14 +886,10 @@ fn gnu_dlsym(lib: &LoadedLib, name: &str) -> Option<PhysAddr> {
         // Compare hash values (ignoring lowest bit which is the chain-end flag)
         if (chain_val | 1) == (h | 1) {
             // Hash matches — verify with string compare
-            let sym_addr = lib.dynsym + i as u64 * 24;
-            let st_name = unsafe { sym_addr.read_at::<u32>(0) };
-            let st_shndx = unsafe { sym_addr.read_at::<u16>(6) };
-            let st_value = unsafe { sym_addr.read_at::<u64>(8) };
-            if st_shndx != 0 {
-                let sym_name = bounded_cstr(lib.dynstr, st_name as u64, lib.dynstr_size);
-                if sym_name == name {
-                    return Some(lib.base + st_value);
+            let sym = lib.sym(i as usize);
+            if sym.st_shndx != 0 {
+                if lib.sym_name(i as usize) == name {
+                    return Some(lib.base + sym.st_value);
                 }
             }
         }
@@ -985,7 +1015,7 @@ pub fn load_shared_lib(data: &[u8]) -> Result<(LoadedLib, u64, u64), &'static st
         if let Some(shdrs) = elf.section_headers() {
             for shdr in shdrs.iter() {
                 if shdr.sh_type == SHT_DYNSYM {
-                    count = (shdr.sh_size / shdr.sh_entsize.max(24)) as usize;
+                    count = (shdr.sh_size / shdr.sh_entsize.max(SYM_SIZE)) as usize;
                     break;
                 }
             }
@@ -997,26 +1027,14 @@ pub fn load_shared_lib(data: &[u8]) -> Result<(LoadedLib, u64, u64), &'static st
     let dynstr = base_kern + strtab_vaddr;
 
     // Apply R_X86_64_RELATIVE relocations
-    let entry_size = 24u64;
     let mut reloc_count = 0u64;
-    let alloc_kern = KernelAddr::from_ptr(base_ptr as *const u8);
     for &(rela_start, rela_sz) in &[(base_kern + rela_vaddr, rela_size), (base_kern + jmprel_vaddr, jmprel_size)] {
         if rela_sz == 0 { continue; }
-        let num = rela_sz / entry_size;
-        for i in 0..num {
-            let entry = rela_start + i * entry_size;
-            let r_offset = unsafe { entry.read_at::<u64>(0) };
-            let r_info = unsafe { entry.read_at::<u64>(8) };
-            let r_addend = unsafe { entry.read_at::<i64>(16) };
-            let r_type = (r_info & 0xFFFF_FFFF) as u32;
-            if r_type == R_X86_64_RELATIVE {
-                let target = base_kern + r_offset;
-                debug_assert!(
-                    target.raw() >= alloc_kern.raw() && target.raw() + 8 <= alloc_kern.raw() + load_size as u64,
-                    "RELATIVE reloc out of bounds: target={} alloc=[{}..+{:#x}] r_offset={:#x}",
-                    target, alloc_kern, load_size, r_offset,
-                );
-                let value = (base_phys.raw() as i64 + r_addend) as u64;
+        for i in 0..rela_sz / RELA_SIZE {
+            let rela = unsafe { (rela_start + i * RELA_SIZE).read_at::<Elf64Rela>(0) };
+            if rela.r_type() == R_X86_64_RELATIVE {
+                let target = base_kern + rela.r_offset;
+                let value = (base_phys.raw() as i64 + rela.r_addend) as u64;
                 unsafe { target.as_mut_ptr::<u64>().write_unaligned(value); }
                 reloc_count += 1;
             }
@@ -1056,20 +1074,11 @@ pub fn load_shared_lib(data: &[u8]) -> Result<(LoadedLib, u64, u64), &'static st
 
 /// Look up a symbol by name in a loaded shared library.
 pub fn dlsym(lib: &LoadedLib, name: &str) -> Option<PhysAddr> {
-    // Each Elf64_Sym is 24 bytes: st_name(4), st_info(1), st_other(1), st_shndx(2), st_value(8), st_size(8)
     for i in 1..lib.sym_count {
-        let sym_addr = lib.dynsym + i as u64 * 24;
-        let st_name = unsafe { sym_addr.read_at::<u32>(0) };
-        let st_shndx = unsafe { sym_addr.read_at::<u16>(6) };
-        let st_value = unsafe { sym_addr.read_at::<u64>(8) };
-
-        if st_shndx == 0 {
-            continue;
-        }
-
-        let sym_name = bounded_cstr(lib.dynstr, st_name as u64, lib.dynstr_size);
-        if sym_name == name {
-            return Some(lib.base + st_value);
+        let sym = lib.sym(i);
+        if sym.st_shndx == 0 { continue; }
+        if lib.sym_name(i) == name {
+            return Some(lib.base + sym.st_value);
         }
     }
     None
@@ -1082,9 +1091,7 @@ pub fn resolve_dlopen_relocs(lib: &LoadedLib, other_libs: &[LoadedLib]) {
     let mut unresolved_count = 0u64;
 
     let resolve_one = |r_offset: u64, r_sym: u32, resolved_count: &mut u64, unresolved_count: &mut u64| {
-        let sym_entry = lib.dynsym + r_sym as u64 * 24;
-        let st_name = unsafe { sym_entry.read_at::<u32>(0) };
-        let sym_name = bounded_cstr(lib.dynstr, st_name as u64, lib.dynstr_size);
+        let sym_name = lib.sym_name(r_sym as usize);
         let resolved = other_libs.iter().find_map(|other| gnu_dlsym(other, sym_name));
         if let Some(addr) = resolved {
             unsafe { lib.rw_write::<u64>(lib.base + r_offset, addr.raw()); }
@@ -1102,18 +1109,12 @@ pub fn resolve_dlopen_relocs(lib: &LoadedLib, other_libs: &[LoadedLib]) {
             resolve_one(r_offset, r_sym, &mut resolved_count, &mut unresolved_count);
         }
     } else {
-        let entry_size = 24u64;
         for (rela_addr, rela_size) in [(lib.rela_addr, lib.rela_size), (lib.jmprel_addr, lib.jmprel_size)] {
             if rela_size == 0 || rela_addr.is_null() { continue; }
-            let count = rela_size / entry_size;
-            for i in 0..count {
-                let entry = rela_addr + i * entry_size;
-                let r_offset = unsafe { entry.read_at::<u64>(0) };
-                let r_info = unsafe { entry.read_at::<u64>(8) };
-                let r_type = (r_info & 0xFFFF_FFFF) as u32;
-                let r_sym = (r_info >> 32) as u32;
-                if r_type == 6 || r_type == 7 {
-                    resolve_one(r_offset, r_sym, &mut resolved_count, &mut unresolved_count);
+            for i in 0..rela_size / RELA_SIZE {
+                let rela = unsafe { (rela_addr + i * RELA_SIZE).read_at::<Elf64Rela>(0) };
+                if rela.r_type() == 6 || rela.r_type() == 7 {
+                    resolve_one(rela.r_offset, rela.r_sym(), &mut resolved_count, &mut unresolved_count);
                 }
             }
         }
@@ -1142,54 +1143,30 @@ fn resolve_lib_bind_relocs(
     exe_sym_map: &hashbrown::HashMap<&str, PhysAddr>,
     libs: &[LoadedLib],
 ) {
+    let resolve_bind = |r_offset: u64, r_sym: u32| {
+        let sym_name = lib.sym_name(r_sym as usize);
+        let resolved = exe_sym_map.get(sym_name).copied()
+            .or_else(|| libs.iter().find_map(|other| gnu_dlsym(other, sym_name)));
+        if let Some(addr) = resolved {
+            unsafe { lib.rw_write::<u64>(lib.base + r_offset, addr.raw()); }
+        } else {
+            log!("dynamic: lib unresolved symbol: {}", sym_name);
+        }
+    };
+
     if let Some(relocs) = &lib.cached_relocs {
-        // Fast path: only iterate the pre-scanned GLOB_DAT/JUMP_SLOT entries
         for &(r_offset, r_sym) in &relocs.bind {
-            let sym_entry = lib.dynsym + r_sym as u64 * 24;
-            let st_name = unsafe { sym_entry.read_at::<u32>(0) };
-            let sym_name = bounded_cstr(lib.dynstr, st_name as u64, lib.dynstr_size);
-            let resolved = exe_sym_map.get(sym_name).copied()
-                .or_else(|| libs.iter().find_map(|other| gnu_dlsym(other, sym_name)));
-            if let Some(addr) = resolved {
-                unsafe { lib.rw_write::<u64>(lib.base + r_offset, addr.raw()); }
-                if sym_name == "main" {
-                    log!("dynamic: resolved main -> {:#x}", addr);
-                }
-            } else {
-                log!("dynamic: lib unresolved symbol: {}", sym_name);
-            }
+            resolve_bind(r_offset, r_sym);
         }
     } else {
-        // Slow path: scan all relocation entries (fresh load, not cached)
-        let entry_size = 24u64;
         for (rela_addr, rela_size) in [(lib.rela_addr, lib.rela_size), (lib.jmprel_addr, lib.jmprel_size)] {
             if rela_size == 0 || rela_addr.is_null() { continue; }
-            let count = rela_size / entry_size;
-            for i in 0..count {
-                let entry = rela_addr + i * entry_size;
-                let r_offset = unsafe { entry.read_at::<u64>(0) };
-                let r_info = unsafe { entry.read_at::<u64>(8) };
-                let r_addend = unsafe { entry.read_at::<i64>(16) };
-                let r_type = (r_info & 0xFFFF_FFFF) as u32;
-                let r_sym = (r_info >> 32) as u32;
-                match r_type {
-                    6 | 7 => {
-                        let sym_entry = lib.dynsym + r_sym as u64 * 24;
-                        let st_name = unsafe { sym_entry.read_at::<u32>(0) };
-                        let sym_name = bounded_cstr(lib.dynstr, st_name as u64, lib.dynstr_size);
-                        let resolved = exe_sym_map.get(sym_name).copied()
-                            .or_else(|| libs.iter().find_map(|other| gnu_dlsym(other, sym_name)));
-                        if let Some(addr) = resolved {
-                            unsafe { lib.rw_write::<u64>(lib.base + r_offset, addr.raw()); }
-                            if sym_name == "main" {
-                                log!("dynamic: resolved main -> {}", addr);
-                            }
-                        } else {
-                            log!("dynamic: lib unresolved symbol: {}", sym_name);
-                        }
-                    }
+            for i in 0..rela_size / RELA_SIZE {
+                let rela = unsafe { (rela_addr + i * RELA_SIZE).read_at::<Elf64Rela>(0) };
+                match rela.r_type() {
+                    6 | 7 => resolve_bind(rela.r_offset, rela.r_sym()),
                     8 => {
-                        unsafe { lib.rw_write::<u64>(lib.base + r_offset, (lib.base.raw() as i64 + r_addend) as u64); }
+                        unsafe { lib.rw_write::<u64>(lib.base + rela.r_offset, (lib.base.raw() as i64 + rela.r_addend) as u64); }
                     }
                     _ => {}
                 }
@@ -1241,26 +1218,19 @@ pub fn apply_tpoff_relocs(lib: &LoadedLib, lib_base_offset: usize, total_memsz: 
         }
     } else {
         // Slow path: scan all relocation entries
-        let entry_size = 24u64;
         let mut count64 = 0u64;
         let mut count32 = 0u64;
         for (rela_addr, rela_size) in [(lib.rela_addr, lib.rela_size), (lib.jmprel_addr, lib.jmprel_size)] {
             if rela_size == 0 || rela_addr.is_null() { continue; }
-            let num = rela_size / entry_size;
-            for i in 0..num {
-                let entry = rela_addr + i * entry_size;
-                let r_offset = unsafe { entry.read_at::<u64>(0) };
-                let r_info = unsafe { entry.read_at::<u64>(8) };
-                let r_addend = unsafe { entry.read_at::<i64>(16) };
-                let r_type = (r_info & 0xFFFF_FFFF) as u32;
-                let r_sym = (r_info >> 32) as u32;
-                if r_type == R_X86_64_TPOFF64 {
-                    let tpoff = compute_tpoff(lib, r_sym, r_addend, lib_base_offset, total_memsz, tls_info);
-                    unsafe { lib.rw_write::<u64>(lib.base + r_offset, tpoff as u64); }
+            for i in 0..rela_size / RELA_SIZE {
+                let rela = unsafe { (rela_addr + i * RELA_SIZE).read_at::<Elf64Rela>(0) };
+                if rela.r_type() == R_X86_64_TPOFF64 {
+                    let tpoff = compute_tpoff(lib, rela.r_sym(), rela.r_addend, lib_base_offset, total_memsz, tls_info);
+                    unsafe { lib.rw_write::<u64>(lib.base + rela.r_offset, tpoff as u64); }
                     count64 += 1;
-                } else if r_type == R_X86_64_TPOFF32 {
-                    let tpoff = compute_tpoff(lib, r_sym, r_addend, lib_base_offset, total_memsz, tls_info);
-                    unsafe { lib.rw_write::<i32>(lib.base + r_offset, tpoff as i32); }
+                } else if rela.r_type() == R_X86_64_TPOFF32 {
+                    let tpoff = compute_tpoff(lib, rela.r_sym(), rela.r_addend, lib_base_offset, total_memsz, tls_info);
+                    unsafe { lib.rw_write::<i32>(lib.base + rela.r_offset, tpoff as i32); }
                     count32 += 1;
                 }
             }
@@ -1275,11 +1245,9 @@ pub fn apply_tpoff_relocs(lib: &LoadedLib, lib_base_offset: usize, total_memsz: 
 /// Compute a TPOFF value for a relocation entry.
 fn compute_tpoff(lib: &LoadedLib, r_sym: u32, r_addend: i64, lib_base_offset: usize, total_memsz: usize, tls_info: &TlsModuleInfo) -> i64 {
     if r_sym != 0 {
-        let sym_entry = lib.dynsym + r_sym as u64 * 24;
-        let st_shndx = unsafe { sym_entry.read_at::<u16>(6) };
-        if st_shndx != 0 {
-            let st_value = unsafe { sym_entry.read_at::<u64>(8) };
-            lib_base_offset as i64 + st_value as i64 + r_addend - total_memsz as i64
+        let sym = lib.sym(r_sym as usize);
+        if sym.st_shndx != 0 {
+            lib_base_offset as i64 + sym.st_value as i64 + r_addend - total_memsz as i64
         } else {
             resolve_cross_lib_tpoff(lib, r_sym, tls_info, total_memsz)
         }
@@ -1296,18 +1264,12 @@ pub fn tls_dlsym_pub(lib: &LoadedLib, name: &str) -> Option<u64> {
 /// Look up a TLS symbol by name in a library's .dynsym, returning its st_value
 /// (offset within the TLS segment). Returns None if not found.
 fn tls_dlsym(lib: &LoadedLib, name: &str) -> Option<u64> {
-    // Linear scan of dynsym since gnu_hash adds base which is wrong for TLS
     for idx in 0..lib.sym_count {
-        let sym_addr = lib.dynsym + idx as u64 * 24;
-        let st_name = unsafe { sym_addr.read_at::<u32>(0) };
-        let st_info = unsafe { sym_addr.read_at::<u8>(4) };
-        let st_shndx = unsafe { sym_addr.read_at::<u16>(6) };
-        let st_value = unsafe { sym_addr.read_at::<u64>(8) };
+        let sym = lib.sym(idx);
         // STT_TLS = 6
-        if st_shndx != 0 && (st_info & 0xf) == 6 {
-            let sym_name = bounded_cstr(lib.dynstr, st_name as u64, lib.dynstr_size);
-            if sym_name == name {
-                return Some(st_value);
+        if sym.st_shndx != 0 && (sym.st_info & 0xf) == 6 {
+            if lib.sym_name(idx) == name {
+                return Some(sym.st_value);
             }
         }
     }
@@ -1317,10 +1279,7 @@ fn tls_dlsym(lib: &LoadedLib, name: &str) -> Option<u64> {
 /// Resolve a cross-library TPOFF64 relocation by looking up the symbol name
 /// from `lib`'s dynsym, finding which library defines it, and computing the tpoff.
 fn resolve_cross_lib_tpoff(lib: &LoadedLib, r_sym: u32, tls_info: &TlsModuleInfo, total_memsz: usize) -> i64 {
-    // Read symbol name from lib's dynsym/dynstr
-    let sym_entry = lib.dynsym + r_sym as u64 * 24;
-    let st_name = unsafe { sym_entry.read_at::<u32>(0) };
-    let sym_name = bounded_cstr(lib.dynstr, st_name as u64, lib.dynstr_size);
+    let sym_name = lib.sym_name(r_sym as usize);
 
     // Search all libraries for the defining TLS symbol
     for other_lib in tls_info.libs {
