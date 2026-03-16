@@ -1201,12 +1201,13 @@ fn sys_dlopen(path: &str) -> u64 {
         }
         crate::elf::LibMemory::Shared { rw_alloc, cached_addr, cached_size, rw_offset, .. } => {
             let pml4 = cpu::read_cr3().as_mut_ptr();
-            paging::map_user_readonly_in(pml4, PhysAddr::new(*cached_addr), *cached_size as u64);
+            let cached_phys = PhysAddr::from_ptr(*cached_addr as *const u8);
+            paging::map_user_readonly_in(pml4, cached_phys, *cached_size as u64);
             let num_rw_pages = rw_alloc.size() / paging::PAGE_2M as usize;
             for i in 0..num_rw_pages {
-                let virt = *cached_addr + *rw_offset as u64 + i as u64 * paging::PAGE_2M;
+                let user_virt = cached_phys.raw() + *rw_offset as u64 + i as u64 * paging::PAGE_2M;
                 let phys = PhysAddr::from_ptr(rw_alloc.ptr()) + i as u64 * paging::PAGE_2M;
-                paging::remap_user_2m_in(pml4, UserAddr::new(virt), phys);
+                paging::remap_user_2m_in(pml4, UserAddr::new(user_virt), phys);
             }
             cpu::flush_tlb();
             apic::tlb_shootdown();

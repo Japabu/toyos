@@ -772,13 +772,16 @@ impl LoadedLib {
     /// Translate a cached virtual address to the kernel-writable physical address.
     /// For Owned memory, this is identity. For Shared memory, RW addresses are
     /// translated to the private physical pages via rw_delta.
-    pub fn rw_write_ptr<T>(&self, cached_addr: u64) -> *mut T {
-        match &self.memory {
+    /// Write a value at a relocation target address.
+    /// Uses unaligned writes because ELF relocation offsets aren't guaranteed aligned.
+    pub unsafe fn rw_write<T: Copy>(&self, cached_addr: u64, value: T) {
+        let ptr = match &self.memory {
             LibMemory::Owned(_) => cached_addr as *mut T,
             LibMemory::Shared { rw_delta, .. } => {
                 (cached_addr as i64 + rw_delta) as *mut T
             }
-        }
+        };
+        ptr.write_unaligned(value);
     }
 }
 
@@ -1060,8 +1063,7 @@ pub fn resolve_dlopen_relocs(lib: &LoadedLib, other_libs: &[LoadedLib]) {
         let sym_name = bounded_cstr(lib.dynstr, st_name as u64, lib.dynstr_size);
         let resolved = other_libs.iter().find_map(|other| gnu_dlsym(other, sym_name));
         if let Some(addr) = resolved {
-            let target = lib.rw_write_ptr::<u64>(lib.base + r_offset);
-            unsafe { *target = addr; }
+            unsafe { lib.rw_write::<u64>(lib.base + r_offset, addr); }
             *resolved_count += 1;
         } else {
             if *unresolved_count < 5 {
@@ -1125,8 +1127,7 @@ fn resolve_lib_bind_relocs(
             let resolved = exe_sym_map.get(sym_name).copied()
                 .or_else(|| libs.iter().find_map(|other| gnu_dlsym(other, sym_name)));
             if let Some(addr) = resolved {
-                let target = lib.rw_write_ptr::<u64>(lib.base + r_offset);
-                unsafe { *target = addr; }
+                unsafe { lib.rw_write::<u64>(lib.base + r_offset, addr); }
                 if sym_name == "main" {
                     log!("dynamic: resolved main -> {:#x}", addr);
                 }
@@ -1155,8 +1156,7 @@ fn resolve_lib_bind_relocs(
                         let resolved = exe_sym_map.get(sym_name).copied()
                             .or_else(|| libs.iter().find_map(|other| gnu_dlsym(other, sym_name)));
                         if let Some(addr) = resolved {
-                            let target = lib.rw_write_ptr::<u64>(lib.base + r_offset);
-                            unsafe { *target = addr; }
+                            unsafe { lib.rw_write::<u64>(lib.base + r_offset, addr); }
                             if sym_name == "main" {
                                 log!("dynamic: resolved main -> {:#x}", addr);
                             }
@@ -1165,8 +1165,7 @@ fn resolve_lib_bind_relocs(
                         }
                     }
                     8 => {
-                        let target = lib.rw_write_ptr::<u64>(lib.base + r_offset);
-                        unsafe { *target = (lib.base as i64 + r_addend) as u64; }
+                        unsafe { lib.rw_write::<u64>(lib.base + r_offset, (lib.base as i64 + r_addend) as u64); }
                     }
                     _ => {}
                 }
@@ -1194,13 +1193,11 @@ pub fn apply_tpoff_relocs(lib: &LoadedLib, lib_base_offset: usize, total_memsz: 
         // Fast path: use pre-scanned TPOFF entries
         for &(r_offset, r_sym, r_addend) in &relocs.tpoff64 {
             let tpoff = compute_tpoff(lib, r_sym, r_addend, lib_base_offset, total_memsz, tls_info);
-            let target = lib.rw_write_ptr::<u64>(lib.base + r_offset);
-            unsafe { *target = tpoff as u64; }
+            unsafe { lib.rw_write::<u64>(lib.base + r_offset, tpoff as u64); }
         }
         for &(r_offset, r_sym, r_addend) in &relocs.tpoff32 {
             let tpoff = compute_tpoff(lib, r_sym, r_addend, lib_base_offset, total_memsz, tls_info);
-            let target = lib.rw_write_ptr::<i32>(lib.base + r_offset);
-            unsafe { *target = tpoff as i32; }
+            unsafe { lib.rw_write::<i32>(lib.base + r_offset, tpoff as i32); }
         }
         if !relocs.tpoff64.is_empty() || !relocs.tpoff32.is_empty() {
             log!("dlopen: applied {} TPOFF64 + {} TPOFF32 relocs (base_offset={}, total_memsz={})",
@@ -1223,13 +1220,11 @@ pub fn apply_tpoff_relocs(lib: &LoadedLib, lib_base_offset: usize, total_memsz: 
                 let r_sym = (r_info >> 32) as u32;
                 if r_type == R_X86_64_TPOFF64 {
                     let tpoff = compute_tpoff(lib, r_sym, r_addend, lib_base_offset, total_memsz, tls_info);
-                    let target = lib.rw_write_ptr::<u64>(lib.base + r_offset);
-                    unsafe { *target = tpoff as u64; }
+                    unsafe { lib.rw_write::<u64>(lib.base + r_offset, tpoff as u64); }
                     count64 += 1;
                 } else if r_type == R_X86_64_TPOFF32 {
                     let tpoff = compute_tpoff(lib, r_sym, r_addend, lib_base_offset, total_memsz, tls_info);
-                    let target = lib.rw_write_ptr::<i32>(lib.base + r_offset);
-                    unsafe { *target = tpoff as i32; }
+                    unsafe { lib.rw_write::<i32>(lib.base + r_offset, tpoff as i32); }
                     count32 += 1;
                 }
             }
