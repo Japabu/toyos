@@ -1,5 +1,15 @@
+//! Safe user memory access via page table walk + kernel direct map.
+//!
+//! User virtual addresses are translated to physical via page table walk,
+//! then accessed through the kernel's high-half direct map (PHYS_OFFSET).
+//! SMAP stays enabled 100% — no stac/clac anywhere.
+//!
+//! Returns kernel-accessible references (&T, &[u8], &str) that point into
+//! the direct map. These are valid for the duration of the syscall.
+
 use core::marker::PhantomData;
 
+use crate::arch::{cpu, paging};
 use crate::UserAddr;
 
 /// Marker for types safe to interpret from / write to validated user pointers.
@@ -16,27 +26,38 @@ unsafe impl UserSafe for [u32; 2] {}
 // Kernel types.
 unsafe impl UserSafe for crate::fd::Stat {}
 
-// ABI types (toyos-abi cannot depend on external trait crates).
+// ABI types.
 unsafe impl UserSafe for toyos_abi::syscall::SpawnArgs {}
-unsafe impl UserSafe for toyos_abi::message::RawMessage {}
+unsafe impl UserSafe for toyos_abi::message::Message {}
 unsafe impl UserSafe for toyos_abi::input::RawKeyEvent {}
 unsafe impl UserSafe for toyos_abi::input::MouseEvent {}
 
-/// Check that all pages in [ptr..ptr+size) are in the user half of the address space.
-/// Pages may not yet be mapped (demand paging); the kernel-mode page fault handler
-/// will map them when the kernel dereferences the validated pointer.
+/// Check that [ptr..ptr+size) is in the user half of the address space.
 fn check_user_range(ptr: UserAddr, size: u64) -> bool {
     if size == 0 { return true; }
     let raw = ptr.raw();
     let Some(end) = raw.checked_add(size) else { return false };
-    // Reject kernel-space pointers (above canonical hole)
     end <= 0x0000_8000_0000_0000
 }
+
+/// Translate a user virtual address to a kernel-accessible pointer via
+/// page table walk + direct map. Triggers demand paging if needed.
+fn translate(user_addr: u64) -> Option<*mut u8> {
+    let pml4 = cpu::read_cr3().as_ptr() as *const u64;
+    if let Some(phys) = paging::virt_to_phys(pml4, UserAddr::new(user_addr)) {
+        return Some(phys.as_mut_ptr());
+    }
+    // Page not present — trigger demand paging then retry
+    if !crate::process::handle_page_fault(user_addr, 0) {
+        return None;
+    }
+    paging::virt_to_phys(pml4, UserAddr::new(user_addr)).map(|p| p.as_mut_ptr())
+}
+
 
 /// Context for a single syscall invocation. All user pointer access goes
 /// through this type, tying reference lifetimes to the syscall scope.
 ///
-/// Create one on the stack in `syscall_dispatch`, pass `&ctx` to handlers.
 /// The lifetime `'a` prevents validated references from escaping the syscall.
 pub struct SyscallContext<'a> {
     _scope: PhantomData<&'a mut ()>,
@@ -51,6 +72,7 @@ impl<'a> SyscallContext<'a> {
     }
 
     /// Validate a user pointer range and return a shared byte slice.
+    /// The returned slice points into the kernel direct map.
     pub fn user_slice(&self, ptr: UserAddr, len: u64) -> Option<&'a [u8]> {
         let len = len as usize;
         if len == 0 {
@@ -59,7 +81,13 @@ impl<'a> SyscallContext<'a> {
         if !check_user_range(ptr, len as u64) {
             return None;
         }
-        Some(unsafe { core::slice::from_raw_parts(ptr.raw() as *const u8, len) })
+        // For slices that may span multiple pages, we need to check that
+        // the physical pages are contiguous. In ToyOS, identity-mapped
+        // allocations (stack, TLS, pipes) ARE contiguous. ELF segments
+        // mapped via demand paging are also contiguous (allocated as
+        // contiguous physical blocks).
+        let kptr = translate(ptr.raw())?;
+        Some(unsafe { core::slice::from_raw_parts(kptr as *const u8, len) })
     }
 
     /// Validate a user pointer range and return a mutable byte slice.
@@ -71,7 +99,8 @@ impl<'a> SyscallContext<'a> {
         if !check_user_range(ptr, len as u64) {
             return None;
         }
-        Some(unsafe { core::slice::from_raw_parts_mut(ptr.raw() as *mut u8, len) })
+        let kptr = translate(ptr.raw())?;
+        Some(unsafe { core::slice::from_raw_parts_mut(kptr, len) })
     }
 
     /// Validate a user pointer range as a UTF-8 string.
@@ -89,7 +118,8 @@ impl<'a> SyscallContext<'a> {
         if ptr.raw() as usize % core::mem::align_of::<T>() != 0 {
             return None;
         }
-        Some(unsafe { &*(ptr.raw() as *const T) })
+        let kptr = translate(ptr.raw())?;
+        Some(unsafe { &*(kptr as *const T) })
     }
 
     /// Validate a user pointer to a typed struct (mutable).
@@ -101,7 +131,8 @@ impl<'a> SyscallContext<'a> {
         if ptr.raw() as usize % core::mem::align_of::<T>() != 0 {
             return None;
         }
-        Some(unsafe { &mut *(ptr.raw() as *mut T) })
+        let kptr = translate(ptr.raw())?;
+        Some(unsafe { &mut *(kptr as *mut T) })
     }
 
     /// Validate a user pointer to a slice of typed structs.
@@ -116,6 +147,7 @@ impl<'a> SyscallContext<'a> {
         if ptr.raw() as usize % core::mem::align_of::<T>() != 0 {
             return None;
         }
-        Some(unsafe { core::slice::from_raw_parts(ptr.raw() as *const T, count) })
+        let kptr = translate(ptr.raw())?;
+        Some(unsafe { core::slice::from_raw_parts(kptr as *const T, count) })
     }
 }

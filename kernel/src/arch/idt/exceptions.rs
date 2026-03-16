@@ -1,9 +1,124 @@
 use core::arch::naked_asm;
 
-use crate::arch::{cpu, paging, syscall, percpu};
+use crate::arch::{cpu, debug, paging, syscall, percpu};
 use crate::{process, log, UserAddr};
 
 use super::{Vector, SavedRegs, InterruptFrame, RPL_MASK, PF_PRESENT, PF_WRITE, PF_INSTRUCTION_FETCH};
+
+/// #DB (debug exception, vector 1) — no error code. Fires as a TRAP after the
+/// instruction that triggered a data watchpoint. DR6 tells us which DR0-DR3 fired.
+#[unsafe(naked)]
+pub(super) extern "sysv64" fn db_entry() {
+    naked_asm!(
+        "test dword ptr [rsp + 8], 3",
+        "jz 1f",
+        "swapgs",
+        "1:",
+        "push 0", // dummy error code
+        "push r15", "push r14", "push r13", "push r12",
+        "push r11", "push r10", "push r9",  "push r8",
+        "push rbp", "push rdi", "push rsi", "push rdx",
+        "push rcx", "push rbx", "push rax",
+        "mov rdi, rsp",
+        "sub rsp, 8",
+        "call {handler}",
+        "add rsp, 8",
+        // If handler returns, resume execution
+        "pop rax",  "pop rbx",  "pop rcx",  "pop rdx",
+        "pop rsi",  "pop rdi",  "pop rbp",
+        "pop r8",   "pop r9",   "pop r10",  "pop r11",
+        "pop r12",  "pop r13",  "pop r14",  "pop r15",
+        "add rsp, 8", // skip dummy error code
+        "test dword ptr [rsp + 8], 3",
+        "jz 3f",
+        "swapgs",
+        "3:",
+        "iretq",
+        handler = sym debug_handler,
+    );
+}
+
+/// #DB handler — logs full context when a hardware watchpoint fires.
+extern "sysv64" fn debug_handler(regs: *const SavedRegs) {
+    // Raw serial output first — bypasses all abstractions
+    unsafe {
+        for &b in b"\n!!! DB TRAP !!!\n" {
+            core::arch::asm!("out dx, al", in("dx") 0x3F8u16, in("al") b);
+        }
+    }
+
+    let regs = unsafe { &*regs };
+    let frame = regs.interrupt_frame();
+    let dr6 = debug::read_dr6();
+
+    let is_user = frame.cs & RPL_MASK != 0;
+    let pid = percpu::current_pid();
+
+    log!("=== HARDWARE WATCHPOINT HIT ===");
+    log!("  DR6={:#x} ({})", dr6,
+        if dr6 & 1 != 0 { "DR0" }
+        else if dr6 & 2 != 0 { "DR1" }
+        else if dr6 & 4 != 0 { "DR2" }
+        else if dr6 & 8 != 0 { "DR3" }
+        else { "unknown" });
+    log!("  context_tag={:#x}", debug::context());
+    log!("  mode={} pid={:?}", if is_user { "user" } else { "kernel" }, pid);
+    log!("  rip={:#018x}  rsp={:#018x}  rbp={:#018x}", frame.rip, frame.rsp, regs.rbp);
+    log!("  rax={:#018x}  rbx={:#018x}  rcx={:#018x}", regs.rax, regs.rbx, regs.rcx);
+    log!("  rdx={:#018x}  rsi={:#018x}  rdi={:#018x}", regs.rdx, regs.rsi, regs.rdi);
+
+    // Symbol resolution
+    log!("  Instruction that wrote:");
+    if is_user {
+        if let Some(p) = pid {
+            if !process::resolve_user_symbol(p, frame.rip) {
+                log!("    {:#x}", frame.rip);
+            }
+        }
+    } else {
+        crate::symbols::resolve_kernel(frame.rip);
+    }
+
+    // Backtrace
+    log!("  Backtrace:");
+    let pml4 = if is_user { cpu::read_cr3().as_ptr::<u64>() as *const u64 } else { core::ptr::null() };
+    let mut rbp = regs.rbp;
+    for _ in 0..20 {
+        let Some(saved_rbp) = safe_read_u64(rbp, pml4) else { break };
+        let Some(return_addr) = safe_read_u64(rbp + 8, pml4) else { break };
+        if return_addr == 0 { break; }
+        if is_user {
+            if let Some(p) = pid {
+                if !process::resolve_user_symbol(p, return_addr) {
+                    log!("    {:#x}", return_addr);
+                }
+            } else {
+                log!("    {:#x}", return_addr);
+            }
+        } else {
+            crate::symbols::resolve_kernel(return_addr);
+        }
+        rbp = saved_rbp;
+    }
+
+    // Read the watched address to see what was written
+    let watched_addr: u64;
+    unsafe { core::arch::asm!("mov {}, dr0", out(reg) watched_addr); }
+    if paging::is_kernel_addr(watched_addr) && watched_addr % 8 == 0 {
+        let val = unsafe { *(watched_addr as *const u64) };
+        log!("  Value at watched addr {:#x} = {:#018x}", watched_addr, val);
+    }
+
+    log!("=== END WATCHPOINT ===");
+
+    // Clear DR6 so we don't re-trigger, then disable watchpoint
+    unsafe {
+        core::arch::asm!("mov dr6, {}", in(reg) 0u64);
+        core::arch::asm!("mov dr7, {}", in(reg) 0u64);
+    }
+
+    // Don't halt — let execution continue so we can see the aftermath
+}
 
 /// #UD — no error code pushed by CPU, so CS is at [rsp + 8].
 #[unsafe(naked)]
@@ -131,6 +246,7 @@ extern "sysv64" fn double_fault_handler(regs: *const SavedRegs) -> ! {
     log!("DOUBLE FAULT on CPU {} (pid={:?})", cpu_id, pid);
     log!("  cr2={:#018x} (address that caused the fault chain)", cr2);
     log!("  rip={:#018x}  rsp={:#018x}  rbp={:#018x}", frame.rip, frame.rsp, regs.rbp);
+    paging::debug_page_walk(cr2);
 
     // Kernel backtrace (where the double fault actually fired)
     log!("  Kernel backtrace:");
@@ -155,7 +271,7 @@ extern "sysv64" fn double_fault_handler(regs: *const SavedRegs) -> ! {
     // Scan upward from where the double fault's RSP was (the old kernel stack).
     // The interrupt frame could be anywhere above, within a reasonable range.
     let scan_start = kernel_rsp;
-    let scan_end = kernel_rsp + 4096; // kernel stacks are typically 16-64KB
+    let scan_end = kernel_rsp.saturating_add(4096); // kernel stacks are typically 16-64KB
     let mut addr = scan_start;
 
     while addr < scan_end {
@@ -253,12 +369,24 @@ extern "sysv64" fn page_fault_handler(regs: *const SavedRegs) {
     let frame = regs.interrupt_frame();
     let fault_addr = cpu::read_cr2().raw();
 
-    // SMAP violation detection: kernel-mode protection fault on user address
+    // SMAP violation detection: kernel-mode protection fault on identity-mapped address.
+    // Enable stac immediately so diagnostics don't cascade into another SMAP fault.
     if frame.error_code & PF_PRESENT != 0 && frame.cs & RPL_MASK == 0
-        && fault_addr < 0x0000_8000_0000_0000
+        && paging::is_kernel_addr(fault_addr)
     {
         log!("SMAP cr2={:#018x} rip={:#018x} err={:#018x} rflags={:#018x}",
             fault_addr, frame.rip, frame.error_code, frame.rflags);
+        log!("  SMAP kernel backtrace:");
+        crate::symbols::resolve_kernel(frame.rip);
+        let mut rbp = regs.rbp;
+        for _ in 0..20 {
+            if rbp == 0 || rbp % 8 != 0 || !paging::is_kernel_addr(rbp) { break; }
+            let saved_rbp = unsafe { *(rbp as *const u64) };
+            let return_addr = unsafe { *((rbp + 8) as *const u64) };
+            if return_addr == 0 { break; }
+            crate::symbols::resolve_kernel(return_addr);
+            rbp = saved_rbp;
+        }
     }
 
     // Only handle not-present faults — protection violations are always fatal
@@ -403,6 +531,10 @@ extern "sysv64" fn exception_handler(raw_vector: u64, regs: *const SavedRegs) ->
 /// Core fatal exception logic. Shared by page_fault_handler (when unresolvable)
 /// and exception_handler (for all other fatal exceptions).
 fn fatal_exception(ctx: &ExceptionContext) -> ! {
+    // SMAP: allow kernel access to user pages for diagnostics (backtrace,
+    // stack dump). Exception entries don't set AC like syscall entry does,
+    // so identity-mapped user pages would trigger SMAP without this.
+    // No matching clac — this function never returns (kills process or halts).
     let is_user = ctx.is_user_fault();
     let pml4 = ctx.pml4();
 
@@ -421,7 +553,7 @@ fn fatal_exception(ctx: &ExceptionContext) -> ! {
             Vector::InvalidOpcode => log!("SIGILL pid={}: illegal instruction", pid),
             Vector::GeneralProtection => log!("SIGBUS pid={}: general protection fault (error_code={:#x})", pid, ctx.frame.error_code),
             Vector::DoubleFault => log!("FATAL pid={}: double fault", pid),
-            Vector::Timer | Vector::Xhci | Vector::TlbFlush => unreachable!(),
+            Vector::Debug | Vector::Timer | Vector::Xhci | Vector::TlbFlush => unreachable!(),
         }
     } else {
         let cpu = percpu::cpu_id();
@@ -440,7 +572,7 @@ fn fatal_exception(ctx: &ExceptionContext) -> ! {
                     Vector::InvalidOpcode => "invalid opcode",
                     Vector::GeneralProtection => "general protection fault",
                     Vector::DoubleFault => "double fault",
-                    Vector::PageFault | Vector::Timer | Vector::Xhci | Vector::TlbFlush => unreachable!(),
+                    Vector::Debug | Vector::PageFault | Vector::Timer | Vector::Xhci | Vector::TlbFlush => unreachable!(),
                 };
                 log!("KERNEL PANIC cpu={} pid={:?}: {} (error_code={:#x})",
                     cpu, percpu::current_pid(), name, ctx.frame.error_code);

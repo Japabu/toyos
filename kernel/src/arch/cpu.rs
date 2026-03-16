@@ -164,13 +164,6 @@ pub fn enable_smap() {
     crate::log!("cpu: SMAP enabled");
 }
 
-/// Allow kernel access to user pages (set RFLAGS.AC).
-/// Must be paired with `clac()`. Only use during syscall handling.
-#[inline(always)]
-pub unsafe fn stac() {
-    asm!("stac", options(nomem, nostack));
-}
-
 pub fn halt() -> ! {
     loop {
         unsafe {
