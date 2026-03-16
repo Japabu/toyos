@@ -39,7 +39,7 @@ pub fn init(base_addr: u32) {
     // Enable LAPIC: set SVR bit 8 (software enable) + spurious vector 0xFF
     lapic.write_u32(LAPIC_SVR, lapic.read_u32(LAPIC_SVR) | (1 << 8) | 0xFF);
 
-    LAPIC_BASE.store(addr.raw(), Ordering::Release);
+    LAPIC_BASE.store(addr.as_ptr::<u8>() as u64, Ordering::Release);
     *LAPIC.lock() = Some(lapic);
     log!("LAPIC: enabled (ID {})", id());
 }

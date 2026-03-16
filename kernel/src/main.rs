@@ -181,7 +181,7 @@ fn kernel_main(
     // ── Phase 5: Kernel subsystems ──────────────────────────────────────
     let t_subsys = clock::nanos_since_boot();
 
-    smp::boot_aps(&madt);
+    smp::boot_aps(&madt, kernel_args.boot_pml4_addr);
     vfs::init();
     process::init();
     pipe::init();

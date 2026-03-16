@@ -4,7 +4,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use alloc::alloc::{alloc_zeroed, Layout};
 
-use crate::arch::{apic, cpu, percpu, syscall};
+use crate::arch::{apic, cpu, paging, percpu, syscall};
 use crate::clock;
 use crate::drivers::acpi::MadtInfo;
 use crate::{log, process};
@@ -106,13 +106,15 @@ macro_rules! asm_label_addr {
 }
 
 /// Copy the trampoline assembly blob to physical page 0x8000.
+/// Accesses via the kernel direct map (PHYS_OFFSET) since there's no identity map.
 fn copy_trampoline() {
     let start = unsafe { asm_label_addr!(_trampoline_start) };
     let end = unsafe { asm_label_addr!(_trampoline_end) };
     let size = end as usize - start as usize;
     assert!(size <= DATA_OFFSET, "trampoline code exceeds data block");
+    let dest = (TRAMPOLINE_PAGE + crate::PHYS_OFFSET) as *mut u8;
     unsafe {
-        core::ptr::copy_nonoverlapping(start, TRAMPOLINE_PAGE as *mut u8, size);
+        core::ptr::copy_nonoverlapping(start, dest, size);
     }
 }
 
@@ -139,7 +141,7 @@ fn build_trampoline_data() -> TrampolineData {
     let data_base = (TRAMPOLINE_PAGE + DATA_OFFSET as u64) as u32;
 
     TrampolineData {
-        cr3: cpu::read_cr3().raw(),
+        cr3: 0, // filled by boot_aps with the boot PML4 (has identity + high-half)
         stack_top: 0, // filled per-AP
         entry: 0,     // filled per-AP
         kernel_gdt,
@@ -168,12 +170,16 @@ fn build_trampoline_data() -> TrampolineData {
 // ---- AP boot ----
 
 /// Boot all Application Processors found in the MADT.
-pub fn boot_aps(madt: &MadtInfo) {
+/// `boot_cr3` is the physical address of the bootloader's PML4 (has both
+/// identity map and high-half). APs use this during their transition to
+/// long mode, then switch to the kernel PML4 in `ap_entry`.
+pub fn boot_aps(madt: &MadtInfo, boot_cr3: u64) {
     let bsp_id = apic::id();
     copy_trampoline();
 
     let mut data = build_trampoline_data();
-    let target = (TRAMPOLINE_PAGE + DATA_OFFSET as u64) as *mut TrampolineData;
+    data.cr3 = boot_cr3;
+    let target = (TRAMPOLINE_PAGE + DATA_OFFSET as u64 + crate::PHYS_OFFSET) as *mut TrampolineData;
 
     for &ap_id in &madt.apic_ids {
         if ap_id == bsp_id { continue; }
@@ -217,6 +223,10 @@ pub fn boot_aps(madt: &MadtInfo) {
 }
 
 extern "C" fn ap_entry() -> ! {
+    // Switch from boot PML4 (identity + high-half) to kernel PML4 (high-half only).
+    // We're already executing at a high-half address, so this is safe.
+    unsafe { cpu::write_cr3(paging::kernel_cr3()); }
+
     let lapic_id = apic::id();
     let cpu_id = NEXT_CPU_ID.fetch_add(1, Ordering::Relaxed);
 

@@ -20,6 +20,9 @@ pub struct KernelArgs {
     pub gop_height: u32,
     pub gop_stride: u32,
     pub gop_pixel_format: u32,
+    /// Physical address of the bootloader's page table (has both identity map and high-half).
+    /// Used by the SMP trampoline for AP boot transition.
+    pub boot_pml4_addr: u64,
 }
 
 #[repr(C)]

@@ -2,36 +2,24 @@
 
 Tracked issues to address, roughly ordered by impact.
 
-## 1. Identity map still present in process page tables
+## ~~1. Identity map~~ DONE
 
-Process PML4[0..N] deep-clones the kernel's identity map so kernel code can
-execute at low addresses and demand paging can access user pages. This wastes
-memory (every process clones ~8 page tables per GB of RAM) and means the
-identity map entries can still get USER bit set by `map_user_in`.
-
-**Fix:** Relink the kernel binary to a high-half virtual address. The bootloader
-already relocates to PHYS_OFFSET — changing the link address makes kernel code
-execute at high-half addresses natively. Then PML4[0..N] can be removed from
-process page tables entirely: only PML4[256+] (shared kernel, no deep clone)
-and per-process user mappings in PML4[0..255].
-
-**Blocked by:** The kernel is PIE but linked at address 0. Relinking requires
-either a linker script change or a fixed load address in the bootloader.
+Removed. Kernel PML4 has no PML4[0..255] entries. Process page tables start
+empty and build user mappings on demand. SMP trampoline uses the bootloader's
+PML4 for AP transition, then switches to kernel PML4 in ap_entry.
 
 ## 2. user_ptr assumes physically contiguous user buffers
 
 `SyscallContext::user_slice()` translates the first page of a user buffer and
-returns a `&[u8]` spanning the full length. This works because ToyOS currently
-allocates user memory (stack, TLS, ELF segments) in physically contiguous
-blocks. If we ever add swap, COW fork, or non-contiguous VMAs, this breaks
-silently — the kernel would read/write the wrong physical pages.
+returns a `&[u8]` spanning the full length. This works because ToyOS allocates
+user memory in physically contiguous 2MB blocks. If we ever add swap, COW fork,
+or non-contiguous VMAs, this breaks silently.
 
 **Fix:** Replace `user_slice` / `user_slice_mut` with `UserBuf` / `UserBufMut`
-types that copy page-at-a-time through the direct map. We built these types
-but the syscall handler refactoring had bugs. The types themselves
-(`copy_from_user` / `copy_to_user` with per-page translation) are correct.
-The handlers need careful porting — do it one syscall at a time with testing
-between each.
+types that copy page-at-a-time through the direct map. The types exist but the
+syscall handler refactoring had bugs. Port handlers one at a time with testing.
+
+**Not urgent while all user allocations are 2MB-aligned contiguous blocks.**
 
 ## 3. No DmaAddr newtype — physical/virtual confusion in drivers
 
@@ -65,7 +53,23 @@ pointer. The only way to access user memory is through `SyscallContext`. This
 is already the convention; making it a hard constraint means the compiler
 catches violations.
 
-## 6. Demand paging called from user_ptr translate()
+## 6. Large NVMe reads for demand paging
+
+The demand pager maps 2MB pages but populates them by issuing up to 512
+individual 4KB page cache lookups (each potentially a separate NVMe read).
+This works but is suboptimal — a single NVMe command can transfer 2MB in
+roughly the same time as a 4KB read (command overhead dominates, not transfer
+size).
+
+**Fix:** Add a bulk read path: when demand-paging a 2MB region, issue one
+NVMe read for the entire 2MB range and populate 512 page cache entries at
+once. The page cache stays at 4KB granularity (important for fine-grained
+eviction of cold blocks), but the I/O path batches reads.
+
+**Not urgent:** Current startup times are fine. This is a throughput
+optimization for large binaries.
+
+## 7. Demand paging called from user_ptr translate()
 
 When `virt_to_phys` returns None, `user_ptr::translate()` calls
 `process::handle_page_fault()` directly. This works but is fragile — if

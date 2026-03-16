@@ -299,7 +299,7 @@ fn start_kernel(kernel: LoadedKernel, kernel_elf_bytes: vec::Vec<u8>, initrd: ve
 
     // KernelArgs: all addresses are PHYSICAL (kernel translates to virtual)
     let kernel_phys = kernel.memory.as_ptr() as u64;
-    let kernel_args = KernelArgs {
+    let mut kernel_args = KernelArgs {
         memory_map_addr: memory_map.as_ptr() as u64,
         memory_map_size: memory_map.len() as u64 * mem::size_of::<MemoryMapEntry>() as u64,
         kernel_memory_addr: kernel_phys,
@@ -319,6 +319,7 @@ fn start_kernel(kernel: LoadedKernel, kernel_elf_bytes: vec::Vec<u8>, initrd: ve
         gop_height,
         gop_stride,
         gop_pixel_format,
+        boot_pml4_addr: 0, // set below after page tables are built
     };
 
     mem::forget(memory_map);
@@ -326,13 +327,11 @@ fn start_kernel(kernel: LoadedKernel, kernel_elf_bytes: vec::Vec<u8>, initrd: ve
     mem::forget(kernel_elf_bytes);
     mem::forget(initrd);
 
-    // Copy KernelArgs to the TOP of the kernel stack, just below RSP.
-    // The inline asm will set RSP, subtract space for KernelArgs, copy it,
-    // then pass a pointer in rdi.
     let stack_top_phys = kernel_phys + kernel.stack_offset as u64 + kernel.stack_size as u64;
 
     // Build boot page tables: identity map + high-half map for first 4GB.
     let pml4_phys = unsafe { build_boot_page_tables(pt_mem, 4 * 1024 * 1024 * 1024) };
+    kernel_args.boot_pml4_addr = pml4_phys;
 
     // Switch to new page tables (identity map keeps us alive)
     unsafe { core::arch::asm!("mov cr3, {}", in(reg) pml4_phys, options(nostack)) };
