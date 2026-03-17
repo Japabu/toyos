@@ -3,6 +3,10 @@
 version = 4
 
 [[package]]
+name = "bcachefs"
+version = "0.1.0"
+
+[[package]]
 name = "elf"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -27,6 +31,7 @@ dependencies = [
 name = "kernel"
 version = "0.1.0"
 dependencies = [
+ "bcachefs",
  "elf",
  "hashbrown",
  "rustc-demangle",

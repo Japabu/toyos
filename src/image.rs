@@ -1,46 +1,28 @@
 use fatfs::FsOptions;
 use std::fs;
 use std::io::{Cursor, Read, Write};
-use tyfs::SimpleFs;
 
-struct VecDisk {
-    data: Vec<u8>,
-}
-
-impl VecDisk {
-    fn new(size: usize) -> Self {
-        Self { data: vec![0u8; size] }
-    }
-}
-
-impl tyfs::Disk for VecDisk {
-    fn read(&mut self, offset: u64, buf: &mut [u8]) {
-        let off = offset as usize;
-        buf.copy_from_slice(&self.data[off..off + buf.len()]);
-    }
-    fn write(&mut self, offset: u64, buf: &[u8]) {
-        let off = offset as usize;
-        self.data[off..off + buf.len()].copy_from_slice(buf);
-    }
-    fn flush(&mut self) {}
-}
+use bcachefs::{Formatted, VecBlockIO};
 
 pub fn create_initrd(files: &[(String, Vec<u8>)]) -> Vec<u8> {
-    let data_size: usize = files.iter().map(|(name, d)| name.len() + d.len()).sum::<usize>();
-    let toc_size = files.len() * 64;
-    let size = (64 + data_size + toc_size + 4095) & !4095;
-    let size = size.max(4096);
+    let data_size: usize = files.iter().map(|(_, d)| d.len()).sum::<usize>();
+    // Estimate: superblock(1) + bitmap + btree nodes + data blocks + backup(1) + 10% padding
+    let data_blocks = (data_size + 4095) / 4096;
+    let btree_blocks = (files.len() / 30).max(2); // ~30 entries per leaf node
+    let overhead = 64; // bitmap + metadata
+    let total_blocks = (1 + overhead + btree_blocks + data_blocks) * 11 / 10;
+    let total_blocks = total_blocks.max(64) as u64;
 
-    let vec_disk = VecDisk::new(size);
-    let mut tyfs = SimpleFs::format(vec_disk, size as u64);
+    let io = VecBlockIO::new(total_blocks);
+    let mut fs = Formatted::format(io);
 
     for (name, data) in files {
         eprintln!("initrd: adding '{}' ({} bytes)", name, data.len());
-        tyfs.create(name, data, 0)
+        fs.create(name, data, 0)
             .unwrap_or_else(|e| panic!("initrd: failed to add '{}': {:?}", name, e));
     }
 
-    tyfs.into_disk().data
+    fs.into_io().into_vec()
 }
 
 pub fn create_boot_image(initrd_bytes: &[u8], profile: &str) -> Vec<u8> {

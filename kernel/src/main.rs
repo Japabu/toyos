@@ -187,10 +187,11 @@ fn kernel_main(
     listener::init();
     shared_memory::init();
 
-    // Mount initrd ramdisk
+    // Mount initrd ramdisk (bcachefs format)
     assert!(!initrd.is_empty(), "No initrd provided");
-    let initrd_disk = unsafe { ramdisk::InitrdDisk::new(initrd.as_ptr(), initrd.len()) };
-    let mut initrd_fs = tyfs::SimpleFs::mount(initrd_disk).expect("Failed to mount initrd");
+    let initrd_io = unsafe { bcachefs::SliceBlockIO::new(initrd.as_ptr(), initrd.len()) };
+    let initrd_fs = bcachefs::Mounted::<_, bcachefs::ReadOnly>::open(initrd_io)
+        .expect("Failed to mount bcachefs initrd");
 
     // Mount root filesystem (ToyFs on NVMe) and tmpfs
     vfs::lock().set_root(Box::new(toyfs::ToyFsAdapter::new(toyfs_instance)));
@@ -211,7 +212,7 @@ fn kernel_main(
 
         let t1 = clock::nanos_since_boot();
 
-        let files = initrd_fs.list();
+        let files = initrd_fs.list().expect("Failed to list initrd");
         let mut total_bytes = 0u64;
         for (name, _size) in &files {
             if let Some(target) = initrd_fs.read_link(name) {
@@ -220,7 +221,7 @@ fn kernel_main(
             } else {
                 let data = initrd_fs.read_file(name)
                     .unwrap_or_else(|e| panic!("read initrd {}: {:?}", name, e));
-                let mtime = initrd_fs.file_mtime(name).unwrap_or(0);
+                let mtime = initrd_fs.file_mtime(name);
                 total_bytes += data.len() as u64;
                 vfs::lock().root_mut().create(name, &data, mtime)
                     .unwrap_or_else(|e| panic!("extract {} ({} bytes): {}", name, data.len(), e));

@@ -1,8 +1,11 @@
+#[allow(dead_code)]
 /// Read-only disk backed by a static memory region (bootloader initrd).
+/// TODO: Remove in Phase 3 when tyfs is fully replaced by bcachefs.
 pub struct InitrdDisk {
     data: &'static [u8],
 }
 
+#[allow(dead_code)]
 impl InitrdDisk {
     /// # Safety
     /// The caller must ensure `ptr` points to a valid memory region of at least `len` bytes
