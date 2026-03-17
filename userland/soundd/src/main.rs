@@ -18,19 +18,19 @@ struct AudioStream {
 impl AudioStream {
     fn read_samples(&self, mix: &mut [i32]) {
         let ring = unsafe { &*self.ring };
-        let mut raw = [0u8; 8192];
+        let need_bytes = mix.len() * 2; // i16 = 2 bytes per sample
         let avail = ring.available() as usize;
         if avail < 2 {
             return;
         }
-        let to_read = raw.len().min(avail) & !1;
+        let to_read = need_bytes.min(avail) & !1;
         if to_read == 0 {
             return;
         }
+        let mut raw = [0u8; 8192];
         let n = ring.read(&mut raw[..to_read]);
         let samples = n / 2;
-        let count = mix.len().min(samples);
-        for i in 0..count {
+        for i in 0..samples {
             let sample = i16::from_le_bytes([raw[i * 2], raw[i * 2 + 1]]);
             mix[i] = mix[i].saturating_add(sample as i32);
         }
@@ -82,8 +82,6 @@ fn main() {
 
     let period_frames = info.period_bytes as usize / 4; // stereo i16 = 4 bytes/frame
     let period_samples = period_frames * info.channels as usize;
-    let period_ns = (period_frames as u64 * 1_000_000_000) / info.sample_rate as u64;
-
     eprintln!("soundd: ready, {} buffers, {}Hz, {} bytes/period",
         num_buffers, info.sample_rate, info.period_bytes);
 
@@ -126,8 +124,10 @@ fn main() {
         // 3. Clean up dead streams
         streams.retain(|s| !s.is_dead());
 
-        // 4. Poll: listener + control sockets from active streams
-        let timeout = if streams.is_empty() { 100_000_000 } else { period_ns };
+        // 4. Poll: listener + control sockets
+        // When streams are active, use a short timeout to keep DMA buffers fed.
+        // audio_poll() is non-blocking so we need to spin frequently.
+        let timeout = if streams.is_empty() { 100_000_000 } else { 1_000_000 }; // 1ms when active
         let mut poll_fds: Vec<u64> = Vec::with_capacity(1 + streams.len());
         poll_fds.push(listener.0 as u64);
         for stream in &streams {

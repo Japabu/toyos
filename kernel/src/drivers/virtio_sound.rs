@@ -153,6 +153,9 @@ pub struct SoundController {
     tx_inflight: usize,
     /// Bitmask of buffers currently in-flight (submitted but not yet completed)
     inflight_mask: u32,
+    /// Maps first descriptor ID → buffer index (needed because desc IDs wrap around
+    /// the 16-entry ring, so desc_id/3 doesn't map correctly after the first cycle)
+    desc_to_buf: [u8; 16],
     started: bool,
 }
 
@@ -228,9 +231,7 @@ impl SoundController {
         let mut completed = 0u32;
         while self.tx_inflight > 0 {
             if let Some((desc_id, _)) = self.txq.poll_used() {
-                // Each submission uses 3 descriptors; desc_id is the first.
-                // Buffer index = desc_id / 3.
-                let idx = desc_id as usize / 3;
+                let idx = self.desc_to_buf[desc_id as usize] as usize;
                 completed |= 1 << idx;
                 self.inflight_mask &= !(1 << idx);
                 self.tx_inflight -= 1;
@@ -264,6 +265,7 @@ impl SoundController {
         let hdr_size = core::mem::size_of::<VirtioSndPcmXfer>() as u32;
         let status_size = core::mem::size_of::<VirtioSndPcmStatus>() as u32;
 
+        let first_desc = self.txq.next_desc_id();
         self.txq.submit(
             &[
                 (hdr_phys, hdr_size, BufDir::Readable),
@@ -274,6 +276,7 @@ impl SoundController {
             self.device.notify_off_multiplier(),
             2, // txq index
         );
+        self.desc_to_buf[first_desc as usize] = idx as u8;
         self.inflight_mask |= 1 << idx;
         self.tx_inflight += 1;
         true
@@ -337,6 +340,7 @@ pub fn init(ecam_base: u64) -> Option<(SoundController, AudioInfo)> {
         tx_data_phys,
         tx_inflight: 0,
         inflight_mask: 0,
+        desc_to_buf: [0; 16],
         started: false,
     };
 

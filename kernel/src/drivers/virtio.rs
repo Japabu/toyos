@@ -171,6 +171,11 @@ impl Virtqueue {
     fn avail_phys(&self) -> u64 { self.base_phys.raw() + AVAIL_OFFSET }
     fn used_phys(&self) -> u64 { self.base_phys.raw() + USED_OFFSET }
 
+    /// The descriptor index that will be used by the next submit call.
+    pub fn next_desc_id(&self) -> u16 {
+        self.next_desc
+    }
+
     /// Submit a descriptor chain and notify the device (non-blocking).
     /// Returns the first descriptor index of the chain.
     pub fn submit(
