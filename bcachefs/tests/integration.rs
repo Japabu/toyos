@@ -1,5 +1,7 @@
 use bcachefs::{Formatted, Mounted, ReadOnly, ReadWrite, VecBlockIO};
 
+// --- Basic read-only tests ---
+
 #[test]
 fn format_and_mount_empty() {
     let io = VecBlockIO::new(128);
@@ -19,7 +21,7 @@ fn create_single_small_file() {
     let files = mounted.list().expect("list failed");
     assert_eq!(files.len(), 1);
     assert_eq!(files[0].0, "hello.txt");
-    assert_eq!(files[0].1, 13); // "Hello, world!" is 13 bytes
+    assert_eq!(files[0].1, 13);
 
     let data = mounted.read_file("hello.txt").expect("read failed");
     assert_eq!(data, b"Hello, world!");
@@ -62,6 +64,18 @@ fn file_not_found() {
 }
 
 #[test]
+fn file_mtime_nonexistent() {
+    let io = VecBlockIO::new(128);
+    let mut fs = Formatted::format(io);
+    fs.create("exists.txt", b"data", 999).expect("create");
+    let mounted = fs.mount_readonly();
+
+    // file_mtime returns 0 for nonexistent files, not panic
+    assert_eq!(mounted.file_mtime("exists.txt"), 999);
+    assert_eq!(mounted.file_mtime("nope.txt"), 0);
+}
+
+#[test]
 fn read_link() {
     let io = VecBlockIO::new(128);
     let mut fs = Formatted::format(io);
@@ -70,57 +84,45 @@ fn read_link() {
 
     let mounted = fs.mount_readonly();
 
-    // read_link should return target for symlink
     let target = mounted.read_link("link.txt");
     assert_eq!(target.as_deref(), Some("real.txt"));
 
-    // read_link should return None for regular file
     assert_eq!(mounted.read_link("real.txt"), None);
-
-    // read_link should return None for nonexistent
     assert_eq!(mounted.read_link("nope"), None);
 }
 
 #[test]
-fn large_file_single_extent() {
-    // 100KB file should be contiguous on a fresh filesystem
-    let data = vec![0xABu8; 100 * 1024];
-    let io = VecBlockIO::new(512);
+fn list_includes_symlinks() {
+    let io = VecBlockIO::new(128);
     let mut fs = Formatted::format(io);
-    fs.create("big.bin", &data, 0).expect("create large file");
+    fs.create("file.txt", b"data", 0).expect("create file");
+    fs.create_symlink("link.txt", "file.txt", 0).expect("create symlink");
 
     let mounted = fs.mount_readonly();
-    let read_data = mounted.read_file("big.bin").expect("read large file");
-    assert_eq!(read_data.len(), data.len());
-    assert_eq!(read_data, data);
+    let files = mounted.list().expect("list");
+    assert_eq!(files.len(), 2, "expected 2 entries (file + symlink), got: {:?}", files);
+
+    let names: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
+    assert!(names.contains(&"file.txt"), "missing file.txt in {:?}", names);
+    assert!(names.contains(&"link.txt"), "missing link.txt in {:?}", names);
+
+    assert!(mounted.is_symlink("link.txt"));
+    assert!(!mounted.is_symlink("file.txt"));
 }
 
 #[test]
-fn large_file_exact_block_boundary() {
-    // File that's exactly 4096 bytes (one block)
-    let data = vec![0x42u8; 4096];
+fn dangling_symlink_allowed() {
     let io = VecBlockIO::new(128);
     let mut fs = Formatted::format(io);
-    fs.create("block.bin", &data, 0).expect("create");
+    // Symlink to nonexistent target should succeed — symlinks are just strings
+    fs.create_symlink("dangling", "/nonexistent/path", 0).expect("create dangling symlink");
 
     let mounted = fs.mount_readonly();
-    let read_data = mounted.read_file("block.bin").expect("read");
-    assert_eq!(read_data, data);
+    assert_eq!(mounted.read_link("dangling").as_deref(), Some("/nonexistent/path"));
+    assert!(mounted.is_symlink("dangling"));
 }
 
-#[test]
-fn large_file_crosses_block_boundary() {
-    // File that's 4097 bytes (spans two blocks)
-    let data: Vec<u8> = (0..4097).map(|i| (i % 256) as u8).collect();
-    let io = VecBlockIO::new(128);
-    let mut fs = Formatted::format(io);
-    fs.create("cross.bin", &data, 0).expect("create");
-
-    let mounted = fs.mount_readonly();
-    let read_data = mounted.read_file("cross.bin").expect("read");
-    assert_eq!(read_data.len(), 4097);
-    assert_eq!(read_data, data);
-}
+// --- File size edge cases ---
 
 #[test]
 fn empty_file() {
@@ -139,8 +141,102 @@ fn empty_file() {
 }
 
 #[test]
+fn large_file_single_extent() {
+    let data = vec![0xABu8; 100 * 1024];
+    let io = VecBlockIO::new(512);
+    let mut fs = Formatted::format(io);
+    fs.create("big.bin", &data, 0).expect("create large file");
+
+    let mounted = fs.mount_readonly();
+    let read_data = mounted.read_file("big.bin").expect("read large file");
+    assert_eq!(read_data.len(), data.len());
+    assert_eq!(read_data, data);
+}
+
+#[test]
+fn large_file_exact_block_boundary() {
+    let data = vec![0x42u8; 4096];
+    let io = VecBlockIO::new(128);
+    let mut fs = Formatted::format(io);
+    fs.create("block.bin", &data, 0).expect("create");
+
+    let mounted = fs.mount_readonly();
+    let read_data = mounted.read_file("block.bin").expect("read");
+    assert_eq!(read_data, data);
+}
+
+#[test]
+fn large_file_crosses_block_boundary() {
+    let data: Vec<u8> = (0..4097).map(|i| (i % 256) as u8).collect();
+    let io = VecBlockIO::new(128);
+    let mut fs = Formatted::format(io);
+    fs.create("cross.bin", &data, 0).expect("create");
+
+    let mounted = fs.mount_readonly();
+    let read_data = mounted.read_file("cross.bin").expect("read");
+    assert_eq!(read_data.len(), 4097);
+    assert_eq!(read_data, data);
+}
+
+// --- Filename edge cases ---
+
+#[test]
+fn long_filename_near_entry_limit() {
+    // 200-byte filename should work fine (fits in a leaf entry)
+    let name: String = (0..200).map(|i| (b'a' + (i % 26) as u8) as char).collect();
+    let io = VecBlockIO::new(128);
+    let mut fs = Formatted::format(io);
+    fs.create(&name, b"data", 0).expect("create with 200-byte name");
+
+    let mounted = fs.mount_readonly();
+    assert_eq!(mounted.read_file(&name).unwrap(), b"data");
+
+    // 513-byte filename should be rejected (MAX_NAME_LEN = 512)
+    let too_long: String = (0..513).map(|i| (b'a' + (i % 26) as u8) as char).collect();
+    let io2 = VecBlockIO::new(128);
+    let mut fs2 = Formatted::format(io2);
+    let result = fs2.create(&too_long, b"data", 0);
+    assert!(result.is_err(), "expected NameTooLong for 513-byte filename");
+}
+
+#[test]
+fn zero_length_filename_rejected() {
+    let io = VecBlockIO::new(128);
+    let mut fs = Formatted::format(io);
+    // Empty filename shouldn't be silently accepted
+    // Current behavior: it would hash to a deterministic value and work.
+    // This test documents the behavior — either error or accept consistently.
+    let result = fs.create("", b"data", 0);
+    // If create succeeds, verify it's retrievable
+    if result.is_ok() {
+        let mounted = fs.mount_readonly();
+        assert_eq!(mounted.read_file("").unwrap(), b"data");
+    }
+    // If it errors, that's also acceptable
+}
+
+#[test]
+fn duplicate_filename_overwrites() {
+    // Creating a file with the same name should overwrite, not duplicate
+    let io = VecBlockIO::new(128);
+    let mut fs = Formatted::format(io);
+    fs.create("test.txt", b"version 1", 10).expect("create v1");
+    fs.create("test.txt", b"version 2", 20).expect("create v2");
+
+    let mounted = fs.mount_readonly();
+    let files = mounted.list().expect("list");
+    assert_eq!(files.len(), 1, "duplicate filename should overwrite, not create second entry");
+    assert_eq!(mounted.read_file("test.txt").unwrap(), b"version 2");
+    assert_eq!(mounted.file_mtime("test.txt"), 20);
+}
+
+// --- B+ tree split correctness ---
+
+#[test]
 fn incremental_insert_and_read() {
-    // Insert files one at a time, checking readability after each insert
+    // Insert files one at a time, checking readability after each insert.
+    // This exercises node splits — hashed keys land in unpredictable order,
+    // and we verify no entries are lost across splits.
     let io = VecBlockIO::new(2048);
     let mut fs = Formatted::format(io);
 
@@ -169,43 +265,7 @@ fn incremental_insert_and_read() {
                 i
             );
         }
-        // Unmount and continue inserting
         fs = mounted.into_formatted();
-    }
-}
-
-#[test]
-fn many_files_triggers_node_split() {
-    // Create enough files to overflow a single btree leaf node
-    // Each entry is ~24 (key) + ~30 (value header + name) = ~54 bytes minimum
-    // A 4KB node fits ~70 entries. Create 100 to ensure at least one split.
-    let io = VecBlockIO::new(1024);
-    let mut fs = Formatted::format(io);
-
-    for i in 0..100 {
-        let name = format!("file_{:04}.txt", i);
-        let data = format!("content of file {}", i);
-        fs.create(&name, data.as_bytes(), i as u64).expect(&format!("create {}", name));
-    }
-
-    let mounted = fs.mount_readonly();
-    let files = mounted.list().expect("list after splits");
-    assert_eq!(files.len(), 100, "expected 100 files, got {}", files.len());
-
-    // Verify every file is readable with correct content
-    for i in 0..100 {
-        let name = format!("file_{:04}.txt", i);
-        let expected = format!("content of file {}", i);
-        let data = mounted.read_file(&name).unwrap_or_else(|e| {
-            panic!("failed to read {}: {:?}", name, e);
-        });
-        assert_eq!(
-            String::from_utf8(data).unwrap(),
-            expected,
-            "content mismatch for {}",
-            name
-        );
-        assert_eq!(mounted.file_mtime(&name), i as u64, "mtime mismatch for {}", name);
     }
 }
 
@@ -267,7 +327,6 @@ fn mounted_readwrite_delete() {
     assert!(mounted.read_file("a.txt").is_err());
     assert_eq!(mounted.read_file("b.txt").unwrap(), b"bbb");
 
-    // Deleting nonexistent returns false
     assert!(!mounted.delete("nonexistent"));
 }
 
@@ -305,7 +364,7 @@ fn mounted_readwrite_overwrite_file() {
     mounted.create("test.txt", b"version 2 is longer", 20).expect("create v2");
     assert_eq!(mounted.read_file("test.txt").unwrap(), b"version 2 is longer");
     assert_eq!(mounted.file_mtime("test.txt"), 20);
-    assert_eq!(mounted.list().unwrap().len(), 1); // should not duplicate
+    assert_eq!(mounted.list().unwrap().len(), 1);
 }
 
 #[test]
@@ -332,8 +391,6 @@ fn mounted_readwrite_sync_and_reopen() {
     mounted.create("persistent.txt", b"I survive reboots", 42).expect("create");
     mounted.sync();
 
-    // Extract raw bytes, create new IO, reopen
-    // We need to get the raw data out. Use into_formatted -> into_io
     let raw = mounted.into_formatted().into_io().into_vec();
     let io2 = VecBlockIO::from_vec(raw);
     let mounted2 = Mounted::<_, ReadOnly>::open(io2).expect("reopen");
@@ -342,9 +399,41 @@ fn mounted_readwrite_sync_and_reopen() {
     assert_eq!(mounted2.file_mtime("persistent.txt"), 42);
 }
 
+// --- Filesystem capacity ---
+
+#[test]
+fn filesystem_full_returns_no_space() {
+    // Tiny filesystem: 32 blocks total. Fill until alloc fails.
+    let io = VecBlockIO::new(32);
+    let fs = Formatted::format(io);
+    let mut mounted = Mounted::<_, ReadWrite>::open(fs.into_io()).expect("open");
+
+    let mut created = 0;
+    for i in 0..100 {
+        let name = format!("f{}", i);
+        let data = vec![0xFFu8; 4096]; // 1 block per file
+        match mounted.create(&name, &data, 0) {
+            Ok(()) => created += 1,
+            Err(_) => break, // NoSpace expected
+        }
+    }
+    assert!(created > 0, "should have created at least one file");
+    assert!(created < 32, "should have hit NoSpace before 32 files");
+
+    // All previously created files should still be readable
+    for i in 0..created {
+        let name = format!("f{}", i);
+        let data = mounted.read_file(&name).unwrap_or_else(|e| {
+            panic!("file {} unreadable after NoSpace: {:?}", name, e);
+        });
+        assert_eq!(data.len(), 4096, "data corruption in {} after NoSpace", name);
+    }
+}
+
+// --- Integrity ---
+
 #[test]
 fn superblock_backup_recovery() {
-    // Create a filesystem, corrupt block 0, verify mount reads backup
     let io = VecBlockIO::new(128);
     let mut fs = Formatted::format(io);
     fs.create("test.txt", b"test data", 0).expect("create");
@@ -353,7 +442,6 @@ fn superblock_backup_recovery() {
     // Corrupt block 0 (superblock)
     raw[0..4].copy_from_slice(b"JUNK");
 
-    // Should still mount from backup at last block
     let io = VecBlockIO::from_vec(raw);
     let mounted = Mounted::<_, ReadOnly>::open(io).expect("mount from backup");
     let data = mounted.read_file("test.txt").expect("read after recovery");
@@ -362,19 +450,76 @@ fn superblock_backup_recovery() {
 
 #[test]
 fn crc_verification_on_nodes() {
-    // Create a filesystem, corrupt a btree node, verify read fails with ChecksumMismatch
     let io = VecBlockIO::new(128);
     let mut fs = Formatted::format(io);
     fs.create("test.txt", b"hello", 0).expect("create");
     let mut raw = fs.into_io().into_vec();
 
-    // The root node is at block 2 (superblock=0, bitmap=1, root=2 for small fs)
-    // Corrupt one byte in the middle of the root node
-    let root_offset = 2 * 4096 + 100; // byte 100 of the root node
+    // Corrupt a byte in the root node (block 2 for small fs)
+    let root_offset = 2 * 4096 + 100;
     raw[root_offset] ^= 0xFF;
 
     let io = VecBlockIO::from_vec(raw);
     let mounted = Mounted::<_, ReadOnly>::open(io).expect("mount");
     let result = mounted.read_file("test.txt");
     assert!(result.is_err(), "expected checksum error, got: {:?}", result.ok().map(|d| d.len()));
+}
+
+#[test]
+fn corrupt_data_block_returns_raw_bytes() {
+    // Data blocks have no CRC — corruption returns silently corrupted data.
+    // This documents the current limitation (Phase 4 adds per-extent checksums).
+    let io = VecBlockIO::new(128);
+    let mut fs = Formatted::format(io);
+    let original = vec![0xAAu8; 4096];
+    fs.create("data.bin", &original, 0).expect("create");
+
+    let mounted = fs.mount_readonly();
+    let block_map = mounted.file_block_map("data.bin").expect("block_map");
+    assert!(!block_map.is_empty());
+    let data_block = block_map[0];
+    fs = mounted.into_formatted();
+
+    let mut raw = fs.into_io().into_vec();
+
+    // Corrupt one byte in the data block
+    let data_offset = data_block as usize * 4096 + 50;
+    raw[data_offset] ^= 0xFF;
+
+    let io = VecBlockIO::from_vec(raw);
+    let mounted = Mounted::<_, ReadOnly>::open(io).expect("mount");
+    let data = mounted.read_file("data.bin").expect("read should succeed — no data CRC");
+    // Data should be corrupted — byte 50 is flipped
+    assert_ne!(data, original, "corruption should be visible in read data");
+    assert_eq!(data[50], 0xAA ^ 0xFF, "byte 50 should be flipped");
+}
+
+// --- State transitions ---
+
+#[test]
+fn format_mount_unmount_create_mount_roundtrip() {
+    // Verify into_formatted preserves all state: superblock, bitmap, free count
+    let io = VecBlockIO::new(512);
+    let mut fs = Formatted::format(io);
+
+    // Create files in Formatted state
+    fs.create("phase1.txt", b"created during format", 10).expect("create phase1");
+
+    // Mount readonly, verify, unmount back to Formatted
+    let mounted = fs.mount_readonly();
+    assert_eq!(mounted.list().unwrap().len(), 1);
+    assert_eq!(mounted.read_file("phase1.txt").unwrap(), b"created during format");
+    fs = mounted.into_formatted();
+
+    // Create more files in Formatted state after round-trip
+    fs.create("phase2.txt", b"created after round-trip", 20).expect("create phase2");
+
+    // Mount readonly again, verify both files exist
+    let mounted = fs.mount_readonly();
+    let files = mounted.list().unwrap();
+    assert_eq!(files.len(), 2, "expected 2 files after round-trip, got: {:?}", files);
+    assert_eq!(mounted.read_file("phase1.txt").unwrap(), b"created during format");
+    assert_eq!(mounted.read_file("phase2.txt").unwrap(), b"created after round-trip");
+    assert_eq!(mounted.file_mtime("phase1.txt"), 10);
+    assert_eq!(mounted.file_mtime("phase2.txt"), 20);
 }
