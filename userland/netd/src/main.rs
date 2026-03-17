@@ -1,13 +1,14 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
-use toyos_abi::{Fd, Pid};
+use toyos_abi::Fd;
 use toyos_abi::device;
-use toyos_abi::message;
+use toyos_abi::ipc;
 use toyos_abi::pipe;
 use toyos_abi::poll as toyos_poll;
 use toyos_abi::raw_net as toyos_nic;
 use toyos_abi::services;
 use toyos_abi::shm;
+
 use toyos_net::*;
 
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
@@ -150,14 +151,14 @@ struct UdpPipes {
 }
 
 struct PendingUdpRecv {
-    client_pid: u32,
+    client_fd: Fd,
     socket_id: u32,
     max_len: u32,
     deadline: Option<Instant>,
 }
 
 struct PendingDns {
-    client_pid: u32,
+    client_fd: Fd,
     query: dns::QueryHandle,
 }
 
@@ -201,7 +202,7 @@ struct PipedListener {
 }
 
 struct PendingPipedConnect {
-    client_pid: u32,
+    client_fd: Fd,
     socket_id: u32,
     handle: SocketHandle,
     rx_pipe_id: u64,
@@ -240,7 +241,7 @@ fn open_piped_connection(handle: SocketHandle, rx_pipe_id: u64, tx_pipe_id: u64)
 
 struct NetDaemon {
     sockets: HashMap<u32, SocketKind>,
-    owners: HashMap<u32, u32>, // socket_id -> owner pid
+    owners: HashMap<u32, Fd>, // socket_id -> owner's control socket fd
     next_id: u32,
     next_local_port: u16,
     pending_udp_recvs: Vec<PendingUdpRecv>,
@@ -281,38 +282,38 @@ impl NetDaemon {
         port
     }
 
-    fn send_error(pid: u32, code: u32) {
-        message::send(Pid(pid), MSG_ERROR, &ErrorResponse { code });
+    fn send_error(fd: Fd, code: u32) {
+        let _ = ipc::send(fd, MSG_ERROR, &ErrorResponse { code });
     }
 
     fn handle_message(
         &mut self,
-        msg: message::Message,
+        client_fd: Fd,
+        header: &ipc::IpcHeader,
         socket_set: &mut SocketSet<'_>,
         iface: &mut Interface,
     ) {
-        let sender = msg.sender;
-        match msg.msg_type {
-            MSG_TCP_CLOSE => self.handle_tcp_close(sender, msg, socket_set),
-            MSG_TCP_SHUTDOWN => self.handle_tcp_shutdown(sender, msg, socket_set),
-            MSG_UDP_BIND => self.handle_udp_bind(sender, msg, socket_set),
-            MSG_UDP_SEND_TO => self.handle_udp_send_to(sender, msg, socket_set),
-            MSG_UDP_RECV_FROM => self.handle_udp_recv_from(sender, msg, socket_set),
-            MSG_UDP_CLOSE => self.handle_udp_close(sender, msg, socket_set),
-            MSG_DNS_LOOKUP => self.handle_dns_lookup(sender, msg, socket_set, iface),
-            MSG_TCP_SET_OPTION => self.handle_tcp_set_option(sender, msg, socket_set),
-            MSG_TCP_GET_OPTION => self.handle_tcp_get_option(sender, msg, socket_set),
-            MSG_TCP_CONNECT_PIPED => self.handle_tcp_connect_piped(sender, msg, socket_set, iface),
-            MSG_TCP_BIND_PIPED => self.handle_tcp_bind_piped(sender, msg, socket_set),
-            MSG_TCP_ACCEPT_PIPED => self.handle_tcp_accept_piped(sender, msg, socket_set),
+        match header.msg_type {
+            MSG_TCP_CLOSE => self.handle_tcp_close(client_fd, header, socket_set),
+            MSG_TCP_SHUTDOWN => self.handle_tcp_shutdown(client_fd, header, socket_set),
+            MSG_UDP_BIND => self.handle_udp_bind(client_fd, header, socket_set),
+            MSG_UDP_SEND_TO => self.handle_udp_send_to(client_fd, header, socket_set),
+            MSG_UDP_RECV_FROM => self.handle_udp_recv_from(client_fd, header, socket_set),
+            MSG_UDP_CLOSE => self.handle_udp_close(client_fd, header, socket_set),
+            MSG_DNS_LOOKUP => self.handle_dns_lookup(client_fd, header, socket_set, iface),
+            MSG_TCP_SET_OPTION => self.handle_tcp_set_option(client_fd, header, socket_set),
+            MSG_TCP_GET_OPTION => self.handle_tcp_get_option(client_fd, header, socket_set),
+            MSG_TCP_CONNECT_PIPED => self.handle_tcp_connect_piped(client_fd, header, socket_set, iface),
+            MSG_TCP_BIND_PIPED => self.handle_tcp_bind_piped(client_fd, header, socket_set),
+            MSG_TCP_ACCEPT_PIPED => self.handle_tcp_accept_piped(client_fd, header, socket_set),
             other => {
-                eprintln!("netd: unknown message type {other} from pid {sender}");
+                eprintln!("netd: unknown message type {other}");
             }
         }
     }
 
-    fn handle_tcp_close(&mut self, sender: u32, msg: message::Message, socket_set: &mut SocketSet<'_>) {
-        let req: SocketCloseRequest = msg.payload();
+    fn handle_tcp_close(&mut self, client_fd: Fd, header: &ipc::IpcHeader, socket_set: &mut SocketSet<'_>) {
+        let req: SocketCloseRequest = ipc::recv_payload(client_fd, header);
         if let Some(kind) = self.sockets.remove(&req.socket_id) {
             match kind {
                 SocketKind::TcpStream(handle) => {
@@ -340,44 +341,44 @@ impl NetDaemon {
             }
             self.owners.remove(&req.socket_id);
         }
-        message::signal(Pid(sender), MSG_RESULT);
+        let _ = ipc::signal(client_fd,MSG_RESULT);
     }
 
     fn handle_tcp_shutdown(
         &mut self,
-        sender: u32,
-        msg: message::Message,
+        client_fd: Fd,
+        header: &ipc::IpcHeader,
         socket_set: &mut SocketSet<'_>,
     ) {
-        let req: TcpShutdownRequest = msg.payload();
+        let req: TcpShutdownRequest = ipc::recv_payload(client_fd, header);
         let Some(SocketKind::TcpStream(handle)) = self.sockets.get(&req.socket_id) else {
-            Self::send_error(sender, ERR_NOT_CONNECTED);
+            Self::send_error(client_fd, ERR_NOT_CONNECTED);
             return;
         };
         let socket = socket_set.get_mut::<tcp::Socket>(*handle);
         if req.how == 1 || req.how == 2 {
             socket.close();
         }
-        message::signal(Pid(sender), MSG_RESULT);
+        let _ = ipc::signal(client_fd,MSG_RESULT);
     }
 
     fn handle_udp_bind(
         &mut self,
-        sender: u32,
-        msg: message::Message,
+        client_fd: Fd,
+        header: &ipc::IpcHeader,
         socket_set: &mut SocketSet<'_>,
     ) {
-        let req: UdpBindRequest = msg.payload();
+        let req: UdpBindRequest = ipc::recv_payload(client_fd, header);
         let port = if req.port == 0 { self.alloc_port() } else { req.port };
 
         // Open pipe fds from client-provided pipe IDs
         let Some(tx_read_fd) = open_pipe_fd(req.tx_pipe_id, true) else {
-            Self::send_error(sender, ERR_INVALID_INPUT);
+            Self::send_error(client_fd, ERR_INVALID_INPUT);
             return;
         };
         let Some(rx_write_fd) = open_pipe_fd(req.rx_pipe_id, false) else {
             toyos_abi::syscall::close(tx_read_fd);
-            Self::send_error(sender, ERR_INVALID_INPUT);
+            Self::send_error(client_fd, ERR_INVALID_INPUT);
             return;
         };
 
@@ -394,17 +395,17 @@ impl NetDaemon {
         if socket.bind(endpoint).is_err() {
             toyos_abi::syscall::close(tx_read_fd);
             toyos_abi::syscall::close(rx_write_fd);
-            Self::send_error(sender, ERR_ADDR_IN_USE);
+            Self::send_error(client_fd, ERR_ADDR_IN_USE);
             return;
         }
 
         let handle = socket_set.add(socket);
         let socket_id = self.alloc_id();
         self.sockets.insert(socket_id, SocketKind::Udp(handle));
-        self.owners.insert(socket_id, sender);
+        self.owners.insert(socket_id, client_fd);
         self.udp_pipes.insert(socket_id, UdpPipes { tx_read_fd, rx_write_fd });
 
-        message::send(Pid(sender), MSG_RESULT, &UdpBindResponse {
+        let _ = ipc::send(client_fd,MSG_RESULT, &UdpBindResponse {
             socket_id,
             bound_port: port,
             _pad: 0,
@@ -413,20 +414,20 @@ impl NetDaemon {
 
     fn handle_udp_send_to(
         &mut self,
-        sender: u32,
-        msg: message::Message,
+        client_fd: Fd,
+        header: &ipc::IpcHeader,
         socket_set: &mut SocketSet<'_>,
     ) {
-        let req: UdpSendToRequest = msg.payload();
+        let req: UdpSendToRequest = ipc::recv_payload(client_fd, header);
 
         let Some(SocketKind::Udp(handle)) = self.sockets.get(&req.socket_id) else {
-            Self::send_error(sender, ERR_NOT_CONNECTED);
+            Self::send_error(client_fd, ERR_NOT_CONNECTED);
             return;
         };
         let handle = *handle;
 
         let Some(pipes) = self.udp_pipes.get(&req.socket_id) else {
-            Self::send_error(sender, ERR_NOT_CONNECTED);
+            Self::send_error(client_fd, ERR_NOT_CONNECTED);
             return;
         };
 
@@ -435,7 +436,7 @@ impl NetDaemon {
         let n = match toyos_abi::syscall::read(pipes.tx_read_fd, &mut buf) {
             Ok(n) => n,
             Err(_) => {
-                Self::send_error(sender, ERR_OTHER);
+                Self::send_error(client_fd, ERR_OTHER);
                 return;
             }
         };
@@ -446,13 +447,13 @@ impl NetDaemon {
         match socket.send_slice(&buf[..n], endpoint) {
             Ok(()) => {
                 let sent = n as u32;
-                message::send(Pid(sender), MSG_RESULT, &sent);
+                let _ = ipc::send(client_fd,MSG_RESULT, &sent);
             }
-            Err(_) => Self::send_error(sender, ERR_OTHER),
+            Err(_) => Self::send_error(client_fd, ERR_OTHER),
         }
     }
 
-    fn send_udp_recv_response(pid: u32, socket: &mut udp::Socket, max_len: u32, rx_write_fd: Fd) -> bool {
+    fn send_udp_recv_response(fd: Fd, socket: &mut udp::Socket, max_len: u32, rx_write_fd: Fd) -> bool {
         if !socket.can_recv() {
             return false;
         }
@@ -462,53 +463,51 @@ impl NetDaemon {
                 let addr = match endpoint.endpoint.addr {
                     IpAddress::Ipv4(a) => a.octets(),
                 };
-                // Write data to client's rx pipe
                 let _ = toyos_abi::syscall::write(rx_write_fd, &buf[..n]);
-                // Send metadata in control message
-                message::send(Pid(pid), MSG_RESULT, &UdpRecvResponse {
+                let _ = ipc::send(fd, MSG_RESULT, &UdpRecvResponse {
                     addr,
                     port: endpoint.endpoint.port,
                     len: n as u16,
                 });
             }
-            Err(_) => Self::send_error(pid, ERR_OTHER),
+            Err(_) => Self::send_error(fd, ERR_OTHER),
         }
         true
     }
 
     fn handle_udp_recv_from(
         &mut self,
-        sender: u32,
-        msg: message::Message,
+        client_fd: Fd,
+        header: &ipc::IpcHeader,
         socket_set: &mut SocketSet<'_>,
     ) {
-        let req: UdpRecvFromRequest = msg.payload();
+        let req: UdpRecvFromRequest = ipc::recv_payload(client_fd, header);
         let Some(SocketKind::Udp(handle)) = self.sockets.get(&req.socket_id) else {
-            Self::send_error(sender, ERR_NOT_CONNECTED);
+            Self::send_error(client_fd, ERR_NOT_CONNECTED);
             return;
         };
         let handle = *handle;
         let Some(pipes) = self.udp_pipes.get(&req.socket_id) else {
-            Self::send_error(sender, ERR_NOT_CONNECTED);
+            Self::send_error(client_fd, ERR_NOT_CONNECTED);
             return;
         };
         let rx_write_fd = pipes.rx_write_fd;
         let socket = socket_set.get_mut::<udp::Socket>(handle);
 
-        if Self::send_udp_recv_response(sender, socket, req.max_len, rx_write_fd) {
+        if Self::send_udp_recv_response(client_fd, socket, req.max_len, rx_write_fd) {
             return;
         }
 
         self.pending_udp_recvs.push(PendingUdpRecv {
-            client_pid: sender,
+            client_fd,
             socket_id: req.socket_id,
             max_len: req.max_len,
             deadline: None,
         });
     }
 
-    fn handle_udp_close(&mut self, sender: u32, msg: message::Message, socket_set: &mut SocketSet<'_>) {
-        let req: SocketCloseRequest = msg.payload();
+    fn handle_udp_close(&mut self, client_fd: Fd, header: &ipc::IpcHeader, socket_set: &mut SocketSet<'_>) {
+        let req: SocketCloseRequest = ipc::recv_payload(client_fd, header);
         if let Some(SocketKind::Udp(handle)) = self.sockets.remove(&req.socket_id) {
             socket_set.get_mut::<udp::Socket>(handle).close();
             socket_set.remove(handle);
@@ -518,21 +517,23 @@ impl NetDaemon {
                 toyos_abi::syscall::close(pipes.rx_write_fd);
             }
         }
-        message::signal(Pid(sender), MSG_RESULT);
+        let _ = ipc::signal(client_fd,MSG_RESULT);
     }
 
     fn handle_dns_lookup(
         &mut self,
-        sender: u32,
-        msg: message::Message,
+        client_fd: Fd,
+        header: &ipc::IpcHeader,
         socket_set: &mut SocketSet<'_>,
         iface: &mut Interface,
     ) {
-        let hostname = msg.bytes().to_vec();
+        let mut raw = [0u8; 256];
+        let n = ipc::recv_bytes(client_fd, header, &mut raw);
+        let hostname = raw[..n].to_vec();
         let hostname = match std::str::from_utf8(&hostname) {
             Ok(s) => s,
             Err(_) => {
-                Self::send_error(sender, ERR_INVALID_INPUT);
+                Self::send_error(client_fd, ERR_INVALID_INPUT);
                 return;
             }
         };
@@ -542,7 +543,7 @@ impl NetDaemon {
             let mut resp = vec![1u8];
             resp.push(4);
             resp.extend_from_slice(&octets);
-            message::send_bytes(Pid(sender), MSG_RESULT, &resp);
+            let _ = ipc::send_bytes(client_fd,MSG_RESULT, &resp);
             return;
         }
 
@@ -550,53 +551,53 @@ impl NetDaemon {
         match dns.start_query(iface.context(), hostname, DnsQueryType::A) {
             Ok(query) => {
                 self.pending_dns.push(PendingDns {
-                    client_pid: sender,
+                    client_fd,
                     query,
                 });
             }
-            Err(_) => Self::send_error(sender, ERR_OTHER),
+            Err(_) => Self::send_error(client_fd, ERR_OTHER),
         }
     }
 
     fn handle_tcp_set_option(
         &mut self,
-        sender: u32,
-        msg: message::Message,
+        client_fd: Fd,
+        header: &ipc::IpcHeader,
         socket_set: &mut SocketSet<'_>,
     ) {
-        let req: SocketOptionRequest = msg.payload();
+        let req: SocketOptionRequest = ipc::recv_payload(client_fd, header);
         let Some(SocketKind::TcpStream(handle)) = self.sockets.get(&req.socket_id) else {
-            Self::send_error(sender, ERR_NOT_CONNECTED);
+            Self::send_error(client_fd, ERR_NOT_CONNECTED);
             return;
         };
         let socket = socket_set.get_mut::<tcp::Socket>(*handle);
         match req.option {
             OPT_NODELAY => {
                 socket.set_nagle_enabled(req.value == 0);
-                message::signal(Pid(sender), MSG_RESULT);
+                let _ = ipc::signal(client_fd,MSG_RESULT);
             }
-            _ => Self::send_error(sender, ERR_INVALID_INPUT),
+            _ => Self::send_error(client_fd, ERR_INVALID_INPUT),
         }
     }
 
     fn handle_tcp_get_option(
         &mut self,
-        sender: u32,
-        msg: message::Message,
+        client_fd: Fd,
+        header: &ipc::IpcHeader,
         socket_set: &mut SocketSet<'_>,
     ) {
-        let req: SocketOptionRequest = msg.payload();
+        let req: SocketOptionRequest = ipc::recv_payload(client_fd, header);
         let Some(SocketKind::TcpStream(handle)) = self.sockets.get(&req.socket_id) else {
-            Self::send_error(sender, ERR_NOT_CONNECTED);
+            Self::send_error(client_fd, ERR_NOT_CONNECTED);
             return;
         };
         let socket = socket_set.get_mut::<tcp::Socket>(*handle);
         match req.option {
             OPT_NODELAY => {
                 let val = if socket.nagle_enabled() { 0u32 } else { 1u32 };
-                message::send(Pid(sender), MSG_RESULT, &SocketOptionResponse { value: val });
+                let _ = ipc::send(client_fd,MSG_RESULT, &SocketOptionResponse { value: val });
             }
-            _ => Self::send_error(sender, ERR_INVALID_INPUT),
+            _ => Self::send_error(client_fd, ERR_INVALID_INPUT),
         }
     }
 
@@ -604,12 +605,12 @@ impl NetDaemon {
 
     fn handle_tcp_connect_piped(
         &mut self,
-        sender: u32,
-        msg: message::Message,
+        client_fd: Fd,
+        header: &ipc::IpcHeader,
         socket_set: &mut SocketSet<'_>,
         iface: &mut Interface,
     ) {
-        let req: TcpConnectPipedRequest = msg.payload();
+        let req: TcpConnectPipedRequest = ipc::recv_payload(client_fd, header);
         let remote = IpEndpoint::new(
             IpAddress::Ipv4(Ipv4Addr::from(req.addr)),
             req.port,
@@ -620,14 +621,14 @@ impl NetDaemon {
         let tx_buf = tcp::SocketBuffer::new(vec![0u8; 65536]);
         let mut socket = tcp::Socket::new(rx_buf, tx_buf);
         if socket.connect(iface.context(), remote, local_port).is_err() {
-            Self::send_error(sender, ERR_CONNECTION_REFUSED);
+            Self::send_error(client_fd, ERR_CONNECTION_REFUSED);
             return;
         }
 
         let handle = socket_set.add(socket);
         let socket_id = self.alloc_id();
         self.sockets.insert(socket_id, SocketKind::TcpStream(handle));
-        self.owners.insert(socket_id, sender);
+        self.owners.insert(socket_id, client_fd);
 
         let deadline = if req.timeout_ms > 0 {
             Some(Instant::now() + Duration::from_millis(req.timeout_ms as u64))
@@ -636,7 +637,7 @@ impl NetDaemon {
         };
 
         self.pending_piped_connects.push(PendingPipedConnect {
-            client_pid: sender,
+            client_fd,
             socket_id,
             handle,
             rx_pipe_id: req.rx_pipe_id,
@@ -647,28 +648,28 @@ impl NetDaemon {
 
     fn handle_tcp_bind_piped(
         &mut self,
-        sender: u32,
-        msg: message::Message,
+        client_fd: Fd,
+        header: &ipc::IpcHeader,
         socket_set: &mut SocketSet<'_>,
     ) {
-        let req: TcpBindPipedRequest = msg.payload();
+        let req: TcpBindPipedRequest = ipc::recv_payload(client_fd, header);
         let port = if req.port == 0 { self.alloc_port() } else { req.port };
 
         let rx_buf = tcp::SocketBuffer::new(vec![0u8; 65536]);
         let tx_buf = tcp::SocketBuffer::new(vec![0u8; 65536]);
         let mut socket = tcp::Socket::new(rx_buf, tx_buf);
         if socket.listen(port).is_err() {
-            Self::send_error(sender, ERR_ADDR_IN_USE);
+            Self::send_error(client_fd, ERR_ADDR_IN_USE);
             return;
         }
 
         let handle = socket_set.add(socket);
         let socket_id = self.alloc_id();
         self.sockets.insert(socket_id, SocketKind::TcpListener(handle));
-        self.owners.insert(socket_id, sender);
+        self.owners.insert(socket_id, client_fd);
 
         let Some(notify_write_fd) = open_pipe_fd(req.notify_pipe_id, false) else {
-            Self::send_error(sender, ERR_INVALID_INPUT);
+            Self::send_error(client_fd, ERR_INVALID_INPUT);
             return;
         };
 
@@ -678,7 +679,7 @@ impl NetDaemon {
             notified: false,
         });
 
-        message::send(Pid(sender), MSG_RESULT, &TcpBindResponse {
+        let _ = ipc::send(client_fd,MSG_RESULT, &TcpBindResponse {
             socket_id,
             bound_port: port,
             _pad: 0,
@@ -687,19 +688,19 @@ impl NetDaemon {
 
     fn handle_tcp_accept_piped(
         &mut self,
-        sender: u32,
-        msg: message::Message,
+        client_fd: Fd,
+        header: &ipc::IpcHeader,
         socket_set: &mut SocketSet<'_>,
     ) {
-        let req: TcpAcceptPipedRequest = msg.payload();
+        let req: TcpAcceptPipedRequest = ipc::recv_payload(client_fd, header);
         let Some(listener) = self.piped_listeners.get(&req.socket_id) else {
-            Self::send_error(sender, ERR_NOT_CONNECTED);
+            Self::send_error(client_fd, ERR_NOT_CONNECTED);
             return;
         };
 
         let socket = socket_set.get_mut::<tcp::Socket>(listener.handle);
         if !socket.is_active() {
-            Self::send_error(sender, ERR_NOT_CONNECTED);
+            Self::send_error(client_fd, ERR_NOT_CONNECTED);
             return;
         }
 
@@ -712,10 +713,10 @@ impl NetDaemon {
         let old_handle = listener.handle;
         let stream_id = self.alloc_id();
         self.sockets.insert(stream_id, SocketKind::TcpStream(old_handle));
-        self.owners.insert(stream_id, sender);
+        self.owners.insert(stream_id, client_fd);
 
         let Some(conn) = open_piped_connection(old_handle, req.rx_pipe_id, req.tx_pipe_id) else {
-            Self::send_error(sender, ERR_INVALID_INPUT);
+            Self::send_error(client_fd, ERR_INVALID_INPUT);
             return;
         };
         self.piped_connections.push(conn);
@@ -733,7 +734,7 @@ impl NetDaemon {
             pl.notified = false;
         }
 
-        message::send(Pid(sender), MSG_RESULT, &TcpAcceptPipedResponse {
+        let _ = ipc::send(client_fd,MSG_RESULT, &TcpAcceptPipedResponse {
             socket_id: stream_id,
             remote_addr,
             remote_port: remote.port,
@@ -810,26 +811,26 @@ impl NetDaemon {
         while i < self.pending_udp_recvs.len() {
             let pr = &self.pending_udp_recvs[i];
             let Some(SocketKind::Udp(handle)) = self.sockets.get(&pr.socket_id) else {
-                Self::send_error(pr.client_pid, ERR_NOT_CONNECTED);
+                Self::send_error(pr.client_fd, ERR_NOT_CONNECTED);
                 self.pending_udp_recvs.swap_remove(i);
                 continue;
             };
             let handle = *handle;
             let Some(pipes) = self.udp_pipes.get(&pr.socket_id) else {
-                Self::send_error(pr.client_pid, ERR_NOT_CONNECTED);
+                Self::send_error(pr.client_fd, ERR_NOT_CONNECTED);
                 self.pending_udp_recvs.swap_remove(i);
                 continue;
             };
             let rx_write_fd = pipes.rx_write_fd;
             let socket = socket_set.get_mut::<udp::Socket>(handle);
-            let client = pr.client_pid;
+            let client = pr.client_fd;
             let max_len = pr.max_len;
             if Self::send_udp_recv_response(client, socket, max_len, rx_write_fd) {
                 self.pending_udp_recvs.swap_remove(i);
                 continue;
             }
             if pr.deadline.is_some_and(|d| now >= d) {
-                Self::send_error(pr.client_pid, ERR_TIMED_OUT);
+                Self::send_error(pr.client_fd, ERR_TIMED_OUT);
                 self.pending_udp_recvs.swap_remove(i);
                 continue;
             }
@@ -853,7 +854,7 @@ impl NetDaemon {
                             }
                         }
                     }
-                    message::send_bytes(Pid(pd.client_pid), MSG_RESULT, &resp);
+                    let _ = ipc::send_bytes(pd.client_fd,MSG_RESULT, &resp);
                     self.pending_dns.swap_remove(i);
                     continue;
                 }
@@ -862,7 +863,7 @@ impl NetDaemon {
                     continue;
                 }
                 Err(_) => {
-                    Self::send_error(pd.client_pid, ERR_OTHER);
+                    Self::send_error(pd.client_fd, ERR_OTHER);
                     self.pending_dns.swap_remove(i);
                     continue;
                 }
@@ -877,7 +878,7 @@ impl NetDaemon {
             if socket.may_send() {
                 let local_port = socket.local_endpoint().map(|e| e.port).unwrap_or(0);
                 let Some(conn) = open_piped_connection(pc.handle, pc.rx_pipe_id, pc.tx_pipe_id) else {
-                    Self::send_error(pc.client_pid, ERR_OTHER);
+                    Self::send_error(pc.client_fd, ERR_OTHER);
                     self.pending_piped_connects.swap_remove(i);
                     continue;
                 };
@@ -888,12 +889,12 @@ impl NetDaemon {
                     local_port,
                     _pad: 0,
                 };
-                message::send(Pid(pc.client_pid), MSG_RESULT, &resp);
+                let _ = ipc::send(pc.client_fd,MSG_RESULT, &resp);
                 self.pending_piped_connects.swap_remove(i);
                 continue;
             }
             if socket.state() == tcp::State::Closed {
-                Self::send_error(pc.client_pid, ERR_CONNECTION_REFUSED);
+                Self::send_error(pc.client_fd, ERR_CONNECTION_REFUSED);
                 self.sockets.remove(&pc.socket_id);
                 self.owners.remove(&pc.socket_id);
                 socket_set.remove(pc.handle);
@@ -901,7 +902,7 @@ impl NetDaemon {
                 continue;
             }
             if pc.deadline.is_some_and(|d| now >= d) {
-                Self::send_error(pc.client_pid, ERR_TIMED_OUT);
+                Self::send_error(pc.client_fd, ERR_TIMED_OUT);
                 socket.abort();
                 self.sockets.remove(&pc.socket_id);
                 self.owners.remove(&pc.socket_id);
@@ -915,7 +916,7 @@ impl NetDaemon {
 }
 
 fn main() {
-    services::register("netd").expect("netd already running");
+    let listener = services::listen("netd").expect("netd already running");
 
     let mut device = DmaNic::new();
     let mac = device.mac;
@@ -971,17 +972,27 @@ fn main() {
             timeout = timeout.min(Duration::from_millis(1));
         }
 
-        let result = toyos_poll::poll_timeout(&[], Some(timeout.as_nanos() as u64));
+        let mut poll_fds: Vec<u64> = vec![listener.0 as u64];
+        for (&_id, fd) in &daemon.owners {
+            if !poll_fds.contains(&(fd.0 as u64)) {
+                poll_fds.push(fd.0 as u64);
+            }
+        }
+        let result = toyos_poll::poll_timeout(&poll_fds, Some(timeout.as_nanos() as u64));
 
-        if result.messages() {
-            loop {
-                let msg = message::recv();
-                daemon.handle_message(msg, &mut socket_set, &mut iface);
+        // Accept new connections
+        if result.fd(0) {
+            let conn = services::accept(listener).expect("accept failed");
+            let header = ipc::recv_header(conn.fd);
+            daemon.handle_message(conn.fd, &header, &mut socket_set, &mut iface);
+        }
 
-                let check = toyos_poll::poll_timeout(&[], Some(0));
-                if !check.messages() {
-                    break;
-                }
+        // Handle messages from existing clients
+        for i in 1..poll_fds.len() {
+            if result.fd(i) {
+                let fd = Fd(poll_fds[i] as i32);
+                let header = ipc::recv_header(fd);
+                daemon.handle_message(fd, &header, &mut socket_set, &mut iface);
             }
         }
     }

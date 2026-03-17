@@ -161,7 +161,7 @@ struct PaintApp {
 impl PaintApp {
     fn new() -> Self {
         let window = Window::create_with_title(0, 0, "Paint");
-        window::set_cursor(window::CURSOR_CROSSHAIR);
+        window.set_cursor(window::CURSOR_CROSSHAIR);
         let fb = window.framebuffer();
         let canvas_w = fb.width().saturating_sub(PALETTE_WIDTH);
         let canvas_h = fb.height().saturating_sub(TOOLBAR_HEIGHT + STATUS_HEIGHT);

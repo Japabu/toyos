@@ -4,13 +4,10 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::arch::naked_asm;
 use core::ptr::NonNull;
-use hashbrown::HashMap;
-
 use crate::arch::{cpu, paging, percpu};
 use crate::arch::paging::PAGE_2M;
 use crate::fd::{self, Descriptor, FdTable};
 use crate::id_map::IdMap;
-use crate::message::MessageQueue;
 use crate::sync::Lock;
 use crate::symbols::ProcessSymbols;
 use crate::{elf, pipe, scheduler, shared_memory, vfs};
@@ -128,7 +125,6 @@ pub enum ProcessState {
     BlockedWaitPid(Pid),
     BlockedThreadJoin(Pid),
     BlockedPoll { deadline: u64 },
-    BlockedRecvMsg,
     BlockedNetRecv { deadline: u64 },
     BlockedSleep { deadline: u64 },
     BlockedFutex { phys_addr: PhysAddr, deadline: u64 },
@@ -139,7 +135,7 @@ impl ProcessState {
     fn is_blocked(&self) -> bool {
         matches!(self, Self::BlockedKeyboard | Self::BlockedPipeRead(_) | Self::BlockedPipeWrite(_)
             | Self::BlockedWaitPid(_) | Self::BlockedThreadJoin(_) | Self::BlockedPoll { .. }
-            | Self::BlockedRecvMsg | Self::BlockedNetRecv { .. } | Self::BlockedSleep { .. }
+            | Self::BlockedNetRecv { .. } | Self::BlockedSleep { .. }
             | Self::BlockedFutex { .. })
     }
 
@@ -166,7 +162,6 @@ impl ProcessState {
             Self::BlockedWaitPid(_) => "BlockedWaitPid",
             Self::BlockedThreadJoin(_) => "BlockedThreadJoin",
             Self::BlockedPoll { .. } => "BlockedPoll",
-            Self::BlockedRecvMsg => "BlockedRecvMsg",
             Self::BlockedNetRecv { .. } => "BlockedNetRecv",
             Self::BlockedSleep { .. } => "BlockedSleep",
             Self::BlockedFutex { .. } => "BlockedFutex",
@@ -326,7 +321,7 @@ pub struct ProcessData {
     pub pid: Pid,
     pub fds: FdTable,
     pub cwd: String,
-    pub messages: MessageQueue,
+
     pub poll_fds: [u64; 64],
     pub poll_len: u32,
     pub elf_alloc: Option<OwnedAlloc>,
@@ -503,11 +498,9 @@ impl ProcessTable {
 }
 
 pub static PROCESS_TABLE: Lock<Option<ProcessTable>> = Lock::new(None);
-static NAME_REGISTRY: Lock<Option<HashMap<String, Pid>>> = Lock::new(None);
 
 pub fn init() {
     *PROCESS_TABLE.lock() = Some(ProcessTable::new());
-    *NAME_REGISTRY.lock() = Some(HashMap::new());
 }
 
 pub fn current_pid() -> Pid {
@@ -753,7 +746,7 @@ pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64, stack_base: u64) -> Op
     let thread_data = Arc::new(Lock::new(ProcessData {
         pid: Pid::from_raw(0),
         fds: FdTable::new(),
-        messages: MessageQueue::new(),
+
         poll_fds: [0; 64],
         poll_len: 0,
         cwd: parent_cwd,
@@ -812,7 +805,8 @@ pub fn build_child_fds(pairs: &[[u32; 2]]) -> FdTable {
     let mut fds = FdTable::new();
     for &[child_fd, parent_fd] in pairs {
         if let Some(desc) = data.fds.get(parent_fd) {
-            fds.insert_at(child_fd, fd::dup(desc));
+            let cloned = desc.clone();
+            fd::alloc_at(&mut fds, child_fd, cloned);
         }
     }
     fds
@@ -1396,7 +1390,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
         pid: Pid::from_raw(0),
         fds,
         cwd,
-        messages: MessageQueue::new(),
+
         poll_fds: [0; 64],
         poll_len: 0,
         elf_alloc: exe_tls_template, // TLS template allocation (if any)
@@ -1520,7 +1514,6 @@ fn teardown_scheduling(table: &mut ProcessTable, pid: Pid, code: i32) {
     let name = core::str::from_utf8(entry.name()).unwrap_or("?").trim_end_matches('\0');
     log!("exit: {name} pid={pid} code={code}");
 
-    if let Some(names) = NAME_REGISTRY.lock().as_mut() { names.retain(|_, &mut v| v != pid); }
 
     // Collect orphaned child processes: remove zombies, detach running ones.
     let orphans: Vec<Pid> = table.iter()
@@ -1661,65 +1654,8 @@ pub fn block_poll(fds: [u64; 64], len: u32, deadline: u64) {
     scheduler::block(ProcessState::BlockedPoll { deadline });
 }
 
-/// Block waiting for a message, with an atomic recheck to prevent TOCTOU races.
-///
-/// The race: `sys_recv_msg` pops from the queue (empty), then `send_message`
-/// pushes a message and checks state (still Running, so no wake), then the
-/// receiver blocks — message sits in the queue with nobody to wake it.
-///
-/// Fix: hold the table lock, briefly lock ProcessData to check the queue,
-/// and only transition to BlockedRecvMsg if the queue is truly empty.
-/// Lock ordering: PROCESS_TABLE > ProcessData (same direction as idle_poll).
-pub fn block_recv_msg() {
-    let mut guard = PROCESS_TABLE.lock();
-    let table = guard.as_mut().unwrap();
-    let pid = percpu::current_pid().expect("block_recv_msg() called during idle");
-    let data_arc = Arc::clone(table.get(pid).unwrap().data());
-
-    // Brief ProcessData lock under table lock to check for messages.
-    if data_arc.lock().messages.has_messages() {
-        return; // Message arrived between pop and block — retry the loop.
-    }
-
-    table.get_mut(pid).unwrap().set_state(ProcessState::BlockedRecvMsg);
-    scheduler::schedule_already_blocked(guard);
-}
-
-/// Cooperative yield: mark current as Ready, switch to next.
 pub fn yield_now() {
     scheduler::yield_now();
-}
-
-// ---------------------------------------------------------------------------
-// Message passing
-// ---------------------------------------------------------------------------
-
-/// Send a message to a target process. Wakes the target if blocked.
-/// Three-phase lock discipline: no lock nesting between table and ProcessData.
-pub fn send_message(target_pid: Pid, msg: crate::message::Message) -> bool {
-    // Phase 1: Get target's data Arc (brief table lock)
-    let data_arc = {
-        let guard = PROCESS_TABLE.lock();
-        match guard.as_ref().unwrap().get(target_pid) {
-            Some(entry) => Arc::clone(entry.data()),
-            None => return false,
-        }
-    };
-    // Phase 2: Push message (per-process lock, no table lock held)
-    {
-        let mut data = data_arc.lock();
-        if data.messages.push(msg).is_err() {
-            return false;
-        }
-    }
-    // Phase 3: Wake target (brief table lock, no process lock held)
-    let mut guard = PROCESS_TABLE.lock();
-    if let Some(entry) = guard.as_mut().unwrap().get_mut(target_pid) {
-        if matches!(entry.state(), ProcessState::BlockedRecvMsg | ProcessState::BlockedPoll { .. }) {
-            entry.set_state(ProcessState::Ready);
-        }
-    }
-    true
 }
 
 // ---------------------------------------------------------------------------
@@ -1818,23 +1754,6 @@ pub fn collect_thread_zombie(tid: Pid, parent_pid: Pid) -> Result<Option<i32>, (
     table.collect_thread_zombie(tid, parent_pid)
 }
 
-// ---------------------------------------------------------------------------
-// Name registry
-// ---------------------------------------------------------------------------
-
-pub fn register_name(name: &str, pid: Pid) -> bool {
-    let mut guard = NAME_REGISTRY.lock();
-    let names = guard.as_mut().unwrap();
-    if names.contains_key(name) {
-        return false;
-    }
-    names.insert(String::from(name), pid);
-    true
-}
-
-pub fn find_pid(name: &str) -> Option<Pid> {
-    NAME_REGISTRY.lock().as_ref().unwrap().get(name).copied()
-}
 
 // ---------------------------------------------------------------------------
 // Demand paging
@@ -2160,7 +2079,7 @@ pub fn kill_process(target_pid: Pid) -> u64 {
     let name = core::str::from_utf8(entry.name()).unwrap_or("?").trim_end_matches('\0');
     log!("kill: {name} pid={target_pid}");
 
-    if let Some(names) = NAME_REGISTRY.lock().as_mut() { names.retain(|_, &mut v| v != target_pid); }
+
 
     // Wake parent if blocked on waitpid for this process
     if let Some(parent) = table.get_mut(caller) {

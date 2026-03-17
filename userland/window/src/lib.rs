@@ -2,17 +2,11 @@ pub mod framebuffer;
 
 pub use framebuffer::{Color, Framebuffer};
 
-use toyos_abi::message::{self, Message};
+use toyos_abi::ipc;
 use toyos_abi::poll;
-use toyos_abi::services;
-use toyos_abi::Pid;
 use toyos_abi::shm::SharedMemory;
-use std::sync::OnceLock;
-
-fn compositor_pid() -> u32 {
-    static PID: OnceLock<u32> = OnceLock::new();
-    *PID.get_or_init(|| services::find("compositor").expect("no compositor running").0)
-}
+use toyos_abi::syscall;
+use toyos_abi::Fd;
 
 // Window flags
 pub const WINDOW_FLAG_TOPMOST: u8 = 1;
@@ -148,32 +142,26 @@ pub enum Event {
     Frame,
 }
 
-/// Set the system clipboard contents.
+/// Set the system clipboard contents (standalone, uses a temporary compositor connection).
 pub fn clipboard_set(text: &str) {
     use std::sync::Mutex;
     static CLIPBOARD_SHM: Mutex<Option<SharedMemory>> = Mutex::new(None);
 
+    let fd = syscall::connect("compositor").expect("compositor not running");
     let bytes = text.as_bytes();
-    if bytes.len() <= message::MAX_PAYLOAD {
-        message::send_bytes(Pid(compositor_pid()), MSG_CLIPBOARD_SET, bytes);
+    if bytes.len() <= 4096 {
+        let _ = ipc::send_bytes(fd, MSG_CLIPBOARD_SET, bytes);
     } else {
         let mut shm = SharedMemory::allocate(bytes.len());
         shm.as_mut_slice()[..bytes.len()].copy_from_slice(bytes);
-        message::send(
-            Pid(compositor_pid()),
-            MSG_CLIPBOARD_SET_SHM,
-            &ClipboardShmMsg { token: shm.token(), len: bytes.len() as u32 },
-        );
+        let _ = ipc::send(fd, MSG_CLIPBOARD_SET_SHM, &ClipboardShmMsg { token: shm.token(), len: bytes.len() as u32 });
         *CLIPBOARD_SHM.lock().unwrap() = Some(shm);
     }
-}
-
-/// Request a cursor style for the current window.
-pub fn set_cursor(style: u8) {
-    message::send(Pid(compositor_pid()), MSG_SET_CURSOR, &(style as u32));
+    syscall::close(fd);
 }
 
 pub struct Window {
+    fd: Fd,
     shm: SharedMemory,
     width: u32,
     height: u32,
@@ -181,8 +169,6 @@ pub struct Window {
 }
 
 impl Window {
-    /// Request a window from the compositor. Blocks until the window is created.
-    /// Pass 0 for width/height to let the compositor decide.
     pub fn create(width: u32, height: u32) -> Self {
         Self::create_with_title(width, height, "")
     }
@@ -196,6 +182,8 @@ impl Window {
     }
 
     fn create_with_flags(width: u32, height: u32, title: &str, flags: u8) -> Self {
+        let fd = syscall::connect("compositor").expect("compositor not running");
+
         let mut req = CreateWindowRequest {
             width,
             height,
@@ -207,44 +195,36 @@ impl Window {
         let len = bytes.len().min(30);
         req.title[..len].copy_from_slice(&bytes[..len]);
         req.title_len = len as u8;
-        message::send(Pid(compositor_pid()), MSG_CREATE_WINDOW, &req);
+        ipc::send(fd, MSG_CREATE_WINDOW, &req).expect("compositor not responding");
 
-        let response = message::recv();
-        assert_eq!(response.msg_type, MSG_WINDOW_CREATED, "unexpected message from compositor");
-        let info: WindowInfo = response.payload();
+        let (msg_type, info): (u32, WindowInfo) = ipc::recv(fd);
+        assert_eq!(msg_type, MSG_WINDOW_CREATED, "unexpected response from compositor");
         let buf_size = info.stride as usize * info.height as usize * 4;
         let shm = SharedMemory::map(info.token, buf_size);
 
-        Self {
-            shm,
-            width: info.width,
-            height: info.height,
-            pixel_format: info.pixel_format,
-        }
+        Self { fd, shm, width: info.width, height: info.height, pixel_format: info.pixel_format }
     }
 
-    /// Receive the next window event from the compositor. Blocks until an event arrives.
     pub fn recv_event(&mut self) -> Event {
-        let msg = message::recv();
-        self.decode_event(msg)
+        let header = ipc::recv_header(self.fd);
+        self.decode_event(&header)
     }
 
-    /// Wait up to `timeout_nanos` for an event. Returns `None` on timeout.
     pub fn poll_event(&mut self, timeout_nanos: u64) -> Option<Event> {
-        let result = poll::poll_timeout(&[], Some(timeout_nanos));
-        if result.messages() {
+        let result = poll::poll_timeout(&[self.fd.0 as u64], Some(timeout_nanos));
+        if result.fd(0) {
             Some(self.recv_event())
         } else {
             None
         }
     }
 
-    fn decode_event(&mut self, msg: Message) -> Event {
-        match msg.msg_type {
-            MSG_KEY_INPUT => Event::KeyInput(msg.payload()),
-            MSG_MOUSE_INPUT => Event::MouseInput(msg.payload()),
+    fn decode_event(&mut self, header: &ipc::IpcHeader) -> Event {
+        match header.msg_type {
+            MSG_KEY_INPUT => Event::KeyInput(ipc::recv_payload(self.fd, header)),
+            MSG_MOUSE_INPUT => Event::MouseInput(ipc::recv_payload(self.fd, header)),
             MSG_WINDOW_RESIZED => {
-                let info: ResizeInfo = msg.payload();
+                let info: ResizeInfo = ipc::recv_payload(self.fd, header);
                 let buf_size = info.stride as usize * info.height as usize * 4;
                 self.shm = SharedMemory::map(info.token, buf_size);
                 self.width = info.width;
@@ -252,9 +232,13 @@ impl Window {
                 self.pixel_format = info.pixel_format;
                 Event::Resized
             }
-            MSG_CLIPBOARD_PASTE => Event::ClipboardPaste(msg.bytes().to_vec()),
+            MSG_CLIPBOARD_PASTE => {
+                let mut buf = [0u8; 4096];
+                let n = ipc::recv_bytes(self.fd, header, &mut buf);
+                Event::ClipboardPaste(buf[..n].to_vec())
+            }
             MSG_CLIPBOARD_PASTE_SHM => {
-                let info: ClipboardShmMsg = msg.payload();
+                let info: ClipboardShmMsg = ipc::recv_payload(self.fd, header);
                 let shm = SharedMemory::map(info.token, info.len as usize);
                 let data = shm.as_slice()[..info.len as usize].to_vec();
                 Event::ClipboardPaste(data)
@@ -265,9 +249,21 @@ impl Window {
         }
     }
 
-    /// Notify the compositor that the buffer has been updated.
+    pub fn set_cursor(&self, style: u8) {
+        let _ = ipc::send(self.fd, MSG_SET_CURSOR, &(style as u32));
+    }
+
+    pub fn set_clipboard(&self, text: &str) {
+        let _ = ipc::send_bytes(self.fd, MSG_CLIPBOARD_SET, text.as_bytes());
+    }
+
     pub fn present(&self) {
-        message::signal(Pid(compositor_pid()), MSG_PRESENT);
+        let _ = ipc::signal(self.fd, MSG_PRESENT);
+    }
+
+    /// The socket fd for this window. Use with `poll` to check for events.
+    pub fn fd(&self) -> Fd {
+        self.fd
     }
 
     pub fn width(&self) -> u32 {
@@ -300,6 +296,7 @@ impl std::fmt::Debug for Window {
 
 impl Drop for Window {
     fn drop(&mut self) {
-        message::signal(Pid(compositor_pid()), MSG_DESTROY_WINDOW);
+        let _ = ipc::signal(self.fd, MSG_DESTROY_WINDOW);
+        syscall::close(self.fd);
     }
 }

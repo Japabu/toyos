@@ -31,8 +31,10 @@ fn main() {
     let shell_stdout_fd = shell_stdout.as_raw_fd() as u64;
     let shell_stderr_fd = shell_stderr.as_raw_fd() as u64;
 
+    let window_fd = window.fd().0 as u64;
+
     loop {
-        let ready = poll::poll(&[shell_stdout_fd, shell_stderr_fd]);
+        let ready = poll::poll(&[shell_stdout_fd, shell_stderr_fd, window_fd]);
 
         if ready.fd(0) {
             let mut buf = [0u8; 4096];
@@ -55,7 +57,7 @@ fn main() {
             }
         }
 
-        if ready.messages() {
+        if ready.fd(2) {
             match window.recv_event() {
                 window::Event::KeyInput(event) => {
                     if event.gui() && event.keycode == 0x06 {

@@ -28,7 +28,7 @@ unsafe impl UserSafe for crate::fd::Stat {}
 
 // ABI types.
 unsafe impl UserSafe for toyos_abi::syscall::SpawnArgs {}
-unsafe impl UserSafe for toyos_abi::message::Message {}
+
 unsafe impl UserSafe for toyos_abi::input::RawKeyEvent {}
 unsafe impl UserSafe for toyos_abi::input::MouseEvent {}
 

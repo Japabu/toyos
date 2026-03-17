@@ -77,6 +77,9 @@ pub const SYS_NIC_TX: u64 = 80;
 pub const SYS_SYMLINK: u64 = 81;
 pub const SYS_READLINK: u64 = 82;
 pub const SYS_GPU_SET_RESOLUTION: u64 = 83;
+pub const SYS_LISTEN: u64 = 85;
+pub const SYS_ACCEPT: u64 = 86;
+pub const SYS_CONNECT: u64 = 87;
 
 pub const WNOHANG: u64 = 1;
 
@@ -428,22 +431,6 @@ pub fn thread_join(tid: u64) -> u64 {
 
 // --- IPC ---
 
-/// Send a 128-byte `Message` to process `target_pid`.
-///
-/// # Safety
-/// `msg_ptr` must point to a valid `Message`.
-pub unsafe fn send_msg(target_pid: u64, msg_ptr: u64) -> u64 {
-    syscall(SYS_SEND_MSG, target_pid, msg_ptr, 0, 0)
-}
-
-/// Receive a 128-byte `Message`. Blocks if the queue is empty.
-///
-/// # Safety
-/// `msg_ptr` must point to a writable `Message`.
-pub unsafe fn recv_msg(msg_ptr: u64) -> u64 {
-    syscall(SYS_RECV_MSG, msg_ptr, 0, 0, 0)
-}
-
 // --- Filesystem ---
 
 /// Open a file.
@@ -590,7 +577,6 @@ pub const POLL_FD_MASK: u64 = !(POLL_READABLE | POLL_WRITABLE);
 /// Result of a [`poll`] or [`poll_timeout`] call.
 pub struct PollResult {
     mask: u64,
-    fd_count: usize,
 }
 
 impl PollResult {
@@ -599,10 +585,6 @@ impl PollResult {
         self.mask & (1 << index) != 0
     }
 
-    /// Whether the process message queue has messages.
-    pub fn messages(&self) -> bool {
-        self.mask & (1 << self.fd_count) != 0
-    }
 }
 
 /// Poll file descriptors and the message queue for readiness.
@@ -619,7 +601,7 @@ pub fn poll(fds: &[u64]) -> PollResult {
 /// Each entry is a fd number (as u64), optionally OR'd with POLL_READABLE/POLL_WRITABLE.
 pub fn poll_timeout(fds: &[u64], timeout: Option<u64>) -> PollResult {
     let mask = syscall(SYS_POLL, fds.as_ptr() as u64, fds.len() as u64, encode_timeout(timeout), 0);
-    PollResult { mask, fd_count: fds.len() }
+    PollResult { mask }
 }
 
 // --- Devices ---
@@ -640,17 +622,37 @@ pub fn open_device(device: DeviceType) -> Result<Fd, SyscallError> {
     check(syscall(SYS_OPEN_DEVICE, device as u64, 0, 0, 0)).map(|v| Fd(v as i32))
 }
 
-// --- Name registry ---
+// --- Service IPC (listen / accept / connect) ---
 
-/// Register the current process under the given name.
-pub fn register_name(name: &str) -> Result<(), SyscallError> {
-    check_unit(syscall(SYS_REGISTER_NAME, name.as_ptr() as u64, name.len() as u64, 0, 0))
+/// Register a named service and return a listener fd.
+/// Other processes can connect to this service by name.
+pub fn listen(name: &str) -> Result<Fd, SyscallError> {
+    check(syscall(SYS_LISTEN, name.as_ptr() as u64, name.len() as u64, 0, 0)).map(|v| Fd(v as i32))
 }
 
-/// Find the PID of a process registered under the given name.
-pub fn find_pid(name: &str) -> Option<Pid> {
-    let pid = syscall(SYS_FIND_PID, name.as_ptr() as u64, name.len() as u64, 0, 0);
-    if SyscallError::from_u64(pid).is_some() { None } else { Some(Pid(pid as u32)) }
+/// Result of [`accept`]: socket fd + connecting client's PID.
+pub struct AcceptResult {
+    pub fd: Fd,
+    pub client_pid: u32,
+}
+
+/// Accept a pending connection on a listener fd.
+/// Blocks until a client connects. Returns a socket fd and the client's PID.
+pub fn accept(listener_fd: Fd) -> Result<AcceptResult, SyscallError> {
+    let raw = syscall(SYS_ACCEPT, listener_fd.0 as u64, 0, 0, 0);
+    if let Some(e) = SyscallError::from_u64(raw) {
+        return Err(e);
+    }
+    Ok(AcceptResult {
+        fd: Fd((raw & 0xFFFF_FFFF) as i32),
+        client_pid: (raw >> 32) as u32,
+    })
+}
+
+/// Connect to a named service. Blocks until the server accepts.
+/// Returns a bidirectional socket fd.
+pub fn connect(name: &str) -> Result<Fd, SyscallError> {
+    check(syscall(SYS_CONNECT, name.as_ptr() as u64, name.len() as u64, 0, 0)).map(|v| Fd(v as i32))
 }
 
 // --- Shared memory ---

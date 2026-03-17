@@ -1,14 +1,16 @@
-//! Process name registry for service discovery.
+//! Service discovery via listen/connect/accept.
 
-use crate::Pid;
+use crate::Fd;
 use crate::syscall::{self, SyscallError};
 
-/// Register the current process under a name so other processes can find it.
-pub fn register(name: &str) -> Result<(), SyscallError> {
-    syscall::register_name(name)
+pub fn listen(name: &str) -> Result<Fd, SyscallError> {
+    syscall::listen(name)
 }
 
-/// Find the PID of a process registered under the given name.
-pub fn find(name: &str) -> Option<Pid> {
-    syscall::find_pid(name)
+pub fn accept(listener: Fd) -> Result<syscall::AcceptResult, SyscallError> {
+    syscall::accept(listener)
+}
+
+pub fn connect(name: &str) -> Result<Fd, SyscallError> {
+    syscall::connect(name)
 }

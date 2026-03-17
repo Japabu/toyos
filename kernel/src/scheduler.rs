@@ -225,7 +225,7 @@ pub fn idle_unlock_and_loop() -> ! {
 
 /// Poll for I/O and wake blocked processes.
 /// Only accesses SchedEntry data — never locks ProcessData.
-/// BlockedPoll and BlockedRecvMsg use spurious wakeups: explicit wake calls
+/// BlockedPoll uses spurious wakeups: explicit wake calls
 /// from pipe/message/keyboard/network subsystems handle the fast path,
 /// and idle_poll only checks timeouts and global readiness flags.
 fn idle_poll(table: &mut ProcessTable) {
@@ -270,9 +270,6 @@ fn idle_poll(table: &mut ProcessTable) {
                 {
                     entry.set_state(ProcessState::Ready);
                 }
-            }
-            ProcessState::BlockedRecvMsg => {
-                // No polling needed — send_message wakes directly.
             }
             ProcessState::BlockedNetRecv { deadline } if net_ready
                 || (deadline > 0 && crate::clock::nanos_since_boot() >= deadline) =>

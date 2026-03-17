@@ -1,9 +1,10 @@
 use filepicker_api::{PickerMode, MSG_FILEPICKER_REQUEST, MSG_FILEPICKER_RESULT};
 use font::Font;
 use std::fs;
-use toyos_abi::message;
-use toyos_abi::Pid;
+use toyos_abi::ipc;
 use toyos_abi::services;
+use toyos_abi::syscall;
+use toyos_abi::Fd;
 use std::path::{Path, PathBuf};
 use window::{Color, Event, Framebuffer, KeyEvent, MouseEvent, Window};
 
@@ -395,7 +396,7 @@ fn handle_mouse(picker: &mut Picker, mouse: &MouseEvent, win_h: usize) -> Picker
 
 // --- Run a single file picker session ---
 
-fn run_picker(mode: PickerMode, start_dir: &str, client_pid: u32) {
+fn run_picker(mode: PickerMode, start_dir: &str, client_fd: Fd) {
     let title = if mode == PickerMode::Save {
         "Save As"
     } else {
@@ -437,11 +438,11 @@ fn run_picker(mode: PickerMode, start_dir: &str, client_pid: u32) {
 
         match result {
             PickerResult::Pick(path) => {
-                message::send_bytes(Pid(client_pid), MSG_FILEPICKER_RESULT, path.as_bytes());
+                let _ = ipc::send_bytes(client_fd, MSG_FILEPICKER_RESULT,path.as_bytes());
                 return;
             }
             PickerResult::Cancel => {
-                message::send_bytes(Pid(client_pid), MSG_FILEPICKER_RESULT, &[]);
+                let _ = ipc::send_bytes(client_fd, MSG_FILEPICKER_RESULT,&[]);
                 return;
             }
             PickerResult::Continue => {}
@@ -457,23 +458,31 @@ fn run_picker(mode: PickerMode, start_dir: &str, client_pid: u32) {
 // --- Main daemon loop ---
 
 fn main() {
-    services::register("filepicker").expect("filepicker: name already taken");
+    let listener = services::listen("filepicker").expect("filepicker: name already taken");
 
     loop {
-        let msg = message::recv();
-        if msg.msg_type != MSG_FILEPICKER_REQUEST {
+        let conn = services::accept(listener).expect("accept failed");
+        let client_fd = conn.fd;
+        let header = ipc::recv_header(client_fd);
+        if header.msg_type != MSG_FILEPICKER_REQUEST {
+            syscall::close(client_fd);
             continue;
         }
 
-        let client_pid = msg.sender;
-        let data = msg.bytes();
-        let mode = if data[0] == PickerMode::Save as u8 {
+        let mut data = [0u8; 4096];
+        let n = ipc::recv_bytes(client_fd, &header, &mut data);
+        let mode = if n > 0 && data[0] == PickerMode::Save as u8 {
             PickerMode::Save
         } else {
             PickerMode::Open
         };
-        let start_dir = core::str::from_utf8(&data[1..]).unwrap_or("/");
+        let start_dir = if n > 1 {
+            core::str::from_utf8(&data[1..n]).unwrap_or("/")
+        } else {
+            "/"
+        };
 
-        run_picker(mode, start_dir, client_pid);
+        run_picker(mode, start_dir, client_fd);
+        syscall::close(client_fd);
     }
 }

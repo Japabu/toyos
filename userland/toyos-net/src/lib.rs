@@ -6,9 +6,9 @@
 
 #![no_std]
 
-use core::sync::atomic::{AtomicU32, Ordering};
-use toyos_abi::message::{self, Message};
-use toyos_abi::{Fd, Pid};
+use core::sync::atomic::{AtomicI32, Ordering};
+use toyos_abi::ipc::{self, IpcHeader};
+use toyos_abi::Fd;
 use toyos_abi::syscall;
 
 // ---------------------------------------------------------------------------
@@ -251,22 +251,22 @@ pub struct UdpBound {
 }
 
 // ---------------------------------------------------------------------------
-// netd PID lookup (cached)
+// netd connection (cached)
 // ---------------------------------------------------------------------------
 
-static NETD_PID: AtomicU32 = AtomicU32::new(0);
+static NETD_FD: AtomicI32 = AtomicI32::new(-1);
 
-pub fn netd_pid() -> Result<Pid, NetError> {
-    let cached = NETD_PID.load(Ordering::Relaxed);
-    if cached != 0 {
-        return Ok(Pid::from_raw(cached));
+fn netd_fd() -> Result<Fd, NetError> {
+    let cached = NETD_FD.load(Ordering::Relaxed);
+    if cached >= 0 {
+        return Ok(Fd(cached));
     }
     for _ in 0..100 {
-        if let Some(pid) = syscall::find_pid("netd") {
-            NETD_PID.store(pid.0, Ordering::Relaxed);
-            return Ok(pid);
+        if let Ok(fd) = syscall::connect("netd") {
+            NETD_FD.store(fd.0, Ordering::Relaxed);
+            return Ok(fd);
         }
-        syscall::nanosleep(10_000_000); // 10ms
+        syscall::nanosleep(10_000_000);
     }
     Err(NetError::NetdNotFound)
 }
@@ -276,27 +276,47 @@ pub fn netd_pid() -> Result<Pid, NetError> {
 // ---------------------------------------------------------------------------
 
 pub fn send_to_netd<T: Copy>(msg_type: u32, payload: &T) -> Result<(), NetError> {
-    let pid = netd_pid()?;
-    message::send(pid, msg_type, payload);
-    Ok(())
+    let fd = netd_fd()?;
+    ipc::send(fd, msg_type, payload).map_err(|_| NetError::Other)
 }
 
 pub fn send_bytes_to_netd(msg_type: u32, data: &[u8]) -> Result<(), NetError> {
-    let pid = netd_pid()?;
-    message::send_bytes(pid, msg_type, data);
-    Ok(())
+    let fd = netd_fd()?;
+    ipc::send_bytes(fd, msg_type, data).map_err(|_| NetError::Other)
 }
 
-pub fn recv_from_netd() -> Message {
-    message::recv()
+/// Receive a response header from netd, check for errors.
+pub fn recv_response_header() -> Result<IpcHeader, NetError> {
+    let fd = netd_fd()?;
+    let header = ipc::recv_header(fd);
+    check_response(&header)?;
+    Ok(header)
 }
 
-pub fn check_response(msg: &Message) -> Result<(), NetError> {
-    if msg.msg_type == MSG_ERROR {
-        let err: ErrorResponse = msg.payload();
+/// Receive a typed payload from the last response header.
+pub fn recv_payload<T: Copy>(header: &IpcHeader) -> T {
+    let fd = netd_fd().unwrap();
+    ipc::recv_payload(fd, header)
+}
+
+/// Receive raw bytes from the last response header.
+pub fn recv_bytes(header: &IpcHeader, buf: &mut [u8]) -> usize {
+    let fd = netd_fd().unwrap();
+    ipc::recv_bytes(fd, header, buf)
+}
+
+fn recv_header_from_netd() -> Result<IpcHeader, NetError> {
+    let fd = netd_fd()?;
+    Ok(ipc::recv_header(fd))
+}
+
+fn check_response(header: &IpcHeader) -> Result<(), NetError> {
+    if header.msg_type == MSG_ERROR {
+        let fd = netd_fd().unwrap();
+        let err: ErrorResponse = ipc::recv_payload(fd, header);
         return Err(NetError::from_error_code(err.code));
     }
-    if msg.msg_type != MSG_RESULT {
+    if header.msg_type != MSG_RESULT {
         return Err(NetError::UnexpectedResponse);
     }
     Ok(())
@@ -305,9 +325,10 @@ pub fn check_response(msg: &Message) -> Result<(), NetError> {
 /// Send a typed request to netd and receive a typed response.
 fn request<Req: Copy, Resp: Copy>(msg_type: u32, payload: &Req) -> Result<Resp, NetError> {
     send_to_netd(msg_type, payload)?;
-    let msg = recv_from_netd();
-    check_response(&msg)?;
-    Ok(msg.payload())
+    let header = recv_header_from_netd()?;
+    check_response(&header)?;
+    let fd = netd_fd().unwrap();
+    Ok(ipc::recv_payload(fd, &header))
 }
 
 // ---------------------------------------------------------------------------
@@ -334,9 +355,9 @@ pub fn tcp_connect(
         rx_pipe_id,
         tx_pipe_id,
     })?;
-    let msg = recv_from_netd();
+    let header = recv_header_from_netd()?;
 
-    if let Err(e) = check_response(&msg) {
+    if let Err(e) = check_response(&header) {
         syscall::close(rx_pipe.read);
         syscall::close(rx_pipe.write);
         syscall::close(tx_pipe.read);
@@ -344,7 +365,8 @@ pub fn tcp_connect(
         return Err(e);
     }
 
-    let resp: TcpConnectResponse = msg.payload();
+    let fd = netd_fd().unwrap();
+    let resp: TcpConnectResponse = ipc::recv_payload(fd, &header);
 
     // Close the ends netd opened via pipe_open
     syscall::close(rx_pipe.write);
@@ -368,15 +390,16 @@ pub fn tcp_bind(addr: [u8; 4], port: u16) -> Result<TcpBound, NetError> {
         _pad: 0,
         notify_pipe_id,
     })?;
-    let msg = recv_from_netd();
+    let header = recv_header_from_netd()?;
 
-    if let Err(e) = check_response(&msg) {
+    if let Err(e) = check_response(&header) {
         syscall::close(notify_pipe.read);
         syscall::close(notify_pipe.write);
         return Err(e);
     }
 
-    let resp: TcpBindResponse = msg.payload();
+    let fd = netd_fd().unwrap();
+    let resp: TcpBindResponse = ipc::recv_payload(fd, &header);
 
     // Close our write end — netd opened its own via pipe_open
     syscall::close(notify_pipe.write);
@@ -401,9 +424,9 @@ pub fn tcp_accept(socket_id: u32) -> Result<TcpAccepted, NetError> {
         rx_pipe_id,
         tx_pipe_id,
     })?;
-    let msg = recv_from_netd();
+    let header = recv_header_from_netd()?;
 
-    if let Err(e) = check_response(&msg) {
+    if let Err(e) = check_response(&header) {
         syscall::close(rx_pipe.read);
         syscall::close(rx_pipe.write);
         syscall::close(tx_pipe.read);
@@ -411,7 +434,8 @@ pub fn tcp_accept(socket_id: u32) -> Result<TcpAccepted, NetError> {
         return Err(e);
     }
 
-    let resp: TcpAcceptPipedResponse = msg.payload();
+    let fd = netd_fd().unwrap();
+    let resp: TcpAcceptPipedResponse = ipc::recv_payload(fd, &header);
 
     // Close the ends netd opened via pipe_open
     syscall::close(rx_pipe.write);
@@ -470,9 +494,9 @@ pub fn udp_bind(addr: [u8; 4], port: u16) -> Result<UdpBound, NetError> {
         tx_pipe_id,
         rx_pipe_id,
     })?;
-    let msg = recv_from_netd();
+    let header = recv_header_from_netd()?;
 
-    if let Err(e) = check_response(&msg) {
+    if let Err(e) = check_response(&header) {
         syscall::close(tx_pipe.read);
         syscall::close(tx_pipe.write);
         syscall::close(rx_pipe.read);
@@ -480,7 +504,8 @@ pub fn udp_bind(addr: [u8; 4], port: u16) -> Result<UdpBound, NetError> {
         return Err(e);
     }
 
-    let resp: UdpBindResponse = msg.payload();
+    let fd = netd_fd().unwrap();
+    let resp: UdpBindResponse = ipc::recv_payload(fd, &header);
 
     // Close the ends netd opened via pipe_open
     syscall::close(tx_pipe.read);

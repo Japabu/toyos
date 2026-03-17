@@ -2,12 +2,17 @@ use alloc::alloc::{alloc_zeroed, dealloc};
 use alloc::vec::Vec;
 use core::alloc::Layout;
 
-use toyos_abi::ring::RingHeader;
+use toyos_abi::ring::{RingHeader, RING_READER_CLOSED, RING_WRITER_CLOSED};
 
 use crate::arch::paging::{self, PAGE_2M};
 use crate::id_map::{IdKey, IdMap};
 use crate::sync::Lock;
 use crate::PhysAddr;
+
+// ---------------------------------------------------------------------------
+// PipeId — raw identifier, Copy, used internally for lookups and in
+// ProcessState. Does NOT carry a refcount. Not public outside the kernel.
+// ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct PipeId(usize);
@@ -27,6 +32,56 @@ impl IdKey for PipeId {
     const ONE: Self = PipeId(1);
 }
 
+// ---------------------------------------------------------------------------
+// PipeReader / PipeWriter — owned refcounted references.
+// Creation bumps, Drop decrements. Clone bumps. No other way to get one.
+// ---------------------------------------------------------------------------
+
+/// Owned reader reference to a pipe. Bumps reader refcount on creation/clone,
+/// decrements on drop. Like Arc but for pipe reader slots.
+pub struct PipeReader(PipeId);
+
+/// Owned writer reference to a pipe. Same semantics as PipeReader but for writers.
+pub struct PipeWriter(PipeId);
+
+impl PipeReader {
+    pub fn id(&self) -> PipeId { self.0 }
+}
+
+impl PipeWriter {
+    pub fn id(&self) -> PipeId { self.0 }
+}
+
+impl Clone for PipeReader {
+    fn clone(&self) -> Self {
+        add_reader(self.0);
+        Self(self.0)
+    }
+}
+
+impl Clone for PipeWriter {
+    fn clone(&self) -> Self {
+        add_writer(self.0);
+        Self(self.0)
+    }
+}
+
+impl Drop for PipeReader {
+    fn drop(&mut self) {
+        close_read(self.0);
+    }
+}
+
+impl Drop for PipeWriter {
+    fn drop(&mut self) {
+        close_write(self.0);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pipe internals
+// ---------------------------------------------------------------------------
+
 const PIPE_SIZE: usize = PAGE_2M as usize;
 
 struct Pipe {
@@ -34,12 +89,9 @@ struct Pipe {
     layout: Layout,
     readers: u32,
     writers: u32,
-    /// PML4 pointers of processes that have this pipe mapped (for unmap on free).
     mapped_in: Vec<*mut u64>,
 }
 
-// SAFETY: mapped_in contains raw PML4 pointers — physical addresses valid across CPUs.
-// Access is serialized by the PIPES lock.
 unsafe impl Send for Pipe {}
 
 impl Pipe {
@@ -48,13 +100,7 @@ impl Pipe {
         let ptr = unsafe { alloc_zeroed(layout) };
         assert!(!ptr.is_null(), "pipe: allocation failed");
         RingHeader::init(ptr, PIPE_SIZE);
-        Self {
-            phys_addr: PhysAddr::from_ptr(ptr),
-            layout,
-            readers: 1,
-            writers: 1,
-            mapped_in: Vec::new(),
-        }
+        Self { phys_addr: PhysAddr::from_ptr(ptr), layout, readers: 0, writers: 0, mapped_in: Vec::new() }
     }
 
     fn header(&self) -> &RingHeader {
@@ -78,16 +124,37 @@ pub fn init() {
     *PIPES.lock() = Some(IdMap::new());
 }
 
-#[must_use]
-pub fn create() -> PipeId {
-    with_pipes_mut(|pipes| pipes.insert(Pipe::new()))
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+/// Create a new pipe. Returns owned reader + writer references.
+pub fn create() -> (PipeReader, PipeWriter) {
+    let id = with_pipes_mut(|pipes| pipes.insert(Pipe::new()));
+    // Bump refcounts for the initial reader and writer.
+    add_reader(id);
+    add_writer(id);
+    (PipeReader(id), PipeWriter(id))
+}
+
+/// Open an existing pipe by raw ID (for cross-process pipe sharing).
+/// Returns a new owned reference.
+pub fn open_reader(id: PipeId) -> Option<PipeReader> {
+    if !exists(id) { return None; }
+    add_reader(id);
+    Some(PipeReader(id))
+}
+
+pub fn open_writer(id: PipeId) -> Option<PipeWriter> {
+    if !exists(id) { return None; }
+    add_writer(id);
+    Some(PipeWriter(id))
 }
 
 pub fn exists(pipe_id: PipeId) -> bool {
     with_pipes(|pipes| pipes.get(pipe_id).is_some())
 }
 
-/// Returns bytes read, 0 for EOF, None if would block.
 pub fn try_read(pipe_id: PipeId, buf: &mut [u8]) -> Option<usize> {
     with_pipes(|pipes| {
         let pipe = pipes.get(pipe_id)?;
@@ -107,7 +174,6 @@ pub enum PipeWrite {
     BrokenPipe,
 }
 
-/// Returns Wrote(n), BrokenPipe, or None if would block.
 pub fn try_write(pipe_id: PipeId, buf: &[u8]) -> Option<PipeWrite> {
     with_pipes(|pipes| {
         let pipe = pipes.get(pipe_id)?;
@@ -142,31 +208,46 @@ pub fn all_empty() -> bool {
     with_pipes(|pipes| pipes.iter().all(|(_, pipe)| pipe.header().available() == 0))
 }
 
-pub fn add_reader(pipe_id: PipeId) {
+pub fn cleanup_pml4(pml4: *mut u64) {
+    with_pipes_mut(|pipes| {
+        for (_, pipe) in pipes.iter_mut() {
+            pipe.mapped_in.retain(|p| *p != pml4);
+        }
+    });
+}
+
+pub fn map_into(pipe_id: PipeId, pml4: *mut u64) -> Option<u64> {
+    with_pipes_mut(|pipes| {
+        let pipe = pipes.get_mut(pipe_id)?;
+        paging::map_user_in(pml4, pipe.phys_addr, PIPE_SIZE as u64);
+        if !pipe.mapped_in.contains(&pml4) {
+            pipe.mapped_in.push(pml4);
+        }
+        Some(pipe.phys_addr.raw())
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Internal refcount management (called by PipeReader/PipeWriter)
+// ---------------------------------------------------------------------------
+
+fn add_reader(pipe_id: PipeId) {
     with_pipes_mut(|pipes| {
         let pipe = pipes.get_mut(pipe_id).expect("add_reader: pipe not found");
         pipe.readers = pipe.readers.checked_add(1).expect("pipe reader overflow");
+        pipe.header().flags.fetch_and(!RING_READER_CLOSED, core::sync::atomic::Ordering::Release);
     });
 }
 
-pub fn add_writer(pipe_id: PipeId) {
+fn add_writer(pipe_id: PipeId) {
     with_pipes_mut(|pipes| {
         let pipe = pipes.get_mut(pipe_id).expect("add_writer: pipe not found");
         pipe.writers = pipe.writers.checked_add(1).expect("pipe writer overflow");
+        pipe.header().flags.fetch_and(!RING_WRITER_CLOSED, core::sync::atomic::Ordering::Release);
     });
 }
 
-fn free_pipe(pipe: Pipe) {
-    // Unmap USER bit from all processes' page tables before freeing memory.
-    // Without this, the freed pages retain USER bit, and if the heap reuses
-    // this memory for kernel stacks, SMAP violations occur during context_switch.
-    for &pml4 in &pipe.mapped_in {
-        paging::unmap_user(pml4, pipe.phys_addr, PIPE_SIZE as u64);
-    }
-    unsafe { dealloc(pipe.phys_addr.as_mut_ptr(), pipe.layout); }
-}
-
-pub fn close_read(pipe_id: PipeId) {
+fn close_read(pipe_id: PipeId) {
     with_pipes_mut(|pipes| {
         let pipe = pipes.get_mut(pipe_id).expect("close_read: pipe not found");
         pipe.readers = pipe.readers.checked_sub(1).expect("pipe reader underflow");
@@ -180,7 +261,7 @@ pub fn close_read(pipe_id: PipeId) {
     });
 }
 
-pub fn close_write(pipe_id: PipeId) {
+fn close_write(pipe_id: PipeId) {
     with_pipes_mut(|pipes| {
         let pipe = pipes.get_mut(pipe_id).expect("close_write: pipe not found");
         pipe.writers = pipe.writers.checked_sub(1).expect("pipe writer underflow");
@@ -194,25 +275,9 @@ pub fn close_write(pipe_id: PipeId) {
     });
 }
 
-/// Remove a PML4 from all pipes' mapped_in lists (called during process exit).
-/// Does NOT unmap — the page tables are about to be freed anyway.
-pub fn cleanup_pml4(pml4: *mut u64) {
-    with_pipes_mut(|pipes| {
-        for (_, pipe) in pipes.iter_mut() {
-            pipe.mapped_in.retain(|p| *p != pml4);
-        }
-    });
-}
-
-/// Map a pipe's shared memory into a process's address space.
-/// Returns the physical address (user processes see this as their virtual address).
-pub fn map_into(pipe_id: PipeId, pml4: *mut u64) -> Option<u64> {
-    with_pipes_mut(|pipes| {
-        let pipe = pipes.get_mut(pipe_id)?;
-        paging::map_user_in(pml4, pipe.phys_addr, PIPE_SIZE as u64);
-        if !pipe.mapped_in.contains(&pml4) {
-            pipe.mapped_in.push(pml4);
-        }
-        Some(pipe.phys_addr.raw())
-    })
+fn free_pipe(pipe: Pipe) {
+    for &pml4 in &pipe.mapped_in {
+        paging::unmap_user(pml4, pipe.phys_addr, PIPE_SIZE as u64);
+    }
+    unsafe { dealloc(pipe.phys_addr.as_mut_ptr(), pipe.layout); }
 }

@@ -5,7 +5,7 @@ pub mod boot;
 pub mod device;
 pub mod gpu;
 pub mod input;
-pub mod message;
+pub mod ipc;
 pub mod net;
 pub mod pipe;
 pub mod poll;

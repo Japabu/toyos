@@ -32,7 +32,7 @@ mod clock;
 mod rtc;
 mod fd;
 mod pipe;
-mod message;
+mod listener;
 mod device;
 mod net;
 mod gpu;
@@ -184,6 +184,7 @@ fn kernel_main(
     vfs::init();
     process::init();
     pipe::init();
+    listener::init();
     shared_memory::init();
 
     // Mount initrd ramdisk

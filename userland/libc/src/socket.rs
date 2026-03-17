@@ -449,12 +449,11 @@ pub unsafe extern "C" fn sendto(
                 set_errno(EIO);
                 return -1;
             }
-            let resp = recv_from_netd();
-            if let Err(e) = check_response(&resp) {
-                set_errno(net_err_to_errno(e));
-                return -1;
-            }
-            let sent: u32 = resp.payload();
+            let header = match recv_response_header() {
+                Ok(h) => h,
+                Err(e) => { set_errno(net_err_to_errno(e)); return -1; }
+            };
+            let sent: u32 = recv_payload(&header);
             sent as isize
         }
     }
@@ -495,12 +494,11 @@ pub unsafe extern "C" fn recvfrom(
                 set_errno(EIO);
                 return -1;
             }
-            let resp = recv_from_netd();
-            if let Err(e) = check_response(&resp) {
-                set_errno(net_err_to_errno(e));
-                return -1;
-            }
-            let recv_resp: UdpRecvResponse = resp.payload();
+            let header = match recv_response_header() {
+                Ok(h) => h,
+                Err(e) => { set_errno(net_err_to_errno(e)); return -1; }
+            };
+            let recv_resp: UdpRecvResponse = recv_payload(&header);
 
             if !src_addr.is_null() && !addrlen.is_null() {
                 fill_sockaddr(src_addr, addrlen, recv_resp.addr, recv_resp.port);
@@ -727,15 +725,16 @@ pub unsafe extern "C" fn getaddrinfo(
     if let Err(_) = send_bytes_to_netd(MSG_DNS_LOOKUP, name) {
         return -1;
     }
-    let resp = recv_from_netd();
-    if let Err(_) = check_response(&resp) {
-        return -1; // EAI_FAIL
-    }
-
-    let resp_bytes = resp.bytes();
-    if resp_bytes.is_empty() {
+    let header = match recv_response_header() {
+        Ok(h) => h,
+        Err(_) => return -1,
+    };
+    let mut resp_bytes = [0u8; 256];
+    let resp_len = recv_bytes(&header, &mut resp_bytes);
+    if resp_len == 0 {
         return -1;
     }
+    let resp_bytes = &resp_bytes[..resp_len];
     let count = resp_bytes[0] as usize;
     if count == 0 {
         return -1; // EAI_NONAME
@@ -744,12 +743,12 @@ pub unsafe extern "C" fn getaddrinfo(
     let mut addrs = Vec::new();
     let mut offset = 1usize;
     for _ in 0..count {
-        if offset + 5 > resp_bytes.len() {
+        if offset + 5 > resp_len {
             break;
         }
         let addr_type = resp_bytes[offset];
         offset += 1;
-        if addr_type == 4 && offset + 4 <= resp_bytes.len() {
+        if addr_type == 4 && offset + 4 <= resp_len {
             let mut ip = [0u8; 4];
             ip.copy_from_slice(&resp_bytes[offset..offset + 4]);
             offset += 4;
