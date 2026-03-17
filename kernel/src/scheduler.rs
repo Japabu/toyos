@@ -59,6 +59,7 @@ fn schedule_inner(mut guard: crate::sync::LockGuard<'_, Option<ProcessTable>>) {
     let table = guard.as_mut().unwrap();
     let cur_pid = percpu::current_pid().expect("schedule_inner() called during idle");
     let cur_alive = table.get(cur_pid).is_some();
+    let now = crate::clock::nanos_since_boot();
 
     idle_poll(table);
 
@@ -95,15 +96,20 @@ fn schedule_inner(mut guard: crate::sync::LockGuard<'_, Option<ProcessTable>>) {
         let new_fs_base = new_entry.fs_base();
         let new_ks_top = new_entry.kernel_stack_top();
 
-        table.get_mut(new_pid).unwrap().set_state(ProcessState::Running);
-        percpu::set_current_pid(Some(new_pid));
-
+        // Save current process state + stop CPU timer
         let old_rsp_ptr = if let Some(cur_entry) = table.get_mut(cur_pid) {
+            cur_entry.stop_cpu_timer(now);
             cur_entry.set_fs_base(cpu::rdmsr(IA32_FS_BASE));
             cur_entry.kernel_rsp_mut() as *mut u64
         } else {
             percpu::idle_rsp_ptr()
         };
+
+        // Start new process + start CPU timer
+        let new_entry = table.get_mut(new_pid).unwrap();
+        new_entry.set_state(ProcessState::Running);
+        new_entry.start_cpu_timer(now);
+        percpu::set_current_pid(Some(new_pid));
         unsafe { percpu::set_kernel_stack(new_ks_top); }
 
         unsafe { cpu::write_cr3(new_cr3); }
@@ -118,6 +124,7 @@ fn schedule_inner(mut guard: crate::sync::LockGuard<'_, Option<ProcessTable>>) {
 
     // No Ready process — switch to per-CPU idle stack.
     let old_rsp_ptr = if let Some(cur_entry) = table.get_mut(cur_pid) {
+        cur_entry.stop_cpu_timer(now);
         cur_entry.set_fs_base(cpu::rdmsr(IA32_FS_BASE));
         cur_entry.kernel_rsp_mut() as *mut u64
     } else {
@@ -199,7 +206,9 @@ fn cpu_idle_loop() -> ! {
                 let new_fs_base = new_entry.fs_base();
                 let new_ks_top = new_entry.kernel_stack_top();
 
-                table.get_mut(new_pid).unwrap().set_state(ProcessState::Running);
+                let new_entry = table.get_mut(new_pid).unwrap();
+                new_entry.set_state(ProcessState::Running);
+                new_entry.start_cpu_timer(crate::clock::nanos_since_boot());
                 percpu::set_current_pid(Some(new_pid));
                 unsafe { percpu::set_kernel_stack(new_ks_top); }
 

@@ -203,6 +203,11 @@ pub struct SchedEntry {
     name: [u8; 28],
     /// Snapshot of allocated memory size (elf + stack) for sysinfo reporting.
     memory_size: u64,
+    /// Accumulated CPU time in nanoseconds.
+    cpu_ns: u64,
+    /// Timestamp (nanos_since_boot) when this process was last scheduled in.
+    /// Zero when not running.
+    scheduled_at: u64,
     /// Per-process data behind its own lock. Syscalls clone this Arc, drop the
     /// table lock, then lock ProcessData — so different processes never contend.
     data: Arc<Lock<ProcessData>>,
@@ -222,7 +227,7 @@ impl SchedEntry {
         memory_size: u64,
         data: Arc<Lock<ProcessData>>,
     ) -> Self {
-        Self { pid, state, kind, cr3, kernel_stack, kernel_rsp, fs_base, heap_owner, name, memory_size, data }
+        Self { pid, state, kind, cr3, kernel_stack, kernel_rsp, fs_base, heap_owner, name, memory_size, cpu_ns: 0, scheduled_at: 0, data }
     }
 
     // --- Read-only getters ---
@@ -234,6 +239,16 @@ impl SchedEntry {
     pub fn name(&self) -> &[u8; 28] { &self.name }
     pub fn memory_size(&self) -> u64 { self.memory_size }
     pub fn data(&self) -> &Arc<Lock<ProcessData>> { &self.data }
+
+    /// Total CPU time in nanoseconds, including time for the current quantum
+    /// if this process is currently running.
+    pub fn cpu_ns(&self) -> u64 {
+        if self.scheduled_at > 0 {
+            self.cpu_ns + (crate::clock::nanos_since_boot() - self.scheduled_at)
+        } else {
+            self.cpu_ns
+        }
+    }
     pub fn cr3(&self) -> Option<PageTableRoot> { self.cr3 }
     pub fn fs_base(&self) -> u64 { self.fs_base }
 
@@ -245,6 +260,19 @@ impl SchedEntry {
     pub fn kernel_rsp(&self) -> u64 { self.kernel_rsp }
     pub fn kernel_rsp_mut(&mut self) -> &mut u64 { &mut self.kernel_rsp }
     pub fn set_fs_base(&mut self, val: u64) { self.fs_base = val; }
+
+    /// Called when this process is being switched OUT. Accumulates elapsed CPU time.
+    pub fn stop_cpu_timer(&mut self, now: u64) {
+        if self.scheduled_at > 0 {
+            self.cpu_ns += now - self.scheduled_at;
+            self.scheduled_at = 0;
+        }
+    }
+
+    /// Called when this process is being switched IN. Records the start timestamp.
+    pub fn start_cpu_timer(&mut self, now: u64) {
+        self.scheduled_at = now;
+    }
 
     // --- State machine ---
 
@@ -1510,10 +1538,10 @@ fn teardown_scheduling(table: &mut ProcessTable, pid: Pid, code: i32) {
     crate::pipe::cleanup_pml4(pml4);
     paging::free_user_page_tables(pml4);
     let has_parent = matches!(entry.kind(), Kind::Process { parent: Some(_) });
+    let cpu_ms = entry.cpu_ns() / 1_000_000;
     entry.zombify(code);
     let name = core::str::from_utf8(entry.name()).unwrap_or("?").trim_end_matches('\0');
-    log!("exit: {name} pid={pid} code={code}");
-
+    log!("exit: {name} pid={pid} code={code} cpu={cpu_ms}ms");
 
     // Collect orphaned child processes: remove zombies, detach running ones.
     let orphans: Vec<Pid> = table.iter()
@@ -1606,9 +1634,10 @@ pub fn thread_exit(code: i32) -> ! {
             let mut guard = PROCESS_TABLE.lock();
             let table = guard.as_mut().unwrap();
             let pid = current_pid();
+            let cpu_ms = table.get(pid).unwrap().cpu_ns() / 1_000_000;
             table.get_mut(pid).unwrap().zombify(code);
             let name = core::str::from_utf8(table.get(pid).unwrap().name()).unwrap_or("?").trim_end_matches('\0');
-            log!("exit: {name} pid={pid} code={code}");
+            log!("exit: {name} pid={pid} code={code} cpu={cpu_ms}ms");
 
             // Wake parent if blocked on thread_join
             if let Some(p) = table.get_mut(parent) {

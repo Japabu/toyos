@@ -79,18 +79,25 @@ pub(super) extern "sysv64" fn timer_entry() {
         "swapgs",
         "iretq",
 
-        // Ring 0: EOI + count idle tick
+        // Ring 0: EOI + count tick. If a process is running (syscall),
+        // count as busy. If idle (current_pid == u32::MAX), count as idle.
         "2:",
         "push rax",
         "push rdx",
         "mov rdx, [rip + LAPIC_BASE]",
         "mov dword ptr [rdx + 0xB0], 0",
         "lock inc qword ptr [rip + {total_ticks}]",
+        "mov eax, gs:[136]",  // current_pid (u32::MAX = idle)
+        "cmp eax, 0xFFFFFFFF",
+        "je 3f",
+        "lock inc qword ptr [rip + {busy_ticks}]",
+        "3:",
         "pop rdx",
         "pop rax",
         "iretq",
         handler = sym timer_handler,
         total_ticks = sym CPU_TOTAL_TICKS,
+        busy_ticks = sym CPU_BUSY_TICKS,
     );
 }
 

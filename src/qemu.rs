@@ -5,7 +5,7 @@ pub fn launch(debug: bool, dump_audio: bool) {
     qemu
         .arg("-machine").arg("q35")
         .arg("-cpu").arg("qemu64,+rdrand,+smap")
-        .arg("-smp").arg("1")
+        .arg("-smp").arg("cores=2")
         .arg("-m").arg("8G")
         // Flash the OVMF UEFI firmware
         .arg("-drive").arg("if=pflash,format=raw,unit=0,file=ovmf/OVMF_CODE-pure-efi.fd,readonly=on")

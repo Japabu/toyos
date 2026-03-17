@@ -6,11 +6,13 @@ mod locale;
 mod ls;
 mod mkdir;
 mod net;
+mod ps;
 mod pwd;
 mod rm;
 mod screen;
 mod shutdown;
 mod spin;
+mod tone;
 
 macro_rules! commands {
     ($($name:ident),*) => {
@@ -35,7 +37,7 @@ macro_rules! commands {
     };
 }
 
-commands!(cat, echo, free, grep, locale, ls, mkdir, net, pwd, rm, screen, shutdown, spin);
+commands!(cat, echo, free, grep, locale, ls, mkdir, net, ps, pwd, rm, screen, shutdown, spin, tone);
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();

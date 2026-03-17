@@ -1,5 +1,4 @@
 use core::ffi::c_void;
-use std::collections::VecDeque;
 use std::num::NonZeroU32;
 use std::ptr::addr_of_mut;
 use std::sync::{Arc, Mutex};
@@ -143,14 +142,11 @@ pub static DG_music_module: MusicModule = MusicModule {
 
 const NUM_SFX_CHANNELS: usize = 16;
 const OUTPUT_RATE: u32 = 44100;
-const SAMPLES_PER_TICK: usize = OUTPUT_RATE as usize / 35; // ~1260
-const MIX_BUF_SAMPLES: usize = SAMPLES_PER_TICK * 2; // stereo
 
 struct CachedSound {
     samples: Vec<i16>,
 }
 
-#[derive(Clone, Copy)]
 struct Channel {
     sound: *const CachedSound,
     pos: u32,
@@ -159,21 +155,71 @@ struct Channel {
     sfxinfo: *mut SfxInfo,
 }
 
-const EMPTY_CHANNEL: Channel = Channel {
-    sound: core::ptr::null(),
-    pos: 0,
-    vol_left: 0,
-    vol_right: 0,
-    sfxinfo: core::ptr::null_mut(),
-};
+unsafe impl Send for Channel {}
 
-static mut SND_CHANNELS: [Channel; NUM_SFX_CHANNELS] = [EMPTY_CHANNEL; NUM_SFX_CHANNELS];
+impl Channel {
+    const EMPTY: Self = Channel {
+        sound: core::ptr::null(),
+        pos: 0,
+        vol_left: 0,
+        vol_right: 0,
+        sfxinfo: core::ptr::null_mut(),
+    };
+}
+
+struct Mixer {
+    channels: [Channel; NUM_SFX_CHANNELS],
+}
+
+unsafe impl Send for Mixer {}
+
+impl Mixer {
+    fn new() -> Self {
+        Mixer {
+            channels: std::array::from_fn(|_| Channel::EMPTY),
+        }
+    }
+
+    /// Mix stereo i16 samples directly into the output buffer.
+    /// Called from the cpal audio callback at hardware rate.
+    fn fill(&mut self, data: &mut [i16]) {
+        // Zero the output
+        for s in data.iter_mut() {
+            *s = 0;
+        }
+
+        let frames = data.len() / 2;
+
+        for ch in &mut self.channels {
+            if ch.sound.is_null() {
+                continue;
+            }
+
+            let snd = unsafe { &*ch.sound };
+            let remaining = snd.samples.len() as u32 - ch.pos;
+            let to_mix = remaining.min(frames as u32);
+
+            for i in 0..to_mix as usize {
+                let sample = snd.samples[ch.pos as usize + i] as i32;
+                let left = (sample * ch.vol_left / 255).clamp(-32768, 32767);
+                let right = (sample * ch.vol_right / 255).clamp(-32768, 32767);
+                data[i * 2] = (data[i * 2] as i32 + left).clamp(-32768, 32767) as i16;
+                data[i * 2 + 1] = (data[i * 2 + 1] as i32 + right).clamp(-32768, 32767) as i16;
+            }
+
+            ch.pos += to_mix;
+            if ch.pos >= snd.samples.len() as u32 {
+                ch.sound = core::ptr::null();
+                ch.sfxinfo = core::ptr::null_mut();
+            }
+        }
+    }
+}
+
 static mut SND_INITIALIZED: bool = false;
 static mut SND_USE_SFX_PREFIX: bool = false;
-static mut MIX_BUF: [i32; MIX_BUF_SAMPLES] = [0; MIX_BUF_SAMPLES];
-static mut OUT_BUF: [i16; MIX_BUF_SAMPLES] = [0; MIX_BUF_SAMPLES];
 
-static mut AUDIO_RING: Option<Arc<Mutex<VecDeque<i16>>>> = None;
+static mut MIXER: Option<Arc<Mutex<Mixer>>> = None;
 // Keep the stream alive — dropping it stops playback.
 static mut _AUDIO_STREAM: Option<cpal::Stream> = None;
 
@@ -242,10 +288,9 @@ unsafe extern "C" fn toyos_init_sound(use_sfx_prefix: bool) -> bool {
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
     SND_USE_SFX_PREFIX = use_sfx_prefix;
-    SND_CHANNELS = [EMPTY_CHANNEL; NUM_SFX_CHANNELS];
 
-    let ring = Arc::new(Mutex::new(VecDeque::<i16>::with_capacity(OUTPUT_RATE as usize)));
-    AUDIO_RING = Some(ring.clone());
+    let mixer = Arc::new(Mutex::new(Mixer::new()));
+    MIXER = Some(mixer.clone());
 
     let host = cpal::default_host();
     let device = host.default_output_device().expect("no audio output device");
@@ -254,10 +299,8 @@ unsafe extern "C" fn toyos_init_sound(use_sfx_prefix: bool) -> bool {
         .build_output_stream(
             config.into(),
             move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
-                let mut ring = ring.lock().unwrap();
-                for sample in data.iter_mut() {
-                    *sample = ring.pop_front().unwrap_or(0);
-                }
+                let mut mixer = mixer.lock().unwrap();
+                mixer.fill(data);
             },
             |err| eprintln!("audio stream error: {err}"),
             None,
@@ -298,57 +341,20 @@ unsafe extern "C" fn toyos_get_sfx_lump_num(sfx: *mut SfxInfo) -> i32 {
 }
 
 unsafe extern "C" fn toyos_update_sound() {
-    if !SND_INITIALIZED {
-        return;
-    }
-
-    MIX_BUF = [0; MIX_BUF_SAMPLES];
-
-    for ch in 0..NUM_SFX_CHANNELS {
-        let c = &mut SND_CHANNELS[ch];
-        if c.sound.is_null() {
-            continue;
-        }
-
-        let snd = &*c.sound;
-        let remaining = snd.samples.len() as u32 - c.pos;
-        let to_mix = remaining.min(SAMPLES_PER_TICK as u32);
-
-        for i in 0..to_mix as usize {
-            let sample = snd.samples[c.pos as usize + i] as i32;
-            MIX_BUF[i * 2] += sample * c.vol_left / 255;
-            MIX_BUF[i * 2 + 1] += sample * c.vol_right / 255;
-        }
-
-        c.pos += to_mix;
-        if c.pos >= snd.samples.len() as u32 {
-            c.sound = core::ptr::null();
-            c.sfxinfo = core::ptr::null_mut();
-        }
-    }
-
-    for i in 0..MIX_BUF_SAMPLES {
-        OUT_BUF[i] = MIX_BUF[i].clamp(-32768, 32767) as i16;
-    }
-
-    if let Some(ring) = &*addr_of_mut!(AUDIO_RING) {
-        let mut ring = ring.lock().unwrap();
-        // Cap the ring buffer to ~100ms to avoid growing unbounded
-        const MAX_SAMPLES: usize = 44100 / 10 * 2;
-        if ring.len() < MAX_SAMPLES {
-            let out = core::ptr::addr_of!(OUT_BUF).read();
-            ring.extend(out.iter().copied());
-        }
-    }
+    // Mixing is done in the cpal audio callback (Mixer::fill).
+    // Nothing to do here.
 }
 
 unsafe extern "C" fn toyos_update_sound_params(handle: i32, vol: i32, sep: i32) {
     if !SND_INITIALIZED || handle < 0 || handle >= NUM_SFX_CHANNELS as i32 {
         return;
     }
-    let c = &mut SND_CHANNELS[handle as usize];
-    c.vol_left = ((254 - sep) * vol / 127).clamp(0, 255);
-    c.vol_right = (sep * vol / 127).clamp(0, 255);
+    if let Some(mixer) = &*addr_of_mut!(MIXER) {
+        let mut mixer = mixer.lock().unwrap();
+        let c = &mut mixer.channels[handle as usize];
+        c.vol_left = ((254 - sep) * vol / 127).clamp(0, 255);
+        c.vol_right = (sep * vol / 127).clamp(0, 255);
+    }
 }
 
 unsafe extern "C" fn toyos_start_sound(
@@ -361,19 +367,20 @@ unsafe extern "C" fn toyos_start_sound(
         return -1;
     }
 
-    let c = &mut SND_CHANNELS[channel as usize];
-    c.sound = core::ptr::null();
-    c.sfxinfo = core::ptr::null_mut();
-
     let snd = cache_sfx(sfxinfo);
     if snd.is_null() {
         return -1;
     }
 
-    c.sound = snd;
-    c.pos = 0;
-    c.sfxinfo = sfxinfo;
-    toyos_update_sound_params(channel, vol, sep);
+    if let Some(mixer) = &*addr_of_mut!(MIXER) {
+        let mut mixer = mixer.lock().unwrap();
+        let c = &mut mixer.channels[channel as usize];
+        c.sound = snd;
+        c.pos = 0;
+        c.sfxinfo = sfxinfo;
+        c.vol_left = ((254 - sep) * vol / 127).clamp(0, 255);
+        c.vol_right = (sep * vol / 127).clamp(0, 255);
+    }
 
     channel
 }
@@ -382,16 +389,24 @@ unsafe extern "C" fn toyos_stop_sound(handle: i32) {
     if !SND_INITIALIZED || handle < 0 || handle >= NUM_SFX_CHANNELS as i32 {
         return;
     }
-    let c = &mut SND_CHANNELS[handle as usize];
-    c.sound = core::ptr::null();
-    c.sfxinfo = core::ptr::null_mut();
+    if let Some(mixer) = &*addr_of_mut!(MIXER) {
+        let mut mixer = mixer.lock().unwrap();
+        let c = &mut mixer.channels[handle as usize];
+        c.sound = core::ptr::null();
+        c.sfxinfo = core::ptr::null_mut();
+    }
 }
 
 unsafe extern "C" fn toyos_sound_is_playing(handle: i32) -> bool {
     if !SND_INITIALIZED || handle < 0 || handle >= NUM_SFX_CHANNELS as i32 {
         return false;
     }
-    !SND_CHANNELS[handle as usize].sound.is_null()
+    if let Some(mixer) = &*addr_of_mut!(MIXER) {
+        let mixer = mixer.lock().unwrap();
+        !mixer.channels[handle as usize].sound.is_null()
+    } else {
+        false
+    }
 }
 
 // Stub music module (no music playback yet)
@@ -531,8 +546,6 @@ struct DoomApp {
 
 impl ApplicationHandler for DoomApp {
     fn can_create_surfaces(&mut self, event_loop: &dyn ActiveEventLoop) {
-        event_loop.set_control_flow(ControlFlow::Poll);
-
         let attrs = WindowAttributes::default()
             .with_title("DOOM")
             .with_surface_size(winit::dpi::LogicalSize::new(960, 600));
@@ -572,12 +585,15 @@ impl ApplicationHandler for DoomApp {
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &dyn ActiveEventLoop) {
+    fn about_to_wait(&mut self, event_loop: &dyn ActiveEventLoop) {
         if self.window.is_some() {
             unsafe { doomgeneric_Tick(); }
             if let Some(window) = &self.window {
                 window.request_redraw();
             }
+            // Doom paces itself via DG_SleepMs. Between ticks, block on events
+            // (input, compositor frames) instead of spinning.
+            event_loop.set_control_flow(ControlFlow::Wait);
         }
     }
 }
@@ -710,17 +726,8 @@ pub extern "C" fn DG_SetWindowTitle(_title: *const u8) {
 }
 
 #[no_mangle]
-pub extern "C" fn DG_AudioWrite(buf: *const u8, len: u32) {
-    if buf.is_null() || len == 0 {
-        return;
-    }
-    unsafe {
-        if let Some(ring) = &*addr_of_mut!(AUDIO_RING) {
-            let samples = core::slice::from_raw_parts(buf as *const i16, len as usize / 2);
-            let mut ring = ring.lock().unwrap();
-            ring.extend(samples.iter().copied());
-        }
-    }
+pub extern "C" fn DG_AudioWrite(_buf: *const u8, _len: u32) {
+    // Audio mixing is handled directly in the cpal callback via the shared Mixer.
 }
 
 fn main() {

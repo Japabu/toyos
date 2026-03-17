@@ -993,7 +993,7 @@ fn sys_thread_join(tid: u64) -> u64 {
 
 fn sys_sysinfo(buf: &mut [u8]) -> u64 {
     const HEADER_SIZE: usize = 48;
-    const ENTRY_SIZE: usize = 48;
+    const ENTRY_SIZE: usize = 56;
     if buf.len() < HEADER_SIZE {
         return SyscallError::InvalidArgument.to_u64();
     }
@@ -1038,6 +1038,7 @@ fn sys_sysinfo(buf: &mut [u8]) -> u64 {
             process::Kind::Process { parent } => (0u8, parent.unwrap_or(process::Pid::MAX)),
         };
         let memory = entry.memory_size();
+        let cpu_ns = entry.cpu_ns();
 
         buf[pos..pos + 4].copy_from_slice(&pid.raw().to_le_bytes());
         buf[pos + 4..pos + 8].copy_from_slice(&parent_pid.raw().to_le_bytes());
@@ -1045,7 +1046,8 @@ fn sys_sysinfo(buf: &mut [u8]) -> u64 {
         buf[pos + 9] = is_thread;
         buf[pos + 10..pos + 12].copy_from_slice(&[0, 0]);
         buf[pos + 12..pos + 20].copy_from_slice(&memory.to_le_bytes());
-        buf[pos + 20..pos + 48].copy_from_slice(entry.name());
+        buf[pos + 20..pos + 28].copy_from_slice(&cpu_ns.to_le_bytes());
+        buf[pos + 28..pos + 56].copy_from_slice(entry.name());
 
         pos += ENTRY_SIZE;
     }

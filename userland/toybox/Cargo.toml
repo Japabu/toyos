@@ -4,5 +4,6 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+cpal = { path = "../cpal" }
 window = { path = "../window" }
 toyos-abi = { path = "../../toyos-abi" }

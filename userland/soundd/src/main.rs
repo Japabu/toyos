@@ -166,7 +166,10 @@ fn main() {
             poll_fds.push(stream.control.0 as u64);
         }
 
-        let timeout = if streams.is_empty() { 100_000_000 } else { 0 };
+        // When idle (no streams), block for up to 100ms waiting for connections.
+        // When active, poll with 1ms timeout — fast enough for ~23ms DMA periods
+        // while avoiding busy-wait CPU burn.
+        let timeout = if streams.is_empty() { 100_000_000 } else { 1_000_000 };
         let result = toyos_poll::poll_timeout(&poll_fds, Some(timeout));
 
         if result.fd(0) {
@@ -199,9 +202,9 @@ fn main() {
             }
         }
 
-        // Yield when waiting for audio data or DMA completion
+        // Yield when all DMA buffers are in-flight
         if !streams.is_empty() && free_mask == 0 {
-            syscall::nanosleep(500_000);
+            syscall::nanosleep(1_000_000);
         }
     }
 }
