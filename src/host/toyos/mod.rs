@@ -15,13 +15,13 @@ const CHANNELS: u16 = 2;
 const SAMPLE_RATE: SampleRate = 44100;
 const BUFFER_FRAMES: u32 = 1024;
 
-/// soundd protocol constants (must match toyos_abi::audio).
+// soundd protocol (must match toyos_abi::audio)
 const MSG_AUDIO_OPEN: u32 = 1;
+const MSG_AUDIO_OPENED: u32 = 2;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct AudioOpenRequest {
-    pipe_id: u64,
     sample_rate: u32,
     channels: u16,
     format: u16,
@@ -31,6 +31,8 @@ struct AudioOpenRequest {
 #[derive(Clone, Copy)]
 struct AudioOpenResponse {
     stream_id: u32,
+    shm_token: u32,
+    ring_size: u32,
 }
 
 pub struct Host;
@@ -174,25 +176,23 @@ impl DeviceTrait for Device {
         let buffer_samples = buffer_frames as usize * channels;
         let buffer_bytes = buffer_samples * sample_size;
 
-        // Connect to soundd and open a stream
+        // Connect to soundd and request a stream
         let control = connect_soundd();
-        let pipe = toyos_abi::syscall::pipe();
-        let pipe_id = toyos_abi::syscall::pipe_id(pipe.read)
-            .expect("pipe_id failed");
-        toyos_abi::syscall::close(pipe.read);
-
         let req = AudioOpenRequest {
-            pipe_id,
             sample_rate: sample_rate as u32,
             channels: channels as u16,
             format: 0, // S16LE
         };
         toyos_abi::ipc::send(control, MSG_AUDIO_OPEN, &req).expect("soundd not responding");
 
-        // Wait for response on our dedicated control socket — no mixing
-        let (_msg_type, _response): (u32, AudioOpenResponse) = toyos_abi::ipc::recv(control).expect("soundd not responding");
+        // soundd allocates shared memory and sends us the token
+        let (msg_type, resp): (u32, AudioOpenResponse) =
+            toyos_abi::ipc::recv(control).expect("soundd not responding");
+        assert_eq!(msg_type, MSG_AUDIO_OPENED);
 
-        let write_fd = pipe.write;
+        // Map the shared memory ring
+        let shm = toyos_abi::shm::SharedMemory::map(resp.shm_token, resp.ring_size as usize);
+
         let playing = Arc::new(AtomicBool::new(false));
         let alive = Arc::new(AtomicBool::new(true));
         let playing2 = playing.clone();
@@ -201,8 +201,8 @@ impl DeviceTrait for Device {
         let thread = std::thread::Builder::new()
             .name("cpal-toyos-audio".to_string())
             .spawn(move || {
+                let ring = unsafe { &*(shm.as_ptr() as *const toyos_abi::ring::RingHeader) };
                 let mut buffer = vec![0u8; buffer_bytes];
-
                 while alive2.load(Ordering::Relaxed) {
                     if !playing2.load(Ordering::Relaxed) {
                         std::thread::sleep(Duration::from_millis(5));
@@ -210,32 +210,49 @@ impl DeviceTrait for Device {
                     }
 
                     let now = StreamInstant::new(0, 0);
-                    let timestamp = OutputStreamTimestamp {
+                    let info = OutputCallbackInfo::new(OutputStreamTimestamp {
                         callback: now,
                         playback: now,
-                    };
-                    let info = OutputCallbackInfo::new(timestamp);
+                    });
 
-                    // Fill buffer with silence first
                     crate::host::fill_with_equilibrium(&mut buffer, sample_format);
-
-                    // Let the user callback fill the buffer
                     let mut data = unsafe {
-                        Data::from_parts(
-                            buffer.as_mut_ptr() as *mut (),
-                            buffer_samples,
-                            sample_format,
-                        )
+                        Data::from_parts(buffer.as_mut_ptr() as *mut (), buffer_samples, sample_format)
                     };
                     data_callback(&mut data, &info);
 
-                    // Write to pipe — blocks when pipe buffer is full.
-                    // soundd drains at hardware rate, providing natural backpressure.
-                    let _ = toyos_abi::syscall::write(write_fd, &buffer);
+                    // Find the last non-zero byte — only write actual audio to the ring.
+                    // If the callback produced nothing (VecDeque empty), skip the write
+                    // entirely. soundd handles empty rings by outputting silence.
+                    let content_len = buffer.iter().rposition(|&b| b != 0)
+                        .map(|pos| (pos + 2) & !1)  // round up to sample boundary
+                        .unwrap_or(0)
+                        .min(buffer.len());
+
+                    if content_len > 0 {
+                        let mut written = 0;
+                        while written < content_len {
+                            let n = ring.write(&buffer[written..content_len]);
+                            written += n;
+                            if n == 0 {
+                                std::thread::sleep(Duration::from_millis(1));
+                            }
+                        }
+                        // Pace to hardware rate: sleep proportional to samples written.
+                        // This is what CoreAudio/ALSA do — call the callback at the
+                        // rate the hardware consumes, not as fast as possible.
+                        let samples_written = content_len / (channels * sample_size);
+                        let sleep_nanos = samples_written as u64 * 1_000_000_000 / sample_rate as u64;
+                        std::thread::sleep(Duration::from_nanos(sleep_nanos));
+                    } else {
+                        // App has no audio right now — sleep for one period and retry.
+                        let period_nanos = buffer_frames as u64 * 1_000_000_000 / sample_rate as u64;
+                        std::thread::sleep(Duration::from_nanos(period_nanos));
+                    }
+
                 }
 
-                // Close pipe to signal soundd
-                toyos_abi::syscall::close(write_fd);
+                ring.close_writer();
             })
             .map_err(|e| BuildStreamError::BackendSpecific {
                 err: crate::BackendSpecificError {
@@ -251,7 +268,6 @@ impl DeviceTrait for Device {
     }
 }
 
-/// Connect to soundd. Retries briefly if not yet started.
 fn connect_soundd() -> toyos_abi::Fd {
     for _ in 0..100 {
         if let Ok(fd) = toyos_abi::syscall::connect("soundd") {
