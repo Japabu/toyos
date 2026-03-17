@@ -197,7 +197,7 @@ impl Window {
         req.title_len = len as u8;
         ipc::send(fd, MSG_CREATE_WINDOW, &req).expect("compositor not responding");
 
-        let (msg_type, info): (u32, WindowInfo) = ipc::recv(fd);
+        let (msg_type, info): (u32, WindowInfo) = ipc::recv(fd).expect("compositor not responding");
         assert_eq!(msg_type, MSG_WINDOW_CREATED, "unexpected response from compositor");
         let buf_size = info.stride as usize * info.height as usize * 4;
         let shm = SharedMemory::map(info.token, buf_size);
@@ -206,7 +206,9 @@ impl Window {
     }
 
     pub fn recv_event(&mut self) -> Event {
-        let header = ipc::recv_header(self.fd);
+        let Ok(header) = ipc::recv_header(self.fd) else {
+            return Event::Close; // compositor disconnected
+        };
         self.decode_event(&header)
     }
 
@@ -221,10 +223,10 @@ impl Window {
 
     fn decode_event(&mut self, header: &ipc::IpcHeader) -> Event {
         match header.msg_type {
-            MSG_KEY_INPUT => Event::KeyInput(ipc::recv_payload(self.fd, header)),
-            MSG_MOUSE_INPUT => Event::MouseInput(ipc::recv_payload(self.fd, header)),
+            MSG_KEY_INPUT => Event::KeyInput(ipc::recv_payload(self.fd, header).unwrap()),
+            MSG_MOUSE_INPUT => Event::MouseInput(ipc::recv_payload(self.fd, header).unwrap()),
             MSG_WINDOW_RESIZED => {
-                let info: ResizeInfo = ipc::recv_payload(self.fd, header);
+                let info: ResizeInfo = ipc::recv_payload(self.fd, header).unwrap();
                 let buf_size = info.stride as usize * info.height as usize * 4;
                 self.shm = SharedMemory::map(info.token, buf_size);
                 self.width = info.width;
@@ -234,18 +236,18 @@ impl Window {
             }
             MSG_CLIPBOARD_PASTE => {
                 let mut buf = [0u8; 4096];
-                let n = ipc::recv_bytes(self.fd, header, &mut buf);
+                let n = ipc::recv_bytes(self.fd, header, &mut buf).unwrap();
                 Event::ClipboardPaste(buf[..n].to_vec())
             }
             MSG_CLIPBOARD_PASTE_SHM => {
-                let info: ClipboardShmMsg = ipc::recv_payload(self.fd, header);
+                let info: ClipboardShmMsg = ipc::recv_payload(self.fd, header).unwrap();
                 let shm = SharedMemory::map(info.token, info.len as usize);
                 let data = shm.as_slice()[..info.len as usize].to_vec();
                 Event::ClipboardPaste(data)
             }
             MSG_WINDOW_CLOSE => Event::Close,
             MSG_FRAME => Event::Frame,
-            other => panic!("unknown window event type: {other}"),
+            _ => Event::Close, // unknown → treat as disconnect
         }
     }
 

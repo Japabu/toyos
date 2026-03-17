@@ -139,10 +139,13 @@ fn main() {
         if result.fd(0) {
             let conn = services::accept(listener).expect("accept failed");
             let client = conn.fd;
-            let header = ipc::recv_header(client);
+            let Ok(header) = ipc::recv_header(client) else {
+                syscall::close(client);
+                continue;
+            };
             match header.msg_type {
                 MSG_AUDIO_OPEN => {
-                    let req: AudioOpenRequest = ipc::recv_payload(client, &header);
+                    let req: AudioOpenRequest = ipc::recv_payload(client, &header).unwrap();
                     if let Some(stream) = open_audio_stream(client, &req, &mut next_stream_id) {
                         streams.push(stream);
                     }
@@ -155,7 +158,7 @@ fn main() {
         for i in 0..streams.len() {
             if result.fd(1 + i) {
                 let fd = streams[i].control;
-                let header = ipc::recv_header(fd);
+                let Ok(header) = ipc::recv_header(fd) else { continue };
                 match header.msg_type {
                     other => eprintln!("soundd: unknown control message type {other}"),
                 }

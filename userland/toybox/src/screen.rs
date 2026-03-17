@@ -5,7 +5,7 @@ pub fn main(args: Vec<String>) {
 
     if args.is_empty() {
         ipc::signal(fd, window::MSG_GET_RESOLUTION).ok();
-        let (msg_type, info): (u32, window::ResolutionInfo) = ipc::recv(fd);
+        let (msg_type, info): (u32, window::ResolutionInfo) = ipc::recv(fd).expect("compositor disconnected");
         assert_eq!(msg_type, window::MSG_RESOLUTION_CHANGED);
         println!("{}x{}", info.width, info.height);
     } else {
@@ -26,7 +26,7 @@ pub fn main(args: Vec<String>) {
         };
 
         ipc::send(fd, window::MSG_SET_RESOLUTION, &window::ResolutionRequest { width, height }).ok();
-        let (msg_type, info): (u32, window::ResolutionInfo) = ipc::recv(fd);
+        let (msg_type, info): (u32, window::ResolutionInfo) = ipc::recv(fd).expect("compositor disconnected");
         assert_eq!(msg_type, window::MSG_RESOLUTION_CHANGED);
         println!("{}x{}", info.width, info.height);
     }

@@ -23,11 +23,14 @@ pub fn pick_file(mode: PickerMode, start_dir: &str) -> Option<String> {
     data[1..1 + len].copy_from_slice(&path_bytes[..len]);
     ipc::send_bytes(fd, MSG_FILEPICKER_REQUEST, &data[..1 + len]).ok();
 
-    let header = ipc::recv_header(fd);
-    let result = if header.msg_type == MSG_FILEPICKER_RESULT && header.len > 0 {
-        let mut buf = [0u8; 4096];
-        let n = ipc::recv_bytes(fd, &header, &mut buf);
-        String::from_utf8(buf[..n].to_vec()).ok()
+    let result = if let Ok(header) = ipc::recv_header(fd) {
+        if header.msg_type == MSG_FILEPICKER_RESULT && header.len > 0 {
+            let mut buf = [0u8; 4096];
+            let n = ipc::recv_bytes(fd, &header, &mut buf).unwrap_or(0);
+            String::from_utf8(buf[..n].to_vec()).ok()
+        } else {
+            None
+        }
     } else {
         None
     };

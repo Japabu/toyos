@@ -164,9 +164,11 @@ pub fn close(table: &mut FdTable, vfs: &mut Vfs, fd: u32, pid: Pid) -> u64 {
         Descriptor::Keyboard | Descriptor::Mouse | Descriptor::Framebuffer(_) | Descriptor::Nic(_) | Descriptor::Audio(_) => {
             device::release_descriptor(&desc, pid);
         }
+        Descriptor::Listener(name) => {
+            listener::remove(name);
+        }
         _ => {}
     }
-    // desc is dropped here → PipeReader/PipeWriter Drop runs → refcounts decremented
     0
 }
 
@@ -183,9 +185,11 @@ pub fn close_all(table: &mut FdTable, vfs: &mut Vfs, pid: Pid) {
             Descriptor::Keyboard | Descriptor::Mouse | Descriptor::Framebuffer(_) | Descriptor::Nic(_) | Descriptor::Audio(_) => {
                 device::release_descriptor(&desc, pid);
             }
+            Descriptor::Listener(name) => {
+                listener::remove(name);
+            }
             _ => {}
         }
-        // desc dropped → pipe refcounts decremented automatically
     }
 }
 

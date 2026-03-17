@@ -313,7 +313,7 @@ impl NetDaemon {
     }
 
     fn handle_tcp_close(&mut self, client_fd: Fd, header: &ipc::IpcHeader, socket_set: &mut SocketSet<'_>) {
-        let req: SocketCloseRequest = ipc::recv_payload(client_fd, header);
+        let req: SocketCloseRequest = ipc::recv_payload(client_fd, header).unwrap();
         if let Some(kind) = self.sockets.remove(&req.socket_id) {
             match kind {
                 SocketKind::TcpStream(handle) => {
@@ -350,7 +350,7 @@ impl NetDaemon {
         header: &ipc::IpcHeader,
         socket_set: &mut SocketSet<'_>,
     ) {
-        let req: TcpShutdownRequest = ipc::recv_payload(client_fd, header);
+        let req: TcpShutdownRequest = ipc::recv_payload(client_fd, header).unwrap();
         let Some(SocketKind::TcpStream(handle)) = self.sockets.get(&req.socket_id) else {
             Self::send_error(client_fd, ERR_NOT_CONNECTED);
             return;
@@ -368,7 +368,7 @@ impl NetDaemon {
         header: &ipc::IpcHeader,
         socket_set: &mut SocketSet<'_>,
     ) {
-        let req: UdpBindRequest = ipc::recv_payload(client_fd, header);
+        let req: UdpBindRequest = ipc::recv_payload(client_fd, header).unwrap();
         let port = if req.port == 0 { self.alloc_port() } else { req.port };
 
         // Open pipe fds from client-provided pipe IDs
@@ -418,7 +418,7 @@ impl NetDaemon {
         header: &ipc::IpcHeader,
         socket_set: &mut SocketSet<'_>,
     ) {
-        let req: UdpSendToRequest = ipc::recv_payload(client_fd, header);
+        let req: UdpSendToRequest = ipc::recv_payload(client_fd, header).unwrap();
 
         let Some(SocketKind::Udp(handle)) = self.sockets.get(&req.socket_id) else {
             Self::send_error(client_fd, ERR_NOT_CONNECTED);
@@ -481,7 +481,7 @@ impl NetDaemon {
         header: &ipc::IpcHeader,
         socket_set: &mut SocketSet<'_>,
     ) {
-        let req: UdpRecvFromRequest = ipc::recv_payload(client_fd, header);
+        let req: UdpRecvFromRequest = ipc::recv_payload(client_fd, header).unwrap();
         let Some(SocketKind::Udp(handle)) = self.sockets.get(&req.socket_id) else {
             Self::send_error(client_fd, ERR_NOT_CONNECTED);
             return;
@@ -507,7 +507,7 @@ impl NetDaemon {
     }
 
     fn handle_udp_close(&mut self, client_fd: Fd, header: &ipc::IpcHeader, socket_set: &mut SocketSet<'_>) {
-        let req: SocketCloseRequest = ipc::recv_payload(client_fd, header);
+        let req: SocketCloseRequest = ipc::recv_payload(client_fd, header).unwrap();
         if let Some(SocketKind::Udp(handle)) = self.sockets.remove(&req.socket_id) {
             socket_set.get_mut::<udp::Socket>(handle).close();
             socket_set.remove(handle);
@@ -528,7 +528,7 @@ impl NetDaemon {
         iface: &mut Interface,
     ) {
         let mut raw = [0u8; 256];
-        let n = ipc::recv_bytes(client_fd, header, &mut raw);
+        let n = ipc::recv_bytes(client_fd, header, &mut raw).unwrap();
         let hostname = raw[..n].to_vec();
         let hostname = match std::str::from_utf8(&hostname) {
             Ok(s) => s,
@@ -565,7 +565,7 @@ impl NetDaemon {
         header: &ipc::IpcHeader,
         socket_set: &mut SocketSet<'_>,
     ) {
-        let req: SocketOptionRequest = ipc::recv_payload(client_fd, header);
+        let req: SocketOptionRequest = ipc::recv_payload(client_fd, header).unwrap();
         let Some(SocketKind::TcpStream(handle)) = self.sockets.get(&req.socket_id) else {
             Self::send_error(client_fd, ERR_NOT_CONNECTED);
             return;
@@ -586,7 +586,7 @@ impl NetDaemon {
         header: &ipc::IpcHeader,
         socket_set: &mut SocketSet<'_>,
     ) {
-        let req: SocketOptionRequest = ipc::recv_payload(client_fd, header);
+        let req: SocketOptionRequest = ipc::recv_payload(client_fd, header).unwrap();
         let Some(SocketKind::TcpStream(handle)) = self.sockets.get(&req.socket_id) else {
             Self::send_error(client_fd, ERR_NOT_CONNECTED);
             return;
@@ -610,7 +610,7 @@ impl NetDaemon {
         socket_set: &mut SocketSet<'_>,
         iface: &mut Interface,
     ) {
-        let req: TcpConnectPipedRequest = ipc::recv_payload(client_fd, header);
+        let req: TcpConnectPipedRequest = ipc::recv_payload(client_fd, header).unwrap();
         let remote = IpEndpoint::new(
             IpAddress::Ipv4(Ipv4Addr::from(req.addr)),
             req.port,
@@ -652,7 +652,7 @@ impl NetDaemon {
         header: &ipc::IpcHeader,
         socket_set: &mut SocketSet<'_>,
     ) {
-        let req: TcpBindPipedRequest = ipc::recv_payload(client_fd, header);
+        let req: TcpBindPipedRequest = ipc::recv_payload(client_fd, header).unwrap();
         let port = if req.port == 0 { self.alloc_port() } else { req.port };
 
         let rx_buf = tcp::SocketBuffer::new(vec![0u8; 65536]);
@@ -692,7 +692,7 @@ impl NetDaemon {
         header: &ipc::IpcHeader,
         socket_set: &mut SocketSet<'_>,
     ) {
-        let req: TcpAcceptPipedRequest = ipc::recv_payload(client_fd, header);
+        let req: TcpAcceptPipedRequest = ipc::recv_payload(client_fd, header).unwrap();
         let Some(listener) = self.piped_listeners.get(&req.socket_id) else {
             Self::send_error(client_fd, ERR_NOT_CONNECTED);
             return;
@@ -983,16 +983,19 @@ fn main() {
         // Accept new connections
         if result.fd(0) {
             let conn = services::accept(listener).expect("accept failed");
-            let header = ipc::recv_header(conn.fd);
-            daemon.handle_message(conn.fd, &header, &mut socket_set, &mut iface);
+            if let Ok(header) = ipc::recv_header(conn.fd) {
+                daemon.handle_message(conn.fd, &header, &mut socket_set, &mut iface);
+            } else {
+                toyos_abi::syscall::close(conn.fd);
+            }
         }
 
-        // Handle messages from existing clients
         for i in 1..poll_fds.len() {
             if result.fd(i) {
                 let fd = Fd(poll_fds[i] as i32);
-                let header = ipc::recv_header(fd);
-                daemon.handle_message(fd, &header, &mut socket_set, &mut iface);
+                if let Ok(header) = ipc::recv_header(fd) {
+                    daemon.handle_message(fd, &header, &mut socket_set, &mut iface);
+                }
             }
         }
     }

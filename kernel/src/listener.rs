@@ -59,3 +59,9 @@ pub fn exists(name: &str) -> bool {
     let guard = LISTENERS.lock();
     guard.as_ref().unwrap().contains_key(name)
 }
+
+/// Remove a listener. Pending connections are dropped (PipeReader/PipeWriter Drop frees pipes).
+pub fn remove(name: &str) {
+    let mut guard = LISTENERS.lock();
+    guard.as_mut().unwrap().remove(name);
+}

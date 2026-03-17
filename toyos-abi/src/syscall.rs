@@ -22,11 +22,9 @@ pub const SYS_SPAWN: u64 = 25;
 pub const SYS_WAITPID: u64 = 26;
 pub const SYS_POLL: u64 = 27;
 pub const SYS_MARK_TTY: u64 = 28;
-pub const SYS_SEND_MSG: u64 = 29;
-pub const SYS_RECV_MSG: u64 = 30;
+// Syscall numbers 29-30 unused (formerly SYS_SEND_MSG/SYS_RECV_MSG).
 pub const SYS_OPEN_DEVICE: u64 = 31;
-pub const SYS_REGISTER_NAME: u64 = 32;
-pub const SYS_FIND_PID: u64 = 33;
+// Syscall numbers 32-33 unused (formerly SYS_REGISTER_NAME/SYS_FIND_PID).
 pub const SYS_SET_SCREEN_SIZE: u64 = 34;
 pub const SYS_GPU_PRESENT: u64 = 35;
 pub const SYS_ALLOC_SHARED: u64 = 36;

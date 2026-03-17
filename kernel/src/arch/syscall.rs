@@ -221,9 +221,9 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             sys_poll(fds, a2, a3)
         }
         SYS_MARK_TTY => process::with_fd_owner_data(|data| fd::mark_tty(&mut data.fds, a1 as u32)),
-        SYS_SEND_MSG | SYS_RECV_MSG => SyscallError::NotSupported.to_u64(),
+        29 | 30 => SyscallError::NotSupported.to_u64(), // formerly SYS_SEND_MSG/SYS_RECV_MSG
         SYS_OPEN_DEVICE => sys_open_device(a1),
-        SYS_REGISTER_NAME | SYS_FIND_PID => SyscallError::NotSupported.to_u64(),
+        32 | 33 => SyscallError::NotSupported.to_u64(), // formerly SYS_REGISTER_NAME/SYS_FIND_PID
         SYS_SET_SCREEN_SIZE => { set_screen_size(a1 as u32, a2 as u32); 0 }
         SYS_GPU_PRESENT => { crate::gpu::present_rect(a1 as u32, a2 as u32, a3 as u32, a4 as u32); 0 }
         SYS_GPU_SET_CURSOR => { crate::gpu::set_cursor(a1 as u32, a2 as u32); 0 }

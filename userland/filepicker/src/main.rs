@@ -463,14 +463,17 @@ fn main() {
     loop {
         let conn = services::accept(listener).expect("accept failed");
         let client_fd = conn.fd;
-        let header = ipc::recv_header(client_fd);
+        let Ok(header) = ipc::recv_header(client_fd) else {
+            syscall::close(client_fd);
+            continue;
+        };
         if header.msg_type != MSG_FILEPICKER_REQUEST {
             syscall::close(client_fd);
             continue;
         }
 
         let mut data = [0u8; 4096];
-        let n = ipc::recv_bytes(client_fd, &header, &mut data);
+        let n = ipc::recv_bytes(client_fd, &header, &mut data).unwrap_or(0);
         let mode = if n > 0 && data[0] == PickerMode::Save as u8 {
             PickerMode::Save
         } else {

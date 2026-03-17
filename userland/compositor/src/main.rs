@@ -1266,21 +1266,31 @@ fn main() {
 
         if ready.fd(POLL_LISTENER) {
             let conn = services::accept(listener_fd).expect("accept failed");
-            let header = ipc::recv_header(conn.fd);
-            client_msgs.push((conn.fd, conn.client_pid, header));
+            if let Ok(header) = ipc::recv_header(conn.fd) {
+                client_msgs.push((conn.fd, conn.client_pid, header));
+            } else {
+                syscall::close(conn.fd);
+            }
         }
 
+        let mut dead_fds: Vec<Fd> = Vec::new();
         for i in 0..windows.len() {
             if ready.fd(POLL_CLIENTS + i) {
-                let header = ipc::recv_header(windows[i].fd);
-                client_msgs.push((windows[i].fd, windows[i].pid, header));
+                match ipc::recv_header(windows[i].fd) {
+                    Ok(header) => client_msgs.push((windows[i].fd, windows[i].pid, header)),
+                    Err(_) => dead_fds.push(windows[i].fd),
+                }
             }
+        }
+        if !dead_fds.is_empty() {
+            windows.retain(|w| !dead_fds.contains(&w.fd));
+            mark_dirty(&mut dirty_rect, DirtyRect::full(screen_w as usize, screen_h as usize));
         }
 
         for (client_fd, client_pid, header) in client_msgs {
             match header.msg_type {
                 window::MSG_CREATE_WINDOW => {
-                    let req: window::CreateWindowRequest = ipc::recv_payload(client_fd, &header);
+                    let req: window::CreateWindowRequest = ipc::recv_payload(client_fd, &header).unwrap();
                     let title = if req.title_len > 0 {
                         let len = (req.title_len as usize).min(30);
                         String::from_utf8_lossy(&req.title[..len]).into_owned()
@@ -1372,22 +1382,22 @@ fn main() {
                 }
                 window::MSG_CLIPBOARD_SET => {
                     let mut buf = [0u8; 116];
-                    let n = ipc::recv_bytes(client_fd, &header, &mut buf);
+                    let n = ipc::recv_bytes(client_fd, &header, &mut buf).unwrap();
                     clipboard = String::from_utf8_lossy(&buf[..n]).into_owned();
                 }
                 window::MSG_CLIPBOARD_SET_SHM => {
-                    let info: window::ClipboardShmMsg = ipc::recv_payload(client_fd, &header);
+                    let info: window::ClipboardShmMsg = ipc::recv_payload(client_fd, &header).unwrap();
                     let shm = SharedMemory::map(info.token, info.len as usize);
                     clipboard = String::from_utf8_lossy(&shm.as_slice()[..info.len as usize]).into_owned();
                 }
                 window::MSG_SET_CURSOR => {
-                    let style: u32 = ipc::recv_payload(client_fd, &header);
+                    let style: u32 = ipc::recv_payload(client_fd, &header).unwrap();
                     if let Some(win) = windows.iter_mut().find(|w| w.fd == client_fd) {
                         win.cursor_style = style as u8;
                     }
                 }
                 window::MSG_SET_RESOLUTION => {
-                    let req: window::ResolutionRequest = ipc::recv_payload(client_fd, &header);
+                    let req: window::ResolutionRequest = ipc::recv_payload(client_fd, &header).unwrap();
                     let reply = match gpu::set_resolution(req.width, req.height) {
                         Ok(new_fb_info) => {
                             fb_info = new_fb_info;
