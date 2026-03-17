@@ -1,15 +1,8 @@
-//! Audio device interface.
-//!
-//! The audio device follows the same capability pattern as NIC and framebuffer:
-//! claim the device via `open_device(Audio)`, read `AudioInfo` from the fd,
-//! map DMA buffer tokens as shared memory, then use `audio_submit`/`audio_poll`
-//! for non-blocking control.
+//! Audio device and soundd protocol.
 
 use crate::syscall;
 
 /// Audio device info returned when claiming the audio device.
-/// Each `buf_tokens` entry is a shared memory token for one DMA page (4096 bytes)
-/// that can be mapped and written to directly.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct AudioInfo {
@@ -28,34 +21,49 @@ impl AudioInfo {
     }
 }
 
-/// soundd protocol message types.
+// ---------------------------------------------------------------------------
+// soundd IPC protocol
+// ---------------------------------------------------------------------------
+
 pub const MSG_AUDIO_OPEN: u32 = 1;
 pub const MSG_AUDIO_OPENED: u32 = 2;
+pub const MSG_AUDIO_SET_VOLUME: u32 = 3;
 
-/// Request to open an audio stream (client → soundd).
+/// Client → soundd: request to open an audio stream.
+/// soundd allocates a shared memory ring and returns it in the response.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct AudioOpenRequest {
-    pub pipe_id: u64,
     pub sample_rate: u32,
     pub channels: u16,
     pub format: u16,
 }
 
-/// Response after opening an audio stream (soundd → client).
+/// soundd → client: stream opened, here's the shared memory ring.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct AudioOpenResponse {
     pub stream_id: u32,
+    pub shm_token: u32,
+    pub ring_size: u32,
 }
 
-/// Submit a filled DMA buffer to the audio device.
+/// Client → soundd: set per-stream volume.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct AudioSetVolume {
+    pub stream_id: u32,
+    pub volume: u32, // 0-256, where 256 = 1.0
+}
+
+// ---------------------------------------------------------------------------
+// Audio hardware syscalls
+// ---------------------------------------------------------------------------
+
 pub fn audio_submit(buf_idx: u32, len: u32) {
     syscall::audio_submit(buf_idx, len);
 }
 
-/// Poll for completed (reusable) DMA buffers.
-/// Returns a bitmask where bit N is set if buffer N is available.
 pub fn audio_poll() -> u32 {
     syscall::audio_poll()
 }

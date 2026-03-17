@@ -1,7 +1,7 @@
-use toyos_abi::audio::{self, AudioInfo, AudioOpenRequest, AudioOpenResponse, MSG_AUDIO_OPEN, MSG_AUDIO_OPENED};
+use toyos_abi::audio::{self, AudioInfo, AudioOpenRequest, AudioOpenResponse, AudioSetVolume};
+use toyos_abi::audio::{MSG_AUDIO_OPEN, MSG_AUDIO_OPENED, MSG_AUDIO_SET_VOLUME};
 use toyos_abi::device;
 use toyos_abi::ipc;
-use toyos_abi::pipe;
 use toyos_abi::poll as toyos_poll;
 use toyos_abi::ring::RingHeader;
 use toyos_abi::services;
@@ -9,42 +9,49 @@ use toyos_abi::shm::SharedMemory;
 use toyos_abi::syscall;
 use toyos_abi::Fd;
 
+const AUDIO_RING_SIZE: usize = 16384;
+const DEFAULT_VOLUME: i32 = 256;
+
 struct AudioStream {
-    data_fd: Fd,
-    ring: *const RingHeader,
+    shm: SharedMemory,
     control: Fd,
+    volume: i32,
 }
 
 impl AudioStream {
-    fn read_samples(&self, mix: &mut [i32]) {
-        let ring = unsafe { &*self.ring };
-        let need_bytes = mix.len() * 2; // i16 = 2 bytes per sample
+    fn ring(&self) -> &RingHeader {
+        unsafe { &*(self.shm.as_ptr() as *const RingHeader) }
+    }
+
+    /// Read up to `max_samples` i16 samples from the ring, mix into `mix` at `offset`.
+    /// Returns the number of samples actually read.
+    fn mix_into(&self, mix: &mut [i32], offset: usize, max_samples: usize) -> usize {
+        let ring = self.ring();
+        let need = max_samples * 2;
         let avail = ring.available() as usize;
-        if avail < 2 {
-            return;
-        }
-        let to_read = need_bytes.min(avail) & !1;
+        let to_read = need.min(avail) & !1;
         if to_read == 0 {
-            return;
+            return 0;
         }
         let mut raw = [0u8; 8192];
         let n = ring.read(&mut raw[..to_read]);
         let samples = n / 2;
+        let vol = self.volume;
         for i in 0..samples {
-            let sample = i16::from_le_bytes([raw[i * 2], raw[i * 2 + 1]]);
-            mix[i] = mix[i].saturating_add(sample as i32);
+            let sample = i16::from_le_bytes([raw[i * 2], raw[i * 2 + 1]]) as i32;
+            mix[offset + i] = mix[offset + i].saturating_add(sample * vol / 256);
         }
+        samples
     }
 
     fn is_dead(&self) -> bool {
-        let ring = unsafe { &*self.ring };
+        let ring = self.ring();
         ring.is_writer_closed() && ring.available() == 0
     }
 }
 
 impl Drop for AudioStream {
     fn drop(&mut self) {
-        syscall::close(self.data_fd);
         syscall::close(self.control);
     }
 }
@@ -58,13 +65,21 @@ fn read_struct<T: Copy>(fd: Fd) -> T {
     unsafe { core::ptr::read(buf.as_ptr() as *const T) }
 }
 
-fn open_audio_stream(control: Fd, req: &AudioOpenRequest, next_id: &mut u32) -> Option<AudioStream> {
-    let data_fd = pipe::open_by_id(req.pipe_id, true).ok()?;
-    let ring = syscall::pipe_map(data_fd).expect("pipe_map failed") as *const RingHeader;
+fn open_stream(control: Fd, client_pid: u32, _req: &AudioOpenRequest, next_id: &mut u32) -> AudioStream {
+    let mut shm = SharedMemory::allocate(AUDIO_RING_SIZE);
+    RingHeader::init(shm.as_mut_slice().as_mut_ptr(), AUDIO_RING_SIZE);
+    shm.grant(client_pid);
+
     let id = *next_id;
     *next_id += 1;
-    let _ = ipc::send(control, MSG_AUDIO_OPENED, &AudioOpenResponse { stream_id: id });
-    Some(AudioStream { data_fd, ring, control })
+
+    let _ = ipc::send(control, MSG_AUDIO_OPENED, &AudioOpenResponse {
+        stream_id: id,
+        shm_token: shm.token(),
+        ring_size: AUDIO_RING_SIZE as u32,
+    });
+
+    AudioStream { shm, control, volume: DEFAULT_VOLUME }
 }
 
 fn main() {
@@ -80,8 +95,9 @@ fn main() {
         dma_pages.push(SharedMemory::map(info.buf_tokens[i], 4096));
     }
 
-    let period_frames = info.period_bytes as usize / 4; // stereo i16 = 4 bytes/frame
+    let period_frames = info.period_bytes as usize / 4;
     let period_samples = period_frames * info.channels as usize;
+
     eprintln!("soundd: ready, {} buffers, {}Hz, {} bytes/period",
         num_buffers, info.sample_rate, info.period_bytes);
 
@@ -89,16 +105,37 @@ fn main() {
     let mut next_stream_id: u32 = 1;
     let mut free_mask: u32 = (1u32 << num_buffers) - 1;
 
+    // Mix accumulator: collects samples from client rings until a full DMA
+    // period is ready. This decouples client audio tic rate from DMA period
+    // size — partial tics accumulate across periods instead of creating
+    // silence gaps.
+    let mut accum = vec![0i32; period_samples];
+    let mut accum_filled: usize = 0;
+
     loop {
         // 1. Reclaim completed DMA buffers
         free_mask |= audio::audio_poll();
 
-        // 2. Fill and submit all free DMA buffers
+        // 2. Drain client rings into accumulator
+        if !streams.is_empty() && accum_filled < period_samples {
+            let want = period_samples - accum_filled;
+            let mut got = 0usize;
+            for stream in &streams {
+                let n = stream.mix_into(&mut accum, accum_filled, want);
+                got = got.max(n);
+            }
+            accum_filled += got;
+        }
+
+        // 3. Submit DMA buffers when accumulator has a full period
         while free_mask != 0 {
             let idx = free_mask.trailing_zeros() as usize;
-            if idx >= num_buffers {
-                break;
+            if idx >= num_buffers { break; }
+
+            if !streams.is_empty() && accum_filled < period_samples {
+                break; // wait for more audio data
             }
+
             free_mask &= !(1 << idx);
 
             let page = dma_pages[idx].as_mut_slice();
@@ -109,60 +146,62 @@ fn main() {
             if streams.is_empty() {
                 for s in out.iter_mut() { *s = 0; }
             } else {
-                let mut mix = vec![0i32; period_samples];
-                for stream in &streams {
-                    stream.read_samples(&mut mix);
-                }
-                for (i, &s) in mix.iter().enumerate() {
+                for (i, &s) in accum.iter().enumerate() {
                     out[i] = s.clamp(-32768, 32767) as i16;
                 }
+                for s in accum.iter_mut() { *s = 0; }
+                accum_filled = 0;
             }
 
             audio::audio_submit(idx as u32, info.period_bytes);
         }
 
-        // 3. Clean up dead streams
+        // 4. Clean up dead streams
         streams.retain(|s| !s.is_dead());
 
-        // 4. Poll: listener + control sockets
-        // When streams are active, use a short timeout to keep DMA buffers fed.
-        // audio_poll() is non-blocking so we need to spin frequently.
-        let timeout = if streams.is_empty() { 100_000_000 } else { 1_000_000 }; // 1ms when active
+        // 5. Check for connections and control messages
         let mut poll_fds: Vec<u64> = Vec::with_capacity(1 + streams.len());
         poll_fds.push(listener.0 as u64);
         for stream in &streams {
             poll_fds.push(stream.control.0 as u64);
         }
+
+        let timeout = if streams.is_empty() { 100_000_000 } else { 0 };
         let result = toyos_poll::poll_timeout(&poll_fds, Some(timeout));
 
-        // 5. Accept new connections
         if result.fd(0) {
             let conn = services::accept(listener).expect("accept failed");
-            let client = conn.fd;
-            let Ok(header) = ipc::recv_header(client) else {
-                syscall::close(client);
+            let Ok(header) = ipc::recv_header(conn.fd) else {
+                syscall::close(conn.fd);
                 continue;
             };
             match header.msg_type {
                 MSG_AUDIO_OPEN => {
-                    let req: AudioOpenRequest = ipc::recv_payload(client, &header).unwrap();
-                    if let Some(stream) = open_audio_stream(client, &req, &mut next_stream_id) {
-                        streams.push(stream);
-                    }
+                    let req: AudioOpenRequest = ipc::recv_payload(conn.fd, &header).unwrap();
+                    let stream = open_stream(conn.fd, conn.client_pid, &req, &mut next_stream_id);
+                    streams.push(stream);
                 }
-                other => eprintln!("soundd: unexpected message type {other} from new client"),
+                other => eprintln!("soundd: unexpected message type {other}"),
             }
         }
 
-        // 6. Handle control messages from existing clients
         for i in 0..streams.len() {
             if result.fd(1 + i) {
                 let fd = streams[i].control;
                 let Ok(header) = ipc::recv_header(fd) else { continue };
                 match header.msg_type {
-                    other => eprintln!("soundd: unknown control message type {other}"),
+                    MSG_AUDIO_SET_VOLUME => {
+                        let cmd: AudioSetVolume = ipc::recv_payload(fd, &header).unwrap();
+                        streams[i].volume = (cmd.volume as i32).min(512);
+                    }
+                    _ => {}
                 }
             }
+        }
+
+        // Yield when waiting for audio data or DMA completion
+        if !streams.is_empty() && free_mask == 0 {
+            syscall::nanosleep(500_000);
         }
     }
 }
