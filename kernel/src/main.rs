@@ -59,12 +59,49 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     cpu::halt()
 }
 
+/// Kernel entry point. Called by bootloader with rdi = &KernelArgs.
+/// Switches to the kernel's own stack, then falls through to init.
+#[unsafe(naked)]
 #[no_mangle]
-pub unsafe extern "sysv64" fn _start(kernel_args: KernelArgs) -> ! {
+pub unsafe extern "sysv64" fn _start(_kernel_args: &KernelArgs) -> ! {
+    // rdi = &KernelArgs (preserved — not clobbered by stack setup)
+    // Stack top = PHYS_OFFSET + kernel_memory_addr + kernel_stack_addr + kernel_stack_size
+    core::arch::naked_asm!(
+        "mov rax, [rdi + 16]",  // kernel_memory_addr
+        "add rax, [rdi + 32]",  // + kernel_stack_addr
+        "add rax, [rdi + 40]",  // + kernel_stack_size
+        "movabs rbx, {phys_offset}",
+        "add rax, rbx",
+        "mov rsp, rax",
+        "call {kernel_main}",
+        phys_offset = const PHYS_OFFSET,
+        kernel_main = sym kernel_main,
+    );
+}
+
+fn register_gpu(driver: Box<dyn gpu::Gpu>, info: gpu::GpuInfo) {
+    let fb_info = fd::FramebufferInfo {
+        token: [info.tokens[0].raw(), info.tokens[1].raw()],
+        cursor_token: info.cursor_token.raw(),
+        width: info.width,
+        height: info.height,
+        stride: info.stride,
+        pixel_format: info.pixel_format,
+        flags: info.flags,
+    };
+    syscall::set_screen_size(fb_info.width, fb_info.height);
+    crate::device::set_framebuffer_info(fb_info);
+    gpu::register(driver, info);
+}
+
+unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
+    // Copy KernelArgs to the kernel stack — the original lives on the UEFI stack
+    // which becomes inaccessible after paging::init drops the identity map.
+    let kernel_args = *kernel_args;
+
     serial::init();
     log!("{:?}", kernel_args);
 
-    // KernelArgs contains physical addresses — convert via PhysAddr to get kernel pointers.
     let entry_count = kernel_args.memory_map_size as usize / core::mem::size_of::<MemoryMapEntry>();
     let maps = core::slice::from_raw_parts(
         PhysAddr::new(kernel_args.memory_map_addr).as_ptr::<MemoryMapEntry>(),
@@ -83,32 +120,8 @@ pub unsafe extern "sysv64" fn _start(kernel_args: KernelArgs) -> ! {
         kernel_args.init_program_len as usize,
     );
     let init_programs = core::str::from_utf8(init_bytes).expect("init_programs: invalid UTF-8");
+    let kernel_args = &kernel_args;
 
-    kernel_main(&kernel_args, maps, initrd, kernel_elf, init_programs);
-}
-
-fn register_gpu(driver: Box<dyn gpu::Gpu>, info: gpu::GpuInfo) {
-    let fb_info = fd::FramebufferInfo {
-        token: [info.tokens[0].raw(), info.tokens[1].raw()],
-        cursor_token: info.cursor_token.raw(),
-        width: info.width,
-        height: info.height,
-        stride: info.stride,
-        pixel_format: info.pixel_format,
-        flags: info.flags,
-    };
-    syscall::set_screen_size(fb_info.width, fb_info.height);
-    crate::device::set_framebuffer_info(fb_info);
-    gpu::register(driver, info);
-}
-
-fn kernel_main(
-    kernel_args: &KernelArgs,
-    maps: &[MemoryMapEntry],
-    initrd: &[u8],
-    kernel_elf: &[u8],
-    init_programs: &str,
-) -> ! {
     // ── Phase 1: Memory ─────────────────────────────────────────────────
     let reserved = [
         allocator::Region { start: kernel_args.kernel_memory_addr, end: kernel_args.kernel_memory_addr + kernel_args.kernel_memory_size },

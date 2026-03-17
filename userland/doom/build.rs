@@ -16,18 +16,19 @@ fn main() {
     // Setting RUSTUP_TOOLCHAIN overrides the toml file.
     let toyos_cc_dir = root.join("../toyos-cc");
     let host = std::env::var("HOST").unwrap();
+    let cc_target_dir = root.join("../target/toyos-cc-host");
     let status = Command::new("cargo")
         .args(["build", "--quiet", "--release", "--target", &host])
         .current_dir(&toyos_cc_dir)
         .env("RUSTUP_TOOLCHAIN", "stable")
+        .env("CARGO_TARGET_DIR", &cc_target_dir)
         .env_remove("RUSTC")
         .env_remove("RUSTFLAGS")
         .env_remove("CARGO_ENCODED_RUSTFLAGS")
         .status()
         .expect("failed to build toyos-cc");
     assert!(status.success(), "toyos-cc build failed");
-    // toyos-cc is a workspace member — output goes to the workspace target dir
-    let toyos_cc = root.join(format!("../target/{host}/release/toyos-cc"));
+    let toyos_cc = cc_target_dir.join(format!("{host}/release/toyos-cc"));
 
     let target = std::env::var("TARGET").unwrap();
 

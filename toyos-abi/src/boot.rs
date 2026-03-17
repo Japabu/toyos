@@ -1,5 +1,5 @@
 #[repr(C)]
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct KernelArgs {
     pub memory_map_addr: u64,
     pub memory_map_size: u64,

@@ -322,13 +322,6 @@ fn start_kernel(kernel: LoadedKernel, kernel_elf_bytes: vec::Vec<u8>, initrd: ve
         boot_pml4_addr: 0, // set below after page tables are built
     };
 
-    mem::forget(memory_map);
-    mem::forget(kernel.memory);
-    mem::forget(kernel_elf_bytes);
-    mem::forget(initrd);
-
-    let stack_top_phys = kernel_phys + kernel.stack_offset as u64 + kernel.stack_size as u64;
-
     // Build boot page tables: identity map + high-half map for first 4GB.
     let pml4_phys = unsafe { build_boot_page_tables(pt_mem, 4 * 1024 * 1024 * 1024) };
     kernel_args.boot_pml4_addr = pml4_phys;
@@ -336,38 +329,15 @@ fn start_kernel(kernel: LoadedKernel, kernel_elf_bytes: vec::Vec<u8>, initrd: ve
     // Switch to new page tables (identity map keeps us alive)
     unsafe { core::arch::asm!("mov cr3, {}", in(reg) pml4_phys, options(nostack)) };
 
-    // Compute high-half addresses.
     let entry_virt = PHYS_OFFSET + kernel_phys + kernel.entry_offset as u64;
-    let stack_top_virt = PHYS_OFFSET + stack_top_phys;
-    let args_src = &kernel_args as *const KernelArgs as u64;
-    let args_size = mem::size_of::<KernelArgs>() as u64;
 
-    // Copy KernelArgs onto the high-half kernel stack, then call _start.
-    // We copy KernelArgs AFTER setting RSP so it's right below the stack top.
-    // rdi = pointer to the copy (sysv64 invisible reference for large structs).
-    unsafe {
-        core::arch::asm!(
-            // Switch to high-half kernel stack
-            "mov rsp, {stack}",
-            // Reserve space for KernelArgs (rounded up to 16-byte alignment)
-            "sub rsp, {size}",
-            "and rsp, -16",
-            // Copy KernelArgs from bootloader stack (identity-mapped) to kernel stack (high-half)
-            "mov rdi, rsp",
-            "mov rsi, {src}",
-            "mov rcx, {size}",
-            "rep movsb",
-            // rdi = pointer to KernelArgs copy on kernel stack
-            "mov rdi, rsp",
-            // Call kernel entry
-            "call {entry}",
-            stack = in(reg) stack_top_virt,
-            size = in(reg) args_size,
-            src = in(reg) args_src,
-            entry = in(reg) entry_virt,
-            options(noreturn),
-        );
-    }
+    mem::forget(memory_map);
+    mem::forget(kernel.memory);
+    mem::forget(kernel_elf_bytes);
+    mem::forget(initrd);
+
+    let entry: extern "sysv64" fn(&KernelArgs) -> ! = unsafe { mem::transmute(entry_virt) };
+    entry(&kernel_args);
 }
 
 #[entry]
