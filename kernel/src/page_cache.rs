@@ -85,7 +85,13 @@ impl PageCache {
         // Allocate new chunk if needed
         let chunk_idx = slot as usize / PAGES_PER_CHUNK;
         if chunk_idx >= self.chunks.len() {
-            self.chunks.push(Box::new([0u8; CHUNK_SIZE]));
+            let chunk: Box<[u8; CHUNK_SIZE]> = unsafe {
+                let layout = alloc::alloc::Layout::new::<[u8; CHUNK_SIZE]>();
+                let ptr = alloc::alloc::alloc_zeroed(layout);
+                assert!(!ptr.is_null(), "page cache: chunk allocation failed");
+                Box::from_raw(ptr as *mut [u8; CHUNK_SIZE])
+            };
+            self.chunks.push(chunk);
         }
         slot
     }
