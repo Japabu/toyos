@@ -869,25 +869,18 @@ fn vaddr_to_file_offset(segments: &[elf::ElfSegment], vaddr: u64) -> u64 {
 }
 
 /// Read a byte range from a file using its block map via the page cache.
-pub(crate) fn read_file_range(block_map: &[u64], offset: u64, len: usize) -> Vec<u8> {
+pub(crate) fn read_file_range(backing: &dyn crate::file_backing::FileBacking, offset: u64, len: usize) -> Vec<u8> {
     let mut result = Vec::with_capacity(len);
     let mut remaining = len;
     let mut file_off = offset;
+    let mut page_buf = [0u8; 4096];
 
     while remaining > 0 {
-        let block_idx = (file_off / 4096) as usize;
         let off_in_block = (file_off % 4096) as usize;
         let chunk = (4096 - off_in_block).min(remaining);
 
-        if block_idx < block_map.len() {
-            let mut cache_guard = crate::page_cache::lock();
-            let (cache, dev) = cache_guard.cache_and_dev();
-            let page = cache.read(dev, block_map[block_idx]);
-            result.extend_from_slice(&page[off_in_block..off_in_block + chunk]);
-        } else {
-            // Beyond file: zero fill
-            result.resize(result.len() + chunk, 0);
-        }
+        backing.read_page(file_off - off_in_block as u64, &mut page_buf);
+        result.extend_from_slice(&page_buf[off_in_block..off_in_block + chunk]);
 
         file_off += chunk as u64;
         remaining -= chunk;
@@ -905,7 +898,7 @@ fn resolve_exe_tpoff(
     total_memsz: usize,
     segments: &[elf::ElfSegment],
     symtab_vaddr: u64,
-    block_map: &[u64],
+    backing: &dyn crate::file_backing::FileBacking,
     dynstr_data: &[u8],
     tls_info: &elf::TlsModuleInfo,
 ) -> i64 {
@@ -914,7 +907,7 @@ fn resolve_exe_tpoff(
     }
 
     let symtab_file_off = vaddr_to_file_offset(segments, symtab_vaddr);
-    let sym_data = read_file_range(block_map, symtab_file_off + r_sym as u64 * elf::SYM_SIZE as u64, elf::SYM_SIZE);
+    let sym_data = read_file_range(backing, symtab_file_off + r_sym as u64 * elf::SYM_SIZE as u64, elf::SYM_SIZE);
     if sym_data.len() < elf::SYM_SIZE {
         return exe_base_offset as i64 + r_addend - total_memsz as i64;
     }
@@ -944,7 +937,7 @@ fn resolve_exe_tpoff(
 /// Spawn a new process from an ELF binary using demand paging.
 /// Only reads ELF headers and metadata from disk — PT_LOAD segments are faulted in on access.
 /// Build VMAs for each PT_LOAD segment in the ELF layout.
-fn build_vmas(layout: &elf::ElfLayout, base: u64, block_map: &Arc<Vec<u64>>) -> crate::vma::VmaList {
+fn build_vmas(layout: &elf::ElfLayout, base: u64, backing: &Arc<dyn crate::file_backing::FileBacking>) -> crate::vma::VmaList {
     let mut vmas = crate::vma::VmaList::new();
     for seg in &layout.segments {
         let seg_start = (base + seg.vaddr) & !0xFFF;
@@ -960,7 +953,7 @@ fn build_vmas(layout: &elf::ElfLayout, base: u64, block_map: &Arc<Vec<u64>>) -> 
                 end: UserAddr::new(file_backed_end.min(seg_end)),
                 writable: seg.writable,
                 kind: crate::vma::VmaKind::FileBacked {
-                    block_map: Arc::clone(block_map),
+                    backing: Arc::clone(backing),
                     file_offset: file_block_start * 4096,
                     file_size: seg.filesz + (seg.file_offset % 4096),
                 },
@@ -1021,23 +1014,18 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
     let path = argv[0];
     let t0 = crate::clock::nanos_since_boot();
 
-    // 1. Get block map from VFS (follows symlinks, traverses inode structure, no data read)
-    let block_map = match vfs::lock().file_block_map(path) {
-        Some(bm) if !bm.is_empty() => bm,
-        Some(_) => {
-            log!("spawn: {}: empty block map", path);
-            return Err(SyscallError::NotFound);
-        }
+    // 1. Open file backing from VFS (follows symlinks)
+    let backing: Arc<dyn crate::file_backing::FileBacking> = match vfs::lock().open_backing(path) {
+        Some(b) => b,
         None => {
-            log!("spawn: {}: not found or filesystem does not support block maps", path);
+            log!("spawn: {}: not found", path);
             return Err(SyscallError::NotFound);
         }
     };
-    let block_map = Arc::new(block_map);
 
-    // 3. Read first few blocks for ELF headers (typically 1-2 blocks suffice)
-    let header_size = 4096.min(block_map.len() * 4096); // at least first block
-    let header_data = read_file_range(&block_map, 0, header_size);
+    // 2. Read first few blocks for ELF headers
+    let header_size = 4096.min(backing.file_size() as usize);
+    let header_data = read_file_range(backing.as_ref(), 0, header_size);
 
     // 3. Parse ELF layout from headers
     let layout = match elf::parse_layout(&header_data) {
@@ -1050,7 +1038,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
 
     // 3b. Parse PT_DYNAMIC from block map (not available in the header buffer)
     let dyn_info = if let Some((dyn_off, dyn_size)) = layout.dynamic {
-        let dyn_data = read_file_range(&block_map, dyn_off, dyn_size as usize);
+        let dyn_data = read_file_range(backing.as_ref(), dyn_off, dyn_size as usize);
         elf::parse_dynamic(&dyn_data)
     } else {
         elf::DynamicInfo::empty()
@@ -1062,21 +1050,21 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
     let base = USER_VM_BASE - layout.vaddr_min;
 
     // 5. Create VMAs for each PT_LOAD segment
-    let vmas = build_vmas(&layout, base, &block_map);
+    let vmas = build_vmas(&layout, base, &backing);
 
     // 6. Read and parse relocation tables from block map
     let rela_data = if dyn_info.rela_size > 0 {
         let rela_file_off = vaddr_to_file_offset(&layout.segments, dyn_info.rela_vaddr);
-        read_file_range(&block_map, rela_file_off, dyn_info.rela_size as usize)
+        read_file_range(backing.as_ref(), rela_file_off, dyn_info.rela_size as usize)
     } else if layout.dynamic.is_none() {
         // No PT_DYNAMIC — fall back to finding .rela.dyn from section headers
         if let Some((shoff, shnum, shentsize)) = layout.section_headers {
-            let shdr_data = read_file_range(&block_map, shoff, shnum as usize * shentsize as usize);
-            let bm = &block_map;
+            let shdr_data = read_file_range(backing.as_ref(), shoff, shnum as usize * shentsize as usize);
+            let bk = backing.as_ref();
             if let Some((rela_off, rela_size)) = elf::find_rela_dyn_from_sections(
-                &shdr_data, shentsize, &|off, len| read_file_range(bm, off, len),
+                &shdr_data, shentsize, &|off, len| read_file_range(bk, off, len),
             ) {
-                read_file_range(&block_map, rela_off, rela_size as usize)
+                read_file_range(backing.as_ref(), rela_off, rela_size as usize)
             } else {
                 Vec::new()
             }
@@ -1088,7 +1076,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
     };
     let jmprel_data = if dyn_info.jmprel_size > 0 {
         let jmprel_file_off = vaddr_to_file_offset(&layout.segments, dyn_info.jmprel_vaddr);
-        read_file_range(&block_map, jmprel_file_off, dyn_info.jmprel_size as usize)
+        read_file_range(backing.as_ref(), jmprel_file_off, dyn_info.jmprel_size as usize)
     } else {
         Vec::new()
     };
@@ -1106,7 +1094,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
     // Read DT_STRTAB from block map to get library names
     let loaded_libs = if !dyn_info.needed_strtab_offsets.is_empty() && dyn_info.strsz > 0 {
         let strtab_file_off = vaddr_to_file_offset(&layout.segments, dyn_info.strtab_vaddr);
-        let strtab_data = read_file_range(&block_map, strtab_file_off, dyn_info.strsz as usize);
+        let strtab_data = read_file_range(backing.as_ref(), strtab_file_off, dyn_info.strsz as usize);
 
         let exe_dir = path.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
         let mut libs = Vec::new();
@@ -1165,14 +1153,14 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
         // 7b. Read exe .dynsym/.dynstr from block map for exe sym map
         if !libs.is_empty() {
             let dynstr_file_off = vaddr_to_file_offset(&layout.segments, dyn_info.strtab_vaddr);
-            let dynstr_data = read_file_range(&block_map, dynstr_file_off, dyn_info.strsz as usize);
+            let dynstr_data = read_file_range(backing.as_ref(), dynstr_file_off, dyn_info.strsz as usize);
 
             // Determine .dynsym entry count via GNU hash table or SYMTAB/STRTAB gap
             let sym_count = if dyn_info.gnu_hash_vaddr != 0 {
                 let gnu_hash_file_off = vaddr_to_file_offset(&layout.segments, dyn_info.gnu_hash_vaddr);
                 // Read enough for the hash table (header + bloom + buckets + chains)
                 // Start with a generous read; typical .dynsym for executables is small
-                let gnu_hash_data = read_file_range(&block_map, gnu_hash_file_off,
+                let gnu_hash_data = read_file_range(backing.as_ref(), gnu_hash_file_off,
                     64 * 1024); // 64KB should cover most exe gnu_hash tables
                 elf::gnu_hash_sym_count_from_data(&gnu_hash_data)
             } else if dyn_info.symtab_vaddr != 0 && dyn_info.strtab_vaddr > dyn_info.symtab_vaddr {
@@ -1184,7 +1172,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
 
             let mut exe_sym_map = if sym_count > 0 {
                 let symtab_file_off = vaddr_to_file_offset(&layout.segments, dyn_info.symtab_vaddr);
-                let dynsym_data = read_file_range(&block_map, symtab_file_off, sym_count * elf::SYM_SIZE);
+                let dynsym_data = read_file_range(backing.as_ref(), symtab_file_off, sym_count * elf::SYM_SIZE);
                 elf::build_exe_sym_map(&dynsym_data, &dynstr_data, sym_count, PhysAddr::new(base))
             } else {
                 hashbrown::HashMap::new()
@@ -1194,8 +1182,8 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
             // This handles PIE executables that don't export symbols via --export-dynamic.
             if exe_sym_map.is_empty() {
                 if let Some((shoff, shnum, shentsize)) = layout.section_headers {
-                    let shdr_data = read_file_range(&block_map, shoff, shnum as usize * shentsize as usize);
-                    if let Some(m) = elf::build_symtab_map(&shdr_data, shentsize, &block_map, PhysAddr::new(base)) {
+                    let shdr_data = read_file_range(backing.as_ref(), shoff, shnum as usize * shentsize as usize);
+                    if let Some(m) = elf::build_symtab_map(&shdr_data, shentsize, backing.as_ref(), PhysAddr::new(base)) {
                         exe_sym_map = m;
                     }
                 }
@@ -1214,7 +1202,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
             let symtab_file_off = vaddr_to_file_offset(&layout.segments, dyn_info.symtab_vaddr);
             for &(r_offset, r_sym, _r_addend) in &parsed_relas.glob_dat {
                 if r_sym == 0 { continue; }
-                let sym_data = read_file_range(&block_map, symtab_file_off + r_sym as u64 * elf::SYM_SIZE as u64, elf::SYM_SIZE);
+                let sym_data = read_file_range(backing.as_ref(), symtab_file_off + r_sym as u64 * elf::SYM_SIZE as u64, elf::SYM_SIZE);
                 if sym_data.len() < elf::SYM_SIZE { continue; }
                 let sym_name = elf::Elf64Sym::from_slice(&sym_data, 0).name(&dynstr_data);
                 let resolved = libs.iter().find_map(|lib| elf::gnu_dlsym_pub(lib, sym_name));
@@ -1273,7 +1261,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
     // 10. TLS setup — read exe TLS template from page cache, build multi-module layout
     let exe_tls_template = if layout.tls_memsz > 0 {
         let tls_file_off = vaddr_to_file_offset(&layout.segments, layout.tls_vaddr);
-        let tls_data = read_file_range(&block_map, tls_file_off, layout.tls_filesz);
+        let tls_data = read_file_range(backing.as_ref(), tls_file_off, layout.tls_filesz);
         let tls_buf = OwnedAlloc::new(layout.tls_memsz, 16).expect("TLS template alloc");
         unsafe {
             core::ptr::copy_nonoverlapping(tls_data.as_ptr(), tls_buf.ptr(), layout.tls_filesz);
@@ -1310,7 +1298,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
         // Read exe .dynsym/.dynstr for resolving named TPOFF symbols
         let dynstr_data = if dyn_info.strsz > 0 {
             let dynstr_file_off = vaddr_to_file_offset(&layout.segments, dyn_info.strtab_vaddr);
-            read_file_range(&block_map, dynstr_file_off, dyn_info.strsz as usize)
+            read_file_range(backing.as_ref(), dynstr_file_off, dyn_info.strsz as usize)
         } else {
             Vec::new()
         };
@@ -1318,14 +1306,14 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
         for &(r_offset, r_sym, r_addend) in &parsed_relas.tpoff64 {
             let tpoff = resolve_exe_tpoff(
                 r_sym, r_addend, exe_base_offset, tls_total_memsz,
-                &layout.segments, dyn_info.symtab_vaddr, &block_map, &dynstr_data, &tls_info,
+                &layout.segments, dyn_info.symtab_vaddr, backing.as_ref(), &dynstr_data, &tls_info,
             );
             reloc_index.add_u64(r_offset, tpoff as u64);
         }
         for &(r_offset, r_sym, r_addend) in &parsed_relas.tpoff32 {
             let tpoff = resolve_exe_tpoff(
                 r_sym, r_addend, exe_base_offset, tls_total_memsz,
-                &layout.segments, dyn_info.symtab_vaddr, &block_map, &dynstr_data, &tls_info,
+                &layout.segments, dyn_info.symtab_vaddr, backing.as_ref(), &dynstr_data, &tls_info,
             );
             reloc_index.add_i32(r_offset, tpoff as i32);
         }
@@ -1376,7 +1364,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
     // Store info for lazy symbol loading (deferred until a crash backtrace)
     let syms = if let Some((sh_off, sh_num, sh_entsize)) = layout.section_headers {
         ProcessSymbols::lazy(
-            Arc::clone(&block_map),
+            Arc::clone(&backing),
             sh_off, sh_num as usize, sh_entsize as usize,
             base,
             base + layout.vaddr_min, base + layout.vaddr_max,
@@ -1850,27 +1838,23 @@ pub fn handle_page_fault(fault_addr: u64, _error_code: u64) -> bool {
             crate::vma::VmaKind::Anonymous => {
                 // Already zeroed by OwnedAlloc::new
             }
-            crate::vma::VmaKind::FileBacked { block_map, file_offset, file_size } => {
-                let mut cache_guard = crate::page_cache::lock();
-                let (cache, dev) = cache_guard.cache_and_dev();
-
-                // Walk 4KB blocks within the overlap of [region_start..region_end_full] and [vma_s..vma_e]
+            crate::vma::VmaKind::FileBacked { backing, file_offset, file_size } => {
                 let fill_start = region_start.max(vma_s);
                 let fill_end = region_end_full.min(vma_e);
                 let mut vaddr = fill_start & !0xFFF;
 
                 while vaddr < fill_end {
                     let vma_offset = vaddr - vma_s;
-                    let byte_offset = vma_offset + file_offset;
-                    let block_idx = (byte_offset / 4096) as usize;
                     let page_offset = (vaddr - region_start) as usize;
 
-                    if vma_offset < *file_size && block_idx < block_map.len() {
-                        let cache_phys = cache.ensure_cached(dev, block_map[block_idx]);
+                    if vma_offset < *file_size {
+                        let byte_offset = vma_offset + file_offset;
+                        let mut page_buf = [0u8; 4096];
+                        backing.read_page(byte_offset, &mut page_buf);
                         let valid = if vma_offset + 4096 <= *file_size { 4096 } else { (*file_size - vma_offset) as usize };
                         unsafe {
                             core::ptr::copy_nonoverlapping(
-                                cache_phys.as_ptr::<u8>(),
+                                page_buf.as_ptr(),
                                 page_ptr.add(page_offset),
                                 valid,
                             );

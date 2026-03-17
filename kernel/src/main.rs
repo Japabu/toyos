@@ -21,12 +21,10 @@ mod mouse;
 mod block;
 #[allow(dead_code)]
 mod page_cache;
-#[allow(dead_code)]
-mod ramdisk;
 mod tmpfs;
-#[allow(dead_code)]
-mod toyfs;
+mod file_backing;
 mod bcachefs_adapter;
+#[allow(dead_code)]
 mod vfs;
 mod elf;
 mod symbols;
@@ -187,63 +185,17 @@ fn kernel_main(
     listener::init();
     shared_memory::init();
 
-    // Mount initrd ramdisk (bcachefs format)
+    // Mount initrd as read-only root filesystem (bcachefs, no extraction)
     assert!(!initrd.is_empty(), "No initrd provided");
-    let initrd_io = unsafe { bcachefs::SliceBlockIO::new(initrd.as_ptr(), initrd.len()) };
-    let initrd_fs = bcachefs::Mounted::<_, bcachefs::ReadOnly>::open(initrd_io)
-        .expect("Failed to mount bcachefs initrd");
+    let initrd_base = initrd.as_ptr();
+    let initrd_fs = bcachefs_adapter::mount_initrd(initrd_base, initrd.len());
+    vfs::lock().set_root(Box::new(bcachefs_adapter::ReadOnlyBcacheFsAdapter::new(initrd_fs, initrd_base)));
 
-    // Mount root filesystem (bcachefs on NVMe) and tmpfs
-    vfs::lock().set_root(Box::new(bcachefs_adapter::BcacheFsAdapter::new(bcachefs_instance)));
+    // Mount NVMe bcachefs at /home for persistent user data
+    vfs::lock().mount("home", Box::new(bcachefs_adapter::BcacheFsAdapter::new(bcachefs_instance)));
     vfs::lock().mount("tmp", Box::new(crate::tmpfs::TmpFs::new()));
 
-    // Extract initrd into root filesystem (fresh binaries every boot)
-    {
-        let t0 = clock::nanos_since_boot();
-
-        // Nuke old system directories and reclaim space
-        {
-            let mut v = vfs::lock();
-            let r = v.root_mut();
-            r.delete_prefix("bin/");
-            r.delete_prefix("lib/");
-            r.delete_prefix("share/");
-        }
-
-        let t1 = clock::nanos_since_boot();
-
-        let files = initrd_fs.list().expect("Failed to list initrd");
-        let mut total_bytes = 0u64;
-        for (name, _size) in &files {
-            if let Some(target) = initrd_fs.read_link(name) {
-                vfs::lock().root_mut().create_symlink(name, &target)
-                    .unwrap_or_else(|e| panic!("symlink {} -> {}: {}", name, target, e));
-            } else {
-                let data = initrd_fs.read_file(name)
-                    .unwrap_or_else(|e| panic!("read initrd {}: {:?}", name, e));
-                let mtime = initrd_fs.file_mtime(name);
-                total_bytes += data.len() as u64;
-                vfs::lock().root_mut().create(name, &data, mtime)
-                    .unwrap_or_else(|e| panic!("extract {} ({} bytes): {}", name, data.len(), e));
-            }
-        }
-
-        let t2 = clock::nanos_since_boot();
-
-        vfs::lock().root_mut().sync();
-
-        let t3 = clock::nanos_since_boot();
-        log!("Boot: initrd {} files, {} MB extracted in {}ms (delete {}ms, write {}ms, sync {}ms)",
-            files.len(), total_bytes / (1024 * 1024),
-            (t3 - t0) / 1_000_000,
-            (t1 - t0) / 1_000_000,
-            (t2 - t1) / 1_000_000,
-            (t3 - t2) / 1_000_000);
-    }
-    // initrd_fs dropped
-
-    // Ensure home directory exists
-    vfs::lock().create_dir("/home");
+    // Ensure home directories exist on NVMe
     vfs::lock().create_dir("/home/root");
     vfs::lock().create_dir("/home/root/.config");
 

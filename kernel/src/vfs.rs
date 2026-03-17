@@ -41,9 +41,9 @@ pub trait FileSystem: Send {
     fn delete_prefix(&mut self, prefix: &str);
     fn create_symlink(&mut self, name: &str, target: &str) -> Result<(), &'static str>;
     fn sync(&mut self);
-    /// Return disk block numbers for each 4KB block of a file.
-    /// Only supported by block-device-backed filesystems (ToyFS).
-    fn file_block_map(&mut self, _name: &str) -> Option<Vec<u64>> { None }
+    /// Open a file backing for demand-paged loading.
+    /// Returns a trait object that the page fault handler uses to read pages.
+    fn open_backing(&mut self, _name: &str) -> Option<alloc::sync::Arc<dyn crate::file_backing::FileBacking>> { None }
 }
 
 
@@ -388,13 +388,13 @@ impl Vfs {
         }
     }
 
-    /// Return disk block numbers for a file. Only works for block-device-backed files.
+    /// Open a file backing for demand-paged loading.
     /// Follows symlinks (up to 10 levels).
-    pub fn file_block_map(&mut self, path: &str) -> Option<Vec<u64>> {
-        self.file_block_map_depth(path, 0)
+    pub fn open_backing(&mut self, path: &str) -> Option<alloc::sync::Arc<dyn crate::file_backing::FileBacking>> {
+        self.open_backing_depth(path, 0)
     }
 
-    fn file_block_map_depth(&mut self, path: &str, depth: u32) -> Option<Vec<u64>> {
+    fn open_backing_depth(&mut self, path: &str, depth: u32) -> Option<alloc::sync::Arc<dyn crate::file_backing::FileBacking>> {
         if depth > 10 { return None; }
         let (mount, file) = self.resolve_path("/", path);
         if mount.is_empty() { return None; }
@@ -407,9 +407,9 @@ impl Vfs {
             } else {
                 format!("/{}", target)
             };
-            return self.file_block_map_depth(&resolved, depth + 1);
+            return self.open_backing_depth(&resolved, depth + 1);
         }
-        fs.file_block_map(&fs_path)
+        fs.open_backing(&fs_path)
     }
 
 }

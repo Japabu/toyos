@@ -728,7 +728,7 @@ pub fn build_exe_sym_map<'a>(
 pub fn build_symtab_map(
     shdr_data: &[u8],
     shentsize: u16,
-    block_map: &[u64],
+    backing: &dyn crate::file_backing::FileBacking,
     base: PhysAddr,
 ) -> Option<hashbrown::HashMap<&'static str, PhysAddr>> {
     let shent = shentsize as usize;
@@ -760,8 +760,8 @@ pub fn build_symtab_map(
     let strtab_off = u64::from_le_bytes(shdr_data[link_off + 24..link_off + 32].try_into().ok()?);
     let strtab_size = u64::from_le_bytes(shdr_data[link_off + 32..link_off + 40].try_into().ok()?);
 
-    let symtab_data = crate::process::read_file_range(block_map, symtab_off, symtab_size as usize);
-    let strtab_data = crate::process::read_file_range(block_map, strtab_off, strtab_size as usize);
+    let symtab_data = crate::process::read_file_range(backing, symtab_off, symtab_size as usize);
+    let strtab_data = crate::process::read_file_range(backing, strtab_off, strtab_size as usize);
 
     // Leak the strtab data so we can return &'static str references
     let strtab_leaked: &'static [u8] = alloc::vec::Vec::leak(strtab_data);

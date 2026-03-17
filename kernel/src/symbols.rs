@@ -55,7 +55,7 @@ impl SymbolTable {
 
 /// Info needed to lazily load symbols from disk on first crash.
 struct LazySymbolSource {
-    block_map: Arc<Vec<u64>>,
+    backing: Arc<dyn crate::file_backing::FileBacking>,
     sh_off: u64,
     sh_num: usize,
     sh_entsize: usize,
@@ -102,7 +102,7 @@ impl ProcessSymbols {
 
     /// Create lazy symbols — stores metadata for on-demand loading.
     pub fn lazy(
-        block_map: Arc<Vec<u64>>,
+        backing: Arc<dyn crate::file_backing::FileBacking>,
         sh_off: u64, sh_num: usize, sh_entsize: usize,
         base: u64,
         prog_base: u64, prog_end: u64,
@@ -111,7 +111,7 @@ impl ProcessSymbols {
         Self {
             table: SymbolTable::new(),
             loaded: false,
-            lazy_source: Some(LazySymbolSource { block_map, sh_off, sh_num, sh_entsize, base }),
+            lazy_source: Some(LazySymbolSource { backing, sh_off, sh_num, sh_entsize, base }),
             prog_base, prog_end, stack_base, stack_end,
         }
     }
@@ -229,7 +229,7 @@ fn load_from_source(src: &LazySymbolSource, table: &mut SymbolTable) {
     use crate::process::read_file_range;
 
     let shdr_size = src.sh_num * src.sh_entsize;
-    let shdr_data = read_file_range(&src.block_map, src.sh_off, shdr_size);
+    let shdr_data = read_file_range(src.backing.as_ref(), src.sh_off, shdr_size);
 
     let class = elf::file::Class::ELF64;
     let endian = AnyEndian::Little;
@@ -257,8 +257,8 @@ fn load_from_source(src: &LazySymbolSource, table: &mut SymbolTable) {
     let Some(str_shdr) = strtab_shdr else { return };
 
     // Read .symtab and .strtab data from disk
-    let sym_data = read_file_range(&src.block_map, sym_shdr.sh_offset, sym_shdr.sh_size as usize);
-    let str_data = read_file_range(&src.block_map, str_shdr.sh_offset, str_shdr.sh_size as usize);
+    let sym_data = read_file_range(src.backing.as_ref(), sym_shdr.sh_offset, sym_shdr.sh_size as usize);
+    let str_data = read_file_range(src.backing.as_ref(), str_shdr.sh_offset, str_shdr.sh_size as usize);
 
     let entry_size = if sym_shdr.sh_entsize > 0 { sym_shdr.sh_entsize as usize } else { 24 };
     let count = sym_data.len() / entry_size;

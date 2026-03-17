@@ -546,19 +546,12 @@ impl<IO: BlockIO, Mode> Mounted<IO, Mode> {
         }
     }
 
-    /// Return the disk block numbers for each 4KB block of a file.
-    /// Used for memory-mapped / zero-copy file loading.
-    pub fn file_block_map(&self, name: &str) -> Option<Vec<u64>> {
+    /// Return the extents and file size for a file.
+    /// Used by the kernel to construct a FileBacking for demand-paged loading.
+    pub fn file_extents(&self, name: &str) -> Option<(Vec<Extent>, u64)> {
         let (_, value) = self.find_by_name(name).ok()??;
         let leaf = decode_leaf_value(&value).ok()?;
-        let extents = leaf.extents();
-        let mut blocks = Vec::new();
-        for ext in extents {
-            for i in 0..ext.block_count as u64 {
-                blocks.push(ext.start_block + i);
-            }
-        }
-        Some(blocks)
+        Some((leaf.extents().to_vec(), leaf.size()))
     }
 
     /// Check if a name is a symlink.

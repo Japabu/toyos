@@ -2,14 +2,14 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::UserAddr;
+use crate::file_backing::FileBacking;
 
 /// What a virtual memory area is backed by.
 pub enum VmaKind {
-    /// File-backed region. On RO fault: map page cache page directly (zero copy).
-    /// On RW fault: allocate private page, copy from page cache.
+    /// File-backed region. On fault: read page from backing store, copy into frame.
     FileBacked {
-        /// Maps file block index to disk block number.
-        block_map: Arc<Vec<u64>>,
+        /// The backing store that provides file pages (NVMe or initrd).
+        backing: Arc<dyn FileBacking>,
         /// Byte offset within the file where this VMA starts.
         file_offset: u64,
         /// Number of valid file bytes in this VMA (from start). Bytes beyond
