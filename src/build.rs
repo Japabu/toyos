@@ -13,6 +13,8 @@ use crate::toolchain;
 struct SystemConfig {
     programs: HashMap<String, ProgramConfig>,
     init: Vec<String>,
+    #[serde(default)]
+    symlinks: HashMap<String, String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -201,6 +203,11 @@ pub fn build(root: &Path, debug: bool, release: bool, toolchain_changed: bool) {
     // Add assets
     initrd_files.extend(assets::collect());
 
+    // Collect symlinks from config
+    let initrd_symlinks: Vec<(String, String)> = config.symlinks.iter()
+        .map(|(name, target)| (name.clone(), target.clone()))
+        .collect();
+
     // Write initrd contents to target/initrd/ for inspection
     let initrd_dir = root.join("target/initrd");
     if initrd_dir.exists() {
@@ -211,9 +218,15 @@ pub fn build(root: &Path, debug: bool, release: bool, toolchain_changed: bool) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, data).unwrap();
     }
+    for (name, target) in &initrd_symlinks {
+        let path = initrd_dir.join(name);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // Write symlink target as a text file for inspection
+        fs::write(&path, format!("-> {}", target)).unwrap();
+    }
     eprintln!("initrd contents written to target/initrd/");
 
-    let initrd_bytes = image::create_initrd(&initrd_files);
+    let initrd_bytes = image::create_initrd(&initrd_files, &initrd_symlinks);
     let disk_bytes = image::create_boot_image(&initrd_bytes, profile);
 
     fs::write(root.join("target/bootable.img"), disk_bytes).expect("Failed to write image");

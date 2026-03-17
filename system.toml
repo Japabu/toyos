@@ -1,6 +1,5 @@
 # Init programs (run at boot, in order)
 init = [
-    "/bin/toybox --install",
     "/bin/toybox locale --load",
     "/bin/compositor",
     "/bin/soundd",
@@ -26,3 +25,22 @@ toyos-ld = {}
 input-test = {}
 proctest = {}
 cargo = { no-default-features = true, warnings = false }
+
+# Symlinks created in the initrd at build time.
+# Paths are relative to the filesystem root (no leading /).
+[symlinks]
+"bin/cat" = "/bin/toybox"
+"bin/echo" = "/bin/toybox"
+"bin/free" = "/bin/toybox"
+"bin/grep" = "/bin/toybox"
+"bin/locale" = "/bin/toybox"
+"bin/ls" = "/bin/toybox"
+"bin/mkdir" = "/bin/toybox"
+"bin/net" = "/bin/toybox"
+"bin/ps" = "/bin/toybox"
+"bin/pwd" = "/bin/toybox"
+"bin/rm" = "/bin/toybox"
+"bin/screen" = "/bin/toybox"
+"bin/shutdown" = "/bin/toybox"
+"bin/spin" = "/bin/toybox"
+"bin/tone" = "/bin/toybox"

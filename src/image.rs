@@ -4,12 +4,16 @@ use std::io::{Cursor, Read, Write};
 
 use bcachefs::{Formatted, VecBlockIO};
 
-pub fn create_initrd(files: &[(String, Vec<u8>)]) -> Vec<u8> {
+pub fn create_initrd(
+    files: &[(String, Vec<u8>)],
+    symlinks: &[(String, String)],
+) -> Vec<u8> {
     let data_size: usize = files.iter().map(|(_, d)| d.len()).sum::<usize>();
+    let total_entries = files.len() + symlinks.len();
     // Estimate: superblock(1) + bitmap + btree nodes + data blocks + backup(1) + 10% padding
     let data_blocks = (data_size + 4095) / 4096;
-    let btree_blocks = (files.len() / 30).max(2); // ~30 entries per leaf node
-    let overhead = 64; // bitmap + metadata
+    let btree_blocks = (total_entries / 30).max(2);
+    let overhead = 64;
     let total_blocks = (1 + overhead + btree_blocks + data_blocks) * 11 / 10;
     let total_blocks = total_blocks.max(64) as u64;
 
@@ -20,6 +24,12 @@ pub fn create_initrd(files: &[(String, Vec<u8>)]) -> Vec<u8> {
         eprintln!("initrd: adding '{}' ({} bytes)", name, data.len());
         fs.create(name, data, 0)
             .unwrap_or_else(|e| panic!("initrd: failed to add '{}': {:?}", name, e));
+    }
+
+    for (name, target) in symlinks {
+        eprintln!("initrd: symlink '{}' -> '{}'", name, target);
+        fs.create_symlink(name, target, 0)
+            .unwrap_or_else(|e| panic!("initrd: failed to symlink '{}' -> '{}': {:?}", name, target, e));
     }
 
     fs.into_io().into_vec()
