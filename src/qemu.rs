@@ -34,12 +34,12 @@ pub fn launch(debug: bool, dump_audio: bool) {
         .arg("-netdev").arg("user,id=net0,hostfwd=tcp::2222-:22")
         .arg("-device").arg("virtio-net-pci-non-transitional,netdev=net0");
 
-    // VirtIO sound — wav file output for analysis or CoreAudio for listening
+    // VirtIO sound — wav file output for analysis or native audio for listening
     if dump_audio {
         eprintln!("Audio output: /tmp/toyos-audio.wav");
         qemu.arg("-audiodev").arg("wav,id=audio0,path=/tmp/toyos-audio.wav");
     } else {
-        qemu.arg("-audiodev").arg("coreaudio,id=audio0");
+        qemu.arg("-audiodev").arg(format!("{},id=audio0", audio_backend()));
     }
     qemu.arg("-device").arg("virtio-sound-pci,audiodev=audio0,streams=1");
 
@@ -59,4 +59,16 @@ pub fn launch(debug: bool, dump_audio: bool) {
     }
 
     qemu.status().expect("failed to execute QEMU");
+}
+
+fn audio_backend() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "coreaudio"
+    } else if cfg!(target_os = "linux") {
+        "pipewire"
+    } else if cfg!(target_os = "windows") {
+        "dsound"
+    } else {
+        "none"
+    }
 }

@@ -86,9 +86,6 @@ pub fn build(root: &Path, debug: bool, release: bool, toolchain_changed: bool) {
         panic!("Failed to build bootloader");
     }
 
-    // Ensure the ToyOS sysroot has host target libraries so proc-macros can compile
-    ensure_host_target_in_sysroot(root);
-
     let userland_dir = root.join("userland");
 
     // Clean workspace target on toolchain change
@@ -307,40 +304,3 @@ fn find_host_rlibs(root: &Path) -> Option<std::path::PathBuf> {
     None
 }
 
-fn ensure_host_target_in_sysroot(root: &Path) {
-    let host = toolchain::host_triple();
-    let toyos_sysroot = root.join("rust/build/x86_64-unknown-toyos/stage2/lib/rustlib");
-    if !toyos_sysroot.exists() {
-        return;
-    }
-    let host_target_dir = toyos_sysroot.join(&host);
-    if host_target_dir.exists() {
-        return;
-    }
-
-    let output = Command::new("rustc")
-        .args(["--print", "sysroot"])
-        .output()
-        .expect("Failed to run rustc");
-    let stable_sysroot = String::from_utf8(output.stdout).unwrap();
-    let stable_sysroot = stable_sysroot.trim();
-    let source = Path::new(stable_sysroot).join("lib/rustlib").join(&host);
-    assert!(
-        source.exists(),
-        "Host target {} not found in stable toolchain at {}",
-        host,
-        source.display()
-    );
-
-    #[cfg(unix)]
-    std::os::unix::fs::symlink(&source, &host_target_dir).unwrap_or_else(|e| {
-        panic!(
-            "Failed to symlink {} -> {}: {}",
-            host_target_dir.display(),
-            source.display(),
-            e
-        )
-    });
-    #[cfg(not(unix))]
-    panic!("Symlinking host target not supported on this platform");
-}
