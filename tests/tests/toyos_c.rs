@@ -176,6 +176,7 @@ toyos_c_tests!(
     (t158_vla, "158_vla"),
     (t159_va_list, "159_va_list"),
     (t160_global_variadic, "160_global_variadic"),
+    (t90_static_vs_global, "90_static_vs_global"),
 );
 
 /// Debug mode: boots QEMU with GDB stub, then polls for commands via file IPC.

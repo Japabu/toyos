@@ -204,10 +204,6 @@ pub fn has_space(pipe_id: PipeId) -> bool {
     })
 }
 
-pub fn all_empty() -> bool {
-    with_pipes(|pipes| pipes.iter().all(|(_, pipe)| pipe.header().available() == 0))
-}
-
 pub fn cleanup_pml4(pml4: *mut u64) {
     with_pipes_mut(|pipes| {
         for (_, pipe) in pipes.iter_mut() {

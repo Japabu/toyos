@@ -384,7 +384,6 @@ fn build_toyos_crate(crate_path: &Path) -> (String, Vec<u8>) {
         Command::new("cargo")
             .args(["build", "--target", "x86_64-unknown-toyos"])
             .env("RUSTUP_TOOLCHAIN", "toyos")
-
             .env_remove("RUSTC")
             .current_dir(crate_path)
             .status()
@@ -392,7 +391,15 @@ fn build_toyos_crate(crate_path: &Path) -> (String, Vec<u8>) {
             .success(),
         "Failed to build userland/{name}"
     );
-    let binary = crate_path.join(format!("target/x86_64-unknown-toyos/debug/{name}"));
+    // Workspace members output to the workspace target dir (parent of crate_path)
+    let workspace_target = crate_path.parent().unwrap().join("target");
+    let binary = workspace_target.join(format!("x86_64-unknown-toyos/debug/{name}"));
+    // Fall back to crate-local target dir for standalone crates
+    let binary = if binary.exists() {
+        binary
+    } else {
+        crate_path.join(format!("target/x86_64-unknown-toyos/debug/{name}"))
+    };
     let data = fs::read(&binary).unwrap_or_else(|e| {
         panic!("Failed to read {}: {e}", binary.display());
     });

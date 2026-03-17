@@ -1683,10 +1683,6 @@ pub fn block_poll(fds: [u64; 64], len: u32, deadline: u64) {
     scheduler::block(ProcessState::BlockedPoll { deadline });
 }
 
-pub fn yield_now() {
-    scheduler::yield_now();
-}
-
 // ---------------------------------------------------------------------------
 // Futex
 // ---------------------------------------------------------------------------

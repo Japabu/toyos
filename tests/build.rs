@@ -28,9 +28,15 @@ fn main() {
 fn build_libc_toyos(libc_dir: &std::path::Path) -> PathBuf {
     let target = "x86_64-unknown-toyos";
     let target_dir = libc_dir.join("target");
-    let output = Command::new("cargo")
+    // Remove all CARGO_* env vars from the outer build to prevent interference
+    let mut cmd = Command::new("cargo");
+    for (key, _) in std::env::vars() {
+        if key.starts_with("CARGO") || key == "RUSTC" || key == "RUSTFLAGS" {
+            cmd.env_remove(&key);
+        }
+    }
+    let output = cmd
         .env("RUSTUP_TOOLCHAIN", "toyos")
-        .env_remove("RUSTC")
         .args(["rustc", "--release", "--target", target, "--crate-type", "staticlib"])
         .arg("--manifest-path")
         .arg(libc_dir.join("Cargo.toml"))
