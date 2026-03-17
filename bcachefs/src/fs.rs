@@ -335,7 +335,7 @@ impl<IO: BlockIO> Formatted<IO> {
 
     /// Create a file on the formatted filesystem (used during mkfs).
     pub fn create(&mut self, name: &str, data: &[u8], mtime: u64) -> Result<(), FsError> {
-        if name.len() > MAX_NAME_LEN {
+        if name.is_empty() || name.len() > MAX_NAME_LEN {
             return Err(FsError::NameTooLong { len: name.len(), max: MAX_NAME_LEN });
         }
 
@@ -354,7 +354,7 @@ impl<IO: BlockIO> Formatted<IO> {
 
     /// Create a symlink on the formatted filesystem.
     pub fn create_symlink(&mut self, name: &str, target: &str, mtime: u64) -> Result<(), FsError> {
-        if name.len() > MAX_NAME_LEN {
+        if name.is_empty() || name.len() > MAX_NAME_LEN {
             return Err(FsError::NameTooLong { len: name.len(), max: MAX_NAME_LEN });
         }
 
@@ -576,7 +576,7 @@ impl<IO: BlockIO, Mode> Mounted<IO, Mode> {
 impl<IO: BlockIO> Mounted<IO, ReadWrite> {
     /// Create a file.
     pub fn create(&mut self, name: &str, data: &[u8], mtime: u64) -> Result<(), FsError> {
-        if name.len() > MAX_NAME_LEN {
+        if name.is_empty() || name.len() > MAX_NAME_LEN {
             return Err(FsError::NameTooLong { len: name.len(), max: MAX_NAME_LEN });
         }
 
@@ -597,7 +597,7 @@ impl<IO: BlockIO> Mounted<IO, ReadWrite> {
 
     /// Create a symlink.
     pub fn create_symlink(&mut self, name: &str, target: &str) -> Result<(), FsError> {
-        if name.len() > MAX_NAME_LEN {
+        if name.is_empty() || name.len() > MAX_NAME_LEN {
             return Err(FsError::NameTooLong { len: name.len(), max: MAX_NAME_LEN });
         }
 

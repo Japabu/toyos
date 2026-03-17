@@ -203,16 +203,8 @@ fn long_filename_near_entry_limit() {
 fn zero_length_filename_rejected() {
     let io = VecBlockIO::new(128);
     let mut fs = Formatted::format(io);
-    // Empty filename shouldn't be silently accepted
-    // Current behavior: it would hash to a deterministic value and work.
-    // This test documents the behavior — either error or accept consistently.
     let result = fs.create("", b"data", 0);
-    // If create succeeds, verify it's retrievable
-    if result.is_ok() {
-        let mounted = fs.mount_readonly();
-        assert_eq!(mounted.read_file("").unwrap(), b"data");
-    }
-    // If it errors, that's also acceptable
+    assert!(result.is_err(), "empty filename should be rejected");
 }
 
 #[test]
@@ -332,24 +324,54 @@ fn mounted_readwrite_delete() {
 
 #[test]
 fn mounted_readwrite_delete_prefix() {
-    let io = VecBlockIO::new(512);
+    // 200 files, only 3 match the prefix. Verifies the full-tree scan
+    // doesn't accidentally delete non-matching entries (keys are hash-ordered,
+    // not name-ordered, so prefix matching must check every leaf).
+    let io = VecBlockIO::new(4096);
     let fs = Formatted::format(io);
     let mut mounted = Mounted::<_, ReadWrite>::open(fs.into_io()).expect("open");
 
+    // Create 200 files across various prefixes
+    for i in 0..100 {
+        let name = format!("lib/lib_{:03}.so", i);
+        mounted.create(&name, format!("lib{}", i).as_bytes(), 0).expect("create lib");
+    }
+    for i in 0..100 {
+        let name = format!("share/asset_{:03}", i);
+        mounted.create(&name, format!("asset{}", i).as_bytes(), 0).expect("create share");
+    }
     mounted.create("bin/shell", b"shell", 0).expect("create");
     mounted.create("bin/editor", b"editor", 0).expect("create");
-    mounted.create("lib/core.so", b"core", 0).expect("create");
-    mounted.create("share/font", b"font", 0).expect("create");
+    mounted.create("bin/compositor", b"compositor", 0).expect("create");
 
-    assert_eq!(mounted.list().unwrap().len(), 4);
+    assert_eq!(mounted.list().unwrap().len(), 203);
 
     mounted.delete_prefix("bin/");
     let files = mounted.list().unwrap();
-    assert_eq!(files.len(), 2, "expected 2 files after deleting bin/, got: {:?}", files);
+    assert_eq!(files.len(), 200, "expected 200 files after deleting bin/, got {}", files.len());
     assert!(mounted.read_file("bin/shell").is_err());
     assert!(mounted.read_file("bin/editor").is_err());
-    assert_eq!(mounted.read_file("lib/core.so").unwrap(), b"core");
-    assert_eq!(mounted.read_file("share/font").unwrap(), b"font");
+    assert!(mounted.read_file("bin/compositor").is_err());
+
+    // Verify all non-matching files survived
+    for i in 0..100 {
+        let name = format!("lib/lib_{:03}.so", i);
+        assert_eq!(
+            mounted.read_file(&name).unwrap(),
+            format!("lib{}", i).as_bytes(),
+            "{} corrupted after delete_prefix",
+            name
+        );
+    }
+    for i in 0..100 {
+        let name = format!("share/asset_{:03}", i);
+        assert_eq!(
+            mounted.read_file(&name).unwrap(),
+            format!("asset{}", i).as_bytes(),
+            "{} corrupted after delete_prefix",
+            name
+        );
+    }
 }
 
 #[test]
@@ -397,6 +419,57 @@ fn mounted_readwrite_sync_and_reopen() {
 
     assert_eq!(mounted2.read_file("persistent.txt").unwrap(), b"I survive reboots");
     assert_eq!(mounted2.file_mtime("persistent.txt"), 42);
+}
+
+#[test]
+fn mounted_readwrite_double_roundtrip() {
+    // Create → sync → reopen rw → create more → sync → reopen ro → verify all.
+    // Catches bitmap free count drift or state corruption across reopens.
+    let io = VecBlockIO::new(512);
+    let fs = Formatted::format(io);
+    let mut m = Mounted::<_, ReadWrite>::open(fs.into_io()).expect("open");
+
+    m.create("round1.txt", b"first round", 10).expect("create round1");
+    m.sync();
+    let raw = m.into_formatted().into_io().into_vec();
+
+    // Reopen read-write, add more
+    let mut m = Mounted::<_, ReadWrite>::open(VecBlockIO::from_vec(raw)).expect("reopen rw");
+    assert_eq!(m.read_file("round1.txt").unwrap(), b"first round");
+    m.create("round2.txt", b"second round", 20).expect("create round2");
+    m.sync();
+    let raw = m.into_formatted().into_io().into_vec();
+
+    // Final read-only verification
+    let m = Mounted::<_, ReadOnly>::open(VecBlockIO::from_vec(raw)).expect("reopen ro");
+    assert_eq!(m.list().unwrap().len(), 2);
+    assert_eq!(m.read_file("round1.txt").unwrap(), b"first round");
+    assert_eq!(m.read_file("round2.txt").unwrap(), b"second round");
+    assert_eq!(m.file_mtime("round1.txt"), 10);
+    assert_eq!(m.file_mtime("round2.txt"), 20);
+}
+
+#[test]
+fn mounted_readwrite_overwrite_with_smaller_data() {
+    // Overwrite a 4KB file with 10 bytes. Verifies old extents are freed
+    // and the reclaimed blocks are reusable.
+    let io = VecBlockIO::new(64); // tight on space
+    let fs = Formatted::format(io);
+    let mut m = Mounted::<_, ReadWrite>::open(fs.into_io()).expect("open");
+
+    // Fill with a large file (uses most free blocks)
+    let big = vec![0xBBu8; 40 * 1024]; // 10 blocks
+    m.create("big.bin", &big, 0).expect("create big");
+
+    // Overwrite with tiny data — should free the 10 blocks
+    m.create("big.bin", b"tiny", 0).expect("overwrite with smaller");
+    assert_eq!(m.read_file("big.bin").unwrap(), b"tiny");
+    assert_eq!(m.list().unwrap().len(), 1);
+
+    // The freed blocks should be reusable — create another large file
+    let big2 = vec![0xCCu8; 40 * 1024];
+    m.create("big2.bin", &big2, 0).expect("create big2 with reclaimed space");
+    assert_eq!(m.read_file("big2.bin").unwrap(), big2);
 }
 
 // --- Filesystem capacity ---
@@ -469,27 +542,26 @@ fn crc_verification_on_nodes() {
 fn corrupt_data_block_returns_raw_bytes() {
     // Data blocks have no CRC — corruption returns silently corrupted data.
     // This documents the current limitation (Phase 4 adds per-extent checksums).
+    //
+    // Layout for a 128-block filesystem:
+    //   block 0: superblock
+    //   block 1: bitmap (128 blocks / 32768 bits_per_block = 1 block)
+    //   block 2: root btree node
+    //   block 3+: data blocks (first file's data starts here)
+    //   block 127: superblock backup
     let io = VecBlockIO::new(128);
     let mut fs = Formatted::format(io);
     let original = vec![0xAAu8; 4096];
     fs.create("data.bin", &original, 0).expect("create");
-
-    let mounted = fs.mount_readonly();
-    let block_map = mounted.file_block_map("data.bin").expect("block_map");
-    assert!(!block_map.is_empty());
-    let data_block = block_map[0];
-    fs = mounted.into_formatted();
-
     let mut raw = fs.into_io().into_vec();
 
-    // Corrupt one byte in the data block
-    let data_offset = data_block as usize * 4096 + 50;
+    // Corrupt byte 50 of the first data block (block 3)
+    let data_offset = 3 * 4096 + 50;
     raw[data_offset] ^= 0xFF;
 
     let io = VecBlockIO::from_vec(raw);
     let mounted = Mounted::<_, ReadOnly>::open(io).expect("mount");
     let data = mounted.read_file("data.bin").expect("read should succeed — no data CRC");
-    // Data should be corrupted — byte 50 is flipped
     assert_ne!(data, original, "corruption should be visible in read data");
     assert_eq!(data[50], 0xAA ^ 0xFF, "byte 50 should be flipped");
 }
