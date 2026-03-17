@@ -190,7 +190,7 @@ impl DeviceTrait for Device {
         toyos_abi::ipc::send(control, MSG_AUDIO_OPEN, &req).expect("soundd not responding");
 
         // Wait for response on our dedicated control socket — no mixing
-        let (_msg_type, _response): (u32, AudioOpenResponse) = toyos_abi::ipc::recv(control);
+        let (_msg_type, _response): (u32, AudioOpenResponse) = toyos_abi::ipc::recv(control).expect("soundd not responding");
 
         let write_fd = pipe.write;
         let playing = Arc::new(AtomicBool::new(false));
