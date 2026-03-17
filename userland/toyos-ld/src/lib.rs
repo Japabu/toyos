@@ -98,10 +98,6 @@ impl Collected {
             }
         }
         for (sym, has_call) in referenced {
-            // __tls_get_addr is called via TLS GD/LD sequences which are always
-            // relaxed to LE/IE (local exec). The call gets overwritten, so this
-            // symbol is never actually needed at runtime.
-            if sym == "__tls_get_addr" { continue; }
             if !self.state.globals.contains_key(&sym)
                 && !self.state.locals.keys().any(|(_, n)| n == &sym)
             {

@@ -363,10 +363,21 @@ pub(crate) fn layout_elf(state: &mut LinkState, base_addr: u64, entry_name: Opti
         matches!(r.r_type,
             RelocType::X86Gotpcrel | RelocType::X86Gotpcrelx
             | RelocType::X86RexGotpcrelx | RelocType::X86Gottpoff)
-        // GD→IE relaxation needs a GOT slot: always in shared mode, or for dynamic TLS in PIE
+        // GD/LD needs a GOT slot: always in shared mode, or for dynamic TLS in PIE
         || (r.r_type == RelocType::X86Tlsgd
             && (is_shared || state.dynamic_imports.contains(r.target.name())))
+        || (r.r_type == RelocType::X86Tlsld && is_shared)
     });
+
+    // In shared mode, TLS GD/LD symbols need two consecutive GOT slots (DTPMOD64+DTPOFF64)
+    let tlsgd_syms: HashSet<&str> = if is_shared {
+        state.relocs.iter()
+            .filter(|r| r.r_type == RelocType::X86Tlsgd || r.r_type == RelocType::X86Tlsld)
+            .map(|r| r.target.name())
+            .collect()
+    } else {
+        HashSet::new()
+    };
 
     cursor = align_up(cursor, 8);
     let mut got = HashMap::new();
@@ -375,7 +386,11 @@ pub(crate) fn layout_elf(state: &mut LinkState, base_addr: u64, entry_name: Opti
         // Dynamic symbols use dyn_got (resolved at load time via GLOB_DAT)
         if dyn_sym_names.contains(sym.name()) { continue; }
         got.insert(sym.clone(), cursor);
-        cursor += 8;
+        if tlsgd_syms.contains(sym.name()) {
+            cursor += 16; // Two slots: DTPMOD64 + DTPOFF64
+        } else {
+            cursor += 8;
+        }
     }
 
     let mut dyn_got = HashMap::new();
@@ -896,7 +911,10 @@ pub(crate) fn emit_elf(
 
     // Rela count
     let rela_count = if let Some(relocs) = relocs {
-        relocs.relatives.len() + relocs.glob_dats.len() + relocs.tpoff64s.len() + relocs.named_tpoff64s.len() + relocs.tpoff32s.len()
+        relocs.relatives.len() + relocs.glob_dats.len()
+            + relocs.tpoff64s.len() + relocs.named_tpoff64s.len() + relocs.tpoff32s.len()
+            + relocs.dtpmod64s.len() + relocs.dtpoff64s.len()
+            + relocs.named_dtpmod64s.len() + relocs.named_dtpoff64s.len()
     } else { 0 };
     let rela_size = rela_count as u64 * 24;
 
@@ -1197,7 +1215,7 @@ pub(crate) fn emit_elf(
 
         // Shared library RELA (reserved before dynamic section, must be written here)
         if let Some(relocs) = relocs {
-            if !relocs.relatives.is_empty() || !relocs.glob_dats.is_empty() || !relocs.tpoff64s.is_empty() || !relocs.named_tpoff64s.is_empty() || !relocs.tpoff32s.is_empty() {
+            if rela_count > 0 {
                 w.write_align_relocation();
                 for &(offset, addend) in &relocs.relatives {
                     w.write_relocation(true, &Rel {
@@ -1239,6 +1257,40 @@ pub(crate) fn emit_elf(
                         r_sym: 0,
                         r_type: elf::R_X86_64_TPOFF32,
                         r_addend: addend,
+                    });
+                }
+                for &(got_vaddr, addend) in &relocs.dtpmod64s {
+                    w.write_relocation(true, &Rel {
+                        r_offset: got_vaddr,
+                        r_sym: 0,
+                        r_type: elf::R_X86_64_DTPMOD64,
+                        r_addend: addend,
+                    });
+                }
+                for &(got_vaddr, addend) in &relocs.dtpoff64s {
+                    w.write_relocation(true, &Rel {
+                        r_offset: got_vaddr,
+                        r_sym: 0,
+                        r_type: elf::R_X86_64_DTPOFF64,
+                        r_addend: addend,
+                    });
+                }
+                for (got_vaddr, sym_name) in &relocs.named_dtpmod64s {
+                    let sym_idx = sym_to_writer_idx[sym_name];
+                    w.write_relocation(true, &Rel {
+                        r_offset: *got_vaddr,
+                        r_sym: sym_idx.0,
+                        r_type: elf::R_X86_64_DTPMOD64,
+                        r_addend: 0,
+                    });
+                }
+                for (got_vaddr, sym_name) in &relocs.named_dtpoff64s {
+                    let sym_idx = sym_to_writer_idx[sym_name];
+                    w.write_relocation(true, &Rel {
+                        r_offset: *got_vaddr,
+                        r_sym: sym_idx.0,
+                        r_type: elf::R_X86_64_DTPOFF64,
+                        r_addend: 0,
                     });
                 }
             }

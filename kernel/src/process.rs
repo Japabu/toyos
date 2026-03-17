@@ -365,6 +365,8 @@ pub struct ProcessData {
     pub tls_total_memsz: usize,
     /// Maximum TLS alignment across all modules.
     pub tls_max_align: usize,
+    /// Next module ID to assign on dlopen (1-based, exe=1).
+    pub next_tls_module_id: u64,
     // Crash diagnostics
     pub symbols: ProcessSymbols,
     // Dynamically loaded shared libraries (indexed by dlopen handle)
@@ -592,26 +594,39 @@ pub fn with_fd_owner_data<R>(f: impl FnOnce(&mut ProcessData) -> R) -> R {
 ///                              ^-- FS base (thread pointer)
 /// Returns (alloc, fs_base).
 pub fn setup_tls(tls_template: KernelAddr, tls_filesz: usize, tls_memsz: usize, tls_align: usize) -> Option<(OwnedAlloc, u64)> {
-    setup_combined_tls(&[elf::TlsModule { template: tls_template, filesz: tls_filesz, memsz: tls_memsz, base_offset: 0 }], tls_memsz, tls_align)
+    setup_combined_tls(&[elf::TlsModule { template: tls_template, filesz: tls_filesz, memsz: tls_memsz, base_offset: 0, module_id: 1 }], tls_memsz, tls_align)
 }
 
 /// Allocate a combined TLS area for multiple modules (exe + shared libraries).
 /// Each module's template is copied at its base_offset within the block.
 ///
 /// x86-64 TLS Variant II layout:
-///   [alignment padding] [TLS data (.tdata + .tbss)] [TCB (64 bytes)]
-///                                                    ^-- TP (FS base)
+///   [DTV] [alignment padding] [TLS data (.tdata + .tbss)] [TCB (64 bytes)]
+///                                                          ^-- TP (FS base)
 ///
 /// The linker (LLD) computes TPOFF = sym_offset - memsz (raw, NOT rounded).
 /// TP must be placed at data_start + memsz to match.
 /// data_start must be aligned to tls_align so variable offsets work correctly.
 ///
 /// TCB layout:
-///   TP+0x00: self-pointer
-///   TP+0x08: DTV pointer (unused, zero)
+///   TP+0x00: self-pointer (fs:[0] == &TCB, x86_64 ABI requirement)
+///   TP+0x08: DTV pointer (user-visible physical address of DTV)
 ///   TP+0x10..0x3F: reserved (zero)
+///
+/// DTV layout (at start of allocation):
+///   [0x00] generation: u64
+///   [0x08] len: u64 (max module_id this DTV can hold)
+///   [0x10] entries[0]: u64 (pointer for module_id=1)
+///   [0x18] entries[1]: u64 (pointer for module_id=2)
+///   ...
 const TCB_SIZE: usize = 64;
 const TLS_DLOPEN_RESERVE: usize = 64 * 1024;
+/// Initial DTV capacity (number of module entries).
+const DTV_INITIAL_CAPACITY: usize = 64;
+/// Header size: generation (8) + len (8).
+const DTV_HEADER_SIZE: usize = 16;
+/// Sentinel value for unallocated DTV entries.
+pub const DTV_UNALLOCATED: u64 = !0u64;
 
 pub fn setup_combined_tls(
     modules: &[crate::elf::TlsModule],
@@ -649,6 +664,34 @@ pub fn setup_combined_tls(
     // Write self-pointer via kernel direct map
     let tp_kernel = block as u64 + (tls_start + total_memsz) as u64;
     unsafe { *(tp_kernel as *mut u64) = tp_user; }
+
+    // Set up DTV at the start of the allocation.
+    // DTV entries point to the start of each module's TLS data (user-visible addresses).
+    let dtv_size = DTV_HEADER_SIZE + DTV_INITIAL_CAPACITY * 8;
+    assert!(dtv_size < tls_start, "DTV overlaps TLS data");
+    let dtv_kern = block as *mut u64;
+    unsafe {
+        // generation = 1 (initial)
+        *dtv_kern = 1;
+        // len = DTV_INITIAL_CAPACITY
+        *dtv_kern.add(1) = DTV_INITIAL_CAPACITY as u64;
+        // Initialize all entries as unallocated
+        for i in 0..DTV_INITIAL_CAPACITY {
+            *dtv_kern.add(2 + i) = DTV_UNALLOCATED;
+        }
+        // Fill entries for static modules: dtv[module_id - 1] = user addr of module's TLS data
+        for module in modules {
+            let idx = module.module_id as usize;
+            if idx > 0 && idx <= DTV_INITIAL_CAPACITY {
+                let module_tls_addr = block_phys + (tls_start + module.base_offset) as u64;
+                *dtv_kern.add(2 + idx - 1) = module_tls_addr;
+            }
+        }
+    }
+
+    // Write DTV pointer to TCB[8] (user-visible physical address of DTV)
+    let dtv_user = block_phys;
+    unsafe { *((tp_kernel + 8) as *mut u64) = dtv_user; }
 
     Some((alloc, tp_user))
 }
@@ -788,6 +831,7 @@ pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64, stack_base: u64) -> Op
         tls_modules,
         tls_total_memsz,
         tls_max_align,
+        next_tls_module_id: 2,
         symbols: ProcessSymbols::empty(),
         loaded_libs: Vec::new(),
         mmap_regions: Vec::new(),
@@ -978,17 +1022,22 @@ fn build_tls_layout(
     loaded_libs: &[elf::LoadedLib],
     layout: &elf::ElfLayout,
     exe_tls_template: Option<&OwnedAlloc>,
-) -> (Vec<elf::TlsModule>, usize, usize) {
+) -> (Vec<elf::TlsModule>, usize, usize, u64) {
     let mut modules = Vec::new();
     let mut cursor = 0usize;
     let mut max_align = 1usize;
+    // Module ID 1 = exe, 2+ = shared libs. Libs are laid out first in the block,
+    // then the exe. Module IDs are assigned in layout order (libs first).
+    let mut next_module_id = 2u64; // 1 reserved for exe
 
     for lib in loaded_libs {
         if lib.tls_memsz > 0 {
             if cursor > 0 { cursor = (cursor + 15) & !15; }
+            let mid = next_module_id;
+            next_module_id += 1;
             modules.push(elf::TlsModule {
                 template: lib.tls_template, filesz: lib.tls_filesz,
-                memsz: lib.tls_memsz, base_offset: cursor,
+                memsz: lib.tls_memsz, base_offset: cursor, module_id: mid,
             });
             cursor += lib.tls_memsz;
             if lib.tls_align > max_align { max_align = lib.tls_align; }
@@ -1002,13 +1051,13 @@ fn build_tls_layout(
             .unwrap_or(KernelAddr::null());
         modules.push(elf::TlsModule {
             template: template_addr, filesz: layout.tls_filesz,
-            memsz: layout.tls_memsz, base_offset: cursor,
+            memsz: layout.tls_memsz, base_offset: cursor, module_id: 1,
         });
         cursor += layout.tls_memsz;
         if layout.tls_align > max_align { max_align = layout.tls_align; }
     }
 
-    (modules, cursor, max_align)
+    (modules, cursor, max_align, next_module_id)
 }
 
 pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> Result<Pid, SyscallError> {
@@ -1275,7 +1324,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
         None
     };
 
-    let (tls_modules, tls_total_memsz, max_tls_align) =
+    let (tls_modules, tls_total_memsz, max_tls_align, next_tls_module_id) =
         build_tls_layout(&loaded_libs, &layout, exe_tls_template.as_ref());
 
     // Apply TPOFF relocations for shared libraries
@@ -1419,6 +1468,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
         tls_modules,
         tls_total_memsz,
         tls_max_align: max_tls_align,
+        next_tls_module_id,
         symbols: syms,
         loaded_libs,
         mmap_regions: Vec::new(),

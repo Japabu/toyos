@@ -22,6 +22,16 @@ pub(crate) struct RelocOutput {
     /// R_X86_64_TPOFF32 runtime relocations for shared libraries: (vaddr of imm32, addend).
     /// Used for LD→LE relaxation in shared mode where DTPOFF32 immediates need load-time patching.
     pub(crate) tpoff32s: Vec<(u64, i64)>,
+    /// R_X86_64_DTPMOD64 runtime relocations for DTV-based TLS in shared libraries:
+    /// (GOT slot vaddr, addend). Kernel writes the module ID at load time.
+    pub(crate) dtpmod64s: Vec<(u64, i64)>,
+    /// R_X86_64_DTPOFF64 runtime relocations for DTV-based TLS in shared libraries:
+    /// (GOT slot vaddr, addend). Addend is the symbol's offset within its module's TLS segment.
+    pub(crate) dtpoff64s: Vec<(u64, i64)>,
+    /// Named R_X86_64_DTPMOD64 for cross-library TLS: (GOT slot vaddr, symbol name).
+    pub(crate) named_dtpmod64s: Vec<(u64, String)>,
+    /// Named R_X86_64_DTPOFF64 for cross-library TLS: (GOT slot vaddr, symbol name).
+    pub(crate) named_dtpoff64s: Vec<(u64, String)>,
 }
 
 /// Resolve a symbol to its virtual address.
@@ -235,6 +245,10 @@ pub(crate) fn apply_relocs(
     let mut tpoff64_entries: Vec<(u64, i64)> = Vec::new();
     let mut named_tpoff64_entries: Vec<(u64, String)> = Vec::new();
     let mut tpoff32_entries: Vec<(u64, i64)> = Vec::new();
+    let mut dtpmod64_entries: Vec<(u64, i64)> = Vec::new();
+    let mut dtpoff64_entries: Vec<(u64, i64)> = Vec::new();
+    let mut named_dtpmod64_entries: Vec<(u64, String)> = Vec::new();
+    let mut named_dtpoff64_entries: Vec<(u64, String)> = Vec::new();
 
     let relocs = std::mem::take(&mut state.relocs);
 
@@ -260,17 +274,42 @@ pub(crate) fn apply_relocs(
                         symbol: reloc.target.name().to_string(),
                     });
                 }
-                if is_dynamic || params.is_shared {
-                    // GD → IE (16-byte padded): `data16; leaq; data16*2; rex64; call`
+                if params.is_shared {
+                    // Shared mode: preserve GD sequence for DTV-based TLS.
+                    // Keep `call __tls_get_addr` intact. Emit DTPMOD64+DTPOFF64
+                    // for the two consecutive GOT slots (TlsIndex pair).
+                    let got_slot = *params.got.get(&reloc.target).ok_or_else(|| {
+                        LinkError::UndefinedSymbols(vec![reloc.target.name().to_string()])
+                    })?;
+                    // Patch leaq's disp32 to point to GOT slot pair
+                    let sec_vaddr = state.sections[reloc.section].vaddr.unwrap();
+                    let rip = sec_vaddr + reloc.offset + 4; // end of leaq instruction
+                    let disp = got_slot as i64 - rip as i64;
+                    check_i32(disp, reloc)?;
+                    write_i32(state, reloc.section, reloc.offset, disp as i32);
+                    // Don't add to relaxed_calls — let the call __tls_get_addr PLT32 reloc fire
+                    if is_dynamic {
+                        // Cross-library TLS: named relocations for kernel to resolve
+                        named_dtpmod64_entries.push((got_slot, reloc.target.name().to_string()));
+                        named_dtpoff64_entries.push((got_slot + 8, reloc.target.name().to_string()));
+                    } else {
+                        // Same-module TLS: kernel writes module ID, offset is known
+                        let sym_addr = resolve_symbol(state, &reloc.target, params.plt)
+                            .ok_or_else(|| LinkError::UndefinedSymbols(vec![reloc.target.name().to_string()]))?;
+                        let sym_tls_offset = sym_addr as i64 - params.tls_start as i64;
+                        dtpmod64_entries.push((got_slot, 0));
+                        dtpoff64_entries.push((got_slot + 8, sym_tls_offset));
+                    }
+                } else if is_dynamic {
+                    // PIE with dynamic TLS: GD → IE relaxation
+                    // `data16; leaq; data16*2; rex64; call`
                     // → `mov %fs:0,%rax; add sym@GOTTPOFF(%rip),%rax`
-                    // Used for shared libs (all TLS) and PIE (dynamic TLS only)
                     #[rustfmt::skip]
                     let inst: [u8; 16] = [
                         0x64, 0x48, 0x8b, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00, // mov %fs:0,%rax
                         0x48, 0x03, 0x05, 0x00, 0x00, 0x00, 0x00,             // add 0(%rip),%rax
                     ];
                     write_bytes(state, reloc.section, reloc.offset - 4, &inst);
-                    // Compute RIP-relative offset to GOT slot
                     let got_slot = *params.got.get(&reloc.target).ok_or_else(|| {
                         LinkError::UndefinedSymbols(vec![reloc.target.name().to_string()])
                     })?;
@@ -280,16 +319,8 @@ pub(crate) fn apply_relocs(
                     check_i32(disp, reloc)?;
                     write_i32(state, reloc.section, reloc.offset + 8, disp as i32);
                     relaxed_calls.insert((reloc.section, reloc.offset + 8));
-                    if is_dynamic {
-                        // Cross-library TLS: emit named TPOFF64 for kernel to resolve
-                        named_tpoff64_entries.push((got_slot, reloc.target.name().to_string()));
-                    } else {
-                        // Same-library TLS: emit local TPOFF64 with known offset
-                        let sym_addr = resolve_symbol(state, &reloc.target, params.plt)
-                            .ok_or_else(|| LinkError::UndefinedSymbols(vec![reloc.target.name().to_string()]))?;
-                        let sym_tls_offset = sym_addr as i64 - params.tls_start as i64;
-                        tpoff64_entries.push((got_slot, sym_tls_offset));
-                    }
+                    // Cross-library TLS: emit named TPOFF64 for kernel to resolve
+                    named_tpoff64_entries.push((got_slot, reloc.target.name().to_string()));
                 } else {
                     let sym_addr = resolve_symbol(state, &reloc.target, params.plt)
                         .ok_or_else(|| LinkError::UndefinedSymbols(vec![reloc.target.name().to_string()]))?;
@@ -308,45 +339,59 @@ pub(crate) fn apply_relocs(
                 }
             }
             RelocType::X86Tlsld => {
-                // LD → LE: get thread pointer. In shared mode, subsequent DTPOFF32
-                // accesses emit R_X86_64_TPOFF32 runtime relocs for load-time patching.
-                let padded = is_padded_tls_sequence(
-                    &state.sections[reloc.section].data,
-                    reloc.offset,
-                );
-                if padded {
-                    // LD → LE (16-byte padded)
-                    #[rustfmt::skip]
-                    let inst: [u8; 16] = [
-                        0x66, 0x66, 0x66,                                           // 3x data16
-                        0x64, 0x48, 0x8b, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00,     // mov %fs:0,%rax
-                        0x0f, 0x1f, 0x40, 0x00,                                     // nopl 0(%rax)
-                    ];
-                    write_bytes(state, reloc.section, reloc.offset - 4, &inst);
-                    relaxed_calls.insert((reloc.section, reloc.offset + 8));
+                if params.is_shared {
+                    // Shared mode: preserve LD sequence for DTV-based TLS.
+                    // Keep `call __tls_get_addr` intact. Emit DTPMOD64 for the
+                    // module GOT slot (shared across all LD accesses in this module).
+                    let got_slot = *params.got.get(&reloc.target).ok_or_else(|| {
+                        LinkError::UndefinedSymbols(vec![reloc.target.name().to_string()])
+                    })?;
+                    let sec_vaddr = state.sections[reloc.section].vaddr.unwrap();
+                    let rip = sec_vaddr + reloc.offset + 4; // end of leaq instruction
+                    let disp = got_slot as i64 - rip as i64;
+                    check_i32(disp, reloc)?;
+                    write_i32(state, reloc.section, reloc.offset, disp as i32);
+                    // Don't add to relaxed_calls — keep the call __tls_get_addr
+                    // Emit DTPMOD64 for module ID (offset slot is 0 for LD)
+                    dtpmod64_entries.push((got_slot, 0));
+                    dtpoff64_entries.push((got_slot + 8, 0));
                 } else {
-                    // LD → LE (12-byte unpadded)
-                    #[rustfmt::skip]
-                    let inst: [u8; 12] = [
-                        0x66, 0x66, 0x66,                                           // 3x data16
-                        0x64, 0x48, 0x8b, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00,     // mov %fs:0,%rax
-                    ];
-                    write_bytes(state, reloc.section, reloc.offset - 3, &inst);
-                    relaxed_calls.insert((reloc.section, reloc.offset + 5));
+                    // LD → LE: get thread pointer
+                    let padded = is_padded_tls_sequence(
+                        &state.sections[reloc.section].data,
+                        reloc.offset,
+                    );
+                    if padded {
+                        // LD → LE (16-byte padded)
+                        #[rustfmt::skip]
+                        let inst: [u8; 16] = [
+                            0x66, 0x66, 0x66,                                           // 3x data16
+                            0x64, 0x48, 0x8b, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00,     // mov %fs:0,%rax
+                            0x0f, 0x1f, 0x40, 0x00,                                     // nopl 0(%rax)
+                        ];
+                        write_bytes(state, reloc.section, reloc.offset - 4, &inst);
+                        relaxed_calls.insert((reloc.section, reloc.offset + 8));
+                    } else {
+                        // LD → LE (12-byte unpadded)
+                        #[rustfmt::skip]
+                        let inst: [u8; 12] = [
+                            0x66, 0x66, 0x66,                                           // 3x data16
+                            0x64, 0x48, 0x8b, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00,     // mov %fs:0,%rax
+                        ];
+                        write_bytes(state, reloc.section, reloc.offset - 3, &inst);
+                        relaxed_calls.insert((reloc.section, reloc.offset + 5));
+                    }
                 }
             }
             RelocType::X86Dtpoff32 => {
                 let sym_addr = resolve_symbol(state, &reloc.target, params.plt)
                     .ok_or_else(|| LinkError::UndefinedSymbols(vec![reloc.target.name().to_string()]))?;
                 if params.is_shared {
-                    // Shared mode: TLSLD relaxation gave us `mov %fs:0, %rax`, so
-                    // DTPOFF32 must produce a tpoff. We don't know the final tpoff
-                    // at link time, so write a placeholder and emit R_X86_64_TPOFF32.
-                    let sec_vaddr = state.sections[reloc.section].vaddr.unwrap();
-                    let imm_vaddr = sec_vaddr + reloc.offset;
-                    let sym_tls_offset = sym_addr as i64 - params.tls_start as i64 + reloc.addend;
-                    write_i32(state, reloc.section, reloc.offset, 0);
-                    tpoff32_entries.push((imm_vaddr, sym_tls_offset));
+                    // Shared mode: LD is not relaxed, so __tls_get_addr returned the
+                    // module's TLS base. DTPOFF32 is just a literal offset from there.
+                    let value = sym_addr as i64 - params.tls_start as i64 + reloc.addend;
+                    check_i32(value, reloc)?;
+                    write_i32(state, reloc.section, reloc.offset, value as i32);
                 } else {
                     let value = tpoff(sym_addr, params.tls_start, params.tls_memsz) + reloc.addend;
                     check_i32(value, reloc)?;
@@ -480,6 +525,9 @@ pub(crate) fn apply_relocs(
             // GD→IE GOT entries are handled via tpoff64/named_tpoff64 entries (collected in pass 1)
             if tpoff64_entries.iter().any(|&(v, _)| v == got_vaddr) { continue; }
             if named_tpoff64_entries.iter().any(|(v, _)| *v == got_vaddr) { continue; }
+            // DTV GOT entries are handled via dtpmod64/dtpoff64 entries (collected in pass 1)
+            if dtpmod64_entries.iter().any(|&(v, _)| v == got_vaddr) { continue; }
+            if named_dtpmod64_entries.iter().any(|(v, _)| *v == got_vaddr) { continue; }
             // Dynamic TLS symbols: emit named TPOFF64 for kernel to resolve
             let is_dynamic_tls = gottpoff_syms.contains(sym_ref)
                 && matches!(state.globals.get(sym_ref.name()), Some(SymbolDef::Dynamic { .. }));
@@ -518,7 +566,18 @@ pub(crate) fn apply_relocs(
         return Err(LinkError::UndefinedSymbols(syms));
     }
 
-    Ok(RelocOutput { relatives, glob_dats, tpoff_fills, tpoff64s: tpoff64_entries, named_tpoff64s: named_tpoff64_entries, tpoff32s: tpoff32_entries })
+    Ok(RelocOutput {
+        relatives,
+        glob_dats,
+        tpoff_fills,
+        tpoff64s: tpoff64_entries,
+        named_tpoff64s: named_tpoff64_entries,
+        tpoff32s: tpoff32_entries,
+        dtpmod64s: dtpmod64_entries,
+        dtpoff64s: dtpoff64_entries,
+        named_dtpmod64s: named_dtpmod64_entries,
+        named_dtpoff64s: named_dtpoff64_entries,
+    })
 }
 
 // ── AArch64 relocation helpers ───────────────────────────────────────────

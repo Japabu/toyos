@@ -1217,9 +1217,18 @@ fn sys_dlopen(path: &str) -> u64 {
 
     // Phase 1: resolve relocations (ProcessData lock)
     let data_arc = process::fd_owner_data();
-    let (new_total, modules) = {
+    let (new_total, modules, _module_id) = {
         let mut data = data_arc.lock();
         crate::elf::resolve_dlopen_relocs(&lib, &data.loaded_libs);
+
+        // Assign module ID for DTV
+        let module_id = if lib_has_tls {
+            let mid = data.next_tls_module_id;
+            data.next_tls_module_id += 1;
+            mid
+        } else {
+            0
+        };
 
         if lib_has_tls {
             let new_memsz = lib.tls_memsz;
@@ -1228,7 +1237,7 @@ fn sys_dlopen(path: &str) -> u64 {
             }
             data.tls_modules.insert(0, crate::elf::TlsModule {
                 template: lib.tls_template, filesz: lib.tls_filesz,
-                memsz: lib.tls_memsz, base_offset: 0,
+                memsz: lib.tls_memsz, base_offset: 0, module_id,
             });
             let raw_total = data.tls_modules.iter()
                 .map(|m| m.base_offset + m.memsz)
@@ -1248,7 +1257,12 @@ fn sys_dlopen(path: &str) -> u64 {
             crate::elf::apply_tpoff_relocs(&lib, lib_base_offset, data.tls_total_memsz, &tls_info);
         }
 
-        (data.tls_total_memsz, data.tls_modules.clone())
+        // Apply DTPMOD64/DTPOFF64 relocations (write module_id + offset into GOT slot pairs)
+        if lib_has_tls {
+            crate::elf::apply_dtpmod_relocs(&lib, module_id);
+        }
+
+        (data.tls_total_memsz, data.tls_modules.clone(), module_id)
     };
 
     // Phase 2: extend TLS in-place for ALL threads of this process.
@@ -1299,6 +1313,30 @@ fn sys_dlopen(path: &str) -> u64 {
             if m.filesz > 0 && !m.template.is_null() {
                 unsafe {
                     core::ptr::copy_nonoverlapping(m.template.as_ptr::<u8>(), dest, m.filesz);
+                }
+            }
+
+            // Update DTV entry for the new module.
+            // The DTV is at the start of the TLS allocation (user-visible physical address).
+            // DTV layout: [generation: u64][len: u64][entries[0]: u64]...
+            // Entry index = module_id - 1
+            let dtv_user = alloc_start; // DTV is at offset 0 of TLS allocation
+            let dtv_kern = PhysAddr::new(dtv_user).to_kernel().raw() as *mut u64;
+            let dtv_idx = _module_id as usize - 1;
+            let dtv_len = unsafe { *dtv_kern.add(1) } as usize;
+            if dtv_idx < dtv_len {
+                // Point DTV entry to the module's TLS data in the static block
+                let module_tls_phys = new_tls_start + m.base_offset as u64;
+                // Convert to physical address (new_tls_start is already physical)
+                unsafe { *dtv_kern.add(2 + dtv_idx) = module_tls_phys; }
+
+                // Also update DTV entries for all shifted modules (their base_offsets changed)
+                for module in &modules[1..] {
+                    let idx = module.module_id as usize - 1;
+                    if idx < dtv_len {
+                        let phys = new_tls_start + module.base_offset as u64;
+                        unsafe { *dtv_kern.add(2 + idx) = phys; }
+                    }
                 }
             }
 

@@ -16,6 +16,8 @@ use elf::abi::{
     DT_SYMTAB, DT_STRTAB, DT_STRSZ, DT_NULL, SHT_DYNSYM, EI_NIDENT,
 };
 
+const R_X86_64_DTPMOD64: u32 = 16;
+const R_X86_64_DTPOFF64: u32 = 17;
 const R_X86_64_TPOFF64: u32 = 18;
 const R_X86_64_TPOFF32: u32 = 23;
 
@@ -104,6 +106,10 @@ pub struct CachedRelocs {
     pub tpoff64: alloc::vec::Vec<(u64, u32, i64)>,
     /// TPOFF32: (offset_from_base, r_sym, r_addend)
     pub tpoff32: alloc::vec::Vec<(u64, u32, i64)>,
+    /// DTPMOD64: (offset_from_base, r_sym, r_addend) — kernel writes module_id
+    pub dtpmod64: alloc::vec::Vec<(u64, u32, i64)>,
+    /// DTPOFF64: (offset_from_base, r_sym, r_addend) — kernel writes TLS offset within module
+    pub dtpoff64: alloc::vec::Vec<(u64, u32, i64)>,
 }
 
 /// Scan rela/jmprel tables and extract non-RELATIVE entries.
@@ -112,6 +118,8 @@ fn prescan_relocs(rela_addr: KernelAddr, rela_size: u64, jmprel_addr: KernelAddr
         bind: alloc::vec::Vec::new(),
         tpoff64: alloc::vec::Vec::new(),
         tpoff32: alloc::vec::Vec::new(),
+        dtpmod64: alloc::vec::Vec::new(),
+        dtpoff64: alloc::vec::Vec::new(),
     };
     for (addr, size) in [(rela_addr, rela_size), (jmprel_addr, jmprel_size)] {
         if size == 0 || addr.is_null() { continue; }
@@ -121,6 +129,8 @@ fn prescan_relocs(rela_addr: KernelAddr, rela_size: u64, jmprel_addr: KernelAddr
                 6 | 7 => relocs.bind.push((rela.r_offset, rela.r_sym())),
                 R_X86_64_TPOFF64 => relocs.tpoff64.push((rela.r_offset, rela.r_sym(), rela.r_addend)),
                 R_X86_64_TPOFF32 => relocs.tpoff32.push((rela.r_offset, rela.r_sym(), rela.r_addend)),
+                R_X86_64_DTPMOD64 => relocs.dtpmod64.push((rela.r_offset, rela.r_sym(), rela.r_addend)),
+                R_X86_64_DTPOFF64 => relocs.dtpoff64.push((rela.r_offset, rela.r_sym(), rela.r_addend)),
                 _ => {}
             }
         }
@@ -196,8 +206,9 @@ fn cache_loaded_lib(path: &str, lib: LoadedLib, rw_vaddr: u64, rw_end_vaddr: u64
 
     // Pre-scan relocs from the allocation (which stays in place as the cache).
     let relocs = prescan_relocs(rela_addr, rela_size, jmprel_addr, jmprel_size);
-    log!("dlopen: cached {} with {} bind + {} tpoff64 + {} tpoff32 pre-scanned relocs",
-        path, relocs.bind.len(), relocs.tpoff64.len(), relocs.tpoff32.len());
+    log!("dlopen: cached {} with {} bind + {} tpoff64 + {} tpoff32 + {} dtpmod64 + {} dtpoff64 pre-scanned relocs",
+        path, relocs.bind.len(), relocs.tpoff64.len(), relocs.tpoff32.len(),
+        relocs.dtpmod64.len(), relocs.dtpoff64.len());
 
     // Allocate private RW pages for the first user.
     // Store as physical address — user processes see physical addresses
@@ -1188,6 +1199,8 @@ pub struct TlsModule {
     pub memsz: usize,
     /// Byte offset of this module within the combined TLS block.
     pub base_offset: usize,
+    /// DTV module ID (1-based). Used by __tls_get_addr to index the DTV.
+    pub module_id: u64,
 }
 
 /// TLS layout info for cross-library TPOFF resolution.
@@ -1240,6 +1253,58 @@ pub fn apply_tpoff_relocs(lib: &LoadedLib, lib_base_offset: usize, total_memsz: 
         if count64 > 0 || count32 > 0 {
             log!("dlopen: applied {} TPOFF64 + {} TPOFF32 relocs (base_offset={}, total_memsz={})",
                 count64, count32, lib_base_offset, total_memsz);
+        }
+    }
+}
+
+/// Apply R_X86_64_DTPMOD64 and R_X86_64_DTPOFF64 relocations in a shared library.
+/// `module_id` is the DTV module index assigned at dlopen time.
+/// DTPMOD64: writes `module_id` into the GOT slot (first of a TlsIndex pair).
+/// DTPOFF64: writes the symbol's offset within the TLS segment into the GOT slot
+///           (second of a TlsIndex pair). For sym=0, uses r_addend as the offset.
+pub fn apply_dtpmod_relocs(lib: &LoadedLib, module_id: u64) {
+    if let Some(relocs) = &lib.cached_relocs {
+        for &(r_offset, _r_sym, _r_addend) in &relocs.dtpmod64 {
+            unsafe { lib.rw_write::<u64>(lib.base + r_offset, module_id); }
+        }
+        for &(r_offset, r_sym, r_addend) in &relocs.dtpoff64 {
+            let offset = if r_sym != 0 {
+                let sym = lib.sym(r_sym as usize);
+                sym.st_value as i64 + r_addend
+            } else {
+                r_addend
+            };
+            unsafe { lib.rw_write::<u64>(lib.base + r_offset, offset as u64); }
+        }
+        if !relocs.dtpmod64.is_empty() || !relocs.dtpoff64.is_empty() {
+            log!("dlopen: applied {} DTPMOD64 + {} DTPOFF64 relocs (module_id={})",
+                relocs.dtpmod64.len(), relocs.dtpoff64.len(), module_id);
+        }
+    } else {
+        let mut count_mod = 0u64;
+        let mut count_off = 0u64;
+        for (rela_addr, rela_size) in [(lib.rela_addr, lib.rela_size), (lib.jmprel_addr, lib.jmprel_size)] {
+            if rela_size == 0 || rela_addr.is_null() { continue; }
+            for i in 0..rela_size / RELA_SIZE {
+                let rela = unsafe { (rela_addr + i * RELA_SIZE).read_at::<Elf64Rela>(0) };
+                if rela.r_type() == R_X86_64_DTPMOD64 {
+                    unsafe { lib.rw_write::<u64>(lib.base + rela.r_offset, module_id); }
+                    count_mod += 1;
+                } else if rela.r_type() == R_X86_64_DTPOFF64 {
+                    let offset = if rela.r_sym() != 0 {
+                        let sym = lib.sym(rela.r_sym() as usize);
+                        sym.st_value as i64 + rela.r_addend
+                    } else {
+                        rela.r_addend
+                    };
+                    unsafe { lib.rw_write::<u64>(lib.base + rela.r_offset, offset as u64); }
+                    count_off += 1;
+                }
+            }
+        }
+        if count_mod > 0 || count_off > 0 {
+            log!("dlopen: applied {} DTPMOD64 + {} DTPOFF64 relocs (module_id={})",
+                count_mod, count_off, module_id);
         }
     }
 }
