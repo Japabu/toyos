@@ -230,6 +230,9 @@ impl DeviceTrait for Device {
                         .min(buffer.len());
 
                     if content_len > 0 {
+                        // Write real audio to ring. Blocks when full — soundd
+                        // drains at hardware rate, so backpressure naturally
+                        // paces us to the consumption rate. No explicit sleep.
                         let mut written = 0;
                         while written < content_len {
                             let n = ring.write(&buffer[written..content_len]);
@@ -238,16 +241,9 @@ impl DeviceTrait for Device {
                                 std::thread::sleep(Duration::from_millis(1));
                             }
                         }
-                        // Pace to hardware rate: sleep proportional to samples written.
-                        // This is what CoreAudio/ALSA do — call the callback at the
-                        // rate the hardware consumes, not as fast as possible.
-                        let samples_written = content_len / (channels * sample_size);
-                        let sleep_nanos = samples_written as u64 * 1_000_000_000 / sample_rate as u64;
-                        std::thread::sleep(Duration::from_nanos(sleep_nanos));
                     } else {
-                        // App has no audio right now — sleep for one period and retry.
-                        let period_nanos = buffer_frames as u64 * 1_000_000_000 / sample_rate as u64;
-                        std::thread::sleep(Duration::from_nanos(period_nanos));
+                        // App has no audio right now.
+                        std::thread::sleep(Duration::from_millis(1));
                     }
 
                 }
