@@ -388,6 +388,16 @@ impl Vfs {
         }
     }
 
+    /// Sync all mounted filesystems to disk.
+    pub fn sync_all(&mut self) {
+        if let Some(root) = &mut self.root {
+            root.sync();
+        }
+        for fs in self.mounts.values_mut() {
+            fs.sync();
+        }
+    }
+
     /// Open a file backing for demand-paged loading.
     /// Follows symlinks (up to 10 levels).
     pub fn open_backing(&mut self, path: &str) -> Option<alloc::sync::Arc<dyn crate::file_backing::FileBacking>> {

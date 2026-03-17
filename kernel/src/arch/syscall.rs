@@ -178,6 +178,9 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             sys_delete(path)
         }
         SYS_SHUTDOWN => {
+            log!("Syncing filesystems...");
+            crate::vfs::lock().sync_all();
+            log!("Shutting down.");
             acpi::shutdown();
         }
         SYS_CHDIR => {

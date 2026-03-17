@@ -682,22 +682,18 @@ fn main() {
     let font_data = std::fs::read("/share/fonts/JetBrainsMono-8x16.font").expect("failed to read font");
     let font = font::Font::from_prebuilt(&font_data);
 
-    eprintln!("compositor: decoding wallpaper...");
-    let jpg_data = std::fs::read("/share/wallpaper.jpg").expect("failed to read wallpaper");
-    let wallpaper_img = {
-        let img = image::load_from_memory_with_format(&jpg_data, image::ImageFormat::Jpeg)
-            .expect("failed to decode wallpaper");
-        img.to_rgb8()
-    };
-    drop(jpg_data);
+    let wallpaper_raw = std::fs::read("/share/wallpaper.rgb").expect("failed to read wallpaper");
+    let wallpaper_w = u32::from_le_bytes(wallpaper_raw[0..4].try_into().unwrap()) as usize;
+    let wallpaper_h = u32::from_le_bytes(wallpaper_raw[4..8].try_into().unwrap()) as usize;
+    let wallpaper_pixels = &wallpaper_raw[8..];
     eprintln!(
-        "compositor: wallpaper decoded {}x{}, scaling to {}x{}",
-        wallpaper_img.width(), wallpaper_img.height(), screen.width(), screen.height()
+        "compositor: wallpaper {}x{}, scaling to {}x{}",
+        wallpaper_w, wallpaper_h, screen.width(), screen.height()
     );
     let mut wallpaper = scale_wallpaper(
-        wallpaper_img.as_raw(),
-        wallpaper_img.width() as usize,
-        wallpaper_img.height() as usize,
+        wallpaper_pixels,
+        wallpaper_w,
+        wallpaper_h,
         screen.width(),
         screen.height(),
         screen.pixel_format_raw() != 0,
@@ -1413,9 +1409,9 @@ fn main() {
                             screen_w = screen.width() as i32;
                             screen_h = screen.height() as i32;
                             wallpaper = scale_wallpaper(
-                                wallpaper_img.as_raw(),
-                                wallpaper_img.width() as usize,
-                                wallpaper_img.height() as usize,
+                                wallpaper_pixels,
+                                wallpaper_w,
+                                wallpaper_h,
                                 screen.width(),
                                 screen.height(),
                                 screen.pixel_format_raw() != 0,

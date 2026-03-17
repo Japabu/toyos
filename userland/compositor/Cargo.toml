@@ -5,7 +5,6 @@ edition = "2021"
 
 [dependencies]
 font = { path = "../font" }
-image = { version = "0.25", default-features = false, features = ["jpeg"] }
 sprite = { path = "../sprite" }
 toyos-abi = { path = "../../toyos-abi" }
 window = { path = "../window" }

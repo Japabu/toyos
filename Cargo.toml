@@ -11,6 +11,7 @@ toml = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 bcachefs = { path = "bcachefs" }
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
 
 [profile.release]
 opt-level = 2
