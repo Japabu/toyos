@@ -17,7 +17,6 @@ const BUFFER_FRAMES: u32 = 1024;
 
 /// soundd protocol constants (must match toyos_abi::audio).
 const MSG_AUDIO_OPEN: u32 = 1;
-const MSG_AUDIO_OPENED: u32 = 2;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -26,6 +25,12 @@ struct AudioOpenRequest {
     sample_rate: u32,
     channels: u16,
     format: u16,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct AudioOpenResponse {
+    stream_id: u32,
 }
 
 pub struct Host;
@@ -169,30 +174,23 @@ impl DeviceTrait for Device {
         let buffer_samples = buffer_frames as usize * channels;
         let buffer_bytes = buffer_samples * sample_size;
 
-        // Find soundd and open a stream via pipe
-        let soundd_pid = find_soundd();
+        // Connect to soundd and open a stream
+        let control = connect_soundd();
         let pipe = toyos_abi::syscall::pipe();
         let pipe_id = toyos_abi::syscall::pipe_id(pipe.read)
             .expect("pipe_id failed");
-        // We don't need the read end — soundd reads from it
         toyos_abi::syscall::close(pipe.read);
 
-        // Send open request to soundd
         let req = AudioOpenRequest {
             pipe_id,
             sample_rate: sample_rate as u32,
             channels: channels as u16,
             format: 0, // S16LE
         };
-        toyos_abi::message::send_bytes(
-            toyos_abi::Pid(soundd_pid),
-            MSG_AUDIO_OPEN,
-            unsafe { core::slice::from_raw_parts(&req as *const _ as *const u8, core::mem::size_of::<AudioOpenRequest>()) },
-        );
+        toyos_abi::ipc::send(control, MSG_AUDIO_OPEN, &req).expect("soundd not responding");
 
-        // Wait for response
-        let msg = toyos_abi::message::recv();
-        assert_eq!(msg.msg_type, MSG_AUDIO_OPENED, "unexpected response from soundd");
+        // Wait for response on our dedicated control socket — no mixing
+        let (_msg_type, _response): (u32, AudioOpenResponse) = toyos_abi::ipc::recv(control);
 
         let write_fd = pipe.write;
         let playing = Arc::new(AtomicBool::new(false));
@@ -253,11 +251,11 @@ impl DeviceTrait for Device {
     }
 }
 
-/// Find soundd's PID via the service registry. Retries briefly if not yet started.
-fn find_soundd() -> u32 {
+/// Connect to soundd. Retries briefly if not yet started.
+fn connect_soundd() -> toyos_abi::Fd {
     for _ in 0..100 {
-        if let Some(pid) = toyos_abi::syscall::find_pid("soundd") {
-            return pid.raw();
+        if let Ok(fd) = toyos_abi::syscall::connect("soundd") {
+            return fd;
         }
         std::thread::sleep(Duration::from_millis(10));
     }
