@@ -1,6 +1,6 @@
 use std::process::Command;
 
-pub fn launch(debug: bool) {
+pub fn launch(debug: bool, dump_audio: bool) {
     let mut qemu = Command::new("qemu-system-x86_64");
     qemu
         .arg("-machine").arg("q35")
@@ -32,12 +32,18 @@ pub fn launch(debug: bool) {
 
         // VirtIO networking with user-mode (SLIRP) backend
         .arg("-netdev").arg("user,id=net0,hostfwd=tcp::2222-:22")
-        .arg("-device").arg("virtio-net-pci-non-transitional,netdev=net0")
+        .arg("-device").arg("virtio-net-pci-non-transitional,netdev=net0");
 
-        // VirtIO sound
-        .arg("-audiodev").arg("coreaudio,id=audio0")
-        .arg("-device").arg("virtio-sound-pci,audiodev=audio0,streams=1")
+    // VirtIO sound — wav file output for analysis or CoreAudio for listening
+    if dump_audio {
+        eprintln!("Audio output: /tmp/toyos-audio.wav");
+        qemu.arg("-audiodev").arg("wav,id=audio0,path=/tmp/toyos-audio.wav");
+    } else {
+        qemu.arg("-audiodev").arg("coreaudio,id=audio0");
+    }
+    qemu.arg("-device").arg("virtio-sound-pci,audiodev=audio0,streams=1");
 
+    qemu
         .arg("-serial").arg("stdio")
 
         .arg("-no-reboot")
