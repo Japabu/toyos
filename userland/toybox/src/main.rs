@@ -22,18 +22,6 @@ macro_rules! commands {
                 _ => eprintln!("toybox: unknown command '{cmd}'"),
             }
         }
-
-        fn install() {
-            let names = &[$(stringify!($name)),*];
-            for name in names {
-                let link = format!("/bin/{name}");
-                // Remove existing file/symlink if present
-                std::fs::remove_file(&link).ok();
-                std::os::toyos::fs::symlink("/bin/toybox", &link).unwrap_or_else(|e| {
-                    eprintln!("toybox: failed to create symlink {link}: {e}");
-                });
-            }
-        }
     };
 }
 
@@ -47,20 +35,12 @@ fn main() {
         .unwrap_or("toybox");
 
     if invoked_as == "toybox" {
-        if args.get(1).map(|s| s.as_str()) == Some("--install") {
-            install();
-            return;
-        }
-        // Subcommand mode: toybox ls -la
         if args.len() < 2 {
             eprintln!("Usage: toybox <command> [args...]");
             return;
         }
-        let cmd_args = args[2..].to_vec();
-        run(&args[1], cmd_args);
+        run(&args[1], args[2..].to_vec());
     } else {
-        // Symlink mode: invoked as "ls -la"
-        let cmd_args = args[1..].to_vec();
-        run(invoked_as, cmd_args);
+        run(invoked_as, args[1..].to_vec());
     }
 }

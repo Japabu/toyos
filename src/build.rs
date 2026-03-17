@@ -182,7 +182,7 @@ pub fn build(root: &Path, debug: bool, release: bool, toolchain_changed: bool) {
         }
     }
 
-    // Collect binaries into initrd
+    // Collect initrd contents: binaries, rustc sysroot, assets, symlinks
     let mut initrd_files: Vec<(String, Vec<u8>)> = Vec::new();
     let workspace_target = userland_dir.join(format!("target/x86_64-unknown-toyos/{profile}"));
 
@@ -196,19 +196,13 @@ pub fn build(root: &Path, debug: bool, release: bool, toolchain_changed: bool) {
             fs::read(&binary).unwrap_or_else(|_| panic!("Failed to read binary for {name}"));
         initrd_files.push((format!("bin/{name}"), data));
     }
-
-    // Add hosted rustc sysroot if it exists
     collect_hosted_rustc(root, &mut initrd_files);
-
-    // Add assets
     initrd_files.extend(assets::collect());
 
-    // Collect symlinks from config
-    let initrd_symlinks: Vec<(String, String)> = config.symlinks.iter()
-        .map(|(name, target)| (name.clone(), target.clone()))
-        .collect();
+    let initrd_symlinks: Vec<(String, String)> = config.symlinks
+        .into_iter().collect();
 
-    // Write initrd contents to target/initrd/ for inspection
+    // Mirror initrd to target/initrd/ for inspection
     let initrd_dir = root.join("target/initrd");
     if initrd_dir.exists() {
         fs::remove_dir_all(&initrd_dir).expect("Failed to clean initrd dir");
@@ -221,10 +215,8 @@ pub fn build(root: &Path, debug: bool, release: bool, toolchain_changed: bool) {
     for (name, target) in &initrd_symlinks {
         let path = initrd_dir.join(name);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
-        // Write symlink target as a text file for inspection
-        fs::write(&path, format!("-> {}", target)).unwrap();
+        fs::write(&path, format!("-> {target}")).unwrap();
     }
-    eprintln!("initrd contents written to target/initrd/");
 
     let initrd_bytes = image::create_initrd(&initrd_files, &initrd_symlinks);
     let disk_bytes = image::create_boot_image(&initrd_bytes, profile);
