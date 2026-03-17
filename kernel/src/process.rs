@@ -611,6 +611,7 @@ pub fn setup_tls(tls_template: KernelAddr, tls_filesz: usize, tls_memsz: usize, 
 ///   TP+0x08: DTV pointer (unused, zero)
 ///   TP+0x10..0x3F: reserved (zero)
 const TCB_SIZE: usize = 64;
+const TLS_DLOPEN_RESERVE: usize = 64 * 1024;
 
 pub fn setup_combined_tls(
     modules: &[crate::elf::TlsModule],
@@ -618,7 +619,7 @@ pub fn setup_combined_tls(
     tls_align: usize,
 ) -> Option<(OwnedAlloc, u64)> {
     let block_size = total_memsz + TCB_SIZE;
-    let alloc_size = paging::align_2m(block_size + tls_align);
+    let alloc_size = paging::align_2m(block_size + tls_align + TLS_DLOPEN_RESERVE);
     let alloc = OwnedAlloc::new_uninit(alloc_size, PAGE_2M as usize)?;
     let block = alloc.ptr();
 

@@ -1289,9 +1289,9 @@ fn sys_dlopen(path: &str) -> u64 {
 
             let new_tls_start = tp - new_total as u64;
             if new_tls_start < alloc_start {
-                log!("dlopen: TLS extension overflow for pid={} (need {:#x}, alloc starts {:#x})",
+                log!("dlopen: TLS overflow for pid={} (need {:#x}, alloc starts {:#x})",
                     pid, new_tls_start, alloc_start);
-                continue;
+                return SyscallError::ResourceExhausted.to_u64();
             }
 
             let m = &modules[0];
