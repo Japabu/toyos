@@ -546,6 +546,21 @@ impl<IO: BlockIO, Mode> Mounted<IO, Mode> {
         }
     }
 
+    /// Return the disk block numbers for each 4KB block of a file.
+    /// Used for memory-mapped / zero-copy file loading.
+    pub fn file_block_map(&self, name: &str) -> Option<Vec<u64>> {
+        let (_, value) = self.find_by_name(name).ok()??;
+        let leaf = decode_leaf_value(&value).ok()?;
+        let extents = leaf.extents();
+        let mut blocks = Vec::new();
+        for ext in extents {
+            for i in 0..ext.block_count as u64 {
+                blocks.push(ext.start_block + i);
+            }
+        }
+        Some(blocks)
+    }
+
     /// Check if a name is a symlink.
     pub fn is_symlink(&self, name: &str) -> bool {
         self.find_by_name(name)
@@ -553,5 +568,156 @@ impl<IO: BlockIO, Mode> Mounted<IO, Mode> {
             .flatten()
             .map(|(key, _)| key.key_type == KeyType::Symlink)
             .unwrap_or(false)
+    }
+}
+
+// --- ReadWrite-only operations ---
+
+impl<IO: BlockIO> Mounted<IO, ReadWrite> {
+    /// Create a file.
+    pub fn create(&mut self, name: &str, data: &[u8], mtime: u64) -> Result<(), FsError> {
+        if name.len() > MAX_NAME_LEN {
+            return Err(FsError::NameTooLong { len: name.len(), max: MAX_NAME_LEN });
+        }
+
+        // Delete existing entry with same name (if any) to free its blocks
+        self.delete_by_name(name);
+
+        let extents = self.write_data(data)?;
+        let value = encode_leaf_value(1, name, data.len() as u64, mtime, &extents);
+        let key = make_key(&self.sb.hash_seed, name, KeyType::File);
+        let entry = Entry { key, value };
+
+        let (new_root, new_level) =
+            btree::insert(&self.io, &mut self.alloc, self.sb.root_node, self.sb.root_level, entry)?;
+        self.sb.root_node = new_root;
+        self.sb.root_level = new_level;
+        Ok(())
+    }
+
+    /// Create a symlink.
+    pub fn create_symlink(&mut self, name: &str, target: &str) -> Result<(), FsError> {
+        if name.len() > MAX_NAME_LEN {
+            return Err(FsError::NameTooLong { len: name.len(), max: MAX_NAME_LEN });
+        }
+
+        self.delete_by_name(name);
+
+        let target_bytes = target.as_bytes();
+        let extents = self.write_data(target_bytes)?;
+        let value = encode_leaf_value(2, name, target_bytes.len() as u64, 0, &extents);
+        let key = make_key(&self.sb.hash_seed, name, KeyType::Symlink);
+        let entry = Entry { key, value };
+
+        let (new_root, new_level) =
+            btree::insert(&self.io, &mut self.alloc, self.sb.root_node, self.sb.root_level, entry)?;
+        self.sb.root_node = new_root;
+        self.sb.root_level = new_level;
+        Ok(())
+    }
+
+    /// Delete a file or symlink by name. Returns true if found and deleted.
+    pub fn delete(&mut self, name: &str) -> bool {
+        self.delete_by_name(name)
+    }
+
+    /// Delete all entries whose name starts with the given prefix.
+    pub fn delete_prefix(&mut self, prefix: &str) {
+        // Collect entries, find matching ones, free their blocks, remove from tree
+        let entries = match btree::collect_all(&self.io, self.sb.root_node, self.sb.root_level) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+
+        for entry in &entries {
+            if let Ok(leaf) = decode_leaf_value(&entry.value) {
+                if leaf.name().starts_with(prefix) {
+                    // Free data blocks
+                    for ext in leaf.extents() {
+                        self.alloc.free_range(&self.io, BlockNum::new(ext.start_block), ext.block_count);
+                    }
+                    // Delete from btree
+                    let _ = btree::delete(&self.io, self.sb.root_node, self.sb.root_level, &entry.key);
+                }
+            }
+        }
+    }
+
+    /// Sync filesystem state to disk.
+    pub fn sync(&mut self) {
+        self.sb.free_blocks = self.alloc.free_blocks;
+        self.sb.next_alloc = self.alloc.next_alloc;
+        self.sb.set_clean(true);
+        self.sb.write(&self.io);
+        self.io.sync();
+    }
+
+    /// Allocate blocks and write data, returning extent list.
+    fn write_data(&mut self, data: &[u8]) -> Result<Vec<Extent>, FsError> {
+        if data.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let blocks_needed = ((data.len() + BLOCK_SIZE - 1) / BLOCK_SIZE) as u32;
+        let mut extents = Vec::new();
+        let mut remaining = blocks_needed;
+        let mut data_offset = 0usize;
+
+        while remaining > 0 {
+            let (start, count) = self.alloc.alloc_contiguous(&self.io, remaining)?;
+            extents.push(Extent {
+                start_block: start.raw(),
+                block_count: count,
+                _reserved: 0,
+            });
+
+            let mut buf = BlockBuf::zeroed();
+            for i in 0..count as u64 {
+                buf.0.fill(0);
+                let chunk_start = data_offset;
+                let chunk_end = (data_offset + BLOCK_SIZE).min(data.len());
+                if chunk_start < data.len() {
+                    let len = chunk_end - chunk_start;
+                    buf.0[..len].copy_from_slice(&data[chunk_start..chunk_end]);
+                }
+                self.io.write_block(BlockNum::new(start.raw() + i), &buf);
+                data_offset += BLOCK_SIZE;
+            }
+
+            remaining -= count;
+        }
+
+        Ok(extents)
+    }
+
+    /// Delete a file/symlink by name, freeing its data blocks. Returns true if found.
+    fn delete_by_name(&mut self, name: &str) -> bool {
+        // Try File key
+        let key = make_key(&self.sb.hash_seed, name, KeyType::File);
+        if let Ok(Some(value)) = btree::delete(&self.io, self.sb.root_node, self.sb.root_level, &key) {
+            if let Ok(leaf) = decode_leaf_value(&value) {
+                if leaf.name() == name {
+                    for ext in leaf.extents() {
+                        self.alloc.free_range(&self.io, BlockNum::new(ext.start_block), ext.block_count);
+                    }
+                    return true;
+                }
+            }
+        }
+
+        // Try Symlink key
+        let key = make_key(&self.sb.hash_seed, name, KeyType::Symlink);
+        if let Ok(Some(value)) = btree::delete(&self.io, self.sb.root_node, self.sb.root_level, &key) {
+            if let Ok(leaf) = decode_leaf_value(&value) {
+                if leaf.name() == name {
+                    for ext in leaf.extents() {
+                        self.alloc.free_range(&self.io, BlockNum::new(ext.start_block), ext.block_count);
+                    }
+                    return true;
+                }
+            }
+        }
+
+        false
     }
 }

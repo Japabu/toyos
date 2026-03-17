@@ -76,6 +76,10 @@ impl PageCache {
         }
     }
 
+    pub fn block_count(&self) -> u64 {
+        self.block_to_slot.len() as u64
+    }
+
     fn alloc_slot(&mut self, block: u64) -> u32 {
         let slot = self.next_slot;
         self.next_slot += 1;

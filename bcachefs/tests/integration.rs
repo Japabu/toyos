@@ -1,4 +1,4 @@
-use bcachefs::{Formatted, Mounted, ReadOnly, VecBlockIO};
+use bcachefs::{Formatted, Mounted, ReadOnly, ReadWrite, VecBlockIO};
 
 #[test]
 fn format_and_mount_empty() {
@@ -236,6 +236,110 @@ fn many_files_with_large_data() {
         assert_eq!(read_data.len(), data.len(), "size mismatch for {}", name);
         assert_eq!(&read_data, data, "data mismatch for {}", name);
     }
+}
+
+// --- Read-write tests ---
+
+#[test]
+fn mounted_readwrite_create_and_read() {
+    let io = VecBlockIO::new(256);
+    let fs = Formatted::format(io);
+    let mut mounted = Mounted::<_, ReadWrite>::open(fs.into_io()).expect("open");
+
+    mounted.create("test.txt", b"hello world", 100).expect("create");
+    let data = mounted.read_file("test.txt").expect("read");
+    assert_eq!(data, b"hello world");
+    assert_eq!(mounted.file_mtime("test.txt"), 100);
+}
+
+#[test]
+fn mounted_readwrite_delete() {
+    let io = VecBlockIO::new(256);
+    let fs = Formatted::format(io);
+    let mut mounted = Mounted::<_, ReadWrite>::open(fs.into_io()).expect("open");
+
+    mounted.create("a.txt", b"aaa", 0).expect("create a");
+    mounted.create("b.txt", b"bbb", 0).expect("create b");
+    assert_eq!(mounted.list().unwrap().len(), 2);
+
+    assert!(mounted.delete("a.txt"));
+    assert_eq!(mounted.list().unwrap().len(), 1);
+    assert!(mounted.read_file("a.txt").is_err());
+    assert_eq!(mounted.read_file("b.txt").unwrap(), b"bbb");
+
+    // Deleting nonexistent returns false
+    assert!(!mounted.delete("nonexistent"));
+}
+
+#[test]
+fn mounted_readwrite_delete_prefix() {
+    let io = VecBlockIO::new(512);
+    let fs = Formatted::format(io);
+    let mut mounted = Mounted::<_, ReadWrite>::open(fs.into_io()).expect("open");
+
+    mounted.create("bin/shell", b"shell", 0).expect("create");
+    mounted.create("bin/editor", b"editor", 0).expect("create");
+    mounted.create("lib/core.so", b"core", 0).expect("create");
+    mounted.create("share/font", b"font", 0).expect("create");
+
+    assert_eq!(mounted.list().unwrap().len(), 4);
+
+    mounted.delete_prefix("bin/");
+    let files = mounted.list().unwrap();
+    assert_eq!(files.len(), 2, "expected 2 files after deleting bin/, got: {:?}", files);
+    assert!(mounted.read_file("bin/shell").is_err());
+    assert!(mounted.read_file("bin/editor").is_err());
+    assert_eq!(mounted.read_file("lib/core.so").unwrap(), b"core");
+    assert_eq!(mounted.read_file("share/font").unwrap(), b"font");
+}
+
+#[test]
+fn mounted_readwrite_overwrite_file() {
+    let io = VecBlockIO::new(256);
+    let fs = Formatted::format(io);
+    let mut mounted = Mounted::<_, ReadWrite>::open(fs.into_io()).expect("open");
+
+    mounted.create("test.txt", b"version 1", 10).expect("create v1");
+    assert_eq!(mounted.read_file("test.txt").unwrap(), b"version 1");
+
+    mounted.create("test.txt", b"version 2 is longer", 20).expect("create v2");
+    assert_eq!(mounted.read_file("test.txt").unwrap(), b"version 2 is longer");
+    assert_eq!(mounted.file_mtime("test.txt"), 20);
+    assert_eq!(mounted.list().unwrap().len(), 1); // should not duplicate
+}
+
+#[test]
+fn mounted_readwrite_symlink() {
+    let io = VecBlockIO::new(256);
+    let fs = Formatted::format(io);
+    let mut mounted = Mounted::<_, ReadWrite>::open(fs.into_io()).expect("open");
+
+    mounted.create("real.txt", b"real data", 0).expect("create");
+    mounted.create_symlink("link.txt", "real.txt").expect("symlink");
+
+    assert_eq!(mounted.read_link("link.txt").as_deref(), Some("real.txt"));
+    assert_eq!(mounted.read_link("real.txt"), None);
+    assert!(mounted.is_symlink("link.txt"));
+    assert!(!mounted.is_symlink("real.txt"));
+}
+
+#[test]
+fn mounted_readwrite_sync_and_reopen() {
+    let io = VecBlockIO::new(512);
+    let fs = Formatted::format(io);
+    let mut mounted = Mounted::<_, ReadWrite>::open(fs.into_io()).expect("open");
+
+    mounted.create("persistent.txt", b"I survive reboots", 42).expect("create");
+    mounted.sync();
+
+    // Extract raw bytes, create new IO, reopen
+    // We need to get the raw data out. Use into_formatted -> into_io
+    let raw = mounted.into_formatted().into_io().into_vec();
+    let io2 = VecBlockIO::from_vec(raw);
+    let mounted2 = Mounted::<_, ReadOnly>::open(io2).expect("reopen");
+
+    assert_eq!(mounted2.read_file("persistent.txt").unwrap(), b"I survive reboots");
+    assert_eq!(mounted2.file_mtime("persistent.txt"), 42);
 }
 
 #[test]

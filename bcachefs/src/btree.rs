@@ -297,6 +297,69 @@ pub fn search_by_hash(
     }
 }
 
+/// Delete an exact key from the B+ tree. Returns the old value if found.
+/// Does not merge underflowing nodes — just removes the entry from the leaf.
+pub fn delete(io: &dyn BlockIO, root: BlockNum, root_level: u16, key: &Key) -> Result<Option<Vec<u8>>, FsError> {
+    let mut block = root;
+    let mut level = root_level;
+
+    // Descend to leaf
+    loop {
+        let mut node = Node::read(io, block)?;
+        if level == 0 {
+            if let Some(pos) = node.entries.iter().position(|e| e.key == *key) {
+                let old = node.entries.remove(pos);
+                node.write(io, block);
+                return Ok(Some(old.value));
+            }
+            return Ok(None);
+        }
+        block = find_child(&node, key);
+        level -= 1;
+    }
+}
+
+/// Delete all entries matching a predicate by scanning the entire tree.
+/// Returns the number of entries deleted.
+pub fn delete_matching(
+    io: &dyn BlockIO,
+    root: BlockNum,
+    root_level: u16,
+    predicate: &dyn Fn(&Entry) -> bool,
+) -> Result<usize, FsError> {
+    let mut count = 0;
+    delete_matching_recursive(io, root, root_level, predicate, &mut count)?;
+    Ok(count)
+}
+
+fn delete_matching_recursive(
+    io: &dyn BlockIO,
+    block: BlockNum,
+    level: u16,
+    predicate: &dyn Fn(&Entry) -> bool,
+    count: &mut usize,
+) -> Result<(), FsError> {
+    let mut node = Node::read(io, block)?;
+    if level == 0 {
+        let before = node.entries.len();
+        node.entries.retain(|e| !predicate(e));
+        let removed = before - node.entries.len();
+        if removed > 0 {
+            *count += removed;
+            node.write(io, block);
+        }
+    } else {
+        // Collect child block numbers first (to avoid borrowing issues)
+        let children: Vec<BlockNum> = node.entries.iter()
+            .map(|e| BlockNum::new(u64::from_le_bytes(e.value[..8].try_into().unwrap())))
+            .collect();
+        for child in children {
+            delete_matching_recursive(io, child, level - 1, predicate, count)?;
+        }
+    }
+    Ok(())
+}
+
 /// Collect all leaf entries by iterating the entire tree.
 pub fn collect_all(io: &dyn BlockIO, root: BlockNum, root_level: u16) -> Result<Vec<Entry>, FsError> {
     let mut results = Vec::new();

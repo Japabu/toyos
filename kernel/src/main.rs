@@ -19,10 +19,14 @@ mod allocator;
 mod keyboard;
 mod mouse;
 mod block;
+#[allow(dead_code)]
 mod page_cache;
+#[allow(dead_code)]
 mod ramdisk;
 mod tmpfs;
+#[allow(dead_code)]
 mod toyfs;
+mod bcachefs_adapter;
 mod vfs;
 mod elf;
 mod symbols;
@@ -157,13 +161,9 @@ fn kernel_main(
     let nvme_dev = nvme::init(ecam_base).expect("NVMe: no controller found");
     page_cache::init(Box::new(nvme_dev));
 
-    let toyfs_instance = {
-        let mut guard = page_cache::lock();
-        let (cache, dev) = guard.cache_and_dev();
-        match toyfs::ToyFs::mount(cache, dev) {
-            Some(fs) => fs,
-            None => toyfs::ToyFs::format(cache, dev),
-        }
+    let bcachefs_instance = match bcachefs_adapter::mount() {
+        Some(fs) => fs,
+        None => bcachefs_adapter::format(),
     };
 
     log!("Boot: storage ready ({}ms)", (clock::nanos_since_boot() - t_storage) / 1_000_000);
@@ -193,8 +193,8 @@ fn kernel_main(
     let initrd_fs = bcachefs::Mounted::<_, bcachefs::ReadOnly>::open(initrd_io)
         .expect("Failed to mount bcachefs initrd");
 
-    // Mount root filesystem (ToyFs on NVMe) and tmpfs
-    vfs::lock().set_root(Box::new(toyfs::ToyFsAdapter::new(toyfs_instance)));
+    // Mount root filesystem (bcachefs on NVMe) and tmpfs
+    vfs::lock().set_root(Box::new(bcachefs_adapter::BcacheFsAdapter::new(bcachefs_instance)));
     vfs::lock().mount("tmp", Box::new(crate::tmpfs::TmpFs::new()));
 
     // Extract initrd into root filesystem (fresh binaries every boot)
