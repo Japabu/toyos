@@ -538,7 +538,11 @@ fn music_thread(ring: Arc<MusicRing>, rx: mpsc::Receiver<MusicCmd>, sf: Arc<Soun
                 std::thread::sleep(std::time::Duration::from_millis(10));
                 continue;
             }
-            if ring.free_space() >= RENDER_CHUNK {
+            let buffered = RING_FRAMES - ring.free_space();
+            if buffered >= RING_FRAMES / 2 {
+                // Enough audio buffered (~93ms) — sleep until it drains
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            } else if ring.free_space() >= RENDER_CHUNK {
                 seq.render(&mut left_buf, &mut right_buf);
                 ring.push(&left_buf, &right_buf);
                 if seq.end_of_sequence() {
