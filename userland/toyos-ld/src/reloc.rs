@@ -234,6 +234,10 @@ pub(crate) struct ElfRelocParams<'a> {
     /// Shared library mode: TLS offsets are not known at link time. GD→IE relaxation
     /// is used instead of GD→LE, and R_X86_64_TPOFF64 runtime relocs are emitted.
     pub(crate) is_shared: bool,
+    /// Shared LD GOT pair for all TLSLD accesses (shared mode only).
+    pub(crate) ld_got_pair: Option<u64>,
+    /// Per-symbol GD GOT pairs for TLSGD accesses (shared mode only).
+    pub(crate) gd_got: &'a HashMap<SymbolRef, u64>,
 }
 
 pub(crate) fn apply_relocs(
@@ -278,7 +282,8 @@ pub(crate) fn apply_relocs(
                     // Shared mode: preserve GD sequence for DTV-based TLS.
                     // Keep `call __tls_get_addr` intact. Emit DTPMOD64+DTPOFF64
                     // for the two consecutive GOT slots (TlsIndex pair).
-                    let got_slot = *params.got.get(&reloc.target).ok_or_else(|| {
+                    // Use gd_got (separate from per-symbol got to avoid GOTTPOFF collisions).
+                    let got_slot = *params.gd_got.get(&reloc.target).ok_or_else(|| {
                         LinkError::UndefinedSymbols(vec![reloc.target.name().to_string()])
                     })?;
                     // Patch leaq's disp32 to point to GOT slot pair
@@ -342,10 +347,9 @@ pub(crate) fn apply_relocs(
                 if params.is_shared {
                     // Shared mode: preserve LD sequence for DTV-based TLS.
                     // Keep `call __tls_get_addr` intact. Emit DTPMOD64 for the
-                    // module GOT slot (shared across all LD accesses in this module).
-                    let got_slot = *params.got.get(&reloc.target).ok_or_else(|| {
-                        LinkError::UndefinedSymbols(vec![reloc.target.name().to_string()])
-                    })?;
+                    // dedicated LD GOT pair (separate from per-symbol GOTTPOFF slots).
+                    let got_slot = params.ld_got_pair
+                        .expect("TLSLD in shared mode but no LD GOT pair allocated");
                     let sec_vaddr = state.sections[reloc.section].vaddr.unwrap();
                     let rip = sec_vaddr + reloc.offset + 4; // end of leaq instruction
                     let disp = got_slot as i64 - rip as i64;

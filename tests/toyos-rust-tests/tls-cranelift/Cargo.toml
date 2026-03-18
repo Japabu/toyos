@@ -1,0 +1,15 @@
+[package]
+name = "tls-cranelift"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+cranelift-codegen = { version = "0.128.3", default-features = false, features = ["std", "timing", "unwind", "all-native-arch"] }
+cranelift-frontend = "0.128.3"
+target-lexicon = "0.13"
+
+[patch.crates-io]
+target-lexicon = { path = "../../../userland/target-lexicon" }

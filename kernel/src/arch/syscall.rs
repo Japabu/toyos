@@ -1241,22 +1241,14 @@ fn sys_dlopen(path: &str) -> u64 {
                 is_static: false,
             });
             // Apply DTPMOD64/DTPOFF64: write module_id + per-symbol offset into GOT slot pairs.
-            // DTV entries are left DTV_UNALLOCATED; __tls_get_addr allocates on first access.
-            crate::elf::apply_dtpmod_relocs(&lib, module_id);
-        }
-    }
-
-    // Dump DTV for debugging
-    if lib_has_tls {
-        let tp = PhysAddr::new(crate::arch::read_fs_base()).to_kernel().raw() as *const u64;
-        let dtv_ptr = unsafe { *tp.add(1) };
-        if dtv_ptr != 0 {
-            let dtv = PhysAddr::new(dtv_ptr).to_kernel().raw() as *const u64;
-            let mid = data_arc.lock().next_tls_module_id - 1; // just assigned
-            let idx = mid as usize - 1;
-            let val = unsafe { *dtv.add(2 + idx) };
-            log!("dlopen: pid={} DTV[{}]={:#x} (UNALLOC={})",
-                process::current_pid().0, mid, val, val == !0u64);
+            // For cross-module GD TLS (r_sym != 0, symbol undefined), resolve to the
+            // defining module's ID and TLS offset. DTV entries are left DTV_UNALLOCATED;
+            // __tls_get_addr allocates on first access.
+            let tls_info = crate::elf::TlsModuleInfo {
+                libs: &data.loaded_libs,
+                modules: &data.tls_modules,
+            };
+            crate::elf::apply_dtpmod_relocs(&lib, module_id, &tls_info);
         }
     }
 

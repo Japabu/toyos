@@ -1261,22 +1261,17 @@ pub fn apply_tpoff_relocs(lib: &LoadedLib, lib_base_offset: usize, total_memsz: 
 }
 
 /// Apply R_X86_64_DTPMOD64 and R_X86_64_DTPOFF64 relocations in a shared library.
-/// `module_id` is the DTV module index assigned at dlopen time.
-/// DTPMOD64: writes `module_id` into the GOT slot (first of a TlsIndex pair).
-/// DTPOFF64: writes the symbol's offset within the TLS segment into the GOT slot
-///           (second of a TlsIndex pair). For sym=0, uses r_addend as the offset.
-pub fn apply_dtpmod_relocs(lib: &LoadedLib, module_id: u64) {
+/// `module_id` is the DTV module index assigned at dlopen time (for same-module TLS).
+/// For cross-module TLS (r_sym != 0, symbol is undefined in this lib), the defining
+/// module's ID and TLS offset are resolved via `tls_info`.
+pub fn apply_dtpmod_relocs(lib: &LoadedLib, module_id: u64, tls_info: &TlsModuleInfo) {
     if let Some(relocs) = &lib.cached_relocs {
-        for &(r_offset, _r_sym, _r_addend) in &relocs.dtpmod64 {
-            unsafe { lib.rw_write::<u64>(lib.base + r_offset, module_id); }
+        for &(r_offset, r_sym, _r_addend) in &relocs.dtpmod64 {
+            let mid = resolve_dtpmod(lib, r_sym, module_id, tls_info);
+            unsafe { lib.rw_write::<u64>(lib.base + r_offset, mid); }
         }
         for &(r_offset, r_sym, r_addend) in &relocs.dtpoff64 {
-            let offset = if r_sym != 0 {
-                let sym = lib.sym(r_sym as usize);
-                sym.st_value as i64 + r_addend
-            } else {
-                r_addend
-            };
+            let offset = resolve_dtpoff(lib, r_sym, r_addend, tls_info);
             unsafe { lib.rw_write::<u64>(lib.base + r_offset, offset as u64); }
         }
         if !relocs.dtpmod64.is_empty() || !relocs.dtpoff64.is_empty() {
@@ -1291,15 +1286,11 @@ pub fn apply_dtpmod_relocs(lib: &LoadedLib, module_id: u64) {
             for i in 0..rela_size / RELA_SIZE {
                 let rela = unsafe { (rela_addr + i * RELA_SIZE).read_at::<Elf64Rela>(0) };
                 if rela.r_type() == R_X86_64_DTPMOD64 {
-                    unsafe { lib.rw_write::<u64>(lib.base + rela.r_offset, module_id); }
+                    let mid = resolve_dtpmod(lib, rela.r_sym(), module_id, tls_info);
+                    unsafe { lib.rw_write::<u64>(lib.base + rela.r_offset, mid); }
                     count_mod += 1;
                 } else if rela.r_type() == R_X86_64_DTPOFF64 {
-                    let offset = if rela.r_sym() != 0 {
-                        let sym = lib.sym(rela.r_sym() as usize);
-                        sym.st_value as i64 + rela.r_addend
-                    } else {
-                        rela.r_addend
-                    };
+                    let offset = resolve_dtpoff(lib, rela.r_sym(), rela.r_addend, tls_info);
                     unsafe { lib.rw_write::<u64>(lib.base + rela.r_offset, offset as u64); }
                     count_off += 1;
                 }
@@ -1310,6 +1301,58 @@ pub fn apply_dtpmod_relocs(lib: &LoadedLib, module_id: u64) {
                 count_mod, count_off, module_id);
         }
     }
+}
+
+/// Resolve which module ID to write for a DTPMOD64 relocation.
+/// If r_sym == 0 (unnamed, same-module LD), use the loading module's ID.
+/// If r_sym != 0 but the symbol is defined in this lib (st_shndx != 0), use the loading module's ID.
+/// Otherwise, look up the symbol across all loaded libs to find the defining module.
+fn resolve_dtpmod(lib: &LoadedLib, r_sym: u32, self_module_id: u64, tls_info: &TlsModuleInfo) -> u64 {
+    if r_sym == 0 {
+        return self_module_id;
+    }
+    let sym = lib.sym(r_sym as usize);
+    if sym.st_shndx != 0 {
+        // Defined in this library
+        return self_module_id;
+    }
+    // Cross-module: find the defining library, then look up its module_id
+    let sym_name = lib.sym_name(r_sym as usize);
+    for other_lib in tls_info.libs {
+        if other_lib.tls_memsz == 0 { continue; }
+        if tls_dlsym(other_lib, sym_name).is_some() {
+            // Find the TLS module for this library (matched by template pointer)
+            let module = tls_info.modules.iter()
+                .find(|m| m.template == other_lib.tls_template)
+                .unwrap_or_else(|| panic!("dtpmod: no TLS module for lib defining {}", sym_name));
+            return module.module_id;
+        }
+    }
+    panic!("dtpmod: unresolved TLS symbol: {}", sym_name);
+}
+
+/// Resolve the TLS offset for a DTPOFF64 relocation.
+/// If r_sym == 0 (unnamed, LD base), use r_addend (typically 0).
+/// If r_sym != 0 and defined in this lib, use st_value + r_addend.
+/// Otherwise, look up the symbol across all loaded libs.
+fn resolve_dtpoff(lib: &LoadedLib, r_sym: u32, r_addend: i64, tls_info: &TlsModuleInfo) -> i64 {
+    if r_sym == 0 {
+        return r_addend;
+    }
+    let sym = lib.sym(r_sym as usize);
+    if sym.st_shndx != 0 {
+        // Defined in this library — st_value is the offset within its TLS segment
+        return sym.st_value as i64 + r_addend;
+    }
+    // Cross-module: find the defining library and the symbol's TLS offset there
+    let sym_name = lib.sym_name(r_sym as usize);
+    for other_lib in tls_info.libs {
+        if other_lib.tls_memsz == 0 { continue; }
+        if let Some(sym_tls_offset) = tls_dlsym(other_lib, sym_name) {
+            return sym_tls_offset as i64 + r_addend;
+        }
+    }
+    panic!("dtpoff: unresolved TLS symbol: {}", sym_name);
 }
 
 /// Compute a TPOFF value for a relocation entry.

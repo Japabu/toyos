@@ -230,14 +230,11 @@ pub fn build(root: &Path, debug: bool, release: bool, toolchain_changed: bool) {
 
 fn collect_hosted_rustc(root: &Path, initrd_files: &mut Vec<(String, Vec<u8>)>) {
     let sysroot = root.join("rust/build/x86_64-unknown-toyos/stage2");
-    if !sysroot.exists() {
-        return;
-    }
+    assert!(sysroot.exists(), "Hosted rustc sysroot missing: {}", sysroot.display());
 
     let rustc = sysroot.join("bin/rustc");
-    if rustc.exists() {
-        initrd_files.push(("bin/rustc".to_string(), fs::read(&rustc).unwrap()));
-    }
+    assert!(rustc.exists(), "Hosted rustc binary missing: {}", rustc.display());
+    initrd_files.push(("bin/rustc".to_string(), fs::read(&rustc).unwrap()));
 
     // Shared libraries
     if let Ok(entries) = fs::read_dir(sysroot.join("lib")) {

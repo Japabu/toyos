@@ -150,6 +150,8 @@ impl LaidOut<ElfLayout> {
             record_relatives: true,
             allow_undefined: false,
             is_shared: false,
+            ld_got_pair: self.layout.ld_got_pair,
+            gd_got: &self.layout.gd_got,
         };
         let relocs = apply_relocs(&mut self.state, &params)?;
         let eh_hdr = build_eh_frame_hdr(&self.state, &self.layout);
@@ -162,6 +164,7 @@ impl LaidOut<ElfLayout> {
 
     fn relocate_and_emit_static(mut self, entry: &str) -> Result<Vec<u8>, LinkError> {
         let empty_dyn_got = HashMap::new();
+        let empty_gd_got = HashMap::new();
         let params = ElfRelocParams {
             got: &self.layout.got,
             tls_start: self.layout.tls_start,
@@ -171,6 +174,8 @@ impl LaidOut<ElfLayout> {
             record_relatives: false,
             allow_undefined: false,
             is_shared: false,
+            ld_got_pair: None,
+            gd_got: &empty_gd_got,
         };
         apply_relocs(&mut self.state, &params)?;
         emit_elf::emit_elf(&self.state, &self.layout, ElfEmitMode::Static { entry_name: entry })
@@ -186,6 +191,8 @@ impl LaidOut<ElfLayout> {
             record_relatives: true,
             allow_undefined: true,
             is_shared: true,
+            ld_got_pair: self.layout.ld_got_pair,
+            gd_got: &self.layout.gd_got,
         };
         let relocs = apply_relocs(&mut self.state, &params)?;
         let eh_hdr = build_eh_frame_hdr(&self.state, &self.layout);

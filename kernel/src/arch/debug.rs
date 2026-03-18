@@ -21,6 +21,7 @@ pub fn context() -> u64 {
 
 /// DR7 encoding helpers.
 const DR7_LOCAL_ENABLE_DR0: u64 = 1 << 0;
+const DR7_GLOBAL_ENABLE_DR0: u64 = 1 << 1;
 const DR7_CONDITION_SHIFT_DR0: u64 = 16;
 const DR7_LENGTH_SHIFT_DR0: u64 = 18;
 const CONDITION_WRITE: u64 = 0b01;
@@ -32,7 +33,7 @@ pub fn watch_write(addr: u64) {
         let zero: u64 = 0;
         asm!("mov dr6, {}", in(reg) zero);
         asm!("mov dr0, {}", in(reg) addr);
-        let dr7 = DR7_LOCAL_ENABLE_DR0
+        let dr7 = DR7_LOCAL_ENABLE_DR0 | DR7_GLOBAL_ENABLE_DR0
             | (CONDITION_WRITE << DR7_CONDITION_SHIFT_DR0)
             | (LENGTH_8_BYTES << DR7_LENGTH_SHIFT_DR0);
         asm!("mov dr7, {}", in(reg) dr7);

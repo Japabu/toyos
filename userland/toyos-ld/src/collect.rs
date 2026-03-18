@@ -1018,8 +1018,12 @@ pub(crate) fn gc_sections(state: &mut LinkState, entry: &str) {
     }
 
     // .init_array / .fini_array sections are always roots
+    // TLS sections are always roots — they're accessed indirectly via __tls_get_addr
+    // and the GC can't trace through GOT/DTPMOD relocations to reach them.
     for (idx, sec) in state.sections.iter().enumerate() {
-        if sec.kind == SectionKind::InitArray || sec.kind == SectionKind::FiniArray {
+        if sec.kind == SectionKind::InitArray || sec.kind == SectionKind::FiniArray
+            || sec.kind.is_tls()
+        {
             if !reachable[idx] {
                 reachable[idx] = true;
                 queue.push_back(idx);

@@ -1345,7 +1345,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
         elf::apply_tpoff_relocs(lib, lib_base_offset, tls_total_memsz, &tls_info);
         // GD model: DTPMOD64/DTPOFF64 for this lib's own TLS (DTV-based dynamic access)
         if let Some(m) = module {
-            elf::apply_dtpmod_relocs(lib, m.module_id);
+            elf::apply_dtpmod_relocs(lib, m.module_id, &tls_info);
         }
     }
     // Resolve exe TPOFF relocations → add pre-computed values to reloc index

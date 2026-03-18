@@ -51,6 +51,15 @@ pub fn ensure(root: &Path, force_rebuild: bool) -> bool {
     // Ensure toyos-ld is built and installed
     ensure_toyos_ld(root, &rust_dir);
 
+    // Ensure hosted rustc (ToyOS binary) exists — rebuild if missing
+    let hosted_rustc = rust_dir.join("build/x86_64-unknown-toyos/stage2/bin/rustc");
+    if !hosted_rustc.exists() {
+        let host = host_triple();
+        let toyos_ld = root.join(format!("userland/target/{host}/release/toyos-ld"));
+        build_hosted_rustc(&rust_dir, &toyos_ld);
+        assert!(hosted_rustc.exists(), "Failed to build hosted rustc");
+    }
+
     // Link the toolchain so cargo can use it
     let host = host_triple();
     let stage2 = rust_dir.join(format!("build/{host}/stage2"));
@@ -135,19 +144,21 @@ fn build_hosted_rustc(rust_dir: &Path, toyos_ld: &Path) {
         .status()
         .expect("Failed to run x build for hosted rustc");
 
+    // rustdoc for ToyOS may fail to link (expected), but rustc + librustc_driver must exist
+    let toyos_stage2 = rust_dir.join("build/x86_64-unknown-toyos/stage2");
+    assert!(
+        toyos_stage2.join("bin/rustc").exists(),
+        "Hosted rustc build failed: {} missing", toyos_stage2.join("bin/rustc").display()
+    );
+    assert!(
+        fs::read_dir(toyos_stage2.join("lib"))
+            .map(|d| d.filter_map(|e| e.ok())
+                .any(|e| e.file_name().to_string_lossy().starts_with("librustc_driver")))
+            .unwrap_or(false),
+        "Hosted rustc build failed: librustc_driver*.so missing"
+    );
     if !status.success() {
-        let toyos_stage2 = rust_dir.join("build/x86_64-unknown-toyos/stage2");
-        if toyos_stage2.join("bin/rustc").exists()
-            && fs::read_dir(toyos_stage2.join("lib"))
-                .map(|d| d
-                    .filter_map(|e| e.ok())
-                    .any(|e| e.file_name().to_string_lossy().starts_with("librustc_driver")))
-                .unwrap_or(false)
-        {
-            eprintln!("Note: rustdoc for ToyOS failed to link (expected), but rustc built successfully.");
-        } else {
-            eprintln!("Warning: ToyOS-hosted rustc build failed (ecosystem libc not yet available). Skipping.");
-        }
+        eprintln!("Note: rustdoc for ToyOS failed to link (expected), but rustc built successfully.");
     }
 
     // Restore config without ToyOS as host for future fast rebuilds

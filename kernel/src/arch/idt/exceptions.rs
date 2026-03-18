@@ -551,7 +551,7 @@ fn fatal_exception(ctx: &ExceptionContext) -> ! {
                 log!("SEGFAULT pid={}: {} at {:#x} ({})", pid, action, ctx.cr2, cause);
             }
             Vector::InvalidOpcode => log!("SIGILL pid={}: illegal instruction", pid),
-            Vector::GeneralProtection => log!("SIGBUS pid={}: general protection fault (error_code={:#x})", pid, ctx.frame.error_code),
+            Vector::GeneralProtection => log!("SIGBUS pid={}: general protection fault (error_code={:#x}) rip={:#x}", pid, ctx.frame.error_code, ctx.frame.rip),
             Vector::DoubleFault => log!("FATAL pid={}: double fault", pid),
             Vector::Debug | Vector::Timer | Vector::Xhci | Vector::TlbFlush => unreachable!(),
         }

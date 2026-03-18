@@ -20,6 +20,10 @@ pub(crate) struct ElfLayout {
     pub(crate) tls_filesz: u64,
     pub(crate) tls_memsz: u64,
     pub(crate) got: HashMap<SymbolRef, u64>,
+    /// Shared LD GOT pair (16 bytes) for all TLSLD accesses in shared mode.
+    pub(crate) ld_got_pair: Option<u64>,
+    /// Per-symbol GD GOT pairs (16 bytes each) for TLSGD in shared mode.
+    pub(crate) gd_got: HashMap<SymbolRef, u64>,
     pub(crate) plt: HashMap<SymbolRef, u64>,
     pub(crate) plt_data: Vec<u8>,
     pub(crate) plt_vaddr: u64,
@@ -359,38 +363,48 @@ pub(crate) fn layout_elf(state: &mut LinkState, base_addr: u64, entry_name: Opti
     }
 
     let is_shared = entry_name.is_none();
+
+    // 8-byte GOT entries: GOTPCREL, GOTTPOFF, and PIE-mode GD→IE (dynamic TLS imports).
+    // In shared mode, all TLS GD/LD 16-byte pairs are allocated separately below.
     let got_symbols = collect_unique_symbols(state.relocs.iter(), |r| {
         matches!(r.r_type,
             RelocType::X86Gotpcrel | RelocType::X86Gotpcrelx
             | RelocType::X86RexGotpcrelx | RelocType::X86Gottpoff)
-        // GD/LD needs a GOT slot: always in shared mode, or for dynamic TLS in PIE
-        || (r.r_type == RelocType::X86Tlsgd
-            && (is_shared || state.dynamic_imports.contains(r.target.name())))
-        || (r.r_type == RelocType::X86Tlsld && is_shared)
+        || (r.r_type == RelocType::X86Tlsgd && !is_shared
+            && state.dynamic_imports.contains(r.target.name()))
     });
 
-    // In shared mode, TLS GD/LD symbols need two consecutive GOT slots (DTPMOD64+DTPOFF64)
-    let tlsgd_syms: HashSet<&str> = if is_shared {
-        state.relocs.iter()
-            .filter(|r| r.r_type == RelocType::X86Tlsgd || r.r_type == RelocType::X86Tlsld)
-            .map(|r| r.target.name())
-            .collect()
+    cursor = align_up(cursor, 8);
+
+    // In shared mode, TLS GD/LD 16-byte GOT pairs live in their own address ranges,
+    // separate from the 8-byte per-symbol `got` map. This prevents DTPMOD64 from
+    // clobbering GOTTPOFF slots when both access the same symbol.
+
+    let ld_got_pair: Option<u64> = if is_shared && state.relocs.iter().any(|r| r.r_type == RelocType::X86Tlsld) {
+        let slot = cursor;
+        cursor += 16;
+        Some(slot)
     } else {
-        HashSet::new()
+        None
     };
 
-    cursor = align_up(cursor, 8);
+    let mut gd_got: HashMap<SymbolRef, u64> = HashMap::new();
+    if is_shared {
+        let gd_symbols = collect_unique_symbols(state.relocs.iter(), |r| {
+            r.r_type == RelocType::X86Tlsgd
+        });
+        for sym in &gd_symbols {
+            gd_got.insert(sym.clone(), cursor);
+            cursor += 16;
+        }
+    }
+
     let mut got = HashMap::new();
     let dyn_sym_names: std::collections::HashSet<&str> = dyn_syms.iter().map(|s| s.name()).collect();
     for sym in &got_symbols {
-        // Dynamic symbols use dyn_got (resolved at load time via GLOB_DAT)
         if dyn_sym_names.contains(sym.name()) { continue; }
         got.insert(sym.clone(), cursor);
-        if tlsgd_syms.contains(sym.name()) {
-            cursor += 16; // Two slots: DTPMOD64 + DTPOFF64
-        } else {
-            cursor += 8;
-        }
+        cursor += 8;
     }
 
     let mut dyn_got = HashMap::new();
@@ -451,7 +465,7 @@ pub(crate) fn layout_elf(state: &mut LinkState, base_addr: u64, entry_name: Opti
     ElfLayout {
         base_addr, rx_start, rx_end, rw_start, rw_filesz, rw_end,
         tls_start, tls_filesz, tls_memsz,
-        got, plt, plt_data, plt_vaddr, dyn_got,
+        got, ld_got_pair, gd_got, plt, plt_data, plt_vaddr, dyn_got,
         init_array_vaddr, init_array_size,
         fini_array_vaddr, fini_array_size,
         eh_frame_hdr_vaddr, eh_frame_hdr_size, eh_frame_vaddr,
