@@ -44,6 +44,16 @@ pub fn ensure(root: &Path, force_rebuild: bool) -> ChangeSet {
         stamps::write_dir_stamp(&root.join("toyos-ld/src"), &linker_stamp);
     }
 
+    // Ensure toyos-cc is built as a host tool (used by doom's build.rs)
+    let cc_stamp = stamps_dir.join("toyos-cc.stamp");
+    let cc_changed = stamps::dir_changed(&root.join("toyos-cc/src"), &cc_stamp);
+    let toyos_cc = toyos_cc_binary(root);
+    if cc_changed || !toyos_cc.exists() {
+        eprintln!("Building toyos-cc...");
+        build_toyos_cc(root);
+        stamps::write_dir_stamp(&root.join("toyos-cc/src"), &cc_stamp);
+    }
+
     let rebuilt = if !toolchain_exists || compiler_changed || force_rebuild {
         // Full bootstrap needed
         eprintln!("Building full toolchain (this takes a while on first run)...");
@@ -55,7 +65,7 @@ pub fn ensure(root: &Path, force_rebuild: bool) -> ChangeSet {
     } else if std_changed || abi_changed {
         // Fast path: only rebuild std
         eprintln!("Rebuilding std (fast path)...");
-        rebuild_std(&rust_dir);
+        rebuild_std(root, &rust_dir);
         stamps::write_dir_stamp(&rust_dir.join("library"), &std_stamp);
         stamps::write_dir_stamp(&root.join("toyos-abi/src"), &abi_stamp);
         true
@@ -64,12 +74,18 @@ pub fn ensure(root: &Path, force_rebuild: bool) -> ChangeSet {
         false
     };
 
-    // Ensure hosted rustc (ToyOS binary) exists — rebuild if missing or std changed
+    // Ensure hosted rustc (ToyOS binary) is up to date.
+    // Invalidate stamp when toolchain was rebuilt (compiler or std changed).
+    let hosted_stamp = stamps_dir.join("hosted-rustc.stamp");
+    if rebuilt {
+        let _ = fs::remove_file(&hosted_stamp);
+    }
     let hosted_rustc = rust_dir.join("build/x86_64-unknown-toyos/stage2/bin/rustc");
-    if !hosted_rustc.exists() || rebuilt {
+    if !hosted_stamp.exists() || !hosted_rustc.exists() {
         let toyos_ld = toyos_ld_binary(root);
         build_hosted_rustc(&rust_dir, &toyos_ld);
         assert!(hosted_rustc.exists(), "Failed to build hosted rustc");
+        fs::write(&hosted_stamp, "").unwrap();
     }
 
     // Link the toolchain so cargo can use it
@@ -121,12 +137,14 @@ fn full_bootstrap(root: &Path, rust_dir: &Path) {
         );
         eprintln!("Note: some targets may have failed to link (expected), but rustc built successfully.");
     }
-
-    // Now build hosted rustc (ToyOS as host) if compiler changed
-    build_hosted_rustc(rust_dir, &toyos_ld);
 }
 
-fn rebuild_std(rust_dir: &Path) {
+fn rebuild_std(root: &Path, rust_dir: &Path) {
+    // Ensure cross-only config (no hosted rustc) — if a previous hosted build
+    // was interrupted, bootstrap.toml may still have ToyOS as host.
+    let toyos_ld = toyos_ld_binary(root);
+    write_config(rust_dir, &host_triple(), &toyos_ld, false);
+
     // Clean bootstrap's cached std for ToyOS targets so it picks up toyos-abi changes.
     // Bootstrap caches compiled std artifacts and won't notice external dep changes.
     let host = host_triple();
@@ -175,9 +193,9 @@ fn build_hosted_rustc(rust_dir: &Path, toyos_ld: &Path) {
     if !status.success() {
         eprintln!("Note: rustdoc for ToyOS failed to link (expected), but rustc built successfully.");
     }
-
-    // Restore config without ToyOS as host for future fast rebuilds
-    write_config(rust_dir, &host_triple(), toyos_ld, false);
+    // No config restore needed — full_bootstrap and rebuild_std write the
+    // cross-only config before they run, so the next non-hosted build
+    // always starts with the correct config regardless of what's on disk.
 }
 
 fn write_config(rust_dir: &Path, host: &str, toyos_ld: &Path, with_hosted_rustc: bool) {
@@ -218,14 +236,29 @@ pub fn toyos_ld_binary(root: &Path) -> PathBuf {
 }
 
 fn build_toyos_ld(root: &Path) {
-    let toyos_ld_dir = root.join("toyos-ld");
     let host = host_triple();
     let status = Command::new("cargo")
         .args(["build", "--release", "--target", &host])
-        .current_dir(&toyos_ld_dir)
+        .current_dir(root.join("toyos-ld"))
         .status()
         .expect("Failed to build toyos-ld");
     assert!(status.success(), "toyos-ld build failed");
+}
+
+/// Path to the host toyos-cc binary.
+pub fn toyos_cc_binary(root: &Path) -> PathBuf {
+    let host = host_triple();
+    root.join(format!("toyos-cc/target/{host}/release/toyos-cc"))
+}
+
+fn build_toyos_cc(root: &Path) {
+    let host = host_triple();
+    let status = Command::new("cargo")
+        .args(["build", "--release", "--target", &host])
+        .current_dir(root.join("toyos-cc"))
+        .status()
+        .expect("Failed to build toyos-cc");
+    assert!(status.success(), "toyos-cc build failed");
 }
 
 pub fn host_triple() -> String {

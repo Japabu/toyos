@@ -1,5 +1,4 @@
 use std::path::PathBuf;
-use std::process::Command;
 use std::sync::Arc;
 use std::{fs, path::Path};
 
@@ -11,24 +10,18 @@ fn main() {
         download_doomgeneric(&root);
     }
 
-    // Build toyos-cc as a host tool. It needs the stable host toolchain,
-    // not the toyos cross-toolchain from userland/rust-toolchain.toml.
-    // Setting RUSTUP_TOOLCHAIN overrides the toml file.
-    let toyos_cc_dir = root.join("../../toyos-cc");
+    download_soundfont();
+
+    download_soundfont();
+
+    // Use pre-built toyos-cc host binary (built by the build system's toolchain phase).
     let host = std::env::var("HOST").unwrap();
-    let cc_target_dir = root.join("../target/toyos-cc-host");
-    let status = Command::new("cargo")
-        .args(["build", "--quiet", "--release", "--target", &host])
-        .current_dir(&toyos_cc_dir)
-        .env("RUSTUP_TOOLCHAIN", "stable")
-        .env("CARGO_TARGET_DIR", &cc_target_dir)
-        .env_remove("RUSTC")
-        .env_remove("RUSTFLAGS")
-        .env_remove("CARGO_ENCODED_RUSTFLAGS")
-        .status()
-        .expect("failed to build toyos-cc");
-    assert!(status.success(), "toyos-cc build failed");
-    let toyos_cc = cc_target_dir.join(format!("{host}/release/toyos-cc"));
+    let toyos_cc = root.join(format!("../../toyos-cc/target/{host}/release/toyos-cc"));
+    assert!(
+        toyos_cc.exists(),
+        "toyos-cc host binary not found at {} — run `cargo run` from repo root first",
+        toyos_cc.display()
+    );
 
     let target = std::env::var("TARGET").unwrap();
 
@@ -146,6 +139,24 @@ fn http_agent() -> ureq::Agent {
         .tls_config(tls)
         .build()
         .new_agent()
+}
+
+fn download_soundfont() {
+    let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    let sf2_path = out_dir.join("FluidR3_GM.sf2");
+    if sf2_path.exists() {
+        return;
+    }
+    println!("Downloading FluidR3_GM.sf2...");
+    let agent = http_agent();
+    let resp = agent
+        .get("https://github.com/Jacalz/fluid-soundfont/raw/master/original-files/FluidR3_GM.sf2")
+        .call()
+        .expect("failed to download FluidR3_GM.sf2");
+    let mut data = Vec::new();
+    std::io::Read::read_to_end(&mut resp.into_body().into_reader(), &mut data)
+        .expect("failed to read SF2 data");
+    fs::write(&sf2_path, &data).expect("failed to write SF2");
 }
 
 fn download_doomgeneric(root: &Path) {

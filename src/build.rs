@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use serde::Deserialize;
@@ -35,59 +35,30 @@ pub fn build(root: &Path, debug: bool, release: bool, changes: &ChangeSet) {
     // PATH with toyos-ld so rustc finds the linker
     let path_env = toolchain::path_with_toyos_ld(root);
 
-    // Build kernel
-    let mut kernel_args = vec!["build", "--target", "x86_64-unknown-none"];
-    if release {
-        kernel_args.push("--release");
-    }
-    if debug {
-        kernel_args.push("--features");
-        kernel_args.push("debug-wait");
-    }
-    if !Command::new("cargo")
-        .args(&kernel_args)
-        .current_dir(root.join("kernel"))
-        .env("RUSTUP_TOOLCHAIN", "toyos")
-        .env("RUSTFLAGS", &rustflags)
-        .env("PATH", &path_env)
-        .env_remove("RUSTC")
-        .status()
-        .expect("Failed to run cargo")
-        .success()
-    {
-        panic!("Failed to build kernel");
-    }
-
-    // Build bootloader
+    // Parse system config (needed by bootloader for init programs)
     let config: SystemConfig = toml::from_str(
         &fs::read_to_string(root.join("system.toml")).expect("Failed to read system.toml"),
     )
     .expect("Failed to parse system.toml");
 
+    // Build kernel and bootloader in parallel (no dependency on each other)
     let init_programs = config.init.join(";");
-    let mut bl_args = vec!["build", "--target", "x86_64-unknown-uefi"];
-    if release {
-        bl_args.push("--release");
-    }
-    if !Command::new("cargo")
-        .args(&bl_args)
-        .current_dir(root.join("bootloader"))
-        .env("RUSTUP_TOOLCHAIN", "toyos")
-        .env("RUSTFLAGS", &rustflags)
-        .env("PATH", &path_env)
-        .env("INIT_PROGRAMS", &init_programs)
-        .env_remove("RUSTC")
-        .status()
-        .expect("Failed to run cargo")
-        .success()
-    {
-        panic!("Failed to build bootloader");
-    }
+    let kernel_handle = {
+        let root = root.to_path_buf();
+        let rustflags = rustflags.clone();
+        let path_env = path_env.clone();
+        std::thread::spawn(move || {
+            build_kernel(&root, debug, release, &rustflags, &path_env);
+        })
+    };
+    build_bootloader(root, release, &rustflags, &path_env, &init_programs);
+    kernel_handle.join().expect("kernel build thread panicked");
 
     let userland_dir = root.join("userland");
 
-    // Clean workspace target on toolchain change
+    // Clean targets on toolchain or linker change
     if changes.std_rebuilt {
+        // std changed — full clean needed (compiled artifacts are stale)
         for subdir in ["target/x86_64-unknown-toyos", "target/debug"] {
             let dir = userland_dir.join(subdir);
             if dir.exists() {
@@ -95,12 +66,38 @@ pub fn build(root: &Path, debug: bool, release: bool, changes: &ChangeSet) {
                 fs::remove_dir_all(&dir).ok();
             }
         }
-        // Also clean standalone toyos-ld/toyos-cc ToyOS targets
         for crate_name in ["toyos-ld", "toyos-cc"] {
             let dir = root.join(format!("{crate_name}/target/x86_64-unknown-toyos"));
             if dir.exists() {
                 eprintln!("toolchain changed: cleaning {crate_name}/target/x86_64-unknown-toyos");
                 fs::remove_dir_all(&dir).ok();
+            }
+        }
+    } else if changes.linker_changed {
+        // Linker changed — cargo doesn't track the linker binary, so we must
+        // delete final executables to force re-linking without full recompilation.
+        eprintln!("linker changed: forcing re-link of all binaries");
+        let ws_target = userland_dir.join(format!("target/x86_64-unknown-toyos/{profile}"));
+        for name in config.programs.keys() {
+            let bin = ws_target.join(name);
+            if bin.exists() {
+                fs::remove_file(&bin).ok();
+            }
+            // Standalone builds
+            let standalone_bin = userland_dir.join(format!(
+                "{name}/target/x86_64-unknown-toyos/{profile}/{name}"
+            ));
+            if standalone_bin.exists() {
+                fs::remove_file(&standalone_bin).ok();
+            }
+        }
+        // Also force re-link of toyos-ld/toyos-cc ToyOS binaries
+        for crate_name in ["toyos-ld", "toyos-cc"] {
+            let bin = root.join(format!(
+                "{crate_name}/target/x86_64-unknown-toyos/{profile}/{crate_name}"
+            ));
+            if bin.exists() {
+                fs::remove_file(&bin).ok();
             }
         }
     }
@@ -320,7 +317,52 @@ fn collect_hosted_rustc(root: &Path, initrd_files: &mut Vec<(String, Vec<u8>)>) 
     }
 }
 
-fn find_host_rlibs(root: &Path) -> Option<std::path::PathBuf> {
+fn build_kernel(root: &Path, debug: bool, release: bool, rustflags: &str, path_env: &str) {
+    let mut args = vec!["build", "--target", "x86_64-unknown-none"];
+    if release {
+        args.push("--release");
+    }
+    if debug {
+        args.push("--features");
+        args.push("debug-wait");
+    }
+    if !Command::new("cargo")
+        .args(&args)
+        .current_dir(root.join("kernel"))
+        .env("RUSTUP_TOOLCHAIN", "toyos")
+        .env("RUSTFLAGS", rustflags)
+        .env("PATH", path_env)
+        .env_remove("RUSTC")
+        .status()
+        .expect("Failed to run cargo")
+        .success()
+    {
+        panic!("Failed to build kernel");
+    }
+}
+
+fn build_bootloader(root: &Path, release: bool, rustflags: &str, path_env: &str, init_programs: &str) {
+    let mut args = vec!["build", "--target", "x86_64-unknown-uefi"];
+    if release {
+        args.push("--release");
+    }
+    if !Command::new("cargo")
+        .args(&args)
+        .current_dir(root.join("bootloader"))
+        .env("RUSTUP_TOOLCHAIN", "toyos")
+        .env("RUSTFLAGS", rustflags)
+        .env("PATH", path_env)
+        .env("INIT_PROGRAMS", init_programs)
+        .env_remove("RUSTC")
+        .status()
+        .expect("Failed to run cargo")
+        .success()
+    {
+        panic!("Failed to build bootloader");
+    }
+}
+
+fn find_host_rlibs(root: &Path) -> Option<PathBuf> {
     let build_dir = root.join("rust/build");
     let entries = fs::read_dir(&build_dir).ok()?;
     for entry in entries.flatten() {
