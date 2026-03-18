@@ -8,6 +8,7 @@ use serde::Deserialize;
 use crate::assets;
 use crate::image;
 use crate::toolchain;
+use crate::toolchain::ChangeSet;
 
 #[derive(Deserialize)]
 struct SystemConfig {
@@ -24,12 +25,15 @@ struct ProgramConfig {
     warnings: Option<bool>,
 }
 
-pub fn build(root: &Path, debug: bool, release: bool, toolchain_changed: bool) {
+pub fn build(root: &Path, debug: bool, release: bool, changes: &ChangeSet) {
     let profile = if release { "release" } else { "debug" };
     let rustflags = match std::env::var("RUSTFLAGS") {
         Ok(flags) => format!("{flags} -Dwarnings"),
         Err(_) => "-Dwarnings".to_string(),
     };
+
+    // PATH with toyos-ld so rustc finds the linker
+    let path_env = toolchain::path_with_toyos_ld(root);
 
     // Build kernel
     let mut kernel_args = vec!["build", "--target", "x86_64-unknown-none"];
@@ -40,13 +44,6 @@ pub fn build(root: &Path, debug: bool, release: bool, toolchain_changed: bool) {
         kernel_args.push("--features");
         kernel_args.push("debug-wait");
     }
-    // Add sysroot bin dir to PATH so the kernel linker (toyos-ld) is found
-    let host = toolchain::host_triple();
-    let sysroot_bin = root.join(format!("rust/build/{host}/stage2/lib/rustlib/{host}/bin"));
-    let path_env = match std::env::var("PATH") {
-        Ok(p) => format!("{}:{p}", sysroot_bin.display()),
-        Err(_) => sysroot_bin.display().to_string(),
-    };
     if !Command::new("cargo")
         .args(&kernel_args)
         .current_dir(root.join("kernel"))
@@ -77,6 +74,7 @@ pub fn build(root: &Path, debug: bool, release: bool, toolchain_changed: bool) {
         .current_dir(root.join("bootloader"))
         .env("RUSTUP_TOOLCHAIN", "toyos")
         .env("RUSTFLAGS", &rustflags)
+        .env("PATH", &path_env)
         .env("INIT_PROGRAMS", &init_programs)
         .env_remove("RUSTC")
         .status()
@@ -89,11 +87,19 @@ pub fn build(root: &Path, debug: bool, release: bool, toolchain_changed: bool) {
     let userland_dir = root.join("userland");
 
     // Clean workspace target on toolchain change
-    if toolchain_changed {
+    if changes.std_rebuilt {
         for subdir in ["target/x86_64-unknown-toyos", "target/debug"] {
             let dir = userland_dir.join(subdir);
             if dir.exists() {
                 eprintln!("toolchain changed: cleaning userland/{subdir}");
+                fs::remove_dir_all(&dir).ok();
+            }
+        }
+        // Also clean standalone toyos-ld/toyos-cc ToyOS targets
+        for crate_name in ["toyos-ld", "toyos-cc"] {
+            let dir = root.join(format!("{crate_name}/target/x86_64-unknown-toyos"));
+            if dir.exists() {
+                eprintln!("toolchain changed: cleaning {crate_name}/target/x86_64-unknown-toyos");
                 fs::remove_dir_all(&dir).ok();
             }
         }
@@ -130,6 +136,7 @@ pub fn build(root: &Path, debug: bool, release: bool, toolchain_changed: bool) {
             .current_dir(&userland_dir)
             .env("RUSTUP_TOOLCHAIN", "toyos")
             .env("RUSTFLAGS", &rustflags)
+            .env("PATH", &path_env)
             .env_remove("RUSTC")
             .status()
             .expect("Failed to run cargo")
@@ -143,7 +150,7 @@ pub fn build(root: &Path, debug: bool, release: bool, toolchain_changed: bool) {
     for (name, prog_config) in &standalone {
         let path = userland_dir.join(name);
 
-        if toolchain_changed {
+        if changes.std_rebuilt {
             for subdir in ["target/x86_64-unknown-toyos", "target/debug"] {
                 let dir = path.join(subdir);
                 if dir.exists() {
@@ -170,12 +177,34 @@ pub fn build(root: &Path, debug: bool, release: bool, toolchain_changed: bool) {
             .current_dir(&path)
             .env("RUSTUP_TOOLCHAIN", "toyos")
             .env("RUSTFLAGS", env_rustflags)
+            .env("PATH", &path_env)
             .env_remove("RUSTC")
             .status()
             .expect("Failed to run cargo")
             .success()
         {
             panic!("Failed to build userland/{name}");
+        }
+    }
+
+    // Build toyos-ld and toyos-cc for ToyOS (standalone, not workspace members)
+    for crate_name in ["toyos-ld", "toyos-cc"] {
+        let mut args = vec!["build", "--target", "x86_64-unknown-toyos"];
+        if release {
+            args.push("--release");
+        }
+        if !Command::new("cargo")
+            .args(&args)
+            .current_dir(root.join(crate_name))
+            .env("RUSTUP_TOOLCHAIN", "toyos")
+            .env("RUSTFLAGS", &rustflags)
+            .env("PATH", &path_env)
+            .env_remove("RUSTC")
+            .status()
+            .unwrap_or_else(|e| panic!("Failed to run cargo for {crate_name}: {e}"))
+            .success()
+        {
+            panic!("Failed to build {crate_name} for ToyOS");
         }
     }
 
@@ -193,6 +222,15 @@ pub fn build(root: &Path, debug: bool, release: bool, toolchain_changed: bool) {
             fs::read(&binary).unwrap_or_else(|_| panic!("Failed to read binary for {name}"));
         initrd_files.push((format!("bin/{name}"), data));
     }
+
+    // Add toyos-ld and toyos-cc ToyOS binaries to initrd
+    for crate_name in ["toyos-ld", "toyos-cc"] {
+        let binary = root.join(format!("{crate_name}/target/x86_64-unknown-toyos/{profile}/{crate_name}"));
+        let data = fs::read(&binary)
+            .unwrap_or_else(|_| panic!("Failed to read {crate_name} ToyOS binary"));
+        initrd_files.push((format!("bin/{crate_name}"), data));
+    }
+
     collect_hosted_rustc(root, &mut initrd_files);
     initrd_files.extend(assets::collect());
 
@@ -300,4 +338,3 @@ fn find_host_rlibs(root: &Path) -> Option<std::path::PathBuf> {
     }
     None
 }
-

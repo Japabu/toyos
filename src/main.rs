@@ -74,10 +74,10 @@ fn main() {
     }
 
     // Ensure toolchain is up to date
-    let toolchain_changed = toolchain::ensure(&root, rebuild_toolchain);
+    let changes = toolchain::ensure(&root, rebuild_toolchain);
 
     // Build everything
-    build::build(&root, debug, release, toolchain_changed);
+    build::build(&root, debug, release, &changes);
 
     if !build_only {
         qemu::launch(debug, dump_audio);

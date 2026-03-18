@@ -21,9 +21,6 @@ members = [
     "terminal",
     "test-runner",
     "toybox",
-    "toyos-cc",
-    "toyos-ld",
-    "toyos-net",
     "window",
 ]
 exclude = [

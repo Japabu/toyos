@@ -360,7 +360,7 @@ fn build_toyos_ld(repo: &Path) -> PathBuf {
     if let Some(p) = cache.as_ref() {
         return p.clone();
     }
-    let toyos_ld_dir = repo.join("userland/toyos-ld");
+    let toyos_ld_dir = repo.join("toyos-ld");
     let host = host_triple();
     assert!(
         Command::new("cargo")
@@ -371,9 +371,7 @@ fn build_toyos_ld(repo: &Path) -> PathBuf {
             .success(),
         "Failed to build toyos-ld"
     );
-    // toyos-ld is part of the userland workspace, so the binary ends up in the
-    // workspace target dir, not the crate-local target dir.
-    let path = repo.join(format!("userland/target/{host}/release/toyos-ld"))
+    let path = repo.join(format!("toyos-ld/target/{host}/release/toyos-ld"))
         .canonicalize()
         .expect("toyos-ld binary not found after build");
     *cache = Some(path.clone());

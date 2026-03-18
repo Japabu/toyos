@@ -14,7 +14,7 @@ fn main() {
     // Build toyos-cc as a host tool. It needs the stable host toolchain,
     // not the toyos cross-toolchain from userland/rust-toolchain.toml.
     // Setting RUSTUP_TOOLCHAIN overrides the toml file.
-    let toyos_cc_dir = root.join("../toyos-cc");
+    let toyos_cc_dir = root.join("../../toyos-cc");
     let host = std::env::var("HOST").unwrap();
     let cc_target_dir = root.join("../target/toyos-cc-host");
     let status = Command::new("cargo")

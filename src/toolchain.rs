@@ -1,12 +1,18 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::stamps;
 
-/// Ensure the toolchain is up to date. Returns true if std was rebuilt
-/// (callers must clean userland targets to avoid stale artifacts).
-pub fn ensure(root: &Path, force_rebuild: bool) -> bool {
+#[allow(dead_code)]
+pub struct ChangeSet {
+    pub std_rebuilt: bool,
+    pub linker_changed: bool,
+    pub compiler_changed: bool,
+}
+
+/// Ensure the toolchain is up to date. Returns a ChangeSet describing what changed.
+pub fn ensure(root: &Path, force_rebuild: bool) -> ChangeSet {
     let rust_dir = root.join("rust");
     let stamps_dir = root.join("target/stamps");
     fs::create_dir_all(&stamps_dir).ok();
@@ -23,10 +29,20 @@ pub fn ensure(root: &Path, force_rebuild: bool) -> bool {
     let compiler_stamp = stamps_dir.join("compiler.stamp");
     let std_stamp = stamps_dir.join("std.stamp");
     let abi_stamp = stamps_dir.join("abi.stamp");
+    let linker_stamp = stamps_dir.join("linker.stamp");
     let compiler_changed = stamps::dir_changed(&rust_dir.join("compiler"), &compiler_stamp);
     let std_changed = stamps::dir_changed(&rust_dir.join("library"), &std_stamp);
     // toyos-abi is a dependency of std — changes to it require an std rebuild
     let abi_changed = stamps::dir_changed(&root.join("toyos-abi/src"), &abi_stamp);
+    let linker_changed = stamps::dir_changed(&root.join("toyos-ld/src"), &linker_stamp);
+
+    // Ensure toyos-ld is built (needed as cross-linker for bootstrap and all builds)
+    let toyos_ld = toyos_ld_binary(root);
+    if linker_changed || !toyos_ld.exists() {
+        eprintln!("Building toyos-ld...");
+        build_toyos_ld(root);
+        stamps::write_dir_stamp(&root.join("toyos-ld/src"), &linker_stamp);
+    }
 
     let rebuilt = if !toolchain_exists || compiler_changed || force_rebuild {
         // Full bootstrap needed
@@ -48,14 +64,10 @@ pub fn ensure(root: &Path, force_rebuild: bool) -> bool {
         false
     };
 
-    // Ensure toyos-ld is built and installed
-    ensure_toyos_ld(root, &rust_dir);
-
-    // Ensure hosted rustc (ToyOS binary) exists — rebuild if missing
+    // Ensure hosted rustc (ToyOS binary) exists — rebuild if missing or std changed
     let hosted_rustc = rust_dir.join("build/x86_64-unknown-toyos/stage2/bin/rustc");
-    if !hosted_rustc.exists() {
-        let host = host_triple();
-        let toyos_ld = root.join(format!("userland/target/{host}/release/toyos-ld"));
+    if !hosted_rustc.exists() || rebuilt {
+        let toyos_ld = toyos_ld_binary(root);
         build_hosted_rustc(&rust_dir, &toyos_ld);
         assert!(hosted_rustc.exists(), "Failed to build hosted rustc");
     }
@@ -77,12 +89,15 @@ pub fn ensure(root: &Path, force_rebuild: bool) -> bool {
     }
     crate::libc::ensure(root, &rust_dir);
 
-    rebuilt
+    ChangeSet {
+        std_rebuilt: rebuilt,
+        linker_changed,
+        compiler_changed,
+    }
 }
 
 fn full_bootstrap(root: &Path, rust_dir: &Path) {
-    // Build toyos-ld first (needed as cross-linker)
-    let toyos_ld = build_toyos_ld(root);
+    let toyos_ld = toyos_ld_binary(root);
 
     // Write bootstrap.toml — ToyOS as target only, not host (fast rebuilds)
     write_config(rust_dir, &host_triple(), &toyos_ld, false);
@@ -196,42 +211,14 @@ linker = "{linker}"{codegen_backends}
     fs::write(rust_dir.join("bootstrap.toml"), config).unwrap();
 }
 
-fn ensure_toyos_ld(root: &Path, rust_dir: &Path) {
-    let ld_src = root.join("userland/toyos-ld/src");
-    let stamp = root.join("target/stamps/toyos-ld.stamp");
+/// Path to the host toyos-ld binary (stable location, never wiped by sysroot rebuilds).
+pub fn toyos_ld_binary(root: &Path) -> PathBuf {
     let host = host_triple();
-    let stage2 = rust_dir.join(format!("build/{host}/stage2"));
-    let sysroot_bin = stage2.join(format!("lib/rustlib/{host}/bin"));
-    let dest = sysroot_bin.join("toyos-ld");
-
-    // Rebuild if source changed OR if the installed binary is missing (e.g. after std rebuild clears sysroot)
-    let source_changed = stamps::dir_changed(&ld_src, &stamp);
-    let missing = !dest.exists();
-
-    if !source_changed && !missing {
-        return;
-    }
-
-    let toyos_ld = if source_changed {
-        eprintln!("Building toyos-ld...");
-        build_toyos_ld(root)
-    } else {
-        eprintln!("Reinstalling toyos-ld into sysroot...");
-        // toyos-ld is a workspace member, so output goes to the workspace target dir
-        root.join(format!("userland/target/{host}/release/toyos-ld"))
-    };
-
-    // Install into sysroot
-    fs::create_dir_all(&sysroot_bin)
-        .unwrap_or_else(|e| panic!("Failed to create {}: {e}", sysroot_bin.display()));
-    fs::copy(&toyos_ld, &dest)
-        .unwrap_or_else(|e| panic!("Failed to copy toyos-ld to {}: {e}", dest.display()));
-
-    stamps::write_dir_stamp(&ld_src, &stamp);
+    root.join(format!("toyos-ld/target/{host}/release/toyos-ld"))
 }
 
-fn build_toyos_ld(root: &Path) -> std::path::PathBuf {
-    let toyos_ld_dir = root.join("userland/toyos-ld");
+fn build_toyos_ld(root: &Path) {
+    let toyos_ld_dir = root.join("toyos-ld");
     let host = host_triple();
     let status = Command::new("cargo")
         .args(["build", "--release", "--target", &host])
@@ -239,8 +226,6 @@ fn build_toyos_ld(root: &Path) -> std::path::PathBuf {
         .status()
         .expect("Failed to build toyos-ld");
     assert!(status.success(), "toyos-ld build failed");
-    // toyos-ld is a workspace member, so output goes to the workspace target dir
-    root.join(format!("userland/target/{host}/release/toyos-ld"))
 }
 
 pub fn host_triple() -> String {
@@ -253,6 +238,16 @@ pub fn host_triple() -> String {
         .find(|l| l.starts_with("host:"))
         .map(|l| l.strip_prefix("host: ").unwrap().to_string())
         .expect("Could not determine host triple")
+}
+
+/// PATH with toyos-ld's build directory prepended, so rustc finds it for linking.
+pub fn path_with_toyos_ld(root: &Path) -> String {
+    let host = host_triple();
+    let ld_dir = root.join(format!("toyos-ld/target/{host}/release"));
+    match std::env::var("PATH") {
+        Ok(p) => format!("{}:{p}", ld_dir.display()),
+        Err(_) => ld_dir.display().to_string(),
+    }
 }
 
 fn ensure_host_target_in_sysroot(root: &Path) {
@@ -300,4 +295,3 @@ fn run(cmd: &str, args: &[&str]) {
         .unwrap_or_else(|e| panic!("Failed to run {cmd}: {e}"));
     assert!(status.success(), "{cmd} failed");
 }
-

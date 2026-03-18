@@ -18,8 +18,8 @@ fn main() {
     write_minimal_config(&tcc_dir);
 
     // ── Build toyos-cc and toyos-ld ──────────────
-    let toyos_cc_dir = root.join("../toyos-cc");
-    let toyos_ld_dir = root.join("../toyos-ld");
+    let toyos_cc_dir = root.join("../../toyos-cc");
+    let toyos_ld_dir = root.join("../../toyos-ld");
     run(Command::new("cargo")
         .args(["build", "--quiet"])
         .current_dir(&toyos_cc_dir));

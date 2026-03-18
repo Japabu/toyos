@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-toyos-cc = { path = "../userland/toyos-cc" }
-toyos-ld = { path = "../userland/toyos-ld" }
+toyos-cc = { path = "../toyos-cc" }
+toyos-ld = { path = "../toyos-ld" }
 bcachefs = { path = "../bcachefs" }
 fatfs = "0.3.6"
 gpt = "3.1.0"

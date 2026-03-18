@@ -11,8 +11,8 @@ fn main() {
     for dir in [
         "userland/libc/src",
         "userland/libc/include",
-        "userland/toyos-ld/src",
-        "userland/toyos-cc/src",
+        "toyos-ld/src",
+        "toyos-cc/src",
         "toyos-abi/src",
         "kernel/src",
         "src",
