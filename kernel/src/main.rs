@@ -194,6 +194,7 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     smp::boot_aps(&madt, kernel_args.boot_pml4_addr);
     vfs::init();
     process::init();
+    scheduler::init();
     pipe::init();
     listener::init();
     shared_memory::init();

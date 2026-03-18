@@ -412,7 +412,7 @@ fn sys_write(fd_num: u32, buf: &[u8]) -> u64 {
                 }
                 None => {
                     let block = data.fds.get(fd_num).and_then(|d| d.pipe_id_write())
-                        .map(|id| process::ProcessState::BlockedPipeWrite(id));
+                        .map(|id| crate::scheduler::BlockReason::PipeWrite(id));
                     Err(block)
                 }
             }
@@ -429,7 +429,7 @@ fn sys_write(fd_num: u32, buf: &[u8]) -> u64 {
 }
 
 enum ReadBlock {
-    State(process::ProcessState),
+    Reason(crate::scheduler::BlockReason),
     Poll { fds: [u64; 64], len: u32, deadline: u64 },
 }
 
@@ -444,9 +444,9 @@ fn sys_read(fd_num: u32, buf: &mut [u8]) -> u64 {
                 None => {
                     let desc = data.fds.get(fd_num);
                     if matches!(desc, Some(fd::Descriptor::Keyboard)) {
-                        Err(Some(ReadBlock::State(process::ProcessState::BlockedKeyboard)))
+                        Err(Some(ReadBlock::Reason(crate::scheduler::BlockReason::Keyboard)))
                     } else if let Some(id) = desc.and_then(|d| d.pipe_id_read()) {
-                        Err(Some(ReadBlock::State(process::ProcessState::BlockedPipeRead(id))))
+                        Err(Some(ReadBlock::Reason(crate::scheduler::BlockReason::PipeRead(id))))
                     } else if matches!(desc, Some(fd::Descriptor::SerialConsole)) {
                         let deadline = crate::clock::nanos_since_boot() + 10_000_000;
                         let mut fds = [0u64; 64];
@@ -463,7 +463,7 @@ fn sys_read(fd_num: u32, buf: &mut [u8]) -> u64 {
                 if let Some(id) = pipe_id { process::wake_pipe_writers(id); }
                 return n;
             }
-            Err(Some(ReadBlock::State(reason))) => process::block(reason),
+            Err(Some(ReadBlock::Reason(reason))) => process::block(reason),
             Err(Some(ReadBlock::Poll { fds, len, deadline })) => process::block_poll(fds, len, deadline),
             Err(None) => return SyscallError::NotFound.to_u64(),
         }
@@ -698,7 +698,7 @@ fn sys_waitpid(pid: u64, flags: u64) -> u64 {
                 if flags & WNOHANG != 0 {
                     return SyscallError::WouldBlock.to_u64();
                 }
-                process::block(process::ProcessState::BlockedWaitPid(child_pid));
+                process::block(crate::scheduler::BlockReason::WaitPid(child_pid));
             }
             Err(()) => return SyscallError::NotFound.to_u64(),
         }
@@ -857,14 +857,9 @@ fn sys_connect(name: &str) -> u64 {
     })
 }
 
-/// Spurious wakeup for all poll-blocked processes (same pattern as pipe wakeups).
+/// Wake all poll-blocked processes (for listener/connect events).
 fn wake_poll_waiters() {
-    let mut guard = process::PROCESS_TABLE.lock();
-    for (_, entry) in guard.as_mut().unwrap().iter_mut() {
-        if matches!(entry.state(), process::ProcessState::BlockedPoll { .. }) {
-            entry.set_state(process::ProcessState::Ready);
-        }
-    }
+    crate::scheduler::wake_all_poll();
 }
 
 fn sys_alloc_shared(size: u64) -> u64 {
@@ -985,7 +980,7 @@ fn sys_thread_join(tid: u64) -> u64 {
     loop {
         match process::collect_thread_zombie(tid, caller) {
             Ok(Some(_)) => return 0,
-            Ok(None) => process::block(process::ProcessState::BlockedThreadJoin(tid)),
+            Ok(None) => process::block(crate::scheduler::BlockReason::ThreadJoin(tid)),
             Err(()) => return SyscallError::NotFound.to_u64(),
         }
     }
@@ -1027,11 +1022,10 @@ fn sys_sysinfo(buf: &mut [u8]) -> u64 {
         }
         let Some(entry) = table.get(tid) else { continue };
 
-        let state: u8 = match entry.state() {
-            process::ProcessState::Running => 0,
-            process::ProcessState::Ready => 1,
-            process::ProcessState::Zombie(_) => 3,
-            _ => 2, // all Blocked variants
+        let state: u8 = if matches!(entry.state(), process::ProcessState::Zombie(_)) {
+            3
+        } else {
+            crate::scheduler::thread_sched_state(tid)
         };
         let (is_thread, parent_pid) = match entry.kind() {
             process::Kind::Thread { parent } => (1u8, *parent),
@@ -1077,13 +1071,13 @@ fn sys_net_recv(buf: &mut [u8], timeout_nanos: u64) -> u64 {
         if deadline > 0 && crate::clock::nanos_since_boot() >= deadline {
             return 0;
         }
-        process::block(process::ProcessState::BlockedNetRecv { deadline });
+        process::block(crate::scheduler::BlockReason::NetRecv { deadline });
     }
 }
 
 fn sys_nanosleep(nanos: u64) -> u64 {
     let deadline = crate::clock::nanos_since_boot().saturating_add(nanos);
-    process::block(process::ProcessState::BlockedSleep { deadline });
+    process::block(crate::scheduler::BlockReason::Sleep { deadline });
     0
 }
 

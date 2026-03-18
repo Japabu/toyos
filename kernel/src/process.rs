@@ -169,56 +169,20 @@ pub fn write_argv_to_stack(stack_top: u64, args: &[&str]) -> u64 {
     sp
 }
 
+/// Thread table state. The scheduler owns the actual scheduling state
+/// (ready/running/blocked). The thread table only tracks alive vs zombie.
 #[derive(Clone, Copy, PartialEq)]
 pub enum ProcessState {
-    Running,
-    Ready,
-    BlockedKeyboard,
-    BlockedPipeRead(pipe::PipeId),
-    BlockedPipeWrite(pipe::PipeId),
-    BlockedWaitPid(Pid),
-    BlockedThreadJoin(Tid),
-    BlockedPoll { deadline: u64 },
-    BlockedNetRecv { deadline: u64 },
-    BlockedSleep { deadline: u64 },
-    BlockedFutex { phys_addr: PhysAddr, deadline: u64 },
+    /// Thread is alive (running, ready, or blocked — scheduler knows which).
+    Alive,
+    /// Thread has exited with the given exit code.
     Zombie(i32),
 }
 
 impl ProcessState {
-    fn is_blocked(&self) -> bool {
-        matches!(self, Self::BlockedKeyboard | Self::BlockedPipeRead(_) | Self::BlockedPipeWrite(_)
-            | Self::BlockedWaitPid(_) | Self::BlockedThreadJoin(_) | Self::BlockedPoll { .. }
-            | Self::BlockedNetRecv { .. } | Self::BlockedSleep { .. }
-            | Self::BlockedFutex { .. })
-    }
-
-    fn can_transition_to(&self, new: &Self) -> bool {
-        match (self, new) {
-            (Self::Zombie(_), _) => false,
-            (_, Self::Zombie(_)) => true,
-            (Self::Running, Self::Ready) => true,
-            (Self::Running, _) if new.is_blocked() => true,
-            (Self::Ready, Self::Running) => true,
-            (s, Self::Ready) if s.is_blocked() => true,
-            _ => false,
-        }
-    }
-
-    /// Short name for debug messages (avoids printing large BlockedPoll data).
     pub fn name(&self) -> &'static str {
         match self {
-            Self::Running => "Running",
-            Self::Ready => "Ready",
-            Self::BlockedKeyboard => "BlockedKeyboard",
-            Self::BlockedPipeRead(_) => "BlockedPipeRead",
-            Self::BlockedPipeWrite(_) => "BlockedPipeWrite",
-            Self::BlockedWaitPid(_) => "BlockedWaitPid",
-            Self::BlockedThreadJoin(_) => "BlockedThreadJoin",
-            Self::BlockedPoll { .. } => "BlockedPoll",
-            Self::BlockedNetRecv { .. } => "BlockedNetRecv",
-            Self::BlockedSleep { .. } => "BlockedSleep",
-            Self::BlockedFutex { .. } => "BlockedFutex",
+            Self::Alive => "Alive",
             Self::Zombie(_) => "Zombie",
         }
     }
@@ -240,30 +204,16 @@ pub enum Kind {
 /// All fields are private — access only through getters and state-machine methods.
 /// This prevents accidental drops of `kernel_stack` (use-after-free) and
 /// invalid state transitions.
+/// Thread table entry — identity and state, protected by PROCESS_TABLE lock.
+/// Context switch data (kernel_rsp, address_space, etc.) lives in ThreadCtx
+/// which is owned by the scheduler.
 pub struct SchedEntry {
     tid: Tid,
-    /// The process this thread belongs to. For main threads, equals their own process ID.
     process: Pid,
     state: ProcessState,
     kind: Kind,
-    /// Reference-counted address space (PML4 page tables). Shared between a
-    /// process and its threads via Arc. Page tables freed when last ref drops.
-    address_space: Option<Arc<AddressSpace>>,
-    /// Kernel stack allocation. Dropping this frees the stack — only safe when
-    /// the process is NOT running on it (i.e. from the idle loop).
-    kernel_stack: OwnedAlloc,
-    kernel_rsp: u64,
-    fs_base: u64,
     name: [u8; 28],
-    /// Snapshot of allocated memory size (elf + stack) for sysinfo reporting.
     memory_size: u64,
-    /// Accumulated CPU time in nanoseconds.
-    cpu_ns: u64,
-    /// Timestamp (nanos_since_boot) when this process was last scheduled in.
-    /// Zero when not running.
-    scheduled_at: u64,
-    /// Per-process data behind its own lock. Syscalls clone this Arc, drop the
-    /// table lock, then lock ProcessData — so different processes never contend.
     data: Arc<Lock<ProcessData>>,
 }
 
@@ -273,18 +223,12 @@ impl SchedEntry {
         process: Pid,
         state: ProcessState,
         kind: Kind,
-        address_space: Option<Arc<AddressSpace>>,
-        kernel_stack: OwnedAlloc,
-        kernel_rsp: u64,
-        fs_base: u64,
         name: [u8; 28],
         memory_size: u64,
         data: Arc<Lock<ProcessData>>,
     ) -> Self {
-        Self { tid, process, state, kind, address_space, kernel_stack, kernel_rsp, fs_base, name, memory_size, cpu_ns: 0, scheduled_at: 0, data }
+        Self { tid, process, state, kind, name, memory_size, data }
     }
-
-    // --- Read-only getters ---
 
     pub fn tid(&self) -> Tid { self.tid }
     pub fn process(&self) -> Pid { self.process }
@@ -294,58 +238,19 @@ impl SchedEntry {
     pub fn memory_size(&self) -> u64 { self.memory_size }
     pub fn data(&self) -> &Arc<Lock<ProcessData>> { &self.data }
 
-    /// Total CPU time in nanoseconds, including time for the current quantum
-    /// if this process is currently running.
+    /// CPU time in nanoseconds, retrieved from the scheduler's ThreadCtx.
     pub fn cpu_ns(&self) -> u64 {
-        if self.scheduled_at > 0 {
-            self.cpu_ns + (crate::clock::nanos_since_boot() - self.scheduled_at)
-        } else {
-            self.cpu_ns
-        }
-    }
-    pub fn address_space(&self) -> Option<&Arc<AddressSpace>> { self.address_space.as_ref() }
-    pub fn fs_base(&self) -> u64 { self.fs_base }
-
-    // --- Scheduler-only accessors ---
-
-    pub fn kernel_stack_top(&self) -> u64 {
-        self.kernel_stack.ptr() as u64 + KERNEL_STACK_SIZE as u64
-    }
-    pub fn kernel_rsp(&self) -> u64 { self.kernel_rsp }
-    pub fn kernel_rsp_mut(&mut self) -> &mut u64 { &mut self.kernel_rsp }
-    pub fn set_fs_base(&mut self, val: u64) { self.fs_base = val; }
-
-    /// Called when this process is being switched OUT. Accumulates elapsed CPU time.
-    pub fn stop_cpu_timer(&mut self, now: u64) {
-        if self.scheduled_at > 0 {
-            self.cpu_ns += now - self.scheduled_at;
-            self.scheduled_at = 0;
-        }
-    }
-
-    /// Called when this process is being switched IN. Records the start timestamp.
-    pub fn start_cpu_timer(&mut self, now: u64) {
-        self.scheduled_at = now;
+        scheduler::thread_cpu_ns(self.tid)
     }
 
     // --- State machine ---
 
-    pub fn set_state(&mut self, new: ProcessState) {
-        assert!(self.state.can_transition_to(&new),
-            "invalid state transition tid={}: {} -> {}", self.tid, self.state.name(), new.name());
-        self.state = new;
+    pub fn zombify(&mut self, code: i32) {
+        assert!(!matches!(self.state, ProcessState::Zombie(_)),
+            "double zombify tid={}", self.tid);
+        self.state = ProcessState::Zombie(code);
     }
 
-    fn zombify(&mut self, code: i32) {
-        self.set_state(ProcessState::Zombie(code));
-    }
-
-    /// Take the address space Arc. Panics if already taken.
-    pub fn take_address_space(&mut self) -> Arc<AddressSpace> {
-        self.address_space.take().expect("take_address_space: already taken")
-    }
-
-    /// Detach this process from its parent (orphan it).
     pub fn detach_from_parent(&mut self) {
         assert!(matches!(self.kind, Kind::Process { parent: Some(_) }),
             "detach_from_parent: tid={} is not a parented process", self.tid);
@@ -520,17 +425,8 @@ impl ProcessTable {
         self.find_main_thread(process).and_then(|tid| self.procs.get(tid))
     }
 
-    /// Get the main thread entry for a process Pid (mutable).
-    pub fn get_process_mut(&mut self, process: Pid) -> Option<&mut SchedEntry> {
-        self.find_main_thread(process).and_then(|tid| self.procs.get_mut(tid))
-    }
-
     pub fn iter(&self) -> impl Iterator<Item = (Tid, &SchedEntry)> {
         self.procs.iter()
-    }
-
-    pub fn iter_mut(&mut self) -> impl Iterator<Item = (Tid, &mut SchedEntry)> {
-        self.procs.iter_mut()
     }
 
     /// Find the main thread Tid for a given process Pid.
@@ -634,7 +530,7 @@ pub fn with_current_sched<R>(f: impl FnOnce(&SchedEntry) -> R) -> R {
 }
 
 pub fn current_address_space() -> Arc<AddressSpace> {
-    with_current_sched(|s| Arc::clone(s.address_space().unwrap()))
+    scheduler::current_address_space().expect("current_address_space: no address space")
 }
 
 // ---------------------------------------------------------------------------
@@ -816,10 +712,11 @@ fn alloc_kernel_stack(
     Some((alloc, frame as u64))
 }
 
-/// Release the process table lock held across context_switch.
-/// Called by process_start before entering userspace.
+/// Release the CPU queue lock held across context_switch.
+/// Called by process_start/thread_start before entering userspace.
 fn scheduler_unlock() {
-    unsafe { PROCESS_TABLE.force_unlock(); }
+    unsafe { scheduler::force_unlock_current_cpu(); }
+    scheduler::handle_outgoing_public();
 }
 
 /// Entry point for new processes. Entered via context_switch's `ret`.
@@ -876,12 +773,13 @@ extern "C" fn thread_start() {
 
 /// Spawn a thread within the current process.
 pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64, stack_base: u64) -> Option<Tid> {
-    // Phase 1: Get parent's SchedEntry data + ProcessData (never held simultaneously)
+    // Phase 1: Get parent's data + address space (never held simultaneously)
     let (parent_addr_space, parent_process, data_arc) = {
         let guard = PROCESS_TABLE.lock();
         let table = guard.as_ref().unwrap();
         let parent = table.get(current_tid()).unwrap();
-        (parent.address_space().cloned(), parent.process(), Arc::clone(parent.data()))
+        let addr_space = scheduler::current_address_space();
+        (addr_space, parent.process(), Arc::clone(parent.data()))
     };
     let (tls_template, tls_filesz, tls_memsz, tls_modules, tls_total_memsz, tls_max_align, parent_cwd) = {
         let data = data_arc.lock();
@@ -947,11 +845,23 @@ pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64, stack_base: u64) -> Op
     let table = guard.as_mut().unwrap();
     let tid = table.insert_with(|tid| {
         SchedEntry::new(
-            tid, parent_process, ProcessState::Ready, Kind::Thread { parent: parent_process },
-            parent_addr_space.clone(), ks_alloc, ks_rsp, fs_base,
+            tid, parent_process, ProcessState::Alive, Kind::Thread { parent: parent_process },
             [0; 28], 0, thread_data,
         )
     });
+    drop(guard);
+
+    let ctx = scheduler::ThreadCtx {
+        tid,
+        process: parent_process,
+        kernel_stack: ks_alloc,
+        kernel_rsp: ks_rsp,
+        address_space: parent_addr_space,
+        fs_base,
+        cpu_ns: 0,
+        scheduled_at: 0,
+    };
+    scheduler::enqueue_new(ctx);
 
     Some(tid)
 }
@@ -1591,11 +1501,23 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
     let tid = table.insert_with(|tid| {
         proc_data.lock().pid = pid;
         SchedEntry::new(
-            tid, pid, ProcessState::Ready, Kind::Process { parent },
-            Some(child_addr_space.clone()), ks_alloc, ks_rsp, fs_base,
+            tid, pid, ProcessState::Alive, Kind::Process { parent },
             make_name(path), memory_size, proc_data,
         )
     });
+    drop(guard);
+
+    let ctx = scheduler::ThreadCtx {
+        tid,
+        process: pid,
+        kernel_stack: ks_alloc,
+        kernel_rsp: ks_rsp,
+        address_space: Some(child_addr_space.clone()),
+        fs_base,
+        cpu_ns: 0,
+        scheduled_at: 0,
+    };
+    scheduler::enqueue_new(ctx);
 
     let t3 = crate::clock::nanos_since_boot();
     log!("spawn: {} pid={} tid={} base={:#x} entry={:#x} cr3={:#x} (layout={}ms relocs={}ms deps={}ms tls={}ms total={}ms)",
@@ -1654,12 +1576,17 @@ fn teardown_resources(data_arc: &Arc<Lock<ProcessData>>, pid: Pid) {
 }
 
 /// Phase 2 of teardown: zombie threads, free page tables, set zombie state.
+/// `addr_space` is the process's address space, extracted from the scheduler
+/// before calling this function.
 /// Caller must hold PROCESS_TABLE lock and have already switched to kernel CR3.
-fn teardown_scheduling(table: &mut ProcessTable, process_pid: Pid, code: i32) {
+/// Returns Tids that need waking (e.g. parent blocked on waitpid, threads blocked
+/// on thread_join). The caller must wake them AFTER releasing the table lock.
+fn teardown_scheduling(table: &mut ProcessTable, process_pid: Pid, addr_space: Arc<AddressSpace>, code: i32) -> Vec<Tid> {
     let main_tid = table.find_main_thread(process_pid)
         .expect("teardown_scheduling: main thread not found");
+    let mut to_wake = Vec::new();
 
-    // Kill all child threads
+    // Kill all child threads and remove their ThreadCtx from the scheduler
     let child_tids: Vec<Tid> = table.iter()
         .filter(|(tid, e)| *tid != main_tid && matches!(e.kind(), Kind::Thread { parent } if *parent == process_pid))
         .map(|(tid, _)| tid)
@@ -1669,16 +1596,17 @@ fn teardown_scheduling(table: &mut ProcessTable, process_pid: Pid, code: i32) {
         if !matches!(child.state(), ProcessState::Zombie(_)) {
             child.zombify(-1);
         }
+        // Remove from scheduler (drop ThreadCtx → frees kernel stack)
+        scheduler::remove_thread(*tid);
     }
 
-    let entry = table.get_mut(main_tid).unwrap();
-    let addr_space = entry.take_address_space();
     shared_memory::cleanup_process(process_pid);
     pipe::cleanup_address_space(&addr_space);
     addr_space.mark_dead();
-    drop(addr_space);
-    let has_parent = matches!(entry.kind(), Kind::Process { parent: Some(_) });
+
+    let entry = table.get_mut(main_tid).unwrap();
     let cpu_ms = entry.cpu_ns() / 1_000_000;
+    let has_parent = matches!(entry.kind(), Kind::Process { parent: Some(_) });
     entry.zombify(code);
     let name = core::str::from_utf8(entry.name()).unwrap_or("?").trim_end_matches('\0');
     log!("exit: {name} pid={process_pid} code={code} cpu={cpu_ms}ms");
@@ -1696,66 +1624,70 @@ fn teardown_scheduling(table: &mut ProcessTable, process_pid: Pid, code: i32) {
         }
     }
 
+    // Identify parent to wake for waitpid
     if has_parent {
-        // Wake parent if blocked on waitpid
         if let Kind::Process { parent: Some(ppid) } = table.get(main_tid).unwrap().kind() {
-            if let Some(parent_entry) = table.get_process_mut(*ppid) {
-                if let ProcessState::BlockedWaitPid(child) = *parent_entry.state() {
-                    if child == process_pid {
-                        parent_entry.set_state(ProcessState::Ready);
-                    }
-                }
+            let ppid = *ppid;
+            if let Some(parent_entry) = table.get_process(ppid) {
+                to_wake.push(parent_entry.tid());
             }
         }
     }
+
+    to_wake
 }
 
 /// Exit the entire process (all threads). If called from a thread, kills the
 /// parent process and all siblings.
 pub fn exit(code: i32) -> ! {
-    // Phase 1: Determine process pid and get data Arc (brief table lock)
-    let (process_pid, data_arc) = {
+    // Phase 1: Determine process pid, data Arc, and address space
+    let (process_pid, data_arc, addr_space) = {
         let guard = PROCESS_TABLE.lock();
         let table = guard.as_ref().unwrap();
         let tid = current_tid();
-        // Our entry was already reaped (parent exited and teardown + zombie
-        // collection ran while we were still physically executing on another
-        // CPU). Nothing left to tear down — just deschedule.
         let Some(entry) = table.get(tid) else {
             drop(guard);
             unsafe { cpu::write_cr3(paging::kernel_cr3()); }
-            let guard = PROCESS_TABLE.lock();
-            scheduler::schedule_no_return_locked(guard);
+            scheduler::exit_current(code);
         };
         let process_pid = entry.process();
-        (process_pid, Arc::clone(table.get_process(process_pid).unwrap().data()))
+        let data_arc = Arc::clone(table.get_process(process_pid).unwrap().data());
+        let addr_space = scheduler::current_address_space()
+            .expect("exit: no address space");
+        (process_pid, data_arc, addr_space)
     };
 
-    // Switch to kernel CR3 before freeing resources
+    // Phase 2: Switch to kernel CR3 and clean up resources
     unsafe { cpu::write_cr3(paging::kernel_cr3()); }
-
-    // Phase 2: Resource cleanup (ProcessData lock, no table lock)
     teardown_resources(&data_arc, process_pid);
 
-    // Phase 3: Scheduling teardown (table lock held through context switch)
-    let mut guard = PROCESS_TABLE.lock();
-    let table = guard.as_mut().unwrap();
-    let pid = current_tid();
+    // Phase 3: Scheduling teardown (table lock, then release before waking)
+    let to_wake = {
+        let mut guard = PROCESS_TABLE.lock();
+        let table = guard.as_mut().unwrap();
+        let tid = current_tid();
 
-    // If we're a thread, zombie ourselves first
-    if let Kind::Thread { .. } = table.get(pid).unwrap().kind() {
-        table.get_mut(pid).unwrap().zombify(code);
+        // If we're a thread, zombie ourselves first
+        if let Kind::Thread { .. } = table.get(tid).unwrap().kind() {
+            table.get_mut(tid).unwrap().zombify(code);
+        }
+
+        teardown_scheduling(table, process_pid, addr_space, code)
+    };
+    // Table lock released — now safe to wake via scheduler
+    for tid in to_wake {
+        scheduler::wake_tid(tid);
     }
 
-    teardown_scheduling(table, process_pid, code);
-    scheduler::schedule_no_return_locked(guard);
+    // Phase 4: Exit the current thread via scheduler (context switch away)
+    scheduler::exit_current(code);
 }
 
 /// Exit the current thread only. For processes without threads, tears down
 /// the process. For threads, zombifies without freeing the address space.
 pub fn thread_exit(code: i32) -> ! {
     let kind = with_current_sched(|s| *s.kind());
-    let addr_space = with_current_sched(|s| s.address_space().cloned());
+    let addr_space = scheduler::current_address_space();
 
     unsafe { cpu::write_cr3(paging::kernel_cr3()); }
 
@@ -1766,42 +1698,49 @@ pub fn thread_exit(code: i32) -> ! {
                 let data_arc = current_data();
                 let mut data = data_arc.lock();
                 fd::close_all(&mut data.fds, &mut *vfs::lock(), current_process());
-                // Clear USER bits from shared page tables before freeing TLS,
-                // so the freed memory doesn't have stale USER PTEs.
                 if let (Some(tls), Some(addr_space)) = (data.tls_alloc.as_ref(), addr_space.as_ref()) {
                     addr_space.unmap_user(PhysAddr::from_ptr(tls.ptr()), tls.size() as u64);
                 }
                 data.tls_alloc.take();
             }
 
-            let mut guard = PROCESS_TABLE.lock();
-            let table = guard.as_mut().unwrap();
-            let tid = current_tid();
-            let cpu_ms = table.get(tid).unwrap().cpu_ns() / 1_000_000;
-            table.get_mut(tid).unwrap().zombify(code);
-            let name = core::str::from_utf8(table.get(tid).unwrap().name()).unwrap_or("?").trim_end_matches('\0');
-            log!("exit: {name} tid={tid} code={code} cpu={cpu_ms}ms");
+            let parent_tid = {
+                let mut guard = PROCESS_TABLE.lock();
+                let table = guard.as_mut().unwrap();
+                let tid = current_tid();
+                let cpu_ms = table.get(tid).unwrap().cpu_ns() / 1_000_000;
+                table.get_mut(tid).unwrap().zombify(code);
+                let name = core::str::from_utf8(table.get(tid).unwrap().name()).unwrap_or("?").trim_end_matches('\0');
+                log!("exit: {name} tid={tid} code={code} cpu={cpu_ms}ms");
 
-            // Wake parent process's main thread if blocked on thread_join
-            if let Some(p) = table.get_process_mut(parent) {
-                if let ProcessState::BlockedThreadJoin(child) = *p.state() {
-                    if child == tid {
-                        p.set_state(ProcessState::Ready);
-                    }
-                }
+                // Find parent's main thread Tid for deferred wake
+                table.get_process(parent).map(|e| e.tid())
+            };
+
+            // Wake parent if blocked on thread_join (after releasing table lock)
+            if let Some(ptid) = parent_tid {
+                scheduler::wake_tid(ptid);
             }
 
-            scheduler::schedule_no_return_locked(guard);
+            scheduler::exit_current(code);
         }
         Kind::Process { .. } => {
             // Process exit — full teardown
+            let process_pid = current_process();
             let data_arc = current_data();
-            teardown_resources(&data_arc, current_process());
+            let addr_space = addr_space.expect("thread_exit: process has no address space");
+            teardown_resources(&data_arc, process_pid);
 
-            let mut guard = PROCESS_TABLE.lock();
-            let table = guard.as_mut().unwrap();
-            teardown_scheduling(table, current_process(), code);
-            scheduler::schedule_no_return_locked(guard);
+            let to_wake = {
+                let mut guard = PROCESS_TABLE.lock();
+                let table = guard.as_mut().unwrap();
+                teardown_scheduling(table, process_pid, addr_space, code)
+            };
+            for tid in to_wake {
+                scheduler::wake_tid(tid);
+            }
+
+            scheduler::exit_current(code);
         }
     }
 }
@@ -1810,8 +1749,8 @@ pub fn thread_exit(code: i32) -> ! {
 // Blocking / scheduling
 // ---------------------------------------------------------------------------
 
-/// Block the current process and switch to the next ready one.
-pub fn block(reason: ProcessState) {
+/// Block the current thread and switch to the next ready one.
+pub fn block(reason: scheduler::BlockReason) {
     scheduler::block(reason);
 }
 
@@ -1857,7 +1796,7 @@ pub fn block_poll(fds: [u64; 64], len: u32, deadline: u64) {
         data.poll_read_pipe_count = rcount;
         data.poll_write_pipe_count = wcount;
     }
-    scheduler::block(ProcessState::BlockedPoll { deadline });
+    scheduler::block(scheduler::BlockReason::Poll { deadline });
 }
 
 // ---------------------------------------------------------------------------
@@ -1866,57 +1805,35 @@ pub fn block_poll(fds: [u64; 64], len: u32, deadline: u64) {
 
 /// Atomically check a user futex word and block if it matches the expected value.
 /// Returns 0 if woken normally, 1 if timed out, u64::MAX on error.
-/// The check-and-block is atomic w.r.t. futex_wake because both hold the process table lock.
 pub fn futex_wait(addr: u64, expected: u32, timeout_ns: u64) -> u64 {
     let deadline = if timeout_ns != u64::MAX {
         crate::clock::nanos_since_boot().saturating_add(timeout_ns)
     } else {
         0
     };
-    let mut guard = PROCESS_TABLE.lock();
-    let table = guard.as_mut().unwrap();
-    let pid = current_tid();
-    let entry = table.get_mut(pid).unwrap();
 
     // Translate virtual → physical so cross-process futex works on shared memory
-    let phys_addr = match entry.address_space()
+    let phys_addr = match scheduler::current_address_space()
         .and_then(|a| a.virt_to_phys(UserAddr::new(addr))) {
         Some(pa) => pa,
         None => return u64::MAX,
     };
 
-    let current = unsafe { core::ptr::read_volatile(phys_addr.as_ptr::<u32>()) };
-    if current != expected {
-        return 0;
+    if scheduler::futex_wait(phys_addr, expected, deadline) {
+        0 // blocked and woken
+    } else {
+        0 // value mismatch, returned immediately
     }
-
-    entry.set_state(ProcessState::BlockedFutex { phys_addr, deadline });
-    scheduler::schedule_already_blocked(guard);
-    0
 }
 
 /// Wake up to `count` threads blocked on the same physical address as `addr`.
 pub fn futex_wake(addr: u64, count: u64) -> u64 {
-    let mut guard = PROCESS_TABLE.lock();
-    let table = guard.as_mut().unwrap();
-    let pid = current_tid();
-    let caller_phys = match table.get(pid)
-        .and_then(|e| e.address_space())
+    let phys_addr = match scheduler::current_address_space()
         .and_then(|a| a.virt_to_phys(UserAddr::new(addr))) {
         Some(pa) => pa,
         None => return 0,
     };
-    let mut woken = 0u64;
-    for (_, entry) in table.iter_mut() {
-        if woken >= count { break; }
-        if let ProcessState::BlockedFutex { phys_addr, .. } = *entry.state() {
-            if phys_addr == caller_phys {
-                entry.set_state(ProcessState::Ready);
-                woken += 1;
-            }
-        }
-    }
-    woken
+    scheduler::futex_wake(phys_addr, count as usize)
 }
 
 // ---------------------------------------------------------------------------
@@ -1965,12 +1882,11 @@ pub fn handle_page_fault(fault_addr: u64, _error_code: u64) -> bool {
     if tid == Tid::MAX { return false; }
 
     let (data_arc, addr_space) = {
+        let Some(addr_space) = scheduler::current_address_space() else { return false };
+        if addr_space.is_dead() { return false; }
         let guard = PROCESS_TABLE.lock();
         let Some(table) = guard.as_ref() else { return false };
         let Some(entry) = table.get(tid) else { return false };
-        let Some(addr_space) = entry.address_space() else { return false };
-        if addr_space.is_dead() { return false; }
-        let addr_space = Arc::clone(addr_space);
         let data = match entry.kind() {
             Kind::Thread { parent } => {
                 match table.get_process(*parent) {
@@ -2116,13 +2032,7 @@ pub fn dump_crash_diagnostics(fault_addr: u64, rip: u64) {
     }
 
     // Dump memory around given addresses (if mapped in the process page tables)
-    let addr_space = {
-        let guard = PROCESS_TABLE.lock();
-        let Some(table) = guard.as_ref() else { return };
-        let Some(entry) = table.get(tid) else { return };
-        entry.address_space().cloned()
-    };
-    let Some(addr_space) = addr_space else { return };
+    let Some(addr_space) = scheduler::current_address_space() else { return };
 
     // Read a u64 from a user virtual address via page table translation.
     // Reads via the kernel direct map (no USER bit) to avoid SMAP faults.
@@ -2152,11 +2062,7 @@ pub fn dump_crash_diagnostics(fault_addr: u64, rip: u64) {
     // Dump TLS self-pointer at FS base
     // Read the ACTUAL FS_BASE MSR (swapgs doesn't affect FS, only GS)
     let fs_base_msr = crate::arch::read_fs_base();
-    let fs_base_saved = {
-        let guard = PROCESS_TABLE.lock();
-        let Some(table) = guard.as_ref() else { return };
-        table.get(tid).map(|e| e.fs_base()).unwrap_or(0)
-    };
+    let fs_base_saved = scheduler::with_current_ctx(|ctx| ctx.fs_base).unwrap_or(0);
     let fs_base = fs_base_msr;
     if fs_base_msr != fs_base_saved {
         log!("  FS base: MSR={:#x} saved={:#x} (MISMATCH!)", fs_base_msr, fs_base_saved);
@@ -2225,8 +2131,8 @@ pub fn kill_process(target_pid: Pid) -> u64 {
         if !matches!(entry.kind(), Kind::Process { parent: Some(ppid) } if *ppid == caller) {
             return SyscallError::PermissionDenied.to_u64();
         }
-        if *entry.state() == ProcessState::Running {
-            return SyscallError::WouldBlock.to_u64();
+        if scheduler::thread_sched_state(entry.tid()) == 0 {
+            return SyscallError::WouldBlock.to_u64(); // currently running on a CPU
         }
         if matches!(entry.state(), ProcessState::Zombie(_)) {
             return 0;
@@ -2246,46 +2152,53 @@ pub fn kill_process(target_pid: Pid) -> u64 {
     }
 
     // Phase 3: Scheduling teardown (table lock)
-    let mut guard = PROCESS_TABLE.lock();
-    let table = guard.as_mut().unwrap();
+    // Phase 3: Scheduling teardown (table lock, then release for wakes)
+    let caller_tid = {
+        let mut guard = PROCESS_TABLE.lock();
+        let table = guard.as_mut().unwrap();
 
-    // Re-check the target is still there and not zombie (might have exited between phases)
-    let Some(main_tid) = table.find_main_thread(target_pid) else { return 0 };
-    let Some(entry) = table.get(main_tid) else { return 0 };
-    if matches!(entry.state(), ProcessState::Zombie(_)) { return 0; }
+        // Re-check the target is still there and not zombie
+        let Some(main_tid) = table.find_main_thread(target_pid) else { return 0 };
+        let Some(entry) = table.get(main_tid) else { return 0 };
+        if matches!(entry.state(), ProcessState::Zombie(_)) { return 0; }
 
-    // Kill child threads of the target
-    let child_tids: Vec<Tid> = table.iter()
-        .filter(|(tid, e)| *tid != main_tid && matches!(e.kind(), Kind::Thread { parent } if *parent == target_pid))
-        .map(|(tid, _)| tid)
-        .collect();
-    for tid in &child_tids {
-        let child = table.get_mut(*tid).unwrap();
-        if !matches!(child.state(), ProcessState::Zombie(_)) {
-            child.zombify(-1);
+        // Kill child threads and remove from scheduler
+        let child_tids: Vec<Tid> = table.iter()
+            .filter(|(tid, e)| *tid != main_tid && matches!(e.kind(), Kind::Thread { parent } if *parent == target_pid))
+            .map(|(tid, _)| tid)
+            .collect();
+        for tid in &child_tids {
+            let child = table.get_mut(*tid).unwrap();
+            if !matches!(child.state(), ProcessState::Zombie(_)) {
+                child.zombify(-1);
+            }
+            scheduler::remove_thread(*tid);
         }
-    }
 
-    let entry = table.get_mut(main_tid).unwrap();
-    let addr_space = entry.take_address_space();
-    if !addr_space.is_dead() {
-        shared_memory::cleanup_process(target_pid);
-        pipe::cleanup_address_space(&addr_space);
-        addr_space.mark_dead();
-    }
-    drop(addr_space);
-
-    entry.zombify(137); // 128 + 9 (SIGKILL-like)
-    let name = core::str::from_utf8(entry.name()).unwrap_or("?").trim_end_matches('\0');
-    log!("kill: {name} pid={target_pid}");
-
-    // Wake caller if blocked on waitpid for this process
-    if let Some(caller_entry) = table.get_process_mut(caller) {
-        if let ProcessState::BlockedWaitPid(child) = *caller_entry.state() {
-            if child == target_pid {
-                caller_entry.set_state(ProcessState::Ready);
+        // Get address space from the main thread's ThreadCtx
+        if let Some(mut ctx) = scheduler::remove_thread(main_tid) {
+            if let Some(addr_space) = ctx.address_space.take() {
+                if !addr_space.is_dead() {
+                    shared_memory::cleanup_process(target_pid);
+                    pipe::cleanup_address_space(&addr_space);
+                    addr_space.mark_dead();
+                }
             }
         }
+
+        let entry = table.get_mut(main_tid).unwrap();
+        entry.zombify(137); // 128 + 9 (SIGKILL-like)
+        let name = core::str::from_utf8(entry.name()).unwrap_or("?").trim_end_matches('\0');
+        log!("kill: {name} pid={target_pid}");
+
+        // Collect caller Tid for deferred wake
+        let caller_tid = table.get_process(caller).map(|e| e.tid());
+        caller_tid
+    };
+
+    // Wake caller if blocked on waitpid (after releasing table lock)
+    if let Some(ctid) = caller_tid {
+        scheduler::wake_tid(ctid);
     }
 
     0

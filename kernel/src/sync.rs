@@ -78,3 +78,38 @@ impl<T> Lock<T> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Lock<Option<T>> projection — lock and unwrap in one step
+// ---------------------------------------------------------------------------
+
+impl<T> Lock<Option<T>> {
+    /// Lock and project through the Option, returning a guard that derefs to T.
+    /// Panics if the Option is None (i.e. not yet initialized).
+    pub fn lock_unwrap(&self) -> OptionGuard<'_, T> {
+        let guard = self.lock();
+        assert!(guard.is_some(), "lock_unwrap: not initialized");
+        OptionGuard { guard }
+    }
+}
+
+/// Guard that projects `LockGuard<Option<T>>` → `&T` / `&mut T`.
+/// Drops the underlying lock when dropped.
+pub struct OptionGuard<'a, T> {
+    guard: LockGuard<'a, Option<T>>,
+}
+
+impl<T> Deref for OptionGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        // SAFETY: lock_unwrap asserted Some
+        self.guard.as_ref().unwrap()
+    }
+}
+
+impl<T> DerefMut for OptionGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        // SAFETY: lock_unwrap asserted Some
+        self.guard.as_mut().unwrap()
+    }
+}
+
