@@ -27,7 +27,7 @@ struct DmaNic {
     net_hdr_size: usize,
     mac: [u8; 6],
     pending_rx: Option<(usize, usize)>,
-    _nic_fd: Fd,
+    nic_fd: Fd,
 }
 
 impl DmaNic {
@@ -55,7 +55,7 @@ impl DmaNic {
             net_hdr_size: info.net_hdr_size as usize,
             mac: info.mac,
             pending_rx: None,
-            _nic_fd: nic_fd,
+            nic_fd,
         }
     }
 
@@ -972,7 +972,10 @@ fn main() {
             timeout = timeout.min(Duration::from_millis(1));
         }
 
-        let mut poll_fds: Vec<u64> = vec![listener.0 as u64];
+        let mut poll_fds: Vec<u64> = vec![
+            listener.0 as u64,
+            device.nic_fd.0 as u64 | toyos_poll::POLL_READABLE,
+        ];
         for (&_id, fd) in &daemon.owners {
             if !poll_fds.contains(&(fd.0 as u64)) {
                 poll_fds.push(fd.0 as u64);
@@ -990,7 +993,8 @@ fn main() {
             }
         }
 
-        for i in 1..poll_fds.len() {
+        // Index 0 = listener, index 1 = NIC (wake only, no read), index 2+ = client FDs
+        for i in 2..poll_fds.len() {
             if result.fd(i) {
                 let fd = Fd(poll_fds[i] as i32);
                 if let Ok(header) = ipc::recv_header(fd) {

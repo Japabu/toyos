@@ -26,18 +26,20 @@ const STATUS_FEATURES_OK: u8 = 8;
 pub const VIRTIO_F_VERSION_1: u64 = 1 << 32;
 
 // Common config field offsets (virtio_pci_common_cfg)
-const COMMON_DEVICE_FEATURE_SELECT: u64 = 0x00;
-const COMMON_DEVICE_FEATURE: u64 = 0x04;
-const COMMON_DRIVER_FEATURE_SELECT: u64 = 0x08;
-const COMMON_DRIVER_FEATURE: u64 = 0x0C;
-const COMMON_DEVICE_STATUS: u64 = 0x14;
-const COMMON_QUEUE_SELECT: u64 = 0x16;
-const COMMON_QUEUE_SIZE: u64 = 0x18;
-const COMMON_QUEUE_ENABLE: u64 = 0x1C;
-const COMMON_QUEUE_NOTIFY_OFF: u64 = 0x1E;
-const COMMON_QUEUE_DESC: u64 = 0x20;
-const COMMON_QUEUE_DRIVER: u64 = 0x28;
-const COMMON_QUEUE_DEVICE: u64 = 0x30;
+pub const COMMON_DEVICE_FEATURE_SELECT: u64 = 0x00;
+pub const COMMON_DEVICE_FEATURE: u64 = 0x04;
+pub const COMMON_DRIVER_FEATURE_SELECT: u64 = 0x08;
+pub const COMMON_DRIVER_FEATURE: u64 = 0x0C;
+pub const COMMON_MSIX_CONFIG: u64 = 0x10;
+pub const COMMON_DEVICE_STATUS: u64 = 0x14;
+pub const COMMON_QUEUE_SELECT: u64 = 0x16;
+pub const COMMON_QUEUE_SIZE: u64 = 0x18;
+pub const COMMON_QUEUE_MSIX: u64 = 0x1A;
+pub const COMMON_QUEUE_ENABLE: u64 = 0x1C;
+pub const COMMON_QUEUE_NOTIFY_OFF: u64 = 0x1E;
+pub const COMMON_QUEUE_DESC: u64 = 0x20;
+pub const COMMON_QUEUE_DRIVER: u64 = 0x28;
+pub const COMMON_QUEUE_DEVICE: u64 = 0x30;
 
 // Virtqueue descriptor flags
 const VIRTQ_DESC_F_NEXT: u16 = 1;
@@ -221,7 +223,7 @@ impl Virtqueue {
         first_desc
     }
 
-    /// Non-destructive check whether the device has completed any request.
+    /// Check if the device has completed any request.
     pub fn has_used(&self) -> bool {
         let used = self.used();
         let used_idx = unsafe { read_volatile(&raw const (*used).idx) };
@@ -331,7 +333,8 @@ impl VirtioDevice {
         Self { config }
     }
 
-    /// Configure a virtqueue. Must be called before `activate()`.
+    /// Configure a virtqueue's addresses and size. Does NOT enable the queue —
+    /// call `enable_queue()` after setting MSI-X vectors (if applicable).
     pub fn setup_queue(&self, index: u16, queue: &mut Virtqueue) {
         let common = self.config.common;
 
@@ -346,7 +349,12 @@ impl VirtioDevice {
         common.write_u64(COMMON_QUEUE_DEVICE, queue.used_phys());
 
         queue.notify_offset = common.read_u16(COMMON_QUEUE_NOTIFY_OFF);
+    }
 
+    /// Enable a previously configured virtqueue.
+    pub fn enable_queue(&self, index: u16) {
+        let common = self.config.common;
+        common.write_u16(COMMON_QUEUE_SELECT, index);
         common.write_u16(COMMON_QUEUE_ENABLE, 1);
     }
 
@@ -365,6 +373,10 @@ impl VirtioDevice {
 
     pub fn notify_off_multiplier(&self) -> u32 {
         self.config.notify_off_multiplier
+    }
+
+    pub fn common_config(&self) -> Mmio {
+        self.config.common
     }
 
     pub fn device_config(&self) -> Mmio {

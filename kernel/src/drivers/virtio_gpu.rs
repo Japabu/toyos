@@ -523,6 +523,8 @@ pub fn init(ecam_base: u64) -> Option<(Box<dyn Gpu>, GpuInfo)> {
 
     device.setup_queue(0, &mut controlq);
     device.setup_queue(1, &mut cursorq);
+    device.enable_queue(0);
+    device.enable_queue(1);
     device.activate();
 
     let req_phys = dma_phys(PAGE_CONTROLQ_BUFS).raw() + REQ_OFFSET as u64;

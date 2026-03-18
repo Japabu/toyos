@@ -310,6 +310,9 @@ pub fn init(ecam_base: u64) -> Option<(SoundController, AudioInfo)> {
     device.setup_queue(0, &mut controlq);
     device.setup_queue(1, &mut eventq);
     device.setup_queue(2, &mut txq);
+    device.enable_queue(0);
+    device.enable_queue(1);
+    device.enable_queue(2);
     device.activate();
 
     let req_phys = dma_phys(PAGE_CTRL_BUFS).raw() + REQ_OFFSET as u64;

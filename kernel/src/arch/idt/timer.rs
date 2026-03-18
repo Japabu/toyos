@@ -105,5 +105,20 @@ extern "sysv64" fn timer_handler() {
     crate::arch::apic::eoi();
     CPU_BUSY_TICKS.fetch_add(1, Ordering::Relaxed);
     CPU_TOTAL_TICKS.fetch_add(1, Ordering::Relaxed);
+
+    // Process deadlines and pending events from the timer interrupt.
+    // try_lock avoids deadlock if the blocked pool is held on this CPU.
+    crate::scheduler::check_deadlines();
+
+    if super::virtio_net::irq_pending() {
+        crate::scheduler::push_event(crate::scheduler::EventSource::Network);
+    }
+
+    // Process xHCI events (keyboard/mouse) from timer context too,
+    // in case the idle loop isn't running on CPU 0.
+    if crate::arch::percpu::cpu_id() == 0 {
+        crate::drivers::xhci::poll_if_pending();
+    }
+
     crate::scheduler::preempt();
 }

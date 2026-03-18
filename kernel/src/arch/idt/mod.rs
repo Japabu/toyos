@@ -1,6 +1,7 @@
 mod exceptions;
 mod timer;
 mod tlb;
+pub mod virtio_net;
 mod xhci;
 
 use super::cpu;
@@ -24,6 +25,7 @@ enum Vector {
     PageFault = 0x0E,
     Timer = 0x20,
     Xhci = 0x21,
+    VirtioNet = 0x22,
     TlbFlush = 0xFE,
 }
 
@@ -184,6 +186,7 @@ pub fn init() {
         idt.entries[Vector::PageFault as usize] = IdtEntry::new(exceptions::page_fault_entry as *const () as u64);
         idt.entries[Vector::Timer as usize] = IdtEntry::new(timer::timer_entry as *const () as u64);
         idt.entries[Vector::Xhci as usize] = IdtEntry::new(xhci::xhci_entry as *const () as u64);
+        idt.entries[Vector::VirtioNet as usize] = IdtEntry::new(virtio_net::virtio_net_entry as *const () as u64);
         idt.entries[Vector::TlbFlush as usize] = IdtEntry::new(tlb::tlb_flush_entry as *const () as u64);
     }
 

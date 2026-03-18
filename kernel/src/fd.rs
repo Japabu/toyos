@@ -79,6 +79,37 @@ impl Descriptor {
             _ => None,
         }
     }
+
+    /// Map this descriptor to the EventSource that indicates readable data.
+    /// Returns None for always-ready descriptors (File, Framebuffer, Audio)
+    /// and for write-only descriptors.
+    pub fn read_event_source(&self) -> Option<crate::scheduler::EventSource> {
+        use crate::scheduler::EventSource;
+        match self {
+            Self::Keyboard => Some(EventSource::Keyboard),
+            Self::Mouse => Some(EventSource::Mouse),
+            Self::SerialConsole => Some(EventSource::Keyboard),
+            Self::Nic(_) => Some(EventSource::Network),
+            Self::Listener(_) => Some(EventSource::Listener),
+            Self::PipeRead(r) | Self::TtyRead(r) => Some(EventSource::PipeReadable(r.id())),
+            Self::Socket { rx, .. } => Some(EventSource::PipeReadable(rx.id())),
+            Self::File(_) | Self::Framebuffer(_) | Self::Audio(_) => None,
+            Self::PipeWrite(_) | Self::TtyWrite(_) => None,
+        }
+    }
+
+    /// Map this descriptor to the EventSource that indicates writable space.
+    pub fn write_event_source(&self) -> Option<crate::scheduler::EventSource> {
+        use crate::scheduler::EventSource;
+        match self {
+            Self::PipeWrite(w) | Self::TtyWrite(w) => Some(EventSource::PipeWritable(w.id())),
+            Self::Socket { tx, .. } => Some(EventSource::PipeWritable(tx.id())),
+            Self::File(_) | Self::SerialConsole => None, // always writable
+            Self::Keyboard | Self::Mouse | Self::Nic(_) | Self::Audio(_)
+            | Self::Framebuffer(_) | Self::Listener(_)
+            | Self::PipeRead(_) | Self::TtyRead(_) => None,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -401,7 +432,8 @@ pub fn has_data(table: &FdTable, fd: u32) -> bool {
                 Descriptor::Mouse => mouse::has_data(),
                 Descriptor::Listener(name) => listener::has_pending(name),
                 Descriptor::SerialConsole => serial::has_data(),
-                Descriptor::File(_) | Descriptor::Framebuffer(_) | Descriptor::Nic(_) | Descriptor::Audio(_) => true,
+                Descriptor::Nic(_) => crate::net::has_packet(),
+                Descriptor::File(_) | Descriptor::Framebuffer(_) | Descriptor::Audio(_) => true,
                 _ => false,
             }
         }

@@ -26,8 +26,14 @@ impl HidDevice {
         let size = self.report_size as usize;
         unsafe { copy_nonoverlapping(self.report_ptr as *const u8, buf.as_mut_ptr(), size); }
         match self.hid_type {
-            HidType::Keyboard => keyboard::handle_report(&buf[..size]),
-            HidType::Mouse => mouse::handle_report(&buf[..size]),
+            HidType::Keyboard => {
+                keyboard::handle_report(&buf[..size]);
+                crate::scheduler::push_event(crate::scheduler::EventSource::Keyboard);
+            }
+            HidType::Mouse => {
+                mouse::handle_report(&buf[..size]);
+                crate::scheduler::push_event(crate::scheduler::EventSource::Mouse);
+            }
         }
     }
 

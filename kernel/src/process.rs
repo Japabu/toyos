@@ -868,6 +868,9 @@ pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64, stack_base: u64) -> Op
         fs_base,
         cpu_ns: 0,
         scheduled_at: 0,
+        registered_events: [scheduler::EventSource::Keyboard; 16],
+        registered_event_count: 0,
+        deadline: 0,
     };
     scheduler::enqueue_new(ctx);
 
@@ -1524,6 +1527,9 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
         fs_base,
         cpu_ns: 0,
         scheduled_at: 0,
+        registered_events: [scheduler::EventSource::Keyboard; 16],
+        registered_event_count: 0,
+        deadline: 0,
     };
     scheduler::enqueue_new(ctx);
 
@@ -1757,54 +1763,76 @@ pub fn thread_exit(code: i32) -> ! {
 // Blocking / scheduling
 // ---------------------------------------------------------------------------
 
-/// Block the current thread and switch to the next ready one.
-pub fn block(reason: scheduler::BlockReason) {
-    scheduler::block(reason);
+/// Block the current thread on the given event sources with optional deadline.
+pub fn block(events: &[scheduler::EventSource], deadline: u64) {
+    scheduler::block(events, deadline);
 }
 
+/// Block the current thread in poll, resolving FDs to event sources.
 pub fn block_poll(fds: [u64; 64], len: u32, deadline: u64) {
     debug_assert!(len <= 64, "poll_len {} exceeds array size", len);
-    {
-        let data_arc = current_data();
-        let mut data = data_arc.lock();
-        data.poll_fds = fds;
-        data.poll_len = len;
+    use scheduler::EventSource;
 
-        // Resolve poll FDs to pipe IDs for targeted wakeups.
-        let mut rcount = 0u32;
-        let mut wcount = 0u32;
-        for i in 0..len as usize {
-            let entry = fds[i];
-            let fd_num = (entry & POLL_FD_MASK) as u32;
-            let want_write = entry & POLL_WRITABLE != 0;
-            let want_read = entry & POLL_READABLE != 0 || !want_write;
-            let read_pipe = if want_read {
-                data.fds.get(fd_num).and_then(|d| d.pipe_id_read())
-            } else {
-                None
-            };
-            let write_pipe = if want_write {
-                data.fds.get(fd_num).and_then(|d| d.pipe_id_write())
-            } else {
-                None
-            };
-            if let Some(id) = read_pipe {
-                if !data.poll_read_pipes[..rcount as usize].contains(&id) {
+    let mut events = [EventSource::Keyboard; 16];
+    let mut event_count = 0usize;
+
+    let data_arc = current_data();
+    let mut data = data_arc.lock();
+    data.poll_fds = fds;
+    data.poll_len = len;
+
+    // Resolve each poll FD to its event source(s)
+    for i in 0..len as usize {
+        let entry = fds[i];
+        let fd_num = (entry & POLL_FD_MASK) as u32;
+        let want_write = entry & POLL_WRITABLE != 0;
+        let want_read = entry & POLL_READABLE != 0 || !want_write;
+
+        if let Some(desc) = data.fds.get(fd_num) {
+            if want_read {
+                if let Some(e) = desc.read_event_source() {
+                    if !events[..event_count].contains(&e) && event_count < 16 {
+                        events[event_count] = e;
+                        event_count += 1;
+                    }
+                }
+            }
+            if want_write {
+                if let Some(e) = desc.write_event_source() {
+                    if !events[..event_count].contains(&e) && event_count < 16 {
+                        events[event_count] = e;
+                        event_count += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    // Also store pipe IDs in ProcessData for poll_entry_ready backward compat
+    let mut rcount = 0u32;
+    let mut wcount = 0u32;
+    for i in 0..event_count {
+        match events[i] {
+            EventSource::PipeReadable(id) => {
+                if (rcount as usize) < 64 {
                     data.poll_read_pipes[rcount as usize] = id;
                     rcount += 1;
                 }
             }
-            if let Some(id) = write_pipe {
-                if !data.poll_write_pipes[..wcount as usize].contains(&id) {
+            EventSource::PipeWritable(id) => {
+                if (wcount as usize) < 64 {
                     data.poll_write_pipes[wcount as usize] = id;
                     wcount += 1;
                 }
             }
+            _ => {}
         }
-        data.poll_read_pipe_count = rcount;
-        data.poll_write_pipe_count = wcount;
     }
-    scheduler::block(scheduler::BlockReason::Poll { deadline });
+    data.poll_read_pipe_count = rcount;
+    data.poll_write_pipe_count = wcount;
+    drop(data);
+
+    scheduler::block(&events[..event_count], deadline);
 }
 
 // ---------------------------------------------------------------------------

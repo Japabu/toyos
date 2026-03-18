@@ -51,11 +51,20 @@ use toyos_abi::boot::{KernelArgs, MemoryMapEntry};
 
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
-    // Write a fixed marker to serial WITHOUT allocating, in case
-    // the panic occurred while the allocator lock was held.
     serial::write_bytes(b"\n[kernel] !!! PANIC !!!\n");
-    // Now try the full formatted message (may deadlock if allocator is locked)
     log!("KERNEL PANIC: {}", info);
+    // Walk the kernel stack for a backtrace
+    log!("  Backtrace:");
+    let mut rbp: u64;
+    unsafe { core::arch::asm!("mov {}, rbp", out(reg) rbp, options(nomem, nostack)); }
+    for _ in 0..20 {
+        if rbp == 0 || rbp % 8 != 0 { break; }
+        let saved_rbp = unsafe { *(rbp as *const u64) };
+        let return_addr = unsafe { *((rbp + 8) as *const u64) };
+        if return_addr == 0 { break; }
+        symbols::resolve_kernel(return_addr);
+        rbp = saved_rbp;
+    }
     cpu::halt()
 }
 

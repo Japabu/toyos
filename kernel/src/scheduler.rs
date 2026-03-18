@@ -1,37 +1,107 @@
 use core::arch::{asm, naked_asm};
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
-use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use hashbrown::HashMap;
 
 use crate::arch::{cpu, paging, percpu};
 use crate::pipe::PipeId;
 use crate::process::{self, AddressSpace, IdleProof, OwnedAlloc, Pid, Tid, KERNEL_STACK_SIZE};
 use crate::sync::Lock;
-use crate::{keyboard, PhysAddr};
+use crate::PhysAddr;
 
 const IA32_FS_BASE: u32 = 0xC0000100;
-const MAX_CPUS: usize = 16;
+const MAX_CPUS: usize = 8;
 const MAX_VRUNTIME_LAG_NS: u64 = 50_000_000; // 50ms
+const MAX_EVENTS_PER_THREAD: usize = 16;
+const MAX_WAITERS_PER_EVENT: usize = 16;
+const MAX_WOKEN_BATCH: usize = 16;
+const EVENT_QUEUE_SIZE: usize = 64;
 
 // ---------------------------------------------------------------------------
-// BlockReason — why a thread is blocked
+// EventSource — what wakes a blocked thread
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, PartialEq)]
-pub enum BlockReason {
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum EventSource {
     Keyboard,
-    PipeRead(PipeId),
-    PipeWrite(PipeId),
-    WaitPid(Pid),
-    ThreadJoin(Tid),
-    Poll { deadline: u64 },
-    NetRecv { deadline: u64 },
-    Sleep { deadline: u64 },
-    Futex { phys_addr: PhysAddr, deadline: u64 },
+    Mouse,
+    Network,
+    Listener,
+    PipeReadable(PipeId),
+    PipeWritable(PipeId),
+    Futex(PhysAddr),
 }
 
+// ---------------------------------------------------------------------------
+// PerCpuEventQueue — lock-free interrupt-to-scheduler channel
+// ---------------------------------------------------------------------------
+
+struct PerCpuEventQueue {
+    events: [EventSource; EVENT_QUEUE_SIZE],
+    head: AtomicU32, // writer (interrupt handler) — wait-free
+    tail: AtomicU32, // reader (scheduler) — single consumer
+}
+
+impl PerCpuEventQueue {
+    const fn new() -> Self {
+        Self {
+            events: [EventSource::Keyboard; EVENT_QUEUE_SIZE],
+            head: AtomicU32::new(0),
+            tail: AtomicU32::new(0),
+        }
+    }
+
+    /// Push an event from interrupt context. Wait-free, no locks.
+    fn push(&self, event: EventSource) {
+        let head = self.head.load(Ordering::Relaxed);
+        let tail = self.tail.load(Ordering::Acquire);
+        let next = (head + 1) % EVENT_QUEUE_SIZE as u32;
+        if next == tail {
+            return; // queue full, drop event (will be retried on next interrupt)
+        }
+        // SAFETY: single producer per CPU, index is in bounds
+        unsafe {
+            let slot = &self.events as *const _ as *mut EventSource;
+            slot.add(head as usize).write(event);
+        }
+        self.head.store(next, Ordering::Release);
+    }
+
+    /// Drain all pending events. Called from scheduler context.
+    fn drain_into(&self, buf: &mut [EventSource; EVENT_QUEUE_SIZE], count: &mut usize) {
+        *count = 0;
+        loop {
+            let tail = self.tail.load(Ordering::Relaxed);
+            let head = self.head.load(Ordering::Acquire);
+            if tail == head {
+                break;
+            }
+            if *count >= EVENT_QUEUE_SIZE {
+                break;
+            }
+            // SAFETY: single consumer, index is in bounds
+            buf[*count] = unsafe {
+                let slot = &self.events as *const EventSource;
+                slot.add(tail as usize).read()
+            };
+            *count += 1;
+            self.tail.store((tail + 1) % EVENT_QUEUE_SIZE as u32, Ordering::Release);
+        }
+    }
+}
+
+// SAFETY: PerCpuEventQueue uses atomics for synchronization.
+unsafe impl Sync for PerCpuEventQueue {}
+
+static PERCPU_EVENTS: [PerCpuEventQueue; MAX_CPUS] =
+    [const { PerCpuEventQueue::new() }; MAX_CPUS];
+
+/// Push an event from interrupt context. Wait-free, no locks, safe from any context.
+pub fn push_event(event: EventSource) {
+    let cpu = percpu::cpu_id() as usize;
+    PERCPU_EVENTS[cpu].push(event);
+}
 
 // ---------------------------------------------------------------------------
 // ThreadCtx — context switch state, owned by the scheduler
@@ -46,6 +116,10 @@ pub struct ThreadCtx {
     pub fs_base: u64,
     pub cpu_ns: u64,
     pub scheduled_at: u64,
+    // Event registrations — one source of truth, no parallel HashMaps
+    pub registered_events: [EventSource; MAX_EVENTS_PER_THREAD],
+    pub registered_event_count: u8,
+    pub deadline: u64, // 0 = no deadline
 }
 
 impl ThreadCtx {
@@ -75,16 +149,93 @@ impl ThreadCtx {
             self.cpu_ns
         }
     }
-
 }
 
 // ---------------------------------------------------------------------------
-// SwitchReason — disposition of the outgoing thread
+// WokenBatch — compiler-enforced thread leak prevention
+// ---------------------------------------------------------------------------
+
+#[must_use = "woken threads must be enqueued or they are permanently lost"]
+pub struct WokenBatch {
+    threads: [Option<ThreadCtx>; MAX_WOKEN_BATCH],
+    count: u8,
+}
+
+impl WokenBatch {
+    fn new() -> Self {
+        Self {
+            threads: [const { None }; MAX_WOKEN_BATCH],
+            count: 0,
+        }
+    }
+
+    fn push(&mut self, ctx: ThreadCtx) {
+        if (self.count as usize) < MAX_WOKEN_BATCH {
+            self.threads[self.count as usize] = Some(ctx);
+            self.count += 1;
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WaiterList — fixed-capacity inline Vec<Tid>
+// ---------------------------------------------------------------------------
+
+struct WaiterList {
+    tids: [Tid; MAX_WAITERS_PER_EVENT],
+    len: u8,
+}
+
+impl WaiterList {
+    fn new() -> Self {
+        Self {
+            tids: [Tid(0); MAX_WAITERS_PER_EVENT],
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, tid: Tid) {
+        if (self.len as usize) < MAX_WAITERS_PER_EVENT {
+            self.tids[self.len as usize] = tid;
+            self.len += 1;
+        }
+    }
+
+    fn retain(&mut self, tid: Tid) {
+        let mut dst = 0usize;
+        for src in 0..self.len as usize {
+            if self.tids[src] != tid {
+                self.tids[dst] = self.tids[src];
+                dst += 1;
+            }
+        }
+        self.len = dst as u8;
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn iter(&self) -> impl Iterator<Item = Tid> + '_ {
+        self.tids[..self.len as usize].iter().copied()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SwitchReason — disposition of the outgoing thread (no heap allocation)
 // ---------------------------------------------------------------------------
 
 enum SwitchReason {
     Yield,
-    Block(BlockReason),
+    Block {
+        events: [EventSource; MAX_EVENTS_PER_THREAD],
+        count: u8,
+        deadline: u64,
+    },
     Exit,
 }
 
@@ -110,12 +261,9 @@ impl CpuRunQueue {
     }
 }
 
-/// Typed guard for a locked CpuRunQueue. All queue operations go through this.
-///
-/// Lock ordering is enforced by the API: `charge()` and `effective_vruntime()`
-/// acquire the vruntimes lock internally, guaranteeing CPU queue → vruntimes
-/// ordering. You cannot lock vruntimes without holding a CpuQueueGuard — the
-/// compiler prevents it.
+/// Typed guard for a locked CpuRunQueue. Lock ordering enforced by API:
+/// `charge()` and `effective_vruntime()` acquire vruntimes internally,
+/// guaranteeing CPU queue → vruntimes. Compiler prevents wrong ordering.
 pub struct CpuQueueGuard<'a>(crate::sync::LockGuard<'a, CpuRunQueue>);
 
 impl<'a> CpuQueueGuard<'a> {
@@ -143,239 +291,117 @@ impl<'a> CpuQueueGuard<'a> {
         key.and_then(|k| self.0.ready.remove(&k))
     }
 
-    /// Charge vruntime. Acquires vruntimes lock internally.
-    /// Lock order: CPU queue (held via self) → vruntimes.
     pub fn charge(&self, sched: &Scheduler, process: Pid, ns: u64) {
         sched.charge_vruntime(process, ns);
     }
 
-    /// Read effective vruntime (with lag cap). Acquires vruntimes lock internally.
     pub fn effective_vruntime(&self, sched: &Scheduler, process: Pid) -> u64 {
         sched.effective_vruntime(process)
     }
 
-    /// Consume the guard without unlocking. The resuming side calls force_unlock.
     pub fn into_raw(self) { core::mem::forget(self.0); }
 }
 
 // ---------------------------------------------------------------------------
-// BlockedPool — blocked threads with secondary indexes
+// BlockedPool — event-indexed blocked threads with deadline heap
 // ---------------------------------------------------------------------------
 
 struct BlockedPool {
-    threads: HashMap<Tid, (ThreadCtx, BlockReason)>,
-    pipe_read_waiters: HashMap<PipeId, Vec<Tid>>,
-    pipe_write_waiters: HashMap<PipeId, Vec<Tid>>,
-    futex_waiters: HashMap<PhysAddr, Vec<Tid>>,
-    poll_waiters: Vec<Tid>,
+    threads: HashMap<Tid, ThreadCtx>,
+    by_event: BTreeMap<EventSource, WaiterList>,
+    deadlines: BTreeMap<(u64, Tid), Tid>,
 }
 
 impl BlockedPool {
     fn new() -> Self {
         Self {
             threads: HashMap::new(),
-            pipe_read_waiters: HashMap::new(),
-            pipe_write_waiters: HashMap::new(),
-            futex_waiters: HashMap::new(),
-            poll_waiters: Vec::new(),
+            by_event: BTreeMap::new(),
+            deadlines: BTreeMap::new(),
         }
     }
 
-    fn insert(&mut self, ctx: ThreadCtx, reason: BlockReason) {
+    fn insert(&mut self, ctx: ThreadCtx) {
         let tid = ctx.tid;
-        match &reason {
-            BlockReason::PipeRead(id) => {
-                self.pipe_read_waiters.entry(*id).or_default().push(tid);
-            }
-            BlockReason::PipeWrite(id) => {
-                self.pipe_write_waiters.entry(*id).or_default().push(tid);
-            }
-            BlockReason::Futex { phys_addr, .. } => {
-                self.futex_waiters.entry(*phys_addr).or_default().push(tid);
-            }
-            BlockReason::Poll { .. } => {
-                self.poll_waiters.push(tid);
-            }
-            _ => {}
+        let event_count = ctx.registered_event_count;
+        for i in 0..event_count as usize {
+            self.by_event.entry(ctx.registered_events[i])
+                .or_insert_with(WaiterList::new)
+                .push(tid);
         }
-        self.threads.insert(tid, (ctx, reason));
-    }
-
-    fn remove(&mut self, tid: Tid) -> Option<(ThreadCtx, BlockReason)> {
-        let (ctx, reason) = self.threads.remove(&tid)?;
-        // Clean up secondary indexes
-        match &reason {
-            BlockReason::PipeRead(id) => {
-                if let Some(v) = self.pipe_read_waiters.get_mut(id) {
-                    v.retain(|t| *t != tid);
-                }
-            }
-            BlockReason::PipeWrite(id) => {
-                if let Some(v) = self.pipe_write_waiters.get_mut(id) {
-                    v.retain(|t| *t != tid);
-                }
-            }
-            BlockReason::Futex { phys_addr, .. } => {
-                if let Some(v) = self.futex_waiters.get_mut(phys_addr) {
-                    v.retain(|t| *t != tid);
-                }
-            }
-            BlockReason::Poll { .. } => {
-                self.poll_waiters.retain(|t| *t != tid);
-            }
-            _ => {}
+        if ctx.deadline > 0 {
+            self.deadlines.insert((ctx.deadline, tid), tid);
         }
-        Some((ctx, reason))
+        self.threads.insert(tid, ctx);
     }
 
-    /// Take all threads blocked on reading from a specific pipe.
-    fn take_pipe_readers(&mut self, pipe_id: PipeId) -> Vec<ThreadCtx> {
-        let tids: Vec<Tid> = self.pipe_read_waiters.remove(&pipe_id).unwrap_or_default();
-        tids.into_iter().filter_map(|tid| {
-            let (ctx, reason) = self.threads.remove(&tid)?;
-            // No need to clean pipe_read_waiters — we already removed the whole vec
-            // But clean other indexes if somehow in multiple
-            match &reason {
-                BlockReason::Futex { phys_addr, .. } => {
-                    if let Some(v) = self.futex_waiters.get_mut(phys_addr) {
-                        v.retain(|t| *t != tid);
-                    }
+    /// Remove a thread from all indexes. Single cleanup path.
+    fn remove_thread(&mut self, tid: Tid) -> Option<ThreadCtx> {
+        let ctx = self.threads.remove(&tid)?;
+        for i in 0..ctx.registered_event_count as usize {
+            if let Some(waiters) = self.by_event.get_mut(&ctx.registered_events[i]) {
+                waiters.retain(tid);
+                if waiters.is_empty() {
+                    self.by_event.remove(&ctx.registered_events[i]);
                 }
-                _ => {}
-            }
-            Some(ctx)
-        }).collect()
-    }
-
-    /// Take all threads blocked on writing to a specific pipe.
-    fn take_pipe_writers(&mut self, pipe_id: PipeId) -> Vec<ThreadCtx> {
-        let tids: Vec<Tid> = self.pipe_write_waiters.remove(&pipe_id).unwrap_or_default();
-        tids.into_iter().filter_map(|tid| {
-            let (ctx, _) = self.threads.remove(&tid)?;
-            Some(ctx)
-        }).collect()
-    }
-
-    /// Take up to `count` threads blocked on a specific futex address.
-    fn take_futex_waiters(&mut self, addr: PhysAddr, count: usize) -> Vec<ThreadCtx> {
-        let tids = match self.futex_waiters.get_mut(&addr) {
-            Some(v) => {
-                let n = count.min(v.len());
-                v.drain(..n).collect::<Vec<_>>()
-            }
-            None => return Vec::new(),
-        };
-        tids.into_iter().filter_map(|tid| {
-            let (ctx, _) = self.threads.remove(&tid)?;
-            Some(ctx)
-        }).collect()
-    }
-
-    /// Take BlockedPoll threads whose poll_fds reference a specific pipe for reading.
-    fn take_poll_readers_for_pipe(&mut self, pipe_id: PipeId) -> Vec<ThreadCtx> {
-        let mut woken = Vec::new();
-        let mut remaining = Vec::new();
-        for tid in self.poll_waiters.drain(..) {
-            if let Some((_, reason)) = self.threads.get(&tid) {
-                if matches!(reason, BlockReason::Poll { .. }) {
-                    // Check ProcessData for pipe interest
-                    let dominated = {
-                        let table = process::PROCESS_TABLE.lock();
-                        let table = table.as_ref().unwrap();
-                        if let Some(info) = table.get(tid) {
-                            let data = info.data().lock();
-                            data.poll_read_pipes[..data.poll_read_pipe_count as usize]
-                                .contains(&pipe_id)
-                        } else {
-                            false
-                        }
-                    };
-                    if dominated {
-                        if let Some((ctx, _)) = self.threads.remove(&tid) {
-                            woken.push(ctx);
-                            continue;
-                        }
-                    }
-                }
-            }
-            remaining.push(tid);
-        }
-        self.poll_waiters = remaining;
-        woken
-    }
-
-    /// Take BlockedPoll threads whose poll_fds reference a specific pipe for writing.
-    fn take_poll_writers_for_pipe(&mut self, pipe_id: PipeId) -> Vec<ThreadCtx> {
-        let mut woken = Vec::new();
-        let mut remaining = Vec::new();
-        for tid in self.poll_waiters.drain(..) {
-            if let Some((_, reason)) = self.threads.get(&tid) {
-                if matches!(reason, BlockReason::Poll { .. }) {
-                    let dominated = {
-                        let table = process::PROCESS_TABLE.lock();
-                        let table = table.as_ref().unwrap();
-                        if let Some(info) = table.get(tid) {
-                            let data = info.data().lock();
-                            data.poll_write_pipes[..data.poll_write_pipe_count as usize]
-                                .contains(&pipe_id)
-                        } else {
-                            false
-                        }
-                    };
-                    if dominated {
-                        if let Some((ctx, _)) = self.threads.remove(&tid) {
-                            woken.push(ctx);
-                            continue;
-                        }
-                    }
-                }
-            }
-            remaining.push(tid);
-        }
-        self.poll_waiters = remaining;
-        woken
-    }
-
-    /// Scan for deadline/global-event wakeups. Returns Tids to wake.
-    fn scan_timeouts_and_events(&self, now: u64, kb_ready: bool, net_ready: bool) -> Vec<Tid> {
-        let mut woken = Vec::new();
-        // Check zombie tids/pids for waitpid/thread_join
-        let (zombie_tids, zombie_pids) = {
-            let table = process::PROCESS_TABLE.lock();
-            let table = table.as_ref().unwrap();
-            let mut zt = Vec::new();
-            let mut zp = Vec::new();
-            for (_, entry) in table.iter() {
-                if matches!(entry.state(), process::ProcessState::Zombie(_)) {
-                    zt.push(entry.tid());
-                    zp.push(entry.process());
-                }
-            }
-            (zt, zp)
-        };
-
-        for (tid, (_, reason)) in &self.threads {
-            let wake = match reason {
-                BlockReason::Keyboard => kb_ready,
-                BlockReason::PipeRead(id) => crate::pipe::has_data(*id),
-                BlockReason::PipeWrite(id) => crate::pipe::has_space(*id),
-                BlockReason::WaitPid(child_pid) => zombie_pids.contains(child_pid),
-                BlockReason::ThreadJoin(child_tid) => zombie_tids.contains(child_tid),
-                BlockReason::Poll { deadline } => {
-                    kb_ready || net_ready
-                        || (*deadline > 0 && now >= *deadline)
-                }
-                BlockReason::NetRecv { deadline } => {
-                    net_ready || (*deadline > 0 && now >= *deadline)
-                }
-                BlockReason::Sleep { deadline } => now >= *deadline,
-                BlockReason::Futex { deadline, .. } => *deadline > 0 && now >= *deadline,
-            };
-            if wake {
-                woken.push(*tid);
             }
         }
-        woken
+        if ctx.deadline > 0 {
+            self.deadlines.remove(&(ctx.deadline, tid));
+        }
+        Some(ctx)
+    }
+
+    /// Remove a thread, skipping one event source (already cleaned by caller).
+    fn remove_thread_skip(&mut self, tid: Tid, skip: &EventSource) -> Option<ThreadCtx> {
+        let ctx = self.threads.remove(&tid)?;
+        for i in 0..ctx.registered_event_count as usize {
+            let event = &ctx.registered_events[i];
+            if event == skip { continue; }
+            if let Some(waiters) = self.by_event.get_mut(event) {
+                waiters.retain(tid);
+                if waiters.is_empty() {
+                    self.by_event.remove(event);
+                }
+            }
+        }
+        if ctx.deadline > 0 {
+            self.deadlines.remove(&(ctx.deadline, tid));
+        }
+        Some(ctx)
+    }
+
+    /// Wake all threads waiting on an event source into a batch.
+    fn take_by_event_into(&mut self, event: &EventSource, batch: &mut WokenBatch) {
+        let Some(waiters) = self.by_event.remove(event) else { return };
+        for tid in waiters.iter() {
+            if let Some(ctx) = self.remove_thread_skip(tid, event) {
+                batch.push(ctx);
+            }
+        }
+    }
+
+    /// Wake up to `count` threads waiting on an event source.
+    fn take_by_event_limited(&mut self, event: &EventSource, count: usize, batch: &mut WokenBatch) {
+        let Some(waiters) = self.by_event.get_mut(event) else { return };
+        let n = count.min(waiters.len as usize);
+        let tids_to_wake: [Tid; MAX_WAITERS_PER_EVENT] = waiters.tids;
+        let wake_count = n;
+        // Remove woken tids from the waiter list
+        let mut dst = 0usize;
+        for src in n..waiters.len as usize {
+            waiters.tids[dst] = waiters.tids[src];
+            dst += 1;
+        }
+        waiters.len = dst as u8;
+        if waiters.is_empty() {
+            self.by_event.remove(event);
+        }
+        for i in 0..wake_count {
+            if let Some(ctx) = self.remove_thread_skip(tids_to_wake[i], event) {
+                batch.push(ctx);
+            }
+        }
     }
 }
 
@@ -397,7 +423,6 @@ static SCHEDULER: Scheduler = Scheduler {
     min_vruntime: AtomicU64::new(0),
 };
 
-/// Initialize the scheduler. Must be called once during boot.
 pub fn init() {
     *SCHEDULER.blocked.lock() = Some(BlockedPool::new());
     *SCHEDULER.vruntimes.lock() = Some(HashMap::new());
@@ -424,15 +449,6 @@ impl Scheduler {
         let mut vruntimes = self.vruntimes.lock_unwrap();
         let vrt = vruntimes.entry(process).or_insert(0);
         *vrt = vrt.saturating_add(ns);
-        let new_vrt = *vrt;
-        drop(vruntimes);
-
-        // Update min_vruntime monotonically
-        let old_min = self.min_vruntime.load(Ordering::Relaxed);
-        if new_vrt > old_min {
-            // Approximate: just push min_vruntime up. A full min scan is too expensive.
-            // The lag cap in effective_vruntime handles the case where min is stale.
-        }
     }
 
     fn init_vruntime(&self, process: Pid) {
@@ -456,62 +472,22 @@ impl Scheduler {
         best_cpu
     }
 
-    fn enqueue_woken(&self, woken: Vec<ThreadCtx>) {
-        for ctx in woken {
-            let cpu = self.pick_target_cpu();
-            let mut q = self.lock_cpu(cpu as usize);
-            let vrt = q.effective_vruntime(self, ctx.process);
-            q.insert(vrt, ctx);
+    fn enqueue_batch(&self, mut batch: WokenBatch) {
+        for i in 0..batch.count as usize {
+            if let Some(ctx) = batch.threads[i].take() {
+                let cpu = self.pick_target_cpu();
+                let mut q = self.lock_cpu(cpu as usize);
+                let vrt = q.effective_vruntime(self, ctx.process);
+                q.insert(vrt, ctx);
+            }
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Public API — called by process.rs and syscall.rs
+// Public API
 // ---------------------------------------------------------------------------
 
-/// Wake a specific thread from the blocked pool by Tid.
-/// Used after teardown to immediately wake parent (waitpid) or joiner (thread_join).
-pub fn wake_tid(tid: Tid) {
-    let ctx = {
-        let mut pool = SCHEDULER.blocked.lock_unwrap();
-        match pool.remove(tid) {
-            Some((ctx, _)) => ctx,
-            None => return, // not blocked, nothing to do
-        }
-    };
-    let cpu = SCHEDULER.pick_target_cpu();
-    let mut q = SCHEDULER.lock_cpu(cpu as usize);
-    let vrt = q.effective_vruntime(&SCHEDULER, ctx.process);
-    q.insert(vrt, ctx);
-}
-
-/// Remove a thread's ThreadCtx from the scheduler (blocked pool or ready queue).
-/// Returns None if the thread is currently running (can't be removed).
-pub fn remove_thread(tid: Tid) -> Option<ThreadCtx> {
-    {
-        let mut pool = SCHEDULER.blocked.lock_unwrap();
-        if let Some((ctx, _)) = pool.remove(tid) {
-            return Some(ctx);
-        }
-    }
-    for i in 0..crate::arch::smp::cpu_count() as usize {
-        let mut q = SCHEDULER.lock_cpu(i);
-        if let Some(ctx) = q.remove_ready(tid) {
-            return Some(ctx);
-        }
-    }
-    None
-}
-
-/// Get the address space from the current thread's ThreadCtx.
-pub fn current_address_space() -> Option<Arc<AddressSpace>> {
-    let cpu = percpu::cpu_id() as usize;
-    let q = SCHEDULER.lock_cpu(cpu);
-    q.current().and_then(|ctx| ctx.address_space.clone())
-}
-
-/// Enqueue a newly spawned thread into the scheduler.
 pub fn enqueue_new(ctx: ThreadCtx) {
     SCHEDULER.init_vruntime(ctx.process);
     let cpu = SCHEDULER.pick_target_cpu();
@@ -520,17 +496,26 @@ pub fn enqueue_new(ctx: ThreadCtx) {
     q.insert(vrt, ctx);
 }
 
-/// Block the current thread and switch to the next ready one.
-pub fn block(reason: BlockReason) {
-    do_schedule(SwitchReason::Block(reason));
+/// Block the current thread on the given event sources with optional deadline.
+/// `deadline = 0` means no timeout. `events` empty means woken only by `wake_tid` or deadline.
+pub fn block(events: &[EventSource], deadline: u64) {
+    let mut ev_arr = [EventSource::Keyboard; MAX_EVENTS_PER_THREAD];
+    let count = events.len().min(MAX_EVENTS_PER_THREAD);
+    if count > 0 {
+        ev_arr[..count].copy_from_slice(&events[..count]);
+    }
+    do_schedule(SwitchReason::Block {
+        events: ev_arr,
+        count: count as u8,
+        deadline,
+    });
 }
 
-/// Cooperative yield: put current thread back in the ready queue.
 pub fn yield_now() {
     do_schedule(SwitchReason::Yield);
 }
 
-/// Timer preemption: called from the timer interrupt handler.
+/// Timer preemption. Called from timer interrupt handler.
 pub fn preempt() {
     if percpu::current_tid().is_none() {
         return;
@@ -538,10 +523,39 @@ pub fn preempt() {
     yield_now();
 }
 
-/// Exit the current thread: context switch away, then the idle loop
-/// handles zombie collection.
+/// Check and wake threads with expired deadlines.
+/// Called from drain_events (which already holds the blocked pool lock).
+fn check_deadlines_locked(pool: &mut BlockedPool, batch: &mut WokenBatch) {
+    let now = crate::clock::nanos_since_boot();
+    while let Some((&(deadline, tid), _)) = pool.deadlines.first_key_value() {
+        if deadline > now { break; }
+        pool.deadlines.pop_first();
+        if let Some(ctx) = pool.remove_thread(tid) {
+            batch.push(ctx);
+        }
+    }
+}
+
+/// Public entry point for timer interrupt. Uses try_lock.
+pub fn check_deadlines() {
+    let now = crate::clock::nanos_since_boot();
+    let Some(mut guard) = SCHEDULER.blocked.try_lock() else { return };
+    let Some(pool) = guard.as_mut() else { return };
+    let mut batch = WokenBatch::new();
+    while let Some((&(deadline, tid), _)) = pool.deadlines.first_key_value() {
+        if deadline > now { break; }
+        pool.deadlines.pop_first();
+        if let Some(ctx) = pool.remove_thread(tid) {
+            batch.push(ctx);
+        }
+    }
+    drop(guard);
+    if !batch.is_empty() {
+        SCHEDULER.enqueue_batch(batch);
+    }
+}
+
 pub fn exit_current(code: i32) -> ! {
-    // Set zombie state in the thread table (if not already zombie)
     {
         let mut guard = process::PROCESS_TABLE.lock();
         let table = guard.as_mut().unwrap();
@@ -552,12 +566,10 @@ pub fn exit_current(code: i32) -> ! {
             }
         }
     }
-
     do_schedule(SwitchReason::Exit);
     unreachable!("exit_current: returned from schedule");
 }
 
-/// Schedule without saving current context (used by ap_idle and BSP boot).
 pub fn schedule_no_return() -> ! {
     percpu::set_current_tid(None);
     unsafe { percpu::set_kernel_stack(percpu::idle_stack_top()); }
@@ -574,78 +586,99 @@ pub fn schedule_no_return() -> ! {
     }
 }
 
-/// Wake processes blocked on reading from a pipe.
+/// Wake all threads waiting on a specific event source.
+pub fn wake_by_event(event: EventSource) {
+    let batch = {
+        let mut pool = SCHEDULER.blocked.lock_unwrap();
+        let mut batch = WokenBatch::new();
+        pool.take_by_event_into(&event, &mut batch);
+        batch
+    };
+    if !batch.is_empty() {
+        SCHEDULER.enqueue_batch(batch);
+    }
+}
+
+/// Wake pipe readers: threads blocked on PipeReadable(pipe_id) + poll threads interested in this pipe.
 pub fn wake_pipe_readers(pipe_id: PipeId) {
-    let woken = {
-        let mut pool = SCHEDULER.blocked.lock_unwrap();
-        let mut result = pool.take_pipe_readers(pipe_id);
-        result.extend(pool.take_poll_readers_for_pipe(pipe_id));
-        result
-    };
-    SCHEDULER.enqueue_woken(woken);
+    wake_by_event(EventSource::PipeReadable(pipe_id));
 }
 
-/// Wake processes blocked on writing to a pipe.
+/// Wake pipe writers: threads blocked on PipeWritable(pipe_id) + poll threads interested in this pipe.
 pub fn wake_pipe_writers(pipe_id: PipeId) {
-    let woken = {
-        let mut pool = SCHEDULER.blocked.lock_unwrap();
-        let mut result = pool.take_pipe_writers(pipe_id);
-        result.extend(pool.take_poll_writers_for_pipe(pipe_id));
-        result
-    };
-    SCHEDULER.enqueue_woken(woken);
+    wake_by_event(EventSource::PipeWritable(pipe_id));
 }
 
-/// Wake all BlockedPoll processes (for listener/connect events).
-pub fn wake_all_poll() {
-    let woken = {
+/// Wake a specific thread by Tid (for waitpid/thread_join).
+pub fn wake_tid(tid: Tid) {
+    let ctx = {
         let mut pool = SCHEDULER.blocked.lock_unwrap();
-        let tids: Vec<Tid> = pool.poll_waiters.drain(..).collect();
-        tids.into_iter().filter_map(|tid| {
-            pool.threads.remove(&tid).map(|(ctx, _)| ctx)
-        }).collect::<Vec<_>>()
+        match pool.remove_thread(tid) {
+            Some(ctx) => ctx,
+            None => return,
+        }
     };
-    SCHEDULER.enqueue_woken(woken);
+    let cpu = SCHEDULER.pick_target_cpu();
+    let mut q = SCHEDULER.lock_cpu(cpu as usize);
+    let vrt = q.effective_vruntime(&SCHEDULER, ctx.process);
+    q.insert(vrt, ctx);
 }
 
-/// Futex wait: atomically check value and block.
+/// Remove a thread from the scheduler entirely (for kill).
+pub fn remove_thread(tid: Tid) -> Option<ThreadCtx> {
+    {
+        let mut pool = SCHEDULER.blocked.lock_unwrap();
+        if let Some(ctx) = pool.remove_thread(tid) {
+            return Some(ctx);
+        }
+    }
+    for i in 0..crate::arch::smp::cpu_count() as usize {
+        let mut q = SCHEDULER.lock_cpu(i);
+        if let Some(ctx) = q.remove_ready(tid) {
+            return Some(ctx);
+        }
+    }
+    None
+}
+
+pub fn current_address_space() -> Option<Arc<AddressSpace>> {
+    let cpu = percpu::cpu_id() as usize;
+    let q = SCHEDULER.lock_cpu(cpu);
+    q.current().and_then(|ctx| ctx.address_space.clone())
+}
+
 pub fn futex_wait(phys_addr: PhysAddr, expected: u32, deadline: u64) -> bool {
     let _futex = FUTEX_LOCK.lock();
     let current = unsafe { *(phys_addr.raw() as *const u32) };
     if current != expected {
-        return false; // value changed, don't block
+        return false;
     }
     drop(_futex);
-    // Even though we dropped the futex lock, the block is still correct:
-    // any concurrent futex_wake that changes the value will wake us from
-    // the blocked pool after we insert ourselves.
-    block(BlockReason::Futex { phys_addr, deadline });
+    block(&[EventSource::Futex(phys_addr)], deadline);
     true
 }
 
-/// Futex wake: wake up to `count` threads blocked on `phys_addr`.
 pub fn futex_wake(phys_addr: PhysAddr, count: usize) -> u64 {
     let _futex = FUTEX_LOCK.lock();
-    let woken = {
+    let mut batch = WokenBatch::new();
+    {
         let mut pool = SCHEDULER.blocked.lock_unwrap();
-        pool.take_futex_waiters(phys_addr, count)
-    };
-    let n = woken.len() as u64;
+        pool.take_by_event_limited(&EventSource::Futex(phys_addr), count, &mut batch);
+    }
+    let n = batch.count as u64;
     drop(_futex);
-    SCHEDULER.enqueue_woken(woken);
+    if !batch.is_empty() {
+        SCHEDULER.enqueue_batch(batch);
+    }
     n
 }
 
-/// Get the ThreadCtx for the current thread from the current CPU's run queue.
-/// Used by exit paths that need to access the thread's context.
 pub fn with_current_ctx<R>(f: impl FnOnce(&ThreadCtx) -> R) -> Option<R> {
     let cpu = percpu::cpu_id() as usize;
     let q = SCHEDULER.lock_cpu(cpu);
     q.current().map(f)
 }
 
-/// Get scheduling state for sysinfo display.
-/// Returns: 0=Running, 1=Ready, 2=Blocked, 3=unknown (not in scheduler, e.g. zombie).
 pub fn thread_sched_state(tid: Tid) -> u8 {
     for i in 0..crate::arch::smp::cpu_count() as usize {
         if let Some(q) = SCHEDULER.try_lock_cpu(i) {
@@ -661,7 +694,6 @@ pub fn thread_sched_state(tid: Tid) -> u8 {
     3
 }
 
-/// Get cpu_ns for a thread that might be running or blocked.
 pub fn thread_cpu_ns(tid: Tid) -> u64 {
     for i in 0..crate::arch::smp::cpu_count() as usize {
         if let Some(q) = SCHEDULER.try_lock_cpu(i) {
@@ -671,22 +703,16 @@ pub fn thread_cpu_ns(tid: Tid) -> u64 {
         }
     }
     let pool = SCHEDULER.blocked.lock_unwrap();
-    if let Some((ctx, _)) = pool.threads.get(&tid) {
+    if let Some(ctx) = pool.threads.get(&tid) {
         return ctx.cpu_ns;
     }
     0
 }
 
-/// Force-unlock the current CPU's queue lock. Called from process_start/thread_start
-/// trampolines after the first context_switch into a new thread.
-///
-/// # Safety
-/// Must only be called when the current CPU's queue lock is held (via `forget`).
 pub unsafe fn force_unlock_current_cpu() {
     SCHEDULER.cpus[percpu::cpu_id() as usize].force_unlock();
 }
 
-/// Handle outgoing thread after context_switch. Public wrapper for process_start trampoline.
 pub fn handle_outgoing_public() {
     handle_outgoing();
 }
@@ -695,7 +721,43 @@ pub fn handle_outgoing_public() {
 // Core scheduling logic
 // ---------------------------------------------------------------------------
 
+/// Drain per-CPU event queue and wake affected threads. One lock acquisition.
+fn drain_events() {
+    // Process xHCI events (keyboard/mouse) — converts MSI-X interrupt flag
+    // into EventSource pushes via HID dispatch_report → push_event.
+    if percpu::cpu_id() == 0 {
+        crate::drivers::xhci::poll_if_pending();
+    }
+
+    // Virtio-net MSI-X interrupt sets a pending flag — convert to event.
+    if crate::arch::idt::virtio_net::irq_pending() {
+        PERCPU_EVENTS[percpu::cpu_id() as usize].push(EventSource::Network);
+    }
+
+    let cpu = percpu::cpu_id() as usize;
+    let mut events = [EventSource::Keyboard; EVENT_QUEUE_SIZE];
+    let mut event_count = 0usize;
+    PERCPU_EVENTS[cpu].drain_into(&mut events, &mut event_count);
+    if event_count == 0 { return; }
+
+    let mut batch = WokenBatch::new();
+    {
+        let mut pool = SCHEDULER.blocked.lock_unwrap();
+        for i in 0..event_count {
+            pool.take_by_event_into(&events[i], &mut batch);
+        }
+        // Also check deadlines while we hold the lock — this is the primary
+        // deadline check path. The timer's check_deadlines is a fallback.
+        check_deadlines_locked(&mut pool, &mut batch);
+    }
+    if !batch.is_empty() {
+        SCHEDULER.enqueue_batch(batch);
+    }
+}
+
 fn do_schedule(reason: SwitchReason) {
+    drain_events();
+
     let cpu = percpu::cpu_id() as usize;
     let now = crate::clock::nanos_since_boot();
 
@@ -756,9 +818,12 @@ fn handle_outgoing() {
                 let vrt = queue.effective_vruntime(&SCHEDULER, old.process);
                 queue.insert(vrt, old);
             }
-            SwitchReason::Block(block_reason) => {
+            SwitchReason::Block { events, count, deadline } => {
+                old.registered_events = events;
+                old.registered_event_count = count;
+                old.deadline = deadline;
                 drop(queue);
-                SCHEDULER.blocked.lock_unwrap().insert(old, block_reason);
+                SCHEDULER.blocked.lock_unwrap().insert(old);
                 return;
             }
             SwitchReason::Exit => {
@@ -775,17 +840,14 @@ fn handle_outgoing() {
 fn cpu_idle_loop() -> ! {
     let idle_proof = unsafe { IdleProof::new_unchecked() };
     loop {
-        // Poll blocked threads for timeouts and events
-        poll_blocked();
+        drain_events();
 
-        // Collect orphan zombies (from thread table)
         {
             let mut guard = process::PROCESS_TABLE.lock();
             let table = guard.as_mut().unwrap();
             table.collect_orphan_zombies(idle_proof);
         }
 
-        // Check for ready threads on this CPU
         let cpu = percpu::cpu_id() as usize;
         {
             let mut queue = SCHEDULER.lock_cpu(cpu);
@@ -814,27 +876,8 @@ fn cpu_idle_loop() -> ! {
             }
         }
 
-        // Halt until next interrupt
         unsafe { core::arch::asm!("sti; hlt", options(nomem, nostack)); }
     }
-}
-
-fn poll_blocked() {
-    if percpu::cpu_id() == 0 {
-        crate::drivers::xhci::poll_if_pending();
-    }
-
-    let kb_ready = keyboard::has_data();
-    let net_ready = crate::net::has_packet();
-    let now = crate::clock::nanos_since_boot();
-
-    let woken: Vec<ThreadCtx> = {
-        let mut pool = SCHEDULER.blocked.lock_unwrap();
-        let tids = pool.scan_timeouts_and_events(now, kb_ready, net_ready);
-        tids.iter().filter_map(|tid| pool.remove(*tid).map(|(ctx, _)| ctx)).collect()
-    };
-
-    SCHEDULER.enqueue_woken(woken);
 }
 
 // ---------------------------------------------------------------------------

@@ -26,6 +26,9 @@ const PAGE_TX_BUF: usize = 5;
 const RX_BUF_COUNT: usize = 3;
 const RX_BUF_SIZE: u32 = 4096;
 
+const PCI_CAP_MSIX: u8 = 0x11;
+const VIRTIO_NET_VECTOR: u8 = 0x22;
+
 static DMA: Lock<DmaPool<6>> = Lock::new(DmaPool::new());
 
 fn dma_phys(page: usize) -> crate::DmaAddr {
@@ -141,6 +144,59 @@ impl crate::net::Nic for VirtioNic {
     }
 }
 
+fn setup_msix(pci_dev: &PciDevice, device: &super::virtio::VirtioDevice) {
+    use super::mmio::Mmio;
+
+    let cap = match pci_dev.capabilities().find(|c| c.id() == PCI_CAP_MSIX) {
+        Some(c) => c,
+        None => {
+            log!("VirtIO net: no MSI-X capability");
+            return;
+        }
+    };
+
+    let table_info = cap.read_u32(4);
+    let table_bir = (table_info & 0x7) as u8;
+    let table_offset = (table_info & !0x7) as u64;
+    let table_bar = pci_dev.read_bar_64(table_bir);
+    let table_addr = crate::PhysAddr::new(table_bar + table_offset);
+
+    crate::arch::paging::map_kernel(table_addr, 0x1000);
+    let table = Mmio::new(table_addr);
+
+    // Configure MSI-X table entry 0: route to LAPIC with our vector
+    table.write_u32(0x00, 0xFEE0_0000); // msg_addr_lo: LAPIC base
+    table.write_u32(0x04, 0);            // msg_addr_hi
+    table.write_u32(0x08, VIRTIO_NET_VECTOR as u32); // msg_data: vector
+    table.write_u32(0x0C, 0);            // vector control: unmask
+
+    // Enable MSI-X in PCI capability
+    let msg_ctrl = cap.read_u16(2);
+    cap.write_u16(2, (msg_ctrl | (1 << 15)) & !(1 << 14));
+
+    use super::virtio::{COMMON_MSIX_CONFIG, COMMON_QUEUE_SELECT, COMMON_QUEUE_MSIX};
+    let common = device.common_config();
+
+    common.write_u16(COMMON_MSIX_CONFIG, 0);
+    let config_vec = common.read_u16(COMMON_MSIX_CONFIG);
+    if config_vec == 0xFFFF {
+        log!("VirtIO net: MSI-X config vector assignment failed");
+        return;
+    }
+
+    // Set RX queue (0) MSI-X vector. queue_enable is called separately after.
+    common.write_u16(COMMON_QUEUE_SELECT, 0);
+    common.write_u16(COMMON_QUEUE_MSIX, 0);
+    let queue_vec = common.read_u16(COMMON_QUEUE_MSIX);
+    if queue_vec == 0xFFFF {
+        log!("VirtIO net: MSI-X queue vector assignment failed");
+        return;
+    }
+
+    log!("VirtIO net: MSI-X enabled (vector {:#x}, config_vec={}, queue_vec={})",
+        VIRTIO_NET_VECTOR, config_vec, queue_vec);
+}
+
 pub fn init(ecam_base: u64) {
     let pci_dev = match PciDevice::find_by_id(ecam_base, VIRTIO_VENDOR, VIRTIO_NET_DEVICE) {
         Some(dev) => dev,
@@ -150,6 +206,7 @@ pub fn init(ecam_base: u64) {
         }
     };
     log!("VirtIO net: found at PCI {:02x}:{:02x}.{}", pci_dev.bus, pci_dev.dev, pci_dev.func);
+    pci_dev.enable_bus_master();
 
     let device = VirtioDevice::init(&pci_dev, VIRTIO_F_VERSION_1 | VIRTIO_NET_F_MAC);
 
@@ -158,6 +215,9 @@ pub fn init(ecam_base: u64) {
 
     device.setup_queue(0, &mut rxq);
     device.setup_queue(1, &mut txq);
+    setup_msix(&pci_dev, &device);  // sets queue_msix_vector for queue 0
+    device.enable_queue(0);
+    device.enable_queue(1);
     device.activate();
 
     // Read MAC address from device config space (bytes 0-5)

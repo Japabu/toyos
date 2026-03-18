@@ -412,7 +412,7 @@ fn sys_write(fd_num: u32, buf: &[u8]) -> u64 {
                 }
                 None => {
                     let block = data.fds.get(fd_num).and_then(|d| d.pipe_id_write())
-                        .map(|id| crate::scheduler::BlockReason::PipeWrite(id));
+                        .map(|id| crate::scheduler::EventSource::PipeWritable(id));
                     Err(block)
                 }
             }
@@ -422,14 +422,14 @@ fn sys_write(fd_num: u32, buf: &[u8]) -> u64 {
                 if let Some(id) = pipe_id { process::wake_pipe_readers(id); }
                 return n;
             }
-            Err(Some(reason)) => process::block(reason),
+            Err(Some(event)) => process::block(&[event], 0),
             Err(None) => return SyscallError::NotFound.to_u64(),
         }
     }
 }
 
 enum ReadBlock {
-    Reason(crate::scheduler::BlockReason),
+    Event(crate::scheduler::EventSource),
     Poll { fds: [u64; 64], len: u32, deadline: u64 },
 }
 
@@ -444,9 +444,9 @@ fn sys_read(fd_num: u32, buf: &mut [u8]) -> u64 {
                 None => {
                     let desc = data.fds.get(fd_num);
                     if matches!(desc, Some(fd::Descriptor::Keyboard)) {
-                        Err(Some(ReadBlock::Reason(crate::scheduler::BlockReason::Keyboard)))
+                        Err(Some(ReadBlock::Event(crate::scheduler::EventSource::Keyboard)))
                     } else if let Some(id) = desc.and_then(|d| d.pipe_id_read()) {
-                        Err(Some(ReadBlock::Reason(crate::scheduler::BlockReason::PipeRead(id))))
+                        Err(Some(ReadBlock::Event(crate::scheduler::EventSource::PipeReadable(id))))
                     } else if matches!(desc, Some(fd::Descriptor::SerialConsole)) {
                         let deadline = crate::clock::nanos_since_boot() + 10_000_000;
                         let mut fds = [0u64; 64];
@@ -463,7 +463,7 @@ fn sys_read(fd_num: u32, buf: &mut [u8]) -> u64 {
                 if let Some(id) = pipe_id { process::wake_pipe_writers(id); }
                 return n;
             }
-            Err(Some(ReadBlock::Reason(reason))) => process::block(reason),
+            Err(Some(ReadBlock::Event(event))) => process::block(&[event], 0),
             Err(Some(ReadBlock::Poll { fds, len, deadline })) => process::block_poll(fds, len, deadline),
             Err(None) => return SyscallError::NotFound.to_u64(),
         }
@@ -698,7 +698,7 @@ fn sys_waitpid(pid: u64, flags: u64) -> u64 {
                 if flags & WNOHANG != 0 {
                     return SyscallError::WouldBlock.to_u64();
                 }
-                process::block(crate::scheduler::BlockReason::WaitPid(child_pid));
+                process::block(&[], 0); // woken by wake_tid from exit path
             }
             Err(()) => return SyscallError::NotFound.to_u64(),
         }
@@ -857,9 +857,9 @@ fn sys_connect(name: &str) -> u64 {
     })
 }
 
-/// Wake all poll-blocked processes (for listener/connect events).
+/// Wake poll-blocked processes interested in listener events.
 fn wake_poll_waiters() {
-    crate::scheduler::wake_all_poll();
+    crate::scheduler::wake_by_event(crate::scheduler::EventSource::Listener);
 }
 
 fn sys_alloc_shared(size: u64) -> u64 {
@@ -980,7 +980,7 @@ fn sys_thread_join(tid: u64) -> u64 {
     loop {
         match process::collect_thread_zombie(tid, caller) {
             Ok(Some(_)) => return 0,
-            Ok(None) => process::block(crate::scheduler::BlockReason::ThreadJoin(tid)),
+            Ok(None) => process::block(&[], 0), // woken by wake_tid from exit path
             Err(()) => return SyscallError::NotFound.to_u64(),
         }
     }
@@ -1071,13 +1071,13 @@ fn sys_net_recv(buf: &mut [u8], timeout_nanos: u64) -> u64 {
         if deadline > 0 && crate::clock::nanos_since_boot() >= deadline {
             return 0;
         }
-        process::block(crate::scheduler::BlockReason::NetRecv { deadline });
+        process::block(&[crate::scheduler::EventSource::Network], deadline);
     }
 }
 
 fn sys_nanosleep(nanos: u64) -> u64 {
     let deadline = crate::clock::nanos_since_boot().saturating_add(nanos);
-    process::block(crate::scheduler::BlockReason::Sleep { deadline });
+    process::block(&[], deadline); // woken by deadline expiry only
     0
 }
 

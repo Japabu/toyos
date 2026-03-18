@@ -553,7 +553,7 @@ fn fatal_exception(ctx: &ExceptionContext) -> ! {
             Vector::InvalidOpcode => log!("SIGILL tid={}: illegal instruction", tid),
             Vector::GeneralProtection => log!("SIGBUS tid={}: general protection fault (error_code={:#x}) rip={:#x}", tid, ctx.frame.error_code, ctx.frame.rip),
             Vector::DoubleFault => log!("FATAL tid={}: double fault", tid),
-            Vector::Debug | Vector::Timer | Vector::Xhci | Vector::TlbFlush => unreachable!(),
+            Vector::Debug | Vector::Timer | Vector::Xhci | Vector::VirtioNet | Vector::TlbFlush => unreachable!(),
         }
     } else {
         let cpu = percpu::cpu_id();
@@ -572,7 +572,7 @@ fn fatal_exception(ctx: &ExceptionContext) -> ! {
                     Vector::InvalidOpcode => "invalid opcode",
                     Vector::GeneralProtection => "general protection fault",
                     Vector::DoubleFault => "double fault",
-                    Vector::Debug | Vector::PageFault | Vector::Timer | Vector::Xhci | Vector::TlbFlush => unreachable!(),
+                    Vector::Debug | Vector::PageFault | Vector::Timer | Vector::Xhci | Vector::VirtioNet | Vector::TlbFlush => unreachable!(),
                 };
                 log!("KERNEL PANIC cpu={} pid={:?}: {} (error_code={:#x})",
                     cpu, percpu::current_tid(), name, ctx.frame.error_code);
