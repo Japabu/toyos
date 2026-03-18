@@ -52,7 +52,7 @@ extern "sysv64" fn debug_handler(regs: *const SavedRegs) {
     let dr6 = debug::read_dr6();
 
     let is_user = frame.cs & RPL_MASK != 0;
-    let pid = percpu::current_pid();
+    let pid = percpu::current_tid();
 
     log!("=== HARDWARE WATCHPOINT HIT ===");
     log!("  DR6={:#x} ({})", dr6,
@@ -241,7 +241,7 @@ extern "sysv64" fn double_fault_handler(regs: *const SavedRegs) -> ! {
     let frame = regs.interrupt_frame();
     let cr2 = cpu::read_cr2().raw();
     let cpu_id = percpu::cpu_id();
-    let pid = percpu::current_pid();
+    let pid = percpu::current_tid();
 
     log!("DOUBLE FAULT on CPU {} (pid={:?})", cpu_id, pid);
     log!("  cr2={:#018x} (address that caused the fault chain)", cr2);
@@ -392,7 +392,7 @@ extern "sysv64" fn page_fault_handler(regs: *const SavedRegs) {
     // Only handle not-present faults — protection violations are always fatal
     if frame.error_code & PF_PRESENT == 0 {
         let is_user = frame.cs & RPL_MASK != 0;
-        if is_user || percpu::current_pid().is_some() {
+        if is_user || percpu::current_tid().is_some() {
             if process::handle_page_fault(fault_addr, frame.error_code) {
                 return;
             }
@@ -432,7 +432,7 @@ impl ExceptionContext<'_> {
     /// during a syscall (e.g. bad pointer passed to write()).
     fn is_user_fault(&self) -> bool {
         self.is_user_mode()
-            || (percpu::current_pid().is_some()
+            || (percpu::current_tid().is_some()
                 && self.cr2 < 0x0000_8000_0000_0000
                 && matches!(self.vector, Vector::PageFault | Vector::GeneralProtection))
     }
@@ -451,7 +451,7 @@ impl ExceptionContext<'_> {
 /// Log an address with symbol resolution (allocation-free).
 fn log_addr(addr: u64, is_user: bool) {
     if is_user {
-        if let Some(pid) = percpu::current_pid() {
+        if let Some(pid) = percpu::current_tid() {
             if process::resolve_user_symbol(pid, addr) {
                 return;
             }
@@ -540,7 +540,7 @@ fn fatal_exception(ctx: &ExceptionContext) -> ! {
 
     // --- Header ---
     if is_user {
-        let pid = percpu::current_pid().unwrap_or(crate::process::Pid(0));
+        let tid = percpu::current_tid().unwrap_or(crate::process::Tid(0));
         match ctx.vector {
             Vector::PageFault => {
                 let action = if ctx.frame.error_code & PF_INSTRUCTION_FETCH != 0 { "execute" }
@@ -548,11 +548,11 @@ fn fatal_exception(ctx: &ExceptionContext) -> ! {
                     else { "read" };
                 let cause = if ctx.frame.error_code & PF_PRESENT != 0 { "protection violation" }
                     else { "page not mapped" };
-                log!("SEGFAULT pid={}: {} at {:#x} ({})", pid, action, ctx.cr2, cause);
+                log!("SEGFAULT tid={}: {} at {:#x} ({})", tid, action, ctx.cr2, cause);
             }
-            Vector::InvalidOpcode => log!("SIGILL pid={}: illegal instruction", pid),
-            Vector::GeneralProtection => log!("SIGBUS pid={}: general protection fault (error_code={:#x}) rip={:#x}", pid, ctx.frame.error_code, ctx.frame.rip),
-            Vector::DoubleFault => log!("FATAL pid={}: double fault", pid),
+            Vector::InvalidOpcode => log!("SIGILL tid={}: illegal instruction", tid),
+            Vector::GeneralProtection => log!("SIGBUS tid={}: general protection fault (error_code={:#x}) rip={:#x}", tid, ctx.frame.error_code, ctx.frame.rip),
+            Vector::DoubleFault => log!("FATAL tid={}: double fault", tid),
             Vector::Debug | Vector::Timer | Vector::Xhci | Vector::TlbFlush => unreachable!(),
         }
     } else {
@@ -565,7 +565,7 @@ fn fatal_exception(ctx: &ExceptionContext) -> ! {
                 let cause = if ctx.frame.error_code & PF_PRESENT != 0 { "protection violation" }
                     else { "page not mapped" };
                 log!("KERNEL PANIC cpu={} pid={:?}: page fault: {} at {:#x} ({})",
-                    cpu, percpu::current_pid(), action, ctx.cr2, cause);
+                    cpu, percpu::current_tid(), action, ctx.cr2, cause);
             }
             _ => {
                 let name = match ctx.vector {
@@ -575,7 +575,7 @@ fn fatal_exception(ctx: &ExceptionContext) -> ! {
                     Vector::Debug | Vector::PageFault | Vector::Timer | Vector::Xhci | Vector::TlbFlush => unreachable!(),
                 };
                 log!("KERNEL PANIC cpu={} pid={:?}: {} (error_code={:#x})",
-                    cpu, percpu::current_pid(), name, ctx.frame.error_code);
+                    cpu, percpu::current_tid(), name, ctx.frame.error_code);
             }
         }
     }

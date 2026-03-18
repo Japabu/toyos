@@ -256,7 +256,7 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         SYS_NANOSLEEP => sys_nanosleep(a1),
         SYS_DUP => sys_dup(a1 as u32),
         SYS_DUP2 => sys_dup2(a1 as u32, a2 as u32),
-        SYS_GETPID => process::current_pid().raw() as u64,
+        SYS_GETPID => process::current_process().raw() as u64,
         SYS_RENAME => {
             let Some(old) = ctx.user_str(UserAddr::new(a1), a2) else { return bad_addr };
             let Some(new) = ctx.user_str(UserAddr::new(a3), a4) else { return bad_addr };
@@ -369,7 +369,7 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
                     };
                     device::set_framebuffer_info(fb_info);
                     set_screen_size(gpu_info.width, gpu_info.height);
-                    let pid = process::current_pid();
+                    let pid = process::current_process();
                     for &token in &gpu_info.tokens {
                         if shared_memory::grant_kernel(token, pid).is_err() {
                             return SyscallError::Unknown.to_u64();
@@ -477,7 +477,7 @@ fn sys_open(path: &str, flags: OpenFlags) -> u64 {
 }
 
 fn sys_close(fd_num: u32) -> u64 {
-    let pid = process::current_pid();
+    let pid = process::current_process();
     let (result, wake_readers, wake_writers) = process::with_fd_owner_data(|data| {
         // Grab pipe IDs before close drops the descriptor
         let wake_r = data.fds.get(fd_num).and_then(|d| d.pipe_id_write()); // writer closed → wake readers
@@ -680,7 +680,7 @@ fn sys_write_nonblock(fd_num: u32, buf: &[u8]) -> u64 {
 
 fn sys_spawn(text: &str, fds: fd::FdTable, env: alloc::vec::Vec<u8>) -> u64 {
     let args: Vec<&str> = text.split('\0').filter(|s| !s.is_empty()).collect();
-    let parent = process::current_pid();
+    let parent = process::current_process();
     match process::spawn(&args, fds, Some(parent), env) {
         Ok(pid) => pid.raw() as u64,
         Err(e) => e.to_u64(),
@@ -690,7 +690,7 @@ fn sys_spawn(text: &str, fds: fd::FdTable, env: alloc::vec::Vec<u8>) -> u64 {
 fn sys_waitpid(pid: u64, flags: u64) -> u64 {
     const WNOHANG: u64 = 1;
     let child_pid = process::Pid::from_raw(pid as u32);
-    let caller = process::current_pid();
+    let caller = process::current_process();
     loop {
         match process::collect_child_zombie(child_pid, caller) {
             Ok(Some(code)) => return code as u64,
@@ -728,9 +728,9 @@ fn sys_poll(fds: &[u64], fds_len: u64, timeout_nanos: u64) -> u64 {
     let fd_data_arc = {
         let guard = process::PROCESS_TABLE.lock();
         let table = guard.as_ref().unwrap();
-        let pid = process::current_pid();
-        let fd_pid = table.get(pid).unwrap().heap_owner();
-        Arc::clone(table.get(fd_pid).unwrap().data())
+        let tid = process::current_tid();
+        let process_pid = table.get(tid).unwrap().process();
+        Arc::clone(table.get_process(process_pid).unwrap().data())
     };
 
     loop {
@@ -778,7 +778,7 @@ fn screen_size() -> u64 {
 }
 
 fn sys_open_device(device_type: u64) -> u64 {
-    let pid = process::current_pid();
+    let pid = process::current_process();
     let desc = match device::try_claim(device_type, pid) {
         Some(d) => d,
         None => return SyscallError::NotFound.to_u64(),
@@ -840,7 +840,7 @@ fn sys_connect(name: &str) -> u64 {
 
     // Queue the server's end. PipeReader/PipeWriter in the queue keep pipes
     // alive even if the client disconnects before accept.
-    let client_pid = process::current_pid();
+    let client_pid = process::current_process();
     crate::listener::push_connection(name, listener::PendingConnection {
         rx: cs_reader,   // server reads from client→server
         tx: sc_writer,   // server writes to server→client
@@ -868,13 +868,13 @@ fn wake_poll_waiters() {
 }
 
 fn sys_alloc_shared(size: u64) -> u64 {
-    let pid = process::current_pid();
+    let pid = process::current_process();
     let addr_space = process::current_address_space();
     shared_memory::alloc(size, pid, &addr_space).raw() as u64
 }
 
 fn sys_grant_shared(token: u64, target_pid: u64) -> u64 {
-    let pid = process::current_pid();
+    let pid = process::current_process();
     let token = shared_memory::SharedToken::from_raw(token as u32);
     match shared_memory::grant(token, pid, process::Pid::from_raw(target_pid as u32)) {
         Ok(()) => 0,
@@ -884,7 +884,7 @@ fn sys_grant_shared(token: u64, target_pid: u64) -> u64 {
 }
 
 fn sys_map_shared(token: u64) -> u64 {
-    let pid = process::current_pid();
+    let pid = process::current_process();
     let addr_space = process::current_address_space();
     match shared_memory::map(shared_memory::SharedToken::from_raw(token as u32), pid, &addr_space) {
         Ok(addr) => addr,
@@ -894,7 +894,7 @@ fn sys_map_shared(token: u64) -> u64 {
 }
 
 fn sys_release_shared(token: u64) -> u64 {
-    let pid = process::current_pid();
+    let pid = process::current_process();
     let token = shared_memory::SharedToken::from_raw(token as u32);
     match shared_memory::release(token, pid) {
         Ok(()) => 0,
@@ -980,8 +980,8 @@ fn sys_munmap(addr: u64, _size: u64) -> u64 {
 }
 
 fn sys_thread_join(tid: u64) -> u64 {
-    let tid = process::Pid::from_raw(tid as u32);
-    let caller = process::current_pid();
+    let tid = process::Tid::from_raw(tid as u32);
+    let caller = process::current_process();
     loop {
         match process::collect_thread_zombie(tid, caller) {
             Ok(Some(_)) => return 0,
@@ -1017,15 +1017,15 @@ fn sys_sysinfo(buf: &mut [u8]) -> u64 {
     buf[40..48].copy_from_slice(&total_ticks.to_le_bytes());
 
     let max_entries = (buf.len() - HEADER_SIZE) / ENTRY_SIZE;
-    let mut sorted_pids: Vec<process::Pid> = table.iter().map(|(pid, _)| pid).collect();
-    sorted_pids.sort();
+    let mut sorted_tids: Vec<process::Tid> = table.iter().map(|(tid, _)| tid).collect();
+    sorted_tids.sort();
 
     let mut pos = HEADER_SIZE;
-    for (i, &pid) in sorted_pids.iter().enumerate() {
+    for (i, &tid) in sorted_tids.iter().enumerate() {
         if i >= max_entries {
             break;
         }
-        let Some(entry) = table.get(pid) else { continue };
+        let Some(entry) = table.get(tid) else { continue };
 
         let state: u8 = match entry.state() {
             process::ProcessState::Running => 0,
@@ -1039,6 +1039,8 @@ fn sys_sysinfo(buf: &mut [u8]) -> u64 {
         };
         let memory = entry.memory_size();
         let cpu_ns = entry.cpu_ns();
+        // Report the process Pid to userland (not the internal Tid)
+        let pid = entry.process();
 
         buf[pos..pos + 4].copy_from_slice(&pid.raw().to_le_bytes());
         buf[pos + 4..pos + 8].copy_from_slice(&parent_pid.raw().to_le_bytes());
@@ -1103,7 +1105,7 @@ fn sys_dup2(old_fd: u32, new_fd: u32) -> u64 {
         };
         if data.fds.get(new_fd).is_some() {
             let mut vfs = vfs::lock();
-            fd::close(&mut data.fds, &mut vfs, new_fd, process::current_pid());
+            fd::close(&mut data.fds, &mut vfs, new_fd, process::current_process());
         }
         data.fds.insert_at(new_fd, desc);
         new_fd as u64

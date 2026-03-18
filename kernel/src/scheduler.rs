@@ -1,6 +1,6 @@
 use core::arch::{asm, naked_asm};
 use crate::arch::{cpu, paging, percpu};
-use crate::process::{IdleProof, Pid, ProcessState, ProcessTable, PROCESS_TABLE};
+use crate::process::{IdleProof, Tid, ProcessState, ProcessTable, PROCESS_TABLE};
 use crate::keyboard;
 const IA32_FS_BASE: u32 = 0xC0000100;
 
@@ -17,7 +17,7 @@ pub fn yield_now() {
 /// Timer preemption: called from the timer interrupt handler.
 /// No-op if no process is running on this CPU (e.g. AP during early boot or idle).
 pub fn preempt() {
-    if percpu::current_pid().is_none() {
+    if percpu::current_tid().is_none() {
         return;
     }
     yield_now();
@@ -38,7 +38,7 @@ fn schedule(cur_state: ProcessState) {
 
     let mut guard = PROCESS_TABLE.lock();
     let table = guard.as_mut().unwrap();
-    let cur_pid = percpu::current_pid().expect("schedule() called during idle");
+    let cur_pid = percpu::current_tid().expect("schedule() called during idle");
 
     if let Some(entry) = table.get_mut(cur_pid) {
         if !matches!(entry.state(), ProcessState::Zombie(_)) {
@@ -58,15 +58,15 @@ pub fn schedule_already_blocked(guard: crate::sync::LockGuard<'_, Option<Process
 
 fn schedule_inner(mut guard: crate::sync::LockGuard<'_, Option<ProcessTable>>) {
     let table = guard.as_mut().unwrap();
-    let cur_pid = percpu::current_pid().expect("schedule_inner() called during idle");
+    let cur_pid = percpu::current_tid().expect("schedule_inner() called during idle");
     let cur_alive = table.get(cur_pid).is_some();
     let now = crate::clock::nanos_since_boot();
 
     idle_poll(table);
 
-    // Round-robin: find smallest Ready PID > current, or wrap to smallest Ready PID
-    let mut best_after: Option<Pid> = None;
-    let mut best_any: Option<Pid> = None;
+    // Round-robin: find smallest Ready TID > current, or wrap to smallest Ready TID
+    let mut best_after: Option<Tid> = None;
+    let mut best_any: Option<Tid> = None;
     for (pid, entry) in table.iter() {
         if *entry.state() == ProcessState::Ready {
             if pid > cur_pid && best_after.map_or(true, |b| pid < b) {
@@ -85,7 +85,7 @@ fn schedule_inner(mut guard: crate::sync::LockGuard<'_, Option<ProcessTable>>) {
         }
 
         let new_entry = table.get(new_pid).unwrap_or_else(|| {
-            let keys: alloc::vec::Vec<Pid> = table.iter().map(|(pid, _)| pid).collect();
+            let keys: alloc::vec::Vec<Tid> = table.iter().map(|(pid, _)| pid).collect();
             panic!("schedule: pid {new_pid} vanished after scan (cur={cur_pid}, keys={keys:?})");
         });
         assert!(*new_entry.state() == ProcessState::Ready,
@@ -109,7 +109,7 @@ fn schedule_inner(mut guard: crate::sync::LockGuard<'_, Option<ProcessTable>>) {
         let new_entry = table.get_mut(new_pid).unwrap();
         new_entry.set_state(ProcessState::Running);
         new_entry.start_cpu_timer(now);
-        percpu::set_current_pid(Some(new_pid));
+        percpu::set_current_tid(Some(new_pid));
         unsafe { percpu::set_kernel_stack(new_ks_top); }
 
         unsafe { cpu::write_cr3(new_cr3); }
@@ -130,7 +130,7 @@ fn schedule_inner(mut guard: crate::sync::LockGuard<'_, Option<ProcessTable>>) {
     } else {
         percpu::idle_rsp_ptr()
     };
-    percpu::set_current_pid(None);
+    percpu::set_current_tid(None);
     unsafe { percpu::set_kernel_stack(percpu::idle_stack_top()); }
 
     unsafe { cpu::write_cr3(paging::kernel_cr3()); }
@@ -142,7 +142,7 @@ fn schedule_inner(mut guard: crate::sync::LockGuard<'_, Option<ProcessTable>>) {
 
 /// Schedule without saving current context (used by ap_idle and BSP boot).
 pub fn schedule_no_return() -> ! {
-    percpu::set_current_pid(None);
+    percpu::set_current_tid(None);
     unsafe { percpu::set_kernel_stack(percpu::idle_stack_top()); }
     unsafe { cpu::write_cr3(paging::kernel_cr3()); }
     let sp = percpu::idle_stack_top();
@@ -163,7 +163,7 @@ pub fn schedule_no_return() -> ! {
 /// we've switched off it.
 pub fn schedule_no_return_locked(guard: crate::sync::LockGuard<'_, Option<ProcessTable>>) -> ! {
     core::mem::forget(guard);
-    percpu::set_current_pid(None);
+    percpu::set_current_tid(None);
     unsafe { percpu::set_kernel_stack(percpu::idle_stack_top()); }
     unsafe { cpu::write_cr3(paging::kernel_cr3()); }
     let sp = percpu::idle_stack_top();
@@ -196,7 +196,7 @@ fn cpu_idle_loop() -> ! {
 
             if let Some(new_pid) = ready {
                 let new_entry = table.get(new_pid).unwrap_or_else(|| {
-                    let keys: alloc::vec::Vec<Pid> = table.iter().map(|(pid, _)| pid).collect();
+                    let keys: alloc::vec::Vec<Tid> = table.iter().map(|(pid, _)| pid).collect();
                     panic!("idle: pid {new_pid} vanished after scan (keys={keys:?})");
                 });
                 let addr_space = new_entry.address_space().expect("idle: scheduling with no address space");
@@ -208,7 +208,7 @@ fn cpu_idle_loop() -> ! {
                 let new_entry = table.get_mut(new_pid).unwrap();
                 new_entry.set_state(ProcessState::Running);
                 new_entry.start_cpu_timer(crate::clock::nanos_since_boot());
-                percpu::set_current_pid(Some(new_pid));
+                percpu::set_current_tid(Some(new_pid));
                 unsafe { percpu::set_kernel_stack(new_ks_top); }
 
                 unsafe { cpu::write_cr3(new_cr3); }
@@ -245,10 +245,12 @@ fn idle_poll(table: &mut ProcessTable) {
     let kb_ready = keyboard::has_data();
     let net_ready = crate::net::has_packet();
 
+    let mut zombie_tids = alloc::vec::Vec::new();
     let mut zombie_pids = alloc::vec::Vec::new();
     for (_, entry) in table.iter() {
         if matches!(entry.state(), ProcessState::Zombie(_)) {
-            zombie_pids.push(entry.pid());
+            zombie_tids.push(entry.tid());
+            zombie_pids.push(entry.process());
         }
     }
 
@@ -263,8 +265,13 @@ fn idle_poll(table: &mut ProcessTable) {
             ProcessState::BlockedPipeWrite(id) if crate::pipe::has_space(id) => {
                 entry.set_state(ProcessState::Ready);
             }
-            ProcessState::BlockedWaitPid(child_pid) | ProcessState::BlockedThreadJoin(child_pid) => {
+            ProcessState::BlockedWaitPid(child_pid) => {
                 if zombie_pids.contains(&child_pid) {
+                    entry.set_state(ProcessState::Ready);
+                }
+            }
+            ProcessState::BlockedThreadJoin(child_tid) => {
+                if zombie_tids.contains(&child_tid) {
                     entry.set_state(ProcessState::Ready);
                 }
             }

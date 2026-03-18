@@ -91,7 +91,7 @@ pub fn check_pte_monitor() {
         crate::log!("  PTE addr={:#x}", addr);
         crate::log!("  expected={:#018x}", expected);
         crate::log!("  actual  ={:#018x}", current);
-        crate::log!("  current pid={:?}", crate::arch::percpu::current_pid());
+        crate::log!("  current tid={:?}", crate::arch::percpu::current_tid());
 
         // Dump what's at the PT page — are neighboring PTEs also corrupted?
         let pt_base = addr & !0xFFF;

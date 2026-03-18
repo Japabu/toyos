@@ -20,7 +20,7 @@ pub mod system;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Fd(pub i32);
 
-/// A process ID.
+/// A process ID. Identifies a process — owns address space, FDs, vruntime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Pid(pub u32);
 
@@ -39,6 +39,28 @@ impl core::fmt::Display for Pid {
 impl core::ops::Add for Pid {
     type Output = Self;
     fn add(self, rhs: Self) -> Self { Pid(self.0 + rhs.0) }
+}
+
+/// A thread ID. Identifies a schedulable entity — goes in run queues.
+/// Every process has at least one thread (the main thread).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Tid(pub u32);
+
+impl Tid {
+    pub const MAX: Self = Tid(u32::MAX);
+    pub fn raw(self) -> u32 { self.0 }
+    pub fn from_raw(v: u32) -> Self { Tid(v) }
+}
+
+impl core::fmt::Display for Tid {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl core::ops::Add for Tid {
+    type Output = Self;
+    fn add(self, rhs: Self) -> Self { Tid(self.0 + rhs.0) }
 }
 
 /// GPU framebuffer info passed between kernel and userland.
