@@ -1,8 +1,12 @@
 use core::ffi::c_void;
 use std::num::NonZeroU32;
 use std::ptr::addr_of_mut;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
+
+use rustysynth::{MidiFile, MidiFileSequencer, SoundFont, Synthesizer, SynthesizerSettings};
 
 use softbuffer::Surface;
 use winit::application::ApplicationHandler;
@@ -24,6 +28,15 @@ extern "C" {
     fn W_LumpLength(lump: i32) -> i32;
     fn W_ReleaseLumpNum(lump: i32);
     fn W_GetNumForName(name: *const u8) -> i32;
+}
+
+// MUS-to-MIDI conversion (mus2mid.c / memio.c)
+extern "C" {
+    fn mem_fopen_read(buf: *const u8, buflen: usize) -> *mut c_void;
+    fn mem_fopen_write() -> *mut c_void;
+    fn mem_get_buf(stream: *mut c_void, buf: *mut *mut u8, buflen: *mut usize);
+    fn mem_fclose(stream: *mut c_void);
+    fn mus2mid(input: *mut c_void, output: *mut c_void) -> i32;
 }
 
 const PU_STATIC: i32 = 1;
@@ -167,6 +180,86 @@ impl Channel {
     };
 }
 
+const RING_FRAMES: usize = 8192;
+const RENDER_CHUNK: usize = 1024;
+
+enum MusicCmd {
+    Play(Arc<MidiFile>, bool),
+    Stop,
+}
+
+struct MusicRing {
+    buf: Box<[i16]>,
+    read: AtomicUsize,
+    write: AtomicUsize,
+    volume: AtomicU32,
+    paused: AtomicBool,
+    playing: AtomicBool,
+}
+
+unsafe impl Sync for MusicRing {}
+
+impl MusicRing {
+    fn new() -> Self {
+        MusicRing {
+            buf: vec![0i16; RING_FRAMES * 2].into_boxed_slice(),
+            read: AtomicUsize::new(0),
+            write: AtomicUsize::new(0),
+            volume: AtomicU32::new(f32::to_bits(1.0)),
+            paused: AtomicBool::new(false),
+            playing: AtomicBool::new(false),
+        }
+    }
+
+    fn free_space(&self) -> usize {
+        let used = self.write.load(Ordering::Acquire).wrapping_sub(self.read.load(Ordering::Relaxed));
+        RING_FRAMES - used
+    }
+
+    fn push(&self, left: &[f32], right: &[f32]) {
+        let vol = f32::from_bits(self.volume.load(Ordering::Relaxed));
+        let mut w = self.write.load(Ordering::Relaxed);
+        let ptr = self.buf.as_ptr() as *mut i16;
+        for i in 0..left.len() {
+            let idx = (w % RING_FRAMES) * 2;
+            unsafe {
+                *ptr.add(idx) = (left[i] * vol * 32767.0).clamp(-32768.0, 32767.0) as i16;
+                *ptr.add(idx + 1) = (right[i] * vol * 32767.0).clamp(-32768.0, 32767.0) as i16;
+            }
+            w = w.wrapping_add(1);
+        }
+        self.write.store(w, Ordering::Release);
+    }
+
+    fn read_mix(&self, data: &mut [i16]) {
+        if self.paused.load(Ordering::Relaxed) || !self.playing.load(Ordering::Relaxed) {
+            return;
+        }
+        let frames = data.len() / 2;
+        let mut r = self.read.load(Ordering::Relaxed);
+        let w = self.write.load(Ordering::Acquire);
+        let avail = w.wrapping_sub(r).min(frames);
+        let ptr = self.buf.as_ptr();
+        for i in 0..avail {
+            let idx = (r % RING_FRAMES) * 2;
+            unsafe {
+                data[i * 2] = (data[i * 2] as i32 + *ptr.add(idx) as i32).clamp(-32768, 32767) as i16;
+                data[i * 2 + 1] = (data[i * 2 + 1] as i32 + *ptr.add(idx + 1) as i32).clamp(-32768, 32767) as i16;
+            }
+            r = r.wrapping_add(1);
+        }
+        self.read.store(r, Ordering::Release);
+    }
+
+    fn clear(&self) {
+        self.read.store(self.write.load(Ordering::Relaxed), Ordering::Release);
+    }
+}
+
+static SOUNDFONT: OnceLock<Arc<SoundFont>> = OnceLock::new();
+static MUSIC_RING: OnceLock<Arc<MusicRing>> = OnceLock::new();
+static MUSIC_TX: OnceLock<Mutex<mpsc::Sender<MusicCmd>>> = OnceLock::new();
+
 struct Mixer {
     channels: [Channel; NUM_SFX_CHANNELS],
 }
@@ -183,7 +276,6 @@ impl Mixer {
     /// Mix stereo i16 samples directly into the output buffer.
     /// Called from the cpal audio callback at hardware rate.
     fn fill(&mut self, data: &mut [i16]) {
-        // Zero the output
         for s in data.iter_mut() {
             *s = 0;
         }
@@ -212,6 +304,11 @@ impl Mixer {
                 ch.sound = core::ptr::null();
                 ch.sfxinfo = core::ptr::null_mut();
             }
+        }
+
+        // Mix pre-rendered music from the ring buffer (rendered by background thread)
+        if let Some(ring) = MUSIC_RING.get() {
+            ring.read_mix(data);
         }
     }
 }
@@ -409,19 +506,177 @@ unsafe extern "C" fn toyos_sound_is_playing(handle: i32) -> bool {
     }
 }
 
-// Stub music module (no music playback yet)
-unsafe extern "C" fn toyos_music_init() -> bool { true }
-unsafe extern "C" fn toyos_music_shutdown() {}
-unsafe extern "C" fn toyos_set_music_volume(_volume: i32) {}
-unsafe extern "C" fn toyos_pause_music() {}
-unsafe extern "C" fn toyos_resume_music() {}
-unsafe extern "C" fn toyos_register_song(_data: *mut c_void, _len: i32) -> *mut c_void {
-    core::ptr::null_mut()
+static SF2_DATA: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/FluidR3_GM.sf2"));
+
+fn music_thread(ring: Arc<MusicRing>, rx: mpsc::Receiver<MusicCmd>, sf: Arc<SoundFont>) {
+    let mut sequencer: Option<MidiFileSequencer> = None;
+    let mut left_buf = vec![0.0f32; RENDER_CHUNK];
+    let mut right_buf = vec![0.0f32; RENDER_CHUNK];
+
+    loop {
+        while let Ok(cmd) = rx.try_recv() {
+            match cmd {
+                MusicCmd::Play(midi_file, looping) => {
+                    let settings = SynthesizerSettings::new(OUTPUT_RATE as i32);
+                    let synth = Synthesizer::new(&sf, &settings).expect("failed to create synthesizer");
+                    let mut seq = MidiFileSequencer::new(synth);
+                    seq.play(&midi_file, looping);
+                    sequencer = Some(seq);
+                    ring.clear();
+                    ring.playing.store(true, Ordering::Release);
+                }
+                MusicCmd::Stop => {
+                    sequencer = None;
+                    ring.playing.store(false, Ordering::Release);
+                    ring.clear();
+                }
+            }
+        }
+
+        if let Some(seq) = &mut sequencer {
+            if ring.paused.load(Ordering::Relaxed) {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                continue;
+            }
+            if ring.free_space() >= RENDER_CHUNK {
+                seq.render(&mut left_buf, &mut right_buf);
+                ring.push(&left_buf, &right_buf);
+                if seq.end_of_sequence() {
+                    sequencer = None;
+                    ring.playing.store(false, Ordering::Release);
+                }
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
 }
-unsafe extern "C" fn toyos_unregister_song(_handle: *mut c_void) {}
-unsafe extern "C" fn toyos_play_song(_handle: *mut c_void, _looping: bool) {}
-unsafe extern "C" fn toyos_stop_song() {}
-unsafe extern "C" fn toyos_music_is_playing() -> bool { false }
+
+unsafe extern "C" fn toyos_music_init() -> bool {
+    let sf = match SoundFont::new(&mut std::io::Cursor::new(SF2_DATA)) {
+        Ok(sf) => sf,
+        Err(e) => {
+            eprintln!("failed to load soundfont: {e:?}");
+            return false;
+        }
+    };
+    let sf = Arc::new(sf);
+    SOUNDFONT.set(sf.clone()).ok();
+
+    let ring = Arc::new(MusicRing::new());
+    MUSIC_RING.set(ring.clone()).ok();
+
+    let (tx, rx) = mpsc::channel();
+    MUSIC_TX.set(Mutex::new(tx)).ok();
+
+    std::thread::Builder::new()
+        .name("midi-synth".into())
+        .spawn(move || music_thread(ring, rx, sf))
+        .expect("failed to spawn music thread");
+
+    true
+}
+
+unsafe extern "C" fn toyos_music_shutdown() {
+    if let Some(tx) = MUSIC_TX.get() {
+        let _ = tx.lock().unwrap().send(MusicCmd::Stop);
+    }
+}
+
+unsafe extern "C" fn toyos_set_music_volume(volume: i32) {
+    // DOOM music volume is 0–15
+    let vol = (volume as f32 / 15.0).clamp(0.0, 1.0);
+    if let Some(ring) = MUSIC_RING.get() {
+        ring.volume.store(vol.to_bits(), Ordering::Relaxed);
+    }
+}
+
+unsafe extern "C" fn toyos_pause_music() {
+    if let Some(ring) = MUSIC_RING.get() {
+        ring.paused.store(true, Ordering::Relaxed);
+    }
+}
+
+unsafe extern "C" fn toyos_resume_music() {
+    if let Some(ring) = MUSIC_RING.get() {
+        ring.paused.store(false, Ordering::Relaxed);
+    }
+}
+
+unsafe extern "C" fn toyos_register_song(data: *mut c_void, len: i32) -> *mut c_void {
+    if data.is_null() || len < 4 {
+        return core::ptr::null_mut();
+    }
+
+    let raw = core::slice::from_raw_parts(data as *const u8, len as usize);
+
+    // MUS format starts with "MUS\x1A", MIDI starts with "MThd"
+    let midi_data = if raw.starts_with(b"MUS\x1a") {
+        let input = mem_fopen_read(data as *const u8, len as usize);
+        let output = mem_fopen_write();
+        mus2mid(input, output);
+
+        let mut buf: *mut u8 = core::ptr::null_mut();
+        let mut buflen: usize = 0;
+        mem_get_buf(output, &mut buf, &mut buflen);
+
+        let midi = if !buf.is_null() && buflen > 0 {
+            core::slice::from_raw_parts(buf, buflen).to_vec()
+        } else {
+            mem_fclose(input);
+            mem_fclose(output);
+            return core::ptr::null_mut();
+        };
+
+        mem_fclose(input);
+        mem_fclose(output);
+        midi
+    } else {
+        raw.to_vec()
+    };
+
+    let midi_file = match MidiFile::new(&mut std::io::Cursor::new(&midi_data)) {
+        Ok(mf) => mf,
+        Err(e) => {
+            eprintln!("failed to parse MIDI: {e:?}");
+            return core::ptr::null_mut();
+        }
+    };
+
+    Box::into_raw(Box::new(Arc::new(midi_file))) as *mut c_void
+}
+
+unsafe extern "C" fn toyos_unregister_song(handle: *mut c_void) {
+    if !handle.is_null() {
+        drop(Box::from_raw(handle as *mut Arc<MidiFile>));
+    }
+}
+
+unsafe extern "C" fn toyos_play_song(handle: *mut c_void, looping: bool) {
+    if handle.is_null() {
+        return;
+    }
+    let midi_file = &*(handle as *const Arc<MidiFile>);
+    if let Some(tx) = MUSIC_TX.get() {
+        let _ = tx.lock().unwrap().send(MusicCmd::Play(midi_file.clone(), looping));
+    }
+}
+
+unsafe extern "C" fn toyos_stop_song() {
+    if let Some(tx) = MUSIC_TX.get() {
+        let _ = tx.lock().unwrap().send(MusicCmd::Stop);
+    }
+}
+
+unsafe extern "C" fn toyos_music_is_playing() -> bool {
+    if let Some(ring) = MUSIC_RING.get() {
+        ring.playing.load(Ordering::Relaxed) && !ring.paused.load(Ordering::Relaxed)
+    } else {
+        false
+    }
+}
 
 // ── Globals for C callback access ──
 

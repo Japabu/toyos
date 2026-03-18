@@ -4,6 +4,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::arch::naked_asm;
 use core::ptr::NonNull;
+use core::sync::atomic::{AtomicBool, Ordering};
 use crate::arch::{cpu, paging, percpu};
 use crate::arch::paging::PAGE_2M;
 use crate::fd::{self, Descriptor, FdTable};
@@ -22,23 +23,71 @@ impl crate::id_map::IdKey for Pid {
 }
 
 // ---------------------------------------------------------------------------
-// PageTableRoot — type-safe PML4 pointer (prevents double-free via Option::take)
+// AddressSpace — reference-counted PML4 page tables
 // ---------------------------------------------------------------------------
 
-/// Physical address of a PML4 page table. Used as `Option<PageTableRoot>` in SchedEntry
-/// so that `take()` makes double-free of page tables impossible at compile time.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub struct PageTableRoot(PhysAddr);
-
-// SAFETY: PageTableRoot points to a PML4 page table in physical memory.
-// Page tables are not tied to any specific thread — they are hardware structures.
-unsafe impl Send for PageTableRoot {}
+/// Physical address of a PML4 page table. Private, non-Copy — only accessible
+/// through AddressSpace. This makes dangling page table pointers impossible:
+/// you must hold an Arc<AddressSpace> to access page tables.
+struct PageTableRoot(PhysAddr);
 
 impl PageTableRoot {
-    pub fn new(addr: PhysAddr) -> Self { Self(addr) }
-    pub fn phys(self) -> PhysAddr { self.0 }
-    pub fn as_ptr(self) -> *mut u64 { self.0.as_mut_ptr() }
-    pub fn as_u64(self) -> u64 { self.0.raw() }
+    fn new(addr: PhysAddr) -> Self { Self(addr) }
+    fn phys(&self) -> PhysAddr { self.0 }
+    fn as_ptr(&self) -> *mut u64 { self.0.as_mut_ptr() }
+}
+
+/// Reference-counted address space. Wraps a PML4 page table and frees it when
+/// the last reference drops. Shared between a process and all its threads via Arc.
+pub struct AddressSpace {
+    root: PageTableRoot,
+    dead: AtomicBool,
+}
+
+// SAFETY: AddressSpace points to a PML4 page table in physical memory.
+// Page tables are hardware structures shared across CPUs.
+unsafe impl Send for AddressSpace {}
+unsafe impl Sync for AddressSpace {}
+
+impl AddressSpace {
+    pub fn new(addr: PhysAddr) -> Arc<Self> {
+        Arc::new(Self { root: PageTableRoot::new(addr), dead: AtomicBool::new(false) })
+    }
+
+    pub fn is_dead(&self) -> bool { self.dead.load(Ordering::Acquire) }
+    pub fn mark_dead(&self) { self.dead.store(true, Ordering::Release); }
+
+    /// Raw CR3 value for hardware register writes.
+    /// SAFETY: Caller must hold Arc<AddressSpace> for the duration of the CR3 load.
+    pub unsafe fn cr3_value(&self) -> PhysAddr { self.root.phys() }
+
+    pub fn map_user(&self, phys: PhysAddr, size: u64) {
+        paging::map_user_in(self.root.as_ptr(), phys, size);
+    }
+    pub fn map_user_readonly(&self, phys: PhysAddr, size: u64) {
+        paging::map_user_readonly_in(self.root.as_ptr(), phys, size);
+    }
+    pub fn remap_user_2m(&self, vaddr: UserAddr, phys: PhysAddr) -> bool {
+        paging::remap_user_2m_in(self.root.as_ptr(), vaddr, phys)
+    }
+    pub fn remap_user_2m_rw(&self, vaddr: UserAddr, phys: PhysAddr, writable: bool) -> bool {
+        paging::remap_user_2m(self.root.as_ptr(), vaddr, phys, writable)
+    }
+    pub fn clear_user_2m(&self, vaddr: UserAddr) {
+        paging::clear_user_2m(self.root.as_ptr(), vaddr);
+    }
+    pub fn unmap_user(&self, phys: PhysAddr, size: u64) {
+        paging::unmap_user(self.root.as_ptr(), phys, size);
+    }
+    pub fn virt_to_phys(&self, vaddr: UserAddr) -> Option<PhysAddr> {
+        paging::virt_to_phys(self.root.as_ptr() as *const u64, vaddr)
+    }
+}
+
+impl Drop for AddressSpace {
+    fn drop(&mut self) {
+        paging::free_user_page_tables(self.root.as_ptr());
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -190,9 +239,9 @@ pub struct SchedEntry {
     pid: Pid,
     state: ProcessState,
     kind: Kind,
-    /// Per-process page table (physical address of PML4).
-    /// Option so teardown can take() it, making double-free impossible.
-    cr3: Option<PageTableRoot>,
+    /// Reference-counted address space (PML4 page tables). Shared between a
+    /// process and its threads via Arc. Page tables freed when last ref drops.
+    address_space: Option<Arc<AddressSpace>>,
     /// Kernel stack allocation. Dropping this frees the stack — only safe when
     /// the process is NOT running on it (i.e. from the idle loop).
     kernel_stack: OwnedAlloc,
@@ -218,7 +267,7 @@ impl SchedEntry {
         pid: Pid,
         state: ProcessState,
         kind: Kind,
-        cr3: Option<PageTableRoot>,
+        address_space: Option<Arc<AddressSpace>>,
         kernel_stack: OwnedAlloc,
         kernel_rsp: u64,
         fs_base: u64,
@@ -227,7 +276,7 @@ impl SchedEntry {
         memory_size: u64,
         data: Arc<Lock<ProcessData>>,
     ) -> Self {
-        Self { pid, state, kind, cr3, kernel_stack, kernel_rsp, fs_base, heap_owner, name, memory_size, cpu_ns: 0, scheduled_at: 0, data }
+        Self { pid, state, kind, address_space, kernel_stack, kernel_rsp, fs_base, heap_owner, name, memory_size, cpu_ns: 0, scheduled_at: 0, data }
     }
 
     // --- Read-only getters ---
@@ -249,7 +298,7 @@ impl SchedEntry {
             self.cpu_ns
         }
     }
-    pub fn cr3(&self) -> Option<PageTableRoot> { self.cr3 }
+    pub fn address_space(&self) -> Option<&Arc<AddressSpace>> { self.address_space.as_ref() }
     pub fn fs_base(&self) -> u64 { self.fs_base }
 
     // --- Scheduler-only accessors ---
@@ -286,9 +335,9 @@ impl SchedEntry {
         self.set_state(ProcessState::Zombie(code));
     }
 
-    /// Consume the page table root. Panics if already taken.
-    pub fn take_cr3(&mut self) -> PageTableRoot {
-        self.cr3.take().expect("take_cr3: already taken")
+    /// Take the address space Arc. Panics if already taken.
+    pub fn take_address_space(&mut self) -> Arc<AddressSpace> {
+        self.address_space.take().expect("take_address_space: already taken")
     }
 
     /// Detach this process from its parent (orphan it).
@@ -550,6 +599,10 @@ pub fn with_current_sched<R>(f: impl FnOnce(&SchedEntry) -> R) -> R {
     f(table.get(current_pid()).unwrap())
 }
 
+pub fn current_address_space() -> Arc<AddressSpace> {
+    with_current_sched(|s| Arc::clone(s.address_space().unwrap()))
+}
+
 // ---------------------------------------------------------------------------
 // Access patterns — ProcessData (clone Arc, drop table lock, lock ProcessData)
 // ---------------------------------------------------------------------------
@@ -790,11 +843,11 @@ extern "C" fn thread_start() {
 /// Spawn a thread within the current process.
 pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64, stack_base: u64) -> Option<Pid> {
     // Phase 1: Get parent's SchedEntry data + ProcessData (never held simultaneously)
-    let (parent_cr3, parent_heap_owner, data_arc) = {
+    let (parent_addr_space, parent_heap_owner, data_arc) = {
         let guard = PROCESS_TABLE.lock();
         let table = guard.as_ref().unwrap();
         let parent = table.get(current_pid()).unwrap();
-        (parent.cr3(), parent.heap_owner(), Arc::clone(parent.data()))
+        (parent.address_space().cloned(), parent.heap_owner(), Arc::clone(parent.data()))
     };
     let (tls_template, tls_filesz, tls_memsz, tls_modules, tls_total_memsz, tls_max_align, parent_cwd) = {
         let data = data_arc.lock();
@@ -859,7 +912,7 @@ pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64, stack_base: u64) -> Op
         thread_data.lock().pid = tid;
         SchedEntry::new(
             tid, ProcessState::Ready, Kind::Thread { parent: parent_pid },
-            parent_cr3, ks_alloc, ks_rsp, fs_base, parent_heap_owner,
+            parent_addr_space.clone(), ks_alloc, ks_rsp, fs_base, parent_heap_owner,
             [0; 28], 0, thread_data,
         )
     });
@@ -1277,25 +1330,23 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
 
     let t_deps = crate::clock::nanos_since_boot();
 
-    // 8. Create user PML4 — no pages mapped for ELF segments (all demand-faulted)
-    let child_pml4_addr = paging::create_user_pml4();
-    let child_pml4 = child_pml4_addr.as_mut_ptr();
-    let child_cr3 = Some(PageTableRoot::new(child_pml4_addr));
+    // 8. Create user address space (PML4) — ELF segments are demand-faulted
+    let child_addr_space = AddressSpace::new(paging::create_user_pml4());
 
     // Map shared libraries (physical pages mapped into user address space, eager)
     for lib in &loaded_libs {
         match &lib.memory {
             elf::LibMemory::Owned(alloc) => {
-                paging::map_user_in(child_pml4, PhysAddr::from_ptr(alloc.ptr()), alloc.size() as u64);
+                child_addr_space.map_user(PhysAddr::from_ptr(alloc.ptr()), alloc.size() as u64);
             }
             elf::LibMemory::Shared { rw_alloc, cached_addr, cached_size, rw_offset, .. } => {
                 let cached_phys = *cached_addr;
-                paging::map_user_readonly_in(child_pml4, cached_phys, *cached_size as u64);
+                child_addr_space.map_user_readonly(cached_phys, *cached_size as u64);
                 let num_rw_pages = rw_alloc.size() / paging::PAGE_2M as usize;
                 for i in 0..num_rw_pages {
                     let user_virt = cached_phys.raw() + *rw_offset as u64 + i as u64 * paging::PAGE_2M;
                     let phys = PhysAddr::from_ptr(rw_alloc.ptr()) + i as u64 * paging::PAGE_2M;
-                    paging::remap_user_2m_in(child_pml4, UserAddr::new(user_virt), phys);
+                    child_addr_space.remap_user_2m(UserAddr::new(user_virt), phys);
                 }
             }
         }
@@ -1306,14 +1357,13 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
         Some(a) => a,
         None => {
             log!("spawn: {}: failed to allocate user stack ({} bytes)", path, USER_STACK_SIZE);
-            paging::free_user_page_tables(child_pml4);
             return Err(SyscallError::ResourceExhausted);
         }
     };
     let stack_phys = PhysAddr::from_ptr(stack_alloc.ptr());
     let stack_base = stack_phys.raw();
     let stack_top = stack_base + USER_STACK_SIZE as u64;
-    paging::map_user_in(child_pml4, stack_phys, USER_STACK_SIZE as u64);
+    child_addr_space.map_user(stack_phys, USER_STACK_SIZE as u64);
 
     // 10. TLS setup — read exe TLS template from page cache, build multi-module layout
     let exe_tls_template = if layout.tls_memsz > 0 {
@@ -1402,7 +1452,6 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
             Some(v) => v,
             None => {
                 log!("spawn: {}: failed to allocate TLS ({} bytes)", path, tls_total_memsz);
-                paging::free_user_page_tables(child_pml4);
                 return Err(SyscallError::ResourceExhausted);
             }
         }
@@ -1411,12 +1460,11 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
             Some(v) => v,
             None => {
                 log!("spawn: {}: failed to allocate TLS (empty)", path);
-                paging::free_user_page_tables(child_pml4);
                 return Err(SyscallError::ResourceExhausted);
             }
         }
     };
-    paging::map_user_in(child_pml4, PhysAddr::from_ptr(tls_alloc.ptr()), tls_alloc.size() as u64);
+    child_addr_space.map_user(PhysAddr::from_ptr(tls_alloc.ptr()), tls_alloc.size() as u64);
 
     let entry = base + layout.entry_vaddr;
     let sp = write_argv_to_stack(stack_top, argv);
@@ -1443,7 +1491,6 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
         Some(ks) => ks,
         None => {
             log!("spawn: {}: failed to allocate kernel stack", path);
-            paging::free_user_page_tables(child_pml4);
             return Err(SyscallError::ResourceExhausted);
         }
     };
@@ -1504,14 +1551,14 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
         proc_data.lock().pid = pid;
         SchedEntry::new(
             pid, ProcessState::Ready, Kind::Process { parent },
-            child_cr3, ks_alloc, ks_rsp, fs_base, pid,
+            Some(child_addr_space.clone()), ks_alloc, ks_rsp, fs_base, pid,
             make_name(path), memory_size, proc_data,
         )
     });
 
     let t3 = crate::clock::nanos_since_boot();
     log!("spawn: {} pid={} base={:#x} entry={:#x} cr3={:#x} (layout={}ms relocs={}ms deps={}ms tls={}ms total={}ms)",
-        path, pid, base, entry, child_cr3.unwrap().as_u64(),
+        path, pid, base, entry, unsafe { child_addr_space.cr3_value() }.raw(),
         (t1 - t0) / 1_000_000, (t2 - t1) / 1_000_000, (t_deps - t2) / 1_000_000,
         (t_tls - t_deps) / 1_000_000, (t3 - t0) / 1_000_000);
 
@@ -1584,11 +1631,11 @@ fn teardown_scheduling(table: &mut ProcessTable, pid: Pid, code: i32) {
     // idle loop (which runs on the per-CPU idle stack).
 
     let entry = table.get_mut(pid).unwrap();
-    let root = entry.take_cr3();
-    let pml4 = root.as_ptr();
+    let addr_space = entry.take_address_space();
     shared_memory::cleanup_process(pid);
-    crate::pipe::cleanup_pml4(pml4);
-    paging::free_user_page_tables(pml4);
+    pipe::cleanup_address_space(&addr_space);
+    addr_space.mark_dead();
+    drop(addr_space);
     let has_parent = matches!(entry.kind(), Kind::Process { parent: Some(_) });
     let cpu_ms = entry.cpu_ns() / 1_000_000;
     entry.zombify(code);
@@ -1632,7 +1679,15 @@ pub fn exit(code: i32) -> ! {
         let guard = PROCESS_TABLE.lock();
         let table = guard.as_ref().unwrap();
         let pid = current_pid();
-        let entry = table.get(pid).unwrap();
+        // Our entry was already reaped (parent exited and teardown + zombie
+        // collection ran while we were still physically executing on another
+        // CPU). Nothing left to tear down — just deschedule.
+        let Some(entry) = table.get(pid) else {
+            drop(guard);
+            unsafe { cpu::write_cr3(paging::kernel_cr3()); }
+            let guard = PROCESS_TABLE.lock();
+            scheduler::schedule_no_return_locked(guard);
+        };
         let process_pid = match entry.kind() {
             Kind::Thread { parent } => *parent,
             Kind::Process { .. } => pid,
@@ -1664,7 +1719,7 @@ pub fn exit(code: i32) -> ! {
 /// the process. For threads, zombifies without freeing the address space.
 pub fn thread_exit(code: i32) -> ! {
     let kind = with_current_sched(|s| *s.kind());
-    let process_pml4 = with_current_sched(|s| s.cr3().map(|c| c.as_ptr()));
+    let addr_space = with_current_sched(|s| s.address_space().cloned());
 
     unsafe { cpu::write_cr3(paging::kernel_cr3()); }
 
@@ -1677,8 +1732,8 @@ pub fn thread_exit(code: i32) -> ! {
                 fd::close_all(&mut data.fds, &mut *vfs::lock(), current_pid());
                 // Clear USER bits from shared page tables before freeing TLS,
                 // so the freed memory doesn't have stale USER PTEs.
-                if let (Some(tls), Some(pml4)) = (data.tls_alloc.as_ref(), process_pml4) {
-                    paging::unmap_user(pml4, PhysAddr::from_ptr(tls.ptr()), tls.size() as u64);
+                if let (Some(tls), Some(addr_space)) = (data.tls_alloc.as_ref(), addr_space.as_ref()) {
+                    addr_space.unmap_user(PhysAddr::from_ptr(tls.ptr()), tls.size() as u64);
                 }
                 data.tls_alloc.take();
             }
@@ -1754,9 +1809,8 @@ pub fn futex_wait(addr: u64, expected: u32, timeout_ns: u64) -> u64 {
     let entry = table.get_mut(pid).unwrap();
 
     // Translate virtual → physical so cross-process futex works on shared memory
-    let pml4 = entry.cr3().map(|r| r.as_ptr() as *const u64)
-        .unwrap_or(paging::kernel_cr3().as_ptr());
-    let phys_addr = match paging::virt_to_phys(pml4, UserAddr::new(addr)) {
+    let phys_addr = match entry.address_space()
+        .and_then(|a| a.virt_to_phys(UserAddr::new(addr))) {
         Some(pa) => pa,
         None => return u64::MAX,
     };
@@ -1776,11 +1830,9 @@ pub fn futex_wake(addr: u64, count: u64) -> u64 {
     let mut guard = PROCESS_TABLE.lock();
     let table = guard.as_mut().unwrap();
     let pid = current_pid();
-    let caller_cr3 = table.get(pid).map(|e| {
-        e.cr3().map(|r| r.as_ptr() as *const u64)
-            .unwrap_or(paging::kernel_cr3().as_ptr())
-    }).unwrap();
-    let caller_phys = match paging::virt_to_phys(caller_cr3, UserAddr::new(addr)) {
+    let caller_phys = match table.get(pid)
+        .and_then(|e| e.address_space())
+        .and_then(|a| a.virt_to_phys(UserAddr::new(addr))) {
         Some(pa) => pa,
         None => return 0,
     };
@@ -1842,11 +1894,13 @@ pub fn handle_page_fault(fault_addr: u64, _error_code: u64) -> bool {
     let pid = current_pid();
     if pid == Pid::MAX { return false; }
 
-    let (data_arc, pml4) = {
+    let (data_arc, addr_space) = {
         let guard = PROCESS_TABLE.lock();
         let Some(table) = guard.as_ref() else { return false };
         let Some(entry) = table.get(pid) else { return false };
-        let Some(cr3) = entry.cr3() else { return false };
+        let Some(addr_space) = entry.address_space() else { return false };
+        if addr_space.is_dead() { return false; }
+        let addr_space = Arc::clone(addr_space);
         let data = match entry.kind() {
             Kind::Thread { parent } => {
                 match table.get(*parent) {
@@ -1856,7 +1910,7 @@ pub fn handle_page_fault(fault_addr: u64, _error_code: u64) -> bool {
             }
             _ => Arc::clone(entry.data()),
         };
-        (data, cr3.as_ptr())
+        (data, addr_space)
     };
 
     let mut data = data_arc.lock();
@@ -1875,7 +1929,7 @@ pub fn handle_page_fault(fault_addr: u64, _error_code: u64) -> bool {
 
     // If a 2MB page is already mapped at this region (from a previous fault
     // in a different VMA that shares the same 2MB range), just return success.
-    if paging::virt_to_phys(pml4 as *const u64, UserAddr::new(region_start)).is_some() {
+    if addr_space.virt_to_phys(UserAddr::new(region_start)).is_some() {
         return true;
     }
 
@@ -1943,7 +1997,7 @@ pub fn handle_page_fault(fault_addr: u64, _error_code: u64) -> bool {
     }
 
     // Map the 2MB page (writable if any overlapping VMA is writable)
-    paging::remap_user_2m(pml4, UserAddr::new(region_start), phys, writable);
+    addr_space.remap_user_2m_rw(UserAddr::new(region_start), phys, writable);
     cpu::flush_tlb();
 
     data.demand_allocs.push(alloc);
@@ -1992,19 +2046,19 @@ pub fn dump_crash_diagnostics(fault_addr: u64, rip: u64) {
     }
 
     // Dump memory around given addresses (if mapped in the process page tables)
-    let pml4 = {
+    let addr_space = {
         let guard = PROCESS_TABLE.lock();
         let Some(table) = guard.as_ref() else { return };
         let Some(entry) = table.get(pid) else { return };
-        entry.cr3().map(|cr3| cr3.as_ptr())
+        entry.address_space().cloned()
     };
-    let Some(pml4) = pml4 else { return };
+    let Some(addr_space) = addr_space else { return };
 
     // Read a u64 from a user virtual address via page table translation.
     // Reads via the kernel direct map (no USER bit) to avoid SMAP faults.
     let read_user = |virt: u64| -> Option<u64> {
         if virt % 8 != 0 { return None; }
-        let phys = paging::virt_to_phys(pml4 as *const u64, UserAddr::new(virt))?;
+        let phys = addr_space.virt_to_phys(UserAddr::new(virt))?;
         Some(unsafe { *phys.as_ptr::<u64>() })
     };
 
@@ -2142,11 +2196,13 @@ pub fn kill_process(target_pid: Pid) -> u64 {
     }
 
     let entry = table.get_mut(target_pid).unwrap();
-    let root = entry.take_cr3();
-    let pml4 = root.as_ptr();
-    shared_memory::cleanup_process(target_pid);
-    crate::pipe::cleanup_pml4(pml4);
-    paging::free_user_page_tables(pml4);
+    let addr_space = entry.take_address_space();
+    if !addr_space.is_dead() {
+        shared_memory::cleanup_process(target_pid);
+        pipe::cleanup_address_space(&addr_space);
+        addr_space.mark_dead();
+    }
+    drop(addr_space);
 
     entry.zombify(137); // 128 + 9 (SIGKILL-like)
     let name = core::str::from_utf8(entry.name()).unwrap_or("?").trim_end_matches('\0');

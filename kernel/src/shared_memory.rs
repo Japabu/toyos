@@ -1,10 +1,11 @@
 use alloc::alloc::{alloc_zeroed, dealloc};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::alloc::Layout;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::arch::paging::{self, PAGE_2M};
-use crate::process::Pid;
+use crate::process::{AddressSpace, Pid};
 use crate::sync::Lock;
 use crate::PhysAddr;
 
@@ -31,17 +32,12 @@ enum Ownership {
     Process { pid: Pid, layout: Layout },
 }
 
-// SAFETY: SharedRegion contains raw PML4 pointers in mapped_in.
-// These are physical memory addresses valid across all CPUs.
-// Access is serialized by the REGIONS lock.
-unsafe impl Send for SharedRegion {}
-
 struct SharedRegion {
     phys_addr: PhysAddr,
     size: u64,
     ownership: Ownership,
-    allowed: Vec<Pid>,                // PIDs allowed to map
-    mapped_in: Vec<(Pid, *mut u64)>,  // (PID, PML4) for processes that have mapped it
+    allowed: Vec<Pid>,
+    mapped_in: Vec<(Pid, Arc<AddressSpace>)>,
 }
 
 static REGIONS: Lock<Option<Vec<(SharedToken, SharedRegion)>>> = Lock::new(None);
@@ -63,14 +59,14 @@ fn next_token() -> SharedToken {
 /// Allocate 2MB-aligned shared memory. Maps it into the owner's page tables.
 /// Returns a token; the owner can retrieve the address via `map()`.
 #[must_use]
-pub fn alloc(size: u64, owner_pid: Pid, owner_pml4: *mut u64) -> SharedToken {
+pub fn alloc(size: u64, owner_pid: Pid, addr_space: &Arc<AddressSpace>) -> SharedToken {
     let aligned_size = paging::align_2m(size as usize);
     let layout = Layout::from_size_align(aligned_size, PAGE_2M as usize).unwrap();
     let ptr = unsafe { alloc_zeroed(layout) };
     assert!(!ptr.is_null(), "shared_memory: allocation failed");
     let phys_addr = PhysAddr::from_ptr(ptr);
 
-    paging::map_user_in(owner_pml4, phys_addr, aligned_size as u64);
+    addr_space.map_user(phys_addr, aligned_size as u64);
 
     let token = next_token();
     with_regions_mut(|regions| {
@@ -79,7 +75,7 @@ pub fn alloc(size: u64, owner_pid: Pid, owner_pml4: *mut u64) -> SharedToken {
             size: aligned_size as u64,
             ownership: Ownership::Process { pid: owner_pid, layout },
             allowed: alloc::vec![owner_pid],
-            mapped_in: alloc::vec![(owner_pid, owner_pml4)],
+            mapped_in: alloc::vec![(owner_pid, Arc::clone(addr_space))],
         }));
     });
 
@@ -109,8 +105,8 @@ pub fn unregister(token: SharedToken) -> Option<(PhysAddr, u64)> {
     with_regions_mut(|regions| {
         let pos = regions.iter().position(|(t, _)| *t == token)?;
         let (_, region) = regions.swap_remove(pos);
-        for &(_, pml4) in &region.mapped_in {
-            paging::unmap_user(pml4, region.phys_addr, region.size);
+        for (_, addr_space) in &region.mapped_in {
+            addr_space.unmap_user(region.phys_addr, region.size);
         }
         Some((region.phys_addr, region.size))
     })
@@ -149,7 +145,7 @@ pub fn grant_kernel(token: SharedToken, target: Pid) -> Result<(), Error> {
 }
 
 /// Map a shared region into the caller's address space.
-pub fn map(token: SharedToken, pid: Pid, pml4: *mut u64) -> Result<u64, Error> {
+pub fn map(token: SharedToken, pid: Pid, addr_space: &Arc<AddressSpace>) -> Result<u64, Error> {
     with_regions_mut(|regions| {
         let (_, region) = regions.iter_mut().find(|(t, _)| *t == token)
             .ok_or(Error::NotFound)?;
@@ -157,8 +153,8 @@ pub fn map(token: SharedToken, pid: Pid, pml4: *mut u64) -> Result<u64, Error> {
             return Err(Error::PermissionDenied);
         }
         if !region.mapped_in.iter().any(|(p, _)| *p == pid) {
-            paging::map_user_in(pml4, region.phys_addr, region.size);
-            region.mapped_in.push((pid, pml4));
+            addr_space.map_user(region.phys_addr, region.size);
+            region.mapped_in.push((pid, Arc::clone(addr_space)));
         }
         Ok(region.phys_addr.raw())
     })
@@ -171,8 +167,8 @@ pub fn release(token: SharedToken, pid: Pid) -> Result<(), Error> {
             .ok_or(Error::NotFound)?;
         region.allowed.retain(|p| *p != pid);
         if let Some(pos) = region.mapped_in.iter().position(|(p, _)| *p == pid) {
-            let (_, pml4) = region.mapped_in.swap_remove(pos);
-            paging::unmap_user(pml4, region.phys_addr, region.size);
+            let (_, addr_space) = region.mapped_in.swap_remove(pos);
+            addr_space.unmap_user(region.phys_addr, region.size);
         }
         Ok(())
     })
@@ -185,8 +181,8 @@ pub fn cleanup_process(pid: Pid) {
         regions.retain_mut(|(_, region)| {
             // Unmap from this process
             if let Some(pos) = region.mapped_in.iter().position(|(p, _)| *p == pid) {
-                let (_, pml4) = region.mapped_in.swap_remove(pos);
-                paging::unmap_user(pml4, region.phys_addr, region.size);
+                let (_, addr_space) = region.mapped_in.swap_remove(pos);
+                addr_space.unmap_user(region.phys_addr, region.size);
             }
             region.allowed.retain(|p| *p != pid);
 

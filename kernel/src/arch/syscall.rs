@@ -631,8 +631,8 @@ fn sys_pipe_map(fd_num: u32) -> u64 {
     let Some(pipe_id) = pipe_id else {
         return SyscallError::InvalidArgument.to_u64();
     };
-    let pml4 = cpu::read_cr3().as_mut_ptr();
-    match pipe::map_into(pipe_id, pml4) {
+    let addr_space = process::current_address_space();
+    match pipe::map_into(pipe_id, &addr_space) {
         Some(addr) => addr,
         None => SyscallError::NotFound.to_u64(),
     }
@@ -869,8 +869,8 @@ fn wake_poll_waiters() {
 
 fn sys_alloc_shared(size: u64) -> u64 {
     let pid = process::current_pid();
-    let pml4 = process::with_current_sched(|s| s.cr3().unwrap().as_ptr());
-    shared_memory::alloc(size, pid, pml4).raw() as u64
+    let addr_space = process::current_address_space();
+    shared_memory::alloc(size, pid, &addr_space).raw() as u64
 }
 
 fn sys_grant_shared(token: u64, target_pid: u64) -> u64 {
@@ -885,8 +885,8 @@ fn sys_grant_shared(token: u64, target_pid: u64) -> u64 {
 
 fn sys_map_shared(token: u64) -> u64 {
     let pid = process::current_pid();
-    let pml4 = process::with_current_sched(|s| s.cr3().unwrap().as_ptr());
-    match shared_memory::map(shared_memory::SharedToken::from_raw(token as u32), pid, pml4) {
+    let addr_space = process::current_address_space();
+    match shared_memory::map(shared_memory::SharedToken::from_raw(token as u32), pid, &addr_space) {
         Ok(addr) => addr,
         Err(shared_memory::Error::NotFound) => SyscallError::NotFound.to_u64(),
         Err(shared_memory::Error::PermissionDenied) => SyscallError::PermissionDenied.to_u64(),
@@ -913,18 +913,17 @@ fn sys_mmap(req_addr: u64, size: u64, _prot: u64, flags: u64) -> u64 {
     if fixed && req_addr != 0 {
         // MAP_FIXED: map the allocated physical memory at the requested virtual address
         let phys_addr = PhysAddr::from_ptr(alloc.ptr());
-        // Get cr3 from SchedEntry (brief table lock)
-        let pml4 = process::with_current_sched(|s| s.cr3().unwrap().as_ptr());
+        let addr_space = process::current_address_space();
         let start = req_addr & !(paging::PAGE_2M - 1);
         let end = (req_addr + aligned as u64 + paging::PAGE_2M - 1) & !(paging::PAGE_2M - 1);
         let mut cur = start;
         let mut offset = 0u64;
         let mut ok = true;
         while cur < end {
-            if !paging::remap_user_2m_in(pml4, UserAddr::new(cur), phys_addr + offset) {
+            if !addr_space.remap_user_2m(UserAddr::new(cur), phys_addr + offset) {
                 let mut undo = start;
                 while undo < cur {
-                    paging::clear_user_2m(pml4, UserAddr::new(undo));
+                    addr_space.clear_user_2m(UserAddr::new(undo));
                     undo += paging::PAGE_2M;
                 }
                 ok = false;
@@ -958,7 +957,7 @@ fn sys_mmap(req_addr: u64, size: u64, _prot: u64, flags: u64) -> u64 {
 }
 
 fn sys_munmap(addr: u64, _size: u64) -> u64 {
-    let pml4 = process::with_current_sched(|s| s.cr3().unwrap().as_ptr());
+    let addr_space = process::current_address_space();
     process::with_current_data(|data| {
         let idx = data.mmap_regions.iter().position(|r| r.addr.raw() == addr);
         if let Some(idx) = idx {
@@ -967,11 +966,11 @@ fn sys_munmap(addr: u64, _size: u64) -> u64 {
                 let mut cur = region.addr.raw();
                 let end = region.addr.raw() + region.size as u64;
                 while cur < end {
-                    paging::clear_user_2m(pml4, UserAddr::new(cur));
+                    addr_space.clear_user_2m(UserAddr::new(cur));
                     cur += paging::PAGE_2M;
                 }
             } else {
-                paging::unmap_user(pml4, PhysAddr::new(region.addr.raw()), region.size as u64);
+                addr_space.unmap_user(PhysAddr::new(region.addr.raw()), region.size as u64);
             }
             0
         } else {
@@ -1195,19 +1194,19 @@ fn sys_dlopen(path: &str) -> u64 {
         }
     };
 
+    let addr_space = process::current_address_space();
     match &lib.memory {
         crate::elf::LibMemory::Owned(alloc) => {
-            paging::map_user(PhysAddr::from_ptr(alloc.ptr()), alloc.size() as u64);
+            addr_space.map_user(PhysAddr::from_ptr(alloc.ptr()), alloc.size() as u64);
         }
         crate::elf::LibMemory::Shared { rw_alloc, cached_addr, cached_size, rw_offset, .. } => {
-            let pml4 = cpu::read_cr3().as_mut_ptr();
             let cached_phys = *cached_addr;
-            paging::map_user_readonly_in(pml4, cached_phys, *cached_size as u64);
+            addr_space.map_user_readonly(cached_phys, *cached_size as u64);
             let num_rw_pages = rw_alloc.size() / paging::PAGE_2M as usize;
             for i in 0..num_rw_pages {
                 let user_virt = cached_phys.raw() + *rw_offset as u64 + i as u64 * paging::PAGE_2M;
                 let phys = PhysAddr::from_ptr(rw_alloc.ptr()) + i as u64 * paging::PAGE_2M;
-                paging::remap_user_2m_in(pml4, UserAddr::new(user_virt), phys);
+                addr_space.remap_user_2m(UserAddr::new(user_virt), phys);
             }
             cpu::flush_tlb();
             apic::tlb_shootdown();

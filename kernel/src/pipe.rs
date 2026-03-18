@@ -1,11 +1,13 @@
 use alloc::alloc::{alloc_zeroed, dealloc};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::alloc::Layout;
 
 use toyos_abi::ring::{RingHeader, RING_READER_CLOSED, RING_WRITER_CLOSED};
 
-use crate::arch::paging::{self, PAGE_2M};
+use crate::arch::paging::PAGE_2M;
 use crate::id_map::{IdKey, IdMap};
+use crate::process::AddressSpace;
 use crate::sync::Lock;
 use crate::PhysAddr;
 
@@ -89,7 +91,7 @@ struct Pipe {
     layout: Layout,
     readers: u32,
     writers: u32,
-    mapped_in: Vec<*mut u64>,
+    mapped_in: Vec<Arc<AddressSpace>>,
 }
 
 unsafe impl Send for Pipe {}
@@ -204,20 +206,20 @@ pub fn has_space(pipe_id: PipeId) -> bool {
     })
 }
 
-pub fn cleanup_pml4(pml4: *mut u64) {
+pub fn cleanup_address_space(addr_space: &Arc<AddressSpace>) {
     with_pipes_mut(|pipes| {
         for (_, pipe) in pipes.iter_mut() {
-            pipe.mapped_in.retain(|p| *p != pml4);
+            pipe.mapped_in.retain(|a| !Arc::ptr_eq(a, addr_space));
         }
     });
 }
 
-pub fn map_into(pipe_id: PipeId, pml4: *mut u64) -> Option<u64> {
+pub fn map_into(pipe_id: PipeId, addr_space: &Arc<AddressSpace>) -> Option<u64> {
     with_pipes_mut(|pipes| {
         let pipe = pipes.get_mut(pipe_id)?;
-        paging::map_user_in(pml4, pipe.phys_addr, PIPE_SIZE as u64);
-        if !pipe.mapped_in.contains(&pml4) {
-            pipe.mapped_in.push(pml4);
+        addr_space.map_user(pipe.phys_addr, PIPE_SIZE as u64);
+        if !pipe.mapped_in.iter().any(|a| Arc::ptr_eq(a, addr_space)) {
+            pipe.mapped_in.push(Arc::clone(addr_space));
         }
         Some(pipe.phys_addr.raw())
     })
@@ -272,8 +274,8 @@ fn close_write(pipe_id: PipeId) {
 }
 
 fn free_pipe(pipe: Pipe) {
-    for &pml4 in &pipe.mapped_in {
-        paging::unmap_user(pml4, pipe.phys_addr, PIPE_SIZE as u64);
+    for addr_space in &pipe.mapped_in {
+        addr_space.unmap_user(pipe.phys_addr, PIPE_SIZE as u64);
     }
     unsafe { dealloc(pipe.phys_addr.as_mut_ptr(), pipe.layout); }
 }

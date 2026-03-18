@@ -42,7 +42,9 @@ fn schedule(cur_state: ProcessState) {
     let cur_pid = percpu::current_pid().expect("schedule() called during idle");
 
     if let Some(entry) = table.get_mut(cur_pid) {
-        entry.set_state(cur_state);
+        if !matches!(entry.state(), ProcessState::Zombie(_)) {
+            entry.set_state(cur_state);
+        }
     } else {
         crate::log!("schedule: warning: cur_pid {cur_pid} not in table, going to idle");
     }
@@ -89,10 +91,9 @@ fn schedule_inner(mut guard: crate::sync::LockGuard<'_, Option<ProcessTable>>) {
         });
         assert!(*new_entry.state() == ProcessState::Ready,
             "scheduling non-Ready pid={new_pid}: {}", new_entry.state().name());
-        assert!(new_entry.cr3().is_some(),
-            "scheduling pid={new_pid} with no page tables");
+        let addr_space = new_entry.address_space().expect("scheduling with no address space");
         let new_rsp = new_entry.kernel_rsp();
-        let new_cr3 = new_entry.cr3().unwrap().phys();
+        let new_cr3 = unsafe { addr_space.cr3_value() };
         let new_fs_base = new_entry.fs_base();
         let new_ks_top = new_entry.kernel_stack_top();
 
@@ -199,10 +200,9 @@ fn cpu_idle_loop() -> ! {
                     let keys: alloc::vec::Vec<Pid> = table.iter().map(|(pid, _)| pid).collect();
                     panic!("idle: pid {new_pid} vanished after scan (keys={keys:?})");
                 });
-                assert!(new_entry.cr3().is_some(),
-                    "idle: scheduling pid={new_pid} with no page tables");
+                let addr_space = new_entry.address_space().expect("idle: scheduling with no address space");
                 let new_rsp = new_entry.kernel_rsp();
-                let new_cr3 = new_entry.cr3().unwrap().phys();
+                let new_cr3 = unsafe { addr_space.cr3_value() };
                 let new_fs_base = new_entry.fs_base();
                 let new_ks_top = new_entry.kernel_stack_top();
 
