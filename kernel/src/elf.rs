@@ -294,8 +294,8 @@ fn clone_from_cache(cached: &CachedLib) -> Option<LoadedLib> {
     let cached_virt = cached.alloc.ptr() as i64;
     let rw_delta = rw_alloc.ptr() as i64 - (cached_virt + cached.rw_offset as i64);
 
-    log!("dlopen: cache hit (shared), {}MB total, {}MB private RW, copy={}ms",
-        cached.alloc_size / (1024*1024), cached.rw_size / (1024*1024),
+    log!("dlopen: cache hit (shared), base={:#x} {}MB total, {}MB private RW, copy={}ms",
+        base.raw(), cached.alloc_size / (1024*1024), cached.rw_size / (1024*1024),
         (t1 - t0) / 1_000_000);
 
     let base_kern = base.to_kernel();
@@ -1069,8 +1069,8 @@ pub fn load_shared_lib(data: &[u8]) -> Result<(LoadedLib, u64, u64), &'static st
     }
 
     let t4 = crate::clock::nanos_since_boot();
-    log!("dlopen: {}MB alloc={}ms zero={}ms copy={}ms reloc={}ms ({} relocs, {} syms)",
-        load_size / (1024*1024),
+    log!("dlopen: base={:#x} {}MB alloc={}ms zero={}ms copy={}ms reloc={}ms ({} relocs, {} syms)",
+        base_phys.raw(), load_size / (1024*1024),
         (t1 - t0) / 1_000_000, (t2 - t1) / 1_000_000, (t3 - t2) / 1_000_000,
         (t4 - t3) / 1_000_000, reloc_count, sym_count);
 
@@ -1197,10 +1197,13 @@ pub struct TlsModule {
     pub filesz: usize,
     /// Total TLS size including BSS (zeroed beyond filesz).
     pub memsz: usize,
-    /// Byte offset of this module within the combined TLS block.
+    /// Byte offset of this module within the combined TLS block (static modules only).
     pub base_offset: usize,
     /// DTV module ID (1-based). Used by __tls_get_addr to index the DTV.
     pub module_id: u64,
+    /// True for modules loaded at process startup (in the static TLS block).
+    /// False for dlopen'd modules (TLS allocated on demand via SYS_TLS_ALLOC_BLOCK).
+    pub is_static: bool,
 }
 
 /// TLS layout info for cross-library TPOFF resolution.

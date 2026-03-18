@@ -367,6 +367,8 @@ pub struct ProcessData {
     pub tls_max_align: usize,
     /// Next module ID to assign on dlopen (1-based, exe=1).
     pub next_tls_module_id: u64,
+    /// Dynamically allocated TLS blocks for dlopen'd modules (keyed by module_id).
+    pub dynamic_tls_blocks: alloc::collections::BTreeMap<u64, OwnedAlloc>,
     // Crash diagnostics
     pub symbols: ProcessSymbols,
     // Dynamically loaded shared libraries (indexed by dlopen handle)
@@ -594,7 +596,7 @@ pub fn with_fd_owner_data<R>(f: impl FnOnce(&mut ProcessData) -> R) -> R {
 ///                              ^-- FS base (thread pointer)
 /// Returns (alloc, fs_base).
 pub fn setup_tls(tls_template: KernelAddr, tls_filesz: usize, tls_memsz: usize, tls_align: usize) -> Option<(OwnedAlloc, u64)> {
-    setup_combined_tls(&[elf::TlsModule { template: tls_template, filesz: tls_filesz, memsz: tls_memsz, base_offset: 0, module_id: 1 }], tls_memsz, tls_align)
+    setup_combined_tls(&[elf::TlsModule { template: tls_template, filesz: tls_filesz, memsz: tls_memsz, base_offset: 0, module_id: 1, is_static: true }], tls_memsz, tls_align)
 }
 
 /// Allocate a combined TLS area for multiple modules (exe + shared libraries).
@@ -620,13 +622,12 @@ pub fn setup_tls(tls_template: KernelAddr, tls_filesz: usize, tls_memsz: usize, 
 ///   [0x18] entries[1]: u64 (pointer for module_id=2)
 ///   ...
 const TCB_SIZE: usize = 64;
-const TLS_DLOPEN_RESERVE: usize = 64 * 1024;
 /// Initial DTV capacity (number of module entries).
 const DTV_INITIAL_CAPACITY: usize = 64;
 /// Header size: generation (8) + len (8).
 const DTV_HEADER_SIZE: usize = 16;
 /// Sentinel value for unallocated DTV entries.
-pub const DTV_UNALLOCATED: u64 = !0u64;
+const DTV_UNALLOCATED: u64 = !0u64;
 
 pub fn setup_combined_tls(
     modules: &[crate::elf::TlsModule],
@@ -634,11 +635,11 @@ pub fn setup_combined_tls(
     tls_align: usize,
 ) -> Option<(OwnedAlloc, u64)> {
     let block_size = total_memsz + TCB_SIZE;
-    let alloc_size = paging::align_2m(block_size + tls_align + TLS_DLOPEN_RESERVE);
+    let alloc_size = paging::align_2m(block_size + tls_align);
     let alloc = OwnedAlloc::new_uninit(alloc_size, PAGE_2M as usize)?;
     let block = alloc.ptr();
 
-    // Place TLS data near the END of the allocation so dlopen can extend downward.
+    // Place TLS data near the end of the allocation (DTV at start, TLS after).
     // Align tls_start so that data_start (= block + tls_start) has tls_align alignment.
     let align = if tls_align > 1 { tls_align } else { 8 };
     let tls_start = (alloc_size - block_size) & !(align - 1);
@@ -647,6 +648,7 @@ pub fn setup_combined_tls(
     unsafe { core::ptr::write_bytes(block.add(tls_start), 0, block_size); }
 
     for module in modules {
+        if !module.is_static { continue; }
         if module.filesz > 0 && !module.template.is_null() {
             unsafe {
                 core::ptr::copy_nonoverlapping(
@@ -679,8 +681,10 @@ pub fn setup_combined_tls(
         for i in 0..DTV_INITIAL_CAPACITY {
             *dtv_kern.add(2 + i) = DTV_UNALLOCATED;
         }
-        // Fill entries for static modules: dtv[module_id - 1] = user addr of module's TLS data
+        // Fill entries for static modules only: dtv[module_id - 1] = user addr of module's TLS data.
+        // Dynamic modules (dlopen'd) stay DTV_UNALLOCATED — allocated on first access.
         for module in modules {
+            if !module.is_static { continue; }
             let idx = module.module_id as usize;
             if idx > 0 && idx <= DTV_INITIAL_CAPACITY {
                 let module_tls_addr = block_phys + (tls_start + module.base_offset) as u64;
@@ -832,6 +836,7 @@ pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64, stack_base: u64) -> Op
         tls_total_memsz,
         tls_max_align,
         next_tls_module_id: 2,
+        dynamic_tls_blocks: alloc::collections::BTreeMap::new(),
         symbols: ProcessSymbols::empty(),
         loaded_libs: Vec::new(),
         mmap_regions: Vec::new(),
@@ -1038,6 +1043,7 @@ fn build_tls_layout(
             modules.push(elf::TlsModule {
                 template: lib.tls_template, filesz: lib.tls_filesz,
                 memsz: lib.tls_memsz, base_offset: cursor, module_id: mid,
+                is_static: true,
             });
             cursor += lib.tls_memsz;
             if lib.tls_align > max_align { max_align = lib.tls_align; }
@@ -1052,6 +1058,7 @@ fn build_tls_layout(
         modules.push(elf::TlsModule {
             template: template_addr, filesz: layout.tls_filesz,
             memsz: layout.tls_memsz, base_offset: cursor, module_id: 1,
+            is_static: true,
         });
         cursor += layout.tls_memsz;
         if layout.tls_align > max_align { max_align = layout.tls_align; }
@@ -1187,8 +1194,8 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
             match elf::load_shared_lib(&so_data) {
                 Ok((lib, rw_vaddr, rw_end_vaddr)) => {
                     let t_load2 = crate::clock::nanos_since_boot();
-                    log!("dynamic: loaded {} ({} syms, read={}ms load={}ms)",
-                        lib_name, lib.sym_count,
+                    log!("dynamic: loaded {} base={:#x} ({} syms, read={}ms load={}ms)",
+                        lib_name, lib.base.raw(), lib.sym_count,
                         (t_load1 - t_load0) / 1_000_000, (t_load2 - t_load1) / 1_000_000);
                     let lib = elf::cache_loaded_lib_pub(&lib_path, lib, rw_vaddr, rw_end_vaddr);
                     libs.push(lib);
@@ -1327,14 +1334,19 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
     let (tls_modules, tls_total_memsz, max_tls_align, next_tls_module_id) =
         build_tls_layout(&loaded_libs, &layout, exe_tls_template.as_ref());
 
-    // Apply TPOFF relocations for shared libraries
+    // Apply TLS relocations for shared libraries loaded at startup.
     let tls_info = elf::TlsModuleInfo { libs: &loaded_libs, modules: &tls_modules };
     for lib in &loaded_libs {
-        let lib_base_offset = tls_modules.iter()
-            .find(|m| m.template == lib.tls_template)
-            .map(|m| m.base_offset)
-            .unwrap_or(0);
+        // Match by template pointer — unique per lib since each points into a distinct ELF mapping.
+        // Libs without TLS (tls_memsz=0) have null template and won't match any module.
+        let module = tls_modules.iter().find(|m| m.template == lib.tls_template);
+        let lib_base_offset = module.map(|m| m.base_offset).unwrap_or(0);
+        // IE model: TPOFF refs to static-block TLS (static modules and cross-module refs)
         elf::apply_tpoff_relocs(lib, lib_base_offset, tls_total_memsz, &tls_info);
+        // GD model: DTPMOD64/DTPOFF64 for this lib's own TLS (DTV-based dynamic access)
+        if let Some(m) = module {
+            elf::apply_dtpmod_relocs(lib, m.module_id);
+        }
     }
     // Resolve exe TPOFF relocations → add pre-computed values to reloc index
     {
@@ -1469,6 +1481,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
         tls_total_memsz,
         tls_max_align: max_tls_align,
         next_tls_module_id,
+        dynamic_tls_blocks: alloc::collections::BTreeMap::new(),
         symbols: syms,
         loaded_libs,
         mmap_regions: Vec::new(),

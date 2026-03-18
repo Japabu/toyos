@@ -68,4 +68,5 @@ toyos_rust_tests!(
     std_sync,
     std_threading,
     std_tls,
+    std_tls_dlopen,
 );

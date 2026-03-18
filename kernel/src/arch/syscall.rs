@@ -393,6 +393,7 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             let Some(name) = ctx.user_str(UserAddr::new(a1), a2) else { return bad_addr };
             sys_connect(name)
         }
+        SYS_TLS_ALLOC_BLOCK => sys_tls_alloc_block(a1),
         _ => SyscallError::InvalidArgument.to_u64(),
     }
 }
@@ -1215,145 +1216,106 @@ fn sys_dlopen(path: &str) -> u64 {
 
     let lib_has_tls = lib.tls_memsz > 0;
 
-    // Phase 1: resolve relocations (ProcessData lock)
+    // Resolve relocations and apply DTV relocs (ProcessData lock)
     let data_arc = process::fd_owner_data();
-    let (new_total, modules, _module_id) = {
+    {
         let mut data = data_arc.lock();
         crate::elf::resolve_dlopen_relocs(&lib, &data.loaded_libs);
 
-        // Assign module ID for DTV
-        let module_id = if lib_has_tls {
-            let mid = data.next_tls_module_id;
-            data.next_tls_module_id += 1;
-            mid
-        } else {
-            0
-        };
-
-        if lib_has_tls {
-            let new_memsz = lib.tls_memsz;
-            for module in data.tls_modules.iter_mut() {
-                module.base_offset += new_memsz;
-            }
-            data.tls_modules.insert(0, crate::elf::TlsModule {
-                template: lib.tls_template, filesz: lib.tls_filesz,
-                memsz: lib.tls_memsz, base_offset: 0, module_id,
-            });
-            let raw_total = data.tls_modules.iter()
-                .map(|m| m.base_offset + m.memsz)
-                .max().unwrap_or(0);
-            data.tls_total_memsz = raw_total;
-            if lib.tls_align > data.tls_max_align {
-                data.tls_max_align = lib.tls_align;
-            }
-        }
-
+        // Apply TPOFF relocs for cross-module IE references (symbols from static-linked modules
+        // like std/core whose TLS lives in the static block with known TP-relative offsets).
         if data.tls_total_memsz > 0 {
             let tls_info = crate::elf::TlsModuleInfo {
                 libs: &data.loaded_libs,
                 modules: &data.tls_modules,
             };
-            let lib_base_offset = if lib_has_tls { 0 } else { 0 };
-            crate::elf::apply_tpoff_relocs(&lib, lib_base_offset, data.tls_total_memsz, &tls_info);
+            crate::elf::apply_tpoff_relocs(&lib, 0, data.tls_total_memsz, &tls_info);
         }
 
-        // Apply DTPMOD64/DTPOFF64 relocations (write module_id + offset into GOT slot pairs)
         if lib_has_tls {
+            let module_id = data.next_tls_module_id;
+            data.next_tls_module_id += 1;
+            data.tls_modules.push(crate::elf::TlsModule {
+                template: lib.tls_template, filesz: lib.tls_filesz,
+                memsz: lib.tls_memsz, base_offset: 0, module_id,
+                is_static: false,
+            });
+            // Apply DTPMOD64/DTPOFF64: write module_id + per-symbol offset into GOT slot pairs.
+            // DTV entries are left DTV_UNALLOCATED; __tls_get_addr allocates on first access.
             crate::elf::apply_dtpmod_relocs(&lib, module_id);
-        }
-
-        (data.tls_total_memsz, data.tls_modules.clone(), module_id)
-    };
-
-    // Phase 2: extend TLS in-place for ALL threads of this process.
-    if lib_has_tls {
-        let cur_pid = process::current_pid();
-
-        // Collect all pids sharing this address space (brief table lock)
-        let pids_to_update: Vec<(process::Pid, Arc<Lock<process::ProcessData>>)> = {
-            let guard = process::PROCESS_TABLE.lock();
-            let table = guard.as_ref().unwrap();
-            let entry = table.get(cur_pid).expect("current process");
-            let owner_pid = entry.heap_owner();
-            table.iter()
-                .filter(|(_, e)| e.heap_owner() == owner_pid)
-                .map(|(pid, e)| (pid, Arc::clone(e.data())))
-                .collect()
-        };
-
-        for (pid, pid_data_arc) in &pids_to_update {
-            let (tp, alloc_start) = if *pid == cur_pid {
-                let tp = crate::arch::read_fs_base();
-                let data = pid_data_arc.lock();
-                let start = data.tls_alloc.as_ref().map(|a| a.ptr() as u64).unwrap_or(0);
-                (tp, start)
-            } else {
-                // For other threads: get fs_base from SchedEntry, tls_alloc from ProcessData
-                let fs_base = {
-                    let guard = process::PROCESS_TABLE.lock();
-                    let table = guard.as_ref().unwrap();
-                    table.get(*pid).map(|e| e.fs_base()).unwrap_or(0)
-                };
-                let data = pid_data_arc.lock();
-                let start = data.tls_alloc.as_ref().map(|a| a.ptr() as u64).unwrap_or(0);
-                (fs_base, start)
-            };
-
-            if tp == 0 || alloc_start == 0 { continue; }
-
-            let new_tls_start = tp - new_total as u64;
-            if new_tls_start < alloc_start {
-                log!("dlopen: TLS overflow for pid={} (need {:#x}, alloc starts {:#x})",
-                    pid, new_tls_start, alloc_start);
-                return SyscallError::ResourceExhausted.to_u64();
-            }
-
-            let m = &modules[0];
-            let dest = (new_tls_start + m.base_offset as u64) as *mut u8;
-            if m.filesz > 0 && !m.template.is_null() {
-                unsafe {
-                    core::ptr::copy_nonoverlapping(m.template.as_ptr::<u8>(), dest, m.filesz);
-                }
-            }
-
-            // Update DTV entry for the new module.
-            // The DTV is at the start of the TLS allocation (user-visible physical address).
-            // DTV layout: [generation: u64][len: u64][entries[0]: u64]...
-            // Entry index = module_id - 1
-            let dtv_user = alloc_start; // DTV is at offset 0 of TLS allocation
-            let dtv_kern = PhysAddr::new(dtv_user).to_kernel().raw() as *mut u64;
-            let dtv_idx = _module_id as usize - 1;
-            let dtv_len = unsafe { *dtv_kern.add(1) } as usize;
-            if dtv_idx < dtv_len {
-                // Point DTV entry to the module's TLS data in the static block
-                let module_tls_phys = new_tls_start + m.base_offset as u64;
-                // Convert to physical address (new_tls_start is already physical)
-                unsafe { *dtv_kern.add(2 + dtv_idx) = module_tls_phys; }
-
-                // Also update DTV entries for all shifted modules (their base_offsets changed)
-                for module in &modules[1..] {
-                    let idx = module.module_id as usize - 1;
-                    if idx < dtv_len {
-                        let phys = new_tls_start + module.base_offset as u64;
-                        unsafe { *dtv_kern.add(2 + idx) = phys; }
-                    }
-                }
-            }
-
-            // Update ProcessData bookkeeping
-            {
-                let mut data = pid_data_arc.lock();
-                data.tls_total_memsz = new_total;
-                data.tls_modules = modules.clone();
-            }
         }
     }
 
-    // Phase 3: store the lib in the owner process
+    // Dump DTV for debugging
+    if lib_has_tls {
+        let tp = PhysAddr::new(crate::arch::read_fs_base()).to_kernel().raw() as *const u64;
+        let dtv_ptr = unsafe { *tp.add(1) };
+        if dtv_ptr != 0 {
+            let dtv = PhysAddr::new(dtv_ptr).to_kernel().raw() as *const u64;
+            let mid = data_arc.lock().next_tls_module_id - 1; // just assigned
+            let idx = mid as usize - 1;
+            let val = unsafe { *dtv.add(2 + idx) };
+            log!("dlopen: pid={} DTV[{}]={:#x} (UNALLOC={})",
+                process::current_pid().0, mid, val, val == !0u64);
+        }
+    }
+
+    // Store the lib in the owner process
     let mut data = data_arc.lock();
     let idx = data.loaded_libs.len();
     data.loaded_libs.push(lib);
     idx as u64
+}
+
+/// Allocate a TLS block for the current thread's DTV entry for `module_id`.
+/// Called by __tls_get_addr slow path when the DTV entry is DTV_UNALLOCATED.
+/// Returns the physical address of the allocated TLS block (stored in DTV and returned to caller).
+fn sys_tls_alloc_block(module_id: u64) -> u64 {
+    if module_id == 0 {
+        panic!("sys_tls_alloc_block: invalid module_id=0");
+    }
+
+    // Read module info from the process-level data (shared across threads via heap owner).
+    let owner_arc = process::fd_owner_data();
+    let (tls_memsz, tls_filesz, tls_template) = {
+        let data = owner_arc.lock();
+        let m = data.tls_modules.iter().find(|m| m.module_id == module_id)
+            .unwrap_or_else(|| panic!("sys_tls_alloc_block: module_id={} not found", module_id));
+        (m.memsz, m.filesz, m.template)
+    };
+
+    // Allocate TLS block
+    let alloc = process::OwnedAlloc::new(tls_memsz.max(1), 16)
+        .unwrap_or_else(|| panic!("sys_tls_alloc_block: failed to allocate {} bytes", tls_memsz));
+    let block_ptr = alloc.ptr();
+    let block_phys = PhysAddr::from_ptr(block_ptr).raw();
+
+    // Initialize: copy template, zero BSS
+    unsafe {
+        core::ptr::write_bytes(block_ptr, 0, tls_memsz);
+        if tls_filesz > 0 && !tls_template.is_null() {
+            core::ptr::copy_nonoverlapping(tls_template.as_ptr::<u8>(), block_ptr, tls_filesz);
+        }
+    }
+
+    // Map into current process's page tables
+    paging::map_user(PhysAddr::from_ptr(block_ptr), tls_memsz as u64);
+
+    // Store in THIS THREAD's ProcessData (each thread owns its own TLS blocks).
+    process::with_current_data(|data| {
+        data.dynamic_tls_blocks.insert(module_id, alloc);
+    });
+
+    // Write block address into current thread's DTV.
+    // fs_base = TP (user-visible physical address). TCB[8] = DTV pointer.
+    let tp = PhysAddr::new(crate::arch::read_fs_base()).to_kernel().raw() as *const u64;
+    let dtv_ptr = unsafe { *tp.add(1) }; // TCB[8]
+    assert!(dtv_ptr != 0, "sys_tls_alloc_block: no DTV for module_id={}", module_id);
+    let dtv_kern = PhysAddr::new(dtv_ptr).to_kernel().raw() as *mut u64;
+    let dtv_len = unsafe { *dtv_kern.add(1) } as u64;
+    assert!(module_id <= dtv_len, "sys_tls_alloc_block: module_id={} exceeds DTV len={}", module_id, dtv_len);
+    unsafe { *dtv_kern.add(2 + (module_id - 1) as usize) = block_phys; }
+    block_phys
 }
 
 fn sys_dlsym(handle: u64, name: &str) -> u64 {

@@ -307,14 +307,21 @@ impl Drop for QemuInstance {
     }
 }
 
-/// Build the kernel for test mode.
+/// Build the kernel. Uses the `toyos` toolchain (linked by the main build system).
 fn build_kernel(repo: &Path) {
-    let toyos_ld = build_toyos_ld(repo);
+    let host = host_triple();
+    let sysroot_bin = repo.join(format!("rust/build/{host}/stage2/lib/rustlib/{host}/bin"));
+    let path_env = match std::env::var("PATH") {
+        Ok(p) => format!("{}:{p}", sysroot_bin.display()),
+        Err(_) => sysroot_bin.display().to_string(),
+    };
     assert!(
         Command::new("cargo")
-            .args(["build"])
+            .args(["build", "--target", "x86_64-unknown-none"])
             .current_dir(repo.join("kernel"))
-            .env("CARGO_TARGET_X86_64_UNKNOWN_NONE_LINKER", toyos_ld.to_str().unwrap())
+            .env("RUSTUP_TOOLCHAIN", "toyos")
+            .env("PATH", &path_env)
+            .env_remove("RUSTC")
             .status()
             .expect("Failed to run cargo")
             .success(),
@@ -324,13 +331,20 @@ fn build_kernel(repo: &Path) {
 
 /// Build the bootloader with test-runner as init.
 fn build_bootloader(repo: &Path) {
-    let toyos_ld = build_toyos_ld(repo);
+    let host = host_triple();
+    let sysroot_bin = repo.join(format!("rust/build/{host}/stage2/lib/rustlib/{host}/bin"));
+    let path_env = match std::env::var("PATH") {
+        Ok(p) => format!("{}:{p}", sysroot_bin.display()),
+        Err(_) => sysroot_bin.display().to_string(),
+    };
     assert!(
         Command::new("cargo")
-            .args(["build"])
+            .args(["build", "--target", "x86_64-unknown-uefi"])
             .current_dir(repo.join("bootloader"))
-            .env("CARGO_TARGET_X86_64_UNKNOWN_UEFI_LINKER", toyos_ld.to_str().unwrap())
+            .env("RUSTUP_TOOLCHAIN", "toyos")
+            .env("PATH", &path_env)
             .env("INIT_PROGRAMS", "/bin/test-runner")
+            .env_remove("RUSTC")
             .status()
             .expect("Failed to run cargo")
             .success(),
@@ -357,8 +371,9 @@ fn build_toyos_ld(repo: &Path) -> PathBuf {
             .success(),
         "Failed to build toyos-ld"
     );
-    let path = toyos_ld_dir
-        .join(format!("target/{host}/release/toyos-ld"))
+    // toyos-ld is part of the userland workspace, so the binary ends up in the
+    // workspace target dir, not the crate-local target dir.
+    let path = repo.join(format!("userland/target/{host}/release/toyos-ld"))
         .canonicalize()
         .expect("toyos-ld binary not found after build");
     *cache = Some(path.clone());
@@ -488,42 +503,25 @@ pub fn build_toyos_bins(crate_path: &Path) -> Vec<(String, Vec<u8>)> {
     results
 }
 
-/// Create a TyFS initrd image from files and symlinks.
+/// Create a bcachefs initrd image from files and symlinks.
 fn create_initrd(files: &[(String, Vec<u8>)], symlinks: &[(String, String)]) -> Vec<u8> {
-    use tyfs::SimpleFs;
-
-    struct VecDisk { data: Vec<u8> }
-    impl tyfs::Disk for VecDisk {
-        fn read(&mut self, offset: u64, buf: &mut [u8]) {
-            let off = offset as usize;
-            buf.copy_from_slice(&self.data[off..off + buf.len()]);
-        }
-        fn write(&mut self, offset: u64, buf: &[u8]) {
-            let off = offset as usize;
-            self.data[off..off + buf.len()].copy_from_slice(buf);
-        }
-        fn flush(&mut self) {}
-    }
-
     let data_size: usize = files.iter().map(|(name, d)| name.len() + d.len()).sum::<usize>()
         + symlinks.iter().map(|(name, target)| name.len() + target.len()).sum::<usize>();
-    let toc_size = (files.len() + symlinks.len()) * 64;
-    let size = (64 + data_size + toc_size + 4095) & !4095;
-    let size = size.max(4096);
-
-    let disk = VecDisk { data: vec![0u8; size] };
-    let mut tyfs = SimpleFs::format(disk, size as u64);
+    // bcachefs needs enough blocks: 4KB per block, generous sizing for btree overhead
+    let n_blocks = ((data_size + files.len() * 4096 + symlinks.len() * 4096 + 256 * 1024) / 4096).max(128);
+    let io = bcachefs::VecBlockIO::new(n_blocks as u64);
+    let mut fs = bcachefs::Formatted::format(io);
 
     for (name, data) in files {
-        tyfs.create(name, data, 0)
+        fs.create(name, data, 0)
             .unwrap_or_else(|e| panic!("failed to add '{name}' to test initrd: {e:?}"));
     }
     for (name, target) in symlinks {
-        tyfs.create_symlink(name, target)
+        fs.create_symlink(name, target, 0)
             .unwrap_or_else(|e| panic!("failed to add symlink '{name}' -> '{target}' to test initrd: {e:?}"));
     }
 
-    tyfs.into_disk().data
+    fs.into_io().into_vec()
 }
 
 /// Create a FAT32 ESP volume.

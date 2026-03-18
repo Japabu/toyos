@@ -78,6 +78,9 @@ pub const SYS_GPU_SET_RESOLUTION: u64 = 83;
 pub const SYS_LISTEN: u64 = 85;
 pub const SYS_ACCEPT: u64 = 86;
 pub const SYS_CONNECT: u64 = 87;
+/// Allocate a TLS block for a dlopen'd module on the current thread.
+/// Arg0: module_id (1-based DTV index). Returns physical address of allocated block.
+pub const SYS_TLS_ALLOC_BLOCK: u64 = 88;
 
 pub const WNOHANG: u64 = 1;
 
@@ -929,4 +932,11 @@ pub fn audio_submit(buf_idx: u32, len: u32) {
 /// Returns a bitmask where bit N is set if buffer N has been consumed and is reusable.
 pub fn audio_poll() -> u32 {
     syscall(SYS_AUDIO_POLL, 0, 0, 0, 0) as u32
+}
+
+/// Allocate a TLS block for a dlopen'd module on the current thread.
+/// Returns the physical address of the allocated block (as stored in the DTV).
+/// Panics in the kernel if module_id is invalid or allocation fails.
+pub fn tls_alloc_block(module_id: u64) -> u64 {
+    syscall(SYS_TLS_ALLOC_BLOCK, module_id, 0, 0, 0)
 }

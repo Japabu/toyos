@@ -754,14 +754,11 @@ pub(crate) fn emit_elf(
             needed_str_ids.push(w.add_dynamic_string(lib.as_bytes()));
         }
         if let Some(relocs) = relocs {
-            for (_, sym_name) in &relocs.glob_dats {
-                if !sym_to_writer_idx.contains_key(sym_name) {
-                    let str_id = w.add_dynamic_string(sym_name.as_bytes());
-                    import_str_ids.push((sym_name.clone(), str_id));
-                    sym_to_writer_idx.insert(sym_name.clone(), SymbolIndex(0));
-                }
-            }
-            for (_, sym_name) in &relocs.named_tpoff64s {
+            for (_, sym_name) in relocs.glob_dats.iter()
+                .chain(relocs.named_tpoff64s.iter())
+                .chain(relocs.named_dtpmod64s.iter())
+                .chain(relocs.named_dtpoff64s.iter())
+            {
                 if !sym_to_writer_idx.contains_key(sym_name) {
                     let str_id = w.add_dynamic_string(sym_name.as_bytes());
                     import_str_ids.push((sym_name.clone(), str_id));
@@ -790,16 +787,13 @@ pub(crate) fn emit_elf(
             let hash = gnu_hash(name.as_bytes());
             export_str_ids.push((name.to_string(), str_id, st_value, hash, is_tls));
         }
-        // Add undefined (imported) symbols that have GLOB_DAT or named TPOFF64 entries
+        // Add undefined (imported) symbols that have dynamic relocations
         if let Some(relocs) = relocs {
-            for (_, sym_name) in &relocs.glob_dats {
-                if !sym_to_writer_idx.contains_key(sym_name) {
-                    let str_id = w.add_dynamic_string(sym_name.as_bytes());
-                    shared_import_str_ids.push((sym_name.clone(), str_id));
-                    sym_to_writer_idx.insert(sym_name.clone(), SymbolIndex(0)); // placeholder
-                }
-            }
-            for (_, sym_name) in &relocs.named_tpoff64s {
+            for (_, sym_name) in relocs.glob_dats.iter()
+                .chain(relocs.named_tpoff64s.iter())
+                .chain(relocs.named_dtpmod64s.iter())
+                .chain(relocs.named_dtpoff64s.iter())
+            {
                 if !sym_to_writer_idx.contains_key(sym_name) {
                     let str_id = w.add_dynamic_string(sym_name.as_bytes());
                     shared_import_str_ids.push((sym_name.clone(), str_id));
