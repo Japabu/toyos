@@ -15,7 +15,7 @@ use crate::{elf, pipe, scheduler, shared_memory, vfs};
 use crate::{KernelAddr, PhysAddr, UserAddr};
 
 pub use toyos_abi::Pid;
-use toyos_abi::syscall::SyscallError;
+use toyos_abi::syscall::{SyscallError, POLL_FD_MASK, POLL_READABLE, POLL_WRITABLE};
 
 impl crate::id_map::IdKey for Pid {
     const ZERO: Self = Pid(0);
@@ -401,6 +401,10 @@ pub struct ProcessData {
 
     pub poll_fds: [u64; 64],
     pub poll_len: u32,
+    pub poll_read_pipes: [pipe::PipeId; 64],
+    pub poll_read_pipe_count: u32,
+    pub poll_write_pipes: [pipe::PipeId; 64],
+    pub poll_write_pipe_count: u32,
     pub elf_alloc: Option<OwnedAlloc>,
     pub stack_alloc: Option<OwnedAlloc>,
     // Thread-local storage
@@ -878,6 +882,10 @@ pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64, stack_base: u64) -> Op
 
         poll_fds: [0; 64],
         poll_len: 0,
+        poll_read_pipes: [pipe::PipeId::from_raw(0); 64],
+        poll_read_pipe_count: 0,
+        poll_write_pipes: [pipe::PipeId::from_raw(0); 64],
+        poll_write_pipe_count: 0,
         cwd: parent_cwd,
         elf_alloc: None,
         stack_alloc: None,
@@ -1518,6 +1526,10 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
 
         poll_fds: [0; 64],
         poll_len: 0,
+        poll_read_pipes: [pipe::PipeId::from_raw(0); 64],
+        poll_read_pipe_count: 0,
+        poll_write_pipes: [pipe::PipeId::from_raw(0); 64],
+        poll_write_pipe_count: 0,
         elf_alloc: exe_tls_template, // TLS template allocation (if any)
         stack_alloc: Some(stack_alloc),
         tls_template,
@@ -1786,6 +1798,40 @@ pub fn block_poll(fds: [u64; 64], len: u32, deadline: u64) {
         let mut data = data_arc.lock();
         data.poll_fds = fds;
         data.poll_len = len;
+
+        // Resolve poll FDs to pipe IDs for targeted wakeups.
+        let mut rcount = 0u32;
+        let mut wcount = 0u32;
+        for i in 0..len as usize {
+            let entry = fds[i];
+            let fd_num = (entry & POLL_FD_MASK) as u32;
+            let want_write = entry & POLL_WRITABLE != 0;
+            let want_read = entry & POLL_READABLE != 0 || !want_write;
+            let read_pipe = if want_read {
+                data.fds.get(fd_num).and_then(|d| d.pipe_id_read())
+            } else {
+                None
+            };
+            let write_pipe = if want_write {
+                data.fds.get(fd_num).and_then(|d| d.pipe_id_write())
+            } else {
+                None
+            };
+            if let Some(id) = read_pipe {
+                if !data.poll_read_pipes[..rcount as usize].contains(&id) {
+                    data.poll_read_pipes[rcount as usize] = id;
+                    rcount += 1;
+                }
+            }
+            if let Some(id) = write_pipe {
+                if !data.poll_write_pipes[..wcount as usize].contains(&id) {
+                    data.poll_write_pipes[wcount as usize] = id;
+                    wcount += 1;
+                }
+            }
+        }
+        data.poll_read_pipe_count = rcount;
+        data.poll_write_pipe_count = wcount;
     }
     scheduler::block(ProcessState::BlockedPoll { deadline });
 }

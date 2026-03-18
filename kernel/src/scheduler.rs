@@ -1,5 +1,4 @@
 use core::arch::{asm, naked_asm};
-
 use crate::arch::{cpu, paging, percpu};
 use crate::process::{IdleProof, Pid, ProcessState, ProcessTable, PROCESS_TABLE};
 use crate::keyboard;
@@ -297,7 +296,7 @@ fn idle_poll(table: &mut ProcessTable) {
 }
 
 /// Wake processes blocked on reading from a pipe that now has data.
-/// Uses spurious wakeups for BlockedPoll — the poll syscall will recheck.
+/// For BlockedPoll, only wakes processes whose poll_fds actually reference this pipe.
 pub fn wake_pipe_readers(pipe_id: crate::pipe::PipeId) {
     let mut guard = PROCESS_TABLE.lock();
     let table = guard.as_mut().unwrap();
@@ -307,8 +306,13 @@ pub fn wake_pipe_readers(pipe_id: crate::pipe::PipeId) {
                 entry.set_state(ProcessState::Ready);
             }
             ProcessState::BlockedPoll { .. } => {
-                // Spurious wakeup — poll syscall will recheck FD readiness.
-                entry.set_state(ProcessState::Ready);
+                let data = entry.data().lock();
+                let dominated = data.poll_read_pipes[..data.poll_read_pipe_count as usize]
+                    .contains(&pipe_id);
+                drop(data);
+                if dominated {
+                    entry.set_state(ProcessState::Ready);
+                }
             }
             _ => {}
         }
@@ -316,7 +320,7 @@ pub fn wake_pipe_readers(pipe_id: crate::pipe::PipeId) {
 }
 
 /// Wake processes blocked on writing to a pipe that now has space.
-/// Uses spurious wakeups for BlockedPoll — the poll syscall will recheck.
+/// For BlockedPoll, only wakes processes whose poll_fds actually reference this pipe.
 pub fn wake_pipe_writers(pipe_id: crate::pipe::PipeId) {
     let mut guard = PROCESS_TABLE.lock();
     let table = guard.as_mut().unwrap();
@@ -326,8 +330,13 @@ pub fn wake_pipe_writers(pipe_id: crate::pipe::PipeId) {
                 entry.set_state(ProcessState::Ready);
             }
             ProcessState::BlockedPoll { .. } => {
-                // Spurious wakeup — poll syscall will recheck FD readiness.
-                entry.set_state(ProcessState::Ready);
+                let data = entry.data().lock();
+                let dominated = data.poll_write_pipes[..data.poll_write_pipe_count as usize]
+                    .contains(&pipe_id);
+                drop(data);
+                if dominated {
+                    entry.set_state(ProcessState::Ready);
+                }
             }
             _ => {}
         }
