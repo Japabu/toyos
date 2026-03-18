@@ -169,20 +169,28 @@ pub fn write_argv_to_stack(stack_top: u64, args: &[&str]) -> u64 {
     sp
 }
 
-/// Thread table state. The scheduler owns the actual scheduling state
-/// (ready/running/blocked). The thread table only tracks alive vs zombie.
+/// Where a thread is in the system. Stored in the thread table (SchedEntry).
+///
+/// The thread table tracks alive vs zombie. For alive threads, the scheduler
+/// is authoritative about whether they're running, ready, or blocked —
+/// query `scheduler::thread_sched_state()` for that detail.
+///
+/// A thread is ready iff it is in a CpuRunQueue. This is enforced structurally
+/// in the scheduler — there is no way to represent "ready but not in a queue."
 #[derive(Clone, Copy, PartialEq)]
-pub enum ProcessState {
-    /// Thread is alive (running, ready, or blocked — scheduler knows which).
-    Alive,
-    /// Thread has exited with the given exit code.
+pub enum ThreadLocation {
+    /// Thread is alive: running, ready, or blocked. The scheduler owns the detail.
+    Scheduled,
+    /// Thread has exited with the given code. Waiting for parent to reap.
     Zombie(i32),
 }
 
-impl ProcessState {
+pub type ProcessState = ThreadLocation;
+
+impl ThreadLocation {
     pub fn name(&self) -> &'static str {
         match self {
-            Self::Alive => "Alive",
+            Self::Scheduled => "Scheduled",
             Self::Zombie(_) => "Zombie",
         }
     }
@@ -845,7 +853,7 @@ pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64, stack_base: u64) -> Op
     let table = guard.as_mut().unwrap();
     let tid = table.insert_with(|tid| {
         SchedEntry::new(
-            tid, parent_process, ProcessState::Alive, Kind::Thread { parent: parent_process },
+            tid, parent_process, ThreadLocation::Scheduled, Kind::Thread { parent: parent_process },
             [0; 28], 0, thread_data,
         )
     });
@@ -1501,7 +1509,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
     let tid = table.insert_with(|tid| {
         proc_data.lock().pid = pid;
         SchedEntry::new(
-            tid, pid, ProcessState::Alive, Kind::Process { parent },
+            tid, pid, ThreadLocation::Scheduled, Kind::Process { parent },
             make_name(path), memory_size, proc_data,
         )
     });

@@ -89,10 +89,10 @@ enum SwitchReason {
 }
 
 // ---------------------------------------------------------------------------
-// CpuRunQueue — per-CPU ready queue + current thread
+// CpuRunQueue + CpuQueueGuard — per-CPU ready queue with typed lock ordering
 // ---------------------------------------------------------------------------
 
-pub struct CpuRunQueue {
+struct CpuRunQueue {
     current: Option<ThreadCtx>,
     outgoing: Option<(ThreadCtx, SwitchReason)>,
     save_rsp: u64,
@@ -108,6 +108,54 @@ impl CpuRunQueue {
             ready: BTreeMap::new(),
         }
     }
+}
+
+/// Typed guard for a locked CpuRunQueue. All queue operations go through this.
+///
+/// Lock ordering is enforced by the API: `charge()` and `effective_vruntime()`
+/// acquire the vruntimes lock internally, guaranteeing CPU queue → vruntimes
+/// ordering. You cannot lock vruntimes without holding a CpuQueueGuard — the
+/// compiler prevents it.
+pub struct CpuQueueGuard<'a>(crate::sync::LockGuard<'a, CpuRunQueue>);
+
+impl<'a> CpuQueueGuard<'a> {
+    pub fn pick_next(&mut self) -> Option<ThreadCtx> {
+        self.0.ready.pop_first().map(|(_, ctx)| ctx)
+    }
+
+    pub fn insert(&mut self, vrt: u64, ctx: ThreadCtx) {
+        let tid = ctx.tid;
+        self.0.ready.insert((vrt, tid), ctx);
+    }
+
+    pub fn take_current(&mut self) -> Option<ThreadCtx> { self.0.current.take() }
+    pub fn set_current(&mut self, ctx: ThreadCtx) { self.0.current = Some(ctx); }
+    pub fn current(&self) -> Option<&ThreadCtx> { self.0.current.as_ref() }
+    fn take_outgoing(&mut self) -> Option<(ThreadCtx, SwitchReason)> { self.0.outgoing.take() }
+    fn set_outgoing(&mut self, ctx: ThreadCtx, reason: SwitchReason) { self.0.outgoing = Some((ctx, reason)); }
+    pub fn save_rsp_ptr(&mut self) -> *mut u64 { &mut self.0.save_rsp as *mut u64 }
+    pub fn save_rsp(&self) -> u64 { self.0.save_rsp }
+    pub fn ready_len(&self) -> usize { self.0.ready.len() }
+    pub fn is_ready(&self, tid: Tid) -> bool { self.0.ready.keys().any(|(_, t)| *t == tid) }
+
+    pub fn remove_ready(&mut self, tid: Tid) -> Option<ThreadCtx> {
+        let key = self.0.ready.keys().find(|(_, t)| *t == tid).copied();
+        key.and_then(|k| self.0.ready.remove(&k))
+    }
+
+    /// Charge vruntime. Acquires vruntimes lock internally.
+    /// Lock order: CPU queue (held via self) → vruntimes.
+    pub fn charge(&self, sched: &Scheduler, process: Pid, ns: u64) {
+        sched.charge_vruntime(process, ns);
+    }
+
+    /// Read effective vruntime (with lag cap). Acquires vruntimes lock internally.
+    pub fn effective_vruntime(&self, sched: &Scheduler, process: Pid) -> u64 {
+        sched.effective_vruntime(process)
+    }
+
+    /// Consume the guard without unlocking. The resuming side calls force_unlock.
+    pub fn into_raw(self) { core::mem::forget(self.0); }
 }
 
 // ---------------------------------------------------------------------------
@@ -358,6 +406,14 @@ pub fn init() {
 static FUTEX_LOCK: Lock<()> = Lock::new(());
 
 impl Scheduler {
+    fn lock_cpu(&self, cpu: usize) -> CpuQueueGuard<'_> {
+        CpuQueueGuard(self.cpus[cpu].lock())
+    }
+
+    fn try_lock_cpu(&self, cpu: usize) -> Option<CpuQueueGuard<'_>> {
+        self.cpus[cpu].try_lock().map(CpuQueueGuard)
+    }
+
     fn effective_vruntime(&self, process: Pid) -> u64 {
         let vrt = self.vruntimes.lock_unwrap().get(&process).copied().unwrap_or(0);
         let min = self.min_vruntime.load(Ordering::Relaxed);
@@ -389,8 +445,8 @@ impl Scheduler {
         let mut best_cpu = 0u32;
         let mut best_len = usize::MAX;
         for i in 0..count {
-            if let Some(guard) = self.cpus[i as usize].try_lock() {
-                let len = guard.ready.len();
+            if let Some(q) = self.try_lock_cpu(i as usize) {
+                let len = q.ready_len();
                 if len < best_len {
                     best_len = len;
                     best_cpu = i;
@@ -403,9 +459,9 @@ impl Scheduler {
     fn enqueue_woken(&self, woken: Vec<ThreadCtx>) {
         for ctx in woken {
             let cpu = self.pick_target_cpu();
-            let vrt = self.effective_vruntime(ctx.process);
-            let tid = ctx.tid;
-            self.cpus[cpu as usize].lock().ready.insert((vrt, tid), ctx);
+            let mut q = self.lock_cpu(cpu as usize);
+            let vrt = q.effective_vruntime(self, ctx.process);
+            q.insert(vrt, ctx);
         }
     }
 }
@@ -425,31 +481,24 @@ pub fn wake_tid(tid: Tid) {
         }
     };
     let cpu = SCHEDULER.pick_target_cpu();
-    let vrt = SCHEDULER.effective_vruntime(ctx.process);
-    let t = ctx.tid;
-    SCHEDULER.cpus[cpu as usize].lock().ready.insert((vrt, t), ctx);
+    let mut q = SCHEDULER.lock_cpu(cpu as usize);
+    let vrt = q.effective_vruntime(&SCHEDULER, ctx.process);
+    q.insert(vrt, ctx);
 }
 
 /// Remove a thread's ThreadCtx from the scheduler (blocked pool or ready queue).
-/// Used by kill_process to reclaim resources of blocked/ready threads.
 /// Returns None if the thread is currently running (can't be removed).
 pub fn remove_thread(tid: Tid) -> Option<ThreadCtx> {
-    // Try blocked pool first
     {
         let mut pool = SCHEDULER.blocked.lock_unwrap();
         if let Some((ctx, _)) = pool.remove(tid) {
             return Some(ctx);
         }
     }
-    // Try each CPU's ready queue
     for i in 0..crate::arch::smp::cpu_count() as usize {
-        let mut queue = SCHEDULER.cpus[i].lock();
-        // Search ready queue for this tid
-        let key = queue.ready.keys()
-            .find(|(_, t)| *t == tid)
-            .copied();
-        if let Some(k) = key {
-            return queue.ready.remove(&k);
+        let mut q = SCHEDULER.lock_cpu(i);
+        if let Some(ctx) = q.remove_ready(tid) {
+            return Some(ctx);
         }
     }
     None
@@ -458,17 +507,17 @@ pub fn remove_thread(tid: Tid) -> Option<ThreadCtx> {
 /// Get the address space from the current thread's ThreadCtx.
 pub fn current_address_space() -> Option<Arc<AddressSpace>> {
     let cpu = percpu::cpu_id() as usize;
-    let guard = SCHEDULER.cpus[cpu].lock();
-    guard.current.as_ref().and_then(|ctx| ctx.address_space.clone())
+    let q = SCHEDULER.lock_cpu(cpu);
+    q.current().and_then(|ctx| ctx.address_space.clone())
 }
 
 /// Enqueue a newly spawned thread into the scheduler.
 pub fn enqueue_new(ctx: ThreadCtx) {
     SCHEDULER.init_vruntime(ctx.process);
     let cpu = SCHEDULER.pick_target_cpu();
-    let vrt = SCHEDULER.effective_vruntime(ctx.process);
-    let tid = ctx.tid;
-    SCHEDULER.cpus[cpu as usize].lock().ready.insert((vrt, tid), ctx);
+    let mut q = SCHEDULER.lock_cpu(cpu as usize);
+    let vrt = q.effective_vruntime(&SCHEDULER, ctx.process);
+    q.insert(vrt, ctx);
 }
 
 /// Block the current thread and switch to the next ready one.
@@ -591,45 +640,36 @@ pub fn futex_wake(phys_addr: PhysAddr, count: usize) -> u64 {
 /// Used by exit paths that need to access the thread's context.
 pub fn with_current_ctx<R>(f: impl FnOnce(&ThreadCtx) -> R) -> Option<R> {
     let cpu = percpu::cpu_id() as usize;
-    let guard = SCHEDULER.cpus[cpu].lock();
-    guard.current.as_ref().map(f)
+    let q = SCHEDULER.lock_cpu(cpu);
+    q.current().map(f)
 }
 
 /// Get scheduling state for sysinfo display.
 /// Returns: 0=Running, 1=Ready, 2=Blocked, 3=unknown (not in scheduler, e.g. zombie).
 pub fn thread_sched_state(tid: Tid) -> u8 {
-    // Check if running on any CPU
     for i in 0..crate::arch::smp::cpu_count() as usize {
-        if let Some(guard) = SCHEDULER.cpus[i].try_lock() {
-            if let Some(ctx) = &guard.current {
-                if ctx.tid == tid { return 0; } // Running
+        if let Some(q) = SCHEDULER.try_lock_cpu(i) {
+            if let Some(ctx) = q.current() {
+                if ctx.tid == tid { return 0; }
             }
-            // Check ready queue
-            for ((_, t), _) in guard.ready.iter() {
-                if *t == tid { return 1; } // Ready
-            }
+            if q.is_ready(tid) { return 1; }
         }
     }
-    // Check blocked pool
     if SCHEDULER.blocked.lock_unwrap().threads.contains_key(&tid) {
-        return 2; // Blocked
+        return 2;
     }
-    3 // Not in scheduler (zombie or just spawned)
+    3
 }
 
 /// Get cpu_ns for a thread that might be running or blocked.
 pub fn thread_cpu_ns(tid: Tid) -> u64 {
-    // Check all CPU queues for running
     for i in 0..crate::arch::smp::cpu_count() as usize {
-        if let Some(guard) = SCHEDULER.cpus[i].try_lock() {
-            if let Some(ctx) = &guard.current {
-                if ctx.tid == tid {
-                    return ctx.cpu_ns();
-                }
+        if let Some(q) = SCHEDULER.try_lock_cpu(i) {
+            if let Some(ctx) = q.current() {
+                if ctx.tid == tid { return ctx.cpu_ns(); }
             }
         }
     }
-    // Check blocked pool
     let pool = SCHEDULER.blocked.lock_unwrap();
     if let Some((ctx, _)) = pool.threads.get(&tid) {
         return ctx.cpu_ns;
@@ -659,19 +699,17 @@ fn do_schedule(reason: SwitchReason) {
     let cpu = percpu::cpu_id() as usize;
     let now = crate::clock::nanos_since_boot();
 
-    let mut queue = SCHEDULER.cpus[cpu].lock();
+    let mut queue = SCHEDULER.lock_cpu(cpu);
 
-    // Take current thread out
-    if let Some(mut old) = queue.current.take() {
+    if let Some(mut old) = queue.take_current() {
         old.fs_base = cpu::rdmsr(IA32_FS_BASE);
         let elapsed = if old.scheduled_at > 0 { now - old.scheduled_at } else { 0 };
         old.stop_cpu_timer(now);
-        SCHEDULER.charge_vruntime(old.process, elapsed);
-        queue.outgoing = Some((old, reason));
+        queue.charge(&SCHEDULER, old.process, elapsed);
+        queue.set_outgoing(old, reason);
     }
 
-    // Pick next from ready queue (lowest vruntime)
-    if let Some((_, new)) = queue.ready.pop_first() {
+    if let Some(new) = queue.pick_next() {
         let new_cr3 = new.cr3();
         let new_fs_base = new.fs_base;
         let new_ks_top = new.kernel_stack_top();
@@ -680,15 +718,15 @@ fn do_schedule(reason: SwitchReason) {
 
         let mut new = new;
         new.start_cpu_timer(now);
-        queue.current = Some(new);
+        queue.set_current(new);
 
-        let old_rsp_ptr = &mut queue.save_rsp as *mut u64;
+        let old_rsp_ptr = queue.save_rsp_ptr();
         percpu::set_current_tid(Some(new_tid));
         unsafe { percpu::set_kernel_stack(new_ks_top); }
         unsafe { cpu::write_cr3(new_cr3); }
         cpu::wrmsr(IA32_FS_BASE, new_fs_base);
 
-        core::mem::forget(queue);
+        queue.into_raw();
         unsafe { context_switch(old_rsp_ptr, new_rsp); }
         unsafe { SCHEDULER.cpus[percpu::cpu_id() as usize].force_unlock(); }
 
@@ -696,30 +734,27 @@ fn do_schedule(reason: SwitchReason) {
         return;
     }
 
-    // No ready thread — switch to idle
-    let old_rsp_ptr = &mut queue.save_rsp as *mut u64;
+    let old_rsp_ptr = queue.save_rsp_ptr();
     percpu::set_current_tid(None);
     unsafe { percpu::set_kernel_stack(percpu::idle_stack_top()); }
     unsafe { cpu::write_cr3(paging::kernel_cr3()); }
 
-    core::mem::forget(queue);
+    queue.into_raw();
     unsafe { context_switch(old_rsp_ptr, percpu::idle_rsp()); }
     unsafe { SCHEDULER.cpus[percpu::cpu_id() as usize].force_unlock(); }
 
     handle_outgoing();
 }
 
-/// After context_switch, handle the outgoing thread's disposition.
 fn handle_outgoing() {
     let cpu = percpu::cpu_id() as usize;
-    let mut queue = SCHEDULER.cpus[cpu].lock();
-    if let Some((mut old, reason)) = queue.outgoing.take() {
-        old.kernel_rsp = queue.save_rsp;
+    let mut queue = SCHEDULER.lock_cpu(cpu);
+    if let Some((mut old, reason)) = queue.take_outgoing() {
+        old.kernel_rsp = queue.save_rsp();
         match reason {
             SwitchReason::Yield => {
-                let vrt = SCHEDULER.effective_vruntime(old.process);
-                let tid = old.tid;
-                queue.ready.insert((vrt, tid), old);
+                let vrt = queue.effective_vruntime(&SCHEDULER, old.process);
+                queue.insert(vrt, old);
             }
             SwitchReason::Block(block_reason) => {
                 drop(queue);
@@ -727,8 +762,6 @@ fn handle_outgoing() {
                 return;
             }
             SwitchReason::Exit => {
-                // ThreadCtx dropped here — kernel_stack freed.
-                // The thread table entry is already zombified.
                 drop(old);
             }
         }
@@ -755,8 +788,8 @@ fn cpu_idle_loop() -> ! {
         // Check for ready threads on this CPU
         let cpu = percpu::cpu_id() as usize;
         {
-            let mut queue = SCHEDULER.cpus[cpu].lock();
-            if let Some((_, new)) = queue.ready.pop_first() {
+            let mut queue = SCHEDULER.lock_cpu(cpu);
+            if let Some(new) = queue.pick_next() {
                 let new_cr3 = new.cr3();
                 let new_fs_base = new.fs_base;
                 let new_ks_top = new.kernel_stack_top();
@@ -765,14 +798,14 @@ fn cpu_idle_loop() -> ! {
 
                 let mut new = new;
                 new.start_cpu_timer(crate::clock::nanos_since_boot());
-                queue.current = Some(new);
+                queue.set_current(new);
 
                 percpu::set_current_tid(Some(new_tid));
                 unsafe { percpu::set_kernel_stack(new_ks_top); }
                 unsafe { cpu::write_cr3(new_cr3); }
                 cpu::wrmsr(IA32_FS_BASE, new_fs_base);
 
-                core::mem::forget(queue);
+                queue.into_raw();
                 unsafe { context_switch(percpu::idle_rsp_ptr(), new_rsp); }
                 unsafe { SCHEDULER.cpus[percpu::cpu_id() as usize].force_unlock(); }
 
