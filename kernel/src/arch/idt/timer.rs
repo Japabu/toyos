@@ -110,10 +110,6 @@ extern "sysv64" fn timer_handler() {
     // try_lock avoids deadlock if the blocked pool is held on this CPU.
     crate::scheduler::check_deadlines();
 
-    if super::virtio_net::irq_pending() {
-        crate::scheduler::push_event(crate::scheduler::EventSource::Network);
-    }
-
     // Process xHCI events (keyboard/mouse) from timer context too,
     // in case the idle loop isn't running on CPU 0.
     if crate::arch::percpu::cpu_id() == 0 {

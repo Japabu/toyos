@@ -2288,12 +2288,15 @@ pub fn handle_page_fault(fault_addr: u64, _error_code: u64) -> bool {
     }
 
     // Apply relocations across the entire 2MB region
+    let mut total_relocs = 0u16;
     if let Some(ref ri) = reloc_index {
         let mut offset = 0u64;
         while offset < page_2m {
             let page_elf_offset = (region_start + offset).wrapping_sub(elf_base);
             if ri.has_relocs_in_page(page_elf_offset) {
-                ri.apply_to_page(page_elf_offset, unsafe { page_ptr.add(offset as usize) });
+                total_relocs = total_relocs.saturating_add(
+                    ri.apply_to_page(page_elf_offset, unsafe { page_ptr.add(offset as usize) }) as u16
+                );
             }
             offset += 4096;
         }
@@ -2318,7 +2321,7 @@ pub fn handle_page_fault(fault_addr: u64, _error_code: u64) -> bool {
         fault_addr,
         page_elf_offset: region_start.wrapping_sub(elf_base),
         block_idx: (region_start / paging::PAGE_2M) as u32,
-        reloc_count: 0,
+        reloc_count: total_relocs,
         flags: if writable { 1 } else { 0 },
         duration_us: elapsed_us,
     });

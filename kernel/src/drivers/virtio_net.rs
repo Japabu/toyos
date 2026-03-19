@@ -170,10 +170,7 @@ fn setup_msix(pci_dev: &PciDevice, device: &super::virtio::VirtioDevice) {
 
     let cap = match pci_dev.capabilities().find(|c| c.id() == PCI_CAP_MSIX) {
         Some(c) => c,
-        None => {
-            log!("VirtIO net: no MSI-X capability");
-            return;
-        }
+        None => panic!("VirtIO net: no MSI-X capability"),
     };
 
     let table_info = cap.read_u32(4);
@@ -201,8 +198,7 @@ fn setup_msix(pci_dev: &PciDevice, device: &super::virtio::VirtioDevice) {
     common.write_u16(COMMON_MSIX_CONFIG, 0);
     let config_vec = common.read_u16(COMMON_MSIX_CONFIG);
     if config_vec == 0xFFFF {
-        log!("VirtIO net: MSI-X config vector assignment failed");
-        return;
+        panic!("VirtIO net: MSI-X config vector assignment failed");
     }
 
     // Set RX queue (0) MSI-X vector. queue_enable is called separately after.
@@ -210,8 +206,7 @@ fn setup_msix(pci_dev: &PciDevice, device: &super::virtio::VirtioDevice) {
     common.write_u16(COMMON_QUEUE_MSIX, 0);
     let queue_vec = common.read_u16(COMMON_QUEUE_MSIX);
     if queue_vec == 0xFFFF {
-        log!("VirtIO net: MSI-X queue vector assignment failed");
-        return;
+        panic!("VirtIO net: MSI-X queue vector assignment failed");
     }
 
     log!("VirtIO net: MSI-X enabled (vector {:#x}, config_vec={}, queue_vec={})",

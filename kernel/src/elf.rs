@@ -607,8 +607,9 @@ impl RelocationIndex {
 
     /// Apply pre-computed relocations that fall within [page_offset, page_offset + 4096).
     /// `page_ptr` is a writable pointer to the page data.
-    pub fn apply_to_page(&self, page_offset: u64, page_ptr: *mut u8) {
+    pub fn apply_to_page(&self, page_offset: u64, page_ptr: *mut u8) -> usize {
         let end_offset = page_offset + 4096;
+        let mut count = 0usize;
 
         // Apply u64 writes
         let start = self.entries_u64.partition_point(|&(off, _)| off < page_offset);
@@ -619,6 +620,7 @@ impl RelocationIndex {
                 unsafe {
                     core::ptr::write_unaligned(page_ptr.add(within_page) as *mut u64, value);
                 }
+                count += 1;
             }
         }
 
@@ -631,8 +633,10 @@ impl RelocationIndex {
                 unsafe {
                     core::ptr::write_unaligned(page_ptr.add(within_page) as *mut i32, value);
                 }
+                count += 1;
             }
         }
+        count
     }
 
     /// Check if any relocations fall within [page_offset, page_offset + 4096).

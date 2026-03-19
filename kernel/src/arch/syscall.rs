@@ -1348,6 +1348,7 @@ fn sys_tls_alloc_block(module_id: u64) -> u64 {
         let addr_space = process::current_address_space();
         let region = addr_space.map_region(&mut data.vmas, block_phys_addr, tls_memsz as u64)
             .expect("sys_tls_alloc_block: out of virtual address space");
+        data.alloc_count += 1;
         region.vaddr()
     });
 

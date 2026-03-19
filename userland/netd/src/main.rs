@@ -953,18 +953,20 @@ fn main() {
         daemon.check_piped_listeners(&mut socket_set);
 
         let delay = iface.poll_delay(now, &socket_set);
-        let mut timeout = match delay {
-            Some(d) if d.total_millis() > 0 => Duration::from_millis(d.total_millis() as u64).min(Duration::from_millis(50)),
-            Some(_) => Duration::from_millis(1),
-            None => Duration::from_millis(50),
-        };
 
         let has_pending_async = !daemon.pending_udp_recvs.is_empty()
             || !daemon.pending_dns.is_empty()
             || !daemon.pending_piped_connects.is_empty();
-        if has_pending_async {
-            timeout = timeout.min(Duration::from_millis(1));
-        }
+
+        let timeout_nanos = if has_pending_async {
+            Some(Duration::from_millis(1).as_nanos() as u64)
+        } else {
+            match delay {
+                Some(d) if d.total_millis() > 0 => Some(Duration::from_millis(d.total_millis() as u64).as_nanos() as u64),
+                Some(_) => Some(Duration::from_millis(1).as_nanos() as u64),
+                None => None,
+            }
+        };
 
         let mut poll_fds: Vec<u64> = vec![
             listener.0 as u64,
@@ -975,7 +977,7 @@ fn main() {
                 poll_fds.push(fd.0 as u64);
             }
         }
-        let result = toyos_poll::poll_timeout(&poll_fds, Some(timeout.as_nanos() as u64));
+        let result = toyos_poll::poll_timeout(&poll_fds, timeout_nanos);
 
         // Accept new connections
         if result.fd(0) {
