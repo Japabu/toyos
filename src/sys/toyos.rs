@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use toyos_abi::Fd;
 use toyos_abi::syscall::{self, SyscallError};
-use toyos_net::{self, NetError};
+use toyos_net::{self, NetError, TcpSocketId};
 
 use crate::{SockAddr, TcpKeepalive};
 
@@ -409,7 +409,7 @@ impl Drop for Socket {
             match state {
                 SocketState::Connected { kernel_fd, socket_id, .. }
                 | SocketState::Listening { kernel_fd, socket_id, .. } => {
-                    toyos_net::tcp_close(socket_id);
+                    let _ = toyos_net::tcp_close(TcpSocketId(socket_id));
                     syscall::close(kernel_fd);
                 }
                 SocketState::Unconnected { .. } => {}
@@ -518,7 +518,7 @@ pub(crate) fn connect(fd: RawSocket, addr: &SockAddr) -> io::Result<()> {
         fd,
         SocketState::Connected {
             kernel_fd,
-            socket_id: conn.socket_id,
+            socket_id: conn.socket_id.0,
             local_port: conn.local_port,
             peer_addr: ip,
             peer_port: port,
@@ -577,7 +577,7 @@ pub(crate) fn listen(fd: RawSocket, _backlog: c_int) -> io::Result<()> {
         fd,
         SocketState::Listening {
             kernel_fd: bound.notify_fd,
-            socket_id: bound.socket_id,
+            socket_id: bound.socket_id.0,
             local_addr: ip,
             local_port: bound.bound_port,
             nonblocking,
@@ -624,7 +624,7 @@ pub(crate) fn accept(fd: RawSocket) -> io::Result<(RawSocket, SockAddr)> {
         }
     }
 
-    let accepted = toyos_net::tcp_accept(socket_id).map_err(net_err_to_io)?;
+    let accepted = toyos_net::tcp_accept(TcpSocketId(socket_id)).map_err(net_err_to_io)?;
 
     // Wrap pipe fds into a kernel socket descriptor
     let rx_pipe_id = syscall::pipe_id(accepted.rx_fd)
@@ -643,7 +643,7 @@ pub(crate) fn accept(fd: RawSocket) -> io::Result<(RawSocket, SockAddr)> {
         new_fd,
         SocketState::Connected {
             kernel_fd: new_kernel_fd,
-            socket_id: accepted.socket_id,
+            socket_id: accepted.socket_id.0,
             local_port: accepted.local_port,
             peer_addr: accepted.remote_addr,
             peer_port: accepted.remote_port,
@@ -763,7 +763,7 @@ pub(crate) fn shutdown(fd: RawSocket, how: Shutdown) -> io::Result<()> {
         Shutdown::Write => 1,
         Shutdown::Both => 2,
     };
-    toyos_net::tcp_shutdown(socket_id, how_val).map_err(net_err_to_io)
+    toyos_net::tcp_shutdown(TcpSocketId(socket_id), how_val).map_err(net_err_to_io)
 }
 
 // ---------------------------------------------------------------------------
@@ -802,8 +802,8 @@ pub(crate) fn recv(
             Err(e) => Err(io::Error::new(io::ErrorKind::Other, format!("{e:?}"))),
         }
     } else if let Some(timeout) = recv_timeout {
-        let poll_entry = kernel_fd.0 as u64 | syscall::POLL_READABLE;
-        let result = syscall::poll_timeout(&[poll_entry], Some(timeout.as_nanos() as u64));
+        let poll_entry = kernel_fd.0 as u64 | toyos_abi::io_uring::POLL_READABLE;
+        let result = toyos_abi::io_uring::poll_fds(&[poll_entry], Some(timeout.as_nanos() as u64));
         if result.fd(0) {
             match syscall::read(kernel_fd, raw_buf) {
                 Ok(n) => Ok(n),
@@ -843,8 +843,8 @@ pub(crate) fn send(fd: RawSocket, buf: &[u8], _flags: c_int) -> io::Result<usize
             Err(e) => Err(io::Error::new(io::ErrorKind::Other, format!("{e:?}"))),
         }
     } else if let Some(timeout) = send_timeout {
-        let poll_entry = kernel_fd.0 as u64 | syscall::POLL_WRITABLE;
-        let result = syscall::poll_timeout(&[poll_entry], Some(timeout.as_nanos() as u64));
+        let poll_entry = kernel_fd.0 as u64 | toyos_abi::io_uring::POLL_WRITABLE;
+        let result = toyos_abi::io_uring::poll_fds(&[poll_entry], Some(timeout.as_nanos() as u64));
         if result.fd(0) {
             match syscall::write(kernel_fd, buf) {
                 Ok(n) => Ok(n),
@@ -991,7 +991,7 @@ pub(crate) unsafe fn setsockopt<T>(
                     *nodelay = value != 0;
                     let sid = *socket_id;
                     drop(map);
-                    let _ = toyos_net::tcp_set_option(sid, toyos_net::OPT_NODELAY, value as u32);
+                    let _ = toyos_net::tcp_set_option(TcpSocketId(sid), toyos_net::OPT_NODELAY, value as u32);
                     return Ok(());
                 }
                 _ => {}
