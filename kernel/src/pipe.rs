@@ -1,13 +1,10 @@
 use alloc::alloc::{alloc_zeroed, dealloc};
-use alloc::sync::Arc;
-use alloc::vec::Vec;
 use core::alloc::Layout;
 
 use toyos_abi::ring::{RingHeader, RING_READER_CLOSED, RING_WRITER_CLOSED};
 
 use crate::arch::paging::PAGE_2M;
 use crate::id_map::{IdKey, IdMap};
-use crate::process::AddressSpace;
 use crate::sync::Lock;
 use crate::PhysAddr;
 
@@ -81,17 +78,17 @@ impl Drop for PipeWriter {
 }
 
 // ---------------------------------------------------------------------------
-// Pipe internals
+// Pipe internals — owns physical memory, tracks refcounts only.
+// Mapping into user address spaces is managed by the FD layer.
 // ---------------------------------------------------------------------------
 
-const PIPE_SIZE: usize = PAGE_2M as usize;
+pub const PIPE_SIZE: usize = PAGE_2M as usize;
 
 struct Pipe {
     phys_addr: PhysAddr,
     layout: Layout,
     readers: u32,
     writers: u32,
-    mapped_in: Vec<Arc<AddressSpace>>,
 }
 
 unsafe impl Send for Pipe {}
@@ -102,7 +99,7 @@ impl Pipe {
         let ptr = unsafe { alloc_zeroed(layout) };
         assert!(!ptr.is_null(), "pipe: allocation failed");
         RingHeader::init(ptr, PIPE_SIZE);
-        Self { phys_addr: PhysAddr::from_ptr(ptr), layout, readers: 0, writers: 0, mapped_in: Vec::new() }
+        Self { phys_addr: PhysAddr::from_ptr(ptr), layout, readers: 0, writers: 0 }
     }
 
     fn header(&self) -> &RingHeader {
@@ -133,14 +130,12 @@ pub fn init() {
 /// Create a new pipe. Returns owned reader + writer references.
 pub fn create() -> (PipeReader, PipeWriter) {
     let id = with_pipes_mut(|pipes| pipes.insert(Pipe::new()));
-    // Bump refcounts for the initial reader and writer.
     add_reader(id);
     add_writer(id);
     (PipeReader(id), PipeWriter(id))
 }
 
 /// Open an existing pipe by raw ID (for cross-process pipe sharing).
-/// Returns a new owned reference.
 pub fn open_reader(id: PipeId) -> Option<PipeReader> {
     if !exists(id) { return None; }
     add_reader(id);
@@ -155,6 +150,11 @@ pub fn open_writer(id: PipeId) -> Option<PipeWriter> {
 
 pub fn exists(pipe_id: PipeId) -> bool {
     with_pipes(|pipes| pipes.get(pipe_id).is_some())
+}
+
+/// Get the physical address of a pipe's ring buffer (for mapping into userland).
+pub fn phys_addr(pipe_id: PipeId) -> Option<PhysAddr> {
+    with_pipes(|pipes| pipes.get(pipe_id).map(|p| p.phys_addr))
 }
 
 pub fn try_read(pipe_id: PipeId, buf: &mut [u8]) -> Option<usize> {
@@ -203,25 +203,6 @@ pub fn has_space(pipe_id: PipeId) -> bool {
         pipes.get(pipe_id).map_or(false, |p| {
             p.header().space() > 0 || p.readers == 0 || p.header().is_reader_closed()
         })
-    })
-}
-
-pub fn cleanup_address_space(addr_space: &Arc<AddressSpace>) {
-    with_pipes_mut(|pipes| {
-        for (_, pipe) in pipes.iter_mut() {
-            pipe.mapped_in.retain(|a| !Arc::ptr_eq(a, addr_space));
-        }
-    });
-}
-
-pub fn map_into(pipe_id: PipeId, addr_space: &Arc<AddressSpace>) -> Option<u64> {
-    with_pipes_mut(|pipes| {
-        let pipe = pipes.get_mut(pipe_id)?;
-        addr_space.map_user(pipe.phys_addr, PIPE_SIZE as u64);
-        if !pipe.mapped_in.iter().any(|a| Arc::ptr_eq(a, addr_space)) {
-            pipe.mapped_in.push(Arc::clone(addr_space));
-        }
-        Some(pipe.phys_addr.raw())
     })
 }
 
@@ -274,8 +255,5 @@ fn close_write(pipe_id: PipeId) {
 }
 
 fn free_pipe(pipe: Pipe) {
-    for addr_space in &pipe.mapped_in {
-        addr_space.unmap_user(pipe.phys_addr, PIPE_SIZE as u64);
-    }
     unsafe { dealloc(pipe.phys_addr.as_mut_ptr(), pipe.layout); }
 }

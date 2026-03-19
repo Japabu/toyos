@@ -69,6 +69,7 @@ impl<K: IdKey, V> IdMap<K, V> {
         self.map.iter().map(|(&k, v)| (k, v))
     }
 
+    #[allow(dead_code)]
     pub fn iter_mut(&mut self) -> impl Iterator<Item = (K, &mut V)> {
         self.map.iter_mut().map(|(&k, v)| (k, v))
     }

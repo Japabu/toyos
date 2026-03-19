@@ -186,6 +186,7 @@ fn is_early_ptr(ptr: *mut u8) -> bool {
     p >= buf_start && p < buf_start + EARLY_SIZE
 }
 
+#[allow(dead_code)]
 pub fn early_buf_range() -> (u64, u64) {
     let start = EARLY_BUF.0.get() as u64;
     (start, start + EARLY_SIZE as u64)
@@ -213,6 +214,7 @@ unsafe impl GlobalAlloc for KernelAllocator {
         self.release(flags);
         result
     }
+
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         // Early allocations are permanent (page tables etc.) — never freed

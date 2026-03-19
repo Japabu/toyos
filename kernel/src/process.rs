@@ -42,6 +42,26 @@ impl PageTableRoot {
     fn as_ptr(&self) -> *mut u64 { self.0.as_mut_ptr() }
 }
 
+/// Proof that a virtual address range is both allocated in the VmaList and
+/// mapped in the page tables. Created by `AddressSpace::map_region` /
+/// `map_stack` and consumed by `unmap_region`.
+pub struct MappedRegion {
+    vaddr: UserAddr,
+    size: u64,
+}
+
+impl MappedRegion {
+    pub fn vaddr(&self) -> UserAddr { self.vaddr }
+    pub fn size(&self) -> u64 { self.size }
+
+    /// Create a MappedRegion for a fixed-address mapping (main thread stack).
+    /// Only used by kernel internals that manage fixed addresses directly.
+    #[allow(dead_code)]
+    pub(crate) fn fixed(vaddr: UserAddr, size: u64) -> Self {
+        Self { vaddr, size }
+    }
+}
+
 /// Reference-counted address space. Wraps a PML4 page table and frees it when
 /// the last reference drops. Shared between a process and all its threads via Arc.
 pub struct AddressSpace {
@@ -66,24 +86,58 @@ impl AddressSpace {
     /// SAFETY: Caller must hold Arc<AddressSpace> for the duration of the CR3 load.
     pub unsafe fn cr3_value(&self) -> PhysAddr { self.root.phys() }
 
-    pub fn map_user(&self, phys: PhysAddr, size: u64) {
-        paging::map_user_in(self.root.as_ptr(), phys, size);
+    // --- Public API: VmaList-managed allocations (for syscall code) ---
+
+    /// Allocate a virtual address range and map physical memory. One operation.
+    /// Returns a MappedRegion proving both allocation and mapping exist.
+    pub fn map_region(&self, vmas: &mut crate::vma::VmaList, phys: PhysAddr, size: u64) -> MappedRegion {
+        let vaddr = vmas.alloc_region(size);
+        let aligned = paging::align_2m(size as usize) as u64;
+        paging::map_user_at(self.root.as_ptr(), vaddr, phys, aligned);
+        MappedRegion { vaddr, size: aligned }
     }
-    pub fn map_user_readonly(&self, phys: PhysAddr, size: u64) {
-        paging::map_user_readonly_in(self.root.as_ptr(), phys, size);
+
+    /// Allocate a stack region with guard pages on both sides and map it.
+    #[allow(dead_code)]
+    pub fn map_stack(&self, vmas: &mut crate::vma::VmaList, phys: PhysAddr, size: u64) -> MappedRegion {
+        let vaddr = vmas.alloc_stack(size);
+        let aligned = paging::align_2m(size as usize) as u64;
+        paging::map_user_at(self.root.as_ptr(), vaddr, phys, aligned);
+        MappedRegion { vaddr, size: aligned }
     }
-    pub fn remap_user_2m(&self, vaddr: UserAddr, phys: PhysAddr) -> bool {
-        paging::remap_user_2m_in(self.root.as_ptr(), vaddr, phys)
+
+    /// Unmap and free a VmaList-managed region.
+    #[allow(dead_code)]
+    pub fn unmap_region(&self, vmas: &mut crate::vma::VmaList, region: MappedRegion) {
+        paging::unmap_user_at(self.root.as_ptr(), region.vaddr, region.size);
+        vmas.free_region(region.vaddr);
     }
-    pub fn remap_user_2m_rw(&self, vaddr: UserAddr, phys: PhysAddr, writable: bool) -> bool {
+
+    // --- Restricted API: for kernel internals only (process.rs, shared_memory, paging) ---
+
+    /// Map at a fixed virtual address. Used for main thread stack, shared memory,
+    /// and demand paging. Not available to syscall handlers.
+    pub(crate) fn map_at(&self, vaddr: UserAddr, phys: PhysAddr, size: u64) {
+        paging::map_user_at(self.root.as_ptr(), vaddr, phys, size);
+    }
+
+    /// Unmap at a fixed virtual address. Used for shared memory teardown and
+    /// demand page cleanup. Not available to syscall handlers.
+    pub(crate) fn unmap_at(&self, vaddr: UserAddr, size: u64) {
+        paging::unmap_user_at(self.root.as_ptr(), vaddr, size);
+    }
+
+    /// Remap a single 2MB page (demand paging, MAP_FIXED).
+    pub fn remap_2m(&self, vaddr: UserAddr, phys: PhysAddr, writable: bool) -> bool {
         paging::remap_user_2m(self.root.as_ptr(), vaddr, phys, writable)
     }
-    pub fn clear_user_2m(&self, vaddr: UserAddr) {
+
+    /// Clear a single 2MB PDE (unmap one page).
+    pub fn clear_2m(&self, vaddr: UserAddr) {
         paging::clear_user_2m(self.root.as_ptr(), vaddr);
     }
-    pub fn unmap_user(&self, phys: PhysAddr, size: u64) {
-        paging::unmap_user(self.root.as_ptr(), phys, size);
-    }
+
+    /// Translate virtual to physical by walking page tables.
     pub fn virt_to_phys(&self, vaddr: UserAddr) -> Option<PhysAddr> {
         paging::virt_to_phys(self.root.as_ptr() as *const u64, vaddr)
     }
@@ -140,33 +194,63 @@ unsafe impl Send for OwnedAlloc {}
 const USER_STACK_SIZE: usize = 4 * PAGE_2M as usize; // 8 MB
 pub const KERNEL_STACK_SIZE: usize = 128 * 1024;
 
-/// Write argc, argv pointers, and string data onto a user stack. Returns new SP.
-/// Write argv onto a user stack. `stack_top` is the user-visible (physical) address.
-/// Returns the new user-visible stack pointer.
-pub fn write_argv_to_stack(stack_top: u64, args: &[&str]) -> u64 {
-    let mut sp = stack_top;
-    let mut argv_ptrs: Vec<u64> = Vec::with_capacity(args.len());
-    for arg in args.iter().rev() {
-        sp -= (arg.len() + 1) as u64;
-        let kptr = PhysAddr::new(sp).as_mut_ptr::<u8>();
+/// Type-safe user stack. Knows its virtual address (what userland sees) and
+/// physical address (for kernel direct-map writes). Impossible to confuse the two.
+pub struct UserStack {
+    vaddr: UserAddr,
+    phys: PhysAddr,
+    size: u64,
+}
+
+impl UserStack {
+    pub fn new(vaddr: UserAddr, phys: PhysAddr, size: u64) -> Self {
+        Self { vaddr, phys, size }
+    }
+
+    /// User-visible virtual address of the stack top (highest address).
+    pub fn top(&self) -> u64 { self.vaddr.raw() + self.size }
+
+    /// User-visible virtual base address.
+    pub fn base(&self) -> UserAddr { self.vaddr }
+
+    pub fn size(&self) -> u64 { self.size }
+
+    /// Convert a user virtual address on this stack to a kernel direct-map pointer.
+    /// Panics if the address is outside this stack.
+    fn kern_ptr(&self, user_addr: u64) -> *mut u8 {
+        let offset = user_addr.checked_sub(self.vaddr.raw())
+            .expect("UserStack: address below stack base");
+        assert!(offset < self.size, "UserStack: address above stack top");
+        (self.phys + offset).as_mut_ptr::<u8>()
+    }
+
+    /// Write argc, argv pointers, and string data onto this stack.
+    /// Returns the new user-visible stack pointer.
+    pub fn write_argv(&self, args: &[&str]) -> u64 {
+        let mut sp = self.top();
+        let mut argv_ptrs: Vec<u64> = Vec::with_capacity(args.len());
+        for arg in args.iter().rev() {
+            sp -= (arg.len() + 1) as u64;
+            let kptr = self.kern_ptr(sp);
+            unsafe {
+                core::ptr::copy_nonoverlapping(arg.as_ptr(), kptr, arg.len());
+                *kptr.add(arg.len()) = 0;
+            }
+            argv_ptrs.push(sp);
+        }
+        argv_ptrs.reverse();
+        let metadata_qwords = args.len() + 2;
+        sp = (sp - metadata_qwords as u64 * 8) & !15;
+        let ksp = self.kern_ptr(sp) as *mut u64;
         unsafe {
-            core::ptr::copy_nonoverlapping(arg.as_ptr(), kptr, arg.len());
-            *kptr.add(arg.len()) = 0;
+            *ksp = args.len() as u64;
+            for (i, ptr) in argv_ptrs.iter().enumerate() {
+                *ksp.add(1 + i) = *ptr;
+            }
+            *ksp.add(1 + args.len()) = 0;
         }
-        argv_ptrs.push(sp); // user-visible address
+        sp
     }
-    argv_ptrs.reverse();
-    let metadata_qwords = args.len() + 2;
-    sp = (sp - metadata_qwords as u64 * 8) & !15;
-    unsafe {
-        let ksp = PhysAddr::new(sp).as_mut_ptr::<u64>();
-        *ksp = args.len() as u64;
-        for (i, ptr) in argv_ptrs.iter().enumerate() {
-            *ksp.add(1 + i) = *ptr;
-        }
-        *ksp.add(1 + args.len()) = 0;
-    }
-    sp
 }
 
 /// Where a thread is in the system. Stored in the thread table (SchedEntry).
@@ -299,6 +383,13 @@ impl PageFaultTrace {
         }
     }
 
+
+    /// Record a page fault event.
+    pub fn record(&mut self, rec: PageFaultRecord) {
+        self.entries[self.write_pos] = rec;
+        self.write_pos = (self.write_pos + 1) % 32;
+        self.total += 1;
+    }
 
     /// Iterate entries in chronological order (oldest first).
     pub fn iter_chronological(&self) -> impl Iterator<Item = &PageFaultRecord> {
@@ -795,13 +886,38 @@ pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64, stack_base: u64) -> Op
          data.tls_modules.clone(), data.tls_total_memsz, data.tls_max_align, data.cwd.clone())
     };
 
-    // Phase 2: Allocate TLS (outside any lock — map_user does TLB flush)
+    // Phase 2: Allocate TLS (outside any lock)
     let (tls_alloc, fs_base) = if !tls_modules.is_empty() {
         setup_combined_tls(&tls_modules, tls_total_memsz, tls_max_align)?
     } else {
         setup_tls(tls_template, tls_filesz, tls_memsz, tls_max_align)?
     };
-    paging::map_user(PhysAddr::from_ptr(tls_alloc.ptr()), tls_alloc.size() as u64);
+    let fs_base = {
+        let addr_space = parent_addr_space.as_ref().expect("spawn_thread: no address space");
+        let mut parent_data = data_arc.lock();
+        let tls_phys = PhysAddr::from_ptr(tls_alloc.ptr());
+        let tls_region = addr_space.map_region(&mut parent_data.vmas, tls_phys, tls_alloc.size() as u64);
+        // Rebase fs_base and internal TLS pointers from physical to virtual
+        let tls_rebase = tls_region.vaddr().raw() as i64 - tls_phys.raw() as i64;
+        let fs_base = (fs_base as i64 + tls_rebase) as u64;
+        unsafe {
+            let tp_kern = tls_phys.as_mut_ptr::<u8>().add((fs_base - tls_region.vaddr().raw()) as usize);
+            let self_ptr = tp_kern as *mut u64;
+            *self_ptr = fs_base;
+            let dtv_phys = *self_ptr.add(1);
+            *self_ptr.add(1) = (dtv_phys as i64 + tls_rebase) as u64;
+            let dtv_kern = tls_phys.as_mut_ptr::<u64>();
+            let dtv_len = *dtv_kern.add(1) as usize;
+            for i in 0..dtv_len {
+                let entry = *dtv_kern.add(2 + i);
+                if entry != !0u64 && entry != 0 {
+                    *dtv_kern.add(2 + i) = (entry as i64 + tls_rebase) as u64;
+                }
+            }
+        }
+        drop(parent_data);
+        fs_base
+    };
 
     let (ks_alloc, ks_rsp) = match alloc_kernel_stack(thread_start, entry, stack_ptr, arg) {
         Some(ks) => ks,
@@ -1117,7 +1233,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
     let base = USER_VM_BASE - layout.vaddr_min;
 
     // 5. Create VMAs for each PT_LOAD segment
-    let vmas = build_vmas(&layout, base, &backing);
+    let mut vmas = build_vmas(&layout, base, &backing);
 
     // 6. Read and parse relocation tables from block map
     let rela_data = if dyn_info.rela_size > 0 {
@@ -1159,7 +1275,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
 
     // 7. Load shared libraries from block map (no full binary read)
     // Read DT_STRTAB from block map to get library names
-    let loaded_libs = if !dyn_info.needed_strtab_offsets.is_empty() && dyn_info.strsz > 0 {
+    let mut loaded_libs = if !dyn_info.needed_strtab_offsets.is_empty() && dyn_info.strsz > 0 {
         let strtab_file_off = vaddr_to_file_offset(&layout.segments, dyn_info.strtab_vaddr);
         let strtab_data = read_file_range(backing.as_ref(), strtab_file_off, dyn_info.strsz as usize);
 
@@ -1205,7 +1321,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
                 Ok((lib, rw_vaddr, rw_end_vaddr)) => {
                     let t_load2 = crate::clock::nanos_since_boot();
                     log!("dynamic: loaded {} base={:#x} ({} syms, read={}ms load={}ms)",
-                        lib_name, lib.base.raw(), lib.sym_count,
+                        lib_name, lib.phys_base.raw(), lib.sym_count,
                         (t_load1 - t_load0) / 1_000_000, (t_load2 - t_load1) / 1_000_000);
                     let lib = elf::cache_loaded_lib_pub(&lib_path, lib, rw_vaddr, rw_end_vaddr);
                     libs.push(lib);
@@ -1240,7 +1356,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
             let mut exe_sym_map = if sym_count > 0 {
                 let symtab_file_off = vaddr_to_file_offset(&layout.segments, dyn_info.symtab_vaddr);
                 let dynsym_data = read_file_range(backing.as_ref(), symtab_file_off, sym_count * elf::SYM_SIZE);
-                elf::build_exe_sym_map(&dynsym_data, &dynstr_data, sym_count, PhysAddr::new(base))
+                elf::build_exe_sym_map(&dynsym_data, &dynstr_data, sym_count, UserAddr::new(base))
             } else {
                 hashbrown::HashMap::new()
             };
@@ -1250,7 +1366,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
             if exe_sym_map.is_empty() {
                 if let Some((shoff, shnum, shentsize)) = layout.section_headers {
                     let shdr_data = read_file_range(backing.as_ref(), shoff, shnum as usize * shentsize as usize);
-                    if let Some(m) = elf::build_symtab_map(&shdr_data, shentsize, backing.as_ref(), PhysAddr::new(base)) {
+                    if let Some(m) = elf::build_symtab_map(&shdr_data, shentsize, backing.as_ref(), UserAddr::new(base)) {
                         exe_sym_map = m;
                     }
                 }
@@ -1260,24 +1376,8 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
             log!("dynamic: {} exe syms hashed from block map in {}ms",
                 exe_sym_map.len(), (t_syms - t2) / 1_000_000);
 
-            // Resolve lib bind relocs against exe symbols
-            for lib in &libs {
-                elf::resolve_lib_bind_relocs_pub(lib, &exe_sym_map, &libs);
-            }
-
-            // 7c. Resolve exe GLOB_DAT entries against loaded libs → add to reloc index
-            let symtab_file_off = vaddr_to_file_offset(&layout.segments, dyn_info.symtab_vaddr);
-            for &(r_offset, r_sym, _r_addend) in &parsed_relas.glob_dat {
-                if r_sym == 0 { continue; }
-                let sym_data = read_file_range(backing.as_ref(), symtab_file_off + r_sym as u64 * elf::SYM_SIZE as u64, elf::SYM_SIZE);
-                if sym_data.len() < elf::SYM_SIZE { continue; }
-                let sym_name = elf::Elf64Sym::from_slice(&sym_data, 0).name(&dynstr_data);
-                let resolved = libs.iter().find_map(|lib| elf::gnu_dlsym_pub(lib, sym_name));
-                match resolved {
-                    Some(addr) => reloc_index.add_u64(r_offset, addr.raw()),
-                    None => log!("dynamic: unresolved exe symbol: {}", sym_name),
-                }
-            }
+            // NOTE: lib bind relocs and exe GLOB_DAT are deferred until after
+            // VMA addresses are assigned (user_base must be correct for GOT values).
         }
 
         libs
@@ -1290,26 +1390,89 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
     // 8. Create user address space (PML4) — ELF segments are demand-faulted
     let child_addr_space = AddressSpace::new(paging::create_user_pml4());
 
-    // Map shared libraries (physical pages mapped into user address space, eager)
-    for lib in &loaded_libs {
+    // 8a. Map shared libraries via VmaList and assign virtual addresses.
+    // This MUST happen BEFORE relocation processing so that user_base is correct
+    // when GOT entries are written (RELATIVE: user_base + addend, GLOB_DAT: user_base + sym.st_value).
+    for lib in &mut loaded_libs {
         match &lib.memory {
             elf::LibMemory::Owned(alloc) => {
-                child_addr_space.map_user(PhysAddr::from_ptr(alloc.ptr()), alloc.size() as u64);
+                let phys = PhysAddr::from_ptr(alloc.ptr());
+                let region = child_addr_space.map_region(&mut vmas, phys, alloc.size() as u64);
+                lib.user_base = region.vaddr();
             }
             elf::LibMemory::Shared { rw_alloc, cached_addr, cached_size, rw_offset, .. } => {
                 let cached_phys = *cached_addr;
-                child_addr_space.map_user_readonly(cached_phys, *cached_size as u64);
+                let region = child_addr_space.map_region(&mut vmas, cached_phys, *cached_size as u64);
+                let lib_vaddr = region.vaddr();
                 let num_rw_pages = rw_alloc.size() / paging::PAGE_2M as usize;
                 for i in 0..num_rw_pages {
-                    let user_virt = cached_phys.raw() + *rw_offset as u64 + i as u64 * paging::PAGE_2M;
+                    let user_virt = lib_vaddr.raw() + *rw_offset as u64 + i as u64 * paging::PAGE_2M;
                     let phys = PhysAddr::from_ptr(rw_alloc.ptr()) + i as u64 * paging::PAGE_2M;
-                    child_addr_space.remap_user_2m(UserAddr::new(user_virt), phys);
+                    child_addr_space.remap_2m(UserAddr::new(user_virt), phys, true);
                 }
+                lib.user_base = lib_vaddr;
             }
         }
     }
 
-    // 9. Stack (eager, physically contiguous)
+    // 8b. Rebase RELATIVE relocations: load_shared_lib applied them with phys_base,
+    // but now user_base differs. Add delta = (user_base - phys_base) to each entry.
+    for lib in &loaded_libs {
+        let delta = lib.user_base.raw() as i64 - lib.phys_base.raw() as i64;
+        if delta != 0 {
+            elf::rebase_relative_relocs(lib, delta);
+        }
+    }
+
+    // 8c. NOW process library bind relocations (user_base is correct for all libs).
+    if !loaded_libs.is_empty() {
+        // Rebuild exe_sym_map (we need it for bind relocs and exe GLOB_DAT)
+        let dynstr_file_off = vaddr_to_file_offset(&layout.segments, dyn_info.strtab_vaddr);
+        let dynstr_data = if dyn_info.strsz > 0 {
+            read_file_range(backing.as_ref(), dynstr_file_off, dyn_info.strsz as usize)
+        } else {
+            Vec::new()
+        };
+
+        let sym_count = if dyn_info.gnu_hash_vaddr != 0 {
+            let gnu_hash_file_off = vaddr_to_file_offset(&layout.segments, dyn_info.gnu_hash_vaddr);
+            let gnu_hash_data = read_file_range(backing.as_ref(), gnu_hash_file_off, 64 * 1024);
+            elf::gnu_hash_sym_count_from_data(&gnu_hash_data)
+        } else if dyn_info.symtab_vaddr != 0 && dyn_info.strtab_vaddr > dyn_info.symtab_vaddr {
+            ((dyn_info.strtab_vaddr - dyn_info.symtab_vaddr) / 24) as usize
+        } else {
+            0
+        };
+
+        let exe_sym_map = if sym_count > 0 {
+            let symtab_file_off = vaddr_to_file_offset(&layout.segments, dyn_info.symtab_vaddr);
+            let dynsym_data = read_file_range(backing.as_ref(), symtab_file_off, sym_count * elf::SYM_SIZE);
+            elf::build_exe_sym_map(&dynsym_data, &dynstr_data, sym_count, UserAddr::new(base))
+        } else {
+            hashbrown::HashMap::new()
+        };
+
+        // Resolve lib bind relocs against exe symbols (NOW user_base is correct)
+        for lib in &loaded_libs {
+            elf::resolve_lib_bind_relocs_pub(lib, &exe_sym_map, &loaded_libs);
+        }
+
+        // Resolve exe GLOB_DAT entries against loaded libs
+        let symtab_file_off = vaddr_to_file_offset(&layout.segments, dyn_info.symtab_vaddr);
+        for &(r_offset, r_sym, _r_addend) in &parsed_relas.glob_dat {
+            if r_sym == 0 { continue; }
+            let sym_data = read_file_range(backing.as_ref(), symtab_file_off + r_sym as u64 * elf::SYM_SIZE as u64, elf::SYM_SIZE);
+            if sym_data.len() < elf::SYM_SIZE { continue; }
+            let sym_name = elf::Elf64Sym::from_slice(&sym_data, 0).name(&dynstr_data);
+            let resolved = loaded_libs.iter().find_map(|lib| elf::gnu_dlsym_pub(lib, sym_name));
+            match resolved {
+                Some(addr) => reloc_index.add_u64(r_offset, addr.raw()),
+                None => log!("dynamic: unresolved exe symbol: {}", sym_name),
+            }
+        }
+    }
+
+    // 9. Stack at fixed virtual address (STACK_BASE from vma.rs)
     let stack_alloc = match OwnedAlloc::new(USER_STACK_SIZE, PAGE_2M as usize) {
         Some(a) => a,
         None => {
@@ -1318,9 +1481,10 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
         }
     };
     let stack_phys = PhysAddr::from_ptr(stack_alloc.ptr());
-    let stack_base = stack_phys.raw();
-    let stack_top = stack_base + USER_STACK_SIZE as u64;
-    child_addr_space.map_user(stack_phys, USER_STACK_SIZE as u64);
+    let stack_vaddr = UserAddr::new(crate::vma::STACK_BASE);
+    let user_stack = UserStack::new(stack_vaddr, stack_phys, USER_STACK_SIZE as u64);
+    child_addr_space.map_at(stack_vaddr, stack_phys, USER_STACK_SIZE as u64);
+
 
     // 10. TLS setup — read exe TLS template from page cache, build multi-module layout
     let exe_tls_template = if layout.tls_memsz > 0 {
@@ -1421,10 +1585,31 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
             }
         }
     };
-    child_addr_space.map_user(PhysAddr::from_ptr(tls_alloc.ptr()), tls_alloc.size() as u64);
+    // TLS mapped via VmaList — rebase all user-visible pointers from phys to vaddr
+    let tls_phys = PhysAddr::from_ptr(tls_alloc.ptr());
+    let tls_region = child_addr_space.map_region(&mut vmas, tls_phys, tls_alloc.size() as u64);
+    let tls_rebase = tls_region.vaddr().raw() as i64 - tls_phys.raw() as i64;
+    let fs_base = (fs_base as i64 + tls_rebase) as u64;
+    // Fix self-pointer (TCB[0]) and DTV pointer (TCB[8]) in the TLS block
+    unsafe {
+        let tp_kern = tls_phys.as_mut_ptr::<u8>().add((fs_base - tls_region.vaddr().raw()) as usize);
+        let self_ptr = tp_kern as *mut u64;
+        *self_ptr = fs_base; // TCB[0] = self-pointer (user vaddr)
+        let dtv_phys = *self_ptr.add(1); // TCB[8] = DTV pointer (still phys)
+        *self_ptr.add(1) = (dtv_phys as i64 + tls_rebase) as u64; // rebase DTV pointer
+        // Rebase DTV entries
+        let dtv_kern = tls_phys.as_mut_ptr::<u64>(); // DTV is at start of allocation
+        let dtv_len = *dtv_kern.add(1) as usize; // dtv[1] = capacity
+        for i in 0..dtv_len {
+            let entry = *dtv_kern.add(2 + i);
+            if entry != !0u64 && entry != 0 { // not unallocated or null
+                *dtv_kern.add(2 + i) = (entry as i64 + tls_rebase) as u64;
+            }
+        }
+    }
 
     let entry = base + layout.entry_vaddr;
-    let sp = write_argv_to_stack(stack_top, argv);
+    let sp = user_stack.write_argv(argv);
 
     let t_tls = crate::clock::nanos_since_boot();
 
@@ -1435,12 +1620,12 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
             sh_off, sh_num as usize, sh_entsize as usize,
             base,
             base + layout.vaddr_min, base + layout.vaddr_max,
-            stack_base, stack_top,
+            user_stack.base().raw(), user_stack.top(),
         )
     } else {
         ProcessSymbols::empty_with_bounds(
             base + layout.vaddr_min, base + layout.vaddr_max,
-            stack_base, stack_top,
+            user_stack.base().raw(), user_stack.top(),
         )
     };
 
@@ -1493,8 +1678,8 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
         symbols: syms,
         loaded_libs,
         mmap_regions: Vec::new(),
-        user_stack_base: UserAddr::new(stack_base),
-        user_stack_size: USER_STACK_SIZE as u64,
+        user_stack_base: user_stack.base(),
+        user_stack_size: user_stack.size(),
         env,
         syscall_counts: [0; 64],
         syscall_total: 0,
@@ -1615,7 +1800,7 @@ fn teardown_scheduling(table: &mut ProcessTable, process_pid: Pid, addr_space: A
     }
 
     shared_memory::cleanup_process(process_pid);
-    pipe::cleanup_address_space(&addr_space);
+    // Pipe mappings are cleaned up via FD close in teardown_resources.
     addr_space.mark_dead();
 
     let entry = table.get_mut(main_tid).unwrap();
@@ -1712,9 +1897,8 @@ pub fn thread_exit(code: i32) -> ! {
                 let data_arc = current_data();
                 let mut data = data_arc.lock();
                 fd::close_all(&mut data.fds, &mut *vfs::lock(), current_process());
-                if let (Some(tls), Some(addr_space)) = (data.tls_alloc.as_ref(), addr_space.as_ref()) {
-                    addr_space.unmap_user(PhysAddr::from_ptr(tls.ptr()), tls.size() as u64);
-                }
+                // TLS page table entries are cleaned up when the AddressSpace is dropped.
+                // The physical memory is freed when tls_alloc is dropped below.
                 data.tls_alloc.take();
             }
 
@@ -1776,7 +1960,7 @@ pub fn block_poll(fds: [u64; 64], len: u32, deadline: u64) {
     let mut events = [EventSource::Keyboard; 16];
     let mut event_count = 0usize;
 
-    let data_arc = current_data();
+    let data_arc = fd_owner_data();
     let mut data = data_arc.lock();
     data.poll_fds = fds;
     data.poll_len = len;
@@ -2019,10 +2203,19 @@ pub fn handle_page_fault(fault_addr: u64, _error_code: u64) -> bool {
     }
 
     // Map the 2MB page (writable if any overlapping VMA is writable)
-    addr_space.remap_user_2m_rw(UserAddr::new(region_start), phys, writable);
+    addr_space.remap_2m(UserAddr::new(region_start), phys, writable);
     cpu::flush_tlb();
 
     data.demand_allocs.push(alloc);
+
+    // Record fault for crash diagnostics
+    data.fault_trace.record(PageFaultRecord {
+        fault_addr,
+        page_elf_offset: region_start.wrapping_sub(elf_base),
+        block_idx: (region_start / paging::PAGE_2M) as u32,
+        reloc_count: 0,
+        flags: if writable { 1 } else { 0 },
+    });
 
     true
 }
@@ -2185,6 +2378,9 @@ pub fn kill_process(target_pid: Pid) -> u64 {
         data.stack_alloc.take();
         data.loaded_libs.clear();
         data.mmap_regions.clear();
+        data.demand_allocs.clear();
+        data.vmas.clear();
+        data.reloc_index = None;
     }
 
     // Phase 3: Scheduling teardown (table lock)
@@ -2216,7 +2412,7 @@ pub fn kill_process(target_pid: Pid) -> u64 {
             if let Some(addr_space) = ctx.address_space.take() {
                 if !addr_space.is_dead() {
                     shared_memory::cleanup_process(target_pid);
-                    pipe::cleanup_address_space(&addr_space);
+                    // Pipe mappings are cleaned up via FD close in teardown_resources.
                     addr_space.mark_dead();
                 }
             }

@@ -22,11 +22,11 @@ use std::net::Ipv4Addr;
 // --- smoltcp Device wrapper ---
 
 struct DmaNic {
-    rx_bufs: [*const u8; 3],
+    rx_base: *const u8,
+    rx_buf_size: usize,
     tx_buf: *mut u8,
     net_hdr_size: usize,
     mac: [u8; 6],
-    pending_rx: Option<(usize, usize)>,
     nic_fd: Fd,
 }
 
@@ -39,31 +39,28 @@ impl DmaNic {
         assert_eq!(n, info_bytes.len(), "netd: NicInfo size mismatch");
         let info: toyos_abi::net::NicInfo = unsafe { core::ptr::read(info_bytes.as_ptr() as *const _) };
 
-        let mut rx_bufs = [core::ptr::null::<u8>(); 3];
-        for i in 0..info.rx_buf_count as usize {
-            let region = shm::SharedMemory::map(info.rx_buf_tokens[i], 4096);
-            rx_bufs[i] = region.as_ptr() as *const u8;
-            std::mem::forget(region);
-        }
+        let rx_buf_count = info.rx_buf_count as usize;
+        let rx_buf_size = info.rx_buf_size as usize;
+        let rx_region = shm::SharedMemory::map(info.rx_buf_token, rx_buf_count * rx_buf_size);
+        let rx_base = rx_region.as_ptr() as *const u8;
+        std::mem::forget(rx_region);
+
         let tx_region = shm::SharedMemory::map(info.tx_buf_token, 4096);
         let tx_ptr = tx_region.as_ptr();
         std::mem::forget(tx_region);
 
         Self {
-            rx_bufs,
+            rx_base,
+            rx_buf_size,
             tx_buf: tx_ptr,
             net_hdr_size: info.net_hdr_size as usize,
             mac: info.mac,
-            pending_rx: None,
             nic_fd,
         }
     }
 
-    fn try_recv(&mut self) {
-        if self.pending_rx.is_some() {
-            return;
-        }
-        self.pending_rx = toyos_nic::nic_rx_poll();
+    fn rx_buf(&self, idx: usize) -> *const u8 {
+        unsafe { self.rx_base.add(idx * self.rx_buf_size) }
     }
 }
 
@@ -72,10 +69,10 @@ impl Device for DmaNic {
     type TxToken<'a> = DmaTxToken<'a>;
 
     fn receive(&mut self, _timestamp: SmoltcpInstant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        let (buf_idx, frame_len) = self.pending_rx.take()?;
+        let (buf_idx, frame_len) = toyos_nic::nic_rx_poll()?;
         let data = unsafe {
             core::slice::from_raw_parts(
-                self.rx_bufs[buf_idx].add(self.net_hdr_size),
+                self.rx_buf(buf_idx).add(self.net_hdr_size),
                 frame_len,
             )
         };
@@ -949,8 +946,6 @@ fn main() {
 
     loop {
         let now = SmoltcpInstant::from_millis(epoch.elapsed().as_millis() as i64);
-
-        device.try_recv();
         iface.poll(now, &mut device, &mut socket_set);
 
         daemon.process_pending(&mut socket_set);
@@ -964,11 +959,10 @@ fn main() {
             None => Duration::from_millis(50),
         };
 
-        let has_pending = !daemon.pending_udp_recvs.is_empty()
+        let has_pending_async = !daemon.pending_udp_recvs.is_empty()
             || !daemon.pending_dns.is_empty()
-            || !daemon.pending_piped_connects.is_empty()
-            || !daemon.piped_connections.is_empty();
-        if has_pending {
+            || !daemon.pending_piped_connects.is_empty();
+        if has_pending_async {
             timeout = timeout.min(Duration::from_millis(1));
         }
 

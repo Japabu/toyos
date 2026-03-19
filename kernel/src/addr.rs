@@ -239,7 +239,9 @@ impl fmt::LowerHex for VirtAddr {
 // ---------------------------------------------------------------------------
 
 impl UserAddr {
-    pub const fn new(v: u64) -> Self {
+    /// Only VmaList, address space constants, and kernel internals create these.
+    /// Syscall handlers and driver code use VmaList::alloc_region instead.
+    pub(crate) const fn new(v: u64) -> Self {
         Self(v)
     }
 

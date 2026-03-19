@@ -45,13 +45,6 @@ pub const COMMON_QUEUE_DEVICE: u64 = 0x30;
 const VIRTQ_DESC_F_NEXT: u16 = 1;
 const VIRTQ_DESC_F_WRITE: u16 = 2;
 
-const QUEUE_SIZE: u16 = 16;
-
-// Virtqueue layout offsets within a DMA page
-const DESC_OFFSET: u64 = 0x000;
-const AVAIL_OFFSET: u64 = 0x100;
-const USED_OFFSET: u64 = 0x200;
-
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct VirtqDesc {
@@ -61,25 +54,14 @@ struct VirtqDesc {
     next: u16,
 }
 
-#[repr(C)]
-struct VirtqAvail {
-    flags: u16,
-    idx: u16,
-    ring: [u16; QUEUE_SIZE as usize],
-}
+// Avail ring layout: flags(u16) + idx(u16) + ring[size](u16 each)
+const AVAIL_IDX_OFF: usize = 2;
+const AVAIL_RING_OFF: usize = 4;
 
-#[repr(C)]
-struct VirtqUsedElem {
-    id: u32,
-    len: u32,
-}
-
-#[repr(C)]
-struct VirtqUsed {
-    flags: u16,
-    idx: u16,
-    ring: [VirtqUsedElem; QUEUE_SIZE as usize],
-}
+// Used ring layout: flags(u16) + idx(u16) + ring[size](id:u32 + len:u32 each)
+const USED_IDX_OFF: usize = 2;
+const USED_RING_OFF: usize = 4;
+const USED_ELEM_SIZE: usize = 8; // id(u32) + len(u32)
 
 /// Parsed VirtIO PCI capability locations.
 struct VirtioPciConfig {
@@ -132,10 +114,76 @@ impl VirtioPciConfig {
     }
 }
 
-/// A VirtIO split virtqueue backed by a single DMA page.
+/// DMA region specification for a virtqueue.
+pub struct VirtqueueRegions {
+    pub desc_phys: u64,
+    pub desc_virt: *mut u8,
+    pub desc_size: usize,
+    pub avail_phys: u64,
+    pub avail_virt: *mut u8,
+    pub avail_size: usize,
+    pub used_phys: u64,
+    pub used_virt: *mut u8,
+    pub used_size: usize,
+}
+
+impl VirtqueueRegions {
+    /// Compute regions from a single contiguous DMA buffer.
+    /// Desc, avail, used are packed sequentially with proper alignment.
+    pub fn from_contiguous(phys: u64, virt: *mut u8, queue_size: u16) -> Self {
+        let desc_size = queue_size as usize * core::mem::size_of::<VirtqDesc>();
+        let avail_size = 4 + queue_size as usize * 2; // flags + idx + ring
+        let used_size = 4 + queue_size as usize * USED_ELEM_SIZE; // flags + idx + ring
+
+        // Avail starts after desc, aligned to 2
+        let avail_off = (desc_size + 1) & !1;
+        // Used starts after avail, aligned to 4
+        let used_off = (avail_off + avail_size + 3) & !3;
+
+        Self {
+            desc_phys: phys,
+            desc_virt: virt,
+            desc_size,
+            avail_phys: phys + avail_off as u64,
+            avail_virt: unsafe { virt.add(avail_off) },
+            avail_size,
+            used_phys: phys + used_off as u64,
+            used_virt: unsafe { virt.add(used_off) },
+            used_size,
+        }
+    }
+
+    /// Compute regions from three separate DMA pages.
+    pub fn from_separate_pages(
+        desc_phys: u64, desc_virt: *mut u8,
+        avail_phys: u64, avail_virt: *mut u8,
+        used_phys: u64, used_virt: *mut u8,
+        queue_size: u16,
+    ) -> Self {
+        Self {
+            desc_phys,
+            desc_virt,
+            desc_size: queue_size as usize * core::mem::size_of::<VirtqDesc>(),
+            avail_phys,
+            avail_virt,
+            avail_size: 4 + queue_size as usize * 2,
+            used_phys,
+            used_virt,
+            used_size: 4 + queue_size as usize * USED_ELEM_SIZE,
+        }
+    }
+
+}
+
+/// A VirtIO split virtqueue.
 pub struct Virtqueue {
-    base_phys: crate::DmaAddr,
-    base_virt: *mut u8,
+    desc_virt: *mut VirtqDesc,
+    avail_virt: *mut u8,
+    used_virt: *const u8,
+    desc_phys: u64,
+    avail_phys: u64,
+    used_phys: u64,
+    size: u16,
     next_desc: u16,
     last_used_idx: u16,
     notify_offset: u16,
@@ -150,28 +198,57 @@ pub enum BufDir {
 }
 
 impl Virtqueue {
-    /// Create a new virtqueue backed by the given DMA page.
-    /// `phys` is the physical address (for device registers), `virt` is the kernel pointer.
+    /// Create a new virtqueue from a contiguous DMA region that fits in one page.
     pub fn new(phys: crate::DmaAddr, virt: *mut u8) -> Self {
+        let regions = VirtqueueRegions::from_contiguous(phys.raw(), virt, 16);
         unsafe { write_bytes(virt, 0, 4096); }
+        Self::from_regions(&regions, 16)
+    }
+
+    /// Create a new virtqueue from explicit DMA regions.
+    pub fn from_regions(regions: &VirtqueueRegions, queue_size: u16) -> Self {
+        unsafe {
+            write_bytes(regions.desc_virt, 0, regions.desc_size);
+            write_bytes(regions.avail_virt, 0, regions.avail_size);
+            write_bytes(regions.used_virt as *mut u8, 0, regions.used_size);
+        }
         Self {
-            base_phys: phys,
-            base_virt: virt,
+            desc_virt: regions.desc_virt as *mut VirtqDesc,
+            avail_virt: regions.avail_virt,
+            used_virt: regions.used_virt as *const u8,
+            desc_phys: regions.desc_phys,
+            avail_phys: regions.avail_phys,
+            used_phys: regions.used_phys,
+            size: queue_size,
             next_desc: 0,
             last_used_idx: 0,
             notify_offset: 0,
         }
     }
 
-    /// Virtual pointers for kernel read/write access.
-    fn descs(&self) -> *mut VirtqDesc { unsafe { self.base_virt.add(DESC_OFFSET as usize) as *mut VirtqDesc } }
-    fn avail(&self) -> *mut VirtqAvail { unsafe { self.base_virt.add(AVAIL_OFFSET as usize) as *mut VirtqAvail } }
-    fn used(&self) -> *const VirtqUsed { unsafe { self.base_virt.add(USED_OFFSET as usize) as *const VirtqUsed } }
-
     /// Physical addresses for device register programming.
-    fn descs_phys(&self) -> u64 { self.base_phys.raw() + DESC_OFFSET }
-    fn avail_phys(&self) -> u64 { self.base_phys.raw() + AVAIL_OFFSET }
-    fn used_phys(&self) -> u64 { self.base_phys.raw() + USED_OFFSET }
+    pub fn descs_phys(&self) -> u64 { self.desc_phys }
+    pub fn avail_phys(&self) -> u64 { self.avail_phys }
+    pub fn used_phys(&self) -> u64 { self.used_phys }
+
+    // Avail ring accessors via raw pointer math
+    fn avail_idx_ptr(&self) -> *mut u16 {
+        unsafe { self.avail_virt.add(AVAIL_IDX_OFF) as *mut u16 }
+    }
+    fn avail_ring_ptr(&self, i: u16) -> *mut u16 {
+        unsafe { self.avail_virt.add(AVAIL_RING_OFF + i as usize * 2) as *mut u16 }
+    }
+
+    // Used ring accessors via raw pointer math
+    fn used_idx_ptr(&self) -> *const u16 {
+        unsafe { self.used_virt.add(USED_IDX_OFF) as *const u16 }
+    }
+    fn used_ring_id_ptr(&self, i: u16) -> *const u32 {
+        unsafe { self.used_virt.add(USED_RING_OFF + i as usize * USED_ELEM_SIZE) as *const u32 }
+    }
+    fn used_ring_len_ptr(&self, i: u16) -> *const u32 {
+        unsafe { self.used_virt.add(USED_RING_OFF + i as usize * USED_ELEM_SIZE + 4) as *const u32 }
+    }
 
     /// The descriptor index that will be used by the next submit call.
     pub fn next_desc_id(&self) -> u16 {
@@ -187,13 +264,12 @@ impl Virtqueue {
         notify_multiplier: u32,
         queue_index: u16,
     ) -> u16 {
-        let descs = self.descs();
-
+        let size = self.size;
         let first_desc = self.next_desc;
         for (i, (addr, len, dir)) in bufs.iter().enumerate() {
-            let desc_idx = (first_desc + i as u16) % QUEUE_SIZE;
+            let desc_idx = (first_desc + i as u16) % size;
             let is_last = i == bufs.len() - 1;
-            let next_idx = (desc_idx + 1) % QUEUE_SIZE;
+            let next_idx = (desc_idx + 1) % size;
 
             let mut flags: u16 = match dir {
                 BufDir::Readable => 0,
@@ -204,16 +280,15 @@ impl Virtqueue {
             }
 
             let desc = VirtqDesc { addr: *addr, len: *len, flags, next: next_idx };
-            unsafe { write_volatile(descs.add(desc_idx as usize), desc); }
+            unsafe { write_volatile(self.desc_virt.add(desc_idx as usize), desc); }
         }
-        self.next_desc = (first_desc + bufs.len() as u16) % QUEUE_SIZE;
+        self.next_desc = (first_desc + bufs.len() as u16) % size;
 
-        let avail = self.avail();
-        let avail_idx = unsafe { read_volatile(&raw const (*avail).idx) };
+        let avail_idx = unsafe { read_volatile(self.avail_idx_ptr()) };
         unsafe {
-            write_volatile(&raw mut (*avail).ring[(avail_idx % QUEUE_SIZE) as usize], first_desc);
+            write_volatile(self.avail_ring_ptr(avail_idx % size), first_desc);
             fence(Ordering::Release);
-            write_volatile(&raw mut (*avail).idx, avail_idx.wrapping_add(1));
+            write_volatile(self.avail_idx_ptr(), avail_idx.wrapping_add(1));
         }
 
         fence(Ordering::Release);
@@ -225,24 +300,23 @@ impl Virtqueue {
 
     /// Check if the device has completed any request.
     pub fn has_used(&self) -> bool {
-        let used = self.used();
-        let used_idx = unsafe { read_volatile(&raw const (*used).idx) };
+        let used_idx = unsafe { read_volatile(self.used_idx_ptr()) };
         used_idx != self.last_used_idx
     }
 
     /// Non-blocking poll of the used ring. Returns `(descriptor_id, written_len)` if
     /// the device has completed a request, or `None` if nothing new.
     pub fn poll_used(&mut self) -> Option<(u16, u32)> {
-        let used = self.used();
-        let used_idx = unsafe { read_volatile(&raw const (*used).idx) };
+        let used_idx = unsafe { read_volatile(self.used_idx_ptr()) };
         if used_idx == self.last_used_idx {
             return None;
         }
-        let entry = unsafe {
-            read_volatile(&raw const (*used).ring[(self.last_used_idx % QUEUE_SIZE) as usize])
-        };
+        fence(Ordering::Acquire);
+        let slot = self.last_used_idx % self.size;
+        let id = unsafe { read_volatile(self.used_ring_id_ptr(slot)) };
+        let len = unsafe { read_volatile(self.used_ring_len_ptr(slot)) };
         self.last_used_idx = self.last_used_idx.wrapping_add(1);
-        Some((entry.id as u16, entry.len))
+        Some((id as u16, len))
     }
 
     /// Submit a descriptor chain and wait for the device to complete it.
@@ -341,8 +415,8 @@ impl VirtioDevice {
         common.write_u16(COMMON_QUEUE_SELECT, index);
 
         let max_size = common.read_u16(COMMON_QUEUE_SIZE);
-        assert!(max_size >= QUEUE_SIZE, "VirtIO: queue {} too small (max={})", index, max_size);
-        common.write_u16(COMMON_QUEUE_SIZE, QUEUE_SIZE);
+        assert!(max_size >= queue.size, "VirtIO: queue {} too small (max={}, need={})", index, max_size, queue.size);
+        common.write_u16(COMMON_QUEUE_SIZE, queue.size);
 
         common.write_u64(COMMON_QUEUE_DESC, queue.descs_phys());
         common.write_u64(COMMON_QUEUE_DRIVER, queue.avail_phys());

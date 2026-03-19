@@ -73,6 +73,15 @@ impl<'a> SyscallContext<'a> {
 
     /// Validate a user pointer range and return a shared byte slice.
     /// The returned slice points into the kernel direct map.
+    ///
+    /// Safe only if the user buffer is physically contiguous (single 2MB page
+    /// or contiguous allocation like stack/TLS/mmap). For buffers that may
+    /// span independently demand-paged 2MB pages, the physical pages might not
+    /// be contiguous — the slice would read wrong memory at page boundaries.
+    ///
+    /// Currently safe because: stack (contiguous OwnedAlloc), TLS (contiguous),
+    /// mmap (contiguous), pipes (single 2MB page). Demand-paged ELF code is
+    /// never accessed via user_slice (only via page fault handler).
     pub fn user_slice(&self, ptr: UserAddr, len: u64) -> Option<&'a [u8]> {
         let len = len as usize;
         if len == 0 {
@@ -81,16 +90,22 @@ impl<'a> SyscallContext<'a> {
         if !check_user_range(ptr, len as u64) {
             return None;
         }
-        // For slices that may span multiple pages, we need to check that
-        // the physical pages are contiguous. In ToyOS, physically contiguous
-        // 2MB allocations (stack, TLS, pipes) ARE contiguous. ELF segments
-        // mapped via demand paging are also contiguous (allocated as
-        // contiguous physical blocks).
         let kptr = translate(ptr.raw())?;
+        // Verify the end of the buffer maps to the expected physical address.
+        // If not, the buffer crosses a non-contiguous 2MB page boundary.
+        if len > 1 {
+            let end_addr = ptr.raw() + len as u64 - 1;
+            let end_kptr = translate(end_addr)?;
+            let expected_end = unsafe { kptr.add(len - 1) };
+            if end_kptr != expected_end {
+                return None; // Non-contiguous: caller must use per-page copies
+            }
+        }
         Some(unsafe { core::slice::from_raw_parts(kptr as *const u8, len) })
     }
 
     /// Validate a user pointer range and return a mutable byte slice.
+    /// Same contiguity constraints as user_slice.
     pub fn user_slice_mut(&self, ptr: UserAddr, len: u64) -> Option<&'a mut [u8]> {
         let len = len as usize;
         if len == 0 {
@@ -100,6 +115,14 @@ impl<'a> SyscallContext<'a> {
             return None;
         }
         let kptr = translate(ptr.raw())?;
+        if len > 1 {
+            let end_addr = ptr.raw() + len as u64 - 1;
+            let end_kptr = translate(end_addr)?;
+            let expected_end = unsafe { kptr.add(len - 1) };
+            if end_kptr != expected_end {
+                return None;
+            }
+        }
         Some(unsafe { core::slice::from_raw_parts_mut(kptr, len) })
     }
 

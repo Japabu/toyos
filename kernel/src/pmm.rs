@@ -149,6 +149,7 @@ impl BuddyAllocator {
             }
         }
 
+
         // Clear bitmap bits
         for i in 0..page_count {
             self.clear_allocated(pfn as usize + i);
@@ -364,6 +365,8 @@ fn build_free_lists(buddy: &mut BuddyAllocator) {
             order += 1;
         }
 
+        // Skip poisoning during init — too slow for millions of pages.
+        // Pages will be poisoned on their first free after allocation.
         buddy.list_insert(pfn as u64, order);
         buddy.free_pages += 1 << order;
         pfn += 1 << order;

@@ -4,11 +4,20 @@ use alloc::vec::Vec;
 use crate::id_map::IdMap;
 use crate::process::Pid;
 use crate::vfs::Vfs;
-use crate::{device, keyboard, listener, mouse, pipe};
+use crate::{device, keyboard, listener, mouse, pipe, UserAddr};
 use crate::pipe::{PipeId, PipeReader, PipeWriter};
 use crate::drivers::serial;
 pub use toyos_abi::FramebufferInfo;
 use toyos_abi::syscall::{FileType, OpenFlags, SeekFrom, SyscallError};
+
+/// Tracks a pipe's mapping into a process's virtual address space.
+/// Created by sys_pipe_map, cleaned up when the FD is closed.
+#[derive(Clone)]
+#[allow(dead_code)]
+pub struct PipeMapping {
+    pub vaddr: UserAddr,
+    pub size: u64,
+}
 
 #[derive(Clone)]
 pub struct OpenFile {
@@ -29,8 +38,8 @@ pub struct OpenFile {
 /// No manual refcount management anywhere else in the kernel.
 pub enum Descriptor {
     File(OpenFile),
-    PipeRead(PipeReader),
-    PipeWrite(PipeWriter),
+    PipeRead(PipeReader, Option<PipeMapping>),
+    PipeWrite(PipeWriter, Option<PipeMapping>),
     TtyRead(PipeReader),
     TtyWrite(PipeWriter),
     Keyboard,
@@ -46,8 +55,8 @@ pub enum Descriptor {
 impl Clone for Descriptor {
     fn clone(&self) -> Self {
         match self {
-            Self::PipeRead(r) => Self::PipeRead(r.clone()),
-            Self::PipeWrite(w) => Self::PipeWrite(w.clone()),
+            Self::PipeRead(r, m) => Self::PipeRead(r.clone(), m.clone()),
+            Self::PipeWrite(w, m) => Self::PipeWrite(w.clone(), m.clone()),
             Self::TtyRead(r) => Self::TtyRead(r.clone()),
             Self::TtyWrite(w) => Self::TtyWrite(w.clone()),
             Self::Socket { rx, tx } => Self::Socket { rx: rx.clone(), tx: tx.clone() },
@@ -66,7 +75,7 @@ impl Clone for Descriptor {
 impl Descriptor {
     pub fn pipe_id_read(&self) -> Option<PipeId> {
         match self {
-            Self::PipeRead(r) | Self::TtyRead(r) => Some(r.id()),
+            Self::PipeRead(r, _) | Self::TtyRead(r) => Some(r.id()),
             Self::Socket { rx, .. } => Some(rx.id()),
             _ => None,
         }
@@ -74,7 +83,7 @@ impl Descriptor {
 
     pub fn pipe_id_write(&self) -> Option<PipeId> {
         match self {
-            Self::PipeWrite(w) | Self::TtyWrite(w) => Some(w.id()),
+            Self::PipeWrite(w, _) | Self::TtyWrite(w) => Some(w.id()),
             Self::Socket { tx, .. } => Some(tx.id()),
             _ => None,
         }
@@ -91,10 +100,10 @@ impl Descriptor {
             Self::SerialConsole => Some(EventSource::Keyboard),
             Self::Nic(_) => Some(EventSource::Network),
             Self::Listener(_) => Some(EventSource::Listener),
-            Self::PipeRead(r) | Self::TtyRead(r) => Some(EventSource::PipeReadable(r.id())),
+            Self::PipeRead(r, _) | Self::TtyRead(r) => Some(EventSource::PipeReadable(r.id())),
             Self::Socket { rx, .. } => Some(EventSource::PipeReadable(rx.id())),
             Self::File(_) | Self::Framebuffer(_) | Self::Audio(_) => None,
-            Self::PipeWrite(_) | Self::TtyWrite(_) => None,
+            Self::PipeWrite(..) | Self::TtyWrite(_) => None,
         }
     }
 
@@ -102,12 +111,12 @@ impl Descriptor {
     pub fn write_event_source(&self) -> Option<crate::scheduler::EventSource> {
         use crate::scheduler::EventSource;
         match self {
-            Self::PipeWrite(w) | Self::TtyWrite(w) => Some(EventSource::PipeWritable(w.id())),
+            Self::PipeWrite(w, _) | Self::TtyWrite(w) => Some(EventSource::PipeWritable(w.id())),
             Self::Socket { tx, .. } => Some(EventSource::PipeWritable(tx.id())),
             Self::File(_) | Self::SerialConsole => None, // always writable
             Self::Keyboard | Self::Mouse | Self::Nic(_) | Self::Audio(_)
             | Self::Framebuffer(_) | Self::Listener(_)
-            | Self::PipeRead(_) | Self::TtyRead(_) => None,
+            | Self::PipeRead(..) | Self::TtyRead(_) => None,
         }
     }
 }
@@ -238,7 +247,7 @@ pub fn try_read(table: &mut FdTable, fd: u32, buf: &mut [u8]) -> Option<u64> {
             file.position += count;
             Some(count as u64)
         }
-        Descriptor::PipeRead(r) | Descriptor::TtyRead(r) => {
+        Descriptor::PipeRead(r, _) | Descriptor::TtyRead(r) => {
             pipe::try_read(r.id(), buf).map(|n| n as u64)
         }
         Descriptor::Socket { rx, .. } => {
@@ -305,7 +314,7 @@ pub fn try_read(table: &mut FdTable, fd: u32, buf: &mut [u8]) -> Option<u64> {
             }
             Some(count as u64)
         }
-        Descriptor::Listener(_) | Descriptor::PipeWrite(_) | Descriptor::TtyWrite(_) => {
+        Descriptor::Listener(_) | Descriptor::PipeWrite(..) | Descriptor::TtyWrite(_) => {
             Some(SyscallError::PermissionDenied.to_u64())
         }
     }
@@ -328,7 +337,7 @@ pub fn try_write(table: &mut FdTable, fd: u32, buf: &[u8]) -> Option<u64> {
             file.mtime = crate::clock::nanos_since_boot();
             Some(buf.len() as u64)
         }
-        Descriptor::PipeWrite(w) | Descriptor::TtyWrite(w) => {
+        Descriptor::PipeWrite(w, _) | Descriptor::TtyWrite(w) => {
             match pipe::try_write(w.id(), buf) {
                 Some(pipe::PipeWrite::BrokenPipe) => Some(SyscallError::NotFound.to_u64()),
                 Some(pipe::PipeWrite::Wrote(n)) => Some(n as u64),
@@ -380,7 +389,7 @@ pub fn fstat(table: &FdTable, fd: u32, stat: &mut Stat) -> bool {
             stat.mtime = file.mtime;
             true
         }
-        Some(Descriptor::PipeRead(_) | Descriptor::PipeWrite(_)) => { stat.file_type = FileType::Pipe as u64; true }
+        Some(Descriptor::PipeRead(..) | Descriptor::PipeWrite(..)) => { stat.file_type = FileType::Pipe as u64; true }
         Some(Descriptor::Keyboard) => { stat.file_type = FileType::Keyboard as u64; true }
         Some(Descriptor::Mouse) => { stat.file_type = FileType::Mouse as u64; true }
         Some(Descriptor::SerialConsole) => { stat.file_type = FileType::Serial as u64; true }
@@ -388,7 +397,7 @@ pub fn fstat(table: &FdTable, fd: u32, stat: &mut Stat) -> bool {
         Some(Descriptor::TtyRead(_) | Descriptor::TtyWrite(_)) => { stat.file_type = FileType::Tty as u64; true }
         Some(Descriptor::Socket { .. }) => { stat.file_type = FileType::Socket as u64; true }
         Some(Descriptor::Nic(_)) => { stat.file_type = FileType::Nic as u64; true }
-        Some(Descriptor::Audio(_)) => { stat.file_type = FileType::Nic as u64; true }
+        Some(Descriptor::Audio(_)) => { stat.file_type = FileType::Unknown as u64; true }
         Some(Descriptor::Listener(_)) => { stat.file_type = FileType::Pipe as u64; true }
         None => false,
     }
@@ -460,8 +469,8 @@ pub fn mark_tty(table: &mut FdTable, fd: u32) -> u64 {
         return SyscallError::NotFound.to_u64();
     };
     let new = match desc {
-        Descriptor::PipeRead(r) => Descriptor::TtyRead(r),
-        Descriptor::PipeWrite(w) => Descriptor::TtyWrite(w),
+        Descriptor::PipeRead(r, _mapping) => Descriptor::TtyRead(r),
+        Descriptor::PipeWrite(w, _mapping) => Descriptor::TtyWrite(w),
         Descriptor::TtyRead(_) | Descriptor::TtyWrite(_) => desc,
         other => { table.insert_at(fd, other); return SyscallError::InvalidArgument.to_u64(); }
     };

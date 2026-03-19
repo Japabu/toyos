@@ -66,12 +66,10 @@ pub fn try_claim(device_type: u64, pid: Pid) -> Option<Descriptor> {
             }
             let info = crate::net::nic_info()?;
             *owner = Some(pid);
-            // Grant all DMA buffer tokens to the claiming process
-            for &token in &info.rx_buf_tokens {
-                if shared_memory::grant_kernel(shared_memory::SharedToken::from_raw(token), pid).is_err() {
-                    *owner = None;
-                    return None;
-                }
+            // Grant DMA buffer tokens to the claiming process
+            if shared_memory::grant_kernel(shared_memory::SharedToken::from_raw(info.rx_buf_token), pid).is_err() {
+                *owner = None;
+                return None;
             }
             if shared_memory::grant_kernel(shared_memory::SharedToken::from_raw(info.tx_buf_token), pid).is_err() {
                 *owner = None;

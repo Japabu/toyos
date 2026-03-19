@@ -584,10 +584,11 @@ fn fd_result(r: Result<u32, SyscallError>) -> u64 {
 fn sys_pipe() -> u64 {
     let (reader, writer) = pipe::create();
     process::with_fd_owner_data(|data| {
-        let Ok(read_fd) = fd::alloc(&mut data.fds, fd::Descriptor::PipeRead(reader)) else {
+        let Ok(read_fd) = fd::alloc(&mut data.fds, fd::Descriptor::PipeRead(reader, None)) else {
             return SyscallError::ResourceExhausted.to_u64();
         };
-        let Ok(write_fd) = fd::alloc(&mut data.fds, fd::Descriptor::PipeWrite(writer)) else {
+        let Ok(write_fd) = fd::alloc(&mut data.fds, fd::Descriptor::PipeWrite(writer, None)) else {
+            fd::close(&mut data.fds, &mut *vfs::lock(), read_fd, process::current_process());
             return SyscallError::ResourceExhausted.to_u64();
         };
         ((read_fd as u64) << 32) | write_fd as u64
@@ -599,11 +600,11 @@ fn sys_pipe_open(pipe_id: u64, mode: u64) -> u64 {
     match mode {
         0 => {
             let Some(reader) = pipe::open_reader(id) else { return SyscallError::NotFound.to_u64() };
-            process::with_fd_owner_data(|data| fd_result(fd::alloc(&mut data.fds, fd::Descriptor::PipeRead(reader))))
+            process::with_fd_owner_data(|data| fd_result(fd::alloc(&mut data.fds, fd::Descriptor::PipeRead(reader, None))))
         }
         1 => {
             let Some(writer) = pipe::open_writer(id) else { return SyscallError::NotFound.to_u64() };
-            process::with_fd_owner_data(|data| fd_result(fd::alloc(&mut data.fds, fd::Descriptor::PipeWrite(writer))))
+            process::with_fd_owner_data(|data| fd_result(fd::alloc(&mut data.fds, fd::Descriptor::PipeWrite(writer, None))))
         }
         _ => SyscallError::InvalidArgument.to_u64(),
     }
@@ -612,30 +613,43 @@ fn sys_pipe_open(pipe_id: u64, mode: u64) -> u64 {
 fn sys_pipe_id(fd_num: u32) -> u64 {
     process::with_fd_owner_data(|data| {
         match data.fds.get(fd_num) {
-            Some(fd::Descriptor::PipeRead(r)) | Some(fd::Descriptor::TtyRead(r)) => r.id().raw() as u64,
-            Some(fd::Descriptor::PipeWrite(w)) | Some(fd::Descriptor::TtyWrite(w)) => w.id().raw() as u64,
+            Some(fd::Descriptor::PipeRead(r, _)) | Some(fd::Descriptor::TtyRead(r)) => r.id().raw() as u64,
+            Some(fd::Descriptor::PipeWrite(w, _)) | Some(fd::Descriptor::TtyWrite(w)) => w.id().raw() as u64,
             _ => SyscallError::InvalidArgument.to_u64(),
         }
     })
 }
 
 fn sys_pipe_map(fd_num: u32) -> u64 {
-    let pipe_id = process::with_fd_owner_data(|data| {
-        match data.fds.get(fd_num) {
-            Some(fd::Descriptor::PipeRead(r)) | Some(fd::Descriptor::TtyRead(r)) => Some(r.id()),
-            Some(fd::Descriptor::PipeWrite(w)) | Some(fd::Descriptor::TtyWrite(w)) => Some(w.id()),
+    // Get the pipe's physical address and allocate a vaddr, map it, store in FD
+    process::with_fd_owner_data(|data| {
+        let pipe_id = match data.fds.get(fd_num) {
+            Some(fd::Descriptor::PipeRead(r, _)) | Some(fd::Descriptor::TtyRead(r)) => Some(r.id()),
+            Some(fd::Descriptor::PipeWrite(w, _)) | Some(fd::Descriptor::TtyWrite(w)) => Some(w.id()),
             Some(fd::Descriptor::Socket { rx, .. }) => Some(rx.id()),
             _ => None,
+        };
+        let Some(pipe_id) = pipe_id else {
+            return SyscallError::InvalidArgument.to_u64();
+        };
+        let Some(phys) = pipe::phys_addr(pipe_id) else {
+            return SyscallError::NotFound.to_u64();
+        };
+        let addr_space = crate::scheduler::current_address_space()
+            .expect("sys_pipe_map: no address space");
+        let region = addr_space.map_region(&mut data.vmas, phys, pipe::PIPE_SIZE as u64);
+        let vaddr = region.vaddr();
+
+        // Store the mapping in the FD so it's unmapped on close
+        let mapping = fd::PipeMapping { vaddr, size: region.size() };
+        match data.fds.get_mut(fd_num) {
+            Some(fd::Descriptor::PipeRead(_, ref mut m)) => *m = Some(mapping),
+            Some(fd::Descriptor::PipeWrite(_, ref mut m)) => *m = Some(mapping),
+            _ => {}
         }
-    });
-    let Some(pipe_id) = pipe_id else {
-        return SyscallError::InvalidArgument.to_u64();
-    };
-    let addr_space = process::current_address_space();
-    match pipe::map_into(pipe_id, &addr_space) {
-        Some(addr) => addr,
-        None => SyscallError::NotFound.to_u64(),
-    }
+
+        vaddr.raw()
+    })
 }
 
 fn sys_socket_create(rx_pipe_id_raw: u64, tx_pipe_id_raw: u64) -> u64 {
@@ -915,10 +929,10 @@ fn sys_mmap(req_addr: u64, size: u64, _prot: u64, flags: u64) -> u64 {
         let mut offset = 0u64;
         let mut ok = true;
         while cur < end {
-            if !addr_space.remap_user_2m(UserAddr::new(cur), phys_addr + offset) {
+            if !addr_space.remap_2m(UserAddr::new(cur), phys_addr + offset, true) {
                 let mut undo = start;
                 while undo < cur {
-                    addr_space.clear_user_2m(UserAddr::new(undo));
+                    addr_space.clear_2m(UserAddr::new(undo));
                     undo += paging::PAGE_2M;
                 }
                 ok = false;
@@ -940,14 +954,17 @@ fn sys_mmap(req_addr: u64, size: u64, _prot: u64, flags: u64) -> u64 {
             SyscallError::InvalidArgument.to_u64()
         }
     } else {
-        let addr = PhysAddr::from_ptr(alloc.ptr());
-        paging::map_user(addr, aligned as u64);
-        process::with_current_data(|data| {
+        let phys = PhysAddr::from_ptr(alloc.ptr());
+        let addr_space = process::current_address_space();
+        let vaddr = process::with_current_data(|data| {
+            let region = addr_space.map_region(&mut data.vmas, phys, aligned as u64);
+            let vaddr = region.vaddr();
             data.mmap_regions.push(process::MmapRegion {
-                addr: UserAddr::new(addr.raw()), size: aligned, _alloc: alloc, fixed: false,
+                addr: vaddr, size: aligned, _alloc: alloc, fixed: false,
             });
+            vaddr
         });
-        addr.raw()
+        vaddr.raw()
     }
 }
 
@@ -961,11 +978,12 @@ fn sys_munmap(addr: u64, _size: u64) -> u64 {
                 let mut cur = region.addr.raw();
                 let end = region.addr.raw() + region.size as u64;
                 while cur < end {
-                    addr_space.clear_user_2m(UserAddr::new(cur));
+                    addr_space.clear_2m(UserAddr::new(cur));
                     cur += paging::PAGE_2M;
                 }
             } else {
-                addr_space.unmap_user(PhysAddr::new(region.addr.raw()), region.size as u64);
+                addr_space.unmap_at(region.addr, region.size as u64);
+                data.vmas.free_region(region.addr);
             }
             0
         } else {
@@ -1092,18 +1110,25 @@ fn sys_dup(fd_num: u32) -> u64 {
 }
 
 fn sys_dup2(old_fd: u32, new_fd: u32) -> u64 {
-    process::with_fd_owner_data(|data| {
+    let mut wake_read = None;
+    let mut wake_write = None;
+    let result = process::with_fd_owner_data(|data| {
         let desc = match data.fds.get(old_fd) {
             Some(d) => d.clone(),
             None => return SyscallError::NotFound.to_u64(),
         };
-        if data.fds.get(new_fd).is_some() {
+        if let Some(existing) = data.fds.get(new_fd) {
+            wake_read = existing.pipe_id_read();
+            wake_write = existing.pipe_id_write();
             let mut vfs = vfs::lock();
             fd::close(&mut data.fds, &mut vfs, new_fd, process::current_process());
         }
         data.fds.insert_at(new_fd, desc);
         new_fd as u64
-    })
+    });
+    if let Some(id) = wake_read { process::wake_pipe_readers(id); }
+    if let Some(id) = wake_write { process::wake_pipe_writers(id); }
+    result
 }
 
 fn sys_rename(old: &str, new: &str) -> u64 {
@@ -1167,7 +1192,7 @@ fn sys_dlopen(path: &str) -> u64 {
 
     // Check shared library cache first
     let lib = crate::elf::try_clone_cached(&resolved);
-    let lib = match lib {
+    let mut lib = match lib {
         Some(lib) => lib,
         None => {
             let binary = match vfs::lock().read_file(&resolved) {
@@ -1190,24 +1215,31 @@ fn sys_dlopen(path: &str) -> u64 {
         }
     };
 
+    // Map library via VmaList and update user_base for symbol resolution
     let addr_space = process::current_address_space();
-    match &lib.memory {
-        crate::elf::LibMemory::Owned(alloc) => {
-            addr_space.map_user(PhysAddr::from_ptr(alloc.ptr()), alloc.size() as u64);
-        }
-        crate::elf::LibMemory::Shared { rw_alloc, cached_addr, cached_size, rw_offset, .. } => {
-            let cached_phys = *cached_addr;
-            addr_space.map_user_readonly(cached_phys, *cached_size as u64);
-            let num_rw_pages = rw_alloc.size() / paging::PAGE_2M as usize;
-            for i in 0..num_rw_pages {
-                let user_virt = cached_phys.raw() + *rw_offset as u64 + i as u64 * paging::PAGE_2M;
-                let phys = PhysAddr::from_ptr(rw_alloc.ptr()) + i as u64 * paging::PAGE_2M;
-                addr_space.remap_user_2m(UserAddr::new(user_virt), phys);
+    process::with_fd_owner_data(|data| {
+        match &lib.memory {
+            crate::elf::LibMemory::Owned(alloc) => {
+                let phys = PhysAddr::from_ptr(alloc.ptr());
+                let region = addr_space.map_region(&mut data.vmas, phys, alloc.size() as u64);
+                lib.user_base = region.vaddr();
             }
-            cpu::flush_tlb();
-            apic::tlb_shootdown();
+            crate::elf::LibMemory::Shared { rw_alloc, cached_addr, cached_size, rw_offset, .. } => {
+                let cached_phys = *cached_addr;
+                let region = addr_space.map_region(&mut data.vmas, cached_phys, *cached_size as u64);
+                let lib_vaddr = region.vaddr();
+                let num_rw_pages = rw_alloc.size() / paging::PAGE_2M as usize;
+                for i in 0..num_rw_pages {
+                    let user_virt = lib_vaddr.raw() + *rw_offset as u64 + i as u64 * paging::PAGE_2M;
+                    let phys = PhysAddr::from_ptr(rw_alloc.ptr()) + i as u64 * paging::PAGE_2M;
+                    addr_space.remap_2m(UserAddr::new(user_virt), phys, true);
+                }
+                cpu::flush_tlb();
+                apic::tlb_shootdown();
+                lib.user_base = lib_vaddr;
+            }
         }
-    }
+    });
 
     let lib_has_tls = lib.tls_memsz > 0;
 
@@ -1275,7 +1307,6 @@ fn sys_tls_alloc_block(module_id: u64) -> u64 {
     let alloc = process::OwnedAlloc::new(tls_memsz.max(1), 16)
         .unwrap_or_else(|| panic!("sys_tls_alloc_block: failed to allocate {} bytes", tls_memsz));
     let block_ptr = alloc.ptr();
-    let block_phys = PhysAddr::from_ptr(block_ptr).raw();
 
     // Initialize: copy template, zero BSS
     unsafe {
@@ -1285,8 +1316,13 @@ fn sys_tls_alloc_block(module_id: u64) -> u64 {
         }
     }
 
-    // Map into current process's page tables
-    paging::map_user(PhysAddr::from_ptr(block_ptr), tls_memsz as u64);
+    // Map into current process's virtual address space via VmaList
+    let block_phys_addr = PhysAddr::from_ptr(block_ptr);
+    let tls_vaddr = process::with_fd_owner_data(|data| {
+        let addr_space = process::current_address_space();
+        let region = addr_space.map_region(&mut data.vmas, block_phys_addr, tls_memsz as u64);
+        region.vaddr()
+    });
 
     // Store in THIS THREAD's ProcessData (each thread owns its own TLS blocks).
     process::with_current_data(|data| {
@@ -1294,15 +1330,22 @@ fn sys_tls_alloc_block(module_id: u64) -> u64 {
     });
 
     // Write block address into current thread's DTV.
-    // fs_base = TP (user-visible physical address). TCB[8] = DTV pointer.
-    let tp = PhysAddr::new(crate::arch::read_fs_base()).to_kernel().raw() as *const u64;
-    let dtv_ptr = unsafe { *tp.add(1) }; // TCB[8]
-    assert!(dtv_ptr != 0, "sys_tls_alloc_block: no DTV for module_id={}", module_id);
-    let dtv_kern = PhysAddr::new(dtv_ptr).to_kernel().raw() as *mut u64;
+    // FS base = TP (user-visible virtual address). TCB[8] = DTV pointer (virtual).
+    // We need to translate user virtual addresses to kernel direct-map pointers.
+    let addr_space = process::current_address_space();
+    let tp_virt = crate::arch::read_fs_base();
+    let tp_phys = addr_space.virt_to_phys(UserAddr::new(tp_virt))
+        .expect("sys_tls_alloc_block: TP not mapped");
+    let tp_kern = tp_phys.as_ptr::<u64>();
+    let dtv_virt = unsafe { *tp_kern.add(1) }; // TCB[8] = DTV pointer (virtual)
+    assert!(dtv_virt != 0, "sys_tls_alloc_block: no DTV for module_id={}", module_id);
+    let dtv_phys = addr_space.virt_to_phys(UserAddr::new(dtv_virt))
+        .expect("sys_tls_alloc_block: DTV not mapped");
+    let dtv_kern = dtv_phys.as_mut_ptr::<u64>();
     let dtv_len = unsafe { *dtv_kern.add(1) } as u64;
     assert!(module_id <= dtv_len, "sys_tls_alloc_block: module_id={} exceeds DTV len={}", module_id, dtv_len);
-    unsafe { *dtv_kern.add(2 + (module_id - 1) as usize) = block_phys; }
-    block_phys
+    unsafe { *dtv_kern.add(2 + (module_id - 1) as usize) = tls_vaddr.raw(); }
+    tls_vaddr.raw()
 }
 
 fn sys_dlsym(handle: u64, name: &str) -> u64 {

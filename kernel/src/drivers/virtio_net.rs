@@ -2,7 +2,7 @@ use alloc::boxed::Box;
 use core::ptr::{copy_nonoverlapping, write_bytes};
 
 use super::pci::PciDevice;
-use super::virtio::{BufDir, Virtqueue, VirtioDevice, VIRTIO_F_VERSION_1};
+use super::virtio::{BufDir, Virtqueue, VirtqueueRegions, VirtioDevice, VIRTIO_F_VERSION_1};
 use super::DmaPool;
 use crate::log;
 use crate::net::NicInfo;
@@ -17,19 +17,28 @@ const VIRTIO_NET_F_MAC: u64 = 1 << 5;
 // VirtIO 1.0 net header: always 12 bytes (includes num_buffers) with VERSION_1
 const NET_HDR_SIZE: usize = 12;
 
-// DMA page assignments
-const PAGE_RXQ: usize = 0;
-const PAGE_TXQ: usize = 1;
-const PAGE_RX_BUFS: usize = 2; // 3 pages for RX buffers
-const PAGE_TX_BUF: usize = 5;
-
-const RX_BUF_COUNT: usize = 3;
+const RX_QUEUE_SIZE: u16 = 256;
+const RX_BUF_COUNT: usize = 256;
 const RX_BUF_SIZE: u32 = 4096;
+
+// DMA page assignments:
+// RX queue: desc(1 page) + avail(1 page) + used(1 page) = 3 pages
+// TX queue: fits in 1 page (16 entries)
+// RX buffers: 256 pages
+// TX buffer: 1 page
+// Total: 3 + 1 + 256 + 1 = 261 pages
+const PAGE_RXQ_DESC: usize = 0;
+const PAGE_RXQ_AVAIL: usize = 1;
+const PAGE_RXQ_USED: usize = 2;
+const PAGE_TXQ: usize = 3;
+const PAGE_RX_BUFS: usize = 4;   // 256 pages
+const PAGE_TX_BUF: usize = 260;
+const TOTAL_DMA_PAGES: usize = 261;
 
 const PCI_CAP_MSIX: u8 = 0x11;
 const VIRTIO_NET_VECTOR: u8 = 0x22;
 
-static DMA: Lock<DmaPool<6>> = Lock::new(DmaPool::new());
+static DMA: Lock<DmaPool<TOTAL_DMA_PAGES>> = Lock::new(DmaPool::new());
 
 fn dma_phys(page: usize) -> crate::DmaAddr {
     DMA.lock().page_phys(page)
@@ -51,7 +60,7 @@ struct VirtioNic {
     rx_ptrs: [*mut u8; RX_BUF_COUNT],
     tx_ptr: *mut u8,
     // Maps virtqueue descriptor index -> rx_bufs index
-    desc_to_buf: [usize; 16],
+    desc_to_buf: [u16; RX_QUEUE_SIZE as usize],
 }
 
 unsafe impl Send for VirtioNic {}
@@ -65,7 +74,7 @@ impl VirtioNic {
             self.device.notify_off_multiplier(),
             0,
         );
-        self.desc_to_buf[desc_id as usize] = buf_idx;
+        self.desc_to_buf[desc_id as usize] = buf_idx as u16;
     }
 }
 
@@ -101,7 +110,7 @@ impl crate::net::Nic for VirtioNic {
 
     fn recv(&mut self, buf: &mut [u8]) -> Option<usize> {
         let (desc_id, written_len) = self.rxq.poll_used()?;
-        let buf_idx = self.desc_to_buf[desc_id as usize];
+        let buf_idx = self.desc_to_buf[desc_id as usize] as usize;
         let total = written_len as usize;
         if total <= NET_HDR_SIZE {
             self.refill_rx(buf_idx);
@@ -119,7 +128,7 @@ impl crate::net::Nic for VirtioNic {
 
     fn poll_rx(&mut self) -> Option<(usize, usize)> {
         let (desc_id, written_len) = self.rxq.poll_used()?;
-        let buf_idx = self.desc_to_buf[desc_id as usize];
+        let buf_idx = self.desc_to_buf[desc_id as usize] as usize;
         let total = written_len as usize;
         if total <= NET_HDR_SIZE {
             self.refill_rx(buf_idx);
@@ -210,12 +219,21 @@ pub fn init(ecam_base: u64) {
 
     let device = VirtioDevice::init(&pci_dev, VIRTIO_F_VERSION_1 | VIRTIO_NET_F_MAC);
 
-    let mut rxq = Virtqueue::new(dma_phys(PAGE_RXQ), dma_ptr(PAGE_RXQ));
+    // RX queue: 256 entries, separate pages for desc/avail/used
+    let rxq_regions = VirtqueueRegions::from_separate_pages(
+        dma_phys(PAGE_RXQ_DESC).raw(), dma_ptr(PAGE_RXQ_DESC),
+        dma_phys(PAGE_RXQ_AVAIL).raw(), dma_ptr(PAGE_RXQ_AVAIL),
+        dma_phys(PAGE_RXQ_USED).raw(), dma_ptr(PAGE_RXQ_USED),
+        RX_QUEUE_SIZE,
+    );
+    let mut rxq = Virtqueue::from_regions(&rxq_regions, RX_QUEUE_SIZE);
+
+    // TX queue: 16 entries, fits in one page
     let mut txq = Virtqueue::new(dma_phys(PAGE_TXQ), dma_ptr(PAGE_TXQ));
 
     device.setup_queue(0, &mut rxq);
     device.setup_queue(1, &mut txq);
-    setup_msix(&pci_dev, &device);  // sets queue_msix_vector for queue 0
+    setup_msix(&pci_dev, &device);
     device.enable_queue(0);
     device.enable_queue(1);
     device.activate();
@@ -229,36 +247,35 @@ pub fn init(ecam_base: u64) {
     log!("VirtIO net: MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 
-    let rx_phys = [
-        dma_phys(PAGE_RX_BUFS).raw(),
-        dma_phys(PAGE_RX_BUFS + 1).raw(),
-        dma_phys(PAGE_RX_BUFS + 2).raw(),
-    ];
-    let rx_ptrs = [
-        dma_ptr(PAGE_RX_BUFS),
-        dma_ptr(PAGE_RX_BUFS + 1),
-        dma_ptr(PAGE_RX_BUFS + 2),
-    ];
+    let rx_phys: [u64; RX_BUF_COUNT] = core::array::from_fn(|i| {
+        dma_phys(PAGE_RX_BUFS + i).raw()
+    });
+    let rx_ptrs: [*mut u8; RX_BUF_COUNT] = core::array::from_fn(|i| {
+        dma_ptr(PAGE_RX_BUFS + i)
+    });
     let tx_phys = dma_phys(PAGE_TX_BUF).raw();
     let tx_ptr = dma_ptr(PAGE_TX_BUF);
 
-    // Register DMA buffers as shared memory for direct userland access
-    let rx_tokens: [u32; 3] = core::array::from_fn(|i| {
-        shared_memory::register(crate::PhysAddr::new(rx_phys[i]), 4096).raw()
-    });
+    // Register DMA buffers as shared memory for direct userland access.
+    // All RX buffers are contiguous in the DMA pool, so register as one region.
+    let rx_token = shared_memory::register(
+        crate::PhysAddr::new(rx_phys[0]),
+        (RX_BUF_COUNT * RX_BUF_SIZE as usize) as u64,
+    ).raw();
     let tx_token = shared_memory::register(crate::PhysAddr::new(tx_phys), 4096).raw();
 
     crate::net::set_nic_info(NicInfo {
-        rx_buf_tokens: rx_tokens,
+        rx_buf_token: rx_token,
         tx_buf_token: tx_token,
         mac,
-        rx_buf_count: RX_BUF_COUNT as u8,
-        net_hdr_size: NET_HDR_SIZE as u8,
+        rx_buf_count: RX_BUF_COUNT as u16,
+        rx_buf_size: RX_BUF_SIZE as u16,
+        net_hdr_size: NET_HDR_SIZE as u16,
     });
 
     let mut nic = VirtioNic {
         device, rxq, txq, mac, rx_phys, tx_phys, rx_ptrs, tx_ptr,
-        desc_to_buf: [0; 16],
+        desc_to_buf: [0; RX_QUEUE_SIZE as usize],
     };
 
     for i in 0..RX_BUF_COUNT {
@@ -266,5 +283,5 @@ pub fn init(ecam_base: u64) {
     }
 
     crate::net::register(Box::new(nic));
-    log!("VirtIO net: initialized");
+    log!("VirtIO net: {} RX buffers, queue size {}", RX_BUF_COUNT, RX_QUEUE_SIZE);
 }

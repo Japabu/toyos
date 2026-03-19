@@ -649,7 +649,7 @@ pub fn current_address_space() -> Option<Arc<AddressSpace>> {
 
 pub fn futex_wait(phys_addr: PhysAddr, expected: u32, deadline: u64) -> bool {
     let _futex = FUTEX_LOCK.lock();
-    let current = unsafe { *(phys_addr.raw() as *const u32) };
+    let current = unsafe { *phys_addr.as_ptr::<u32>() };
     if current != expected {
         return false;
     }
