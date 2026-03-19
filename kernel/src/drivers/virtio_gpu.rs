@@ -48,14 +48,14 @@ const CURSOR_RESOURCE_ID: u32 = 3;
 const REQ_OFFSET: usize = 0x000;
 const RESP_OFFSET: usize = 0x800;
 
-static DMA: Lock<DmaPool<4>> = Lock::new(DmaPool::new());
+static DMA: Lock<Option<DmaPool>> = Lock::new(None);
 
 fn dma_phys(page: usize) -> crate::DmaAddr {
-    DMA.lock().page_phys(page)
+    DMA.lock().as_ref().unwrap().page_phys(page)
 }
 
 fn dma_ptr(page: usize) -> *mut u8 {
-    DMA.lock().page_ptr(page)
+    DMA.lock().as_ref().unwrap().page_ptr(page)
 }
 
 // ---- GPU command/response structs ----
@@ -526,6 +526,7 @@ impl Gpu for GpuController {
 pub fn init(ecam_base: u64) -> Option<(Box<dyn Gpu>, GpuInfo)> {
     let pci_dev = PciDevice::find_by_id(ecam_base, VIRTIO_VENDOR, VIRTIO_GPU_DEVICE)?;
     log!("VirtIO GPU: found at PCI {:02x}:{:02x}.{}", pci_dev.bus, pci_dev.dev, pci_dev.func);
+    *DMA.lock() = Some(DmaPool::alloc(4));
 
     let device = VirtioDevice::init(&pci_dev, VIRTIO_F_VERSION_1);
 

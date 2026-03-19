@@ -47,14 +47,14 @@ const PAGE_TX_DATA: usize = 5; // 5 pages: 5..9
 const REQ_OFFSET: usize = 0x000;
 const RESP_OFFSET: usize = 0x800;
 
-static DMA: Lock<DmaPool<10>> = Lock::new(DmaPool::new());
+static DMA: Lock<Option<DmaPool>> = Lock::new(None);
 
 fn dma_phys(page: usize) -> crate::DmaAddr {
-    DMA.lock().page_phys(page)
+    DMA.lock().as_ref().unwrap().page_phys(page)
 }
 
 fn dma_ptr(page: usize) -> *mut u8 {
-    DMA.lock().page_ptr(page)
+    DMA.lock().as_ref().unwrap().page_ptr(page)
 }
 
 // ---- VirtIO sound structs (per VirtIO 1.2 spec, section 5.14) ----
@@ -299,6 +299,7 @@ impl SoundController {
 pub fn init(ecam_base: u64) -> Option<(SoundController, AudioInfo)> {
     let pci_dev = PciDevice::find_by_id(ecam_base, VIRTIO_VENDOR, VIRTIO_SND_DEVICE)?;
     log!("virtio-sound: found at PCI {:02x}:{:02x}.{}", pci_dev.bus, pci_dev.dev, pci_dev.func);
+    *DMA.lock() = Some(DmaPool::alloc(10));
 
     let device = VirtioDevice::init(&pci_dev, VIRTIO_F_VERSION_1);
 

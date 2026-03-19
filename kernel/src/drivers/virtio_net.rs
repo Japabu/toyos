@@ -38,14 +38,14 @@ const TOTAL_DMA_PAGES: usize = 261;
 const PCI_CAP_MSIX: u8 = 0x11;
 const VIRTIO_NET_VECTOR: u8 = 0x22;
 
-static DMA: Lock<DmaPool<TOTAL_DMA_PAGES>> = Lock::new(DmaPool::new());
+static DMA: Lock<Option<DmaPool>> = Lock::new(None);
 
 fn dma_phys(page: usize) -> crate::DmaAddr {
-    DMA.lock().page_phys(page)
+    DMA.lock().as_ref().unwrap().page_phys(page)
 }
 
 fn dma_ptr(page: usize) -> *mut u8 {
-    DMA.lock().page_ptr(page)
+    DMA.lock().as_ref().unwrap().page_ptr(page)
 }
 
 struct VirtioNic {
@@ -222,6 +222,7 @@ pub fn init(ecam_base: u64) {
         }
     };
     log!("VirtIO net: found at PCI {:02x}:{:02x}.{}", pci_dev.bus, pci_dev.dev, pci_dev.func);
+    *DMA.lock() = Some(DmaPool::alloc(TOTAL_DMA_PAGES));
     pci_dev.enable_bus_master();
 
     let device = VirtioDevice::init(&pci_dev, VIRTIO_F_VERSION_1 | VIRTIO_NET_F_MAC);

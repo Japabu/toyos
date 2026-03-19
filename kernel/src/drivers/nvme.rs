@@ -133,14 +133,14 @@ const PRP_LIST_PAGE: usize = 5;
 const DATA_PAGE_START: usize = 6;
 const MAX_DATA_PAGES: usize = 32; // 128KB max per transfer
 
-static DMA_POOL: Lock<DmaPool<DMA_PAGES>> = Lock::new(DmaPool::new());
+static DMA_POOL: Lock<Option<DmaPool>> = Lock::new(None);
 
 fn dma_phys(index: usize) -> crate::DmaAddr {
-    DMA_POOL.lock().page_phys(index)
+    DMA_POOL.lock().as_ref().unwrap().page_phys(index)
 }
 
 fn dma_ptr(index: usize) -> *mut u8 {
-    DMA_POOL.lock().page_ptr(index)
+    DMA_POOL.lock().as_ref().unwrap().page_ptr(index)
 }
 
 struct NvmeController {
@@ -356,6 +356,7 @@ impl BlockDevice for NvmeBlockDevice {
 pub fn init(ecam_base: u64) -> Option<NvmeBlockDevice> {
     let pci_dev = PciDevice::find(ecam_base, 0x01, 0x08, None)?;
     log!("NVMe: found at PCI {:02x}:{:02x}.{}", pci_dev.bus, pci_dev.dev, pci_dev.func);
+    *DMA_POOL.lock() = Some(DmaPool::alloc(DMA_PAGES));
 
     let bar = Mmio::new(crate::PhysAddr::new(pci_dev.read_bar_64(0)));
     pci_dev.enable_bus_master();
