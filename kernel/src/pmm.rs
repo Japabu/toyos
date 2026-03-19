@@ -144,13 +144,10 @@ impl BuddyAllocator {
         for i in 0..self.reserved_count {
             let (res_start, res_end) = self.reserved_ranges[i];
             if alloc_start < res_end && alloc_end > res_start {
-                // Raw serial to avoid layout shift from format strings
-                unsafe {
-                    for &b in b"BUDDY ALLOC RESERVED!\n" {
-                        core::arch::asm!("out dx, al", in("dx") 0x3F8u16, in("al") b);
-                    }
-                }
-                crate::arch::cpu::halt();
+                panic!(
+                    "buddy alloc: returned reserved memory pfn={:#x} order={} reserved={:#x}..{:#x}",
+                    pfn, order, res_start, res_end
+                );
             }
         }
 

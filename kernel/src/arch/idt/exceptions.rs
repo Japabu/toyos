@@ -14,14 +14,14 @@ static IN_FATAL: AtomicBool = AtomicBool::new(false);
 
 /// Write bytes to serial port 0x3F8 using raw port I/O.
 /// No fmt, no allocation, no ptr::add — cannot cause recursive faults.
-fn raw_serial(bytes: &[u8]) {
+pub fn raw_serial(bytes: &[u8]) {
     for &b in bytes {
         unsafe { core::arch::asm!("out dx, al", in("dx") 0x3F8u16, in("al") b, options(nomem, nostack)); }
     }
 }
 
 /// Write a u64 as hex to serial using raw port I/O.
-fn raw_serial_hex(prefix: &[u8], value: u64) {
+pub fn raw_serial_hex(prefix: &[u8], value: u64) {
     raw_serial(prefix);
     for i in (0..16).rev() {
         let nibble = ((value >> (i * 4)) & 0xF) as u8;

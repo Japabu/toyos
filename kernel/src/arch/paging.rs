@@ -1,10 +1,10 @@
 use core::alloc::Layout;
-use core::sync::atomic::{AtomicPtr, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 
 use alloc::alloc::{alloc_zeroed, dealloc};
 
 use super::{apic, cpu};
-use crate::{MemoryMapEntry, PhysAddr, UserAddr, PHYS_OFFSET};
+use crate::{MemoryMapEntry, PHYS_OFFSET, PhysAddr, UserAddr};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -145,6 +145,29 @@ impl PageTable {
 // ---------------------------------------------------------------------------
 
 static KERNEL_PML4: AtomicPtr<u64> = AtomicPtr::new(core::ptr::null_mut());
+static KERNEL_PHYS_START: AtomicU64 = AtomicU64::new(0);
+static KERNEL_PHYS_END: AtomicU64 = AtomicU64::new(0);
+
+/// Register the kernel's physical memory range for safety assertions.
+pub fn set_kernel_phys_range(start: u64, size: u64) {
+    KERNEL_PHYS_START.store(start, Ordering::Release);
+    KERNEL_PHYS_END.store(start + size, Ordering::Release);
+}
+
+/// Panic if a physical address range overlaps the kernel's memory.
+/// Called before writing any PDE into a user page table.
+fn assert_user_phys_safe(phys_start: u64, size: u64) {
+    let k_start = KERNEL_PHYS_START.load(Ordering::Acquire);
+    let k_end = KERNEL_PHYS_END.load(Ordering::Acquire);
+    if k_start == 0 && k_end == 0 { return; } // not yet initialized
+    let p_end = phys_start + size;
+    if phys_start < k_end && p_end > k_start {
+        panic!(
+            "map_user: physical range {:#x}..{:#x} overlaps kernel {:#x}..{:#x}",
+            phys_start, p_end, k_start, k_end
+        );
+    }
+}
 
 
 /// Physical address of the kernel PML4 template. Used for idle/exit CR3.
@@ -319,6 +342,8 @@ pub(crate) fn map_user_at(pml4_ptr: *mut u64, vaddr: UserAddr, phys: PhysAddr, s
     let pstart = phys.raw() & !(PAGE_2M - 1);
     let total = ((phys.raw() + size + PAGE_2M - 1) & !(PAGE_2M - 1)) - pstart;
 
+    assert_user_phys_safe(pstart, total);
+
     let mut off = 0u64;
     while off < total {
         let (pml4_idx, pdpt_idx, pd_idx) = page_indices(vstart + off);
@@ -352,6 +377,7 @@ pub(crate) fn remap_user_2m(pml4_ptr: *mut u64, virt_addr: UserAddr, phys_addr: 
     if virt_addr.raw() & (PAGE_2M - 1) != 0 || phys_addr.raw() & (PAGE_2M - 1) != 0 {
         return false;
     }
+    assert_user_phys_safe(phys_addr.raw(), PAGE_2M);
     let pml4 = PageTable::from_virt(pml4_ptr);
     let (pml4_idx, pdpt_idx, pd_idx) = page_indices(virt_addr.raw());
     let mut flags = PAGE_PRESENT | PAGE_USER;

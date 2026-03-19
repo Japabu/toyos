@@ -2207,6 +2207,8 @@ pub fn handle_page_fault(fault_addr: u64, _error_code: u64) -> bool {
     let phys = PhysAddr::from_ptr(alloc.ptr());
     let page_ptr = alloc.ptr();
 
+
+
     // Fill the 2MB page from ALL VMAs that overlap this region.
     // Multiple segments (e.g. .text and .rodata) can share a 2MB range.
     // If ANY overlapping VMA is writable, map the entire 2MB as writable.
@@ -2250,6 +2252,7 @@ pub fn handle_page_fault(fault_addr: u64, _error_code: u64) -> bool {
         }
     }
 
+
     // Apply relocations across the entire 2MB region
     let mut total_relocs = 0u16;
     if let Some(ref ri) = reloc_index {
@@ -2264,6 +2267,7 @@ pub fn handle_page_fault(fault_addr: u64, _error_code: u64) -> bool {
             offset += 4096;
         }
     }
+
 
     // Map the 2MB page (writable if any overlapping VMA is writable)
     addr_space.remap_2m(UserAddr::new(region_start), phys, writable);
