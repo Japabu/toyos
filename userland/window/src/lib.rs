@@ -3,7 +3,7 @@ pub mod framebuffer;
 pub use framebuffer::{Color, Framebuffer};
 
 use toyos_abi::ipc;
-use toyos_abi::poll;
+use toyos_abi::io_uring;
 use toyos_abi::shm::SharedMemory;
 use toyos_abi::syscall;
 use toyos_abi::Fd;
@@ -213,7 +213,7 @@ impl Window {
     }
 
     pub fn poll_event(&mut self, timeout_nanos: u64) -> Option<Event> {
-        let result = poll::poll_timeout(&[self.fd.0 as u64], Some(timeout_nanos));
+        let result = io_uring::poll_fds(&[self.fd.0 as u64], Some(timeout_nanos));
         if result.fd(0) {
             Some(self.recv_event())
         } else {

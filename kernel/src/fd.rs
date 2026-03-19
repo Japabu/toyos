@@ -50,6 +50,7 @@ pub enum Descriptor {
     Nic(crate::net::NicInfo),
     Audio(toyos_abi::audio::AudioInfo),
     Listener(String),
+    IoUring(crate::io_uring::RingId),
 }
 
 impl Clone for Descriptor {
@@ -68,6 +69,7 @@ impl Clone for Descriptor {
             Self::Nic(info) => Self::Nic(*info),
             Self::Audio(info) => Self::Audio(*info),
             Self::Listener(name) => Self::Listener(name.clone()),
+            Self::IoUring(id) => Self::IoUring(*id),
         }
     }
 }
@@ -104,6 +106,7 @@ impl Descriptor {
             Self::Socket { rx, .. } => Some(EventSource::PipeReadable(rx.id())),
             Self::File(_) | Self::Framebuffer(_) | Self::Audio(_) => None,
             Self::PipeWrite(..) | Self::TtyWrite(_) => None,
+            Self::IoUring(_) => None,
         }
     }
 
@@ -116,7 +119,7 @@ impl Descriptor {
             Self::File(_) | Self::SerialConsole => None, // always writable
             Self::Keyboard | Self::Mouse | Self::Nic(_) | Self::Audio(_)
             | Self::Framebuffer(_) | Self::Listener(_)
-            | Self::PipeRead(..) | Self::TtyRead(_) => None,
+            | Self::PipeRead(..) | Self::TtyRead(_) | Self::IoUring(_) => None,
         }
     }
 }
@@ -192,6 +195,11 @@ pub fn close(table: &mut FdTable, vfs: &mut Vfs, fd: u32, pid: Pid) -> u64 {
     let Some(desc) = table.remove(fd) else {
         return SyscallError::NotFound.to_u64();
     };
+    // Auto-deregister from any io_uring instances watching this fd
+    let sources = [desc.read_event_source(), desc.write_event_source()];
+    if sources.iter().any(|s| s.is_some()) {
+        crate::io_uring::remove_fd(fd, &sources);
+    }
     // Non-pipe cleanup that can't be in Drop
     match &desc {
         Descriptor::File(file) => {
@@ -206,6 +214,9 @@ pub fn close(table: &mut FdTable, vfs: &mut Vfs, fd: u32, pid: Pid) -> u64 {
         }
         Descriptor::Listener(name) => {
             listener::remove(name);
+        }
+        Descriptor::IoUring(id) => {
+            crate::io_uring::destroy(*id);
         }
         _ => {}
     }
@@ -227,6 +238,9 @@ pub fn close_all(table: &mut FdTable, vfs: &mut Vfs, pid: Pid) {
             }
             Descriptor::Listener(name) => {
                 listener::remove(name);
+            }
+            Descriptor::IoUring(id) => {
+                crate::io_uring::destroy(*id);
             }
             _ => {}
         }
@@ -314,7 +328,8 @@ pub fn try_read(table: &mut FdTable, fd: u32, buf: &mut [u8]) -> Option<u64> {
             }
             Some(count as u64)
         }
-        Descriptor::Listener(_) | Descriptor::PipeWrite(..) | Descriptor::TtyWrite(_) => {
+        Descriptor::Listener(_) | Descriptor::PipeWrite(..) | Descriptor::TtyWrite(_)
+        | Descriptor::IoUring(_) => {
             Some(SyscallError::PermissionDenied.to_u64())
         }
     }
@@ -399,6 +414,7 @@ pub fn fstat(table: &FdTable, fd: u32, stat: &mut Stat) -> bool {
         Some(Descriptor::Nic(_)) => { stat.file_type = FileType::Nic as u64; true }
         Some(Descriptor::Audio(_)) => { stat.file_type = FileType::Unknown as u64; true }
         Some(Descriptor::Listener(_)) => { stat.file_type = FileType::Pipe as u64; true }
+        Some(Descriptor::IoUring(_)) => { stat.file_type = FileType::Unknown as u64; true }
         None => false,
     }
 }

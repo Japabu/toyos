@@ -2,7 +2,7 @@ use toyos_abi::audio::{self, AudioInfo, AudioOpenRequest, AudioOpenResponse, Aud
 use toyos_abi::audio::{MSG_AUDIO_OPEN, MSG_AUDIO_OPENED, MSG_AUDIO_SET_VOLUME};
 use toyos_abi::device;
 use toyos_abi::ipc;
-use toyos_abi::poll as toyos_poll;
+use toyos_abi::io_uring;
 use toyos_abi::ring::RingHeader;
 use toyos_abi::services;
 use toyos_abi::shm::SharedMemory;
@@ -170,7 +170,7 @@ fn main() {
         // When active, poll with 1ms timeout — fast enough for ~23ms DMA periods
         // while avoiding busy-wait CPU burn.
         let timeout = if streams.is_empty() { 100_000_000 } else { 1_000_000 };
-        let result = toyos_poll::poll_timeout(&poll_fds, Some(timeout));
+        let result = io_uring::poll_fds(&poll_fds, Some(timeout));
 
         if result.fd(0) {
             let conn = services::accept(listener).expect("accept failed");

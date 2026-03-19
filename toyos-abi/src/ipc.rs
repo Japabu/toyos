@@ -44,6 +44,7 @@ pub fn recv_header(fd: Fd) -> Result<IpcHeader, IpcError> {
     Ok(header)
 }
 
+
 pub fn recv_payload<T: Copy>(fd: Fd, header: &IpcHeader) -> Result<T, IpcError> {
     let size = core::mem::size_of::<T>();
     assert!(header.len as usize >= size);

@@ -1,10 +1,12 @@
 use core::arch::{asm, naked_asm};
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use hashbrown::HashMap;
 
 use crate::arch::{cpu, paging, percpu};
+use crate::io_uring::RingId;
 use crate::pipe::PipeId;
 use crate::process::{self, AddressSpace, IdleProof, OwnedAlloc, Pid, Tid, KERNEL_STACK_SIZE};
 use crate::sync::Lock;
@@ -13,10 +15,7 @@ use crate::PhysAddr;
 const IA32_FS_BASE: u32 = 0xC0000100;
 const MAX_CPUS: usize = 8;
 const MAX_VRUNTIME_LAG_NS: u64 = 50_000_000; // 50ms
-const MAX_EVENTS_PER_THREAD: usize = 16;
-const MAX_WAITERS_PER_EVENT: usize = 16;
-const MAX_WOKEN_BATCH: usize = 16;
-const EVENT_QUEUE_SIZE: usize = 64;
+const EVENT_QUEUE_SIZE: usize = 256;
 
 // ---------------------------------------------------------------------------
 // EventSource — what wakes a blocked thread
@@ -31,6 +30,7 @@ pub enum EventSource {
     PipeReadable(PipeId),
     PipeWritable(PipeId),
     Futex(PhysAddr),
+    IoUring(RingId),
 }
 
 // ---------------------------------------------------------------------------
@@ -119,9 +119,7 @@ pub struct ThreadCtx {
     pub fs_base: u64,
     pub cpu_ns: u64,
     pub scheduled_at: u64,
-    // Event registrations — one source of truth, no parallel HashMaps
-    pub registered_events: [EventSource; MAX_EVENTS_PER_THREAD],
-    pub registered_event_count: u8,
+    pub blocked_on: Option<EventSource>, // what this thread is waiting on (None = pure timeout/wake_tid)
     pub deadline: u64, // 0 = no deadline
     pub blocked_since: u64, // nanos_since_boot when entered blocked pool (0 = not blocked)
 }
@@ -161,71 +159,20 @@ impl ThreadCtx {
 
 #[must_use = "woken threads must be enqueued or they are permanently lost"]
 pub struct WokenBatch {
-    threads: [Option<ThreadCtx>; MAX_WOKEN_BATCH],
-    count: u8,
+    threads: Vec<ThreadCtx>,
 }
 
 impl WokenBatch {
     fn new() -> Self {
-        Self {
-            threads: [const { None }; MAX_WOKEN_BATCH],
-            count: 0,
-        }
+        Self { threads: Vec::new() }
     }
 
     fn push(&mut self, ctx: ThreadCtx) {
-        if (self.count as usize) < MAX_WOKEN_BATCH {
-            self.threads[self.count as usize] = Some(ctx);
-            self.count += 1;
-        }
+        self.threads.push(ctx);
     }
 
     fn is_empty(&self) -> bool {
-        self.count == 0
-    }
-}
-
-// ---------------------------------------------------------------------------
-// WaiterList — fixed-capacity inline Vec<Tid>
-// ---------------------------------------------------------------------------
-
-struct WaiterList {
-    tids: [Tid; MAX_WAITERS_PER_EVENT],
-    len: u8,
-}
-
-impl WaiterList {
-    fn new() -> Self {
-        Self {
-            tids: [Tid(0); MAX_WAITERS_PER_EVENT],
-            len: 0,
-        }
-    }
-
-    fn push(&mut self, tid: Tid) {
-        if (self.len as usize) < MAX_WAITERS_PER_EVENT {
-            self.tids[self.len as usize] = tid;
-            self.len += 1;
-        }
-    }
-
-    fn retain(&mut self, tid: Tid) {
-        let mut dst = 0usize;
-        for src in 0..self.len as usize {
-            if self.tids[src] != tid {
-                self.tids[dst] = self.tids[src];
-                dst += 1;
-            }
-        }
-        self.len = dst as u8;
-    }
-
-    fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    fn iter(&self) -> impl Iterator<Item = Tid> + '_ {
-        self.tids[..self.len as usize].iter().copied()
+        self.threads.is_empty()
     }
 }
 
@@ -236,8 +183,7 @@ impl WaiterList {
 enum SwitchReason {
     Yield,
     Block {
-        events: [EventSource; MAX_EVENTS_PER_THREAD],
-        count: u8,
+        event: Option<EventSource>,
         deadline: u64,
     },
     Exit,
@@ -312,7 +258,7 @@ impl<'a> CpuQueueGuard<'a> {
 
 struct BlockedPool {
     threads: HashMap<Tid, ThreadCtx>,
-    by_event: BTreeMap<EventSource, WaiterList>,
+    by_event: BTreeMap<EventSource, Vec<Tid>>,
     deadlines: BTreeMap<(u64, Tid), Tid>,
 }
 
@@ -328,10 +274,9 @@ impl BlockedPool {
     fn insert(&mut self, mut ctx: ThreadCtx) {
         let tid = ctx.tid;
         ctx.blocked_since = crate::clock::nanos_since_boot();
-        let event_count = ctx.registered_event_count;
-        for i in 0..event_count as usize {
-            self.by_event.entry(ctx.registered_events[i])
-                .or_insert_with(WaiterList::new)
+        if let Some(event) = ctx.blocked_on {
+            self.by_event.entry(event)
+                .or_insert_with(Vec::new)
                 .push(tid);
         }
         if ctx.deadline > 0 {
@@ -343,28 +288,9 @@ impl BlockedPool {
     /// Remove a thread from all indexes. Single cleanup path.
     fn remove_thread(&mut self, tid: Tid) -> Option<ThreadCtx> {
         let ctx = self.threads.remove(&tid)?;
-        for i in 0..ctx.registered_event_count as usize {
-            if let Some(waiters) = self.by_event.get_mut(&ctx.registered_events[i]) {
-                waiters.retain(tid);
-                if waiters.is_empty() {
-                    self.by_event.remove(&ctx.registered_events[i]);
-                }
-            }
-        }
-        if ctx.deadline > 0 {
-            self.deadlines.remove(&(ctx.deadline, tid));
-        }
-        Some(ctx)
-    }
-
-    /// Remove a thread, skipping one event source (already cleaned by caller).
-    fn remove_thread_skip(&mut self, tid: Tid, skip: &EventSource) -> Option<ThreadCtx> {
-        let ctx = self.threads.remove(&tid)?;
-        for i in 0..ctx.registered_event_count as usize {
-            let event = &ctx.registered_events[i];
-            if event == skip { continue; }
+        if let Some(event) = &ctx.blocked_on {
             if let Some(waiters) = self.by_event.get_mut(event) {
-                waiters.retain(tid);
+                waiters.retain(|&t| t != tid);
                 if waiters.is_empty() {
                     self.by_event.remove(event);
                 }
@@ -379,8 +305,8 @@ impl BlockedPool {
     /// Wake all threads waiting on an event source into a batch.
     fn take_by_event_into(&mut self, event: &EventSource, batch: &mut WokenBatch) {
         let Some(waiters) = self.by_event.remove(event) else { return };
-        for tid in waiters.iter() {
-            if let Some(ctx) = self.remove_thread_skip(tid, event) {
+        for tid in waiters {
+            if let Some(ctx) = self.remove_thread(tid) {
                 batch.push(ctx);
             }
         }
@@ -389,21 +315,13 @@ impl BlockedPool {
     /// Wake up to `count` threads waiting on an event source.
     fn take_by_event_limited(&mut self, event: &EventSource, count: usize, batch: &mut WokenBatch) {
         let Some(waiters) = self.by_event.get_mut(event) else { return };
-        let n = count.min(waiters.len as usize);
-        let tids_to_wake: [Tid; MAX_WAITERS_PER_EVENT] = waiters.tids;
-        let wake_count = n;
-        // Remove woken tids from the waiter list
-        let mut dst = 0usize;
-        for src in n..waiters.len as usize {
-            waiters.tids[dst] = waiters.tids[src];
-            dst += 1;
-        }
-        waiters.len = dst as u8;
+        let n = count.min(waiters.len());
+        let tids_to_wake: Vec<Tid> = waiters.drain(..n).collect();
         if waiters.is_empty() {
             self.by_event.remove(event);
         }
-        for i in 0..wake_count {
-            if let Some(ctx) = self.remove_thread_skip(tids_to_wake[i], event) {
+        for tid in tids_to_wake {
+            if let Some(ctx) = self.remove_thread(tid) {
                 batch.push(ctx);
             }
         }
@@ -441,6 +359,27 @@ pub fn stats() -> (u64, u64) {
 pub fn init() {
     *SCHEDULER.blocked.lock() = Some(BlockedPool::new());
     *SCHEDULER.vruntimes.lock() = Some(HashMap::new());
+}
+
+/// Log scheduler health. Called from idle loop.
+pub fn log_health() {
+    let mut ready = 0usize;
+    for i in 0..crate::arch::smp::cpu_count() as usize {
+        if let Some(q) = SCHEDULER.try_lock_cpu(i) {
+            ready += q.ready_len();
+            if q.current().is_some() { ready += 1; }
+        }
+    }
+    let blocked = SCHEDULER.blocked.try_lock()
+        .map(|g| g.as_ref().map(|p| p.threads.len()).unwrap_or(0))
+        .unwrap_or(0);
+    let tid = percpu::current_tid();
+    crate::log!("sched: ready={} blocked={} current={:?}", ready, blocked, tid);
+
+    // If everything is stuck, dump what threads are blocked on
+    if ready == 0 && blocked > 0 {
+        dump_blocked();
+    }
 }
 
 static FUTEX_LOCK: Lock<()> = Lock::new(());
@@ -487,14 +426,12 @@ impl Scheduler {
         best_cpu
     }
 
-    fn enqueue_batch(&self, mut batch: WokenBatch) {
-        for i in 0..batch.count as usize {
-            if let Some(ctx) = batch.threads[i].take() {
-                let cpu = self.pick_target_cpu();
-                let mut q = self.lock_cpu(cpu as usize);
-                let vrt = q.effective_vruntime(self, ctx.process);
-                q.insert(vrt, ctx);
-            }
+    fn enqueue_batch(&self, batch: WokenBatch) {
+        for ctx in batch.threads {
+            let cpu = self.pick_target_cpu();
+            let mut q = self.lock_cpu(cpu as usize);
+            let vrt = q.effective_vruntime(self, ctx.process);
+            q.insert(vrt, ctx);
         }
     }
 }
@@ -514,14 +451,8 @@ pub fn enqueue_new(ctx: ThreadCtx) {
 /// Block the current thread on the given event sources with optional deadline.
 /// `deadline = 0` means no timeout. `events` empty means woken only by `wake_tid` or deadline.
 pub fn block(events: &[EventSource], deadline: u64) {
-    let mut ev_arr = [EventSource::Keyboard; MAX_EVENTS_PER_THREAD];
-    let count = events.len().min(MAX_EVENTS_PER_THREAD);
-    if count > 0 {
-        ev_arr[..count].copy_from_slice(&events[..count]);
-    }
     do_schedule(SwitchReason::Block {
-        events: ev_arr,
-        count: count as u8,
+        event: events.first().copied(),
         deadline,
     });
 }
@@ -686,7 +617,7 @@ pub fn futex_wake(phys_addr: PhysAddr, count: usize) -> u64 {
         let mut pool = SCHEDULER.blocked.lock_unwrap();
         pool.take_by_event_limited(&EventSource::Futex(phys_addr), count, &mut batch);
     }
-    let n = batch.count as u64;
+    let n = batch.threads.len() as u64;
     drop(_futex);
     if !batch.is_empty() {
         SCHEDULER.enqueue_batch(batch);
@@ -815,6 +746,7 @@ fn do_schedule(reason: SwitchReason) {
         let old_rsp_ptr = queue.save_rsp_ptr();
         percpu::set_current_tid(Some(new_tid));
         unsafe { percpu::set_kernel_stack(new_ks_top); }
+        paging::assert_pml4_canary(new_cr3, new_tid);
         unsafe { cpu::write_cr3(new_cr3); }
         cpu::wrmsr(IA32_FS_BASE, new_fs_base);
 
@@ -849,9 +781,8 @@ fn handle_outgoing() {
                 let vrt = queue.effective_vruntime(&SCHEDULER, old.process);
                 queue.insert(vrt, old);
             }
-            SwitchReason::Block { events, count, deadline } => {
-                old.registered_events = events;
-                old.registered_event_count = count;
+            SwitchReason::Block { event, deadline } => {
+                old.blocked_on = event;
                 old.deadline = deadline;
                 drop(queue);
                 SCHEDULER.blocked.lock_unwrap().insert(old);
@@ -868,9 +799,16 @@ fn handle_outgoing() {
 // Idle loop
 // ---------------------------------------------------------------------------
 
+static IDLE_HEALTH_COUNTER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
 fn cpu_idle_loop() -> ! {
     let idle_proof = unsafe { IdleProof::new_unchecked() };
     loop {
+        // Health check every ~1000 idle iterations
+        if IDLE_HEALTH_COUNTER.fetch_add(1, Ordering::Relaxed) % 1000 == 999 {
+            log_health();
+        }
+
         drain_events();
 
         {
@@ -895,6 +833,7 @@ fn cpu_idle_loop() -> ! {
 
                 percpu::set_current_tid(Some(new_tid));
                 unsafe { percpu::set_kernel_stack(new_ks_top); }
+                paging::assert_pml4_canary(new_cr3, new_tid);
                 unsafe { cpu::write_cr3(new_cr3); }
                 cpu::wrmsr(IA32_FS_BASE, new_fs_base);
 
@@ -942,6 +881,7 @@ fn event_name(event: &EventSource) -> &'static str {
         EventSource::PipeReadable(_) => "PipeR",
         EventSource::PipeWritable(_) => "PipeW",
         EventSource::Futex(_) => "Futex",
+        EventSource::IoUring(_) => "IoUring",
     }
 }
 
@@ -954,22 +894,10 @@ pub fn dump_blocked() {
     for (tid, ctx) in &pool.threads {
         let since_ms = if ctx.blocked_since > 0 { (now - ctx.blocked_since) / 1_000_000 } else { 0 };
 
-        // Build event list string on stack (no alloc)
-        let mut events_buf = [0u8; 128];
-        let mut pos = 0;
-        for i in 0..ctx.registered_event_count as usize {
-            if pos > 0 && pos + 2 < 128 {
-                events_buf[pos] = b',';
-                events_buf[pos + 1] = b' ';
-                pos += 2;
-            }
-            let name = event_name(&ctx.registered_events[i]);
-            let bytes = name.as_bytes();
-            let copy = bytes.len().min(128 - pos);
-            events_buf[pos..pos + copy].copy_from_slice(&bytes[..copy]);
-            pos += copy;
-        }
-        let events = core::str::from_utf8(&events_buf[..pos]).unwrap_or("?");
+        let events = match &ctx.blocked_on {
+            Some(e) => event_name(e),
+            None => "(none)",
+        };
 
         // Try to get process name without blocking
         let mut name_buf = [0u8; 28];

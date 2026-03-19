@@ -2,7 +2,7 @@ mod console;
 
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
-use toyos_abi::poll;
+use toyos_abi::io_uring;
 use std::os::toyos::process;
 use std::process::Command;
 
@@ -34,7 +34,7 @@ fn main() {
     let window_fd = window.fd().0 as u64;
 
     loop {
-        let ready = poll::poll(&[shell_stdout_fd, shell_stderr_fd, window_fd]);
+        let ready = io_uring::poll_fds(&[shell_stdout_fd, shell_stderr_fd, window_fd], None);
 
         if ready.fd(0) {
             let mut buf = [0u8; 4096];

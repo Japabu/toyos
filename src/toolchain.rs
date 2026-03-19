@@ -29,11 +29,13 @@ pub fn ensure(root: &Path, force_rebuild: bool) -> ChangeSet {
     let compiler_stamp = stamps_dir.join("compiler.stamp");
     let std_stamp = stamps_dir.join("std.stamp");
     let abi_stamp = stamps_dir.join("abi.stamp");
+    let net_stamp = stamps_dir.join("net.stamp");
     let linker_stamp = stamps_dir.join("linker.stamp");
     let compiler_changed = stamps::dir_changed(&rust_dir.join("compiler"), &compiler_stamp);
     let std_changed = stamps::dir_changed(&rust_dir.join("library"), &std_stamp);
-    // toyos-abi is a dependency of std — changes to it require an std rebuild
+    // toyos-abi and toyos-net are dependencies of std — changes require an std rebuild
     let abi_changed = stamps::dir_changed(&root.join("toyos-abi/src"), &abi_stamp);
+    let net_changed = stamps::dir_changed(&root.join("toyos-net/src"), &net_stamp);
     let linker_changed = stamps::dir_changed(&root.join("toyos-ld/src"), &linker_stamp);
 
     // Ensure toyos-ld is built (needed as cross-linker for bootstrap and all builds)
@@ -61,13 +63,15 @@ pub fn ensure(root: &Path, force_rebuild: bool) -> ChangeSet {
         stamps::write_dir_stamp(&rust_dir.join("compiler"), &compiler_stamp);
         stamps::write_dir_stamp(&rust_dir.join("library"), &std_stamp);
         stamps::write_dir_stamp(&root.join("toyos-abi/src"), &abi_stamp);
+        stamps::write_dir_stamp(&root.join("toyos-net/src"), &net_stamp);
         true
-    } else if std_changed || abi_changed {
+    } else if std_changed || abi_changed || net_changed {
         // Fast path: only rebuild std
         eprintln!("Rebuilding std (fast path)...");
         rebuild_std(root, &rust_dir);
         stamps::write_dir_stamp(&rust_dir.join("library"), &std_stamp);
         stamps::write_dir_stamp(&root.join("toyos-abi/src"), &abi_stamp);
+        stamps::write_dir_stamp(&root.join("toyos-net/src"), &net_stamp);
         true
     } else {
         eprintln!("Toolchain up to date.");
@@ -75,9 +79,10 @@ pub fn ensure(root: &Path, force_rebuild: bool) -> ChangeSet {
     };
 
     // Ensure hosted rustc (ToyOS binary) is up to date.
-    // Invalidate stamp when toolchain was rebuilt (compiler or std changed).
+    // Only invalidate when the compiler changed — std-only changes are picked up
+    // by rebuild_std which updates the sysroot libraries that hosted rustc uses.
     let hosted_stamp = stamps_dir.join("hosted-rustc.stamp");
-    if rebuilt {
+    if compiler_changed || force_rebuild {
         let _ = fs::remove_file(&hosted_stamp);
     }
     let hosted_rustc = rust_dir.join("build/x86_64-unknown-toyos/stage2/bin/rustc");

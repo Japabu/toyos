@@ -33,6 +33,7 @@ mod scheduler;
 mod clock;
 mod rtc;
 mod fd;
+mod io_uring;
 mod pipe;
 mod listener;
 mod device;
@@ -234,6 +235,7 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     process::init();
     scheduler::init();
     pipe::init();
+    io_uring::init();
     listener::init();
     shared_memory::init();
 

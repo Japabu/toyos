@@ -2,7 +2,8 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use toyos_abi::shm::SharedMemory;
-use toyos_abi::{gpu, ipc, poll, services, system, FramebufferInfo, Fd};
+use toyos_abi::{gpu, ipc, services, system, FramebufferInfo, Fd};
+use toyos_abi::io_uring::*;
 use toyos_abi::{device, syscall};
 use window::{Color, Framebuffer};
 
@@ -79,6 +80,10 @@ struct WindowState {
     saved_h: usize,
     presented: bool,
     cursor_style: u8,
+    /// Partial IPC header bytes received so far. Fully non-blocking client I/O:
+    /// if a read returns partial data, buffer it here and finish next iteration.
+    recv_buf: [u8; 8],
+    recv_len: usize,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -741,34 +746,83 @@ fn main() {
     let mut last_taskbar_update = Instant::now();
     let mut cached_stats = SystemStats { used_mb: 0, total_mb: 0, cpu_pct: 0 };
 
-    // Fixed poll indices: 0 = keyboard, 1 = mouse, 2 = listener
-    const POLL_KB: usize = 0;
-    const POLL_MOUSE: usize = 1;
-    const POLL_LISTENER: usize = 2;
-    const POLL_CLIENTS: usize = 3; // client fds start here
+    // io_uring token assignments: system fds use their fd number directly.
+    // Client fds also use their fd number. We distinguish by checking if the
+    // token matches a known system fd.
+    let token_kb = kb_fd.0 as u64;
+    let token_mouse = mouse_fd.0 as u64;
+    let token_listener = listener_fd.0 as u64;
+
+    // Create io_uring for event multiplexing
+    let (ring_fd, ring_shm_token) = syscall::io_uring_setup(256).expect("io_uring_setup failed");
+    let ring_base = unsafe { syscall::map_shared(ring_shm_token) };
+    let ring_params = unsafe { &*(ring_base as *const IoUringParams) };
+    let ring_sq_size = ring_params.sq_ring_size;
+    let ring_cq_size = ring_params.cq_ring_size;
+
+    let ring_submit = |fd: i32, token: u64, flags: u32| {
+        let sq_hdr = unsafe { &*(ring_base.add(SQ_RING_OFF as usize) as *const IoUringRingHeader) };
+        let tail = sq_hdr.tail.load(std::sync::atomic::Ordering::Acquire);
+        let idx = tail & (ring_sq_size - 1);
+        let sqe = unsafe {
+            &mut *(ring_base.add(SQES_OFF as usize + idx as usize * core::mem::size_of::<IoUringSqe>()) as *mut IoUringSqe)
+        };
+        *sqe = IoUringSqe::default();
+        sqe.op = IORING_OP_POLL_ADD;
+        sqe.fd = fd;
+        sqe.op_flags = flags;
+        sqe.user_data = token;
+        sq_hdr.tail.store(tail.wrapping_add(1), std::sync::atomic::Ordering::Release);
+    };
+
+    // Submit initial POLL_ADDs for system fds (tokens = fd numbers)
+    ring_submit(kb_fd.0, token_kb, IORING_POLL_IN);
+    ring_submit(mouse_fd.0, token_mouse, IORING_POLL_IN);
+    ring_submit(listener_fd.0, token_listener, IORING_POLL_IN);
 
     loop {
         // Drain all pending events before compositing
         let mut waited = false;
         loop {
             let timeout = if waited { Duration::from_nanos(1) } else { FRAME_INTERVAL };
-            let mut poll_fds: Vec<u64> = vec![
-                kb_fd.0 as u64,
-                mouse_fd.0 as u64,
-                listener_fd.0 as u64,
-            ];
-            for win in &windows {
-                poll_fds.push(win.fd.0 as u64);
-            }
-            let ready = poll::poll_timeout(&poll_fds, Some(timeout.as_nanos() as u64));
 
-            let any_client_ready = (POLL_CLIENTS..poll_fds.len()).any(|i| ready.fd(i));
-            if !ready.fd(POLL_KB) && !ready.fd(POLL_MOUSE) && !ready.fd(POLL_LISTENER) && !any_client_ready {
+            // Submit any pending SQEs (initial or re-armed) and wait
+            let pending = {
+                let sq_hdr = unsafe { &*(ring_base.add(SQ_RING_OFF as usize) as *const IoUringRingHeader) };
+                let head = sq_hdr.head.load(std::sync::atomic::Ordering::Acquire);
+                let tail = sq_hdr.tail.load(std::sync::atomic::Ordering::Acquire);
+                tail.wrapping_sub(head)
+            };
+            let _ = syscall::io_uring_enter(ring_fd, pending, 1, timeout.as_nanos() as u64);
+
+            // Drain CQEs into a set of ready tokens (fd numbers)
+            let mut ready_tokens: Vec<u64> = Vec::new();
+            let cq_hdr = unsafe { &*(ring_base.add(CQ_RING_OFF as usize) as *const IoUringRingHeader) };
+            loop {
+                let head = cq_hdr.head.load(std::sync::atomic::Ordering::Acquire);
+                let tail = cq_hdr.tail.load(std::sync::atomic::Ordering::Acquire);
+                if head == tail { break; }
+                let idx = head & (ring_cq_size - 1);
+                let cqe = unsafe {
+                    &*(ring_base.add(CQ_RING_OFF as usize + 16 + idx as usize * core::mem::size_of::<IoUringCqe>()) as *const IoUringCqe)
+                };
+                if cqe.result > 0 {
+                    ready_tokens.push(cqe.user_data);
+                }
+                cq_hdr.head.store(head.wrapping_add(1), std::sync::atomic::Ordering::Release);
+            }
+
+            let kb_ready = ready_tokens.contains(&token_kb);
+            let mouse_ready = ready_tokens.contains(&token_mouse);
+            let listener_ready = ready_tokens.contains(&token_listener);
+            let any_client_ready = windows.iter().any(|w| ready_tokens.contains(&(w.fd.0 as u64)));
+
+            if !kb_ready && !mouse_ready && !listener_ready && !any_client_ready {
                 break;
             }
             waited = true;
 
-        if ready.fd(POLL_KB) {
+        if kb_ready {
             let mut events = [window::KeyEvent::EMPTY; 8];
             let buf = unsafe {
                 std::slice::from_raw_parts_mut(
@@ -899,7 +953,7 @@ fn main() {
             }
         }
 
-        if ready.fd(POLL_MOUSE) {
+        if mouse_ready {
             // Drain all pending mouse events in one read
             let mut buf = [0u8; 512];
             let n = syscall::read(mouse_fd, &mut buf).unwrap_or(0);
@@ -1260,7 +1314,7 @@ fn main() {
         // We collect first to avoid borrowing windows while mutating it.
         let mut client_msgs: Vec<(Fd, u32, ipc::IpcHeader)> = Vec::new();
 
-        if ready.fd(POLL_LISTENER) {
+        if listener_ready {
             let conn = services::accept(listener_fd).expect("accept failed");
             if let Ok(header) = ipc::recv_header(conn.fd) {
                 client_msgs.push((conn.fd, conn.client_pid, header));
@@ -1271,10 +1325,24 @@ fn main() {
 
         let mut dead_fds: Vec<Fd> = Vec::new();
         for i in 0..windows.len() {
-            if ready.fd(POLL_CLIENTS + i) {
-                match ipc::recv_header(windows[i].fd) {
-                    Ok(header) => client_msgs.push((windows[i].fd, windows[i].pid, header)),
-                    Err(_) => dead_fds.push(windows[i].fd),
+            if ready_tokens.contains(&(windows[i].fd.0 as u64)) {
+                let win = &mut windows[i];
+                // Non-blocking read into per-client header buffer
+                match syscall::read_nonblock(win.fd, &mut win.recv_buf[win.recv_len..]) {
+                    Ok(0) => dead_fds.push(win.fd),
+                    Ok(n) => {
+                        win.recv_len += n;
+                        if win.recv_len >= 8 {
+                            let header = ipc::IpcHeader {
+                                msg_type: u32::from_ne_bytes([win.recv_buf[0], win.recv_buf[1], win.recv_buf[2], win.recv_buf[3]]),
+                                len: u32::from_ne_bytes([win.recv_buf[4], win.recv_buf[5], win.recv_buf[6], win.recv_buf[7]]),
+                            };
+                            win.recv_len = 0;
+                            client_msgs.push((win.fd, win.pid, header));
+                        }
+                        // else: partial header, continue next iteration
+                    }
+                    Err(_) => {} // WouldBlock — no data yet
                 }
             }
         }
@@ -1348,7 +1416,12 @@ fn main() {
                         saved_h: 0,
                         presented: false,
                         cursor_style: window::CURSOR_DEFAULT,
+                        recv_buf: [0; 8],
+                        recv_len: 0,
                     });
+
+                    // Register new client fd in io_uring (token = fd number)
+                    ring_submit(client_fd.0, client_fd.0 as u64, IORING_POLL_IN);
 
                     let _ = ipc::send(
                         client_fd,
@@ -1459,6 +1532,16 @@ fn main() {
                     let _ = ipc::send(client_fd, window::MSG_RESOLUTION_CHANGED, &reply);
                 }
                 _ => {}
+            }
+        }
+        // Re-arm one-shot POLL_ADDs for fds that fired
+        if kb_ready { ring_submit(kb_fd.0, token_kb, IORING_POLL_IN); }
+        if mouse_ready { ring_submit(mouse_fd.0, token_mouse, IORING_POLL_IN); }
+        if listener_ready { ring_submit(listener_fd.0, token_listener, IORING_POLL_IN); }
+        for win in windows.iter() {
+            let token = win.fd.0 as u64;
+            if ready_tokens.contains(&token) {
+                ring_submit(win.fd.0, token, IORING_POLL_IN);
             }
         }
         } // end inner drain loop

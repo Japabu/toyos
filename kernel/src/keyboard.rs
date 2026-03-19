@@ -1,10 +1,26 @@
 use alloc::collections::VecDeque;
+use alloc::vec::Vec;
 
+use crate::io_uring::RingId;
 use crate::sync::Lock;
 pub use toyos_abi::input::{RawKeyEvent, MOD_SHIFT, MOD_CTRL, MOD_ALT, MOD_GUI, MOD_RELEASED};
 
 static KEY_BUF: Lock<VecDeque<RawKeyEvent>> = Lock::new(VecDeque::new());
 static PREV_REPORT: Lock<[u8; 8]> = Lock::new([0; 8]);
+static IO_URING_WATCHERS: Lock<Vec<RingId>> = Lock::new(Vec::new());
+
+pub fn add_io_uring_watcher(id: RingId) {
+    let mut w = IO_URING_WATCHERS.lock();
+    if !w.contains(&id) { w.push(id); }
+}
+
+pub fn remove_io_uring_watcher(id: RingId) {
+    IO_URING_WATCHERS.lock().retain(|&x| x != id);
+}
+
+pub fn io_uring_watchers() -> Vec<RingId> {
+    IO_URING_WATCHERS.lock().clone()
+}
 
 /// Process a HID boot protocol keyboard report (8 bytes).
 pub fn handle_report(report: &[u8]) {

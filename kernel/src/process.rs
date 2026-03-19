@@ -15,7 +15,7 @@ use crate::{elf, pipe, scheduler, shared_memory, vfs};
 use crate::{KernelAddr, PhysAddr, UserAddr};
 
 pub use toyos_abi::{Pid, Tid};
-use toyos_abi::syscall::{SyscallError, POLL_FD_MASK, POLL_READABLE, POLL_WRITABLE};
+use toyos_abi::syscall::SyscallError;
 
 impl crate::id_map::IdKey for Tid {
     const ZERO: Self = Tid(0);
@@ -212,6 +212,21 @@ impl<S> OwnedAlloc<S> {
 
 impl<S> Drop for OwnedAlloc<S> {
     fn drop(&mut self) {
+        // Check for PML4 canary in every 4KB page being freed.
+        // If a page contains the canary, this dealloc would corrupt a live PML4.
+        let page_count = (self.layout.size() + 4095) / 4096;
+        for i in 0..page_count {
+            let page = unsafe { self.ptr.as_ptr().add(i * 4096) };
+            let slot_255 = unsafe { *(page.add(255 * 8) as *const u64) };
+            if slot_255 & 0xFFFF_FFFF_0000_0000 == 0xCAFE_BABE_0000_0000 {
+                let phys = page as u64 - crate::PHYS_OFFSET;
+                panic!(
+                    "OwnedAlloc::drop: freeing page at phys {:#x} that contains PML4 canary {:#x}! \
+                     alloc ptr={:p} size={:#x}",
+                    phys, slot_255, self.ptr.as_ptr(), self.layout.size()
+                );
+            }
+        }
         unsafe { dealloc(self.ptr.as_ptr(), self.layout); }
     }
 }
@@ -456,12 +471,6 @@ pub struct ProcessData {
     pub fds: FdTable,
     pub cwd: String,
 
-    pub poll_fds: [u64; 64],
-    pub poll_len: u32,
-    pub poll_read_pipes: [pipe::PipeId; 64],
-    pub poll_read_pipe_count: u32,
-    pub poll_write_pipes: [pipe::PipeId; 64],
-    pub poll_write_pipe_count: u32,
     pub elf_alloc: Option<OwnedAlloc>,
     pub stack_alloc: Option<OwnedAlloc>,
     // Thread-local storage
@@ -713,10 +722,17 @@ pub fn current_address_space() -> Arc<AddressSpace> {
 // ---------------------------------------------------------------------------
 
 /// Get the current process's ProcessData Arc (brief table lock).
+/// If the entry is gone (process killed while thread was running), exits silently.
 pub fn current_data() -> Arc<Lock<ProcessData>> {
     let guard = PROCESS_TABLE.lock();
     let table = guard.as_ref().unwrap();
-    Arc::clone(table.get(current_tid()).unwrap().data())
+    match table.get(current_tid()) {
+        Some(entry) => Arc::clone(entry.data()),
+        None => {
+            drop(guard);
+            scheduler::exit_current(-1);
+        }
+    }
 }
 
 /// Get the FD/heap owner's ProcessData Arc (brief table lock).
@@ -1012,12 +1028,6 @@ pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64, stack_base: u64) -> Op
         pid: parent_process,
         fds: FdTable::new(),
 
-        poll_fds: [0; 64],
-        poll_len: 0,
-        poll_read_pipes: [pipe::PipeId::from_raw(0); 64],
-        poll_read_pipe_count: 0,
-        poll_write_pipes: [pipe::PipeId::from_raw(0); 64],
-        poll_write_pipe_count: 0,
         cwd: parent_cwd,
         elf_alloc: None,
         stack_alloc: None,
@@ -1068,8 +1078,7 @@ pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64, stack_base: u64) -> Op
         fs_base,
         cpu_ns: 0,
         scheduled_at: 0,
-        registered_events: [scheduler::EventSource::Keyboard; 16],
-        registered_event_count: 0,
+        blocked_on: None,
         deadline: 0,
         blocked_since: 0,
     };
@@ -1746,12 +1755,6 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
         fds,
         cwd,
 
-        poll_fds: [0; 64],
-        poll_len: 0,
-        poll_read_pipes: [pipe::PipeId::from_raw(0); 64],
-        poll_read_pipe_count: 0,
-        poll_write_pipes: [pipe::PipeId::from_raw(0); 64],
-        poll_write_pipe_count: 0,
         elf_alloc: exe_tls_template, // TLS template allocation (if any)
         stack_alloc: Some(stack_alloc),
         tls_template,
@@ -1804,8 +1807,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
         fs_base,
         cpu_ns: 0,
         scheduled_at: 0,
-        registered_events: [scheduler::EventSource::Keyboard; 16],
-        registered_event_count: 0,
+        blocked_on: None,
         deadline: 0,
         blocked_since: 0,
     };
@@ -1868,7 +1870,6 @@ fn teardown_resources(data_arc: &Arc<Lock<ProcessData>>, pid: Pid) {
     data.loaded_libs.clear();
     data.mmap_regions.clear();
 
-    // Free demand-paged 2MB allocations (dropped automatically by OwnedAlloc).
     data.demand_allocs.clear();
     data.vmas.clear();
     data.reloc_index = None;
@@ -1897,6 +1898,13 @@ fn teardown_scheduling(table: &mut ProcessTable, process_pid: Pid, addr_space: A
         }
         // Remove from scheduler (drop ThreadCtx → frees kernel stack)
         scheduler::remove_thread(*tid);
+    }
+
+    // Remove the main thread from the scheduler if it's not the current thread.
+    // (If it IS the current thread, exit_current handles it via SwitchReason::Exit.)
+    let current = crate::arch::percpu::current_tid().unwrap();
+    if main_tid != current {
+        scheduler::remove_thread(main_tid);
     }
 
     shared_memory::cleanup_process(process_pid);
@@ -2048,72 +2056,7 @@ pub fn block(events: &[scheduler::EventSource], deadline: u64) {
     scheduler::block(events, deadline);
 }
 
-/// Block the current thread in poll, resolving FDs to event sources.
-pub fn block_poll(fds: [u64; 64], len: u32, deadline: u64) {
-    debug_assert!(len <= 64, "poll_len {} exceeds array size", len);
-    use scheduler::EventSource;
 
-    let mut events = [EventSource::Keyboard; 16];
-    let mut event_count = 0usize;
-
-    let data_arc = fd_owner_data();
-    let mut data = data_arc.lock();
-    data.poll_fds = fds;
-    data.poll_len = len;
-
-    // Resolve each poll FD to its event source(s)
-    for i in 0..len as usize {
-        let entry = fds[i];
-        let fd_num = (entry & POLL_FD_MASK) as u32;
-        let want_write = entry & POLL_WRITABLE != 0;
-        let want_read = entry & POLL_READABLE != 0 || !want_write;
-
-        if let Some(desc) = data.fds.get(fd_num) {
-            if want_read {
-                if let Some(e) = desc.read_event_source() {
-                    if !events[..event_count].contains(&e) && event_count < 16 {
-                        events[event_count] = e;
-                        event_count += 1;
-                    }
-                }
-            }
-            if want_write {
-                if let Some(e) = desc.write_event_source() {
-                    if !events[..event_count].contains(&e) && event_count < 16 {
-                        events[event_count] = e;
-                        event_count += 1;
-                    }
-                }
-            }
-        }
-    }
-
-    // Also store pipe IDs in ProcessData for poll_entry_ready backward compat
-    let mut rcount = 0u32;
-    let mut wcount = 0u32;
-    for i in 0..event_count {
-        match events[i] {
-            EventSource::PipeReadable(id) => {
-                if (rcount as usize) < 64 {
-                    data.poll_read_pipes[rcount as usize] = id;
-                    rcount += 1;
-                }
-            }
-            EventSource::PipeWritable(id) => {
-                if (wcount as usize) < 64 {
-                    data.poll_write_pipes[wcount as usize] = id;
-                    wcount += 1;
-                }
-            }
-            _ => {}
-        }
-    }
-    data.poll_read_pipe_count = rcount;
-    data.poll_write_pipe_count = wcount;
-    drop(data);
-
-    scheduler::block(&events[..event_count], deadline);
-}
 
 // ---------------------------------------------------------------------------
 // Futex
@@ -2159,11 +2102,27 @@ pub fn futex_wake(addr: u64, count: u64) -> u64 {
 /// Wake processes blocked on reading from a pipe that now has data.
 pub fn wake_pipe_readers(pipe_id: pipe::PipeId) {
     scheduler::wake_pipe_readers(pipe_id);
+    // Also complete any io_uring pending polls watching this pipe
+    let watchers = pipe::io_uring_watchers(pipe_id);
+    if !watchers.is_empty() {
+        crate::io_uring::complete_pending_for_event(
+            &watchers,
+            scheduler::EventSource::PipeReadable(pipe_id),
+        );
+    }
 }
 
 /// Wake processes blocked on writing to a pipe that now has space.
 pub fn wake_pipe_writers(pipe_id: pipe::PipeId) {
     scheduler::wake_pipe_writers(pipe_id);
+    // Also complete any io_uring pending polls watching this pipe
+    let watchers = pipe::io_uring_watchers(pipe_id);
+    if !watchers.is_empty() {
+        crate::io_uring::complete_pending_for_event(
+            &watchers,
+            scheduler::EventSource::PipeWritable(pipe_id),
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

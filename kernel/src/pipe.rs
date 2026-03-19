@@ -3,7 +3,10 @@ use core::alloc::Layout;
 
 use toyos_abi::ring::{RingHeader, RING_READER_CLOSED, RING_WRITER_CLOSED};
 
+use alloc::vec::Vec;
+
 use crate::arch::paging::PAGE_2M;
+use crate::io_uring::RingId;
 use crate::id_map::{IdKey, IdMap};
 use crate::sync::Lock;
 use crate::PhysAddr;
@@ -89,6 +92,7 @@ struct Pipe {
     layout: Layout,
     readers: u32,
     writers: u32,
+    io_uring_watchers: Vec<RingId>,
 }
 
 unsafe impl Send for Pipe {}
@@ -99,7 +103,7 @@ impl Pipe {
         let ptr = unsafe { alloc_zeroed(layout) };
         assert!(!ptr.is_null(), "pipe: allocation failed");
         RingHeader::init(ptr, PIPE_SIZE);
-        Self { phys_addr: PhysAddr::from_ptr(ptr), layout, readers: 0, writers: 0 }
+        Self { phys_addr: PhysAddr::from_ptr(ptr), layout, readers: 0, writers: 0, io_uring_watchers: Vec::new() }
     }
 
     fn header(&self) -> &RingHeader {
@@ -256,4 +260,32 @@ fn close_write(pipe_id: PipeId) {
 
 fn free_pipe(pipe: Pipe) {
     unsafe { dealloc(pipe.phys_addr.as_mut_ptr(), pipe.layout); }
+}
+
+// ---------------------------------------------------------------------------
+// io_uring watcher management
+// ---------------------------------------------------------------------------
+
+pub fn add_io_uring_watcher(pipe_id: PipeId, ring_id: RingId) {
+    with_pipes_mut(|pipes| {
+        if let Some(pipe) = pipes.get_mut(pipe_id) {
+            if !pipe.io_uring_watchers.contains(&ring_id) {
+                pipe.io_uring_watchers.push(ring_id);
+            }
+        }
+    });
+}
+
+pub fn remove_io_uring_watcher(pipe_id: PipeId, ring_id: RingId) {
+    with_pipes_mut(|pipes| {
+        if let Some(pipe) = pipes.get_mut(pipe_id) {
+            pipe.io_uring_watchers.retain(|&id| id != ring_id);
+        }
+    });
+}
+
+pub fn io_uring_watchers(pipe_id: PipeId) -> Vec<RingId> {
+    with_pipes(|pipes| {
+        pipes.get(pipe_id).map_or(Vec::new(), |p| p.io_uring_watchers.clone())
+    })
 }

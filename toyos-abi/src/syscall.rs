@@ -20,7 +20,6 @@ pub const SYS_SET_KEYBOARD_LAYOUT: u64 = 23;
 pub const SYS_PIPE: u64 = 24;
 pub const SYS_SPAWN: u64 = 25;
 pub const SYS_WAITPID: u64 = 26;
-pub const SYS_POLL: u64 = 27;
 pub const SYS_MARK_TTY: u64 = 28;
 // Syscall numbers 29-30 unused (formerly SYS_SEND_MSG/SYS_RECV_MSG).
 pub const SYS_OPEN_DEVICE: u64 = 31;
@@ -81,6 +80,8 @@ pub const SYS_CONNECT: u64 = 87;
 /// Allocate a TLS block for a dlopen'd module on the current thread.
 /// Arg0: module_id (1-based DTV index). Returns physical address of allocated block.
 pub const SYS_TLS_ALLOC_BLOCK: u64 = 88;
+pub const SYS_IO_URING_SETUP: u64 = 89;
+pub const SYS_IO_URING_ENTER: u64 = 90;
 
 pub const WNOHANG: u64 = 1;
 
@@ -567,44 +568,6 @@ pub fn shutdown() -> ! {
     loop {}
 }
 
-// --- Poll ---
-
-/// Poll interest flags — encode in the high bits of each fd entry passed to poll.
-/// If neither bit is set, defaults to read interest.
-pub const POLL_READABLE: u64 = 1 << 62;
-pub const POLL_WRITABLE: u64 = 1 << 63;
-pub const POLL_FD_MASK: u64 = !(POLL_READABLE | POLL_WRITABLE);
-
-/// Result of a [`poll`] or [`poll_timeout`] call.
-pub struct PollResult {
-    mask: u64,
-}
-
-impl PollResult {
-    /// Whether the file descriptor at `index` is ready.
-    pub fn fd(&self, index: usize) -> bool {
-        self.mask & (1 << index) != 0
-    }
-
-}
-
-/// Poll file descriptors and the message queue for readiness.
-/// Blocks until at least one source has data.
-///
-/// Each entry is a fd number (as u64), optionally OR'd with POLL_READABLE/POLL_WRITABLE.
-pub fn poll(fds: &[u64]) -> PollResult {
-    poll_timeout(fds, None)
-}
-
-/// Poll file descriptors and the message queue for readiness.
-/// `None` = block forever, `Some(nanos)` = timeout after `nanos` nanoseconds.
-///
-/// Each entry is a fd number (as u64), optionally OR'd with POLL_READABLE/POLL_WRITABLE.
-pub fn poll_timeout(fds: &[u64], timeout: Option<u64>) -> PollResult {
-    let mask = syscall(SYS_POLL, fds.as_ptr() as u64, fds.len() as u64, encode_timeout(timeout), 0);
-    PollResult { mask }
-}
-
 // --- Devices ---
 
 /// Device types for [`open_device`].
@@ -939,4 +902,26 @@ pub fn audio_poll() -> u32 {
 /// Panics in the kernel if module_id is invalid or allocation fails.
 pub fn tls_alloc_block(module_id: u64) -> u64 {
     syscall(SYS_TLS_ALLOC_BLOCK, module_id, 0, 0, 0)
+}
+
+// --- io_uring ---
+
+/// Create an io_uring instance with the given queue depth (must be power of 2, max 256).
+/// Returns (ring_fd, shared_memory_token). The shared memory contains the SQ/CQ rings
+/// and SQE array; map it with `map_shared()` to access them.
+pub fn io_uring_setup(depth: u32) -> Result<(Fd, u32), SyscallError> {
+    let raw = check(syscall(SYS_IO_URING_SETUP, depth as u64, 0, 0, 0))?;
+    let fd = Fd((raw & 0xFFFF_FFFF) as i32);
+    let token = (raw >> 32) as u32;
+    Ok((fd, token))
+}
+
+/// Submit SQEs and/or wait for completions on an io_uring instance.
+/// `to_submit`: number of SQEs to consume from the SQ ring.
+/// `min_complete`: block until at least this many CQEs are available (0 = don't block).
+/// `timeout_nanos`: 0 = non-blocking, u64::MAX = block forever, else timeout in nanos.
+/// Returns the number of CQEs available.
+pub fn io_uring_enter(fd: Fd, to_submit: u32, min_complete: u32, timeout_nanos: u64) -> Result<u32, SyscallError> {
+    check(syscall(SYS_IO_URING_ENTER, fd.0 as u64, to_submit as u64, min_complete as u64, timeout_nanos))
+        .map(|n| n as u32)
 }

@@ -1,10 +1,26 @@
 use alloc::collections::VecDeque;
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU8, Ordering};
+use crate::io_uring::RingId;
 use crate::sync::Lock;
 pub use toyos_abi::input::MouseEvent;
 
 static MOUSE_BUF: Lock<VecDeque<MouseEvent>> = Lock::new(VecDeque::new());
 static LAST_BUTTONS: AtomicU8 = AtomicU8::new(0);
+static IO_URING_WATCHERS: Lock<Vec<RingId>> = Lock::new(Vec::new());
+
+pub fn add_io_uring_watcher(id: RingId) {
+    let mut w = IO_URING_WATCHERS.lock();
+    if !w.contains(&id) { w.push(id); }
+}
+
+pub fn remove_io_uring_watcher(id: RingId) {
+    IO_URING_WATCHERS.lock().retain(|&x| x != id);
+}
+
+pub fn io_uring_watchers() -> Vec<RingId> {
+    IO_URING_WATCHERS.lock().clone()
+}
 
 /// Process a HID boot protocol mouse report (3+ bytes).
 pub fn handle_report(report: &[u8]) {

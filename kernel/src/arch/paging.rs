@@ -182,6 +182,97 @@ pub fn init(memory_map: &[MemoryMapEntry]) {
 // Per-process page table operations
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// PML4 corruption detection
+// ---------------------------------------------------------------------------
+
+const PML4_CANARY_SLOT: usize = 255;
+const PML4_CANARY_MAGIC: u64 = 0xCAFE_BABE_DEAD_0000;
+const MAX_ACTIVE_PML4S: usize = 64;
+
+static ACTIVE_PML4_COUNT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static ACTIVE_PML4S: [core::sync::atomic::AtomicU64; MAX_ACTIVE_PML4S] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; MAX_ACTIVE_PML4S];
+
+fn register_active_pml4(phys: PhysAddr) {
+    let idx = ACTIVE_PML4_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    if idx < MAX_ACTIVE_PML4S {
+        ACTIVE_PML4S[idx].store(phys.raw(), core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+fn unregister_active_pml4(phys: u64) {
+    let count = ACTIVE_PML4_COUNT.load(core::sync::atomic::Ordering::Relaxed);
+    for i in 0..count.min(MAX_ACTIVE_PML4S) {
+        if ACTIVE_PML4S[i].load(core::sync::atomic::Ordering::Relaxed) == phys {
+            ACTIVE_PML4S[i].store(0, core::sync::atomic::Ordering::Relaxed);
+            return;
+        }
+    }
+}
+
+/// Inline canary check before write_cr3. Lock-free — reads directly via physical map.
+pub fn assert_pml4_canary(phys: PhysAddr, tid: crate::process::Tid) {
+    let pml4 = PageTable::from_phys(phys.raw());
+    let canary = pml4.read_volatile(PML4_CANARY_SLOT);
+    let expected = pml4_canary(phys.raw());
+    if canary != expected {
+        let kernel = PageTable::from_virt(KERNEL_PML4.load(Ordering::Acquire));
+        let entry_256 = pml4.read_volatile(256);
+        let expected_256 = kernel.read(256);
+        let mut dump = [0u64; 8];
+        for j in 0..8 {
+            dump[j] = pml4.read_volatile(j);
+        }
+        panic!(
+            "PML4 CORRUPTION before write_cr3: phys={:#x} tid={}\n\
+             canary[255]: got {:#x}, expected {:#x}\n\
+             entry[256]: got {:#x}, expected {:#x}\n\
+             [0..8]: {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x}",
+            phys.raw(), tid, canary, expected, entry_256, expected_256,
+            dump[0], dump[1], dump[2], dump[3], dump[4], dump[5], dump[6], dump[7],
+        );
+    }
+}
+
+/// Check all active PML4s for canary corruption. Called from timer interrupt.
+pub fn check_pml4_canaries() {
+    let count = ACTIVE_PML4_COUNT.load(core::sync::atomic::Ordering::Relaxed);
+    let kernel = PageTable::from_virt(KERNEL_PML4.load(Ordering::Acquire));
+    if kernel.as_ptr().is_null() { return; }
+    let expected_256 = kernel.read(256);
+
+    for i in 0..count.min(MAX_ACTIVE_PML4S) {
+        let phys = ACTIVE_PML4S[i].load(core::sync::atomic::Ordering::Relaxed);
+        if phys == 0 { continue; }
+
+        let pml4 = PageTable::from_phys(phys);
+        let canary = pml4.read_volatile(PML4_CANARY_SLOT);
+        let expected_canary = pml4_canary(phys);
+
+        if canary != expected_canary {
+            let entry_256 = pml4.read_volatile(256);
+            // Dump first 8 entries to identify the corrupting data
+            let mut dump = [0u64; 8];
+            for j in 0..8 {
+                dump[j] = pml4.read_volatile(j);
+            }
+            panic!(
+                "PML4 CORRUPTION: phys={:#x}\n\
+                 canary[255]: got {:#x}, expected {:#x}\n\
+                 entry[256]: got {:#x}, expected {:#x}\n\
+                 [0..8]: {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x}",
+                phys, canary, expected_canary, entry_256, expected_256,
+                dump[0], dump[1], dump[2], dump[3], dump[4], dump[5], dump[6], dump[7],
+            );
+        }
+    }
+}
+
+fn pml4_canary(phys: u64) -> u64 {
+    PML4_CANARY_MAGIC | (phys & 0xFFFF_FFFF_F000)
+}
+
 /// Create a per-process PML4.
 /// PML4[0..255]: empty. PML4[256..511]: shallow-copy kernel high-half entries.
 pub fn create_user_pml4() -> PhysAddr {
@@ -196,13 +287,18 @@ pub fn create_user_pml4() -> PhysAddr {
         }
     }
 
-    PhysAddr::from_ptr(pml4.as_ptr())
+    let phys = PhysAddr::from_ptr(pml4.as_ptr());
+    // Write canary into unused slot 255 for corruption detection
+    pml4.write_raw(PML4_CANARY_SLOT, pml4_canary(phys.raw()));
+    register_active_pml4(phys);
+    phys
 }
 
 /// Free a per-process PML4 and all its user page table structures.
 /// Only frees PML4[0..255]. PML4[256+] are shared kernel entries.
 pub fn free_user_page_tables(pml4_ptr: *mut u64) {
     let pml4 = PageTable::from_virt(pml4_ptr);
+    unregister_active_pml4(pml4.phys());
     for pml4_idx in 0..256 {
         let Some(pdpt) = pml4.child(pml4_idx) else { continue };
         for pdpt_idx in 0..512 {

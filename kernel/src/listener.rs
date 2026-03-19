@@ -1,6 +1,8 @@
 use alloc::collections::VecDeque;
 use alloc::string::String;
+use alloc::vec::Vec;
 
+use crate::io_uring::RingId;
 use crate::pipe::{PipeReader, PipeWriter};
 use crate::process::Pid;
 use crate::sync::Lock;
@@ -18,9 +20,23 @@ struct Listener {
 }
 
 static LISTENERS: Lock<Option<hashbrown::HashMap<String, Listener>>> = Lock::new(None);
+static IO_URING_WATCHERS: Lock<Vec<RingId>> = Lock::new(Vec::new());
 
 pub fn init() {
     *LISTENERS.lock() = Some(hashbrown::HashMap::new());
+}
+
+pub fn add_io_uring_watcher(id: RingId) {
+    let mut w = IO_URING_WATCHERS.lock();
+    if !w.contains(&id) { w.push(id); }
+}
+
+pub fn remove_io_uring_watcher(id: RingId) {
+    IO_URING_WATCHERS.lock().retain(|&x| x != id);
+}
+
+pub fn io_uring_watchers() -> Vec<RingId> {
+    IO_URING_WATCHERS.lock().clone()
 }
 
 pub fn listen(name: &str) -> bool {

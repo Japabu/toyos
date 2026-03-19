@@ -1,4 +1,6 @@
 use alloc::boxed::Box;
+use alloc::vec::Vec;
+use crate::io_uring::RingId;
 use crate::sync::Lock;
 
 pub use toyos_abi::net::NicInfo;
@@ -21,6 +23,20 @@ pub trait Nic: Send {
 
 static NIC: Lock<Option<Box<dyn Nic>>> = Lock::new(None);
 static NIC_INFO: Lock<Option<NicInfo>> = Lock::new(None);
+static IO_URING_WATCHERS: Lock<Vec<RingId>> = Lock::new(Vec::new());
+
+pub fn add_io_uring_watcher(id: RingId) {
+    let mut w = IO_URING_WATCHERS.lock();
+    if !w.contains(&id) { w.push(id); }
+}
+
+pub fn remove_io_uring_watcher(id: RingId) {
+    IO_URING_WATCHERS.lock().retain(|&x| x != id);
+}
+
+pub fn io_uring_watchers() -> Vec<RingId> {
+    IO_URING_WATCHERS.lock().clone()
+}
 
 pub fn register(nic: Box<dyn Nic>) {
     *NIC.lock() = Some(nic);

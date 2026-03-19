@@ -1,12 +1,11 @@
 use core::arch::naked_asm;
 
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 use super::{apic, cpu, gdt, paging};
 use crate::drivers::acpi;
 use crate::sync::Lock;
 use crate::user_ptr::SyscallContext;
-use crate::{allocator, device, fd, keyboard, listener, log, pipe, process, shared_memory, vfs};
+use crate::{allocator, device, fd, keyboard, listener, log, pipe, process, scheduler, shared_memory, vfs};
 use crate::{PhysAddr, UserAddr};
 
 // MSR addresses
@@ -217,11 +216,7 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             sys_spawn(text, fds, env)
         }
         SYS_WAITPID => sys_waitpid(a1, a2),
-        SYS_POLL => {
-            if a2 > 63 { return SyscallError::InvalidArgument.to_u64(); }
-            let Some(fds) = ctx.user_slice_of::<u64>(UserAddr::new(a1), a2 as usize) else { return bad_addr };
-            sys_poll(fds, a2, a3)
-        }
+
         SYS_MARK_TTY => process::with_fd_owner_data(|data| fd::mark_tty(&mut data.fds, a1 as u32)),
         29 | 30 => SyscallError::NotSupported.to_u64(), // formerly SYS_SEND_MSG/SYS_RECV_MSG
         SYS_OPEN_DEVICE => sys_open_device(a1),
@@ -396,6 +391,8 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             sys_connect(name)
         }
         SYS_TLS_ALLOC_BLOCK => sys_tls_alloc_block(a1),
+        SYS_IO_URING_SETUP => sys_io_uring_setup(a1 as u32),
+        SYS_IO_URING_ENTER => sys_io_uring_enter(a1 as u32, a2 as u32, a3 as u32, a4),
         _ => SyscallError::InvalidArgument.to_u64(),
     };
 
@@ -440,7 +437,7 @@ fn sys_write(fd_num: u32, buf: &[u8]) -> u64 {
 
 enum ReadBlock {
     Event(crate::scheduler::EventSource),
-    Poll { fds: [u64; 64], len: u32, deadline: u64 },
+    EventWithDeadline(crate::scheduler::EventSource, u64),
 }
 
 fn sys_read(fd_num: u32, buf: &mut [u8]) -> u64 {
@@ -459,9 +456,7 @@ fn sys_read(fd_num: u32, buf: &mut [u8]) -> u64 {
                         Err(Some(ReadBlock::Event(crate::scheduler::EventSource::PipeReadable(id))))
                     } else if matches!(desc, Some(fd::Descriptor::SerialConsole)) {
                         let deadline = crate::clock::nanos_since_boot() + 10_000_000;
-                        let mut fds = [0u64; 64];
-                        fds[0] = fd_num as u64;
-                        Err(Some(ReadBlock::Poll { fds, len: 1, deadline }))
+                        Err(Some(ReadBlock::EventWithDeadline(crate::scheduler::EventSource::Keyboard, deadline)))
                     } else {
                         Err(None)
                     }
@@ -474,7 +469,7 @@ fn sys_read(fd_num: u32, buf: &mut [u8]) -> u64 {
                 return n;
             }
             Err(Some(ReadBlock::Event(event))) => process::block(&[event], 0),
-            Err(Some(ReadBlock::Poll { fds, len, deadline })) => process::block_poll(fds, len, deadline),
+            Err(Some(ReadBlock::EventWithDeadline(event, deadline))) => process::block(&[event], deadline),
             Err(None) => return SyscallError::NotFound.to_u64(),
         }
     }
@@ -731,63 +726,6 @@ fn sys_waitpid(pid: u64, flags: u64) -> u64 {
     }
 }
 
-/// Extract the raw fd number from a poll entry (strip interest bits).
-fn poll_fd_num(entry: u64) -> u32 {
-    (entry & POLL_FD_MASK) as u32
-}
-
-/// Check if a poll entry is ready, respecting interest bits.
-fn poll_entry_ready(fds: &fd::FdTable, entry: u64) -> bool {
-    let fd_num = poll_fd_num(entry);
-    let want_write = entry & POLL_WRITABLE != 0;
-    let want_read = entry & POLL_READABLE != 0 || !want_write;
-    (want_read && fd::has_data(fds, fd_num)) || (want_write && fd::has_space(fds, fd_num))
-}
-
-fn sys_poll(fds: &[u64], fds_len: u64, timeout_nanos: u64) -> u64 {
-    let deadline = if timeout_nanos != u64::MAX {
-        crate::clock::nanos_since_boot().saturating_add(timeout_nanos)
-    } else {
-        0
-    };
-
-    let fd_data_arc = {
-        let guard = process::PROCESS_TABLE.lock();
-        let table = guard.as_ref().unwrap();
-        let tid = process::current_tid();
-        let process_pid = table.get(tid).unwrap().process();
-        Arc::clone(table.get_process(process_pid).unwrap().data())
-    };
-
-    loop {
-        crate::drivers::xhci::poll_if_pending();
-
-        let mut mask: u64 = 0;
-
-        // Check FD readiness + messages. Handle the common case (process, not thread)
-        // where fd_data_arc and cur_data_arc are the same Arc.
-        {
-            let data = fd_data_arc.lock();
-            for (i, &entry) in fds.iter().enumerate() {
-                if poll_entry_ready(&data.fds, entry) {
-                    mask |= 1 << i;
-                }
-            }
-        }
-
-        if mask != 0 {
-            return mask;
-        }
-        if deadline > 0 && crate::clock::nanos_since_boot() >= deadline {
-            return 0;
-        }
-        let mut poll_fds = [0u64; 64];
-        let copy_len = (fds_len as usize).min(64);
-        poll_fds[..copy_len].copy_from_slice(&fds[..copy_len]);
-        process::block_poll(poll_fds, copy_len as u32, deadline);
-    }
-}
-
 // Screen size globals (set during kernel init, font is always 8x16)
 static SCREEN_COLS: Lock<usize> = Lock::new(80);
 static SCREEN_ROWS: Lock<usize> = Lock::new(24);
@@ -850,9 +788,7 @@ fn sys_accept(fd_num: u32) -> u64 {
                 Err(e) => e.to_u64(),
             };
         }
-        let mut poll_fds = [0u64; 64];
-        poll_fds[0] = fd_num as u64;
-        process::block_poll(poll_fds, 1, 0);
+        process::block(&[scheduler::EventSource::Listener], 0);
     }
 }
 
@@ -1387,6 +1323,46 @@ fn sys_dlsym(handle: u64, name: &str) -> u64 {
     match crate::elf::dlsym(&data.loaded_libs[idx], name) {
         Some(addr) => addr.raw(),
         None => u64::MAX,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// io_uring syscalls
+// ---------------------------------------------------------------------------
+
+fn sys_io_uring_setup(depth: u32) -> u64 {
+    let (ring_id, shm_token) = match crate::io_uring::create(depth) {
+        Ok(v) => v,
+        Err(e) => return e.to_u64(),
+    };
+    let fd = process::with_fd_owner_data(|data| {
+        fd::alloc(&mut data.fds, fd::Descriptor::IoUring(ring_id))
+    });
+    match fd {
+        Ok(fd_num) => {
+            // Pack fd and shm_token into return value
+            ((shm_token.raw() as u64) << 32) | (fd_num as u64)
+        }
+        Err(e) => {
+            crate::io_uring::destroy(ring_id);
+            e.to_u64()
+        }
+    }
+}
+
+fn sys_io_uring_enter(ring_fd: u32, to_submit: u32, min_complete: u32, timeout_nanos: u64) -> u64 {
+    let ring_id = process::with_fd_owner_data(|data| {
+        match data.fds.get(ring_fd) {
+            Some(fd::Descriptor::IoUring(id)) => Some(*id),
+            _ => None,
+        }
+    });
+    let Some(ring_id) = ring_id else {
+        return SyscallError::InvalidArgument.to_u64();
+    };
+    match crate::io_uring::enter(ring_id, to_submit, min_complete, timeout_nanos) {
+        Ok(n) => n as u64,
+        Err(e) => e.to_u64(),
     }
 }
 
