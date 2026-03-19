@@ -86,7 +86,7 @@ mod imp {
     use std::io;
     use std::io::Read;
     use std::os::fd::AsRawFd;
-    use toyos_abi::poll;
+    use toyos_abi::io_uring;
     use std::process::{ChildStderr, ChildStdout};
 
     pub fn read2(
@@ -102,13 +102,13 @@ mod imp {
         while !out_done || !err_done {
             let mut fds = Vec::new();
             if !out_done {
-                fds.push(out_pipe.as_raw_fd() as u64 | poll::POLL_READABLE);
+                fds.push(out_pipe.as_raw_fd() as u64 | io_uring::POLL_READABLE);
             }
             if !err_done {
-                fds.push(err_pipe.as_raw_fd() as u64 | poll::POLL_READABLE);
+                fds.push(err_pipe.as_raw_fd() as u64 | io_uring::POLL_READABLE);
             }
 
-            let result = poll::poll(&fds);
+            let result = io_uring::poll_fds(&fds, None);
 
             // Use single read() calls — poll guarantees data is available,
             // so a single read won't block. read_to_end would block until EOF.
