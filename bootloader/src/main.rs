@@ -115,6 +115,7 @@ fn load_kernel_elf(kernel_elf_bytes: &[u8]) -> LoadedKernel {
         panic!("SHT_REL not supported");
     }
 
+    let mut reloc_count = 0u64;
     section_headers
         .iter()
         .filter(|section_header| section_header.sh_type == abi::SHT_RELA)
@@ -126,19 +127,25 @@ fn load_kernel_elf(kernel_elf_bytes: &[u8]) -> LoadedKernel {
                         abi::R_X86_64_RELATIVE => {
                             let offset = rela.r_offset as isize;
                             let addend = rela.r_addend as isize;
-                            // Relocate to high-half: kernel symbols live at PHYS_OFFSET + phys
+                            let value = PHYS_OFFSET + unsafe { process_mem.as_ptr().byte_offset(addend) } as u64;
                             unsafe {
                                 process_mem
                                     .as_mut_ptr()
                                     .byte_offset(offset)
                                     .cast::<u64>()
-                                    .write(PHYS_OFFSET + process_mem.as_ptr().byte_offset(addend) as u64);
+                                    .write(value);
                             }
+                            reloc_count += 1;
                         }
                         _ => panic!("Unsupported relocation type"),
                     }
                 });
         });
+    println!("Applied {} relocations", reloc_count);
+    // Verify a specific GOT entry that was observed to be zero at runtime
+    let got_check_offset = 0x200f50usize;
+    let got_val = unsafe { *(process_mem.as_ptr().add(got_check_offset) as *const u64) };
+    println!("GOT[0x{:x}] = 0x{:x} (expected PHYS_OFFSET + base + 0x1e00a0)", got_check_offset, got_val);
 
     LoadedKernel {
         memory: process_mem,
@@ -279,6 +286,18 @@ fn start_kernel(kernel: LoadedKernel, kernel_elf_bytes: vec::Vec<u8>, initrd: ve
     let pt_layout = Layout::from_size_align(PT_PAGES * 4096, 4096).unwrap();
     let pt_mem = unsafe { alloc::alloc::alloc_zeroed(pt_layout) };
     assert!(!pt_mem.is_null(), "page table allocation failed");
+    let kp = kernel.memory.as_ptr() as u64;
+    let ksz = kernel.memory.len() as u64;
+    println!("pt_mem: {:#x}..{:#x}", pt_mem as u64, pt_mem as u64 + (PT_PAGES * 4096) as u64);
+    println!("kernel: {:#x}..{:#x}  .data: {:#x}..{:#x}", kp, kp + ksz, kp + 0x1EA000, kp + 0x3DB000);
+    println!("memory_map buf: {:#x}..{:#x}", memory_map.as_ptr() as u64, memory_map.as_ptr() as u64 + (memory_map.capacity() * core::mem::size_of::<MemoryMapEntry>()) as u64);
+    // Check if pt_mem or memory_map overlap kernel
+    let pt_start = pt_mem as u64;
+    let pt_end = pt_start + (PT_PAGES * 4096) as u64;
+    let mm_start = memory_map.as_ptr() as u64;
+    let mm_end = mm_start + (memory_map.capacity() * core::mem::size_of::<MemoryMapEntry>()) as u64;
+    if pt_start < kp + ksz && pt_end > kp { println!("!!! pt_mem OVERLAPS kernel !!!"); }
+    if mm_start < kp + ksz && mm_end > kp { println!("!!! memory_map OVERLAPS kernel !!!"); }
 
     let (_system_table, uefi_memory_map) = system_table.exit_boot_services(MemoryType::LOADER_DATA);
 

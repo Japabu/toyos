@@ -1,5 +1,6 @@
 #![no_std]
 #![no_main]
+#![allow(dead_code)]
 extern crate alloc;
 
 /// Debugger spin gate. When `--debug` is active, the kernel spins here until
@@ -139,12 +140,57 @@ fn register_gpu(driver: Box<dyn gpu::Gpu>, info: gpu::GpuInfo) {
     gpu::register(driver, info);
 }
 
+/// Check GOT entries for fmt::write and panic_fmt. Uses raw serial to avoid
+/// triggering the very code paths that depend on these GOT entries.
+fn check_got(label: &str) {
+    // GOT offsets from objdump — update if binary layout changes
+    const FMT_WRITE_GOT: usize = 0x202230;
+    const PANIC_FMT_GOT: usize = 0x202210;
+
+    unsafe {
+        let start_addr = _start as *const () as u64;
+        let got_fmt = (start_addr + FMT_WRITE_GOT as u64) as *const u64;
+        let got_panic = (start_addr + PANIC_FMT_GOT as u64) as *const u64;
+        let fmt_write_got: u64;
+        let panic_fmt_got: u64;
+
+        fmt_write_got = core::ptr::read_volatile(got_fmt);
+        panic_fmt_got = core::ptr::read_volatile(got_panic);
+
+        // Print via raw serial
+        for &b in b"GOT[" { core::arch::asm!("out dx, al", in("dx") 0x3F8u16, in("al") b); }
+        for &b in label.as_bytes() { core::arch::asm!("out dx, al", in("dx") 0x3F8u16, in("al") b); }
+        for &b in b"] fmt_write=" { core::arch::asm!("out dx, al", in("dx") 0x3F8u16, in("al") b); }
+        for i in (0..16).rev() {
+            let nibble = ((fmt_write_got >> (i * 4)) & 0xF) as u8;
+            let c = if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 };
+            core::arch::asm!("out dx, al", in("dx") 0x3F8u16, in("al") c);
+        }
+        for &b in b" panic_fmt=" { core::arch::asm!("out dx, al", in("dx") 0x3F8u16, in("al") b); }
+        for i in (0..16).rev() {
+            let nibble = ((panic_fmt_got >> (i * 4)) & 0xF) as u8;
+            let c = if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 };
+            core::arch::asm!("out dx, al", in("dx") 0x3F8u16, in("al") c);
+        }
+        for &b in b"\n" { core::arch::asm!("out dx, al", in("dx") 0x3F8u16, in("al") b); }
+
+        // Panic if zero
+        if fmt_write_got == 0 || panic_fmt_got == 0 {
+            for &b in b"!!! GOT CORRUPTED !!!\n" {
+                core::arch::asm!("out dx, al", in("dx") 0x3F8u16, in("al") b);
+            }
+            cpu::halt();
+        }
+    }
+}
+
 unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     // Copy KernelArgs to the kernel stack — the original lives on the UEFI stack
     // which becomes inaccessible after paging::init drops the identity map.
     let kernel_args = *kernel_args;
 
     serial::init();
+    check_got("entry");
     log!("{:?}", kernel_args);
 
     let entry_count = kernel_args.memory_map_size as usize / core::mem::size_of::<MemoryMapEntry>();
@@ -175,7 +221,9 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
         allocator::Region { start: kernel_args.kernel_stack_addr, end: kernel_args.kernel_stack_addr + kernel_args.kernel_stack_size },
         allocator::Region { start: 0x8000, end: 0x9000 }, // AP trampoline page
     ];
+    check_got("pre-alloc-init");
     unsafe { allocator::init(maps, &reserved); }
+    check_got("post-alloc-init");
 
     // Copy init_programs into heap before init_buddy reclaims bootloader memory.
     // The original pointer is into the bootloader's .rodata, which the buddy
@@ -183,8 +231,11 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     let init_programs = alloc::string::String::from(init_programs);
     let init_programs: &str = &init_programs;
 
+    check_got("pre-paging");
     paging::init(maps);
+    check_got("post-paging");
     unsafe { allocator::init_buddy(maps, &reserved); }
+    check_got("post-buddy");
 
     // ── Phase 2: CPU — exceptions, LAPIC, clock ─────────────────────────
     // Get exception handlers up ASAP so bugs in later phases produce diagnostics
@@ -206,6 +257,7 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     clock::init(hpet_base);
     apic::init_timer();
 
+    check_got("post-cpu");
     log!("Boot: CPU ready ({}ms)", clock::nanos_since_boot() / 1_000_000);
 
     // ── Phase 3: Storage ────────────────────────────────────────────────

@@ -44,6 +44,8 @@ impl Vector {
 
 // Page fault error code bits
 const PF_PRESENT: u64 = 1 << 0;
+const PF_WRITE: u64 = 1 << 1;
+const PF_INSTRUCTION_FETCH: u64 = 1 << 4;
 
 // CS ring mask
 const RPL_MASK: u64 = 3;

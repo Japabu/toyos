@@ -3,7 +3,14 @@ use core::arch::naked_asm;
 use crate::arch::{cpu, debug, paging, syscall, percpu};
 use crate::{log, process};
 
-use super::{Vector, SavedRegs, InterruptFrame, RPL_MASK, PF_PRESENT};
+use core::sync::atomic::{AtomicBool, Ordering};
+
+use super::{Vector, SavedRegs, InterruptFrame, RPL_MASK, PF_PRESENT, PF_WRITE, PF_INSTRUCTION_FETCH};
+
+/// Guards against recursive page faults (e.g. from debug-mode ptr::add precondition checks).
+static IN_PAGE_FAULT: AtomicBool = AtomicBool::new(false);
+/// Guards against re-entry into fatal_exception (log!() triggering an unresolvable fault).
+static IN_FATAL: AtomicBool = AtomicBool::new(false);
 
 /// Write bytes to serial port 0x3F8 using raw port I/O.
 /// No fmt, no allocation, no ptr::add — cannot cause recursive faults.
@@ -199,7 +206,9 @@ pub(super) extern "sysv64" fn page_fault_entry() {
         // One arg: pointer to saved regs
         "mov rdi, rsp",
         "sub rsp, 8", // 16-byte align (15 GPR pushes + error code = 16 pushes = aligned, but sub 8 for call)
+        "sti",         // re-enable interrupts so timer/deadlines fire during page fault handling
         "call {handler}",
+        "cli",
         "add rsp, 8",
 
         // Handler returned — fault was resolved. Restore and return.
@@ -383,25 +392,33 @@ extern "sysv64" fn double_fault_handler(regs: *const SavedRegs) -> ! {
 /// Returns normally if the fault was resolved (page mapped in).
 /// Diverges (never returns) if the fault is fatal.
 extern "sysv64" fn page_fault_handler(regs: *const SavedRegs) {
-    use core::sync::atomic::{AtomicBool, Ordering};
-    static IN_PAGE_FAULT: AtomicBool = AtomicBool::new(false);
-
-    // Detect recursive page faults (e.g. from debug-mode ptr::add precondition checks
-    // in the panic/log path). Break the recursion with raw serial output and halt.
-    if IN_PAGE_FAULT.swap(true, Ordering::Relaxed) {
-        let cr2 = cpu::read_cr2().raw();
-        let frame = unsafe { &*regs }.interrupt_frame();
-        raw_serial(b"\n!!! RECURSIVE KERNEL #PF");
-        raw_serial_hex(b" rip=", frame.rip);
-        raw_serial_hex(b" cr2=", cr2);
-        raw_serial_hex(b" rsp=", frame.rsp);
-        raw_serial(b"\n");
-        cpu::halt();
+    if IN_PAGE_FAULT.swap(true, Ordering::SeqCst) {
+        // Recursive page fault — we're already handling one. This happens when
+        // log!() in fatal_exception triggers a debug-mode ptr::add precondition
+        // check fault. Don't try to handle it; let the fault fall through to
+        // fatal_exception which will detect re-entry via IN_FATAL.
+        let regs = unsafe { &*regs };
+        let frame = regs.interrupt_frame();
+        let ctx = ExceptionContext {
+            vector: Vector::PageFault,
+            regs,
+            frame,
+            cr2: cpu::read_cr2().raw(),
+        };
+        fatal_exception(&ctx);
     }
 
     let regs = unsafe { &*regs };
     let frame = regs.interrupt_frame();
     let fault_addr = cpu::read_cr2().raw();
+
+    // Raw serial spam: log every page fault
+    raw_serial(b"PF cr2=");
+    raw_serial_hex(b"", fault_addr);
+    raw_serial_hex(b" rip=", frame.rip);
+    raw_serial_hex(b" err=", frame.error_code);
+    raw_serial_hex(b" cr3=", cpu::read_cr3().raw());
+    raw_serial(b"\n");
 
     // SMAP violation detection: kernel-mode protection fault on a kernel direct-map address.
     // Enable stac immediately so diagnostics don't cascade into another SMAP fault.
@@ -431,7 +448,16 @@ extern "sysv64" fn page_fault_handler(regs: *const SavedRegs) {
                 IN_PAGE_FAULT.store(false, Ordering::Relaxed);
                 return;
             }
+            // Demand paging failed
+            log!("#PF UNHANDLED: cr2={:#x} rip={:#x} err={:#x} user={} tid={:?}",
+                fault_addr, frame.rip, frame.error_code, is_user, percpu::current_tid());
+        } else {
+            log!("#PF SKIP: cr2={:#x} rip={:#x} err={:#x} (no tid, not user)",
+                fault_addr, frame.rip, frame.error_code);
         }
+    } else {
+        log!("#PF PRESENT: cr2={:#x} rip={:#x} err={:#x} cs={:#x}",
+            fault_addr, frame.rip, frame.error_code, frame.cs);
     }
 
     // Fatal — build context and terminate
@@ -509,67 +535,164 @@ extern "sysv64" fn exception_handler(raw_vector: u64, regs: *const SavedRegs) ->
 /// Core fatal exception logic. Shared by page_fault_handler (when unresolvable)
 /// and exception_handler (for all other fatal exceptions).
 ///
-/// Uses raw serial I/O exclusively — no fmt::Write, no log!(), no ptr::add().
-/// This prevents recursive page faults from debug-mode precondition checks
-/// that would exhaust the stack and triple fault.
+/// Step 1: Raw serial preamble (guaranteed output, cannot fail).
+/// Step 2: Rich diagnostics via log!() (best-effort; if it triggers an
+///         unresolvable fault, we re-enter via IN_FATAL and skip to step 3).
+/// Step 3: Terminate (kill process for user faults, halt for kernel faults).
 fn fatal_exception(ctx: &ExceptionContext) -> ! {
     let is_user = ctx.is_user_fault();
+    let recursive = IN_FATAL.swap(true, Ordering::SeqCst);
 
-    // --- Header ---
-    if is_user {
-        raw_serial(b"\n!!! FAULT ");
-    } else {
-        raw_serial(b"\n!!! KERNEL FAULT ");
-    }
-    match ctx.vector {
-        Vector::PageFault => raw_serial(b"#PF"),
-        Vector::InvalidOpcode => raw_serial(b"#UD"),
-        Vector::GeneralProtection => raw_serial(b"#GP"),
-        Vector::DoubleFault => raw_serial(b"#DF"),
-        _ => raw_serial(b"???"),
-    }
-
-    // --- Registers ---
-    raw_serial_hex(b" rip=", ctx.frame.rip);
+    // === Step 1: Raw serial preamble (always, even on recursive entry) ===
+    let tid_raw = percpu::current_tid().map_or(u32::MAX, |t| t.raw());
+    raw_serial_hex(b"\n!!! FAULT rip=", ctx.frame.rip);
     raw_serial_hex(b" cr2=", ctx.cr2);
     raw_serial_hex(b" err=", ctx.frame.error_code);
-    raw_serial_hex(b"\n rsp=", ctx.frame.rsp);
     raw_serial_hex(b" cr3=", cpu::read_cr3().raw());
-    raw_serial_hex(b" rax=", ctx.regs.rax);
-    raw_serial_hex(b" rbx=", ctx.regs.rbx);
-    raw_serial_hex(b"\n rcx=", ctx.regs.rcx);
-    raw_serial_hex(b" rdx=", ctx.regs.rdx);
-    raw_serial_hex(b" rsi=", ctx.regs.rsi);
-    raw_serial_hex(b" rdi=", ctx.regs.rdi);
-    raw_serial_hex(b"\n rbp=", ctx.regs.rbp);
-    raw_serial_hex(b"  r8=", ctx.regs.r8);
-    raw_serial_hex(b"  r9=", ctx.regs.r9);
-    raw_serial_hex(b" r10=", ctx.regs.r10);
-    raw_serial_hex(b"\n r11=", ctx.regs.r11);
-    raw_serial_hex(b" r12=", ctx.regs.r12);
-    raw_serial_hex(b" r13=", ctx.regs.r13);
-    raw_serial_hex(b" r14=", ctx.regs.r14);
-    raw_serial_hex(b"\n r15=", ctx.regs.r15);
+    raw_serial_hex(b" rsp=", ctx.frame.rsp);
+    raw_serial_hex(b" tid=", tid_raw as u64);
+    if recursive { raw_serial(b" RECURSIVE"); }
+    raw_serial(b"\n");
 
-    // --- Backtrace (frame pointer walk using wrapping_add, never ptr::add) ---
-    raw_serial(b"\n backtrace:");
-    raw_serial_hex(b"\n  ", ctx.frame.rip);
-    let mut rbp = ctx.regs.rbp;
-    for _ in 0..20 {
-        if rbp == 0 || rbp % 8 != 0 { break; }
-        // For kernel frames, read directly. For user frames in kernel context
-        // (syscall path), the direct map covers all physical memory.
-        if !paging::is_kernel_addr(rbp) && !is_user { break; }
-        let ret_addr = unsafe { *((rbp as *const u64).wrapping_add(1)) };
-        if ret_addr == 0 { break; }
-        raw_serial_hex(b"\n  ", ret_addr);
-        rbp = unsafe { *(rbp as *const u64) };
+    // Raw serial stack dump — when RIP=0 (null call), the return address is at RSP
+    raw_serial(b" stack:");
+    let rsp = ctx.frame.rsp;
+    for i in 0..8u64 {
+        let addr = rsp.wrapping_add(i * 8);
+        if !paging::is_kernel_addr(addr) { break; }
+        let val = unsafe { *(addr as *const u64) };
+        raw_serial_hex(b" ", val);
     }
     raw_serial(b"\n");
 
-    // --- Terminate ---
+    if recursive {
+        // Re-entered fatal_exception (log!() triggered an unresolvable fault).
+        // Step 1 already printed the basics on both entries. Just terminate.
+        if is_user {
+            IN_FATAL.store(false, Ordering::SeqCst);
+            IN_PAGE_FAULT.store(false, Ordering::SeqCst);
+            syscall::kill_process(-1);
+        }
+        cpu::halt();
+    }
+
+    // Reset IN_PAGE_FAULT so log!() can trigger normal (resolvable) page faults
+    // like demand paging. Unresolvable faults will re-enter fatal_exception
+    // where IN_FATAL catches the recursion.
+    IN_PAGE_FAULT.store(false, Ordering::SeqCst);
+
+    // === Step 2: Rich diagnostics via log!() ===
+    let tid = percpu::current_tid().unwrap_or(crate::process::Tid(0));
+    let pml4 = if is_user { cpu::read_cr3().as_ptr::<u64>() as *const u64 } else { core::ptr::null() };
+
+    // Header
     if is_user {
-        // Kill only the faulting process — other processes continue.
+        match ctx.vector {
+            Vector::PageFault => {
+                let action = if ctx.frame.error_code & PF_INSTRUCTION_FETCH != 0 { "execute" }
+                    else if ctx.frame.error_code & PF_WRITE != 0 { "write" }
+                    else { "read" };
+                let cause = if ctx.frame.error_code & PF_PRESENT != 0 { "protection violation" }
+                    else { "unmapped address" };
+                log!("SEGFAULT tid={}: {} {} at {:#x}", tid, action, cause, ctx.cr2);
+            }
+            Vector::InvalidOpcode => log!("SIGILL tid={}: illegal instruction", tid),
+            Vector::GeneralProtection => log!("SIGBUS tid={}: general protection fault (error_code={:#x})", tid, ctx.frame.error_code),
+            Vector::DoubleFault => log!("FATAL tid={}: double fault", tid),
+            _ => log!("FATAL tid={}: exception {:?}", tid, ctx.vector),
+        }
+    } else {
+        match ctx.vector {
+            Vector::PageFault => {
+                let action = if ctx.frame.error_code & PF_INSTRUCTION_FETCH != 0 { "execute" }
+                    else if ctx.frame.error_code & PF_WRITE != 0 { "write" }
+                    else { "read" };
+                let cause = if ctx.frame.error_code & PF_PRESENT != 0 { "protection violation" }
+                    else { "unmapped address" };
+                log!("KERNEL PANIC: {} {} at {:#x}", action, cause, ctx.cr2);
+            }
+            _ => {
+                let name = match ctx.vector {
+                    Vector::InvalidOpcode => "invalid opcode",
+                    Vector::GeneralProtection => "general protection fault",
+                    Vector::DoubleFault => "double fault",
+                    _ => "exception",
+                };
+                log!("KERNEL PANIC: {} (error_code={:#x})", name, ctx.frame.error_code);
+            }
+        }
+    }
+
+    // Crash location with symbol resolution
+    log!("  rip:");
+    if is_user {
+        if !process::resolve_user_symbol(tid, ctx.frame.rip) {
+            log!("    {:#x}", ctx.frame.rip);
+        }
+    } else {
+        crate::symbols::resolve_kernel(ctx.frame.rip);
+    }
+
+    if ctx.vector == Vector::PageFault {
+        paging::debug_page_walk(ctx.cr2);
+    }
+
+    // Full register dump
+    log!("  Registers:");
+    log!("    rax={:#018x}  rbx={:#018x}", ctx.regs.rax, ctx.regs.rbx);
+    log!("    rcx={:#018x}  rdx={:#018x}", ctx.regs.rcx, ctx.regs.rdx);
+    log!("    rsi={:#018x}  rdi={:#018x}", ctx.regs.rsi, ctx.regs.rdi);
+    log!("    rbp={:#018x}  rsp={:#018x}", ctx.regs.rbp, ctx.frame.rsp);
+    log!("     r8={:#018x}   r9={:#018x}", ctx.regs.r8, ctx.regs.r9);
+    log!("    r10={:#018x}  r11={:#018x}", ctx.regs.r10, ctx.regs.r11);
+    log!("    r12={:#018x}  r13={:#018x}", ctx.regs.r12, ctx.regs.r13);
+    log!("    r14={:#018x}  r15={:#018x}", ctx.regs.r14, ctx.regs.r15);
+
+    // Backtrace with symbol resolution
+    log!("  Backtrace:");
+    if is_user {
+        if !process::resolve_user_symbol(tid, ctx.frame.rip) {
+            log!("    {:#x}", ctx.frame.rip);
+        }
+    } else {
+        crate::symbols::resolve_kernel(ctx.frame.rip);
+    }
+    let mut rbp = ctx.regs.rbp;
+    for _ in 0..32 {
+        if rbp == 0 || rbp % 8 != 0 { break; }
+        let Some(saved_rbp) = safe_read_u64(rbp, pml4) else { break };
+        let Some(ret_addr) = safe_read_u64(rbp + 8, pml4) else { break };
+        if ret_addr == 0 { break; }
+        if is_user {
+            if !process::resolve_user_symbol(tid, ret_addr) {
+                log!("    {:#x}", ret_addr);
+            }
+        } else {
+            crate::symbols::resolve_kernel(ret_addr);
+        }
+        rbp = saved_rbp;
+    }
+
+    // Stack dump
+    if safe_read_u64(ctx.frame.rsp, pml4).is_some() {
+        log!("  Stack (from RSP):");
+        for i in 0..8u64 {
+            let addr = ctx.frame.rsp + i * 8;
+            let Some(val) = safe_read_u64(addr, pml4) else { break };
+            log!("    [{:#x}] = {:#018x}", addr, val);
+        }
+    }
+
+    // Full crash diagnostics for user faults
+    if is_user {
+        let crash_addr = if ctx.vector == Vector::PageFault { ctx.cr2 } else { 0 };
+        process::dump_crash_diagnostics(crash_addr, ctx.frame.rip);
+    }
+
+    // === Step 3: Terminate ===
+    if is_user {
+        IN_FATAL.store(false, Ordering::SeqCst);
+        IN_PAGE_FAULT.store(false, Ordering::SeqCst);
         syscall::kill_process(-1);
     }
     cpu::halt();

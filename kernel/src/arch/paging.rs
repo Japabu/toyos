@@ -299,6 +299,8 @@ pub fn create_user_pml4() -> PhysAddr {
 pub fn free_user_page_tables(pml4_ptr: *mut u64) {
     let pml4 = PageTable::from_virt(pml4_ptr);
     unregister_active_pml4(pml4.phys());
+    // Clear canary before freeing so the page can be safely reused.
+    pml4.write_raw(PML4_CANARY_SLOT, 0);
     for pml4_idx in 0..256 {
         let Some(pdpt) = pml4.child(pml4_idx) else { continue };
         for pdpt_idx in 0..512 {

@@ -31,6 +31,9 @@ pub(crate) struct BuddyAllocator {
     page_count: usize,
     free_pages: usize,
     total_usable_pages: usize,
+    /// Reserved region PFN ranges — alloc asserts we never return these.
+    reserved_ranges: [(usize, usize); 8], // (start_pfn, end_pfn)
+    reserved_count: usize,
 }
 
 impl BuddyAllocator {
@@ -41,6 +44,8 @@ impl BuddyAllocator {
             page_count: 0,
             free_pages: 0,
             total_usable_pages: 0,
+            reserved_ranges: [(0, 0); 8],
+            reserved_count: 0,
         }
     }
 
@@ -132,6 +137,22 @@ impl BuddyAllocator {
             self.set_allocated(pfn as usize + i);
         }
         self.free_pages -= page_count;
+
+        // Assert we never return memory from reserved regions (kernel, initrd, etc.)
+        let alloc_start = pfn as usize;
+        let alloc_end = alloc_start + page_count;
+        for i in 0..self.reserved_count {
+            let (res_start, res_end) = self.reserved_ranges[i];
+            if alloc_start < res_end && alloc_end > res_start {
+                // Raw serial to avoid layout shift from format strings
+                unsafe {
+                    for &b in b"BUDDY ALLOC RESERVED!\n" {
+                        core::arch::asm!("out dx, al", in("dx") 0x3F8u16, in("al") b);
+                    }
+                }
+                crate::arch::cpu::halt();
+            }
+        }
 
         crate::PhysAddr::from_pfn(pfn).as_mut_ptr::<u8>()
     }
@@ -290,6 +311,23 @@ pub(crate) unsafe fn init_buddy(
 
     buddy.total_usable_pages = total_usable;
     buddy.free_pages = 0;
+
+    // Store reserved ranges for runtime assertions in alloc()
+    let mut rc = 0;
+    for region in reserved_regions {
+        if region.start < region.end && rc < buddy.reserved_ranges.len() {
+            let start_pfn = region.start as usize / PAGE_SIZE;
+            let end_pfn = (region.end as usize + PAGE_SIZE - 1) / PAGE_SIZE;
+            buddy.reserved_ranges[rc] = (start_pfn, end_pfn);
+            rc += 1;
+        }
+    }
+    // Also reserve the bitmap's own pages
+    if rc < buddy.reserved_ranges.len() {
+        buddy.reserved_ranges[rc] = (bitmap_start_pfn, bitmap_start_pfn + bitmap_pages);
+        rc += 1;
+    }
+    buddy.reserved_count = rc;
 
     // Build buddy free lists
     build_free_lists(buddy);
