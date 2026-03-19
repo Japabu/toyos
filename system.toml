@@ -23,7 +23,7 @@ filepicker = {}
 toybox = {}
 input-test = {}
 proctest = {}
-cargo = { no-default-features = true, warnings = false }
+# cargo = { no-default-features = true, warnings = false }
 
 # Symlinks created in the initrd at build time.
 # Paths are relative to the filesystem root (no leading /).

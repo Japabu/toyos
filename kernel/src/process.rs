@@ -89,21 +89,22 @@ impl AddressSpace {
     // --- Public API: VmaList-managed allocations (for syscall code) ---
 
     /// Allocate a virtual address range and map physical memory. One operation.
-    /// Returns a MappedRegion proving both allocation and mapping exist.
-    pub fn map_region(&self, vmas: &mut crate::vma::VmaList, phys: PhysAddr, size: u64) -> MappedRegion {
-        let vaddr = vmas.alloc_region(size);
+    /// Returns `None` if the virtual address space is exhausted.
+    pub fn map_region(&self, vmas: &mut crate::vma::VmaList, phys: PhysAddr, size: u64) -> Option<MappedRegion> {
+        let vaddr = vmas.alloc_region(size).ok()?;
         let aligned = paging::align_2m(size as usize) as u64;
         paging::map_user_at(self.root.as_ptr(), vaddr, phys, aligned);
-        MappedRegion { vaddr, size: aligned }
+        Some(MappedRegion { vaddr, size: aligned })
     }
 
     /// Allocate a stack region with guard pages on both sides and map it.
+    /// Returns `None` if the virtual address space is exhausted.
     #[allow(dead_code)]
-    pub fn map_stack(&self, vmas: &mut crate::vma::VmaList, phys: PhysAddr, size: u64) -> MappedRegion {
-        let vaddr = vmas.alloc_stack(size);
+    pub fn map_stack(&self, vmas: &mut crate::vma::VmaList, phys: PhysAddr, size: u64) -> Option<MappedRegion> {
+        let vaddr = vmas.alloc_stack(size).ok()?;
         let aligned = paging::align_2m(size as usize) as u64;
         paging::map_user_at(self.root.as_ptr(), vaddr, phys, aligned);
-        MappedRegion { vaddr, size: aligned }
+        Some(MappedRegion { vaddr, size: aligned })
     }
 
     /// Unmap and free a VmaList-managed region.
@@ -153,43 +154,70 @@ impl Drop for AddressSpace {
 // OwnedAlloc — RAII wrapper for page-aligned allocations
 // ---------------------------------------------------------------------------
 
+/// Typestate: allocation contains uninitialized memory.
+pub enum Uninit {}
+/// Typestate: allocation is fully initialized (safe to expose to userspace).
+pub enum Zeroed {}
+
 /// Move-only wrapper around a (`*mut u8`, `Layout`) pair.
 /// `Drop` calls `dealloc`, so forgetting to free memory is a compile-time error
 /// (you'd have to actively `mem::forget` it).
-pub struct OwnedAlloc {
+///
+/// The typestate parameter `S` tracks initialization:
+/// - `OwnedAlloc<Zeroed>` (default): all bytes are initialized. Can be mapped to userspace.
+/// - `OwnedAlloc<Uninit>`: bytes may be uninitialized. Must call `assume_zeroed()` after
+///   initializing all bytes before storing in ProcessData or mapping to userspace.
+pub struct OwnedAlloc<S = Zeroed> {
     ptr: NonNull<u8>,
     layout: Layout,
+    _state: core::marker::PhantomData<S>,
 }
 
-impl OwnedAlloc {
+impl OwnedAlloc<Zeroed> {
     /// Allocate zeroed memory with the given size and alignment.
     /// Returns `None` if the allocator returns null.
     pub fn new(size: usize, align: usize) -> Option<Self> {
         let layout = Layout::from_size_align(size, align).ok()?;
         let ptr = NonNull::new(unsafe { alloc_zeroed(layout) })?;
-        Some(Self { ptr, layout })
+        Some(Self { ptr, layout, _state: core::marker::PhantomData })
     }
+}
 
+impl OwnedAlloc<Uninit> {
     /// Allocate uninitialized memory with the given size and alignment.
-    /// The caller must initialize all bytes before reading them.
+    /// The caller must initialize all bytes, then call `assume_zeroed()`.
     pub fn new_uninit(size: usize, align: usize) -> Option<Self> {
         let layout = Layout::from_size_align(size, align).ok()?;
         let ptr = NonNull::new(unsafe { alloc(layout) })?;
-        Some(Self { ptr, layout })
+        Some(Self { ptr, layout, _state: core::marker::PhantomData })
     }
 
+    /// Convert to `OwnedAlloc<Zeroed>` after the caller has initialized all bytes.
+    ///
+    /// # Safety
+    /// All bytes in the allocation must have been written. The resulting
+    /// allocation may be mapped into userspace.
+    pub unsafe fn assume_zeroed(self) -> OwnedAlloc<Zeroed> {
+        let ptr = self.ptr;
+        let layout = self.layout;
+        core::mem::forget(self);
+        OwnedAlloc { ptr, layout, _state: core::marker::PhantomData }
+    }
+}
+
+impl<S> OwnedAlloc<S> {
     pub fn ptr(&self) -> *mut u8 { self.ptr.as_ptr() }
     pub fn size(&self) -> usize { self.layout.size() }
 }
 
-impl Drop for OwnedAlloc {
+impl<S> Drop for OwnedAlloc<S> {
     fn drop(&mut self) {
         unsafe { dealloc(self.ptr.as_ptr(), self.layout); }
     }
 }
 
 // OwnedAlloc is Send — the underlying allocation is just raw memory.
-unsafe impl Send for OwnedAlloc {}
+unsafe impl<S> Send for OwnedAlloc<S> {}
 
 const USER_STACK_SIZE: usize = 4 * PAGE_2M as usize; // 8 MB
 pub const KERNEL_STACK_SIZE: usize = 128 * 1024;
@@ -271,6 +299,11 @@ pub enum ThreadLocation {
 
 pub type ProcessState = ThreadLocation;
 
+/// Proof that a process was zombified and its orphaned children must be handled.
+/// Returned by `SchedEntry::zombify_process`, consumed by `ProcessTable::handle_orphans`.
+#[must_use = "orphaned children must be collected after zombifying a process"]
+pub struct OrphanCleanup(Pid);
+
 impl ThreadLocation {
     pub fn name(&self) -> &'static str {
         match self {
@@ -337,10 +370,24 @@ impl SchedEntry {
 
     // --- State machine ---
 
-    pub fn zombify(&mut self, code: i32) {
+    /// Zombify a thread. Panics if called on a process or already a zombie.
+    pub fn zombify_thread(&mut self, code: i32) {
+        assert!(matches!(self.kind, Kind::Thread { .. }),
+            "zombify_thread: tid={} is not a thread", self.tid);
         assert!(!matches!(self.state, ProcessState::Zombie(_)),
             "double zombify tid={}", self.tid);
         self.state = ProcessState::Zombie(code);
+    }
+
+    /// Zombify a process. Returns an `OrphanCleanup` token that must be consumed
+    /// by `ProcessTable::handle_orphans` to collect orphaned children.
+    pub fn zombify_process(&mut self, code: i32) -> OrphanCleanup {
+        assert!(matches!(self.kind, Kind::Process { .. }),
+            "zombify_process: tid={} is not a process", self.tid);
+        assert!(!matches!(self.state, ProcessState::Zombie(_)),
+            "double zombify tid={}", self.tid);
+        self.state = ProcessState::Zombie(code);
+        OrphanCleanup(self.process)
     }
 
     pub fn detach_from_parent(&mut self) {
@@ -362,6 +409,7 @@ pub struct PageFaultRecord {
     pub block_idx: u32,
     pub reloc_count: u16,
     pub flags: u16, // bit 0: writable, bit 1: has_relocs, bit 2: anonymous, bit 3: beyond_extent
+    pub duration_us: u16, // microseconds spent handling this fault
 }
 
 /// Fixed-size ring buffer of recent page fault events for crash diagnostics.
@@ -376,7 +424,7 @@ impl PageFaultTrace {
         Self {
             entries: [PageFaultRecord {
                 fault_addr: 0, page_elf_offset: 0, block_idx: 0,
-                reloc_count: 0, flags: 0,
+                reloc_count: 0, flags: 0, duration_us: 0,
             }; 32],
             write_pos: 0,
             total: 0,
@@ -430,7 +478,9 @@ pub struct ProcessData {
     /// Next module ID to assign on dlopen (1-based, exe=1).
     pub next_tls_module_id: u64,
     /// Dynamically allocated TLS blocks for dlopen'd modules (keyed by module_id).
-    pub dynamic_tls_blocks: alloc::collections::BTreeMap<u64, OwnedAlloc>,
+    /// Dynamically allocated TLS blocks for dlopen'd modules, keyed by (thread Tid, module_id).
+    /// Stored in the process-level (fd-owner) data so the VMA and backing memory have the same lifetime.
+    pub dynamic_tls_blocks: alloc::collections::BTreeMap<(Tid, u64), OwnedAlloc>,
     // Crash diagnostics
     pub symbols: ProcessSymbols,
     // Dynamically loaded shared libraries (indexed by dlopen handle)
@@ -445,6 +495,8 @@ pub struct ProcessData {
     /// Syscall counts per syscall number (for profiling)
     pub syscall_counts: [u32; 64],
     pub syscall_total: u64,
+    /// Wall-clock nanoseconds spent in syscall dispatch (includes preemption time)
+    pub syscall_total_ns: u64,
     /// Virtual memory areas for demand paging.
     pub vmas: crate::vma::VmaList,
     /// 2MB allocations for demand-paged pages. Freed on process exit.
@@ -455,6 +507,12 @@ pub struct ProcessData {
     pub elf_base: UserAddr,
     /// Ring buffer of recent page faults for crash diagnostics.
     pub fault_trace: PageFaultTrace,
+    /// Peak memory usage in bytes (high-water mark)
+    pub peak_memory: u64,
+    /// Total allocations (demand pages + mmap + TLS blocks)
+    pub alloc_count: u64,
+    /// Total frees (munmap)
+    pub free_count: u64,
 }
 
 pub struct MmapRegion {
@@ -572,6 +630,24 @@ impl ProcessTable {
         assert!(matches!(entry.state, ProcessState::Zombie(_)),
             "remove_orphan_zombie_child: tid={} is not a zombie (state={})", child_tid, entry.state.name());
         self.procs.remove(child_tid);
+    }
+
+    /// Handle orphaned children of a just-zombified process.
+    /// Consumes the `OrphanCleanup` token, ensuring this step is never skipped.
+    /// Zombie children are removed; running children are detached (become orphans).
+    pub fn handle_orphans(&mut self, cleanup: OrphanCleanup) {
+        let pid = cleanup.0;
+        let orphan_tids: Vec<Tid> = self.procs.iter()
+            .filter(|(_, e)| matches!(e.kind(), Kind::Process { parent: Some(ppid) } if *ppid == pid))
+            .map(|(tid, _)| tid)
+            .collect();
+        for tid in orphan_tids {
+            if matches!(self.get(tid).unwrap().state(), ProcessState::Zombie(_)) {
+                self.remove_orphan_zombie_child(tid);
+            } else {
+                self.get_mut(tid).unwrap().detach_from_parent();
+            }
+        }
     }
 
     /// Sweep all reclaimable zombies. Requires `IdleProof` — only callable from
@@ -718,16 +794,16 @@ pub fn setup_combined_tls(
 ) -> Option<(OwnedAlloc, u64)> {
     let block_size = total_memsz + TCB_SIZE;
     let alloc_size = paging::align_2m(block_size + tls_align);
-    let alloc = OwnedAlloc::new_uninit(alloc_size, PAGE_2M as usize)?;
-    let block = alloc.ptr();
+    let uninit_alloc = OwnedAlloc::new_uninit(alloc_size, PAGE_2M as usize)?;
+    let block = uninit_alloc.ptr();
 
     // Place TLS data near the end of the allocation (DTV at start, TLS after).
     // Align tls_start so that data_start (= block + tls_start) has tls_align alignment.
     let align = if tls_align > 1 { tls_align } else { 8 };
     let tls_start = (alloc_size - block_size) & !(align - 1);
 
-    // Zero the TLS block area (BSS must be zero).
-    unsafe { core::ptr::write_bytes(block.add(tls_start), 0, block_size); }
+    // Zero the entire allocation (DTV area, gap, TLS block, TCB).
+    unsafe { core::ptr::write_bytes(block, 0, alloc_size); }
 
     for module in modules {
         if !module.is_static { continue; }
@@ -779,6 +855,8 @@ pub fn setup_combined_tls(
     let dtv_user = block_phys;
     unsafe { *((tp_kernel + 8) as *mut u64) = dtv_user; }
 
+    // SAFETY: all bytes have been written (zeroed + DTV + TLS templates + TCB pointers).
+    let alloc = unsafe { uninit_alloc.assume_zeroed() };
     Some((alloc, tp_user))
 }
 
@@ -795,6 +873,7 @@ fn alloc_kernel_stack(
     arg: u64,
 ) -> Option<(OwnedAlloc, u64)> {
     let alloc = OwnedAlloc::new(KERNEL_STACK_SIZE, 4096)?;
+    scheduler::write_stack_canary(&alloc);
     let top = alloc.ptr() as u64 + KERNEL_STACK_SIZE as u64;
     // Must match context_switch layout: pushfq, push rbp..r15 (8 values) + return address
     let frame = (top - 8 * 8) as *mut u64;
@@ -896,7 +975,8 @@ pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64, stack_base: u64) -> Op
         let addr_space = parent_addr_space.as_ref().expect("spawn_thread: no address space");
         let mut parent_data = data_arc.lock();
         let tls_phys = PhysAddr::from_ptr(tls_alloc.ptr());
-        let tls_region = addr_space.map_region(&mut parent_data.vmas, tls_phys, tls_alloc.size() as u64);
+        let tls_region = addr_space.map_region(&mut parent_data.vmas, tls_phys, tls_alloc.size() as u64)
+            .expect("spawn_thread: out of virtual address space");
         // Rebase fs_base and internal TLS pointers from physical to virtual
         let tls_rebase = tls_region.vaddr().raw() as i64 - tls_phys.raw() as i64;
         let fs_base = (fs_base as i64 + tls_rebase) as u64;
@@ -958,11 +1038,15 @@ pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64, stack_base: u64) -> Op
         env: Vec::new(),
         syscall_counts: [0; 64],
         syscall_total: 0,
+        syscall_total_ns: 0,
         vmas: crate::vma::VmaList::new(),
         demand_allocs: Vec::new(),
         reloc_index: None,
         elf_base: UserAddr::new(0),
         fault_trace: PageFaultTrace::new(),
+        peak_memory: 0,
+        alloc_count: 0,
+        free_count: 0,
     }));
 
     let mut guard = PROCESS_TABLE.lock();
@@ -987,6 +1071,7 @@ pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64, stack_base: u64) -> Op
         registered_events: [scheduler::EventSource::Keyboard; 16],
         registered_event_count: 0,
         deadline: 0,
+        blocked_since: 0,
     };
     scheduler::enqueue_new(ctx);
 
@@ -1397,12 +1482,14 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
         match &lib.memory {
             elf::LibMemory::Owned(alloc) => {
                 let phys = PhysAddr::from_ptr(alloc.ptr());
-                let region = child_addr_space.map_region(&mut vmas, phys, alloc.size() as u64);
+                let region = child_addr_space.map_region(&mut vmas, phys, alloc.size() as u64)
+                    .expect("spawn: out of virtual address space for lib");
                 lib.user_base = region.vaddr();
             }
             elf::LibMemory::Shared { rw_alloc, cached_addr, cached_size, rw_offset, .. } => {
                 let cached_phys = *cached_addr;
-                let region = child_addr_space.map_region(&mut vmas, cached_phys, *cached_size as u64);
+                let region = child_addr_space.map_region(&mut vmas, cached_phys, *cached_size as u64)
+                    .expect("spawn: out of virtual address space for lib");
                 let lib_vaddr = region.vaddr();
                 let num_rw_pages = rw_alloc.size() / paging::PAGE_2M as usize;
                 for i in 0..num_rw_pages {
@@ -1587,7 +1674,8 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
     };
     // TLS mapped via VmaList — rebase all user-visible pointers from phys to vaddr
     let tls_phys = PhysAddr::from_ptr(tls_alloc.ptr());
-    let tls_region = child_addr_space.map_region(&mut vmas, tls_phys, tls_alloc.size() as u64);
+    let tls_region = child_addr_space.map_region(&mut vmas, tls_phys, tls_alloc.size() as u64)
+        .expect("spawn: out of virtual address space for TLS");
     let tls_rebase = tls_region.vaddr().raw() as i64 - tls_phys.raw() as i64;
     let fs_base = (fs_base as i64 + tls_rebase) as u64;
     // Fix self-pointer (TCB[0]) and DTV pointer (TCB[8]) in the TLS block
@@ -1683,11 +1771,15 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
         env,
         syscall_counts: [0; 64],
         syscall_total: 0,
+        syscall_total_ns: 0,
         vmas,
         demand_allocs: Vec::new(),
         reloc_index,
         elf_base: UserAddr::new(base),
         fault_trace: PageFaultTrace::new(),
+        peak_memory: 0,
+        alloc_count: 0,
+        free_count: 0,
     }));
 
     let mut guard = PROCESS_TABLE.lock();
@@ -1715,6 +1807,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
         registered_events: [scheduler::EventSource::Keyboard; 16],
         registered_event_count: 0,
         deadline: 0,
+        blocked_since: 0,
     };
     scheduler::enqueue_new(ctx);
 
@@ -1758,7 +1851,14 @@ fn teardown_resources(data_arc: &Arc<Lock<ProcessData>>, pid: Pid) {
                 let _ = write!(profile, " {}={}", i, count);
             }
         }
-        log!("syscalls: pid={pid} total={}{profile}", data.syscall_total);
+        let wall_ms = data.syscall_total_ns / 1_000_000;
+        log!("syscalls: pid={pid} total={} syscall_wall={wall_ms}ms{profile}", data.syscall_total);
+    }
+
+    // Print memory stats
+    if data.peak_memory > 0 || data.alloc_count > 0 {
+        log!("memory: pid={pid} peak={}MB allocs={} frees={}",
+            data.peak_memory / (1024 * 1024), data.alloc_count, data.free_count);
     }
 
     fd::close_all(&mut data.fds, &mut *vfs::lock(), pid);
@@ -1793,7 +1893,7 @@ fn teardown_scheduling(table: &mut ProcessTable, process_pid: Pid, addr_space: A
     for tid in &child_tids {
         let child = table.get_mut(*tid).unwrap();
         if !matches!(child.state(), ProcessState::Zombie(_)) {
-            child.zombify(-1);
+            child.zombify_thread(-1);
         }
         // Remove from scheduler (drop ThreadCtx → frees kernel stack)
         scheduler::remove_thread(*tid);
@@ -1806,22 +1906,11 @@ fn teardown_scheduling(table: &mut ProcessTable, process_pid: Pid, addr_space: A
     let entry = table.get_mut(main_tid).unwrap();
     let cpu_ms = entry.cpu_ns() / 1_000_000;
     let has_parent = matches!(entry.kind(), Kind::Process { parent: Some(_) });
-    entry.zombify(code);
+    let orphan_cleanup = entry.zombify_process(code);
     let name = core::str::from_utf8(entry.name()).unwrap_or("?").trim_end_matches('\0');
     log!("exit: {name} pid={process_pid} code={code} cpu={cpu_ms}ms");
 
-    // Collect orphaned child processes: remove zombies, detach running ones.
-    let orphan_tids: Vec<Tid> = table.iter()
-        .filter(|(_, e)| matches!(e.kind(), Kind::Process { parent: Some(ppid) } if *ppid == process_pid))
-        .map(|(tid, _)| tid)
-        .collect();
-    for tid in orphan_tids {
-        if matches!(table.get(tid).unwrap().state(), ProcessState::Zombie(_)) {
-            table.remove_orphan_zombie_child(tid);
-        } else {
-            table.get_mut(tid).unwrap().detach_from_parent();
-        }
-    }
+    table.handle_orphans(orphan_cleanup);
 
     // Identify parent to wake for waitpid
     if has_parent {
@@ -1868,7 +1957,7 @@ pub fn exit(code: i32) -> ! {
 
         // If we're a thread, zombie ourselves first
         if let Kind::Thread { .. } = table.get(tid).unwrap().kind() {
-            table.get_mut(tid).unwrap().zombify(code);
+            table.get_mut(tid).unwrap().zombify_thread(code);
         }
 
         teardown_scheduling(table, process_pid, addr_space, code)
@@ -1901,13 +1990,20 @@ pub fn thread_exit(code: i32) -> ! {
                 // The physical memory is freed when tls_alloc is dropped below.
                 data.tls_alloc.take();
             }
+            // Free this thread's dynamic TLS blocks from the process-level data.
+            {
+                let tid = current_tid();
+                let owner_arc = fd_owner_data();
+                let mut owner_data = owner_arc.lock();
+                owner_data.dynamic_tls_blocks.retain(|&(t, _), _| t != tid);
+            }
 
             let parent_tid = {
                 let mut guard = PROCESS_TABLE.lock();
                 let table = guard.as_mut().unwrap();
                 let tid = current_tid();
                 let cpu_ms = table.get(tid).unwrap().cpu_ns() / 1_000_000;
-                table.get_mut(tid).unwrap().zombify(code);
+                table.get_mut(tid).unwrap().zombify_thread(code);
                 let name = core::str::from_utf8(table.get(tid).unwrap().name()).unwrap_or("?").trim_end_matches('\0');
                 log!("exit: {name} tid={tid} code={code} cpu={cpu_ms}ms");
 
@@ -2098,6 +2194,7 @@ pub fn collect_thread_zombie(tid: Tid, parent_pid: Pid) -> Result<Option<i32>, (
 /// Handle a page fault at `fault_addr` by looking up the current process's VMAs.
 /// Returns true if the fault was resolved (a page was mapped), false if fatal.
 pub fn handle_page_fault(fault_addr: u64, _error_code: u64) -> bool {
+    let t0 = crate::clock::nanos_since_boot();
     let tid = current_tid();
     if tid == Tid::MAX { return false; }
 
@@ -2208,13 +2305,22 @@ pub fn handle_page_fault(fault_addr: u64, _error_code: u64) -> bool {
 
     data.demand_allocs.push(alloc);
 
+    // Update memory tracking
+    data.alloc_count += 1;
+    let current_mem = data.demand_allocs.len() as u64 * paging::PAGE_2M;
+    if current_mem > data.peak_memory {
+        data.peak_memory = current_mem;
+    }
+
     // Record fault for crash diagnostics
+    let elapsed_us = ((crate::clock::nanos_since_boot() - t0) / 1000).min(u16::MAX as u64) as u16;
     data.fault_trace.record(PageFaultRecord {
         fault_addr,
         page_elf_offset: region_start.wrapping_sub(elf_base),
         block_idx: (region_start / paging::PAGE_2M) as u32,
         reloc_count: 0,
         flags: if writable { 1 } else { 0 },
+        duration_us: elapsed_us,
     });
 
     true
@@ -2254,9 +2360,9 @@ pub fn dump_crash_diagnostics(fault_addr: u64, rip: u64) {
             if rec.flags & 4 != 0 { flag_str[2] = b'A'; } // anonymous
             if rec.flags & 8 != 0 { flag_str[3] = b'Z'; } // beyond extent (zero)
             let flags = core::str::from_utf8(&flag_str).unwrap_or("????");
-            log!("    fault={:#x} elf_off={:#x} blk={} relocs={} [{}]",
+            log!("    fault={:#x} elf_off={:#x} blk={} relocs={} {}us [{}]",
                 rec.fault_addr, rec.page_elf_offset, rec.block_idx,
-                rec.reloc_count, flags);
+                rec.reloc_count, rec.duration_us, flags);
         }
     }
 
@@ -2402,7 +2508,7 @@ pub fn kill_process(target_pid: Pid) -> u64 {
         for tid in &child_tids {
             let child = table.get_mut(*tid).unwrap();
             if !matches!(child.state(), ProcessState::Zombie(_)) {
-                child.zombify(-1);
+                child.zombify_thread(-1);
             }
             scheduler::remove_thread(*tid);
         }
@@ -2419,9 +2525,11 @@ pub fn kill_process(target_pid: Pid) -> u64 {
         }
 
         let entry = table.get_mut(main_tid).unwrap();
-        entry.zombify(137); // 128 + 9 (SIGKILL-like)
+        let orphan_cleanup = entry.zombify_process(137); // 128 + 9 (SIGKILL-like)
         let name = core::str::from_utf8(entry.name()).unwrap_or("?").trim_end_matches('\0');
         log!("kill: {name} pid={target_pid}");
+
+        table.handle_orphans(orphan_cleanup);
 
         // Collect caller Tid for deferred wake
         let caller_tid = table.get_process(caller).map(|e| e.tid());

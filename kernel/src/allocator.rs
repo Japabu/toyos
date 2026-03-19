@@ -211,6 +211,11 @@ unsafe impl GlobalAlloc for KernelAllocator {
         } else {
             buddy.alloc(order_for(layout.size(), layout.align()))
         };
+        if result.is_null() {
+            // OOM diagnostic: raw serial to avoid re-entrant allocation from log!
+            let (total, used) = buddy.memory_stats();
+            raw_serial_oom(layout.size(), layout.align(), total, used);
+        }
         self.release(flags);
         result
     }
@@ -268,4 +273,39 @@ pub fn memory_stats() -> (u64, u64) {
     let stats = buddy.memory_stats();
     ALLOCATOR.release(flags);
     stats
+}
+
+/// Raw serial OOM diagnostic — no formatting, no allocation.
+/// Outputs "OOM: size=X total=X used=X\n" using direct port I/O.
+fn raw_serial_oom(size: usize, align: usize, total: u64, used: u64) {
+    unsafe fn serial_str(s: &[u8]) {
+        for &b in s {
+            core::arch::asm!("out dx, al", in("dx") 0x3F8u16, in("al") b);
+        }
+    }
+    unsafe fn serial_u64(mut val: u64) {
+        if val == 0 {
+            core::arch::asm!("out dx, al", in("dx") 0x3F8u16, in("al") b'0');
+            return;
+        }
+        let mut buf = [0u8; 20];
+        let mut pos = 20;
+        while val > 0 {
+            pos -= 1;
+            buf[pos] = b'0' + (val % 10) as u8;
+            val /= 10;
+        }
+        serial_str(&buf[pos..]);
+    }
+    unsafe {
+        serial_str(b"\nOOM: size=");
+        serial_u64(size as u64);
+        serial_str(b" align=");
+        serial_u64(align as u64);
+        serial_str(b" total=");
+        serial_u64(total);
+        serial_str(b" used=");
+        serial_u64(used);
+        serial_str(b"\n");
+    }
 }

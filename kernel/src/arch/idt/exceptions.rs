@@ -428,13 +428,15 @@ impl ExceptionContext<'_> {
     }
 
     /// Whether this fault should be attributed to a user process.
-    /// True for Ring 3 faults, and also for kernel-mode faults on user memory
+    /// True for Ring 3 faults, and also for kernel-mode page faults on user memory
     /// during a syscall (e.g. bad pointer passed to write()).
+    /// GPFs use cr2 only for page faults — for other vectors, cr2 is stale/zero
+    /// and must not be used to classify the fault.
     fn is_user_fault(&self) -> bool {
         self.is_user_mode()
-            || (percpu::current_tid().is_some()
-                && self.cr2 < 0x0000_8000_0000_0000
-                && matches!(self.vector, Vector::PageFault | Vector::GeneralProtection))
+            || (self.vector == Vector::PageFault
+                && percpu::current_tid().is_some()
+                && self.cr2 < 0x0000_8000_0000_0000)
     }
 
     /// PML4 for safe memory reads. Uses page table translation for user faults

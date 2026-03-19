@@ -41,6 +41,7 @@ struct PerCpuEventQueue {
     events: [EventSource; EVENT_QUEUE_SIZE],
     head: AtomicU32, // writer (interrupt handler) — wait-free
     tail: AtomicU32, // reader (scheduler) — single consumer
+    overflow_count: AtomicU64, // events dropped due to full buffer
 }
 
 impl PerCpuEventQueue {
@@ -49,6 +50,7 @@ impl PerCpuEventQueue {
             events: [EventSource::Keyboard; EVENT_QUEUE_SIZE],
             head: AtomicU32::new(0),
             tail: AtomicU32::new(0),
+            overflow_count: AtomicU64::new(0),
         }
     }
 
@@ -58,7 +60,8 @@ impl PerCpuEventQueue {
         let tail = self.tail.load(Ordering::Acquire);
         let next = (head + 1) % EVENT_QUEUE_SIZE as u32;
         if next == tail {
-            return; // queue full, drop event (will be retried on next interrupt)
+            self.overflow_count.fetch_add(1, Ordering::Relaxed);
+            return;
         }
         // SAFETY: single producer per CPU, index is in bounds
         unsafe {
@@ -120,6 +123,7 @@ pub struct ThreadCtx {
     pub registered_events: [EventSource; MAX_EVENTS_PER_THREAD],
     pub registered_event_count: u8,
     pub deadline: u64, // 0 = no deadline
+    pub blocked_since: u64, // nanos_since_boot when entered blocked pool (0 = not blocked)
 }
 
 impl ThreadCtx {
@@ -321,8 +325,9 @@ impl BlockedPool {
         }
     }
 
-    fn insert(&mut self, ctx: ThreadCtx) {
+    fn insert(&mut self, mut ctx: ThreadCtx) {
         let tid = ctx.tid;
+        ctx.blocked_since = crate::clock::nanos_since_boot();
         let event_count = ctx.registered_event_count;
         for i in 0..event_count as usize {
             self.by_event.entry(ctx.registered_events[i])
@@ -422,6 +427,16 @@ static SCHEDULER: Scheduler = Scheduler {
     vruntimes: Lock::new(None),
     min_vruntime: AtomicU64::new(0),
 };
+
+// Scheduler metrics — zero overhead when not read
+static CONTEXT_SWITCHES: AtomicU64 = AtomicU64::new(0);
+static IDLE_ENTRIES: AtomicU64 = AtomicU64::new(0);
+
+/// Returns (context_switches, idle_entries).
+#[allow(dead_code)]
+pub fn stats() -> (u64, u64) {
+    (CONTEXT_SWITCHES.load(Ordering::Relaxed), IDLE_ENTRIES.load(Ordering::Relaxed))
+}
 
 pub fn init() {
     *SCHEDULER.blocked.lock() = Some(BlockedPool::new());
@@ -562,7 +577,13 @@ pub fn exit_current(code: i32) -> ! {
         let tid = percpu::current_tid().unwrap();
         if let Some(entry) = table.get_mut(tid) {
             if !matches!(entry.state(), process::ProcessState::Zombie(_)) {
-                entry.zombify(code);
+                match entry.kind() {
+                    process::Kind::Thread { .. } => entry.zombify_thread(code),
+                    process::Kind::Process { .. } => {
+                        let cleanup = entry.zombify_process(code);
+                        table.handle_orphans(cleanup);
+                    }
+                }
             }
         }
     }
@@ -735,6 +756,13 @@ fn drain_events() {
     }
 
     let cpu = percpu::cpu_id() as usize;
+
+    // Check for event queue overflow (events silently dropped by push)
+    let overflow = PERCPU_EVENTS[cpu].overflow_count.swap(0, Ordering::Relaxed);
+    if overflow > 0 {
+        crate::log!("EVENT QUEUE OVERFLOW: cpu={} dropped={} events", cpu, overflow);
+    }
+
     let mut events = [EventSource::Keyboard; EVENT_QUEUE_SIZE];
     let mut event_count = 0usize;
     PERCPU_EVENTS[cpu].drain_into(&mut events, &mut event_count);
@@ -764,6 +792,7 @@ fn do_schedule(reason: SwitchReason) {
     let mut queue = SCHEDULER.lock_cpu(cpu);
 
     if let Some(mut old) = queue.take_current() {
+        check_stack_canary(&old);
         old.fs_base = cpu::rdmsr(IA32_FS_BASE);
         let elapsed = if old.scheduled_at > 0 { now - old.scheduled_at } else { 0 };
         old.stop_cpu_timer(now);
@@ -772,6 +801,7 @@ fn do_schedule(reason: SwitchReason) {
     }
 
     if let Some(new) = queue.pick_next() {
+        CONTEXT_SWITCHES.fetch_add(1, Ordering::Relaxed);
         let new_cr3 = new.cr3();
         let new_fs_base = new.fs_base;
         let new_ks_top = new.kernel_stack_top();
@@ -796,6 +826,7 @@ fn do_schedule(reason: SwitchReason) {
         return;
     }
 
+    IDLE_ENTRIES.fetch_add(1, Ordering::Relaxed);
     let old_rsp_ptr = queue.save_rsp_ptr();
     percpu::set_current_tid(None);
     unsafe { percpu::set_kernel_stack(percpu::idle_stack_top()); }
@@ -878,6 +909,96 @@ fn cpu_idle_loop() -> ! {
 
         unsafe { core::arch::asm!("sti; hlt", options(nomem, nostack)); }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Stack canary — detects kernel stack overflow on context switch
+// ---------------------------------------------------------------------------
+
+const STACK_CANARY: u64 = 0xDEAD_BEEF_CAFE_BABE;
+
+pub fn write_stack_canary(stack: &OwnedAlloc) {
+    unsafe { *(stack.ptr() as *mut u64) = STACK_CANARY; }
+}
+
+fn check_stack_canary(ctx: &ThreadCtx) {
+    let canary = unsafe { *(ctx.kernel_stack.ptr() as *const u64) };
+    if canary != STACK_CANARY {
+        panic!("KERNEL STACK OVERFLOW: tid={} canary={:#x} expected={:#x}",
+            ctx.tid, canary, STACK_CANARY);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Blocked thread dump — diagnostic for "system hangs" debugging
+// ---------------------------------------------------------------------------
+
+fn event_name(event: &EventSource) -> &'static str {
+    match event {
+        EventSource::Keyboard => "Keyboard",
+        EventSource::Mouse => "Mouse",
+        EventSource::Network => "Network",
+        EventSource::Listener => "Listener",
+        EventSource::PipeReadable(_) => "PipeR",
+        EventSource::PipeWritable(_) => "PipeW",
+        EventSource::Futex(_) => "Futex",
+    }
+}
+
+/// Dump all blocked threads with their registered events and deadlines.
+/// Safe to call from any context (uses try_lock for process table).
+pub fn dump_blocked() {
+    let pool = SCHEDULER.blocked.lock_unwrap();
+    let now = crate::clock::nanos_since_boot();
+    crate::log!("=== BLOCKED THREADS ({}) ===", pool.threads.len());
+    for (tid, ctx) in &pool.threads {
+        let since_ms = if ctx.blocked_since > 0 { (now - ctx.blocked_since) / 1_000_000 } else { 0 };
+
+        // Build event list string on stack (no alloc)
+        let mut events_buf = [0u8; 128];
+        let mut pos = 0;
+        for i in 0..ctx.registered_event_count as usize {
+            if pos > 0 && pos + 2 < 128 {
+                events_buf[pos] = b',';
+                events_buf[pos + 1] = b' ';
+                pos += 2;
+            }
+            let name = event_name(&ctx.registered_events[i]);
+            let bytes = name.as_bytes();
+            let copy = bytes.len().min(128 - pos);
+            events_buf[pos..pos + copy].copy_from_slice(&bytes[..copy]);
+            pos += copy;
+        }
+        let events = core::str::from_utf8(&events_buf[..pos]).unwrap_or("?");
+
+        // Try to get process name without blocking
+        let mut name_buf = [0u8; 28];
+        let mut got_name = false;
+        if let Some(guard) = crate::process::PROCESS_TABLE.try_lock() {
+            if let Some(table) = guard.as_ref() {
+                if let Some(entry) = table.get(*tid) {
+                    name_buf = *entry.name();
+                    got_name = true;
+                }
+            }
+        }
+        let name = if got_name {
+            core::str::from_utf8(&name_buf).unwrap_or("?").trim_end_matches('\0')
+        } else {
+            "?"
+        };
+
+        if ctx.deadline > 0 {
+            let dl_secs = ctx.deadline / 1_000_000_000;
+            let dl_ms = (ctx.deadline % 1_000_000_000) / 1_000_000;
+            crate::log!("  tid={} pid={} ({}) events=[{}] deadline={}.{:03}s since={}ms",
+                tid, ctx.process, name, events, dl_secs, dl_ms, since_ms);
+        } else {
+            crate::log!("  tid={} pid={} ({}) events=[{}] deadline=none since={}ms",
+                tid, ctx.process, name, events, since_ms);
+        }
+    }
+    crate::log!("=== END BLOCKED ===");
 }
 
 // ---------------------------------------------------------------------------

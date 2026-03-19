@@ -215,7 +215,7 @@ fn cache_loaded_lib(path: &str, lib: LoadedLib, rw_vaddr: u64, rw_end_vaddr: u64
     // Allocate private RW pages for the first user.
     // Store as physical address — user processes see physical addresses
     let cached_addr = crate::PhysAddr::from_ptr(alloc_ptr);
-    let rw_alloc = match OwnedAlloc::new_uninit(rw_size, PAGE_2M as usize) {
+    let uninit_rw = match OwnedAlloc::new_uninit(rw_size, PAGE_2M as usize) {
         Some(a) => a,
         None => {
             return LoadedLib {
@@ -228,7 +228,9 @@ fn cache_loaded_lib(path: &str, lib: LoadedLib, rw_vaddr: u64, rw_end_vaddr: u64
         }
     };
     let src = unsafe { alloc_ptr.add(rw_offset) };
-    unsafe { core::ptr::copy_nonoverlapping(src, rw_alloc.ptr(), rw_size); }
+    unsafe { core::ptr::copy_nonoverlapping(src, uninit_rw.ptr(), rw_size); }
+    // SAFETY: all bytes copied from the cached allocation.
+    let rw_alloc = unsafe { uninit_rw.assume_zeroed() };
     // rw_delta: from (phys + PHYS_OFFSET + rw_offset) → rw_alloc.ptr()
     let cached_virt = cached_addr.to_kernel().raw();
     let rw_delta = rw_alloc.ptr() as i64 - (cached_virt as i64 + rw_offset as i64);
@@ -289,9 +291,11 @@ fn clone_from_cache(cached: &CachedLib) -> Option<LoadedLib> {
     let base = cached_phys - cached.vaddr_min;
 
     // Allocate and copy only the private (RW) portion
-    let rw_alloc = OwnedAlloc::new_uninit(cached.rw_size, PAGE_2M as usize)?;
+    let uninit_rw = OwnedAlloc::new_uninit(cached.rw_size, PAGE_2M as usize)?;
     let src = unsafe { cached.alloc.ptr().add(cached.rw_offset) };
-    unsafe { core::ptr::copy_nonoverlapping(src, rw_alloc.ptr(), cached.rw_size); }
+    unsafe { core::ptr::copy_nonoverlapping(src, uninit_rw.ptr(), cached.rw_size); }
+    // SAFETY: all bytes copied from the cached allocation.
+    let rw_alloc = unsafe { uninit_rw.assume_zeroed() };
 
     let t1 = crate::clock::nanos_since_boot();
     // rw_delta: from (phys + PHYS_OFFSET + rw_offset) → rw_alloc.ptr()
@@ -964,12 +968,12 @@ pub fn load_shared_lib(data: &[u8]) -> Result<(LoadedLib, u64, u64), &'static st
 
     let load_size = paging::align_2m((vaddr_max - vaddr_min) as usize);
     let t0 = crate::clock::nanos_since_boot();
-    let alloc = match OwnedAlloc::new_uninit(load_size, PAGE_2M as usize) {
+    let uninit_alloc = match OwnedAlloc::new_uninit(load_size, PAGE_2M as usize) {
         Some(a) => a,
         None => return Err("dlopen: allocation failed"),
     };
     let t1 = crate::clock::nanos_since_boot();
-    let base_ptr = alloc.ptr();
+    let base_ptr = uninit_alloc.ptr();
     let base_kern = KernelAddr::from_ptr(base_ptr as *const u8) - vaddr_min;
     let base_phys = PhysAddr::from_ptr(base_ptr) - vaddr_min;
 
@@ -1082,6 +1086,9 @@ pub fn load_shared_lib(data: &[u8]) -> Result<(LoadedLib, u64, u64), &'static st
     let rela_addr = if rela_size > 0 { base_kern + rela_vaddr } else { KernelAddr::null() };
     let jmprel_addr = if jmprel_size > 0 { base_kern + jmprel_vaddr } else { KernelAddr::null() };
     let gnu_hash = if gnu_hash_vaddr != 0 { base_kern + gnu_hash_vaddr } else { KernelAddr::null() };
+
+    // SAFETY: all bytes written (zeroed + PT_LOAD segments copied + RELATIVE relocs applied).
+    let alloc = unsafe { uninit_alloc.assume_zeroed() };
 
     Ok((LoadedLib { memory: LibMemory::Owned(alloc), user_base: UserAddr::new(base_phys.raw()), phys_base: base_phys,
         dynsym, dynstr, dynstr_size: strtab_size, sym_count,

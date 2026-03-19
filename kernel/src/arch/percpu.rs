@@ -197,6 +197,9 @@ pub fn init_bsp(lapic_id: u32) {
     cpu::wrmsr(MSR_GS_BASE, ptr as u64);
     cpu::wrmsr(MSR_KERNEL_GS_BASE, ptr as u64);
 
+    // GS base is now valid — enable CPU/TID context in log! macro
+    crate::log::PERCPU_READY.store(true, core::sync::atomic::Ordering::Release);
+
     log!("percpu: BSP cpu_id=0 lapic_id={}", lapic_id);
 }
 

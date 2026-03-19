@@ -91,14 +91,24 @@ impl<'a> SyscallContext<'a> {
             return None;
         }
         let kptr = translate(ptr.raw())?;
-        // Verify the end of the buffer maps to the expected physical address.
-        // If not, the buffer crosses a non-contiguous 2MB page boundary.
+        // Verify contiguity at every 2MB page boundary crossing.
+        // One translate() per boundary — negligible for typical syscall buffers.
+        let start = ptr.raw();
+        let end = start + len as u64;
+        let mut boundary = (start & !(paging::PAGE_2M - 1)) + paging::PAGE_2M;
+        while boundary < end {
+            let k = translate(boundary)?;
+            let expected = unsafe { kptr.add((boundary - start) as usize) };
+            if k != expected {
+                return None;
+            }
+            boundary += paging::PAGE_2M;
+        }
         if len > 1 {
-            let end_addr = ptr.raw() + len as u64 - 1;
-            let end_kptr = translate(end_addr)?;
+            let end_kptr = translate(end - 1)?;
             let expected_end = unsafe { kptr.add(len - 1) };
             if end_kptr != expected_end {
-                return None; // Non-contiguous: caller must use per-page copies
+                return None;
             }
         }
         Some(unsafe { core::slice::from_raw_parts(kptr as *const u8, len) })
@@ -115,9 +125,19 @@ impl<'a> SyscallContext<'a> {
             return None;
         }
         let kptr = translate(ptr.raw())?;
+        let start = ptr.raw();
+        let end = start + len as u64;
+        let mut boundary = (start & !(paging::PAGE_2M - 1)) + paging::PAGE_2M;
+        while boundary < end {
+            let k = translate(boundary)?;
+            let expected = unsafe { kptr.add((boundary - start) as usize) };
+            if k != expected {
+                return None;
+            }
+            boundary += paging::PAGE_2M;
+        }
         if len > 1 {
-            let end_addr = ptr.raw() + len as u64 - 1;
-            let end_kptr = translate(end_addr)?;
+            let end_kptr = translate(end - 1)?;
             let expected_end = unsafe { kptr.add(len - 1) };
             if end_kptr != expected_end {
                 return None;

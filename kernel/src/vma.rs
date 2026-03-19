@@ -84,6 +84,9 @@ fn align_up_2m(v: u64) -> u64 {
     (v + PAGE_2M - 1) & !(PAGE_2M - 1)
 }
 
+/// Virtual address space exhausted — allocation would overlap shared memory region.
+pub struct VmaError;
+
 impl VmaList {
     pub fn new() -> Self {
         Self {
@@ -95,32 +98,41 @@ impl VmaList {
 
     /// Allocate a 2MB-aligned virtual address range with a trailing guard page.
     /// Returns the start address. The guard page after the allocation is left unmapped.
+    /// Returns `Err(VmaError)` if the allocation would exceed `SHM_BASE`.
     ///
     /// Known limitation: bump allocator does not reclaim freed ranges.
     /// Acceptable for short-lived processes. Future: free list.
-    pub fn alloc_region(&mut self, size: u64) -> UserAddr {
+    pub fn alloc_region(&mut self, size: u64) -> Result<UserAddr, VmaError> {
         let aligned = align_up_2m(size);
         let addr = align_up_2m(self.next_alloc);
-        self.next_alloc = addr + aligned + GUARD_SIZE;
+        let new_next = addr + aligned + GUARD_SIZE;
+        if new_next > SHM_BASE {
+            return Err(VmaError);
+        }
+        self.next_alloc = new_next;
         let vaddr = UserAddr::new(addr);
         self.regions.insert(vaddr, aligned);
-        vaddr
+        Ok(vaddr)
     }
 
     /// Allocate a stack region with guard pages on BOTH sides.
-    #[allow(dead_code)]
     /// Guard below catches stack overflow (stack grows down).
     /// Guard above catches upward corruption.
     ///
     /// Layout: [guard 2MB][stack (grows ↓)][guard 2MB]
-    pub fn alloc_stack(&mut self, size: u64) -> UserAddr {
+    #[allow(dead_code)]
+    pub fn alloc_stack(&mut self, size: u64) -> Result<UserAddr, VmaError> {
         let aligned = align_up_2m(size);
         let guard_below = align_up_2m(self.next_alloc);
         let stack_start = guard_below + GUARD_SIZE;
-        self.next_alloc = stack_start + aligned + GUARD_SIZE;
+        let new_next = stack_start + aligned + GUARD_SIZE;
+        if new_next > SHM_BASE {
+            return Err(VmaError);
+        }
+        self.next_alloc = new_next;
         let vaddr = UserAddr::new(stack_start);
         self.regions.insert(vaddr, aligned);
-        vaddr
+        Ok(vaddr)
     }
 
     /// Free a previously allocated region. Returns the size for unmapping.

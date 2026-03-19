@@ -2,7 +2,7 @@ use alloc::boxed::Box;
 use core::ptr::{copy_nonoverlapping, write_bytes};
 
 use super::pci::PciDevice;
-use super::virtio::{BufDir, Virtqueue, VirtqueueRegions, VirtioDevice, VIRTIO_F_VERSION_1};
+use super::virtio::{BufDir, DescSlot, Virtqueue, VirtqueueRegions, VirtioDevice, VIRTIO_F_VERSION_1};
 use super::DmaPool;
 use crate::log;
 use crate::net::NicInfo;
@@ -61,14 +61,18 @@ struct VirtioNic {
     tx_ptr: *mut u8,
     // Maps virtqueue descriptor index -> rx_bufs index
     desc_to_buf: [u16; RX_QUEUE_SIZE as usize],
+    /// Stash area: slot returned by poll_used, indexed by buf_idx, consumed by refill_rx_buf.
+    pending_rx_slots: [Option<DescSlot>; RX_BUF_COUNT],
+    tx_slot: Option<DescSlot>,
 }
 
 unsafe impl Send for VirtioNic {}
 
 impl VirtioNic {
-    fn refill_rx(&mut self, buf_idx: usize) {
+    fn refill_rx(&mut self, buf_idx: usize, slot: DescSlot) {
         unsafe { write_bytes(self.rx_ptrs[buf_idx], 0, NET_HDR_SIZE); }
         let desc_id = self.rxq.submit(
+            slot,
             &[(self.rx_phys[buf_idx], RX_BUF_SIZE, BufDir::Writable)],
             self.device.notify_mmio(),
             self.device.notify_off_multiplier(),
@@ -96,12 +100,14 @@ impl crate::net::Nic for VirtioNic {
             );
         }
 
-        self.txq.submit_and_wait(
+        let slot = self.tx_slot.take().expect("virtio-net: no tx slot");
+        self.tx_slot = Some(self.txq.submit_and_wait(
+            slot,
             &[(self.tx_phys, (NET_HDR_SIZE + len) as u32, BufDir::Readable)],
             self.device.notify_mmio(),
             self.device.notify_off_multiplier(),
             1,
-        );
+        ));
     }
 
     fn has_packet(&self) -> bool {
@@ -109,11 +115,11 @@ impl crate::net::Nic for VirtioNic {
     }
 
     fn recv(&mut self, buf: &mut [u8]) -> Option<usize> {
-        let (desc_id, written_len) = self.rxq.poll_used()?;
-        let buf_idx = self.desc_to_buf[desc_id as usize] as usize;
+        let (slot, written_len) = self.rxq.poll_used()?;
+        let buf_idx = self.desc_to_buf[slot.id() as usize] as usize;
         let total = written_len as usize;
         if total <= NET_HDR_SIZE {
-            self.refill_rx(buf_idx);
+            self.refill_rx(buf_idx, slot);
             return None;
         }
         let frame_len = total - NET_HDR_SIZE;
@@ -122,34 +128,40 @@ impl crate::net::Nic for VirtioNic {
         unsafe {
             copy_nonoverlapping(src, buf.as_mut_ptr(), copy_len);
         }
-        self.refill_rx(buf_idx);
+        self.refill_rx(buf_idx, slot);
         Some(copy_len)
     }
 
     fn poll_rx(&mut self) -> Option<(usize, usize)> {
-        let (desc_id, written_len) = self.rxq.poll_used()?;
-        let buf_idx = self.desc_to_buf[desc_id as usize] as usize;
+        let (slot, written_len) = self.rxq.poll_used()?;
+        let buf_idx = self.desc_to_buf[slot.id() as usize] as usize;
         let total = written_len as usize;
         if total <= NET_HDR_SIZE {
-            self.refill_rx(buf_idx);
+            self.refill_rx(buf_idx, slot);
             return None;
         }
+        // Stash the slot for refill_rx_buf to consume later
+        self.pending_rx_slots[buf_idx] = Some(slot);
         Some((buf_idx, total - NET_HDR_SIZE))
     }
 
     fn refill_rx_buf(&mut self, buf_index: usize) {
         if buf_index < RX_BUF_COUNT {
-            self.refill_rx(buf_index);
+            let slot = self.pending_rx_slots[buf_index].take()
+                .expect("refill_rx_buf: no pending slot (poll_rx not called for this buf_index)");
+            self.refill_rx(buf_index, slot);
         }
     }
 
     fn submit_tx(&mut self, total_len: usize) {
-        self.txq.submit_and_wait(
+        let slot = self.tx_slot.take().expect("virtio-net: no tx slot");
+        self.tx_slot = Some(self.txq.submit_and_wait(
+            slot,
             &[(self.tx_phys, total_len as u32, BufDir::Readable)],
             self.device.notify_mmio(),
             self.device.notify_off_multiplier(),
             1,
-        );
+        ));
     }
 }
 
@@ -273,13 +285,22 @@ pub fn init(ecam_base: u64) {
         net_hdr_size: NET_HDR_SIZE as u16,
     });
 
+    let mut rx_slots = rxq.initial_slots();
+    let mut tx_slots = txq.initial_slots();
+    let tx_slot = tx_slots.pop().expect("virtio-net: no tx slots");
+    drop(tx_slots);
+
+    const NONE_SLOT: Option<DescSlot> = None;
     let mut nic = VirtioNic {
         device, rxq, txq, mac, rx_phys, tx_phys, rx_ptrs, tx_ptr,
         desc_to_buf: [0; RX_QUEUE_SIZE as usize],
+        pending_rx_slots: [NONE_SLOT; RX_BUF_COUNT],
+        tx_slot: Some(tx_slot),
     };
 
     for i in 0..RX_BUF_COUNT {
-        nic.refill_rx(i);
+        let slot = rx_slots.pop().expect("virtio-net: not enough rx slots");
+        nic.refill_rx(i, slot);
     }
 
     crate::net::register(Box::new(nic));

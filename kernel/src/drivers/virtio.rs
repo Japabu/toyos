@@ -175,6 +175,16 @@ impl VirtqueueRegions {
 
 }
 
+/// Proof that a descriptor slot is available for submission.
+/// Non-Copy, non-Clone: must be obtained from `poll_used()` or `initial_slots()`.
+/// Consumed by `submit()` — prevents overwriting in-flight descriptors.
+pub struct DescSlot(u16);
+
+impl DescSlot {
+    /// The raw descriptor index.
+    pub fn id(&self) -> u16 { self.0 }
+}
+
 /// A VirtIO split virtqueue.
 pub struct Virtqueue {
     desc_virt: *mut VirtqDesc,
@@ -184,7 +194,6 @@ pub struct Virtqueue {
     avail_phys: u64,
     used_phys: u64,
     size: u16,
-    next_desc: u16,
     last_used_idx: u16,
     notify_offset: u16,
 }
@@ -220,7 +229,6 @@ impl Virtqueue {
             avail_phys: regions.avail_phys,
             used_phys: regions.used_phys,
             size: queue_size,
-            next_desc: 0,
             last_used_idx: 0,
             notify_offset: 0,
         }
@@ -250,22 +258,25 @@ impl Virtqueue {
         unsafe { self.used_virt.add(USED_RING_OFF + i as usize * USED_ELEM_SIZE + 4) as *const u32 }
     }
 
-    /// The descriptor index that will be used by the next submit call.
-    pub fn next_desc_id(&self) -> u16 {
-        self.next_desc
+    /// Return the initial pool of descriptor slots. Call once after construction.
+    /// The caller manages these tokens — `submit()` consumes one, `poll_used()` returns one.
+    pub fn initial_slots(&self) -> alloc::vec::Vec<DescSlot> {
+        (0..self.size).map(DescSlot).collect()
     }
 
     /// Submit a descriptor chain and notify the device (non-blocking).
-    /// Returns the first descriptor index of the chain.
+    /// Consumes a `DescSlot` proving a descriptor is available.
+    /// Returns the descriptor index used (for caller bookkeeping).
     pub fn submit(
         &mut self,
+        slot: DescSlot,
         bufs: &[(u64, u32, BufDir)],
         notify_mmio: Mmio,
         notify_multiplier: u32,
         queue_index: u16,
     ) -> u16 {
         let size = self.size;
-        let first_desc = self.next_desc;
+        let first_desc = slot.0;
         for (i, (addr, len, dir)) in bufs.iter().enumerate() {
             let desc_idx = (first_desc + i as u16) % size;
             let is_last = i == bufs.len() - 1;
@@ -282,7 +293,6 @@ impl Virtqueue {
             let desc = VirtqDesc { addr: *addr, len: *len, flags, next: next_idx };
             unsafe { write_volatile(self.desc_virt.add(desc_idx as usize), desc); }
         }
-        self.next_desc = (first_desc + bufs.len() as u16) % size;
 
         let avail_idx = unsafe { read_volatile(self.avail_idx_ptr()) };
         unsafe {
@@ -304,9 +314,10 @@ impl Virtqueue {
         used_idx != self.last_used_idx
     }
 
-    /// Non-blocking poll of the used ring. Returns `(descriptor_id, written_len)` if
+    /// Non-blocking poll of the used ring. Returns `(DescSlot, written_len)` if
     /// the device has completed a request, or `None` if nothing new.
-    pub fn poll_used(&mut self) -> Option<(u16, u32)> {
+    /// The returned `DescSlot` can be reused for a new submission.
+    pub fn poll_used(&mut self) -> Option<(DescSlot, u32)> {
         let used_idx = unsafe { read_volatile(self.used_idx_ptr()) };
         if used_idx == self.last_used_idx {
             return None;
@@ -316,21 +327,23 @@ impl Virtqueue {
         let id = unsafe { read_volatile(self.used_ring_id_ptr(slot)) };
         let len = unsafe { read_volatile(self.used_ring_len_ptr(slot)) };
         self.last_used_idx = self.last_used_idx.wrapping_add(1);
-        Some((id as u16, len))
+        Some((DescSlot(id as u16), len))
     }
 
     /// Submit a descriptor chain and wait for the device to complete it.
+    /// Consumes a `DescSlot` and returns the one recovered from the used ring.
     pub fn submit_and_wait(
         &mut self,
+        slot: DescSlot,
         bufs: &[(u64, u32, BufDir)],
         notify_mmio: Mmio,
         notify_multiplier: u32,
         queue_index: u16,
-    ) {
-        self.submit(bufs, notify_mmio, notify_multiplier, queue_index);
+    ) -> DescSlot {
+        self.submit(slot, bufs, notify_mmio, notify_multiplier, queue_index);
         loop {
-            if self.poll_used().is_some() {
-                break;
+            if let Some((slot, _)) = self.poll_used() {
+                return slot;
             }
             core::hint::spin_loop();
         }

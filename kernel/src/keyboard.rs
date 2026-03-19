@@ -76,6 +76,11 @@ pub fn handle_report(report: &[u8]) {
         let keycode = report[i];
         if keycode < 4 { continue; }
         if !prev[2..8].contains(&keycode) {
+            // Ctrl+Alt+D (HID 0x07) → dump blocked threads
+            if ctrl && alt && keycode == 0x07 {
+                crate::scheduler::dump_blocked();
+                continue;
+            }
             let mut event = RawKeyEvent {
                 keycode,
                 modifiers,

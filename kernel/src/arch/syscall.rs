@@ -120,6 +120,8 @@ extern "sysv64" fn syscall_handler(num: u64, a1: u64, a2: u64, _: u64, a3: u64, 
 }
 
 fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
+    let t0 = crate::clock::nanos_since_boot();
+
     // Count syscalls per process
     process::with_current_data(|data| {
         data.syscall_total += 1;
@@ -133,7 +135,7 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
 
     let bad_addr = SyscallError::BadAddress.to_u64();
 
-    match num {
+    let result = match num {
         SYS_WRITE => {
             let Some(buf) = ctx.user_slice(UserAddr::new(a2), a3) else { return bad_addr };
             sys_write(a1 as u32, buf)
@@ -395,7 +397,15 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         }
         SYS_TLS_ALLOC_BLOCK => sys_tls_alloc_block(a1),
         _ => SyscallError::InvalidArgument.to_u64(),
-    }
+    };
+
+    // Track wall-clock syscall time (includes preemption — see plan for documented limitation)
+    let elapsed = crate::clock::nanos_since_boot() - t0;
+    process::with_current_data(|data| {
+        data.syscall_total_ns += elapsed;
+    });
+
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -637,7 +647,9 @@ fn sys_pipe_map(fd_num: u32) -> u64 {
         };
         let addr_space = crate::scheduler::current_address_space()
             .expect("sys_pipe_map: no address space");
-        let region = addr_space.map_region(&mut data.vmas, phys, pipe::PIPE_SIZE as u64);
+        let Some(region) = addr_space.map_region(&mut data.vmas, phys, pipe::PIPE_SIZE as u64) else {
+            return SyscallError::ResourceExhausted.to_u64();
+        };
         let vaddr = region.vaddr();
 
         // Store the mapping in the FD so it's unmapped on close
@@ -948,6 +960,9 @@ fn sys_mmap(req_addr: u64, size: u64, _prot: u64, flags: u64) -> u64 {
                 data.mmap_regions.push(process::MmapRegion {
                     addr: UserAddr::new(start), size: aligned, _alloc: alloc, fixed: true,
                 });
+                data.alloc_count += 1;
+                let mem = data.mmap_regions.iter().map(|r| r.size as u64).sum::<u64>();
+                if mem > data.peak_memory { data.peak_memory = mem; }
             });
             req_addr
         } else {
@@ -957,14 +972,22 @@ fn sys_mmap(req_addr: u64, size: u64, _prot: u64, flags: u64) -> u64 {
         let phys = PhysAddr::from_ptr(alloc.ptr());
         let addr_space = process::current_address_space();
         let vaddr = process::with_current_data(|data| {
-            let region = addr_space.map_region(&mut data.vmas, phys, aligned as u64);
+            let Some(region) = addr_space.map_region(&mut data.vmas, phys, aligned as u64) else {
+                return Err(());
+            };
             let vaddr = region.vaddr();
             data.mmap_regions.push(process::MmapRegion {
                 addr: vaddr, size: aligned, _alloc: alloc, fixed: false,
             });
-            vaddr
+            data.alloc_count += 1;
+            let mem = data.mmap_regions.iter().map(|r| r.size as u64).sum::<u64>();
+            if mem > data.peak_memory { data.peak_memory = mem; }
+            Ok(vaddr)
         });
-        vaddr.raw()
+        match vaddr {
+            Ok(v) => v.raw(),
+            Err(()) => SyscallError::ResourceExhausted.to_u64(),
+        }
     }
 }
 
@@ -974,6 +997,7 @@ fn sys_munmap(addr: u64, _size: u64) -> u64 {
         let idx = data.mmap_regions.iter().position(|r| r.addr.raw() == addr);
         if let Some(idx) = idx {
             let region = data.mmap_regions.swap_remove(idx);
+            data.free_count += 1;
             if region.fixed {
                 let mut cur = region.addr.raw();
                 let end = region.addr.raw() + region.size as u64;
@@ -1221,12 +1245,14 @@ fn sys_dlopen(path: &str) -> u64 {
         match &lib.memory {
             crate::elf::LibMemory::Owned(alloc) => {
                 let phys = PhysAddr::from_ptr(alloc.ptr());
-                let region = addr_space.map_region(&mut data.vmas, phys, alloc.size() as u64);
+                let region = addr_space.map_region(&mut data.vmas, phys, alloc.size() as u64)
+                    .expect("dlopen: out of virtual address space");
                 lib.user_base = region.vaddr();
             }
             crate::elf::LibMemory::Shared { rw_alloc, cached_addr, cached_size, rw_offset, .. } => {
                 let cached_phys = *cached_addr;
-                let region = addr_space.map_region(&mut data.vmas, cached_phys, *cached_size as u64);
+                let region = addr_space.map_region(&mut data.vmas, cached_phys, *cached_size as u64)
+                    .expect("dlopen: out of virtual address space");
                 let lib_vaddr = region.vaddr();
                 let num_rw_pages = rw_alloc.size() / paging::PAGE_2M as usize;
                 for i in 0..num_rw_pages {
@@ -1320,13 +1346,15 @@ fn sys_tls_alloc_block(module_id: u64) -> u64 {
     let block_phys_addr = PhysAddr::from_ptr(block_ptr);
     let tls_vaddr = process::with_fd_owner_data(|data| {
         let addr_space = process::current_address_space();
-        let region = addr_space.map_region(&mut data.vmas, block_phys_addr, tls_memsz as u64);
+        let region = addr_space.map_region(&mut data.vmas, block_phys_addr, tls_memsz as u64)
+            .expect("sys_tls_alloc_block: out of virtual address space");
         region.vaddr()
     });
 
-    // Store in THIS THREAD's ProcessData (each thread owns its own TLS blocks).
-    process::with_current_data(|data| {
-        data.dynamic_tls_blocks.insert(module_id, alloc);
+    // Store in the process-level (fd-owner) data alongside the VMA allocation.
+    let tid = process::current_tid();
+    process::with_fd_owner_data(|data| {
+        data.dynamic_tls_blocks.insert((tid, module_id), alloc);
     });
 
     // Write block address into current thread's DTV.

@@ -49,10 +49,25 @@ use arch::{apic, cpu, idt, paging, percpu, smp, syscall};
 use drivers::{acpi, gop, nvme, pci, serial, virtio_gpu, virtio_net, virtio_sound, xhci};
 use toyos_abi::boot::{KernelArgs, MemoryMapEntry};
 
+static PANIC_IN_PROGRESS: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
+    // Double-panic guard: if we panic inside the panic handler (or another CPU
+    // panics simultaneously), halt immediately with raw serial output.
+    if PANIC_IN_PROGRESS.swap(true, core::sync::atomic::Ordering::SeqCst) {
+        unsafe {
+            for &b in b"\n!!! DOUBLE PANIC !!!\n" {
+                core::arch::asm!("out dx, al", in("dx") 0x3F8u16, in("al") b);
+            }
+        }
+        cpu::halt();
+    }
+
     serial::write_bytes(b"\n[kernel] !!! PANIC !!!\n");
     log!("KERNEL PANIC: {}", info);
+
     // Walk the kernel stack for a backtrace
     log!("  Backtrace:");
     let mut rbp: u64;
@@ -65,6 +80,20 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
         symbols::resolve_kernel(return_addr);
         rbp = saved_rbp;
     }
+
+    // Dump current process/thread context (try_lock to avoid deadlock)
+    if let Some(tid) = percpu::current_tid() {
+        log!("  Running: tid={}", tid);
+        if let Some(guard) = process::PROCESS_TABLE.try_lock() {
+            if let Some(table) = guard.as_ref() {
+                if let Some(entry) = table.get(tid) {
+                    let name = core::str::from_utf8(entry.name()).unwrap_or("?").trim_end_matches('\0');
+                    log!("  Process: {} pid={} state={}", name, entry.process(), entry.state().name());
+                }
+            }
+        }
+    }
+
     cpu::halt()
 }
 

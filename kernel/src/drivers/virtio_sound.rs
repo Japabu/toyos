@@ -1,7 +1,7 @@
 use core::ptr::{copy_nonoverlapping, read_volatile, write_volatile};
 
 use super::pci::PciDevice;
-use super::virtio::{BufDir, Virtqueue, VirtioDevice, VIRTIO_F_VERSION_1};
+use super::virtio::{BufDir, DescSlot, Virtqueue, VirtioDevice, VIRTIO_F_VERSION_1};
 use super::DmaPool;
 use crate::log;
 use crate::sync::Lock;
@@ -157,6 +157,9 @@ pub struct SoundController {
     /// the 16-entry ring, so desc_id/3 doesn't map correctly after the first cycle)
     desc_to_buf: [u8; 16],
     started: bool,
+    control_slot: Option<DescSlot>,
+    /// Available TX descriptor slots (returned by poll_used, consumed by submit)
+    tx_free_slots: alloc::vec::Vec<DescSlot>,
 }
 
 unsafe impl Send for SoundController {}
@@ -170,7 +173,9 @@ impl SoundController {
             copy_nonoverlapping(bytes.as_ptr(), self.req_ptr, bytes.len());
         }
 
-        self.controlq.submit_and_wait(
+        let slot = self.control_slot.take().expect("sound: no control slot");
+        self.control_slot = Some(self.controlq.submit_and_wait(
+            slot,
             &[
                 (self.req_phys, bytes.len() as u32, BufDir::Readable),
                 (self.resp_phys, resp_size, BufDir::Writable),
@@ -178,7 +183,7 @@ impl SoundController {
             self.device.notify_mmio(),
             self.device.notify_off_multiplier(),
             0, // controlq index
-        );
+        ));
 
         unsafe { read_volatile(self.resp_ptr as *const u32) }
     }
@@ -230,11 +235,12 @@ impl SoundController {
     fn drain_tx(&mut self) -> u32 {
         let mut completed = 0u32;
         while self.tx_inflight > 0 {
-            if let Some((desc_id, _)) = self.txq.poll_used() {
-                let idx = self.desc_to_buf[desc_id as usize] as usize;
+            if let Some((slot, _)) = self.txq.poll_used() {
+                let idx = self.desc_to_buf[slot.id() as usize] as usize;
                 completed |= 1 << idx;
                 self.inflight_mask &= !(1 << idx);
                 self.tx_inflight -= 1;
+                self.tx_free_slots.push(slot);
             } else {
                 break;
             }
@@ -249,6 +255,7 @@ impl SoundController {
     pub fn submit_buffer(&mut self, idx: usize, len: u32) -> bool {
         if idx >= TX_INFLIGHT_MAX { return false; }
         if self.inflight_mask & (1 << idx) != 0 { return false; }
+        let Some(slot) = self.tx_free_slots.pop() else { return false };
         if !self.started {
             self.start();
         }
@@ -265,8 +272,8 @@ impl SoundController {
         let hdr_size = core::mem::size_of::<VirtioSndPcmXfer>() as u32;
         let status_size = core::mem::size_of::<VirtioSndPcmStatus>() as u32;
 
-        let first_desc = self.txq.next_desc_id();
-        self.txq.submit(
+        let first_desc = self.txq.submit(
+            slot,
             &[
                 (hdr_phys, hdr_size, BufDir::Readable),
                 (data_phys, len, BufDir::Readable),
@@ -330,6 +337,11 @@ pub fn init(ecam_base: u64) -> Option<(SoundController, AudioInfo)> {
         buf_tokens[i] = shared_memory::register(PhysAddr::new(tx_data_phys[i]), 4096).raw();
     }
 
+    let mut control_slots = controlq.initial_slots();
+    let control_slot = control_slots.pop().expect("sound: no control slots");
+    drop(control_slots);
+    let tx_free_slots = txq.initial_slots();
+
     let mut ctrl = SoundController {
         device,
         controlq,
@@ -345,6 +357,8 @@ pub fn init(ecam_base: u64) -> Option<(SoundController, AudioInfo)> {
         inflight_mask: 0,
         desc_to_buf: [0; 16],
         started: false,
+        control_slot: Some(control_slot),
+        tx_free_slots,
     };
 
     // Query PCM stream info

@@ -5,7 +5,7 @@ use alloc::alloc::{alloc_zeroed, dealloc};
 use alloc::boxed::Box;
 
 use super::pci::PciDevice;
-use super::virtio::{BufDir, Virtqueue, VirtioDevice, VIRTIO_F_VERSION_1};
+use super::virtio::{BufDir, DescSlot, Virtqueue, VirtioDevice, VIRTIO_F_VERSION_1};
 use super::DmaPool;
 use crate::arch::paging::{self, PAGE_2M};
 use crate::gpu::{FLAG_HARDWARE_CURSOR, Gpu, GpuInfo};
@@ -202,6 +202,8 @@ struct GpuController {
     device: VirtioDevice,
     controlq: Virtqueue,
     cursorq: Virtqueue,
+    control_slot: Option<DescSlot>,
+    cursor_slot: Option<DescSlot>,
     /// Physical addresses for virtqueue descriptors (device DMA).
     req_phys: u64,
     resp_phys: u64,
@@ -226,7 +228,9 @@ impl GpuController {
             copy_nonoverlapping(req_bytes.as_ptr(), self.req_ptr, req_bytes.len());
         }
 
-        self.controlq.submit_and_wait(
+        let slot = self.control_slot.take().expect("GPU: no control slot");
+        let returned = self.controlq.submit_and_wait(
+            slot,
             &[
                 (self.req_phys, req_bytes.len() as u32, BufDir::Readable),
                 (self.resp_phys, resp_size, BufDir::Writable),
@@ -235,6 +239,7 @@ impl GpuController {
             self.device.notify_off_multiplier(),
             0, // controlq index
         );
+        self.control_slot = Some(returned);
 
         // Read response type from header
         unsafe { read_volatile(self.resp_ptr as *const u32) }
@@ -258,7 +263,9 @@ impl GpuController {
             copy_nonoverlapping(bytes.as_ptr(), self.req_ptr, bytes.len());
         }
 
-        self.controlq.submit_and_wait(
+        let slot = self.control_slot.take().expect("GPU: no control slot");
+        self.control_slot = Some(self.controlq.submit_and_wait(
+            slot,
             &[
                 (self.req_phys, bytes.len() as u32, BufDir::Readable),
                 (self.resp_phys, resp_size, BufDir::Writable),
@@ -266,7 +273,7 @@ impl GpuController {
             self.device.notify_mmio(),
             self.device.notify_off_multiplier(),
             0,
-        );
+        ));
 
         unsafe { read_volatile(self.resp_ptr as *const RespDisplayInfo) }
     }
@@ -318,7 +325,9 @@ impl GpuController {
             );
         }
 
-        self.controlq.submit_and_wait(
+        let slot = self.control_slot.take().expect("GPU: no control slot");
+        self.control_slot = Some(self.controlq.submit_and_wait(
+            slot,
             &[
                 (self.req_phys, (cmd_size + entry_size) as u32, BufDir::Readable),
                 (self.resp_phys, core::mem::size_of::<CtrlHeader>() as u32, BufDir::Writable),
@@ -326,7 +335,7 @@ impl GpuController {
             self.device.notify_mmio(),
             self.device.notify_off_multiplier(),
             0,
-        );
+        ));
 
         let resp = unsafe { read_volatile(self.resp_ptr as *const u32) };
         assert!(resp == RESP_OK_NODATA, "VirtIO GPU: RESOURCE_ATTACH_BACKING failed: {:#x}", resp);
@@ -373,7 +382,9 @@ impl GpuController {
         unsafe {
             copy_nonoverlapping(bytes.as_ptr(), self.cursor_req_ptr, bytes.len());
         }
-        self.cursorq.submit_and_wait(
+        let slot = self.cursor_slot.take().expect("GPU: no cursor slot");
+        self.cursor_slot = Some(self.cursorq.submit_and_wait(
+            slot,
             &[
                 (self.cursor_req_phys, bytes.len() as u32, BufDir::Readable),
                 (self.cursor_resp_phys, core::mem::size_of::<CtrlHeader>() as u32, BufDir::Writable),
@@ -381,7 +392,7 @@ impl GpuController {
             self.device.notify_mmio(),
             self.device.notify_off_multiplier(),
             1, // cursor queue index
-        );
+        ));
     }
 
     fn update_cursor(&mut self, x: u32, y: u32, hot_x: u32, hot_y: u32) {
@@ -527,6 +538,13 @@ pub fn init(ecam_base: u64) -> Option<(Box<dyn Gpu>, GpuInfo)> {
     device.enable_queue(1);
     device.activate();
 
+    let mut control_slots = controlq.initial_slots();
+    let mut cursor_slots = cursorq.initial_slots();
+    let control_slot = control_slots.pop().expect("GPU: no control slots");
+    let cursor_slot = cursor_slots.pop().expect("GPU: no cursor slots");
+    drop(control_slots);
+    drop(cursor_slots);
+
     let req_phys = dma_phys(PAGE_CONTROLQ_BUFS).raw() + REQ_OFFSET as u64;
     let resp_phys = dma_phys(PAGE_CONTROLQ_BUFS).raw() + RESP_OFFSET as u64;
     let cursor_req_phys = dma_phys(PAGE_CURSORQ_BUFS).raw() + REQ_OFFSET as u64;
@@ -539,6 +557,8 @@ pub fn init(ecam_base: u64) -> Option<(Box<dyn Gpu>, GpuInfo)> {
         device,
         controlq,
         cursorq,
+        control_slot: Some(control_slot),
+        cursor_slot: Some(cursor_slot),
         req_phys,
         resp_phys,
         cursor_req_phys,
