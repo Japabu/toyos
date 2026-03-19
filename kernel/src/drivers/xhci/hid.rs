@@ -29,10 +29,24 @@ impl HidDevice {
             HidType::Keyboard => {
                 keyboard::handle_report(&buf[..size]);
                 crate::scheduler::push_event(crate::scheduler::EventSource::Keyboard);
+                let watchers = keyboard::io_uring_watchers();
+                if !watchers.is_empty() {
+                    crate::io_uring::complete_pending_for_event(
+                        &watchers,
+                        crate::scheduler::EventSource::Keyboard,
+                    );
+                }
             }
             HidType::Mouse => {
                 mouse::handle_report(&buf[..size]);
                 crate::scheduler::push_event(crate::scheduler::EventSource::Mouse);
+                let watchers = mouse::io_uring_watchers();
+                if !watchers.is_empty() {
+                    crate::io_uring::complete_pending_for_event(
+                        &watchers,
+                        crate::scheduler::EventSource::Mouse,
+                    );
+                }
             }
         }
     }

@@ -418,6 +418,7 @@ impl SchedEntry {
 
 /// Record of a single demand-paged fault, stored in a ring buffer for crash diagnostics.
 #[derive(Clone, Copy)]
+#[allow(dead_code)]
 pub struct PageFaultRecord {
     pub fault_addr: u64,
     pub page_elf_offset: u64,
@@ -428,6 +429,7 @@ pub struct PageFaultRecord {
 }
 
 /// Fixed-size ring buffer of recent page fault events for crash diagnostics.
+#[allow(dead_code)]
 pub struct PageFaultTrace {
     entries: [PageFaultRecord; 32],
     write_pos: usize,
@@ -2295,6 +2297,7 @@ pub fn handle_page_fault(fault_addr: u64, _error_code: u64) -> bool {
 
 /// Dump the page fault trace and memory around `fault_addr` for the current process.
 /// Called from the exception handler on user-mode crashes.
+#[allow(dead_code)]
 pub fn dump_crash_diagnostics(fault_addr: u64, rip: u64) {
     let tid = current_tid();
     if tid == Tid::MAX { return; }

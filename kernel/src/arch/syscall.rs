@@ -819,9 +819,16 @@ fn sys_connect(name: &str) -> u64 {
     })
 }
 
-/// Wake poll-blocked processes interested in listener events.
+/// Wake processes interested in listener events (direct blockers + io_uring watchers).
 fn wake_poll_waiters() {
     crate::scheduler::wake_by_event(crate::scheduler::EventSource::Listener);
+    let watchers = crate::listener::io_uring_watchers();
+    if !watchers.is_empty() {
+        crate::io_uring::complete_pending_for_event(
+            &watchers,
+            crate::scheduler::EventSource::Listener,
+        );
+    }
 }
 
 fn sys_alloc_shared(size: u64) -> u64 {

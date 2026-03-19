@@ -684,6 +684,13 @@ fn drain_events() {
     // Virtio-net MSI-X interrupt sets a pending flag — convert to event.
     if crate::arch::idt::virtio_net::irq_pending() {
         PERCPU_EVENTS[percpu::cpu_id() as usize].push(EventSource::Network);
+        let watchers = crate::net::io_uring_watchers();
+        if !watchers.is_empty() {
+            crate::io_uring::complete_pending_for_event(
+                &watchers,
+                EventSource::Network,
+            );
+        }
     }
 
     let cpu = percpu::cpu_id() as usize;
