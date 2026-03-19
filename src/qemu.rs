@@ -1,3 +1,4 @@
+use std::fs::File;
 use std::process::Command;
 
 pub fn launch(debug: bool, dump_audio: bool) {
@@ -52,12 +53,22 @@ pub fn launch(debug: bool, dump_audio: bool) {
         .arg("-s")
 
         // QMP socket for programmatic control
-        .arg("-qmp").arg("unix:/tmp/toyos-qmp.sock,server,nowait");
+        .arg("-qmp").arg("unix:/tmp/toyos-qmp.sock,server,nowait")
+
+        // Debug log — captures interrupts, exceptions, MMU faults, triple faults
+        .arg("-d").arg("int,cpu_reset")
+        .arg("-D").arg("/tmp/toyos-qemu-debug.log");
 
     if debug {
         eprintln!("Debug mode: kernel will wait for debugger before entering userland");
     }
 
+    // Serial output goes to stdout (stdio), so keep stdout attached to terminal.
+    // Capture QEMU's own stderr to a file for post-mortem analysis.
+    let stderr_file = File::create("/tmp/toyos-qemu-stderr.log").expect("create stderr log");
+    qemu.stderr(stderr_file);
+
+    eprintln!("QEMU logs: /tmp/toyos-qemu-debug.log, /tmp/toyos-qemu-stderr.log");
     qemu.status().expect("failed to execute QEMU");
 }
 

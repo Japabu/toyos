@@ -2,6 +2,12 @@
 #![no_main]
 extern crate alloc;
 
+/// Debugger spin gate. When `--debug` is active, the kernel spins here until
+/// LLDB sets this to false: `expr -- *(bool*)&DEBUG_WAIT = false`
+#[no_mangle]
+#[cfg(feature = "debug-wait")]
+static DEBUG_WAIT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+
 mod addr;
 pub use addr::{PhysAddr, VirtAddr, UserAddr, KernelAddr, DmaAddr, PHYS_OFFSET};
 
@@ -287,8 +293,6 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
 
     #[cfg(feature = "debug-wait")]
     {
-        use core::sync::atomic::AtomicBool;
-        static DEBUG_WAIT: AtomicBool = AtomicBool::new(true);
         log!("debug: waiting for debugger — set DEBUG_WAIT=false to continue");
         while DEBUG_WAIT.load(core::sync::atomic::Ordering::Relaxed) {
             core::hint::spin_loop();
