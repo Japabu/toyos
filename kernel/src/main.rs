@@ -9,8 +9,7 @@ extern crate alloc;
 #[cfg(feature = "debug-wait")]
 static DEBUG_WAIT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
 
-mod addr;
-pub use addr::{PhysAddr, VirtAddr, UserAddr, KernelAddr, DmaAddr, PHYS_OFFSET};
+pub use mm::{UserAddr, DmaAddr, DirectMap, PHYS_OFFSET};
 
 mod sync;
 mod id_map;
@@ -21,8 +20,6 @@ mod drivers;
 #[macro_use]
 mod log;
 mod mm;
-mod pmm;
-mod allocator;
 
 mod keyboard;
 mod mouse;
@@ -143,7 +140,7 @@ fn register_gpu(driver: Box<dyn gpu::Gpu>, info: gpu::GpuInfo) {
 
 unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     // Copy KernelArgs to the kernel stack — the original lives on the UEFI stack
-    // which becomes inaccessible after paging::init drops the identity map.
+    // which becomes inaccessible after mm::init drops the identity map.
     let kernel_args = *kernel_args;
 
     serial::init();
@@ -152,19 +149,19 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
 
     let entry_count = kernel_args.memory_map_size as usize / core::mem::size_of::<MemoryMapEntry>();
     let maps = core::slice::from_raw_parts(
-        PhysAddr::new(kernel_args.memory_map_addr).as_ptr::<MemoryMapEntry>(),
+        DirectMap::new(kernel_args.memory_map_addr).as_ptr::<MemoryMapEntry>(),
         entry_count,
     );
     let initrd = core::slice::from_raw_parts(
-        PhysAddr::new(kernel_args.initrd_addr).as_ptr::<u8>(),
+        DirectMap::new(kernel_args.initrd_addr).as_ptr::<u8>(),
         kernel_args.initrd_size as usize,
     );
     let kernel_elf = core::slice::from_raw_parts(
-        PhysAddr::new(kernel_args.kernel_elf_addr).as_ptr::<u8>(),
+        DirectMap::new(kernel_args.kernel_elf_addr).as_ptr::<u8>(),
         kernel_args.kernel_elf_size as usize,
     );
     let init_bytes = core::slice::from_raw_parts(
-        PhysAddr::new(kernel_args.init_program_addr).as_ptr::<u8>(),
+        DirectMap::new(kernel_args.init_program_addr).as_ptr::<u8>(),
         kernel_args.init_program_len as usize,
     );
     let init_programs = core::str::from_utf8(init_bytes).expect("init_programs: invalid UTF-8");
@@ -172,27 +169,17 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
 
     // ── Phase 1: Memory ─────────────────────────────────────────────────
     let reserved = [
-        allocator::Region { start: kernel_args.kernel_memory_addr, end: kernel_args.kernel_memory_addr + kernel_args.kernel_memory_size },
-        allocator::Region { start: kernel_args.initrd_addr, end: kernel_args.initrd_addr + kernel_args.initrd_size },
-        allocator::Region { start: kernel_args.kernel_elf_addr, end: kernel_args.kernel_elf_addr + kernel_args.kernel_elf_size },
-        allocator::Region { start: kernel_args.kernel_stack_addr, end: kernel_args.kernel_stack_addr + kernel_args.kernel_stack_size },
-        allocator::Region { start: 0x8000, end: 0x9000 }, // AP trampoline page
+        mm::Region { start: kernel_args.kernel_memory_addr, end: kernel_args.kernel_memory_addr + kernel_args.kernel_memory_size },
+        mm::Region { start: kernel_args.initrd_addr, end: kernel_args.initrd_addr + kernel_args.initrd_size },
+        mm::Region { start: kernel_args.kernel_elf_addr, end: kernel_args.kernel_elf_addr + kernel_args.kernel_elf_size },
+        mm::Region { start: kernel_args.kernel_stack_addr, end: kernel_args.kernel_stack_addr + kernel_args.kernel_stack_size },
+        mm::Region { start: 0x8000, end: 0x9000 }, // AP trampoline page
     ];
 
-    unsafe { allocator::init(maps, &reserved); }
-
-    // Copy init_programs into heap before init_buddy reclaims bootloader memory.
-    // The original pointer is into the bootloader's .rodata, which the buddy
-    // allocator treats as free usable memory.
+    // Copy init_programs into heap before mm::init reclaims bootloader memory.
+    mm::init(maps, &reserved);
     let init_programs = alloc::string::String::from(init_programs);
     let init_programs: &str = &init_programs;
-
-    paging::init(maps);
-
-    unsafe { allocator::init_buddy(maps, &reserved); }
-
-    // Register kernel physical range for user page table safety assertions
-    paging::set_kernel_phys_range(kernel_args.kernel_memory_addr, kernel_args.kernel_memory_size);
 
     // ── Phase 2: CPU — exceptions, LAPIC, clock ─────────────────────────
     // Get exception handlers up ASAP so bugs in later phases produce diagnostics
@@ -210,7 +197,7 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     // HPET clock — enables profiling for everything from here on
     let hpet_base = acpi::find_hpet_base(kernel_args.rsdp_addr)
         .expect("ACPI: HPET not found");
-    paging::map_kernel(PhysAddr::new(hpet_base), 0x1000);
+    mm::map_mmio(hpet_base, 0x1000);
     clock::init(hpet_base);
     apic::init_timer();
 

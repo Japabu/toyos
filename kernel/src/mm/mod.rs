@@ -90,6 +90,19 @@ impl core::fmt::Debug for DmaAddr {
     }
 }
 
+/// Physical address accessed through the kernel direct map.
+/// Not an ownership token — just a safe conversion from physical to virtual.
+/// Use for bootloader-provided addresses, ACPI tables, and other fixed
+/// physical memory that needs to be read/written by the kernel.
+#[derive(Clone, Copy)]
+pub struct DirectMap(u64);
+
+impl DirectMap {
+    pub fn new(phys: u64) -> Self { Self(phys) }
+    pub fn as_ptr<T>(&self) -> *const T { (self.0 + PHYS_OFFSET) as *const T }
+    pub fn as_mut_ptr<T>(&self) -> *mut T { (self.0 + PHYS_OFFSET) as *mut T }
+}
+
 // ---------------------------------------------------------------------------
 // Boot
 // ---------------------------------------------------------------------------

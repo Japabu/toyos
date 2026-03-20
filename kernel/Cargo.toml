@@ -14,4 +14,4 @@ toyos-abi = { path = "../toyos-abi" }
 rustc-demangle = "0.1"
 elf = { version = "0.8", default-features = false }
 hashbrown = { version = "0.16", default-features = false, features = ["default-hasher"] }
-dlmalloc = { path = "../userland/dlmalloc-rs", default-features = false }
+dlmalloc = { version = "0.2", default-features = false }

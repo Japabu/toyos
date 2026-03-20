@@ -102,7 +102,7 @@ unsafe impl GlobalAlloc for KernelAllocator {
     }
 }
 
-// Will become #[global_allocator] once old allocator.rs is removed
+#[global_allocator]
 static ALLOCATOR: KernelAllocator = KernelAllocator::new();
 
 // ---------------------------------------------------------------------------
