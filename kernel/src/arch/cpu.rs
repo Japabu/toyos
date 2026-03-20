@@ -75,6 +75,22 @@ pub unsafe fn write_cr3(addr: PhysAddr) {
     asm!("mov cr3, {}", in(reg) addr.raw(), options(nostack));
 }
 
+/// Read CR3 as a raw physical address (u64).
+#[inline]
+pub fn read_cr3_raw() -> u64 {
+    let value: u64;
+    unsafe { asm!("mov {}, cr3", out(reg) value, options(nomem, nostack)); }
+    value
+}
+
+/// Write CR3 from a raw physical address (u64).
+/// # Safety
+/// The caller must ensure the value is a valid PML4 physical address.
+#[inline]
+pub unsafe fn write_cr3_raw(addr: u64) {
+    asm!("mov cr3, {}", in(reg) addr, options(nostack));
+}
+
 #[inline]
 pub fn flush_tlb() {
     unsafe {

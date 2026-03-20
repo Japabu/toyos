@@ -20,6 +20,7 @@ mod drivers;
 
 #[macro_use]
 mod log;
+mod mm;
 mod pmm;
 mod allocator;
 
