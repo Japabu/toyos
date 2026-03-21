@@ -34,8 +34,8 @@ pub fn init(
     let aligned_size = align_2m(size as usize) as u64;
     crate::mm::paging::kernel().lock().as_mut().unwrap().map_mmio(addr, aligned_size);
 
-    let token0 = shared_memory::register(DirectMap::new(addr), aligned_size);
-    let token1 = shared_memory::register(DirectMap::new(addr), aligned_size);
+    let token0 = shared_memory::register(DirectMap::from_phys(addr), aligned_size);
+    let token1 = shared_memory::register(DirectMap::from_phys(addr), aligned_size);
     log!("GOP: {}x{} stride={} format={} at {:#x} tokens=[{:?}, {:?}]",
         width, height, stride, pixel_format, addr, token0, token1);
 
@@ -45,7 +45,7 @@ pub fn init(
     let cursor_ptr = unsafe { alloc_zeroed(cursor_layout) };
     assert!(!cursor_ptr.is_null(), "GOP: cursor alloc failed");
     let cursor_token = shared_memory::register(
-        DirectMap::new(DirectMap::phys_of(cursor_ptr)),
+        DirectMap::from_ptr(cursor_ptr),
         cursor_aligned as u64,
     );
 

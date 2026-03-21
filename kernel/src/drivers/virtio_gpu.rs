@@ -433,7 +433,7 @@ impl GpuController {
             let phys_addr = crate::mm::DirectMap::phys_of(ptr);
             ptrs[i] = ptr;
             phys_addrs[i] = phys_addr;
-            tokens[i] = shared_memory::register(crate::DirectMap::new(phys_addr), fb_aligned as u64);
+            tokens[i] = shared_memory::register(crate::DirectMap::from_phys(phys_addr), fb_aligned as u64);
             log!("VirtIO GPU: buffer {} at {:?} phys={:#x} ({} bytes) token={:?}", i, ptr, phys_addrs[i], fb_size, tokens[i]);
         }
         FbAlloc { tokens, phys_addrs, ptrs, layout: fb_layout }
@@ -617,7 +617,7 @@ pub fn init(ecam: &crate::mm::Mmio) -> Option<(Box<dyn Gpu>, GpuInfo)> {
     let cursor_ptr = unsafe { alloc_zeroed(cursor_layout) };
     assert!(!cursor_ptr.is_null(), "VirtIO GPU: cursor alloc failed");
     let cursor_phys = crate::mm::DirectMap::phys_of(cursor_ptr);
-    gpu.cursor_token = shared_memory::register(crate::DirectMap::new(cursor_phys), cursor_aligned as u64);
+    gpu.cursor_token = shared_memory::register(crate::DirectMap::from_phys(cursor_phys), cursor_aligned as u64);
     gpu.create_resource(CURSOR_RESOURCE_ID, FORMAT_B8G8R8A8_UNORM, CURSOR_SIZE, CURSOR_SIZE);
     gpu.attach_backing(CURSOR_RESOURCE_ID, cursor_phys, cursor_bytes as u32);
     log!("VirtIO GPU: cursor resource at {:?} phys={:#x} token={:?}", cursor_ptr, cursor_phys, gpu.cursor_token);

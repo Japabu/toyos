@@ -35,7 +35,7 @@ pub fn init(base_addr: u32) {
     // Enable LAPIC: set SVR bit 8 (software enable) + spurious vector 0xFF
     mmio.write_u32(LAPIC_SVR, mmio.read_u32(LAPIC_SVR) | (1 << 8) | 0xFF);
 
-    LAPIC_BASE.store(crate::DirectMap::new(base_addr as u64).as_ptr::<u8>() as u64, Ordering::Release);
+    LAPIC_BASE.store(crate::DirectMap::from_phys(base_addr as u64).as_ptr::<u8>() as u64, Ordering::Release);
     *LAPIC.lock() = Some(mmio);
     log!("LAPIC: enabled (ID {})", id());
 }

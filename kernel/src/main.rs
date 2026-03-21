@@ -149,19 +149,19 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
 
     let entry_count = kernel_args.memory_map_size as usize / core::mem::size_of::<MemoryMapEntry>();
     let maps = core::slice::from_raw_parts(
-        DirectMap::new(kernel_args.memory_map_addr).as_ptr::<MemoryMapEntry>(),
+        DirectMap::from_phys(kernel_args.memory_map_addr).as_ptr::<MemoryMapEntry>(),
         entry_count,
     );
     let initrd = core::slice::from_raw_parts(
-        DirectMap::new(kernel_args.initrd_addr).as_ptr::<u8>(),
+        DirectMap::from_phys(kernel_args.initrd_addr).as_ptr::<u8>(),
         kernel_args.initrd_size as usize,
     );
     let kernel_elf = core::slice::from_raw_parts(
-        DirectMap::new(kernel_args.kernel_elf_addr).as_ptr::<u8>(),
+        DirectMap::from_phys(kernel_args.kernel_elf_addr).as_ptr::<u8>(),
         kernel_args.kernel_elf_size as usize,
     );
     let init_bytes = core::slice::from_raw_parts(
-        DirectMap::new(kernel_args.init_program_addr).as_ptr::<u8>(),
+        DirectMap::from_phys(kernel_args.init_program_addr).as_ptr::<u8>(),
         kernel_args.init_program_len as usize,
     );
     let init_programs = core::str::from_utf8(init_bytes).expect("init_programs: invalid UTF-8");

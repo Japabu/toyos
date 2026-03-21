@@ -335,7 +335,7 @@ pub fn init(ecam: &crate::mm::Mmio) -> Option<(SoundController, AudioInfo)> {
     for i in 0..TX_INFLIGHT_MAX {
         tx_data_phys[i] = dma_phys(PAGE_TX_DATA + i).raw();
         // Register each TX data page as shared memory so soundd can map it
-        buf_tokens[i] = shared_memory::register(crate::DirectMap::new(tx_data_phys[i]), 4096).raw();
+        buf_tokens[i] = shared_memory::register(crate::DirectMap::from_phys(tx_data_phys[i]), 4096).raw();
     }
 
     let mut control_slots = controlq.initial_slots();

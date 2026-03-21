@@ -28,11 +28,11 @@ impl PageTablePage {
     }
 
     unsafe fn from_phys<'a>(phys: u64) -> &'a PageTablePage {
-        &*super::DirectMap::new(phys).as_ptr::<PageTablePage>()
+        &*super::DirectMap::from_phys(phys).as_ptr::<PageTablePage>()
     }
 
     unsafe fn from_phys_mut<'a>(phys: u64) -> &'a mut PageTablePage {
-        &mut *super::DirectMap::new(phys).as_mut_ptr::<PageTablePage>()
+        &mut *super::DirectMap::from_phys(phys).as_mut_ptr::<PageTablePage>()
     }
 
     fn child(&self, index: usize) -> Option<&PageTablePage> {
@@ -169,7 +169,7 @@ impl AddressSpace {
         if pde & PAGE_PRESENT == 0 { return None; }
         let page_phys = pde & ADDR_MASK_2M;
         let offset = va & (PAGE_2M - 1);
-        Some(super::DirectMap::new(page_phys + offset))
+        Some(super::DirectMap::from_phys(page_phys + offset))
     }
 
     /// Map a physical region into the direct map using 2MB pages.
@@ -184,7 +184,7 @@ impl AddressSpace {
         }
         crate::arch::cpu::flush_tlb();
         crate::arch::apic::tlb_shootdown();
-        super::Mmio::new(super::DirectMap::new(phys), size)
+        super::Mmio::new(super::DirectMap::from_phys(phys), size)
     }
 
     /// Unmap a physical region from the direct map.
@@ -201,7 +201,7 @@ impl AddressSpace {
     }
 
     fn map_2m(&mut self, phys: u64, flags: u64) {
-        let virt = super::DirectMap::new(phys).as_ptr::<u8>() as u64;
+        let virt = super::DirectMap::from_phys(phys).as_ptr::<u8>() as u64;
         let (pml4_idx, pdpt_idx, pd_idx) = indices(virt);
         let pd = self.ensure_table(pml4_idx, flags, pdpt_idx, flags);
         if pd[pd_idx] & PAGE_PRESENT == 0 {
@@ -210,7 +210,7 @@ impl AddressSpace {
     }
 
     fn unmap_2m(&mut self, phys: u64) {
-        let virt = super::DirectMap::new(phys).as_ptr::<u8>() as u64;
+        let virt = super::DirectMap::from_phys(phys).as_ptr::<u8>() as u64;
         let (pml4_idx, pdpt_idx, pd_idx) = indices(virt);
         if let Some(pdpt) = self.root.child_mut(pml4_idx) {
             if let Some(pd) = pdpt.child_mut(pdpt_idx) {

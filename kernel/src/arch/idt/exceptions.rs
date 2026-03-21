@@ -106,7 +106,7 @@ extern "sysv64" fn debug_handler(regs: *const SavedRegs) {
 
     // Backtrace
     log!("  Backtrace:");
-    let pml4 = if is_user { crate::DirectMap::new(cpu::read_cr3()).as_ptr::<u64>() as *const u64 } else { core::ptr::null() };
+    let pml4 = if is_user { crate::DirectMap::from_phys(cpu::read_cr3()).as_ptr::<u64>() as *const u64 } else { core::ptr::null() };
     let mut rbp = regs.rbp;
     for _ in 0..20 {
         let Some(saved_rbp) = safe_read_u64(rbp, pml4) else { break };
@@ -336,7 +336,7 @@ extern "sysv64" fn double_fault_handler(regs: *const SavedRegs) -> ! {
                     log!("    rip={:#018x}  rsp={:#018x}  rbp={:#018x}", maybe_rip, maybe_rsp, user_rbp);
 
                     // Walk user backtrace through page tables
-                    let pml4 = crate::DirectMap::new(cpu::read_cr3()).as_ptr::<u64>();
+                    let pml4 = crate::DirectMap::from_phys(cpu::read_cr3()).as_ptr::<u64>();
                     log!("  User backtrace:");
                     if let Some(p) = pid {
                         if !process::resolve_user_symbol(p, maybe_rip) {
@@ -515,15 +515,15 @@ fn safe_read_u64(addr: u64, user_pml4: *const u64) -> Option<u64> {
         let pd_idx = ((addr >> 21) & 0x1FF) as usize;
         let pml4e = unsafe { *user_pml4.add(pml4_idx) };
         if pml4e & 1 == 0 { return None; }
-        let pdpt = crate::DirectMap::new(pml4e & 0x000F_FFFF_FFFF_F000).as_ptr::<u64>();
+        let pdpt = crate::DirectMap::from_phys(pml4e & 0x000F_FFFF_FFFF_F000).as_ptr::<u64>();
         let pdpte = unsafe { *pdpt.add(pdpt_idx) };
         if pdpte & 1 == 0 { return None; }
-        let pd = crate::DirectMap::new(pdpte & 0x000F_FFFF_FFFF_F000).as_ptr::<u64>();
+        let pd = crate::DirectMap::from_phys(pdpte & 0x000F_FFFF_FFFF_F000).as_ptr::<u64>();
         let pde = unsafe { *pd.add(pd_idx) };
         if pde & 1 == 0 { return None; }
         let page_phys = pde & 0x000F_FFFF_FFE0_0000;
         let offset = addr & (crate::mm::PAGE_2M - 1);
-        Some(unsafe { *crate::DirectMap::new(page_phys + offset).as_ptr::<u64>() })
+        Some(unsafe { *crate::DirectMap::from_phys(page_phys + offset).as_ptr::<u64>() })
     } else if crate::mm::is_kernel_addr(addr) {
         Some(unsafe { *(addr as *const u64) })
     } else {
@@ -596,7 +596,7 @@ fn fatal_exception(ctx: &ExceptionContext) -> ! {
 
     // === Step 2: Rich diagnostics via log!() ===
     let tid = percpu::current_tid().unwrap_or(crate::process::Tid(0));
-    let pml4 = if is_user { crate::DirectMap::new(cpu::read_cr3()).as_ptr::<u64>() as *const u64 } else { core::ptr::null() };
+    let pml4 = if is_user { crate::DirectMap::from_phys(cpu::read_cr3()).as_ptr::<u64>() as *const u64 } else { core::ptr::null() };
 
     // Header
     if is_user {

@@ -27,7 +27,7 @@ impl PhysPage {
 
     /// Access this page through the kernel direct map.
     pub fn direct_map(&self) -> super::DirectMap {
-        super::DirectMap::new(self.0)
+        super::DirectMap::from_phys(self.0)
     }
 
     /// DMA address for device descriptors.
@@ -61,12 +61,12 @@ const NULL_PAGE: u64 = 0;
 
 /// Read the `next` pointer from a free page (stored in its first 8 bytes).
 fn read_next(phys: u64) -> u64 {
-    unsafe { *super::DirectMap::new(phys).as_ptr::<u64>() }
+    unsafe { *super::DirectMap::from_phys(phys).as_ptr::<u64>() }
 }
 
 /// Write the `next` pointer into a free page.
 fn write_next(phys: u64, next: u64) {
-    unsafe { *super::DirectMap::new(phys).as_mut_ptr::<u64>() = next; }
+    unsafe { *super::DirectMap::from_phys(phys).as_mut_ptr::<u64>() = next; }
 }
 
 /// Initialize the free list from the UEFI memory map.
@@ -105,7 +105,7 @@ pub(super) fn alloc_page() -> Option<PhysPage> {
     list.free_count -= 1;
     drop(list); // release lock before zeroing
 
-    unsafe { core::ptr::write_bytes(DirectMap::new(phys).as_mut_ptr::<u8>(), 0, PAGE_2M as usize); }
+    unsafe { core::ptr::write_bytes(DirectMap::from_phys(phys).as_mut_ptr::<u8>(), 0, PAGE_2M as usize); }
 
     Some(PhysPage(phys))
 }

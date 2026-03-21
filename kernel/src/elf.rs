@@ -1,10 +1,11 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use crate::mm::{PAGE_2M, align_2m};
+use core::ptr;
+
+use crate::mm::{PAGE_2M, align_2m, DirectMap, KernelSlice};
 use crate::process::OwnedAlloc;
 use crate::UserAddr;
-use crate::DirectMap;
 use crate::sync::Lock;
 use elf::ElfBytes;
 use elf::endian::AnyEndian;
@@ -25,7 +26,7 @@ const R_X86_64_TPOFF32: u32 = 23;
 // ── ELF binary structures ───────────────────────────────────────────────
 // These match the on-disk/in-memory ELF64 layout (repr(C)). The `elf` crate's
 // Symbol/Rela types reorder fields during parsing, so they can't be used for
-// raw pointer reads via DirectMap::read_at.
+// raw pointer reads via ptr::read_unaligned.
 
 /// ELF64 symbol table entry (24 bytes).
 #[derive(Clone, Copy)]
@@ -81,16 +82,13 @@ pub enum LibMemory {
     Owned(OwnedAlloc),
     /// Cloned from cache: RO pages are shared (owned by cache), RW pages are private.
     Shared {
-        /// Private copy of the RW segment pages.
         rw_alloc: OwnedAlloc,
-        /// Physical start address of the cached allocation.
-        cached_addr: DirectMap,
-        /// Total size of the cached allocation.
+        /// Kernel pointer to the start of the cached allocation.
+        cached_ptr: *const u8,
         cached_size: usize,
         /// 2MB-aligned offset within cached alloc where private RW region starts.
         rw_offset: usize,
-        /// Delta to translate cached RW addresses to private physical addresses.
-        /// kernel_write_addr = cached_addr + rw_delta
+        /// Delta to translate cached addresses to private RW addresses.
         rw_delta: i64,
     },
 }
@@ -114,7 +112,7 @@ pub struct CachedRelocs {
 }
 
 /// Scan rela/jmprel tables and extract non-RELATIVE entries.
-fn prescan_relocs(rela_addr: DirectMap, rela_size: u64, jmprel_addr: DirectMap, jmprel_size: u64) -> CachedRelocs {
+fn prescan_relocs(rela: &Option<KernelSlice>, jmprel: &Option<KernelSlice>) -> CachedRelocs {
     let mut relocs = CachedRelocs {
         bind: alloc::vec::Vec::new(),
         tpoff64: alloc::vec::Vec::new(),
@@ -122,10 +120,11 @@ fn prescan_relocs(rela_addr: DirectMap, rela_size: u64, jmprel_addr: DirectMap, 
         dtpmod64: alloc::vec::Vec::new(),
         dtpoff64: alloc::vec::Vec::new(),
     };
-    for (addr, size) in [(rela_addr, rela_size), (jmprel_addr, jmprel_size)] {
-        if size == 0 || addr.is_null() { continue; }
-        for i in 0..size / RELA_SIZE {
-            let rela = unsafe { (addr + i * RELA_SIZE).read_at::<Elf64Rela>(0) };
+    for table in [rela, jmprel] {
+        let Some(table) = table else { continue };
+        let count = table.size() / RELA_SIZE as usize;
+        for i in 0..count {
+            let rela = unsafe { table.read::<Elf64Rela>(i * RELA_SIZE as usize) };
             match rela.r_type() {
                 6 | 7 => relocs.bind.push((rela.r_offset, rela.r_sym())),
                 R_X86_64_TPOFF64 => relocs.tpoff64.push((rela.r_offset, rela.r_sym(), rela.r_addend)),
@@ -188,7 +187,7 @@ fn cache_loaded_lib(path: &str, lib: LoadedLib, rw_vaddr: u64, rw_end_vaddr: u64
     let alloc = match memory {
         LibMemory::Owned(a) => a,
         other => return LoadedLib {
-            memory: other, user_base: UserAddr::new(base.raw()), phys_base: base,
+            memory: other, user_base: UserAddr::new(base), phys_base: base,
             dynsym, dynstr, dynstr_size, sym_count,
             tls_template, tls_filesz, tls_memsz, tls_align,
             rela_addr, rela_size, jmprel_addr, jmprel_size, gnu_hash,
@@ -197,12 +196,11 @@ fn cache_loaded_lib(path: &str, lib: LoadedLib, rw_vaddr: u64, rw_end_vaddr: u64
     };
     let size = alloc.size();
     let alloc_ptr = alloc.ptr();
-    let vaddr_min = alloc_ptr as u64 - base.to_kernel().raw();
+    let base_kern = DirectMap::from_phys(base).as_ptr::<u8>();
+    let vaddr_min = alloc_ptr as u64 - base_kern as u64;
 
-    // Compute the 2MB-aligned RW region within the allocation.
-    let base_kern = base.to_kernel();
-    let rw_start_in_alloc = (base_kern + rw_vaddr).raw() as usize - alloc_ptr as usize;
-    let rw_end_in_alloc = (base_kern + rw_end_vaddr).raw() as usize - alloc_ptr as usize;
+    let rw_start_in_alloc = unsafe { base_kern.add(rw_vaddr as usize) as usize - alloc_ptr as usize };
+    let rw_end_in_alloc = unsafe { base_kern.add(rw_end_vaddr as usize) as usize - alloc_ptr as usize };
     let rw_offset = rw_start_in_alloc & !(PAGE_2M as usize - 1);
     let rw_size = align_2m(rw_end_in_alloc) - rw_offset;
 
@@ -214,12 +212,12 @@ fn cache_loaded_lib(path: &str, lib: LoadedLib, rw_vaddr: u64, rw_end_vaddr: u64
 
     // Allocate private RW pages for the first user.
     // Store as physical address — user processes see physical addresses
-    let cached_addr = crate::DirectMap::from_ptr(alloc_ptr);
+    let cached_ptr = alloc_ptr as *const u8;
     let uninit_rw = match OwnedAlloc::new_uninit(rw_size, PAGE_2M as usize) {
         Some(a) => a,
         None => {
             return LoadedLib {
-                memory: LibMemory::Owned(alloc), user_base: UserAddr::new(base.raw()), phys_base: base,
+                memory: LibMemory::Owned(alloc), user_base: UserAddr::new(base), phys_base: base,
                 dynsym, dynstr, dynstr_size, sym_count,
                 tls_template, tls_filesz, tls_memsz, tls_align,
                 rela_addr, rela_size, jmprel_addr, jmprel_size, gnu_hash,
@@ -241,19 +239,19 @@ fn cache_loaded_lib(path: &str, lib: LoadedLib, rw_vaddr: u64, rw_end_vaddr: u64
         vaddr_min,
         rw_offset,
         rw_size,
-        dynsym_off: dynsym - base_kern,
-        dynstr_off: dynstr - base_kern,
+        dynsym_off: dynsym - base,
+        dynstr_off: dynstr - base,
         dynstr_size,
         sym_count,
-        tls_vaddr: if tls_memsz > 0 { tls_template - base_kern } else { 0 },
+        tls_vaddr: if tls_memsz > 0 { tls_template - base } else { 0 },
         tls_filesz,
         tls_memsz,
         tls_align,
-        rela_off: if !rela_addr.is_null() { rela_addr - base_kern } else { 0 },
+        rela_off: if !rela_addr.is_null() { rela_addr - base } else { 0 },
         rela_size,
-        jmprel_off: if !jmprel_addr.is_null() { jmprel_addr - base_kern } else { 0 },
+        jmprel_off: if !jmprel_addr.is_null() { jmprel_addr - base } else { 0 },
         jmprel_size,
-        gnu_hash_off: if !gnu_hash.is_null() { gnu_hash - base_kern } else { 0 },
+        gnu_hash_off: if !gnu_hash.is_null() { gnu_hash - base } else { 0 },
         relocs: relocs.clone(),
     };
     SO_CACHE.lock().push((String::from(path), cached));
@@ -306,7 +304,7 @@ fn clone_from_cache(cached: &CachedLib) -> Option<LoadedLib> {
         base.raw(), cached.alloc_size / (1024*1024), cached.rw_size / (1024*1024),
         (t1 - t0) / 1_000_000);
 
-    let base_kern = base.to_kernel();
+    let base = base.to_kernel();
     Some(LoadedLib {
         memory: LibMemory::Shared {
             rw_alloc,
@@ -318,21 +316,21 @@ fn clone_from_cache(cached: &CachedLib) -> Option<LoadedLib> {
         user_base: UserAddr::new(base.raw()),
         phys_base: base,
         // dynsym/dynstr/rela/jmprel are kernel-read addresses → DirectMap
-        dynsym: base_kern + cached.dynsym_off,
-        dynstr: base_kern + cached.dynstr_off,
+        dynsym: base + cached.dynsym_off,
+        dynstr: base + cached.dynstr_off,
         dynstr_size: cached.dynstr_size,
         sym_count: cached.sym_count,
         tls_template: if cached.tls_memsz > 0 {
-            base_kern + cached.tls_vaddr
+            base + cached.tls_vaddr
         } else { DirectMap::null() },
         tls_filesz: cached.tls_filesz,
         tls_memsz: cached.tls_memsz,
         tls_align: cached.tls_align,
-        rela_addr: if cached.rela_off != 0 { base_kern + cached.rela_off } else { DirectMap::null() },
+        rela_addr: if cached.rela_off != 0 { base + cached.rela_off } else { DirectMap::null() },
         rela_size: cached.rela_size,
-        jmprel_addr: if cached.jmprel_off != 0 { base_kern + cached.jmprel_off } else { DirectMap::null() },
+        jmprel_addr: if cached.jmprel_off != 0 { base + cached.jmprel_off } else { DirectMap::null() },
         jmprel_size: cached.jmprel_size,
-        gnu_hash: if cached.gnu_hash_off != 0 { base_kern + cached.gnu_hash_off } else { DirectMap::null() },
+        gnu_hash: if cached.gnu_hash_off != 0 { base + cached.gnu_hash_off } else { DirectMap::null() },
         cached_relocs: Some(cached.relocs.clone()),
     })
 }
@@ -340,26 +338,21 @@ fn clone_from_cache(cached: &CachedLib) -> Option<LoadedLib> {
 /// Derive total symbol count from a GNU hash table.
 /// The table is: [nbuckets, symoffset, bloom_size, bloom_shift, bloom[], buckets[], chain[]]
 /// Each bucket holds the lowest symbol index; each chain entry's bit 0 marks the end of a chain.
-fn gnu_hash_sym_count(addr: DirectMap) -> usize {
-    let ptr = addr.as_ptr::<u32>();
-    let nbuckets = unsafe { *ptr } as usize;
-    let symoffset = unsafe { *ptr.add(1) } as usize;
-    let bloom_size = unsafe { *ptr.add(2) } as usize;
-    // Skip header (4 u32s) + bloom (bloom_size u64s = bloom_size*2 u32s)
-    let buckets_offset = 4 + bloom_size * 2;
-    let buckets_ptr = unsafe { ptr.add(buckets_offset) };
-    // Find the max bucket value = highest starting symbol index
+fn gnu_hash_sym_count(table: &KernelSlice) -> usize {
+    let nbuckets = unsafe { table.read::<u32>(0) } as usize;
+    let symoffset = unsafe { table.read::<u32>(4) } as usize;
+    let bloom_size = unsafe { table.read::<u32>(8) } as usize;
+    let buckets_off = 16 + bloom_size * 8;
     let mut max_sym = 0usize;
     for i in 0..nbuckets {
-        let val = unsafe { *buckets_ptr.add(i) } as usize;
+        let val = unsafe { table.read::<u32>(buckets_off + i * 4) } as usize;
         if val > max_sym { max_sym = val; }
     }
     if max_sym < symoffset { return symoffset; }
-    // Walk the chain from max_sym until we find the end (bit 0 set)
-    let chain_ptr = unsafe { buckets_ptr.add(nbuckets) };
+    let chains_off = buckets_off + nbuckets * 4;
     let mut idx = max_sym - symoffset;
     loop {
-        let entry = unsafe { *chain_ptr.add(idx) };
+        let entry = unsafe { table.read::<u32>(chains_off + idx * 4) };
         if entry & 1 != 0 { return symoffset + idx + 1; }
         idx += 1;
     }
@@ -367,9 +360,9 @@ fn gnu_hash_sym_count(addr: DirectMap) -> usize {
 
 /// Read a null-terminated string from `base + offset`, bounded by `max_size`.
 /// Returns `""` if the offset is out of bounds or no null terminator is found.
-fn bounded_cstr(base: DirectMap, offset: u64, max_size: u64) -> &'static str {
+fn bounded_cstr(base: *const u8, offset: u64, max_size: u64) -> &'static str {
     if offset >= max_size { return ""; }
-    let ptr = (base + offset).as_ptr::<u8>();
+    let ptr = unsafe { base.add(offset as usize) };
     let remaining = (max_size - offset) as usize;
     let mut len = 0;
     while len < remaining {
@@ -809,55 +802,57 @@ pub fn build_symtab_map(
 
 pub struct LoadedLib {
     pub memory: LibMemory,
-    /// User-visible base address. Symbol addresses = user_base + ELF offset.
-    /// Set to phys_base initially; updated by spawn when mapped via VmaList.
     pub user_base: UserAddr,
-    /// Physical base address. Used for kernel direct-map writes during relocation.
-    pub phys_base: DirectMap,
-    /// Kernel-readable pointers for symbol/relocation tables.
-    pub dynsym: DirectMap,
-    pub dynstr: DirectMap,
-    pub dynstr_size: u64,
+    /// Physical base address for page table mappings.
+    pub phys_base: u64,
+    /// Bounds-checked view of the entire loaded image.
+    pub image: KernelSlice,
+    pub dynsym: Option<KernelSlice>,
+    pub dynstr: Option<KernelSlice>,
     pub sym_count: usize,
-    /// Kernel-readable TLS template pointer for copy_nonoverlapping.
-    pub tls_template: DirectMap,
-    pub tls_filesz: usize,
+    pub tls_template: Option<KernelSlice>,
     pub tls_memsz: usize,
     pub tls_align: usize,
-    /// Kernel-readable relocation table pointers.
-    pub rela_addr: DirectMap,
-    pub rela_size: u64,
-    pub jmprel_addr: DirectMap,
-    pub jmprel_size: u64,
-    /// Kernel-readable .gnu.hash table pointer, or null.
-    pub gnu_hash: DirectMap,
-    /// Pre-scanned non-RELATIVE relocs (only for cached/shared libs).
+    pub rela: Option<KernelSlice>,
+    pub jmprel: Option<KernelSlice>,
+    pub gnu_hash: Option<KernelSlice>,
     pub cached_relocs: Option<CachedRelocs>,
 }
 
 impl LoadedLib {
-    /// Read the i-th symbol table entry.
     fn sym(&self, i: usize) -> Elf64Sym {
-        unsafe { self.dynsym.add(i * SYM_SIZE).read_at::<Elf64Sym>(0) }
+        let dynsym = self.dynsym.as_ref().expect("no dynsym");
+        unsafe { dynsym.read::<Elf64Sym>(i * SYM_SIZE) }
     }
 
-    /// Get the name of the i-th symbol.
     fn sym_name(&self, i: usize) -> &str {
-        let st_name = self.sym(i).st_name;
-        bounded_cstr(self.dynstr, st_name as u64, self.dynstr_size)
+        let dynstr = self.dynstr.as_ref().expect("no dynstr");
+        let st_name = self.sym(i).st_name as usize;
+        if st_name >= dynstr.size() { return ""; }
+        let ptr = dynstr.ptr_at(st_name);
+        let remaining = dynstr.size() - st_name;
+        let mut len = 0;
+        while len < remaining {
+            if unsafe { *ptr.add(len) } == 0 { break; }
+            len += 1;
+        }
+        let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
+        core::str::from_utf8(bytes).unwrap_or("")
     }
 
-    /// Write a value at a byte offset within this library.
-    /// Converts to a kernel-writable pointer via the direct map.
+    pub fn tls_filesz(&self) -> usize {
+        self.tls_template.as_ref().map_or(0, |s| s.size())
+    }
+
+    /// Write a value at a byte offset within this library's kernel mapping.
     pub unsafe fn write_at<T: Copy>(&self, offset: u64, value: T) {
-        let phys = self.phys_base + offset;
-        let ptr = match &self.memory {
-            LibMemory::Owned(_) => phys.as_mut_ptr::<T>(),
+        match &self.memory {
+            LibMemory::Owned(_) => self.image.write(offset as usize, value),
             LibMemory::Shared { rw_delta, .. } => {
-                (phys.to_kernel().raw() as i64 + rw_delta) as *mut T
+                let ptr = (self.image.base().add(offset as usize) as i64 + rw_delta) as *mut T;
+                ptr.write_unaligned(value);
             }
-        };
-        ptr.write_unaligned(value);
+        }
     }
 }
 
@@ -872,56 +867,40 @@ fn gnu_hash(name: &str) -> u32 {
 
 /// Fast symbol lookup using .gnu.hash table.
 fn gnu_dlsym(lib: &LoadedLib, name: &str) -> Option<UserAddr> {
-    if lib.gnu_hash.is_null() {
-        return dlsym(lib, name);
-    }
-    let hash_addr = lib.gnu_hash;
+    let table = lib.gnu_hash.as_ref()?;
     let h = gnu_hash(name);
 
-    // Parse header: nbuckets, symoffset, bloom_size, bloom_shift
-    let nbuckets = unsafe { hash_addr.read_at::<u32>(0) };
-    let symoffset = unsafe { hash_addr.read_at::<u32>(4) };
-    let bloom_size = unsafe { hash_addr.read_at::<u32>(8) };
-    let bloom_shift = unsafe { hash_addr.read_at::<u32>(12) };
+    let nbuckets = unsafe { table.read::<u32>(0) };
+    let symoffset = unsafe { table.read::<u32>(4) };
+    let bloom_size = unsafe { table.read::<u32>(8) };
+    let bloom_shift = unsafe { table.read::<u32>(12) };
 
-    // Bloom filter check (64-bit words)
-    let bloom_base = hash_addr + 16;
-    let bloom_word = unsafe {
-        (bloom_base + ((h as u64 / 64) % bloom_size as u64) * 8).read_at::<u64>(0)
-    };
+    let bloom_off = 16;
+    let bloom_idx = ((h as u64 / 64) % bloom_size as u64) as usize;
+    let bloom_word = unsafe { table.read::<u64>(bloom_off + bloom_idx * 8) };
     let mask = (1u64 << (h % 64)) | (1u64 << ((h >> bloom_shift) % 64));
     if bloom_word & mask != mask {
         return None;
     }
 
-    // Bucket lookup
-    let buckets_base = bloom_base + bloom_size as u64 * 8;
+    let buckets_off = bloom_off + bloom_size as usize * 8;
     let bucket_idx = h % nbuckets;
-    let sym_idx = unsafe { (buckets_base + bucket_idx as u64 * 4).read_at::<u32>(0) };
+    let sym_idx = unsafe { table.read::<u32>(buckets_off + bucket_idx as usize * 4) };
     if sym_idx == 0 {
         return None;
     }
 
-    // Chain walk
-    let chains_base = buckets_base + nbuckets as u64 * 4;
+    let chains_off = buckets_off + nbuckets as usize * 4;
     let mut i = sym_idx;
     loop {
-        let chain_val = unsafe {
-            (chains_base + (i - symoffset) as u64 * 4).read_at::<u32>(0)
-        };
-        // Compare hash values (ignoring lowest bit which is the chain-end flag)
+        let chain_val = unsafe { table.read::<u32>(chains_off + (i - symoffset) as usize * 4) };
         if (chain_val | 1) == (h | 1) {
-            // Hash matches — verify with string compare
             let sym = lib.sym(i as usize);
-            if sym.st_shndx != 0 {
-                if lib.sym_name(i as usize) == name {
-                    return Some(lib.user_base + sym.st_value);
-                }
+            if sym.st_shndx != 0 && lib.sym_name(i as usize) == name {
+                return Some(lib.user_base + sym.st_value);
             }
         }
-        if chain_val & 1 != 0 {
-            break; // End of chain
-        }
+        if chain_val & 1 != 0 { break; }
         i += 1;
     }
     None
@@ -978,8 +957,8 @@ pub fn load_shared_lib(data: &[u8]) -> Result<(LoadedLib, u64, u64), &'static st
     };
     let t1 = crate::clock::nanos_since_boot();
     let base_ptr = uninit_alloc.ptr();
-    let base_kern = DirectMap::from_ptr(base_ptr as *const u8) - vaddr_min;
-    let base_phys = DirectMap::from_ptr(base_ptr) - vaddr_min;
+    // Kernel pointer offset by vaddr_min so that base.add(vaddr) gives the right location.
+    let base = unsafe { (base_ptr as *const u8).sub(vaddr_min as usize) };
 
     // Copy PT_LOAD segments and zero BSS gaps.
     // Zero the entire range first to handle gaps between segments safely.
@@ -987,7 +966,7 @@ pub fn load_shared_lib(data: &[u8]) -> Result<(LoadedLib, u64, u64), &'static st
     let t2 = crate::clock::nanos_since_boot();
     for phdr in segments.iter() {
         if phdr.p_type == PT_LOAD {
-            let dst = (base_kern + phdr.p_vaddr).as_mut_ptr::<u8>();
+            let dst = base.add(phdr.p_vaddr as usize) as *mut u8;
             let src = &data[phdr.p_offset as usize..][..phdr.p_filesz as usize];
             unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), dst, phdr.p_filesz as usize); }
         }
@@ -1010,12 +989,12 @@ pub fn load_shared_lib(data: &[u8]) -> Result<(LoadedLib, u64, u64), &'static st
     let mut gnu_hash_vaddr = 0u64;
     for phdr in segments.iter() {
         if phdr.p_type == PT_DYNAMIC {
-            let dyn_start = base_kern + phdr.p_vaddr;
+            let dyn_start = unsafe { base.add(phdr.p_vaddr as usize) };
             let dyn_size = phdr.p_filesz as usize;
-            let mut offset = 0;
-            while offset + 16 <= dyn_size {
-                let d_tag = unsafe { dyn_start.read_at::<i64>(offset) };
-                let d_val = unsafe { dyn_start.read_at::<u64>(offset + 8) };
+            let mut off = 0;
+            while off + 16 <= dyn_size {
+                let d_tag = unsafe { ptr::read_unaligned(dyn_start.add(off) as *const i64) };
+                let d_val = unsafe { ptr::read_unaligned(dyn_start.add(off + 8) as *const u64) };
                 match d_tag {
                     DT_SYMTAB => symtab_vaddr = d_val,
                     DT_STRTAB => strtab_vaddr = d_val,
@@ -1028,14 +1007,13 @@ pub fn load_shared_lib(data: &[u8]) -> Result<(LoadedLib, u64, u64), &'static st
                     DT_NULL => break,
                     _ => {}
                 }
-                offset += 16;
+                off += 16;
             }
         }
     }
 
-    // Count .dynsym entries from GNU hash (avoids parsing section headers)
     let sym_count = if gnu_hash_vaddr != 0 {
-        gnu_hash_sym_count(base_kern + gnu_hash_vaddr)
+        gnu_hash_sym_count(unsafe { base.add(gnu_hash_vaddr as usize) })
     } else {
         let mut count = 0;
         if let Some(shdrs) = elf.section_headers() {
@@ -1049,32 +1027,34 @@ pub fn load_shared_lib(data: &[u8]) -> Result<(LoadedLib, u64, u64), &'static st
         count
     };
 
-    let dynsym = base_kern + symtab_vaddr;
-    let dynstr = base_kern + strtab_vaddr;
+    let dynsym = unsafe { base.add(symtab_vaddr as usize) };
+    let dynstr = unsafe { base.add(strtab_vaddr as usize) };
 
     // Apply R_X86_64_RELATIVE relocations
+    let base_phys = DirectMap::phys_of(base.add(vaddr_min as usize));
     let mut reloc_count = 0u64;
-    for &(rela_start, rela_sz) in &[(base_kern + rela_vaddr, rela_size), (base_kern + jmprel_vaddr, jmprel_size)] {
+    for &(rela_start, rela_sz) in &[(rela_vaddr, rela_size), (jmprel_vaddr, jmprel_size)] {
         if rela_sz == 0 { continue; }
+        let rela_ptr = unsafe { base.add(rela_start as usize) };
         for i in 0..rela_sz / RELA_SIZE {
-            let rela = unsafe { (rela_start + i * RELA_SIZE).read_at::<Elf64Rela>(0) };
+            let rela = unsafe { ptr::read_unaligned(rela_ptr.add((i * RELA_SIZE) as usize) as *const Elf64Rela) };
             if rela.r_type() == R_X86_64_RELATIVE {
-                let target = base_kern + rela.r_offset;
-                let value = (base_phys.raw() as i64 + rela.r_addend) as u64;
-                unsafe { target.as_mut_ptr::<u64>().write_unaligned(value); }
+                let target = unsafe { base.add(rela.r_offset as usize) as *mut u64 };
+                let value = (base_phys as i64 + rela.r_addend) as u64;
+                unsafe { target.write_unaligned(value); }
                 reloc_count += 1;
             }
         }
     }
 
-    // Parse PT_TLS for thread-local storage
-    let mut tls_template = DirectMap::null();
+    // Parse PT_TLS
+    let mut tls_template: *const u8 = ptr::null();
     let mut tls_filesz = 0usize;
     let mut tls_memsz = 0usize;
     let mut tls_align = 0usize;
     for phdr in segments.iter() {
         if phdr.p_type == PT_TLS {
-            tls_template = base_kern + phdr.p_vaddr;
+            tls_template = unsafe { base.add(phdr.p_vaddr as usize) };
             tls_filesz = phdr.p_filesz as usize;
             tls_memsz = phdr.p_memsz as usize;
             tls_align = phdr.p_align as usize;
@@ -1083,18 +1063,17 @@ pub fn load_shared_lib(data: &[u8]) -> Result<(LoadedLib, u64, u64), &'static st
 
     let t4 = crate::clock::nanos_since_boot();
     log!("dlopen: base={:#x} {}MB alloc={}ms zero={}ms copy={}ms reloc={}ms ({} relocs, {} syms)",
-        base_phys.raw(), load_size / (1024*1024),
+        base_phys, load_size / (1024*1024),
         (t1 - t0) / 1_000_000, (t2 - t1) / 1_000_000, (t3 - t2) / 1_000_000,
         (t4 - t3) / 1_000_000, reloc_count, sym_count);
 
-    let rela_addr = if rela_size > 0 { base_kern + rela_vaddr } else { DirectMap::null() };
-    let jmprel_addr = if jmprel_size > 0 { base_kern + jmprel_vaddr } else { DirectMap::null() };
-    let gnu_hash = if gnu_hash_vaddr != 0 { base_kern + gnu_hash_vaddr } else { DirectMap::null() };
+    let rela_addr: *const u8 = if rela_size > 0 { unsafe { base.add(rela_vaddr as usize) } } else { ptr::null() };
+    let jmprel_addr: *const u8 = if jmprel_size > 0 { unsafe { base.add(jmprel_vaddr as usize) } } else { ptr::null() };
+    let gnu_hash: *const u8 = if gnu_hash_vaddr != 0 { unsafe { base.add(gnu_hash_vaddr as usize) } } else { ptr::null() };
 
-    // SAFETY: all bytes written (zeroed + PT_LOAD segments copied + RELATIVE relocs applied).
     let alloc = unsafe { uninit_alloc.assume_zeroed() };
 
-    Ok((LoadedLib { memory: LibMemory::Owned(alloc), user_base: UserAddr::new(base_phys.raw()), phys_base: base_phys,
+    Ok((LoadedLib { memory: LibMemory::Owned(alloc), user_base: UserAddr::new(base_phys), phys_base: base_phys,
         dynsym, dynstr, dynstr_size: strtab_size, sym_count,
         tls_template, tls_filesz, tls_memsz, tls_align,
         rela_addr, rela_size, jmprel_addr, jmprel_size, gnu_hash,
@@ -1104,14 +1083,14 @@ pub fn load_shared_lib(data: &[u8]) -> Result<(LoadedLib, u64, u64), &'static st
 /// Rebase all R_X86_64_RELATIVE relocation entries by adding `delta` to each value.
 /// Called after user_base is assigned (differs from phys_base used during load_shared_lib).
 pub fn rebase_relative_relocs(lib: &LoadedLib, delta: i64) {
-    let base_kern = lib.phys_base.to_kernel();
-    for &(rela_start, rela_sz) in &[(lib.rela_addr, lib.rela_size), (lib.jmprel_addr, lib.jmprel_size)] {
-        if rela_start.is_null() || rela_sz == 0 { continue; }
+    let base = DirectMap::from_phys(lib.phys_base).as_ptr::<u8>();
+    for &(rela_ptr, rela_sz) in &[(lib.rela_addr, lib.rela_size), (lib.jmprel_addr, lib.jmprel_size)] {
+        if rela_ptr.is_null() || rela_sz == 0 { continue; }
         for i in 0..rela_sz / RELA_SIZE as u64 {
-            let rela = unsafe { (rela_start + i * RELA_SIZE as u64).read_at::<Elf64Rela>(0) };
+            let rela = unsafe { ptr::read_unaligned(rela_ptr.add((i * RELA_SIZE) as usize) as *const Elf64Rela) };
             if rela.r_type() == R_X86_64_RELATIVE {
-                let target = base_kern + rela.r_offset;
-                let old_value = unsafe { target.as_ptr::<u64>().read_unaligned() };
+                let target = unsafe { base.add(rela.r_offset as usize) as *const u64 };
+                let old_value = unsafe { target.read_unaligned() };
                 let new_value = (old_value as i64 + delta) as u64;
                 unsafe { lib.write_at::<u64>(rela.r_offset, new_value); }
             }
@@ -1226,7 +1205,7 @@ fn resolve_lib_bind_relocs(
 #[derive(Clone)]
 pub struct TlsModule {
     /// Kernel pointer to the TLS template data (initial values).
-    pub template: DirectMap,
+    pub template: *const u8,
     /// Size of initialized TLS data (copied from template).
     pub filesz: usize,
     /// Total TLS size including BSS (zeroed beyond filesz).

@@ -103,7 +103,7 @@ impl Pipe {
         let ptr = unsafe { alloc_zeroed(layout) };
         assert!(!ptr.is_null(), "pipe: allocation failed");
         RingHeader::init(ptr, PIPE_SIZE);
-        Self { phys_addr: DirectMap::new(DirectMap::phys_of(ptr)), layout, readers: 0, writers: 0, io_uring_watchers: Vec::new() }
+        Self { phys_addr: DirectMap::from_ptr(ptr), layout, readers: 0, writers: 0, io_uring_watchers: Vec::new() }
     }
 
     fn header(&self) -> &RingHeader {

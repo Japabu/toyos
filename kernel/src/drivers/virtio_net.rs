@@ -264,10 +264,10 @@ pub fn init(ecam: &crate::mm::Mmio) {
     // Register DMA buffers as shared memory for direct userland access.
     // All RX buffers are contiguous in the DMA pool, so register as one region.
     let rx_token = shared_memory::register(
-        crate::DirectMap::new(rx_phys[0]),
+        crate::DirectMap::from_phys(rx_phys[0]),
         (RX_BUF_COUNT * RX_BUF_SIZE as usize) as u64,
     ).raw();
-    let tx_token = shared_memory::register(crate::DirectMap::new(tx_phys), 4096).raw();
+    let tx_token = shared_memory::register(crate::DirectMap::from_phys(tx_phys), 4096).raw();
 
     crate::net::set_nic_info(NicInfo {
         rx_buf_token: rx_token,

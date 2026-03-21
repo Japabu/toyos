@@ -2,8 +2,10 @@ pub mod pmm;
 pub mod paging;
 mod alloc;
 mod mmio;
+mod region;
 
 pub use mmio::Mmio;
+pub use region::KernelSlice;
 
 use crate::MemoryMapEntry;
 pub use pmm::Region;
@@ -67,7 +69,7 @@ impl core::fmt::LowerHex for UserAddr {
     }
 }
 
-/// Physical address for DMA device access. Only constructable from PhysPage.
+/// Physical address for DMA device access.
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(transparent)]
 pub struct DmaAddr(u64);
@@ -87,15 +89,13 @@ impl core::fmt::Debug for DmaAddr {
     }
 }
 
-/// Physical address accessed through the kernel direct map.
-/// Not an ownership token — just a safe conversion from physical to virtual.
-/// Use for bootloader-provided addresses, ACPI tables, and other fixed
-/// physical memory that needs to be read/written by the kernel.
+/// Converts between physical addresses and kernel virtual pointers.
+/// Use at the boundary between physical and virtual — not for storing pointers.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DirectMap(u64);
 
 impl DirectMap {
-    pub fn new(phys: u64) -> Self { Self(phys) }
+    pub fn from_phys(phys: u64) -> Self { Self(phys) }
 
     /// Wrap a kernel direct-map pointer as a DirectMap.
     pub fn from_ptr<T>(ptr: *const T) -> Self {
@@ -129,9 +129,8 @@ impl core::fmt::Debug for DirectMap {
 /// Initialize the memory subsystem. Call once at boot.
 /// Order: pmm (physical pages) → paging (direct map) → alloc (heap).
 pub fn init(memory_map: &[MemoryMapEntry], reserved: &[Region]) {
-    alloc::init_early(); // enable early bump allocator for paging::init
+    alloc::init_early();
     pmm::init(memory_map, reserved);
     paging::init(memory_map);
-    alloc::init(); // switch to dlmalloc
+    alloc::init();
 }
-

@@ -134,7 +134,7 @@ static SLP_TYPA: AtomicU16 = AtomicU16::new(0);
 
 /// Given the RSDP address from UEFI, parse XSDT -> MCFG -> return ECAM base address.
 pub fn find_ecam_base(rsdp_addr: u64) -> Option<u64> {
-    let rsdp = DirectMap::new(rsdp_addr);
+    let rsdp = DirectMap::from_phys(rsdp_addr);
     log!("ACPI: RSDP at {:#x}", rsdp_addr);
 
     let xsdt = get_xsdt(rsdp);
@@ -152,7 +152,7 @@ pub fn find_ecam_base(rsdp_addr: u64) -> Option<u64> {
 
 /// Parse FADT and DSDT to prepare for ACPI shutdown.
 pub fn init_power(rsdp_addr: u64) {
-    let xsdt = get_xsdt(DirectMap::new(rsdp_addr));
+    let xsdt = get_xsdt(DirectMap::from_phys(rsdp_addr));
 
     let fadt_phys = find_table(xsdt, b"FACP").expect("ACPI: FADT not found");
     let fadt = unsafe { &*fadt_phys.as_ptr::<Fadt>() };
@@ -167,7 +167,7 @@ pub fn init_power(rsdp_addr: u64) {
         fadt.dsdt as u64
     };
     assert!(dsdt_addr != 0, "ACPI: DSDT not found");
-    let dsdt_phys = DirectMap::new(dsdt_addr);
+    let dsdt_phys = DirectMap::from_phys(dsdt_addr);
 
     let dsdt = dsdt_phys.as_ptr::<SdtHeader>();
     let dsdt_len = unsafe { read_unaligned(&raw const (*dsdt).length) } as usize;
@@ -193,7 +193,7 @@ pub fn shutdown() -> ! {
 /// Read XSDT physical address from RSDP.
 fn get_xsdt(rsdp_addr: DirectMap) -> DirectMap {
     let rsdp = unsafe { &*rsdp_addr.as_ptr::<Rsdp>() };
-    DirectMap::new(rsdp.xsdt_address)
+    DirectMap::from_phys(rsdp.xsdt_address)
 }
 
 /// Iterate XSDT entries looking for a table with the given 4-byte signature.
@@ -206,7 +206,7 @@ fn find_table(xsdt: DirectMap, signature: &[u8; 4]) -> Option<DirectMap> {
     let entries_base = unsafe { xsdt.as_ptr::<u8>().add(size_of::<SdtHeader>()) } as *const u64;
 
     for i in 0..entry_count {
-        let table_phys = DirectMap::new(unsafe { read_unaligned(entries_base.add(i)) });
+        let table_phys = DirectMap::from_phys(unsafe { read_unaligned(entries_base.add(i)) });
         let table_header = unsafe { &*table_phys.as_ptr::<SdtHeader>() };
 
         if &table_header.signature == signature {
@@ -219,7 +219,7 @@ fn find_table(xsdt: DirectMap, signature: &[u8; 4]) -> Option<DirectMap> {
 
 /// Given the RSDP address, parse XSDT -> HPET table -> return HPET MMIO base address.
 pub fn find_hpet_base(rsdp_addr: u64) -> Option<u64> {
-    let xsdt = get_xsdt(DirectMap::new(rsdp_addr));
+    let xsdt = get_xsdt(DirectMap::from_phys(rsdp_addr));
     let hpet_phys = find_table(xsdt, b"HPET")?;
     let hpet = unsafe { &*hpet_phys.as_ptr::<HpetTable>() };
     let base = hpet.base_address_value;
@@ -229,7 +229,7 @@ pub fn find_hpet_base(rsdp_addr: u64) -> Option<u64> {
 
 /// Parse MADT (signature "APIC") to discover Local APIC address and per-CPU APIC IDs.
 pub fn parse_madt(rsdp_addr: u64) -> Option<MadtInfo> {
-    let xsdt = get_xsdt(DirectMap::new(rsdp_addr));
+    let xsdt = get_xsdt(DirectMap::from_phys(rsdp_addr));
     let madt_phys = find_table(xsdt, b"APIC")?;
     let madt = unsafe { &*madt_phys.as_ptr::<Madt>() };
 
