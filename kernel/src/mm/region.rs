@@ -1,6 +1,6 @@
 /// Bounds-checked view into a contiguous kernel memory region.
 /// Like Mmio but for RAM — prevents out-of-bounds reads/writes.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct KernelSlice {
     base: *mut u8,
     size: usize,
