@@ -5,7 +5,7 @@ use core::alloc::Layout;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::mm::{PAGE_2M, align_2m};
-use crate::process::{AddressSpace, Pid};
+use crate::process::{PageTables, Pid};
 use crate::sync::Lock;
 use crate::{DirectMap, UserAddr};
 
@@ -72,27 +72,27 @@ struct SharedRegion {
     vaddr: UserAddr,
     ownership: Ownership,
     allowed: Vec<Pid>,
-    mapped_in: Vec<(Pid, Arc<AddressSpace>)>,
+    mapped_in: Vec<(Pid, PageTables)>,
 }
 
 impl SharedRegion {
-    fn map_into(&mut self, pid: Pid, addr_space: &Arc<AddressSpace>) {
+    fn map_into(&mut self, pid: Pid, pt: &PageTables) {
         if !self.mapped_in.iter().any(|(p, _)| *p == pid) {
-            addr_space.map_at(self.vaddr, self.phys, self.size);
-            self.mapped_in.push((pid, Arc::clone(addr_space)));
+            pt.lock().map_range(self.vaddr, self.phys.phys(), self.size, true);
+            self.mapped_in.push((pid, Arc::clone(pt)));
         }
     }
 
     fn unmap_from(&mut self, pid: Pid) {
         if let Some(pos) = self.mapped_in.iter().position(|(p, _)| *p == pid) {
-            let (_, addr_space) = self.mapped_in.swap_remove(pos);
-            addr_space.unmap_at(self.vaddr, self.size);
+            let (_, pt) = self.mapped_in.swap_remove(pos);
+            pt.lock().unmap_range(self.vaddr, self.size);
         }
     }
 
     fn unmap_all(&self) {
-        for (_, addr_space) in &self.mapped_in {
-            addr_space.unmap_at(self.vaddr, self.size);
+        for (_, pt) in &self.mapped_in {
+            pt.lock().unmap_range(self.vaddr, self.size);
         }
     }
 }
@@ -124,7 +124,7 @@ fn next_token() -> SharedToken {
 /// Allocate 2MB-aligned shared memory. Maps it into the owner's page tables.
 /// Returns a token; other processes can map it via `map()` after `grant()`.
 #[must_use]
-pub fn alloc(size: u64, owner_pid: Pid, addr_space: &Arc<AddressSpace>) -> SharedToken {
+pub fn alloc(size: u64, owner_pid: Pid, addr_space: &PageTables) -> SharedToken {
     let aligned_size = align_2m(size as usize);
     let layout = Layout::from_size_align(aligned_size, PAGE_2M as usize).unwrap();
     let ptr = unsafe { alloc_zeroed(layout) };
@@ -211,7 +211,7 @@ pub fn grant_kernel(token: SharedToken, target: Pid) -> Result<(), Error> {
 
 /// Map a shared region into the caller's address space.
 /// Returns the userland virtual address.
-pub fn map(token: SharedToken, pid: Pid, addr_space: &Arc<AddressSpace>) -> Result<u64, Error> {
+pub fn map(token: SharedToken, pid: Pid, addr_space: &PageTables) -> Result<u64, Error> {
     with_regions_mut(|regions| {
         let (_, region) = regions.iter_mut().find(|(t, _)| *t == token)
             .ok_or(Error::NotFound)?;

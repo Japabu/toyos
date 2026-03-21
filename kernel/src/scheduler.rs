@@ -1,6 +1,5 @@
 use core::arch::{asm, naked_asm};
 use alloc::collections::BTreeMap;
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use hashbrown::HashMap;
@@ -8,7 +7,7 @@ use hashbrown::HashMap;
 use crate::arch::{cpu, percpu};
 use crate::io_uring::RingId;
 use crate::pipe::PipeId;
-use crate::process::{self, AddressSpace, IdleProof, OwnedAlloc, Pid, Tid, KERNEL_STACK_SIZE};
+use crate::process::{self, IdleProof, OwnedAlloc, PageTables, Pid, Tid, KERNEL_STACK_SIZE};
 use crate::sync::Lock;
 use crate::DirectMap;
 
@@ -115,7 +114,7 @@ pub struct ThreadCtx {
     pub process: Pid,
     pub kernel_stack: OwnedAlloc,
     pub kernel_rsp: u64,
-    pub address_space: Option<Arc<AddressSpace>>,
+    pub address_space: Option<PageTables>,
     pub fs_base: u64,
     pub cpu_ns: u64,
     pub scheduled_at: u64,
@@ -129,8 +128,8 @@ impl ThreadCtx {
         self.kernel_stack.ptr() as u64 + KERNEL_STACK_SIZE as u64
     }
 
-    pub fn cr3(&self) -> DirectMap {
-        unsafe { self.address_space.as_ref().unwrap().cr3_value() }
+    pub fn cr3(&self) -> u64 {
+        self.address_space.as_ref().unwrap().lock().cr3()
     }
 
     pub fn stop_cpu_timer(&mut self, now: u64) {
@@ -593,7 +592,7 @@ pub fn remove_thread(tid: Tid) -> Option<ThreadCtx> {
     None
 }
 
-pub fn current_address_space() -> Option<Arc<AddressSpace>> {
+pub fn current_address_space() -> Option<PageTables> {
     let cpu = percpu::cpu_id() as usize;
     let q = SCHEDULER.lock_cpu(cpu);
     q.current().and_then(|ctx| ctx.address_space.clone())
@@ -753,7 +752,7 @@ fn do_schedule(reason: SwitchReason) {
         let old_rsp_ptr = queue.save_rsp_ptr();
         percpu::set_current_tid(Some(new_tid));
         unsafe { percpu::set_kernel_stack(new_ks_top); }
-        unsafe { cpu::write_cr3(new_cr3.raw()); }
+        unsafe { cpu::write_cr3(new_cr3); }
         cpu::wrmsr(IA32_FS_BASE, new_fs_base);
 
         queue.into_raw();
@@ -839,7 +838,7 @@ fn cpu_idle_loop() -> ! {
 
                 percpu::set_current_tid(Some(new_tid));
                 unsafe { percpu::set_kernel_stack(new_ks_top); }
-                        unsafe { cpu::write_cr3(new_cr3.raw()); }
+                        unsafe { cpu::write_cr3(new_cr3); }
                 cpu::wrmsr(IA32_FS_BASE, new_fs_base);
 
                 queue.into_raw();

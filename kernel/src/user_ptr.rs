@@ -42,14 +42,15 @@ fn check_user_range(ptr: UserAddr, size: u64) -> bool {
 /// Translate a user virtual address to a kernel-accessible pointer via
 /// page table walk + direct map. Triggers demand paging if needed.
 fn translate(user_addr: u64) -> Option<*mut u8> {
-    let addr_space = crate::process::current_address_space();
-    if let Some(dm) = addr_space.virt_to_phys(UserAddr::new(user_addr)) {
+    let pt = crate::process::current_address_space();
+    if let Some(dm) = pt.lock().translate(UserAddr::new(user_addr)) {
         return Some(dm.as_mut_ptr());
     }
     if !crate::process::handle_page_fault(user_addr, 0) {
         return None;
     }
-    addr_space.virt_to_phys(UserAddr::new(user_addr)).map(|dm| dm.as_mut_ptr())
+    let result = pt.lock().translate(UserAddr::new(user_addr)).map(|dm| dm.as_mut_ptr());
+    result
 }
 
 

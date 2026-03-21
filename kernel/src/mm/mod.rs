@@ -103,7 +103,7 @@ impl DirectMap {
     }
 
     /// The raw physical address.
-    pub fn raw(self) -> u64 { self.0 }
+    pub fn phys(self) -> u64 { self.0 }
 
     pub fn as_ptr<T>(&self) -> *const T { (self.0 + PHYS_OFFSET) as *const T }
     pub fn as_mut_ptr<T>(&self) -> *mut T { (self.0 + PHYS_OFFSET) as *mut T }

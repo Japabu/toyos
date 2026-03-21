@@ -4,7 +4,6 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::arch::naked_asm;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicBool, Ordering};
 use crate::arch::{cpu, percpu};
 use crate::mm::PAGE_2M;
 use crate::fd::{self, Descriptor, FdTable};
@@ -27,127 +26,21 @@ impl crate::id_map::IdKey for Pid {
     const ONE: Self = Pid(1);
 }
 
-// ---------------------------------------------------------------------------
-// AddressSpace — reference-counted PML4 page tables
-// ---------------------------------------------------------------------------
+/// Page tables shared between a process and all its threads.
+pub type PageTables = Arc<Lock<crate::mm::paging::AddressSpace>>;
 
-/// Physical address of a PML4 page table. Private, non-Copy — only accessible
-/// through AddressSpace. This makes dangling page table pointers impossible:
-/// you must hold an Arc<AddressSpace> to access page tables.
-struct PageTableRoot(DirectMap);
-
-impl PageTableRoot {
-    fn new(addr: DirectMap) -> Self { Self(addr) }
-    fn phys(&self) -> DirectMap { self.0 }
-    fn as_ptr(&self) -> *mut u64 { self.0.as_mut_ptr() }
-}
-
-/// Proof that a virtual address range is both allocated in the VmaList and
-/// mapped in the page tables. Created by `AddressSpace::map_region` /
-/// `map_stack` and consumed by `unmap_region`.
-pub struct MappedRegion {
-    vaddr: UserAddr,
+/// Allocate a VMA region and map physical memory into it.
+/// Returns the allocated virtual address, or None if out of address space.
+pub fn vma_map(
+    vmas: &mut crate::vma::VmaList,
+    pt: &Lock<crate::mm::paging::AddressSpace>,
+    phys: u64,
     size: u64,
-}
-
-impl MappedRegion {
-    pub fn vaddr(&self) -> UserAddr { self.vaddr }
-    pub fn size(&self) -> u64 { self.size }
-
-    /// Create a MappedRegion for a fixed-address mapping (main thread stack).
-    /// Only used by kernel internals that manage fixed addresses directly.
-    #[allow(dead_code)]
-    pub(crate) fn fixed(vaddr: UserAddr, size: u64) -> Self {
-        Self { vaddr, size }
-    }
-}
-
-/// Reference-counted address space. Wraps a PML4 page table and frees it when
-/// the last reference drops. Shared between a process and all its threads via Arc.
-pub struct AddressSpace {
-    root: PageTableRoot,
-    dead: AtomicBool,
-}
-
-// SAFETY: AddressSpace points to a PML4 page table in physical memory.
-// Page tables are hardware structures shared across CPUs.
-unsafe impl Send for AddressSpace {}
-unsafe impl Sync for AddressSpace {}
-
-impl AddressSpace {
-    pub fn new(addr: DirectMap) -> Arc<Self> {
-        Arc::new(Self { root: PageTableRoot::new(addr), dead: AtomicBool::new(false) })
-    }
-
-    pub fn is_dead(&self) -> bool { self.dead.load(Ordering::Acquire) }
-    pub fn mark_dead(&self) { self.dead.store(true, Ordering::Release); }
-
-    /// Raw CR3 value for hardware register writes.
-    /// SAFETY: Caller must hold Arc<AddressSpace> for the duration of the CR3 load.
-    pub unsafe fn cr3_value(&self) -> DirectMap { self.root.phys() }
-
-    // --- Public API: VmaList-managed allocations (for syscall code) ---
-
-    /// Allocate a virtual address range and map physical memory. One operation.
-    /// Returns `None` if the virtual address space is exhausted.
-    pub fn map_region(&self, vmas: &mut crate::vma::VmaList, phys: DirectMap, size: u64) -> Option<MappedRegion> {
-        let vaddr = vmas.alloc_region(size).ok()?;
-        let aligned = crate::mm::align_2m(size as usize) as u64;
-        paging::map_user_at(self.root.as_ptr(), vaddr, phys, aligned);
-        Some(MappedRegion { vaddr, size: aligned })
-    }
-
-    /// Allocate a stack region with guard pages on both sides and map it.
-    /// Returns `None` if the virtual address space is exhausted.
-    #[allow(dead_code)]
-    pub fn map_stack(&self, vmas: &mut crate::vma::VmaList, phys: DirectMap, size: u64) -> Option<MappedRegion> {
-        let vaddr = vmas.alloc_stack(size).ok()?;
-        let aligned = crate::mm::align_2m(size as usize) as u64;
-        paging::map_user_at(self.root.as_ptr(), vaddr, phys, aligned);
-        Some(MappedRegion { vaddr, size: aligned })
-    }
-
-    /// Unmap and free a VmaList-managed region.
-    #[allow(dead_code)]
-    pub fn unmap_region(&self, vmas: &mut crate::vma::VmaList, region: MappedRegion) {
-        paging::unmap_user_at(self.root.as_ptr(), region.vaddr, region.size);
-        vmas.free_region(region.vaddr);
-    }
-
-    // --- Restricted API: for kernel internals only (process.rs, shared_memory, paging) ---
-
-    /// Map at a fixed virtual address. Used for main thread stack, shared memory,
-    /// and demand paging. Not available to syscall handlers.
-    pub(crate) fn map_at(&self, vaddr: UserAddr, phys: DirectMap, size: u64) {
-        paging::map_user_at(self.root.as_ptr(), vaddr, phys, size);
-    }
-
-    /// Unmap at a fixed virtual address. Used for shared memory teardown and
-    /// demand page cleanup. Not available to syscall handlers.
-    pub(crate) fn unmap_at(&self, vaddr: UserAddr, size: u64) {
-        paging::unmap_user_at(self.root.as_ptr(), vaddr, size);
-    }
-
-    /// Remap a single 2MB page (demand paging, MAP_FIXED).
-    pub fn remap_2m(&self, vaddr: UserAddr, phys: DirectMap, writable: bool) -> bool {
-        paging::remap_user_2m(self.root.as_ptr(), vaddr, phys, writable)
-    }
-
-    /// Clear a single 2MB PDE (unmap one page).
-    pub fn clear_2m(&self, vaddr: UserAddr) {
-        paging::clear_user_2m(self.root.as_ptr(), vaddr);
-    }
-
-    /// Translate virtual to physical by walking page tables.
-    pub fn virt_to_phys(&self, vaddr: UserAddr) -> Option<DirectMap> {
-        paging::virt_to_phys(self.root.as_ptr() as *const u64, vaddr)
-    }
-}
-
-impl Drop for AddressSpace {
-    fn drop(&mut self) {
-        paging::free_user_page_tables(self.root.as_ptr());
-    }
+) -> Option<(UserAddr, u64)> {
+    let aligned = crate::mm::align_2m(size as usize) as u64;
+    let vaddr = vmas.alloc_region(aligned).ok()?;
+    pt.lock().map_range(vaddr, phys, aligned, true);
+    Some((vaddr, aligned))
 }
 
 // ---------------------------------------------------------------------------
@@ -264,7 +157,7 @@ impl UserStack {
         let offset = user_addr.checked_sub(self.vaddr.raw())
             .expect("UserStack: address below stack base");
         assert!(offset < self.size, "UserStack: address above stack top");
-        (self.phys + offset).as_mut_ptr::<u8>()
+        DirectMap::from_phys(self.phys.phys() + offset).as_mut_ptr::<u8>()
     }
 
     /// Write argc, argv pointers, and string data onto this stack.
@@ -474,8 +367,7 @@ pub struct ProcessData {
     pub elf_alloc: Option<OwnedAlloc>,
     pub stack_alloc: Option<OwnedAlloc>,
     // Thread-local storage
-    pub tls_template: DirectMap,
-    pub tls_filesz: usize,
+    pub tls_template: Option<crate::mm::KernelSlice>,
     pub tls_memsz: usize,
     pub tls_alloc: Option<OwnedAlloc>,
     /// Multi-module TLS layout per loaded library.
@@ -713,7 +605,7 @@ pub fn with_current_sched<R>(f: impl FnOnce(&SchedEntry) -> R) -> R {
     f(table.get(current_tid()).unwrap())
 }
 
-pub fn current_address_space() -> Arc<AddressSpace> {
+pub fn current_address_space() -> PageTables {
     scheduler::current_address_space().expect("current_address_space: no address space")
 }
 
@@ -769,8 +661,8 @@ pub fn with_fd_owner_data<R>(f: impl FnOnce(&mut ProcessData) -> R) -> R {
 /// [TLS data (.tdata + .tbss)] [TCB: self-pointer]
 ///                              ^-- FS base (thread pointer)
 /// Returns (alloc, fs_base).
-pub fn setup_tls(tls_template: DirectMap, tls_filesz: usize, tls_memsz: usize, tls_align: usize) -> Option<(OwnedAlloc, u64)> {
-    setup_combined_tls(&[elf::TlsModule { template: tls_template, filesz: tls_filesz, memsz: tls_memsz, base_offset: 0, module_id: 1, is_static: true }], tls_memsz, tls_align)
+pub fn setup_tls(tls_template: Option<crate::mm::KernelSlice>, tls_memsz: usize, tls_align: usize) -> Option<(OwnedAlloc, u64)> {
+    setup_combined_tls(&[elf::TlsModule { template: tls_template, memsz: tls_memsz, base_offset: 0, module_id: 1, is_static: true }], tls_memsz, tls_align)
 }
 
 /// Allocate a combined TLS area for multiple modules (exe + shared libraries).
@@ -823,19 +715,19 @@ pub fn setup_combined_tls(
 
     for module in modules {
         if !module.is_static { continue; }
-        if module.filesz > 0 && !module.template.is_null() {
+        if let Some(template) = &module.template {
             unsafe {
                 core::ptr::copy_nonoverlapping(
-                    module.template.as_ptr::<u8>(),
+                    template.base(),
                     block.add(tls_start + module.base_offset),
-                    module.filesz,
+                    template.size(),
                 );
             }
         }
     }
 
     // TP must be a user-visible physical address (mapped with USER bit in user page tables).
-    let block_phys = DirectMap::from_ptr(block).raw();
+    let block_phys = DirectMap::from_ptr(block).phys();
     let tp_user = block_phys + (tls_start + total_memsz) as u64;
     // Write self-pointer via kernel direct map
     let tp_kernel = block as u64 + (tls_start + total_memsz) as u64;
@@ -975,9 +867,9 @@ pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64, stack_base: u64) -> Op
         let addr_space = scheduler::current_address_space();
         (addr_space, parent.process(), Arc::clone(parent.data()))
     };
-    let (tls_template, tls_filesz, tls_memsz, tls_modules, tls_total_memsz, tls_max_align, parent_cwd) = {
+    let (tls_template, tls_memsz, tls_modules, tls_total_memsz, tls_max_align, parent_cwd) = {
         let data = data_arc.lock();
-        (data.tls_template, data.tls_filesz, data.tls_memsz,
+        (data.tls_template, data.tls_memsz,
          data.tls_modules.clone(), data.tls_total_memsz, data.tls_max_align, data.cwd.clone())
     };
 
@@ -985,24 +877,25 @@ pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64, stack_base: u64) -> Op
     let (tls_alloc, fs_base) = if !tls_modules.is_empty() {
         setup_combined_tls(&tls_modules, tls_total_memsz, tls_max_align)?
     } else {
-        setup_tls(tls_template, tls_filesz, tls_memsz, tls_max_align)?
+        setup_tls(tls_template, tls_memsz, tls_max_align)?
     };
     let fs_base = {
         let addr_space = parent_addr_space.as_ref().expect("spawn_thread: no address space");
         let mut parent_data = data_arc.lock();
-        let tls_phys = DirectMap::from_ptr(tls_alloc.ptr());
-        let tls_region = addr_space.map_region(&mut parent_data.vmas, tls_phys, tls_alloc.size() as u64)
+        let tls_phys = DirectMap::phys_of(tls_alloc.ptr());
+        let (tls_vaddr, _) = vma_map(&mut parent_data.vmas, addr_space, tls_phys, tls_alloc.size() as u64)
             .expect("spawn_thread: out of virtual address space");
         // Rebase fs_base and internal TLS pointers from physical to virtual
-        let tls_rebase = tls_region.vaddr().raw() as i64 - tls_phys.raw() as i64;
+        let tls_rebase = tls_vaddr.raw() as i64 - tls_phys as i64;
         let fs_base = (fs_base as i64 + tls_rebase) as u64;
         unsafe {
-            let tp_kern = tls_phys.as_mut_ptr::<u8>().add((fs_base - tls_region.vaddr().raw()) as usize);
+            let tls_base_ptr = DirectMap::from_phys(tls_phys).as_mut_ptr::<u8>();
+            let tp_kern = tls_base_ptr.add((fs_base - tls_vaddr.raw()) as usize);
             let self_ptr = tp_kern as *mut u64;
             *self_ptr = fs_base;
             let dtv_phys = *self_ptr.add(1);
             *self_ptr.add(1) = (dtv_phys as i64 + tls_rebase) as u64;
-            let dtv_kern = tls_phys.as_mut_ptr::<u64>();
+            let dtv_kern = tls_base_ptr as *mut u64;
             let dtv_len = *dtv_kern.add(1) as usize;
             for i in 0..dtv_len {
                 let entry = *dtv_kern.add(2 + i);
@@ -1032,7 +925,6 @@ pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64, stack_base: u64) -> Op
         elf_alloc: None,
         stack_alloc: None,
         tls_template,
-        tls_filesz,
         tls_memsz,
         tls_alloc: Some(tls_alloc),
         tls_modules,
@@ -1181,12 +1073,12 @@ fn resolve_exe_tpoff(
     if sym_data.len() < elf::SYM_SIZE {
         return exe_base_offset as i64 + r_addend - total_memsz as i64;
     }
-    let sym = elf::Elf64Sym::from_slice(&sym_data, 0);
+    let sym = elf::read_sym(&sym_data, 0);
 
     if sym.st_shndx != 0 {
         exe_base_offset as i64 + sym.st_value as i64 + r_addend - total_memsz as i64
     } else {
-        let sym_name = sym.name(dynstr_data);
+        let sym_name = elf::sym_name(&sym, dynstr_data);
 
         // Search loaded libraries for the defining TLS symbol
         for lib in tls_info.libs {
@@ -1261,7 +1153,7 @@ fn build_tls_layout(
             let mid = next_module_id;
             next_module_id += 1;
             modules.push(elf::TlsModule {
-                template: lib.tls_template, filesz: lib.tls_filesz,
+                template: lib.tls_template,
                 memsz: lib.tls_memsz, base_offset: cursor, module_id: mid,
                 is_static: true,
             });
@@ -1272,11 +1164,10 @@ fn build_tls_layout(
 
     if layout.tls_memsz > 0 {
         if cursor > 0 { cursor = (cursor + 15) & !15; }
-        let template_addr = exe_tls_template
-            .map(|buf| DirectMap::from_ptr(buf.ptr()))
-            .unwrap_or(DirectMap::null());
+        let template = exe_tls_template
+            .map(|buf| unsafe { crate::mm::KernelSlice::from_raw(buf.ptr(), layout.tls_filesz) });
         modules.push(elf::TlsModule {
-            template: template_addr, filesz: layout.tls_filesz,
+            template,
             memsz: layout.tls_memsz, base_offset: cursor, module_id: 1,
             is_static: true,
         });
@@ -1415,7 +1306,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
                 Ok((lib, rw_vaddr, rw_end_vaddr)) => {
                     let t_load2 = crate::clock::nanos_since_boot();
                     log!("dynamic: loaded {} base={:#x} ({} syms, read={}ms load={}ms)",
-                        lib_name, lib.phys_base.raw(), lib.sym_count,
+                        lib_name, lib.phys_base, lib.sym_count,
                         (t_load1 - t_load0) / 1_000_000, (t_load2 - t_load1) / 1_000_000);
                     let lib = elf::cache_loaded_lib_pub(&lib_path, lib, rw_vaddr, rw_end_vaddr);
                     libs.push(lib);
@@ -1482,7 +1373,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
     let t_deps = crate::clock::nanos_since_boot();
 
     // 8. Create user address space (PML4) — ELF segments are demand-faulted
-    let child_addr_space = AddressSpace::new(crate::mm::paging::AddressSpace::new_user());
+    let child_pt: PageTables = Arc::new(Lock::new(crate::mm::paging::AddressSpace::new_user()));
 
     // 8a. Map shared libraries via VmaList and assign virtual addresses.
     // This MUST happen BEFORE relocation processing so that user_base is correct
@@ -1490,21 +1381,21 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
     for lib in &mut loaded_libs {
         match &lib.memory {
             elf::LibMemory::Owned(alloc) => {
-                let phys = DirectMap::from_ptr(alloc.ptr());
-                let region = child_addr_space.map_region(&mut vmas, phys, alloc.size() as u64)
+                let phys = DirectMap::phys_of(alloc.ptr());
+                let (vaddr, _) = vma_map(&mut vmas, &child_pt, phys, alloc.size() as u64)
                     .expect("spawn: out of virtual address space for lib");
-                lib.user_base = region.vaddr();
+                lib.user_base = vaddr;
             }
-            elf::LibMemory::Shared { rw_alloc, cached_addr, cached_size, rw_offset, .. } => {
-                let cached_phys = *cached_addr;
-                let region = child_addr_space.map_region(&mut vmas, cached_phys, *cached_size as u64)
+            elf::LibMemory::Shared { rw_alloc, cached_image, rw_offset, .. } => {
+                let cached_phys = cached_image.phys();
+                let (lib_vaddr, _) = vma_map(&mut vmas, &child_pt, cached_phys, cached_image.size() as u64)
                     .expect("spawn: out of virtual address space for lib");
-                let lib_vaddr = region.vaddr();
-                let num_rw_pages = rw_alloc.size() / paging::PAGE_2M as usize;
+                let num_rw_pages = rw_alloc.size() / PAGE_2M as usize;
+                let rw_phys = DirectMap::phys_of(rw_alloc.ptr());
                 for i in 0..num_rw_pages {
-                    let user_virt = lib_vaddr.raw() + *rw_offset as u64 + i as u64 * paging::PAGE_2M;
-                    let phys = DirectMap::from_ptr(rw_alloc.ptr()) + i as u64 * paging::PAGE_2M;
-                    child_addr_space.remap_2m(UserAddr::new(user_virt), phys, true);
+                    let user_virt = lib_vaddr.raw() + *rw_offset as u64 + i as u64 * PAGE_2M;
+                    let phys = rw_phys + i as u64 * PAGE_2M;
+                    child_pt.lock().remap(UserAddr::new(user_virt), phys, true);
                 }
                 lib.user_base = lib_vaddr;
             }
@@ -1514,7 +1405,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
     // 8b. Rebase RELATIVE relocations: load_shared_lib applied them with phys_base,
     // but now user_base differs. Add delta = (user_base - phys_base) to each entry.
     for lib in &loaded_libs {
-        let delta = lib.user_base.raw() as i64 - lib.phys_base.raw() as i64;
+        let delta = lib.user_base.raw() as i64 - lib.phys_base as i64;
         if delta != 0 {
             elf::rebase_relative_relocs(lib, delta);
         }
@@ -1559,7 +1450,8 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
             if r_sym == 0 { continue; }
             let sym_data = read_file_range(backing.as_ref(), symtab_file_off + r_sym as u64 * elf::SYM_SIZE as u64, elf::SYM_SIZE);
             if sym_data.len() < elf::SYM_SIZE { continue; }
-            let sym_name = elf::Elf64Sym::from_slice(&sym_data, 0).name(&dynstr_data);
+            let sym = elf::read_sym(&sym_data, 0);
+            let sym_name = elf::sym_name(&sym, &dynstr_data);
             let resolved = loaded_libs.iter().find_map(|lib| elf::gnu_dlsym_pub(lib, sym_name));
             match resolved {
                 Some(addr) => reloc_index.add_u64(r_offset, addr.raw()),
@@ -1579,7 +1471,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
     let stack_phys = DirectMap::from_ptr(stack_alloc.ptr());
     let stack_vaddr = UserAddr::new(crate::vma::STACK_BASE);
     let user_stack = UserStack::new(stack_vaddr, stack_phys, USER_STACK_SIZE as u64);
-    child_addr_space.map_at(stack_vaddr, stack_phys, USER_STACK_SIZE as u64);
+    child_pt.lock().map_range(stack_vaddr, stack_phys.phys(), USER_STACK_SIZE as u64, true);
 
 
     // 10. TLS setup — read exe TLS template from page cache, build multi-module layout
@@ -1618,9 +1510,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
     // Resolve exe TPOFF relocations → add pre-computed values to reloc index
     {
         let exe_base_offset = tls_modules.iter()
-            .find(|m| {
-                exe_tls_template.as_ref().map_or(false, |buf| m.template == DirectMap::from_ptr(buf.ptr()))
-            })
+            .find(|m| m.module_id == 1)
             .map(|m| m.base_offset)
             .unwrap_or(0);
 
@@ -1657,10 +1547,10 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
         None
     };
 
-    let (tls_template, tls_filesz, tls_memsz) = if !tls_modules.is_empty() {
-        (tls_modules[0].template, tls_modules[0].filesz, tls_modules[0].memsz)
+    let (tls_template, tls_memsz) = if !tls_modules.is_empty() {
+        (tls_modules[0].template, tls_modules[0].memsz)
     } else {
-        (DirectMap::null(), 0, 0)
+        (None, 0)
     };
 
     log!("spawn: TLS {} modules, total_memsz={}", tls_modules.len(), tls_total_memsz);
@@ -1673,7 +1563,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
             }
         }
     } else {
-        match setup_tls(DirectMap::null(), 0, 0, 1) {
+        match setup_tls(None, 0, 1) {
             Some(v) => v,
             None => {
                 log!("spawn: {}: failed to allocate TLS (empty)", path);
@@ -1682,24 +1572,24 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
         }
     };
     // TLS mapped via VmaList — rebase all user-visible pointers from phys to vaddr
-    let tls_phys = DirectMap::from_ptr(tls_alloc.ptr());
-    let tls_region = child_addr_space.map_region(&mut vmas, tls_phys, tls_alloc.size() as u64)
+    let tls_phys = DirectMap::phys_of(tls_alloc.ptr());
+    let (tls_vaddr, _) = vma_map(&mut vmas, &child_pt, tls_phys, tls_alloc.size() as u64)
         .expect("spawn: out of virtual address space for TLS");
-    let tls_rebase = tls_region.vaddr().raw() as i64 - tls_phys.raw() as i64;
+    let tls_rebase = tls_vaddr.raw() as i64 - tls_phys as i64;
     let fs_base = (fs_base as i64 + tls_rebase) as u64;
     // Fix self-pointer (TCB[0]) and DTV pointer (TCB[8]) in the TLS block
     unsafe {
-        let tp_kern = tls_phys.as_mut_ptr::<u8>().add((fs_base - tls_region.vaddr().raw()) as usize);
+        let tls_base_ptr = DirectMap::from_phys(tls_phys).as_mut_ptr::<u8>();
+        let tp_kern = tls_base_ptr.add((fs_base - tls_vaddr.raw()) as usize);
         let self_ptr = tp_kern as *mut u64;
-        *self_ptr = fs_base; // TCB[0] = self-pointer (user vaddr)
-        let dtv_phys = *self_ptr.add(1); // TCB[8] = DTV pointer (still phys)
-        *self_ptr.add(1) = (dtv_phys as i64 + tls_rebase) as u64; // rebase DTV pointer
-        // Rebase DTV entries
-        let dtv_kern = tls_phys.as_mut_ptr::<u64>(); // DTV is at start of allocation
-        let dtv_len = *dtv_kern.add(1) as usize; // dtv[1] = capacity
+        *self_ptr = fs_base;
+        let dtv_phys = *self_ptr.add(1);
+        *self_ptr.add(1) = (dtv_phys as i64 + tls_rebase) as u64;
+        let dtv_kern = tls_base_ptr as *mut u64;
+        let dtv_len = *dtv_kern.add(1) as usize;
         for i in 0..dtv_len {
             let entry = *dtv_kern.add(2 + i);
-            if entry != !0u64 && entry != 0 { // not unallocated or null
+            if entry != !0u64 && entry != 0 {
                 *dtv_kern.add(2 + i) = (entry as i64 + tls_rebase) as u64;
             }
         }
@@ -1758,7 +1648,6 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
         elf_alloc: exe_tls_template, // TLS template allocation (if any)
         stack_alloc: Some(stack_alloc),
         tls_template,
-        tls_filesz,
         tls_memsz,
         tls_alloc: Some(tls_alloc),
         tls_modules,
@@ -1803,7 +1692,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
         process: pid,
         kernel_stack: ks_alloc,
         kernel_rsp: ks_rsp,
-        address_space: Some(child_addr_space.clone()),
+        address_space: Some(child_pt.clone()),
         fs_base,
         cpu_ns: 0,
         scheduled_at: 0,
@@ -1815,7 +1704,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
 
     let t3 = crate::clock::nanos_since_boot();
     log!("spawn: {} pid={} tid={} base={:#x} entry={:#x} cr3={:#x} (layout={}ms relocs={}ms deps={}ms tls={}ms total={}ms)",
-        path, pid, tid, base, entry, unsafe { child_addr_space.cr3_value() }.raw(),
+        path, pid, tid, base, entry, child_pt.lock().cr3(),
         (t1 - t0) / 1_000_000, (t2 - t1) / 1_000_000, (t_deps - t2) / 1_000_000,
         (t_tls - t_deps) / 1_000_000, (t3 - t0) / 1_000_000);
 
@@ -1881,7 +1770,7 @@ fn teardown_resources(data_arc: &Arc<Lock<ProcessData>>, pid: Pid) {
 /// Caller must hold PROCESS_TABLE lock and have already switched to kernel CR3.
 /// Returns Tids that need waking (e.g. parent blocked on waitpid, threads blocked
 /// on thread_join). The caller must wake them AFTER releasing the table lock.
-fn teardown_scheduling(table: &mut ProcessTable, process_pid: Pid, addr_space: Arc<AddressSpace>, code: i32) -> Vec<Tid> {
+fn teardown_scheduling(table: &mut ProcessTable, process_pid: Pid, _addr_space: PageTables, code: i32) -> Vec<Tid> {
     let main_tid = table.find_main_thread(process_pid)
         .expect("teardown_scheduling: main thread not found");
     let mut to_wake = Vec::new();
@@ -1908,8 +1797,6 @@ fn teardown_scheduling(table: &mut ProcessTable, process_pid: Pid, addr_space: A
     }
 
     shared_memory::cleanup_process(process_pid);
-    // Pipe mappings are cleaned up via FD close in teardown_resources.
-    addr_space.mark_dead();
 
     let entry = table.get_mut(main_tid).unwrap();
     let cpu_ms = entry.cpu_ns() / 1_000_000;
@@ -2073,7 +1960,7 @@ pub fn futex_wait(addr: u64, expected: u32, timeout_ns: u64) -> u64 {
 
     // Translate virtual → physical so cross-process futex works on shared memory
     let phys_addr = match scheduler::current_address_space()
-        .and_then(|a| a.virt_to_phys(UserAddr::new(addr))) {
+        .and_then(|pt| pt.lock().translate(UserAddr::new(addr))) {
         Some(pa) => pa,
         None => return u64::MAX,
     };
@@ -2088,7 +1975,7 @@ pub fn futex_wait(addr: u64, expected: u32, timeout_ns: u64) -> u64 {
 /// Wake up to `count` threads blocked on the same physical address as `addr`.
 pub fn futex_wake(addr: u64, count: u64) -> u64 {
     let phys_addr = match scheduler::current_address_space()
-        .and_then(|a| a.virt_to_phys(UserAddr::new(addr))) {
+        .and_then(|pt| pt.lock().translate(UserAddr::new(addr))) {
         Some(pa) => pa,
         None => return 0,
     };
@@ -2162,7 +2049,6 @@ pub fn handle_page_fault(fault_addr: u64, _error_code: u64) -> bool {
 
     let (data_arc, addr_space) = {
         let Some(addr_space) = scheduler::current_address_space() else { return false };
-        if addr_space.is_dead() { return false; }
         let guard = PROCESS_TABLE.lock();
         let Some(table) = guard.as_ref() else { return false };
         let Some(entry) = table.get(tid) else { return false };
@@ -2187,7 +2073,7 @@ pub fn handle_page_fault(fault_addr: u64, _error_code: u64) -> bool {
     }
 
     // Round down to 2MB boundary
-    let page_2m = paging::PAGE_2M;
+    let page_2m = PAGE_2M;
     let region_start = fault_addr & !(page_2m - 1);
 
     let reloc_index = data.reloc_index.clone();
@@ -2195,7 +2081,7 @@ pub fn handle_page_fault(fault_addr: u64, _error_code: u64) -> bool {
 
     // If a 2MB page is already mapped at this region (from a previous fault
     // in a different VMA that shares the same 2MB range), just return success.
-    if addr_space.virt_to_phys(UserAddr::new(region_start)).is_some() {
+    if addr_space.lock().translate(UserAddr::new(region_start)).is_some() {
         return true;
     }
 
@@ -2204,10 +2090,7 @@ pub fn handle_page_fault(fault_addr: u64, _error_code: u64) -> bool {
         Some(a) => a,
         None => return false,
     };
-    let phys = DirectMap::from_ptr(alloc.ptr());
     let page_ptr = alloc.ptr();
-
-
 
     // Fill the 2MB page from ALL VMAs that overlap this region.
     // Multiple segments (e.g. .text and .rodata) can share a 2MB range.
@@ -2270,14 +2153,14 @@ pub fn handle_page_fault(fault_addr: u64, _error_code: u64) -> bool {
 
 
     // Map the 2MB page (writable if any overlapping VMA is writable)
-    addr_space.remap_2m(UserAddr::new(region_start), phys, writable);
+    addr_space.lock().remap(UserAddr::new(region_start), DirectMap::phys_of(alloc.ptr()), writable);
     cpu::flush_tlb();
 
     data.demand_allocs.push(alloc);
 
     // Update memory tracking
     data.alloc_count += 1;
-    let current_mem = data.demand_allocs.len() as u64 * paging::PAGE_2M;
+    let current_mem = data.demand_allocs.len() as u64 * PAGE_2M;
     if current_mem > data.peak_memory {
         data.peak_memory = current_mem;
     }
@@ -2287,7 +2170,7 @@ pub fn handle_page_fault(fault_addr: u64, _error_code: u64) -> bool {
     data.fault_trace.record(PageFaultRecord {
         fault_addr,
         page_elf_offset: region_start.wrapping_sub(elf_base),
-        block_idx: (region_start / paging::PAGE_2M) as u32,
+        block_idx: (region_start / PAGE_2M) as u32,
         reloc_count: total_relocs,
         flags: if writable { 1 } else { 0 },
         duration_us: elapsed_us,
@@ -2343,7 +2226,7 @@ pub fn dump_crash_diagnostics(fault_addr: u64, rip: u64) {
     // Reads via the kernel direct map (no USER bit) to avoid SMAP faults.
     let read_user = |virt: u64| -> Option<u64> {
         if virt % 8 != 0 { return None; }
-        let phys = addr_space.virt_to_phys(UserAddr::new(virt))?;
+        let phys = addr_space.lock().translate(UserAddr::new(virt))?;
         Some(unsafe { *phys.as_ptr::<u64>() })
     };
 
@@ -2485,12 +2368,8 @@ pub fn kill_process(target_pid: Pid) -> u64 {
 
         // Get address space from the main thread's ThreadCtx
         if let Some(mut ctx) = scheduler::remove_thread(main_tid) {
-            if let Some(addr_space) = ctx.address_space.take() {
-                if !addr_space.is_dead() {
-                    shared_memory::cleanup_process(target_pid);
-                    // Pipe mappings are cleaned up via FD close in teardown_resources.
-                    addr_space.mark_dead();
-                }
+            if ctx.address_space.take().is_some() {
+                shared_memory::cleanup_process(target_pid);
             }
         }
 

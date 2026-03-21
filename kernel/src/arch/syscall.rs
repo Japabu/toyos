@@ -640,15 +640,14 @@ fn sys_pipe_map(fd_num: u32) -> u64 {
         let Some(phys) = pipe::phys_addr(pipe_id) else {
             return SyscallError::NotFound.to_u64();
         };
-        let addr_space = crate::scheduler::current_address_space()
+        let pt = crate::scheduler::current_address_space()
             .expect("sys_pipe_map: no address space");
-        let Some(region) = addr_space.map_region(&mut data.vmas, phys, pipe::PIPE_SIZE as u64) else {
+        let Some((vaddr, aligned)) = process::vma_map(&mut data.vmas, &pt, phys.phys(), pipe::PIPE_SIZE as u64) else {
             return SyscallError::ResourceExhausted.to_u64();
         };
-        let vaddr = region.vaddr();
 
         // Store the mapping in the FD so it's unmapped on close
-        let mapping = fd::PipeMapping { vaddr, size: region.size() };
+        let mapping = fd::PipeMapping { vaddr, size: aligned };
         match data.fds.get_mut(fd_num) {
             Some(fd::Descriptor::PipeRead(_, ref mut m)) => *m = Some(mapping),
             Some(fd::Descriptor::PipeWrite(_, ref mut m)) => *m = Some(mapping),
@@ -876,49 +875,35 @@ fn sys_mmap(req_addr: u64, size: u64, _prot: u64, flags: u64) -> u64 {
 
     if fixed && req_addr != 0 {
         // MAP_FIXED: map the allocated physical memory at the requested virtual address
-        let phys_addr = DirectMap::from_ptr(alloc.ptr());
-        let addr_space = process::current_address_space();
+        let phys_addr = DirectMap::phys_of(alloc.ptr());
+        let pt = process::current_address_space();
         let start = req_addr & !(crate::mm::PAGE_2M - 1);
         let end = (req_addr + aligned as u64 + crate::mm::PAGE_2M - 1) & !(crate::mm::PAGE_2M - 1);
         let mut cur = start;
         let mut offset = 0u64;
-        let mut ok = true;
         while cur < end {
-            if !addr_space.remap_2m(UserAddr::new(cur), phys_addr + offset, true) {
-                let mut undo = start;
-                while undo < cur {
-                    addr_space.clear_2m(UserAddr::new(undo));
-                    undo += crate::mm::PAGE_2M;
-                }
-                ok = false;
-                break;
-            }
+            pt.lock().remap(UserAddr::new(cur), phys_addr + offset, true);
             cur += crate::mm::PAGE_2M;
             offset += crate::mm::PAGE_2M;
         }
-        if ok {
-            cpu::flush_tlb();
-            apic::tlb_shootdown();
-            process::with_current_data(|data| {
-                data.mmap_regions.push(process::MmapRegion {
-                    addr: UserAddr::new(start), size: aligned, _alloc: alloc, fixed: true,
-                });
-                data.alloc_count += 1;
-                let mem = data.mmap_regions.iter().map(|r| r.size as u64).sum::<u64>();
-                if mem > data.peak_memory { data.peak_memory = mem; }
+        cpu::flush_tlb();
+        apic::tlb_shootdown();
+        process::with_current_data(|data| {
+            data.mmap_regions.push(process::MmapRegion {
+                addr: UserAddr::new(start), size: aligned, _alloc: alloc, fixed: true,
             });
-            req_addr
-        } else {
-            SyscallError::InvalidArgument.to_u64()
-        }
+            data.alloc_count += 1;
+            let mem = data.mmap_regions.iter().map(|r| r.size as u64).sum::<u64>();
+            if mem > data.peak_memory { data.peak_memory = mem; }
+        });
+        req_addr
     } else {
-        let phys = DirectMap::from_ptr(alloc.ptr());
-        let addr_space = process::current_address_space();
+        let phys = DirectMap::phys_of(alloc.ptr());
+        let pt = process::current_address_space();
         let vaddr = process::with_current_data(|data| {
-            let Some(region) = addr_space.map_region(&mut data.vmas, phys, aligned as u64) else {
+            let Some((vaddr, _)) = process::vma_map(&mut data.vmas, &pt, phys, aligned as u64) else {
                 return Err(());
             };
-            let vaddr = region.vaddr();
             data.mmap_regions.push(process::MmapRegion {
                 addr: vaddr, size: aligned, _alloc: alloc, fixed: false,
             });
@@ -935,7 +920,7 @@ fn sys_mmap(req_addr: u64, size: u64, _prot: u64, flags: u64) -> u64 {
 }
 
 fn sys_munmap(addr: u64, _size: u64) -> u64 {
-    let addr_space = process::current_address_space();
+    let pt = process::current_address_space();
     process::with_current_data(|data| {
         let idx = data.mmap_regions.iter().position(|r| r.addr.raw() == addr);
         if let Some(idx) = idx {
@@ -945,11 +930,11 @@ fn sys_munmap(addr: u64, _size: u64) -> u64 {
                 let mut cur = region.addr.raw();
                 let end = region.addr.raw() + region.size as u64;
                 while cur < end {
-                    addr_space.clear_2m(UserAddr::new(cur));
+                    pt.lock().unmap(UserAddr::new(cur));
                     cur += crate::mm::PAGE_2M;
                 }
             } else {
-                addr_space.unmap_at(region.addr, region.size as u64);
+                pt.lock().unmap_range(region.addr, region.size as u64);
                 data.vmas.free_region(region.addr);
             }
             0
@@ -1183,25 +1168,25 @@ fn sys_dlopen(path: &str) -> u64 {
     };
 
     // Map library via VmaList and update user_base for symbol resolution
-    let addr_space = process::current_address_space();
+    let pt = process::current_address_space();
     process::with_fd_owner_data(|data| {
         match &lib.memory {
             crate::elf::LibMemory::Owned(alloc) => {
-                let phys = DirectMap::from_ptr(alloc.ptr());
-                let region = addr_space.map_region(&mut data.vmas, phys, alloc.size() as u64)
+                let phys = DirectMap::phys_of(alloc.ptr());
+                let (vaddr, _) = process::vma_map(&mut data.vmas, &pt, phys, alloc.size() as u64)
                     .expect("dlopen: out of virtual address space");
-                lib.user_base = region.vaddr();
+                lib.user_base = vaddr;
             }
-            crate::elf::LibMemory::Shared { rw_alloc, cached_addr, cached_size, rw_offset, .. } => {
-                let cached_phys = *cached_addr;
-                let region = addr_space.map_region(&mut data.vmas, cached_phys, *cached_size as u64)
+            crate::elf::LibMemory::Shared { rw_alloc, cached_image, rw_offset, .. } => {
+                let cached_phys = cached_image.phys();
+                let (lib_vaddr, _) = process::vma_map(&mut data.vmas, &pt, cached_phys, cached_image.size() as u64)
                     .expect("dlopen: out of virtual address space");
-                let lib_vaddr = region.vaddr();
                 let num_rw_pages = rw_alloc.size() / crate::mm::PAGE_2M as usize;
+                let rw_phys = DirectMap::phys_of(rw_alloc.ptr());
                 for i in 0..num_rw_pages {
                     let user_virt = lib_vaddr.raw() + *rw_offset as u64 + i as u64 * crate::mm::PAGE_2M;
-                    let phys = DirectMap::from_ptr(rw_alloc.ptr()) + i as u64 * crate::mm::PAGE_2M;
-                    addr_space.remap_2m(UserAddr::new(user_virt), phys, true);
+                    let phys = rw_phys + i as u64 * crate::mm::PAGE_2M;
+                    pt.lock().remap(UserAddr::new(user_virt), phys, true);
                 }
                 cpu::flush_tlb();
                 apic::tlb_shootdown();
@@ -1232,7 +1217,7 @@ fn sys_dlopen(path: &str) -> u64 {
             let module_id = data.next_tls_module_id;
             data.next_tls_module_id += 1;
             data.tls_modules.push(crate::elf::TlsModule {
-                template: lib.tls_template, filesz: lib.tls_filesz,
+                template: lib.tls_template,
                 memsz: lib.tls_memsz, base_offset: 0, module_id,
                 is_static: false,
             });
@@ -1265,11 +1250,11 @@ fn sys_tls_alloc_block(module_id: u64) -> u64 {
 
     // Read module info from the process-level data (shared across threads via heap owner).
     let owner_arc = process::fd_owner_data();
-    let (tls_memsz, tls_filesz, tls_template) = {
+    let (tls_memsz, tls_template) = {
         let data = owner_arc.lock();
         let m = data.tls_modules.iter().find(|m| m.module_id == module_id)
             .unwrap_or_else(|| panic!("sys_tls_alloc_block: module_id={} not found", module_id));
-        (m.memsz, m.filesz, m.template)
+        (m.memsz, m.template)
     };
 
     // Allocate TLS block
@@ -1280,19 +1265,19 @@ fn sys_tls_alloc_block(module_id: u64) -> u64 {
     // Initialize: copy template, zero BSS
     unsafe {
         core::ptr::write_bytes(block_ptr, 0, tls_memsz);
-        if tls_filesz > 0 && !tls_template.is_null() {
-            core::ptr::copy_nonoverlapping(tls_template.as_ptr::<u8>(), block_ptr, tls_filesz);
+        if let Some(template) = &tls_template {
+            core::ptr::copy_nonoverlapping(template.base(), block_ptr, template.size());
         }
     }
 
     // Map into current process's virtual address space via VmaList
-    let block_phys_addr = DirectMap::from_ptr(block_ptr);
+    let block_phys = DirectMap::phys_of(block_ptr);
+    let pt = process::current_address_space();
     let tls_vaddr = process::with_fd_owner_data(|data| {
-        let addr_space = process::current_address_space();
-        let region = addr_space.map_region(&mut data.vmas, block_phys_addr, tls_memsz as u64)
+        let (vaddr, _) = process::vma_map(&mut data.vmas, &pt, block_phys, tls_memsz as u64)
             .expect("sys_tls_alloc_block: out of virtual address space");
         data.alloc_count += 1;
-        region.vaddr()
+        vaddr
     });
 
     // Store in the process-level (fd-owner) data alongside the VMA allocation.
@@ -1304,14 +1289,13 @@ fn sys_tls_alloc_block(module_id: u64) -> u64 {
     // Write block address into current thread's DTV.
     // FS base = TP (user-visible virtual address). TCB[8] = DTV pointer (virtual).
     // We need to translate user virtual addresses to kernel direct-map pointers.
-    let addr_space = process::current_address_space();
     let tp_virt = crate::arch::read_fs_base();
-    let tp_phys = addr_space.virt_to_phys(UserAddr::new(tp_virt))
+    let tp_phys = pt.lock().translate(UserAddr::new(tp_virt))
         .expect("sys_tls_alloc_block: TP not mapped");
     let tp_kern = tp_phys.as_ptr::<u64>();
     let dtv_virt = unsafe { *tp_kern.add(1) }; // TCB[8] = DTV pointer (virtual)
     assert!(dtv_virt != 0, "sys_tls_alloc_block: no DTV for module_id={}", module_id);
-    let dtv_phys = addr_space.virt_to_phys(UserAddr::new(dtv_virt))
+    let dtv_phys = pt.lock().translate(UserAddr::new(dtv_virt))
         .expect("sys_tls_alloc_block: DTV not mapped");
     let dtv_kern = dtv_phys.as_mut_ptr::<u64>();
     let dtv_len = unsafe { *dtv_kern.add(1) } as u64;

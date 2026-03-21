@@ -11,6 +11,8 @@ use elf::file::{parse_ident, FileHeader};
 use elf::segment::{ProgramHeader, SegmentTable};
 use elf::dynamic::DynamicTable;
 use elf::parse::ParseAt;
+use elf::symbol::Elf64_Sym;
+use elf::relocation::Elf64_Rela;
 use elf::abi::{
     PT_LOAD, PT_TLS, PT_DYNAMIC, ET_DYN, EM_X86_64, R_X86_64_RELATIVE,
     DT_SYMTAB, DT_STRTAB, DT_STRSZ, DT_NULL, SHT_DYNSYM, EI_NIDENT,
@@ -21,56 +23,23 @@ const R_X86_64_DTPOFF64: u32 = 17;
 const R_X86_64_TPOFF64: u32 = 18;
 const R_X86_64_TPOFF32: u32 = 23;
 
-// ── ELF binary structures ───────────────────────────────────────────────
-// These match the on-disk/in-memory ELF64 layout (repr(C)). The `elf` crate's
-// Symbol/Rela types reorder fields during parsing, so they can't be used for
-// raw pointer reads via ptr::read_unaligned.
+pub const SYM_SIZE: usize = core::mem::size_of::<Elf64_Sym>(); // 24
+const RELA_SIZE: u64 = core::mem::size_of::<Elf64_Rela>() as u64; // 24
 
-/// ELF64 symbol table entry (24 bytes).
-#[derive(Clone, Copy)]
-#[repr(C)]
-pub struct Elf64Sym {
-    pub st_name: u32,
-    pub st_info: u8,
-    pub st_other: u8,
-    pub st_shndx: u16,
-    pub st_value: u64,
-    pub st_size: u64,
+pub fn read_sym(data: &[u8], index: usize) -> Elf64_Sym {
+    let off = index * SYM_SIZE;
+    unsafe { core::ptr::read_unaligned(data[off..].as_ptr() as *const Elf64_Sym) }
 }
 
-pub const SYM_SIZE: usize = core::mem::size_of::<Elf64Sym>(); // 24
-
-impl Elf64Sym {
-    /// Parse from a byte slice at the given index. Panics if out of bounds.
-    pub fn from_slice(data: &[u8], index: usize) -> Self {
-        let off = index * SYM_SIZE;
-        unsafe { core::ptr::read_unaligned(data[off..].as_ptr() as *const Self) }
-    }
-
-    /// Look up this symbol's name in a string table byte slice.
-    pub fn name<'a>(&self, strtab: &'a [u8]) -> &'a str {
-        let start = self.st_name as usize;
-        if start >= strtab.len() { return ""; }
-        let len = strtab[start..].iter().position(|&b| b == 0).unwrap_or(strtab.len() - start);
-        core::str::from_utf8(&strtab[start..start + len]).unwrap_or("")
-    }
+pub fn sym_name<'a>(sym: &Elf64_Sym, strtab: &'a [u8]) -> &'a str {
+    let start = sym.st_name as usize;
+    if start >= strtab.len() { return ""; }
+    let len = strtab[start..].iter().position(|&b| b == 0).unwrap_or(strtab.len() - start);
+    core::str::from_utf8(&strtab[start..start + len]).unwrap_or("")
 }
 
-/// ELF64 relocation entry with addend.
-#[derive(Clone, Copy)]
-#[repr(C)]
-struct Elf64Rela {
-    r_offset: u64,
-    r_info: u64,
-    r_addend: i64,
-}
-
-const RELA_SIZE: u64 = core::mem::size_of::<Elf64Rela>() as u64; // 24
-
-impl Elf64Rela {
-    fn r_type(self) -> u32 { (self.r_info & 0xFFFF_FFFF) as u32 }
-    fn r_sym(self) -> u32 { (self.r_info >> 32) as u32 }
-}
+fn rela_type(r: &Elf64_Rela) -> u32 { (r.r_info & 0xFFFF_FFFF) as u32 }
+fn rela_sym(r: &Elf64_Rela) -> u32 { (r.r_info >> 32) as u32 }
 
 // ── Shared library memory ownership ──────────────────────────────────────
 
@@ -121,13 +90,13 @@ fn prescan_relocs(rela: &Option<KernelSlice>, jmprel: &Option<KernelSlice>) -> C
         let Some(table) = table else { continue };
         let count = table.size() / RELA_SIZE as usize;
         for i in 0..count {
-            let rela = unsafe { table.read::<Elf64Rela>(i * RELA_SIZE as usize) };
-            match rela.r_type() {
-                6 | 7 => relocs.bind.push((rela.r_offset, rela.r_sym())),
-                R_X86_64_TPOFF64 => relocs.tpoff64.push((rela.r_offset, rela.r_sym(), rela.r_addend)),
-                R_X86_64_TPOFF32 => relocs.tpoff32.push((rela.r_offset, rela.r_sym(), rela.r_addend)),
-                R_X86_64_DTPMOD64 => relocs.dtpmod64.push((rela.r_offset, rela.r_sym(), rela.r_addend)),
-                R_X86_64_DTPOFF64 => relocs.dtpoff64.push((rela.r_offset, rela.r_sym(), rela.r_addend)),
+            let rela = unsafe { table.read::<Elf64_Rela>(i * RELA_SIZE as usize) };
+            match rela_type(&rela) {
+                6 | 7 => relocs.bind.push((rela.r_offset, rela_sym(&rela))),
+                R_X86_64_TPOFF64 => relocs.tpoff64.push((rela.r_offset, rela_sym(&rela), rela.r_addend)),
+                R_X86_64_TPOFF32 => relocs.tpoff32.push((rela.r_offset, rela_sym(&rela), rela.r_addend)),
+                R_X86_64_DTPMOD64 => relocs.dtpmod64.push((rela.r_offset, rela_sym(&rela), rela.r_addend)),
+                R_X86_64_DTPOFF64 => relocs.dtpoff64.push((rela.r_offset, rela_sym(&rela), rela.r_addend)),
                 _ => {}
             }
         }
@@ -659,9 +628,9 @@ pub fn build_exe_sym_map<'a>(
     let mut map = hashbrown::HashMap::with_capacity(sym_count);
     for i in 1..sym_count {
         if (i + 1) * SYM_SIZE > dynsym_data.len() { break; }
-        let sym = Elf64Sym::from_slice(dynsym_data, i);
+        let sym = read_sym(dynsym_data, i);
         if sym.st_shndx == 0 { continue; }
-        let name = sym.name(dynstr_data);
+        let name = sym_name(&sym, dynstr_data);
         if !name.is_empty() {
             map.insert(name, base + sym.st_value);
         }
@@ -715,11 +684,11 @@ pub fn build_symtab_map(
     let sym_count = symtab_data.len() / SYM_SIZE;
     let mut map = hashbrown::HashMap::with_capacity(sym_count);
     for i in 1..sym_count {
-        let sym = Elf64Sym::from_slice(&symtab_data, i);
+        let sym = read_sym(&symtab_data, i);
         // Only export GLOBAL or WEAK symbols that are defined (st_shndx != 0)
         let bind = sym.st_info >> 4;
         if sym.st_shndx == 0 || (bind != 1 && bind != 2) { continue; }
-        let name = sym.name(strtab_leaked);
+        let name = sym_name(&sym, strtab_leaked);
         if !name.is_empty() {
             map.insert(name, base + sym.st_value);
         }
@@ -749,9 +718,9 @@ pub struct LoadedLib {
 }
 
 impl LoadedLib {
-    fn sym(&self, i: usize) -> Elf64Sym {
+    fn sym(&self, i: usize) -> Elf64_Sym {
         let dynsym = self.dynsym.as_ref().expect("no dynsym");
-        unsafe { dynsym.read::<Elf64Sym>(i * SYM_SIZE) }
+        unsafe { dynsym.read::<Elf64_Sym>(i * SYM_SIZE) }
     }
 
     fn sym_name(&self, i: usize) -> &str {
@@ -975,8 +944,8 @@ pub fn load_shared_lib(data: &[u8]) -> Result<(LoadedLib, u64, u64), &'static st
         let Some(table) = table else { continue };
         let count = table.size() / RELA_SIZE as usize;
         for i in 0..count {
-            let rela = unsafe { table.read::<Elf64Rela>(i * RELA_SIZE as usize) };
-            if rela.r_type() == R_X86_64_RELATIVE {
+            let rela = unsafe { table.read::<Elf64_Rela>(i * RELA_SIZE as usize) };
+            if rela_type(&rela) == R_X86_64_RELATIVE {
                 let value = (base_phys as i64 + rela.r_addend) as u64;
                 unsafe { image.write::<u64>((rela.r_offset - vaddr_min) as usize, value); }
                 reloc_count += 1;
@@ -1018,8 +987,8 @@ pub fn rebase_relative_relocs(lib: &LoadedLib, delta: i64) {
         let Some(table) = table else { continue };
         let count = table.size() / RELA_SIZE as usize;
         for i in 0..count {
-            let rela = unsafe { table.read::<Elf64Rela>(i * RELA_SIZE as usize) };
-            if rela.r_type() == R_X86_64_RELATIVE {
+            let rela = unsafe { table.read::<Elf64_Rela>(i * RELA_SIZE as usize) };
+            if rela_type(&rela) == R_X86_64_RELATIVE {
                 let old_value = unsafe { lib.image.read::<u64>(rela.r_offset as usize) };
                 let new_value = (old_value as i64 + delta) as u64;
                 unsafe { lib.write_at::<u64>(rela.r_offset, new_value); }
@@ -1069,9 +1038,9 @@ pub fn resolve_dlopen_relocs(lib: &LoadedLib, other_libs: &[LoadedLib]) {
             let Some(table) = table else { continue };
             let count = table.size() / RELA_SIZE as usize;
             for i in 0..count {
-                let rela = unsafe { table.read::<Elf64Rela>(i * RELA_SIZE as usize) };
-                if rela.r_type() == 6 || rela.r_type() == 7 {
-                    resolve_one(rela.r_offset, rela.r_sym(), &mut resolved_count, &mut unresolved_count);
+                let rela = unsafe { table.read::<Elf64_Rela>(i * RELA_SIZE as usize) };
+                if rela_type(&rela) == 6 || rela_type(&rela) == 7 {
+                    resolve_one(rela.r_offset, rela_sym(&rela), &mut resolved_count, &mut unresolved_count);
                 }
             }
         }
@@ -1120,9 +1089,9 @@ fn resolve_lib_bind_relocs(
             let Some(table) = table else { continue };
             let count = table.size() / RELA_SIZE as usize;
             for i in 0..count {
-                let rela = unsafe { table.read::<Elf64Rela>(i * RELA_SIZE as usize) };
-                match rela.r_type() {
-                    6 | 7 => resolve_bind(rela.r_offset, rela.r_sym()),
+                let rela = unsafe { table.read::<Elf64_Rela>(i * RELA_SIZE as usize) };
+                match rela_type(&rela) {
+                    6 | 7 => resolve_bind(rela.r_offset, rela_sym(&rela)),
                     8 => {
                         unsafe { lib.write_at::<u64>(rela.r_offset, (lib.user_base.raw() as i64 + rela.r_addend) as u64); }
                     }
@@ -1185,13 +1154,13 @@ pub fn apply_tpoff_relocs(lib: &LoadedLib, lib_base_offset: usize, total_memsz: 
             let Some(table) = table else { continue };
             let count = table.size() / RELA_SIZE as usize;
             for i in 0..count {
-                let rela = unsafe { table.read::<Elf64Rela>(i * RELA_SIZE as usize) };
-                if rela.r_type() == R_X86_64_TPOFF64 {
-                    let tpoff = compute_tpoff(lib, rela.r_sym(), rela.r_addend, lib_base_offset, total_memsz, tls_info);
+                let rela = unsafe { table.read::<Elf64_Rela>(i * RELA_SIZE as usize) };
+                if rela_type(&rela) == R_X86_64_TPOFF64 {
+                    let tpoff = compute_tpoff(lib, rela_sym(&rela), rela.r_addend, lib_base_offset, total_memsz, tls_info);
                     unsafe { lib.write_at::<u64>(rela.r_offset, tpoff as u64); }
                     count64 += 1;
-                } else if rela.r_type() == R_X86_64_TPOFF32 {
-                    let tpoff = compute_tpoff(lib, rela.r_sym(), rela.r_addend, lib_base_offset, total_memsz, tls_info);
+                } else if rela_type(&rela) == R_X86_64_TPOFF32 {
+                    let tpoff = compute_tpoff(lib, rela_sym(&rela), rela.r_addend, lib_base_offset, total_memsz, tls_info);
                     unsafe { lib.write_at::<i32>(rela.r_offset, tpoff as i32); }
                     count32 += 1;
                 }
@@ -1229,13 +1198,13 @@ pub fn apply_dtpmod_relocs(lib: &LoadedLib, module_id: u64, tls_info: &TlsModule
             let Some(table) = table else { continue };
             let count = table.size() / RELA_SIZE as usize;
             for i in 0..count {
-                let rela = unsafe { table.read::<Elf64Rela>(i * RELA_SIZE as usize) };
-                if rela.r_type() == R_X86_64_DTPMOD64 {
-                    let mid = resolve_dtpmod(lib, rela.r_sym(), module_id, tls_info);
+                let rela = unsafe { table.read::<Elf64_Rela>(i * RELA_SIZE as usize) };
+                if rela_type(&rela) == R_X86_64_DTPMOD64 {
+                    let mid = resolve_dtpmod(lib, rela_sym(&rela), module_id, tls_info);
                     unsafe { lib.write_at::<u64>(rela.r_offset, mid); }
                     count_mod += 1;
-                } else if rela.r_type() == R_X86_64_DTPOFF64 {
-                    let offset = resolve_dtpoff(lib, rela.r_sym(), rela.r_addend, tls_info);
+                } else if rela_type(&rela) == R_X86_64_DTPOFF64 {
+                    let offset = resolve_dtpoff(lib, rela_sym(&rela), rela.r_addend, tls_info);
                     unsafe { lib.write_at::<u64>(rela.r_offset, offset as u64); }
                     count_off += 1;
                 }

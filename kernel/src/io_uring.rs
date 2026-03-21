@@ -228,7 +228,7 @@ pub fn create(depth: u32) -> Result<(RingId, SharedToken), SyscallError> {
 
     let shm_vaddr = shared_memory::map(shm_token, pid, &addr_space)
         .map_err(|_| SyscallError::Unknown)?;
-    let shm_phys = addr_space.virt_to_phys(crate::UserAddr::new(shm_vaddr))
+    let shm_phys = addr_space.lock().translate(crate::UserAddr::new(shm_vaddr))
         .ok_or(SyscallError::Unknown)?;
 
     let base = shm_phys.as_mut_ptr::<u8>();

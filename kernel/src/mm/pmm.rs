@@ -119,7 +119,7 @@ fn free_page_raw(phys: u64) {
 }
 
 /// Return (total_bytes, used_bytes).
-pub(super) fn stats() -> (u64, u64) {
+pub fn stats() -> (u64, u64) {
     let list = FREE_LIST.lock();
     let total = list.total_count * PAGE_2M;
     let used = (list.total_count - list.free_count) * PAGE_2M;

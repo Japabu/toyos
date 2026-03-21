@@ -7,7 +7,6 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 use super::{PAGE_2M, UserAddr};
-use super::pmm::PhysPage;
 use crate::sync::Lock;
 use crate::MemoryMapEntry;
 
@@ -115,11 +114,43 @@ impl AddressSpace {
         self.root.phys()
     }
 
-    /// Map a 2MB page into user space.
-    /// Asserts: vaddr is 2MB-aligned, PDE slot is empty (no double-map).
-    pub fn map(&mut self, vaddr: UserAddr, page: &PhysPage, writable: bool) {
+    /// Map a contiguous physical region into user space as 2MB pages.
+    /// Asserts: vaddr and phys are 2MB-aligned, all PDE slots are empty.
+    pub fn map_range(&mut self, vaddr: UserAddr, phys: u64, size: u64, writable: bool) {
+        assert!(vaddr.raw() & (PAGE_2M - 1) == 0, "map_range: vaddr not 2MB-aligned");
+        assert!(phys & (PAGE_2M - 1) == 0, "map_range: phys {phys:#x} not 2MB-aligned");
+        let mut offset = 0u64;
+        while offset < size {
+            let va = vaddr.raw() + offset;
+            let pa = phys + offset;
+            let mut flags = PAGE_PRESENT | PAGE_USER;
+            if writable { flags |= PAGE_WRITE; }
+            let (pml4_idx, pdpt_idx, pd_idx) = indices(va);
+            let user_flags = PAGE_PRESENT | PAGE_WRITE | PAGE_USER;
+            let pd = self.ensure_table(pml4_idx, user_flags, pdpt_idx, user_flags);
+            let existing = pd[pd_idx];
+            assert!(existing & PAGE_PRESENT == 0,
+                "map_range: PDE already present at vaddr {va:#x} (existing={existing:#x})");
+            pd[pd_idx] = pa | flags | PAGE_SIZE_BIT;
+            offset += PAGE_2M;
+        }
+    }
+
+    /// Unmap a contiguous range of 2MB pages.
+    pub fn unmap_range(&mut self, vaddr: UserAddr, size: u64) {
+        let mut offset = 0u64;
+        while offset < size {
+            self.unmap(UserAddr::new(vaddr.raw() + offset));
+            offset += PAGE_2M;
+        }
+    }
+
+    /// Map a single 2MB page, replacing any existing mapping.
+    /// Used by demand paging and shared library RW overlay.
+    pub fn remap(&mut self, vaddr: UserAddr, phys: u64, writable: bool) {
         let va = vaddr.raw();
-        assert!(va & (PAGE_2M - 1) == 0, "map: vaddr {va:#x} not 2MB-aligned");
+        assert!(va & (PAGE_2M - 1) == 0, "remap: vaddr {va:#x} not 2MB-aligned");
+        assert!(phys & (PAGE_2M - 1) == 0, "remap: phys {phys:#x} not 2MB-aligned");
 
         let mut flags = PAGE_PRESENT | PAGE_USER;
         if writable { flags |= PAGE_WRITE; }
@@ -127,12 +158,7 @@ impl AddressSpace {
         let (pml4_idx, pdpt_idx, pd_idx) = indices(va);
         let user_flags = PAGE_PRESENT | PAGE_WRITE | PAGE_USER;
         let pd = self.ensure_table(pml4_idx, user_flags, pdpt_idx, user_flags);
-
-        let existing = pd[pd_idx];
-        assert!(existing & PAGE_PRESENT == 0,
-            "map: PDE already present at vaddr {va:#x} (existing={existing:#x})");
-
-        pd[pd_idx] = page.phys() | flags | PAGE_SIZE_BIT;
+        pd[pd_idx] = phys | flags | PAGE_SIZE_BIT;
     }
 
     /// Unmap one 2MB page.

@@ -37,7 +37,7 @@ impl KernelSlice {
             "KernelSlice OOB: offset={:#x} len={} size={:#x}", offset, len, self.size);
     }
 
-    pub unsafe fn read<T: Copy>(&self, offset: usize) -> T {
+    pub unsafe fn read<T>(&self, offset: usize) -> T {
         self.check(offset, core::mem::size_of::<T>());
         core::ptr::read_unaligned(self.base.add(offset) as *const T)
     }
