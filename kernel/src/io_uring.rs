@@ -21,7 +21,7 @@ use crate::process::{self, Pid};
 use crate::scheduler::{self, EventSource};
 use crate::shared_memory::{self, SharedToken};
 use crate::sync::Lock;
-use crate::PhysAddr;
+use crate::DirectMap;
 
 use toyos_abi::io_uring::{
     IoUringCqe, IoUringParams, IoUringRingHeader, IoUringSqe,
@@ -145,7 +145,7 @@ struct PendingPoll {
 // ---------------------------------------------------------------------------
 
 struct IoUringInstance {
-    shm_phys: PhysAddr,
+    shm_phys: DirectMap,
     shm_token: SharedToken,
     sq_size: u32,
     cq_size: u32,
@@ -224,16 +224,13 @@ pub fn create(depth: u32) -> Result<(RingId, SharedToken), SyscallError> {
 
     let pid = process::current_process();
     let addr_space = process::current_address_space();
-    let shm_token = shared_memory::alloc(crate::arch::paging::PAGE_2M, pid, &addr_space);
+    let shm_token = shared_memory::alloc(crate::mm::PAGE_2M, pid, &addr_space);
 
-    // Get the physical address of the shared page
     let shm_vaddr = shared_memory::map(shm_token, pid, &addr_space)
         .map_err(|_| SyscallError::Unknown)?;
-    let pml4 = crate::arch::cpu::read_cr3().as_ptr() as *const u64;
-    let shm_phys = crate::arch::paging::virt_to_phys(pml4, crate::UserAddr::new(shm_vaddr))
+    let shm_phys = addr_space.virt_to_phys(crate::UserAddr::new(shm_vaddr))
         .ok_or(SyscallError::Unknown)?;
 
-    // Initialize the shared page
     let base = shm_phys.as_mut_ptr::<u8>();
 
     // Zero the entire page first (alloc_zeroed does this, but be explicit)

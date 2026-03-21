@@ -106,7 +106,6 @@ extern "sysv64" fn timer_handler() {
     CPU_BUSY_TICKS.fetch_add(1, Ordering::Relaxed);
     CPU_TOTAL_TICKS.fetch_add(1, Ordering::Relaxed);
 
-    crate::arch::paging::check_pml4_canaries();
 
     // Process deadlines and pending events from the timer interrupt.
     // try_lock avoids deadlock if the blocked pool is held on this CPU.

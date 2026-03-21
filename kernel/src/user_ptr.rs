@@ -9,7 +9,6 @@
 
 use core::marker::PhantomData;
 
-use crate::arch::{cpu, paging};
 use crate::UserAddr;
 
 /// Marker for types safe to interpret from / write to validated user pointers.
@@ -43,15 +42,14 @@ fn check_user_range(ptr: UserAddr, size: u64) -> bool {
 /// Translate a user virtual address to a kernel-accessible pointer via
 /// page table walk + direct map. Triggers demand paging if needed.
 fn translate(user_addr: u64) -> Option<*mut u8> {
-    let pml4 = cpu::read_cr3().as_ptr() as *const u64;
-    if let Some(phys) = paging::virt_to_phys(pml4, UserAddr::new(user_addr)) {
-        return Some(phys.as_mut_ptr());
+    let addr_space = crate::process::current_address_space();
+    if let Some(dm) = addr_space.virt_to_phys(UserAddr::new(user_addr)) {
+        return Some(dm.as_mut_ptr());
     }
-    // Page not present — trigger demand paging then retry
     if !crate::process::handle_page_fault(user_addr, 0) {
         return None;
     }
-    paging::virt_to_phys(pml4, UserAddr::new(user_addr)).map(|p| p.as_mut_ptr())
+    addr_space.virt_to_phys(UserAddr::new(user_addr)).map(|dm| dm.as_mut_ptr())
 }
 
 
@@ -95,14 +93,14 @@ impl<'a> SyscallContext<'a> {
         // One translate() per boundary — negligible for typical syscall buffers.
         let start = ptr.raw();
         let end = start + len as u64;
-        let mut boundary = (start & !(paging::PAGE_2M - 1)) + paging::PAGE_2M;
+        let mut boundary = (start & !(crate::mm::PAGE_2M - 1)) + crate::mm::PAGE_2M;
         while boundary < end {
             let k = translate(boundary)?;
             let expected = unsafe { kptr.add((boundary - start) as usize) };
             if k != expected {
                 return None;
             }
-            boundary += paging::PAGE_2M;
+            boundary += crate::mm::PAGE_2M;
         }
         if len > 1 {
             let end_kptr = translate(end - 1)?;
@@ -127,14 +125,14 @@ impl<'a> SyscallContext<'a> {
         let kptr = translate(ptr.raw())?;
         let start = ptr.raw();
         let end = start + len as u64;
-        let mut boundary = (start & !(paging::PAGE_2M - 1)) + paging::PAGE_2M;
+        let mut boundary = (start & !(crate::mm::PAGE_2M - 1)) + crate::mm::PAGE_2M;
         while boundary < end {
             let k = translate(boundary)?;
             let expected = unsafe { kptr.add((boundary - start) as usize) };
             if k != expected {
                 return None;
             }
-            boundary += paging::PAGE_2M;
+            boundary += crate::mm::PAGE_2M;
         }
         if len > 1 {
             let end_kptr = translate(end - 1)?;
@@ -194,14 +192,14 @@ impl<'a> SyscallContext<'a> {
         // Verify contiguity at every 2MB page boundary crossing.
         let start = ptr.raw();
         let end = start + byte_len as u64;
-        let mut boundary = (start & !(paging::PAGE_2M - 1)) + paging::PAGE_2M;
+        let mut boundary = (start & !(crate::mm::PAGE_2M - 1)) + crate::mm::PAGE_2M;
         while boundary < end {
             let k = translate(boundary)?;
             let expected = unsafe { kptr.add((boundary - start) as usize) };
             if k != expected {
                 return None;
             }
-            boundary += paging::PAGE_2M;
+            boundary += crate::mm::PAGE_2M;
         }
         if byte_len > 1 {
             let end_kptr = translate(end - 1)?;
@@ -231,14 +229,14 @@ impl<'a> SyscallContext<'a> {
         // Verify contiguity at every 2MB page boundary crossing.
         let start = ptr.raw();
         let end = start + byte_len as u64;
-        let mut boundary = (start & !(paging::PAGE_2M - 1)) + paging::PAGE_2M;
+        let mut boundary = (start & !(crate::mm::PAGE_2M - 1)) + crate::mm::PAGE_2M;
         while boundary < end {
             let k = translate(boundary)?;
             let expected = unsafe { kptr.add((boundary - start) as usize) };
             if k != expected {
                 return None;
             }
-            boundary += paging::PAGE_2M;
+            boundary += crate::mm::PAGE_2M;
         }
         if byte_len > 1 {
             let end_kptr = translate(end - 1)?;

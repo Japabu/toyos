@@ -4,10 +4,10 @@ use alloc::vec::Vec;
 use core::alloc::Layout;
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use crate::arch::paging::{self, PAGE_2M};
+use crate::mm::{PAGE_2M, align_2m};
 use crate::process::{AddressSpace, Pid};
 use crate::sync::Lock;
-use crate::{PhysAddr, UserAddr};
+use crate::{DirectMap, UserAddr};
 
 // ---------------------------------------------------------------------------
 // SharedToken — opaque handle for a shared memory region
@@ -67,7 +67,7 @@ fn alloc_vaddr(size: u64) -> UserAddr {
 // ---------------------------------------------------------------------------
 
 struct SharedRegion {
-    phys: PhysAddr,
+    phys: DirectMap,
     size: u64,
     vaddr: UserAddr,
     ownership: Ownership,
@@ -125,11 +125,11 @@ fn next_token() -> SharedToken {
 /// Returns a token; other processes can map it via `map()` after `grant()`.
 #[must_use]
 pub fn alloc(size: u64, owner_pid: Pid, addr_space: &Arc<AddressSpace>) -> SharedToken {
-    let aligned_size = paging::align_2m(size as usize);
+    let aligned_size = align_2m(size as usize);
     let layout = Layout::from_size_align(aligned_size, PAGE_2M as usize).unwrap();
     let ptr = unsafe { alloc_zeroed(layout) };
     assert!(!ptr.is_null(), "shared_memory: allocation failed");
-    let phys = PhysAddr::from_ptr(ptr);
+    let phys = DirectMap::from_ptr(ptr as *const u8);
     let vaddr = alloc_vaddr(aligned_size as u64);
 
     let token = next_token();
@@ -150,7 +150,7 @@ pub fn alloc(size: u64, owner_pid: Pid, addr_space: &Arc<AddressSpace>) -> Share
 /// Register an existing kernel-owned allocation as a shared region.
 /// Permanent: never auto-removed. Used for GPU framebuffers and DMA buffers.
 #[must_use]
-pub fn register(phys: PhysAddr, size: u64) -> SharedToken {
+pub fn register(phys: DirectMap, size: u64) -> SharedToken {
     let vaddr = alloc_vaddr(size);
     let token = next_token();
     with_regions_mut(|regions| {
@@ -168,7 +168,7 @@ pub fn register(phys: PhysAddr, size: u64) -> SharedToken {
 
 /// Unregister a kernel-owned shared region, unmapping it from all processes.
 /// Returns `(phys, size)` so the caller can free the backing memory.
-pub fn unregister(token: SharedToken) -> Option<(PhysAddr, u64)> {
+pub fn unregister(token: SharedToken) -> Option<(DirectMap, u64)> {
     with_regions_mut(|regions| {
         let pos = regions.iter().position(|(t, _)| *t == token)?;
         let (_, region) = regions.swap_remove(pos);

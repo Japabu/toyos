@@ -1,10 +1,4 @@
-// Physical Memory Manager — free list of 2MB pages.
-//
-// Tracks all usable physical RAM. alloc_page() pops a 2MB page from the
-// free list, free_page() pushes it back. O(1) both ways. No bitmap,
-// no buddy, no orders.
-
-use super::{PHYS_OFFSET, PAGE_2M};
+use super::{DirectMap, PAGE_2M};
 use crate::sync::Lock;
 use crate::MemoryMapEntry;
 
@@ -22,7 +16,7 @@ pub struct PhysPage(u64); // raw physical address, 2MB-aligned
 impl PhysPage {
     /// Reconstruct from a raw physical address. Caller must ensure this
     /// is a valid 2MB-aligned page that was previously allocated.
-    pub(super) unsafe fn from_raw(phys: u64) -> Self {
+    pub(super) fn from_raw(phys: u64) -> Self {
         Self(phys)
     }
 
@@ -31,9 +25,9 @@ impl PhysPage {
         self.0
     }
 
-    /// Kernel-accessible pointer via the high-half direct map.
-    pub fn as_ptr(&self) -> *mut u8 {
-        (self.0 + PHYS_OFFSET) as *mut u8
+    /// Access this page through the kernel direct map.
+    pub fn direct_map(&self) -> super::DirectMap {
+        super::DirectMap::new(self.0)
     }
 
     /// DMA address for device descriptors.
@@ -67,15 +61,13 @@ const NULL_PAGE: u64 = 0;
 
 /// Read the `next` pointer from a free page (stored in its first 8 bytes).
 fn read_next(phys: u64) -> u64 {
-    unsafe { *((phys + PHYS_OFFSET) as *const u64) }
+    unsafe { *super::DirectMap::new(phys).as_ptr::<u64>() }
 }
 
 /// Write the `next` pointer into a free page.
 fn write_next(phys: u64, next: u64) {
-    unsafe { *((phys + PHYS_OFFSET) as *mut u64) = next; }
+    unsafe { *super::DirectMap::new(phys).as_mut_ptr::<u64>() = next; }
 }
-
-// --- Public API ---
 
 /// Initialize the free list from the UEFI memory map.
 /// Extracts all 2MB-aligned chunks from usable regions, skipping reserved areas.
@@ -111,9 +103,9 @@ pub(super) fn alloc_page() -> Option<PhysPage> {
     }
     list.head = read_next(phys);
     list.free_count -= 1;
+    drop(list); // release lock before zeroing
 
-    // Zero the page before returning
-    unsafe { core::ptr::write_bytes((phys + PHYS_OFFSET) as *mut u8, 0, PAGE_2M as usize); }
+    unsafe { core::ptr::write_bytes(DirectMap::new(phys).as_mut_ptr::<u8>(), 0, PAGE_2M as usize); }
 
     Some(PhysPage(phys))
 }
@@ -134,10 +126,17 @@ pub(super) fn stats() -> (u64, u64) {
     (total, used)
 }
 
-// --- Helpers ---
+const EFI_LOADER_CODE: u32 = 1;
+const EFI_LOADER_DATA: u32 = 2;
+const EFI_BOOT_SERVICES_CODE: u32 = 3;
+const EFI_BOOT_SERVICES_DATA: u32 = 4;
+const EFI_CONVENTIONAL_MEMORY: u32 = 7;
 
 fn is_usable(entry: &MemoryMapEntry) -> bool {
-    matches!(entry.uefi_type, 1 | 2 | 3 | 4 | 7)
+    matches!(entry.uefi_type,
+        EFI_LOADER_CODE | EFI_LOADER_DATA |
+        EFI_BOOT_SERVICES_CODE | EFI_BOOT_SERVICES_DATA |
+        EFI_CONVENTIONAL_MEMORY)
 }
 
 fn overlaps_reserved(start: u64, end: u64, reserved: &[Region]) -> bool {

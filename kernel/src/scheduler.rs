@@ -5,12 +5,12 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use hashbrown::HashMap;
 
-use crate::arch::{cpu, paging, percpu};
+use crate::arch::{cpu, percpu};
 use crate::io_uring::RingId;
 use crate::pipe::PipeId;
 use crate::process::{self, AddressSpace, IdleProof, OwnedAlloc, Pid, Tid, KERNEL_STACK_SIZE};
 use crate::sync::Lock;
-use crate::PhysAddr;
+use crate::DirectMap;
 
 const IA32_FS_BASE: u32 = 0xC0000100;
 const MAX_CPUS: usize = 8;
@@ -29,7 +29,7 @@ pub enum EventSource {
     Listener,
     PipeReadable(PipeId),
     PipeWritable(PipeId),
-    Futex(PhysAddr),
+    Futex(DirectMap),
     IoUring(RingId),
 }
 
@@ -129,7 +129,7 @@ impl ThreadCtx {
         self.kernel_stack.ptr() as u64 + KERNEL_STACK_SIZE as u64
     }
 
-    pub fn cr3(&self) -> PhysAddr {
+    pub fn cr3(&self) -> DirectMap {
         unsafe { self.address_space.as_ref().unwrap().cr3_value() }
     }
 
@@ -525,7 +525,7 @@ pub fn exit_current(code: i32) -> ! {
 pub fn schedule_no_return() -> ! {
     percpu::set_current_tid(None);
     unsafe { percpu::set_kernel_stack(percpu::idle_stack_top()); }
-    unsafe { cpu::write_cr3(paging::kernel_cr3()); }
+    unsafe { cpu::write_cr3(crate::mm::paging::kernel().lock().as_ref().unwrap().cr3()); }
     let sp = percpu::idle_stack_top();
     unsafe {
         asm!(
@@ -599,7 +599,7 @@ pub fn current_address_space() -> Option<Arc<AddressSpace>> {
     q.current().and_then(|ctx| ctx.address_space.clone())
 }
 
-pub fn futex_wait(phys_addr: PhysAddr, expected: u32, deadline: u64) -> bool {
+pub fn futex_wait(phys_addr: DirectMap, expected: u32, deadline: u64) -> bool {
     let _futex = FUTEX_LOCK.lock();
     let current = unsafe { *phys_addr.as_ptr::<u32>() };
     if current != expected {
@@ -610,7 +610,7 @@ pub fn futex_wait(phys_addr: PhysAddr, expected: u32, deadline: u64) -> bool {
     true
 }
 
-pub fn futex_wake(phys_addr: PhysAddr, count: usize) -> u64 {
+pub fn futex_wake(phys_addr: DirectMap, count: usize) -> u64 {
     let _futex = FUTEX_LOCK.lock();
     let mut batch = WokenBatch::new();
     {
@@ -753,8 +753,7 @@ fn do_schedule(reason: SwitchReason) {
         let old_rsp_ptr = queue.save_rsp_ptr();
         percpu::set_current_tid(Some(new_tid));
         unsafe { percpu::set_kernel_stack(new_ks_top); }
-        paging::assert_pml4_canary(new_cr3, new_tid);
-        unsafe { cpu::write_cr3(new_cr3); }
+        unsafe { cpu::write_cr3(new_cr3.raw()); }
         cpu::wrmsr(IA32_FS_BASE, new_fs_base);
 
         queue.into_raw();
@@ -769,7 +768,7 @@ fn do_schedule(reason: SwitchReason) {
     let old_rsp_ptr = queue.save_rsp_ptr();
     percpu::set_current_tid(None);
     unsafe { percpu::set_kernel_stack(percpu::idle_stack_top()); }
-    unsafe { cpu::write_cr3(paging::kernel_cr3()); }
+    unsafe { cpu::write_cr3(crate::mm::paging::kernel().lock().as_ref().unwrap().cr3()); }
 
     queue.into_raw();
     unsafe { context_switch(old_rsp_ptr, percpu::idle_rsp()); }
@@ -840,8 +839,7 @@ fn cpu_idle_loop() -> ! {
 
                 percpu::set_current_tid(Some(new_tid));
                 unsafe { percpu::set_kernel_stack(new_ks_top); }
-                paging::assert_pml4_canary(new_cr3, new_tid);
-                unsafe { cpu::write_cr3(new_cr3); }
+                        unsafe { cpu::write_cr3(new_cr3.raw()); }
                 cpu::wrmsr(IA32_FS_BASE, new_fs_base);
 
                 queue.into_raw();

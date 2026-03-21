@@ -4,7 +4,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use alloc::alloc::{alloc_zeroed, Layout};
 
-use crate::arch::{apic, cpu, paging, percpu, syscall};
+use crate::arch::{apic, cpu, percpu, syscall};
 use crate::clock;
 use crate::drivers::acpi::MadtInfo;
 use crate::{log, process};
@@ -112,7 +112,7 @@ fn copy_trampoline() {
     let end = unsafe { asm_label_addr!(_trampoline_end) };
     let size = end as usize - start as usize;
     assert!(size <= DATA_OFFSET, "trampoline code exceeds data block");
-    let dest = crate::PhysAddr::new(TRAMPOLINE_PAGE).as_mut_ptr::<u8>();
+    let dest = crate::DirectMap::new(TRAMPOLINE_PAGE).as_mut_ptr::<u8>();
     unsafe {
         core::ptr::copy_nonoverlapping(start, dest, size);
     }
@@ -179,7 +179,7 @@ pub fn boot_aps(madt: &MadtInfo, boot_cr3: u64) {
 
     let mut data = build_trampoline_data();
     data.cr3 = boot_cr3;
-    let target = crate::PhysAddr::new(TRAMPOLINE_PAGE + DATA_OFFSET as u64).as_mut_ptr::<TrampolineData>();
+    let target = crate::DirectMap::new(TRAMPOLINE_PAGE + DATA_OFFSET as u64).as_mut_ptr::<TrampolineData>();
 
     for &ap_id in &madt.apic_ids {
         if ap_id == bsp_id { continue; }
@@ -225,7 +225,7 @@ pub fn boot_aps(madt: &MadtInfo, boot_cr3: u64) {
 extern "C" fn ap_entry() -> ! {
     // Switch from boot PML4 (identity + high-half) to kernel PML4 (high-half only).
     // We're already executing at a high-half address, so this is safe.
-    unsafe { cpu::write_cr3(paging::kernel_cr3()); }
+    unsafe { cpu::write_cr3(crate::mm::paging::kernel().lock().as_ref().unwrap().cr3()); }
 
     let lapic_id = apic::id();
     let cpu_id = NEXT_CPU_ID.fetch_add(1, Ordering::Relaxed);

@@ -1,20 +1,12 @@
-// Memory management subsystem.
-//
-// pmm      — free list of 2MB physical pages
-// paging   — page tables, kernel direct map, per-process address spaces
-// alloc    — dlmalloc GlobalAlloc backed by pmm pages
-
 pub mod pmm;
 pub mod paging;
 mod alloc;
+mod mmio;
+
+pub use mmio::Mmio;
 
 use crate::MemoryMapEntry;
-pub use pmm::{PhysPage, Region};
-// pub use paging::AddressSpace;  // TODO: enable once consumers migrate
-
-// ---------------------------------------------------------------------------
-// Address types
-// ---------------------------------------------------------------------------
+pub use pmm::Region;
 
 /// All physical memory is mapped at this virtual offset.
 pub const PHYS_OFFSET: u64 = 0xFFFF_8000_0000_0000;
@@ -82,6 +74,11 @@ pub struct DmaAddr(u64);
 
 impl DmaAddr {
     pub const fn raw(self) -> u64 { self.0 }
+
+    /// Convert a kernel direct-map pointer to a DMA address.
+    pub fn from_ptr<T>(ptr: *const T) -> Self {
+        Self(DirectMap::phys_of(ptr))
+    }
 }
 
 impl core::fmt::Debug for DmaAddr {
@@ -94,18 +91,40 @@ impl core::fmt::Debug for DmaAddr {
 /// Not an ownership token — just a safe conversion from physical to virtual.
 /// Use for bootloader-provided addresses, ACPI tables, and other fixed
 /// physical memory that needs to be read/written by the kernel.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DirectMap(u64);
 
 impl DirectMap {
     pub fn new(phys: u64) -> Self { Self(phys) }
+
+    /// Wrap a kernel direct-map pointer as a DirectMap.
+    pub fn from_ptr<T>(ptr: *const T) -> Self {
+        Self(ptr as u64 - PHYS_OFFSET)
+    }
+
+    /// The raw physical address.
+    pub fn raw(self) -> u64 { self.0 }
+
     pub fn as_ptr<T>(&self) -> *const T { (self.0 + PHYS_OFFSET) as *const T }
     pub fn as_mut_ptr<T>(&self) -> *mut T { (self.0 + PHYS_OFFSET) as *mut T }
+
+    /// Convert a kernel direct-map pointer to its physical address.
+    pub fn phys_of<T>(ptr: *const T) -> u64 {
+        ptr as u64 - PHYS_OFFSET
+    }
 }
 
-// ---------------------------------------------------------------------------
-// Boot
-// ---------------------------------------------------------------------------
+impl core::fmt::Display for DirectMap {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{:#x}", self.0)
+    }
+}
+
+impl core::fmt::Debug for DirectMap {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "DirectMap({:#x})", self.0)
+    }
+}
 
 /// Initialize the memory subsystem. Call once at boot.
 /// Order: pmm (physical pages) → paging (direct map) → alloc (heap).
@@ -116,12 +135,3 @@ pub fn init(memory_map: &[MemoryMapEntry], reserved: &[Region]) {
     alloc::init(); // switch to dlmalloc
 }
 
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
-
-pub fn alloc_page() -> Option<PhysPage> { pmm::alloc_page() }
-pub fn memory_stats() -> (u64, u64) { pmm::stats() }
-pub fn kernel_cr3() -> u64 { paging::kernel_cr3() }
-pub fn map_mmio(phys: u64, size: u64) { paging::map_mmio(phys, size) }
-pub fn debug_page_walk(addr: u64) { paging::debug_page_walk(addr) }

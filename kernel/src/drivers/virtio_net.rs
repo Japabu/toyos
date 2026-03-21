@@ -166,8 +166,6 @@ impl crate::net::Nic for VirtioNic {
 }
 
 fn setup_msix(pci_dev: &PciDevice, device: &super::virtio::VirtioDevice) {
-    use super::mmio::Mmio;
-
     let cap = match pci_dev.capabilities().find(|c| c.id() == PCI_CAP_MSIX) {
         Some(c) => c,
         None => panic!("VirtIO net: no MSI-X capability"),
@@ -177,10 +175,9 @@ fn setup_msix(pci_dev: &PciDevice, device: &super::virtio::VirtioDevice) {
     let table_bir = (table_info & 0x7) as u8;
     let table_offset = (table_info & !0x7) as u64;
     let table_bar = pci_dev.read_bar_64(table_bir);
-    let table_addr = crate::PhysAddr::new(table_bar + table_offset);
+    let table_addr = table_bar + table_offset;
 
-    crate::arch::paging::map_kernel(table_addr, 0x1000);
-    let table = Mmio::new(table_addr);
+    let table = crate::mm::paging::kernel().lock().as_mut().unwrap().map_mmio(table_addr, 0x1000);
 
     // Configure MSI-X table entry 0: route to LAPIC with our vector
     table.write_u32(0x00, 0xFEE0_0000); // msg_addr_lo: LAPIC base
@@ -213,8 +210,8 @@ fn setup_msix(pci_dev: &PciDevice, device: &super::virtio::VirtioDevice) {
         VIRTIO_NET_VECTOR, config_vec, queue_vec);
 }
 
-pub fn init(ecam_base: u64) {
-    let pci_dev = match PciDevice::find_by_id(ecam_base, VIRTIO_VENDOR, VIRTIO_NET_DEVICE) {
+pub fn init(ecam: &crate::mm::Mmio) {
+    let pci_dev = match PciDevice::find_by_id(ecam, VIRTIO_VENDOR, VIRTIO_NET_DEVICE) {
         Some(dev) => dev,
         None => {
             log!("VirtIO net: no device found");
@@ -267,10 +264,10 @@ pub fn init(ecam_base: u64) {
     // Register DMA buffers as shared memory for direct userland access.
     // All RX buffers are contiguous in the DMA pool, so register as one region.
     let rx_token = shared_memory::register(
-        crate::PhysAddr::new(rx_phys[0]),
+        crate::DirectMap::new(rx_phys[0]),
         (RX_BUF_COUNT * RX_BUF_SIZE as usize) as u64,
     ).raw();
-    let tx_token = shared_memory::register(crate::PhysAddr::new(tx_phys), 4096).raw();
+    let tx_token = shared_memory::register(crate::DirectMap::new(tx_phys), 4096).raw();
 
     crate::net::set_nic_info(NicInfo {
         rx_buf_token: rx_token,

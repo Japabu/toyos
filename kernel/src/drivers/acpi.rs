@@ -3,7 +3,7 @@ use core::mem::size_of;
 use core::ptr::{read_unaligned, read_volatile};
 use core::sync::atomic::{AtomicU16, Ordering};
 use crate::log;
-use crate::PhysAddr;
+use crate::DirectMap;
 
 pub struct MadtInfo {
     pub local_apic_addr: u32,
@@ -134,7 +134,7 @@ static SLP_TYPA: AtomicU16 = AtomicU16::new(0);
 
 /// Given the RSDP address from UEFI, parse XSDT -> MCFG -> return ECAM base address.
 pub fn find_ecam_base(rsdp_addr: u64) -> Option<u64> {
-    let rsdp = PhysAddr::new(rsdp_addr);
+    let rsdp = DirectMap::new(rsdp_addr);
     log!("ACPI: RSDP at {:#x}", rsdp_addr);
 
     let xsdt = get_xsdt(rsdp);
@@ -152,7 +152,7 @@ pub fn find_ecam_base(rsdp_addr: u64) -> Option<u64> {
 
 /// Parse FADT and DSDT to prepare for ACPI shutdown.
 pub fn init_power(rsdp_addr: u64) {
-    let xsdt = get_xsdt(PhysAddr::new(rsdp_addr));
+    let xsdt = get_xsdt(DirectMap::new(rsdp_addr));
 
     let fadt_phys = find_table(xsdt, b"FACP").expect("ACPI: FADT not found");
     let fadt = unsafe { &*fadt_phys.as_ptr::<Fadt>() };
@@ -161,13 +161,13 @@ pub fn init_power(rsdp_addr: u64) {
     PM1A_CNT_PORT.store(pm1a, Ordering::Relaxed);
 
     // Prefer X_DSDT (64-bit, ACPI 2.0+) over DSDT (32-bit)
-    let dsdt_phys = PhysAddr::new(if fadt.header.revision >= 2 && fadt.x_dsdt != 0 {
+    let dsdt_addr = if fadt.header.revision >= 2 && fadt.x_dsdt != 0 {
         fadt.x_dsdt
     } else {
         fadt.dsdt as u64
-    });
-
-    assert!(!dsdt_phys.is_null(), "ACPI: DSDT not found");
+    };
+    assert!(dsdt_addr != 0, "ACPI: DSDT not found");
+    let dsdt_phys = DirectMap::new(dsdt_addr);
 
     let dsdt = dsdt_phys.as_ptr::<SdtHeader>();
     let dsdt_len = unsafe { read_unaligned(&raw const (*dsdt).length) } as usize;
@@ -191,14 +191,14 @@ pub fn shutdown() -> ! {
 }
 
 /// Read XSDT physical address from RSDP.
-fn get_xsdt(rsdp_addr: PhysAddr) -> PhysAddr {
+fn get_xsdt(rsdp_addr: DirectMap) -> DirectMap {
     let rsdp = unsafe { &*rsdp_addr.as_ptr::<Rsdp>() };
-    PhysAddr::new(rsdp.xsdt_address)
+    DirectMap::new(rsdp.xsdt_address)
 }
 
 /// Iterate XSDT entries looking for a table with the given 4-byte signature.
 /// Returns the physical address of the matching table.
-fn find_table(xsdt: PhysAddr, signature: &[u8; 4]) -> Option<PhysAddr> {
+fn find_table(xsdt: DirectMap, signature: &[u8; 4]) -> Option<DirectMap> {
     let header = unsafe { &*xsdt.as_ptr::<SdtHeader>() };
     let length = header.length as usize;
     let entry_count = (length - size_of::<SdtHeader>()) / 8;
@@ -206,7 +206,7 @@ fn find_table(xsdt: PhysAddr, signature: &[u8; 4]) -> Option<PhysAddr> {
     let entries_base = unsafe { xsdt.as_ptr::<u8>().add(size_of::<SdtHeader>()) } as *const u64;
 
     for i in 0..entry_count {
-        let table_phys = PhysAddr::new(unsafe { read_unaligned(entries_base.add(i)) });
+        let table_phys = DirectMap::new(unsafe { read_unaligned(entries_base.add(i)) });
         let table_header = unsafe { &*table_phys.as_ptr::<SdtHeader>() };
 
         if &table_header.signature == signature {
@@ -219,7 +219,7 @@ fn find_table(xsdt: PhysAddr, signature: &[u8; 4]) -> Option<PhysAddr> {
 
 /// Given the RSDP address, parse XSDT -> HPET table -> return HPET MMIO base address.
 pub fn find_hpet_base(rsdp_addr: u64) -> Option<u64> {
-    let xsdt = get_xsdt(PhysAddr::new(rsdp_addr));
+    let xsdt = get_xsdt(DirectMap::new(rsdp_addr));
     let hpet_phys = find_table(xsdt, b"HPET")?;
     let hpet = unsafe { &*hpet_phys.as_ptr::<HpetTable>() };
     let base = hpet.base_address_value;
@@ -229,7 +229,7 @@ pub fn find_hpet_base(rsdp_addr: u64) -> Option<u64> {
 
 /// Parse MADT (signature "APIC") to discover Local APIC address and per-CPU APIC IDs.
 pub fn parse_madt(rsdp_addr: u64) -> Option<MadtInfo> {
-    let xsdt = get_xsdt(PhysAddr::new(rsdp_addr));
+    let xsdt = get_xsdt(DirectMap::new(rsdp_addr));
     let madt_phys = find_table(xsdt, b"APIC")?;
     let madt = unsafe { &*madt_phys.as_ptr::<Madt>() };
 

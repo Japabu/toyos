@@ -5,14 +5,14 @@ use alloc::vec::Vec;
 use core::arch::naked_asm;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, Ordering};
-use crate::arch::{cpu, paging, percpu};
-use crate::arch::paging::PAGE_2M;
+use crate::arch::{cpu, percpu};
+use crate::mm::PAGE_2M;
 use crate::fd::{self, Descriptor, FdTable};
 use crate::id_map::IdMap;
 use crate::sync::Lock;
 use crate::symbols::ProcessSymbols;
 use crate::{elf, pipe, scheduler, shared_memory, vfs};
-use crate::{KernelAddr, PhysAddr, UserAddr};
+use crate::{DirectMap, UserAddr};
 
 pub use toyos_abi::{Pid, Tid};
 use toyos_abi::syscall::SyscallError;
@@ -34,11 +34,11 @@ impl crate::id_map::IdKey for Pid {
 /// Physical address of a PML4 page table. Private, non-Copy — only accessible
 /// through AddressSpace. This makes dangling page table pointers impossible:
 /// you must hold an Arc<AddressSpace> to access page tables.
-struct PageTableRoot(PhysAddr);
+struct PageTableRoot(DirectMap);
 
 impl PageTableRoot {
-    fn new(addr: PhysAddr) -> Self { Self(addr) }
-    fn phys(&self) -> PhysAddr { self.0 }
+    fn new(addr: DirectMap) -> Self { Self(addr) }
+    fn phys(&self) -> DirectMap { self.0 }
     fn as_ptr(&self) -> *mut u64 { self.0.as_mut_ptr() }
 }
 
@@ -75,7 +75,7 @@ unsafe impl Send for AddressSpace {}
 unsafe impl Sync for AddressSpace {}
 
 impl AddressSpace {
-    pub fn new(addr: PhysAddr) -> Arc<Self> {
+    pub fn new(addr: DirectMap) -> Arc<Self> {
         Arc::new(Self { root: PageTableRoot::new(addr), dead: AtomicBool::new(false) })
     }
 
@@ -84,15 +84,15 @@ impl AddressSpace {
 
     /// Raw CR3 value for hardware register writes.
     /// SAFETY: Caller must hold Arc<AddressSpace> for the duration of the CR3 load.
-    pub unsafe fn cr3_value(&self) -> PhysAddr { self.root.phys() }
+    pub unsafe fn cr3_value(&self) -> DirectMap { self.root.phys() }
 
     // --- Public API: VmaList-managed allocations (for syscall code) ---
 
     /// Allocate a virtual address range and map physical memory. One operation.
     /// Returns `None` if the virtual address space is exhausted.
-    pub fn map_region(&self, vmas: &mut crate::vma::VmaList, phys: PhysAddr, size: u64) -> Option<MappedRegion> {
+    pub fn map_region(&self, vmas: &mut crate::vma::VmaList, phys: DirectMap, size: u64) -> Option<MappedRegion> {
         let vaddr = vmas.alloc_region(size).ok()?;
-        let aligned = paging::align_2m(size as usize) as u64;
+        let aligned = crate::mm::align_2m(size as usize) as u64;
         paging::map_user_at(self.root.as_ptr(), vaddr, phys, aligned);
         Some(MappedRegion { vaddr, size: aligned })
     }
@@ -100,9 +100,9 @@ impl AddressSpace {
     /// Allocate a stack region with guard pages on both sides and map it.
     /// Returns `None` if the virtual address space is exhausted.
     #[allow(dead_code)]
-    pub fn map_stack(&self, vmas: &mut crate::vma::VmaList, phys: PhysAddr, size: u64) -> Option<MappedRegion> {
+    pub fn map_stack(&self, vmas: &mut crate::vma::VmaList, phys: DirectMap, size: u64) -> Option<MappedRegion> {
         let vaddr = vmas.alloc_stack(size).ok()?;
-        let aligned = paging::align_2m(size as usize) as u64;
+        let aligned = crate::mm::align_2m(size as usize) as u64;
         paging::map_user_at(self.root.as_ptr(), vaddr, phys, aligned);
         Some(MappedRegion { vaddr, size: aligned })
     }
@@ -118,7 +118,7 @@ impl AddressSpace {
 
     /// Map at a fixed virtual address. Used for main thread stack, shared memory,
     /// and demand paging. Not available to syscall handlers.
-    pub(crate) fn map_at(&self, vaddr: UserAddr, phys: PhysAddr, size: u64) {
+    pub(crate) fn map_at(&self, vaddr: UserAddr, phys: DirectMap, size: u64) {
         paging::map_user_at(self.root.as_ptr(), vaddr, phys, size);
     }
 
@@ -129,7 +129,7 @@ impl AddressSpace {
     }
 
     /// Remap a single 2MB page (demand paging, MAP_FIXED).
-    pub fn remap_2m(&self, vaddr: UserAddr, phys: PhysAddr, writable: bool) -> bool {
+    pub fn remap_2m(&self, vaddr: UserAddr, phys: DirectMap, writable: bool) -> bool {
         paging::remap_user_2m(self.root.as_ptr(), vaddr, phys, writable)
     }
 
@@ -139,7 +139,7 @@ impl AddressSpace {
     }
 
     /// Translate virtual to physical by walking page tables.
-    pub fn virt_to_phys(&self, vaddr: UserAddr) -> Option<PhysAddr> {
+    pub fn virt_to_phys(&self, vaddr: UserAddr) -> Option<DirectMap> {
         paging::virt_to_phys(self.root.as_ptr() as *const u64, vaddr)
     }
 }
@@ -241,12 +241,12 @@ pub const KERNEL_STACK_SIZE: usize = 128 * 1024;
 /// physical address (for kernel direct-map writes). Impossible to confuse the two.
 pub struct UserStack {
     vaddr: UserAddr,
-    phys: PhysAddr,
+    phys: DirectMap,
     size: u64,
 }
 
 impl UserStack {
-    pub fn new(vaddr: UserAddr, phys: PhysAddr, size: u64) -> Self {
+    pub fn new(vaddr: UserAddr, phys: DirectMap, size: u64) -> Self {
         Self { vaddr, phys, size }
     }
 
@@ -474,7 +474,7 @@ pub struct ProcessData {
     pub elf_alloc: Option<OwnedAlloc>,
     pub stack_alloc: Option<OwnedAlloc>,
     // Thread-local storage
-    pub tls_template: KernelAddr,
+    pub tls_template: DirectMap,
     pub tls_filesz: usize,
     pub tls_memsz: usize,
     pub tls_alloc: Option<OwnedAlloc>,
@@ -769,7 +769,7 @@ pub fn with_fd_owner_data<R>(f: impl FnOnce(&mut ProcessData) -> R) -> R {
 /// [TLS data (.tdata + .tbss)] [TCB: self-pointer]
 ///                              ^-- FS base (thread pointer)
 /// Returns (alloc, fs_base).
-pub fn setup_tls(tls_template: KernelAddr, tls_filesz: usize, tls_memsz: usize, tls_align: usize) -> Option<(OwnedAlloc, u64)> {
+pub fn setup_tls(tls_template: DirectMap, tls_filesz: usize, tls_memsz: usize, tls_align: usize) -> Option<(OwnedAlloc, u64)> {
     setup_combined_tls(&[elf::TlsModule { template: tls_template, filesz: tls_filesz, memsz: tls_memsz, base_offset: 0, module_id: 1, is_static: true }], tls_memsz, tls_align)
 }
 
@@ -809,7 +809,7 @@ pub fn setup_combined_tls(
     tls_align: usize,
 ) -> Option<(OwnedAlloc, u64)> {
     let block_size = total_memsz + TCB_SIZE;
-    let alloc_size = paging::align_2m(block_size + tls_align);
+    let alloc_size = crate::mm::align_2m(block_size + tls_align);
     let uninit_alloc = OwnedAlloc::new_uninit(alloc_size, PAGE_2M as usize)?;
     let block = uninit_alloc.ptr();
 
@@ -835,7 +835,7 @@ pub fn setup_combined_tls(
     }
 
     // TP must be a user-visible physical address (mapped with USER bit in user page tables).
-    let block_phys = PhysAddr::from_ptr(block).raw();
+    let block_phys = DirectMap::from_ptr(block).raw();
     let tp_user = block_phys + (tls_start + total_memsz) as u64;
     // Write self-pointer via kernel direct map
     let tp_kernel = block as u64 + (tls_start + total_memsz) as u64;
@@ -990,7 +990,7 @@ pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64, stack_base: u64) -> Op
     let fs_base = {
         let addr_space = parent_addr_space.as_ref().expect("spawn_thread: no address space");
         let mut parent_data = data_arc.lock();
-        let tls_phys = PhysAddr::from_ptr(tls_alloc.ptr());
+        let tls_phys = DirectMap::from_ptr(tls_alloc.ptr());
         let tls_region = addr_space.map_region(&mut parent_data.vmas, tls_phys, tls_alloc.size() as u64)
             .expect("spawn_thread: out of virtual address space");
         // Rebase fs_base and internal TLS pointers from physical to virtual
@@ -1273,8 +1273,8 @@ fn build_tls_layout(
     if layout.tls_memsz > 0 {
         if cursor > 0 { cursor = (cursor + 15) & !15; }
         let template_addr = exe_tls_template
-            .map(|buf| KernelAddr::from_ptr(buf.ptr()))
-            .unwrap_or(KernelAddr::null());
+            .map(|buf| DirectMap::from_ptr(buf.ptr()))
+            .unwrap_or(DirectMap::null());
         modules.push(elf::TlsModule {
             template: template_addr, filesz: layout.tls_filesz,
             memsz: layout.tls_memsz, base_offset: cursor, module_id: 1,
@@ -1482,7 +1482,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
     let t_deps = crate::clock::nanos_since_boot();
 
     // 8. Create user address space (PML4) — ELF segments are demand-faulted
-    let child_addr_space = AddressSpace::new(paging::create_user_pml4());
+    let child_addr_space = AddressSpace::new(crate::mm::paging::AddressSpace::new_user());
 
     // 8a. Map shared libraries via VmaList and assign virtual addresses.
     // This MUST happen BEFORE relocation processing so that user_base is correct
@@ -1490,7 +1490,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
     for lib in &mut loaded_libs {
         match &lib.memory {
             elf::LibMemory::Owned(alloc) => {
-                let phys = PhysAddr::from_ptr(alloc.ptr());
+                let phys = DirectMap::from_ptr(alloc.ptr());
                 let region = child_addr_space.map_region(&mut vmas, phys, alloc.size() as u64)
                     .expect("spawn: out of virtual address space for lib");
                 lib.user_base = region.vaddr();
@@ -1503,7 +1503,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
                 let num_rw_pages = rw_alloc.size() / paging::PAGE_2M as usize;
                 for i in 0..num_rw_pages {
                     let user_virt = lib_vaddr.raw() + *rw_offset as u64 + i as u64 * paging::PAGE_2M;
-                    let phys = PhysAddr::from_ptr(rw_alloc.ptr()) + i as u64 * paging::PAGE_2M;
+                    let phys = DirectMap::from_ptr(rw_alloc.ptr()) + i as u64 * paging::PAGE_2M;
                     child_addr_space.remap_2m(UserAddr::new(user_virt), phys, true);
                 }
                 lib.user_base = lib_vaddr;
@@ -1576,7 +1576,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
             return Err(SyscallError::ResourceExhausted);
         }
     };
-    let stack_phys = PhysAddr::from_ptr(stack_alloc.ptr());
+    let stack_phys = DirectMap::from_ptr(stack_alloc.ptr());
     let stack_vaddr = UserAddr::new(crate::vma::STACK_BASE);
     let user_stack = UserStack::new(stack_vaddr, stack_phys, USER_STACK_SIZE as u64);
     child_addr_space.map_at(stack_vaddr, stack_phys, USER_STACK_SIZE as u64);
@@ -1619,7 +1619,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
     {
         let exe_base_offset = tls_modules.iter()
             .find(|m| {
-                exe_tls_template.as_ref().map_or(false, |buf| m.template == KernelAddr::from_ptr(buf.ptr()))
+                exe_tls_template.as_ref().map_or(false, |buf| m.template == DirectMap::from_ptr(buf.ptr()))
             })
             .map(|m| m.base_offset)
             .unwrap_or(0);
@@ -1660,7 +1660,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
     let (tls_template, tls_filesz, tls_memsz) = if !tls_modules.is_empty() {
         (tls_modules[0].template, tls_modules[0].filesz, tls_modules[0].memsz)
     } else {
-        (KernelAddr::null(), 0, 0)
+        (DirectMap::null(), 0, 0)
     };
 
     log!("spawn: TLS {} modules, total_memsz={}", tls_modules.len(), tls_total_memsz);
@@ -1673,7 +1673,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
             }
         }
     } else {
-        match setup_tls(KernelAddr::null(), 0, 0, 1) {
+        match setup_tls(DirectMap::null(), 0, 0, 1) {
             Some(v) => v,
             None => {
                 log!("spawn: {}: failed to allocate TLS (empty)", path);
@@ -1682,7 +1682,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
         }
     };
     // TLS mapped via VmaList — rebase all user-visible pointers from phys to vaddr
-    let tls_phys = PhysAddr::from_ptr(tls_alloc.ptr());
+    let tls_phys = DirectMap::from_ptr(tls_alloc.ptr());
     let tls_region = child_addr_space.map_region(&mut vmas, tls_phys, tls_alloc.size() as u64)
         .expect("spawn: out of virtual address space for TLS");
     let tls_rebase = tls_region.vaddr().raw() as i64 - tls_phys.raw() as i64;
@@ -1943,7 +1943,7 @@ pub fn exit(code: i32) -> ! {
         let tid = current_tid();
         let Some(entry) = table.get(tid) else {
             drop(guard);
-            unsafe { cpu::write_cr3(paging::kernel_cr3()); }
+            unsafe { cpu::write_cr3(crate::mm::paging::kernel().lock().as_ref().unwrap().cr3()); }
             scheduler::exit_current(code);
         };
         let process_pid = entry.process();
@@ -1954,7 +1954,7 @@ pub fn exit(code: i32) -> ! {
     };
 
     // Phase 2: Switch to kernel CR3 and clean up resources
-    unsafe { cpu::write_cr3(paging::kernel_cr3()); }
+    unsafe { cpu::write_cr3(crate::mm::paging::kernel().lock().as_ref().unwrap().cr3()); }
     teardown_resources(&data_arc, process_pid);
 
     // Phase 3: Scheduling teardown (table lock, then release before waking)
@@ -1985,7 +1985,7 @@ pub fn thread_exit(code: i32) -> ! {
     let kind = with_current_sched(|s| *s.kind());
     let addr_space = scheduler::current_address_space();
 
-    unsafe { cpu::write_cr3(paging::kernel_cr3()); }
+    unsafe { cpu::write_cr3(crate::mm::paging::kernel().lock().as_ref().unwrap().cr3()); }
 
     match kind {
         Kind::Thread { parent } => {
@@ -2204,7 +2204,7 @@ pub fn handle_page_fault(fault_addr: u64, _error_code: u64) -> bool {
         Some(a) => a,
         None => return false,
     };
-    let phys = PhysAddr::from_ptr(alloc.ptr());
+    let phys = DirectMap::from_ptr(alloc.ptr());
     let page_ptr = alloc.ptr();
 
 

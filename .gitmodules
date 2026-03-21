@@ -73,9 +73,6 @@
 [submodule "userland/raw-window-handle"]
 	path = userland/raw-window-handle
 	url = https://github.com/Japabu/raw-window-handle.git
-[submodule "userland/dlmalloc-rs"]
-	path = userland/dlmalloc-rs
-	url = https://github.com/Japabu/dlmalloc-rs.git
 [submodule "userland/rustix"]
 	path = userland/rustix
 	url = https://github.com/Japabu/rustix.git

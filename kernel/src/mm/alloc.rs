@@ -1,8 +1,3 @@
-// Kernel heap allocator — dlmalloc backed by 2MB pages from pmm.
-//
-// All kernel heap allocations (Box, Vec, String, etc.) go through this.
-// dlmalloc handles slab/bucket allocation internally. We just feed it pages.
-
 use core::alloc::{GlobalAlloc, Layout};
 use core::sync::atomic::{AtomicU8, Ordering};
 
@@ -10,17 +5,13 @@ use super::PHYS_OFFSET;
 use super::PAGE_2M;
 use super::pmm;
 
-// ---------------------------------------------------------------------------
-// Page source for dlmalloc
-// ---------------------------------------------------------------------------
-
 struct KernelPageSource;
 
 unsafe impl dlmalloc::Allocator for KernelPageSource {
     fn alloc(&self, _size: usize) -> (*mut u8, usize, u32) {
         // Single 2MB page per request. dlmalloc rarely asks for more.
         if let Some(page) = pmm::alloc_page() {
-            let ptr = page.as_ptr();
+            let ptr = page.direct_map().as_mut_ptr::<u8>();
             core::mem::forget(page); // dlmalloc manages the lifetime
             (ptr, PAGE_2M as usize, 0)
         } else {
@@ -40,7 +31,7 @@ unsafe impl dlmalloc::Allocator for KernelPageSource {
         // Return the 2MB page to pmm
         let phys = ptr as u64 - PHYS_OFFSET;
         // Reconstruct a PhysPage to return via Drop
-        let page = unsafe { super::pmm::PhysPage::from_raw(phys) };
+        let page = super::pmm::PhysPage::from_raw(phys);
         drop(page);
         true
     }
@@ -57,10 +48,6 @@ unsafe impl dlmalloc::Allocator for KernelPageSource {
         PAGE_2M as usize
     }
 }
-
-// ---------------------------------------------------------------------------
-// GlobalAlloc implementation
-// ---------------------------------------------------------------------------
 
 struct KernelAllocator {
     dlmalloc: Lock<dlmalloc::Dlmalloc<KernelPageSource>>,
@@ -105,10 +92,6 @@ unsafe impl GlobalAlloc for KernelAllocator {
 #[global_allocator]
 static ALLOCATOR: KernelAllocator = KernelAllocator::new();
 
-// ---------------------------------------------------------------------------
-// Early bump allocator (before pmm + paging are ready)
-// ---------------------------------------------------------------------------
-
 const EARLY_SIZE: usize = 512 * 1024;
 
 #[repr(C, align(4096))]
@@ -134,10 +117,6 @@ fn is_early_ptr(ptr: *mut u8) -> bool {
     p >= buf_start && p < buf_start + EARLY_SIZE
 }
 
-// ---------------------------------------------------------------------------
-// Init
-// ---------------------------------------------------------------------------
-
 /// Phase 1: Enable early bump allocator (before paging).
 pub(super) fn init_early() {
     ALLOCATOR.phase.store(PHASE_EARLY, Ordering::Release);
@@ -146,9 +125,4 @@ pub(super) fn init_early() {
 /// Phase 2: Switch to dlmalloc (after pmm + paging are ready).
 pub(super) fn init() {
     ALLOCATOR.phase.store(PHASE_READY, Ordering::Release);
-}
-
-/// Memory stats from pmm (total usable, used).
-pub(super) fn memory_stats() -> (u64, u64) {
-    pmm::stats()
 }

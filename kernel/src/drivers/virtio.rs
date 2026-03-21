@@ -1,11 +1,9 @@
 use core::ptr::{read_volatile, write_volatile, write_bytes};
 use core::sync::atomic::{fence, Ordering};
 
-use super::mmio::Mmio;
+use crate::mm::Mmio;
 use super::pci::PciDevice;
-use crate::arch::paging;
 use crate::log;
-use crate::PhysAddr;
 
 // VirtIO PCI capability types
 const VIRTIO_PCI_CAP_COMMON_CFG: u8 = 1;
@@ -81,16 +79,30 @@ impl VirtioPciConfig {
         let mut isr = None;
         let mut device = None;
 
+        // Map all BAR regions used by VirtIO capabilities
+        let mut mapped_bars: [Option<crate::mm::Mmio>; 6] = [None, None, None, None, None, None];
+        for cap in pci_dev.capabilities() {
+            if cap.id() != PCI_CAP_ID_VENDOR { continue; }
+            let bar_idx = cap.read_u8(4) as usize;
+            if bar_idx < 6 && mapped_bars[bar_idx].is_none() {
+                let bar_addr = pci_dev.read_bar_64(bar_idx as u8);
+                if bar_addr != 0 {
+                    mapped_bars[bar_idx] = Some(crate::mm::paging::kernel().lock().as_mut().unwrap().map_mmio(bar_addr, 0x4000));
+                }
+            }
+        }
+
         for cap in pci_dev.capabilities() {
             if cap.id() != PCI_CAP_ID_VENDOR {
                 continue;
             }
             let cfg_type = cap.read_u8(3);
-            let bar_idx = cap.read_u8(4);
+            let bar_idx = cap.read_u8(4) as usize;
             let offset = cap.read_u32(8) as u64;
+            let length = cap.read_u32(12) as u64;
 
-            let bar_addr = pci_dev.read_bar_64(bar_idx);
-            let mmio = Mmio::new(crate::PhysAddr::new(bar_addr + offset));
+            let bar = mapped_bars[bar_idx].as_ref().expect("VirtIO: BAR not mapped");
+            let mmio = bar.subregion(offset, length.max(4));
 
             match cfg_type {
                 VIRTIO_PCI_CAP_COMMON_CFG if common.is_none() => common = Some(mmio),
@@ -361,19 +373,6 @@ impl VirtioDevice {
         pci_dev.enable_bus_master();
 
         let config = VirtioPciConfig::parse(pci_dev);
-
-        // Map the BAR regions used by capabilities
-        // The BAR addresses are physical; we access them via the kernel direct map.
-        // Map a generous region covering all capability offsets.
-        for cap in pci_dev.capabilities() {
-            if cap.id() != PCI_CAP_ID_VENDOR { continue; }
-            let bar_idx = cap.read_u8(4);
-            let bar_addr = pci_dev.read_bar_64(bar_idx);
-            if bar_addr != 0 {
-                paging::map_kernel(PhysAddr::new(bar_addr), 0x4000);
-            }
-        }
-
         let common = config.common;
 
         // 1. Reset

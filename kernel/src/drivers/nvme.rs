@@ -1,6 +1,6 @@
 use core::ptr::{read_volatile, write_volatile, write_bytes, copy_nonoverlapping};
 use core::sync::atomic::{fence, Ordering};
-use super::mmio::Mmio;
+use crate::mm::Mmio;
 use super::pci::PciDevice;
 use super::DmaPool;
 use crate::block::{BlockDevice, DeviceId};
@@ -353,16 +353,16 @@ impl BlockDevice for NvmeBlockDevice {
     }
 }
 
-pub fn init(ecam_base: u64) -> Option<NvmeBlockDevice> {
-    let pci_dev = PciDevice::find(ecam_base, 0x01, 0x08, None)?;
+pub fn init(ecam: &crate::mm::Mmio) -> Option<NvmeBlockDevice> {
+    let pci_dev = PciDevice::find(ecam, 0x01, 0x08, None)?;
     log!("NVMe: found at PCI {:02x}:{:02x}.{}", pci_dev.bus, pci_dev.dev, pci_dev.func);
     *DMA_POOL.lock() = Some(DmaPool::alloc(DMA_PAGES));
 
-    let bar = Mmio::new(crate::PhysAddr::new(pci_dev.read_bar_64(0)));
+    let bar_addr = pci_dev.read_bar_64(0);
     pci_dev.enable_bus_master();
-    log!("NVMe: BAR0={:#x}", bar.addr());
+    log!("NVMe: BAR0={:#x}", bar_addr);
 
-    crate::arch::paging::map_kernel(bar.addr(), 0x4000);
+    let bar = crate::mm::paging::kernel().lock().as_mut().unwrap().map_mmio(bar_addr, 0x4000);
 
     let cap = bar.read_u64(REG_CAP);
     let stride = ((cap >> 32) & 0xF) as u32;

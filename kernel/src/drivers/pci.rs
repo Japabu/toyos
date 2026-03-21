@@ -1,7 +1,6 @@
-use super::mmio::Mmio;
+use crate::mm::Mmio;
 use crate::log;
 
-// PCI configuration space offsets
 const VENDOR_ID: u64 = 0x00;
 const DEVICE_ID: u64 = 0x02;
 const COMMAND: u64 = 0x04;
@@ -15,7 +14,6 @@ const CAPABILITIES_PTR: u64 = 0x34;
 const MULTI_FUNCTION: u8 = 0x80;
 const INVALID_VENDOR: u16 = 0xFFFF;
 
-/// A PCI capability in the capability linked list.
 pub struct Capability<'a> {
     device: &'a PciDevice,
     offset: u64,
@@ -52,12 +50,11 @@ pub struct PciDevice {
 }
 
 impl PciDevice {
-    fn new(ecam_base: u64, bus: u8, dev: u8, func: u8) -> Self {
-        let addr = ecam_base
-            | ((bus as u64) << 20)
+    fn new(ecam: &crate::mm::Mmio, bus: u8, dev: u8, func: u8) -> Self {
+        let offset = ((bus as u64) << 20)
             | ((dev as u64) << 15)
             | ((func as u64) << 12);
-        Self { mmio: Mmio::new(crate::PhysAddr::new(addr)), bus, dev, func }
+        Self { mmio: ecam.subregion(offset, 4096), bus, dev, func }
     }
 
     pub fn vendor_id(&self) -> u16 {
@@ -80,18 +77,15 @@ impl PciDevice {
         self.mmio.read_u32(offset)
     }
 
-    /// Read a Base Address Register by index (0–5).
-    /// Handles both 32-bit and 64-bit BARs correctly.
+    /// Read a Base Address Register by index (0-5).
     pub fn read_bar_64(&self, index: u8) -> u64 {
         let offset = BAR_BASE + index as u64 * 4;
         let low = self.mmio.read_u32(offset) as u64;
         let bar_type = (low >> 1) & 0x3;
         if bar_type == 2 {
-            // 64-bit BAR: combine low and high 32-bit registers
             let high = self.mmio.read_u32(offset + 4) as u64;
             ((high << 32) | low) & !0xF
         } else {
-            // 32-bit BAR
             low & !0xF
         }
     }
@@ -106,26 +100,25 @@ impl PciDevice {
         self.mmio.write_u16(COMMAND, cmd | 0x06);
     }
 
-    /// Iterate all PCI capabilities in the capability linked list.
     pub fn capabilities(&self) -> CapabilityIter<'_> {
         let first = self.mmio.read_u8(CAPABILITIES_PTR);
         CapabilityIter { device: self, next: first }
     }
 
     /// Find a PCI device by class, subclass, and optional prog_if.
-    pub fn find(ecam_base: u64, class: u8, subclass: u8, prog_if: Option<u8>) -> Option<Self> {
-        Self::scan(ecam_base, |pci| pci.matches_class(class, subclass, prog_if))
+    pub fn find(ecam: &crate::mm::Mmio, class: u8, subclass: u8, prog_if: Option<u8>) -> Option<Self> {
+        Self::scan(ecam, |pci| pci.matches_class(class, subclass, prog_if))
     }
 
     /// Find a PCI device by vendor and device ID.
-    pub fn find_by_id(ecam_base: u64, vendor: u16, device: u16) -> Option<Self> {
-        Self::scan(ecam_base, |pci| pci.vendor_id() == vendor && pci.device_id() == device)
+    pub fn find_by_id(ecam: &crate::mm::Mmio, vendor: u16, device: u16) -> Option<Self> {
+        Self::scan(ecam, |pci| pci.vendor_id() == vendor && pci.device_id() == device)
     }
 
-    fn scan(ecam_base: u64, predicate: impl Fn(&PciDevice) -> bool) -> Option<Self> {
+    fn scan(ecam: &crate::mm::Mmio, predicate: impl Fn(&PciDevice) -> bool) -> Option<Self> {
         for bus in 0..=255u16 {
             for dev in 0..32u8 {
-                let pci = PciDevice::new(ecam_base, bus as u8, dev, 0);
+                let pci = PciDevice::new(ecam, bus as u8, dev, 0);
                 if pci.vendor_id() == INVALID_VENDOR { continue; }
 
                 if predicate(&pci) {
@@ -134,7 +127,7 @@ impl PciDevice {
 
                 if pci.mmio.read_u8(HEADER_TYPE) & MULTI_FUNCTION != 0 {
                     for func in 1..=7u8 {
-                        let pci = PciDevice::new(ecam_base, bus as u8, dev, func);
+                        let pci = PciDevice::new(ecam, bus as u8, dev, func);
                         if pci.vendor_id() == INVALID_VENDOR { continue; }
                         if predicate(&pci) {
                             return Some(pci);
@@ -175,19 +168,19 @@ impl<'a> Iterator for CapabilityIter<'a> {
 }
 
 /// Enumerate all PCIe devices via ECAM and print them.
-pub fn enumerate(ecam_base: u64) {
+pub fn enumerate(ecam: &crate::mm::Mmio) {
     log!("PCI: Enumerating devices...");
 
     for bus in 0..=255u16 {
         for dev in 0..32u8 {
-            let pci = PciDevice::new(ecam_base, bus as u8, dev, 0);
+            let pci = PciDevice::new(ecam, bus as u8, dev, 0);
             if pci.vendor_id() == INVALID_VENDOR { continue; }
 
             print_device(&pci);
 
             if pci.read_config_u8(HEADER_TYPE) & MULTI_FUNCTION != 0 {
                 for func in 1..=7u8 {
-                    let pci = PciDevice::new(ecam_base, bus as u8, dev, func);
+                    let pci = PciDevice::new(ecam, bus as u8, dev, func);
                     if pci.vendor_id() != INVALID_VENDOR {
                         print_device(&pci);
                     }

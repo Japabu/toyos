@@ -1,10 +1,10 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use crate::arch::paging::{self, PAGE_2M};
+use crate::mm::{PAGE_2M, align_2m};
 use crate::process::OwnedAlloc;
 use crate::UserAddr;
-use crate::{PhysAddr, KernelAddr};
+use crate::DirectMap;
 use crate::sync::Lock;
 use elf::ElfBytes;
 use elf::endian::AnyEndian;
@@ -25,7 +25,7 @@ const R_X86_64_TPOFF32: u32 = 23;
 // ── ELF binary structures ───────────────────────────────────────────────
 // These match the on-disk/in-memory ELF64 layout (repr(C)). The `elf` crate's
 // Symbol/Rela types reorder fields during parsing, so they can't be used for
-// raw pointer reads via KernelAddr::read_at.
+// raw pointer reads via DirectMap::read_at.
 
 /// ELF64 symbol table entry (24 bytes).
 #[derive(Clone, Copy)]
@@ -84,7 +84,7 @@ pub enum LibMemory {
         /// Private copy of the RW segment pages.
         rw_alloc: OwnedAlloc,
         /// Physical start address of the cached allocation.
-        cached_addr: PhysAddr,
+        cached_addr: DirectMap,
         /// Total size of the cached allocation.
         cached_size: usize,
         /// 2MB-aligned offset within cached alloc where private RW region starts.
@@ -114,7 +114,7 @@ pub struct CachedRelocs {
 }
 
 /// Scan rela/jmprel tables and extract non-RELATIVE entries.
-fn prescan_relocs(rela_addr: KernelAddr, rela_size: u64, jmprel_addr: KernelAddr, jmprel_size: u64) -> CachedRelocs {
+fn prescan_relocs(rela_addr: DirectMap, rela_size: u64, jmprel_addr: DirectMap, jmprel_size: u64) -> CachedRelocs {
     let mut relocs = CachedRelocs {
         bind: alloc::vec::Vec::new(),
         tpoff64: alloc::vec::Vec::new(),
@@ -204,7 +204,7 @@ fn cache_loaded_lib(path: &str, lib: LoadedLib, rw_vaddr: u64, rw_end_vaddr: u64
     let rw_start_in_alloc = (base_kern + rw_vaddr).raw() as usize - alloc_ptr as usize;
     let rw_end_in_alloc = (base_kern + rw_end_vaddr).raw() as usize - alloc_ptr as usize;
     let rw_offset = rw_start_in_alloc & !(PAGE_2M as usize - 1);
-    let rw_size = paging::align_2m(rw_end_in_alloc) - rw_offset;
+    let rw_size = align_2m(rw_end_in_alloc) - rw_offset;
 
     // Pre-scan relocs from the allocation (which stays in place as the cache).
     let relocs = prescan_relocs(rela_addr, rela_size, jmprel_addr, jmprel_size);
@@ -214,7 +214,7 @@ fn cache_loaded_lib(path: &str, lib: LoadedLib, rw_vaddr: u64, rw_end_vaddr: u64
 
     // Allocate private RW pages for the first user.
     // Store as physical address — user processes see physical addresses
-    let cached_addr = crate::PhysAddr::from_ptr(alloc_ptr);
+    let cached_addr = crate::DirectMap::from_ptr(alloc_ptr);
     let uninit_rw = match OwnedAlloc::new_uninit(rw_size, PAGE_2M as usize) {
         Some(a) => a,
         None => {
@@ -287,7 +287,7 @@ pub fn try_clone_cached(path: &str) -> Option<LoadedLib> {
 fn clone_from_cache(cached: &CachedLib) -> Option<LoadedLib> {
     let t0 = crate::clock::nanos_since_boot();
 
-    let cached_phys = crate::PhysAddr::from_ptr(cached.alloc.ptr());
+    let cached_phys = crate::DirectMap::from_ptr(cached.alloc.ptr());
     let base = cached_phys - cached.vaddr_min;
 
     // Allocate and copy only the private (RW) portion
@@ -317,22 +317,22 @@ fn clone_from_cache(cached: &CachedLib) -> Option<LoadedLib> {
         },
         user_base: UserAddr::new(base.raw()),
         phys_base: base,
-        // dynsym/dynstr/rela/jmprel are kernel-read addresses → KernelAddr
+        // dynsym/dynstr/rela/jmprel are kernel-read addresses → DirectMap
         dynsym: base_kern + cached.dynsym_off,
         dynstr: base_kern + cached.dynstr_off,
         dynstr_size: cached.dynstr_size,
         sym_count: cached.sym_count,
         tls_template: if cached.tls_memsz > 0 {
             base_kern + cached.tls_vaddr
-        } else { KernelAddr::null() },
+        } else { DirectMap::null() },
         tls_filesz: cached.tls_filesz,
         tls_memsz: cached.tls_memsz,
         tls_align: cached.tls_align,
-        rela_addr: if cached.rela_off != 0 { base_kern + cached.rela_off } else { KernelAddr::null() },
+        rela_addr: if cached.rela_off != 0 { base_kern + cached.rela_off } else { DirectMap::null() },
         rela_size: cached.rela_size,
-        jmprel_addr: if cached.jmprel_off != 0 { base_kern + cached.jmprel_off } else { KernelAddr::null() },
+        jmprel_addr: if cached.jmprel_off != 0 { base_kern + cached.jmprel_off } else { DirectMap::null() },
         jmprel_size: cached.jmprel_size,
-        gnu_hash: if cached.gnu_hash_off != 0 { base_kern + cached.gnu_hash_off } else { KernelAddr::null() },
+        gnu_hash: if cached.gnu_hash_off != 0 { base_kern + cached.gnu_hash_off } else { DirectMap::null() },
         cached_relocs: Some(cached.relocs.clone()),
     })
 }
@@ -340,7 +340,7 @@ fn clone_from_cache(cached: &CachedLib) -> Option<LoadedLib> {
 /// Derive total symbol count from a GNU hash table.
 /// The table is: [nbuckets, symoffset, bloom_size, bloom_shift, bloom[], buckets[], chain[]]
 /// Each bucket holds the lowest symbol index; each chain entry's bit 0 marks the end of a chain.
-fn gnu_hash_sym_count(addr: KernelAddr) -> usize {
+fn gnu_hash_sym_count(addr: DirectMap) -> usize {
     let ptr = addr.as_ptr::<u32>();
     let nbuckets = unsafe { *ptr } as usize;
     let symoffset = unsafe { *ptr.add(1) } as usize;
@@ -367,7 +367,7 @@ fn gnu_hash_sym_count(addr: KernelAddr) -> usize {
 
 /// Read a null-terminated string from `base + offset`, bounded by `max_size`.
 /// Returns `""` if the offset is out of bounds or no null terminator is found.
-fn bounded_cstr(base: KernelAddr, offset: u64, max_size: u64) -> &'static str {
+fn bounded_cstr(base: DirectMap, offset: u64, max_size: u64) -> &'static str {
     if offset >= max_size { return ""; }
     let ptr = (base + offset).as_ptr::<u8>();
     let remaining = (max_size - offset) as usize;
@@ -813,24 +813,24 @@ pub struct LoadedLib {
     /// Set to phys_base initially; updated by spawn when mapped via VmaList.
     pub user_base: UserAddr,
     /// Physical base address. Used for kernel direct-map writes during relocation.
-    pub phys_base: PhysAddr,
+    pub phys_base: DirectMap,
     /// Kernel-readable pointers for symbol/relocation tables.
-    pub dynsym: KernelAddr,
-    pub dynstr: KernelAddr,
+    pub dynsym: DirectMap,
+    pub dynstr: DirectMap,
     pub dynstr_size: u64,
     pub sym_count: usize,
     /// Kernel-readable TLS template pointer for copy_nonoverlapping.
-    pub tls_template: KernelAddr,
+    pub tls_template: DirectMap,
     pub tls_filesz: usize,
     pub tls_memsz: usize,
     pub tls_align: usize,
     /// Kernel-readable relocation table pointers.
-    pub rela_addr: KernelAddr,
+    pub rela_addr: DirectMap,
     pub rela_size: u64,
-    pub jmprel_addr: KernelAddr,
+    pub jmprel_addr: DirectMap,
     pub jmprel_size: u64,
     /// Kernel-readable .gnu.hash table pointer, or null.
-    pub gnu_hash: KernelAddr,
+    pub gnu_hash: DirectMap,
     /// Pre-scanned non-RELATIVE relocs (only for cached/shared libs).
     pub cached_relocs: Option<CachedRelocs>,
 }
@@ -970,7 +970,7 @@ pub fn load_shared_lib(data: &[u8]) -> Result<(LoadedLib, u64, u64), &'static st
     let rw_vaddr = rw_start.unwrap_or(vaddr_max);
     let rw_end_vaddr = rw_end.unwrap_or(vaddr_max);
 
-    let load_size = paging::align_2m((vaddr_max - vaddr_min) as usize);
+    let load_size = align_2m((vaddr_max - vaddr_min) as usize);
     let t0 = crate::clock::nanos_since_boot();
     let uninit_alloc = match OwnedAlloc::new_uninit(load_size, PAGE_2M as usize) {
         Some(a) => a,
@@ -978,8 +978,8 @@ pub fn load_shared_lib(data: &[u8]) -> Result<(LoadedLib, u64, u64), &'static st
     };
     let t1 = crate::clock::nanos_since_boot();
     let base_ptr = uninit_alloc.ptr();
-    let base_kern = KernelAddr::from_ptr(base_ptr as *const u8) - vaddr_min;
-    let base_phys = PhysAddr::from_ptr(base_ptr) - vaddr_min;
+    let base_kern = DirectMap::from_ptr(base_ptr as *const u8) - vaddr_min;
+    let base_phys = DirectMap::from_ptr(base_ptr) - vaddr_min;
 
     // Copy PT_LOAD segments and zero BSS gaps.
     // Zero the entire range first to handle gaps between segments safely.
@@ -1068,7 +1068,7 @@ pub fn load_shared_lib(data: &[u8]) -> Result<(LoadedLib, u64, u64), &'static st
     }
 
     // Parse PT_TLS for thread-local storage
-    let mut tls_template = KernelAddr::null();
+    let mut tls_template = DirectMap::null();
     let mut tls_filesz = 0usize;
     let mut tls_memsz = 0usize;
     let mut tls_align = 0usize;
@@ -1087,9 +1087,9 @@ pub fn load_shared_lib(data: &[u8]) -> Result<(LoadedLib, u64, u64), &'static st
         (t1 - t0) / 1_000_000, (t2 - t1) / 1_000_000, (t3 - t2) / 1_000_000,
         (t4 - t3) / 1_000_000, reloc_count, sym_count);
 
-    let rela_addr = if rela_size > 0 { base_kern + rela_vaddr } else { KernelAddr::null() };
-    let jmprel_addr = if jmprel_size > 0 { base_kern + jmprel_vaddr } else { KernelAddr::null() };
-    let gnu_hash = if gnu_hash_vaddr != 0 { base_kern + gnu_hash_vaddr } else { KernelAddr::null() };
+    let rela_addr = if rela_size > 0 { base_kern + rela_vaddr } else { DirectMap::null() };
+    let jmprel_addr = if jmprel_size > 0 { base_kern + jmprel_vaddr } else { DirectMap::null() };
+    let gnu_hash = if gnu_hash_vaddr != 0 { base_kern + gnu_hash_vaddr } else { DirectMap::null() };
 
     // SAFETY: all bytes written (zeroed + PT_LOAD segments copied + RELATIVE relocs applied).
     let alloc = unsafe { uninit_alloc.assume_zeroed() };
@@ -1226,7 +1226,7 @@ fn resolve_lib_bind_relocs(
 #[derive(Clone)]
 pub struct TlsModule {
     /// Kernel pointer to the TLS template data (initial values).
-    pub template: KernelAddr,
+    pub template: DirectMap,
     /// Size of initialized TLS data (copied from template).
     pub filesz: usize,
     /// Total TLS size including BSS (zeroed beyond filesz).

@@ -7,7 +7,7 @@ use alloc::boxed::Box;
 use super::pci::PciDevice;
 use super::virtio::{BufDir, DescSlot, Virtqueue, VirtioDevice, VIRTIO_F_VERSION_1};
 use super::DmaPool;
-use crate::arch::paging::{self, PAGE_2M};
+use crate::mm::{PAGE_2M, align_2m};
 use crate::gpu::{FLAG_HARDWARE_CURSOR, Gpu, GpuInfo};
 use crate::log;
 use crate::shared_memory::{self, SharedToken};
@@ -422,7 +422,7 @@ impl GpuController {
     /// Allocate framebuffer backing stores and register as shared memory.
     fn alloc_framebuffer(&mut self, width: u32, height: u32) -> FbAlloc {
         let fb_size = (width * height * 4) as usize;
-        let fb_aligned = paging::align_2m(fb_size);
+        let fb_aligned = align_2m(fb_size);
         let fb_layout = Layout::from_size_align(fb_aligned, PAGE_2M as usize).unwrap();
         let mut tokens = [SharedToken::from_raw(0); 2];
         let mut phys_addrs = [0u64; 2];
@@ -430,10 +430,10 @@ impl GpuController {
         for i in 0..2 {
             let ptr = unsafe { alloc_zeroed(fb_layout) };
             assert!(!ptr.is_null(), "VirtIO GPU: framebuffer alloc failed");
-            let phys = crate::PhysAddr::from_ptr(ptr);
+            let phys_addr = crate::mm::DirectMap::phys_of(ptr);
             ptrs[i] = ptr;
-            phys_addrs[i] = phys.raw();
-            tokens[i] = shared_memory::register(phys, fb_aligned as u64);
+            phys_addrs[i] = phys_addr;
+            tokens[i] = shared_memory::register(crate::DirectMap::new(phys_addr), fb_aligned as u64);
             log!("VirtIO GPU: buffer {} at {:?} phys={:#x} ({} bytes) token={:?}", i, ptr, phys_addrs[i], fb_size, tokens[i]);
         }
         FbAlloc { tokens, phys_addrs, ptrs, layout: fb_layout }
@@ -523,8 +523,8 @@ impl Gpu for GpuController {
 }
 
 /// Initialize the VirtIO GPU. Returns the driver and display info on success.
-pub fn init(ecam_base: u64) -> Option<(Box<dyn Gpu>, GpuInfo)> {
-    let pci_dev = PciDevice::find_by_id(ecam_base, VIRTIO_VENDOR, VIRTIO_GPU_DEVICE)?;
+pub fn init(ecam: &crate::mm::Mmio) -> Option<(Box<dyn Gpu>, GpuInfo)> {
+    let pci_dev = PciDevice::find_by_id(ecam, VIRTIO_VENDOR, VIRTIO_GPU_DEVICE)?;
     log!("VirtIO GPU: found at PCI {:02x}:{:02x}.{}", pci_dev.bus, pci_dev.dev, pci_dev.func);
     *DMA.lock() = Some(DmaPool::alloc(4));
 
@@ -612,15 +612,15 @@ pub fn init(ecam_base: u64) -> Option<(Box<dyn Gpu>, GpuInfo)> {
 
     // Create cursor resource (64x64, BGRA with alpha)
     let cursor_bytes = (CURSOR_SIZE * CURSOR_SIZE * 4) as usize;
-    let cursor_aligned = paging::align_2m(cursor_bytes);
+    let cursor_aligned = align_2m(cursor_bytes);
     let cursor_layout = Layout::from_size_align(cursor_aligned, PAGE_2M as usize).unwrap();
     let cursor_ptr = unsafe { alloc_zeroed(cursor_layout) };
     assert!(!cursor_ptr.is_null(), "VirtIO GPU: cursor alloc failed");
-    let cursor_phys = crate::PhysAddr::from_ptr(cursor_ptr);
-    gpu.cursor_token = shared_memory::register(cursor_phys, cursor_aligned as u64);
+    let cursor_phys = crate::mm::DirectMap::phys_of(cursor_ptr);
+    gpu.cursor_token = shared_memory::register(crate::DirectMap::new(cursor_phys), cursor_aligned as u64);
     gpu.create_resource(CURSOR_RESOURCE_ID, FORMAT_B8G8R8A8_UNORM, CURSOR_SIZE, CURSOR_SIZE);
-    gpu.attach_backing(CURSOR_RESOURCE_ID, cursor_phys.raw(), cursor_bytes as u32);
-    log!("VirtIO GPU: cursor resource at {:?} phys={:#x} token={:?}", cursor_ptr, cursor_phys.raw(), gpu.cursor_token);
+    gpu.attach_backing(CURSOR_RESOURCE_ID, cursor_phys, cursor_bytes as u32);
+    log!("VirtIO GPU: cursor resource at {:?} phys={:#x} token={:?}", cursor_ptr, cursor_phys, gpu.cursor_token);
 
     gpu.width = width;
     gpu.height = height;

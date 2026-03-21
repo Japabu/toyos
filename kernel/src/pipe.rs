@@ -5,11 +5,11 @@ use toyos_abi::ring::{RingHeader, RING_READER_CLOSED, RING_WRITER_CLOSED};
 
 use alloc::vec::Vec;
 
-use crate::arch::paging::PAGE_2M;
+use crate::mm::PAGE_2M;
 use crate::io_uring::RingId;
 use crate::id_map::{IdKey, IdMap};
 use crate::sync::Lock;
-use crate::PhysAddr;
+use crate::DirectMap;
 
 // ---------------------------------------------------------------------------
 // PipeId — raw identifier, Copy, used internally for lookups and in
@@ -88,7 +88,7 @@ impl Drop for PipeWriter {
 pub const PIPE_SIZE: usize = PAGE_2M as usize;
 
 struct Pipe {
-    phys_addr: PhysAddr,
+    phys_addr: DirectMap,
     layout: Layout,
     readers: u32,
     writers: u32,
@@ -103,7 +103,7 @@ impl Pipe {
         let ptr = unsafe { alloc_zeroed(layout) };
         assert!(!ptr.is_null(), "pipe: allocation failed");
         RingHeader::init(ptr, PIPE_SIZE);
-        Self { phys_addr: PhysAddr::from_ptr(ptr), layout, readers: 0, writers: 0, io_uring_watchers: Vec::new() }
+        Self { phys_addr: DirectMap::new(DirectMap::phys_of(ptr)), layout, readers: 0, writers: 0, io_uring_watchers: Vec::new() }
     }
 
     fn header(&self) -> &RingHeader {
@@ -157,7 +157,7 @@ pub fn exists(pipe_id: PipeId) -> bool {
 }
 
 /// Get the physical address of a pipe's ring buffer (for mapping into userland).
-pub fn phys_addr(pipe_id: PipeId) -> Option<PhysAddr> {
+pub fn phys_addr(pipe_id: PipeId) -> Option<DirectMap> {
     with_pipes(|pipes| pipes.get(pipe_id).map(|p| p.phys_addr))
 }
 

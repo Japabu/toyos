@@ -1,6 +1,6 @@
 use core::arch::naked_asm;
 
-use crate::arch::{cpu, debug, paging, syscall, percpu};
+use crate::arch::{cpu, debug, syscall, percpu};
 use crate::{log, process};
 
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -106,7 +106,7 @@ extern "sysv64" fn debug_handler(regs: *const SavedRegs) {
 
     // Backtrace
     log!("  Backtrace:");
-    let pml4 = if is_user { cpu::read_cr3().as_ptr::<u64>() as *const u64 } else { core::ptr::null() };
+    let pml4 = if is_user { crate::DirectMap::new(cpu::read_cr3()).as_ptr::<u64>() as *const u64 } else { core::ptr::null() };
     let mut rbp = regs.rbp;
     for _ in 0..20 {
         let Some(saved_rbp) = safe_read_u64(rbp, pml4) else { break };
@@ -129,7 +129,7 @@ extern "sysv64" fn debug_handler(regs: *const SavedRegs) {
     // Read the watched address to see what was written
     let watched_addr: u64;
     unsafe { core::arch::asm!("mov {}, dr0", out(reg) watched_addr); }
-    if paging::is_kernel_addr(watched_addr) && watched_addr % 8 == 0 {
+    if crate::mm::is_kernel_addr(watched_addr) && watched_addr % 8 == 0 {
         let val = unsafe { *(watched_addr as *const u64) };
         log!("  Value at watched addr {:#x} = {:#018x}", watched_addr, val);
     }
@@ -257,7 +257,7 @@ pub(super) extern "sysv64" fn double_fault_entry() {
 /// Safe kernel memory read for the double fault handler.
 /// Only reads kernel direct-map addresses. Returns None for anything suspect.
 fn safe_read_kernel(addr: u64) -> Option<u64> {
-    if addr % 8 != 0 || !paging::is_kernel_addr(addr) {
+    if addr % 8 != 0 || !crate::mm::is_kernel_addr(addr) {
         return None;
     }
     Some(unsafe { core::ptr::read_volatile(addr as *const u64) })
@@ -266,14 +266,14 @@ fn safe_read_kernel(addr: u64) -> Option<u64> {
 extern "sysv64" fn double_fault_handler(regs: *const SavedRegs) -> ! {
     let regs = unsafe { &*regs };
     let frame = regs.interrupt_frame();
-    let cr2 = cpu::read_cr2().raw();
+    let cr2 = cpu::read_cr2();
     let cpu_id = percpu::cpu_id();
     let pid = percpu::current_tid();
 
     log!("DOUBLE FAULT on CPU {} (pid={:?})", cpu_id, pid);
     log!("  cr2={:#018x} (address that caused the fault chain)", cr2);
     log!("  rip={:#018x}  rsp={:#018x}  rbp={:#018x}", frame.rip, frame.rsp, regs.rbp);
-    paging::debug_page_walk(cr2);
+    crate::mm::paging::debug_page_walk(cr2);
 
     // Kernel backtrace (where the double fault actually fired)
     log!("  Kernel backtrace:");
@@ -336,7 +336,7 @@ extern "sysv64" fn double_fault_handler(regs: *const SavedRegs) -> ! {
                     log!("    rip={:#018x}  rsp={:#018x}  rbp={:#018x}", maybe_rip, maybe_rsp, user_rbp);
 
                     // Walk user backtrace through page tables
-                    let pml4 = cpu::read_cr3().as_ptr::<u64>();
+                    let pml4 = crate::DirectMap::new(cpu::read_cr3()).as_ptr::<u64>();
                     log!("  User backtrace:");
                     if let Some(p) = pid {
                         if !process::resolve_user_symbol(p, maybe_rip) {
@@ -403,27 +403,27 @@ extern "sysv64" fn page_fault_handler(regs: *const SavedRegs) {
             vector: Vector::PageFault,
             regs,
             frame,
-            cr2: cpu::read_cr2().raw(),
+            cr2: cpu::read_cr2(),
         };
         fatal_exception(&ctx);
     }
 
     let regs = unsafe { &*regs };
     let frame = regs.interrupt_frame();
-    let fault_addr = cpu::read_cr2().raw();
+    let fault_addr = cpu::read_cr2();
 
     // Raw serial spam: log every page fault
     raw_serial(b"PF cr2=");
     raw_serial_hex(b"", fault_addr);
     raw_serial_hex(b" rip=", frame.rip);
     raw_serial_hex(b" err=", frame.error_code);
-    raw_serial_hex(b" cr3=", cpu::read_cr3().raw());
+    raw_serial_hex(b" cr3=", cpu::read_cr3());
     raw_serial(b"\n");
 
     // SMAP violation detection: kernel-mode protection fault on a kernel direct-map address.
     // Enable stac immediately so diagnostics don't cascade into another SMAP fault.
     if frame.error_code & PF_PRESENT != 0 && frame.cs & RPL_MASK == 0
-        && paging::is_kernel_addr(fault_addr)
+        && crate::mm::is_kernel_addr(fault_addr)
     {
         log!("SMAP cr2={:#018x} rip={:#018x} err={:#018x} rflags={:#018x}",
             fault_addr, frame.rip, frame.error_code, frame.rflags);
@@ -431,7 +431,7 @@ extern "sysv64" fn page_fault_handler(regs: *const SavedRegs) {
         crate::symbols::resolve_kernel(frame.rip);
         let mut rbp = regs.rbp;
         for _ in 0..20 {
-            if rbp == 0 || rbp % 8 != 0 || !paging::is_kernel_addr(rbp) { break; }
+            if rbp == 0 || rbp % 8 != 0 || !crate::mm::is_kernel_addr(rbp) { break; }
             let saved_rbp = unsafe { *(rbp as *const u64) };
             let return_addr = unsafe { *((rbp + 8) as *const u64) };
             if return_addr == 0 { break; }
@@ -509,9 +509,22 @@ fn safe_read_u64(addr: u64, user_pml4: *const u64) -> Option<u64> {
         return None;
     }
     if !user_pml4.is_null() {
-        let phys = paging::virt_to_phys(user_pml4, crate::UserAddr::new(addr))?;
-        Some(unsafe { *phys.as_ptr::<u64>() })
-    } else if paging::is_kernel_addr(addr) {
+        // Inline page table walk — can't take locks in exception handlers.
+        let pml4_idx = ((addr >> 39) & 0x1FF) as usize;
+        let pdpt_idx = ((addr >> 30) & 0x1FF) as usize;
+        let pd_idx = ((addr >> 21) & 0x1FF) as usize;
+        let pml4e = unsafe { *user_pml4.add(pml4_idx) };
+        if pml4e & 1 == 0 { return None; }
+        let pdpt = crate::DirectMap::new(pml4e & 0x000F_FFFF_FFFF_F000).as_ptr::<u64>();
+        let pdpte = unsafe { *pdpt.add(pdpt_idx) };
+        if pdpte & 1 == 0 { return None; }
+        let pd = crate::DirectMap::new(pdpte & 0x000F_FFFF_FFFF_F000).as_ptr::<u64>();
+        let pde = unsafe { *pd.add(pd_idx) };
+        if pde & 1 == 0 { return None; }
+        let page_phys = pde & 0x000F_FFFF_FFE0_0000;
+        let offset = addr & (crate::mm::PAGE_2M - 1);
+        Some(unsafe { *crate::DirectMap::new(page_phys + offset).as_ptr::<u64>() })
+    } else if crate::mm::is_kernel_addr(addr) {
         Some(unsafe { *(addr as *const u64) })
     } else {
         None
@@ -527,7 +540,7 @@ extern "sysv64" fn exception_handler(raw_vector: u64, regs: *const SavedRegs) ->
     let regs = unsafe { &*regs };
     let vector = Vector::from_raw(raw_vector);
     let frame = regs.interrupt_frame();
-    let cr2 = if vector == Vector::PageFault { cpu::read_cr2().raw() } else { 0 };
+    let cr2 = if vector == Vector::PageFault { cpu::read_cr2() } else { 0 };
     let ctx = ExceptionContext { vector, regs, frame, cr2 };
     fatal_exception(&ctx);
 }
@@ -548,7 +561,7 @@ fn fatal_exception(ctx: &ExceptionContext) -> ! {
     raw_serial_hex(b"\n!!! FAULT rip=", ctx.frame.rip);
     raw_serial_hex(b" cr2=", ctx.cr2);
     raw_serial_hex(b" err=", ctx.frame.error_code);
-    raw_serial_hex(b" cr3=", cpu::read_cr3().raw());
+    raw_serial_hex(b" cr3=", cpu::read_cr3());
     raw_serial_hex(b" rsp=", ctx.frame.rsp);
     raw_serial_hex(b" tid=", tid_raw as u64);
     if recursive { raw_serial(b" RECURSIVE"); }
@@ -559,7 +572,7 @@ fn fatal_exception(ctx: &ExceptionContext) -> ! {
     let rsp = ctx.frame.rsp;
     for i in 0..8u64 {
         let addr = rsp.wrapping_add(i * 8);
-        if !paging::is_kernel_addr(addr) { break; }
+        if !crate::mm::is_kernel_addr(addr) { break; }
         let val = unsafe { *(addr as *const u64) };
         raw_serial_hex(b" ", val);
     }
@@ -583,7 +596,7 @@ fn fatal_exception(ctx: &ExceptionContext) -> ! {
 
     // === Step 2: Rich diagnostics via log!() ===
     let tid = percpu::current_tid().unwrap_or(crate::process::Tid(0));
-    let pml4 = if is_user { cpu::read_cr3().as_ptr::<u64>() as *const u64 } else { core::ptr::null() };
+    let pml4 = if is_user { crate::DirectMap::new(cpu::read_cr3()).as_ptr::<u64>() as *const u64 } else { core::ptr::null() };
 
     // Header
     if is_user {
@@ -634,7 +647,7 @@ fn fatal_exception(ctx: &ExceptionContext) -> ! {
     }
 
     if ctx.vector == Vector::PageFault {
-        paging::debug_page_walk(ctx.cr2);
+        crate::mm::paging::debug_page_walk(ctx.cr2);
     }
 
     // Full register dump

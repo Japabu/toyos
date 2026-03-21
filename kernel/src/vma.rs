@@ -2,7 +2,7 @@ use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use crate::arch::paging::PAGE_2M;
+use crate::mm::PAGE_2M;
 use crate::file_backing::FileBacking;
 use crate::UserAddr;
 

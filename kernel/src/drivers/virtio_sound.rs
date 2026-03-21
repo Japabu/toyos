@@ -5,7 +5,7 @@ use super::virtio::{BufDir, DescSlot, Virtqueue, VirtioDevice, VIRTIO_F_VERSION_
 use super::DmaPool;
 use crate::log;
 use crate::sync::Lock;
-use crate::{shared_memory, PhysAddr};
+use crate::shared_memory;
 use toyos_abi::audio::AudioInfo;
 
 // VirtIO sound PCI identity
@@ -296,8 +296,8 @@ impl SoundController {
 }
 
 /// Initialize the VirtIO sound device. Returns the controller and AudioInfo on success.
-pub fn init(ecam_base: u64) -> Option<(SoundController, AudioInfo)> {
-    let pci_dev = PciDevice::find_by_id(ecam_base, VIRTIO_VENDOR, VIRTIO_SND_DEVICE)?;
+pub fn init(ecam: &crate::mm::Mmio) -> Option<(SoundController, AudioInfo)> {
+    let pci_dev = PciDevice::find_by_id(ecam, VIRTIO_VENDOR, VIRTIO_SND_DEVICE)?;
     log!("virtio-sound: found at PCI {:02x}:{:02x}.{}", pci_dev.bus, pci_dev.dev, pci_dev.func);
     *DMA.lock() = Some(DmaPool::alloc(10));
 
@@ -335,7 +335,7 @@ pub fn init(ecam_base: u64) -> Option<(SoundController, AudioInfo)> {
     for i in 0..TX_INFLIGHT_MAX {
         tx_data_phys[i] = dma_phys(PAGE_TX_DATA + i).raw();
         // Register each TX data page as shared memory so soundd can map it
-        buf_tokens[i] = shared_memory::register(PhysAddr::new(tx_data_phys[i]), 4096).raw();
+        buf_tokens[i] = shared_memory::register(crate::DirectMap::new(tx_data_phys[i]), 4096).raw();
     }
 
     let mut control_slots = controlq.initial_slots();

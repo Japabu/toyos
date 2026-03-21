@@ -4,7 +4,7 @@ mod hid;
 use alloc::vec::Vec;
 use core::ptr::{read_volatile, write_volatile, write_bytes};
 use core::sync::atomic::{fence, Ordering};
-use super::mmio::Mmio;
+use crate::mm::Mmio;
 use super::pci::PciDevice;
 use super::DmaPool;
 use crate::log;
@@ -414,9 +414,7 @@ fn setup_msix(pci_dev: &PciDevice) {
     let table_bar = pci_dev.read_bar_64(table_bir);
     let table_addr = table_bar + table_offset;
 
-    let table_addr = crate::PhysAddr::new(table_addr);
-    crate::arch::paging::map_kernel(table_addr, 0x1000);
-    let table = Mmio::new(table_addr);
+    let table = crate::mm::paging::kernel().lock().as_mut().unwrap().map_mmio(table_addr, 0x1000);
 
     // Configure entry 0: route to LAPIC with vector XHCI_VECTOR
     table.write_u32(0x00, 0xFEE0_0000); // msg_addr_lo: LAPIC base
@@ -435,16 +433,16 @@ fn setup_msix(pci_dev: &PciDevice) {
 // Main initialization
 // ---------------------------------------------------------------------------
 
-pub fn init(ecam_base: u64) -> Option<XhciController> {
-    let pci_dev = PciDevice::find(ecam_base, 0x0C, 0x03, Some(0x30))?;
+pub fn init(ecam: &crate::mm::Mmio) -> Option<XhciController> {
+    let pci_dev = PciDevice::find(ecam, 0x0C, 0x03, Some(0x30))?;
     log!("xHCI: found at PCI {:02x}:{:02x}.{}", pci_dev.bus, pci_dev.dev, pci_dev.func);
     *XHCI_DMA_POOL.lock() = Some(DmaPool::alloc(DMA_PAGES));
 
-    let bar = Mmio::new(crate::PhysAddr::new(pci_dev.read_bar_64(0)));
+    let bar_addr = pci_dev.read_bar_64(0);
     pci_dev.enable_bus_master();
-    log!("xHCI: BAR0={:#x}", bar.addr());
+    log!("xHCI: BAR0={:#x}", bar_addr);
 
-    crate::arch::paging::map_kernel(bar.addr(), 0x10000);
+    let bar = crate::mm::paging::kernel().lock().as_mut().unwrap().map_mmio(bar_addr, 0x10000);
 
     // Configure MSI-X
     setup_msix(&pci_dev);
@@ -461,9 +459,10 @@ pub fn init(ecam_base: u64) -> Option<XhciController> {
     let csz = ((hccparams1 >> 2) & 1) != 0;
     let context_size: usize = if csz { 64 } else { 32 };
 
-    let op_base = bar.offset(cap_length);
-    let db_base = bar.offset(db_offset);
-    let rt_base = bar.offset(rts_offset);
+    let bar_size = 0x10000u64;
+    let op_base = bar.subregion(cap_length, bar_size - cap_length);
+    let db_base = bar.subregion(db_offset, bar_size - db_offset);
+    let rt_base = bar.subregion(rts_offset, bar_size - rts_offset);
 
     log!("xHCI: max_slots={} max_ports={} ctx_size={}", max_slots, max_ports, context_size);
 

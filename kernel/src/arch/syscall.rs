@@ -1,12 +1,12 @@
 use core::arch::naked_asm;
 
 use alloc::vec::Vec;
-use super::{apic, cpu, gdt, paging};
+use super::{apic, cpu, gdt};
 use crate::drivers::acpi;
 use crate::sync::Lock;
 use crate::user_ptr::SyscallContext;
-use crate::{allocator, device, fd, keyboard, listener, log, pipe, process, scheduler, shared_memory, vfs};
-use crate::{PhysAddr, UserAddr};
+use crate::{device, fd, keyboard, listener, log, pipe, process, scheduler, shared_memory, vfs};
+use crate::{DirectMap, UserAddr};
 
 // MSR addresses
 const MSR_EFER: u32 = 0xC000_0080;
@@ -867,19 +867,19 @@ fn sys_release_shared(token: u64) -> u64 {
 }
 
 fn sys_mmap(req_addr: u64, size: u64, _prot: u64, flags: u64) -> u64 {
-    let aligned = paging::align_2m(size as usize);
+    let aligned = crate::mm::align_2m(size as usize);
     let fixed = flags & 4 != 0; // MmapFlags::FIXED
 
-    let Some(alloc) = process::OwnedAlloc::new(aligned, paging::PAGE_2M as usize) else {
+    let Some(alloc) = process::OwnedAlloc::new(aligned, crate::mm::PAGE_2M as usize) else {
         return SyscallError::Unknown.to_u64();
     };
 
     if fixed && req_addr != 0 {
         // MAP_FIXED: map the allocated physical memory at the requested virtual address
-        let phys_addr = PhysAddr::from_ptr(alloc.ptr());
+        let phys_addr = DirectMap::from_ptr(alloc.ptr());
         let addr_space = process::current_address_space();
-        let start = req_addr & !(paging::PAGE_2M - 1);
-        let end = (req_addr + aligned as u64 + paging::PAGE_2M - 1) & !(paging::PAGE_2M - 1);
+        let start = req_addr & !(crate::mm::PAGE_2M - 1);
+        let end = (req_addr + aligned as u64 + crate::mm::PAGE_2M - 1) & !(crate::mm::PAGE_2M - 1);
         let mut cur = start;
         let mut offset = 0u64;
         let mut ok = true;
@@ -888,13 +888,13 @@ fn sys_mmap(req_addr: u64, size: u64, _prot: u64, flags: u64) -> u64 {
                 let mut undo = start;
                 while undo < cur {
                     addr_space.clear_2m(UserAddr::new(undo));
-                    undo += paging::PAGE_2M;
+                    undo += crate::mm::PAGE_2M;
                 }
                 ok = false;
                 break;
             }
-            cur += paging::PAGE_2M;
-            offset += paging::PAGE_2M;
+            cur += crate::mm::PAGE_2M;
+            offset += crate::mm::PAGE_2M;
         }
         if ok {
             cpu::flush_tlb();
@@ -912,7 +912,7 @@ fn sys_mmap(req_addr: u64, size: u64, _prot: u64, flags: u64) -> u64 {
             SyscallError::InvalidArgument.to_u64()
         }
     } else {
-        let phys = PhysAddr::from_ptr(alloc.ptr());
+        let phys = DirectMap::from_ptr(alloc.ptr());
         let addr_space = process::current_address_space();
         let vaddr = process::with_current_data(|data| {
             let Some(region) = addr_space.map_region(&mut data.vmas, phys, aligned as u64) else {
@@ -946,7 +946,7 @@ fn sys_munmap(addr: u64, _size: u64) -> u64 {
                 let end = region.addr.raw() + region.size as u64;
                 while cur < end {
                     addr_space.clear_2m(UserAddr::new(cur));
-                    cur += paging::PAGE_2M;
+                    cur += crate::mm::PAGE_2M;
                 }
             } else {
                 addr_space.unmap_at(region.addr, region.size as u64);
@@ -978,7 +978,7 @@ fn sys_sysinfo(buf: &mut [u8]) -> u64 {
         return SyscallError::InvalidArgument.to_u64();
     }
 
-    let (total_mem, used_mem) = allocator::memory_stats();
+    let (total_mem, used_mem) = crate::mm::pmm::stats();
     let cpu_count = super::smp::cpu_count();
     let uptime = crate::clock::nanos_since_boot();
     let (busy_ticks, total_ticks) = super::idt::cpu_ticks();
@@ -1187,7 +1187,7 @@ fn sys_dlopen(path: &str) -> u64 {
     process::with_fd_owner_data(|data| {
         match &lib.memory {
             crate::elf::LibMemory::Owned(alloc) => {
-                let phys = PhysAddr::from_ptr(alloc.ptr());
+                let phys = DirectMap::from_ptr(alloc.ptr());
                 let region = addr_space.map_region(&mut data.vmas, phys, alloc.size() as u64)
                     .expect("dlopen: out of virtual address space");
                 lib.user_base = region.vaddr();
@@ -1197,10 +1197,10 @@ fn sys_dlopen(path: &str) -> u64 {
                 let region = addr_space.map_region(&mut data.vmas, cached_phys, *cached_size as u64)
                     .expect("dlopen: out of virtual address space");
                 let lib_vaddr = region.vaddr();
-                let num_rw_pages = rw_alloc.size() / paging::PAGE_2M as usize;
+                let num_rw_pages = rw_alloc.size() / crate::mm::PAGE_2M as usize;
                 for i in 0..num_rw_pages {
-                    let user_virt = lib_vaddr.raw() + *rw_offset as u64 + i as u64 * paging::PAGE_2M;
-                    let phys = PhysAddr::from_ptr(rw_alloc.ptr()) + i as u64 * paging::PAGE_2M;
+                    let user_virt = lib_vaddr.raw() + *rw_offset as u64 + i as u64 * crate::mm::PAGE_2M;
+                    let phys = DirectMap::from_ptr(rw_alloc.ptr()) + i as u64 * crate::mm::PAGE_2M;
                     addr_space.remap_2m(UserAddr::new(user_virt), phys, true);
                 }
                 cpu::flush_tlb();
@@ -1286,7 +1286,7 @@ fn sys_tls_alloc_block(module_id: u64) -> u64 {
     }
 
     // Map into current process's virtual address space via VmaList
-    let block_phys_addr = PhysAddr::from_ptr(block_ptr);
+    let block_phys_addr = DirectMap::from_ptr(block_ptr);
     let tls_vaddr = process::with_fd_owner_data(|data| {
         let addr_space = process::current_address_space();
         let region = addr_space.map_region(&mut data.vmas, block_phys_addr, tls_memsz as u64)

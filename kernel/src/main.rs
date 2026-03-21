@@ -51,7 +51,7 @@ mod vma;
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
-use arch::{apic, cpu, idt, paging, percpu, smp, syscall};
+use arch::{apic, cpu, idt, percpu, smp, syscall};
 use drivers::{acpi, gop, nvme, pci, serial, virtio_gpu, virtio_net, virtio_sound, xhci};
 use toyos_abi::boot::{KernelArgs, MemoryMapEntry};
 
@@ -197,7 +197,6 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     // HPET clock — enables profiling for everything from here on
     let hpet_base = acpi::find_hpet_base(kernel_args.rsdp_addr)
         .expect("ACPI: HPET not found");
-    mm::map_mmio(hpet_base, 0x1000);
     clock::init(hpet_base);
     apic::init_timer();
 
@@ -208,8 +207,9 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
 
     let ecam_base = acpi::find_ecam_base(kernel_args.rsdp_addr)
         .expect("ACPI: failed to find ECAM base address");
-    pci::enumerate(ecam_base);
-    let nvme_dev = nvme::init(ecam_base).expect("NVMe: no controller found");
+    let ecam = mm::paging::kernel().lock().as_mut().unwrap().map_mmio(ecam_base, 256 * 32 * 8 * 4096);
+    pci::enumerate(&ecam);
+    let nvme_dev = nvme::init(&ecam).expect("NVMe: no controller found");
     page_cache::init(Box::new(nvme_dev));
 
     let bcachefs_instance = match bcachefs_adapter::mount() {
@@ -222,7 +222,7 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     // ── Phase 4: Peripherals ────────────────────────────────────────────
     let t_periph = clock::nanos_since_boot();
 
-    let xhci_ctrl = xhci::init(ecam_base).expect("xHCI: no USB controller found");
+    let xhci_ctrl = xhci::init(&ecam).expect("xHCI: no USB controller found");
     xhci::set_global(xhci_ctrl);
     acpi::init_power(kernel_args.rsdp_addr);
 
@@ -259,14 +259,14 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     // ── Phase 6: Devices ────────────────────────────────────────────────
     let t_devices = clock::nanos_since_boot();
 
-    virtio_net::init(ecam_base);
+    virtio_net::init(&ecam);
 
-    if let Some((sound, audio_info)) = virtio_sound::init(ecam_base) {
+    if let Some((sound, audio_info)) = virtio_sound::init(&ecam) {
         crate::audio::register(sound, audio_info);
     }
 
     // Initialize GPU: try VirtIO first, fall back to UEFI GOP
-    if let Some((gpu_driver, gpu_info)) = virtio_gpu::init(ecam_base) {
+    if let Some((gpu_driver, gpu_info)) = virtio_gpu::init(&ecam) {
         log!("GPU: using VirtIO");
         register_gpu(gpu_driver, gpu_info);
     } else if kernel_args.gop_framebuffer != 0 {
