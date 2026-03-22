@@ -16,34 +16,28 @@ pub fn init() {
     outb(PORT + 4, 0x0F); // Normal operation mode
 }
 
-pub fn print(s: &str) {
-    for c in s.chars() {
-        write_serial(c);
+/// Write bytes to serial, stripping ANSI CSI escape sequences.
+pub(crate) fn write(bytes: &[u8]) {
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == 0x1B && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
+            i += 2;
+            while i < bytes.len() && !(0x40..=0x7E).contains(&bytes[i]) {
+                i += 1;
+            }
+            if i < bytes.len() { i += 1; }
+        } else {
+            while inb(PORT + 5) & 0x20 == 0 {}
+            outb(PORT, bytes[i]);
+            i += 1;
+        }
     }
 }
 
-pub fn write_bytes(bytes: &[u8]) {
-    for &b in bytes {
-        while !is_transmit_empty() {}
-        outb(PORT, b);
-    }
-}
-
-fn is_transmit_empty() -> bool {
-    inb(PORT + 5) & 0x20 != 0
-}
-
-fn write_serial(a: char) {
-    while !is_transmit_empty() {}
-    outb(PORT, a as u8);
-}
-
-/// Check if a byte is available to read from the serial port.
 pub fn has_data() -> bool {
     inb(PORT + 5) & 0x01 != 0
 }
 
-/// Try to read one byte without blocking.
 pub fn try_read_byte() -> Option<u8> {
     if has_data() { Some(inb(PORT)) } else { None }
 }

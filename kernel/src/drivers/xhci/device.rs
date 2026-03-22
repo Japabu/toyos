@@ -2,7 +2,8 @@ use core::mem::size_of;
 use core::ptr::{read_volatile, write_volatile, write_bytes};
 
 use crate::log;
-use super::{Mmio, Trb, TrbRing, XhciController, dma_phys, dma_ptr, RING_SIZE};
+use super::{Mmio, Trb, TrbRing, XhciController, dma, RING_SIZE};
+use super::{OFF_DCBAA, OFF_INPUT_CTX, OFF_EP0_RING, OFF_DATA_BUF, OFF_OUT_CTX1, OFF_OUT_CTX2, OFF_OUT_CTX3, OFF_KB_INT_RING, OFF_MOUSE_INT_RING};
 use super::{TRB_ENABLE_SLOT, TRB_ADDRESS_DEVICE, TRB_CONFIGURE_EP, TRB_LINK};
 use super::{OP_PORT_BASE, PORT_REG_SIZE, PORTSC_CCS, PORTSC_PED, PORTSC_PR, PORTSC_PRC, PORTSC_RW1C};
 use super::hid::{HidType, HidDevice};
@@ -82,12 +83,12 @@ fn max_packet_for_speed(speed: u8) -> u16 {
     }
 }
 
-/// Map slot_id (1-based, assigned by controller) to DMA page for output context.
-fn output_ctx_page(slot_id: u8) -> usize {
+/// Map slot_id (1-based) to DMA offset for output context.
+fn output_ctx_offset(slot_id: u8) -> usize {
     match slot_id {
-        1 => 4,
-        2 => 10,
-        3 => 12,
+        1 => OFF_OUT_CTX1,
+        2 => OFF_OUT_CTX2,
+        3 => OFF_OUT_CTX3,
         _ => panic!("xHCI: too many USB slots (max 3)"),
     }
 }
@@ -196,9 +197,11 @@ pub fn init_device(ctrl: &mut XhciController, op_base: &Mmio, port_idx: u8) {
     ctrl.reset_ep0_ring();
 
     // Address Device
-    let input_ctx_ptr = dma_ptr(5);
-    let input_ctx_phys = dma_phys(5).raw();
-    unsafe { write_bytes(input_ctx_ptr, 0, 4096); }
+    let dma = dma();
+    let input_ctx = dma.subslice(OFF_INPUT_CTX, 0x1000);
+    let input_ctx_ptr = input_ctx.base();
+    let input_ctx_phys = input_ctx.phys();
+    unsafe { input_ctx.zero(); }
 
     ctrl.write_ctx32(input_ctx_ptr, 0, 1, 0x3); // Add Slot + EP0
     let slot_dw0 = ((speed as u32) << 20) | (1u32 << 27);
@@ -208,16 +211,16 @@ pub fn init_device(ctrl: &mut XhciController, op_base: &Mmio, port_idx: u8) {
     let max_packet = max_packet_for_speed(speed);
     let ep0_dw1 = (3u32 << 1) | (4u32 << 3) | ((max_packet as u32) << 16);
     ctrl.write_ctx32(input_ctx_ptr, 2, 1, ep0_dw1);
-    let ep0_dequeue = dma_phys(6).raw() | 1;
+    let ep0_dequeue = dma.phys() + OFF_EP0_RING as u64 | 1;
     ctrl.write_ctx32(input_ctx_ptr, 2, 2, ep0_dequeue as u32);
     ctrl.write_ctx32(input_ctx_ptr, 2, 3, (ep0_dequeue >> 32) as u32);
     ctrl.write_ctx32(input_ctx_ptr, 2, 4, 8);
 
-    let output_ctx_page = output_ctx_page(slot_id);
-    unsafe { write_bytes(dma_ptr(output_ctx_page), 0, 4096); }
+    let out_ctx = dma.subslice(output_ctx_offset(slot_id), 0x1000);
+    unsafe { out_ctx.zero(); }
     unsafe {
-        let dcbaa = dma_ptr(0) as *mut u64;
-        write_volatile(dcbaa.add(slot_id as usize), dma_phys(output_ctx_page).raw());
+        let dcbaa = dma.ptr_at(OFF_DCBAA) as *mut u64;
+        write_volatile(dcbaa.add(slot_id as usize), out_ctx.phys());
     }
 
     let mut addr_dev = Trb::ZERO;
@@ -232,8 +235,9 @@ pub fn init_device(ctrl: &mut XhciController, op_base: &Mmio, port_idx: u8) {
     log!("xHCI: device addressed");
 
     // GET_DESCRIPTOR (Device)
-    let data_buf_ptr = dma_ptr(8);
-    let data_buf_phys = dma_phys(8).raw();
+    let data_buf = dma.subslice(OFF_DATA_BUF, 0x1000);
+    let data_buf_ptr = data_buf.base();
+    let data_buf_phys = data_buf.phys();
     unsafe { write_bytes(data_buf_ptr, 0, 256); }
     let code = ctrl.control_transfer(0x80, 0x06, 0x0100, 0, Some(data_buf_phys), 18);
     if code != 1 && code != 13 {
@@ -287,25 +291,26 @@ pub fn init_device(ctrl: &mut XhciController, op_base: &Mmio, port_idx: u8) {
     }
 
     // Choose interrupt ring and report buffer based on device type
-    let (int_ring_page, report_buf_offset): (usize, usize) = match info.protocol {
-        HidType::Keyboard => (7, 512),
-        HidType::Mouse => (11, 1024),
+    let (int_ring_off, report_buf_offset): (usize, usize) = match info.protocol {
+        HidType::Keyboard => (OFF_KB_INT_RING, 512),
+        HidType::Mouse => (OFF_MOUSE_INT_RING, 1024),
     };
-    let report_phys = dma_phys(8).raw() + report_buf_offset as u64;
-    let report_ptr = unsafe { dma_ptr(8).add(report_buf_offset) };
+    let report_phys = data_buf.phys() + report_buf_offset as u64;
+    let report_ptr = data_buf.ptr_at(report_buf_offset);
 
     // Set up interrupt ring link TRB
-    let int_ring_ptr = dma_ptr(int_ring_page) as *mut Trb;
-    unsafe { write_bytes(dma_ptr(int_ring_page), 0, 4096); }
+    let int_ring = dma.subslice(int_ring_off, 0x1000);
+    unsafe { int_ring.zero(); }
     let mut int_link = Trb::ZERO;
-    int_link.param = dma_phys(int_ring_page).raw();
+    int_link.param = int_ring.phys();
     int_link.control = TRB_LINK | (1 << 1);
-    unsafe { write_volatile(int_ring_ptr.add(RING_SIZE - 1), int_link); }
+    unsafe { write_volatile((int_ring.base() as *mut Trb).add(RING_SIZE - 1), int_link); }
 
     // Configure Endpoint
-    let input_ctx_ptr = dma_ptr(5);
-    let input_ctx_phys = dma_phys(5).raw();
-    unsafe { write_bytes(input_ctx_ptr, 0, 4096); }
+    let input_ctx = dma.subslice(OFF_INPUT_CTX, 0x1000);
+    let input_ctx_ptr = input_ctx.base();
+    let input_ctx_phys = input_ctx.phys();
+    unsafe { input_ctx.zero(); }
 
     ctrl.write_ctx32(input_ctx_ptr, 0, 1, (1u32 << (int_ep_dci as u32)) | 1);
 
@@ -328,7 +333,7 @@ pub fn init_device(ctrl: &mut XhciController, op_base: &Mmio, port_idx: u8) {
     let ep_dw1 = (3u32 << 1) | (7u32 << 3) | ((info.ep_max_packet as u32) << 16);
     ctrl.write_ctx32(input_ctx_ptr, ep_ctx_index, 1, ep_dw1);
 
-    let int_dequeue = dma_phys(int_ring_page).raw() | 1;
+    let int_dequeue = int_ring.phys() | 1;
     ctrl.write_ctx32(input_ctx_ptr, ep_ctx_index, 2, int_dequeue as u32);
     ctrl.write_ctx32(input_ctx_ptr, ep_ctx_index, 3, (int_dequeue >> 32) as u32);
     ctrl.write_ctx32(input_ctx_ptr, ep_ctx_index, 4, 8);
@@ -352,7 +357,7 @@ pub fn init_device(ctrl: &mut XhciController, op_base: &Mmio, port_idx: u8) {
     let mut dev = HidDevice {
         slot_id,
         int_ep_dci,
-        int_ring: TrbRing::new(int_ring_ptr, dma_phys(int_ring_page)),
+        int_ring: TrbRing::new(int_ring),
         report_phys,
         report_ptr,
         report_size,

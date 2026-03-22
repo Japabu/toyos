@@ -9,8 +9,10 @@ pub struct KernelSlice {
 unsafe impl Send for KernelSlice {}
 unsafe impl Sync for KernelSlice {}
 
+// TODO: who intantiates this? if its always consumers from raw then nothing prevents it from being wrong
 impl KernelSlice {
     /// Wrap an existing kernel pointer + size. Caller must ensure the region is valid.
+    /// TODO: should not exist
     pub unsafe fn from_raw(base: *mut u8, size: usize) -> Self {
         Self { base, size }
     }

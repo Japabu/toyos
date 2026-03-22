@@ -22,6 +22,7 @@ impl<T> Lock<T> {
         }
     }
 
+    #[track_caller]
     pub fn lock(&self) -> LockGuard<'_, T> {
         let my_ticket = self.ticket.fetch_add(1, Ordering::Relaxed);
         let mut spins = 0u64;
@@ -30,15 +31,15 @@ impl<T> Lock<T> {
             core::hint::spin_loop();
             spins += 1;
             if spins == next_warn {
-                let rip: u64;
-                unsafe { core::arch::asm!("lea {}, [rip]", out(reg) rip); }
-                crate::log!("LOCK CONTENTION: {}M spins at {:#x}, ticket={} now={}",
-                    spins / 1_000_000, rip, my_ticket, self.now.load(Ordering::Relaxed));
+                let caller = core::panic::Location::caller();
+                crate::log!("LOCK CONTENTION: {}M spins at {}, ticket={} now={}",
+                    spins / 1_000_000, caller, my_ticket, self.now.load(Ordering::Relaxed));
                 next_warn = (next_warn * 2).min(500_000_000);
             }
             if spins >= 500_000_000 {
-                panic!("DEADLOCK: 500M spins, ticket={} now={}",
-                    my_ticket, self.now.load(Ordering::Relaxed));
+                let caller = core::panic::Location::caller();
+                panic!("DEADLOCK at {}: 500M spins, ticket={} now={}",
+                    caller, my_ticket, self.now.load(Ordering::Relaxed));
             }
         }
         LockGuard { lock: self }

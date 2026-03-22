@@ -9,7 +9,7 @@ extern crate alloc;
 #[cfg(feature = "debug-wait")]
 static DEBUG_WAIT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
 
-pub use mm::{UserAddr, DmaAddr, DirectMap, PHYS_OFFSET};
+pub use mm::{UserAddr, DirectMap, PHYS_OFFSET};
 
 mod sync;
 mod id_map;
@@ -71,18 +71,17 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
         cpu::halt();
     }
 
-    serial::write_bytes(b"\n[kernel] !!! PANIC !!!\n");
-    log!("KERNEL PANIC: {}", info);
+    log!("!!! PANIC !!!: {}", info);
 
     // Walk the kernel stack for a backtrace
     log!("  Backtrace:");
     let mut rbp: u64;
     unsafe { core::arch::asm!("mov {}, rbp", out(reg) rbp, options(nomem, nostack)); }
     for _ in 0..20 {
-        if rbp == 0 || rbp % 8 != 0 { break; }
+        if rbp == 0 || rbp % 8 != 0 || !mm::is_kernel_addr(rbp) { break; }
         let saved_rbp = unsafe { *(rbp as *const u64) };
         let return_addr = unsafe { *((rbp + 8) as *const u64) };
-        if return_addr == 0 { break; }
+        if return_addr == 0 || !mm::is_kernel_addr(return_addr) { break; }
         symbols::resolve_kernel(return_addr);
         rbp = saved_rbp;
     }
@@ -144,6 +143,14 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     let kernel_args = *kernel_args;
 
     serial::init();
+
+    #[cfg(feature = "debug-wait")]
+    {
+        log!("debug: waiting for debugger — set DEBUG_WAIT=false to continue");
+        while DEBUG_WAIT.load(core::sync::atomic::Ordering::Relaxed) {
+            core::hint::spin_loop();
+        }
+    }
 
     log!("{:?}", kernel_args);
 
@@ -285,14 +292,6 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     };
 
     log!("Boot: devices ready ({}ms)", (clock::nanos_since_boot() - t_devices) / 1_000_000);
-
-    #[cfg(feature = "debug-wait")]
-    {
-        log!("debug: waiting for debugger — set DEBUG_WAIT=false to continue");
-        while DEBUG_WAIT.load(core::sync::atomic::Ordering::Relaxed) {
-            core::hint::spin_loop();
-        }
-    }
 
     // ── Phase 7: Userland ───────────────────────────────────────────────
     assert!(!init_programs.is_empty(), "bootloader must provide init_programs");

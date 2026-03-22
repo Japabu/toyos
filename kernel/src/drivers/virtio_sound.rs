@@ -4,6 +4,7 @@ use super::pci::PciDevice;
 use super::virtio::{BufDir, DescSlot, Virtqueue, VirtioDevice, VIRTIO_F_VERSION_1};
 use super::DmaPool;
 use crate::log;
+use crate::mm::KernelSlice;
 use crate::sync::Lock;
 use crate::shared_memory;
 use toyos_abi::audio::AudioInfo;
@@ -30,31 +31,22 @@ const VIRTIO_SND_PCM_FMT_S16: u8 = 5;
 const VIRTIO_SND_PCM_RATE_44100: u8 = 6;
 const VIRTIO_SND_PCM_RATE_48000: u8 = 7;
 
-// DMA page assignments
-//   0: control queue
-//   1: event queue
-//   2: TX queue
-//   3: control request/response buffers
-//   4: TX xfer headers + status structs (kernel-only, not shared)
-//   5-9: TX data pages (shared with soundd for direct DMA writes)
-const PAGE_CONTROLQ: usize = 0;
-const PAGE_EVENTQ: usize = 1;
-const PAGE_TXQ: usize = 2;
-const PAGE_CTRL_BUFS: usize = 3;
-const PAGE_TX_META: usize = 4;
-const PAGE_TX_DATA: usize = 5; // 5 pages: 5..9
+// DMA layout (byte offsets)
+const OFF_CONTROLQ: usize  = 0x0000;
+const OFF_EVENTQ: usize    = 0x1000;
+const OFF_TXQ: usize       = 0x2000;
+const OFF_CTRL_BUFS: usize = 0x3000;
+const OFF_TX_META: usize   = 0x4000;
+const OFF_TX_DATA: usize   = 0x5000; // 5 × 4KB
+const DMA_SIZE: usize      = 0xA000;
 
 const REQ_OFFSET: usize = 0x000;
 const RESP_OFFSET: usize = 0x800;
 
 static DMA: Lock<Option<DmaPool>> = Lock::new(None);
 
-fn dma_phys(page: usize) -> crate::DmaAddr {
-    DMA.lock().as_ref().unwrap().page_phys(page)
-}
-
-fn dma_ptr(page: usize) -> *mut u8 {
-    DMA.lock().as_ref().unwrap().page_ptr(page)
+fn dma() -> KernelSlice {
+    DMA.lock().as_ref().unwrap().slice()
 }
 
 // ---- VirtIO sound structs (per VirtIO 1.2 spec, section 5.14) ----
@@ -299,7 +291,8 @@ impl SoundController {
 pub fn init(ecam: &crate::mm::Mmio) -> Option<(SoundController, AudioInfo)> {
     let pci_dev = PciDevice::find_by_id(ecam, VIRTIO_VENDOR, VIRTIO_SND_DEVICE)?;
     log!("virtio-sound: found at PCI {:02x}:{:02x}.{}", pci_dev.bus, pci_dev.dev, pci_dev.func);
-    *DMA.lock() = Some(DmaPool::alloc(10));
+    *DMA.lock() = Some(DmaPool::alloc(DMA_SIZE));
+    let dma = dma();
 
     let device = VirtioDevice::init(&pci_dev, VIRTIO_F_VERSION_1);
 
@@ -311,9 +304,9 @@ pub fn init(ecam: &crate::mm::Mmio) -> Option<(SoundController, AudioInfo)> {
 
     assert!(streams > 0, "virtio-sound: no PCM streams available");
 
-    let mut controlq = Virtqueue::new(dma_phys(PAGE_CONTROLQ), dma_ptr(PAGE_CONTROLQ));
-    let mut eventq = Virtqueue::new(dma_phys(PAGE_EVENTQ), dma_ptr(PAGE_EVENTQ));
-    let mut txq = Virtqueue::new(dma_phys(PAGE_TXQ), dma_ptr(PAGE_TXQ));
+    let mut controlq = Virtqueue::new(dma.subslice(OFF_CONTROLQ, 0x1000));
+    let mut eventq = Virtqueue::new(dma.subslice(OFF_EVENTQ, 0x1000));
+    let mut txq = Virtqueue::new(dma.subslice(OFF_TXQ, 0x1000));
 
     device.setup_queue(0, &mut controlq);
     device.setup_queue(1, &mut eventq);
@@ -323,19 +316,21 @@ pub fn init(ecam: &crate::mm::Mmio) -> Option<(SoundController, AudioInfo)> {
     device.enable_queue(2);
     device.activate();
 
-    let req_phys = dma_phys(PAGE_CTRL_BUFS).raw() + REQ_OFFSET as u64;
-    let resp_phys = dma_phys(PAGE_CTRL_BUFS).raw() + RESP_OFFSET as u64;
-    let req_ptr = unsafe { dma_ptr(PAGE_CTRL_BUFS).add(REQ_OFFSET) };
-    let resp_ptr = unsafe { dma_ptr(PAGE_CTRL_BUFS).add(RESP_OFFSET) };
-    let meta_phys = dma_phys(PAGE_TX_META).raw();
-    let meta_ptr = dma_ptr(PAGE_TX_META);
+    let ctrl_bufs = dma.subslice(OFF_CTRL_BUFS, 0x1000);
+    let meta = dma.subslice(OFF_TX_META, 0x1000);
+    let req_phys = ctrl_bufs.phys() + REQ_OFFSET as u64;
+    let resp_phys = ctrl_bufs.phys() + RESP_OFFSET as u64;
+    let req_ptr = ctrl_bufs.ptr_at(REQ_OFFSET);
+    let resp_ptr = ctrl_bufs.ptr_at(RESP_OFFSET);
+    let meta_phys = meta.phys();
+    let meta_ptr = meta.base();
 
     let mut tx_data_phys = [0u64; TX_INFLIGHT_MAX];
     let mut buf_tokens = [0u32; TX_INFLIGHT_MAX];
     for i in 0..TX_INFLIGHT_MAX {
-        tx_data_phys[i] = dma_phys(PAGE_TX_DATA + i).raw();
-        // Register each TX data page as shared memory so soundd can map it
-        buf_tokens[i] = shared_memory::register(crate::DirectMap::from_phys(tx_data_phys[i]), 4096).raw();
+        let tx_page = dma.subslice(OFF_TX_DATA + i * 0x1000, 0x1000);
+        tx_data_phys[i] = tx_page.phys();
+        buf_tokens[i] = shared_memory::register(crate::DirectMap::from_phys(tx_page.phys()), 4096).raw();
     }
 
     let mut control_slots = controlq.initial_slots();

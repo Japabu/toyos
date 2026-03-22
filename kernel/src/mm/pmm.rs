@@ -30,99 +30,176 @@ impl PhysPage {
         super::DirectMap::from_phys(self.0)
     }
 
-    /// DMA address for device descriptors.
-    pub fn dma_addr(&self) -> super::DmaAddr {
-        super::DmaAddr(self.0)
-    }
 }
 
 impl Drop for PhysPage {
     fn drop(&mut self) {
-        free_page_raw(self.0);
+        free_page(self.0);
     }
 }
 
-// --- Free list ---
+// --- Bitmap allocator ---
 
-struct FreeList {
-    head: u64,       // physical address of first free page, 0 = empty
-    free_count: u64,
-    total_count: u64,
+/// Maximum physical memory: 64 GB → 32768 2MB pages → 4096 bytes bitmap.
+const MAX_PAGES: usize = 32768;
+
+struct Bitmap {
+    /// One bit per 2MB page. 1 = free, 0 = allocated.
+    bits: [u64; MAX_PAGES / 64],
+    /// Physical address of page index 0 (lowest usable page).
+    base: u64,
+    /// Number of valid page indices (base..base + page_count * PAGE_2M).
+    page_count: usize,
+    free_count: usize,
+    total_usable: usize,
 }
 
-static FREE_LIST: Lock<FreeList> = Lock::new(FreeList {
-    head: 0,
-    free_count: 0,
-    total_count: 0,
-});
+impl Bitmap {
+    const fn new() -> Self {
+        Self {
+            bits: [0; MAX_PAGES / 64],
+            base: 0,
+            page_count: 0,
+            free_count: 0,
+            total_usable: 0,
+        }
+    }
 
-/// Sentinel value: no next page.
-const NULL_PAGE: u64 = 0;
+    fn set_free(&mut self, idx: usize) {
+        self.bits[idx / 64] |= 1u64 << (idx % 64);
+    }
 
-/// Read the `next` pointer from a free page (stored in its first 8 bytes).
-fn read_next(phys: u64) -> u64 {
-    unsafe { *super::DirectMap::from_phys(phys).as_ptr::<u64>() }
+    fn set_used(&mut self, idx: usize) {
+        self.bits[idx / 64] &= !(1u64 << (idx % 64));
+    }
+
+    fn is_free(&self, idx: usize) -> bool {
+        self.bits[idx / 64] & (1u64 << (idx % 64)) != 0
+    }
+
+    fn phys_to_idx(&self, phys: u64) -> usize {
+        ((phys - self.base) / PAGE_2M) as usize
+    }
+
+    fn idx_to_phys(&self, idx: usize) -> u64 {
+        self.base + idx as u64 * PAGE_2M
+    }
 }
 
-/// Write the `next` pointer into a free page.
-fn write_next(phys: u64, next: u64) {
-    unsafe { *super::DirectMap::from_phys(phys).as_mut_ptr::<u64>() = next; }
-}
+static BITMAP: Lock<Bitmap> = Lock::new(Bitmap::new());
 
-/// Initialize the free list from the UEFI memory map.
-/// Extracts all 2MB-aligned chunks from usable regions, skipping reserved areas.
+/// Initialize the bitmap from the UEFI memory map.
 pub(super) fn init(entries: &[MemoryMapEntry], reserved: &[Region]) {
-    let mut list = FREE_LIST.lock();
+    let mut bm = BITMAP.lock();
 
+    // Find the range of usable physical memory.
+    let mut lo = u64::MAX;
+    let mut hi = 0u64;
     for entry in entries.iter().filter(|e| is_usable(e)) {
-        // Align region start up to 2MB, end down to 2MB
         let start = (entry.start + PAGE_2M - 1) & !(PAGE_2M - 1);
         let end = entry.end & !(PAGE_2M - 1);
+        if start < end {
+            lo = lo.min(start);
+            hi = hi.max(end);
+        }
+    }
+    if lo >= hi { return; }
 
+    bm.base = lo;
+    bm.page_count = ((hi - lo) / PAGE_2M) as usize;
+    assert!(bm.page_count <= MAX_PAGES, "pmm: physical memory exceeds {} GB", MAX_PAGES * 2 / 1024);
+
+    // Mark usable pages as free (skip reserved regions).
+    for entry in entries.iter().filter(|e| is_usable(e)) {
+        let start = (entry.start + PAGE_2M - 1) & !(PAGE_2M - 1);
+        let end = entry.end & !(PAGE_2M - 1);
         let mut addr = start;
         while addr + PAGE_2M <= end {
-            // Skip if this 2MB chunk overlaps any reserved region
             if !overlaps_reserved(addr, addr + PAGE_2M, reserved) {
-                // Zero the first 8 bytes (next pointer) and push onto list
-                write_next(addr, list.head);
-                list.head = addr;
-                list.free_count += 1;
-                list.total_count += 1;
+                let idx = bm.phys_to_idx(addr);
+                bm.set_free(idx);
+                bm.free_count += 1;
+                bm.total_usable += 1;
             }
             addr += PAGE_2M;
         }
     }
 }
 
-/// Allocate one 2MB physical page. Returns None if out of memory.
-pub(super) fn alloc_page() -> Option<PhysPage> {
-    let mut list = FREE_LIST.lock();
-    let phys = list.head;
-    if phys == NULL_PAGE {
-        return None;
+/// Allocate one 2MB physical page. Does not heap-allocate (safe to call from the allocator).
+pub fn alloc_page() -> Option<PhysPage> {
+    let mut bm = BITMAP.lock();
+    if bm.free_count == 0 { return None; }
+    for idx in 0..bm.page_count {
+        if bm.is_free(idx) {
+            bm.set_used(idx);
+            bm.free_count -= 1;
+            let phys = bm.idx_to_phys(idx);
+            drop(bm);
+            unsafe {
+                core::ptr::write_bytes(
+                    DirectMap::from_phys(phys).as_mut_ptr::<u8>(), 0, PAGE_2M as usize,
+                );
+            }
+            return Some(PhysPage(phys));
+        }
     }
-    list.head = read_next(phys);
-    list.free_count -= 1;
-    drop(list); // release lock before zeroing
-
-    unsafe { core::ptr::write_bytes(DirectMap::from_phys(phys).as_mut_ptr::<u8>(), 0, PAGE_2M as usize); }
-
-    Some(PhysPage(phys))
+    None
 }
 
-/// Return a page to the free list (called by PhysPage::drop).
-fn free_page_raw(phys: u64) {
-    let mut list = FREE_LIST.lock();
-    write_next(phys, list.head);
-    list.head = phys;
-    list.free_count += 1;
+/// Allocate `count` physically contiguous 2MB pages.
+pub fn alloc_contiguous(count: usize) -> Option<alloc::vec::Vec<PhysPage>> {
+    assert!(count > 0);
+    let mut bm = BITMAP.lock();
+    if bm.free_count < count { return None; }
+
+    // Scan for a run of `count` consecutive free bits.
+    let mut run = 0usize;
+    let mut run_start = 0usize;
+    for idx in 0..bm.page_count {
+        if bm.is_free(idx) {
+            if run == 0 { run_start = idx; }
+            run += 1;
+            if run == count {
+                for i in run_start..run_start + count {
+                    bm.set_used(i);
+                }
+                bm.free_count -= count;
+                let base_phys = bm.idx_to_phys(run_start);
+                drop(bm);
+
+                let mut pages = alloc::vec::Vec::with_capacity(count);
+                for i in 0..count {
+                    let phys = base_phys + i as u64 * PAGE_2M;
+                    unsafe {
+                        core::ptr::write_bytes(
+                            DirectMap::from_phys(phys).as_mut_ptr::<u8>(), 0, PAGE_2M as usize,
+                        );
+                    }
+                    pages.push(PhysPage(phys));
+                }
+                return Some(pages);
+            }
+        } else {
+            run = 0;
+        }
+    }
+    None
+}
+
+/// Return a page to the bitmap (called by PhysPage::drop).
+fn free_page(phys: u64) {
+    let mut bm = BITMAP.lock();
+    let idx = bm.phys_to_idx(phys);
+    bm.set_free(idx);
+    bm.free_count += 1;
 }
 
 /// Return (total_bytes, used_bytes).
 pub fn stats() -> (u64, u64) {
-    let list = FREE_LIST.lock();
-    let total = list.total_count * PAGE_2M;
-    let used = (list.total_count - list.free_count) * PAGE_2M;
+    let bm = BITMAP.lock();
+    let total = bm.total_usable as u64 * PAGE_2M;
+    let used = (bm.total_usable - bm.free_count) as u64 * PAGE_2M;
     (total, used)
 }
 

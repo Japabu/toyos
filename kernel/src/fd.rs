@@ -367,7 +367,7 @@ pub fn try_write(table: &mut FdTable, fd: u32, buf: &[u8]) -> Option<u64> {
             }
         }
         Descriptor::SerialConsole => {
-            serial_write_plain(buf);
+            serial::write(buf);
             Some(buf.len() as u64)
         }
         _ => Some(SyscallError::PermissionDenied.to_u64()),
@@ -494,25 +494,3 @@ pub fn mark_tty(table: &mut FdTable, fd: u32) -> u64 {
     0
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-fn serial_write_plain(bytes: &[u8]) {
-    let mut i = 0;
-    let mut start = 0;
-    while i < bytes.len() {
-        if bytes[i] == 0x1B && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
-            if start < i { serial::write_bytes(&bytes[start..i]); }
-            i += 2;
-            while i < bytes.len() && !(0x40..=0x7E).contains(&bytes[i]) {
-                i += 1;
-            }
-            if i < bytes.len() { i += 1; }
-            start = i;
-        } else {
-            i += 1;
-        }
-    }
-    if start < bytes.len() { serial::write_bytes(&bytes[start..]); }
-}

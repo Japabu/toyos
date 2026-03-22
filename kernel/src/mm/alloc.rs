@@ -8,8 +8,10 @@ use super::pmm;
 struct KernelPageSource;
 
 unsafe impl dlmalloc::Allocator for KernelPageSource {
-    fn alloc(&self, _size: usize) -> (*mut u8, usize, u32) {
-        // Single 2MB page per request. dlmalloc rarely asks for more.
+    fn alloc(&self, size: usize) -> (*mut u8, usize, u32) {
+        if size > PAGE_2M as usize {
+            panic!("dlmalloc requested {} bytes (align from GlobalAlloc) — caller should use pmm::alloc_contiguous", size);
+        }
         if let Some(page) = pmm::alloc_page() {
             let ptr = page.direct_map().as_mut_ptr::<u8>();
             core::mem::forget(page); // dlmalloc manages the lifetime
@@ -28,11 +30,8 @@ unsafe impl dlmalloc::Allocator for KernelPageSource {
     }
 
     fn free(&self, ptr: *mut u8, _size: usize) -> bool {
-        // Return the 2MB page to pmm
         let phys = ptr as u64 - PHYS_OFFSET;
-        // Reconstruct a PhysPage to return via Drop
-        let page = super::pmm::PhysPage::from_raw(phys);
-        drop(page);
+        drop(pmm::PhysPage::from_raw(phys));
         true
     }
 
@@ -41,7 +40,7 @@ unsafe impl dlmalloc::Allocator for KernelPageSource {
     }
 
     fn allocates_zeros(&self) -> bool {
-        true // pmm::alloc_page returns zeroed pages
+        true
     }
 
     fn page_size(&self) -> usize {
@@ -58,7 +57,6 @@ const PHASE_UNINIT: u8 = 0;
 const PHASE_EARLY: u8 = 1;
 const PHASE_READY: u8 = 2;
 
-// Interrupt-safe lock for the allocator
 use crate::sync::Lock;
 
 impl KernelAllocator {

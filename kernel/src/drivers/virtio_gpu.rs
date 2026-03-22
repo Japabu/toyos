@@ -1,13 +1,11 @@
-use core::alloc::Layout;
 use core::ptr::{copy_nonoverlapping, read_volatile};
 
-use alloc::alloc::{alloc_zeroed, dealloc};
 use alloc::boxed::Box;
 
 use super::pci::PciDevice;
 use super::virtio::{BufDir, DescSlot, Virtqueue, VirtioDevice, VIRTIO_F_VERSION_1};
 use super::DmaPool;
-use crate::mm::{PAGE_2M, align_2m};
+use crate::mm::{PAGE_2M, KernelSlice};
 use crate::gpu::{FLAG_HARDWARE_CURSOR, Gpu, GpuInfo};
 use crate::log;
 use crate::shared_memory::{self, SharedToken};
@@ -36,11 +34,12 @@ const RESP_OK_DISPLAY_INFO: u32 = 0x1101;
 const FORMAT_B8G8R8A8_UNORM: u32 = 1;
 const FORMAT_B8G8R8X8_UNORM: u32 = 2;
 
-// DMA page assignments
-const PAGE_CONTROLQ: usize = 0;
-const PAGE_CONTROLQ_BUFS: usize = 1;
-const PAGE_CURSORQ: usize = 2;
-const PAGE_CURSORQ_BUFS: usize = 3;
+// DMA layout (byte offsets)
+const OFF_CONTROLQ: usize      = 0x0000;
+const OFF_CONTROLQ_BUFS: usize = 0x1000;
+const OFF_CURSORQ: usize       = 0x2000;
+const OFF_CURSORQ_BUFS: usize  = 0x3000;
+const DMA_SIZE: usize           = 0x4000;
 
 const CURSOR_SIZE: u32 = 64;
 const CURSOR_RESOURCE_ID: u32 = 3;
@@ -50,12 +49,8 @@ const RESP_OFFSET: usize = 0x800;
 
 static DMA: Lock<Option<DmaPool>> = Lock::new(None);
 
-fn dma_phys(page: usize) -> crate::DmaAddr {
-    DMA.lock().as_ref().unwrap().page_phys(page)
-}
-
-fn dma_ptr(page: usize) -> *mut u8 {
-    DMA.lock().as_ref().unwrap().page_ptr(page)
+fn dma() -> KernelSlice {
+    DMA.lock().as_ref().unwrap().slice()
 }
 
 // ---- GPU command/response structs ----
@@ -187,11 +182,9 @@ struct UpdateCursor {
 
 struct FbAlloc {
     tokens: [SharedToken; 2],
-    /// Physical addresses (for device DMA / attach_backing).
     phys_addrs: [u64; 2],
-    /// Virtual pointers (for kernel dealloc).
     ptrs: [*mut u8; 2],
-    layout: Layout,
+    _pages: [alloc::vec::Vec<crate::mm::pmm::PhysPage>; 2],
 }
 
 // ---- GPU Controller ----
@@ -218,6 +211,7 @@ struct GpuController {
     resource: u32,
     fb: FbAlloc,
     cursor_token: SharedToken,
+    _cursor_pages: alloc::vec::Vec<crate::mm::pmm::PhysPage>,
 }
 
 impl GpuController {
@@ -422,29 +416,30 @@ impl GpuController {
     /// Allocate framebuffer backing stores and register as shared memory.
     fn alloc_framebuffer(&mut self, width: u32, height: u32) -> FbAlloc {
         let fb_size = (width * height * 4) as usize;
-        let fb_aligned = align_2m(fb_size);
-        let fb_layout = Layout::from_size_align(fb_aligned, PAGE_2M as usize).unwrap();
+        let fb_pages = (fb_size + PAGE_2M as usize - 1) / PAGE_2M as usize;
         let mut tokens = [SharedToken::from_raw(0); 2];
         let mut phys_addrs = [0u64; 2];
         let mut ptrs = [core::ptr::null_mut(); 2];
+        let pages0 = crate::mm::pmm::alloc_contiguous(fb_pages).expect("VirtIO GPU: framebuffer alloc failed");
+        let pages1 = crate::mm::pmm::alloc_contiguous(fb_pages).expect("VirtIO GPU: framebuffer alloc failed");
+        let all_pages = [pages0, pages1];
         for i in 0..2 {
-            let ptr = unsafe { alloc_zeroed(fb_layout) };
-            assert!(!ptr.is_null(), "VirtIO GPU: framebuffer alloc failed");
-            let phys_addr = crate::mm::DirectMap::phys_of(ptr);
+            let phys_addr = all_pages[i][0].direct_map().phys();
+            let ptr = all_pages[i][0].direct_map().as_mut_ptr::<u8>();
             ptrs[i] = ptr;
             phys_addrs[i] = phys_addr;
+            let fb_aligned = fb_pages * PAGE_2M as usize;
             tokens[i] = shared_memory::register(crate::DirectMap::from_phys(phys_addr), fb_aligned as u64);
             log!("VirtIO GPU: buffer {} at {:?} phys={:#x} ({} bytes) token={:?}", i, ptr, phys_addrs[i], fb_size, tokens[i]);
         }
-        FbAlloc { tokens, phys_addrs, ptrs, layout: fb_layout }
+        FbAlloc { tokens, phys_addrs, ptrs, _pages: all_pages }
     }
 
-    /// Free old framebuffer backing stores and unregister shared memory.
     fn free_framebuffer(&mut self, fb: FbAlloc) {
         for i in 0..2 {
             shared_memory::unregister(fb.tokens[i]);
-            unsafe { dealloc(fb.ptrs[i], fb.layout); }
         }
+        // PhysPages freed via Drop when _pages is dropped
     }
 
     fn build_gpu_info(&self) -> GpuInfo {
@@ -526,12 +521,13 @@ impl Gpu for GpuController {
 pub fn init(ecam: &crate::mm::Mmio) -> Option<(Box<dyn Gpu>, GpuInfo)> {
     let pci_dev = PciDevice::find_by_id(ecam, VIRTIO_VENDOR, VIRTIO_GPU_DEVICE)?;
     log!("VirtIO GPU: found at PCI {:02x}:{:02x}.{}", pci_dev.bus, pci_dev.dev, pci_dev.func);
-    *DMA.lock() = Some(DmaPool::alloc(4));
+    *DMA.lock() = Some(DmaPool::alloc(DMA_SIZE));
+    let dma = dma();
 
     let device = VirtioDevice::init(&pci_dev, VIRTIO_F_VERSION_1);
 
-    let mut controlq = Virtqueue::new(dma_phys(PAGE_CONTROLQ), dma_ptr(PAGE_CONTROLQ));
-    let mut cursorq = Virtqueue::new(dma_phys(PAGE_CURSORQ), dma_ptr(PAGE_CURSORQ));
+    let mut controlq = Virtqueue::new(dma.subslice(OFF_CONTROLQ, 0x1000));
+    let mut cursorq = Virtqueue::new(dma.subslice(OFF_CURSORQ, 0x1000));
 
     device.setup_queue(0, &mut controlq);
     device.setup_queue(1, &mut cursorq);
@@ -546,13 +542,15 @@ pub fn init(ecam: &crate::mm::Mmio) -> Option<(Box<dyn Gpu>, GpuInfo)> {
     drop(control_slots);
     drop(cursor_slots);
 
-    let req_phys = dma_phys(PAGE_CONTROLQ_BUFS).raw() + REQ_OFFSET as u64;
-    let resp_phys = dma_phys(PAGE_CONTROLQ_BUFS).raw() + RESP_OFFSET as u64;
-    let cursor_req_phys = dma_phys(PAGE_CURSORQ_BUFS).raw() + REQ_OFFSET as u64;
-    let cursor_resp_phys = dma_phys(PAGE_CURSORQ_BUFS).raw() + RESP_OFFSET as u64;
-    let req_ptr = unsafe { dma_ptr(PAGE_CONTROLQ_BUFS).add(REQ_OFFSET) };
-    let resp_ptr = unsafe { dma_ptr(PAGE_CONTROLQ_BUFS).add(RESP_OFFSET) };
-    let cursor_req_ptr = unsafe { dma_ptr(PAGE_CURSORQ_BUFS).add(REQ_OFFSET) };
+    let ctrl_bufs = dma.subslice(OFF_CONTROLQ_BUFS, 0x1000);
+    let cursor_bufs = dma.subslice(OFF_CURSORQ_BUFS, 0x1000);
+    let req_phys = ctrl_bufs.phys() + REQ_OFFSET as u64;
+    let resp_phys = ctrl_bufs.phys() + RESP_OFFSET as u64;
+    let cursor_req_phys = cursor_bufs.phys() + REQ_OFFSET as u64;
+    let cursor_resp_phys = cursor_bufs.phys() + RESP_OFFSET as u64;
+    let req_ptr = ctrl_bufs.ptr_at(REQ_OFFSET);
+    let resp_ptr = ctrl_bufs.ptr_at(RESP_OFFSET);
+    let cursor_req_ptr = cursor_bufs.ptr_at(REQ_OFFSET);
 
     let mut gpu = GpuController {
         device,
@@ -574,9 +572,10 @@ pub fn init(ecam: &crate::mm::Mmio) -> Option<(Box<dyn Gpu>, GpuInfo)> {
             tokens: [SharedToken::from_raw(0); 2],
             phys_addrs: [0; 2],
             ptrs: [core::ptr::null_mut(); 2],
-            layout: Layout::from_size_align(PAGE_2M as usize, PAGE_2M as usize).unwrap(),
+            _pages: [alloc::vec::Vec::new(), alloc::vec::Vec::new()],
         },
         cursor_token: SharedToken::from_raw(0),
+        _cursor_pages: alloc::vec::Vec::new(),
     };
 
     // Query display info
@@ -612,12 +611,11 @@ pub fn init(ecam: &crate::mm::Mmio) -> Option<(Box<dyn Gpu>, GpuInfo)> {
 
     // Create cursor resource (64x64, BGRA with alpha)
     let cursor_bytes = (CURSOR_SIZE * CURSOR_SIZE * 4) as usize;
-    let cursor_aligned = align_2m(cursor_bytes);
-    let cursor_layout = Layout::from_size_align(cursor_aligned, PAGE_2M as usize).unwrap();
-    let cursor_ptr = unsafe { alloc_zeroed(cursor_layout) };
-    assert!(!cursor_ptr.is_null(), "VirtIO GPU: cursor alloc failed");
-    let cursor_phys = crate::mm::DirectMap::phys_of(cursor_ptr);
-    gpu.cursor_token = shared_memory::register(crate::DirectMap::from_phys(cursor_phys), cursor_aligned as u64);
+    let cursor_pages = crate::mm::pmm::alloc_contiguous(1).expect("VirtIO GPU: cursor alloc failed");
+    let cursor_ptr = cursor_pages[0].direct_map().as_mut_ptr::<u8>();
+    let cursor_phys = cursor_pages[0].direct_map().phys();
+    gpu.cursor_token = shared_memory::register(crate::DirectMap::from_phys(cursor_phys), PAGE_2M);
+    gpu._cursor_pages = cursor_pages;
     gpu.create_resource(CURSOR_RESOURCE_ID, FORMAT_B8G8R8A8_UNORM, CURSOR_SIZE, CURSOR_SIZE);
     gpu.attach_backing(CURSOR_RESOURCE_ID, cursor_phys, cursor_bytes as u32);
     log!("VirtIO GPU: cursor resource at {:?} phys={:#x} token={:?}", cursor_ptr, cursor_phys, gpu.cursor_token);

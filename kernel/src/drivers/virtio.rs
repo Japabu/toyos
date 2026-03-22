@@ -1,4 +1,4 @@
-use core::ptr::{read_volatile, write_volatile, write_bytes};
+use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{fence, Ordering};
 
 use crate::mm::Mmio;
@@ -101,7 +101,7 @@ impl VirtioPciConfig {
             let offset = cap.read_u32(8) as u64;
             let length = cap.read_u32(12) as u64;
 
-            let bar = mapped_bars[bar_idx].as_ref().expect("VirtIO: BAR not mapped");
+            let Some(bar) = mapped_bars[bar_idx].as_ref() else { continue };
             let mmio = bar.subregion(offset, length.max(4));
 
             match cfg_type {
@@ -127,64 +127,40 @@ impl VirtioPciConfig {
 }
 
 /// DMA region specification for a virtqueue.
+use crate::mm::KernelSlice;
+
 pub struct VirtqueueRegions {
-    pub desc_phys: u64,
-    pub desc_virt: *mut u8,
-    pub desc_size: usize,
-    pub avail_phys: u64,
-    pub avail_virt: *mut u8,
-    pub avail_size: usize,
-    pub used_phys: u64,
-    pub used_virt: *mut u8,
-    pub used_size: usize,
+    pub desc: KernelSlice,
+    pub avail: KernelSlice,
+    pub used: KernelSlice,
 }
 
 impl VirtqueueRegions {
     /// Compute regions from a single contiguous DMA buffer.
-    /// Desc, avail, used are packed sequentially with proper alignment.
-    pub fn from_contiguous(phys: u64, virt: *mut u8, queue_size: u16) -> Self {
+    pub fn from_contiguous(buf: KernelSlice, queue_size: u16) -> Self {
         let desc_size = queue_size as usize * core::mem::size_of::<VirtqDesc>();
-        let avail_size = 4 + queue_size as usize * 2; // flags + idx + ring
-        let used_size = 4 + queue_size as usize * USED_ELEM_SIZE; // flags + idx + ring
-
-        // Avail starts after desc, aligned to 2
+        let avail_size = 4 + queue_size as usize * 2;
+        let used_size = 4 + queue_size as usize * USED_ELEM_SIZE;
         let avail_off = (desc_size + 1) & !1;
-        // Used starts after avail, aligned to 4
         let used_off = (avail_off + avail_size + 3) & !3;
-
         Self {
-            desc_phys: phys,
-            desc_virt: virt,
-            desc_size,
-            avail_phys: phys + avail_off as u64,
-            avail_virt: unsafe { virt.add(avail_off) },
-            avail_size,
-            used_phys: phys + used_off as u64,
-            used_virt: unsafe { virt.add(used_off) },
-            used_size,
+            desc: buf.subslice(0, desc_size),
+            avail: buf.subslice(avail_off, avail_size),
+            used: buf.subslice(used_off, used_size),
         }
     }
 
     /// Compute regions from three separate DMA pages.
-    pub fn from_separate_pages(
-        desc_phys: u64, desc_virt: *mut u8,
-        avail_phys: u64, avail_virt: *mut u8,
-        used_phys: u64, used_virt: *mut u8,
-        queue_size: u16,
-    ) -> Self {
+    pub fn from_separate(desc: KernelSlice, avail: KernelSlice, used: KernelSlice, queue_size: u16) -> Self {
+        let desc_size = queue_size as usize * core::mem::size_of::<VirtqDesc>();
+        let avail_size = 4 + queue_size as usize * 2;
+        let used_size = 4 + queue_size as usize * USED_ELEM_SIZE;
         Self {
-            desc_phys,
-            desc_virt,
-            desc_size: queue_size as usize * core::mem::size_of::<VirtqDesc>(),
-            avail_phys,
-            avail_virt,
-            avail_size: 4 + queue_size as usize * 2,
-            used_phys,
-            used_virt,
-            used_size: 4 + queue_size as usize * USED_ELEM_SIZE,
+            desc: desc.subslice(0, desc_size),
+            avail: avail.subslice(0, avail_size),
+            used: used.subslice(0, used_size),
         }
     }
-
 }
 
 /// Proof that a descriptor slot is available for submission.
@@ -199,12 +175,9 @@ impl DescSlot {
 
 /// A VirtIO split virtqueue.
 pub struct Virtqueue {
-    desc_virt: *mut VirtqDesc,
-    avail_virt: *mut u8,
-    used_virt: *const u8,
-    desc_phys: u64,
-    avail_phys: u64,
-    used_phys: u64,
+    desc: KernelSlice,
+    avail: KernelSlice,
+    used: KernelSlice,
     size: u16,
     last_used_idx: u16,
     notify_offset: u16,
@@ -212,34 +185,28 @@ pub struct Virtqueue {
 
 /// Direction of a buffer in a descriptor chain.
 pub enum BufDir {
-    /// Driver → device (device reads this buffer).
     Readable,
-    /// Device → driver (device writes this buffer).
     Writable,
 }
 
 impl Virtqueue {
-    /// Create a new virtqueue from a contiguous DMA region that fits in one page.
-    pub fn new(phys: crate::DmaAddr, virt: *mut u8) -> Self {
-        let regions = VirtqueueRegions::from_contiguous(phys.raw(), virt, 16);
-        unsafe { write_bytes(virt, 0, 4096); }
-        Self::from_regions(&regions, 16)
+    /// Create a new virtqueue from a contiguous DMA region (one 4KB page, 16 entries).
+    pub fn new(buf: KernelSlice) -> Self {
+        unsafe { buf.zero(); }
+        Self::from_regions(&VirtqueueRegions::from_contiguous(buf, 16), 16)
     }
 
     /// Create a new virtqueue from explicit DMA regions.
     pub fn from_regions(regions: &VirtqueueRegions, queue_size: u16) -> Self {
         unsafe {
-            write_bytes(regions.desc_virt, 0, regions.desc_size);
-            write_bytes(regions.avail_virt, 0, regions.avail_size);
-            write_bytes(regions.used_virt as *mut u8, 0, regions.used_size);
+            regions.desc.zero();
+            regions.avail.zero();
+            regions.used.zero();
         }
         Self {
-            desc_virt: regions.desc_virt as *mut VirtqDesc,
-            avail_virt: regions.avail_virt,
-            used_virt: regions.used_virt as *const u8,
-            desc_phys: regions.desc_phys,
-            avail_phys: regions.avail_phys,
-            used_phys: regions.used_phys,
+            desc: regions.desc,
+            avail: regions.avail,
+            used: regions.used,
             size: queue_size,
             last_used_idx: 0,
             notify_offset: 0,
@@ -247,27 +214,25 @@ impl Virtqueue {
     }
 
     /// Physical addresses for device register programming.
-    pub fn descs_phys(&self) -> u64 { self.desc_phys }
-    pub fn avail_phys(&self) -> u64 { self.avail_phys }
-    pub fn used_phys(&self) -> u64 { self.used_phys }
+    pub fn descs_phys(&self) -> u64 { self.desc.phys() }
+    pub fn avail_phys(&self) -> u64 { self.avail.phys() }
+    pub fn used_phys(&self) -> u64 { self.used.phys() }
 
-    // Avail ring accessors via raw pointer math
     fn avail_idx_ptr(&self) -> *mut u16 {
-        unsafe { self.avail_virt.add(AVAIL_IDX_OFF) as *mut u16 }
+        self.avail.ptr_at(AVAIL_IDX_OFF) as *mut u16
     }
     fn avail_ring_ptr(&self, i: u16) -> *mut u16 {
-        unsafe { self.avail_virt.add(AVAIL_RING_OFF + i as usize * 2) as *mut u16 }
+        self.avail.ptr_at(AVAIL_RING_OFF + i as usize * 2) as *mut u16
     }
 
-    // Used ring accessors via raw pointer math
     fn used_idx_ptr(&self) -> *const u16 {
-        unsafe { self.used_virt.add(USED_IDX_OFF) as *const u16 }
+        self.used.ptr_at(USED_IDX_OFF) as *const u16
     }
     fn used_ring_id_ptr(&self, i: u16) -> *const u32 {
-        unsafe { self.used_virt.add(USED_RING_OFF + i as usize * USED_ELEM_SIZE) as *const u32 }
+        self.used.ptr_at(USED_RING_OFF + i as usize * USED_ELEM_SIZE) as *const u32
     }
     fn used_ring_len_ptr(&self, i: u16) -> *const u32 {
-        unsafe { self.used_virt.add(USED_RING_OFF + i as usize * USED_ELEM_SIZE + 4) as *const u32 }
+        self.used.ptr_at(USED_RING_OFF + i as usize * USED_ELEM_SIZE + 4) as *const u32
     }
 
     /// Return the initial pool of descriptor slots. Call once after construction.
@@ -303,7 +268,8 @@ impl Virtqueue {
             }
 
             let desc = VirtqDesc { addr: *addr, len: *len, flags, next: next_idx };
-            unsafe { write_volatile(self.desc_virt.add(desc_idx as usize), desc); }
+            let desc_ptr = self.desc.ptr_at(desc_idx as usize * core::mem::size_of::<VirtqDesc>()) as *mut VirtqDesc;
+            unsafe { write_volatile(desc_ptr, desc); }
         }
 
         let avail_idx = unsafe { read_volatile(self.avail_idx_ptr()) };

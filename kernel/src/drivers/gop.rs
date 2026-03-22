@@ -1,4 +1,3 @@
-use alloc::alloc::{alloc_zeroed, Layout};
 use alloc::boxed::Box;
 
 use crate::mm::{PAGE_2M, align_2m, DirectMap};
@@ -39,15 +38,13 @@ pub fn init(
     log!("GOP: {}x{} stride={} format={} at {:#x} tokens=[{:?}, {:?}]",
         width, height, stride, pixel_format, addr, token0, token1);
 
-    let cursor_bytes = (64 * 64 * 4) as usize;
-    let cursor_aligned = align_2m(cursor_bytes);
-    let cursor_layout = Layout::from_size_align(cursor_aligned, PAGE_2M as usize).unwrap();
-    let cursor_ptr = unsafe { alloc_zeroed(cursor_layout) };
-    assert!(!cursor_ptr.is_null(), "GOP: cursor alloc failed");
+    let cursor_pages = crate::mm::pmm::alloc_contiguous(1).expect("GOP: cursor alloc failed");
+    let cursor_phys = cursor_pages[0].direct_map().phys();
     let cursor_token = shared_memory::register(
-        DirectMap::from_ptr(cursor_ptr),
-        cursor_aligned as u64,
+        DirectMap::from_phys(cursor_phys),
+        PAGE_2M,
     );
+    core::mem::forget(cursor_pages); // lives forever (GPU is never torn down)
 
     let info = GpuInfo {
         tokens: [token0, token1],

@@ -1,7 +1,6 @@
-use alloc::alloc::{alloc_zeroed, dealloc};
+use crate::mm::pmm;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::alloc::Layout;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::mm::{PAGE_2M, align_2m};
@@ -40,7 +39,7 @@ enum Ownership {
     /// Never freed by shared_memory — the kernel subsystem manages the lifetime.
     Kernel,
     /// Process-owned. Freed when the owning process exits and no mappings remain.
-    Process { pid: Pid, layout: Layout },
+    Process { pid: Pid, _pages: Vec<pmm::PhysPage> },
 }
 
 // ---------------------------------------------------------------------------
@@ -126,10 +125,9 @@ fn next_token() -> SharedToken {
 #[must_use]
 pub fn alloc(size: u64, owner_pid: Pid, addr_space: &PageTables) -> SharedToken {
     let aligned_size = align_2m(size as usize);
-    let layout = Layout::from_size_align(aligned_size, PAGE_2M as usize).unwrap();
-    let ptr = unsafe { alloc_zeroed(layout) };
-    assert!(!ptr.is_null(), "shared_memory: allocation failed");
-    let phys = DirectMap::from_ptr(ptr as *const u8);
+    let page_count = aligned_size / PAGE_2M as usize;
+    let pages = pmm::alloc_contiguous(page_count).expect("shared_memory: allocation failed");
+    let phys = DirectMap::from_phys(pages[0].direct_map().phys());
     let vaddr = alloc_vaddr(aligned_size as u64);
 
     let token = next_token();
@@ -137,7 +135,7 @@ pub fn alloc(size: u64, owner_pid: Pid, addr_space: &PageTables) -> SharedToken 
         phys,
         size: aligned_size as u64,
         vaddr,
-        ownership: Ownership::Process { pid: owner_pid, layout },
+        ownership: Ownership::Process { pid: owner_pid, _pages: pages },
         allowed: alloc::vec![owner_pid],
         mapped_in: Vec::new(),
     };
@@ -242,10 +240,9 @@ pub fn cleanup_process(pid: Pid) {
             region.unmap_from(pid);
             region.allowed.retain(|p| *p != pid);
 
-            if let Ownership::Process { pid: owner, layout } = region.ownership {
-                if owner == pid && region.mapped_in.is_empty() {
-                    unsafe { dealloc(region.phys.as_mut_ptr(), layout); }
-                    return false;
+            if let Ownership::Process { pid: owner, .. } = &region.ownership {
+                if *owner == pid && region.mapped_in.is_empty() {
+                    return false; // PhysPages freed via Drop
                 }
             }
             true

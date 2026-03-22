@@ -2,12 +2,13 @@ mod device;
 mod hid;
 
 use alloc::vec::Vec;
-use core::ptr::{read_volatile, write_volatile, write_bytes};
+use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{fence, Ordering};
 use crate::mm::Mmio;
 use super::pci::PciDevice;
 use super::DmaPool;
 use crate::log;
+use crate::mm::KernelSlice;
 use crate::sync::Lock;
 
 use hid::HidDevice;
@@ -118,8 +119,8 @@ struct TrbRing {
 }
 
 impl TrbRing {
-    fn new(base: *mut Trb, base_phys: crate::DmaAddr) -> Self {
-        Self { base, base_phys: base_phys.raw(), tail: 0, cycle: true }
+    fn new(buf: KernelSlice) -> Self {
+        Self { base: buf.base() as *mut Trb, base_phys: buf.phys(), tail: 0, cycle: true }
     }
 
     fn enqueue(&mut self, mut trb: Trb) {
@@ -146,28 +147,26 @@ impl TrbRing {
 // ---------------------------------------------------------------------------
 // DMA memory pool
 // ---------------------------------------------------------------------------
-//   Page 0:  DCBAA (Device Context Base Address Array)
-//   Page 1:  Command Ring (256 TRBs)
-//   Page 2:  Event Ring Segment Table
-//   Page 3:  Event Ring (256 TRBs)
-//   Page 4:  Output Context (slot 1)
-//   Page 5:  Input Context (temporary, reused per device)
-//   Page 6:  EP0 Transfer Ring (temporary, reused per device)
-//   Page 7:  Keyboard Interrupt Ring
-//   Page 8:  Data buffer + report buffers (kb@+512, mouse@+1024)
-//   Page 9:  Scratchpad buffer array
-//   Page 10: Output Context (slot 2)
-//   Page 11: Mouse Interrupt Ring
-//   Page 12: Output Context (slot 3)
-const DMA_PAGES: usize = 13;
+// DMA layout (byte offsets)
+const OFF_DCBAA: usize       = 0x0000;
+const OFF_CMD_RING: usize    = 0x1000;
+const OFF_ERST: usize        = 0x2000;
+const OFF_EVT_RING: usize    = 0x3000;
+const OFF_OUT_CTX1: usize    = 0x4000;
+const OFF_INPUT_CTX: usize   = 0x5000;
+const OFF_EP0_RING: usize    = 0x6000;
+const OFF_KB_INT_RING: usize = 0x7000;
+const OFF_DATA_BUF: usize    = 0x8000;
+const OFF_SCRATCH: usize     = 0x9000;
+const OFF_OUT_CTX2: usize    = 0xA000;
+const OFF_MOUSE_INT_RING: usize = 0xB000;
+const OFF_OUT_CTX3: usize    = 0xC000;
+const DMA_SIZE: usize         = 0xD000;
+
 static XHCI_DMA_POOL: Lock<Option<DmaPool>> = Lock::new(None);
 
-fn dma_phys(index: usize) -> crate::DmaAddr {
-    XHCI_DMA_POOL.lock().as_ref().unwrap().page_phys(index)
-}
-
-fn dma_ptr(index: usize) -> *mut u8 {
-    XHCI_DMA_POOL.lock().as_ref().unwrap().page_ptr(index)
+fn dma() -> KernelSlice {
+    XHCI_DMA_POOL.lock().as_ref().unwrap().slice()
 }
 
 // ---------------------------------------------------------------------------
@@ -251,7 +250,7 @@ impl XhciController {
         if self.event_head == 0 {
             self.event_phase = !self.event_phase;
         }
-        let erdp = dma_phys(3).raw() + (self.event_head as u64) * 16;
+        let erdp = dma().phys() + OFF_EVT_RING as u64 + (self.event_head as u64) * 16;
         self.rt_base.write_u64(IR0_ERDP, erdp | (1 << 3)); // EHB clears interrupt pending
         self.rt_base.write_u32(IR0_IMAN, 3); // clear IP (W1C) + keep IE
     }
@@ -331,12 +330,14 @@ impl XhciController {
     // Reset EP0 ring for reuse between devices
     // -------------------------------------------------------------------
     fn reset_ep0_ring(&mut self) {
-        unsafe { write_bytes(dma_ptr(6), 0, 4096); }
+        let dma = dma();
+        let ring = dma.subslice(OFF_EP0_RING, 0x1000);
+        unsafe { ring.zero(); }
         let mut link = Trb::ZERO;
-        link.param = dma_phys(6).raw();
+        link.param = ring.phys();
         link.control = TRB_LINK | (1 << 1);
-        unsafe { write_volatile((dma_ptr(6) as *mut Trb).add(RING_SIZE - 1), link); }
-        self.ep0_ring = TrbRing::new(dma_ptr(6) as *mut Trb, dma_phys(6));
+        unsafe { write_volatile((ring.base() as *mut Trb).add(RING_SIZE - 1), link); }
+        self.ep0_ring = TrbRing::new(ring);
     }
 
     // -------------------------------------------------------------------
@@ -436,7 +437,7 @@ fn setup_msix(pci_dev: &PciDevice) {
 pub fn init(ecam: &crate::mm::Mmio) -> Option<XhciController> {
     let pci_dev = PciDevice::find(ecam, 0x0C, 0x03, Some(0x30))?;
     log!("xHCI: found at PCI {:02x}:{:02x}.{}", pci_dev.bus, pci_dev.dev, pci_dev.func);
-    *XHCI_DMA_POOL.lock() = Some(DmaPool::alloc(DMA_PAGES));
+    *XHCI_DMA_POOL.lock() = Some(DmaPool::alloc(DMA_SIZE));
 
     let bar_addr = pci_dev.read_bar_64(0);
     pci_dev.enable_bus_master();
@@ -487,55 +488,54 @@ pub fn init(ecam: &crate::mm::Mmio) -> Option<XhciController> {
 
     op_base.write_u32(OP_CONFIG, max_slots as u32);
 
-    // Zero DMA pages
-    for i in 0..DMA_PAGES {
-        unsafe { write_bytes(dma_ptr(i), 0, 4096); }
-    }
+    let dma = dma();
+    unsafe { dma.zero(); }
 
     // Scratchpad buffers
     let max_sp_hi = ((hcsparams2 >> 21) & 0x1F) as usize;
     let max_sp_lo = ((hcsparams2 >> 27) & 0x1F) as usize;
     let max_scratchpad = (max_sp_hi << 5) | max_sp_lo;
     if max_scratchpad > 0 {
-        let sp_array = dma_ptr(9) as *mut u64;
-        unsafe { write_volatile(sp_array, dma_phys(9).raw() + 2048); }
-        unsafe { write_volatile(dma_ptr(0) as *mut u64, dma_phys(9).raw()); }
+        let sp_array = dma.ptr_at(OFF_SCRATCH) as *mut u64;
+        unsafe { write_volatile(sp_array, dma.phys() + OFF_SCRATCH as u64 + 2048); }
+        unsafe { write_volatile(dma.ptr_at(OFF_DCBAA) as *mut u64, dma.phys() + OFF_SCRATCH as u64); }
         log!("xHCI: {} scratchpad buffers configured", max_scratchpad);
     }
 
-    op_base.write_u64(OP_DCBAAP, dma_phys(0).raw());
+    op_base.write_u64(OP_DCBAAP, dma.phys() + OFF_DCBAA as u64);
 
     // Command Ring
-    let cmd_ring = dma_ptr(1) as *mut Trb;
+    let cmd_ring_buf = dma.subslice(OFF_CMD_RING, 0x1000);
     let mut link = Trb::ZERO;
-    link.param = dma_phys(1).raw();
+    link.param = cmd_ring_buf.phys();
     link.control = TRB_LINK | (1 << 1);
-    unsafe { write_volatile(cmd_ring.add(RING_SIZE - 1), link); }
-    op_base.write_u64(OP_CRCR, dma_phys(1).raw() | 1);
+    unsafe { write_volatile((cmd_ring_buf.base() as *mut Trb).add(RING_SIZE - 1), link); }
+    op_base.write_u64(OP_CRCR, cmd_ring_buf.phys() | 1);
 
     // Event Ring
-    let erst = dma_ptr(2) as *mut ErstEntry;
+    let evt_ring_buf = dma.subslice(OFF_EVT_RING, 0x1000);
+    let erst = dma.ptr_at(OFF_ERST) as *mut ErstEntry;
     unsafe {
         write_volatile(erst, ErstEntry {
-            ring_base: dma_phys(3).raw(),
+            ring_base: evt_ring_buf.phys(),
             ring_size: RING_SIZE as u32,
             _reserved: 0,
         });
     }
     rt_base.write_u32(IR0_ERSTSZ, 1);
-    rt_base.write_u64(IR0_ERDP, dma_phys(3).raw());
-    rt_base.write_u64(IR0_ERSTBA, dma_phys(2).raw());
+    rt_base.write_u64(IR0_ERDP, evt_ring_buf.phys());
+    rt_base.write_u64(IR0_ERSTBA, dma.phys() + OFF_ERST as u64);
 
-    // Enable interrupter 0: set IE (bit 1) in IMAN, no moderation
+    // Enable interrupter 0
     rt_base.write_u32(IR0_IMOD, 0);
-    rt_base.write_u32(IR0_IMAN, 3); // clear IP (W1C) + set IE
+    rt_base.write_u32(IR0_IMAN, 3);
 
     // EP0 Ring (will be reset per device)
-    let ep0_ring = dma_ptr(6) as *mut Trb;
+    let ep0_buf = dma.subslice(OFF_EP0_RING, 0x1000);
     let mut ep0_link = Trb::ZERO;
-    ep0_link.param = dma_phys(6).raw();
+    ep0_link.param = ep0_buf.phys();
     ep0_link.control = TRB_LINK | (1 << 1);
-    unsafe { write_volatile(ep0_ring.add(RING_SIZE - 1), ep0_link); }
+    unsafe { write_volatile((ep0_buf.base() as *mut Trb).add(RING_SIZE - 1), ep0_link); }
 
     // Start controller (R/S + INTE for interrupt delivery)
     op_base.write_u32(OP_USBCMD, 1 | (1 << 2));
@@ -548,9 +548,9 @@ pub fn init(ecam: &crate::mm::Mmio) -> Option<XhciController> {
         db_base,
         rt_base,
         context_size,
-        cmd_ring: TrbRing::new(cmd_ring, dma_phys(1)),
-        ep0_ring: TrbRing::new(ep0_ring, dma_phys(6)),
-        event_ring: dma_ptr(3) as *const Trb,
+        cmd_ring: TrbRing::new(cmd_ring_buf),
+        ep0_ring: TrbRing::new(ep0_buf),
+        event_ring: evt_ring_buf.base() as *const Trb,
         event_head: 0,
         event_phase: true,
         active_slot: 0,

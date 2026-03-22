@@ -8,7 +8,7 @@ pub struct LogWriter;
 
 impl core::fmt::Write for LogWriter {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        crate::drivers::serial::print(s);
+        crate::drivers::serial::write(s.as_bytes());
         Ok(())
     }
 }

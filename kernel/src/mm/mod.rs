@@ -69,25 +69,6 @@ impl core::fmt::LowerHex for UserAddr {
     }
 }
 
-/// Physical address for DMA device access.
-#[derive(Clone, Copy, PartialEq, Eq)]
-#[repr(transparent)]
-pub struct DmaAddr(u64);
-
-impl DmaAddr {
-    pub const fn raw(self) -> u64 { self.0 }
-
-    /// Convert a kernel direct-map pointer to a DMA address.
-    pub fn from_ptr<T>(ptr: *const T) -> Self {
-        Self(DirectMap::phys_of(ptr))
-    }
-}
-
-impl core::fmt::Debug for DmaAddr {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "DmaAddr({:#x})", self.0)
-    }
-}
 
 /// Converts between physical addresses and kernel virtual pointers.
 /// Use at the boundary between physical and virtual — not for storing pointers.

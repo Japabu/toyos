@@ -5,6 +5,7 @@ use super::pci::PciDevice;
 use super::virtio::{BufDir, DescSlot, Virtqueue, VirtqueueRegions, VirtioDevice, VIRTIO_F_VERSION_1};
 use super::DmaPool;
 use crate::log;
+use crate::mm::KernelSlice;
 use crate::net::NicInfo;
 use crate::shared_memory;
 use crate::sync::Lock;
@@ -21,31 +22,22 @@ const RX_QUEUE_SIZE: u16 = 256;
 const RX_BUF_COUNT: usize = 256;
 const RX_BUF_SIZE: u32 = 4096;
 
-// DMA page assignments:
-// RX queue: desc(1 page) + avail(1 page) + used(1 page) = 3 pages
-// TX queue: fits in 1 page (16 entries)
-// RX buffers: 256 pages
-// TX buffer: 1 page
-// Total: 3 + 1 + 256 + 1 = 261 pages
-const PAGE_RXQ_DESC: usize = 0;
-const PAGE_RXQ_AVAIL: usize = 1;
-const PAGE_RXQ_USED: usize = 2;
-const PAGE_TXQ: usize = 3;
-const PAGE_RX_BUFS: usize = 4;   // 256 pages
-const PAGE_TX_BUF: usize = 260;
-const TOTAL_DMA_PAGES: usize = 261;
+// DMA layout (byte offsets, 4KB-aligned):
+const OFF_RXQ_DESC: usize  = 0x0000;
+const OFF_RXQ_AVAIL: usize = 0x1000;
+const OFF_RXQ_USED: usize  = 0x2000;
+const OFF_TXQ: usize       = 0x3000;
+const OFF_RX_BUFS: usize   = 0x4000;  // 256 × 4KB
+const OFF_TX_BUF: usize    = 0x4000 + 256 * 0x1000;
+const DMA_SIZE: usize       = OFF_TX_BUF + 0x1000;
 
 const PCI_CAP_MSIX: u8 = 0x11;
 const VIRTIO_NET_VECTOR: u8 = 0x22;
 
 static DMA: Lock<Option<DmaPool>> = Lock::new(None);
 
-fn dma_phys(page: usize) -> crate::DmaAddr {
-    DMA.lock().as_ref().unwrap().page_phys(page)
-}
-
-fn dma_ptr(page: usize) -> *mut u8 {
-    DMA.lock().as_ref().unwrap().page_ptr(page)
+fn dma() -> KernelSlice {
+    DMA.lock().as_ref().unwrap().slice()
 }
 
 struct VirtioNic {
@@ -219,22 +211,23 @@ pub fn init(ecam: &crate::mm::Mmio) {
         }
     };
     log!("VirtIO net: found at PCI {:02x}:{:02x}.{}", pci_dev.bus, pci_dev.dev, pci_dev.func);
-    *DMA.lock() = Some(DmaPool::alloc(TOTAL_DMA_PAGES));
+    *DMA.lock() = Some(DmaPool::alloc(DMA_SIZE));
+    let dma = dma();
     pci_dev.enable_bus_master();
 
     let device = VirtioDevice::init(&pci_dev, VIRTIO_F_VERSION_1 | VIRTIO_NET_F_MAC);
 
     // RX queue: 256 entries, separate pages for desc/avail/used
-    let rxq_regions = VirtqueueRegions::from_separate_pages(
-        dma_phys(PAGE_RXQ_DESC).raw(), dma_ptr(PAGE_RXQ_DESC),
-        dma_phys(PAGE_RXQ_AVAIL).raw(), dma_ptr(PAGE_RXQ_AVAIL),
-        dma_phys(PAGE_RXQ_USED).raw(), dma_ptr(PAGE_RXQ_USED),
+    let rxq_regions = VirtqueueRegions::from_separate(
+        dma.subslice(OFF_RXQ_DESC, 0x1000),
+        dma.subslice(OFF_RXQ_AVAIL, 0x1000),
+        dma.subslice(OFF_RXQ_USED, 0x1000),
         RX_QUEUE_SIZE,
     );
     let mut rxq = Virtqueue::from_regions(&rxq_regions, RX_QUEUE_SIZE);
 
     // TX queue: 16 entries, fits in one page
-    let mut txq = Virtqueue::new(dma_phys(PAGE_TXQ), dma_ptr(PAGE_TXQ));
+    let mut txq = Virtqueue::new(dma.subslice(OFF_TXQ, 0x1000));
 
     device.setup_queue(0, &mut rxq);
     device.setup_queue(1, &mut txq);
@@ -253,21 +246,24 @@ pub fn init(ecam: &crate::mm::Mmio) {
         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 
     let rx_phys: [u64; RX_BUF_COUNT] = core::array::from_fn(|i| {
-        dma_phys(PAGE_RX_BUFS + i).raw()
+        dma.phys() + (OFF_RX_BUFS + i * 0x1000) as u64
     });
     let rx_ptrs: [*mut u8; RX_BUF_COUNT] = core::array::from_fn(|i| {
-        dma_ptr(PAGE_RX_BUFS + i)
+        dma.ptr_at(OFF_RX_BUFS + i * 0x1000)
     });
-    let tx_phys = dma_phys(PAGE_TX_BUF).raw();
-    let tx_ptr = dma_ptr(PAGE_TX_BUF);
+    let tx_phys = dma.phys() + OFF_TX_BUF as u64;
+    let tx_ptr = dma.ptr_at(OFF_TX_BUF);
 
-    // Register DMA buffers as shared memory for direct userland access.
-    // All RX buffers are contiguous in the DMA pool, so register as one region.
+    let rx_region = dma.subslice(OFF_RX_BUFS, RX_BUF_COUNT * 0x1000);
+    let tx_region = dma.subslice(OFF_TX_BUF, 0x1000);
     let rx_token = shared_memory::register(
-        crate::DirectMap::from_phys(rx_phys[0]),
-        (RX_BUF_COUNT * RX_BUF_SIZE as usize) as u64,
+        crate::DirectMap::from_phys(rx_region.phys()),
+        rx_region.size() as u64,
     ).raw();
-    let tx_token = shared_memory::register(crate::DirectMap::from_phys(tx_phys), 4096).raw();
+    let tx_token = shared_memory::register(
+        crate::DirectMap::from_phys(tx_region.phys()),
+        tx_region.size() as u64,
+    ).raw();
 
     crate::net::set_nic_info(NicInfo {
         rx_buf_token: rx_token,

@@ -81,6 +81,8 @@ fn indices(addr: u64) -> (usize, usize, usize) {
 pub struct AddressSpace {
     root: Box<PageTablePage>,
     children: Vec<Box<PageTablePage>>,
+    /// Physical data pages mapped into user space. Freed on drop.
+    pages: Vec<super::pmm::PhysPage>,
 }
 
 unsafe impl Send for AddressSpace {}
@@ -91,6 +93,7 @@ impl AddressSpace {
         Self {
             root: Box::new(PageTablePage([0; 512])),
             children: Vec::new(),
+            pages: Vec::new(),
         }
     }
 
@@ -106,7 +109,7 @@ impl AddressSpace {
             }
         }
 
-        Self { root: pml4, children: Vec::new() }
+        Self { root: pml4, children: Vec::new(), pages: Vec::new() }
     }
 
     /// Physical address of PML4 for CR3 writes.
@@ -161,7 +164,30 @@ impl AddressSpace {
         pd[pd_idx] = phys | flags | PAGE_SIZE_BIT;
     }
 
-    /// Unmap one 2MB page.
+    /// Allocate a 2MB page from PMM and map it at `vaddr`.
+    /// Returns a DirectMap handle for kernel access to the page.
+    pub fn map_alloc(&mut self, vaddr: UserAddr, writable: bool) -> super::DirectMap {
+        let page = super::pmm::alloc_page().expect("map_alloc: out of physical memory");
+        let phys = page.phys();
+        let dm = page.direct_map();
+
+        let va = vaddr.raw();
+        assert!(va & (PAGE_2M - 1) == 0, "map_alloc: vaddr {va:#x} not 2MB-aligned");
+
+        let mut flags = PAGE_PRESENT | PAGE_USER;
+        if writable { flags |= PAGE_WRITE; }
+
+        let (pml4_idx, pdpt_idx, pd_idx) = indices(va);
+        let user_flags = PAGE_PRESENT | PAGE_WRITE | PAGE_USER;
+        let pd = self.ensure_table(pml4_idx, user_flags, pdpt_idx, user_flags);
+        assert!(pd[pd_idx] & PAGE_PRESENT == 0,
+            "map_alloc: PDE already present at vaddr {va:#x}");
+        pd[pd_idx] = phys | flags | PAGE_SIZE_BIT;
+        self.pages.push(page);
+        dm
+    }
+
+    /// Unmap one 2MB page and free its physical memory.
     pub fn unmap(&mut self, vaddr: UserAddr) {
         let va = vaddr.raw();
         assert!(va & (PAGE_2M - 1) == 0, "unmap: vaddr {va:#x} not 2MB-aligned");
@@ -170,7 +196,13 @@ impl AddressSpace {
 
         if let Some(pdpt) = self.root.child_mut(pml4_idx) {
             if let Some(pd) = pdpt.child_mut(pdpt_idx) {
-                pd[pd_idx] = 0;
+                let pde = pd[pd_idx];
+                if pde & PAGE_PRESENT != 0 {
+                    pd[pd_idx] = 0;
+                    let phys = pde & ADDR_MASK_2M;
+                    // Remove the page from our owned list — Drop frees it
+                    self.pages.retain(|p| p.phys() != phys);
+                }
             }
         }
     }
