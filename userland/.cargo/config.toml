@@ -3,4 +3,4 @@ channel = "toyos"
 
 [build]
 target = "x86_64-unknown-toyos"
-rustflags = ["-Cforce-frame-pointers=yes"]
+rustflags = []

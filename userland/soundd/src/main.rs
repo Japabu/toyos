@@ -90,9 +90,11 @@ fn main() {
     syscall::close(audio_fd);
 
     let num_buffers = info.num_buffers as usize;
-    let mut dma_pages: Vec<SharedMemory> = Vec::with_capacity(num_buffers);
+    let dma_page = SharedMemory::map(info.dma_token, 2 * 1024 * 1024);
+    let dma_base = dma_page.as_ptr();
+    let mut dma_ptrs: Vec<*mut u8> = Vec::with_capacity(num_buffers);
     for i in 0..num_buffers {
-        dma_pages.push(SharedMemory::map(info.buf_tokens[i], 4096));
+        dma_ptrs.push(unsafe { dma_base.add(info.buf_offsets[i] as usize) });
     }
 
     let period_frames = info.period_bytes as usize / 4;
@@ -138,9 +140,8 @@ fn main() {
 
             free_mask &= !(1 << idx);
 
-            let page = dma_pages[idx].as_mut_slice();
             let out = unsafe {
-                core::slice::from_raw_parts_mut(page.as_mut_ptr() as *mut i16, period_samples)
+                core::slice::from_raw_parts_mut(dma_ptrs[idx] as *mut i16, period_samples)
             };
 
             if streams.is_empty() {

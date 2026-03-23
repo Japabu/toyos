@@ -72,6 +72,9 @@ pub fn ensure(root: &Path, force_rebuild: bool) -> ChangeSet {
         stamps::write_dir_stamp(&rust_dir.join("library"), &std_stamp);
         stamps::write_dir_stamp(&root.join("toyos-abi/src"), &abi_stamp);
         stamps::write_dir_stamp(&root.join("toyos-net/src"), &net_stamp);
+        // Delete userland stamp so build.rs knows a clean is needed,
+        // even if a previous build failed after the std stamps were written.
+        let _ = fs::remove_file(stamps_dir.join("userland.stamp"));
         true
     } else {
         eprintln!("Toolchain up to date.");

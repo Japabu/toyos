@@ -97,6 +97,27 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
                 }
             }
         }
+        // Print syscall context and user backtrace
+        let user_rip = percpu::syscall_rip();
+        let user_rsp = percpu::user_rsp();
+        if user_rip != 0 {
+            log!("  Syscall: num={} user_rip={:#x} user_rsp={:#x}", percpu::syscall_num(), user_rip, user_rsp);
+            log!("  User backtrace:");
+            process::resolve_user_symbol(tid, user_rip);
+            if let Some(pt) = scheduler::current_address_space() {
+                let mut rbp = percpu::syscall_rbp();
+                for _ in 0..20 {
+                    if rbp == 0 || rbp % 8 != 0 { break; }
+                    let Some(dm) = pt.lock().translate(UserAddr::new(rbp)) else { break };
+                    let saved_rbp = unsafe { *dm.as_ptr::<u64>() };
+                    let Some(dm_ret) = pt.lock().translate(UserAddr::new(rbp + 8)) else { break };
+                    let ret_addr = unsafe { *dm_ret.as_ptr::<u64>() };
+                    if ret_addr == 0 { break; }
+                    process::resolve_user_symbol(tid, ret_addr);
+                    rbp = saved_rbp;
+                }
+            }
+        }
     }
 
     cpu::halt()
@@ -198,7 +219,7 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     syscall::init();
     symbols::set_kernel_base(kernel_args.kernel_memory_addr);
     if !kernel_elf.is_empty() {
-        symbols::load_kernel(kernel_elf, kernel_args.kernel_memory_addr);
+        symbols::load_kernel(kernel_elf, mm::PHYS_OFFSET + kernel_args.kernel_memory_addr);
     }
 
     // HPET clock — enables profiling for everything from here on

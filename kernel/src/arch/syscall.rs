@@ -39,6 +39,9 @@ extern "sysv64" fn syscall_entry() {
     naked_asm!(
         "swapgs",
         "mov gs:[24], rsp",     // save user RSP to percpu.user_rsp
+        "mov gs:[216], rcx",    // save user RIP to percpu.syscall_rip
+        "mov gs:[224], rdi",    // save syscall number to percpu.syscall_num
+        "mov gs:[232], rbp",    // save user RBP to percpu.syscall_rbp
         "mov rsp, gs:[16]",     // load kernel RSP from percpu.kernel_rsp
         "push gs:[24]",         // user RSP on kernel stack
         "push rcx",             // return RIP
@@ -869,20 +872,19 @@ fn sys_mmap(req_addr: u64, size: u64, _prot: u64, flags: u64) -> u64 {
     let aligned = crate::mm::align_2m(size as usize);
     let fixed = flags & 4 != 0; // MmapFlags::FIXED
 
-    let Some(alloc) = process::OwnedAlloc::new(aligned, crate::mm::PAGE_2M as usize) else {
+    let Some(pages) = process::PageAlloc::new(aligned) else {
         return SyscallError::Unknown.to_u64();
     };
 
     if fixed && req_addr != 0 {
-        // MAP_FIXED: map the allocated physical memory at the requested virtual address
-        let phys_addr = DirectMap::phys_of(alloc.ptr());
+        let phys = pages.phys();
         let pt = process::current_address_space();
         let start = req_addr & !(crate::mm::PAGE_2M - 1);
         let end = (req_addr + aligned as u64 + crate::mm::PAGE_2M - 1) & !(crate::mm::PAGE_2M - 1);
         let mut cur = start;
         let mut offset = 0u64;
         while cur < end {
-            pt.lock().remap(UserAddr::new(cur), phys_addr + offset, true);
+            pt.lock().remap(UserAddr::new(cur), phys + offset, true);
             cur += crate::mm::PAGE_2M;
             offset += crate::mm::PAGE_2M;
         }
@@ -890,7 +892,7 @@ fn sys_mmap(req_addr: u64, size: u64, _prot: u64, flags: u64) -> u64 {
         apic::tlb_shootdown();
         process::with_current_data(|data| {
             data.mmap_regions.push(process::MmapRegion {
-                addr: UserAddr::new(start), size: aligned, _alloc: alloc, fixed: true,
+                addr: UserAddr::new(start), size: aligned, _pages: pages, fixed: true,
             });
             data.alloc_count += 1;
             let mem = data.mmap_regions.iter().map(|r| r.size as u64).sum::<u64>();
@@ -898,14 +900,14 @@ fn sys_mmap(req_addr: u64, size: u64, _prot: u64, flags: u64) -> u64 {
         });
         req_addr
     } else {
-        let phys = DirectMap::phys_of(alloc.ptr());
+        let phys = pages.phys();
         let pt = process::current_address_space();
         let vaddr = process::with_current_data(|data| {
             let Some((vaddr, _)) = process::vma_map(&mut data.vmas, &pt, phys, aligned as u64) else {
                 return Err(());
             };
             data.mmap_regions.push(process::MmapRegion {
-                addr: vaddr, size: aligned, _alloc: alloc, fixed: false,
+                addr: vaddr, size: aligned, _pages: pages, fixed: false,
             });
             data.alloc_count += 1;
             let mem = data.mmap_regions.iter().map(|r| r.size as u64).sum::<u64>();
@@ -1257,24 +1259,23 @@ fn sys_tls_alloc_block(module_id: u64) -> u64 {
         (m.memsz, m.template)
     };
 
-    // Allocate TLS block
-    let alloc = process::OwnedAlloc::new(tls_memsz.max(1), 16)
+    // Allocate TLS block from PMM (needs 2MB alignment for user mapping)
+    let page_alloc = process::PageAlloc::new(tls_memsz.max(1))
         .unwrap_or_else(|| panic!("sys_tls_alloc_block: failed to allocate {} bytes", tls_memsz));
-    let block_ptr = alloc.ptr();
+    let block_ptr = page_alloc.ptr();
 
-    // Initialize: copy template, zero BSS
+    // Initialize: copy template, zero BSS (PageAlloc is already zeroed)
     unsafe {
-        core::ptr::write_bytes(block_ptr, 0, tls_memsz);
         if let Some(template) = &tls_template {
             core::ptr::copy_nonoverlapping(template.base(), block_ptr, template.size());
         }
     }
 
     // Map into current process's virtual address space via VmaList
-    let block_phys = DirectMap::phys_of(block_ptr);
+    let block_phys = page_alloc.phys();
     let pt = process::current_address_space();
     let tls_vaddr = process::with_fd_owner_data(|data| {
-        let (vaddr, _) = process::vma_map(&mut data.vmas, &pt, block_phys, tls_memsz as u64)
+        let (vaddr, _) = process::vma_map(&mut data.vmas, &pt, block_phys, page_alloc.size() as u64)
             .expect("sys_tls_alloc_block: out of virtual address space");
         data.alloc_count += 1;
         vaddr
@@ -1283,7 +1284,7 @@ fn sys_tls_alloc_block(module_id: u64) -> u64 {
     // Store in the process-level (fd-owner) data alongside the VMA allocation.
     let tid = process::current_tid();
     process::with_fd_owner_data(|data| {
-        data.dynamic_tls_blocks.insert((tid, module_id), alloc);
+        data.dynamic_tls_blocks.insert((tid, module_id), page_alloc);
     });
 
     // Write block address into current thread's DTV.

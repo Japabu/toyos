@@ -326,11 +326,12 @@ pub fn init(ecam: &crate::mm::Mmio) -> Option<(SoundController, AudioInfo)> {
     let meta_ptr = meta.base();
 
     let mut tx_data_phys = [0u64; TX_INFLIGHT_MAX];
-    let mut buf_tokens = [0u32; TX_INFLIGHT_MAX];
+    let dma_base_phys = dma.phys() & !(crate::mm::PAGE_2M - 1);
+    let dma_token = shared_memory::register(crate::DirectMap::from_phys(dma_base_phys), crate::mm::PAGE_2M);
+    let mut buf_offsets = [0u32; TX_INFLIGHT_MAX];
     for i in 0..TX_INFLIGHT_MAX {
-        let tx_page = dma.subslice(OFF_TX_DATA + i * 0x1000, 0x1000);
-        tx_data_phys[i] = tx_page.phys();
-        buf_tokens[i] = shared_memory::register(crate::DirectMap::from_phys(tx_page.phys()), 4096).raw();
+        tx_data_phys[i] = dma.phys() + (OFF_TX_DATA + i * 0x1000) as u64;
+        buf_offsets[i] = (OFF_TX_DATA + i * 0x1000) as u32;
     }
 
     let mut control_slots = controlq.initial_slots();
@@ -379,7 +380,8 @@ pub fn init(ecam: &crate::mm::Mmio) -> Option<(SoundController, AudioInfo)> {
     ctrl.configure(44100, 2);
 
     let info = AudioInfo {
-        buf_tokens,
+        dma_token: dma_token.raw(),
+        buf_offsets,
         num_buffers: TX_INFLIGHT_MAX as u8,
         sample_rate: 44100,
         channels: 2,

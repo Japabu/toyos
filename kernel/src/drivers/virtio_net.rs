@@ -254,20 +254,13 @@ pub fn init(ecam: &crate::mm::Mmio) {
     let tx_phys = dma.phys() + OFF_TX_BUF as u64;
     let tx_ptr = dma.ptr_at(OFF_TX_BUF);
 
-    let rx_region = dma.subslice(OFF_RX_BUFS, RX_BUF_COUNT * 0x1000);
-    let tx_region = dma.subslice(OFF_TX_BUF, 0x1000);
-    let rx_token = shared_memory::register(
-        crate::DirectMap::from_phys(rx_region.phys()),
-        rx_region.size() as u64,
-    ).raw();
-    let tx_token = shared_memory::register(
-        crate::DirectMap::from_phys(tx_region.phys()),
-        tx_region.size() as u64,
-    ).raw();
+    let dma_base_phys = dma.phys() & !(crate::mm::PAGE_2M - 1);
+    let dma_token = shared_memory::register(crate::DirectMap::from_phys(dma_base_phys), crate::mm::PAGE_2M);
 
     crate::net::set_nic_info(NicInfo {
-        rx_buf_token: rx_token,
-        tx_buf_token: tx_token,
+        dma_token: dma_token.raw(),
+        rx_buf_offset: OFF_RX_BUFS as u32,
+        tx_buf_offset: OFF_TX_BUF as u32,
         mac,
         rx_buf_count: RX_BUF_COUNT as u16,
         rx_buf_size: RX_BUF_SIZE as u16,

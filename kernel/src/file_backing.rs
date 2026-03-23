@@ -16,6 +16,12 @@ pub trait FileBacking: Send + Sync {
 
     /// Total file size in bytes.
     fn file_size(&self) -> u64;
+
+    /// Return a pointer to file data at `offset` if it's contiguous in memory.
+    /// Only works for memory-resident backings (e.g. initrd).
+    fn memory_ptr(&self, _offset: u64, _len: usize) -> Option<*const u8> {
+        None
+    }
 }
 
 /// File backed by NVMe blocks via the kernel PageCache.
@@ -117,5 +123,17 @@ impl FileBacking for InitrdBacking {
 
     fn file_size(&self) -> u64 {
         self.size
+    }
+
+    fn memory_ptr(&self, offset: u64, len: usize) -> Option<*const u8> {
+        if len == 0 || offset + len as u64 > self.size { return None; }
+        let start_ptr = self.file_offset_to_ptr(offset)?;
+        let end_ptr = self.file_offset_to_ptr(offset + len as u64 - 1)?;
+        let expected_end = unsafe { start_ptr.add(len - 1) };
+        if end_ptr == expected_end {
+            Some(start_ptr)
+        } else {
+            None
+        }
     }
 }

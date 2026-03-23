@@ -1,5 +1,4 @@
-use alloc::alloc::{alloc_zeroed, dealloc};
-use core::alloc::Layout;
+use crate::mm::pmm;
 
 use toyos_abi::ring::{RingHeader, RING_READER_CLOSED, RING_WRITER_CLOSED};
 
@@ -88,8 +87,7 @@ impl Drop for PipeWriter {
 pub const PIPE_SIZE: usize = PAGE_2M as usize;
 
 struct Pipe {
-    phys_addr: DirectMap,
-    layout: Layout,
+    page: pmm::PhysPage,
     readers: u32,
     writers: u32,
     io_uring_watchers: Vec<RingId>,
@@ -99,15 +97,13 @@ unsafe impl Send for Pipe {}
 
 impl Pipe {
     fn new() -> Self {
-        let layout = Layout::from_size_align(PIPE_SIZE, PIPE_SIZE).unwrap();
-        let ptr = unsafe { alloc_zeroed(layout) };
-        assert!(!ptr.is_null(), "pipe: allocation failed");
-        RingHeader::init(ptr, PIPE_SIZE);
-        Self { phys_addr: DirectMap::from_ptr(ptr), layout, readers: 0, writers: 0, io_uring_watchers: Vec::new() }
+        let page = pmm::alloc_page().expect("pipe: allocation failed");
+        RingHeader::init(page.direct_map().as_mut_ptr(), PIPE_SIZE);
+        Self { page, readers: 0, writers: 0, io_uring_watchers: Vec::new() }
     }
 
     fn header(&self) -> &RingHeader {
-        unsafe { &*self.phys_addr.as_ptr::<RingHeader>() }
+        unsafe { &*self.page.direct_map().as_ptr::<RingHeader>() }
     }
 }
 
@@ -158,7 +154,7 @@ pub fn exists(pipe_id: PipeId) -> bool {
 
 /// Get the physical address of a pipe's ring buffer (for mapping into userland).
 pub fn phys_addr(pipe_id: PipeId) -> Option<DirectMap> {
-    with_pipes(|pipes| pipes.get(pipe_id).map(|p| p.phys_addr))
+    with_pipes(|pipes| pipes.get(pipe_id).map(|p| p.page.direct_map()))
 }
 
 pub fn try_read(pipe_id: PipeId, buf: &mut [u8]) -> Option<usize> {
@@ -259,7 +255,7 @@ fn close_write(pipe_id: PipeId) {
 }
 
 fn free_pipe(pipe: Pipe) {
-    unsafe { dealloc(pipe.phys_addr.as_mut_ptr(), pipe.layout); }
+    drop(pipe); // PhysPage freed via Drop
 }
 
 // ---------------------------------------------------------------------------

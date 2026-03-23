@@ -56,8 +56,12 @@ pub fn build(root: &Path, debug: bool, release: bool, changes: &ChangeSet) {
 
     let userland_dir = root.join("userland");
 
-    // Clean targets on toolchain or linker change
-    if changes.std_rebuilt {
+    // Clean targets on toolchain or linker change.
+    // Use a userland stamp to track whether a clean build succeeded —
+    // if a previous build failed mid-way, the clean runs again.
+    let userland_stamp = root.join("target/stamps/userland.stamp");
+    let needs_clean = changes.std_rebuilt || !userland_stamp.exists();
+    if needs_clean {
         // std changed — full clean needed (compiled artifacts are stale)
         for subdir in ["target/x86_64-unknown-toyos", "target/debug"] {
             let dir = userland_dir.join(subdir);
@@ -261,6 +265,9 @@ pub fn build(root: &Path, debug: bool, release: bool, changes: &ChangeSet) {
         let nvme_bytes = vec![0u8; 1024 * 1024 * 1024];
         fs::write(&nvme_path, nvme_bytes).expect("Failed to write NVMe image");
     }
+
+    // Mark userland build as successful — prevents redundant cleans on next run
+    fs::write(&userland_stamp, "").ok();
 }
 
 fn collect_hosted_rustc(root: &Path, initrd_files: &mut Vec<(String, Vec<u8>)>) {

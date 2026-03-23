@@ -6,7 +6,8 @@ use crate::syscall;
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct AudioInfo {
-    pub buf_tokens: [u32; 5],
+    pub dma_token: u32,
+    pub buf_offsets: [u32; 5],
     pub num_buffers: u8,
     pub sample_rate: u32,
     pub channels: u8,

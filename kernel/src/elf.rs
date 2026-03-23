@@ -2,7 +2,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::mm::{PAGE_2M, align_2m, DirectMap, KernelSlice};
-use crate::process::OwnedAlloc;
+use crate::process::PageAlloc;
 use crate::UserAddr;
 use crate::sync::Lock;
 use elf::ElfBytes;
@@ -46,10 +46,10 @@ fn rela_sym(r: &Elf64_Rela) -> u32 { (r.r_info >> 32) as u32 }
 /// Ownership model for a loaded shared library's memory.
 pub enum LibMemory {
     /// Fresh load: single allocation owns everything.
-    Owned(OwnedAlloc),
+    Owned(PageAlloc),
     /// Cloned from cache: RO pages are shared (owned by cache), RW pages are private.
     Shared {
-        rw_alloc: OwnedAlloc,
+        rw_alloc: PageAlloc,
         /// The cached (shared) allocation this was cloned from.
         cached_image: KernelSlice,
         /// 2MB-aligned offset within cached alloc where private RW region starts.
@@ -110,7 +110,7 @@ fn prescan_relocs(rela: &Option<KernelSlice>, jmprel: &Option<KernelSlice>) -> C
 /// RO pages (code/rodata) are mapped directly into user processes.
 /// RW pages (data/GOT) are copied privately per process.
 struct CachedLib {
-    alloc: OwnedAlloc,
+    alloc: PageAlloc,
     image: KernelSlice,
     vaddr_min: u64,
     rw_offset: usize,
@@ -152,15 +152,14 @@ fn cache_loaded_lib(path: &str, lib: LoadedLib, rw_vaddr: u64, rw_end_vaddr: u64
         path, relocs.bind.len(), relocs.tpoff64.len(), relocs.tpoff32.len(),
         relocs.dtpmod64.len(), relocs.dtpoff64.len());
 
-    let uninit_rw = match OwnedAlloc::new_uninit(rw_size, PAGE_2M as usize) {
+    let rw_alloc = match PageAlloc::new(rw_size) {
         Some(a) => a,
         None => {
             return LoadedLib { memory: LibMemory::Owned(alloc), ..lib };
         }
     };
     let src = unsafe { alloc_ptr.add(rw_offset) };
-    unsafe { core::ptr::copy_nonoverlapping(src, uninit_rw.ptr(), rw_size); }
-    let rw_alloc = unsafe { uninit_rw.assume_zeroed() };
+    unsafe { core::ptr::copy_nonoverlapping(src, rw_alloc.ptr(), rw_size); }
     let rw_delta = rw_alloc.ptr() as i64 - (alloc_ptr as i64 + rw_offset as i64);
 
     let cached = CachedLib {
@@ -211,10 +210,9 @@ pub fn try_clone_cached(path: &str) -> Option<LoadedLib> {
 fn clone_from_cache(cached: &CachedLib) -> Option<LoadedLib> {
     let t0 = crate::clock::nanos_since_boot();
 
-    let uninit_rw = OwnedAlloc::new_uninit(cached.rw_size, PAGE_2M as usize)?;
+    let rw_alloc = PageAlloc::new(cached.rw_size)?;
     let src = unsafe { cached.alloc.ptr().add(cached.rw_offset) };
-    unsafe { core::ptr::copy_nonoverlapping(src, uninit_rw.ptr(), cached.rw_size); }
-    let rw_alloc = unsafe { uninit_rw.assume_zeroed() };
+    unsafe { core::ptr::copy_nonoverlapping(src, rw_alloc.ptr(), cached.rw_size); }
 
     let t1 = crate::clock::nanos_since_boot();
     let rw_delta = rw_alloc.ptr() as i64 - (cached.alloc.ptr() as i64 + cached.rw_offset as i64);
@@ -849,12 +847,12 @@ pub fn load_shared_lib(data: &[u8]) -> Result<(LoadedLib, u64, u64), &'static st
 
     let load_size = align_2m((vaddr_max - vaddr_min) as usize);
     let t0 = crate::clock::nanos_since_boot();
-    let uninit_alloc = match OwnedAlloc::new_uninit(load_size, PAGE_2M as usize) {
+    let alloc = match PageAlloc::new(load_size) {
         Some(a) => a,
         None => return Err("dlopen: allocation failed"),
     };
     let t1 = crate::clock::nanos_since_boot();
-    let base_ptr = uninit_alloc.ptr();
+    let base_ptr = alloc.ptr();
     let image = unsafe { KernelSlice::from_raw(base_ptr, load_size) };
 
     unsafe { image.zero(); }
@@ -970,8 +968,6 @@ pub fn load_shared_lib(data: &[u8]) -> Result<(LoadedLib, u64, u64), &'static st
         base_phys, load_size / (1024*1024),
         (t1 - t0) / 1_000_000, (t2 - t1) / 1_000_000, (t3 - t2) / 1_000_000,
         (t4 - t3) / 1_000_000, reloc_count, sym_count);
-
-    let alloc = unsafe { uninit_alloc.assume_zeroed() };
 
     Ok((LoadedLib { memory: LibMemory::Owned(alloc), user_base: UserAddr::new(base_phys), phys_base: base_phys,
         image, dynsym, dynstr, sym_count,

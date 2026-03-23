@@ -1,4 +1,4 @@
-use alloc::alloc::{alloc, alloc_zeroed, dealloc, Layout};
+use alloc::alloc::{alloc_zeroed, dealloc, Layout};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -38,94 +38,73 @@ pub fn vma_map(
     size: u64,
 ) -> Option<(UserAddr, u64)> {
     let aligned = crate::mm::align_2m(size as usize) as u64;
+    assert!(phys & (PAGE_2M - 1) == 0, "vma_map: phys {:#x} not 2MB-aligned (size={:#x})", phys, size);
     let vaddr = vmas.alloc_region(aligned).ok()?;
     pt.lock().map_range(vaddr, phys, aligned, true);
     Some((vaddr, aligned))
 }
 
 // ---------------------------------------------------------------------------
-// OwnedAlloc — RAII wrapper for page-aligned allocations
+// ---------------------------------------------------------------------------
+// OwnedAlloc — RAII heap allocation (for kernel-only buffers < 2MB)
 // ---------------------------------------------------------------------------
 
-/// Typestate: allocation contains uninitialized memory.
-pub enum Uninit {}
-/// Typestate: allocation is fully initialized (safe to expose to userspace).
-pub enum Zeroed {}
-
-/// Move-only wrapper around a (`*mut u8`, `Layout`) pair.
-/// `Drop` calls `dealloc`, so forgetting to free memory is a compile-time error
-/// (you'd have to actively `mem::forget` it).
-///
-/// The typestate parameter `S` tracks initialization:
-/// - `OwnedAlloc<Zeroed>` (default): all bytes are initialized. Can be mapped to userspace.
-/// - `OwnedAlloc<Uninit>`: bytes may be uninitialized. Must call `assume_zeroed()` after
-///   initializing all bytes before storing in ProcessData or mapping to userspace.
-pub struct OwnedAlloc<S = Zeroed> {
+/// Move-only wrapper around a heap allocation. Drop calls dealloc.
+/// For kernel-only buffers (kernel stacks, TLS templates). NOT for user-mapped pages.
+pub struct OwnedAlloc {
     ptr: NonNull<u8>,
     layout: Layout,
-    _state: core::marker::PhantomData<S>,
 }
 
-impl OwnedAlloc<Zeroed> {
-    /// Allocate zeroed memory with the given size and alignment.
-    /// Returns `None` if the allocator returns null.
+impl OwnedAlloc {
     pub fn new(size: usize, align: usize) -> Option<Self> {
         let layout = Layout::from_size_align(size, align).ok()?;
         let ptr = NonNull::new(unsafe { alloc_zeroed(layout) })?;
-        Some(Self { ptr, layout, _state: core::marker::PhantomData })
-    }
-}
-
-impl OwnedAlloc<Uninit> {
-    /// Allocate uninitialized memory with the given size and alignment.
-    /// The caller must initialize all bytes, then call `assume_zeroed()`.
-    pub fn new_uninit(size: usize, align: usize) -> Option<Self> {
-        let layout = Layout::from_size_align(size, align).ok()?;
-        let ptr = NonNull::new(unsafe { alloc(layout) })?;
-        Some(Self { ptr, layout, _state: core::marker::PhantomData })
+        Some(Self { ptr, layout })
     }
 
-    /// Convert to `OwnedAlloc<Zeroed>` after the caller has initialized all bytes.
-    ///
-    /// # Safety
-    /// All bytes in the allocation must have been written. The resulting
-    /// allocation may be mapped into userspace.
-    pub unsafe fn assume_zeroed(self) -> OwnedAlloc<Zeroed> {
-        let ptr = self.ptr;
-        let layout = self.layout;
-        core::mem::forget(self);
-        OwnedAlloc { ptr, layout, _state: core::marker::PhantomData }
-    }
-}
-
-impl<S> OwnedAlloc<S> {
     pub fn ptr(&self) -> *mut u8 { self.ptr.as_ptr() }
     pub fn size(&self) -> usize { self.layout.size() }
 }
 
-impl<S> Drop for OwnedAlloc<S> {
+impl Drop for OwnedAlloc {
     fn drop(&mut self) {
-        // Check for PML4 canary in every 4KB page being freed.
-        // If a page contains the canary, this dealloc would corrupt a live PML4.
-        let page_count = (self.layout.size() + 4095) / 4096;
-        for i in 0..page_count {
-            let page = unsafe { self.ptr.as_ptr().add(i * 4096) };
-            let slot_255 = unsafe { *(page.add(255 * 8) as *const u64) };
-            if slot_255 & 0xFFFF_FFFF_0000_0000 == 0xCAFE_BABE_0000_0000 {
-                let phys = page as u64 - crate::PHYS_OFFSET;
-                panic!(
-                    "OwnedAlloc::drop: freeing page at phys {:#x} that contains PML4 canary {:#x}! \
-                     alloc ptr={:p} size={:#x}",
-                    phys, slot_255, self.ptr.as_ptr(), self.layout.size()
-                );
-            }
-        }
         unsafe { dealloc(self.ptr.as_ptr(), self.layout); }
     }
 }
 
-// OwnedAlloc is Send — the underlying allocation is just raw memory.
-unsafe impl<S> Send for OwnedAlloc<S> {}
+unsafe impl Send for OwnedAlloc {}
+
+// ---------------------------------------------------------------------------
+// PageAlloc — contiguous 2MB physical pages from PMM
+// ---------------------------------------------------------------------------
+
+/// Contiguous 2MB-aligned physical pages from PMM. Provides a kernel-accessible
+/// pointer via the direct map. Pages are zeroed on allocation, freed on drop.
+pub struct PageAlloc(Vec<crate::mm::pmm::PhysPage>);
+
+impl PageAlloc {
+    /// Allocate `size` bytes as contiguous 2MB pages.
+    pub fn new(size: usize) -> Option<Self> {
+        let count = (size + PAGE_2M as usize - 1) / PAGE_2M as usize;
+        Some(Self(crate::mm::pmm::alloc_contiguous(count)?))
+    }
+
+    /// Kernel pointer to the start of the allocation (via direct map).
+    pub fn ptr(&self) -> *mut u8 {
+        self.0[0].direct_map().as_mut_ptr()
+    }
+
+    /// Total size in bytes (always a multiple of 2MB).
+    pub fn size(&self) -> usize {
+        self.0.len() * PAGE_2M as usize
+    }
+
+    /// Physical address of the start.
+    pub fn phys(&self) -> u64 {
+        self.0[0].direct_map().phys()
+    }
+}
 
 const USER_STACK_SIZE: usize = 4 * PAGE_2M as usize; // 8 MB
 pub const KERNEL_STACK_SIZE: usize = 128 * 1024;
@@ -248,6 +227,7 @@ pub struct SchedEntry {
     name: [u8; 28],
     memory_size: u64,
     data: Arc<Lock<ProcessData>>,
+    symbols: Arc<Lock<ProcessSymbols>>,
 }
 
 impl SchedEntry {
@@ -259,8 +239,9 @@ impl SchedEntry {
         name: [u8; 28],
         memory_size: u64,
         data: Arc<Lock<ProcessData>>,
+        symbols: Arc<Lock<ProcessSymbols>>,
     ) -> Self {
-        Self { tid, process, state, kind, name, memory_size, data }
+        Self { tid, process, state, kind, name, memory_size, data, symbols }
     }
 
     pub fn tid(&self) -> Tid { self.tid }
@@ -270,6 +251,7 @@ impl SchedEntry {
     pub fn name(&self) -> &[u8; 28] { &self.name }
     pub fn memory_size(&self) -> u64 { self.memory_size }
     pub fn data(&self) -> &Arc<Lock<ProcessData>> { &self.data }
+    pub fn symbols(&self) -> &Arc<Lock<ProcessSymbols>> { &self.symbols }
 
     /// CPU time in nanoseconds, retrieved from the scheduler's ThreadCtx.
     pub fn cpu_ns(&self) -> u64 {
@@ -365,11 +347,11 @@ pub struct ProcessData {
     pub cwd: String,
 
     pub elf_alloc: Option<OwnedAlloc>,
-    pub stack_alloc: Option<OwnedAlloc>,
+    pub stack_pages: Option<PageAlloc>,
     // Thread-local storage
     pub tls_template: Option<crate::mm::KernelSlice>,
     pub tls_memsz: usize,
-    pub tls_alloc: Option<OwnedAlloc>,
+    pub tls_pages: Option<PageAlloc>,
     /// Multi-module TLS layout per loaded library.
     pub tls_modules: Vec<crate::elf::TlsModule>,
     /// Total combined TLS size across all modules.
@@ -381,9 +363,7 @@ pub struct ProcessData {
     /// Dynamically allocated TLS blocks for dlopen'd modules (keyed by module_id).
     /// Dynamically allocated TLS blocks for dlopen'd modules, keyed by (thread Tid, module_id).
     /// Stored in the process-level (fd-owner) data so the VMA and backing memory have the same lifetime.
-    pub dynamic_tls_blocks: alloc::collections::BTreeMap<(Tid, u64), OwnedAlloc>,
-    // Crash diagnostics
-    pub symbols: ProcessSymbols,
+    pub dynamic_tls_blocks: alloc::collections::BTreeMap<(Tid, u64), PageAlloc>,
     // Dynamically loaded shared libraries (indexed by dlopen handle)
     pub loaded_libs: Vec<elf::LoadedLib>,
     // Anonymous memory mappings (mmap)
@@ -401,7 +381,7 @@ pub struct ProcessData {
     /// Virtual memory areas for demand paging.
     pub vmas: crate::vma::VmaList,
     /// 2MB allocations for demand-paged pages. Freed on process exit.
-    pub demand_allocs: Vec<OwnedAlloc>,
+    pub demand_pages: Vec<PageAlloc>,
     /// RELATIVE relocation index for demand-paged ELF (applied per-page on fault).
     pub reloc_index: Option<Arc<elf::RelocationIndex>>,
     /// Runtime base address for the demand-paged ELF (for relocation computation).
@@ -419,7 +399,7 @@ pub struct ProcessData {
 pub struct MmapRegion {
     pub addr: UserAddr,
     pub size: usize,
-    pub _alloc: OwnedAlloc,
+    pub _pages: PageAlloc,
     /// True if this is a MAP_FIXED mapping (virt addr != phys addr).
     pub fixed: bool,
 }
@@ -661,7 +641,7 @@ pub fn with_fd_owner_data<R>(f: impl FnOnce(&mut ProcessData) -> R) -> R {
 /// [TLS data (.tdata + .tbss)] [TCB: self-pointer]
 ///                              ^-- FS base (thread pointer)
 /// Returns (alloc, fs_base).
-pub fn setup_tls(tls_template: Option<crate::mm::KernelSlice>, tls_memsz: usize, tls_align: usize) -> Option<(OwnedAlloc, u64)> {
+pub fn setup_tls(tls_template: Option<crate::mm::KernelSlice>, tls_memsz: usize, tls_align: usize) -> Option<(PageAlloc, u64)> {
     setup_combined_tls(&[elf::TlsModule { template: tls_template, memsz: tls_memsz, base_offset: 0, module_id: 1, is_static: true }], tls_memsz, tls_align)
 }
 
@@ -699,11 +679,11 @@ pub fn setup_combined_tls(
     modules: &[crate::elf::TlsModule],
     total_memsz: usize,
     tls_align: usize,
-) -> Option<(OwnedAlloc, u64)> {
+) -> Option<(PageAlloc, u64)> {
     let block_size = total_memsz + TCB_SIZE;
     let alloc_size = crate::mm::align_2m(block_size + tls_align);
-    let uninit_alloc = OwnedAlloc::new_uninit(alloc_size, PAGE_2M as usize)?;
-    let block = uninit_alloc.ptr();
+    let page_alloc = PageAlloc::new(alloc_size)?;
+    let block = page_alloc.ptr();
 
     // Place TLS data near the end of the allocation (DTV at start, TLS after).
     // Align tls_start so that data_start (= block + tls_start) has tls_align alignment.
@@ -763,9 +743,7 @@ pub fn setup_combined_tls(
     let dtv_user = block_phys;
     unsafe { *((tp_kernel + 8) as *mut u64) = dtv_user; }
 
-    // SAFETY: all bytes have been written (zeroed + DTV + TLS templates + TCB pointers).
-    let alloc = unsafe { uninit_alloc.assume_zeroed() };
-    Some((alloc, tp_user))
+    Some((page_alloc, tp_user))
 }
 
 // ---------------------------------------------------------------------------
@@ -882,7 +860,7 @@ pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64, stack_base: u64) -> Op
     let fs_base = {
         let addr_space = parent_addr_space.as_ref().expect("spawn_thread: no address space");
         let mut parent_data = data_arc.lock();
-        let tls_phys = DirectMap::phys_of(tls_alloc.ptr());
+        let tls_phys = tls_alloc.phys();
         let (tls_vaddr, _) = vma_map(&mut parent_data.vmas, addr_space, tls_phys, tls_alloc.size() as u64)
             .expect("spawn_thread: out of virtual address space");
         // Rebase fs_base and internal TLS pointers from physical to virtual
@@ -923,16 +901,15 @@ pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64, stack_base: u64) -> Op
 
         cwd: parent_cwd,
         elf_alloc: None,
-        stack_alloc: None,
+        stack_pages: None,
         tls_template,
         tls_memsz,
-        tls_alloc: Some(tls_alloc),
+        tls_pages: Some(tls_alloc),
         tls_modules,
         tls_total_memsz,
         tls_max_align,
         next_tls_module_id: 2,
         dynamic_tls_blocks: alloc::collections::BTreeMap::new(),
-        symbols: ProcessSymbols::empty(),
         loaded_libs: Vec::new(),
         mmap_regions: Vec::new(),
         user_stack_base: UserAddr::new(stack_base),
@@ -942,7 +919,7 @@ pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64, stack_base: u64) -> Op
         syscall_total: 0,
         syscall_total_ns: 0,
         vmas: crate::vma::VmaList::new(),
-        demand_allocs: Vec::new(),
+        demand_pages: Vec::new(),
         reloc_index: None,
         elf_base: UserAddr::new(0),
         fault_trace: PageFaultTrace::new(),
@@ -956,7 +933,7 @@ pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64, stack_base: u64) -> Op
     let tid = table.insert_with(|tid| {
         SchedEntry::new(
             tid, parent_process, ThreadLocation::Scheduled, Kind::Thread { parent: parent_process },
-            [0; 28], 0, thread_data,
+            [0; 28], 0, thread_data, Arc::new(Lock::new(ProcessSymbols::empty())),
         )
     });
     drop(guard);
@@ -1461,17 +1438,17 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
     }
 
     // 9. Stack at fixed virtual address (STACK_BASE from vma.rs)
-    let stack_alloc = match OwnedAlloc::new(USER_STACK_SIZE, PAGE_2M as usize) {
+    let stack_pages = match PageAlloc::new(USER_STACK_SIZE) {
         Some(a) => a,
         None => {
             log!("spawn: {}: failed to allocate user stack ({} bytes)", path, USER_STACK_SIZE);
             return Err(SyscallError::ResourceExhausted);
         }
     };
-    let stack_phys = DirectMap::from_ptr(stack_alloc.ptr());
+    let stack_phys = DirectMap::from_phys(stack_pages.phys());
     let stack_vaddr = UserAddr::new(crate::vma::STACK_BASE);
     let user_stack = UserStack::new(stack_vaddr, stack_phys, USER_STACK_SIZE as u64);
-    child_pt.lock().map_range(stack_vaddr, stack_phys.phys(), USER_STACK_SIZE as u64, true);
+    child_pt.lock().map_range(stack_vaddr, stack_pages.phys(), USER_STACK_SIZE as u64, true);
 
 
     // 10. TLS setup — read exe TLS template from page cache, build multi-module layout
@@ -1572,7 +1549,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
         }
     };
     // TLS mapped via VmaList — rebase all user-visible pointers from phys to vaddr
-    let tls_phys = DirectMap::phys_of(tls_alloc.ptr());
+    let tls_phys = tls_alloc.phys();
     let (tls_vaddr, _) = vma_map(&mut vmas, &child_pt, tls_phys, tls_alloc.size() as u64)
         .expect("spawn: out of virtual address space for TLS");
     let tls_rebase = tls_vaddr.raw() as i64 - tls_phys as i64;
@@ -1600,11 +1577,9 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
 
     let t_tls = crate::clock::nanos_since_boot();
 
-    // Store info for lazy symbol loading (deferred until a crash backtrace)
     let syms = if let Some((sh_off, sh_num, sh_entsize)) = layout.section_headers {
-        ProcessSymbols::lazy(
-            Arc::clone(&backing),
-            sh_off, sh_num as usize, sh_entsize as usize,
+        find_symtab_in_memory(
+            backing.as_ref(), sh_off, sh_num as usize, sh_entsize as usize,
             base,
             base + layout.vaddr_min, base + layout.vaddr_max,
             user_stack.base().raw(), user_stack.top(),
@@ -1646,16 +1621,15 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
         cwd,
 
         elf_alloc: exe_tls_template, // TLS template allocation (if any)
-        stack_alloc: Some(stack_alloc),
+        stack_pages: Some(stack_pages),
         tls_template,
         tls_memsz,
-        tls_alloc: Some(tls_alloc),
+        tls_pages: Some(tls_alloc),  // tls_alloc is now PageAlloc
         tls_modules,
         tls_total_memsz,
         tls_max_align: max_tls_align,
         next_tls_module_id,
         dynamic_tls_blocks: alloc::collections::BTreeMap::new(),
-        symbols: syms,
         loaded_libs,
         mmap_regions: Vec::new(),
         user_stack_base: user_stack.base(),
@@ -1665,7 +1639,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
         syscall_total: 0,
         syscall_total_ns: 0,
         vmas,
-        demand_allocs: Vec::new(),
+        demand_pages: Vec::new(),
         reloc_index,
         elf_base: UserAddr::new(base),
         fault_trace: PageFaultTrace::new(),
@@ -1682,7 +1656,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
         proc_data.lock().pid = pid;
         SchedEntry::new(
             tid, pid, ThreadLocation::Scheduled, Kind::Process { parent },
-            make_name(path), memory_size, proc_data,
+            make_name(path), memory_size, proc_data, Arc::new(Lock::new(syms)),
         )
     });
     drop(guard);
@@ -1753,13 +1727,13 @@ fn teardown_resources(data_arc: &Arc<Lock<ProcessData>>, pid: Pid) {
     }
 
     fd::close_all(&mut data.fds, &mut *vfs::lock(), pid);
-    data.tls_alloc.take();
+    data.tls_pages.take();
     data.elf_alloc.take();
-    data.stack_alloc.take();
+    data.stack_pages.take();
     data.loaded_libs.clear();
     data.mmap_regions.clear();
 
-    data.demand_allocs.clear();
+    data.demand_pages.clear();
     data.vmas.clear();
     data.reloc_index = None;
 }
@@ -1883,7 +1857,7 @@ pub fn thread_exit(code: i32) -> ! {
                 fd::close_all(&mut data.fds, &mut *vfs::lock(), current_process());
                 // TLS page table entries are cleaned up when the AddressSpace is dropped.
                 // The physical memory is freed when tls_alloc is dropped below.
-                data.tls_alloc.take();
+                data.tls_pages.take();
             }
             // Free this thread's dynamic TLS blocks from the process-level data.
             {
@@ -2086,11 +2060,11 @@ pub fn handle_page_fault(fault_addr: u64, _error_code: u64) -> bool {
     }
 
     // Allocate a zeroed 2MB physical page
-    let alloc = match OwnedAlloc::new(page_2m as usize, page_2m as usize) {
+    let page_alloc = match PageAlloc::new(page_2m as usize) {
         Some(a) => a,
         None => return false,
     };
-    let page_ptr = alloc.ptr();
+    let page_ptr = page_alloc.ptr();
 
     // Fill the 2MB page from ALL VMAs that overlap this region.
     // Multiple segments (e.g. .text and .rodata) can share a 2MB range.
@@ -2105,7 +2079,7 @@ pub fn handle_page_fault(fault_addr: u64, _error_code: u64) -> bool {
 
         match &vma.kind {
             crate::vma::VmaKind::Anonymous => {
-                // Already zeroed by OwnedAlloc::new
+                // Already zeroed by PageAlloc::new
             }
             crate::vma::VmaKind::FileBacked { backing, file_offset, file_size } => {
                 let fill_start = region_start.max(vma_s);
@@ -2153,14 +2127,14 @@ pub fn handle_page_fault(fault_addr: u64, _error_code: u64) -> bool {
 
 
     // Map the 2MB page (writable if any overlapping VMA is writable)
-    addr_space.lock().remap(UserAddr::new(region_start), DirectMap::phys_of(alloc.ptr()), writable);
+    addr_space.lock().remap(UserAddr::new(region_start), page_alloc.phys(), writable);
     cpu::flush_tlb();
 
-    data.demand_allocs.push(alloc);
+    data.demand_pages.push(page_alloc);
 
     // Update memory tracking
     data.alloc_count += 1;
-    let current_mem = data.demand_allocs.len() as u64 * PAGE_2M;
+    let current_mem = data.demand_pages.len() as u64 * PAGE_2M;
     if current_mem > data.peak_memory {
         data.peak_memory = current_mem;
     }
@@ -2276,7 +2250,7 @@ pub fn dump_crash_diagnostics(fault_addr: u64, rip: u64) {
             log!("  FS base {:#x} NOT MAPPED!", fs_base);
         }
         // Also dump TLS alloc info
-        let tls_info = data.tls_alloc.as_ref().map(|a| (a.ptr() as u64, a.size()));
+        let tls_info = data.tls_pages.as_ref().map(|a| (a.ptr() as u64, a.size()));
         log!("  TLS alloc: {:?}", tls_info);
     }
 }
@@ -2287,17 +2261,77 @@ pub fn dump_crash_diagnostics(fault_addr: u64, rip: u64) {
 
 /// Resolve and log a user-mode address against the process's symbol table.
 /// Returns true if the address was resolved and logged.
+/// Uses try_lock so it's safe to call from panic handlers.
 pub fn resolve_user_symbol(tid: Tid, addr: u64) -> bool {
-    let data_arc = {
-        let guard = PROCESS_TABLE.lock();
+    let syms_arc = {
+        let Some(guard) = PROCESS_TABLE.try_lock() else { return false };
         let Some(table) = guard.as_ref() else { return false };
         match table.get(tid) {
-            Some(entry) => Arc::clone(entry.data()),
+            Some(entry) => Arc::clone(entry.symbols()),
             None => return false,
         }
     };
-    let mut data = data_arc.lock();
-    crate::symbols::resolve_user(&mut data.symbols, addr)
+    let Some(syms) = syms_arc.try_lock() else { return false };
+    crate::symbols::resolve_user(&syms, addr)
+}
+
+/// Find .symtab and .strtab in an ELF's section headers and return pointers
+/// into the initrd memory. No allocation — the sections are read in-place.
+fn find_symtab_in_memory(
+    backing: &dyn crate::file_backing::FileBacking,
+    sh_off: u64, sh_num: usize, sh_entsize: usize,
+    base: u64,
+    prog_base: u64, prog_end: u64,
+    stack_base: u64, stack_end: u64,
+) -> ProcessSymbols {
+    const SHT_SYMTAB: u32 = 2;
+    const SHT_STRTAB: u32 = 3;
+    let empty = || ProcessSymbols::empty_with_bounds(prog_base, prog_end, stack_base, stack_end);
+
+    // Read section headers — they're small enough to read via read_file_range.
+    let shdr_size = sh_num * sh_entsize;
+    let shdr_data = read_file_range(backing, sh_off, shdr_size);
+
+    // Find SHT_SYMTAB and its linked SHT_STRTAB.
+    let mut symtab_off = 0u64;
+    let mut symtab_size = 0u64;
+    let mut symtab_entsize = 0u64;
+    let mut symtab_link = 0u32;
+    for i in 0..sh_num {
+        let off = i * sh_entsize;
+        if off + 64 > shdr_data.len() { break; }
+        let sh_type = u32::from_le_bytes(shdr_data[off + 4..off + 8].try_into().unwrap());
+        if sh_type == SHT_SYMTAB {
+            symtab_off = u64::from_le_bytes(shdr_data[off + 24..off + 32].try_into().unwrap());
+            symtab_size = u64::from_le_bytes(shdr_data[off + 32..off + 40].try_into().unwrap());
+            symtab_link = u32::from_le_bytes(shdr_data[off + 40..off + 44].try_into().unwrap());
+            symtab_entsize = u64::from_le_bytes(shdr_data[off + 56..off + 64].try_into().unwrap());
+            break;
+        }
+    }
+    if symtab_size == 0 { return empty(); }
+
+    // Find the linked strtab.
+    let link_off = symtab_link as usize * sh_entsize;
+    if link_off + 64 > shdr_data.len() { return empty(); }
+    let strtab_type = u32::from_le_bytes(shdr_data[link_off + 4..link_off + 8].try_into().unwrap());
+    if strtab_type != SHT_STRTAB { return empty(); }
+    let strtab_off = u64::from_le_bytes(shdr_data[link_off + 24..link_off + 32].try_into().unwrap());
+    let strtab_size = u64::from_le_bytes(shdr_data[link_off + 32..link_off + 40].try_into().unwrap());
+
+    // Get in-memory pointers (only works for initrd-backed files).
+    let Some(symtab_ptr) = backing.memory_ptr(symtab_off, symtab_size as usize) else { return empty() };
+    let Some(strtab_ptr) = backing.memory_ptr(strtab_off, strtab_size as usize) else { return empty() };
+
+    let entry_size = if symtab_entsize > 0 { symtab_entsize as usize } else { 24 };
+    let entries = symtab_size as usize / entry_size;
+
+    ProcessSymbols::from_raw(
+        symtab_ptr, entries,
+        strtab_ptr, strtab_size as usize,
+        base,
+        prog_base, prog_end, stack_base, stack_end,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -2332,12 +2366,12 @@ pub fn kill_process(target_pid: Pid) -> u64 {
     {
         let mut data = data_arc.lock();
         fd::close_all(&mut data.fds, &mut *vfs::lock(), target_pid);
-        data.tls_alloc.take();
+        data.tls_pages.take();
         data.elf_alloc.take();
-        data.stack_alloc.take();
+        data.stack_pages.take();
         data.loaded_libs.clear();
         data.mmap_regions.clear();
-        data.demand_allocs.clear();
+        data.demand_pages.clear();
         data.vmas.clear();
         data.reloc_index = None;
     }

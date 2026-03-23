@@ -22,8 +22,7 @@ use std::net::Ipv4Addr;
 // --- smoltcp Device wrapper ---
 
 struct DmaNic {
-    _rx_region: shm::SharedMemory,
-    _tx_region: shm::SharedMemory,
+    _dma_region: shm::SharedMemory,
     rx_base: *const u8,
     rx_buf_size: usize,
     tx_buf: *mut u8,
@@ -41,17 +40,14 @@ impl DmaNic {
         assert_eq!(n, info_bytes.len(), "netd: NicInfo size mismatch");
         let info: toyos_abi::net::NicInfo = unsafe { core::ptr::read(info_bytes.as_ptr() as *const _) };
 
-        let rx_buf_count = info.rx_buf_count as usize;
         let rx_buf_size = info.rx_buf_size as usize;
-        let rx_region = shm::SharedMemory::map(info.rx_buf_token, rx_buf_count * rx_buf_size);
-        let rx_base = rx_region.as_ptr() as *const u8;
-
-        let tx_region = shm::SharedMemory::map(info.tx_buf_token, 4096);
-        let tx_ptr = tx_region.as_ptr();
+        let dma_region = shm::SharedMemory::map(info.dma_token, 2 * 1024 * 1024);
+        let dma_base = dma_region.as_ptr() as *const u8;
+        let rx_base = unsafe { dma_base.add(info.rx_buf_offset as usize) };
+        let tx_ptr = unsafe { dma_base.add(info.tx_buf_offset as usize) as *mut u8 };
 
         Self {
-            _rx_region: rx_region,
-            _tx_region: tx_region,
+            _dma_region: dma_region,
             rx_base,
             rx_buf_size,
             tx_buf: tx_ptr,

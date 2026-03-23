@@ -67,11 +67,7 @@ pub fn try_claim(device_type: u64, pid: Pid) -> Option<Descriptor> {
             let info = crate::net::nic_info()?;
             *owner = Some(pid);
             // Grant DMA buffer tokens to the claiming process
-            if shared_memory::grant_kernel(shared_memory::SharedToken::from_raw(info.rx_buf_token), pid).is_err() {
-                *owner = None;
-                return None;
-            }
-            if shared_memory::grant_kernel(shared_memory::SharedToken::from_raw(info.tx_buf_token), pid).is_err() {
+            if shared_memory::grant_kernel(shared_memory::SharedToken::from_raw(info.dma_token), pid).is_err() {
                 *owner = None;
                 return None;
             }
@@ -84,11 +80,9 @@ pub fn try_claim(device_type: u64, pid: Pid) -> Option<Descriptor> {
             }
             let info = crate::audio::audio_info()?;
             *owner = Some(pid);
-            for &token in &info.buf_tokens[..info.num_buffers as usize] {
-                if shared_memory::grant_kernel(shared_memory::SharedToken::from_raw(token), pid).is_err() {
-                    *owner = None;
-                    return None;
-                }
+            if shared_memory::grant_kernel(shared_memory::SharedToken::from_raw(info.dma_token), pid).is_err() {
+                *owner = None;
+                return None;
             }
             Some(Descriptor::Audio(info))
         }

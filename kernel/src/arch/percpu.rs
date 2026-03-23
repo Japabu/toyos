@@ -59,6 +59,12 @@ pub struct PerCpu {
     gdt: [u64; 7],      // offset 144 (56 bytes)
     idle_rsp: u64,       // offset 200: saved RSP for idle context (for context_switch)
     idle_stack_top: u64, // offset 208: top of per-CPU idle stack
+    /// Saved user RIP at last syscall entry (for panic diagnostics).
+    pub syscall_rip: u64,  // offset 216
+    /// Saved syscall number (for panic diagnostics).
+    pub syscall_num: u64,  // offset 224
+    /// Saved user RBP at last syscall entry (for panic diagnostics).
+    pub syscall_rbp: u64,  // offset 232
 }
 
 // GDT layout:
@@ -271,5 +277,25 @@ pub fn idle_rsp_ptr() -> *mut u64 {
 /// Top of this CPU's idle stack.
 pub fn idle_stack_top() -> u64 {
     unsafe { (*percpu_ptr()).idle_stack_top }
+}
+
+/// User RIP saved at last syscall entry (for panic diagnostics).
+pub fn syscall_rip() -> u64 {
+    unsafe { (*percpu_ptr()).syscall_rip }
+}
+
+/// Syscall number saved at last syscall entry (for panic diagnostics).
+pub fn syscall_num() -> u64 {
+    unsafe { (*percpu_ptr()).syscall_num }
+}
+
+/// User RSP saved at last syscall entry.
+pub fn user_rsp() -> u64 {
+    unsafe { (*percpu_ptr()).user_rsp }
+}
+
+/// User RBP saved at last syscall entry (for panic diagnostics).
+pub fn syscall_rbp() -> u64 {
+    unsafe { (*percpu_ptr()).syscall_rbp }
 }
 

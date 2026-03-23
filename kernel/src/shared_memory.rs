@@ -149,6 +149,8 @@ pub fn alloc(size: u64, owner_pid: Pid, addr_space: &PageTables) -> SharedToken 
 /// Permanent: never auto-removed. Used for GPU framebuffers and DMA buffers.
 #[must_use]
 pub fn register(phys: DirectMap, size: u64) -> SharedToken {
+    assert!(phys.phys() & (PAGE_2M - 1) == 0,
+        "shared_memory::register: phys {:#x} not 2MB-aligned", phys.phys());
     let vaddr = alloc_vaddr(size);
     let token = next_token();
     with_regions_mut(|regions| {

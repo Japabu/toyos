@@ -9,9 +9,8 @@ struct KernelPageSource;
 
 unsafe impl dlmalloc::Allocator for KernelPageSource {
     fn alloc(&self, size: usize) -> (*mut u8, usize, u32) {
-        if size > PAGE_2M as usize {
-            panic!("dlmalloc requested {} bytes (align from GlobalAlloc) — caller should use pmm::alloc_contiguous", size);
-        }
+        assert!(size <= PAGE_2M as usize,
+            "GlobalAlloc: dlmalloc asked for {} bytes — a caller is using alloc for page-scale memory", size);
         if let Some(page) = pmm::alloc_page() {
             let ptr = page.direct_map().as_mut_ptr::<u8>();
             core::mem::forget(page); // dlmalloc manages the lifetime
@@ -74,6 +73,8 @@ unsafe impl GlobalAlloc for KernelAllocator {
             PHASE_UNINIT => core::ptr::null_mut(),
             PHASE_EARLY => early_alloc(layout),
             _ => {
+                assert!(layout.align() < PAGE_2M as usize,
+                    "GlobalAlloc: {:#x} bytes with {:#x} align — use PageAlloc", layout.size(), layout.align());
                 let mut dlm = self.dlmalloc.lock();
                 dlm.malloc(layout.size(), layout.align())
             }
