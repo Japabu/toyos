@@ -167,9 +167,18 @@ fn spawn_and_wait_ready(mut qemu: Command, no_timeout: bool) -> QemuInstance {
                 eprintln!("[qemu] Test runner ready");
                 break;
             }
-            Ok(ref line) if !no_timeout && (line.contains("SEGFAULT") || line.contains("KERNEL PANIC")) => {
+            Ok(ref line) if !no_timeout && (line.contains("SEGFAULT") || line.contains("KERNEL PANIC") || line.contains("!!! PANIC !!!")) => {
+                // Collect backtrace lines before killing
+                let mut crash_msg = line.clone();
+                let drain_deadline = Instant::now() + Duration::from_secs(2);
+                while Instant::now() < drain_deadline {
+                    match rx.recv_timeout(Duration::from_millis(200)) {
+                        Ok(bt_line) => { crash_msg.push('\n'); crash_msg.push_str(&bt_line); }
+                        Err(_) => break,
+                    }
+                }
                 let _ = child.kill();
-                panic!("[qemu] Init process crashed during boot: {line}");
+                panic!("[qemu] Init process crashed during boot:\n{crash_msg}");
             }
             Ok(_) => continue,
             Err(RecvTimeoutError::Timeout) => continue,

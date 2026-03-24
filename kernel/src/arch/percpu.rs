@@ -133,7 +133,8 @@ impl PerCpu {
             "mov ds, {ds:x}",
             "mov es, {ds:x}",
             "mov fs, {ds:x}",
-            "mov gs, {ds:x}",
+            // Skip GS — its base is managed via IA32_GS_BASE MSR.
+            // Writing the selector would zero the cached base.
             "mov ss, {ds:x}",
             in(reg) &ptr,
             cs = in(reg) KERNEL_CS as u64,
@@ -229,6 +230,7 @@ pub fn init_ap(percpu_ptr: *mut PerCpu) {
     unsafe { percpu.load_gdt(); }
     cpu::enable_sse();
     cpu::enable_smap();
+
     // GS base already set by trampoline; set KERNEL_GS_BASE too for swapgs.
     cpu::wrmsr(MSR_KERNEL_GS_BASE, percpu_ptr as u64);
 
