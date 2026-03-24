@@ -315,5 +315,6 @@ impl Drop for QemuInstance {
 /// Build all binaries in a multi-binary crate. Delegates to the main build system.
 pub fn build_toyos_bins(crate_path: &Path) -> Vec<(String, Vec<u8>)> {
     let repo = compile::repo_root();
-    toyos::build::build_toyos_bins(&repo, crate_path)
+    let changes = toyos::toolchain::ensure(&repo, false);
+    toyos::build::build_toyos_bins(&repo, crate_path, &changes)
 }

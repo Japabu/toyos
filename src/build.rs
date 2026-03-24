@@ -395,9 +395,28 @@ pub fn build_toyos_crate(root: &Path, crate_path: &Path) -> (String, Vec<u8>) {
 
 /// Build all binaries in a multi-binary crate. Returns vec of (binary_name, bytes).
 /// Also builds any cdylib subcrates and includes their .so files.
-pub fn build_toyos_bins(root: &Path, crate_path: &Path) -> Vec<(String, Vec<u8>)> {
+pub fn build_toyos_bins(root: &Path, crate_path: &Path, changes: &crate::toolchain::ChangeSet) -> Vec<(String, Vec<u8>)> {
     let bin_dir = crate_path.join("target/x86_64-unknown-toyos/debug");
     let path_env = crate::toolchain::path_with_toyos_ld(root);
+
+    // Force re-link when linker or std changed
+    if changes.std_rebuilt {
+        let target_dir = crate_path.join("target/x86_64-unknown-toyos");
+        if target_dir.exists() {
+            eprintln!("toolchain changed: cleaning {}", target_dir.display());
+            fs::remove_dir_all(&target_dir).ok();
+        }
+    } else if changes.linker_changed {
+        eprintln!("linker changed: forcing re-link of test binaries");
+        if bin_dir.exists() {
+            for entry in fs::read_dir(&bin_dir).into_iter().flatten().flatten() {
+                let path = entry.path();
+                if path.is_file() && path.extension().is_none() {
+                    fs::remove_file(&path).ok();
+                }
+            }
+        }
+    }
     let mut results = Vec::new();
 
     // Build cdylib subcrates first (test shared libraries)
