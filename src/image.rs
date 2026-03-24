@@ -45,7 +45,7 @@ pub fn create_boot_image(initrd_bytes: &[u8], profile: &str) -> Vec<u8> {
     create_gpt_disk(esp_volume)
 }
 
-fn create_fat_volume(kernel: &[u8], bootloader: &[u8], initrd: &[u8]) -> Vec<u8> {
+pub fn create_fat_volume(kernel: &[u8], bootloader: &[u8], initrd: &[u8]) -> Vec<u8> {
     let content_size = kernel.len() + bootloader.len() + initrd.len();
     // FAT32 requires at least 65525 clusters; ensure volume is large enough
     let total_size = (content_size + 4 * 1024 * 1024).max(34 * 1024 * 1024);
@@ -90,7 +90,7 @@ fn create_fat_volume(kernel: &[u8], bootloader: &[u8], initrd: &[u8]) -> Vec<u8>
     volume
 }
 
-fn create_gpt_disk(esp_volume: Vec<u8>) -> Vec<u8> {
+pub fn create_gpt_disk(esp_volume: Vec<u8>) -> Vec<u8> {
     let overhead = 100 * 1024; // 100 KiB for GPT headers
     let total_size = esp_volume.len() + overhead;
     let mut disk = vec![0u8; total_size];

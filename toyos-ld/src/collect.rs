@@ -392,6 +392,7 @@ fn parse_object(obj: &object::File, _name: &str) -> Result<ParsedObject, LinkErr
             read::SectionKind::TlsVariables => SectionKind::TlsVariables,
             read::SectionKind::Elf(elf::SHT_INIT_ARRAY) => SectionKind::InitArray,
             read::SectionKind::Elf(elf::SHT_FINI_ARRAY) => SectionKind::FiniArray,
+            read::SectionKind::Elf(elf::SHT_X86_64_UNWIND) => SectionKind::ReadOnly,
             read::SectionKind::OtherString
             | read::SectionKind::Other
             | read::SectionKind::Debug
@@ -399,7 +400,11 @@ fn parse_object(obj: &object::File, _name: &str) -> Result<ParsedObject, LinkErr
             | read::SectionKind::Linker
             | read::SectionKind::Note
             | read::SectionKind::Metadata => continue,
-            read::SectionKind::Elf(_) => continue,
+            read::SectionKind::Elf(t) => panic!(
+                "unhandled ELF section type {:#x} in section {}",
+                t,
+                section.name().unwrap_or("<unnamed>"),
+            ),
             read::SectionKind::Unknown => continue,
             _ => panic!(
                 "unhandled section kind {:?} in section {}",

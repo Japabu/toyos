@@ -1,10 +1,4 @@
-mod assets;
-mod build;
-mod image;
-mod libc;
 mod qemu;
-mod stamps;
-mod toolchain;
 
 use std::env;
 use std::path::PathBuf;
@@ -74,10 +68,10 @@ fn main() {
     }
 
     // Ensure toolchain is up to date
-    let changes = toolchain::ensure(&root, rebuild_toolchain);
+    let changes = toyos::toolchain::ensure(&root, rebuild_toolchain);
 
     // Build everything
-    build::build(&root, debug, release, &changes);
+    toyos::build::build(&root, debug, release, &changes);
 
     if !build_only {
         qemu::launch(debug, dump_audio);

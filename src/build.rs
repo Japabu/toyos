@@ -324,6 +324,141 @@ fn collect_hosted_rustc(root: &Path, initrd_files: &mut Vec<(String, Vec<u8>)>) 
     }
 }
 
+/// Build kernel and bootloader for tests. Ensures toolchain is up to date first.
+/// The bootloader uses `/bin/test-runner` as init.
+pub fn build_for_tests(root: &Path, debug_wait: bool) {
+    let changes = crate::toolchain::ensure(root, false);
+    let path_env = crate::toolchain::path_with_toyos_ld(root);
+    let rustflags = "-Dwarnings".to_string();
+
+    // Clean if needed (same logic as full build)
+    if changes.std_rebuilt {
+        let userland_dir = root.join("userland");
+        for subdir in ["target/x86_64-unknown-toyos", "target/debug"] {
+            let dir = userland_dir.join(subdir);
+            if dir.exists() {
+                eprintln!("toolchain changed: cleaning userland/{subdir}");
+                fs::remove_dir_all(&dir).ok();
+            }
+        }
+    }
+
+    build_kernel(root, debug_wait, false, &rustflags, &path_env);
+    build_bootloader(root, false, &rustflags, &path_env, "/bin/test-runner");
+}
+
+/// Build a ToyOS userland crate. Returns (binary_name, binary_bytes).
+pub fn build_toyos_crate(root: &Path, crate_path: &Path) -> (String, Vec<u8>) {
+    let name = crate_path.file_name().unwrap().to_str().unwrap().to_string();
+    let path_env = crate::toolchain::path_with_toyos_ld(root);
+    assert!(
+        Command::new("cargo")
+            .args(["build", "--target", "x86_64-unknown-toyos"])
+            .env("RUSTUP_TOOLCHAIN", "toyos")
+            .env("PATH", &path_env)
+            .env_remove("RUSTC")
+            .current_dir(crate_path)
+            .status()
+            .expect("Failed to run cargo")
+            .success(),
+        "Failed to build userland/{name}"
+    );
+    // Workspace members output to the workspace target dir
+    let workspace_target = crate_path.parent().unwrap().join("target");
+    let binary = workspace_target.join(format!("x86_64-unknown-toyos/debug/{name}"));
+    let binary = if binary.exists() {
+        binary
+    } else {
+        crate_path.join(format!("target/x86_64-unknown-toyos/debug/{name}"))
+    };
+    let data = fs::read(&binary).unwrap_or_else(|e| {
+        panic!("Failed to read {}: {e}", binary.display());
+    });
+    (name, data)
+}
+
+/// Build all binaries in a multi-binary crate. Returns vec of (binary_name, bytes).
+/// Also builds any cdylib subcrates and includes their .so files.
+pub fn build_toyos_bins(root: &Path, crate_path: &Path) -> Vec<(String, Vec<u8>)> {
+    let bin_dir = crate_path.join("target/x86_64-unknown-toyos/debug");
+    let path_env = crate::toolchain::path_with_toyos_ld(root);
+    let mut results = Vec::new();
+
+    // Build cdylib subcrates first (test shared libraries)
+    let mut lib_search_dirs = Vec::new();
+    for entry in fs::read_dir(crate_path).unwrap() {
+        let entry = entry.unwrap();
+        let sub_path = entry.path();
+        if !sub_path.is_dir() { continue; }
+        let cargo_toml = sub_path.join("Cargo.toml");
+        if !cargo_toml.exists() { continue; }
+        let toml_text = fs::read_to_string(&cargo_toml).unwrap();
+        if !toml_text.contains("cdylib") { continue; }
+
+        let lib_name = sub_path.file_name().unwrap().to_str().unwrap();
+        eprintln!("[build] Building cdylib subcrate: {lib_name}");
+        assert!(
+            Command::new("cargo")
+                .args(["build", "--target", "x86_64-unknown-toyos"])
+                .env("RUSTUP_TOOLCHAIN", "toyos")
+                .env("PATH", &path_env)
+                .env_remove("RUSTC")
+                .current_dir(&sub_path)
+                .status()
+                .expect("Failed to run cargo")
+                .success(),
+            "Failed to build cdylib {lib_name}"
+        );
+
+        let lib_out = sub_path.join("target/x86_64-unknown-toyos/debug");
+        lib_search_dirs.push(lib_out.clone());
+
+        for so_entry in fs::read_dir(&lib_out).unwrap() {
+            let so_entry = so_entry.unwrap();
+            let name = so_entry.file_name().to_str().unwrap().to_string();
+            if name.ends_with(".so") {
+                let data = fs::read(so_entry.path()).unwrap();
+                results.push((name, data));
+            }
+        }
+    }
+
+    // Build test binaries, linking against cdylib outputs
+    let mut rustflags = String::new();
+    for dir in &lib_search_dirs {
+        rustflags.push_str(&format!("-L {} ", dir.display()));
+    }
+
+    assert!(
+        Command::new("cargo")
+            .args(["build", "--target", "x86_64-unknown-toyos", "--bins"])
+            .env("RUSTUP_TOOLCHAIN", "toyos")
+            .env("PATH", &path_env)
+            .env("RUSTFLAGS", &rustflags)
+            .env_remove("RUSTC")
+            .current_dir(crate_path)
+            .status()
+            .expect("Failed to run cargo")
+            .success(),
+        "Failed to build test binaries"
+    );
+
+    let bin_src = crate_path.join("src/bin");
+    if bin_src.exists() {
+        for entry in fs::read_dir(&bin_src).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().to_str().unwrap().strip_suffix(".rs").unwrap().to_string();
+            let binary = bin_dir.join(&name);
+            if binary.exists() {
+                let data = fs::read(&binary).unwrap();
+                results.push((name, data));
+            }
+        }
+    }
+
+    results
+}
+
 fn build_kernel(root: &Path, debug: bool, release: bool, rustflags: &str, path_env: &str) {
     let mut args = vec!["build", "--target", "x86_64-unknown-none"];
     if release {
