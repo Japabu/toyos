@@ -48,7 +48,7 @@ macro_rules! toyos_rust_tests {
                     let mut qemu = QEMU.lock().unwrap_or_else(|e| e.into_inner());
                     qemu.run_test(
                         &format!("test_rs_{}", stringify!($name)),
-                        Duration::from_secs(30),
+                        Duration::from_secs(5),
                     )
                 };
                 check_test_result(&result);
