@@ -13,5 +13,21 @@ serde_json = "1"
 bcachefs = { path = "bcachefs" }
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
 
+[dev-dependencies]
+toyos-cc = { path = "toyos-cc" }
+toyos-ld = { path = "toyos-ld" }
+wait-timeout = "0.2.1"
+
 [profile.release]
 opt-level = 2
+
+[profile.dev.package.toyos-cc]
+opt-level = 3
+
+[profile.dev.package.toyos-ld]
+opt-level = 3
+
+[patch.crates-io]
+target-lexicon = { path = "userland/target-lexicon" }
+stacker = { path = "userland/stacker" }
+psm = { path = "userland/stacker/psm" }

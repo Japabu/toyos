@@ -1,10 +1,11 @@
 use std::path::Path;
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
-use toyos_tests::qemu::{self, QemuInstance, TestResult};
+mod common;
+use common::qemu::{self, QemuInstance, TestResult};
 
 static QEMU: LazyLock<Mutex<QemuInstance>> = LazyLock::new(|| {
-    let rust_tests_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("toyos-rust-tests");
+    let rust_tests_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/toyos-rust-tests");
 
     assert!(
         rust_tests_dir.join("Cargo.toml").exists(),

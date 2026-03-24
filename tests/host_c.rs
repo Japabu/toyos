@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::LazyLock;
-use toyos_tests::compile;
+mod common;
+use common::compile;
 
 type CompiledObjs = (Vec<u8>, Vec<Vec<u8>>);
 

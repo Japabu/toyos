@@ -6,7 +6,7 @@ use wait_timeout::ChildExt;
 
 /// Root of the repository.
 pub fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf()
+    Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf()
 }
 
 /// Directory containing the TinyCC test cases.
@@ -19,11 +19,39 @@ pub fn libc_dir() -> PathBuf {
     repo_root().join("userland/libc")
 }
 
-/// Get the pre-built toyos libc archive.
+/// Build (if needed) and return the toyos libc archive path.
 pub fn libc_archive_toyos() -> PathBuf {
-    let path = PathBuf::from(env!("TOYOS_LIBC_TOYOS"));
-    assert!(path.exists(), "pre-built libc not found at {}", path.display());
-    path
+    let libc_dir = libc_dir();
+    let target = "x86_64-unknown-toyos";
+    let target_dir = libc_dir.join("target");
+    let archive = target_dir.join(format!("{target}/release/libtoyos_libc.a"));
+
+    // Build if the archive doesn't exist
+    if !archive.exists() {
+        let mut cmd = Command::new("cargo");
+        for (key, _) in env::vars() {
+            if key.starts_with("CARGO") || key == "RUSTC" || key == "RUSTFLAGS" {
+                cmd.env_remove(&key);
+            }
+        }
+        let output = cmd
+            .env("RUSTUP_TOOLCHAIN", "toyos")
+            .args(["rustc", "--release", "--target", target, "--crate-type", "staticlib"])
+            .arg("--manifest-path")
+            .arg(libc_dir.join("Cargo.toml"))
+            .arg("--target-dir")
+            .arg(&target_dir)
+            .output()
+            .unwrap_or_else(|e| panic!("failed to run cargo for toyos-libc: {e}"));
+        assert!(
+            output.status.success(),
+            "toyos-libc build failed:\n{}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    assert!(archive.exists(), "expected staticlib at {}", archive.display());
+    archive
 }
 
 /// Include paths for toyos-libc headers.

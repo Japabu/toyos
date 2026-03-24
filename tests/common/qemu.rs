@@ -5,7 +5,7 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 use std::{env, fs, thread};
 
-use crate::compile;
+use super::compile;
 
 /// Result of a single test run inside QEMU.
 #[derive(Debug)]
@@ -154,7 +154,7 @@ fn spawn_and_wait_ready(mut qemu: Command) -> QemuInstance {
     });
 
     // Wait for ===READY=== from the test-runner
-    let boot_timeout = Duration::from_secs(120);
+    let boot_timeout = Duration::from_secs(10);
     let start = Instant::now();
     loop {
         if start.elapsed() > boot_timeout {
@@ -165,6 +165,10 @@ fn spawn_and_wait_ready(mut qemu: Command) -> QemuInstance {
             Ok(line) if line.contains("===READY===") => {
                 eprintln!("[qemu] Test runner ready");
                 break;
+            }
+            Ok(ref line) if line.contains("SEGFAULT") || line.contains("KERNEL PANIC") => {
+                let _ = child.kill();
+                panic!("[qemu] Init process crashed during boot: {line}");
             }
             Ok(_) => continue,
             Err(RecvTimeoutError::Timeout) => continue,
@@ -309,12 +313,7 @@ impl Drop for QemuInstance {
 
 /// Build the kernel. Uses the `toyos` toolchain (linked by the main build system).
 fn build_kernel(repo: &Path) {
-    let host = host_triple();
-    let sysroot_bin = repo.join(format!("rust/build/{host}/stage2/lib/rustlib/{host}/bin"));
-    let path_env = match std::env::var("PATH") {
-        Ok(p) => format!("{}:{p}", sysroot_bin.display()),
-        Err(_) => sysroot_bin.display().to_string(),
-    };
+    let path_env = path_with_toyos_ld(repo);
     assert!(
         Command::new("cargo")
             .args(["build", "--target", "x86_64-unknown-none"])
@@ -331,12 +330,7 @@ fn build_kernel(repo: &Path) {
 
 /// Build the bootloader with test-runner as init.
 fn build_bootloader(repo: &Path) {
-    let host = host_triple();
-    let sysroot_bin = repo.join(format!("rust/build/{host}/stage2/lib/rustlib/{host}/bin"));
-    let path_env = match std::env::var("PATH") {
-        Ok(p) => format!("{}:{p}", sysroot_bin.display()),
-        Err(_) => sysroot_bin.display().to_string(),
-    };
+    let path_env = path_with_toyos_ld(repo);
     assert!(
         Command::new("cargo")
             .args(["build", "--target", "x86_64-unknown-uefi"])
@@ -390,13 +384,26 @@ fn host_triple() -> String {
         .expect("Could not determine host triple")
 }
 
+/// PATH with toyos-ld's directory prepended so rustc finds the linker.
+fn path_with_toyos_ld(repo: &Path) -> String {
+    let ld = build_toyos_ld(repo);
+    let ld_dir = ld.parent().unwrap();
+    match env::var("PATH") {
+        Ok(p) => format!("{}:{p}", ld_dir.display()),
+        Err(_) => ld_dir.display().to_string(),
+    }
+}
+
 /// Build a ToyOS userland crate. Returns (binary_name, binary_bytes).
 fn build_toyos_crate(crate_path: &Path) -> (String, Vec<u8>) {
     let name = crate_path.file_name().unwrap().to_str().unwrap().to_string();
+    let repo = compile::repo_root();
+    let path_env = path_with_toyos_ld(&repo);
     assert!(
         Command::new("cargo")
             .args(["build", "--target", "x86_64-unknown-toyos"])
             .env("RUSTUP_TOOLCHAIN", "toyos")
+            .env("PATH", &path_env)
             .env_remove("RUSTC")
             .current_dir(crate_path)
             .status()
@@ -423,6 +430,8 @@ fn build_toyos_crate(crate_path: &Path) -> (String, Vec<u8>) {
 /// Also builds any cdylib subcrates and includes their .so files.
 pub fn build_toyos_bins(crate_path: &Path) -> Vec<(String, Vec<u8>)> {
     let bin_dir = crate_path.join("target/x86_64-unknown-toyos/debug");
+    let repo = compile::repo_root();
+    let path_env = path_with_toyos_ld(&repo);
     let mut results = Vec::new();
 
     // Build cdylib subcrates first (test shared libraries)
@@ -442,7 +451,7 @@ pub fn build_toyos_bins(crate_path: &Path) -> Vec<(String, Vec<u8>)> {
             Command::new("cargo")
                 .args(["build", "--target", "x86_64-unknown-toyos"])
                 .env("RUSTUP_TOOLCHAIN", "toyos")
-    
+                .env("PATH", &path_env)
                 .env_remove("RUSTC")
                 .current_dir(&sub_path)
                 .status()
@@ -475,7 +484,7 @@ pub fn build_toyos_bins(crate_path: &Path) -> Vec<(String, Vec<u8>)> {
         Command::new("cargo")
             .args(["build", "--target", "x86_64-unknown-toyos", "--bins"])
             .env("RUSTUP_TOOLCHAIN", "toyos")
-
+            .env("PATH", &path_env)
             .env("RUSTFLAGS", &rustflags)
             .env_remove("RUSTC")
             .current_dir(crate_path)

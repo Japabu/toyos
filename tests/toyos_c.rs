@@ -3,8 +3,9 @@ use std::path::Path;
 use std::sync::{LazyLock, Mutex};
 use std::thread;
 use std::time::Duration;
-use toyos_tests::compile;
-use toyos_tests::qemu::{QemuInstance, TestResult};
+mod common;
+use common::compile;
+use common::qemu::{QemuInstance, TestResult};
 
 macro_rules! toyos_c_tests {
     ($(($func:ident, $name:expr)),* $(,)?) => {
