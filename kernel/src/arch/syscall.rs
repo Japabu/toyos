@@ -396,6 +396,10 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         SYS_TLS_ALLOC_BLOCK => sys_tls_alloc_block(a1),
         SYS_IO_URING_SETUP => sys_io_uring_setup(a1 as u32),
         SYS_IO_URING_ENTER => sys_io_uring_enter(a1 as u32, a2 as u32, a3 as u32, a4),
+        SYS_QUERY_MODULES => {
+            let Some(buf) = ctx.user_slice_mut(UserAddr::new(a1), a2) else { return bad_addr };
+            sys_query_modules(buf)
+        }
         _ => SyscallError::InvalidArgument.to_u64(),
     };
 
@@ -1177,7 +1181,9 @@ fn sys_dlopen(path: &str) -> u64 {
                 let phys = DirectMap::phys_of(alloc.ptr());
                 let (vaddr, _) = process::vma_map(&mut data.vmas, &pt, phys, alloc.size() as u64)
                     .expect("dlopen: out of virtual address space");
+                let delta = vaddr.raw() as i64 - lib.user_base.raw() as i64;
                 lib.user_base = vaddr;
+                lib.user_end = (lib.user_end as i64 + delta) as u64;
             }
             crate::elf::LibMemory::Shared { rw_alloc, cached_image, rw_offset, .. } => {
                 let cached_phys = cached_image.phys();
@@ -1192,7 +1198,9 @@ fn sys_dlopen(path: &str) -> u64 {
                 }
                 cpu::flush_tlb();
                 apic::tlb_shootdown();
+                let delta = lib_vaddr.raw() as i64 - lib.user_base.raw() as i64;
                 lib.user_base = lib_vaddr;
+                lib.user_end = (lib.user_end as i64 + delta) as u64;
             }
         }
     });
@@ -1238,6 +1246,7 @@ fn sys_dlopen(path: &str) -> u64 {
     // Store the lib in the owner process
     let mut data = data_arc.lock();
     let idx = data.loaded_libs.len();
+    data.lib_paths.push(resolved);
     data.loaded_libs.push(lib);
     idx as u64
 }
@@ -1356,6 +1365,73 @@ fn sys_io_uring_enter(ring_fd: u32, to_submit: u32, min_complete: u32, timeout_n
         Ok(n) => n as u64,
         Err(e) => e.to_u64(),
     }
+}
+
+fn sys_query_modules(buf: &mut [u8]) -> u64 {
+    use toyos_abi::syscall::ModuleInfo;
+    let info_size = core::mem::size_of::<ModuleInfo>();
+
+    process::with_fd_owner_data(|data| {
+        // Count modules: 1 (exe) + loaded_libs
+        let module_count = 1 + data.loaded_libs.len();
+
+        // Calculate total path bytes
+        let exe_path_bytes = data.exe_path.as_bytes();
+        let total_path_bytes: usize = exe_path_bytes.len()
+            + data.lib_paths.iter().map(|p| p.as_bytes().len()).sum::<usize>();
+
+        let required = module_count * info_size + total_path_bytes;
+        if buf.len() < required {
+            return SyscallError::InvalidArgument.to_u64();
+        }
+
+        let mut path_offset = (module_count * info_size) as u32;
+
+        // Write exe module info
+        let (eh_vaddr, eh_size) = (data.exe_eh_frame_hdr_vaddr, data.exe_eh_frame_hdr_size);
+        let exe_info = ModuleInfo {
+            base: data.elf_base.raw(),
+            text_end: data.exe_vaddr_max,
+            eh_frame_hdr: if eh_vaddr != 0 { data.elf_base.raw() + eh_vaddr } else { 0 },
+            eh_frame_hdr_size: eh_size,
+            path_offset,
+            path_len: exe_path_bytes.len() as u32,
+        };
+        buf[..info_size].copy_from_slice(unsafe {
+            core::slice::from_raw_parts(&exe_info as *const ModuleInfo as *const u8, info_size)
+        });
+        buf[path_offset as usize..path_offset as usize + exe_path_bytes.len()]
+            .copy_from_slice(exe_path_bytes);
+        path_offset += exe_path_bytes.len() as u32;
+
+        // Write library module infos
+        for (i, lib) in data.loaded_libs.iter().enumerate() {
+            let lib_path_bytes = if i < data.lib_paths.len() {
+                data.lib_paths[i].as_bytes()
+            } else {
+                b""
+            };
+            let lib_info = ModuleInfo {
+                base: lib.user_base.raw(),
+                text_end: lib.user_end,
+                eh_frame_hdr: if lib.eh_frame_hdr_vaddr != 0 {
+                    lib.user_base.raw() + lib.eh_frame_hdr_vaddr
+                } else { 0 },
+                eh_frame_hdr_size: lib.eh_frame_hdr_size,
+                path_offset,
+                path_len: lib_path_bytes.len() as u32,
+            };
+            let off = (1 + i) * info_size;
+            buf[off..off + info_size].copy_from_slice(unsafe {
+                core::slice::from_raw_parts(&lib_info as *const ModuleInfo as *const u8, info_size)
+            });
+            buf[path_offset as usize..path_offset as usize + lib_path_bytes.len()]
+                .copy_from_slice(lib_path_bytes);
+            path_offset += lib_path_bytes.len() as u32;
+        }
+
+        module_count as u64
+    })
 }
 
 /// Terminate the current userspace process (called from exception handlers).

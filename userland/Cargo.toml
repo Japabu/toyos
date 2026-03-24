@@ -9,7 +9,6 @@ members = [
     "files",
     "font",
     "input-test",
-    "libc",
     "netd",
     "paint",
     "proctest",
@@ -24,6 +23,8 @@ members = [
     "window",
 ]
 exclude = [
+    # no_std C runtime — uses panic=abort (own Cargo.toml profile)
+    "libc",
     # Ecosystem forks — own workspaces or standalone
     "cargo",
     "cpal",

@@ -31,12 +31,12 @@ pub fn ensure(root: &Path, rust_dir: &Path) {
             "--release",
             "--target",
             "x86_64-unknown-toyos",
-            "-p",
-            "toyos-libc",
             "--features",
-            "toyos-libc/std-runtime",
+            "std-runtime",
             "--message-format=json",
+            "--manifest-path",
         ])
+        .arg(root.join("userland/libc/Cargo.toml").to_str().unwrap())
         .current_dir(root.join("userland"))
         .stderr(std::process::Stdio::inherit())
         .output()

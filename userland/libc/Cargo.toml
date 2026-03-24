@@ -11,3 +11,9 @@ std-runtime = []
 toyos-abi = { path = "../../toyos-abi" }
 toyos-net = { path = "../../toyos-net" }
 dlmalloc = "0.2.7"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

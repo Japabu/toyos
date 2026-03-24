@@ -71,4 +71,5 @@ toyos_rust_tests!(
     std_tls_dlopen,
     std_tls_multi_crate,
     std_tls_cranelift,
+    std_unwind,
 );

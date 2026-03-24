@@ -394,6 +394,16 @@ pub struct ProcessData {
     pub alloc_count: u64,
     /// Total frees (munmap)
     pub free_count: u64,
+    /// Executable path (for SYS_QUERY_MODULES).
+    pub exe_path: String,
+    /// Executable .eh_frame_hdr vaddr (stated ELF vaddr, before base offset).
+    pub exe_eh_frame_hdr_vaddr: u64,
+    /// Executable .eh_frame_hdr size.
+    pub exe_eh_frame_hdr_size: u64,
+    /// Executable virtual address extent (elf_base + vaddr_max - vaddr_min).
+    pub exe_vaddr_max: u64,
+    /// Paths of dlopen'd libraries (parallel to loaded_libs).
+    pub lib_paths: Vec<String>,
 }
 
 pub struct MmapRegion {
@@ -926,6 +936,11 @@ pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64, stack_base: u64) -> Op
         peak_memory: 0,
         alloc_count: 0,
         free_count: 0,
+        exe_path: String::new(),
+        exe_eh_frame_hdr_vaddr: 0,
+        exe_eh_frame_hdr_size: 0,
+        exe_vaddr_max: 0,
+        lib_paths: Vec::new(),
     }));
 
     let mut guard = PROCESS_TABLE.lock();
@@ -1237,12 +1252,13 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
 
     // 7. Load shared libraries from block map (no full binary read)
     // Read DT_STRTAB from block map to get library names
-    let mut loaded_libs = if !dyn_info.needed_strtab_offsets.is_empty() && dyn_info.strsz > 0 {
+    let (mut loaded_libs, lib_paths) = if !dyn_info.needed_strtab_offsets.is_empty() && dyn_info.strsz > 0 {
         let strtab_file_off = vaddr_to_file_offset(&layout.segments, dyn_info.strtab_vaddr);
         let strtab_data = read_file_range(backing.as_ref(), strtab_file_off, dyn_info.strsz as usize);
 
         let exe_dir = path.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
         let mut libs = Vec::new();
+        let mut lib_paths_vec = Vec::new();
 
         for &name_offset in &dyn_info.needed_strtab_offsets {
             let name_off = name_offset as usize;
@@ -1257,6 +1273,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
 
             // Check the shared library cache first
             if let Some(lib) = elf::try_clone_cached(&lib_path) {
+                lib_paths_vec.push(lib_path);
                 libs.push(lib);
                 continue;
             }
@@ -1286,6 +1303,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
                         lib_name, lib.phys_base, lib.sym_count,
                         (t_load1 - t_load0) / 1_000_000, (t_load2 - t_load1) / 1_000_000);
                     let lib = elf::cache_loaded_lib_pub(&lib_path, lib, rw_vaddr, rw_end_vaddr);
+                    lib_paths_vec.push(lib_path);
                     libs.push(lib);
                 }
                 Err(e) => {
@@ -1342,9 +1360,9 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
             // VMA addresses are assigned (user_base must be correct for GOT values).
         }
 
-        libs
+        (libs, lib_paths_vec)
     } else {
-        Vec::new()
+        (Vec::new(), Vec::new())
     };
 
     let t_deps = crate::clock::nanos_since_boot();
@@ -1361,7 +1379,9 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
                 let phys = DirectMap::phys_of(alloc.ptr());
                 let (vaddr, _) = vma_map(&mut vmas, &child_pt, phys, alloc.size() as u64)
                     .expect("spawn: out of virtual address space for lib");
+                let delta = vaddr.raw() as i64 - lib.user_base.raw() as i64;
                 lib.user_base = vaddr;
+                lib.user_end = (lib.user_end as i64 + delta) as u64;
             }
             elf::LibMemory::Shared { rw_alloc, cached_image, rw_offset, .. } => {
                 let cached_phys = cached_image.phys();
@@ -1374,7 +1394,9 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
                     let phys = rw_phys + i as u64 * PAGE_2M;
                     child_pt.lock().remap(UserAddr::new(user_virt), phys, true);
                 }
+                let delta = lib_vaddr.raw() as i64 - lib.user_base.raw() as i64;
                 lib.user_base = lib_vaddr;
+                lib.user_end = (lib.user_end as i64 + delta) as u64;
             }
         }
     }
@@ -1646,6 +1668,11 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
         peak_memory: 0,
         alloc_count: 0,
         free_count: 0,
+        exe_path: String::from(path),
+        exe_eh_frame_hdr_vaddr: layout.eh_frame_hdr.map_or(0, |(v, _)| v),
+        exe_eh_frame_hdr_size: layout.eh_frame_hdr.map_or(0, |(_, s)| s),
+        exe_vaddr_max: base + layout.vaddr_max - layout.vaddr_min,
+        lib_paths,
     }));
 
     let mut guard = PROCESS_TABLE.lock();

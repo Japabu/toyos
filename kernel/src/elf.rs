@@ -125,6 +125,9 @@ struct CachedLib {
     jmprel: Option<KernelSlice>,
     gnu_hash: Option<KernelSlice>,
     relocs: CachedRelocs,
+    eh_frame_hdr_vaddr: u64,
+    eh_frame_hdr_size: u64,
+    user_end: u64,
 }
 
 static SO_CACHE: Lock<alloc::vec::Vec<(String, CachedLib)>> = Lock::new(alloc::vec::Vec::new());
@@ -178,6 +181,9 @@ fn cache_loaded_lib(path: &str, lib: LoadedLib, rw_vaddr: u64, rw_end_vaddr: u64
         jmprel: lib.jmprel,
         gnu_hash: lib.gnu_hash,
         relocs: relocs.clone(),
+        eh_frame_hdr_vaddr: lib.eh_frame_hdr_vaddr,
+        eh_frame_hdr_size: lib.eh_frame_hdr_size,
+        user_end: lib.user_end,
     };
     SO_CACHE.lock().push((String::from(path), cached));
 
@@ -190,6 +196,8 @@ fn cache_loaded_lib(path: &str, lib: LoadedLib, rw_vaddr: u64, rw_end_vaddr: u64
         tls_template: lib.tls_template, tls_memsz: lib.tls_memsz, tls_align: lib.tls_align,
         rela: lib.rela, jmprel: lib.jmprel, gnu_hash: lib.gnu_hash,
         cached_relocs: Some(relocs),
+        eh_frame_hdr_vaddr: lib.eh_frame_hdr_vaddr, eh_frame_hdr_size: lib.eh_frame_hdr_size,
+        user_end: lib.user_end,
     }
 }
 
@@ -242,6 +250,9 @@ fn clone_from_cache(cached: &CachedLib) -> Option<LoadedLib> {
         jmprel: cached.jmprel,
         gnu_hash: cached.gnu_hash,
         cached_relocs: Some(cached.relocs.clone()),
+        eh_frame_hdr_vaddr: cached.eh_frame_hdr_vaddr,
+        eh_frame_hdr_size: cached.eh_frame_hdr_size,
+        user_end: cached.user_end,
     })
 }
 
@@ -299,6 +310,8 @@ pub struct ElfLayout {
     pub dynamic: Option<(u64, u64)>,
     /// Section header table location (e_shoff, e_shnum, e_shentsize) for loading symbols.
     pub section_headers: Option<(u64, u16, u16)>,
+    /// PT_GNU_EH_FRAME segment: (vaddr, memsz). Used for DWARF unwinding.
+    pub eh_frame_hdr: Option<(u64, u64)>,
 }
 
 /// Parsed DT_* entries from a PT_DYNAMIC segment.
@@ -375,6 +388,7 @@ pub fn parse_layout(data: &[u8]) -> Result<ElfLayout, &'static str> {
     let mut tls_memsz = 0usize;
     let mut tls_align = 0usize;
     let mut dynamic = None;
+    let mut eh_frame_hdr = None;
 
     for phdr in phdrs.iter() {
         match phdr.p_type {
@@ -398,6 +412,9 @@ pub fn parse_layout(data: &[u8]) -> Result<ElfLayout, &'static str> {
             PT_DYNAMIC => {
                 dynamic = Some((phdr.p_offset, phdr.p_filesz));
             }
+            0x6474e550 /* PT_GNU_EH_FRAME */ => {
+                eh_frame_hdr = Some((phdr.p_vaddr, phdr.p_memsz));
+            }
             _ => {}
         }
     }
@@ -417,6 +434,7 @@ pub fn parse_layout(data: &[u8]) -> Result<ElfLayout, &'static str> {
         tls_vaddr, tls_filesz, tls_memsz, tls_align,
         dynamic,
         section_headers,
+        eh_frame_hdr,
     })
 }
 
@@ -713,6 +731,12 @@ pub struct LoadedLib {
     pub jmprel: Option<KernelSlice>,
     pub gnu_hash: Option<KernelSlice>,
     pub cached_relocs: Option<CachedRelocs>,
+    /// .eh_frame_hdr vaddr (relative to module base, from PT_GNU_EH_FRAME).
+    pub eh_frame_hdr_vaddr: u64,
+    /// .eh_frame_hdr size.
+    pub eh_frame_hdr_size: u64,
+    /// Virtual address extent (user_base + vaddr_max).
+    pub user_end: u64,
 }
 
 impl LoadedLib {
@@ -954,12 +978,21 @@ pub fn load_shared_lib(data: &[u8]) -> Result<(LoadedLib, u64, u64), &'static st
     let mut tls_template: Option<KernelSlice> = None;
     let mut tls_memsz = 0usize;
     let mut tls_align = 0usize;
+    let mut eh_frame_hdr_vaddr = 0u64;
+    let mut eh_frame_hdr_size = 0u64;
     for phdr in segments.iter() {
-        if phdr.p_type == PT_TLS {
-            let off = (phdr.p_vaddr - vaddr_min) as usize;
-            tls_template = Some(image.subslice(off, phdr.p_filesz as usize));
-            tls_memsz = phdr.p_memsz as usize;
-            tls_align = phdr.p_align as usize;
+        match phdr.p_type {
+            PT_TLS => {
+                let off = (phdr.p_vaddr - vaddr_min) as usize;
+                tls_template = Some(image.subslice(off, phdr.p_filesz as usize));
+                tls_memsz = phdr.p_memsz as usize;
+                tls_align = phdr.p_align as usize;
+            }
+            0x6474e550 /* PT_GNU_EH_FRAME */ => {
+                eh_frame_hdr_vaddr = phdr.p_vaddr;
+                eh_frame_hdr_size = phdr.p_memsz;
+            }
+            _ => {}
         }
     }
 
@@ -973,7 +1006,10 @@ pub fn load_shared_lib(data: &[u8]) -> Result<(LoadedLib, u64, u64), &'static st
         image, dynsym, dynstr, sym_count,
         tls_template, tls_memsz, tls_align,
         rela: rela_slice, jmprel: jmprel_slice, gnu_hash: gnu_hash_slice,
-        cached_relocs: None }, rw_vaddr, rw_end_vaddr))
+        cached_relocs: None,
+        eh_frame_hdr_vaddr, eh_frame_hdr_size,
+        user_end: base_phys + vaddr_max - vaddr_min,
+    }, rw_vaddr, rw_end_vaddr))
 }
 
 /// Rebase all R_X86_64_RELATIVE relocation entries by adding `delta` to each value.

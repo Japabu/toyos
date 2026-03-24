@@ -82,6 +82,7 @@ pub const SYS_CONNECT: u64 = 87;
 pub const SYS_TLS_ALLOC_BLOCK: u64 = 88;
 pub const SYS_IO_URING_SETUP: u64 = 89;
 pub const SYS_IO_URING_ENTER: u64 = 90;
+pub const SYS_QUERY_MODULES: u64 = 91;
 
 pub const WNOHANG: u64 = 1;
 
@@ -924,4 +925,38 @@ pub fn io_uring_setup(depth: u32) -> Result<(Fd, u32), SyscallError> {
 pub fn io_uring_enter(fd: Fd, to_submit: u32, min_complete: u32, timeout_nanos: u64) -> Result<u32, SyscallError> {
     check(syscall(SYS_IO_URING_ENTER, fd.0 as u64, to_submit as u64, min_complete as u64, timeout_nanos))
         .map(|n| n as u32)
+}
+
+// --- Module info (for stack unwinding / backtraces) ---
+
+/// Information about a loaded module (executable or shared library).
+///
+/// Buffer layout returned by `SYS_QUERY_MODULES`:
+///   `[ModuleInfo; count]` followed by packed path strings.
+///   Each `ModuleInfo::path_offset` is relative to the start of the buffer.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ModuleInfo {
+    /// Load base address (bias) of this module.
+    pub base: u64,
+    /// End of the last mapped segment (base + vaddr_max).
+    pub text_end: u64,
+    /// Absolute virtual address of `.eh_frame_hdr` (0 if none).
+    pub eh_frame_hdr: u64,
+    /// Size of `.eh_frame_hdr` in bytes.
+    pub eh_frame_hdr_size: u64,
+    /// Byte offset of the module's path string within the buffer.
+    pub path_offset: u32,
+    /// Length of the path string in bytes.
+    pub path_len: u32,
+}
+
+/// Query all loaded modules (exe + dlopen'd libs) in the current process.
+///
+/// Writes an array of `ModuleInfo` followed by path strings into `buf`.
+/// Returns the number of modules on success.
+/// Returns `Err(InvalidArgument)` with the required buffer size encoded
+/// if `buf` is too small.
+pub fn query_modules(buf: &mut [u8]) -> Result<usize, SyscallError> {
+    check(syscall(SYS_QUERY_MODULES, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0)).map(|n| n as usize)
 }
