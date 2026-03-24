@@ -28,10 +28,11 @@ pub struct QemuInstance {
 fn prepare_boot(
     c_tests: &[(String, Vec<u8>)],
     rust_tests: &[(String, Vec<u8>)],
+    debug_wait: bool,
 ) -> (PathBuf, PathBuf, PathBuf) {
     let repo = compile::repo_root();
 
-    build_kernel(&repo);
+    build_kernel(&repo, debug_wait);
     build_bootloader(&repo);
 
     let mut initrd_files: Vec<(String, Vec<u8>)> = Vec::new();
@@ -124,7 +125,7 @@ fn qemu_command(boot_image: &Path, nvme_image: &Path, repo: &Path, gdb_stub: boo
 
 /// Spawn QEMU and wait for the test-runner to signal ===READY===.
 /// Returns the QemuInstance with serial I/O channels.
-fn spawn_and_wait_ready(mut qemu: Command) -> QemuInstance {
+fn spawn_and_wait_ready(mut qemu: Command, no_timeout: bool) -> QemuInstance {
     qemu.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
@@ -157,7 +158,7 @@ fn spawn_and_wait_ready(mut qemu: Command) -> QemuInstance {
     let boot_timeout = Duration::from_secs(10);
     let start = Instant::now();
     loop {
-        if start.elapsed() > boot_timeout {
+        if !no_timeout && start.elapsed() > boot_timeout {
             let _ = child.kill();
             panic!("[qemu] Boot timed out waiting for ===READY===");
         }
@@ -166,7 +167,7 @@ fn spawn_and_wait_ready(mut qemu: Command) -> QemuInstance {
                 eprintln!("[qemu] Test runner ready");
                 break;
             }
-            Ok(ref line) if line.contains("SEGFAULT") || line.contains("KERNEL PANIC") => {
+            Ok(ref line) if !no_timeout && (line.contains("SEGFAULT") || line.contains("KERNEL PANIC")) => {
                 let _ = child.kill();
                 panic!("[qemu] Init process crashed during boot: {line}");
             }
@@ -194,18 +195,21 @@ impl QemuInstance {
         c_tests: &[(String, Vec<u8>)],
         rust_tests: &[(String, Vec<u8>)],
     ) -> Self {
-        Self::boot_with_options(c_tests, rust_tests, false)
+        Self::boot_with_options(c_tests, rust_tests, false, false)
     }
 
-    /// Boot QEMU with configurable GDB stub.
+    /// Boot QEMU with configurable GDB stub and kernel debug-wait.
+    /// When `debug_wait` is true, the kernel spins until released via LLDB and
+    /// the boot timeout is disabled.
     pub fn boot_with_options(
         c_tests: &[(String, Vec<u8>)],
         rust_tests: &[(String, Vec<u8>)],
         gdb_stub: bool,
+        debug_wait: bool,
     ) -> Self {
-        let (boot_image, nvme_image, repo) = prepare_boot(c_tests, rust_tests);
+        let (boot_image, nvme_image, repo) = prepare_boot(c_tests, rust_tests, debug_wait);
         let qemu = qemu_command(&boot_image, &nvme_image, &repo, gdb_stub);
-        spawn_and_wait_ready(qemu)
+        spawn_and_wait_ready(qemu, debug_wait)
     }
 
     /// Get mutable access to QEMU's stdin (serial input).
@@ -312,11 +316,15 @@ impl Drop for QemuInstance {
 }
 
 /// Build the kernel. Uses the `toyos` toolchain (linked by the main build system).
-fn build_kernel(repo: &Path) {
+fn build_kernel(repo: &Path, debug_wait: bool) {
     let path_env = path_with_toyos_ld(repo);
+    let mut args = vec!["build", "--target", "x86_64-unknown-none"];
+    if debug_wait {
+        args.extend(["--features", "debug-wait"]);
+    }
     assert!(
         Command::new("cargo")
-            .args(["build", "--target", "x86_64-unknown-none"])
+            .args(&args)
             .current_dir(repo.join("kernel"))
             .env("RUSTUP_TOOLCHAIN", "toyos")
             .env("PATH", &path_env)

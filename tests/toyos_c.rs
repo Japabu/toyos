@@ -218,7 +218,7 @@ fn debug() {
     }
 
     eprintln!("[debug] Booting QEMU in debug mode with {} test binaries...", c_test_bins.len());
-    let mut qemu = QemuInstance::boot_with_options(&c_test_bins, &[], true);
+    let mut qemu = QemuInstance::boot_with_options(&c_test_bins, &[], true, true);
 
     let repo = compile::repo_root();
     let kernel_elf = repo.join("kernel/target/x86_64-unknown-none/debug/kernel");

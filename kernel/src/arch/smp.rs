@@ -73,9 +73,10 @@ struct TrampolineData {
     lm64_far: FarPointer,                    // +0x68 (6 bytes)
     _pad5: [u8; 2],                          // +0x6E
     cs_reload_addr: u64,                     // +0x70
+    percpu_ptr: u64,                         // +0x78
 }
 
-const _: () = assert!(size_of::<TrampolineData>() == 0x78);
+const _: () = assert!(size_of::<TrampolineData>() == 0x80);
 
 // ---- Trampoline blob (linked into .text, copied to 0x8000 at runtime) ----
 
@@ -164,6 +165,7 @@ fn build_trampoline_data() -> TrampolineData {
         lm64_far: FarPointer { offset: lm64_addr, selector: 0x18 },
         _pad5: [0; 2],
         cs_reload_addr,
+        percpu_ptr: 0, // filled per-AP
     }
 }
 
@@ -181,6 +183,7 @@ pub fn boot_aps(madt: &MadtInfo, boot_cr3: u64) {
     data.cr3 = boot_cr3;
     let target = crate::DirectMap::from_phys(TRAMPOLINE_PAGE + DATA_OFFSET as u64).as_mut_ptr::<TrampolineData>();
 
+    let mut next_cpu_id = 1u32; // BSP is 0
     for &ap_id in &madt.apic_ids {
         if ap_id == bsp_id { continue; }
 
@@ -188,8 +191,13 @@ pub fn boot_aps(madt: &MadtInfo, boot_cr3: u64) {
         let stack_base = unsafe { alloc_zeroed(stack_layout) };
         assert!(!stack_base.is_null(), "SMP: failed to allocate AP stack");
 
+        let ap_cpu_id = next_cpu_id;
+        next_cpu_id += 1;
+        let ap_percpu = percpu::alloc_ap(ap_cpu_id, ap_id as u32);
+
         data.stack_top = stack_base as u64 + AP_STACK_SIZE as u64;
         data.entry = ap_entry as *const () as u64;
+        data.percpu_ptr = ap_percpu as u64;
         unsafe { core::ptr::write_unaligned(target, data); }
 
         AP_STARTED.store(false, Ordering::Release);
@@ -227,15 +235,13 @@ extern "C" fn ap_entry() -> ! {
     // We're already executing at a high-half address, so this is safe.
     unsafe { cpu::write_cr3(crate::mm::paging::kernel().lock().as_ref().unwrap().cr3()); }
 
-    let lapic_id = apic::id();
-    let cpu_id = NEXT_CPU_ID.fetch_add(1, Ordering::Relaxed);
-
-    percpu::init_ap(cpu_id, lapic_id as u32);
+    // GS base was set by the trampoline; finish percpu init (GDT, SSE, SMAP).
+    percpu::init_ap(percpu::percpu_ptr());
     syscall::init();
     apic::init_ap();
     apic::init_timer_ap();
 
-    log!("Hello from CPU {} (LAPIC ID {})", cpu_id, lapic_id);
+    log!("Hello from CPU {} (LAPIC ID {})", percpu::cpu_id(), apic::id());
     AP_STARTED.store(true, Ordering::Release);
 
     // Wait for BSP to finish kernel init
@@ -243,7 +249,7 @@ extern "C" fn ap_entry() -> ! {
         core::hint::spin_loop();
     }
 
-    log!("CPU {}: joining scheduler", cpu_id);
+    log!("CPU {}: joining scheduler", percpu::cpu_id());
     process::ap_idle();
 }
 
@@ -340,7 +346,16 @@ global_asm!(
     "mov gs, ax",
     "mov ss, ax",
 
-    // Load kernel IDT
+    // Set GS base to percpu pointer (IA32_GS_BASE MSR 0xC0000101)
+    // Must happen before IDT load so page fault handlers can access percpu.
+    "mov edi, 0x8F00",
+    "mov rax, [rdi + 0x78]",  // TrampolineData.percpu_ptr
+    "mov rdx, rax",
+    "shr rdx, 32",
+    "mov ecx, 0xC0000101",    // IA32_GS_BASE
+    "wrmsr",
+
+    // Load kernel IDT (safe now — percpu/GS is set up)
     "mov edi, 0x8F00",
     "lidt [rdi + 0x28]",       // TrampolineData.kernel_idt
 

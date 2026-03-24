@@ -3,14 +3,7 @@ use core::arch::naked_asm;
 use crate::arch::{cpu, debug, syscall, percpu};
 use crate::{log, process};
 
-use core::sync::atomic::{AtomicBool, Ordering};
-
 use super::{Vector, SavedRegs, InterruptFrame, RPL_MASK, PF_PRESENT, PF_WRITE, PF_INSTRUCTION_FETCH};
-
-/// Guards against recursive page faults (e.g. from debug-mode ptr::add precondition checks).
-static IN_PAGE_FAULT: AtomicBool = AtomicBool::new(false);
-/// Guards against re-entry into fatal_exception (log!() triggering an unresolvable fault).
-static IN_FATAL: AtomicBool = AtomicBool::new(false);
 
 /// Write bytes to serial port 0x3F8 using raw port I/O.
 /// No fmt, no allocation, no ptr::add — cannot cause recursive faults.
@@ -392,7 +385,7 @@ extern "sysv64" fn double_fault_handler(regs: *const SavedRegs) -> ! {
 /// Returns normally if the fault was resolved (page mapped in).
 /// Diverges (never returns) if the fault is fatal.
 extern "sysv64" fn page_fault_handler(regs: *const SavedRegs) {
-    if IN_PAGE_FAULT.swap(true, Ordering::SeqCst) {
+    if percpu::swap_in_page_fault(true) {
         // Recursive page fault — we're already handling one. This happens when
         // log!() in fatal_exception triggers a debug-mode ptr::add precondition
         // check fault. Don't try to handle it; let the fault fall through to
@@ -445,7 +438,7 @@ extern "sysv64" fn page_fault_handler(regs: *const SavedRegs) {
         let is_user = frame.cs & RPL_MASK != 0;
         if is_user || percpu::current_tid().is_some() {
             if process::handle_page_fault(fault_addr, frame.error_code) {
-                IN_PAGE_FAULT.store(false, Ordering::Relaxed);
+                percpu::set_in_page_fault(false);
                 return;
             }
             // Demand paging failed
@@ -554,7 +547,7 @@ extern "sysv64" fn exception_handler(raw_vector: u64, regs: *const SavedRegs) ->
 /// Step 3: Terminate (kill process for user faults, halt for kernel faults).
 fn fatal_exception(ctx: &ExceptionContext) -> ! {
     let is_user = ctx.is_user_fault();
-    let recursive = IN_FATAL.swap(true, Ordering::SeqCst);
+    let recursive = percpu::swap_in_fatal(true);
 
     // === Step 1: Raw serial preamble (always, even on recursive entry) ===
     let tid_raw = percpu::current_tid().map_or(u32::MAX, |t| t.raw());
@@ -582,8 +575,8 @@ fn fatal_exception(ctx: &ExceptionContext) -> ! {
         // Re-entered fatal_exception (log!() triggered an unresolvable fault).
         // Step 1 already printed the basics on both entries. Just terminate.
         if is_user {
-            IN_FATAL.store(false, Ordering::SeqCst);
-            IN_PAGE_FAULT.store(false, Ordering::SeqCst);
+            percpu::set_in_fatal(false);
+            percpu::set_in_page_fault(false);
             syscall::kill_process(-1);
         }
         cpu::halt();
@@ -592,7 +585,7 @@ fn fatal_exception(ctx: &ExceptionContext) -> ! {
     // Reset IN_PAGE_FAULT so log!() can trigger normal (resolvable) page faults
     // like demand paging. Unresolvable faults will re-enter fatal_exception
     // where IN_FATAL catches the recursion.
-    IN_PAGE_FAULT.store(false, Ordering::SeqCst);
+    percpu::set_in_page_fault(false);
 
     // === Step 2: Rich diagnostics via log!() ===
     let tid = percpu::current_tid().unwrap_or(crate::process::Tid(0));
@@ -704,8 +697,8 @@ fn fatal_exception(ctx: &ExceptionContext) -> ! {
 
     // === Step 3: Terminate ===
     if is_user {
-        IN_FATAL.store(false, Ordering::SeqCst);
-        IN_PAGE_FAULT.store(false, Ordering::SeqCst);
+        percpu::set_in_fatal(false);
+        percpu::set_in_page_fault(false);
         syscall::kill_process(-1);
     }
     cpu::halt();

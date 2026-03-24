@@ -65,6 +65,10 @@ pub struct PerCpu {
     pub syscall_num: u64,  // offset 224
     /// Saved user RBP at last syscall entry (for panic diagnostics).
     pub syscall_rbp: u64,  // offset 232
+    /// Per-CPU guard against recursive page faults.
+    pub in_page_fault: bool,
+    /// Per-CPU guard against re-entry into fatal_exception.
+    pub in_fatal: bool,
 }
 
 // GDT layout:
@@ -209,21 +213,26 @@ pub fn init_bsp(lapic_id: u32) {
     log!("percpu: BSP cpu_id=0 lapic_id={}", lapic_id);
 }
 
-/// Initialize per-CPU data for an AP. Called from ap_entry.
-pub fn init_ap(cpu_id: u32, lapic_id: u32) {
+/// Allocate percpu for an AP on the BSP. Returns the raw pointer for the trampoline
+/// to write into IA32_GS_BASE before loading the IDT.
+pub fn alloc_ap(cpu_id: u32, lapic_id: u32) -> *mut PerCpu {
     let ptr = alloc_percpu(cpu_id, lapic_id);
     let percpu = unsafe { &mut *ptr };
-
     alloc_idle_stack(percpu);
     alloc_ist1_stack(percpu);
+    ptr
+}
+
+/// Finish AP percpu initialization (called from ap_entry after GS base is set by trampoline).
+pub fn init_ap(percpu_ptr: *mut PerCpu) {
+    let percpu = unsafe { &mut *percpu_ptr };
     unsafe { percpu.load_gdt(); }
     cpu::enable_sse();
     cpu::enable_smap();
+    // GS base already set by trampoline; set KERNEL_GS_BASE too for swapgs.
+    cpu::wrmsr(MSR_KERNEL_GS_BASE, percpu_ptr as u64);
 
-    cpu::wrmsr(MSR_GS_BASE, ptr as u64);
-    cpu::wrmsr(MSR_KERNEL_GS_BASE, ptr as u64);
-
-    log!("percpu: AP cpu_id={} lapic_id={}", cpu_id, lapic_id);
+    log!("percpu: AP cpu_id={} lapic_id={}", percpu.cpu_id, percpu.lapic_id);
 }
 
 /// Update both the percpu kernel_rsp (for syscall entry) and tss.rsp0 (for interrupts).
@@ -258,7 +267,7 @@ pub fn set_current_tid(tid: Option<crate::process::Tid>) {
     unsafe { core::arch::asm!("mov gs:[136], {:e}", in(reg) raw, options(nostack, preserves_flags)); }
 }
 
-fn percpu_ptr() -> *mut PerCpu {
+pub fn percpu_ptr() -> *mut PerCpu {
     let p: *mut PerCpu;
     unsafe { core::arch::asm!("mov {}, gs:[0]", out(reg) p, options(nomem, nostack, preserves_flags)); }
     p
@@ -297,5 +306,31 @@ pub fn user_rsp() -> u64 {
 /// User RBP saved at last syscall entry (for panic diagnostics).
 pub fn syscall_rbp() -> u64 {
     unsafe { (*percpu_ptr()).syscall_rbp }
+}
+
+/// Swap the per-CPU page fault recursion guard. Returns the previous value.
+pub fn swap_in_page_fault(val: bool) -> bool {
+    let p = unsafe { &mut (*percpu_ptr()).in_page_fault };
+    let old = *p;
+    *p = val;
+    old
+}
+
+/// Set the per-CPU page fault recursion guard.
+pub fn set_in_page_fault(val: bool) {
+    unsafe { (*percpu_ptr()).in_page_fault = val; }
+}
+
+/// Swap the per-CPU fatal exception recursion guard. Returns the previous value.
+pub fn swap_in_fatal(val: bool) -> bool {
+    let p = unsafe { &mut (*percpu_ptr()).in_fatal };
+    let old = *p;
+    *p = val;
+    old
+}
+
+/// Set the per-CPU fatal exception recursion guard.
+pub fn set_in_fatal(val: bool) {
+    unsafe { (*percpu_ptr()).in_fatal = val; }
 }
 
