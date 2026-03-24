@@ -124,7 +124,17 @@ fn full_bootstrap(root: &Path, rust_dir: &Path) {
     let toyos_ld = toyos_ld_binary(root);
 
     // Write bootstrap.toml — ToyOS as target only, not host (fast rebuilds)
-    write_config(rust_dir, &host_triple(), &toyos_ld, false);
+    let host = host_triple();
+    write_config(rust_dir, &host, &toyos_ld, false);
+
+    // Clean cached std for all ToyOS targets so bootstrap picks up compiler changes
+    // (e.g. target spec changes like default_uwtable that affect codegen).
+    for target in ["x86_64-unknown-toyos", "x86_64-unknown-none", "x86_64-unknown-uefi"] {
+        let stage1_std = rust_dir.join(format!("build/{host}/stage1-std/{target}"));
+        if stage1_std.exists() {
+            fs::remove_dir_all(&stage1_std).ok();
+        }
+    }
 
     // Run full bootstrap
     let x = if rust_dir.join("x").exists() { "./x" } else { "./x.py" };
@@ -137,7 +147,6 @@ fn full_bootstrap(root: &Path, rust_dir: &Path) {
 
     if !status.success() {
         // Check if essential artifacts exist (rustdoc for ToyOS may fail, that's ok)
-        let host = host_triple();
         let stage2 = rust_dir.join(format!("build/{host}/stage2"));
         assert!(
             stage2.join("bin/rustc").exists(),

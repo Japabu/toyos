@@ -326,7 +326,8 @@ fn collect_hosted_rustc(root: &Path, initrd_files: &mut Vec<(String, Vec<u8>)>) 
 
 /// Build kernel and bootloader for tests. Ensures toolchain is up to date first.
 /// The bootloader uses `/bin/test-runner` as init.
-pub fn build_for_tests(root: &Path, debug_wait: bool) {
+/// Returns the ChangeSet so callers can react to linker/std changes.
+pub fn build_for_tests(root: &Path, debug_wait: bool) -> crate::toolchain::ChangeSet {
     let changes = crate::toolchain::ensure(root, false);
     let path_env = crate::toolchain::path_with_toyos_ld(root);
     let rustflags = "-Dwarnings".to_string();
@@ -341,10 +342,25 @@ pub fn build_for_tests(root: &Path, debug_wait: bool) {
                 fs::remove_dir_all(&dir).ok();
             }
         }
+    } else if changes.linker_changed {
+        // Linker changed — cargo doesn't track the linker binary, so we must
+        // delete final executables to force re-linking without full recompilation.
+        eprintln!("linker changed: forcing re-link of userland binaries");
+        let ws_target = root.join("userland/target/x86_64-unknown-toyos/debug");
+        if ws_target.exists() {
+            // Delete all ELF executables (not .d, .rlib, etc.)
+            for entry in fs::read_dir(&ws_target).into_iter().flatten().flatten() {
+                let path = entry.path();
+                if path.is_file() && path.extension().is_none() {
+                    fs::remove_file(&path).ok();
+                }
+            }
+        }
     }
 
     build_kernel(root, debug_wait, false, &rustflags, &path_env);
     build_bootloader(root, false, &rustflags, &path_env, "/bin/test-runner");
+    changes
 }
 
 /// Build a ToyOS userland crate. Returns (binary_name, binary_bytes).
