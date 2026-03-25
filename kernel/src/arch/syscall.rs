@@ -1182,6 +1182,9 @@ fn sys_dlopen(path: &str) -> u64 {
                 let (vaddr, _) = process::vma_map(&mut data.vmas, &pt, phys, alloc.size() as u64)
                     .expect("dlopen: out of virtual address space");
                 let delta = vaddr.raw() as i64 - lib.user_base.raw() as i64;
+                if delta != 0 {
+                    crate::elf::fixup_relative_relocs(&lib, delta);
+                }
                 lib.user_base = vaddr;
                 lib.user_end = (lib.user_end as i64 + delta) as u64;
             }
@@ -1199,6 +1202,9 @@ fn sys_dlopen(path: &str) -> u64 {
                 cpu::flush_tlb();
                 apic::tlb_shootdown();
                 let delta = lib_vaddr.raw() as i64 - lib.user_base.raw() as i64;
+                if delta != 0 {
+                    crate::elf::fixup_relative_relocs(&lib, delta);
+                }
                 lib.user_base = lib_vaddr;
                 lib.user_end = (lib.user_end as i64 + delta) as u64;
             }

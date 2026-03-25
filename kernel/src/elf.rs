@@ -932,9 +932,10 @@ pub fn load_shared_lib(data: &[u8]) -> Result<(LoadedLib, u64, u64), &'static st
         let off = (gnu_hash_vaddr - vaddr_min) as usize;
         Some(image.subslice(off, image.size() - off))
     } else { None };
-    let sym_count = if let Some(ref gh) = gnu_hash_slice {
-        gnu_hash_sym_count(gh)
-    } else {
+    // Determine symbol count. Prefer section header sh_size (includes all symbols:
+    // null + hashed exports + unhashed imports). The .gnu_hash only covers hashed
+    // exports, so gnu_hash_sym_count underreports when imports exist.
+    let sym_count = {
         let mut count = 0;
         if let Some(shdrs) = elf.section_headers() {
             for shdr in shdrs.iter() {
@@ -942,6 +943,11 @@ pub fn load_shared_lib(data: &[u8]) -> Result<(LoadedLib, u64, u64), &'static st
                     count = (shdr.sh_size / shdr.sh_entsize.max(SYM_SIZE as u64)) as usize;
                     break;
                 }
+            }
+        }
+        if count == 0 {
+            if let Some(ref gh) = gnu_hash_slice {
+                count = gnu_hash_sym_count(gh);
             }
         }
         count
@@ -1087,6 +1093,41 @@ pub fn resolve_lib_bind_relocs_pub(
     libs: &[LoadedLib],
 ) {
     resolve_lib_bind_relocs(lib, exe_sym_map, libs);
+}
+
+/// Adjust all R_X86_64_RELATIVE relocations by delta.
+/// Called when a library's user_base differs from the base used during initial relocation.
+/// For Owned libs, writes directly to the image. For Shared libs, writes to the private
+/// RW copy (RELATIVE relocs always target the RW data segment, never RO text).
+pub fn fixup_relative_relocs(lib: &LoadedLib, delta: i64) {
+    let (rw_base, rw_offset) = match &lib.memory {
+        LibMemory::Shared { rw_alloc, rw_offset, .. } => {
+            (Some(rw_alloc.ptr()), *rw_offset)
+        }
+        _ => (None, 0),
+    };
+
+    for table in [&lib.rela, &lib.jmprel] {
+        let Some(table) = table else { continue };
+        let n = table.size() / RELA_SIZE as usize;
+        for i in 0..n {
+            let rela = unsafe { table.read::<Elf64_Rela>(i * RELA_SIZE as usize) };
+            if rela_type(&rela) != R_X86_64_RELATIVE { continue; }
+
+            let offset = rela.r_offset as usize;
+            if let Some(rw_ptr) = rw_base {
+                // Shared: write to private RW copy
+                let rw_off = offset - rw_offset;
+                let ptr = unsafe { rw_ptr.add(rw_off) as *mut u64 };
+                let old = unsafe { core::ptr::read_unaligned(ptr) };
+                unsafe { core::ptr::write_unaligned(ptr, (old as i64 + delta) as u64); }
+            } else {
+                // Owned: write to image directly
+                let old = unsafe { lib.image.read::<u64>(offset) };
+                unsafe { lib.image.write::<u64>(offset, (old as i64 + delta) as u64); }
+            }
+        }
+    }
 }
 
 /// Public wrapper for gnu_dlsym.
