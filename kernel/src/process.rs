@@ -967,7 +967,6 @@ pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64, stack_base: u64) -> Op
         blocked_since: 0,
     };
     scheduler::enqueue_new(ctx);
-
     Some(tid)
 }
 
@@ -1197,7 +1196,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
     };
 
     // 3b. Parse PT_DYNAMIC from block map (not available in the header buffer)
-    let dyn_info = if let Some((dyn_off, dyn_size)) = layout.dynamic {
+    let dyn_info = if let Some((dyn_off, _, dyn_size)) = layout.dynamic {
         let dyn_data = read_file_range(backing.as_ref(), dyn_off, dyn_size as usize);
         elf::parse_dynamic(&dyn_data)
     } else {
@@ -1278,30 +1277,29 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
                 continue;
             }
 
-            let so_data = {
-                let result = vfs::lock().read_file(&lib_path);
-                match result {
-                    Ok(d) => d,
-                    Err(_) => {
+            let so_backing = {
+                let b = vfs::lock().open_backing(&lib_path);
+                match b {
+                    Some(b) => b,
+                    None => {
                         let fallback = alloc::format!("/lib/{}", lib_name);
-                        match vfs::lock().read_file(&fallback) {
-                            Ok(d) => d,
-                            Err(e) => {
-                                log!("spawn: {}: failed to load {}: {}", path, lib_name, e);
+                        match vfs::lock().open_backing(&fallback) {
+                            Some(b) => b,
+                            None => {
+                                log!("spawn: {}: failed to load {}: not found", path, lib_name);
                                 return Err(SyscallError::NotFound);
                             }
                         }
                     }
                 }
             };
-            let t_load1 = crate::clock::nanos_since_boot();
 
-            match elf::load_shared_lib(&so_data) {
+            match elf::load_shared_lib(so_backing.as_ref()) {
                 Ok((lib, rw_vaddr, rw_end_vaddr)) => {
-                    let t_load2 = crate::clock::nanos_since_boot();
-                    log!("dynamic: loaded {} base={:#x} ({} syms, read={}ms load={}ms)",
+                    let t_load1 = crate::clock::nanos_since_boot();
+                    log!("dynamic: loaded {} base={:#x} ({} syms, {}ms)",
                         lib_name, lib.phys_base, lib.sym_count,
-                        (t_load1 - t_load0) / 1_000_000, (t_load2 - t_load1) / 1_000_000);
+                        (t_load1 - t_load0) / 1_000_000);
                     let lib = elf::cache_loaded_lib_pub(&lib_path, lib, rw_vaddr, rw_end_vaddr);
                     lib_paths_vec.push(lib_path);
                     libs.push(lib);

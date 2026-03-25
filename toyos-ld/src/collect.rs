@@ -677,7 +677,14 @@ fn merge_parsed_object(state: &mut LinkState, parsed: ParsedObject, obj_idx: Obj
         }
         match state.globals.get(&name) {
             Some(SymbolDef::Defined { .. }) => {}
-            _ => { state.globals.insert(name, def); }
+            _ => {
+                // When a local definition supersedes a shared library import,
+                // remove it from dynamic_imports so it won't get a GOT+GLOB_DAT entry.
+                if matches!(def, SymbolDef::Defined { .. }) {
+                    state.dynamic_imports.remove(&name);
+                }
+                state.globals.insert(name.clone(), def);
+            }
         }
     }
 
@@ -886,6 +893,14 @@ fn macho_x86_64_to_reloc_type(r_type: u8, r_length: u8) -> Option<RelocType> {
 
 pub(crate) fn is_archive(data: &[u8]) -> bool {
     data.starts_with(b"!<arch>\n") || data.starts_with(b"!<thin>\n")
+}
+
+/// Check if data is a shared library (ELF ET_DYN).
+pub(crate) fn is_shared_lib(data: &[u8]) -> bool {
+    // ELF magic + enough bytes for e_type at offset 16-17
+    data.len() >= 18
+        && data[..4] == [0x7f, b'E', b'L', b'F']
+        && u16::from_le_bytes([data[16], data[17]]) == elf::ET_DYN
 }
 
 pub(crate) fn extract_archive(name: &str, data: &[u8], out: &mut Vec<(String, Vec<u8>)>) -> Result<(), LinkError> {

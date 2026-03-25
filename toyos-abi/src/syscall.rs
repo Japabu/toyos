@@ -736,8 +736,23 @@ pub fn readlink(path: &[u8], buf: &mut [u8]) -> Result<usize, SyscallError> {
 // --- Dynamic linking ---
 
 /// Load a shared library (.so) into the current process.
+/// Runs .init_array constructors after loading.
 pub fn dl_open(path: &[u8]) -> Result<u64, SyscallError> {
-    check(syscall(SYS_DLOPEN, path.as_ptr() as u64, path.len() as u64, 0, 0))
+    let mut init_info: [u64; 2] = [0; 2];
+    let handle = check(syscall(SYS_DLOPEN, path.as_ptr() as u64, path.len() as u64, init_info.as_mut_ptr() as u64, 0))?;
+    // Run .init_array constructors (e.g. EH frame finder registration in cdylib std)
+    let init_array_ptr = init_info[0];
+    let init_count = init_info[1];
+    if init_array_ptr != 0 && init_count > 0 {
+        let entries = unsafe { core::slice::from_raw_parts(init_array_ptr as *const usize, init_count as usize) };
+        for &entry in entries {
+            if entry != 0 {
+                let f: extern "C" fn() = unsafe { core::mem::transmute(entry) };
+                f();
+            }
+        }
+    }
+    Ok(handle)
 }
 
 /// Look up a symbol in a loaded shared library. Returns the address.

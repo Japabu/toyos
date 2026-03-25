@@ -61,3 +61,49 @@ pub extern "C" fn dl_tls_scope_push(scope_id: u32) -> u32 {
 pub extern "C" fn dl_tls_scope_pop(restore_to: u32) -> u32 {
     CURRENT_SCOPE.with(|c| c.replace(restore_to))
 }
+
+/// Test catch_unwind inside a cdylib .so — verifies the .so's unwinding crate
+/// has its EH frame finder registered (via .init_array constructor).
+#[no_mangle]
+pub extern "C" fn dl_test_catch_unwind() -> u64 {
+    let result = std::panic::catch_unwind(|| {
+        panic!("intentional panic from .so");
+    });
+    if result.is_err() { 1 } else { 0 }
+}
+
+/// Test that Drop runs during unwind inside a cdylib .so.
+#[no_mangle]
+pub extern "C" fn dl_test_drop_during_unwind() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static DROP_COUNT: AtomicU64 = AtomicU64::new(0);
+    DROP_COUNT.store(0, Ordering::SeqCst);
+
+    struct Guard;
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            DROP_COUNT.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let result = std::panic::catch_unwind(|| {
+        let _g1 = Guard;
+        let _g2 = Guard;
+        panic!("unwind with guards");
+    });
+    if result.is_err() && DROP_COUNT.load(Ordering::SeqCst) == 2 { 1 } else { 0 }
+}
+
+/// Test catch_unwind on a thread spawned from inside the .so.
+#[no_mangle]
+pub extern "C" fn dl_test_thread_unwind() -> u64 {
+    let handle = std::thread::spawn(|| {
+        std::panic::catch_unwind(|| {
+            panic!("panic on .so thread");
+        }).is_err()
+    });
+    match handle.join() {
+        Ok(true) => 1,
+        _ => 0,
+    }
+}

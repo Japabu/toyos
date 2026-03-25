@@ -5,7 +5,6 @@ use crate::mm::{PAGE_2M, align_2m, DirectMap, KernelSlice};
 use crate::process::PageAlloc;
 use crate::UserAddr;
 use crate::sync::Lock;
-use elf::ElfBytes;
 use elf::endian::AnyEndian;
 use elf::file::{parse_ident, FileHeader};
 use elf::segment::{ProgramHeader, SegmentTable};
@@ -127,6 +126,8 @@ struct CachedLib {
     relocs: CachedRelocs,
     eh_frame_hdr_vaddr: u64,
     eh_frame_hdr_size: u64,
+    init_array_vaddr: u64,
+    init_array_size: u64,
     user_end: u64,
 }
 
@@ -183,6 +184,8 @@ fn cache_loaded_lib(path: &str, lib: LoadedLib, rw_vaddr: u64, rw_end_vaddr: u64
         relocs: relocs.clone(),
         eh_frame_hdr_vaddr: lib.eh_frame_hdr_vaddr,
         eh_frame_hdr_size: lib.eh_frame_hdr_size,
+        init_array_vaddr: lib.init_array_vaddr,
+        init_array_size: lib.init_array_size,
         user_end: lib.user_end,
     };
     SO_CACHE.lock().push((String::from(path), cached));
@@ -197,6 +200,7 @@ fn cache_loaded_lib(path: &str, lib: LoadedLib, rw_vaddr: u64, rw_end_vaddr: u64
         rela: lib.rela, jmprel: lib.jmprel, gnu_hash: lib.gnu_hash,
         cached_relocs: Some(relocs),
         eh_frame_hdr_vaddr: lib.eh_frame_hdr_vaddr, eh_frame_hdr_size: lib.eh_frame_hdr_size,
+        init_array_vaddr: lib.init_array_vaddr, init_array_size: lib.init_array_size,
         user_end: lib.user_end,
     }
 }
@@ -252,6 +256,8 @@ fn clone_from_cache(cached: &CachedLib) -> Option<LoadedLib> {
         cached_relocs: Some(cached.relocs.clone()),
         eh_frame_hdr_vaddr: cached.eh_frame_hdr_vaddr,
         eh_frame_hdr_size: cached.eh_frame_hdr_size,
+        init_array_vaddr: cached.init_array_vaddr,
+        init_array_size: cached.init_array_size,
         user_end: cached.user_end,
     })
 }
@@ -306,8 +312,8 @@ pub struct ElfLayout {
     pub tls_filesz: usize,
     pub tls_memsz: usize,
     pub tls_align: usize,
-    /// PT_DYNAMIC segment location (file_offset, size), or None if absent.
-    pub dynamic: Option<(u64, u64)>,
+    /// PT_DYNAMIC segment location (file_offset, vaddr, size), or None if absent.
+    pub dynamic: Option<(u64, u64, u64)>,
     /// Section header table location (e_shoff, e_shnum, e_shentsize) for loading symbols.
     pub section_headers: Option<(u64, u16, u16)>,
     /// PT_GNU_EH_FRAME segment: (vaddr, memsz). Used for DWARF unwinding.
@@ -410,7 +416,7 @@ pub fn parse_layout(data: &[u8]) -> Result<ElfLayout, &'static str> {
                 tls_align = phdr.p_align as usize;
             }
             PT_DYNAMIC => {
-                dynamic = Some((phdr.p_offset, phdr.p_filesz));
+                dynamic = Some((phdr.p_offset, phdr.p_vaddr, phdr.p_filesz));
             }
             0x6474e550 /* PT_GNU_EH_FRAME */ => {
                 eh_frame_hdr = Some((phdr.p_vaddr, phdr.p_memsz));
@@ -735,6 +741,10 @@ pub struct LoadedLib {
     pub eh_frame_hdr_vaddr: u64,
     /// .eh_frame_hdr size.
     pub eh_frame_hdr_size: u64,
+    /// .init_array vaddr (relative to ELF base, from DT_INIT_ARRAY).
+    pub init_array_vaddr: u64,
+    /// .init_array size in bytes (each entry is 8 bytes on x86_64).
+    pub init_array_size: u64,
     /// Virtual address extent (user_base + vaddr_max).
     pub user_end: u64,
 }
@@ -826,71 +836,72 @@ fn gnu_dlsym(lib: &LoadedLib, name: &str) -> Option<UserAddr> {
     None
 }
 
+/// Read from a file backing directly into a destination pointer.
+/// No heap allocation — reads 4KB at a time from the backing.
+fn read_backing_into(backing: &dyn crate::file_backing::FileBacking, offset: u64, dst: *mut u8, len: usize) {
+    let mut remaining = len;
+    let mut file_off = offset;
+    let mut buf_off = 0usize;
+    let mut page_buf = [0u8; 4096];
+    while remaining > 0 {
+        let off_in_block = (file_off % 4096) as usize;
+        let chunk = (4096 - off_in_block).min(remaining);
+        backing.read_page(file_off - off_in_block as u64, &mut page_buf);
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                page_buf[off_in_block..off_in_block + chunk].as_ptr(),
+                dst.add(buf_off),
+                chunk,
+            );
+        }
+        file_off += chunk as u64;
+        buf_off += chunk;
+        remaining -= chunk;
+    }
+}
+
 /// Load a shared library (.so) into memory for dynamic linking.
-/// Eagerly loads the entire ELF into memory, applies RELATIVE relocations,
-/// and parses PT_DYNAMIC for .dynsym/.dynstr symbol tables.
+/// Reads ELF headers and segments from the file backing (no full-file buffer).
+/// Applies RELATIVE relocations and parses PT_DYNAMIC for symbol tables.
 /// Returns (LoadedLib, rw_vaddr, rw_end_vaddr) for RW region tracking.
-pub fn load_shared_lib(data: &[u8]) -> Result<(LoadedLib, u64, u64), &'static str> {
-    let elf = match ElfBytes::<AnyEndian>::minimal_parse(data) {
-        Ok(e) => e,
-        Err(_) => return Err("dlopen: ELF parse error"),
-    };
+pub fn load_shared_lib(backing: &dyn crate::file_backing::FileBacking) -> Result<(LoadedLib, u64, u64), &'static str> {
+    // Read ELF headers (first 4KB covers ELF header + program headers)
+    let header_size = 4096.min(backing.file_size() as usize);
+    let header_data = crate::process::read_file_range(backing, 0, header_size);
+    let layout = parse_layout(&header_data)?;
 
-    let ehdr = &elf.ehdr;
-    if ehdr.e_type != ET_DYN {
-        return Err("dlopen: not a shared library (expected ET_DYN)");
-    }
-    if ehdr.e_machine != EM_X86_64 {
-        return Err("dlopen: not x86_64");
-    }
-
-    let segments = match elf.segments() {
-        Some(s) => s,
-        None => return Err("dlopen: no program headers"),
-    };
-
-    // Scan PT_LOAD for address range and writable segment bounds
-    let mut vaddr_range: Option<(u64, u64)> = None;
+    let (vaddr_min, vaddr_max) = (layout.vaddr_min, layout.vaddr_max);
     let mut rw_start: Option<u64> = None;
     let mut rw_end: Option<u64> = None;
-    for phdr in segments.iter().filter(|p| p.p_type == PT_LOAD) {
-        let lo = phdr.p_vaddr;
-        let hi = phdr.p_vaddr + phdr.p_memsz;
-        vaddr_range = Some(match vaddr_range {
-            None => (lo, hi),
-            Some((min, max)) => (min.min(lo), max.max(hi)),
-        });
-        if phdr.p_flags & 0x2 != 0 { // PF_W
+    for seg in &layout.segments {
+        if seg.writable {
+            let lo = seg.vaddr;
+            let hi = seg.vaddr + seg.memsz;
             rw_start = Some(rw_start.map_or(lo, |v: u64| v.min(lo)));
             rw_end = Some(rw_end.map_or(hi, |v: u64| v.max(hi)));
         }
     }
-    let (vaddr_min, vaddr_max) = vaddr_range.ok_or("dlopen: no loadable segments")?;
     let rw_vaddr = rw_start.unwrap_or(vaddr_max);
     let rw_end_vaddr = rw_end.unwrap_or(vaddr_max);
 
     let load_size = align_2m((vaddr_max - vaddr_min) as usize);
     let t0 = crate::clock::nanos_since_boot();
-    let alloc = match PageAlloc::new(load_size) {
-        Some(a) => a,
-        None => return Err("dlopen: allocation failed"),
-    };
+    let alloc = PageAlloc::new(load_size).ok_or("dlopen: allocation failed")?;
     let t1 = crate::clock::nanos_since_boot();
     let base_ptr = alloc.ptr();
     let image = unsafe { KernelSlice::from_raw(base_ptr, load_size) };
 
     unsafe { image.zero(); }
     let t2 = crate::clock::nanos_since_boot();
-    for phdr in segments.iter() {
-        if phdr.p_type == PT_LOAD {
-            let dst = image.ptr_at((phdr.p_vaddr - vaddr_min) as usize);
-            let src = &data[phdr.p_offset as usize..][..phdr.p_filesz as usize];
-            unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), dst, phdr.p_filesz as usize); }
-        }
+
+    // Read PT_LOAD segments from backing directly into image
+    for seg in &layout.segments {
+        let dst = image.ptr_at((seg.vaddr - vaddr_min) as usize);
+        read_backing_into(backing, seg.file_offset, dst, seg.filesz as usize);
     }
     let t3 = crate::clock::nanos_since_boot();
 
-    // Parse PT_DYNAMIC
+    // Parse PT_DYNAMIC from loaded image
     let mut symtab_vaddr = 0u64;
     let mut strtab_vaddr = 0u64;
     let mut strtab_size = 0u64;
@@ -898,33 +909,30 @@ pub fn load_shared_lib(data: &[u8]) -> Result<(LoadedLib, u64, u64), &'static st
     let mut rela_size = 0u64;
     let mut jmprel_vaddr = 0u64;
     let mut jmprel_size = 0u64;
-    const DT_RELA: i64 = 7;
-    const DT_RELASZ: i64 = 8;
-    const DT_JMPREL: i64 = 23;
-    const DT_PLTRELSZ: i64 = 2;
-    const DT_GNU_HASH: i64 = 0x6ffffef5u64 as i64;
     let mut gnu_hash_vaddr = 0u64;
-    for phdr in segments.iter() {
-        if phdr.p_type == PT_DYNAMIC {
-            let dyn_region = image.subslice((phdr.p_vaddr - vaddr_min) as usize, phdr.p_filesz as usize);
-            let mut off = 0;
-            while off + 16 <= dyn_region.size() {
-                let d_tag = unsafe { dyn_region.read::<i64>(off) };
-                let d_val = unsafe { dyn_region.read::<u64>(off + 8) };
-                match d_tag {
-                    DT_SYMTAB => symtab_vaddr = d_val,
-                    DT_STRTAB => strtab_vaddr = d_val,
-                    DT_STRSZ => strtab_size = d_val,
-                    DT_RELA => rela_vaddr = d_val,
-                    DT_RELASZ => rela_size = d_val,
-                    DT_JMPREL => jmprel_vaddr = d_val,
-                    DT_PLTRELSZ => jmprel_size = d_val,
-                    DT_GNU_HASH => gnu_hash_vaddr = d_val,
-                    DT_NULL => break,
-                    _ => {}
-                }
-                off += 16;
+    let mut init_array_vaddr = 0u64;
+    let mut init_array_size = 0u64;
+    if let Some((_, dyn_vaddr, dyn_filesz)) = layout.dynamic {
+        let dyn_region = image.subslice((dyn_vaddr - vaddr_min) as usize, dyn_filesz as usize);
+        let mut off = 0;
+        while off + 16 <= dyn_region.size() {
+            let d_tag = unsafe { dyn_region.read::<i64>(off) };
+            let d_val = unsafe { dyn_region.read::<u64>(off + 8) };
+            match d_tag {
+                DT_SYMTAB => symtab_vaddr = d_val,
+                DT_STRTAB => strtab_vaddr = d_val,
+                DT_STRSZ => strtab_size = d_val,
+                7 /* DT_RELA */ => rela_vaddr = d_val,
+                8 /* DT_RELASZ */ => rela_size = d_val,
+                23 /* DT_JMPREL */ => jmprel_vaddr = d_val,
+                2 /* DT_PLTRELSZ */ => jmprel_size = d_val,
+                d if d == 0x6ffffef5u64 as i64 /* DT_GNU_HASH */ => gnu_hash_vaddr = d_val,
+                25 /* DT_INIT_ARRAY */ => init_array_vaddr = d_val,
+                27 /* DT_INIT_ARRAYSZ */ => init_array_size = d_val,
+                DT_NULL => break,
+                _ => {}
             }
+            off += 16;
         }
     }
 
@@ -932,15 +940,23 @@ pub fn load_shared_lib(data: &[u8]) -> Result<(LoadedLib, u64, u64), &'static st
         let off = (gnu_hash_vaddr - vaddr_min) as usize;
         Some(image.subslice(off, image.size() - off))
     } else { None };
+
     // Determine symbol count. Prefer section header sh_size (includes all symbols:
     // null + hashed exports + unhashed imports). The .gnu_hash only covers hashed
     // exports, so gnu_hash_sym_count underreports when imports exist.
     let sym_count = {
         let mut count = 0;
-        if let Some(shdrs) = elf.section_headers() {
-            for shdr in shdrs.iter() {
-                if shdr.sh_type == SHT_DYNSYM {
-                    count = (shdr.sh_size / shdr.sh_entsize.max(SYM_SIZE as u64)) as usize;
+        if let Some((shoff, shnum, shentsize)) = layout.section_headers {
+            let shdr_data = crate::process::read_file_range(backing, shoff, shnum as usize * shentsize as usize);
+            let shent = shentsize as usize;
+            for i in 0..shnum as usize {
+                let base = i * shent;
+                if base + 64 > shdr_data.len() { break; }
+                let sh_type = u32::from_le_bytes(shdr_data[base + 4..base + 8].try_into().unwrap());
+                if sh_type == SHT_DYNSYM {
+                    let sh_size = u64::from_le_bytes(shdr_data[base + 32..base + 40].try_into().unwrap());
+                    let sh_entsize = u64::from_le_bytes(shdr_data[base + 56..base + 64].try_into().unwrap());
+                    count = (sh_size / sh_entsize.max(SYM_SIZE as u64)) as usize;
                     break;
                 }
             }
@@ -986,20 +1002,17 @@ pub fn load_shared_lib(data: &[u8]) -> Result<(LoadedLib, u64, u64), &'static st
     let mut tls_align = 0usize;
     let mut eh_frame_hdr_vaddr = 0u64;
     let mut eh_frame_hdr_size = 0u64;
-    for phdr in segments.iter() {
-        match phdr.p_type {
-            PT_TLS => {
-                let off = (phdr.p_vaddr - vaddr_min) as usize;
-                tls_template = Some(image.subslice(off, phdr.p_filesz as usize));
-                tls_memsz = phdr.p_memsz as usize;
-                tls_align = phdr.p_align as usize;
-            }
-            0x6474e550 /* PT_GNU_EH_FRAME */ => {
-                eh_frame_hdr_vaddr = phdr.p_vaddr;
-                eh_frame_hdr_size = phdr.p_memsz;
-            }
-            _ => {}
-        }
+    let (_, tls_vaddr, tls_filesz, tls_memsz_layout, tls_align_layout) =
+        ((), layout.tls_vaddr, layout.tls_filesz, layout.tls_memsz, layout.tls_align);
+    if tls_memsz_layout > 0 {
+        let off = (tls_vaddr - vaddr_min) as usize;
+        tls_template = Some(image.subslice(off, tls_filesz));
+        tls_memsz = tls_memsz_layout;
+        tls_align = tls_align_layout;
+    }
+    if let Some((ehdr_vaddr, ehdr_size)) = layout.eh_frame_hdr {
+        eh_frame_hdr_vaddr = ehdr_vaddr;
+        eh_frame_hdr_size = ehdr_size;
     }
 
     let t4 = crate::clock::nanos_since_boot();
@@ -1014,6 +1027,7 @@ pub fn load_shared_lib(data: &[u8]) -> Result<(LoadedLib, u64, u64), &'static st
         rela: rela_slice, jmprel: jmprel_slice, gnu_hash: gnu_hash_slice,
         cached_relocs: None,
         eh_frame_hdr_vaddr, eh_frame_hdr_size,
+        init_array_vaddr, init_array_size,
         user_end: base_phys + vaddr_max - vaddr_min,
     }, rw_vaddr, rw_end_vaddr))
 }

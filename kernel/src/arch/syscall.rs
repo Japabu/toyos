@@ -272,7 +272,7 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         }
         SYS_DLOPEN => {
             let Some(path) = ctx.user_str(UserAddr::new(a1), a2) else { return bad_addr };
-            sys_dlopen(path)
+            sys_dlopen(path, a3)
         }
         SYS_DLSYM => {
             let Some(name) = ctx.user_str(UserAddr::new(a2), a3) else { return bad_addr };
@@ -1144,7 +1144,7 @@ fn sys_readlink(path: &str, buf: &mut [u8]) -> u64 {
     }
 }
 
-fn sys_dlopen(path: &str) -> u64 {
+fn sys_dlopen(path: &str, init_out: u64) -> u64 {
     let cwd = process::with_current_data(|d| d.cwd.clone());
     let resolved = vfs::lock().resolve_absolute(&cwd, path);
 
@@ -1153,15 +1153,15 @@ fn sys_dlopen(path: &str) -> u64 {
     let mut lib = match lib {
         Some(lib) => lib,
         None => {
-            let binary = match vfs::lock().read_file(&resolved) {
-                Ok(d) => d,
-                Err(e) => {
-                    log!("dlopen: {}: {}", resolved, e);
+            let backing = match vfs::lock().open_backing(&resolved) {
+                Some(b) => b,
+                None => {
+                    log!("dlopen: {}: not found", resolved);
                     return SyscallError::NotFound.to_u64();
                 }
             };
 
-            let (lib, rw_vaddr, rw_end_vaddr) = match crate::elf::load_shared_lib(&binary) {
+            let (lib, rw_vaddr, rw_end_vaddr) = match crate::elf::load_shared_lib(backing.as_ref()) {
                 Ok(result) => result,
                 Err(msg) => {
                     log!("dlopen: {}", msg);
@@ -1246,6 +1246,25 @@ fn sys_dlopen(path: &str) -> u64 {
                 modules: &data.tls_modules,
             };
             crate::elf::apply_dtpmod_relocs(&lib, module_id, &tls_info);
+        }
+    }
+
+    // Write init_array info to user-provided buffer if requested.
+    // Format: [init_array_vaddr: u64, init_array_count: u64]
+    // The vaddr is rebased to the library's user_base.
+    if init_out != 0 {
+        let init_vaddr = if lib.init_array_vaddr != 0 {
+            lib.user_base.raw() + lib.init_array_vaddr
+        } else {
+            0
+        };
+        let init_count = lib.init_array_size / 8;
+        if let Some(phys) = process::current_address_space().lock().translate(UserAddr::new(init_out)) {
+            let ptr = phys.as_mut_ptr::<u64>();
+            unsafe {
+                core::ptr::write(ptr, init_vaddr);
+                core::ptr::write(ptr.add(1), init_count);
+            }
         }
     }
 

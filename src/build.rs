@@ -399,14 +399,31 @@ pub fn build_toyos_bins(root: &Path, crate_path: &Path, changes: &crate::toolcha
     let bin_dir = crate_path.join("target/x86_64-unknown-toyos/debug");
     let path_env = crate::toolchain::path_with_toyos_ld(root);
 
-    // Force re-link when linker or std changed
-    if changes.std_rebuilt {
-        let target_dir = crate_path.join("target/x86_64-unknown-toyos");
-        if target_dir.exists() {
-            eprintln!("toolchain changed: cleaning {}", target_dir.display());
-            fs::remove_dir_all(&target_dir).ok();
+    // Detect sysroot changes: compare sysroot std fingerprint against a stamp in each target dir.
+    // This catches std rebuilds from previous runs (not just the current one).
+    let sysroot_fp = sysroot_fingerprint(root);
+
+    // Collect all target dirs: main crate + cdylib subcrates
+    let mut target_dirs = vec![crate_path.join("target/x86_64-unknown-toyos")];
+    for entry in fs::read_dir(crate_path).into_iter().flatten().flatten() {
+        let sub_path = entry.path();
+        if sub_path.is_dir() && sub_path.join("Cargo.toml").exists() {
+            target_dirs.push(sub_path.join("target/x86_64-unknown-toyos"));
         }
-    } else if changes.linker_changed {
+    }
+
+    // Clean all stale target dirs
+    for target_dir in &target_dirs {
+        if !target_dir.exists() { continue; }
+        let stamp = target_dir.join(".sysroot-stamp");
+        let stored = fs::read_to_string(&stamp).unwrap_or_default();
+        if stored != sysroot_fp {
+            eprintln!("sysroot changed: cleaning {}", target_dir.display());
+            fs::remove_dir_all(target_dir).ok();
+        }
+    }
+
+    if changes.linker_changed {
         eprintln!("linker changed: forcing re-link of test binaries");
         if bin_dir.exists() {
             for entry in fs::read_dir(&bin_dir).into_iter().flatten().flatten() {
@@ -491,7 +508,48 @@ pub fn build_toyos_bins(root: &Path, crate_path: &Path, changes: &crate::toolcha
         }
     }
 
+    // Write sysroot stamp to all target dirs so future runs know they're up to date
+    for target_dir in &target_dirs {
+        if target_dir.exists() {
+            let stamp = target_dir.join(".sysroot-stamp");
+            fs::write(&stamp, &sysroot_fp).ok();
+        }
+    }
+
     results
+}
+
+/// Fingerprint the sysroot's std rlib to detect toolchain changes across runs.
+fn sysroot_fingerprint(root: &Path) -> String {
+    let sysroot_lib = root.join("rust/build")
+        .join(toolchain::host_triple())
+        .join("stage2/lib/rustlib/x86_64-unknown-toyos/lib");
+    if !sysroot_lib.exists() { return String::new(); }
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(&sysroot_lib).into_iter().flatten().flatten() {
+        let path = entry.path();
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        if name.starts_with("libstd") && name.ends_with(".rlib") {
+            if let Ok(meta) = fs::metadata(&path) {
+                let mtime = meta.modified().ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0);
+                entries.push(format!("{}:{}:{}", name, meta.len(), mtime));
+            }
+        }
+    }
+    // Include linker binary mtime so linker changes also invalidate caches
+    let linker = toolchain::toyos_ld_binary(root);
+    if let Ok(meta) = fs::metadata(&linker) {
+        let mtime = meta.modified().ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        entries.push(format!("toyos-ld:{}:{}", meta.len(), mtime));
+    }
+    entries.sort();
+    entries.join("\n")
 }
 
 fn build_kernel(root: &Path, debug: bool, release: bool, rustflags: &str, path_env: &str) {

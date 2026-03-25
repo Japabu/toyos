@@ -15,7 +15,7 @@ use std::fs;
 
 
 pub use collect::RelocType;
-use collect::{Arch, collect, synthesize_alloc_shims, gc_sections, merge_string_sections, is_archive, extract_archive, find_lib, has_toyos_libc_note, scan_symbols, SectionIdx, SectionKind, SymbolDef, SymbolRef};
+use collect::{Arch, collect, synthesize_alloc_shims, gc_sections, merge_string_sections, is_archive, is_shared_lib, extract_archive, find_lib, has_toyos_libc_note, scan_symbols, SectionIdx, SectionKind, SymbolDef, SymbolRef};
 use reloc::{ElfRelocParams, apply_relocs, apply_relocs_pe, MachORelocParams, apply_relocs_macho};
 use emit_elf::{layout_elf, build_eh_frame_hdr, ElfEmitMode, ElfLayout};
 use emit_pe::{layout_pe, emit_pe_bytes, PeLayout};
@@ -385,7 +385,9 @@ pub fn resolve_libs_with_entry(
         }
     }
 
-    // Scan direct objects for defined/referenced symbols
+    // Scan direct objects for defined/referenced symbols.
+    // Symbols from shared libraries (.so) must NOT count as "defined" for archive pull-in —
+    // they're resolved at load time, not link time. Only .o file definitions prevent pull-in.
     let mut defined = HashSet::new();
     let mut undefined = HashSet::new();
     // The entry point is an implicit undefined — ensure its archive member
@@ -393,14 +395,14 @@ pub fn resolve_libs_with_entry(
     if let Some(entry) = entry {
         undefined.insert(entry.to_string());
     }
-    let obj_scans: Vec<_> = objects.iter()
-        .map(|(_, data)| scan_symbols(data))
-        .collect();
-    for (defs, refs) in obj_scans {
+    for (_name, data) in &objects {
+        // Skip shared libraries for defined-symbol scanning
+        if is_shared_lib(data) { continue; }
+        let (defs, refs) = scan_symbols(data);
         defined.extend(defs);
         undefined.extend(refs);
     }
-    // Only truly undefined: referenced but not yet defined
+    // Only truly undefined: referenced but not yet defined by .o files
     undefined.retain(|s| !defined.contains(s));
 
     // Scan archive members and build a symbol → member index for O(1) lookup.
