@@ -562,6 +562,11 @@ impl<IO: BlockIO, Mode> Mounted<IO, Mode> {
             .map(|(key, _)| key.key_type == KeyType::Symlink)
             .unwrap_or(false)
     }
+    /// Get file size without reading data (metadata only).
+    pub fn file_size_meta(&self, name: &str) -> Option<u64> {
+        let (_, value) = self.find_by_name(name).ok()??;
+        decode_leaf_value(&value).ok().map(|l| l.size())
+    }
 }
 
 // --- ReadWrite-only operations ---
@@ -712,5 +717,98 @@ impl<IO: BlockIO> Mounted<IO, ReadWrite> {
         }
 
         false
+    }
+
+    /// Rename a file or symlink. Crash-safe ordering: insert new, then delete old.
+    pub fn rename(&mut self, old_name: &str, new_name: &str) -> Result<(), FsError> {
+        // 1. Find old entry
+        let (old_key, old_value) = self.find_by_name(old_name)?
+            .ok_or(FsError::NotFound)?;
+        let leaf = decode_leaf_value(&old_value)?;
+
+        // 2. INSERT new entry first (crash-safe: duplicate better than loss)
+        let entry_type = if old_key.key_type == KeyType::File { 1 } else { 2 };
+        let new_value = encode_leaf_value(
+            entry_type, new_name, leaf.size(), leaf.mtime(), leaf.extents(),
+        );
+        let new_key = make_key(&self.sb.hash_seed, new_name, old_key.key_type);
+        let (new_root, new_level) = btree::insert(
+            &self.io, &mut self.alloc,
+            self.sb.root_node, self.sb.root_level,
+            Entry { key: new_key, value: new_value },
+        )?;
+        self.sb.root_node = new_root;
+        self.sb.root_level = new_level;
+
+        // 3. DELETE target's old entry if it existed (frees target's blocks)
+        self.delete_by_name(new_name);
+
+        // 4. DELETE source's old entry (without freeing blocks — they're in the new entry)
+        if let Ok(Some(_)) = btree::delete(&self.io, self.sb.root_node, self.sb.root_level, &old_key) {
+            // Blocks are NOT freed — they now belong to the new entry
+        }
+
+        Ok(())
+    }
+
+    /// Update file metadata (size, mtime, extents) without rewriting data.
+    pub fn update_metadata(
+        &mut self,
+        name: &str,
+        new_extents: &[Extent],
+        size: u64,
+        mtime: u64,
+    ) -> Result<(), FsError> {
+        // Find and delete old entry
+        let (old_key, old_value) = self.find_by_name(name)?
+            .ok_or(FsError::NotFound)?;
+        let leaf = decode_leaf_value(&old_value)?;
+        let entry_type = if old_key.key_type == KeyType::File { 1 } else { 2 };
+
+        // Delete old entry (don't free blocks — we're keeping them)
+        btree::delete(&self.io, self.sb.root_node, self.sb.root_level, &old_key)?;
+
+        // If extents changed, free blocks that are no longer needed
+        // (For now, just use the new extents as-is)
+        let extents = if new_extents.is_empty() { leaf.extents() } else { new_extents };
+
+        // Insert updated entry
+        let new_value = encode_leaf_value(entry_type, leaf.name(), size, mtime, extents);
+        let (new_root, new_level) = btree::insert(
+            &self.io, &mut self.alloc,
+            self.sb.root_node, self.sb.root_level,
+            Entry { key: old_key, value: new_value },
+        )?;
+        self.sb.root_node = new_root;
+        self.sb.root_level = new_level;
+        Ok(())
+    }
+
+    /// Resolve a page index to a block number, allocating a new block if needed.
+    /// Returns (block_number, extents_were_extended).
+    pub fn resolve_or_alloc_block(
+        &mut self,
+        extents: &mut Vec<Extent>,
+        page_idx: u32,
+    ) -> Result<u64, FsError> {
+        // Check if page_idx is within existing extents
+        let mut cursor = 0u32;
+        for ext in extents.iter() {
+            if page_idx < cursor + ext.block_count {
+                return Ok(ext.start_block + (page_idx - cursor) as u64);
+            }
+            cursor += ext.block_count;
+        }
+
+        // Page is beyond existing extents — allocate new blocks to cover it
+        let needed = page_idx + 1 - cursor;
+        let (start, count) = self.alloc.alloc_contiguous(&self.io, needed)?;
+        extents.push(Extent {
+            start_block: start.raw(),
+            block_count: count,
+            _reserved: 0,
+        });
+        // The requested page_idx is at offset (page_idx - cursor) within the new extent
+        Ok(start.raw() + (page_idx - cursor) as u64)
     }
 }

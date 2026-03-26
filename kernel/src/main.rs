@@ -26,6 +26,7 @@ mod mouse;
 mod block;
 #[allow(dead_code)]
 mod page_cache;
+mod file_cache;
 mod tmpfs;
 mod file_backing;
 mod bcachefs_adapter;

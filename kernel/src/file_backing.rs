@@ -57,11 +57,12 @@ impl FileBacking for NvmeBacking {
             return;
         }
         if let Some(block) = self.file_offset_to_block(file_offset) {
-            let mut guard = page_cache::lock();
-            let (cache, dev) = guard.cache_and_dev();
-            let page = cache.read(dev, block);
+            // Direct disk read — bypasses block page cache.
+            // File cache is the sole cache for file data.
+            let mut raw = [0u8; BLOCK_SIZE];
+            page_cache::raw_block_read(block, &mut raw);
             let valid = BLOCK_SIZE.min((self.size - file_offset) as usize);
-            buf[..valid].copy_from_slice(&page[..valid]);
+            buf[..valid].copy_from_slice(&raw[..valid]);
         }
     }
 

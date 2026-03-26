@@ -6,43 +6,76 @@ use crate::block::{BlockDevice, DeviceId};
 use crate::sync::Lock;
 use crate::DirectMap;
 
-struct PageCacheWithDev {
-    cache: PageCache,
-    dev: Box<dyn BlockDevice>,
-}
-
-static PAGE_CACHE: Lock<Option<PageCacheWithDev>> = Lock::new(None);
+// Separate locks: device I/O and cache data structures.
+// Lock ordering: BLOCK_CACHE → BLOCK_DEV (never reversed).
+static BLOCK_CACHE: Lock<Option<PageCache>> = Lock::new(None);
+static BLOCK_DEV: Lock<Option<Box<dyn BlockDevice>>> = Lock::new(None);
 
 /// Initialize the page cache, taking ownership of the block device.
 pub fn init(dev: Box<dyn BlockDevice>) {
     let block_count = dev.block_count() as usize;
     let device_id = dev.device_id();
-    *PAGE_CACHE.lock() = Some(PageCacheWithDev {
-        cache: PageCache::new(block_count, device_id),
-        dev,
-    });
+    *BLOCK_CACHE.lock() = Some(PageCache::new(block_count, device_id));
+    *BLOCK_DEV.lock() = Some(dev);
 }
 
+/// Lock both cache and device for metadata operations (bcachefs btree, etc.).
+/// Lock ordering: cache first, then device.
 pub fn lock() -> PageCacheGuard {
-    PageCacheGuard(PAGE_CACHE.lock())
+    let cache = BLOCK_CACHE.lock();
+    let dev = BLOCK_DEV.lock();
+    PageCacheGuard { cache, dev }
 }
 
-pub struct PageCacheGuard(crate::sync::LockGuard<'static, Option<PageCacheWithDev>>);
+pub struct PageCacheGuard {
+    cache: crate::sync::LockGuard<'static, Option<PageCache>>,
+    dev: crate::sync::LockGuard<'static, Option<Box<dyn BlockDevice>>>,
+}
 
 impl PageCacheGuard {
     pub fn cache_and_dev(&mut self) -> (&mut PageCache, &mut dyn BlockDevice) {
-        let inner = self.0.as_mut().expect("page cache not initialized");
-        (&mut inner.cache, inner.dev.as_mut())
+        let cache = self.cache.as_mut().expect("page cache not initialized");
+        let dev = self.dev.as_mut().expect("block device not initialized");
+        (cache, dev.as_mut())
+    }
+
+    pub fn block_count(&self) -> u64 {
+        self.cache.as_ref().expect("page cache not initialized").block_count()
     }
 }
 
 impl core::ops::Deref for PageCacheGuard {
     type Target = PageCache;
-    fn deref(&self) -> &PageCache { &self.0.as_ref().expect("page cache not initialized").cache }
+    fn deref(&self) -> &PageCache { self.cache.as_ref().expect("page cache not initialized") }
 }
 
 impl core::ops::DerefMut for PageCacheGuard {
-    fn deref_mut(&mut self) -> &mut PageCache { &mut self.0.as_mut().expect("page cache not initialized").cache }
+    fn deref_mut(&mut self) -> &mut PageCache { self.cache.as_mut().expect("page cache not initialized") }
+}
+
+/// Read a block directly from disk, bypassing the cache.
+/// Locks only the device — no contention with metadata cache operations.
+/// Used by NvmeBacking for file data reads (file cache is the sole data cache).
+pub fn raw_block_read(block: u64, buf: &mut [u8; 4096]) {
+    let mut dev = BLOCK_DEV.lock();
+    let dev = dev.as_mut().expect("block device not initialized");
+    dev.read_blocks(block, 1, buf);
+}
+
+/// Write a block directly to disk, bypassing the cache.
+/// Locks only the device.
+/// Used by filesystem write_page for file data writeback.
+pub fn raw_block_write(block: u64, buf: &[u8; 4096]) {
+    let mut dev = BLOCK_DEV.lock();
+    let dev = dev.as_mut().expect("block device not initialized");
+    dev.write_blocks(block, 1, buf);
+}
+
+/// Flush the block device write buffer.
+pub fn raw_block_flush() {
+    let mut dev = BLOCK_DEV.lock();
+    let dev = dev.as_mut().expect("block device not initialized");
+    dev.flush();
 }
 
 const NOT_CACHED: u32 = u32::MAX;
@@ -86,7 +119,6 @@ impl PageCache {
         self.block_to_slot[block as usize] = slot;
         self.slot_to_block.push(block);
         self.dirty.push(false);
-        // Allocate new chunk if needed
         let chunk_idx = slot as usize / PAGES_PER_CHUNK;
         if chunk_idx >= self.chunks.len() {
             let chunk: Box<[u8; CHUNK_SIZE]> = unsafe {
@@ -114,22 +146,17 @@ impl PageCache {
         &mut self.chunks[chunk_idx][off..off + 4096]
     }
 
-    /// Get the physical address of a cached block's 4KB page.
-    /// Identity mapping: virtual pointer IS physical address.
     pub fn phys_addr(&self, block: u64) -> Option<DirectMap> {
         let slot = self.block_to_slot[block as usize];
         if slot == NOT_CACHED { return None; }
         Some(DirectMap::from_ptr(self.slot_data(slot).as_ptr() as *const u8))
     }
 
-    /// Ensure a block is cached (loading from device if needed) and return its physical address.
     pub fn ensure_cached(&mut self, dev: &mut dyn BlockDevice, block: u64) -> DirectMap {
         self.read(dev, block);
         self.phys_addr(block).unwrap()
     }
 
-    /// Read a block, returning a reference to the cached 4KB page.
-    /// Loads from device on cache miss.
     pub fn read(&mut self, dev: &mut dyn BlockDevice, block: u64) -> &[u8] {
         let slot = self.block_to_slot[block as usize];
         if slot != NOT_CACHED {
@@ -142,19 +169,14 @@ impl PageCache {
         self.slot_data(slot)
     }
 
-    /// Prefetch a contiguous range of blocks into the cache with batched I/O.
-    /// Skips blocks already cached. Reads up to 32 blocks per device call.
     pub fn prefetch(&mut self, dev: &mut dyn BlockDevice, blocks: &[u64]) {
-        // Find runs of contiguous uncached blocks and batch-read them.
         let mut i = 0;
         while i < blocks.len() {
-            // Skip already-cached blocks
             if self.block_to_slot[blocks[i] as usize] != NOT_CACHED {
                 i += 1;
                 continue;
             }
 
-            // Start a contiguous run of uncached blocks
             let run_start = i;
             let first_block = blocks[i];
             i += 1;
@@ -167,25 +189,21 @@ impl PageCache {
             }
             let run_len = i - run_start;
 
-            // Allocate slots for the entire run
             let first_slot = self.next_slot;
             for j in 0..run_len {
                 self.alloc_slot(first_block + j as u64);
             }
 
-            // Check if all slots land in the same chunk (common case for sequential alloc)
             let first_chunk = first_slot as usize / PAGES_PER_CHUNK;
             let last_chunk = (first_slot as usize + run_len - 1) / PAGES_PER_CHUNK;
 
             if first_chunk == last_chunk {
-                // All pages are contiguous in memory — read directly into chunk
                 let page_in_chunk = first_slot as usize % PAGES_PER_CHUNK;
                 let off = page_in_chunk * 4096;
                 let end = off + run_len * 4096;
                 let buf = &mut self.chunks[first_chunk][off..end];
                 dev.read_blocks(first_block, run_len as u32, buf);
             } else {
-                // Pages span chunks — read into temp buffer, then scatter
                 let mut buf = vec![0u8; run_len * 4096];
                 dev.read_blocks(first_block, run_len as u32, &mut buf);
                 for j in 0..run_len {
@@ -197,8 +215,6 @@ impl PageCache {
         }
     }
 
-    /// Get a mutable reference to a cached block for modification.
-    /// Loads from device on cache miss, marks page dirty.
     pub fn write(&mut self, dev: &mut dyn BlockDevice, block: u64) -> &mut [u8] {
         let slot = self.block_to_slot[block as usize];
         if slot != NOT_CACHED {
@@ -212,8 +228,6 @@ impl PageCache {
         self.slot_data_mut(slot)
     }
 
-    /// Get a mutable reference to a block without reading from device first.
-    /// Use when the entire block will be overwritten.
     pub fn write_new(&mut self, _dev: &mut dyn BlockDevice, block: u64) -> &mut [u8] {
         let slot = self.block_to_slot[block as usize];
         if slot != NOT_CACHED {
@@ -224,14 +238,10 @@ impl PageCache {
         }
         let slot = self.alloc_slot(block);
         self.dirty[slot as usize] = true;
-        // Chunk memory is already zeroed on allocation
         self.slot_data_mut(slot)
     }
 
-    /// Flush all dirty pages for a device to disk.
-    /// Batches contiguous runs into multi-block writes for performance.
     pub fn sync(&mut self, dev: &mut dyn BlockDevice) {
-        // Collect dirty block numbers, sorted for batching
         let mut dirty_blocks: Vec<u64> = (0..self.next_slot)
             .filter(|&s| self.dirty[s as usize])
             .map(|s| self.slot_to_block[s as usize])
@@ -242,8 +252,7 @@ impl PageCache {
         }
         dirty_blocks.sort_unstable();
 
-        // Batch contiguous runs and write together
-        let mut buf = vec![0u8; 32 * 4096]; // reuse buffer across batches
+        let mut buf = vec![0u8; 32 * 4096];
         let mut i = 0;
         while i < dirty_blocks.len() {
             let start = dirty_blocks[i];
@@ -256,7 +265,6 @@ impl PageCache {
                 count += 1;
             }
 
-            // Copy cached pages into contiguous buffer
             for j in 0..count {
                 let block = start + j as u64;
                 let slot = self.block_to_slot[block as usize];
@@ -266,7 +274,6 @@ impl PageCache {
 
             dev.write_blocks(start, count, &buf[..count as usize * 4096]);
 
-            // Mark pages clean
             for j in 0..count {
                 let block = start + j as u64;
                 let slot = self.block_to_slot[block as usize];

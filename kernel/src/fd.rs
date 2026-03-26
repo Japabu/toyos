@@ -1,6 +1,8 @@
 use alloc::string::String;
-use alloc::vec::Vec;
+use alloc::sync::Arc;
 
+use crate::file_backing::FileBacking;
+use crate::file_cache::{self, FileId};
 use crate::id_map::IdMap;
 use crate::process::Pid;
 use crate::vfs::Vfs;
@@ -11,7 +13,6 @@ pub use toyos_abi::FramebufferInfo;
 use toyos_abi::syscall::{FileType, OpenFlags, SeekFrom, SyscallError};
 
 /// Tracks a pipe's mapping into a process's virtual address space.
-/// Created by sys_pipe_map, cleaned up when the FD is closed.
 #[derive(Clone)]
 #[allow(dead_code)]
 pub struct PipeMapping {
@@ -19,23 +20,35 @@ pub struct PipeMapping {
     pub size: u64,
 }
 
-#[derive(Clone)]
 pub struct OpenFile {
     path: String,
-    data: Vec<u8>,
+    file_id: FileId,
+    backing: Option<Arc<dyn FileBacking>>,
     position: usize,
     writable: bool,
     modified: bool,
     mtime: u64,
 }
 
+impl Clone for OpenFile {
+    fn clone(&self) -> Self {
+        file_cache::open(self.file_id);
+        Self {
+            path: self.path.clone(),
+            file_id: self.file_id,
+            backing: self.backing.clone(),
+            position: self.position,
+            writable: self.writable,
+            modified: false, // cloned fd starts unmodified
+            mtime: self.mtime,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Descriptor
 // ---------------------------------------------------------------------------
 
-/// Every pipe-backed variant holds PipeReader/PipeWriter which are owned,
-/// refcounted references. Clone bumps refcounts. Drop decrements and frees.
-/// No manual refcount management anywhere else in the kernel.
 pub enum Descriptor {
     File(OpenFile),
     PipeRead(PipeReader, Option<PipeMapping>),
@@ -91,9 +104,6 @@ impl Descriptor {
         }
     }
 
-    /// Map this descriptor to the EventSource that indicates readable data.
-    /// Returns None for always-ready descriptors (File, Framebuffer, Audio)
-    /// and for write-only descriptors.
     pub fn read_event_source(&self) -> Option<crate::scheduler::EventSource> {
         use crate::scheduler::EventSource;
         match self {
@@ -110,13 +120,12 @@ impl Descriptor {
         }
     }
 
-    /// Map this descriptor to the EventSource that indicates writable space.
     pub fn write_event_source(&self) -> Option<crate::scheduler::EventSource> {
         use crate::scheduler::EventSource;
         match self {
             Self::PipeWrite(w, _) | Self::TtyWrite(w) => Some(EventSource::PipeWritable(w.id())),
             Self::Socket { tx, .. } => Some(EventSource::PipeWritable(tx.id())),
-            Self::File(_) | Self::SerialConsole => None, // always writable
+            Self::File(_) | Self::SerialConsole => None,
             Self::Keyboard | Self::Mouse | Self::Nic(_) | Self::Audio(_)
             | Self::Framebuffer(_) | Self::Listener(_)
             | Self::PipeRead(..) | Self::TtyRead(_) | Self::IoUring(_) => None,
@@ -156,57 +165,94 @@ pub fn open(table: &mut FdTable, vfs: &mut Vfs, path: &str, flags: OpenFlags) ->
         }
     }
 
-    let (data, mtime) = if truncate && create {
+    // Handle CREATE + TRUNCATE: create (or truncate) empty file
+    if truncate && create {
         let mtime = crate::clock::nanos_since_boot();
-        if let Err(_) = vfs.write_file(path, &[], mtime) {
-            return SyscallError::Unknown.to_u64();
-        }
-        (Vec::new(), mtime)
-    } else {
-        match vfs.read_file(path) {
-            Ok(data) => {
-                let mtime = vfs.file_mtime(path);
-                (data.into_owned(), mtime)
-            }
-            Err(_) => {
-                if create {
-                    let mtime = crate::clock::nanos_since_boot();
-                    if let Err(_) = vfs.write_file(path, &[], mtime) {
-                        return SyscallError::Unknown.to_u64();
-                    }
-                    (Vec::new(), mtime)
-                } else {
-                    return SyscallError::NotFound.to_u64();
-                }
-            }
-        }
-    };
+        // Delete existing file if any
+        vfs.delete(path);
+        let file_id = match vfs.create_file(path, mtime) {
+            Ok(id) => id,
+            Err(_) => return SyscallError::Unknown.to_u64(),
+        };
+        let file = OpenFile {
+            path: String::from(path),
+            file_id,
+            backing: None,
+            position: 0,
+            writable,
+            modified: false,
+            mtime,
+        };
+        return match alloc(table, Descriptor::File(file)) {
+            Ok(fd) => fd as u64,
+            Err(e) => e.to_u64(),
+        };
+    }
 
-    let position = if append { data.len() } else { 0 };
-    let file = OpenFile { path: String::from(path), data, position, writable, modified: false, mtime };
-    match alloc(table, Descriptor::File(file)) {
-        Ok(fd) => fd as u64,
-        Err(e) => e.to_u64(),
+    // Try to open existing file
+    match vfs.open_file(path) {
+        Some((file_id, backing)) => {
+            let mtime = vfs.file_mtime(path);
+            let size = file_cache::size(file_id);
+            let position = if append { size as usize } else { 0 };
+            let file = OpenFile {
+                path: String::from(path),
+                file_id,
+                backing,
+                position,
+                writable,
+                modified: false,
+                mtime,
+            };
+            match alloc(table, Descriptor::File(file)) {
+                Ok(fd) => fd as u64,
+                Err(e) => e.to_u64(),
+            }
+        }
+        None => {
+            if create {
+                let mtime = crate::clock::nanos_since_boot();
+                let file_id = match vfs.create_file(path, mtime) {
+                    Ok(id) => id,
+                    Err(_) => return SyscallError::Unknown.to_u64(),
+                };
+                let file = OpenFile {
+                    path: String::from(path),
+                    file_id,
+                    backing: None,
+                    position: 0,
+                    writable,
+                    modified: false,
+                    mtime,
+                };
+                match alloc(table, Descriptor::File(file)) {
+                    Ok(fd) => fd as u64,
+                    Err(e) => e.to_u64(),
+                }
+            } else {
+                SyscallError::NotFound.to_u64()
+            }
+        }
     }
 }
 
-/// Close an fd. Pipe refcounts are handled automatically by Drop on the Descriptor.
+/// Close an fd. Flushes modified files, handles pipe refcounts.
 pub fn close(table: &mut FdTable, vfs: &mut Vfs, fd: u32, pid: Pid) -> u64 {
     let Some(desc) = table.remove(fd) else {
         return SyscallError::NotFound.to_u64();
     };
-    // Auto-deregister from any io_uring instances watching this fd
     let sources = [desc.read_event_source(), desc.write_event_source()];
     if sources.iter().any(|s| s.is_some()) {
         crate::io_uring::remove_fd(fd, &sources);
     }
-    // Non-pipe cleanup that can't be in Drop
     match &desc {
         Descriptor::File(file) => {
-            if file.modified && file.writable {
-                if let Err(_) = vfs.write_file(&file.path, &file.data, file.mtime) {
-                    return SyscallError::Unknown.to_u64();
-                }
+            if file.modified {
+                let _ = vfs.flush_file(&file.path, file.file_id, file.mtime);
+            }
+            let last_ref = file_cache::release(file.file_id);
+            if last_ref {
+                vfs.close_file(&file.path, file.file_id);
             }
         }
         Descriptor::Keyboard | Descriptor::Mouse | Descriptor::Framebuffer(_) | Descriptor::Nic(_) | Descriptor::Audio(_) => {
@@ -227,10 +273,14 @@ pub fn close_all(table: &mut FdTable, vfs: &mut Vfs, pid: Pid) {
     for (_, desc) in table.drain() {
         match &desc {
             Descriptor::File(file) => {
-                if file.modified && file.writable {
-                    if let Err(e) = vfs.write_file(&file.path, &file.data, file.mtime) {
-                        log!("warning: VFS write failed on process exit: {}: {}", file.path, e);
+                if file.modified {
+                    if let Err(e) = vfs.flush_file(&file.path, file.file_id, file.mtime) {
+                        crate::log!("warning: flush failed on process exit: {}: {}", file.path, e);
                     }
+                }
+                let last_ref = file_cache::release(file.file_id);
+                if last_ref {
+                    vfs.close_file(&file.path, file.file_id);
                 }
             }
             Descriptor::Keyboard | Descriptor::Mouse | Descriptor::Framebuffer(_) | Descriptor::Nic(_) | Descriptor::Audio(_) => {
@@ -255,9 +305,29 @@ pub fn try_read(table: &mut FdTable, fd: u32, buf: &mut [u8]) -> Option<u64> {
     let desc = table.get_mut(fd)?;
     match desc {
         Descriptor::File(file) => {
-            let available = file.data.len().saturating_sub(file.position);
+            let size = file_cache::size(file.file_id) as usize;
+            let available = size.saturating_sub(file.position);
             let count = buf.len().min(available);
-            buf[..count].copy_from_slice(&file.data[file.position..file.position + count]);
+            if count == 0 {
+                return Some(0);
+            }
+            // Read page by page from file cache
+            let mut read = 0;
+            while read < count {
+                let abs_pos = file.position + read;
+                let page_idx = (abs_pos / 4096) as u32;
+                let offset_in_page = abs_pos % 4096;
+                let remaining_in_page = 4096 - offset_in_page;
+                let to_read = remaining_in_page.min(count - read);
+                file_cache::read_page(
+                    file.file_id,
+                    page_idx,
+                    offset_in_page,
+                    &mut buf[read..read + to_read],
+                    file.backing.as_deref(),
+                );
+                read += to_read;
+            }
             file.position += count;
             Some(count as u64)
         }
@@ -342,12 +412,24 @@ pub fn try_write(table: &mut FdTable, fd: u32, buf: &[u8]) -> Option<u64> {
             if !file.writable {
                 return Some(SyscallError::PermissionDenied.to_u64());
             }
-            let end = file.position + buf.len();
-            if end > file.data.len() {
-                file.data.resize(end, 0);
+            // Write page by page to file cache
+            let mut written = 0;
+            while written < buf.len() {
+                let abs_pos = file.position + written;
+                let page_idx = (abs_pos / 4096) as u32;
+                let offset_in_page = abs_pos % 4096;
+                let remaining_in_page = 4096 - offset_in_page;
+                let to_write = remaining_in_page.min(buf.len() - written);
+                file_cache::write_page(
+                    file.file_id,
+                    page_idx,
+                    offset_in_page,
+                    &buf[written..written + to_write],
+                    file.backing.as_deref(),
+                );
+                written += to_write;
             }
-            file.data[file.position..end].copy_from_slice(buf);
-            file.position = end;
+            file.position += buf.len();
             file.modified = true;
             file.mtime = crate::clock::nanos_since_boot();
             Some(buf.len() as u64)
@@ -378,13 +460,14 @@ pub fn seek(table: &mut FdTable, fd: u32, pos: SeekFrom) -> u64 {
     let Some(Descriptor::File(file)) = table.get_mut(fd) else {
         return SyscallError::NotFound.to_u64();
     };
+    let size = file_cache::size(file.file_id) as usize;
     let new_pos = match pos {
         SeekFrom::Start(n) => n as i64,
         SeekFrom::Current(n) => (file.position as i64).checked_add(n).unwrap_or(-1),
-        SeekFrom::End(n) => (file.data.len() as i64).checked_add(n).unwrap_or(-1),
+        SeekFrom::End(n) => (size as i64).checked_add(n).unwrap_or(-1),
     };
     if new_pos < 0 { return SyscallError::InvalidArgument.to_u64(); }
-    file.position = (new_pos as usize).min(file.data.len());
+    file.position = (new_pos as usize).min(size);
     file.position as u64
 }
 
@@ -400,7 +483,7 @@ pub fn fstat(table: &FdTable, fd: u32, stat: &mut Stat) -> bool {
     match table.get(fd) {
         Some(Descriptor::File(file)) => {
             stat.file_type = FileType::File as u64;
-            stat.size = file.data.len() as u64;
+            stat.size = file_cache::size(file.file_id);
             stat.mtime = file.mtime;
             true
         }
@@ -423,8 +506,8 @@ pub fn fsync(table: &mut FdTable, vfs: &mut Vfs, fd: u32) -> u64 {
     let Some(Descriptor::File(file)) = table.get_mut(fd) else {
         return SyscallError::NotFound.to_u64();
     };
-    if file.modified && file.writable {
-        if let Err(_) = vfs.write_file(&file.path, &file.data, file.mtime) {
+    if file.modified {
+        if let Err(_) = vfs.flush_file(&file.path, file.file_id, file.mtime) {
             return SyscallError::Unknown.to_u64();
         }
         file.modified = false;
@@ -437,7 +520,7 @@ pub fn ftruncate(table: &mut FdTable, fd: u32, size: u64) -> u64 {
         return SyscallError::NotFound.to_u64();
     };
     if !file.writable { return SyscallError::PermissionDenied.to_u64(); }
-    file.data.resize(size as usize, 0);
+    file_cache::set_size(file.file_id, size);
     if file.position > size as usize { file.position = size as usize; }
     file.modified = true;
     file.mtime = crate::clock::nanos_since_boot();
@@ -493,4 +576,3 @@ pub fn mark_tty(table: &mut FdTable, fd: u32) -> u64 {
     table.insert_at(fd, new);
     0
 }
-
