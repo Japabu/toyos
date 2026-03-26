@@ -79,25 +79,16 @@ pub(super) extern "sysv64" fn timer_entry() {
         "swapgs",
         "iretq",
 
-        // Ring 0: EOI + count tick. If a process is running (syscall),
-        // count as busy. If idle (current_pid == u32::MAX), count as idle.
+        // Ring 0: just EOI. One-shot timer fired, nothing to do in kernel context.
         "2:",
         "push rax",
         "push rdx",
         "mov rdx, [rip + LAPIC_BASE]",
         "mov dword ptr [rdx + 0xB0], 0",
-        "lock inc qword ptr [rip + {total_ticks}]",
-        "mov eax, gs:[136]",  // current_pid (u32::MAX = idle)
-        "cmp eax, 0xFFFFFFFF",
-        "je 3f",
-        "lock inc qword ptr [rip + {busy_ticks}]",
-        "3:",
         "pop rdx",
         "pop rax",
         "iretq",
         handler = sym timer_handler,
-        total_ticks = sym CPU_TOTAL_TICKS,
-        busy_ticks = sym CPU_BUSY_TICKS,
     );
 }
 
@@ -106,12 +97,7 @@ extern "sysv64" fn timer_handler() {
     CPU_BUSY_TICKS.fetch_add(1, Ordering::Relaxed);
     CPU_TOTAL_TICKS.fetch_add(1, Ordering::Relaxed);
 
-
-    // Process deadlines and pending events from the timer interrupt.
-    // try_lock avoids deadlock if the blocked pool is held on this CPU.
-    crate::scheduler::check_deadlines();
-
-    // Process xHCI events (keyboard/mouse) from timer context too,
+    // Process xHCI events (keyboard/mouse) from preemption context,
     // in case the idle loop isn't running on CPU 0.
     if crate::arch::percpu::cpu_id() == 0 {
         crate::drivers::xhci::poll_if_pending();

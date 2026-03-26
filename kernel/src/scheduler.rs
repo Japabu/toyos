@@ -15,6 +15,7 @@ const IA32_FS_BASE: u32 = 0xC0000100;
 const MAX_CPUS: usize = 8;
 const MAX_VRUNTIME_LAG_NS: u64 = 50_000_000; // 50ms
 const EVENT_QUEUE_SIZE: usize = 256;
+const PREEMPTION_QUANTUM_NS: u64 = 10_000_000; // 10ms
 
 // ---------------------------------------------------------------------------
 // EventSource — what wakes a blocked thread
@@ -426,11 +427,19 @@ impl Scheduler {
     }
 
     fn enqueue_batch(&self, batch: WokenBatch) {
+        let self_cpu = percpu::cpu_id();
+        let mut kick = false;
         for ctx in batch.threads {
             let cpu = self.pick_target_cpu();
             let mut q = self.lock_cpu(cpu as usize);
             let vrt = q.effective_vruntime(self, ctx.process);
             q.insert(vrt, ctx);
+            if cpu != self_cpu {
+                kick = true;
+            }
+        }
+        if kick {
+            crate::arch::apic::kick_cpus();
         }
     }
 }
@@ -445,6 +454,10 @@ pub fn enqueue_new(ctx: ThreadCtx) {
     let mut q = SCHEDULER.lock_cpu(cpu as usize);
     let vrt = q.effective_vruntime(&SCHEDULER, ctx.process);
     q.insert(vrt, ctx);
+    drop(q);
+    if cpu != percpu::cpu_id() {
+        crate::arch::apic::kick_cpus();
+    }
 }
 
 /// Block the current thread on the given event sources with optional deadline.
@@ -481,24 +494,6 @@ fn check_deadlines_locked(pool: &mut BlockedPool, batch: &mut WokenBatch) {
     }
 }
 
-/// Public entry point for timer interrupt. Uses try_lock.
-pub fn check_deadlines() {
-    let now = crate::clock::nanos_since_boot();
-    let Some(mut guard) = SCHEDULER.blocked.try_lock() else { return };
-    let Some(pool) = guard.as_mut() else { return };
-    let mut batch = WokenBatch::new();
-    while let Some((&(deadline, tid), _)) = pool.deadlines.first_key_value() {
-        if deadline > now { break; }
-        pool.deadlines.pop_first();
-        if let Some(ctx) = pool.remove_thread(tid) {
-            batch.push(ctx);
-        }
-    }
-    drop(guard);
-    if !batch.is_empty() {
-        SCHEDULER.enqueue_batch(batch);
-    }
-}
 
 pub fn exit_current(code: i32) -> ! {
     {
@@ -573,6 +568,10 @@ pub fn wake_tid(tid: Tid) {
     let mut q = SCHEDULER.lock_cpu(cpu as usize);
     let vrt = q.effective_vruntime(&SCHEDULER, ctx.process);
     q.insert(vrt, ctx);
+    drop(q);
+    if cpu != percpu::cpu_id() {
+        crate::arch::apic::kick_cpus();
+    }
 }
 
 /// Remove a thread from the scheduler entirely (for kill).
@@ -673,7 +672,9 @@ pub fn handle_outgoing_public() {
 // ---------------------------------------------------------------------------
 
 /// Drain per-CPU event queue and wake affected threads. One lock acquisition.
-fn drain_events() {
+/// Process pending events and expired deadlines. Returns the next deadline
+/// (absolute nanos_since_boot), or 0 if no threads have deadlines.
+fn drain_events() -> u64 {
     // Process xHCI events (keyboard/mouse) — converts MSI-X interrupt flag
     // into EventSource pushes via HID dispatch_report → push_event.
     if percpu::cpu_id() == 0 {
@@ -703,21 +704,22 @@ fn drain_events() {
     let mut events = [EventSource::Keyboard; EVENT_QUEUE_SIZE];
     let mut event_count = 0usize;
     PERCPU_EVENTS[cpu].drain_into(&mut events, &mut event_count);
-    if event_count == 0 { return; }
 
     let mut batch = WokenBatch::new();
+    let next_deadline;
     {
         let mut pool = SCHEDULER.blocked.lock_unwrap();
         for i in 0..event_count {
             pool.take_by_event_into(&events[i], &mut batch);
         }
-        // Also check deadlines while we hold the lock — this is the primary
-        // deadline check path. The timer's check_deadlines is a fallback.
         check_deadlines_locked(&mut pool, &mut batch);
+        next_deadline = pool.deadlines.first_key_value()
+            .map(|(&(dl, _), _)| dl).unwrap_or(0);
     }
     if !batch.is_empty() {
         SCHEDULER.enqueue_batch(batch);
     }
+    next_deadline
 }
 
 fn do_schedule(reason: SwitchReason) {
@@ -739,6 +741,7 @@ fn do_schedule(reason: SwitchReason) {
 
     if let Some(new) = queue.pick_next() {
         CONTEXT_SWITCHES.fetch_add(1, Ordering::Relaxed);
+        crate::arch::apic::arm_one_shot(PREEMPTION_QUANTUM_NS);
         let new_cr3 = new.cr3();
         let new_fs_base = new.fs_base;
         let new_ks_top = new.kernel_stack_top();
@@ -814,7 +817,7 @@ fn cpu_idle_loop() -> ! {
             log_health();
         }
 
-        drain_events();
+        let next_deadline = drain_events();
 
         {
             let mut guard = process::PROCESS_TABLE.lock();
@@ -826,6 +829,7 @@ fn cpu_idle_loop() -> ! {
         {
             let mut queue = SCHEDULER.lock_cpu(cpu);
             if let Some(new) = queue.pick_next() {
+                crate::arch::apic::arm_one_shot(PREEMPTION_QUANTUM_NS);
                 let new_cr3 = new.cr3();
                 let new_fs_base = new.fs_base;
                 let new_ks_top = new.kernel_stack_top();
@@ -838,7 +842,7 @@ fn cpu_idle_loop() -> ! {
 
                 percpu::set_current_tid(Some(new_tid));
                 unsafe { percpu::set_kernel_stack(new_ks_top); }
-                        unsafe { cpu::write_cr3(new_cr3); }
+                unsafe { cpu::write_cr3(new_cr3); }
                 cpu::wrmsr(IA32_FS_BASE, new_fs_base);
 
                 queue.into_raw();
@@ -848,6 +852,18 @@ fn cpu_idle_loop() -> ! {
                 handle_outgoing();
                 continue;
             }
+        }
+
+        // Idle: arm one-shot timer for next deadline, or stop if none.
+        // The CPU will sleep until a timer or MSI-X interrupt arrives.
+        if next_deadline > 0 {
+            let now = crate::clock::nanos_since_boot();
+            if next_deadline <= now {
+                continue; // deadline already expired, re-check
+            }
+            crate::arch::apic::arm_one_shot(next_deadline - now);
+        } else {
+            crate::arch::apic::stop_timer();
         }
 
         unsafe { core::arch::asm!("sti; hlt", options(nomem, nostack)); }

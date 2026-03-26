@@ -94,7 +94,20 @@ pub fn tlb_shootdown() {
     }
 }
 
-/// Calibrate and start the LAPIC timer on the BSP. Requires HPET.
+/// Send a timer IPI to all other CPUs, waking any that are halted.
+/// Lock-free — safe to call from scheduler context.
+pub fn kick_cpus() {
+    let base = LAPIC_BASE.load(Ordering::Relaxed);
+    if base == 0 { return; }
+    unsafe {
+        // ICR: all-excluding-self (0b11 << 18) | timer vector
+        (base as *mut u8).add(LAPIC_ICR_LOW as usize).cast::<u32>()
+            .write_volatile(0x000C_0000 | TIMER_VECTOR as u32);
+    }
+}
+
+/// Calibrate the LAPIC timer on the BSP. Requires HPET.
+/// Does not start the timer — the scheduler arms one-shot timers on demand.
 pub fn init_timer() {
     with_lapic(|l| {
         // Divide by 1 for maximum resolution
@@ -116,23 +129,33 @@ pub fn init_timer() {
         TIMER_TICKS.store(ticks_10ms, Ordering::Release);
         log!("LAPIC timer: {} ticks/10ms", ticks_10ms);
     });
-
-    start_timer();
 }
 
-/// Start the LAPIC timer on an AP (uses BSP-calibrated tick count).
-pub fn init_timer_ap() {
-    start_timer();
+/// AP timer init — calibration was done on the BSP, nothing to start.
+pub fn init_timer_ap() {}
+
+/// Arm a one-shot timer to fire after `nanos` nanoseconds.
+/// Lock-free — writes LAPIC MMIO directly. Safe to call from scheduler context.
+pub fn arm_one_shot(nanos: u64) {
+    let base = LAPIC_BASE.load(Ordering::Relaxed);
+    let ticks_10ms = TIMER_TICKS.load(Ordering::Relaxed) as u64;
+    let ticks = (nanos as u128 * ticks_10ms as u128 / 10_000_000) as u64;
+    let ticks = ticks.clamp(1, u32::MAX as u64) as u32;
+    unsafe {
+        let base = base as *mut u8;
+        // Divide by 1
+        base.add(LAPIC_TIMER_DIVIDE as usize).cast::<u32>().write_volatile(0b1011);
+        // One-shot mode (bit 17 = 0), unmasked, vector
+        base.add(LAPIC_LVT_TIMER as usize).cast::<u32>().write_volatile(TIMER_VECTOR as u32);
+        // Initial count — starts countdown
+        base.add(LAPIC_TIMER_INIT as usize).cast::<u32>().write_volatile(ticks);
+    }
 }
 
-fn start_timer() {
-    with_lapic(|l| {
-        let ticks = TIMER_TICKS.load(Ordering::Acquire);
-        assert!(ticks > 0, "LAPIC timer not calibrated");
-
-        l.write_u32(LAPIC_TIMER_DIVIDE, 0b1011);
-        // Periodic mode (bit 17) | vector
-        l.write_u32(LAPIC_LVT_TIMER, (1 << 17) | TIMER_VECTOR as u32);
-        l.write_u32(LAPIC_TIMER_INIT, ticks);
-    });
+/// Stop the timer. No more interrupts until re-armed.
+pub fn stop_timer() {
+    let base = LAPIC_BASE.load(Ordering::Relaxed);
+    unsafe {
+        (base as *mut u8).add(LAPIC_TIMER_INIT as usize).cast::<u32>().write_volatile(0);
+    }
 }
