@@ -809,7 +809,6 @@ extern "C" fn process_start() {
         "push 0x202",       // RFLAGS: IF=1
         "push 0x23",        // CS: user_code | RPL=3
         "push r12",         // RIP: entry point
-        "swapgs",
         "iretq",
         unlock = sym scheduler_unlock,
     );
@@ -835,7 +834,6 @@ extern "C" fn thread_start() {
         "push 0x202",       // RFLAGS: IF=1
         "push 0x23",        // CS: user_code | RPL=3
         "push r12",         // RIP: entry point
-        "swapgs",
         "iretq",
         unlock = sym scheduler_unlock,
     );

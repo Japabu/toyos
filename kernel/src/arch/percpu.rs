@@ -7,7 +7,6 @@ use super::cpu;
 use crate::log;
 
 const MSR_GS_BASE: u32 = 0xC000_0101;
-const MSR_KERNEL_GS_BASE: u32 = 0xC000_0102;
 
 // GDT selectors (must match entry order)
 pub const KERNEL_CS: u16 = 0x08;
@@ -206,7 +205,6 @@ pub fn init_bsp(lapic_id: u32) {
     cpu::enable_smap();
 
     cpu::wrmsr(MSR_GS_BASE, ptr as u64);
-    cpu::wrmsr(MSR_KERNEL_GS_BASE, ptr as u64);
 
     // GS base is now valid — enable CPU/TID context in log! macro
     crate::log::PERCPU_READY.store(true, core::sync::atomic::Ordering::Release);
@@ -230,9 +228,6 @@ pub fn init_ap(percpu_ptr: *mut PerCpu) {
     unsafe { percpu.load_gdt(); }
     cpu::enable_sse();
     cpu::enable_smap();
-
-    // GS base already set by trampoline; set KERNEL_GS_BASE too for swapgs.
-    cpu::wrmsr(MSR_KERNEL_GS_BASE, percpu_ptr as u64);
 
     log!("percpu: AP cpu_id={} lapic_id={}", percpu.cpu_id, percpu.lapic_id);
 }

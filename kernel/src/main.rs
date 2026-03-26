@@ -76,16 +76,9 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 
     // Walk the kernel stack for a backtrace
     log!("  Backtrace:");
-    let mut rbp: u64;
+    let rbp: u64;
     unsafe { core::arch::asm!("mov {}, rbp", out(reg) rbp, options(nomem, nostack)); }
-    for _ in 0..20 {
-        if rbp == 0 || rbp % 8 != 0 || !mm::is_kernel_addr(rbp) { break; }
-        let saved_rbp = unsafe { *(rbp as *const u64) };
-        let return_addr = unsafe { *((rbp + 8) as *const u64) };
-        if return_addr == 0 || !mm::is_kernel_addr(return_addr) { break; }
-        symbols::resolve_kernel(return_addr);
-        rbp = saved_rbp;
-    }
+    arch::idt::exceptions::kernel_backtrace(rbp, 20);
 
     // Dump current process/thread context (try_lock to avoid deadlock)
     if let Some(tid) = percpu::current_tid() {

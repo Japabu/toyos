@@ -30,14 +30,13 @@ pub fn init() {
     cpu::wrmsr(MSR_FMASK, 0x40200); // mask IF (bit 9) + AC (bit 18) on SYSCALL entry
 }
 
-// Syscall entry: swapgs to get kernel GS, use GS-relative kernel/user RSP.
+// Syscall entry: GS permanently points to kernel per-CPU data (no swapgs needed).
 // PerCpu layout: offset 16 = kernel_rsp, offset 24 = user_rsp.
 // Saves/restores XMM registers because blocking syscalls context-switch,
 // and kernel Rust code is free to clobber caller-saved XMM registers.
 #[unsafe(naked)]
 extern "sysv64" fn syscall_entry() {
     naked_asm!(
-        "swapgs",
         "mov gs:[24], rsp",     // save user RSP to percpu.user_rsp
         "mov gs:[216], rcx",    // save user RIP to percpu.syscall_rip
         "mov gs:[224], rdi",    // save syscall number to percpu.syscall_num
@@ -106,12 +105,10 @@ extern "sysv64" fn syscall_entry() {
         "pop rdi",
         "pop r11",
         "pop rcx",
-        // CLI before the critical pop rsp / swapgs / sysretq window.
-        // Without this, an interrupt between pop rsp and swapgs would use
-        // the user RSP as the kernel stack — a privilege escalation bug.
+        // CLI before pop rsp / sysretq — an interrupt after pop rsp would
+        // use the user RSP as the kernel stack.
         "cli",
         "pop rsp",              // restore user RSP from kernel stack
-        "swapgs",
         "sysretq",
         handler = sym syscall_handler,
     );

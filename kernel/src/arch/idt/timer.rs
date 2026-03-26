@@ -18,7 +18,6 @@ pub(super) extern "sysv64" fn timer_entry() {
         "jz 2f",
 
         // Ring 3: preempt — save GPRs
-        "swapgs",
         "push 0", // dummy error code for stack layout consistency
         "push r15", "push r14", "push r13", "push r12",
         "push r11", "push r10", "push r9",  "push r8",
@@ -76,7 +75,6 @@ pub(super) extern "sysv64" fn timer_entry() {
         "pop r8",   "pop r9",   "pop r10",  "pop r11",
         "pop r12",  "pop r13",  "pop r14",  "pop r15",
         "add rsp, 8", // pop dummy error code
-        "swapgs",
         "iretq",
 
         // Ring 0: just EOI. One-shot timer fired, nothing to do in kernel context.

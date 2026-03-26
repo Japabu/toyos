@@ -1,8 +1,10 @@
-mod exceptions;
+pub(crate) mod exceptions;
 mod timer;
 mod tlb;
 pub mod virtio_net;
 mod xhci;
+
+use core::arch::naked_asm;
 
 use super::cpu;
 use super::cpu::{outb, io_wait};
@@ -107,10 +109,16 @@ struct IdtPointer {
     base: u64,
 }
 
-/// GPRs saved by exception/interrupt entry stubs.
-/// Push order: rax, rbx, rcx, rdx, rsi, rdi, rbp, r8..r15 (lowest address first).
+// ============================================================
+// Unified trap frame — contiguous struct for all exception state
+// ============================================================
+
+/// Complete CPU state at exception entry. Pushed by stub + common_entry + CPU.
+/// Layout (lowest address = first field):
+///   [GPRs: 15×8=120]  [vector: 8]  [error_code: 8]  [rip cs rflags rsp ss: 5×8=40]
 #[repr(C)]
-pub struct SavedRegs {
+pub struct TrapFrame {
+    // GPRs pushed by common_entry (lowest address first)
     pub rax: u64,
     pub rbx: u64,
     pub rcx: u64,
@@ -126,24 +134,94 @@ pub struct SavedRegs {
     pub r13: u64,
     pub r14: u64,
     pub r15: u64,
+    // Pushed by stub
+    pub vector: u64,
+    // Pushed by CPU (or dummy 0 by stub for exceptions without error code)
+    pub error_code: u64,
+    // CPU interrupt frame
+    pub rip: u64,
+    pub cs: u64,
+    pub rflags: u64,
+    pub rsp: u64,
+    pub ss: u64,
 }
 
-/// CPU-pushed interrupt/exception frame, sitting above the saved GPRs + error code.
-#[repr(C)]
-pub struct InterruptFrame {
-    error_code: u64,
-    rip: u64,
-    cs: u64,
-    rflags: u64,
-    rsp: u64,
-    ss: u64,
+// ============================================================
+// Exception entry stubs — tiny per-vector, jump to common_entry
+// ============================================================
+
+/// #DB — no CPU error code. Push dummy error code + vector, jump to common.
+#[unsafe(naked)]
+extern "sysv64" fn stub_db() {
+    naked_asm!("push 0", "push 1", "jmp {common}", common = sym common_entry);
 }
 
-impl SavedRegs {
-    fn interrupt_frame(&self) -> &InterruptFrame {
-        unsafe { &*((self as *const SavedRegs).add(1) as *const InterruptFrame) }
+/// #UD — no CPU error code.
+#[unsafe(naked)]
+extern "sysv64" fn stub_ud() {
+    naked_asm!("push 0", "push 6", "jmp {common}", common = sym common_entry);
+}
+
+/// #DF — CPU pushes error code (always 0). Push vector.
+#[unsafe(naked)]
+extern "sysv64" fn stub_df() {
+    naked_asm!("push 8", "jmp {common}", common = sym common_entry);
+}
+
+/// #GP — CPU pushes error code. Push vector.
+#[unsafe(naked)]
+extern "sysv64" fn stub_gpf() {
+    naked_asm!("push 13", "jmp {common}", common = sym common_entry);
+}
+
+/// #PF — CPU pushes error code. Push vector.
+#[unsafe(naked)]
+extern "sysv64" fn stub_pf() {
+    naked_asm!("push 14", "jmp {common}", common = sym common_entry);
+}
+
+/// Common exception entry: save all GPRs, call Rust dispatcher, restore, iretq.
+#[unsafe(naked)]
+extern "sysv64" fn common_entry() {
+    naked_asm!(
+        "push r15", "push r14", "push r13", "push r12",
+        "push r11", "push r10", "push r9",  "push r8",
+        "push rbp", "push rdi", "push rsi", "push rdx",
+        "push rcx", "push rbx", "push rax",
+        "mov rdi, rsp",        // &TrapFrame
+        "sub rsp, 8",          // 16-byte align
+        "call {dispatch}",
+        "add rsp, 8",
+        // If dispatch returns, fault was resolved — restore and iretq
+        "pop rax",  "pop rbx",  "pop rcx",  "pop rdx",
+        "pop rsi",  "pop rdi",  "pop rbp",
+        "pop r8",   "pop r9",   "pop r10",  "pop r11",
+        "pop r12",  "pop r13",  "pop r14",  "pop r15",
+        "add rsp, 16",         // skip vector + error code
+        "iretq",
+        dispatch = sym trap_dispatch,
+    );
+}
+
+/// Rust exception dispatcher — routes by vector to the appropriate handler.
+extern "sysv64" fn trap_dispatch(frame: *mut TrapFrame) {
+    let frame = unsafe { &mut *frame };
+    match frame.vector {
+        0x01 => exceptions::debug_handler(frame),
+        0x06 | 0x0D => exceptions::exception_handler(frame),
+        0x08 => exceptions::double_fault_handler(frame),
+        0x0E => {
+            cpu::enable_interrupts();
+            exceptions::page_fault_handler(frame);
+            unsafe { core::arch::asm!("cli", options(nomem, nostack)); }
+        }
+        v => panic!("unhandled exception vector {:#x}", v),
     }
 }
+
+// ============================================================
+// PIC disable + IDT init
+// ============================================================
 
 /// Disable the legacy 8259 PIC.
 fn disable_pic() {
@@ -179,11 +257,11 @@ pub fn init() {
 
     {
         let mut idt = IDT.lock();
-        idt.entries[Vector::Debug as usize] = IdtEntry::new(exceptions::db_entry as *const () as u64);
-        idt.entries[Vector::InvalidOpcode as usize] = IdtEntry::new(exceptions::ud_entry as *const () as u64);
-        idt.entries[Vector::DoubleFault as usize] = IdtEntry::new(exceptions::double_fault_entry as *const () as u64).with_ist(1);
-        idt.entries[Vector::GeneralProtection as usize] = IdtEntry::new(exceptions::gpf_entry as *const () as u64);
-        idt.entries[Vector::PageFault as usize] = IdtEntry::new(exceptions::page_fault_entry as *const () as u64);
+        idt.entries[Vector::Debug as usize] = IdtEntry::new(stub_db as *const () as u64);
+        idt.entries[Vector::InvalidOpcode as usize] = IdtEntry::new(stub_ud as *const () as u64);
+        idt.entries[Vector::DoubleFault as usize] = IdtEntry::new(stub_df as *const () as u64).with_ist(1);
+        idt.entries[Vector::GeneralProtection as usize] = IdtEntry::new(stub_gpf as *const () as u64);
+        idt.entries[Vector::PageFault as usize] = IdtEntry::new(stub_pf as *const () as u64);
         idt.entries[Vector::Timer as usize] = IdtEntry::new(timer::timer_entry as *const () as u64);
         idt.entries[Vector::Xhci as usize] = IdtEntry::new(xhci::xhci_entry as *const () as u64);
         idt.entries[Vector::VirtioNet as usize] = IdtEntry::new(virtio_net::virtio_net_entry as *const () as u64);
