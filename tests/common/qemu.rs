@@ -32,9 +32,8 @@ fn prepare_boot(
 ) -> (PathBuf, PathBuf, PathBuf) {
     let repo = compile::repo_root();
 
-    // Use the main build system for toolchain, kernel, and bootloader
-    toyos::build::build_for_tests(&repo, debug_wait);
-
+    // Kernel and bootloader are already built by build_toyos_bins (called before boot).
+    // Just assemble the initrd here.
     let mut initrd_files: Vec<(String, Vec<u8>)> = Vec::new();
 
     // test-runner (init process)
@@ -312,9 +311,11 @@ impl Drop for QemuInstance {
     }
 }
 
-/// Build all binaries in a multi-binary crate. Delegates to the main build system.
+/// Build kernel, bootloader, and all binaries in a test crate.
+/// Calls ensure() once and passes the ChangeSet to both build_for_tests and build_toyos_bins,
+/// so linker changes are detected consistently.
 pub fn build_toyos_bins(crate_path: &Path) -> Vec<(String, Vec<u8>)> {
     let repo = compile::repo_root();
-    let changes = toyos::toolchain::ensure(&repo, false);
+    let changes = toyos::build::build_for_tests(&repo, false);
     toyos::build::build_toyos_bins(&repo, crate_path, &changes)
 }

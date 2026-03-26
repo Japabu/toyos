@@ -83,6 +83,10 @@ pub const SYS_TLS_ALLOC_BLOCK: u64 = 88;
 pub const SYS_IO_URING_SETUP: u64 = 89;
 pub const SYS_IO_URING_ENTER: u64 = 90;
 pub const SYS_QUERY_MODULES: u64 = 91;
+/// Debug syscall. Arg0 selects the action:
+///   0 = kernel panic (triggers panic!() in syscall context)
+///   1 = kernel fault (null pointer deref in kernel context)
+pub const SYS_DEBUG: u64 = 92;
 
 pub const WNOHANG: u64 = 1;
 
@@ -373,6 +377,11 @@ pub fn thread_exit(code: i32) -> ! {
 /// Exit the entire process (all threads) with `code`. Does not return.
 pub fn exit(code: i32) -> ! {
     loop { syscall(SYS_EXIT, code as u64, 0, 0, 0); }
+}
+
+/// Debug syscall. `action`: 0 = kernel panic, 1 = kernel fault.
+pub fn debug(action: u64) -> u64 {
+    syscall(SYS_DEBUG, action, 0, 0, 0)
 }
 
 /// Create a pipe. Returns the read and write file descriptors.

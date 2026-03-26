@@ -18,6 +18,32 @@ const EVENT_QUEUE_SIZE: usize = 256;
 const PREEMPTION_QUANTUM_NS: u64 = 10_000_000; // 10ms
 
 // ---------------------------------------------------------------------------
+// Poison set — lock-free, prevents panicked threads from being re-scheduled
+// ---------------------------------------------------------------------------
+
+static POISONED_TIDS: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(u32::MAX) }; MAX_CPUS];
+
+/// Mark a thread as poisoned (panicked). Lock-free — safe from panic context.
+pub fn poison_tid(tid: Tid) {
+    let cpu = percpu::cpu_id() as usize;
+    if cpu < MAX_CPUS {
+        POISONED_TIDS[cpu].store(tid.raw(), Ordering::Release);
+    }
+}
+
+/// Check if a thread is poisoned.
+pub fn is_poisoned(tid: Tid) -> bool {
+    POISONED_TIDS.iter().any(|s| s.load(Ordering::Relaxed) == tid.raw())
+}
+
+/// Clear poison for a thread after it has been zombified by the idle loop.
+pub fn clear_poison(tid: Tid) {
+    for slot in &POISONED_TIDS {
+        let _ = slot.compare_exchange(tid.raw(), u32::MAX, Ordering::Relaxed, Ordering::Relaxed);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // EventSource — what wakes a blocked thread
 // ---------------------------------------------------------------------------
 
@@ -218,7 +244,13 @@ pub struct CpuQueueGuard<'a>(crate::sync::LockGuard<'a, CpuRunQueue>);
 
 impl<'a> CpuQueueGuard<'a> {
     pub fn pick_next(&mut self) -> Option<ThreadCtx> {
-        self.0.ready.pop_first().map(|(_, ctx)| ctx)
+        while let Some((_, ctx)) = self.0.ready.pop_first() {
+            if !is_poisoned(ctx.tid) {
+                return Some(ctx);
+            }
+            // Poisoned thread — drop its SchedContext, it will never run again.
+        }
+        None
     }
 
     pub fn insert(&mut self, vrt: u64, ctx: ThreadCtx) {
@@ -519,7 +551,7 @@ pub fn exit_current(code: i32) -> ! {
 pub fn schedule_no_return() -> ! {
     percpu::set_current_tid(None);
     unsafe { percpu::set_kernel_stack(percpu::idle_stack_top()); }
-    unsafe { cpu::write_cr3(crate::mm::paging::kernel().lock().as_ref().unwrap().cr3()); }
+    unsafe { cpu::write_cr3(crate::mm::paging::kernel_cr3()); }
     let sp = percpu::idle_stack_top();
     unsafe {
         asm!(
@@ -557,6 +589,7 @@ pub fn wake_pipe_writers(pipe_id: PipeId) {
 
 /// Wake a specific thread by Tid (for waitpid/thread_join).
 pub fn wake_tid(tid: Tid) {
+    if is_poisoned(tid) { return; }
     let ctx = {
         let mut pool = SCHEDULER.blocked.lock_unwrap();
         match pool.remove_thread(tid) {
@@ -770,7 +803,7 @@ fn do_schedule(reason: SwitchReason) {
     let old_rsp_ptr = queue.save_rsp_ptr();
     percpu::set_current_tid(None);
     unsafe { percpu::set_kernel_stack(percpu::idle_stack_top()); }
-    unsafe { cpu::write_cr3(crate::mm::paging::kernel().lock().as_ref().unwrap().cr3()); }
+    unsafe { cpu::write_cr3(crate::mm::paging::kernel_cr3()); }
 
     queue.into_raw();
     unsafe { context_switch(old_rsp_ptr, percpu::idle_rsp()); }
@@ -823,6 +856,26 @@ fn cpu_idle_loop() -> ! {
             let mut guard = process::PROCESS_TABLE.lock();
             let table = guard.as_mut().unwrap();
             table.collect_orphan_zombies(idle_proof);
+
+            // Zombify poisoned threads that couldn't be cleaned up during panic recovery
+            // (try_lock failed at panic time, so cleanup was deferred to the idle loop).
+            for slot in &POISONED_TIDS {
+                let raw = slot.load(Ordering::Relaxed);
+                if raw == u32::MAX { continue; }
+                let tid = Tid::from_raw(raw);
+                if let Some(entry) = table.get_mut(tid) {
+                    if !matches!(entry.state(), process::ProcessState::Zombie(_)) {
+                        match *entry.kind() {
+                            process::Kind::Thread { .. } => entry.zombify_thread(-1),
+                            process::Kind::Process { .. } => {
+                                let c = entry.zombify_process(-1);
+                                table.handle_orphans(c);
+                            }
+                        }
+                    }
+                }
+                clear_poison(tid);
+            }
         }
 
         let cpu = percpu::cpu_id() as usize;

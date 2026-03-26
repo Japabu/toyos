@@ -9,7 +9,7 @@ use crate::mm::PAGE_2M;
 use crate::fd::{self, Descriptor, FdTable};
 use crate::id_map::IdMap;
 use crate::sync::Lock;
-use crate::symbols::ProcessSymbols;
+use crate::symbols::SymbolTable;
 use crate::{elf, pipe, scheduler, shared_memory, vfs};
 use crate::{DirectMap, UserAddr};
 
@@ -227,7 +227,7 @@ pub struct SchedEntry {
     name: [u8; 28],
     memory_size: u64,
     data: Arc<Lock<ProcessData>>,
-    symbols: Arc<Lock<ProcessSymbols>>,
+    symbols: Arc<Lock<SymbolTable>>,
 }
 
 impl SchedEntry {
@@ -239,7 +239,7 @@ impl SchedEntry {
         name: [u8; 28],
         memory_size: u64,
         data: Arc<Lock<ProcessData>>,
-        symbols: Arc<Lock<ProcessSymbols>>,
+        symbols: Arc<Lock<SymbolTable>>,
     ) -> Self {
         Self { tid, process, state, kind, name, memory_size, data, symbols }
     }
@@ -251,7 +251,7 @@ impl SchedEntry {
     pub fn name(&self) -> &[u8; 28] { &self.name }
     pub fn memory_size(&self) -> u64 { self.memory_size }
     pub fn data(&self) -> &Arc<Lock<ProcessData>> { &self.data }
-    pub fn symbols(&self) -> &Arc<Lock<ProcessSymbols>> { &self.symbols }
+    pub fn symbols(&self) -> &Arc<Lock<SymbolTable>> { &self.symbols }
 
     /// CPU time in nanoseconds, retrieved from the scheduler's ThreadCtx.
     pub fn cpu_ns(&self) -> u64 {
@@ -946,7 +946,7 @@ pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64, stack_base: u64) -> Op
     let tid = table.insert_with(|tid| {
         SchedEntry::new(
             tid, parent_process, ThreadLocation::Scheduled, Kind::Thread { parent: parent_process },
-            [0; 28], 0, thread_data, Arc::new(Lock::new(ProcessSymbols::empty())),
+            [0; 28], 0, thread_data, Arc::new(Lock::new(SymbolTable::empty())),
         )
     });
     drop(guard);
@@ -1603,7 +1603,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
             user_stack.base().raw(), user_stack.top(),
         )
     } else {
-        ProcessSymbols::empty_with_bounds(
+        SymbolTable::empty_with_bounds(
             base + layout.vaddr_min, base + layout.vaddr_max,
             user_stack.base().raw(), user_stack.top(),
         )
@@ -2188,14 +2188,20 @@ pub fn dump_crash_diagnostics(fault_addr: u64, rip: u64) {
     if tid == Tid::MAX { return; }
 
     let data_arc = {
-        let guard = PROCESS_TABLE.lock();
+        let Some(guard) = PROCESS_TABLE.try_lock() else {
+            log!("  [crash diagnostics: PROCESS_TABLE locked, skipping]");
+            return;
+        };
         let Some(table) = guard.as_ref() else { return };
         match table.get(tid) {
             Some(entry) => Arc::clone(entry.data()),
             None => return,
         }
     };
-    let data = data_arc.lock();
+    let Some(data) = data_arc.try_lock() else {
+        log!("  [crash diagnostics: ProcessData locked, skipping]");
+        return;
+    };
 
     // Dump page fault trace
     let trace = &data.fault_trace;
@@ -2306,10 +2312,10 @@ fn find_symtab_in_memory(
     base: u64,
     prog_base: u64, prog_end: u64,
     stack_base: u64, stack_end: u64,
-) -> ProcessSymbols {
+) -> SymbolTable {
     const SHT_SYMTAB: u32 = 2;
     const SHT_STRTAB: u32 = 3;
-    let empty = || ProcessSymbols::empty_with_bounds(prog_base, prog_end, stack_base, stack_end);
+    let empty = || SymbolTable::empty_with_bounds(prog_base, prog_end, stack_base, stack_end);
 
     // Read section headers — they're small enough to read via read_file_range.
     let shdr_size = sh_num * sh_entsize;
@@ -2349,7 +2355,7 @@ fn find_symtab_in_memory(
     let entry_size = if symtab_entsize > 0 { symtab_entsize as usize } else { 24 };
     let entries = symtab_size as usize / entry_size;
 
-    ProcessSymbols::from_raw(
+    SymbolTable::from_raw(
         symtab_ptr, entries,
         strtab_ptr, strtab_size as usize,
         base,

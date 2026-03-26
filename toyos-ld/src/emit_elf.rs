@@ -569,8 +569,9 @@ fn collect_symtab_entries<'a>(
 ) -> (Vec<SymEntry>, u32) {
     let mut entries = Vec::new();
 
-    // Locals
+    // Locals (skip __section_sym_* — internal linker bookkeeping, not real symbols)
     for ((_, name), def) in &state.locals {
+        if name.starts_with("__section_sym_") { continue; }
         let SymbolDef::Defined { section, value } = def else { continue; };
         let sec = &state.sections[*section];
         let st_value = sec.vaddr.unwrap() + value;

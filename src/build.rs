@@ -104,6 +104,11 @@ pub fn build(root: &Path, debug: bool, release: bool, changes: &ChangeSet) {
                 fs::remove_file(&bin).ok();
             }
         }
+        // Force kernel re-link via cargo clean
+        let _ = Command::new("cargo")
+            .args(["clean", "--target", "x86_64-unknown-none", "-p", "kernel"])
+            .current_dir(root.join("kernel"))
+            .status();
     }
 
     // Partition programs into workspace members vs standalone (own workspace / special config)
@@ -348,7 +353,6 @@ pub fn build_for_tests(root: &Path, debug_wait: bool) -> crate::toolchain::Chang
         eprintln!("linker changed: forcing re-link of userland binaries");
         let ws_target = root.join("userland/target/x86_64-unknown-toyos/debug");
         if ws_target.exists() {
-            // Delete all ELF executables (not .d, .rlib, etc.)
             for entry in fs::read_dir(&ws_target).into_iter().flatten().flatten() {
                 let path = entry.path();
                 if path.is_file() && path.extension().is_none() {
@@ -356,6 +360,11 @@ pub fn build_for_tests(root: &Path, debug_wait: bool) -> crate::toolchain::Chang
                 }
             }
         }
+        // Force kernel re-link via cargo clean
+        let _ = Command::new("cargo")
+            .args(["clean", "--target", "x86_64-unknown-none", "-p", "kernel"])
+            .current_dir(root.join("kernel"))
+            .status();
     }
 
     build_kernel(root, debug_wait, false, &rustflags, &path_env);

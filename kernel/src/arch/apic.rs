@@ -106,6 +106,20 @@ pub fn kick_cpus() {
     }
 }
 
+/// Halt all CPUs. Sends halt IPI to all other CPUs, then halts self.
+/// Lock-free — writes LAPIC MMIO directly. Safe from any context.
+pub fn halt_all_cpus() -> ! {
+    let base = LAPIC_BASE.load(Ordering::Relaxed);
+    if base != 0 {
+        unsafe {
+            // IPI all-excluding-self, vector 0xFD (halt)
+            (base as *mut u8).add(LAPIC_ICR_LOW as usize).cast::<u32>()
+                .write_volatile(0x000C_0000 | 0xFD);
+        }
+    }
+    super::cpu::halt();
+}
+
 /// Calibrate the LAPIC timer on the BSP. Requires HPET.
 /// Does not start the timer — the scheduler arms one-shot timers on demand.
 pub fn init_timer() {

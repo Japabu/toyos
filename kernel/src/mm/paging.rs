@@ -309,9 +309,17 @@ const MIN_PHYS_MAP: u64 = 4 * 1024 * 1024 * 1024;
 
 static KERNEL: Lock<Option<AddressSpace>> = Lock::new(None);
 
+/// Kernel CR3, cached for lock-free access from panic/crash paths.
+static KERNEL_CR3: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// The kernel address space. Mapped once at boot, lives forever.
 pub fn kernel() -> &'static Lock<Option<AddressSpace>> {
     &KERNEL
+}
+
+/// Kernel CR3. Lock-free — safe to call from panic context.
+pub fn kernel_cr3() -> u64 {
+    KERNEL_CR3.load(core::sync::atomic::Ordering::Relaxed)
 }
 
 /// Build kernel page tables: map all physical memory in the high half using 2MB large pages.
@@ -333,6 +341,7 @@ pub(super) fn init(memory_map: &[MemoryMapEntry]) {
     }
 
     let cr3 = kernel.cr3();
+    KERNEL_CR3.store(cr3, core::sync::atomic::Ordering::Release);
     *KERNEL.lock() = Some(kernel);
     unsafe { crate::arch::cpu::write_cr3(cr3); }
 }

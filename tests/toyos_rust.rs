@@ -75,3 +75,54 @@ toyos_rust_tests!(
     std_unwind,
     std_unwind_so,
 );
+
+#[test]
+fn panic_recovery() {
+    let result = {
+        let mut qemu = QEMU.lock().unwrap_or_else(|e| e.into_inner());
+        qemu.run_test(
+            "test_rs_panic_recovery",
+            Duration::from_secs(10),
+        )
+    };
+    check_test_result(&result);
+}
+
+/// Verify that panic_recovery produces proper diagnostics in serial output.
+/// Checks all three fault paths: syscall panic, kernel fault, user segfault.
+#[test]
+fn panic_recovery_diagnostics() {
+    let result = {
+        let mut qemu = QEMU.lock().unwrap_or_else(|e| e.into_inner());
+        qemu.run_test(
+            "test_rs_panic_recovery",
+            Duration::from_secs(5),
+        )
+    };
+    check_test_result(&result);
+
+    // 1. Syscall panic: PANIC header + kernel backtrace + syscall context + user backtrace
+    assert!(result.stdout.contains("!!! PANIC !!!"),
+        "expected PANIC header\nstdout:\n{}", result.stdout);
+    assert!(result.stdout.contains("SYS_DEBUG"),
+        "expected SYS_DEBUG in panic message\nstdout:\n{}", result.stdout);
+    assert!(result.stdout.contains("Syscall: num=92"),
+        "expected syscall context in panic report\nstdout:\n{}", result.stdout);
+    assert!(result.stdout.contains("User backtrace:"),
+        "expected user backtrace in panic report\nstdout:\n{}", result.stdout);
+
+    // 2. Kernel fault during syscall: classified as user fault (cr2=0 is in user address range)
+    //    Produces SEGFAULT with register dump and backtrace
+    assert!(result.stdout.contains("Registers:"),
+        "expected register dump from kernel fault\nstdout:\n{}", result.stdout);
+
+    // 3. User segfault: SEGFAULT with symbolized backtrace
+    assert!(result.stdout.contains("SEGFAULT tid="),
+        "expected SEGFAULT header\nstdout:\n{}", result.stdout);
+    assert!(result.stdout.contains("deliberate_null_deref"),
+        "expected deliberate_null_deref in segfault backtrace\nstdout:\n{}", result.stdout);
+
+    // All three should have symbolized backtraces (name+0xoffset)
+    assert!(result.stdout.contains("+0x"),
+        "expected symbolized backtraces\nstdout:\n{}", result.stdout);
+}

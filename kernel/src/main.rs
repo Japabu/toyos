@@ -56,65 +56,37 @@ use arch::{apic, cpu, idt, percpu, smp, syscall};
 use drivers::{acpi, gop, nvme, pci, serial, virtio_gpu, virtio_net, virtio_sound, xhci};
 use toyos_abi::boot::{KernelArgs, MemoryMapEntry};
 
-static PANIC_IN_PROGRESS: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
-
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
-    // Double-panic guard: if we panic inside the panic handler (or another CPU
-    // panics simultaneously), halt immediately with raw serial output.
-    if PANIC_IN_PROGRESS.swap(true, core::sync::atomic::Ordering::SeqCst) {
-        unsafe {
-            for &b in b"\n!!! DOUBLE PANIC !!!\n" {
-                core::arch::asm!("out dx, al", in("dx") 0x3F8u16, in("al") b);
-            }
-        }
+    unsafe { core::arch::asm!("cli", options(nomem, nostack)); }
+
+    // Early boot: percpu not ready, just halt (single CPU at this point)
+    if !log::PERCPU_READY.load(core::sync::atomic::Ordering::Relaxed) {
+        arch::idt::exceptions::raw_serial(b"\n!!! EARLY PANIC !!!\n");
         cpu::halt();
     }
 
-    log!("!!! PANIC !!!: {}", info);
-
-    // Walk the kernel stack for a backtrace
-    log!("  Backtrace:");
-    let rbp: u64;
-    unsafe { core::arch::asm!("mov {}, rbp", out(reg) rbp, options(nomem, nostack)); }
-    arch::idt::exceptions::kernel_backtrace(rbp, 20);
-
-    // Dump current process/thread context (try_lock to avoid deadlock)
-    if let Some(tid) = percpu::current_tid() {
-        log!("  Running: tid={}", tid);
-        if let Some(guard) = process::PROCESS_TABLE.try_lock() {
-            if let Some(table) = guard.as_ref() {
-                if let Some(entry) = table.get(tid) {
-                    let name = core::str::from_utf8(entry.name()).unwrap_or("?").trim_end_matches('\0');
-                    log!("  Process: {} pid={} state={}", name, entry.process(), entry.state().name());
-                }
-            }
-        }
-        // Print syscall context and user backtrace
-        let user_rip = percpu::syscall_rip();
-        let user_rsp = percpu::user_rsp();
-        if user_rip != 0 {
-            log!("  Syscall: num={} user_rip={:#x} user_rsp={:#x}", percpu::syscall_num(), user_rip, user_rsp);
-            log!("  User backtrace:");
-            process::resolve_user_symbol(tid, user_rip);
-            if let Some(pt) = scheduler::current_address_space() {
-                let mut rbp = percpu::syscall_rbp();
-                for _ in 0..20 {
-                    if rbp == 0 || rbp % 8 != 0 { break; }
-                    let Some(dm) = pt.lock().translate(UserAddr::new(rbp)) else { break };
-                    let saved_rbp = unsafe { *dm.as_ptr::<u64>() };
-                    let Some(dm_ret) = pt.lock().translate(UserAddr::new(rbp + 8)) else { break };
-                    let ret_addr = unsafe { *dm_ret.as_ptr::<u64>() };
-                    if ret_addr == 0 { break; }
-                    process::resolve_user_symbol(tid, ret_addr);
-                    rbp = saved_rbp;
-                }
-            }
-        }
+    // Per-CPU fault state transition
+    let prev = percpu::swap_fault_state(percpu::CpuFaultState::Panic);
+    if prev != percpu::CpuFaultState::Normal {
+        // Nested: Panic→Panic, Fatal→Panic, PageFault→Panic. Escalate.
+        arch::idt::exceptions::raw_serial(b"\n!!! DOUBLE PANIC !!!\n");
+        apic::halt_all_cpus();
     }
 
-    cpu::halt()
+    let rbp: u64;
+    unsafe { core::arch::asm!("mov {}, rbp", out(reg) rbp, options(nomem, nostack)); }
+
+    arch::idt::exceptions::crash_report(
+        &arch::idt::exceptions::CrashInfo::Panic { message: info, rbp }
+    );
+
+    // If in syscall context: kill the process, rejoin scheduler
+    if percpu::syscall_rip() != 0 && percpu::current_tid().is_some() {
+        arch::idt::exceptions::try_recover_from_panic();
+    }
+
+    apic::halt_all_cpus();
 }
 
 /// Kernel entry point. Called by bootloader with rdi = &KernelArgs.

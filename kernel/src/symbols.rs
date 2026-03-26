@@ -1,59 +1,13 @@
-use alloc::vec::Vec;
+use core::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 
+use alloc::boxed::Box;
 use elf::ElfBytes;
 use elf::endian::AnyEndian;
-use elf::abi::STT_FUNC;
-use crate::sync::Lock;
 
-struct Symbol {
-    addr: u64,
-    size: u64,
-    name_start: u32,
-}
-
-struct SymbolTable {
-    symbols: Vec<Symbol>,
-    names: Vec<u8>,
-}
-
-impl SymbolTable {
-    const fn new() -> Self {
-        Self { symbols: Vec::new(), names: Vec::new() }
-    }
-
-    /// Resolve an address without allocating. Returns the mangled symbol name.
-    fn resolve(&self, addr: u64) -> Option<(&str, u64)> {
-        if self.symbols.is_empty() { return None; }
-
-        let mut lo = 0usize;
-        let mut hi = self.symbols.len();
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            if self.symbols[mid].addr <= addr {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
-
-        if lo == 0 { return None; }
-        let sym = &self.symbols[lo - 1];
-        let offset = addr - sym.addr;
-
-        if sym.size > 0 && offset >= sym.size { return None; }
-
-        let name_start = sym.name_start as usize;
-        let name_end = self.names[name_start..].iter().position(|&b| b == 0)
-            .map(|i| name_start + i)
-            .unwrap_or(self.names.len());
-        let raw = unsafe { core::str::from_utf8_unchecked(&self.names[name_start..name_end]) };
-        Some((raw, offset))
-    }
-}
-
-/// Per-process symbol info. Points directly into the ELF in memory (initrd).
-/// No copying, no allocation — just pointers to .symtab and .strtab.
-pub struct ProcessSymbols {
+/// Zero-allocation symbol table. Points directly into ELF sections in memory.
+/// Resolution is a linear scan over raw Elf64_Sym entries — O(n) but lock-free,
+/// allocation-free, and safe to call from any context including panic/double-fault.
+pub struct SymbolTable {
     /// Raw .symtab section data in memory.
     symtab: *const u8,
     symtab_entries: usize,
@@ -68,11 +22,11 @@ pub struct ProcessSymbols {
     stack_end: u64,
 }
 
-// Safety: the initrd is mapped for the kernel's entire lifetime.
-unsafe impl Send for ProcessSymbols {}
-unsafe impl Sync for ProcessSymbols {}
+// Safety: the ELF data (initrd or kernel image) is mapped for the kernel's entire lifetime.
+unsafe impl Send for SymbolTable {}
+unsafe impl Sync for SymbolTable {}
 
-impl ProcessSymbols {
+impl SymbolTable {
     pub fn empty() -> Self {
         Self {
             symtab: core::ptr::null(),
@@ -87,7 +41,6 @@ impl ProcessSymbols {
         }
     }
 
-    /// Create with memory bounds but no symbols (no section headers available).
     pub fn empty_with_bounds(
         prog_base: u64, prog_end: u64,
         stack_base: u64, stack_end: u64,
@@ -102,7 +55,6 @@ impl ProcessSymbols {
         }
     }
 
-    /// Create from raw pointers to .symtab and .strtab already in memory.
     pub fn from_raw(
         symtab: *const u8, symtab_entries: usize,
         strtab: *const u8, strtab_len: usize,
@@ -118,13 +70,69 @@ impl ProcessSymbols {
         }
     }
 
+    /// Parse an ELF in memory and create a SymbolTable pointing into its sections.
+    /// No copying — only stores pointers into `data`.
+    fn from_elf(data: &[u8], base: u64) -> Self {
+        let elf = match ElfBytes::<AnyEndian>::minimal_parse(data) {
+            Ok(e) => e,
+            Err(_) => return Self::empty(),
+        };
+
+        // Find .symtab section header
+        let shdrs = match elf.section_headers() {
+            Some(s) => s,
+            None => return Self::empty(),
+        };
+
+        const SHT_SYMTAB: u32 = 2;
+        let mut symtab_shdr = None;
+        for shdr in shdrs.iter() {
+            if shdr.sh_type == SHT_SYMTAB {
+                symtab_shdr = Some(shdr);
+                break;
+            }
+        }
+        let Some(shdr) = symtab_shdr else { return Self::empty() };
+
+        let symtab_off = shdr.sh_offset as usize;
+        let symtab_size = shdr.sh_size as usize;
+        let entsize = if shdr.sh_entsize > 0 { shdr.sh_entsize as usize } else { 24 };
+        let link = shdr.sh_link as usize;
+
+        if symtab_off + symtab_size > data.len() { return Self::empty(); }
+
+        // Get linked strtab
+        let strtab_shdr = match shdrs.get(link) {
+            Ok(s) => s,
+            Err(_) => return Self::empty(),
+        };
+        let strtab_off = strtab_shdr.sh_offset as usize;
+        let strtab_size = strtab_shdr.sh_size as usize;
+        if strtab_off + strtab_size > data.len() { return Self::empty(); }
+
+        let symtab_ptr = unsafe { data.as_ptr().add(symtab_off) };
+        let strtab_ptr = unsafe { data.as_ptr().add(strtab_off) };
+        let entries = symtab_size / entsize;
+
+        Self {
+            symtab: symtab_ptr,
+            symtab_entries: entries,
+            strtab: strtab_ptr,
+            strtab_len: strtab_size,
+            base,
+            prog_base: 0,
+            prog_end: 0,
+            stack_base: 0,
+            stack_end: 0,
+        }
+    }
+
     pub fn is_valid_user_addr(&self, addr: u64) -> bool {
         (addr >= self.prog_base && addr < self.prog_end)
             || (addr >= self.stack_base && addr < self.stack_end)
     }
 
-    /// Resolve a user address to (mangled_name, offset).
-    /// Scans the .symtab in-place — no allocation.
+    /// Resolve an address to (mangled_name, offset). Linear scan — no allocation, no lock.
     pub fn resolve(&self, addr: u64) -> Option<(&str, u64)> {
         if self.symtab.is_null() || self.symtab_entries == 0 { return None; }
 
@@ -140,10 +148,13 @@ impl ProcessSymbols {
             let st_value = unsafe { u64::from_le_bytes(core::ptr::read_unaligned(entry.add(8) as *const [u8; 8])) };
             if st_value == 0 { continue; }
             let sym_addr = self.base + st_value;
-            if sym_addr <= addr && sym_addr > best_addr {
+            let st_size = unsafe { u64::from_le_bytes(core::ptr::read_unaligned(entry.add(16) as *const [u8; 8])) };
+            if sym_addr <= addr && (sym_addr > best_addr
+                || (sym_addr == best_addr && best_size == 0 && st_size > 0))
+            {
                 best_addr = sym_addr;
                 best_name_off = unsafe { u32::from_le_bytes(core::ptr::read_unaligned(entry as *const [u8; 4])) };
-                best_size = unsafe { u64::from_le_bytes(core::ptr::read_unaligned(entry.add(16) as *const [u8; 8])) };
+                best_size = st_size;
             }
         }
 
@@ -167,102 +178,52 @@ impl ProcessSymbols {
     pub fn prog_base(&self) -> u64 {
         self.prog_base
     }
-
 }
 
-// Kernel symbols (loaded once at boot, never cleared)
-static KERNEL_SYMS: Lock<SymbolTable> = Lock::new(SymbolTable::new());
-static KERNEL_BASE: Lock<u64> = Lock::new(0);
+// Kernel symbols — set once at boot, lock-free reads forever after.
+static KERNEL_SYMS: AtomicPtr<SymbolTable> = AtomicPtr::new(core::ptr::null_mut());
+static KERNEL_BASE: AtomicU64 = AtomicU64::new(0);
 
-/// Resolve and log an address against kernel symbols without allocating.
-/// Demangles directly to serial via fmt::Write. Safe to call from exception handlers.
+/// Set the kernel base address for crash diagnostics.
+pub fn set_kernel_base(base: u64) {
+    KERNEL_BASE.store(base, Ordering::Release);
+}
+
+/// Load kernel symbols from raw ELF bytes in the direct map. Called once at boot.
+/// Stores pointers into the ELF data — the only allocation is the ~72-byte SymbolTable struct.
+pub fn load_kernel(data: &[u8], base: u64) {
+    let table = SymbolTable::from_elf(data, base);
+    let count = table.symtab_entries;
+    KERNEL_SYMS.store(Box::into_raw(Box::new(table)), Ordering::Release);
+    log!("symbols: loaded {} kernel symbols", count);
+}
+
+/// Resolve and log an address against kernel symbols. Lock-free, allocation-free.
+/// Safe to call from any context including panic, double fault, NMI.
 pub fn resolve_kernel(addr: u64) -> Option<u64> {
-    resolve_kernel_inner(addr, false)
-}
-
-/// Like `resolve_kernel`, but uses try_lock to avoid deadlock.
-/// Safe to call from double fault / NMI handlers where locks may already be held.
-pub fn resolve_kernel_nonblocking(addr: u64) -> Option<u64> {
-    resolve_kernel_inner(addr, true)
-}
-
-fn resolve_kernel_inner(addr: u64, nonblocking: bool) -> Option<u64> {
-    let guard = if nonblocking { KERNEL_SYMS.try_lock() } else { Some(KERNEL_SYMS.lock()) };
-    let Some(guard) = guard else {
-        crate::log!("    {:#x}  [symbols locked]", addr);
+    let ptr = KERNEL_SYMS.load(Ordering::Acquire);
+    if ptr.is_null() {
+        log!("    {:#x}", addr);
         return None;
-    };
-    if let Some((raw, offset)) = guard.resolve(addr) {
-        // Demangle directly to serial via fmt::Write — no allocation.
-        crate::log!("    {:#x}  {:#}+{:#x}", addr, rustc_demangle::demangle(raw), offset);
+    }
+    let table = unsafe { &*ptr };
+    if let Some((raw, offset)) = table.resolve(addr) {
+        log!("    {:#x}  {:#}+{:#x}", addr, rustc_demangle::demangle(raw), offset);
         Some(offset)
     } else {
-        drop(guard);
-        let kernel_base = if nonblocking {
-            KERNEL_BASE.try_lock().map(|g| *g)
+        let kb = KERNEL_BASE.load(Ordering::Relaxed);
+        if kb != 0 && addr >= kb {
+            log!("    {:#x}  [kernel+{:#x}]", addr, addr - kb);
         } else {
-            Some(*KERNEL_BASE.lock())
-        };
-        if let Some(kb) = kernel_base {
-            if kb != 0 && addr >= kb {
-                crate::log!("    {:#x}  [kernel+{:#x}]", addr, addr - kb);
-            } else {
-                crate::log!("    {:#x}", addr);
-            }
-        } else {
-            crate::log!("    {:#x}", addr);
+            log!("    {:#x}", addr);
         }
         None
     }
 }
 
-/// Parse .symtab from raw ELF bytes into a SymbolTable.
-fn parse_symtab(data: &[u8], base: u64, table: &mut SymbolTable) {
-    table.symbols.clear();
-    table.names.clear();
-
-    let elf = match ElfBytes::<AnyEndian>::minimal_parse(data) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-
-    let (symtab, strtab) = match elf.symbol_table() {
-        Ok(Some(pair)) => pair,
-        _ => return,
-    };
-
-    for sym in symtab.iter() {
-        if sym.st_symtype() == STT_FUNC && sym.st_value != 0 {
-            let name = match strtab.get(sym.st_name as usize) {
-                Ok(n) => n,
-                Err(_) => continue,
-            };
-            let name_start = table.names.len() as u32;
-            table.names.extend_from_slice(name.as_bytes());
-            table.names.push(0);
-            table.symbols.push(Symbol {
-                addr: base + sym.st_value,
-                size: sym.st_size,
-                name_start,
-            });
-        }
-    }
-
-    table.symbols.sort_unstable_by_key(|s| s.addr);
-}
-
-
-/// Load kernel symbols from raw ELF bytes. Called once at boot.
-pub fn load_kernel(data: &[u8], base: u64) {
-    let mut table = KERNEL_SYMS.lock();
-    parse_symtab(data, base, &mut table);
-    log!("symbols: loaded {} kernel symbols", table.symbols.len());
-}
-
 /// Resolve and log a user address against a process's symbol table.
 /// Returns true if the address could be identified.
-/// Triggers lazy symbol loading on first call.
-pub fn resolve_user(syms: &ProcessSymbols, addr: u64) -> bool {
+pub fn resolve_user(syms: &SymbolTable, addr: u64) -> bool {
     if let Some((name, offset)) = syms.resolve(addr) {
         log!("    {:#x}  {:#}+{:#x}", addr, rustc_demangle::demangle(name), offset);
         true
@@ -273,10 +234,4 @@ pub fn resolve_user(syms: &ProcessSymbols, addr: u64) -> bool {
     } else {
         false
     }
-}
-
-
-/// Set the kernel base address for crash diagnostics.
-pub fn set_kernel_base(base: u64) {
-    *KERNEL_BASE.lock() = base;
 }

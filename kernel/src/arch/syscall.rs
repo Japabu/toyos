@@ -397,6 +397,11 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             let Some(buf) = ctx.user_slice_mut(UserAddr::new(a1), a2) else { return bad_addr };
             sys_query_modules(buf)
         }
+        SYS_DEBUG => match a1 {
+            0 => panic!("SYS_DEBUG: kernel panic triggered by userspace"),
+            1 => { unsafe { core::ptr::read_volatile(core::ptr::null::<u64>()); } 0 }
+            _ => SyscallError::InvalidArgument.to_u64(),
+        },
         _ => SyscallError::InvalidArgument.to_u64(),
     };
 

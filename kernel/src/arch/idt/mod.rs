@@ -28,6 +28,7 @@ enum Vector {
     Timer = 0x20,
     Xhci = 0x21,
     VirtioNet = 0x22,
+    HaltAll = 0xFD,
     TlbFlush = 0xFE,
 }
 
@@ -180,6 +181,12 @@ extern "sysv64" fn stub_pf() {
     naked_asm!("push 14", "jmp {common}", common = sym common_entry);
 }
 
+/// Halt IPI — received when another CPU calls halt_all_cpus(). Never returns.
+#[unsafe(naked)]
+extern "sysv64" fn stub_halt_all() {
+    naked_asm!("cli", "2: hlt", "jmp 2b");
+}
+
 /// Common exception entry: save all GPRs, call Rust dispatcher, restore, iretq.
 #[unsafe(naked)]
 extern "sysv64" fn common_entry() {
@@ -265,6 +272,7 @@ pub fn init() {
         idt.entries[Vector::Timer as usize] = IdtEntry::new(timer::timer_entry as *const () as u64);
         idt.entries[Vector::Xhci as usize] = IdtEntry::new(xhci::xhci_entry as *const () as u64);
         idt.entries[Vector::VirtioNet as usize] = IdtEntry::new(virtio_net::virtio_net_entry as *const () as u64);
+        idt.entries[Vector::HaltAll as usize] = IdtEntry::new(stub_halt_all as *const () as u64);
         idt.entries[Vector::TlbFlush as usize] = IdtEntry::new(tlb::tlb_flush_entry as *const () as u64);
     }
 

@@ -43,6 +43,16 @@ impl Tss {
     }
 }
 
+/// Per-CPU fault state machine. Encodes the escalation policy for nested faults.
+#[repr(u8)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CpuFaultState {
+    Normal = 0,
+    PageFault = 1,   // demand paging in progress
+    Fatal = 2,       // fatal exception handler running
+    Panic = 3,       // panic handler running
+}
+
 /// Per-CPU data. Accessed via GS segment in kernel mode.
 /// Field offsets are hardcoded in assembly — do not reorder.
 #[repr(C)]
@@ -64,10 +74,8 @@ pub struct PerCpu {
     pub syscall_num: u64,  // offset 224
     /// Saved user RBP at last syscall entry (for panic diagnostics).
     pub syscall_rbp: u64,  // offset 232
-    /// Per-CPU guard against recursive page faults.
-    pub in_page_fault: bool,
-    /// Per-CPU guard against re-entry into fatal_exception.
-    pub in_fatal: bool,
+    /// Per-CPU fault nesting state. Not accessed from asm.
+    fault_state: u8,
 }
 
 // GDT layout:
@@ -305,29 +313,25 @@ pub fn syscall_rbp() -> u64 {
     unsafe { (*percpu_ptr()).syscall_rbp }
 }
 
-/// Swap the per-CPU page fault recursion guard. Returns the previous value.
-pub fn swap_in_page_fault(val: bool) -> bool {
-    let p = unsafe { &mut (*percpu_ptr()).in_page_fault };
+/// Swap the per-CPU fault state. Returns the previous state.
+/// Not atomic — safe because only exception/panic entry points read or write
+/// fault_state, and they all run with interrupts disabled (interrupt gate for
+/// exceptions, explicit cli for panics). The timer handler never touches it.
+pub fn swap_fault_state(new: CpuFaultState) -> CpuFaultState {
+    let p = unsafe { &mut (*percpu_ptr()).fault_state };
     let old = *p;
-    *p = val;
-    old
+    *p = new as u8;
+    match old {
+        0 => CpuFaultState::Normal,
+        1 => CpuFaultState::PageFault,
+        2 => CpuFaultState::Fatal,
+        3 => CpuFaultState::Panic,
+        _ => CpuFaultState::Panic, // corrupted → treat as nested
+    }
 }
 
-/// Set the per-CPU page fault recursion guard.
-pub fn set_in_page_fault(val: bool) {
-    unsafe { (*percpu_ptr()).in_page_fault = val; }
-}
-
-/// Swap the per-CPU fatal exception recursion guard. Returns the previous value.
-pub fn swap_in_fatal(val: bool) -> bool {
-    let p = unsafe { &mut (*percpu_ptr()).in_fatal };
-    let old = *p;
-    *p = val;
-    old
-}
-
-/// Set the per-CPU fatal exception recursion guard.
-pub fn set_in_fatal(val: bool) {
-    unsafe { (*percpu_ptr()).in_fatal = val; }
+/// Set the per-CPU fault state.
+pub fn set_fault_state(new: CpuFaultState) {
+    unsafe { (*percpu_ptr()).fault_state = new as u8; }
 }
 
