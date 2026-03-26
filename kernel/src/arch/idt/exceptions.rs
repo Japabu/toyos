@@ -5,27 +5,6 @@ use crate::{log, mm, process, scheduler, symbols};
 use super::{Vector, TrapFrame, RPL_MASK, PF_PRESENT, PF_WRITE, PF_INSTRUCTION_FETCH};
 
 // ============================================================
-// Raw serial output — allocation-free, cannot cause recursive faults
-// ============================================================
-
-/// Write bytes to serial port 0x3F8 using raw port I/O.
-pub fn raw_serial(bytes: &[u8]) {
-    for &b in bytes {
-        unsafe { core::arch::asm!("out dx, al", in("dx") 0x3F8u16, in("al") b, options(nomem, nostack)); }
-    }
-}
-
-/// Write a u64 as hex to serial using raw port I/O.
-pub fn raw_serial_hex(prefix: &[u8], value: u64) {
-    raw_serial(prefix);
-    for i in (0..16).rev() {
-        let nibble = ((value >> (i * 4)) & 0xF) as u8;
-        let ch = if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 };
-        unsafe { core::arch::asm!("out dx, al", in("dx") 0x3F8u16, in("al") ch, options(nomem, nostack)); }
-    }
-}
-
-// ============================================================
 // Shared backtrace functions — allocation-free
 // ============================================================
 
@@ -517,13 +496,6 @@ pub(super) fn page_fault_handler(frame: &TrapFrame) {
 
     let fault_addr = cpu::read_cr2();
 
-    raw_serial(b"PF cr2=");
-    raw_serial_hex(b"", fault_addr);
-    raw_serial_hex(b" rip=", frame.rip);
-    raw_serial_hex(b" err=", frame.error_code);
-    raw_serial_hex(b" cr3=", cpu::read_cr3());
-    raw_serial(b"\n");
-
     // SMAP violation detection
     if frame.error_code & PF_PRESENT != 0 && frame.cs & RPL_MASK == 0
         && mm::is_kernel_addr(fault_addr)
@@ -575,16 +547,14 @@ fn fatal_exception(ctx: &ExceptionContext) -> ! {
     let prev = percpu::swap_fault_state(CpuFaultState::Fatal);
     let recursive = prev == CpuFaultState::Fatal || prev == CpuFaultState::Panic;
 
-    // Raw serial preamble — guaranteed output even if everything else is broken
     let tid_raw = percpu::current_tid().map_or(u32::MAX, |t| t.raw());
-    raw_serial_hex(b"\n!!! FAULT rip=", ctx.frame.rip);
-    raw_serial_hex(b" cr2=", ctx.cr2);
-    raw_serial_hex(b" err=", ctx.frame.error_code);
-    raw_serial_hex(b" cr3=", cpu::read_cr3());
-    raw_serial_hex(b" rsp=", ctx.frame.rsp);
-    raw_serial_hex(b" tid=", tid_raw as u64);
-    if recursive { raw_serial(b" RECURSIVE"); }
-    raw_serial(b"\n");
+    if recursive {
+        log!("!!! FAULT rip={:#018x} cr2={:#018x} err={:#018x} cr3={:#018x} rsp={:#018x} tid={} RECURSIVE",
+            ctx.frame.rip, ctx.cr2, ctx.frame.error_code, cpu::read_cr3(), ctx.frame.rsp, tid_raw);
+    } else {
+        log!("!!! FAULT rip={:#018x} cr2={:#018x} err={:#018x} cr3={:#018x} rsp={:#018x} tid={}",
+            ctx.frame.rip, ctx.cr2, ctx.frame.error_code, cpu::read_cr3(), ctx.frame.rsp, tid_raw);
+    }
 
     if recursive {
         if is_user {

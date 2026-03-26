@@ -16,7 +16,7 @@ static QEMU: LazyLock<Mutex<QemuInstance>> = LazyLock::new(|| {
 
     assert!(!rust_bins.is_empty(), "No Rust test binaries found");
 
-    Mutex::new(QemuInstance::boot(&[], &rust_bins))
+    Mutex::new(QemuInstance::boot(&rust_tests_dir, &[], &rust_bins))
 });
 
 fn check_test_result(result: &TestResult) {
@@ -102,27 +102,27 @@ fn panic_recovery_diagnostics() {
     check_test_result(&result);
 
     // 1. Syscall panic: PANIC header + kernel backtrace + syscall context + user backtrace
-    assert!(result.stdout.contains("!!! PANIC !!!"),
-        "expected PANIC header\nstdout:\n{}", result.stdout);
-    assert!(result.stdout.contains("SYS_DEBUG"),
-        "expected SYS_DEBUG in panic message\nstdout:\n{}", result.stdout);
-    assert!(result.stdout.contains("Syscall: num=92"),
-        "expected syscall context in panic report\nstdout:\n{}", result.stdout);
-    assert!(result.stdout.contains("User backtrace:"),
-        "expected user backtrace in panic report\nstdout:\n{}", result.stdout);
+    assert!(result.serial.contains("!!! PANIC !!!"),
+        "expected PANIC header\nstdout:\n{}", result.serial);
+    assert!(result.serial.contains("SYS_DEBUG"),
+        "expected SYS_DEBUG in panic message\nstdout:\n{}", result.serial);
+    assert!(result.serial.contains("Syscall: num=92"),
+        "expected syscall context in panic report\nstdout:\n{}", result.serial);
+    assert!(result.serial.contains("User backtrace:"),
+        "expected user backtrace in panic report\nstdout:\n{}", result.serial);
 
     // 2. Kernel fault during syscall: classified as user fault (cr2=0 is in user address range)
     //    Produces SEGFAULT with register dump and backtrace
-    assert!(result.stdout.contains("Registers:"),
-        "expected register dump from kernel fault\nstdout:\n{}", result.stdout);
+    assert!(result.serial.contains("Registers:"),
+        "expected register dump from kernel fault\nstdout:\n{}", result.serial);
 
     // 3. User segfault: SEGFAULT with symbolized backtrace
-    assert!(result.stdout.contains("SEGFAULT tid="),
-        "expected SEGFAULT header\nstdout:\n{}", result.stdout);
-    assert!(result.stdout.contains("deliberate_null_deref"),
-        "expected deliberate_null_deref in segfault backtrace\nstdout:\n{}", result.stdout);
+    assert!(result.serial.contains("SEGFAULT tid="),
+        "expected SEGFAULT header\nstdout:\n{}", result.serial);
+    assert!(result.serial.contains("deliberate_null_deref"),
+        "expected deliberate_null_deref in segfault backtrace\nstdout:\n{}", result.serial);
 
     // All three should have symbolized backtraces (name+0xoffset)
-    assert!(result.stdout.contains("+0x"),
-        "expected symbolized backtraces\nstdout:\n{}", result.stdout);
+    assert!(result.serial.contains("+0x"),
+        "expected symbolized backtraces\nstdout:\n{}", result.serial);
 }

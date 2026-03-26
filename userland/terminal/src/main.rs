@@ -21,7 +21,7 @@ fn main() {
     let mut window = Window::create_with_title(0, 0, "Terminal");
     gpu::set_screen_size(window.width(), window.height());
     let fb = window.framebuffer();
-    let font_data = std::fs::read("/share/fonts/JetBrainsMono-8x16.font").expect("failed to read font");
+    let font_data = std::fs::read("/share/fonts/JetBrainsMono-Regular-8x16.font").expect("failed to read font");
     let font = font::Font::from_prebuilt(&font_data);
     let mut console = console::Console::new(fb, font);
 

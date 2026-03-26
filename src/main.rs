@@ -68,10 +68,10 @@ fn main() {
     }
 
     // Ensure toolchain is up to date
-    let changes = toyos::toolchain::ensure(&root, rebuild_toolchain);
+    toyos::toolchain::ensure(&root, rebuild_toolchain);
 
     // Build everything
-    toyos::build::build(&root, debug, release, &changes);
+    toyos::build::build(&root, debug, release);
 
     if !build_only {
         qemu::launch(debug, dump_audio);

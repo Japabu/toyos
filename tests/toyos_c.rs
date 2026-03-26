@@ -32,7 +32,7 @@ static QEMU: LazyLock<Mutex<QemuInstance>> = LazyLock::new(|| {
     let mut c_test_bins: Vec<(String, Vec<u8>)> = Vec::new();
     for name in TOYOS_C_TESTS {
         let result = std::panic::catch_unwind(|| {
-            let (obj, extras) = compile::compile_c(name, Some("x86_64-unknown-toyos"));
+            let (obj, extras) = compile::compile_c(name);
             compile::link_toyos(&obj, &extras, name)
         });
         match result {
@@ -41,7 +41,8 @@ static QEMU: LazyLock<Mutex<QemuInstance>> = LazyLock::new(|| {
         }
     }
     eprintln!("[toyos_c] Booting QEMU with {} test binaries...", c_test_bins.len());
-    Mutex::new(QemuInstance::boot(&c_test_bins, &[]))
+    let test_config = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/testcases");
+    Mutex::new(QemuInstance::boot(&test_config, &c_test_bins, &[]))
 });
 
 fn check_test_result(result: &TestResult) {
@@ -208,7 +209,7 @@ fn debug() {
     let mut c_test_bins: Vec<(String, Vec<u8>)> = Vec::new();
     for name in TOYOS_C_TESTS {
         let result = std::panic::catch_unwind(|| {
-            let (obj, extras) = compile::compile_c(name, Some("x86_64-unknown-toyos"));
+            let (obj, extras) = compile::compile_c(name);
             compile::link_toyos(&obj, &extras, name)
         });
         match result {
@@ -218,7 +219,8 @@ fn debug() {
     }
 
     eprintln!("[debug] Booting QEMU in debug mode with {} test binaries...", c_test_bins.len());
-    let mut qemu = QemuInstance::boot_with_options(&c_test_bins, &[], true, true);
+    let test_config = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/testcases");
+    let mut qemu = QemuInstance::boot_with_options(&test_config, &c_test_bins, &[], true, true);
 
     let repo = compile::repo_root();
     let kernel_elf = repo.join("kernel/target/x86_64-unknown-none/debug/kernel");

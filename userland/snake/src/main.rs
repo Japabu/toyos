@@ -109,7 +109,7 @@ impl Game {
             )
             .unwrap();
 
-        let font = font::Font::from_prebuilt(include_bytes!(concat!(env!("OUT_DIR"), "/JetBrainsMono-8x16.font")));
+        let font = font::Font::from_prebuilt(include_bytes!(concat!(env!("OUT_DIR"), "/JetBrainsMono-Regular-8x16.font")));
 
         let cols = size.width as usize / CELL;
         let rows = (size.height as usize).saturating_sub(HEADER) / CELL;

@@ -1,0 +1,17 @@
+init = ["/bin/test-runner"]
+
+[programs]
+test-runner = {}
+toybox = {}
+
+[symlinks]
+"bin/cat" = "/bin/toybox"
+"bin/echo" = "/bin/toybox"
+"bin/free" = "/bin/toybox"
+"bin/grep" = "/bin/toybox"
+"bin/ls" = "/bin/toybox"
+"bin/mkdir" = "/bin/toybox"
+"bin/ps" = "/bin/toybox"
+"bin/pwd" = "/bin/toybox"
+"bin/rm" = "/bin/toybox"
+"bin/shutdown" = "/bin/toybox"

@@ -6,7 +6,7 @@ fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let ttf = fs::read("../../assets/JetBrainsMono-Regular.ttf").expect("Failed to read font TTF");
     let font_data = rasterize_font(&ttf, 8, 16);
-    fs::write(out_dir.join("JetBrainsMono-8x16.font"), font_data).unwrap();
+    fs::write(out_dir.join("JetBrainsMono-Regular-8x16.font"), font_data).unwrap();
     println!("cargo:rerun-if-changed=../../assets/JetBrainsMono-Regular.ttf");
 }
 

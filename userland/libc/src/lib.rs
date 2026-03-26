@@ -62,6 +62,17 @@ mod runtime {
         toyos_abi::syscall::exit(134) // SIGABRT-like
     }
 
+    // Unwinding stubs — core references these symbols via .eh_frame, but with
+    // panic=abort the unwinding path is never taken. Provide no-op/abort stubs
+    // to satisfy the linker.
+    #[unsafe(no_mangle)]
+    extern "C" fn rust_eh_personality() {}
+
+    #[unsafe(no_mangle)]
+    extern "C" fn _Unwind_Resume() -> ! {
+        toyos_abi::syscall::exit(134)
+    }
+
     struct MmapAllocator;
 
     unsafe impl dlmalloc::Allocator for MmapAllocator {

@@ -80,42 +80,58 @@ fn rasterize_font(ttf_bytes: &[u8], cell_width: usize, cell_height: usize) -> Ve
     out
 }
 
-pub fn collect() -> Vec<(String, Vec<u8>)> {
+pub fn collect(dirs: &[String]) -> Vec<(String, Vec<u8>)> {
     let mut files = vec![];
 
-    // Pre-rasterize the font at build time so userland gets instant font loading
-    let ttf = fs::read("assets/JetBrainsMono-Regular.ttf").expect("Failed to read font TTF");
-    let font_data = rasterize_font(&ttf, 8, 16);
-    files.push(("share/fonts/JetBrainsMono-8x16.font".to_string(), font_data));
+    for dir in dirs {
+        let dir = Path::new(dir);
 
-    // Pre-decode wallpaper JPEG at build time so the compositor gets instant loading
-    let jpg_data = fs::read("assets/wallpaper.jpg").expect("Failed to read wallpaper JPEG");
-    let img = image::load_from_memory_with_format(&jpg_data, image::ImageFormat::Jpeg)
-        .expect("Failed to decode wallpaper JPEG")
-        .to_rgb8();
-    let mut wallpaper_data = Vec::new();
-    wallpaper_data.extend((img.width() as u32).to_le_bytes());
-    wallpaper_data.extend((img.height() as u32).to_le_bytes());
-    wallpaper_data.extend(img.as_raw());
-    files.push(("share/wallpaper.rgb".to_string(), wallpaper_data));
-
-    // Include all other files in assets/ (recursively, skipping handled files)
-    fn add_dir(dir: &Path, prefix: &str, files: &mut Vec<(String, Vec<u8>)>) {
+        // Pre-rasterize TTF fonts
         for entry in fs::read_dir(dir).unwrap_or_else(|e| panic!("Failed to read {}: {e}", dir.display())) {
             let path = entry.unwrap().path();
-            if path.is_dir() {
-                let subdir = path.file_name().unwrap().to_str().unwrap();
-                add_dir(&path, &format!("{prefix}{subdir}/"), files);
-            } else if path.extension().is_some_and(|e| e == "ttf" || e == "jpg") {
-                continue; // TTF and JPEG handled above via pre-processing
-            } else {
-                let name = path.file_name().unwrap().to_str().unwrap().to_lowercase();
-                let data = fs::read(&path).unwrap_or_else(|e| panic!("Failed to read {}: {e}", path.display()));
-                files.push((format!("{prefix}{name}"), data));
+            if path.extension().is_some_and(|e| e == "ttf") {
+                let ttf = fs::read(&path).unwrap_or_else(|e| panic!("Failed to read {}: {e}", path.display()));
+                let stem = path.file_stem().unwrap().to_str().unwrap();
+                let font_data = rasterize_font(&ttf, 8, 16);
+                files.push((format!("share/fonts/{stem}-8x16.font"), font_data));
             }
         }
+
+        // Pre-decode JPEG images
+        for entry in fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|e| e == "jpg") {
+                let jpg_data = fs::read(&path).unwrap_or_else(|e| panic!("Failed to read {}: {e}", path.display()));
+                let img = image::load_from_memory_with_format(&jpg_data, image::ImageFormat::Jpeg)
+                    .expect("Failed to decode JPEG")
+                    .to_rgb8();
+                let stem = path.file_stem().unwrap().to_str().unwrap();
+                let mut data = Vec::new();
+                data.extend((img.width() as u32).to_le_bytes());
+                data.extend((img.height() as u32).to_le_bytes());
+                data.extend(img.as_raw());
+                files.push((format!("share/{stem}.rgb"), data));
+            }
+        }
+
+        // Include all other files recursively (skipping pre-processed types)
+        fn add_dir(dir: &Path, prefix: &str, files: &mut Vec<(String, Vec<u8>)>) {
+            for entry in fs::read_dir(dir).unwrap_or_else(|e| panic!("Failed to read {}: {e}", dir.display())) {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    let subdir = path.file_name().unwrap().to_str().unwrap();
+                    add_dir(&path, &format!("{prefix}{subdir}/"), files);
+                } else if path.extension().is_some_and(|e| e == "ttf" || e == "jpg") {
+                    continue;
+                } else {
+                    let name = path.file_name().unwrap().to_str().unwrap().to_lowercase();
+                    let data = fs::read(&path).unwrap_or_else(|e| panic!("Failed to read {}: {e}", path.display()));
+                    files.push((format!("{prefix}{name}"), data));
+                }
+            }
+        }
+        add_dir(dir, "share/", &mut files);
     }
-    add_dir(Path::new("assets"), "share/", &mut files);
 
     files
 }

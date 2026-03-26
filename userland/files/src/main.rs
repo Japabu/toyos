@@ -54,7 +54,7 @@ impl FileBrowser {
         let window = Window::create_with_title(0, 0, "Files");
         let fb = window.framebuffer();
 
-        let font_data = fs::read("/share/fonts/JetBrainsMono-8x16.font").expect("failed to read font");
+        let font_data = fs::read("/share/fonts/JetBrainsMono-Regular-8x16.font").expect("failed to read font");
         let font = font::Font::from_prebuilt(&font_data);
 
         let folder_svg = fs::read("/share/icons/folder-bold.svg").expect("failed to read folder icon");

@@ -62,7 +62,7 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 
     // Early boot: percpu not ready, just halt (single CPU at this point)
     if !log::PERCPU_READY.load(core::sync::atomic::Ordering::Relaxed) {
-        arch::idt::exceptions::raw_serial(b"\n!!! EARLY PANIC !!!\n");
+        log!("!!! EARLY PANIC !!!");
         cpu::halt();
     }
 
@@ -70,7 +70,7 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     let prev = percpu::swap_fault_state(percpu::CpuFaultState::Panic);
     if prev != percpu::CpuFaultState::Normal {
         // Nested: Panic→Panic, Fatal→Panic, PageFault→Panic. Escalate.
-        arch::idt::exceptions::raw_serial(b"\n!!! DOUBLE PANIC !!!\n");
+        log!("!!! DOUBLE PANIC !!!");
         apic::halt_all_cpus();
     }
 

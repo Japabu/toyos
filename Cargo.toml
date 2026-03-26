@@ -16,7 +16,6 @@ image = { version = "0.25", default-features = false, features = ["jpeg"] }
 [dev-dependencies]
 toyos-cc = { path = "toyos-cc" }
 toyos-ld = { path = "toyos-ld" }
-wait-timeout = "0.2.1"
 
 [profile.release]
 opt-level = 2

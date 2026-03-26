@@ -7,6 +7,9 @@ init = [
     "/bin/sshd",
 ]
 
+hosted-rustc = true
+assets = ["assets"]
+
 [programs]
 shell = {}
 terminal = {}
@@ -23,7 +26,9 @@ filepicker = {}
 toybox = {}
 input-test = {}
 proctest = {}
-# cargo = { no-default-features = true, warnings = false }
+toyos-ld = { path = "toyos-ld" }
+toyos-cc = { path = "toyos-cc" }
+# cargo = { path = "userland/cargo", no-default-features = true, warnings = false }
 
 # Symlinks created in the initrd at build time.
 # Paths are relative to the filesystem root (no leading /).

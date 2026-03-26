@@ -684,7 +684,7 @@ fn main() {
     upload_cursor(cursor_buf, &cursor_default, hw_cursor);
     let mut current_cursor_style: u8 = window::CURSOR_DEFAULT;
 
-    let font_data = std::fs::read("/share/fonts/JetBrainsMono-8x16.font").expect("failed to read font");
+    let font_data = std::fs::read("/share/fonts/JetBrainsMono-Regular-8x16.font").expect("failed to read font");
     let font = font::Font::from_prebuilt(&font_data);
 
     let wallpaper_raw = std::fs::read("/share/wallpaper.rgb").expect("failed to read wallpaper");
