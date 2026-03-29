@@ -6,6 +6,7 @@ use hashbrown::HashMap;
 
 use crate::arch::{cpu, percpu};
 use crate::io_uring::RingId;
+use crate::listener::ListenerId;
 use crate::pipe::PipeId;
 use crate::process::{self, IdleProof, OwnedAlloc, PageTables, Pid, Tid, KERNEL_STACK_SIZE};
 use crate::sync::Lock;
@@ -47,12 +48,12 @@ pub fn clear_poison(tid: Tid) {
 // EventSource — what wakes a blocked thread
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum EventSource {
     Keyboard,
     Mouse,
     Network,
-    Listener,
+    Listener(ListenerId),
     PipeReadable(PipeId),
     PipeWritable(PipeId),
     Futex(DirectMap),
@@ -243,10 +244,10 @@ impl CpuRunQueue {
 pub struct CpuQueueGuard<'a>(crate::sync::LockGuard<'a, CpuRunQueue>);
 
 impl<'a> CpuQueueGuard<'a> {
-    pub fn pick_next(&mut self) -> Option<ThreadCtx> {
-        while let Some((_, ctx)) = self.0.ready.pop_first() {
+    pub fn pick_next(&mut self) -> Option<(u64, ThreadCtx)> {
+        while let Some(((vrt, _), ctx)) = self.0.ready.pop_first() {
             if !is_poisoned(ctx.tid) {
-                return Some(ctx);
+                return Some((vrt, ctx));
             }
             // Poisoned thread — drop its SchedContext, it will never run again.
         }
@@ -442,6 +443,10 @@ impl Scheduler {
         self.vruntimes.lock_unwrap().entry(process).or_insert(min);
     }
 
+    fn remove_vruntime(&self, process: Pid) {
+        self.vruntimes.lock_unwrap().remove(&process);
+    }
+
     fn pick_target_cpu(&self) -> u32 {
         let count = crate::arch::smp::cpu_count();
         let mut best_cpu = 0u32;
@@ -480,6 +485,18 @@ impl Scheduler {
 // Public API
 // ---------------------------------------------------------------------------
 
+pub fn remove_vruntime(process: Pid) {
+    SCHEDULER.remove_vruntime(process);
+}
+
+pub fn process_vruntime(process: Pid) -> u64 {
+    SCHEDULER.vruntimes.lock_unwrap().get(&process).copied().unwrap_or(0)
+}
+
+pub fn global_min_vruntime() -> u64 {
+    SCHEDULER.min_vruntime.load(Ordering::Relaxed)
+}
+
 pub fn enqueue_new(ctx: ThreadCtx) {
     SCHEDULER.init_vruntime(ctx.process);
     let cpu = SCHEDULER.pick_target_cpu();
@@ -492,13 +509,10 @@ pub fn enqueue_new(ctx: ThreadCtx) {
     }
 }
 
-/// Block the current thread on the given event sources with optional deadline.
-/// `deadline = 0` means no timeout. `events` empty means woken only by `wake_tid` or deadline.
-pub fn block(events: &[EventSource], deadline: u64) {
-    do_schedule(SwitchReason::Block {
-        event: events.first().copied(),
-        deadline,
-    });
+/// Block the current thread on an optional event source with optional deadline.
+/// `deadline = 0` means no timeout. `event = None` means woken only by `wake_tid` or deadline.
+pub fn block(event: Option<EventSource>, deadline: u64) {
+    do_schedule(SwitchReason::Block { event, deadline });
 }
 
 pub fn yield_now() {
@@ -637,7 +651,7 @@ pub fn futex_wait(phys_addr: DirectMap, expected: u32, deadline: u64) -> bool {
         return false;
     }
     drop(_futex);
-    block(&[EventSource::Futex(phys_addr)], deadline);
+    block(Some(EventSource::Futex(phys_addr)), deadline);
     true
 }
 
@@ -772,7 +786,8 @@ fn do_schedule(reason: SwitchReason) {
         queue.set_outgoing(old, reason);
     }
 
-    if let Some(new) = queue.pick_next() {
+    if let Some((vrt, new)) = queue.pick_next() {
+        SCHEDULER.min_vruntime.store(vrt, Ordering::Relaxed);
         CONTEXT_SWITCHES.fetch_add(1, Ordering::Relaxed);
         crate::arch::apic::arm_one_shot(PREEMPTION_QUANTUM_NS);
         let new_cr3 = new.cr3();
@@ -881,7 +896,8 @@ fn cpu_idle_loop() -> ! {
         let cpu = percpu::cpu_id() as usize;
         {
             let mut queue = SCHEDULER.lock_cpu(cpu);
-            if let Some(new) = queue.pick_next() {
+            if let Some((vrt, new)) = queue.pick_next() {
+                SCHEDULER.min_vruntime.store(vrt, Ordering::Relaxed);
                 crate::arch::apic::arm_one_shot(PREEMPTION_QUANTUM_NS);
                 let new_cr3 = new.cr3();
                 let new_fs_base = new.fs_base;
@@ -950,7 +966,7 @@ fn event_name(event: &EventSource) -> &'static str {
         EventSource::Keyboard => "Keyboard",
         EventSource::Mouse => "Mouse",
         EventSource::Network => "Network",
-        EventSource::Listener => "Listener",
+        EventSource::Listener(_) => "Listener",
         EventSource::PipeReadable(_) => "PipeR",
         EventSource::PipeWritable(_) => "PipeW",
         EventSource::Futex(_) => "Futex",

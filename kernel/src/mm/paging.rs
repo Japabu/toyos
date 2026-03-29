@@ -264,7 +264,7 @@ impl AddressSpace {
             }
             let gap = top - region_end;
             if gap >= total {
-                return Some(UserAddr::new(region_end));
+                return Some(UserAddr::new(top - total));
             }
             top = start.raw();
         }
@@ -308,6 +308,10 @@ impl AddressSpace {
 
     /// Insert a region at a specific address (for ELF segments, stack, etc.)
     pub fn insert_region(&mut self, addr: UserAddr, region: Region) {
+        assert!(
+            self.find_region(addr).is_none(),
+            "insert_region: address {:#x} already occupied", addr.raw()
+        );
         self.regions.insert(addr, region);
     }
 
@@ -323,8 +327,10 @@ impl AddressSpace {
 
     /// Iterate all regions that overlap the range [start, end).
     pub fn overlapping_regions(&self, start: UserAddr, end: UserAddr) -> impl Iterator<Item = (&UserAddr, &Region)> {
-        self.regions.iter().filter(move |(&s, r)| {
-            s.raw() < end.raw() && s.raw() + r.size > start.raw()
+        // A region starting at s with size n overlaps [start, end) iff s < end && s+n > start.
+        // Use range(..end) to skip regions starting at or after end, then filter the lower bound.
+        self.regions.range(..end).filter(move |(&s, r)| {
+            s.raw() + r.size > start.raw()
         })
     }
 

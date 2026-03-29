@@ -75,6 +75,7 @@ toyos_rust_tests!(
     std_tls_cranelift,
     std_unwind,
     std_unwind_so,
+    sched_stress,
 );
 
 #[test]

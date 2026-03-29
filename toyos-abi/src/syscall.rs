@@ -87,6 +87,7 @@ pub const SYS_QUERY_MODULES: u64 = 91;
 ///   0 = kernel panic (triggers panic!() in syscall context)
 ///   1 = kernel fault (null pointer deref in kernel context)
 pub const SYS_DEBUG: u64 = 92;
+pub const SYS_SCHED_INFO: u64 = 93;
 
 pub const WNOHANG: u64 = 1;
 
@@ -983,4 +984,23 @@ pub struct ModuleInfo {
 /// if `buf` is too small.
 pub fn query_modules(buf: &mut [u8]) -> Result<usize, SyscallError> {
     check(syscall(SYS_QUERY_MODULES, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0)).map(|n| n as usize)
+}
+
+// --- Scheduler introspection ---
+
+/// Scheduler info for the calling process.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct SchedInfo {
+    /// Current vruntime of this process (nanoseconds of virtual CPU time).
+    pub vruntime: u64,
+    /// Global min_vruntime frontier (minimum vruntime across all runnable processes).
+    pub min_vruntime: u64,
+}
+
+/// Get scheduler info for the calling process.
+pub fn sched_info() -> SchedInfo {
+    let mut info = SchedInfo { vruntime: 0, min_vruntime: 0 };
+    syscall(SYS_SCHED_INFO, &mut info as *mut SchedInfo as u64, 0, 0, 0);
+    info
 }

@@ -8,7 +8,8 @@ use crate::mm::PAGE_2M;
 // ---------------------------------------------------------------------------
 
 /// Dynamic allocations grow top-down from this ceiling.
-pub const ALLOC_CEILING: u64 = 0x0080_0000_0000; // 512 GB
+/// Must stay below SHM_BASE — shared memory lives above this.
+pub const ALLOC_CEILING: u64 = SHM_BASE;
 
 /// Nothing allocated below this floor (guard against NULL-ish addresses).
 pub const ALLOC_FLOOR: u64 = 0x0002_0000_0000; // 8 GB

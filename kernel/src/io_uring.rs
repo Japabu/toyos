@@ -7,9 +7,11 @@
 //! One-shot POLL_ADD: each fires once, then the pending poll is consumed.
 //! Userspace must re-submit POLL_ADD to re-arm.
 //!
-//! Lock ordering: IO_URINGS is never held while acquiring PIPES or device locks.
-//! The wake path copies watcher lists under source locks, releases them, then
-//! acquires IO_URINGS.
+//! Lock ordering: the wake path copies watcher lists under source locks (PIPES,
+//! LISTENERS, device locks), releases them, then acquires IO_URINGS.
+//! The recheck path in process_poll_add holds IO_URINGS while calling source
+//! readiness checks (which acquire source locks internally). This is safe
+//! because no path holds source locks while acquiring IO_URINGS.
 
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
@@ -322,7 +324,7 @@ pub fn enter(
             return Ok(count);
         }
 
-        scheduler::block(&[EventSource::IoUring(ring_id)], deadline);
+        scheduler::block(Some(EventSource::IoUring(ring_id)), deadline);
     }
 }
 
@@ -391,8 +393,8 @@ fn process_poll_add(ring_id: RingId, sqe: &IoUringSqe) {
     let flags = PollFlags::from_raw(sqe.op_flags);
     let user_data = sqe.user_data;
 
-    // Check readiness first
-    let (ready, read_source, write_source) = process::with_current_data(|data| {
+    // Check readiness first (use fd_owner_data — fds belong to the process, not the thread)
+    let (ready, read_source, write_source) = process::with_fd_owner_data(|data| {
         let readable = flags.readable() && fd::has_data(&data.fds, fd_num);
         let writable = flags.writable() && fd::has_space(&data.fds, fd_num);
         let rsrc = if flags.readable() {
@@ -435,6 +437,22 @@ fn process_poll_add(ring_id: RingId, sqe: &IoUringSqe) {
             write_source,
             _watcher: watcher,
         });
+
+        // Recheck: close TOCTOU window between readiness check and PendingPoll
+        // insertion. A concurrent wake (complete_pending_for_event) either already
+        // ran and found no PendingPoll (recheck catches the data it left behind),
+        // or is blocked on IO_URINGS and will find the PendingPoll after we release.
+        let became_ready = read_source.as_ref().map_or(false, source_ready)
+            || write_source.as_ref().map_or(false, source_ready);
+        if became_ready {
+            let pp = instance.pending_polls.pop().unwrap();
+            let mut result_flags = 0u32;
+            if pp.flags.readable() { result_flags |= PollFlags::IN.raw(); }
+            if pp.flags.writable() { result_flags |= PollFlags::OUT.raw(); }
+            instance.post_cqe(pp.user_data, result_flags as i32, 0);
+            // Wake any other thread blocked in enter() on this ring.
+            scheduler::push_event(EventSource::IoUring(ring_id));
+        }
     }
 }
 
@@ -458,7 +476,7 @@ fn process_accept(ring_id: RingId, sqe: &IoUringSqe) {
     let user_data = sqe.user_data;
 
     // Get the listener name from the fd
-    let listener_name = process::with_current_data(|data| {
+    let listener_name = process::with_fd_owner_data(|data| {
         match data.fds.get(fd_num) {
             Some(fd::Descriptor::Listener(name)) => Some(name.clone()),
             _ => None,
@@ -473,7 +491,7 @@ fn process_accept(ring_id: RingId, sqe: &IoUringSqe) {
     match crate::listener::pop_connection(&name) {
         Some(conn) => {
             // Create socket fd from the pending connection
-            let new_fd = process::with_current_data(|data| {
+            let new_fd = process::with_fd_owner_data(|data| {
                 data.fds.insert(fd::Descriptor::Socket {
                     rx: conn.rx,
                     tx: conn.tx,
@@ -492,7 +510,7 @@ fn process_close(ring_id: RingId, sqe: &IoUringSqe) {
     let user_data = sqe.user_data;
     let pid = process::current_process();
 
-    let result = process::with_current_data(|data| {
+    let result = process::with_fd_owner_data(|data| {
         fd::close(&mut data.fds, &mut *crate::vfs::lock(), fd_num, pid)
     });
 
@@ -610,6 +628,20 @@ pub fn destroy(ring_id: RingId) {
 // Watcher list operations — dispatch to the source object
 // ---------------------------------------------------------------------------
 
+/// Check if an event source is currently ready. Called under IO_URINGS lock
+/// during the TOCTOU recheck in process_poll_add.
+fn source_ready(source: &EventSource) -> bool {
+    match source {
+        EventSource::PipeReadable(id) => pipe::has_data(*id),
+        EventSource::PipeWritable(id) => pipe::has_space(*id),
+        EventSource::Listener(id) => crate::listener::has_pending_by_id(*id),
+        EventSource::Keyboard => crate::keyboard::has_data(),
+        EventSource::Mouse => crate::mouse::has_data(),
+        EventSource::Network => crate::net::has_packet(),
+        EventSource::Futex(_) | EventSource::IoUring(_) => false,
+    }
+}
+
 fn add_watcher_to_source(source: &EventSource, ring_id: RingId) {
     match source {
         EventSource::PipeReadable(pipe_id) | EventSource::PipeWritable(pipe_id) => {
@@ -618,7 +650,7 @@ fn add_watcher_to_source(source: &EventSource, ring_id: RingId) {
         EventSource::Keyboard => crate::keyboard::add_io_uring_watcher(ring_id),
         EventSource::Mouse => crate::mouse::add_io_uring_watcher(ring_id),
         EventSource::Network => crate::net::add_io_uring_watcher(ring_id),
-        EventSource::Listener => crate::listener::add_io_uring_watcher(ring_id),
+        EventSource::Listener(id) => crate::listener::add_io_uring_watcher(*id, ring_id),
         EventSource::Futex(_) | EventSource::IoUring(_) => {}
     }
 }
@@ -631,7 +663,7 @@ fn remove_watcher_from_source(source: &EventSource, ring_id: RingId) {
         EventSource::Keyboard => crate::keyboard::remove_io_uring_watcher(ring_id),
         EventSource::Mouse => crate::mouse::remove_io_uring_watcher(ring_id),
         EventSource::Network => crate::net::remove_io_uring_watcher(ring_id),
-        EventSource::Listener => crate::listener::remove_io_uring_watcher(ring_id),
+        EventSource::Listener(id) => crate::listener::remove_io_uring_watcher(*id, ring_id),
         EventSource::Futex(_) | EventSource::IoUring(_) => {}
     }
 }
@@ -644,7 +676,7 @@ pub fn watchers_for_source(source: &EventSource) -> Vec<RingId> {
         EventSource::Keyboard => crate::keyboard::io_uring_watchers(),
         EventSource::Mouse => crate::mouse::io_uring_watchers(),
         EventSource::Network => crate::net::io_uring_watchers(),
-        EventSource::Listener => crate::listener::io_uring_watchers(),
+        EventSource::Listener(id) => crate::listener::io_uring_watchers(*id),
         EventSource::Futex(_) | EventSource::IoUring(_) => Vec::new(),
     }
 }

@@ -221,7 +221,8 @@ pub struct SchedEntry {
     kind: Kind,
     name: [u8; 28],
     memory_size: u64,
-    data: Arc<Lock<ProcessData>>,
+    process_data: Arc<Lock<ProcessData>>,
+    thread_data: Arc<Lock<ThreadData>>,
     symbols: Arc<Lock<SymbolTable>>,
 }
 
@@ -233,10 +234,11 @@ impl SchedEntry {
         kind: Kind,
         name: [u8; 28],
         memory_size: u64,
-        data: Arc<Lock<ProcessData>>,
+        process_data: Arc<Lock<ProcessData>>,
+        thread_data: Arc<Lock<ThreadData>>,
         symbols: Arc<Lock<SymbolTable>>,
     ) -> Self {
-        Self { tid, process, state, kind, name, memory_size, data, symbols }
+        Self { tid, process, state, kind, name, memory_size, process_data, thread_data, symbols }
     }
 
     pub fn tid(&self) -> Tid { self.tid }
@@ -245,7 +247,8 @@ impl SchedEntry {
     pub fn kind(&self) -> &Kind { &self.kind }
     pub fn name(&self) -> &[u8; 28] { &self.name }
     pub fn memory_size(&self) -> u64 { self.memory_size }
-    pub fn data(&self) -> &Arc<Lock<ProcessData>> { &self.data }
+    pub fn process_data(&self) -> &Arc<Lock<ProcessData>> { &self.process_data }
+    pub fn thread_data(&self) -> &Arc<Lock<ThreadData>> { &self.thread_data }
     pub fn symbols(&self) -> &Arc<Lock<SymbolTable>> { &self.symbols }
 
     /// CPU time in nanoseconds, retrieved from the scheduler's ThreadCtx.
@@ -334,19 +337,19 @@ impl PageFaultTrace {
     pub fn total(&self) -> u64 { self.total }
 }
 
-/// Per-process data independently lockable via `Arc<Lock<ProcessData>>`.
-/// Syscalls clone the Arc from SchedEntry, drop the table lock, then lock this.
+/// Process-level data shared across all threads via `Arc<Lock<ProcessData>>`.
+/// Contains fds, memory mappings, loaded libraries — everything that belongs to the process.
+/// Accessed via `with_fd_owner_data`. All threads of a process share the same Arc.
 pub struct ProcessData {
-    pub pid: Pid,
     pub fds: FdTable,
     pub cwd: String,
+    /// Inherited environment variables (KEY=VALUE\0KEY2=VALUE2\0...)
+    pub env: Vec<u8>,
 
     pub elf_alloc: Option<OwnedAlloc>,
-    pub stack_pages: Option<PageAlloc>,
-    // Thread-local storage
+    // Thread-local storage (process-level: template, modules, layout)
     pub tls_template: Option<crate::mm::KernelSlice>,
     pub tls_memsz: usize,
-    pub tls_pages: Option<PageAlloc>,
     /// Multi-module TLS layout per loaded library.
     pub tls_modules: Vec<crate::elf::TlsModule>,
     /// Total combined TLS size across all modules.
@@ -355,24 +358,13 @@ pub struct ProcessData {
     pub tls_max_align: usize,
     /// Next module ID to assign on dlopen (1-based, exe=1).
     pub next_tls_module_id: u64,
-    /// Dynamically allocated TLS blocks for dlopen'd modules (keyed by module_id).
     /// Dynamically allocated TLS blocks for dlopen'd modules, keyed by (thread Tid, module_id).
-    /// Stored in the process-level (fd-owner) data so the VMA and backing memory have the same lifetime.
+    /// Stored in process-level data so the VMA and backing memory have the same lifetime.
     pub dynamic_tls_blocks: alloc::collections::BTreeMap<(Tid, u64), PageAlloc>,
     // Dynamically loaded shared libraries (indexed by dlopen handle)
     pub loaded_libs: Vec<elf::LoadedLib>,
     // Anonymous memory mappings (mmap)
     pub mmap_regions: Vec<MmapRegion>,
-    // User stack location (for SYS_STACK_INFO)
-    pub user_stack_base: UserAddr,
-    pub user_stack_size: u64,
-    /// Inherited environment variables (KEY=VALUE\0KEY2=VALUE2\0...)
-    pub env: Vec<u8>,
-    /// Syscall counts per syscall number (for profiling)
-    pub syscall_counts: [u32; 64],
-    pub syscall_total: u64,
-    /// Wall-clock nanoseconds spent in syscall dispatch (includes preemption time)
-    pub syscall_total_ns: u64,
     /// 2MB allocations for demand-paged pages. Freed on process exit.
     pub demand_pages: Vec<PageAlloc>,
     /// RELATIVE relocation index for demand-paged ELF (applied per-page on fault).
@@ -397,6 +389,22 @@ pub struct ProcessData {
     pub exe_vaddr_max: u64,
     /// Paths of dlopen'd libraries (parallel to loaded_libs).
     pub lib_paths: Vec<String>,
+}
+
+/// Per-thread data, unique to each thread via `Arc<Lock<ThreadData>>`.
+/// Contains thread-local storage pages, stack info, syscall profiling.
+/// Accessed via `with_current_data`. Each thread has its own Arc.
+pub struct ThreadData {
+    pub tls_pages: Option<PageAlloc>,
+    pub stack_pages: Option<PageAlloc>,
+    // User stack location (for SYS_STACK_INFO)
+    pub user_stack_base: UserAddr,
+    pub user_stack_size: u64,
+    /// Syscall counts per syscall number (for profiling)
+    pub syscall_counts: [u32; 64],
+    pub syscall_total: u64,
+    /// Wall-clock nanoseconds spent in syscall dispatch (includes preemption time)
+    pub syscall_total_ns: u64,
 }
 
 pub struct MmapRegion {
@@ -596,13 +604,13 @@ pub fn current_address_space() -> PageTables {
 // Access patterns — ProcessData (clone Arc, drop table lock, lock ProcessData)
 // ---------------------------------------------------------------------------
 
-/// Get the current process's ProcessData Arc (brief table lock).
+/// Get the current thread's ThreadData Arc (brief table lock).
 /// If the entry is gone (process killed while thread was running), exits silently.
-pub fn current_data() -> Arc<Lock<ProcessData>> {
+pub fn current_data() -> Arc<Lock<ThreadData>> {
     let guard = PROCESS_TABLE.lock();
     let table = guard.as_ref().unwrap();
     match table.get(current_tid()) {
-        Some(entry) => Arc::clone(entry.data()),
+        Some(entry) => Arc::clone(entry.thread_data()),
         None => {
             drop(guard);
             scheduler::exit_current(-1);
@@ -610,25 +618,29 @@ pub fn current_data() -> Arc<Lock<ProcessData>> {
     }
 }
 
-/// Get the FD/heap owner's ProcessData Arc (brief table lock).
-/// For processes this is self; for threads it's the parent process.
+/// Get the process-level ProcessData Arc (brief table lock).
+/// All threads of a process share the same Arc — no table walk needed.
 pub fn fd_owner_data() -> Arc<Lock<ProcessData>> {
     let guard = PROCESS_TABLE.lock();
     let table = guard.as_ref().unwrap();
-    let tid = current_tid();
-    let process_pid = table.get(tid).unwrap().process();
-    Arc::clone(table.get_process(process_pid).unwrap().data())
+    match table.get(current_tid()) {
+        Some(entry) => Arc::clone(entry.process_data()),
+        None => {
+            drop(guard);
+            scheduler::exit_current(-1);
+        }
+    }
 }
 
-/// Access the current process's ProcessData mutably.
-/// Table lock is NOT held during the closure — only the per-process lock.
-pub fn with_current_data<R>(f: impl FnOnce(&mut ProcessData) -> R) -> R {
+/// Access the current thread's ThreadData mutably.
+/// Table lock is NOT held during the closure — only the per-thread lock.
+pub fn with_current_data<R>(f: impl FnOnce(&mut ThreadData) -> R) -> R {
     let arc = current_data();
     let mut guard = arc.lock();
     f(&mut guard)
 }
 
-/// Access the FD/heap owner's ProcessData mutably.
+/// Access the process-level ProcessData mutably.
 /// Table lock is NOT held during the closure — only the per-process lock.
 pub fn with_fd_owner_data<R>(f: impl FnOnce(&mut ProcessData) -> R) -> R {
     let arc = fd_owner_data();
@@ -839,17 +851,17 @@ extern "C" fn thread_start() {
 /// Spawn a thread within the current process.
 pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64, stack_base: u64) -> Option<Tid> {
     // Phase 1: Get parent's data + address space (never held simultaneously)
-    let (parent_addr_space, parent_process, data_arc) = {
+    let (parent_addr_space, parent_process, process_data_arc) = {
         let guard = PROCESS_TABLE.lock();
         let table = guard.as_ref().unwrap();
         let parent = table.get(current_tid()).unwrap();
         let addr_space = scheduler::current_address_space();
-        (addr_space, parent.process(), Arc::clone(parent.data()))
+        (addr_space, parent.process(), Arc::clone(parent.process_data()))
     };
-    let (tls_template, tls_memsz, tls_modules, tls_total_memsz, tls_max_align, parent_cwd) = {
-        let data = data_arc.lock();
+    let (tls_template, tls_memsz, tls_modules, tls_total_memsz, tls_max_align) = {
+        let data = process_data_arc.lock();
         (data.tls_template, data.tls_memsz,
-         data.tls_modules.clone(), data.tls_total_memsz, data.tls_max_align, data.cwd.clone())
+         data.tls_modules.clone(), data.tls_total_memsz, data.tls_max_align)
     };
 
     // Phase 2: Allocate TLS (outside any lock)
@@ -860,7 +872,7 @@ pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64, stack_base: u64) -> Op
     };
     let fs_base = {
         let addr_space = parent_addr_space.as_ref().expect("spawn_thread: no address space");
-        let parent_data = data_arc.lock();
+        let parent_data = process_data_arc.lock();
         let tls_phys = tls_alloc.phys();
         let (tls_vaddr, _) = vma_map(addr_space, tls_phys, tls_alloc.size() as u64)
             .expect("spawn_thread: out of virtual address space");
@@ -896,41 +908,15 @@ pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64, stack_base: u64) -> Op
     };
 
     // Phase 3: Insert into table (brief table lock)
-    let thread_data = Arc::new(Lock::new(ProcessData {
-        pid: parent_process,
-        fds: FdTable::new(),
-
-        cwd: parent_cwd,
-        elf_alloc: None,
-        stack_pages: None,
-        tls_template,
-        tls_memsz,
+    // Threads share the parent's ProcessData Arc — no empty fds or zeroed process fields.
+    let thread_data = Arc::new(Lock::new(ThreadData {
         tls_pages: Some(tls_alloc),
-        tls_modules,
-        tls_total_memsz,
-        tls_max_align,
-        next_tls_module_id: 2,
-        dynamic_tls_blocks: alloc::collections::BTreeMap::new(),
-        loaded_libs: Vec::new(),
-        mmap_regions: Vec::new(),
+        stack_pages: None,
         user_stack_base: UserAddr::new(stack_base),
         user_stack_size: if stack_base > 0 { stack_ptr - stack_base } else { 0 },
-        env: Vec::new(),
         syscall_counts: [0; 64],
         syscall_total: 0,
         syscall_total_ns: 0,
-        demand_pages: Vec::new(),
-        reloc_index: None,
-        elf_base: UserAddr::new(0),
-        fault_trace: PageFaultTrace::new(),
-        peak_memory: 0,
-        alloc_count: 0,
-        free_count: 0,
-        exe_path: String::new(),
-        exe_eh_frame_hdr_vaddr: 0,
-        exe_eh_frame_hdr_size: 0,
-        exe_vaddr_max: 0,
-        lib_paths: Vec::new(),
     }));
 
     let mut guard = PROCESS_TABLE.lock();
@@ -938,7 +924,7 @@ pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64, stack_base: u64) -> Op
     let tid = table.insert_with(|tid| {
         SchedEntry::new(
             tid, parent_process, ThreadLocation::Scheduled, Kind::Thread { parent: parent_process },
-            [0; 28], 0, thread_data, Arc::new(Lock::new(SymbolTable::empty())),
+            [0; 28], 0, Arc::clone(&process_data_arc), thread_data, Arc::new(Lock::new(SymbolTable::empty())),
         )
     });
     drop(guard);
@@ -1619,7 +1605,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
             let arc = {
                 let guard = PROCESS_TABLE.lock();
                 let table = guard.as_ref().unwrap();
-                Arc::clone(table.get_process(ppid).unwrap().data())
+                Arc::clone(table.get_process(ppid).unwrap().process_data())
             };
             let cwd = arc.lock().cwd.clone();
             cwd
@@ -1630,15 +1616,13 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
     let memory_size = USER_STACK_SIZE as u64;
 
     let proc_data = Arc::new(Lock::new(ProcessData {
-        pid: Pid::from_raw(0),
         fds,
         cwd,
+        env,
 
         elf_alloc: exe_tls_template, // TLS template allocation (if any)
-        stack_pages: Some(stack_pages),
         tls_template,
         tls_memsz,
-        tls_pages: Some(tls_alloc),  // tls_alloc is now PageAlloc
         tls_modules,
         tls_total_memsz,
         tls_max_align: max_tls_align,
@@ -1646,12 +1630,6 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
         dynamic_tls_blocks: alloc::collections::BTreeMap::new(),
         loaded_libs,
         mmap_regions: Vec::new(),
-        user_stack_base: user_stack.base(),
-        user_stack_size: user_stack.size(),
-        env,
-        syscall_counts: [0; 64],
-        syscall_total: 0,
-        syscall_total_ns: 0,
         demand_pages: Vec::new(),
         reloc_index,
         elf_base: UserAddr::new(base),
@@ -1666,15 +1644,24 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
         lib_paths,
     }));
 
+    let thread_data = Arc::new(Lock::new(ThreadData {
+        tls_pages: Some(tls_alloc),
+        stack_pages: Some(stack_pages),
+        user_stack_base: user_stack.base(),
+        user_stack_size: user_stack.size(),
+        syscall_counts: [0; 64],
+        syscall_total: 0,
+        syscall_total_ns: 0,
+    }));
+
     let mut guard = PROCESS_TABLE.lock();
     let table = guard.as_mut().unwrap();
     let pid = table.alloc_pid();
 
     let tid = table.insert_with(|tid| {
-        proc_data.lock().pid = pid;
         SchedEntry::new(
             tid, pid, ThreadLocation::Scheduled, Kind::Process { parent },
-            make_name(path), memory_size, proc_data, Arc::new(Lock::new(syms)),
+            make_name(path), memory_size, proc_data, thread_data, Arc::new(Lock::new(syms)),
         )
     });
     drop(guard);
@@ -1721,21 +1708,39 @@ pub fn spawn_kernel(argv: &[&str]) -> Pid {
 /// Called in two phases:
 /// - Phase 1 (resource cleanup): ProcessData lock held, table lock NOT held.
 /// - Phase 2 (scheduling): table lock held through context switch.
-fn teardown_resources(data_arc: &Arc<Lock<ProcessData>>, pid: Pid) {
-    let mut data = data_arc.lock();
+fn teardown_resources(
+    process_data_arc: &Arc<Lock<ProcessData>>,
+    thread_data_arc: &Arc<Lock<ThreadData>>,
+    pid: Pid,
+) {
+    // Phase 1a: Read syscall stats from ThreadData, then drop lock
+    let (syscall_total, syscall_total_ns, syscall_counts) = {
+        let tdata = thread_data_arc.lock();
+        (tdata.syscall_total, tdata.syscall_total_ns, tdata.syscall_counts)
+    };
+
+    // Phase 1b: Free thread resources
+    {
+        let mut tdata = thread_data_arc.lock();
+        tdata.tls_pages.take();
+        tdata.stack_pages.take();
+    }
+
+    // Phase 2: Process-level cleanup (never hold both locks)
+    let mut data = process_data_arc.lock();
 
     // Print syscall profile for processes with significant activity
-    if data.syscall_total > 0 {
+    if syscall_total > 0 {
         use alloc::string::String;
         use core::fmt::Write;
         let mut profile = String::new();
-        for (i, &count) in data.syscall_counts.iter().enumerate() {
+        for (i, &count) in syscall_counts.iter().enumerate() {
             if count > 0 {
                 let _ = write!(profile, " {}={}", i, count);
             }
         }
-        let wall_ms = data.syscall_total_ns / 1_000_000;
-        log!("syscalls: pid={pid} total={} syscall_wall={wall_ms}ms{profile}", data.syscall_total);
+        let wall_ms = syscall_total_ns / 1_000_000;
+        log!("syscalls: pid={pid} total={} syscall_wall={wall_ms}ms{profile}", syscall_total);
     }
 
     // Print memory stats
@@ -1745,9 +1750,8 @@ fn teardown_resources(data_arc: &Arc<Lock<ProcessData>>, pid: Pid) {
     }
 
     fd::close_all(&mut data.fds, &mut *vfs::lock(), pid);
-    data.tls_pages.take();
+    scheduler::remove_vruntime(pid);
     data.elf_alloc.take();
-    data.stack_pages.take();
     data.loaded_libs.clear();
     data.mmap_regions.clear();
 
@@ -1815,7 +1819,7 @@ fn teardown_scheduling(table: &mut ProcessTable, process_pid: Pid, _addr_space: 
 /// parent process and all siblings.
 pub fn exit(code: i32) -> ! {
     // Phase 1: Determine process pid, data Arc, and address space
-    let (process_pid, data_arc, addr_space) = {
+    let (process_pid, process_data_arc, thread_data_arc, addr_space) = {
         let guard = PROCESS_TABLE.lock();
         let table = guard.as_ref().unwrap();
         let tid = current_tid();
@@ -1825,15 +1829,16 @@ pub fn exit(code: i32) -> ! {
             scheduler::exit_current(code);
         };
         let process_pid = entry.process();
-        let data_arc = Arc::clone(table.get_process(process_pid).unwrap().data());
+        let pdata = Arc::clone(table.get_process(process_pid).unwrap().process_data());
+        let tdata = Arc::clone(entry.thread_data());
         let addr_space = scheduler::current_address_space()
             .expect("exit: no address space");
-        (process_pid, data_arc, addr_space)
+        (process_pid, pdata, tdata, addr_space)
     };
 
     // Phase 2: Switch to kernel CR3 and clean up resources
     unsafe { cpu::write_cr3(crate::mm::paging::kernel().lock().as_ref().unwrap().cr3()); }
-    teardown_resources(&data_arc, process_pid);
+    teardown_resources(&process_data_arc, &thread_data_arc, process_pid);
 
     // Phase 3: Scheduling teardown (table lock, then release before waking)
     let to_wake = {
@@ -1867,14 +1872,13 @@ pub fn thread_exit(code: i32) -> ! {
 
     match kind {
         Kind::Thread { parent } => {
-            // Thread exit: close our FDs, free TLS, zombie ourselves
+            // Thread exit: free TLS (threads share ProcessData, no fd::close_all needed)
             {
-                let data_arc = current_data();
-                let mut data = data_arc.lock();
-                fd::close_all(&mut data.fds, &mut *vfs::lock(), current_process());
+                let tdata_arc = current_data();
+                let mut tdata = tdata_arc.lock();
                 // TLS page table entries are cleaned up when the AddressSpace is dropped.
                 // The physical memory is freed when tls_alloc is dropped below.
-                data.tls_pages.take();
+                tdata.tls_pages.take();
             }
             // Free this thread's dynamic TLS blocks from the process-level data.
             {
@@ -1907,9 +1911,10 @@ pub fn thread_exit(code: i32) -> ! {
         Kind::Process { .. } => {
             // Process exit — full teardown
             let process_pid = current_process();
-            let data_arc = current_data();
+            let thread_data_arc = current_data();
+            let process_data_arc = fd_owner_data();
             let addr_space = addr_space.expect("thread_exit: process has no address space");
-            teardown_resources(&data_arc, process_pid);
+            teardown_resources(&process_data_arc, &thread_data_arc, process_pid);
 
             let to_wake = {
                 let mut guard = PROCESS_TABLE.lock();
@@ -1929,9 +1934,9 @@ pub fn thread_exit(code: i32) -> ! {
 // Blocking / scheduling
 // ---------------------------------------------------------------------------
 
-/// Block the current thread on the given event sources with optional deadline.
-pub fn block(events: &[scheduler::EventSource], deadline: u64) {
-    scheduler::block(events, deadline);
+/// Block the current thread on an optional event source with optional deadline.
+pub fn block(event: Option<scheduler::EventSource>, deadline: u64) {
+    scheduler::block(event, deadline);
 }
 
 
@@ -2043,15 +2048,7 @@ pub fn handle_page_fault(fault_addr: u64, _error_code: u64) -> bool {
         let guard = PROCESS_TABLE.lock();
         let Some(table) = guard.as_ref() else { return false };
         let Some(entry) = table.get(tid) else { return false };
-        let data = match entry.kind() {
-            Kind::Thread { parent } => {
-                match table.get_process(*parent) {
-                    Some(parent_entry) => Arc::clone(parent_entry.data()),
-                    None => return false,
-                }
-            }
-            _ => Arc::clone(entry.data()),
-        };
+        let data = Arc::clone(entry.process_data());
         (data, addr_space)
     };
 
@@ -2073,7 +2070,7 @@ pub fn handle_page_fault(fault_addr: u64, _error_code: u64) -> bool {
         FileBacked { backing: Arc<dyn crate::file_backing::FileBacking>, file_offset: u64, file_size: u64 },
     }
 
-    let (valid, already_mapped, writable, regions) = {
+    let (writable, regions) = {
         let as_guard = addr_space.lock();
 
         // Verify the fault address is within a valid region
@@ -2110,10 +2107,8 @@ pub fn handle_page_fault(fault_addr: u64, _error_code: u64) -> bool {
                 kind: snap_kind,
             });
         }
-        (true, false, writable, snaps)
+        (writable, snaps)
     };
-
-    let _ = (valid, already_mapped); // used above in early returns
 
     let mut data = data_arc.lock();
 
@@ -2224,7 +2219,7 @@ pub fn dump_crash_diagnostics(fault_addr: u64, rip: u64) {
         };
         let Some(table) = guard.as_ref() else { return };
         match table.get(tid) {
-            Some(entry) => Arc::clone(entry.data()),
+            Some(entry) => Arc::clone(entry.process_data()),
             None => return,
         }
     };
@@ -2308,9 +2303,7 @@ pub fn dump_crash_diagnostics(fault_addr: u64, rip: u64) {
         } else {
             log!("  FS base {:#x} NOT MAPPED!", fs_base);
         }
-        // Also dump TLS alloc info
-        let tls_info = data.tls_pages.as_ref().map(|a| (a.ptr() as u64, a.size()));
-        log!("  TLS alloc: {:?}", tls_info);
+        // TLS alloc info is in ThreadData; FS base dump above gives the relevant info.
     }
 }
 
@@ -2403,8 +2396,8 @@ pub fn kill_process(target_pid: Pid) -> u64 {
     use toyos_abi::syscall::SyscallError;
     let caller = current_process();
 
-    // Phase 1: Validate and get data Arc (brief table lock)
-    let data_arc = {
+    // Phase 1: Validate and get data Arcs (brief table lock)
+    let (process_data_arc, thread_data_arc) = {
         let guard = PROCESS_TABLE.lock();
         let table = guard.as_ref().unwrap();
 
@@ -2418,20 +2411,23 @@ pub fn kill_process(target_pid: Pid) -> u64 {
         if matches!(entry.state(), ProcessState::Zombie(_)) {
             return 0;
         }
-        Arc::clone(entry.data())
+        (Arc::clone(entry.process_data()), Arc::clone(entry.thread_data()))
     };
 
-    // Phase 2: Resource cleanup (ProcessData lock, no table lock)
+    // Phase 2: Resource cleanup (lock sequentially, never hold both)
     {
-        let mut data = data_arc.lock();
-        fd::close_all(&mut data.fds, &mut *vfs::lock(), target_pid);
-        data.tls_pages.take();
-        data.elf_alloc.take();
-        data.stack_pages.take();
-        data.loaded_libs.clear();
-        data.mmap_regions.clear();
-        data.demand_pages.clear();
-        data.reloc_index = None;
+        let mut pdata = process_data_arc.lock();
+        fd::close_all(&mut pdata.fds, &mut *vfs::lock(), target_pid);
+        pdata.elf_alloc.take();
+        pdata.loaded_libs.clear();
+        pdata.mmap_regions.clear();
+        pdata.demand_pages.clear();
+        pdata.reloc_index = None;
+    }
+    {
+        let mut tdata = thread_data_arc.lock();
+        tdata.tls_pages.take();
+        tdata.stack_pages.take();
     }
 
     // Phase 3: Scheduling teardown (table lock)

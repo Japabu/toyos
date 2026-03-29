@@ -102,7 +102,16 @@ system.toml       What to build and boot
 - If something is blocking, stop and report it. Don't work around it.
 - **Never truncate command output.** No `| head`, `| tail`, `| grep` to reduce output. If a command produces a lot of output or takes long, run it in the background — background tasks automatically get their output written to a file.
 
+## Ideas
+
+- **io_uring as the only blocking I/O mechanism.** Currently the kernel has two parallel notification paths: `scheduler::block(event)` for direct thread blocking and `io_uring::complete_pending_for_event` for ring watchers. Every wake site does both. If all fd-based blocking went through io_uring, blocking syscalls (read, write, accept) become non-blocking try-once-and-return, wake sites become a single io_uring call, and the scheduler drops fd-related `EventSource` variants (only keeps `Futex` and `IoUring`). Per-source watcher lists and io_uring machinery stay the same. Userspace helpers in `toyos-abi` would wrap the ring setup for simple blocking I/O.
+
 ## Known issues
 
 <!-- Track blocking issues and findings here. Remove when resolved. -->
 - Profiling tooling is missing — no way to measure performance inside ToyOS yet.
+- FS base uses `wrmsr`/`rdmsr` on every context switch — should use FSGSBASE instructions (`wrfsbase`/`rdfsbase`) which are 5-20x faster. Requires setting CR4.FSGSBASE at boot.
+- APIC is xAPIC (memory-mapped) — should switch to x2APIC (MSR-based). Eliminates MMIO mapping, gives 32-bit APIC IDs (>255 CPUs), and fixes the ICR high/low write race. QEMU needs `-cpu ...,+x2apic`.
+- No PCID — every context switch and TLB shootdown does a full TLB flush. PCID would tag TLB entries per-address-space, avoiding flushes on CR3 switch. Also no per-page `invlpg` — shootdowns IPI all CPUs for a full flush.
+- LAPIC timer uses one-shot mode — should use TSC deadline mode (`IA32_TSC_DEADLINE` MSR) for precise absolute-time wakeups. TSC is already calibrated for `nanos_since_boot()`.
+- SMEP not enabled — SMAP is on but SMEP (CR4 bit 20, prevents kernel executing user pages) is not. Trivial to enable.

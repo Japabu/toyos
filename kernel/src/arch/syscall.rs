@@ -320,7 +320,7 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         }
         SYS_EXIT => sys_exit(a1 as i32),
         SYS_GET_ENV => {
-            let env = process::with_current_data(|d| d.env.clone());
+            let env = process::with_fd_owner_data(|d| d.env.clone());
             if a2 == 0 {
                 env.len() as u64
             } else {
@@ -402,6 +402,14 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             1 => { unsafe { core::ptr::read_volatile(core::ptr::null::<u64>()); } 0 }
             _ => SyscallError::InvalidArgument.to_u64(),
         },
+        SYS_SCHED_INFO => {
+            let info_size = core::mem::size_of::<toyos_abi::syscall::SchedInfo>() as u64;
+            let Some(buf) = ctx.user_slice_mut(UserAddr::new(a1), info_size) else {
+                return bad_addr;
+            };
+            let out = unsafe { &mut *(buf.as_mut_ptr() as *mut toyos_abi::syscall::SchedInfo) };
+            sys_sched_info(out)
+        },
         _ => SyscallError::InvalidArgument.to_u64(),
     };
 
@@ -438,7 +446,7 @@ fn sys_write(fd_num: u32, buf: &[u8]) -> u64 {
                 if let Some(id) = pipe_id { process::wake_pipe_readers(id); }
                 return n;
             }
-            Err(Some(event)) => process::block(&[event], 0),
+            Err(Some(event)) => process::block(Some(event), 0),
             Err(None) => return SyscallError::NotFound.to_u64(),
         }
     }
@@ -477,15 +485,15 @@ fn sys_read(fd_num: u32, buf: &mut [u8]) -> u64 {
                 if let Some(id) = pipe_id { process::wake_pipe_writers(id); }
                 return n;
             }
-            Err(Some(ReadBlock::Event(event))) => process::block(&[event], 0),
-            Err(Some(ReadBlock::EventWithDeadline(event, deadline))) => process::block(&[event], deadline),
+            Err(Some(ReadBlock::Event(event))) => process::block(Some(event), 0),
+            Err(Some(ReadBlock::EventWithDeadline(event, deadline))) => process::block(Some(event), deadline),
             Err(None) => return SyscallError::NotFound.to_u64(),
         }
     }
 }
 
 fn sys_open(path: &str, flags: OpenFlags) -> u64 {
-    let cwd = process::with_current_data(|d| d.cwd.clone());
+    let cwd = process::with_fd_owner_data(|d| d.cwd.clone());
     let resolved = vfs::lock().resolve_absolute(&cwd, path);
     process::with_fd_owner_data(|data| fd::open(&mut data.fds, &mut *vfs::lock(), &resolved, flags))
 }
@@ -527,7 +535,7 @@ fn sys_random(buf: &mut [u8]) -> u64 {
 }
 
 fn sys_readdir(path: &str, buf: &mut [u8]) -> u64 {
-    let cwd = process::with_current_data(|d| d.cwd.clone());
+    let cwd = process::with_fd_owner_data(|d| d.cwd.clone());
     let entries = match vfs::lock().list(&cwd, path) {
         Ok(e) => e,
         Err(_) => return SyscallError::NotFound.to_u64(),
@@ -554,17 +562,17 @@ fn sys_readdir(path: &str, buf: &mut [u8]) -> u64 {
 }
 
 fn sys_delete(path: &str) -> u64 {
-    let cwd = process::with_current_data(|d| d.cwd.clone());
+    let cwd = process::with_fd_owner_data(|d| d.cwd.clone());
     let mut vfs = vfs::lock();
     let resolved = vfs.resolve_absolute(&cwd, path);
     if vfs.delete(&resolved) { 0 } else { SyscallError::NotFound.to_u64() }
 }
 
 fn sys_chdir(path: &str) -> u64 {
-    let cwd = process::with_current_data(|d| d.cwd.clone());
+    let cwd = process::with_fd_owner_data(|d| d.cwd.clone());
     match vfs::lock().cd(&cwd, path) {
         Some(new_cwd) => {
-            process::with_current_data(|d| d.cwd = new_cwd);
+            process::with_fd_owner_data(|d| d.cwd = new_cwd);
             0
         }
         None => SyscallError::NotFound.to_u64(),
@@ -572,7 +580,7 @@ fn sys_chdir(path: &str) -> u64 {
 }
 
 fn sys_getcwd(buf: &mut [u8]) -> u64 {
-    process::with_current_data(|data| {
+    process::with_fd_owner_data(|data| {
         let cwd = &data.cwd;
         let len = cwd.len().min(buf.len());
         buf[..len].copy_from_slice(&cwd.as_bytes()[..len]);
@@ -727,7 +735,7 @@ fn sys_waitpid(pid: u64, flags: u64) -> u64 {
                 if flags & WNOHANG != 0 {
                     return SyscallError::WouldBlock.to_u64();
                 }
-                process::block(&[], 0); // woken by wake_tid from exit path
+                process::block(None, 0); // woken by wake_tid from exit path
             }
             Err(()) => return SyscallError::NotFound.to_u64(),
         }
@@ -763,9 +771,9 @@ fn sys_open_device(device_type: u64) -> u64 {
 // ---------------------------------------------------------------------------
 
 fn sys_listen(name: &str) -> u64 {
-    if !crate::listener::listen(name) {
+    let Some(_id) = crate::listener::listen(name) else {
         return SyscallError::AlreadyExists.to_u64();
-    }
+    };
     process::with_fd_owner_data(|data| {
         fd_result(fd::alloc(&mut data.fds, fd::Descriptor::Listener(alloc::string::String::from(name))))
     })
@@ -783,6 +791,10 @@ fn sys_accept(fd_num: u32) -> u64 {
         return SyscallError::InvalidArgument.to_u64();
     };
 
+    let Some(listener_id) = crate::listener::listener_id(&name) else {
+        return SyscallError::InvalidArgument.to_u64();
+    };
+
     loop {
         if let Some(conn) = crate::listener::pop_connection(&name) {
             let client_pid = conn.client_pid;
@@ -796,7 +808,7 @@ fn sys_accept(fd_num: u32) -> u64 {
                 Err(e) => e.to_u64(),
             };
         }
-        process::block(&[scheduler::EventSource::Listener], 0);
+        process::block(Some(scheduler::EventSource::Listener(listener_id)), 0);
     }
 }
 
@@ -816,7 +828,7 @@ fn sys_connect(name: &str) -> u64 {
         tx: sc_writer,   // server writes to server→client
         client_pid,
     });
-    wake_poll_waiters();
+    wake_poll_waiters(name);
 
     // Client's end
     process::with_fd_owner_data(|data| {
@@ -827,15 +839,14 @@ fn sys_connect(name: &str) -> u64 {
     })
 }
 
-/// Wake processes interested in listener events (direct blockers + io_uring watchers).
-fn wake_poll_waiters() {
-    crate::scheduler::wake_by_event(crate::scheduler::EventSource::Listener);
-    let watchers = crate::listener::io_uring_watchers();
+/// Wake processes interested in this specific listener (direct blockers + io_uring watchers).
+fn wake_poll_waiters(name: &str) {
+    let Some(id) = crate::listener::listener_id(name) else { return };
+    let event = crate::scheduler::EventSource::Listener(id);
+    crate::scheduler::wake_by_event(event);
+    let watchers = crate::listener::io_uring_watchers(id);
     if !watchers.is_empty() {
-        crate::io_uring::complete_pending_for_event(
-            &watchers,
-            crate::scheduler::EventSource::Listener,
-        );
+        crate::io_uring::complete_pending_for_event(&watchers, event);
     }
 }
 
@@ -896,7 +907,7 @@ fn sys_mmap(req_addr: u64, size: u64, _prot: u64, flags: u64) -> u64 {
         }
         cpu::flush_tlb();
         apic::tlb_shootdown();
-        process::with_current_data(|data| {
+        process::with_fd_owner_data(|data| {
             data.mmap_regions.push(process::MmapRegion {
                 addr: UserAddr::new(start), size: aligned, _pages: pages, fixed: true,
             });
@@ -908,7 +919,7 @@ fn sys_mmap(req_addr: u64, size: u64, _prot: u64, flags: u64) -> u64 {
     } else {
         let phys = pages.phys();
         let pt = process::current_address_space();
-        let vaddr = process::with_current_data(|data| {
+        let vaddr = process::with_fd_owner_data(|data| {
             let Some((vaddr, _)) = process::vma_map(&pt, phys, aligned as u64) else {
                 return Err(());
             };
@@ -929,7 +940,7 @@ fn sys_mmap(req_addr: u64, size: u64, _prot: u64, flags: u64) -> u64 {
 
 fn sys_munmap(addr: u64, _size: u64) -> u64 {
     let pt = process::current_address_space();
-    process::with_current_data(|data| {
+    process::with_fd_owner_data(|data| {
         let idx = data.mmap_regions.iter().position(|r| r.addr.raw() == addr);
         if let Some(idx) = idx {
             let region = data.mmap_regions.swap_remove(idx);
@@ -959,7 +970,7 @@ fn sys_thread_join(tid: u64) -> u64 {
     loop {
         match process::collect_thread_zombie(tid, caller) {
             Ok(Some(_)) => return 0,
-            Ok(None) => process::block(&[], 0), // woken by wake_tid from exit path
+            Ok(None) => process::block(None, 0), // woken by wake_tid from exit path
             Err(()) => return SyscallError::NotFound.to_u64(),
         }
     }
@@ -1050,13 +1061,13 @@ fn sys_net_recv(buf: &mut [u8], timeout_nanos: u64) -> u64 {
         if deadline > 0 && crate::clock::nanos_since_boot() >= deadline {
             return 0;
         }
-        process::block(&[crate::scheduler::EventSource::Network], deadline);
+        process::block(Some(crate::scheduler::EventSource::Network), deadline);
     }
 }
 
 fn sys_nanosleep(nanos: u64) -> u64 {
     let deadline = crate::clock::nanos_since_boot().saturating_add(nanos);
-    process::block(&[], deadline); // woken by deadline expiry only
+    process::block(None, deadline); // woken by deadline expiry only
     0
 }
 
@@ -1093,7 +1104,7 @@ fn sys_dup2(old_fd: u32, new_fd: u32) -> u64 {
 }
 
 fn sys_rename(old: &str, new: &str) -> u64 {
-    let cwd = process::with_current_data(|d| d.cwd.clone());
+    let cwd = process::with_fd_owner_data(|d| d.cwd.clone());
     let mut vfs = vfs::lock();
     let old_abs = vfs.resolve_absolute(&cwd, old);
     let new_abs = vfs.resolve_absolute(&cwd, new);
@@ -1104,7 +1115,7 @@ fn sys_rename(old: &str, new: &str) -> u64 {
 }
 
 fn sys_mkdir(path: &str) -> u64 {
-    let cwd = process::with_current_data(|d| d.cwd.clone());
+    let cwd = process::with_fd_owner_data(|d| d.cwd.clone());
     let mut vfs = vfs::lock();
     let resolved = vfs.resolve_absolute(&cwd, path);
     vfs.create_dir(&resolved);
@@ -1112,7 +1123,7 @@ fn sys_mkdir(path: &str) -> u64 {
 }
 
 fn sys_rmdir(path: &str) -> u64 {
-    let cwd = process::with_current_data(|d| d.cwd.clone());
+    let cwd = process::with_fd_owner_data(|d| d.cwd.clone());
     let mut vfs = vfs::lock();
     let resolved = vfs.resolve_absolute(&cwd, path);
     vfs.remove_dir(&resolved);
@@ -1120,7 +1131,7 @@ fn sys_rmdir(path: &str) -> u64 {
 }
 
 fn sys_symlink(target: &str, link: &str) -> u64 {
-    let cwd = process::with_current_data(|d| d.cwd.clone());
+    let cwd = process::with_fd_owner_data(|d| d.cwd.clone());
     let mut vfs = vfs::lock();
     let resolved = vfs.resolve_absolute(&cwd, link);
     match vfs.create_symlink(&resolved, target) {
@@ -1133,7 +1144,7 @@ fn sys_symlink(target: &str, link: &str) -> u64 {
 }
 
 fn sys_readlink(path: &str, buf: &mut [u8]) -> u64 {
-    let cwd = process::with_current_data(|d| d.cwd.clone());
+    let cwd = process::with_fd_owner_data(|d| d.cwd.clone());
     let mut vfs = vfs::lock();
     let resolved = vfs.resolve_absolute(&cwd, path);
     match vfs.read_link(&resolved) {
@@ -1148,7 +1159,7 @@ fn sys_readlink(path: &str, buf: &mut [u8]) -> u64 {
 }
 
 fn sys_dlopen(path: &str, init_out: u64) -> u64 {
-    let cwd = process::with_current_data(|d| d.cwd.clone());
+    let cwd = process::with_fd_owner_data(|d| d.cwd.clone());
     let resolved = vfs::lock().resolve_absolute(&cwd, path);
 
     // Check shared library cache first
@@ -1393,6 +1404,15 @@ fn sys_io_uring_enter(ring_fd: u32, to_submit: u32, min_complete: u32, timeout_n
         Ok(n) => n as u64,
         Err(e) => e.to_u64(),
     }
+}
+
+fn sys_sched_info(out: &mut toyos_abi::syscall::SchedInfo) -> u64 {
+    let pid = process::current_process();
+    let vruntime = crate::scheduler::process_vruntime(pid);
+    let min_vruntime = crate::scheduler::global_min_vruntime();
+    out.vruntime = vruntime;
+    out.min_vruntime = min_vruntime;
+    0
 }
 
 fn sys_query_modules(buf: &mut [u8]) -> u64 {

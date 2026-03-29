@@ -111,7 +111,7 @@ impl Descriptor {
             Self::Mouse => Some(EventSource::Mouse),
             Self::SerialConsole => Some(EventSource::Keyboard),
             Self::Nic(_) => Some(EventSource::Network),
-            Self::Listener(_) => Some(EventSource::Listener),
+            Self::Listener(name) => listener::listener_id(name).map(EventSource::Listener),
             Self::PipeRead(r, _) | Self::TtyRead(r) => Some(EventSource::PipeReadable(r.id())),
             Self::Socket { rx, .. } => Some(EventSource::PipeReadable(rx.id())),
             Self::File(_) | Self::Framebuffer(_) | Self::Audio(_) => None,
