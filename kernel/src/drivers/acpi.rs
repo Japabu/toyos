@@ -6,8 +6,7 @@ use crate::log;
 use crate::DirectMap;
 
 pub struct MadtInfo {
-    pub local_apic_addr: u32,
-    pub apic_ids: Vec<u8>,
+    pub apic_ids: Vec<u32>,
 }
 
 // ACPI table structures (all packed — tables are not guaranteed aligned)
@@ -108,6 +107,15 @@ struct MadtLocalApic {
     processor_id: u8,
     apic_id: u8,
     flags: u32,
+}
+
+#[repr(C, packed)]
+struct MadtLocalX2Apic {
+    header: MadtEntryHeader,
+    _reserved: u16,
+    x2apic_id: u32,
+    flags: u32,
+    _processor_uid: u32,
 }
 
 #[repr(C, packed)]
@@ -227,14 +235,13 @@ pub fn find_hpet_base(rsdp_addr: u64) -> Option<u64> {
     Some(base)
 }
 
-/// Parse MADT (signature "APIC") to discover Local APIC address and per-CPU APIC IDs.
+/// Parse MADT (signature "APIC") to discover per-CPU APIC IDs.
 pub fn parse_madt(rsdp_addr: u64) -> Option<MadtInfo> {
     let xsdt = get_xsdt(DirectMap::from_phys(rsdp_addr));
     let madt_phys = find_table(xsdt, b"APIC")?;
     let madt = unsafe { &*madt_phys.as_ptr::<Madt>() };
 
     let length = madt.header.length as usize;
-    let local_apic_addr = madt.local_apic_address;
 
     let mut apic_ids = Vec::new();
     let entries_base: *const u8 = unsafe { madt_phys.as_ptr::<u8>().add(size_of::<Madt>()) };
@@ -246,20 +253,29 @@ pub fn parse_madt(rsdp_addr: u64) -> Option<MadtInfo> {
         let entry_len = entry.length as usize;
         if entry_len == 0 { break; }
 
-        // Type 0 = Processor Local APIC
-        if entry.entry_type == 0 && entry_len >= size_of::<MadtLocalApic>() {
-            let lapic = unsafe { &*(entries_base.add(offset) as *const MadtLocalApic) };
-            // Bit 0: Processor Enabled, Bit 1: Online Capable
-            if lapic.flags & 1 != 0 {
-                apic_ids.push(lapic.apic_id);
+        match entry.entry_type {
+            // Type 0 = Processor Local APIC
+            0 if entry_len >= size_of::<MadtLocalApic>() => {
+                let lapic = unsafe { &*(entries_base.add(offset) as *const MadtLocalApic) };
+                if lapic.flags & 1 != 0 {
+                    apic_ids.push(lapic.apic_id as u32);
+                }
             }
+            // Type 9 = Processor Local x2APIC (32-bit APIC IDs)
+            9 if entry_len >= size_of::<MadtLocalX2Apic>() => {
+                let x2 = unsafe { &*(entries_base.add(offset) as *const MadtLocalX2Apic) };
+                if x2.flags & 1 != 0 {
+                    apic_ids.push(x2.x2apic_id);
+                }
+            }
+            _ => {}
         }
 
         offset += entry_len;
     }
 
-    log!("ACPI: MADT local_apic={:#x} cpus={:?}", local_apic_addr, apic_ids);
-    Some(MadtInfo { local_apic_addr, apic_ids })
+    log!("ACPI: MADT cpus={:?}", apic_ids);
+    Some(MadtInfo { apic_ids })
 }
 
 /// Scan DSDT AML bytecode for the \_S5_ package and extract SLP_TYPa.

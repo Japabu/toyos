@@ -110,7 +110,6 @@ system.toml       What to build and boot
 
 <!-- Track blocking issues and findings here. Remove when resolved. -->
 - Profiling tooling is missing — no way to measure performance inside ToyOS yet.
-- APIC is xAPIC (memory-mapped) — should switch to x2APIC (MSR-based). Eliminates MMIO mapping, gives 32-bit APIC IDs (>255 CPUs), and fixes the ICR high/low write race. QEMU needs `-cpu ...,+x2apic`.
 - No PCID — every context switch and TLB shootdown does a full TLB flush. PCID would tag TLB entries per-address-space, avoiding flushes on CR3 switch. Also no per-page `invlpg` — shootdowns IPI all CPUs for a full flush.
 - LAPIC timer uses one-shot mode — should use TSC deadline mode (`IA32_TSC_DEADLINE` MSR) for precise absolute-time wakeups. TSC is already calibrated for `nanos_since_boot()`.
 - SMEP not enabled — SMAP is on but SMEP (CR4 bit 20, prevents kernel executing user pages) is not. Trivial to enable.

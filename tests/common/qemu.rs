@@ -208,7 +208,7 @@ fn qemu_command(boot_image: &Path, nvme_image: &Path, gdb_stub: bool) -> Command
     qemu.arg("-machine")
         .arg("q35")
         .arg("-cpu")
-        .arg("qemu64,+rdrand,+smap,+fsgsbase")
+        .arg("qemu64,+rdrand,+smap,+fsgsbase,+x2apic")
         .arg("-smp")
         .arg("2")
         .arg("-m")

@@ -179,8 +179,8 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     // Get exception handlers up ASAP so bugs in later phases produce diagnostics
     // instead of triple-faulting.
     let madt = acpi::parse_madt(kernel_args.rsdp_addr).expect("ACPI: MADT not found");
-    apic::init(madt.local_apic_addr);
-    percpu::init_bsp(apic::id() as u32);
+    apic::init();
+    percpu::init_bsp(apic::id());
     idt::init();
     syscall::init();
     symbols::set_kernel_base(kernel_args.kernel_memory_addr);

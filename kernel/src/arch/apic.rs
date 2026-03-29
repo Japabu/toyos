@@ -1,121 +1,94 @@
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-use crate::mm::Mmio;
+use super::cpu;
 use crate::log;
-use crate::sync::Lock;
 
-// Local APIC register offsets
-const LAPIC_ID: u64 = 0x020;
-const LAPIC_SVR: u64 = 0x0F0;
-const LAPIC_ICR_LOW: u64 = 0x300;
-const LAPIC_ICR_HIGH: u64 = 0x310;
-const LAPIC_EOI: u64 = 0x0B0;
-const LAPIC_LVT_TIMER: u64 = 0x320;
-const LAPIC_TIMER_INIT: u64 = 0x380;
-const LAPIC_TIMER_CURRENT: u64 = 0x390;
-const LAPIC_TIMER_DIVIDE: u64 = 0x3E0;
+// x2APIC MSR addresses (base 0x800 + xAPIC_offset >> 4)
+const IA32_APIC_BASE_MSR: u32 = 0x1B;
+const X2APIC_ID: u32 = 0x802;
+const X2APIC_SVR: u32 = 0x80F;
+const X2APIC_EOI: u32 = 0x80B;
+const X2APIC_ICR: u32 = 0x830;
+const X2APIC_LVT_TIMER: u32 = 0x832;
+const X2APIC_TIMER_INIT: u32 = 0x838;
+const X2APIC_TIMER_CURRENT: u32 = 0x839;
+const X2APIC_TIMER_DIVIDE: u32 = 0x83E;
 
 pub const TIMER_VECTOR: u8 = 0x20;
 
 /// Calibrated LAPIC timer ticks per 10ms (computed on BSP, reused by APs).
 static TIMER_TICKS: AtomicU32 = AtomicU32::new(0);
 
-static LAPIC: Lock<Option<Mmio>> = Lock::new(None);
+/// Set once during BSP init. Guards IPI sends before APIC is ready.
+static X2APIC_ENABLED: AtomicBool = AtomicBool::new(false);
 
-/// LAPIC base address for lock-free access in interrupt handlers.
-/// Set once during init, read-only afterwards.
-/// `#[no_mangle]` so the TLB flush handler in idt.rs can reference it via `rip + LAPIC_BASE`.
-#[no_mangle]
-static LAPIC_BASE: AtomicU64 = AtomicU64::new(0);
+/// Enable x2APIC mode on this CPU. Sets global enable (bit 11) + x2APIC (bit 10)
+/// in IA32_APIC_BASE, then software-enables via SVR.
+fn enable_x2apic() {
+    let mut base = cpu::rdmsr(IA32_APIC_BASE_MSR);
+    base |= (1 << 11) | (1 << 10);
+    cpu::wrmsr(IA32_APIC_BASE_MSR, base);
 
-/// Initialize the BSP's Local APIC at the given physical address.
-pub fn init(base_addr: u32) {
-    let mmio = crate::mm::paging::kernel().lock().as_mut().unwrap().map_mmio(base_addr as u64, 0x1000);
-
-    // Enable LAPIC: set SVR bit 8 (software enable) + spurious vector 0xFF
-    mmio.write_u32(LAPIC_SVR, mmio.read_u32(LAPIC_SVR) | (1 << 8) | 0xFF);
-
-    LAPIC_BASE.store(crate::DirectMap::from_phys(base_addr as u64).as_ptr::<u8>() as u64, Ordering::Release);
-    *LAPIC.lock() = Some(mmio);
-    log!("LAPIC: enabled (ID {})", id());
+    let svr = cpu::rdmsr(X2APIC_SVR);
+    cpu::wrmsr(X2APIC_SVR, svr | (1 << 8) | 0xFF);
 }
 
-fn with_lapic<R>(f: impl FnOnce(&Mmio) -> R) -> R {
-    let guard = LAPIC.lock();
-    let mmio = guard.as_ref().expect("LAPIC not initialized");
-    f(mmio)
+/// Initialize the BSP's Local APIC in x2APIC mode.
+pub fn init() {
+    enable_x2apic();
+    X2APIC_ENABLED.store(true, Ordering::Release);
+    log!("LAPIC: x2APIC enabled (ID {})", id());
 }
 
-pub fn id() -> u8 {
-    (with_lapic(|l| l.read_u32(LAPIC_ID)) >> 24) as u8
+/// Enable the AP's local APIC in x2APIC mode.
+pub fn init_ap() {
+    enable_x2apic();
+}
+
+pub fn id() -> u32 {
+    cpu::rdmsr(X2APIC_ID) as u32
 }
 
 /// Send INIT IPI to the specified APIC ID.
-pub fn send_init(apic_id: u8) {
-    with_lapic(|l| {
-        l.write_u32(LAPIC_ICR_HIGH, (apic_id as u32) << 24);
-        l.write_u32(LAPIC_ICR_LOW, 0x4500); // delivery=INIT, level=assert
-    });
+pub fn send_init(apic_id: u32) {
+    // ICR: destination in high 32 bits, 0x4500 = delivery INIT, level assert
+    cpu::wrmsr(X2APIC_ICR, ((apic_id as u64) << 32) | 0x4500);
 }
 
 /// Send Startup IPI (SIPI) with the given vector (trampoline page number).
-pub fn send_sipi(apic_id: u8, vector: u8) {
-    with_lapic(|l| {
-        l.write_u32(LAPIC_ICR_HIGH, (apic_id as u32) << 24);
-        l.write_u32(LAPIC_ICR_LOW, 0x4600 | vector as u32); // delivery=Startup
-    });
+pub fn send_sipi(apic_id: u32, vector: u8) {
+    cpu::wrmsr(X2APIC_ICR, ((apic_id as u64) << 32) | 0x4600 | vector as u64);
 }
 
-/// Enable the AP's local APIC (same MMIO base, already mapped by BSP).
-pub fn init_ap() {
-    with_lapic(|l| {
-        l.write_u32(LAPIC_SVR, l.read_u32(LAPIC_SVR) | (1 << 8) | 0xFF);
-    });
-}
-
-/// Send EOI. Lock-free — safe to call from interrupt handlers.
+/// Send EOI.
+#[inline]
 pub fn eoi() {
-    let base = LAPIC_BASE.load(Ordering::Relaxed);
-    unsafe { ((base + LAPIC_EOI) as *mut u32).write_volatile(0); }
+    cpu::wrmsr(X2APIC_EOI, 0);
 }
 
 /// Send an IPI to all CPUs except self (shorthand destination).
 fn ipi_all_excluding_self(vector: u8) {
-    with_lapic(|l| {
-        // ICR: destination shorthand = all-excluding-self (0b11 << 18), fixed delivery
-        l.write_u32(LAPIC_ICR_LOW, 0x000C_0000 | vector as u32);
-    });
+    // destination shorthand = all-excluding-self (0b11 << 18), fixed delivery
+    cpu::wrmsr(X2APIC_ICR, 0x000C_0000 | vector as u64);
 }
 
-/// Flush TLB on all other CPUs. No-op if LAPIC not yet initialized.
+/// Flush TLB on all other CPUs. No-op if x2APIC not yet initialized.
 pub fn tlb_shootdown() {
-    if LAPIC_BASE.load(Ordering::Relaxed) != 0 {
+    if X2APIC_ENABLED.load(Ordering::Relaxed) {
         ipi_all_excluding_self(0xFE);
     }
 }
 
 /// Send a timer IPI to all other CPUs, waking any that are halted.
-/// Lock-free — safe to call from scheduler context.
 pub fn kick_cpus() {
-    let base = LAPIC_BASE.load(Ordering::Relaxed);
-    if base == 0 { return; }
-    unsafe {
-        // ICR: all-excluding-self (0b11 << 18) | timer vector
-        (base as *mut u8).add(LAPIC_ICR_LOW as usize).cast::<u32>()
-            .write_volatile(0x000C_0000 | TIMER_VECTOR as u32);
-    }
+    if !X2APIC_ENABLED.load(Ordering::Relaxed) { return; }
+    cpu::wrmsr(X2APIC_ICR, 0x000C_0000 | TIMER_VECTOR as u64);
 }
 
 /// Halt all CPUs. Sends halt IPI to all other CPUs, then halts self.
-/// Lock-free — writes LAPIC MMIO directly. Safe from any context.
 pub fn halt_all_cpus() -> ! {
-    let base = LAPIC_BASE.load(Ordering::Relaxed);
-    if base != 0 {
-        unsafe {
-            // IPI all-excluding-self, vector 0xFD (halt)
-            (base as *mut u8).add(LAPIC_ICR_LOW as usize).cast::<u32>()
-                .write_volatile(0x000C_0000 | 0xFD);
-        }
+    if X2APIC_ENABLED.load(Ordering::Relaxed) {
+        cpu::wrmsr(X2APIC_ICR, 0x000C_0000 | 0xFD);
     }
     super::cpu::halt();
 }
@@ -123,53 +96,40 @@ pub fn halt_all_cpus() -> ! {
 /// Calibrate the LAPIC timer on the BSP. Requires HPET.
 /// Does not start the timer — the scheduler arms one-shot timers on demand.
 pub fn init_timer() {
-    with_lapic(|l| {
-        // Divide by 1 for maximum resolution
-        l.write_u32(LAPIC_TIMER_DIVIDE, 0b1011);
+    // Divide by 1 for maximum resolution
+    cpu::wrmsr(X2APIC_TIMER_DIVIDE, 0b1011);
 
-        // Masked one-shot mode for calibration
-        l.write_u32(LAPIC_LVT_TIMER, 1 << 16);
-        l.write_u32(LAPIC_TIMER_INIT, 0xFFFF_FFFF);
+    // Masked one-shot mode for calibration
+    cpu::wrmsr(X2APIC_LVT_TIMER, 1 << 16);
+    cpu::wrmsr(X2APIC_TIMER_INIT, 0xFFFF_FFFF);
 
-        let start = crate::clock::nanos_since_boot();
-        while crate::clock::nanos_since_boot() - start < 10_000_000 {}
-        let elapsed = crate::clock::nanos_since_boot() - start;
+    let start = crate::clock::nanos_since_boot();
+    while crate::clock::nanos_since_boot() - start < 10_000_000 {}
+    let elapsed = crate::clock::nanos_since_boot() - start;
 
-        let remaining = l.read_u32(LAPIC_TIMER_CURRENT);
-        let ticks_elapsed = 0xFFFF_FFFFu32.wrapping_sub(remaining);
-        let ticks_10ms = (ticks_elapsed as u64 * 10_000_000 / elapsed) as u32;
+    let remaining = cpu::rdmsr(X2APIC_TIMER_CURRENT) as u32;
+    let ticks_elapsed = 0xFFFF_FFFFu32.wrapping_sub(remaining);
+    let ticks_10ms = (ticks_elapsed as u64 * 10_000_000 / elapsed) as u32;
 
-        l.write_u32(LAPIC_TIMER_INIT, 0);
-        TIMER_TICKS.store(ticks_10ms, Ordering::Release);
-        log!("LAPIC timer: {} ticks/10ms", ticks_10ms);
-    });
+    cpu::wrmsr(X2APIC_TIMER_INIT, 0);
+    TIMER_TICKS.store(ticks_10ms, Ordering::Release);
+    log!("LAPIC timer: {} ticks/10ms", ticks_10ms);
 }
 
 /// AP timer init — calibration was done on the BSP, nothing to start.
 pub fn init_timer_ap() {}
 
 /// Arm a one-shot timer to fire after `nanos` nanoseconds.
-/// Lock-free — writes LAPIC MMIO directly. Safe to call from scheduler context.
 pub fn arm_one_shot(nanos: u64) {
-    let base = LAPIC_BASE.load(Ordering::Relaxed);
     let ticks_10ms = TIMER_TICKS.load(Ordering::Relaxed) as u64;
     let ticks = (nanos as u128 * ticks_10ms as u128 / 10_000_000) as u64;
     let ticks = ticks.clamp(1, u32::MAX as u64) as u32;
-    unsafe {
-        let base = base as *mut u8;
-        // Divide by 1
-        base.add(LAPIC_TIMER_DIVIDE as usize).cast::<u32>().write_volatile(0b1011);
-        // One-shot mode (bit 17 = 0), unmasked, vector
-        base.add(LAPIC_LVT_TIMER as usize).cast::<u32>().write_volatile(TIMER_VECTOR as u32);
-        // Initial count — starts countdown
-        base.add(LAPIC_TIMER_INIT as usize).cast::<u32>().write_volatile(ticks);
-    }
+    cpu::wrmsr(X2APIC_TIMER_DIVIDE, 0b1011);
+    cpu::wrmsr(X2APIC_LVT_TIMER, TIMER_VECTOR as u64);
+    cpu::wrmsr(X2APIC_TIMER_INIT, ticks as u64);
 }
 
 /// Stop the timer. No more interrupts until re-armed.
 pub fn stop_timer() {
-    let base = LAPIC_BASE.load(Ordering::Relaxed);
-    unsafe {
-        (base as *mut u8).add(LAPIC_TIMER_INIT as usize).cast::<u32>().write_volatile(0);
-    }
+    cpu::wrmsr(X2APIC_TIMER_INIT, 0);
 }
