@@ -117,6 +117,43 @@ pub fn enable_sse() {
     }
 }
 
+/// Enable SMEP (Supervisor Mode Execution Prevention).
+/// When enabled, the kernel cannot execute code on user-accessible pages.
+/// Must be called on each CPU during init.
+pub fn enable_smep() {
+    // Check CPUID leaf 7, subleaf 0, EBX bit 7
+    let ebx: u32;
+    unsafe {
+        asm!(
+            "push rbx",
+            "mov eax, 7",
+            "xor ecx, ecx",
+            "cpuid",
+            "mov {0:e}, ebx",
+            "pop rbx",
+            out(reg) ebx,
+            out("eax") _,
+            out("ecx") _,
+            out("edx") _,
+            options(nomem),
+        );
+    }
+    if ebx & (1 << 7) == 0 {
+        crate::log!("cpu: SMEP not supported, skipping");
+        return;
+    }
+    unsafe {
+        asm!(
+            "mov {0}, cr4",
+            "or {0}, 1 << 20",  // CR4.SMEP
+            "mov cr4, {0}",
+            out(reg) _,
+            options(nostack),
+        );
+    }
+    crate::log!("cpu: SMEP enabled");
+}
+
 /// Enable SMAP (Supervisor Mode Access Prevention).
 /// When enabled, kernel code cannot access user pages unless RFLAGS.AC=1 (set by STAC).
 /// Must be called on each CPU during init.

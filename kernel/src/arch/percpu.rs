@@ -210,6 +210,7 @@ pub fn init_bsp(lapic_id: u32) {
 
     unsafe { percpu.load_gdt(); }
     cpu::enable_sse();
+    cpu::enable_smep();
     cpu::enable_smap();
     cpu::enable_fsgsbase();
 
@@ -236,6 +237,7 @@ pub fn init_ap(percpu_ptr: *mut PerCpu) {
     let percpu = unsafe { &mut *percpu_ptr };
     unsafe { percpu.load_gdt(); }
     cpu::enable_sse();
+    cpu::enable_smep();
     cpu::enable_smap();
     cpu::enable_fsgsbase();
 

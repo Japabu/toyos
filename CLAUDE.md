@@ -112,4 +112,3 @@ system.toml       What to build and boot
 - Profiling tooling is missing — no way to measure performance inside ToyOS yet.
 - No PCID — every context switch and TLB shootdown does a full TLB flush. PCID would tag TLB entries per-address-space, avoiding flushes on CR3 switch. Also no per-page `invlpg` — shootdowns IPI all CPUs for a full flush.
 - LAPIC timer uses one-shot mode — should use TSC deadline mode (`IA32_TSC_DEADLINE` MSR) for precise absolute-time wakeups. TSC is already calibrated for `nanos_since_boot()`.
-- SMEP not enabled — SMAP is on but SMEP (CR4 bit 20, prevents kernel executing user pages) is not. Trivial to enable.
