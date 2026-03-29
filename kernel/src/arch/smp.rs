@@ -4,7 +4,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use alloc::alloc::{alloc_zeroed, Layout};
 
-use crate::arch::{apic, cpu, percpu, syscall};
+use crate::arch::{apic, percpu, syscall};
 use crate::clock;
 use crate::drivers::acpi::MadtInfo;
 use crate::{log, process};
@@ -233,7 +233,7 @@ pub fn boot_aps(madt: &MadtInfo, boot_cr3: u64) {
 extern "C" fn ap_entry() -> ! {
     // Switch from boot PML4 (identity + high-half) to kernel PML4 (high-half only).
     // We're already executing at a high-half address, so this is safe.
-    unsafe { cpu::write_cr3(crate::mm::paging::kernel().lock().as_ref().unwrap().cr3()); }
+    unsafe { crate::mm::paging::kernel_cr3().load_flush(); }
 
     // GS base was set by the trampoline; finish percpu init (GDT, SSE, SMAP).
     percpu::init_ap(percpu::percpu_ptr());

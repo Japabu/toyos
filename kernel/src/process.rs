@@ -4,7 +4,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::arch::naked_asm;
 use core::ptr::NonNull;
-use crate::arch::{cpu, percpu};
+use crate::arch::percpu;
 use crate::mm::PAGE_2M;
 use crate::fd::{self, Descriptor, FdTable};
 use crate::id_map::IdMap;
@@ -1683,7 +1683,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
 
     let t3 = crate::clock::nanos_since_boot();
     log!("spawn: {} pid={} tid={} base={:#x} entry={:#x} cr3={:#x} (layout={}ms relocs={}ms deps={}ms tls={}ms total={}ms)",
-        path, pid, tid, base, entry, child_pt.lock().cr3(),
+        path, pid, tid, base, entry, child_pt.lock().cr3().phys(),
         (t1 - t0) / 1_000_000, (t2 - t1) / 1_000_000, (t_deps - t2) / 1_000_000,
         (t_tls - t_deps) / 1_000_000, (t3 - t0) / 1_000_000);
 
@@ -1825,7 +1825,7 @@ pub fn exit(code: i32) -> ! {
         let tid = current_tid();
         let Some(entry) = table.get(tid) else {
             drop(guard);
-            unsafe { cpu::write_cr3(crate::mm::paging::kernel().lock().as_ref().unwrap().cr3()); }
+            unsafe { crate::mm::paging::kernel_cr3().activate(); }
             scheduler::exit_current(code);
         };
         let process_pid = entry.process();
@@ -1837,7 +1837,7 @@ pub fn exit(code: i32) -> ! {
     };
 
     // Phase 2: Switch to kernel CR3 and clean up resources
-    unsafe { cpu::write_cr3(crate::mm::paging::kernel().lock().as_ref().unwrap().cr3()); }
+    unsafe { crate::mm::paging::kernel_cr3().activate(); }
     teardown_resources(&process_data_arc, &thread_data_arc, process_pid);
 
     // Phase 3: Scheduling teardown (table lock, then release before waking)
@@ -1868,7 +1868,7 @@ pub fn thread_exit(code: i32) -> ! {
     let kind = with_current_sched(|s| *s.kind());
     let addr_space = scheduler::current_address_space();
 
-    unsafe { cpu::write_cr3(crate::mm::paging::kernel().lock().as_ref().unwrap().cr3()); }
+    unsafe { crate::mm::paging::kernel_cr3().activate(); }
 
     match kind {
         Kind::Thread { parent } => {
@@ -2176,7 +2176,7 @@ pub fn handle_page_fault(fault_addr: u64, _error_code: u64) -> bool {
 
     // Map the 2MB page (writable if any overlapping VMA is writable)
     addr_space.lock().remap(UserAddr::new(region_start), page_alloc.phys(), writable);
-    cpu::flush_tlb();
+    crate::mm::paging::invlpg(region_start);
 
     data.demand_pages.push(page_alloc);
 

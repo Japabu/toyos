@@ -62,7 +62,7 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 
     // Early boot: percpu not ready, just halt (single CPU at this point)
     if !log::PERCPU_READY.load(core::sync::atomic::Ordering::Relaxed) {
-        log!("!!! EARLY PANIC !!!");
+        log!("!!! EARLY PANIC !!!: {}", info);
         cpu::halt();
     }
 

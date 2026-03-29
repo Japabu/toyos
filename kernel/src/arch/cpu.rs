@@ -67,20 +67,31 @@ pub fn read_cr3() -> u64 {
 }
 
 /// # Safety
-/// The caller must ensure the value is a valid PML4 physical address.
+/// The caller must ensure the value is a valid CR3.
 #[inline]
-pub unsafe fn write_cr3(addr: u64) {
-    asm!("mov cr3, {}", in(reg) addr, options(nostack));
+pub unsafe fn write_cr3(value: u64) {
+    asm!("mov cr3, {}", in(reg) value, options(nostack));
 }
 
-
 #[inline]
-pub fn flush_tlb() {
+pub fn invlpg(addr: u64) {
+    unsafe { asm!("invlpg [{}]", in(reg) addr, options(nostack)); }
+}
+
+/// INVPCID — invalidate TLB entries by type.
+/// Type 0: single (pcid, addr). Type 1: all for pcid. Type 2: all PCIDs.
+#[inline]
+pub fn invpcid(kind: u64, pcid: u64, addr: u64) {
+    let desc: [u64; 2] = [pcid, addr];
     unsafe {
-        asm!("mov {0}, cr3", "mov cr3, {0}", out(reg) _, options(nostack));
+        asm!(
+            "invpcid {0}, [{1}]",
+            in(reg) kind,
+            in(reg) desc.as_ptr(),
+            options(nostack, readonly),
+        );
     }
 }
-
 
 /// # Safety
 /// The pointer must reference a valid IDT descriptor.
@@ -205,6 +216,59 @@ pub fn enable_fsgsbase() {
             options(nostack),
         );
     }
+}
+
+/// Enable PCID + INVPCID if both are supported. Returns true if enabled.
+/// PCID without INVPCID is not useful — we need INVPCID for targeted flushes.
+/// Must be called on each CPU. CR3 must have PCID 0 when called.
+pub fn enable_pcid() -> bool {
+    // CPUID leaf 1, ECX bit 17 = PCID
+    let ecx: u32;
+    unsafe {
+        asm!(
+            "push rbx",
+            "mov eax, 1",
+            "cpuid",
+            "mov {0:e}, ecx",
+            "pop rbx",
+            out(reg) ecx,
+            out("eax") _,
+            out("ecx") _,
+            out("edx") _,
+            options(nomem),
+        );
+    }
+    if ecx & (1 << 17) == 0 { return false; }
+
+    // CPUID leaf 7, subleaf 0, EBX bit 10 = INVPCID
+    let ebx: u32;
+    unsafe {
+        asm!(
+            "push rbx",
+            "mov eax, 7",
+            "xor ecx, ecx",
+            "cpuid",
+            "mov {0:e}, ebx",
+            "pop rbx",
+            out(reg) ebx,
+            out("eax") _,
+            out("ecx") _,
+            out("edx") _,
+            options(nomem),
+        );
+    }
+    if ebx & (1 << 10) == 0 { return false; }
+
+    unsafe {
+        asm!(
+            "mov {0}, cr4",
+            "or {0}, 1 << 17",  // CR4.PCIDE
+            "mov cr4, {0}",
+            out(reg) _,
+            options(nostack),
+        );
+    }
+    true
 }
 
 #[inline]

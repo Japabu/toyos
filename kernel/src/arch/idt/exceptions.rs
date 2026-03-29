@@ -135,7 +135,7 @@ pub(crate) fn crash_report(info: &CrashInfo) {
 fn crash_report_exception(ctx: &ExceptionContext) {
     let is_user = ctx.is_user_fault();
     let tid = percpu::current_tid().unwrap_or(crate::process::Tid(0));
-    let pml4 = if is_user { crate::DirectMap::from_phys(cpu::read_cr3()).as_ptr::<u64>() as *const u64 } else { core::ptr::null() };
+    let pml4 = if is_user { crate::DirectMap::from_phys(crate::mm::paging::Cr3::current().phys()).as_ptr::<u64>() as *const u64 } else { core::ptr::null() };
 
     // Header
     if is_user {
@@ -217,7 +217,7 @@ fn crash_report_exception(ctx: &ExceptionContext) {
                     percpu::syscall_num(), user_rip, percpu::user_rsp());
                 log!("  User backtrace:");
                 process::resolve_user_symbol(tid, user_rip);
-                let pml4 = crate::DirectMap::from_phys(cpu::read_cr3()).as_ptr::<u64>() as *const u64;
+                let pml4 = crate::DirectMap::from_phys(crate::mm::paging::Cr3::current().phys()).as_ptr::<u64>() as *const u64;
                 user_backtrace(tid, percpu::syscall_rbp(), pml4, 20);
             }
         }
@@ -266,7 +266,7 @@ fn crash_report_panic(info: &core::panic::PanicInfo, rbp: u64) {
                 percpu::syscall_num(), user_rip, percpu::user_rsp());
             log!("  User backtrace:");
             process::resolve_user_symbol(tid, user_rip);
-            let pml4 = crate::DirectMap::from_phys(cpu::read_cr3()).as_ptr::<u64>() as *const u64;
+            let pml4 = crate::DirectMap::from_phys(crate::mm::paging::Cr3::current().phys()).as_ptr::<u64>() as *const u64;
             user_backtrace(tid, percpu::syscall_rbp(), pml4, 20);
         }
     }
@@ -370,7 +370,7 @@ pub(super) fn debug_handler(frame: &TrapFrame) {
 
     log!("  Backtrace:");
     if is_user {
-        let pml4 = crate::DirectMap::from_phys(cpu::read_cr3()).as_ptr::<u64>() as *const u64;
+        let pml4 = crate::DirectMap::from_phys(crate::mm::paging::Cr3::current().phys()).as_ptr::<u64>() as *const u64;
         if let Some(p) = pid {
             user_backtrace(p, frame.rbp, pml4, 20);
         }
@@ -452,7 +452,7 @@ pub(super) fn double_fault_handler(frame: &TrapFrame) -> ! {
                     log!("  User context (pid={:?}):", pid);
                     log!("    rip={:#018x}  rsp={:#018x}  rbp={:#018x}", maybe_rip, maybe_rsp, user_rbp);
 
-                    let pml4 = crate::DirectMap::from_phys(cpu::read_cr3()).as_ptr::<u64>();
+                    let pml4 = crate::DirectMap::from_phys(crate::mm::paging::Cr3::current().phys()).as_ptr::<u64>();
                     log!("  User backtrace:");
                     if let Some(p) = pid {
                         if !process::resolve_user_symbol(p, maybe_rip) {

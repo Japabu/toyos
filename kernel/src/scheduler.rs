@@ -155,7 +155,7 @@ impl ThreadCtx {
         self.kernel_stack.ptr() as u64 + KERNEL_STACK_SIZE as u64
     }
 
-    pub fn cr3(&self) -> u64 {
+    pub fn cr3(&self) -> crate::mm::paging::Cr3 {
         self.address_space.as_ref().unwrap().lock().cr3()
     }
 
@@ -564,7 +564,7 @@ pub fn exit_current(code: i32) -> ! {
 pub fn schedule_no_return() -> ! {
     percpu::set_current_tid(None);
     unsafe { percpu::set_kernel_stack(percpu::idle_stack_top()); }
-    unsafe { cpu::write_cr3(crate::mm::paging::kernel_cr3()); }
+    unsafe { crate::mm::paging::kernel_cr3().activate(); }
     let sp = percpu::idle_stack_top();
     unsafe {
         asm!(
@@ -802,7 +802,7 @@ fn do_schedule(reason: SwitchReason) {
         let old_rsp_ptr = queue.save_rsp_ptr();
         percpu::set_current_tid(Some(new_tid));
         unsafe { percpu::set_kernel_stack(new_ks_top); }
-        unsafe { cpu::write_cr3(new_cr3); }
+        unsafe { new_cr3.activate(); }
         cpu::wrfsbase(new_fs_base);
 
         queue.into_raw();
@@ -817,7 +817,7 @@ fn do_schedule(reason: SwitchReason) {
     let old_rsp_ptr = queue.save_rsp_ptr();
     percpu::set_current_tid(None);
     unsafe { percpu::set_kernel_stack(percpu::idle_stack_top()); }
-    unsafe { cpu::write_cr3(crate::mm::paging::kernel_cr3()); }
+    unsafe { crate::mm::paging::kernel_cr3().activate(); }
 
     queue.into_raw();
     unsafe { context_switch(old_rsp_ptr, percpu::idle_rsp()); }
@@ -910,7 +910,7 @@ fn cpu_idle_loop() -> ! {
 
                 percpu::set_current_tid(Some(new_tid));
                 unsafe { percpu::set_kernel_stack(new_ks_top); }
-                unsafe { cpu::write_cr3(new_cr3); }
+                unsafe { new_cr3.activate(); }
                 cpu::wrfsbase(new_fs_base);
 
                 queue.into_raw();

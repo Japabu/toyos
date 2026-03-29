@@ -213,6 +213,7 @@ pub fn init_bsp(lapic_id: u32) {
     cpu::enable_smep();
     cpu::enable_smap();
     cpu::enable_fsgsbase();
+    crate::mm::paging::enable_pcid();
 
     cpu::wrmsr(MSR_GS_BASE, ptr as u64);
 
@@ -240,6 +241,7 @@ pub fn init_ap(percpu_ptr: *mut PerCpu) {
     cpu::enable_smep();
     cpu::enable_smap();
     cpu::enable_fsgsbase();
+    crate::mm::paging::enable_pcid();
 
     log!("percpu: AP cpu_id={} lapic_id={}", percpu.cpu_id, percpu.lapic_id);
 }

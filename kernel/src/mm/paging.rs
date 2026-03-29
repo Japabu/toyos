@@ -3,6 +3,8 @@
 // The only code that writes page table entries. Manages the kernel direct map
 // (all physical memory at PHYS_OFFSET) and per-process user address spaces.
 
+use core::sync::atomic::{AtomicU16, Ordering};
+
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
@@ -74,6 +76,121 @@ fn indices(addr: u64) -> (usize, usize, usize) {
 }
 
 // ---------------------------------------------------------------------------
+// PCID and TLB management
+// ---------------------------------------------------------------------------
+
+use core::sync::atomic::AtomicBool;
+
+const CR3_NOFLUSH: u64 = 1 << 63;
+const CR3_ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
+
+/// True when CR4.PCIDE + INVPCID are active.
+static PCID_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Enable PCID if the CPU supports both PCID and INVPCID.
+/// Without INVPCID there's no way to flush all PCIDs, so PCID alone is useless.
+/// Must be called on each CPU. CR3 must have PCID 0 when called.
+pub fn enable_pcid() {
+    use crate::arch::cpu;
+    if cpu::enable_pcid() {
+        PCID_ACTIVE.store(true, Ordering::Relaxed);
+        crate::log!("cpu: PCID + INVPCID enabled");
+    } else {
+        crate::log!("cpu: PCID not available, context switches will flush TLB");
+    }
+}
+
+pub fn pcid_active() -> bool {
+    PCID_ACTIVE.load(Ordering::Relaxed)
+}
+
+/// Flush all TLB entries on this CPU, all PCIDs.
+pub fn flush_tlb_all() {
+    if pcid_active() {
+        crate::arch::cpu::invpcid(2, 0, 0);
+    } else {
+        unsafe {
+            let cr3 = crate::arch::cpu::read_cr3();
+            crate::arch::cpu::write_cr3(cr3);
+        }
+    }
+}
+
+/// Invalidate a single TLB entry for the given address.
+pub fn invlpg(addr: u64) {
+    if pcid_active() {
+        let pcid = crate::arch::cpu::read_cr3() & 0xFFF;
+        crate::arch::cpu::invpcid(0, pcid, addr);
+    } else {
+        crate::arch::cpu::invlpg(addr);
+    }
+}
+
+/// CR3 register value: PML4 physical address | PCID.
+#[derive(Clone, Copy)]
+pub struct Cr3(u64);
+
+impl Cr3 {
+    pub fn current() -> Self {
+        Self(crate::arch::cpu::read_cr3())
+    }
+
+    pub fn phys(self) -> u64 { self.0 & CR3_ADDR_MASK }
+    pub fn pcid(self) -> u16 { (self.0 & 0xFFF) as u16 }
+
+    /// Switch to this address space. With PCID, sets NOFLUSH to preserve
+    /// other processes' TLB entries. Without PCID, plain CR3 write.
+    ///
+    /// # Safety
+    /// The underlying page tables must be valid and live.
+    pub unsafe fn activate(self) {
+        if pcid_active() {
+            crate::arch::cpu::write_cr3(self.0 | CR3_NOFLUSH);
+        } else {
+            crate::arch::cpu::write_cr3(self.0);
+        }
+    }
+
+    /// Load CR3 with a TLB flush. Used during boot before PCID is enabled.
+    ///
+    /// # Safety
+    /// The underlying page tables must be valid and live.
+    pub unsafe fn load_flush(self) {
+        crate::arch::cpu::write_cr3(self.0);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PCID allocator
+// ---------------------------------------------------------------------------
+
+/// Next PCID to allocate. Range 1..4095. PCID 0 is reserved for the kernel.
+static NEXT_PCID: AtomicU16 = AtomicU16::new(1);
+
+/// Allocate a unique PCID for a new user address space.
+/// On wrap past 4095, flushes all TLBs on all CPUs before recycling.
+fn alloc_pcid() -> u16 {
+    loop {
+        let cur = NEXT_PCID.load(Ordering::Relaxed);
+        if cur >= 1 && cur <= 4095 {
+            match NEXT_PCID.compare_exchange(cur, cur + 1, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => return cur,
+                Err(_) => continue,
+            }
+        }
+        // Wrapped past 4095 — flush before recycling to prevent stale TLB hits.
+        match NEXT_PCID.compare_exchange(cur, 2, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => {
+                flush_tlb_all();
+                crate::arch::apic::tlb_shootdown();
+                return 1;
+            }
+            Err(_) => continue,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // AddressSpace
 // ---------------------------------------------------------------------------
 
@@ -89,6 +206,8 @@ pub struct AddressSpace {
     pages: Vec<super::pmm::PhysPage>,
     /// All virtual memory regions, keyed by start address.
     regions: BTreeMap<UserAddr, Region>,
+    /// PCID for this address space. 0 = kernel, 1..4095 = user.
+    pcid: u16,
 }
 
 unsafe impl Send for AddressSpace {}
@@ -99,15 +218,6 @@ fn align_up_2m(v: u64) -> u64 {
 }
 
 impl AddressSpace {
-    fn empty() -> Self {
-        Self {
-            root: Box::new(PageTablePage([0; 512])),
-            children: Vec::new(),
-            pages: Vec::new(),
-            regions: BTreeMap::new(),
-        }
-    }
-
     /// Create a new user address space with kernel entries shallow-copied.
     pub fn new_user() -> Self {
         let guard = kernel().lock();
@@ -125,12 +235,12 @@ impl AddressSpace {
             children: Vec::new(),
             pages: Vec::new(),
             regions: BTreeMap::new(),
+            pcid: alloc_pcid(),
         }
     }
 
-    /// Physical address of PML4 for CR3 writes.
-    pub fn cr3(&self) -> u64 {
-        self.root.phys()
+    pub fn cr3(&self) -> Cr3 {
+        Cr3(self.root.phys() | self.pcid as u64)
     }
 
     /// Map a contiguous physical region into user space as 2MB pages.
@@ -353,7 +463,7 @@ impl AddressSpace {
             self.map_2m(cur, PAGE_PRESENT | PAGE_WRITE);
             cur += PAGE_2M;
         }
-        crate::arch::cpu::flush_tlb();
+        flush_tlb_all();
         crate::arch::apic::tlb_shootdown();
         super::Mmio::new(super::DirectMap::from_phys(phys), size)
     }
@@ -367,7 +477,7 @@ impl AddressSpace {
             self.unmap_2m(cur);
             cur += PAGE_2M;
         }
-        crate::arch::cpu::flush_tlb();
+        flush_tlb_all();
         crate::arch::apic::tlb_shootdown();
     }
 
@@ -431,8 +541,8 @@ pub fn kernel() -> &'static Lock<Option<AddressSpace>> {
 }
 
 /// Kernel CR3. Lock-free — safe to call from panic context.
-pub fn kernel_cr3() -> u64 {
-    KERNEL_CR3.load(core::sync::atomic::Ordering::Relaxed)
+pub fn kernel_cr3() -> Cr3 {
+    Cr3(KERNEL_CR3.load(core::sync::atomic::Ordering::Relaxed))
 }
 
 /// Build kernel page tables: map all physical memory in the high half using 2MB large pages.
@@ -445,7 +555,13 @@ pub(super) fn init(memory_map: &[MemoryMapEntry]) {
     }
     max_addr = (max_addr + PAGE_2M - 1) & !(PAGE_2M - 1);
 
-    let mut kernel = AddressSpace::empty();
+    let mut kernel = AddressSpace {
+        root: Box::new(PageTablePage([0; 512])),
+        children: Vec::new(),
+        pages: Vec::new(),
+        regions: BTreeMap::new(),
+        pcid: 0, // Kernel always uses PCID 0
+    };
 
     let mut addr: u64 = 0;
     while addr < max_addr {
@@ -454,9 +570,10 @@ pub(super) fn init(memory_map: &[MemoryMapEntry]) {
     }
 
     let cr3 = kernel.cr3();
-    KERNEL_CR3.store(cr3, core::sync::atomic::Ordering::Release);
+    KERNEL_CR3.store(cr3.0, core::sync::atomic::Ordering::Release);
     *KERNEL.lock() = Some(kernel);
-    unsafe { crate::arch::cpu::write_cr3(cr3); }
+    // Boot path: load CR3 with flush (PCID not yet enabled).
+    unsafe { cr3.load_flush(); }
 }
 
 // ---------------------------------------------------------------------------
@@ -469,15 +586,15 @@ fn has(entry: u64, flag: u64) -> u8 {
 
 /// Dump page table entries for an address. Lock-free for crash safety.
 pub fn debug_page_walk(addr: u64) {
-    let cr3 = crate::arch::cpu::read_cr3();
-    let pml4 = unsafe { PageTablePage::from_phys(cr3) };
+    let cr3 = Cr3::current();
+    let pml4 = unsafe { PageTablePage::from_phys(cr3.phys()) };
     let pml4_idx = ((addr >> 39) & 0x1FF) as usize;
     let pdpt_idx = ((addr >> 30) & 0x1FF) as usize;
     let pd_idx = ((addr >> 21) & 0x1FF) as usize;
     let pt_idx = ((addr >> 12) & 0x1FF) as usize;
 
-    log!("  Page walk for {:#x} [PML4={:#x} PML4[{}] PDPT[{}] PD[{}] PT[{}]]:",
-        addr, cr3, pml4_idx, pdpt_idx, pd_idx, pt_idx);
+    log!("  Page walk for {:#x} [PML4={:#x} PCID={} PML4[{}] PDPT[{}] PD[{}] PT[{}]]:",
+        addr, cr3.phys(), cr3.pcid(), pml4_idx, pdpt_idx, pd_idx, pt_idx);
 
     let pml4e = pml4[pml4_idx];
     log!("    PML4E: {:#018x} P={} W={} U={}", pml4e,

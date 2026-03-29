@@ -905,7 +905,7 @@ fn sys_mmap(req_addr: u64, size: u64, _prot: u64, flags: u64) -> u64 {
             cur += crate::mm::PAGE_2M;
             offset += crate::mm::PAGE_2M;
         }
-        cpu::flush_tlb();
+        crate::mm::paging::flush_tlb_all();
         apic::tlb_shootdown();
         process::with_fd_owner_data(|data| {
             data.mmap_regions.push(process::MmapRegion {
@@ -1213,7 +1213,7 @@ fn sys_dlopen(path: &str, init_out: u64) -> u64 {
                     let phys = rw_phys + i as u64 * crate::mm::PAGE_2M;
                     pt.lock().remap(UserAddr::new(user_virt), phys, true);
                 }
-                cpu::flush_tlb();
+                crate::mm::paging::flush_tlb_all();
                 apic::tlb_shootdown();
                 let delta = lib_vaddr.raw() as i64 - lib.user_base.raw() as i64;
                 if delta != 0 {

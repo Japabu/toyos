@@ -62,7 +62,9 @@ Key crates forked in `userland/` with `[patch.crates-io]`. Rules:
 ## Build & test
 
 - `cargo run` builds everything (toolchain, kernel, bootloader, userland, initrd) and launches QEMU.
+- `cargo run -- --build-only` builds everything without launching QEMU.
 - `cargo test` runs integration tests (boots QEMU headless, runs test harness inside ToyOS).
+- `cargo test -- --nocapture` same but with serial output visible.
 - `system.toml` defines which programs to build and the init sequence.
 
 ## Repository layout
@@ -110,5 +112,6 @@ system.toml       What to build and boot
 
 <!-- Track blocking issues and findings here. Remove when resolved. -->
 - Profiling tooling is missing — no way to measure performance inside ToyOS yet.
-- No PCID — every context switch and TLB shootdown does a full TLB flush. PCID would tag TLB entries per-address-space, avoiding flushes on CR3 switch. Also no per-page `invlpg` — shootdowns IPI all CPUs for a full flush.
+- PCID + INVPCID codepaths untested on real hardware (QEMU TCG doesn't support either). Both are CPUID-gated — TCG falls back to CR3 reload. Needs testing on KVM or bare metal.
+- TLB shootdowns still IPI all CPUs for a full flush. Per-page targeted shootdowns not yet implemented.
 - LAPIC timer uses one-shot mode — should use TSC deadline mode (`IA32_TSC_DEADLINE` MSR) for precise absolute-time wakeups. TSC is already calibrated for `nanos_since_boot()`.
