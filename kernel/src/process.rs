@@ -29,19 +29,14 @@ impl crate::id_map::IdKey for Pid {
 /// Page tables shared between a process and all its threads.
 pub type PageTables = Arc<Lock<crate::mm::paging::AddressSpace>>;
 
-/// Allocate a VMA region and map physical memory into it.
+/// Allocate a virtual region and map physical memory into it.
 /// Returns the allocated virtual address, or None if out of address space.
 pub fn vma_map(
-    vmas: &mut crate::vma::VmaList,
     pt: &Lock<crate::mm::paging::AddressSpace>,
     phys: u64,
     size: u64,
 ) -> Option<(UserAddr, u64)> {
-    let aligned = crate::mm::align_2m(size as usize) as u64;
-    assert!(phys & (PAGE_2M - 1) == 0, "vma_map: phys {:#x} not 2MB-aligned (size={:#x})", phys, size);
-    let vaddr = vmas.alloc_region(aligned).ok()?;
-    pt.lock().map_range(vaddr, phys, aligned, true);
-    Some((vaddr, aligned))
+    pt.lock().alloc_and_map(phys, size)
 }
 
 // ---------------------------------------------------------------------------
@@ -378,8 +373,6 @@ pub struct ProcessData {
     pub syscall_total: u64,
     /// Wall-clock nanoseconds spent in syscall dispatch (includes preemption time)
     pub syscall_total_ns: u64,
-    /// Virtual memory areas for demand paging.
-    pub vmas: crate::vma::VmaList,
     /// 2MB allocations for demand-paged pages. Freed on process exit.
     pub demand_pages: Vec<PageAlloc>,
     /// RELATIVE relocation index for demand-paged ELF (applied per-page on fault).
@@ -867,9 +860,9 @@ pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64, stack_base: u64) -> Op
     };
     let fs_base = {
         let addr_space = parent_addr_space.as_ref().expect("spawn_thread: no address space");
-        let mut parent_data = data_arc.lock();
+        let parent_data = data_arc.lock();
         let tls_phys = tls_alloc.phys();
-        let (tls_vaddr, _) = vma_map(&mut parent_data.vmas, addr_space, tls_phys, tls_alloc.size() as u64)
+        let (tls_vaddr, _) = vma_map(addr_space, tls_phys, tls_alloc.size() as u64)
             .expect("spawn_thread: out of virtual address space");
         // Rebase fs_base and internal TLS pointers from physical to virtual
         let tls_rebase = tls_vaddr.raw() as i64 - tls_phys as i64;
@@ -926,7 +919,6 @@ pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64, stack_base: u64) -> Op
         syscall_counts: [0; 64],
         syscall_total: 0,
         syscall_total_ns: 0,
-        vmas: crate::vma::VmaList::new(),
         demand_pages: Vec::new(),
         reloc_index: None,
         elf_base: UserAddr::new(0),
@@ -1087,9 +1079,15 @@ fn resolve_exe_tpoff(
 
 /// Spawn a new process from an ELF binary using demand paging.
 /// Only reads ELF headers and metadata from disk — PT_LOAD segments are faulted in on access.
-/// Build VMAs for each PT_LOAD segment in the ELF layout.
-fn build_vmas(layout: &elf::ElfLayout, base: u64, backing: &Arc<dyn crate::file_backing::FileBacking>) -> crate::vma::VmaList {
-    let mut vmas = crate::vma::VmaList::new();
+/// Insert demand-paged regions for each PT_LOAD segment into the address space.
+fn insert_elf_regions(
+    addr_space: &mut crate::mm::paging::AddressSpace,
+    layout: &elf::ElfLayout,
+    base: u64,
+    backing: &Arc<dyn crate::file_backing::FileBacking>,
+) {
+    use crate::vma::{Region, RegionKind};
+
     for seg in &layout.segments {
         let seg_start = (base + seg.vaddr) & !0xFFF;
         let seg_end = (base + seg.vaddr + seg.memsz + 0xFFF) & !0xFFF;
@@ -1099,11 +1097,10 @@ fn build_vmas(layout: &elf::ElfLayout, base: u64, backing: &Arc<dyn crate::file_
         let file_backed_end = seg_start + file_blocks_needed as u64 * 4096;
 
         if file_blocks_needed > 0 && file_backed_end > seg_start {
-            vmas.insert(crate::vma::Vma {
-                start: UserAddr::new(seg_start),
-                end: UserAddr::new(file_backed_end.min(seg_end)),
+            addr_space.insert_region(UserAddr::new(seg_start), Region {
+                size: file_backed_end.min(seg_end) - seg_start,
                 writable: seg.writable,
-                kind: crate::vma::VmaKind::FileBacked {
+                kind: RegionKind::FileBacked {
                     backing: Arc::clone(backing),
                     file_offset: file_block_start * 4096,
                     file_size: seg.filesz + (seg.file_offset % 4096),
@@ -1112,15 +1109,14 @@ fn build_vmas(layout: &elf::ElfLayout, base: u64, backing: &Arc<dyn crate::file_
         }
 
         if file_backed_end < seg_end {
-            vmas.insert(crate::vma::Vma {
-                start: UserAddr::new(file_backed_end.max(seg_start)),
-                end: UserAddr::new(seg_end),
+            let anon_start = file_backed_end.max(seg_start);
+            addr_space.insert_region(UserAddr::new(anon_start), Region {
+                size: seg_end - anon_start,
                 writable: seg.writable,
-                kind: crate::vma::VmaKind::Anonymous,
+                kind: RegionKind::Anonymous,
             });
         }
     }
-    vmas
 }
 
 /// Build TLS module layout from loaded shared libraries and the exe's TLS segment.
@@ -1205,9 +1201,6 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
 
     // 4. Choose base address in user virtual space
     let base = USER_VM_BASE - layout.vaddr_min;
-
-    // 5. Create VMAs for each PT_LOAD segment
-    let mut vmas = build_vmas(&layout, base, &backing);
 
     // 6. Read and parse relocation tables from block map
     let rela_data = if dyn_info.rela_size > 0 {
@@ -1366,14 +1359,17 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
     // 8. Create user address space (PML4) — ELF segments are demand-faulted
     let child_pt: PageTables = Arc::new(Lock::new(crate::mm::paging::AddressSpace::new_user()));
 
-    // 8a. Map shared libraries via VmaList and assign virtual addresses.
+    // 8a. Insert ELF regions into the child address space (demand-paged)
+    insert_elf_regions(&mut child_pt.lock(), &layout, base, &backing);
+
+    // 8b. Map shared libraries and assign virtual addresses.
     // This MUST happen BEFORE relocation processing so that user_base is correct
     // when GOT entries are written (RELATIVE: user_base + addend, GLOB_DAT: user_base + sym.st_value).
     for lib in &mut loaded_libs {
         match &lib.memory {
             elf::LibMemory::Owned(alloc) => {
                 let phys = DirectMap::phys_of(alloc.ptr());
-                let (vaddr, _) = vma_map(&mut vmas, &child_pt, phys, alloc.size() as u64)
+                let (vaddr, _) = vma_map(&child_pt, phys, alloc.size() as u64)
                     .expect("spawn: out of virtual address space for lib");
                 let delta = vaddr.raw() as i64 - lib.user_base.raw() as i64;
                 lib.user_base = vaddr;
@@ -1381,7 +1377,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
             }
             elf::LibMemory::Shared { rw_alloc, cached_image, rw_offset, .. } => {
                 let cached_phys = cached_image.phys();
-                let (lib_vaddr, _) = vma_map(&mut vmas, &child_pt, cached_phys, cached_image.size() as u64)
+                let (lib_vaddr, _) = vma_map(&child_pt, cached_phys, cached_image.size() as u64)
                     .expect("spawn: out of virtual address space for lib");
                 let num_rw_pages = rw_alloc.size() / PAGE_2M as usize;
                 let rw_phys = DirectMap::phys_of(rw_alloc.ptr());
@@ -1566,9 +1562,9 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
             }
         }
     };
-    // TLS mapped via VmaList — rebase all user-visible pointers from phys to vaddr
+    // TLS mapped via address space — rebase all user-visible pointers from phys to vaddr
     let tls_phys = tls_alloc.phys();
-    let (tls_vaddr, _) = vma_map(&mut vmas, &child_pt, tls_phys, tls_alloc.size() as u64)
+    let (tls_vaddr, _) = vma_map(&child_pt, tls_phys, tls_alloc.size() as u64)
         .expect("spawn: out of virtual address space for TLS");
     let tls_rebase = tls_vaddr.raw() as i64 - tls_phys as i64;
     let fs_base = (fs_base as i64 + tls_rebase) as u64;
@@ -1656,7 +1652,6 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
         syscall_counts: [0; 64],
         syscall_total: 0,
         syscall_total_ns: 0,
-        vmas,
         demand_pages: Vec::new(),
         reloc_index,
         elf_base: UserAddr::new(base),
@@ -1757,7 +1752,6 @@ fn teardown_resources(data_arc: &Arc<Lock<ProcessData>>, pid: Pid) {
     data.mmap_regions.clear();
 
     data.demand_pages.clear();
-    data.vmas.clear();
     data.reloc_index = None;
 }
 
@@ -2061,26 +2055,70 @@ pub fn handle_page_fault(fault_addr: u64, _error_code: u64) -> bool {
         (data, addr_space)
     };
 
-    let mut data = data_arc.lock();
-
-    // Verify the fault address is within a valid VMA
-    if data.vmas.find(UserAddr::new(fault_addr)).is_none() {
-        //log!("handle_page_fault: no VMA for {:#x} tid={}", fault_addr, tid);
-        return false;
-    }
-
     // Round down to 2MB boundary
     let page_2m = PAGE_2M;
     let region_start = fault_addr & !(page_2m - 1);
+    let region_end_full = region_start + page_2m;
+
+    // Collect region info from the address space (lock addr_space briefly).
+    // We gather everything we need so we can drop the lock before doing I/O.
+    struct RegionSnap {
+        start: u64,
+        end: u64,
+        writable: bool,
+        kind: RegionSnapKind,
+    }
+    enum RegionSnapKind {
+        Anonymous,
+        FileBacked { backing: Arc<dyn crate::file_backing::FileBacking>, file_offset: u64, file_size: u64 },
+    }
+
+    let (valid, already_mapped, writable, regions) = {
+        let as_guard = addr_space.lock();
+
+        // Verify the fault address is within a valid region
+        if as_guard.find_region(UserAddr::new(fault_addr)).is_none() {
+            return false;
+        }
+
+        // If a 2MB page is already mapped at this region (from a previous fault
+        // in a different VMA that shares the same 2MB range), just return success.
+        if as_guard.translate(UserAddr::new(region_start)).is_some() {
+            return true;
+        }
+
+        // Collect overlapping regions info
+        let mut writable = false;
+        let mut snaps = Vec::new();
+        for (&start_addr, region) in as_guard.overlapping_regions(UserAddr::new(region_start), UserAddr::new(region_end_full)) {
+            if region.writable { writable = true; }
+            let snap_kind = match &region.kind {
+                crate::vma::RegionKind::Anonymous => RegionSnapKind::Anonymous,
+                crate::vma::RegionKind::FileBacked { backing, file_offset, file_size } => {
+                    RegionSnapKind::FileBacked {
+                        backing: Arc::clone(backing),
+                        file_offset: *file_offset,
+                        file_size: *file_size,
+                    }
+                }
+                crate::vma::RegionKind::Mapped => RegionSnapKind::Anonymous, // already mapped eagerly
+            };
+            snaps.push(RegionSnap {
+                start: start_addr.raw(),
+                end: start_addr.raw() + region.size,
+                writable: region.writable,
+                kind: snap_kind,
+            });
+        }
+        (true, false, writable, snaps)
+    };
+
+    let _ = (valid, already_mapped); // used above in early returns
+
+    let mut data = data_arc.lock();
 
     let reloc_index = data.reloc_index.clone();
     let elf_base = data.elf_base.raw();
-
-    // If a 2MB page is already mapped at this region (from a previous fault
-    // in a different VMA that shares the same 2MB range), just return success.
-    if addr_space.lock().translate(UserAddr::new(region_start)).is_some() {
-        return true;
-    }
 
     // Allocate a zeroed 2MB physical page
     let page_alloc = match PageAlloc::new(page_2m as usize) {
@@ -2089,28 +2127,20 @@ pub fn handle_page_fault(fault_addr: u64, _error_code: u64) -> bool {
     };
     let page_ptr = page_alloc.ptr();
 
-    // Fill the 2MB page from ALL VMAs that overlap this region.
+    // Fill the 2MB page from ALL regions that overlap this range.
     // Multiple segments (e.g. .text and .rodata) can share a 2MB range.
-    // If ANY overlapping VMA is writable, map the entire 2MB as writable.
-    let region_end_full = region_start + page_2m;
-    let writable = data.vmas.overlapping(UserAddr::new(region_start), UserAddr::new(region_end_full))
-        .any(|v| v.writable);
-
-    for vma in data.vmas.overlapping(UserAddr::new(region_start), UserAddr::new(region_end_full)) {
-        let vma_s = vma.start.raw();
-        let vma_e = vma.end.raw();
-
-        match &vma.kind {
-            crate::vma::VmaKind::Anonymous => {
+    for region in &regions {
+        match &region.kind {
+            RegionSnapKind::Anonymous => {
                 // Already zeroed by PageAlloc::new
             }
-            crate::vma::VmaKind::FileBacked { backing, file_offset, file_size } => {
-                let fill_start = region_start.max(vma_s);
-                let fill_end = region_end_full.min(vma_e);
+            RegionSnapKind::FileBacked { backing, file_offset, file_size } => {
+                let fill_start = region_start.max(region.start);
+                let fill_end = region_end_full.min(region.end);
                 let mut vaddr = fill_start & !0xFFF;
 
                 while vaddr < fill_end {
-                    let vma_offset = vaddr - vma_s;
+                    let vma_offset = vaddr - region.start;
                     let page_offset = (vaddr - region_start) as usize;
 
                     if vma_offset < *file_size {
@@ -2401,7 +2431,6 @@ pub fn kill_process(target_pid: Pid) -> u64 {
         data.loaded_libs.clear();
         data.mmap_regions.clear();
         data.demand_pages.clear();
-        data.vmas.clear();
         data.reloc_index = None;
     }
 

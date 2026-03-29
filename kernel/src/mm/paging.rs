@@ -4,10 +4,12 @@
 // (all physical memory at PHYS_OFFSET) and per-process user address spaces.
 
 use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 use super::{PAGE_2M, UserAddr};
 use crate::sync::Lock;
+use crate::vma::{self, Region, RegionKind};
 use crate::MemoryMapEntry;
 
 const PAGE_PRESENT: u64 = 1 << 0;
@@ -75,18 +77,26 @@ fn indices(addr: u64) -> (usize, usize, usize) {
 // AddressSpace
 // ---------------------------------------------------------------------------
 
-/// Address space backed by a PML4 page table.
+/// Unified address space: hardware page tables + virtual memory region tracking.
+///
 /// PML4[0..255] = user mappings (per-process), PML4[256..511] = kernel direct map (shared).
-/// All child page table pages are owned by `children` and freed automatically on drop.
+/// `regions` tracks all mapped virtual memory areas (ELF segments, mmap, stack, etc.)
+/// and serves as the source of truth for the virtual address allocator.
 pub struct AddressSpace {
     root: Box<PageTablePage>,
     children: Vec<Box<PageTablePage>>,
     /// Physical data pages mapped into user space. Freed on drop.
     pages: Vec<super::pmm::PhysPage>,
+    /// All virtual memory regions, keyed by start address.
+    regions: BTreeMap<UserAddr, Region>,
 }
 
 unsafe impl Send for AddressSpace {}
 unsafe impl Sync for AddressSpace {}
+
+fn align_up_2m(v: u64) -> u64 {
+    (v + PAGE_2M - 1) & !(PAGE_2M - 1)
+}
 
 impl AddressSpace {
     fn empty() -> Self {
@@ -94,6 +104,7 @@ impl AddressSpace {
             root: Box::new(PageTablePage([0; 512])),
             children: Vec::new(),
             pages: Vec::new(),
+            regions: BTreeMap::new(),
         }
     }
 
@@ -109,7 +120,12 @@ impl AddressSpace {
             }
         }
 
-        Self { root: pml4, children: Vec::new(), pages: Vec::new() }
+        Self {
+            root: pml4,
+            children: Vec::new(),
+            pages: Vec::new(),
+            regions: BTreeMap::new(),
+        }
     }
 
     /// Physical address of PML4 for CR3 writes.
@@ -229,6 +245,97 @@ impl AddressSpace {
         let offset = va & (PAGE_2M - 1);
         Some(super::DirectMap::from_phys(page_phys + offset))
     }
+
+    // -----------------------------------------------------------------------
+    // Virtual memory region management
+    // -----------------------------------------------------------------------
+
+    /// Find a free gap of at least `size` bytes (2MB-aligned), searching top-down.
+    fn find_gap(&self, size: u64) -> Option<UserAddr> {
+        let aligned = align_up_2m(size);
+        let total = aligned + vma::GUARD_SIZE;
+
+        let mut top = vma::ALLOC_CEILING;
+        for (&start, region) in self.regions.range(..UserAddr::new(vma::ALLOC_CEILING)).rev() {
+            let region_end = align_up_2m(start.raw() + region.size);
+            if region_end > top {
+                top = start.raw();
+                continue;
+            }
+            let gap = top - region_end;
+            if gap >= total {
+                return Some(UserAddr::new(region_end));
+            }
+            top = start.raw();
+        }
+        // Gap below all regions
+        if top >= total + vma::ALLOC_FLOOR {
+            return Some(UserAddr::new(top - total));
+        }
+        None
+    }
+
+    /// Allocate a virtual address range and register the region.
+    pub fn alloc_region(&mut self, size: u64, kind: RegionKind, writable: bool) -> Option<UserAddr> {
+        let aligned = align_up_2m(size);
+        let addr = self.find_gap(aligned)?;
+        self.regions.insert(addr, Region { size: aligned, writable, kind });
+        Some(addr)
+    }
+
+    /// Allocate a region and map physical memory into it.
+    pub fn alloc_and_map(&mut self, phys: u64, size: u64) -> Option<(UserAddr, u64)> {
+        let aligned = align_up_2m(size);
+        assert!(phys & (PAGE_2M - 1) == 0, "alloc_and_map: phys {phys:#x} not 2MB-aligned");
+        let addr = self.find_gap(aligned)?;
+        self.regions.insert(addr, Region { size: aligned, writable: true, kind: RegionKind::Mapped });
+        self.map_range(addr, phys, aligned, true);
+        Some((addr, aligned))
+    }
+
+    /// Free a previously allocated region and unmap it.
+    pub fn free_and_unmap(&mut self, addr: UserAddr) -> Option<u64> {
+        let size = self.regions.remove(&addr)?.size;
+        self.unmap_range(addr, size);
+        Some(size)
+    }
+
+    /// Free a region without unmapping (for demand-paged regions where pages
+    /// are tracked separately).
+    pub fn free_region(&mut self, addr: UserAddr) -> Option<u64> {
+        self.regions.remove(&addr).map(|r| r.size)
+    }
+
+    /// Insert a region at a specific address (for ELF segments, stack, etc.)
+    pub fn insert_region(&mut self, addr: UserAddr, region: Region) {
+        self.regions.insert(addr, region);
+    }
+
+    /// Find the region containing `addr`. Returns (start_addr, region).
+    pub fn find_region(&self, addr: UserAddr) -> Option<(UserAddr, &Region)> {
+        let (&start, region) = self.regions.range(..=addr).next_back()?;
+        if addr.raw() < start.raw() + region.size {
+            Some((start, region))
+        } else {
+            None
+        }
+    }
+
+    /// Iterate all regions that overlap the range [start, end).
+    pub fn overlapping_regions(&self, start: UserAddr, end: UserAddr) -> impl Iterator<Item = (&UserAddr, &Region)> {
+        self.regions.iter().filter(move |(&s, r)| {
+            s.raw() < end.raw() && s.raw() + r.size > start.raw()
+        })
+    }
+
+    /// Clear all regions (for process teardown).
+    pub fn clear_regions(&mut self) {
+        self.regions.clear();
+    }
+
+    // -----------------------------------------------------------------------
+    // Direct map / MMIO
+    // -----------------------------------------------------------------------
 
     /// Map a physical region into the direct map using 2MB pages.
     /// Returns an Mmio handle for bounds-checked register access.

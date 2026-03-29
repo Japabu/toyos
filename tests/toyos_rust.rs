@@ -64,6 +64,7 @@ toyos_rust_tests!(
     std_fs,
     std_fs_write,
     std_io,
+    mmap_stress,
     std_mmap,
     std_process,
     std_sync,

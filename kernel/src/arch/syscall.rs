@@ -651,7 +651,7 @@ fn sys_pipe_map(fd_num: u32) -> u64 {
         };
         let pt = crate::scheduler::current_address_space()
             .expect("sys_pipe_map: no address space");
-        let Some((vaddr, aligned)) = process::vma_map(&mut data.vmas, &pt, phys.phys(), pipe::PIPE_SIZE as u64) else {
+        let Some((vaddr, aligned)) = process::vma_map(&pt, phys.phys(), pipe::PIPE_SIZE as u64) else {
             return SyscallError::ResourceExhausted.to_u64();
         };
 
@@ -909,7 +909,7 @@ fn sys_mmap(req_addr: u64, size: u64, _prot: u64, flags: u64) -> u64 {
         let phys = pages.phys();
         let pt = process::current_address_space();
         let vaddr = process::with_current_data(|data| {
-            let Some((vaddr, _)) = process::vma_map(&mut data.vmas, &pt, phys, aligned as u64) else {
+            let Some((vaddr, _)) = process::vma_map(&pt, phys, aligned as u64) else {
                 return Err(());
             };
             data.mmap_regions.push(process::MmapRegion {
@@ -942,8 +942,9 @@ fn sys_munmap(addr: u64, _size: u64) -> u64 {
                     cur += crate::mm::PAGE_2M;
                 }
             } else {
-                pt.lock().unmap_range(region.addr, region.size as u64);
-                data.vmas.free_region(region.addr);
+                let mut as_guard = pt.lock();
+                as_guard.unmap_range(region.addr, region.size as u64);
+                as_guard.free_region(region.addr);
             }
             0
         } else {
@@ -1175,13 +1176,13 @@ fn sys_dlopen(path: &str, init_out: u64) -> u64 {
         }
     };
 
-    // Map library via VmaList and update user_base for symbol resolution
+    // Map library into current process's virtual address space
     let pt = process::current_address_space();
-    process::with_fd_owner_data(|data| {
+    process::with_fd_owner_data(|_data| {
         match &lib.memory {
             crate::elf::LibMemory::Owned(alloc) => {
                 let phys = DirectMap::phys_of(alloc.ptr());
-                let (vaddr, _) = process::vma_map(&mut data.vmas, &pt, phys, alloc.size() as u64)
+                let (vaddr, _) = process::vma_map(&pt, phys, alloc.size() as u64)
                     .expect("dlopen: out of virtual address space");
                 let delta = vaddr.raw() as i64 - lib.user_base.raw() as i64;
                 if delta != 0 {
@@ -1192,7 +1193,7 @@ fn sys_dlopen(path: &str, init_out: u64) -> u64 {
             }
             crate::elf::LibMemory::Shared { rw_alloc, cached_image, rw_offset, .. } => {
                 let cached_phys = cached_image.phys();
-                let (lib_vaddr, _) = process::vma_map(&mut data.vmas, &pt, cached_phys, cached_image.size() as u64)
+                let (lib_vaddr, _) = process::vma_map(&pt, cached_phys, cached_image.size() as u64)
                     .expect("dlopen: out of virtual address space");
                 let num_rw_pages = rw_alloc.size() / crate::mm::PAGE_2M as usize;
                 let rw_phys = DirectMap::phys_of(rw_alloc.ptr());
@@ -1311,7 +1312,7 @@ fn sys_tls_alloc_block(module_id: u64) -> u64 {
     let block_phys = page_alloc.phys();
     let pt = process::current_address_space();
     let tls_vaddr = process::with_fd_owner_data(|data| {
-        let (vaddr, _) = process::vma_map(&mut data.vmas, &pt, block_phys, page_alloc.size() as u64)
+        let (vaddr, _) = process::vma_map(&pt, block_phys, page_alloc.size() as u64)
             .expect("sys_tls_alloc_block: out of virtual address space");
         data.alloc_count += 1;
         vaddr
