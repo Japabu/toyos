@@ -2276,8 +2276,7 @@ pub fn dump_crash_diagnostics(fault_addr: u64, rip: u64) {
     dump_region("rip", rip);
 
     // Dump TLS self-pointer at FS base
-    // Read the ACTUAL FS_BASE MSR (swapgs doesn't affect FS, only GS)
-    let fs_base_msr = crate::arch::read_fs_base();
+    let fs_base_msr = crate::arch::cpu::rdfsbase();
     let fs_base_saved = scheduler::with_current_ctx(|ctx| ctx.fs_base).unwrap_or(0);
     let fs_base = fs_base_msr;
     if fs_base_msr != fs_base_saved {

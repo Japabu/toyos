@@ -1338,7 +1338,7 @@ fn sys_tls_alloc_block(module_id: u64) -> u64 {
     // Write block address into current thread's DTV.
     // FS base = TP (user-visible virtual address). TCB[8] = DTV pointer (virtual).
     // We need to translate user virtual addresses to kernel direct-map pointers.
-    let tp_virt = crate::arch::read_fs_base();
+    let tp_virt = super::cpu::rdfsbase();
     let tp_phys = pt.lock().translate(UserAddr::new(tp_virt))
         .expect("sys_tls_alloc_block: TP not mapped");
     let tp_kern = tp_phys.as_ptr::<u64>();

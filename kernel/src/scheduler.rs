@@ -12,7 +12,6 @@ use crate::process::{self, IdleProof, OwnedAlloc, PageTables, Pid, Tid, KERNEL_S
 use crate::sync::Lock;
 use crate::DirectMap;
 
-const IA32_FS_BASE: u32 = 0xC0000100;
 const MAX_CPUS: usize = 8;
 const MAX_VRUNTIME_LAG_NS: u64 = 50_000_000; // 50ms
 const EVENT_QUEUE_SIZE: usize = 256;
@@ -779,7 +778,7 @@ fn do_schedule(reason: SwitchReason) {
 
     if let Some(mut old) = queue.take_current() {
         check_stack_canary(&old);
-        old.fs_base = cpu::rdmsr(IA32_FS_BASE);
+        old.fs_base = cpu::rdfsbase();
         let elapsed = if old.scheduled_at > 0 { now - old.scheduled_at } else { 0 };
         old.stop_cpu_timer(now);
         queue.charge(&SCHEDULER, old.process, elapsed);
@@ -804,7 +803,7 @@ fn do_schedule(reason: SwitchReason) {
         percpu::set_current_tid(Some(new_tid));
         unsafe { percpu::set_kernel_stack(new_ks_top); }
         unsafe { cpu::write_cr3(new_cr3); }
-        cpu::wrmsr(IA32_FS_BASE, new_fs_base);
+        cpu::wrfsbase(new_fs_base);
 
         queue.into_raw();
         unsafe { context_switch(old_rsp_ptr, new_rsp); }
@@ -912,7 +911,7 @@ fn cpu_idle_loop() -> ! {
                 percpu::set_current_tid(Some(new_tid));
                 unsafe { percpu::set_kernel_stack(new_ks_top); }
                 unsafe { cpu::write_cr3(new_cr3); }
-                cpu::wrmsr(IA32_FS_BASE, new_fs_base);
+                cpu::wrfsbase(new_fs_base);
 
                 queue.into_raw();
                 unsafe { context_switch(percpu::idle_rsp_ptr(), new_rsp); }

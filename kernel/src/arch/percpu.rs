@@ -211,6 +211,7 @@ pub fn init_bsp(lapic_id: u32) {
     unsafe { percpu.load_gdt(); }
     cpu::enable_sse();
     cpu::enable_smap();
+    cpu::enable_fsgsbase();
 
     cpu::wrmsr(MSR_GS_BASE, ptr as u64);
 
@@ -236,6 +237,7 @@ pub fn init_ap(percpu_ptr: *mut PerCpu) {
     unsafe { percpu.load_gdt(); }
     cpu::enable_sse();
     cpu::enable_smap();
+    cpu::enable_fsgsbase();
 
     log!("percpu: AP cpu_id={} lapic_id={}", percpu.cpu_id, percpu.lapic_id);
 }

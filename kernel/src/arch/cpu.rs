@@ -156,6 +156,36 @@ pub fn enable_smap() {
     crate::log!("cpu: SMAP enabled");
 }
 
+/// Enable FSGSBASE instructions (rdfsbase, rdgsbase, wrfsbase, wrgsbase).
+/// Must be called on each CPU during init, before any FSGSBASE instruction is used.
+pub fn enable_fsgsbase() {
+    unsafe {
+        asm!(
+            "mov {0}, cr4",
+            "or {0}, 1 << 16",  // CR4.FSGSBASE
+            "mov cr4, {0}",
+            out(reg) _,
+            options(nostack),
+        );
+    }
+}
+
+#[inline]
+pub fn rdfsbase() -> u64 {
+    let val: u64;
+    unsafe {
+        asm!("rdfsbase {}", out(reg) val, options(nomem, nostack));
+    }
+    val
+}
+
+#[inline]
+pub fn wrfsbase(val: u64) {
+    unsafe {
+        asm!("wrfsbase {}", in(reg) val, options(nomem, nostack));
+    }
+}
+
 pub fn halt() -> ! {
     loop {
         unsafe {
