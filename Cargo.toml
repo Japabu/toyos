@@ -26,6 +26,10 @@ opt-level = 3
 [profile.dev.package.toyos-ld]
 opt-level = 3
 
+[[test]]
+name = "toyos"
+harness = false
+
 [patch.crates-io]
 target-lexicon = { path = "userland/target-lexicon" }
 stacker = { path = "userland/stacker" }

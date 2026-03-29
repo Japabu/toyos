@@ -1,11 +1,15 @@
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 use std::{env, fs, thread};
 
 use super::compile;
+
+/// When true, serial output is printed to stderr as it arrives.
+pub static VERBOSE: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug)]
 pub struct TestResult {
@@ -26,7 +30,8 @@ pub struct QemuInstance {
 /// Build all binaries in a test crate.
 pub fn build_toyos_bins(crate_path: &Path) -> Vec<(String, Vec<u8>)> {
     let repo = compile::repo_root();
-    toyos::build::build_toyos_bins(&repo, crate_path)
+    let quiet = !VERBOSE.load(Ordering::Relaxed);
+    toyos::build::build_toyos_bins(&repo, crate_path, quiet)
 }
 
 /// All kernel serial output goes through log!() which prepends "[kernel ...]".
@@ -75,7 +80,8 @@ impl QemuInstance {
             config_path.display()
         );
 
-        let disk = toyos::build::build_test_image(&repo, &config_path, debug_wait, &extra_files);
+        let quiet = !VERBOSE.load(Ordering::Relaxed);
+        let disk = toyos::build::build_test_image(&repo, &config_path, debug_wait, quiet, &extra_files);
 
         let pid = std::process::id();
         let test_dir = env::temp_dir().join(format!("toyos-tests-{pid}"));
@@ -140,11 +146,6 @@ impl QemuInstance {
                         } else {
                             (None, None)
                         };
-                        let status = match (exit_code, &error) {
-                            (Some(0), None) => "PASS",
-                            _ => "FAIL",
-                        };
-                        eprintln!("[test] {status} {name}");
                         return TestResult {
                             name: name.to_string(),
                             exit_code,
@@ -264,7 +265,9 @@ fn spawn_and_wait_ready(mut qemu: Command, no_timeout: bool) -> QemuInstance {
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
 
-    eprintln!("[qemu] Launching QEMU...");
+    if VERBOSE.load(Ordering::Relaxed) {
+        eprintln!("[qemu] Launching QEMU...");
+    }
     let mut child = qemu.spawn().expect("Failed to launch QEMU");
 
     let stdin = BufWriter::new(child.stdin.take().unwrap());
@@ -279,7 +282,9 @@ fn spawn_and_wait_ready(mut qemu: Command, no_timeout: bool) -> QemuInstance {
                 Ok(line) => {
                     full_log.push_str(&line);
                     full_log.push('\n');
-                    eprintln!("[serial] {line}");
+                    if VERBOSE.load(Ordering::Relaxed) {
+                        eprintln!("[serial] {line}");
+                    }
                     if tx.send(line).is_err() {
                         break;
                     }
@@ -299,7 +304,9 @@ fn spawn_and_wait_ready(mut qemu: Command, no_timeout: bool) -> QemuInstance {
         }
         match rx.recv_timeout(Duration::from_secs(1)) {
             Ok(line) if line.contains("===READY===") => {
-                eprintln!("[qemu] Test runner ready");
+                if VERBOSE.load(Ordering::Relaxed) {
+                    eprintln!("[qemu] Test runner ready");
+                }
                 break;
             }
             Ok(ref line)

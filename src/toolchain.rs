@@ -74,7 +74,6 @@ pub fn ensure(root: &Path, force_rebuild: bool) -> ChangeSet {
         stamps::write_dir_stamp(&root.join("toyos-net/src"), &net_stamp);
         true
     } else {
-        eprintln!("Toolchain up to date.");
         false
     };
 

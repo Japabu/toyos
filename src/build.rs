@@ -167,69 +167,35 @@ fn invalidate_stale(root: &Path, config: &SystemConfig, fp: &str) {
 
 // --- Cargo helpers ---
 
-fn build_kernel(root: &Path, debug_wait: bool, release: bool, rustflags: &str, path_env: &str) {
-    let mut args = vec!["build", "--target", "x86_64-unknown-none"];
-    if release {
-        args.push("--release");
-    }
-    if debug_wait {
-        args.push("--features");
-        args.push("debug-wait");
-    }
-    assert!(
-        Command::new("cargo")
-            .args(&args)
-            .current_dir(root.join("kernel"))
-            .env("RUSTUP_TOOLCHAIN", "toyos")
-            .env("RUSTFLAGS", rustflags)
-            .env("PATH", path_env)
-            .env_remove("RUSTC")
-            .status()
-            .expect("Failed to run cargo")
-            .success(),
-        "Failed to build kernel"
-    );
-}
-
-fn build_bootloader(
-    root: &Path,
-    release: bool,
+fn cargo_build(
+    crate_dir: &Path,
+    target: &str,
+    extra_args: &[&str],
     rustflags: &str,
     path_env: &str,
-    init_programs: &str,
+    extra_env: &[(&str, &str)],
+    quiet: bool,
 ) {
-    let mut args = vec!["build", "--target", "x86_64-unknown-uefi"];
-    if release {
-        args.push("--release");
+    let mut args = vec!["build", "--target", target];
+    if quiet {
+        args.push("--quiet");
+    }
+    args.extend_from_slice(extra_args);
+    let mut cmd = Command::new("cargo");
+    cmd.args(&args)
+        .current_dir(crate_dir)
+        .env("RUSTUP_TOOLCHAIN", "toyos")
+        .env("RUSTFLAGS", rustflags)
+        .env("PATH", path_env)
+        .env_remove("RUSTC");
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    if quiet {
+        cmd.stderr(std::process::Stdio::null());
     }
     assert!(
-        Command::new("cargo")
-            .args(&args)
-            .current_dir(root.join("bootloader"))
-            .env("RUSTUP_TOOLCHAIN", "toyos")
-            .env("RUSTFLAGS", rustflags)
-            .env("PATH", path_env)
-            .env("INIT_PROGRAMS", init_programs)
-            .env_remove("RUSTC")
-            .status()
-            .expect("Failed to run cargo")
-            .success(),
-        "Failed to build bootloader"
-    );
-}
-
-fn cargo_build_toyos(crate_dir: &Path, extra_args: &[&str], rustflags: &str, path_env: &str) {
-    let mut args = vec!["build", "--target", "x86_64-unknown-toyos"];
-    args.extend_from_slice(extra_args);
-    assert!(
-        Command::new("cargo")
-            .args(&args)
-            .current_dir(crate_dir)
-            .env("RUSTUP_TOOLCHAIN", "toyos")
-            .env("RUSTFLAGS", rustflags)
-            .env("PATH", path_env)
-            .env_remove("RUSTC")
-            .status()
+        cmd.status()
             .unwrap_or_else(|e| panic!("cargo build failed in {}: {e}", crate_dir.display()))
             .success(),
         "cargo build failed in {}",
@@ -247,6 +213,7 @@ fn build_and_assemble(
     rustflags: &str,
     path_env: &str,
     extra_files: &[(String, Vec<u8>)],
+    quiet: bool,
 ) -> Vec<u8> {
     let userland_dir = root.join("userland");
 
@@ -277,7 +244,15 @@ fn build_and_assemble(
             extra.push("-p");
             extra.push(pkg);
         }
-        cargo_build_toyos(&userland_dir, &extra, rustflags, path_env);
+        cargo_build(
+            &userland_dir,
+            "x86_64-unknown-toyos",
+            &extra,
+            rustflags,
+            path_env,
+            &[],
+            quiet,
+        );
     }
 
     // Build standalone programs individually
@@ -295,7 +270,15 @@ fn build_and_assemble(
         } else {
             ""
         };
-        cargo_build_toyos(&crate_dir, &extra, flags, path_env);
+        cargo_build(
+            &crate_dir,
+            "x86_64-unknown-toyos",
+            &extra,
+            flags,
+            path_env,
+            &[],
+            quiet,
+        );
     }
 
     // Collect binaries
@@ -333,7 +316,7 @@ fn build_and_assemble(
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
 
-    image::create_initrd(&initrd_files, &symlinks)
+    image::create_initrd(&initrd_files, &symlinks, quiet)
 }
 
 // --- Public API ---
@@ -357,14 +340,47 @@ pub fn build(root: &Path, debug: bool, release: bool) {
         let root = root.to_path_buf();
         let rustflags = rustflags.clone();
         let path_env = path_env.clone();
+        let release = release;
+        let debug = debug;
         std::thread::spawn(move || {
-            build_kernel(&root, debug, release, &rustflags, &path_env);
+            let mut extra = Vec::new();
+            if release {
+                extra.push("--release");
+            }
+            if debug {
+                extra.push("--features");
+                extra.push("debug-wait");
+            }
+            cargo_build(
+                &root.join("kernel"),
+                "x86_64-unknown-none",
+                &extra,
+                &rustflags,
+                &path_env,
+                &[],
+                false,
+            );
         })
     };
-    build_bootloader(root, release, &rustflags, &path_env, &init_programs);
+    {
+        let mut extra = Vec::new();
+        if release {
+            extra.push("--release");
+        }
+        cargo_build(
+            &root.join("bootloader"),
+            "x86_64-unknown-uefi",
+            &extra,
+            &rustflags,
+            &path_env,
+            &[("INIT_PROGRAMS", init_programs.as_str())],
+            false,
+        );
+    }
     kernel_handle.join().expect("kernel build thread panicked");
 
-    let initrd_bytes = build_and_assemble(root, &config, profile, &rustflags, &path_env, &[]);
+    let initrd_bytes =
+        build_and_assemble(root, &config, profile, &rustflags, &path_env, &[], false);
 
     // Mirror initrd to target/initrd/ for inspection
     let initrd_dir = root.join("target/initrd");
@@ -393,6 +409,7 @@ pub fn build_test_image(
     root: &Path,
     config_path: &Path,
     debug_wait: bool,
+    quiet: bool,
     extra_files: &[(String, Vec<u8>)],
 ) -> Vec<u8> {
     crate::toolchain::ensure(root, false);
@@ -404,10 +421,39 @@ pub fn build_test_image(
     invalidate_stale(root, &config, &fp);
 
     let init_programs = config.init.join(";");
-    build_kernel(root, debug_wait, false, rustflags, &path_env);
-    build_bootloader(root, false, rustflags, &path_env, &init_programs);
+    let mut kernel_extra: Vec<&str> = Vec::new();
+    if debug_wait {
+        kernel_extra.push("--features");
+        kernel_extra.push("debug-wait");
+    }
+    cargo_build(
+        &root.join("kernel"),
+        "x86_64-unknown-none",
+        &kernel_extra,
+        rustflags,
+        &path_env,
+        &[],
+        quiet,
+    );
+    cargo_build(
+        &root.join("bootloader"),
+        "x86_64-unknown-uefi",
+        &[],
+        rustflags,
+        &path_env,
+        &[("INIT_PROGRAMS", init_programs.as_str())],
+        quiet,
+    );
 
-    let initrd_bytes = build_and_assemble(root, &config, "debug", rustflags, &path_env, extra_files);
+    let initrd_bytes = build_and_assemble(
+        root,
+        &config,
+        "debug",
+        rustflags,
+        &path_env,
+        extra_files,
+        quiet,
+    );
 
     let kernel_bytes = fs::read(root.join("kernel/target/x86_64-unknown-none/debug/kernel"))
         .expect("Failed to read kernel");
@@ -421,7 +467,7 @@ pub fn build_test_image(
 
 /// Build all binaries in a multi-binary crate. Returns vec of (binary_name, bytes).
 /// Also builds any cdylib subcrates and includes their .so files.
-pub fn build_toyos_bins(root: &Path, crate_path: &Path) -> Vec<(String, Vec<u8>)> {
+pub fn build_toyos_bins(root: &Path, crate_path: &Path, quiet: bool) -> Vec<(String, Vec<u8>)> {
     crate::toolchain::ensure(root, false);
     let path_env = toolchain::path_with_toyos_ld(root);
     let fp = external_fingerprint(root);
@@ -454,8 +500,10 @@ pub fn build_toyos_bins(root: &Path, crate_path: &Path) -> Vec<(String, Vec<u8>)
         }
 
         let lib_name = sub_path.file_name().unwrap().to_str().unwrap();
-        eprintln!("[build] Building cdylib subcrate: {lib_name}");
-        cargo_build_toyos(&sub_path, &[], "", &path_env);
+        if !quiet {
+            eprintln!("[build] Building cdylib subcrate: {lib_name}");
+        }
+        cargo_build(&sub_path, "x86_64-unknown-toyos", &[], "", &path_env, &[], quiet);
 
         let lib_out = sub_path.join("target/x86_64-unknown-toyos/debug");
         lib_search_dirs.push(lib_out.clone());
@@ -475,7 +523,15 @@ pub fn build_toyos_bins(root: &Path, crate_path: &Path) -> Vec<(String, Vec<u8>)
     for dir in &lib_search_dirs {
         rustflags.push_str(&format!("-L {} ", dir.display()));
     }
-    cargo_build_toyos(crate_path, &["--bins"], &rustflags, &path_env);
+    cargo_build(
+        crate_path,
+        "x86_64-unknown-toyos",
+        &["--bins"],
+        &rustflags,
+        &path_env,
+        &[],
+        quiet,
+    );
 
     let bin_dir = crate_path.join("target/x86_64-unknown-toyos/debug");
     let bin_src = crate_path.join("src/bin");

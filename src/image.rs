@@ -7,6 +7,7 @@ use bcachefs::{Formatted, VecBlockIO};
 pub fn create_initrd(
     files: &[(String, Vec<u8>)],
     symlinks: &[(String, String)],
+    quiet: bool,
 ) -> Vec<u8> {
     let data_size: usize = files.iter().map(|(_, d)| d.len()).sum::<usize>();
     let total_entries = files.len() + symlinks.len();
@@ -21,13 +22,17 @@ pub fn create_initrd(
     let mut fs = Formatted::format(io);
 
     for (name, data) in files {
-        eprintln!("initrd: adding '{}' ({} bytes)", name, data.len());
+        if !quiet {
+            eprintln!("initrd: adding '{}' ({} bytes)", name, data.len());
+        }
         fs.create(name, data, 0)
             .unwrap_or_else(|e| panic!("initrd: failed to add '{}': {:?}", name, e));
     }
 
     for (name, target) in symlinks {
-        eprintln!("initrd: symlink '{}' -> '{}'", name, target);
+        if !quiet {
+            eprintln!("initrd: symlink '{}' -> '{}'", name, target);
+        }
         fs.create_symlink(name, target, 0)
             .unwrap_or_else(|e| panic!("initrd: failed to symlink '{}' -> '{}': {:?}", name, target, e));
     }
