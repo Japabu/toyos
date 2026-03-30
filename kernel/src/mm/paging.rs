@@ -293,7 +293,7 @@ impl AddressSpace {
     /// Allocate a 2MB page from PMM and map it at `vaddr`.
     /// Returns a DirectMap handle for kernel access to the page.
     pub fn map_alloc(&mut self, vaddr: UserAddr, writable: bool) -> super::DirectMap {
-        let page = super::pmm::alloc_page().expect("map_alloc: out of physical memory");
+        let page = super::pmm::alloc_page(super::pmm::Category::PageTable).expect("map_alloc: out of physical memory");
         let phys = page.phys();
         let dm = page.direct_map();
 

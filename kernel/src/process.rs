@@ -80,9 +80,9 @@ pub struct PageAlloc(Vec<crate::mm::pmm::PhysPage>);
 
 impl PageAlloc {
     /// Allocate `size` bytes as contiguous 2MB pages.
-    pub fn new(size: usize) -> Option<Self> {
+    pub fn new(size: usize, cat: crate::mm::pmm::Category) -> Option<Self> {
         let count = (size + PAGE_2M as usize - 1) / PAGE_2M as usize;
-        Some(Self(crate::mm::pmm::alloc_contiguous(count)?))
+        Some(Self(crate::mm::pmm::alloc_contiguous(count, cat)?))
     }
 
     /// Kernel pointer to the start of the allocation (via direct map).
@@ -697,7 +697,7 @@ pub fn setup_combined_tls(
 ) -> Option<(PageAlloc, u64)> {
     let block_size = total_memsz + TCB_SIZE;
     let alloc_size = crate::mm::align_2m(block_size + tls_align);
-    let page_alloc = PageAlloc::new(alloc_size)?;
+    let page_alloc = PageAlloc::new(alloc_size, crate::mm::pmm::Category::InitTls)?;
     let block = page_alloc.ptr();
 
     // Place TLS data near the end of the allocation (DTV at start, TLS after).
@@ -1438,7 +1438,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
     }
 
     // 9. Stack at fixed virtual address (STACK_BASE from vma.rs)
-    let stack_pages = match PageAlloc::new(USER_STACK_SIZE) {
+    let stack_pages = match PageAlloc::new(USER_STACK_SIZE, crate::mm::pmm::Category::Stack) {
         Some(a) => a,
         None => {
             log!("spawn: {}: failed to allocate user stack ({} bytes)", path, USER_STACK_SIZE);
@@ -2116,7 +2116,7 @@ pub fn handle_page_fault(fault_addr: u64, _error_code: u64) -> bool {
     let elf_base = data.elf_base.raw();
 
     // Allocate a zeroed 2MB physical page
-    let page_alloc = match PageAlloc::new(page_2m as usize) {
+    let page_alloc = match PageAlloc::new(page_2m as usize, crate::mm::pmm::Category::DemandPage) {
         Some(a) => a,
         None => return false,
     };

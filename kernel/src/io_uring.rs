@@ -619,8 +619,8 @@ pub fn destroy(ring_id: RingId) {
     if let Some(mut instance) = instance {
         // Drop all pending polls (WatcherGuards clean up watcher lists)
         instance.pending_polls.clear();
-        // Release shared memory
-        let _ = shared_memory::release(instance.shm_token, instance.owner_pid);
+        // Destroy shared memory region — unmaps from all processes, frees backing pages
+        let _ = shared_memory::destroy(instance.shm_token, instance.owner_pid);
     }
 }
 

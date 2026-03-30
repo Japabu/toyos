@@ -889,7 +889,7 @@ fn sys_mmap(req_addr: u64, size: u64, _prot: u64, flags: u64) -> u64 {
     let aligned = crate::mm::align_2m(size as usize);
     let fixed = flags & 4 != 0; // MmapFlags::FIXED
 
-    let Some(pages) = process::PageAlloc::new(aligned) else {
+    let Some(pages) = process::PageAlloc::new(aligned, crate::mm::pmm::Category::Mmap) else {
         return SyscallError::Unknown.to_u64();
     };
 
@@ -1021,7 +1021,19 @@ fn sys_sysinfo(buf: &mut [u8]) -> u64 {
             process::Kind::Thread { parent } => (1u8, *parent),
             process::Kind::Process { parent } => (0u8, parent.unwrap_or(process::Pid::MAX)),
         };
-        let memory = entry.memory_size();
+        let memory = if let Some(data) = entry.process_data().try_lock() {
+            let demand = data.demand_pages.iter().map(|p| p.size() as u64).sum::<u64>();
+            let mmap = data.mmap_regions.iter().map(|r| r._pages.size() as u64).sum::<u64>();
+            let tls = data.dynamic_tls_blocks.values().map(|p| p.size() as u64).sum::<u64>();
+            let libs: u64 = data.loaded_libs.iter().map(|l| match &l.memory {
+                crate::elf::LibMemory::Owned(alloc) => alloc.size() as u64,
+                crate::elf::LibMemory::Shared { rw_alloc, .. } => rw_alloc.size() as u64,
+            }).sum();
+            let stack = entry.memory_size(); // static stack size
+            demand + mmap + tls + libs + stack
+        } else {
+            entry.memory_size()
+        };
         let cpu_ns = entry.cpu_ns();
         // Report the process Pid to userland (not the internal Tid)
         let pid = entry.process();
@@ -1308,7 +1320,7 @@ fn sys_tls_alloc_block(module_id: u64) -> u64 {
     };
 
     // Allocate TLS block from PMM (needs 2MB alignment for user mapping)
-    let page_alloc = process::PageAlloc::new(tls_memsz.max(1))
+    let page_alloc = process::PageAlloc::new(tls_memsz.max(1), crate::mm::pmm::Category::Tls)
         .unwrap_or_else(|| panic!("sys_tls_alloc_block: failed to allocate {} bytes", tls_memsz));
     let block_ptr = page_alloc.ptr();
 

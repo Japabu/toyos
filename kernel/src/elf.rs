@@ -156,7 +156,7 @@ fn cache_loaded_lib(path: &str, lib: LoadedLib, rw_vaddr: u64, rw_end_vaddr: u64
         path, relocs.bind.len(), relocs.tpoff64.len(), relocs.tpoff32.len(),
         relocs.dtpmod64.len(), relocs.dtpoff64.len());
 
-    let rw_alloc = match PageAlloc::new(rw_size) {
+    let rw_alloc = match PageAlloc::new(rw_size, crate::mm::pmm::Category::Elf) {
         Some(a) => a,
         None => {
             return LoadedLib { memory: LibMemory::Owned(alloc), ..lib };
@@ -222,7 +222,7 @@ pub fn try_clone_cached(path: &str) -> Option<LoadedLib> {
 fn clone_from_cache(cached: &CachedLib) -> Option<LoadedLib> {
     let t0 = crate::clock::nanos_since_boot();
 
-    let rw_alloc = PageAlloc::new(cached.rw_size)?;
+    let rw_alloc = PageAlloc::new(cached.rw_size, crate::mm::pmm::Category::Elf)?;
     let src = unsafe { cached.alloc.ptr().add(cached.rw_offset) };
     unsafe { core::ptr::copy_nonoverlapping(src, rw_alloc.ptr(), cached.rw_size); }
 
@@ -886,7 +886,7 @@ pub fn load_shared_lib(backing: &dyn crate::file_backing::FileBacking) -> Result
 
     let load_size = align_2m((vaddr_max - vaddr_min) as usize);
     let t0 = crate::clock::nanos_since_boot();
-    let alloc = PageAlloc::new(load_size).ok_or("dlopen: allocation failed")?;
+    let alloc = PageAlloc::new(load_size, crate::mm::pmm::Category::Elf).ok_or("dlopen: allocation failed")?;
     let t1 = crate::clock::nanos_since_boot();
     let base_ptr = alloc.ptr();
     let image = unsafe { KernelSlice::from_raw(base_ptr, load_size) };

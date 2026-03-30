@@ -97,7 +97,7 @@ unsafe impl Send for Pipe {}
 
 impl Pipe {
     fn new() -> Self {
-        let page = pmm::alloc_page().expect("pipe: allocation failed");
+        let page = pmm::alloc_page(pmm::Category::Pipe).expect("pipe: allocation failed");
         RingHeader::init(page.direct_map().as_mut_ptr(), PIPE_SIZE);
         Self { page, readers: 0, writers: 0, io_uring_watchers: Vec::new() }
     }

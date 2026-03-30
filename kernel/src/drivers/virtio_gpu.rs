@@ -420,8 +420,8 @@ impl GpuController {
         let mut tokens = [SharedToken::from_raw(0); 2];
         let mut phys_addrs = [0u64; 2];
         let mut ptrs = [core::ptr::null_mut(); 2];
-        let pages0 = crate::mm::pmm::alloc_contiguous(fb_pages).expect("VirtIO GPU: framebuffer alloc failed");
-        let pages1 = crate::mm::pmm::alloc_contiguous(fb_pages).expect("VirtIO GPU: framebuffer alloc failed");
+        let pages0 = crate::mm::pmm::alloc_contiguous(fb_pages, crate::mm::pmm::Category::Framebuffer).expect("VirtIO GPU: framebuffer alloc failed");
+        let pages1 = crate::mm::pmm::alloc_contiguous(fb_pages, crate::mm::pmm::Category::Framebuffer).expect("VirtIO GPU: framebuffer alloc failed");
         let all_pages = [pages0, pages1];
         for i in 0..2 {
             let phys_addr = all_pages[i][0].direct_map().phys();
@@ -611,7 +611,7 @@ pub fn init(ecam: &crate::mm::Mmio) -> Option<(Box<dyn Gpu>, GpuInfo)> {
 
     // Create cursor resource (64x64, BGRA with alpha)
     let cursor_bytes = (CURSOR_SIZE * CURSOR_SIZE * 4) as usize;
-    let cursor_pages = crate::mm::pmm::alloc_contiguous(1).expect("VirtIO GPU: cursor alloc failed");
+    let cursor_pages = crate::mm::pmm::alloc_contiguous(1, crate::mm::pmm::Category::Framebuffer).expect("VirtIO GPU: cursor alloc failed");
     let cursor_ptr = cursor_pages[0].direct_map().as_mut_ptr::<u8>();
     let cursor_phys = cursor_pages[0].direct_map().phys();
     gpu.cursor_token = shared_memory::register(crate::DirectMap::from_phys(cursor_phys), PAGE_2M);

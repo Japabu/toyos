@@ -126,7 +126,7 @@ fn next_token() -> SharedToken {
 pub fn alloc(size: u64, owner_pid: Pid, addr_space: &PageTables) -> SharedToken {
     let aligned_size = align_2m(size as usize);
     let page_count = aligned_size / PAGE_2M as usize;
-    let pages = pmm::alloc_contiguous(page_count).expect("shared_memory: allocation failed");
+    let pages = pmm::alloc_contiguous(page_count, pmm::Category::SharedMemory).expect("shared_memory: allocation failed");
     let phys = DirectMap::from_phys(pages[0].direct_map().phys());
     let vaddr = alloc_vaddr(aligned_size as u64);
 
@@ -230,6 +230,24 @@ pub fn release(token: SharedToken, pid: Pid) -> Result<(), Error> {
             .ok_or(Error::NotFound)?;
         region.allowed.retain(|p| *p != pid);
         region.unmap_from(pid);
+        Ok(())
+    })
+}
+
+/// Destroy a process-owned shared region: unmap from all processes, remove from
+/// table, and free backing pages (via Drop). The caller must be the owner.
+pub fn destroy(token: SharedToken, owner: Pid) -> Result<(), Error> {
+    with_regions_mut(|regions| {
+        let pos = regions.iter().position(|(t, _)| *t == token)
+            .ok_or(Error::NotFound)?;
+        let (_, ref region) = regions[pos];
+        match &region.ownership {
+            Ownership::Process { pid, .. } if *pid == owner => {}
+            _ => return Err(Error::PermissionDenied),
+        }
+        let (_, region) = regions.swap_remove(pos);
+        region.unmap_all();
+        // region dropped here → PhysPages dropped → pages returned to PMM
         Ok(())
     })
 }

@@ -412,6 +412,23 @@ pub fn log_health() {
     if ready == 0 && blocked > 0 {
         dump_blocked();
     }
+
+    // PMM stats dump (any CPU, time-gated to every 10s)
+    use core::sync::atomic::AtomicU64;
+    static NEXT_PMM_DUMP: AtomicU64 = AtomicU64::new(0);
+    const PMM_DUMP_INTERVAL_NS: u64 = 10_000_000_000;
+    let now = crate::clock::nanos_since_boot();
+    let next = NEXT_PMM_DUMP.load(Ordering::Relaxed);
+    if next == 0 {
+        NEXT_PMM_DUMP.store(now + PMM_DUMP_INTERVAL_NS, Ordering::Relaxed);
+    } else if now >= next {
+        // CAS to avoid multiple CPUs dumping simultaneously
+        if NEXT_PMM_DUMP.compare_exchange(next, now + PMM_DUMP_INTERVAL_NS,
+            Ordering::Relaxed, Ordering::Relaxed).is_ok()
+        {
+            crate::mm::pmm::dump_stats();
+        }
+    }
 }
 
 static FUTEX_LOCK: Lock<()> = Lock::new(());

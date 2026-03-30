@@ -38,7 +38,7 @@ pub fn init(
     log!("GOP: {}x{} stride={} format={} at {:#x} tokens=[{:?}, {:?}]",
         width, height, stride, pixel_format, addr, token0, token1);
 
-    let cursor_pages = crate::mm::pmm::alloc_contiguous(1).expect("GOP: cursor alloc failed");
+    let cursor_pages = crate::mm::pmm::alloc_contiguous(1, crate::mm::pmm::Category::Framebuffer).expect("GOP: cursor alloc failed");
     let cursor_phys = cursor_pages[0].direct_map().phys();
     let cursor_token = shared_memory::register(
         DirectMap::from_phys(cursor_phys),

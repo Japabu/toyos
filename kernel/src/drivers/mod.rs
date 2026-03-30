@@ -26,7 +26,7 @@ unsafe impl Send for DmaPool {}
 impl DmaPool {
     pub fn alloc(size: usize) -> Self {
         let pages_2m = (size + crate::mm::PAGE_2M as usize - 1) / crate::mm::PAGE_2M as usize;
-        let pages = crate::mm::pmm::alloc_contiguous(pages_2m)
+        let pages = crate::mm::pmm::alloc_contiguous(pages_2m, crate::mm::pmm::Category::Dma)
             .expect("DmaPool: out of physical memory");
         let base = pages[0].direct_map().as_mut_ptr::<u8>();
         let slice = unsafe { KernelSlice::from_raw(base, pages_2m * crate::mm::PAGE_2M as usize) };
