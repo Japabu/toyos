@@ -47,4 +47,5 @@ toyos-cc = { path = "toyos-cc" }
 "bin/screen" = "/bin/toybox"
 "bin/shutdown" = "/bin/toybox"
 "bin/spin" = "/bin/toybox"
+"bin/stats" = "/bin/toybox"
 "bin/tone" = "/bin/toybox"

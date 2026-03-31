@@ -88,6 +88,7 @@ pub const SYS_QUERY_MODULES: u64 = 91;
 ///   1 = kernel fault (null pointer deref in kernel context)
 pub const SYS_DEBUG: u64 = 92;
 pub const SYS_SCHED_INFO: u64 = 93;
+pub const SYS_PROCESS_STATS: u64 = 94;
 
 pub const WNOHANG: u64 = 1;
 
@@ -1003,4 +1004,41 @@ pub fn sched_info() -> SchedInfo {
     let mut info = SchedInfo { vruntime: 0, min_vruntime: 0 };
     syscall(SYS_SCHED_INFO, &mut info as *mut SchedInfo as u64, 0, 0, 0);
     info
+}
+
+/// Per-process accounting statistics. Used as the snapshot stashed on the parent
+/// at process exit and returned by SYS_PROCESS_STATS.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct ProcessStats {
+    pub wall_ns: u64,
+    pub cpu_ns: u64,
+    pub syscall_total: u64,
+    pub syscall_total_ns: u64,
+    pub fault_demand_count: u32,
+    pub fault_zero_count: u32,
+    pub fault_ns: u64,
+    pub io_read_ops: u32,
+    pub _pad: u32,
+    pub io_read_bytes: u64,
+    pub blocked_io_ns: u64,
+    pub blocked_futex_ns: u64,
+    pub blocked_pipe_ns: u64,
+    pub blocked_ipc_ns: u64,
+    pub blocked_other_ns: u64,
+    pub runqueue_wait_ns: u64,
+    pub peak_memory: u64,
+    pub alloc_count: u64,
+}
+
+/// Read accounting stats for an exited child process.
+/// Returns Ok(()) on success, Err if no stats available for that pid.
+pub fn process_stats(child_pid: Pid, stats: &mut ProcessStats) -> Result<(), SyscallError> {
+    check_unit(syscall(
+        SYS_PROCESS_STATS,
+        child_pid.0 as u64,
+        stats as *mut ProcessStats as u64,
+        core::mem::size_of::<ProcessStats>() as u64,
+        0,
+    ))
 }

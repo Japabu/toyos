@@ -410,6 +410,15 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             let out = unsafe { &mut *(buf.as_mut_ptr() as *mut toyos_abi::syscall::SchedInfo) };
             sys_sched_info(out)
         },
+        SYS_PROCESS_STATS => {
+            let stats_size = core::mem::size_of::<toyos_abi::syscall::ProcessStats>() as u64;
+            if a3 < stats_size { return SyscallError::InvalidArgument.to_u64(); }
+            let Some(buf) = ctx.user_slice_mut(UserAddr::new(a2), stats_size) else {
+                return bad_addr;
+            };
+            let out = unsafe { &mut *(buf.as_mut_ptr() as *mut toyos_abi::syscall::ProcessStats) };
+            sys_process_stats(process::Pid::from_raw(a1 as u32), out)
+        },
         _ => SyscallError::InvalidArgument.to_u64(),
     };
 
@@ -1425,6 +1434,17 @@ fn sys_sched_info(out: &mut toyos_abi::syscall::SchedInfo) -> u64 {
     out.vruntime = vruntime;
     out.min_vruntime = min_vruntime;
     0
+}
+
+fn sys_process_stats(child_pid: process::Pid, out: &mut toyos_abi::syscall::ProcessStats) -> u64 {
+    let snap = process::with_fd_owner_data(|data| {
+        let pos = data.child_stats.iter().position(|(pid, _)| *pid == child_pid);
+        pos.map(|i| data.child_stats.remove(i).1)
+    });
+    match snap {
+        Some(s) => { *out = s; 0 }
+        None => SyscallError::NotFound.to_u64(),
+    }
 }
 
 fn sys_query_modules(buf: &mut [u8]) -> u64 {

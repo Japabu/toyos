@@ -389,6 +389,29 @@ pub struct ProcessData {
     pub exe_vaddr_max: u64,
     /// Paths of dlopen'd libraries (parallel to loaded_libs).
     pub lib_paths: Vec<String>,
+
+    // --- Process accounting (Layer 1 diagnostics) ---
+    pub spawn_ns: u64,
+    pub accounting: ProcessAccounting,
+    /// Stashed stats from exited children (capped at 64).
+    pub child_stats: Vec<(Pid, toyos_abi::syscall::ProcessStats)>,
+}
+
+/// Per-process accounting counters. Accumulated from all threads on exit.
+#[derive(Default)]
+pub struct ProcessAccounting {
+    pub fault_demand_count: u32,
+    pub fault_zero_count: u32,
+    pub fault_ns: u64,
+    pub io_read_ops: u32,
+    pub io_read_bytes: u64,
+    pub blocked_io_ns: u64,
+    pub blocked_futex_ns: u64,
+    pub blocked_pipe_ns: u64,
+    pub blocked_ipc_ns: u64,
+    pub blocked_other_ns: u64,
+    pub child_threads_cpu_ns: u64,
+    pub runqueue_wait_ns: u64,
 }
 
 /// Per-thread data, unique to each thread via `Arc<Lock<ThreadData>>`.
@@ -941,6 +964,8 @@ pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64, stack_base: u64) -> Op
         blocked_on: None,
         deadline: 0,
         blocked_since: 0,
+        enqueued_at: 0,
+        accounting: scheduler::ThreadAccounting::default(),
     };
     scheduler::enqueue_new(ctx);
     Some(tid)
@@ -1642,6 +1667,9 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
         exe_eh_frame_hdr_size: layout.eh_frame_hdr.map_or(0, |(_, s)| s),
         exe_vaddr_max: base + layout.vaddr_max - layout.vaddr_min,
         lib_paths,
+        spawn_ns: crate::clock::nanos_since_boot(),
+        accounting: ProcessAccounting::default(),
+        child_stats: Vec::new(),
     }));
 
     let thread_data = Arc::new(Lock::new(ThreadData {
@@ -1678,6 +1706,8 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
         blocked_on: None,
         deadline: 0,
         blocked_since: 0,
+        enqueued_at: 0,
+        accounting: scheduler::ThreadAccounting::default(),
     };
     scheduler::enqueue_new(ctx);
 
@@ -1708,11 +1738,12 @@ pub fn spawn_kernel(argv: &[&str]) -> Pid {
 /// Called in two phases:
 /// - Phase 1 (resource cleanup): ProcessData lock held, table lock NOT held.
 /// - Phase 2 (scheduling): table lock held through context switch.
+/// Returns (syscall_total, syscall_total_ns) for the main thread, needed by the accounting snapshot.
 fn teardown_resources(
     process_data_arc: &Arc<Lock<ProcessData>>,
     thread_data_arc: &Arc<Lock<ThreadData>>,
     pid: Pid,
-) {
+) -> (u64, u64) {
     // Phase 1a: Read syscall stats from ThreadData, then drop lock
     let (syscall_total, syscall_total_ns, syscall_counts) = {
         let tdata = thread_data_arc.lock();
@@ -1728,6 +1759,9 @@ fn teardown_resources(
 
     // Phase 2: Process-level cleanup (never hold both locks)
     let mut data = process_data_arc.lock();
+
+    // Flush current thread's blocked/runqueue stats into process accounting
+    scheduler::flush_current_stats(&mut data.accounting);
 
     // Print syscall profile for processes with significant activity
     if syscall_total > 0 {
@@ -1749,6 +1783,10 @@ fn teardown_resources(
             data.peak_memory / (1024 * 1024), data.alloc_count, data.free_count);
     }
 
+    drop(data);
+
+    // Free resources (re-acquire lock)
+    let mut data = process_data_arc.lock();
     fd::close_all(&mut data.fds, &mut *vfs::lock(), pid);
     scheduler::remove_vruntime(pid);
     data.elf_alloc.take();
@@ -1757,6 +1795,8 @@ fn teardown_resources(
 
     data.demand_pages.clear();
     data.reloc_index = None;
+
+    (syscall_total, syscall_total_ns)
 }
 
 /// Phase 2 of teardown: zombie threads, free page tables, set zombie state.
@@ -1765,7 +1805,8 @@ fn teardown_resources(
 /// Caller must hold PROCESS_TABLE lock and have already switched to kernel CR3.
 /// Returns Tids that need waking (e.g. parent blocked on waitpid, threads blocked
 /// on thread_join). The caller must wake them AFTER releasing the table lock.
-fn teardown_scheduling(table: &mut ProcessTable, process_pid: Pid, _addr_space: PageTables, code: i32) -> Vec<Tid> {
+fn teardown_scheduling(table: &mut ProcessTable, process_pid: Pid, _addr_space: PageTables, code: i32,
+                       process_data_arc: &Arc<Lock<ProcessData>>) -> Vec<Tid> {
     let main_tid = table.find_main_thread(process_pid)
         .expect("teardown_scheduling: main thread not found");
     let mut to_wake = Vec::new();
@@ -1780,8 +1821,12 @@ fn teardown_scheduling(table: &mut ProcessTable, process_pid: Pid, _addr_space: 
         if !matches!(child.state(), ProcessState::Zombie(_)) {
             child.zombify_thread(-1);
         }
-        // Remove from scheduler (drop ThreadCtx → frees kernel stack)
-        scheduler::remove_thread(*tid);
+        // Remove from scheduler and flush stats (blocked time, runqueue wait, cpu_ns) into process accounting
+        if let Some(ctx) = scheduler::remove_thread(*tid) {
+            let mut pdata = process_data_arc.lock();
+            ctx.accounting.merge_into(&mut pdata.accounting);
+            pdata.accounting.child_threads_cpu_ns += ctx.cpu_ns();
+        }
     }
 
     // Remove the main thread from the scheduler if it's not the current thread.
@@ -1817,9 +1862,62 @@ fn teardown_scheduling(table: &mut ProcessTable, process_pid: Pid, _addr_space: 
 
 /// Exit the entire process (all threads). If called from a thread, kills the
 /// parent process and all siblings.
+/// Build accounting snapshot from ProcessData (after all threads flushed) and stash on parent.
+/// Must be called after teardown_scheduling so child thread stats are included.
+fn stash_accounting_snapshot(
+    process_data_arc: &Arc<Lock<ProcessData>>,
+    pid: Pid,
+    parent_pid: Option<Pid>,
+    syscall_total: u64,
+    syscall_total_ns: u64,
+) {
+    use toyos_abi::syscall::ProcessStats;
+
+    let ppid = match parent_pid {
+        Some(ppid) => ppid,
+        None => return,
+    };
+    let data = process_data_arc.lock();
+    let acct = &data.accounting;
+    let snapshot = ProcessStats {
+        wall_ns: crate::clock::nanos_since_boot().saturating_sub(data.spawn_ns),
+        cpu_ns: scheduler::thread_cpu_ns(current_tid()) + acct.child_threads_cpu_ns,
+        syscall_total,
+        syscall_total_ns,
+        fault_demand_count: acct.fault_demand_count,
+        fault_zero_count: acct.fault_zero_count,
+        fault_ns: acct.fault_ns,
+        io_read_ops: acct.io_read_ops,
+        _pad: 0,
+        io_read_bytes: acct.io_read_bytes,
+        blocked_io_ns: acct.blocked_io_ns,
+        blocked_futex_ns: acct.blocked_futex_ns,
+        blocked_pipe_ns: acct.blocked_pipe_ns,
+        blocked_ipc_ns: acct.blocked_ipc_ns,
+        blocked_other_ns: acct.blocked_other_ns,
+        runqueue_wait_ns: acct.runqueue_wait_ns,
+        peak_memory: data.peak_memory,
+        alloc_count: data.alloc_count,
+    };
+    drop(data);
+
+    let parent_arc = {
+        let guard = PROCESS_TABLE.lock();
+        guard.as_ref().and_then(|t| t.get_process(ppid))
+            .map(|e| Arc::clone(e.process_data()))
+    };
+    if let Some(parent_arc) = parent_arc {
+        let mut pdata = parent_arc.lock();
+        if pdata.child_stats.len() >= 64 {
+            pdata.child_stats.remove(0);
+        }
+        pdata.child_stats.push((pid, snapshot));
+    }
+}
+
 pub fn exit(code: i32) -> ! {
-    // Phase 1: Determine process pid, data Arc, and address space
-    let (process_pid, process_data_arc, thread_data_arc, addr_space) = {
+    // Phase 1: Determine process pid, data Arc, address space, and parent pid
+    let (process_pid, process_data_arc, thread_data_arc, addr_space, parent_pid) = {
         let guard = PROCESS_TABLE.lock();
         let table = guard.as_ref().unwrap();
         let tid = current_tid();
@@ -1833,12 +1931,17 @@ pub fn exit(code: i32) -> ! {
         let tdata = Arc::clone(entry.thread_data());
         let addr_space = scheduler::current_address_space()
             .expect("exit: no address space");
-        (process_pid, pdata, tdata, addr_space)
+        let main_entry = table.get_process(process_pid).unwrap();
+        let parent_pid = match main_entry.kind() {
+            Kind::Process { parent } => *parent,
+            _ => None,
+        };
+        (process_pid, pdata, tdata, addr_space, parent_pid)
     };
 
     // Phase 2: Switch to kernel CR3 and clean up resources
     unsafe { crate::mm::paging::kernel_cr3().activate(); }
-    teardown_resources(&process_data_arc, &thread_data_arc, process_pid);
+    let (syscall_total, syscall_total_ns) = teardown_resources(&process_data_arc, &thread_data_arc, process_pid);
 
     // Phase 3: Scheduling teardown (table lock, then release before waking)
     let to_wake = {
@@ -1851,14 +1954,18 @@ pub fn exit(code: i32) -> ! {
             table.get_mut(tid).unwrap().zombify_thread(code);
         }
 
-        teardown_scheduling(table, process_pid, addr_space, code)
+        teardown_scheduling(table, process_pid, addr_space, code, &process_data_arc)
     };
+
+    // Phase 4: Build snapshot (after child threads flushed in Phase 3) and stash on parent
+    stash_accounting_snapshot(&process_data_arc, process_pid, parent_pid, syscall_total, syscall_total_ns);
+
     // Table lock released — now safe to wake via scheduler
     for tid in to_wake {
         scheduler::wake_tid(tid);
     }
 
-    // Phase 4: Exit the current thread via scheduler (context switch away)
+    // Phase 5: Exit the current thread via scheduler (context switch away)
     scheduler::exit_current(code);
 }
 
@@ -1908,19 +2015,23 @@ pub fn thread_exit(code: i32) -> ! {
 
             scheduler::exit_current(code);
         }
-        Kind::Process { .. } => {
+        Kind::Process { parent, .. } => {
             // Process exit — full teardown
+            let parent_pid = parent;
             let process_pid = current_process();
             let thread_data_arc = current_data();
             let process_data_arc = fd_owner_data();
             let addr_space = addr_space.expect("thread_exit: process has no address space");
-            teardown_resources(&process_data_arc, &thread_data_arc, process_pid);
+            let (syscall_total, syscall_total_ns) = teardown_resources(&process_data_arc, &thread_data_arc, process_pid);
 
             let to_wake = {
                 let mut guard = PROCESS_TABLE.lock();
                 let table = guard.as_mut().unwrap();
-                teardown_scheduling(table, process_pid, addr_space, code)
+                teardown_scheduling(table, process_pid, addr_space, code, &process_data_arc)
             };
+
+            stash_accounting_snapshot(&process_data_arc, process_pid, parent_pid, syscall_total, syscall_total_ns);
+
             for tid in to_wake {
                 scheduler::wake_tid(tid);
             }
@@ -2124,6 +2235,7 @@ pub fn handle_page_fault(fault_addr: u64, _error_code: u64) -> bool {
 
     // Fill the 2MB page from ALL regions that overlap this range.
     // Multiple segments (e.g. .text and .rodata) can share a 2MB range.
+    let mut io_reads: u32 = 0;
     for region in &regions {
         match &region.kind {
             RegionSnapKind::Anonymous => {
@@ -2142,6 +2254,7 @@ pub fn handle_page_fault(fault_addr: u64, _error_code: u64) -> bool {
                         let byte_offset = vma_offset + file_offset;
                         let mut page_buf = [0u8; 4096];
                         backing.read_page(byte_offset, &mut page_buf);
+                        io_reads += 1;
                         let valid = if vma_offset + 4096 <= *file_size { 4096 } else { (*file_size - vma_offset) as usize };
                         unsafe {
                             core::ptr::copy_nonoverlapping(
@@ -2187,8 +2300,19 @@ pub fn handle_page_fault(fault_addr: u64, _error_code: u64) -> bool {
         data.peak_memory = current_mem;
     }
 
+    // Update fault accounting
+    let fault_elapsed = crate::clock::nanos_since_boot() - t0;
+    data.accounting.fault_ns += fault_elapsed;
+    if io_reads > 0 {
+        data.accounting.fault_demand_count += 1;
+        data.accounting.io_read_ops += io_reads;
+        data.accounting.io_read_bytes += io_reads as u64 * 4096;
+    } else {
+        data.accounting.fault_zero_count += 1;
+    }
+
     // Record fault for crash diagnostics
-    let elapsed_us = ((crate::clock::nanos_since_boot() - t0) / 1000).min(u16::MAX as u64) as u16;
+    let elapsed_us = (fault_elapsed / 1000).min(u16::MAX as u64) as u16;
     data.fault_trace.record(PageFaultRecord {
         fault_addr,
         page_elf_offset: region_start.wrapping_sub(elf_base),

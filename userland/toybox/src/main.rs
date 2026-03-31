@@ -12,6 +12,7 @@ mod rm;
 mod screen;
 mod shutdown;
 mod spin;
+mod stats;
 mod tone;
 
 macro_rules! commands {
@@ -25,7 +26,7 @@ macro_rules! commands {
     };
 }
 
-commands!(cat, echo, free, grep, locale, ls, mkdir, net, ps, pwd, rm, screen, shutdown, spin, tone);
+commands!(cat, echo, free, grep, locale, ls, mkdir, net, ps, pwd, rm, screen, shutdown, spin, stats, tone);
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();

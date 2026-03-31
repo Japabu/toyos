@@ -65,6 +65,9 @@ Key crates forked in `userland/` with `[patch.crates-io]`. Rules:
 - `cargo run -- --build-only` builds everything without launching QEMU.
 - `cargo test` runs integration tests (boots QEMU headless, runs test harness inside ToyOS).
 - `cargo test -- --nocapture` same but with serial output visible.
+- `cargo test -- process_stats` runs only tests matching "process_stats" (substring filter).
+- `cargo test -- process_stats --nocapture` filter + serial output.
+- `cargo test -- --list` lists all test names without running them.
 - `system.toml` defines which programs to build and the init sequence.
 
 ## Repository layout
@@ -103,17 +106,30 @@ system.toml       What to build and boot
 - After each task, audit CLAUDE.md and update if the architecture or project state changed.
 - If something is blocking, stop and report it. Don't work around it.
 - **Never truncate command output.** No `| head`, `| tail`, `| grep` to reduce output. If a command produces a lot of output or takes long, run it in the background — background tasks automatically get their output written to a file.
+- **`cargo test` and `cargo run` produce large output** (std rebuild warnings, initrd listing, serial output). Always run them in the background so the Bash tool doesn't silently truncate the output — `... [N characters truncated] ...` in tool output means data was lost. Read the output file afterward.
+- **Always be empirical.** Never assume a command succeeded or failed — read the actual output. Never assume code works — run it. Never guess at root causes — investigate. Guessing is unproductive; verify everything.
 
 ## Ideas
 
 - **io_uring as the only blocking I/O mechanism.** Currently the kernel has two parallel notification paths: `scheduler::block(event)` for direct thread blocking and `io_uring::complete_pending_for_event` for ring watchers. Every wake site does both. If all fd-based blocking went through io_uring, blocking syscalls (read, write, accept) become non-blocking try-once-and-return, wake sites become a single io_uring call, and the scheduler drops fd-related `EventSource` variants (only keeps `Futex` and `IoUring`). Per-source watcher lists and io_uring machinery stay the same. Userspace helpers in `toyos-abi` would wrap the ring setup for simple blocking I/O.
 
+## Diagnostics roadmap
+
+Three layers, built in order. Each layer is useful on its own.
+
+**Layer 1: Process accounting (counters).** Add cumulative counters to ProcessData — wall time, user/kernel CPU time, page fault count (by cause: demand, zero, shared), I/O op count + bytes, time blocked (by reason: I/O, futex, IPC, runqueue). Increment at existing kernel sites (fault handler, NVMe completion, scheduler block/wake, syscall entry/exit). One new syscall to read them. Userland `stats` tool: spawn child, wait, read counters, print summary. Answers "what kind of problem is this?" with near-zero overhead.
+
+**Layer 2: Event tracing (timestamped log).** Per-process ring buffer of `(timestamp_ns, TraceEvent)` entries. Events: syscall entry/exit, fault entry/exit (with address + cause), I/O submit/complete, scheduled (with runqueue wait duration), preempted (with timeslice used), blocked/woken (with reason), lib load, lib relocate. ~24 bytes per event, 4096-entry ring (~96KB). Instrument ~8 kernel sites. One new syscall to read the ring. Userland `trace` tool: spawn child, wait, read events, print timeline with durations. Answers "where exactly is time going, in what order?"
+
+**Layer 3: RIP sampling (statistical profiler).** Only useful once Layer 1/2 confirm something is CPU-bound. Per-process ring buffer of `(timestamp_ns, rip)` samples recorded on timer tick. Needs frame-pointer-based stack unwinding to be useful (flat RIP profiles without call stacks are nearly worthless). Build only when CPU-bound userspace code becomes an actual problem.
+
 ## Known issues
 
 <!-- Track blocking issues and findings here. Remove when resolved. -->
-- Profiling tooling is missing — no way to measure performance inside ToyOS yet.
+- Profiling tooling is incomplete — Layer 1 (process accounting counters + `stats` tool) is implemented. Layer 2 (event tracing) and Layer 3 (RIP sampling) are not yet built. See Diagnostics roadmap.
 - PCID + INVPCID codepaths untested on real hardware (QEMU TCG doesn't support either). Both are CPUID-gated — TCG falls back to CR3 reload. Needs testing on KVM or bare metal.
 - TLB shootdowns still IPI all CPUs for a full flush. Per-page targeted shootdowns not yet implemented.
 - LAPIC timer uses one-shot mode — should use TSC deadline mode (`IA32_TSC_DEADLINE` MSR) for precise absolute-time wakeups. TSC is already calibrated for `nanos_since_boot()`.
 - **io_uring abuses shared_memory.** io_uring doesn't share memory between processes — it shares a page between kernel and one userspace process. It should own its `PageAlloc` directly, map it into the process's page tables, and store it in `IoUringInstance`. Drop frees the pages. No shared_memory involvement. This also removes the only caller of `shared_memory::destroy()`.
 - **`SharedToken` is a bare `u32` — no RAII.** Unlike `PhysPage` (which can't leak because Drop returns it to the PMM), `SharedToken` is `Copy` with no destructor. The caller must remember to call the right cleanup function. It should be a non-Copy RAII handle: Drop removes the region and frees backing pages. Expose `.raw()` for the numeric value to pass to userspace, but keep the owning handle in kernel data structures.
+- **No physical memory fairness.** Any process can allocate unbounded physical memory until the system runs out. There are no per-process limits, no memory pressure signals, and no OOM killer. A single misbehaving process can starve the entire system.

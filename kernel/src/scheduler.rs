@@ -148,6 +148,31 @@ pub struct ThreadCtx {
     pub blocked_on: Option<EventSource>, // what this thread is waiting on (None = pure timeout/wake_tid)
     pub deadline: u64, // 0 = no deadline
     pub blocked_since: u64, // nanos_since_boot when entered blocked pool (0 = not blocked)
+    pub enqueued_at: u64, // nanos_since_boot when inserted into ready queue (0 = not queued)
+    pub accounting: ThreadAccounting,
+}
+
+/// Per-thread accounting counters, flushed to ProcessAccounting on exit.
+#[derive(Default)]
+pub struct ThreadAccounting {
+    pub blocked_io_ns: u64,
+    pub blocked_futex_ns: u64,
+    pub blocked_pipe_ns: u64,
+    pub blocked_ipc_ns: u64,
+    pub blocked_other_ns: u64,
+    pub runqueue_wait_ns: u64,
+}
+
+impl ThreadAccounting {
+    /// Merge this thread's counters into the process-level accounting.
+    pub fn merge_into(&self, proc_acct: &mut process::ProcessAccounting) {
+        proc_acct.blocked_io_ns += self.blocked_io_ns;
+        proc_acct.blocked_futex_ns += self.blocked_futex_ns;
+        proc_acct.blocked_pipe_ns += self.blocked_pipe_ns;
+        proc_acct.blocked_ipc_ns += self.blocked_ipc_ns;
+        proc_acct.blocked_other_ns += self.blocked_other_ns;
+        proc_acct.runqueue_wait_ns += self.runqueue_wait_ns;
+    }
 }
 
 impl ThreadCtx {
@@ -176,6 +201,23 @@ impl ThreadCtx {
         } else {
             self.cpu_ns
         }
+    }
+
+    /// Accumulate blocked time from blocked_since/blocked_on into per-category counters.
+    /// Called when a thread is removed from the blocked pool before re-enqueuing.
+    fn accumulate_blocked_time(&mut self) {
+        if self.blocked_since == 0 { return; }
+        let elapsed = crate::clock::nanos_since_boot() - self.blocked_since;
+        let acct = &mut self.accounting;
+        match &self.blocked_on {
+            Some(EventSource::IoUring(_)) => acct.blocked_io_ns += elapsed,
+            Some(EventSource::Futex(_)) => acct.blocked_futex_ns += elapsed,
+            Some(EventSource::PipeReadable(_) | EventSource::PipeWritable(_)) => acct.blocked_pipe_ns += elapsed,
+            Some(EventSource::Listener(_)) => acct.blocked_ipc_ns += elapsed,
+            _ => acct.blocked_other_ns += elapsed,
+        }
+        self.blocked_since = 0;
+        self.blocked_on = None;
     }
 }
 
@@ -244,8 +286,12 @@ pub struct CpuQueueGuard<'a>(crate::sync::LockGuard<'a, CpuRunQueue>);
 
 impl<'a> CpuQueueGuard<'a> {
     pub fn pick_next(&mut self) -> Option<(u64, ThreadCtx)> {
-        while let Some(((vrt, _), ctx)) = self.0.ready.pop_first() {
+        while let Some(((vrt, _), mut ctx)) = self.0.ready.pop_first() {
             if !is_poisoned(ctx.tid) {
+                if ctx.enqueued_at > 0 {
+                    ctx.accounting.runqueue_wait_ns += crate::clock::nanos_since_boot() - ctx.enqueued_at;
+                    ctx.enqueued_at = 0;
+                }
                 return Some((vrt, ctx));
             }
             // Poisoned thread — drop its SchedContext, it will never run again.
@@ -253,7 +299,8 @@ impl<'a> CpuQueueGuard<'a> {
         None
     }
 
-    pub fn insert(&mut self, vrt: u64, ctx: ThreadCtx) {
+    pub fn insert(&mut self, vrt: u64, mut ctx: ThreadCtx) {
+        ctx.enqueued_at = crate::clock::nanos_since_boot();
         let tid = ctx.tid;
         self.0.ready.insert((vrt, tid), ctx);
     }
@@ -482,7 +529,8 @@ impl Scheduler {
     fn enqueue_batch(&self, batch: WokenBatch) {
         let self_cpu = percpu::cpu_id();
         let mut kick = false;
-        for ctx in batch.threads {
+        for mut ctx in batch.threads {
+            ctx.accumulate_blocked_time();
             let cpu = self.pick_target_cpu();
             let mut q = self.lock_cpu(cpu as usize);
             let vrt = q.effective_vruntime(self, ctx.process);
@@ -620,13 +668,14 @@ pub fn wake_pipe_writers(pipe_id: PipeId) {
 /// Wake a specific thread by Tid (for waitpid/thread_join).
 pub fn wake_tid(tid: Tid) {
     if is_poisoned(tid) { return; }
-    let ctx = {
+    let mut ctx = {
         let mut pool = SCHEDULER.blocked.lock_unwrap();
         match pool.remove_thread(tid) {
             Some(ctx) => ctx,
             None => return,
         }
     };
+    ctx.accumulate_blocked_time();
     let cpu = SCHEDULER.pick_target_cpu();
     let mut q = SCHEDULER.lock_cpu(cpu as usize);
     let vrt = q.effective_vruntime(&SCHEDULER, ctx.process);
@@ -690,6 +739,16 @@ pub fn with_current_ctx<R>(f: impl FnOnce(&ThreadCtx) -> R) -> Option<R> {
     let cpu = percpu::cpu_id() as usize;
     let q = SCHEDULER.lock_cpu(cpu);
     q.current().map(f)
+}
+
+/// Flush the current thread's blocked/runqueue stats into ProcessData.
+/// Called from teardown_resources while the thread is still current.
+pub fn flush_current_stats(acct: &mut process::ProcessAccounting) {
+    let cpu = percpu::cpu_id() as usize;
+    let q = SCHEDULER.lock_cpu(cpu);
+    if let Some(ctx) = q.current() {
+        ctx.accounting.merge_into(acct);
+    }
 }
 
 pub fn thread_sched_state(tid: Tid) -> u8 {

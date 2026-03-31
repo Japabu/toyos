@@ -192,15 +192,16 @@ fn cargo_build(
         cmd.env(k, v);
     }
     if quiet {
-        cmd.stderr(std::process::Stdio::null());
+        // Capture stderr so we can show it only on failure (suppress warnings on success).
+        cmd.stderr(std::process::Stdio::piped());
     }
-    assert!(
-        cmd.status()
-            .unwrap_or_else(|e| panic!("cargo build failed in {}: {e}", crate_dir.display()))
-            .success(),
-        "cargo build failed in {}",
-        crate_dir.display()
-    );
+    let output = cmd.output()
+        .unwrap_or_else(|e| panic!("cargo build failed to launch in {}: {e}", crate_dir.display()));
+    if !output.status.success() {
+        // Always show stderr on failure so compiler errors are visible.
+        std::io::Write::write_all(&mut std::io::stderr(), &output.stderr).ok();
+        panic!("cargo build failed in {}", crate_dir.display());
+    }
 }
 
 // --- Shared initrd assembly ---
