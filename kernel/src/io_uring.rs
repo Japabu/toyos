@@ -429,6 +429,10 @@ fn process_poll_add(ring_id: RingId, sqe: &IoUringSqe) {
     let mut guard = IO_URINGS.lock();
     let map = guard.as_mut().expect("io_uring not initialized");
     if let Some(instance) = map.get_mut(ring_id) {
+        let len = instance.pending_polls.len();
+        if len % 1000 == 0 && len > 0 {
+            log!("io_uring: pending_polls={} fd={} rsrc={:?} wsrc={:?}", len, fd_num, read_source, write_source);
+        }
         instance.pending_polls.push(PendingPoll {
             user_data,
             fd_num,
