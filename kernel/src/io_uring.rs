@@ -146,6 +146,10 @@ struct PendingPoll {
 // IoUringInstance
 // ---------------------------------------------------------------------------
 
+/// Hard cap on pending polls per ring. With dedup this should never be reached
+/// (bounded by number of open fds), but guards against future bugs.
+const MAX_PENDING_POLLS: usize = 1024;
+
 struct IoUringInstance {
     shm_phys: DirectMap,
     shm_token: SharedToken,
@@ -429,18 +433,28 @@ fn process_poll_add(ring_id: RingId, sqe: &IoUringSqe) {
     let mut guard = IO_URINGS.lock();
     let map = guard.as_mut().expect("io_uring not initialized");
     if let Some(instance) = map.get_mut(ring_id) {
-        let len = instance.pending_polls.len();
-        if len % 1000 == 0 && len > 0 {
-            log!("io_uring: pending_polls={} fd={} rsrc={:?} wsrc={:?}", len, fd_num, read_source, write_source);
-        }
-        instance.pending_polls.push(PendingPoll {
+        let new_pp = PendingPoll {
             user_data,
             fd_num,
             flags,
             read_source,
             write_source,
             _watcher: watcher,
-        });
+        };
+
+        // Deduplicate: if a PendingPoll already exists for this fd, replace it.
+        // The old PendingPoll is dropped, which drops its WatcherGuard, cleaning
+        // up stale watcher registrations before the new ones take effect.
+        if let Some(existing) = instance.pending_polls.iter_mut()
+            .find(|pp| pp.fd_num == fd_num)
+        {
+            *existing = new_pp;
+        } else if instance.pending_polls.len() < MAX_PENDING_POLLS {
+            instance.pending_polls.push(new_pp);
+        } else {
+            instance.post_cqe(user_data, -(SyscallError::ResourceExhausted as i32), 0);
+            return;
+        }
 
         // Recheck: close TOCTOU window between readiness check and PendingPoll
         // insertion. A concurrent wake (complete_pending_for_event) either already
@@ -449,13 +463,14 @@ fn process_poll_add(ring_id: RingId, sqe: &IoUringSqe) {
         let became_ready = read_source.as_ref().map_or(false, source_ready)
             || write_source.as_ref().map_or(false, source_ready);
         if became_ready {
-            let pp = instance.pending_polls.pop().unwrap();
-            let mut result_flags = 0u32;
-            if pp.flags.readable() { result_flags |= PollFlags::IN.raw(); }
-            if pp.flags.writable() { result_flags |= PollFlags::OUT.raw(); }
-            instance.post_cqe(pp.user_data, result_flags as i32, 0);
-            // Wake any other thread blocked in enter() on this ring.
-            scheduler::push_event(EventSource::IoUring(ring_id));
+            if let Some(pos) = instance.pending_polls.iter().position(|pp| pp.fd_num == fd_num) {
+                let pp = instance.pending_polls.swap_remove(pos);
+                let mut result_flags = 0u32;
+                if pp.flags.readable() { result_flags |= PollFlags::IN.raw(); }
+                if pp.flags.writable() { result_flags |= PollFlags::OUT.raw(); }
+                instance.post_cqe(pp.user_data, result_flags as i32, 0);
+                scheduler::push_event(EventSource::IoUring(ring_id));
+            }
         }
     }
 }
