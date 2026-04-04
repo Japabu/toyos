@@ -27,14 +27,15 @@ impl RawKeyEvent {
     }
 }
 
-/// A mouse event as delivered by the kernel through the mouse fd.
+/// A mouse/tablet event as delivered by the kernel through the mouse fd.
+/// Carries absolute coordinates (0–32767) from the USB tablet.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct MouseEvent {
     pub buttons: u8,
-    pub dx: i8,
-    pub dy: i8,
     pub scroll: i8,
+    pub abs_x: u16,
+    pub abs_y: u16,
 }
 
 impl MouseEvent {

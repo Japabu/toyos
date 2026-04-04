@@ -93,7 +93,7 @@ fn output_ctx_offset(slot_id: u8) -> usize {
     }
 }
 
-/// Parse the configuration descriptor for a HID boot-protocol interface.
+/// Parse the configuration descriptor for a HID interface.
 fn parse_hid_config(data_buf: *const u8) -> Option<HidInterfaceInfo> {
     unsafe {
         let buf = data_buf;
@@ -116,11 +116,19 @@ fn parse_hid_config(data_buf: *const u8) -> Option<HidInterfaceInfo> {
             match desc_type {
                 4 if offset + size_of::<UsbInterfaceDescriptor>() <= total_len => {
                     let intf = &*(buf.add(offset) as *const UsbInterfaceDescriptor);
-                    if intf.b_interface_class == 3 && intf.b_interface_sub_class == 1 {
-                        found_protocol = match intf.b_interface_protocol {
-                            1 => Some(HidType::Keyboard),
-                            2 => Some(HidType::Mouse),
-                            _ => None,
+                    if intf.b_interface_class == 3 {
+                        found_protocol = if intf.b_interface_sub_class == 1 {
+                            // Boot protocol interface
+                            match intf.b_interface_protocol {
+                                1 => Some(HidType::Keyboard),
+                                2 => Some(HidType::Mouse),
+                                _ => None,
+                            }
+                        } else if intf.b_interface_sub_class == 0 {
+                            // Non-boot HID device (e.g. USB tablet)
+                            Some(HidType::Tablet)
+                        } else {
+                            None
                         };
                         if found_protocol.is_some() {
                             iface_num = intf.b_interface_number;
@@ -270,6 +278,7 @@ pub fn init_device(ctrl: &mut XhciController, op_base: &Mmio, port_idx: u8) {
     let kind = match info.protocol {
         HidType::Keyboard => "keyboard",
         HidType::Mouse => "mouse",
+        HidType::Tablet => "tablet",
     };
     let ep_num = info.ep_addr & 0x0F;
     let int_ep_dci = ep_num * 2 + 1;
@@ -284,16 +293,18 @@ pub fn init_device(ctrl: &mut XhciController, op_base: &Mmio, port_idx: u8) {
     }
     log!("xHCI: configuration set");
 
-    // SET_PROTOCOL (boot protocol)
-    let code = ctrl.control_transfer(0x21, 0x0B, 0, info.iface_num as u16, None, 0);
-    if code != 1 {
-        log!("xHCI: SET_PROTOCOL failed, code={}", code);
+    // SET_PROTOCOL (boot protocol) — only for boot-interface devices
+    if info.protocol != HidType::Tablet {
+        let code = ctrl.control_transfer(0x21, 0x0B, 0, info.iface_num as u16, None, 0);
+        if code != 1 {
+            log!("xHCI: SET_PROTOCOL failed, code={}", code);
+        }
     }
 
     // Choose interrupt ring and report buffer based on device type
     let (int_ring_off, report_buf_offset): (usize, usize) = match info.protocol {
         HidType::Keyboard => (OFF_KB_INT_RING, 512),
-        HidType::Mouse => (OFF_MOUSE_INT_RING, 1024),
+        HidType::Mouse | HidType::Tablet => (OFF_MOUSE_INT_RING, 1024),
     };
     let report_phys = data_buf.phys() + report_buf_offset as u64;
     let report_ptr = data_buf.ptr_at(report_buf_offset);
@@ -353,6 +364,7 @@ pub fn init_device(ctrl: &mut XhciController, op_base: &Mmio, port_idx: u8) {
     let report_size = match info.protocol {
         HidType::Keyboard => 8,
         HidType::Mouse => 4,
+        HidType::Tablet => 6,
     };
     let mut dev = HidDevice {
         slot_id,

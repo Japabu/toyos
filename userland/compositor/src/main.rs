@@ -957,22 +957,24 @@ fn main() {
             // Drain all pending mouse events in one read
             let mut buf = [0u8; 512];
             let n = syscall::read(mouse_fd, &mut buf).unwrap_or(0);
-            let event_count = n / 4;
+            let event_size = 6; // MouseEvent: buttons(1) + scroll(1) + abs_x(2) + abs_y(2)
+            let event_count = n / event_size;
 
-            // Accumulate deltas and track button transitions
-            let mut total_dx: i32 = 0;
-            let mut total_dy: i32 = 0;
+            // Track button transitions and last absolute position
             let mut total_scroll: i32 = 0;
+            let mut last_abs_x: u16 = 0;
+            let mut last_abs_y: u16 = 0;
             let mut buttons = prev_buttons;
             let mut press_happened = false;
             let mut release_happened = false;
 
             for i in 0..event_count {
-                let off = i * 4;
+                let off = i * event_size;
                 let new_buttons = buf[off];
-                total_dx += buf[off + 1] as i8 as i32;
-                total_dy += buf[off + 2] as i8 as i32;
-                total_scroll += buf[off + 3] as i8 as i32;
+                let scroll = buf[off + 1] as i8;
+                last_abs_x = u16::from_le_bytes([buf[off + 2], buf[off + 3]]);
+                last_abs_y = u16::from_le_bytes([buf[off + 4], buf[off + 5]]);
+                total_scroll += scroll as i32;
 
                 let new_left = new_buttons & 1 != 0;
                 let old_left = buttons & 1 != 0;
@@ -984,20 +986,24 @@ fn main() {
             if event_count > 0 {
                 let left = buttons & 1 != 0;
 
-                // Move cursor once for all accumulated deltas
-                cursor_x = (cursor_x + total_dx).clamp(0, screen_w - 1);
-                cursor_y = (cursor_y + total_dy).clamp(0, screen_h - 1);
+                // Convert absolute tablet coordinates (0–32767) to screen coordinates
+                let old_cursor_x = cursor_x;
+                let old_cursor_y = cursor_y;
+                cursor_x = (last_abs_x as i32 * screen_w / 32768).clamp(0, screen_w - 1);
+                cursor_y = (last_abs_y as i32 * screen_h / 32768).clamp(0, screen_h - 1);
                 if hw_cursor {
                     gpu::move_cursor(cursor_x as u32, cursor_y as u32);
                 } else {
                     // Software cursor: mark old and new cursor regions dirty
                     let cw = 20usize;
                     let ch = 20usize;
-                    let old_cx = (cursor_x - total_dx).clamp(0, screen_w - 1) as usize;
-                    let old_cy = (cursor_y - total_dy).clamp(0, screen_h - 1) as usize;
-                    mark_dirty(&mut dirty_rect, DirtyRect { x: old_cx, y: old_cy, w: cw, h: ch });
+                    mark_dirty(&mut dirty_rect, DirtyRect { x: old_cursor_x as usize, y: old_cursor_y as usize, w: cw, h: ch });
                     mark_dirty(&mut dirty_rect, DirtyRect { x: cursor_x as usize, y: cursor_y as usize, w: cw, h: ch });
                 }
+
+                // Cursor deltas for drag/resize operations
+                let cursor_dx = cursor_x - old_cursor_x;
+                let cursor_dy = cursor_y - old_cursor_y;
 
                 // Update cursor shape
                 let want_resize = match interaction {
@@ -1255,19 +1261,19 @@ fn main() {
                             let min_x = BORDER_WIDTH as i32;
                             let min_y = (BORDER_WIDTH + TITLE_BAR_HEIGHT) as i32;
                             win.content_x =
-                                (win.content_x as i32 + total_dx).max(min_x) as usize;
+                                (win.content_x as i32 + cursor_dx).max(min_x) as usize;
                             win.content_y =
-                                (win.content_y as i32 + total_dy).max(min_y) as usize;
+                                (win.content_y as i32 + cursor_dy).max(min_y) as usize;
                             let new_rect = window_screen_rect(&windows[window_idx]);
                             mark_dirty(&mut dirty_rect, old_rect.union(new_rect));
                         }
                         Interaction::Resizing { window_idx } => {
                             let old_rect = window_screen_rect(&windows[window_idx]);
                             let win = &mut windows[window_idx];
-                            win.width = (win.width as i32 + total_dx)
+                            win.width = (win.width as i32 + cursor_dx)
                                 .max(MIN_CONTENT_WIDTH as i32)
                                 as usize;
-                            win.height = (win.height as i32 + total_dy)
+                            win.height = (win.height as i32 + cursor_dy)
                                 .max(MIN_CONTENT_HEIGHT as i32)
                                 as usize;
                             let new_rect = window_screen_rect(&windows[window_idx]);

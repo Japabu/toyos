@@ -8,6 +8,7 @@ use super::{Mmio, Trb, TrbRing, TRB_NORMAL};
 pub enum HidType {
     Keyboard,
     Mouse,
+    Tablet,
 }
 
 pub struct HidDevice {
@@ -37,7 +38,7 @@ impl HidDevice {
                     );
                 }
             }
-            HidType::Mouse => {
+            HidType::Mouse | HidType::Tablet => {
                 mouse::handle_report(&buf[..size]);
                 crate::scheduler::push_event(crate::scheduler::EventSource::Mouse);
                 let watchers = mouse::io_uring_watchers();

@@ -35,7 +35,7 @@ pub fn launch(debug: bool, dump_audio: bool) {
         .arg("-device")
         .arg("usb-kbd,bus=xhci.0")
         .arg("-device")
-        .arg("usb-mouse,bus=xhci.0")
+        .arg("usb-tablet,bus=xhci.0")
         // NVMe SSD
         .arg("-drive")
         .arg("if=none,id=nvme0,format=raw,file=target/nvme.img")
