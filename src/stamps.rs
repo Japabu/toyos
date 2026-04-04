@@ -39,7 +39,7 @@ fn collect_entries(dir: &Path, entries: &mut Vec<String>) {
                 continue;
             }
             collect_entries(&path, entries);
-        } else if path.extension().is_some_and(|e| e == "rs" || e == "toml") {
+        } else if path.extension().is_some_and(|e| e == "rs" || e == "toml" || e == "h") {
             if let Ok(meta) = fs::metadata(&path) {
                 let size = meta.len();
                 let mtime = meta

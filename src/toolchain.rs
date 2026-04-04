@@ -48,12 +48,15 @@ pub fn ensure(root: &Path, force_rebuild: bool) -> ChangeSet {
 
     // Ensure toyos-cc is built as a host tool (used by doom's build.rs)
     let cc_stamp = stamps_dir.join("toyos-cc.stamp");
-    let cc_changed = stamps::dir_changed(&root.join("toyos-cc/src"), &cc_stamp);
+    let cc_src_changed = stamps::dir_changed(&root.join("toyos-cc/src"), &cc_stamp);
+    let cc_inc_stamp = stamps_dir.join("toyos-cc-include.stamp");
+    let cc_inc_changed = stamps::dir_changed(&root.join("toyos-cc/include"), &cc_inc_stamp);
     let toyos_cc = toyos_cc_binary(root);
-    if cc_changed || !toyos_cc.exists() {
+    if cc_src_changed || cc_inc_changed || !toyos_cc.exists() {
         eprintln!("Building toyos-cc...");
         build_toyos_cc(root);
         stamps::write_dir_stamp(&root.join("toyos-cc/src"), &cc_stamp);
+        stamps::write_dir_stamp(&root.join("toyos-cc/include"), &cc_inc_stamp);
     }
 
     let rebuilt = if !toolchain_exists || compiler_changed || force_rebuild {
