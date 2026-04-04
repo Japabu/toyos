@@ -205,10 +205,16 @@ fn qemu_command(boot_image: &Path, nvme_image: &Path, gdb_stub: bool) -> Command
     let ovmf_dir = repo.join("ovmf");
 
     let mut qemu = Command::new("qemu-system-x86_64");
+
+    let kvm = cfg!(target_arch = "x86_64") && Path::new("/dev/kvm").exists();
+    if kvm {
+        qemu.arg("-accel").arg("kvm");
+    }
+
     qemu.arg("-machine")
         .arg("q35")
         .arg("-cpu")
-        .arg("qemu64,+rdrand,+smap,+fsgsbase,+x2apic")
+        .arg(if kvm { "host,+rdrand,+smap,+fsgsbase,+x2apic" } else { "qemu64,+rdrand,+smap,+fsgsbase,+x2apic" })
         .arg("-smp")
         .arg("2")
         .arg("-m")
