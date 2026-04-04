@@ -419,20 +419,30 @@ fn process_poll_add(ring_id: RingId, sqe: &IoUringSqe) {
         return;
     }
 
-    // Not ready — create pending poll with watcher guard
-    let mut watcher = WatcherGuard::new(ring_id);
-    if let Some(src) = read_source {
-        add_watcher_to_source(&src, ring_id);
-        watcher.add_source(src);
-    }
-    if let Some(src) = write_source {
-        add_watcher_to_source(&src, ring_id);
-        watcher.add_source(src);
-    }
-
+    // Not ready — insert pending poll.
+    // Drop any existing PendingPoll for this fd FIRST, so its WatcherGuard
+    // cleanup runs before we register the new watchers. Otherwise:
+    //   1. add_watcher(new) → no-op (old watcher still registered)
+    //   2. drop(old) → removes the watcher
+    //   3. result: zero watchers despite an active PendingPoll
     let mut guard = IO_URINGS.lock();
     let map = guard.as_mut().expect("io_uring not initialized");
     if let Some(instance) = map.get_mut(ring_id) {
+        // Remove existing PendingPoll for this fd (drops old WatcherGuard)
+        if let Some(pos) = instance.pending_polls.iter().position(|pp| pp.fd_num == fd_num) {
+            instance.pending_polls.swap_remove(pos);
+        }
+
+        let mut watcher = WatcherGuard::new(ring_id);
+        if let Some(src) = read_source {
+            add_watcher_to_source(&src, ring_id);
+            watcher.add_source(src);
+        }
+        if let Some(src) = write_source {
+            add_watcher_to_source(&src, ring_id);
+            watcher.add_source(src);
+        }
+
         let new_pp = PendingPoll {
             user_data,
             fd_num,
@@ -442,14 +452,7 @@ fn process_poll_add(ring_id: RingId, sqe: &IoUringSqe) {
             _watcher: watcher,
         };
 
-        // Deduplicate: if a PendingPoll already exists for this fd, replace it.
-        // The old PendingPoll is dropped, which drops its WatcherGuard, cleaning
-        // up stale watcher registrations before the new ones take effect.
-        if let Some(existing) = instance.pending_polls.iter_mut()
-            .find(|pp| pp.fd_num == fd_num)
-        {
-            *existing = new_pp;
-        } else if instance.pending_polls.len() < MAX_PENDING_POLLS {
+        if instance.pending_polls.len() < MAX_PENDING_POLLS {
             instance.pending_polls.push(new_pp);
         } else {
             instance.post_cqe(user_data, -(SyscallError::ResourceExhausted as i32), 0);

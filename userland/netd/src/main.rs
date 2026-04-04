@@ -825,21 +825,29 @@ impl NetDaemon {
             let rx_ring = unsafe { &*conn.rx_ring };
             let tx_ring = unsafe { &*conn.tx_ring };
 
-            // smoltcp rx → pipe write (drain fully)
-            while socket.can_recv() && rx_ring.space() > 0 {
-                let mut buf = [0u8; 4096];
-                match socket.recv_slice(&mut buf) {
-                    Ok(n) if n > 0 => rx_ring.write(&buf[..n]),
-                    _ => break,
-                };
+            // smoltcp rx → pipe write via kernel (ensures reader notification)
+            while socket.can_recv() {
+                if let Some(fd) = conn.rx_write_fd {
+                    let mut buf = [0u8; 4096];
+                    match socket.recv_slice(&mut buf) {
+                        Ok(n) if n > 0 => {
+                            let _ = toyos_abi::syscall::write_nonblock(fd, &buf[..n]);
+                        }
+                        _ => break,
+                    };
+                } else {
+                    break;
+                }
             }
 
-            // pipe read → smoltcp tx (drain fully)
-            while socket.can_send() && tx_ring.available() > 0 {
-                let mut buf = [0u8; 4096];
-                let n = tx_ring.read(&mut buf);
-                if n > 0 {
-                    let _ = socket.send_slice(&buf[..n]);
+            // pipe read → smoltcp tx (drain fully via kernel for proper notification)
+            while socket.can_send() {
+                if let Some(fd) = conn.tx_read_fd {
+                    let mut buf = [0u8; 4096];
+                    match toyos_abi::syscall::read_nonblock(fd, &mut buf) {
+                        Ok(n) if n > 0 => { let _ = socket.send_slice(&buf[..n]); }
+                        _ => break,
+                    }
                 } else {
                     break;
                 }
@@ -1063,6 +1071,7 @@ fn main() {
     let ring_cq_size = ring_params.cq_ring_size;
     const TOKEN_LISTENER: u64 = 0;
     const TOKEN_NIC: u64 = 1;
+    const TOKEN_TX_PIPE_BASE: u64 = 0x1000;
 
     loop {
         // 1. Drive smoltcp until quiescent
@@ -1087,8 +1096,13 @@ fn main() {
         let has_pending_async = !daemon.pending_udp_recvs.is_empty()
             || !daemon.pending_dns.is_empty()
             || !daemon.pending_piped_connects.is_empty();
+        let has_piped = !daemon.piped_connections.is_empty();
 
-        let timeout_nanos = if has_pending_async {
+        // Use 1ms polling when piped connections are active. This is the network
+        // equivalent of NAPI polling — during active I/O, poll frequently to
+        // bridge data between smoltcp and kernel pipes without relying solely on
+        // interrupt-driven wakeups.
+        let timeout_nanos = if has_pending_async || has_piped {
             Some(Duration::from_millis(1).as_nanos() as u64)
         } else {
             match delay {
@@ -1098,39 +1112,43 @@ fn main() {
             }
         };
 
-        // 7. Poll: listener fd + NIC fd via io_uring
+        // 7. Poll: listener fd + NIC fd + tx pipe fds via io_uring
+        let mut to_submit = 0u32;
         {
             let sq_hdr = unsafe { &*(ring_base.add(SQ_RING_OFF as usize) as *const IoUringRingHeader) };
-            // Submit POLL_ADD for listener
-            let tail = sq_hdr.tail.load(std::sync::atomic::Ordering::Acquire);
-            let sqe = unsafe {
-                &mut *(ring_base.add(SQES_OFF as usize + (tail & (ring_sq_size - 1)) as usize * core::mem::size_of::<IoUringSqe>()) as *mut IoUringSqe)
-            };
-            *sqe = IoUringSqe::default();
-            sqe.op = IORING_OP_POLL_ADD;
-            sqe.fd = listener.0;
-            sqe.op_flags = IORING_POLL_IN;
-            sqe.user_data = TOKEN_LISTENER;
-            sq_hdr.tail.store(tail.wrapping_add(1), std::sync::atomic::Ordering::Release);
 
-            // Submit POLL_ADD for NIC
-            let tail = sq_hdr.tail.load(std::sync::atomic::Ordering::Acquire);
-            let sqe = unsafe {
-                &mut *(ring_base.add(SQES_OFF as usize + (tail & (ring_sq_size - 1)) as usize * core::mem::size_of::<IoUringSqe>()) as *mut IoUringSqe)
+            let submit_sqe = |fd: i32, flags: u32, user_data: u64| {
+                let tail = sq_hdr.tail.load(std::sync::atomic::Ordering::Acquire);
+                let sqe = unsafe {
+                    &mut *(ring_base.add(SQES_OFF as usize + (tail & (ring_sq_size - 1)) as usize * core::mem::size_of::<IoUringSqe>()) as *mut IoUringSqe)
+                };
+                *sqe = IoUringSqe::default();
+                sqe.op = IORING_OP_POLL_ADD;
+                sqe.fd = fd;
+                sqe.op_flags = flags;
+                sqe.user_data = user_data;
+                sq_hdr.tail.store(tail.wrapping_add(1), std::sync::atomic::Ordering::Release);
             };
-            *sqe = IoUringSqe::default();
-            sqe.op = IORING_OP_POLL_ADD;
-            sqe.fd = device.nic_fd.0;
-            sqe.op_flags = IORING_POLL_IN;
-            sqe.user_data = TOKEN_NIC;
-            sq_hdr.tail.store(tail.wrapping_add(1), std::sync::atomic::Ordering::Release);
+
+            submit_sqe(listener.0, IORING_POLL_IN, TOKEN_LISTENER);
+            to_submit += 1;
+            submit_sqe(device.nic_fd.0, IORING_POLL_IN, TOKEN_NIC);
+            to_submit += 1;
+
+            // Submit POLL_ADD for each active tx pipe (client → netd direction)
+            for (i, conn) in daemon.piped_connections.iter().enumerate() {
+                if let Some(fd) = conn.tx_read_fd {
+                    submit_sqe(fd.0, IORING_POLL_IN, TOKEN_TX_PIPE_BASE + i as u64);
+                    to_submit += 1;
+                }
+            }
         }
 
         let timeout = match timeout_nanos {
             None => u64::MAX,
             Some(n) => n,
         };
-        let _ = toyos_abi::syscall::io_uring_enter(ring_fd, 2, 1, timeout);
+        let _ = toyos_abi::syscall::io_uring_enter(ring_fd, to_submit, 1, timeout);
 
         // Drain CQEs
         let mut listener_ready = false;
