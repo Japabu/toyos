@@ -23,12 +23,17 @@ const CMD_SET_SCANOUT: u32 = 0x0103;
 const CMD_RESOURCE_FLUSH: u32 = 0x0104;
 const CMD_TRANSFER_TO_HOST_2D: u32 = 0x0105;
 const CMD_RESOURCE_ATTACH_BACKING: u32 = 0x0106;
+const CMD_GET_EDID: u32 = 0x010a;
 const CMD_UPDATE_CURSOR: u32 = 0x0300;
 const CMD_MOVE_CURSOR: u32 = 0x0301;
 
 // GPU response types
 const RESP_OK_NODATA: u32 = 0x1100;
 const RESP_OK_DISPLAY_INFO: u32 = 0x1101;
+const RESP_OK_EDID: u32 = 0x1104;
+
+// Feature bits
+const VIRTIO_GPU_F_EDID: u64 = 1 << 1;
 
 // Pixel formats
 const FORMAT_B8G8R8A8_UNORM: u32 = 1;
@@ -178,6 +183,23 @@ struct UpdateCursor {
     padding: u32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct GetEdid {
+    hdr: CtrlHeader,
+    scanout: u32,
+    padding: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RespEdid {
+    hdr: CtrlHeader,
+    size: u32,
+    padding: u32,
+    edid: [u8; 1024],
+}
+
 // ---- Framebuffer allocation tracking ----
 
 struct FbAlloc {
@@ -270,6 +292,36 @@ impl GpuController {
         ));
 
         unsafe { read_volatile(self.resp_ptr as *const RespDisplayInfo) }
+    }
+
+    fn get_edid(&mut self, scanout: u32) -> RespEdid {
+        let cmd = GetEdid {
+            hdr: CtrlHeader::new(CMD_GET_EDID),
+            scanout,
+            padding: 0,
+        };
+        let bytes = unsafe {
+            core::slice::from_raw_parts(&cmd as *const _ as *const u8, core::mem::size_of::<GetEdid>())
+        };
+        let resp_size = core::mem::size_of::<RespEdid>() as u32;
+
+        unsafe {
+            copy_nonoverlapping(bytes.as_ptr(), self.req_ptr, bytes.len());
+        }
+
+        let slot = self.control_slot.take().expect("GPU: no control slot");
+        self.control_slot = Some(self.controlq.submit_and_wait(
+            slot,
+            &[
+                (self.req_phys, bytes.len() as u32, BufDir::Readable),
+                (self.resp_phys, resp_size, BufDir::Writable),
+            ],
+            self.device.notify_mmio(),
+            self.device.notify_off_multiplier(),
+            0,
+        ));
+
+        unsafe { read_volatile(self.resp_ptr as *const RespEdid) }
     }
 
     fn create_resource(&mut self, id: u32, format: u32, width: u32, height: u32) {
@@ -524,7 +576,7 @@ pub fn init(ecam: &crate::mm::Mmio) -> Option<(Box<dyn Gpu>, GpuInfo)> {
     *DMA.lock() = Some(DmaPool::alloc(DMA_SIZE));
     let dma = dma();
 
-    let device = VirtioDevice::init(&pci_dev, VIRTIO_F_VERSION_1);
+    let device = VirtioDevice::init(&pci_dev, VIRTIO_F_VERSION_1 | VIRTIO_GPU_F_EDID);
 
     let mut controlq = Virtqueue::new(dma.subslice(OFF_CONTROLQ, 0x1000));
     let mut cursorq = Virtqueue::new(dma.subslice(OFF_CURSORQ, 0x1000));
@@ -578,23 +630,21 @@ pub fn init(ecam: &crate::mm::Mmio) -> Option<(Box<dyn Gpu>, GpuInfo)> {
         _cursor_pages: alloc::vec::Vec::new(),
     };
 
-    // Query display info
-    let display_info = gpu.get_display_info();
-    assert!(
-        display_info.hdr.cmd_type == RESP_OK_DISPLAY_INFO,
-        "VirtIO GPU: GET_DISPLAY_INFO failed: {:#x}", display_info.hdr.cmd_type
-    );
-
-    let scanout = &display_info.pmodes[0];
-    let width = if scanout.enabled != 0 && scanout.r.width > 0 {
-        scanout.r.width
+    // EDID reports firmware-set resolution (often 640x480 from OVMF), not the
+    // host-configured preferred resolution. Query EDID for the preferred mode
+    // from the first Detailed Timing Descriptor.
+    let edid = gpu.get_edid(0);
+    let (width, height) = if edid.hdr.cmd_type == RESP_OK_EDID {
+        let dtd = &edid.edid[54..72];
+        let w = dtd[2] as u32 | ((dtd[4] as u32 >> 4) << 8);
+        let h = dtd[5] as u32 | ((dtd[7] as u32 >> 4) << 8);
+        if w >= 1280 && h >= 720 {
+            (w, h)
+        } else {
+            (1280, 720) // EDID reports stale firmware resolution, use default
+        }
     } else {
-        1024 // fallback
-    };
-    let height = if scanout.enabled != 0 && scanout.r.height > 0 {
-        scanout.r.height
-    } else {
-        768
+        (1280, 720)
     };
     log!("VirtIO GPU: display {}x{}", width, height);
 
