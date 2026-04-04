@@ -119,6 +119,10 @@ pub fn ensure(root: &Path, force_rebuild: bool) -> ChangeSet {
 fn full_bootstrap(root: &Path, rust_dir: &Path) {
     let toyos_ld = toyos_ld_binary(root);
 
+    // Ensure library/backtrace is checked out — std depends on it.
+    // Other rust submodules (llvm, docs, cargo) are handled by bootstrap on demand.
+    crate::ensure_submodule(rust_dir, "library/backtrace");
+
     // Write bootstrap.toml — ToyOS as target only, not host (fast rebuilds)
     let host = host_triple();
     write_config(rust_dir, &host, &toyos_ld, false);

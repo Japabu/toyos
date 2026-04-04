@@ -57,15 +57,7 @@ fn main() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     env::set_current_dir(&root).expect("Failed to cd to project root");
 
-    // Auto-init git submodules
-    if !root.join("rust/compiler").exists() {
-        eprintln!("Initializing git submodules...");
-        let status = Command::new("git")
-            .args(["submodule", "update", "--init"])
-            .status()
-            .expect("Failed to run git");
-        assert!(status.success(), "git submodule update failed");
-    }
+    toyos::ensure_submodules(&root);
 
     // Ensure toolchain is up to date
     toyos::toolchain::ensure(&root, rebuild_toolchain);

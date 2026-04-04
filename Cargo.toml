@@ -31,6 +31,4 @@ name = "toyos"
 harness = false
 
 [patch.crates-io]
-target-lexicon = { path = "userland/target-lexicon" }
-stacker = { path = "userland/stacker" }
-psm = { path = "userland/stacker/psm" }
+target-lexicon = { git = "https://github.com/Japabu/target-lexicon.git" }
