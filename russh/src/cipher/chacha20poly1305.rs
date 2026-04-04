@@ -282,7 +282,9 @@ mod pure_rust {
                 cipher.seek(64u32);
                 #[allow(clippy::indexing_slicing)]
                 cipher.apply_keystream(&mut ciphertext[super::super::PACKET_LENGTH_LEN..]);
-                Ok(ciphertext)
+                // Return only the decrypted payload, skipping the 4-byte encrypted length
+                // prefix (matches ring/aws-lc-rs backend behavior).
+                Ok(&ciphertext[super::super::PACKET_LENGTH_LEN..])
             } else {
                 Err(Error::DecryptionError)
             }
