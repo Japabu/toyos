@@ -240,6 +240,7 @@ target = ["{host}", "x86_64-unknown-toyos", "x86_64-unknown-none", "x86_64-unkno
 
 [rust]
 incremental = true
+lld = false
 
 [target.x86_64-unknown-toyos]
 linker = "{linker}"{codegen_backends}
