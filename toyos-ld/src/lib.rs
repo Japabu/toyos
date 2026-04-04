@@ -13,7 +13,6 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::fs;
 
-
 pub use collect::RelocType;
 use collect::{Arch, collect, synthesize_alloc_shims, gc_sections, merge_string_sections, is_archive, is_shared_lib, extract_archive, find_lib, has_toyos_libc_note, scan_symbols, SectionIdx, SectionKind, SymbolDef, SymbolRef};
 use reloc::{ElfRelocParams, apply_relocs, apply_relocs_pe, MachORelocParams, apply_relocs_macho};
@@ -97,9 +96,10 @@ impl Collected {
                 *entry = true;
             }
         }
+        let local_names: std::collections::HashSet<&str> = self.state.locals.keys().map(|(_, n)| n.as_str()).collect();
         for (sym, has_call) in referenced {
             if !self.state.globals.contains_key(&sym)
-                && !self.state.locals.keys().any(|(_, n)| n == &sym)
+                && !local_names.contains(sym.as_str())
             {
                 self.state.dynamic_imports.insert(sym.clone());
                 self.state.globals.insert(sym, SymbolDef::Dynamic { is_func: has_call, is_tls: false });

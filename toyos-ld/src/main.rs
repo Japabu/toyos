@@ -1,9 +1,13 @@
 use std::fmt::Write as _;
 use std::path::PathBuf;
+use std::time::Instant;
 use std::{env, fs, process};
 
 fn main() {
+    let total_start = Instant::now();
     let args = parse_args();
+
+    let t = Instant::now();
     let objects = match toyos_ld::resolve_libs_with_entry(&args.inputs, &args.lib_paths, &args.libs, Some(&args.entry)) {
         Ok(o) => o,
         Err(e) => {
@@ -11,12 +15,14 @@ fn main() {
             process::exit(1);
         }
     };
+    let resolve_time = t.elapsed();
 
     if objects.is_empty() {
         eprintln!("toyos-ld: no input files");
         process::exit(1);
     }
 
+    let t = Instant::now();
     let result = match args.format {
         OutputFormat::Shared => toyos_ld::link_shared_full(&objects, args.build_id),
         OutputFormat::Pe { subsystem } => toyos_ld::link_pe_with(&objects, &args.entry, subsystem.to_u16(), args.gc_sections),
@@ -24,6 +30,7 @@ fn main() {
         OutputFormat::Static { image_base } => toyos_ld::link_static_full(&objects, &args.entry, image_base, args.gc_sections, args.build_id),
         OutputFormat::Pie => toyos_ld::link_full(&objects, &args.entry, args.gc_sections, args.build_id),
     };
+    let link_time = t.elapsed();
 
     match result {
         Ok(output_bytes) => {
@@ -53,6 +60,14 @@ fn main() {
             process::exit(1);
         }
     }
+
+    let output_name = args.output.file_name().unwrap_or_default().to_string_lossy();
+    eprintln!("[toyos-ld] {output_name}: {:.3}s (resolve {:.3}s, link {:.3}s, {} objects, {:.1} MB)",
+        total_start.elapsed().as_secs_f64(),
+        resolve_time.as_secs_f64(),
+        link_time.as_secs_f64(),
+        objects.len(),
+        objects.iter().map(|(_, d)| d.len()).sum::<usize>() as f64 / 1_048_576.0);
 }
 
 fn generate_map(output: &[u8], output_path: &PathBuf, inputs: &[(String, Vec<u8>)]) -> String {
