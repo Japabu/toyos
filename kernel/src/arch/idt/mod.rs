@@ -256,7 +256,6 @@ fn disable_pic() {
     outb(PIC2_DATA, 0xFF);
 }
 
-pub use timer::cpu_ticks;
 pub use xhci::xhci_irq_pending;
 
 pub fn init() {

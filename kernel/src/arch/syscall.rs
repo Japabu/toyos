@@ -995,7 +995,8 @@ fn sys_sysinfo(buf: &mut [u8]) -> u64 {
     let (total_mem, used_mem) = crate::mm::pmm::stats();
     let cpu_count = super::smp::cpu_count();
     let uptime = crate::clock::nanos_since_boot();
-    let (busy_ticks, total_ticks) = super::idt::cpu_ticks();
+    let total_cpu_ns = crate::scheduler::total_cpu_ns();
+    let total_available_ns = uptime * cpu_count as u64;
 
     let guard = process::PROCESS_TABLE.lock();
     let table = guard.as_ref().unwrap();
@@ -1007,8 +1008,8 @@ fn sys_sysinfo(buf: &mut [u8]) -> u64 {
     buf[16..20].copy_from_slice(&cpu_count.to_le_bytes());
     buf[20..24].copy_from_slice(&process_count.to_le_bytes());
     buf[24..32].copy_from_slice(&uptime.to_le_bytes());
-    buf[32..40].copy_from_slice(&busy_ticks.to_le_bytes());
-    buf[40..48].copy_from_slice(&total_ticks.to_le_bytes());
+    buf[32..40].copy_from_slice(&total_cpu_ns.to_le_bytes());
+    buf[40..48].copy_from_slice(&total_available_ns.to_le_bytes());
 
     let max_entries = (buf.len() - HEADER_SIZE) / ENTRY_SIZE;
     let mut sorted_tids: Vec<process::Tid> = table.iter().map(|(tid, _)| tid).collect();

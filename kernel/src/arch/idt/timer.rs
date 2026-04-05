@@ -1,12 +1,4 @@
 use core::arch::naked_asm;
-use core::sync::atomic::{AtomicU64, Ordering};
-
-static CPU_BUSY_TICKS: AtomicU64 = AtomicU64::new(0);
-static CPU_TOTAL_TICKS: AtomicU64 = AtomicU64::new(0);
-
-pub fn cpu_ticks() -> (u64, u64) {
-    (CPU_BUSY_TICKS.load(Ordering::Relaxed), CPU_TOTAL_TICKS.load(Ordering::Relaxed))
-}
 
 // Ring 3: save all registers (GPR + SSE/XMM), call Rust handler (preempt), restore, iretq.
 // Ring 0: just EOI and return (no preemption while kernel code runs).
@@ -96,8 +88,6 @@ pub(super) extern "sysv64" fn timer_entry() {
 
 extern "sysv64" fn timer_handler() {
     crate::arch::apic::eoi();
-    CPU_BUSY_TICKS.fetch_add(1, Ordering::Relaxed);
-    CPU_TOTAL_TICKS.fetch_add(1, Ordering::Relaxed);
 
     // Process xHCI events (keyboard/mouse) from preemption context,
     // in case the idle loop isn't running on CPU 0.

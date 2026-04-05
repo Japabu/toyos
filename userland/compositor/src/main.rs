@@ -1563,10 +1563,10 @@ fn main() {
                 let used_mem = u64::from_le_bytes(si[8..16].try_into().unwrap());
                 let busy = u64::from_le_bytes(si[32..40].try_into().unwrap());
                 let total = u64::from_le_bytes(si[40..48].try_into().unwrap());
-                let d_busy = busy.wrapping_sub(prev_busy_ticks);
-                let d_total = total.wrapping_sub(prev_total_ticks);
+                let d_busy = busy.saturating_sub(prev_busy_ticks);
+                let d_total = total.saturating_sub(prev_total_ticks);
                 if d_total > 0 {
-                    cpu_pct = d_busy * 100 / d_total;
+                    cpu_pct = d_busy.saturating_mul(100) / d_total;
                 }
                 prev_busy_ticks = busy;
                 prev_total_ticks = total;

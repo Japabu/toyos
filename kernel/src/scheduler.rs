@@ -14,6 +14,22 @@ use crate::DirectMap;
 
 const MAX_CPUS: usize = 8;
 const MAX_VRUNTIME_LAG_NS: u64 = 50_000_000; // 50ms
+
+// Per-CPU CPU-time counters. Each CPU only writes its own slot (no contention).
+// Cache-line padded to prevent false sharing between cores.
+#[repr(align(64))]
+struct CpuTimeCounter(AtomicU64);
+static CPU_TIME_NS: [CpuTimeCounter; MAX_CPUS] = [const { CpuTimeCounter(AtomicU64::new(0)) }; MAX_CPUS];
+
+/// Returns cumulative CPU-nanoseconds consumed across all CPUs (monotonic).
+pub fn total_cpu_ns() -> u64 {
+    let mut total = 0u64;
+    for i in 0..crate::arch::smp::cpu_count() as usize {
+        total += CPU_TIME_NS[i].0.load(Ordering::Relaxed);
+    }
+    total
+}
+
 const EVENT_QUEUE_SIZE: usize = 256;
 const PREEMPTION_QUANTUM_NS: u64 = 10_000_000; // 10ms
 
@@ -186,8 +202,11 @@ impl ThreadCtx {
 
     pub fn stop_cpu_timer(&mut self, now: u64) {
         if self.scheduled_at > 0 {
-            self.cpu_ns += now - self.scheduled_at;
+            let delta = now - self.scheduled_at;
+            self.cpu_ns += delta;
             self.scheduled_at = 0;
+            let cpu = percpu::cpu_id() as usize;
+            CPU_TIME_NS[cpu].0.fetch_add(delta, Ordering::Relaxed);
         }
     }
 
