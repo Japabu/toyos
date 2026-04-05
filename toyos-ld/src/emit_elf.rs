@@ -533,7 +533,7 @@ fn resolve_entry(state: &LinkState, entry_name: &str, plt: Option<&HashMap<Symbo
                 plt.and_then(|p| p.get(&entry_ref).copied())
                     .ok_or_else(|| LinkError::MissingEntry(entry_name.to_string()))
             }
-            SymbolDef::Defined { section, value } => {
+            SymbolDef::Defined { section, value, .. } => {
                 Ok(state.sections[*section].vaddr.unwrap() + value)
             }
         })
@@ -572,7 +572,7 @@ fn collect_symtab_entries<'a>(
     // Locals (skip __section_sym_* — internal linker bookkeeping, not real symbols)
     for ((_, name), def) in &state.locals {
         if name.starts_with("__section_sym_") { continue; }
-        let SymbolDef::Defined { section, value } = def else { continue; };
+        let SymbolDef::Defined { section, value, size } = def else { continue; };
         let sec = &state.sections[*section];
         let st_value = sec.vaddr.unwrap() + value;
         let out_idx = output_section_index(sec, text_idx, data_idx);
@@ -584,7 +584,7 @@ fn collect_symtab_entries<'a>(
         entries.push(SymEntry {
             name_id: w.add_string(name.as_bytes()),
             st_value,
-            st_size: 0,
+            st_size: *size,
             st_info: (elf::STB_LOCAL << 4) | st_type,
             section_idx: out_idx,
             is_local: true,
@@ -593,7 +593,7 @@ fn collect_symtab_entries<'a>(
 
     // Globals
     for (name, def) in &state.globals {
-        let SymbolDef::Defined { section, value } = def else { continue; };
+        let SymbolDef::Defined { section, value, size } = def else { continue; };
         let sec = &state.sections[*section];
         let st_value = sec.vaddr.unwrap() + value;
         let out_idx = output_section_index(sec, text_idx, data_idx);
@@ -605,7 +605,7 @@ fn collect_symtab_entries<'a>(
         entries.push(SymEntry {
             name_id: w.add_string(name.as_bytes()),
             st_value,
-            st_size: 0,
+            st_size: *size,
             st_info: (elf::STB_GLOBAL << 4) | st_type,
             section_idx: out_idx,
             is_local: false,
@@ -790,7 +790,7 @@ pub(crate) fn emit_elf(
         let mut symbols: Vec<_> = state.globals.iter().collect();
         symbols.sort_by_key(|(name, _)| *name);
         for (name, def) in &symbols {
-            let SymbolDef::Defined { section, value } = def else { continue; };
+            let SymbolDef::Defined { section, value, .. } = def else { continue; };
             let str_id = w.add_dynamic_string(name.as_bytes());
             let is_tls = state.sections[*section].kind.is_tls();
             let st_value = if is_tls {

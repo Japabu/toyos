@@ -697,7 +697,7 @@ pub(crate) fn emit_macho_bytes(
         .globals
         .get(entry_name)
         .map(|def| match def {
-            SymbolDef::Defined { section, value } => {
+            SymbolDef::Defined { section, value, .. } => {
                 let sec = &state.sections[*section];
                 sec.vaddr.unwrap_or_else(|| panic!(
                     "entry point in section {:?} ({:?}) has no vaddr",
@@ -1163,7 +1163,7 @@ fn build_symbol_table(
     // Defined external symbols
     let mut extdef_syms: Vec<(String, u64, u8)> = Vec::new();
     for (name, def) in &state.globals {
-        let SymbolDef::Defined { section, value } = def else { continue; };
+        let SymbolDef::Defined { section, value, .. } = def else { continue; };
         let sec = &state.sections[*section];
         let value = sec.vaddr.unwrap_or_else(|| panic!(
             "symbol {name:?} in section {:?} ({:?}) has no vaddr",

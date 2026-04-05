@@ -188,7 +188,7 @@ pub(crate) struct InputReloc {
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum SymbolDef {
-    Defined { section: SectionIdx, value: u64 },
+    Defined { section: SectionIdx, value: u64, size: u64 },
     /// Dynamic (shared library) import. `is_func` distinguishes function vs data symbols
     /// so the linker can create stubs only for functions (not data like __stdoutp).
     /// `is_tls` marks thread-local symbols that need TPOFF64 relocs, not GLOB_DAT.
@@ -234,9 +234,15 @@ struct ParsedObject {
     tls_local_indices: Vec<LocalSectionIdx>,
     metadata: Vec<(String, Vec<u8>)>,
     globals: Vec<(String, SymbolDef, LocalSectionIdx)>,
-    /// (sym_name, local_section_idx, value)
-    locals: Vec<(String, LocalSectionIdx, u64)>,
+    locals: Vec<LocalSymbol>,
     relocs: Vec<LocalReloc>,
+}
+
+struct LocalSymbol {
+    name: String,
+    section: LocalSectionIdx,
+    value: u64,
+    size: u64,
 }
 
 /// Relocation with local section indices (not yet remapped to global).
@@ -465,6 +471,7 @@ fn parse_object(obj: &object::File, _name: &str) -> Result<ParsedObject, LinkErr
         };
         let sec_addr = obj.section_by_index(sec_idx).map(|s| s.address()).unwrap_or(0);
         let value = symbol.address() - sec_addr;
+        let size = symbol.size();
 
         if symbol.is_global() {
             // COFF weak externals
@@ -472,15 +479,15 @@ fn parse_object(obj: &object::File, _name: &str) -> Result<ParsedObject, LinkErr
                 let alias = rest.strip_suffix(".default").unwrap_or(rest).to_string();
                 globals.push((alias, SymbolDef::Defined {
                     section: SectionIdx(0), // placeholder, remapped during merge
-                    value,
+                    value, size,
                 }, local_sec));
             }
             globals.push((sym_name, SymbolDef::Defined {
                 section: SectionIdx(0), // placeholder
-                value,
+                value, size,
             }, local_sec));
         } else {
-            locals.push((sym_name, local_sec, value));
+            locals.push(LocalSymbol { name: sym_name, section: local_sec, value, size });
         }
     }
 
@@ -689,7 +696,7 @@ fn merge_parsed_object(state: &mut LinkState, parsed: ParsedObject, obj_idx: Obj
     }
 
     // Merge locals
-    for (name, local_sec, value) in parsed.locals {
+    for LocalSymbol { name, section: local_sec, value, size } in parsed.locals {
         let global_sec = remap(local_sec);
         if let Some(SymbolDef::Defined { section: existing_sec, .. }) = state.locals.get(&(obj_idx, name.clone())) {
             assert_eq!(
@@ -701,7 +708,7 @@ fn merge_parsed_object(state: &mut LinkState, parsed: ParsedObject, obj_idx: Obj
         }
         state.locals.insert((obj_idx, name), SymbolDef::Defined {
             section: global_sec,
-            value,
+            value, size,
         });
     }
 
@@ -738,7 +745,7 @@ fn remap_sym_ref_and_register(
             let syn = format!("__section_sym_{}_{}", obj_idx.0, global_idx.0);
             locals.entry((obj_idx, syn.clone())).or_insert(SymbolDef::Defined {
                 section: global_idx,
-                value: 0,
+                value: 0, size: 0,
             });
             SymbolRef::Local(obj_idx, syn)
         }
@@ -1175,7 +1182,7 @@ pub(crate) fn synthesize_alloc_shims(state: &mut LinkState) {
         });
         state.globals.insert(
             shim_name.to_string(),
-            SymbolDef::Defined { section: sec_idx, value: 0 },
+            SymbolDef::Defined { section: sec_idx, value: 0, size: 0 },
         );
         state.relocs.push(InputReloc {
             section: sec_idx,
@@ -1207,7 +1214,7 @@ pub(crate) fn synthesize_alloc_shims(state: &mut LinkState) {
         });
         state.globals.insert(
             SHIM_NO_ALLOC_UNSTABLE.to_string(),
-            SymbolDef::Defined { section: sec_idx, value: 0 },
+            SymbolDef::Defined { section: sec_idx, value: 0, size: 0 },
         );
     }
 }
@@ -1286,7 +1293,7 @@ pub(crate) fn merge_string_sections(state: &mut LinkState) {
     // Only these are needed for relocation addend updates below.
     let mut old_global_defs: HashMap<String, (SectionIdx, u64)> = HashMap::new();
     for (name, def) in &state.globals {
-        if let SymbolDef::Defined { section, value } = def {
+        if let SymbolDef::Defined { section, value, .. } = def {
             if merge_set.contains(section) {
                 old_global_defs.insert(name.clone(), (*section, *value));
             }
@@ -1294,7 +1301,7 @@ pub(crate) fn merge_string_sections(state: &mut LinkState) {
     }
     let mut old_local_defs: HashMap<(ObjIdx, String), (SectionIdx, u64)> = HashMap::new();
     for ((oi, name), def) in &state.locals {
-        if let SymbolDef::Defined { section, value } = def {
+        if let SymbolDef::Defined { section, value, .. } = def {
             if merge_set.contains(section) {
                 old_local_defs.insert((*oi, name.clone()), (*section, *value));
             }
@@ -1303,7 +1310,7 @@ pub(crate) fn merge_string_sections(state: &mut LinkState) {
 
     // Update symbol definitions pointing into merged sections
     for def in state.globals.values_mut() {
-        if let SymbolDef::Defined { section, value } = def {
+        if let SymbolDef::Defined { section, value, .. } = def {
             if let Some(&new_off) = offset_remap.get(&(*section, *value)) {
                 let old_name = &state.sections[*section].name;
                 if let Some(group) = groups.get(old_name) {
@@ -1314,7 +1321,7 @@ pub(crate) fn merge_string_sections(state: &mut LinkState) {
         }
     }
     for def in state.locals.values_mut() {
-        if let SymbolDef::Defined { section, value } = def {
+        if let SymbolDef::Defined { section, value, .. } = def {
             if let Some(&new_off) = offset_remap.get(&(*section, *value)) {
                 let old_name = &state.sections[*section].name;
                 if let Some(group) = groups.get(old_name) {

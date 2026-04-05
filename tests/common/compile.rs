@@ -71,6 +71,7 @@ pub fn compile_c(name: &str) -> (Vec<u8>, Vec<Vec<u8>>) {
         defines: Vec::new(),
         target: Some("x86_64-unknown-toyos".to_string()),
         opt_level: 0,
+        force_includes: Vec::new(),
     };
 
     let obj = toyos_cc::compile(&source, &format!("{name}.c"), &opts);

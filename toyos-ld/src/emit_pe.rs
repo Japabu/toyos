@@ -95,7 +95,7 @@ pub(crate) fn emit_pe_bytes(
         .globals
         .get(entry_name)
         .map(|def| match def {
-            SymbolDef::Defined { section, value } => {
+            SymbolDef::Defined { section, value, .. } => {
                 (state.sections[*section].vaddr.unwrap() + value) as u32
             }
             SymbolDef::Dynamic { .. } => panic!("entry point cannot be a dynamic symbol"),

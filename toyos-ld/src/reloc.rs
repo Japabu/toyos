@@ -46,7 +46,7 @@ pub(crate) fn resolve_symbol(
         SymbolRef::Global(name) => {
             match state.globals.get(name)? {
                 SymbolDef::Dynamic { .. } => plt.and_then(|p| p.get(&SymbolRef::Global(name.clone())).copied()),
-                SymbolDef::Defined { section, value } => {
+                SymbolDef::Defined { section, value, .. } => {
                     let sec = &state.sections[*section];
                     Some(sec.vaddr.unwrap_or_else(|| panic!(
                         "symbol {name:?} in section {:?} ({:?}) has no vaddr",
@@ -59,7 +59,7 @@ pub(crate) fn resolve_symbol(
             // Local (static) symbols resolve to the local definition first.
             // Only fall back to global if no local exists (e.g., section symbols
             // that were promoted to global during merging).
-            if let Some(SymbolDef::Defined { section, value }) = state.locals.get(&(*obj_idx, name.clone())) {
+            if let Some(SymbolDef::Defined { section, value, .. }) = state.locals.get(&(*obj_idx, name.clone())) {
                 let sec = &state.sections[*section];
                 return Some(sec.vaddr.unwrap_or_else(|| panic!(
                     "local symbol {name:?} in section {:?} ({:?}) has no vaddr",
@@ -69,7 +69,7 @@ pub(crate) fn resolve_symbol(
             if let Some(def) = state.globals.get(name) {
                 return match def {
                     SymbolDef::Dynamic { .. } => plt.and_then(|p| p.get(&SymbolRef::Global(name.clone())).copied()),
-                    SymbolDef::Defined { section, value } => {
+                    SymbolDef::Defined { section, value, .. } => {
                         let sec = &state.sections[*section];
                         Some(sec.vaddr.unwrap_or_else(|| panic!(
                             "symbol {name:?} in section {:?} ({:?}) has no vaddr",

@@ -614,7 +614,7 @@ fn create_aarch64_stubs(
         });
 
         state.globals.insert(format!("{sym_name}.__stub"), SymbolDef::Defined {
-            section: stub_sec_idx, value: offset,
+            section: stub_sec_idx, value: offset, size: 0,
         });
     }
 
@@ -656,7 +656,7 @@ fn create_x86_64_stubs(
         });
 
         state.globals.insert(format!("{sym_name}.__stub"), SymbolDef::Defined {
-            section: stub_sec_idx, value: offset,
+            section: stub_sec_idx, value: offset, size: 0,
         });
     }
 
