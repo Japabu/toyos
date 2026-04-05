@@ -819,8 +819,13 @@ impl ApplicationHandler for DoomApp {
         self.context = Some(context);
 
         // Initialize doom — this calls DG_Init() which just sets START_TIME
-        let args: Vec<&[u8]> = vec![b"doom\0", b"-iwad\0", b"/share/doom1.wad\0"];
-        let argv: Vec<*const u8> = args.iter().map(|a| a.as_ptr()).collect();
+        // Leak: doom stores myargv globally and reads it on every tick.
+        let argv: Vec<*const u8> = vec![
+            b"doom\0".as_ptr(),
+            b"-iwad\0".as_ptr(),
+            b"/share/doom1.wad\0".as_ptr(),
+        ];
+        let argv = argv.leak();
         unsafe {
             doomgeneric_Create(argv.len() as i32, argv.as_ptr());
         }

@@ -2166,7 +2166,7 @@ pub fn handle_page_fault(fault_addr: u64, _error_code: u64) -> bool {
     // Round down to 2MB boundary
     let page_2m = PAGE_2M;
     let region_start = fault_addr & !(page_2m - 1);
-    let region_end_full = region_start + page_2m;
+    let region_end_full = region_start.saturating_add(page_2m);
 
     // Collect region info from the address space (lock addr_space briefly).
     // We gather everything we need so we can drop the lock before doing I/O.

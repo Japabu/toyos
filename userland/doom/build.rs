@@ -127,6 +127,9 @@ fn main() {
     }
 
     build.compile("doomgeneric");
+
+    println!("cargo:rerun-if-changed=include");
+    println!("cargo:rerun-if-changed=doomgeneric");
 }
 
 fn http_agent() -> ureq::Agent {
