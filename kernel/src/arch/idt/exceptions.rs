@@ -256,7 +256,7 @@ fn crash_report_panic(info: &core::panic::PanicInfo, rbp: u64) {
         log!("  Running: pid={} tid={:?}", pid, tid);
         if let Some(guard) = process::PROCESS_TABLE.try_lock() {
             if let Some(table) = guard.as_ref() {
-                if let Some(proc) = table.get_process(pid) {
+                if let Some(proc) = table.get(pid) {
                     log!("  Process: {} pid={} state={}", proc.name_str(), proc.pid(), proc.state().name());
                 }
             }
@@ -296,27 +296,27 @@ pub(crate) fn recover_or_halt(is_user: bool, is_ring3: bool) -> ! {
 /// Recover from a panic in syscall context. Poisons the thread, tries to zombify,
 /// then rejoins the scheduler via lock-free schedule_no_return.
 pub(crate) fn try_recover_from_panic() -> ! {
-    let mut parent_tid = None;
+    let mut parent_to_wake = None;
     if let Some(tid) = percpu::current_tid() {
         let pid = percpu::current_pid().unwrap_or(crate::process::Pid(u32::MAX));
         // Poison FIRST — lock-free, prevents re-scheduling
-        scheduler::poison_tid(tid, pid);
+        scheduler::poison_tid(scheduler::TaskId(pid, tid));
 
         // Try to zombify (non-blocking)
         if let Some(mut guard) = process::PROCESS_TABLE.try_lock() {
             if let Some(table) = guard.as_mut() {
-                if let Some(proc) = table.get_process(pid) {
+                if let Some(proc) = table.get(pid) {
                     if let Some(ppid) = proc.parent() {
-                        parent_tid = table.get_process(ppid).map(|p| p.main_tid());
+                        parent_to_wake = table.get(ppid).map(|p| (ppid, p.main_tid()));
                     }
                 }
-                table.zombify_tid(pid, tid, -1);
+                process::zombify_tid(table,pid, tid, -1);
             }
         }
     }
     percpu::set_fault_state(CpuFaultState::Normal);
-    if let Some(ptid) = parent_tid {
-        scheduler::wake_tid(ptid);
+    if let Some((ppid, ptid)) = parent_to_wake {
+        scheduler::wake_task(scheduler::TaskId(ppid, ptid));
     }
     scheduler::schedule_no_return();
 }

@@ -738,7 +738,7 @@ fn sys_waitpid(pid: u64, flags: u64) -> u64 {
     let child_pid = process::Pid::from_raw(pid as u32);
     let caller = process::current_process();
     loop {
-        match process::collect_child_zombie(child_pid, caller) {
+        match process::wait_child_zombie(child_pid, caller) {
             Ok(Some(code)) => return code as u64,
             Ok(None) => {
                 if flags & WNOHANG != 0 {
@@ -979,7 +979,7 @@ fn sys_thread_join(tid: u64) -> u64 {
     let tid = process::Tid::from_raw(tid as u32);
     let caller = process::current_process();
     loop {
-        match process::collect_thread_zombie(tid, caller) {
+        match process::wait_thread_zombie(tid, caller) {
             Ok(Some(_)) => return 0,
             Ok(None) => process::block(None, 0), // woken by wake_tid from exit path
             Err(()) => return SyscallError::NotFound.to_u64(),
@@ -1004,7 +1004,7 @@ fn sys_sysinfo(buf: &mut [u8]) -> u64 {
     let table = guard.as_ref().unwrap();
 
     // Count all entries (processes + threads)
-    let entry_count: u32 = table.iter_all().count() as u32;
+    let entry_count: u32 = table.iter().flat_map(|(_, proc)| proc.threads().iter().map(move |(tid, thread)| (tid, proc, thread))).count() as u32;
 
     buf[0..8].copy_from_slice(&total_mem.to_le_bytes());
     buf[8..16].copy_from_slice(&used_mem.to_le_bytes());
@@ -1016,10 +1016,10 @@ fn sys_sysinfo(buf: &mut [u8]) -> u64 {
 
     let max_entries = (buf.len() - HEADER_SIZE) / ENTRY_SIZE;
 
-    // Collect and sort by Tid for stable output
+    // Collect and sort by (pid, tid) for stable output
     let mut entries: Vec<(process::Tid, &process::ProcessEntry, &process::ThreadEntry)> =
-        table.iter_all().map(|(proc, tid, thread)| (tid, proc, thread)).collect();
-    entries.sort_by_key(|(tid, _, _)| *tid);
+        table.iter().flat_map(|(_, proc)| proc.threads().iter().map(move |(tid, thread)| (tid, proc, thread))).collect();
+    entries.sort_by_key(|(tid, proc, _)| (proc.pid(), *tid));
 
     let mut pos = HEADER_SIZE;
     for (i, &(tid, proc, thread)) in entries.iter().enumerate() {
@@ -1030,7 +1030,7 @@ fn sys_sysinfo(buf: &mut [u8]) -> u64 {
         let state: u8 = if matches!(thread.state(), process::ProcessState::Zombie(_)) {
             3
         } else {
-            crate::scheduler::thread_sched_state(tid)
+            crate::scheduler::task_sched_state(crate::scheduler::TaskId(proc.pid(), tid))
         };
         let is_thread: u8 = if tid != proc.main_tid() { 1 } else { 0 };
         let parent_pid = proc.parent().unwrap_or(process::Pid::MAX);
@@ -1047,7 +1047,7 @@ fn sys_sysinfo(buf: &mut [u8]) -> u64 {
         } else {
             0
         };
-        let cpu_ns = crate::scheduler::thread_cpu_ns(tid);
+        let cpu_ns = crate::scheduler::task_cpu_ns(crate::scheduler::TaskId(proc.pid(), tid));
         let pid = proc.pid();
 
         buf[pos..pos + 4].copy_from_slice(&pid.raw().to_le_bytes());

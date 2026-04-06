@@ -885,7 +885,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
             let arc = {
                 let guard = PROCESS_TABLE.lock();
                 let table = guard.as_ref().unwrap();
-                Arc::clone(table.get_process(ppid).unwrap().process_data())
+                Arc::clone(table.get(ppid).unwrap().process_data())
             };
             let cwd = arc.lock().cwd.clone();
             cwd
@@ -938,23 +938,19 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
 
     let mut guard = PROCESS_TABLE.lock();
     let table = guard.as_mut().unwrap();
-    let tid = table.alloc_tid();
-    let mut threads = hashbrown::HashMap::new();
-    threads.insert(tid, ThreadEntry::new(thread_data));
-    let pid = table.insert_process(|pid| ProcessEntry::new(
+    let pid = table.insert_with(|pid| ProcessEntry::new(
         pid,
         parent,
         make_name(path),
         proc_data,
         Arc::new(Lock::new(syms)),
-        tid,
-        threads,
+        ThreadEntry::new(thread_data),
     ));
+    let tid = table.get(pid).unwrap().main_tid();
     drop(guard);
 
-    let ctx = scheduler::ThreadCtx {
-        tid,
-        process: pid,
+    let ctx = scheduler::TaskCtx {
+        id: scheduler::TaskId(pid, tid),
         kernel_stack: ks_alloc,
         kernel_rsp: ks_rsp,
         address_space: Some(child_pt.clone()),
@@ -965,7 +961,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
         deadline: 0,
         blocked_since: 0,
         enqueued_at: 0,
-        accounting: scheduler::ThreadAccounting::default(),
+        accounting: scheduler::TaskAccounting::default(),
     };
     scheduler::enqueue_new(ctx);
 
