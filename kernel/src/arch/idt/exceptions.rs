@@ -22,14 +22,14 @@ pub(crate) fn kernel_backtrace(start_rbp: u64, max_frames: usize) {
 }
 
 /// Walk RBP chain for user backtrace through page tables.
-fn user_backtrace(tid: crate::process::Tid, start_rbp: u64, pml4: *const u64, max_frames: usize) {
+fn user_backtrace(pid: crate::process::Pid, start_rbp: u64, pml4: *const u64, max_frames: usize) {
     let mut rbp = start_rbp;
     for _ in 0..max_frames {
         if rbp == 0 || rbp % 8 != 0 { break; }
         let Some(saved_rbp) = safe_read_u64(rbp, pml4) else { break };
         let Some(return_addr) = safe_read_u64(rbp + 8, pml4) else { break };
         if return_addr == 0 { break; }
-        if !process::resolve_user_symbol(tid, return_addr) {
+        if !process::resolve_user_symbol(pid, return_addr) {
             log!("    {:#x}", return_addr);
         }
         rbp = saved_rbp;
@@ -135,19 +135,25 @@ pub(crate) fn crash_report(info: &CrashInfo) {
 fn crash_report_exception(ctx: &ExceptionContext) {
     let is_user = ctx.is_user_fault();
     let tid = percpu::current_tid().unwrap_or(crate::process::Tid(0));
+    let pid = percpu::current_pid();
     let pml4 = if is_user { crate::DirectMap::from_phys(crate::mm::paging::Cr3::current().phys()).as_ptr::<u64>() as *const u64 } else { core::ptr::null() };
+
+    // Decode page fault details once (shared by user and kernel headers)
+    let (pf_action, pf_cause) = if ctx.vector() == Vector::PageFault {
+        let action = if ctx.frame.error_code & PF_INSTRUCTION_FETCH != 0 { "execute" }
+            else if ctx.frame.error_code & PF_WRITE != 0 { "write" }
+            else { "read" };
+        let cause = if ctx.frame.error_code & PF_PRESENT != 0 { "protection violation" }
+            else { "unmapped address" };
+        (action, cause)
+    } else {
+        ("", "")
+    };
 
     // Header
     if is_user {
         match ctx.vector() {
-            Vector::PageFault => {
-                let action = if ctx.frame.error_code & PF_INSTRUCTION_FETCH != 0 { "execute" }
-                    else if ctx.frame.error_code & PF_WRITE != 0 { "write" }
-                    else { "read" };
-                let cause = if ctx.frame.error_code & PF_PRESENT != 0 { "protection violation" }
-                    else { "unmapped address" };
-                log!("SEGFAULT tid={}: {} {} at {:#x}", tid, action, cause, ctx.cr2);
-            }
+            Vector::PageFault => log!("SEGFAULT tid={}: {} {} at {:#x}", tid, pf_action, pf_cause, ctx.cr2),
             Vector::InvalidOpcode => log!("SIGILL tid={}: illegal instruction", tid),
             Vector::GeneralProtection => log!("SIGBUS tid={}: general protection fault (error_code={:#x})", tid, ctx.frame.error_code),
             Vector::DoubleFault => log!("FATAL tid={}: double fault", tid),
@@ -155,14 +161,7 @@ fn crash_report_exception(ctx: &ExceptionContext) {
         }
     } else {
         match ctx.vector() {
-            Vector::PageFault => {
-                let action = if ctx.frame.error_code & PF_INSTRUCTION_FETCH != 0 { "execute" }
-                    else if ctx.frame.error_code & PF_WRITE != 0 { "write" }
-                    else { "read" };
-                let cause = if ctx.frame.error_code & PF_PRESENT != 0 { "protection violation" }
-                    else { "unmapped address" };
-                log!("KERNEL PANIC: {} {} at {:#x}", action, cause, ctx.cr2);
-            }
+            Vector::PageFault => log!("KERNEL PANIC: {} {} at {:#x}", pf_action, pf_cause, ctx.cr2),
             _ => {
                 let name = match ctx.vector() {
                     Vector::InvalidOpcode => "invalid opcode",
@@ -178,7 +177,11 @@ fn crash_report_exception(ctx: &ExceptionContext) {
     // Crash location (once — not duplicated in backtrace)
     log!("  rip:");
     if is_user {
-        if !process::resolve_user_symbol(tid, ctx.frame.rip) {
+        if let Some(pid) = pid {
+            if !process::resolve_user_symbol(pid, ctx.frame.rip) {
+                log!("    {:#x}", ctx.frame.rip);
+            }
+        } else {
             log!("    {:#x}", ctx.frame.rip);
         }
     } else {
@@ -203,8 +206,8 @@ fn crash_report_exception(ctx: &ExceptionContext) {
     // Backtrace (skip RIP — already printed above)
     log!("  Backtrace:");
     if is_user {
-        if let Some(p) = percpu::current_tid() {
-            user_backtrace(p, ctx.frame.rbp, pml4, 32);
+        if let Some(pid) = pid {
+            user_backtrace(pid, ctx.frame.rbp, pml4, 32);
         }
     } else {
         kernel_backtrace(ctx.frame.rbp, 32);
@@ -212,13 +215,13 @@ fn crash_report_exception(ctx: &ExceptionContext) {
         // If this kernel fault happened during a syscall, print the user context
         let user_rip = percpu::syscall_rip();
         if user_rip != 0 {
-            if let Some(tid) = percpu::current_tid() {
+            if let Some(pid) = pid {
                 log!("  Syscall: num={} user_rip={:#x} user_rsp={:#x}",
                     percpu::syscall_num(), user_rip, percpu::user_rsp());
                 log!("  User backtrace:");
-                process::resolve_user_symbol(tid, user_rip);
+                process::resolve_user_symbol(pid, user_rip);
                 let pml4 = crate::DirectMap::from_phys(crate::mm::paging::Cr3::current().phys()).as_ptr::<u64>() as *const u64;
-                user_backtrace(tid, percpu::syscall_rbp(), pml4, 20);
+                user_backtrace(pid, percpu::syscall_rbp(), pml4, 20);
             }
         }
     }
@@ -248,11 +251,12 @@ fn crash_report_panic(info: &core::panic::PanicInfo, rbp: u64) {
     kernel_backtrace(rbp, 20);
 
     // Process/thread context (try_lock only)
-    if let Some(tid) = percpu::current_tid() {
-        log!("  Running: tid={}", tid);
+    if let Some(pid) = percpu::current_pid() {
+        let tid = percpu::current_tid();
+        log!("  Running: pid={} tid={:?}", pid, tid);
         if let Some(guard) = process::PROCESS_TABLE.try_lock() {
             if let Some(table) = guard.as_ref() {
-                if let Some((proc, _)) = table.get_by_tid(tid) {
+                if let Some(proc) = table.get_process(pid) {
                     log!("  Process: {} pid={} state={}", proc.name_str(), proc.pid(), proc.state().name());
                 }
             }
@@ -264,9 +268,9 @@ fn crash_report_panic(info: &core::panic::PanicInfo, rbp: u64) {
             log!("  Syscall: num={} user_rip={:#x} user_rsp={:#x}",
                 percpu::syscall_num(), user_rip, percpu::user_rsp());
             log!("  User backtrace:");
-            process::resolve_user_symbol(tid, user_rip);
+            process::resolve_user_symbol(pid, user_rip);
             let pml4 = crate::DirectMap::from_phys(crate::mm::paging::Cr3::current().phys()).as_ptr::<u64>() as *const u64;
-            user_backtrace(tid, percpu::syscall_rbp(), pml4, 20);
+            user_backtrace(pid, percpu::syscall_rbp(), pml4, 20);
         }
     }
 }
@@ -294,21 +298,19 @@ pub(crate) fn recover_or_halt(is_user: bool, is_ring3: bool) -> ! {
 pub(crate) fn try_recover_from_panic() -> ! {
     let mut parent_tid = None;
     if let Some(tid) = percpu::current_tid() {
+        let pid = percpu::current_pid().unwrap_or(crate::process::Pid(u32::MAX));
         // Poison FIRST — lock-free, prevents re-scheduling
-        scheduler::poison_tid(tid);
+        scheduler::poison_tid(tid, pid);
 
         // Try to zombify (non-blocking)
         if let Some(mut guard) = process::PROCESS_TABLE.try_lock() {
             if let Some(table) = guard.as_mut() {
-                if let Some(pid) = table.pid_of(tid) {
-                    // Find parent's main tid for deferred wake
-                    if let Some(proc) = table.get_process(pid) {
-                        if let Some(ppid) = proc.parent() {
-                            parent_tid = table.get_process(ppid).map(|p| p.main_tid());
-                        }
+                if let Some(proc) = table.get_process(pid) {
+                    if let Some(ppid) = proc.parent() {
+                        parent_tid = table.get_process(ppid).map(|p| p.main_tid());
                     }
-                    table.zombify_tid(tid, -1);
                 }
+                table.zombify_tid(pid, tid, -1);
             }
         }
     }
@@ -334,7 +336,8 @@ pub(super) fn debug_handler(frame: &TrapFrame) {
 
     let dr6 = debug::read_dr6();
     let is_user = frame.cs & RPL_MASK != 0;
-    let pid = percpu::current_tid();
+    let tid = percpu::current_tid();
+    let pid = percpu::current_pid();
 
     log!("=== HARDWARE WATCHPOINT HIT ===");
     log!("  DR6={:#x} ({})", dr6,
@@ -344,15 +347,15 @@ pub(super) fn debug_handler(frame: &TrapFrame) {
         else if dr6 & 8 != 0 { "DR3" }
         else { "unknown" });
     log!("  context_tag={:#x}", debug::context());
-    log!("  mode={} pid={:?}", if is_user { "user" } else { "kernel" }, pid);
+    log!("  mode={} pid={:?} tid={:?}", if is_user { "user" } else { "kernel" }, pid, tid);
     log!("  rip={:#018x}  rsp={:#018x}  rbp={:#018x}", frame.rip, frame.rsp, frame.rbp);
     log!("  rax={:#018x}  rbx={:#018x}  rcx={:#018x}", frame.rax, frame.rbx, frame.rcx);
     log!("  rdx={:#018x}  rsi={:#018x}  rdi={:#018x}", frame.rdx, frame.rsi, frame.rdi);
 
     log!("  Instruction that wrote:");
     if is_user {
-        if let Some(p) = pid {
-            if !process::resolve_user_symbol(p, frame.rip) {
+        if let Some(pid) = pid {
+            if !process::resolve_user_symbol(pid, frame.rip) {
                 log!("    {:#x}", frame.rip);
             }
         }
@@ -363,8 +366,8 @@ pub(super) fn debug_handler(frame: &TrapFrame) {
     log!("  Backtrace:");
     if is_user {
         let pml4 = crate::DirectMap::from_phys(crate::mm::paging::Cr3::current().phys()).as_ptr::<u64>() as *const u64;
-        if let Some(p) = pid {
-            user_backtrace(p, frame.rbp, pml4, 20);
+        if let Some(pid) = pid {
+            user_backtrace(pid, frame.rbp, pml4, 20);
         }
     } else {
         kernel_backtrace(frame.rbp, 20);
@@ -391,9 +394,10 @@ pub(super) fn debug_handler(frame: &TrapFrame) {
 pub(super) fn double_fault_handler(frame: &TrapFrame) -> ! {
     let cr2 = cpu::read_cr2();
     let cpu_id = percpu::cpu_id();
-    let pid = percpu::current_tid();
+    let tid = percpu::current_tid();
+    let pid = percpu::current_pid();
 
-    log!("DOUBLE FAULT on CPU {} (pid={:?})", cpu_id, pid);
+    log!("DOUBLE FAULT on CPU {} (pid={:?} tid={:?})", cpu_id, pid, tid);
     log!("  cr2={:#018x} (address that caused the fault chain)", cr2);
     log!("  rip={:#018x}  rsp={:#018x}  rbp={:#018x}", frame.rip, frame.rsp, frame.rbp);
     crate::mm::paging::debug_page_walk(cr2);
@@ -441,16 +445,16 @@ pub(super) fn double_fault_handler(frame: &TrapFrame) -> ! {
                 // Try to recover user RBP from saved GPRs (rbp is at offset 6*8)
                 let user_rbp_addr = saved_regs_base + 6 * 8;
                 if let Some(user_rbp) = safe_read_kernel(user_rbp_addr) {
-                    log!("  User context (pid={:?}):", pid);
+                    log!("  User context (pid={:?} tid={:?}):", pid, tid);
                     log!("    rip={:#018x}  rsp={:#018x}  rbp={:#018x}", maybe_rip, maybe_rsp, user_rbp);
 
                     let pml4 = crate::DirectMap::from_phys(crate::mm::paging::Cr3::current().phys()).as_ptr::<u64>();
                     log!("  User backtrace:");
-                    if let Some(p) = pid {
-                        if !process::resolve_user_symbol(p, maybe_rip) {
+                    if let Some(pid) = pid {
+                        if !process::resolve_user_symbol(pid, maybe_rip) {
                             log!("    {:#x}", maybe_rip);
                         }
-                        user_backtrace(p, user_rbp, pml4, 20);
+                        user_backtrace(pid, user_rbp, pml4, 20);
                     } else {
                         log!("    {:#x}", maybe_rip);
                     }

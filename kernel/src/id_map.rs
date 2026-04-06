@@ -13,13 +13,33 @@ pub trait IdKey: Copy + Eq + Hash + Ord + Add<Output = Self> {
     const ONE: Self;
 }
 
-impl IdKey for u32 { const ZERO: Self = 0; const ONE: Self = 1; }
-impl IdKey for u64 { const ZERO: Self = 0; const ONE: Self = 1; }
-impl IdKey for usize { const ZERO: Self = 0; const ONE: Self = 1; }
+impl IdKey for u32 {
+    const ZERO: Self = 0;
+    const ONE: Self = 1;
+}
+impl IdKey for u64 {
+    const ZERO: Self = 0;
+    const ONE: Self = 1;
+}
+impl IdKey for usize {
+    const ZERO: Self = 0;
+    const ONE: Self = 1;
+}
+impl IdKey for toyos_abi::Pid {
+    const ZERO: Self = Self(0);
+    const ONE: Self = Self(1);
+}
+impl IdKey for toyos_abi::Tid {
+    const ZERO: Self = Self(0);
+    const ONE: Self = Self(1);
+}
 
 impl<K: IdKey, V> IdMap<K, V> {
     pub fn new() -> Self {
-        Self { map: HashMap::new(), next: K::ZERO }
+        Self {
+            map: HashMap::new(),
+            next: K::ZERO,
+        }
     }
 
     /// Insert with auto-assigned ID. Returns the new ID.

@@ -37,25 +37,37 @@ const PREEMPTION_QUANTUM_NS: u64 = 10_000_000; // 10ms
 // Poison set — lock-free, prevents panicked threads from being re-scheduled
 // ---------------------------------------------------------------------------
 
-static POISONED_TIDS: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(u32::MAX) }; MAX_CPUS];
+/// Packed (tid, pid) in a single AtomicU64: low 32 = tid, high 32 = pid.
+static POISONED: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(u64::MAX) }; MAX_CPUS];
+
+fn pack_poison(tid: Tid, pid: Pid) -> u64 {
+    tid.raw() as u64 | (pid.raw() as u64) << 32
+}
+
+fn unpack_poison(v: u64) -> (Tid, Pid) {
+    (Tid::from_raw(v as u32), Pid::from_raw((v >> 32) as u32))
+}
 
 /// Mark a thread as poisoned (panicked). Lock-free — safe from panic context.
-pub fn poison_tid(tid: Tid) {
+pub fn poison_tid(tid: Tid, pid: Pid) {
     let cpu = percpu::cpu_id() as usize;
     if cpu < MAX_CPUS {
-        POISONED_TIDS[cpu].store(tid.raw(), Ordering::Release);
+        POISONED[cpu].store(pack_poison(tid, pid), Ordering::Release);
     }
 }
 
 /// Check if a thread is poisoned.
 pub fn is_poisoned(tid: Tid) -> bool {
-    POISONED_TIDS.iter().any(|s| s.load(Ordering::Relaxed) == tid.raw())
+    POISONED.iter().any(|s| s.load(Ordering::Relaxed) as u32 == tid.raw())
 }
 
 /// Clear poison for a thread after it has been zombified by the idle loop.
-pub fn clear_poison(tid: Tid) {
-    for slot in &POISONED_TIDS {
-        let _ = slot.compare_exchange(tid.raw(), u32::MAX, Ordering::Relaxed, Ordering::Relaxed);
+fn clear_poison(tid: Tid) {
+    for slot in &POISONED {
+        let v = slot.load(Ordering::Relaxed);
+        if v as u32 == tid.raw() {
+            let _ = slot.compare_exchange(v, u64::MAX, Ordering::Relaxed, Ordering::Relaxed);
+        }
     }
 }
 
@@ -629,7 +641,8 @@ pub fn exit_current(code: i32) -> ! {
         let mut guard = process::PROCESS_TABLE.lock();
         let table = guard.as_mut().unwrap();
         let tid = percpu::current_tid().unwrap();
-        table.zombify_tid(tid, code);
+        let pid = percpu::current_pid().unwrap();
+        table.zombify_tid(pid, tid, code);
     }
     do_schedule(SwitchReason::Exit);
     unreachable!("exit_current: returned from schedule");
@@ -962,11 +975,11 @@ fn cpu_idle_loop() -> ! {
 
             // Zombify poisoned threads that couldn't be cleaned up during panic recovery
             // (try_lock failed at panic time, so cleanup was deferred to the idle loop).
-            for slot in &POISONED_TIDS {
+            for slot in &POISONED {
                 let raw = slot.load(Ordering::Relaxed);
-                if raw == u32::MAX { continue; }
-                let tid = Tid::from_raw(raw);
-                table.zombify_tid(tid, -1);
+                if raw == u64::MAX { continue; }
+                let (tid, pid) = unpack_poison(raw);
+                table.zombify_tid(pid, tid, -1);
                 clear_poison(tid);
             }
         }
@@ -1073,7 +1086,7 @@ pub fn dump_blocked() {
         let mut got_name = false;
         if let Some(guard) = crate::process::PROCESS_TABLE.try_lock() {
             if let Some(table) = guard.as_ref() {
-                if let Some((proc, _)) = table.get_by_tid(*tid) {
+                if let Some(proc) = table.get_process(ctx.process) {
                     name_buf = *proc.name();
                     got_name = true;
                 }

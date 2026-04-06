@@ -35,6 +35,7 @@ mod vfs;
 mod elf;
 mod symbols;
 mod process;
+mod loader;
 mod scheduler;
 mod clock;
 mod rtc;
