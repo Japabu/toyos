@@ -1027,19 +1027,19 @@ fn sys_sysinfo(buf: &mut [u8]) -> u64 {
             break;
         }
 
-        let state: u8 = if matches!(thread.state, process::ProcessState::Zombie(_)) {
+        let state: u8 = if matches!(thread.state(), process::ProcessState::Zombie(_)) {
             3
         } else {
             crate::scheduler::thread_sched_state(tid)
         };
-        let is_thread: u8 = if tid != proc.main_tid { 1 } else { 0 };
-        let parent_pid = proc.parent.unwrap_or(process::Pid::MAX);
+        let is_thread: u8 = if tid != proc.main_tid() { 1 } else { 0 };
+        let parent_pid = proc.parent().unwrap_or(process::Pid::MAX);
 
-        let memory = if let Some(data) = proc.process_data.try_lock() {
+        let memory = if let Some(data) = proc.process_data().try_lock() {
             let demand = data.demand_pages.iter().map(|p| p.size() as u64).sum::<u64>();
             let mmap = data.mmap_regions.iter().map(|r| r._pages.size() as u64).sum::<u64>();
-            let tls = data.dynamic_tls_blocks.values().map(|p| p.size() as u64).sum::<u64>();
-            let libs: u64 = data.loaded_libs.iter().map(|l| match &l.memory {
+            let tls = data.elf.dynamic_tls_blocks.values().map(|p| p.size() as u64).sum::<u64>();
+            let libs: u64 = data.elf.loaded_libs.iter().map(|l| match &l.memory {
                 crate::elf::LibMemory::Owned(alloc) => alloc.size() as u64,
                 crate::elf::LibMemory::Shared { rw_alloc, .. } => rw_alloc.size() as u64,
             }).sum();
@@ -1048,7 +1048,7 @@ fn sys_sysinfo(buf: &mut [u8]) -> u64 {
             0
         };
         let cpu_ns = crate::scheduler::thread_cpu_ns(tid);
-        let pid = proc.pid;
+        let pid = proc.pid();
 
         buf[pos..pos + 4].copy_from_slice(&pid.raw().to_le_bytes());
         buf[pos + 4..pos + 8].copy_from_slice(&parent_pid.raw().to_le_bytes());
@@ -1057,7 +1057,7 @@ fn sys_sysinfo(buf: &mut [u8]) -> u64 {
         buf[pos + 10..pos + 12].copy_from_slice(&[0, 0]);
         buf[pos + 12..pos + 20].copy_from_slice(&memory.to_le_bytes());
         buf[pos + 20..pos + 28].copy_from_slice(&cpu_ns.to_le_bytes());
-        buf[pos + 28..pos + 56].copy_from_slice(&proc.name);
+        buf[pos + 28..pos + 56].copy_from_slice(proc.name());
 
         pos += ENTRY_SIZE;
     }
@@ -1255,22 +1255,22 @@ fn sys_dlopen(path: &str, init_out: u64) -> u64 {
     let data_arc = process::fd_owner_data();
     {
         let mut data = data_arc.lock();
-        crate::elf::resolve_dlopen_relocs(&lib, &data.loaded_libs);
+        crate::elf::resolve_dlopen_relocs(&lib, &data.elf.loaded_libs);
 
         // Apply TPOFF relocs for cross-module IE references (symbols from static-linked modules
         // like std/core whose TLS lives in the static block with known TP-relative offsets).
-        if data.tls_total_memsz > 0 {
+        if data.elf.tls_total_memsz > 0 {
             let tls_info = crate::elf::TlsModuleInfo {
-                libs: &data.loaded_libs,
-                modules: &data.tls_modules,
+                libs: &data.elf.loaded_libs,
+                modules: &data.elf.tls_modules,
             };
-            crate::elf::apply_tpoff_relocs(&lib, 0, data.tls_total_memsz, &tls_info);
+            crate::elf::apply_tpoff_relocs(&lib, 0, data.elf.tls_total_memsz, &tls_info);
         }
 
         if lib_has_tls {
-            let module_id = data.next_tls_module_id;
-            data.next_tls_module_id += 1;
-            data.tls_modules.push(crate::elf::TlsModule {
+            let module_id = data.elf.next_tls_module_id;
+            data.elf.next_tls_module_id += 1;
+            data.elf.tls_modules.push(crate::elf::TlsModule {
                 template: lib.tls_template,
                 memsz: lib.tls_memsz, base_offset: 0, module_id,
                 is_static: false,
@@ -1280,8 +1280,8 @@ fn sys_dlopen(path: &str, init_out: u64) -> u64 {
             // defining module's ID and TLS offset. DTV entries are left DTV_UNALLOCATED;
             // __tls_get_addr allocates on first access.
             let tls_info = crate::elf::TlsModuleInfo {
-                libs: &data.loaded_libs,
-                modules: &data.tls_modules,
+                libs: &data.elf.loaded_libs,
+                modules: &data.elf.tls_modules,
             };
             crate::elf::apply_dtpmod_relocs(&lib, module_id, &tls_info);
         }
@@ -1308,9 +1308,9 @@ fn sys_dlopen(path: &str, init_out: u64) -> u64 {
 
     // Store the lib in the owner process
     let mut data = data_arc.lock();
-    let idx = data.loaded_libs.len();
-    data.lib_paths.push(resolved);
-    data.loaded_libs.push(lib);
+    let idx = data.elf.loaded_libs.len();
+    data.elf.lib_paths.push(resolved);
+    data.elf.loaded_libs.push(lib);
     idx as u64
 }
 
@@ -1326,7 +1326,7 @@ fn sys_tls_alloc_block(module_id: u64) -> u64 {
     let owner_arc = process::fd_owner_data();
     let (tls_memsz, tls_template) = {
         let data = owner_arc.lock();
-        let m = data.tls_modules.iter().find(|m| m.module_id == module_id)
+        let m = data.elf.tls_modules.iter().find(|m| m.module_id == module_id)
             .unwrap_or_else(|| panic!("sys_tls_alloc_block: module_id={} not found", module_id));
         (m.memsz, m.template)
     };
@@ -1356,7 +1356,7 @@ fn sys_tls_alloc_block(module_id: u64) -> u64 {
     // Store in the process-level (fd-owner) data alongside the VMA allocation.
     let tid = process::current_tid();
     process::with_fd_owner_data(|data| {
-        data.dynamic_tls_blocks.insert((tid, module_id), page_alloc);
+        data.elf.dynamic_tls_blocks.insert((tid, module_id), page_alloc);
     });
 
     // Write block address into current thread's DTV.
@@ -1381,10 +1381,10 @@ fn sys_dlsym(handle: u64, name: &str) -> u64 {
     let data_arc = process::fd_owner_data();
     let data = data_arc.lock();
     let idx = handle as usize;
-    if idx >= data.loaded_libs.len() {
+    if idx >= data.elf.loaded_libs.len() {
         return SyscallError::NotFound.to_u64();
     }
-    match crate::elf::dlsym(&data.loaded_libs[idx], name) {
+    match crate::elf::dlsym(&data.elf.loaded_libs[idx], name) {
         Some(addr) => addr.raw(),
         None => u64::MAX,
     }
@@ -1456,12 +1456,12 @@ fn sys_query_modules(buf: &mut [u8]) -> u64 {
 
     process::with_fd_owner_data(|data| {
         // Count modules: 1 (exe) + loaded_libs
-        let module_count = 1 + data.loaded_libs.len();
+        let module_count = 1 + data.elf.loaded_libs.len();
 
         // Calculate total path bytes
         let exe_path_bytes = data.exe_path.as_bytes();
         let total_path_bytes: usize = exe_path_bytes.len()
-            + data.lib_paths.iter().map(|p| p.as_bytes().len()).sum::<usize>();
+            + data.elf.lib_paths.iter().map(|p| p.as_bytes().len()).sum::<usize>();
 
         let required = module_count * info_size + total_path_bytes;
         if buf.len() < required {
@@ -1471,11 +1471,11 @@ fn sys_query_modules(buf: &mut [u8]) -> u64 {
         let mut path_offset = (module_count * info_size) as u32;
 
         // Write exe module info
-        let (eh_vaddr, eh_size) = (data.exe_eh_frame_hdr_vaddr, data.exe_eh_frame_hdr_size);
+        let (eh_vaddr, eh_size) = (data.elf.exe_eh_frame_hdr_vaddr, data.elf.exe_eh_frame_hdr_size);
         let exe_info = ModuleInfo {
-            base: data.elf_base.raw(),
-            text_end: data.exe_vaddr_max,
-            eh_frame_hdr: if eh_vaddr != 0 { data.elf_base.raw() + eh_vaddr } else { 0 },
+            base: data.elf.elf_base.raw(),
+            text_end: data.elf.exe_vaddr_max,
+            eh_frame_hdr: if eh_vaddr != 0 { data.elf.elf_base.raw() + eh_vaddr } else { 0 },
             eh_frame_hdr_size: eh_size,
             path_offset,
             path_len: exe_path_bytes.len() as u32,
@@ -1488,9 +1488,9 @@ fn sys_query_modules(buf: &mut [u8]) -> u64 {
         path_offset += exe_path_bytes.len() as u32;
 
         // Write library module infos
-        for (i, lib) in data.loaded_libs.iter().enumerate() {
-            let lib_path_bytes = if i < data.lib_paths.len() {
-                data.lib_paths[i].as_bytes()
+        for (i, lib) in data.elf.loaded_libs.iter().enumerate() {
+            let lib_path_bytes = if i < data.elf.lib_paths.len() {
+                data.elf.lib_paths[i].as_bytes()
             } else {
                 b""
             };

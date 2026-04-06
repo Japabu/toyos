@@ -629,23 +629,7 @@ pub fn exit_current(code: i32) -> ! {
         let mut guard = process::PROCESS_TABLE.lock();
         let table = guard.as_mut().unwrap();
         let tid = percpu::current_tid().unwrap();
-        let pid = percpu::current_pid().unwrap();
-        if let Some(proc) = table.get_process(pid) {
-            let is_main = proc.main_tid == tid;
-            if is_main {
-                if !matches!(proc.state, process::ProcessState::Zombie(_)) {
-                    let proc = table.get_process_mut(pid).unwrap();
-                    let cleanup = proc.zombify(code);
-                    table.handle_orphans(cleanup);
-                }
-            } else {
-                if let Some(thread) = table.get_thread_mut(tid) {
-                    if !matches!(thread.state, process::ProcessState::Zombie(_)) {
-                        thread.state = process::ProcessState::Zombie(code);
-                    }
-                }
-            }
-        }
+        table.zombify_tid(tid, code);
     }
     do_schedule(SwitchReason::Exit);
     unreachable!("exit_current: returned from schedule");
@@ -982,23 +966,7 @@ fn cpu_idle_loop() -> ! {
                 let raw = slot.load(Ordering::Relaxed);
                 if raw == u32::MAX { continue; }
                 let tid = Tid::from_raw(raw);
-                if let Some(pid) = table.pid_of(tid) {
-                    let is_main = table.get_process(pid).map_or(false, |p| p.main_tid == tid);
-                    if is_main {
-                        if let Some(proc) = table.get_process_mut(pid) {
-                            if !matches!(proc.state, process::ProcessState::Zombie(_)) {
-                                let c = proc.zombify(-1);
-                                table.handle_orphans(c);
-                            }
-                        }
-                    } else {
-                        if let Some(thread) = table.get_thread_mut(tid) {
-                            if !matches!(thread.state, process::ProcessState::Zombie(_)) {
-                                thread.state = process::ProcessState::Zombie(-1);
-                            }
-                        }
-                    }
-                }
+                table.zombify_tid(tid, -1);
                 clear_poison(tid);
             }
         }
@@ -1106,7 +1074,7 @@ pub fn dump_blocked() {
         if let Some(guard) = crate::process::PROCESS_TABLE.try_lock() {
             if let Some(table) = guard.as_ref() {
                 if let Some((proc, _)) = table.get_by_tid(*tid) {
-                    name_buf = proc.name;
+                    name_buf = *proc.name();
                     got_name = true;
                 }
             }

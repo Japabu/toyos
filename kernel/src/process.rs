@@ -187,20 +187,38 @@ impl ThreadLocation {
 
 /// Per-thread metadata. Tid is the HashMap key in ProcessEntry.threads.
 pub struct ThreadEntry {
-    pub state: ThreadLocation,
-    pub thread_data: Arc<Lock<ThreadData>>,
+    state: ThreadLocation,
+    thread_data: Arc<Lock<ThreadData>>,
+}
+
+impl ThreadEntry {
+    pub fn state(&self) -> ThreadLocation { self.state }
+    pub fn thread_data(&self) -> &Arc<Lock<ThreadData>> { &self.thread_data }
 }
 
 /// A process and all its threads. Removing a ProcessEntry removes all threads.
 pub struct ProcessEntry {
-    pub pid: Pid,
-    pub parent: Option<Pid>,
-    pub state: ProcessState,
-    pub name: [u8; 28],
-    pub process_data: Arc<Lock<ProcessData>>,
-    pub symbols: Arc<Lock<SymbolTable>>,
-    pub main_tid: Tid,
-    pub threads: hashbrown::HashMap<Tid, ThreadEntry>,
+    pid: Pid,
+    parent: Option<Pid>,
+    state: ProcessState,
+    name: [u8; 28],
+    process_data: Arc<Lock<ProcessData>>,
+    symbols: Arc<Lock<SymbolTable>>,
+    main_tid: Tid,
+    threads: hashbrown::HashMap<Tid, ThreadEntry>,
+}
+
+impl ProcessEntry {
+    pub fn pid(&self) -> Pid { self.pid }
+    pub fn parent(&self) -> Option<Pid> { self.parent }
+    pub fn state(&self) -> ProcessState { self.state }
+    pub fn name(&self) -> &[u8; 28] { &self.name }
+    pub fn name_str(&self) -> &str {
+        core::str::from_utf8(&self.name).unwrap_or("?").trim_end_matches('\0')
+    }
+    pub fn process_data(&self) -> &Arc<Lock<ProcessData>> { &self.process_data }
+    pub fn symbols(&self) -> &Arc<Lock<SymbolTable>> { &self.symbols }
+    pub fn main_tid(&self) -> Tid { self.main_tid }
 }
 
 impl ProcessEntry {
@@ -265,15 +283,9 @@ impl PageFaultTrace {
     pub fn total(&self) -> u64 { self.total }
 }
 
-/// Process-level data shared across all threads via `Arc<Lock<ProcessData>>`.
-/// Contains fds, memory mappings, loaded libraries — everything that belongs to the process.
-/// Accessed via `with_fd_owner_data`. All threads of a process share the same Arc.
-pub struct ProcessData {
-    pub fds: FdTable,
-    pub cwd: String,
-    /// Inherited environment variables (KEY=VALUE\0KEY2=VALUE2\0...)
-    pub env: Vec<u8>,
-
+/// ELF loading artifacts and TLS state. Grouped separately from runtime process
+/// state to keep concerns distinct — a future lock split becomes trivial.
+pub struct ElfInfo {
     pub elf_alloc: Option<OwnedAlloc>,
     // Thread-local storage (process-level: template, modules, layout)
     pub tls_template: Option<crate::mm::KernelSlice>,
@@ -289,16 +301,38 @@ pub struct ProcessData {
     /// Dynamically allocated TLS blocks for dlopen'd modules, keyed by (thread Tid, module_id).
     /// Stored in process-level data so the VMA and backing memory have the same lifetime.
     pub dynamic_tls_blocks: alloc::collections::BTreeMap<(Tid, u64), PageAlloc>,
-    // Dynamically loaded shared libraries (indexed by dlopen handle)
+    /// Dynamically loaded shared libraries (indexed by dlopen handle).
     pub loaded_libs: Vec<elf::LoadedLib>,
-    // Anonymous memory mappings (mmap)
-    pub mmap_regions: Vec<MmapRegion>,
-    /// 2MB allocations for demand-paged pages. Freed on process exit.
-    pub demand_pages: Vec<PageAlloc>,
     /// RELATIVE relocation index for demand-paged ELF (applied per-page on fault).
     pub reloc_index: Option<Arc<elf::RelocationIndex>>,
     /// Runtime base address for the demand-paged ELF (for relocation computation).
     pub elf_base: UserAddr,
+    /// Executable .eh_frame_hdr vaddr (stated ELF vaddr, before base offset).
+    pub exe_eh_frame_hdr_vaddr: u64,
+    /// Executable .eh_frame_hdr size.
+    pub exe_eh_frame_hdr_size: u64,
+    /// Executable virtual address extent (elf_base + vaddr_max - vaddr_min).
+    pub exe_vaddr_max: u64,
+    /// Paths of dlopen'd libraries (parallel to loaded_libs).
+    pub lib_paths: Vec<String>,
+}
+
+/// Process-level data shared across all threads via `Arc<Lock<ProcessData>>`.
+/// Contains fds, memory mappings, ELF state, accounting — everything that belongs to the process.
+/// Accessed via `with_fd_owner_data`. All threads of a process share the same Arc.
+pub struct ProcessData {
+    pub fds: FdTable,
+    pub cwd: String,
+    /// Inherited environment variables (KEY=VALUE\0KEY2=VALUE2\0...)
+    pub env: Vec<u8>,
+
+    /// ELF loading artifacts and TLS state.
+    pub elf: ElfInfo,
+
+    // Anonymous memory mappings (mmap)
+    pub mmap_regions: Vec<MmapRegion>,
+    /// 2MB allocations for demand-paged pages. Freed on process exit.
+    pub demand_pages: Vec<PageAlloc>,
     /// Ring buffer of recent page faults for crash diagnostics.
     pub fault_trace: PageFaultTrace,
     /// Peak memory usage in bytes (high-water mark)
@@ -309,14 +343,6 @@ pub struct ProcessData {
     pub free_count: u64,
     /// Executable path (for SYS_QUERY_MODULES).
     pub exe_path: String,
-    /// Executable .eh_frame_hdr vaddr (stated ELF vaddr, before base offset).
-    pub exe_eh_frame_hdr_vaddr: u64,
-    /// Executable .eh_frame_hdr size.
-    pub exe_eh_frame_hdr_size: u64,
-    /// Executable virtual address extent (elf_base + vaddr_max - vaddr_min).
-    pub exe_vaddr_max: u64,
-    /// Paths of dlopen'd libraries (parallel to loaded_libs).
-    pub lib_paths: Vec<String>,
 
     // --- Process accounting (Layer 1 diagnostics) ---
     pub spawn_ns: u64,
@@ -542,6 +568,28 @@ impl ProcessTable {
                 self.remove_process(child_pid);
             } else {
                 self.processes.get_mut(&child_pid).unwrap().parent = None;
+            }
+        }
+    }
+
+    /// Zombify a thread or process by Tid. Handles main-thread-vs-child-thread
+    /// logic internally. Idempotent — does nothing if already a zombie.
+    /// For main threads: zombifies the process and handles orphaned children.
+    /// For child threads: zombifies just the thread.
+    pub fn zombify_tid(&mut self, tid: Tid, code: i32) {
+        let Some(pid) = self.pid_of(tid) else { return };
+        let is_main = self.processes.get(&pid).map_or(false, |p| p.main_tid == tid);
+        if is_main {
+            let proc = self.processes.get_mut(&pid).unwrap();
+            if !matches!(proc.state, ProcessState::Zombie(_)) {
+                let cleanup = proc.zombify(code);
+                self.handle_orphans(cleanup);
+            }
+        } else {
+            if let Some(thread) = self.get_thread_mut(tid) {
+                if !matches!(thread.state, ProcessState::Zombie(_)) {
+                    thread.state = ProcessState::Zombie(code);
+                }
             }
         }
     }
@@ -837,8 +885,8 @@ pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64, stack_base: u64) -> Op
     };
     let (tls_template, tls_memsz, tls_modules, tls_total_memsz, tls_max_align) = {
         let data = process_data_arc.lock();
-        (data.tls_template, data.tls_memsz,
-         data.tls_modules.clone(), data.tls_total_memsz, data.tls_max_align)
+        (data.elf.tls_template, data.elf.tls_memsz,
+         data.elf.tls_modules.clone(), data.elf.tls_total_memsz, data.elf.tls_max_align)
     };
 
     // Phase 2: Allocate TLS (outside any lock)
@@ -1602,29 +1650,30 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
         fds,
         cwd,
         env,
-
-        elf_alloc: exe_tls_template, // TLS template allocation (if any)
-        tls_template,
-        tls_memsz,
-        tls_modules,
-        tls_total_memsz,
-        tls_max_align: max_tls_align,
-        next_tls_module_id,
-        dynamic_tls_blocks: alloc::collections::BTreeMap::new(),
-        loaded_libs,
+        elf: ElfInfo {
+            elf_alloc: exe_tls_template, // TLS template allocation (if any)
+            tls_template,
+            tls_memsz,
+            tls_modules,
+            tls_total_memsz,
+            tls_max_align: max_tls_align,
+            next_tls_module_id,
+            dynamic_tls_blocks: alloc::collections::BTreeMap::new(),
+            loaded_libs,
+            reloc_index,
+            elf_base: UserAddr::new(base),
+            exe_eh_frame_hdr_vaddr: layout.eh_frame_hdr.map_or(0, |(v, _)| v),
+            exe_eh_frame_hdr_size: layout.eh_frame_hdr.map_or(0, |(_, s)| s),
+            exe_vaddr_max: base + layout.vaddr_max - layout.vaddr_min,
+            lib_paths,
+        },
         mmap_regions: Vec::new(),
         demand_pages: Vec::new(),
-        reloc_index,
-        elf_base: UserAddr::new(base),
         fault_trace: PageFaultTrace::new(),
         peak_memory: 0,
         alloc_count: 0,
         free_count: 0,
         exe_path: String::from(path),
-        exe_eh_frame_hdr_vaddr: layout.eh_frame_hdr.map_or(0, |(v, _)| v),
-        exe_eh_frame_hdr_size: layout.eh_frame_hdr.map_or(0, |(_, s)| s),
-        exe_vaddr_max: base + layout.vaddr_max - layout.vaddr_min,
-        lib_paths,
         spawn_ns: crate::clock::nanos_since_boot(),
         accounting: ProcessAccounting::default(),
         child_stats: Vec::new(),
@@ -1757,12 +1806,12 @@ fn teardown_resources(
     let mut data = process_data_arc.lock();
     fd::close_all(&mut data.fds, &mut *vfs::lock(), pid);
     scheduler::remove_vruntime(pid);
-    data.elf_alloc.take();
-    data.loaded_libs.clear();
+    data.elf.elf_alloc.take();
+    data.elf.loaded_libs.clear();
     data.mmap_regions.clear();
 
     data.demand_pages.clear();
-    data.reloc_index = None;
+    data.elf.reloc_index = None;
 
     (syscall_total, syscall_total_ns)
 }
@@ -1932,76 +1981,48 @@ pub fn exit(code: i32) -> ! {
     scheduler::exit_current(code);
 }
 
-/// Exit the current thread only. For processes without threads, tears down
-/// the process. For threads, zombifies without freeing the address space.
+/// Exit the current thread. If this is the main thread, tears down the entire
+/// process via `exit()`. For child threads, frees thread resources and zombifies.
 pub fn thread_exit(code: i32) -> ! {
     let process_pid = current_process();
     let tid = current_tid();
     let is_main_thread = {
         let guard = PROCESS_TABLE.lock();
         let table = guard.as_ref().unwrap();
-        let proc = table.get_process(process_pid).unwrap();
-        proc.main_tid == tid
+        table.get_process(process_pid).unwrap().main_tid == tid
     };
-    let addr_space = scheduler::current_address_space();
 
+    if is_main_thread {
+        exit(code);
+    }
+
+    // Thread-only exit path: free TLS, zombify, wake parent
     unsafe { crate::mm::paging::kernel_cr3().activate(); }
 
-    if !is_main_thread {
-        // Thread exit: free TLS (threads share ProcessData, no fd::close_all needed)
-        {
-            let tdata_arc = current_data();
-            let mut tdata = tdata_arc.lock();
-            tdata.tls_pages.take();
-        }
-        // Free this thread's dynamic TLS blocks from the process-level data.
-        {
-            let owner_arc = fd_owner_data();
-            let mut owner_data = owner_arc.lock();
-            owner_data.dynamic_tls_blocks.retain(|&(t, _), _| t != tid);
-        }
-
-        let parent_main_tid = {
-            let mut guard = PROCESS_TABLE.lock();
-            let table = guard.as_mut().unwrap();
-            let cpu_ms = scheduler::thread_cpu_ns(tid) / 1_000_000;
-            table.get_thread_mut(tid).unwrap().state = ProcessState::Zombie(code);
-            let proc = table.get_process(process_pid).unwrap();
-            let name = core::str::from_utf8(&proc.name).unwrap_or("?").trim_end_matches('\0');
-            log!("exit: {name} tid={tid} code={code} cpu={cpu_ms}ms");
-            proc.main_tid
-        };
-
-        // Wake parent's main thread if blocked on thread_join (after releasing table lock)
-        scheduler::wake_tid(parent_main_tid);
-
-        scheduler::exit_current(code);
-    } else {
-        // Process exit — full teardown
-        let parent_pid = {
-            let guard = PROCESS_TABLE.lock();
-            let table = guard.as_ref().unwrap();
-            table.get_process(process_pid).unwrap().parent
-        };
-        let thread_data_arc = current_data();
-        let process_data_arc = fd_owner_data();
-        let addr_space = addr_space.expect("thread_exit: process has no address space");
-        let (syscall_total, syscall_total_ns) = teardown_resources(&process_data_arc, &thread_data_arc, process_pid);
-
-        let to_wake = {
-            let mut guard = PROCESS_TABLE.lock();
-            let table = guard.as_mut().unwrap();
-            teardown_scheduling(table, process_pid, addr_space, code, &process_data_arc)
-        };
-
-        stash_accounting_snapshot(&process_data_arc, process_pid, parent_pid, syscall_total, syscall_total_ns);
-
-        for tid in to_wake {
-            scheduler::wake_tid(tid);
-        }
-
-        scheduler::exit_current(code);
+    {
+        let tdata_arc = current_data();
+        let mut tdata = tdata_arc.lock();
+        tdata.tls_pages.take();
     }
+    {
+        let owner_arc = fd_owner_data();
+        let mut owner_data = owner_arc.lock();
+        owner_data.elf.dynamic_tls_blocks.retain(|&(t, _), _| t != tid);
+    }
+
+    let parent_main_tid = {
+        let mut guard = PROCESS_TABLE.lock();
+        let table = guard.as_mut().unwrap();
+        let cpu_ms = scheduler::thread_cpu_ns(tid) / 1_000_000;
+        table.get_thread_mut(tid).unwrap().state = ProcessState::Zombie(code);
+        let proc = table.get_process(process_pid).unwrap();
+        let name = core::str::from_utf8(&proc.name).unwrap_or("?").trim_end_matches('\0');
+        log!("exit: {name} tid={tid} code={code} cpu={cpu_ms}ms");
+        proc.main_tid
+    };
+
+    scheduler::wake_tid(parent_main_tid);
+    scheduler::exit_current(code);
 }
 
 // ---------------------------------------------------------------------------
@@ -2186,8 +2207,8 @@ pub fn handle_page_fault(fault_addr: u64, _error_code: u64) -> bool {
 
     let mut data = data_arc.lock();
 
-    let reloc_index = data.reloc_index.clone();
-    let elf_base = data.elf_base.raw();
+    let reloc_index = data.elf.reloc_index.clone();
+    let elf_base = data.elf.elf_base.raw();
 
     // Allocate a zeroed 2MB physical page
     let page_alloc = match PageAlloc::new(page_2m as usize, crate::mm::pmm::Category::DemandPage) {
@@ -2505,11 +2526,11 @@ pub fn kill_process(target_pid: Pid) -> u64 {
     {
         let mut pdata = process_data_arc.lock();
         fd::close_all(&mut pdata.fds, &mut *vfs::lock(), target_pid);
-        pdata.elf_alloc.take();
-        pdata.loaded_libs.clear();
+        pdata.elf.elf_alloc.take();
+        pdata.elf.loaded_libs.clear();
         pdata.mmap_regions.clear();
         pdata.demand_pages.clear();
-        pdata.reloc_index = None;
+        pdata.elf.reloc_index = None;
     }
     {
         let mut tdata = thread_data_arc.lock();
