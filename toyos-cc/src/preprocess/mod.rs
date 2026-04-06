@@ -55,6 +55,7 @@ pub struct Preprocessor {
     pub(crate) counter: u32,
     pragma_once_files: HashSet<String>,
     pub suppress_line_markers: bool,
+    pub force_includes: Vec<PathBuf>,
     // Tracks __LINE__ / __FILE__ when explicitly redefined by user source.
     // While in this set, expand_line skips the automatic per-line update.
     user_redefined_builtins: HashSet<String>,
@@ -75,6 +76,7 @@ impl Preprocessor {
             counter: 0,
             pragma_once_files: HashSet::new(),
             suppress_line_markers: false,
+            force_includes: Vec::new(),
             user_redefined_builtins: HashSet::new(),
             in_if_eval: false,
         };
@@ -118,6 +120,10 @@ impl Preprocessor {
 
     pub fn preprocess(&mut self, source: &str, filename: &str) -> String {
         self.output.clear();
+        for path in std::mem::take(&mut self.force_includes) {
+            let directive = format!("#include \"{}\"\n", path.display());
+            self.process_source(&directive, filename, None);
+        }
         self.process_source(source, filename, None);
         std::mem::take(&mut self.output)
     }

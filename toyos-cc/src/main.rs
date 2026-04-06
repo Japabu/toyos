@@ -36,6 +36,7 @@ fn run() {
         defines: args.defines.clone(),
         target: args.target.clone(),
         opt_level: args.opt_level,
+        force_includes: args.force_includes.clone(),
     };
 
     for input in &args.inputs {
@@ -108,6 +109,7 @@ struct Args {
     inputs: Vec<PathBuf>,
     output: Option<PathBuf>,
     include_paths: Vec<PathBuf>,
+    force_includes: Vec<PathBuf>,
     defines: Vec<(String, String)>,
     target: Option<String>,
     compile_only: bool,          // -c
@@ -121,6 +123,7 @@ fn parse_args() -> Args {
     let mut inputs = Vec::new();
     let mut output = None;
     let mut include_paths = Vec::new();
+    let mut force_includes = Vec::new();
     let mut defines = Vec::new();
     let mut target = None;
     let mut compile_only = false;
@@ -139,6 +142,7 @@ fn parse_args() -> Args {
             "--target" => { i += 1; target = Some(argv[i].clone()); }
             "-I" => { i += 1; include_paths.push(PathBuf::from(&argv[i])); }
             s if s.starts_with("-I") => include_paths.push(PathBuf::from(&s[2..])),
+            "-include" => { i += 1; force_includes.push(PathBuf::from(&argv[i])); }
             "-D" => {
                 i += 1;
                 let d = &argv[i];
@@ -181,5 +185,5 @@ fn parse_args() -> Args {
         process::exit(1);
     }
 
-    Args { inputs, output, include_paths, defines, target, compile_only, preprocess_only, suppress_line_markers, opt_level }
+    Args { inputs, output, include_paths, force_includes, defines, target, compile_only, preprocess_only, suppress_line_markers, opt_level }
 }

@@ -35,7 +35,9 @@ fn main() {
         .define("FEATURE_SOUND", None)
         .warnings(false)
         .opt_level(2)
-        .flag(&format!("--target={target}"));
+        .flag(&format!("--target={target}"))
+        .flag("-include")
+        .flag(&root.join("include/doomtype.h").to_string_lossy().into_owned());
 
     let sources = [
         "am_map.c",

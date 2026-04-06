@@ -10,12 +10,12 @@ mod types;
 
 use std::path::{Path, PathBuf};
 
-/// Options for compiling a C source file to an object file.
 pub struct CompileOptions {
     pub include_paths: Vec<PathBuf>,
     pub defines: Vec<(String, String)>,
     pub target: Option<String>,
     pub opt_level: u8,
+    pub force_includes: Vec<PathBuf>,
 }
 
 impl Default for CompileOptions {
@@ -25,20 +25,27 @@ impl Default for CompileOptions {
             defines: Vec::new(),
             target: None,
             opt_level: 0,
+            force_includes: Vec::new(),
         }
     }
+}
+
+fn make_preprocessor(options: &CompileOptions, suppress_line_markers: bool) -> preprocess::Preprocessor {
+    let mut pp = preprocess::Preprocessor::new(
+        options.include_paths.clone(),
+        options.defines.clone(),
+        options.target.as_deref(),
+    );
+    pp.suppress_line_markers = suppress_line_markers;
+    pp.force_includes = options.force_includes.clone();
+    pp
 }
 
 /// Compile a C source string to object file bytes.
 ///
 /// `filename` is used for error messages and `__FILE__`.
 pub fn compile(source: &str, filename: &str, options: &CompileOptions) -> Vec<u8> {
-    let mut pp = preprocess::Preprocessor::new(
-        options.include_paths.clone(),
-        options.defines.clone(),
-        options.target.as_deref(),
-    );
-    pp.suppress_line_markers = false;
+    let mut pp = make_preprocessor(options, false);
     let preprocessed = pp.preprocess(source, filename);
 
     let lexer = lex::Lexer::new(&preprocessed, filename);
@@ -66,11 +73,6 @@ pub fn preprocess_source(
     options: &CompileOptions,
     suppress_line_markers: bool,
 ) -> String {
-    let mut pp = preprocess::Preprocessor::new(
-        options.include_paths.clone(),
-        options.defines.clone(),
-        options.target.as_deref(),
-    );
-    pp.suppress_line_markers = suppress_line_markers;
+    let mut pp = make_preprocessor(options, suppress_line_markers);
     pp.preprocess(source, filename)
 }
