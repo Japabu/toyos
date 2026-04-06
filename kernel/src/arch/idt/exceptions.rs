@@ -252,9 +252,9 @@ fn crash_report_panic(info: &core::panic::PanicInfo, rbp: u64) {
         log!("  Running: tid={}", tid);
         if let Some(guard) = process::PROCESS_TABLE.try_lock() {
             if let Some(table) = guard.as_ref() {
-                if let Some(entry) = table.get(tid) {
-                    let name = core::str::from_utf8(entry.name()).unwrap_or("?").trim_end_matches('\0');
-                    log!("  Process: {} pid={} state={}", name, entry.process(), entry.state().name());
+                if let Some((proc, _)) = table.get_by_tid(tid) {
+                    let name = core::str::from_utf8(&proc.name).unwrap_or("?").trim_end_matches('\0');
+                    log!("  Process: {} pid={} state={}", name, proc.pid, proc.state.name());
                 }
             }
         }
@@ -301,19 +301,27 @@ pub(crate) fn try_recover_from_panic() -> ! {
         // Try to zombify (non-blocking)
         if let Some(mut guard) = process::PROCESS_TABLE.try_lock() {
             if let Some(table) = guard.as_mut() {
-                // Find parent tid first (immutable borrow)
-                if let Some(entry) = table.get(tid) {
-                    if let process::Kind::Process { parent: Some(parent_pid) } = *entry.kind() {
-                        parent_tid = table.get_process(parent_pid).map(|e| e.tid());
+                if let Some(pid) = table.pid_of(tid) {
+                    // Find parent's main tid for deferred wake
+                    if let Some(proc) = table.get_process(pid) {
+                        if let Some(ppid) = proc.parent {
+                            parent_tid = table.get_process(ppid).map(|p| p.main_tid);
+                        }
                     }
-                }
-                // Now zombify (mutable borrow)
-                if let Some(entry) = table.get_mut(tid) {
-                    match *entry.kind() {
-                        process::Kind::Thread { .. } => entry.zombify_thread(-1),
-                        process::Kind::Process { .. } => {
-                            let c = entry.zombify_process(-1);
-                            table.handle_orphans(c);
+                    // Zombify
+                    let is_main = table.get_process(pid).map_or(false, |p| p.main_tid == tid);
+                    if is_main {
+                        if let Some(proc) = table.get_process_mut(pid) {
+                            if !matches!(proc.state, process::ProcessState::Zombie(_)) {
+                                let c = proc.zombify(-1);
+                                table.handle_orphans(c);
+                            }
+                        }
+                    } else {
+                        if let Some(thread) = table.get_thread_mut(tid) {
+                            if !matches!(thread.state, process::ProcessState::Zombie(_)) {
+                                thread.state = process::ProcessState::Zombie(-1);
+                            }
                         }
                     }
                 }

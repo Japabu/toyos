@@ -64,7 +64,7 @@ pub struct PerCpu {
     pub user_rsp: u64,   // offset 24: syscall entry saves user RSP here
     pub tss: Tss,        // offset 32 (104 bytes)
     current_tid: u32,    // offset 136: TID of thread running on this CPU (u32::MAX = idle)
-    _pad: [u8; 4],      // offset 140: align GDT to 16 bytes
+    current_pid: u32,    // offset 140: PID of process running on this CPU (u32::MAX = idle)
     gdt: [u64; 7],      // offset 144 (56 bytes)
     idle_rsp: u64,       // offset 200: saved RSP for idle context (for context_switch)
     idle_stack_top: u64, // offset 208: top of per-CPU idle stack
@@ -161,6 +161,7 @@ const _: () = assert!(core::mem::offset_of!(PerCpu, kernel_rsp) == 16);
 const _: () = assert!(core::mem::offset_of!(PerCpu, user_rsp) == 24);
 const _: () = assert!(core::mem::offset_of!(PerCpu, tss) == 32);
 const _: () = assert!(core::mem::offset_of!(PerCpu, current_tid) == 136);
+const _: () = assert!(core::mem::offset_of!(PerCpu, current_pid) == 140);
 
 const IDLE_STACK_SIZE: usize = 16384; // 16KB
 const IST1_STACK_SIZE: usize = 4096;  // 4KB — only used by double fault handler
@@ -176,6 +177,7 @@ fn alloc_percpu(cpu_id: u32, lapic_id: u32) -> *mut PerCpu {
     percpu.cpu_id = cpu_id;
     percpu.lapic_id = lapic_id;
     percpu.current_tid = u32::MAX;
+    percpu.current_pid = u32::MAX;
     percpu.tss = Tss::new();
     percpu.gdt = GDT_ENTRIES;
     percpu.init_tss_descriptor();
@@ -276,6 +278,19 @@ pub fn current_tid() -> Option<crate::process::Tid> {
 pub fn set_current_tid(tid: Option<crate::process::Tid>) {
     let raw = tid.map_or(u32::MAX, |t| t.raw());
     unsafe { core::arch::asm!("mov gs:[136], {:e}", in(reg) raw, options(nostack, preserves_flags)); }
+}
+
+/// Read the Pid of the process running on this CPU. None means idle.
+pub fn current_pid() -> Option<crate::process::Pid> {
+    let raw: u32;
+    unsafe { core::arch::asm!("mov {:e}, gs:[140]", out(reg) raw, options(nomem, nostack, preserves_flags)); }
+    if raw == u32::MAX { None } else { Some(crate::process::Pid::from_raw(raw)) }
+}
+
+/// Set the Pid of the process running on this CPU. None sets idle (u32::MAX).
+pub fn set_current_pid(pid: Option<crate::process::Pid>) {
+    let raw = pid.map_or(u32::MAX, |p| p.raw());
+    unsafe { core::arch::asm!("mov gs:[140], {:e}", in(reg) raw, options(nostack, preserves_flags)); }
 }
 
 pub fn percpu_ptr() -> *mut PerCpu {

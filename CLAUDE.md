@@ -115,6 +115,8 @@ system.toml       What to build and boot
 
 - **io_uring as the only blocking I/O mechanism.** Currently the kernel has two parallel notification paths: `scheduler::block(event)` for direct thread blocking and `io_uring::complete_pending_for_event` for ring watchers. Every wake site does both. If all fd-based blocking went through io_uring, blocking syscalls (read, write, accept) become non-blocking try-once-and-return, wake sites become a single io_uring call, and the scheduler drops fd-related `EventSource` variants (only keeps `Futex` and `IoUring`). Per-source watcher lists and io_uring machinery stay the same. Userspace helpers in `toyos-abi` would wrap the ring setup for simple blocking I/O.
 
+- **Capability-based resource model.** Replace global Pid/Tid integers with per-process handles (like Zircon's `zx_handle_t`). Every kernel object — processes, threads, pipes, shared memory, devices — gets referenced via handles that encode both identity and rights. A process can only operate on objects it holds a handle to. This unifies fds, Pids, and Tids into one mechanism, eliminates confused-deputy bugs, and enables fine-grained rights delegation. The per-process fd table is already halfway there. Zircon (Fuchsia) and seL4 are the reference designs.
+
 ## Diagnostics roadmap
 
 Three layers, built in order. Each layer is useful on its own.

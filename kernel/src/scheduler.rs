@@ -629,13 +629,19 @@ pub fn exit_current(code: i32) -> ! {
         let mut guard = process::PROCESS_TABLE.lock();
         let table = guard.as_mut().unwrap();
         let tid = percpu::current_tid().unwrap();
-        if let Some(entry) = table.get_mut(tid) {
-            if !matches!(entry.state(), process::ProcessState::Zombie(_)) {
-                match entry.kind() {
-                    process::Kind::Thread { .. } => entry.zombify_thread(code),
-                    process::Kind::Process { .. } => {
-                        let cleanup = entry.zombify_process(code);
-                        table.handle_orphans(cleanup);
+        let pid = percpu::current_pid().unwrap();
+        if let Some(proc) = table.get_process(pid) {
+            let is_main = proc.main_tid == tid;
+            if is_main {
+                if !matches!(proc.state, process::ProcessState::Zombie(_)) {
+                    let proc = table.get_process_mut(pid).unwrap();
+                    let cleanup = proc.zombify(code);
+                    table.handle_orphans(cleanup);
+                }
+            } else {
+                if let Some(thread) = table.get_thread_mut(tid) {
+                    if !matches!(thread.state, process::ProcessState::Zombie(_)) {
+                        thread.state = process::ProcessState::Zombie(code);
                     }
                 }
             }
@@ -647,6 +653,7 @@ pub fn exit_current(code: i32) -> ! {
 
 pub fn schedule_no_return() -> ! {
     percpu::set_current_tid(None);
+    percpu::set_current_pid(None);
     unsafe { percpu::set_kernel_stack(percpu::idle_stack_top()); }
     unsafe { crate::mm::paging::kernel_cr3().activate(); }
     let sp = percpu::idle_stack_top();
@@ -889,6 +896,7 @@ fn do_schedule(reason: SwitchReason) {
         let new_ks_top = new.kernel_stack_top();
         let new_rsp = new.kernel_rsp;
         let new_tid = new.tid;
+        let new_pid = new.process;
 
         let mut new = new;
         new.start_cpu_timer(now);
@@ -896,6 +904,7 @@ fn do_schedule(reason: SwitchReason) {
 
         let old_rsp_ptr = queue.save_rsp_ptr();
         percpu::set_current_tid(Some(new_tid));
+        percpu::set_current_pid(Some(new_pid));
         unsafe { percpu::set_kernel_stack(new_ks_top); }
         unsafe { new_cr3.activate(); }
         cpu::wrfsbase(new_fs_base);
@@ -911,6 +920,7 @@ fn do_schedule(reason: SwitchReason) {
     IDLE_ENTRIES.fetch_add(1, Ordering::Relaxed);
     let old_rsp_ptr = queue.save_rsp_ptr();
     percpu::set_current_tid(None);
+    percpu::set_current_pid(None);
     unsafe { percpu::set_kernel_stack(percpu::idle_stack_top()); }
     unsafe { crate::mm::paging::kernel_cr3().activate(); }
 
@@ -972,13 +982,19 @@ fn cpu_idle_loop() -> ! {
                 let raw = slot.load(Ordering::Relaxed);
                 if raw == u32::MAX { continue; }
                 let tid = Tid::from_raw(raw);
-                if let Some(entry) = table.get_mut(tid) {
-                    if !matches!(entry.state(), process::ProcessState::Zombie(_)) {
-                        match *entry.kind() {
-                            process::Kind::Thread { .. } => entry.zombify_thread(-1),
-                            process::Kind::Process { .. } => {
-                                let c = entry.zombify_process(-1);
+                if let Some(pid) = table.pid_of(tid) {
+                    let is_main = table.get_process(pid).map_or(false, |p| p.main_tid == tid);
+                    if is_main {
+                        if let Some(proc) = table.get_process_mut(pid) {
+                            if !matches!(proc.state, process::ProcessState::Zombie(_)) {
+                                let c = proc.zombify(-1);
                                 table.handle_orphans(c);
+                            }
+                        }
+                    } else {
+                        if let Some(thread) = table.get_thread_mut(tid) {
+                            if !matches!(thread.state, process::ProcessState::Zombie(_)) {
+                                thread.state = process::ProcessState::Zombie(-1);
                             }
                         }
                     }
@@ -998,12 +1014,14 @@ fn cpu_idle_loop() -> ! {
                 let new_ks_top = new.kernel_stack_top();
                 let new_rsp = new.kernel_rsp;
                 let new_tid = new.tid;
+                let new_pid = new.process;
 
                 let mut new = new;
                 new.start_cpu_timer(crate::clock::nanos_since_boot());
                 queue.set_current(new);
 
                 percpu::set_current_tid(Some(new_tid));
+                percpu::set_current_pid(Some(new_pid));
                 unsafe { percpu::set_kernel_stack(new_ks_top); }
                 unsafe { new_cr3.activate(); }
                 cpu::wrfsbase(new_fs_base);
@@ -1087,8 +1105,8 @@ pub fn dump_blocked() {
         let mut got_name = false;
         if let Some(guard) = crate::process::PROCESS_TABLE.try_lock() {
             if let Some(table) = guard.as_ref() {
-                if let Some(entry) = table.get(*tid) {
-                    name_buf = *entry.name();
+                if let Some((proc, _)) = table.get_by_tid(*tid) {
+                    name_buf = proc.name;
                     got_name = true;
                 }
             }

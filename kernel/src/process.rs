@@ -7,7 +7,6 @@ use core::ptr::NonNull;
 use crate::arch::percpu;
 use crate::mm::PAGE_2M;
 use crate::fd::{self, Descriptor, FdTable};
-use crate::id_map::IdMap;
 use crate::sync::Lock;
 use crate::symbols::SymbolTable;
 use crate::{elf, pipe, scheduler, shared_memory, vfs};
@@ -15,16 +14,6 @@ use crate::{DirectMap, UserAddr};
 
 pub use toyos_abi::{Pid, Tid};
 use toyos_abi::syscall::SyscallError;
-
-impl crate::id_map::IdKey for Tid {
-    const ZERO: Self = Tid(0);
-    const ONE: Self = Tid(1);
-}
-
-impl crate::id_map::IdKey for Pid {
-    const ZERO: Self = Pid(0);
-    const ONE: Self = Pid(1);
-}
 
 /// Page tables shared between a process and all its threads.
 pub type PageTables = Arc<Lock<crate::mm::paging::AddressSpace>>;
@@ -163,26 +152,23 @@ impl UserStack {
     }
 }
 
-/// Where a thread is in the system. Stored in the thread table (SchedEntry).
+/// Where a thread/process is in its lifecycle.
 ///
-/// The thread table tracks alive vs zombie. For alive threads, the scheduler
+/// The process table tracks alive vs zombie. For alive threads, the scheduler
 /// is authoritative about whether they're running, ready, or blocked —
 /// query `scheduler::thread_sched_state()` for that detail.
-///
-/// A thread is ready iff it is in a CpuRunQueue. This is enforced structurally
-/// in the scheduler — there is no way to represent "ready but not in a queue."
 #[derive(Clone, Copy, PartialEq)]
 pub enum ThreadLocation {
-    /// Thread is alive: running, ready, or blocked. The scheduler owns the detail.
+    /// Alive: running, ready, or blocked. The scheduler owns the detail.
     Scheduled,
-    /// Thread has exited with the given code. Waiting for parent to reap.
+    /// Exited with the given code. Waiting to be reaped.
     Zombie(i32),
 }
 
 pub type ProcessState = ThreadLocation;
 
 /// Proof that a process was zombified and its orphaned children must be handled.
-/// Returned by `SchedEntry::zombify_process`, consumed by `ProcessTable::handle_orphans`.
+/// Returned by `ProcessEntry::zombify`, consumed by `ProcessTable::handle_orphans`.
 #[must_use = "orphaned children must be collected after zombifying a process"]
 pub struct OrphanCleanup(Pid);
 
@@ -195,93 +181,35 @@ impl ThreadLocation {
     }
 }
 
-#[derive(Clone, Copy)]
-pub enum Kind {
-    /// A process (may have a parent process for waitpid).
-    Process { parent: Option<Pid> },
-    /// A thread within a process (shares address space with parent).
-    Thread { parent: Pid },
-}
-
 // ---------------------------------------------------------------------------
-// SchedEntry — scheduling metadata under the global PROCESS_TABLE lock
+// ProcessEntry + ThreadEntry — hierarchical process/thread table
 // ---------------------------------------------------------------------------
 
-/// Scheduling metadata protected by the global PROCESS_TABLE lock.
-/// All fields are private — access only through getters and state-machine methods.
-/// This prevents accidental drops of `kernel_stack` (use-after-free) and
-/// invalid state transitions.
-/// Thread table entry — identity and state, protected by PROCESS_TABLE lock.
-/// Context switch data (kernel_rsp, address_space, etc.) lives in ThreadCtx
-/// which is owned by the scheduler.
-pub struct SchedEntry {
-    tid: Tid,
-    process: Pid,
-    state: ProcessState,
-    kind: Kind,
-    name: [u8; 28],
-    memory_size: u64,
-    process_data: Arc<Lock<ProcessData>>,
-    thread_data: Arc<Lock<ThreadData>>,
-    symbols: Arc<Lock<SymbolTable>>,
+/// Per-thread metadata. Tid is the HashMap key in ProcessEntry.threads.
+pub struct ThreadEntry {
+    pub state: ThreadLocation,
+    pub thread_data: Arc<Lock<ThreadData>>,
 }
 
-impl SchedEntry {
-    fn new(
-        tid: Tid,
-        process: Pid,
-        state: ProcessState,
-        kind: Kind,
-        name: [u8; 28],
-        memory_size: u64,
-        process_data: Arc<Lock<ProcessData>>,
-        thread_data: Arc<Lock<ThreadData>>,
-        symbols: Arc<Lock<SymbolTable>>,
-    ) -> Self {
-        Self { tid, process, state, kind, name, memory_size, process_data, thread_data, symbols }
-    }
+/// A process and all its threads. Removing a ProcessEntry removes all threads.
+pub struct ProcessEntry {
+    pub pid: Pid,
+    pub parent: Option<Pid>,
+    pub state: ProcessState,
+    pub name: [u8; 28],
+    pub process_data: Arc<Lock<ProcessData>>,
+    pub symbols: Arc<Lock<SymbolTable>>,
+    pub main_tid: Tid,
+    pub threads: hashbrown::HashMap<Tid, ThreadEntry>,
+}
 
-    pub fn tid(&self) -> Tid { self.tid }
-    pub fn process(&self) -> Pid { self.process }
-    pub fn state(&self) -> &ProcessState { &self.state }
-    pub fn kind(&self) -> &Kind { &self.kind }
-    pub fn name(&self) -> &[u8; 28] { &self.name }
-    pub fn memory_size(&self) -> u64 { self.memory_size }
-    pub fn process_data(&self) -> &Arc<Lock<ProcessData>> { &self.process_data }
-    pub fn thread_data(&self) -> &Arc<Lock<ThreadData>> { &self.thread_data }
-    pub fn symbols(&self) -> &Arc<Lock<SymbolTable>> { &self.symbols }
-
-    /// CPU time in nanoseconds, retrieved from the scheduler's ThreadCtx.
-    pub fn cpu_ns(&self) -> u64 {
-        scheduler::thread_cpu_ns(self.tid)
-    }
-
-    // --- State machine ---
-
-    /// Zombify a thread. Panics if called on a process or already a zombie.
-    pub fn zombify_thread(&mut self, code: i32) {
-        assert!(matches!(self.kind, Kind::Thread { .. }),
-            "zombify_thread: tid={} is not a thread", self.tid);
+impl ProcessEntry {
+    /// Zombify this process. Returns an `OrphanCleanup` token that must be consumed.
+    pub fn zombify(&mut self, code: i32) -> OrphanCleanup {
         assert!(!matches!(self.state, ProcessState::Zombie(_)),
-            "double zombify tid={}", self.tid);
+            "double zombify pid={}", self.pid);
         self.state = ProcessState::Zombie(code);
-    }
-
-    /// Zombify a process. Returns an `OrphanCleanup` token that must be consumed
-    /// by `ProcessTable::handle_orphans` to collect orphaned children.
-    pub fn zombify_process(&mut self, code: i32) -> OrphanCleanup {
-        assert!(matches!(self.kind, Kind::Process { .. }),
-            "zombify_process: tid={} is not a process", self.tid);
-        assert!(!matches!(self.state, ProcessState::Zombie(_)),
-            "double zombify tid={}", self.tid);
-        self.state = ProcessState::Zombie(code);
-        OrphanCleanup(self.process)
-    }
-
-    pub fn detach_from_parent(&mut self) {
-        assert!(matches!(self.kind, Kind::Process { parent: Some(_) }),
-            "detach_from_parent: tid={} is not a parented process", self.tid);
-        self.kind = Kind::Process { parent: None };
+        OrphanCleanup(self.pid)
     }
 }
 
@@ -445,7 +373,7 @@ pub struct MmapRegion {
 /// Zero-sized proof that we are on the per-CPU idle stack.
 /// Required by `ProcessTable::collect_orphan_zombies` to prevent calling it
 /// from a process's kernel stack (which would be use-after-free if we drop
-/// the SchedEntry we're running on).
+/// the thread entry we're running on).
 #[derive(Clone, Copy)]
 pub struct IdleProof(());
 
@@ -462,134 +390,170 @@ impl IdleProof {
 // ---------------------------------------------------------------------------
 
 pub struct ProcessTable {
-    procs: IdMap<Tid, SchedEntry>,
+    processes: hashbrown::HashMap<Pid, ProcessEntry>,
+    tid_to_pid: hashbrown::HashMap<Tid, Pid>,
     next_pid: Pid,
+    next_tid: Tid,
 }
 
 impl ProcessTable {
     fn new() -> Self {
-        Self { procs: IdMap::new(), next_pid: Pid(0) }
+        Self {
+            processes: hashbrown::HashMap::new(),
+            tid_to_pid: hashbrown::HashMap::new(),
+            next_pid: Pid(0),
+            next_tid: Tid(0),
+        }
     }
 
-    /// Allocate a new Pid for a process.
     pub fn alloc_pid(&mut self) -> Pid {
         let pid = self.next_pid;
         self.next_pid = Pid(pid.0 + 1);
         pid
     }
 
-    // --- Passthrough accessors ---
-
-    pub fn insert_with(&mut self, f: impl FnOnce(Tid) -> SchedEntry) -> Tid {
-        self.procs.insert_with(f)
+    pub fn alloc_tid(&mut self) -> Tid {
+        let tid = self.next_tid;
+        self.next_tid = Tid(tid.0 + 1);
+        tid
     }
 
-    pub fn get(&self, tid: Tid) -> Option<&SchedEntry> {
-        self.procs.get(tid)
+    // --- Lookup by Tid (O(1) via reverse index) ---
+
+    pub fn pid_of(&self, tid: Tid) -> Option<Pid> {
+        self.tid_to_pid.get(&tid).copied()
     }
 
-    pub fn get_mut(&mut self, tid: Tid) -> Option<&mut SchedEntry> {
-        self.procs.get_mut(tid)
+    /// Get (process, thread) by Tid.
+    pub fn get_by_tid(&self, tid: Tid) -> Option<(&ProcessEntry, &ThreadEntry)> {
+        let pid = self.tid_to_pid.get(&tid)?;
+        let proc = self.processes.get(pid)?;
+        let thread = proc.threads.get(&tid)?;
+        Some((proc, thread))
     }
 
-    /// Get the main thread entry for a process Pid.
-    pub fn get_process(&self, process: Pid) -> Option<&SchedEntry> {
-        self.find_main_thread(process).and_then(|tid| self.procs.get(tid))
+    pub fn get_thread(&self, tid: Tid) -> Option<&ThreadEntry> {
+        let pid = self.tid_to_pid.get(&tid)?;
+        self.processes.get(pid)?.threads.get(&tid)
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = (Tid, &SchedEntry)> {
-        self.procs.iter()
+    pub fn get_thread_mut(&mut self, tid: Tid) -> Option<&mut ThreadEntry> {
+        let pid = *self.tid_to_pid.get(&tid)?;
+        self.processes.get_mut(&pid)?.threads.get_mut(&tid)
     }
 
-    /// Find the main thread Tid for a given process Pid.
-    pub fn find_main_thread(&self, process: Pid) -> Option<Tid> {
-        self.procs.iter()
-            .find(|(_, e)| e.process == process && matches!(e.kind, Kind::Process { .. }))
-            .map(|(tid, _)| tid)
+    // --- Lookup by Pid (O(1)) ---
+
+    pub fn get_process(&self, pid: Pid) -> Option<&ProcessEntry> {
+        self.processes.get(&pid)
     }
 
-    // --- Safe removal methods (each validates preconditions) ---
+    pub fn get_process_mut(&mut self, pid: Pid) -> Option<&mut ProcessEntry> {
+        self.processes.get_mut(&pid)
+    }
 
-    /// Waitpid: collect a zombie child process by Pid. Validates parent relationship.
+    // --- Insertion ---
+
+    pub fn insert_process(&mut self, entry: ProcessEntry) {
+        let pid = entry.pid;
+        for &tid in entry.threads.keys() {
+            self.tid_to_pid.insert(tid, pid);
+        }
+        self.processes.insert(pid, entry);
+    }
+
+    pub fn insert_thread(&mut self, pid: Pid, tid: Tid, thread: ThreadEntry) {
+        self.tid_to_pid.insert(tid, pid);
+        self.processes.get_mut(&pid)
+            .expect("insert_thread: process not found")
+            .threads.insert(tid, thread);
+    }
+
+    // --- Removal ---
+
+    /// Remove an entire process and all its threads atomically.
+    pub fn remove_process(&mut self, pid: Pid) -> Option<ProcessEntry> {
+        let proc = self.processes.remove(&pid)?;
+        for &tid in proc.threads.keys() {
+            self.tid_to_pid.remove(&tid);
+        }
+        Some(proc)
+    }
+
+    /// Remove a single thread from its process.
+    pub fn remove_thread(&mut self, tid: Tid) -> Option<ThreadEntry> {
+        let pid = *self.tid_to_pid.get(&tid)?;
+        self.tid_to_pid.remove(&tid);
+        self.processes.get_mut(&pid)?.threads.remove(&tid)
+    }
+
+    // --- Iteration ---
+
+    pub fn iter_processes(&self) -> impl Iterator<Item = &ProcessEntry> {
+        self.processes.values()
+    }
+
+    /// Iterate all (process, tid, thread) tuples — for sysinfo.
+    pub fn iter_all(&self) -> impl Iterator<Item = (&ProcessEntry, Tid, &ThreadEntry)> {
+        self.processes.values().flat_map(|proc| {
+            proc.threads.iter().map(move |(&tid, thread)| (proc, tid, thread))
+        })
+    }
+
+    // --- Zombie collection ---
+
+    /// Waitpid: collect a zombie child process. Removes process and ALL its threads.
     pub fn collect_child_zombie(&mut self, child_pid: Pid, parent_pid: Pid) -> Result<Option<i32>, ()> {
-        let tid = self.find_main_thread(child_pid).ok_or(())?;
-        let entry = self.procs.get(tid).unwrap();
-        if !matches!(entry.kind, Kind::Process { parent: Some(ppid) } if ppid == parent_pid) {
-            return Err(());
-        }
-        if let ProcessState::Zombie(code) = entry.state {
-            self.procs.remove(tid);
+        let proc = self.processes.get(&child_pid).ok_or(())?;
+        if proc.parent != Some(parent_pid) { return Err(()); }
+        if let ProcessState::Zombie(code) = proc.state {
+            self.remove_process(child_pid);
             Ok(Some(code))
         } else {
             Ok(None)
         }
     }
 
-    /// Thread join: collect a zombie thread. Validates parent relationship.
+    /// Thread join: collect a zombie thread.
     pub fn collect_thread_zombie(&mut self, tid: Tid, parent_pid: Pid) -> Result<Option<i32>, ()> {
-        let entry = self.procs.get(tid).ok_or(())?;
-        if !matches!(entry.kind, Kind::Thread { parent } if parent == parent_pid) {
-            return Err(());
-        }
-        if let ProcessState::Zombie(code) = entry.state {
-            self.procs.remove(tid);
+        let pid = *self.tid_to_pid.get(&tid).ok_or(())?;
+        if pid != parent_pid { return Err(()); }
+        let proc = self.processes.get(&pid).ok_or(())?;
+        let thread = proc.threads.get(&tid).ok_or(())?;
+        if let ThreadLocation::Zombie(code) = thread.state {
+            self.remove_thread(tid);
             Ok(Some(code))
         } else {
             Ok(None)
         }
     }
 
-    /// Remove a zombie orphan child during parent teardown.
-    fn remove_orphan_zombie_child(&mut self, child_tid: Tid) {
-        let entry = self.procs.get(child_tid).expect("remove_orphan_zombie_child: child not found");
-        assert!(matches!(entry.state, ProcessState::Zombie(_)),
-            "remove_orphan_zombie_child: tid={} is not a zombie (state={})", child_tid, entry.state.name());
-        self.procs.remove(child_tid);
-    }
-
-    /// Handle orphaned children of a just-zombified process.
+    /// Handle orphaned child processes of a just-zombified process.
     /// Consumes the `OrphanCleanup` token, ensuring this step is never skipped.
     /// Zombie children are removed; running children are detached (become orphans).
     pub fn handle_orphans(&mut self, cleanup: OrphanCleanup) {
         let pid = cleanup.0;
-        let orphan_tids: Vec<Tid> = self.procs.iter()
-            .filter(|(_, e)| matches!(e.kind(), Kind::Process { parent: Some(ppid) } if *ppid == pid))
-            .map(|(tid, _)| tid)
+        let orphan_pids: Vec<Pid> = self.processes.iter()
+            .filter(|(_, p)| p.parent == Some(pid))
+            .map(|(&pid, _)| pid)
             .collect();
-        for tid in orphan_tids {
-            if matches!(self.get(tid).unwrap().state(), ProcessState::Zombie(_)) {
-                self.remove_orphan_zombie_child(tid);
+        for child_pid in orphan_pids {
+            if matches!(self.processes[&child_pid].state, ProcessState::Zombie(_)) {
+                self.remove_process(child_pid);
             } else {
-                self.get_mut(tid).unwrap().detach_from_parent();
+                self.processes.get_mut(&child_pid).unwrap().parent = None;
             }
         }
     }
 
-    /// Sweep all reclaimable zombies. Requires `IdleProof` — only callable from
-    /// the idle loop, which runs on the per-CPU idle stack (safe to drop kernel stacks).
+    /// Sweep orphan zombie processes. Single pass — threads are structurally owned.
     pub fn collect_orphan_zombies(&mut self, _proof: IdleProof) {
-        // First pass: find zombie process pids (for thread collection)
-        let zombie_pids: Vec<Pid> = self.procs.iter()
-            .filter(|(_, e)| matches!(e.state, ProcessState::Zombie(_)) && matches!(e.kind, Kind::Process { .. }))
-            .map(|(_, e)| e.process)
+        let orphans: Vec<Pid> = self.processes.iter()
+            .filter(|(_, p)| p.parent.is_none() && matches!(p.state, ProcessState::Zombie(_)))
+            .map(|(&pid, _)| pid)
             .collect();
-
-        // Second pass: collect reclaimable zombies
-        let orphans: Vec<Tid> = self.procs.iter()
-            .filter(|(_, e)| {
-                if !matches!(e.state, ProcessState::Zombie(_)) {
-                    return false;
-                }
-                match e.kind {
-                    Kind::Process { parent: None } => true,
-                    Kind::Thread { parent } => zombie_pids.contains(&parent),
-                    _ => false,
-                }
-            })
-            .map(|(tid, _)| tid)
-            .collect();
-        for tid in orphans {
-            self.procs.remove(tid);
+        for pid in orphans {
+            self.remove_process(pid);
         }
     }
 }
@@ -605,18 +569,7 @@ pub fn current_tid() -> Tid {
 }
 
 pub fn current_process() -> Pid {
-    with_current_sched(|s| s.process())
-}
-
-// ---------------------------------------------------------------------------
-// Access patterns — SchedEntry (brief table lock)
-// ---------------------------------------------------------------------------
-
-/// Access the current process's SchedEntry immutably (table lock held for closure).
-pub fn with_current_sched<R>(f: impl FnOnce(&SchedEntry) -> R) -> R {
-    let guard = PROCESS_TABLE.lock();
-    let table = guard.as_ref().unwrap();
-    f(table.get(current_tid()).unwrap())
+    percpu::current_pid().expect("current_process() called during idle (no thread running)")
 }
 
 pub fn current_address_space() -> PageTables {
@@ -632,8 +585,8 @@ pub fn current_address_space() -> PageTables {
 pub fn current_data() -> Arc<Lock<ThreadData>> {
     let guard = PROCESS_TABLE.lock();
     let table = guard.as_ref().unwrap();
-    match table.get(current_tid()) {
-        Some(entry) => Arc::clone(entry.thread_data()),
+    match table.get_thread(current_tid()) {
+        Some(thread) => Arc::clone(&thread.thread_data),
         None => {
             drop(guard);
             scheduler::exit_current(-1);
@@ -646,8 +599,8 @@ pub fn current_data() -> Arc<Lock<ThreadData>> {
 pub fn fd_owner_data() -> Arc<Lock<ProcessData>> {
     let guard = PROCESS_TABLE.lock();
     let table = guard.as_ref().unwrap();
-    match table.get(current_tid()) {
-        Some(entry) => Arc::clone(entry.process_data()),
+    match table.get_by_tid(current_tid()) {
+        Some((proc, _)) => Arc::clone(&proc.process_data),
         None => {
             drop(guard);
             scheduler::exit_current(-1);
@@ -874,12 +827,13 @@ extern "C" fn thread_start() {
 /// Spawn a thread within the current process.
 pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64, stack_base: u64) -> Option<Tid> {
     // Phase 1: Get parent's data + address space (never held simultaneously)
-    let (parent_addr_space, parent_process, process_data_arc) = {
+    let parent_process = current_process();
+    let (parent_addr_space, process_data_arc) = {
         let guard = PROCESS_TABLE.lock();
         let table = guard.as_ref().unwrap();
-        let parent = table.get(current_tid()).unwrap();
+        let (proc, _) = table.get_by_tid(current_tid()).unwrap();
         let addr_space = scheduler::current_address_space();
-        (addr_space, parent.process(), Arc::clone(parent.process_data()))
+        (addr_space, Arc::clone(&proc.process_data))
     };
     let (tls_template, tls_memsz, tls_modules, tls_total_memsz, tls_max_align) = {
         let data = process_data_arc.lock();
@@ -944,11 +898,10 @@ pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64, stack_base: u64) -> Op
 
     let mut guard = PROCESS_TABLE.lock();
     let table = guard.as_mut().unwrap();
-    let tid = table.insert_with(|tid| {
-        SchedEntry::new(
-            tid, parent_process, ThreadLocation::Scheduled, Kind::Thread { parent: parent_process },
-            [0; 28], 0, Arc::clone(&process_data_arc), thread_data, Arc::new(Lock::new(SymbolTable::empty())),
-        )
+    let tid = table.alloc_tid();
+    table.insert_thread(parent_process, tid, ThreadEntry {
+        state: ThreadLocation::Scheduled,
+        thread_data,
     });
     drop(guard);
 
@@ -1637,15 +1590,13 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
             let arc = {
                 let guard = PROCESS_TABLE.lock();
                 let table = guard.as_ref().unwrap();
-                Arc::clone(table.get_process(ppid).unwrap().process_data())
+                Arc::clone(&table.get_process(ppid).unwrap().process_data)
             };
             let cwd = arc.lock().cwd.clone();
             cwd
         }
         None => String::from("/"),
     };
-
-    let memory_size = USER_STACK_SIZE as u64;
 
     let proc_data = Arc::new(Lock::new(ProcessData {
         fds,
@@ -1692,12 +1643,22 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
     let mut guard = PROCESS_TABLE.lock();
     let table = guard.as_mut().unwrap();
     let pid = table.alloc_pid();
+    let tid = table.alloc_tid();
 
-    let tid = table.insert_with(|tid| {
-        SchedEntry::new(
-            tid, pid, ThreadLocation::Scheduled, Kind::Process { parent },
-            make_name(path), memory_size, proc_data, thread_data, Arc::new(Lock::new(syms)),
-        )
+    let mut threads = hashbrown::HashMap::new();
+    threads.insert(tid, ThreadEntry {
+        state: ThreadLocation::Scheduled,
+        thread_data,
+    });
+    table.insert_process(ProcessEntry {
+        pid,
+        parent,
+        state: ThreadLocation::Scheduled,
+        name: make_name(path),
+        process_data: proc_data,
+        symbols: Arc::new(Lock::new(syms)),
+        main_tid: tid,
+        threads,
     });
     drop(guard);
 
@@ -1814,21 +1775,22 @@ fn teardown_resources(
 /// on thread_join). The caller must wake them AFTER releasing the table lock.
 fn teardown_scheduling(table: &mut ProcessTable, process_pid: Pid, _addr_space: PageTables, code: i32,
                        process_data_arc: &Arc<Lock<ProcessData>>) -> Vec<Tid> {
-    let main_tid = table.find_main_thread(process_pid)
-        .expect("teardown_scheduling: main thread not found");
+    let proc = table.get_process(process_pid)
+        .expect("teardown_scheduling: process not found");
+    let main_tid = proc.main_tid;
     let mut to_wake = Vec::new();
 
     // Kill all child threads and remove their ThreadCtx from the scheduler
-    let child_tids: Vec<Tid> = table.iter()
-        .filter(|(tid, e)| *tid != main_tid && matches!(e.kind(), Kind::Thread { parent } if *parent == process_pid))
-        .map(|(tid, _)| tid)
+    let child_tids: Vec<Tid> = proc.threads.keys()
+        .filter(|&&tid| tid != main_tid)
+        .copied()
         .collect();
     for tid in &child_tids {
-        let child = table.get_mut(*tid).unwrap();
-        if !matches!(child.state(), ProcessState::Zombie(_)) {
-            child.zombify_thread(-1);
+        let thread = table.get_thread_mut(*tid).unwrap();
+        if !matches!(thread.state, ProcessState::Zombie(_)) {
+            thread.state = ProcessState::Zombie(-1);
         }
-        // Remove from scheduler and flush stats (blocked time, runqueue wait, cpu_ns) into process accounting
+        // Remove from scheduler and flush stats into process accounting
         if let Some(ctx) = scheduler::remove_thread(*tid) {
             let mut pdata = process_data_arc.lock();
             ctx.accounting.merge_into(&mut pdata.accounting);
@@ -1837,7 +1799,6 @@ fn teardown_scheduling(table: &mut ProcessTable, process_pid: Pid, _addr_space: 
     }
 
     // Remove the main thread from the scheduler if it's not the current thread.
-    // (If it IS the current thread, exit_current handles it via SwitchReason::Exit.)
     let current = crate::arch::percpu::current_tid().unwrap();
     if main_tid != current {
         scheduler::remove_thread(main_tid);
@@ -1845,22 +1806,20 @@ fn teardown_scheduling(table: &mut ProcessTable, process_pid: Pid, _addr_space: 
 
     shared_memory::cleanup_process(process_pid);
 
-    let entry = table.get_mut(main_tid).unwrap();
-    let cpu_ms = entry.cpu_ns() / 1_000_000;
-    let has_parent = matches!(entry.kind(), Kind::Process { parent: Some(_) });
-    let orphan_cleanup = entry.zombify_process(code);
-    let name = core::str::from_utf8(entry.name()).unwrap_or("?").trim_end_matches('\0');
+    let proc = table.get_process(process_pid).unwrap();
+    let cpu_ms = scheduler::thread_cpu_ns(main_tid) / 1_000_000;
+    let parent_pid = proc.parent;
+    let name = core::str::from_utf8(&proc.name).unwrap_or("?").trim_end_matches('\0');
     log!("exit: {name} pid={process_pid} code={code} cpu={cpu_ms}ms");
 
+    let proc = table.get_process_mut(process_pid).unwrap();
+    let orphan_cleanup = proc.zombify(code);
     table.handle_orphans(orphan_cleanup);
 
     // Identify parent to wake for waitpid
-    if has_parent {
-        if let Kind::Process { parent: Some(ppid) } = table.get(main_tid).unwrap().kind() {
-            let ppid = *ppid;
-            if let Some(parent_entry) = table.get_process(ppid) {
-                to_wake.push(parent_entry.tid());
-            }
+    if let Some(ppid) = parent_pid {
+        if let Some(parent_proc) = table.get_process(ppid) {
+            to_wake.push(parent_proc.main_tid);
         }
     }
 
@@ -1911,7 +1870,7 @@ fn stash_accounting_snapshot(
     let parent_arc = {
         let guard = PROCESS_TABLE.lock();
         guard.as_ref().and_then(|t| t.get_process(ppid))
-            .map(|e| Arc::clone(e.process_data()))
+            .map(|p| Arc::clone(&p.process_data))
     };
     if let Some(parent_arc) = parent_arc {
         let mut pdata = parent_arc.lock();
@@ -1923,27 +1882,23 @@ fn stash_accounting_snapshot(
 }
 
 pub fn exit(code: i32) -> ! {
-    // Phase 1: Determine process pid, data Arc, address space, and parent pid
-    let (process_pid, process_data_arc, thread_data_arc, addr_space, parent_pid) = {
+    // Phase 1: Determine process pid, data Arcs, address space, and parent pid
+    let process_pid = current_process();
+    let (process_data_arc, thread_data_arc, addr_space, parent_pid) = {
         let guard = PROCESS_TABLE.lock();
         let table = guard.as_ref().unwrap();
         let tid = current_tid();
-        let Some(entry) = table.get(tid) else {
+        let Some((proc, thread)) = table.get_by_tid(tid) else {
             drop(guard);
             unsafe { crate::mm::paging::kernel_cr3().activate(); }
             scheduler::exit_current(code);
         };
-        let process_pid = entry.process();
-        let pdata = Arc::clone(table.get_process(process_pid).unwrap().process_data());
-        let tdata = Arc::clone(entry.thread_data());
+        let pdata = Arc::clone(&proc.process_data);
+        let tdata = Arc::clone(&thread.thread_data);
         let addr_space = scheduler::current_address_space()
             .expect("exit: no address space");
-        let main_entry = table.get_process(process_pid).unwrap();
-        let parent_pid = match main_entry.kind() {
-            Kind::Process { parent } => *parent,
-            _ => None,
-        };
-        (process_pid, pdata, tdata, addr_space, parent_pid)
+        let parent_pid = proc.parent;
+        (pdata, tdata, addr_space, parent_pid)
     };
 
     // Phase 2: Switch to kernel CR3 and clean up resources
@@ -1955,10 +1910,11 @@ pub fn exit(code: i32) -> ! {
         let mut guard = PROCESS_TABLE.lock();
         let table = guard.as_mut().unwrap();
         let tid = current_tid();
+        let proc = table.get_process(process_pid).unwrap();
 
-        // If we're a thread, zombie ourselves first
-        if let Kind::Thread { .. } = table.get(tid).unwrap().kind() {
-            table.get_mut(tid).unwrap().zombify_thread(code);
+        // If we're a thread (not the main thread), zombie ourselves first
+        if proc.main_tid != tid {
+            table.get_thread_mut(tid).unwrap().state = ProcessState::Zombie(code);
         }
 
         teardown_scheduling(table, process_pid, addr_space, code, &process_data_arc)
@@ -1979,72 +1935,72 @@ pub fn exit(code: i32) -> ! {
 /// Exit the current thread only. For processes without threads, tears down
 /// the process. For threads, zombifies without freeing the address space.
 pub fn thread_exit(code: i32) -> ! {
-    let kind = with_current_sched(|s| *s.kind());
+    let process_pid = current_process();
+    let tid = current_tid();
+    let is_main_thread = {
+        let guard = PROCESS_TABLE.lock();
+        let table = guard.as_ref().unwrap();
+        let proc = table.get_process(process_pid).unwrap();
+        proc.main_tid == tid
+    };
     let addr_space = scheduler::current_address_space();
 
     unsafe { crate::mm::paging::kernel_cr3().activate(); }
 
-    match kind {
-        Kind::Thread { parent } => {
-            // Thread exit: free TLS (threads share ProcessData, no fd::close_all needed)
-            {
-                let tdata_arc = current_data();
-                let mut tdata = tdata_arc.lock();
-                // TLS page table entries are cleaned up when the AddressSpace is dropped.
-                // The physical memory is freed when tls_alloc is dropped below.
-                tdata.tls_pages.take();
-            }
-            // Free this thread's dynamic TLS blocks from the process-level data.
-            {
-                let tid = current_tid();
-                let owner_arc = fd_owner_data();
-                let mut owner_data = owner_arc.lock();
-                owner_data.dynamic_tls_blocks.retain(|&(t, _), _| t != tid);
-            }
-
-            let parent_tid = {
-                let mut guard = PROCESS_TABLE.lock();
-                let table = guard.as_mut().unwrap();
-                let tid = current_tid();
-                let cpu_ms = table.get(tid).unwrap().cpu_ns() / 1_000_000;
-                table.get_mut(tid).unwrap().zombify_thread(code);
-                let name = core::str::from_utf8(table.get(tid).unwrap().name()).unwrap_or("?").trim_end_matches('\0');
-                log!("exit: {name} tid={tid} code={code} cpu={cpu_ms}ms");
-
-                // Find parent's main thread Tid for deferred wake
-                table.get_process(parent).map(|e| e.tid())
-            };
-
-            // Wake parent if blocked on thread_join (after releasing table lock)
-            if let Some(ptid) = parent_tid {
-                scheduler::wake_tid(ptid);
-            }
-
-            scheduler::exit_current(code);
+    if !is_main_thread {
+        // Thread exit: free TLS (threads share ProcessData, no fd::close_all needed)
+        {
+            let tdata_arc = current_data();
+            let mut tdata = tdata_arc.lock();
+            tdata.tls_pages.take();
         }
-        Kind::Process { parent, .. } => {
-            // Process exit — full teardown
-            let parent_pid = parent;
-            let process_pid = current_process();
-            let thread_data_arc = current_data();
-            let process_data_arc = fd_owner_data();
-            let addr_space = addr_space.expect("thread_exit: process has no address space");
-            let (syscall_total, syscall_total_ns) = teardown_resources(&process_data_arc, &thread_data_arc, process_pid);
-
-            let to_wake = {
-                let mut guard = PROCESS_TABLE.lock();
-                let table = guard.as_mut().unwrap();
-                teardown_scheduling(table, process_pid, addr_space, code, &process_data_arc)
-            };
-
-            stash_accounting_snapshot(&process_data_arc, process_pid, parent_pid, syscall_total, syscall_total_ns);
-
-            for tid in to_wake {
-                scheduler::wake_tid(tid);
-            }
-
-            scheduler::exit_current(code);
+        // Free this thread's dynamic TLS blocks from the process-level data.
+        {
+            let owner_arc = fd_owner_data();
+            let mut owner_data = owner_arc.lock();
+            owner_data.dynamic_tls_blocks.retain(|&(t, _), _| t != tid);
         }
+
+        let parent_main_tid = {
+            let mut guard = PROCESS_TABLE.lock();
+            let table = guard.as_mut().unwrap();
+            let cpu_ms = scheduler::thread_cpu_ns(tid) / 1_000_000;
+            table.get_thread_mut(tid).unwrap().state = ProcessState::Zombie(code);
+            let proc = table.get_process(process_pid).unwrap();
+            let name = core::str::from_utf8(&proc.name).unwrap_or("?").trim_end_matches('\0');
+            log!("exit: {name} tid={tid} code={code} cpu={cpu_ms}ms");
+            proc.main_tid
+        };
+
+        // Wake parent's main thread if blocked on thread_join (after releasing table lock)
+        scheduler::wake_tid(parent_main_tid);
+
+        scheduler::exit_current(code);
+    } else {
+        // Process exit — full teardown
+        let parent_pid = {
+            let guard = PROCESS_TABLE.lock();
+            let table = guard.as_ref().unwrap();
+            table.get_process(process_pid).unwrap().parent
+        };
+        let thread_data_arc = current_data();
+        let process_data_arc = fd_owner_data();
+        let addr_space = addr_space.expect("thread_exit: process has no address space");
+        let (syscall_total, syscall_total_ns) = teardown_resources(&process_data_arc, &thread_data_arc, process_pid);
+
+        let to_wake = {
+            let mut guard = PROCESS_TABLE.lock();
+            let table = guard.as_mut().unwrap();
+            teardown_scheduling(table, process_pid, addr_space, code, &process_data_arc)
+        };
+
+        stash_accounting_snapshot(&process_data_arc, process_pid, parent_pid, syscall_total, syscall_total_ns);
+
+        for tid in to_wake {
+            scheduler::wake_tid(tid);
+        }
+
+        scheduler::exit_current(code);
     }
 }
 
@@ -2165,8 +2121,8 @@ pub fn handle_page_fault(fault_addr: u64, _error_code: u64) -> bool {
         let Some(addr_space) = scheduler::current_address_space() else { return false };
         let guard = PROCESS_TABLE.lock();
         let Some(table) = guard.as_ref() else { return false };
-        let Some(entry) = table.get(tid) else { return false };
-        let data = Arc::clone(entry.process_data());
+        let Some((proc, _)) = table.get_by_tid(tid) else { return false };
+        let data = Arc::clone(&proc.process_data);
         (data, addr_space)
     };
 
@@ -2349,8 +2305,8 @@ pub fn dump_crash_diagnostics(fault_addr: u64, rip: u64) {
             return;
         };
         let Some(table) = guard.as_ref() else { return };
-        match table.get(tid) {
-            Some(entry) => Arc::clone(entry.process_data()),
+        match table.get_by_tid(tid) {
+            Some((proc, _)) => Arc::clone(&proc.process_data),
             None => return,
         }
     };
@@ -2448,8 +2404,8 @@ pub fn resolve_user_symbol(tid: Tid, addr: u64) -> bool {
     let syms_arc = {
         let Some(guard) = PROCESS_TABLE.try_lock() else { return false };
         let Some(table) = guard.as_ref() else { return false };
-        match table.get(tid) {
-            Some(entry) => Arc::clone(entry.symbols()),
+        match table.get_by_tid(tid) {
+            Some((proc, _)) => Arc::clone(&proc.symbols),
             None => return false,
         }
     };
@@ -2531,17 +2487,18 @@ pub fn kill_process(target_pid: Pid) -> u64 {
         let guard = PROCESS_TABLE.lock();
         let table = guard.as_ref().unwrap();
 
-        let Some(entry) = table.get_process(target_pid) else { return SyscallError::NotFound.to_u64() };
-        if !matches!(entry.kind(), Kind::Process { parent: Some(ppid) } if *ppid == caller) {
+        let Some(proc) = table.get_process(target_pid) else { return SyscallError::NotFound.to_u64() };
+        if proc.parent != Some(caller) {
             return SyscallError::PermissionDenied.to_u64();
         }
-        if scheduler::thread_sched_state(entry.tid()) == 0 {
+        if scheduler::thread_sched_state(proc.main_tid) == 0 {
             return SyscallError::WouldBlock.to_u64(); // currently running on a CPU
         }
-        if matches!(entry.state(), ProcessState::Zombie(_)) {
+        if matches!(proc.state, ProcessState::Zombie(_)) {
             return 0;
         }
-        (Arc::clone(entry.process_data()), Arc::clone(entry.thread_data()))
+        let main_thread = proc.threads.get(&proc.main_tid).unwrap();
+        (Arc::clone(&proc.process_data), Arc::clone(&main_thread.thread_data))
     };
 
     // Phase 2: Resource cleanup (lock sequentially, never hold both)
@@ -2560,26 +2517,25 @@ pub fn kill_process(target_pid: Pid) -> u64 {
         tdata.stack_pages.take();
     }
 
-    // Phase 3: Scheduling teardown (table lock)
     // Phase 3: Scheduling teardown (table lock, then release for wakes)
-    let caller_tid = {
+    let caller_main_tid = {
         let mut guard = PROCESS_TABLE.lock();
         let table = guard.as_mut().unwrap();
 
         // Re-check the target is still there and not zombie
-        let Some(main_tid) = table.find_main_thread(target_pid) else { return 0 };
-        let Some(entry) = table.get(main_tid) else { return 0 };
-        if matches!(entry.state(), ProcessState::Zombie(_)) { return 0; }
+        let Some(proc) = table.get_process(target_pid) else { return 0 };
+        if matches!(proc.state, ProcessState::Zombie(_)) { return 0; }
+        let main_tid = proc.main_tid;
 
         // Kill child threads and remove from scheduler
-        let child_tids: Vec<Tid> = table.iter()
-            .filter(|(tid, e)| *tid != main_tid && matches!(e.kind(), Kind::Thread { parent } if *parent == target_pid))
-            .map(|(tid, _)| tid)
+        let child_tids: Vec<Tid> = proc.threads.keys()
+            .filter(|&&tid| tid != main_tid)
+            .copied()
             .collect();
         for tid in &child_tids {
-            let child = table.get_mut(*tid).unwrap();
-            if !matches!(child.state(), ProcessState::Zombie(_)) {
-                child.zombify_thread(-1);
+            let thread = table.get_thread_mut(*tid).unwrap();
+            if !matches!(thread.state, ProcessState::Zombie(_)) {
+                thread.state = ProcessState::Zombie(-1);
             }
             scheduler::remove_thread(*tid);
         }
@@ -2591,20 +2547,18 @@ pub fn kill_process(target_pid: Pid) -> u64 {
             }
         }
 
-        let entry = table.get_mut(main_tid).unwrap();
-        let orphan_cleanup = entry.zombify_process(137); // 128 + 9 (SIGKILL-like)
-        let name = core::str::from_utf8(entry.name()).unwrap_or("?").trim_end_matches('\0');
+        let proc = table.get_process_mut(target_pid).unwrap();
+        let name = core::str::from_utf8(&proc.name).unwrap_or("?").trim_end_matches('\0');
         log!("kill: {name} pid={target_pid}");
-
+        let orphan_cleanup = proc.zombify(137); // 128 + 9 (SIGKILL-like)
         table.handle_orphans(orphan_cleanup);
 
-        // Collect caller Tid for deferred wake
-        let caller_tid = table.get_process(caller).map(|e| e.tid());
-        caller_tid
+        // Collect caller's main tid for deferred wake
+        table.get_process(caller).map(|p| p.main_tid)
     };
 
     // Wake caller if blocked on waitpid (after releasing table lock)
-    if let Some(ctid) = caller_tid {
+    if let Some(ctid) = caller_main_tid {
         scheduler::wake_tid(ctid);
     }
 

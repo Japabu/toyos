@@ -1003,37 +1003,39 @@ fn sys_sysinfo(buf: &mut [u8]) -> u64 {
     let guard = process::PROCESS_TABLE.lock();
     let table = guard.as_ref().unwrap();
 
-    let process_count = table.iter().count() as u32;
+    // Count all entries (processes + threads)
+    let entry_count: u32 = table.iter_all().count() as u32;
 
     buf[0..8].copy_from_slice(&total_mem.to_le_bytes());
     buf[8..16].copy_from_slice(&used_mem.to_le_bytes());
     buf[16..20].copy_from_slice(&cpu_count.to_le_bytes());
-    buf[20..24].copy_from_slice(&process_count.to_le_bytes());
+    buf[20..24].copy_from_slice(&entry_count.to_le_bytes());
     buf[24..32].copy_from_slice(&uptime.to_le_bytes());
     buf[32..40].copy_from_slice(&total_cpu_ns.to_le_bytes());
     buf[40..48].copy_from_slice(&total_available_ns.to_le_bytes());
 
     let max_entries = (buf.len() - HEADER_SIZE) / ENTRY_SIZE;
-    let mut sorted_tids: Vec<process::Tid> = table.iter().map(|(tid, _)| tid).collect();
-    sorted_tids.sort();
+
+    // Collect and sort by Tid for stable output
+    let mut entries: Vec<(process::Tid, &process::ProcessEntry, &process::ThreadEntry)> =
+        table.iter_all().map(|(proc, tid, thread)| (tid, proc, thread)).collect();
+    entries.sort_by_key(|(tid, _, _)| *tid);
 
     let mut pos = HEADER_SIZE;
-    for (i, &tid) in sorted_tids.iter().enumerate() {
+    for (i, &(tid, proc, thread)) in entries.iter().enumerate() {
         if i >= max_entries {
             break;
         }
-        let Some(entry) = table.get(tid) else { continue };
 
-        let state: u8 = if matches!(entry.state(), process::ProcessState::Zombie(_)) {
+        let state: u8 = if matches!(thread.state, process::ProcessState::Zombie(_)) {
             3
         } else {
             crate::scheduler::thread_sched_state(tid)
         };
-        let (is_thread, parent_pid) = match entry.kind() {
-            process::Kind::Thread { parent } => (1u8, *parent),
-            process::Kind::Process { parent } => (0u8, parent.unwrap_or(process::Pid::MAX)),
-        };
-        let memory = if let Some(data) = entry.process_data().try_lock() {
+        let is_thread: u8 = if tid != proc.main_tid { 1 } else { 0 };
+        let parent_pid = proc.parent.unwrap_or(process::Pid::MAX);
+
+        let memory = if let Some(data) = proc.process_data.try_lock() {
             let demand = data.demand_pages.iter().map(|p| p.size() as u64).sum::<u64>();
             let mmap = data.mmap_regions.iter().map(|r| r._pages.size() as u64).sum::<u64>();
             let tls = data.dynamic_tls_blocks.values().map(|p| p.size() as u64).sum::<u64>();
@@ -1041,14 +1043,12 @@ fn sys_sysinfo(buf: &mut [u8]) -> u64 {
                 crate::elf::LibMemory::Owned(alloc) => alloc.size() as u64,
                 crate::elf::LibMemory::Shared { rw_alloc, .. } => rw_alloc.size() as u64,
             }).sum();
-            let stack = entry.memory_size(); // static stack size
-            demand + mmap + tls + libs + stack
+            demand + mmap + tls + libs
         } else {
-            entry.memory_size()
+            0
         };
-        let cpu_ns = entry.cpu_ns();
-        // Report the process Pid to userland (not the internal Tid)
-        let pid = entry.process();
+        let cpu_ns = crate::scheduler::thread_cpu_ns(tid);
+        let pid = proc.pid;
 
         buf[pos..pos + 4].copy_from_slice(&pid.raw().to_le_bytes());
         buf[pos + 4..pos + 8].copy_from_slice(&parent_pid.raw().to_le_bytes());
@@ -1057,7 +1057,7 @@ fn sys_sysinfo(buf: &mut [u8]) -> u64 {
         buf[pos + 10..pos + 12].copy_from_slice(&[0, 0]);
         buf[pos + 12..pos + 20].copy_from_slice(&memory.to_le_bytes());
         buf[pos + 20..pos + 28].copy_from_slice(&cpu_ns.to_le_bytes());
-        buf[pos + 28..pos + 56].copy_from_slice(entry.name());
+        buf[pos + 28..pos + 56].copy_from_slice(&proc.name);
 
         pos += ENTRY_SIZE;
     }
