@@ -3,11 +3,12 @@
 // The only code that writes page table entries. Manages the kernel direct map
 // (all physical memory at PHYS_OFFSET) and per-process user address spaces.
 
-use core::sync::atomic::{AtomicU16, Ordering};
+use core::sync::atomic::Ordering;
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
+use hashbrown::HashMap;
 
 use super::{UserAddr, PAGE_2M};
 use crate::sync::Lock;
@@ -191,28 +192,23 @@ impl Cr3 {
 // ---------------------------------------------------------------------------
 
 /// Next PCID to allocate. Range 1..4095. PCID 0 is reserved for the kernel.
-static NEXT_PCID: AtomicU16 = AtomicU16::new(1);
+/// Lock ensures flush + shootdown completes atomically with PCID recycling.
+static NEXT_PCID: Lock<u16> = Lock::new(1);
 
 /// Allocate a unique PCID for a new user address space.
 /// On wrap past 4095, flushes all TLBs on all CPUs before recycling.
 fn alloc_pcid() -> u16 {
-    loop {
-        let cur = NEXT_PCID.load(Ordering::Relaxed);
-        if cur >= 1 && cur <= 4095 {
-            match NEXT_PCID.compare_exchange(cur, cur + 1, Ordering::Relaxed, Ordering::Relaxed) {
-                Ok(_) => return cur,
-                Err(_) => continue,
-            }
-        }
-        // Wrapped past 4095 — flush before recycling to prevent stale TLB hits.
-        match NEXT_PCID.compare_exchange(cur, 2, Ordering::Relaxed, Ordering::Relaxed) {
-            Ok(_) => {
-                flush_tlb_all();
-                crate::arch::apic::tlb_shootdown();
-                return 1;
-            }
-            Err(_) => continue,
-        }
+    let mut next = NEXT_PCID.lock();
+    let pcid = *next;
+    if pcid <= 4095 {
+        *next = pcid + 1;
+        pcid
+    } else {
+        // Wrapped — flush all TLBs before recycling PCID space.
+        flush_tlb_all();
+        crate::arch::apic::tlb_shootdown();
+        *next = 2;
+        1
     }
 }
 
@@ -228,8 +224,8 @@ fn alloc_pcid() -> u16 {
 pub struct AddressSpace {
     root: Box<PageTablePage>,
     children: Vec<Box<PageTablePage>>,
-    /// Physical data pages mapped into user space. Freed on drop.
-    pages: Vec<super::pmm::PhysPage>,
+    /// Physical data pages mapped into user space, keyed by physical address. Freed on drop.
+    pages: HashMap<u64, super::pmm::PhysPage>,
     /// All virtual memory regions, keyed by start address.
     regions: BTreeMap<UserAddr, Region>,
     /// PCID for this address space. 0 = kernel, 1..4095 = user.
@@ -259,7 +255,7 @@ impl AddressSpace {
         Self {
             root: pml4,
             children: Vec::new(),
-            pages: Vec::new(),
+            pages: HashMap::new(),
             regions: BTreeMap::new(),
             pcid: alloc_pcid(),
         }
@@ -361,7 +357,7 @@ impl AddressSpace {
             "map_alloc: PDE already present at vaddr {va:#x}"
         );
         pd.set_pde(pd_idx, phys | flags | PAGE_SIZE_BIT, va);
-        self.pages.push(page);
+        self.pages.insert(phys, page);
         dm
     }
 
@@ -381,8 +377,9 @@ impl AddressSpace {
                 if pde & PAGE_PRESENT != 0 {
                     pd.clear_pde(pd_idx, va);
                     let phys = pde & ADDR_MASK_2M;
-                    // Remove the page from our owned list — Drop frees it
-                    self.pages.retain(|p| p.phys() != phys);
+                    // Remove the page from our owned list — Drop frees it.
+                    // No-op for shared memory pages (not in this map).
+                    self.pages.remove(&phys);
                 }
             }
         }
@@ -471,7 +468,7 @@ impl AddressSpace {
     }
 
     /// Allocate a region and map physical memory into it.
-    pub fn alloc_and_map(&mut self, phys: u64, size: u64) -> Option<(UserAddr, u64)> {
+    pub fn alloc_and_map(&mut self, phys: u64, size: u64, writable: bool) -> Option<(UserAddr, u64)> {
         let aligned = align_up_2m(size);
         assert!(
             phys & (PAGE_2M - 1) == 0,
@@ -482,11 +479,11 @@ impl AddressSpace {
             addr,
             Region {
                 size: aligned,
-                writable: true,
+                writable,
                 kind: RegionKind::Mapped,
             },
         );
-        self.map_range(addr, phys, aligned, true);
+        self.map_range(addr, phys, aligned, writable);
         Some((addr, aligned))
     }
 
@@ -604,6 +601,8 @@ impl AddressSpace {
             self.root.set_entry(pml4_idx, child.phys() | pml4_flags);
             self.children.push(child);
         } else {
+            // x86-64: upper-level entries must be at least as permissive as any
+            // leaf entry below them. Widen only (OR), never narrow.
             self.root.or_flags(pml4_idx, pml4_flags & (PAGE_PRESENT | PAGE_WRITE | PAGE_USER));
         }
 
@@ -655,7 +654,7 @@ pub(super) fn init(memory_map: &[MemoryMapEntry]) {
     let mut kernel = AddressSpace {
         root: Box::new(PageTablePage([0; 512])),
         children: Vec::new(),
-        pages: Vec::new(),
+        pages: HashMap::new(),
         regions: BTreeMap::new(),
         pcid: 0, // Kernel always uses PCID 0
     };

@@ -63,7 +63,7 @@ impl SharedRegion {
         if let Some((_, _, vaddr)) = self.mapped_in.iter().find(|(p, _, _)| *p == pid) {
             return Some(*vaddr);
         }
-        let (addr, _) = pt.lock().alloc_and_map(self.phys.phys(), self.size)?;
+        let (addr, _) = pt.lock().alloc_and_map(self.phys.phys(), self.size, true)?;
         self.mapped_in.push((pid, Arc::clone(pt), addr));
         Some(addr)
     }

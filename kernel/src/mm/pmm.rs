@@ -156,6 +156,8 @@ struct Bitmap {
     page_count: usize,
     free_count: usize,
     total_usable: usize,
+    /// Hint for next free page scan — avoids re-scanning already-allocated prefix.
+    next_hint: usize,
 }
 
 impl Bitmap {
@@ -166,6 +168,7 @@ impl Bitmap {
             page_count: 0,
             free_count: 0,
             total_usable: 0,
+            next_hint: 0,
         }
     }
 
@@ -234,10 +237,13 @@ pub(super) fn init(entries: &[MemoryMapEntry], reserved: &[Region]) {
 pub fn alloc_page(cat: Category) -> Option<PhysPage> {
     let mut bm = BITMAP.lock();
     if bm.free_count == 0 { return None; }
-    for idx in 0..bm.page_count {
+    let start = bm.next_hint;
+    for offset in 0..bm.page_count {
+        let idx = (start + offset) % bm.page_count;
         if bm.is_free(idx) {
             bm.set_used(idx);
             bm.free_count -= 1;
+            bm.next_hint = if idx + 1 < bm.page_count { idx + 1 } else { 0 };
             let phys = bm.idx_to_phys(idx);
             drop(bm);
             unsafe {
@@ -297,8 +303,10 @@ pub fn alloc_contiguous(count: usize, cat: Category) -> Option<alloc::vec::Vec<P
 fn free_page(phys: u64) {
     let mut bm = BITMAP.lock();
     let idx = bm.phys_to_idx(phys);
+    assert!(!bm.is_free(idx), "double free of physical page at {:#x}", phys);
     bm.set_free(idx);
     bm.free_count += 1;
+    bm.next_hint = bm.next_hint.min(idx);
 }
 
 /// Return (total_bytes, used_bytes).

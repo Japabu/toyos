@@ -36,7 +36,7 @@ pub fn vma_map(
     phys: u64,
     size: u64,
 ) -> Option<(UserAddr, u64)> {
-    pt.lock().alloc_and_map(phys, size)
+    pt.lock().alloc_and_map(phys, size, true)
 }
 
 // ---------------------------------------------------------------------------
@@ -1473,8 +1473,15 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
     let stack_phys = DirectMap::from_phys(stack_pages.phys());
     let stack_vaddr = UserAddr::new(crate::vma::STACK_BASE);
     let user_stack = UserStack::new(stack_vaddr, stack_phys, USER_STACK_SIZE as u64);
-    child_pt.lock().map_range(stack_vaddr, stack_pages.phys(), USER_STACK_SIZE as u64, true);
-
+    {
+        let mut pt = child_pt.lock();
+        pt.map_range(stack_vaddr, stack_pages.phys(), USER_STACK_SIZE as u64, true);
+        pt.insert_region(stack_vaddr, crate::vma::Region {
+            size: USER_STACK_SIZE as u64,
+            writable: true,
+            kind: crate::vma::RegionKind::Anonymous,
+        });
+    }
 
     // 10. TLS setup — read exe TLS template from page cache, build multi-module layout
     let exe_tls_template = if layout.tls_memsz > 0 {

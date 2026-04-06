@@ -8,6 +8,9 @@ use crate::mm::PAGE_2M;
 // ---------------------------------------------------------------------------
 
 /// Dynamic allocations (mmap, shared memory) grow top-down from this ceiling.
+/// The stack at STACK_BASE is tracked in the regions BTreeMap, so find_gap
+/// avoids it. ALLOC_CEILING equals STACK_BASE because the stack extends upward
+/// to the PIE base — no usable VA space exists above it.
 pub const ALLOC_CEILING: u64 = STACK_BASE;
 
 /// Nothing allocated below this floor (guard against NULL-ish addresses).
