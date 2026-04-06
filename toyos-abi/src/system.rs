@@ -5,8 +5,8 @@ use crate::syscall::{self, SyscallError};
 
 /// Sysinfo header size in bytes.
 pub const SYSINFO_HEADER_SIZE: usize = 48;
-/// Per-process entry size in bytes.
-pub const SYSINFO_ENTRY_SIZE: usize = 56;
+/// Per-process/thread entry size in bytes.
+pub const SYSINFO_ENTRY_SIZE: usize = 64;
 
 /// Read the wall-clock time from the hardware RTC.
 pub fn clock_realtime() -> RealTime {

@@ -89,6 +89,7 @@ pub const SYS_QUERY_MODULES: u64 = 91;
 pub const SYS_DEBUG: u64 = 92;
 pub const SYS_SCHED_INFO: u64 = 93;
 pub const SYS_PROCESS_STATS: u64 = 94;
+pub const SYS_SET_THREAD_NAME: u64 = 95;
 
 pub const WNOHANG: u64 = 1;
 
@@ -441,6 +442,11 @@ pub unsafe fn thread_spawn(entry: u64, stack: u64, arg: u64, stack_base: u64) ->
 /// Wait for thread `tid` to exit.
 pub fn thread_join(tid: u64) -> u64 {
     syscall(SYS_THREAD_JOIN, tid, 0, 0, 0)
+}
+
+/// Set the name of the calling thread (up to 28 bytes, truncated).
+pub fn set_thread_name(name: &[u8]) {
+    syscall(SYS_SET_THREAD_NAME, name.as_ptr() as u64, name.len() as u64, 0, 0);
 }
 
 // --- IPC ---

@@ -419,6 +419,13 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             let out = unsafe { &mut *(buf.as_mut_ptr() as *mut toyos_abi::syscall::ProcessStats) };
             sys_process_stats(process::Pid::from_raw(a1 as u32), out)
         },
+        SYS_SET_THREAD_NAME => {
+            let Some(name) = ctx.user_slice(UserAddr::new(a1), a2.min(28)) else {
+                return bad_addr;
+            };
+            process::set_current_thread_name(name);
+            0
+        },
         _ => SyscallError::InvalidArgument.to_u64(),
     };
 
@@ -989,7 +996,7 @@ fn sys_thread_join(tid: u64) -> u64 {
 
 fn sys_sysinfo(buf: &mut [u8]) -> u64 {
     const HEADER_SIZE: usize = 48;
-    const ENTRY_SIZE: usize = 56;
+    const ENTRY_SIZE: usize = 64;
     if buf.len() < HEADER_SIZE {
         return SyscallError::InvalidArgument.to_u64();
     }
@@ -1050,14 +1057,19 @@ fn sys_sysinfo(buf: &mut [u8]) -> u64 {
         let cpu_ns = crate::scheduler::task_cpu_ns(crate::scheduler::TaskId(proc.pid(), tid));
         let pid = proc.pid();
 
+        // Use thread name if set, otherwise process name
+        let name = if thread.name()[0] != 0 { thread.name() } else { proc.name() };
+
         buf[pos..pos + 4].copy_from_slice(&pid.raw().to_le_bytes());
         buf[pos + 4..pos + 8].copy_from_slice(&parent_pid.raw().to_le_bytes());
-        buf[pos + 8] = state;
-        buf[pos + 9] = is_thread;
-        buf[pos + 10..pos + 12].copy_from_slice(&[0, 0]);
-        buf[pos + 12..pos + 20].copy_from_slice(&memory.to_le_bytes());
-        buf[pos + 20..pos + 28].copy_from_slice(&cpu_ns.to_le_bytes());
-        buf[pos + 28..pos + 56].copy_from_slice(proc.name());
+        buf[pos + 8..pos + 12].copy_from_slice(&tid.raw().to_le_bytes());
+        buf[pos + 12] = state;
+        buf[pos + 13] = is_thread;
+        buf[pos + 14..pos + 16].copy_from_slice(&[0, 0]);
+        buf[pos + 16..pos + 24].copy_from_slice(&memory.to_le_bytes());
+        buf[pos + 24..pos + 32].copy_from_slice(&cpu_ns.to_le_bytes());
+        buf[pos + 32..pos + 60].copy_from_slice(name);
+        buf[pos + 60..pos + 64].copy_from_slice(&[0, 0, 0, 0]);
 
         pos += ENTRY_SIZE;
     }

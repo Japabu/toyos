@@ -192,14 +192,21 @@ impl ThreadLocation {
 /// Per-thread metadata. Tid is the HashMap key in ProcessEntry.threads.
 pub struct ThreadEntry {
     state: ThreadLocation,
+    name: [u8; 28],
     thread_data: Arc<Lock<ThreadData>>,
 }
 
 impl ThreadEntry {
     pub fn new(thread_data: Arc<Lock<ThreadData>>) -> Self {
-        Self { state: ThreadLocation::Scheduled, thread_data }
+        Self { state: ThreadLocation::Scheduled, name: [0u8; 28], thread_data }
     }
     pub fn state(&self) -> ThreadLocation { self.state }
+    pub fn name(&self) -> &[u8; 28] { &self.name }
+    pub fn set_name(&mut self, name: &[u8]) {
+        self.name = [0u8; 28];
+        let len = name.len().min(28);
+        self.name[..len].copy_from_slice(&name[..len]);
+    }
     pub fn thread_data(&self) -> &Arc<Lock<ThreadData>> { &self.thread_data }
 }
 
@@ -543,6 +550,17 @@ pub fn current_data() -> Arc<Lock<ThreadData>> {
         None => {
             drop(guard);
             scheduler::exit_current(-1);
+        }
+    }
+}
+
+/// Set the name of the currently running thread.
+pub fn set_current_thread_name(name: &[u8]) {
+    let mut guard = PROCESS_TABLE.lock();
+    let table = guard.as_mut().unwrap();
+    if let Some(proc) = table.get_mut(current_process()) {
+        if let Some(thread) = proc.threads.get_mut(current_tid()) {
+            thread.set_name(name);
         }
     }
 }
