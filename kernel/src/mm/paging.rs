@@ -9,7 +9,7 @@ use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
-use super::{PAGE_2M, UserAddr};
+use super::{UserAddr, PAGE_2M};
 use crate::sync::Lock;
 use crate::vma::{self, Region, RegionKind};
 use crate::MemoryMapEntry;
@@ -55,15 +55,37 @@ impl PageTablePage {
             None
         }
     }
+
+    /// Set a leaf PDE (2MB page) and invalidate the TLB entry.
+    /// This is the ONLY way to write a user-space PDE.
+    fn set_pde(&mut self, idx: usize, value: u64, va: u64) {
+        self.0[idx] = value;
+        invlpg(va);
+    }
+
+    /// Clear a leaf PDE and invalidate the TLB entry.
+    fn clear_pde(&mut self, idx: usize, va: u64) {
+        self.0[idx] = 0;
+        invlpg(va);
+    }
+
+    /// Set a non-leaf entry (PML4E, PDPTE) or kernel entry. No TLB invalidation —
+    /// caller is responsible for flushing when needed (e.g. flush_tlb_all after batch).
+    fn set_entry(&mut self, idx: usize, value: u64) {
+        self.0[idx] = value;
+    }
+
+    /// OR flags into an existing non-leaf entry (e.g. adding PAGE_WRITE to a PML4E).
+    fn or_flags(&mut self, idx: usize, flags: u64) {
+        self.0[idx] |= flags;
+    }
 }
 
 impl core::ops::Index<usize> for PageTablePage {
     type Output = u64;
-    fn index(&self, idx: usize) -> &u64 { &self.0[idx] }
-}
-
-impl core::ops::IndexMut<usize> for PageTablePage {
-    fn index_mut(&mut self, idx: usize) -> &mut u64 { &mut self.0[idx] }
+    fn index(&self, idx: usize) -> &u64 {
+        &self.0[idx]
+    }
 }
 
 #[inline]
@@ -135,8 +157,12 @@ impl Cr3 {
         Self(crate::arch::cpu::read_cr3())
     }
 
-    pub fn phys(self) -> u64 { self.0 & CR3_ADDR_MASK }
-    pub fn pcid(self) -> u16 { (self.0 & 0xFFF) as u16 }
+    pub fn phys(self) -> u64 {
+        self.0 & CR3_ADDR_MASK
+    }
+    pub fn pcid(self) -> u16 {
+        (self.0 & 0xFFF) as u16
+    }
 
     /// Switch to this address space. With PCID, sets NOFLUSH to preserve
     /// other processes' TLB entries. Without PCID, plain CR3 write.
@@ -226,7 +252,7 @@ impl AddressSpace {
 
         for i in 256..512 {
             if kernel_as.root[i] & PAGE_PRESENT != 0 {
-                pml4[i] = kernel_as.root[i];
+                pml4.set_entry(i, kernel_as.root[i]);
             }
         }
 
@@ -246,21 +272,31 @@ impl AddressSpace {
     /// Map a contiguous physical region into user space as 2MB pages.
     /// Asserts: vaddr and phys are 2MB-aligned, all PDE slots are empty.
     pub fn map_range(&mut self, vaddr: UserAddr, phys: u64, size: u64, writable: bool) {
-        assert!(vaddr.raw() & (PAGE_2M - 1) == 0, "map_range: vaddr not 2MB-aligned");
-        assert!(phys & (PAGE_2M - 1) == 0, "map_range: phys {phys:#x} not 2MB-aligned");
+        assert!(
+            vaddr.raw() & (PAGE_2M - 1) == 0,
+            "map_range: vaddr not 2MB-aligned"
+        );
+        assert!(
+            phys & (PAGE_2M - 1) == 0,
+            "map_range: phys {phys:#x} not 2MB-aligned"
+        );
         let mut offset = 0u64;
         while offset < size {
             let va = vaddr.raw() + offset;
             let pa = phys + offset;
             let mut flags = PAGE_PRESENT | PAGE_USER;
-            if writable { flags |= PAGE_WRITE; }
+            if writable {
+                flags |= PAGE_WRITE;
+            }
             let (pml4_idx, pdpt_idx, pd_idx) = indices(va);
             let user_flags = PAGE_PRESENT | PAGE_WRITE | PAGE_USER;
             let pd = self.ensure_table(pml4_idx, user_flags, pdpt_idx, user_flags);
             let existing = pd[pd_idx];
-            assert!(existing & PAGE_PRESENT == 0,
-                "map_range: PDE already present at vaddr {va:#x} (existing={existing:#x})");
-            pd[pd_idx] = pa | flags | PAGE_SIZE_BIT;
+            assert!(
+                existing & PAGE_PRESENT == 0,
+                "map_range: PDE already present at vaddr {va:#x} (existing={existing:#x})"
+            );
+            pd.set_pde(pd_idx, pa | flags | PAGE_SIZE_BIT, va);
             offset += PAGE_2M;
         }
     }
@@ -278,37 +314,53 @@ impl AddressSpace {
     /// Used by demand paging and shared library RW overlay.
     pub fn remap(&mut self, vaddr: UserAddr, phys: u64, writable: bool) {
         let va = vaddr.raw();
-        assert!(va & (PAGE_2M - 1) == 0, "remap: vaddr {va:#x} not 2MB-aligned");
-        assert!(phys & (PAGE_2M - 1) == 0, "remap: phys {phys:#x} not 2MB-aligned");
+        assert!(
+            va & (PAGE_2M - 1) == 0,
+            "remap: vaddr {va:#x} not 2MB-aligned"
+        );
+        assert!(
+            phys & (PAGE_2M - 1) == 0,
+            "remap: phys {phys:#x} not 2MB-aligned"
+        );
 
         let mut flags = PAGE_PRESENT | PAGE_USER;
-        if writable { flags |= PAGE_WRITE; }
+        if writable {
+            flags |= PAGE_WRITE;
+        }
 
         let (pml4_idx, pdpt_idx, pd_idx) = indices(va);
         let user_flags = PAGE_PRESENT | PAGE_WRITE | PAGE_USER;
         let pd = self.ensure_table(pml4_idx, user_flags, pdpt_idx, user_flags);
-        pd[pd_idx] = phys | flags | PAGE_SIZE_BIT;
+        pd.set_pde(pd_idx, phys | flags | PAGE_SIZE_BIT, va);
     }
 
     /// Allocate a 2MB page from PMM and map it at `vaddr`.
     /// Returns a DirectMap handle for kernel access to the page.
     pub fn map_alloc(&mut self, vaddr: UserAddr, writable: bool) -> super::DirectMap {
-        let page = super::pmm::alloc_page(super::pmm::Category::PageTable).expect("map_alloc: out of physical memory");
+        let page = super::pmm::alloc_page(super::pmm::Category::PageTable)
+            .expect("map_alloc: out of physical memory");
         let phys = page.phys();
         let dm = page.direct_map();
 
         let va = vaddr.raw();
-        assert!(va & (PAGE_2M - 1) == 0, "map_alloc: vaddr {va:#x} not 2MB-aligned");
+        assert!(
+            va & (PAGE_2M - 1) == 0,
+            "map_alloc: vaddr {va:#x} not 2MB-aligned"
+        );
 
         let mut flags = PAGE_PRESENT | PAGE_USER;
-        if writable { flags |= PAGE_WRITE; }
+        if writable {
+            flags |= PAGE_WRITE;
+        }
 
         let (pml4_idx, pdpt_idx, pd_idx) = indices(va);
         let user_flags = PAGE_PRESENT | PAGE_WRITE | PAGE_USER;
         let pd = self.ensure_table(pml4_idx, user_flags, pdpt_idx, user_flags);
-        assert!(pd[pd_idx] & PAGE_PRESENT == 0,
-            "map_alloc: PDE already present at vaddr {va:#x}");
-        pd[pd_idx] = phys | flags | PAGE_SIZE_BIT;
+        assert!(
+            pd[pd_idx] & PAGE_PRESENT == 0,
+            "map_alloc: PDE already present at vaddr {va:#x}"
+        );
+        pd.set_pde(pd_idx, phys | flags | PAGE_SIZE_BIT, va);
         self.pages.push(page);
         dm
     }
@@ -316,7 +368,10 @@ impl AddressSpace {
     /// Unmap one 2MB page and free its physical memory.
     pub fn unmap(&mut self, vaddr: UserAddr) {
         let va = vaddr.raw();
-        assert!(va & (PAGE_2M - 1) == 0, "unmap: vaddr {va:#x} not 2MB-aligned");
+        assert!(
+            va & (PAGE_2M - 1) == 0,
+            "unmap: vaddr {va:#x} not 2MB-aligned"
+        );
 
         let (pml4_idx, pdpt_idx, pd_idx) = indices(va);
 
@@ -324,7 +379,7 @@ impl AddressSpace {
             if let Some(pd) = pdpt.child_mut(pdpt_idx) {
                 let pde = pd[pd_idx];
                 if pde & PAGE_PRESENT != 0 {
-                    pd[pd_idx] = 0;
+                    pd.clear_pde(pd_idx, va);
                     let phys = pde & ADDR_MASK_2M;
                     // Remove the page from our owned list — Drop frees it
                     self.pages.retain(|p| p.phys() != phys);
@@ -337,8 +392,12 @@ impl AddressSpace {
     pub fn is_mapped(&self, vaddr: UserAddr) -> bool {
         let va = vaddr.raw() & !(PAGE_2M - 1);
         let (pml4_idx, pdpt_idx, pd_idx) = indices(va);
-        let Some(pdpt) = self.root.child(pml4_idx) else { return false };
-        let Some(pd) = pdpt.child(pdpt_idx) else { return false };
+        let Some(pdpt) = self.root.child(pml4_idx) else {
+            return false;
+        };
+        let Some(pd) = pdpt.child(pdpt_idx) else {
+            return false;
+        };
         pd[pd_idx] & PAGE_PRESENT != 0
     }
 
@@ -350,7 +409,9 @@ impl AddressSpace {
         let pdpt = self.root.child(pml4_idx)?;
         let pd = pdpt.child(pdpt_idx)?;
         let pde = pd[pd_idx];
-        if pde & PAGE_PRESENT == 0 { return None; }
+        if pde & PAGE_PRESENT == 0 {
+            return None;
+        }
         let page_phys = pde & ADDR_MASK_2M;
         let offset = va & (PAGE_2M - 1);
         Some(super::DirectMap::from_phys(page_phys + offset))
@@ -366,7 +427,11 @@ impl AddressSpace {
         let total = aligned + vma::GUARD_SIZE;
 
         let mut top = vma::ALLOC_CEILING;
-        for (&start, region) in self.regions.range(..UserAddr::new(vma::ALLOC_CEILING)).rev() {
+        for (&start, region) in self
+            .regions
+            .range(..UserAddr::new(vma::ALLOC_CEILING))
+            .rev()
+        {
             let region_end = align_up_2m(start.raw() + region.size);
             if region_end > top {
                 top = start.raw();
@@ -386,19 +451,41 @@ impl AddressSpace {
     }
 
     /// Allocate a virtual address range and register the region.
-    pub fn alloc_region(&mut self, size: u64, kind: RegionKind, writable: bool) -> Option<UserAddr> {
+    pub fn alloc_region(
+        &mut self,
+        size: u64,
+        kind: RegionKind,
+        writable: bool,
+    ) -> Option<UserAddr> {
         let aligned = align_up_2m(size);
         let addr = self.find_gap(aligned)?;
-        self.regions.insert(addr, Region { size: aligned, writable, kind });
+        self.regions.insert(
+            addr,
+            Region {
+                size: aligned,
+                writable,
+                kind,
+            },
+        );
         Some(addr)
     }
 
     /// Allocate a region and map physical memory into it.
     pub fn alloc_and_map(&mut self, phys: u64, size: u64) -> Option<(UserAddr, u64)> {
         let aligned = align_up_2m(size);
-        assert!(phys & (PAGE_2M - 1) == 0, "alloc_and_map: phys {phys:#x} not 2MB-aligned");
+        assert!(
+            phys & (PAGE_2M - 1) == 0,
+            "alloc_and_map: phys {phys:#x} not 2MB-aligned"
+        );
         let addr = self.find_gap(aligned)?;
-        self.regions.insert(addr, Region { size: aligned, writable: true, kind: RegionKind::Mapped });
+        self.regions.insert(
+            addr,
+            Region {
+                size: aligned,
+                writable: true,
+                kind: RegionKind::Mapped,
+            },
+        );
         self.map_range(addr, phys, aligned, true);
         Some((addr, aligned))
     }
@@ -420,7 +507,8 @@ impl AddressSpace {
     pub fn insert_region(&mut self, addr: UserAddr, region: Region) {
         assert!(
             self.find_region(addr).is_none(),
-            "insert_region: address {:#x} already occupied", addr.raw()
+            "insert_region: address {:#x} already occupied",
+            addr.raw()
         );
         self.regions.insert(addr, region);
     }
@@ -436,12 +524,16 @@ impl AddressSpace {
     }
 
     /// Iterate all regions that overlap the range [start, end).
-    pub fn overlapping_regions(&self, start: UserAddr, end: UserAddr) -> impl Iterator<Item = (&UserAddr, &Region)> {
+    pub fn overlapping_regions(
+        &self,
+        start: UserAddr,
+        end: UserAddr,
+    ) -> impl Iterator<Item = (&UserAddr, &Region)> {
         // A region starting at s with size n overlaps [start, end) iff s < end && s+n > start.
         // Use range(..end) to skip regions starting at or after end, then filter the lower bound.
-        self.regions.range(..end).filter(move |(&s, r)| {
-            s.raw() + r.size > start.raw()
-        })
+        self.regions
+            .range(..end)
+            .filter(move |(&s, r)| s.raw() + r.size > start.raw())
     }
 
     /// Clear all regions (for process teardown).
@@ -486,7 +578,7 @@ impl AddressSpace {
         let (pml4_idx, pdpt_idx, pd_idx) = indices(virt);
         let pd = self.ensure_table(pml4_idx, flags, pdpt_idx, flags);
         if pd[pd_idx] & PAGE_PRESENT == 0 {
-            pd[pd_idx] = phys | flags | PAGE_SIZE_BIT;
+            pd.set_entry(pd_idx, phys | flags | PAGE_SIZE_BIT);
         }
     }
 
@@ -495,29 +587,34 @@ impl AddressSpace {
         let (pml4_idx, pdpt_idx, pd_idx) = indices(virt);
         if let Some(pdpt) = self.root.child_mut(pml4_idx) {
             if let Some(pd) = pdpt.child_mut(pdpt_idx) {
-                pd[pd_idx] = 0;
+                pd.set_entry(pd_idx, 0);
             }
         }
     }
 
-    fn ensure_table(&mut self, pml4_idx: usize, pml4_flags: u64,
-                    pdpt_idx: usize, pdpt_flags: u64) -> &mut PageTablePage {
+    fn ensure_table(
+        &mut self,
+        pml4_idx: usize,
+        pml4_flags: u64,
+        pdpt_idx: usize,
+        pdpt_flags: u64,
+    ) -> &mut PageTablePage {
         if self.root[pml4_idx] & PAGE_PRESENT == 0 {
             let child = Box::new(PageTablePage([0; 512]));
-            self.root[pml4_idx] = child.phys() | pml4_flags;
+            self.root.set_entry(pml4_idx, child.phys() | pml4_flags);
             self.children.push(child);
         } else {
-            self.root[pml4_idx] |= pml4_flags & (PAGE_PRESENT | PAGE_WRITE | PAGE_USER);
+            self.root.or_flags(pml4_idx, pml4_flags & (PAGE_PRESENT | PAGE_WRITE | PAGE_USER));
         }
 
         let pdpt = unsafe { PageTablePage::from_phys_mut(self.root[pml4_idx] & ADDR_MASK) };
 
         if pdpt[pdpt_idx] & PAGE_PRESENT == 0 {
             let child = Box::new(PageTablePage([0; 512]));
-            pdpt[pdpt_idx] = child.phys() | pdpt_flags;
+            pdpt.set_entry(pdpt_idx, child.phys() | pdpt_flags);
             self.children.push(child);
         } else {
-            pdpt[pdpt_idx] |= pdpt_flags & (PAGE_PRESENT | PAGE_WRITE | PAGE_USER);
+            pdpt.or_flags(pdpt_idx, pdpt_flags & (PAGE_PRESENT | PAGE_WRITE | PAGE_USER));
         }
 
         unsafe { PageTablePage::from_phys_mut(pdpt[pdpt_idx] & ADDR_MASK) }
@@ -573,7 +670,9 @@ pub(super) fn init(memory_map: &[MemoryMapEntry]) {
     KERNEL_CR3.store(cr3.0, core::sync::atomic::Ordering::Release);
     *KERNEL.lock() = Some(kernel);
     // Boot path: load CR3 with flush (PCID not yet enabled).
-    unsafe { cr3.load_flush(); }
+    unsafe {
+        cr3.load_flush();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -581,7 +680,11 @@ pub(super) fn init(memory_map: &[MemoryMapEntry]) {
 // ---------------------------------------------------------------------------
 
 fn has(entry: u64, flag: u64) -> u8 {
-    if entry & flag != 0 { 1 } else { 0 }
+    if entry & flag != 0 {
+        1
+    } else {
+        0
+    }
 }
 
 /// Dump page table entries for an address. Lock-free for crash safety.
@@ -593,25 +696,55 @@ pub fn debug_page_walk(addr: u64) {
     let pd_idx = ((addr >> 21) & 0x1FF) as usize;
     let pt_idx = ((addr >> 12) & 0x1FF) as usize;
 
-    log!("  Page walk for {:#x} [PML4={:#x} PCID={} PML4[{}] PDPT[{}] PD[{}] PT[{}]]:",
-        addr, cr3.phys(), cr3.pcid(), pml4_idx, pdpt_idx, pd_idx, pt_idx);
+    log!(
+        "  Page walk for {:#x} [PML4={:#x} PCID={} PML4[{}] PDPT[{}] PD[{}] PT[{}]]:",
+        addr,
+        cr3.phys(),
+        cr3.pcid(),
+        pml4_idx,
+        pdpt_idx,
+        pd_idx,
+        pt_idx
+    );
 
     let pml4e = pml4[pml4_idx];
-    log!("    PML4E: {:#018x} P={} W={} U={}", pml4e,
-        has(pml4e, PAGE_PRESENT), has(pml4e, PAGE_WRITE), has(pml4e, PAGE_USER));
-    if pml4e & PAGE_PRESENT == 0 { return; }
+    log!(
+        "    PML4E: {:#018x} P={} W={} U={}",
+        pml4e,
+        has(pml4e, PAGE_PRESENT),
+        has(pml4e, PAGE_WRITE),
+        has(pml4e, PAGE_USER)
+    );
+    if pml4e & PAGE_PRESENT == 0 {
+        return;
+    }
 
     let pdpt = unsafe { PageTablePage::from_phys(pml4e & ADDR_MASK) };
     let pdpte = pdpt[pdpt_idx];
-    log!("    PDPTE: {:#018x} P={} W={} U={}", pdpte,
-        has(pdpte, PAGE_PRESENT), has(pdpte, PAGE_WRITE), has(pdpte, PAGE_USER));
-    if pdpte & PAGE_PRESENT == 0 { return; }
+    log!(
+        "    PDPTE: {:#018x} P={} W={} U={}",
+        pdpte,
+        has(pdpte, PAGE_PRESENT),
+        has(pdpte, PAGE_WRITE),
+        has(pdpte, PAGE_USER)
+    );
+    if pdpte & PAGE_PRESENT == 0 {
+        return;
+    }
 
     let pd = unsafe { PageTablePage::from_phys(pdpte & ADDR_MASK) };
     let pde = pd[pd_idx];
-    log!("    PDE:   {:#018x} P={} W={} U={} PS={}", pde,
-        has(pde, PAGE_PRESENT), has(pde, PAGE_WRITE), has(pde, PAGE_USER), has(pde, PAGE_SIZE_BIT));
-    if pde & PAGE_PRESENT == 0 { return; }
+    log!(
+        "    PDE:   {:#018x} P={} W={} U={} PS={}",
+        pde,
+        has(pde, PAGE_PRESENT),
+        has(pde, PAGE_WRITE),
+        has(pde, PAGE_USER),
+        has(pde, PAGE_SIZE_BIT)
+    );
+    if pde & PAGE_PRESENT == 0 {
+        return;
+    }
     if pde & PAGE_SIZE_BIT != 0 {
         log!("    -> 2MB large page at {:#x}", pde & ADDR_MASK_2M);
         return;
@@ -619,8 +752,15 @@ pub fn debug_page_walk(addr: u64) {
 
     let pt = unsafe { PageTablePage::from_phys(pde & ADDR_MASK) };
     let pte = pt[pt_idx];
-    log!("    PTE:   {:#018x} P={} W={} U={}", pte,
-        has(pte, PAGE_PRESENT), has(pte, PAGE_WRITE), has(pte, PAGE_USER));
-    if pte & PAGE_PRESENT == 0 { return; }
+    log!(
+        "    PTE:   {:#018x} P={} W={} U={}",
+        pte,
+        has(pte, PAGE_PRESENT),
+        has(pte, PAGE_WRITE),
+        has(pte, PAGE_USER)
+    );
+    if pte & PAGE_PRESENT == 0 {
+        return;
+    }
     log!("    -> 4KB page at {:#x}", pte & ADDR_MASK);
 }

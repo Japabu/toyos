@@ -872,6 +872,7 @@ fn sys_grant_shared(token: u64, target_pid: u64) -> u64 {
         Ok(()) => 0,
         Err(shared_memory::Error::NotFound) => SyscallError::NotFound.to_u64(),
         Err(shared_memory::Error::PermissionDenied) => SyscallError::PermissionDenied.to_u64(),
+        Err(shared_memory::Error::OutOfVirtualMemory) => unreachable!(),
     }
 }
 
@@ -882,6 +883,7 @@ fn sys_map_shared(token: u64) -> u64 {
         Ok(addr) => addr,
         Err(shared_memory::Error::NotFound) => SyscallError::NotFound.to_u64(),
         Err(shared_memory::Error::PermissionDenied) => SyscallError::PermissionDenied.to_u64(),
+        Err(shared_memory::Error::OutOfVirtualMemory) => SyscallError::ResourceExhausted.to_u64(),
     }
 }
 

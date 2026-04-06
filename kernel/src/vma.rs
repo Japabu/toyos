@@ -7,15 +7,11 @@ use crate::mm::PAGE_2M;
 // Address space layout constants
 // ---------------------------------------------------------------------------
 
-/// Dynamic allocations grow top-down from this ceiling.
-/// Must stay below SHM_BASE — shared memory lives above this.
-pub const ALLOC_CEILING: u64 = SHM_BASE;
+/// Dynamic allocations (mmap, shared memory) grow top-down from this ceiling.
+pub const ALLOC_CEILING: u64 = STACK_BASE;
 
 /// Nothing allocated below this floor (guard against NULL-ish addresses).
 pub const ALLOC_FLOOR: u64 = 0x0002_0000_0000; // 8 GB
-
-/// Shared memory region base (16GB). Cross-process, managed by shared_memory.rs.
-pub const SHM_BASE: u64 = 0x0004_0000_0000;
 
 /// Main thread stack base. RSP starts at STACK_BASE + USER_STACK_SIZE.
 pub const STACK_BASE: u64 = 0x00FF_FF80_0000;

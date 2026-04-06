@@ -28,6 +28,7 @@ impl SharedToken {
 pub enum Error {
     NotFound,
     PermissionDenied,
+    OutOfVirtualMemory,
 }
 
 // ---------------------------------------------------------------------------
@@ -43,55 +44,42 @@ enum Ownership {
 }
 
 // ---------------------------------------------------------------------------
-// Virtual address allocator for shared memory mappings
-// ---------------------------------------------------------------------------
-
-/// Shared memory mappings live at 16GB+ in every process's virtual address space,
-/// far above code, heap, stack, and mmap regions.
-const SHM_VIRT_BASE: u64 = 0x4_0000_0000;
-
-static SHM_VIRT_NEXT: Lock<UserAddr> = Lock::new(UserAddr::new(SHM_VIRT_BASE));
-
-/// Allocate a 2MB-aligned virtual address range for a shared memory mapping.
-fn alloc_vaddr(size: u64) -> UserAddr {
-    let aligned_size = (size + PAGE_2M - 1) & !(PAGE_2M - 1);
-    let mut next = SHM_VIRT_NEXT.lock();
-    let aligned = UserAddr::new((next.raw() + PAGE_2M - 1) & !(PAGE_2M - 1));
-    *next = UserAddr::new(aligned.raw() + aligned_size);
-    aligned
-}
-
-// ---------------------------------------------------------------------------
 // SharedRegion — a single shared memory region
 // ---------------------------------------------------------------------------
 
 struct SharedRegion {
     phys: DirectMap,
     size: u64,
-    vaddr: UserAddr,
     ownership: Ownership,
     allowed: Vec<Pid>,
-    mapped_in: Vec<(Pid, PageTables)>,
+    /// Per-process mappings: each process gets its own virtual address.
+    mapped_in: Vec<(Pid, PageTables, UserAddr)>,
 }
 
 impl SharedRegion {
-    fn map_into(&mut self, pid: Pid, pt: &PageTables) {
-        if !self.mapped_in.iter().any(|(p, _)| *p == pid) {
-            pt.lock().map_range(self.vaddr, self.phys.phys(), self.size, true);
-            self.mapped_in.push((pid, Arc::clone(pt)));
+    /// Map this region into a process's address space via its AddressSpace allocator.
+    /// Returns the per-process virtual address, or the existing one if already mapped.
+    fn map_into(&mut self, pid: Pid, pt: &PageTables) -> Option<UserAddr> {
+        if let Some((_, _, vaddr)) = self.mapped_in.iter().find(|(p, _, _)| *p == pid) {
+            return Some(*vaddr);
         }
+        let (addr, _) = pt.lock().alloc_and_map(self.phys.phys(), self.size)?;
+        self.mapped_in.push((pid, Arc::clone(pt), addr));
+        Some(addr)
     }
 
+    /// Unmap this region from a process, returning the VA to its AddressSpace pool.
     fn unmap_from(&mut self, pid: Pid) {
-        if let Some(pos) = self.mapped_in.iter().position(|(p, _)| *p == pid) {
-            let (_, pt) = self.mapped_in.swap_remove(pos);
-            pt.lock().unmap_range(self.vaddr, self.size);
+        if let Some(pos) = self.mapped_in.iter().position(|(p, _, _)| *p == pid) {
+            let (_, pt, vaddr) = self.mapped_in.swap_remove(pos);
+            pt.lock().free_and_unmap(vaddr);
         }
     }
 
-    fn unmap_all(&self) {
-        for (_, pt) in &self.mapped_in {
-            pt.lock().unmap_range(self.vaddr, self.size);
+    /// Unmap from all processes. Takes self by value — region must be dropped after.
+    fn unmap_all(self) {
+        for (_, pt, vaddr) in &self.mapped_in {
+            pt.lock().free_and_unmap(*vaddr);
         }
     }
 }
@@ -100,6 +88,9 @@ impl SharedRegion {
 // Global registry
 // ---------------------------------------------------------------------------
 
+// Lock ordering: REGIONS lock → PageTables lock.
+// All public functions that call map_into/unmap_from do so while holding
+// the REGIONS lock (inside with_regions_mut), then acquire PageTables inside.
 static REGIONS: Lock<Option<Vec<(SharedToken, SharedRegion)>>> = Lock::new(None);
 static NEXT_TOKEN: AtomicU32 = AtomicU32::new(1);
 
@@ -128,21 +119,21 @@ pub fn alloc(size: u64, owner_pid: Pid, addr_space: &PageTables) -> SharedToken 
     let page_count = aligned_size / PAGE_2M as usize;
     let pages = pmm::alloc_contiguous(page_count, pmm::Category::SharedMemory).expect("shared_memory: allocation failed");
     let phys = DirectMap::from_phys(pages[0].direct_map().phys());
-    let vaddr = alloc_vaddr(aligned_size as u64);
 
-    let token = next_token();
-    let mut region = SharedRegion {
-        phys,
-        size: aligned_size as u64,
-        vaddr,
-        ownership: Ownership::Process { pid: owner_pid, _pages: pages },
-        allowed: alloc::vec![owner_pid],
-        mapped_in: Vec::new(),
-    };
-    region.map_into(owner_pid, addr_space);
-
-    with_regions_mut(|regions| regions.push((token, region)));
-    token
+    with_regions_mut(|regions| {
+        let token = next_token();
+        let mut region = SharedRegion {
+            phys,
+            size: aligned_size as u64,
+            ownership: Ownership::Process { pid: owner_pid, _pages: pages },
+            allowed: alloc::vec![owner_pid],
+            mapped_in: Vec::new(),
+        };
+        region.map_into(owner_pid, addr_space)
+            .expect("shared_memory::alloc: failed to map into owner");
+        regions.push((token, region));
+        token
+    })
 }
 
 /// Register an existing kernel-owned allocation as a shared region.
@@ -151,13 +142,11 @@ pub fn alloc(size: u64, owner_pid: Pid, addr_space: &PageTables) -> SharedToken 
 pub fn register(phys: DirectMap, size: u64) -> SharedToken {
     assert!(phys.phys() & (PAGE_2M - 1) == 0,
         "shared_memory::register: phys {:#x} not 2MB-aligned", phys.phys());
-    let vaddr = alloc_vaddr(size);
     let token = next_token();
     with_regions_mut(|regions| {
         regions.push((token, SharedRegion {
             phys,
             size,
-            vaddr,
             ownership: Ownership::Kernel,
             allowed: Vec::new(),
             mapped_in: Vec::new(),
@@ -172,8 +161,10 @@ pub fn unregister(token: SharedToken) -> Option<(DirectMap, u64)> {
     with_regions_mut(|regions| {
         let pos = regions.iter().position(|(t, _)| *t == token)?;
         let (_, region) = regions.swap_remove(pos);
+        let phys = region.phys;
+        let size = region.size;
         region.unmap_all();
-        Some((region.phys, region.size))
+        Some((phys, size))
     })
 }
 
@@ -210,7 +201,7 @@ pub fn grant_kernel(token: SharedToken, target: Pid) -> Result<(), Error> {
 }
 
 /// Map a shared region into the caller's address space.
-/// Returns the userland virtual address.
+/// Returns the per-process virtual address.
 pub fn map(token: SharedToken, pid: Pid, addr_space: &PageTables) -> Result<u64, Error> {
     with_regions_mut(|regions| {
         let (_, region) = regions.iter_mut().find(|(t, _)| *t == token)
@@ -218,8 +209,9 @@ pub fn map(token: SharedToken, pid: Pid, addr_space: &PageTables) -> Result<u64,
         if !region.allowed.contains(&pid) {
             return Err(Error::PermissionDenied);
         }
-        region.map_into(pid, addr_space);
-        Ok(region.vaddr.raw())
+        let vaddr = region.map_into(pid, addr_space)
+            .ok_or(Error::OutOfVirtualMemory)?;
+        Ok(vaddr.raw())
     })
 }
 
@@ -260,8 +252,12 @@ pub fn cleanup_process(pid: Pid) {
             region.unmap_from(pid);
             region.allowed.retain(|p| *p != pid);
 
+            // Drop process-owned regions when the owner exits, or when the
+            // last mapper exits (handles orphaned regions whose owner already left).
             if let Ownership::Process { pid: owner, .. } = &region.ownership {
-                if *owner == pid && region.mapped_in.is_empty() {
+                if (*owner == pid || !region.allowed.contains(owner))
+                    && region.mapped_in.is_empty()
+                {
                     return false; // PhysPages freed via Drop
                 }
             }
