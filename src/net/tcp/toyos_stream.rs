@@ -5,7 +5,7 @@ use std::net::{Shutdown, SocketAddr};
 use crate::{event, Interest, Registry, Token};
 use toyos_abi::Fd;
 use toyos_abi::syscall::{self, SyscallError};
-use toyos_net::{NetError, TcpSocketId};
+use toyos::net::{NetError, TcpSocketId};
 
 /// A non-blocking TCP stream backed by kernel pipes via netd.
 pub struct TcpStream {
@@ -40,7 +40,7 @@ impl TcpStream {
             }
         };
 
-        let conn = toyos_net::tcp_connect(ip, addr.port(), 30000).map_err(net_err_to_io)?;
+        let conn = toyos::net::tcp_connect(ip, addr.port(), 30000).map_err(net_err_to_io)?;
 
         Ok(TcpStream {
             rx_fd: conn.rx_fd,
@@ -52,7 +52,7 @@ impl TcpStream {
     }
 
     /// Create a TcpStream from pre-existing pipe FDs (used by TcpListener::accept).
-    pub(crate) fn from_accepted(accepted: toyos_net::TcpAccepted) -> TcpStream {
+    pub(crate) fn from_accepted(accepted: toyos::net::TcpAccepted) -> TcpStream {
         let peer_addr = SocketAddr::from((accepted.remote_addr, accepted.remote_port));
         TcpStream {
             rx_fd: accepted.rx_fd,
@@ -77,7 +77,7 @@ impl TcpStream {
             Shutdown::Write => 1,
             Shutdown::Both => 2,
         };
-        toyos_net::tcp_shutdown(self.socket_id, how_val).map_err(net_err_to_io)
+        toyos::net::tcp_shutdown(self.socket_id, how_val).map_err(net_err_to_io)
     }
 
     pub fn set_nodelay(&self, _nodelay: bool) -> io::Result<()> {
@@ -207,7 +207,7 @@ impl event::Source for TcpStream {
 
 impl Drop for TcpStream {
     fn drop(&mut self) {
-        let _ = toyos_net::tcp_close(self.socket_id);
+        let _ = toyos::net::tcp_close(self.socket_id);
         syscall::close(self.rx_fd);
         syscall::close(self.tx_fd);
     }

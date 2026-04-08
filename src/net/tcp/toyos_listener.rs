@@ -12,7 +12,7 @@ use toyos_abi::syscall;
 /// netd writes a byte to the notify pipe when a new connection arrives.
 /// Polling the notify_fd for readability indicates a connection is ready to accept.
 pub struct TcpListener {
-    socket_id: toyos_net::TcpSocketId,
+    socket_id: toyos::net::TcpSocketId,
     notify_fd: Fd,
     local_addr: SocketAddr,
 }
@@ -27,7 +27,7 @@ impl TcpListener {
             }
         };
 
-        let bound = toyos_net::tcp_bind(ip, addr.port())
+        let bound = toyos::net::tcp_bind(ip, addr.port())
             .map_err(super::toyos_stream::net_err_to_io)?;
 
         let bound_addr = SocketAddr::from((ip, bound.bound_port));
@@ -55,7 +55,7 @@ impl TcpListener {
             Ok(_) => {} // notification received, proceed with accept
         }
 
-        let accepted = toyos_net::tcp_accept(self.socket_id)
+        let accepted = toyos::net::tcp_accept(self.socket_id)
             .map_err(super::toyos_stream::net_err_to_io)?;
 
         let peer_addr = SocketAddr::from((accepted.remote_addr, accepted.remote_port));
@@ -113,7 +113,7 @@ impl event::Source for TcpListener {
 
 impl Drop for TcpListener {
     fn drop(&mut self) {
-        let _ = toyos_net::tcp_close(self.socket_id);
+        let _ = toyos::net::tcp_close(self.socket_id);
         syscall::close(self.notify_fd);
     }
 }
