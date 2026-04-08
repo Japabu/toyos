@@ -64,7 +64,7 @@ features = [
 
 [target.'cfg(target_os = "toyos")'.dependencies]
 toyos-abi = { path = "../../toyos-abi" }
-toyos-net = { path = "../../toyos-net" }
+toyos = { path = "../../toyos" }
 
 [features]
 # Enable all API, even ones not available on all OSs.

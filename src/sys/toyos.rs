@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use toyos_abi::Fd;
 use toyos_abi::syscall::{self, SyscallError};
-use toyos_net::{self, NetError, TcpSocketId};
+use toyos::net::{self, NetError, TcpSocketId};
 
 use crate::{SockAddr, TcpKeepalive};
 
@@ -409,7 +409,7 @@ impl Drop for Socket {
             match state {
                 SocketState::Connected { kernel_fd, socket_id, .. }
                 | SocketState::Listening { kernel_fd, socket_id, .. } => {
-                    let _ = toyos_net::tcp_close(TcpSocketId(socket_id));
+                    let _ = toyos::net::tcp_close(TcpSocketId(socket_id));
                     syscall::close(kernel_fd);
                 }
                 SocketState::Unconnected { .. } => {}
@@ -479,7 +479,7 @@ pub(crate) fn bind(fd: RawSocket, addr: &SockAddr) -> io::Result<()> {
 pub(crate) fn connect(fd: RawSocket, addr: &SockAddr) -> io::Result<()> {
     let (ip, port) = sockaddr_to_v4(addr)?;
 
-    let conn = toyos_net::tcp_connect(ip, port, 30000).map_err(net_err_to_io)?;
+    let conn = toyos::net::tcp_connect(ip, port, 30000).map_err(net_err_to_io)?;
 
     // Wrap pipe fds into a kernel socket descriptor
     let rx_pipe_id = syscall::pipe_id(conn.rx_fd)
@@ -531,7 +531,7 @@ pub(crate) fn connect(fd: RawSocket, addr: &SockAddr) -> io::Result<()> {
 
     // Apply queued nodelay option
     if nodelay {
-        let _ = toyos_net::tcp_set_option(conn.socket_id, toyos_net::OPT_NODELAY, 1);
+        let _ = toyos::net::tcp_set_option(conn.socket_id, toyos::net::OPT_NODELAY, 1);
     }
 
     Ok(())
@@ -571,7 +571,7 @@ pub(crate) fn listen(fd: RawSocket, _backlog: c_int) -> io::Result<()> {
         }
     };
 
-    let bound = toyos_net::tcp_bind(ip, port).map_err(net_err_to_io)?;
+    let bound = toyos::net::tcp_bind(ip, port).map_err(net_err_to_io)?;
 
     map.insert(
         fd,
@@ -624,7 +624,7 @@ pub(crate) fn accept(fd: RawSocket) -> io::Result<(RawSocket, SockAddr)> {
         }
     }
 
-    let accepted = toyos_net::tcp_accept(TcpSocketId(socket_id)).map_err(net_err_to_io)?;
+    let accepted = toyos::net::tcp_accept(TcpSocketId(socket_id)).map_err(net_err_to_io)?;
 
     // Wrap pipe fds into a kernel socket descriptor
     let rx_pipe_id = syscall::pipe_id(accepted.rx_fd)
@@ -763,7 +763,7 @@ pub(crate) fn shutdown(fd: RawSocket, how: Shutdown) -> io::Result<()> {
         Shutdown::Write => 1,
         Shutdown::Both => 2,
     };
-    toyos_net::tcp_shutdown(TcpSocketId(socket_id), how_val).map_err(net_err_to_io)
+    toyos::net::tcp_shutdown(TcpSocketId(socket_id), how_val).map_err(net_err_to_io)
 }
 
 // ---------------------------------------------------------------------------
@@ -991,7 +991,7 @@ pub(crate) unsafe fn setsockopt<T>(
                     *nodelay = value != 0;
                     let sid = *socket_id;
                     drop(map);
-                    let _ = toyos_net::tcp_set_option(TcpSocketId(sid), toyos_net::OPT_NODELAY, value as u32);
+                    let _ = toyos::net::tcp_set_option(TcpSocketId(sid), toyos::net::OPT_NODELAY, value as u32);
                     return Ok(());
                 }
                 _ => {}
