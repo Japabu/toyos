@@ -1,5 +1,5 @@
 [package]
-name = "toyos"
+name = "toyos-build"
 version = "0.1.0"
 edition = "2021"
 
@@ -27,7 +27,8 @@ opt-level = 3
 opt-level = 3
 
 [[test]]
-name = "toyos"
+name = "toyos-build"
+path = "tests/toyos.rs"
 harness = false
 
 [patch.crates-io]

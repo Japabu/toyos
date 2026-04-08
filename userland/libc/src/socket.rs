@@ -5,7 +5,7 @@ use alloc::vec::Vec;
 use core::ptr;
 use toyos_abi::Fd;
 use toyos_abi::syscall;
-use toyos_net::{self, NetError, TcpSocketId, UdpSocketId, OPT_NODELAY};
+use toyos::net::{NetError, TcpSocketId, UdpSocketId, OPT_NODELAY};
 
 // ---------------------------------------------------------------------------
 // C types matching POSIX
@@ -218,7 +218,7 @@ pub unsafe extern "C" fn connect(fd: i32, addr: *const Sockaddr, addrlen: Sockle
 
     match entry.kind {
         SocketKind::Tcp => {
-            let conn = match toyos_net::tcp_connect(ip, port, 30000) {
+            let conn = match toyos::net::tcp_connect(ip, port, 30000) {
                 Ok(c) => c,
                 Err(e) => { set_errno(net_err_to_errno(e)); return -1; }
             };
@@ -257,7 +257,7 @@ pub unsafe extern "C" fn bind(fd: i32, addr: *const Sockaddr, addrlen: SocklenT)
 
     match entry.kind {
         SocketKind::Tcp => {
-            let bound = match toyos_net::tcp_bind(ip, port) {
+            let bound = match toyos::net::tcp_bind(ip, port) {
                 Ok(b) => b,
                 Err(e) => { set_errno(net_err_to_errno(e)); return -1; }
             };
@@ -268,7 +268,7 @@ pub unsafe extern "C" fn bind(fd: i32, addr: *const Sockaddr, addrlen: SocklenT)
             0
         }
         SocketKind::Udp => {
-            let bound = match toyos_net::udp_bind(ip, port) {
+            let bound = match toyos::net::udp_bind(ip, port) {
                 Ok(b) => b,
                 Err(e) => { set_errno(net_err_to_errno(e)); return -1; }
             };
@@ -309,7 +309,7 @@ pub unsafe extern "C" fn accept(
     let mut notify_byte = [0u8; 1];
     let _ = syscall::read(Fd(notify_fd), &mut notify_byte);
 
-    let accepted = match toyos_net::tcp_accept(listener_id) {
+    let accepted = match toyos::net::tcp_accept(listener_id) {
         Ok(a) => a,
         Err(e) => { set_errno(net_err_to_errno(e)); return -1; }
     };
@@ -334,7 +334,7 @@ pub unsafe extern "C" fn accept(
     if new_fd < 0 {
         syscall::close(accepted.rx_fd);
         syscall::close(accepted.tx_fd);
-        let _ = toyos_net::tcp_close(accepted.socket_id);
+        let _ = toyos::net::tcp_close(accepted.socket_id);
         set_errno(ENOMEM);
     }
     new_fd
@@ -440,7 +440,7 @@ pub unsafe extern "C" fn sendto(
                 return -1;
             }
             // Send control message with metadata
-            match toyos_net::udp_send_to(UdpSocketId(entry.netd_id), ip, port, len as u16) {
+            match toyos::net::udp_send_to(UdpSocketId(entry.netd_id), ip, port, len as u16) {
                 Ok(sent) => sent as isize,
                 Err(e) => { set_errno(net_err_to_errno(e)); -1 }
             }
@@ -476,7 +476,7 @@ pub unsafe extern "C" fn recvfrom(
         }
         SocketKind::Udp => {
             // Send control request and get metadata response
-            let recv_resp = match toyos_net::udp_recv_from(UdpSocketId(entry.netd_id), len as u32) {
+            let recv_resp = match toyos::net::udp_recv_from(UdpSocketId(entry.netd_id), len as u32) {
                 Ok(r) => r,
                 Err(e) => { set_errno(net_err_to_errno(e)); return -1; }
             };
@@ -512,7 +512,7 @@ pub unsafe extern "C" fn shutdown(fd: i32, how: i32) -> i32 {
     };
 
     if let SocketKind::Tcp = entry.kind {
-        if let Err(e) = toyos_net::tcp_shutdown(TcpSocketId(entry.netd_id), how as u32) {
+        if let Err(e) = toyos::net::tcp_shutdown(TcpSocketId(entry.netd_id), how as u32) {
             set_errno(net_err_to_errno(e));
             return -1;
         }
@@ -544,8 +544,8 @@ pub unsafe extern "C" fn close_socket(fd: i32) -> bool {
     // Tell netd to close the socket
     if entry.netd_id != 0 {
         match entry.kind {
-            SocketKind::Tcp => { let _ = toyos_net::tcp_close(TcpSocketId(entry.netd_id)); }
-            SocketKind::Udp => { let _ = toyos_net::udp_close(UdpSocketId(entry.netd_id)); }
+            SocketKind::Tcp => { let _ = toyos::net::tcp_close(TcpSocketId(entry.netd_id)); }
+            SocketKind::Udp => { let _ = toyos::net::udp_close(UdpSocketId(entry.netd_id)); }
         }
     }
     true
@@ -575,7 +575,7 @@ pub unsafe extern "C" fn setsockopt(
     // TCP_NODELAY is the only option we actually send to netd
     if level == IPPROTO_TCP && optname == TCP_NODELAY && entry.netd_id != 0 {
         let val = if optval.is_null() { 0u32 } else { *(optval as *const i32) as u32 };
-        if let Err(e) = toyos_net::tcp_set_option(TcpSocketId(entry.netd_id), OPT_NODELAY, val) {
+        if let Err(e) = toyos::net::tcp_set_option(TcpSocketId(entry.netd_id), OPT_NODELAY, val) {
             set_errno(net_err_to_errno(e));
             return -1;
         }
@@ -607,7 +607,7 @@ pub unsafe extern "C" fn getsockopt(
     }
 
     if level == IPPROTO_TCP && optname == TCP_NODELAY && entry.netd_id != 0 {
-        match toyos_net::tcp_get_option(TcpSocketId(entry.netd_id), OPT_NODELAY) {
+        match toyos::net::tcp_get_option(TcpSocketId(entry.netd_id), OPT_NODELAY) {
             Ok(val) => {
                 *(optval as *mut i32) = val as i32;
                 *optlen = 4;
@@ -702,13 +702,13 @@ pub unsafe extern "C" fn getaddrinfo(
         return build_addrinfo_result(res, &[(ip, 0)]);
     }
 
-    // Use toyos-net's dns_lookup
+    // Use toyos::net dns_lookup
     let hostname = match core::str::from_utf8(name) {
         Ok(s) => s,
         Err(_) => return -1,
     };
     let mut results = [[0u8; 4]; 16];
-    let count = match toyos_net::dns_lookup(hostname, &mut results) {
+    let count = match toyos::net::dns_lookup(hostname, &mut results) {
         Ok(n) => n,
         Err(_) => return -1,
     };

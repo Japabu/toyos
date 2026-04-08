@@ -1,11 +1,11 @@
-use toyos_abi::{ipc, syscall};
+use toyos::services;
 
 pub fn main(args: Vec<String>) {
-    let fd = syscall::connect("compositor").expect("compositor not running");
+    let conn = services::connect("compositor").expect("compositor not running");
 
     if args.is_empty() {
-        ipc::signal(fd, window::MSG_GET_RESOLUTION).ok();
-        let (msg_type, info): (u32, window::ResolutionInfo) = ipc::recv(fd).expect("compositor disconnected");
+        conn.signal(window::MSG_GET_RESOLUTION).ok();
+        let (msg_type, info): (u32, window::ResolutionInfo) = conn.recv().expect("compositor disconnected");
         assert_eq!(msg_type, window::MSG_RESOLUTION_CHANGED);
         println!("{}x{}", info.width, info.height);
     } else {
@@ -13,7 +13,6 @@ pub fn main(args: Vec<String>) {
             let parts: Vec<&str> = args[0].split('x').collect();
             if parts.len() != 2 {
                 eprintln!("Usage: screen [WIDTHxHEIGHT]");
-                syscall::close(fd);
                 return;
             }
             let w: u32 = parts[0].parse().unwrap_or_else(|_| { eprintln!("invalid width"); std::process::exit(1); });
@@ -25,11 +24,9 @@ pub fn main(args: Vec<String>) {
             (w, h)
         };
 
-        ipc::send(fd, window::MSG_SET_RESOLUTION, &window::ResolutionRequest { width, height }).ok();
-        let (msg_type, info): (u32, window::ResolutionInfo) = ipc::recv(fd).expect("compositor disconnected");
+        conn.send(window::MSG_SET_RESOLUTION, &window::ResolutionRequest { width, height }).ok();
+        let (msg_type, info): (u32, window::ResolutionInfo) = conn.recv().expect("compositor disconnected");
         assert_eq!(msg_type, window::MSG_RESOLUTION_CHANGED);
         println!("{}x{}", info.width, info.height);
     }
-
-    syscall::close(fd);
 }

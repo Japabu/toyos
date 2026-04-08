@@ -3,21 +3,10 @@
 //! Owns the netd IPC protocol and provides client functions for TCP, UDP, and DNS.
 //! All networking in ToyOS goes through the `netd` daemon via message passing
 //! and kernel pipes.
-//!
-//! # Type Safety
-//!
-//! - `TcpSocketId` / `UdpSocketId` prevent mixing socket types at compile time.
-//! - `NetdConn` / `PendingResponse` enforce the IPC request-response protocol
-//!   via typestate: you cannot read a response without sending a request, and
-//!   you cannot send two requests on one connection.
-//! - `IpcPayload` restricts IPC transmission to explicitly opted-in `#[repr(C)]` types.
-//! - `MsgType` enum prevents typos in message type constants.
 
-#![no_std]
-
-use toyos_abi::ipc::{self, IpcHeader};
-use toyos_abi::syscall;
 use toyos_abi::Fd;
+use toyos_abi::syscall;
+use crate::ipc::{self, IpcHeader};
 
 // ---------------------------------------------------------------------------
 // IPC payload safety
@@ -33,7 +22,6 @@ pub unsafe trait IpcPayload: Copy {}
 // IPC message types
 // ---------------------------------------------------------------------------
 
-/// Client → netd message types.
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MsgType {
@@ -71,7 +59,6 @@ impl MsgType {
     }
 }
 
-/// netd → client response types.
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RespType {
@@ -110,9 +97,7 @@ pub enum NetError {
     AddrInUse,
     NotConnected,
     InvalidInput,
-    /// Unexpected response code from netd.
     Protocol(u32),
-    /// Pipe or syscall failure.
     Io,
 }
 
@@ -335,23 +320,16 @@ pub struct UdpBound {
 // NetdConn — per-operation IPC connection (typestate protocol)
 // ---------------------------------------------------------------------------
 
-/// A connection to netd for a single IPC operation.
-///
-/// Created via `connect()` (single attempt) or `connect_blocking()` (retries).
-/// Consumed by `request()` / `request_bytes()` / `signal()` into a
-/// `PendingResponse`, enforcing the send-then-receive protocol at compile time.
 pub struct NetdConn(Fd);
 
 impl NetdConn {
     const BOOT_RETRIES: u32 = 100;
     const BOOT_RETRY_INTERVAL_NS: u64 = 10_000_000;
 
-    /// Single connect attempt. For close and other fire-and-forget operations.
     pub fn connect() -> Result<Self, NetError> {
         syscall::connect("netd").map(Self).map_err(|_| NetError::NetdNotFound)
     }
 
-    /// Retry loop for boot-time operations (connect, bind).
     pub fn connect_blocking() -> Result<Self, NetError> {
         for _ in 0..Self::BOOT_RETRIES {
             if let Ok(fd) = syscall::connect("netd") {
@@ -362,13 +340,11 @@ impl NetdConn {
         Err(NetError::NetdNotFound)
     }
 
-    /// Send a typed request, consuming the connection into a pending response.
     pub fn request<Req: IpcPayload>(self, msg_type: MsgType, payload: &Req) -> Result<PendingResponse, NetError> {
         ipc::send(self.0, msg_type as u32, payload).map_err(|_| NetError::Io)?;
         Ok(PendingResponse(self))
     }
 
-    /// Send a byte-slice request, consuming the connection into a pending response.
     pub fn request_bytes(self, msg_type: MsgType, data: &[u8]) -> Result<PendingResponse, NetError> {
         ipc::send_bytes(self.0, msg_type as u32, data).map_err(|_| NetError::Io)?;
         Ok(PendingResponse(self))
@@ -381,13 +357,9 @@ impl Drop for NetdConn {
     }
 }
 
-/// A pending response from netd. Created by `NetdConn::request()`.
-///
-/// Must be consumed by `response()`, `response_bytes()`, or `status()`.
 pub struct PendingResponse(NetdConn);
 
 impl PendingResponse {
-    /// Read the response header, check for errors.
     fn recv_checked_header(&self) -> Result<IpcHeader, NetError> {
         let fd = (self.0).0;
         let header = ipc::recv_header(fd).map_err(|_| NetError::Io)?;
@@ -401,26 +373,22 @@ impl PendingResponse {
         Ok(header)
     }
 
-    /// Read a typed response payload.
     pub fn response<Resp: IpcPayload>(self) -> Result<Resp, NetError> {
         let header = self.recv_checked_header()?;
         let fd = (self.0).0;
         ipc::recv_payload(fd, &header).map_err(|_| NetError::Io)
     }
 
-    /// Read raw bytes into a buffer. Returns the number of bytes read.
     pub fn response_bytes(self, buf: &mut [u8]) -> Result<usize, NetError> {
         let header = self.recv_checked_header()?;
         let fd = (self.0).0;
         ipc::recv_bytes(fd, &header, buf).map_err(|_| NetError::Io)
     }
 
-    /// Check status only (no payload expected).
     pub fn status(self) -> Result<(), NetError> {
         let header = self.recv_checked_header()?;
         let fd = (self.0).0;
         if header.len > 0 {
-            // Drain any unexpected payload
             let mut skip = [0u8; 128];
             let _ = ipc::recv_bytes(fd, &header, &mut skip);
         }
@@ -643,8 +611,6 @@ pub fn udp_close(socket_id: UdpSocketId) -> Result<(), NetError> {
 // DNS
 // ---------------------------------------------------------------------------
 
-/// Look up a hostname via netd's DNS resolver.
-/// Returns the number of IPv4 addresses written to `results`.
 pub fn dns_lookup(hostname: &str, results: &mut [[u8; 4]]) -> Result<usize, NetError> {
     let mut buf = [0u8; 256];
     let n = NetdConn::connect_blocking()?

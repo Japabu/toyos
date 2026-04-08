@@ -9,7 +9,7 @@ std-runtime = []
 
 [dependencies]
 toyos-abi = { path = "../../toyos-abi" }
-toyos-net = { path = "../../toyos-net" }
+toyos = { path = "../../toyos" }
 dlmalloc = "0.2.7"
 
 [profile.dev]

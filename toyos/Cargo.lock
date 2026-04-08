@@ -9,16 +9,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aa9c45b374136f52f2d6311062c7146bff20fec063c3f5d46a410bd937746955"
 
 [[package]]
-name = "toyos-abi"
-version = "0.1.0"
-dependencies = [
- "rustc-std-workspace-core",
-]
-
-[[package]]
-name = "toyos-net"
+name = "toyos"
 version = "0.1.0"
 dependencies = [
  "rustc-std-workspace-core",
  "toyos-abi",
+]
+
+[[package]]
+name = "toyos-abi"
+version = "0.1.0"
+dependencies = [
+ "rustc-std-workspace-core",
 ]

@@ -2,9 +2,9 @@ pub mod framebuffer;
 
 pub use framebuffer::{Color, Framebuffer};
 
-use toyos_abi::ipc;
+use toyos::ipc;
 use toyos_abi::io_uring;
-use toyos_abi::shm::SharedMemory;
+use toyos::shm::SharedMemory;
 use toyos_abi::syscall;
 use toyos_abi::Fd;
 

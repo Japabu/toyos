@@ -6,7 +6,7 @@ use toyos_abi::io_uring;
 use std::os::toyos::process;
 use std::process::Command;
 
-use toyos_abi::gpu;
+use toyos::gpu;
 use window::Window;
 
 fn main() {

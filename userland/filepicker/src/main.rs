@@ -1,8 +1,8 @@
 use filepicker_api::{PickerMode, MSG_FILEPICKER_REQUEST, MSG_FILEPICKER_RESULT};
 use font::Font;
 use std::fs;
-use toyos_abi::ipc;
-use toyos_abi::services;
+use toyos::ipc;
+use toyos::services;
 use toyos_abi::Fd;
 use std::path::{Path, PathBuf};
 use window::{Color, Event, Framebuffer, KeyEvent, MouseEvent, Window};
@@ -461,7 +461,7 @@ fn main() {
 
     loop {
         let conn = services::accept(&listener).expect("accept failed");
-        let client_fd = conn.fd.fd();
+        let client_fd = conn.conn.fd();
         let Ok(header) = ipc::recv_header(client_fd) else {
             continue;
         };

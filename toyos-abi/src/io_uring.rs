@@ -118,9 +118,8 @@ pub fn poll_fds(fds: &[u64], timeout_nanos: Option<u64>) -> PollResult {
         return PollResult { mask: 0 };
     }
 
-    let (raw_ring_fd, shm_token) = crate::syscall::io_uring_setup(64)
+    let (ring_fd, shm_token) = crate::syscall::io_uring_setup(64)
         .expect("poll_fds: io_uring_setup failed");
-    let ring_fd = crate::OwnedFd::new(raw_ring_fd);
     let base = unsafe { crate::syscall::map_shared(shm_token) };
     let params = unsafe { &*(base as *const IoUringParams) };
     let sq_size = params.sq_ring_size;
@@ -154,7 +153,7 @@ pub fn poll_fds(fds: &[u64], timeout_nanos: Option<u64>) -> PollResult {
         None => u64::MAX,
         Some(n) => n,
     };
-    let _ = crate::syscall::io_uring_enter(ring_fd.fd(), len as u32, 1, timeout);
+    let _ = crate::syscall::io_uring_enter(ring_fd, len as u32, 1, timeout);
 
     // Drain CQEs
     let cq_hdr = unsafe { &*(base.add(CQ_RING_OFF as usize) as *const IoUringRingHeader) };
@@ -172,5 +171,6 @@ pub fn poll_fds(fds: &[u64], timeout_nanos: Option<u64>) -> PollResult {
         }
         cq_hdr.head.store(head.wrapping_add(1), Ordering::Release);
     }
+    crate::syscall::close(ring_fd);
     PollResult { mask }
 }

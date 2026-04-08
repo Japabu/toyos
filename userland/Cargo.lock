@@ -393,6 +393,7 @@ version = "0.1.0"
 dependencies = [
  "font",
  "sprite",
+ "toyos",
  "toyos-abi 0.1.0",
  "window",
 ]
@@ -471,6 +472,7 @@ dependencies = [
  "objc2-core-audio-types",
  "objc2-core-foundation",
  "objc2-foundation",
+ "toyos",
  "toyos-abi 0.1.0",
  "wasm-bindgen",
  "wasm-bindgen-futures",
@@ -900,6 +902,7 @@ version = "0.1.0"
 dependencies = [
  "filepicker-api",
  "font",
+ "toyos",
  "toyos-abi 0.1.0",
  "window",
 ]
@@ -908,6 +911,7 @@ dependencies = [
 name = "filepicker-api"
 version = "0.1.0"
 dependencies = [
+ "toyos",
  "toyos-abi 0.1.0",
 ]
 
@@ -1616,8 +1620,8 @@ name = "mio"
 version = "1.1.1"
 dependencies = [
  "libc",
+ "toyos",
  "toyos-abi 0.1.0",
- "toyos-net",
  "wasi",
  "windows-sys 0.61.2",
 ]
@@ -1657,8 +1661,8 @@ name = "netd"
 version = "0.0.0"
 dependencies = [
  "smoltcp",
+ "toyos",
  "toyos-abi 0.1.0",
- "toyos-net",
 ]
 
 [[package]]
@@ -2924,8 +2928,8 @@ name = "socket2"
 version = "0.6.3"
 dependencies = [
  "libc",
+ "toyos",
  "toyos-abi 0.1.0",
- "toyos-net",
  "windows-sys 0.61.2",
 ]
 
@@ -2953,6 +2957,7 @@ dependencies = [
 name = "soundd"
 version = "0.0.0"
 dependencies = [
+ "toyos",
  "toyos-abi 0.1.0",
 ]
 
@@ -3084,6 +3089,7 @@ name = "terminal"
 version = "0.1.0"
 dependencies = [
  "font",
+ "toyos",
  "toyos-abi 0.1.0",
  "window",
 ]
@@ -3238,8 +3244,16 @@ name = "toybox"
 version = "0.1.0"
 dependencies = [
  "cpal",
+ "toyos",
  "toyos-abi 0.1.0",
  "window",
+]
+
+[[package]]
+name = "toyos"
+version = "0.1.0"
+dependencies = [
+ "toyos-abi 0.1.0",
 ]
 
 [[package]]
@@ -3250,13 +3264,6 @@ version = "0.1.0"
 name = "toyos-abi"
 version = "0.1.0"
 source = "git+https://github.com/Japabu/toyos-abi#2fe0c57be9d7a9e8e4eff804eb92666edffd51e5"
-
-[[package]]
-name = "toyos-net"
-version = "0.1.0"
-dependencies = [
- "toyos-abi 0.1.0",
-]
 
 [[package]]
 name = "tracing"
@@ -3585,6 +3592,7 @@ name = "window"
 version = "0.1.0"
 dependencies = [
  "font",
+ "toyos",
  "toyos-abi 0.1.0",
 ]
 

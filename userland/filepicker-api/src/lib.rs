@@ -1,4 +1,4 @@
-use toyos_abi::ipc;
+use toyos::ipc;
 use toyos_abi::syscall;
 
 pub const MSG_FILEPICKER_REQUEST: u32 = 1;

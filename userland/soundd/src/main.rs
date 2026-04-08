@@ -1,20 +1,21 @@
-use toyos_abi::audio::{self, AudioInfo, AudioOpenRequest, AudioOpenResponse, AudioSetVolume};
-use toyos_abi::audio::{MSG_AUDIO_OPEN, MSG_AUDIO_OPENED, MSG_AUDIO_SET_VOLUME};
-use toyos_abi::device;
-use toyos_abi::ipc;
+use toyos_abi::audio::AudioInfo;
 use toyos_abi::io_uring;
 use toyos_abi::ring::RingHeader;
-use toyos_abi::services;
-use toyos_abi::shm::SharedMemory;
 use toyos_abi::syscall;
-use toyos_abi::{Fd, OwnedFd};
+use toyos_abi::Fd;
+use toyos::audio::{AudioOpenRequest, AudioOpenResponse, AudioSetVolume};
+use toyos::audio::{MSG_AUDIO_OPEN, MSG_AUDIO_OPENED, MSG_AUDIO_SET_VOLUME};
+use toyos::device;
+use toyos::services;
+use toyos::shm::SharedMemory;
+use toyos::{Connection, Device};
 
 const AUDIO_RING_SIZE: usize = 16384;
 const DEFAULT_VOLUME: i32 = 256;
 
 struct AudioStream {
     shm: SharedMemory,
-    control: OwnedFd,
+    control: Connection,
     volume: i32,
 }
 
@@ -50,16 +51,16 @@ impl AudioStream {
     }
 }
 
-fn read_struct<T: Copy>(fd: &OwnedFd) -> T {
+fn read_struct<T: Copy>(dev: &Device) -> T {
     let mut buf = [0u8; 256];
     let size = core::mem::size_of::<T>();
     assert!(size <= buf.len());
-    let n = syscall::read(fd.fd(), &mut buf[..size]).expect("read device info failed");
+    let n = dev.read(&mut buf[..size]).expect("read device info failed");
     assert_eq!(n, size);
     unsafe { core::ptr::read(buf.as_ptr() as *const T) }
 }
 
-fn open_stream(control: OwnedFd, client_pid: u32, _req: &AudioOpenRequest, next_id: &mut u32) -> AudioStream {
+fn open_stream(control: Connection, client_pid: u32, _req: &AudioOpenRequest, next_id: &mut u32) -> AudioStream {
     let mut shm = SharedMemory::allocate(AUDIO_RING_SIZE);
     RingHeader::init(shm.as_mut_slice().as_mut_ptr(), AUDIO_RING_SIZE);
     shm.grant(client_pid);
@@ -67,7 +68,7 @@ fn open_stream(control: OwnedFd, client_pid: u32, _req: &AudioOpenRequest, next_
     let id = *next_id;
     *next_id += 1;
 
-    let _ = ipc::send(control.fd(), MSG_AUDIO_OPENED, &AudioOpenResponse {
+    let _ = control.send(MSG_AUDIO_OPENED, &AudioOpenResponse {
         stream_id: id,
         shm_token: shm.token(),
         ring_size: AUDIO_RING_SIZE as u32,
@@ -79,9 +80,9 @@ fn open_stream(control: OwnedFd, client_pid: u32, _req: &AudioOpenRequest, next_
 fn main() {
     let listener = services::listen("soundd").expect("soundd already running");
 
-    let audio_fd = device::open_audio().expect("soundd: no audio device");
-    let info: AudioInfo = read_struct(&audio_fd);
-    drop(audio_fd);
+    let audio_dev = device::open_audio().expect("soundd: no audio device");
+    let info: AudioInfo = read_struct(&audio_dev);
+    drop(audio_dev);
 
     let num_buffers = info.num_buffers as usize;
     let dma_page = SharedMemory::map(info.dma_token, 2 * 1024 * 1024);
@@ -110,7 +111,7 @@ fn main() {
 
     loop {
         // 1. Reclaim completed DMA buffers
-        free_mask |= audio::audio_poll();
+        free_mask |= toyos::audio::audio_poll();
 
         // 2. Drain client rings into accumulator
         if !streams.is_empty() && accum_filled < period_samples {
@@ -148,7 +149,7 @@ fn main() {
                 accum_filled = 0;
             }
 
-            audio::audio_submit(idx as u32, info.period_bytes);
+            toyos::audio::audio_submit(idx as u32, info.period_bytes);
         }
 
         // 4. Clean up dead streams
@@ -169,13 +170,13 @@ fn main() {
 
         if result.fd(0) {
             let conn = services::accept(&listener).expect("accept failed");
-            let Ok(header) = ipc::recv_header(conn.fd.fd()) else {
+            let Ok(header) = conn.conn.recv_header() else {
                 continue;
             };
             match header.msg_type {
                 MSG_AUDIO_OPEN => {
-                    let req: AudioOpenRequest = ipc::recv_payload(conn.fd.fd(), &header).unwrap();
-                    let stream = open_stream(conn.fd, conn.client_pid, &req, &mut next_stream_id);
+                    let req: AudioOpenRequest = conn.conn.recv_payload(&header).unwrap();
+                    let stream = open_stream(conn.conn, conn.client_pid, &req, &mut next_stream_id);
                     streams.push(stream);
                 }
                 other => eprintln!("soundd: unexpected message type {other}"),
@@ -186,13 +187,13 @@ fn main() {
         for i in 0..streams.len() {
             if result.fd(1 + i) {
                 let fd = streams[i].control.fd();
-                let Ok(header) = ipc::recv_header(fd) else {
+                let Ok(header) = streams[i].control.recv_header() else {
                     dead_controls.push(fd);
                     continue;
                 };
                 match header.msg_type {
                     MSG_AUDIO_SET_VOLUME => {
-                        let cmd: AudioSetVolume = ipc::recv_payload(fd, &header).unwrap();
+                        let cmd: AudioSetVolume = streams[i].control.recv_payload(&header).unwrap();
                         streams[i].volume = (cmd.volume as i32).min(512);
                     }
                     _ => {}

@@ -33,9 +33,9 @@ pub fn ensure(root: &Path, force_rebuild: bool) -> ChangeSet {
     let linker_stamp = stamps_dir.join("linker.stamp");
     let compiler_changed = stamps::dir_changed(&rust_dir.join("compiler"), &compiler_stamp);
     let std_changed = stamps::dir_changed(&rust_dir.join("library"), &std_stamp);
-    // toyos-abi and toyos-net are dependencies of std — changes require an std rebuild
+    // toyos-abi and toyos are dependencies of std — changes require an std rebuild
     let abi_changed = stamps::dir_changed(&root.join("toyos-abi/src"), &abi_stamp);
-    let net_changed = stamps::dir_changed(&root.join("toyos-net/src"), &net_stamp);
+    let net_changed = stamps::dir_changed(&root.join("toyos/src"), &net_stamp);
     let linker_changed = stamps::dir_changed(&root.join("toyos-ld/src"), &linker_stamp);
 
     // Ensure toyos-ld is built (needed as cross-linker for bootstrap and all builds)
@@ -66,7 +66,7 @@ pub fn ensure(root: &Path, force_rebuild: bool) -> ChangeSet {
         stamps::write_dir_stamp(&rust_dir.join("compiler"), &compiler_stamp);
         stamps::write_dir_stamp(&rust_dir.join("library"), &std_stamp);
         stamps::write_dir_stamp(&root.join("toyos-abi/src"), &abi_stamp);
-        stamps::write_dir_stamp(&root.join("toyos-net/src"), &net_stamp);
+        stamps::write_dir_stamp(&root.join("toyos/src"), &net_stamp);
         true
     } else if std_changed || abi_changed || net_changed {
         // Fast path: only rebuild std
@@ -74,7 +74,7 @@ pub fn ensure(root: &Path, force_rebuild: bool) -> ChangeSet {
         rebuild_std(root, &rust_dir);
         stamps::write_dir_stamp(&rust_dir.join("library"), &std_stamp);
         stamps::write_dir_stamp(&root.join("toyos-abi/src"), &abi_stamp);
-        stamps::write_dir_stamp(&root.join("toyos-net/src"), &net_stamp);
+        stamps::write_dir_stamp(&root.join("toyos/src"), &net_stamp);
         true
     } else {
         false

@@ -34,7 +34,7 @@ The name has no meaning. This is not a hobby project. The quality bar is the sam
 
 **Filesystem** — VFS with mount points. Initrd, tmpfs, NVMe.
 
-**Syscall ABI** — Defined in `toyos-abi/`. The ABI is the contract between kernel and userland. Completely unstable — read the code for current state. Never add or change a syscall without discussion.
+**Syscall ABI** — Defined in `toyos-abi/`. The ABI is the contract between kernel and userland. Includes struct layouts, syscall numbers, constants, and typed syscall wrappers. Completely unstable — read the code for current state. Never add or change a syscall without discussion. The `toyos/` crate builds on top with typed handles, IPC framing, and service helpers — userland code uses `toyos`, kernel uses `toyos-abi` only.
 
 **Kernel must never crash from userland.** A buggy userland process must not be able to bring down the kernel. But if the kernel itself has a bug, it must crash loudly so we can fix it and harden.
 
@@ -74,14 +74,14 @@ Key crates forked in `userland/` with `[patch.crates-io]`. Rules:
 ## Repository layout
 
 ```
-src/              Build system (the root cargo project)
+src/              Build system (the root cargo project, package name: toyos-build)
 kernel/           Kernel
 bootloader/       UEFI bootloader
 userland/         All userland programs + ecosystem forks
-toyos-abi/        Syscall ABI (shared between kernel and userland)
+toyos-abi/        Kernel ABI (types, constants, syscall numbers, syscall wrappers)
+toyos/            Userland SDK (typed handles, IPC, services, shm, net, Ring)
 toyos-ld/         Custom linker
 toyos-cc/         Custom C compiler
-toyos-net/        Networking library
 rust/             Rust compiler/std fork (submodule)
 tests/            Integration tests (QEMU-based)
 system.toml       What to build and boot
@@ -114,7 +114,7 @@ system.toml       What to build and boot
 
 ## Ideas
 
-- **io_uring as the only blocking I/O mechanism.** Currently the kernel has two parallel notification paths: `scheduler::block(event)` for direct thread blocking and `io_uring::complete_pending_for_event` for ring watchers. Every wake site does both. If all fd-based blocking went through io_uring, blocking syscalls (read, write, accept) become non-blocking try-once-and-return, wake sites become a single io_uring call, and the scheduler drops fd-related `EventSource` variants (only keeps `Futex` and `IoUring`). Per-source watcher lists and io_uring machinery stay the same. Userspace helpers in `toyos-abi` would wrap the ring setup for simple blocking I/O.
+- **io_uring as the only blocking I/O mechanism.** Currently the kernel has two parallel notification paths: `scheduler::block(event)` for direct thread blocking and `io_uring::complete_pending_for_event` for ring watchers. Every wake site does both. If all fd-based blocking went through io_uring, blocking syscalls (read, write, accept) become non-blocking try-once-and-return, wake sites become a single io_uring call, and the scheduler drops fd-related `EventSource` variants (only keeps `Futex` and `IoUring`). Per-source watcher lists and io_uring machinery stay the same. Userspace helpers in `toyos` would wrap the ring setup for simple blocking I/O.
 
 - **Capability-based resource model.** Replace global Pid/Tid integers with per-process handles (like Zircon's `zx_handle_t`). Every kernel object — processes, threads, pipes, shared memory, devices — gets referenced via handles that encode both identity and rights. A process can only operate on objects it holds a handle to. This unifies fds, Pids, and Tids into one mechanism, eliminates confused-deputy bugs, and enables fine-grained rights delegation. The per-process fd table is already halfway there. Zircon (Fuchsia) and seL4 are the reference designs.
 
@@ -139,5 +139,4 @@ Three layers, built in order. Each layer is useful on its own.
 - **`SharedToken` is a bare `u32` — no RAII.** Unlike `PhysPage` (which can't leak because Drop returns it to the PMM), `SharedToken` is `Copy` with no destructor. The caller must remember to call the right cleanup function. It should be a non-Copy RAII handle: Drop removes the region and frees backing pages. Expose `.raw()` for the numeric value to pass to userspace, but keep the owning handle in kernel data structures.
 - **No physical memory fairness.** Any process can allocate unbounded physical memory until the system runs out. There are no per-process limits, no memory pressure signals, and no OOM killer. A single misbehaving process can starve the entire system.
 - **`build_toyos_bins` belongs in the test harness, not `src/build.rs`.** It's only called from the test harness and contains test-specific logic (cdylib subcrate discovery, `-L` rustflags for `.so` linking). Move it to `tests/`.
-- **`toyos-abi` is two things in one crate.** Half is pure ABI definitions (struct layouts, syscall numbers, constants — used by both kernel and userland). Half is userland runtime library (syscall wrappers, RAII types like `SharedMemory`, helpers like `ipc::send()`, `services::listen()` — never used by kernel). Should split into `toyos-abi` (pure contract) and a userland runtime crate.
-- **`Fd` is a Unix-ism.** ToyOS has no files-are-everything model. The integer identifies pipes, devices, io_uring instances, IPC connections — it's a handle, not a file descriptor. Rename `Fd` → `Handle` (and `OwnedFd` → `OwnedHandle`) to match what it actually is. Aligns with the capability-based direction.
+- **`Fd` is a Unix-ism.** ToyOS has no files-are-everything model. The integer identifies pipes, devices, io_uring instances, IPC connections — it's a handle, not a file descriptor. Rename `Fd` → `Handle` to match what it actually is. Aligns with the capability-based direction.

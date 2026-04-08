@@ -7,3 +7,4 @@ edition = "2021"
 cpal = { path = "../cpal" }
 window = { path = "../window" }
 toyos-abi = { path = "../../toyos-abi" }
+toyos = { path = "../../toyos" }

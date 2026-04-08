@@ -1,15 +1,16 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
-use toyos_abi::{Fd, OwnedFd};
-use toyos_abi::device;
-use toyos_abi::ipc;
-use toyos_abi::pipe;
-use toyos_abi::io_uring::*;
-use toyos_abi::raw_net as toyos_nic;
-use toyos_abi::services;
-use toyos_abi::shm;
+use toyos_abi::Fd;
+use toyos_abi::io_uring::IORING_POLL_IN;
+use toyos::device;
+use toyos::ipc;
+use toyos::pipe;
+use toyos::raw_net as toyos_nic;
+use toyos::services;
+use toyos::shm;
+use toyos::{Device as ToyosDevice, Pipe};
 
-use toyos_net::*;
+use toyos::net::*;
 
 use smoltcp::iface::{Config, Interface, PollResult, SocketHandle, SocketSet};
 use smoltcp::phy::{self, Device, DeviceCapabilities, Medium};
@@ -28,7 +29,7 @@ struct DmaNic {
     tx_buf: *mut u8,
     net_hdr_size: usize,
     mac: [u8; 6],
-    nic_fd: OwnedFd,
+    nic_fd: ToyosDevice,
 }
 
 impl DmaNic {
@@ -145,8 +146,8 @@ enum SocketKind {
 }
 
 struct UdpPipes {
-    tx_read_fd: OwnedFd,
-    rx_write_fd: OwnedFd,
+    tx_read_fd: Pipe,
+    rx_write_fd: Pipe,
 }
 
 struct PendingUdpRecv {
@@ -164,8 +165,8 @@ struct PendingDns {
 /// A piped TCP connection: data flows through kernel pipes instead of IPC messages.
 struct PipedConnection {
     handle: SocketHandle,
-    rx_write_fd: Option<OwnedFd>,
-    tx_read_fd: Option<OwnedFd>,
+    rx_write_fd: Option<Pipe>,
+    tx_read_fd: Option<Pipe>,
     rx_ring: *const toyos_abi::ring::RingHeader,
     tx_ring: *const toyos_abi::ring::RingHeader,
 }
@@ -192,7 +193,7 @@ impl PipedConnection {
 /// A piped TCP listener: netd writes 1 byte to notify pipe on new connection.
 struct PipedListener {
     handle: SocketHandle,
-    notify_write_fd: OwnedFd,
+    notify_write_fd: Pipe,
     notify_ring: *const toyos_abi::ring::RingHeader,
     notified: bool,
 }
@@ -206,20 +207,20 @@ struct PendingPipedConnect {
     deadline: Option<Instant>,
 }
 
-fn map_pipe_ring(fd: &OwnedFd) -> *const toyos_abi::ring::RingHeader {
-    toyos_abi::syscall::pipe_map(fd.fd())
+fn map_pipe_ring(pipe: &Pipe) -> *const toyos_abi::ring::RingHeader {
+    pipe.pipe_map()
         .expect("pipe_map failed") as *const toyos_abi::ring::RingHeader
 }
 
-/// Open a pipe by ID and return the fd. `read_end=true` opens for reading, false for writing.
-fn open_pipe_fd(pipe_id: u64, read_end: bool) -> Option<OwnedFd> {
-    pipe::open_by_id(pipe_id, read_end).ok().map(OwnedFd::new)
+/// Open a pipe by ID and return the handle. `read_end=true` opens for reading, false for writing.
+fn open_pipe(pipe_id: u64, read_end: bool) -> Option<Pipe> {
+    pipe::open_by_id(pipe_id, read_end).ok()
 }
 
 /// Open rx (write) and tx (read) pipe fds and create a PipedConnection.
 fn open_piped_connection(handle: SocketHandle, rx_pipe_id: u64, tx_pipe_id: u64) -> Option<PipedConnection> {
-    let rx_write_fd = open_pipe_fd(rx_pipe_id, false)?;
-    let tx_read_fd = open_pipe_fd(tx_pipe_id, true)?;
+    let rx_write_fd = open_pipe(rx_pipe_id, false)?;
+    let tx_read_fd = open_pipe(tx_pipe_id, true)?;
     let rx_ring = map_pipe_ring(&rx_write_fd);
     let tx_ring = map_pipe_ring(&tx_read_fd);
     Some(PipedConnection {
@@ -399,11 +400,11 @@ impl NetDaemon {
         };
         let port = if req.port == 0 { self.alloc_port() } else { req.port };
 
-        let Some(tx_read_fd) = open_pipe_fd(req.tx_pipe_id, true) else {
+        let Some(tx_read_fd) = open_pipe(req.tx_pipe_id, true) else {
             send_error_close(client_fd, ERR_INVALID_INPUT);
             return;
         };
-        let Some(rx_write_fd) = open_pipe_fd(req.rx_pipe_id, false) else {
+        let Some(rx_write_fd) = open_pipe(req.rx_pipe_id, false) else {
             send_error_close(client_fd, ERR_INVALID_INPUT);
             return;
         };
@@ -545,7 +546,7 @@ impl NetDaemon {
         if let Some(SocketKind::Udp(handle)) = self.sockets.remove(&req.socket_id) {
             socket_set.get_mut::<udp::Socket>(handle).close();
             socket_set.remove(handle);
-            // OwnedFd in UdpPipes auto-closes on drop
+            // Pipe handles in UdpPipes auto-close on drop
             self.udp_pipes.remove(&req.socket_id);
         }
         signal_result_close(client_fd);
@@ -704,7 +705,7 @@ impl NetDaemon {
 
         // BUG 4 fix: open pipe BEFORE adding socket to socket_set.
         // If pipe open fails, no socket to clean up.
-        let Some(notify_write_fd) = open_pipe_fd(req.notify_pipe_id, false) else {
+        let Some(notify_write_fd) = open_pipe(req.notify_pipe_id, false) else {
             send_error_close(client_fd, ERR_INVALID_INPUT);
             return;
         };
@@ -1045,12 +1046,7 @@ fn main() {
     eprintln!("netd: ready");
 
     // Create io_uring for event multiplexing
-    let (raw_ring_fd, ring_shm_token) = toyos_abi::syscall::io_uring_setup(64).expect("netd: io_uring_setup failed");
-    let ring_fd = OwnedFd::new(raw_ring_fd);
-    let ring_base = unsafe { toyos_abi::syscall::map_shared(ring_shm_token) };
-    let ring_params = unsafe { &*(ring_base as *const IoUringParams) };
-    let ring_sq_size = ring_params.sq_ring_size;
-    let ring_cq_size = ring_params.cq_ring_size;
+    let ring = toyos::ring::Ring::new(64);
     const TOKEN_LISTENER: u64 = 0;
     const TOKEN_NIC: u64 = 1;
     const TOKEN_TX_PIPE_BASE: u64 = 0x1000;
@@ -1095,34 +1091,13 @@ fn main() {
         };
 
         // 7. Poll: listener fd + NIC fd + tx pipe fds via io_uring
-        let mut to_submit = 0u32;
-        {
-            let sq_hdr = unsafe { &*(ring_base.add(SQ_RING_OFF as usize) as *const IoUringRingHeader) };
+        ring.poll_add(listener.fd(), IORING_POLL_IN, TOKEN_LISTENER);
+        ring.poll_add(device.nic_fd.fd(), IORING_POLL_IN, TOKEN_NIC);
 
-            let submit_sqe = |fd: i32, flags: u32, user_data: u64| {
-                let tail = sq_hdr.tail.load(std::sync::atomic::Ordering::Acquire);
-                let sqe = unsafe {
-                    &mut *(ring_base.add(SQES_OFF as usize + (tail & (ring_sq_size - 1)) as usize * core::mem::size_of::<IoUringSqe>()) as *mut IoUringSqe)
-                };
-                *sqe = IoUringSqe::default();
-                sqe.op = IORING_OP_POLL_ADD;
-                sqe.fd = fd;
-                sqe.op_flags = flags;
-                sqe.user_data = user_data;
-                sq_hdr.tail.store(tail.wrapping_add(1), std::sync::atomic::Ordering::Release);
-            };
-
-            submit_sqe(listener.fd().0, IORING_POLL_IN, TOKEN_LISTENER);
-            to_submit += 1;
-            submit_sqe(device.nic_fd.fd().0, IORING_POLL_IN, TOKEN_NIC);
-            to_submit += 1;
-
-            // Submit POLL_ADD for each active tx pipe (client → netd direction)
-            for (i, conn) in daemon.piped_connections.iter().enumerate() {
-                if let Some(ref fd) = conn.tx_read_fd {
-                    submit_sqe(fd.fd().0, IORING_POLL_IN, TOKEN_TX_PIPE_BASE + i as u64);
-                    to_submit += 1;
-                }
+        // Submit POLL_ADD for each active tx pipe (client → netd direction)
+        for (i, conn) in daemon.piped_connections.iter().enumerate() {
+            if let Some(ref pipe) = conn.tx_read_fd {
+                ring.poll_add(pipe.fd(), IORING_POLL_IN, TOKEN_TX_PIPE_BASE + i as u64);
             }
         }
 
@@ -1130,33 +1105,20 @@ fn main() {
             None => u64::MAX,
             Some(n) => n,
         };
-        let _ = toyos_abi::syscall::io_uring_enter(ring_fd.fd(), to_submit, 1, timeout);
 
-        // Drain CQEs
         let mut listener_ready = false;
-        {
-            let cq_hdr = unsafe { &*(ring_base.add(CQ_RING_OFF as usize) as *const IoUringRingHeader) };
-            loop {
-                let head = cq_hdr.head.load(std::sync::atomic::Ordering::Acquire);
-                let tail = cq_hdr.tail.load(std::sync::atomic::Ordering::Acquire);
-                if head == tail { break; }
-                let idx = head & (ring_cq_size - 1);
-                let cqe = unsafe {
-                    &*(ring_base.add(CQ_RING_OFF as usize + 16 + idx as usize * core::mem::size_of::<IoUringCqe>()) as *const IoUringCqe)
-                };
-                if cqe.result > 0 && cqe.user_data == TOKEN_LISTENER {
-                    listener_ready = true;
-                }
-                cq_hdr.head.store(head.wrapping_add(1), std::sync::atomic::Ordering::Release);
+        ring.wait(1, timeout, |token| {
+            if token == TOKEN_LISTENER {
+                listener_ready = true;
             }
-        }
+        });
 
         // 8. Accept and handle new IPC request (per-operation: accept → handle → close)
         if listener_ready {
-            let conn = services::accept(&listener).expect("accept failed");
-            let raw_fd = conn.fd.fd();
+            let result = services::accept(&listener).expect("accept failed");
+            let raw_fd = result.conn.fd();
             if let Ok(header) = ipc::recv_header(raw_fd) {
-                conn.fd.into_raw();
+                core::mem::forget(result.conn);
                 daemon.handle_message(raw_fd, &header, &mut socket_set, &mut iface);
             }
         }

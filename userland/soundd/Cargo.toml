@@ -4,3 +4,4 @@ edition = "2024"
 
 [dependencies]
 toyos-abi = { path = "../../toyos-abi" }
+toyos = { path = "../../toyos" }

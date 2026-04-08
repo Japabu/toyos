@@ -57,13 +57,13 @@ fn main() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     env::set_current_dir(&root).expect("Failed to cd to project root");
 
-    toyos::ensure_submodules(&root);
+    toyos_build::ensure_submodules(&root);
 
     // Ensure toolchain is up to date
-    toyos::toolchain::ensure(&root, rebuild_toolchain);
+    toyos_build::toolchain::ensure(&root, rebuild_toolchain);
 
     // Build everything
-    toyos::build::build(&root, debug, release);
+    toyos_build::build::build(&root, debug, release);
     println!("Build finished.");
 
     if !build_only {

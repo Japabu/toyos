@@ -2,8 +2,8 @@
 //!
 //! Wire format: `[u32 msg_type][u32 len][len bytes payload]`.
 
-use crate::Fd;
-use crate::syscall::{self, SyscallError};
+use toyos_abi::Fd;
+use toyos_abi::syscall::{self, SyscallError};
 
 #[repr(C)]
 #[derive(Clone, Copy)]

@@ -1,4 +1,4 @@
-use toyos_abi::system;
+use toyos::system;
 
 const HEADER: usize = system::SYSINFO_HEADER_SIZE;
 const ENTRY: usize = system::SYSINFO_ENTRY_SIZE;

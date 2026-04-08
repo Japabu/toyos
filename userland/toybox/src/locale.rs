@@ -1,5 +1,5 @@
 use std::io::{self, Read, Write};
-use toyos_abi::system::set_keyboard_layout;
+use toyos::system::set_keyboard_layout;
 
 const CONFIG_PATH: &str = "/home/root/.config/keyboard_layout";
 const LAYOUTS: &[&str] = &["us", "swiss-german-mac"];
