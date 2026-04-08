@@ -15,26 +15,6 @@ const CHANNELS: u16 = 2;
 const SAMPLE_RATE: SampleRate = 44100;
 const BUFFER_FRAMES: u32 = 1024;
 
-// soundd protocol (must match toyos_abi::audio)
-const MSG_AUDIO_OPEN: u32 = 1;
-const MSG_AUDIO_OPENED: u32 = 2;
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct AudioOpenRequest {
-    sample_rate: u32,
-    channels: u16,
-    format: u16,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct AudioOpenResponse {
-    stream_id: u32,
-    shm_token: u32,
-    ring_size: u32,
-}
-
 pub struct Host;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -176,22 +156,15 @@ impl DeviceTrait for Device {
         let buffer_samples = buffer_frames as usize * channels;
         let buffer_bytes = buffer_samples * sample_size;
 
-        // Connect to soundd and request a stream
-        let control = connect_soundd();
-        let req = AudioOpenRequest {
-            sample_rate: sample_rate as u32,
-            channels: channels as u16,
-            format: 0, // S16LE
-        };
-        toyos::ipc::send(control, MSG_AUDIO_OPEN, &req).expect("soundd not responding");
-
-        // soundd allocates shared memory and sends us the token
-        let (msg_type, resp): (u32, AudioOpenResponse) =
-            toyos::ipc::recv(control).expect("soundd not responding");
-        assert_eq!(msg_type, MSG_AUDIO_OPENED);
-
-        // Map the shared memory ring
-        let shm = toyos::shm::SharedMemory::map(resp.shm_token, resp.ring_size as usize);
+        let audio = toyos::audio::AudioStream::open(
+            sample_rate as u32,
+            channels as u16,
+            0, // S16LE
+        ).map_err(|e| BuildStreamError::BackendSpecific {
+            err: crate::BackendSpecificError {
+                description: format!("failed to open audio stream: {e:?}"),
+            },
+        })?;
 
         let playing = Arc::new(AtomicBool::new(false));
         let alive = Arc::new(AtomicBool::new(true));
@@ -201,7 +174,7 @@ impl DeviceTrait for Device {
         let thread = std::thread::Builder::new()
             .name("cpal-toyos-audio".to_string())
             .spawn(move || {
-                let ring = unsafe { &*(shm.as_ptr() as *const toyos_abi::ring::RingHeader) };
+                let ring = audio.ring();
                 let mut buffer = vec![0u8; buffer_bytes];
                 while alive2.load(Ordering::Relaxed) {
                     if !playing2.load(Ordering::Relaxed) {
@@ -248,7 +221,7 @@ impl DeviceTrait for Device {
 
                 }
 
-                ring.close_writer();
+                ring.close();
             })
             .map_err(|e| BuildStreamError::BackendSpecific {
                 err: crate::BackendSpecificError {
@@ -262,16 +235,6 @@ impl DeviceTrait for Device {
             thread: Some(thread),
         })
     }
-}
-
-fn connect_soundd() -> toyos_abi::Fd {
-    for _ in 0..100 {
-        if let Ok(fd) = toyos_abi::syscall::connect("soundd") {
-            return fd;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    panic!("soundd not found");
 }
 
 impl StreamTrait for Stream {
@@ -289,16 +252,15 @@ impl StreamTrait for Stream {
 impl Drop for Stream {
     fn drop(&mut self) {
         self.alive.store(false, Ordering::Relaxed);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+        if let Some(th) = self.thread.take() {
+            let _ = th.join();
         }
     }
 }
 
 impl Iterator for Devices {
     type Item = Device;
-
-    fn next(&mut self) -> Option<Device> {
+    fn next(&mut self) -> Option<Self::Item> {
         if self.yielded {
             None
         } else {
