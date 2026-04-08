@@ -2,7 +2,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use toyos_abi::shm::SharedMemory;
-use toyos_abi::{gpu, ipc, services, system, FramebufferInfo, Fd};
+use toyos_abi::{gpu, ipc, services, system, FramebufferInfo, Fd, OwnedFd};
 use toyos_abi::io_uring::*;
 use toyos_abi::{device, syscall};
 use window::{Color, Framebuffer};
@@ -53,15 +53,15 @@ const LAUNCHER_APPS: &[LauncherEntry] = &[
 
 const FLAG_HARDWARE_CURSOR: u32 = 1 << 0;
 
-fn read_fb_info(fd: Fd) -> FramebufferInfo {
+fn read_fb_info(fd: &OwnedFd) -> FramebufferInfo {
     let mut buf = [0u8; std::mem::size_of::<FramebufferInfo>()];
-    let n = syscall::read(fd, &mut buf).expect("failed to read framebuffer info");
+    let n = syscall::read(fd.fd(), &mut buf).expect("failed to read framebuffer info");
     assert_eq!(n, buf.len(), "failed to read framebuffer info");
     unsafe { std::ptr::read(buf.as_ptr() as *const FramebufferInfo) }
 }
 
 struct WindowState {
-    fd: Fd,
+    fd: OwnedFd,
     pid: u32,
     shm: SharedMemory,
     content_x: usize,
@@ -154,7 +154,7 @@ fn resize_window(win: &mut WindowState, new_w: usize, new_h: usize, pixel_format
     win.buf_width = new_w;
     win.buf_height = new_h;
     let _ = ipc::send(
-        win.fd,
+        win.fd.fd(),
         window::MSG_WINDOW_RESIZED,
         &window::ResizeInfo {
             token,
@@ -658,7 +658,7 @@ fn main() {
     let mouse_fd = device::open_mouse().expect("failed to claim mouse");
     let fb_fd = device::open_framebuffer().expect("failed to claim framebuffer");
 
-    let mut fb_info = read_fb_info(fb_fd);
+    let mut fb_info = read_fb_info(&fb_fd);
     let fb_size = fb_info.stride as usize * fb_info.height as usize * 4;
     let mut fb_shm = SharedMemory::map(fb_info.token[0], fb_size);
     let mut screen = Framebuffer::new(
@@ -749,12 +749,13 @@ fn main() {
     // io_uring token assignments: system fds use their fd number directly.
     // Client fds also use their fd number. We distinguish by checking if the
     // token matches a known system fd.
-    let token_kb = kb_fd.0 as u64;
-    let token_mouse = mouse_fd.0 as u64;
-    let token_listener = listener_fd.0 as u64;
+    let token_kb = kb_fd.fd().0 as u64;
+    let token_mouse = mouse_fd.fd().0 as u64;
+    let token_listener = listener_fd.fd().0 as u64;
 
     // Create io_uring for event multiplexing
-    let (ring_fd, ring_shm_token) = syscall::io_uring_setup(256).expect("io_uring_setup failed");
+    let (raw_ring_fd, ring_shm_token) = syscall::io_uring_setup(256).expect("io_uring_setup failed");
+    let ring_fd = OwnedFd::new(raw_ring_fd);
     let ring_base = unsafe { syscall::map_shared(ring_shm_token) };
     let ring_params = unsafe { &*(ring_base as *const IoUringParams) };
     let ring_sq_size = ring_params.sq_ring_size;
@@ -776,9 +777,9 @@ fn main() {
     };
 
     // Submit initial POLL_ADDs for system fds (tokens = fd numbers)
-    ring_submit(kb_fd.0, token_kb, IORING_POLL_IN);
-    ring_submit(mouse_fd.0, token_mouse, IORING_POLL_IN);
-    ring_submit(listener_fd.0, token_listener, IORING_POLL_IN);
+    ring_submit(kb_fd.fd().0, token_kb, IORING_POLL_IN);
+    ring_submit(mouse_fd.fd().0, token_mouse, IORING_POLL_IN);
+    ring_submit(listener_fd.fd().0, token_listener, IORING_POLL_IN);
 
     loop {
         // Drain all pending events before compositing
@@ -793,7 +794,7 @@ fn main() {
                 let tail = sq_hdr.tail.load(std::sync::atomic::Ordering::Acquire);
                 tail.wrapping_sub(head)
             };
-            let _ = syscall::io_uring_enter(ring_fd, pending, 1, timeout.as_nanos() as u64);
+            let _ = syscall::io_uring_enter(ring_fd.fd(), pending, 1, timeout.as_nanos() as u64);
 
             // Drain CQEs into a set of ready tokens (fd numbers)
             let mut ready_tokens: Vec<u64> = Vec::new();
@@ -815,7 +816,7 @@ fn main() {
             let kb_ready = ready_tokens.contains(&token_kb);
             let mouse_ready = ready_tokens.contains(&token_mouse);
             let listener_ready = ready_tokens.contains(&token_listener);
-            let any_client_ready = windows.iter().any(|w| ready_tokens.contains(&(w.fd.0 as u64)));
+            let any_client_ready = windows.iter().any(|w| ready_tokens.contains(&(w.fd.fd().0 as u64)));
 
             if !kb_ready && !mouse_ready && !listener_ready && !any_client_ready {
                 break;
@@ -830,7 +831,7 @@ fn main() {
                     std::mem::size_of_val(&events),
                 )
             };
-            let n = syscall::read(kb_fd, buf).unwrap_or(0);
+            let n = syscall::read(kb_fd.fd(), buf).unwrap_or(0);
             for event in &events[..n / std::mem::size_of::<window::KeyEvent>()] {
                 if launcher_open && event.pressed() && event.keycode == 0x29 {
                     // Escape: close launcher
@@ -902,14 +903,14 @@ fn main() {
                             0x14 => {
                                 // GUI+Q: close focused window
                                 let win = windows.remove(idx);
-                                let _ = ipc::signal(win.fd,window::MSG_WINDOW_CLOSE);
+                                let _ = ipc::signal(win.fd.fd(), window::MSG_WINDOW_CLOSE);
                             }
                             0x19 => {
                                 // GUI+V: paste clipboard
                                 if !clipboard.is_empty() {
                                     if clipboard.len() <= 4096 {
                                         let _ = ipc::send_bytes(
-                                            windows[idx].fd,
+                                            windows[idx].fd.fd(),
                                             window::MSG_CLIPBOARD_PASTE,
                                             clipboard.as_bytes(),
                                         );
@@ -920,7 +921,7 @@ fn main() {
                                         shm.as_mut_slice()[..clipboard.len()]
                                             .copy_from_slice(clipboard.as_bytes());
                                         let _ = ipc::send(
-                                            windows[idx].fd,
+                                            windows[idx].fd.fd(),
                                             window::MSG_CLIPBOARD_PASTE_SHM,
                                             &window::ClipboardShmMsg {
                                                 token: shm.token(),
@@ -934,7 +935,7 @@ fn main() {
                             _ => {
                                 // Forward other GUI combos to focused app
                                 let _ = ipc::send(
-                                    windows[idx].fd,
+                                    windows[idx].fd.fd(),
                                     window::MSG_KEY_INPUT,
                                     event,
                                 );
@@ -947,7 +948,7 @@ fn main() {
                     Command::new("/bin/terminal").spawn().ok();
                 } else {
                     if let Some(idx) = focused_window_idx(&windows) {
-                        let _ = ipc::send(windows[idx].fd, window::MSG_KEY_INPUT, event);
+                        let _ = ipc::send(windows[idx].fd.fd(), window::MSG_KEY_INPUT, event);
                     }
                 }
             }
@@ -956,7 +957,7 @@ fn main() {
         if mouse_ready {
             // Drain all pending mouse events in one read
             let mut buf = [0u8; 512];
-            let n = syscall::read(mouse_fd, &mut buf).unwrap_or(0);
+            let n = syscall::read(mouse_fd.fd(), &mut buf).unwrap_or(0);
             let event_size = 6; // MouseEvent: buttons(1) + scroll(1) + abs_x(2) + abs_y(2)
             let event_count = n / event_size;
 
@@ -1054,7 +1055,7 @@ fn main() {
                     match hit_test(&windows, cursor_x, cursor_y, screen_h, launcher_open) {
                         HitZone::CloseButton(idx) => {
                             let win = windows.remove(idx);
-                            let _ = ipc::signal(win.fd,window::MSG_WINDOW_CLOSE);
+                            let _ = ipc::signal(win.fd.fd(), window::MSG_WINDOW_CLOSE);
                             mark_dirty(&mut dirty_rect, DirtyRect::full(screen_w as usize, screen_h as usize));
                         }
                         HitZone::MinimizeButton(idx) => {
@@ -1081,7 +1082,7 @@ fn main() {
 
                             // Double-click detection
                             let now = Instant::now();
-                            let win_fd = windows[new_idx].fd;
+                            let win_fd = windows[new_idx].fd.fd();
                             if Some(win_fd) == last_title_click_fd
                                 && now.duration_since(last_title_click_time) < DOUBLE_CLICK_TIME
                             {
@@ -1132,7 +1133,7 @@ fn main() {
                             }
                             let win = &windows[new_idx];
                             let ev = make_mouse_event(win, window::MOUSE_PRESS, 1, 0);
-                            let _ = ipc::send(win.fd, window::MSG_MOUSE_INPUT, &ev);
+                            let _ = ipc::send(win.fd.fd(), window::MSG_MOUSE_INPUT, &ev);
                         }
                         HitZone::TaskbarItem(idx) => {
                             if idx < windows.len() {
@@ -1170,7 +1171,7 @@ fn main() {
                     if let Some(idx) = focused_window_idx(&windows) {
                         let ev = make_mouse_event(&windows[idx], window::MOUSE_RELEASE, 1, 0);
                         let _ = ipc::send(
-                            windows[idx].fd,
+                            windows[idx].fd.fd(),
                             window::MSG_MOUSE_INPUT,
                             &ev,
                         );
@@ -1289,7 +1290,7 @@ fn main() {
                                     0,
                                 );
                                 let _ = ipc::send(
-                                    windows[idx].fd,
+                                    windows[idx].fd.fd(),
                                     window::MSG_MOUSE_INPUT,
                                     &ev,
                                 );
@@ -1307,7 +1308,7 @@ fn main() {
                             let clamped_scroll = total_scroll.clamp(-128, 127) as i8;
                             let ev =
                                 make_mouse_event(&windows[idx], window::MOUSE_SCROLL, 0, clamped_scroll);
-                            let _ = ipc::send(windows[idx].fd, window::MSG_MOUSE_INPUT, &ev);
+                            let _ = ipc::send(windows[idx].fd.fd(), window::MSG_MOUSE_INPUT, &ev);
                         }
                     }
                 }
@@ -1321,21 +1322,21 @@ fn main() {
         let mut client_msgs: Vec<(Fd, u32, ipc::IpcHeader)> = Vec::new();
 
         if listener_ready {
-            let conn = services::accept(listener_fd).expect("accept failed");
-            if let Ok(header) = ipc::recv_header(conn.fd) {
-                client_msgs.push((conn.fd, conn.client_pid, header));
-            } else {
-                syscall::close(conn.fd);
+            let conn = services::accept(&listener_fd).expect("accept failed");
+            let raw_fd = conn.fd.fd();
+            if let Ok(header) = ipc::recv_header(raw_fd) {
+                client_msgs.push((raw_fd, conn.client_pid, header));
+                conn.fd.into_raw();
             }
         }
 
         let mut dead_fds: Vec<Fd> = Vec::new();
         for i in 0..windows.len() {
-            if ready_tokens.contains(&(windows[i].fd.0 as u64)) {
+            if ready_tokens.contains(&(windows[i].fd.fd().0 as u64)) {
                 let win = &mut windows[i];
                 // Non-blocking read into per-client header buffer
-                match syscall::read_nonblock(win.fd, &mut win.recv_buf[win.recv_len..]) {
-                    Ok(0) => dead_fds.push(win.fd),
+                match syscall::read_nonblock(win.fd.fd(), &mut win.recv_buf[win.recv_len..]) {
+                    Ok(0) => dead_fds.push(win.fd.fd()),
                     Ok(n) => {
                         win.recv_len += n;
                         if win.recv_len >= 8 {
@@ -1344,7 +1345,7 @@ fn main() {
                                 len: u32::from_ne_bytes([win.recv_buf[4], win.recv_buf[5], win.recv_buf[6], win.recv_buf[7]]),
                             };
                             win.recv_len = 0;
-                            client_msgs.push((win.fd, win.pid, header));
+                            client_msgs.push((win.fd.fd(), win.pid, header));
                         }
                         // else: partial header, continue next iteration
                     }
@@ -1353,7 +1354,7 @@ fn main() {
             }
         }
         if !dead_fds.is_empty() {
-            windows.retain(|w| !dead_fds.contains(&w.fd));
+            windows.retain(|w| !dead_fds.contains(&w.fd.fd()));
             mark_dirty(&mut dirty_rect, DirtyRect::full(screen_w as usize, screen_h as usize));
         }
 
@@ -1403,7 +1404,7 @@ fn main() {
 
                     let topmost = req.flags & window::WINDOW_FLAG_TOPMOST != 0;
                     windows.push(WindowState {
-                        fd: client_fd,
+                        fd: OwnedFd::new(client_fd),
                         pid: client_pid,
                         shm,
                         content_x,
@@ -1443,14 +1444,13 @@ fn main() {
                     mark_dirty(&mut dirty_rect, DirtyRect::full(screen_w, screen_h));
                 }
                 window::MSG_PRESENT => {
-                    if let Some(win) = windows.iter_mut().find(|w| w.fd == client_fd) {
+                    if let Some(win) = windows.iter_mut().find(|w| w.fd.fd() == client_fd) {
                         win.presented = true;
                         mark_dirty(&mut dirty_rect, window_screen_rect(win));
                     }
                 }
                 window::MSG_DESTROY_WINDOW => {
-                    if let Some(idx) = windows.iter().position(|w| w.fd == client_fd) {
-                        syscall::close(windows[idx].fd);
+                    if let Some(idx) = windows.iter().position(|w| w.fd.fd() == client_fd) {
                         windows.remove(idx);
                         mark_dirty(&mut dirty_rect, DirtyRect::full(screen_w as usize, screen_h as usize));
                     }
@@ -1467,7 +1467,7 @@ fn main() {
                 }
                 window::MSG_SET_CURSOR => {
                     let style: u32 = ipc::recv_payload(client_fd, &header).unwrap();
-                    if let Some(win) = windows.iter_mut().find(|w| w.fd == client_fd) {
+                    if let Some(win) = windows.iter_mut().find(|w| w.fd.fd() == client_fd) {
                         win.cursor_style = style as u8;
                     }
                 }
@@ -1541,13 +1541,13 @@ fn main() {
             }
         }
         // Re-arm one-shot POLL_ADDs for fds that fired
-        if kb_ready { ring_submit(kb_fd.0, token_kb, IORING_POLL_IN); }
-        if mouse_ready { ring_submit(mouse_fd.0, token_mouse, IORING_POLL_IN); }
-        if listener_ready { ring_submit(listener_fd.0, token_listener, IORING_POLL_IN); }
+        if kb_ready { ring_submit(kb_fd.fd().0, token_kb, IORING_POLL_IN); }
+        if mouse_ready { ring_submit(mouse_fd.fd().0, token_mouse, IORING_POLL_IN); }
+        if listener_ready { ring_submit(listener_fd.fd().0, token_listener, IORING_POLL_IN); }
         for win in windows.iter() {
-            let token = win.fd.0 as u64;
+            let token = win.fd.fd().0 as u64;
             if ready_tokens.contains(&token) {
-                ring_submit(win.fd.0, token, IORING_POLL_IN);
+                ring_submit(win.fd.fd().0, token, IORING_POLL_IN);
             }
         }
         } // end inner drain loop
@@ -1605,20 +1605,11 @@ fn main() {
                 // Send frame callbacks to windows that presented and were composited
                 for win in windows.iter_mut() {
                     if win.presented && !win.minimized && rect.overlaps(window_screen_rect(win)) {
-                        let _ = ipc::signal(win.fd,window::MSG_FRAME);
+                        let _ = ipc::signal(win.fd.fd(),window::MSG_FRAME);
                         win.presented = false;
                     }
                 }
 
-                // Reap windows whose processes have exited
-                let count_before = windows.len();
-                windows.retain(|win| {
-                    let _ = ipc::signal(win.fd,window::MSG_FRAME);
-                    true
-                });
-                if windows.len() != count_before {
-                    mark_dirty(&mut dirty_rect, DirtyRect::full(screen_w as usize, screen_h as usize));
-                }
             }
         }
     }

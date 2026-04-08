@@ -14,6 +14,7 @@ The name has no meaning. This is not a hobby project. The quality bar is the sam
 - **Development ergonomics above all.** The ability to iterate fast matters more than feature count. Tooling comes first.
 - **Self-hosting.** The north star is building ToyOS from within ToyOS. No LLVM dependency. Cranelift as codegen backend.
 - **Efficient.** Never hog resources without purpose. Free memory when not used. Minimize kernel overhead. The OS must be fast and responsive. General improvements only — never optimize for one specific app.
+- **No slop comments.** Never add comments that restate what the code does. No "auto-closes on drop", "returns the value", "loop through items". Comments explain *why*, not *what*. If the code needs a *what* comment to be understood, rewrite the code.
 
 ## Architecture
 
@@ -138,3 +139,5 @@ Three layers, built in order. Each layer is useful on its own.
 - **`SharedToken` is a bare `u32` — no RAII.** Unlike `PhysPage` (which can't leak because Drop returns it to the PMM), `SharedToken` is `Copy` with no destructor. The caller must remember to call the right cleanup function. It should be a non-Copy RAII handle: Drop removes the region and frees backing pages. Expose `.raw()` for the numeric value to pass to userspace, but keep the owning handle in kernel data structures.
 - **No physical memory fairness.** Any process can allocate unbounded physical memory until the system runs out. There are no per-process limits, no memory pressure signals, and no OOM killer. A single misbehaving process can starve the entire system.
 - **`build_toyos_bins` belongs in the test harness, not `src/build.rs`.** It's only called from the test harness and contains test-specific logic (cdylib subcrate discovery, `-L` rustflags for `.so` linking). Move it to `tests/`.
+- **`toyos-abi` is two things in one crate.** Half is pure ABI definitions (struct layouts, syscall numbers, constants — used by both kernel and userland). Half is userland runtime library (syscall wrappers, RAII types like `SharedMemory`, helpers like `ipc::send()`, `services::listen()` — never used by kernel). Should split into `toyos-abi` (pure contract) and a userland runtime crate.
+- **`Fd` is a Unix-ism.** ToyOS has no files-are-everything model. The integer identifies pipes, devices, io_uring instances, IPC connections — it's a handle, not a file descriptor. Rename `Fd` → `Handle` (and `OwnedFd` → `OwnedHandle`) to match what it actually is. Aligns with the capability-based direction.

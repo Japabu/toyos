@@ -16,9 +16,37 @@ pub mod shm;
 pub mod syscall;
 pub mod system;
 
-/// A file descriptor.
+/// A file descriptor (raw, Copy). Use `OwnedFd` for automatic close-on-drop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Fd(pub i32);
+
+/// An owned file descriptor. Non-Copy. Drop calls `syscall::close()`.
+///
+/// Use `.fd()` to get the raw `Fd` for passing to syscall functions.
+/// Use `.into_raw()` to take ownership without closing.
+pub struct OwnedFd(Fd);
+
+impl OwnedFd {
+    pub fn new(fd: Fd) -> Self { Self(fd) }
+    pub fn fd(&self) -> Fd { self.0 }
+    pub fn into_raw(self) -> Fd {
+        let fd = self.0;
+        core::mem::forget(self);
+        fd
+    }
+}
+
+impl Drop for OwnedFd {
+    fn drop(&mut self) {
+        syscall::close(self.0);
+    }
+}
+
+impl core::fmt::Debug for OwnedFd {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "OwnedFd({})", self.0.0)
+    }
+}
 
 /// A process ID. Identifies a process — owns address space, FDs, vruntime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]

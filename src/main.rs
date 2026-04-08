@@ -64,6 +64,7 @@ fn main() {
 
     // Build everything
     toyos::build::build(&root, debug, release);
+    println!("Build finished.");
 
     if !build_only {
         qemu::launch(debug, dump_audio);

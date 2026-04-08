@@ -3,7 +3,6 @@ use font::Font;
 use std::fs;
 use toyos_abi::ipc;
 use toyos_abi::services;
-use toyos_abi::syscall;
 use toyos_abi::Fd;
 use std::path::{Path, PathBuf};
 use window::{Color, Event, Framebuffer, KeyEvent, MouseEvent, Window};
@@ -461,14 +460,12 @@ fn main() {
     let listener = services::listen("filepicker").expect("filepicker: name already taken");
 
     loop {
-        let conn = services::accept(listener).expect("accept failed");
-        let client_fd = conn.fd;
+        let conn = services::accept(&listener).expect("accept failed");
+        let client_fd = conn.fd.fd();
         let Ok(header) = ipc::recv_header(client_fd) else {
-            syscall::close(client_fd);
             continue;
         };
         if header.msg_type != MSG_FILEPICKER_REQUEST {
-            syscall::close(client_fd);
             continue;
         }
 
@@ -486,6 +483,5 @@ fn main() {
         };
 
         run_picker(mode, start_dir, client_fd);
-        syscall::close(client_fd);
     }
 }

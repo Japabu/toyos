@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
-use toyos_abi::Fd;
+use toyos_abi::{Fd, OwnedFd};
 use toyos_abi::device;
 use toyos_abi::ipc;
 use toyos_abi::pipe;
@@ -28,7 +28,7 @@ struct DmaNic {
     tx_buf: *mut u8,
     net_hdr_size: usize,
     mac: [u8; 6],
-    nic_fd: Fd,
+    nic_fd: OwnedFd,
 }
 
 impl DmaNic {
@@ -36,7 +36,7 @@ impl DmaNic {
         let nic_fd = device::open_nic().expect("netd: failed to claim NIC device");
 
         let mut info_bytes = [0u8; core::mem::size_of::<toyos_abi::net::NicInfo>()];
-        let n = toyos_abi::syscall::read(nic_fd, &mut info_bytes).expect("netd: failed to read NicInfo");
+        let n = toyos_abi::syscall::read(nic_fd.fd(), &mut info_bytes).expect("netd: failed to read NicInfo");
         assert_eq!(n, info_bytes.len(), "netd: NicInfo size mismatch");
         let info: toyos_abi::net::NicInfo = unsafe { core::ptr::read(info_bytes.as_ptr() as *const _) };
 
@@ -145,8 +145,8 @@ enum SocketKind {
 }
 
 struct UdpPipes {
-    tx_read_fd: Fd,
-    rx_write_fd: Fd,
+    tx_read_fd: OwnedFd,
+    rx_write_fd: OwnedFd,
 }
 
 struct PendingUdpRecv {
@@ -164,23 +164,19 @@ struct PendingDns {
 /// A piped TCP connection: data flows through kernel pipes instead of IPC messages.
 struct PipedConnection {
     handle: SocketHandle,
-    rx_write_fd: Option<Fd>,
-    tx_read_fd: Option<Fd>,
+    rx_write_fd: Option<OwnedFd>,
+    tx_read_fd: Option<OwnedFd>,
     rx_ring: *const toyos_abi::ring::RingHeader,
     tx_ring: *const toyos_abi::ring::RingHeader,
 }
 
 impl PipedConnection {
     fn close_rx(&mut self) {
-        if let Some(fd) = self.rx_write_fd.take() {
-            toyos_abi::syscall::close(fd);
-        }
+        self.rx_write_fd.take();
     }
 
     fn close_tx(&mut self) {
-        if let Some(fd) = self.tx_read_fd.take() {
-            toyos_abi::syscall::close(fd);
-        }
+        self.tx_read_fd.take();
     }
 
     fn close_all(&mut self) {
@@ -196,7 +192,7 @@ impl PipedConnection {
 /// A piped TCP listener: netd writes 1 byte to notify pipe on new connection.
 struct PipedListener {
     handle: SocketHandle,
-    notify_write_fd: Fd,
+    notify_write_fd: OwnedFd,
     notify_ring: *const toyos_abi::ring::RingHeader,
     notified: bool,
 }
@@ -210,32 +206,28 @@ struct PendingPipedConnect {
     deadline: Option<Instant>,
 }
 
-fn map_pipe_ring(fd: Fd) -> *const toyos_abi::ring::RingHeader {
-    toyos_abi::syscall::pipe_map(fd)
+fn map_pipe_ring(fd: &OwnedFd) -> *const toyos_abi::ring::RingHeader {
+    toyos_abi::syscall::pipe_map(fd.fd())
         .expect("pipe_map failed") as *const toyos_abi::ring::RingHeader
 }
 
 /// Open a pipe by ID and return the fd. `read_end=true` opens for reading, false for writing.
-fn open_pipe_fd(pipe_id: u64, read_end: bool) -> Option<Fd> {
-    pipe::open_by_id(pipe_id, read_end).ok()
+fn open_pipe_fd(pipe_id: u64, read_end: bool) -> Option<OwnedFd> {
+    pipe::open_by_id(pipe_id, read_end).ok().map(OwnedFd::new)
 }
 
 /// Open rx (write) and tx (read) pipe fds and create a PipedConnection.
 fn open_piped_connection(handle: SocketHandle, rx_pipe_id: u64, tx_pipe_id: u64) -> Option<PipedConnection> {
     let rx_write_fd = open_pipe_fd(rx_pipe_id, false)?;
-    let tx_read_fd = match open_pipe_fd(tx_pipe_id, true) {
-        Some(fd) => fd,
-        None => {
-            toyos_abi::syscall::close(rx_write_fd);
-            return None;
-        }
-    };
+    let tx_read_fd = open_pipe_fd(tx_pipe_id, true)?;
+    let rx_ring = map_pipe_ring(&rx_write_fd);
+    let tx_ring = map_pipe_ring(&tx_read_fd);
     Some(PipedConnection {
         handle,
         rx_write_fd: Some(rx_write_fd),
         tx_read_fd: Some(tx_read_fd),
-        rx_ring: map_pipe_ring(rx_write_fd),
-        tx_ring: map_pipe_ring(tx_read_fd),
+        rx_ring,
+        tx_ring,
     })
 }
 
@@ -362,17 +354,12 @@ impl NetDaemon {
                 SocketKind::TcpListener(handle) => {
                     socket_set.get_mut::<tcp::Socket>(handle).abort();
                     socket_set.remove(handle);
-                    if let Some(listener) = self.piped_listeners.remove(&req.socket_id) {
-                        toyos_abi::syscall::close(listener.notify_write_fd);
-                    }
+                    self.piped_listeners.remove(&req.socket_id);
                 }
                 SocketKind::Udp(handle) => {
                     socket_set.get_mut::<udp::Socket>(handle).close();
                     socket_set.remove(handle);
-                    if let Some(pipes) = self.udp_pipes.remove(&req.socket_id) {
-                        toyos_abi::syscall::close(pipes.tx_read_fd);
-                        toyos_abi::syscall::close(pipes.rx_write_fd);
-                    }
+                    self.udp_pipes.remove(&req.socket_id);
                 }
             }
         }
@@ -417,7 +404,6 @@ impl NetDaemon {
             return;
         };
         let Some(rx_write_fd) = open_pipe_fd(req.rx_pipe_id, false) else {
-            toyos_abi::syscall::close(tx_read_fd);
             send_error_close(client_fd, ERR_INVALID_INPUT);
             return;
         };
@@ -433,8 +419,6 @@ impl NetDaemon {
         let mut socket = udp::Socket::new(rx_buf, tx_buf);
         let endpoint = IpEndpoint::new(IpAddress::Ipv4(Ipv4Addr::from(req.addr)), port);
         if socket.bind(endpoint).is_err() {
-            toyos_abi::syscall::close(tx_read_fd);
-            toyos_abi::syscall::close(rx_write_fd);
             send_error_close(client_fd, ERR_ADDR_IN_USE);
             return;
         }
@@ -474,7 +458,7 @@ impl NetDaemon {
         };
 
         let mut buf = vec![0u8; req.len as usize];
-        let n = match toyos_abi::syscall::read(pipes.tx_read_fd, &mut buf) {
+        let n = match toyos_abi::syscall::read(pipes.tx_read_fd.fd(), &mut buf) {
             Ok(n) => n,
             Err(_) => {
                 send_error_close(client_fd, ERR_OTHER);
@@ -535,7 +519,7 @@ impl NetDaemon {
             send_error_close(client_fd, ERR_NOT_CONNECTED);
             return;
         };
-        let rx_write_fd = pipes.rx_write_fd;
+        let rx_write_fd = pipes.rx_write_fd.fd();
         let socket = socket_set.get_mut::<udp::Socket>(handle);
 
         if Self::send_udp_recv_response(client_fd, socket, req.max_len, rx_write_fd) {
@@ -561,10 +545,8 @@ impl NetDaemon {
         if let Some(SocketKind::Udp(handle)) = self.sockets.remove(&req.socket_id) {
             socket_set.get_mut::<udp::Socket>(handle).close();
             socket_set.remove(handle);
-            if let Some(pipes) = self.udp_pipes.remove(&req.socket_id) {
-                toyos_abi::syscall::close(pipes.tx_read_fd);
-                toyos_abi::syscall::close(pipes.rx_write_fd);
-            }
+            // OwnedFd in UdpPipes auto-closes on drop
+            self.udp_pipes.remove(&req.socket_id);
         }
         signal_result_close(client_fd);
     }
@@ -731,7 +713,6 @@ impl NetDaemon {
         let tx_buf = tcp::SocketBuffer::new(vec![0u8; 65536]);
         let mut socket = tcp::Socket::new(rx_buf, tx_buf);
         if socket.listen(port).is_err() {
-            toyos_abi::syscall::close(notify_write_fd);
             send_error_close(client_fd, ERR_ADDR_IN_USE);
             return;
         }
@@ -740,10 +721,11 @@ impl NetDaemon {
         let socket_id = self.alloc_id();
         self.sockets.insert(socket_id, SocketKind::TcpListener(handle));
 
+        let notify_ring = map_pipe_ring(&notify_write_fd);
         self.piped_listeners.insert(socket_id, PipedListener {
             handle,
             notify_write_fd,
-            notify_ring: map_pipe_ring(notify_write_fd),
+            notify_ring,
             notified: false,
         });
 
@@ -827,11 +809,11 @@ impl NetDaemon {
 
             // smoltcp rx → pipe write via kernel (ensures reader notification)
             while socket.can_recv() {
-                if let Some(fd) = conn.rx_write_fd {
+                if let Some(ref fd) = conn.rx_write_fd {
                     let mut buf = [0u8; 4096];
                     match socket.recv_slice(&mut buf) {
                         Ok(n) if n > 0 => {
-                            let _ = toyos_abi::syscall::write_nonblock(fd, &buf[..n]);
+                            let _ = toyos_abi::syscall::write_nonblock(fd.fd(), &buf[..n]);
                         }
                         _ => break,
                     };
@@ -842,9 +824,9 @@ impl NetDaemon {
 
             // pipe read → smoltcp tx (drain fully via kernel for proper notification)
             while socket.can_send() {
-                if let Some(fd) = conn.tx_read_fd {
+                if let Some(ref fd) = conn.tx_read_fd {
                     let mut buf = [0u8; 4096];
-                    match toyos_abi::syscall::read_nonblock(fd, &mut buf) {
+                    match toyos_abi::syscall::read_nonblock(fd.fd(), &mut buf) {
                         Ok(n) if n > 0 => { let _ = socket.send_slice(&buf[..n]); }
                         _ => break,
                     }
@@ -887,7 +869,7 @@ impl NetDaemon {
             // BUG 6 fix: check Established, not is_active.
             // is_active is true in SynReceived before the 3-way handshake completes.
             if socket.state() == tcp::State::Established && !listener.notified {
-                let _ = toyos_abi::syscall::write_nonblock(listener.notify_write_fd, &[1]);
+                let _ = toyos_abi::syscall::write_nonblock(listener.notify_write_fd.fd(), &[1]);
                 listener.notified = true;
             }
         }
@@ -903,8 +885,7 @@ impl NetDaemon {
             }
         }
         for socket_id in dead {
-            if let Some(listener) = self.piped_listeners.remove(&socket_id) {
-                toyos_abi::syscall::close(listener.notify_write_fd);
+            if let Some(_listener) = self.piped_listeners.remove(&socket_id) {
                 if let Some(kind) = self.sockets.remove(&socket_id) {
                     if let SocketKind::TcpListener(handle) = kind {
                         socket_set.get_mut::<tcp::Socket>(handle).abort();
@@ -934,7 +915,7 @@ impl NetDaemon {
                 self.pending_udp_recvs.swap_remove(i);
                 continue;
             };
-            let rx_write_fd = pipes.rx_write_fd;
+            let rx_write_fd = pipes.rx_write_fd.fd();
             let socket = socket_set.get_mut::<udp::Socket>(handle);
             let client = pr.client_fd;
             let max_len = pr.max_len;
@@ -1064,7 +1045,8 @@ fn main() {
     eprintln!("netd: ready");
 
     // Create io_uring for event multiplexing
-    let (ring_fd, ring_shm_token) = toyos_abi::syscall::io_uring_setup(64).expect("netd: io_uring_setup failed");
+    let (raw_ring_fd, ring_shm_token) = toyos_abi::syscall::io_uring_setup(64).expect("netd: io_uring_setup failed");
+    let ring_fd = OwnedFd::new(raw_ring_fd);
     let ring_base = unsafe { toyos_abi::syscall::map_shared(ring_shm_token) };
     let ring_params = unsafe { &*(ring_base as *const IoUringParams) };
     let ring_sq_size = ring_params.sq_ring_size;
@@ -1130,15 +1112,15 @@ fn main() {
                 sq_hdr.tail.store(tail.wrapping_add(1), std::sync::atomic::Ordering::Release);
             };
 
-            submit_sqe(listener.0, IORING_POLL_IN, TOKEN_LISTENER);
+            submit_sqe(listener.fd().0, IORING_POLL_IN, TOKEN_LISTENER);
             to_submit += 1;
-            submit_sqe(device.nic_fd.0, IORING_POLL_IN, TOKEN_NIC);
+            submit_sqe(device.nic_fd.fd().0, IORING_POLL_IN, TOKEN_NIC);
             to_submit += 1;
 
             // Submit POLL_ADD for each active tx pipe (client → netd direction)
             for (i, conn) in daemon.piped_connections.iter().enumerate() {
-                if let Some(fd) = conn.tx_read_fd {
-                    submit_sqe(fd.0, IORING_POLL_IN, TOKEN_TX_PIPE_BASE + i as u64);
+                if let Some(ref fd) = conn.tx_read_fd {
+                    submit_sqe(fd.fd().0, IORING_POLL_IN, TOKEN_TX_PIPE_BASE + i as u64);
                     to_submit += 1;
                 }
             }
@@ -1148,7 +1130,7 @@ fn main() {
             None => u64::MAX,
             Some(n) => n,
         };
-        let _ = toyos_abi::syscall::io_uring_enter(ring_fd, to_submit, 1, timeout);
+        let _ = toyos_abi::syscall::io_uring_enter(ring_fd.fd(), to_submit, 1, timeout);
 
         // Drain CQEs
         let mut listener_ready = false;
@@ -1171,11 +1153,11 @@ fn main() {
 
         // 8. Accept and handle new IPC request (per-operation: accept → handle → close)
         if listener_ready {
-            let conn = services::accept(listener).expect("accept failed");
-            if let Ok(header) = ipc::recv_header(conn.fd) {
-                daemon.handle_message(conn.fd, &header, &mut socket_set, &mut iface);
-            } else {
-                toyos_abi::syscall::close(conn.fd);
+            let conn = services::accept(&listener).expect("accept failed");
+            let raw_fd = conn.fd.fd();
+            if let Ok(header) = ipc::recv_header(raw_fd) {
+                conn.fd.into_raw();
+                daemon.handle_message(raw_fd, &header, &mut socket_set, &mut iface);
             }
         }
     }

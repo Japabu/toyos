@@ -7,14 +7,14 @@ use toyos_abi::ring::RingHeader;
 use toyos_abi::services;
 use toyos_abi::shm::SharedMemory;
 use toyos_abi::syscall;
-use toyos_abi::Fd;
+use toyos_abi::{Fd, OwnedFd};
 
 const AUDIO_RING_SIZE: usize = 16384;
 const DEFAULT_VOLUME: i32 = 256;
 
 struct AudioStream {
     shm: SharedMemory,
-    control: Fd,
+    control: OwnedFd,
     volume: i32,
 }
 
@@ -50,22 +50,16 @@ impl AudioStream {
     }
 }
 
-impl Drop for AudioStream {
-    fn drop(&mut self) {
-        syscall::close(self.control);
-    }
-}
-
-fn read_struct<T: Copy>(fd: Fd) -> T {
+fn read_struct<T: Copy>(fd: &OwnedFd) -> T {
     let mut buf = [0u8; 256];
     let size = core::mem::size_of::<T>();
     assert!(size <= buf.len());
-    let n = syscall::read(fd, &mut buf[..size]).expect("read device info failed");
+    let n = syscall::read(fd.fd(), &mut buf[..size]).expect("read device info failed");
     assert_eq!(n, size);
     unsafe { core::ptr::read(buf.as_ptr() as *const T) }
 }
 
-fn open_stream(control: Fd, client_pid: u32, _req: &AudioOpenRequest, next_id: &mut u32) -> AudioStream {
+fn open_stream(control: OwnedFd, client_pid: u32, _req: &AudioOpenRequest, next_id: &mut u32) -> AudioStream {
     let mut shm = SharedMemory::allocate(AUDIO_RING_SIZE);
     RingHeader::init(shm.as_mut_slice().as_mut_ptr(), AUDIO_RING_SIZE);
     shm.grant(client_pid);
@@ -73,7 +67,7 @@ fn open_stream(control: Fd, client_pid: u32, _req: &AudioOpenRequest, next_id: &
     let id = *next_id;
     *next_id += 1;
 
-    let _ = ipc::send(control, MSG_AUDIO_OPENED, &AudioOpenResponse {
+    let _ = ipc::send(control.fd(), MSG_AUDIO_OPENED, &AudioOpenResponse {
         stream_id: id,
         shm_token: shm.token(),
         ring_size: AUDIO_RING_SIZE as u32,
@@ -86,8 +80,8 @@ fn main() {
     let listener = services::listen("soundd").expect("soundd already running");
 
     let audio_fd = device::open_audio().expect("soundd: no audio device");
-    let info: AudioInfo = read_struct(audio_fd);
-    syscall::close(audio_fd);
+    let info: AudioInfo = read_struct(&audio_fd);
+    drop(audio_fd);
 
     let num_buffers = info.num_buffers as usize;
     let dma_page = SharedMemory::map(info.dma_token, 2 * 1024 * 1024);
@@ -162,9 +156,9 @@ fn main() {
 
         // 5. Check for connections and control messages
         let mut poll_fds: Vec<u64> = Vec::with_capacity(1 + streams.len());
-        poll_fds.push(listener.0 as u64);
+        poll_fds.push(listener.fd().0 as u64);
         for stream in &streams {
-            poll_fds.push(stream.control.0 as u64);
+            poll_fds.push(stream.control.fd().0 as u64);
         }
 
         // When idle (no streams), block for up to 100ms waiting for connections.
@@ -174,14 +168,13 @@ fn main() {
         let result = io_uring::poll_fds(&poll_fds, Some(timeout));
 
         if result.fd(0) {
-            let conn = services::accept(listener).expect("accept failed");
-            let Ok(header) = ipc::recv_header(conn.fd) else {
-                syscall::close(conn.fd);
+            let conn = services::accept(&listener).expect("accept failed");
+            let Ok(header) = ipc::recv_header(conn.fd.fd()) else {
                 continue;
             };
             match header.msg_type {
                 MSG_AUDIO_OPEN => {
-                    let req: AudioOpenRequest = ipc::recv_payload(conn.fd, &header).unwrap();
+                    let req: AudioOpenRequest = ipc::recv_payload(conn.fd.fd(), &header).unwrap();
                     let stream = open_stream(conn.fd, conn.client_pid, &req, &mut next_stream_id);
                     streams.push(stream);
                 }
@@ -189,10 +182,14 @@ fn main() {
             }
         }
 
+        let mut dead_controls: Vec<Fd> = Vec::new();
         for i in 0..streams.len() {
             if result.fd(1 + i) {
-                let fd = streams[i].control;
-                let Ok(header) = ipc::recv_header(fd) else { continue };
+                let fd = streams[i].control.fd();
+                let Ok(header) = ipc::recv_header(fd) else {
+                    dead_controls.push(fd);
+                    continue;
+                };
                 match header.msg_type {
                     MSG_AUDIO_SET_VOLUME => {
                         let cmd: AudioSetVolume = ipc::recv_payload(fd, &header).unwrap();
@@ -201,6 +198,9 @@ fn main() {
                     _ => {}
                 }
             }
+        }
+        if !dead_controls.is_empty() {
+            streams.retain(|s| !dead_controls.contains(&s.control.fd()));
         }
 
         // Yield when all DMA buffers are in-flight

@@ -227,7 +227,7 @@ fn add_writer(pipe_id: PipeId) {
 }
 
 fn close_read(pipe_id: PipeId) {
-    with_pipes_mut(|pipes| {
+    let wake_writers = with_pipes_mut(|pipes| {
         let pipe = pipes.get_mut(pipe_id).expect("close_read: pipe not found");
         pipe.readers = pipe.readers.checked_sub(1).expect("pipe reader underflow");
         if pipe.readers == 0 {
@@ -236,12 +236,27 @@ fn close_read(pipe_id: PipeId) {
         if pipe.readers == 0 && pipe.writers == 0 {
             let pipe = pipes.remove(pipe_id).unwrap();
             free_pipe(pipe);
+            None // pipe freed, no one to wake
+        } else if pipe.readers == 0 {
+            // Writers need to discover broken pipe
+            Some(pipe.io_uring_watchers.clone())
+        } else {
+            None
         }
     });
+    if let Some(watchers) = wake_writers {
+        crate::scheduler::wake_pipe_writers(pipe_id);
+        if !watchers.is_empty() {
+            crate::io_uring::complete_pending_for_event(
+                &watchers,
+                crate::scheduler::EventSource::PipeWritable(pipe_id),
+            );
+        }
+    }
 }
 
 fn close_write(pipe_id: PipeId) {
-    with_pipes_mut(|pipes| {
+    let wake_readers = with_pipes_mut(|pipes| {
         let pipe = pipes.get_mut(pipe_id).expect("close_write: pipe not found");
         pipe.writers = pipe.writers.checked_sub(1).expect("pipe writer underflow");
         if pipe.writers == 0 {
@@ -250,8 +265,23 @@ fn close_write(pipe_id: PipeId) {
         if pipe.readers == 0 && pipe.writers == 0 {
             let pipe = pipes.remove(pipe_id).unwrap();
             free_pipe(pipe);
+            None // pipe freed, no one to wake
+        } else if pipe.writers == 0 {
+            // Readers need to discover EOF
+            Some(pipe.io_uring_watchers.clone())
+        } else {
+            None
         }
     });
+    if let Some(watchers) = wake_readers {
+        crate::scheduler::wake_pipe_readers(pipe_id);
+        if !watchers.is_empty() {
+            crate::io_uring::complete_pending_for_event(
+                &watchers,
+                crate::scheduler::EventSource::PipeReadable(pipe_id),
+            );
+        }
+    }
 }
 
 fn free_pipe(pipe: Pipe) {
