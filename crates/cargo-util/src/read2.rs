@@ -86,7 +86,8 @@ mod imp {
     use std::io;
     use std::io::Read;
     use std::os::fd::AsRawFd;
-    use toyos_abi::io_uring;
+    use toyos::poller::{Poller, IORING_POLL_IN};
+    use toyos::Fd;
     use std::process::{ChildStderr, ChildStdout};
 
     pub fn read2(
@@ -99,34 +100,35 @@ mod imp {
         let mut out = Vec::new();
         let mut err = Vec::new();
 
+        let poller = Poller::new(4);
+
         while !out_done || !err_done {
-            let mut fds = Vec::new();
             if !out_done {
-                fds.push(out_pipe.as_raw_fd() as u64 | io_uring::POLL_READABLE);
+                poller.poll_add_fd(Fd(out_pipe.as_raw_fd()), IORING_POLL_IN, 0);
             }
             if !err_done {
-                fds.push(err_pipe.as_raw_fd() as u64 | io_uring::POLL_READABLE);
+                poller.poll_add_fd(Fd(err_pipe.as_raw_fd()), IORING_POLL_IN, 1);
             }
 
-            let result = io_uring::poll_fds(&fds, None);
+            let mut out_ready = false;
+            let mut err_ready = false;
+            poller.wait(1, u64::MAX, |token| match token {
+                0 => out_ready = true,
+                1 => err_ready = true,
+                _ => {}
+            });
 
-            // Use single read() calls — poll guarantees data is available,
-            // so a single read won't block. read_to_end would block until EOF.
-            let mut idx = 0;
-            if !out_done {
-                if result.fd(idx) {
-                    let mut buf = [0u8; 8192];
-                    match out_pipe.read(&mut buf) {
-                        Ok(0) => out_done = true,
-                        Ok(n) => out.extend_from_slice(&buf[..n]),
-                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
-                        Err(e) => return Err(e),
-                    }
-                    data(true, &mut out, out_done);
+            if !out_done && out_ready {
+                let mut buf = [0u8; 8192];
+                match out_pipe.read(&mut buf) {
+                    Ok(0) => out_done = true,
+                    Ok(n) => out.extend_from_slice(&buf[..n]),
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(e) => return Err(e),
                 }
-                idx += 1;
+                data(true, &mut out, out_done);
             }
-            if !err_done && result.fd(idx) {
+            if !err_done && err_ready {
                 let mut buf = [0u8; 8192];
                 match err_pipe.read(&mut buf) {
                     Ok(0) => err_done = true,
