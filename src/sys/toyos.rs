@@ -482,16 +482,16 @@ pub(crate) fn connect(fd: RawSocket, addr: &SockAddr) -> io::Result<()> {
     let conn = toyos::net::tcp_connect(ip, port, 30000).map_err(net_err_to_io)?;
 
     // Wrap pipe fds into a kernel socket descriptor
-    let rx_pipe_id = syscall::pipe_id(conn.rx_fd)
+    let rx_pipe_id = conn.rx.pipe_id()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("pipe_id: {e:?}")))?;
-    let tx_pipe_id = syscall::pipe_id(conn.tx_fd)
+    let tx_pipe_id = conn.tx.pipe_id()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("pipe_id: {e:?}")))?;
     let kernel_fd = syscall::socket_create(rx_pipe_id, tx_pipe_id)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("socket_create: {e:?}")))?;
 
-    // Close raw pipe fds — socket descriptor holds the refcounts
-    syscall::close(conn.rx_fd);
-    syscall::close(conn.tx_fd);
+    // Drop pipes — socket descriptor holds the refcounts
+    drop(conn.rx);
+    drop(conn.tx);
 
     let mut map = sockets().lock().unwrap();
     let old = map
@@ -576,7 +576,7 @@ pub(crate) fn listen(fd: RawSocket, _backlog: c_int) -> io::Result<()> {
     map.insert(
         fd,
         SocketState::Listening {
-            kernel_fd: bound.notify_fd,
+            kernel_fd: bound.notify.into_fd(),
             socket_id: bound.socket_id.0,
             local_addr: ip,
             local_port: bound.bound_port,
@@ -627,16 +627,16 @@ pub(crate) fn accept(fd: RawSocket) -> io::Result<(RawSocket, SockAddr)> {
     let accepted = toyos::net::tcp_accept(TcpSocketId(socket_id)).map_err(net_err_to_io)?;
 
     // Wrap pipe fds into a kernel socket descriptor
-    let rx_pipe_id = syscall::pipe_id(accepted.rx_fd)
+    let rx_pipe_id = accepted.rx.pipe_id()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("pipe_id: {e:?}")))?;
-    let tx_pipe_id = syscall::pipe_id(accepted.tx_fd)
+    let tx_pipe_id = accepted.tx.pipe_id()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("pipe_id: {e:?}")))?;
     let new_kernel_fd = syscall::socket_create(rx_pipe_id, tx_pipe_id)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("socket_create: {e:?}")))?;
 
-    // Close raw pipe fds — socket descriptor holds the refcounts
-    syscall::close(accepted.rx_fd);
-    syscall::close(accepted.tx_fd);
+    // Drop pipes — socket descriptor holds the refcounts
+    drop(accepted.rx);
+    drop(accepted.tx);
 
     let new_fd = alloc_fd();
     sockets().lock().unwrap().insert(
@@ -802,9 +802,11 @@ pub(crate) fn recv(
             Err(e) => Err(io::Error::new(io::ErrorKind::Other, format!("{e:?}"))),
         }
     } else if let Some(timeout) = recv_timeout {
-        let poll_entry = kernel_fd.0 as u64 | toyos_abi::io_uring::POLL_READABLE;
-        let result = toyos_abi::io_uring::poll_fds(&[poll_entry], Some(timeout.as_nanos() as u64));
-        if result.fd(0) {
+        let poller = toyos::poller::Poller::new(1);
+        poller.poll_add_fd(kernel_fd, toyos::poller::IORING_POLL_IN, 0);
+        let mut ready = false;
+        poller.wait(1, timeout.as_nanos() as u64, |_| ready = true);
+        if ready {
             match syscall::read(kernel_fd, raw_buf) {
                 Ok(n) => Ok(n),
                 Err(e) => Err(io::Error::new(io::ErrorKind::Other, format!("{e:?}"))),
@@ -843,9 +845,11 @@ pub(crate) fn send(fd: RawSocket, buf: &[u8], _flags: c_int) -> io::Result<usize
             Err(e) => Err(io::Error::new(io::ErrorKind::Other, format!("{e:?}"))),
         }
     } else if let Some(timeout) = send_timeout {
-        let poll_entry = kernel_fd.0 as u64 | toyos_abi::io_uring::POLL_WRITABLE;
-        let result = toyos_abi::io_uring::poll_fds(&[poll_entry], Some(timeout.as_nanos() as u64));
-        if result.fd(0) {
+        let poller = toyos::poller::Poller::new(1);
+        poller.poll_add_fd(kernel_fd, toyos::poller::IORING_POLL_OUT, 0);
+        let mut ready = false;
+        poller.wait(1, timeout.as_nanos() as u64, |_| ready = true);
+        if ready {
             match syscall::write(kernel_fd, buf) {
                 Ok(n) => Ok(n),
                 Err(e) => Err(io::Error::new(io::ErrorKind::Other, format!("{e:?}"))),
