@@ -34,7 +34,7 @@ impl TcpListener {
 
         Ok(TcpListener {
             socket_id: bound.socket_id,
-            notify_fd: bound.notify_fd,
+            notify_fd: bound.notify.into_fd(),
             local_addr: bound_addr,
         })
     }

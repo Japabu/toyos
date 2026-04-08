@@ -43,8 +43,8 @@ impl TcpStream {
         let conn = toyos::net::tcp_connect(ip, addr.port(), 30000).map_err(net_err_to_io)?;
 
         Ok(TcpStream {
-            rx_fd: conn.rx_fd,
-            tx_fd: conn.tx_fd,
+            rx_fd: conn.rx.into_fd(),
+            tx_fd: conn.tx.into_fd(),
             peer_addr: addr,
             local_port: conn.local_port,
             socket_id: conn.socket_id,
@@ -55,8 +55,8 @@ impl TcpStream {
     pub(crate) fn from_accepted(accepted: toyos::net::TcpAccepted) -> TcpStream {
         let peer_addr = SocketAddr::from((accepted.remote_addr, accepted.remote_port));
         TcpStream {
-            rx_fd: accepted.rx_fd,
-            tx_fd: accepted.tx_fd,
+            rx_fd: accepted.rx.into_fd(),
+            tx_fd: accepted.tx.into_fd(),
             peer_addr,
             local_port: accepted.local_port,
             socket_id: accepted.socket_id,
