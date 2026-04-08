@@ -183,15 +183,15 @@ impl DeviceTrait for Device {
             channels: channels as u16,
             format: 0, // S16LE
         };
-        toyos_abi::ipc::send(control, MSG_AUDIO_OPEN, &req).expect("soundd not responding");
+        toyos::ipc::send(control, MSG_AUDIO_OPEN, &req).expect("soundd not responding");
 
         // soundd allocates shared memory and sends us the token
         let (msg_type, resp): (u32, AudioOpenResponse) =
-            toyos_abi::ipc::recv(control).expect("soundd not responding");
+            toyos::ipc::recv(control).expect("soundd not responding");
         assert_eq!(msg_type, MSG_AUDIO_OPENED);
 
         // Map the shared memory ring
-        let shm = toyos_abi::shm::SharedMemory::map(resp.shm_token, resp.ring_size as usize);
+        let shm = toyos::shm::SharedMemory::map(resp.shm_token, resp.ring_size as usize);
 
         let playing = Arc::new(AtomicBool::new(false));
         let alive = Arc::new(AtomicBool::new(true));
