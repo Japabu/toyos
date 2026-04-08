@@ -2,9 +2,9 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use toyos::shm::SharedMemory;
-use toyos::{gpu, ipc, services, system, Connection, Device};
-use toyos_abi::io_uring::*;
-use toyos_abi::{syscall, FramebufferInfo, Fd};
+use toyos::{gpu, ipc, services, system, Connection, Keyboard, Mouse, FramebufferDev};
+use toyos::poller::{Poller, IORING_POLL_IN};
+use toyos_abi::Fd;
 use window::{Color, Framebuffer};
 
 const TITLE_BAR_HEIGHT: usize = 28;
@@ -52,13 +52,6 @@ const LAUNCHER_APPS: &[LauncherEntry] = &[
 ];
 
 const FLAG_HARDWARE_CURSOR: u32 = 1 << 0;
-
-fn read_fb_info(dev: &Device) -> FramebufferInfo {
-    let mut buf = [0u8; std::mem::size_of::<FramebufferInfo>()];
-    let n = dev.read(&mut buf).expect("failed to read framebuffer info");
-    assert_eq!(n, buf.len(), "failed to read framebuffer info");
-    unsafe { std::ptr::read(buf.as_ptr() as *const FramebufferInfo) }
-}
 
 struct WindowState {
     fd: Connection,
@@ -653,11 +646,11 @@ fn draw_software_cursor(screen: &Framebuffer, sprite: &sprite::Sprite, cx: i32, 
 fn main() {
     let listener = services::listen("compositor").expect("compositor already running");
 
-    let kb = toyos::device::open_keyboard().expect("failed to claim keyboard");
-    let mouse = toyos::device::open_mouse().expect("failed to claim mouse");
-    let fb = toyos::device::open_framebuffer().expect("failed to claim framebuffer");
+    let kb = Keyboard::open().expect("failed to claim keyboard");
+    let mouse = Mouse::open().expect("failed to claim mouse");
+    let fb_dev = FramebufferDev::open().expect("failed to claim framebuffer");
 
-    let mut fb_info = read_fb_info(&fb);
+    let mut fb_info = fb_dev.info().expect("failed to read framebuffer info");
     let fb_size = fb_info.stride as usize * fb_info.height as usize * 4;
     let mut fb_shm = SharedMemory::map(fb_info.token[0], fb_size);
     let mut screen = Framebuffer::new(
@@ -752,32 +745,11 @@ fn main() {
     let token_mouse = mouse.fd().0 as u64;
     let token_listener = listener.fd().0 as u64;
 
-    // Create io_uring for event multiplexing
-    let (ring_fd, ring_shm_token) = syscall::io_uring_setup(256).expect("io_uring_setup failed");
-    let ring_base = unsafe { syscall::map_shared(ring_shm_token) };
-    let ring_params = unsafe { &*(ring_base as *const IoUringParams) };
-    let ring_sq_size = ring_params.sq_ring_size;
-    let ring_cq_size = ring_params.cq_ring_size;
+    let poller = Poller::new(256);
 
-    let ring_submit = |fd: i32, token: u64, flags: u32| {
-        let sq_hdr = unsafe { &*(ring_base.add(SQ_RING_OFF as usize) as *const IoUringRingHeader) };
-        let tail = sq_hdr.tail.load(std::sync::atomic::Ordering::Acquire);
-        let idx = tail & (ring_sq_size - 1);
-        let sqe = unsafe {
-            &mut *(ring_base.add(SQES_OFF as usize + idx as usize * core::mem::size_of::<IoUringSqe>()) as *mut IoUringSqe)
-        };
-        *sqe = IoUringSqe::default();
-        sqe.op = IORING_OP_POLL_ADD;
-        sqe.fd = fd;
-        sqe.op_flags = flags;
-        sqe.user_data = token;
-        sq_hdr.tail.store(tail.wrapping_add(1), std::sync::atomic::Ordering::Release);
-    };
-
-    // Submit initial POLL_ADDs for system fds (tokens = fd numbers)
-    ring_submit(kb.fd().0, token_kb, IORING_POLL_IN);
-    ring_submit(mouse.fd().0, token_mouse, IORING_POLL_IN);
-    ring_submit(listener.fd().0, token_listener, IORING_POLL_IN);
+    poller.poll_add(&kb, IORING_POLL_IN, token_kb);
+    poller.poll_add(&mouse, IORING_POLL_IN, token_mouse);
+    poller.poll_add(&listener, IORING_POLL_IN, token_listener);
 
     loop {
         // Drain all pending events before compositing
@@ -785,31 +757,10 @@ fn main() {
         loop {
             let timeout = if waited { Duration::from_nanos(1) } else { FRAME_INTERVAL };
 
-            // Submit any pending SQEs (initial or re-armed) and wait
-            let pending = {
-                let sq_hdr = unsafe { &*(ring_base.add(SQ_RING_OFF as usize) as *const IoUringRingHeader) };
-                let head = sq_hdr.head.load(std::sync::atomic::Ordering::Acquire);
-                let tail = sq_hdr.tail.load(std::sync::atomic::Ordering::Acquire);
-                tail.wrapping_sub(head)
-            };
-            let _ = syscall::io_uring_enter(ring_fd, pending, 1, timeout.as_nanos() as u64);
-
-            // Drain CQEs into a set of ready tokens (fd numbers)
             let mut ready_tokens: Vec<u64> = Vec::new();
-            let cq_hdr = unsafe { &*(ring_base.add(CQ_RING_OFF as usize) as *const IoUringRingHeader) };
-            loop {
-                let head = cq_hdr.head.load(std::sync::atomic::Ordering::Acquire);
-                let tail = cq_hdr.tail.load(std::sync::atomic::Ordering::Acquire);
-                if head == tail { break; }
-                let idx = head & (ring_cq_size - 1);
-                let cqe = unsafe {
-                    &*(ring_base.add(CQ_RING_OFF as usize + 16 + idx as usize * core::mem::size_of::<IoUringCqe>()) as *const IoUringCqe)
-                };
-                if cqe.result > 0 {
-                    ready_tokens.push(cqe.user_data);
-                }
-                cq_hdr.head.store(head.wrapping_add(1), std::sync::atomic::Ordering::Release);
-            }
+            poller.wait(1, timeout.as_nanos() as u64, |token| {
+                ready_tokens.push(token);
+            });
 
             let kb_ready = ready_tokens.contains(&token_kb);
             let mouse_ready = ready_tokens.contains(&token_mouse);
@@ -1421,7 +1372,7 @@ fn main() {
                     });
 
                     // Register new client fd in io_uring (token = fd number)
-                    ring_submit(client_fd.0, client_fd.0 as u64, IORING_POLL_IN);
+                    poller.poll_add(&windows.last().unwrap().fd, IORING_POLL_IN, client_fd.0 as u64);
 
                     let _ = ipc::send(
                         client_fd,
@@ -1534,13 +1485,13 @@ fn main() {
             }
         }
         // Re-arm one-shot POLL_ADDs for fds that fired
-        if kb_ready { ring_submit(kb.fd().0, token_kb, IORING_POLL_IN); }
-        if mouse_ready { ring_submit(mouse.fd().0, token_mouse, IORING_POLL_IN); }
-        if listener_ready { ring_submit(listener.fd().0, token_listener, IORING_POLL_IN); }
+        if kb_ready { poller.poll_add(&kb, IORING_POLL_IN, token_kb); }
+        if mouse_ready { poller.poll_add(&mouse, IORING_POLL_IN, token_mouse); }
+        if listener_ready { poller.poll_add(&listener, IORING_POLL_IN, token_listener); }
         for win in windows.iter() {
             let token = win.fd.fd().0 as u64;
             if ready_tokens.contains(&token) {
-                ring_submit(win.fd.fd().0, token, IORING_POLL_IN);
+                poller.poll_add(&win.fd, IORING_POLL_IN, token);
             }
         }
         } // end inner drain loop

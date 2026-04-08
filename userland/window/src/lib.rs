@@ -3,10 +3,10 @@ pub mod framebuffer;
 pub use framebuffer::{Color, Framebuffer};
 
 use toyos::ipc;
-use toyos_abi::io_uring;
+use toyos::poller::{Poller, IORING_POLL_IN};
+use toyos::services;
+use toyos::Connection;
 use toyos::shm::SharedMemory;
-use toyos_abi::syscall;
-use toyos_abi::Fd;
 
 // Window flags
 pub const WINDOW_FLAG_TOPMOST: u8 = 1;
@@ -147,21 +147,22 @@ pub fn clipboard_set(text: &str) {
     use std::sync::Mutex;
     static CLIPBOARD_SHM: Mutex<Option<SharedMemory>> = Mutex::new(None);
 
-    let fd = syscall::connect("compositor").expect("compositor not running");
+    let conn = services::connect("compositor").expect("compositor not running");
     let bytes = text.as_bytes();
     if bytes.len() <= 4096 {
-        let _ = ipc::send_bytes(fd, MSG_CLIPBOARD_SET, bytes);
+        let _ = conn.send_bytes(MSG_CLIPBOARD_SET, bytes);
     } else {
         let mut shm = SharedMemory::allocate(bytes.len());
         shm.as_mut_slice()[..bytes.len()].copy_from_slice(bytes);
-        let _ = ipc::send(fd, MSG_CLIPBOARD_SET_SHM, &ClipboardShmMsg { token: shm.token(), len: bytes.len() as u32 });
+        let _ = conn.send(MSG_CLIPBOARD_SET_SHM, &ClipboardShmMsg { token: shm.token(), len: bytes.len() as u32 });
         *CLIPBOARD_SHM.lock().unwrap() = Some(shm);
     }
-    syscall::close(fd);
+    // conn drops here, closing the fd
 }
 
 pub struct Window {
-    fd: Fd,
+    conn: Connection,
+    poller: Poller,
     shm: SharedMemory,
     width: u32,
     height: u32,
@@ -182,7 +183,7 @@ impl Window {
     }
 
     fn create_with_flags(width: u32, height: u32, title: &str, flags: u8) -> Self {
-        let fd = syscall::connect("compositor").expect("compositor not running");
+        let conn = services::connect("compositor").expect("compositor not running");
 
         let mut req = CreateWindowRequest {
             width,
@@ -195,26 +196,29 @@ impl Window {
         let len = bytes.len().min(30);
         req.title[..len].copy_from_slice(&bytes[..len]);
         req.title_len = len as u8;
-        ipc::send(fd, MSG_CREATE_WINDOW, &req).expect("compositor not responding");
+        conn.send(MSG_CREATE_WINDOW, &req).expect("compositor not responding");
 
-        let (msg_type, info): (u32, WindowInfo) = ipc::recv(fd).expect("compositor not responding");
+        let (msg_type, info): (u32, WindowInfo) = conn.recv().expect("compositor not responding");
         assert_eq!(msg_type, MSG_WINDOW_CREATED, "unexpected response from compositor");
         let buf_size = info.stride as usize * info.height as usize * 4;
         let shm = SharedMemory::map(info.token, buf_size);
 
-        Self { fd, shm, width: info.width, height: info.height, pixel_format: info.pixel_format }
+        let poller = Poller::new(1);
+        Self { conn, poller, shm, width: info.width, height: info.height, pixel_format: info.pixel_format }
     }
 
     pub fn recv_event(&mut self) -> Event {
-        let Ok(header) = ipc::recv_header(self.fd) else {
-            return Event::Close; // compositor disconnected
+        let Ok(header) = self.conn.recv_header() else {
+            return Event::Close;
         };
         self.decode_event(&header)
     }
 
     pub fn poll_event(&mut self, timeout_nanos: u64) -> Option<Event> {
-        let result = io_uring::poll_fds(&[self.fd.0 as u64], Some(timeout_nanos));
-        if result.fd(0) {
+        self.poller.poll_add(&self.conn, IORING_POLL_IN, 0);
+        let mut ready = false;
+        self.poller.wait(1, timeout_nanos, |_| ready = true);
+        if ready {
             Some(self.recv_event())
         } else {
             None
@@ -223,10 +227,10 @@ impl Window {
 
     fn decode_event(&mut self, header: &ipc::IpcHeader) -> Event {
         match header.msg_type {
-            MSG_KEY_INPUT => Event::KeyInput(ipc::recv_payload(self.fd, header).unwrap()),
-            MSG_MOUSE_INPUT => Event::MouseInput(ipc::recv_payload(self.fd, header).unwrap()),
+            MSG_KEY_INPUT => Event::KeyInput(self.conn.recv_payload(header).unwrap()),
+            MSG_MOUSE_INPUT => Event::MouseInput(self.conn.recv_payload(header).unwrap()),
             MSG_WINDOW_RESIZED => {
-                let info: ResizeInfo = ipc::recv_payload(self.fd, header).unwrap();
+                let info: ResizeInfo = self.conn.recv_payload(header).unwrap();
                 let buf_size = info.stride as usize * info.height as usize * 4;
                 self.shm = SharedMemory::map(info.token, buf_size);
                 self.width = info.width;
@@ -236,36 +240,35 @@ impl Window {
             }
             MSG_CLIPBOARD_PASTE => {
                 let mut buf = [0u8; 4096];
-                let n = ipc::recv_bytes(self.fd, header, &mut buf).unwrap();
+                let n = self.conn.recv_bytes(header, &mut buf).unwrap();
                 Event::ClipboardPaste(buf[..n].to_vec())
             }
             MSG_CLIPBOARD_PASTE_SHM => {
-                let info: ClipboardShmMsg = ipc::recv_payload(self.fd, header).unwrap();
+                let info: ClipboardShmMsg = self.conn.recv_payload(header).unwrap();
                 let shm = SharedMemory::map(info.token, info.len as usize);
                 let data = shm.as_slice()[..info.len as usize].to_vec();
                 Event::ClipboardPaste(data)
             }
             MSG_WINDOW_CLOSE => Event::Close,
             MSG_FRAME => Event::Frame,
-            _ => Event::Close, // unknown → treat as disconnect
+            _ => Event::Close,
         }
     }
 
     pub fn set_cursor(&self, style: u8) {
-        let _ = ipc::send(self.fd, MSG_SET_CURSOR, &(style as u32));
+        let _ = self.conn.send(MSG_SET_CURSOR, &(style as u32));
     }
 
     pub fn set_clipboard(&self, text: &str) {
-        let _ = ipc::send_bytes(self.fd, MSG_CLIPBOARD_SET, text.as_bytes());
+        let _ = self.conn.send_bytes(MSG_CLIPBOARD_SET, text.as_bytes());
     }
 
     pub fn present(&self) {
-        let _ = ipc::signal(self.fd, MSG_PRESENT);
+        let _ = self.conn.signal(MSG_PRESENT);
     }
 
-    /// The socket fd for this window. Use with `poll` to check for events.
-    pub fn fd(&self) -> Fd {
-        self.fd
+    pub fn fd(&self) -> toyos_abi::Fd {
+        self.conn.fd()
     }
 
     pub fn width(&self) -> u32 {
@@ -298,7 +301,7 @@ impl std::fmt::Debug for Window {
 
 impl Drop for Window {
     fn drop(&mut self) {
-        let _ = ipc::signal(self.fd, MSG_DESTROY_WINDOW);
-        syscall::close(self.fd);
+        let _ = self.conn.signal(MSG_DESTROY_WINDOW);
+        // conn drops here, closing the fd
     }
 }

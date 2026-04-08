@@ -903,7 +903,6 @@ dependencies = [
  "filepicker-api",
  "font",
  "toyos",
- "toyos-abi 0.1.0",
  "window",
 ]
 
@@ -912,7 +911,6 @@ name = "filepicker-api"
 version = "0.1.0"
 dependencies = [
  "toyos",
- "toyos-abi 0.1.0",
 ]
 
 [[package]]
@@ -3090,7 +3088,6 @@ version = "0.1.0"
 dependencies = [
  "font",
  "toyos",
- "toyos-abi 0.1.0",
  "window",
 ]
 

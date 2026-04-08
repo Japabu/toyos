@@ -2,11 +2,12 @@ mod console;
 
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
-use toyos_abi::io_uring;
 use std::os::toyos::process;
 use std::process::Command;
 
 use toyos::gpu;
+use toyos::poller::{Poller, IORING_POLL_IN};
+use toyos::Fd;
 use window::Window;
 
 fn main() {
@@ -28,15 +29,19 @@ fn main() {
     let mut shell_stdin = child.stdin.take().unwrap();
     let mut shell_stdout = child.stdout.take().unwrap();
     let mut shell_stderr = child.stderr.take().unwrap();
-    let shell_stdout_fd = shell_stdout.as_raw_fd() as u64;
-    let shell_stderr_fd = shell_stderr.as_raw_fd() as u64;
-
-    let window_fd = window.fd().0 as u64;
+    let poller = Poller::new(4);
 
     loop {
-        let ready = io_uring::poll_fds(&[shell_stdout_fd, shell_stderr_fd, window_fd], None);
+        poller.poll_add_fd(Fd(shell_stdout.as_raw_fd()), IORING_POLL_IN, 0);
+        poller.poll_add_fd(Fd(shell_stderr.as_raw_fd()), IORING_POLL_IN, 1);
+        poller.poll_add_fd(window.fd(), IORING_POLL_IN, 2);
 
-        if ready.fd(0) {
+        let mut ready = [false; 3];
+        poller.wait(1, u64::MAX, |token| {
+            if (token as usize) < 3 { ready[token as usize] = true; }
+        });
+
+        if ready[0] {
             let mut buf = [0u8; 4096];
             let n = shell_stdout.read(&mut buf).unwrap_or(0);
             if n == 0 {
@@ -47,7 +52,7 @@ fn main() {
             window.present();
         }
 
-        if ready.fd(1) {
+        if ready[1] {
             let mut buf = [0u8; 4096];
             let n = shell_stderr.read(&mut buf).unwrap_or(0);
             if n > 0 {
@@ -57,7 +62,7 @@ fn main() {
             }
         }
 
-        if ready.fd(2) {
+        if ready[2] {
             match window.recv_event() {
                 window::Event::KeyInput(event) => {
                     if event.gui() && event.keycode == 0x06 {

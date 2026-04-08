@@ -1,9 +1,8 @@
 use filepicker_api::{PickerMode, MSG_FILEPICKER_REQUEST, MSG_FILEPICKER_RESULT};
 use font::Font;
 use std::fs;
-use toyos::ipc;
+use toyos::Connection;
 use toyos::services;
-use toyos_abi::Fd;
 use std::path::{Path, PathBuf};
 use window::{Color, Event, Framebuffer, KeyEvent, MouseEvent, Window};
 
@@ -395,7 +394,7 @@ fn handle_mouse(picker: &mut Picker, mouse: &MouseEvent, win_h: usize) -> Picker
 
 // --- Run a single file picker session ---
 
-fn run_picker(mode: PickerMode, start_dir: &str, client_fd: Fd) {
+fn run_picker(mode: PickerMode, start_dir: &str, client: &Connection) {
     let title = if mode == PickerMode::Save {
         "Save As"
     } else {
@@ -437,11 +436,11 @@ fn run_picker(mode: PickerMode, start_dir: &str, client_fd: Fd) {
 
         match result {
             PickerResult::Pick(path) => {
-                let _ = ipc::send_bytes(client_fd, MSG_FILEPICKER_RESULT,path.as_bytes());
+                let _ = client.send_bytes(MSG_FILEPICKER_RESULT, path.as_bytes());
                 return;
             }
             PickerResult::Cancel => {
-                let _ = ipc::send_bytes(client_fd, MSG_FILEPICKER_RESULT,&[]);
+                let _ = client.send_bytes(MSG_FILEPICKER_RESULT, &[]);
                 return;
             }
             PickerResult::Continue => {}
@@ -461,8 +460,7 @@ fn main() {
 
     loop {
         let conn = services::accept(&listener).expect("accept failed");
-        let client_fd = conn.conn.fd();
-        let Ok(header) = ipc::recv_header(client_fd) else {
+        let Ok(header) = conn.conn.recv_header() else {
             continue;
         };
         if header.msg_type != MSG_FILEPICKER_REQUEST {
@@ -470,7 +468,7 @@ fn main() {
         }
 
         let mut data = [0u8; 4096];
-        let n = ipc::recv_bytes(client_fd, &header, &mut data).unwrap_or(0);
+        let n = conn.conn.recv_bytes(&header, &mut data).unwrap_or(0);
         let mode = if n > 0 && data[0] == PickerMode::Save as u8 {
             PickerMode::Save
         } else {
@@ -482,6 +480,6 @@ fn main() {
             "/"
         };
 
-        run_picker(mode, start_dir, client_fd);
+        run_picker(mode, start_dir, &conn.conn);
     }
 }

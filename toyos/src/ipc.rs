@@ -4,6 +4,7 @@
 
 use toyos_abi::Fd;
 use toyos_abi::syscall::{self, SyscallError};
+use crate::{AsHandle, Handle};
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -17,6 +18,63 @@ pub enum IpcError {
     Disconnected,
     Syscall(SyscallError),
 }
+
+// ---------------------------------------------------------------------------
+// Connection — typed IPC endpoint
+// ---------------------------------------------------------------------------
+
+/// An IPC connection. Created by [`crate::services::accept`] or
+/// [`crate::services::connect`].
+pub struct Connection(pub(crate) Handle);
+
+impl AsHandle for Connection {
+    fn as_handle(&self) -> Fd { self.0.fd() }
+}
+
+impl Connection {
+    pub fn fd(&self) -> Fd { self.0.fd() }
+
+    pub fn send<T: Copy>(&self, msg_type: u32, payload: &T) -> Result<(), IpcError> {
+        send(self.fd(), msg_type, payload)
+    }
+
+    pub fn signal(&self, msg_type: u32) -> Result<(), IpcError> {
+        signal(self.fd(), msg_type)
+    }
+
+    pub fn send_bytes(&self, msg_type: u32, data: &[u8]) -> Result<(), IpcError> {
+        send_bytes(self.fd(), msg_type, data)
+    }
+
+    pub fn recv_header(&self) -> Result<IpcHeader, IpcError> {
+        recv_header(self.fd())
+    }
+
+    pub fn recv_payload<T: Copy>(&self, header: &IpcHeader) -> Result<T, IpcError> {
+        recv_payload(self.fd(), header)
+    }
+
+    pub fn recv<T: Copy>(&self) -> Result<(u32, T), IpcError> {
+        recv(self.fd())
+    }
+
+    pub fn recv_bytes(&self, header: &IpcHeader, buf: &mut [u8]) -> Result<usize, IpcError> {
+        recv_bytes(self.fd(), header, buf)
+    }
+
+    pub fn read_nonblock(&self, buf: &mut [u8]) -> Result<usize, SyscallError> {
+        self.0.read_nonblock(buf)
+    }
+
+    pub fn write_nonblock(&self, buf: &[u8]) -> Result<usize, SyscallError> {
+        self.0.write_nonblock(buf)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Free functions — used by consumers that hold raw Fds (compositor, netd).
+// Will become pub(crate) once all callers migrate to Connection methods.
+// ---------------------------------------------------------------------------
 
 pub fn send<T: Copy>(fd: Fd, msg_type: u32, payload: &T) -> Result<(), IpcError> {
     let header = IpcHeader { msg_type, len: core::mem::size_of::<T>() as u32 };

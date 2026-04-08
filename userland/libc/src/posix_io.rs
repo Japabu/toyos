@@ -467,24 +467,25 @@ pub unsafe extern "C" fn poll(fds: *mut pollfd, nfds: u32, timeout: i32) -> i32 
 
     let timeout_ns = if timeout < 0 { None } else { Some(timeout as u64 * 1_000_000) };
 
-    // Build fd array for io_uring poll
     let n = nfds as usize;
-    let mut toyos_fds = alloc::vec![0u64; n];
+    let poller = toyos::poller::Poller::new(n as u32);
     for i in 0..n {
         let pfd = &*fds.add(i);
-        let mut fd_val = pfd.fd as u64;
-        if pfd.events & POLLIN != 0 { fd_val |= toyos_abi::io_uring::POLL_READABLE; }
-        if pfd.events & POLLOUT != 0 { fd_val |= toyos_abi::io_uring::POLL_WRITABLE; }
-        toyos_fds[i] = fd_val;
+        let mut flags = 0u32;
+        if pfd.events & POLLIN != 0 { flags |= toyos::poller::IORING_POLL_IN; }
+        if pfd.events & POLLOUT != 0 { flags |= toyos::poller::IORING_POLL_OUT; }
+        poller.poll_add_fd(toyos_abi::Fd(pfd.fd), flags, i as u64);
     }
 
-    let result = toyos_abi::io_uring::poll_fds(&toyos_fds, timeout_ns);
+    let mut ready_set = alloc::vec![false; n];
+    poller.wait(1, timeout_ns.unwrap_or(u64::MAX), |token| {
+        if (token as usize) < n { ready_set[token as usize] = true; }
+    });
     let mut ready = 0i32;
     for i in 0..n {
         let pfd = &mut *fds.add(i);
         pfd.revents = 0;
-        if result.fd(i) {
-            // Set same events as requested (we don't distinguish yet)
+        if ready_set[i] {
             pfd.revents = pfd.events;
             ready += 1;
         }

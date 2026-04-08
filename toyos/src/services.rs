@@ -1,7 +1,8 @@
 //! Service discovery via listen/connect/accept.
 
 use toyos_abi::syscall::{self, SyscallError};
-use crate::{Listener, Connection, Handle};
+use crate::{Listener, Handle};
+use crate::ipc::Connection;
 
 pub struct AcceptResult {
     pub conn: Connection,

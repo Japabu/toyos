@@ -5,6 +5,5 @@ edition = "2021"
 
 [dependencies]
 font = { path = "../font" }
-toyos-abi = { path = "../../toyos-abi" }
 toyos = { path = "../../toyos" }
 window = { path = "../window" }

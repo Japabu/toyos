@@ -18,6 +18,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "toyos"
+version = "0.1.0"
+dependencies = [
+ "toyos-abi",
+]
+
+[[package]]
 name = "toyos-abi"
 version = "0.1.0"
 
@@ -26,6 +33,7 @@ name = "toyos-rust-tests"
 version = "0.1.0"
 dependencies = [
  "libloading",
+ "toyos",
  "toyos-abi",
 ]
 

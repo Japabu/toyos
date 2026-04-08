@@ -41,7 +41,19 @@ pub fn ensure(root: &Path, rust_dir: &Path) {
         .stderr(std::process::Stdio::inherit())
         .output()
         .expect("Failed to build toyos-libc");
-    assert!(output.status.success(), "toyos-libc build failed");
+    if !output.status.success() {
+        // --message-format=json suppresses rendered errors on stderr.
+        // Print them from the JSON diagnostic messages on stdout.
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            let Ok(msg) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+            if msg.get("reason").and_then(|r| r.as_str()) == Some("compiler-message") {
+                if let Some(rendered) = msg.pointer("/message/rendered").and_then(|r| r.as_str()) {
+                    eprint!("{rendered}");
+                }
+            }
+        }
+        panic!("toyos-libc build failed");
+    }
 
     // Collect rlib paths from cargo's JSON output, then merge into a single archive.
     let mut rlib_paths: Vec<std::path::PathBuf> = Vec::new();

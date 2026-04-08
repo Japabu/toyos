@@ -31,7 +31,7 @@ pub struct QemuInstance {
 pub fn build_toyos_bins(crate_path: &Path) -> Vec<(String, Vec<u8>)> {
     let repo = compile::repo_root();
     let quiet = !VERBOSE.load(Ordering::Relaxed);
-    toyos::build::build_toyos_bins(&repo, crate_path, quiet)
+    toyos_build::build::build_toyos_bins(&repo, crate_path, quiet)
 }
 
 /// All kernel serial output goes through log!() which prepends "[kernel ...]".
@@ -81,7 +81,7 @@ impl QemuInstance {
         );
 
         let quiet = !VERBOSE.load(Ordering::Relaxed);
-        let disk = toyos::build::build_test_image(&repo, &config_path, debug_wait, quiet, &extra_files);
+        let disk = toyos_build::build::build_test_image(&repo, &config_path, debug_wait, quiet, &extra_files);
 
         let pid = std::process::id();
         let test_dir = env::temp_dir().join(format!("toyos-tests-{pid}"));

@@ -5,7 +5,7 @@ use std::time::Duration;
 use std::process::{Command, Stdio};
 
 use toyos_abi::syscall;
-use toyos_abi::io_uring;
+use toyos::poller::{Poller, IORING_POLL_IN};
 
 fn main() {
     match std::env::args().nth(1).as_deref() {
@@ -60,12 +60,10 @@ fn test_listener_isolation_io_uring() {
     let a = thread::spawn(move || -> bool {
         let fd = syscall::listen("test_uring_a").expect("listen a");
         a_ready2.store(true, Ordering::Release);
-        // poll_fds: POLL_IN on listener fd, 500ms timeout
-        let result = io_uring::poll_fds(
-            &[fd.0 as u64 | io_uring::POLL_READABLE],
-            Some(500_000_000),
-        );
-        let ready = result.fd(0);
+        let poller = Poller::new(1);
+        poller.poll_add_fd(fd, IORING_POLL_IN, 0);
+        let mut ready = false;
+        poller.wait(1, 500_000_000, |_| ready = true);
         syscall::close(fd);
         ready
     });
@@ -74,13 +72,10 @@ fn test_listener_isolation_io_uring() {
     let b = thread::spawn(move || -> bool {
         let fd = syscall::listen("test_uring_b").expect("listen b");
         b_ready2.store(true, Ordering::Release);
-        // poll_fds: POLL_IN on listener fd, 200ms timeout
-        // If spurious wake happens, this returns true despite no connection
-        let result = io_uring::poll_fds(
-            &[fd.0 as u64 | io_uring::POLL_READABLE],
-            Some(200_000_000),
-        );
-        let ready = result.fd(0);
+        let poller = Poller::new(1);
+        poller.poll_add_fd(fd, IORING_POLL_IN, 0);
+        let mut ready = false;
+        poller.wait(1, 200_000_000, |_| ready = true);
         syscall::close(fd);
         ready
     });
@@ -102,7 +97,6 @@ fn test_listener_isolation_io_uring() {
     assert!(!b_poll_ready, "svc_b poll completed spuriously — listener isolation broken!");
 
     // Clean up: accept svc_a's connection so the listener can be removed
-    // (already consumed by poll_fds returning, but the connection is still queued)
 
     println!("  listener isolation (io_uring): ok");
 }

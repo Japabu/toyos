@@ -1,14 +1,13 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use toyos_abi::Fd;
-use toyos_abi::io_uring::IORING_POLL_IN;
-use toyos::device;
+use toyos::poller::IORING_POLL_IN;
 use toyos::ipc;
 use toyos::pipe;
-use toyos::raw_net as toyos_nic;
+use toyos_abi::syscall as toyos_nic;
 use toyos::services;
 use toyos::shm;
-use toyos::{Device as ToyosDevice, Pipe};
+use toyos::{Nic as NicDev, Pipe};
 
 use toyos::net::*;
 
@@ -29,17 +28,13 @@ struct DmaNic {
     tx_buf: *mut u8,
     net_hdr_size: usize,
     mac: [u8; 6],
-    nic_fd: ToyosDevice,
+    nic_fd: NicDev,
 }
 
 impl DmaNic {
     fn new() -> Self {
-        let nic_fd = device::open_nic().expect("netd: failed to claim NIC device");
-
-        let mut info_bytes = [0u8; core::mem::size_of::<toyos_abi::net::NicInfo>()];
-        let n = toyos_abi::syscall::read(nic_fd.fd(), &mut info_bytes).expect("netd: failed to read NicInfo");
-        assert_eq!(n, info_bytes.len(), "netd: NicInfo size mismatch");
-        let info: toyos_abi::net::NicInfo = unsafe { core::ptr::read(info_bytes.as_ptr() as *const _) };
+        let nic_dev = NicDev::open().expect("netd: failed to claim NIC device");
+        let info = nic_dev.info().expect("netd: failed to read NicInfo");
 
         let rx_buf_size = info.rx_buf_size as usize;
         let dma_region = shm::SharedMemory::map(info.dma_token, 2 * 1024 * 1024);
@@ -54,7 +49,7 @@ impl DmaNic {
             tx_buf: tx_ptr,
             net_hdr_size: info.net_hdr_size as usize,
             mac: info.mac,
-            nic_fd,
+            nic_fd: nic_dev,
         }
     }
 
@@ -68,7 +63,9 @@ impl Device for DmaNic {
     type TxToken<'a> = DmaTxToken<'a>;
 
     fn receive(&mut self, _timestamp: SmoltcpInstant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        let (buf_idx, frame_len) = toyos_nic::nic_rx_poll()?;
+        let v = toyos_nic::nic_rx_poll();
+        if v == 0 { return None; }
+        let (buf_idx, frame_len) = ((v >> 16) as usize, (v & 0xFFFF) as usize);
         // Safety: The data slice borrows from the DMA region via the device's lifetime 'a.
         // smoltcp's RxToken::consume takes self by value with FnOnce(&[u8]) -> R, so the
         // callback cannot store the reference. nic_rx_done is called after the callback
@@ -108,7 +105,7 @@ impl<'a> phy::RxToken for DmaRxToken<'a> {
         F: FnOnce(&[u8]) -> R,
     {
         let result = f(self.data);
-        toyos_nic::nic_rx_done(self.buf_idx);
+        toyos_nic::nic_rx_done(self.buf_idx as u64);
         result
     }
 }
@@ -131,7 +128,7 @@ impl<'a> phy::TxToken for DmaTxToken<'a> {
                 len,
             );
             let result = f(frame);
-            toyos_nic::nic_tx(self.net_hdr_size + len);
+            toyos_nic::nic_tx((self.net_hdr_size + len) as u64);
             result
         }
     }
@@ -1046,7 +1043,7 @@ fn main() {
     eprintln!("netd: ready");
 
     // Create io_uring for event multiplexing
-    let ring = toyos::ring::Ring::new(64);
+    let poller = toyos::poller::Poller::new(64);
     const TOKEN_LISTENER: u64 = 0;
     const TOKEN_NIC: u64 = 1;
     const TOKEN_TX_PIPE_BASE: u64 = 0x1000;
@@ -1091,13 +1088,13 @@ fn main() {
         };
 
         // 7. Poll: listener fd + NIC fd + tx pipe fds via io_uring
-        ring.poll_add(listener.fd(), IORING_POLL_IN, TOKEN_LISTENER);
-        ring.poll_add(device.nic_fd.fd(), IORING_POLL_IN, TOKEN_NIC);
+        poller.poll_add(&listener, IORING_POLL_IN, TOKEN_LISTENER);
+        poller.poll_add(&device.nic_fd, IORING_POLL_IN, TOKEN_NIC);
 
         // Submit POLL_ADD for each active tx pipe (client → netd direction)
         for (i, conn) in daemon.piped_connections.iter().enumerate() {
             if let Some(ref pipe) = conn.tx_read_fd {
-                ring.poll_add(pipe.fd(), IORING_POLL_IN, TOKEN_TX_PIPE_BASE + i as u64);
+                poller.poll_add(pipe, IORING_POLL_IN, TOKEN_TX_PIPE_BASE + i as u64);
             }
         }
 
@@ -1107,7 +1104,7 @@ fn main() {
         };
 
         let mut listener_ready = false;
-        ring.wait(1, timeout, |token| {
+        poller.wait(1, timeout, |token| {
             if token == TOKEN_LISTENER {
                 listener_ready = true;
             }

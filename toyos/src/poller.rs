@@ -1,4 +1,4 @@
-//! Ergonomic io_uring wrapper.
+//! Event-driven I/O polling via io_uring.
 
 use core::sync::atomic::Ordering;
 use toyos_abi::Fd;
@@ -7,23 +7,31 @@ use toyos_abi::io_uring::{
     IoUringSqe, IoUringCqe, IoUringRingHeader, IoUringParams,
     IORING_OP_POLL_ADD, SQ_RING_OFF, CQ_RING_OFF, SQES_OFF,
 };
+use crate::AsHandle;
 
-/// An io_uring instance for event-driven I/O.
+pub use toyos_abi::io_uring::{IORING_POLL_IN, IORING_POLL_OUT};
+
+/// An io_uring instance for polling fd readiness.
 ///
 /// Owns the ring fd and shared memory mapping. Submissions are batched
-/// and flushed on `wait()`.
-pub struct Ring {
+/// and flushed on [`wait`](Self::wait).
+pub struct Poller {
     ring_fd: Fd,
     base: *mut u8,
     sq_size: u32,
     cq_size: u32,
 }
 
-impl Ring {
+// Safety: the base pointer is process-local shared memory mapped from the
+// kernel. It is only accessed through atomic operations on the ring headers.
+unsafe impl Send for Poller {}
+unsafe impl Sync for Poller {}
+
+impl Poller {
     /// Create a new io_uring with the given number of entries.
     pub fn new(entries: u32) -> Self {
         let (ring_fd, shm_token) = syscall::io_uring_setup(entries)
-            .expect("Ring::new: io_uring_setup failed");
+            .expect("Poller::new: io_uring_setup failed");
         let base = unsafe { syscall::map_shared(shm_token) };
         let params = unsafe { &*(base as *const IoUringParams) };
         let sq_size = params.sq_ring_size;
@@ -31,11 +39,18 @@ impl Ring {
         Self { ring_fd, base, sq_size, cq_size }
     }
 
-    /// Submit a poll request for the given fd.
+    /// Submit a poll request for the given handle.
     ///
-    /// `flags` are `IORING_POLL_IN` / `IORING_POLL_OUT` from `toyos_abi::io_uring`.
-    /// `token` is returned in completions to identify which fd is ready.
-    pub fn poll_add(&self, fd: Fd, flags: u32, token: u64) {
+    /// `flags` are [`IORING_POLL_IN`] / [`IORING_POLL_OUT`].
+    /// `token` is returned in completions to identify which handle is ready.
+    pub fn poll_add(&self, handle: &impl AsHandle, flags: u32, token: u64) {
+        self.poll_add_fd(handle.as_handle(), flags, token);
+    }
+
+    /// Submit a poll request for a raw fd.
+    ///
+    /// Prefer [`poll_add`](Self::poll_add) when you have a typed handle.
+    pub fn poll_add_fd(&self, fd: Fd, flags: u32, token: u64) {
         let sq_hdr = unsafe {
             &*(self.base.add(SQ_RING_OFF as usize) as *const IoUringRingHeader)
         };
@@ -91,7 +106,7 @@ impl Ring {
     }
 }
 
-impl Drop for Ring {
+impl Drop for Poller {
     fn drop(&mut self) {
         syscall::close(self.ring_fd);
     }

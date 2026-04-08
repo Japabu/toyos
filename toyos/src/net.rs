@@ -4,9 +4,9 @@
 //! All networking in ToyOS goes through the `netd` daemon via message passing
 //! and kernel pipes.
 
-use toyos_abi::Fd;
 use toyos_abi::syscall;
-use crate::ipc::{self, IpcHeader};
+use crate::ipc::IpcHeader;
+use crate::{Connection, Pipe, Handle};
 
 // ---------------------------------------------------------------------------
 // IPC payload safety
@@ -288,21 +288,21 @@ unsafe impl IpcPayload for SentBytes {}
 // ---------------------------------------------------------------------------
 
 pub struct TcpConnection {
-    pub rx_fd: Fd,
-    pub tx_fd: Fd,
+    pub rx: Pipe,
+    pub tx: Pipe,
     pub socket_id: TcpSocketId,
     pub local_port: u16,
 }
 
 pub struct TcpBound {
-    pub notify_fd: Fd,
+    pub notify: Pipe,
     pub socket_id: TcpSocketId,
     pub bound_port: u16,
 }
 
 pub struct TcpAccepted {
-    pub rx_fd: Fd,
-    pub tx_fd: Fd,
+    pub rx: Pipe,
+    pub tx: Pipe,
     pub socket_id: TcpSocketId,
     pub remote_addr: [u8; 4],
     pub remote_port: u16,
@@ -312,28 +312,28 @@ pub struct TcpAccepted {
 pub struct UdpBound {
     pub socket_id: UdpSocketId,
     pub bound_port: u16,
-    pub tx_fd: Fd,
-    pub rx_fd: Fd,
+    pub tx: Pipe,
+    pub rx: Pipe,
 }
 
 // ---------------------------------------------------------------------------
 // NetdConn — per-operation IPC connection (typestate protocol)
 // ---------------------------------------------------------------------------
 
-pub struct NetdConn(Fd);
+pub struct NetdConn(Connection);
 
 impl NetdConn {
     const BOOT_RETRIES: u32 = 100;
     const BOOT_RETRY_INTERVAL_NS: u64 = 10_000_000;
 
     pub fn connect() -> Result<Self, NetError> {
-        syscall::connect("netd").map(Self).map_err(|_| NetError::NetdNotFound)
+        crate::services::connect("netd").map(Self).map_err(|_| NetError::NetdNotFound)
     }
 
     pub fn connect_blocking() -> Result<Self, NetError> {
         for _ in 0..Self::BOOT_RETRIES {
-            if let Ok(fd) = syscall::connect("netd") {
-                return Ok(Self(fd));
+            if let Ok(conn) = crate::services::connect("netd") {
+                return Ok(Self(conn));
             }
             syscall::nanosleep(Self::BOOT_RETRY_INTERVAL_NS);
         }
@@ -341,30 +341,25 @@ impl NetdConn {
     }
 
     pub fn request<Req: IpcPayload>(self, msg_type: MsgType, payload: &Req) -> Result<PendingResponse, NetError> {
-        ipc::send(self.0, msg_type as u32, payload).map_err(|_| NetError::Io)?;
+        self.0.send(msg_type as u32, payload).map_err(|_| NetError::Io)?;
         Ok(PendingResponse(self))
     }
 
     pub fn request_bytes(self, msg_type: MsgType, data: &[u8]) -> Result<PendingResponse, NetError> {
-        ipc::send_bytes(self.0, msg_type as u32, data).map_err(|_| NetError::Io)?;
+        self.0.send_bytes(msg_type as u32, data).map_err(|_| NetError::Io)?;
         Ok(PendingResponse(self))
-    }
-}
-
-impl Drop for NetdConn {
-    fn drop(&mut self) {
-        syscall::close(self.0);
     }
 }
 
 pub struct PendingResponse(NetdConn);
 
 impl PendingResponse {
+    fn conn(&self) -> &Connection { &(self.0).0 }
+
     fn recv_checked_header(&self) -> Result<IpcHeader, NetError> {
-        let fd = (self.0).0;
-        let header = ipc::recv_header(fd).map_err(|_| NetError::Io)?;
+        let header = self.conn().recv_header().map_err(|_| NetError::Io)?;
         if header.msg_type == RespType::Error as u32 {
-            let err: ErrorResponse = ipc::recv_payload(fd, &header).map_err(|_| NetError::Io)?;
+            let err: ErrorResponse = self.conn().recv_payload(&header).map_err(|_| NetError::Io)?;
             return Err(NetError::from_error_code(err.code));
         }
         if header.msg_type != RespType::Result as u32 {
@@ -375,22 +370,19 @@ impl PendingResponse {
 
     pub fn response<Resp: IpcPayload>(self) -> Result<Resp, NetError> {
         let header = self.recv_checked_header()?;
-        let fd = (self.0).0;
-        ipc::recv_payload(fd, &header).map_err(|_| NetError::Io)
+        self.conn().recv_payload(&header).map_err(|_| NetError::Io)
     }
 
     pub fn response_bytes(self, buf: &mut [u8]) -> Result<usize, NetError> {
         let header = self.recv_checked_header()?;
-        let fd = (self.0).0;
-        ipc::recv_bytes(fd, &header, buf).map_err(|_| NetError::Io)
+        self.conn().recv_bytes(&header, buf).map_err(|_| NetError::Io)
     }
 
     pub fn status(self) -> Result<(), NetError> {
         let header = self.recv_checked_header()?;
-        let fd = (self.0).0;
         if header.len > 0 {
             let mut skip = [0u8; 128];
-            let _ = ipc::recv_bytes(fd, &header, &mut skip);
+            let _ = self.conn().recv_bytes(&header, &mut skip);
         }
         Ok(())
     }
@@ -428,8 +420,8 @@ pub fn tcp_connect(
             syscall::close(rx_pipe.write);
             syscall::close(tx_pipe.read);
             Ok(TcpConnection {
-                rx_fd: rx_pipe.read,
-                tx_fd: tx_pipe.write,
+                rx: Pipe(Handle(rx_pipe.read)),
+                tx: Pipe(Handle(tx_pipe.write)),
                 socket_id: TcpSocketId(resp.socket_id),
                 local_port: resp.local_port,
             })
@@ -461,7 +453,7 @@ pub fn tcp_bind(addr: [u8; 4], port: u16) -> Result<TcpBound, NetError> {
         Ok(resp) => {
             syscall::close(notify_pipe.write);
             Ok(TcpBound {
-                notify_fd: notify_pipe.read,
+                notify: Pipe(Handle(notify_pipe.read)),
                 socket_id: TcpSocketId(resp.socket_id),
                 bound_port: resp.bound_port,
             })
@@ -495,8 +487,8 @@ pub fn tcp_accept(socket_id: TcpSocketId) -> Result<TcpAccepted, NetError> {
             syscall::close(rx_pipe.write);
             syscall::close(tx_pipe.read);
             Ok(TcpAccepted {
-                rx_fd: rx_pipe.read,
-                tx_fd: tx_pipe.write,
+                rx: Pipe(Handle(rx_pipe.read)),
+                tx: Pipe(Handle(tx_pipe.write)),
                 socket_id: TcpSocketId(resp.socket_id),
                 remote_addr: resp.remote_addr,
                 remote_port: resp.remote_port,
@@ -566,8 +558,8 @@ pub fn udp_bind(addr: [u8; 4], port: u16) -> Result<UdpBound, NetError> {
             Ok(UdpBound {
                 socket_id: UdpSocketId(resp.socket_id),
                 bound_port: resp.bound_port,
-                tx_fd: tx_pipe.write,
-                rx_fd: rx_pipe.read,
+                tx: Pipe(Handle(tx_pipe.write)),
+                rx: Pipe(Handle(rx_pipe.read)),
             })
         }
         Err(e) => {

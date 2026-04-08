@@ -1,41 +1,34 @@
 use toyos_abi::audio::AudioInfo;
-use toyos_abi::io_uring;
-use toyos_abi::ring::RingHeader;
+use toyos::poller::{Poller, IORING_POLL_IN};
 use toyos_abi::syscall;
 use toyos_abi::Fd;
-use toyos::audio::{AudioOpenRequest, AudioOpenResponse, AudioSetVolume};
+use toyos::audio::{AudioOpenRequest, AudioOpenResponse, AudioRingReader, AudioSetVolume};
 use toyos::audio::{MSG_AUDIO_OPEN, MSG_AUDIO_OPENED, MSG_AUDIO_SET_VOLUME};
-use toyos::device;
 use toyos::services;
 use toyos::shm::SharedMemory;
-use toyos::{Connection, Device};
+use toyos::{AudioDev, Connection};
 
 const AUDIO_RING_SIZE: usize = 16384;
 const DEFAULT_VOLUME: i32 = 256;
 
-struct AudioStream {
-    shm: SharedMemory,
+struct ClientStream {
+    ring: AudioRingReader,
     control: Connection,
     volume: i32,
 }
 
-impl AudioStream {
-    fn ring(&self) -> &RingHeader {
-        unsafe { &*(self.shm.as_ptr() as *const RingHeader) }
-    }
-
+impl ClientStream {
     /// Read up to `max_samples` i16 samples from the ring, mix into `mix` at `offset`.
     /// Returns the number of samples actually read.
     fn mix_into(&self, mix: &mut [i32], offset: usize, max_samples: usize) -> usize {
-        let ring = self.ring();
         let need = max_samples * 2;
-        let avail = ring.available() as usize;
+        let avail = self.ring.available() as usize;
         let to_read = need.min(avail) & !1;
         if to_read == 0 {
             return 0;
         }
         let mut raw = [0u8; 8192];
-        let n = ring.read(&mut raw[..to_read]);
+        let n = self.ring.read(&mut raw[..to_read]);
         let samples = n / 2;
         let vol = self.volume;
         for i in 0..samples {
@@ -46,23 +39,12 @@ impl AudioStream {
     }
 
     fn is_dead(&self) -> bool {
-        let ring = self.ring();
-        ring.is_writer_closed() && ring.available() == 0
+        self.ring.is_writer_closed() && self.ring.available() == 0
     }
 }
 
-fn read_struct<T: Copy>(dev: &Device) -> T {
-    let mut buf = [0u8; 256];
-    let size = core::mem::size_of::<T>();
-    assert!(size <= buf.len());
-    let n = dev.read(&mut buf[..size]).expect("read device info failed");
-    assert_eq!(n, size);
-    unsafe { core::ptr::read(buf.as_ptr() as *const T) }
-}
-
-fn open_stream(control: Connection, client_pid: u32, _req: &AudioOpenRequest, next_id: &mut u32) -> AudioStream {
-    let mut shm = SharedMemory::allocate(AUDIO_RING_SIZE);
-    RingHeader::init(shm.as_mut_slice().as_mut_ptr(), AUDIO_RING_SIZE);
+fn open_stream(control: Connection, client_pid: u32, _req: &AudioOpenRequest, next_id: &mut u32) -> ClientStream {
+    let shm = SharedMemory::allocate(AUDIO_RING_SIZE);
     shm.grant(client_pid);
 
     let id = *next_id;
@@ -74,14 +56,15 @@ fn open_stream(control: Connection, client_pid: u32, _req: &AudioOpenRequest, ne
         ring_size: AUDIO_RING_SIZE as u32,
     });
 
-    AudioStream { shm, control, volume: DEFAULT_VOLUME }
+    let ring = AudioRingReader::new(shm);
+    ClientStream { ring, control, volume: DEFAULT_VOLUME }
 }
 
 fn main() {
     let listener = services::listen("soundd").expect("soundd already running");
 
-    let audio_dev = device::open_audio().expect("soundd: no audio device");
-    let info: AudioInfo = read_struct(&audio_dev);
+    let audio_dev = AudioDev::open().expect("soundd: no audio device");
+    let info: AudioInfo = audio_dev.info().expect("soundd: failed to read audio info");
     drop(audio_dev);
 
     let num_buffers = info.num_buffers as usize;
@@ -98,7 +81,7 @@ fn main() {
     eprintln!("soundd: ready, {} buffers, {}Hz, {} bytes/period",
         num_buffers, info.sample_rate, info.period_bytes);
 
-    let mut streams: Vec<AudioStream> = Vec::new();
+    let mut streams: Vec<ClientStream> = Vec::new();
     let mut next_stream_id: u32 = 1;
     let mut free_mask: u32 = (1u32 << num_buffers) - 1;
 
@@ -108,6 +91,8 @@ fn main() {
     // silence gaps.
     let mut accum = vec![0i32; period_samples];
     let mut accum_filled: usize = 0;
+
+    let poller = Poller::new(64);
 
     loop {
         // 1. Reclaim completed DMA buffers
@@ -155,20 +140,21 @@ fn main() {
         // 4. Clean up dead streams
         streams.retain(|s| !s.is_dead());
 
-        // 5. Check for connections and control messages
-        let mut poll_fds: Vec<u64> = Vec::with_capacity(1 + streams.len());
-        poll_fds.push(listener.fd().0 as u64);
-        for stream in &streams {
-            poll_fds.push(stream.control.fd().0 as u64);
+        // 5. Check for connections and control messages via io_uring
+        const TOKEN_LISTENER: u64 = u64::MAX;
+        poller.poll_add(&listener, IORING_POLL_IN, TOKEN_LISTENER);
+        for (i, stream) in streams.iter().enumerate() {
+            poller.poll_add(&stream.control, IORING_POLL_IN, i as u64);
         }
 
         // When idle (no streams), block for up to 100ms waiting for connections.
         // When active, poll with 1ms timeout — fast enough for ~23ms DMA periods
         // while avoiding busy-wait CPU burn.
         let timeout = if streams.is_empty() { 100_000_000 } else { 1_000_000 };
-        let result = io_uring::poll_fds(&poll_fds, Some(timeout));
+        let mut ready_tokens: Vec<u64> = Vec::new();
+        poller.wait(1, timeout, |token| ready_tokens.push(token));
 
-        if result.fd(0) {
+        if ready_tokens.contains(&TOKEN_LISTENER) {
             let conn = services::accept(&listener).expect("accept failed");
             let Ok(header) = conn.conn.recv_header() else {
                 continue;
@@ -185,7 +171,7 @@ fn main() {
 
         let mut dead_controls: Vec<Fd> = Vec::new();
         for i in 0..streams.len() {
-            if result.fd(1 + i) {
+            if ready_tokens.contains(&(i as u64)) {
                 let fd = streams[i].control.fd();
                 let Ok(header) = streams[i].control.recv_header() else {
                     dead_controls.push(fd);

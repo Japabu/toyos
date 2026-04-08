@@ -7,5 +7,4 @@ edition = "2021"
 window = { path = "../window" }
 font = { path = "../font" }
 filepicker-api = { path = "../filepicker-api" }
-toyos-abi = { path = "../../toyos-abi" }
 toyos = { path = "../../toyos" }
