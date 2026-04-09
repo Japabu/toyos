@@ -5,19 +5,18 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use log::{debug, error, warn};
-use signature::Verifier;
 use ssh_encoding::{Decode, Encode};
 use ssh_key::{Mpint, PublicKey, Signature};
 
 use super::IncomingSshPacket;
 use crate::client::{Config, NewKeys};
 use crate::kex::dh::groups::DhGroup;
-use crate::kex::{KexAlgorithm, KexAlgorithmImplementor, KexCause, KexProgress, KEXES};
+use crate::kex::{KEXES, KexAlgorithm, KexAlgorithmImplementor, KexCause, KexProgress};
 use crate::keys::key::parse_public_key;
 use crate::negotiation::{Names, Select};
 use crate::session::Exchange;
 use crate::sshbuffer::PacketWriter;
-use crate::{msg, negotiation, strict_kex_violation, CryptoVec, Error, SshId};
+use crate::{CryptoVec, Error, SshId, msg, negotiation, strict_kex_violation};
 
 thread_local! {
     static HASH_BUFFER: RefCell<CryptoVec> = RefCell::new(CryptoVec::new());
@@ -116,7 +115,9 @@ impl ClientKex {
 
                 let names = {
                     // read algorithms from packet.
-                    self.exchange.server_kex_init.extend(&input.buffer);
+                    self.exchange
+                        .server_kex_init
+                        .extend_from_slice(&input.buffer);
                     negotiation::Client::read_kex(
                         &input.buffer,
                         &self.config.preferred,
@@ -139,7 +140,7 @@ impl ClientKex {
                 if kex.skip_exchange() {
                     // Non-standard no-kex exchange
                     let newkeys = compute_keys(
-                        CryptoVec::new(),
+                        Vec::new(),
                         kex,
                         names.clone(),
                         self.exchange.clone(),
@@ -270,10 +271,12 @@ impl ClientKex {
                 );
 
                 let server_ephemeral = Bytes::decode(r)?;
-                self.exchange.server_ephemeral.extend(&server_ephemeral);
+                self.exchange
+                    .server_ephemeral
+                    .extend_from_slice(&server_ephemeral);
                 kex.compute_shared_secret(&self.exchange.server_ephemeral)?;
 
-                let mut pubkey_vec = CryptoVec::new();
+                let mut pubkey_vec = Vec::new();
                 server_host_key.to_bytes()?.encode(&mut pubkey_vec)?;
 
                 let exchange = &self.exchange;
@@ -288,7 +291,9 @@ impl ClientKex {
                 let signature = Bytes::decode(r)?;
                 let signature = Signature::decode(&mut &signature[..])?;
 
-                if let Err(e) = Verifier::verify(&server_host_key, hash.as_ref(), &signature) {
+                if let Err(e) =
+                    signature::Verifier::verify(&server_host_key, hash.as_ref(), &signature)
+                {
                     debug!("wrong server sig: {e:?}");
                     return Err(Error::WrongServerSig);
                 }
@@ -346,32 +351,43 @@ impl ClientKex {
 }
 
 fn compute_keys(
-    hash: CryptoVec,
+    hash: Vec<u8>,
     kex: KexAlgorithm,
     names: Names,
     exchange: Exchange,
     session_id: Option<&CryptoVec>,
 ) -> Result<NewKeys, Error> {
-    let session_id = if let Some(session_id) = session_id {
-        session_id
-    } else {
-        &hash
+    let session_id_ref: &[u8] = match session_id {
+        Some(sid) => sid,
+        None => &hash,
     };
     // Now computing keys.
     let c = kex.compute_keys(
-        session_id,
+        session_id_ref,
         &hash,
         names.cipher,
         names.server_mac,
         names.client_mac,
         false,
     )?;
+    // The session_id stored in NewKeys is sensitive key material
+    // (used in key derivation), so keep it as CryptoVec.
+    // On initial exchange the exchange hash becomes the session_id;
+    // on rekey we already have it as CryptoVec.
+    let session_id_cv = match session_id {
+        Some(s) => s.clone(),
+        None => {
+            let mut cv = CryptoVec::new();
+            cv.extend(&hash);
+            cv
+        }
+    };
     Ok(NewKeys {
         exchange,
         names,
         kex,
         key: 0,
         cipher: c,
-        session_id: session_id.clone(),
+        session_id: session_id_cv,
     })
 }

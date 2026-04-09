@@ -34,6 +34,7 @@
 //!
 //! [Session]: client::Session
 
+use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::convert::TryInto;
 use std::num::Wrapping;
@@ -68,8 +69,8 @@ use crate::session::{CommonSession, EncryptedState, GlobalRequestResponse, NewKe
 use crate::ssh_read::SshRead;
 use crate::sshbuffer::{IncomingSshPacket, PacketWriter, SSHBuffer, SshId};
 use crate::{
-    ChannelId, ChannelOpenFailure, CryptoVec, Disconnect, Error, Limits, MethodSet, Sig, auth,
-    map_err, msg, negotiation,
+    ChannelId, ChannelOpenFailure, Disconnect, Error, Limits, MethodSet, Sig, auth, map_err, msg,
+    negotiation,
 };
 
 mod encrypted;
@@ -92,7 +93,7 @@ pub struct Session {
     sender: UnboundedSender<Reply>,
     channels: HashMap<ChannelId, ChannelRef>,
     target_window_size: u32,
-    pending_reads: Vec<CryptoVec>,
+    pending_reads: Vec<Vec<u8>>,
     pending_len: u32,
     inbound_channel_sender: Sender<Msg>,
     inbound_channel_receiver: Receiver<Msg>,
@@ -117,7 +118,12 @@ enum Reply {
     ChannelOpenFailure,
     SignRequest {
         key: ssh_key::PublicKey,
-        data: CryptoVec,
+        data: Vec<u8>,
+    },
+    SignRequestCert {
+        cert: Certificate,
+        hash_alg: Option<HashAlg>,
+        data: Vec<u8>,
     },
     AuthInfoRequest {
         name: String,
@@ -137,7 +143,7 @@ pub enum Msg {
         responses: Vec<String>,
     },
     Signed {
-        data: CryptoVec,
+        data: Vec<u8>,
     },
     ChannelOpenSession {
         channel_ref: ChannelRef,
@@ -480,7 +486,69 @@ impl<H: Handler> Handle<H> {
                     });
                 }
                 Some(Reply::SignRequest { key, data }) => {
-                    let data = signer.auth_publickey_sign(&key, hash_alg, data).await;
+                    let data = signer.auth_sign(&key.into(), hash_alg, data).await;
+                    let data = match data {
+                        Ok(data) => data,
+                        Err(e) => return Err(e),
+                    };
+                    if self.sender.send(Msg::Signed { data }).await.is_err() {
+                        return Err((crate::SendError {}).into());
+                    }
+                }
+                None => {
+                    return Ok(AuthResult::Failure {
+                        remaining_methods: MethodSet::empty(),
+                        partial_success: false,
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Authenticate using a certificate with a custom signer that implements the
+    /// [`Signer`][auth::Signer] trait. This is for certificate-based authentication
+    /// where the signing is delegated to an external signer (e.g., SSH agent).
+    ///
+    /// For RSA certificates, you can specify the hash algorithm to use.
+    pub async fn authenticate_certificate_with<U: Into<String>, S: auth::Signer>(
+        &mut self,
+        user: U,
+        cert: Certificate,
+        hash_alg: Option<HashAlg>,
+        signer: &mut S,
+    ) -> Result<AuthResult, S::Error> {
+        let user = user.into();
+        if self
+            .sender
+            .send(Msg::Authenticate {
+                user,
+                method: auth::Method::FutureCertificate { cert, hash_alg },
+            })
+            .await
+            .is_err()
+        {
+            return Err((crate::SendError {}).into());
+        }
+        loop {
+            let reply = self.receiver.recv().await;
+            match reply {
+                Some(Reply::AuthSuccess) => return Ok(AuthResult::Success),
+                Some(Reply::AuthFailure {
+                    proceed_with_methods: remaining_methods,
+                    partial_success,
+                }) => {
+                    return Ok(AuthResult::Failure {
+                        remaining_methods,
+                        partial_success,
+                    });
+                }
+                Some(Reply::SignRequestCert {
+                    cert,
+                    hash_alg,
+                    data,
+                }) => {
+                    let data = signer.auth_sign(&cert.into(), hash_alg, data).await;
                     let data = match data {
                         Ok(data) => data,
                         Err(e) => return Err(e),
@@ -695,7 +763,7 @@ impl<H: Handler> Handle<H> {
     ///
     /// If port == 0 the server will choose a port that will be returned, returns 0 otherwise
     pub async fn tcpip_forward<A: Into<String>>(
-        &mut self,
+        &self,
         address: A,
         port: u32,
     ) -> Result<u32, crate::Error> {
@@ -747,7 +815,7 @@ impl<H: Handler> Handle<H> {
 
     // Requests the server to open a UDS forward channel
     pub async fn streamlocal_forward<A: Into<String>>(
-        &mut self,
+        &self,
         socket_path: A,
     ) -> Result<(), crate::Error> {
         let (reply_send, reply_recv) = oneshot::channel();
@@ -815,9 +883,14 @@ impl<H: Handler> Handle<H> {
     ///
     /// This is useful for server-initiated channels; for channels created by
     /// the client, prefer to use the Channel returned from the `open_*` methods.
-    pub async fn data(&self, id: ChannelId, data: CryptoVec) -> Result<(), CryptoVec> {
+    pub async fn data(
+        &self,
+        id: ChannelId,
+        data: impl Into<bytes::Bytes>,
+    ) -> Result<(), bytes::Bytes> {
+        let data = data.into();
         self.sender
-            .send(Msg::Channel(id, ChannelMsg::Data { data }))
+            .send(Msg::Channel(id, ChannelMsg::Data { data: data.clone() }))
             .await
             .map_err(|e| match e.0 {
                 Msg::Channel(_, ChannelMsg::Data { data, .. }) => data,
@@ -948,7 +1021,7 @@ where
             config,
             wants_reply: false,
             disconnected: false,
-            buffer: CryptoVec::new(),
+            buffer: Vec::new(),
             strict_kex: false,
             alive_timeouts: 0,
             received_data: false,
@@ -990,7 +1063,7 @@ async fn start_reading<R: AsyncRead + Unpin>(
 impl Session {
     fn maybe_decompress(&mut self, buffer: &SSHBuffer) -> Result<IncomingSshPacket, Error> {
         if let Some(ref mut enc) = self.common.encrypted {
-            let mut decomp = CryptoVec::new();
+            let mut decomp = Vec::new();
             Ok(IncomingSshPacket {
                 #[allow(clippy::indexing_slicing)] // length checked
                 buffer: enc.decompress.decompress(
@@ -1612,22 +1685,42 @@ impl GexParams {
         preferred_group_size: usize,
         max_group_size: usize,
     ) -> Result<Self, Error> {
-        let this = Self {
+        Self::for_client_config(min_group_size, preferred_group_size, max_group_size)
+    }
+
+    pub fn for_client_config(
+        min_group_size: usize,
+        preferred_group_size: usize,
+        max_group_size: usize,
+    ) -> Result<Self, Error> {
+        Self::build(
             min_group_size,
             preferred_group_size,
             max_group_size,
-        };
-        this.validate()?;
-        Ok(this)
+            ValidationKind::ClientConfig,
+        )
     }
 
-    pub(crate) fn validate(&self) -> Result<(), Error> {
-        if self.min_group_size < 2048 {
-            return Err(Error::InvalidConfig(format!(
-                "min_group_size must be at least 2048 bits. We got {} bits",
-                self.min_group_size
-            )));
+    fn validate(&self, kind: ValidationKind) -> Result<(), Error> {
+        match kind {
+            ValidationKind::ClientConfig => {
+                if self.min_group_size < 2048 {
+                    return Err(Error::InvalidConfig(format!(
+                        "min_group_size must be at least 2048 bits. We got {} bits",
+                        self.min_group_size
+                    )));
+                }
+            }
+            ValidationKind::PeerRequest => {
+                if self.max_group_size < 2048 {
+                    return Err(Error::InvalidConfig(format!(
+                        "max_group_size must be at least 2048 bits. We got {} bits",
+                        self.max_group_size
+                    )));
+                }
+            }
         }
+
         if self.preferred_group_size < self.min_group_size {
             return Err(Error::InvalidConfig(format!(
                 "preferred_group_size must be at least as large as min_group_size. We have preferred_group_size = {} < min_group_size = {}",
@@ -1640,7 +1733,36 @@ impl GexParams {
                 self.max_group_size, self.preferred_group_size
             )));
         }
+
         Ok(())
+    }
+
+    pub(crate) fn from_peer_request(
+        min_group_size: usize,
+        preferred_group_size: usize,
+        max_group_size: usize,
+    ) -> Result<Self, Error> {
+        Self::build(
+            min_group_size,
+            preferred_group_size,
+            max_group_size,
+            ValidationKind::PeerRequest,
+        )
+    }
+
+    fn build(
+        min_group_size: usize,
+        preferred_group_size: usize,
+        max_group_size: usize,
+        kind: ValidationKind,
+    ) -> Result<Self, Error> {
+        let this = Self {
+            min_group_size,
+            preferred_group_size,
+            max_group_size,
+        };
+        this.validate(kind)?;
+        Ok(this)
     }
 
     pub fn min_group_size(&self) -> usize {
@@ -1654,6 +1776,12 @@ impl GexParams {
     pub fn max_group_size(&self) -> usize {
         self.max_group_size
     }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ValidationKind {
+    ClientConfig,
+    PeerRequest,
 }
 
 impl Default for GexParams {
@@ -1698,11 +1826,12 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Config {
         Config {
-            client_id: SshId::Standard(format!(
-                "SSH-2.0-{}_{}",
+            client_id: SshId::Standard(Cow::Borrowed(concat!(
+                "SSH-2.0-",
                 env!("CARGO_PKG_NAME"),
+                "_",
                 env!("CARGO_PKG_VERSION")
-            )),
+            ))),
             limits: Limits::default(),
             window_size: 2097152,
             maximum_packet_size: 32768,

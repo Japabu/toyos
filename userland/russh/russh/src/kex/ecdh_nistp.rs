@@ -1,11 +1,11 @@
 use std::marker::PhantomData;
 use std::ops::Deref;
 
-use crate::keys::ssh_key::rand_core::OsRng;
 use byteorder::{BigEndian, ByteOrder};
+use elliptic_curve::Generate;
 use elliptic_curve::ecdh::{EphemeralSecret, SharedSecret};
 use elliptic_curve::point::PointCompression;
-use elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
+use elliptic_curve::sec1::{FromSec1Point, ModulusSize, ToSec1Point};
 use elliptic_curve::{AffinePoint, Curve, CurveArithmetic, FieldBytesSize};
 use log::debug;
 use p256::NistP256;
@@ -79,7 +79,7 @@ impl<C: Curve + CurveArithmetic, D: Digest> KexAlgorithmImplementor for EcdhNist
 where
     C: PointCompression,
     FieldBytesSize<C>: ModulusSize,
-    AffinePoint<C>: FromEncodedPoint<C> + ToEncodedPoint<C>,
+    AffinePoint<C>: FromSec1Point<C> + ToSec1Point<C>,
 {
     fn skip_exchange(&self) -> bool {
         false
@@ -106,14 +106,14 @@ where
                 .map_err(|_| crate::Error::Inconsistent)?
         };
 
-        let server_secret = elliptic_curve::ecdh::EphemeralSecret::<C>::random(&mut OsRng);
+        let server_secret = elliptic_curve::ecdh::EphemeralSecret::<C>::generate_from_rng(&mut rand::rng());
         let server_pubkey = server_secret.public_key();
 
         // fill exchange.
         exchange.server_ephemeral.clear();
         exchange
             .server_ephemeral
-            .extend(&server_pubkey.to_sec1_bytes());
+            .extend_from_slice(&server_pubkey.to_sec1_bytes());
         let shared = server_secret.diffie_hellman(&client_pubkey);
         self.shared_secret = Some(shared);
         Ok(())
@@ -122,15 +122,15 @@ where
     #[doc(hidden)]
     fn client_dh(
         &mut self,
-        client_ephemeral: &mut CryptoVec,
+        client_ephemeral: &mut Vec<u8>,
         writer: &mut impl Writer,
     ) -> Result<(), crate::Error> {
-        let client_secret = elliptic_curve::ecdh::EphemeralSecret::<C>::random(&mut OsRng);
+        let client_secret = elliptic_curve::ecdh::EphemeralSecret::<C>::generate_from_rng(&mut rand::rng());
         let client_pubkey = client_secret.public_key();
 
         // fill exchange.
         client_ephemeral.clear();
-        client_ephemeral.extend(&client_pubkey.to_sec1_bytes());
+        client_ephemeral.extend_from_slice(&client_pubkey.to_sec1_bytes());
 
         msg::KEX_ECDH_INIT.encode(writer)?;
         client_pubkey.to_sec1_bytes().encode(writer)?;
@@ -155,10 +155,10 @@ where
 
     fn compute_exchange_hash(
         &self,
-        key: &CryptoVec,
+        key: &[u8],
         exchange: &Exchange,
         buffer: &mut CryptoVec,
-    ) -> Result<CryptoVec, crate::Error> {
+    ) -> Result<Vec<u8>, crate::Error> {
         // Computing the exchange hash, see page 7 of RFC 5656.
         buffer.clear();
         exchange.client_id.deref().encode(buffer)?;
@@ -177,15 +177,13 @@ where
         let mut hasher = D::new();
         hasher.update(&buffer);
 
-        let mut res = CryptoVec::new();
-        res.extend(&hasher.finalize());
-        Ok(res)
+        Ok(hasher.finalize().to_vec())
     }
 
     fn compute_keys(
         &self,
-        session_id: &CryptoVec,
-        exchange_hash: &CryptoVec,
+        session_id: &[u8],
+        exchange_hash: &[u8],
         cipher: cipher::Name,
         remote_to_local_mac: mac::Name,
         local_to_remote_mac: mac::Name,
@@ -216,14 +214,14 @@ mod tests {
     #[test]
     fn test_shared_secret() {
         let mut party1 = EcdhNistPKex::<NistP256, Sha256> {
-            local_secret: Some(EphemeralSecret::<NistP256>::random(&mut OsRng)),
+            local_secret: Some(EphemeralSecret::<NistP256>::generate_from_rng(&mut rand::rng())),
             shared_secret: None,
             _digest: PhantomData,
         };
         let p1_pubkey = party1.local_secret.as_ref().unwrap().public_key();
 
         let mut party2 = EcdhNistPKex::<NistP256, Sha256> {
-            local_secret: Some(EphemeralSecret::<NistP256>::random(&mut OsRng)),
+            local_secret: Some(EphemeralSecret::<NistP256>::generate_from_rng(&mut rand::rng())),
             shared_secret: None,
             _digest: PhantomData,
         };

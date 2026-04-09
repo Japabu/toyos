@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use russh::keys::ssh_key::rand_core::OsRng;
 use russh::keys::{Certificate, *};
 use russh::server::{Msg, Server as _, Session};
 use russh::*;
@@ -19,7 +18,8 @@ async fn main() {
         auth_rejection_time: std::time::Duration::from_secs(3),
         auth_rejection_time_initial: Some(std::time::Duration::from_secs(0)),
         keys: vec![
-            russh::keys::PrivateKey::random(&mut OsRng, russh::keys::Algorithm::Ed25519).unwrap(),
+            russh::keys::PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519)
+                .unwrap(),
         ],
         preferred: Preferred {
             // kex: std::borrow::Cow::Owned(vec![russh::kex::DH_GEX_SHA256]),
@@ -52,7 +52,7 @@ struct Server {
 }
 
 impl Server {
-    async fn post(&mut self, data: CryptoVec) {
+    async fn post(&mut self, data: Vec<u8>) {
         let mut clients = self.clients.lock().await;
         for (id, (channel, s)) in clients.iter_mut() {
             if *id != self.id {
@@ -116,7 +116,7 @@ impl server::Handler for Server {
             return Err(russh::Error::Disconnect);
         }
 
-        let data = CryptoVec::from(format!("Got data: {}\r\n", String::from_utf8_lossy(data)));
+        let data = format!("Got data: {}\r\n", String::from_utf8_lossy(data)).into_bytes();
         self.post(data.clone()).await;
         session.data(channel, data)?;
         Ok(())
