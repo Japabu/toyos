@@ -1,0 +1,9 @@
+# Allow rust-analyzer and local `cargo doc` invocations to pick up unreleased changelog entries
+#
+# Note that these flags are (intentionally) not included when building from the downloaded crate.
+[build]
+rustdocflags = ["--cfg=unreleased_changelogs"]
+rustflags = ["--cfg=unreleased_changelogs"]
+
+[target.wasm32-unknown-unknown]
+runner = "wasm-bindgen-test-runner"

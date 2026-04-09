@@ -1,0 +1,4 @@
+- [ ] Tested on all platforms changed
+- [ ] Added an entry to the `changelog` module if knowledge of this change could be valuable to users
+- [ ] Updated documentation to reflect any user-facing changes, including notes of platform-specific behavior
+- [ ] Created or updated an example program if it would help users understand this functionality

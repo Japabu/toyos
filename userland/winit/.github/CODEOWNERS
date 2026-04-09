@@ -1,0 +1,26 @@
+# Android
+/winit-android                      @MarijnS95
+
+# Apple (AppKit + UIKit)
+/winit-appkit                       @madsmtm
+/winit-uikit                        @madsmtm
+/winit-common/src/core_foundation   @madsmtm
+/winit-common/src/event_handler.rs  @madsmtm
+
+# XKB
+/winit-common/src/xkb               @kchibisov
+
+# Wayland
+/winit-wayland                      @kchibisov
+
+# X11
+/winit-x11                          @kchibisov
+
+# Web
+/winit-web                          @daxpedda
+
+# Windows (Win32) (UNOWNED)
+#/winit-win32                       
+
+# Orbital (Redox OS)
+/winit-orbital                      @jackpot51
