@@ -32,4 +32,4 @@ path = "tests/toyos.rs"
 harness = false
 
 [patch.crates-io]
-target-lexicon = { git = "https://github.com/Japabu/target-lexicon.git" }
+target-lexicon = { path = "userland/target-lexicon" }

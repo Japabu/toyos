@@ -47,14 +47,18 @@ exclude = [
     "raw-window-handle",
     "softbuffer",
     "winit",
+    "rustix",
+    "getrandom-0.2",
+    "getrandom-0.3",
+    "getrandom-0.4",
     # Host-only tool with its own patches
     "bootstrap-cc",
 ]
 
 [patch.crates-io]
 # getrandom forks (v0.2 used by doom/snake/sshd transitive deps, v0.3 by sshd transitive deps)
-getrandom = { git = "https://github.com/Japabu/getrandom", branch = "toyos-v0.2", package = "getrandom" }
-getrandom_03 = { git = "https://github.com/Japabu/getrandom", branch = "toyos-v0.3", package = "getrandom" }
+getrandom = { path = "getrandom-0.2", package = "getrandom" }
+getrandom_03 = { path = "getrandom-0.3", package = "getrandom" }
 # Ecosystem forks for ToyOS support
 mio = { path = "mio" }
 tokio = { path = "tokio/tokio" }

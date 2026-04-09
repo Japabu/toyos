@@ -8,8 +8,8 @@ cranelift-codegen = { version = "0.128", default-features = false, features = ["
 cranelift-frontend = "0.128"
 cranelift-module = "0.128"
 cranelift-object = "0.128"
-target-lexicon = { git = "https://github.com/Japabu/target-lexicon.git" }
+target-lexicon = { path = "../userland/target-lexicon" }
 toyos-ld = { path = "../toyos-ld" }
 
 [patch.crates-io]
-target-lexicon = { git = "https://github.com/Japabu/target-lexicon.git" }
+target-lexicon = { path = "../userland/target-lexicon" }

@@ -298,9 +298,9 @@ http-transport-reqwest = ["gix/blocking-http-transport-reqwest"]
 mio = { path = "../mio" }
 tokio = { path = "../tokio/tokio" }
 tokio-util = { path = "../tokio/tokio-util" }
-getrandom = { git = "https://github.com/Japabu/getrandom", branch = "toyos-v0.2", package = "getrandom" }
-getrandom_03 = { git = "https://github.com/Japabu/getrandom", branch = "toyos-v0.3", package = "getrandom" }
-getrandom_04 = { git = "https://github.com/Japabu/getrandom", branch = "toyos-v0.4", package = "getrandom" }
+getrandom = { path = "../getrandom-0.2", package = "getrandom" }
+getrandom_03 = { path = "../getrandom-0.3", package = "getrandom" }
+getrandom_04 = { path = "../getrandom-0.4", package = "getrandom" }
 errno = { path = "../errno" }
 filetime = { path = "../filetime" }
 gix = { path = "../gitoxide/gix" }
