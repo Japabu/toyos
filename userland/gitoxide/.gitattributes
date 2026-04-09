@@ -1,0 +1,11 @@
+**/generated-archives/*.tar* filter=lfs-disabled diff=lfs merge=lfs -text
+
+# assure line feeds don't interfere with our working copy hash
+*.sh text eol=lf
+justfile text eol=lf
+
+# have GitHub include fixture-making scripts when it counts code
+**/tests/fixtures/**/*.sh -linguist-vendored
+
+# have GitHub treat the gix-packetline-blocking src copy as auto-generated
+/gix-packetline-blocking/src/**/* linguist-generated

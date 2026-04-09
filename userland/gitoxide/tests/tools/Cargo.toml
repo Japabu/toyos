@@ -1,0 +1,54 @@
+lints.workspace = true
+
+[package]
+name = "gix-testtools"
+description = "Shared code for gitoxide crates to facilitate testing"
+version = "0.19.0"
+authors = ["Sebastian Thiel <sebastian.thiel@icloud.com>"]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+include = ["/src/**/*", "/LICENSE-*"]
+rust-version = "1.82"
+
+[[bin]]
+name = "jtt"
+path = "src/main.rs"
+
+[lib]
+doctest = true
+
+[features]
+default = []
+## Use instead of plain `tar` files, compress these to produce `tar.xz` files instead.
+## This is useful if archives are uploaded into `git-lfs`, which doesn't have built-in compression
+## and metering counts towards uncompressed bytes transferred.
+xz = ["dep:xz2"]
+
+[dependencies]
+gix-hash = { version = "^0.22.0", path = "../../gix-hash", features = ["sha1"] }
+gix-lock = { version = "^21.0.0", path = "../../gix-lock" }
+gix-discover = { version = "^0.48.0", path = "../../gix-discover" }
+gix-worktree = { version = "^0.49.0", path = "../../gix-worktree" }
+gix-fs = { version = "^0.19.1", path = "../../gix-fs" }
+gix-tempfile = { version = "^21.0.0", path = "../../gix-tempfile", default-features = false, features = ["signals"] }
+
+winnow = { version = "0.7.14", features = ["simd"] }
+fastrand = "2.0.0"
+bstr = { version = "1.12.0", default-features = false }
+crc = "3.4.0"
+tempfile = "3.26.0"
+fs_extra = "1.2.0"
+parking_lot = { version = "0.12.4" }
+is_ci = "1.1.1"
+io-close = "0.3.7"
+tar = { version = "0.4.38", default-features = false }
+xz2 = { version = "0.1.6", optional = true }
+
+document-features = { version = "0.2.1", optional = true }
+
+[dev-dependencies]
+serial_test = { version = "3.4.0", default-features = false }
+
+[package.metadata.docs.rs]
+all-features = true
+features = ["document-features"]

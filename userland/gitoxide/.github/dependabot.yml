@@ -1,0 +1,50 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: '/'
+    schedule:
+      interval: monthly
+    commit-message:
+      # Avoid non-"purposeful" prefix due to Dependabot misdetecting style (see `DEVELOPMENT.md`).
+      prefix: ''
+    allow:
+      - dependency-type: all
+    ignore:
+      # Keep `expectrl` at 0.7.* for now. See https://github.com/GitoxideLabs/gitoxide/pull/2200.
+      - dependency-name: expectrl
+        update-types:
+          - 'version-update:semver-major'
+          - 'version-update:semver-minor'
+      # Some `getrandom` dependencies are at 0.2.*. Keep them there for now. (Some are at 0.3.*.
+      # This allows them to remain there but keeps them from going to a future 0.4.*.) This is
+      # hopefully temporary. See https://github.com/GitoxideLabs/gitoxide/pull/2093.
+      - dependency-name: getrandom
+        update-types:
+          - 'version-update:semver-major'
+          - 'version-update:semver-minor'
+     # Keep `imara-diff` at 0.1.* for now. See https://github.com/GitoxideLabs/gitoxide/pull/2068.
+      - dependency-name: imara-diff
+        update-types:
+          - 'version-update:semver-major'
+          - 'version-update:semver-minor'
+    groups:
+      cargo:
+        patterns: ['*']
+        exclude-patterns:
+          - expectrl
+          - imara-diff
+    cooldown:
+      default-days: 7
+
+  - package-ecosystem: github-actions
+    directory: '/'
+    schedule:
+      interval: monthly
+    commit-message:
+      # Avoid non-"purposeful" prefix due to Dependabot misdetecting style (see `DEVELOPMENT.md`).
+      prefix: ''
+    groups:
+      github-actions:
+        patterns: ['*']
+    cooldown:
+      default-days: 7

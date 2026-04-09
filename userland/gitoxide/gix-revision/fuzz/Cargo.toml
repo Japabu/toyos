@@ -1,0 +1,30 @@
+[package]
+name = "gix-revision-fuzz"
+version = "0.0.0"
+authors = ["Automatically generated"]
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+gix-hash = { path = "../../gix-hash" }
+gix-error = { path = "../../gix-error" }
+bstr = { version = "1.5.0", default-features = false }
+
+[dependencies.gix-revision]
+path = ".."
+features = ["sha1"]
+
+# Prevent this from interfering with workspaces
+[workspace]
+members = ["."]
+
+
+[[bin]]
+name = "parse"
+path = "fuzz_targets/parse.rs"
+test = false
+doc = false

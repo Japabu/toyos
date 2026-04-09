@@ -1,0 +1,21 @@
+lints.workspace = true
+
+[package]
+name = "internal-tools"
+description = "internal CLI tooling to help generated test-cases"
+version = "0.0.0"
+authors = ["Sebastian Thiel <sebastian.thiel@icloud.com>"]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+rust-version = "1.82"
+
+[[bin]]
+name = "it"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.102"
+clap = { version = "4.5.60", features = ["derive"] }
+gix = { version = "^0.80.0", path = "../../gix", default-features = false, features = ["attributes", "blame", "blob-diff", "revision", "sha1"] }
+regex = { version = "1.12.3", default-features = false, features = ["std"] }

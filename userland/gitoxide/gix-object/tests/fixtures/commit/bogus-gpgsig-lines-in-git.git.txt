@@ -1,0 +1,31 @@
+tree db079155794727ac821adfba2eb68b330cc0c120
+parent 33a11a20eb7610771268e34211509cbbdee76b1e
+author Junio C Hamano <gitster@pobox.com> 1319256362 -0700
+committer Junio C Hamano <gitster@pobox.com> 1319259176 -0700
+gpgsig -----BEGIN PGP SIGNATURE-----
+gpgsig Version: GnuPG v1.4.10 (GNU/Linux)
+gpgsig 
+gpgsig iQIcBAABAgAGBQJOokwoAAoJELC16IaWr+bL0WoP/2QKYkWpEyXF608m2L/cB9Qx
+gpgsig /N0oBjyL1guIjPX9B3Wxq80dnLLEPnpnO39aiQIXFoJS0L6KEurqK6uDPHy3/ULa
+gpgsig QsAug2HeCLsDnIFbzFSpSIMv/bP/72FDb/idMBT99xTcQj5UJEUgj7AAtx0vnKvQ
+gpgsig pQIXtPu5GBUdhl3SiGgiJFRyp4r5EgV5I40GBwx/ty9cPEIN7ukJ3CR9+KC8eIGx
+gpgsig Az7qngi3dhTn7g+3Z8XX5OYFDMSt9xn1gxqWXOMNlG0mxCvpFe59kwciugp26KVp
+gpgsig n+yJ0UOdoxyZX8pdqXQjvklmoo7e55aaxtbHe7KSD56ebL7h7vHhkGWORU1dOp+h
+gpgsig Iv5dQItkKSR8afB7FmRjo8+B/2g0wZDKRTGhzm7d1gooO5gpXvuvm4GRl5Io+IEj
+gpgsig c7Li3EYmXADWUZWJtbDKDgKGKIOmWv72Qrz52iaESrhZ909HiXfn/jhHBuDRmLtQ
+gpgsig /4v3T4O25uhdZ4p/PjHQn/ZroCmDyMwmnrtw/tt5fSNrl4qGcYg8Jj/1ynfF1AtS
+gpgsig dM2LR65sOwXzSsqAbQjyRFYMLSWhHd/h8BcpZHDXmNBkZJVPm4zvD3ZVaAo6rtZD
+gpgsig WJ9YXWXtPhuf09OgYBzcBlamTrk9ByH+NCIdrFkqfhNF1YI5dArSZytIXJhpPI1e
+gpgsig TrmQAZf0BiI5J6PYN0AI
+gpgsig =Qg/+
+gpgsig -----END PGP SIGNATURE-----
+
+pretty: %G[?GS] placeholders
+
+Add new placeholders related to the GPG signature on signed commits.
+
+ - %GG to show the raw verification message from GPG;
+ - %G? to show either "G" for Good, "B" for Bad;
+ - %GS to show the name of the signer.
+
+Signed-off-by: Junio C Hamano <gitster@pobox.com>

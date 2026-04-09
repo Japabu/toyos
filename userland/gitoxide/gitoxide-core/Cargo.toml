@@ -1,0 +1,132 @@
+lints.workspace = true
+
+[package]
+name = "gitoxide-core"
+description = "The library implementing all capabilities of the gitoxide CLI"
+repository = "https://github.com/GitoxideLabs/gitoxide"
+version = "0.54.0"
+authors = ["Sebastian Thiel <sebastian.thiel@icloud.com>"]
+license = "MIT OR Apache-2.0"
+edition = "2021"
+
+[lib]
+doctest = false
+test = false
+
+[features]
+default = []
+
+#! ### Tools
+## Discover all git repositories within a directory. Particularly useful with [skim](https://github.com/lotabout/skim).
+organize = ["dep:gix-url", "dep:jwalk"]
+## Derive the amount of time invested into a git repository akin to [git-hours](https://github.com/kimmobrunfeldt/git-hours).
+estimate-hours = ["dep:fs-err", "dep:crossbeam-channel", "dep:smallvec"]
+## Gather information about repositories and store it in a database for easy querying.
+query = ["dep:rusqlite"]
+## Run algorithms on a corpus of repositories and store their results for later comparison and intelligence gathering.
+## *Note that* `organize` we need for finding git repositories fast.
+corpus = ["dep:rusqlite", "dep:sysinfo", "organize", "dep:crossbeam-channel", "dep:serde_json", "dep:tracing-forest", "dep:tracing-subscriber", "tracing", "dep:parking_lot"]
+
+## The ability to create archives from virtual worktrees, similar to `git archive`.
+archive = ["dep:gix-archive-for-configuration-only", "gix/worktree-archive"]
+
+## The ability to clean a repository, similar to `git clean`.
+clean = ["gix/dirwalk"]
+
+#! ### Mutually Exclusive Networking
+#! If both are set, _blocking-client_ will take precedence, allowing `--all-features` to be used.
+
+## If set, the client used to connect to git servers will use a blocking API. It supports more transports and is what most would want.
+blocking-client = ["gix/blocking-network-client"]
+## The client to connect to git servers will be async, while supporting only the 'git' transport itself.
+## It's the most limited and can be seen as example on how to use custom transports for custom servers.
+async-client = ["gix/async-network-client-async-std", "gix-transport-configuration-only/async-std", "async-trait", "futures-io", "async-net", "async-io", "futures-lite", "blocking"]
+
+#! ### Other
+## Data structures implement `serde::Serialize` and `serde::Deserialize`.
+serde = ["gix/serde", "dep:serde_json", "dep:serde", "bytesize/serde"]
+
+[dependencies]
+# deselect everything else (like "performance") as this should be controllable by the parent application.
+gix = { version = "^0.80.0", path = "../gix", default-features = false, features = ["merge", "blob-diff", "blame", "revision", "mailmap", "excludes", "attributes", "worktree-mutation", "credentials", "interrupt", "status", "dirwalk"] }
+gix-pack-for-configuration-only = { package = "gix-pack", version = "^0.67.0", path = "../gix-pack", default-features = false, features = ["pack-cache-lru-dynamic", "pack-cache-lru-static", "generate", "streaming-input"] }
+gix-transport-configuration-only = { package = "gix-transport", version = "^0.55.0", path = "../gix-transport", default-features = false }
+gix-archive-for-configuration-only = { package = "gix-archive", version = "^0.29.0", path = "../gix-archive", optional = true, features = ["tar", "tar_gz"] }
+gix-status = { version = "^0.27.0", path = "../gix-status" }
+gix-fsck = { version = "^0.18.0", path = "../gix-fsck" }
+gix-error-for-configuration-only = { package = "gix-error", version = "^0.2.0", path = "../gix-error", features = ["anyhow"] }
+serde = { version = "1.0.114", optional = true, default-features = false, features = ["derive"] }
+anyhow = "1.0.102"
+thiserror = "2.0.18"
+bytesize = "2.3.1"
+tempfile = "3.26.0"
+
+# for async-client
+async-trait = { version = "0.1.51", optional = true }
+async-net = { version = "2.0", optional = true }
+futures-lite = { version = "2.1.0", optional = true }
+async-io = { version = "2.6", optional = true }
+futures-io = { version = "0.3.32", optional = true }
+blocking = { version = "1.6.2", optional = true }
+
+# for 'organize' functionality
+gix-url = { version = "^0.35.2", path = "../gix-url", optional = true }
+jwalk = { version = "0.8.0", optional = true }
+
+# for 'hours'
+fs-err = { version = "3.3.0", optional = true }
+crossbeam-channel = { version = "0.5.15", optional = true }
+smallvec = { version = "1.15.1", optional = true }
+
+# for 'query' and 'corpus'
+rusqlite = { version = "0.38.0", optional = true, features = ["bundled", "fallible_uint"] }
+
+# for 'corpus'
+parking_lot = { version = "0.12.4", optional = true }
+sysinfo = { version = "0.38.2", optional = true, default-features = false, features = ["system"] }
+serde_json = { version = "1.0.149", optional = true }
+tracing-forest = { version = "0.2.0", features = ["serde"], optional = true }
+tracing-subscriber = { version = "0.3.22", optional = true }
+tracing = { version = "0.1.43", optional = true }
+
+# for svg graph output
+layout-rs = "0.1.3"
+open = "5.0.0"
+
+document-features = { version = "0.2.0", optional = true }
+
+[dev-dependencies]
+gix = { path = "../gix", default-features = false, features = ["sha1"] }
+
+[package.metadata.docs.rs]
+features = ["document-features", "blocking-client", "organize", "estimate-hours", "serde"]
+
+[package.metadata.cargo-machete]
+ignored = [
+    # Enabled through `async-client` feature wiring only.
+    "async-io",
+    # Enabled through `async-client` feature wiring only.
+    "async-net",
+    # Enabled through `async-client` feature wiring only.
+    "async-trait",
+    # Enabled through `async-client` feature wiring only.
+    "blocking",
+    # Enabled through `estimate-hours` feature wiring only.
+    "fs-err",
+    # Enabled through `async-client` feature wiring only.
+    "futures-io",
+    # Enabled through `async-client` feature wiring only.
+    "futures-lite",
+    # Configuration-only dependency selected by the `archive` feature.
+    "gix-archive-for-configuration-only",
+    # Configuration-only dependency used to constrain global `gix-error` feature resolution.
+    "gix-error-for-configuration-only",
+    # Configuration-only dependency used to constrain global `gix-pack` feature resolution.
+    "gix-pack-for-configuration-only",
+    # Configuration-only dependency selected by `async-client` feature wiring.
+    "gix-transport-configuration-only",
+    # Imported as crate `layout`, which does not match the package name `layout-rs`.
+    "layout-rs",
+    # Enabled through `estimate-hours` feature wiring only.
+    "smallvec",
+]

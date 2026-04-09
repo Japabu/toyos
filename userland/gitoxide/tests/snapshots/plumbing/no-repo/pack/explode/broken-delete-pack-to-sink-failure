@@ -1,0 +1,5 @@
+Error: Failed to explode the entire pack - some loose objects may have been created nonetheless
+
+Caused by:
+    0: Failed to verify pack file checksum
+    1: Hash was 337fe3b886fc5041a35313887d68feefeae52519, but should have been f1cd3cc7bc63a4a2b357a475a58ad49b40355470

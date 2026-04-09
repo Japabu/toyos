@@ -1,0 +1,45 @@
+name: CIFuzz
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - '.github/**'
+      - 'ci/**'
+      - 'etc/**'
+      - 'src/**'
+      - 'tests/**'
+      - 'cargo-*/**'
+      - 'gix*/**'
+      - '*.toml'
+      - Makefile
+  workflow_dispatch:
+
+permissions: {}  # The fuzzing actions don't use our github.token at all.
+
+jobs:
+  Fuzzing:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Build Fuzzers
+        id: build
+        uses: google/oss-fuzz/infra/cifuzz/actions/build_fuzzers@master  # zizmor: ignore[unpinned-uses]
+        with:
+          oss-fuzz-project-name: gitoxide
+          language: rust
+
+      - name: Run Fuzzers
+        uses: google/oss-fuzz/infra/cifuzz/actions/run_fuzzers@master  # zizmor: ignore[unpinned-uses]
+        with:
+          oss-fuzz-project-name: gitoxide
+          language: rust
+          fuzz-seconds: 600
+
+      - name: Upload Crash
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        if: failure() && steps.build.outcome == 'success'
+        with:
+          name: artifacts
+          path: ./out/artifacts

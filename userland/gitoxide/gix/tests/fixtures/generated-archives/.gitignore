@@ -1,0 +1,12 @@
+/make_worktree_repo.tar
+/make_worktree_repo_bare.tar
+/make_worktree_repo_with_configs.tar
+/make_remote_repos.tar
+/make_complex_shallow_repo.tar
+/make_fetch_repos.tar
+/make_core_worktree_repo.tar
+/make_signatures_repo.tar
+/make_diff_repos.tar
+/make_submodule_with_worktree.tar
+/repo_with_untracked_files.tar
+/make_worktree_repo_with_info_exclude.tar
