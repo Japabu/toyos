@@ -89,6 +89,7 @@ pub enum EventSource {
     Listener(ListenerId),
     PipeReadable(PipeId),
     PipeWritable(PipeId),
+    Audio,
     Futex(DirectMap),
     IoUring(RingId),
 }
@@ -842,6 +843,18 @@ fn drain_events() -> u64 {
         }
     }
 
+    // Virtio-sound MSI-X interrupt — DMA buffer completed.
+    if crate::arch::idt::virtio_sound::irq_pending() {
+        PERCPU_EVENTS[percpu::cpu_id() as usize].push(EventSource::Audio);
+        let watchers = crate::audio::io_uring_watchers();
+        if !watchers.is_empty() {
+            crate::io_uring::complete_pending_for_event(
+                &watchers,
+                EventSource::Audio,
+            );
+        }
+    }
+
     let cpu = percpu::cpu_id() as usize;
 
     // Check for event queue overflow (events silently dropped by push)
@@ -1066,6 +1079,7 @@ fn event_name(event: &EventSource) -> &'static str {
         EventSource::Listener(_) => "Listener",
         EventSource::PipeReadable(_) => "PipeR",
         EventSource::PipeWritable(_) => "PipeW",
+        EventSource::Audio => "Audio",
         EventSource::Futex(_) => "Futex",
         EventSource::IoUring(_) => "IoUring",
     }

@@ -315,9 +315,6 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         SYS_AUDIO_SUBMIT => {
             if crate::audio::submit_buffer(a1 as usize, a2 as u32) { 0 } else { SyscallError::InvalidArgument.to_u64() }
         }
-        SYS_AUDIO_POLL => {
-            crate::audio::poll_completed() as u64
-        }
         SYS_EXIT => sys_exit(a1 as i32),
         SYS_GET_ENV => {
             let env = process::with_fd_owner_data(|d| d.env.clone());
@@ -485,6 +482,8 @@ fn sys_read(fd_num: u32, buf: &mut [u8]) -> u64 {
                     let desc = data.fds.get(fd_num);
                     if matches!(desc, Some(fd::Descriptor::Keyboard)) {
                         Err(Some(ReadBlock::Event(crate::scheduler::EventSource::Keyboard)))
+                    } else if matches!(desc, Some(fd::Descriptor::Audio { info_read: true, .. })) {
+                        Err(Some(ReadBlock::Event(crate::scheduler::EventSource::Audio)))
                     } else if let Some(id) = desc.and_then(|d| d.pipe_id_read()) {
                         Err(Some(ReadBlock::Event(crate::scheduler::EventSource::PipeReadable(id))))
                     } else if matches!(desc, Some(fd::Descriptor::SerialConsole)) {

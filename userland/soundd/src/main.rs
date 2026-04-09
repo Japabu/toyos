@@ -1,9 +1,8 @@
 use toyos_abi::audio::AudioInfo;
 use toyos::poller::{Poller, IORING_POLL_IN};
-use toyos_abi::syscall;
 use toyos_abi::Fd;
 use toyos::audio::{AudioOpenRequest, AudioOpenResponse, AudioRingReader, AudioSetVolume};
-use toyos::audio::{MSG_AUDIO_OPEN, MSG_AUDIO_OPENED, MSG_AUDIO_SET_VOLUME};
+use toyos::audio::{MSG_AUDIO_DATA_READY, MSG_AUDIO_OPEN, MSG_AUDIO_OPENED, MSG_AUDIO_SET_VOLUME};
 use toyos::services;
 use toyos::shm::SharedMemory;
 use toyos::{AudioDev, Connection};
@@ -65,7 +64,6 @@ fn main() {
 
     let audio_dev = AudioDev::open().expect("soundd: no audio device");
     let info: AudioInfo = audio_dev.info().expect("soundd: failed to read audio info");
-    drop(audio_dev);
 
     let num_buffers = info.num_buffers as usize;
     let dma_page = SharedMemory::map(info.dma_token, 2 * 1024 * 1024);
@@ -94,11 +92,32 @@ fn main() {
 
     let poller = Poller::new(64);
 
-    loop {
-        // 1. Reclaim completed DMA buffers
-        free_mask |= toyos::audio::audio_poll();
+    const TOKEN_LISTENER: u64 = u64::MAX;
+    const TOKEN_AUDIO: u64 = u64::MAX - 1;
 
-        // 2. Drain client rings into accumulator
+    loop {
+        // 1. Register poll interests
+        poller.poll_add(&audio_dev, IORING_POLL_IN, TOKEN_AUDIO);
+        poller.poll_add(&listener, IORING_POLL_IN, TOKEN_LISTENER);
+        for (i, stream) in streams.iter().enumerate() {
+            poller.poll_add(&stream.control, IORING_POLL_IN, i as u64);
+        }
+
+        // 2. Wait for events — DMA completions arrive as interrupts via
+        // TOKEN_AUDIO. Client ring data arrives via shared memory with no
+        // kernel notification, so we use a short timeout to poll rings.
+        let timeout = if streams.is_empty() { 100_000_000 } else { u64::MAX };
+        let mut ready_tokens: Vec<u64> = Vec::new();
+        poller.wait(1, timeout, |token| ready_tokens.push(token));
+
+        // 3. Handle DMA completions via fd read
+        if ready_tokens.contains(&TOKEN_AUDIO) {
+            if let Ok(mask) = audio_dev.read_completions() {
+                free_mask |= mask;
+            }
+        }
+
+        // 4. Drain client rings into accumulator
         if !streams.is_empty() && accum_filled < period_samples {
             let want = period_samples - accum_filled;
             let mut got = 0usize;
@@ -109,13 +128,13 @@ fn main() {
             accum_filled += got;
         }
 
-        // 3. Submit DMA buffers when accumulator has a full period
+        // 5. Submit DMA buffers when accumulator has a full period
         while free_mask != 0 {
             let idx = free_mask.trailing_zeros() as usize;
             if idx >= num_buffers { break; }
 
             if !streams.is_empty() && accum_filled < period_samples {
-                break; // wait for more audio data
+                break;
             }
 
             free_mask &= !(1 << idx);
@@ -137,23 +156,10 @@ fn main() {
             toyos::audio::audio_submit(idx as u32, info.period_bytes);
         }
 
-        // 4. Clean up dead streams
+        // 6. Clean up dead streams
         streams.retain(|s| !s.is_dead());
 
-        // 5. Check for connections and control messages via io_uring
-        const TOKEN_LISTENER: u64 = u64::MAX;
-        poller.poll_add(&listener, IORING_POLL_IN, TOKEN_LISTENER);
-        for (i, stream) in streams.iter().enumerate() {
-            poller.poll_add(&stream.control, IORING_POLL_IN, i as u64);
-        }
-
-        // When idle (no streams), block for up to 100ms waiting for connections.
-        // When active, poll with 1ms timeout — fast enough for ~23ms DMA periods
-        // while avoiding busy-wait CPU burn.
-        let timeout = if streams.is_empty() { 100_000_000 } else { 1_000_000 };
-        let mut ready_tokens: Vec<u64> = Vec::new();
-        poller.wait(1, timeout, |token| ready_tokens.push(token));
-
+        // 7. Handle connections and control messages
         if ready_tokens.contains(&TOKEN_LISTENER) {
             let conn = services::accept(&listener).expect("accept failed");
             let Ok(header) = conn.conn.recv_header() else {
@@ -182,17 +188,13 @@ fn main() {
                         let cmd: AudioSetVolume = streams[i].control.recv_payload(&header).unwrap();
                         streams[i].volume = (cmd.volume as i32).min(512);
                     }
+                    MSG_AUDIO_DATA_READY => {}
                     _ => {}
                 }
             }
         }
         if !dead_controls.is_empty() {
             streams.retain(|s| !dead_controls.contains(&s.control.fd()));
-        }
-
-        // Yield when all DMA buffers are in-flight
-        if !streams.is_empty() && free_mask == 0 {
-            syscall::nanosleep(1_000_000);
         }
     }
 }

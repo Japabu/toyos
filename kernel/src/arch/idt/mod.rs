@@ -2,6 +2,7 @@ pub(crate) mod exceptions;
 mod timer;
 mod tlb;
 pub mod virtio_net;
+pub mod virtio_sound;
 mod xhci;
 
 use core::arch::naked_asm;
@@ -28,6 +29,7 @@ enum Vector {
     Timer = 0x20,
     Xhci = 0x21,
     VirtioNet = 0x22,
+    VirtioSound = 0x23,
     HaltAll = 0xFD,
     TlbFlush = 0xFE,
 }
@@ -271,6 +273,7 @@ pub fn init() {
         idt.entries[Vector::Timer as usize] = IdtEntry::new(timer::timer_entry as *const () as u64);
         idt.entries[Vector::Xhci as usize] = IdtEntry::new(xhci::xhci_entry as *const () as u64);
         idt.entries[Vector::VirtioNet as usize] = IdtEntry::new(virtio_net::virtio_net_entry as *const () as u64);
+        idt.entries[Vector::VirtioSound as usize] = IdtEntry::new(virtio_sound::virtio_sound_entry as *const () as u64);
         idt.entries[Vector::HaltAll as usize] = IdtEntry::new(stub_halt_all as *const () as u64);
         idt.entries[Vector::TlbFlush as usize] = IdtEntry::new(tlb::tlb_flush_entry as *const () as u64);
     }

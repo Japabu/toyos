@@ -660,6 +660,7 @@ fn source_ready(source: &EventSource) -> bool {
         EventSource::Keyboard => crate::keyboard::has_data(),
         EventSource::Mouse => crate::mouse::has_data(),
         EventSource::Network => crate::net::has_packet(),
+        EventSource::Audio => crate::audio::has_pending(),
         EventSource::Futex(_) | EventSource::IoUring(_) => false,
     }
 }
@@ -672,6 +673,7 @@ fn add_watcher_to_source(source: &EventSource, ring_id: RingId) {
         EventSource::Keyboard => crate::keyboard::add_io_uring_watcher(ring_id),
         EventSource::Mouse => crate::mouse::add_io_uring_watcher(ring_id),
         EventSource::Network => crate::net::add_io_uring_watcher(ring_id),
+        EventSource::Audio => crate::audio::add_io_uring_watcher(ring_id),
         EventSource::Listener(id) => crate::listener::add_io_uring_watcher(*id, ring_id),
         EventSource::Futex(_) | EventSource::IoUring(_) => {}
     }
@@ -685,6 +687,7 @@ fn remove_watcher_from_source(source: &EventSource, ring_id: RingId) {
         EventSource::Keyboard => crate::keyboard::remove_io_uring_watcher(ring_id),
         EventSource::Mouse => crate::mouse::remove_io_uring_watcher(ring_id),
         EventSource::Network => crate::net::remove_io_uring_watcher(ring_id),
+        EventSource::Audio => crate::audio::remove_io_uring_watcher(ring_id),
         EventSource::Listener(id) => crate::listener::remove_io_uring_watcher(*id, ring_id),
         EventSource::Futex(_) | EventSource::IoUring(_) => {}
     }
@@ -698,6 +701,7 @@ pub fn watchers_for_source(source: &EventSource) -> Vec<RingId> {
         EventSource::Keyboard => crate::keyboard::io_uring_watchers(),
         EventSource::Mouse => crate::mouse::io_uring_watchers(),
         EventSource::Network => crate::net::io_uring_watchers(),
+        EventSource::Audio => crate::audio::io_uring_watchers(),
         EventSource::Listener(id) => crate::listener::io_uring_watchers(*id),
         EventSource::Futex(_) | EventSource::IoUring(_) => Vec::new(),
     }

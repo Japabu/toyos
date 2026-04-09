@@ -8,6 +8,7 @@ use crate::shm::SharedMemory;
 pub const MSG_AUDIO_OPEN: u32 = 1;
 pub const MSG_AUDIO_OPENED: u32 = 2;
 pub const MSG_AUDIO_SET_VOLUME: u32 = 3;
+pub const MSG_AUDIO_DATA_READY: u32 = 4;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -34,10 +35,6 @@ pub struct AudioSetVolume {
 
 pub fn audio_submit(buf_idx: u32, len: u32) {
     syscall::audio_submit(buf_idx, len);
-}
-
-pub fn audio_poll() -> u32 {
-    syscall::audio_poll()
 }
 
 // ---------------------------------------------------------------------------
@@ -105,6 +102,10 @@ impl AudioRingReader {
         }
 
         h.read_cursor.store((r + count) as u32, Ordering::Release);
+        // Wake any writer blocked on ring-full
+        unsafe {
+            syscall::futex_wake(&h.read_cursor as *const AtomicU32 as *const u32, 1);
+        }
         count
     }
 
@@ -157,6 +158,25 @@ impl AudioRingWriter {
         count
     }
 
+    pub fn write_blocking(&self, buf: &[u8]) {
+        let mut offset = 0;
+        while offset < buf.len() {
+            let n = self.write(&buf[offset..]);
+            offset += n;
+            if n == 0 {
+                let h = header(&self.shm);
+                let cur = h.read_cursor.load(Ordering::Acquire);
+                unsafe {
+                    syscall::futex_wait(
+                        &h.read_cursor as *const AtomicU32 as *const u32,
+                        cur,
+                        None,
+                    );
+                }
+            }
+        }
+    }
+
     pub fn close(&self) {
         header(&self.shm).flags.fetch_or(WRITER_CLOSED, Ordering::Release);
     }
@@ -204,6 +224,13 @@ impl AudioStream {
 
     pub fn ring(&self) -> &AudioRingWriter {
         &self.ring
+    }
+
+    /// Write audio data to the ring, blocking when full. Notifies soundd
+    /// that data is available so it can wake from its event loop.
+    pub fn write_blocking(&self, buf: &[u8]) {
+        self.ring.write_blocking(buf);
+        let _ = self.control.signal(MSG_AUDIO_DATA_READY);
     }
 
     pub fn stream_id(&self) -> u32 {

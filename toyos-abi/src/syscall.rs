@@ -924,12 +924,6 @@ pub fn audio_submit(buf_idx: u32, len: u32) {
     syscall(SYS_AUDIO_SUBMIT, buf_idx as u64, len as u64, 0, 0);
 }
 
-/// Poll for completed audio DMA buffers.
-/// Returns a bitmask where bit N is set if buffer N has been consumed and is reusable.
-pub fn audio_poll() -> u32 {
-    syscall(SYS_AUDIO_POLL, 0, 0, 0, 0) as u32
-}
-
 /// Allocate a TLS block for a dlopen'd module on the current thread.
 /// Returns the physical address of the allocated block (as stored in the DTV).
 /// Panics in the kernel if module_id is invalid or allocation fails.

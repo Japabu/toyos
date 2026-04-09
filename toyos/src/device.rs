@@ -106,6 +106,16 @@ impl AudioDev {
     pub fn info(&self) -> Result<toyos_abi::audio::AudioInfo, SyscallError> {
         read_info(&self.0)
     }
+
+    /// Read completed DMA buffer bitmask. Blocks until at least one buffer completes.
+    pub fn read_completions(&self) -> Result<u32, SyscallError> {
+        let mut mask = 0u32;
+        let buf = unsafe {
+            core::slice::from_raw_parts_mut(&mut mask as *mut u32 as *mut u8, 4)
+        };
+        syscall::read(self.0.0.0, buf)?;
+        Ok(mask)
+    }
 }
 
 impl AsHandle for AudioDev {

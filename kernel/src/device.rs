@@ -84,7 +84,7 @@ pub fn try_claim(device_type: u64, pid: Pid) -> Option<Descriptor> {
                 *owner = None;
                 return None;
             }
-            Some(Descriptor::Audio(info))
+            Some(Descriptor::Audio { info, info_read: false })
         }
         _ => None,
     }
@@ -112,7 +112,7 @@ pub fn release_descriptor(desc: &Descriptor, pid: Pid) {
         Descriptor::Mouse => release(DEVICE_MOUSE, pid),
         Descriptor::Framebuffer(_) => release(DEVICE_FRAMEBUFFER, pid),
         Descriptor::Nic(_) => release(DEVICE_NIC, pid),
-        Descriptor::Audio(_) => release(DEVICE_AUDIO, pid),
+        Descriptor::Audio { .. } => release(DEVICE_AUDIO, pid),
         _ => {}
     }
 }

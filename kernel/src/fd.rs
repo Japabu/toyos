@@ -61,7 +61,7 @@ pub enum Descriptor {
     Framebuffer(FramebufferInfo),
     Socket { rx: PipeReader, tx: PipeWriter },
     Nic(crate::net::NicInfo),
-    Audio(toyos_abi::audio::AudioInfo),
+    Audio { info: toyos_abi::audio::AudioInfo, info_read: bool },
     Listener(String),
     IoUring(crate::io_uring::RingId),
 }
@@ -80,7 +80,7 @@ impl Clone for Descriptor {
             Self::SerialConsole => Self::SerialConsole,
             Self::Framebuffer(info) => Self::Framebuffer(*info),
             Self::Nic(info) => Self::Nic(*info),
-            Self::Audio(info) => Self::Audio(*info),
+            Self::Audio { info, info_read } => Self::Audio { info: *info, info_read: *info_read },
             Self::Listener(name) => Self::Listener(name.clone()),
             Self::IoUring(id) => Self::IoUring(*id),
         }
@@ -114,7 +114,8 @@ impl Descriptor {
             Self::Listener(name) => listener::listener_id(name).map(EventSource::Listener),
             Self::PipeRead(r, _) | Self::TtyRead(r) => Some(EventSource::PipeReadable(r.id())),
             Self::Socket { rx, .. } => Some(EventSource::PipeReadable(rx.id())),
-            Self::File(_) | Self::Framebuffer(_) | Self::Audio(_) => None,
+            Self::Audio { .. } => Some(EventSource::Audio),
+            Self::File(_) | Self::Framebuffer(_) => None,
             Self::PipeWrite(..) | Self::TtyWrite(_) => None,
             Self::IoUring(_) => None,
         }
@@ -126,7 +127,7 @@ impl Descriptor {
             Self::PipeWrite(w, _) | Self::TtyWrite(w) => Some(EventSource::PipeWritable(w.id())),
             Self::Socket { tx, .. } => Some(EventSource::PipeWritable(tx.id())),
             Self::File(_) | Self::SerialConsole => None,
-            Self::Keyboard | Self::Mouse | Self::Nic(_) | Self::Audio(_)
+            Self::Keyboard | Self::Mouse | Self::Nic(_) | Self::Audio { .. }
             | Self::Framebuffer(_) | Self::Listener(_)
             | Self::PipeRead(..) | Self::TtyRead(_) | Self::IoUring(_) => None,
         }
@@ -255,7 +256,7 @@ pub fn close(table: &mut FdTable, vfs: &mut Vfs, fd: u32, pid: Pid) -> u64 {
                 vfs.close_file(&file.path, file.file_id);
             }
         }
-        Descriptor::Keyboard | Descriptor::Mouse | Descriptor::Framebuffer(_) | Descriptor::Nic(_) | Descriptor::Audio(_) => {
+        Descriptor::Keyboard | Descriptor::Mouse | Descriptor::Framebuffer(_) | Descriptor::Nic(_) | Descriptor::Audio { .. } => {
             device::release_descriptor(&desc, pid);
         }
         Descriptor::Listener(name) => {
@@ -283,7 +284,7 @@ pub fn close_all(table: &mut FdTable, vfs: &mut Vfs, pid: Pid) {
                     vfs.close_file(&file.path, file.file_id);
                 }
             }
-            Descriptor::Keyboard | Descriptor::Mouse | Descriptor::Framebuffer(_) | Descriptor::Nic(_) | Descriptor::Audio(_) => {
+            Descriptor::Keyboard | Descriptor::Mouse | Descriptor::Framebuffer(_) | Descriptor::Nic(_) | Descriptor::Audio { .. } => {
                 device::release_descriptor(&desc, pid);
             }
             Descriptor::Listener(name) => {
@@ -377,11 +378,23 @@ pub fn try_read(table: &mut FdTable, fd: u32, buf: &mut [u8]) -> Option<u64> {
             buf[..count].copy_from_slice(&bytes[..count]);
             Some(count as u64)
         }
-        Descriptor::Audio(info) => {
-            let bytes = info.as_bytes();
-            let count = buf.len().min(bytes.len());
-            buf[..count].copy_from_slice(&bytes[..count]);
-            Some(count as u64)
+        Descriptor::Audio { info, info_read } => {
+            if !*info_read {
+                let bytes = info.as_bytes();
+                let count = buf.len().min(bytes.len());
+                buf[..count].copy_from_slice(&bytes[..count]);
+                *info_read = true;
+                return Some(count as u64);
+            }
+            return match crate::audio::drain_completed() {
+                Some(mask) => {
+                    let bytes = mask.to_le_bytes();
+                    let count = buf.len().min(bytes.len());
+                    buf[..count].copy_from_slice(&bytes[..count]);
+                    Some(count as u64)
+                }
+                None => None,
+            };
         }
         Descriptor::SerialConsole => {
             let mut count = 0usize;
@@ -495,7 +508,7 @@ pub fn fstat(table: &FdTable, fd: u32, stat: &mut Stat) -> bool {
         Some(Descriptor::TtyRead(_) | Descriptor::TtyWrite(_)) => { stat.file_type = FileType::Tty as u64; true }
         Some(Descriptor::Socket { .. }) => { stat.file_type = FileType::Socket as u64; true }
         Some(Descriptor::Nic(_)) => { stat.file_type = FileType::Nic as u64; true }
-        Some(Descriptor::Audio(_)) => { stat.file_type = FileType::Unknown as u64; true }
+        Some(Descriptor::Audio { .. }) => { stat.file_type = FileType::Unknown as u64; true }
         Some(Descriptor::Listener(_)) => { stat.file_type = FileType::Pipe as u64; true }
         Some(Descriptor::IoUring(_)) => { stat.file_type = FileType::Unknown as u64; true }
         None => false,
@@ -541,7 +554,9 @@ pub fn has_data(table: &FdTable, fd: u32) -> bool {
                 Descriptor::Listener(name) => listener::has_pending(name),
                 Descriptor::SerialConsole => serial::has_data(),
                 Descriptor::Nic(_) => crate::net::has_packet(),
-                Descriptor::File(_) | Descriptor::Framebuffer(_) | Descriptor::Audio(_) => true,
+                Descriptor::Audio { info_read: false, .. } => true,
+                Descriptor::Audio { info_read: true, .. } => crate::audio::has_pending(),
+                Descriptor::File(_) | Descriptor::Framebuffer(_) => true,
                 _ => false,
             }
         }

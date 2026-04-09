@@ -1,7 +1,7 @@
 use core::ptr::{copy_nonoverlapping, read_volatile, write_volatile};
 
 use super::pci::PciDevice;
-use super::virtio::{BufDir, DescSlot, Virtqueue, VirtioDevice, VIRTIO_F_VERSION_1};
+use super::virtio::{BufDir, DescSlot, Virtqueue, VirtioDevice, VIRTIO_F_VERSION_1, COMMON_MSIX_CONFIG, COMMON_QUEUE_SELECT, COMMON_QUEUE_MSIX};
 use super::DmaPool;
 use crate::log;
 use crate::mm::KernelSlice;
@@ -285,6 +285,58 @@ impl SoundController {
     pub fn poll_completed(&mut self) -> u32 {
         self.drain_tx()
     }
+
+    /// Non-consuming check: are there completed buffers in the used ring?
+    pub fn has_used(&self) -> bool {
+        self.txq.has_used()
+    }
+
+}
+
+const PCI_CAP_MSIX: u8 = 0x11;
+const VIRTIO_SOUND_VECTOR: u8 = 0x23;
+
+fn setup_msix(pci_dev: &PciDevice, device: &VirtioDevice) {
+    let cap = match pci_dev.capabilities().find(|c| c.id() == PCI_CAP_MSIX) {
+        Some(c) => c,
+        None => panic!("virtio-sound: no MSI-X capability"),
+    };
+
+    let table_info = cap.read_u32(4);
+    let table_bir = (table_info & 0x7) as u8;
+    let table_offset = (table_info & !0x7) as u64;
+    let table_bar = pci_dev.read_bar_64(table_bir);
+    let table_addr = table_bar + table_offset;
+
+    let table = crate::mm::paging::kernel().lock().as_mut().unwrap().map_mmio(table_addr, 0x1000);
+
+    table.write_u32(0x00, 0xFEE0_0000); // msg_addr_lo: LAPIC base
+    table.write_u32(0x04, 0);            // msg_addr_hi
+    table.write_u32(0x08, VIRTIO_SOUND_VECTOR as u32); // msg_data: vector
+    table.write_u32(0x0C, 0);            // vector control: unmask
+
+    // Enable MSI-X in PCI capability
+    let msg_ctrl = cap.read_u16(2);
+    cap.write_u16(2, (msg_ctrl | (1 << 15)) & !(1 << 14));
+
+    let common = device.common_config();
+
+    common.write_u16(COMMON_MSIX_CONFIG, 0);
+    let config_vec = common.read_u16(COMMON_MSIX_CONFIG);
+    if config_vec == 0xFFFF {
+        panic!("virtio-sound: MSI-X config vector assignment failed");
+    }
+
+    // Set TX queue (2) MSI-X vector
+    common.write_u16(COMMON_QUEUE_SELECT, 2);
+    common.write_u16(COMMON_QUEUE_MSIX, 0);
+    let queue_vec = common.read_u16(COMMON_QUEUE_MSIX);
+    if queue_vec == 0xFFFF {
+        panic!("virtio-sound: MSI-X queue vector assignment failed");
+    }
+
+    log!("virtio-sound: MSI-X enabled (vector {:#x}, config_vec={}, queue_vec={})",
+        VIRTIO_SOUND_VECTOR, config_vec, queue_vec);
 }
 
 /// Initialize the VirtIO sound device. Returns the controller and AudioInfo on success.
@@ -311,6 +363,7 @@ pub fn init(ecam: &crate::mm::Mmio) -> Option<(SoundController, AudioInfo)> {
     device.setup_queue(0, &mut controlq);
     device.setup_queue(1, &mut eventq);
     device.setup_queue(2, &mut txq);
+    setup_msix(&pci_dev, &device);
     device.enable_queue(0);
     device.enable_queue(1);
     device.enable_queue(2);
