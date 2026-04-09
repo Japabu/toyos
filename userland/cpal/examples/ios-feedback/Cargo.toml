@@ -1,0 +1,14 @@
+[package]
+name = "cpal-ios-example"
+version = "0.1.0"
+authors = ["Michael Hills <mhills@gmail.com>"]
+edition = "2021"
+
+[lib]
+name = "cpal_ios_example"
+crate-type = ["staticlib"]
+
+[dependencies]
+cpal = { path = "../.." }
+anyhow = "1.0"
+ringbuf = "0.4"
