@@ -8,7 +8,8 @@ use std::fs::{self, File};
 use std::io::prelude::*;
 use std::io::{self, BufWriter, Cursor};
 use std::iter::repeat;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+use std::process::Command;
 
 use filetime::FileTime;
 use rand::rngs::SmallRng;
@@ -55,14 +56,7 @@ impl<R: Read> Read for RandomReader<R> {
 /// The RNG is seeded from a hash of the data, so different archives
 /// exercise different read-size sequences while remaining deterministic.
 fn random_cursor_reader<D: AsRef<[u8]>>(data: D) -> RandomReader<Cursor<D>> {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    data.as_ref().hash(&mut hasher);
-    let seed = hasher.finish();
-    RandomReader {
-        inner: Cursor::new(data),
-        rng: SmallRng::seed_from_u64(seed),
-    }
+    RandomReader::new(Cursor::new(data))
 }
 
 macro_rules! tar {
@@ -504,6 +498,83 @@ fn writing_and_extracting_directories() {
     let mut ar = Archive::new(rdr);
     ar.unpack(td.path()).unwrap();
     check_dirtree(&td);
+}
+
+#[test]
+fn writing_files_absolute_path_fail() {
+    let td = TempBuilder::new().prefix("tar-rs").tempdir().unwrap();
+    let mut ar = Builder::new(Vec::new());
+
+    let td_abs_path = td.path().to_path_buf();
+    if let Err(res) = ar.append_dir(&td_abs_path, &td_abs_path) {
+        assert!(res
+            .to_string()
+            .contains("paths in archives must be relative when setting path for"));
+        return;
+    }
+
+    panic!("Expected error");
+}
+
+#[test]
+fn writing_files_absolute_path_succeed() {
+    let td = TempBuilder::new().prefix("tar-rs").tempdir().unwrap();
+
+    let mut ar = Builder::new(Vec::new());
+    ar.preserve_absolute(true);
+
+    let td_abs_path = td.path().to_path_buf();
+    ar.append_dir(&td_abs_path, &td_abs_path).unwrap();
+    ar.finish().unwrap();
+
+    let rdr = Cursor::new(ar.into_inner().unwrap());
+    let mut ar = Archive::new(rdr);
+    let actual: Vec<PathBuf> = ar
+        .entries()
+        .unwrap()
+        .map(|e| e.unwrap().path().unwrap().into_owned())
+        .collect();
+
+    assert_eq!(actual, vec![td_abs_path]);
+}
+
+#[test]
+fn extract_absolute_path_gnu_tar() {
+    let td_abs_path = TempBuilder::new().prefix("tar-rs").tempdir().unwrap();
+
+    let test_file = td_abs_path.path().join("tmpfile");
+    File::create(&test_file)
+        .unwrap()
+        .write_all(b"content")
+        .unwrap();
+
+    let test_arr = td_abs_path.path().join("arr.tar");
+
+    Command::new("tar")
+        .args([
+            "-cf",
+            &test_arr.display().to_string(),
+            "-P",
+            &test_file.display().to_string(),
+        ])
+        .status()
+        .expect("Failed to create an archive via GNU tar");
+
+    assert!(fs::metadata(&test_arr).is_ok());
+
+    fs::remove_file(&test_file).unwrap();
+    assert!(fs::metadata(&test_file).is_err());
+
+    let mut ar = Archive::new(File::open(&test_arr).unwrap());
+    ar.unpack(&td_abs_path).unwrap();
+
+    let unpacked_path = td_abs_path.path().join(
+        test_file
+            .components()
+            .skip_while(|c| matches!(c, Component::RootDir | Component::Prefix(_)))
+            .collect::<PathBuf>(),
+    );
+    assert!(fs::metadata(&unpacked_path).is_ok());
 }
 
 #[test]
@@ -1877,4 +1948,155 @@ fn append_data_error_does_not_corrupt_subsequent_entries() {
 
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].path().unwrap().to_str().unwrap(), "clean.txt");
+}
+
+/// Build the PAX size smuggling archive described in the original report.
+///
+/// A PAX extended header declares `size=2048` for a regular file whose
+/// actual header size field is 8. A symlink entry is hidden inside the
+/// inflated region. A correct parser honours the PAX size and skips over
+/// the symlink; a buggy one reads only the header size and exposes it.
+fn build_pax_smuggle_archive() -> Vec<u8> {
+    const B: usize = 512;
+    const INFLATED: usize = 2048;
+    let end_of_archive = || std::iter::repeat(0u8).take(B * 2);
+
+    let mut ar: Vec<u8> = Vec::new();
+
+    // PAX extended header declaring size=2048 for the next entry.
+    let pax_rec = format!("13 size={INFLATED}\n");
+    let mut pax_hdr = Header::new_ustar();
+    pax_hdr.set_path("./PaxHeaders/regular").unwrap();
+    pax_hdr.set_size(pax_rec.as_bytes().len() as u64);
+    pax_hdr.set_entry_type(EntryType::XHeader);
+    pax_hdr.set_cksum();
+    ar.extend_from_slice(pax_hdr.as_bytes());
+    ar.extend_from_slice(pax_rec.as_bytes());
+    ar.resize(ar.len().next_multiple_of(B), 0);
+
+    // Regular file whose header says size=8, but PAX says 2048.
+    let content = b"regular\n";
+    let mut file_hdr = Header::new_ustar();
+    file_hdr.set_path("regular.txt").unwrap();
+    file_hdr.set_size(content.len() as u64);
+    file_hdr.set_entry_type(EntryType::Regular);
+    file_hdr.set_cksum();
+    ar.extend_from_slice(file_hdr.as_bytes());
+    let mark = ar.len();
+    ar.extend_from_slice(content);
+    ar.resize(ar.len().next_multiple_of(B), 0);
+
+    // Smuggled symlink hidden in the inflated region.
+    let mut sym_hdr = Header::new_ustar();
+    sym_hdr.set_path("smuggled").unwrap();
+    sym_hdr.set_size(0);
+    sym_hdr.set_entry_type(EntryType::Symlink);
+    sym_hdr.set_link_name("/etc/shadow").unwrap();
+    sym_hdr.set_cksum();
+    ar.extend_from_slice(sym_hdr.as_bytes());
+    ar.extend(end_of_archive());
+
+    // Pad to fill the inflated window.
+    let used = ar.len() - mark;
+    let pad = INFLATED.saturating_sub(used);
+    ar.extend(std::iter::repeat(0u8).take(pad.next_multiple_of(B)));
+
+    // End-of-archive.
+    ar.extend(end_of_archive());
+    ar
+}
+
+/// Regression test for PAX size smuggling.
+///
+/// A crafted archive uses a PAX extended header to declare a file size (2048)
+/// larger than the header's octal size field (8). Before the fix, `tar-rs`
+/// only applied the PAX size override when the header size was 0, so it would
+/// read the small header size, advance too little, and expose a symlink entry
+/// hidden in the "padding" area. After the fix, the PAX size unconditionally
+/// overrides the header size, causing the parser to skip over the smuggled
+/// symlink — matching the behavior of compliant parsers.
+#[test]
+fn pax_size_smuggled_symlink() {
+    let data = build_pax_smuggle_archive();
+
+    let mut archive = Archive::new(random_cursor_reader(&data[..]));
+    let entries: Vec<_> = archive
+        .entries()
+        .unwrap()
+        .map(|e| {
+            let e = e.unwrap();
+            let path = e.path().unwrap().to_path_buf();
+            let kind = e.header().entry_type();
+            let link = e.link_name().unwrap().map(|l| l.to_path_buf());
+            (path, kind, link)
+        })
+        .collect();
+
+    // With the fix applied, only "regular.txt" should be visible.
+    // The smuggled symlink must NOT appear.
+    let expected: Vec<(PathBuf, EntryType, Option<PathBuf>)> =
+        vec![(PathBuf::from("regular.txt"), EntryType::Regular, None)];
+    assert_eq!(
+        entries, expected,
+        "smuggled symlink visible or unexpected entries\n\
+         got: {entries:?}"
+    );
+}
+
+/// Cross-validate that `tar` and `astral-tokio-tar` parse the PAX size
+/// smuggling archive identically, guarding against parsing differentials.
+#[tokio::test]
+async fn pax_size_smuggle_matches_astral_tokio_tar() {
+    use tokio_stream::StreamExt;
+
+    let data = build_pax_smuggle_archive();
+
+    // Parse with sync tar.
+    let sync_entries: Vec<_> = {
+        let mut ar = Archive::new(&data[..]);
+        ar.entries()
+            .unwrap()
+            .map(|e| {
+                let e = e.unwrap();
+                let path = e.path().unwrap().to_path_buf();
+                let kind = e.header().entry_type();
+                let link = e.link_name().unwrap().map(|l| l.to_path_buf());
+                (path, kind, link)
+            })
+            .collect()
+    };
+
+    // Parse with async astral-tokio-tar.
+    let async_entries: Vec<_> = {
+        let mut ar = tokio_tar::Archive::new(&data[..]);
+        let mut entries = ar.entries().unwrap();
+        let mut result = Vec::new();
+        while let Some(e) = entries.next().await {
+            let e = e.unwrap();
+            let entry_type = e.header().entry_type();
+            result.push((
+                e.path().unwrap().to_path_buf(),
+                // Map through the raw byte so the two crates' EntryTypes compare.
+                EntryType::new(entry_type.as_byte()),
+                e.link_name().unwrap().map(|l| l.to_path_buf()),
+            ));
+        }
+        result
+    };
+
+    // Assert exact expected content for both parsers independently,
+    // so we verify correctness — not just mutual agreement.
+    let expected: Vec<(PathBuf, EntryType, Option<PathBuf>)> =
+        vec![(PathBuf::from("regular.txt"), EntryType::Regular, None)];
+
+    assert_eq!(
+        sync_entries, expected,
+        "tar-rs produced unexpected entries (smuggled symlink visible?)\n\
+         got: {sync_entries:?}"
+    );
+    assert_eq!(
+        async_entries, expected,
+        "astral-tokio-tar produced unexpected entries (smuggled symlink visible?)\n\
+         got: {async_entries:?}"
+    );
 }
