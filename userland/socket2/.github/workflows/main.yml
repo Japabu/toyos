@@ -1,0 +1,158 @@
+name: CI
+on:
+  push:
+    branches: [ master, "v0.4.x" ]
+  pull_request:
+    branches: [ master, "v0.4.x" ]
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: full
+jobs:
+  Test:
+    name: Test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        build: [stable, msrv-linux, msrv-windows, beta, nightly, macos, windows]
+        include:
+          - build: stable
+            os: ubuntu-latest
+            rust: stable
+          - build: msrv-linux
+            os: ubuntu-latest
+            rust: 1.70.0
+          - build: msrv-windows
+            os: windows-latest
+            rust: 1.70.0
+          - build: beta
+            os: ubuntu-latest
+            rust: beta
+          - build: nightly
+            os: ubuntu-latest
+            rust: nightly
+          - build: macos
+            os: macos-latest
+            rust: stable
+          - build: windows
+            os: windows-latest
+            rust: stable
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: ${{ matrix.rust }}
+    - uses: taiki-e/install-action@cargo-hack
+    - name: Pin windows-sys for MSRV compatibility
+      if: matrix.os == 'windows-latest' && matrix.rust == '1.70.0'
+      run: cargo update -p windows-sys --precise 0.60.2
+    - name: Run tests
+      run: cargo hack test --feature-powerset && cargo hack test --feature-powerset --release
+  Rustfmt:
+    name: Rustfmt
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@stable
+      with:
+        components: rustfmt
+    - name: Check formatting
+      run: cargo fmt --all -- --check
+  Check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-apple-darwin
+          - aarch64-apple-ios
+          - aarch64-apple-tvos
+          - aarch64-apple-visionos
+          - aarch64-apple-watchos
+          - aarch64-linux-android
+          - aarch64-unknown-freebsd
+          - aarch64-unknown-linux-gnu
+          - aarch64-unknown-linux-musl
+          - aarch64-unknown-linux-ohos
+          - aarch64-unknown-netbsd
+          - aarch64-unknown-openbsd
+          - aarch64-unknown-redox
+          - arm-linux-androideabi
+          - arm64_32-apple-watchos
+          - armv7-linux-androideabi
+          - armv7-sony-vita-newlibeabihf
+          - armv7-unknown-linux-ohos
+          - i686-linux-android
+          # Broken, see https://github.com/rust-lang/socket2/issues/539.
+          #- i686-unknown-hurd-gnu
+          - i686-unknown-linux-gnu
+          - sparcv9-sun-solaris
+          - x86_64-apple-darwin
+          - x86_64-apple-ios
+          - x86_64-pc-cygwin
+          - x86_64-pc-solaris
+          # Fails with:
+          # `rror calling dlltool 'x86_64-w64-mingw32-dlltool': No such file or
+          # directory (os error 2)`, build log:
+          # <https://github.com/rust-lang/socket2/actions/runs/9577808331/job/26406752150>.
+          #- x86_64-pc-windows-gnu
+          - x86_64-pc-windows-msvc
+          - x86_64-unknown-dragonfly
+          - x86_64-unknown-freebsd
+          - x86_64-unknown-fuchsia
+          - x86_64-unknown-illumos
+          - x86_64-unknown-linux-gnu
+          - x86_64-unknown-linux-musl
+          - x86_64-unknown-linux-ohos
+          - x86_64-unknown-netbsd
+          - x86_64-unknown-openbsd
+          - x86_64-unknown-redox
+          - wasm32-wasip2
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@nightly
+      with:
+        components: rust-src
+    - uses: taiki-e/install-action@cargo-hack
+    - name: Check build
+      run: cargo hack check -Z build-std=std,panic_abort --feature-powerset --target ${{ matrix.target }}
+    - name: Check docs
+      run: RUSTDOCFLAGS="-D warnings --cfg docsrs" cargo doc -Z build-std=std,panic_abort --no-deps --all-features --target ${{ matrix.target }}
+  Clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@stable
+      with:
+        components: clippy
+    - name: Run Clippy
+      run: cargo clippy --all-targets --all-features -- -D warnings
+  CheckExternalTypes:
+    name: check-external-types (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - windows-latest
+          - ubuntu-latest
+          - macos-latest
+        rust:
+          # `check-external-types` requires a specific Rust nightly version. See
+          # the README for details: https://github.com/awslabs/cargo-check-external-types
+          - nightly-2024-06-30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust ${{ matrix.rust }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.rust }}
+      - name: Install cargo-check-external-types
+        uses: taiki-e/cache-cargo-install-action@v1
+        with:
+          tool: cargo-check-external-types@0.1.13
+          locked: true
+      - name: check-external-types
+        run: cargo check-external-types --all-features
