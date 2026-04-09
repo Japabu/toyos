@@ -606,7 +606,7 @@ impl MmapOptions {
     ///
     /// The memory map length should be configured using [`MmapOptions::len()`]
     /// before creating an anonymous memory map, otherwise a zero-length mapping
-    /// will be crated.
+    /// will be created.
     ///
     /// # Errors
     ///
