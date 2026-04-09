@@ -27,7 +27,7 @@ pub struct WebDisplayImpl<D> {
 impl<D: HasDisplayHandle> ContextInterface<D> for WebDisplayImpl<D> {
     fn new(display: D) -> Result<Self, InitError<D>> {
         let raw = display.display_handle()?.as_raw();
-        let RawDisplayHandle::Web(..) = raw else {
+        let RawDisplayHandle::WasmBindgen(..) = raw else {
             return Err(InitError::Unsupported(display));
         };
 
@@ -144,11 +144,11 @@ impl<D: HasDisplayHandle, W: HasWindowHandle> SurfaceInterface<D, W> for WebImpl
                     // We already made sure this was a canvas in `querySelector`.
                     .unchecked_into()
             }
-            RawWindowHandle::WebCanvas(handle) => {
+            RawWindowHandle::WasmBindgenCanvas(handle) => {
                 let value: &JsValue = unsafe { handle.obj.cast().as_ref() };
                 value.clone().unchecked_into()
             }
-            RawWindowHandle::WebOffscreenCanvas(handle) => {
+            RawWindowHandle::WasmBindgenOffscreenCanvas(handle) => {
                 let value: &JsValue = unsafe { handle.obj.cast().as_ref() };
                 let canvas: OffscreenCanvas = value.clone().unchecked_into();
 

@@ -2,7 +2,6 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 
-use russh::keys::ssh_key::rand_core::OsRng;
 use russh::keys::PublicKey;
 use russh::server::{Auth, Msg, Server, Session};
 use russh::{Channel, ChannelId};
@@ -220,7 +219,7 @@ fn main() {
             auth_rejection_time: std::time::Duration::from_secs(1),
             nodelay: true,
             keys: vec![
-                russh::keys::PrivateKey::random(&mut OsRng, russh::keys::Algorithm::Ed25519)
+                russh::keys::PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519)
                     .unwrap(),
             ],
             ..Default::default()

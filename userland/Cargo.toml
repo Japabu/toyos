@@ -59,6 +59,7 @@ exclude = [
 # getrandom forks (v0.2 used by doom/snake/sshd transitive deps, v0.3 by sshd transitive deps)
 getrandom = { path = "getrandom-0.2", package = "getrandom" }
 getrandom_03 = { path = "getrandom-0.3", package = "getrandom" }
+getrandom_04 = { path = "getrandom-0.4", package = "getrandom" }
 # Ecosystem forks for ToyOS support
 mio = { path = "mio" }
 tokio = { path = "tokio/tokio" }

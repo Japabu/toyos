@@ -204,7 +204,7 @@ mod pure_rust {
 
     use aes_gcm::aead::generic_array::GenericArray;
     use aes_gcm::{AeadInPlace, Aes128Gcm, Aes256Gcm, KeyInit, Tag};
-    use rand::RngCore;
+    use rand_core::Rng;
 
     use super::super::super::Error;
     use crate::keys::key::safe_rng;

@@ -1,12 +1,11 @@
 cfg_not_wasi! {
+    #[cfg(not(target_os = "toyos"))]
     use std::time::Duration;
 }
 
 cfg_not_wasip1! {
     use crate::net::{to_socket_addrs, ToSocketAddrs};
     use std::future::poll_fn;
-    #[cfg(not(target_os = "toyos"))]
-    use std::time::Duration;
 }
 
 use crate::io::{AsyncRead, AsyncWrite, Interest, PollEvented, ReadBuf, Ready};

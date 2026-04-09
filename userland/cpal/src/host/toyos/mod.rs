@@ -24,6 +24,8 @@ pub struct Stream {
     playing: Arc<AtomicBool>,
     alive: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
+    creation: std::time::Instant,
+    buffer_frames: u32,
 }
 
 crate::assert_stream_send!(Stream);
@@ -212,6 +214,8 @@ impl DeviceTrait for Device {
             playing,
             alive,
             thread: Some(thread),
+            creation: std::time::Instant::now(),
+            buffer_frames,
         })
     }
 }
@@ -229,6 +233,15 @@ impl StreamTrait for Stream {
     fn pause(&self) -> Result<(), PauseStreamError> {
         self.playing.store(false, Ordering::Relaxed);
         Ok(())
+    }
+
+    fn buffer_size(&self) -> Result<crate::FrameCount, crate::StreamError> {
+        Ok(self.buffer_frames)
+    }
+
+    fn now(&self) -> crate::StreamInstant {
+        let d = self.creation.elapsed();
+        crate::StreamInstant::new(d.as_secs(), d.subsec_nanos())
     }
 }
 

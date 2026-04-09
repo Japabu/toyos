@@ -3,5 +3,6 @@ name = "sshd"
 edition = "2024"
 
 [dependencies]
-russh = { version = "0.57", default-features = false, features = ["rustcrypto", "flate2", "rsa"] }
+rand = "0.10"
+russh = { version = "0.60", default-features = false, features = ["rustcrypto", "flate2", "rsa"] }
 tokio = { version = "1", features = ["rt", "net", "macros", "io-util", "sync", "time"] }

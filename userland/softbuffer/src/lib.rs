@@ -694,8 +694,8 @@ fn window_handle_type_name(handle: &RawWindowHandle) -> &'static str {
         RawWindowHandle::Xlib(_) => "Xlib",
         RawWindowHandle::Win32(_) => "Win32",
         RawWindowHandle::WinRt(_) => "WinRt",
-        RawWindowHandle::WebCanvas(_) => "WebCanvas",
-        RawWindowHandle::WebOffscreenCanvas(_) => "WebOffscreenCanvas",
+        RawWindowHandle::WasmBindgenCanvas(_) => "WebCanvas",
+        RawWindowHandle::WasmBindgenOffscreenCanvas(_) => "WebOffscreenCanvas",
         RawWindowHandle::Wayland(_) => "Wayland",
         RawWindowHandle::AndroidNdk(_) => "AndroidNdk",
         RawWindowHandle::AppKit(_) => "AppKit",
@@ -713,7 +713,7 @@ fn window_handle_type_name(handle: &RawWindowHandle) -> &'static str {
 fn display_handle_type_name(handle: &RawDisplayHandle) -> &'static str {
     match handle {
         RawDisplayHandle::Xlib(_) => "Xlib",
-        RawDisplayHandle::Web(_) => "Web",
+        RawDisplayHandle::WasmBindgen(_) => "Web",
         RawDisplayHandle::Wayland(_) => "Wayland",
         RawDisplayHandle::AppKit(_) => "AppKit",
         RawDisplayHandle::Orbital(_) => "Orbital",

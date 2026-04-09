@@ -978,7 +978,7 @@ impl TcpSocket {
     /// }
     /// ```
     pub fn from_std_stream(std_stream: std::net::TcpStream) -> TcpSocket {
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "toyos")))]
         {
             use std::os::fd::{FromRawFd, IntoRawFd};
 
@@ -988,8 +988,6 @@ impl TcpSocket {
 
         #[cfg(target_os = "toyos")]
         {
-            // On ToyOS, we can't extract raw fds from std TcpStream.
-            // Create a new socket2 socket instead.
             let _ = std_stream;
             panic!("TcpSocket::from_std_stream is not supported on ToyOS");
         }

@@ -2,6 +2,7 @@ use std::borrow::Cow;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+#[cfg(not(target_os = "toyos"))]
 use std::env;
 
 use data_encoding::BASE64_MIME;

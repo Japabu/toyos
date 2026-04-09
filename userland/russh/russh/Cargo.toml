@@ -112,9 +112,6 @@ tokio = { workspace = true, features = [
   "net",
 ] }
 
-[target.'cfg(not(any(target_arch = "wasm32", target_os = "toyos")))'.dependencies]
-home.workspace = true
-
 [target.'cfg(windows)'.dependencies]
 pageant = { version = "0.2", path = "../pageant" }
 
