@@ -1,5 +1,4 @@
 pub const METADATA_NAME: &str = "metadata.name";
-pub const PORT_GROUP: &str = "port.group";
 
 // NOTE: the icon name contains bluetooth and etc, not icon-name, but icon_name
 // I have tried to get the information, and get
@@ -16,15 +15,15 @@ pub mod clock {
     pub const MAX_QUANTUM: &str = "clock.max-quantum";
 }
 
+pub mod node {
+    pub const RATE: &str = "node.rate";
+    pub const LATENCY: &str = "node.latency";
+}
+
 pub mod audio {
     pub const SINK: &str = "Audio/Sink";
     pub const SOURCE: &str = "Audio/Source";
     pub const DUPLEX: &str = "Audio/Duplex";
     pub const STREAM_OUTPUT: &str = "Stream/Output/Audio";
     pub const STREAM_INPUT: &str = "Stream/Input/Audio";
-}
-
-pub mod group {
-    pub const PLAY_BACK: &str = "playback";
-    pub const CAPTURE: &str = "capture";
 }

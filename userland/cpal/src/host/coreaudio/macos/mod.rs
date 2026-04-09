@@ -238,29 +238,24 @@ impl Stream {
 
 impl StreamTrait for Stream {
     fn play(&self) -> Result<(), PlayStreamError> {
-        let mut stream = self
-            .inner
-            .lock()
-            .map_err(|_| PlayStreamError::BackendSpecific {
-                err: BackendSpecificError {
-                    description: "A cpal stream operation panicked while holding the lock - this is a bug, please report it".to_string(),
-                },
-            })?;
-
-        stream.play()
+        self.inner.lock().expect("stream lock poisoned").play()
     }
 
     fn pause(&self) -> Result<(), PauseStreamError> {
-        let mut stream = self
-            .inner
-            .lock()
-            .map_err(|_| PauseStreamError::BackendSpecific {
-                err: BackendSpecificError {
-                    description: "A cpal stream operation panicked while holding the lock - this is a bug, please report it".to_string(),
-                },
-            })?;
+        self.inner.lock().expect("stream lock poisoned").pause()
+    }
 
-        stream.pause()
+    fn now(&self) -> crate::StreamInstant {
+        let m_host_time = unsafe { mach2::mach_time::mach_absolute_time() };
+        host_time_to_stream_instant(m_host_time).expect("mach_timebase_info failed")
+    }
+
+    fn buffer_size(&self) -> Result<crate::FrameCount, crate::StreamError> {
+        let stream = self.inner.lock().unwrap();
+
+        device::get_device_buffer_frame_size(&stream.audio_unit)
+            .map(|size| size as crate::FrameCount)
+            .map_err(|_| crate::StreamError::DeviceNotAvailable)
     }
 }
 

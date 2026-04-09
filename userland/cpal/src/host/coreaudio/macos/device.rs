@@ -21,7 +21,8 @@ use objc2_core_audio::kAudioObjectPropertyElementMain;
 use objc2_core_audio::{
     kAudioAggregateDeviceClassID, kAudioDevicePropertyAvailableNominalSampleRates,
     kAudioDevicePropertyBufferFrameSize, kAudioDevicePropertyBufferFrameSizeRange,
-    kAudioDevicePropertyNominalSampleRate, kAudioDevicePropertyStreamConfiguration,
+    kAudioDevicePropertyLatency, kAudioDevicePropertyNominalSampleRate,
+    kAudioDevicePropertySafetyOffset, kAudioDevicePropertyStreamConfiguration,
     kAudioDevicePropertyStreamFormat, kAudioObjectPropertyClass, kAudioObjectPropertyElementMaster,
     kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyScopeInput,
     kAudioObjectPropertyScopeOutput, AudioClassID, AudioDeviceID, AudioObjectGetPropertyData,
@@ -766,8 +767,8 @@ impl Device {
 
         // Register the callback that is being called by coreaudio whenever it needs data to be
         // fed to the audio buffer.
-        let (bytes_per_channel, sample_rate, device_buffer_frames) =
-            setup_callback_vars(&audio_unit, config, sample_format);
+        let (bytes_per_channel, sample_rate, device_buffer_frames, extra_latency_frames) =
+            setup_callback_vars(&audio_unit, config, sample_format, Scope::Input);
 
         type Args = render_callback::Args<data::Raw>;
         audio_unit.set_input_callback(move |args: Args| unsafe {
@@ -792,16 +793,12 @@ impl Device {
                 Ok(cb) => cb,
             };
             let buffer_frames = len / channels as usize;
-            // Use device buffer size for latency calculation if available
-            let latency_frames = device_buffer_frames.unwrap_or(
-                // Fallback to callback buffer size if device buffer size is unknown
-                // (may overestimate latency for BufferSize::Default)
-                buffer_frames,
-            );
+            let latency_frames =
+                device_buffer_frames.unwrap_or(buffer_frames) + extra_latency_frames;
             let delay = frames_to_duration(latency_frames, sample_rate);
             let capture = callback
-                .sub(delay)
-                .expect("`capture` occurs before origin of alsa `StreamInstant`");
+                .checked_sub(delay)
+                .unwrap_or(crate::StreamInstant::ZERO);
             let timestamp = crate::InputStreamTimestamp { callback, capture };
 
             let info = InputCallbackInfo { timestamp };
@@ -832,11 +829,7 @@ impl Device {
         stream
             .inner
             .lock()
-            .map_err(|_| BuildStreamError::BackendSpecific {
-                err: BackendSpecificError {
-                    description: "A cpal stream operation panicked while holding the lock - this is a bug, please report it".to_string(),
-                },
-            })?
+            .expect("stream lock poisoned")
             .audio_unit
             .start()?;
 
@@ -869,8 +862,8 @@ impl Device {
 
         // Register the callback that is being called by coreaudio whenever it needs data to be
         // fed to the audio buffer.
-        let (bytes_per_channel, sample_rate, device_buffer_frames) =
-            setup_callback_vars(&audio_unit, config, sample_format);
+        let (bytes_per_channel, sample_rate, device_buffer_frames, extra_latency_frames) =
+            setup_callback_vars(&audio_unit, config, sample_format, Scope::Output);
 
         type Args = render_callback::Args<data::Raw>;
         audio_unit.set_render_callback(move |args: Args| unsafe {
@@ -896,15 +889,10 @@ impl Device {
             };
             let buffer_frames = len / channels as usize;
             // Use device buffer size for latency calculation if available
-            let latency_frames = device_buffer_frames.unwrap_or(
-                // Fallback to callback buffer size if device buffer size is unknown
-                // (may overestimate latency for BufferSize::Default)
-                buffer_frames,
-            );
+            let latency_frames =
+                device_buffer_frames.unwrap_or(buffer_frames) + extra_latency_frames;
             let delay = frames_to_duration(latency_frames, sample_rate);
-            let playback = callback
-                .add(delay)
-                .expect("`playback` occurs beyond representation supported by `StreamInstant`");
+            let playback = callback + delay;
             let timestamp = crate::OutputStreamTimestamp { callback, playback };
 
             let info = OutputCallbackInfo { timestamp };
@@ -935,11 +923,7 @@ impl Device {
         stream
             .inner
             .lock()
-            .map_err(|_| BuildStreamError::BackendSpecific {
-                err: BackendSpecificError {
-                    description: "A cpal stream operation panicked while holding the lock - this is a bug, please report it".to_string(),
-                },
-            })?
+            .expect("stream lock poisoned")
             .audio_unit
             .start()?;
 
@@ -986,28 +970,47 @@ fn configure_stream_format_and_buffer(
     Ok(())
 }
 
-/// Setup common callback variables and query device buffer size.
+/// Returns the sum of the device latency and safety offset in frames.
+fn get_device_extra_latency_frames(audio_unit: &AudioUnit, scope: Scope) -> usize {
+    let device_latency: u32 = audio_unit
+        .get_property(kAudioDevicePropertyLatency, scope, Element::Output)
+        .unwrap_or(0);
+    let safety_offset: u32 = audio_unit
+        .get_property(kAudioDevicePropertySafetyOffset, scope, Element::Output)
+        .unwrap_or(0);
+    (device_latency + safety_offset) as usize
+}
+
+/// Setup common callback variables, querying both the I/O buffer size and extra hardware latency.
 ///
-/// Returns (bytes_per_channel, sample_rate, device_buffer_frames)
+/// Returns `(bytes_per_channel, sample_rate, device_buffer_frames, extra_latency_frames)`
 fn setup_callback_vars(
     audio_unit: &AudioUnit,
     config: StreamConfig,
     sample_format: SampleFormat,
-) -> (usize, crate::SampleRate, Option<usize>) {
+    scope: Scope,
+) -> (usize, crate::SampleRate, Option<usize>, usize) {
     let bytes_per_channel = sample_format.sample_size();
     let sample_rate = config.sample_rate;
 
-    // Query device buffer size for latency calculation
     let device_buffer_frames = get_device_buffer_frame_size(audio_unit).ok();
+    let extra_latency_frames = get_device_extra_latency_frames(audio_unit, scope);
 
-    (bytes_per_channel, sample_rate, device_buffer_frames)
+    (
+        bytes_per_channel,
+        sample_rate,
+        device_buffer_frames,
+        extra_latency_frames,
+    )
 }
 
 /// Query the current device buffer frame size from CoreAudio.
 ///
 /// Buffer frame size is a device-level property that always uses Scope::Global + Element::Output,
 /// regardless of whether the audio unit is configured for input or output streams.
-fn get_device_buffer_frame_size(audio_unit: &AudioUnit) -> Result<usize, coreaudio::Error> {
+pub(crate) fn get_device_buffer_frame_size(
+    audio_unit: &AudioUnit,
+) -> Result<usize, coreaudio::Error> {
     // Device-level property: always use Scope::Global + Element::Output
     // This is consistent with how we set the buffer size and query the buffer size range
     let frames: u32 = audio_unit.get_property(

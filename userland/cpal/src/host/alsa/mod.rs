@@ -8,8 +8,8 @@ extern crate libc;
 use std::{
     cmp,
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc,
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
     },
     thread::{self, JoinHandle},
     time::Duration,
@@ -27,8 +27,8 @@ use crate::{
     DefaultStreamConfigError, DeviceDescription, DeviceDescriptionBuilder, DeviceDirection,
     DeviceId, DeviceIdError, DeviceNameError, DevicesError, FrameCount, InputCallbackInfo,
     OutputCallbackInfo, PauseStreamError, PlayStreamError, SampleFormat, SampleRate, StreamConfig,
-    StreamError, SupportedBufferSize, SupportedStreamConfig, SupportedStreamConfigRange,
-    SupportedStreamConfigsError,
+    StreamError, StreamInstant, SupportedBufferSize, SupportedStreamConfig,
+    SupportedStreamConfigRange, SupportedStreamConfigsError,
 };
 
 mod enumerate;
@@ -86,6 +86,9 @@ mod enumerate;
 
 const DEFAULT_DEVICE: &str = "default";
 
+// Some ALSA plugins (e.g. alsaequal, certain USB drivers) are not reentrant.
+static ALSA_OPEN_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 // TODO: Not yet defined in rust-lang/libc crate
 const LIBC_ENOTSUPP: libc::c_int = 524;
 
@@ -117,6 +120,13 @@ impl HostTrait for Host {
         self.enumerate_devices()
     }
 
+    fn device_by_id(&self, id: &crate::DeviceId) -> Option<Self::Device> {
+        let canonical_id = crate::DeviceId(id.0, canonical_pcm_id(&id.1));
+        self.devices()
+            .ok()?
+            .find(|d| d.id().ok().as_ref() == Some(&canonical_id))
+    }
+
     fn default_input_device(&self) -> Option<Self::Device> {
         Some(Device::default())
     }
@@ -127,7 +137,7 @@ impl HostTrait for Host {
 }
 
 /// Global count of active ALSA context instances.
-static ALSA_CONTEXT_COUNT: AtomicUsize = AtomicUsize::new(0);
+static ALSA_CONTEXT_COUNT: Mutex<usize> = Mutex::new(0);
 
 /// ALSA backend context shared between `Host`, `Device`, and `Stream` via `Arc`.
 #[derive(Debug)]
@@ -135,18 +145,20 @@ pub(super) struct AlsaContext;
 
 impl AlsaContext {
     fn new() -> Result<Self, alsa::Error> {
-        // Initialize global ALSA config cache on first context creation.
-        if ALSA_CONTEXT_COUNT.fetch_add(1, Ordering::SeqCst) == 0 {
+        let mut count = ALSA_CONTEXT_COUNT.lock().unwrap_or_else(|e| e.into_inner());
+        if *count == 0 {
             alsa::config::update()?;
         }
+        *count += 1;
         Ok(Self)
     }
 }
 
 impl Drop for AlsaContext {
     fn drop(&mut self) {
-        // Free the global ALSA config cache when the last context is dropped.
-        if ALSA_CONTEXT_COUNT.fetch_sub(1, Ordering::SeqCst) == 1 {
+        let mut count = ALSA_CONTEXT_COUNT.lock().unwrap_or_else(|e| e.into_inner());
+        *count = count.saturating_sub(1);
+        if *count == 0 {
             let _ = alsa::config::update_free_global();
         }
     }
@@ -265,23 +277,41 @@ struct TriggerReceiver(libc::c_int);
 impl TriggerSender {
     fn wakeup(&self) {
         let buf = 1u64;
-        let ret = unsafe { libc::write(self.0, &buf as *const u64 as *const _, 8) };
-        assert_eq!(ret, 8);
+        loop {
+            let ret = unsafe { libc::write(self.0, &buf as *const u64 as *const _, 8) };
+            if ret == 8 {
+                return;
+            }
+            // write() can be interrupted by a signal before writing any bytes; retry.
+            assert_eq!(ret, -1, "wakeup: unexpected return value {ret}");
+            if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                panic!("wakeup: {}", std::io::Error::last_os_error());
+            }
+        }
     }
 }
 
 impl TriggerReceiver {
     fn clear_pipe(&self) {
         let mut out = 0u64;
-        let ret = unsafe { libc::read(self.0, &mut out as *mut u64 as *mut _, 8) };
-        assert_eq!(ret, 8);
+        loop {
+            let ret = unsafe { libc::read(self.0, &mut out as *mut u64 as *mut _, 8) };
+            if ret == 8 {
+                return;
+            }
+            // read() can be interrupted by a signal before reading any bytes; retry.
+            assert_eq!(ret, -1, "clear_pipe: unexpected return value {ret}");
+            if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                panic!("clear_pipe: {}", std::io::Error::last_os_error());
+            }
+        }
     }
 }
 
-fn trigger() -> (TriggerSender, TriggerReceiver) {
+fn trigger() -> (TriggerSender, Arc<TriggerReceiver>) {
     let mut fds = [0, 0];
     match unsafe { libc::pipe(fds.as_mut_ptr()) } {
-        0 => (TriggerSender(fds[1]), TriggerReceiver(fds[0])),
+        0 => (TriggerSender(fds[1]), Arc::new(TriggerReceiver(fds[0]))),
         _ => panic!("Could not create pipe"),
     }
 }
@@ -353,9 +383,11 @@ impl Device {
             }
         }
 
-        let handle = match alsa::pcm::PCM::new(&self.pcm_id, stream_type, true)
-            .map_err(|e| (e, e.errno()))
-        {
+        let open_result = {
+            let _guard = ALSA_OPEN_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+            alsa::pcm::PCM::new(&self.pcm_id, stream_type, true).map_err(|e| (e, e.errno()))
+        };
+        let handle = match open_result {
             Err((_, libc::ENOENT))
             | Err((_, libc::EPERM))
             | Err((_, libc::ENODEV))
@@ -392,7 +424,8 @@ impl Device {
 
         // Pre-compute a period-sized buffer filled with silence values.
         let period_frames = period_samples / conf.channels as usize;
-        let period_bytes = period_samples * sample_format.sample_size();
+        let frame_size = sample_format.sample_size() * conf.channels as usize;
+        let period_bytes = period_frames * frame_size;
         let mut silence_template = vec![0u8; period_bytes].into_boxed_slice();
 
         // Only fill buffer for unsigned formats that don't have a zero value for silence.
@@ -408,6 +441,7 @@ impl Device {
             conf,
             period_samples,
             period_frames,
+            frame_size,
             silence_template,
             can_pause,
             creation_instant,
@@ -454,21 +488,24 @@ impl Device {
         &self,
         stream_t: alsa::Direction,
     ) -> Result<VecIntoIter<SupportedStreamConfigRange>, SupportedStreamConfigsError> {
-        let pcm =
-            match alsa::pcm::PCM::new(&self.pcm_id, stream_t, true).map_err(|e| (e, e.errno())) {
-                Err((_, libc::ENOENT))
-                | Err((_, libc::EPERM))
-                | Err((_, libc::ENODEV))
-                | Err((_, LIBC_ENOTSUPP)) => {
-                    return Err(SupportedStreamConfigsError::DeviceNotAvailable)
-                }
-                Err((_, libc::EBUSY)) | Err((_, libc::EAGAIN)) => {
-                    return Err(SupportedStreamConfigsError::DeviceBusy)
-                }
-                Err((_, libc::EINVAL)) => return Err(SupportedStreamConfigsError::InvalidArgument),
-                Err((e, _)) => return Err(e.into()),
-                Ok(pcm) => pcm,
-            };
+        let open_result = {
+            let _guard = ALSA_OPEN_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+            alsa::pcm::PCM::new(&self.pcm_id, stream_t, true).map_err(|e| (e, e.errno()))
+        };
+        let pcm = match open_result {
+            Err((_, libc::ENOENT))
+            | Err((_, libc::EPERM))
+            | Err((_, libc::ENODEV))
+            | Err((_, LIBC_ENOTSUPP)) => {
+                return Err(SupportedStreamConfigsError::DeviceNotAvailable)
+            }
+            Err((_, libc::EBUSY)) | Err((_, libc::EAGAIN)) => {
+                return Err(SupportedStreamConfigsError::DeviceBusy)
+            }
+            Err((_, libc::EINVAL)) => return Err(SupportedStreamConfigsError::InvalidArgument),
+            Err((e, _)) => return Err(e.into()),
+            Ok(pcm) => pcm,
+        };
 
         let hw_params = alsa::pcm::HwParams::any(&pcm)?;
 
@@ -693,6 +730,7 @@ struct StreamInner {
     // Cached values for performance in audio callback hot path
     period_samples: usize,
     period_frames: usize,
+    frame_size: usize,
     silence_template: Box<[u8]>,
 
     #[allow(dead_code)]
@@ -728,6 +766,10 @@ pub struct Stream {
 
     /// Used to signal to stop processing.
     trigger: TriggerSender,
+
+    /// Keeps the read end of the self-pipe alive for the lifetime of the Stream, so that
+    /// `trigger.wakeup()` never writes to a closed pipe, even if the worker exited early.
+    _rx: Arc<TriggerReceiver>,
 }
 
 // Compile-time assertion that Stream is Send and Sync
@@ -788,7 +830,7 @@ impl StreamWorkerContext {
 }
 
 fn input_stream_worker(
-    rx: TriggerReceiver,
+    rx: Arc<TriggerReceiver>,
     stream: &StreamInner,
     data_callback: &mut (dyn FnMut(&Data, &InputCallbackInfo) + Send + 'static),
     error_callback: &mut (dyn FnMut(StreamError) + Send + 'static),
@@ -798,44 +840,45 @@ fn input_stream_worker(
 
     let mut ctxt = StreamWorkerContext::new(&timeout, stream, &rx);
     loop {
-        let flow =
-            poll_descriptors_and_prepare_buffer(&rx, stream, &mut ctxt).unwrap_or_else(|err| {
-                error_callback(err.into());
-                PollDescriptorsFlow::Continue
-            });
-
-        match flow {
-            PollDescriptorsFlow::Continue => {
-                continue;
-            }
-            PollDescriptorsFlow::XRun => {
-                error_callback(StreamError::BufferUnderrun);
-                if let Err(err) = stream.channel.prepare() {
-                    error_callback(err.into());
-                }
-                continue;
-            }
-            PollDescriptorsFlow::Return => return,
-            PollDescriptorsFlow::Ready {
+        if stream.dropping.load(Ordering::Acquire) {
+            return;
+        }
+        let result = match poll_for_period(&rx, stream, &mut ctxt) {
+            Ok(Poll::Pending) => continue,
+            Ok(Poll::Ready {
                 status,
                 delay_frames,
-            } => {
-                if let Err(err) = process_input(
-                    stream,
-                    &mut ctxt.transfer_buffer,
-                    status,
-                    delay_frames,
-                    data_callback,
-                ) {
-                    error_callback(err.into());
+            }) => process_input(
+                stream,
+                &mut ctxt.transfer_buffer,
+                status,
+                delay_frames,
+                data_callback,
+            ),
+            Err(err) => Err(err),
+        };
+        if let Err(err) = result {
+            match err {
+                StreamError::BufferUnderrun => {
+                    error_callback(StreamError::BufferUnderrun);
+                    if let Err(err) = stream.channel.prepare() {
+                        error_callback(err.into());
+                    } else if let Err(err) = stream.channel.start() {
+                        error_callback(err.into());
+                    }
                 }
+                StreamError::DeviceNotAvailable => {
+                    error_callback(StreamError::DeviceNotAvailable);
+                    return;
+                }
+                err => error_callback(err),
             }
         }
     }
 }
 
 fn output_stream_worker(
-    rx: TriggerReceiver,
+    rx: Arc<TriggerReceiver>,
     stream: &StreamInner,
     data_callback: &mut (dyn FnMut(&mut Data, &OutputCallbackInfo) + Send + 'static),
     error_callback: &mut (dyn FnMut(StreamError) + Send + 'static),
@@ -846,36 +889,39 @@ fn output_stream_worker(
     let mut ctxt = StreamWorkerContext::new(&timeout, stream, &rx);
 
     loop {
-        let flow =
-            poll_descriptors_and_prepare_buffer(&rx, stream, &mut ctxt).unwrap_or_else(|err| {
-                error_callback(err.into());
-                PollDescriptorsFlow::Continue
-            });
-
-        match flow {
-            PollDescriptorsFlow::Continue => continue,
-            PollDescriptorsFlow::XRun => {
-                error_callback(StreamError::BufferUnderrun);
-                if let Err(err) = stream.channel.prepare() {
-                    error_callback(err.into());
-                }
-                continue;
-            }
-            PollDescriptorsFlow::Return => return,
-            PollDescriptorsFlow::Ready {
+        if stream.dropping.load(Ordering::Acquire) {
+            return;
+        }
+        let result = match poll_for_period(&rx, stream, &mut ctxt) {
+            Ok(Poll::Pending) => continue,
+            Ok(Poll::Ready {
                 status,
                 delay_frames,
-            } => {
-                if let Err(err) = process_output(
-                    stream,
-                    &mut ctxt.transfer_buffer,
-                    status,
-                    delay_frames,
-                    data_callback,
-                    error_callback,
-                ) {
-                    error_callback(err.into());
+            }) => process_output(
+                stream,
+                &mut ctxt.transfer_buffer,
+                status,
+                delay_frames,
+                data_callback,
+            ),
+            Err(err) => Err(err),
+        };
+        if let Err(err) = result {
+            match err {
+                StreamError::BufferUnderrun => {
+                    error_callback(StreamError::BufferUnderrun);
+                    if let Err(err) = stream.channel.prepare() {
+                        error_callback(err.into());
+                    }
+                    // No need to call start() for output streams after prepare();
+                    // ALSA automatically restarts them when the buffer is refilled
+                    // and the stream is triggered again.
                 }
+                StreamError::DeviceNotAvailable => {
+                    error_callback(StreamError::DeviceNotAvailable);
+                    return;
+                }
+                err => error_callback(err),
             }
         }
     }
@@ -900,28 +946,48 @@ fn boost_current_thread_priority(buffer_size: BufferSize, sample_rate: SampleRat
 #[cfg(not(feature = "audio_thread_priority"))]
 fn boost_current_thread_priority(_: BufferSize, _: SampleRate) {}
 
-enum PollDescriptorsFlow {
-    Continue,
-    Return,
+/// Attempt hardware resume from a suspend event (`ESTRPIPE`).
+fn try_resume(channel: &alsa::PCM) -> Result<Poll, StreamError> {
+    match channel.resume() {
+        Ok(()) => {
+            if channel
+                .info()
+                .map(|i| i.get_stream() == alsa::Direction::Capture)
+                .unwrap_or(false)
+            {
+                // A successful `resume()` may leave the device `PREPARED` rather than `RUNNING`.
+                // `start()` to ensure the capture actually resumes.
+                if let Err(e) = channel.start() {
+                    // `EBUSY` is ignored because it means the device is already running.
+                    if e.errno() != libc::EBUSY {
+                        return Err(e.into());
+                    }
+                }
+            }
+            Ok(Poll::Pending)
+        }
+        // device is still resuming; poll again until it is ready.
+        Err(e) if e.errno() == libc::EAGAIN => Ok(Poll::Pending),
+        // hardware does not support soft resume
+        Err(e) if e.errno() == libc::ENOSYS => Err(StreamError::BufferUnderrun),
+        Err(e) => Err(e.into()),
+    }
+}
+
+enum Poll {
+    Pending,
     Ready {
         status: alsa::pcm::Status,
         delay_frames: usize,
     },
-    XRun,
 }
 
 // This block is shared between both input and output stream worker functions.
-fn poll_descriptors_and_prepare_buffer(
+fn poll_for_period(
     rx: &TriggerReceiver,
     stream: &StreamInner,
     ctxt: &mut StreamWorkerContext,
-) -> Result<PollDescriptorsFlow, BackendSpecificError> {
-    if stream.dropping.load(Ordering::Acquire) {
-        // The stream has been requested to be destroyed.
-        rx.clear_pipe();
-        return Ok(PollDescriptorsFlow::Return);
-    }
-
+) -> Result<Poll, StreamError> {
     let StreamWorkerContext {
         ref mut descriptors,
         ref poll_timeout,
@@ -930,35 +996,38 @@ fn poll_descriptors_and_prepare_buffer(
 
     let res = alsa::poll::poll(descriptors, *poll_timeout)?;
     if res == 0 {
-        let description = String::from("`alsa::poll()` spuriously returned");
-        return Err(BackendSpecificError { description });
+        // poll() returned 0: either a timeout or a spurious wakeup. Nothing to do.
+        return Ok(Poll::Pending);
     }
 
     if descriptors[0].revents != 0 {
-        // The stream has been requested to be destroyed.
+        // Self-pipe fired: the stream is being dropped. Clear the pipe and let the
+        // worker loop detect the dropping flag on the next iteration.
         rx.clear_pipe();
-        return Ok(PollDescriptorsFlow::Return);
+        return Ok(Poll::Pending);
     }
 
     let revents = stream.channel.revents(&descriptors[1..])?;
-    if revents.contains(alsa::poll::Flags::ERR) {
-        let description = String::from("`alsa::poll()` returned POLLERR");
-        return Err(BackendSpecificError { description });
+    // No events: spurious wakeup, poll again.
+    if revents.is_empty() {
+        return Ok(Poll::Pending);
     }
-
-    // Check if data is ready for processing (either input or output)
-    if !revents.contains(alsa::poll::Flags::IN) && !revents.contains(alsa::poll::Flags::OUT) {
-        // Nothing to process, poll again
-        return Ok(PollDescriptorsFlow::Continue);
+    // POLLHUP/POLLNVAL: the device has been disconnected.
+    if revents.intersects(alsa::poll::Flags::HUP | alsa::poll::Flags::NVAL) {
+        return Err(StreamError::DeviceNotAvailable);
     }
+    // POLLERR signals an xrun or suspend; avail() below returns EPIPE/ESTRPIPE accordingly.
+    // POLLIN/POLLOUT: data is ready, fall through to process it.
 
     let status = stream.channel.status()?;
     let avail_frames = match stream.channel.avail() {
-        Err(err) if err.errno() == libc::EPIPE => return Ok(PollDescriptorsFlow::XRun),
+        // Xrun: recover via prepare() (+ start() for capture, handled by the worker).
+        Err(err) if err.errno() == libc::EPIPE => return Err(StreamError::BufferUnderrun),
+        // Suspend: try hardware resume first; fall back to prepare() if unsupported.
+        Err(err) if err.errno() == libc::ESTRPIPE => return try_resume(&stream.channel),
         res => res,
     }? as usize;
     let delay_frames = match status.get_delay() {
-        // Buffer underrun detected, but notification happens in XRun handler
         d if d < 0 => 0,
         d => d as usize,
     };
@@ -969,10 +1038,10 @@ fn poll_descriptors_and_prepare_buffer(
     // Verify we have room for at least one full period before processing.
     // See: https://bugzilla.kernel.org/show_bug.cgi?id=202499
     if available_samples < stream.period_samples {
-        return Ok(PollDescriptorsFlow::Continue);
+        return Ok(Poll::Pending);
     }
 
-    Ok(PollDescriptorsFlow::Ready {
+    Ok(Poll::Ready {
         status,
         delay_frames,
     })
@@ -985,8 +1054,35 @@ fn process_input(
     status: alsa::pcm::Status,
     delay_frames: usize,
     data_callback: &mut (dyn FnMut(&Data, &InputCallbackInfo) + Send + 'static),
-) -> Result<(), BackendSpecificError> {
-    stream.channel.io_bytes().readi(buffer)?;
+) -> Result<(), StreamError> {
+    let mut frames_read = 0;
+    while frames_read < stream.period_frames {
+        match stream
+            .channel
+            .io_bytes()
+            .readi(&mut buffer[frames_read * stream.frame_size..])
+        {
+            Ok(n) => frames_read += n,
+            // EAGAIN = no frames available: skip this cycle if no progress was made,
+            // otherwise treat as an underrun (partial period cannot be delivered safely).
+            Err(err) if err.errno() == libc::EAGAIN => {
+                if frames_read == 0 {
+                    return Ok(());
+                } else {
+                    return Err(StreamError::BufferUnderrun);
+                }
+            }
+            // EPIPE = xrun: full underrun recovery (prepare + start) required.
+            Err(err) if err.errno() == libc::EPIPE => return Err(StreamError::BufferUnderrun),
+            // ESTRPIPE = hardware suspend: try soft resume first, falling back to underrun
+            // recovery if the hardware doesn't support it.
+            Err(err) if err.errno() == libc::ESTRPIPE => {
+                return try_resume(&stream.channel).map(|_| ());
+            }
+            Err(err) if err.errno() == libc::ENODEV => return Err(StreamError::DeviceNotAvailable),
+            Err(err) => return Err(err.into()),
+        }
+    }
     let data = buffer.as_mut_ptr() as *mut ();
     let data = unsafe { Data::from_parts(data, stream.period_samples, stream.sample_format) };
     let callback = if stream.use_hw_timestamps {
@@ -997,11 +1093,8 @@ fn process_input(
     }?;
     let delay_duration = frames_to_duration(delay_frames, stream.conf.sample_rate);
     let capture = callback
-        .sub(delay_duration)
-        .ok_or_else(|| BackendSpecificError {
-            description: "`capture` is earlier than representation supported by `StreamInstant`"
-                .to_string(),
-        })?;
+        .checked_sub(delay_duration)
+        .unwrap_or(StreamInstant::ZERO);
     let timestamp = crate::InputStreamTimestamp { callback, capture };
     let info = crate::InputCallbackInfo { timestamp };
     data_callback(&data, &info);
@@ -1010,16 +1103,13 @@ fn process_input(
 }
 
 // Request data from the user's function and write it via ALSA.
-//
-// Returns `true`
 fn process_output(
     stream: &StreamInner,
     buffer: &mut [u8],
     status: alsa::pcm::Status,
     delay_frames: usize,
     data_callback: &mut (dyn FnMut(&mut Data, &OutputCallbackInfo) + Send + 'static),
-    error_callback: &mut dyn FnMut(StreamError),
-) -> Result<(), BackendSpecificError> {
+) -> Result<(), StreamError> {
     // Buffer is always pre-filled with equilibrium, user overwrites what they want
     buffer.copy_from_slice(&stream.silence_template);
     {
@@ -1033,45 +1123,39 @@ fn process_output(
             stream_timestamp_fallback(stream.creation_instant)
         }?;
         let delay_duration = frames_to_duration(delay_frames, stream.conf.sample_rate);
-        let playback = callback
-            .add(delay_duration)
-            .ok_or_else(|| BackendSpecificError {
-                description: "`playback` occurs beyond representation supported by `StreamInstant`"
-                    .to_string(),
-            })?;
+        let playback = callback + delay_duration;
         let timestamp = crate::OutputStreamTimestamp { callback, playback };
         let info = crate::OutputCallbackInfo { timestamp };
         data_callback(&mut data, &info);
     }
 
-    loop {
-        match stream.channel.io_bytes().writei(buffer) {
-            Err(err) if err.errno() == libc::EPIPE => {
-                // ALSA underrun or overrun.
-                // See https://github.com/alsa-project/alsa-lib/blob/b154d9145f0e17b9650e4584ddfdf14580b4e0d7/src/pcm/pcm.c#L8767-L8770
-                // Even if these recover successfully, they still may cause audible glitches.
-
-                error_callback(StreamError::BufferUnderrun);
-                if let Err(recover_err) = stream.channel.try_recover(err, true) {
-                    error_callback(recover_err.into());
+    let mut frames_written = 0;
+    while frames_written < stream.period_frames {
+        match stream
+            .channel
+            .io_bytes()
+            .writei(&buffer[frames_written * stream.frame_size..])
+        {
+            Ok(n) => frames_written += n,
+            // EAGAIN = device cannot currently accept more frames: skip this cycle if no
+            // progress was made, otherwise treat as an underrun (partial period cannot be
+            // completed safely).
+            Err(err) if err.errno() == libc::EAGAIN => {
+                if frames_written == 0 {
+                    return Ok(());
+                } else {
+                    return Err(StreamError::BufferUnderrun);
                 }
             }
-            Err(err) => {
-                error_callback(err.into());
-                continue;
+            // EPIPE = xrun: full underrun recovery (prepare) required.
+            Err(err) if err.errno() == libc::EPIPE => return Err(StreamError::BufferUnderrun),
+            // ESTRPIPE = hardware suspend: try soft resume first, falling back to underrun
+            // recovery if the hardware doesn't support it.
+            Err(err) if err.errno() == libc::ESTRPIPE => {
+                return try_resume(&stream.channel).map(|_| ());
             }
-            Ok(result) if result != stream.period_frames => {
-                let description = format!(
-                    "unexpected number of frames written: expected {}, \
-                        result {result} (this should never happen)",
-                    stream.period_frames
-                );
-                error_callback(BackendSpecificError { description }.into());
-                continue;
-            }
-            _ => {
-                break;
-            }
+            Err(err) if err.errno() == libc::ENODEV => return Err(StreamError::DeviceNotAvailable),
+            Err(err) => return Err(err.into()),
         }
     }
     Ok(())
@@ -1083,8 +1167,18 @@ fn process_output(
 #[inline]
 fn stream_timestamp_hardware(
     status: &alsa::pcm::Status,
-) -> Result<crate::StreamInstant, BackendSpecificError> {
+) -> Result<StreamInstant, BackendSpecificError> {
     let trigger_ts = status.get_trigger_htstamp();
+    // trigger_htstamp records when the PCM stream started.
+    // On the first few callbacks, it might not have been set yet,
+    // which would yield a huge positive nanos nd cause non-monotonicity
+    // once it is set. Bail out and let the caller use the fallback.
+    // See https://github.com/RustAudio/cpal/issues/710
+    if trigger_ts.tv_sec == 0 && trigger_ts.tv_nsec == 0 {
+        return Err(BackendSpecificError {
+            description: "trigger_htstamp not yet set".to_string(),
+        });
+    }
     let ts = status.get_htstamp();
     let nanos = timespec_diff_nanos(ts, trigger_ts);
     if nanos < 0 {
@@ -1094,7 +1188,7 @@ fn stream_timestamp_hardware(
         );
         return Err(BackendSpecificError { description });
     }
-    Ok(crate::StreamInstant::from_nanos(nanos))
+    Ok(StreamInstant::from_nanos(nanos as u64))
 }
 
 // Use elapsed duration since stream creation as fallback when hardware timestamps are unavailable.
@@ -1103,23 +1197,21 @@ fn stream_timestamp_hardware(
 #[inline]
 fn stream_timestamp_fallback(
     creation: std::time::Instant,
-) -> Result<crate::StreamInstant, BackendSpecificError> {
+) -> Result<StreamInstant, BackendSpecificError> {
     let now = std::time::Instant::now();
     let duration = now.duration_since(creation);
-    crate::StreamInstant::from_nanos_i128(duration.as_nanos() as i128).ok_or(BackendSpecificError {
-        description: "stream duration has exceeded `StreamInstant` representation".to_string(),
-    })
+    Ok(StreamInstant::new(
+        duration.as_secs(),
+        duration.subsec_nanos(),
+    ))
 }
 
 // Adapted from `timestamp2ns` here:
 // https://fossies.org/linux/alsa-lib/test/audio_time.c
 #[inline]
+#[allow(clippy::unnecessary_cast)]
 fn timespec_to_nanos(ts: libc::timespec) -> i64 {
-    let nanos = ts.tv_sec * 1_000_000_000 + ts.tv_nsec;
-    #[cfg(target_pointer_width = "64")]
-    return nanos;
-    #[cfg(not(target_pointer_width = "64"))]
-    return nanos.into();
+    ts.tv_sec as i64 * 1_000_000_000 + ts.tv_nsec as i64
 }
 
 // Adapted from `timediff` here:
@@ -1150,13 +1242,13 @@ impl Stream {
         E: FnMut(StreamError) + Send + 'static,
     {
         let (tx, rx) = trigger();
-        // Clone the handle for passing into worker thread.
+        let rx_thread = rx.clone();
         let stream = inner.clone();
         let thread = thread::Builder::new()
             .name("cpal_alsa_in".to_owned())
             .spawn(move || {
                 input_stream_worker(
-                    rx,
+                    rx_thread,
                     &stream,
                     &mut data_callback,
                     &mut error_callback,
@@ -1168,6 +1260,7 @@ impl Stream {
             thread: Some(thread),
             inner,
             trigger: tx,
+            _rx: rx,
         }
     }
 
@@ -1182,13 +1275,13 @@ impl Stream {
         E: FnMut(StreamError) + Send + 'static,
     {
         let (tx, rx) = trigger();
-        // Clone the handle for passing into worker thread.
+        let rx_thread = rx.clone();
         let stream = inner.clone();
         let thread = thread::Builder::new()
             .name("cpal_alsa_out".to_owned())
             .spawn(move || {
                 output_stream_worker(
-                    rx,
+                    rx_thread,
                     &stream,
                     &mut data_callback,
                     &mut error_callback,
@@ -1200,6 +1293,7 @@ impl Stream {
             thread: Some(thread),
             inner,
             trigger: tx,
+            _rx: rx,
         }
     }
 }
@@ -1222,6 +1316,21 @@ impl StreamTrait for Stream {
     fn pause(&self) -> Result<(), PauseStreamError> {
         self.inner.channel.pause(true).ok();
         Ok(())
+    }
+    fn now(&self) -> StreamInstant {
+        if self.inner.use_hw_timestamps {
+            if let Ok(status) = self.inner.channel.status() {
+                if let Ok(instant) = stream_timestamp_hardware(&status) {
+                    return instant;
+                }
+            }
+        }
+        stream_timestamp_fallback(self.inner.creation_instant)
+            .expect("stream duration exceeded `StreamInstant` range")
+    }
+
+    fn buffer_size(&self) -> Result<FrameCount, crate::StreamError> {
+        Ok(self.inner.period_frames as FrameCount)
     }
 }
 
@@ -1418,6 +1527,21 @@ fn set_sw_params_from_format(
     }
 
     Ok(period_samples)
+}
+
+fn canonical_pcm_id(pcm_id: &str) -> String {
+    if let Some((prefix, rest)) = pcm_id.split_once(':') {
+        let (card_str, device_str) = match rest.split_once(',') {
+            Some((c, d)) => (c.trim(), d.trim()),
+            None => (rest.trim(), "0"),
+        };
+        if !card_str.contains('=') {
+            if let Ok(device) = device_str.parse::<u32>() {
+                return format!("{prefix}:CARD={card_str},DEV={device}");
+            }
+        }
+    }
+    pcm_id.to_owned()
 }
 
 impl From<alsa::Error> for BackendSpecificError {

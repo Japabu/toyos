@@ -1,6 +1,6 @@
 [package]
 name = "asio-sys"
-version = "0.2.6"
+version = "0.3.0"
 authors = ["Tom Gowan <tomrgowan@gmail.com>"]
 description = "Low-level interface and binding generation for the steinberg ASIO SDK."
 repository = "https://github.com/RustAudio/cpal/"
@@ -14,7 +14,6 @@ rust-version = "1.82"
 bindgen = "0.72"
 walkdir = "2"
 cc = "1.2"
-parse_cfg = "4.1"
 
 [dependencies]
 num-derive = "0.4"

@@ -143,6 +143,14 @@ impl StreamTrait for Stream {
     fn pause(&self) -> Result<(), PauseStreamError> {
         unimplemented!()
     }
+
+    fn now(&self) -> crate::StreamInstant {
+        unimplemented!()
+    }
+
+    fn buffer_size(&self) -> Result<crate::FrameCount, crate::StreamError> {
+        unimplemented!()
+    }
 }
 
 impl Iterator for Devices {

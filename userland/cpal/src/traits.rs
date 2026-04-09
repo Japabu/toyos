@@ -11,7 +11,8 @@ use crate::{
     BuildStreamError, Data, DefaultStreamConfigError, DeviceDescription, DeviceId, DeviceIdError,
     DeviceNameError, DevicesError, InputCallbackInfo, InputDevices, OutputCallbackInfo,
     OutputDevices, PauseStreamError, PlayStreamError, SampleFormat, SizedSample, StreamConfig,
-    StreamError, SupportedStreamConfig, SupportedStreamConfigRange, SupportedStreamConfigsError,
+    StreamError, StreamInstant, SupportedStreamConfig, SupportedStreamConfigRange,
+    SupportedStreamConfigsError,
 };
 
 /// A [`Host`] provides access to the available audio devices on the system.
@@ -302,6 +303,35 @@ pub trait StreamTrait {
     /// Note: Not all devices support suspending the stream at the hardware level. This method may
     /// fail in these cases.
     fn pause(&self) -> Result<(), PauseStreamError>;
+
+    /// Returns the backend's best available estimate of the number of frames per callback.
+    ///
+    /// The value is available immediately after stream creation: for fixed buffer sizes this is
+    /// the negotiated hardware size; for default buffer sizes this is the backend's configured
+    /// default. The value is updated when it changes during the lifetime of the stream.
+    ///
+    /// Returns `Err` if the backend cannot retrieve the buffer size.
+    ///
+    /// # Implementation notes
+    ///
+    /// It is not enforced that each callback delivers exactly this many frames. The actual frame
+    /// count for each callback is given by its buffer.
+    ///
+    /// `buffer_size()` is primarily intended for sizing pre-allocated buffers, but must not be
+    /// trusted as a guaranteed bound. An incorrect implementation of `buffer_size()` should not
+    /// lead to memory safety violations.
+    fn buffer_size(&self) -> Result<crate::FrameCount, crate::StreamError>;
+
+    /// Returns a [`StreamInstant`] representing the current moment on the stream's clock.
+    ///
+    /// The clock is **monotonic**: successive calls to `now()` will never return a value earlier
+    /// than a previous one, and the returned value will never be earlier than any `callback`,
+    /// `capture`, or `playback` instant already delivered to the stream's data callback.
+    ///
+    /// The returned value shares the same time base as the [`StreamInstant`]s delivered to the
+    /// stream's data callback via [`crate::InputStreamTimestamp::callback`] and
+    /// [`crate::OutputStreamTimestamp::callback`], so durations between them are meaningful.
+    fn now(&self) -> StreamInstant;
 }
 
 /// Compile-time assertion that a stream type implements [`Send`].
