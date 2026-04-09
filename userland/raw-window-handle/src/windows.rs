@@ -6,14 +6,6 @@ use super::DisplayHandle;
 /// Raw display handle for Windows.
 ///
 /// It can be used regardless of Windows window backend.
-///
-/// ## Thread-Safety
-///
-/// Overall, even though Win32 windows have [thread affinity], the overall
-/// Win32 user API is thread-safe. Therefore this type is `Send` and `Sync`.
-/// This means it can be sent to or used from other threads.
-///
-/// [thread affinity]: https://devblogs.microsoft.com/oldnewthing/20051010-09/?p=33843
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct WindowsDisplayHandle {}
@@ -55,16 +47,12 @@ impl DisplayHandle<'static> {
 
 /// Raw window handle for Win32.
 ///
-/// ## Thread-Safety
+/// ## Safety
 ///
-/// Window handles have [thread affinity]. This means that they are `!Send`, as
-/// they must be dropped on the same thread that created them. However, some
-/// functions on the window can be called from other threads. This means that
-/// the window is `Sync`.
-///
-/// Note that not all functions of the Win32 handle are thread-safe (modifying
-/// functions especially), so care should be taken to not call these functions
-/// from other threads. When in doubt, only run the function on the main thread.
+/// Window objects have [thread affinity]. Some functions read or modify window
+/// state non-atomically, making them unsafe to call from threads other than
+/// the one that created the window. When in doubt, only run the function on
+/// the thread the window object was created on.
 ///
 /// [thread affinity]: https://devblogs.microsoft.com/oldnewthing/20051010-09/?p=33843
 #[non_exhaustive]
@@ -76,6 +64,7 @@ pub struct Win32WindowHandle {
     pub hinstance: Option<NonNull<c_void>>,
 }
 
+unsafe impl Send for Win32WindowHandle {}
 unsafe impl Sync for Win32WindowHandle {}
 
 impl Win32WindowHandle {
@@ -83,8 +72,9 @@ impl Win32WindowHandle {
     ///
     /// # Safety
     ///
-    /// It is assumed that the Win32 handle belongs to the current thread. This
-    /// is necessary for the handle to be considered "valid" in all cases.
+    /// Some APIs taking a `HWND` must observe its thread-affinity.
+    /// Consumers are responsible to ensure these safety guarantees themselves.
+    /// See [`GetWindowThreadProcessId()`](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getwindowthreadprocessid).
     ///
     /// # Example
     ///
@@ -102,6 +92,11 @@ impl Win32WindowHandle {
     /// let hinstance = NonNull::new(unsafe { GetWindowLongPtrW(window, GWLP_HINSTANCE) }).unwrap();
     /// # let hinstance = None;
     /// handle.hinstance = hinstance;
+    ///
+    /// // On the other end we need to check if we are on the
+    /// // right thread when using API calls that require it:
+    /// # #[cfg(only_for_showcase)]
+    /// unsafe { assert_eq!(GetWindowThreadProcessId(HWND(handle.hwnd.as_ptr()), None), GetCurrentThreadId()) };
     /// ```
     pub fn new(hwnd: NonNull<c_void>) -> Self {
         Self {
@@ -112,19 +107,6 @@ impl Win32WindowHandle {
 }
 
 /// Raw window handle for WinRT.
-///
-/// ## Thread-Safety
-///
-/// Window handles have [thread affinity]. This means that they are `!Send`, as
-/// they must be dropped on the same thread that created them. However, some
-/// functions on the window can be called from other threads. This means that
-/// the window is `Sync`.
-///
-/// Note that not all functions of the Win32 handle are thread-safe (modifying
-/// functions especially), so care should be taken to not call these functions
-/// from other threads. When in doubt, only run the function on the main thread.
-///
-/// [thread affinity]: https://devblogs.microsoft.com/oldnewthing/20051010-09/?p=33843
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct WinRtWindowHandle {
