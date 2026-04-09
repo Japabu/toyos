@@ -70,7 +70,7 @@ memmap2 = { version = "0.9.0", optional = true }
 wayland-backend = { version = "0.3.0", optional = true, features = [
     "client_system",
 ] }
-wayland-client = { version = "0.31.12", optional = true }
+wayland-client = { version = "0.31.14", optional = true }
 wayland-sys = { version = "0.31.0", optional = true }
 # X11
 as-raw-xcb-connection = { version = "1.0.0", optional = true }
@@ -80,7 +80,7 @@ x11rb = { version = "0.13.0", optional = true, features = [
     "shm",
 ] }
 # KMS/DRM
-drm = { version = "0.14.1", default-features = false, optional = true }
+drm = { version = "0.15.0", default-features = false, optional = true }
 
 # Windows dependencies.
 [target.'cfg(target_os = "windows")'.dependencies]
@@ -95,9 +95,11 @@ windows-sys = { version = "0.61.2", features = [
 # CoreGraphics (macOS/iOS/...) dependencies.
 [target.'cfg(target_vendor = "apple")'.dependencies]
 objc2 = "0.6.0"
+libc = "0.2.180"
 objc2-core-graphics = { version = "0.3.2", default-features = false, features = [
     "std",
     "objc2",
+    "libc",
     "CGColorSpace",
     "CGDataProvider",
     "CGImage",
@@ -115,6 +117,7 @@ objc2-foundation = { version = "0.3.2", default-features = false, features = [
     "NSString",
     "NSThread",
     "NSValue",
+    "NSNull",
 ] }
 objc2-quartz-core = { version = "0.3.2", default-features = false, features = [
     "std",
@@ -126,7 +129,7 @@ objc2-quartz-core = { version = "0.3.2", default-features = false, features = [
 # Web dependencies.
 [target.'cfg(target_family = "wasm")'.dependencies]
 js-sys = "0.3.63"
-wasm-bindgen = "0.2.86"
+wasm-bindgen = "0.2.108"
 web-sys = { version = "0.3.55", features = [
     "CanvasRenderingContext2d",
     "Document",
