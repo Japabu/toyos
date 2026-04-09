@@ -174,19 +174,22 @@ impl DeviceTrait for Device {
         let thread = std::thread::Builder::new()
             .name("cpal-toyos-audio".to_string())
             .spawn(move || {
-                let ring = audio.ring();
                 let mut buffer = vec![0u8; buffer_bytes];
+
+                let now = StreamInstant::new(0, 0);
+                let info = OutputCallbackInfo::new(OutputStreamTimestamp {
+                    callback: now,
+                    playback: now,
+                });
+
                 while alive2.load(Ordering::Relaxed) {
                     if !playing2.load(Ordering::Relaxed) {
-                        std::thread::sleep(Duration::from_millis(5));
+                        let ptr = &*playing2 as *const AtomicBool as *const u32;
+                        unsafe {
+                            toyos_abi::syscall::futex_wait(ptr, 0, None);
+                        }
                         continue;
                     }
-
-                    let now = StreamInstant::new(0, 0);
-                    let info = OutputCallbackInfo::new(OutputStreamTimestamp {
-                        callback: now,
-                        playback: now,
-                    });
 
                     crate::host::fill_with_equilibrium(&mut buffer, sample_format);
                     let mut data = unsafe {
@@ -194,34 +197,10 @@ impl DeviceTrait for Device {
                     };
                     data_callback(&mut data, &info);
 
-                    // Find the last non-zero byte — only write actual audio to the ring.
-                    // If the callback produced nothing (VecDeque empty), skip the write
-                    // entirely. soundd handles empty rings by outputting silence.
-                    let content_len = buffer.iter().rposition(|&b| b != 0)
-                        .map(|pos| (pos + 2) & !1)  // round up to sample boundary
-                        .unwrap_or(0)
-                        .min(buffer.len());
-
-                    if content_len > 0 {
-                        // Write real audio to ring. Blocks when full — soundd
-                        // drains at hardware rate, so backpressure naturally
-                        // paces us to the consumption rate. No explicit sleep.
-                        let mut written = 0;
-                        while written < content_len {
-                            let n = ring.write(&buffer[written..content_len]);
-                            written += n;
-                            if n == 0 {
-                                std::thread::sleep(Duration::from_millis(1));
-                            }
-                        }
-                    } else {
-                        // App has no audio right now.
-                        std::thread::sleep(Duration::from_millis(1));
-                    }
-
+                    audio.write_blocking(&buffer);
                 }
 
-                ring.close();
+                audio.ring().close();
             })
             .map_err(|e| BuildStreamError::BackendSpecific {
                 err: crate::BackendSpecificError {
@@ -240,6 +219,10 @@ impl DeviceTrait for Device {
 impl StreamTrait for Stream {
     fn play(&self) -> Result<(), PlayStreamError> {
         self.playing.store(true, Ordering::Relaxed);
+        unsafe {
+            let ptr = &*self.playing as *const AtomicBool as *const u32;
+            toyos_abi::syscall::futex_wake(ptr, 1);
+        }
         Ok(())
     }
 
