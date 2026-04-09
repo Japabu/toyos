@@ -8,6 +8,7 @@ use crate::core::compiler::future_incompat::FutureBreakageItem;
 use crate::core::compiler::locking::LockKey;
 use crate::core::compiler::timings::SectionTiming;
 use crate::util::Queue;
+use crate::util::context::WarningHandling;
 use crate::{CargoResult, core::compiler::locking::LockManager};
 
 use super::{Artifact, DiagDedupe, Job, JobId, Message};
@@ -35,7 +36,7 @@ pub struct JobState<'a, 'gctx> {
     /// interleaving is still prevented as the lock would be held for the whole printing of an
     /// output message.
     ///
-    /// [`Shell`]: crate::core::Shell
+    /// [`Shell`]: cargo_util_terminal::Shell
     /// [`GlobalContext`]: crate::GlobalContext
     output: Option<&'a DiagDedupe<'gctx>>,
 
@@ -51,6 +52,8 @@ pub struct JobState<'a, 'gctx> {
     /// Manages locks for build units when fine grain locking is enabled.
     lock_manager: Arc<LockManager>,
 
+    warning_handling: WarningHandling,
+
     // Historical versions of Cargo made use of the `'a` argument here, so to
     // leave the door open to future refactorings keep it here.
     _marker: marker::PhantomData<&'a ()>,
@@ -63,6 +66,7 @@ impl<'a, 'gctx> JobState<'a, 'gctx> {
         output: Option<&'a DiagDedupe<'gctx>>,
         rmeta_required: bool,
         lock_manager: Arc<LockManager>,
+        warning_handling: WarningHandling,
     ) -> Self {
         Self {
             id,
@@ -70,6 +74,7 @@ impl<'a, 'gctx> JobState<'a, 'gctx> {
             output,
             rmeta_required: Cell::new(rmeta_required),
             lock_manager,
+            warning_handling,
             _marker: marker::PhantomData,
         }
     }
@@ -106,7 +111,9 @@ impl<'a, 'gctx> JobState<'a, 'gctx> {
         lint: bool,
         fixable: bool,
     ) -> CargoResult<()> {
-        if let Some(dedupe) = self.output {
+        if level == "warning" && lint && self.warning_handling == WarningHandling::Allow {
+            tracing::warn!("{diag}");
+        } else if let Some(dedupe) = self.output {
             let emitted = dedupe.emit_diag(&diag)?;
             if level == "warning" {
                 self.messages.push(Message::WarningCount {
@@ -211,5 +218,14 @@ impl<'a, 'gctx> JobState<'a, 'gctx> {
     pub fn future_incompat_report(&self, report: Vec<FutureBreakageItem>) {
         self.messages
             .push(Message::FutureIncompatReport(self.id, report));
+    }
+
+    /// The rustc emitted the list of unused `--extern` args.
+    ///
+    /// This is useful for checking unused dependencies.
+    /// Should only be called once, as the compiler only emits it once per compilation.
+    pub fn unused_externs(&self, unused_externs: Vec<String>) {
+        self.messages
+            .push(Message::UnusedExterns(self.id, unused_externs));
     }
 }

@@ -1,15 +1,15 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use annotate_snippets::AnnotationKind;
-use annotate_snippets::Group;
-use annotate_snippets::Level;
-use annotate_snippets::Origin;
-use annotate_snippets::Patch;
-use annotate_snippets::Snippet;
 use cargo_platform::Platform;
 use cargo_util_schemas::manifest::TomlDependency;
 use cargo_util_schemas::manifest::TomlToolLints;
+use cargo_util_terminal::report::AnnotationKind;
+use cargo_util_terminal::report::Group;
+use cargo_util_terminal::report::Level;
+use cargo_util_terminal::report::Origin;
+use cargo_util_terminal::report::Patch;
+use cargo_util_terminal::report::Snippet;
 use toml::de::DeValue;
 
 use crate::CargoResult;
@@ -31,7 +31,6 @@ pub static LINT: &Lint = &Lint {
     desc: "dependency version requirement without an explicit minimum version",
     primary_group: &PEDANTIC,
     msrv: None,
-    edition_lint_opts: None,
     feature_gate: None,
     docs: Some(
         r#"
@@ -93,7 +92,6 @@ pub fn implicit_minimum_version_req_pkg(
     let (lint_level, reason) = LINT.level(
         cargo_lints,
         pkg.rust_version(),
-        pkg.manifest().edition(),
         pkg.manifest().unstable_features(),
     );
 
@@ -161,7 +159,6 @@ pub fn implicit_minimum_version_req_ws(
     let (lint_level, reason) = LINT.level(
         cargo_lints,
         ws.lowest_rust_version(),
-        maybe_pkg.edition(),
         maybe_pkg.unstable_features(),
     );
 

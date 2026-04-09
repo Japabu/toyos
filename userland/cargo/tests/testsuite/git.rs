@@ -249,10 +249,20 @@ fn cargo_compile_git_dep_pull_request() {
 
     // Make a reference in GitHub's pull request ref naming convention.
     let repo = git2::Repository::open(&git_project.root()).unwrap();
-    let oid = repo.refname_to_id("HEAD").unwrap();
-    let force = false;
     let log_message = "open pull request";
-    repo.reference("refs/pull/330/head", oid, force, log_message)
+    let parent = repo.head().unwrap().peel_to_commit().unwrap();
+    let author = repo.signature().unwrap();
+    let oid = repo
+        .commit(
+            None,
+            &author,
+            &author,
+            log_message,
+            &parent.tree().unwrap(),
+            &[&parent],
+        )
+        .unwrap();
+    repo.reference("refs/pull/330/head", oid, false, log_message)
         .unwrap();
 
     let project = project
@@ -290,6 +300,25 @@ fn cargo_compile_git_dep_pull_request() {
         .run();
 
     assert!(project.bin("foo").is_file());
+
+    // Delete the local cache, but keep the Cargo.lock to prevent regression
+    // of <https://github.com/rust-lang/cargo/issues/16767>
+    // This ensures we fetch the refs/pull/330/head spec explicitly, even
+    // if we have a locked commit.
+    paths::cargo_home().join("git").rm_rf();
+
+    project
+        .cargo("check")
+        .env("CARGO_NET_GIT_FETCH_WITH_CLI", "true")
+        .with_stderr_data(str![[r#"
+[UPDATING] git repository `[ROOTURL]/dep1`
+...
+[CHECKING] dep1 v0.5.0 ([ROOTURL]/dep1?rev=refs%2Fpull%2F330%2Fhead#[..])
+[CHECKING] foo v0.0.0 ([ROOT]/foo)
+[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+
+"#]])
+        .run();
 }
 
 #[cargo_test]
@@ -813,7 +842,14 @@ fn update_with_shared_deps() {
         .with_status(101)
         .with_stderr_data(str![[r#"
 [UPDATING] git repository `[ROOTURL]/bar`
-[ERROR] unable to update [ROOTURL]/bar#0.1.2
+[ERROR] failed to get `bar` as a dependency of package `dep1 v0.5.0 ([ROOT]/foo/dep1)`
+    ... which satisfies path dependency `dep1` (locked to 0.5.0) of package `foo v0.5.0 ([ROOT]/foo)`
+
+Caused by:
+  failed to load source for dependency `bar`
+
+Caused by:
+  unable to update [ROOTURL]/bar#0.1.2
 
 Caused by:
   revspec '0.1.2' not found; class=Reference (4); code=NotFound (-3)
@@ -2139,7 +2175,7 @@ fn update_ambiguous() {
     p.cargo("update bar")
         .with_status(101)
         .with_stderr_data(str![[r#"
-[ERROR] specificationm `bar` is ambiguous
+[ERROR] specification `bar` is ambiguous
 [HELP] re-run this command with one of the following specifications
   bar@0.5.0
   bar@0.6.0
@@ -4378,4 +4414,76 @@ fn dep_with_cached_submodule() {
         .map(Result::unwrap)
         .collect::<Vec<_>>();
     assert_eq!(db_paths.len(), 1, "submodule db created once");
+}
+
+#[cargo_test]
+fn dep_with_scp_like_submodule_url() {
+    // Regression test for https://github.com/rust-lang/cargo/pull/16727
+    let git_project = git::new("dep1", |project| {
+        project
+            .file("Cargo.toml", &basic_manifest("dep1", "0.5.0"))
+            .file("src/lib.rs", "pub fn dep() {}")
+    });
+    let git_project2 = git::new("dep2", |project| project.file("lib.rs", "pub fn dep2() {}"));
+
+    let repo = git2::Repository::open(&git_project.root()).unwrap();
+    let url = git_project2.root().to_url().to_string();
+    git::add_submodule(&repo, &url, Path::new("submod"));
+    git::commit(&repo);
+
+    git_project.change_file(
+        ".gitmodules",
+        "[submodule \"submod\"]\n\tpath = submod\n\turl = git@github.com:foo/bar.git",
+    );
+    git::add(&repo);
+    git::commit(&repo);
+
+    let p = project()
+        .file(
+            "Cargo.toml",
+            &format!(
+                r#"
+                    [package]
+                    name = "foo"
+                    version = "0.5.0"
+                    edition = "2015"
+
+                    [dependencies.dep1]
+                    git = '{}'
+                "#,
+                git_project.url()
+            ),
+        )
+        .file("src/lib.rs", "extern crate dep1;")
+        .build();
+
+    // With the SCP-like URL fix, Cargo preserves the original SCP-like URL
+    // for the actual fetch, while using the ssh:// form internally for caching.
+    // The fetch fails because the SSH server is not reachable, but the URL
+    // shown in messages is the original SCP-like form.
+    p.cargo("fetch")
+        .env(
+            "GIT_SSH_COMMAND",
+            "ssh -o StrictHostKeyChecking=no -o LogLevel=ERROR",
+        )
+        .with_status(101)
+        .with_stderr_data(str![[r#"
+[UPDATING] git repository `[ROOTURL]/dep1`
+[UPDATING] git submodule `git@github.com:foo/bar.git`
+[ERROR] failed to get `dep1` as a dependency of package `foo v0.5.0 ([ROOT]/foo)`
+
+Caused by:
+  failed to load source for dependency `dep1`
+
+Caused by:
+  unable to update [ROOTURL]/dep1
+
+Caused by:
+  failed to update submodule `submod`
+
+Caused by:
+  failed to fetch submodule `submod` from git@github.com:foo/bar.git
+...
+"#]])
+        .run();
 }

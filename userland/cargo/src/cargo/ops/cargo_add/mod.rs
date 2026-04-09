@@ -13,6 +13,7 @@ use cargo_util::paths;
 use cargo_util_schemas::core::PartialVersion;
 use cargo_util_schemas::manifest::PathBaseName;
 use cargo_util_schemas::manifest::RustVersion;
+use cargo_util_terminal::Shell;
 use indexmap::IndexSet;
 use itertools::Itertools;
 use toml_edit::Item as TomlItem;
@@ -25,7 +26,6 @@ use crate::core::Features;
 use crate::core::Package;
 use crate::core::PackageId;
 use crate::core::Registry;
-use crate::core::Shell;
 use crate::core::Summary;
 use crate::core::Workspace;
 use crate::core::dependency::DepKind;
@@ -831,14 +831,8 @@ fn get_latest_dependency(
             unreachable!("registry dependencies required, found a workspace dependency");
         }
         MaybeWorkspace::Other(query) => {
-            let possibilities = loop {
-                match registry.query_vec(&query, QueryKind::Normalized) {
-                    std::task::Poll::Ready(res) => {
-                        break res?;
-                    }
-                    std::task::Poll::Pending => registry.block_until_ready()?,
-                }
-            };
+            let possibilities =
+                crate::util::block_on(registry.query_vec(&query, QueryKind::Normalized))?;
 
             let mut possibilities: Vec<_> = possibilities
                 .into_iter()
@@ -963,15 +957,8 @@ fn select_package(
             unreachable!("path or git dependency expected, found workspace dependency");
         }
         MaybeWorkspace::Other(query) => {
-            let possibilities = loop {
-                // Exact to avoid returning all for path/git
-                match registry.query_vec(&query, QueryKind::Normalized) {
-                    std::task::Poll::Ready(res) => {
-                        break res?;
-                    }
-                    std::task::Poll::Pending => registry.block_until_ready()?,
-                }
-            };
+            let possibilities =
+                crate::util::block_on(registry.query_vec(&query, QueryKind::Normalized))?;
 
             let possibilities: Vec<_> = possibilities
                 .into_iter()
@@ -1196,14 +1183,8 @@ fn populate_available_features(
         return Ok(dependency);
     }
 
-    let possibilities = loop {
-        match registry.query_vec(&query, QueryKind::Normalized) {
-            std::task::Poll::Ready(res) => {
-                break res?;
-            }
-            std::task::Poll::Pending => registry.block_until_ready()?,
-        }
-    };
+    let possibilities = crate::util::block_on(registry.query_vec(&query, QueryKind::Normalized))?;
+
     // Ensure widest feature flag compatibility by picking the earliest version that could show up
     // in the lock file for a given version requirement.
     let lowest_common_denominator = possibilities
@@ -1224,7 +1205,7 @@ fn populate_available_features(
 }
 
 fn print_action_msg(shell: &mut Shell, dep: &DependencyUI, section: &[String]) -> CargoResult<()> {
-    if matches!(shell.verbosity(), crate::core::shell::Verbosity::Quiet) {
+    if matches!(shell.verbosity(), cargo_util_terminal::Verbosity::Quiet) {
         return Ok(());
     }
 
@@ -1266,7 +1247,7 @@ fn print_action_msg(shell: &mut Shell, dep: &DependencyUI, section: &[String]) -
 }
 
 fn print_dep_table_msg(shell: &mut Shell, dep: &DependencyUI) -> CargoResult<()> {
-    if matches!(shell.verbosity(), crate::core::shell::Verbosity::Quiet) {
+    if matches!(shell.verbosity(), cargo_util_terminal::Verbosity::Quiet) {
         return Ok(());
     }
 

@@ -11,12 +11,12 @@ use std::io::Seek;
 use std::io::SeekFrom;
 use std::time::Duration;
 
-use annotate_snippets::Level;
 use anyhow::Context as _;
 use anyhow::bail;
 use cargo_credential::Operation;
 use cargo_credential::Secret;
 use cargo_util::paths;
+use cargo_util_terminal::report::Level;
 use crates_io::NewCrate;
 use crates_io::NewCrateDependency;
 use crates_io::Registry;
@@ -190,6 +190,18 @@ pub fn publish(ws: &Workspace<'_>, opts: &PublishOpts<'_>) -> CargoResult<()> {
     // As a side effect, any given package's "effective" timeout may be much larger.
     let mut to_confirm = BTreeSet::new();
 
+    // Check for circular dependencies before publishing.
+    if plan.has_cycles() {
+        bail!(
+            "circular dependency detected while publishing {}\n\
+             help: to break a cycle between dev-dependencies \
+             and other dependencies, remove the version field \
+             on the dev-dependency so it will be implicitly \
+             stripped on publish",
+            package_list(plan.cycle_members(), "and")
+        );
+    }
+
     while !plan.is_empty() {
         // There might not be any ready package, if the previous confirmations
         // didn't unlock a new one. For example, if `c` depends on `a` and
@@ -197,6 +209,18 @@ pub fn publish(ws: &Workspace<'_>, opts: &PublishOpts<'_>) -> CargoResult<()> {
         // the following pass through the outer loop nothing will be ready for
         // upload.
         let mut ready = plan.take_ready();
+
+        if ready.is_empty() {
+            // Circular dependencies are caught above, so this indicates a failure
+            // to progress, potentially due to a timeout while waiting for confirmations.
+            return Err(crate::util::internal(format!(
+                "no packages ready to publish but {} packages remain in plan with {} awaiting confirmation: {}",
+                plan.len(),
+                to_confirm.len(),
+                package_list(plan.iter(), "and")
+            )));
+        }
+
         while let Some(pkg_id) = ready.pop_first() {
             let (pkg, (_features, tarball)) = &pkg_dep_graph.packages[&pkg_id];
             opts.gctx.shell().status("Uploading", pkg.package_id())?;
@@ -274,12 +298,12 @@ pub fn publish(ws: &Workspace<'_>, opts: &PublishOpts<'_>) -> CargoResult<()> {
                 let short_pkg_descriptions = package_list(to_confirm.iter().copied(), "or");
                 if plan.is_empty() {
                     let report = &[
-                        annotate_snippets::Group::with_title(
-                        annotate_snippets::Level::NOTE
+                        cargo_util_terminal::report::Group::with_title(
+                        cargo_util_terminal::report::Level::NOTE
                             .secondary_title(format!(
                                 "waiting for {short_pkg_descriptions} to be available at {source_description}"
                             ))),
-                            annotate_snippets::Group::with_title(annotate_snippets::Level::HELP.secondary_title(format!(
+                            cargo_util_terminal::report::Group::with_title(cargo_util_terminal::report::Level::HELP.secondary_title(format!(
                                 "you may press ctrl-c to skip waiting; the {crate} should be available shortly",
                                 crate = if to_confirm.len() == 1 { "crate" } else {"crates"}
                             ))),
@@ -388,7 +412,7 @@ fn wait_for_any_publish_confirmation(
             source.invalidate_cache();
             let mut available = BTreeSet::new();
             for pkg in pkgs {
-                if poll_one_package(registry_src, pkg, &mut source)? {
+                if poll_one_package(registry_src, pkg, &mut *source)? {
                     available.insert(*pkg);
                 }
             }
@@ -415,19 +439,12 @@ fn wait_for_any_publish_confirmation(
 fn poll_one_package(
     registry_src: SourceId,
     pkg_id: &PackageId,
-    source: &mut dyn Source,
+    source: &dyn Source,
 ) -> CargoResult<bool> {
     let version_req = format!("={}", pkg_id.version());
     let query = Dependency::parse(pkg_id.name(), Some(&version_req), registry_src)?;
-    let summaries = loop {
-        // Exact to avoid returning all for path/git
-        match source.query_vec(&query, QueryKind::Exact) {
-            std::task::Poll::Ready(res) => {
-                break res?;
-            }
-            std::task::Poll::Pending => source.block_until_ready()?,
-        }
-    };
+    // Exact to avoid returning all for path/git
+    let summaries = crate::util::block_on(source.query_vec(&query, QueryKind::Exact))?;
     Ok(!summaries.is_empty())
 }
 
@@ -443,14 +460,7 @@ fn verify_unpublished(
         Some(&pkg.version().to_exact_req().to_string()),
         source_ids.replacement,
     )?;
-    let duplicate_query = loop {
-        match source.query_vec(&query, QueryKind::Exact) {
-            std::task::Poll::Ready(res) => {
-                break res?;
-            }
-            std::task::Poll::Pending => source.block_until_ready()?,
-        }
-    };
+    let duplicate_query = crate::util::block_on(source.query_vec(&query, QueryKind::Exact))?;
     if !duplicate_query.is_empty() {
         // Move the registry error earlier in the publish process.
         // Since dry-run wouldn't talk to the registry to get the error, we downgrade it to a
@@ -714,6 +724,8 @@ fn transmit(
 struct PublishPlan {
     /// Graph of publishable packages where the edges are `(dependency -> dependent)`
     dependents: Graph<PackageId, ()>,
+    /// The original graph of publishable packages where the edges are `(dependent -> dependency)`
+    graph: Graph<PackageId, ()>,
     /// The weight of a package is the number of unpublished dependencies it has.
     dependencies_count: HashMap<PackageId, usize>,
 }
@@ -729,6 +741,7 @@ impl PublishPlan {
             .collect();
         Self {
             dependents,
+            graph: graph.clone(),
             dependencies_count,
         }
     }
@@ -743,6 +756,34 @@ impl PublishPlan {
 
     fn len(&self) -> usize {
         self.dependencies_count.len()
+    }
+
+    /// Determines whether the dependency graph contains any circular dependencies.
+    fn has_cycles(&self) -> bool {
+        !self.cycle_members().is_empty()
+    }
+
+    /// Identifies and returns the packages involved in a circular dependency.
+    fn cycle_members(&self) -> Vec<PackageId> {
+        let mut remaining: BTreeSet<_> = self.dependencies_count.keys().copied().collect();
+        loop {
+            let to_remove: Vec<_> = remaining
+                .iter()
+                .filter(|&id| {
+                    self.graph
+                        .edges(id)
+                        .all(|(child, _)| !remaining.contains(child))
+                })
+                .copied()
+                .collect();
+            if to_remove.is_empty() {
+                break;
+            }
+            for id in to_remove {
+                remaining.remove(&id);
+            }
+        }
+        remaining.into_iter().collect()
     }
 
     /// Returns the set of packages that are ready for publishing (i.e. have no outstanding dependencies).

@@ -216,11 +216,11 @@ fn wrong_case_http() {
     let _server = setup_http();
     wrong_case(str![[r#"
 [UPDATING] `dummy-registry` index
-[ERROR] no matching package found
-searched package name: `Init`
-perhaps you meant:      init
+[ERROR] no matching package named `Init` found
 location searched: `dummy-registry` index (which is replacing registry `crates-io`)
 required by package `foo v0.0.1 ([ROOT]/foo)`
+[HELP] packages with similar names: init
+
 
 "#]]);
 }
@@ -229,11 +229,11 @@ required by package `foo v0.0.1 ([ROOT]/foo)`
 fn wrong_case_git() {
     wrong_case(str![[r#"
 [UPDATING] `dummy-registry` index
-[ERROR] no matching package found
-searched package name: `Init`
-perhaps you meant:      init
+[ERROR] no matching package named `Init` found
 location searched: `dummy-registry` index (which is replacing registry `crates-io`)
 required by package `foo v0.0.1 ([ROOT]/foo)`
+[HELP] packages with similar names: init
+
 
 "#]]);
 }
@@ -270,11 +270,11 @@ fn mis_hyphenated_http() {
     let _server = setup_http();
     mis_hyphenated(str![[r#"
 [UPDATING] `dummy-registry` index
-[ERROR] no matching package found
-searched package name: `mis_hyphenated`
-perhaps you meant:      mis-hyphenated
+[ERROR] no matching package named `mis_hyphenated` found
 location searched: `dummy-registry` index (which is replacing registry `crates-io`)
 required by package `foo v0.0.1 ([ROOT]/foo)`
+[HELP] packages with similar names: mis-hyphenated
+
 
 "#]]);
 }
@@ -283,11 +283,11 @@ required by package `foo v0.0.1 ([ROOT]/foo)`
 fn mis_hyphenated_git() {
     mis_hyphenated(str![[r#"
 [UPDATING] `dummy-registry` index
-[ERROR] no matching package found
-searched package name: `mis_hyphenated`
-perhaps you meant:      mis-hyphenated
+[ERROR] no matching package named `mis_hyphenated` found
 location searched: `dummy-registry` index (which is replacing registry `crates-io`)
 required by package `foo v0.0.1 ([ROOT]/foo)`
+[HELP] packages with similar names: mis-hyphenated
+
 
 "#]]);
 }
@@ -329,7 +329,7 @@ fn wrong_version_http() {
 candidate versions found which didn't match: 0.0.2, 0.0.1
 location searched: `dummy-registry` index (which is replacing registry `crates-io`)
 required by package `foo v0.0.1 ([ROOT]/foo)`
-perhaps a crate was updated and forgotten to be re-vendored?
+[NOTE] perhaps a crate was updated and forgotten to be re-vendored?
 
 "#]],
         str![[r#"
@@ -338,7 +338,7 @@ perhaps a crate was updated and forgotten to be re-vendored?
 candidate versions found which didn't match: 0.0.4, 0.0.3, 0.0.2, ...
 location searched: `dummy-registry` index (which is replacing registry `crates-io`)
 required by package `foo v0.0.1 ([ROOT]/foo)`
-perhaps a crate was updated and forgotten to be re-vendored?
+[NOTE] perhaps a crate was updated and forgotten to be re-vendored?
 
 "#]],
     );
@@ -353,7 +353,7 @@ fn wrong_version_git() {
 candidate versions found which didn't match: 0.0.2, 0.0.1
 location searched: `dummy-registry` index (which is replacing registry `crates-io`)
 required by package `foo v0.0.1 ([ROOT]/foo)`
-perhaps a crate was updated and forgotten to be re-vendored?
+[NOTE] perhaps a crate was updated and forgotten to be re-vendored?
 
 "#]],
         str![[r#"
@@ -362,7 +362,7 @@ perhaps a crate was updated and forgotten to be re-vendored?
 candidate versions found which didn't match: 0.0.4, 0.0.3, 0.0.2, ...
 location searched: `dummy-registry` index (which is replacing registry `crates-io`)
 required by package `foo v0.0.1 ([ROOT]/foo)`
-perhaps a crate was updated and forgotten to be re-vendored?
+[NOTE] perhaps a crate was updated and forgotten to be re-vendored?
 
 "#]],
     );
@@ -2209,7 +2209,7 @@ fn use_semver_package_incorrectly_http() {
 candidate versions found which didn't match: 0.1.1-alpha.0
 location searched: [ROOT]/foo/a
 required by package `b v0.1.0 ([ROOT]/foo/b)`
-if you are looking for the prerelease package it needs to be specified explicitly
+[HELP] if you are looking for the prerelease package it needs to be specified explicitly
     a = { version = "0.1.1-alpha.0" }
 
 "#]]);
@@ -2222,7 +2222,7 @@ fn use_semver_package_incorrectly_git() {
 candidate versions found which didn't match: 0.1.1-alpha.0
 location searched: [ROOT]/foo/a
 required by package `b v0.1.0 ([ROOT]/foo/b)`
-if you are looking for the prerelease package it needs to be specified explicitly
+[HELP] if you are looking for the prerelease package it needs to be specified explicitly
     a = { version = "0.1.1-alpha.0" }
 
 "#]]);
@@ -2435,7 +2435,8 @@ fn disallow_network_http() {
 [ERROR] no matching package named `foo` found
 location searched: `dummy-registry` index (which is replacing registry `crates-io`)
 required by package `bar v0.5.0 ([ROOT]/foo)`
-As a reminder, you're using offline mode (--frozen) which can sometimes cause surprising resolution failures, if this error is too confusing you may wish to retry without `--frozen`.
+[NOTE] offline mode (via `--frozen`) can sometimes cause surprising resolution failures
+[HELP] if this error is too confusing you may wish to retry without `--frozen`
 
 "#]])
         .run();
@@ -2467,7 +2468,8 @@ fn disallow_network_git() {
 [ERROR] no matching package named `foo` found
 location searched: `dummy-registry` index (which is replacing registry `crates-io`)
 required by package `bar v0.5.0 ([ROOT]/foo)`
-As a reminder, you're using offline mode (--frozen) which can sometimes cause surprising resolution failures, if this error is too confusing you may wish to retry without `--frozen`.
+[NOTE] offline mode (via `--frozen`) can sometimes cause surprising resolution failures
+[HELP] if this error is too confusing you may wish to retry without `--frozen`
 
 "#]])
         .run();
@@ -3560,27 +3562,38 @@ fn sparse_blocking_count() {
         .file("src/main.rs", "fn main() {}")
         .build();
 
-    Package::new("bar", "0.0.1").publish();
+    Package::new("dep1", "0.0.1").publish();
+    Package::new("dep2", "0.0.1").publish();
+    Package::new("bar", "0.0.1")
+        .dep("dep1", "0.0.1")
+        .dep("dep2", "0.0.1")
+        .publish();
 
-    // Ensure we have the expected number of `block_until_ready` calls.
-    // The 1st (0 transfers pending), is the deliberate extra call in `ensure_loaded` for a source.
-    // The 2nd (1 transfers pending), is the registry `config.json`.
-    // the 3rd (1 transfers pending), is the package metadata for `bar`.
-
+    // Ensure we have the expected number of resolver restarts and network requests.
     p.cargo("check")
-        .env("CARGO_LOG", "network::HttpRegistry::block_until_ready=trace")
+        .env("CARGO_LOG", "cargo::core::resolver::restarting=debug,network::fetch=debug")
         .with_stderr_data(str![[r#"
-   [..] TRACE network::HttpRegistry::block_until_ready: 0 transfers pending
 [UPDATING] `dummy-registry` index
-   [..] TRACE network::HttpRegistry::block_until_ready: 1 transfers pending
-   [..] TRACE network::HttpRegistry::block_until_ready: 1 transfers pending
+   [..] DEBUG network::fetch: url="[..]/index/config.json"
+   [..] DEBUG network::fetch: url="[..]/index/3/b/bar"
 [WARNING] spurious network error (3 tries remaining): failed to get successful HTTP response from `[..]/index/3/b/bar` ([..]), got 500
 body:
 internal server error
-[LOCKING] 1 package to latest compatible version
+   [..] DEBUG network::fetch: url="[..]/index/3/b/bar"
+   [..] DEBUG cargo::core::resolver::restarting: pending=1
+   [..] DEBUG network::fetch: url="[..]/index/de/p1/dep1"
+   [..] DEBUG network::fetch: url="[..]/index/de/p2/dep2"
+   [..] DEBUG cargo::core::resolver::restarting: pending=2
+   [..] DEBUG cargo::core::resolver::restarting: pending=0
+[LOCKING] 3 packages to latest compatible versions
+   [..] DEBUG cargo::core::resolver::restarting: pending=0
 [DOWNLOADING] crates ...
-[DOWNLOADED] bar v0.0.1 (registry `dummy-registry`)
-[CHECKING] bar v0.0.1
+[DOWNLOADED] [..] v0.0.1 (registry `dummy-registry`)
+[DOWNLOADED] [..] v0.0.1 (registry `dummy-registry`)
+[DOWNLOADED] [..] v0.0.1 (registry `dummy-registry`)
+[CHECKING] [..] v0.0.1
+[CHECKING] [..] v0.0.1
+[CHECKING] [..] v0.0.1
 [CHECKING] foo v0.0.1 ([ROOT]/foo)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 
@@ -4280,10 +4293,13 @@ Please slow down
 [ERROR] failed to get `bar` as a dependency of package `foo v0.1.0 ([ROOT]/foo)`
 
 Caused by:
-  failed to query replaced source registry `crates-io`
+  failed to load source for dependency `bar`
 
 Caused by:
-  download of 3/b/bar failed
+  unable to update registry `crates-io`
+
+Caused by:
+  failed to query replaced source registry `crates-io`
 
 Caused by:
   failed to get successful HTTP response from `http://127.0.0.1:[..]/index/3/b/bar` (127.0.0.1), got 503
@@ -4694,4 +4710,81 @@ fn deterministic_mtime() {
     assert_deterministic_mtime(pkg_root.join("Cargo.lock"));
     assert_deterministic_mtime(pkg_root.join("Cargo.toml"));
     assert_deterministic_mtime(pkg_root.join(".cargo_vcs_info.json"));
+}
+
+#[cargo_test]
+fn symlink_and_directory() {
+    // Tests for symlink and directory entry in a tar file. The tar crate
+    // would incorrectly change the permissions of the symlink destination,
+    // which could be anywhere on the filesystem.
+    //
+    // Use a tempfile path to keep the path length below 100 for a USTAR
+    // archive. Otherwise, a long target directory name would break the
+    // archive generation.
+    let victim = tempfile::tempdir().unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perm = fs::Permissions::from_mode(0o700);
+        fs::set_permissions(&victim, perm).unwrap();
+        assert_eq!(
+            victim.path().metadata().unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+
+    Package::new("bar", "1.0.0")
+        .file("src/lib.rs", "")
+        .symlink("smuggled", victim.path().to_str().unwrap())
+        .directory("smuggled")
+        .publish();
+
+    let p = project()
+        .file(
+            "Cargo.toml",
+            r#"
+                [package]
+                name = "foo"
+                edition = "2015"
+
+                [dependencies]
+                bar = "1.0"
+            "#,
+        )
+        .file("src/lib.rs", "")
+        .build();
+
+    p.cargo("fetch")
+        .with_status(101)
+        .with_stderr_data(str![[r#"
+[UPDATING] `dummy-registry` index
+[LOCKING] 1 package to latest compatible version
+[DOWNLOADING] crates ...
+[DOWNLOADED] bar v1.0.0 (registry `dummy-registry`)
+[ERROR] failed to download replaced source registry `crates-io`
+
+Caused by:
+  failed to unpack package `bar v1.0.0 (registry `dummy-registry`)`
+
+Caused by:
+  failed to unpack entry at `bar-1.0.0/smuggled`
+
+Caused by:
+  failed to unpack `[ROOT]/home/.cargo/registry/src/-[HASH]/bar-1.0.0/smuggled`
+
+Caused by:
+  [..] when creating dir [ROOT]/home/.cargo/registry/src/-[HASH]/bar-1.0.0/smuggled
+
+"#]])
+        .run();
+
+    #[cfg(unix)]
+    {
+        // Permissions should not change.
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            victim.path().metadata().unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
 }

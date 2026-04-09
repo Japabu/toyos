@@ -4,22 +4,20 @@ use std::io::SeekFrom;
 use std::io::prelude::*;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::task::Poll;
 
-use annotate_snippets::Level;
 use anyhow::{Context as _, bail, format_err};
 use cargo_util::paths;
 use cargo_util_schemas::core::PartialVersion;
+use cargo_util_terminal::report::Level;
 use ops::FilterRule;
 use serde::{Deserialize, Serialize};
 
-use crate::core::Target;
 use crate::core::compiler::{DirtyReason, Freshness};
 use crate::core::{Dependency, FeatureValue, Package, PackageId, SourceId};
+use crate::core::{PackageSet, Target};
 use crate::ops::{self, CompileFilter, CompileOptions};
 use crate::sources::PathSource;
-use crate::sources::source::QueryKind;
-use crate::sources::source::Source;
+use crate::sources::source::{QueryKind, Source, SourceMap};
 use crate::util::GlobalContext;
 use crate::util::cache_lock::CacheLockMode;
 use crate::util::context::{ConfigRelativePath, Definition};
@@ -594,16 +592,13 @@ pub fn path_source(source_id: SourceId, gctx: &GlobalContext) -> CargoResult<Pat
 }
 
 /// Gets a Package based on command-line requirements.
-pub fn select_dep_pkg<T>(
-    source: &mut T,
+pub fn select_dep_pkg(
+    source: &mut dyn Source,
     dep: Dependency,
     gctx: &GlobalContext,
     needs_update: bool,
     current_rust_version: Option<&PartialVersion>,
-) -> CargoResult<Package>
-where
-    T: Source,
-{
+) -> CargoResult<Package> {
     // This operation may involve updating some sources or making a few queries
     // which may involve frobbing caches, as a result make sure we synchronize
     // with other global Cargos
@@ -613,12 +608,7 @@ where
         source.invalidate_cache();
     }
 
-    let deps = loop {
-        match source.query_vec(&dep, QueryKind::Exact)? {
-            Poll::Ready(deps) => break deps,
-            Poll::Pending => source.block_until_ready()?,
-        }
-    };
+    let deps = crate::util::block_on(source.query_vec(&dep, QueryKind::Exact))?;
     match deps
         .iter()
         .map(|s| s.as_summary())
@@ -633,12 +623,8 @@ where
                         // Match any version, not just the selected
                         let msrv_dep =
                             Dependency::parse(dep.package_name(), None, dep.source_id())?;
-                        let msrv_deps = loop {
-                            match source.query_vec(&msrv_dep, QueryKind::Exact)? {
-                                Poll::Ready(deps) => break deps,
-                                Poll::Pending => source.block_until_ready()?,
-                            }
-                        };
+                        let msrv_deps =
+                            crate::util::block_on(source.query_vec(&msrv_dep, QueryKind::Exact))?;
                         if let Some(alt) = msrv_deps
                             .iter()
                             .map(|s| s.as_summary())
@@ -673,8 +659,11 @@ cannot install package `{name} {ver}`, it requires rustc {msrv} or newer, while 
                     )
                 }
             }
-            let pkg = Box::new(source).download_now(summary.package_id(), gctx)?;
-            Ok(pkg)
+            // Download the package immediately.
+            let mut sources = SourceMap::new();
+            sources.insert(Box::new(source));
+            let pkg_set = PackageSet::new(&[summary.package_id()], sources, gctx)?;
+            Ok(pkg_set.get_one(summary.package_id())?.clone())
         }
         None => {
             let is_yanked: bool = if dep.version_req().is_exact() {
@@ -683,13 +672,7 @@ cannot install package `{name} {ver}`, it requires rustc {msrv} or newer, while 
                     PackageId::try_new(dep.package_name(), &version[1..], source.source_id())
                 {
                     source.invalidate_cache();
-                    loop {
-                        match source.is_yanked(pkg_id) {
-                            Poll::Ready(Ok(is_yanked)) => break is_yanked,
-                            Poll::Ready(Err(_)) => break false,
-                            Poll::Pending => source.block_until_ready()?,
-                        }
-                    }
+                    crate::util::block_on(source.is_yanked(pkg_id)).unwrap_or_default()
                 } else {
                     false
                 }

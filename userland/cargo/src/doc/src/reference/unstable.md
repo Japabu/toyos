@@ -358,6 +358,7 @@ private_dep = "2.0.0" # Will be 'private' by default
 
 Documentation updates:
 - For workspace's "The `dependencies` table" section, include `public` as an unsupported field for `workspace.dependencies`
+- Required MSRV for use of `public` is 1.83 (see [#14507](https://github.com/rust-lang/cargo/pull/14507))
 
 ## msrv-policy
 - [RFC: MSRV-aware Resolver](https://rust-lang.github.io/rfcs/3537-msrv-resolver.html)
@@ -1786,6 +1787,10 @@ lockfiles should be stored in different directories.
 
 *as a new `resolver.lockfile-path` entry in config.md*
 
+*Keep in mind, the `[resolver]` section has this clarification:*
+
+> *The `[resolver]` table overrides dependency resolution behavior for local development (e.g. excludes `cargo install`).*
+
 #### `resolver.lockfile-path`
 
 * Type: string (path)
@@ -1859,7 +1864,7 @@ in the future.
 Controls how Cargo handles warnings. Allowed values are:
 * `warn`: warnings are emitted as warnings (default).
 * `allow`: warnings are hidden.
-* `deny`: if warnings are emitted, an error will be raised at the end of the operation and the process will exit with a failure exit code. 
+* `deny`: if warnings are emitted, an error will be raised at the end of the current crate and the process. Use `--keep-going` to see all warnings.
 
 ## feature unification
 

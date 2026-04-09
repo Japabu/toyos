@@ -3,10 +3,12 @@
 use std::cmp;
 use std::time::{Duration, Instant};
 
-use crate::core::shell::Verbosity;
 use crate::util::context::ProgressWhen;
 use crate::util::{CargoResult, GlobalContext};
+use anstyle_progress::TermProgress;
 use cargo_util::is_ci;
+use cargo_util_terminal::Shell;
+use cargo_util_terminal::Verbosity;
 use unicode_width::UnicodeWidthChar;
 
 /// CLI progress bar.
@@ -27,159 +29,18 @@ use unicode_width::UnicodeWidthChar;
 /// needed, though be cautious if the tick rate is very high or it is
 /// expensive to compute the progress value.
 pub struct Progress<'gctx> {
-    state: Option<State<'gctx>>,
-}
-
-/// Indicates the style of information for displaying the amount of progress.
-///
-/// See also [`Progress::print_now`] for displaying progress without a bar.
-pub enum ProgressStyle {
-    /// Displays progress as a percentage.
-    ///
-    /// Example: `Fetch [=====================>   ]  88.15%`
-    ///
-    /// This is good for large values like number of bytes downloaded.
-    Percentage,
-    /// Displays progress as a ratio.
-    ///
-    /// Example: `Building [===>                      ] 35/222`
-    ///
-    /// This is good for smaller values where the exact number is useful to see.
-    Ratio,
-    /// Does not display an exact value of how far along it is.
-    ///
-    /// Example: `Fetch [===========>                     ]`
-    ///
-    /// This is good for situations where the exact value is an approximation,
-    /// and thus there isn't anything accurate to display to the user.
-    Indeterminate,
-}
-
-struct Throttle {
-    first: bool,
-    last_update: Instant,
-}
-
-struct State<'gctx> {
     gctx: &'gctx GlobalContext,
-    format: Format,
-    name: String,
-    done: bool,
-    throttle: Throttle,
-    last_line: Option<String>,
-    fixed_width: Option<usize>,
-}
-
-struct Format {
-    style: ProgressStyle,
-    max_width: usize,
-    max_print: usize,
-    term_integration: TerminalIntegration,
-    unicode: bool,
-}
-
-/// Controls terminal progress integration via OSC sequences.
-struct TerminalIntegration {
-    enabled: bool,
-    error: bool,
-}
-
-/// A progress status value printable as an ANSI OSC 9;4 escape code.
-#[cfg_attr(test, derive(PartialEq, Debug))]
-enum StatusValue {
-    /// No output.
-    None,
-    /// Remove progress.
-    Remove,
-    /// Progress value (0-100).
-    Value(f64),
-    /// Indeterminate state (no bar, just animation)
-    Indeterminate,
-    /// Progress value in an error state (0-100).
-    Error(f64),
-}
-
-enum ProgressOutput {
-    /// Print progress without a message
-    PrintNow,
-    /// Progress, message and progress report
-    TextAndReport(String, StatusValue),
-    /// Only progress report, no message and no text progress
-    Report(StatusValue),
-}
-
-impl TerminalIntegration {
-    #[cfg(test)]
-    fn new(enabled: bool) -> Self {
-        Self {
-            enabled,
-            error: false,
-        }
-    }
-
-    /// Creates a `TerminalIntegration` from Cargo's configuration.
-    /// Autodetect support if not explicitly enabled or disabled.
-    fn from_config(gctx: &GlobalContext) -> Self {
-        let enabled = gctx
-            .progress_config()
-            .term_integration
-            .unwrap_or_else(|| gctx.shell().is_err_term_integration_available());
-
-        Self {
-            enabled,
-            error: false,
-        }
-    }
-
-    fn progress_state(&self, value: StatusValue) -> StatusValue {
-        match (self.enabled, self.error) {
-            (true, false) => value,
-            (true, true) => match value {
-                StatusValue::Value(v) => StatusValue::Error(v),
-                _ => StatusValue::Error(100.0),
-            },
-            (false, _) => StatusValue::None,
-        }
-    }
-
-    pub fn remove(&self) -> StatusValue {
-        self.progress_state(StatusValue::Remove)
-    }
-
-    pub fn value(&self, percent: f64) -> StatusValue {
-        self.progress_state(StatusValue::Value(percent))
-    }
-
-    pub fn indeterminate(&self) -> StatusValue {
-        self.progress_state(StatusValue::Indeterminate)
-    }
-
-    pub fn error(&mut self) {
-        self.error = true;
-    }
-}
-
-impl std::fmt::Display for StatusValue {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // From https://conemu.github.io/en/AnsiEscapeCodes.html#ConEmu_specific_OSC
-        // ESC ] 9 ; 4 ; st ; pr ST
-        // When st is 0: remove progress.
-        // When st is 1: set progress value to pr (number, 0-100).
-        // When st is 2: set error state in taskbar, pr is optional.
-        // When st is 3: set indeterminate state, pr is ignored.
-        // When st is 4: set paused state, pr is optional.
-        let (state, progress) = match self {
-            Self::None => return Ok(()), // No output
-            Self::Remove => (0, 0.0),
-            Self::Value(v) => (1, *v),
-            Self::Indeterminate => (3, 0.0),
-            Self::Error(v) => (2, *v),
-        };
-        write!(f, "\x1b]9;4;{state};{progress:.0}\x1b\\")
-    }
+    state: Option<State>,
 }
 
 impl<'gctx> Progress<'gctx> {
+    /// Creates a new `Progress` with the [`ProgressStyle::Percentage`] style.
+    ///
+    /// See [`Progress::with_style`] for more information.
+    pub fn new(name: &str, gctx: &'gctx GlobalContext) -> Progress<'gctx> {
+        Self::with_style(name, ProgressStyle::Percentage, gctx)
+    }
+
     /// Creates a new progress bar.
     ///
     /// The first parameter is the text displayed to the left of the bar, such
@@ -205,11 +66,11 @@ impl<'gctx> Progress<'gctx> {
         let progress_config = gctx.progress_config();
         match progress_config.when {
             ProgressWhen::Always => return Progress::new_priv(name, style, gctx),
-            ProgressWhen::Never => return Progress { state: None },
+            ProgressWhen::Never => return Progress { gctx, state: None },
             ProgressWhen::Auto => {}
         }
         if gctx.shell().verbosity() == Verbosity::Quiet || dumb || is_ci() {
-            return Progress { state: None };
+            return Progress { gctx, state: None };
         }
         Progress::new_priv(name, style, gctx)
     }
@@ -221,8 +82,8 @@ impl<'gctx> Progress<'gctx> {
             .or_else(|| gctx.shell().err_width().progress_max_width());
 
         Progress {
+            gctx,
             state: width.map(|n| State {
-                gctx,
                 format: Format {
                     style,
                     max_width: n,
@@ -251,13 +112,6 @@ impl<'gctx> Progress<'gctx> {
         self.state.is_some()
     }
 
-    /// Creates a new `Progress` with the [`ProgressStyle::Percentage`] style.
-    ///
-    /// See [`Progress::with_style`] for more information.
-    pub fn new(name: &str, gctx: &'gctx GlobalContext) -> Progress<'gctx> {
-        Self::with_style(name, ProgressStyle::Percentage, gctx)
-    }
-
     /// Updates the state of the progress bar.
     ///
     /// * `cur` should be how far along the progress is.
@@ -271,6 +125,8 @@ impl<'gctx> Progress<'gctx> {
         let Some(s) = &mut self.state else {
             return Ok(());
         };
+
+        let mut shell = self.gctx.shell();
 
         // Don't update too often as it can cause excessive performance loss
         // just putting stuff onto the terminal. We also want to avoid
@@ -288,7 +144,7 @@ impl<'gctx> Progress<'gctx> {
             return Ok(());
         }
 
-        s.tick(cur, max, msg)
+        s.tick(cur, max, msg, &mut shell)
     }
 
     /// Updates the state of the progress bar.
@@ -300,8 +156,10 @@ impl<'gctx> Progress<'gctx> {
     /// `tick` too fast, and accurate information is more important than
     /// limiting the console update rate.
     pub fn tick_now(&mut self, cur: usize, max: usize, msg: &str) -> CargoResult<()> {
+        let mut shell = self.gctx.shell();
+
         match self.state {
-            Some(ref mut s) => s.tick(cur, max, msg),
+            Some(ref mut s) => s.tick(cur, max, msg, &mut shell),
             None => Ok(()),
         }
     }
@@ -326,16 +184,20 @@ impl<'gctx> Progress<'gctx> {
     /// This does not have any rate limit throttling, so be careful about
     /// calling it too often.
     pub fn print_now(&mut self, msg: &str) -> CargoResult<()> {
+        let mut shell = self.gctx.shell();
+
         match &mut self.state {
-            Some(s) => s.print(ProgressOutput::PrintNow, msg),
+            Some(s) => s.print(ProgressOutput::PrintNow, msg, &mut shell),
             None => Ok(()),
         }
     }
 
     /// Clears the progress bar from the console.
     pub fn clear(&mut self) {
+        let mut shell = self.gctx.shell();
+
         if let Some(ref mut s) = self.state {
-            s.clear();
+            s.clear(&mut shell);
         }
     }
 
@@ -347,44 +209,50 @@ impl<'gctx> Progress<'gctx> {
     }
 }
 
-impl Throttle {
-    fn new() -> Throttle {
-        Throttle {
-            first: true,
-            last_update: Instant::now(),
-        }
-    }
-
-    fn allowed(&mut self) -> bool {
-        if self.first {
-            let delay = Duration::from_millis(500);
-            if self.last_update.elapsed() < delay {
-                return false;
-            }
-        } else {
-            let interval = Duration::from_millis(100);
-            if self.last_update.elapsed() < interval {
-                return false;
-            }
-        }
-        self.update();
-        true
-    }
-
-    fn update(&mut self) {
-        self.first = false;
-        self.last_update = Instant::now();
+impl<'gctx> Drop for Progress<'gctx> {
+    fn drop(&mut self) {
+        self.clear();
     }
 }
 
-impl<'gctx> State<'gctx> {
-    fn tick(&mut self, cur: usize, max: usize, msg: &str) -> CargoResult<()> {
+/// Indicates the style of information for displaying the amount of progress.
+///
+/// See also [`Progress::print_now`] for displaying progress without a bar.
+pub enum ProgressStyle {
+    /// Displays progress as a percentage.
+    ///
+    /// Example: `Fetch [=====================>   ]  88.15%`
+    ///
+    /// This is good for large values like number of bytes downloaded.
+    Percentage,
+    /// Displays progress as a ratio.
+    ///
+    /// Example: `Building [===>                      ] 35/222`
+    ///
+    /// This is good for smaller values where the exact number is useful to see.
+    Ratio,
+    /// Does not display an exact value of how far along it is.
+    ///
+    /// Example: `Fetch [===========>                     ]`
+    ///
+    /// This is good for situations where the exact value is an approximation,
+    /// and thus there isn't anything accurate to display to the user.
+    Indeterminate,
+}
+
+struct State {
+    format: Format,
+    name: String,
+    done: bool,
+    throttle: Throttle,
+    last_line: Option<String>,
+    fixed_width: Option<usize>,
+}
+
+impl State {
+    fn tick(&mut self, cur: usize, max: usize, msg: &str, shell: &mut Shell) -> CargoResult<()> {
         if self.done {
-            write!(
-                self.gctx.shell().err(),
-                "{}",
-                self.format.term_integration.remove()
-            )?;
+            write!(shell.err(), "{}", self.format.term_integration.remove())?;
             return Ok(());
         }
 
@@ -394,16 +262,16 @@ impl<'gctx> State<'gctx> {
 
         // Write out a pretty header, then the progress bar itself, and then
         // return back to the beginning of the line for the next print.
-        self.try_update_max_width();
+        self.try_update_max_width(shell);
         if let Some(pbar) = self.format.progress(cur, max) {
-            self.print(pbar, msg)?;
+            self.print(pbar, msg, shell)?;
         }
         Ok(())
     }
 
-    fn print(&mut self, progress: ProgressOutput, msg: &str) -> CargoResult<()> {
+    fn print(&mut self, progress: ProgressOutput, msg: &str, shell: &mut Shell) -> CargoResult<()> {
         self.throttle.update();
-        self.try_update_max_width();
+        self.try_update_max_width(shell);
 
         let (mut line, report) = match progress {
             ProgressOutput::PrintNow => (String::new(), None),
@@ -415,7 +283,7 @@ impl<'gctx> State<'gctx> {
         if self.format.max_width < 15 {
             // even if we don't have space we can still output progress report
             if let Some(tb) = report {
-                write!(self.gctx.shell().err(), "{tb}\r")?;
+                write!(shell.err(), "{tb}\r")?;
             }
             return Ok(());
         }
@@ -426,8 +294,7 @@ impl<'gctx> State<'gctx> {
         }
 
         // Only update if the line has changed.
-        if self.gctx.shell().is_cleared() || self.last_line.as_ref() != Some(&line) {
-            let mut shell = self.gctx.shell();
+        if shell.is_cleared() || self.last_line.as_ref() != Some(&line) {
             shell.set_needs_clear(false);
             shell.transient_status(&self.name)?;
             if let Some(tb) = report {
@@ -442,27 +309,31 @@ impl<'gctx> State<'gctx> {
         Ok(())
     }
 
-    fn clear(&mut self) {
+    fn clear(&mut self, shell: &mut Shell) {
         // Always clear the progress report
-        let _ = write!(
-            self.gctx.shell().err(),
-            "{}",
-            self.format.term_integration.remove()
-        );
+        let _ = write!(shell.err(), "{}", self.format.term_integration.remove());
         // No need to clear if the progress is not currently being displayed.
-        if self.last_line.is_some() && !self.gctx.shell().is_cleared() {
-            self.gctx.shell().err_erase_line();
+        if self.last_line.is_some() && !shell.is_cleared() {
+            shell.err_erase_line();
             self.last_line = None;
         }
     }
 
-    fn try_update_max_width(&mut self) {
+    fn try_update_max_width(&mut self, shell: &mut Shell) {
         if self.fixed_width.is_none() {
-            if let Some(n) = self.gctx.shell().err_width().progress_max_width() {
+            if let Some(n) = shell.err_width().progress_max_width() {
                 self.format.max_width = n;
             }
         }
     }
+}
+
+struct Format {
+    style: ProgressStyle,
+    max_width: usize,
+    max_print: usize,
+    term_integration: TerminalIntegration,
+    unicode: bool,
 }
 
 impl Format {
@@ -479,7 +350,9 @@ impl Format {
         };
         let report = match self.style {
             ProgressStyle::Percentage | ProgressStyle::Ratio => {
-                self.term_integration.value(pct * 100.0)
+                let pct = (pct * 100.0) as u8;
+                let pct = pct.clamp(0, 100);
+                self.term_integration.value(pct)
             }
             ProgressStyle::Indeterminate => self.term_integration.indeterminate(),
         };
@@ -560,9 +433,133 @@ impl Format {
     }
 }
 
-impl<'gctx> Drop for State<'gctx> {
-    fn drop(&mut self) {
-        self.clear();
+struct Throttle {
+    first: bool,
+    last_update: Instant,
+}
+
+impl Throttle {
+    fn new() -> Throttle {
+        Throttle {
+            first: true,
+            last_update: Instant::now(),
+        }
+    }
+
+    fn allowed(&mut self) -> bool {
+        if self.first {
+            let delay = Duration::from_millis(500);
+            if self.last_update.elapsed() < delay {
+                return false;
+            }
+        } else {
+            let interval = Duration::from_millis(100);
+            if self.last_update.elapsed() < interval {
+                return false;
+            }
+        }
+        self.update();
+        true
+    }
+
+    fn update(&mut self) {
+        self.first = false;
+        self.last_update = Instant::now();
+    }
+}
+
+/// Controls terminal progress integration via OSC sequences.
+struct TerminalIntegration {
+    enabled: bool,
+    error: bool,
+}
+
+impl TerminalIntegration {
+    #[cfg(test)]
+    fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            error: false,
+        }
+    }
+
+    /// Creates a `TerminalIntegration` from Cargo's configuration.
+    /// Autodetect support if not explicitly enabled or disabled.
+    fn from_config(gctx: &GlobalContext) -> Self {
+        let enabled = gctx
+            .progress_config()
+            .term_integration
+            .unwrap_or_else(|| gctx.shell().is_err_term_integration_available());
+
+        Self {
+            enabled,
+            error: false,
+        }
+    }
+
+    fn progress_state(&self, value: StatusValue) -> StatusValue {
+        match (self.enabled, self.error) {
+            (true, false) => value,
+            (true, true) => match value {
+                StatusValue::Value(v) => StatusValue::Error(v),
+                _ => StatusValue::Error(100),
+            },
+            (false, _) => StatusValue::None,
+        }
+    }
+
+    pub fn remove(&self) -> StatusValue {
+        self.progress_state(StatusValue::Remove)
+    }
+
+    pub fn value(&self, percent: u8) -> StatusValue {
+        self.progress_state(StatusValue::Value(percent))
+    }
+
+    pub fn indeterminate(&self) -> StatusValue {
+        self.progress_state(StatusValue::Indeterminate)
+    }
+
+    pub fn error(&mut self) {
+        self.error = true;
+    }
+}
+
+enum ProgressOutput {
+    /// Print progress without a message
+    PrintNow,
+    /// Progress, message and progress report
+    TextAndReport(String, StatusValue),
+    /// Only progress report, no message and no text progress
+    Report(StatusValue),
+}
+
+/// A progress status value printable as an ANSI OSC 9;4 escape code.
+#[cfg_attr(test, derive(PartialEq, Debug))]
+enum StatusValue {
+    /// No output.
+    None,
+    /// Remove progress.
+    Remove,
+    /// Progress value (0-100).
+    Value(u8),
+    /// Indeterminate state (no bar, just animation)
+    Indeterminate,
+    /// Progress value in an error state (0-100).
+    Error(u8),
+}
+
+impl std::fmt::Display for StatusValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let progress = match self {
+            Self::None => TermProgress::none(),
+            Self::Remove => TermProgress::remove(),
+            Self::Value(v) => TermProgress::start().percent(*v),
+            Self::Indeterminate => TermProgress::start(),
+            Self::Error(v) => TermProgress::error().percent(*v),
+        };
+
+        progress.fmt(f)
     }
 }
 
@@ -697,7 +694,7 @@ fn test_term_integration_disabled() {
     let report = TerminalIntegration::new(false);
     let mut out = String::new();
     out.push_str(&report.remove().to_string());
-    out.push_str(&report.value(10.0).to_string());
+    out.push_str(&report.value(10).to_string());
     out.push_str(&report.indeterminate().to_string());
     assert!(out.is_empty());
 }
@@ -705,7 +702,7 @@ fn test_term_integration_disabled() {
 #[test]
 fn test_term_integration_error_state() {
     let mut report = TerminalIntegration::new(true);
-    assert_eq!(report.value(10.0), StatusValue::Value(10.0));
+    assert_eq!(report.value(10), StatusValue::Value(10));
     report.error();
-    assert_eq!(report.value(50.0), StatusValue::Error(50.0));
+    assert_eq!(report.value(50), StatusValue::Error(50));
 }

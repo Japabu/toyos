@@ -15,7 +15,6 @@
 use std::collections::HashMap;
 use std::fmt::Write;
 use std::fs;
-use std::task;
 
 use cargo::CargoResult;
 use cargo::core::Package;
@@ -133,6 +132,7 @@ fn bump_check(args: &clap::ArgMatches, gctx: &cargo::util::GlobalContext) -> Car
         // See `TO_PUBLISH` in publish.py.
         "home",
     ];
+    let crates_not_checked = ["cargo-util-terminal"];
 
     status(&format!("base commit `{}`", base_commit.id()))?;
     status(&format!("head commit `{}`", head_commit.id()))?;
@@ -149,6 +149,10 @@ fn bump_check(args: &clap::ArgMatches, gctx: &cargo::util::GlobalContext) -> Car
             let pkg_name = referenced_member.name().as_str();
 
             if crates_not_check_against_channels.contains(&pkg_name) {
+                continue;
+            }
+
+            if crates_not_checked.contains(&pkg_name) {
                 continue;
             }
 
@@ -186,6 +190,9 @@ fn bump_check(args: &clap::ArgMatches, gctx: &cargo::util::GlobalContext) -> Car
             .arg("--workspace")
             .arg("--baseline-rev")
             .arg(referenced_commit.id().to_string());
+        for krate in crates_not_checked {
+            cmd.args(&["--exclude", krate]);
+        }
         for krate in crates_not_check_against_channels {
             cmd.args(&["--exclude", krate]);
         }
@@ -208,6 +215,9 @@ fn bump_check(args: &clap::ArgMatches, gctx: &cargo::util::GlobalContext) -> Car
         .arg("check-release")
         .arg("--workspace")
         .args(&["--exclude", "cargo"]);
+    for krate in crates_not_checked {
+        cmd.args(&["--exclude", krate]);
+    }
 
     gctx.shell().status("Running", &cmd)?;
     cmd.exec()?;
@@ -433,15 +443,9 @@ fn check_crates_io<'a>(
         let current = member.version();
         let version_req = format!(">={current}");
         let query = Dependency::parse(*name, Some(&version_req), source_id)?;
-        let possibilities = loop {
-            // Exact to avoid returning all for path/git
-            match registry.query_vec(&query, QueryKind::Exact) {
-                task::Poll::Ready(res) => {
-                    break res?;
-                }
-                task::Poll::Pending => registry.block_until_ready()?,
-            }
-        };
+        // Exact to avoid returning all for path/git
+        let possibilities =
+            futures::executor::block_on(registry.query_vec(&query, QueryKind::Exact))?;
         if possibilities.is_empty() {
             tracing::trace!("dep `{name}` has no version greater than or equal to `{current}`");
         } else {

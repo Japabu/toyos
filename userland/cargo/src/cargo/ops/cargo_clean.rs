@@ -9,6 +9,7 @@ use crate::util::interning::InternedString;
 use crate::util::{GlobalContext, Progress, ProgressStyle};
 use anyhow::bail;
 use cargo_util::paths;
+use cargo_util_terminal::report::Level;
 use indexmap::{IndexMap, IndexSet};
 
 use std::ffi::OsString;
@@ -48,6 +49,22 @@ pub fn clean(ws: &Workspace<'_>, opts: &CleanOptions<'_>) -> CargoResult<()> {
     let gctx = opts.gctx;
     let mut clean_ctx = CleanContext::new(gctx);
     clean_ctx.dry_run = opts.dry_run;
+
+    const CLEAN_ABORT_NOTE: &str =
+        "cleaning has been aborted to prevent accidental deletion of unrelated files";
+
+    // make sure target_dir is a directory if it exists so that we don't delete files
+    if let Ok(meta) = fs::symlink_metadata(target_dir.as_path_unlocked()) {
+        // do not error if target_dir is symlink; let cargo delete it
+        if !meta.is_symlink() && !meta.is_dir() {
+            let title = format!("cannot clean `{}`: not a directory", target_dir.display());
+            let report = [Level::ERROR
+                .primary_title(title)
+                .element(Level::NOTE.message(CLEAN_ABORT_NOTE))];
+            gctx.shell().print_report(&report, false)?;
+            return Err(crate::AlreadyPrintedError::new(anyhow::anyhow!("")).into());
+        }
+    }
 
     if opts.doc {
         if !opts.spec.is_empty() {

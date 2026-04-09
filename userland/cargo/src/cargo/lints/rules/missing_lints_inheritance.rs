@@ -1,11 +1,11 @@
 use std::path::Path;
 
-use annotate_snippets::Group;
-use annotate_snippets::Level;
-use annotate_snippets::Origin;
-use annotate_snippets::Patch;
-use annotate_snippets::Snippet;
 use cargo_util_schemas::manifest::TomlToolLints;
+use cargo_util_terminal::report::Group;
+use cargo_util_terminal::report::Level;
+use cargo_util_terminal::report::Origin;
+use cargo_util_terminal::report::Patch;
+use cargo_util_terminal::report::Snippet;
 
 use crate::CargoResult;
 use crate::GlobalContext;
@@ -21,7 +21,6 @@ pub static LINT: &Lint = &Lint {
     desc: "missing `[lints]` to inherit `[workspace.lints]`",
     primary_group: &SUSPICIOUS,
     msrv: Some(super::CARGO_LINTS_MSRV),
-    edition_lint_opts: None,
     feature_gate: None,
     docs: Some(
         r#"
@@ -64,7 +63,6 @@ pub fn missing_lints_inheritance(
     let (lint_level, reason) = LINT.level(
         cargo_lints,
         pkg.rust_version(),
-        pkg.manifest().edition(),
         pkg.manifest().unstable_features(),
     );
 

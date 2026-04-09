@@ -11,6 +11,7 @@ pub mod backend;
 pub mod http;
 #[cfg(feature = "curl-backend")]
 pub mod http_curl;
+pub mod http_async;
 pub mod proxy;
 pub mod retry;
 pub mod sleep;
@@ -47,10 +48,10 @@ macro_rules! try_old_curl {
                 ::tracing::warn!(target: "network", "ignoring libcurl {} error: {}", $msg, e);
             }
         } else {
-            use ::anyhow::Context;
-            result.with_context(|| {
-                ::anyhow::format_err!("failed to enable {}, is curl not built right?", $msg)
-            })?;
+            if let Err(e) = &result {
+                ::tracing::error!(target: "network", "failed to enable {}, is curl not built right? error: {}", $msg, e);
+            }
+            result?;
         }
     };
 }

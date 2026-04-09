@@ -1,13 +1,13 @@
 use std::path::Path;
 
-use annotate_snippets::AnnotationKind;
-use annotate_snippets::Group;
-use annotate_snippets::Level;
-use annotate_snippets::Origin;
-use annotate_snippets::Patch;
-use annotate_snippets::Snippet;
 use cargo_util_schemas::manifest::InheritableDependency;
 use cargo_util_schemas::manifest::TomlToolLints;
+use cargo_util_terminal::report::AnnotationKind;
+use cargo_util_terminal::report::Group;
+use cargo_util_terminal::report::Level;
+use cargo_util_terminal::report::Origin;
+use cargo_util_terminal::report::Patch;
+use cargo_util_terminal::report::Snippet;
 use indexmap::IndexSet;
 
 use crate::CargoResult;
@@ -25,7 +25,6 @@ pub static LINT: &Lint = &Lint {
     desc: "unused workspace dependency",
     primary_group: &SUSPICIOUS,
     msrv: Some(super::CARGO_LINTS_MSRV),
-    edition_lint_opts: None,
     feature_gate: None,
     docs: Some(
         r#"
@@ -57,7 +56,6 @@ pub fn unused_workspace_dependencies(
     let (lint_level, reason) = LINT.level(
         cargo_lints,
         ws.lowest_rust_version(),
-        maybe_pkg.edition(),
         maybe_pkg.unstable_features(),
     );
     if lint_level == LintLevel::Allow {

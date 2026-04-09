@@ -1139,23 +1139,22 @@ fn invalid_path_with_base() {
     p.cargo("build")
         .masquerade_as_nightly_cargo(&["path-bases"])
         .with_status(101)
-        .with_stderr_data(
-            "\
+        .with_stderr_data(str![[r#"
 [ERROR] failed to get `bar` as a dependency of package `foo v0.5.0 ([ROOT]/foo)`
 
 Caused by:
   failed to load source for dependency `bar`
 
 Caused by:
-  unable to update [ROOT]/foo/shared_proj/\"
+  unable to update [ROOT]/foo/shared_proj/"
 
 Caused by:
-  failed to read `[ROOT]/foo/shared_proj/\"/Cargo.toml`
+  failed to read `[ROOT]/foo/shared_proj/"/Cargo.toml`
 
 Caused by:
   [NOT_FOUND]
-",
-        )
+
+"#]])
         .run();
 }
 
@@ -1670,11 +1669,11 @@ fn invalid_path_dep_in_workspace_with_lockfile() {
     p.cargo("check")
         .with_status(101)
         .with_stderr_data(str![[r#"
-[ERROR] no matching package found
-searched package name: `bar`
-perhaps you meant:      foo
+[ERROR] no matching package named `bar` found
 location searched: [ROOT]/foo/foo
 required by package `foo v0.5.0 ([ROOT]/foo/foo)`
+[HELP] packages with similar names: foo
+
 
 "#]])
         .run();

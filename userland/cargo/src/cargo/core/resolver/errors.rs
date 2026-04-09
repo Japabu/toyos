@@ -1,6 +1,5 @@
 use std::fmt;
 use std::fmt::Write as _;
-use std::task::Poll;
 
 use crate::core::{Dependency, PackageId, Registry, Summary};
 use crate::sources::IndexSummary;
@@ -74,7 +73,7 @@ impl From<(PackageId, ConflictReason)> for ActivateError {
 
 pub(super) fn activation_error(
     resolver_ctx: &ResolverContext,
-    registry: &mut dyn Registry,
+    registry: &impl Registry,
     parent: &Summary,
     dep: &Dependency,
     conflicting_activations: &ConflictMap,
@@ -145,10 +144,11 @@ pub(super) fn activation_error(
                     msg.push_str(link);
                     msg.push_str("` as well:\n");
                     msg.push_str(&describe_path_in_context(resolver_ctx, p));
-                    msg.push_str("\nOnly one package in the dependency graph may specify the same links value. This helps ensure that only one copy of a native library is linked in the final binary. ");
-                    msg.push_str("Try to adjust your dependencies so that only one package uses the `links = \"");
+                    msg.push_str("\nnote: only one package in the dependency graph may specify the same links value to ensure that only one copy of a native library is linked in the final binary");
+                    msg.push_str("\nfor more information, see https://doc.rust-lang.org/cargo/reference/resolver.html#links");
+                    msg.push_str("\nhelp: try to adjust your dependencies so that only one package uses the `links = \"");
                     msg.push_str(link);
-                    msg.push_str("\"` value. For more information, see https://doc.rust-lang.org/cargo/reference/resolver.html#links.");
+                    msg.push_str("\"` value");
                 }
                 ConflictReason::MissingFeature(feature) => {
                     msg.push_str("\n\npackage `");
@@ -162,16 +162,14 @@ pub(super) fn activation_error(
                     msg.push_str("` does not have that feature.\n");
                     let latest = candidates.last().expect("in the non-empty branch");
                     if let Some(closest) = closest(feature, latest.features().keys(), |k| k) {
-                        msg.push_str(" package `");
-                        msg.push_str(&*dep.package_name());
-                        msg.push_str("` does have feature `");
+                        msg.push_str("help: there is a feature `");
                         msg.push_str(closest);
-                        msg.push_str("`\n");
+                        msg.push_str("` with a similar name\n");
                     } else if !latest.features().is_empty() {
                         let mut features: Vec<_> =
                             latest.features().keys().map(|f| f.as_str()).collect();
                         features.sort();
-                        msg.push_str(" available features: ");
+                        msg.push_str("help: available features: ");
                         msg.push_str(&features.join(", "));
                         msg.push_str("\n");
                     }
@@ -188,7 +186,7 @@ pub(super) fn activation_error(
                     msg.push_str(&*dep.package_name());
                     msg.push_str("` does not have that feature.\n");
                     msg.push_str(
-                        " A required dependency with that name exists, \
+                        "note: a required dependency with that name exists, \
                          but only optional dependencies can be used as features.\n",
                     );
                     // p == parent so the full path is redundant.
@@ -204,7 +202,7 @@ pub(super) fn activation_error(
                     msg.push_str(&*dep.package_name());
                     msg.push_str("` does not have that feature.\n");
                     msg.push_str(
-                        " An optional dependency with that name exists, \
+                        "note: an optional dependency with that name exists, \
                          but that dependency uses the \"dep:\" \
                          syntax in the features table, so it does not have an \
                          implicit feature with that name.\n",
@@ -216,7 +214,7 @@ pub(super) fn activation_error(
 
         if has_semver {
             // Group these errors together.
-            msg.push_str("\n\nall possible versions conflict with previously selected packages.");
+            msg.push_str("\n\nall possible versions conflict with previously selected packages");
             for (p, r) in &conflicting_activations {
                 if let ConflictReason::Semver = r {
                     msg.push_str("\n\n  previously selected ");
@@ -336,7 +334,7 @@ pub(super) fn activation_error(
         if let Some(pre) = candidates.iter().find(|c| c.version().is_prerelease()) {
             let _ = write!(
                 &mut hints,
-                "\nif you are looking for the prerelease package it needs to be specified explicitly"
+                "\nhelp: if you are looking for the prerelease package it needs to be specified explicitly"
             );
             let _ = write!(
                 &mut hints,
@@ -352,15 +350,14 @@ pub(super) fn activation_error(
         if dep.source_id().is_path() && dep.version_req().is_locked() {
             let _ = write!(
                 &mut hints,
-                "\nconsider running `cargo update` to update \
-                          a path dependency's locked version",
+                "\nhelp: to update a path dependency's locked version, run `cargo update`",
             );
         }
 
         if registry.is_replaced(dep.source_id()) {
             let _ = write!(
                 &mut hints,
-                "\nperhaps a crate was updated and forgotten to be re-vendored?"
+                "\nnote: perhaps a crate was updated and forgotten to be re-vendored?"
             );
         }
     } else if let Some(name_candidates) = alt_names(registry, dep) {
@@ -368,19 +365,20 @@ pub(super) fn activation_error(
             Ok(c) => c,
             Err(e) => return to_resolve_err(e),
         };
-        let _ = writeln!(&mut msg, "no matching package found",);
-        let _ = writeln!(&mut msg, "searched package name: `{}`", dep.package_name());
+        let _ = writeln!(
+            &mut msg,
+            "no matching package named `{}` found",
+            dep.package_name()
+        );
+
         let mut names = name_candidates
             .iter()
             .take(3)
             .map(|c| c.1.name().as_str())
             .collect::<Vec<_>>();
-
         if name_candidates.len() > 3 {
             names.push("...");
         }
-        // Vertically align first suggestion with missing crate name
-        // so a typo jumps out at you.
         let suggestions =
             names
                 .iter()
@@ -390,7 +388,10 @@ pub(super) fn activation_error(
                     i if names.len() - 1 == i && name_candidates.len() <= 3 => acc + " or " + el,
                     _ => acc + ", " + el,
                 });
-        let _ = writeln!(&mut msg, "perhaps you meant:      {suggestions}");
+        let _ = writeln!(
+            &mut hints,
+            "\nhelp: packages with similar names: {suggestions}"
+        );
     } else {
         let _ = writeln!(
             &mut msg,
@@ -414,10 +415,10 @@ pub(super) fn activation_error(
         if let Some(offline_flag) = gctx.offline_flag() {
             let _ = write!(
                 &mut hints,
-                "\nAs a reminder, you're using offline mode ({offline_flag}) \
-                 which can sometimes cause surprising resolution failures, \
-                 if this error is too confusing you may wish to retry \
-                 without `{offline_flag}`.",
+                "\nnote: offline mode (via `{offline_flag}`) \
+                 can sometimes cause surprising resolution failures\
+                 \nhelp: if this error is too confusing you may wish to retry \
+                 without `{offline_flag}`",
             );
         }
     }
@@ -428,22 +429,13 @@ pub(super) fn activation_error(
 // Maybe the user mistyped the ver_req? Like `dep="2"` when `dep="0.2"`
 // was meant. So we re-query the registry with `dep="*"` so we can
 // list a few versions that were actually found.
-fn alt_versions(
-    registry: &mut dyn Registry,
-    dep: &Dependency,
-) -> Option<CargoResult<Vec<Summary>>> {
+fn alt_versions(registry: &impl Registry, dep: &Dependency) -> Option<CargoResult<Vec<Summary>>> {
     let mut wild_dep = dep.clone();
     wild_dep.set_version_req(OptVersionReq::Any);
 
-    let candidates = loop {
-        match registry.query_vec(&wild_dep, QueryKind::Exact) {
-            Poll::Ready(Ok(candidates)) => break candidates,
-            Poll::Ready(Err(e)) => return Some(Err(e)),
-            Poll::Pending => match registry.block_until_ready() {
-                Ok(()) => continue,
-                Err(e) => return Some(Err(e)),
-            },
-        }
+    let candidates = match crate::util::block_on(registry.query_vec(&wild_dep, QueryKind::Exact)) {
+        Ok(candidates) => candidates,
+        Err(e) => return Some(Err(e)),
     };
     let mut candidates: Vec<_> = candidates.into_iter().map(|s| s.into_summary()).collect();
     candidates.sort_unstable_by(|a, b| b.version().cmp(a.version()));
@@ -456,19 +448,14 @@ fn alt_versions(
 
 /// Maybe something is wrong with the available versions
 fn rejected_versions(
-    registry: &mut dyn Registry,
+    registry: &impl Registry,
     dep: &Dependency,
 ) -> Option<CargoResult<Vec<IndexSummary>>> {
-    let mut version_candidates = loop {
-        match registry.query_vec(&dep, QueryKind::RejectedVersions) {
-            Poll::Ready(Ok(candidates)) => break candidates,
-            Poll::Ready(Err(e)) => return Some(Err(e)),
-            Poll::Pending => match registry.block_until_ready() {
-                Ok(()) => continue,
-                Err(e) => return Some(Err(e)),
-            },
-        }
-    };
+    let mut version_candidates =
+        match crate::util::block_on(registry.query_vec(&dep, QueryKind::RejectedVersions)) {
+            Ok(candidates) => candidates,
+            Err(e) => return Some(Err(e)),
+        };
     version_candidates.sort_unstable_by_key(|a| a.as_summary().version().clone());
     if version_candidates.is_empty() {
         None
@@ -480,22 +467,17 @@ fn rejected_versions(
 /// Maybe the user mistyped the name? Like `dep-thing` when `Dep_Thing`
 /// was meant. So we try asking the registry for a `fuzzy` search for suggestions.
 fn alt_names(
-    registry: &mut dyn Registry,
+    registry: &impl Registry,
     dep: &Dependency,
 ) -> Option<CargoResult<Vec<(usize, Summary)>>> {
     let mut wild_dep = dep.clone();
     wild_dep.set_version_req(OptVersionReq::Any);
 
-    let name_candidates = loop {
-        match registry.query_vec(&wild_dep, QueryKind::AlternativeNames) {
-            Poll::Ready(Ok(candidates)) => break candidates,
-            Poll::Ready(Err(e)) => return Some(Err(e)),
-            Poll::Pending => match registry.block_until_ready() {
-                Ok(()) => continue,
-                Err(e) => return Some(Err(e)),
-            },
-        }
-    };
+    let name_candidates =
+        match crate::util::block_on(registry.query_vec(&wild_dep, QueryKind::AlternativeNames)) {
+            Ok(candidates) => candidates,
+            Err(e) => return Some(Err(e)),
+        };
     let mut name_candidates: Vec<_> = name_candidates
         .into_iter()
         .map(|s| s.into_summary())

@@ -122,7 +122,7 @@ mod version_prefs;
 pub fn resolve(
     summaries: &[(Summary, ResolveOpts)],
     replacements: &[(PackageIdSpec, Dependency)],
-    registry: &mut dyn Registry,
+    registry: &impl Registry,
     version_prefs: &VersionPreferences,
     resolve_version: ResolveVersion,
     gctx: Option<&GlobalContext>,
@@ -146,10 +146,8 @@ pub fn resolve(
             gctx,
             &mut past_conflicting_activations,
         )?;
-        if registry.reset_pending() {
+        if registry.wait()? {
             break resolver_ctx;
-        } else {
-            registry.registry.block_until_ready()?;
         }
     };
 
@@ -194,7 +192,7 @@ pub fn resolve(
 /// If all dependencies can be activated and resolved to a version in the
 /// dependency graph, `cx` is returned.
 fn activate_deps_loop(
-    registry: &mut RegistryQueryer<'_>,
+    registry: &mut RegistryQueryer<'_, impl Registry>,
     summaries: &[(Summary, ResolveOpts)],
     first_version: Option<VersionOrdering>,
     gctx: Option<&GlobalContext>,
@@ -350,7 +348,7 @@ fn activate_deps_loop(
                         debug!("no candidates found");
                         Err(errors::activation_error(
                             &resolver_ctx,
-                            registry.registry,
+                            registry.registry(),
                             &parent,
                             &dep,
                             &conflicting_activations,
@@ -622,7 +620,7 @@ fn activate_deps_loop(
 /// iterate through next.
 fn activate(
     cx: &mut ResolverContext,
-    registry: &mut RegistryQueryer<'_>,
+    registry: &mut RegistryQueryer<'_, impl Registry>,
     parent: Option<(&Summary, &Dependency)>,
     candidate: Summary,
     first_version: Option<VersionOrdering>,
@@ -648,7 +646,7 @@ fn activate(
             // does. TBH it basically cause panics in the test suite if
             // `parent` is passed through here and `[replace]` is otherwise
             // on life support so it's not critical to fix bugs anyway per se.
-            if cx.flag_activated(replace, opts, None)? && activated {
+            if cx.flag_activated(&replace, opts, None)? && activated {
                 return Ok(None);
             }
             trace!(
@@ -808,7 +806,7 @@ impl RemainingCandidates {
 /// It will add the new conflict to the cache if one is found.
 fn generalize_conflicting(
     cx: &ResolverContext,
-    registry: &mut RegistryQueryer<'_>,
+    registry: &mut RegistryQueryer<'_, impl Registry>,
     past_conflicting_activations: &mut conflict_cache::ConflictCache,
     parent: &Summary,
     dep: &Dependency,
@@ -848,8 +846,8 @@ fn generalize_conflicting(
             // to be conflicting, then we can just say that we conflict with the parent.
             if let Some(others) = registry
                 .query(critical_parents_dep, first_version)
-                .expect("an already used dep now error!?")
                 .expect("an already used dep now pending!?")
+                .expect("an already used dep now error!?")
                 .iter()
                 .rev() // the last one to be tried is the least likely to be in the cache, so start with that.
                 .map(|other| {

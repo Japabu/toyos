@@ -7,9 +7,10 @@ use annotate_snippets::{Renderer, Report};
 use anstream::AutoStream;
 use anstyle::Style;
 
-use crate::util::errors::CargoResult;
-use crate::util::hostname;
-use crate::util::style::*;
+use crate::CargoResult;
+use crate::style::*;
+
+pub use anstyle_hyperlink::Hyperlink;
 
 /// An abstraction around console output that remembers preferences for output
 /// verbosity and color.
@@ -22,7 +23,6 @@ pub struct Shell {
     /// Flag that indicates the current line needs to be cleared before
     /// printing. Used when a progress bar is currently displayed.
     needs_clear: bool,
-    hostname: Option<String>,
 }
 
 impl fmt::Debug for Shell {
@@ -62,7 +62,6 @@ impl Shell {
             },
             verbosity: Verbosity::Verbose,
             needs_clear: false,
-            hostname: None,
         }
     }
 
@@ -72,7 +71,6 @@ impl Shell {
             output: ShellOut::Write(AutoStream::never(out)), // strip all formatting on write
             verbosity: Verbosity::Verbose,
             needs_clear: false,
-            hostname: None,
         }
     }
 
@@ -334,8 +332,10 @@ impl Shell {
                 stdout, hyperlinks, ..
             } => stdout.current_choice() == anstream::ColorChoice::AlwaysAnsi && *hyperlinks,
         };
-        Hyperlink {
-            url: supports_hyperlinks.then_some(url),
+        if supports_hyperlinks {
+            Hyperlink::with_url(url)
+        } else {
+            Hyperlink::default()
         }
     }
 
@@ -347,39 +347,20 @@ impl Shell {
             } => stderr.current_choice() == anstream::ColorChoice::AlwaysAnsi && *hyperlinks,
         };
         if supports_hyperlinks {
-            Hyperlink { url: Some(url) }
+            Hyperlink::with_url(url)
         } else {
-            Hyperlink { url: None }
+            Hyperlink::default()
         }
     }
 
-    pub fn out_file_hyperlink(&mut self, path: &std::path::Path) -> Hyperlink<url::Url> {
-        let url = self.file_hyperlink(path);
+    pub fn out_file_hyperlink(&mut self, path: &std::path::Path) -> Hyperlink<String> {
+        let url = anstyle_hyperlink::path_to_url(path);
         url.map(|u| self.out_hyperlink(u)).unwrap_or_default()
     }
 
-    pub fn err_file_hyperlink(&mut self, path: &std::path::Path) -> Hyperlink<url::Url> {
-        let url = self.file_hyperlink(path);
+    pub fn err_file_hyperlink(&mut self, path: &std::path::Path) -> Hyperlink<String> {
+        let url = anstyle_hyperlink::path_to_url(path);
         url.map(|u| self.err_hyperlink(u)).unwrap_or_default()
-    }
-
-    fn file_hyperlink(&mut self, path: &std::path::Path) -> Option<url::Url> {
-        let mut url = url::Url::from_file_path(path).ok()?;
-        // Do a best-effort of setting the host in the URL to avoid issues with opening a link
-        // scoped to the computer you've SSH'ed into
-        let hostname = if cfg!(windows) {
-            // Not supported correctly on windows
-            None
-        } else {
-            if let Some(hostname) = self.hostname.as_deref() {
-                Some(hostname)
-            } else {
-                self.hostname = hostname().ok().and_then(|h| h.into_string().ok());
-                self.hostname.as_deref()
-            }
-        };
-        let _ = url.set_host(hostname);
-        Some(url)
     }
 
     fn unstable_flags_rustc_unicode(&self) -> bool {
@@ -392,7 +373,7 @@ impl Shell {
         }
     }
 
-    pub(crate) fn set_unstable_flags_rustc_unicode(&mut self, yes: bool) -> CargoResult<()> {
+    pub fn set_unstable_flags_rustc_unicode(&mut self, yes: bool) -> CargoResult<()> {
         if let ShellOut::Stream {
             unstable_flags_rustc_unicode,
             ..
@@ -631,82 +612,8 @@ fn supports_hyperlinks() -> bool {
 }
 
 /// Determines whether the terminal supports ANSI OSC 9;4.
-#[expect(
-    clippy::disallowed_methods,
-    reason = "reading the state of the system, not config"
-)]
 fn supports_term_integration(stream: &dyn IsTerminal) -> bool {
-    let windows_terminal = std::env::var("WT_SESSION").is_ok();
-    let conemu = std::env::var("ConEmuANSI").ok() == Some("ON".into());
-    let wezterm = std::env::var("TERM_PROGRAM").ok() == Some("WezTerm".into());
-    let ghostty = std::env::var("TERM_PROGRAM").ok() == Some("ghostty".into());
-    // iTerm added OSC 9;4 support in v3.6.6, which we can check for.
-    // For context: https://github.com/rust-lang/cargo/pull/16506#discussion_r2706584034
-    let iterm = std::env::var("TERM_PROGRAM").ok() == Some("iTerm.app".into())
-        && std::env::var("TERM_FEATURES")
-            .ok()
-            .is_some_and(|v| term_features_has_progress(&v));
-
-    (windows_terminal || conemu || wezterm || ghostty || iterm) && stream.is_terminal()
-}
-
-// For iTerm, the TERM_FEATURES value "P" indicates OSC 9;4 support.
-// Context: https://iterm2.com/feature-reporting/
-fn term_features_has_progress(value: &str) -> bool {
-    let mut current = String::new();
-
-    for ch in value.chars() {
-        if !ch.is_ascii_alphanumeric() {
-            break;
-        }
-        if ch.is_ascii_uppercase() {
-            if current == "P" {
-                return true;
-            }
-            current.clear();
-            current.push(ch);
-        } else {
-            current.push(ch);
-        }
-    }
-    current == "P"
-}
-
-#[cfg(test)]
-mod tests {
-    use super::term_features_has_progress;
-
-    #[test]
-    fn term_features_progress_detection() {
-        // With PROGRESS feature ("P")
-        assert!(term_features_has_progress("MBT2ScP"));
-
-        // Without PROGRESS feature
-        assert!(!term_features_has_progress("MBT2Sc"));
-    }
-}
-
-pub struct Hyperlink<D: fmt::Display> {
-    url: Option<D>,
-}
-
-impl<D: fmt::Display> Default for Hyperlink<D> {
-    fn default() -> Self {
-        Self { url: None }
-    }
-}
-
-impl<D: fmt::Display> fmt::Display for Hyperlink<D> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let Some(url) = self.url.as_ref() else {
-            return Ok(());
-        };
-        if f.alternate() {
-            write!(f, "\x1B]8;;\x1B\\")
-        } else {
-            write!(f, "\x1B]8;;{url}\x1B\\")
-        }
-    }
+    anstyle_progress::supports_term_progress(stream.is_terminal())
 }
 
 #[cfg(unix)]

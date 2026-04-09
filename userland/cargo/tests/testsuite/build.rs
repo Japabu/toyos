@@ -10,7 +10,6 @@ use crate::utils::cargo_exe;
 use crate::utils::cargo_process;
 use crate::utils::tools;
 use cargo::GlobalContext;
-use cargo::core::Shell;
 use cargo::core::Workspace;
 use cargo::core::compiler::UserIntent;
 use cargo::ops::CompileOptions;
@@ -23,6 +22,7 @@ use cargo_test_support::{
     main_file, paths, process, project, rustc_host, sleep_ms, symlink_supported, t,
 };
 use cargo_util::paths::dylib_path_envvar;
+use cargo_util_terminal::Shell;
 
 #[cargo_test]
 fn cargo_compile_simple() {
@@ -1412,7 +1412,7 @@ fn incompatible_dependencies() {
     ... which satisfies dependency `qux = "^0.1.0"` of package `foo v0.0.1 ([ROOT]/foo)`
 versions that meet the requirements `>=1.0.1` are: 1.0.2, 1.0.1
 
-all possible versions conflict with previously selected packages.
+all possible versions conflict with previously selected packages
 
   previously selected package `bad v1.0.0`
     ... which satisfies dependency `bad = "=1.0.0"` of package `baz v0.1.0`
@@ -1459,7 +1459,7 @@ fn incompatible_dependencies_with_multi_semver() {
     ... required by package `foo v0.0.1 ([ROOT]/foo)`
 versions that meet the requirements `>=1.0.1, <=2.0.0` are: 2.0.0, 1.0.1
 
-all possible versions conflict with previously selected packages.
+all possible versions conflict with previously selected packages
 
   previously selected package `bad v2.0.1`
     ... which satisfies dependency `bad = ">=2.0.1"` of package `baz v0.1.0`
@@ -4531,6 +4531,59 @@ fn rustc_wrapper_queries() {
             "[..]running [..]rustc-echo-wrapper[EXE] rustc - --crate-name ___ --print[..]",
         )
         .run();
+}
+
+#[cargo_test]
+fn rustc_wrapper_vv_probe_has_cargo_env() {
+    // Verify that the CARGO env var is set during the -vV probe,
+    // so that wrappers like sccache can detect the workspace wrapper pattern.
+    // See https://github.com/rust-lang/cargo/issues/16805
+    let p = project().file("src/lib.rs", "").build();
+    let marker_dir = p.build_dir().join("cargo-env-check");
+    std::fs::create_dir_all(&marker_dir).unwrap();
+
+    let wrapper_project = project()
+        .at("cargo-env-checker")
+        .file("Cargo.toml", &basic_manifest("cargo-env-checker", "1.0.0"))
+        .file(
+            "src/main.rs",
+            r#"
+            fn main() {
+                let args: Vec<_> = std::env::args().collect();
+                // When invoked for the -vV probe, record whether CARGO is set.
+                if args.iter().any(|a| a == "-vV") {
+                    if let Ok(dir) = std::env::var("CARGO_ENV_CHECK_DIR") {
+                        let has_cargo = std::env::var("CARGO").is_ok();
+                        let _ = std::fs::write(
+                            format!("{dir}/cargo_env_in_vv"),
+                            format!("{has_cargo}"),
+                        );
+                    }
+                }
+                let status = std::process::Command::new(&args[1])
+                    .args(&args[2..])
+                    .status()
+                    .unwrap();
+                std::process::exit(status.code().unwrap_or(1));
+            }
+            "#,
+        )
+        .build();
+    wrapper_project.cargo("build").run();
+    let wrapper = wrapper_project.bin("cargo-env-checker");
+
+    p.cargo("build")
+        .env_remove("CARGO")
+        .env("CARGO_ENV_CHECK_DIR", &marker_dir)
+        .env("RUSTC_WRAPPER", &wrapper)
+        .env("RUSTC_WORKSPACE_WRAPPER", &wrapper)
+        .run();
+
+    let result = std::fs::read_to_string(marker_dir.join("cargo_env_in_vv")).unwrap();
+    assert_eq!(
+        result, "true",
+        "CARGO env var should be set during -vV probe for wrapper compatibility"
+    );
 }
 
 #[cargo_test]

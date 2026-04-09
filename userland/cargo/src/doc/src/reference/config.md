@@ -605,7 +605,8 @@ order, with the first one being used:
 
 1. `CARGO_ENCODED_RUSTDOCFLAGS` environment variable.
 2. `RUSTDOCFLAGS` environment variable.
-3. All matching `target.<triple>.rustdocflags` config entries joined together.
+3. All matching `target.<triple>.rustdocflags` and `target.<cfg>.rustdocflags`
+  config entries joined together.
 4. `build.rustdocflags` config value.
 
 Additional flags may also be passed with the [`cargo rustdoc`] command.
@@ -1345,9 +1346,9 @@ Specifies the linker which is passed to `rustc` (via [`-C linker`]) when the
 
 #### `target.<cfg>.linker`
 This is similar to the [target linker](#targettriplelinker), but using
-a [`cfg()` expression]. If both a [`<triple>`] and `<cfg>` runner match,
+a [`cfg()` expression]. If both a [`<triple>`] and `<cfg>` linker match,
 the `<triple>` will take precedence. It is an error if more than one
-`<cfg>` runner matches the current target.
+`<cfg>` linker matches the current target.
 
 #### `target.<triple>.runner`
 * Type: string or array of strings ([program path with args])
@@ -1393,6 +1394,12 @@ The value may be an array of strings or a space-separated string.
 
 See [`build.rustdocflags`](#buildrustdocflags) for more details on the different
 ways to specific extra flags.
+
+#### `target.<cfg>.rustdocflags`
+
+This is similar to the [target rustdocflags](#targettriplerustdocflags), but
+using a [`cfg()` expression]. If several `<cfg>` and [`<triple>`] entries
+match the current target, the flags are joined together.
 
 #### `target.<triple>.<links>`
 

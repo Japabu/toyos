@@ -2,7 +2,6 @@ use crate::core::Registry as _;
 use crate::core::dependency::Dependency;
 use crate::core::registry::PackageRegistry;
 use crate::core::resolver::features::{CliFeatures, HasDevUnits};
-use crate::core::shell::Verbosity;
 use crate::core::{PackageId, PackageIdSpec, PackageIdSpecQuery};
 use crate::core::{Resolve, SourceId, Workspace};
 use crate::ops;
@@ -17,6 +16,7 @@ use crate::util::{CargoResult, VersionExt};
 use crate::util::{OptVersionReq, style};
 use anyhow::Context as _;
 use cargo_util_schemas::core::PartialVersion;
+use cargo_util_terminal::Verbosity;
 use indexmap::{IndexMap, IndexSet};
 use itertools::Itertools;
 use semver::{Op, Version, VersionReq};
@@ -370,16 +370,7 @@ fn upgrade_dependency(
     let query =
         crate::core::dependency::Dependency::parse(name, None, dependency.source_id().clone())?;
 
-    let possibilities = {
-        loop {
-            match registry.query_vec(&query, QueryKind::Exact) {
-                std::task::Poll::Ready(res) => {
-                    break res?;
-                }
-                std::task::Poll::Pending => registry.block_until_ready()?,
-            }
-        }
-    };
+    let possibilities = crate::util::block_on(registry.query_vec(&query, QueryKind::Exact))?;
 
     let latest = if !possibilities.is_empty() {
         possibilities
@@ -576,14 +567,7 @@ fn print_lockfile_generation(
         match change.kind {
             PackageChangeKind::Added => {
                 let possibilities = if let Some(query) = change.alternatives_query() {
-                    loop {
-                        match registry.query_vec(&query, QueryKind::Exact) {
-                            std::task::Poll::Ready(res) => {
-                                break res?;
-                            }
-                            std::task::Poll::Pending => registry.block_until_ready()?,
-                        }
-                    }
+                    crate::util::block_on(registry.query_vec(&query, QueryKind::Exact))?
                 } else {
                     vec![]
                 };
@@ -639,14 +623,7 @@ fn print_lockfile_sync(
             | PackageChangeKind::Upgraded
             | PackageChangeKind::Downgraded => {
                 let possibilities = if let Some(query) = change.alternatives_query() {
-                    loop {
-                        match registry.query_vec(&query, QueryKind::Exact) {
-                            std::task::Poll::Ready(res) => {
-                                break res?;
-                            }
-                            std::task::Poll::Pending => registry.block_until_ready()?,
-                        }
-                    }
+                    crate::util::block_on(registry.query_vec(&query, QueryKind::Exact))?
                 } else {
                     vec![]
                 };
@@ -688,14 +665,7 @@ fn print_lockfile_updates(
     let mut unchanged_behind = 0;
     for change in changes.values() {
         let possibilities = if let Some(query) = change.alternatives_query() {
-            loop {
-                match registry.query_vec(&query, QueryKind::Exact) {
-                    std::task::Poll::Ready(res) => {
-                        break res?;
-                    }
-                    std::task::Poll::Pending => registry.block_until_ready()?,
-                }
-            }
+            crate::util::block_on(registry.query_vec(&query, QueryKind::Exact))?
         } else {
             vec![]
         };

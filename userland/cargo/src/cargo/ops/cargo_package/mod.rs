@@ -5,11 +5,8 @@ use std::fs::File;
 use std::io::SeekFrom;
 use std::io::prelude::*;
 use std::path::{Path, PathBuf};
-use std::task::Poll;
 
 use crate::core::PackageIdSpecQuery;
-use crate::core::Shell;
-use crate::core::Verbosity;
 use crate::core::Workspace;
 use crate::core::dependency::DepKind;
 use crate::core::manifest::Target;
@@ -32,12 +29,15 @@ use crate::util::errors::ManifestError;
 use crate::util::restricted_names;
 use crate::util::toml::prepare_for_publish;
 use crate::{drop_println, ops};
-use annotate_snippets::Level;
 use anyhow::{Context as _, bail};
 use cargo_util::paths;
 use cargo_util_schemas::index::{IndexPackage, RegistryDependency};
 use cargo_util_schemas::messages;
+use cargo_util_terminal::report::Level;
+use cargo_util_terminal::{Shell, Verbosity};
 use flate2::{Compression, GzBuilder};
+use futures::TryStreamExt;
+use futures::stream::FuturesUnordered;
 use tar::{Builder, EntryType, Header, HeaderMode};
 use tracing::debug;
 use unicase::Ascii as UncasedAscii;
@@ -469,7 +469,7 @@ fn prepare_archive(
     opts: &PackageOpts<'_>,
 ) -> CargoResult<Vec<ArchiveFile>> {
     let gctx = ws.gctx();
-    let mut src = PathSource::new(pkg.root(), pkg.package_id().source_id(), gctx);
+    let src = PathSource::new(pkg.root(), pkg.package_id().source_id(), gctx);
     src.load()?;
 
     if opts.check_metadata {
@@ -1036,38 +1036,30 @@ pub fn check_yanked(
     // maybe updating files, so be sure to lock it here.
     let _lock = gctx.acquire_package_cache_lock(CacheLockMode::DownloadExclusive)?;
 
-    let mut sources = pkg_set.sources_mut();
-    let mut pending: Vec<PackageId> = resolve.iter().collect();
-    let mut results = Vec::new();
-    for (_id, source) in sources.sources_mut() {
+    for (_id, source) in pkg_set.sources().iter() {
         source.invalidate_cache();
     }
-    while !pending.is_empty() {
-        pending.retain(|pkg_id| {
-            if let Some(source) = sources.get_mut(pkg_id.source_id()) {
-                match source.is_yanked(*pkg_id) {
-                    Poll::Ready(result) => results.push((*pkg_id, result)),
-                    Poll::Pending => return true,
-                }
-            }
-            false
-        });
-        for (_id, source) in sources.sources_mut() {
-            source.block_until_ready()?;
-        }
-    }
 
-    for (pkg_id, is_yanked) in results {
-        if is_yanked? {
-            gctx.shell().warn(format!(
-                "package `{}` in Cargo.lock is yanked in registry `{}`, {}",
-                pkg_id,
-                pkg_id.source_id().display_registry_name(),
-                hint
-            ))?;
-        }
-    }
-    Ok(())
+    let mut futures = resolve
+        .iter()
+        .map(|pkg_id| async move {
+            if let Some(source) = pkg_set.sources().get(pkg_id.source_id())
+                && source.is_yanked(pkg_id).await?
+            {
+                gctx.shell().warn(format!(
+                    "package `{}` in Cargo.lock is yanked in registry `{}`, {}",
+                    pkg_id,
+                    pkg_id.source_id().display_registry_name(),
+                    hint
+                ))?;
+            }
+            CargoResult::Ok(())
+        })
+        .collect::<FuturesUnordered<_>>();
+    crate::util::block_on(async {
+        while futures.try_next().await?.is_some() {}
+        CargoResult::Ok(())
+    })
 }
 
 // It can often be the case that files of a particular name on one platform

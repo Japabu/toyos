@@ -607,6 +607,7 @@ pub struct Dependency {
 enum EntryData {
     Regular(String),
     Symlink(PathBuf),
+    Directory,
 }
 
 /// A file to be created in a package.
@@ -823,7 +824,6 @@ impl HttpServer {
                 url,
                 body,
             };
-            println!("req: {:#?}", req);
             let response = self.route(&req);
             let buf = buf.get_mut();
             write!(buf, "HTTP/1.1 {}\r\n", response.code).unwrap();
@@ -1029,7 +1029,7 @@ impl HttpServer {
         Response {
             code: 401,
             headers: vec![
-                r#"WWW-Authenticate: Cargo login_url="https://test-registry-login/me""#.to_string(),
+                r#"www-authenticate: Cargo login_url="https://test-registry-login/me""#.to_string(),
             ],
             body: b"Unauthorized message from server.".to_vec(),
         }
@@ -1325,6 +1325,17 @@ impl Package {
         self.files.push(PackageFile {
             path: dst.to_string(),
             contents: EntryData::Symlink(src.into()),
+            mode: DEFAULT_MODE,
+            extra: false,
+        });
+        self
+    }
+
+    /// Adds an empty directory at the given path.
+    pub fn directory(&mut self, path: &str) -> &mut Package {
+        self.files.push(PackageFile {
+            path: path.to_string(),
+            contents: EntryData::Directory,
             mode: DEFAULT_MODE,
             extra: false,
         });
@@ -1735,6 +1746,10 @@ impl Package {
         mode: u32,
         contents: &EntryData,
     ) {
+        // Unfortunately we cannot use GNU headers with dynamic extensions for
+        // long paths because that would cause package checksums to change
+        // based on whether or not the tests are running in a long directory
+        // name.
         let mut header = Header::new_ustar();
         let contents = match contents {
             EntryData::Regular(contents) => contents.as_str(),
@@ -1742,6 +1757,10 @@ impl Package {
                 header.set_entry_type(tar::EntryType::Symlink);
                 t!(header.set_link_name(src));
                 "" // Symlink has no contents.
+            }
+            EntryData::Directory => {
+                header.set_entry_type(tar::EntryType::Directory);
+                ""
             }
         };
         header.set_size(contents.len() as u64);

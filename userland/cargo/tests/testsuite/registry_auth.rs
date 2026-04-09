@@ -223,8 +223,15 @@ fn bad_environment_token_with_asymmetric_subject() {
 [ERROR] failed to get `bar` as a dependency of package `foo v0.0.1 ([ROOT]/foo)`
 
 Caused by:
+  failed to load source for dependency `bar`
+
+Caused by:
+  unable to update registry `alternative`
+
+Caused by:
   token rejected for `alternative`, please run `cargo login --registry alternative`
   or use environment variable CARGO_REGISTRIES_ALTERNATIVE_TOKEN
+  [NOTE] the token does not include an authentication scheme
 
 Caused by:
   failed to get successful HTTP response from `http://127.0.0.1:[..]/index/config.json`, got 401
@@ -258,8 +265,15 @@ fn bad_environment_token_with_asymmetric_incorrect_subject() {
 [ERROR] failed to get `bar` as a dependency of package `foo v0.0.1 ([ROOT]/foo)`
 
 Caused by:
+  failed to load source for dependency `bar`
+
+Caused by:
+  unable to update registry `alternative`
+
+Caused by:
   token rejected for `alternative`, please run `cargo login --registry alternative`
   or use environment variable CARGO_REGISTRIES_ALTERNATIVE_TOKEN
+  [NOTE] the token does not include an authentication scheme
 
 Caused by:
   failed to get successful HTTP response from `http://127.0.0.1:[..]/index/config.json`, got 401
@@ -296,8 +310,15 @@ fn bad_environment_token_with_incorrect_asymmetric() {
 [ERROR] failed to get `bar` as a dependency of package `foo v0.0.1 ([ROOT]/foo)`
 
 Caused by:
+  failed to load source for dependency `bar`
+
+Caused by:
+  unable to update registry `alternative`
+
+Caused by:
   token rejected for `alternative`, please run `cargo login --registry alternative`
   or use environment variable CARGO_REGISTRIES_ALTERNATIVE_TOKEN
+  [NOTE] the token does not include an authentication scheme
 
 Caused by:
   failed to get successful HTTP response from `http://127.0.0.1:[..]/index/config.json`, got 401
@@ -324,6 +345,12 @@ fn missing_token() {
         .with_stderr_data(str![[r#"
 [UPDATING] `alternative` index
 [ERROR] failed to get `bar` as a dependency of package `foo v0.0.1 ([ROOT]/foo)`
+
+Caused by:
+  failed to load source for dependency `bar`
+
+Caused by:
+  unable to update registry `alternative`
 
 Caused by:
   no token found for `alternative`, please run `cargo login --registry alternative`
@@ -378,8 +405,15 @@ fn incorrect_token() {
 [ERROR] failed to get `bar` as a dependency of package `foo v0.0.1 ([ROOT]/foo)`
 
 Caused by:
+  failed to load source for dependency `bar`
+
+Caused by:
+  unable to update registry `alternative`
+
+Caused by:
   token rejected for `alternative`, please run `cargo login --registry alternative`
   or use environment variable CARGO_REGISTRIES_ALTERNATIVE_TOKEN
+  [NOTE] the token does not include an authentication scheme
 
 Caused by:
   failed to get successful HTTP response from `http://127.0.0.1:[..]/index/config.json`, got 401
@@ -411,6 +445,42 @@ fn incorrect_token_git() {
 
 Caused by:
   failed to get successful HTTP response from `http://127.0.0.1:[..]/dl/bar/0.0.1/download` (127.0.0.1), got 401
+  body:
+  Unauthorized message from server.
+
+"#]])
+        .run();
+}
+
+#[cargo_test]
+fn incorrect_token_bearer_scheme() {
+    let _registry = RegistryBuilder::new()
+        .alternative()
+        .auth_required()
+        .no_configure_token()
+        .http_index()
+        .build();
+
+    let p = make_project();
+    cargo(&p, "build")
+        .env("CARGO_REGISTRIES_ALTERNATIVE_TOKEN", "Bearer incorrect")
+        .with_status(101)
+        .with_stderr_data(str![[r#"
+[UPDATING] `alternative` index
+[ERROR] failed to get `bar` as a dependency of package `foo v0.0.1 ([ROOT]/foo)`
+
+Caused by:
+  failed to load source for dependency `bar`
+
+Caused by:
+  unable to update registry `alternative`
+
+Caused by:
+  token rejected for `alternative`, please run `cargo login --registry alternative`
+  or use environment variable CARGO_REGISTRIES_ALTERNATIVE_TOKEN
+
+Caused by:
+  failed to get successful HTTP response from `http://127.0.0.1:[..]/index/config.json`, got 401
   body:
   Unauthorized message from server.
 
@@ -549,7 +619,7 @@ fn token_not_logged() {
         str![[r#"
 ...
 [PUBLISHED] foo v0.1.0 at registry `crates-io`
-
+...
 "#]],
     );
     let authorizations: Vec<_> = log

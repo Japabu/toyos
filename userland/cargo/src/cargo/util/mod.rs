@@ -13,7 +13,6 @@ pub use self::flock::{FileLock, Filesystem};
 pub use self::graph::Graph;
 pub use self::hasher::StableHasher;
 pub use self::hex::{hash_u64, short_hash, to_hex};
-pub use self::hostname::hostname;
 pub use self::into_url::IntoUrl;
 pub use self::into_url_with_base::IntoUrlWithBase;
 pub(crate) use self::io::LimitErrorReader;
@@ -24,6 +23,7 @@ pub use self::progress::{Progress, ProgressStyle};
 pub use self::queue::Queue;
 pub use self::rustc::Rustc;
 pub use self::semver_ext::{OptVersionReq, VersionExt};
+pub use self::unhashed::Unhashed;
 pub use self::vcs::{FossilRepo, GitRepo, HgRepo, PijulRepo, existing_vcs_repo};
 pub use self::workspace::{
     add_path_args, path_args, print_available_benches, print_available_binaries,
@@ -47,13 +47,14 @@ pub mod frontmatter;
 pub mod graph;
 mod hasher;
 pub mod hex;
-mod hostname;
 pub mod important_paths;
 pub mod interning;
 pub mod into_url;
 mod into_url_with_base;
 mod io;
 pub mod job;
+mod local_poll_adapter;
+pub use local_poll_adapter::LocalPollAdapter;
 mod lockserver;
 pub mod log_message;
 pub mod logger;
@@ -69,11 +70,15 @@ mod semver_eval_ext;
 mod semver_ext;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
-pub mod style;
 pub mod toml;
 pub mod toml_mut;
+mod unhashed;
 mod vcs;
 mod workspace;
+
+pub use cargo_util_terminal::style;
+pub(crate) use futures::executor::block_on;
+pub(crate) use futures::executor::block_on_stream;
 
 pub fn is_rustup() -> bool {
     #[expect(clippy::disallowed_methods, reason = "consistency with rustup")]

@@ -246,7 +246,7 @@ where
 
 #[test]
 fn with_retry_repeats_the_call_then_works() {
-    use crate::core::Shell;
+    use cargo_util_terminal::Shell;
 
     //Error HTTP codes (5xx) are considered maybe_spurious and will prompt retry
     let error1 = HttpNotSuccessful {
@@ -274,7 +274,7 @@ fn with_retry_repeats_the_call_then_works() {
 
 #[test]
 fn with_retry_finds_nested_spurious_errors() {
-    use crate::core::Shell;
+    use cargo_util_terminal::Shell;
 
     //Error HTTP codes (5xx) are considered maybe_spurious and will prompt retry
     //String error messages are not considered spurious
@@ -303,7 +303,7 @@ fn with_retry_finds_nested_spurious_errors() {
 
 #[test]
 fn default_retry_schedule() {
-    use crate::core::Shell;
+    use cargo_util_terminal::Shell;
 
     let spurious = || -> CargoResult<()> {
         Err(anyhow::Error::from(HttpNotSuccessful {
@@ -350,7 +350,7 @@ fn curle_http2_stream_is_spurious() {
 
 #[test]
 fn retry_after_parsing() {
-    use crate::core::Shell;
+    use cargo_util_terminal::Shell;
     fn spurious(code: u32, header: &str) -> HttpNotSuccessful {
         HttpNotSuccessful {
             code,
