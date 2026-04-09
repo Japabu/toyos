@@ -1,0 +1,2017 @@
+# Test a selection of projects which depend on rustix.
+
+name: Test rustix's users
+
+on: workflow_dispatch
+
+jobs:
+  listenfd:
+    name: listenfd ported to rustix
+    runs-on: ${{ matrix.os }}
+    env:
+      QEMU_BUILD_VERSION: 7.0.0
+    strategy:
+      matrix:
+        build: [ubuntu, i686-linux, aarch64-linux, powerpc-linux, powerpc64le-linux, riscv64-linux, s390x-linux, mipsel-linux, mips64el-linux, arm-linux, macos-latest]
+        include:
+          - build: ubuntu
+            os: ubuntu-latest
+            rust: nightly
+          - build: i686-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: i686-unknown-linux-gnu
+            gcc_package: gcc-i686-linux-gnu
+            gcc: i686-linux-gnu-gcc
+            libc_package: libc-dev-i386-cross
+          - build: aarch64-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: aarch64-unknown-linux-gnu
+            gcc_package: gcc-aarch64-linux-gnu
+            gcc: aarch64-linux-gnu-gcc
+            qemu: qemu-aarch64
+            qemu_args: -L /usr/aarch64-linux-gnu
+            qemu_target: aarch64-linux-user
+          - build: powerpc-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: powerpc-unknown-linux-gnu
+            gcc_package: gcc-powerpc-linux-gnu
+            gcc: powerpc-linux-gnu-gcc
+            qemu: qemu-ppc
+            qemu_args: -L /usr/powerpc-linux-gnu
+            qemu_target: ppc-linux-user
+          - build: powerpc64le-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: powerpc64le-unknown-linux-gnu
+            gcc_package: gcc-powerpc64le-linux-gnu
+            gcc: powerpc64le-linux-gnu-gcc
+            qemu: qemu-ppc64le
+            qemu_args: -L /usr/powerpc64le-linux-gnu
+            qemu_target: ppc64le-linux-user
+          - build: mips64el-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: mips64el-unknown-linux-gnuabi64
+            gcc_package: gcc-mips64el-linux-gnuabi64
+            gcc: mips64el-linux-gnuabi64-gcc
+            qemu: qemu-mips64el
+            qemu_args: -L /usr/mips64el-linux-gnuabi64
+            qemu_target: mips64el-linux-user
+          - build: mipsel-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: mipsel-unknown-linux-gnu
+            gcc_package: gcc-mipsel-linux-gnu
+            gcc: mipsel-linux-gnu-gcc
+            qemu: qemu-mipsel
+            qemu_args: -L /usr/mipsel-linux-gnu
+            qemu_target: mipsel-linux-user
+          - build: riscv64-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: riscv64gc-unknown-linux-gnu
+            gcc_package: gcc-riscv64-linux-gnu
+            gcc: riscv64-linux-gnu-gcc
+            qemu: qemu-riscv64
+            qemu_args: -L /usr/riscv64-linux-gnu
+            qemu_target: riscv64-linux-user
+          - build: s390x-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: s390x-unknown-linux-gnu
+            gcc_package: gcc-s390x-linux-gnu
+            gcc: s390x-linux-gnu-gcc
+            qemu: qemu-s390x
+            qemu_args: -L /usr/s390x-linux-gnu
+            qemu_target: s390x-linux-user
+          - build: arm-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: armv5te-unknown-linux-gnueabi
+            gcc_package: gcc-arm-linux-gnueabi
+            gcc: arm-linux-gnueabi-gcc
+            qemu: qemu-arm
+            qemu_args: -L /usr/arm-linux-gnueabi
+            qemu_target: arm-linux-user
+          - build: macos-latest
+            os: macos-latest
+            rust: nightly
+    steps:
+    - uses: actions/checkout@v4
+    - uses: ./.github/actions/install-rust
+      with:
+        toolchain: ${{ matrix.rust }}
+    - uses: actions/checkout@v4
+      with:
+        repository: sunfishcode/rust-listenfd
+        path: rust-listenfd
+        ref: rustix-0.35.6-beta.2
+
+    - uses: actions/checkout@v4
+      with:
+        repository: davidedelpapa/thttp
+        path: thttp
+
+    - name: Configure Cargo target
+      run: |
+        echo CARGO_BUILD_TARGET=${{ matrix.target }} >> $GITHUB_ENV
+        rustup target add ${{ matrix.target }}
+      if: matrix.target != ''
+
+    - uses: actions/cache@v4
+      with:
+        path: ${{ runner.tool_cache }}/qemu
+        key: qemu-${{ matrix.target }}-${{ env.QEMU_BUILD_VERSION }}-patched
+      if: matrix.target != '' && matrix.os == 'ubuntu-latest'
+
+    - name: Install cross-compilation tools
+      run: |
+        set -ex
+        sudo apt-get update
+        sudo apt-get install -y ${{ matrix.gcc_package }} ninja-build
+        upcase=$(echo ${{ matrix.target }} | awk '{ print toupper($0) }' | sed 's/-/_/g')
+        echo CARGO_TARGET_${upcase}_LINKER=${{ matrix.gcc }} >> $GITHUB_ENV
+        echo CC_${{ matrix.target }}=${{ matrix.gcc }} >> $GITHUB_ENV
+      if: matrix.gcc_package != '' && matrix.os == 'ubuntu-latest'
+
+    - name: Install cross-compilation libraries
+      run: |
+        set -ex
+        sudo apt-get update
+        sudo apt-get install -y ${{ matrix.libc_package }}
+      if: matrix.libc_package != '' && matrix.os == 'ubuntu-latest'
+
+    - name: Install qemu
+      run: |
+        set -ex
+
+        upcase=$(echo ${{ matrix.target }} | awk '{ print toupper($0) }' | sed 's/-/_/g')
+        echo CARGO_TARGET_${upcase}_RUNNER=${{ runner.tool_cache }}/qemu/bin/${{ matrix.qemu }} ${{ matrix.qemu_args }} >> $GITHUB_ENV
+
+        # See if qemu is already in the cache
+        if [ -f ${{ runner.tool_cache }}/qemu/bin/${{ matrix.qemu }} ]; then
+          exit 0
+        fi
+
+        # Download and build qemu from source since the most recent release is
+        # way faster at arm emulation than the current version github actions'
+        # ubuntu image uses. Disable as much as we can to get it to build
+        # quickly.
+        cd
+        curl https://download.qemu.org/qemu-$QEMU_BUILD_VERSION.tar.xz | tar xJf -
+        cd qemu-$QEMU_BUILD_VERSION
+        patch -p1 < $GITHUB_WORKSPACE/ci/translate-errno.patch
+        patch -p1 < $GITHUB_WORKSPACE/ci/getsockopt-timeouts.patch
+        patch -p1 < $GITHUB_WORKSPACE/ci/s390x-stat-have-nsec.patch
+        ./configure --target-list=${{ matrix.qemu_target }} --prefix=${{ runner.tool_cache }}/qemu --disable-tools --disable-slirp --disable-fdt --disable-capstone --disable-docs
+        ninja -C build install
+      if: matrix.qemu != '' && matrix.os == 'ubuntu-latest'
+
+    - run: cargo install systemfd
+
+    - run: cd rust-listenfd && cargo update
+    - run: sed -i'.bak' 's/^version = "'`cd rust-listenfd && cargo tree --edges=normal |head -1 |sed 's/^[[:alnum:]_-]* v\([[:alnum:].-]*\) (.*/\1/'`'"$/version = '`grep -A1 '^name = "rustix"' rust-listenfd/Cargo.lock |grep ^version |sed 's/^[^"]*//'`'/' Cargo.toml
+
+    - run: cd rust-listenfd && echo '[patch.crates-io]' >> Cargo.toml
+    - run: cd rust-listenfd && echo 'rustix = { path = ".." }' >> Cargo.toml
+
+    - run: cd thttp && echo '[patch.crates-io]' >> Cargo.toml
+    - run: cd thttp && echo 'listenfd = { path = "../rust-listenfd" }' >> Cargo.toml
+    - run: cd thttp && echo 'rustix = { path = ".." }' >> Cargo.toml
+
+    - run: cd thttp && cargo build
+    - run: cd thttp && systemfd --no-pid -s http::0.0.0.0:5052 -- cargo run &
+    - run: cd thttp && sleep 5
+    - run: cd thttp && wget http://127.0.0.1:5052/Cargo.toml
+    - run: cd thttp && diff -u Cargo.toml Cargo.toml.1
+
+  async-io:
+    name: async-io ported to rustix
+    runs-on: ${{ matrix.os }}
+    env:
+      QEMU_BUILD_VERSION: 7.0.0
+    strategy:
+      matrix:
+        build: [ubuntu, i686-linux, aarch64-linux, powerpc-linux, powerpc64le-linux, riscv64-linux, s390x-linux, mipsel-linux, mips64el-linux, arm-linux, macos-latest]
+        include:
+          - build: ubuntu
+            os: ubuntu-latest
+            rust: nightly
+          - build: i686-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: i686-unknown-linux-gnu
+            gcc_package: gcc-i686-linux-gnu
+            gcc: i686-linux-gnu-gcc
+            libc_package: libc-dev-i386-cross
+          - build: aarch64-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: aarch64-unknown-linux-gnu
+            gcc_package: gcc-aarch64-linux-gnu
+            gcc: aarch64-linux-gnu-gcc
+            qemu: qemu-aarch64
+            qemu_args: -L /usr/aarch64-linux-gnu
+            qemu_target: aarch64-linux-user
+          - build: powerpc-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: powerpc-unknown-linux-gnu
+            gcc_package: gcc-powerpc-linux-gnu
+            gcc: powerpc-linux-gnu-gcc
+            qemu: qemu-ppc
+            qemu_args: -L /usr/powerpc-linux-gnu
+            qemu_target: ppc-linux-user
+          - build: powerpc64le-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: powerpc64le-unknown-linux-gnu
+            gcc_package: gcc-powerpc64le-linux-gnu
+            gcc: powerpc64le-linux-gnu-gcc
+            qemu: qemu-ppc64le
+            qemu_args: -L /usr/powerpc64le-linux-gnu
+            qemu_target: ppc64le-linux-user
+          - build: mips64el-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: mips64el-unknown-linux-gnuabi64
+            gcc_package: gcc-mips64el-linux-gnuabi64
+            gcc: mips64el-linux-gnuabi64-gcc
+            qemu: qemu-mips64el
+            qemu_args: -L /usr/mips64el-linux-gnuabi64
+            qemu_target: mips64el-linux-user
+          - build: mipsel-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: mipsel-unknown-linux-gnu
+            gcc_package: gcc-mipsel-linux-gnu
+            gcc: mipsel-linux-gnu-gcc
+            qemu: qemu-mipsel
+            qemu_args: -L /usr/mipsel-linux-gnu
+            qemu_target: mipsel-linux-user
+          - build: riscv64-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: riscv64gc-unknown-linux-gnu
+            gcc_package: gcc-riscv64-linux-gnu
+            gcc: riscv64-linux-gnu-gcc
+            qemu: qemu-riscv64
+            qemu_args: -L /usr/riscv64-linux-gnu
+            qemu_target: riscv64-linux-user
+          - build: s390x-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: s390x-unknown-linux-gnu
+            gcc_package: gcc-s390x-linux-gnu
+            gcc: s390x-linux-gnu-gcc
+            qemu: qemu-s390x
+            qemu_args: -L /usr/s390x-linux-gnu
+            qemu_target: s390x-linux-user
+          - build: arm-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: armv5te-unknown-linux-gnueabi
+            gcc_package: gcc-arm-linux-gnueabi
+            gcc: arm-linux-gnueabi-gcc
+            qemu: qemu-arm
+            qemu_args: -L /usr/arm-linux-gnueabi
+            qemu_target: arm-linux-user
+          - build: macos-latest
+            os: macos-latest
+            rust: nightly
+    steps:
+    - uses: actions/checkout@v4
+    - uses: ./.github/actions/install-rust
+      with:
+        toolchain: ${{ matrix.rust }}
+    - uses: actions/checkout@v4
+      with:
+        repository: sunfishcode/async-io
+        path: async-io
+        ref: rustix-0.35.6-beta.2
+
+    - name: Configure Cargo target
+      run: |
+        echo CARGO_BUILD_TARGET=${{ matrix.target }} >> $GITHUB_ENV
+        rustup target add ${{ matrix.target }}
+      if: matrix.target != ''
+
+    - uses: actions/cache@v4
+      with:
+        path: ${{ runner.tool_cache }}/qemu
+        key: qemu-${{ matrix.target }}-${{ env.QEMU_BUILD_VERSION }}-patched
+      if: matrix.target != '' && matrix.os == 'ubuntu-latest'
+
+    - name: Install cross-compilation tools
+      run: |
+        set -ex
+        sudo apt-get update
+        sudo apt-get install -y ${{ matrix.gcc_package }} ninja-build
+        upcase=$(echo ${{ matrix.target }} | awk '{ print toupper($0) }' | sed 's/-/_/g')
+        echo CARGO_TARGET_${upcase}_LINKER=${{ matrix.gcc }} >> $GITHUB_ENV
+      if: matrix.gcc_package != '' && matrix.os == 'ubuntu-latest'
+
+    - name: Install cross-compilation libraries
+      run: |
+        set -ex
+        sudo apt-get update
+        sudo apt-get install -y ${{ matrix.libc_package }}
+      if: matrix.libc_package != '' && matrix.os == 'ubuntu-latest'
+
+    - name: Install qemu
+      run: |
+        set -ex
+
+        upcase=$(echo ${{ matrix.target }} | awk '{ print toupper($0) }' | sed 's/-/_/g')
+        echo CARGO_TARGET_${upcase}_RUNNER=${{ runner.tool_cache }}/qemu/bin/${{ matrix.qemu }} ${{ matrix.qemu_args }} >> $GITHUB_ENV
+
+        # See if qemu is already in the cache
+        if [ -f ${{ runner.tool_cache }}/qemu/bin/${{ matrix.qemu }} ]; then
+          exit 0
+        fi
+
+        # Download and build qemu from source since the most recent release is
+        # way faster at arm emulation than the current version github actions'
+        # ubuntu image uses. Disable as much as we can to get it to build
+        # quickly.
+        cd
+        curl https://download.qemu.org/qemu-$QEMU_BUILD_VERSION.tar.xz | tar xJf -
+        cd qemu-$QEMU_BUILD_VERSION
+        patch -p1 < $GITHUB_WORKSPACE/ci/translate-errno.patch
+        patch -p1 < $GITHUB_WORKSPACE/ci/getsockopt-timeouts.patch
+        patch -p1 < $GITHUB_WORKSPACE/ci/s390x-stat-have-nsec.patch
+        ./configure --target-list=${{ matrix.qemu_target }} --prefix=${{ runner.tool_cache }}/qemu --disable-tools --disable-slirp --disable-fdt --disable-capstone --disable-docs
+        ninja -C build install
+      if: matrix.qemu != '' && matrix.os == 'ubuntu-latest'
+
+    - run: cd async-io && cargo update
+    - run: sed -i'.bak' 's/^version = "'`cd async-io && cargo tree --edges=normal |head -1 |sed 's/^[[:alnum:]_-]* v\([[:alnum:].-]*\) (.*/\1/'`'"$/version = '`grep -A1 '^name = "rustix"' async-io/Cargo.lock |grep ^version |sed 's/^[^"]*//'`'/' Cargo.toml
+    - run: cd async-io && echo '[patch.crates-io]' >> Cargo.toml
+    - run: cd async-io && echo 'rustix = { path = ".." }' >> Cargo.toml
+    - run: cd async-io && cargo test
+
+  cap-std:
+    name: cap-std
+    runs-on: ${{ matrix.os }}
+    env:
+      QEMU_BUILD_VERSION: 7.0.0
+    strategy:
+      matrix:
+        build: [ubuntu, i686-linux, aarch64-linux, powerpc-linux, powerpc64le-linux, riscv64-linux, s390x-linux, mipsel-linux, mips64el-linux, arm-linux, macos-latest]
+        include:
+          - build: ubuntu
+            os: ubuntu-latest
+            rust: nightly
+          - build: i686-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: i686-unknown-linux-gnu
+            gcc_package: gcc-i686-linux-gnu
+            gcc: i686-linux-gnu-gcc
+            libc_package: libc-dev-i386-cross
+          - build: aarch64-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: aarch64-unknown-linux-gnu
+            gcc_package: gcc-aarch64-linux-gnu
+            gcc: aarch64-linux-gnu-gcc
+            qemu: qemu-aarch64
+            qemu_args: -L /usr/aarch64-linux-gnu
+            qemu_target: aarch64-linux-user
+          - build: powerpc-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: powerpc-unknown-linux-gnu
+            gcc_package: gcc-powerpc-linux-gnu
+            gcc: powerpc-linux-gnu-gcc
+            qemu: qemu-ppc
+            qemu_args: -L /usr/powerpc-linux-gnu
+            qemu_target: ppc-linux-user
+          - build: powerpc64le-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: powerpc64le-unknown-linux-gnu
+            gcc_package: gcc-powerpc64le-linux-gnu
+            gcc: powerpc64le-linux-gnu-gcc
+            qemu: qemu-ppc64le
+            qemu_args: -L /usr/powerpc64le-linux-gnu
+            qemu_target: ppc64le-linux-user
+          - build: mips64el-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: mips64el-unknown-linux-gnuabi64
+            gcc_package: gcc-mips64el-linux-gnuabi64
+            gcc: mips64el-linux-gnuabi64-gcc
+            qemu: qemu-mips64el
+            qemu_args: -L /usr/mips64el-linux-gnuabi64
+            qemu_target: mips64el-linux-user
+          - build: mipsel-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: mipsel-unknown-linux-gnu
+            gcc_package: gcc-mipsel-linux-gnu
+            gcc: mipsel-linux-gnu-gcc
+            qemu: qemu-mipsel
+            qemu_args: -L /usr/mipsel-linux-gnu
+            qemu_target: mipsel-linux-user
+          - build: riscv64-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: riscv64gc-unknown-linux-gnu
+            gcc_package: gcc-riscv64-linux-gnu
+            gcc: riscv64-linux-gnu-gcc
+            qemu: qemu-riscv64
+            qemu_args: -L /usr/riscv64-linux-gnu
+            qemu_target: riscv64-linux-user
+          - build: s390x-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: s390x-unknown-linux-gnu
+            gcc_package: gcc-s390x-linux-gnu
+            gcc: s390x-linux-gnu-gcc
+            qemu: qemu-s390x
+            qemu_args: -L /usr/s390x-linux-gnu
+            qemu_target: s390x-linux-user
+          - build: arm-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: armv5te-unknown-linux-gnueabi
+            gcc_package: gcc-arm-linux-gnueabi
+            gcc: arm-linux-gnueabi-gcc
+            qemu: qemu-arm
+            qemu_args: -L /usr/arm-linux-gnueabi
+            qemu_target: arm-linux-user
+          - build: macos-latest
+            os: macos-latest
+            rust: nightly
+    steps:
+    - uses: actions/checkout@v4
+    - uses: ./.github/actions/install-rust
+      with:
+        toolchain: ${{ matrix.rust }}
+    - uses: actions/checkout@v4
+      with:
+        repository: bytecodealliance/cap-std
+        path: cap-std
+        ref: rustix-0.35.6-beta.2
+
+    - name: Configure Cargo target
+      run: |
+        echo CARGO_BUILD_TARGET=${{ matrix.target }} >> $GITHUB_ENV
+        rustup target add ${{ matrix.target }}
+      if: matrix.target != ''
+
+    - uses: actions/cache@v4
+      with:
+        path: ${{ runner.tool_cache }}/qemu
+        key: qemu-${{ matrix.target }}-${{ env.QEMU_BUILD_VERSION }}-patched
+      if: matrix.target != '' && matrix.os == 'ubuntu-latest'
+
+    - name: Install cross-compilation tools
+      run: |
+        set -ex
+        sudo apt-get update
+        sudo apt-get install -y ${{ matrix.gcc_package }} ninja-build
+        upcase=$(echo ${{ matrix.target }} | awk '{ print toupper($0) }' | sed 's/-/_/g')
+        echo CARGO_TARGET_${upcase}_LINKER=${{ matrix.gcc }} >> $GITHUB_ENV
+      if: matrix.gcc_package != '' && matrix.os == 'ubuntu-latest'
+
+    - name: Install cross-compilation libraries
+      run: |
+        set -ex
+        sudo apt-get update
+        sudo apt-get install -y ${{ matrix.libc_package }}
+      if: matrix.libc_package != '' && matrix.os == 'ubuntu-latest'
+
+    - name: Install qemu
+      run: |
+        set -ex
+
+        upcase=$(echo ${{ matrix.target }} | awk '{ print toupper($0) }' | sed 's/-/_/g')
+        echo CARGO_TARGET_${upcase}_RUNNER=${{ runner.tool_cache }}/qemu/bin/${{ matrix.qemu }} ${{ matrix.qemu_args }} >> $GITHUB_ENV
+
+        # See if qemu is already in the cache
+        if [ -f ${{ runner.tool_cache }}/qemu/bin/${{ matrix.qemu }} ]; then
+          exit 0
+        fi
+
+        # Download and build qemu from source since the most recent release is
+        # way faster at arm emulation than the current version github actions'
+        # ubuntu image uses. Disable as much as we can to get it to build
+        # quickly.
+        cd
+        curl https://download.qemu.org/qemu-$QEMU_BUILD_VERSION.tar.xz | tar xJf -
+        cd qemu-$QEMU_BUILD_VERSION
+        patch -p1 < $GITHUB_WORKSPACE/ci/translate-errno.patch
+        patch -p1 < $GITHUB_WORKSPACE/ci/getsockopt-timeouts.patch
+        patch -p1 < $GITHUB_WORKSPACE/ci/s390x-stat-have-nsec.patch
+        ./configure --target-list=${{ matrix.qemu_target }} --prefix=${{ runner.tool_cache }}/qemu --disable-tools --disable-slirp --disable-fdt --disable-capstone --disable-docs
+        ninja -C build install
+      if: matrix.qemu != '' && matrix.os == 'ubuntu-latest'
+
+    - run: cd cap-std && cargo update
+    - run: sed -i'.bak' 's/^version = "'`cd cap-std && cargo tree --edges=normal |head -1 |sed 's/^[[:alnum:]_-]* v\([[:alnum:].-]*\) (.*/\1/'`'"$/version = '`grep -A1 '^name = "rustix"' cap-std/Cargo.lock |grep ^version |sed 's/^[^"]*//'`'/' Cargo.toml
+    - run: cd cap-std && echo '[patch.crates-io]' >> Cargo.toml
+    - run: cd cap-std && echo 'rustix = { path = ".." }' >> Cargo.toml
+    - run: cd cap-std && cargo test
+
+  cargo:
+    name: cargo ported to rustix
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        # Cargo depends on pkg-config which must be configured for cross-compilation.
+        build: [ubuntu]
+        include:
+          - build: ubuntu
+            os: ubuntu-latest
+            rust: nightly
+    steps:
+    - uses: actions/checkout@v4
+    - uses: ./.github/actions/install-rust
+      with:
+        toolchain: ${{ matrix.rust }}
+    - uses: actions/checkout@v4
+      with:
+        repository: sunfishcode/cargo
+        path: cargo
+        ref: rustix-0.35.6-beta.2
+
+    - run: rustup component add rust-src rustc-dev llvm-tools-preview
+    - run: cd cargo && cargo update
+    - run: sed -i'.bak' 's/^version = "'`cd cargo && cargo tree --edges=normal |head -1 |sed 's/^[[:alnum:]_-]* v\([[:alnum:].-]*\) (.*/\1/'`'"$/version = '`grep -A1 '^name = "rustix"' cargo/Cargo.lock |grep ^version |sed 's/^[^"]*//'`'/' Cargo.toml
+    - run: cd cargo && echo '[patch.crates-io]' >> Cargo.toml
+    - run: cd cargo && echo 'rustix = { path = ".." }' >> Cargo.toml
+    - run: cd cargo && cargo test --workspace
+      # Cargo cross tests require extra build dependencies.
+      env:
+        CFG_DISABLE_CROSS_TESTS: 1
+
+  memfd-rs:
+    name: memfd-rs
+    runs-on: ${{ matrix.os }}
+    env:
+      QEMU_BUILD_VERSION: 7.0.0
+    strategy:
+      matrix:
+        build: [ubuntu, i686-linux, aarch64-linux, powerpc-linux, powerpc64le-linux, riscv64-linux, s390x-linux, mipsel-linux, mips64el-linux, arm-linux]
+        include:
+          - build: ubuntu
+            os: ubuntu-latest
+            rust: nightly
+          - build: i686-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: i686-unknown-linux-gnu
+            gcc_package: gcc-i686-linux-gnu
+            gcc: i686-linux-gnu-gcc
+            libc_package: libc-dev-i386-cross
+          - build: aarch64-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: aarch64-unknown-linux-gnu
+            gcc_package: gcc-aarch64-linux-gnu
+            gcc: aarch64-linux-gnu-gcc
+            qemu: qemu-aarch64
+            qemu_args: -L /usr/aarch64-linux-gnu
+            qemu_target: aarch64-linux-user
+          - build: powerpc-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: powerpc-unknown-linux-gnu
+            gcc_package: gcc-powerpc-linux-gnu
+            gcc: powerpc-linux-gnu-gcc
+            qemu: qemu-ppc
+            qemu_args: -L /usr/powerpc-linux-gnu
+            qemu_target: ppc-linux-user
+          - build: powerpc64le-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: powerpc64le-unknown-linux-gnu
+            gcc_package: gcc-powerpc64le-linux-gnu
+            gcc: powerpc64le-linux-gnu-gcc
+            qemu: qemu-ppc64le
+            qemu_args: -L /usr/powerpc64le-linux-gnu
+            qemu_target: ppc64le-linux-user
+          - build: mips64el-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: mips64el-unknown-linux-gnuabi64
+            gcc_package: gcc-mips64el-linux-gnuabi64
+            gcc: mips64el-linux-gnuabi64-gcc
+            qemu: qemu-mips64el
+            qemu_args: -L /usr/mips64el-linux-gnuabi64
+            qemu_target: mips64el-linux-user
+          - build: mipsel-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: mipsel-unknown-linux-gnu
+            gcc_package: gcc-mipsel-linux-gnu
+            gcc: mipsel-linux-gnu-gcc
+            qemu: qemu-mipsel
+            qemu_args: -L /usr/mipsel-linux-gnu
+            qemu_target: mipsel-linux-user
+          - build: riscv64-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: riscv64gc-unknown-linux-gnu
+            gcc_package: gcc-riscv64-linux-gnu
+            gcc: riscv64-linux-gnu-gcc
+            qemu: qemu-riscv64
+            qemu_args: -L /usr/riscv64-linux-gnu
+            qemu_target: riscv64-linux-user
+          - build: s390x-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: s390x-unknown-linux-gnu
+            gcc_package: gcc-s390x-linux-gnu
+            gcc: s390x-linux-gnu-gcc
+            qemu: qemu-s390x
+            qemu_args: -L /usr/s390x-linux-gnu
+            qemu_target: s390x-linux-user
+          - build: arm-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: armv5te-unknown-linux-gnueabi
+            gcc_package: gcc-arm-linux-gnueabi
+            gcc: arm-linux-gnueabi-gcc
+            qemu: qemu-arm
+            qemu_args: -L /usr/arm-linux-gnueabi
+            qemu_target: arm-linux-user
+    steps:
+    - uses: actions/checkout@v4
+    - uses: ./.github/actions/install-rust
+      with:
+        toolchain: ${{ matrix.rust }}
+    - uses: actions/checkout@v4
+      with:
+        repository: sunfishcode/memfd-rs
+        path: memfd-rs
+        ref: rustix-0.35.6-beta.2
+
+    - name: Configure Cargo target
+      run: |
+        echo CARGO_BUILD_TARGET=${{ matrix.target }} >> $GITHUB_ENV
+        rustup target add ${{ matrix.target }}
+      if: matrix.target != ''
+
+    - uses: actions/cache@v4
+      with:
+        path: ${{ runner.tool_cache }}/qemu
+        key: qemu-${{ matrix.target }}-${{ env.QEMU_BUILD_VERSION }}-patched
+      if: matrix.target != '' && matrix.os == 'ubuntu-latest'
+
+    - name: Install cross-compilation tools
+      run: |
+        set -ex
+        sudo apt-get update
+        sudo apt-get install -y ${{ matrix.gcc_package }} ninja-build
+        upcase=$(echo ${{ matrix.target }} | awk '{ print toupper($0) }' | sed 's/-/_/g')
+        echo CARGO_TARGET_${upcase}_LINKER=${{ matrix.gcc }} >> $GITHUB_ENV
+      if: matrix.gcc_package != '' && matrix.os == 'ubuntu-latest'
+
+    - name: Install cross-compilation libraries
+      run: |
+        set -ex
+        sudo apt-get update
+        sudo apt-get install -y ${{ matrix.libc_package }}
+      if: matrix.libc_package != '' && matrix.os == 'ubuntu-latest'
+
+    - name: Install qemu
+      run: |
+        set -ex
+
+        upcase=$(echo ${{ matrix.target }} | awk '{ print toupper($0) }' | sed 's/-/_/g')
+        echo CARGO_TARGET_${upcase}_RUNNER=${{ runner.tool_cache }}/qemu/bin/${{ matrix.qemu }} ${{ matrix.qemu_args }} >> $GITHUB_ENV
+
+        # See if qemu is already in the cache
+        if [ -f ${{ runner.tool_cache }}/qemu/bin/${{ matrix.qemu }} ]; then
+          exit 0
+        fi
+
+        # Download and build qemu from source since the most recent release is
+        # way faster at arm emulation than the current version github actions'
+        # ubuntu image uses. Disable as much as we can to get it to build
+        # quickly.
+        cd
+        curl https://download.qemu.org/qemu-$QEMU_BUILD_VERSION.tar.xz | tar xJf -
+        cd qemu-$QEMU_BUILD_VERSION
+        patch -p1 < $GITHUB_WORKSPACE/ci/translate-errno.patch
+        patch -p1 < $GITHUB_WORKSPACE/ci/getsockopt-timeouts.patch
+        patch -p1 < $GITHUB_WORKSPACE/ci/s390x-stat-have-nsec.patch
+        ./configure --target-list=${{ matrix.qemu_target }} --prefix=${{ runner.tool_cache }}/qemu --disable-tools --disable-slirp --disable-fdt --disable-capstone --disable-docs
+        ninja -C build install
+      if: matrix.qemu != '' && matrix.os == 'ubuntu-latest'
+
+    - run: cd memfd-rs && cargo update
+    - run: sed -i'.bak' 's/^version = "'`cd memfd-rs && cargo tree --edges=normal |head -1 |sed 's/^[[:alnum:]_-]* v\([[:alnum:].-]*\) (.*/\1/'`'"$/version = '`grep -A1 '^name = "rustix"' memfd-rs/Cargo.lock |grep ^version |sed 's/^[^"]*//'`'/' Cargo.toml
+    - run: cd memfd-rs && echo '[patch.crates-io]' >> Cargo.toml
+    - run: cd memfd-rs && echo 'rustix = { path = ".." }' >> Cargo.toml
+    - run: cd memfd-rs && cargo test
+
+  rust-timerfd:
+    name: rust-timerfd
+    runs-on: ${{ matrix.os }}
+    env:
+      QEMU_BUILD_VERSION: 7.0.0
+    strategy:
+      matrix:
+        build: [ubuntu, i686-linux, aarch64-linux, powerpc-linux, powerpc64le-linux, riscv64-linux, s390x-linux, mipsel-linux, mips64el-linux, arm-linux]
+        include:
+          - build: ubuntu
+            os: ubuntu-latest
+            rust: nightly
+          - build: i686-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: i686-unknown-linux-gnu
+            gcc_package: gcc-i686-linux-gnu
+            gcc: i686-linux-gnu-gcc
+            libc_package: libc-dev-i386-cross
+          - build: aarch64-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: aarch64-unknown-linux-gnu
+            gcc_package: gcc-aarch64-linux-gnu
+            gcc: aarch64-linux-gnu-gcc
+            qemu: qemu-aarch64
+            qemu_args: -L /usr/aarch64-linux-gnu
+            qemu_target: aarch64-linux-user
+          - build: powerpc-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: powerpc-unknown-linux-gnu
+            gcc_package: gcc-powerpc-linux-gnu
+            gcc: powerpc-linux-gnu-gcc
+            qemu: qemu-ppc
+            qemu_args: -L /usr/powerpc-linux-gnu
+            qemu_target: ppc-linux-user
+          - build: powerpc64le-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: powerpc64le-unknown-linux-gnu
+            gcc_package: gcc-powerpc64le-linux-gnu
+            gcc: powerpc64le-linux-gnu-gcc
+            qemu: qemu-ppc64le
+            qemu_args: -L /usr/powerpc64le-linux-gnu
+            qemu_target: ppc64le-linux-user
+          - build: mips64el-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: mips64el-unknown-linux-gnuabi64
+            gcc_package: gcc-mips64el-linux-gnuabi64
+            gcc: mips64el-linux-gnuabi64-gcc
+            qemu: qemu-mips64el -L /usr/mips64el-linux-gnuabi64
+            qemu_target: mips64el-linux-user
+          - build: mipsel-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: mipsel-unknown-linux-gnu
+            gcc_package: gcc-mipsel-linux-gnu
+            gcc: mipsel-linux-gnu-gcc
+            qemu: qemu-mipsel -L /usr/mipsel-linux-gnu
+            qemu_target: mipsel-linux-user
+          - build: riscv64-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: riscv64gc-unknown-linux-gnu
+            gcc_package: gcc-riscv64-linux-gnu
+            gcc: riscv64-linux-gnu-gcc
+            qemu: qemu-riscv64
+            qemu_args: -L /usr/riscv64-linux-gnu
+            qemu_target: riscv64-linux-user
+          - build: s390x-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: s390x-unknown-linux-gnu
+            gcc_package: gcc-s390x-linux-gnu
+            gcc: s390x-linux-gnu-gcc
+            qemu: qemu-s390x
+            qemu_args: -L /usr/s390x-linux-gnu
+            qemu_target: s390x-linux-user
+          - build: arm-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: armv5te-unknown-linux-gnueabi
+            gcc_package: gcc-arm-linux-gnueabi
+            gcc: arm-linux-gnueabi-gcc
+            qemu: qemu-arm
+            qemu_args: -L /usr/arm-linux-gnueabi
+            qemu_target: arm-linux-user
+    steps:
+    - uses: actions/checkout@v4
+    - uses: ./.github/actions/install-rust
+      with:
+        toolchain: ${{ matrix.rust }}
+    - uses: actions/checkout@v4
+      with:
+        repository: sunfishcode/rust-timerfd
+        path: rust-timerfd
+        ref: rustix-0.35.6-beta.2
+
+    - name: Configure Cargo target
+      run: |
+        echo CARGO_BUILD_TARGET=${{ matrix.target }} >> $GITHUB_ENV
+        rustup target add ${{ matrix.target }}
+      if: matrix.target != ''
+
+    - uses: actions/cache@v4
+      with:
+        path: ${{ runner.tool_cache }}/qemu
+        key: qemu-${{ matrix.target }}-${{ env.QEMU_BUILD_VERSION }}-patched
+      if: matrix.target != '' && matrix.os == 'ubuntu-latest'
+
+    - name: Install cross-compilation tools
+      run: |
+        set -ex
+        sudo apt-get update
+        sudo apt-get install -y ${{ matrix.gcc_package }} ninja-build
+        upcase=$(echo ${{ matrix.target }} | awk '{ print toupper($0) }' | sed 's/-/_/g')
+        echo CARGO_TARGET_${upcase}_LINKER=${{ matrix.gcc }} >> $GITHUB_ENV
+      if: matrix.gcc_package != '' && matrix.os == 'ubuntu-latest'
+
+    - name: Install cross-compilation libraries
+      run: |
+        set -ex
+        sudo apt-get update
+        sudo apt-get install -y ${{ matrix.libc_package }}
+      if: matrix.libc_package != '' && matrix.os == 'ubuntu-latest'
+
+    - name: Install qemu
+      run: |
+        set -ex
+
+        upcase=$(echo ${{ matrix.target }} | awk '{ print toupper($0) }' | sed 's/-/_/g')
+        echo CARGO_TARGET_${upcase}_RUNNER=${{ runner.tool_cache }}/qemu/bin/${{ matrix.qemu }} ${{ matrix.qemu_args }} >> $GITHUB_ENV
+
+        # See if qemu is already in the cache
+        if [ -f ${{ runner.tool_cache }}/qemu/bin/${{ matrix.qemu }} ]; then
+          exit 0
+        fi
+
+        # Download and build qemu from source since the most recent release is
+        # way faster at arm emulation than the current version github actions'
+        # ubuntu image uses. Disable as much as we can to get it to build
+        # quickly.
+        cd
+        curl https://download.qemu.org/qemu-$QEMU_BUILD_VERSION.tar.xz | tar xJf -
+        cd qemu-$QEMU_BUILD_VERSION
+        patch -p1 < $GITHUB_WORKSPACE/ci/translate-errno.patch
+        patch -p1 < $GITHUB_WORKSPACE/ci/getsockopt-timeouts.patch
+        patch -p1 < $GITHUB_WORKSPACE/ci/s390x-stat-have-nsec.patch
+        ./configure --target-list=${{ matrix.qemu_target }} --prefix=${{ runner.tool_cache }}/qemu --disable-tools --disable-slirp --disable-fdt --disable-capstone --disable-docs
+        ninja -C build install
+      if: matrix.qemu != '' && matrix.os == 'ubuntu-latest'
+
+    - run: cd rust-timerfd && cargo update
+    - run: sed -i'.bak' 's/^version = "'`cd rust-timerfd && cargo tree --edges=normal |head -1 |sed 's/^[[:alnum:]_-]* v\([[:alnum:].-]*\) (.*/\1/'`'"$/version = '`grep -A1 '^name = "rustix"' rust-timerfd/Cargo.lock |grep ^version |sed 's/^[^"]*//'`'/' Cargo.toml
+    - run: cd rust-timerfd && echo '[patch.crates-io]' >> Cargo.toml
+    - run: cd rust-timerfd && echo 'rustix = { path = ".." }' >> Cargo.toml
+    - run: cd rust-timerfd && cargo test
+
+  procfs:
+    name: procfs
+    runs-on: ${{ matrix.os }}
+    env:
+      QEMU_BUILD_VERSION: 7.0.0
+    strategy:
+      matrix:
+        build: [ubuntu, i686-linux, aarch64-linux, powerpc-linux, powerpc64le-linux, riscv64-linux, s390x-linux, mipsel-linux, mips64el-linux, arm-linux]
+        include:
+          - build: ubuntu
+            os: ubuntu-latest
+            rust: nightly
+          - build: i686-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: i686-unknown-linux-gnu
+            gcc_package: gcc-i686-linux-gnu
+            gcc: i686-linux-gnu-gcc
+            libc_package: libc-dev-i386-cross
+          - build: aarch64-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: aarch64-unknown-linux-gnu
+            gcc_package: gcc-aarch64-linux-gnu
+            gcc: aarch64-linux-gnu-gcc
+            qemu: qemu-aarch64
+            qemu_args: -L /usr/aarch64-linux-gnu
+            qemu_target: aarch64-linux-user
+          - build: powerpc-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: powerpc-unknown-linux-gnu
+            gcc_package: gcc-powerpc-linux-gnu
+            gcc: powerpc-linux-gnu-gcc
+            qemu: qemu-ppc
+            qemu_args: -L /usr/powerpc-linux-gnu
+            qemu_target: ppc-linux-user
+          - build: powerpc64le-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: powerpc64le-unknown-linux-gnu
+            gcc_package: gcc-powerpc64le-linux-gnu
+            gcc: powerpc64le-linux-gnu-gcc
+            qemu: qemu-ppc64le
+            qemu_args: -L /usr/powerpc64le-linux-gnu
+            qemu_target: ppc64le-linux-user
+          - build: mips64el-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: mips64el-unknown-linux-gnuabi64
+            gcc_package: gcc-mips64el-linux-gnuabi64
+            gcc: mips64el-linux-gnuabi64-gcc
+            qemu: qemu-mips64el -L /usr/mips64el-linux-gnuabi64
+            qemu_target: mips64el-linux-user
+          - build: mipsel-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: mipsel-unknown-linux-gnu
+            gcc_package: gcc-mipsel-linux-gnu
+            gcc: mipsel-linux-gnu-gcc
+            qemu: qemu-mipsel -L /usr/mipsel-linux-gnu
+            qemu_target: mipsel-linux-user
+          - build: riscv64-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: riscv64gc-unknown-linux-gnu
+            gcc_package: gcc-riscv64-linux-gnu
+            gcc: riscv64-linux-gnu-gcc
+            qemu: qemu-riscv64
+            qemu_args: -L /usr/riscv64-linux-gnu
+            qemu_target: riscv64-linux-user
+          - build: s390x-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: s390x-unknown-linux-gnu
+            gcc_package: gcc-s390x-linux-gnu
+            gcc: s390x-linux-gnu-gcc
+            qemu: qemu-s390x
+            qemu_args: -L /usr/s390x-linux-gnu
+            qemu_target: s390x-linux-user
+          - build: arm-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: armv5te-unknown-linux-gnueabi
+            gcc_package: gcc-arm-linux-gnueabi
+            gcc: arm-linux-gnueabi-gcc
+            qemu: qemu-arm
+            qemu_args: -L /usr/arm-linux-gnueabi
+            qemu_target: arm-linux-user
+    steps:
+    - uses: actions/checkout@v4
+    - uses: ./.github/actions/install-rust
+      with:
+        toolchain: ${{ matrix.rust }}
+    - uses: actions/checkout@v4
+      with:
+        repository: sunfishcode/procfs
+        path: procfs
+        ref: rustix-0.35.6-beta.2
+
+    - name: Configure Cargo target
+      run: |
+        echo CARGO_BUILD_TARGET=${{ matrix.target }} >> $GITHUB_ENV
+        rustup target add ${{ matrix.target }}
+      if: matrix.target != ''
+
+    - uses: actions/cache@v4
+      with:
+        path: ${{ runner.tool_cache }}/qemu
+        key: qemu-${{ matrix.target }}-${{ env.QEMU_BUILD_VERSION }}-patched
+      if: matrix.target != '' && matrix.os == 'ubuntu-latest'
+
+    - name: Install cross-compilation tools
+      run: |
+        set -ex
+        sudo apt-get update
+        sudo apt-get install -y ${{ matrix.gcc_package }} ninja-build
+        upcase=$(echo ${{ matrix.target }} | awk '{ print toupper($0) }' | sed 's/-/_/g')
+        echo CARGO_TARGET_${upcase}_LINKER=${{ matrix.gcc }} >> $GITHUB_ENV
+      if: matrix.gcc_package != '' && matrix.os == 'ubuntu-latest'
+
+    - name: Install cross-compilation libraries
+      run: |
+        set -ex
+        sudo apt-get update
+        sudo apt-get install -y ${{ matrix.libc_package }}
+      if: matrix.libc_package != '' && matrix.os == 'ubuntu-latest'
+
+    - name: Install qemu
+      run: |
+        set -ex
+
+        upcase=$(echo ${{ matrix.target }} | awk '{ print toupper($0) }' | sed 's/-/_/g')
+        echo CARGO_TARGET_${upcase}_RUNNER=${{ runner.tool_cache }}/qemu/bin/${{ matrix.qemu }} ${{ matrix.qemu_args }} >> $GITHUB_ENV
+
+        # See if qemu is already in the cache
+        if [ -f ${{ runner.tool_cache }}/qemu/bin/${{ matrix.qemu }} ]; then
+          exit 0
+        fi
+
+        # Download and build qemu from source since the most recent release is
+        # way faster at arm emulation than the current version github actions'
+        # ubuntu image uses. Disable as much as we can to get it to build
+        # quickly.
+        cd
+        curl https://download.qemu.org/qemu-$QEMU_BUILD_VERSION.tar.xz | tar xJf -
+        cd qemu-$QEMU_BUILD_VERSION
+        patch -p1 < $GITHUB_WORKSPACE/ci/translate-errno.patch
+        patch -p1 < $GITHUB_WORKSPACE/ci/getsockopt-timeouts.patch
+        patch -p1 < $GITHUB_WORKSPACE/ci/s390x-stat-have-nsec.patch
+        ./configure --target-list=${{ matrix.qemu_target }} --prefix=${{ runner.tool_cache }}/qemu --disable-tools --disable-slirp --disable-fdt --disable-capstone --disable-docs
+        ninja -C build install
+      if: matrix.qemu != '' && matrix.os == 'ubuntu-latest'
+
+    - run: cd procfs && cargo update
+    - run: sed -i'.bak' 's/^version = "'`cd procfs && cargo tree --edges=normal |head -1 |sed 's/^[[:alnum:]_-]* v\([[:alnum:].-]*\) (.*/\1/'`'"$/version = '`grep -A1 '^name = "rustix"' procfs/Cargo.lock |grep ^version |sed 's/^[^"]*//'`'/' Cargo.toml
+    - run: cd procfs && echo '[patch.crates-io]' >> Cargo.toml
+    - run: cd procfs && echo 'rustix = { path = ".." }' >> Cargo.toml
+    - run: cd procfs && cargo test
+
+  rust-atomicwrites:
+    name: rust-atomicwrites
+    runs-on: ${{ matrix.os }}
+    env:
+      QEMU_BUILD_VERSION: 7.0.0
+    strategy:
+      matrix:
+        build: [ubuntu, i686-linux, aarch64-linux, powerpc-linux, powerpc64le-linux, riscv64-linux, s390x-linux, mipsel-linux, mips64el-linux, arm-linux]
+        include:
+          - build: ubuntu
+            os: ubuntu-latest
+            rust: nightly
+          - build: i686-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: i686-unknown-linux-gnu
+            gcc_package: gcc-i686-linux-gnu
+            gcc: i686-linux-gnu-gcc
+            libc_package: libc-dev-i386-cross
+          - build: aarch64-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: aarch64-unknown-linux-gnu
+            gcc_package: gcc-aarch64-linux-gnu
+            gcc: aarch64-linux-gnu-gcc
+            qemu: qemu-aarch64
+            qemu_args: -L /usr/aarch64-linux-gnu
+            qemu_target: aarch64-linux-user
+          - build: powerpc-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: powerpc-unknown-linux-gnu
+            gcc_package: gcc-powerpc-linux-gnu
+            gcc: powerpc-linux-gnu-gcc
+            qemu: qemu-ppc
+            qemu_args: -L /usr/powerpc-linux-gnu
+            qemu_target: ppc-linux-user
+          - build: powerpc64le-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: powerpc64le-unknown-linux-gnu
+            gcc_package: gcc-powerpc64le-linux-gnu
+            gcc: powerpc64le-linux-gnu-gcc
+            qemu: qemu-ppc64le
+            qemu_args: -L /usr/powerpc64le-linux-gnu
+            qemu_target: ppc64le-linux-user
+          - build: mips64el-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: mips64el-unknown-linux-gnuabi64
+            gcc_package: gcc-mips64el-linux-gnuabi64
+            gcc: mips64el-linux-gnuabi64-gcc
+            qemu: qemu-mips64el -L /usr/mips64el-linux-gnuabi64
+            qemu_target: mips64el-linux-user
+          - build: mipsel-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: mipsel-unknown-linux-gnu
+            gcc_package: gcc-mipsel-linux-gnu
+            gcc: mipsel-linux-gnu-gcc
+            qemu: qemu-mipsel -L /usr/mipsel-linux-gnu
+            qemu_target: mipsel-linux-user
+          - build: riscv64-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: riscv64gc-unknown-linux-gnu
+            gcc_package: gcc-riscv64-linux-gnu
+            gcc: riscv64-linux-gnu-gcc
+            qemu: qemu-riscv64
+            qemu_args: -L /usr/riscv64-linux-gnu
+            qemu_target: riscv64-linux-user
+          - build: s390x-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: s390x-unknown-linux-gnu
+            gcc_package: gcc-s390x-linux-gnu
+            gcc: s390x-linux-gnu-gcc
+            qemu: qemu-s390x
+            qemu_args: -L /usr/s390x-linux-gnu
+            qemu_target: s390x-linux-user
+          - build: arm-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: armv5te-unknown-linux-gnueabi
+            gcc_package: gcc-arm-linux-gnueabi
+            gcc: arm-linux-gnueabi-gcc
+            qemu: qemu-arm
+            qemu_args: -L /usr/arm-linux-gnueabi
+            qemu_target: arm-linux-user
+    steps:
+    - uses: actions/checkout@v4
+    - uses: ./.github/actions/install-rust
+      with:
+        toolchain: ${{ matrix.rust }}
+    - uses: actions/checkout@v4
+      with:
+        repository: sunfishcode/rust-atomicwrites
+        path: rust-atomicwrites
+        ref: rustix-0.35.6-beta.2
+
+    - name: Configure Cargo target
+      run: |
+        echo CARGO_BUILD_TARGET=${{ matrix.target }} >> $GITHUB_ENV
+        rustup target add ${{ matrix.target }}
+      if: matrix.target != ''
+
+    - uses: actions/cache@v4
+      with:
+        path: ${{ runner.tool_cache }}/qemu
+        key: qemu-${{ matrix.target }}-${{ env.QEMU_BUILD_VERSION }}-patched
+      if: matrix.target != '' && matrix.os == 'ubuntu-latest'
+
+    - name: Install cross-compilation tools
+      run: |
+        set -ex
+        sudo apt-get update
+        sudo apt-get install -y ${{ matrix.gcc_package }} ninja-build
+        upcase=$(echo ${{ matrix.target }} | awk '{ print toupper($0) }' | sed 's/-/_/g')
+        echo CARGO_TARGET_${upcase}_LINKER=${{ matrix.gcc }} >> $GITHUB_ENV
+      if: matrix.gcc_package != '' && matrix.os == 'ubuntu-latest'
+
+    - name: Install cross-compilation libraries
+      run: |
+        set -ex
+        sudo apt-get update
+        sudo apt-get install -y ${{ matrix.libc_package }}
+      if: matrix.libc_package != '' && matrix.os == 'ubuntu-latest'
+
+    - name: Install qemu
+      run: |
+        set -ex
+
+        upcase=$(echo ${{ matrix.target }} | awk '{ print toupper($0) }' | sed 's/-/_/g')
+        echo CARGO_TARGET_${upcase}_RUNNER=${{ runner.tool_cache }}/qemu/bin/${{ matrix.qemu }} ${{ matrix.qemu_args }} >> $GITHUB_ENV
+
+        # See if qemu is already in the cache
+        if [ -f ${{ runner.tool_cache }}/qemu/bin/${{ matrix.qemu }} ]; then
+          exit 0
+        fi
+
+        # Download and build qemu from source since the most recent release is
+        # way faster at arm emulation than the current version github actions'
+        # ubuntu image uses. Disable as much as we can to get it to build
+        # quickly.
+        cd
+        curl https://download.qemu.org/qemu-$QEMU_BUILD_VERSION.tar.xz | tar xJf -
+        cd qemu-$QEMU_BUILD_VERSION
+        patch -p1 < $GITHUB_WORKSPACE/ci/translate-errno.patch
+        patch -p1 < $GITHUB_WORKSPACE/ci/getsockopt-timeouts.patch
+        patch -p1 < $GITHUB_WORKSPACE/ci/s390x-stat-have-nsec.patch
+        ./configure --target-list=${{ matrix.qemu_target }} --prefix=${{ runner.tool_cache }}/qemu --disable-tools --disable-slirp --disable-fdt --disable-capstone --disable-docs
+        ninja -C build install
+      if: matrix.qemu != '' && matrix.os == 'ubuntu-latest'
+
+    - run: cd rust-atomicwrites && cargo update
+    - run: sed -i'.bak' 's/^version = "'`cd rust-atomicwrites && cargo tree --edges=normal |head -1 |sed 's/^[[:alnum:]_-]* v\([[:alnum:].-]*\) (.*/\1/'`'"$/version = '`grep -A1 '^name = "rustix"' rust-atomicwrites/Cargo.lock |grep ^version |sed 's/^[^"]*//'`'/' Cargo.toml
+    - run: cd rust-atomicwrites && echo '[patch.crates-io]' >> Cargo.toml
+    - run: cd rust-atomicwrites && echo 'rustix = { path = ".." }' >> Cargo.toml
+    - run: cd rust-atomicwrites && cargo test
+
+  io-uring:
+    name: io-uring ported to rustix
+    runs-on: ${{ matrix.os }}
+    env:
+      QEMU_BUILD_VERSION: 7.0.0
+    strategy:
+      matrix:
+        build: [ubuntu, i686-linux, aarch64-linux, powerpc-linux, powerpc64le-linux, riscv64-linux, s390x-linux, mipsel-linux, mips64el-linux, arm-linux]
+        include:
+          - build: ubuntu
+            os: ubuntu-latest
+            rust: nightly
+          - build: i686-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: i686-unknown-linux-gnu
+            gcc_package: gcc-i686-linux-gnu
+            gcc: i686-linux-gnu-gcc
+            libc_package: libc-dev-i386-cross
+          - build: aarch64-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: aarch64-unknown-linux-gnu
+            gcc_package: gcc-aarch64-linux-gnu
+            gcc: aarch64-linux-gnu-gcc
+            qemu: qemu-aarch64
+            qemu_args: -L /usr/aarch64-linux-gnu
+            qemu_target: aarch64-linux-user
+          - build: powerpc-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: powerpc-unknown-linux-gnu
+            gcc_package: gcc-powerpc-linux-gnu
+            gcc: powerpc-linux-gnu-gcc
+            qemu: qemu-ppc
+            qemu_args: -L /usr/powerpc-linux-gnu
+            qemu_target: ppc-linux-user
+          - build: powerpc64le-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: powerpc64le-unknown-linux-gnu
+            gcc_package: gcc-powerpc64le-linux-gnu
+            gcc: powerpc64le-linux-gnu-gcc
+            qemu: qemu-ppc64le
+            qemu_args: -L /usr/powerpc64le-linux-gnu
+            qemu_target: ppc64le-linux-user
+          - build: mips64el-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: mips64el-unknown-linux-gnuabi64
+            gcc_package: gcc-mips64el-linux-gnuabi64
+            gcc: mips64el-linux-gnuabi64-gcc
+            qemu: qemu-mips64el -L /usr/mips64el-linux-gnuabi64
+            qemu_target: mips64el-linux-user
+          - build: mipsel-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: mipsel-unknown-linux-gnu
+            gcc_package: gcc-mipsel-linux-gnu
+            gcc: mipsel-linux-gnu-gcc
+            qemu: qemu-mipsel -L /usr/mipsel-linux-gnu
+            qemu_target: mipsel-linux-user
+          - build: riscv64-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: riscv64gc-unknown-linux-gnu
+            gcc_package: gcc-riscv64-linux-gnu
+            gcc: riscv64-linux-gnu-gcc
+            qemu: qemu-riscv64
+            qemu_args: -L /usr/riscv64-linux-gnu
+            qemu_target: riscv64-linux-user
+          - build: s390x-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: s390x-unknown-linux-gnu
+            gcc_package: gcc-s390x-linux-gnu
+            gcc: s390x-linux-gnu-gcc
+            qemu: qemu-s390x
+            qemu_args: -L /usr/s390x-linux-gnu
+            qemu_target: s390x-linux-user
+          - build: arm-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: armv5te-unknown-linux-gnueabi
+            gcc_package: gcc-arm-linux-gnueabi
+            gcc: arm-linux-gnueabi-gcc
+            qemu: qemu-arm
+            qemu_args: -L /usr/arm-linux-gnueabi
+            qemu_target: arm-linux-user
+    steps:
+    - uses: actions/checkout@v4
+    - uses: ./.github/actions/install-rust
+      with:
+        toolchain: ${{ matrix.rust }}
+    - uses: actions/checkout@v4
+      with:
+        repository: sunfishcode/io-uring
+        path: io-uring
+        ref: rustix-0.35.6-beta.2
+
+    - name: Configure Cargo target
+      run: |
+        echo CARGO_BUILD_TARGET=${{ matrix.target }} >> $GITHUB_ENV
+        rustup target add ${{ matrix.target }}
+      if: matrix.target != ''
+
+    - uses: actions/cache@v4
+      with:
+        path: ${{ runner.tool_cache }}/qemu
+        key: qemu-${{ matrix.target }}-${{ env.QEMU_BUILD_VERSION }}-patched
+      if: matrix.target != '' && matrix.os == 'ubuntu-latest'
+
+    - name: Install cross-compilation tools
+      run: |
+        set -ex
+        sudo apt-get update
+        sudo apt-get install -y ${{ matrix.gcc_package }} ninja-build
+        upcase=$(echo ${{ matrix.target }} | awk '{ print toupper($0) }' | sed 's/-/_/g')
+        echo CARGO_TARGET_${upcase}_LINKER=${{ matrix.gcc }} >> $GITHUB_ENV
+      if: matrix.gcc_package != '' && matrix.os == 'ubuntu-latest'
+
+    - name: Install cross-compilation libraries
+      run: |
+        set -ex
+        sudo apt-get update
+        sudo apt-get install -y ${{ matrix.libc_package }}
+      if: matrix.libc_package != '' && matrix.os == 'ubuntu-latest'
+
+    - name: Install qemu
+      run: |
+        set -ex
+
+        upcase=$(echo ${{ matrix.target }} | awk '{ print toupper($0) }' | sed 's/-/_/g')
+        echo CARGO_TARGET_${upcase}_RUNNER=${{ runner.tool_cache }}/qemu/bin/${{ matrix.qemu }} ${{ matrix.qemu_args }} >> $GITHUB_ENV
+
+        # See if qemu is already in the cache
+        if [ -f ${{ runner.tool_cache }}/qemu/bin/${{ matrix.qemu }} ]; then
+          exit 0
+        fi
+
+        # Download and build qemu from source since the most recent release is
+        # way faster at arm emulation than the current version github actions'
+        # ubuntu image uses. Disable as much as we can to get it to build
+        # quickly.
+        cd
+        curl https://download.qemu.org/qemu-$QEMU_BUILD_VERSION.tar.xz | tar xJf -
+        cd qemu-$QEMU_BUILD_VERSION
+        patch -p1 < $GITHUB_WORKSPACE/ci/translate-errno.patch
+        patch -p1 < $GITHUB_WORKSPACE/ci/getsockopt-timeouts.patch
+        patch -p1 < $GITHUB_WORKSPACE/ci/s390x-stat-have-nsec.patch
+        ./configure --target-list=${{ matrix.qemu_target }} --prefix=${{ runner.tool_cache }}/qemu --disable-tools --disable-slirp --disable-fdt --disable-capstone --disable-docs
+        ninja -C build install
+      if: matrix.qemu != '' && matrix.os == 'ubuntu-latest'
+
+    - run: cd io-uring && cargo update
+    - run: sed -i'.bak' 's/^version = "'`cd io-uring && cargo tree --edges=normal |head -1 |sed 's/^[[:alnum:]_-]* v\([[:alnum:].-]*\) (.*/\1/'`'"$/version = '`grep -A1 '^name = "rustix"' io-uring/Cargo.lock |grep ^version |sed 's/^[^"]*//'`'/' Cargo.toml
+    - run: cd io-uring && echo '[patch.crates-io]' >> Cargo.toml
+    - run: cd io-uring && echo 'rustix = { path = ".." }' >> Cargo.toml
+    - run: cd io-uring && cargo test
+
+  tempfile:
+    name: tempfile ported to rustix
+    runs-on: ${{ matrix.os }}
+    env:
+      QEMU_BUILD_VERSION: 7.0.0
+    strategy:
+      matrix:
+        build: [ubuntu, i686-linux, aarch64-linux, powerpc-linux, powerpc64le-linux, riscv64-linux, s390x-linux, mipsel-linux, mips64el-linux, arm-linux, macos-latest]
+        include:
+          - build: ubuntu
+            os: ubuntu-latest
+            rust: nightly
+          - build: i686-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: i686-unknown-linux-gnu
+            gcc_package: gcc-i686-linux-gnu
+            gcc: i686-linux-gnu-gcc
+            libc_package: libc-dev-i386-cross
+          - build: aarch64-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: aarch64-unknown-linux-gnu
+            gcc_package: gcc-aarch64-linux-gnu
+            gcc: aarch64-linux-gnu-gcc
+            qemu: qemu-aarch64
+            qemu_args: -L /usr/aarch64-linux-gnu
+            qemu_target: aarch64-linux-user
+          - build: powerpc-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: powerpc-unknown-linux-gnu
+            gcc_package: gcc-powerpc-linux-gnu
+            gcc: powerpc-linux-gnu-gcc
+            qemu: qemu-ppc
+            qemu_args: -L /usr/powerpc-linux-gnu
+            qemu_target: ppc-linux-user
+          - build: powerpc64le-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: powerpc64le-unknown-linux-gnu
+            gcc_package: gcc-powerpc64le-linux-gnu
+            gcc: powerpc64le-linux-gnu-gcc
+            qemu: qemu-ppc64le
+            qemu_args: -L /usr/powerpc64le-linux-gnu
+            qemu_target: ppc64le-linux-user
+          - build: mips64el-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: mips64el-unknown-linux-gnuabi64
+            gcc_package: gcc-mips64el-linux-gnuabi64
+            gcc: mips64el-linux-gnuabi64-gcc
+            qemu: qemu-mips64el
+            qemu_args: -L /usr/mips64el-linux-gnuabi64
+            qemu_target: mips64el-linux-user
+          - build: mipsel-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: mipsel-unknown-linux-gnu
+            gcc_package: gcc-mipsel-linux-gnu
+            gcc: mipsel-linux-gnu-gcc
+            qemu: qemu-mipsel
+            qemu_args: -L /usr/mipsel-linux-gnu
+            qemu_target: mipsel-linux-user
+          - build: riscv64-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: riscv64gc-unknown-linux-gnu
+            gcc_package: gcc-riscv64-linux-gnu
+            gcc: riscv64-linux-gnu-gcc
+            qemu: qemu-riscv64
+            qemu_args: -L /usr/riscv64-linux-gnu
+            qemu_target: riscv64-linux-user
+          - build: s390x-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: s390x-unknown-linux-gnu
+            gcc_package: gcc-s390x-linux-gnu
+            gcc: s390x-linux-gnu-gcc
+            qemu: qemu-s390x
+            qemu_args: -L /usr/s390x-linux-gnu
+            qemu_target: s390x-linux-user
+          - build: arm-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: armv5te-unknown-linux-gnueabi
+            gcc_package: gcc-arm-linux-gnueabi
+            gcc: arm-linux-gnueabi-gcc
+            qemu: qemu-arm
+            qemu_args: -L /usr/arm-linux-gnueabi
+            qemu_target: arm-linux-user
+          - build: macos-latest
+            os: macos-latest
+            rust: nightly
+    steps:
+    - uses: actions/checkout@v4
+    - uses: ./.github/actions/install-rust
+      with:
+        toolchain: ${{ matrix.rust }}
+    - uses: actions/checkout@v4
+      with:
+        repository: sunfishcode/tempfile
+        path: tempfile
+        ref: rustix-0.35.6-beta.2
+
+    - name: Configure Cargo target
+      run: |
+        echo CARGO_BUILD_TARGET=${{ matrix.target }} >> $GITHUB_ENV
+        rustup target add ${{ matrix.target }}
+      if: matrix.target != ''
+
+    - uses: actions/cache@v4
+      with:
+        path: ${{ runner.tool_cache }}/qemu
+        key: qemu-${{ matrix.target }}-${{ env.QEMU_BUILD_VERSION }}-patched
+      if: matrix.target != '' && matrix.os == 'ubuntu-latest'
+
+    - name: Install cross-compilation tools
+      run: |
+        set -ex
+        sudo apt-get update
+        sudo apt-get install -y ${{ matrix.gcc_package }} ninja-build
+        upcase=$(echo ${{ matrix.target }} | awk '{ print toupper($0) }' | sed 's/-/_/g')
+        echo CARGO_TARGET_${upcase}_LINKER=${{ matrix.gcc }} >> $GITHUB_ENV
+      if: matrix.gcc_package != '' && matrix.os == 'ubuntu-latest'
+
+    - name: Install cross-compilation libraries
+      run: |
+        set -ex
+        sudo apt-get update
+        sudo apt-get install -y ${{ matrix.libc_package }}
+      if: matrix.libc_package != '' && matrix.os == 'ubuntu-latest'
+
+    - name: Install qemu
+      run: |
+        set -ex
+
+        upcase=$(echo ${{ matrix.target }} | awk '{ print toupper($0) }' | sed 's/-/_/g')
+        echo CARGO_TARGET_${upcase}_RUNNER=${{ runner.tool_cache }}/qemu/bin/${{ matrix.qemu }} ${{ matrix.qemu_args }} >> $GITHUB_ENV
+
+        # See if qemu is already in the cache
+        if [ -f ${{ runner.tool_cache }}/qemu/bin/${{ matrix.qemu }} ]; then
+          exit 0
+        fi
+
+        # Download and build qemu from source since the most recent release is
+        # way faster at arm emulation than the current version github actions'
+        # ubuntu image uses. Disable as much as we can to get it to build
+        # quickly.
+        cd
+        curl https://download.qemu.org/qemu-$QEMU_BUILD_VERSION.tar.xz | tar xJf -
+        cd qemu-$QEMU_BUILD_VERSION
+        patch -p1 < $GITHUB_WORKSPACE/ci/translate-errno.patch
+        patch -p1 < $GITHUB_WORKSPACE/ci/getsockopt-timeouts.patch
+        patch -p1 < $GITHUB_WORKSPACE/ci/s390x-stat-have-nsec.patch
+        ./configure --target-list=${{ matrix.qemu_target }} --prefix=${{ runner.tool_cache }}/qemu --disable-tools --disable-slirp --disable-fdt --disable-capstone --disable-docs
+        ninja -C build install
+      if: matrix.qemu != '' && matrix.os == 'ubuntu-latest'
+
+    - run: cd tempfile && cargo update
+    - run: sed -i'.bak' 's/^version = "'`cd tempfile && cargo tree --edges=normal |head -1 |sed 's/^[[:alnum:]_-]* v\([[:alnum:].-]*\) (.*/\1/'`'"$/version = '`grep -A1 '^name = "rustix"' tempfile/Cargo.lock |grep ^version |sed 's/^[^"]*//'`'/' Cargo.toml
+    - run: cd tempfile && echo '[patch.crates-io]' >> Cargo.toml
+    - run: cd tempfile && echo 'rustix = { path = ".." }' >> Cargo.toml
+    - run: cd tempfile && cargo test
+
+  fd-lock:
+    name: fd-lock
+    runs-on: ${{ matrix.os }}
+    env:
+      QEMU_BUILD_VERSION: 7.0.0
+    strategy:
+      matrix:
+        build: [ubuntu, i686-linux, aarch64-linux, powerpc-linux, powerpc64le-linux, riscv64-linux, s390x-linux, mipsel-linux, mips64el-linux, arm-linux, macos-latest]
+        include:
+          - build: ubuntu
+            os: ubuntu-latest
+            rust: nightly
+          - build: i686-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: i686-unknown-linux-gnu
+            gcc_package: gcc-i686-linux-gnu
+            gcc: i686-linux-gnu-gcc
+            libc_package: libc-dev-i386-cross
+          - build: aarch64-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: aarch64-unknown-linux-gnu
+            gcc_package: gcc-aarch64-linux-gnu
+            gcc: aarch64-linux-gnu-gcc
+            qemu: qemu-aarch64
+            qemu_args: -L /usr/aarch64-linux-gnu
+            qemu_target: aarch64-linux-user
+          - build: powerpc-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: powerpc-unknown-linux-gnu
+            gcc_package: gcc-powerpc-linux-gnu
+            gcc: powerpc-linux-gnu-gcc
+            qemu: qemu-ppc
+            qemu_args: -L /usr/powerpc-linux-gnu
+            qemu_target: ppc-linux-user
+          - build: powerpc64le-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: powerpc64le-unknown-linux-gnu
+            gcc_package: gcc-powerpc64le-linux-gnu
+            gcc: powerpc64le-linux-gnu-gcc
+            qemu: qemu-ppc64le
+            qemu_args: -L /usr/powerpc64le-linux-gnu
+            qemu_target: ppc64le-linux-user
+          - build: mips64el-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: mips64el-unknown-linux-gnuabi64
+            gcc_package: gcc-mips64el-linux-gnuabi64
+            gcc: mips64el-linux-gnuabi64-gcc
+            qemu: qemu-mips64el
+            qemu_args: -L /usr/mips64el-linux-gnuabi64
+            qemu_target: mips64el-linux-user
+          - build: mipsel-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: mipsel-unknown-linux-gnu
+            gcc_package: gcc-mipsel-linux-gnu
+            gcc: mipsel-linux-gnu-gcc
+            qemu: qemu-mipsel
+            qemu_args: -L /usr/mipsel-linux-gnu
+            qemu_target: mipsel-linux-user
+          - build: riscv64-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: riscv64gc-unknown-linux-gnu
+            gcc_package: gcc-riscv64-linux-gnu
+            gcc: riscv64-linux-gnu-gcc
+            qemu: qemu-riscv64
+            qemu_args: -L /usr/riscv64-linux-gnu
+            qemu_target: riscv64-linux-user
+          - build: s390x-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: s390x-unknown-linux-gnu
+            gcc_package: gcc-s390x-linux-gnu
+            gcc: s390x-linux-gnu-gcc
+            qemu: qemu-s390x
+            qemu_args: -L /usr/s390x-linux-gnu
+            qemu_target: s390x-linux-user
+          - build: arm-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: armv5te-unknown-linux-gnueabi
+            gcc_package: gcc-arm-linux-gnueabi
+            gcc: arm-linux-gnueabi-gcc
+            qemu: qemu-arm
+            qemu_args: -L /usr/arm-linux-gnueabi
+            qemu_target: arm-linux-user
+          - build: macos-latest
+            os: macos-latest
+            rust: nightly
+    steps:
+    - uses: actions/checkout@v4
+    - uses: ./.github/actions/install-rust
+      with:
+        toolchain: ${{ matrix.rust }}
+    - uses: actions/checkout@v4
+      with:
+        repository: sunfishcode/fd-lock
+        path: fd-lock
+        ref: rustix-0.35.6-beta.2
+
+    - name: Configure Cargo target
+      run: |
+        echo CARGO_BUILD_TARGET=${{ matrix.target }} >> $GITHUB_ENV
+        rustup target add ${{ matrix.target }}
+      if: matrix.target != ''
+
+    - uses: actions/cache@v4
+      with:
+        path: ${{ runner.tool_cache }}/qemu
+        key: qemu-${{ matrix.target }}-${{ env.QEMU_BUILD_VERSION }}-patched
+      if: matrix.target != '' && matrix.os == 'ubuntu-latest'
+
+    - name: Install cross-compilation tools
+      run: |
+        set -ex
+        sudo apt-get update
+        sudo apt-get install -y ${{ matrix.gcc_package }} ninja-build
+        upcase=$(echo ${{ matrix.target }} | awk '{ print toupper($0) }' | sed 's/-/_/g')
+        echo CARGO_TARGET_${upcase}_LINKER=${{ matrix.gcc }} >> $GITHUB_ENV
+      if: matrix.gcc_package != '' && matrix.os == 'ubuntu-latest'
+
+    - name: Install cross-compilation libraries
+      run: |
+        set -ex
+        sudo apt-get update
+        sudo apt-get install -y ${{ matrix.libc_package }}
+      if: matrix.libc_package != '' && matrix.os == 'ubuntu-latest'
+
+    - name: Install qemu
+      run: |
+        set -ex
+
+        upcase=$(echo ${{ matrix.target }} | awk '{ print toupper($0) }' | sed 's/-/_/g')
+        echo CARGO_TARGET_${upcase}_RUNNER=${{ runner.tool_cache }}/qemu/bin/${{ matrix.qemu }} ${{ matrix.qemu_args }} >> $GITHUB_ENV
+
+        # See if qemu is already in the cache
+        if [ -f ${{ runner.tool_cache }}/qemu/bin/${{ matrix.qemu }} ]; then
+          exit 0
+        fi
+
+        # Download and build qemu from source since the most recent release is
+        # way faster at arm emulation than the current version github actions'
+        # ubuntu image uses. Disable as much as we can to get it to build
+        # quickly.
+        cd
+        curl https://download.qemu.org/qemu-$QEMU_BUILD_VERSION.tar.xz | tar xJf -
+        cd qemu-$QEMU_BUILD_VERSION
+        patch -p1 < $GITHUB_WORKSPACE/ci/translate-errno.patch
+        patch -p1 < $GITHUB_WORKSPACE/ci/getsockopt-timeouts.patch
+        patch -p1 < $GITHUB_WORKSPACE/ci/s390x-stat-have-nsec.patch
+        ./configure --target-list=${{ matrix.qemu_target }} --prefix=${{ runner.tool_cache }}/qemu --disable-tools --disable-slirp --disable-fdt --disable-capstone --disable-docs
+        ninja -C build install
+      if: matrix.qemu != '' && matrix.os == 'ubuntu-latest'
+
+    - run: cd fd-lock && cargo update
+    - run: sed -i'.bak' 's/^version = "'`cd fd-lock && cargo tree --edges=normal |head -1 |sed 's/^[[:alnum:]_-]* v\([[:alnum:].-]*\) (.*/\1/'`'"$/version = '`grep -A1 '^name = "rustix"' fd-lock/Cargo.lock |grep ^version |sed 's/^[^"]*//'`'/' Cargo.toml
+    - run: cd fd-lock && echo '[patch.crates-io]' >> Cargo.toml
+    - run: cd fd-lock && echo 'rustix = { path = ".." }' >> Cargo.toml
+    - run: cd fd-lock && cargo test
+
+  wasmtime:
+    name: wasmtime
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        # Qemu doesn't support running Wasmtime.
+        build: [ubuntu, macos-latest]
+        include:
+          - build: ubuntu
+            os: ubuntu-latest
+            rust: nightly
+          - build: macos-latest
+            os: macos-latest
+            rust: nightly
+    steps:
+    - uses: actions/checkout@v4
+    - uses: ./.github/actions/install-rust
+      with:
+        toolchain: ${{ matrix.rust }}
+    - uses: actions/checkout@v4
+      with:
+        repository: sunfishcode/wasmtime
+        path: wasmtime
+        ref: rustix-0.35.6-beta.2
+        submodules: true
+
+    - run: rustup target add wasm32-wasip1
+    - run: cd wasmtime && cargo update
+    - run: sed -i'.bak' 's/^version = "'`cd wasmtime && cargo tree --edges=normal |head -1 |sed 's/^[[:alnum:]_-]* v\([[:alnum:].-]*\) (.*/\1/'`'"$/version = '`grep -A1 '^name = "rustix"' wasmtime/Cargo.lock |grep ^version |sed 's/^[^"]*//'`'/' Cargo.toml
+    - run: cd wasmtime && echo '[patch.crates-io]' >> Cargo.toml
+    - run: cd wasmtime && echo 'rustix = { path = ".." }' >> Cargo.toml
+    - run: cd wasmtime && cargo test --features "test-programs/test_programs" --workspace --exclude 'wasmtime-wasi-*' --exclude wasi-crypto --exclude wasmtime-fuzzing
+
+  nameless:
+    name: nameless
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        # Our build script below only runs on Linux at the moment.
+        # Our build script below doesn't support cross compilation at the moment.
+        build: [ubuntu]
+        include:
+          - build: ubuntu
+            os: ubuntu-latest
+            rust: nightly
+    steps:
+    - uses: actions/checkout@v4
+    - uses: ./.github/actions/install-rust
+      with:
+        toolchain: ${{ matrix.rust }}
+    - uses: actions/checkout@v4
+      with:
+        repository: sunfishcode/nameless
+        path: nameless
+        ref: rustix-0.35.6-beta.2
+
+    - run: |
+        set -ex
+        sudo apt-get update
+        sudo apt-get install -y libssl-dev
+    - run: cd nameless && cargo update
+    - run: sed -i'.bak' 's/^version = "'`cd nameless && cargo tree --edges=normal |head -1 |sed 's/^[[:alnum:]_-]* v\([[:alnum:].-]*\) (.*/\1/'`'"$/version = '`grep -A1 '^name = "rustix"' nameless/Cargo.lock |grep ^version |sed 's/^[^"]*//'`'/' Cargo.toml
+    - run: cd nameless && echo '[patch.crates-io]' >> Cargo.toml
+    - run: cd nameless && echo 'rustix = { path = ".." }' >> Cargo.toml
+    - run: cd nameless && cargo test
+
+  cap-std-ext:
+    name: cap-std-ext
+    runs-on: ${{ matrix.os }}
+    env:
+      QEMU_BUILD_VERSION: 7.0.0
+    strategy:
+      matrix:
+        # cap-std-ext only builds on Linux at the moment.
+        build: [ubuntu, i686-linux, aarch64-linux, powerpc-linux, powerpc64le-linux, riscv64-linux, s390x-linux, mipsel-linux, mips64el-linux, arm-linux]
+        include:
+          - build: ubuntu
+            os: ubuntu-latest
+            rust: nightly
+          - build: i686-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: i686-unknown-linux-gnu
+            gcc_package: gcc-i686-linux-gnu
+            gcc: i686-linux-gnu-gcc
+            libc_package: libc-dev-i386-cross
+          - build: aarch64-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: aarch64-unknown-linux-gnu
+            gcc_package: gcc-aarch64-linux-gnu
+            gcc: aarch64-linux-gnu-gcc
+            qemu: qemu-aarch64
+            qemu_args: -L /usr/aarch64-linux-gnu
+            qemu_target: aarch64-linux-user
+          - build: powerpc-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: powerpc-unknown-linux-gnu
+            gcc_package: gcc-powerpc-linux-gnu
+            gcc: powerpc-linux-gnu-gcc
+            qemu: qemu-ppc
+            qemu_args: -L /usr/powerpc-linux-gnu
+            qemu_target: ppc-linux-user
+          - build: powerpc64le-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: powerpc64le-unknown-linux-gnu
+            gcc_package: gcc-powerpc64le-linux-gnu
+            gcc: powerpc64le-linux-gnu-gcc
+            qemu: qemu-ppc64le
+            qemu_args: -L /usr/powerpc64le-linux-gnu
+            qemu_target: ppc64le-linux-user
+          - build: mips64el-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: mips64el-unknown-linux-gnuabi64
+            gcc_package: gcc-mips64el-linux-gnuabi64
+            gcc: mips64el-linux-gnuabi64-gcc
+            qemu: qemu-mips64el
+            qemu_args: -L /usr/mips64el-linux-gnuabi64
+            qemu_target: mips64el-linux-user
+          - build: mipsel-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: mipsel-unknown-linux-gnu
+            gcc_package: gcc-mipsel-linux-gnu
+            gcc: mipsel-linux-gnu-gcc
+            qemu: qemu-mipsel
+            qemu_args: -L /usr/mipsel-linux-gnu
+            qemu_target: mipsel-linux-user
+          - build: riscv64-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: riscv64gc-unknown-linux-gnu
+            gcc_package: gcc-riscv64-linux-gnu
+            gcc: riscv64-linux-gnu-gcc
+            qemu: qemu-riscv64
+            qemu_args: -L /usr/riscv64-linux-gnu
+            qemu_target: riscv64-linux-user
+          - build: s390x-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: s390x-unknown-linux-gnu
+            gcc_package: gcc-s390x-linux-gnu
+            gcc: s390x-linux-gnu-gcc
+            qemu: qemu-s390x
+            qemu_args: -L /usr/s390x-linux-gnu
+            qemu_target: s390x-linux-user
+          - build: arm-linux
+            os: ubuntu-latest
+            rust: nightly
+            target: armv5te-unknown-linux-gnueabi
+            gcc_package: gcc-arm-linux-gnueabi
+            gcc: arm-linux-gnueabi-gcc
+            qemu: qemu-arm
+            qemu_args: -L /usr/arm-linux-gnueabi
+            qemu_target: arm-linux-user
+    steps:
+    - uses: actions/checkout@v4
+    - uses: ./.github/actions/install-rust
+      with:
+        toolchain: ${{ matrix.rust }}
+    - uses: actions/checkout@v4
+      with:
+        #repository: coreos/cap-std-ext
+        repository: sunfishcode/cap-std-ext
+        path: cap-std-ext
+        ref: rustix-0.35.6-beta.2
+
+    - name: Configure Cargo target
+      run: |
+        echo CARGO_BUILD_TARGET=${{ matrix.target }} >> $GITHUB_ENV
+        rustup target add ${{ matrix.target }}
+      if: matrix.target != ''
+
+    - uses: actions/cache@v4
+      with:
+        path: ${{ runner.tool_cache }}/qemu
+        key: qemu-${{ matrix.target }}-${{ env.QEMU_BUILD_VERSION }}-patched
+      if: matrix.target != '' && matrix.os == 'ubuntu-latest'
+
+    - name: Install cross-compilation tools
+      run: |
+        set -ex
+        sudo apt-get update
+        sudo apt-get install -y ${{ matrix.gcc_package }} ninja-build
+        upcase=$(echo ${{ matrix.target }} | awk '{ print toupper($0) }' | sed 's/-/_/g')
+        echo CARGO_TARGET_${upcase}_LINKER=${{ matrix.gcc }} >> $GITHUB_ENV
+      if: matrix.gcc_package != '' && matrix.os == 'ubuntu-latest'
+
+    - name: Install cross-compilation libraries
+      run: |
+        set -ex
+        sudo apt-get update
+        sudo apt-get install -y ${{ matrix.libc_package }}
+      if: matrix.libc_package != '' && matrix.os == 'ubuntu-latest'
+
+    - name: Install qemu
+      run: |
+        set -ex
+
+        upcase=$(echo ${{ matrix.target }} | awk '{ print toupper($0) }' | sed 's/-/_/g')
+        echo CARGO_TARGET_${upcase}_RUNNER=${{ runner.tool_cache }}/qemu/bin/${{ matrix.qemu }} ${{ matrix.qemu_args }} >> $GITHUB_ENV
+
+        # See if qemu is already in the cache
+        if [ -f ${{ runner.tool_cache }}/qemu/bin/${{ matrix.qemu }} ]; then
+          exit 0
+        fi
+
+        # Download and build qemu from source since the most recent release is
+        # way faster at arm emulation than the current version github actions'
+        # ubuntu image uses. Disable as much as we can to get it to build
+        # quickly.
+        cd
+        curl https://download.qemu.org/qemu-$QEMU_BUILD_VERSION.tar.xz | tar xJf -
+        cd qemu-$QEMU_BUILD_VERSION
+        patch -p1 < $GITHUB_WORKSPACE/ci/translate-errno.patch
+        patch -p1 < $GITHUB_WORKSPACE/ci/getsockopt-timeouts.patch
+        patch -p1 < $GITHUB_WORKSPACE/ci/s390x-stat-have-nsec.patch
+        ./configure --target-list=${{ matrix.qemu_target }} --prefix=${{ runner.tool_cache }}/qemu --disable-tools --disable-slirp --disable-fdt --disable-capstone --disable-docs
+        ninja -C build install
+      if: matrix.qemu != '' && matrix.os == 'ubuntu-latest'
+
+    - run: cd cap-std-ext && cargo update
+    - run: sed -i'.bak' 's/^version = "'`cd cap-std-ext && cargo tree --edges=normal |head -1 |sed 's/^[[:alnum:]_-]* v\([[:alnum:].-]*\) (.*/\1/'`'"$/version = '`grep -A1 '^name = "rustix"' cap-std-ext/Cargo.lock |grep ^version |sed 's/^[^"]*//'`'/' Cargo.toml
+    - run: cd cap-std-ext && echo '[patch.crates-io]' >> Cargo.toml
+    - run: cd cap-std-ext && echo 'rustix = { path = ".." }' >> Cargo.toml
+    - run: cd cap-std-ext && cargo test
+
+  dbus-rs:
+    name: dbus-rs ported to rustix
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        # Our build script below only runs on Linux at the moment.
+        # Our build script below doesn't support cross compilation at the moment.
+        build: [ubuntu]
+        include:
+          - build: ubuntu
+            os: ubuntu-latest
+            #rust: nightly
+            rust: stable
+    steps:
+    - uses: actions/checkout@v4
+    - uses: ./.github/actions/install-rust
+      with:
+        toolchain: ${{ matrix.rust }}
+    - uses: actions/checkout@v4
+      with:
+        repository: sunfishcode/dbus-rs
+        path: dbus-rs
+        ref: rustix-0.35.6-beta.2
+
+    - run: |
+        set -ex
+        sudo apt-get update
+        sudo apt-get install -y libdbus-1-dev at-spi2-core pkg-config
+    - run: cd dbus-rs && cargo update
+    - run: sed -i'.bak' 's/^version = "'`cd dbus-rs && cargo tree --edges=normal |head -1 |sed 's/^[[:alnum:]_-]* v\([[:alnum:].-]*\) (.*/\1/'`'"$/version = '`grep -A1 '^name = "rustix"' dbus-rs/Cargo.lock |grep ^version |sed 's/^[^"]*//'`'/' Cargo.toml
+    - run: cd dbus-rs && echo '[patch.crates-io]' >> Cargo.toml
+    - run: cd dbus-rs && echo 'rustix = { path = ".." }' >> Cargo.toml
+    - run: cd dbus-rs && env DBUS_SESSION_BUS_ADDRESS=`dbus-daemon --session --print-address --fork` cargo test --workspace
+
+  mustang:
+    name: mustang
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        build: [ubuntu]
+        include:
+          - build: ubuntu
+            os: ubuntu-latest
+            rust: nightly
+    steps:
+    - uses: actions/checkout@v4
+    - uses: ./.github/actions/install-rust
+      with:
+        toolchain: ${{ matrix.rust }}
+    - uses: actions/checkout@v4
+      with:
+        repository: sunfishcode/mustang
+        path: mustang
+
+    - run: rustup component add rust-src --toolchain nightly-x86_64-unknown-linux-gnu
+    - run: cd mustang && cargo update
+    - run: sed -i'.bak' 's/^version = "'`cd mustang && cargo tree --edges=normal |head -1 |sed 's/^[[:alnum:]_-]* v\([[:alnum:].-]*\) (.*/\1/'`'"$/version = '`grep -A1 '^name = "rustix"' mustang/Cargo.lock |grep ^version |sed 's/^[^"]*//'`'/' Cargo.toml
+    - run: cd mustang && echo '[patch.crates-io]' >> Cargo.toml
+    - run: cd mustang && echo 'rustix = { path = ".." }' >> Cargo.toml
+    # This test takes too long.
+    - run: cd mustang && sed -i'.bak' 's/fn concurrent_recursive_mkdir()/#[ignore]\rfn concurrent_recursive_mkdir()/' tests/fs.rs
+    # Use jobs=1 to hopefully avoid apparently oversubscribing the runner.
+    - run: cd mustang && cargo test --target=specs/x86_64-mustang-linux-gnu.json -Zbuild-std --jobs=1
+
+  std:
+    name: std ported to rustix
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        build: [ubuntu]
+        include:
+          - build: ubuntu
+            os: ubuntu-latest
+            rust: nightly
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        # Fetch everything to get rebase with rustc-dep-of-std.
+        fetch-depth: 0
+    - uses: ./.github/actions/install-rust
+      with:
+        toolchain: ${{ matrix.rust }}
+    - uses: actions/checkout@v4
+      with:
+        repository: sunfishcode/rust
+        path: rust
+        ref: rustix
+        submodules: true
+        # Fetch at least 200 to let the bootstrap script find an LLVM revision.
+        fetch-depth: 200
+    # Hack to get git rebase to work.
+    - run: git config --global user.email "you@example.com"
+    - run: git config --global user.name "Your Name"
+    # Include the changes needed to support std.
+    - run: git rebase origin/rustc-dep-of-std
+    # Download a pre-built LLVM instead of building it from source.
+    - run: cd rust && echo "[llvm]" >> config.toml
+    - run: cd rust && echo "download-ci-llvm = true" >> config.toml
+    - run: cd rust && sed -i'.bak' 's/\<git = "https:\/\/github\.com\/bytecodealliance\/rustix", branch = "rustc-dep-of-std"/path = "..\/..\/.."/' library/std/Cargo.toml
+    - run: cd rust && ./x.py test library/std --stage=0
+      # See <https://github.com/bytecodealliance/rustix/issues/76#issuecomment-962196433>
+      env:
+        RUSTFLAGS: --cfg=linux_raw --cfg=asm --cfg=rustc_attrs
