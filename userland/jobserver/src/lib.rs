@@ -94,7 +94,10 @@ mod imp;
 #[cfg(windows)]
 #[path = "windows.rs"]
 mod imp;
-#[cfg(not(any(unix, windows)))]
+#[cfg(target_os = "toyos")]
+#[path = "toyos.rs"]
+mod imp;
+#[cfg(not(any(unix, windows, target_os = "toyos")))]
 #[path = "wasm.rs"]
 mod imp;
 

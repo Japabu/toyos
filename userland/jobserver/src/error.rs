@@ -1,6 +1,8 @@
 #[cfg(unix)]
 type RawFd = std::os::unix::io::RawFd;
-#[cfg(not(unix))]
+#[cfg(target_os = "toyos")]
+type RawFd = std::os::fd::RawFd;
+#[cfg(not(any(unix, target_os = "toyos")))]
 type RawFd = std::convert::Infallible;
 
 /// Error type for [`Client::from_env_ext`] function.
