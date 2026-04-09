@@ -163,8 +163,7 @@ psm_stack_manipulation! {
                 let (stack_base, allocated_stack_size) = guard.stack_area();
                 debug_assert!(allocated_stack_size >= requested_stack_size);
                 set_stack_limit(Some(stack_base as usize));
-                // TODO should we not pass `allocated_stack_size` here?
-                let panic = psm::on_stack(stack_base, requested_stack_size, move || {
+                let panic = psm::on_stack(stack_base, allocated_stack_size, move || {
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(callback)).err()
                 });
                 drop(guard);
@@ -176,12 +175,12 @@ psm_stack_manipulation! {
     }
 
     no {
-        #[cfg(not(windows))]
+        #[cfg(not(all(windows, not(miri))))]
         fn _grow(stack_size: usize, callback: &mut dyn FnMut()) {
             let _ = stack_size;
             callback();
         }
-        #[cfg(windows)]
+        #[cfg(all(windows, not(miri)))]
         use backends::windows::_grow;
     }
 }

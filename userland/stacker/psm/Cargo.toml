@@ -8,10 +8,11 @@ description = "Portable Stack Manipulation: stack manipulation and introspection
 keywords = ["stack", "no_std"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/rust-lang/stacker/"
-documentation = "https://docs.rs/psm/0.1.25"
+documentation = "https://docs.rs/psm/0.1.30"
 readme = "README.mkd"
 
 [dependencies]
 
 [build-dependencies]
-cc = "1.1.22"
+ar_archive_writer = "0.5.0"
+cc = "1.2.33"
