@@ -7,6 +7,40 @@
 //! * loose object reading and writing
 //! * access to packed objects
 //! * multiple loose objects and pack locations as gathered from `alternates` files.
+//!
+//! ## Write And Read Loose Objects
+//!
+//! ```
+//! # fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+//! # mod doctest { include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/doctest.rs")); }
+//! use gix_object::{FindExt, Write};
+//!
+//! let (_dir, odb) = doctest::empty_store()?;
+//! let id = odb.write_buf(gix_object::Kind::Blob, b"hello")?;
+//!
+//! let mut buf = Vec::new();
+//! let object = odb.find(&id, &mut buf)?;
+//! assert_eq!(object.kind, gix_object::Kind::Blob);
+//! assert_eq!(object.data, b"hello");
+//! # Ok(()) }
+//! ```
+//!
+//! ## Inspect Headers Without Decoding The Object
+//!
+//! ```
+//! # fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+//! # mod doctest { include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/doctest.rs")); }
+//! use gix_object::Write;
+//! use gix_odb::HeaderExt;
+//!
+//! let (_dir, odb) = doctest::empty_store()?;
+//! let id = odb.write_buf(gix_object::Kind::Blob, b"hello")?;
+//!
+//! let header = odb.header(&id)?;
+//! assert_eq!(header.kind(), gix_object::Kind::Blob);
+//! assert_eq!(header.size(), 5);
+//! # Ok(()) }
+//! ```
 //! ## Feature Flags
 #![cfg_attr(
     all(doc, feature = "document-features"),

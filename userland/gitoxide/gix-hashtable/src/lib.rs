@@ -1,6 +1,22 @@
 //! Customized `HashMap` and Hasher implementation optimized for using `ObjectId`s as keys.
 //!
 //! The crate mirrors `std::collections` in layout for familiarity.
+//!
+//! ## Examples
+//!
+//! ```
+//! use gix_hash::{Kind, ObjectId};
+//!
+//! let id = ObjectId::empty_blob(Kind::Sha1);
+//!
+//! let mut map = gix_hashtable::HashMap::default();
+//! map.insert(id, "empty blob");
+//! assert_eq!(map.get(&id), Some(&"empty blob"));
+//!
+//! let shared = gix_hashtable::sync::ObjectIdMap::default();
+//! assert_eq!(shared.insert(id, 1), None);
+//! assert_eq!(shared.insert(id, 2), Some(1));
+//! ```
 #![deny(missing_docs, rust_2018_idioms)]
 #![forbid(unsafe_code)]
 

@@ -296,7 +296,7 @@ mod tests {
     use crate::handshake::{refs, refs::shared::InternalRef};
 
     #[test]
-    fn extract_symbolic_references_from_capabilities() -> Result<(), client::Error> {
+    fn from_capabilities_extracts_symbolic_references() -> Result<(), client::Error> {
         let caps = client::Capabilities::from_bytes(
             b"\0unrelated symref=HEAD:refs/heads/main symref=ANOTHER:refs/heads/foo symref=MISSING_NAMESPACE_TARGET:(null) agent=git/2.28.0",
         )?

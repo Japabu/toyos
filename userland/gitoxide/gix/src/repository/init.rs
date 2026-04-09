@@ -34,6 +34,32 @@ impl crate::Repository {
     pub fn into_sync(self) -> crate::ThreadSafeRepository {
         self.into()
     }
+
+    /// Reopen this repository in place using the stored open options.
+    /// Use this to forcefully refresh Git configuration, drop caches, and release system resources
+    /// for opened object database resources.
+    ///
+    /// This discards in-memory-only configuration edits and any other transient repository state that is recreated
+    /// during opening.
+    ///
+    /// # Notes on relative paths
+    ///
+    /// When the [`git_dir`](Self::git_dir()) is relative and the current working dir changed,
+    /// then a reload will be performed on the joined path of both to make it succeed, which makes
+    /// the reloaded repository git-dir absolute.
+    pub fn reload(&mut self) -> Result<&mut Self, crate::open::Error> {
+        let mut git_dir = self.git_dir().to_owned();
+        let options = self.options.clone().open_path_as_is(true);
+        if git_dir.is_relative() {
+            if let Some((prev_cwd, cwd)) = options.current_dir.as_ref().zip(std::env::current_dir().ok()) {
+                if *prev_cwd != cwd {
+                    git_dir = prev_cwd.join(git_dir);
+                }
+            }
+        }
+        *self = crate::ThreadSafeRepository::open_opts(git_dir, options)?.to_thread_local();
+        Ok(self)
+    }
 }
 
 #[cfg_attr(not(feature = "max-performance-safe"), allow(unused_variables, unused_mut))]

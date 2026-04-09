@@ -442,6 +442,7 @@ mod abbrev {
 mod validate {
     use crate::{bstr::BStr, config::tree::keys};
 
+    #[derive(Clone, Copy)]
     pub struct Disambiguate;
     impl keys::Validate for Disambiguate {
         #[cfg_attr(not(feature = "revision"), allow(unused_variables))]
@@ -452,6 +453,7 @@ mod validate {
         }
     }
 
+    #[derive(Clone, Copy)]
     pub struct LogAllRefUpdates;
     impl keys::Validate for LogAllRefUpdates {
         fn validate(&self, value: &BStr) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
@@ -461,6 +463,7 @@ mod validate {
         }
     }
 
+    #[derive(Clone, Copy)]
     pub struct CheckStat;
     impl keys::Validate for CheckStat {
         fn validate(&self, value: &BStr) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
@@ -469,6 +472,7 @@ mod validate {
         }
     }
 
+    #[derive(Clone, Copy)]
     pub struct Abbrev;
     impl keys::Validate for Abbrev {
         fn validate(&self, value: &BStr) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
@@ -479,6 +483,7 @@ mod validate {
     }
 
     #[cfg(feature = "attributes")]
+    #[derive(Clone, Copy)]
     pub struct SafeCrlf;
     #[cfg(feature = "attributes")]
     impl keys::Validate for SafeCrlf {
@@ -489,6 +494,7 @@ mod validate {
     }
 
     #[cfg(feature = "attributes")]
+    #[derive(Clone, Copy)]
     pub struct AutoCrlf;
     #[cfg(feature = "attributes")]
     impl keys::Validate for AutoCrlf {
@@ -499,6 +505,7 @@ mod validate {
     }
 
     #[cfg(feature = "attributes")]
+    #[derive(Clone, Copy)]
     pub struct Eol;
     #[cfg(feature = "attributes")]
     impl keys::Validate for Eol {
@@ -509,6 +516,7 @@ mod validate {
     }
 
     #[cfg(feature = "attributes")]
+    #[derive(Clone, Copy)]
     pub struct CheckRoundTripEncoding;
     #[cfg(feature = "attributes")]
     impl keys::Validate for CheckRoundTripEncoding {

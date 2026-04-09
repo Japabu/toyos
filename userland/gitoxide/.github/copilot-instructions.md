@@ -66,6 +66,7 @@ Follow "purposeful conventional commits" style:
 - Follow existing patterns in the codebase
 - No `.unwrap()` - use `.expect("context")` if you are sure this can't fail.
 - Prefer references in plumbing crates to avoid expensive clones
+- Avoid calling `.detach()` unless an owned value is explicitly required. Many `gix` APIs accept attached ids and references directly, so prefer keeping repository-backed handles like `gix::Id` when possible.
 - Use `gix_features::threading::*` for interior mutability primitives
 
 ### Path Handling

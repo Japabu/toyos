@@ -1046,7 +1046,11 @@ fn force_and_dir(
             let dir = fixture_path_inner(
                 Path::new("generated-do-not-edit")
                     .join(archive_name)
-                    .join(hash_kind.unwrap_or_else(hash_kind_from_env).to_string())
+                    .join(
+                        hash_kind
+                            .unwrap_or_else(|| hash_kind_from_env().unwrap_or_default())
+                            .to_string(),
+                    )
                     .join(format!("{}-{}", script_identity, family_name())),
                 root,
             );
@@ -1141,8 +1145,7 @@ where
         gix_tempfile::signal::handler::Mode::DeleteTempfilesOnTerminationAndRestoreDefaultBehaviour,
     );
 
-    let hash_kind = hash_kind_from_env();
-    eprintln!("Using hash '{hash_kind}' when determining which fixture to use or recreate");
+    let hash_kind = hash_kind_from_env().unwrap_or_default();
 
     let script_location = script_name.as_ref();
     let script_path = fixture_path_inner(script_location, root);
@@ -1266,15 +1269,29 @@ where
     Ok((script_result_directory, res))
 }
 
-fn hash_kind_from_env() -> gix_hash::Kind {
-    env::var_os("GIX_TEST_FIXTURE_HASH").and_then(|value| value.into_string().ok()).map(|object_kind| {
+/// Returns the hash function that is used when creating or loading test fixtures.
+///
+/// The value returned is derived from the environment variable `GIX_TEST_FIXTURE_HASH`.
+/// Use this, e. g., when you need to run different assertions depending on the hash
+/// function used in a specific fixture.
+///
+/// Returns `None` if the environment variable isn't set.
+///
+/// # Panics
+///
+/// If the value set in `GIX_TEST_FIXTURE_HASH` is not valid.
+pub fn hash_kind_from_env() -> Option<gix_hash::Kind> {
+    static FIXTURE_HASH: LazyLock<Option<gix_hash::Kind>> = LazyLock::new(|| {
+        env::var_os("GIX_TEST_FIXTURE_HASH").and_then(|value| value.into_string().ok()).map(|object_kind| {
         gix_hash::Kind::from_str(&object_kind).unwrap_or_else(|_| {
                     panic!(
                         "GIX_TEST_FIXTURE_HASH was set to {object_kind} which is an invalid value. Valid values are {}. Exiting.",
                         gix_hash::Kind::all().iter().map(std::string::ToString::to_string).collect::<Vec<_>>().join(", ")
                     )
                 })
-    }).unwrap_or_default()
+    })
+    });
+    *FIXTURE_HASH
 }
 
 #[cfg(windows)]

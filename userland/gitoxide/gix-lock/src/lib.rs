@@ -14,6 +14,28 @@
 //! * [All limitations of `gix-tempfile`](gix_tempfile) apply. **A highlight of such a limitation is resource leakage
 //!   which results in them being permanently locked unless there is user-intervention.**
 //! * As the lock file is separate from the actual resource, locking is merely a convention rather than being enforced.
+//!
+//! ## Examples
+//!
+//! ```
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! use std::io::Write;
+//!
+//! # let dir = tempfile::tempdir()?;
+//! let resource = dir.path().join("config");
+//! std::fs::write(&resource, b"old = value\n")?;
+//! let mut lock = gix_lock::File::acquire_to_update_resource(
+//!     &resource,
+//!     gix_lock::acquire::Fail::Immediately,
+//!     None,
+//! )?;
+//! lock.write_all(b"new = value\n")?;
+//! let (resource_path, _) = lock.commit()?;
+//!
+//! assert_eq!(resource_path, resource);
+//! assert_eq!(std::fs::read_to_string(&resource)?, "new = value\n");
+//! # Ok(()) }
+//! ```
 #![deny(missing_docs, rust_2018_idioms, unsafe_code)]
 
 use std::path::PathBuf;

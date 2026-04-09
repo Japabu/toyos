@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use crate::{bstr::BString, config};
 
 /// Permissions associated with various resources of a git repository
-#[derive(Debug, Clone)]
+#[derive(Copy, Clone, Ord, PartialOrd, PartialEq, Eq, Debug, Hash)]
 pub struct Permissions {
     /// Control which environment variables may be accessed.
     pub env: permissions::Environment,

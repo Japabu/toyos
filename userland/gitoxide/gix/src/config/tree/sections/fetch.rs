@@ -77,6 +77,7 @@ mod algorithm {
 mod validate {
     use crate::{bstr::BStr, config::tree::keys};
 
+    #[derive(Clone, Copy)]
     pub struct NegotiationAlgorithm;
     impl keys::Validate for NegotiationAlgorithm {
         #[cfg_attr(not(feature = "credentials"), allow(unused_variables))]
@@ -88,6 +89,7 @@ mod validate {
     }
 
     #[cfg(feature = "attributes")]
+    #[derive(Clone, Copy)]
     pub struct RecurseSubmodules;
     #[cfg(feature = "attributes")]
     impl keys::Validate for RecurseSubmodules {

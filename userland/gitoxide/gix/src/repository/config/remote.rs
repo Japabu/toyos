@@ -10,6 +10,18 @@ use crate::{
 impl crate::Repository {
     /// Returns a sorted list unique of symbolic names of remotes that
     /// we deem [trustworthy][crate::open::Options::filter_config_section()].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    /// # mod doctest { include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/doctest.rs")); }
+    /// # let repo = doctest::open_repo(doctest::remote_repo_dir("clone")?)?;
+    /// let remote_names: Vec<_> = repo.remote_names().into_iter().map(|name| name.to_string()).collect();
+    ///
+    /// assert_eq!(remote_names, vec!["myself".to_owned(), "origin".to_owned()]);
+    /// # Ok(()) }
+    /// ```
     pub fn remote_names(&self) -> remote::Names<'_> {
         self.config
             .resolved
@@ -31,6 +43,27 @@ impl crate::Repository {
     /// # Notes
     ///
     /// It's up to the caller to determine what to do if the current `head` is unborn or detached.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    /// # mod doctest { include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/doctest.rs")); }
+    /// # let repo = doctest::open_repo(doctest::remote_repo_dir("clone")?)?;
+    /// assert_eq!(
+    ///     repo.remote_default_name(gix::remote::Direction::Fetch)
+    ///         .expect("configured")
+    ///         .as_ref(),
+    ///     "origin"
+    /// );
+    /// assert_eq!(
+    ///     repo.remote_default_name(gix::remote::Direction::Push)
+    ///         .expect("configured")
+    ///         .as_ref(),
+    ///     "origin"
+    /// );
+    /// # Ok(()) }
+    /// ```
     pub fn remote_default_name(&self, direction: remote::Direction) -> Option<Cow<'_, BStr>> {
         let name = (direction == remote::Direction::Push)
             .then(|| {

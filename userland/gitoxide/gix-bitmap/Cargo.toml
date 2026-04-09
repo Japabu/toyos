@@ -12,7 +12,7 @@ rust-version = "1.82"
 exclude = ["CHANGELOG.md"]
 
 [lib]
-doctest = false
+doctest = true
 test = true
 
 [dependencies]

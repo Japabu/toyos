@@ -22,6 +22,7 @@ pub mod name {
         EndsWithSlash,
         Empty,
         SomeLowercase,
+        Reserved { name: BString },
     }
 
     impl std::fmt::Display for Error {
@@ -39,6 +40,7 @@ pub mod name {
                 Error::EndsWithSlash => write!(f, "Reference name cannot end with a slash"),
                 Error::Empty => write!(f, "Reference name cannot be empty"),
                 Error::SomeLowercase => write!(f, "Standalone references must be all uppercased, like 'HEAD'"),
+                Error::Reserved { name } => write!(f, "Reference name is reserved and cannot be used: {name:?}"),
             }
         }
     }
@@ -79,6 +81,17 @@ pub fn name(path: &BStr) -> Result<&BStr, name::Error> {
             unreachable!("Without sanitization, there is no chance a sanitized version is returned.")
         }
     }
+}
+
+/// Validate a reference name for use as a local branch.
+///
+/// This is like [`name()`], but also rejects `refs/heads/HEAD`, matching Git's branch-specific validation.
+pub fn branch_name(path: &BStr) -> Result<&BStr, name::Error> {
+    let path = name(path)?;
+    if path == "refs/heads/HEAD" {
+        return Err(name::Error::Reserved { name: path.into() });
+    }
+    Ok(path)
 }
 
 /// Validate a partial reference name. As it is assumed to be partial, names like `some-name` is allowed

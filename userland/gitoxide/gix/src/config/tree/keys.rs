@@ -14,6 +14,7 @@ use crate::{
 };
 
 /// Implements a value without any constraints, i.e. a any value.
+#[derive(Copy, Clone)]
 pub struct Any<T: Validate = validate::All> {
     /// The key of the value in the git configuration.
     pub name: &'static str,
@@ -148,7 +149,7 @@ impl<T: Validate> Key for Any<T> {
     }
 }
 
-impl<T: Validate> gix_config::AsKey for Any<T> {
+impl<T: Validate + Copy + Clone> gix_config::AsKey for Any<T> {
     fn as_key(&self) -> gix_config::KeyRef<'_> {
         self.try_as_key().expect("infallible")
     }
@@ -512,7 +513,7 @@ pub mod validate {
     };
 
     /// Everything is valid.
-    #[derive(Default)]
+    #[derive(Default, Copy, Clone)]
     pub struct All;
 
     impl Validate for All {
@@ -522,7 +523,7 @@ pub mod validate {
     }
 
     /// Assure that values that parse as git dates are valid.
-    #[derive(Default)]
+    #[derive(Default, Clone, Copy)]
     pub struct Time;
 
     impl Validate for Time {
@@ -534,7 +535,7 @@ pub mod validate {
     }
 
     /// Assure that values that parse as unsigned integers are valid.
-    #[derive(Default)]
+    #[derive(Default, Clone, Copy)]
     pub struct UnsignedInteger;
 
     impl Validate for UnsignedInteger {
@@ -550,7 +551,7 @@ pub mod validate {
     }
 
     /// Assure that values that parse as git booleans are valid.
-    #[derive(Default)]
+    #[derive(Default, Clone, Copy)]
     pub struct Boolean;
 
     impl Validate for Boolean {
@@ -561,7 +562,7 @@ pub mod validate {
     }
 
     /// Values that are git remotes, symbolic or urls
-    #[derive(Default)]
+    #[derive(Default, Clone, Copy)]
     pub struct RemoteName;
     impl Validate for RemoteName {
         fn validate(&self, value: &BStr) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
@@ -572,7 +573,7 @@ pub mod validate {
     }
 
     /// Values that are programs - everything is allowed.
-    #[derive(Default)]
+    #[derive(Default, Clone, Copy)]
     pub struct Program;
     impl Validate for Program {
         fn validate(&self, _value: &BStr) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
@@ -581,7 +582,7 @@ pub mod validate {
     }
 
     /// Values that are programs executables, everything is allowed.
-    #[derive(Default)]
+    #[derive(Default, Clone, Copy)]
     pub struct Executable;
     impl Validate for Executable {
         fn validate(&self, _value: &BStr) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
@@ -590,7 +591,7 @@ pub mod validate {
     }
 
     /// Values that parse as URLs.
-    #[derive(Default)]
+    #[derive(Default, Clone, Copy)]
     pub struct Url;
     impl Validate for Url {
         fn validate(&self, value: &BStr) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
@@ -600,7 +601,7 @@ pub mod validate {
     }
 
     /// Values that parse as ref-specs for pushing.
-    #[derive(Default)]
+    #[derive(Default, Clone, Copy)]
     pub struct PushRefSpec;
     impl Validate for PushRefSpec {
         fn validate(&self, value: &BStr) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
@@ -610,7 +611,7 @@ pub mod validate {
     }
 
     /// Values that parse as ref-specs for pushing.
-    #[derive(Default)]
+    #[derive(Default, Clone, Copy)]
     pub struct FetchRefSpec;
     impl Validate for FetchRefSpec {
         fn validate(&self, value: &BStr) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
@@ -620,6 +621,7 @@ pub mod validate {
     }
 
     /// Timeouts used for file locks.
+    #[derive(Clone, Copy)]
     pub struct LockTimeout;
     impl Validate for LockTimeout {
         fn validate(&self, value: &BStr) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
@@ -632,6 +634,7 @@ pub mod validate {
     }
 
     /// Durations in milliseconds.
+    #[derive(Clone, Copy)]
     pub struct DurationInMilliseconds;
     impl Validate for DurationInMilliseconds {
         fn validate(&self, value: &BStr) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
@@ -644,6 +647,7 @@ pub mod validate {
     }
 
     /// A UTF-8 string.
+    #[derive(Clone, Copy)]
     pub struct String;
     impl Validate for String {
         fn validate(&self, value: &BStr) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
@@ -653,6 +657,7 @@ pub mod validate {
     }
 
     /// Any path - everything is allowed.
+    #[derive(Clone, Copy)]
     pub struct Path;
     impl Validate for Path {
         fn validate(&self, _value: &BStr) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {

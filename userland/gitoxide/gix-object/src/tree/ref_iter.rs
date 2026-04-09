@@ -1,7 +1,57 @@
+use std::ops::ControlFlow;
+
 use bstr::BStr;
 use winnow::{error::ParserError, prelude::*};
 
 use crate::{tree, tree::EntryRef, TreeRef, TreeRefIter};
+
+/// Advance a path lookup by matching the next path component against `tree`.
+///
+/// `components` must yield the remaining path components to resolve, and `tree` must be the
+/// current object to search in.
+///
+/// The return value indicates how the caller should proceed:
+///
+/// - [`ControlFlow::Continue`] contains the object id of the matched entry when there are more
+///   components left to resolve. Callers should load that object and pass it back into a subsequent
+///   invocation.
+/// - [`ControlFlow::Break`]`(Some(entry))` contains the matched entry for the final component, and
+///   signals that lookup completed successfully.
+/// - [`ControlFlow::Break`]`(None)` signals that lookup cannot continue and should stop without a
+///   match. This happens if `tree` is not a tree object, if `components` is already exhausted, or if
+///   the next component is not present in `tree`.
+///
+/// Note that this behaviour is tuned to prefer to exhaust the entire chain of `components`, only the
+/// last component can yield a [`ControlFlow::Break`].
+pub fn next_entry<'a, I, P>(
+    components: &mut core::iter::Peekable<I>,
+    tree: crate::Data<'a>,
+) -> core::ops::ControlFlow<Option<EntryRef<'a>>, gix_hash::ObjectId>
+where
+    I: Iterator<Item = P>,
+    P: PartialEq<BStr>,
+{
+    if !tree.kind.is_tree() {
+        return ControlFlow::Break(None);
+    }
+
+    let Some(component) = components.next() else {
+        return ControlFlow::Break(None);
+    };
+
+    let Some(entry) = TreeRefIter::from_bytes(tree.data)
+        .filter_map(Result::ok)
+        .find(|entry| component.eq(entry.filename))
+    else {
+        return ControlFlow::Break(None);
+    };
+
+    if components.peek().is_none() {
+        ControlFlow::Break(Some(entry))
+    } else {
+        ControlFlow::Continue(entry.oid.to_owned())
+    }
+}
 
 impl<'a> TreeRefIter<'a> {
     /// Instantiate an iterator from the given tree data.
@@ -28,30 +78,22 @@ impl<'a> TreeRefIter<'a> {
         P: PartialEq<BStr>,
     {
         buffer.clear();
-
-        let mut path = path.into_iter().peekable();
         buffer.extend_from_slice(self.data);
-        while let Some(component) = path.next() {
-            match TreeRefIter::from_bytes(buffer)
-                .filter_map(Result::ok)
-                .find(|entry| component.eq(entry.filename))
-            {
-                Some(entry) => {
-                    if path.peek().is_none() {
-                        return Ok(Some(entry.into()));
-                    } else {
-                        let next_id = entry.oid.to_owned();
-                        let obj = odb.try_find(&next_id, buffer)?;
-                        let Some(obj) = obj else { return Ok(None) };
-                        if !obj.kind.is_tree() {
-                            return Ok(None);
-                        }
-                    }
+
+        let mut iter = path.into_iter().peekable();
+        let mut data = crate::Data::new(crate::Kind::Tree, buffer);
+
+        loop {
+            data = match next_entry(&mut iter, data) {
+                ControlFlow::Continue(oid) => {
+                    let Some(next_tree) = odb.try_find(&oid, buffer)? else {
+                        break Ok(None);
+                    };
+                    next_tree
                 }
-                None => return Ok(None),
+                ControlFlow::Break(v) => break Ok(v.map(Into::into)),
             }
         }
-        Ok(None)
     }
 
     /// Like [`Self::lookup_entry()`], but takes any [`AsRef<Path>`](`std::path::Path`) directly via `relative_path`,
@@ -68,15 +110,13 @@ impl<'a> TreeRefIter<'a> {
         buffer: &'a mut Vec<u8>,
         relative_path: impl AsRef<std::path::Path>,
     ) -> Result<Option<tree::Entry>, crate::find::Error> {
-        use crate::bstr::ByteSlice;
         self.lookup_entry(
             odb,
             buffer,
-            relative_path.as_ref().components().map(|c: std::path::Component<'_>| {
-                gix_path::os_str_into_bstr(c.as_os_str())
-                    .unwrap_or_else(|_| "".into())
-                    .as_bytes()
-            }),
+            relative_path
+                .as_ref()
+                .components()
+                .map(|c| c.as_os_str().as_encoded_bytes()),
         )
     }
 }
@@ -202,8 +242,21 @@ mod decode {
     }
 
     pub fn tree<'a, E: ParserError<&'a [u8]>>(i: &mut &'a [u8]) -> ModalResult<TreeRef<'a>, E> {
-        let mut out = Vec::new();
         let mut i = &**i;
+
+        // Calculate an estimate of the amount of entries to reduce
+        // the amount of allocations necessary.
+        // Note that this assumes that we want speed over fitting Vecs, this is a trade-off.
+        // TODO(SHA256): know actual/desired length for reduced overallocation
+        const HASH_LEN_FIXME: usize = 20;
+        const AVERAGE_FILENAME_LEN: usize = 24;
+        const AVERAGE_MODE_LEN: usize = 6;
+        const ENTRY_DELIMITER_LEN: usize = 2; // space + trailing zero
+        const AVERAGE_TREE_ENTRIES: usize = 16 * 2; // prevent overallocation beyond what's meaningful or what could be dangerous
+        let average_entry_len = ENTRY_DELIMITER_LEN + HASH_LEN_FIXME + AVERAGE_MODE_LEN + AVERAGE_FILENAME_LEN;
+        let upper_bound = i.len() / average_entry_len;
+        let mut out = Vec::with_capacity(upper_bound.min(AVERAGE_TREE_ENTRIES));
+
         while !i.is_empty() {
             let Some((rest, entry)) = fast_entry(i) else {
                 #[allow(clippy::unit_arg)]

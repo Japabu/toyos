@@ -1,4 +1,20 @@
 //! A library implementing a URL for use in git with access to its special capabilities.
+//!
+//! ## Examples
+//!
+//! ```
+//! let mut url = gix_url::parse("ssh://git@example.com/gitoxide".into()).unwrap();
+//! assert_eq!(url.user(), Some("git"));
+//! assert_eq!(url.host(), Some("example.com"));
+//! assert_eq!(url.to_bstring(), "ssh://git@example.com/gitoxide");
+//!
+//! assert_eq!(url.set_user(Some("byron".into())), Some("git".into()));
+//! assert_eq!(url.user_argument_safe(), Some("byron"));
+//! assert_eq!(url.to_bstring(), "ssh://byron@example.com/gitoxide");
+//!
+//! let suspicious = gix_url::parse("ssh://-Fconfig@host/repo".into()).unwrap();
+//! assert_eq!(suspicious.user_argument_safe(), None, "The user isn't returned as it looks like an argument");
+//! ```
 //! ## Feature Flags
 #![cfg_attr(
     all(doc, feature = "document-features"),

@@ -35,6 +35,18 @@ impl<'repo> Reference<'repo> {
     }
 
     /// Return the target to which this reference points to.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    /// # mod doctest { include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/doctest.rs")); }
+    /// # let repo = doctest::open_repo(doctest::basic_repo_dir()?)?;
+    /// let branch = repo.find_reference("main")?;
+    ///
+    /// assert_eq!(branch.target().try_id().expect("direct target"), repo.head_id()?.as_ref());
+    /// # Ok(()) }
+    /// ```
     pub fn target(&self) -> gix_ref::TargetRef<'_> {
         self.inner.target.to_ref()
     }
@@ -83,6 +95,22 @@ impl<'repo> Reference<'repo> {
     ///
     /// Note that this method mutates `self` in place if it does not already point to a
     /// non-symbolic object.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    /// # mod doctest { include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/doctest.rs")); }
+    /// # let repo = doctest::open_repo(doctest::remote_repo_dir("base")?)?;
+    /// let mut tag = repo.find_reference("b-tag")?;
+    /// let tag_object_id = tag.id();
+    /// let peeled_id = tag.peel_to_id()?;
+    ///
+    /// assert!(repo.find_tag(tag_object_id).is_ok(), "the ref initially points to a tag object");
+    /// assert_ne!(peeled_id, tag_object_id);
+    /// assert_eq!(peeled_id, repo.find_reference("b")?.id());
+    /// # Ok(()) }
+    /// ```
     pub fn peel_to_id(&mut self) -> Result<Id<'repo>, peel::Error> {
         let oid = self.inner.peel_to_id(&self.repo.refs, &self.repo.objects)?;
         Ok(Id::from_id(oid, self.repo))
@@ -145,6 +173,19 @@ impl<'repo> Reference<'repo> {
     /// Peel this ref until the first commit.
     ///
     /// For details, see [`peel_to_kind`()](Self::peel_to_kind()).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    /// # mod doctest { include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/doctest.rs")); }
+    /// # let repo = doctest::open_repo(doctest::basic_repo_dir()?)?;
+    /// let mut branch = repo.find_reference("main")?;
+    /// let commit = branch.peel_to_commit()?;
+    ///
+    /// assert_eq!(commit.message_raw()?, "c2\n");
+    /// # Ok(()) }
+    /// ```
     pub fn peel_to_commit(&mut self) -> Result<Commit<'repo>, peel::to_kind::Error> {
         Ok(self.peel_to_kind(gix_object::Kind::Commit)?.into_commit())
     }
@@ -215,6 +256,19 @@ impl<'repo> Reference<'repo> {
     /// Follow this symbolic reference one level and return the ref it refers to.
     ///
     /// Returns `None` if this is not a symbolic reference, hence the leaf of the chain.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    /// # mod doctest { include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/doctest.rs")); }
+    /// # let repo = doctest::open_repo(doctest::basic_repo_dir()?)?;
+    /// let head = repo.find_reference("HEAD")?;
+    /// let branch = head.follow().expect("symbolic")?;
+    ///
+    /// assert_eq!(branch.name().as_bstr(), "refs/heads/main");
+    /// # Ok(()) }
+    /// ```
     pub fn follow(&self) -> Option<Result<Reference<'repo>, gix_ref::file::find::existing::Error>> {
         self.inner.follow(&self.repo.refs).map(|res| {
             res.map(|r| Reference {

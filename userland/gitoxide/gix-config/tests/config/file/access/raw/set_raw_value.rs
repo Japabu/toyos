@@ -65,3 +65,14 @@ fn non_existing_values_cannot_be_set() -> crate::Result {
     );
     Ok(())
 }
+
+#[test]
+fn accepts_short_lived_keys() -> crate::Result {
+    let mut file = gix_config::File::default();
+    let key = String::from("new.key");
+
+    file.set_raw_value(key.as_str(), "value")?;
+
+    assert_eq!(file.string("new.key").expect("present").as_ref(), "value");
+    Ok(())
+}

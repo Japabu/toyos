@@ -1,4 +1,27 @@
 //! [Read](read()) and [write](write()) shallow files, while performing typical operations on them.
+//!
+//! ## Examples
+//!
+//! ```
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let first = gix_hash::ObjectId::from_hex(b"1111111111111111111111111111111111111111")?;
+//! let second = gix_hash::ObjectId::from_hex(b"2222222222222222222222222222222222222222")?;
+//! # let dir = tempfile::tempdir()?;
+//! # let shallow_file = dir.path().join("shallow");
+//! # std::fs::write(&shallow_file, format!("{first}\n"))?;
+//!
+//! let shallow = gix_shallow::read(&shallow_file)?.expect("a shallow boundary");
+//! let lock = gix_lock::File::acquire_to_update_resource(
+//!     &shallow_file,
+//!     gix_lock::acquire::Fail::Immediately,
+//!     None,
+//! )?;
+//! gix_shallow::write(lock, Some(shallow), &[gix_shallow::Update::Shallow(second)])?;
+//!
+//! let ids = gix_shallow::read(&shallow_file)?.unwrap().into_iter().collect::<Vec<_>>();
+//! assert_eq!(ids, vec![first, second]);
+//! # Ok(()) }
+//! ```
 #![deny(missing_docs, rust_2018_idioms)]
 #![forbid(unsafe_code)]
 

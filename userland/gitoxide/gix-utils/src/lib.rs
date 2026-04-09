@@ -1,6 +1,21 @@
 //! A crate with utilities that don't need feature toggles.
 //!
 //! If they would need feature toggles, they should be in `gix-features` instead.
+//!
+//! ## Examples
+//!
+//! ```
+//! use std::time::Duration;
+//!
+//! use gix_utils::{backoff::Quadratic};
+//!
+//! let waits: Vec<_> = Quadratic::default().take(3).collect();
+//! assert_eq!(waits, vec![
+//!     Duration::from_millis(1),
+//!     Duration::from_millis(4),
+//!     Duration::from_millis(9),
+//! ]);
+//! ```
 #![deny(rust_2018_idioms, missing_docs)]
 #![forbid(unsafe_code)]
 

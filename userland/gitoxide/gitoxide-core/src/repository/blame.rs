@@ -11,7 +11,7 @@ pub fn blame_file(
 ) -> anyhow::Result<()> {
     {
         let mut config = repo.config_snapshot_mut();
-        if config.string(&tree::Core::DELTA_BASE_CACHE_LIMIT).is_none() {
+        if config.string(tree::Core::DELTA_BASE_CACHE_LIMIT).is_none() {
             config.set_value(&tree::Core::DELTA_BASE_CACHE_LIMIT, "100m")?;
         }
     }

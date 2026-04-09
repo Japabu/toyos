@@ -1,6 +1,24 @@
 //! Date and time parsing similar to what git can do.
 //!
 //! Note that this is not a general purpose time library.
+//!
+//! ## Examples
+//!
+//! ```
+//! use gix_date::{
+//!     parse,
+//!     parse_header,
+//!     time::{format, Format},
+//! };
+//!
+//! let time = parse("Thu, 18 Aug 2022 12:45:06 +0800", None).unwrap();
+//! assert_eq!(time.offset, 8 * 60 * 60);
+//! assert_eq!(time.format(Format::Raw).unwrap(), "1660797906 +0800");
+//! assert_eq!(time.format(Format::Custom(format::ISO8601)).unwrap(), "2022-08-18 12:45:06 +0800");
+//!
+//! let from_header = parse_header("1660797906 +0800").unwrap();
+//! assert_eq!(from_header, time);
+//! ```
 //! ## Feature Flags
 #![cfg_attr(
     all(doc, feature = "document-features"),

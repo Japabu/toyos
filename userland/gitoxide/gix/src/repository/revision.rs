@@ -24,6 +24,19 @@ impl crate::Repository {
     }
 
     /// Parse a revision specification and return single object id as represented by this instance.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    /// # mod doctest { include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/doctest.rs")); }
+    /// # let repo = doctest::open_repo(doctest::basic_repo_dir()?)?;
+    /// let parent = repo.rev_parse_single("HEAD^")?.object()?.into_commit();
+    ///
+    /// assert_eq!(parent.message_raw()?, "c1\n");
+    /// assert_ne!(parent.id, repo.rev_parse_single("HEAD")?);
+    /// # Ok(()) }
+    /// ```
     #[doc(alias = "revparse_single", alias = "git2")]
     #[cfg(feature = "revision")]
     pub fn rev_parse_single<'repo, 'a>(

@@ -542,6 +542,7 @@ pub mod validate {
 
     use crate::{bstr::BStr, config::tree::keys::Validate};
 
+    #[derive(Clone, Copy)]
     pub struct ProtocolFromUser;
     impl Validate for ProtocolFromUser {
         fn validate(&self, value: &BStr) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
@@ -552,6 +553,7 @@ pub mod validate {
         }
     }
 
+    #[derive(Clone, Copy)]
     pub struct RefsNamespace;
     impl Validate for RefsNamespace {
         fn validate(&self, value: &BStr) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {

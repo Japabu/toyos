@@ -5,6 +5,8 @@ use crate::{bstr::ByteSlice, config};
 /// General Configuration
 impl crate::Repository {
     /// Return a snapshot of the configuration as seen upon opening the repository.
+    ///
+    /// Use [`reload()`](Self::reload()) to refresh it from disk.
     pub fn config_snapshot(&self) -> config::Snapshot<'_> {
         config::Snapshot { repo: self }
     }
@@ -13,7 +15,8 @@ impl crate::Repository {
     /// When the returned instance is dropped, it is applied in full, even if the reason for the drop is an error.
     ///
     /// Note that changes to the configuration are in-memory only and are observed only this instance
-    /// of the [`Repository`](crate::Repository).
+    /// of the [`Repository`](crate::Repository). Use [`reload()`](Self::reload()) to discard them and
+    /// refresh the snapshot from disk.
     pub fn config_snapshot_mut(&mut self) -> config::SnapshotMut<'_> {
         let config = self.config.resolved.as_ref().clone();
         config::SnapshotMut {

@@ -13,7 +13,7 @@ include = ["src/**/*", "LICENSE-*"]
 rust-version = "1.82"
 
 [lib]
-doctest = false
+doctest = true
 test = false
 
 [dependencies]

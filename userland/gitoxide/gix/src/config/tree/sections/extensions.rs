@@ -48,6 +48,7 @@ impl Section for Extensions {
 mod validate {
     use crate::{bstr::BStr, config::tree::keys};
 
+    #[derive(Clone, Copy)]
     pub struct ObjectFormat;
 
     impl keys::Validate for ObjectFormat {

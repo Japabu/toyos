@@ -67,6 +67,11 @@ impl Capabilities {
     }
 
     /// Just like [`Self::probe()`], but doesn't expect any git-specific files like `.git/config` to exist.
+    ///
+    /// Consider using this on worktree directories separately as they may be on a different filesystem
+    /// which thus may have different capabilities.
+    /// The capabilities of the git-directory is important for loose references, and the worktree directory is
+    /// of importance for linked worktrees and their checkouts.
     pub fn probe_dir(dir: &Path) -> Self {
         Self::probe_inner(dir, Dir::IsArbitrary)
     }
@@ -119,39 +124,55 @@ impl Capabilities {
     }
 
     fn probe_ignore_case(git_dir: &Path, mode: Dir) -> std::io::Result<bool> {
-        std::fs::metadata(git_dir.join("cOnFiG")).map(|_| true).or_else(|err| {
-            if err.kind() == std::io::ErrorKind::NotFound {
-                if matches!(mode, Dir::IsGit) || git_dir.join("config").exists() {
-                    return Ok(false);
-                }
-
-                use std::io::ErrorKind;
-                let (mut lower, mut mixed) = (None, None);
-
-                let res = (|| {
-                    let first = git_dir.join("config");
-                    let second = git_dir.join("cOnFiG");
-                    std::fs::OpenOptions::new().create_new(true).write(true).open(&first)?;
-                    lower = Some(first);
-
-                    match std::fs::OpenOptions::new().create_new(true).write(true).open(&second) {
-                        Ok(_) => {
-                            mixed = Some(second);
-                            Ok(false)
+        match mode {
+            Dir::IsGit => {
+                for (probe_name, canonical_name) in [("hEaD", "HEAD"), ("cOnFiG", "config")] {
+                    match std::fs::metadata(git_dir.join(probe_name)) {
+                        Ok(_) => return Ok(true),
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                            if git_dir.join(canonical_name).exists() {
+                                return Ok(false);
+                            }
                         }
-                        Err(err) if err.kind() == ErrorKind::AlreadyExists => Ok(true),
-                        Err(err) => Err(err),
+                        Err(err) => return Err(err),
                     }
-                })();
-
-                for file_to_remove in lower.into_iter().chain(mixed) {
-                    std::fs::remove_file(file_to_remove).ok();
                 }
-                res
-            } else {
-                Err(err)
+                Ok(false)
             }
-        })
+            Dir::IsArbitrary => std::fs::metadata(git_dir.join("cOnFiG")).map(|_| true).or_else(|err| {
+                if err.kind() == std::io::ErrorKind::NotFound {
+                    if git_dir.join("config").exists() {
+                        return Ok(false);
+                    }
+
+                    use std::io::ErrorKind;
+                    let (mut lower, mut mixed) = (None, None);
+
+                    let res = (|| {
+                        let first = git_dir.join("config");
+                        let second = git_dir.join("cOnFiG");
+                        std::fs::OpenOptions::new().create_new(true).write(true).open(&first)?;
+                        lower = Some(first);
+
+                        match std::fs::OpenOptions::new().create_new(true).write(true).open(&second) {
+                            Ok(_) => {
+                                mixed = Some(second);
+                                Ok(false)
+                            }
+                            Err(err) if err.kind() == ErrorKind::AlreadyExists => Ok(true),
+                            Err(err) => Err(err),
+                        }
+                    })();
+
+                    for file_to_remove in lower.into_iter().chain(mixed) {
+                        std::fs::remove_file(file_to_remove).ok();
+                    }
+                    res
+                } else {
+                    Err(err)
+                }
+            }),
+        }
     }
 
     fn probe_precompose_unicode(root: &Path) -> std::io::Result<bool> {
@@ -179,5 +200,29 @@ impl Capabilities {
         let res = std::fs::symlink_metadata(&link_path).map(|m| m.file_type().is_symlink());
         crate::symlink::remove(&link_path).or_else(|_| std::fs::remove_file(&link_path))?;
         res
+    }
+}
+
+#[cfg(target_os = "wasi")]
+impl Default for Capabilities {
+    fn default() -> Self {
+        Capabilities {
+            precompose_unicode: false,
+            ignore_case: false,
+            executable_bit: false,
+            symlink: true,
+        }
+    }
+}
+
+#[cfg(not(any(windows, unix, target_os = "wasi")))]
+impl Default for Capabilities {
+    fn default() -> Self {
+        Capabilities {
+            precompose_unicode: false,
+            ignore_case: false,
+            executable_bit: false,
+            symlink: false,
+        }
     }
 }

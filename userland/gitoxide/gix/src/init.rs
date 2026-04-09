@@ -4,10 +4,14 @@ use std::{borrow::Cow, path::Path};
 use gix_ref::{
     store::WriteReflog,
     transaction::{PreviousValue, RefEdit},
-    FullName, Target,
+    Category, FullName, Target,
 };
 
-use crate::{bstr::BString, config::tree::Init, ThreadSafeRepository};
+use crate::{
+    bstr::{BString, ByteSlice},
+    config::tree::Init,
+    ThreadSafeRepository,
+};
 
 /// The name of the branch to use if non is configured via git configuration.
 ///
@@ -75,13 +79,17 @@ impl ThreadSafeRepository {
             .string(Init::DEFAULT_BRANCH)
             .unwrap_or_else(|| Cow::Borrowed(DEFAULT_BRANCH_NAME.into()));
         if branch_name.as_ref() != DEFAULT_BRANCH_NAME {
-            let sym_ref: FullName =
-                format!("refs/heads/{branch_name}")
-                    .try_into()
-                    .map_err(|err| Error::InvalidBranchName {
-                        name: branch_name.into_owned(),
-                        source: err,
-                    })?;
+            let configured_branch_name = branch_name.into_owned();
+            let sym_ref: FullName = Category::LocalBranch
+                .to_full_name(configured_branch_name.as_bstr())
+                .map_err(|err| Error::InvalidBranchName {
+                    name: configured_branch_name.clone(),
+                    source: err,
+                })?;
+            gix_validate::reference::branch_name(sym_ref.as_bstr()).map_err(|err| Error::InvalidBranchName {
+                name: configured_branch_name,
+                source: err,
+            })?;
             let mut repo = repo.to_thread_local();
             let prev_write_reflog = repo.refs.write_reflog;
             repo.refs.write_reflog = WriteReflog::Disable;

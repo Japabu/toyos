@@ -1,5 +1,29 @@
 //! [Parse][parse()] .mailmap files as used in git repositories and remap names and emails
 //! using an [accelerated data-structure][Snapshot].
+//!
+//! ## Examples
+//!
+//! ```
+//! use gix_actor::SignatureRef;
+//!
+//! let input = b"
+//! Joe R. Developer <joe@example.com> <bugs@example.com>
+//! Jane Doe <jane@example.com> Jane <bugs@example.com>
+//! ";
+//!
+//! let parsed = gix_mailmap::parse(input)
+//!     .collect::<Result<Vec<_>, _>>()
+//!     .unwrap();
+//! assert_eq!(parsed.len(), 2);
+//!
+//! let snapshot = gix_mailmap::Snapshot::new(parsed);
+//! let resolved = snapshot.resolve(
+//!     SignatureRef::from_bytes::<()>(b"Jane <bugs@example.com> 1711398853 +0800").unwrap(),
+//! );
+//!
+//! assert_eq!(resolved.name, "Jane Doe");
+//! assert_eq!(resolved.email, "jane@example.com");
+//! ```
 //! ## Feature Flags
 #![cfg_attr(
     all(doc, feature = "document-features"),

@@ -11,7 +11,7 @@ use std::{path::Path, time::SystemTime};
 pub struct Metadata(rustix::fs::Stat);
 
 /// A structure to partially mirror [`std::fs::Metadata`].
-#[cfg(any(windows, target_os = "toyos"))]
+#[cfg(not(unix))]
 pub struct Metadata(std::fs::Metadata);
 
 /// Lifecycle
@@ -22,7 +22,7 @@ impl Metadata {
         {
             rustix::fs::lstat(path).map(Metadata).map_err(Into::into)
         }
-        #[cfg(any(windows, target_os = "toyos"))]
+        #[cfg(not(unix))]
         path.symlink_metadata().map(Metadata)
     }
 
@@ -32,7 +32,7 @@ impl Metadata {
         {
             rustix::fs::fstat(file).map(Metadata).map_err(Into::into)
         }
-        #[cfg(any(windows, target_os = "toyos"))]
+        #[cfg(not(unix))]
         file.metadata().map(Metadata)
     }
 }
@@ -46,7 +46,7 @@ impl Metadata {
         {
             (self.0.st_mode as u32 & libc::S_IFMT as u32) == libc::S_IFDIR as u32
         }
-        #[cfg(any(windows, target_os = "toyos"))]
+        #[cfg(not(unix))]
         self.0.is_dir()
     }
 
@@ -54,30 +54,14 @@ impl Metadata {
     pub fn modified(&self) -> Option<SystemTime> {
         #[cfg(unix)]
         {
-            #[cfg(not(any(
-                target_os = "aix",
-                target_os = "hurd",
-                all(target_arch = "loongarch64", target_env = "musl")
-            )))]
+            #[cfg(not(any(target_os = "aix", target_os = "hurd")))]
             let seconds = self.0.st_mtime;
-            #[cfg(any(
-                target_os = "aix",
-                target_os = "hurd",
-                all(target_arch = "loongarch64", target_env = "musl")
-            ))]
+            #[cfg(any(target_os = "aix", target_os = "hurd"))]
             let seconds = self.0.st_mtim.tv_sec;
 
-            #[cfg(not(any(
-                target_os = "aix",
-                target_os = "hurd",
-                all(target_arch = "loongarch64", target_env = "musl")
-            )))]
+            #[cfg(not(any(target_os = "aix", target_os = "hurd")))]
             let nanoseconds = self.0.st_mtime_nsec;
-            #[cfg(any(
-                target_os = "aix",
-                target_os = "hurd",
-                all(target_arch = "loongarch64", target_env = "musl")
-            ))]
+            #[cfg(any(target_os = "aix", target_os = "hurd"))]
             let nanoseconds = self.0.st_mtim.tv_nsec;
 
             // All operating systems treat the seconds as offset from unix epoch, hence it must
@@ -86,7 +70,7 @@ impl Metadata {
             let seconds = seconds as i64;
             system_time_from_secs_nanos(seconds, nanoseconds.try_into().ok()?)
         }
-        #[cfg(any(windows, target_os = "toyos"))]
+        #[cfg(not(unix))]
         self.0.modified().ok()
     }
 
@@ -97,30 +81,14 @@ impl Metadata {
     pub fn created(&self) -> Option<SystemTime> {
         #[cfg(unix)]
         {
-            #[cfg(not(any(
-                target_os = "aix",
-                target_os = "hurd",
-                all(target_arch = "loongarch64", target_env = "musl")
-            )))]
+            #[cfg(not(any(target_os = "aix", target_os = "hurd")))]
             let seconds = self.0.st_ctime;
-            #[cfg(any(
-                target_os = "aix",
-                target_os = "hurd",
-                all(target_arch = "loongarch64", target_env = "musl")
-            ))]
+            #[cfg(any(target_os = "aix", target_os = "hurd"))]
             let seconds = self.0.st_ctim.tv_sec;
 
-            #[cfg(not(any(
-                target_os = "aix",
-                target_os = "hurd",
-                all(target_arch = "loongarch64", target_env = "musl")
-            )))]
+            #[cfg(not(any(target_os = "aix", target_os = "hurd")))]
             let nanoseconds = self.0.st_ctime_nsec;
-            #[cfg(any(
-                target_os = "aix",
-                target_os = "hurd",
-                all(target_arch = "loongarch64", target_env = "musl")
-            ))]
+            #[cfg(any(target_os = "aix", target_os = "hurd"))]
             let nanoseconds = self.0.st_ctim.tv_nsec;
 
             // All operating systems treat the seconds as offset from unix epoch, hence it must
@@ -137,6 +105,8 @@ impl Metadata {
         {
             self.0.modified().ok()
         }
+        #[cfg(not(any(unix, windows, target_os = "toyos")))]
+        self.0.created().ok()
     }
 
     /// Return the size of the file in bytes.
@@ -145,10 +115,8 @@ impl Metadata {
         {
             self.0.st_size as u64
         }
-        #[cfg(any(windows, target_os = "toyos"))]
-        {
-            self.0.len()
-        }
+        #[cfg(not(unix))]
+        self.0.len()
     }
 
     /// Return the device id on which the file is located, or 0 on windows.
@@ -157,10 +125,8 @@ impl Metadata {
         {
             self.0.st_dev as u64
         }
-        #[cfg(any(windows, target_os = "toyos"))]
-        {
-            0
-        }
+        #[cfg(not(unix))]
+        0
     }
 
     /// Return the inode id tracking the file, or 0 on windows.
@@ -169,10 +135,8 @@ impl Metadata {
         {
             self.0.st_ino as u64
         }
-        #[cfg(any(windows, target_os = "toyos"))]
-        {
-            0
-        }
+        #[cfg(not(unix))]
+        0
     }
 
     /// Return the user-id of the file or 0 on windows.
@@ -181,10 +145,8 @@ impl Metadata {
         {
             self.0.st_uid as u32
         }
-        #[cfg(any(windows, target_os = "toyos"))]
-        {
-            0
-        }
+        #[cfg(not(unix))]
+        0
     }
 
     /// Return the group-id of the file or 0 on windows.
@@ -193,10 +155,8 @@ impl Metadata {
         {
             self.0.st_gid as u32
         }
-        #[cfg(any(windows, target_os = "toyos"))]
-        {
-            0
-        }
+        #[cfg(not(unix))]
+        0
     }
 
     /// Return `true` if the file's executable bit is set, or `false` on windows.
@@ -214,6 +174,8 @@ impl Metadata {
         {
             false
         }
+        #[cfg(not(any(unix, windows, target_os = "toyos")))]
+        gix_fs::is_executable(&self.0)
     }
 
     /// Return `true` if the file's is a symbolic link.
@@ -222,10 +184,8 @@ impl Metadata {
         {
             (self.0.st_mode as u32 & libc::S_IFMT as u32) == libc::S_IFLNK as u32
         }
-        #[cfg(any(windows, target_os = "toyos"))]
-        {
-            self.0.is_symlink()
-        }
+        #[cfg(not(unix))]
+        self.0.is_symlink()
     }
 
     /// Return `true` if this is a regular file, executable or not.
@@ -234,10 +194,8 @@ impl Metadata {
         {
             (self.0.st_mode as u32 & libc::S_IFMT as u32) == libc::S_IFREG as u32
         }
-        #[cfg(any(windows, target_os = "toyos"))]
-        {
-            self.0.is_file()
-        }
+        #[cfg(not(unix))]
+        self.0.is_file()
     }
 }
 

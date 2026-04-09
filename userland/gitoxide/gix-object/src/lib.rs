@@ -1,5 +1,33 @@
 //! This crate provides types for [read-only git objects][crate::ObjectRef] backed by bytes provided in git's serialization format
 //! as well as [mutable versions][Object] of these. Both types of objects can be encoded.
+//!
+//! ## Decode Borrowed Objects
+//!
+//! ```
+//! let object = gix_object::ObjectRef::from_loose(b"blob 5\0hello").unwrap();
+//! let blob = object.as_blob().unwrap();
+//!
+//! assert_eq!(blob.data, b"hello");
+//! assert_eq!(object.kind(), gix_object::Kind::Blob);
+//! ```
+//!
+//! ## Mutate And Encode Owned Objects
+//!
+//! ```
+//! use gix_object::WriteTo;
+//!
+//! let object = gix_object::ObjectRef::from_loose(b"blob 5\0hello")
+//!     .unwrap()
+//!     .into_owned()
+//!     .unwrap();
+//! let mut blob = object.into_blob();
+//! blob.data.extend_from_slice(b" world");
+//!
+//! let mut out = Vec::new();
+//! blob.write_to(&mut out).unwrap();
+//! assert_eq!(out, b"hello world");
+//! assert_eq!(blob.loose_header().as_slice(), b"blob 11\0");
+//! ```
 //! ## Feature Flags
 #![cfg_attr(
     all(doc, feature = "document-features"),

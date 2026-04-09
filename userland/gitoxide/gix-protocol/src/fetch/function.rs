@@ -140,6 +140,8 @@ where
                     break 'negotiation reader;
                 }
             };
+            // This needs drop if tracing is compiled in. We just don't know it.
+            #[allow(clippy::drop_non_drop)]
             drop(negotiate_span);
 
             let mut previous_response = previous_response.expect("knowledge of a pack means a response was received");

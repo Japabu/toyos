@@ -30,7 +30,7 @@ impl Repository {
             let renormalize = self
                 .config
                 .resolved
-                .boolean(&tree::Merge::RENORMALIZE)
+                .boolean(tree::Merge::RENORMALIZE)
                 .map(|res| {
                     tree::Merge::RENORMALIZE
                         .enrich_error(res)
@@ -57,7 +57,7 @@ impl Repository {
         let filter = gix_filter::Pipeline::new(self.command_context()?, crate::filter::Pipeline::options(self)?);
         let filter = gix_merge::blob::Pipeline::new(worktree_roots, filter, self.config.merge_pipeline_options()?);
         let options = gix_merge::blob::platform::Options {
-            default_driver: self.config.resolved.string(&tree::Merge::DEFAULT).map(Cow::into_owned),
+            default_driver: self.config.resolved.string(tree::Merge::DEFAULT).map(Cow::into_owned),
         };
         let drivers = self.config.merge_drivers()?;
         Ok(gix_merge::blob::Platform::new(filter, mode, attrs, drivers, options))
@@ -75,7 +75,7 @@ impl Repository {
                     style: self
                         .config
                         .resolved
-                        .string(&tree::Merge::CONFLICT_STYLE)
+                        .string(tree::Merge::CONFLICT_STYLE)
                         .map(|value| {
                             tree::Merge::CONFLICT_STYLE
                                 .try_into_conflict_style(value)

@@ -49,6 +49,7 @@ impl Section for Pack {
 mod validate {
     use crate::{bstr::BStr, config::tree::keys};
 
+    #[derive(Clone, Copy)]
     pub struct IndexVersion;
     impl keys::Validate for IndexVersion {
         fn validate(&self, value: &BStr) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {

@@ -2,7 +2,7 @@ lints.workspace = true
 
 [package]
 name = "gix-tempfile"
-version = "21.0.1"
+version = "21.0.2"
 repository = "https://github.com/GitoxideLabs/gitoxide"
 license = "MIT OR Apache-2.0"
 description = "A tempfile implementation with a global registry to assure cleanup"
@@ -27,11 +27,11 @@ path = "examples/try-deadlock-on-cleanup.rs"
 required-features = ["signals"]
 
 [lib]
-doctest = false
+doctest = true
 test = true
 
 [dependencies]
-gix-fs = { version = "^0.19.1", path = "../gix-fs" }
+gix-fs = { version = "^0.19.2", path = "../gix-fs" }
 parking_lot = "0.12.4"
 dashmap = { version = "6.0.1", optional = true }
 tempfile = "3.26.0"

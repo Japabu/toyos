@@ -5,14 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## 0.11.1 (2026-02-10)
+## 0.11.2 (2026-03-22)
 
 ### Commit Statistics
 
 <csr-read-only-do-not-edit/>
 
- - 3 commits contributed to the release over the course of 18 calendar days.
- - 18 days passed between releases.
+ - 3 commits contributed to the release.
  - 0 commits were understood as [conventional](https://www.conventionalcommits.org).
  - 0 issues like '(#ID)' were seen in commit messages
 
@@ -23,6 +22,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <details><summary>view details</summary>
 
  * **Uncategorized**
+    - Merge pull request #2454 from GitoxideLabs/dependabot/cargo/cargo-da044b9bb0 ([`6183fd0`](https://github.com/GitoxideLabs/gitoxide/commit/6183fd092d7acd43763fe15be400ce81e7172775))
+    - Bump the cargo group with 68 updates ([`6bdb331`](https://github.com/GitoxideLabs/gitoxide/commit/6bdb33145e8aa81ba0dae5caafc675c591569715))
+    - Merge branch 'release' ([`9327b73`](https://github.com/GitoxideLabs/gitoxide/commit/9327b73785227f1322a327cb48fbb0800e1286ae))
+</details>
+
+## 0.11.1 (2026-02-10)
+
+### Commit Statistics
+
+<csr-read-only-do-not-edit/>
+
+ - 4 commits contributed to the release over the course of 19 calendar days.
+ - 19 days passed between releases.
+ - 0 commits were understood as [conventional](https://www.conventionalcommits.org).
+ - 0 issues like '(#ID)' were seen in commit messages
+
+### Commit Details
+
+<csr-read-only-do-not-edit/>
+
+<details><summary>view details</summary>
+
+ * **Uncategorized**
+    - Release gix-error v0.1.0, gix-date v0.14.0, gix-actor v0.39.0, gix-trace v0.1.18, gix-path v0.11.1, gix-features v0.46.1, gix-hash v0.22.1, gix-object v0.56.0, gix-quote v0.6.2, gix-attributes v0.30.1, gix-command v0.7.1, gix-packetline v0.21.1, gix-filter v0.26.0, gix-fs v0.19.1, gix-chunk v0.6.0, gix-commitgraph v0.33.0, gix-revwalk v0.27.0, gix-traverse v0.53.0, gix-worktree-stream v0.28.0, gix-archive v0.28.0, gix-bitmap v0.2.16, gix-tempfile v21.0.1, gix-lock v21.0.1, gix-index v0.47.0, gix-config-value v0.17.1, gix-pathspec v0.15.1, gix-worktree v0.48.0, gix-diff v0.59.0, gix-blame v0.9.0, gix-ref v0.59.0, gix-sec v0.13.1, gix-config v0.52.0, gix-prompt v0.13.1, gix-url v0.35.1, gix-credentials v0.36.0, gix-discover v0.47.0, gix-dir v0.21.0, gix-mailmap v0.31.0, gix-revision v0.41.0, gix-merge v0.12.0, gix-negotiate v0.27.0, gix-pack v0.66.0, gix-odb v0.76.0, gix-refspec v0.37.0, gix-shallow v0.8.1, gix-transport v0.54.0, gix-protocol v0.57.0, gix-status v0.26.0, gix-submodule v0.26.0, gix-worktree-state v0.26.0, gix v0.79.0, safety bump 35 crates ([`d66ac10`](https://github.com/GitoxideLabs/gitoxide/commit/d66ac1057a5b7bfb608d4e6be585c69fb692bfee))
     - Merge pull request #2407 from GitoxideLabs/dependabot/cargo/cargo-fb4135702f ([`8bceefb`](https://github.com/GitoxideLabs/gitoxide/commit/8bceefbfc5f897517bfdd24744695a82cfa0d5be))
     - Bump the cargo group with 59 updates ([`7ce3c55`](https://github.com/GitoxideLabs/gitoxide/commit/7ce3c5587aec1ca813039c047783b9cb2a106826))
     - Merge pull request #2393 from GitoxideLabs/report ([`f7d0975`](https://github.com/GitoxideLabs/gitoxide/commit/f7d09758d245aaa89409e39bb6ba1ed6b7118ea5))
@@ -371,9 +394,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     - Use `nul` instead of `NUL` on Windows ([`b24783a`](https://github.com/GitoxideLabs/gitoxide/commit/b24783accba4bdd39c0821564060a3b4f3745903))
     - Merge pull request #2100 from GitoxideLabs/release ([`202bc6d`](https://github.com/GitoxideLabs/gitoxide/commit/202bc6da79854d1fb6bb32b9c6bb2a6f882c77f5))
 </details>
-
-<csr-unknown>
-Instead of using the first existing subdirectory we fine, thischecks for all of them and requires that exactly one exist. If morethan one exist, then that is now treated the same as if none exist,falling back to the git --exec-path-based strategy, which issometimes slower but more robust. Extend ALTERNATIVE_LOCATIONS for ARM64 Windowsgix-path looks for and runs an installed git executable, whenpresent, to discover information about how Git is set up. Thisis used in several functions in gix_path::env, especially onWindows, where if git.exe is not found in a PATH search, thencommon installation locations for Git for Windows are checked.These locations on Windows are resolved based on information fromthe current environment, since different systems have differentprogram files directories. This was implemented in #1456 (whichbuilt on #1419). Although this was sufficient to find the mostcommon Git for Windows installation locations, it did not findARM64 builds of Git for Windows. Such builds place the non-shimgit.exe program in (git root)\clangarm64\bin, rather than in(git root)\mingw64\bin or (git root)\mingw32\bin. At the timeof #1419 and #1456, no stable ARM64 builds of Git for Windows wereavailable. Since then, Git for Windows began releasing such builds.This modifies the alternative locations examined if git.exe isnot found in a PATH search on Windows so that, where (git root)is in a 64-bit program files directory, we check for a(git root)\clangarm64\bin directory, in addition to checking fora (git root)\mingw64\bin directory as was already done.Although 64-bit and 32-bit program files directories are separate,on ARM64 systems the 64-bit program files directory is used bothfor ARM64 programs, which the system can run directly, and forx86_64 programs, which the system must run through emulation.This checks both clangarm64 and mingw64, where mingw64 waschecked before. It does so in that order, because if both areavailable, then we are probably on an ARM64 system, and the ARM64build of Git for Windows should be preferred, both because it willtend to perform better and because the user is likely to expectthat to be used. (An x86_64 build, especially if present directlyalongside an ARM64 build, may be left over from a previous versionof Git for Windows that didn’t have ARM64 builds and that was onlyincompletely uninstalled.)This checks both, in that order, on all systems where we hadchecked mingw64 before, even on x86_64 systems. This is because:The reason it’s less straightforward is that, if our parent process(or other ancestor) passes down a sanitized environment while stillattempting to let the program files directories be found, then:(These complexities all relate to deciding whether and in whatorder to search bin subdirectories of clangarm64, mingw64,and mingw32. They would go away if we looked for the shim ratherthan the non-shim executable. This is because the path from(git root) to the shim does not contain a directory componentnamed after a build target. That simplification would carry its owntradeoffs, and it is unclear if it ought to be done; it is not donehere.) Use nul instead of NUL on WindowsNULL_DEVICE is /dev/null except on Windows, where there areseveral possible choices. Previously we were using NUL becausethe more modern full path \\.\NUL is not supported by git.However, git also rejects NUL, when capitalized, on someWindows systems. This can be observed on Windows 11 ARM64 builds.In contrast, the lower-case nul, which Windows itself treats thesame as NUL, is always accepted by Git for Windows.Although it’s not readily apparent why Git for Windows acceptsNUL on some Windows operating systems and/or platforms and notothers, the preferential treatment of nul (not extending toNUL) can be seen in a few places in the Git for Windows sourcecode, including in mingw_access (strcmp is case-sensitive):<csr-unknown/>
 
 ## 0.10.20 (2025-08-03)
 
@@ -767,9 +787,6 @@ A maintenance release without user-facing changes.
     - Merge pull request #1778 from GitoxideLabs/new-release ([`8df0db2`](https://github.com/GitoxideLabs/gitoxide/commit/8df0db2f8fe1832a5efd86d6aba6fb12c4c855de))
 </details>
 
-<csr-unknown>
-This makes things more robust overall than either preferring thenon-shim or just doing a path search for sh as was done beforethat. But it exacerbates #1868 (as described there), so if theGit for Windows sh.exe shim continues to work as it currentlydoes, then further improvements may be called for here.<csr-unknown/>
-
 ## 0.10.14 (2025-01-18)
 
 <csr-id-17835bccb066bbc47cc137e8ec5d9fe7d5665af0/>
@@ -1114,9 +1131,6 @@ A maintenance release without user-facing changes.
     - Merge pull request #1546 from nyurik/semilocons ([`f992fb7`](https://github.com/GitoxideLabs/gitoxide/commit/f992fb773b443454015bd14658cfaa2f3ac07997))
     - Add missing semicolons ([`ec69c88`](https://github.com/GitoxideLabs/gitoxide/commit/ec69c88fc119f3aa1967a7e7f5fca30e3ce97595))
 </details>
-
-<csr-unknown>
-https://github.com/Byron/gitoxide/security/advisories/GHSA-mgvv-9p9g-3jv4<csr-unknown/>
 
 ## 0.10.10 (2024-08-22)
 

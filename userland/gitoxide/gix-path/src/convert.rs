@@ -44,9 +44,9 @@ pub fn try_os_str_into_bstr(path: Cow<'_, OsStr>) -> Result<Cow<'_, BStr>, Utf8E
     }
 }
 
-/// Convert the given path either into its raw bytes on Unix or its UTF-8 encoded counterpart on Windows.
+/// Convert the given path either into its raw bytes on Unix or its UTF-8 encoded counterpart on non-Unix platforms.
 ///
-/// On Windows, if the source `Path`` contains ill-formed, lone surrogates, the UTF-8 conversion will fail
+/// On non-Unix platforms, if the source `Path`` contains ill-formed, lone surrogates, the UTF-8 conversion will fail
 /// causing `Utf8Error` to be returned.
 pub fn try_into_bstr<'a>(path: impl Into<Cow<'a, Path>>) -> Result<Cow<'a, BStr>, Utf8Error> {
     let path = path.into();
@@ -57,12 +57,7 @@ pub fn try_into_bstr<'a>(path: impl Into<Cow<'a, Path>>) -> Result<Cow<'a, BStr>
                 use std::os::unix::ffi::OsStringExt;
                 path.into_os_string().into_vec().into()
             };
-            #[cfg(target_os = "wasi")]
-            let p: BString = {
-                use std::os::wasi::ffi::OsStringExt;
-                path.into_os_string().into_vec().into()
-            };
-            #[cfg(not(any(unix, target_os = "wasi")))]
+            #[cfg(not(unix))]
             let p: BString = path.into_os_string().into_string().map_err(|_| Utf8Error)?.into();
             p
         }),
@@ -72,12 +67,7 @@ pub fn try_into_bstr<'a>(path: impl Into<Cow<'a, Path>>) -> Result<Cow<'a, BStr>
                 use std::os::unix::ffi::OsStrExt;
                 path.as_os_str().as_bytes().into()
             };
-            #[cfg(target_os = "wasi")]
-            let p: &BStr = {
-                use std::os::wasi::ffi::OsStrExt;
-                path.as_os_str().as_bytes().into()
-            };
-            #[cfg(not(any(unix, target_os = "wasi")))]
+            #[cfg(not(unix))]
             let p: &BStr = path.to_str().ok_or(Utf8Error)?.as_bytes().into();
             p
         }),
@@ -102,7 +92,7 @@ pub fn join_bstr_unix_pathsep<'a, 'b>(base: impl Into<Cow<'a, BStr>>, path: impl
 
 /// Given `input` bytes, produce a `Path` from them ignoring encoding entirely if on Unix.
 ///
-/// On Windows, the input is required to be valid UTF-8, which is guaranteed if we wrote it before.
+/// On non-Unix platforms, the input is required to be valid UTF-8, which is guaranteed if we wrote it before.
 /// There are some potential Git versions and Windows installations which produce malformed UTF-16
 /// if certain emojis are in the path. It's as rare as it sounds, but possible.
 pub fn try_from_byte_slice(input: &[u8]) -> Result<&Path, Utf8Error> {
@@ -111,12 +101,7 @@ pub fn try_from_byte_slice(input: &[u8]) -> Result<&Path, Utf8Error> {
         use std::os::unix::ffi::OsStrExt;
         OsStr::from_bytes(input).as_ref()
     };
-    #[cfg(target_os = "wasi")]
-    let p: &Path = {
-        use std::os::wasi::ffi::OsStrExt;
-        OsStr::from_bytes(input).as_ref()
-    };
-    #[cfg(not(any(unix, target_os = "wasi")))]
+    #[cfg(not(unix))]
     let p = Path::new(std::str::from_utf8(input).map_err(|_| Utf8Error)?);
     Ok(p)
 }
@@ -143,12 +128,7 @@ pub fn try_from_bstring(input: impl Into<BString>) -> Result<PathBuf, Utf8Error>
         use std::os::unix::ffi::OsStringExt;
         std::ffi::OsString::from_vec(input.into()).into()
     };
-    #[cfg(target_os = "wasi")]
-    let p: PathBuf = {
-        use std::os::wasi::ffi::OsStringExt;
-        std::ffi::OsString::from_vec(input.into()).into()
-    };
-    #[cfg(not(any(unix, target_os = "wasi")))]
+    #[cfg(not(unix))]
     let p = {
         use bstr::ByteVec;
         PathBuf::from(

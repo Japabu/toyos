@@ -7,7 +7,7 @@ repository = "https://github.com/GitoxideLabs/gitoxide"
 authors = ["Sebastian Thiel <sebastian.thiel@icloud.com>"]
 edition = "2021"
 license = "MIT OR Apache-2.0"
-version = "0.51.0"
+version = "0.52.0"
 rust-version = "1.82"
 default-run = "gix"
 include = ["src/**/*", "/build.rs", "LICENSE-*", "README.md"]
@@ -164,9 +164,9 @@ gitoxide-core-async-client = ["gitoxide-core/async-client", "futures-lite"]
 [dependencies]
 anyhow = "1.0.98"
 
-gitoxide-core = { version = "^0.54.0", path = "gitoxide-core" }
-gix-features = { version = "^0.46.1", path = "gix-features" }
-gix = { version = "^0.80.0", path = "gix", default-features = false }
+gitoxide-core = { version = "^0.55.0", path = "gitoxide-core" }
+gix-features = { version = "^0.46.2", path = "gix-features" }
+gix = { version = "^0.81.0", path = "gix", default-features = false }
 
 clap = { version = "4.5.42", features = ["derive", "cargo"] }
 clap_complete = "4.5.55"

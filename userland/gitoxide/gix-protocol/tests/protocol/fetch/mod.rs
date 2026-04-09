@@ -12,6 +12,8 @@ use crate::fixture_bytes;
 pub(super) mod _impl;
 use _impl::{Action, DelegateBlocking, RefsAction};
 
+mod ref_map;
+
 mod error {
     use std::io;
 

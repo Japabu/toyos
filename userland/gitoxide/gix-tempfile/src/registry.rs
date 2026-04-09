@@ -33,7 +33,7 @@ pub fn cleanup_tempfiles_signal_safe() {
     #[cfg(not(feature = "hp-hashmap"))]
     {
         REGISTRY.for_each(|tf| {
-            if tf.as_ref().map_or(false, |tf| tf.owning_process_id == current_pid) {
+            if tf.as_ref().is_some_and(|tf| tf.owning_process_id == current_pid) {
                 if let Some(tf) = tf.take() {
                     tf.drop_without_deallocation();
                 }
@@ -58,7 +58,7 @@ pub fn cleanup_tempfiles() {
     });
     #[cfg(not(feature = "hp-hashmap"))]
     REGISTRY.for_each(|tf| {
-        if tf.as_ref().map_or(false, |tf| tf.owning_process_id == current_pid) {
+        if tf.as_ref().is_some_and(|tf| tf.owning_process_id == current_pid) {
             tf.take();
         }
     });

@@ -137,6 +137,21 @@ fn to_full_name() -> gix_testtools::Result {
 }
 
 #[test]
+fn local_branch_head_is_representable_as_full_ref_name() -> gix_testtools::Result {
+    assert_eq!(
+        Category::LocalBranch.to_full_name("HEAD")?.as_bstr(),
+        "refs/heads/HEAD",
+        "generic full-name construction accepts names that are invalid only in branch-specific contexts"
+    );
+    assert_eq!(
+        Category::LocalBranch.to_full_name("refs/heads/HEAD")?.as_bstr(),
+        "refs/heads/HEAD",
+        "fully qualified names keep their category prefix de-duplicated"
+    );
+    Ok(())
+}
+
+#[test]
 fn prefix_with_namespace_and_stripping() {
     let ns = gix_ref::namespace::expand("foo").unwrap();
     let mut name: gix_ref::FullName = "refs/heads/main".try_into().unwrap();

@@ -1,4 +1,18 @@
 //! Launch commands very similarly to `Command`, but with `git` specific capabilities and adjustments.
+//!
+//! ## Examples
+//!
+//! ```
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let output = gix_command::prepare("git")
+//!     .arg("--version")
+//!     .spawn()?
+//!     .wait_with_output()?;
+//!
+//! assert!(output.status.success());
+//! assert!(String::from_utf8(output.stdout)?.starts_with("git version "));
+//! # Ok(()) }
+//! ```
 #![deny(rust_2018_idioms, missing_docs)]
 #![forbid(unsafe_code)]
 

@@ -1,5 +1,24 @@
 //! Parsing for data types used in `git-config` files to allow their use from environment variables and other sources.
 //!
+//! ## Examples
+//!
+//! ```
+//! use std::borrow::Cow;
+//!
+//! use bstr::ByteSlice;
+//! use gix_config_value::{Boolean, Integer, Path};
+//!
+//! let auto_crlf: bool = Boolean::try_from("true".as_bytes().as_bstr()).unwrap().into();
+//! assert!(auto_crlf);
+//!
+//! let packed_limit = Integer::try_from("10m".as_bytes().as_bstr()).unwrap();
+//! assert_eq!(packed_limit.to_decimal(), Some(10 * 1024 * 1024));
+//!
+//! let ignore_revs = Path::from(Cow::Borrowed(b":(optional)~/.git-blame-ignore-revs".as_bstr()));
+//! assert!(ignore_revs.is_optional);
+//! assert_eq!(ignore_revs.value.as_ref(), b"~/.git-blame-ignore-revs".as_bstr());
+//! ```
+//!
 //! ## Feature Flags
 #![cfg_attr(
     all(doc, feature = "document-features"),

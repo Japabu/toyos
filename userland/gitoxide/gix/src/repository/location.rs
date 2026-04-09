@@ -143,8 +143,8 @@ impl crate::Repository {
             .resolved
             .string(crate::config::tree::Init::DEFAULT_BRANCH)
             .unwrap_or(Cow::Borrowed("master".into()));
-        let default_branch_ref_name: gix_ref::FullName = format!("refs/heads/{name}")
-            .try_into()
+        let default_branch_ref_name = gix_ref::Category::LocalBranch
+            .to_full_name(name.as_ref())
             .unwrap_or_else(|_| gix_ref::FullName::try_from("refs/heads/master").expect("known to be valid"));
         self.refs.is_pristine(default_branch_ref_name.as_ref())
     }

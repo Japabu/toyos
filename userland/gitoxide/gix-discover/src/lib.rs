@@ -1,6 +1,30 @@
 //! Find git repositories or search them upwards from a starting point, or determine if a directory looks like a git repository.
 //!
 //! Note that detection methods are educated guesses using the presence of files, without looking too much into the details.
+//!
+//! ## Examples
+//!
+//! ```
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! # let dir = tempfile::tempdir()?;
+//! # let git_dir = dir.path().join(".git");
+//! # std::fs::create_dir_all(git_dir.join("objects"))?;
+//! # std::fs::create_dir_all(git_dir.join("refs").join("heads"))?;
+//! # std::fs::write(git_dir.join("HEAD"), b"ref: refs/heads/main\n")?;
+//! # std::fs::write(
+//! #     git_dir.join("refs").join("heads").join("main"),
+//! #     b"1111111111111111111111111111111111111111\n",
+//! # )?;
+//! # let nested = dir.path().join("src").join("module");
+//! # std::fs::create_dir_all(&nested)?;
+//! let (path, _trust) = gix_discover::upwards(&nested)?;
+//! let (repository_dir, worktree_dir) = path.into_repository_and_work_tree_directories();
+//!
+//! assert_eq!(repository_dir, git_dir);
+//! assert_eq!(worktree_dir, Some(dir.path().to_path_buf()));
+//! assert!(gix_discover::is_git(&repository_dir).is_ok());
+//! # Ok(()) }
+//! ```
 #![deny(missing_docs, rust_2018_idioms)]
 #![forbid(unsafe_code)]
 

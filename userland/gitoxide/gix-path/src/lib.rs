@@ -3,6 +3,20 @@
 //! Generally `git` treats paths as bytes, but inherently assumes non-illformed UTF-8 as encoding on windows. Internally, it expects
 //! slashes to be used as path separators and paths in files must have slashes, with conversions being performed on windows accordingly.
 //!
+//! ## Examples
+//!
+//! ```
+//! use bstr::ByteSlice;
+//!
+//! use std::path::Path;
+//!
+//! let normalized = gix_path::normalize(Path::new("a/./b/..").into(), Path::new("/cwd")).unwrap();
+//! assert_eq!(normalized.as_ref(), Path::new("a"));
+//!
+//! let unix = gix_path::to_unix_separators(b"dir\\subdir\\file".as_bstr());
+//! assert_eq!(unix.as_ref(), b"dir/subdir/file".as_bstr());
+//! ```
+//!
 //! <details>
 //!
 //! ### Research

@@ -111,6 +111,7 @@ mod key_impls {
 mod validate {
     use crate::{bstr::BStr, config::tree::keys};
 
+    #[derive(Clone, Copy)]
     pub struct Allow;
     impl keys::Validate for Allow {
         fn validate(&self, _value: &BStr) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
@@ -120,6 +121,7 @@ mod validate {
         }
     }
 
+    #[derive(Clone, Copy)]
     pub struct Version;
     impl keys::Validate for Version {
         fn validate(&self, value: &BStr) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {

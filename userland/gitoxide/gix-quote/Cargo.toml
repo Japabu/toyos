@@ -12,7 +12,7 @@ rust-version = "1.82"
 include = ["src/**/*", "LICENSE-*"]
 
 [lib]
-doctest = false
+doctest = true
 
 [dependencies]
 gix-utils = { version = "^0.3.1", path = "../gix-utils" }

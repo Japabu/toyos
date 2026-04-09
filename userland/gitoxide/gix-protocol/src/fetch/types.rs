@@ -39,6 +39,8 @@ pub struct Context<'a, T> {
 
 #[cfg(feature = "fetch")]
 mod with_fetch {
+    use bstr::ByteSlice;
+
     use crate::fetch::{self, negotiate, refmap};
 
     /// For use in [`fetch`](crate::fetch()).
@@ -136,6 +138,37 @@ mod with_fetch {
         ///
         /// It was extracted from the `handshake` as advertised by the server.
         pub object_hash: gix_hash::Kind,
+    }
+
+    impl RefMap {
+        /// Return `true` if the explicit fetch refspecs represented by this mapping failed to match the remote in a way
+        /// that should typically be reported as "no mapping".
+        ///
+        /// Use this before negotiation or reference updates when callers need to reject a fetch early instead of proceeding
+        /// with an empty or purely implicit mapping set.
+        ///
+        /// This is the case if the server advertised refs but none matched at all, or if only implicit mappings were produced
+        /// while at least one explicit refspec required an actual ref match, as is the case for exact ref names like `HEAD`
+        /// or `refs/heads/main`.
+        pub fn is_missing_required_mapping(&self) -> bool {
+            let has_explicit_mapping = self
+                .mappings
+                .iter()
+                .any(|mapping| matches!(mapping.spec_index, crate::fetch::refmap::SpecIndex::ExplicitInRemote(_)));
+
+            (self.mappings.is_empty() && !self.remote_refs.is_empty())
+                || (!has_explicit_mapping && explicit_fetch_refspecs_require_a_match(&self.refspecs))
+        }
+    }
+
+    fn explicit_fetch_refspecs_require_a_match(refspecs: &[gix_refspec::RefSpec]) -> bool {
+        refspecs.iter().any(|spec| match spec.to_ref().instruction() {
+            gix_refspec::Instruction::Fetch(
+                gix_refspec::instruction::Fetch::Only { src } | gix_refspec::instruction::Fetch::AndUpdate { src, .. },
+            ) => src.find_byteset(b"*?[]\\").is_none() && gix_hash::ObjectId::from_hex(src).is_err(),
+            gix_refspec::Instruction::Fetch(gix_refspec::instruction::Fetch::Exclude { .. })
+            | gix_refspec::Instruction::Push(_) => false,
+        })
     }
 }
 #[cfg(feature = "fetch")]

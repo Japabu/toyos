@@ -79,6 +79,24 @@ title "Porcelain ${kind}"
               expect_run_sh $SUCCESSFULLY "$exe tool estimate-hours -pfl 2>/dev/null"
             }
           )
+          (with "co-authored-by trailers and pii"
+            (sandbox
+              git init &>/dev/null
+              git checkout -b main &>/dev/null
+              git config commit.gpgsign false
+              git config tag.gpgsign false
+              touch a
+              git add a
+              git commit -m "first" &>/dev/null
+              echo hi >> a
+              git add a
+              git commit -m "$(printf 'second\n\nCo-authored-by: Co Author <co@example.com>')" &>/dev/null
+              it "counts co-authors as additional authors" && {
+                WITH_SNAPSHOT="$snapshot/co-authored-by-success" \
+                expect_run_sh $SUCCESSFULLY "$exe tool estimate-hours --show-pii 2>/dev/null"
+              }
+            )
+          )
           (with "a branch name that doesn't exist"
             it "fails and shows a decent enough error message" && {
               WITH_SNAPSHOT="$snapshot/invalid-branch-name-failure" \

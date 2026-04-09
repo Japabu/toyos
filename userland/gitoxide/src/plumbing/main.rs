@@ -125,7 +125,7 @@ pub fn main() -> Result<()> {
                     .boolean(gix::config::tree::Gitoxide::PARSE_PRECIOUS)
                     .is_none()
                 {
-                    config_mut.set_raw_value(&gix::config::tree::Gitoxide::PARSE_PRECIOUS, "true")?;
+                    config_mut.set_raw_value(gix::config::tree::Gitoxide::PARSE_PRECIOUS, "true")?;
                 }
             }
             Ok(repo)

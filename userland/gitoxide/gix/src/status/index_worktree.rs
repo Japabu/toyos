@@ -283,7 +283,7 @@ mod submodule_status {
                     // diff.ignoreSubmodules is the global setting, and if it exists, it overrides the submodule's own ignore setting.
                     let global_ignore = repo
                         .config_snapshot()
-                        .string(&config::tree::Diff::IGNORE_SUBMODULES)
+                        .string(config::tree::Diff::IGNORE_SUBMODULES)
                         .map(|value| config::tree::Diff::IGNORE_SUBMODULES.try_into_ignore(value))
                         .transpose()
                         .with_leniency(repo.config.lenient_config)?;

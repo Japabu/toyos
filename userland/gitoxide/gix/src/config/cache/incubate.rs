@@ -74,7 +74,7 @@ impl StageOne {
             config.append(worktree_config);
         }
         let precompose_unicode = config
-            .boolean(&Core::PRECOMPOSE_UNICODE)
+            .boolean(Core::PRECOMPOSE_UNICODE)
             .map(|v| Core::PRECOMPOSE_UNICODE.enrich_error(v))
             .transpose()
             .with_leniency(lenient)

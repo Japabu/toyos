@@ -1,6 +1,6 @@
 use gix::config::tree::{gitoxide, Branch, Core, Key};
 
-use crate::named_repo;
+use crate::{named_repo, repo_rw};
 
 #[cfg(feature = "credentials")]
 mod credential_helpers;
@@ -12,7 +12,7 @@ fn commit_auto_rollback() -> crate::Result {
 
     {
         let mut config = repo.config_snapshot_mut();
-        config.set_raw_value(&Core::ABBREV, "4")?;
+        config.set_raw_value(Core::ABBREV, "4")?;
         let repo = config.commit_auto_rollback()?;
         assert_eq!(repo.head_id()?.shorten()?.to_string(), "3189");
     }
@@ -21,7 +21,7 @@ fn commit_auto_rollback() -> crate::Result {
 
     let repo = {
         let mut config = repo.config_snapshot_mut();
-        config.set_raw_value(&Core::ABBREV, "4")?;
+        config.set_raw_value(Core::ABBREV, "4")?;
         let mut repo = config.commit_auto_rollback()?;
         assert_eq!(repo.head_id()?.shorten()?.to_string(), "3189");
         // access to the mutable repo underneath
@@ -39,7 +39,7 @@ mod trusted_path {
     #[test]
     fn optional_is_respected() -> crate::Result {
         let mut repo: gix::Repository = named_repo("make_basic_repo.sh")?;
-        repo.config_snapshot_mut().set_raw_value(&"my.path", "does-not-exist")?;
+        repo.config_snapshot_mut().set_raw_value("my.path", "does-not-exist")?;
 
         let actual = repo
             .config_snapshot()
@@ -53,7 +53,7 @@ mod trusted_path {
         );
 
         repo.config_snapshot_mut()
-            .set_raw_value(&"my.path", ":(optional)does-not-exist")?;
+            .set_raw_value("my.path", ":(optional)does-not-exist")?;
         let actual = repo.config_snapshot().trusted_path("my.path").transpose()?;
         assert_eq!(actual, None, "non-existing paths aren't returned to the caller");
         Ok(())
@@ -71,7 +71,7 @@ fn snapshot_mut_commit_and_forget() -> crate::Result {
     assert_eq!(repo.config_snapshot().integer("core.abbrev").expect("set"), 4);
     {
         let mut repo = repo.config_snapshot_mut();
-        repo.set_raw_value(&Core::ABBREV, "8")?;
+        repo.set_raw_value(Core::ABBREV, "8")?;
         repo.forget();
     }
     assert_eq!(repo.config_snapshot().integer("core.abbrev"), Some(4));
@@ -89,7 +89,7 @@ fn values_are_set_in_memory_only() {
 
     {
         let mut config = repo.config_snapshot_mut();
-        config.set_raw_value(&"hallo.welt", "true").unwrap();
+        config.set_raw_value("hallo.welt", "true").unwrap();
         config
             .set_subsection_value(&Branch::MERGE, "main", "refs/heads/foo")
             .unwrap();
@@ -168,5 +168,34 @@ fn apply_cli_overrides() -> crate::Result {
         "values without key-sep are true"
     );
 
+    Ok(())
+}
+
+#[test]
+fn reload_reloads_on_disk_changes() -> crate::Result {
+    use std::io::Write;
+
+    let (mut repo, _tmp) = repo_rw("make_config_repo.sh")?;
+    assert_eq!(repo.config_snapshot().integer("core.abbrev"), None);
+
+    let config_path = repo.git_dir().join("config");
+    let mut config = std::fs::OpenOptions::new().append(true).open(config_path)?;
+    writeln!(config, "\n[core]\n\tabbrev = 4")?;
+
+    assert_eq!(repo.config_snapshot().integer("core.abbrev"), None);
+    repo.reload()?;
+    assert_eq!(repo.config_snapshot().integer("core.abbrev"), Some(4));
+    Ok(())
+}
+
+#[test]
+fn reload_discards_in_memory_only_changes() -> crate::Result {
+    let mut repo = named_repo("make_config_repo.sh")?;
+
+    repo.config_snapshot_mut().set_raw_value(Core::ABBREV, "4")?;
+    assert_eq!(repo.config_snapshot().integer("core.abbrev"), Some(4));
+
+    repo.reload()?;
+    assert_eq!(repo.config_snapshot().integer("core.abbrev"), None);
     Ok(())
 }

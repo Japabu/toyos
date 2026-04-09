@@ -5,6 +5,12 @@ use gix::bstr::BString;
 use crate::util::named_subrepo_opts;
 
 #[test]
+fn open_permissions_is_isolated() {
+    assert!(gix::open::Permissions::isolated().is_isolated());
+    assert!(!gix::open::Permissions::all().is_isolated());
+}
+
+#[test]
 fn on_root_with_decomposed_unicode() -> crate::Result {
     let tmp = gix_testtools::tempfile::TempDir::new()?;
 

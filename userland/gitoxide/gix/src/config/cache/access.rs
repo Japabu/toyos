@@ -186,7 +186,7 @@ impl Cache {
             .user_agent
             .get_or_init(|| {
                 self.resolved
-                    .string(&Gitoxide::USER_AGENT)
+                    .string(Gitoxide::USER_AGENT)
                     .map_or_else(|| crate::env::agent().into(), |s| s.to_string())
             })
             .to_owned();
@@ -533,7 +533,7 @@ pub(crate) fn trusted_file_path<'config>(
     lenient_config: bool,
     environment: crate::open::permissions::Environment,
 ) -> Option<Result<Cow<'config, std::path::Path>, gix_config::path::interpolate::Error>> {
-    let path = config.path_filter(&key, filter)?;
+    let path = config.path_filter(key, filter)?;
 
     if lenient_config && path.is_empty() {
         let _key = key.as_key();

@@ -74,6 +74,77 @@ mod non_bare {
         );
         Ok(())
     }
+
+    #[test]
+    fn init_bare_with_fully_qualified_custom_branch_name_is_not_prefixed_again() -> crate::Result {
+        let tmp = tempfile::tempdir()?;
+        let repo: gix::Repository = gix::ThreadSafeRepository::init_opts(
+            tmp.path(),
+            gix::create::Kind::Bare,
+            gix::create::Options::default(),
+            gix::open::Options::isolated().config_overrides([
+                "user.name=a",
+                "user.email=b",
+                "init.defaultBranch=refs/heads/special",
+            ]),
+        )?
+        .into();
+        assert_eq!(
+            repo.head()?.referent_name().expect("name").as_bstr(),
+            "refs/heads/special"
+        );
+        assert_eq!(
+            repo.is_pristine(),
+            Some(true),
+            "the expected default ref uses the de-duplicated fully qualified branch name"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn init_bare_rejects_reserved_branch_name() -> crate::Result {
+        let tmp = tempfile::tempdir()?;
+        let err = gix::ThreadSafeRepository::init_opts(
+            tmp.path(),
+            gix::create::Kind::Bare,
+            gix::create::Options::default(),
+            gix::open::Options::isolated().config_overrides(["user.name=a", "user.email=b", "init.defaultBranch=HEAD"]),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            gix::init::Error::InvalidBranchName {
+                name,
+                source: gix_validate::reference::name::Error::Reserved { name: reserved }
+            } if name == "HEAD" && reserved == "refs/heads/HEAD"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn init_bare_rejects_reserved_fully_qualified_branch_name() -> crate::Result {
+        let tmp = tempfile::tempdir()?;
+        let err = gix::ThreadSafeRepository::init_opts(
+            tmp.path(),
+            gix::create::Kind::Bare,
+            gix::create::Options::default(),
+            gix::open::Options::isolated().config_overrides([
+                "user.name=a",
+                "user.email=b",
+                "init.defaultBranch=refs/heads/HEAD",
+            ]),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            gix::init::Error::InvalidBranchName {
+                name,
+                source: gix_validate::reference::name::Error::Reserved { name: reserved }
+            } if name == "refs/heads/HEAD" && reserved == "refs/heads/HEAD"
+        ));
+        Ok(())
+    }
+
     #[test]
     fn init_into_empty_directory_creates_a_dot_git_dir() -> crate::Result {
         let tmp = tempfile::tempdir()?;

@@ -26,6 +26,26 @@
 //!
 //! [`signal-hook`]: https://docs.rs/signal-hook
 //!
+//! ## Examples
+//!
+//! ```
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! use std::io::Write;
+//!
+//! # let dir = tempfile::tempdir()?;
+//! # let destination = dir.path().join("config");
+//! let mut tempfile = gix_tempfile::writable_at(
+//!     dir.path().join("config.lock"),
+//!     gix_tempfile::ContainingDirectory::Exists,
+//!     gix_tempfile::AutoRemove::Tempfile,
+//! )?;
+//! tempfile.write_all(b"new = value\n")?;
+//! tempfile.persist(&destination)?;
+//!
+//! assert_eq!(std::fs::read_to_string(&destination)?, "new = value\n");
+//! # Ok(()) }
+//! ```
+//!
 //! ## Feature Flags
 #![cfg_attr(
     all(doc, feature = "document-features"),

@@ -75,7 +75,7 @@ pub(crate) mod hero {
         use crate::transport::client::async_io;
         #[cfg(feature = "blocking-client")]
         use crate::transport::client::blocking_io;
-        use crate::{fetch::RefMap, Handshake};
+        use crate::{fetch::RefMap, ls_refs::RefPrefixes, Handshake};
         use gix_features::progress::Progress;
         use std::borrow::Cow;
 
@@ -146,10 +146,12 @@ pub(crate) mod hero {
                     )?));
                 }
 
-                let all_refspecs = refmap_context.aggregate_refspecs();
-                let prefix_refspecs = prefix_from_spec_as_filter_on_remote.then_some(&all_refspecs[..]);
+                let prefix_refs = prefix_from_spec_as_filter_on_remote.then(|| {
+                    let all_refspecs = refmap_context.aggregate_refspecs();
+                    RefPrefixes::from_refspecs(&all_refspecs)
+                });
                 Ok(ObtainRefMap::LsRefsCommand(
-                    crate::LsRefsCommand::new(prefix_refspecs, &self.capabilities, user_agent),
+                    crate::LsRefsCommand::new(prefix_refs, &self.capabilities, user_agent),
                     refmap_context,
                 ))
             }

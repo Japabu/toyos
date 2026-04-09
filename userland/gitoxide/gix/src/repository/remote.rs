@@ -6,6 +6,25 @@ impl crate::Repository {
     ///
     /// It's configured to fetch included tags by default, similar to git.
     /// See [`with_fetch_tags(…)`][Remote::with_fetch_tags()] for a way to change it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    /// # mod doctest { include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/doctest.rs")); }
+    /// # let repo = doctest::open_repo(doctest::basic_repo_dir()?)?;
+    /// let remote = repo.remote_at("https://github.com/byron/gitoxide")?;
+    ///
+    /// assert_eq!(remote.name(), None);
+    /// assert_eq!(
+    ///     remote
+    ///         .url(gix::remote::Direction::Fetch)
+    ///         .expect("fetch URL")
+    ///         .to_bstring(),
+    ///     "https://github.com/byron/gitoxide"
+    /// );
+    /// # Ok(()) }
+    /// ```
     pub fn remote_at<Url, E>(&self, url: Url) -> Result<Remote<'_>, remote::init::Error>
     where
         Url: TryInto<gix_url::Url, Error = E>,
@@ -30,6 +49,19 @@ impl crate::Repository {
     /// similar to [`try_find_remote(…)`][Self::try_find_remote()].
     ///
     /// Note that we will obtain remotes only if we deem them [trustworthy][crate::open::Options::filter_config_section()].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    /// # mod doctest { include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/doctest.rs")); }
+    /// # let repo = doctest::open_repo(doctest::remote_repo_dir("clone")?)?;
+    /// let remote = repo.find_remote("origin")?;
+    ///
+    /// assert_eq!(remote.name().expect("configured").as_bstr(), "origin");
+    /// assert_eq!(remote.refspecs(gix::remote::Direction::Fetch).len(), 1);
+    /// # Ok(()) }
+    /// ```
     pub fn find_remote<'a>(&self, name_or_url: impl Into<&'a BStr>) -> Result<Remote<'_>, find::existing::Error> {
         let name_or_url = name_or_url.into();
         Ok(self
@@ -42,6 +74,20 @@ impl crate::Repository {
     /// Find the default remote as configured, or `None` if no such configuration could be found.
     ///
     /// See [`remote_default_name()`](Self::remote_default_name()) for more information on the `direction` parameter.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    /// # mod doctest { include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/doctest.rs")); }
+    /// # let repo = doctest::open_repo(doctest::remote_repo_dir("clone")?)?;
+    /// let remote = repo
+    ///     .find_default_remote(gix::remote::Direction::Fetch)
+    ///     .expect("configured")?;
+    ///
+    /// assert_eq!(remote.name().expect("named").as_bstr(), "origin");
+    /// # Ok(()) }
+    /// ```
     pub fn find_default_remote(
         &self,
         direction: remote::Direction,
@@ -77,6 +123,20 @@ impl crate::Repository {
     /// * fall back to either a generally configured remote or the only configured remote.
     ///
     /// Fail if no remote could be found despite all of the above.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    /// # mod doctest { include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/doctest.rs")); }
+    /// # let repo = doctest::open_repo(doctest::remote_repo_dir("clone")?)?;
+    /// let remote_names: Vec<_> = repo.remote_names().into_iter().map(|name| name.to_string()).collect();
+    /// assert_eq!(remote_names, vec!["myself".to_owned(), "origin".to_owned()]);
+    ///
+    /// let remote = repo.find_fetch_remote(None)?;
+    /// assert_eq!(remote.name().expect("configured").as_bstr(), "origin");
+    /// # Ok(()) }
+    /// ```
     pub fn find_fetch_remote(&self, name_or_url: Option<&BStr>) -> Result<Remote<'_>, find::for_fetch::Error> {
         Ok(match name_or_url {
             Some(name) => match self.try_find_remote(name).and_then(Result::ok) {
@@ -137,7 +197,7 @@ impl crate::Repository {
         let mut config_url = |key: &'static config::tree::keys::Url, kind: &'static str| {
             self.config
                 .resolved
-                .string_filter(format!("remote.{}.{}", name_or_url, key.name), &mut filter)
+                .string_filter(&format!("remote.{}.{}", name_or_url, key.name), &mut filter)
                 .map(|url| {
                     key.try_into_url(url).map_err(|err| find::Error::Url {
                         kind,
@@ -151,7 +211,7 @@ impl crate::Repository {
         let config = &self.config.resolved;
 
         let fetch_specs = config
-            .strings_filter(format!("remote.{}.{}", name_or_url, "fetch"), &mut filter)
+            .strings_filter(&format!("remote.{}.{}", name_or_url, "fetch"), &mut filter)
             .map(|specs| {
                 config_spec(
                     specs,
@@ -161,7 +221,7 @@ impl crate::Repository {
                 )
             });
         let push_specs = config
-            .strings_filter(format!("remote.{}.{}", name_or_url, "push"), &mut filter)
+            .strings_filter(&format!("remote.{}.{}", name_or_url, "push"), &mut filter)
             .map(|specs| {
                 config_spec(
                     specs,
@@ -171,7 +231,7 @@ impl crate::Repository {
                 )
             });
         let fetch_tags = config
-            .string_filter(format!("remote.{}.{}", name_or_url, "tagOpt"), &mut filter)
+            .string_filter(&format!("remote.{}.{}", name_or_url, "tagOpt"), &mut filter)
             .map(|value| {
                 config::tree::Remote::TAG_OPT
                     .try_into_tag_opt(value)

@@ -57,6 +57,7 @@ impl Section for Index {
 mod validate {
     use crate::{bstr::BStr, config::tree::keys};
 
+    #[derive(Clone, Copy)]
     pub struct IndexThreads;
     impl keys::Validate for IndexThreads {
         fn validate(&self, value: &BStr) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {

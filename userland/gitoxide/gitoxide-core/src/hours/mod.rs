@@ -6,6 +6,7 @@ use gix::{
     prelude::*,
     progress, Count, NestedProgress, Progress,
 };
+use smallvec::{smallvec, SmallVec};
 
 /// Additional configuration for the hours estimation functionality.
 pub struct Context<W> {
@@ -38,6 +39,21 @@ impl SignatureRef<'_> {
     }
 }
 
+/// Return `(commit_author, [commit_author, co_authors...])`. Use the `commit_author` for easy access to the commit author itself.
+fn commit_author_identities(
+    commit_data: &[u8],
+) -> Result<(gix::actor::SignatureRef<'_>, SmallVec<[gix::actor::IdentityRef<'_>; 2]>), gix::objs::decode::Error> {
+    let commit = gix::objs::CommitRef::from_bytes(commit_data)?;
+    let author = commit.author()?.trim();
+    let mut authors = smallvec![gix::actor::IdentityRef::from(author)];
+    authors.extend(commit.co_authored_by_trailers().filter_map(|trailer| {
+        gix::actor::IdentityRef::from_bytes::<gix::objs::decode::ParseError>(trailer.value.as_ref())
+            .ok()
+            .map(|identity| identity.trim())
+    }));
+    Ok((author, authors))
+}
+
 /// Estimate the hours it takes to produce the content of the repository in `_working_dir_`, with `_refname_` for
 /// the start of the commit graph traversal.
 ///
@@ -68,7 +84,7 @@ where
     let needs_stats = file_stats || line_stats;
     let threads = gix::features::parallel::num_threads(threads);
 
-    let (commit_authors, stats, is_shallow, skipped_merge_commits) = {
+    let (commit_authors, stats, is_shallow, skipped_merge_commits, num_commits) = {
         std::thread::scope(|scope| -> anyhow::Result<_> {
             let start = Instant::now();
             let (tx, rx) = std::sync::mpsc::channel::<(u32, Vec<u8>)>();
@@ -77,10 +93,7 @@ where
             let extract_signatures = scope.spawn(move || -> anyhow::Result<Vec<_>> {
                 let mut out = Vec::new();
                 for (commit_idx, commit_data) in rx {
-                    if let Ok(author) = gix::objs::CommitRefIter::from_bytes(&commit_data)
-                        .author()
-                        .map(|author| mailmap.resolve_cow(author.trim()))
-                    {
+                    if let Ok((commit_author, authors)) = commit_author_identities(&commit_data) {
                         let mut string_ref = |s: &[u8]| -> &'static BStr {
                             match string_heap.get(s) {
                                 Some(n) => n.as_bstr(),
@@ -91,17 +104,28 @@ where
                                 }
                             }
                         };
-                        let name = string_ref(author.name.as_ref());
-                        let email = string_ref(author.email.as_ref());
-
-                        out.push((
-                            commit_idx,
-                            SignatureRef {
+                        let mut authors_for_commit = SmallVec::<[SignatureRef<'static>; 2]>::new();
+                        for identity in authors {
+                            let author = mailmap.resolve_cow(gix::actor::SignatureRef {
+                                name: identity.name,
+                                email: identity.email,
+                                time: commit_author.time,
+                            });
+                            let name = string_ref(author.name.as_ref());
+                            let email = string_ref(author.email.as_ref());
+                            if authors_for_commit
+                                .iter()
+                                .any(|existing| existing.name == name && existing.email == email)
+                            {
+                                continue;
+                            }
+                            authors_for_commit.push(SignatureRef {
                                 name,
                                 email,
                                 time: author.time,
-                            },
-                        ));
+                            });
+                        }
+                        out.extend(authors_for_commit.into_iter().map(|author| (commit_idx, author)));
                     }
                 }
                 out.shrink_to_fit();
@@ -109,6 +133,7 @@ where
                     a.1.email
                         .cmp(b.1.email)
                         .then(a.1.seconds().cmp(&b.1.seconds()).reverse())
+                        .then(a.0.cmp(&b.0))
                 });
                 Ok(out)
             });
@@ -228,6 +253,7 @@ where
                 stats_by_commit_idx,
                 is_shallow,
                 skipped_merge_commits,
+                commit_idx,
             ))
         })?
     };
@@ -241,20 +267,23 @@ where
     let mut slice_start = 0;
     let mut results_by_hours = Vec::new();
     let mut ignored_bot_commits = 0_u32;
+    let mut push_estimate = |commits: &[(u32, SignatureRef<'static>)]| {
+        let estimate = estimate_hours(commits, &stats);
+        if ignore_bots && estimate.name.contains_str(b"[bot]") {
+            ignored_bot_commits += estimate.num_commits;
+            return;
+        }
+        results_by_hours.push(estimate);
+    };
     for (idx, (_, elm)) in commit_authors.iter().enumerate() {
         if elm.email != *current_email {
-            let estimate = estimate_hours(&commit_authors[slice_start..idx], &stats);
+            push_estimate(&commit_authors[slice_start..idx]);
             slice_start = idx;
             current_email = &elm.email;
-            if ignore_bots && estimate.name.contains_str(b"[bot]") {
-                ignored_bot_commits += estimate.num_commits;
-                continue;
-            }
-            results_by_hours.push(estimate);
         }
     }
     if let Some(commits) = commit_authors.get(slice_start..) {
-        results_by_hours.push(estimate_hours(commits, &stats));
+        push_estimate(commits);
     }
 
     let num_authors = results_by_hours.len();
@@ -271,17 +300,30 @@ where
     let elapsed = start.elapsed();
     progress.done(format!(
         "Extracted and organized data from {} commits in {:?} ({:0.0} commits/s)",
-        commit_authors.len(),
+        num_commits,
         elapsed,
-        commit_authors.len() as f32 / elapsed.as_secs_f32()
+        num_commits as f32 / elapsed.as_secs_f32()
     ));
 
     let num_unique_authors = results_by_hours.len();
-    let (total_hours, total_commits, total_files, total_lines) = results_by_hours
+    let total_hours = results_by_hours.iter().map(|e| e.hours).sum::<f32>();
+    let included_commit_ids = commit_authors
         .iter()
-        .map(|e| (e.hours, e.num_commits, e.files, e.lines))
-        .reduce(|a, b| (a.0 + b.0, a.1 + b.1, a.2.clone().added(&b.2), a.3.clone().added(&b.3)))
-        .expect("at least one commit at this point");
+        .filter(|(_, author)| !(ignore_bots && author.name.contains_str(b"[bot]")))
+        .map(|(commit_idx, _)| *commit_idx)
+        .collect::<BTreeSet<_>>();
+    let total_commits = included_commit_ids.len() as u32;
+    let (total_files, total_lines) = stats
+        .iter()
+        .filter(|(commit_idx, _, _)| included_commit_ids.contains(commit_idx))
+        .fold(
+            (FileStats::default(), LineStats::default()),
+            |mut acc, (_, files, lines)| {
+                acc.0.add(files);
+                acc.1.add(lines);
+                acc
+            },
+        );
     if show_pii {
         results_by_hours.sort_by(|a, b| a.hours.partial_cmp(&b.hours).unwrap_or(std::cmp::Ordering::Equal));
         for entry in &results_by_hours {
@@ -336,11 +378,7 @@ where
     if needs_stats && skipped_merge_commits != 0 {
         writeln!(out, "stats omitted for {skipped_merge_commits} merge commits")?;
     }
-    assert_eq!(
-        total_commits,
-        commit_authors.len() as u32 - ignored_bot_commits,
-        "need to get all commits"
-    );
+    debug_assert!(total_commits <= num_commits);
     Ok(())
 }
 
@@ -351,3 +389,61 @@ mod util;
 use util::{CommitIdx, FileStats, LineStats, WorkByEmail, WorkByPerson};
 
 use crate::hours::core::spawn_tree_delta_threads;
+
+#[cfg(test)]
+mod tests {
+    use gix::bstr::ByteSlice;
+
+    use super::commit_author_identities;
+
+    #[test]
+    fn commit_author_identities_include_coauthors() {
+        let commit = b"tree 1111111111111111111111111111111111111111\n\
+author Main Author <main@example.com> 1710000000 +0000\n\
+committer Main Author <main@example.com> 1710000000 +0000\n\
+\n\
+subject\n\
+\n\
+body\n\
+\n\
+Co-authored-by: Second Author <second@example.com>\n\
+Co-authored-by: Third Author <third@example.com>\n";
+        let (author, authors) = commit_author_identities(commit).expect("valid commit");
+        assert_eq!(author.time, "1710000000 +0000");
+        assert_eq!(
+            authors
+                .iter()
+                .map(|identity| (identity.name, identity.email))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    "Main Author".as_bytes().as_bstr(),
+                    "main@example.com".as_bytes().as_bstr()
+                ),
+                (
+                    "Second Author".as_bytes().as_bstr(),
+                    "second@example.com".as_bytes().as_bstr()
+                ),
+                (
+                    "Third Author".as_bytes().as_bstr(),
+                    "third@example.com".as_bytes().as_bstr()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn commit_author_identities_skip_invalid_coauthors() {
+        let commit = b"tree 1111111111111111111111111111111111111111\n\
+author Main Author <main@example.com> 1710000000 +0000\n\
+committer Main Author <main@example.com> 1710000000 +0000\n\
+\n\
+subject\n\
+\n\
+Co-authored-by: not a signature\n";
+        let (_, authors) = commit_author_identities(commit).expect("valid commit");
+        assert_eq!(authors.len(), 1);
+        assert_eq!(authors[0].name, "Main Author".as_bytes().as_bstr());
+        assert_eq!(authors[0].email, "main@example.com".as_bytes().as_bstr());
+    }
+}

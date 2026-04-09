@@ -71,6 +71,10 @@ impl crate::Repository {
     /// Create a new reference with `name`, like `refs/heads/branch`, pointing to `target`, adhering to `constraint`
     /// during creation and writing `log_message` into the reflog. Note that a ref-log will be written even if `log_message` is empty.
     ///
+    /// Note that this accepts any valid full reference name, including `refs/heads/HEAD`.
+    /// Git rejects creating a local branch with that name in branch-specific code paths, but this API operates on generic
+    /// references instead. Branch names can be validated with [`gix_validate::reference::branch_name()`].
+    ///
     /// The newly created Reference is returned.
     pub fn reference<Name, E>(
         &self,
@@ -166,6 +170,20 @@ impl crate::Repository {
     /// Return the repository head, an abstraction to help dealing with the `HEAD` reference.
     ///
     /// The `HEAD` reference can be in various states, for more information, the documentation of [`Head`](crate::Head).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    /// # mod doctest { include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/doctest.rs")); }
+    /// # let repo = doctest::open_repo(doctest::basic_repo_dir()?)?;
+    /// let head = repo.head()?;
+    ///
+    /// assert_eq!(head.referent_name().expect("born").as_bstr(), "refs/heads/main");
+    /// assert!(!head.is_detached());
+    /// assert!(!head.is_unborn());
+    /// # Ok(()) }
+    /// ```
     pub fn head(&self) -> Result<crate::Head<'_>, reference::find::existing::Error> {
         let head = self.find_reference("HEAD")?;
         Ok(match head.inner.target {
@@ -213,6 +231,22 @@ impl crate::Repository {
     /// Note that this may fail for various reasons, most notably because the repository
     /// is freshly initialized and doesn't have any commits yet. It could also fail if the
     /// head does not point to a commit.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    /// # mod doctest { include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/doctest.rs")); }
+    /// # let repo = doctest::open_repo(doctest::basic_repo_dir()?)?;
+    /// let head = repo.head_commit()?;
+    ///
+    /// assert_eq!(head.decode()?.message, "c2\n");
+    /// assert_eq!(repo.head_tree_id()?, head.tree_id()?);
+    ///
+    /// let previous = repo.rev_parse_single("HEAD^")?;
+    /// assert_ne!(previous, head.id);
+    /// # Ok(()) }
+    /// ```
     pub fn head_commit(&self) -> Result<crate::Commit<'_>, reference::head_commit::Error> {
         Ok(self.head()?.peel_to_commit()?)
     }
@@ -249,6 +283,18 @@ impl crate::Repository {
     /// Note that this may fail for various reasons, most notably because the repository
     /// is freshly initialized and doesn't have any commits yet. It could also fail if the
     /// head does not point to a tree, unlikely but possible.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    /// # mod doctest { include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/doctest.rs")); }
+    /// # let repo = doctest::open_repo(doctest::basic_repo_dir()?)?;
+    /// let tree = repo.head_tree()?;
+    ///
+    /// assert_eq!(tree.find_entry("this").expect("present").filename(), "this");
+    /// # Ok(()) }
+    /// ```
     pub fn head_tree(&self) -> Result<crate::Tree<'_>, reference::head_tree::Error> {
         Ok(self.head_commit()?.tree()?)
     }
@@ -258,6 +304,19 @@ impl crate::Repository {
     ///
     /// Consider [`try_find_reference(…)`](crate::Repository::try_find_reference()) if the reference might not exist
     /// without that being considered an error.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    /// # mod doctest { include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/doctest.rs")); }
+    /// # let repo = doctest::open_repo(doctest::basic_repo_dir()?)?;
+    /// let mut reference = repo.find_reference("main")?;
+    ///
+    /// assert_eq!(reference.name().as_bstr(), "refs/heads/main");
+    /// assert_eq!(reference.peel_to_commit()?.message()?.title, "c2\n");
+    /// # Ok(()) }
+    /// ```
     pub fn find_reference<'a, Name, E>(&self, name: Name) -> Result<Reference<'_>, reference::find::existing::Error>
     where
         Name: TryInto<&'a PartialNameRef, Error = E> + Clone,
@@ -279,6 +338,22 @@ impl crate::Repository {
     ///
     /// Common kinds of iteration are [all](crate::reference::iter::Platform::all()) or [prefixed](crate::reference::iter::Platform::prefixed())
     /// references.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    /// # mod doctest { include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/doctest.rs")); }
+    /// # let repo = doctest::open_repo(doctest::basic_repo_dir()?)?;
+    /// let branches = repo
+    ///     .references()?
+    ///     .local_branches()?
+    ///     .map(|reference| reference.map(|reference| reference.name().as_bstr().to_string()))
+    ///     .collect::<Result<Vec<_>, _>>()?;
+    ///
+    /// assert_eq!(branches, vec!["refs/heads/main".to_owned()]);
+    /// # Ok(()) }
+    /// ```
     pub fn references(&self) -> Result<reference::iter::Platform<'_>, reference::iter::Error> {
         Ok(reference::iter::Platform {
             platform: self.refs.iter()?,

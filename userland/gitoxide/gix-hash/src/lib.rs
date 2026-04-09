@@ -1,6 +1,25 @@
 //! This crate provides types for identifying git objects using a hash digest.
 //!
 //! These are provided in [borrowed versions][oid] as well as an [owned one][ObjectId].
+//!
+//! ## Examples
+//!
+//! ```
+//! use gix_hash::{hasher, Kind, ObjectId, Prefix};
+//!
+//! let id = ObjectId::from_hex(b"e69de29bb2d1d6434b8b29ae775ad8c2e48c5391").unwrap();
+//! assert_eq!(id.kind(), Kind::Sha1);
+//! assert!(id.is_empty_blob());
+//!
+//! let prefix = Prefix::new(&id, 7).unwrap();
+//! assert_eq!(prefix.to_string(), "e69de29");
+//!
+//! let mut digest = hasher(Kind::Sha1);
+//! digest.update(id.as_slice());
+//! let hashed_bytes = digest.try_finalize().unwrap();
+//! assert_eq!(hashed_bytes.kind(), Kind::Sha1);
+//! assert_ne!(hashed_bytes, id);
+//! ```
 //! ## Feature Flags
 #![cfg_attr(
     all(doc, feature = "document-features"),

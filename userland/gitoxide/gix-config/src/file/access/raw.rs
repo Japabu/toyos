@@ -647,11 +647,16 @@ impl<'event> File<'event> {
     /// ```
     pub fn set_raw_value<'b>(
         &mut self,
-        key: &'event impl AsKey,
+        key: impl AsKey,
         new_value: impl Into<&'b BStr>,
     ) -> Result<Option<Cow<'event, BStr>>, crate::file::set_raw_value::Error> {
         let key = key.as_key();
-        self.set_raw_value_by(key.section_name, key.subsection_name, key.value_name, new_value)
+        self.set_raw_value_by(
+            key.section_name,
+            key.subsection_name,
+            key.value_name.to_owned(),
+            new_value,
+        )
     }
 
     /// Sets a value in a given `section_name`, optional `subsection_name`, and `value_name`.
@@ -699,12 +704,18 @@ impl<'event> File<'event> {
     /// `filter`, creating a new section otherwise.
     pub fn set_raw_value_filter<'b>(
         &mut self,
-        key: &'event impl AsKey,
+        key: impl AsKey,
         new_value: impl Into<&'b BStr>,
         filter: impl FnMut(&Metadata) -> bool,
     ) -> Result<Option<Cow<'event, BStr>>, crate::file::set_raw_value::Error> {
         let key = key.as_key();
-        self.set_raw_value_filter_by(key.section_name, key.subsection_name, key.value_name, new_value, filter)
+        self.set_raw_value_filter_by(
+            key.section_name,
+            key.subsection_name,
+            key.value_name.to_owned(),
+            new_value,
+            filter,
+        )
     }
 
     /// Similar to [`set_raw_value_by()`](Self::set_raw_value_by()), but only sets existing values in sections matching

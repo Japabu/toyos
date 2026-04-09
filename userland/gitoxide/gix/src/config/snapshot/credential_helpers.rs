@@ -186,7 +186,7 @@ pub(super) mod function {
         let prompt_options = gix_prompt::Options {
             askpass: crate::config::cache::access::trusted_file_path(
                 config,
-                &Core::ASKPASS,
+                Core::ASKPASS,
                 &mut filter,
                 is_lenient_config,
                 environment,
@@ -195,7 +195,7 @@ pub(super) mod function {
             .ignore_empty()?
             .map(|c| Cow::Owned(c.into_owned())),
             mode: config
-                .boolean(&Credentials::TERMINAL_PROMPT)
+                .boolean(Credentials::TERMINAL_PROMPT)
                 .map(|val| Credentials::TERMINAL_PROMPT.enrich_error(val))
                 .transpose()
                 .with_leniency(is_lenient_config)?
@@ -210,7 +210,7 @@ pub(super) mod function {
                 // The default ssh implementation uses binaries that do their own auth, so our passwords aren't used.
                 query_user_only: url.scheme == gix_url::Scheme::Ssh,
                 stderr: config
-                    .boolean(&Credentials::HELPER_STDERR)
+                    .boolean(Credentials::HELPER_STDERR)
                     .map(|val| Credentials::HELPER_STDERR.enrich_error(val))
                     .transpose()
                     .with_leniency(is_lenient_config)?

@@ -44,7 +44,7 @@ mod impl_ {
             eprintln!(
                 "{}[{:0x}]: {} / {} (hits/misses) = {:.02}%, puts = {}",
                 self.owner,
-                self as *const _ as usize,
+                std::ptr::from_ref(self) as usize,
                 hits,
                 misses,
                 ratio * 100.0,

@@ -2,7 +2,7 @@ lints.workspace = true
 
 [package]
 name = "gix-discover"
-version = "0.48.0"
+version = "0.49.0"
 repository = "https://github.com/GitoxideLabs/gitoxide"
 license = "MIT OR Apache-2.0"
 description = "Discover git repositories and check if a directory is a git repository"
@@ -12,17 +12,17 @@ include = ["src/**/*", "LICENSE-*"]
 rust-version = "1.82"
 
 [lib]
-doctest = false
+doctest = true
 
 [features]
 ## Enable support for the SHA-1 hash by forwarding the feature to dependencies.
 sha1 = ["gix-ref/sha1"]
 
 [dependencies]
-gix-sec = { version = "^0.13.1", path = "../gix-sec" }
-gix-path = { version = "^0.11.1", path = "../gix-path" }
-gix-ref = { version = "^0.60.0", path = "../gix-ref" }
-gix-fs = { version = "^0.19.1", path = "../gix-fs" }
+gix-sec = { version = "^0.13.2", path = "../gix-sec" }
+gix-path = { version = "^0.11.2", path = "../gix-path" }
+gix-ref = { version = "^0.61.0", path = "../gix-ref" }
+gix-fs = { version = "^0.19.2", path = "../gix-fs" }
 
 bstr = { version = "1.12.0", default-features = false, features = ["std", "unicode"] }
 thiserror = "2.0.18"

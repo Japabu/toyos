@@ -31,6 +31,28 @@ fn probe() {
 }
 
 #[test]
+fn probe_git_dir_without_config_uses_head() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::File::create(dir.path().join("HEAD")).unwrap();
+
+    let actual = gix_fs::Capabilities::probe(dir.path());
+    let expected_ignore_case = std::fs::metadata(dir.path().join("hEaD")).is_ok();
+    assert_eq!(actual.ignore_case, expected_ignore_case);
+
+    let entries: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_name().to_str() != Some("HEAD"))
+        .map(|e| e.path())
+        .collect();
+    assert_eq!(
+        entries.len(),
+        0,
+        "there should be no left-over files after probing, found {entries:?}"
+    );
+}
+
+#[test]
 fn parallel_probe() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::File::create(dir.path().join("config")).unwrap();

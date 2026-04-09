@@ -196,6 +196,7 @@ pub(super) mod validate {
         config::tree::{keys, Diff},
     };
 
+    #[derive(Copy, Clone)]
     pub struct Ignore;
     impl keys::Validate for Ignore {
         fn validate(&self, value: &BStr) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
@@ -205,6 +206,7 @@ pub(super) mod validate {
         }
     }
 
+    #[derive(Copy, Clone)]
     pub struct Algorithm;
     impl keys::Validate for Algorithm {
         fn validate(&self, value: &BStr) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
@@ -213,6 +215,7 @@ pub(super) mod validate {
         }
     }
 
+    #[derive(Copy, Clone)]
     pub struct Renames;
     impl keys::Validate for Renames {
         fn validate(&self, value: &BStr) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
@@ -222,6 +225,7 @@ pub(super) mod validate {
         }
     }
 
+    #[derive(Copy, Clone)]
     pub struct Binary;
     impl keys::Validate for Binary {
         fn validate(&self, value: &BStr) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {

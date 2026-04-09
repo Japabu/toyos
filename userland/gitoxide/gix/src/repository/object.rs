@@ -40,6 +40,19 @@ impl crate::Repository {
     ///
     /// In order to get the kind of the object, is must be fully decoded from storage if it is packed with deltas.
     /// Loose object could be partially decoded, even though that's not implemented.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    /// # mod doctest { include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/doctest.rs")); }
+    /// # let repo = doctest::open_repo(doctest::basic_repo_dir()?)?;
+    /// let object = repo.find_object(repo.head_id()?)?;
+    ///
+    /// assert_eq!(object.kind, gix::objs::Kind::Commit);
+    /// assert_eq!(object.into_commit().message_raw()?, "c2\n");
+    /// # Ok(()) }
+    /// ```
     pub fn find_object(&self, id: impl Into<ObjectId>) -> Result<Object<'_>, object::find::existing::Error> {
         let id = id.into();
         if id == ObjectId::empty_tree(self.object_hash()) {
@@ -56,6 +69,18 @@ impl crate::Repository {
     }
 
     /// Find a commit with `id` or fail if there was no object or the object wasn't a commit.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    /// # mod doctest { include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/doctest.rs")); }
+    /// # let repo = doctest::open_repo(doctest::basic_repo_dir()?)?;
+    /// let commit = repo.find_commit(repo.head_id()?)?;
+    ///
+    /// assert_eq!(commit.message_raw()?, "c2\n");
+    /// # Ok(()) }
+    /// ```
     pub fn find_commit(
         &self,
         id: impl Into<ObjectId>,
@@ -64,6 +89,18 @@ impl crate::Repository {
     }
 
     /// Find a tree with `id` or fail if there was no object or the object wasn't a tree.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    /// # mod doctest { include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/doctest.rs")); }
+    /// # let repo = doctest::open_repo(doctest::basic_repo_dir()?)?;
+    /// let tree = repo.find_tree(repo.head_tree_id()?)?;
+    ///
+    /// assert_eq!(tree.find_entry("this").expect("present").filename(), "this");
+    /// # Ok(()) }
+    /// ```
     pub fn find_tree(
         &self,
         id: impl Into<ObjectId>,
@@ -90,6 +127,18 @@ impl crate::Repository {
     /// Also note that for empty trees and blobs, it will always report it to exist in loose objects, even if they don't
     /// exist or if they exist in a pack.
     #[doc(alias = "read_header", alias = "git2")]
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    /// # mod doctest { include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/doctest.rs")); }
+    /// # let repo = doctest::open_repo(doctest::basic_repo_dir()?)?;
+    /// let header = repo.find_header(repo.head_id()?)?;
+    ///
+    /// assert_eq!(header.kind(), gix::objs::Kind::Commit);
+    /// # Ok(()) }
+    /// ```
     pub fn find_header(&self, id: impl Into<ObjectId>) -> Result<gix_odb::find::Header, object::find::existing::Error> {
         let id = id.into();
         if id == ObjectId::empty_tree(self.object_hash()) {
@@ -110,6 +159,16 @@ impl crate::Repository {
     /// Use [`repo.objects.refresh_never()`](gix_odb::store::Handle::refresh_never) to avoid expensive
     /// IO-bound refreshes if an object wasn't found.
     #[doc(alias = "exists", alias = "git2")]
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    /// # mod doctest { include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/doctest.rs")); }
+    /// # let repo = doctest::open_repo(doctest::basic_repo_dir()?)?;
+    /// assert!(repo.has_object(repo.head_id()?));
+    /// # Ok(()) }
+    /// ```
     pub fn has_object(&self, id: impl AsRef<gix_hash::oid>) -> bool {
         let id = id.as_ref();
         if id.to_owned().is_empty_tree() {
@@ -122,6 +181,18 @@ impl crate::Repository {
     /// Obtain information about an object without fully decoding it, or `None` if the object doesn't exist.
     ///
     /// Note that despite being cheaper than [`Self::try_find_object()`], there is still some effort traversing delta-chains.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    /// # mod doctest { include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/doctest.rs")); }
+    /// # let repo = doctest::open_repo(doctest::basic_repo_dir()?)?;
+    /// let header = repo.try_find_header(repo.head_id()?)?.expect("present");
+    ///
+    /// assert_eq!(header.kind(), gix::objs::Kind::Commit);
+    /// # Ok(()) }
+    /// ```
     pub fn try_find_header(
         &self,
         id: impl Into<ObjectId>,
@@ -137,6 +208,18 @@ impl crate::Repository {
     }
 
     /// Try to find the object with `id` or return `None` if it wasn't found.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    /// # mod doctest { include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/doctest.rs")); }
+    /// # let repo = doctest::open_repo(doctest::basic_repo_dir()?)?;
+    /// let object = repo.try_find_object(repo.head_id()?)?.expect("present");
+    ///
+    /// assert_eq!(object.kind, gix::objs::Kind::Commit);
+    /// # Ok(()) }
+    /// ```
     pub fn try_find_object(&self, id: impl Into<ObjectId>) -> Result<Option<Object<'_>>, object::find::Error> {
         let id = id.into();
         if id == ObjectId::empty_tree(self.object_hash()) {
@@ -191,6 +274,19 @@ impl crate::Repository {
     ///
     /// We avoid writing duplicate objects to slow disks that will eventually have to be garbage collected by
     /// pre-hashing the data, and checking if the object is already present.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    /// # mod doctest { include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/doctest.rs")); }
+    /// # let dir = doctest::tempdir()?;
+    /// let repo = gix::init_bare(dir.path())?;
+    /// let blob_id = repo.write_blob(b"hello world")?;
+    ///
+    /// assert_eq!(repo.find_blob(blob_id)?.data, b"hello world");
+    /// # Ok(()) }
+    /// ```
     pub fn write_blob(&self, bytes: impl AsRef<[u8]>) -> Result<Id<'_>, object::write::Error> {
         let bytes = bytes.as_ref();
         let oid = gix_object::compute_hash(self.object_hash(), gix_object::Kind::Blob, bytes)

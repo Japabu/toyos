@@ -1,5 +1,32 @@
 //! Parse `.gitattribute` files and provide utilities to match against them.
 //!
+//! ## Examples
+//!
+//! ```
+//! use gix_attributes::search::{MetadataCollection, Outcome};
+//! use gix_glob::pattern::Case;
+//!
+//! let mut search = gix_attributes::Search::default();
+//! let mut collection = MetadataCollection::default();
+//! search.add_patterns_buffer(
+//!     b"*.sh text eol=lf",
+//!     "<memory>".into(),
+//!     None,
+//!     &mut collection,
+//!     true,
+//! );
+//!
+//! let mut out = Outcome::default();
+//! out.initialize_with_selection(&collection, ["text", "eol"]);
+//! assert!(search.pattern_matching_relative_path("script.sh".into(), Case::Sensitive, Some(false), &mut out));
+//!
+//! let assignments = out
+//!     .iter_selected()
+//!     .map(|m| m.assignment.to_string())
+//!     .collect::<Vec<_>>();
+//! assert_eq!(assignments, vec!["text", "eol=lf"]);
+//! ```
+//!
 //! ## Feature Flags
 #![cfg_attr(
     all(doc, feature = "document-features"),

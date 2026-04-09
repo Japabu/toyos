@@ -2,7 +2,7 @@ lints.workspace = true
 
 [package]
 name = "gix-prompt"
-version = "0.14.0"
+version = "0.14.1"
 repository = "https://github.com/GitoxideLabs/gitoxide"
 license = "MIT OR Apache-2.0"
 description = "A crate of the gitoxide project for handling prompts in the terminal"

@@ -67,7 +67,7 @@ impl crate::Repository {
 
         let configured_path = self
             .config_snapshot()
-            .trusted_path(&Mailmap::FILE)
+            .trusted_path(Mailmap::FILE)
             .and_then(|res| res.map_err(|e| err.get_or_insert(e.into())).ok());
 
         if let Some(mut file) =

@@ -48,6 +48,21 @@ impl Commit<'_> {
 
 impl<'repo> Commit<'repo> {
     /// Turn this objects id into a shortened id with a length in hex as configured by `core.abbrev`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use std::cmp::Ordering;
+    /// # fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    /// # mod doctest { include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/doctest.rs")); }
+    /// # let repo = doctest::open_repo(doctest::basic_repo_dir()?)?;
+    /// let commit = repo.head_commit()?;
+    /// let short_id = commit.short_id()?;
+    ///
+    /// assert_eq!(short_id.cmp_oid(&commit.id), Ordering::Equal);
+    /// assert_eq!(short_id.to_string(), "3189cd3");
+    /// # Ok(()) }
+    /// ```
     pub fn short_id(&self) -> Result<gix_hash::Prefix, crate::id::shorten::Error> {
         use crate::ext::ObjectIdExt;
         self.id.attach(self.repo).shorten()
@@ -58,6 +73,18 @@ impl<'repo> Commit<'repo> {
         Ok(gix_object::commit::MessageRef::from_bytes(self.message_raw()?))
     }
     /// Decode the commit object until the message and return it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    /// # mod doctest { include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/doctest.rs")); }
+    /// # let repo = doctest::open_repo(doctest::basic_repo_dir()?)?;
+    /// let commit = repo.head_commit()?;
+    ///
+    /// assert_eq!(commit.message_raw()?, "c2\n");
+    /// # Ok(()) }
+    /// ```
     pub fn message_raw(&self) -> Result<&'_ BStr, gix_object::decode::Error> {
         gix_object::CommitRefIter::from_bytes(&self.data).message()
     }
@@ -110,7 +137,19 @@ impl<'repo> Commit<'repo> {
     }
 
     /// Decode this commits parent ids on the fly without allocating.
-    // TODO: tests
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    /// # mod doctest { include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/doctest.rs")); }
+    /// # let repo = doctest::open_repo(doctest::basic_repo_dir()?)?;
+    /// let commit = repo.head_commit()?;
+    /// let parent_ids: Vec<_> = commit.parent_ids().collect();
+    ///
+    /// assert_eq!(parent_ids, vec![repo.rev_parse_single("HEAD~1")?]);
+    /// # Ok(()) }
+    /// ```
     pub fn parent_ids(&self) -> impl Iterator<Item = crate::Id<'repo>> + '_ {
         use crate::ext::ObjectIdExt;
         let repo = self.repo;
@@ -120,6 +159,19 @@ impl<'repo> Commit<'repo> {
     }
 
     /// Parse the commit and return the tree object it points to.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    /// # mod doctest { include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/doctest.rs")); }
+    /// # let repo = doctest::open_repo(doctest::basic_repo_dir()?)?;
+    /// let commit = repo.head_commit()?;
+    /// let tree = commit.tree()?;
+    ///
+    /// assert_eq!(tree.id, repo.head_tree_id()?);
+    /// # Ok(()) }
+    /// ```
     pub fn tree(&self) -> Result<Tree<'repo>, Error> {
         match self.tree_id()?.object()?.try_into_tree() {
             Ok(tree) => Ok(tree),

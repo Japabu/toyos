@@ -59,6 +59,7 @@ impl Section for Status {
 mod validate {
     use crate::{bstr::BStr, config::tree::keys};
 
+    #[derive(Clone, Copy)]
     pub struct ShowUntrackedFiles;
     impl keys::Validate for ShowUntrackedFiles {
         fn validate(&self, value: &BStr) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {

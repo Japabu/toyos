@@ -1,4 +1,59 @@
 //! A crate with file-system specific utilities.
+//!
+//! ## Examples
+//!
+//! ```
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! use std::path::{Path, PathBuf};
+//!
+//! use gix_fs::{
+//!     stack::{Delegate, ToNormalPathComponents},
+//!     Stack,
+//! };
+//!
+//! let components = "src/lib.rs"
+//!     .to_normal_path_components()
+//!     .collect::<Result<Vec<_>, _>>()?;
+//! assert_eq!(
+//!     components
+//!         .into_iter()
+//!         .map(|component| component.to_string_lossy().into_owned())
+//!         .collect::<Vec<_>>(),
+//!     vec!["src", "lib.rs"]
+//! );
+//!
+//! #[derive(Default)]
+//! struct Recorder {
+//!     directories: Vec<PathBuf>,
+//!     paths: Vec<PathBuf>,
+//! }
+//!
+//! impl Delegate for Recorder {
+//!     fn push_directory(&mut self, stack: &Stack) -> std::io::Result<()> {
+//!         self.directories.push(stack.current_relative().to_path_buf());
+//!         Ok(())
+//!     }
+//!
+//!     fn push(&mut self, _is_last_component: bool, stack: &Stack) -> std::io::Result<()> {
+//!         self.paths.push(stack.current_relative().to_path_buf());
+//!         Ok(())
+//!     }
+//!
+//!     fn pop_directory(&mut self) {}
+//! }
+//!
+//! # let dir = tempfile::tempdir()?;
+//! let capabilities = gix_fs::Capabilities::probe_dir(dir.path());
+//! let mut stack = Stack::new(dir.path().to_path_buf());
+//! let mut recorder = Recorder::default();
+//! stack.make_relative_path_current("src/lib.rs", &mut recorder)?;
+//!
+//! assert_eq!(stack.current_relative(), Path::new("src/lib.rs"));
+//! assert_eq!(recorder.directories[0], Path::new(""));
+//! assert_eq!(recorder.paths, vec![PathBuf::from("src"), PathBuf::from("src/lib.rs")]);
+//! assert_eq!(gix_fs::current_dir(capabilities.precompose_unicode)?, std::env::current_dir()?);
+//! # Ok(()) }
+//! ```
 #![deny(rust_2018_idioms, missing_docs)]
 #![forbid(unsafe_code)]
 

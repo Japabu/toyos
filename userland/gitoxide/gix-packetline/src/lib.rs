@@ -1,5 +1,41 @@
 //! Read and write the git packet line wire format without copying it.
 //!
+//! ## Examples
+//!
+//! ```
+//! # #[cfg(feature = "blocking-io")]
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! use std::io::Write;
+//!
+//! use gix_packetline::{
+//!     blocking_io::{encode, StreamingPeekableIter, Writer},
+//!     PacketLineRef,
+//! };
+//!
+//! let mut writer = Writer::new(Vec::new());
+//! writer.enable_text_mode();
+//! writer.write_all(b"command=ls-refs")?;
+//! writer.write_all(b"agent=gitoxide")?;
+//! encode::flush_to_write(writer.inner_mut())?;
+//!
+//! let bytes = writer.into_inner();
+//! let mut reader = StreamingPeekableIter::new(&bytes[..], &[PacketLineRef::Flush], false);
+//!
+//! assert_eq!(
+//!     reader.read_line().unwrap()??.as_text().unwrap().as_bstr(),
+//!     "command=ls-refs"
+//! );
+//! assert_eq!(
+//!     reader.read_line().unwrap()??.as_text().unwrap().as_bstr(),
+//!     "agent=gitoxide"
+//! );
+//! assert!(reader.read_line().is_none());
+//! assert_eq!(reader.stopped_at(), Some(PacketLineRef::Flush));
+//! # Ok(()) }
+//! # #[cfg(not(feature = "blocking-io"))]
+//! # fn main() {}
+//! ```
+//!
 //! ## Feature Flags
 #![cfg_attr(
     all(doc, all(doc, feature = "document-features")),

@@ -2,7 +2,7 @@ use gix_merge::blob::Platform;
 use gix_worktree::stack::state::attributes;
 
 mod merge {
-    use std::{convert::Infallible, process::Stdio};
+    use std::{convert::Infallible, path::Path, process::Stdio};
 
     use bstr::{BStr, ByteSlice};
     use gix_merge::blob::{
@@ -356,6 +356,98 @@ theirs
                 "binary\0"
             ],
             "in this case, the binary lines are just taken verbatim"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(not(windows))] // assertions aren't handling Windows paths, and there is no need.
+    /// This test is a complex behavioural test for an external merge driver similar to `mergiraf`.
+    fn with_external_mergiraf_like_driver_uses_worktree_tempfiles_from_context() -> crate::Result {
+        let mut platform = new_platform(
+            [gix_merge::blob::Driver {
+                name: "b".into(),
+                command: r#"for input in "%O" "%A" "%B"; do
+    case "$input" in
+        "$GIT_WORK_TREE"/*) ;;
+        *)
+            echo "$input is outside of $GIT_WORK_TREE" >&2
+            exit 1
+            ;;
+    esac
+done
+meta="%A.mergiraf"
+printf '%s\n' "$GIT_DIR" "$GIT_WORK_TREE" "%O" "%A" "%B" "%P" "%S" "%X" "%Y" "%L" > "$meta"
+cat "$meta" > "%A"
+printf '%s\n' "--base--" >> "%A"
+cat "%O" >> "%A"
+printf '%s\n' "--theirs--" >> "%A"
+cat "%B" >> "%A""#
+                    .into(),
+                ..Default::default()
+            }],
+            pipeline::Mode::ToGit,
+        );
+
+        let mut db = ObjectDb::default();
+        for (content, kind) in [
+            ("base", ResourceKind::CommonAncestorOrBase),
+            ("ours", ResourceKind::CurrentOrOurs),
+            ("theirs", ResourceKind::OtherOrTheirs),
+        ] {
+            let id = db.insert(content)?;
+            platform.set_resource(id, EntryKind::Blob, "b".into(), kind, &db)?;
+        }
+
+        let platform_ref = platform.prepare_merge(&db, Default::default())?;
+        let worktree = gix_testtools::tempfile::TempDir::new()?;
+        let git_dir = worktree.path().join(".git");
+        std::fs::create_dir(&git_dir)?;
+
+        let mut buf = Vec::new();
+        let res = platform_ref.merge(
+            &mut buf,
+            default_labels(),
+            &gix_command::Context {
+                git_dir: Some(git_dir.clone()),
+                worktree_dir: Some(worktree.path().to_owned()),
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(res, (Pick::Buffer, Resolution::Complete));
+
+        let mut lines = buf.lines();
+        assert_eq!(Path::new(lines.next().expect("git dir").to_str()?), git_dir.as_path());
+        assert_eq!(
+            Path::new(lines.next().expect("worktree dir").to_str()?),
+            worktree.path()
+        );
+        for tmp_path in lines.by_ref().take(3) {
+            assert!(
+                Path::new(tmp_path.to_str()?).starts_with(worktree.path()),
+                "{:?}",
+                tmp_path.as_bstr()
+            );
+        }
+
+        let lines: Vec<_> = lines
+            .map(|line| line.to_str().expect("driver output is valid UTF-8"))
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "'b'",
+                "'ancestor label'",
+                "'current label'",
+                "'other label'",
+                "7",
+                "--base--",
+                "b",
+                "--theirs--",
+                "theirs"
+            ],
+            "a mergiraf-like driver can create sidecar files next to %A and gets tempfiles inside GIT_WORK_TREE"
         );
 
         Ok(())

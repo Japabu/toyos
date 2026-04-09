@@ -315,3 +315,39 @@ mod name {
         );
     }
 }
+
+mod branch_name {
+    mod valid {
+        use bstr::ByteSlice;
+
+        #[test]
+        fn refs_heads_main() {
+            assert!(gix_validate::reference::branch_name(b"refs/heads/main".as_bstr()).is_ok());
+        }
+
+        #[test]
+        fn refs_heads_head_different_case() {
+            assert!(gix_validate::reference::branch_name(b"refs/heads/HEAd".as_bstr()).is_ok());
+        }
+    }
+
+    mod invalid {
+        use bstr::ByteSlice;
+
+        #[test]
+        fn refs_heads_head_is_reserved() {
+            assert!(matches!(
+                gix_validate::reference::branch_name(b"refs/heads/HEAD".as_bstr()),
+                Err(gix_validate::reference::name::Error::Reserved { name }) if name == "refs/heads/HEAD"
+            ));
+        }
+
+        #[test]
+        fn invalid_refname_is_wrapped() {
+            assert!(matches!(
+                gix_validate::reference::branch_name(b"refs//heads/main".as_bstr()),
+                Err(gix_validate::reference::name::Error::RepeatedSlash)
+            ));
+        }
+    }
+}

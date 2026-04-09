@@ -1,5 +1,41 @@
 //! Parse [path specifications](https://git-scm.com/docs/gitglossary#Documentation/gitglossary.txt-aiddefpathspecapathspec) and
 //! see if a path matches.
+//!
+//! ## Examples
+//!
+//! ```
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! use std::path::Path;
+//!
+//! fn no_attrs(
+//!     _path: &bstr::BStr,
+//!     _case: gix_pathspec::attributes::glob::pattern::Case,
+//!     _is_dir: bool,
+//!     _out: &mut gix_pathspec::attributes::search::Outcome,
+//! ) -> bool {
+//!     false
+//! }
+//!
+//! let specs = ["src/**", ":!src/generated/**"]
+//!     .into_iter()
+//!     .map(|spec| gix_pathspec::parse(spec.as_bytes(), Default::default()).unwrap());
+//! let mut search = gix_pathspec::Search::from_specs(specs, None, Path::new(""))?;
+//!
+//! assert!(search.can_match_relative_path("src".into(), Some(true)));
+//!
+//! let matched = search
+//!     .pattern_matching_relative_path("src/lib.rs".into(), Some(false), &mut no_attrs)
+//!     .unwrap();
+//! assert_eq!(matched.pattern.path(), "src/**");
+//! assert!(!matched.pattern.is_excluded());
+//!
+//! let excluded = search
+//!     .pattern_matching_relative_path("src/generated/lib.rs".into(), Some(false), &mut no_attrs)
+//!     .unwrap();
+//! assert_eq!(excluded.pattern.to_bstring(), ":(exclude)src/generated/**");
+//! assert!(excluded.pattern.is_excluded());
+//! # Ok(()) }
+//! ```
 #![deny(missing_docs, rust_2018_idioms)]
 #![forbid(unsafe_code)]
 

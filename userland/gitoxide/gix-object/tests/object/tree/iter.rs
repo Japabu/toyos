@@ -76,6 +76,23 @@ fn everything() -> crate::Result {
     Ok(())
 }
 
+#[test]
+fn leading_space_in_tree_name() -> crate::Result {
+    let oid = hex_to_id("4d5fcadc293a348e88f777dc0920f11e7d71441c");
+    let mut buf = b"40000  leading space\0".to_vec();
+    buf.extend_from_slice(oid.as_bytes());
+
+    assert_eq!(
+        TreeRefIter::from_bytes(&buf).collect::<Result<Vec<_>, _>>()?,
+        vec![EntryRef {
+            mode: tree::EntryKind::Tree.into(),
+            filename: b" leading space".as_bstr(),
+            oid: oid.as_ref(),
+        }]
+    );
+    Ok(())
+}
+
 mod lookup_entry {
     use gix_object::tree::EntryKind;
     use utils::entry;

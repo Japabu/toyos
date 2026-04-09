@@ -112,7 +112,7 @@ impl Default for Attributes {
 }
 
 /// Permissions related to the usage of environment variables
-#[derive(Debug, Clone, Copy)]
+#[derive(Copy, Clone, Ord, PartialOrd, PartialEq, Eq, Debug, Hash)]
 pub struct Environment {
     /// Control whether resources pointed to by `XDG_CONFIG_HOME` can be used when looking up common configuration values.
     ///
@@ -170,6 +170,7 @@ impl Environment {
     }
 }
 
+/// Lifecycle
 impl Permissions {
     /// Secure permissions are similar to `all()`
     pub fn secure() -> Self {
@@ -197,6 +198,14 @@ impl Permissions {
             attributes: Attributes::isolated(),
             env: Environment::isolated(),
         }
+    }
+}
+
+/// Access
+impl Permissions {
+    /// Return true if these permissions only allow repository-local configuration and deny environment access.
+    pub fn is_isolated(&self) -> bool {
+        *self == Self::isolated()
     }
 }
 

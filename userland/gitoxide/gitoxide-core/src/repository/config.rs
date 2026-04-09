@@ -55,7 +55,7 @@ struct Filter {
 
 impl Filter {
     fn new(input: BString) -> Self {
-        match input.try_as_key() {
+        match (&input).try_as_key() {
             Some(key) => Filter {
                 name: key.section_name.into(),
                 subsection: key.subsection_name.map(ToOwned::to_owned),

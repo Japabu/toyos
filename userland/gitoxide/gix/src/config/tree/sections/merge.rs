@@ -97,6 +97,7 @@ mod validate {
         config::tree::{keys, Merge},
     };
 
+    #[derive(Clone, Copy)]
     pub struct ConflictStyle;
     impl keys::Validate for ConflictStyle {
         fn validate(&self, value: &BStr) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {

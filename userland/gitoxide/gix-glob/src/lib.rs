@@ -1,4 +1,26 @@
 //! Provide glob [`Patterns`][Pattern] for matching against paths or anything else.
+//!
+//! ## Examples
+//!
+//! ```
+//! use bstr::ByteSlice;
+//! use gix_glob::{pattern::Case, wildmatch, Pattern};
+//!
+//! let pattern = Pattern::from_bytes(b"src/**/*.rs").unwrap();
+//! assert!(pattern.matches_repo_relative_path(
+//!     b"src/lib.rs".as_bstr(),
+//!     Some(4),
+//!     Some(false),
+//!     Case::Sensitive,
+//!     wildmatch::Mode::NO_MATCH_SLASH_LITERAL,
+//! ));
+//!
+//! assert!(gix_glob::wildmatch(
+//!     b"*.rs".as_bstr(),
+//!     b"lib.rs".as_bstr(),
+//!     wildmatch::Mode::empty(),
+//! ));
+//! ```
 //! ## Feature Flags
 #![cfg_attr(
     all(doc, feature = "document-features"),

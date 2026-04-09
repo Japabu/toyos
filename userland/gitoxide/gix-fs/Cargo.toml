@@ -2,7 +2,7 @@ lints.workspace = true
 
 [package]
 name = "gix-fs"
-version = "0.19.1"
+version = "0.19.2"
 repository = "https://github.com/GitoxideLabs/gitoxide"
 license = "MIT OR Apache-2.0"
 description = "A crate providing file system specific utilities to `gitoxide`"
@@ -12,7 +12,7 @@ rust-version = "1.82"
 include = ["src/**/*", "LICENSE-*"]
 
 [lib]
-doctest = false
+doctest = true
 
 [features]
 ## Data structures implement `serde::Serialize` and `serde::Deserialize`.
@@ -20,8 +20,8 @@ serde = ["dep:serde"]
 
 [dependencies]
 bstr = "1.12.0"
-gix-path = { version = "^0.11.1", path = "../gix-path" }
-gix-features = { version = "^0.46.1", path = "../gix-features", features = ["fs-read-dir"] }
+gix-path = { version = "^0.11.2", path = "../gix-path" }
+gix-features = { version = "^0.46.2", path = "../gix-features", features = ["fs-read-dir"] }
 gix-utils = { version = "^0.3.1", path = "../gix-utils" }
 thiserror = "2.0.18"
 serde = { version = "1.0.114", optional = true, default-features = false, features = ["std", "derive"] }

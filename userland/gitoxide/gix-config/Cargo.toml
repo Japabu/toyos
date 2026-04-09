@@ -2,7 +2,7 @@ lints.workspace = true
 
 [package]
 name = "gix-config"
-version = "0.53.0"
+version = "0.54.0"
 repository = "https://github.com/GitoxideLabs/gitoxide"
 description = "A git-config file parser and editor from the gitoxide project"
 license = "MIT OR Apache-2.0"
@@ -21,14 +21,14 @@ sha1 = ["gix-ref/sha1"]
 serde = ["dep:serde", "bstr/serde", "gix-sec/serde", "gix-ref/serde", "gix-glob/serde", "gix-config-value/serde"]
 
 [dependencies]
-gix-features = { version = "^0.46.1", path = "../gix-features" }
+gix-features = { version = "^0.46.2", path = "../gix-features" }
 gix-config-value = { version = "^0.17.1", path = "../gix-config-value" }
-gix-path = { version = "^0.11.1", path = "../gix-path" }
-gix-sec = { version = "^0.13.1", path = "../gix-sec" }
-gix-ref = { version = "^0.60.0", path = "../gix-ref" }
+gix-path = { version = "^0.11.2", path = "../gix-path" }
+gix-sec = { version = "^0.13.2", path = "../gix-sec" }
+gix-ref = { version = "^0.61.0", path = "../gix-ref" }
 gix-glob = { version = "^0.24.0", path = "../gix-glob" }
 
-winnow = { version = "0.7.14", features = ["simd"] }
+winnow = { version = "1.0.0", features = ["simd"] }
 memchr = "2"
 thiserror = "2.0.18"
 unicode-bom = { version = "2.0.3" }

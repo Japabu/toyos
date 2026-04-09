@@ -4,6 +4,22 @@
 //! individually. Sometimes it may hide complexity under the assumption that the performance difference doesn't matter
 //! for all but the fewest tools out there, which would be using the underlying crates directly or file an issue.
 //!
+//! ## Example
+//!
+//! This is merely an introduction, for more see the respective [`Repository`] methods.
+//! ```
+//! # fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+//! # mod doctest { include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/doctest.rs")); }
+//! # let repo_dir = doctest::basic_repo_dir()?;
+//! # let repo = doctest::open_repo(repo_dir)?;
+//! let head = repo.head_commit()?;
+//!
+//! assert_eq!(repo.head_name()?.expect("born").shorten(), "main");
+//! assert_eq!(head.decode()?.message, "c2\n");
+//! assert_eq!(repo.head_tree_id()?, head.tree_id()?);
+//! # Ok(()) }
+//! ```
+//!
 //! ### The Trust Model
 //!
 //! It is very simple - based on the ownership of the repository compared to the user of the current process [Trust](sec::Trust)
@@ -223,6 +239,20 @@ pub mod merge;
 /// To achieve that, one has to [enable `git_binary` configuration](https://github.com/GitoxideLabs/gitoxide/blob/9723e1addf52cc336d59322de039ea0537cdca36/src/plumbing/main.rs#L86)
 /// in the open-options and use [`ThreadSafeRepository::discover_opts()`] instead. Alternatively, it might be well-known
 /// that the tool is going to run in a neatly configured environment without relying on bundled configuration.
+///
+/// # Examples
+///
+/// ```
+/// # fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+/// # mod doctest { include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/doctest.rs")); }
+/// # let repo_dir = doctest::basic_repo_dir()?;
+/// let repo = doctest::discover_repo(repo_dir.join("some/very/deeply/nested/subdir"))?;
+///
+/// assert_eq!(repo.kind(), gix::repository::Kind::Common);
+/// assert_eq!(repo.head_name()?.expect("born").shorten(), "main");
+/// assert!(repo.workdir_path("this").expect("non-bare").is_file());
+/// # Ok(()) }
+/// ```
 #[allow(clippy::result_large_err)]
 pub fn discover(directory: impl AsRef<std::path::Path>) -> Result<Repository, discover::Error> {
     ThreadSafeRepository::discover(directory).map(Into::into)
@@ -247,6 +277,20 @@ pub fn open_with_environment_overrides(directory: impl Into<std::path::PathBuf>)
 }
 
 /// See [`ThreadSafeRepository::init()`], but returns a [`Repository`] instead.
+///
+/// # Examples
+///
+/// ```
+/// # fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+/// # mod doctest { include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/doctest.rs")); }
+/// # let dir = doctest::tempdir()?;
+/// let repo = gix::init(dir.path())?;
+///
+/// assert!(repo.git_dir().is_dir());
+/// assert!(repo.head_name()?.is_some());
+/// assert!(repo.head()?.is_unborn());
+/// # Ok(()) }
+/// ```
 #[allow(clippy::result_large_err)]
 pub fn init(directory: impl AsRef<std::path::Path>) -> Result<Repository, init::Error> {
     ThreadSafeRepository::init(directory, create::Kind::WithWorktree, create::Options::default()).map(Into::into)
@@ -307,6 +351,19 @@ fn open_opts_with_git_binary_config() -> open::Options {
 }
 
 /// See [`ThreadSafeRepository::open()`], but returns a [`Repository`] instead.
+///
+/// # Examples
+///
+/// ```
+/// # fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+/// # mod doctest { include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/doctest.rs")); }
+/// # let repo_dir = doctest::basic_repo_dir()?;
+/// let repo = doctest::open_repo(repo_dir)?;
+///
+/// assert_eq!(repo.head_name()?.expect("born").shorten(), "main");
+/// assert_eq!(repo.head_commit()?.decode()?.message, "c2\n");
+/// # Ok(()) }
+/// ```
 #[allow(clippy::result_large_err)]
 #[doc(alias = "git2")]
 pub fn open(directory: impl Into<std::path::PathBuf>) -> Result<Repository, open::Error> {

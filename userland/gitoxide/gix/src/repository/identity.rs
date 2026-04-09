@@ -50,10 +50,10 @@ impl crate::Repository {
         if self.committer().is_none() {
             let mut config = gix_config::File::new(gix_config::file::Metadata::api());
             config
-                .set_raw_value(&gitoxide::Committer::NAME_FALLBACK, "no name configured")
+                .set_raw_value(gitoxide::Committer::NAME_FALLBACK, "no name configured")
                 .expect("works - statically known");
             config
-                .set_raw_value(&gitoxide::Committer::EMAIL_FALLBACK, "noEmailAvailable@example.com")
+                .set_raw_value(gitoxide::Committer::EMAIL_FALLBACK, "noEmailAvailable@example.com")
                 .expect("works - statically known");
             let mut repo_config = self.config_snapshot_mut();
             repo_config.append(config);

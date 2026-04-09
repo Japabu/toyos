@@ -126,7 +126,11 @@ impl<'a> RefSpecRef<'a> {
     /// Derive the prefix from the [`source`][Self::source()] side of this spec if this is a fetch spec,
     /// or the [`destination`][Self::destination()] side if it is a push spec, if it is possible to do so without ambiguity.
     ///
-    /// This means it starts with `refs/`. Note that it won't contain more than two components, like `refs/heads/`
+    /// Exact refs starting with `refs/` are returned unchanged, like `refs/heads/main`
+    /// or `refs/namespaces/foo/refs/heads/main`. Simple Git-style glob refspecs return
+    /// the portion up to their single `*`, like `refs/heads/` or `refs/namespaces/foo/refs/heads/`.
+    ///
+    /// More complex wildcard patterns don't have a Git-compatible ref-prefix and thus return `None`.
     pub fn prefix(&self) -> Option<&BStr> {
         if self.mode == Mode::Negative {
             return None;
@@ -138,10 +142,19 @@ impl<'a> RefSpecRef<'a> {
         if source == "HEAD" {
             return source.into();
         }
-        let suffix = source.strip_prefix(b"refs/")?;
-        let slash_pos = suffix.find_byte(b'/')?;
-        let prefix = source[..="refs/".len() + slash_pos].as_bstr();
-        (!prefix.contains(&b'*')).then_some(prefix)
+
+        let sans_refs_prefix = source.strip_prefix(b"refs/")?;
+        if let Some(star_pos) = sans_refs_prefix.find_byte(b'*') {
+            if star_pos == 0
+                || sans_refs_prefix[star_pos + 1..].contains(&b'*')
+                || sans_refs_prefix.find_byteset(b"?[]\\").is_some()
+            {
+                return None;
+            }
+            let prefix = &source[.."refs/".len() + star_pos];
+            return (!prefix.is_empty()).then_some(prefix.as_bstr());
+        }
+        Some(source)
     }
 
     /// As opposed to [`prefix()`][Self::prefix], if the latter is `None` it will expand to all possible prefixes and place them in `out`.

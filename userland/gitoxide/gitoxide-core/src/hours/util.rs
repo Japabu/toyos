@@ -154,12 +154,6 @@ impl FileStats {
         self
     }
 
-    pub fn added(&self, other: &FileStats) -> Self {
-        let mut a = *self;
-        a.add(other);
-        a
-    }
-
     pub fn sum(&self) -> f32 {
         (self.added + self.removed + self.modified) as f32
     }
@@ -170,12 +164,6 @@ impl LineStats {
         self.added += other.added;
         self.removed += other.removed;
         self
-    }
-
-    pub fn added(&self, other: &LineStats) -> Self {
-        let mut a = *self;
-        a.add(other);
-        a
     }
 
     pub fn sum(&self) -> f32 {

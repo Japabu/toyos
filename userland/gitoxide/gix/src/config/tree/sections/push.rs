@@ -50,6 +50,7 @@ mod default {
 }
 
 mod validate {
+    #[derive(Clone, Copy)]
     pub struct Default;
     use std::{borrow::Cow, error::Error};
 

@@ -1,5 +1,26 @@
 //! Parse `.gitignore` files and provide utilities to match against them.
 //!
+//! ## Examples
+//!
+//! ```
+//! use gix_glob::pattern::Case;
+//!
+//! let search = gix_ignore::Search::from_overrides(["target/", "!target/keep.me"], Default::default());
+//!
+//! let ignored = search
+//!     .pattern_matching_relative_path("target".into(), Some(true), Case::Sensitive)
+//!     .unwrap();
+//! assert_eq!(ignored.sequence_number, 1);
+//! assert_eq!(ignored.kind, gix_ignore::Kind::Expendable);
+//! assert!(!ignored.pattern.is_negative());
+//!
+//! let kept = search
+//!     .pattern_matching_relative_path("target/keep.me".into(), Some(false), Case::Sensitive)
+//!     .unwrap();
+//! assert_eq!(kept.sequence_number, 2);
+//! assert!(kept.pattern.is_negative());
+//! ```
+//!
 //! ## Feature Flags
 #![cfg_attr(
     all(doc, feature = "document-features"),
