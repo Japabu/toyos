@@ -1088,7 +1088,6 @@ dependencies = [
 [[package]]
 name = "getrandom"
 version = "0.2.17"
-source = "git+https://github.com/Japabu/getrandom?branch=toyos-v0.2#c473bb1022335e22fb5e997f69d5c00c8ac0b2c5"
 dependencies = [
  "cfg-if",
  "js-sys",
@@ -1101,7 +1100,6 @@ dependencies = [
 [[package]]
 name = "getrandom"
 version = "0.3.4"
-source = "git+https://github.com/Japabu/getrandom?branch=toyos-v0.3#bb423bc0173b1548fff892e4fdb9843bebe1083f"
 dependencies = [
  "cfg-if",
  "libc",
