@@ -2,7 +2,7 @@ use std::io::{self, Read, Write};
 use toyos::system::set_keyboard_layout;
 
 const CONFIG_PATH: &str = "/home/root/.config/keyboard_layout";
-const LAYOUTS: &[&str] = &["us", "swiss-german-mac"];
+const LAYOUTS: &[&str] = &["us", "de", "swiss-german-mac"];
 
 pub fn main(args: Vec<String>) {
     match args.first().map(|s| s.as_str()) {

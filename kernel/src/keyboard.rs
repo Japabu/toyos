@@ -188,7 +188,7 @@ pub fn layout_lookup(usage: u8, shift: bool, alt: bool) -> Option<&'static [u8]>
 
 static ACTIVE_LAYOUT: Lock<usize> = Lock::new(0);
 
-const LAYOUTS: &[&Layout] = &[&US_QWERTY, &SWISS_GERMAN_MAC];
+const LAYOUTS: &[&Layout] = &[&US_QWERTY, &GERMAN, &SWISS_GERMAN_MAC];
 
 fn active_layout() -> &'static Layout {
     LAYOUTS[*ACTIVE_LAYOUT.lock()]
@@ -292,8 +292,11 @@ const US_QWERTY: Layout = Layout {
 };
 
 const UUML_L: &[u8] = "ü".as_bytes();
+const UUML_U: &[u8] = "Ü".as_bytes();
 const OUML_L: &[u8] = "ö".as_bytes();
+const OUML_U: &[u8] = "Ö".as_bytes();
 const AUML_L: &[u8] = "ä".as_bytes();
+const AUML_U: &[u8] = "Ä".as_bytes();
 const EACU_L: &[u8] = "é".as_bytes();
 const EGRV_L: &[u8] = "è".as_bytes();
 const AGRV_L: &[u8] = "à".as_bytes();
@@ -302,6 +305,70 @@ const SECT:   &[u8] = "§".as_bytes();
 const DEGREE: &[u8] = "°".as_bytes();
 const POUND:  &[u8] = "£".as_bytes();
 const DIAER:  &[u8] = "¨".as_bytes();
+const SZLIG:  &[u8] = "ß".as_bytes();
+const EURO:   &[u8] = "€".as_bytes();
+const MICRO:  &[u8] = "µ".as_bytes();
+const ACUTE:  &[u8] = "´".as_bytes();
+
+const GERMAN: Layout = Layout {
+    name: "de",
+    iso_key: key_opt(b"<", b">", b"|"),          // 0x64 (ISO key between left Shift and Y)
+    keys: [
+        key(b"a", b"A"),                            // 0x04
+        key(b"b", b"B"),                            // 0x05
+        key(b"c", b"C"),                            // 0x06
+        key(b"d", b"D"),                            // 0x07
+        key_opt(b"e", b"E", EURO),                  // 0x08
+        key(b"f", b"F"),                            // 0x09
+        key(b"g", b"G"),                            // 0x0A
+        key(b"h", b"H"),                            // 0x0B
+        key(b"i", b"I"),                            // 0x0C
+        key(b"j", b"J"),                            // 0x0D
+        key(b"k", b"K"),                            // 0x0E
+        key(b"l", b"L"),                            // 0x0F
+        key_opt(b"m", b"M", MICRO),                 // 0x10
+        key(b"n", b"N"),                            // 0x11
+        key(b"o", b"O"),                            // 0x12
+        key(b"p", b"P"),                            // 0x13
+        key_opt(b"q", b"Q", b"@"),                  // 0x14
+        key(b"r", b"R"),                            // 0x15
+        key(b"s", b"S"),                            // 0x16
+        key(b"t", b"T"),                            // 0x17
+        key(b"u", b"U"),                            // 0x18
+        key(b"v", b"V"),                            // 0x19
+        key(b"w", b"W"),                            // 0x1A
+        key(b"x", b"X"),                            // 0x1B
+        key(b"z", b"Z"),                            // 0x1C (QWERTZ: Y key types Z)
+        key(b"y", b"Y"),                            // 0x1D (QWERTZ: Z key types Y)
+        key(b"1", b"!"),                            // 0x1E
+        key(b"2", b"\""),                           // 0x1F
+        key_opt(b"3", SECT, b"#"),                  // 0x20 (note: shifted on german has no #)
+        key(b"4", b"$"),                            // 0x21
+        key(b"5", b"%"),                            // 0x22
+        key(b"6", b"&"),                            // 0x23
+        key_opt(b"7", b"/", b"{"),                  // 0x24
+        key_opt(b"8", b"(", b"["),                  // 0x25
+        key_opt(b"9", b")", b"]"),                  // 0x26
+        key_opt(b"0", b"=", b"}"),                  // 0x27
+        key(b"\r", b"\r"),                          // 0x28
+        key(&[0x1B], &[0x1B]),                      // 0x29
+        key(&[0x08], &[0x08]),                      // 0x2A
+        key(b"\t", b"\t"),                          // 0x2B
+        key(b" ", b" "),                            // 0x2C
+        key_opt(SZLIG, b"?", b"\\"),                // 0x2D
+        key(ACUTE, b"`"),                           // 0x2E
+        key(UUML_L, UUML_U),                       // 0x2F
+        key_opt(b"+", b"*", b"~"),                  // 0x30
+        key(b"#", b"'"),                            // 0x31
+        K,                                          // 0x32
+        key(OUML_L, OUML_U),                        // 0x33
+        key(AUML_L, AUML_U),                        // 0x34
+        key(b"^", DEGREE),                          // 0x35
+        key(b",", b";"),                            // 0x36
+        key(b".", b":"),                            // 0x37
+        key(b"-", b"_"),                            // 0x38
+    ],
+};
 
 const SWISS_GERMAN_MAC: Layout = Layout {
     name: "swiss-german-mac",
