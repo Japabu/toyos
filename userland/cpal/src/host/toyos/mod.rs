@@ -13,7 +13,6 @@ use crate::{
 
 const CHANNELS: u16 = 2;
 const SAMPLE_RATE: SampleRate = 44100;
-const BUFFER_FRAMES: u32 = 1024;
 
 pub struct Host;
 
@@ -97,7 +96,7 @@ impl DeviceTrait for Device {
             SAMPLE_RATE,
             SAMPLE_RATE,
             SupportedBufferSize::Range {
-                min: 256,
+                min: 128,
                 max: 4096,
             },
             SampleFormat::I16,
@@ -114,7 +113,7 @@ impl DeviceTrait for Device {
             CHANNELS,
             SAMPLE_RATE,
             SupportedBufferSize::Range {
-                min: 256,
+                min: 128,
                 max: 4096,
             },
             SampleFormat::I16,
@@ -150,13 +149,6 @@ impl DeviceTrait for Device {
     {
         let channels = config.channels as usize;
         let sample_rate = config.sample_rate;
-        let buffer_frames = match config.buffer_size {
-            crate::BufferSize::Fixed(n) => n,
-            crate::BufferSize::Default => BUFFER_FRAMES,
-        };
-        let sample_size = sample_format.sample_size();
-        let buffer_samples = buffer_frames as usize * channels;
-        let buffer_bytes = buffer_samples * sample_size;
 
         let audio = toyos::audio::AudioStream::open(
             sample_rate as u32,
@@ -168,6 +160,9 @@ impl DeviceTrait for Device {
             },
         })?;
 
+        let buffer_frames = audio.period_frames();
+        let buffer_samples = buffer_frames as usize * channels;
+
         let playing = Arc::new(AtomicBool::new(false));
         let alive = Arc::new(AtomicBool::new(true));
         let playing2 = playing.clone();
@@ -176,8 +171,6 @@ impl DeviceTrait for Device {
         let thread = std::thread::Builder::new()
             .name("cpal-toyos-audio".to_string())
             .spawn(move || {
-                let mut buffer = vec![0u8; buffer_bytes];
-
                 let now = StreamInstant::new(0, 0);
                 let info = OutputCallbackInfo::new(OutputStreamTimestamp {
                     callback: now,
@@ -193,16 +186,16 @@ impl DeviceTrait for Device {
                         continue;
                     }
 
-                    crate::host::fill_with_equilibrium(&mut buffer, sample_format);
-                    let mut data = unsafe {
-                        Data::from_parts(buffer.as_mut_ptr() as *mut (), buffer_samples, sample_format)
-                    };
-                    data_callback(&mut data, &info);
-
-                    audio.write_blocking(&buffer);
+                    audio.wait_and_fill(|buf| {
+                        crate::host::fill_with_equilibrium(buf, sample_format);
+                        let mut data = unsafe {
+                            Data::from_parts(buf.as_mut_ptr() as *mut (), buffer_samples, sample_format)
+                        };
+                        data_callback(&mut data, &info);
+                    });
                 }
 
-                audio.ring().close();
+                audio.close();
             })
             .map_err(|e| BuildStreamError::BackendSpecific {
                 err: crate::BackendSpecificError {

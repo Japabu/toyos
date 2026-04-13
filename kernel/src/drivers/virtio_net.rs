@@ -227,7 +227,7 @@ pub fn init(ecam: &crate::mm::Mmio) {
     let mut rxq = Virtqueue::from_regions(&rxq_regions, RX_QUEUE_SIZE);
 
     // TX queue: 16 entries, fits in one page
-    let mut txq = Virtqueue::new(dma.subslice(OFF_TXQ, 0x1000));
+    let mut txq = Virtqueue::new(dma.subslice(OFF_TXQ, 0x1000), 16);
 
     device.setup_queue(0, &mut rxq);
     device.setup_queue(1, &mut txq);

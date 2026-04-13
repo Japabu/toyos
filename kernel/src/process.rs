@@ -688,6 +688,8 @@ pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64, stack_base: u64) -> Op
         deadline: 0,
         blocked_since: 0,
         enqueued_at: 0,
+        is_rt: false,
+        rt_inherited: false,
         accounting: scheduler::TaskAccounting::default(),
     };
     scheduler::enqueue_new(ctx);

@@ -183,6 +183,8 @@ pub struct TaskCtx {
     pub deadline: u64, // 0 = no deadline
     pub blocked_since: u64, // nanos_since_boot when entered blocked pool (0 = not blocked)
     pub enqueued_at: u64, // nanos_since_boot when inserted into ready queue (0 = not queued)
+    pub is_rt: bool, // RT band (FIFO scheduling, preempts normal)
+    pub rt_inherited: bool, // RT was transiently inherited via priority inheritance
     pub accounting: TaskAccounting,
 }
 
@@ -302,6 +304,7 @@ struct CpuRunQueue {
     current: Option<TaskCtx>,
     outgoing: Option<(TaskCtx, SwitchReason)>,
     save_rsp: u64,
+    rt_ready: Vec<TaskCtx>,
     ready: BTreeMap<(u64, TaskId), TaskCtx>,
 }
 
@@ -311,6 +314,7 @@ impl CpuRunQueue {
             current: None,
             outgoing: None,
             save_rsp: 0,
+            rt_ready: Vec::new(),
             ready: BTreeMap::new(),
         }
     }
@@ -323,6 +327,18 @@ pub struct CpuQueueGuard<'a>(crate::sync::LockGuard<'a, CpuRunQueue>);
 
 impl<'a> CpuQueueGuard<'a> {
     pub fn pick_next(&mut self) -> Option<(u64, TaskCtx)> {
+        // RT band first (FIFO)
+        while !self.0.rt_ready.is_empty() {
+            let mut ctx = self.0.rt_ready.remove(0);
+            if !is_poisoned(ctx.id) {
+                if ctx.enqueued_at > 0 {
+                    ctx.accounting.runqueue_wait_ns += crate::clock::nanos_since_boot() - ctx.enqueued_at;
+                    ctx.enqueued_at = 0;
+                }
+                return Some((0, ctx));
+            }
+        }
+        // Normal band (CFS — lowest vruntime first)
         while let Some(((vrt, _), mut ctx)) = self.0.ready.pop_first() {
             if !is_poisoned(ctx.id) {
                 if ctx.enqueued_at > 0 {
@@ -331,27 +347,38 @@ impl<'a> CpuQueueGuard<'a> {
                 }
                 return Some((vrt, ctx));
             }
-            // Poisoned thread — drop its SchedContext, it will never run again.
         }
         None
     }
 
     pub fn insert(&mut self, vrt: u64, mut ctx: TaskCtx) {
         ctx.enqueued_at = crate::clock::nanos_since_boot();
-        self.0.ready.insert((vrt, ctx.id), ctx);
+        if ctx.is_rt {
+            self.0.rt_ready.push(ctx);
+        } else {
+            self.0.ready.insert((vrt, ctx.id), ctx);
+        }
     }
 
     pub fn take_current(&mut self) -> Option<TaskCtx> { self.0.current.take() }
     pub fn set_current(&mut self, ctx: TaskCtx) { self.0.current = Some(ctx); }
     pub fn current(&self) -> Option<&TaskCtx> { self.0.current.as_ref() }
+    pub fn current_mut(&mut self) -> Option<&mut TaskCtx> { self.0.current.as_mut() }
     fn take_outgoing(&mut self) -> Option<(TaskCtx, SwitchReason)> { self.0.outgoing.take() }
     fn set_outgoing(&mut self, ctx: TaskCtx, reason: SwitchReason) { self.0.outgoing = Some((ctx, reason)); }
     pub fn save_rsp_ptr(&mut self) -> *mut u64 { &mut self.0.save_rsp as *mut u64 }
     pub fn save_rsp(&self) -> u64 { self.0.save_rsp }
-    pub fn ready_len(&self) -> usize { self.0.ready.len() }
-    pub fn is_ready(&self, id: TaskId) -> bool { self.0.ready.keys().any(|(_, k)| *k == id) }
+    pub fn ready_len(&self) -> usize { self.0.rt_ready.len() + self.0.ready.len() }
+
+    pub fn is_ready(&self, id: TaskId) -> bool {
+        self.0.rt_ready.iter().any(|c| c.id == id) ||
+        self.0.ready.keys().any(|(_, k)| *k == id)
+    }
 
     pub fn remove_ready(&mut self, id: TaskId) -> Option<TaskCtx> {
+        if let Some(pos) = self.0.rt_ready.iter().position(|c| c.id == id) {
+            return Some(self.0.rt_ready.remove(pos));
+        }
         let key = self.0.ready.keys().find(|(_, k)| *k == id).copied();
         key.and_then(|k| self.0.ready.remove(&k))
     }
@@ -491,13 +518,18 @@ pub fn log_health() {
     let tid = percpu::current_tid();
     crate::log!("sched: ready={} blocked={} current={:?}", ready, blocked, tid);
 
-    // If everything is stuck, dump what threads are blocked on
-    if ready == 0 && blocked > 0 {
+    // Dump blocked threads at most every 10s (serial output is slow and can
+    // starve audio DMA completions on single-core systems)
+    use core::sync::atomic::AtomicU64;
+    static NEXT_BLOCKED_DUMP: AtomicU64 = AtomicU64::new(0);
+    const BLOCKED_DUMP_INTERVAL_NS: u64 = 10_000_000_000;
+    let now_bl = crate::clock::nanos_since_boot();
+    if ready == 0 && blocked > 0 && now_bl >= NEXT_BLOCKED_DUMP.load(Ordering::Relaxed) {
+        NEXT_BLOCKED_DUMP.store(now_bl + BLOCKED_DUMP_INTERVAL_NS, Ordering::Relaxed);
         dump_blocked();
     }
 
     // PMM stats dump (any CPU, time-gated to every 10s)
-    use core::sync::atomic::AtomicU64;
     static NEXT_PMM_DUMP: AtomicU64 = AtomicU64::new(0);
     const PMM_DUMP_INTERVAL_NS: u64 = 10_000_000_000;
     let now = crate::clock::nanos_since_boot();
@@ -683,9 +715,31 @@ pub fn wake_by_event(event: EventSource) {
     }
 }
 
-/// Wake pipe readers: threads blocked on PipeReadable(pipe_id) + poll threads interested in this pipe.
+/// Wake pipe readers with priority inheritance: if the caller is RT,
+/// boost woken threads to RT (transient — cleared when they next block).
 pub fn wake_pipe_readers(pipe_id: PipeId) {
-    wake_by_event(EventSource::PipeReadable(pipe_id));
+    let caller_is_rt = {
+        let cpu = percpu::cpu_id() as usize;
+        SCHEDULER.lock_cpu(cpu).current().map_or(false, |c| c.is_rt)
+    };
+
+    let batch = {
+        let mut pool = SCHEDULER.blocked.lock_unwrap();
+        let mut batch = WokenBatch::new();
+        pool.take_by_event_into(&EventSource::PipeReadable(pipe_id), &mut batch);
+        if caller_is_rt {
+            for ctx in batch.threads.iter_mut() {
+                if !ctx.is_rt {
+                    ctx.is_rt = true;
+                    ctx.rt_inherited = true;
+                }
+            }
+        }
+        batch
+    };
+    if !batch.is_empty() {
+        SCHEDULER.enqueue_batch(batch);
+    }
 }
 
 /// Wake pipe writers: threads blocked on PipeWritable(pipe_id) + poll threads interested in this pipe.
@@ -711,6 +765,16 @@ pub fn wake_task(id: TaskId) {
     drop(q);
     if cpu != percpu::cpu_id() {
         crate::arch::apic::kick_cpus();
+    }
+}
+
+/// Set RT priority on the currently running thread.
+pub fn set_current_rt(enable: bool) {
+    let cpu = percpu::cpu_id() as usize;
+    let mut queue = SCHEDULER.lock_cpu(cpu);
+    if let Some(current) = queue.current_mut() {
+        current.is_rt = enable;
+        current.rt_inherited = false;
     }
 }
 
@@ -845,6 +909,7 @@ fn drain_events() -> u64 {
 
     // Virtio-sound MSI-X interrupt — DMA buffer completed.
     if crate::arch::idt::virtio_sound::irq_pending() {
+        crate::audio::set_completion_timestamp(crate::clock::nanos_since_boot());
         PERCPU_EVENTS[percpu::cpu_id() as usize].push(EventSource::Audio);
         let watchers = crate::audio::io_uring_watchers();
         if !watchers.is_empty() {
@@ -885,7 +950,7 @@ fn drain_events() -> u64 {
 }
 
 fn do_schedule(reason: SwitchReason) {
-    drain_events();
+    let next_deadline = drain_events();
 
     let cpu = percpu::cpu_id() as usize;
     let now = crate::clock::nanos_since_boot();
@@ -904,7 +969,12 @@ fn do_schedule(reason: SwitchReason) {
     if let Some((vrt, new)) = queue.pick_next() {
         SCHEDULER.min_vruntime.store(vrt, Ordering::Relaxed);
         CONTEXT_SWITCHES.fetch_add(1, Ordering::Relaxed);
-        crate::arch::apic::arm_one_shot(PREEMPTION_QUANTUM_NS);
+        let quantum = if next_deadline > 0 && next_deadline > now {
+            PREEMPTION_QUANTUM_NS.min(next_deadline - now)
+        } else {
+            PREEMPTION_QUANTUM_NS
+        };
+        crate::arch::apic::arm_one_shot(quantum);
         let new_cr3 = new.cr3();
         let new_fs_base = new.fs_base;
         let new_ks_top = new.kernel_stack_top();
@@ -956,10 +1026,23 @@ fn handle_outgoing() {
                 queue.insert(vrt, old);
             }
             SwitchReason::Block { event, deadline } => {
+                if old.rt_inherited {
+                    old.is_rt = false;
+                    old.rt_inherited = false;
+                }
                 old.blocked_on = event;
                 old.deadline = deadline;
                 drop(queue);
                 SCHEDULER.blocked.lock_unwrap().insert(old);
+                // drain_events (called earlier in do_schedule) may have posted
+                // CQEs via complete_pending_for_event before this thread entered
+                // the blocked pool. The IoUring wake event was consumed with no
+                // match. Re-check and re-push so the next drain_events wakes it.
+                if let Some(EventSource::IoUring(ring_id)) = event {
+                    if crate::io_uring::has_completions(ring_id) {
+                        push_event(EventSource::IoUring(ring_id));
+                    }
+                }
                 return;
             }
             SwitchReason::Exit => {
@@ -1006,7 +1089,17 @@ fn cpu_idle_loop() -> ! {
             let mut queue = SCHEDULER.lock_cpu(cpu);
             if let Some((vrt, new)) = queue.pick_next() {
                 SCHEDULER.min_vruntime.store(vrt, Ordering::Relaxed);
-                crate::arch::apic::arm_one_shot(PREEMPTION_QUANTUM_NS);
+                let idle_quantum = if next_deadline > 0 {
+                    let now_dl = crate::clock::nanos_since_boot();
+                    if next_deadline > now_dl {
+                        PREEMPTION_QUANTUM_NS.min(next_deadline - now_dl)
+                    } else {
+                        PREEMPTION_QUANTUM_NS
+                    }
+                } else {
+                    PREEMPTION_QUANTUM_NS
+                };
+                crate::arch::apic::arm_one_shot(idle_quantum);
                 let new_cr3 = new.cr3();
                 let new_fs_base = new.fs_base;
                 let new_ks_top = new.kernel_stack_top();

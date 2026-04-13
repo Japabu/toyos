@@ -4,23 +4,14 @@ use core::sync::atomic::AtomicBool;
 /// Before this, reading gs:[8] or gs:[136] would fault on garbage GS base.
 pub static PERCPU_READY: AtomicBool = AtomicBool::new(false);
 
-pub struct LogWriter;
-
-impl core::fmt::Write for LogWriter {
-    fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        crate::drivers::serial::write(s.as_bytes());
-        Ok(())
-    }
-}
-
 /// Logs a formatted message to serial with timestamp, CPU, and TID context.
 ///
 /// Before percpu init: `[kernel 0.000 boot] message`
 /// Idle (no thread):   `[kernel 1.042 cpu0] message`
 /// With thread:        `[kernel 1.042 cpu0 tid=3] message`
 ///
-/// Does not allocate — all formatting is stack-based via `format_args!`,
-/// and output goes directly to the serial port.
+/// Acquires the serial lock once for the whole line so the prefix and body
+/// can't interleave with output from another CPU.
 #[macro_export]
 macro_rules! log {
     ($($arg:tt)*) => {{
@@ -28,6 +19,7 @@ macro_rules! log {
         let ts = $crate::clock::nanos_since_boot();
         let secs = ts / 1_000_000_000;
         let millis = (ts % 1_000_000_000) / 1_000_000;
+        let mut __w = $crate::drivers::serial::SerialWriter::lock();
         if $crate::log::PERCPU_READY.load(core::sync::atomic::Ordering::Relaxed) {
             let cpu: u32;
             let tid: u32;
@@ -36,13 +28,13 @@ macro_rules! log {
                 core::arch::asm!("mov {:e}, gs:[136]", out(reg) tid, options(nomem, nostack, preserves_flags));
             }
             if tid == u32::MAX {
-                let _ = write!($crate::log::LogWriter, "[kernel {}.{:03} cpu{}] ", secs, millis, cpu);
+                let _ = write!(__w, "[kernel {}.{:03} cpu{}] ", secs, millis, cpu);
             } else {
-                let _ = write!($crate::log::LogWriter, "[kernel {}.{:03} cpu{} tid={}] ", secs, millis, cpu, tid);
+                let _ = write!(__w, "[kernel {}.{:03} cpu{} tid={}] ", secs, millis, cpu, tid);
             }
         } else {
-            let _ = write!($crate::log::LogWriter, "[kernel {}.{:03} boot] ", secs, millis);
+            let _ = write!(__w, "[kernel {}.{:03} boot] ", secs, millis);
         }
-        let _ = writeln!($crate::log::LogWriter, $($arg)*);
+        let _ = writeln!(__w, $($arg)*);
     }};
 }

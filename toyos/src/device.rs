@@ -107,14 +107,26 @@ impl AudioDev {
         read_info(&self.0)
     }
 
-    /// Read completed DMA buffer bitmask. Blocks until at least one buffer completes.
-    pub fn read_completions(&self) -> Result<u32, SyscallError> {
-        let mut mask = 0u32;
-        let buf = unsafe {
-            core::slice::from_raw_parts_mut(&mut mask as *mut u32 as *mut u8, 4)
+    pub fn read_completions(&self) -> Result<(u32, u64), SyscallError> {
+        let mut data = [0u8; 12];
+        let n = syscall::read_nonblock(self.0.0.0, &mut data)? as usize;
+        let mask = u32::from_le_bytes(data[0..4].try_into().unwrap());
+        let ts = if n >= 12 {
+            u64::from_le_bytes(data[4..12].try_into().unwrap())
+        } else {
+            0
         };
-        syscall::read(self.0.0.0, buf)?;
-        Ok(mask)
+        Ok((mask, ts))
+    }
+
+    pub fn start(&self) -> Result<(), SyscallError> {
+        syscall::write(self.0.0.0, &[1])?;
+        Ok(())
+    }
+
+    pub fn stop(&self) -> Result<(), SyscallError> {
+        syscall::write(self.0.0.0, &[0])?;
+        Ok(())
     }
 }
 

@@ -20,6 +20,7 @@ const VIRTIO_SND_R_PCM_PREPARE: u32 = 0x0102;
 #[allow(dead_code)]
 const VIRTIO_SND_R_PCM_RELEASE: u32 = 0x0103;
 const VIRTIO_SND_R_PCM_START: u32 = 0x0104;
+const VIRTIO_SND_R_PCM_STOP: u32 = 0x0105;
 
 // Status codes
 const VIRTIO_SND_S_OK: u32 = 0x8000;
@@ -37,8 +38,8 @@ const OFF_EVENTQ: usize    = 0x1000;
 const OFF_TXQ: usize       = 0x2000;
 const OFF_CTRL_BUFS: usize = 0x3000;
 const OFF_TX_META: usize   = 0x4000;
-const OFF_TX_DATA: usize   = 0x5000; // 5 × 4KB
-const DMA_SIZE: usize      = 0xA000;
+const OFF_TX_DATA: usize   = 0x5000; // 8 × 512 bytes = 4096, fits in 1 page
+const DMA_SIZE: usize      = 0x6000;
 
 const REQ_OFFSET: usize = 0x000;
 const RESP_OFFSET: usize = 0x800;
@@ -115,9 +116,7 @@ struct VirtioSndPcmStatus {
 
 // ---- Sound Controller ----
 
-/// Maximum number of TX buffers in flight at once.
-/// Each uses 3 descriptors from the 16-slot virtqueue, so max 5 in flight.
-const TX_INFLIGHT_MAX: usize = 5;
+const TX_INFLIGHT_MAX: usize = 8;
 
 /// Stride between xfer headers within PAGE_TX_META (aligned to 16 bytes)
 const XFER_STRIDE: u64 = 16;
@@ -146,8 +145,8 @@ pub struct SoundController {
     /// Bitmask of buffers currently in-flight (submitted but not yet completed)
     inflight_mask: u32,
     /// Maps first descriptor ID → buffer index (needed because desc IDs wrap around
-    /// the 16-entry ring, so desc_id/3 doesn't map correctly after the first cycle)
-    desc_to_buf: [u8; 16],
+    /// the 32-entry ring, so desc_id/3 doesn't map correctly after the first cycle)
+    desc_to_buf: [u8; 32],
     started: bool,
     control_slot: Option<DescSlot>,
     /// Available TX descriptor slots (returned by poll_used, consumed by submit)
@@ -198,8 +197,8 @@ impl SoundController {
         let cmd = VirtioSndPcmSetParams {
             hdr: VirtioSndHdr { code: VIRTIO_SND_R_PCM_SET_PARAMS },
             stream_id: 0,
-            buffer_bytes: 4096 * 4,
-            period_bytes: 4096,
+            buffer_bytes: 512 * TX_INFLIGHT_MAX as u32,
+            period_bytes: 512,
             features: 0,
             channels,
             format: VIRTIO_SND_PCM_FMT_S16,
@@ -221,6 +220,14 @@ impl SoundController {
         assert!(status == VIRTIO_SND_S_OK, "virtio-sound: START failed: {:#x}", status);
         self.started = true;
         log!("virtio-sound: stream 0 started");
+    }
+
+    pub fn stop(&mut self) {
+        if !self.started { return; }
+        let status = self.simple_ctrl(VIRTIO_SND_R_PCM_STOP, 0);
+        assert!(status == VIRTIO_SND_S_OK, "virtio-sound: STOP failed: {:#x}", status);
+        self.started = false;
+        log!("virtio-sound: stream 0 stopped");
     }
 
     /// Drain completed TX buffers. Returns bitmask of newly completed buffer indices.
@@ -356,9 +363,9 @@ pub fn init(ecam: &crate::mm::Mmio) -> Option<(SoundController, AudioInfo)> {
 
     assert!(streams > 0, "virtio-sound: no PCM streams available");
 
-    let mut controlq = Virtqueue::new(dma.subslice(OFF_CONTROLQ, 0x1000));
-    let mut eventq = Virtqueue::new(dma.subslice(OFF_EVENTQ, 0x1000));
-    let mut txq = Virtqueue::new(dma.subslice(OFF_TXQ, 0x1000));
+    let mut controlq = Virtqueue::new(dma.subslice(OFF_CONTROLQ, 0x1000), 16);
+    let mut eventq = Virtqueue::new(dma.subslice(OFF_EVENTQ, 0x1000), 16);
+    let mut txq = Virtqueue::new(dma.subslice(OFF_TXQ, 0x1000), 32);
 
     device.setup_queue(0, &mut controlq);
     device.setup_queue(1, &mut eventq);
@@ -381,16 +388,17 @@ pub fn init(ecam: &crate::mm::Mmio) -> Option<(SoundController, AudioInfo)> {
     let mut tx_data_phys = [0u64; TX_INFLIGHT_MAX];
     let dma_base_phys = dma.phys() & !(crate::mm::PAGE_2M - 1);
     let dma_token = shared_memory::register(crate::DirectMap::from_phys(dma_base_phys), crate::mm::PAGE_2M);
+    let period_bytes = 512usize;
     let mut buf_offsets = [0u32; TX_INFLIGHT_MAX];
     for i in 0..TX_INFLIGHT_MAX {
-        tx_data_phys[i] = dma.phys() + (OFF_TX_DATA + i * 0x1000) as u64;
-        buf_offsets[i] = (OFF_TX_DATA + i * 0x1000) as u32;
+        tx_data_phys[i] = dma.phys() + (OFF_TX_DATA + i * period_bytes) as u64;
+        buf_offsets[i] = (OFF_TX_DATA + i * period_bytes) as u32;
     }
 
     let mut control_slots = controlq.initial_slots();
     let control_slot = control_slots.pop().expect("sound: no control slots");
     drop(control_slots);
-    let tx_free_slots = txq.initial_slots();
+    let tx_free_slots = txq.initial_slots_strided(3);
 
     let mut ctrl = SoundController {
         device,
@@ -405,7 +413,7 @@ pub fn init(ecam: &crate::mm::Mmio) -> Option<(SoundController, AudioInfo)> {
         tx_data_phys,
         tx_inflight: 0,
         inflight_mask: 0,
-        desc_to_buf: [0; 16],
+        desc_to_buf: [0; 32],
         started: false,
         control_slot: Some(control_slot),
         tx_free_slots,
@@ -438,7 +446,7 @@ pub fn init(ecam: &crate::mm::Mmio) -> Option<(SoundController, AudioInfo)> {
         num_buffers: TX_INFLIGHT_MAX as u8,
         sample_rate: 44100,
         channels: 2,
-        period_bytes: 4096,
+        period_bytes: 512,
     };
 
     log!("virtio-sound: initialized ({} DMA buffers, playback starts on first submit)", TX_INFLIGHT_MAX);

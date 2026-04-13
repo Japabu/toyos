@@ -1,4 +1,5 @@
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
 use crate::drivers::virtio_sound::SoundController;
 use crate::io_uring::RingId;
 use crate::sync::Lock;
@@ -7,6 +8,7 @@ use toyos_abi::audio::AudioInfo;
 static AUDIO: Lock<Option<SoundController>> = Lock::new(None);
 static AUDIO_INFO: Lock<Option<AudioInfo>> = Lock::new(None);
 static IO_URING_WATCHERS: Lock<Vec<RingId>> = Lock::new(Vec::new());
+static COMPLETION_TS: AtomicU64 = AtomicU64::new(0);
 
 pub fn register(controller: SoundController, info: AudioInfo) {
     *AUDIO.lock() = Some(controller);
@@ -15,6 +17,18 @@ pub fn register(controller: SoundController, info: AudioInfo) {
 
 pub fn audio_info() -> Option<AudioInfo> {
     *AUDIO_INFO.lock()
+}
+
+pub fn start() {
+    if let Some(ctrl) = AUDIO.lock().as_mut() {
+        ctrl.start();
+    }
+}
+
+pub fn stop() {
+    if let Some(ctrl) = AUDIO.lock().as_mut() {
+        ctrl.stop();
+    }
 }
 
 /// Submit a filled DMA buffer to the VirtIO device.
@@ -26,12 +40,21 @@ pub fn submit_buffer(idx: usize, len: u32) -> bool {
     }
 }
 
-/// Drain completed TX buffers. Returns `Some(bitmask)` if any completed,
+pub fn set_completion_timestamp(ts: u64) {
+    COMPLETION_TS.store(ts, Ordering::Release);
+}
+
+/// Drain completed TX buffers. Returns `Some((bitmask, timestamp))` if any completed,
 /// `None` if nothing new.
-pub fn drain_completed() -> Option<u32> {
-    if let Some(ctrl) = AUDIO.lock().as_mut() {
-        let mask = ctrl.poll_completed();
-        if mask != 0 { Some(mask) } else { None }
+pub fn drain_completed() -> Option<(u32, u64)> {
+    let mask = if let Some(ctrl) = AUDIO.lock().as_mut() {
+        ctrl.poll_completed()
+    } else {
+        0
+    };
+    if mask != 0 {
+        let ts = COMPLETION_TS.swap(0, Ordering::Acquire);
+        Some((mask, ts))
     } else {
         None
     }

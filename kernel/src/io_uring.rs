@@ -284,6 +284,13 @@ pub fn create(depth: u32) -> Result<(RingId, SharedToken), SyscallError> {
 // Enter — submit SQEs and/or wait for CQEs
 // ---------------------------------------------------------------------------
 
+/// Check if a ring has unread CQEs.
+pub fn has_completions(ring_id: RingId) -> bool {
+    let guard = IO_URINGS.lock();
+    let map = guard.as_ref().expect("io_uring not initialized");
+    map.get(ring_id).map_or(false, |inst| inst.cq_count() > 0)
+}
+
 /// Process SQEs and wait for completions. Called from the syscall handler.
 /// Returns the number of CQEs available after processing.
 pub fn enter(
@@ -569,7 +576,6 @@ fn complete_pending_for_source(watchers: &[RingId], matches: impl Fn(&PendingPol
     for &ring_id in watchers {
         let Some(instance) = map.get_mut(ring_id) else { continue };
 
-        // Find and remove matching pending polls
         let mut i = 0;
         while i < instance.pending_polls.len() {
             if matches(&instance.pending_polls[i]) {
@@ -578,13 +584,11 @@ fn complete_pending_for_source(watchers: &[RingId], matches: impl Fn(&PendingPol
                 if pp.flags.readable() { result_flags |= PollFlags::IN.raw(); }
                 if pp.flags.writable() { result_flags |= PollFlags::OUT.raw(); }
                 instance.post_cqe(pp.user_data, result_flags as i32, 0);
-                // Don't increment i — swap_remove moved the last element here
             } else {
                 i += 1;
             }
         }
 
-        // Push wake event for the thread blocked on this ring
         scheduler::push_event(EventSource::IoUring(ring_id));
     }
 }

@@ -1,18 +1,23 @@
-//! soundd IPC protocol and audio hardware wrappers.
+//! soundd IPC protocol and double-buffer shared memory audio streaming.
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::Ordering;
+use toyos_abi::audio::AudioSlotHeader;
 use toyos_abi::syscall;
 use crate::ipc::IpcError;
 use crate::shm::SharedMemory;
 
-pub const MSG_AUDIO_OPEN: u32 = 1;
-pub const MSG_AUDIO_OPENED: u32 = 2;
-pub const MSG_AUDIO_SET_VOLUME: u32 = 3;
-pub const MSG_AUDIO_DATA_READY: u32 = 4;
+// ---------------------------------------------------------------------------
+// IPC message types
+// ---------------------------------------------------------------------------
+
+pub const MSG_STREAM_OPEN: u32 = 1;
+pub const MSG_STREAM_OPENED: u32 = 2;
+pub const MSG_STREAM_SET_VOLUME: u32 = 3;
+pub const MSG_STREAM_CLOSE: u32 = 4;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub struct AudioOpenRequest {
+pub struct StreamOpenRequest {
     pub sample_rate: u32,
     pub channels: u16,
     pub format: u16,
@@ -20,17 +25,20 @@ pub struct AudioOpenRequest {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub struct AudioOpenResponse {
-    pub stream_id: u32,
+pub struct StreamOpenResponse {
     pub shm_token: u32,
-    pub ring_size: u32,
+    pub signal_pipe_id: u64,
+    pub client_period_frames: u32,
+    pub client_period_bytes: u32,
+    pub device_sample_rate: u32,
+    pub device_channels: u16,
+    pub slot_count: u16,
 }
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub struct AudioSetVolume {
-    pub stream_id: u32,
-    pub volume: u32,
+pub struct StreamSetVolume {
+    pub gain: f32,
 }
 
 pub fn audio_submit(buf_idx: u32, len: u32) {
@@ -38,152 +46,95 @@ pub fn audio_submit(buf_idx: u32, len: u32) {
 }
 
 // ---------------------------------------------------------------------------
-// AudioRing — SPSC ring buffer over shared memory for audio streaming
+// AudioSlotWriter — client side of slot-ring protocol
 // ---------------------------------------------------------------------------
 
-#[repr(C, align(64))]
-struct Header {
-    write_cursor: AtomicU32,
-    read_cursor: AtomicU32,
-    capacity: u32,
-    flags: AtomicU32,
-}
-
-const WRITER_CLOSED: u32 = 1;
-
-fn header(shm: &SharedMemory) -> &Header {
-    unsafe { &*(shm.as_ptr() as *const Header) }
-}
-
-fn data_ptr(shm: &SharedMemory) -> *mut u8 {
-    unsafe { shm.as_ptr().add(core::mem::size_of::<Header>()) }
-}
-
-fn available(shm: &SharedMemory) -> u32 {
-    let h = header(shm);
-    let w = h.write_cursor.load(Ordering::Acquire);
-    let r = h.read_cursor.load(Ordering::Acquire);
-    w.wrapping_sub(r)
-}
-
-/// Reader half of an audio ring buffer. Used by soundd to consume audio
-/// samples written by clients.
-pub struct AudioRingReader {
+pub struct AudioSlotWriter {
     shm: SharedMemory,
+    period_bytes: u32,
+    slot_count: u32,
 }
 
-impl AudioRingReader {
-    pub fn new(shm: SharedMemory) -> Self {
-        Self { shm }
+impl AudioSlotWriter {
+    pub fn new(shm: SharedMemory, period_bytes: u32, slot_count: u32) -> Self {
+        Self { shm, period_bytes, slot_count }
     }
 
-    pub fn available(&self) -> u32 {
-        available(&self.shm)
+    fn header(&self) -> &AudioSlotHeader {
+        unsafe { &*(self.shm.as_ptr() as *const AudioSlotHeader) }
     }
 
-    pub fn read(&self, buf: &mut [u8]) -> usize {
-        let avail = self.available() as usize;
-        if avail == 0 {
-            return 0;
-        }
-        let h = header(&self.shm);
-        let count = buf.len().min(avail);
-        let cap = h.capacity as usize;
-        let r = h.read_cursor.load(Ordering::Relaxed) as usize;
-        let offset = r % cap;
-        let data = data_ptr(&self.shm);
-
-        let first = count.min(cap - offset);
+    fn slot_data_mut(&self, slot_idx: u32) -> &mut [u8] {
+        let offset = AudioSlotHeader::SIZE + slot_idx as usize * self.period_bytes as usize;
         unsafe {
-            core::ptr::copy_nonoverlapping(data.add(offset), buf.as_mut_ptr(), first);
-            if first < count {
-                core::ptr::copy_nonoverlapping(data, buf.as_mut_ptr().add(first), count - first);
-            }
-        }
-
-        h.read_cursor.store((r + count) as u32, Ordering::Release);
-        // Wake any writer blocked on ring-full
-        unsafe {
-            syscall::futex_wake(&h.read_cursor as *const AtomicU32 as *const u32, 1);
-        }
-        count
-    }
-
-    pub fn is_writer_closed(&self) -> bool {
-        header(&self.shm).flags.load(Ordering::Acquire) & WRITER_CLOSED != 0
-    }
-}
-
-/// Writer half of an audio ring buffer. Used by audio clients to produce
-/// samples consumed by soundd.
-pub struct AudioRingWriter {
-    shm: SharedMemory,
-}
-
-impl AudioRingWriter {
-    /// Initialize shared memory as an audio ring and take ownership as writer.
-    pub fn new(mut shm: SharedMemory) -> Self {
-        let capacity = shm.len() - core::mem::size_of::<Header>();
-        let ptr = shm.as_mut_slice().as_mut_ptr() as *mut Header;
-        unsafe {
-            (*ptr).write_cursor = AtomicU32::new(0);
-            (*ptr).read_cursor = AtomicU32::new(0);
-            (*ptr).capacity = capacity as u32;
-            (*ptr).flags = AtomicU32::new(0);
-        }
-        Self { shm }
-    }
-
-    pub fn write(&self, buf: &[u8]) -> usize {
-        let h = header(&self.shm);
-        let free = (h.capacity - available(&self.shm)) as usize;
-        if free == 0 {
-            return 0;
-        }
-        let count = buf.len().min(free);
-        let cap = h.capacity as usize;
-        let w = h.write_cursor.load(Ordering::Relaxed) as usize;
-        let offset = w % cap;
-        let data = data_ptr(&self.shm);
-
-        let first = count.min(cap - offset);
-        unsafe {
-            core::ptr::copy_nonoverlapping(buf.as_ptr(), data.add(offset), first);
-            if first < count {
-                core::ptr::copy_nonoverlapping(buf.as_ptr().add(first), data, count - first);
-            }
-        }
-
-        h.write_cursor.store((w + count) as u32, Ordering::Release);
-        count
-    }
-
-    pub fn write_blocking(&self, buf: &[u8]) {
-        let mut offset = 0;
-        while offset < buf.len() {
-            let n = self.write(&buf[offset..]);
-            offset += n;
-            if n == 0 {
-                let h = header(&self.shm);
-                let cur = h.read_cursor.load(Ordering::Acquire);
-                unsafe {
-                    syscall::futex_wait(
-                        &h.read_cursor as *const AtomicU32 as *const u32,
-                        cur,
-                        None,
-                    );
-                }
-            }
+            core::slice::from_raw_parts_mut(self.shm.as_ptr().add(offset), self.period_bytes as usize)
         }
     }
 
-    pub fn close(&self) {
-        header(&self.shm).flags.fetch_or(WRITER_CLOSED, Ordering::Release);
+    /// Try to acquire a slot for writing. Returns None if the ring is full.
+    pub fn try_fill(&self) -> Option<(u32, &mut [u8])> {
+        let w = self.header().write_idx.load(Ordering::Acquire);
+        let r = self.header().read_idx.load(Ordering::Acquire);
+        if w.wrapping_sub(r) >= self.slot_count {
+            return None;
+        }
+        let slot_idx = w % self.slot_count;
+        Some((w, self.slot_data_mut(slot_idx)))
+    }
+
+    /// Commit a filled slot, advancing write_idx.
+    pub fn commit(&self, w: u32) {
+        self.header().write_idx.store(w.wrapping_add(1), Ordering::Release);
     }
 }
 
 // ---------------------------------------------------------------------------
-// AudioStream — ergonomic client for soundd
+// AudioSlotReader — soundd side of slot-ring protocol
+// ---------------------------------------------------------------------------
+
+pub struct AudioSlotReader {
+    shm: SharedMemory,
+    period_bytes: u32,
+    slot_count: u32,
+}
+
+impl AudioSlotReader {
+    pub fn new(shm: SharedMemory, period_bytes: u32, slot_count: u32) -> Self {
+        Self { shm, period_bytes, slot_count }
+    }
+
+    fn header(&self) -> &AudioSlotHeader {
+        unsafe { &*(self.shm.as_ptr() as *const AudioSlotHeader) }
+    }
+
+    fn slot_data(&self, slot_idx: u32) -> &[u8] {
+        let offset = AudioSlotHeader::SIZE + slot_idx as usize * self.period_bytes as usize;
+        unsafe {
+            core::slice::from_raw_parts(self.shm.as_ptr().add(offset), self.period_bytes as usize)
+        }
+    }
+
+    /// Consume one filled slot. Returns None if the ring is empty (underrun).
+    pub fn try_consume(&self) -> Option<&[u8]> {
+        let h = self.header();
+        let w = h.write_idx.load(Ordering::Acquire);
+        let r = h.read_idx.load(Ordering::Acquire);
+        if w == r {
+            return None;
+        }
+        let slot_idx = r % self.slot_count;
+        let slice = self.slot_data(slot_idx);
+        h.read_idx.store(r.wrapping_add(1), Ordering::Release);
+        Some(slice)
+    }
+
+    pub fn period_bytes(&self) -> u32 {
+        self.period_bytes
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AudioStream — client handle for soundd
 // ---------------------------------------------------------------------------
 
 #[derive(Debug)]
@@ -195,53 +146,71 @@ pub enum AudioError {
 
 pub struct AudioStream {
     control: crate::Connection,
-    ring: AudioRingWriter,
-    stream_id: u32,
+    slot_writer: AudioSlotWriter,
+    signal_fd: toyos_abi::Fd,
+    period_frames: u32,
+    period_bytes: u32,
 }
 
 impl AudioStream {
     const BOOT_RETRIES: u32 = 100;
     const BOOT_RETRY_INTERVAL_NS: u64 = 10_000_000;
 
-    /// Connect to soundd and open a stream. Retries connection during boot.
     pub fn open(sample_rate: u32, channels: u16, format: u16) -> Result<Self, AudioError> {
         let control = Self::connect_soundd()?;
 
-        let req = AudioOpenRequest { sample_rate, channels, format };
-        control.send(MSG_AUDIO_OPEN, &req).map_err(AudioError::Ipc)?;
+        let req = StreamOpenRequest { sample_rate, channels, format };
+        control.send(MSG_STREAM_OPEN, &req).map_err(AudioError::Ipc)?;
 
-        let (msg_type, resp): (u32, AudioOpenResponse) =
+        let (msg_type, resp): (u32, StreamOpenResponse) =
             control.recv().map_err(AudioError::Ipc)?;
-        if msg_type != MSG_AUDIO_OPENED {
+        if msg_type != MSG_STREAM_OPENED {
             return Err(AudioError::Protocol(msg_type));
         }
 
-        let shm = SharedMemory::map(resp.shm_token, resp.ring_size as usize);
-        let ring = AudioRingWriter::new(shm);
+        let slot_count = resp.slot_count as u32;
+        let shm_size = AudioSlotHeader::SIZE + slot_count as usize * resp.client_period_bytes as usize;
+        let shm = SharedMemory::map(resp.shm_token, shm_size);
+        let slot_writer = AudioSlotWriter::new(shm, resp.client_period_bytes, slot_count);
 
-        Ok(Self { control, ring, stream_id: resp.stream_id })
+        let signal_fd = syscall::pipe_open(resp.signal_pipe_id, 0)
+            .map_err(|e| AudioError::Ipc(IpcError::Syscall(e)))?;
+
+        Ok(Self {
+            control,
+            slot_writer,
+            signal_fd,
+            period_frames: resp.client_period_frames,
+            period_bytes: resp.client_period_bytes,
+        })
     }
 
-    pub fn ring(&self) -> &AudioRingWriter {
-        &self.ring
+    /// Block until soundd signals, then fill all available ring slots via the callback.
+    /// Each callback invocation receives one period-sized buffer to fill.
+    pub fn wait_and_fill(&self, mut callback: impl FnMut(&mut [u8])) {
+        let mut buf = [0u8; 64];
+        let _ = syscall::read(self.signal_fd, &mut buf);
+        while let Some((w, slot)) = self.slot_writer.try_fill() {
+            callback(slot);
+            self.slot_writer.commit(w);
+        }
     }
 
-    /// Write audio data to the ring, blocking when full. Notifies soundd
-    /// that data is available so it can wake from its event loop.
-    pub fn write_blocking(&self, buf: &[u8]) {
-        self.ring.write_blocking(buf);
-        let _ = self.control.signal(MSG_AUDIO_DATA_READY);
+    pub fn period_frames(&self) -> u32 {
+        self.period_frames
     }
 
-    pub fn stream_id(&self) -> u32 {
-        self.stream_id
+    pub fn period_bytes(&self) -> u32 {
+        self.period_bytes
     }
 
-    pub fn set_volume(&self, volume: u32) -> Result<(), AudioError> {
-        self.control.send(MSG_AUDIO_SET_VOLUME, &AudioSetVolume {
-            stream_id: self.stream_id,
-            volume,
-        }).map_err(AudioError::Ipc)
+    pub fn set_volume(&self, gain: f32) -> Result<(), AudioError> {
+        self.control.send(MSG_STREAM_SET_VOLUME, &StreamSetVolume { gain })
+            .map_err(AudioError::Ipc)
+    }
+
+    pub fn close(&self) {
+        let _ = self.control.signal(MSG_STREAM_CLOSE);
     }
 
     fn connect_soundd() -> Result<crate::Connection, AudioError> {

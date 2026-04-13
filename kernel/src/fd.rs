@@ -387,10 +387,12 @@ pub fn try_read(table: &mut FdTable, fd: u32, buf: &mut [u8]) -> Option<u64> {
                 return Some(count as u64);
             }
             return match crate::audio::drain_completed() {
-                Some(mask) => {
-                    let bytes = mask.to_le_bytes();
-                    let count = buf.len().min(bytes.len());
-                    buf[..count].copy_from_slice(&bytes[..count]);
+                Some((mask, ts)) => {
+                    let mask_bytes = mask.to_le_bytes();
+                    let ts_bytes = ts.to_le_bytes();
+                    let count = buf.len().min(12);
+                    if count >= 4 { buf[..4].copy_from_slice(&mask_bytes); }
+                    if count >= 12 { buf[4..12].copy_from_slice(&ts_bytes); }
                     Some(count as u64)
                 }
                 None => None,
@@ -462,8 +464,20 @@ pub fn try_write(table: &mut FdTable, fd: u32, buf: &[u8]) -> Option<u64> {
             }
         }
         Descriptor::SerialConsole => {
-            serial::write(buf);
+            serial::SerialWriter::lock().write_bytes(buf);
             Some(buf.len() as u64)
+        }
+        Descriptor::Audio { .. } => {
+            if !buf.is_empty() {
+                match buf[0] {
+                    0 => crate::audio::stop(),
+                    1 => crate::audio::start(),
+                    _ => {}
+                }
+                Some(1)
+            } else {
+                Some(0)
+            }
         }
         _ => Some(SyscallError::PermissionDenied.to_u64()),
     }

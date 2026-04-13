@@ -90,6 +90,7 @@ pub const SYS_DEBUG: u64 = 92;
 pub const SYS_SCHED_INFO: u64 = 93;
 pub const SYS_PROCESS_STATS: u64 = 94;
 pub const SYS_SET_THREAD_NAME: u64 = 95;
+pub const SYS_SET_RT_PRIORITY: u64 = 96;
 
 pub const WNOHANG: u64 = 1;
 
@@ -707,6 +708,11 @@ pub fn net_recv_timeout(buf: &mut [u8], timeout: Option<u64>) -> usize {
 /// Sleep for the given number of nanoseconds.
 pub fn nanosleep(nanos: u64) {
     syscall(SYS_NANOSLEEP, nanos, 0, 0, 0);
+}
+
+/// Set or clear real-time scheduling priority on the current thread.
+pub fn set_rt_priority(enable: bool) {
+    syscall(SYS_SET_RT_PRIORITY, enable as u64, 0, 0, 0);
 }
 
 /// Duplicate a file descriptor.

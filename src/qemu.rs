@@ -58,8 +58,10 @@ pub fn launch(debug: bool, dump_audio: bool) {
         qemu.arg("-audiodev")
             .arg("wav,id=audio0,path=/tmp/toyos-audio.wav");
     } else {
-        qemu.arg("-audiodev")
-            .arg(format!("{},id=audio0", audio_backend()));
+        qemu.arg("-audiodev").arg(format!(
+            "{},id=audio0,timer-period=5000,out.buffer-length=20000",
+            audio_backend()
+        ));
     }
     qemu.arg("-device")
         .arg("virtio-sound-pci,audiodev=audio0,streams=1");

@@ -578,8 +578,8 @@ pub fn init(ecam: &crate::mm::Mmio) -> Option<(Box<dyn Gpu>, GpuInfo)> {
 
     let device = VirtioDevice::init(&pci_dev, VIRTIO_F_VERSION_1 | VIRTIO_GPU_F_EDID);
 
-    let mut controlq = Virtqueue::new(dma.subslice(OFF_CONTROLQ, 0x1000));
-    let mut cursorq = Virtqueue::new(dma.subslice(OFF_CURSORQ, 0x1000));
+    let mut controlq = Virtqueue::new(dma.subslice(OFF_CONTROLQ, 0x1000), 16);
+    let mut cursorq = Virtqueue::new(dma.subslice(OFF_CURSORQ, 0x1000), 16);
 
     device.setup_queue(0, &mut controlq);
     device.setup_queue(1, &mut cursorq);

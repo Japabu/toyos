@@ -961,6 +961,8 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
         deadline: 0,
         blocked_since: 0,
         enqueued_at: 0,
+        is_rt: false,
+        rt_inherited: false,
         accounting: scheduler::TaskAccounting::default(),
     };
     scheduler::enqueue_new(ctx);

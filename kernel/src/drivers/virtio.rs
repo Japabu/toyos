@@ -169,7 +169,6 @@ impl VirtqueueRegions {
 pub struct DescSlot(u16);
 
 impl DescSlot {
-    /// The raw descriptor index.
     pub fn id(&self) -> u16 { self.0 }
 }
 
@@ -190,10 +189,10 @@ pub enum BufDir {
 }
 
 impl Virtqueue {
-    /// Create a new virtqueue from a contiguous DMA region (one 4KB page, 16 entries).
-    pub fn new(buf: KernelSlice) -> Self {
+    /// Create a new virtqueue from a contiguous DMA region.
+    pub fn new(buf: KernelSlice, queue_size: u16) -> Self {
         unsafe { buf.zero(); }
-        Self::from_regions(&VirtqueueRegions::from_contiguous(buf, 16), 16)
+        Self::from_regions(&VirtqueueRegions::from_contiguous(buf, queue_size), queue_size)
     }
 
     /// Create a new virtqueue from explicit DMA regions.
@@ -239,6 +238,12 @@ impl Virtqueue {
     /// The caller manages these tokens — `submit()` consumes one, `poll_used()` returns one.
     pub fn initial_slots(&self) -> alloc::vec::Vec<DescSlot> {
         (0..self.size).map(DescSlot).collect()
+    }
+
+    /// Like `initial_slots`, but returns only slots spaced `stride` apart.
+    /// Use when each submission chains multiple consecutive descriptors.
+    pub fn initial_slots_strided(&self, stride: u16) -> alloc::vec::Vec<DescSlot> {
+        (0..self.size).step_by(stride as usize).map(DescSlot).collect()
     }
 
     /// Submit a descriptor chain and notify the device (non-blocking).
