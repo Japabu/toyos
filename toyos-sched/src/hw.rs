@@ -6,7 +6,7 @@
 //! behind this trait.
 
 use crate::cpu::{RunToken, SleepToken};
-use crate::task::{SchedPayload, TaskKey};
+use crate::task::{SchedPayload, TaskAccounting, TaskKey};
 
 /// CPU identity. Always a field or a parameter, never an ambient query —
 /// `Hw` deliberately has no `cpu_id()`, so a wrong-CPU lookup is
@@ -16,8 +16,24 @@ pub struct CpuId(pub u32);
 
 /// Absolute nanoseconds: since boot in the kernel, virtual-clock time in the
 /// simulator.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct Nanos(pub u64);
+
+impl Nanos {
+    pub const ZERO: Nanos = Nanos(0);
+
+    pub fn after(self, ns: u64) -> Nanos {
+        Nanos(self.0.saturating_add(ns))
+    }
+
+    /// Elapsed since `earlier`. Saturating rather than wrapping: a pass that
+    /// samples a clock older than the last one is a driver bug, and charging
+    /// a colossal interval would hide it behind absurd accounting instead of
+    /// leaving the counters honest.
+    pub fn since(self, earlier: Nanos) -> u64 {
+        self.0.saturating_sub(earlier.0)
+    }
+}
 
 /// One scheduling-relevant event in the format shared by the kernel's
 /// per-CPU binary trace ring (Stage 6) and the simulator's recorder
@@ -93,8 +109,16 @@ pub trait Hw: Kicker + 'static {
     /// Kernel: cli / final recheck / sti;hlt. Sim: mark the vcpu sleeping.
     fn idle_wait(&self, token: SleepToken);
 
-    /// Finalize sink: the environment reclaims a dead task's payload.
-    fn release(&self, key: TaskKey, payload: Self::Payload);
+    /// Ask `cpu` to take its next safe point. The core needs this for exactly
+    /// one case the spec spells out (§7.6): a `Retire` whose target is the
+    /// task currently *running* cannot be yanked mid-syscall, so it is asked
+    /// to die at its next safe point instead. Not in the spec's trait list —
+    /// which leaves that request without a way to reach the driver.
+    fn need_resched(&self, cpu: CpuId);
+
+    /// Finalize sink: the environment reclaims a dead task's payload and its
+    /// accounting, both handed over exactly once (spec §9.3).
+    fn release(&self, key: TaskKey, payload: Self::Payload, acct: TaskAccounting);
 
     fn trace(&self, ev: TraceEvent);
 }

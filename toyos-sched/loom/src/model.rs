@@ -6,7 +6,8 @@ use loom::sync::{Mutex, MutexGuard};
 
 use crate::hw::{CpuId, Kicker};
 use crate::mailbox::{PreemptGuard, SchedMsg};
-use crate::task::{TaskKey, WakeCause, WakeReason};
+use crate::sync::Arc;
+use crate::task::{TaskKey, TaskShared, WakeCause, WakeReason};
 use crate::waitq::{LeafLock, WaitList};
 
 pub const CPU0: CpuId = CpuId(0);
@@ -27,8 +28,8 @@ impl SchedMsg for Msg {
         Msg::Wake(key, cause.reason)
     }
 
-    fn retire(key: TaskKey) -> Self {
-        Msg::Retire(key)
+    fn retire(shared: Arc<TaskShared<Self>>) -> Self {
+        Msg::Retire(shared.key())
     }
 }
 

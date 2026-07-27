@@ -83,7 +83,7 @@ fn post_retire<M: SchedMsg>(
         .expect("one retire in flight per task: node must be free");
     let handle = cpus.get(target);
     // Retire always preempts: a killed task must stop running promptly.
-    if handle.post(slot, M::retire(shared.key()), Urgency::Preempt, preempt) == Kick::Send {
+    if handle.post(slot, M::retire(shared.clone()), Urgency::Preempt, preempt) == Kick::Send {
         kicker.kick(target);
     }
     Some(target)
@@ -125,8 +125,8 @@ mod tests {
         fn wake(key: TaskKey, _cause: WakeCause) -> Self {
             Msg::Wake(key)
         }
-        fn retire(key: TaskKey) -> Self {
-            Msg::Retire(key)
+        fn retire(shared: Arc<TaskShared<Self>>) -> Self {
+            Msg::Retire(shared.key())
         }
     }
 

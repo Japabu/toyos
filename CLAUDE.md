@@ -172,16 +172,28 @@ the subsystems they cover:
 - `specs/scheduler-core-spec.md` — ownership-typed scheduler core as a `no_std` crate
   with a host-side deterministic simulator + interleaving fuzzer; per-CPU exclusive
   queues with message-passing wakes; 10-stage always-green migration.
-  **Migration state: Stage 3 done.** `toyos-sched/` holds the core crate (Stage 0
+  **Migration state: Stage 4 done.** `toyos-sched/` holds the core crate (Stage 0
   boundary types + `fair.rs`, the relocated vruntime/lag/frontier policy the kernel
-  now calls, plus the Stage 3 primitives: `mailbox.rs` — the crate's only `unsafe`,
-  everything else is `deny(unsafe_code)` — `waitq.rs`, `retire.rs`, `task.rs` state
-  word), `toyos-sched/sim/` the simulator package (ChoiceStream plumbing;
-  VM/explorer land at Stage 4), and `toyos-sched/loom/` the model-checking harness.
-  Host tests: `cargo test` inside `toyos-sched/` (covers unit + loom + sim). The
-  guard-removal proof that the loom models have teeth:
+  now calls, the Stage 3 primitives — `mailbox.rs` is the crate's only `unsafe`,
+  everything else is `deny(unsafe_code)`; `waitq.rs`, `retire.rs`, `task.rs` state
+  word — and the Stage 4 machine: the linear `Task` value with its five lifecycle
+  types (`task.rs`), `queue.rs`, `timer.rs`, `msg.rs`, `invariants.rs` and the
+  per-CPU `cpu.rs` (`CpuSched`, the `SchedPass` type-state, `Action`, the sleep
+  handshake). `toyos-sched/sim/` is the deterministic simulator (VM, explorer,
+  ChoiceStream with seed/fuzz-byte/PCT/replay drivers, shrinker, corpus, scenario
+  library); `toyos-sched/loom/` the model-checking harness. **The kernel still does
+  not call any of it** beyond `fair.rs` — conversions are Stage 5, `Hw` is Stage 6,
+  cutover is Stage 7.
+  Host tests: `cargo test` inside `toyos-sched/` (unit + loom + sim; ~15 s). Two
+  proofs that the harnesses have teeth, both required:
   `TOYOS_LOOM_RAW=1 cargo test -p toyos-sched-loom --features no-preempt-guard`
-  must FAIL (it does, on invariant I2); without the feature it passes.
+  must FAIL (it does, on invariant I2), and the simulator's `old_steal_port`
+  scenario — a port of the OLD steal-and-scan algorithm — must fail while the same
+  workload passes under the new protocol (it does, on I1/I6 and on I8, the
+  address-space-freed-under-a-live-task detector). The full Stage 4 exit criterion
+  runs from the CLI, not from `cargo test`:
+  `cargo run --release -p toyos-sched-sim -- gate 10000` (10⁴ seeds/scenario) and
+  `-- fuzz-sweep 10000000` (10⁷ fuzz steps/scenario).
   Gate A (audio glitch) runs inside `cargo test`: each audio test boots at smp=1
   and smp=8 and is gated on the recorded histograms in `tests/audio-baseline.toml`
   (currently all-clean = strict). Stage 2 landed: per-CPU `kernel/src/irq_ring.rs`

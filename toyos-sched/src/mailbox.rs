@@ -34,9 +34,8 @@ use core::marker::PhantomData;
 use core::mem::ManuallyDrop;
 use core::ptr;
 
-use crate::cpu::SleepToken;
 use crate::sync::{Arc, AtomicBool, AtomicPtr, AtomicU32, Ordering};
-use crate::task::{TaskKey, WakeCause};
+use crate::task::{TaskKey, TaskShared, WakeCause};
 
 /// The message vocabulary the primitives need to speak.
 ///
@@ -47,7 +46,11 @@ use crate::task::{TaskKey, WakeCause};
 /// payload type.
 pub trait SchedMsg: Send + Sized {
     fn wake(key: TaskKey, cause: WakeCause) -> Self;
-    fn retire(key: TaskKey) -> Self;
+
+    /// A retire carries the whole [`TaskShared`], not just the key: the home
+    /// CPU that finds the task gone must read the state word to chase it
+    /// (spec §7.6), and a bare key gives it nothing to read.
+    fn retire(shared: Arc<TaskShared<Self>>) -> Self;
 }
 
 /// Proof that preemption is disabled for as long as the guard is borrowed.
@@ -266,6 +269,42 @@ impl<M: Send> MailboxProducer<M> {
         // form a `&mut`.
         unsafe { self.inner.push_raw(ptr) };
     }
+
+    /// Push a message that carries its own node — the ownership-transferring
+    /// `Adopt`, which rides inside the very task record it transfers
+    /// (spec §7.2). That message cannot be posted through [`Self::post`]: a
+    /// [`PostSlot`] borrows the node, and the node is inside the value being
+    /// moved.
+    ///
+    /// * **N4 (self-carried node).** `node_of(&msg)` must return a node that
+    ///   lives in an allocation `msg` *owns* and that does not move when
+    ///   `msg` moves — i.e. behind `Task`'s `Box`. That is what makes the
+    ///   node address taken before the move still valid after it. The node
+    ///   must also be free; it is claimed here, so N1 holds as for any other
+    ///   push.
+    ///
+    /// The message owns itself while queued (the record contains the value
+    /// that owns the record). Nothing else references it, so a message that
+    /// is never consumed is a leak — caught by the scenario-end invariant
+    /// I10, not silently absorbed.
+    pub fn post_owned(
+        &self,
+        msg: M,
+        node_of: fn(&M) -> &MailboxNode<M>,
+        _preempt: &impl PreemptGuard,
+    ) {
+        let node = node_of(&msg) as *const MailboxNode<M> as *mut MailboxNode<M>;
+        // SAFETY: N4 — `node` points into the stable allocation `msg` owns,
+        // so it stays valid across the move into the slot below.
+        unsafe {
+            assert!(
+                !(*node).in_flight.swap(true, Ordering::AcqRel),
+                "a self-carried message is already in flight",
+            );
+            (*node).slot.put(msg);
+            self.inner.push_raw(node);
+        }
+    }
 }
 
 /// The consumer half: `!Sync`, owned by the CPU whose mailbox it is.
@@ -472,7 +511,7 @@ impl Default for Doorbell {
 }
 
 /// SLEEPING is published; the final mailbox check has not happened yet. The
-/// only way to obtain a [`SleepToken`] runs through here, so "halt with work
+/// only way to obtain a [`crate::cpu::SleepToken`] runs through here, so "halt with work
 /// queued" has no expression (spec §7.5).
 #[must_use = "an armed sleep must be confirmed or abandoned"]
 pub struct SleepArm<'d> {
@@ -483,15 +522,28 @@ pub struct SleepArm<'d> {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Awake;
 
+/// SLEEPING was published before a mailbox-empty check that came back empty.
+/// Half of what [`crate::cpu::SleepToken`] requires.
+#[must_use]
+pub struct Quiesced {
+    _private: (),
+}
+
 impl SleepArm<'_> {
     /// The final check. `mailbox` is this CPU's consumer: passing someone
     /// else's is impossible, since a `MailboxConsumer` is `!Send` and lives
     /// in the CPU's own `CpuSched`.
-    pub fn confirm<M: Send>(self, mailbox: &MailboxConsumer<M>) -> Result<SleepToken, Awake> {
+    ///
+    /// Success yields [`Quiesced`], one of the two halves [`crate::cpu::SleepToken`]
+    /// needs — the other being the applied timer plan (spec §7.5, §8.4). A
+    /// CPU therefore cannot halt with work queued *or* with a deadline
+    /// pending and the timer unarmed, and neither fact is asserted anywhere:
+    /// there is no way to say it.
+    pub fn confirm<M: Send>(self, mailbox: &MailboxConsumer<M>) -> Result<Quiesced, Awake> {
         if !mailbox.is_empty() || self.doorbell.kick_pending() {
             return Err(Awake);
         }
-        Ok(SleepToken::new(self))
+        Ok(Quiesced { _private: () })
     }
 
     /// Give up on sleeping without checking (a pass decided otherwise).

@@ -14,6 +14,8 @@
 use core::num::NonZeroU32;
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use crate::sync::LeafLock;
+
 /// Clamp for stored lag at the Runnable→NonRunnable transition: how far
 /// behind (entitled catch-up) or ahead (throttled on wake) of the frontier a
 /// process may be remembered as. 50ms.
@@ -234,6 +236,64 @@ fn vrt_from_lag(frontier: u64, lag: i64) -> u64 {
         frontier.saturating_sub(lag as u64)
     } else {
         frontier.saturating_add((-lag) as u64)
+    }
+}
+
+/// One process's fair-share pot, reachable from every thread of that process
+/// (spec §9.1). The cell is supplied by the environment for the reason stated
+/// on [`LeafLock`]; the kernel's is the word-sized spin the spec calls
+/// `SpinSmall`, the simulator's a plain mutex.
+///
+/// The global `sched_state: Lock<HashMap<Pid, ..>>` — one hot lock per charge
+/// — has no successor here: a share is reached through the task that owns it.
+pub struct FairShare<L> {
+    state: L,
+}
+
+impl<L: LeafLock<ShareState>> FairShare<L> {
+    pub fn new(state: L) -> Self {
+        Self { state }
+    }
+
+    /// A thread of this process is entering a run queue: returns the vruntime
+    /// to insert with. Called at exactly the §5.2 transitions that add a task
+    /// to the Ready+Running pair, which is what keeps `runnable_threads` and
+    /// the containers in step (invariant I6).
+    pub fn enter_runnable(&self, frontier: &Frontier) -> u64 {
+        self.state.with(|s| s.enter_runnable(frontier.get()))
+    }
+
+    /// A thread left the Ready+Running pair (park, die, migrate away).
+    pub fn leave_runnable(&self, frontier: &Frontier) {
+        self.state.with(|s| s.leave_runnable(frontier.get()));
+    }
+
+    /// The re-insert vruntime for a thread that stays runnable (preempt and
+    /// yield), which must not re-enter and double-count the refcount.
+    pub fn runnable_vruntime(&self) -> Result<u64, NotRunnable> {
+        self.state.with(|s| s.runnable_vruntime())
+    }
+
+    pub fn charge(&self, ns: u64) -> Result<(), NotRunnable> {
+        self.state.with(|s| s.charge(ns))
+    }
+
+    pub fn vruntime(&self, frontier: &Frontier) -> u64 {
+        self.state.with(|s| s.vruntime(frontier.get()))
+    }
+
+    pub fn lag(&self) -> i64 {
+        self.state.with(|s| s.lag())
+    }
+
+    /// The refcount invariant I6 compares against the containers.
+    pub fn runnable_threads(&self) -> u32 {
+        self.state.with(|s| match s {
+            ShareState::Runnable {
+                runnable_threads, ..
+            } => runnable_threads.get(),
+            ShareState::NonRunnable { .. } => 0,
+        })
     }
 }
 

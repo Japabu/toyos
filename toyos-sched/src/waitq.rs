@@ -38,12 +38,7 @@ use crate::mailbox::{Kick, PreemptGuard, SchedMsg};
 use crate::sync::Arc;
 use crate::task::{Claim, Gen, ParkOutcome, TaskShared, WaitClass, WakeCause};
 
-/// Interior mutability for the queue's list, supplied by the environment.
-/// The kernel's implementor is a few-instruction, IRQ-off leaf lock that
-/// acquires nothing beneath it and is never held across a pass or a switch.
-pub trait LeafLock<T>: Sync {
-    fn with<R>(&self, f: impl FnOnce(&mut T) -> R) -> R;
-}
+pub use crate::sync::LeafLock;
 
 /// The registered waiters, in registration order.
 pub struct WaitList<M> {
@@ -281,12 +276,54 @@ pub enum Cancelled {
 
 /// The result of committing a registration.
 #[must_use]
-pub enum Commit<M> {
-    /// The state word is `Blocked`; the pass may park the task.
-    Parked(CommittedTicket<M>),
+pub enum Commit<'q, M: SchedMsg, L: LeafLock<WaitList<M>>> {
+    /// The state word is `Blocked`; the pass may park the task with the
+    /// ticket, and must clear the registration with [`Registration::finish`]
+    /// once the task runs again.
+    Parked(CommittedTicket<M>, Registration<'q, M, L>),
     /// A wake landed between registration and commit: do not park, do not
     /// switch (spec §8.1).
     AlreadyWoken,
+}
+
+/// A live registration on a queue, outstanding while its task is parked.
+///
+/// It exists because a *timeout* leaves the waiter's node behind: the local
+/// deadline fire wins the same claim CAS a waker would, and the core has no
+/// idea which queue the task was on — nor should it, since the scheduler
+/// knows only tasks, tickets and causes (spec §8.1).
+///
+/// A leftover node is not merely untidy. Once the task parks on a *second*
+/// queue, a `wake_one` on the first would find it `Blocked` and claim it:
+/// that queue's wake is consumed by a waiter that is no longer waiting for it
+/// — the "wake satisfied by a corpse" failure §8.2 exists to prevent, one
+/// level up. Holding this guard across the block, on the task's own stack,
+/// makes the cleanup structural instead of one more per-source recheck.
+#[must_use = "a registration must be finished once the task runs again"]
+pub struct Registration<'q, M: SchedMsg, L: LeafLock<WaitList<M>>> {
+    queue: &'q WaitQueue<M, L>,
+    shared: Arc<TaskShared<M>>,
+    armed: bool,
+    _not_send: PhantomData<*mut ()>,
+}
+
+impl<M: SchedMsg, L: LeafLock<WaitList<M>>> Registration<'_, M, L> {
+    /// Called by the blocking site once its task is running again, whatever
+    /// woke it. Idempotent against the ordinary wake path, which dequeued the
+    /// waiter when it claimed it.
+    pub fn finish(mut self) {
+        self.armed = false;
+        self.queue.dequeue(&self.shared);
+    }
+}
+
+impl<M: SchedMsg, L: LeafLock<WaitList<M>>> Drop for Registration<'_, M, L> {
+    fn drop(&mut self) {
+        assert!(
+            !self.armed,
+            "wait registration dropped: it must be finished once the task runs",
+        );
+    }
 }
 
 /// Proof that the task's word is `Blocked` and its registration is live —
@@ -311,7 +348,7 @@ impl<M> CommittedTicket<M> {
     }
 }
 
-impl<M: SchedMsg, L: LeafLock<WaitList<M>>> WaitTicket<'_, M, L> {
+impl<'q, M: SchedMsg, L: LeafLock<WaitList<M>>> WaitTicket<'q, M, L> {
     /// The condition became true after registering: withdraw.
     pub fn cancel(mut self) -> Cancelled {
         self.armed = false;
@@ -323,14 +360,22 @@ impl<M: SchedMsg, L: LeafLock<WaitList<M>>> WaitTicket<'_, M, L> {
     }
 
     /// Phase 2, run by the blocking pass.
-    pub fn commit(mut self) -> Commit<M> {
+    pub fn commit(mut self) -> Commit<'q, M, L> {
         self.armed = false;
         match self.shared.commit_park(self.cpu, self.generation) {
-            ParkOutcome::Parked => Commit::Parked(CommittedTicket {
-                shared: self.shared.clone(),
-                cpu: self.cpu,
-                class: self.queue.class(),
-            }),
+            ParkOutcome::Parked => Commit::Parked(
+                CommittedTicket {
+                    shared: self.shared.clone(),
+                    cpu: self.cpu,
+                    class: self.queue.class(),
+                },
+                Registration {
+                    queue: self.queue,
+                    shared: self.shared.clone(),
+                    armed: true,
+                    _not_send: PhantomData,
+                },
+            ),
             ParkOutcome::AlreadyWoken => {
                 // Every claim path pops the waiter first; this only tidies up
                 // after a claim that did not (none today, and cheap insurance
@@ -373,8 +418,8 @@ mod tests {
         fn wake(key: TaskKey, cause: WakeCause) -> Self {
             Msg::Wake(key, cause.reason)
         }
-        fn retire(key: TaskKey) -> Self {
-            Msg::Retire(key)
+        fn retire(shared: Arc<TaskShared<Self>>) -> Self {
+            Msg::Retire(shared.key())
         }
     }
 
@@ -418,6 +463,17 @@ mod tests {
         WakeCause::new(cause)
     }
 
+    /// Commit a ticket and keep the registration the blocking site would hold
+    /// across its block.
+    fn park<'q>(
+        ticket: WaitTicket<'q, Msg, StdLock<WaitList<Msg>>>,
+    ) -> Registration<'q, Msg, StdLock<WaitList<Msg>>> {
+        match ticket.commit() {
+            Commit::Parked(_, reg) => reg,
+            Commit::AlreadyWoken => panic!("expected the park to commit"),
+        }
+    }
+
     #[test]
     fn park_then_wake_delivers_exactly_one_message() {
         let q = queue();
@@ -425,8 +481,7 @@ mod tests {
         let kicks = Kicks::default();
         let t = task(1);
 
-        let ticket = q.prepare_wait(&CurrentTask::new(&t, C0));
-        assert!(matches!(ticket.commit(), Commit::Parked(_)));
+        let reg = park(q.prepare_wait(&CurrentTask::new(&t, C0)));
         assert_eq!(q.len(), 1);
 
         assert_eq!(
@@ -437,6 +492,7 @@ mod tests {
         assert_eq!(rx.pop(&NoPreempt), None);
         assert!(q.is_empty() && !t.is_waiting());
         assert!(t.finish_wake(C0));
+        reg.finish();
     }
 
     #[test]
@@ -482,10 +538,10 @@ mod tests {
         let dead = task(1);
         let alive = task(2);
 
-        for t in [&dead, &alive] {
-            let ticket = q.prepare_wait(&CurrentTask::new(t, C0));
-            assert!(matches!(ticket.commit(), Commit::Parked(_)));
-        }
+        let regs: Vec<_> = [&dead, &alive]
+            .into_iter()
+            .map(|t| park(q.prepare_wait(&CurrentTask::new(t, C0))))
+            .collect();
         // The first waiter's deadline fired: its claim is already spent.
         assert_eq!(dead.claim_wake(), Claim::Parked(C0));
         assert_eq!(
@@ -494,6 +550,9 @@ mod tests {
             "the wake skips the corpse and reaches the live waiter",
         );
         assert_eq!(rx.pop(&NoPreempt), Some(Msg::Wake(TaskKey(2), WakeReason::Woken)));
+        for reg in regs {
+            reg.finish();
+        }
     }
 
     #[test]
@@ -502,10 +561,10 @@ mod tests {
         let (handles, mut rx) = cpus();
         let kicks = Kicks::default();
         let tasks: Vec<_> = (1..=3).map(task).collect();
-        for t in &tasks {
-            let ticket = q.prepare_wait(&CurrentTask::new(t, C0));
-            assert!(matches!(ticket.commit(), Commit::Parked(_)));
-        }
+        let regs: Vec<_> = tasks
+            .iter()
+            .map(|t| park(q.prepare_wait(&CurrentTask::new(t, C0))))
+            .collect();
 
         let cause = WakeCause::boosted(WakeReason::Woken, crate::hw::Nanos(1_000));
         assert_eq!(q.wake_all(cause, &handles, &kicks, &NoPreempt), 3);
@@ -515,20 +574,23 @@ mod tests {
         assert_eq!(rx.pop(&NoPreempt), None);
         assert_eq!(kicks.count(), 3, "boost wakes always kick");
         assert!(q.is_empty());
+        for reg in regs {
+            reg.finish();
+        }
     }
 
     #[test]
     fn the_timeout_path_dequeues_without_a_message() {
         let q = queue();
         let t = task(1);
-        let ticket = q.prepare_wait(&CurrentTask::new(&t, C0));
-        assert!(matches!(ticket.commit(), Commit::Parked(_)));
+        let reg = park(q.prepare_wait(&CurrentTask::new(&t, C0)));
 
         // Local fire: claim on the owning CPU, then leave the queue.
         assert_eq!(t.claim_wake(), Claim::Parked(C0));
         assert!(q.dequeue(&t));
         assert!(!q.dequeue(&t), "idempotent");
         assert!(q.is_empty() && !t.is_waiting());
+        reg.finish();
     }
 
     #[test]
@@ -537,8 +599,7 @@ mod tests {
         let kicks = Kicks::default();
         let q = queue();
         let t = task(9);
-        let ticket = q.prepare_wait(&CurrentTask::new(&t, C0));
-        assert!(matches!(ticket.commit(), Commit::Parked(_)));
+        let reg = park(q.prepare_wait(&CurrentTask::new(&t, C0)));
 
         assert!(wake_direct(
             &t,
@@ -555,7 +616,7 @@ mod tests {
             &kicks,
             &NoPreempt
         ));
-        q.dequeue(&t);
+        reg.finish();
     }
 
     #[test]
@@ -577,8 +638,7 @@ mod tests {
         let node: *const MailboxNode<Msg> = t.wake_node();
 
         for _ in 0..3 {
-            let ticket = q.prepare_wait(&CurrentTask::new(&t, C0));
-            assert!(matches!(ticket.commit(), Commit::Parked(_)));
+            let reg = park(q.prepare_wait(&CurrentTask::new(&t, C0)));
             assert_eq!(
                 q.wake_one(woken(WakeReason::Woken), &handles, &kicks, &NoPreempt),
                 1
@@ -588,6 +648,7 @@ mod tests {
             assert!(!t.wake_node().in_flight(), "released on consume");
             assert!(t.finish_wake(C0));
             assert!(t.transition(TaskState::Ready(C0), TaskState::Running(C0)));
+            reg.finish();
         }
         assert_eq!(node, t.wake_node() as *const _, "the node never moved");
     }

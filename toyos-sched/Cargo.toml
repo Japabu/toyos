@@ -14,6 +14,11 @@ std = []
 # Deep cross-container invariant asserts (spec invariants.rs). Off by default;
 # enabled by sim runs and kernel check builds.
 check = []
+# Compiles the escape hatch `old_steal_port` needs to re-create the OLD
+# scheduler's steal-in-transit algorithm (spec §10.3). The simulator enables
+# it; the kernel does not, so the old protocol is not reachable from
+# production code at all.
+protocol-port = []
 # Declared, never enabled here: the `toyos-sched-loom` package compiles these
 # same sources into its own crate with the feature on, so `src/sync.rs`
 # resolves to loom's instrumented atomics. Keeping it a feature of a separate

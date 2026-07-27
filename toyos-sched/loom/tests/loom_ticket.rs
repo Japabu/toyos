@@ -77,7 +77,7 @@ fn no_schedule_leaves_a_waiter_parked_with_the_condition_true() {
 
         // The waiter runs on CPU0 (this thread). Two iterations suffice: a
         // cancel can only be caused by the condition already being true.
-        let mut parked = false;
+        let mut parked = None;
         for _ in 0..2 {
             if ready.load(Ordering::Acquire) {
                 break;
@@ -93,8 +93,8 @@ fn no_schedule_leaves_a_waiter_parked_with_the_condition_true() {
                 }
             }
             match ticket.commit() {
-                Commit::Parked(_) => {
-                    parked = true;
+                Commit::Parked(_, registration) => {
+                    parked = Some(registration);
                     break;
                 }
                 Commit::AlreadyWoken => break,
@@ -104,7 +104,7 @@ fn no_schedule_leaves_a_waiter_parked_with_the_condition_true() {
         let woken = producer.join().unwrap();
         let msgs = drain(&mut rx, &world.preempt);
 
-        if parked {
+        if let Some(registration) = parked {
             assert_eq!(
                 waiter.state(),
                 TaskState::WakeQueued(CPU0),
@@ -115,6 +115,7 @@ fn no_schedule_leaves_a_waiter_parked_with_the_condition_true() {
                 [Msg::Wake(TaskKey(1), WakeReason::Woken)],
                 "the claim posts exactly one wake message",
             );
+            registration.finish();
         } else {
             assert!(
                 msgs.len() <= 1,
@@ -156,7 +157,8 @@ fn a_pre_park_claim_never_posts_a_message() {
         let msgs = drain(&mut rx, &world.preempt);
 
         match outcome {
-            Commit::Parked(_) => {
+            Commit::Parked(_, registration) => {
+                registration.finish();
                 // The waker either lost the race to us and posted a message
                 // (we were already Blocked), or found nothing.
                 assert_eq!(woken, msgs.len());
@@ -180,10 +182,16 @@ fn a_wake_racing_a_timeout_is_never_swallowed_by_the_corpse() {
         let (world, mut rx) = world();
         let first = task(1);
         let second = task(2);
-        for t in [&first, &second] {
-            let ticket = world.queue.prepare_wait(&CurrentTask::new(t, CPU0));
-            assert!(matches!(ticket.commit(), Commit::Parked(_)));
-        }
+        let registrations: Vec<_> = [&first, &second]
+            .into_iter()
+            .map(|t| {
+                let ticket = world.queue.prepare_wait(&CurrentTask::new(t, CPU0));
+                match ticket.commit() {
+                    Commit::Parked(_, registration) => registration,
+                    Commit::AlreadyWoken => panic!("nothing has woken these yet"),
+                }
+            })
+            .collect();
 
         let timeout = {
             let world = world.clone();
@@ -216,10 +224,13 @@ fn a_wake_racing_a_timeout_is_never_swallowed_by_the_corpse() {
              (timeout_won={timeout_won})",
         );
 
-        // Tidy up so the surviving registration does not outlive the model.
-        for t in [&first, &second] {
-            world.queue.dequeue(t);
+        // The registrations are what a blocking site holds across its block;
+        // finishing them is the cleanup that keeps a timed-out waiter from
+        // leaving a node behind.
+        for registration in registrations {
+            registration.finish();
         }
+        assert!(world.queue.is_empty(), "no registration is left behind");
         assert!(world.kicks.count() <= 1);
     });
 }

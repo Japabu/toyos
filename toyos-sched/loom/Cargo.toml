@@ -14,6 +14,14 @@ publish = false
 [features]
 default = ["loom"]
 loom = []
+# Deep cross-container invariant asserts. Mirrors `toyos-sched`'s feature so
+# the shared sources compile identically here; the loom models exercise the
+# primitives, not whole passes, so nothing enables it.
+check = []
+# Likewise the negative gate's escape hatch: declared so `cfg` checking knows
+# the name, never enabled — the loom models exercise the primitives, and the
+# old protocol is the simulator's business.
+protocol-port = []
 # Model the mandatory preempt-disabled push away (spec §7.2). The
 # `preempted_producer_strands_suffix` case must FAIL under this feature —
 # `loom/tests/loom_mailbox.rs` asserts exactly that.

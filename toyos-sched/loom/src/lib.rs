@@ -14,8 +14,10 @@
 //! 4) owns the protocol above them. Loom does not scale to the whole
 //! scheduler; the simulator does not model weak memory.
 //!
-//! Keep this module list identical to `../src/lib.rs`, minus `fair` (pure
-//! math, no atomics worth modelling beyond the frontier's `fetch_max`).
+//! Keep this module list identical to `../src/lib.rs`. `fair` is pure math
+//! with no atomics worth modelling beyond the frontier's `fetch_max`, but it
+//! is compiled all the same: `cpu.rs` calls it, and a divergent module list
+//! would mean loom checking a different crate than the one that ships.
 
 #![deny(unsafe_code)]
 
@@ -23,16 +25,26 @@ extern crate alloc;
 
 #[path = "../../src/cpu.rs"]
 pub mod cpu;
+#[path = "../../src/fair.rs"]
+pub mod fair;
 #[path = "../../src/hw.rs"]
 pub mod hw;
+#[path = "../../src/invariants.rs"]
+pub mod invariants;
 #[path = "../../src/mailbox.rs"]
 pub mod mailbox;
+#[path = "../../src/msg.rs"]
+pub mod msg;
+#[path = "../../src/queue.rs"]
+pub mod queue;
 #[path = "../../src/retire.rs"]
 pub mod retire;
 #[path = "../../src/sync.rs"]
 pub mod sync;
 #[path = "../../src/task.rs"]
 pub mod task;
+#[path = "../../src/timer.rs"]
+pub mod timer;
 #[path = "../../src/waitq.rs"]
 pub mod waitq;
 

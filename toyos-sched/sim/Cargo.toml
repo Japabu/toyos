@@ -5,5 +5,17 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-toyos-sched = { path = "..", features = ["std"] }
+# `check` turns on the core's own container/state-word cross-checks, and
+# `protocol-port` compiles the escape hatch the negative gate needs. Neither
+# is enabled by the kernel.
+toyos-sched = { path = "..", features = ["std", "check", "protocol-port"] }
 rand = { version = "0.9", features = ["small_rng"] }
+
+[lib]
+name = "toyos_sched_sim"
+path = "src/lib.rs"
+
+[[bin]]
+name = "toyos-sched-sim"
+path = "src/main.rs"
+
