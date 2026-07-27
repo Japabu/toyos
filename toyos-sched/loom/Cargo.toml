@@ -1,0 +1,31 @@
+[package]
+name = "toyos-sched-loom"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# This package exists only to run the loom model checker over the scheduler
+# primitives (spec §10.6). It compiles `../src/*.rs` into its own crate with
+# `feature = "loom"` on, so every atomic in those files becomes a
+# loom-instrumented one. Nothing depends on this package, so loom never
+# reaches `kernel/Cargo.lock`.
+
+[features]
+default = ["loom"]
+loom = []
+# Model the mandatory preempt-disabled push away (spec §7.2). The
+# `preempted_producer_strands_suffix` case must FAIL under this feature —
+# `loom/tests/loom_mailbox.rs` asserts exactly that.
+no-preempt-guard = []
+
+[dependencies]
+loom = "0.7"
+
+[lib]
+# The primitives are compiled into the lib; the models are the test targets.
+path = "src/lib.rs"
+# The shared sources' own `#[cfg(test)]` unit tests belong to `toyos-sched`
+# and run there, against real atomics. Loom atomics outside a `loom::model`
+# panic, so this crate exposes no unit tests of its own.
+test = false

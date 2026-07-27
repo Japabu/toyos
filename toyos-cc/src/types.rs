@@ -1,0 +1,339 @@
+use std::collections::HashMap;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Signedness {
+    Signed,
+    Unsigned,
+}
+
+impl Signedness {
+    pub fn is_unsigned(self) -> bool { self == Signedness::Unsigned }
+    pub fn is_signed(self) -> bool { self == Signedness::Signed }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum CType {
+    Void,
+    Bool,
+    Char(Signedness),
+    Short(Signedness),
+    Int(Signedness),
+    Long(Signedness),
+    LongLong(Signedness),
+    Int128(Signedness),
+    Float,
+    Double,
+    LongDouble,
+    Pointer(Box<CType>),
+    Array(Box<CType>, Option<usize>), // element type, optional size
+    Function(Box<CType>, Vec<ParamType>, bool, bool), // return type, params, variadic, unspecified_params
+    Struct(StructDef),
+    Union(StructDef),
+    Enum(EnumDef),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParamType {
+    pub name: Option<String>,
+    pub ty: CType,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct StructDef {
+    pub name: Option<String>,
+    pub fields: Vec<FieldDef>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FieldDef {
+    pub name: Option<String>,
+    pub ty: CType,
+    pub bit_width: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EnumDef {
+    pub name: Option<String>,
+    pub variants: Vec<(String, i64)>,
+}
+
+/// Result of looking up a field in a struct/union.
+/// Unifies the old `field_offset()` and `field_bit_width()` into a single lookup.
+#[derive(Debug, Clone)]
+pub struct FieldInfo {
+    pub byte_offset: usize,
+    pub bit_offset: u32,
+    pub bit_width: Option<u32>,
+    pub ty: CType,
+}
+
+impl CType {
+    pub fn size(&self) -> usize {
+        match self {
+            CType::Void => 0,
+            CType::Bool => 1,
+            CType::Char(_) => 1,
+            CType::Short(_) => 2,
+            CType::Int(_) | CType::Enum(_) | CType::Float => 4,
+            CType::Long(_) | CType::LongLong(_) | CType::Double | CType::Pointer(_) => 8,
+            CType::LongDouble => 16,
+            CType::Int128(_) => 16,
+            CType::Array(elem, Some(n)) => elem.size() * n,
+            CType::Array(_, None) => 8, // incomplete array = pointer-sized
+            CType::Function(..) => 8,   // function pointer
+            CType::Struct(def) => self.struct_size(def),
+            CType::Union(def) => self.union_size(def),
+        }
+    }
+
+    pub fn align(&self) -> usize {
+        match self {
+            CType::Void => 1,
+            CType::Bool | CType::Char(_) => 1,
+            CType::Short(_) => 2,
+            CType::Int(_) | CType::Enum(_) | CType::Float => 4,
+            CType::Long(_) | CType::LongLong(_) | CType::Double | CType::Pointer(_) => 8,
+            CType::LongDouble | CType::Int128(_) => 16,
+            CType::Array(elem, _) => elem.align(),
+            CType::Function(..) => 8,
+            CType::Struct(def) => def.fields.iter().map(|f| f.ty.align()).max().unwrap_or(1),
+            CType::Union(def) => def.fields.iter().map(|f| f.ty.align()).max().unwrap_or(1),
+        }
+    }
+
+    pub fn signedness(&self) -> Signedness {
+        use Signedness::*;
+        match self {
+            CType::Bool | CType::Pointer(_) => Unsigned,
+            CType::Enum(def) => if def.variants.iter().all(|(_, v)| *v >= 0) { Unsigned } else { Signed },
+            CType::Char(s) | CType::Short(s) | CType::Int(s)
+            | CType::Long(s) | CType::LongLong(s) | CType::Int128(s) => *s,
+            CType::Void | CType::Float | CType::Double | CType::LongDouble
+            | CType::Array(..) | CType::Function(..) | CType::Struct(_) | CType::Union(_) => Signed,
+        }
+    }
+
+    pub fn is_unsigned(&self) -> bool { self.signedness().is_unsigned() }
+
+    pub fn is_signed(&self) -> bool { self.signedness().is_signed() }
+
+    pub fn is_float(&self) -> bool {
+        matches!(self, CType::Float | CType::Double | CType::LongDouble)
+    }
+
+    pub fn is_pointer(&self) -> bool {
+        matches!(self, CType::Pointer(_))
+    }
+
+    pub fn is_aggregate(&self) -> bool {
+        matches!(self, CType::Struct(_) | CType::Union(_))
+    }
+
+    pub fn is_function(&self) -> bool {
+        matches!(self, CType::Function(..))
+    }
+
+    /// Walk the layout of a struct, tracking byte offsets and bitfield positions.
+    /// Calls `visitor` for each field with `(byte_offset, bit_offset_in_unit, &FieldDef)`.
+    /// If the visitor returns `Some(R)`, walking stops early and that value is returned.
+    fn walk_struct_layout<R>(
+        def: &StructDef,
+        mut visitor: impl FnMut(usize, u32, &FieldDef) -> Option<R>,
+    ) -> (usize, Option<R>) {
+        let mut offset = 0usize;
+        let mut bit_pos = 0u32;
+        let mut bit_unit_size = 0usize;
+        for field in &def.fields {
+            if let Some(bw) = field.bit_width {
+                let unit_size = field.ty.size();
+                let unit_bits = (unit_size * 8) as u32;
+                let align = field.ty.align();
+                if bw == 0 {
+                    if bit_unit_size > 0 {
+                        offset += bit_unit_size;
+                        bit_pos = 0;
+                        bit_unit_size = 0;
+                    }
+                    offset = (offset + align - 1) & !(align - 1);
+                } else if bit_unit_size == unit_size && bit_pos + bw <= unit_bits {
+                    let field_bit_off = bit_pos;
+                    bit_pos += bw;
+                    if let Some(r) = visitor(offset, field_bit_off, field) {
+                        return (offset, Some(r));
+                    }
+                } else {
+                    offset += bit_unit_size;
+                    offset = (offset + align - 1) & !(align - 1);
+                    bit_unit_size = unit_size;
+                    bit_pos = bw;
+                    if let Some(r) = visitor(offset, 0, field) {
+                        return (offset, Some(r));
+                    }
+                }
+                continue;
+            }
+            // Flush any pending bitfield storage unit
+            offset += bit_unit_size;
+            bit_pos = 0;
+            bit_unit_size = 0;
+            // Flexible array member (incomplete array at end of struct) has size 0
+            if matches!(&field.ty, CType::Array(_, None)) {
+                if let Some(r) = visitor(offset, 0, field) {
+                    return (offset, Some(r));
+                }
+                continue;
+            }
+            let align = field.ty.align();
+            offset = (offset + align - 1) & !(align - 1);
+            if let Some(r) = visitor(offset, 0, field) {
+                return (offset, Some(r));
+            }
+            offset += field.ty.size();
+        }
+        offset += bit_unit_size;
+        (offset, None)
+    }
+
+    fn struct_size(&self, def: &StructDef) -> usize {
+        let (offset, _) = Self::walk_struct_layout(def, |_, _, _| None::<()>);
+        let struct_align = self.align();
+        (offset + struct_align - 1) & !(struct_align - 1)
+    }
+
+    fn union_size(&self, def: &StructDef) -> usize {
+        let max_size = def.fields.iter().map(|f| f.ty.size()).max().unwrap_or(0);
+        let align = self.align();
+        (max_size + align - 1) & !(align - 1)
+    }
+
+    /// Look up a field by name in a struct/union.
+    /// Returns byte offset, bit offset within storage unit, bitfield width, and field type.
+    pub fn field_offset(&self, name: &str) -> Option<FieldInfo> {
+        let def = match self {
+            CType::Struct(def) => def,
+            CType::Union(_) => return self.union_field(name),
+            CType::Pointer(inner) => return inner.field_offset(name),
+            _ => panic!("field_offset called on non-struct/union type: {self:?}"),
+        };
+        let (_, result) = Self::walk_struct_layout(def, |byte_offset, bit_offset, field| {
+            if field.name.as_deref() == Some(name) {
+                return Some(FieldInfo {
+                    byte_offset,
+                    bit_offset,
+                    bit_width: field.bit_width,
+                    ty: field.ty.clone(),
+                });
+            }
+            // Anonymous struct/union — search inside
+            if field.name.is_none() && field.bit_width.is_none() {
+                if let Some(mut fi) = field.ty.field_offset(name) {
+                    fi.byte_offset += byte_offset;
+                    return Some(fi);
+                }
+            }
+            None
+        });
+        result
+    }
+
+    fn union_field(&self, name: &str) -> Option<FieldInfo> {
+        let def = match self {
+            CType::Union(def) => def,
+            _ => panic!("union_field called on non-union type: {self:?}"),
+        };
+        for field in &def.fields {
+            if field.name.as_deref() == Some(name) {
+                return Some(FieldInfo { byte_offset: 0, bit_offset: 0, bit_width: field.bit_width, ty: field.ty.clone() });
+            }
+            if field.name.is_none() {
+                if let Some(fi) = field.ty.field_offset(name) {
+                    return Some(fi);
+                }
+            }
+        }
+        None
+    }
+
+    /// Apply C integer promotion for a type, considering bitfield width if provided.
+    /// Per C99 6.3.1.1: if int can represent all values, promote to int; else unsigned int.
+    pub fn promote_integer(ty: CType, bit_width: Option<u32>) -> CType {
+        if let Some(w) = bit_width {
+            // Bitfield promotion: width determines result type
+            if w == 0 { return ty; }
+            if w < 32 { return CType::Int(Signedness::Signed); }  // fits in int
+            if w == 32 {
+                // signed int:32 fits in int; unsigned int:32 stays unsigned
+                return CType::Int(ty.signedness());
+            }
+            return ty; // > 32 bits: keep original type
+        }
+        // Non-bitfield integer promotion: small types promote to int
+        match ty {
+            CType::Char(_) | CType::Short(_) | CType::Bool => CType::Int(Signedness::Signed),
+            _ => ty,
+        }
+    }
+
+    /// Number of scalar initializer values consumed by flat/brace-elided initialization.
+    pub fn flat_init_count(&self) -> usize {
+        match self {
+            CType::Array(elem, Some(n)) => elem.flat_init_count() * n,
+            CType::Struct(def) => def.fields.iter().map(|f| f.ty.flat_init_count()).sum(),
+            CType::Union(def) => def.fields.first().map(|f| f.ty.flat_init_count()).unwrap_or(1),
+            _ => 1,
+        }
+    }
+
+    /// Integer promotion (C99 6.3.1.1)
+    pub fn promote(&self) -> CType {
+        match self {
+            CType::Bool | CType::Char(_) | CType::Short(_) => CType::Int(Signedness::Signed),
+            CType::Enum(_) => CType::Int(Signedness::Signed),
+            other => other.clone(),
+        }
+    }
+
+    /// Usual arithmetic conversions (C99 6.3.1.8)
+    pub fn common(a: &CType, b: &CType) -> CType {
+        let a = a.promote();
+        let b = b.promote();
+        if a == b { return a; }
+        if a.is_float() || b.is_float() {
+            match (&a, &b) {
+                (CType::LongDouble, _) | (_, CType::LongDouble) => return CType::LongDouble,
+                (CType::Double, _) | (_, CType::Double) => return CType::Double,
+                (CType::Float, _) | (_, CType::Float) => return CType::Float,
+                _ => {}
+            }
+        }
+        // Both integers
+        if a.size() > b.size() { a } else if b.size() > a.size() { b }
+        else if !a.is_signed() { a } else { b }
+    }
+}
+
+/// Tracks struct/union/enum tag definitions and typedefs
+pub struct TypeEnv {
+    pub typedefs: HashMap<String, CType>,
+    pub tags: HashMap<String, CType>,
+    pub enum_constants: HashMap<String, i64>,
+}
+
+impl TypeEnv {
+    pub fn new() -> Self {
+        let mut env = Self {
+            typedefs: HashMap::new(),
+            tags: HashMap::new(),
+            enum_constants: HashMap::new(),
+        };
+        // Compiler builtins — no header provides these
+        env.typedefs.insert("__builtin_va_list".into(), CType::Pointer(Box::new(CType::Void)));
+        env.typedefs.insert("__uint128_t".into(), CType::Int128(Signedness::Unsigned));
+        env
+    }
+
+    pub fn is_typedef(&self, name: &str) -> bool {
+        self.typedefs.contains_key(name)
+    }
+}
+

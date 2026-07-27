@@ -1,0 +1,151 @@
+# ToyOS fork manifest
+#
+# Every third-party crate ToyOS patches. Nothing is vendored: each fork is a
+# real repository with a `toyos` branch based on a pinned upstream commit, so
+# `git log <base>..toyos` is always the exact ToyOS delta — the artifact an
+# upstream PR is made of.
+#
+# Tiers:
+#   sibling  — upstream needs only a small cfg-gated dispatch arm; the real
+#              code lives in a ToyOS-owned crate. Target state for platform
+#              backends: the fork eventually disappears.
+#   fork     — the change is genuinely invasive and must live in the crate.
+#   toolchain— consumed by the rust/ submodule rather than userland.
+#
+# `base` is the upstream commit the branch is built on. Several are NOT release
+# tags: the vendored snapshots predated the tags they claimed, and using the tag
+# would have misattributed upstream churn to us. Each base was found by
+# minimising the diff and is recorded here so re-basing is reproducible.
+#
+# `pr` is the upstream pull request, or why there isn't one yet. Opening a PR
+# requires ToyOS's own crates (toyos-abi, toyos, window) to be published to
+# crates.io — a fork cannot reference them by path once cargo checks it out
+# alone. That is the single blocker for the entire upstreaming programme.
+
+[meta]
+owner = "Japabu"
+branch = "toyos"
+# Local dev: clone a fork next to the monorepo and add a path override in
+# .cargo/config.toml for the duration; the committed [patch] entries always
+# point at the git branches.
+
+[socket2]
+upstream = "rust-lang/socket2"
+base = "v0.6.3"
+delta = "+1303/-11"
+tier = "fork"
+why = "Full socket backend (src/sys/toyos.rs) over the ToyOS network syscalls."
+pr = "none — blocked on publishing toyos-abi/toyos"
+
+[mio]
+upstream = "tokio-rs/mio"
+base = "844cf25"
+base_note = "two commits past v1.2.0; the tag itself gives a polluted diff"
+delta = "+774/-30"
+tier = "fork"
+why = "io_uring-driven selector, pipe waker, ToyOS TCP types."
+pr = "none — blocked on publishing toyos-abi/toyos"
+
+[tokio]
+upstream = "tokio-rs/tokio"
+base = "d7db722b"
+base_note = "three commits past tokio-1.51.1"
+delta = "+119/-41"
+tier = "fork"
+why = "cfg-gated ToyOS arms in TcpSocket; unsupported APIs disabled."
+pr = "none — blocked on publishing toyos-abi/toyos"
+
+[russh]
+upstream = "Eugeny/russh"
+base = "v0.60.0"
+delta = "+703/-231"
+tier = "fork"
+why = "ToyOS bits are small; most of the delta is a pure-Rust `rustcrypto` cipher backend."
+pr = "none — the rustcrypto backend is independently upstreamable TODAY (no ToyOS dependency); split it out and send it"
+
+[cpal]
+upstream = "RustAudio/cpal"
+base = "b4ddd28"
+delta = "+327"
+tier = "sibling"
+why = "Pure addition: a ToyOS host backend. Should become a `cpal-toyos` crate."
+pr = "none — blocked on publishing"
+
+[winit]
+upstream = "rust-windowing/winit"
+base = "c4afadbf"
+delta = "+1234"
+tier = "sibling"
+why = "Adds the winit-toyos sibling crate — the model case for this tier."
+pr = "none — winit-toyos must be published before upstream can depend on it by version"
+followup = "winit-toyos is ToyOS's own code still living inside the fork; move it to the monorepo once published"
+
+[softbuffer]
+upstream = "rust-windowing/softbuffer"
+base = "f0d20b9"
+delta = "+155/-5"
+tier = "sibling"
+why = "ToyOS surface backend. The -5 lines track unreleased raw-window-handle renames, not ToyOS work."
+pr = "none — blocked on publishing window"
+
+[raw-window-handle]
+upstream = "rust-windowing/raw-window-handle"
+base = "1b85948"
+delta = "+69"
+tier = "sibling"
+why = "Pure addition: a ToyOS handle variant."
+pr = "none — smallest, cleanest candidate; send this one first"
+
+[getrandom]
+upstream = "rust-random/getrandom"
+base = "v0.2.17 / v0.3.4 / v0.4.2"
+branches = ["toyos-0.2", "toyos-0.3", "toyos-0.4"]
+delta = "+14 / +19 / +19"
+tier = "fork"
+why = "Three major versions are live in the dependency graph simultaneously."
+pr = "none — trivial delta, good early candidate once toyos-abi is published"
+
+[libloading]
+upstream = "nagisa/rust_libloading"
+base = "35b6a30"
+base_note = "0.9.0 plus two upstream commits; Cargo.toml version is relabelled 0.8.9 to satisfy a rustc pin"
+delta = "+345/-4"
+tier = "toolchain"
+why = "dlopen/dlsym over ToyOS."
+pr = "none — blocked on publishing toyos-abi"
+
+[memmap2]
+upstream = "RazrFalcon/memmap2-rs"
+base = "v0.9.10"
+base_note = "Cargo.toml version is relabelled 0.2.1 to satisfy rustc_data_structures' pin"
+delta = "+139/-35"
+tier = "toolchain"
+why = "ToyOS mapping emulation in its own cfg-gated module."
+pr = "ready to draft — the cross-platform stub.rs hijack was reverted, so the delta is now purely additive"
+
+[stacker]
+upstream = "rust-lang/stacker"
+base = "93c7abc"
+base_note = "0.1.23 was released without a tag"
+delta = "+90/-48"
+tier = "toolchain"
+pr = "none — blocked on publishing toyos-abi"
+
+[ctrlc]
+upstream = "Detegr/rust-ctrlc"
+base = "3.5.2"
+base_note = "vendored Cargo.toml claimed 3.5.1; the code is 3.5.2. The version string should be restored."
+delta = "+45/-57"
+tier = "toolchain"
+pr = "none"
+
+[target-lexicon]
+upstream = "bytecodealliance/target-lexicon"
+base = "v0.13.5"
+delta = "+9/-22"
+tier = "fork"
+why = "Adds the toyos target triple. Nine lines."
+pr = "none — no ToyOS crate dependency, so this can be sent TODAY. Do it first."
+
+# Not a crate fork: rust/ is a submodule of Japabu/rust (compiler + std with
+# ToyOS as a target). Its own upstream sync is tracked separately.

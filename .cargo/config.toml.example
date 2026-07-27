@@ -1,0 +1,16 @@
+# Local fork development — copy to .cargo/config.toml (gitignored).
+#
+# Committed builds fetch every fork from GitHub, so a fresh clone works with
+# no setup. When you need to *edit* a fork, clone it next to the monorepo and
+# list it here; cargo then uses your working copy instead of the git branch.
+#
+#   git clone https://github.com/Japabu/cpal ../forks/cpal
+#   cd ../forks/cpal && git checkout toyos
+#
+# Delete the entry (or the file) to go back to the pushed branch.
+
+paths = [
+    # "../forks/cpal",
+    # "../forks/socket2",
+    # "../forks/winit",
+]

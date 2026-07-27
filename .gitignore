@@ -1,0 +1,8 @@
+target/
+.claude/
+assets/timgm6mb.sf2
+.vscode/
+.mcp.json
+.DS_Store
+phosphor-icons
+.cargo/config.toml

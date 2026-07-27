@@ -1,0 +1,347 @@
+//! Fairness policy: per-process vruntime/lag/frontier math, relocated
+//! verbatim from `kernel/src/scheduler.rs` at migration Stage 1 (spec §9.1)
+//! so the simulator exercises the exact production arithmetic. The stored-lag
+//! semantics (kernel commits `138a625d`, `c9205ce2`, `b71d0d07`) are
+//! preserved bit-identically through the machinery cutover so regressions
+//! stay attributable; policy upgrades are separate, sim-gated stages.
+//!
+//! The kernel still owns the Pid-keyed map and its lock; each map value is a
+//! [`ShareState`]. The per-task `FairShare { state: SpinSmall<ShareState> }`
+//! wrapper of spec §9.1 arrives when tasks carry their share directly
+//! (Stages 4/7) — introducing per-share locks at Stage 1 would change lock
+//! granularity, which the policy-identical requirement forbids.
+
+use core::num::NonZeroU32;
+use core::sync::atomic::{AtomicU64, Ordering};
+
+/// Clamp for stored lag at the Runnable→NonRunnable transition: how far
+/// behind (entitled catch-up) or ahead (throttled on wake) of the frontier a
+/// process may be remembered as. 50ms.
+pub const MAX_VRUNTIME_LAG_NS: u64 = 50_000_000;
+
+/// Preemption quantum. 10ms.
+pub const QUANTUM_NS: u64 = 10_000_000;
+
+/// The requested operation needs the `Runnable` arm. A marker, not a
+/// recoverable error: callers panic with their own context (the kernel adds
+/// the pid) — charging or yield-reading a NonRunnable share is a
+/// bookkeeping bug.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct NotRunnable;
+
+/// The global vruntime frontier: a monotonic-non-decreasing baseline from
+/// which non-runnable processes' lag is measured (see
+/// [`ShareState::NonRunnable`]).
+///
+/// Kept global through the cutover for attributability; replaced by a
+/// per-CPU frontier with epoch reconciliation in a scheduled, sim-gated
+/// stage (spec §11 Stage 9).
+pub struct Frontier(AtomicU64);
+
+impl Frontier {
+    pub const fn new() -> Self {
+        Self(AtomicU64::new(0))
+    }
+
+    /// Advance the frontier to at least `vrt`, at dispatch. `fetch_max` is
+    /// the only correct semantic on SMP: a plain `store(vrt)` lets a CPU
+    /// picking a low-vrt task regress the frontier another CPU has already
+    /// advanced, and lets RT picks (vrt=0) reset it to zero on every
+    /// preemption.
+    pub fn advance(&self, vrt: u64) {
+        self.0.fetch_max(vrt, Ordering::Relaxed);
+    }
+
+    pub fn get(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
+/// Per-process fair-share state.
+///
+/// Encodes the runnable/non-runnable split in the type system:
+/// - `Runnable` means at least one thread of this process is in a CPU run
+///   queue (ready or current). The stored `vruntime` is live and accurate;
+///   it is read directly and [`ShareState::charge`] increments it.
+///   `runnable_threads: NonZeroU32` is a refcount of threads contributing
+///   to runnability — the type forbids representing "Runnable with 0
+///   threads", a state that would mean the leave→NonRunnable transition was
+///   botched.
+///   `lag_at_wake` is the clamped lag (±[`MAX_VRUNTIME_LAG_NS`]) frozen at
+///   the most recent NonRunnable→Runnable transition (0 for newly-spawned
+///   processes that have never blocked). It is the *contract value* of
+///   lag — the scheduler guarantees |lag_at_wake| ≤ MAX_VRUNTIME_LAG_NS by
+///   construction. Live `frontier - vruntime` may exceed that bound between
+///   a wake and the actual pick, but that is a diagnostic, not a contract.
+/// - `NonRunnable` means no thread is in any run queue. We do not store a
+///   stale vruntime — instead we store `lag = frontier - vruntime` from the
+///   moment of transition, clamped to ±MAX_VRUNTIME_LAG_NS. The current
+///   "effective vruntime" is computed live as `current_frontier - lag`, so
+///   the process tracks the global frontier without stored-state writes.
+///
+/// External readers ([`ShareState::vruntime`], [`ShareState::lag`], debug
+/// dumps) compute live values from this enum — there is no separate "truth
+/// function" that mutates state behind their back.
+pub enum ShareState {
+    Runnable {
+        vruntime: u64,
+        runnable_threads: NonZeroU32,
+        /// Clamped lag at the most recent NonRunnable→Runnable transition
+        /// (0 for processes that have never blocked since spawn). Frozen
+        /// while the process stays Runnable; refreshed only on the next
+        /// wake. This is the value reported by [`ShareState::lag`] —
+        /// bounded ±MAX_VRUNTIME_LAG_NS by the transition contract.
+        lag_at_wake: i64,
+    },
+    NonRunnable {
+        /// `lag = frontier - vruntime` at the moment of last transition,
+        /// clamped to [-MAX_VRUNTIME_LAG_NS, +MAX_VRUNTIME_LAG_NS].
+        /// Positive = process is behind the frontier (entitled to catch
+        /// up). Negative = process ran ahead (will be throttled on wake).
+        lag: i64,
+    },
+}
+
+impl ShareState {
+    /// First runnable thread of a never-scheduled process: starts at the
+    /// current frontier with `lag_at_wake = 0`, so its insert vruntime is
+    /// `frontier` itself.
+    pub fn new_runnable(frontier: u64) -> Self {
+        Self::Runnable {
+            vruntime: frontier,
+            runnable_threads: NonZeroU32::MIN,
+            lag_at_wake: 0,
+        }
+    }
+
+    /// A thread of this process is becoming runnable. Returns the vruntime
+    /// to insert with.
+    /// - First runnable thread of a NonRunnable process: re-derive vrt from
+    ///   stored lag and transition to Runnable with refcount 1, freezing
+    ///   that same lag in `lag_at_wake`.
+    /// - Subsequent runnable thread of an already-Runnable process: bump
+    ///   refcount, return the existing vrt (all threads of one process
+    ///   share vrt). `lag_at_wake` stays frozen at the value set on the
+    ///   most recent NonRunnable→Runnable edge.
+    pub fn enter_runnable(&mut self, frontier: u64) -> u64 {
+        match self {
+            Self::Runnable {
+                vruntime,
+                runnable_threads,
+                ..
+            } => {
+                *runnable_threads = runnable_threads
+                    .checked_add(1)
+                    .expect("runnable_threads overflow");
+                *vruntime
+            }
+            Self::NonRunnable { lag } => {
+                let lag = *lag;
+                let vrt = vrt_from_lag(frontier, lag);
+                *self = Self::Runnable {
+                    vruntime: vrt,
+                    runnable_threads: NonZeroU32::MIN,
+                    lag_at_wake: lag,
+                };
+                vrt
+            }
+        }
+    }
+
+    /// A thread of this process is no longer runnable (blocked, exited,
+    /// killed). Decrements the refcount; on the last runnable thread,
+    /// stores clamped lag and transitions to NonRunnable.
+    ///
+    /// No-op if already NonRunnable — covers removal of a thread that is
+    /// already blocked (its refcount was decremented when it blocked).
+    pub fn leave_runnable(&mut self, frontier: u64) {
+        if let Self::Runnable {
+            vruntime,
+            runnable_threads,
+            ..
+        } = self
+        {
+            if let Some(n) = NonZeroU32::new(runnable_threads.get() - 1) {
+                *runnable_threads = n;
+            } else {
+                let lag = live_lag(frontier, *vruntime)
+                    .clamp(-(MAX_VRUNTIME_LAG_NS as i64), MAX_VRUNTIME_LAG_NS as i64);
+                *self = Self::NonRunnable { lag };
+            }
+        }
+    }
+
+    /// Charge `ns` of consumed CPU time to the share's vruntime.
+    /// `Err(NotRunnable)`: the caller charged a process with no runnable
+    /// threads — a bookkeeping bug it must report loudly.
+    pub fn charge(&mut self, ns: u64) -> Result<(), NotRunnable> {
+        match self {
+            Self::Runnable { vruntime, .. } => {
+                *vruntime = vruntime.saturating_add(ns);
+                Ok(())
+            }
+            Self::NonRunnable { .. } => Err(NotRunnable),
+        }
+    }
+
+    /// The stored Runnable vruntime, for the yield re-insert path where the
+    /// thread stays runnable. `Err(NotRunnable)` means a yielding thread was
+    /// wrongly counted out — the caller panics with its context.
+    pub fn runnable_vruntime(&self) -> Result<u64, NotRunnable> {
+        match self {
+            Self::Runnable { vruntime, .. } => Ok(*vruntime),
+            Self::NonRunnable { .. } => Err(NotRunnable),
+        }
+    }
+
+    /// Live vruntime for external readers: the stored value while Runnable,
+    /// `current_frontier - lag` while NonRunnable (computed each call, so
+    /// readers always see a value tracking the frontier without stored-state
+    /// writes).
+    pub fn vruntime(&self, frontier: u64) -> u64 {
+        match self {
+            Self::Runnable { vruntime, .. } => *vruntime,
+            Self::NonRunnable { lag } => vrt_from_lag(frontier, *lag),
+        }
+    }
+
+    /// Contract lag: the clamped lag established at the most recent
+    /// transition in either direction. Bounded ±MAX_VRUNTIME_LAG_NS by
+    /// construction — NOT the live `frontier - vruntime` drift, which can
+    /// exceed the bound during the wake-to-pick gap on multi-CPU systems.
+    pub fn lag(&self) -> i64 {
+        match self {
+            Self::Runnable { lag_at_wake, .. } => *lag_at_wake,
+            Self::NonRunnable { lag } => *lag,
+        }
+    }
+}
+
+/// Lag of a Runnable process: `lag = frontier - vruntime`, unclamped. Used
+/// at the leave-runnable transition, which clamps before storing. Wrapping
+/// subtraction is deliberate: vruntimes are dense in u64 and `frontier -
+/// vrt` is the signed distance regardless of whether the frontier has
+/// wrapped past vrt.
+fn live_lag(frontier: u64, vrt: u64) -> i64 {
+    (frontier as i64).wrapping_sub(vrt as i64)
+}
+
+/// Convert a stored lag back to a vruntime relative to the *current*
+/// frontier: `vrt = frontier - lag`, saturating at u64 bounds. This is how
+/// a non-runnable process re-derives its vruntime when it wakes.
+fn vrt_from_lag(frontier: u64, lag: i64) -> u64 {
+    if lag >= 0 {
+        frontier.saturating_sub(lag as u64)
+    } else {
+        frontier.saturating_add((-lag) as u64)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CLAMP: i64 = MAX_VRUNTIME_LAG_NS as i64;
+
+    fn runnable_count(s: &ShareState) -> u32 {
+        match s {
+            ShareState::Runnable {
+                runnable_threads, ..
+            } => runnable_threads.get(),
+            ShareState::NonRunnable { .. } => 0,
+        }
+    }
+
+    #[test]
+    fn new_process_starts_at_frontier_with_zero_lag() {
+        let s = ShareState::new_runnable(1_000);
+        assert_eq!(s.vruntime(1_000), 1_000);
+        assert_eq!(s.lag(), 0);
+        assert_eq!(runnable_count(&s), 1);
+    }
+
+    #[test]
+    fn refcount_tracks_runnable_threads() {
+        let mut s = ShareState::new_runnable(0);
+        assert_eq!(s.enter_runnable(0), 0);
+        assert_eq!(runnable_count(&s), 2);
+        s.leave_runnable(0);
+        assert_eq!(runnable_count(&s), 1);
+        assert!(s.runnable_vruntime().is_ok());
+        s.leave_runnable(0);
+        assert_eq!(runnable_count(&s), 0);
+        assert_eq!(s.runnable_vruntime(), Err(NotRunnable));
+    }
+
+    #[test]
+    fn charge_accumulates_and_saturates() {
+        let mut s = ShareState::new_runnable(10);
+        s.charge(5).unwrap();
+        assert_eq!(s.runnable_vruntime(), Ok(15));
+        s.charge(u64::MAX).unwrap();
+        assert_eq!(s.runnable_vruntime(), Ok(u64::MAX));
+    }
+
+    #[test]
+    fn charge_nonrunnable_is_a_bug() {
+        let mut s = ShareState::new_runnable(0);
+        s.leave_runnable(0);
+        assert_eq!(s.charge(1), Err(NotRunnable));
+    }
+
+    #[test]
+    fn leave_stores_lag_and_wake_rederives_vruntime() {
+        // Ran 10ms ahead of the frontier, then blocked: lag = -10ms.
+        let mut s = ShareState::new_runnable(0);
+        s.charge(10_000_000).unwrap();
+        s.leave_runnable(0);
+        assert_eq!(s.lag(), -10_000_000);
+        // Frontier advanced to 50ms while blocked: wake resumes 10ms ahead
+        // of the *current* frontier and freezes the lag as the contract.
+        let vrt = s.enter_runnable(50_000_000);
+        assert_eq!(vrt, 60_000_000);
+        assert_eq!(s.lag(), -10_000_000);
+    }
+
+    #[test]
+    fn lag_clamps_in_both_directions() {
+        // Far behind the frontier: entitled catch-up clamps to +50ms.
+        let mut s = ShareState::new_runnable(0);
+        s.leave_runnable(10 * MAX_VRUNTIME_LAG_NS);
+        assert_eq!(s.lag(), CLAMP);
+        // Far ahead of the frontier: throttle clamps to -50ms.
+        let mut s = ShareState::new_runnable(0);
+        s.charge(10 * MAX_VRUNTIME_LAG_NS).unwrap();
+        s.leave_runnable(0);
+        assert_eq!(s.lag(), -CLAMP);
+    }
+
+    #[test]
+    fn nonrunnable_vruntime_tracks_the_live_frontier() {
+        let mut s = ShareState::new_runnable(1_000);
+        s.leave_runnable(2_000); // lag = +1000
+        assert_eq!(s.vruntime(2_000), 1_000);
+        assert_eq!(s.vruntime(10_000), 9_000);
+        // Saturates instead of wrapping below zero.
+        assert_eq!(s.vruntime(500), 0);
+    }
+
+    #[test]
+    fn leave_when_nonrunnable_is_a_noop() {
+        let mut s = ShareState::new_runnable(0);
+        s.leave_runnable(1_000);
+        let lag = s.lag();
+        s.leave_runnable(9_999_999);
+        assert_eq!(s.lag(), lag);
+    }
+
+    #[test]
+    fn frontier_is_monotonic() {
+        let f = Frontier::new();
+        f.advance(10);
+        f.advance(5);
+        assert_eq!(f.get(), 10);
+        f.advance(11);
+        assert_eq!(f.get(), 11);
+    }
+}

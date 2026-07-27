@@ -1,0 +1,75 @@
+[workspace]
+resolver = "2"
+members = [
+    "compositor",
+    "doom",
+    "editor",
+    "filepicker",
+    "filepicker-api",
+    "files",
+    "font",
+    "input-test",
+    "netd",
+    "paint",
+    "proctest",
+    "shell",
+    "snake",
+    "soundd",
+    "sprite",
+    "sshd",
+    "terminal",
+    "test-runner",
+    "toybox",
+    "window",
+]
+exclude = [
+    # no_std C runtime — uses panic=abort (own Cargo.toml profile)
+    "libc",
+    # Host-only tool with its own patches
+    "bootstrap-cc",
+]
+
+[patch.crates-io]
+# ToyOS's own crates: the forks below depend on these by version so they can be
+# consumed as git dependencies (a path escaping the fork's own repo cannot
+# resolve once cargo checks it out alone). These redirects keep local builds
+# on the working tree. Publishing them to crates.io is only needed for real
+# upstream PRs, not for building here.
+toyos-abi = { path = "../toyos-abi" }
+toyos = { path = "../toyos" }
+window = { path = "window" }
+
+# Ecosystem forks — see forks.toml for upstream base, tier, and PR status.
+getrandom = { git = "https://github.com/Japabu/getrandom", branch = "toyos-0.2", package = "getrandom" }
+getrandom_03 = { git = "https://github.com/Japabu/getrandom", branch = "toyos-0.3", package = "getrandom" }
+getrandom_04 = { git = "https://github.com/Japabu/getrandom", branch = "toyos-0.4", package = "getrandom" }
+mio = { git = "https://github.com/Japabu/mio", branch = "toyos" }
+tokio = { git = "https://github.com/Japabu/tokio", branch = "toyos" }
+russh = { git = "https://github.com/Japabu/russh", branch = "toyos" }
+russh-cryptovec = { git = "https://github.com/Japabu/russh", branch = "toyos" }
+socket2 = { git = "https://github.com/Japabu/socket2", branch = "toyos" }
+raw-window-handle = { git = "https://github.com/Japabu/raw-window-handle", branch = "toyos" }
+cpal = { git = "https://github.com/Japabu/cpal", branch = "toyos" }
+softbuffer = { git = "https://github.com/Japabu/softbuffer", branch = "toyos" }
+winit = { git = "https://github.com/Japabu/winit", branch = "toyos" }
+libloading = { git = "https://github.com/Japabu/rust_libloading", branch = "toyos" }
+memmap2 = { git = "https://github.com/Japabu/memmap2-rs", branch = "toyos" }
+stacker = { git = "https://github.com/Japabu/stacker", branch = "toyos" }
+ctrlc = { git = "https://github.com/Japabu/rust-ctrlc", branch = "toyos" }
+target-lexicon = { git = "https://github.com/Japabu/target-lexicon", branch = "toyos" }
+
+
+# Dependencies are compiled once and cached, so optimizing them costs nothing
+# in iteration speed — and unoptimized DSP/render crates are unusably slow
+# under TCG (measured: rustysynth at opt-level 0 renders music at 2-4x slower
+# than real time on one emulated core; optimized it fits comfortably).
+# Workspace members stay at the dev default for fast rebuilds, except the two
+# compute-heavy apps below.
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.dev.package.doom]
+opt-level = 2
+
+[profile.dev.package.compositor]
+opt-level = 2

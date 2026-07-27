@@ -1,0 +1,9 @@
+[package]
+name = "sshd"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+rand = "0.10"
+russh = { version = "0.60", default-features = false, features = ["rustcrypto", "flate2", "rsa"] }
+tokio = { version = "1", features = ["rt", "net", "macros", "io-util", "sync", "time"] }

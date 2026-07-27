@@ -1,0 +1,18 @@
+[package]
+name = "toyos-rust-tests"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+toyos-abi = { path = "../../toyos-abi" }
+toyos = { path = "../../toyos" }
+libloading = { git = "https://github.com/Japabu/rust_libloading", branch = "toyos" }
+cpal = { git = "https://github.com/Japabu/cpal", branch = "toyos" }
+
+# Separate workspace from userland/, so it needs its own redirects: the forks
+# above depend on ToyOS crates by version, and only a patch maps those to the
+# working tree.
+[patch.crates-io]
+toyos-abi = { path = "../../toyos-abi" }
+toyos = { path = "../../toyos" }

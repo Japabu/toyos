@@ -1,0 +1,11 @@
+[package]
+name = "toybox"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+cpal = "0.18"
+window = { path = "../window" }
+toyos-abi = { path = "../../toyos-abi" }
+toyos = { path = "../../toyos" }

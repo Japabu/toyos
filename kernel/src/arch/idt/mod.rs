@@ -1,0 +1,341 @@
+pub(crate) mod exceptions;
+mod msix;
+mod timer;
+mod tlb;
+mod virtio_net;
+mod virtio_sound;
+mod xhci;
+
+use core::arch::naked_asm;
+
+use super::cpu;
+use super::cpu::{outb, io_wait};
+use crate::sync::Lock;
+
+// PIC ports
+const PIC1_CMD: u16 = 0x20;
+const PIC1_DATA: u16 = 0x21;
+const PIC2_CMD: u16 = 0xA0;
+const PIC2_DATA: u16 = 0xA1;
+
+/// IDT vector assignments — CPU exceptions and hardware interrupts.
+#[repr(usize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Vector {
+    Debug = 0x01,
+    InvalidOpcode = 0x06,
+    DoubleFault = 0x08,
+    GeneralProtection = 0x0D,
+    PageFault = 0x0E,
+    Timer = 0x20,
+    Xhci = 0x21,
+    VirtioNet = 0x22,
+    VirtioSound = 0x23,
+    HaltAll = 0xFD,
+    TlbFlush = 0xFE,
+}
+
+impl Vector {
+    fn from_raw(v: u64) -> Self {
+        match v {
+            0x01 => Self::Debug,
+            0x06 => Self::InvalidOpcode,
+            0x08 => Self::DoubleFault,
+            0x0D => Self::GeneralProtection,
+            0x0E => Self::PageFault,
+            _ => panic!("unhandled exception vector {:#x}", v),
+        }
+    }
+}
+
+// Page fault error code bits
+const PF_PRESENT: u64 = 1 << 0;
+const PF_WRITE: u64 = 1 << 1;
+const PF_INSTRUCTION_FETCH: u64 = 1 << 4;
+
+// CS ring mask
+const RPL_MASK: u64 = 3;
+
+// IDT entry (16 bytes in 64-bit mode)
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct IdtEntry {
+    offset_low: u16,
+    selector: u16,
+    ist: u8,
+    type_attr: u8,
+    offset_mid: u16,
+    offset_high: u32,
+    reserved: u32,
+}
+
+impl IdtEntry {
+    const EMPTY: Self = Self {
+        offset_low: 0,
+        selector: 0,
+        ist: 0,
+        type_attr: 0,
+        offset_mid: 0,
+        offset_high: 0,
+        reserved: 0,
+    };
+
+    fn new(handler: u64) -> Self {
+        Self {
+            offset_low: handler as u16,
+            selector: 0x08, // kernel CS
+            ist: 0,
+            type_attr: 0x8E, // interrupt gate, DPL=0, present
+            offset_mid: (handler >> 16) as u16,
+            offset_high: (handler >> 32) as u32,
+            reserved: 0,
+        }
+    }
+
+    fn with_ist(mut self, ist_index: u8) -> Self {
+        self.ist = ist_index;
+        self
+    }
+}
+
+#[repr(C, align(16))]
+struct Idt {
+    entries: [IdtEntry; 256],
+}
+
+static IDT: Lock<Idt> = Lock::new(Idt {
+    entries: [IdtEntry::EMPTY; 256],
+});
+
+#[repr(C, packed)]
+struct IdtPointer {
+    limit: u16,
+    base: u64,
+}
+
+// ============================================================
+// Unified trap frame — contiguous struct for all exception state
+// ============================================================
+
+/// Complete CPU state at exception entry. Pushed by stub + common_entry + CPU.
+/// Layout (lowest address = first field):
+///   [GPRs: 15×8=120]  [vector: 8]  [error_code: 8]  [rip cs rflags rsp ss: 5×8=40]
+#[repr(C)]
+pub struct TrapFrame {
+    // GPRs pushed by common_entry (lowest address first)
+    pub rax: u64,
+    pub rbx: u64,
+    pub rcx: u64,
+    pub rdx: u64,
+    pub rsi: u64,
+    pub rdi: u64,
+    pub rbp: u64,
+    pub r8: u64,
+    pub r9: u64,
+    pub r10: u64,
+    pub r11: u64,
+    pub r12: u64,
+    pub r13: u64,
+    pub r14: u64,
+    pub r15: u64,
+    // Pushed by stub
+    pub vector: u64,
+    // Pushed by CPU (or dummy 0 by stub for exceptions without error code)
+    pub error_code: u64,
+    // CPU interrupt frame
+    pub rip: u64,
+    pub cs: u64,
+    pub rflags: u64,
+    pub rsp: u64,
+    pub ss: u64,
+}
+
+// ============================================================
+// Exception entry stubs — tiny per-vector, jump to common_entry
+// ============================================================
+
+/// #DB — no CPU error code. Push dummy error code + vector, jump to common.
+#[unsafe(naked)]
+extern "sysv64" fn stub_db() {
+    naked_asm!("push 0", "push 1", "jmp {common}", common = sym common_entry);
+}
+
+/// #UD — no CPU error code.
+#[unsafe(naked)]
+extern "sysv64" fn stub_ud() {
+    naked_asm!("push 0", "push 6", "jmp {common}", common = sym common_entry);
+}
+
+/// #DF — CPU pushes error code (always 0). Push vector.
+#[unsafe(naked)]
+extern "sysv64" fn stub_df() {
+    naked_asm!("push 8", "jmp {common}", common = sym common_entry);
+}
+
+/// #GP — CPU pushes error code. Push vector.
+#[unsafe(naked)]
+extern "sysv64" fn stub_gpf() {
+    naked_asm!("push 13", "jmp {common}", common = sym common_entry);
+}
+
+/// #PF — CPU pushes error code. Push vector.
+#[unsafe(naked)]
+extern "sysv64" fn stub_pf() {
+    naked_asm!("push 14", "jmp {common}", common = sym common_entry);
+}
+
+/// Halt IPI — received when another CPU calls halt_all_cpus(). Never returns.
+#[unsafe(naked)]
+extern "sysv64" fn stub_halt_all() {
+    naked_asm!("cli", "2: hlt", "jmp 2b");
+}
+
+#[unsafe(naked)]
+extern "sysv64" fn common_entry() {
+    naked_asm!(
+        "push r15", "push r14", "push r13", "push r12",
+        "push r11", "push r10", "push r9",  "push r8",
+        "push rbp", "push rdi", "push rsi", "push rdx",
+        "push rcx", "push rbx", "push rax",
+        "lock add dword ptr gs:[240], 1",
+        // 15 pushes from rsp=8(mod 16) leaves rsp=0(mod 16): no extra align.
+        "mov rdi, rsp",
+        "call {dispatch}",
+        "lock sub dword ptr gs:[240], 1",
+        // Run exit-to-user epilogue before restoring GPRs — the call clobbers
+        // scratch regs, which would otherwise leak kernel state into user.
+        "test dword ptr [rsp + 144], 3",
+        "jz 9f",
+        "cli",
+        "call {exit_to_user}",
+        "9:",
+        "pop rax",  "pop rbx",  "pop rcx",  "pop rdx",
+        "pop rsi",  "pop rdi",  "pop rbp",
+        "pop r8",   "pop r9",   "pop r10",  "pop r11",
+        "pop r12",  "pop r13",  "pop r14",  "pop r15",
+        "add rsp, 16",
+        "iretq",
+        dispatch = sym trap_dispatch,
+        exit_to_user = sym kernel_exit_to_user_check,
+    );
+}
+
+/// Deferred-preempt epilogue. Caller must have IF=0 on entry; returns IF=0.
+/// Briefly enables interrupts only inside the yield, so the final
+/// iretq/sysretq stays race-free without each caller juggling IF itself.
+///
+/// `do_preempt` owns the `need_resched` clear (see its doc) — clearing here
+/// would silently drop requests its re-entry guard defers. A request that
+/// survives `do_preempt` on this path means the IN_SCHEDULE guard leaked;
+/// spinning on it would hang the CPU silently, so die loudly instead.
+pub(crate) extern "sysv64" fn kernel_exit_to_user_check() {
+    flush_ring0_timer_fires_to_trace();
+    while crate::preempt::need_resched() {
+        assert!(!crate::scheduler::in_schedule_self(),
+            "exit-to-user with IN_SCHEDULE set");
+        unsafe { core::arch::asm!("sti", options(nomem, nostack)); }
+        crate::scheduler::do_preempt();
+        unsafe { core::arch::asm!("cli", options(nomem, nostack)); }
+        flush_ring0_timer_fires_to_trace();
+    }
+}
+
+fn flush_ring0_timer_fires_to_trace() {
+    let cur: u32;
+    let last: u32;
+    unsafe {
+        core::arch::asm!(
+            "mov {cur:e}, gs:[248]",
+            "mov {last:e}, gs:[252]",
+            cur = out(reg) cur,
+            last = out(reg) last,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    let missed = cur.wrapping_sub(last);
+    if missed > 0 {
+        crate::trace::trace(crate::trace::TraceKind::TimerFireBurst, missed);
+        unsafe {
+            core::arch::asm!(
+                "mov gs:[252], {cur:e}",
+                cur = in(reg) cur,
+                options(nomem, nostack, preserves_flags),
+            );
+        }
+    }
+}
+
+/// Rust exception dispatcher — routes by vector to the appropriate handler.
+extern "sysv64" fn trap_dispatch(frame: *mut TrapFrame) {
+    let frame = unsafe { &mut *frame };
+    match frame.vector {
+        0x01 => exceptions::debug_handler(frame),
+        0x06 | 0x0D => exceptions::exception_handler(frame),
+        0x08 => exceptions::double_fault_handler(frame),
+        0x0E => {
+            cpu::enable_interrupts();
+            exceptions::page_fault_handler(frame);
+            unsafe { core::arch::asm!("cli", options(nomem, nostack)); }
+        }
+        v => panic!("unhandled exception vector {:#x}", v),
+    }
+}
+
+// ============================================================
+// PIC disable + IDT init
+// ============================================================
+
+/// Disable the legacy 8259 PIC.
+fn disable_pic() {
+    outb(PIC1_CMD, 0x11);
+    io_wait();
+    outb(PIC2_CMD, 0x11);
+    io_wait();
+
+    outb(PIC1_DATA, 32);
+    io_wait();
+    outb(PIC2_DATA, 40);
+    io_wait();
+
+    outb(PIC1_DATA, 4);
+    io_wait();
+    outb(PIC2_DATA, 2);
+    io_wait();
+
+    outb(PIC1_DATA, 0x01);
+    io_wait();
+    outb(PIC2_DATA, 0x01);
+    io_wait();
+
+    outb(PIC1_DATA, 0xFF);
+    outb(PIC2_DATA, 0xFF);
+}
+
+pub fn init() {
+    disable_pic();
+
+    {
+        let mut idt = IDT.lock();
+        idt.entries[Vector::Debug as usize] = IdtEntry::new(stub_db as *const () as u64);
+        idt.entries[Vector::InvalidOpcode as usize] = IdtEntry::new(stub_ud as *const () as u64);
+        idt.entries[Vector::DoubleFault as usize] = IdtEntry::new(stub_df as *const () as u64).with_ist(1);
+        idt.entries[Vector::GeneralProtection as usize] = IdtEntry::new(stub_gpf as *const () as u64);
+        idt.entries[Vector::PageFault as usize] = IdtEntry::new(stub_pf as *const () as u64);
+        idt.entries[Vector::Timer as usize] = IdtEntry::new(timer::timer_entry as *const () as u64);
+        idt.entries[Vector::Xhci as usize] = IdtEntry::new(xhci::xhci_entry as *const () as u64);
+        idt.entries[Vector::VirtioNet as usize] = IdtEntry::new(virtio_net::virtio_net_entry as *const () as u64);
+        idt.entries[Vector::VirtioSound as usize] = IdtEntry::new(virtio_sound::virtio_sound_entry as *const () as u64);
+        idt.entries[Vector::HaltAll as usize] = IdtEntry::new(stub_halt_all as *const () as u64);
+        idt.entries[Vector::TlbFlush as usize] = IdtEntry::new(tlb::tlb_flush_entry as *const () as u64);
+    }
+
+    let ptr = IdtPointer {
+        limit: (core::mem::size_of::<Idt>() - 1) as u16,
+        base: IDT.data_ptr() as u64,
+    };
+
+    unsafe {
+        cpu::lidt(&ptr as *const IdtPointer as *const u8);
+        cpu::enable_interrupts();
+    }
+}

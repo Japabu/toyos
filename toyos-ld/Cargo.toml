@@ -1,0 +1,11 @@
+[package]
+name = "toyos-ld"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+object = { version = "0.38", default-features = false, features = ["read", "write", "elf", "coff", "pe", "macho", "std"] }
+sha2 = "0.10"
+thiserror = "2"
+zerocopy = { version = "0.8", features = ["derive"] }

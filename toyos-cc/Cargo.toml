@@ -1,0 +1,16 @@
+[package]
+name = "toyos-cc"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+cranelift-codegen = { version = "0.128", default-features = false, features = ["std", "x86", "arm64"] }
+cranelift-frontend = "0.128"
+cranelift-module = "0.128"
+cranelift-object = "0.128"
+target-lexicon = { git = "https://github.com/Japabu/target-lexicon", branch = "toyos" }
+toyos-ld = { path = "../toyos-ld" }
+
+[patch.crates-io]
+target-lexicon = { git = "https://github.com/Japabu/target-lexicon", branch = "toyos" }

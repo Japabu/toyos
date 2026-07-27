@@ -1,0 +1,22 @@
+[workspace]
+members = [".", "sim", "loom"]
+default-members = [".", "sim", "loom"]
+
+[package]
+name = "toyos-sched"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[features]
+# Host-side additions for the simulator and tests. Never enabled by the kernel.
+std = []
+# Deep cross-container invariant asserts (spec invariants.rs). Off by default;
+# enabled by sim runs and kernel check builds.
+check = []
+# Declared, never enabled here: the `toyos-sched-loom` package compiles these
+# same sources into its own crate with the feature on, so `src/sync.rs`
+# resolves to loom's instrumented atomics. Keeping it a feature of a separate
+# package (rather than a `cfg(loom)` dependency) keeps loom and its 30
+# transitive host crates out of `kernel/Cargo.lock`.
+loom = []

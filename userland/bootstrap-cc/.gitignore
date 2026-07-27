@@ -1,0 +1,3 @@
+tinycc/
+tcc-stage*
+*.o
