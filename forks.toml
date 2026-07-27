@@ -145,7 +145,7 @@ base = "v0.13.5"
 delta = "+9/-22"
 tier = "fork"
 why = "Adds the toyos target triple. Nine lines."
-pr = "none — no ToyOS crate dependency, so this can be sent TODAY. Do it first."
+pr = "https://github.com/bytecodealliance/target-lexicon/pull/134 (open, 2026-07-27)"
 
 # Not a crate fork: rust/ is a submodule of Japabu/rust (compiler + std with
 # ToyOS as a target). Its own upstream sync is tracked separately.
