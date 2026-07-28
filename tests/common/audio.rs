@@ -331,34 +331,67 @@ fn strip_kernel_logging(serial: &str) -> String {
     out
 }
 
-/// Pull soundd's stats lines out of a serial capture. Fields are located by
-/// name rather than by position, and an unreadable line is an error rather
-/// than a skip: a silently dropped window would under-count `drains` and
-/// `underruns`, which is a gate that passes because it failed to look.
-pub fn parse_soundd_counters(serial: &str) -> Result<SounddCounters, String> {
-    let field = |line: &str, key: &str| -> Option<u64> {
-        let rest = line.split(&format!("{key}=")).nth(1)?;
-        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-        digits.parse().ok()
-    };
-    let mut out = SounddCounters::default();
-    for line in strip_kernel_logging(serial).lines() {
-        if !line.contains("soundd: wakes=") {
-            continue;
+const STATS_MARKER: &str = "soundd: wakes=";
+/// soundd's stats fields, in the order it prints them.
+const STATS_KEYS: [&str; 8] = [
+    "wakes",
+    "completions",
+    "submitted",
+    "underruns",
+    "drains",
+    "max_wake_lat_us",
+    "max_batch",
+    "clients",
+];
+
+/// Read `key=<digits>` at or after `from`, tolerating a foreign line spliced
+/// in between. Any writer sharing the console can land in the middle of the
+/// value — the kernel is stripped beforehand, but the tone client's own
+/// `println!` does it too — and such a write always ends at a newline, so
+/// when the value is interrupted it resumes on the following line.
+fn stats_field(window: &str, key: &str, from: usize) -> Option<(u64, usize)> {
+    let pat = format!("{key}=");
+    let mut at = from + window[from..].find(&pat)? + pat.len();
+    loop {
+        let digits: String = window[at..].chars().take_while(|c| c.is_ascii_digit()).collect();
+        if !digits.is_empty() {
+            return Some((digits.parse().ok()?, at));
         }
-        let get = |key: &str| {
-            field(line, key)
-                .ok_or_else(|| format!("unreadable soundd stats line (no {key}=): {line}"))
-        };
+        at += window[at..].find('\n')? + 1;
+    }
+}
+
+/// Pull soundd's stats windows out of a serial capture. An unreadable window
+/// is an error rather than a skip: silently dropping one would under-count
+/// `drains` and `underruns`, which is a gate passing because it failed to
+/// look.
+pub fn parse_soundd_counters(serial: &str) -> Result<SounddCounters, String> {
+    let text = strip_kernel_logging(serial);
+    // A window's fields can be split across lines, so it extends to the next
+    // window marker rather than to the next newline.
+    let starts: Vec<usize> = text.match_indices(STATS_MARKER).map(|(i, _)| i).collect();
+    let mut out = SounddCounters::default();
+    for (n, &start) in starts.iter().enumerate() {
+        let end = starts.get(n + 1).copied().unwrap_or(text.len());
+        let window = &text[start..end];
+        let mut vals = [0u64; STATS_KEYS.len()];
+        let mut cursor = 0;
+        for (i, key) in STATS_KEYS.iter().enumerate() {
+            let (v, at) = stats_field(window, key, cursor).ok_or_else(|| {
+                format!("unreadable soundd stats window (no {key}=<digits>): {window:?}")
+            })?;
+            vals[i] = v;
+            cursor = at;
+        }
         let w = SounddWindow {
-            wakes: get("wakes")? as u32,
-            completions: get("completions")? as u32,
-            submitted: get("submitted")? as u32,
-            underruns: get("underruns")? as u32,
-            drains: get("drains")? as u32,
-            max_wake_lat_us: get("max_wake_lat_us")?,
-            max_batch: get("max_batch")? as u32,
-            clients: get("clients")? as u32,
+            wakes: vals[0] as u32,
+            completions: vals[1] as u32,
+            submitted: vals[2] as u32,
+            underruns: vals[3] as u32,
+            drains: vals[4] as u32,
+            max_wake_lat_us: vals[5],
+            max_batch: vals[6] as u32,
+            clients: vals[7] as u32,
         };
         out.windows += 1;
         out.max_wake_lat_us = out.max_wake_lat_us.max(w.max_wake_lat_us);

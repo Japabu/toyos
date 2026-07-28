@@ -37,11 +37,11 @@
 # something about the hardware rather than about a particular afternoon.
 #
 # HOW THE NUMBERS WERE PICKED. Measured over 30 serial runs per config on a
-# quiet host (one QEMU at a time, verified; Apple M4 Pro, QEMU 11.0.2 under
-# cross-arch TCG, 1-min load 4.2-6.0). Rule, applied uniformly:
+# quiet host (one QEMU at a time, verified before every iteration; Apple M4
+# Pro, QEMU 11.0.2 under cross-arch TCG, 1-min load 4.2-6.1 recorded per run).
+# Rule, applied uniformly:
 #
-#     limit = 2x the observed maximum, rounded up
-#             (wake latency: rounded up to a whole pipeline depth)
+#     limit = 2x the observed maximum, rounded up to a round number
 #
 # These are max-of-window order statistics with heavy right tails. At n=30 the
 # observed maximum sits near the 97th percentile, so a limit AT the maximum
@@ -50,6 +50,12 @@
 # watching. Doubling it puts the per-config false-red rate well under 1% while
 # still failing on a doubling of the tail, which is the magnitude a scheduler
 # regression that broke RT preemption or the audio IRQ path would produce.
+#
+# How heavy those tails are is not a guess: on `audio_tone_load.smp1` the
+# observed maximum wake lateness went from 26627us at n=15 to 92989us at n=30.
+# One more run more than tripled it. That is why the rule has a factor in it
+# at all, and why the wake-latency bar on that config is weak — for it the
+# sharp instrument is `drains`, not the latency maximum.
 #
 # WHAT THESE NUMBERS ADMIT. Every config's worst wake lateness exceeds one
 # pipeline depth. The spec-derived bar — never wake later than the pipeline
@@ -72,29 +78,41 @@
 # Every number above must survive being asked "why that value?".
 
 [audio_tone.smp1]
-# 30 runs: wake_lat max 27707us (1.19 pl); drains max 4; underruns max 20.
-max_wake_lat_us = 46438   # 2 pipeline depths
+# n=30. wake_lat median 16184us, max 27707us (1.19 pl); drains median 1,
+# max 4; underruns median 9, max 20. Gaps: 1 of 30 runs (one 1-period).
+max_wake_lat_us = 56000   # 2.41 pl
 drains = 8
 underruns = 40
 
 [audio_tone.smp8]
-# 30 runs: wake_lat max 23569us (1.01 pl); drains max 1; underruns max 6.
-# The drains floor is 4 rather than 2: a single observed event over 30 runs
-# bounds the true rate only loosely, and a bar of 2 would be a coin flip.
-max_wake_lat_us = 46438   # 2 pipeline depths
+# n=28 (two runs lost their stats line to console interleaving before the
+# parser handled it). wake_lat median 7423us, max 23569us (1.01 pl); drains
+# max 1; underruns median 4, max 6. Gaps: 0 of 30 runs — the only config that
+# never dropped a sample.
+# drains is 4 rather than 2: one observed event in 28 runs bounds the true
+# rate only loosely (95% upper bound ~12%), and a bar of 2 would be a coin
+# flip on a config that is otherwise the healthiest of the four.
+max_wake_lat_us = 48000   # 2.07 pl
 drains = 4
 underruns = 12
 
 [audio_tone_load.smp1]
-# 30 runs: wake_lat max 26627us (1.15 pl); drains max 10; underruns max 33.
+# n=30. wake_lat median 13919us, max 92989us (4.00 pl); drains median 2,
+# max 13; underruns median 20, max 33. Gaps: 2 of 30 runs (one 2-period, one
+# 5-period).
 # The spec's first-class case (§5.10: glitch-free on one CPU under load) and
-# the worst config by every counter. These are the residual's own numbers.
-max_wake_lat_us = 46438   # 2 pipeline depths
-drains = 20
+# the worst config on every counter. These are the residual's own numbers: a
+# worst wake of four full pipeline depths means the device ran dry and stayed
+# dry for 32 periods. The limit is 2x that, which is a loose bar — deliberately
+# so, because the statistic is heavy-tailed. `drains` and the strict zero-gap
+# histogram are what actually hold this config.
+max_wake_lat_us = 186000   # 8.01 pl
+drains = 26
 underruns = 70
 
 [audio_tone_load.smp8]
-# 30 runs: wake_lat max 39001us (1.68 pl); drains max 3; underruns max 16.
-max_wake_lat_us = 69657   # 3 pipeline depths
+# n=29. wake_lat median 7712us, max 39001us (1.68 pl); drains max 3;
+# underruns median 4, max 16. Gaps: 1 of 30 runs (two 4-period).
+max_wake_lat_us = 80000   # 3.45 pl
 drains = 6
 underruns = 32
