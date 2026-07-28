@@ -25,6 +25,15 @@
 #
 # A fork being sendable is not the same as it being *worth* sending. See memmap2
 # below: purely additive, unblocked, and still a bad PR.
+#
+# `delta` is `git diff --shortstat <base>..<branch>`, re-measured 2026-07-28.
+# The numbers before that date were inflated by vendoring cruft — gutted upstream
+# READMEs (memmap2's deleted the upstream authors' copyright notices) and stray
+# .gitignore entries — which has now been reverted everywhere. The invariant is
+# that base..branch contains no hunk an upstream PR would not: check with
+#   git diff <base>..<branch> -- README* LICENSE* COPYRIGHT NOTICE .gitignore
+# and expect empty. Fork identity lives in each repo's GitHub description, which
+# costs no diff.
 
 [meta]
 owner = "Japabu"
@@ -36,7 +45,7 @@ branch = "toyos"
 [socket2]
 upstream = "rust-lang/socket2"
 base = "v0.6.3"
-delta = "+1303/-11"
+delta = "+1302/-11"
 tier = "fork"
 why = "Full socket backend (src/sys/toyos.rs) over the ToyOS network syscalls."
 pr = "none — blocked on publishing toyos-abi/toyos"
@@ -45,7 +54,7 @@ pr = "none — blocked on publishing toyos-abi/toyos"
 upstream = "tokio-rs/mio"
 base = "844cf25"
 base_note = "two commits past v1.2.0; the tag itself gives a polluted diff"
-delta = "+774/-30"
+delta = "+773/-30"
 tier = "fork"
 why = "io_uring-driven selector, pipe waker, ToyOS TCP types."
 pr = "none — blocked on publishing toyos-abi/toyos"
@@ -54,10 +63,11 @@ pr = "none — blocked on publishing toyos-abi/toyos"
 upstream = "tokio-rs/tokio"
 base = "d7db722b"
 base_note = "three commits past tokio-1.51.1"
-delta = "+119/-41"
+delta = "+118/-41"
 tier = "fork"
 why = "cfg-gated ToyOS arms in TcpSocket; unsupported APIs disabled."
 pr = "none — blocked on publishing toyos-abi/toyos"
+not_pr_content = "The root Cargo.toml carries a `[patch.crates-io] mio = <our fork>` entry. It only affects builds *inside* the tokio repo (consumers resolve via tokio/Cargo.toml), so it may be load-bearing for local dev there — but it is never PR content and needs a decision."
 
 [russh]
 upstream = "Eugeny/russh"
@@ -114,7 +124,7 @@ pr = "none — trivial delta, good early candidate once toyos-abi is published"
 upstream = "nagisa/rust_libloading"
 base = "35b6a30"
 base_note = "0.9.0 plus two upstream commits; Cargo.toml version is relabelled 0.8.9 to satisfy a rustc pin"
-delta = "+345/-4"
+delta = "+341/-4"
 tier = "toolchain"
 why = "dlopen/dlsym over ToyOS."
 pr = "none — blocked on publishing toyos-abi"
@@ -123,58 +133,79 @@ pr = "none — blocked on publishing toyos-abi"
 upstream = "RazrFalcon/memmap2-rs"
 base = "v0.9.10"
 base_note = "Cargo.toml version is relabelled 0.2.1 to satisfy rustc_data_structures' pin"
-delta = "+139/-35"
+delta = "+173/-3"
 tier = "toolchain"
 why = "ToyOS mapping emulation in its own cfg-gated module."
-pr = "deliberately NOT sent — see pr_note. Purely additive and unblocked, but a bad PR on the merits."
+pr = "deliberately NOT sent — see pr_note. Purely additive, unblocked, now correct, and still a bad PR."
 pr_note = """
 Evaluated 2026-07-28 by building the port against upstream master and running
-upstream's own suite against our module: it fails 5 of 16 tests. Four reasons
-not to send it, in descending weight:
-  1. It breaks the crate's stated contract. memmap2 0.9.10 added "return
-     ErrorKind::Unsupported on unsupported platforms to allow reliable runtime
-     detection" (#161). Our `map_mut` reports success and then drops the writes
-     in a no-op `flush` — a caller doing exactly the detection upstream built is
-     told "supported" and silently loses data. Demonstrated, not theoretical.
-  2. No pattern to follow. memmap2 has no per-target_os module arm at all, only
+upstream's own suite against our module. It failed 5 of 16 tests, which turned
+up three real bugs in our branch — all now fixed, see `bugs` below. The original
+first objection (the fork violated memmap2's own ErrorKind::Unsupported contract
+from #161 by reporting success and discarding writes) is therefore RESOLVED, and
+the note's own escape clause is satisfied verbatim. Three objections remain, and
+each is independently decisive:
+  1. No pattern to follow. memmap2 has no per-target_os module arm at all, only
      unix/windows/stub. This would invent the dispatch rather than join it —
      the opposite of the target-lexicon and raw-window-handle cases.
-  3. Upstream could never compile or test it: target_os="toyos" exists only in
+  2. Upstream could never compile or test it: target_os="toyos" exists only in
      the rust/ fork, unlike Redox and Haiku which are real rustc targets.
-  4. Nothing upstream blocks us. ToyOS is neither unix nor windows, so stock
-     memmap2 already routes us to stub.rs and builds. The fork exists to give
-     ToyOS better-than-Unsupported — a downstream policy choice.
+  3. Nothing upstream blocks us. ToyOS is neither unix nor windows, so stock
+     memmap2 already routes us to stub.rs and builds.
 It is also barely a platform port: ToyOS has no mmap, so the module is a generic
 heap-buffer emulation any platform could have.
-
-Submittable only if `map`/`map_copy*`/`map_anon` are made correct (the copy
-variants already are — private COW mappings genuinely never write back) and
-`map_mut`/`map_exec` return Unsupported. Reasons 2–4 would still stand.
 """
-bugs = "two real bugs in our own toyos branch, found by that evaluation — see CLAUDE.md known issues"
+bugs = """
+Three bugs, found by that evaluation and fixed in c74a0a9 (branch now 87ae85a):
+  1. read_file used file.try_clone() and seeked — try_clone SHARES the offset,
+     so mapping silently reseeked the caller's File to the end of the mapped
+     range and every later read returned wrong data or EOF.
+  2. Mapped pointers were byte-aligned (backing Vec<u8>) where the crate
+     guarantees usize alignment, including for empty maps.
+  3. map_anon treated its 4th parameter as a fill byte; upstream's signature is
+     `huge: Option<u8>`, a huge-page size shift. `.huge(Some(n)).map_anon()`
+     returned a buffer full of byte n instead of zeros.
+map_mut/map_exec/make_mut-on-shared now return Unsupported rather than pretending
+to succeed. Decided empirically: nothing in the graph can reach them (see
+`dead_code`), so Unsupported cannot break a caller, while emulated write-back
+would have made ToyOS depend on semantics that are not mapping semantics.
+"""
+dead_code = """
+OPEN QUESTION. rust/compiler/rustc_data_structures/src/memmap.rs cfg-gates
+target_os="toyos" to a Vec<u8> implementation at all 8 sites, and userland lists
+memmap2 under [patch.unused]. So NO ToyOS code path calls any memmap2 API: the
+165 lines of src/toyos.rs are compiled and unreachable, and the fork's only
+load-bearing content is the 0.9.10 → 0.2.1 version relabel.
+Two coherent end-states, exactly one of which should exist:
+  (a) delete src/toyos.rs and let stub.rs serve ToyOS, keeping the relabel; or
+  (b) drop the toyos gate in rustc_data_structures now that map_copy_read_only
+      and map_anon — the only two memmap2 APIs rustc uses — are correct here.
+Keeping both is the duplication the zero-technical-debt principle forbids.
+"""
 
 [stacker]
 upstream = "rust-lang/stacker"
 base = "93c7abc"
 base_note = "0.1.23 was released without a tag"
-delta = "+90/-48"
+delta = "+86/-6"
 tier = "toolchain"
 pr = "none — blocked on publishing toyos-abi"
+not_pr_content = "`cc` is relaxed 1.2.33 → 1.2.0 in both Cargo.toml and psm/Cargo.toml — a build-dep downgrade with no ToyOS connection, 4 of the 8 files in the delta. Undocumented: find out what forced it (MSRV of the pinned toolchain?) and either justify or drop it."
 
 [ctrlc]
 upstream = "Detegr/rust-ctrlc"
 base = "3.5.2"
 base_note = "vendored Cargo.toml claimed 3.5.1; the code is 3.5.2. The version string should be restored."
-delta = "+45/-57"
+delta = "+42/-1"
 tier = "toolchain"
 pr = "none"
 
 [target-lexicon]
 upstream = "bytecodealliance/target-lexicon"
 base = "v0.13.5"
-delta = "+9/-22"
+delta = "+7/-1"
 tier = "fork"
-why = "Adds the toyos target triple. Nine lines."
+why = "Adds the toyos target triple. Five lines of code across two files."
 pr = "https://github.com/bytecodealliance/target-lexicon/pull/134 (open, 2026-07-27)"
 
 # Not a crate fork: rust/ is a submodule of Japabu/rust (compiler + std with
