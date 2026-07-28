@@ -359,7 +359,15 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             }
         }
         SYS_NIC_RX_DONE => { crate::net::refill_rx_buf(a1 as usize); 0 }
-        SYS_NIC_TX => { crate::net::submit_tx(a1 as usize); 0 }
+        SYS_NIC_TX => {
+            if !device::is_owner(device::DEVICE_NIC, process::current_process()) {
+                return SyscallError::PermissionDenied.to_u64();
+            }
+            match crate::net::submit_tx(a1 as usize) {
+                Ok(()) => 0,
+                Err(e) => e.to_u64(),
+            }
+        }
         SYS_SYMLINK => {
             let target = match ctx.user_str(UserAddr::new(a1), a2) { Ok(s) => s, Err(e) => return e.to_u64() };
             let link = match ctx.user_str(UserAddr::new(a3), a4) { Ok(s) => s, Err(e) => return e.to_u64() };

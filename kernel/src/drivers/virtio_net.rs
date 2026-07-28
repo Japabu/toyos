@@ -29,7 +29,8 @@ const OFF_RXQ_USED: usize  = 0x2000;
 const OFF_TXQ: usize       = 0x3000;
 const OFF_RX_BUFS: usize   = 0x4000;  // 256 × 4KB
 const OFF_TX_BUF: usize    = 0x4000 + 256 * 0x1000;
-const DMA_SIZE: usize       = OFF_TX_BUF + 0x1000;
+const TX_BUF_LEN: usize    = 0x1000;
+const DMA_SIZE: usize       = OFF_TX_BUF + TX_BUF_LEN;
 
 const PCI_CAP_MSIX: u8 = 0x11;
 const VIRTIO_NET_VECTOR: u8 = 0x22;
@@ -144,6 +145,8 @@ impl crate::net::Nic for VirtioNic {
             self.refill_rx(buf_index, slot);
         }
     }
+
+    fn tx_buf_len(&self) -> usize { TX_BUF_LEN }
 
     fn submit_tx(&mut self, total_len: usize) {
         let slot = self.tx_slot.take().expect("virtio-net: no tx slot");

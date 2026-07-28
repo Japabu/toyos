@@ -2,6 +2,7 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 use crate::io_uring::RingId;
 use crate::sync::Lock;
+use toyos_abi::syscall::SyscallError;
 
 pub use toyos_abi::net::NicInfo;
 
@@ -18,7 +19,16 @@ pub trait Nic: Send {
     /// Resubmit an RX buffer to the hardware after the frame has been consumed.
     fn refill_rx_buf(&mut self, _buf_index: usize) {}
     /// Submit the TX buffer to hardware. Frame data (with net header) must already be written.
+    ///
+    /// `total_len` becomes the DMA descriptor length verbatim. Callers must
+    /// have bounded it by `tx_buf_len` — see `net::submit_tx`.
     fn submit_tx(&mut self, _total_len: usize) {}
+
+    /// Size in bytes of the TX buffer userland writes into. The submitted
+    /// length is a descriptor length starting at that buffer, so this is the
+    /// only thing standing between a `u64` from userland and the device
+    /// reading adjacent kernel memory onto the wire.
+    fn tx_buf_len(&self) -> usize { 0 }
 }
 
 static NIC: Lock<Option<Box<dyn Nic>>> = Lock::new(None);
@@ -78,8 +88,18 @@ pub fn refill_rx_buf(buf_index: usize) {
     }
 }
 
-pub fn submit_tx(total_len: usize) {
-    if let Some(nic) = NIC.lock().as_mut() {
-        nic.submit_tx(total_len);
+/// Hand the device the TX buffer's first `total_len` bytes.
+///
+/// The length arrives from userland as a bare `u64` and there is no pointer
+/// and no copy on this path — the frame was written straight into the shared
+/// DMA buffer — so the destination size cannot bound it the way a copy would.
+/// Bounding it here is the only bound there is.
+pub fn submit_tx(total_len: usize) -> Result<(), SyscallError> {
+    let mut guard = NIC.lock();
+    let Some(nic) = guard.as_mut() else { return Err(SyscallError::NotFound) };
+    if total_len == 0 || total_len > nic.tx_buf_len() {
+        return Err(SyscallError::InvalidArgument);
     }
+    nic.submit_tx(total_len);
+    Ok(())
 }
