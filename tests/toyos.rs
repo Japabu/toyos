@@ -519,8 +519,12 @@ fn measure_audio_run(
         let kept = qemu
             .audio_wav_path()
             .with_file_name(format!("audio-{name}-smp{smp}{suffix}.wav"));
-        if fs::rename(qemu.audio_wav_path(), &kept).is_ok() {
-            eprintln!("        {label}{name} smp={smp} wav kept at {}", kept.display());
+        match fs::rename(qemu.audio_wav_path(), &kept) {
+            Ok(()) => eprintln!("        {label}{name} smp={smp} wav kept at {}", kept.display()),
+            Err(e) => eprintln!(
+                "        {label}{name} smp={smp} could not keep {}: {e}",
+                kept.display()
+            ),
         }
     }
 
@@ -697,10 +701,11 @@ fn run_audio_gate(
     );
 
     for iter in 1..=iterations {
+        eprintln!("  --- iteration {iter}/{iterations} ---");
         for &(name, smp) in &configs {
             let key = format!("{name}.smp{smp}");
             let baseline = config_baseline(audio_baseline, name, smp);
-            let tag = format!("{iter}/{iterations}");
+            let tag = format!("iter{iter:03}");
             let run = match measure_audio_run(
                 name, smp, &baseline, test_config, c_bins, rust_bins, &tag,
             ) {
