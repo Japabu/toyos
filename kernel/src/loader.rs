@@ -416,8 +416,7 @@ fn build_tls_layout(
 
     if layout.tls_memsz > 0 {
         if cursor > 0 { cursor = (cursor + 15) & !15; }
-        let template = exe_tls_template
-            .map(|buf| unsafe { crate::mm::KernelSlice::from_raw(buf.ptr(), layout.tls_filesz) });
+        let template = exe_tls_template.map(|buf| buf.slice(layout.tls_filesz));
         modules.push(elf::TlsModule {
             template,
             memsz: layout.tls_memsz, base_offset: cursor, module_id: 1,
@@ -746,14 +745,18 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
     // 10. TLS setup — read exe TLS template from page cache, build multi-module layout
     let exe_tls_template = if layout.tls_memsz > 0 {
         let tls_file_off = vaddr_to_file_offset(&layout.segments, layout.tls_vaddr);
-        let tls_data = read_file_range(backing.as_ref(), tls_file_off, layout.tls_filesz);
-        let tls_buf = OwnedAlloc::new(layout.tls_memsz, 16).expect("TLS template alloc");
-        unsafe {
-            core::ptr::copy_nonoverlapping(tls_data.as_ptr(), tls_buf.ptr(), layout.tls_filesz);
-            if layout.tls_memsz > layout.tls_filesz {
-                core::ptr::write_bytes(tls_buf.ptr().add(layout.tls_filesz), 0, layout.tls_memsz - layout.tls_filesz);
-            }
-        }
+        // Allocate first, then read straight into the buffer. The old order
+        // read `tls_filesz` bytes into a `Vec` and copied them into a
+        // `tls_memsz`-sized allocation, which overran whenever the header
+        // claimed `filesz > memsz` — an ELF-controlled heap overwrite.
+        // `ElfLayout`'s invariant now rules that out, and reading in place
+        // removes the intermediate `Vec` sized by the same untrusted number.
+        // `OwnedAlloc` zeroes, so the `.tbss` tail needs no second pass.
+        let Some(tls_buf) = OwnedAlloc::new(layout.tls_memsz, 16) else {
+            log!("spawn: {}: failed to allocate TLS template ({} bytes)", path, layout.tls_memsz);
+            return Err(SyscallError::ResourceExhausted);
+        };
+        elf::read_backing_into(backing.as_ref(), tls_file_off, tls_buf.ptr(), layout.tls_filesz);
         Some(tls_buf)
     } else {
         None

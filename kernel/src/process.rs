@@ -46,7 +46,14 @@ pub struct OwnedAlloc {
 }
 
 impl OwnedAlloc {
+    /// `None` for any size the kernel heap cannot serve, so a caller sizing a
+    /// buffer from untrusted input gets a value to handle rather than a panic.
+    /// The heap's page source asserts above `PAGE_2M` (`mm::alloc`) instead of
+    /// returning null, so that ceiling has to be checked before the request,
+    /// not after — the two real callers (128 KiB kernel stacks, ELF TLS
+    /// templates) are far below it.
     pub fn new(size: usize, align: usize) -> Option<Self> {
+        if size >= PAGE_2M as usize { return None; }
         let layout = Layout::from_size_align(size, align).ok()?;
         let ptr = NonNull::new(unsafe { alloc_zeroed(layout) })?;
         Some(Self { ptr, layout })
@@ -54,6 +61,17 @@ impl OwnedAlloc {
 
     pub fn ptr(&self) -> *mut u8 { self.ptr.as_ptr() }
     pub fn size(&self) -> usize { self.layout.size() }
+
+    /// A bounds-checked view of the first `len` bytes.
+    ///
+    /// The only safe way to build a `KernelSlice` over an `OwnedAlloc` — the
+    /// raw `KernelSlice::from_raw` was once handed an ELF's `p_filesz` over a
+    /// `p_memsz`-sized buffer, which made every later `copy_from`/`read` on it
+    /// out of bounds while still passing that slice's own checks.
+    pub fn slice(&self, len: usize) -> crate::mm::KernelSlice {
+        assert!(len <= self.size(), "OwnedAlloc::slice: {} > {}", len, self.size());
+        unsafe { crate::mm::KernelSlice::from_raw(self.ptr(), len) }
+    }
 }
 
 impl Drop for OwnedAlloc {

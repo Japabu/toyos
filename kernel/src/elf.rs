@@ -303,6 +303,27 @@ pub struct ElfSegment {
 }
 
 /// ELF layout parsed from program headers only — no data read beyond the first few KB.
+///
+/// # Invariants
+///
+/// An ELF comes from the filesystem and is untrusted. `parse_layout` is the
+/// only constructor and rejects anything that breaks the following, so every
+/// `ElfLayout` value that exists already satisfies them and no consumer needs
+/// to re-check:
+///
+/// - every `segments[i].filesz <= .memsz`, and neither `vaddr + memsz` nor
+///   `file_offset + filesz` overflows;
+/// - `tls_filesz <= tls_memsz`;
+/// - the file-backed extent of PT_TLS, and all of PT_DYNAMIC and
+///   PT_GNU_EH_FRAME, lie inside `[vaddr_min, vaddr_max)`.
+///
+/// The size pairs are the point. Downstream every one of them is a
+/// (copy length, destination size) pair — `OwnedAlloc::new(memsz)` then
+/// `copy(.., filesz)` for the exe's TLS template, an image sized from
+/// `vaddr_max` then a `filesz`-long segment read for a `dlopen`ed library —
+/// so `p_filesz <= p_memsz` is a memory-safety invariant here, not an ELF
+/// formality. The vaddr ranges are the same story one level up:
+/// `load_shared_lib` addresses the loaded image as `vaddr - vaddr_min`.
 pub struct ElfLayout {
     pub entry_vaddr: u64,
     pub vaddr_min: u64,
@@ -397,10 +418,22 @@ pub fn parse_layout(data: &[u8]) -> Result<ElfLayout, &'static str> {
     let mut eh_frame_hdr = None;
 
     for phdr in phdrs.iter() {
+        // See the invariants on `ElfLayout`: `p_filesz` and `p_memsz` are a
+        // (copy length, destination size) pair downstream, so the spec's
+        // `p_filesz <= p_memsz` is enforced here or not at all.
+        if matches!(phdr.p_type, PT_LOAD | PT_TLS) && phdr.p_filesz > phdr.p_memsz {
+            return Err("ELF: p_filesz > p_memsz");
+        }
         match phdr.p_type {
             PT_LOAD => {
+                let Some(seg_end) = phdr.p_vaddr.checked_add(phdr.p_memsz) else {
+                    return Err("ELF: PT_LOAD p_vaddr + p_memsz overflows");
+                };
+                if phdr.p_offset.checked_add(phdr.p_filesz).is_none() {
+                    return Err("ELF: PT_LOAD p_offset + p_filesz overflows");
+                }
                 vaddr_min = vaddr_min.min(phdr.p_vaddr);
-                vaddr_max = vaddr_max.max(phdr.p_vaddr + phdr.p_memsz);
+                vaddr_max = vaddr_max.max(seg_end);
                 segments.push(ElfSegment {
                     vaddr: phdr.p_vaddr,
                     memsz: phdr.p_memsz,
@@ -426,6 +459,30 @@ pub fn parse_layout(data: &[u8]) -> Result<ElfLayout, &'static str> {
     }
 
     if segments.is_empty() { return Err("ELF: no loadable segments"); }
+
+    // Every other program header names a vaddr that `load_shared_lib` turns
+    // into an offset into the loaded image as `vaddr - vaddr_min`. Outside
+    // `[vaddr_min, vaddr_max)` that is a wrapping subtraction into an
+    // out-of-bounds kernel pointer, so bound them here rather than at each of
+    // the seven use sites. Only the file-backed part of PT_TLS is checked:
+    // `.tbss` occupies address space the containing PT_LOAD need not cover,
+    // and it is never read from, only zeroed in a buffer of its own.
+    let in_image = |vaddr: u64, size: u64| {
+        vaddr >= vaddr_min && vaddr.checked_add(size).is_some_and(|end| end <= vaddr_max)
+    };
+    if tls_memsz > 0 && !in_image(tls_vaddr, tls_filesz as u64) {
+        return Err("ELF: PT_TLS file image outside the loadable segments");
+    }
+    if let Some((_, dyn_vaddr, dyn_filesz)) = dynamic {
+        if !in_image(dyn_vaddr, dyn_filesz) {
+            return Err("ELF: PT_DYNAMIC outside the loadable segments");
+        }
+    }
+    if let Some((ehf_vaddr, ehf_size)) = eh_frame_hdr {
+        if !in_image(ehf_vaddr, ehf_size) {
+            return Err("ELF: PT_GNU_EH_FRAME outside the loadable segments");
+        }
+    }
 
     let section_headers = if ehdr.e_shoff != 0 && ehdr.e_shnum > 0 {
         Some((ehdr.e_shoff, ehdr.e_shnum, ehdr.e_shentsize))
@@ -838,7 +895,7 @@ fn gnu_dlsym(lib: &LoadedLib, name: &str) -> Option<UserAddr> {
 
 /// Read from a file backing directly into a destination pointer.
 /// No heap allocation — reads 4KB at a time from the backing.
-fn read_backing_into(backing: &dyn crate::file_backing::FileBacking, offset: u64, dst: *mut u8, len: usize) {
+pub(crate) fn read_backing_into(backing: &dyn crate::file_backing::FileBacking, offset: u64, dst: *mut u8, len: usize) {
     let mut remaining = len;
     let mut file_off = offset;
     let mut buf_off = 0usize;
@@ -894,10 +951,15 @@ pub fn load_shared_lib(backing: &dyn crate::file_backing::FileBacking) -> Result
     unsafe { image.zero(); }
     let t2 = crate::clock::nanos_since_boot();
 
-    // Read PT_LOAD segments from backing directly into image
+    // Read PT_LOAD segments from backing directly into image. `image` is sized
+    // from `vaddr_max`, i.e. from every segment's p_memsz, so reading p_filesz
+    // bytes into it stays in bounds only because `ElfLayout` guarantees
+    // filesz <= memsz. Take the checked subslice rather than a bare `ptr_at`
+    // so a future weakening of that invariant is an assert, not an overwrite
+    // of whatever the PMM handed out after this allocation.
     for seg in &layout.segments {
-        let dst = image.ptr_at((seg.vaddr - vaddr_min) as usize);
-        read_backing_into(backing, seg.file_offset, dst, seg.filesz as usize);
+        let dst = image.subslice((seg.vaddr - vaddr_min) as usize, seg.filesz as usize);
+        read_backing_into(backing, seg.file_offset, dst.base(), dst.size());
     }
     let t3 = crate::clock::nanos_since_boot();
 
