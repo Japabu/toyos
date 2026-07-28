@@ -17,10 +17,14 @@
 # would have misattributed upstream churn to us. Each base was found by
 # minimising the diff and is recorded here so re-basing is reproducible.
 #
-# `pr` is the upstream pull request, or why there isn't one yet. Opening a PR
-# requires ToyOS's own crates (toyos-abi, toyos, window) to be published to
-# crates.io — a fork cannot reference them by path once cargo checks it out
-# alone. That is the single blocker for the entire upstreaming programme.
+# `pr` is the upstream pull request, or why there isn't one yet. Most forks are
+# blocked on publishing ToyOS's own crates (toyos-abi, toyos, window): a fork
+# cannot reference them by path once cargo checks it out alone. The exceptions
+# are the forks whose ToyOS code depends on nothing of ours — a target triple, a
+# handle type — and those are the ones already sent.
+#
+# A fork being sendable is not the same as it being *worth* sending. See memmap2
+# below: purely additive, unblocked, and still a bad PR.
 
 [meta]
 owner = "Japabu"
@@ -91,10 +95,11 @@ pr = "none — blocked on publishing window"
 [raw-window-handle]
 upstream = "rust-windowing/raw-window-handle"
 base = "1b85948"
-delta = "+69"
+delta = "+109"
 tier = "sibling"
-why = "Pure addition: a ToyOS handle variant."
-pr = "none — smallest, cleanest candidate; send this one first"
+why = "Pure addition: a ToyOS handle variant. Depends on nothing of ours, so it was sendable without publishing."
+pr = "https://github.com/rust-windowing/raw-window-handle/pull/223 (open, 2026-07-28)"
+pr_note = "`toyos` was moved to c39042b so its tree is byte-identical to the PR head; the delta grew +69 → +109 by adding the doc examples and CHANGELOG entry every other platform module carries."
 
 [getrandom]
 upstream = "rust-random/getrandom"
@@ -121,7 +126,32 @@ base_note = "Cargo.toml version is relabelled 0.2.1 to satisfy rustc_data_struct
 delta = "+139/-35"
 tier = "toolchain"
 why = "ToyOS mapping emulation in its own cfg-gated module."
-pr = "ready to draft — the cross-platform stub.rs hijack was reverted, so the delta is now purely additive"
+pr = "deliberately NOT sent — see pr_note. Purely additive and unblocked, but a bad PR on the merits."
+pr_note = """
+Evaluated 2026-07-28 by building the port against upstream master and running
+upstream's own suite against our module: it fails 5 of 16 tests. Four reasons
+not to send it, in descending weight:
+  1. It breaks the crate's stated contract. memmap2 0.9.10 added "return
+     ErrorKind::Unsupported on unsupported platforms to allow reliable runtime
+     detection" (#161). Our `map_mut` reports success and then drops the writes
+     in a no-op `flush` — a caller doing exactly the detection upstream built is
+     told "supported" and silently loses data. Demonstrated, not theoretical.
+  2. No pattern to follow. memmap2 has no per-target_os module arm at all, only
+     unix/windows/stub. This would invent the dispatch rather than join it —
+     the opposite of the target-lexicon and raw-window-handle cases.
+  3. Upstream could never compile or test it: target_os="toyos" exists only in
+     the rust/ fork, unlike Redox and Haiku which are real rustc targets.
+  4. Nothing upstream blocks us. ToyOS is neither unix nor windows, so stock
+     memmap2 already routes us to stub.rs and builds. The fork exists to give
+     ToyOS better-than-Unsupported — a downstream policy choice.
+It is also barely a platform port: ToyOS has no mmap, so the module is a generic
+heap-buffer emulation any platform could have.
+
+Submittable only if `map`/`map_copy*`/`map_anon` are made correct (the copy
+variants already are — private COW mappings genuinely never write back) and
+`map_mut`/`map_exec` return Unsupported. Reasons 2–4 would still stand.
+"""
+bugs = "two real bugs in our own toyos branch, found by that evaluation — see CLAUDE.md known issues"
 
 [stacker]
 upstream = "rust-lang/stacker"
