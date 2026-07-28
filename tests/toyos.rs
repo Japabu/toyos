@@ -8,7 +8,7 @@ use std::thread;
 use std::time::Duration;
 
 use common::qemu::{self, BootOptions, QemuInstance, TestResult};
-use common::{audio, compile};
+use common::{audio, compile, stats};
 
 // ---------------------------------------------------------------------------
 // Test definition
@@ -269,13 +269,38 @@ struct AudioBaselineEntry {
     max_wake_lat_us: u64,
     drains: u32,
     underruns: u32,
+    sample: BaselineSample,
+}
+
+/// The recorded clean-tree *sample* for one config, not a summary of it. The
+/// thorough tier compares a fresh sample against this one, so it needs the
+/// observations themselves — see `tests/common/stats.rs` for why a summary
+/// would understate the false-red rate.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BaselineSample {
+    /// Runs whose wav was analysed (the counter arrays can be longer: a run
+    /// can lose its histogram and still report counters).
+    gap_sample: u32,
+    /// Of `gap_sample`, how many showed at least one mid-tone dropout.
+    gap_runs: u32,
+    /// Of the counter runs, how many breached this config's per-run ceilings.
+    ceiling_runs: u32,
+    max_wake_lat_us: Vec<f64>,
+    underruns: Vec<f64>,
+    wakes: Vec<f64>,
+    /// Recorded for re-baselining the per-run ceiling only. Deliberately not
+    /// tested distributionally: it is zero on 50-90% of runs, and the ties
+    /// leave a rank test with no power (measured: 0.00-0.21 against a tripling).
+    drains: Vec<f64>,
 }
 
 type AudioBaseline = BTreeMap<String, BTreeMap<String, AudioBaselineEntry>>;
 
-struct ConfigBaseline {
+struct ConfigBaseline<'a> {
     gaps: BTreeMap<u32, u32>,
     counters: audio::CounterLimits,
+    sample: &'a BaselineSample,
 }
 
 fn load_audio_baseline() -> AudioBaseline {
@@ -287,12 +312,13 @@ fn load_audio_baseline() -> AudioBaseline {
 
 /// Baseline for one (test, smp) config. Every config must be recorded: an
 /// ungated config would pass by omission.
-fn config_baseline(baseline: &AudioBaseline, name: &str, smp: u32) -> ConfigBaseline {
+fn config_baseline<'a>(baseline: &'a AudioBaseline, name: &str, smp: u32) -> ConfigBaseline<'a> {
     let entry = baseline
         .get(name)
         .and_then(|per_smp| per_smp.get(&format!("smp{smp}")))
         .unwrap_or_else(|| panic!("audio-baseline.toml: no [{name}.smp{smp}] section"));
     ConfigBaseline {
+        sample: &entry.sample,
         gaps: entry
             .gaps
             .iter()
@@ -311,19 +337,44 @@ fn config_baseline(baseline: &AudioBaseline, name: &str, smp: u32) -> ConfigBase
     }
 }
 
+/// What one audio boot measured. Both tiers are computed from this; they
+/// differ only in how many they collect and what decision they take on the
+/// collection.
+struct AudioRun {
+    gaps: BTreeMap<u32, u32>,
+    counters: audio::SounddCounters,
+    /// The instrument itself is untrustworthy on this run (no tone, no dither,
+    /// clicks). Never a rare-event judgement — always fatal, in both tiers.
+    broken: Vec<String>,
+    /// soundd counters past this config's per-run ceilings. Fatal in the fast
+    /// tier; a counted rate in the thorough tier.
+    breaches: Vec<String>,
+}
+
+impl AudioRun {
+    fn dropped_audio(&self) -> bool {
+        !self.gaps.is_empty()
+    }
+}
+
 /// Boot a fresh QEMU with the given CPU count, run one in-guest audio test,
-/// then assert on two independent instruments: soundd's in-guest counters
-/// (wake lateness, pipeline drains, periods of silence submitted) and the
-/// captured wav (mid-signal silence must not regress the recorded histogram,
-/// and there must be no hard sample-to-sample discontinuities).
-fn run_audio_test(
+/// and measure it: soundd's in-guest counters (wake lateness, pipeline drains,
+/// periods of silence submitted) and the captured wav (mid-signal silence, hard
+/// sample-to-sample discontinuities, and the dither the detector needs to see
+/// anything at all).
+///
+/// `Err` means the run produced no measurement — a boot failure, a timeout, an
+/// unreadable capture. That is never a rare-event judgement call; it is fatal
+/// in both tiers.
+fn measure_audio_run(
     name: &str,
     smp: u32,
     baseline: &ConfigBaseline,
     test_config: &Path,
     c_bins: &[(String, Vec<u8>)],
     rust_bins: &[(String, Vec<u8>)],
-) -> Result<(), String> {
+    label: &str,
+) -> Result<AudioRun, String> {
     let mut qemu = QemuInstance::boot_with_options(
         test_config,
         c_bins,
@@ -361,7 +412,7 @@ fn run_audio_test(
     let gaps = audio::gap_histogram(&analysis, wav.sample_rate);
     let counters = audio::parse_soundd_counters(&serial)?;
     eprintln!(
-        "        {name} smp={smp} gaps: {} (baseline {}) peak {} active {:.2}s dither {:.1}%",
+        "        {label}{name} smp={smp} gaps: {} (baseline {}) peak {} active {:.2}s dither {:.1}%",
         audio::format_histogram(&gaps),
         audio::format_histogram(&baseline.gaps),
         analysis.peak,
@@ -369,7 +420,7 @@ fn run_audio_test(
         analysis.dither_ratio.unwrap_or(0.0) * 100.0,
     );
     eprintln!(
-        "        {name} smp={smp} soundd: wake_lat {}us ({:.2} pipelines, limit {}us) \
+        "        {label}{name} smp={smp} soundd: wake_lat {}us ({:.2} pipelines, limit {}us) \
          drains {}/{} underruns {}/{} submitted {} wakes {} batch {} windows {}",
         counters.max_wake_lat_us,
         counters.max_wake_lat_us as f64 / audio::PIPELINE_DEPTH_US as f64,
@@ -384,10 +435,12 @@ fn run_audio_test(
         counters.windows,
     );
 
-    let mut problems = Vec::new();
+    let mut breaches = Vec::new();
     if let Err(regression) = audio::check_counters(&counters, &baseline.counters) {
-        problems.push(regression);
+        breaches.push(regression);
     }
+
+    let mut problems = Vec::new();
     if secs(analysis.active_samples) < TONE_MIN_ACTIVE_SECS {
         problems.push(format!(
             "tone missing: only {:.2}s of active signal (expected >= {TONE_MIN_ACTIVE_SECS}s)",
@@ -415,9 +468,9 @@ fn run_audio_test(
         Some(_) => {}
         None => problems.push("no silent stretch in capture to verify dither against".to_string()),
     }
-    if let Err(regression) = audio::check_gap_regression(&gaps, &baseline.gaps) {
+    if audio::check_gap_regression(&gaps, &baseline.gaps).is_err() {
         let mut msg = format!(
-            "{regression}\n      {} mid-signal underruns (silence >= 2ms inside the tone):",
+            "{} mid-signal underruns (silence >= 2ms inside the tone):",
             analysis.underruns.len()
         );
         for run in analysis.underruns.iter().take(20) {
@@ -430,7 +483,7 @@ fn run_audio_test(
         if analysis.underruns.len() > 20 {
             msg.push_str(&format!("\n      ... and {} more", analysis.underruns.len() - 20));
         }
-        problems.push(msg);
+        eprintln!("        {label}{name} smp={smp} {msg}");
     }
     if !analysis.clicks.is_empty() {
         let mut msg = format!("{} hard discontinuities (|delta| > 8000):", analysis.clicks.len());
@@ -448,21 +501,347 @@ fn run_audio_test(
         problems.push(msg);
     }
 
-    if problems.is_empty() {
+    // Keep every capture that shows something, so a dropout can be listened to
+    // even when the tier's rule says one occurrence is not yet a verdict.
+    if !problems.is_empty() || !breaches.is_empty() || !gaps.is_empty() {
+        let kept = qemu
+            .audio_wav_path()
+            .with_file_name(format!("audio-{name}-smp{smp}.wav"));
+        if fs::rename(qemu.audio_wav_path(), &kept).is_ok() {
+            eprintln!("        {label}{name} smp={smp} wav kept at {}", kept.display());
+        }
+    }
+
+    Ok(AudioRun {
+        gaps,
+        counters,
+        broken: problems,
+        breaches,
+    })
+}
+
+/// Fast tier — one boot per config, run on every `cargo test`.
+///
+/// Certifies: this build's soundd counters sit inside their recorded per-run
+/// ceilings, the instrument is alive, and the capture does not *reproducibly*
+/// drop audio. It cannot certify a dropout *rate*; one run is one Bernoulli
+/// trial against a per-config rate measured at 0-7%, which discriminates
+/// nothing. That is what `--audio-gate` is for.
+///
+/// The dropout check keeps the strict zero-gap bar and adds a confirmation:
+/// a run that gaps is re-booted once, and only a second gap is a failure. No
+/// limit is widened by this. It is the 2-of-2 rule, and it is here because the
+/// alternative measured 12.8% red per invocation on an unmodified tree — a
+/// gate that cries wolf one run in eight is a gate that gets ignored, which is
+/// the failure mode that matters most for a check developers see every day.
+/// The first gap is still printed, and the capture still kept.
+fn run_audio_test(
+    name: &str,
+    smp: u32,
+    baseline: &ConfigBaseline,
+    test_config: &Path,
+    c_bins: &[(String, Vec<u8>)],
+    rust_bins: &[(String, Vec<u8>)],
+) -> Result<(), String> {
+    let run = measure_audio_run(name, smp, baseline, test_config, c_bins, rust_bins, "")?;
+
+    let problems = [run.broken.as_slice(), run.breaches.as_slice()].concat();
+    if !problems.is_empty() {
+        return Err(problems.join("\n    "));
+    }
+    if !run.dropped_audio() {
         return Ok(());
     }
 
-    // Keep the capture for post-mortem listening; the boot's Drop removes
-    // the original path.
-    let kept = qemu
-        .audio_wav_path()
-        .with_file_name(format!("failed-{name}-smp{smp}.wav"));
-    let _ = fs::rename(qemu.audio_wav_path(), &kept);
-    Err(format!(
-        "{}\n    wav kept at {}",
-        problems.join("\n    "),
-        kept.display()
-    ))
+    eprintln!(
+        "        {name} smp={smp} DROPOUT {} — rare on this tree ({} of {} recorded runs); \
+         re-booting once to confirm",
+        audio::format_histogram(&run.gaps),
+        baseline.sample.gap_runs,
+        baseline.sample.gap_sample,
+    );
+    let again = measure_audio_run(name, smp, baseline, test_config, c_bins, rust_bins, "confirm: ")?;
+    let problems = [again.broken.as_slice(), again.breaches.as_slice()].concat();
+    if !problems.is_empty() {
+        return Err(problems.join("\n    "));
+    }
+    if again.dropped_audio() {
+        return Err(format!(
+            "audio dropped out on two consecutive boots: {} then {}",
+            audio::format_histogram(&run.gaps),
+            audio::format_histogram(&again.gaps),
+        ));
+    }
+    eprintln!("        {name} smp={smp} not reproduced on the confirming boot");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Thorough tier: `cargo test -- --audio-gate N`
+// ---------------------------------------------------------------------------
+
+/// One config's fresh sample, accumulated over the N iterations.
+#[derive(Default)]
+struct GateSamples {
+    max_wake_lat_us: Vec<f64>,
+    underruns: Vec<f64>,
+    wakes: Vec<f64>,
+    drains: Vec<f64>,
+    gap_runs: u32,
+    ceiling_runs: u32,
+}
+
+/// A rejected statistic, ready to print.
+struct Verdict {
+    config: String,
+    statistic: String,
+    detail: String,
+}
+
+fn mwu_verdict(
+    config: &str,
+    statistic: &str,
+    base: &[f64],
+    fresh: &[f64],
+    worse_is_lower: bool,
+) -> Option<Verdict> {
+    let z = stats::mann_whitney_z(base, fresh);
+    let z = if worse_is_lower { -z } else { z };
+    let med = |v: &[f64]| {
+        let mut v = v.to_vec();
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        v[v.len() / 2]
+    };
+    (z > stats::Z_CRIT).then(|| Verdict {
+        config: config.to_string(),
+        statistic: statistic.to_string(),
+        detail: format!(
+            "median {:.0} -> {:.0} (Mann-Whitney z={z:.2} > {:.2})",
+            med(base),
+            med(fresh),
+            stats::Z_CRIT
+        ),
+    })
+}
+
+fn rate_verdict(
+    config: &str,
+    statistic: &str,
+    k1: u32,
+    n1: u32,
+    k0: u32,
+    n0: u32,
+) -> Option<Verdict> {
+    let p = stats::fisher_greater(k1, n1, k0, n0);
+    (p <= stats::ALPHA).then(|| Verdict {
+        config: config.to_string(),
+        statistic: statistic.to_string(),
+        detail: format!(
+            "{k1} of {n1} vs recorded {k0} of {n0} (Fisher p={p:.2e} <= {:.0e})",
+            stats::ALPHA
+        ),
+    })
+}
+
+/// Thorough tier — N iterations of all four configs, gating on *rates* and
+/// *distributions* rather than on single outcomes. This is what a
+/// scheduler-migration stage transition must pass (spec §11 gate A).
+///
+/// Certifies, at N=30 and the measured clean-tree distributions:
+///   * wake lateness has not shifted by 25% (detected 99.9% of the time) or
+///     20% (93%). A 10% shift is missed (4%).
+///   * periods of silence on the wire have not risen 25% (94%) or 50% (100%).
+///   * soundd is not being woken less often — the signature of completions
+///     being batched because it ran late. A 5% drop is caught 99.9% of the
+///     time.
+///   * the mid-tone dropout *rate* has not risen 10x (100%) or 5x (71%).
+///     A doubling is NOT detectable at this N and never will be at any N a
+///     human waits for: separating 3% from 7% at this confidence needs ~600
+///     runs per config. The counters above are the instrument with power; the
+///     dropout rate is the audible symptom, kept because it is the only
+///     statistic here that says "someone would have heard it".
+///
+/// False-red rate on a clean tree: 0.25%, measured over 2000 invocations
+/// simulated from the recorded distributions.
+fn run_audio_gate(
+    iterations: u32,
+    audio_baseline: &AudioBaseline,
+    audio_to_run: &[&str],
+    test_config: &Path,
+    c_bins: &[(String, Vec<u8>)],
+    rust_bins: &[(String, Vec<u8>)],
+) -> bool {
+    let configs: Vec<(&str, u32)> = audio_to_run
+        .iter()
+        .flat_map(|name| AUDIO_SMP.iter().map(move |&smp| (*name, smp)))
+        .collect();
+    let mut samples: BTreeMap<String, GateSamples> = BTreeMap::new();
+    let start = std::time::Instant::now();
+
+    eprintln!(
+        "\n[gate A] {iterations} iterations x {} configs, serial. Every per-run outcome \
+         becomes a rate; the verdict is on the collection, not on any one run.",
+        configs.len()
+    );
+
+    for iter in 1..=iterations {
+        for &(name, smp) in &configs {
+            let key = format!("{name}.smp{smp}");
+            let baseline = config_baseline(audio_baseline, name, smp);
+            let label = format!("[{iter}/{iterations}] ");
+            let run = match measure_audio_run(
+                name, smp, &baseline, test_config, c_bins, rust_bins, &label,
+            ) {
+                Ok(run) => run,
+                Err(err) => {
+                    eprintln!("\n[gate A] FAILED on iteration {iter}: {key} produced no measurement: {err}");
+                    eprintln!("[gate A] A run that does not complete is not a rare event to be \
+                               averaged away — every known cause of one has been fixed.");
+                    return false;
+                }
+            };
+            if !run.broken.is_empty() {
+                eprintln!("\n[gate A] FAILED on iteration {iter}: {key} instrument broken: {}",
+                          run.broken.join("; "));
+                return false;
+            }
+            let s = samples.entry(key).or_default();
+            s.max_wake_lat_us.push(run.counters.max_wake_lat_us as f64);
+            s.underruns.push(run.counters.underruns as f64);
+            s.wakes.push(run.counters.wakes as f64);
+            s.drains.push(run.counters.drains as f64);
+            s.gap_runs += u32::from(run.dropped_audio());
+            s.ceiling_runs += u32::from(!run.breaches.is_empty());
+        }
+
+        // Fail-side curtailment. Adding runs can only raise a count, so once a
+        // count passes the threshold for the *full* N the final verdict is
+        // already decided — stopping early costs no confidence.
+        if let Some(v) = curtail(&samples, audio_baseline, &configs, iterations) {
+            eprintln!("\n[gate A] FAILED after {iter} of {iterations} iterations (the remaining \
+                       runs cannot change this):");
+            eprintln!("    {} {}: {}", v.config, v.statistic, v.detail);
+            return false;
+        }
+    }
+
+    // ---- verdict ----------------------------------------------------------
+    let mut rejected: Vec<Verdict> = Vec::new();
+    let (mut pooled_gap_k, mut pooled_gap_n) = (0, 0);
+    let (mut pooled_ceil_k, mut pooled_ceil_n) = (0, 0);
+    let (mut base_gap_k, mut base_gap_n) = (0, 0);
+    let (mut base_ceil_k, mut base_ceil_n) = (0, 0);
+
+    eprintln!("\n[gate A] {iterations} iterations in {:.0?}. Fresh sample vs recorded sample:\n", start.elapsed());
+    for &(name, smp) in &configs {
+        let key = format!("{name}.smp{smp}");
+        let base = config_baseline(audio_baseline, name, smp).sample;
+        let s = &samples[&key];
+
+        rejected.extend(mwu_verdict(&key, "wake lateness", &base.max_wake_lat_us, &s.max_wake_lat_us, false));
+        rejected.extend(mwu_verdict(&key, "underruns", &base.underruns, &s.underruns, false));
+        rejected.extend(mwu_verdict(&key, "wakes", &base.wakes, &s.wakes, true));
+        rejected.extend(rate_verdict(&key, "dropout rate", s.gap_runs, iterations, base.gap_runs, base.gap_sample));
+
+        pooled_gap_k += s.gap_runs;
+        pooled_gap_n += iterations;
+        pooled_ceil_k += s.ceiling_runs;
+        pooled_ceil_n += iterations;
+        base_gap_k += base.gap_runs;
+        base_gap_n += base.gap_sample;
+        base_ceil_k += base.ceiling_runs;
+        base_ceil_n += base.max_wake_lat_us.len() as u32;
+
+        report_config(&key, base, s, iterations);
+    }
+    rejected.extend(rate_verdict("pooled", "dropout rate", pooled_gap_k, pooled_gap_n, base_gap_k, base_gap_n));
+    rejected.extend(rate_verdict("pooled", "per-run ceiling breaches", pooled_ceil_k, pooled_ceil_n, base_ceil_k, base_ceil_n));
+
+    eprintln!(
+        "  pooled dropouts {pooled_gap_k}/{pooled_gap_n} (recorded {base_gap_k}/{base_gap_n}), \
+         ceiling breaches {pooled_ceil_k}/{pooled_ceil_n} (recorded {base_ceil_k}/{base_ceil_n})"
+    );
+
+    if rejected.is_empty() {
+        eprintln!("\n[gate A] PASS — no statistic regressed at alpha={:.0e} per test.", stats::ALPHA);
+        true
+    } else {
+        eprintln!("\n[gate A] FAILED — {} statistic(s) regressed:", rejected.len());
+        for v in &rejected {
+            eprintln!("    {} {}: {}", v.config, v.statistic, v.detail);
+        }
+        false
+    }
+}
+
+/// Whether a count has already passed the threshold it would face at the full
+/// iteration count. Only the yes/no statistics curtail: a rank test's outcome
+/// is not monotone in the sample, so there is no honest early exit for it.
+fn curtail(
+    samples: &BTreeMap<String, GateSamples>,
+    audio_baseline: &AudioBaseline,
+    configs: &[(&str, u32)],
+    iterations: u32,
+) -> Option<Verdict> {
+    let mut pooled_gap = 0;
+    let mut pooled_ceil = 0;
+    let (mut base_gap_k, mut base_gap_n) = (0, 0);
+    let (mut base_ceil_k, mut base_ceil_n) = (0, 0);
+    for &(name, smp) in configs {
+        let key = format!("{name}.smp{smp}");
+        let base = config_baseline(audio_baseline, name, smp).sample;
+        let Some(s) = samples.get(&key) else { continue };
+        if let Some(v) = rate_verdict(&key, "dropout rate", s.gap_runs, iterations, base.gap_runs, base.gap_sample) {
+            return Some(v);
+        }
+        pooled_gap += s.gap_runs;
+        pooled_ceil += s.ceiling_runs;
+        base_gap_k += base.gap_runs;
+        base_gap_n += base.gap_sample;
+        base_ceil_k += base.ceiling_runs;
+        base_ceil_n += base.max_wake_lat_us.len() as u32;
+    }
+    let n = iterations * configs.len() as u32;
+    rate_verdict("pooled", "dropout rate", pooled_gap, n, base_gap_k, base_gap_n)
+        .or_else(|| rate_verdict("pooled", "per-run ceiling breaches", pooled_ceil, n, base_ceil_k, base_ceil_n))
+}
+
+/// Print one config's fresh sample next to the recorded one, in a form that can
+/// be pasted straight back into `tests/audio-baseline.toml` when a re-baseline
+/// is deliberate. The gate's output *is* the next baseline.
+fn report_config(key: &str, base: &BaselineSample, s: &GateSamples, iterations: u32) {
+    let stat = |v: &[f64]| {
+        let mut v = v.to_vec();
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        (v[0], v[v.len() / 2], v[v.len() - 1])
+    };
+    eprintln!("  {key}  (n={iterations}, recorded n={})", base.max_wake_lat_us.len());
+    for (label, b, f) in [
+        ("wake_lat_us", &base.max_wake_lat_us, &s.max_wake_lat_us),
+        ("underruns  ", &base.underruns, &s.underruns),
+        ("wakes      ", &base.wakes, &s.wakes),
+        ("drains     ", &base.drains, &s.drains),
+    ] {
+        let (bl, bm, bh) = stat(b);
+        let (fl, fm, fh) = stat(f);
+        eprintln!(
+            "    {label} recorded {bl:.0}/{bm:.0}/{bh:.0}   fresh {fl:.0}/{fm:.0}/{fh:.0}   (min/median/max)"
+        );
+    }
+    eprintln!(
+        "    dropouts    recorded {}/{}   fresh {}/{iterations}",
+        base.gap_runs, base.gap_sample, s.gap_runs
+    );
+    let fmt = |v: &[f64]| {
+        let mut v = v.to_vec();
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let v: Vec<String> = v.iter().map(|x| format!("{x:.0}")).collect();
+        format!("[{}]", v.join(", "))
+    };
+    eprintln!("    toml: max_wake_lat_us = {}", fmt(&s.max_wake_lat_us));
+    eprintln!("    toml: underruns = {}", fmt(&s.underruns));
+    eprintln!("    toml: wakes = {}", fmt(&s.wakes));
+    eprintln!("    toml: drains = {}", fmt(&s.drains));
 }
 
 // ---------------------------------------------------------------------------
@@ -604,6 +983,31 @@ fn main() {
     let list_mode = args.iter().any(|a| a == "--list");
     let nocapture = args.iter().any(|a| a == "--nocapture" || a == "--show-output");
 
+    // Thorough tier. A flag rather than an env var or a test name: an env var
+    // is invisible in the command line and easy to leave set, and a test name
+    // would drag ~17 minutes into every plain `cargo test`.
+    let mut audio_gate: Option<u32> = None;
+    let mut consumed: Vec<usize> = Vec::new();
+    for (i, a) in args.iter().enumerate() {
+        let n = if let Some(v) = a.strip_prefix("--audio-gate=") {
+            consumed.push(i);
+            v
+        } else if a == "--audio-gate" {
+            consumed.push(i);
+            consumed.push(i + 1);
+            args.get(i + 1).map(|s| s.as_str()).unwrap_or_else(|| {
+                panic!("--audio-gate needs an iteration count, e.g. --audio-gate 30")
+            })
+        } else {
+            continue;
+        };
+        let n: u32 = n
+            .parse()
+            .unwrap_or_else(|_| panic!("--audio-gate: {n:?} is not an iteration count"));
+        assert!(n >= 2, "--audio-gate needs at least 2 iterations to compare anything");
+        audio_gate = Some(n);
+    }
+
     if nocapture || debug_mode {
         common::qemu::VERBOSE.store(true, std::sync::atomic::Ordering::Relaxed);
     }
@@ -611,8 +1015,9 @@ fn main() {
     // Filter: first positional arg that isn't a flag
     let filter: Option<&str> = args
         .iter()
-        .find(|a| !a.starts_with('-'))
-        .map(|s| s.as_str());
+        .enumerate()
+        .find(|(i, a)| !a.starts_with('-') && !consumed.contains(i))
+        .map(|(_, s)| s.as_str());
 
     // Discover and compile C tests
     let c_names = discover_c_tests();
@@ -639,6 +1044,28 @@ fn main() {
 
     if debug_mode {
         run_debug_mode(&c_bins, &rust_bins);
+        return;
+    }
+
+    if let Some(iterations) = audio_gate {
+        let audio_to_run: Vec<&str> = AUDIO_TESTS
+            .iter()
+            .copied()
+            .filter(|n| filter.map_or(true, |f| n.contains(f)))
+            .collect();
+        assert!(!audio_to_run.is_empty(), "no audio test matches filter {filter:?}");
+        let test_config = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/testcases");
+        let ok = run_audio_gate(
+            iterations,
+            &load_audio_baseline(),
+            &audio_to_run,
+            &test_config,
+            &c_bins,
+            &rust_bins,
+        );
+        if !ok {
+            std::process::exit(1);
+        }
         return;
     }
 

@@ -4,3 +4,5 @@ pub mod audio;
 pub mod compile;
 #[allow(dead_code)]
 pub mod qemu;
+#[allow(dead_code)]
+pub mod stats;
