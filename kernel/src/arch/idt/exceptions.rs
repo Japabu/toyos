@@ -293,31 +293,24 @@ pub(crate) fn recover_or_halt(is_user: bool, is_ring3: bool) -> ! {
     apic::halt_all_cpus();
 }
 
-/// Recover from a panic in syscall context. Poisons the thread, tries to zombify,
-/// then rejoins the scheduler via lock-free schedule_no_return.
+/// Recover from a panic in syscall context. Hands the faulted thread to the
+/// idle loop through the poison set, then rejoins the scheduler via lock-free
+/// schedule_no_return.
+///
+/// Nothing here touches the process table, and that is the point. The faulted
+/// thread may hold any kernel lock, including the table's, so blocking on it
+/// can deadlock and a `try_lock` can fail — and a failed one used to leave the
+/// thread poisoned but never zombified, with its parent parked in `waitpid`
+/// forever. Cleanup has exactly one home now: the poison set is both the
+/// "do not re-schedule" mark and the cleanup request, and `schedule_no_return`
+/// jumps into `cpu_idle_loop`, which reaps it — zombify plus the waiter's wake
+/// — before it picks another task.
 pub(crate) fn try_recover_from_panic() -> ! {
-    let mut parent_to_wake = None;
     if let Some(tid) = percpu::current_tid() {
         let pid = percpu::current_pid().unwrap_or(crate::process::Pid(u32::MAX));
-        // Poison FIRST — lock-free, prevents re-scheduling
         scheduler::poison_tid(scheduler::TaskId(pid, tid));
-
-        // Try to zombify (non-blocking)
-        if let Some(mut guard) = process::PROCESS_TABLE.try_lock() {
-            if let Some(table) = guard.as_mut() {
-                if let Some(proc) = table.get(pid) {
-                    if let Some(ppid) = proc.parent() {
-                        parent_to_wake = table.get(ppid).map(|p| (ppid, p.main_tid()));
-                    }
-                }
-                process::zombify_tid(table,pid, tid, -1);
-            }
-        }
     }
     percpu::set_fault_state(CpuFaultState::Normal);
-    if let Some((ppid, ptid)) = parent_to_wake {
-        scheduler::wake_task(scheduler::TaskId(ppid, ptid));
-    }
     scheduler::schedule_no_return();
 }
 

@@ -27,9 +27,10 @@ Not hypothetical. A full survey of the kernel's allocation and teardown paths
 (2026-07-28) found the following, all cited to code:
 
 **`try_recover_from_panic` never frees anything.**
-`kernel/src/arch/idt/exceptions.rs:298` poisons the tid, zombifies, and
-reschedules. It never calls `teardown_resources` or `fd::close_all`. It is
-reached from the `#[panic_handler]` in syscall context
+`kernel/src/arch/idt/exceptions.rs:308` poisons the tid and reschedules; the
+zombify and the waiter's wake happen later, in the idle loop's poison reap
+(`scheduler.rs:1812`). Neither half calls `teardown_resources` or
+`fd::close_all`. It is reached from the `#[panic_handler]` in syscall context
 (`kernel/src/main.rs:139`), from ring-0 faults attributed to user code
 (`exceptions.rs:287`), and — because there is **no `#[alloc_error_handler]`
 anywhere in the workspace** — from *any heap OOM in syscall context*.

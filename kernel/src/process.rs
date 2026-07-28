@@ -542,6 +542,32 @@ pub fn zombify_tid(table: &mut ProcessTable, pid: Pid, tid: Tid, code: i32) {
     }
 }
 
+/// Zombify a thread that died in panic recovery, and name the waiter that
+/// must be woken for it.
+///
+/// The panic path itself cannot do this — it may hold any lock the faulted
+/// thread was holding — so it only records the thread in the poison set and
+/// this runs later, from the idle loop. Returning the waiter rather than
+/// waking it here keeps the wake outside the table lock, as every other exit
+/// path does.
+///
+/// The waiter is the same one the corresponding clean exit would wake: a main
+/// thread's death releases the parent's `waitpid` (`exit`), any other thread's
+/// releases its own process's `thread_join` (`thread_exit`). `None` means
+/// there is nothing to wake — the entry is already gone, or the process has
+/// no parent, in which case `collect_orphan_zombies` reaps it.
+#[must_use = "the waiter of a zombified thread must be woken"]
+pub fn zombify_poisoned(table: &mut ProcessTable, pid: Pid, tid: Tid) -> Option<(Pid, Tid)> {
+    let Some(proc) = table.get(pid) else { return None };
+    let waiter = if tid == proc.main_tid {
+        proc.parent.and_then(|ppid| table.get(ppid).map(|p| (ppid, p.main_tid)))
+    } else {
+        Some((pid, proc.main_tid))
+    };
+    zombify_tid(table, pid, tid, -1);
+    waiter
+}
+
 /// Sweep orphan zombie processes. Single pass — threads are structurally owned.
 pub fn collect_orphan_zombies(table: &mut ProcessTable, _proof: IdleProof) {
     let orphans: Vec<Pid> = table.iter()

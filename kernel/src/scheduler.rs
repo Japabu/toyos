@@ -108,15 +108,32 @@ fn leave_schedule() {
 
 // ---------------------------------------------------------------------------
 // Poison set — lock-free, prevents panicked threads from being re-scheduled
+// AND carries them to `cpu_idle_loop`, their only cleanup site
 // ---------------------------------------------------------------------------
 
 static POISONED: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(u64::MAX) }; MAX_CPUS];
 
-/// Mark a thread as poisoned (panicked). Lock-free — safe from panic context.
+/// Mark a thread as poisoned (panicked). Lock-free — the panic path can hold
+/// any lock, so this is the only thing it is allowed to do.
+///
+/// The mark is not just "do not re-schedule": it is the request that gets the
+/// thread zombified and its waiter woken, so losing one strands a `waitpid`
+/// forever. One slot per CPU suffices — the panic path's next act is
+/// `schedule_no_return` into this CPU's idle loop, which reaps every slot
+/// before it picks another task, so a CPU cannot poison twice over one slot.
 pub fn poison_tid(id: TaskId) {
     let cpu = percpu::cpu_id() as usize;
-    if cpu < MAX_CPUS {
-        POISONED[cpu].store(id.pack(), Ordering::Release);
+    // Bounded by AP bring-up, which indexes its own `MAX_CPUS` arrays by
+    // cpu id. Neither arm below can fire; both scream rather than drop the
+    // record, because dropping it is the wedge this set exists to prevent.
+    let Some(slot) = POISONED.get(cpu) else {
+        crate::log!("poison_tid: cpu {cpu} >= MAX_CPUS — {id} will never be reaped");
+        return;
+    };
+    let prev = slot.swap(id.pack(), Ordering::Release);
+    if prev != u64::MAX {
+        crate::log!("poison_tid: cpu {cpu} slot still held {} — its waiter is stranded",
+            TaskId::unpack(prev));
     }
 }
 
@@ -1792,20 +1809,29 @@ fn cpu_idle_loop() -> ! {
 
         let next_deadline = drain_events();
 
+        // Reap threads that died in panic recovery. This is their *only*
+        // cleanup: `try_recover_from_panic` cannot touch the process table
+        // (it may hold any lock the faulted thread held), so it hands the
+        // thread over through the poison set and jumps straight here.
+        // Fixed-size, so an idle iteration that reaps nothing allocates nothing.
+        let mut wakes = [None; MAX_CPUS];
         {
             let mut guard = process::PROCESS_TABLE.lock();
             let table = guard.as_mut().unwrap();
             process::collect_orphan_zombies(table,idle_proof);
 
-            // Zombify poisoned threads that couldn't be cleaned up during panic recovery
-            // (try_lock failed at panic time, so cleanup was deferred to the idle loop).
-            for slot in &POISONED {
+            for (slot, wake) in POISONED.iter().zip(wakes.iter_mut()) {
                 let raw = slot.load(Ordering::Relaxed);
                 if raw == u64::MAX { continue; }
                 let id = TaskId::unpack(raw);
-                process::zombify_tid(table, id.0, id.1, -1);
+                *wake = process::zombify_poisoned(table, id.0, id.1);
+                // Before the wake below: `wake_task` drops wakes aimed at a
+                // poisoned task, and the waiter may be poisoned itself.
                 clear_poison(id);
             }
+        }
+        for (pid, tid) in wakes.into_iter().flatten() {
+            wake_task(TaskId(pid, tid));
         }
 
         let cpu = percpu::cpu_id() as usize;
