@@ -218,10 +218,13 @@ pub fn init() {
 // Create
 // ---------------------------------------------------------------------------
 
+/// Largest submission ring a process may ask for. Bounds every quantity in
+/// `submit_sqes` that a process can influence.
+const MAX_SQ_DEPTH: u32 = 256;
+
 /// Create an io_uring instance. Returns (ring_id, shared_memory_token).
 pub fn create(depth: u32) -> Result<(RingId, SharedToken), SyscallError> {
-    // Validate: power of 2, max 256
-    if depth == 0 || depth > 256 || !depth.is_power_of_two() {
+    if depth == 0 || depth > MAX_SQ_DEPTH || !depth.is_power_of_two() {
         return Err(SyscallError::InvalidArgument);
     }
 
@@ -292,9 +295,7 @@ pub fn has_completions(ring_id: RingId) -> bool {
 }
 
 fn cq_count(ring_id: RingId) -> Result<u32, SyscallError> {
-    let guard = IO_URINGS.lock();
-    let map = guard.as_ref().expect("io_uring not initialized");
-    Ok(map.get(ring_id).ok_or(SyscallError::NotFound)?.cq_count())
+    with_instance(ring_id, |inst| inst.cq_count())
 }
 
 /// Process SQEs and wait for completions. Called from the syscall handler.
@@ -350,34 +351,50 @@ pub fn enter(
 }
 
 /// Read and process SQEs from the submission ring.
+///
+/// Both inputs are untrusted: `count` is a syscall argument, and the `head`/
+/// `tail` the ring depth is measured against live in the 2 MiB page the
+/// process maps and writes itself. Neither is clamped — a request the ring
+/// could never honestly hold is refused, because clamping would silently
+/// turn a lie into a smaller lie.
 fn submit_sqes(ring_id: RingId, count: u32) -> Result<(), SyscallError> {
+    if count > with_instance(ring_id, |inst| inst.sq_size)? {
+        return Err(SyscallError::InvalidArgument);
+    }
+    for _ in 0..count {
+        let Some(sqe) = claim_sqe(ring_id)? else { break };
+        process_sqe(ring_id, &sqe);
+    }
+    Ok(())
+}
+
+/// Take the SQE at the ring head, advancing it. `None` when the ring is empty.
+///
+/// One SQE at a time under the lock rather than a batch copied into a `Vec`:
+/// the batch's capacity was the only userland-sized allocation in this file,
+/// and processing needs the lock released between entries either way.
+fn claim_sqe(ring_id: RingId) -> Result<Option<IoUringSqe>, SyscallError> {
+    with_instance(ring_id, |instance| {
+        let sq = instance.sq_header();
+        let head = sq.head.load(Ordering::Acquire);
+        let tail = sq.tail.load(Ordering::Acquire);
+        let available = tail.wrapping_sub(head);
+        if available == 0 {
+            return Ok(None);
+        }
+        if available > instance.sq_size {
+            return Err(SyscallError::InvalidArgument);
+        }
+        let sqe = *instance.sqe_at(head & (instance.sq_size - 1));
+        sq.head.store(head.wrapping_add(1), Ordering::Release);
+        Ok(Some(sqe))
+    })?
+}
+
+fn with_instance<R>(ring_id: RingId, f: impl FnOnce(&IoUringInstance) -> R) -> Result<R, SyscallError> {
     let guard = IO_URINGS.lock();
     let map = guard.as_ref().expect("io_uring not initialized");
-    let instance = map.get(ring_id).ok_or(SyscallError::NotFound)?;
-
-    let sq = instance.sq_header();
-    let head = sq.head.load(Ordering::Acquire);
-    let tail = sq.tail.load(Ordering::Acquire);
-    let available = tail.wrapping_sub(head);
-    let to_process = count.min(available);
-
-    // Copy SQEs out so we can release the lock
-    let mut sqes = Vec::with_capacity(to_process as usize);
-    for i in 0..to_process {
-        let idx = (head.wrapping_add(i)) & (instance.sq_size - 1);
-        sqes.push(*instance.sqe_at(idx));
-    }
-
-    // Advance SQ head
-    sq.head.store(head.wrapping_add(to_process), Ordering::Release);
-    drop(guard);
-
-    // Process each SQE
-    for sqe in &sqes {
-        process_sqe(ring_id, sqe);
-    }
-
-    Ok(())
+    Ok(f(map.get(ring_id).ok_or(SyscallError::NotFound)?))
 }
 
 /// Process a single SQE.
