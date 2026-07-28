@@ -27,6 +27,7 @@
 
 use core::marker::PhantomData;
 
+use crate::listener::ListenerId;
 use crate::pipe::PipeId;
 use crate::scheduler::{self, EventSource, TaskId};
 use crate::DirectMap;
@@ -49,6 +50,11 @@ impl WaitQueue {
     /// queue is shared across the processes that map it.
     pub fn futex(addr: DirectMap) -> Self {
         Self(EventSource::Futex(addr))
+    }
+
+    /// Threads in `accept` on one listener.
+    pub fn listener(id: ListenerId) -> Self {
+        Self(EventSource::Listener(id))
     }
 
     /// Phase 1: register the running thread. The caller must then re-check

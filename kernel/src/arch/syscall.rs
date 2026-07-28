@@ -6,7 +6,7 @@ use crate::drivers::acpi;
 use crate::sync::Lock;
 use crate::user_ptr::SyscallContext;
 use crate::waitq::WaitQueue;
-use crate::{device, fd, keyboard, listener, log, pipe, process, scheduler, shared_memory, vfs};
+use crate::{device, fd, keyboard, listener, log, pipe, process, shared_memory, vfs};
 use crate::{DirectMap, UserAddr};
 
 // MSR addresses
@@ -830,7 +830,7 @@ fn sys_accept(fd_num: u32) -> u64 {
                 Err(e) => e.to_u64(),
             };
         }
-        process::block(Some(scheduler::EventSource::Listener(listener_id)), 0);
+        WaitQueue::listener(listener_id).wait(0);
     }
 }
 
