@@ -119,6 +119,21 @@
 #   says "someone would have heard it"; the counters are what actually decide
 #   whether a stage regressed.
 #
+#   WHY FIXED N AND NOT A SEQUENTIAL TEST. An SPRT on the dropout rate would
+#   accept a clean tree after ~17 iterations instead of 30, saving about a
+#   third of the wall clock. Two reasons not to: the run is also the artefact
+#   you re-baseline from, and a variable-length sample is not comparable to the
+#   one recorded here; and the accept rule would have to be combined across all
+#   18 statistics, which is where the honesty of the alpha would go to die.
+#   What is taken from the sequential idea is the cheap half — fail-side
+#   curtailment. A count can only rise, so once one passes the threshold it
+#   would face at the full N, the verdict is already decided and the run stops.
+#   A badly broken tree fails in minutes; a clean one pays the full 17.
+#
+#   ALPHA IS 0.001 PER TEST, and it is a constant in `tests/common/stats.rs`,
+#   not a field here. A gate whose alpha can be raised is a gate that will be
+#   raised on the afternoon it goes red.
+#
 # ===========================================================================
 # THE RECORDED SAMPLE
 # ===========================================================================
