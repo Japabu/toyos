@@ -71,6 +71,19 @@ pub fn disable() {
     }
 }
 
+/// Drop the count without polling `need_resched`, for a caller that is about
+/// to reschedule anyway (the wait ticket's park — see `waitq`). The request
+/// stays set, so nothing is dropped: the imminent `do_schedule` serves it, and
+/// if the caller changes its mind the next poll picks it up.
+#[inline]
+pub fn enable_no_resched() {
+    if !percpu_ready() { return; }
+    unsafe {
+        asm!("lock sub dword ptr gs:[240], 1",
+            options(nostack, preserves_flags));
+    }
+}
+
 #[inline]
 pub fn enable() {
     if !percpu_ready() { return; }

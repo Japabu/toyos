@@ -12,6 +12,7 @@ use crate::listener::ListenerId;
 use crate::pipe::PipeId;
 use crate::process::{self, IdleProof, OwnedAlloc, PageTables, Pid, Tid, KERNEL_STACK_SIZE};
 use crate::sync::Lock;
+use crate::waitq::WaitTicket;
 use crate::DirectMap;
 
 pub const MAX_CPUS: usize = 8;
@@ -604,16 +605,30 @@ impl<'a> CpuQueueGuard<'a> {
 // BlockedPool — event-indexed blocked threads with deadline heap
 // ---------------------------------------------------------------------------
 
+/// A thread that has registered on a wait queue but has not reached the pool
+/// yet — spec §8.1's `Committing` state, in the shape the old pool can hold.
+///
+/// The registration is what makes the park window harmless: a wake that finds
+/// no parked waiter marks `fired` here instead, and `park_outgoing` honors the
+/// mark rather than parking. Both sides run under the pool lock, so a wake
+/// either marks the registration or finds the thread already parked.
+struct Prepared {
+    source: EventSource,
+    fired: bool,
+}
+
 struct BlockedPool {
     threads: HashMap<TaskId, TaskCtx>,
     by_event: BTreeMap<EventSource, Vec<TaskId>>,
     deadlines: BTreeMap<(u64, TaskId), TaskId>,
-    /// Sticky wakes: `wake_task` targets that were not in the pool (the
-    /// thread was in its park window — committed to blocking but not yet
-    /// inserted). Consumed at park time so a waitpid/thread_join wake can
-    /// never vanish into the window. A leftover entry for a task that never
-    /// parks again costs one spurious wake after Tid reuse — harmless, all
-    /// block paths retry in a loop.
+    /// Registrations of threads still in their park window (see `Prepared`).
+    prepared: HashMap<TaskId, Prepared>,
+    /// Sticky wakes: `wake_task` targets that were not in the pool and hold no
+    /// registration either — a park window belonging to a source that stage 5
+    /// has not converted yet. Consumed at park time so a waitpid/thread_join
+    /// wake can never vanish into the window. A leftover entry for a task that
+    /// never parks again costs one spurious wake after Tid reuse — harmless,
+    /// all block paths retry in a loop.
     pending_wakes: HashSet<TaskId>,
 }
 
@@ -623,8 +638,25 @@ impl BlockedPool {
             threads: HashMap::new(),
             by_event: BTreeMap::new(),
             deadlines: BTreeMap::new(),
+            prepared: HashMap::new(),
             pending_wakes: HashSet::new(),
         }
+    }
+
+    /// Mark up to `limit` registrations for `event`. A marked registration
+    /// counts as a woken waiter: its park will decline and the thread runs on.
+    fn fire_prepared(&mut self, event: &EventSource, limit: usize) -> usize {
+        let mut fired = 0;
+        for p in self.prepared.values_mut() {
+            if fired == limit {
+                break;
+            }
+            if p.source == *event && !p.fired {
+                p.fired = true;
+                fired += 1;
+            }
+        }
+        fired
     }
 
     fn insert(&mut self, mut ctx: TaskCtx) {
@@ -662,8 +694,10 @@ impl BlockedPool {
         Some(ctx)
     }
 
-    /// Wake all threads waiting on an event source into a batch.
+    /// Wake all threads waiting on an event source into a batch, and mark
+    /// every registration for it — the waiters still in their park window.
     fn take_by_event_into(&mut self, event: &EventSource, batch: &mut WokenBatch) {
+        self.fire_prepared(event, usize::MAX);
         let Some(waiters) = self.by_event.remove(event) else { return };
         for id in waiters {
             if let Some(ctx) = self.remove_task(id) {
@@ -672,19 +706,25 @@ impl BlockedPool {
         }
     }
 
-    /// Wake up to `count` threads waiting on an event source.
-    fn take_by_event_limited(&mut self, event: &EventSource, count: usize, batch: &mut WokenBatch) {
-        let Some(waiters) = self.by_event.get_mut(event) else { return };
-        let n = count.min(waiters.len());
-        let ids_to_wake: Vec<TaskId> = waiters.drain(..n).collect();
-        if waiters.is_empty() {
-            self.by_event.remove(event);
-        }
-        for id in ids_to_wake {
-            if let Some(ctx) = self.remove_task(id) {
-                batch.push(ctx);
+    /// Wake up to `count` threads waiting on an event source: parked ones
+    /// first, then registrations in the park window. Returns how many were
+    /// woken in total.
+    fn take_by_event_limited(&mut self, event: &EventSource, count: usize, batch: &mut WokenBatch) -> usize {
+        let mut woken = 0;
+        if let Some(waiters) = self.by_event.get_mut(event) {
+            let n = count.min(waiters.len());
+            let ids_to_wake: Vec<TaskId> = waiters.drain(..n).collect();
+            if waiters.is_empty() {
+                self.by_event.remove(event);
+            }
+            for id in ids_to_wake {
+                if let Some(ctx) = self.remove_task(id) {
+                    batch.push(ctx);
+                    woken += 1;
+                }
             }
         }
+        woken + self.fire_prepared(event, count - woken)
     }
 }
 
@@ -946,8 +986,41 @@ pub fn enqueue_new(ctx: TaskCtx) {
 
 /// Block the current thread on an optional event source with optional deadline.
 /// `deadline = 0` means no timeout. `event = None` means woken only by `wake_task` or deadline.
+///
+/// The unconverted sources of spec stage 5 still enter here; converted ones
+/// come through [`block_on`], which cannot be called without a registration.
 pub fn block(event: Option<EventSource>, deadline: u64) {
     do_schedule(SwitchReason::Block { event, deadline });
+}
+
+/// Park the running thread on the queue it registered with.
+///
+/// Taking the ticket by value is the whole point: a park that reaches the pool
+/// without a registration behind it is the lost-wake window, and there is no
+/// other way to construct one.
+pub fn block_on(ticket: WaitTicket<'_>, deadline: u64) {
+    do_schedule(SwitchReason::Block { event: Some(ticket.into_park()), deadline });
+}
+
+/// Register the running thread on `source` — `WaitQueue::prepare_wait`'s half
+/// inside the pool. Returns the registered task, which the ticket carries.
+pub(crate) fn register_wait(source: EventSource) -> TaskId {
+    let id = TaskId(
+        percpu::current_pid().expect("prepare_wait: no current process"),
+        percpu::current_tid().expect("prepare_wait: no current thread"),
+    );
+    let prev = SCHEDULER.blocked.lock_unwrap().prepared.insert(
+        id,
+        Prepared { source, fired: false },
+    );
+    assert!(prev.is_none(), "prepare_wait: {id} is already registered on a queue");
+    id
+}
+
+/// Withdraw a registration — `WaitTicket::cancel`.
+pub(crate) fn cancel_wait(id: TaskId) {
+    let prev = SCHEDULER.blocked.lock_unwrap().prepared.remove(&id);
+    assert!(prev.is_some(), "cancel_wait: {id} holds no registration");
 }
 
 pub fn yield_now() {
@@ -1119,9 +1192,13 @@ pub fn wake_task(id: TaskId) {
             None => {
                 // Not in the pool: either running/ready (wake is moot) or in
                 // its park window — committed to blocking but not yet
-                // inserted. Record a sticky wake consumed at park time so
-                // the wake survives the window instead of vanishing.
-                pool.pending_wakes.insert(id);
+                // inserted. A registered thread takes the wake on its ticket,
+                // whatever source it registered on; the rest need the sticky
+                // set until stage 5 has converted them.
+                match pool.prepared.get_mut(&id) {
+                    Some(p) => p.fired = true,
+                    None => { pool.pending_wakes.insert(id); }
+                }
                 return;
             }
         }
@@ -1176,8 +1253,11 @@ enum ScanResult {
 
 fn scan_remove(id: TaskId) -> ScanResult {
     let mut pool = SCHEDULER.blocked.lock_unwrap();
-    // A retired task can never consume a sticky wake — discard any aimed at it.
+    // A retired task can never consume a wake aimed at its park window —
+    // discard both forms. Its registration dies with it: retire yanks the ctx
+    // out of the outgoing slot, so park_outgoing never runs to clear it.
     pool.pending_wakes.remove(&id);
+    pool.prepared.remove(&id);
     if let Some(ctx) = pool.remove_task(id) {
         // Blocked threads are not counted runnable — no refcount change.
         return ScanResult::Removed(ctx);
@@ -1283,11 +1363,10 @@ pub fn futex_wake(phys_addr: DirectMap, count: usize) -> u64 {
     let _transit = TransitGuard::new();
     FUTEX_WAKE_GEN.fetch_add(1, Ordering::Relaxed);
     let mut batch = WokenBatch::new();
-    {
+    let n = {
         let mut pool = SCHEDULER.blocked.lock_unwrap();
-        pool.take_by_event_limited(&EventSource::Futex(phys_addr), count, &mut batch);
-    }
-    let n = batch.threads.len() as u64;
+        pool.take_by_event_limited(&EventSource::Futex(phys_addr), count, &mut batch) as u64
+    };
     drop(_futex);
     if !batch.is_empty() {
         SCHEDULER.enqueue_batch(batch);
@@ -1378,24 +1457,6 @@ unsafe impl Sync for DrainBuf {}
 static DRAIN_BUFS: [DrainBuf; MAX_CPUS] =
     [const { DrainBuf(UnsafeCell::new([EventSource::Keyboard; EVENT_QUEUE_SIZE])) }; MAX_CPUS];
 
-/// Is a waited-on source currently ready? Used to recover from event-queue
-/// overflow: dropped events are unidentifiable, so readiness is re-derived
-/// per source instead. Futex reports false — futex wakes carry no queryable
-/// state; the wake-generation counter covers their race.
-fn event_ready(event: &EventSource) -> bool {
-    match event {
-        EventSource::Keyboard => crate::keyboard::has_data(),
-        EventSource::Mouse => crate::mouse::has_data(),
-        EventSource::Network => crate::net::has_packet(),
-        EventSource::Listener(id) => crate::listener::has_pending_by_id(*id),
-        EventSource::PipeReadable(id) => crate::pipe::has_data(*id),
-        EventSource::PipeWritable(id) => crate::pipe::has_space(*id),
-        EventSource::Audio => crate::audio::has_pending(),
-        EventSource::Futex(_) => false,
-        EventSource::IoUring(ring) => crate::io_uring::has_completions(*ring),
-    }
-}
-
 /// Drain per-CPU event queue and wake affected threads. One lock acquisition.
 /// Process pending events and expired deadlines. Returns the next deadline
 /// (absolute nanos_since_boot), or 0 if no threads have deadlines.
@@ -1467,7 +1528,7 @@ fn drain_events() -> u64 {
         let waited: Vec<EventSource> = SCHEDULER.blocked.lock_unwrap()
             .by_event.keys().copied().collect();
         let ready: Vec<EventSource> = waited.into_iter()
-            .filter(|e| event_ready(e))
+            .filter(crate::waitq::source_ready)
             .collect();
         if !ready.is_empty() {
             let mut pool = SCHEDULER.blocked.lock_unwrap();
@@ -1613,11 +1674,14 @@ fn do_schedule(reason: SwitchReason) {
     leave_schedule();
 }
 
-/// Move the outgoing thread into the blocked pool and close the two races
-/// the park window opens: the LAPIC one-shot for this CPU was armed before
-/// this deadline existed in the pool (re-arm if earlier), and a wake for
-/// `event` may have been consumed before insertion (callers re-check).
-fn park_outgoing(queue: CpuQueueGuard<'_>, mut old: TaskCtx, event: Option<EventSource>, deadline: u64) {
+/// Move the outgoing thread into the blocked pool, or decline the park when a
+/// wake reached it in the window. Returns whether the thread held a
+/// registration — a converted source needs no further recheck, an unconverted
+/// one does (see `handle_outgoing`).
+///
+/// The other race the window opens is the LAPIC one-shot: this CPU's timer was
+/// armed before the deadline existed in the pool, so re-arm if it is earlier.
+fn park_outgoing(queue: CpuQueueGuard<'_>, mut old: TaskCtx, event: Option<EventSource>, deadline: u64) -> bool {
     old.blocked_on = event;
     old.deadline = deadline;
     let tag = event.as_ref()
@@ -1628,6 +1692,7 @@ fn park_outgoing(queue: CpuQueueGuard<'_>, mut old: TaskCtx, event: Option<Event
     drop(queue);
 
     let mut pool = SCHEDULER.blocked.lock_unwrap();
+    let prepared = pool.prepared.remove(&old.id);
     // The kill mark is checked under the pool lock, adjacent to the insert:
     // a check before taking the lock would leave a gap where retire_task's
     // scan misses the ctx (not yet in the pool) while the mark misses the
@@ -1637,12 +1702,21 @@ fn park_outgoing(queue: CpuQueueGuard<'_>, mut old: TaskCtx, event: Option<Event
         drop(pool);
         SCHEDULER.leave_runnable(pid);
         drop(old);
-        return;
+        return prepared.is_some();
     }
-    if pool.pending_wakes.remove(&old.id) {
-        // A wake_task raced the park window — honor it now: stay runnable
-        // and requeue locally instead of parking. Spurious from the
-        // blocker's view; all block paths retry in a loop.
+    if let Some(p) = &prepared {
+        assert_eq!(Some(p.source), event,
+            "park_outgoing: {} parked on a source it did not register on", old.id);
+    }
+    // A wake landed between the decision to block and this insert: for a
+    // registered source it marked the ticket, for the rest only wake_task's
+    // sticky set can report it. The sticky entry is consumed either way —
+    // left behind, it would fire again at the next park.
+    let sticky = pool.pending_wakes.remove(&old.id);
+    let woken_in_window = prepared.as_ref().is_some_and(|p| p.fired) || sticky;
+    if woken_in_window {
+        // Honor it now: stay runnable and requeue locally instead of parking.
+        // Spurious from the blocker's view; all block paths retry in a loop.
         drop(pool);
         old.blocked_on = None;
         old.deadline = 0;
@@ -1655,7 +1729,7 @@ fn park_outgoing(queue: CpuQueueGuard<'_>, mut old: TaskCtx, event: Option<Event
         if is_rt {
             crate::preempt::set_need_resched();
         }
-        return;
+        return prepared.is_some();
     }
     SCHEDULER.leave_runnable(pid);
     pool.insert(old);
@@ -1663,6 +1737,7 @@ fn park_outgoing(queue: CpuQueueGuard<'_>, mut old: TaskCtx, event: Option<Event
     if deadline > 0 {
         crate::arch::apic::ensure_armed_before(deadline);
     }
+    prepared.is_some()
 }
 
 fn handle_outgoing() {
@@ -1690,15 +1765,15 @@ fn handle_outgoing() {
             queue.insert(vrt, old);
         }
         SwitchReason::Block { event, deadline } => {
-            park_outgoing(queue, old, event, deadline);
-            // drain_events (called earlier in do_schedule) may have consumed
-            // the wake for `event` before this thread entered the pool.
-            // Re-derive readiness for EVERY source and wake immediately —
-            // any variant left out of this recheck (PipeWritable and
-            // Listener once were) turns the race into a permanent
+            let ticketed = park_outgoing(queue, old, event, deadline);
+            // Unconverted sources (spec stage 5) have nothing to mark in the
+            // park window, so their race is still covered the old way: a wake
+            // consumed before the insert is recovered by re-deriving
+            // readiness. Any variant left out of this recheck (PipeWritable
+            // and Listener once were) turns the race into a permanent
             // writer/accept deadlock. Spurious wakes are fine, all blocking
             // paths retry in a loop.
-            let raced = event.as_ref().map_or(false, event_ready);
+            let raced = !ticketed && event.as_ref().is_some_and(crate::waitq::source_ready);
             if raced {
                 wake_by_event(event.unwrap());
             }
@@ -1720,9 +1795,14 @@ fn handle_outgoing() {
             let pid = old.id.0;
             drop(queue);
             SCHEDULER.leave_runnable(pid);
-            // Terminal park: a sticky wake aimed at this thread can never be
-            // consumed — drop it so pending_wakes doesn't grow unboundedly.
-            SCHEDULER.blocked.lock_unwrap().pending_wakes.remove(&old.id);
+            // Terminal park: nothing aimed at this thread's park window can
+            // ever be consumed — drop it so neither index grows unboundedly.
+            // A live registration here means the thread died (panic recovery)
+            // between prepare_wait and its park.
+            let mut pool = SCHEDULER.blocked.lock_unwrap();
+            pool.pending_wakes.remove(&old.id);
+            pool.prepared.remove(&old.id);
+            drop(pool);
             drop(old);
         }
     }

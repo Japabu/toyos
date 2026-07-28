@@ -5,6 +5,7 @@ use super::{apic, cpu, gdt};
 use crate::drivers::acpi;
 use crate::sync::Lock;
 use crate::user_ptr::SyscallContext;
+use crate::waitq::WaitQueue;
 use crate::{device, fd, keyboard, listener, log, pipe, process, scheduler, shared_memory, vfs};
 use crate::{DirectMap, UserAddr};
 
@@ -463,11 +464,7 @@ fn sys_write(fd_num: u32, buf: &[u8]) -> u64 {
                     let pipe_id = data.fds.get(fd_num).and_then(|d| d.pipe_id_write());
                     Ok((n, pipe_id))
                 }
-                None => {
-                    let block = data.fds.get(fd_num).and_then(|d| d.pipe_id_write())
-                        .map(|id| crate::scheduler::EventSource::PipeWritable(id));
-                    Err(block)
-                }
+                None => Err(data.fds.get(fd_num).and_then(|d| d.pipe_id_write())),
             }
         });
         match action {
@@ -475,13 +472,14 @@ fn sys_write(fd_num: u32, buf: &[u8]) -> u64 {
                 if let Some(id) = pipe_id { process::wake_pipe_readers(id); }
                 return n;
             }
-            Err(Some(event)) => process::block(Some(event), 0),
+            Err(Some(id)) => WaitQueue::pipe_writable(id).wait(0),
             Err(None) => return SyscallError::NotFound.to_u64(),
         }
     }
 }
 
 enum ReadBlock {
+    Pipe(pipe::PipeId),
     Event(crate::scheduler::EventSource),
     EventWithDeadline(crate::scheduler::EventSource, u64),
 }
@@ -501,7 +499,7 @@ fn sys_read(fd_num: u32, buf: &mut [u8]) -> u64 {
                     } else if matches!(desc, Some(fd::Descriptor::Audio { info_read: true, .. })) {
                         Err(Some(ReadBlock::Event(crate::scheduler::EventSource::Audio)))
                     } else if let Some(id) = desc.and_then(|d| d.pipe_id_read()) {
-                        Err(Some(ReadBlock::Event(crate::scheduler::EventSource::PipeReadable(id))))
+                        Err(Some(ReadBlock::Pipe(id)))
                     } else if matches!(desc, Some(fd::Descriptor::SerialConsole)) {
                         let deadline = crate::clock::nanos_since_boot() + 10_000_000;
                         Err(Some(ReadBlock::EventWithDeadline(crate::scheduler::EventSource::Keyboard, deadline)))
@@ -516,6 +514,7 @@ fn sys_read(fd_num: u32, buf: &mut [u8]) -> u64 {
                 if let Some(id) = pipe_id { process::wake_pipe_writers(id); }
                 return n;
             }
+            Err(Some(ReadBlock::Pipe(id))) => WaitQueue::pipe_readable(id).wait(0),
             Err(Some(ReadBlock::Event(event))) => process::block(Some(event), 0),
             Err(Some(ReadBlock::EventWithDeadline(event, deadline))) => process::block(Some(event), deadline),
             Err(None) => return SyscallError::NotFound.to_u64(),

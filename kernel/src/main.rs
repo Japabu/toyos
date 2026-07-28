@@ -37,6 +37,7 @@ mod symbols;
 mod process;
 mod loader;
 mod scheduler;
+mod waitq;
 mod preempt;
 mod irq_ring;
 mod trace;
