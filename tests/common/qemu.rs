@@ -143,6 +143,28 @@ impl QemuInstance {
         self.stdin.flush().expect("Failed to flush QEMU stdin");
     }
 
+    /// Keep collecting serial output for `dur` after a test has returned.
+    /// soundd flushes its final stats window when the last client leaves,
+    /// which races the client process's exit — so the line the audio gate
+    /// reads lands on either side of `===TEST_END===`.
+    pub fn drain_serial(&mut self, dur: Duration) -> String {
+        let deadline = Instant::now() + dur;
+        let mut out = String::new();
+        loop {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return out;
+            };
+            match self.rx.recv_timeout(remaining) {
+                Ok(line) => {
+                    out.push_str(&line);
+                    out.push('\n');
+                }
+                Err(RecvTimeoutError::Timeout) => return out,
+                Err(RecvTimeoutError::Disconnected) => return out,
+            }
+        }
+    }
+
     pub fn run_test(&mut self, name: &str, timeout: Duration) -> TestResult {
         writeln!(self.stdin, "run {name}").expect("Failed to write to QEMU stdin");
         self.stdin.flush().expect("Failed to flush QEMU stdin");

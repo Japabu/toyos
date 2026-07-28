@@ -1,23 +1,100 @@
-# Recorded audio-glitch baselines — scheduler-core migration gate A
-# (specs/scheduler-core-spec.md §11, recorded at Stage 0).
+# Audio gate (gate A) baselines — one section per (test, smp) config.
+# specs/scheduler-core-spec.md §11, specs/audio-subsystem-spec.md §5.4/§5.9,
+# specs/audio-glitch-distribution-2026-07-28.md.
 #
-# Each entry holds the underrun histogram measured on the Stage 0 tree for
-# one (test, smp) config: `gaps` maps gap length in device periods (2.902ms,
-# rounded) to the count of such mid-signal zero runs in one 3s-tone run.
-# An absent `gaps` table means the config measured clean — the strict
-# zero-gap baseline.
+# Every config must appear here. A missing section is a hard error, not a
+# pass: an ungated config would go green by omission.
 #
-# Migration stages 1-6 gate on no regression vs these histograms (total
-# count and longest gap class, tests/common/audio.rs check_gap_regression);
-# Stage 7 replaces this mechanism with the strict zero-gap target. Re-record
-# deliberately, never to paper over a regression: run `cargo test -- audio`
-# and copy the histograms printed next to each test.
+# Two independent instruments per config; both must hold.
 #
-# Example of a non-clean entry:
-#   [audio_tone_load.smp1]
-#   gaps = { "1" = 3, "4" = 1 }   # three 1-period gaps, one 4-period gap
+#   gaps              Underrun histogram from the captured wav, keyed by gap
+#                     length in whole device periods (2.902ms). An absent
+#                     table is the strict zero-gap bar, which is what all four
+#                     configs carry — the quality target is no dropouts, and
+#                     recording a non-empty histogram here would be a decision
+#                     to accept audible ones.
+#   max_wake_lat_us   Worst single stats window of soundd waking later than
+#                     its predicted DMA completion.
+#   drains            Cycles that found the entire DMA pipeline free (§5.9).
+#   underruns         Periods submitted with no client audio behind them.
+#
+# Why the counters are here at all: the wav is a rare-event detector. One 3s
+# tone samples ~1100 device periods once per run, so it only fires when a
+# dropout happens to land inside the tone — a 0-10% per-run event that cannot
+# resolve a change in the failure rate. soundd's counters are non-zero on
+# essentially every run and are direct evidence of the same stall, so they are
+# the half of this gate with statistical power. They are scoped to the
+# streaming phase: soundd zeroes them when the first client arrives and
+# flushes them when the last one leaves, so no number here is diluted by the
+# idle path (where soundd waits on raw completion IRQs with no timer and a
+# batched IRQ is indistinguishable from a missed deadline).
+#
+# THE PHYSICAL SCALE. The DMA pipeline holds TX_INFLIGHT_MAX = 8 buffers of
+# 128 frames at 44.1kHz = 23.219ms. That is soundd's entire timing budget:
+# wake later than one pipeline depth and every buffer has already drained and
+# the device has run out of audio. `max_wake_lat_us` limits are therefore
+# quantised to whole pipeline depths (1 pl = 23219us), so the number says
+# something about the hardware rather than about a particular afternoon.
+#
+# HOW THE NUMBERS WERE PICKED. Measured over 30 serial runs per config on a
+# quiet host (one QEMU at a time, verified; Apple M4 Pro, QEMU 11.0.2 under
+# cross-arch TCG, 1-min load 4.2-6.0). Rule, applied uniformly:
+#
+#     limit = 2x the observed maximum, rounded up
+#             (wake latency: rounded up to a whole pipeline depth)
+#
+# These are max-of-window order statistics with heavy right tails. At n=30 the
+# observed maximum sits near the 97th percentile, so a limit AT the maximum
+# would false-red on the order of once every 30 runs per config — four configs
+# per invocation would make the gate red more often than the defect it is
+# watching. Doubling it puts the per-config false-red rate well under 1% while
+# still failing on a doubling of the tail, which is the magnitude a scheduler
+# regression that broke RT preemption or the audio IRQ path would produce.
+#
+# WHAT THESE NUMBERS ADMIT. Every config's worst wake lateness exceeds one
+# pipeline depth. The spec-derived bar — never wake later than the pipeline
+# you are feeding — is NOT met on this tree, and these limits sit above it.
+# That is the known residual (mode-B client misses under single-CPU load), a
+# separate scoped-out defect; the limits are set to catch it getting worse,
+# not to pretend it is absent. The measured value is printed on every run,
+# passing or failing, so the residual stays visible in the log rather than
+# hiding behind a green tick. When the residual is fixed, every
+# `max_wake_lat_us` here should drop to 23219 (one pipeline) and stay there.
+#
+# `underruns` is dominated by a stream-start transient: the client is added
+# with an empty ring and the mix loop submits the already-free buffers before
+# cpal's callback thread has filled a slot. Those periods are inaudible (the
+# §5.5 connect ramp still has the gain near zero) but they are real silence on
+# the wire and are counted as such. The floor is ~4; anything well above it is
+# genuine mid-stream starvation.
+#
+# Re-record deliberately, never casually, and never to make a red run green.
+# Every number above must survive being asked "why that value?".
 
 [audio_tone.smp1]
+# 30 runs: wake_lat max 27707us (1.19 pl); drains max 4; underruns max 20.
+max_wake_lat_us = 46438   # 2 pipeline depths
+drains = 8
+underruns = 40
+
 [audio_tone.smp8]
+# 30 runs: wake_lat max 23569us (1.01 pl); drains max 1; underruns max 6.
+# The drains floor is 4 rather than 2: a single observed event over 30 runs
+# bounds the true rate only loosely, and a bar of 2 would be a coin flip.
+max_wake_lat_us = 46438   # 2 pipeline depths
+drains = 4
+underruns = 12
+
 [audio_tone_load.smp1]
+# 30 runs: wake_lat max 26627us (1.15 pl); drains max 10; underruns max 33.
+# The spec's first-class case (§5.10: glitch-free on one CPU under load) and
+# the worst config by every counter. These are the residual's own numbers.
+max_wake_lat_us = 46438   # 2 pipeline depths
+drains = 20
+underruns = 70
+
 [audio_tone_load.smp8]
+# 30 runs: wake_lat max 39001us (1.68 pl); drains max 3; underruns max 16.
+max_wake_lat_us = 69657   # 3 pipeline depths
+drains = 6
+underruns = 32

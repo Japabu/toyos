@@ -254,19 +254,29 @@ const TONE_MIN_ACTIVE_SECS: f64 = 2.5;
 /// signal path is broken even if technically "active".
 const TONE_MIN_PEAK: i32 = 4000;
 
-/// Recorded per-(test, smp) underrun baselines — the scheduler-core
-/// migration's gate A (specs/scheduler-core-spec.md §11). Stages 1-6 gate on
-/// no regression vs these histograms; Stage 7 tightens to strictly zero.
-/// Keys of `gaps` are gap lengths in device periods (2.902ms), values are
-/// counts per run. Re-record deliberately, never casually: run
-/// `cargo test -- audio` and copy the printed histograms.
-#[derive(serde::Deserialize, Default)]
+/// Recorded per-(test, smp) baselines — the scheduler-core migration's gate A
+/// (specs/scheduler-core-spec.md §11). Two independent instruments per config:
+/// the wav underrun histogram (`gaps`, keyed by gap length in device periods)
+/// and ceilings on soundd's own counters. The wav is a rare-event detector;
+/// the counters fire on nearly every run and carry the statistical power. Both
+/// must hold. Re-record deliberately, never casually — and justify every
+/// number in `tests/audio-baseline.toml` itself.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AudioBaselineEntry {
     #[serde(default)]
     gaps: BTreeMap<String, u32>,
+    max_wake_lat_us: u64,
+    drains: u32,
+    underruns: u32,
 }
 
 type AudioBaseline = BTreeMap<String, BTreeMap<String, AudioBaselineEntry>>;
+
+struct ConfigBaseline {
+    gaps: BTreeMap<u32, u32>,
+    counters: audio::CounterLimits,
+}
 
 fn load_audio_baseline() -> AudioBaseline {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/audio-baseline.toml");
@@ -275,35 +285,41 @@ fn load_audio_baseline() -> AudioBaseline {
     toml::from_str(&text).unwrap_or_else(|e| panic!("parse {}: {e}", path.display()))
 }
 
-/// Baseline histogram for one (test, smp) config. A missing entry is the
-/// strict zero-gap baseline.
-fn baseline_gaps(baseline: &AudioBaseline, name: &str, smp: u32) -> BTreeMap<u32, u32> {
-    baseline
+/// Baseline for one (test, smp) config. Every config must be recorded: an
+/// ungated config would pass by omission.
+fn config_baseline(baseline: &AudioBaseline, name: &str, smp: u32) -> ConfigBaseline {
+    let entry = baseline
         .get(name)
         .and_then(|per_smp| per_smp.get(&format!("smp{smp}")))
-        .map(|entry| {
-            entry
-                .gaps
-                .iter()
-                .map(|(k, &count)| {
-                    let periods: u32 = k.parse().unwrap_or_else(|_| {
-                        panic!("audio-baseline.toml: bad gap key {k:?} for {name} smp{smp}")
-                    });
-                    (periods, count)
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+        .unwrap_or_else(|| panic!("audio-baseline.toml: no [{name}.smp{smp}] section"));
+    ConfigBaseline {
+        gaps: entry
+            .gaps
+            .iter()
+            .map(|(k, &count)| {
+                let periods: u32 = k.parse().unwrap_or_else(|_| {
+                    panic!("audio-baseline.toml: bad gap key {k:?} for {name} smp{smp}")
+                });
+                (periods, count)
+            })
+            .collect(),
+        counters: audio::CounterLimits {
+            max_wake_lat_us: entry.max_wake_lat_us,
+            drains: entry.drains,
+            underruns: entry.underruns,
+        },
+    }
 }
 
 /// Boot a fresh QEMU with the given CPU count, run one in-guest audio test,
-/// then assert the captured wav contains a clean tone: mid-signal silence
-/// (underruns) must not regress the recorded baseline histogram, and there
-/// must be no hard sample-to-sample discontinuities (clicks).
+/// then assert on two independent instruments: soundd's in-guest counters
+/// (wake lateness, pipeline drains, periods of silence submitted) and the
+/// captured wav (mid-signal silence must not regress the recorded histogram,
+/// and there must be no hard sample-to-sample discontinuities).
 fn run_audio_test(
     name: &str,
     smp: u32,
-    baseline: &BTreeMap<u32, u32>,
+    baseline: &ConfigBaseline,
     test_config: &Path,
     c_bins: &[(String, Vec<u8>)],
     rust_bins: &[(String, Vec<u8>)],
@@ -329,8 +345,10 @@ fn run_audio_test(
     }
 
     // The wav timeline advances in real time; give the tone tail and its
-    // trailing silence context time to reach the file before reading it.
-    thread::sleep(Duration::from_millis(500));
+    // trailing silence context time to reach the file before reading it. The
+    // same wait collects soundd's final stats flush, which races the client's
+    // exit and so can arrive after ===TEST_END===.
+    let serial = result.serial + &qemu.drain_serial(Duration::from_millis(500));
 
     let wav = audio::parse_wav(qemu.audio_wav_path())?;
     let analysis = audio::analyze(&wav);
@@ -338,15 +356,38 @@ fn run_audio_test(
     let secs = |samples: usize| samples as f64 / rate;
 
     // The record gate A tracks across migration stages — always printed, so
-    // every green run leaves a comparable histogram in the log.
+    // every green run leaves comparable numbers in the log, including the ones
+    // that pass.
     let gaps = audio::gap_histogram(&analysis, wav.sample_rate);
+    let counters = audio::parse_soundd_counters(&serial)?;
     eprintln!(
-        "        {name} smp={smp} gaps: {} (baseline {})",
+        "        {name} smp={smp} gaps: {} (baseline {}) peak {} active {:.2}s dither {:.1}%",
         audio::format_histogram(&gaps),
-        audio::format_histogram(baseline)
+        audio::format_histogram(&baseline.gaps),
+        analysis.peak,
+        secs(analysis.active_samples),
+        analysis.dither_ratio.unwrap_or(0.0) * 100.0,
+    );
+    eprintln!(
+        "        {name} smp={smp} soundd: wake_lat {}us ({:.2} pipelines, limit {}us) \
+         drains {}/{} underruns {}/{} submitted {} wakes {} batch {} windows {}",
+        counters.max_wake_lat_us,
+        counters.max_wake_lat_us as f64 / audio::PIPELINE_DEPTH_US as f64,
+        baseline.counters.max_wake_lat_us,
+        counters.drains,
+        baseline.counters.drains,
+        counters.underruns,
+        baseline.counters.underruns,
+        counters.submitted,
+        counters.wakes,
+        counters.max_batch,
+        counters.windows,
     );
 
     let mut problems = Vec::new();
+    if let Err(regression) = audio::check_counters(&counters, &baseline.counters) {
+        problems.push(regression);
+    }
     if secs(analysis.active_samples) < TONE_MIN_ACTIVE_SECS {
         problems.push(format!(
             "tone missing: only {:.2}s of active signal (expected >= {TONE_MIN_ACTIVE_SECS}s)",
@@ -359,7 +400,22 @@ fn run_audio_test(
             analysis.peak
         ));
     }
-    if let Err(regression) = audio::check_gap_regression(&gaps, baseline) {
+    // Without this the gate can go green while measuring nothing: the underrun
+    // detector's silence band is derived from soundd applying TPDF dither into
+    // a rounding quantizer (spec §5.4). Lose the dither and silence becomes
+    // exact zero everywhere, the band collapses, and dropouts stop being
+    // visible — the exact failure this instrument was rebuilt to remove.
+    match analysis.dither_ratio {
+        Some(ratio) if ratio < audio::MIN_DITHER_RATIO => problems.push(format!(
+            "dither missing: only {:.1}% of silent samples are non-zero (expected ~25%, \
+             floor {:.0}%) — soundd is not dithering, so the underrun detector is blind",
+            ratio * 100.0,
+            audio::MIN_DITHER_RATIO * 100.0
+        )),
+        Some(_) => {}
+        None => problems.push("no silent stretch in capture to verify dither against".to_string()),
+    }
+    if let Err(regression) = audio::check_gap_regression(&gaps, &baseline.gaps) {
         let mut msg = format!(
             "{regression}\n      {} mid-signal underruns (silence >= 2ms inside the tone):",
             analysis.underruns.len()
@@ -659,7 +715,7 @@ fn main() {
         for name in &audio_to_run {
             for &smp in AUDIO_SMP {
                 let label = format!("{name} (smp={smp})");
-                let baseline = baseline_gaps(&audio_baseline, name, smp);
+                let baseline = config_baseline(&audio_baseline, name, smp);
                 let start = std::time::Instant::now();
                 let outcome =
                     run_audio_test(name, smp, &baseline, &test_config, &c_bins, &rust_bins);

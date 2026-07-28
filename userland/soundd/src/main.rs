@@ -230,9 +230,48 @@ impl Xorshift32 {
     }
 }
 
+/// §5.4. TPDF dither is defined against a **round-to-nearest** quantizer —
+/// that pairing is what makes the error zero-mean and its variance
+/// signal-independent. Truncating instead (`as i16` rounds toward zero) biases
+/// every sample 0.5 LSB toward zero and swallows the dither whole inside
+/// ±1 LSB, giving a 2-LSB dead zone at the zero crossing and a noise floor
+/// that collapses with the signal: exactly the crossover distortion and
+/// noise-floor modulation dither exists to remove.
 fn dither_and_quantize(sample: f32, rng: &mut Xorshift32) -> i16 {
     let dither = rng.next() + rng.next(); // triangular PDF in [-1.0, 1.0]
-    (sample * 32767.0 + dither).clamp(-32768.0, 32767.0) as i16
+    (sample * 32767.0 + dither).round().clamp(-32768.0, 32767.0) as i16
+}
+
+// ---------------------------------------------------------------------------
+// Mix-thread accounting
+// ---------------------------------------------------------------------------
+
+/// Counters for one reporting window. A window covers streaming only: it is
+/// zeroed when the first client arrives and flushed when the last one leaves,
+/// so no number here is diluted by the idle path — where soundd waits on raw
+/// completion IRQs with no timer, and a batched IRQ looks exactly like a
+/// missed deadline. The audio gate reads these
+/// (`tests/audio-baseline.toml`), so they have to mean one thing only.
+#[derive(Default)]
+struct MixStats {
+    wakes: u32,
+    completions: u32,
+    submitted: u32,
+    /// Periods submitted with no client audio behind them: silence that
+    /// actually went on the wire while a client was streaming.
+    underruns: u32,
+    /// Cycles that found the whole DMA pipeline free (§5.9).
+    drains: u32,
+    max_wake_lat_ns: u64,
+    max_batch: u32,
+}
+
+impl MixStats {
+    fn report(&self, clients: usize) {
+        eprintln!("soundd: wakes={} completions={} submitted={} underruns={} drains={} max_wake_lat_us={} max_batch={} clients={}",
+            self.wakes, self.completions, self.submitted, self.underruns, self.drains,
+            self.max_wake_lat_ns / 1_000, self.max_batch, clients);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -510,16 +549,12 @@ fn mix_thread(
     const TOKEN_AUDIO: u64 = u64::MAX - 1;
     const TOKEN_CMD: u64 = u64::MAX - 2;
 
-    let mut stat_wakes: u32 = 0;
-    let mut stat_completions: u32 = 0;
-    let mut stat_submitted: u32 = 0;
-    let mut stat_underruns: u32 = 0;
-    let mut stat_drains: u32 = 0;
-    let mut stat_max_wake_lat_ns: u64 = 0;
-    let mut stat_max_batch: u32 = 0;
+    let mut stats = MixStats::default();
     let mut next_stats_ns = syscall::clock_nanos() + STATS_INTERVAL_NANOS;
 
     loop {
+        let was_streaming = !streams.is_empty();
+
         // Signal all clients BEFORE the io_uring wait. Priority inheritance
         // boosts them to RT; they fill their ring slots while soundd is blocked
         // in the poller wait below. A write error means the client is gone —
@@ -559,8 +594,8 @@ fn mix_thread(
             other => panic!("soundd: unexpected poll token {other}"),
         });
 
-        if !streams.is_empty() {
-            stat_wakes += 1;
+        if was_streaming {
+            stats.wakes += 1;
         }
 
         if cmd_ready {
@@ -588,6 +623,11 @@ fn mix_thread(
             }
         }
 
+        if !was_streaming && !streams.is_empty() {
+            stats = MixStats::default();
+            next_stats_ns = syscall::clock_nanos() + STATS_INTERVAL_NANOS;
+        }
+
         let n_records = match audio_dev.read_completions(&mut records) {
             Ok(n) => n,
             Err(toyos_abi::syscall::SyscallError::WouldBlock) => 0,
@@ -596,7 +636,9 @@ fn mix_thread(
         if n_records > 0 {
             if let Some(t_est) = dll.t_estimated {
                 let lateness = syscall::clock_nanos().saturating_sub(t_est as u64);
-                stat_max_wake_lat_ns = stat_max_wake_lat_ns.max(lateness);
+                if !streams.is_empty() {
+                    stats.max_wake_lat_ns = stats.max_wake_lat_ns.max(lateness);
+                }
             }
             let mut wake_completions = 0u32;
             for rec in &records[..n_records] {
@@ -608,8 +650,8 @@ fn mix_thread(
                 dll.update(rec.timestamp_nanos as f64, n);
             }
             if !streams.is_empty() {
-                stat_completions += wake_completions;
-                stat_max_batch = stat_max_batch.max(wake_completions);
+                stats.completions += wake_completions;
+                stats.max_batch = stats.max_batch.max(wake_completions);
             }
         }
 
@@ -627,7 +669,7 @@ fn mix_thread(
         // amount. Recovery costs only the periods the clients cannot cover.
         if free_mask.count_ones() as usize == num_buffers {
             if !streams.is_empty() {
-                stat_drains += 1;
+                stats.drains += 1;
             }
             dll.reset();
         }
@@ -660,8 +702,10 @@ fn mix_thread(
 
             toyos::audio::audio_submit(idx as u32, device_period_bytes as u32)
                 .unwrap_or_else(|e| panic!("soundd: audio_submit({idx}) failed: {e}"));
-            stat_submitted += 1;
-            if !any_data && !streams.is_empty() { stat_underruns += 1; }
+            if !streams.is_empty() {
+                stats.submitted += 1;
+                if !any_data { stats.underruns += 1; }
+            }
         }
 
         // Disconnected clients leave only after their ramp-down finishes;
@@ -677,23 +721,20 @@ fn mix_thread(
             }
         });
 
+        // Flushing on the last disconnect closes the streaming phase out
+        // completely: the tail between the final periodic window and the
+        // client leaving is short-lived audio like a test tone's whole
+        // second half, and dropping it would leave the gate blind to it.
         let now_ns = syscall::clock_nanos();
-        if now_ns >= next_stats_ns {
+        if was_streaming && streams.is_empty() {
+            stats.report(0);
+            stats = MixStats::default();
+            next_stats_ns = now_ns + STATS_INTERVAL_NANOS;
+        } else if now_ns >= next_stats_ns {
             if !streams.is_empty() {
-                // `underruns` counts every period submitted with no client
-                // audio behind it — i.e. every period of silence this window
-                // actually put on the wire.
-                eprintln!("soundd: wakes={} completions={} submitted={} underruns={} drains={} max_wake_lat_us={} max_batch={} clients={}",
-                    stat_wakes, stat_completions, stat_submitted, stat_underruns, stat_drains,
-                    stat_max_wake_lat_ns / 1_000, stat_max_batch, streams.len());
+                stats.report(streams.len());
+                stats = MixStats::default();
             }
-            stat_wakes = 0;
-            stat_completions = 0;
-            stat_submitted = 0;
-            stat_underruns = 0;
-            stat_drains = 0;
-            stat_max_wake_lat_ns = 0;
-            stat_max_batch = 0;
             next_stats_ns = now_ns + STATS_INTERVAL_NANOS;
         }
     }
