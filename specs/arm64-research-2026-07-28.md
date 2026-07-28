@@ -6,6 +6,28 @@
 > aarch64/HVF and aarch64/TCG. Scope is deliberately high-level: enough to choose
 > an approach, not to start typing.
 
+## 0. Decisions taken (2026-07-28)
+
+**Motivation: ARM64 support is the goal in itself**, not a dev-loop optimisation.
+The measured HVF numbers below and the 635 MB initrd finding are still true and
+still worth acting on, but they are *not* the reason and must not be treated as
+an alternative. The report's "case against" argues partly from ergonomics ROI —
+that argument does not apply. What survives of it is only the scheduling
+collision: Stage 7c deletes `scheduler.rs` outright, including the exact
+`context_switch` and idle handshake an abstraction-first port would refactor
+first. Sequence around that, do not re-litigate whether to do it.
+
+**Dispatch: compile-time, statically resolved.** One `cfg_attr(path)` module
+selection. No `dyn Arch`, and no `Kernel<A: Arch>` type parameter — the first
+buys indirect calls on the fault and lock paths, the second infects every static
+in the kernel, and both model a decision the target triple already made.
+
+Note the `const _: fn() -> CpuId = imp::cpu_id;` lines in §2 are **signature
+assertions, not dispatch**. Call sites are direct calls to `imp::*`, inlinable
+and zero-cost; the `const _` block exists so that a missing or mis-typed item
+fails to compile at the contract file, naming the item, instead of at a call
+site. `Hw` stays a trait only where a second implementation genuinely exists.
+
 ## 1. Is ARM64 faster on this host?
 
 ## Yes — but not as a flat multiplier, and the honest number is per-operation-class.
