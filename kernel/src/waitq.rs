@@ -29,6 +29,7 @@ use core::marker::PhantomData;
 
 use crate::pipe::PipeId;
 use crate::scheduler::{self, EventSource, TaskId};
+use crate::DirectMap;
 
 /// The waiter set of one event source. Stage 7 gives every waitable object
 /// its own queue; until then the set lives in the blocked pool and this is a
@@ -42,6 +43,12 @@ impl WaitQueue {
 
     pub fn pipe_writable(id: PipeId) -> Self {
         Self(EventSource::PipeWritable(id))
+    }
+
+    /// The waiters of one futex word, keyed by its physical address so the
+    /// queue is shared across the processes that map it.
+    pub fn futex(addr: DirectMap) -> Self {
+        Self(EventSource::Futex(addr))
     }
 
     /// Phase 1: register the running thread. The caller must then re-check

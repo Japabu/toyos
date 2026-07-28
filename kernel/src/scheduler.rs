@@ -12,7 +12,7 @@ use crate::listener::ListenerId;
 use crate::pipe::PipeId;
 use crate::process::{self, IdleProof, OwnedAlloc, PageTables, Pid, Tid, KERNEL_STACK_SIZE};
 use crate::sync::Lock;
-use crate::waitq::WaitTicket;
+use crate::waitq::{WaitQueue, WaitTicket};
 use crate::DirectMap;
 
 pub const MAX_CPUS: usize = 8;
@@ -423,14 +423,6 @@ enum SwitchReason {
         event: Option<EventSource>,
         deadline: u64,
     },
-    /// Futex park carries the wake-generation snapshot taken in `futex_wait`
-    /// so `handle_outgoing` can detect a `futex_wake` that scanned the pool
-    /// before this thread was inserted (the classic lost-wake window).
-    BlockFutex {
-        addr: DirectMap,
-        deadline: u64,
-        wake_gen: u64,
-    },
     Exit,
 }
 
@@ -797,17 +789,6 @@ pub fn log_health() {
         }
     }
 }
-
-static FUTEX_LOCK: Lock<()> = Lock::new(());
-
-/// Bumped by every `futex_wake` before it scans the blocked pool. A waiter
-/// snapshots it under FUTEX_LOCK (after the userspace value check) and
-/// re-compares after pool insertion — a changed value means a wake ran in
-/// the park window and may have missed the waiter. Relaxed is sufficient:
-/// in the missed-scan case the waker released the blocked-pool lock before
-/// the waiter acquired it for insertion, and that acquire orders the
-/// waker's increment before the waiter's re-compare.
-static FUTEX_WAKE_GEN: AtomicU64 = AtomicU64::new(0);
 
 impl Scheduler {
     fn lock_cpu(&self, cpu: usize) -> CpuQueueGuard<'_> {
@@ -1343,31 +1324,32 @@ pub fn current_address_space() -> Option<PageTables> {
     q.current().and_then(|ctx| ctx.address_space.clone())
 }
 
+/// Block on a futex word unless it already changed. Returns whether it parked.
+///
+/// Registering before reading the word is the whole protocol: a `futex_wake`
+/// that runs after the registration either marks the ticket or finds the
+/// waiter parked, and one that ran before it stored the new value before
+/// taking the pool lock this registration passed through — so the read below
+/// sees it. A futex has no readiness to re-derive after the fact, which is
+/// what the wake-generation counter and its lock existed to work around.
 pub fn futex_wait(phys_addr: DirectMap, expected: u32, deadline: u64) -> bool {
-    let _futex = FUTEX_LOCK.lock();
-    let current = unsafe { *phys_addr.as_ptr::<u32>() };
-    if current != expected {
+    let queue = WaitQueue::futex(phys_addr);
+    let ticket = queue.prepare_wait();
+    if unsafe { *phys_addr.as_ptr::<u32>() } != expected {
+        ticket.cancel();
         return false;
     }
-    // Snapshot under FUTEX_LOCK, after the value check: any wake that runs
-    // after this point bumps the generation, and handle_outgoing re-wakes
-    // us if the pool scan happened before our insertion.
-    let wake_gen = FUTEX_WAKE_GEN.load(Ordering::Relaxed);
-    drop(_futex);
-    do_schedule(SwitchReason::BlockFutex { addr: phys_addr, deadline, wake_gen });
+    block_on(ticket, deadline);
     true
 }
 
 pub fn futex_wake(phys_addr: DirectMap, count: usize) -> u64 {
-    let _futex = FUTEX_LOCK.lock();
     let _transit = TransitGuard::new();
-    FUTEX_WAKE_GEN.fetch_add(1, Ordering::Relaxed);
     let mut batch = WokenBatch::new();
     let n = {
         let mut pool = SCHEDULER.blocked.lock_unwrap();
         pool.take_by_event_limited(&EventSource::Futex(phys_addr), count, &mut batch) as u64
     };
-    drop(_futex);
     if !batch.is_empty() {
         SCHEDULER.enqueue_batch(batch);
     }
@@ -1630,7 +1612,6 @@ fn do_schedule(reason: SwitchReason) {
     vsched!("sched do_schedule reason={}", match &reason {
         SwitchReason::Yield => "Yield",
         SwitchReason::Block { .. } => "Block",
-        SwitchReason::BlockFutex { .. } => "BlockFutex",
         SwitchReason::Exit => "Exit",
     });
     let next_deadline = drain_events();
@@ -1776,19 +1757,6 @@ fn handle_outgoing() {
             let raced = !ticketed && event.as_ref().is_some_and(crate::waitq::source_ready);
             if raced {
                 wake_by_event(event.unwrap());
-            }
-        }
-        SwitchReason::BlockFutex { addr, deadline, wake_gen } => {
-            let id = old.id;
-            park_outgoing(queue, old, Some(EventSource::Futex(addr)), deadline);
-            // A futex_wake between the wait's value check and the pool
-            // insertion scanned the pool without finding us — its bumped
-            // generation is the only trace. Re-wake THIS waiter only:
-            // waking the whole address would exceed futex_wake's count and
-            // thundering-herd every other (legitimately parked) waiter.
-            // std futex loops absorb the spurious case.
-            if FUTEX_WAKE_GEN.load(Ordering::Relaxed) != wake_gen {
-                wake_task(id);
             }
         }
         SwitchReason::Exit => {
