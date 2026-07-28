@@ -254,7 +254,11 @@ When no clients are connected, soundd either continues submitting silence (zero 
 
 ### 5.9 Pipeline Recovery
 
-If all DMA buffers drain due to a catastrophic scheduling stall, soundd detects a full free list and re-primes the pipeline with silence. The DLL re-initializes from the first new completion timestamp. Audio resumes on the next cycle.
+If all DMA buffers drain due to a catastrophic scheduling stall, soundd detects a full free list and resets the DLL: the device restarts its period grid from whatever is submitted next, so the old estimate is not clock drift to be tracked but a dead reference to be discarded. The DLL re-initializes from the first new completion timestamp.
+
+Recovery must be **proportional to the shortfall**. The drained buffers are refilled by the ordinary mix path, exactly like any other free buffer: client audio already sitting in the slot rings goes out immediately, and silence is submitted only for those periods no client can cover. Re-priming the whole pipeline with silence is not acceptable — it makes the cost of *any* stall, however brief, a full pipeline depth of audible dropout, and delays the client audio queued behind it by the same amount. Since the client rings are as deep as the DMA pipeline (§5.10 fallback), a stall that the clients kept up with costs no silence at all.
+
+Only the startup prime (§5.2) submits silence unconditionally: nothing is in flight, so there is no free buffer to mix into and no client to mix from.
 
 ### 5.10 Synchronous Client Scheduling
 
@@ -440,7 +444,7 @@ Equivalent systems: Linux `PTHREAD_PRIO_INHERIT` on mutexes, Linux PI-futexes, D
 | Client crashes | Gain ramps to 0, client removed after ramp | Other clients unaffected |
 | DMA completions batch (2-3 per wake) | soundd consumes multiple client slots per cycle | Slot ring absorbs batching |
 | soundd scheduling jitter | DLL timer + pipeline depth absorbs jitter | Automatic |
-| All DMA buffers drain | soundd re-primes with silence, DLL re-initializes | Audio resumes next cycle |
+| All DMA buffers drain | soundd resets the DLL and refills from the client rings; silence only for periods no client covers | Audio resumes the same cycle |
 | No clients connected | soundd submits silence or quiesces | Zero overhead |
 | Hardware error | Driver reports error to soundd | soundd logs and attempts re-init |
 | Client connects | Gain ramps from 0 to target | No click or pop |

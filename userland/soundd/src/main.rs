@@ -481,18 +481,17 @@ fn mix_thread(
     let mut streams: Vec<ClientStream> = Vec::new();
     let mut free_mask: u32 = 0;
 
-    let prime_silence = |free: &mut u32| {
-        for i in 0..num_buffers {
-            let buf = unsafe { core::slice::from_raw_parts_mut(dma_ptrs[i], device_period_bytes) };
-            buf.fill(0);
-            // A swallowed submit failure would strand the buffer outside both
-            // free_mask and the kernel's inflight set — silent pipeline shrink.
-            toyos::audio::audio_submit(i as u32, device_period_bytes as u32)
-                .unwrap_or_else(|e| panic!("soundd: audio_submit({i}) failed: {e}"));
-        }
-        *free = 0;
-    };
-    prime_silence(&mut free_mask);
+    // Startup prime: nothing is in flight yet, so there is no free buffer for
+    // the mix loop to fill and no client whose audio could fill it. This is
+    // the only place silence is submitted unconditionally.
+    for i in 0..num_buffers {
+        let buf = unsafe { core::slice::from_raw_parts_mut(dma_ptrs[i], device_period_bytes) };
+        buf.fill(0);
+        // A swallowed submit failure would strand the buffer outside both
+        // free_mask and the kernel's inflight set — silent pipeline shrink.
+        toyos::audio::audio_submit(i as u32, device_period_bytes as u32)
+            .unwrap_or_else(|e| panic!("soundd: audio_submit({i}) failed: {e}"));
+    }
 
     syscall::set_rt_priority(true);
 
@@ -515,7 +514,7 @@ fn mix_thread(
     let mut stat_completions: u32 = 0;
     let mut stat_submitted: u32 = 0;
     let mut stat_underruns: u32 = 0;
-    let mut stat_reprimes: u32 = 0;
+    let mut stat_drains: u32 = 0;
     let mut stat_max_wake_lat_ns: u64 = 0;
     let mut stat_max_batch: u32 = 0;
     let mut next_stats_ns = syscall::clock_nanos() + STATS_INTERVAL_NANOS;
@@ -615,11 +614,21 @@ fn mix_thread(
         }
 
         // §5.9: every buffer free means the pipeline fully drained — a
-        // catastrophic stall. Re-prime with silence and let the next
-        // completion re-initialize the DLL from a clean timestamp.
+        // catastrophic stall. What died with it is the *clock*, not the audio:
+        // the device restarts its period grid from whatever we submit next, so
+        // the DLL estimate is meaningless and must be dropped, or the next
+        // update reads the discontinuity as clock drift and drags the period.
+        //
+        // The buffers are refilled by the ordinary mix loop below, like any
+        // other free buffer. A drain is not a reason to discard the client
+        // audio already sitting in the ring: submitting a full pipeline of
+        // silence would cost `num_buffers` periods of audible dropout for any
+        // stall, however brief, and delay that client audio by the same
+        // amount. Recovery costs only the periods the clients cannot cover.
         if free_mask.count_ones() as usize == num_buffers {
-            stat_reprimes += 1;
-            prime_silence(&mut free_mask);
+            if !streams.is_empty() {
+                stat_drains += 1;
+            }
             dll.reset();
         }
 
@@ -671,15 +680,18 @@ fn mix_thread(
         let now_ns = syscall::clock_nanos();
         if now_ns >= next_stats_ns {
             if !streams.is_empty() {
-                eprintln!("soundd: wakes={} completions={} submitted={} underruns={} reprimes={} max_wake_lat_us={} max_batch={} clients={}",
-                    stat_wakes, stat_completions, stat_submitted, stat_underruns, stat_reprimes,
+                // `underruns` counts every period submitted with no client
+                // audio behind it — i.e. every period of silence this window
+                // actually put on the wire.
+                eprintln!("soundd: wakes={} completions={} submitted={} underruns={} drains={} max_wake_lat_us={} max_batch={} clients={}",
+                    stat_wakes, stat_completions, stat_submitted, stat_underruns, stat_drains,
                     stat_max_wake_lat_ns / 1_000, stat_max_batch, streams.len());
             }
             stat_wakes = 0;
             stat_completions = 0;
             stat_submitted = 0;
             stat_underruns = 0;
-            stat_reprimes = 0;
+            stat_drains = 0;
             stat_max_wake_lat_ns = 0;
             stat_max_batch = 0;
             next_stats_ns = now_ns + STATS_INTERVAL_NANOS;
