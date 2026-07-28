@@ -60,6 +60,13 @@ fn is_kernel_line(line: &str) -> bool {
     line.starts_with("[kernel ")
 }
 
+/// The in-guest runner's end-of-test marker. Matched anywhere in the line, not
+/// as a prefix: the virtio-console is shared and not line-atomic, so a daemon
+/// mid-`println!` pushes the marker into the middle of its line. Anchoring on
+/// the prefix made the harness miss the marker and time out — measured at 1 in
+/// 120 audio boots, where it looked like a guest hang rather than a lost line.
+const END_MARKER: &str = "===TEST_END ";
+
 impl QemuInstance {
     /// Build everything and boot QEMU with test binaries in the initrd.
     /// `test_crate` is the path to the test crate (must contain a `system.toml`).
@@ -189,8 +196,17 @@ impl QemuInstance {
                 Ok(line) => {
                     if line.contains("===TEST_START ") {
                         in_test = true;
-                    } else if let Some(rest) = line.strip_prefix("===TEST_END ") {
-                        let rest = rest.strip_suffix("===").unwrap_or(rest);
+                    } else if let Some(at) = line.find(END_MARKER) {
+                        // Everything before the marker is a line some other
+                        // console writer was in the middle of when the runner
+                        // printed; it is still real output and the audio gate
+                        // reads soundd's stats out of it.
+                        if at > 0 && in_test {
+                            serial.push_str(&line[..at]);
+                            serial.push('\n');
+                        }
+                        let rest = &line[at + END_MARKER.len()..];
+                        let rest = rest.split_once("===").map_or(rest, |(head, _)| head);
                         let parts: Vec<&str> = rest.splitn(2, ' ').collect();
                         let (exit_code, error) = if parts.len() > 1 {
                             if let Some(code_str) = parts[1].strip_prefix("exit=") {
