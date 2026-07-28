@@ -371,6 +371,14 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             sys_readlink(path, buf)
         }
         SYS_GPU_SET_RESOLUTION => {
+            // Reconfiguring the display is the display owner's business. The
+            // check is first so a non-claimant never reaches the driver, and
+            // never gets its two arbitrary u32s turned into a contiguous
+            // physical allocation.
+            let pid = process::current_process();
+            if !device::is_owner(device::DEVICE_FRAMEBUFFER, pid) {
+                return SyscallError::PermissionDenied.to_u64();
+            }
             let info_size = core::mem::size_of::<fd::FramebufferInfo>() as u64;
             let Some(out_buf) = ctx.user_slice_mut(UserAddr::new(a3), info_size) else { return bad_addr };
             match crate::gpu::set_resolution(a1 as u32, a2 as u32) {
@@ -386,7 +394,6 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
                     };
                     device::set_framebuffer_info(fb_info);
                     set_screen_size(gpu_info.width, gpu_info.height);
-                    let pid = process::current_process();
                     for &token in &gpu_info.tokens {
                         if shared_memory::grant_kernel(token, pid).is_err() {
                             return SyscallError::Unknown.to_u64();
@@ -398,7 +405,7 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
                     out_buf.copy_from_slice(fb_info.as_bytes());
                     0
                 }
-                Err(()) => SyscallError::NotSupported.to_u64(),
+                Err(e) => e.to_u64(),
             }
         }
         SYS_LISTEN => {

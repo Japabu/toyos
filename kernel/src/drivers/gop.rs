@@ -1,5 +1,7 @@
 use alloc::boxed::Box;
 
+use toyos_abi::syscall::SyscallError;
+
 use crate::mm::{PAGE_2M, align_2m, DirectMap};
 use crate::gpu::{Gpu, GpuInfo};
 use crate::log;
@@ -15,8 +17,9 @@ impl Gpu for GopGpu {
     fn set_cursor(&mut self, _hot_x: u32, _hot_y: u32) {}
     fn move_cursor(&mut self, _x: u32, _y: u32) {}
 
-    fn set_resolution(&mut self, _width: u32, _height: u32) -> Result<GpuInfo, ()> {
-        Err(()) // GOP cannot change resolution after UEFI boot services exit
+    fn set_resolution(&mut self, _width: u32, _height: u32) -> Result<GpuInfo, SyscallError> {
+        // GOP cannot change resolution after UEFI boot services exit.
+        Err(SyscallError::NotSupported)
     }
 }
 

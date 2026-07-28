@@ -90,6 +90,21 @@ pub fn try_claim(device_type: u64, pid: Pid) -> Option<Descriptor> {
     }
 }
 
+/// True when `pid` currently holds the claim on `device_type`. Syscalls that
+/// drive a claimed device gate on this — a claim is what makes a process the
+/// device's owner, so it is also what makes it allowed to reconfigure it.
+pub fn is_owner(device_type: u64, pid: Pid) -> bool {
+    let owner = match device_type {
+        DEVICE_KEYBOARD => KEYBOARD_OWNER.lock(),
+        DEVICE_MOUSE => MOUSE_OWNER.lock(),
+        DEVICE_FRAMEBUFFER => FRAMEBUFFER_OWNER.lock(),
+        DEVICE_NIC => NIC_OWNER.lock(),
+        DEVICE_AUDIO => AUDIO_OWNER.lock(),
+        _ => return false,
+    };
+    *owner == Some(pid)
+}
+
 /// Release a device owned by the given PID.
 pub fn release(device_type: u64, pid: Pid) {
     let mut owner = match device_type {

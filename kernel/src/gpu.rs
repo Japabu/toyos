@@ -1,4 +1,5 @@
 use alloc::boxed::Box;
+use toyos_abi::syscall::SyscallError;
 use crate::shared_memory::SharedToken;
 use crate::sync::Lock;
 
@@ -20,7 +21,9 @@ pub trait Gpu: Send {
     fn present_rect(&mut self, x: u32, y: u32, w: u32, h: u32);
     fn set_cursor(&mut self, hot_x: u32, hot_y: u32);
     fn move_cursor(&mut self, x: u32, y: u32);
-    fn set_resolution(&mut self, width: u32, height: u32) -> Result<GpuInfo, ()>;
+    /// Width and height come straight from userspace. Implementations must
+    /// refuse a resolution they cannot back rather than panic on the way.
+    fn set_resolution(&mut self, width: u32, height: u32) -> Result<GpuInfo, SyscallError>;
 }
 
 static GPU: Lock<Option<Box<dyn Gpu>>> = Lock::new(None);
@@ -53,10 +56,10 @@ pub fn set_cursor(hot_x: u32, hot_y: u32) {
     }
 }
 
-pub fn set_resolution(width: u32, height: u32) -> Result<GpuInfo, ()> {
+pub fn set_resolution(width: u32, height: u32) -> Result<GpuInfo, SyscallError> {
     let new_info = {
         let mut gpu = GPU.lock();
-        let gpu = gpu.as_mut().ok_or(())?;
+        let gpu = gpu.as_mut().ok_or(SyscallError::NotSupported)?;
         gpu.set_resolution(width, height)?
     };
     let mut info = INFO.lock();

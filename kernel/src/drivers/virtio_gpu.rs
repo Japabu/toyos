@@ -5,6 +5,7 @@ use alloc::boxed::Box;
 use super::pci::PciDevice;
 use super::virtio::{BufDir, DescSlot, Virtqueue, VirtioDevice, VIRTIO_F_VERSION_1};
 use super::DmaPool;
+use toyos_abi::syscall::SyscallError;
 use crate::mm::{PAGE_2M, KernelSlice};
 use crate::gpu::{FLAG_HARDWARE_CURSOR, Gpu, GpuInfo};
 use crate::log;
@@ -466,14 +467,16 @@ impl GpuController {
     }
 
     /// Allocate framebuffer backing stores and register as shared memory.
-    fn alloc_framebuffer(&mut self, width: u32, height: u32) -> FbAlloc {
-        let fb_size = (width * height * 4) as usize;
+    /// `None` when the physical memory is not there — the caller decides
+    /// whether that is fatal.
+    fn alloc_framebuffer(&mut self, fb_size: u32) -> Option<FbAlloc> {
+        let fb_size = fb_size as usize;
         let fb_pages = (fb_size + PAGE_2M as usize - 1) / PAGE_2M as usize;
         let mut tokens = [SharedToken::from_raw(0); 2];
         let mut phys_addrs = [0u64; 2];
         let mut ptrs = [core::ptr::null_mut(); 2];
-        let pages0 = crate::mm::pmm::alloc_contiguous(fb_pages, crate::mm::pmm::Category::Framebuffer).expect("VirtIO GPU: framebuffer alloc failed");
-        let pages1 = crate::mm::pmm::alloc_contiguous(fb_pages, crate::mm::pmm::Category::Framebuffer).expect("VirtIO GPU: framebuffer alloc failed");
+        let pages0 = crate::mm::pmm::alloc_contiguous(fb_pages, crate::mm::pmm::Category::Framebuffer)?;
+        let pages1 = crate::mm::pmm::alloc_contiguous(fb_pages, crate::mm::pmm::Category::Framebuffer)?;
         let all_pages = [pages0, pages1];
         for i in 0..2 {
             let phys_addr = all_pages[i][0].direct_map().phys();
@@ -484,7 +487,7 @@ impl GpuController {
             tokens[i] = shared_memory::register(crate::DirectMap::from_phys(phys_addr), fb_aligned as u64);
             log!("VirtIO GPU: buffer {} at {:?} phys={:#x} ({} bytes) token={:?}", i, ptr, phys_addrs[i], fb_size, tokens[i]);
         }
-        FbAlloc { tokens, phys_addrs, ptrs, _pages: all_pages }
+        Some(FbAlloc { tokens, phys_addrs, ptrs, _pages: all_pages })
     }
 
     fn free_framebuffer(&mut self, fb: FbAlloc) {
@@ -534,22 +537,24 @@ impl Gpu for GpuController {
         GpuController::move_cursor(self, x, y);
     }
 
-    fn set_resolution(&mut self, width: u32, height: u32) -> Result<GpuInfo, ()> {
+    fn set_resolution(&mut self, width: u32, height: u32) -> Result<GpuInfo, SyscallError> {
         if width == self.width && height == self.height {
             return Ok(self.build_gpu_info());
         }
 
+        let fb_size = fb_size_bytes(width, height).ok_or(SyscallError::InvalidArgument)?;
+
         log!("VirtIO GPU: changing resolution {}x{} -> {}x{}", self.width, self.height, width, height);
 
-        // Allocate new framebuffer backing
-        let new_fb = self.alloc_framebuffer(width, height);
-        let fb_size = (width * height * 4) as usize;
+        // Allocate new framebuffer backing. The old pair stays live until the
+        // swap below, so a refusal here leaves the display exactly as it was.
+        let new_fb = self.alloc_framebuffer(fb_size).ok_or(SyscallError::ResourceExhausted)?;
 
         // Create new GPU resource
         let old_resource = self.resource;
         self.resource += 1;
         self.create_resource(self.resource, FORMAT_B8G8R8X8_UNORM, width, height);
-        self.attach_backing(self.resource, new_fb.phys_addrs[0], fb_size as u32);
+        self.attach_backing(self.resource, new_fb.phys_addrs[0], fb_size);
 
         // Switch scanout to new resource
         let rect = Rect { x: 0, y: 0, width, height };
@@ -567,6 +572,18 @@ impl Gpu for GpuController {
 
         Ok(self.build_gpu_info())
     }
+}
+
+/// Framebuffer bytes for a resolution, or `None` if the device could never
+/// back it: zero-sized, or past the u32 length `attach_backing` carries.
+/// Both dimensions are userland-chosen via `SYS_GPU_SET_RESOLUTION`, so the
+/// product is computed in u64 — `width * height * 4` in u32 wraps.
+fn fb_size_bytes(width: u32, height: u32) -> Option<u32> {
+    let bytes = (width as u64).checked_mul(height as u64)?.checked_mul(4)?;
+    if bytes == 0 || bytes > u32::MAX as u64 {
+        return None;
+    }
+    Some(bytes as u32)
 }
 
 /// Initialize the VirtIO GPU. Returns the driver and display info on success.
@@ -648,12 +665,14 @@ pub fn init(ecam: &crate::mm::Mmio) -> Option<(Box<dyn Gpu>, GpuInfo)> {
     };
     log!("VirtIO GPU: display {}x{}", width, height);
 
-    // Allocate framebuffer backing stores (2MB-aligned)
-    gpu.fb = gpu.alloc_framebuffer(width, height);
-    let fb_size = (width * height * 4) as usize;
+    // Allocate framebuffer backing stores (2MB-aligned). Boot-time, and the
+    // dimensions come from EDID or the default above — a failure here is a
+    // machine that cannot run, so it dies loudly.
+    let fb_size = fb_size_bytes(width, height).expect("VirtIO GPU: nonsense display dimensions");
+    gpu.fb = gpu.alloc_framebuffer(fb_size).expect("VirtIO GPU: framebuffer alloc failed");
 
     gpu.create_resource(gpu.resource, FORMAT_B8G8R8X8_UNORM, width, height);
-    gpu.attach_backing(gpu.resource, gpu.fb.phys_addrs[0], fb_size as u32);
+    gpu.attach_backing(gpu.resource, gpu.fb.phys_addrs[0], fb_size);
 
     // Set scanout to the single resource
     let rect = Rect { x: 0, y: 0, width, height };
