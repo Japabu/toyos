@@ -281,7 +281,16 @@ fn vaddr_to_file_offset(segments: &[elf::ElfSegment], vaddr: u64) -> u64 {
 }
 
 /// Read a byte range from a file using its block map via the page cache.
+///
+/// Returns only the part of the request the file actually holds. Every `len`
+/// here comes off an ELF — `DT_STRSZ`, a symbol count, `e_shnum * e_shentsize`
+/// — so an unclamped `Vec::with_capacity` is a heap allocation sized by
+/// untrusted input, and past EOF there is nothing to read anyway (the
+/// backings zero-fill). Callers already treat a short return as
+/// "table truncated, stop"; they all length-check before indexing.
 pub(crate) fn read_file_range(backing: &dyn crate::file_backing::FileBacking, offset: u64, len: usize) -> Vec<u8> {
+    let available = backing.file_size().saturating_sub(offset);
+    let len = len.min(available as usize);
     let mut result = Vec::with_capacity(len);
     let mut remaining = len;
     let mut file_off = offset;

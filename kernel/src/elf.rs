@@ -266,9 +266,13 @@ fn clone_from_cache(cached: &CachedLib) -> Option<LoadedLib> {
 /// The table is: [nbuckets, symoffset, bloom_size, bloom_shift, bloom[], buckets[], chain[]]
 /// Each bucket holds the lowest symbol index; each chain entry's bit 0 marks the end of a chain.
 fn gnu_hash_sym_count(table: &KernelSlice) -> usize {
+    if table.size() < 16 { return 0; }
     let nbuckets = unsafe { table.read::<u32>(0) } as usize;
     let symoffset = unsafe { table.read::<u32>(4) } as usize;
     let bloom_size = unsafe { table.read::<u32>(8) } as usize;
+    // A zero bucket or bloom count divides by zero in `gnu_dlsym`; a table
+    // that cannot be walked contributes no symbols.
+    if nbuckets == 0 || bloom_size == 0 { return 0; }
     let buckets_off = 16 + bloom_size * 8;
     let mut max_sym = 0usize;
     for i in 0..nbuckets {
@@ -484,7 +488,11 @@ pub fn parse_layout(data: &[u8]) -> Result<ElfLayout, &'static str> {
         }
     }
 
-    let section_headers = if ehdr.e_shoff != 0 && ehdr.e_shnum > 0 {
+    // `e_shentsize` is 64 for ELF64. Consumers divide a byte count by it and
+    // index 64-byte fields out of each entry, so anything smaller is a
+    // division by zero or a short read — drop the table instead of recording
+    // a size that every consumer would have to re-check.
+    let section_headers = if ehdr.e_shoff != 0 && ehdr.e_shnum > 0 && ehdr.e_shentsize >= 64 {
         Some((ehdr.e_shoff, ehdr.e_shnum, ehdr.e_shentsize))
     } else {
         None
@@ -704,7 +712,11 @@ pub fn build_exe_sym_map<'a>(
     sym_count: usize,
     base: UserAddr,
 ) -> hashbrown::HashMap<&'a str, UserAddr> {
-    let mut map = hashbrown::HashMap::with_capacity(sym_count);
+    // `sym_count` comes off the ELF (a .gnu.hash walk or a SYMTAB/STRTAB vaddr
+    // gap), so it is not a size to pre-allocate from. The table cannot hold
+    // more entries than `dynsym_data` has room for — the loop below breaks on
+    // exactly that — so reserve for what is actually there.
+    let mut map = hashbrown::HashMap::with_capacity(sym_count.min(dynsym_data.len() / SYM_SIZE));
     for i in 1..sym_count {
         if (i + 1) * SYM_SIZE > dynsym_data.len() { break; }
         let sym = read_sym(dynsym_data, i);
@@ -832,7 +844,17 @@ impl LoadedLib {
     }
 
     /// Write a value at a byte offset within this library's kernel mapping.
+    ///
+    /// `offset` is a relocation's `r_offset`, i.e. it came out of the file.
+    /// The `Shared` arm did raw pointer arithmetic with no check at all,
+    /// which made a crafted `.rela` an arbitrary kernel write; the `Owned`
+    /// arm was checked only by `KernelSlice`. `load_shared_lib` rejects any
+    /// entry that fails this bound, so reaching the assert means the loader
+    /// let something through — a kernel bug, and fail-fast is right for it.
     pub unsafe fn write_at<T: Copy>(&self, offset: u64, value: T) {
+        let end = (offset as usize).checked_add(core::mem::size_of::<T>());
+        assert!(end.is_some_and(|e| e <= self.image.size()),
+            "LoadedLib::write_at: r_offset {:#x} outside image of {:#x}", offset, self.image.size());
         match &self.memory {
             LibMemory::Owned(_) => self.image.write(offset as usize, value),
             LibMemory::Shared { rw_delta, .. } => {
@@ -857,10 +879,13 @@ fn gnu_dlsym(lib: &LoadedLib, name: &str) -> Option<UserAddr> {
     let table = lib.gnu_hash.as_ref()?;
     let h = gnu_hash(name);
 
+    if table.size() < 16 { return None; }
     let nbuckets = unsafe { table.read::<u32>(0) };
     let symoffset = unsafe { table.read::<u32>(4) };
     let bloom_size = unsafe { table.read::<u32>(8) };
     let bloom_shift = unsafe { table.read::<u32>(12) };
+    // Both are divisors below, and both come out of the file.
+    if nbuckets == 0 || bloom_size == 0 { return None; }
 
     let bloom_off = 16;
     let bloom_idx = ((h as u64 / 64) % bloom_size as u64) as usize;
@@ -921,6 +946,39 @@ pub(crate) fn read_backing_into(backing: &dyn crate::file_backing::FileBacking, 
 /// Reads ELF headers and segments from the file backing (no full-file buffer).
 /// Applies RELATIVE relocations and parses PT_DYNAMIC for symbol tables.
 /// Returns (LoadedLib, rw_vaddr, rw_end_vaddr) for RW region tracking.
+/// A loaded module image, addressed by the module's own virtual addresses.
+///
+/// Every `DT_*` tag and every `r_offset` in a shared object is a vaddr the
+/// loader has to turn into an offset into this image, and all of them come
+/// from the file. Written inline as `vaddr - vaddr_min` that is a wrapping
+/// subtraction on untrusted input, producing a huge offset whose
+/// `offset + size` wraps back under the slice's own bounds check — an
+/// out-of-bounds kernel pointer that passes every assert on the way. There
+/// were nine such subtractions; this is the one place they all go through
+/// now, and it returns an error rather than asserting because a malformed
+/// `.so` is untrusted input, not a kernel bug.
+struct ModuleImage {
+    image: KernelSlice,
+    vaddr_min: u64,
+    vaddr_max: u64,
+}
+
+impl ModuleImage {
+    fn slice(&self, vaddr: u64, size: u64) -> Result<KernelSlice, &'static str> {
+        let end = vaddr.checked_add(size).ok_or("ELF: dynamic extent overflows")?;
+        if vaddr < self.vaddr_min || end > self.vaddr_max {
+            return Err("ELF: dynamic table outside the loaded image");
+        }
+        Ok(self.image.subslice((vaddr - self.vaddr_min) as usize, size as usize))
+    }
+
+    /// From `vaddr` to the end of the image, for tables whose size no tag
+    /// records (`.gnu.hash` is walked structurally, not by a declared length).
+    fn slice_to_end(&self, vaddr: u64) -> Result<KernelSlice, &'static str> {
+        self.slice(vaddr, self.vaddr_max.saturating_sub(vaddr))
+    }
+}
+
 pub fn load_shared_lib(backing: &dyn crate::file_backing::FileBacking) -> Result<(LoadedLib, u64, u64), &'static str> {
     // Read ELF headers (first 4KB covers ELF header + program headers)
     let header_size = 4096.min(backing.file_size() as usize);
@@ -974,8 +1032,9 @@ pub fn load_shared_lib(backing: &dyn crate::file_backing::FileBacking) -> Result
     let mut gnu_hash_vaddr = 0u64;
     let mut init_array_vaddr = 0u64;
     let mut init_array_size = 0u64;
+    let module = ModuleImage { image, vaddr_min, vaddr_max };
     if let Some((_, dyn_vaddr, dyn_filesz)) = layout.dynamic {
-        let dyn_region = image.subslice((dyn_vaddr - vaddr_min) as usize, dyn_filesz as usize);
+        let dyn_region = module.slice(dyn_vaddr, dyn_filesz)?;
         let mut off = 0;
         while off + 16 <= dyn_region.size() {
             let d_tag = unsafe { dyn_region.read::<i64>(off) };
@@ -999,8 +1058,7 @@ pub fn load_shared_lib(backing: &dyn crate::file_backing::FileBacking) -> Result
     }
 
     let gnu_hash_slice = if gnu_hash_vaddr != 0 {
-        let off = (gnu_hash_vaddr - vaddr_min) as usize;
-        Some(image.subslice(off, image.size() - off))
+        Some(module.slice_to_end(gnu_hash_vaddr)?)
     } else { None };
 
     // Determine symbol count. Prefer section header sh_size (includes all symbols:
@@ -1031,19 +1089,20 @@ pub fn load_shared_lib(backing: &dyn crate::file_backing::FileBacking) -> Result
         count
     };
 
-    let dynsym_off = (symtab_vaddr - vaddr_min) as usize;
-    let dynstr_off = (strtab_vaddr - vaddr_min) as usize;
-    let dynsym = Some(image.subslice(dynsym_off, sym_count * SYM_SIZE));
-    let dynstr = Some(image.subslice(dynstr_off, strtab_size as usize));
+    // `sym_count` is derived from a section header's sh_size or from the
+    // .gnu.hash chain walk, both file-controlled, so the symbol table it
+    // implies has to fit in the image like every other tag.
+    let dynsym = Some(module.slice(symtab_vaddr, (sym_count * SYM_SIZE) as u64)?);
+    let dynstr = Some(module.slice(strtab_vaddr, strtab_size)?);
 
     // Apply R_X86_64_RELATIVE relocations
     let base_phys = image.phys();
     let mut reloc_count = 0u64;
     let rela_slice = if rela_size > 0 {
-        Some(image.subslice((rela_vaddr - vaddr_min) as usize, rela_size as usize))
+        Some(module.slice(rela_vaddr, rela_size)?)
     } else { None };
     let jmprel_slice = if jmprel_size > 0 {
-        Some(image.subslice((jmprel_vaddr - vaddr_min) as usize, jmprel_size as usize))
+        Some(module.slice(jmprel_vaddr, jmprel_size)?)
     } else { None };
 
     for table in [&rela_slice, &jmprel_slice] {
@@ -1053,7 +1112,18 @@ pub fn load_shared_lib(backing: &dyn crate::file_backing::FileBacking) -> Result
             let rela = unsafe { table.read::<Elf64_Rela>(i * RELA_SIZE as usize) };
             if rela_type(&rela) == R_X86_64_RELATIVE {
                 let value = (base_phys as i64 + rela.r_addend) as u64;
-                unsafe { image.write::<u64>((rela.r_offset - vaddr_min) as usize, value); }
+                // Two conventions meet here and both have to hold.
+                // `rebase_relative_relocs`/`fixup_relative_relocs` walk this
+                // same table later and index the image by the *raw*
+                // `r_offset`, not by `r_offset - vaddr_min`. The two coincide
+                // only for `vaddr_min == 0`, which is what every ToyOS-linked
+                // module has; rather than leave the difference to chance,
+                // require the entry to be valid under both, so a table that
+                // survives this loop can never reach `write_at`'s assert.
+                if rela.r_offset as usize + 8 > image.size() {
+                    return Err("ELF: RELATIVE r_offset outside the loaded image");
+                }
+                unsafe { module.slice(rela.r_offset, 8)?.write::<u64>(0, value) };
                 reloc_count += 1;
             }
         }
@@ -1067,8 +1137,7 @@ pub fn load_shared_lib(backing: &dyn crate::file_backing::FileBacking) -> Result
     let (_, tls_vaddr, tls_filesz, tls_memsz_layout, tls_align_layout) =
         ((), layout.tls_vaddr, layout.tls_filesz, layout.tls_memsz, layout.tls_align);
     if tls_memsz_layout > 0 {
-        let off = (tls_vaddr - vaddr_min) as usize;
-        tls_template = Some(image.subslice(off, tls_filesz));
+        tls_template = Some(module.slice(tls_vaddr, tls_filesz as u64)?);
         tls_memsz = tls_memsz_layout;
         tls_align = tls_align_layout;
     }

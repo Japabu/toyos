@@ -26,7 +26,15 @@ const DIR: &str = "/home/abuse_elf";
 const ET_DYN: u16 = 3;
 const EM_X86_64: u16 = 62;
 const PT_LOAD: u32 = 1;
+const PT_DYNAMIC: u32 = 2;
 const PT_TLS: u32 = 7;
+
+const DT_STRTAB: i64 = 5;
+const DT_SYMTAB: i64 = 6;
+const DT_RELA: i64 = 7;
+const DT_RELASZ: i64 = 8;
+const DT_STRSZ: i64 = 10;
+const DT_GNU_HASH: i64 = 0x6fff_fef5u32 as i32 as i64;
 
 /// One PT_LOAD covering the whole file plus one extra header the caller fills.
 /// `entry` and the load segment are honest; only the extra header lies.
@@ -54,6 +62,40 @@ fn elf(extra: Phdr) -> Vec<u8> {
     // Give the file real content past the headers, so an overrunning copy
     // moves a recognizable pattern rather than zeros.
     out.resize(0x4000, 0x41);
+    out
+}
+
+/// One PT_LOAD at vaddr 0x1000 (so `vaddr_min` is non-zero and vaddr 0 is
+/// *below* the image) plus a PT_DYNAMIC holding `tags`, DT_NULL-terminated.
+/// vaddr V maps to file offset V - 0x1000; the image spans [0x1000, 0x5000).
+fn dyn_elf(tags: &[(i64, u64)]) -> Vec<u8> {
+    let mut out = vec![0u8; 0x4000];
+
+    out[..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+    out[4] = 2;
+    out[5] = 1;
+    out[6] = 1;
+    out[16..18].copy_from_slice(&ET_DYN.to_le_bytes());
+    out[18..20].copy_from_slice(&EM_X86_64.to_le_bytes());
+    out[20..24].copy_from_slice(&1u32.to_le_bytes());
+    out[24..32].copy_from_slice(&0x1000u64.to_le_bytes());
+    out[32..40].copy_from_slice(&64u64.to_le_bytes());
+    out[52..54].copy_from_slice(&64u16.to_le_bytes());
+    out[54..56].copy_from_slice(&56u16.to_le_bytes());
+    out[56..58].copy_from_slice(&2u16.to_le_bytes());
+    out[58..60].copy_from_slice(&64u16.to_le_bytes());
+
+    Phdr { kind: PT_LOAD, flags: 6, offset: 0, vaddr: 0x1000, filesz: 0x4000, memsz: 0x4000, align: 0x1000 }
+        .write(&mut out[64..120]);
+    Phdr { kind: PT_DYNAMIC, flags: 6, offset: 0x1000, vaddr: 0x2000, filesz: 0x400, memsz: 0x400, align: 8 }
+        .write(&mut out[120..176]);
+
+    let mut off = 0x1000;
+    for &(tag, val) in tags {
+        out[off..off + 8].copy_from_slice(&tag.to_le_bytes());
+        out[off + 8..off + 16].copy_from_slice(&val.to_le_bytes());
+        off += 16;
+    }
     out
 }
 
@@ -164,6 +206,46 @@ fn main() {
         filesz: 0x4000, memsz: 16, align: 8,
     }));
     assert!(!msg.is_empty(), "dlopen error message");
+
+    // 7. PT_DYNAMIC whose DT_* tags point outside the loaded image.
+    //    `load_shared_lib` maps each tag's vaddr to an image offset as
+    //    `vaddr - vaddr_min`; below vaddr_min that wraps, and the wrapped
+    //    `offset + size` can wrap back under a slice's own bounds check.
+    //    DT_STRSZ and the implied symbol count also size kernel allocations.
+    //    `dyn_elf` puts the image at [0x1000, 0x5000), so vaddr 0 is below
+    //    vaddr_min; the base tags are honest and each case overrides one.
+    let base = [(DT_SYMTAB, 0x3000), (DT_STRTAB, 0x3000), (DT_STRSZ, 8)];
+    for (name, over) in [
+        ("dyn_symtab_low", &[(DT_SYMTAB, 0)][..]),
+        ("dyn_strtab_low", &[(DT_STRTAB, 0)][..]),
+        ("dyn_strsz_huge", &[(DT_STRSZ, u64::MAX)][..]),
+        ("dyn_gnuhash_far", &[(DT_GNU_HASH, 0x7000_0000)][..]),
+        ("dyn_rela_far", &[(DT_RELA, 0x7000_0000), (DT_RELASZ, 24)][..]),
+        ("dyn_reloc_oob", &[(DT_RELA, 0x3800), (DT_RELASZ, 24)][..]),
+    ] {
+        let tags: Vec<(i64, u64)> = base.iter().chain(over.iter()).copied().collect();
+        let mut bytes = dyn_elf(&tags);
+        if name == "dyn_reloc_oob" {
+            // One R_X86_64_RELATIVE whose r_offset is far past the image.
+            let r = 0x2800; // file offset of vaddr 0x3800
+            bytes[r..r + 8].copy_from_slice(&0x7000_0000u64.to_le_bytes());
+            bytes[r + 8..r + 16].copy_from_slice(&8u64.to_le_bytes()); // R_X86_64_RELATIVE
+        }
+        let msg = dlopen_err(&format!("{name}.so"), &bytes);
+        assert!(!msg.is_empty(), "{name}: dlopen error message");
+    }
+
+    // 8. e_shentsize = 0 with a section table present: consumers divide a byte
+    //    count by it, and #DE in the kernel is not a survivable fault. A
+    //    well-formed enough library may legitimately load here — the assertion
+    //    is only that the kernel comes back at all.
+    let mut bytes = dyn_elf(&base);
+    bytes[40..48].copy_from_slice(&0x1000u64.to_le_bytes()); // e_shoff
+    bytes[58..60].copy_from_slice(&0u16.to_le_bytes()); // e_shentsize
+    bytes[60..62].copy_from_slice(&4u16.to_le_bytes()); // e_shnum
+    let path = format!("{DIR}/shentsize_zero.so");
+    fs::write(&path, &bytes).expect("write shentsize_zero.so");
+    drop(unsafe { libloading::Library::new(&path) });
 
     // The kernel heap is intact: allocate and touch enough to walk it, then
     // prove spawn and the real loader still work.
