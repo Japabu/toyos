@@ -751,16 +751,28 @@ fn sys_waitpid(pid: u64, flags: u64) -> u64 {
     const WNOHANG: u64 = 1;
     let child_pid = process::Pid::from_raw(pid as u32);
     let caller = process::current_process();
+    let queue = WaitQueue::task();
     loop {
+        // Registered before the table is read, so a child that exits in the
+        // park window marks the ticket instead of aiming a wake at a thread
+        // that is not parked yet.
+        let ticket = queue.prepare_wait();
         match process::wait_child_zombie(child_pid, caller) {
-            Ok(Some(code)) => return code as u64,
+            Ok(Some(code)) => {
+                ticket.cancel();
+                return code as u64;
+            }
             Ok(None) => {
                 if flags & WNOHANG != 0 {
+                    ticket.cancel();
                     return SyscallError::WouldBlock.to_u64();
                 }
-                process::block(None, 0); // woken by wake_tid from exit path
+                crate::scheduler::block_on(ticket, 0);
             }
-            Err(()) => return SyscallError::NotFound.to_u64(),
+            Err(()) => {
+                ticket.cancel();
+                return SyscallError::NotFound.to_u64();
+            }
         }
     }
 }
@@ -992,11 +1004,19 @@ fn sys_munmap(addr: u64, _size: u64) -> u64 {
 fn sys_thread_join(tid: u64) -> u64 {
     let tid = process::Tid::from_raw(tid as u32);
     let caller = process::current_process();
+    let queue = WaitQueue::task();
     loop {
+        let ticket = queue.prepare_wait();
         match process::wait_thread_zombie(tid, caller) {
-            Ok(Some(_)) => return 0,
-            Ok(None) => process::block(None, 0), // woken by wake_tid from exit path
-            Err(()) => return SyscallError::NotFound.to_u64(),
+            Ok(Some(_)) => {
+                ticket.cancel();
+                return 0;
+            }
+            Ok(None) => crate::scheduler::block_on(ticket, 0),
+            Err(()) => {
+                ticket.cancel();
+                return SyscallError::NotFound.to_u64();
+            }
         }
     }
 }
@@ -1110,7 +1130,9 @@ fn sys_net_recv(buf: &mut [u8], timeout_nanos: u64) -> u64 {
 
 fn sys_nanosleep(nanos: u64) -> u64 {
     let deadline = crate::clock::nanos_since_boot().saturating_add(nanos);
-    process::block(None, deadline); // woken by deadline expiry only
+    // No condition to re-check: the deadline is the wake, and one that has
+    // already passed fires at the next scheduler entry.
+    crate::scheduler::block_on(WaitQueue::task().prepare_wait(), deadline);
     0
 }
 

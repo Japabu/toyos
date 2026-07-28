@@ -605,7 +605,7 @@ impl<'a> CpuQueueGuard<'a> {
 /// mark rather than parking. Both sides run under the pool lock, so a wake
 /// either marks the registration or finds the thread already parked.
 struct Prepared {
-    source: EventSource,
+    source: Option<EventSource>,
     fired: bool,
 }
 
@@ -643,7 +643,7 @@ impl BlockedPool {
             if fired == limit {
                 break;
             }
-            if p.source == *event && !p.fired {
+            if p.source == Some(*event) && !p.fired {
                 p.fired = true;
                 fired += 1;
             }
@@ -980,12 +980,12 @@ pub fn block(event: Option<EventSource>, deadline: u64) {
 /// without a registration behind it is the lost-wake window, and there is no
 /// other way to construct one.
 pub fn block_on(ticket: WaitTicket<'_>, deadline: u64) {
-    do_schedule(SwitchReason::Block { event: Some(ticket.into_park()), deadline });
+    do_schedule(SwitchReason::Block { event: ticket.into_park(), deadline });
 }
 
 /// Register the running thread on `source` — `WaitQueue::prepare_wait`'s half
 /// inside the pool. Returns the registered task, which the ticket carries.
-pub(crate) fn register_wait(source: EventSource) -> TaskId {
+pub(crate) fn register_wait(source: Option<EventSource>) -> TaskId {
     let id = TaskId(
         percpu::current_pid().expect("prepare_wait: no current process"),
         percpu::current_tid().expect("prepare_wait: no current thread"),
@@ -1686,7 +1686,7 @@ fn park_outgoing(queue: CpuQueueGuard<'_>, mut old: TaskCtx, event: Option<Event
         return prepared.is_some();
     }
     if let Some(p) = &prepared {
-        assert_eq!(Some(p.source), event,
+        assert_eq!(p.source, event,
             "park_outgoing: {} parked on a source it did not register on", old.id);
     }
     // A wake landed between the decision to block and this insert: for a

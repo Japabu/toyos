@@ -33,39 +33,47 @@ use crate::pipe::PipeId;
 use crate::scheduler::{self, EventSource, TaskId};
 use crate::DirectMap;
 
-/// The waiter set of one event source. Stage 7 gives every waitable object
-/// its own queue; until then the set lives in the blocked pool and this is a
-/// typed name for its key.
-pub struct WaitQueue(EventSource);
+/// The waiter set of one event source, or — for `None` — of the threads a
+/// `wake_task` targets directly. Stage 7 gives every waitable object its own
+/// queue; until then the set lives in the blocked pool and this is a typed
+/// name for its key.
+pub struct WaitQueue(Option<EventSource>);
 
 impl WaitQueue {
     pub fn pipe_readable(id: PipeId) -> Self {
-        Self(EventSource::PipeReadable(id))
+        Self(Some(EventSource::PipeReadable(id)))
     }
 
     pub fn pipe_writable(id: PipeId) -> Self {
-        Self(EventSource::PipeWritable(id))
+        Self(Some(EventSource::PipeWritable(id)))
     }
 
     /// The waiters of one futex word, keyed by its physical address so the
     /// queue is shared across the processes that map it.
     pub fn futex(addr: DirectMap) -> Self {
-        Self(EventSource::Futex(addr))
+        Self(Some(EventSource::Futex(addr)))
     }
 
     /// Threads in `accept` on one listener.
     pub fn listener(id: ListenerId) -> Self {
-        Self(EventSource::Listener(id))
+        Self(Some(EventSource::Listener(id)))
     }
 
     /// Readers of the audio device's completion records.
     pub fn audio() -> Self {
-        Self(EventSource::Audio)
+        Self(Some(EventSource::Audio))
     }
 
     /// Threads waiting on one io_uring's completion queue.
     pub fn io_uring(id: RingId) -> Self {
-        Self(EventSource::IoUring(id))
+        Self(Some(EventSource::IoUring(id)))
+    }
+
+    /// Waiters woken by name rather than by source: waitpid, thread_join,
+    /// sleep. There is nothing to re-derive here — the caller's own predicate
+    /// (a zombie in the table, the clock) is the condition.
+    pub fn task() -> Self {
+        Self(None)
     }
 
     /// Phase 1: register the running thread. The caller must then re-check
@@ -91,7 +99,7 @@ impl WaitQueue {
 
     /// Is the source ready right now? The post-registration re-check.
     pub fn ready(&self) -> bool {
-        source_ready(&self.0)
+        self.0.as_ref().is_some_and(source_ready)
     }
 
     /// The whole two-phase commit, for a site whose re-check is exactly this
@@ -159,7 +167,7 @@ impl WaitTicket<'_> {
     /// Phase 2, for `scheduler::block_on` only: consume the ticket and name
     /// the source the thread parks on. Preemption comes back without a poll —
     /// the caller's next act is the reschedule.
-    pub(crate) fn into_park(mut self) -> EventSource {
+    pub(crate) fn into_park(mut self) -> Option<EventSource> {
         self.armed = false;
         crate::preempt::enable_no_resched();
         self.queue.0
