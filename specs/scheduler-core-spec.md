@@ -766,15 +766,31 @@ model weak memory.
 ## 11. Migration plan — always-green stages
 
 Gate legend: **B** = `cargo run -- --build-only` clean; **T** = `cargo test` (QEMU integration,
-run in background per CLAUDE.md, full output read); **A** = audio glitch analysis
-(`tests/common/audio.rs` wav zero-run scan, at `-smp 1` and `-smp 8`); **H** = host
-`cargo test -p toyos-sched` incl. loom; **S** = sim corpus + seed sweep green.
+run in background per CLAUDE.md, full output read; includes gate A's **fast tier**); **A** =
+gate A's **thorough tier**, `cargo test --test toyos-build -- --audio-gate 30`, ~17 min, at `-smp 1` and `-smp 8`;
+**H** = host `cargo test -p toyos-sched` incl. loom; **S** = sim corpus + seed sweep green.
 
-**Honest baseline for gate A:** today's tree emits ~1300 period-quantized gaps per 100 s — the
-old scheduler does not pass a strict gate. Stage 0 records a baseline histogram
-(`gaps[n_periods]` per 30 s run). Stages 1–6 gate on **no regression vs baseline** (the
-stabilization track may improve it; re-baseline when it lands). Stage 7 gates the NEW scheduler
-on the strict target: **zero mid-playback gaps ≥ 1 period over 30 s**, both SMP configs.
+**Honest baseline for gate A** (rewritten 2026-07-28 after the distribution was measured; the
+original text here assumed a per-run histogram comparison would work). A single audio run is one
+Bernoulli trial against a 0–7% per-config dropout rate: it reds an unmodified tree on 12.8% of
+invocations and cannot see a doubling of that rate. **No stage may be gated on it.** The gate is
+therefore two-tiered, and only the thorough tier states anything about a rate:
+
+- **Fast tier** (inside every `cargo test`): per-run counter ceilings, instrument-alive checks,
+  and a *confirmed* zero-gap bar — a run that drops audio re-boots once and only a second
+  dropout fails. Certifies that this build is not catastrophically broken. Certifies no rate.
+- **Thorough tier** (`--audio-gate N`, what **A** means in the table): N iterations of all four
+  configs, every per-run outcome converted to a rate or a distribution and compared against the
+  recorded 30-run sample in `tests/audio-baseline.toml` — Mann-Whitney for soundd's counters,
+  Fisher exact for the yes/no outcomes. At N=30 it detects a 25% shift in wake lateness 99.9% of
+  the time, a 5% drop in soundd's wake count 99.9%, and a 10× rise in the dropout rate 100%,
+  with a 0.25% false-red rate on a clean tree.
+
+What it still cannot do: resolve a **doubling of the dropout rate**. Separating 3% from 7% at
+this confidence needs ~600 runs per config, five hours per config, and no choice of N a human
+waits for changes that. The audible symptom is the weak instrument; soundd's counters are the
+strong one, and they are strong because they fire on every run. Stage 7 keeps the strict target —
+**zero mid-playback gaps** — as the *recorded rate going to zero*, not as one green run.
 
 | Stage | Content | Gate |
 |---|---|---|

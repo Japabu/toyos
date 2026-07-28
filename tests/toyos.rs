@@ -373,8 +373,15 @@ fn measure_audio_run(
     test_config: &Path,
     c_bins: &[(String, Vec<u8>)],
     rust_bins: &[(String, Vec<u8>)],
-    label: &str,
+    // Distinguishes this boot from the others of the same config in the log
+    // and in the kept capture's filename; empty for a plain single boot.
+    tag: &str,
 ) -> Result<AudioRun, String> {
+    let label = if tag.is_empty() {
+        String::new()
+    } else {
+        format!("{tag}: ")
+    };
     let mut qemu = QemuInstance::boot_with_options(
         test_config,
         c_bins,
@@ -504,9 +511,14 @@ fn measure_audio_run(
     // Keep every capture that shows something, so a dropout can be listened to
     // even when the tier's rule says one occurrence is not yet a verdict.
     if !problems.is_empty() || !breaches.is_empty() || !gaps.is_empty() {
+        let suffix = if tag.is_empty() {
+            String::new()
+        } else {
+            format!("-{tag}")
+        };
         let kept = qemu
             .audio_wav_path()
-            .with_file_name(format!("audio-{name}-smp{smp}.wav"));
+            .with_file_name(format!("audio-{name}-smp{smp}{suffix}.wav"));
         if fs::rename(qemu.audio_wav_path(), &kept).is_ok() {
             eprintln!("        {label}{name} smp={smp} wav kept at {}", kept.display());
         }
@@ -560,7 +572,7 @@ fn run_audio_test(
         baseline.sample.gap_runs,
         baseline.sample.gap_sample,
     );
-    let again = measure_audio_run(name, smp, baseline, test_config, c_bins, rust_bins, "confirm: ")?;
+    let again = measure_audio_run(name, smp, baseline, test_config, c_bins, rust_bins, "confirm")?;
     let problems = [again.broken.as_slice(), again.breaches.as_slice()].concat();
     if !problems.is_empty() {
         return Err(problems.join("\n    "));
@@ -577,7 +589,7 @@ fn run_audio_test(
 }
 
 // ---------------------------------------------------------------------------
-// Thorough tier: `cargo test -- --audio-gate N`
+// Thorough tier: `cargo test --test toyos-build -- --audio-gate N`
 // ---------------------------------------------------------------------------
 
 /// One config's fresh sample, accumulated over the N iterations.
@@ -688,9 +700,9 @@ fn run_audio_gate(
         for &(name, smp) in &configs {
             let key = format!("{name}.smp{smp}");
             let baseline = config_baseline(audio_baseline, name, smp);
-            let label = format!("[{iter}/{iterations}] ");
+            let tag = format!("{iter}/{iterations}");
             let run = match measure_audio_run(
-                name, smp, &baseline, test_config, c_bins, rust_bins, &label,
+                name, smp, &baseline, test_config, c_bins, rust_bins, &tag,
             ) {
                 Ok(run) => run,
                 Err(err) => {

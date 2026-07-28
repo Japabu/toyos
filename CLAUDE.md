@@ -115,7 +115,24 @@ failed only because it sat *below* std instead of beside it. See
 - `cargo test -- process_stats` runs only tests matching "process_stats" (substring filter).
 - `cargo test -- process_stats --nocapture` filter + serial output.
 - `cargo test -- --list` lists all test names without running them.
+- `cargo test --test toyos-build -- --audio-gate 30` runs gate A's thorough tier (~17 min, see below).
 - `system.toml` defines which programs to build and the init sequence.
+
+**Gate A (audio) has two tiers.** `tests/audio-baseline.toml` documents both in
+full; the short version:
+
+- **Fast** — part of every `cargo test`. One boot per config. Certifies the
+  per-run counter ceilings, that the instrument is alive, and that audio does
+  not *reproducibly* drop out (a dropout re-boots once; only a second one
+  fails). It certifies nothing about a rate — one run is one sample.
+- **Thorough** — `cargo test --test toyos-build -- --audio-gate N`. N iterations of all four
+  configs; every per-run outcome becomes a rate or a distribution, compared
+  against the recorded sample by Mann-Whitney (counters) and Fisher exact
+  (yes/no outcomes). This is what a scheduler-migration stage transition gates
+  on. At N=30 it detects a 25% shift in wake lateness 99.9% of the time and a
+  5% drop in soundd's wake count 99.9%, with a 0.25% false-red rate on a clean
+  tree; it does *not* detect a doubling of the dropout rate, and no N a human
+  waits for would.
 
 ## Repository layout
 
@@ -219,18 +236,18 @@ the subsystems they cover:
   runs from the CLI, not from `cargo test`:
   `cargo run --release -p toyos-sched-sim -- gate 10000` (10⁴ seeds/scenario) and
   `-- fuzz-sweep 10000000` (10⁷ fuzz steps/scenario).
-  Gate A (audio glitch) runs inside `cargo test`: each audio test boots at smp=1
-  and smp=8 and is gated on **two** instruments recorded per config in
-  `tests/audio-baseline.toml` — the wav underrun histogram (all-clean = strict,
-  unchanged) *and* ceilings on soundd's own counters (`max_wake_lat_us`,
-  `drains`, `underruns`). The wav samples ~1100 device periods once per run and
-  only fires when a dropout lands inside the tone, so it is a rare-event
-  detector; the counters are non-zero on essentially every run and are the half
-  with statistical power. Every number in that file is justified in the file
-  itself, measured over 30 serial runs per config on a quiet host. The harness
-  also fails if the capture's silence carries no dither — without that check,
-  reverting the §5.4 quantizer fix would silently collapse the dropout
-  detector's band and take the instrument out (see below). Stage 2 landed: per-CPU `kernel/src/irq_ring.rs`
+  Gate A (audio glitch) is **two-tiered** — see Build & test above and the long
+  form in `tests/audio-baseline.toml`. The fast tier runs inside every
+  `cargo test`; **a stage transition gates on the thorough tier**
+  (`cargo test --test toyos-build -- --audio-gate 30`), which is the only one that certifies a
+  rate. Both read the same per-config record: the per-run counter ceilings
+  (`max_wake_lat_us`, `drains`, `underruns`), the strict zero-gap wav histogram,
+  and — new — the recorded 30-run *sample* of each counter, which the thorough
+  tier compares a fresh sample against. Every number in that file is justified
+  in the file itself. The harness also fails if the capture's silence carries no
+  dither — without that check, reverting the §5.4 quantizer fix would silently
+  collapse the dropout detector's band and take the instrument out (see below).
+  Stage 2 landed: per-CPU `kernel/src/irq_ring.rs`
   carries `(IrqSource, ts)` IRQ-time stamps for audio/net/xHCI; ISRs publish + set
   need_resched via the shared `msix_entry!` macro; `drain_events` consumes the ring
   (no global pending flags, no cpu==0 gating).
@@ -242,8 +259,8 @@ the subsystems they cover:
 ## Known issues
 
 <!-- Track blocking issues and findings here. Remove when resolved. -->
-- **`audio_tone_load` at smp=1 is flaky on an unmodified tree, so the recorded audio baseline is wrong.** Measured 2026-07-28 during Stage 5: 2 failures in 19 baseline runs (1- and 8-period gaps), with soundd's own underrun count spanning 0–17 across runs that all "passed". `tests/audio-baseline.toml` records all-clean, so Gate A both under-reports real glitches and will fire false failures during the scheduler migration — the one gate the migration most depends on. Two things to settle, in order: (1) is the residual a real single-core underrun or harness noise (soundd reporting non-zero underruns on passing runs says real), and (2) record an honest histogram rather than an aspirational one. Until then, treat a single green audio run as evidence of nothing. Note this does not undo the audio work — the pre-fix baseline was 1,834 gaps — but "0 gaps, verified" was too strong a claim. **Update 2026-07-28:** the dominant contributor was soundd's re-prime path (`specs/audio-glitch-distribution-2026-07-28.md` mode A) and it is now fixed. Re-measured over 30 serial suite invocations per side, 120 config-runs each: 7/30 → 1/30 suites red, 12 → 1 gap events, 464 ms → 29 ms of total mid-tone dropout, and the ×8 quantisation is gone (8 events / 418 ms of multiples-of-8 → zero). The residual is one 10-period gap on `audio_tone_load` smp=1 — a client slot miss driven by the unchanged wake lateness (median ~35 ms against a 23.2 ms pipeline), which is the separate, still-open defect. Whoever re-records the baseline should measure fresh; the numbers in the distribution doc are pre-fix. **Update 2026-07-28 (baseline re-recorded):** measured fresh over 30 serial suite invocations, 120 config-runs, quiet host, post-quantizer-fix. Gap-producing runs, raw counts: `audio_tone` smp=1 **1/30** (one 1-period), `audio_tone` smp=8 **0/30**, `audio_tone_load` smp=1 **2/30** (one 2-period, one 5-period), `audio_tone_load` smp=8 **1/30** (two 4-period). Three of 30 suite invocations red on gaps. The `gaps` histograms stay strictly zero — the bar was not loosened — and Gate A now additionally asserts on soundd's counters, whose distributions are recorded per config in `tests/audio-baseline.toml`. The wake-lateness residual is confirmed and is now measured properly (streaming-scoped): median 13.9 ms but max **93.0 ms = 4.0 pipeline depths** on `audio_tone_load` smp=1, with up to 13 full pipeline drains in one 3 s stream. That statistic is badly heavy-tailed — its 30-run maximum more than tripled between n=15 and n=30 — so `drains` and the zero-gap histogram, not the latency maximum, are what actually hold that config.
-- **The audio harness's per-test 30 s timeout fired once in 30 quiet-host runs** (`audio_tone` smp=8, which is otherwise the healthiest config: 0/30 gaps, median 7.4 ms wake lateness). The tone itself is ~3.5 s, so something stalled for an order of magnitude longer than the whole test. Not reproduced and not diagnosed. If it recurs, keep the QEMU alive and attach LLDB — this smells like the same rare class as the unreproduced `panic_recovery` wedge.
+- **`audio_tone_load` at smp=1 is flaky on an unmodified tree, so the recorded audio baseline is wrong.** Measured 2026-07-28 during Stage 5: 2 failures in 19 baseline runs (1- and 8-period gaps), with soundd's own underrun count spanning 0–17 across runs that all "passed". `tests/audio-baseline.toml` records all-clean, so Gate A both under-reports real glitches and will fire false failures during the scheduler migration — the one gate the migration most depends on. Two things to settle, in order: (1) is the residual a real single-core underrun or harness noise (soundd reporting non-zero underruns on passing runs says real), and (2) record an honest histogram rather than an aspirational one. Until then, treat a single green audio run as evidence of nothing. Note this does not undo the audio work — the pre-fix baseline was 1,834 gaps — but "0 gaps, verified" was too strong a claim. **Update 2026-07-28:** the dominant contributor was soundd's re-prime path (`specs/audio-glitch-distribution-2026-07-28.md` mode A) and it is now fixed. Re-measured over 30 serial suite invocations per side, 120 config-runs each: 7/30 → 1/30 suites red, 12 → 1 gap events, 464 ms → 29 ms of total mid-tone dropout, and the ×8 quantisation is gone (8 events / 418 ms of multiples-of-8 → zero). The residual is one 10-period gap on `audio_tone_load` smp=1 — a client slot miss driven by the unchanged wake lateness (median ~35 ms against a 23.2 ms pipeline), which is the separate, still-open defect. Whoever re-records the baseline should measure fresh; the numbers in the distribution doc are pre-fix. **Update 2026-07-28 (baseline re-recorded):** measured fresh over 30 serial suite invocations, 120 config-runs, quiet host, post-quantizer-fix. Gap-producing runs, raw counts: `audio_tone` smp=1 **1/30** (one 1-period), `audio_tone` smp=8 **0/30**, `audio_tone_load` smp=1 **2/30** (one 2-period, one 5-period), `audio_tone_load` smp=8 **1/30** (two 4-period). Three of 30 suite invocations red on gaps. The `gaps` histograms stay strictly zero — the bar was not loosened — and Gate A now additionally asserts on soundd's counters, whose distributions are recorded per config in `tests/audio-baseline.toml`. The wake-lateness residual is confirmed and is now measured properly (streaming-scoped): median 13.9 ms but max **93.0 ms = 4.0 pipeline depths** on `audio_tone_load` smp=1, with up to 13 full pipeline drains in one 3 s stream. That statistic is badly heavy-tailed — its 30-run maximum more than tripled between n=15 and n=30 — so `drains` and the zero-gap histogram, not the latency maximum, are what actually hold that config. **Update 2026-07-28 (gate rebuilt, this item is closed as a *baseline* problem):** the baseline is no longer wrong — it records the measured distribution, sample and all. What was still wrong was the *statistic*: one run per config per invocation is a Bernoulli trial against a 3.4% pooled dropout rate, which reds a clean tree on 12.8% of invocations and is blind to a doubling. Gate A is now two-tiered (see Build & test); the fast tier confirms a dropout with a second boot before failing, and stage transitions gate on `--audio-gate 30`, which compares a fresh 30-run sample against the recorded one. Residual, unchanged and still scoped out: 9 of 120 runs wake later than the 23.2 ms pipeline they are feeding, worst 4.0 depths.
+- ~~The audio harness's per-test 30 s timeout fired once in 30 quiet-host runs.~~ **Diagnosed and fixed, and it was not a guest stall.** `run_test` matched `===TEST_END ` as a *line prefix*; soundd was mid-`println!` when the runner printed the marker, so the marker landed inside soundd's line and the harness never saw it. The guest had already exited cleanly. The marker is now matched anywhere in the line and the text preceding it is kept (it is usually the stats line gate A reads). Worth remembering as a class: a "guest hang" that only ever appears on the audio tests is more likely to be the shared console than the scheduler.
 - **The virtio-console has no line atomicity between writers, and it corrupts machine-readable serial output.** Kernel `log!` output and userspace `println!` interleave *mid-word* into each other's lines: soundd's stats line was split by a kernel message in 1 of 15 runs and by the tone client's own `println!("tone done")` in 2 of 120 config-runs, each time pushing the line's tail onto the following line. `tests/common/audio.rs` now reassembles both cases (strip `[kernel …]` spans; resume a field's digits after the next newline), but that is a reader-side workaround for a writer-side defect — any tool parsing serial output has the same problem. Serial writes of a whole line should be atomic.
 - Profiling tooling is incomplete — Layer 1 (process accounting counters + `stats` tool) is implemented. Layer 2 (event tracing) and Layer 3 (RIP sampling) are not yet built. See Diagnostics roadmap.
 - **~half the CPU is unattributed kernel time on single-core under load.** With the Doom demo on `--smp 1`, per-process CPU sums to ~45% while the core runs ~97% busy. Prime suspect: context-switch volume (audio cycles + game + compositor ≈ 1000+ switches/s) with address-space switches, expensive under TCG. Quantify (needs Layer 2 tracing or a switch counter) before optimizing; this is the main obstacle to full-speed single-core Doom.

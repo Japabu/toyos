@@ -205,3 +205,60 @@ What would have to change, in order of value:
 Raw logs, preserved failure captures, and the analysis scripts for this run live
 outside the repo (session scratchpad); the numbers above are reproducible with
 `cargo test -- audio --nocapture` run serially.
+
+## 8. Addendum (same day, after the §5.9 and §5.4 fixes): what the gate became
+
+§7 said no, and listed four things to change. Three of them are done; the
+numbers moved, and the conclusion moved with them.
+
+**The distribution changed.** After the proportional-recovery fix (mode A) and
+the quantizer fix, re-measured over the same 30 serial invocations on the same
+quiet host: dropout-producing runs are `audio_tone` smp=1 **1/30**, smp=8
+**0/28**, `audio_tone_load` smp=1 **2/30**, smp=8 **1/29** — pooled **4 of 117**
+(3.4%), against 7/120 before, with the ×8 quantisation gone. Suite-level: 3 of
+30 invocations red on dropouts, not 7.
+
+**Item 3 (control the host) is procedure, not code**, and it stands: serial
+runs, one QEMU, quiet machine.
+
+**Item 4 (fix the defect) is not done and is still scoped out.** Every config's
+worst wake still exceeds one pipeline depth; `audio_tone_load` smp=1 peaks at
+**93.0 ms = 4.0 pipeline depths**. 9 of 120 runs wake later than the pipeline
+they are feeding. The gate records that rate rather than hiding it.
+
+**Items 1 and 2 are done, and they are what makes the answer yes.** Gate A now
+has two tiers (`tests/audio-baseline.toml` documents both):
+
+- The **fast tier** is what `cargo test` runs. It keeps the strict zero-gap bar
+  but confirms a dropout with one re-boot before failing, which takes the
+  clean-tree red rate from 12.8% per invocation to 0.67% while still firing 25%
+  of the time against a config that regressed to a 50% dropout rate.
+- The **thorough tier** (`cargo test --test toyos-build -- --audio-gate 30`, ~17 min) is what a
+  stage transition gates on. It compares a fresh 30-run sample against the
+  recorded 30-run sample — Mann-Whitney for soundd's counters, Fisher exact for
+  the yes/no outcomes — and detects a 25% shift in wake lateness 99.9% of the
+  time, a 5% drop in soundd's wake count 99.9%, a 50% rise in periods of silence
+  100%, and a 10× rise in the dropout rate 100%. False-red on a clean tree:
+  0.25%, over 2000 invocations simulated from the recorded distributions.
+
+**So: yes for stages 6–9, with one stated limit.** The thorough tier can
+certify that the audio timing distribution has not shifted, which is what a
+scheduler change would move. It cannot certify that the *dropout rate* has not
+doubled — separating 3% from 7% at this confidence needs ~600 runs per config
+(five hours per config), and that is a property of a 3% Bernoulli event, not of
+the harness. Any claim of the form "stage N did not increase dropouts by less
+than 2×" is outside what this instrument can support, and §7's warning applies
+to it unchanged.
+
+Two harness defects found while measuring this, both fixed, both of which had
+been presenting as guest faults:
+
+1. `run_test` matched `===TEST_END ` as a **line prefix**. The virtio-console is
+   shared and not line-atomic, so soundd mid-`println!` pushes the marker into
+   the middle of its line; the harness then misses it and times out after 30 s.
+   1 of 120 audio boots. It looked exactly like a guest hang.
+2. The soundd stats parser could not read a line another writer had split. 2 of
+   120 boots. Both now splice across the interruption.
+
+Neither was a kernel problem, and both were counted against the kernel before
+they were found.

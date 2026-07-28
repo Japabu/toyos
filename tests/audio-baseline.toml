@@ -92,7 +92,7 @@
 #   is still printed and its wav still kept.
 #   What it CANNOT certify: any statement about a rate. One run is one sample.
 #
-# THOROUGH TIER — `cargo test -- --audio-gate 30`, ~17 minutes.
+# THOROUGH TIER — `cargo test --test toyos-build -- --audio-gate 30`, ~17 minutes.
 #   What a scheduler-migration stage transition gates on (spec §11 gate A).
 #   N iterations of all four configs; every per-run outcome becomes a rate or a
 #   distribution, and the fresh sample is compared against the RECORDED SAMPLE
