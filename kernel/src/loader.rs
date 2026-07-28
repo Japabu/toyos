@@ -3,7 +3,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::arch::naked_asm;
 use crate::elf;
-use crate::fd::{self, Descriptor, FdTable};
+use crate::fd::{Descriptor, FdTable};
 use crate::sync::Lock;
 use crate::symbols::SymbolTable;
 use crate::{scheduler, vfs, DirectMap, UserAddr};
@@ -239,17 +239,17 @@ fn make_name(path: &str) -> [u8; 28] {
 
 /// Build a child's FdTable from (child_fd, parent_fd) pairs.
 /// Duplicates each referenced parent descriptor into the child table.
-pub fn build_child_fds(pairs: &[[u32; 2]]) -> FdTable {
+pub fn build_child_fds(pairs: &[[u32; 2]]) -> Result<FdTable, SyscallError> {
     let data_arc = fd_owner_data();
     let data = data_arc.lock();
     let mut fds = FdTable::new();
     for &[child_fd, parent_fd] in pairs {
         if let Some(desc) = data.fds.get(parent_fd) {
             let cloned = desc.clone();
-            fd::alloc_at(&mut fds, child_fd, cloned);
+            fds.insert_at(child_fd, cloned)?;
         }
     }
-    fds
+    Ok(fds)
 }
 
 /// User virtual address space starts at 1TB — well above any direct-mapped physical RAM.
@@ -997,8 +997,9 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
 /// to `/bin/<name>`. Panics on failure.
 pub fn spawn_kernel(argv: &[&str]) -> Pid {
     let mut fds = FdTable::new();
-    fds.insert_at(0, Descriptor::SerialConsole);
-    fds.insert_at(1, Descriptor::SerialConsole);
-    fds.insert_at(2, Descriptor::SerialConsole);
+    for fd in 0..3 {
+        fds.insert_at(fd, Descriptor::SerialConsole)
+            .expect("spawn_kernel: three fds cannot exhaust an empty table");
+    }
     spawn(argv, fds, None, Vec::new()).expect("spawn_kernel: failed to spawn")
 }

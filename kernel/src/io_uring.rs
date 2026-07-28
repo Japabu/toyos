@@ -553,7 +553,10 @@ fn process_accept(ring_id: RingId, sqe: &IoUringSqe) {
                     tx: conn.tx,
                 })
             });
-            post_cqe_locked(ring_id, user_data, new_fd as i32, 0);
+            match new_fd {
+                Ok(fd_num) => post_cqe_locked(ring_id, user_data, fd_num as i32, 0),
+                Err(e) => post_cqe_locked(ring_id, user_data, -(e as i32), 0),
+            }
         }
         None => {
             post_cqe_locked(ring_id, user_data, -(SyscallError::WouldBlock as i32), 0);

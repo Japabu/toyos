@@ -216,7 +216,10 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             let fd_count = args.fd_map_count as usize;
             let fds = if fd_count > 0 {
                 let Some(pairs) = ctx.user_slice_of::<[u32; 2]>(UserAddr::new(args.fd_map_ptr), fd_count) else { return bad_addr };
-                process::build_child_fds(pairs)
+                match process::build_child_fds(pairs) {
+                    Ok(fds) => fds,
+                    Err(e) => return e.to_u64(),
+                }
             } else {
                 fd::FdTable::new()
             };
@@ -644,10 +647,10 @@ fn fd_result(r: Result<u32, SyscallError>) -> u64 {
 fn sys_pipe() -> u64 {
     let (reader, writer) = pipe::create();
     process::with_fd_owner_data(|data| {
-        let Ok(read_fd) = fd::alloc(&mut data.fds, fd::Descriptor::PipeRead(reader)) else {
+        let Ok(read_fd) = data.fds.insert(fd::Descriptor::PipeRead(reader)) else {
             return SyscallError::ResourceExhausted.to_u64();
         };
-        let Ok(write_fd) = fd::alloc(&mut data.fds, fd::Descriptor::PipeWrite(writer)) else {
+        let Ok(write_fd) = data.fds.insert(fd::Descriptor::PipeWrite(writer)) else {
             fd::close(&mut data.fds, &mut *vfs::lock(), read_fd, process::current_process());
             return SyscallError::ResourceExhausted.to_u64();
         };
@@ -660,11 +663,11 @@ fn sys_pipe_open(pipe_id: u64, mode: u64) -> u64 {
     match mode {
         0 => {
             let Some(reader) = pipe::open_reader(id) else { return SyscallError::NotFound.to_u64() };
-            process::with_fd_owner_data(|data| fd_result(fd::alloc(&mut data.fds, fd::Descriptor::PipeRead(reader))))
+            process::with_fd_owner_data(|data| fd_result(data.fds.insert(fd::Descriptor::PipeRead(reader))))
         }
         1 => {
             let Some(writer) = pipe::open_writer(id) else { return SyscallError::NotFound.to_u64() };
-            process::with_fd_owner_data(|data| fd_result(fd::alloc(&mut data.fds, fd::Descriptor::PipeWrite(writer))))
+            process::with_fd_owner_data(|data| fd_result(data.fds.insert(fd::Descriptor::PipeWrite(writer))))
         }
         _ => SyscallError::InvalidArgument.to_u64(),
     }
@@ -711,7 +714,7 @@ fn sys_socket_create(rx_pipe_id_raw: u64, tx_pipe_id_raw: u64) -> u64 {
     let Some(rx) = pipe::open_reader(rx_id) else { return SyscallError::NotFound.to_u64() };
     let Some(tx) = pipe::open_writer(tx_id) else { return SyscallError::NotFound.to_u64() };
     process::with_fd_owner_data(|data| {
-        fd_result(fd::alloc(&mut data.fds, fd::Descriptor::Socket { rx, tx }))
+        fd_result(data.fds.insert(fd::Descriptor::Socket { rx, tx }))
     })
 }
 
@@ -805,7 +808,7 @@ fn sys_open_device(device_type: u64) -> u64 {
         Some(d) => d,
         None => return SyscallError::NotFound.to_u64(),
     };
-    process::with_fd_owner_data(|data| fd_result(fd::alloc(&mut data.fds, desc)))
+    process::with_fd_owner_data(|data| fd_result(data.fds.insert(desc)))
 }
 
 // ---------------------------------------------------------------------------
@@ -817,7 +820,7 @@ fn sys_listen(name: &str) -> u64 {
         return SyscallError::AlreadyExists.to_u64();
     };
     process::with_fd_owner_data(|data| {
-        fd_result(fd::alloc(&mut data.fds, fd::Descriptor::Listener(alloc::string::String::from(name))))
+        fd_result(data.fds.insert(fd::Descriptor::Listener(alloc::string::String::from(name))))
     })
 }
 
@@ -843,7 +846,7 @@ fn sys_accept(fd_num: u32) -> u64 {
             // PipeReader/PipeWriter move from the queue into the Socket descriptor.
             // No refcount change — ownership transfers.
             let fd = process::with_fd_owner_data(|data| {
-                fd::alloc(&mut data.fds, fd::Descriptor::Socket { rx: conn.rx, tx: conn.tx })
+                data.fds.insert(fd::Descriptor::Socket { rx: conn.rx, tx: conn.tx })
             });
             return match fd {
                 Ok(fd_num) => ((client_pid.raw() as u64) << 32) | (fd_num as u64),
@@ -874,7 +877,7 @@ fn sys_connect(name: &str) -> u64 {
 
     // Client's end
     process::with_fd_owner_data(|data| {
-        fd_result(fd::alloc(&mut data.fds, fd::Descriptor::Socket {
+        fd_result(data.fds.insert(fd::Descriptor::Socket {
             rx: sc_reader,   // client reads from server→client
             tx: cs_writer,   // client writes to client→server
         }))
@@ -1149,7 +1152,7 @@ fn sys_dup(fd_num: u32) -> u64 {
             Some(d) => d.clone(),
             None => return SyscallError::NotFound.to_u64(),
         };
-        fd_result(fd::alloc(&mut data.fds, desc))
+        fd_result(data.fds.insert(desc))
     })
 }
 
@@ -1167,8 +1170,10 @@ fn sys_dup2(old_fd: u32, new_fd: u32) -> u64 {
             let mut vfs = vfs::lock();
             fd::close(&mut data.fds, &mut vfs, new_fd, process::current_process());
         }
-        data.fds.insert_at(new_fd, desc);
-        new_fd as u64
+        match data.fds.insert_at(new_fd, desc) {
+            Ok(()) => new_fd as u64,
+            Err(e) => e.to_u64(),
+        }
     });
     if let Some(id) = wake_read { process::wake_pipe_readers(id); }
     if let Some(id) = wake_write { process::wake_pipe_writers(id); }
@@ -1448,7 +1453,7 @@ fn sys_io_uring_setup(depth: u32) -> u64 {
         Err(e) => return e.to_u64(),
     };
     let fd = process::with_fd_owner_data(|data| {
-        fd::alloc(&mut data.fds, fd::Descriptor::IoUring(ring_id))
+        data.fds.insert(fd::Descriptor::IoUring(ring_id))
     });
     match fd {
         Ok(fd_num) => {

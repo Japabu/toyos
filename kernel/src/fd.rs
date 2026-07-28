@@ -130,19 +130,72 @@ impl Descriptor {
 // FdTable operations
 // ---------------------------------------------------------------------------
 
-pub type FdTable = IdMap<u32, Descriptor>;
-
 const MAX_FDS: usize = 1024;
 
-pub fn alloc(table: &mut FdTable, desc: Descriptor) -> Result<u32, SyscallError> {
-    if table.len() >= MAX_FDS {
-        return Err(SyscallError::ResourceExhausted);
-    }
-    Ok(table.insert(desc))
+/// A process's descriptor table.
+///
+/// A newtype around `IdMap` rather than an alias for it, so that `MAX_FDS` can
+/// live on the insert primitives instead of at the call sites. The inner map
+/// is private: every path that can grow a process's table — open, accept,
+/// dup, dup2, a spawn fd_map — goes through `insert` or `insert_at` and gets
+/// the cap, and there is no third way in to forget it.
+pub struct FdTable {
+    map: IdMap<u32, Descriptor>,
 }
 
-pub fn alloc_at(table: &mut FdTable, fd_num: u32, desc: Descriptor) {
-    table.insert_at(fd_num, desc);
+impl FdTable {
+    pub fn new() -> Self {
+        Self { map: IdMap::new() }
+    }
+
+    /// Insert at the lowest unused id.
+    pub fn insert(&mut self, desc: Descriptor) -> Result<u32, SyscallError> {
+        self.check_room(None)?;
+        Ok(self.map.insert(desc))
+    }
+
+    /// Insert at a caller-chosen id, replacing whatever is there.
+    pub fn insert_at(&mut self, fd: u32, desc: Descriptor) -> Result<(), SyscallError> {
+        self.check_room(Some(fd))?;
+        self.map.insert_at(fd, desc);
+        Ok(())
+    }
+
+    /// Replace the descriptor at `fd` with a function of itself.
+    ///
+    /// The length is unchanged by construction, which is why this is the only
+    /// operation allowed to reach the uncapped `IdMap::insert_at`.
+    pub fn update(&mut self, fd: u32, f: impl FnOnce(Descriptor) -> Descriptor) {
+        let Some(desc) = self.map.remove(fd) else { return };
+        self.map.insert_at(fd, f(desc));
+    }
+
+    /// Refuse growth past `MAX_FDS`. Overwriting a live id is not growth.
+    fn check_room(&self, replacing: Option<u32>) -> Result<(), SyscallError> {
+        if replacing.is_some_and(|fd| self.map.get(fd).is_some()) {
+            return Ok(());
+        }
+        if self.map.len() >= MAX_FDS {
+            return Err(SyscallError::ResourceExhausted);
+        }
+        Ok(())
+    }
+
+    pub fn get(&self, fd: u32) -> Option<&Descriptor> {
+        self.map.get(fd)
+    }
+
+    pub fn get_mut(&mut self, fd: u32) -> Option<&mut Descriptor> {
+        self.map.get_mut(fd)
+    }
+
+    pub fn remove(&mut self, fd: u32) -> Option<Descriptor> {
+        self.map.remove(fd)
+    }
+
+    pub fn drain(&mut self) -> impl Iterator<Item = (u32, Descriptor)> + '_ {
+        self.map.drain()
+    }
 }
 
 pub fn open(table: &mut FdTable, vfs: &mut Vfs, path: &str, flags: OpenFlags) -> u64 {
@@ -176,7 +229,7 @@ pub fn open(table: &mut FdTable, vfs: &mut Vfs, path: &str, flags: OpenFlags) ->
             modified: false,
             mtime,
         };
-        return match alloc(table, Descriptor::File(file)) {
+        return match table.insert(Descriptor::File(file)) {
             Ok(fd) => fd as u64,
             Err(e) => e.to_u64(),
         };
@@ -197,7 +250,7 @@ pub fn open(table: &mut FdTable, vfs: &mut Vfs, path: &str, flags: OpenFlags) ->
                 modified: false,
                 mtime,
             };
-            match alloc(table, Descriptor::File(file)) {
+            match table.insert(Descriptor::File(file)) {
                 Ok(fd) => fd as u64,
                 Err(e) => e.to_u64(),
             }
@@ -218,7 +271,7 @@ pub fn open(table: &mut FdTable, vfs: &mut Vfs, path: &str, flags: OpenFlags) ->
                     modified: false,
                     mtime,
                 };
-                match alloc(table, Descriptor::File(file)) {
+                match table.insert(Descriptor::File(file)) {
                     Ok(fd) => fd as u64,
                     Err(e) => e.to_u64(),
                 }
@@ -581,15 +634,18 @@ pub fn has_space(table: &FdTable, fd: u32) -> bool {
 // ---------------------------------------------------------------------------
 
 pub fn mark_tty(table: &mut FdTable, fd: u32) -> u64 {
-    let Some(desc) = table.remove(fd) else {
-        return SyscallError::NotFound.to_u64();
-    };
-    let new = match desc {
+    match table.get(fd) {
+        Some(Descriptor::PipeRead(_) | Descriptor::PipeWrite(_)) => {}
+        Some(Descriptor::TtyRead(_) | Descriptor::TtyWrite(_)) => return 0,
+        Some(_) => return SyscallError::InvalidArgument.to_u64(),
+        None => return SyscallError::NotFound.to_u64(),
+    }
+    // Moves the PipeReader/PipeWriter into the Tty variant — no clone, so the
+    // pipe refcount is untouched.
+    table.update(fd, |desc| match desc {
         Descriptor::PipeRead(r) => Descriptor::TtyRead(r),
         Descriptor::PipeWrite(w) => Descriptor::TtyWrite(w),
-        Descriptor::TtyRead(_) | Descriptor::TtyWrite(_) => desc,
-        other => { table.insert_at(fd, other); return SyscallError::InvalidArgument.to_u64(); }
-    };
-    table.insert_at(fd, new);
+        other => other,
+    });
     0
 }
