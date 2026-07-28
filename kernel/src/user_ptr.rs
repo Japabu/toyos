@@ -9,7 +9,22 @@
 
 use core::marker::PhantomData;
 
+use toyos_abi::syscall::SyscallError;
+
 use crate::UserAddr;
+
+/// Longest string, in bytes, the kernel accepts from userspace — for every
+/// syscall that takes one.
+///
+/// The bound lives on the primitive rather than at its ~20 call sites because
+/// every consumer either copies the string onto the kernel heap or splits it
+/// into borrowed tokens; none of them stream it, so none of them wants a
+/// different answer. The number is set by the largest *derived* allocation,
+/// not by the string itself: 64 KiB of `"a\0"` is 32768 spawn argv tokens, and
+/// the `Vec<&str>` holding them is 512 KiB — comfortably under the allocator's
+/// 2 MiB single-allocation ceiling. A tighter PATH_MAX for the path syscalls
+/// would buy a second constant and a second check site for no safety.
+pub const MAX_USER_STR: u64 = 64 * 1024;
 
 /// Marker for types safe to interpret from / write to validated user pointers.
 ///
@@ -145,10 +160,20 @@ impl<'a> SyscallContext<'a> {
         Some(unsafe { core::slice::from_raw_parts_mut(kptr, len) })
     }
 
-    /// Validate a user pointer range as a UTF-8 string.
-    pub fn user_str(&self, ptr: UserAddr, len: u64) -> Option<&'a str> {
-        let slice = self.user_slice(ptr, len)?;
-        core::str::from_utf8(slice).ok()
+    /// Validate a user pointer range as a UTF-8 string of at most
+    /// [`MAX_USER_STR`] bytes.
+    ///
+    /// Unlike the slice accessors this returns a typed error, because an
+    /// over-long or non-UTF-8 string is a bad *argument*, not a bad address —
+    /// the range may be perfectly mapped. `user_slice` stays unbounded on
+    /// purpose: read/write buffers are borrowed, never copied, so their size
+    /// costs the kernel nothing.
+    pub fn user_str(&self, ptr: UserAddr, len: u64) -> Result<&'a str, SyscallError> {
+        if len > MAX_USER_STR {
+            return Err(SyscallError::InvalidArgument);
+        }
+        let slice = self.user_slice(ptr, len).ok_or(SyscallError::BadAddress)?;
+        core::str::from_utf8(slice).map_err(|_| SyscallError::InvalidArgument)
     }
 
     /// Validate a user pointer to a typed struct (immutable).

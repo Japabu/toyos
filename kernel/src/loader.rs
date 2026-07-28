@@ -431,7 +431,11 @@ fn build_tls_layout(
 }
 
 pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> Result<Pid, SyscallError> {
-    let path = argv[0];
+    // An argv of only separators survives the split in sys_spawn as an empty
+    // slice; there is no argv[0] to load.
+    let Some(&path) = argv.first() else {
+        return Err(SyscallError::InvalidArgument);
+    };
     let t0 = crate::clock::nanos_since_boot();
 
     // 1. Open file backing from VFS (follows symlinks)
