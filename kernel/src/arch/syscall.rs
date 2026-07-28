@@ -479,7 +479,8 @@ fn sys_write(fd_num: u32, buf: &[u8]) -> u64 {
 }
 
 enum ReadBlock {
-    Pipe(pipe::PipeId),
+    Queue(WaitQueue),
+    /// Sources stage 5 has not converted yet.
     Event(crate::scheduler::EventSource),
     EventWithDeadline(crate::scheduler::EventSource, u64),
 }
@@ -497,9 +498,9 @@ fn sys_read(fd_num: u32, buf: &mut [u8]) -> u64 {
                     if matches!(desc, Some(fd::Descriptor::Keyboard)) {
                         Err(Some(ReadBlock::Event(crate::scheduler::EventSource::Keyboard)))
                     } else if matches!(desc, Some(fd::Descriptor::Audio { info_read: true, .. })) {
-                        Err(Some(ReadBlock::Event(crate::scheduler::EventSource::Audio)))
+                        Err(Some(ReadBlock::Queue(WaitQueue::audio())))
                     } else if let Some(id) = desc.and_then(|d| d.pipe_id_read()) {
-                        Err(Some(ReadBlock::Pipe(id)))
+                        Err(Some(ReadBlock::Queue(WaitQueue::pipe_readable(id))))
                     } else if matches!(desc, Some(fd::Descriptor::SerialConsole)) {
                         let deadline = crate::clock::nanos_since_boot() + 10_000_000;
                         Err(Some(ReadBlock::EventWithDeadline(crate::scheduler::EventSource::Keyboard, deadline)))
@@ -514,7 +515,7 @@ fn sys_read(fd_num: u32, buf: &mut [u8]) -> u64 {
                 if let Some(id) = pipe_id { process::wake_pipe_writers(id); }
                 return n;
             }
-            Err(Some(ReadBlock::Pipe(id))) => WaitQueue::pipe_readable(id).wait(0),
+            Err(Some(ReadBlock::Queue(queue))) => queue.wait(0),
             Err(Some(ReadBlock::Event(event))) => process::block(Some(event), 0),
             Err(Some(ReadBlock::EventWithDeadline(event, deadline))) => process::block(Some(event), deadline),
             Err(None) => return SyscallError::NotFound.to_u64(),

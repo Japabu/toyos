@@ -57,6 +57,11 @@ impl WaitQueue {
         Self(EventSource::Listener(id))
     }
 
+    /// Readers of the audio device's completion records.
+    pub fn audio() -> Self {
+        Self(EventSource::Audio)
+    }
+
     /// Phase 1: register the running thread. The caller must then re-check
     /// its condition and either cancel the ticket or block on it.
     ///
