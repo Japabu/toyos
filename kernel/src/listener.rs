@@ -47,6 +47,10 @@ pub struct PendingConnection {
 // ---------------------------------------------------------------------------
 
 struct Listener {
+    /// The process that registered the name. A client's `connect` learns the
+    /// server's pid from here — without it a client knows only a service name
+    /// and could not name its own peer.
+    owner: Pid,
     pending: VecDeque<PendingConnection>,
     io_uring_watchers: Vec<RingId>,
 }
@@ -65,18 +69,27 @@ pub fn init() {
     });
 }
 
-pub fn listen(name: &str) -> Option<ListenerId> {
+pub fn listen(name: &str, owner: Pid) -> Option<ListenerId> {
     let mut guard = LISTENERS.lock();
     let reg = guard.as_mut().unwrap();
     if reg.by_name.contains_key(name) {
         return None;
     }
     let id = reg.by_id.insert(Listener {
+        owner,
         pending: VecDeque::new(),
         io_uring_watchers: Vec::new(),
     });
     reg.by_name.insert(String::from(name), id);
     Some(id)
+}
+
+/// The process serving `name`.
+pub fn owner(name: &str) -> Option<Pid> {
+    let guard = LISTENERS.lock();
+    let reg = guard.as_ref().unwrap();
+    let &id = reg.by_name.get(name)?;
+    reg.by_id.get(id).map(|l| l.owner)
 }
 
 pub fn push_connection(name: &str, conn: PendingConnection) -> bool {

@@ -551,6 +551,7 @@ fn process_accept(ring_id: RingId, sqe: &IoUringSqe) {
                 data.fds.insert(fd::Descriptor::Socket {
                     rx: conn.rx,
                     tx: conn.tx,
+                    peer: conn.client_pid,
                 })
             });
             match new_fd {

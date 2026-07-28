@@ -652,7 +652,7 @@ fn fd_result(r: Result<u32, SyscallError>) -> u64 {
 }
 
 fn sys_pipe() -> u64 {
-    let (reader, writer) = pipe::create();
+    let (reader, writer) = pipe::create(process::current_process());
     process::with_fd_owner_data(|data| {
         let Ok(read_fd) = data.fds.insert(fd::Descriptor::PipeRead(reader)) else {
             return SyscallError::ResourceExhausted.to_u64();
@@ -665,8 +665,52 @@ fn sys_pipe() -> u64 {
     })
 }
 
+/// May `caller` attach to a pipe created by `creator`?
+///
+/// `PipeId`s are dense sequential integers with no rights attached, so the
+/// answer used to be "always" — `for id in 0.. { pipe_open(id) }` attached a
+/// reader or a writer to every pipe in the system, and `SYS_PIPE_MAP` then
+/// handed over the raw 2 MiB ring page.
+///
+/// The policy the API actually means is a delegation: an id is openable by a
+/// process it was deliberately handed to over IPC. The kernel cannot see that
+/// hand-off — the id travels inside a message payload — but it can see the
+/// channel it travelled on. So: the creator itself, or a process holding a
+/// live socket to the creator. Both real cross-process users satisfy it and
+/// neither direction is privileged — netd opens pipes its *client* created
+/// (it holds the accepted socket), an audio client opens the signal pipe
+/// *soundd* created (it holds the connected socket).
+///
+/// Already holding a descriptor for the pipe also qualifies: a child that
+/// inherited a pipe fd through a spawn `fd_map` is not its creator and has no
+/// socket to the parent, and re-opening what you already hold grants nothing.
+///
+/// What it cannot express: *which* of a peer's pipes. A peer entitled to one
+/// id is entitled to all of them, so a compromised daemon can still walk its
+/// clients' pipes. Narrowing that needs a right attached to the id itself,
+/// which is what `specs/capability-handles-spec.md` replaces this syscall
+/// with entirely. Stopgap until then.
+fn may_open_pipe(caller: process::Pid, creator: process::Pid, id: pipe::PipeId) -> bool {
+    if caller == creator {
+        return true;
+    }
+    process::with_fd_owner_data(|data| {
+        data.fds.iter().any(|(_, d)| {
+            d.pipe_id_read() == Some(id)
+                || d.pipe_id_write() == Some(id)
+                || matches!(d, fd::Descriptor::Socket { peer, .. } if *peer == creator)
+        })
+    })
+}
+
 fn sys_pipe_open(pipe_id: u64, mode: u64) -> u64 {
     let id = pipe::PipeId::from_raw(pipe_id as usize);
+    let Some(creator) = pipe::creator(id) else {
+        return SyscallError::NotFound.to_u64();
+    };
+    if !may_open_pipe(process::current_process(), creator, id) {
+        return SyscallError::PermissionDenied.to_u64();
+    }
     match mode {
         0 => {
             let Some(reader) = pipe::open_reader(id) else { return SyscallError::NotFound.to_u64() };
@@ -715,13 +759,34 @@ fn sys_pipe_map(fd_num: u32) -> u64 {
     })
 }
 
+/// Bundle two pipes the caller already holds into one socket descriptor.
+///
+/// The ids used to be looked up globally with no check at all, which made
+/// this a second, quieter route to any pipe in the system. Its only caller is
+/// std's `make_socket_fd`, which wraps two pipes this same process created and
+/// still holds fds for — so "you must already hold both ends, in the right
+/// direction" is exact, not conservative. Unlike `SYS_PIPE_OPEN` this grants
+/// no new access, which is why it can be this strict.
 fn sys_socket_create(rx_pipe_id_raw: u64, tx_pipe_id_raw: u64) -> u64 {
     let rx_id = pipe::PipeId::from_raw(rx_pipe_id_raw as usize);
     let tx_id = pipe::PipeId::from_raw(tx_pipe_id_raw as usize);
+    let holds_both = process::with_fd_owner_data(|data| {
+        let mut has_rx = false;
+        let mut has_tx = false;
+        for (_, d) in data.fds.iter() {
+            has_rx |= d.pipe_id_read() == Some(rx_id);
+            has_tx |= d.pipe_id_write() == Some(tx_id);
+        }
+        has_rx && has_tx
+    });
+    if !holds_both {
+        return SyscallError::PermissionDenied.to_u64();
+    }
     let Some(rx) = pipe::open_reader(rx_id) else { return SyscallError::NotFound.to_u64() };
     let Some(tx) = pipe::open_writer(tx_id) else { return SyscallError::NotFound.to_u64() };
+    let peer = process::current_process();
     process::with_fd_owner_data(|data| {
-        fd_result(data.fds.insert(fd::Descriptor::Socket { rx, tx }))
+        fd_result(data.fds.insert(fd::Descriptor::Socket { rx, tx, peer }))
     })
 }
 
@@ -823,7 +888,7 @@ fn sys_open_device(device_type: u64) -> u64 {
 // ---------------------------------------------------------------------------
 
 fn sys_listen(name: &str) -> u64 {
-    let Some(_id) = crate::listener::listen(name) else {
+    let Some(_id) = crate::listener::listen(name, process::current_process()) else {
         return SyscallError::AlreadyExists.to_u64();
     };
     process::with_fd_owner_data(|data| {
@@ -853,7 +918,7 @@ fn sys_accept(fd_num: u32) -> u64 {
             // PipeReader/PipeWriter move from the queue into the Socket descriptor.
             // No refcount change — ownership transfers.
             let fd = process::with_fd_owner_data(|data| {
-                data.fds.insert(fd::Descriptor::Socket { rx: conn.rx, tx: conn.tx })
+                data.fds.insert(fd::Descriptor::Socket { rx: conn.rx, tx: conn.tx, peer: client_pid })
             });
             return match fd {
                 Ok(fd_num) => ((client_pid.raw() as u64) << 32) | (fd_num as u64),
@@ -865,16 +930,18 @@ fn sys_accept(fd_num: u32) -> u64 {
 }
 
 fn sys_connect(name: &str) -> u64 {
-    if !crate::listener::exists(name) {
+    // The owner lookup doubles as the existence check: a client knows only a
+    // service name, and this is where it learns which process it is talking to.
+    let Some(server_pid) = crate::listener::owner(name) else {
         return SyscallError::NotFound.to_u64();
-    }
+    };
 
-    let (cs_reader, cs_writer) = pipe::create(); // client → server
-    let (sc_reader, sc_writer) = pipe::create(); // server → client
+    let client_pid = process::current_process();
+    let (cs_reader, cs_writer) = pipe::create(client_pid); // client → server
+    let (sc_reader, sc_writer) = pipe::create(client_pid); // server → client
 
     // Queue the server's end. PipeReader/PipeWriter in the queue keep pipes
     // alive even if the client disconnects before accept.
-    let client_pid = process::current_process();
     crate::listener::push_connection(name, listener::PendingConnection {
         rx: cs_reader,   // server reads from client→server
         tx: sc_writer,   // server writes to server→client
@@ -887,6 +954,7 @@ fn sys_connect(name: &str) -> u64 {
         fd_result(data.fds.insert(fd::Descriptor::Socket {
             rx: sc_reader,   // client reads from server→client
             tx: cs_writer,   // client writes to client→server
+            peer: server_pid,
         }))
     })
 }

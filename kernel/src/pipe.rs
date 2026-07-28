@@ -6,6 +6,7 @@ use alloc::vec::Vec;
 
 use crate::mm::PAGE_2M;
 use crate::io_uring::RingId;
+use crate::process::Pid;
 use crate::id_map::{IdKey, IdMap};
 use crate::sync::Lock;
 use crate::DirectMap;
@@ -88,6 +89,11 @@ pub const PIPE_SIZE: usize = PAGE_2M as usize;
 
 struct Pipe {
     page: pmm::PhysPage,
+    /// The process that called `create`. `PipeId`s are dense sequential
+    /// integers and userland passes raw ones to `SYS_PIPE_OPEN`, so this is
+    /// the only thing that distinguishes "a peer handed me this id" from
+    /// "I counted up from zero". See `sys_pipe_open`.
+    creator: Pid,
     readers: u32,
     writers: u32,
     io_uring_watchers: Vec<RingId>,
@@ -101,10 +107,10 @@ struct Pipe {
 unsafe impl Send for Pipe {}
 
 impl Pipe {
-    fn new() -> Self {
+    fn new(creator: Pid) -> Self {
         let page = pmm::alloc_page(pmm::Category::Pipe).expect("pipe: allocation failed");
         RingHeader::init(page.direct_map().as_mut_ptr(), PIPE_SIZE);
-        Self { page, readers: 0, writers: 0, io_uring_watchers: Vec::new(), rt_boost_pending: false }
+        Self { page, creator, readers: 0, writers: 0, io_uring_watchers: Vec::new(), rt_boost_pending: false }
     }
 
     fn header(&self) -> &RingHeader {
@@ -133,11 +139,16 @@ pub fn init() {
 // ---------------------------------------------------------------------------
 
 /// Create a new pipe. Returns owned reader + writer references.
-pub fn create() -> (PipeReader, PipeWriter) {
-    let id = with_pipes_mut(|pipes| pipes.insert(Pipe::new()));
+pub fn create(creator: Pid) -> (PipeReader, PipeWriter) {
+    let id = with_pipes_mut(|pipes| pipes.insert(Pipe::new(creator)));
     add_reader(id);
     add_writer(id);
     (PipeReader(id), PipeWriter(id))
+}
+
+/// The process that created this pipe, or `None` if the id names no pipe.
+pub fn creator(id: PipeId) -> Option<Pid> {
+    with_pipes(|pipes| pipes.get(id).map(|p| p.creator))
 }
 
 /// Open an existing pipe by raw ID (for cross-process pipe sharing).

@@ -51,7 +51,10 @@ pub enum Descriptor {
     Mouse,
     SerialConsole,
     Framebuffer(FramebufferInfo),
-    Socket { rx: PipeReader, tx: PipeWriter },
+    /// An accepted or connected IPC channel. `peer` is the process on the
+    /// other end — recorded because holding this descriptor is what
+    /// authorizes `SYS_PIPE_OPEN` on a pipe that process created.
+    Socket { rx: PipeReader, tx: PipeWriter, peer: Pid },
     Nic(crate::net::NicInfo),
     Audio { info: toyos_abi::audio::AudioInfo, info_read: bool },
     Listener(String),
@@ -65,7 +68,7 @@ impl Clone for Descriptor {
             Self::PipeWrite(w) => Self::PipeWrite(w.clone()),
             Self::TtyRead(r) => Self::TtyRead(r.clone()),
             Self::TtyWrite(w) => Self::TtyWrite(w.clone()),
-            Self::Socket { rx, tx } => Self::Socket { rx: rx.clone(), tx: tx.clone() },
+            Self::Socket { rx, tx, peer } => Self::Socket { rx: rx.clone(), tx: tx.clone(), peer: *peer },
             Self::File(file) => Self::File(file.clone()),
             Self::Keyboard => Self::Keyboard,
             Self::Mouse => Self::Mouse,
@@ -196,6 +199,11 @@ impl FdTable {
     pub fn drain(&mut self) -> impl Iterator<Item = (u32, Descriptor)> + '_ {
         self.map.drain()
     }
+
+    pub fn iter(&self) -> impl Iterator<Item = (u32, &Descriptor)> {
+        self.map.iter()
+    }
+
 }
 
 pub fn open(table: &mut FdTable, vfs: &mut Vfs, path: &str, flags: OpenFlags) -> u64 {
