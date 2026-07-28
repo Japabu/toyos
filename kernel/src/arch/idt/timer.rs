@@ -1,5 +1,9 @@
 use core::arch::naked_asm;
 
+use toyos_sched::hw::{CpuId, Machine, TraceEvent, TraceKind};
+
+use crate::hw::HW;
+
 // Ring 0 path re-arms the one-shot timer itself: without re-arming, a fire
 // while in Ring 0 would silently disable preemption forever. need_resched
 // gets picked up at the next kernel→user exit.
@@ -101,7 +105,15 @@ pub(super) extern "sysv64" fn timer_entry() {
 }
 
 extern "sysv64" fn timer_handler() {
-    crate::trace::trace(crate::trace::TraceKind::TimerFire, 0);
+    // Through the `Machine` boundary rather than the ring directly: this
+    // handler is the driver entry the cutover builds on, and routing it now
+    // is what puts the boundary's trace path on the highest-rate event the
+    // kernel has.
+    HW.trace(TraceEvent {
+        ts: HW.now(),
+        cpu: CpuId(crate::arch::percpu::cpu_id()),
+        kind: TraceKind::TimerFire,
+    });
     crate::arch::apic::eoi();
 
     // Process xHCI events (keyboard/mouse) from preemption context, in case

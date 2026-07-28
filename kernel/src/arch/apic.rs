@@ -148,7 +148,7 @@ pub fn arm_one_shot(nanos: u64) {
     percpu.armed_deadline_ns.store(
         crate::clock::nanos_since_boot().saturating_add(nanos), Ordering::Relaxed);
     cpu::wrmsr(X2APIC_TIMER_INIT, ticks as u64);
-    crate::trace::trace(crate::trace::TraceKind::TimerArm, nanos as u32);
+    crate::trace::trace(crate::trace::Kind::TimerArm, nanos as u32);
 }
 
 /// Re-arm the one-shot for an absolute deadline if it precedes what this
@@ -171,5 +171,5 @@ pub fn stop_timer() {
     percpu.last_armed_ticks.store(0, Ordering::Relaxed);
     percpu.armed_deadline_ns.store(u64::MAX, Ordering::Relaxed);
     cpu::wrmsr(X2APIC_TIMER_INIT, 0);
-    crate::trace::trace(crate::trace::TraceKind::TimerStop, 0);
+    crate::trace::trace(crate::trace::Kind::TimerStop, 0);
 }

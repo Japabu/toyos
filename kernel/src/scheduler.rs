@@ -5,8 +5,10 @@ use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use hashbrown::{HashMap, HashSet};
 use toyos_sched::fair::{Frontier, ShareState, QUANTUM_NS};
+use toyos_sched::hw::{CpuId, Kicker, Machine, Nanos, TraceEvent, TraceKind};
 
 use crate::arch::{cpu, percpu};
+use crate::hw::HW;
 use crate::io_uring::RingId;
 use crate::listener::ListenerId;
 use crate::pipe::PipeId;
@@ -383,7 +385,7 @@ impl TaskCtx {
 
     pub fn cpu_ns(&self) -> u64 {
         if self.scheduled_at > 0 {
-            self.cpu_ns + (crate::clock::nanos_since_boot() - self.scheduled_at)
+            self.cpu_ns + (crate::hw::now_ns() - self.scheduled_at)
         } else {
             self.cpu_ns
         }
@@ -393,7 +395,7 @@ impl TaskCtx {
     /// Called when a thread is removed from the blocked pool before re-enqueuing.
     fn accumulate_blocked_time(&mut self) {
         if self.blocked_since == 0 { return; }
-        let elapsed = crate::clock::nanos_since_boot() - self.blocked_since;
+        let elapsed = crate::hw::now_ns() - self.blocked_since;
         let acct = &mut self.accounting;
         match &self.blocked_on {
             Some(EventSource::IoUring(_)) => acct.blocked_io_ns += elapsed,
@@ -505,7 +507,7 @@ impl<'a> CpuQueueGuard<'a> {
                 continue;
             }
             if ctx.enqueued_at > 0 {
-                ctx.accounting.runqueue_wait_ns += crate::clock::nanos_since_boot() - ctx.enqueued_at;
+                ctx.accounting.runqueue_wait_ns += crate::hw::now_ns() - ctx.enqueued_at;
                 ctx.enqueued_at = 0;
             }
             return Some((0, ctx));
@@ -517,7 +519,7 @@ impl<'a> CpuQueueGuard<'a> {
                 continue;
             }
             if ctx.enqueued_at > 0 {
-                ctx.accounting.runqueue_wait_ns += crate::clock::nanos_since_boot() - ctx.enqueued_at;
+                ctx.accounting.runqueue_wait_ns += crate::hw::now_ns() - ctx.enqueued_at;
                 ctx.enqueued_at = 0;
             }
             return Some((vrt, ctx));
@@ -532,7 +534,7 @@ impl<'a> CpuQueueGuard<'a> {
             SCHEDULER.leave_runnable(ctx.id.0);
             return;
         }
-        ctx.enqueued_at = crate::clock::nanos_since_boot();
+        ctx.enqueued_at = crate::hw::now_ns();
         if ctx.is_rt {
             self.0.rt_ready.push_back(ctx);
         } else {
@@ -670,7 +672,7 @@ impl BlockedPool {
 
     fn insert(&mut self, mut ctx: TaskCtx) {
         let id = ctx.id;
-        ctx.blocked_since = crate::clock::nanos_since_boot();
+        ctx.blocked_since = crate::hw::now_ns();
         if let Some(event) = ctx.blocked_on {
             self.by_event.entry(event)
                 .or_insert_with(Vec::new)
@@ -688,7 +690,7 @@ impl BlockedPool {
         let tag = ctx.blocked_on.as_ref()
             .map(crate::trace::event_source_tag)
             .unwrap_or(0xFF_000000); // 0xFF = no event (deadline/explicit wake)
-        crate::trace::trace(crate::trace::TraceKind::Wake, tag);
+        crate::trace::trace(crate::trace::Kind::Wake, tag);
         if let Some(event) = &ctx.blocked_on {
             if let Some(waiters) = self.by_event.get_mut(event) {
                 waiters.retain(|&k| k != id);
@@ -784,7 +786,7 @@ pub fn log_health() {
     use core::sync::atomic::AtomicU64;
     static NEXT_BLOCKED_DUMP: AtomicU64 = AtomicU64::new(0);
     const BLOCKED_DUMP_INTERVAL_NS: u64 = 10_000_000_000;
-    let now_bl = crate::clock::nanos_since_boot();
+    let now_bl = crate::hw::now_ns();
     if ready == 0 && blocked > 0 && now_bl >= NEXT_BLOCKED_DUMP.load(Ordering::Relaxed) {
         NEXT_BLOCKED_DUMP.store(now_bl + BLOCKED_DUMP_INTERVAL_NS, Ordering::Relaxed);
         dump_blocked();
@@ -793,7 +795,7 @@ pub fn log_health() {
     // PMM stats dump (any CPU, time-gated to every 10s)
     static NEXT_PMM_DUMP: AtomicU64 = AtomicU64::new(0);
     const PMM_DUMP_INTERVAL_NS: u64 = 10_000_000_000;
-    let now = crate::clock::nanos_since_boot();
+    let now = crate::hw::now_ns();
     let next = NEXT_PMM_DUMP.load(Ordering::Relaxed);
     if next == 0 {
         NEXT_PMM_DUMP.store(now + PMM_DUMP_INTERVAL_NS, Ordering::Relaxed);
@@ -924,13 +926,13 @@ impl Scheduler {
                 // §9.4: an RT wake on this CPU must preempt the current
                 // normal task at the next preempt point instead of waiting
                 // out its quantum.
-                crate::preempt::set_need_resched();
+                HW.need_resched(CpuId(cpu));
             }
         }
         while kick_mask != 0 {
             let cpu = kick_mask.trailing_zeros();
             kick_mask &= kick_mask - 1;
-            crate::arch::apic::kick_cpu(cpu);
+            HW.kick(CpuId(cpu));
         }
     }
 }
@@ -976,9 +978,9 @@ pub fn enqueue_new(ctx: TaskCtx) {
     q.insert(vrt, ctx);
     drop(q);
     if cpu != percpu::cpu_id() {
-        crate::arch::apic::kick_cpu(cpu);
+        HW.kick(CpuId(cpu));
     } else if is_rt {
-        crate::preempt::set_need_resched();
+        HW.need_resched(CpuId(cpu));
     }
 }
 
@@ -1044,14 +1046,14 @@ pub fn do_preempt() {
         // is moot, not deferred.
         return;
     }
-    crate::trace::trace(crate::trace::TraceKind::Preempt, 0);
+    crate::trace::trace(crate::trace::Kind::Preempt, 0);
     yield_now();
 }
 
 /// Check and wake threads with expired deadlines.
 /// Called from drain_events (which already holds the blocked pool lock).
 fn check_deadlines_locked(pool: &mut BlockedPool, batch: &mut WokenBatch) {
-    let now = crate::clock::nanos_since_boot();
+    let now = crate::hw::now_ns();
     while let Some((&(deadline, id), _)) = pool.deadlines.first_key_value() {
         if deadline > now { break; }
         pool.deadlines.pop_first();
@@ -1209,9 +1211,9 @@ pub fn wake_task(id: TaskId) {
     q.insert(vrt, ctx);
     drop(q);
     if cpu != percpu::cpu_id() {
-        crate::arch::apic::kick_cpu(cpu);
+        HW.kick(CpuId(cpu));
     } else if is_rt {
-        crate::preempt::set_need_resched();
+        HW.need_resched(CpuId(cpu));
     }
 }
 
@@ -1305,7 +1307,7 @@ pub fn retire_task(id: TaskId) -> Option<TaskCtx> {
         assert!(TaskId(pid, tid) != id, "retire_task: cannot retire self");
     }
     mark_killed(id);
-    let deadline = crate::clock::nanos_since_boot() + 1_000_000_000;
+    let deadline = crate::hw::now_ns() + 1_000_000_000;
     loop {
         match scan_remove(id) {
             ScanResult::Removed(ctx) => {
@@ -1323,12 +1325,14 @@ pub fn retire_task(id: TaskId) -> Option<TaskCtx> {
                 }
             }
             ScanResult::InFlight(cpu) => {
-                // Running right now — force it to a scheduling boundary,
-                // where the kill mark drops it (park/insert/pick).
-                crate::arch::apic::kick_cpu(cpu);
+                // Running right now — ask it for its next safe point, where
+                // the kill mark drops it (park/insert/pick). Spec §7.6: this
+                // is the one case the core needs `need_resched` for, and it
+                // is already the one case the old scheduler needs it for.
+                HW.need_resched(CpuId(cpu));
             }
         }
-        if crate::clock::nanos_since_boot() > deadline {
+        if crate::hw::now_ns() > deadline {
             panic!("retire_task: {id} still in flight after 1s");
         }
         yield_now();
@@ -1579,18 +1583,25 @@ fn run_task_on_self(
     assert!(!is_poisoned(new.id),
         "run_task_on_self: scheduling a poisoned task {}", new.id);
     SCHEDULER.min_vruntime.advance(vrt);
-    let quantum = if next_deadline > 0 {
-        let now_dl = crate::clock::nanos_since_boot();
-        if next_deadline > now_dl {
-            QUANTUM_NS.min(next_deadline - now_dl)
-        } else {
-            QUANTUM_NS
-        }
+    // One clock sample for the whole dispatch — the quantum, the timer
+    // deadline, the trace record and the incoming task's charge all date from
+    // the same instant. Spec §6.2's "sampled ONCE per pass"; this path used
+    // to read the TSC three times and let the three disagree.
+    let now_pick = crate::hw::now_ns();
+    let quantum = if next_deadline > now_pick {
+        QUANTUM_NS.min(next_deadline - now_pick)
     } else {
         QUANTUM_NS
     };
-    crate::trace::trace(crate::trace::TraceKind::SchedPick, quantum as u32);
-    crate::arch::apic::arm_one_shot(quantum);
+    // The task key names the *incoming* thread. `percpu::current_tid` is
+    // still the outgoing one here — it is updated below — so the old
+    // ambient-read trace recorded whoever was leaving.
+    HW.trace(TraceEvent {
+        ts: Nanos(now_pick),
+        cpu: CpuId(percpu::cpu_id()),
+        kind: TraceKind::Schedule { task: toyos_sched::task::TaskKey(new.id.pack()) },
+    });
+    HW.set_timer(Nanos(now_pick).after(quantum));
     let new_cr3 = new.cr3();
     let new_fs_base = new.fs_base;
     let new_ks_top = new.kernel_stack_top();
@@ -1599,7 +1610,16 @@ fn run_task_on_self(
     let new_pid = new.id.0;
 
     let mut new = new;
-    new.start_cpu_timer(crate::clock::nanos_since_boot());
+    // Deliberately a *fresh* sample, not `now_pick`. `scheduled_at` opens the
+    // interval the task is charged for, and everything between `now_pick` and
+    // here is the scheduler's own arming work — three x2APIC MSR writes, each
+    // an exit to the device model under TCG. Dating the charge from
+    // `now_pick` bills that per *dispatch*, so it lands on whichever task is
+    // dispatched most often; measured, that is soundd, and it cost 21% of its
+    // wakes on `audio_tone_load` at smp=1. One clock sample per pass is the
+    // stage 7 shape, and it is right there because the pass charges at entry —
+    // not because the timestamps can be shared with the arming path.
+    new.start_cpu_timer(crate::hw::now_ns());
     new.last_cpu = Some(percpu::cpu_id());
     queue.set_current(new);
 
@@ -1634,7 +1654,7 @@ fn do_schedule(reason: SwitchReason) {
     let next_deadline = drain_events();
 
     let cpu = percpu::cpu_id() as usize;
-    let now = crate::clock::nanos_since_boot();
+    let now = crate::hw::now_ns();
 
     let mut queue = SCHEDULER.lock_cpu(cpu);
 
@@ -1654,7 +1674,7 @@ fn do_schedule(reason: SwitchReason) {
         return;
     }
 
-    crate::trace::trace(crate::trace::TraceKind::SchedIdle, next_deadline as u32);
+    crate::trace::trace(crate::trace::Kind::SchedIdle, next_deadline as u32);
     let old_rsp_ptr = queue.save_rsp_ptr();
     percpu::set_current_tid(None);
     percpu::set_current_pid(None);
@@ -1685,7 +1705,7 @@ fn park_outgoing(queue: CpuQueueGuard<'_>, mut old: TaskCtx, event: Option<Event
     let tag = event.as_ref()
         .map(crate::trace::event_source_tag)
         .unwrap_or(0xFF_000000);
-    crate::trace::trace(crate::trace::TraceKind::Block, tag);
+    crate::trace::trace(crate::trace::Kind::Block, tag);
     let pid = old.id.0;
     drop(queue);
 
@@ -1725,7 +1745,7 @@ fn park_outgoing(queue: CpuQueueGuard<'_>, mut old: TaskCtx, event: Option<Event
         q.insert(vrt, old);
         drop(q);
         if is_rt {
-            crate::preempt::set_need_resched();
+            HW.need_resched(CpuId(cpu as u32));
         }
         return prepared.is_some();
     }
@@ -1892,19 +1912,13 @@ fn cpu_idle_loop() -> ! {
         // Idle: arm one-shot timer for next deadline, or stop if none.
         // The CPU will sleep until a timer or MSI-X interrupt arrives.
         if next_deadline > 0 {
-            let now = crate::clock::nanos_since_boot();
-            if next_deadline <= now {
+            if next_deadline <= crate::hw::now_ns() {
                 continue; // deadline already expired, re-check
             }
-            crate::arch::apic::arm_one_shot(next_deadline - now);
+            HW.set_timer(Nanos(next_deadline));
         } else {
-            crate::arch::apic::stop_timer();
+            HW.stop_timer();
         }
-
-        crate::trace::trace(
-            crate::trace::TraceKind::IdleHalt,
-            (next_deadline / 1_000_000) as u32,
-        );
 
         // Final re-check with IRQs disabled, immediately before sti;hlt.
         // A wake that landed after the pick attempt above (enqueue + kick
@@ -1912,7 +1926,15 @@ fn cpu_idle_loop() -> ! {
         // consumed as an ordinary interrupt and then slept through forever.
         // With IF=0, anything that arrives from here on stays pending and
         // terminates the hlt; anything that arrived before is visible to
-        // these checks. The sti;hlt pair is atomic (STI shadow).
+        // these checks.
+        //
+        // Not `Machine::irq_guard`, and the reason is worth keeping: that
+        // guard restores the caller's IF, and both exits from here must
+        // *set* it. The panic path `cli`s and lands in this loop through
+        // `schedule_no_return`, so the entering IF is genuinely sometimes 0 —
+        // restoring it would strand the recovering CPU. The halt exit has a
+        // second reason: `sti` and `hlt` must be one instruction pair (STI
+        // shadow), which no guard drop can be.
         unsafe { core::arch::asm!("cli", options(nomem, nostack)); }
         let work_pending = {
             let queue = SCHEDULER.lock_cpu(cpu);
@@ -1923,8 +1945,17 @@ fn cpu_idle_loop() -> ! {
             unsafe { core::arch::asm!("sti", options(nomem, nostack)); }
             continue;
         }
-        unsafe { core::arch::asm!("sti; hlt", options(nomem, nostack)); }
-        crate::trace::trace(crate::trace::TraceKind::IdleWake, 0);
+        HW.trace(TraceEvent {
+            ts: Nanos(crate::hw::now_ns()),
+            cpu: CpuId(cpu as u32),
+            kind: TraceKind::IdleEnter,
+        });
+        HW.halt();
+        HW.trace(TraceEvent {
+            ts: Nanos(crate::hw::now_ns()),
+            cpu: CpuId(cpu as u32),
+            kind: TraceKind::IdleExit,
+        });
     }
 }
 
@@ -1975,7 +2006,7 @@ pub fn dump_blocked() {
         return;
     };
     let Some(pool) = guard.as_ref() else { return };
-    let now = crate::clock::nanos_since_boot();
+    let now = crate::hw::now_ns();
     crate::log!("=== BLOCKED THREADS ({}) ===", pool.threads.len());
     for (&id, ctx) in &pool.threads {
         let (pid, tid) = (id.0, id.1);

@@ -672,23 +672,49 @@ invariant I7 asserts conservation (Σ accounted == virtual elapsed per CPU).
 ### 10.1 The hardware surface
 
 ```rust
-// toyos-sched/src/hw.rs
-pub trait Hw: Sync + 'static {
-    type Payload: SchedPayload;
+// toyos-sched/src/hw.rs — three traits stacked by what they must know about.
+pub trait Kicker: Sync {
+    fn kick(&self, target: CpuId);              // targeted x2APIC ICR; never broadcast
+}
+
+pub trait Machine: Kicker + 'static {           // the task-blind half
     type IrqGuard;
     // NO cpu_id() — CPU identity is CpuSched.id, a constructor parameter. An
     // ambient wrong-CPU query is unrepresentable in the core.
     fn now(&self) -> Nanos;                     // sampled ONCE per pass by the driver; core threads it
     fn set_timer(&self, deadline: Nanos);       // kernel: LAPIC one-shot, later TSC-deadline
     fn stop_timer(&self);
-    fn kick(&self, target: CpuId);              // targeted x2APIC ICR; never broadcast
-    fn irq_guard(&self) -> Self::IrqGuard;      // kernel: cli/sti RAII; sim: gates event delivery
+    fn irq_guard(&self) -> Self::IrqGuard;      // no user in either world — see below
+    fn halt(&self);                             // kernel: sti;hlt (one atom); sim: mark sleeping
+    fn need_resched(&self, cpu: CpuId);         // §7.6's retire-the-runner request
+    fn trace(&self, ev: TraceEvent);            // shared vocabulary, kernel ring + sim recorder (§10.4)
+    fn idle_wait(&self, token: SleepToken) {    // provided: consume the proof, perform the effect
+        let _consumed = token;
+        self.halt();
+    }
+}
+
+pub trait Hw: Machine {                         // the two members that name a task
+    type Payload: SchedPayload;
     unsafe fn switch(&self, token: RunToken<Self::Payload>);
-    fn idle_wait(&self, token: SleepToken);     // kernel: cli/recheck/sti;hlt; sim: mark sleeping
-    fn release(&self, key: TaskKey, payload: Self::Payload);   // finalize sink
-    fn trace(&self, ev: TraceEvent);            // shared format, kernel ring + sim recorder (§10.4)
+    fn release(&self, key: TaskKey, payload: Self::Payload, acct: TaskAccounting);
 }
 ```
+
+**Why three traits and not one** (settled at stage 6, against the kernel). `switch` and `release`
+are the only members that need `Payload`, and the kernel has no `SchedPayload` until the cutover —
+so a single trait would have made stage 6's whole purpose, meeting real interrupts before anything
+depends on the surface, impossible to reach without importing stage 7's task record. `Kicker` was
+already this split's first cut. `idle_wait` splits for the same reason: its `SleepToken` is
+unforgeable outside a `SchedPass`, so a stage-6 driver could never call it; the token is proof,
+`halt` is the effect, and separating them is what let the halt ship a stage early.
+
+**`irq_guard` has no user in either world, and its RAII shape is wrong for the site this spec
+named for it.** The kernel's pre-halt recheck must *set* IF on both exits — the halt exit because
+`sti;hlt` is one instruction pair (STI shadow), the stay-awake exit because panic recovery enters
+the idle loop with IF already 0 and restoring the caller's flags would strand that CPU. The core
+never calls it either. It stays on the trait as a declared surface; the first real caller decides
+its shape.
 
 Real vs mocked (the kernel-equivalence contract): task types, state word, transitions, RunQueue,
 FairShare math, mailbox, doorbell, sleep handshake, ticket protocol, retire chase, deadline heap,
@@ -730,8 +756,18 @@ max pass duration as the on-target counterpart.
 ### 10.4 Shared trace format and QEMU replay
 
 `TraceEvent` (schedule, wake, block, park-commit, migrate, adopt, retire, idle-enter/exit, IRQ,
-timer-fire; ~24 bytes each) is defined once in `hw.rs`. The kernel `Hw::trace` writes to a per-CPU
-binary ring (drained like the log ring, off the timer path); the sim records the same stream.
+timer-fire) is defined once in `hw.rs`. **One vocabulary, two representations** — settled at
+stage 6. `hw::TraceEvent` is the vocabulary: a closed Rust enum the sim holds by value and asserts
+on, with no layout guarantee, so it cannot be what goes on the wire. `kernel/src/trace.rs`'s
+`Record` is the wire form: `repr(C)`, 24 bytes, hand-fixed discriminants, because its readers are
+`memory read` in LLDB and `replay --from-qemu`, neither of which can parse a Rust enum.
+`trace::record` is the total (wildcard-free) mapping from the first onto the second and is what
+`Machine::trace` installs. The ring keeps kinds the core cannot produce — `IrqDrain` (the B10
+instrument), `TimerArm`/`TimerStop`, `Preempt`, `TimerFireBurst` — because they are kernel
+observations from *below* the boundary, and collapsing the ring into the core's vocabulary would
+delete working instruments to buy a symmetry nothing needs. The kernel `Machine::trace` writes to
+a per-CPU binary ring (drained like the log ring, off the timer path); the sim records the same
+stream.
 `toyos-sched-sim replay --from-qemu <trace.bin>` converts a captured kernel trace into a sim event
 script — a real-world anomaly becomes a host-side repro. This is the pipeline crash.md's destroyed
 evidence needed: post-cutover, one QEMU capture replays deterministically under the invariant
@@ -800,7 +836,7 @@ strong one, and they are strong because they fire on every run. Stage 7 keeps th
 | 3 | **Primitives + loom.** `mailbox.rs` (incl. preempt-disabled push), `waitq.rs` (state word, ticket, wake_one retry), sleep handshake, retire CAS. Kernel untouched. | H (all loom suites) |
 | 4 | **Core machine + simulator + validation gate.** `cpu.rs`, `queue.rs`, `timer.rs`, `invariants.rs`; VM, ChoiceStream (seed/fuzz/PCT), shrinker, replay emitter, corpus. Scenarios: crash_md_exit_race, the five lost-wake windows, idle_hlt_race, rt_wake_latency, audio_pipeline (soundd-shaped RT daemon + hog + clients, `cpus=1` first-class), futex/fork storms. **Exit criterion: `old_steal_port` fails; new protocol passes 10⁴ seeds + 10⁷ fuzz steps per scenario class with zero violations.** | H, S |
 | 5 | **Per-source WaitQueue conversion under the OLD scheduler** — one green commit per source: pipes, futex (delete `FUTEX_WAKE_GEN` + `FUTEX_LOCK` dance), listener, audio fd, io_uring, join (`wake_task`). Each site adopts the `prepare_wait`/`cancel`/`block_on` shape via a shim that parks in the existing pool; the shim generalizes the IoUring-only `handle_outgoing` recheck into one `ticket.fired()` recheck applied to **every** converted source after pool insertion. *Honesty note:* this closes each source's practical decide-to-park window via the recheck; the structural (message-serialized) closure lands at Stage 7 — the claim "window closed" is scoped accordingly. | B, T, A per commit |
-| 6 | **KernelHw under the old scheduler.** Route `arm_one_shot`/`kick_cpu` (now targeted ICR — broadcast kicks die here)/`now`/idle `hlt` through `Hw`; add the kernel `TraceEvent` ring. De-risks the Hw surface on real interrupts before cutover. | B, T, A |
+| 6 | **KernelHw under the old scheduler.** ✅ Done. `kernel/src/hw.rs` implements `Machine` (not `Hw` — see §10.1); `arm_one_shot`/`stop_timer`/`kick_cpu`/`now`/idle `hlt`/`need_resched` and the trace ring route through it. Broadcast kicks were already dead: `kick_cpu` had been a targeted ICR since before this stage, and the two surviving broadcasts (`tlb_shootdown`, `halt_all_cpus`) are not on the scheduler path. De-risked the surface on real interrupts before cutover, and caught one real regression doing it (see §10.1 and the accounting note in `run_task_on_self`). | B, T, A |
 | 7 | **Cutover, sub-staged** (each sub-stage boots and gates): **7a** percpu `CpuSched`, driver idle loop + asm switch + trampoline, park-before-switch, message wakes — with `StealRequest`/balance **disabled** (wake-time push placement only); **7b** enable StealRequest/balance + retire messages replace `retire_task`; **7c** delete the legacy body: `handle_outgoing`, `park_outgoing`, `finish_fresh_thread_switch`, `wake_by_event`/`EventSource`, `drain_events`, `PERCPU_EVENTS`, `IN_SCHEDULE`, `POISONED`, `KILLED`, `WAKE_TRANSITS`, `CpuQueueGuard::into_raw`, `Lock::force_unlock`, `loader.rs` trampoline unlock, global blocked pool, `sched_state` map; `scheduler.rs` is removed. Preempt-count baseline asserts land in the new entry shims. | B, T, **A(strict)** per sub-stage, S |
 | 8 | **Consolidation.** Remove shims (callers hold `WaitQueue`s directly, converging on io_uring-only blocking); privilege-gate `SYS_SET_RT_PRIORITY`; wire sim fuzz into CI (fixed corpus + N seeded runs, seeds logged; nightly long fuzz with auto-minimized corpus PRs); panic-path reentry flag hardening; update CLAUDE.md architecture + known issues. | B, T, A, H, S |
 | 9 | **Scale stage (sim-gated).** Per-CPU vruntime frontier with epoch reconciliation piggybacked on Adopt messages (replaces the global `fetch_max`) — gated on I5 fairness bounds vs the global-frontier reference across FairnessStorm at 1–128 vcpus; TSC-deadline `set_timer`; 128-vcpu sim sweeps as the standing scheduling-overhead benchmark; QEMU `-smp` sweep. | B, T, A, S |

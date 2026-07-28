@@ -38,6 +38,7 @@ mod process;
 mod loader;
 mod scheduler;
 mod waitq;
+mod hw;
 mod preempt;
 mod irq_ring;
 mod trace;

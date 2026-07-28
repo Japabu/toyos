@@ -13,8 +13,12 @@
 //! and timer plan ([`timer`]), the message set ([`msg`]) and the per-CPU
 //! [`cpu::CpuSched`] with its [`cpu::SchedPass`] type-state.
 //!
-//! The kernel does not call any of it yet: the per-source conversions land at
-//! Stage 5, the `Hw` implementation at Stage 6 and the cutover at Stage 7.
+//! Stage 6 landed the task-blind half of the boundary: the kernel implements
+//! [`hw::Machine`] (`kernel/src/hw.rs`) and routes its LAPIC one-shot, TSC,
+//! targeted ICR, halt and trace ring through it while the old scheduler still
+//! drives. [`hw::Hw`] itself — the context switch and the finalize sink —
+//! waits for the cutover at Stage 7, which is also when the kernel first has
+//! a [`task::SchedPayload`].
 //! What drives it today is the host simulator (`toyos-sched/sim/`), which
 //! explores the protocol against invariants I1–I12 — including the deliberate
 //! port of the old steal-during-exit algorithm, which the simulator must

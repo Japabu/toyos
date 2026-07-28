@@ -254,7 +254,7 @@ fn flush_ring0_timer_fires_to_trace() {
     }
     let missed = cur.wrapping_sub(last);
     if missed > 0 {
-        crate::trace::trace(crate::trace::TraceKind::TimerFireBurst, missed);
+        crate::trace::trace(crate::trace::Kind::TimerFireBurst, missed);
         unsafe {
             core::arch::asm!(
                 "mov gs:[252], {cur:e}",

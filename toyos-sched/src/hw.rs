@@ -102,6 +102,16 @@ pub trait Machine: Kicker + 'static {
     fn stop_timer(&self);
 
     /// Kernel: cli/sti RAII. Sim: gates event delivery for this vcpu.
+    ///
+    /// Note for whoever reaches for this: it does **not** fit the one site the
+    /// spec names for it (§7.5's "cli / final recheck / sti;hlt"). Measured at
+    /// stage 6 against the kernel: both exits from that recheck must *set* IF
+    /// unconditionally — the halt exit because `sti;hlt` is one atom, and the
+    /// stay-awake exit because the kernel's panic recovery enters the idle
+    /// loop with IF already 0, so restoring the caller's flags would strand
+    /// that CPU. An RAII guard can express neither. The kernel therefore
+    /// implements this member and calls it nowhere; the core does not call it
+    /// either. It is a designed surface with no user in either world.
     fn irq_guard(&self) -> Self::IrqGuard;
 
     /// Enable interrupts and halt, atomically — on x86 the `sti;hlt` pair and
