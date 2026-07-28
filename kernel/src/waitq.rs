@@ -27,6 +27,7 @@
 
 use core::marker::PhantomData;
 
+use crate::io_uring::RingId;
 use crate::listener::ListenerId;
 use crate::pipe::PipeId;
 use crate::scheduler::{self, EventSource, TaskId};
@@ -60,6 +61,11 @@ impl WaitQueue {
     /// Readers of the audio device's completion records.
     pub fn audio() -> Self {
         Self(EventSource::Audio)
+    }
+
+    /// Threads waiting on one io_uring's completion queue.
+    pub fn io_uring(id: RingId) -> Self {
+        Self(EventSource::IoUring(id))
     }
 
     /// Phase 1: register the running thread. The caller must then re-check

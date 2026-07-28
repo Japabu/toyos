@@ -23,6 +23,7 @@ use crate::process::{self, Pid};
 use crate::scheduler::{self, EventSource};
 use crate::shared_memory::{self, SharedToken};
 use crate::sync::Lock;
+use crate::waitq::WaitQueue;
 use crate::DirectMap;
 
 use toyos_abi::io_uring::{
@@ -290,6 +291,12 @@ pub fn has_completions(ring_id: RingId) -> bool {
     map.get(ring_id).map_or(false, |inst| inst.cq_count() > 0)
 }
 
+fn cq_count(ring_id: RingId) -> Result<u32, SyscallError> {
+    let guard = IO_URINGS.lock();
+    let map = guard.as_ref().expect("io_uring not initialized");
+    Ok(map.get(ring_id).ok_or(SyscallError::NotFound)?.cq_count())
+}
+
 /// Process SQEs and wait for completions. Called from the syscall handler.
 /// Returns the number of CQEs available after processing.
 pub fn enter(
@@ -312,13 +319,9 @@ pub fn enter(
     }
 
     // Wait phase
+    let queue = WaitQueue::io_uring(ring_id);
     loop {
-        let count = {
-            let guard = IO_URINGS.lock();
-            let map = guard.as_ref().expect("io_uring not initialized");
-            let instance = map.get(ring_id).ok_or(SyscallError::NotFound)?;
-            instance.cq_count()
-        };
+        let count = cq_count(ring_id)?;
 
         if count >= min_complete || min_complete == 0 {
             return Ok(count);
@@ -334,7 +337,15 @@ pub fn enter(
             return Ok(count);
         }
 
-        scheduler::block(Some(EventSource::IoUring(ring_id)), deadline);
+        // The re-check is this ring's own condition, not mere readiness: a
+        // waiter for `min_complete` CQEs that cancelled on the first one
+        // would spin instead of parking.
+        let ticket = queue.prepare_wait();
+        if cq_count(ring_id)? >= min_complete {
+            ticket.cancel();
+            continue;
+        }
+        scheduler::block_on(ticket, deadline);
     }
 }
 
