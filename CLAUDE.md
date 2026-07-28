@@ -92,9 +92,10 @@ failed only because it sat *below* std instead of beside it. See
 
 ## Std library rules
 
-- **Never edit cross-platform std files** (e.g. `library/std/src/process.rs`, `library/std/src/io/mod.rs`)
-- Only edit ToyOS-specific files: `sys/pal/toyos/`, `os/toyos/`, files with `toyos` in the path
-- Add ToyOS as a new platform alongside unix/windows/wasi — never hijack existing cfg gates
+- **Add ToyOS as a new platform alongside unix/windows/wasi — never hijack existing cfg gates.** This is the rule that actually governs; the two below are its consequences.
+- Prefer ToyOS-specific files: `sys/pal/toyos/`, `os/toyos/`, anything with `toyos` in the path.
+- A cross-platform file may be touched **only to add a target arm to an existing platform-dispatch site** — never to change cross-platform semantics or API shape. 54 files in the fork have no `toyos` in their path (`sys/*/mod.rs` dispatch, `rustc_target/src/spec/`, `os/fd/`); every one is a dispatch arm. `library/alloc` and `library/core` have **zero** delta and should keep it.
+- Corollary: cherry-picking an already-**merged** upstream commit is early convergence, not divergence, and is allowed. Copying an unmerged PR is not — it voids the promise that the fork delta is what an upstream PR would contain.
 
 ## Build & test
 

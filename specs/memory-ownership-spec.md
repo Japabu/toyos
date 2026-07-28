@@ -204,8 +204,10 @@ Verified. `Box::new` is inherent to `Box<T, Global>`, so it does not resolve
 through the alias either. Three layers, in order of strength:
 
 1. **Compile error** (the aliases) — catches every idiomatic call site.
-2. **CI grep** for fully-qualified `alloc::boxed::`/`alloc::vec::` — catches the
-   one deliberate bypass, and such a line is obviously wrong on sight.
+2. **CI grep** for fully-qualified `alloc::boxed::`/`alloc::vec::`/`alloc::string::`
+   /`alloc::collections::` — catches the one deliberate bypass, and such a line is
+   obviously wrong on sight. The string arm is not hypothetical: `main.rs:230` and
+   `arch/syscall.rs:813` are exactly this shape today.
 3. **Runtime trap** — the `#[global_allocator]` that must exist panics on use.
    Verified to compile and link fine, so the backstop is free.
 
@@ -255,18 +257,101 @@ Stated plainly, because a design that overclaims here is worse than none:
   together**; §2's bug table is the intersection of both.
 - **It does not bound memory.** Quotas, pressure signals, and an OOM killer are
   downstream of the accounting, not part of it.
-- **It does not attribute `String`.** `alloc::string::String` takes zero generic
-  parameters and hard-codes `Global` — verified. **OPEN**: whether to implement
-  `String<A>` in the rust fork, build a ToyOS-owned `KString<A>` over
-  `Vec<u8, A>`, or eliminate heap strings from the kernel. Under evaluation
-  separately; the leading concern is that `library/alloc/src/string.rs` is the
-  most cross-platform file in std and CLAUDE.md forbids editing such files.
+- **It does not attribute `alloc::String`.** `String` takes zero generic
+  parameters and hard-codes `Global`. **Decided 2026-07-28 — see §6.1.** Not by
+  forking std: by a ToyOS-owned `KString<A>`, done inside Stage 2.
 - **It does not make "must be consumed" a compile error.** `#[must_use]` is
   inadequate — verified: binding, `let _ =`, `drop()`, and burial in a collection
   all pass a `#[must_use]` type silently. True linear types are RFC-only and the
   most recent serious attempt died in October 2025, blocked on unwind semantics.
   The drop-bomb idiom the kernel already uses (`WaitTicket`, `scheduler.rs`)
   remains the state of the art, and it is a runtime check.
+
+### 6.1 Strings: `KString<A>`, not `String<A>` — decided
+
+The question "should ToyOS implement the allocator parameter on `String`?" was
+evaluated by four parallel investigations and three independent judges (upstream
+status, kernel usage, fork cost, alternatives). All three judges reached **B —
+build `KString<A>`** independently. The decisive facts, each re-verified here:
+
+**1. `String<A>` would attribute exactly ONE allocating site in the whole
+kernel.** `String::new()` does not allocate — `rust/library/alloc/src/string.rs`
+is `pub const fn new() -> String { String { vec: Vec::new() } }`, capacity 0.
+`new_in` is the only constructor the upstream work hands us. Of the kernel's four
+`String::new()` sites, three (`vfs.rs:145` ×2, `:154`, `:227`) return empty
+strings that are never grown; only `process.rs:777` reaches the allocator.
+
+**2. And that one site should be deleted, not tagged.** `process.rs:777`
+allocates a scratch formatting buffer *while holding the process-data lock*, on
+the process-exit path — where an OOM routes into `try_recover_from_panic`, which
+frees nothing (§2). ToyOS already owns the right primitive: `SerialWriter`
+(`drivers/serial.rs:202-282`) is a 1 KiB stack buffer implementing
+`core::fmt::Write` that spills to the log ring rather than truncating, already
+used by 273 `log!` sites with zero allocation.
+
+**3. Upstream will not rescue option A.** rust#149328 is real, reviewed
+("The code LGTM" — Amanieu), crater-clean (5 regressions in 829,643 crates) and
+was `bors r+`'d on 2026-03-02 — but it is still open, `mergeable: false`, stuck
+on a rustdoc URL-stability question ToyOS has no standing to resolve. More
+importantly its scope is wrong for us: `library/alloc/src/fmt.rs` is **absent**
+from its 168 changed files, and `From<&str>`, `FromIterator`, `ToString` and
+`Cow` stay on `Global` — verified against the PR's own file list. So `format!`
+(23 sites) and `String::from` (33 sites) remain untagged **even after it
+merges**. Every *stored* kernel string is built with `String::from`.
+
+**4. `string.rs` has no dispatch site to join.** The rule the fork actually
+enforces is CLAUDE.md's third bullet — add a target arm to an existing
+platform-dispatch site, never change cross-platform semantics. `string.rs`
+contains zero `target_os`/`target_family`/`cfg(unix)`/`cfg(windows)` predicates,
+so there is nothing to join; and it saw 106 upstream commits since 2024-01-01.
+The fork's `library/alloc` + `library/core` delta is currently **empty**, and
+should stay that way.
+
+```rust
+pub struct KString<A: Allocator> { buf: Vec<u8, A> }   // UTF-8 by construction
+```
+
+Same layout as `String` plus the tag. Needs only `Vec::new_in`,
+`with_capacity_in`, and `extend_from_slice` — no std change of any kind.
+`impl core::fmt::Write` needs only `write_str`, so `write!`/`format_args!` keep
+working. ~23 stored sites change, in the same eight files Stage 2 already
+rewrites for `Vec`/`BTreeMap`/`Arc` — which is why this belongs *inside* Stage 2
+rather than as its own project.
+
+Three honest costs. (a) ~100–150 lines of ToyOS-owned code duplicating a std
+type: real debt, denominated in our maintenance rather than rebase conflicts.
+(b) One `unsafe` (`str::from_utf8_unchecked` in `as_str`) with a `debug_assert`,
+in a project that just held `toyos-sched` to `deny(unsafe_code)`. (c) **LLDB
+regression**: `rust/src/etc/rust_types.py:42` matches only `alloc::…::String`, so
+`KString` renders as a raw byte `Vec` in the debugger ToyOS lives in. Budget a
+ToyOS-owned summary provider next to `.claude/qmp.py`.
+
+Do these first — they *delete* strings rather than tag them, and each fixes a
+separate bug:
+- `Descriptor::Listener(String)` (`fd.rs:57`) → `ListenerId`. `listener.rs:56`
+  already is the intern table and all six consumers immediately re-look-up the
+  id, two of them cloning the name per accept-poll. Also fixes the
+  un-refcounted `Descriptor::clone` in §2.
+- `bcachefs_adapter` stores each filename twice (map key + `OpenFileInfo.name`)
+  purely so `close_file` can find the key — a free 50% cut.
+- `user_ptr.rs:149` (`user_str`) applies **no length check**, and no `MAX_PATH`
+  constant exists anywhere. This is what actually bounds `Vfs.created_dirs`,
+  which takes unbounded userland paths from `mkdir` and is never freed on
+  process exit.
+
+**Unresolved boundary:** `bcachefs/src/fs.rs:529` `list() -> Vec<(String, u64)>`
+and `:506` `read_link() -> Option<String>` are the kernel's largest transient
+string producers and scale with the self-hosting workload. bcachefs is
+ToyOS-owned so it can change, but returning `KString<A>` drags `allocator_api`
+into it. Prefer a visitor over `&str` — removing the allocation beats tagging it.
+**Decide this before writing `KString`: it determines which crate it lives in.**
+
+**Revisit trigger.** Re-open only when rust#149328 is merged **and** its file
+list includes `library/alloc/src/fmt.rs` or an allocator-generic
+`impl From<&str>`. Both halves required — a merged #149328 as written still
+attributes zero stored kernel strings. If both land, alias `KString` to
+`String<A>` and delete it; nothing in the design changes either way, which is
+why it is safe to build now.
 
 ## 7. Rejected alternatives
 
