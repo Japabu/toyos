@@ -1,9 +1,13 @@
 //! The hardware boundary: everything the scheduler core needs from the
-//! world, as one trait. The kernel implements it with LAPIC one-shot,
-//! targeted x2APIC ICR and the asm switch (migration Stage 6); the simulator
-//! implements it over a virtual clock and vcpu bookkeeping (Stage 4). No
-//! scheduling decision, state transition or ordering-sensitive code may live
-//! behind this trait.
+//! world, in three traits stacked by what they have to know about.
+//! [`Kicker`] knows only a CPU id; [`Machine`] adds the rest of the
+//! task-blind surface (clock, one-shot timer, interrupt gate, halt, trace);
+//! [`Hw`] adds the two operations that carry a task — the context switch and
+//! the finalize sink. The kernel implements the first two with LAPIC
+//! one-shot, targeted x2APIC ICR and TSC at migration stage 6, and the third
+//! with the asm switch at stage 7; the simulator implements all three over a
+//! virtual clock and vcpu bookkeeping (stage 4). No scheduling decision,
+//! state transition or ordering-sensitive code may live behind them.
 
 use crate::cpu::{RunToken, SleepToken};
 use crate::task::{SchedPayload, TaskAccounting, TaskKey};
@@ -64,36 +68,79 @@ pub enum TraceKind {
     TimerFire,
 }
 
-/// The complete hardware surface. Everything above this trait — task types,
-/// state word, transitions, run queue, fairness math, mailbox, doorbell,
-/// sleep handshake, ticket protocol, deadline heap, pass logic — is real and
-/// shared between the kernel and the simulator; everything behind it is
-/// LAPIC/TSC/ICR/asm in the kernel and virtual time/pending-IPI bookkeeping
-/// in the sim (spec §10.1).
 /// The one effect a wake path needs from the world: the targeted kick IPI a
 /// [`crate::mailbox::Kick::Send`] obliges the poster to deliver. Split out of
-/// [`Hw`] so wait queues and the retire protocol — which run at any wake
+/// [`Machine`] so wait queues and the retire protocol — which run at any wake
 /// site, not inside a scheduler pass — depend on nothing else.
 pub trait Kicker: Sync {
     /// Targeted kick IPI. Never broadcast.
     fn kick(&self, target: CpuId);
 }
 
-pub trait Hw: Kicker + 'static {
-    type Payload: SchedPayload;
+/// The half of the hardware surface that says nothing about tasks: clock,
+/// one-shot timer, interrupt gate, halt, resched request, trace sink.
+///
+/// Separate from [`Hw`] because it is separately *implementable*. Migration
+/// stage 6 puts the kernel's LAPIC/TSC/ICR behind this trait while the old
+/// scheduler still runs, so the surface meets real interrupts a stage before
+/// anything depends on it — and a stage before the kernel has a
+/// [`SchedPayload`] to name. A single trait would have made that impossible:
+/// `switch` and `release` are the only members that need the payload, and
+/// they are exactly the two the cutover brings.
+pub trait Machine: Kicker + 'static {
     type IrqGuard;
 
     /// Sampled ONCE per pass by the driver and threaded as a value — the
     /// core never reads the clock mid-flight.
     fn now(&self) -> Nanos;
 
-    /// Program the one-shot timer for an absolute deadline.
+    /// Program the one-shot timer for an **absolute** deadline. The kernel's
+    /// LAPIC one-shot is relative, so it converts; TSC-deadline mode is
+    /// absolute and will not.
     fn set_timer(&self, deadline: Nanos);
 
     fn stop_timer(&self);
 
     /// Kernel: cli/sti RAII. Sim: gates event delivery for this vcpu.
     fn irq_guard(&self) -> Self::IrqGuard;
+
+    /// Enable interrupts and halt, atomically — on x86 the `sti;hlt` pair and
+    /// its STI shadow, which is why this is one operation and not an
+    /// [`Self::irq_guard`] drop followed by a halt. A wake that lands in
+    /// between would be consumed as an ordinary interrupt and then slept
+    /// through. Returns once an interrupt has been taken.
+    ///
+    /// The *decision* to halt is not here: the final recheck reads scheduler
+    /// state, so it lives above the boundary and its proof is [`SleepToken`].
+    fn halt(&self);
+
+    /// Ask `cpu` to take its next safe point. The core needs this for exactly
+    /// one case the spec spells out (§7.6): a `Retire` whose target is the
+    /// task currently *running* cannot be yanked mid-syscall, so it is asked
+    /// to die at its next safe point instead. Not in the spec's trait list —
+    /// which leaves that request without a way to reach the driver.
+    fn need_resched(&self, cpu: CpuId);
+
+    fn trace(&self, ev: TraceEvent);
+
+    /// Halt on the strength of a [`SleepToken`]. Provided, and deliberately
+    /// not overridable in spirit: the token is proof, [`Self::halt`] is the
+    /// effect, and keeping the two apart is what lets a driver that cannot
+    /// yet mint a token (stage 6) still exercise the halt.
+    fn idle_wait(&self, token: SleepToken) {
+        let _consumed = token;
+        self.halt();
+    }
+}
+
+/// The complete hardware surface. Everything above this trait — task types,
+/// state word, transitions, run queue, fairness math, mailbox, doorbell,
+/// sleep handshake, ticket protocol, deadline heap, pass logic — is real and
+/// shared between the kernel and the simulator; everything behind it is
+/// LAPIC/TSC/ICR/asm in the kernel and virtual time/pending-IPI bookkeeping
+/// in the sim (spec §10.1).
+pub trait Hw: Machine {
+    type Payload: SchedPayload;
 
     /// Perform the context switch the token describes. Nothing
     /// scheduler-related runs after this on the old context — the pass that
@@ -106,19 +153,7 @@ pub trait Hw: Kicker + 'static {
     #[allow(unsafe_code)] // declaration only — the core constructs tokens in safe code (spec §4)
     unsafe fn switch(&self, token: RunToken<Self::Payload>);
 
-    /// Kernel: cli / final recheck / sti;hlt. Sim: mark the vcpu sleeping.
-    fn idle_wait(&self, token: SleepToken);
-
-    /// Ask `cpu` to take its next safe point. The core needs this for exactly
-    /// one case the spec spells out (§7.6): a `Retire` whose target is the
-    /// task currently *running* cannot be yanked mid-syscall, so it is asked
-    /// to die at its next safe point instead. Not in the spec's trait list —
-    /// which leaves that request without a way to reach the driver.
-    fn need_resched(&self, cpu: CpuId);
-
     /// Finalize sink: the environment reclaims a dead task's payload and its
     /// accounting, both handed over exactly once (spec §9.3).
     fn release(&self, key: TaskKey, payload: Self::Payload, acct: TaskAccounting);
-
-    fn trace(&self, ev: TraceEvent);
 }

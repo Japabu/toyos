@@ -10,8 +10,8 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use toyos_sched::cpu::{RunToken, SleepToken};
-use toyos_sched::hw::{CpuId, Hw, Kicker, Nanos, TraceEvent};
+use toyos_sched::cpu::RunToken;
+use toyos_sched::hw::{CpuId, Hw, Kicker, Machine, Nanos, TraceEvent};
 use toyos_sched::task::{TaskAccounting, TaskKey};
 
 use crate::payload::{SimCtx, SimPayload};
@@ -108,8 +108,7 @@ impl Kicker for SimHw {
     }
 }
 
-impl Hw for SimHw {
-    type Payload = SimPayload;
+impl Machine for SimHw {
     /// A step is atomic in this world, so "IRQs off" is the default rather
     /// than a state to enter: delivery steps are simply not enabled while a
     /// pass runs. The guard is therefore a witness with nothing to carry.
@@ -135,6 +134,25 @@ impl Hw for SimHw {
 
     fn irq_guard(&self) {}
 
+    fn halt(&self) {
+        self.with(|s| {
+            let cpu = Self::cpu(s);
+            s.halted[cpu] = true;
+        });
+    }
+
+    fn need_resched(&self, cpu: CpuId) {
+        self.with(|s| s.need_resched[cpu.0 as usize] = true);
+    }
+
+    fn trace(&self, ev: TraceEvent) {
+        self.with(|s| s.trace.push(ev));
+    }
+}
+
+impl Hw for SimHw {
+    type Payload = SimPayload;
+
     #[allow(unsafe_code)] // the trait method is `unsafe fn`; this body derefs nothing
     unsafe fn switch(&self, token: RunToken<SimPayload>) {
         self.with(|s| {
@@ -159,17 +177,6 @@ impl Hw for SimHw {
         });
     }
 
-    fn idle_wait(&self, _token: SleepToken) {
-        self.with(|s| {
-            let cpu = Self::cpu(s);
-            s.halted[cpu] = true;
-        });
-    }
-
-    fn need_resched(&self, cpu: CpuId) {
-        self.with(|s| s.need_resched[cpu.0 as usize] = true);
-    }
-
     fn release(&self, key: TaskKey, payload: SimPayload, acct: TaskAccounting) {
         self.with(|s| {
             if !s.ctx_saved.get(&key).copied().unwrap_or(true) {
@@ -184,10 +191,6 @@ impl Hw for SimHw {
         // Dropping the payload here releases its address-space Arc. Invariant
         // I8 re-counts the refs after every step; this is the drop it counts.
         drop(payload);
-    }
-
-    fn trace(&self, ev: TraceEvent) {
-        self.with(|s| s.trace.push(ev));
     }
 }
 

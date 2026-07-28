@@ -16,7 +16,7 @@ use std::sync::Arc as StdArc;
 
 use toyos_sched::cpu::{Action, CpuHandle, CpuSched, Env, SchedPass};
 use toyos_sched::fair::{FairShare, Frontier, ShareState};
-use toyos_sched::hw::{CpuId, Hw, Kicker, Nanos};
+use toyos_sched::hw::{CpuId, Hw, Kicker, Machine, Nanos};
 use toyos_sched::mailbox::{mailbox, Kick, Urgency};
 use toyos_sched::msg::Msg;
 use toyos_sched::retire;
