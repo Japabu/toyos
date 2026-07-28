@@ -182,8 +182,19 @@ the subsystems they cover:
   handshake). `toyos-sched/sim/` is the deterministic simulator (VM, explorer,
   ChoiceStream with seed/fuzz-byte/PCT/replay drivers, shrinker, corpus, scenario
   library); `toyos-sched/loom/` the model-checking harness. **The kernel still does
-  not call any of it** beyond `fair.rs` — conversions are Stage 5, `Hw` is Stage 6,
-  cutover is Stage 7.
+  not call any of it** beyond `fair.rs` — `Hw` is Stage 6, cutover is Stage 7.
+  **Stage 5 done** (one commit per source): every wait site named in the spec —
+  pipes, futex, listener, audio fd, io_uring, join — now registers before it
+  re-checks and parks with the registration in hand. `kernel/src/waitq.rs` is the
+  shim: `WaitQueue`/`WaitTicket` in the shape of `toyos_sched::waitq`, registrations
+  held in the old blocked pool so the lock every wake path already takes arbitrates
+  them; `scheduler::block_on` takes the ticket by value, so a park cannot reach the
+  pool without one. The per-source rechecks are one recheck, and `FUTEX_WAKE_GEN`,
+  `FUTEX_LOCK` and `SwitchReason::BlockFutex` are deleted. Not converted (not in the
+  spec's list, and they keep `pending_wakes` and the legacy `source_ready` recheck
+  alive until Stage 8): keyboard, serial-console and network reads. Honest scope —
+  the practical decide-to-park window is closed; the structural, message-serialized
+  closure is Stage 7, which deletes the shim.
   Host tests: `cargo test` inside `toyos-sched/` (unit + loom + sim; ~15 s). Two
   proofs that the harnesses have teeth, both required:
   `TOYOS_LOOM_RAW=1 cargo test -p toyos-sched-loom --features no-preempt-guard`
@@ -215,9 +226,9 @@ the subsystems they cover:
 - soundd idles at ~7% of a core (mixing/dithering silence at period rate even with no clients). Acceptable but worth revisiting with the idle policy in spec §5.8.
 - `ps` state column (`task_sched_state`) still uses try_lock and skips `outgoing` — can transiently misreport under load (display-only; CPU-time column is accurate).
 - One unreproduced observation: `ps` appeared to stall for >2s under heavy single-core load (later runs fine). If seen again, capture with LLDB before restarting.
-- One unreproduced observation (2026-07-24): a full `cargo test` run wedged at `panic_recovery` — the test timed out and every later test in the shared boot timed out too, i.e. the guest never recovered. Solo runs and full-suite reruns pass. Smells like a rare panic-recovery/scheduler race (exactly the B9 class the scheduler-core rewrite targets); if seen again, keep the QEMU alive and attach LLDB.
+- **`panic_recovery` wedges roughly 1 run in 6, and takes every later test in the boot with it** (reproduced 2026-07-28, was the unreproduced 2026-07-24 observation). Measured at the same rate with and without that day's scheduler changes, so it is not migration fallout. Serial at the wedge: both CPUs idle, the panicking child gone, and the parent still parked in waitpid — `[kernel] sched: ready=0 blocked=4`, with `test_rs_panic_recovery` and `test-runner` both `events=[(none)]` for the rest of the boot. Prime suspect is `try_recover_from_panic` (`kernel/src/arch/idt/exceptions.rs`): it computes `parent_to_wake` *inside* `if let Some(guard) = PROCESS_TABLE.try_lock()`, so when that try_lock fails the child is neither zombified there nor is any wake sent — and the idle loop's later `zombify_tid` wakes nobody. Confirm by logging the failed try_lock, then make the wake unconditional (or have the idle-loop zombify path wake the parent).
 - `SYS_AUDIO_SUBMIT` has no ownership check — any process can submit audio buffers without holding the audio fd. Gate on the claimed device (or fold into capability handles).
-- The build system suppresses rustc warnings on success (`src/build.rs` quiet mode), so the zero-warning bar is not enforced by `cargo run -- --build-only`. Surface or gate on warnings.
+- The build system suppresses rustc warnings on success (`src/build.rs` uses `Command::output()`, which captures stderr whether or not quiet mode is on), so the zero-warning bar is not enforced by `cargo run -- --build-only`. The kernel itself builds with `-D warnings`, so its warnings are errors anyway; everything else is unchecked. To see a crate's warnings meanwhile: `cd kernel && touch src/main.rs && env -u RUSTFLAGS -u RUSTC RUSTUP_TOOLCHAIN=toyos PATH=<repo>/toyos-ld/target/<host>/release:$PATH cargo build --target x86_64-unknown-none`.
 - Panic-path residual: a panic while the virtio-console TX queue is wedged *and* unlocked still spins in `submit_and_wait`; bounding that wait is a virtio.rs semantics change needing its own discussion.
 - Pre-existing deadlock hazard: `timer_handler` (IRQ context, IF=0) → `xhci::poll_if_pending` → `XHCI.lock()` (spinning ticket lock) can deadlock if the timer interrupts the same CPU's thread while it holds the XHCI lock via the fd.rs keyboard/mouse read poll. A `try_lock` in the timer path would remove it.
 - `tests/toyos-rust-tests/system.toml` is dead (only `tests/testcases` is used) — delete.
