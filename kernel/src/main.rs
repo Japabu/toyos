@@ -133,6 +133,14 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
         &arch::idt::exceptions::CrashInfo::Panic { message: info, rbp }
     );
 
+    // Drain the report now, not eventually. `crash_report` only writes into
+    // the 64 KiB log ring; the drains are the idle loop and the timer tick,
+    // and neither is guaranteed to run again — the recovery path below
+    // re-enters a scheduler the panicking thread may have left holding a
+    // lock. A wedge after that point loses the one message explaining it.
+    // Draining twice is harmless (the second drain finds an empty ring).
+    unsafe { drivers::serial::panic_flush(); }
+
     // If in syscall context: kill the process, rejoin scheduler. This panic
     // is fully handled — reset the reentry guard so a future, independent
     // panic on this CPU still reports.
