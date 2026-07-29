@@ -10,7 +10,7 @@
 use alloc::boxed::Box;
 use core::ptr::addr_of_mut;
 
-use crate::fair::{FairShare, ShareState};
+use crate::fair::{FairShare, ShareState, QUANTUM_NS};
 use crate::hw::{CpuId, Nanos};
 use crate::mailbox::MailboxNode;
 use crate::msg::Msg;
@@ -80,8 +80,11 @@ pub enum WakeReason {
     Timeout,
 }
 
-/// Inherited RT expires on a wall-clock bound, not on "until the next block",
-/// so a boosted client that spins cannot keep RT forever (spec §8.5, I9).
+/// A lend of RT priority. `until` is a bound on how long the borrowed priority
+/// may be *held*: it is armed at dispatch and cleared at the first preempt or
+/// park past it, so a boosted client that spins cannot keep RT forever, and one
+/// that is merely slow to reach a CPU does not lose the lend it was given
+/// (spec §8.5, invariant I9).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct BoostWindow {
     pub until: Nanos,
@@ -460,14 +463,16 @@ impl<M> TaskShared<M> {
 
 /// Whether a task is real-time, and until when a borrowed priority lasts.
 ///
-/// Inherited RT expires on a wall-clock bound rather than "until the next
-/// block", so a boosted client that spins cannot keep RT forever (spec §8.5,
-/// invariant I9).
+/// The borrowed window bounds *running* time, not wall clock: it is armed at
+/// dispatch and cleared at the preempt or park that passes it. A spinning
+/// boosted client therefore cannot keep RT forever, and a starved one cannot
+/// lose the lend before it has spent any of it (spec §8.5, invariant I9).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct RtState {
     /// Granted by the privilege-gated `SYS_SET_RT_PRIORITY`.
     pub permanent: bool,
-    /// Lent by a waker, valid until this instant.
+    /// Lent by a waker. Holds the instant the lend runs out; re-armed at
+    /// dispatch if it lapsed while the task was queued (see [`RtState::arm`]).
     pub inherited: Option<Nanos>,
 }
 
@@ -476,11 +481,35 @@ impl RtState {
         self.permanent || self.inherited.is_some()
     }
 
-    /// Called at every `preempt`/`park`: the window is a time bound.
+    /// Called at every `preempt`/`park`: the window is a time bound on how long
+    /// the borrowed priority may be *held*, and holding ends here.
     fn expire(&mut self, now: Nanos) {
         if let Some(until) = self.inherited {
             if now >= until {
                 self.inherited = None;
+            }
+        }
+    }
+
+    /// Called at `dispatch`. A window that lapsed while the task was *queued*
+    /// was never spent — waiting for a CPU is the opposite of holding a
+    /// priority — so it is re-armed rather than dropped. Dropping it is what
+    /// the pre-fix code did, and it inverted the lend: the task fell out of the
+    /// RT band into the fair band, behind exactly the normal-priority work the
+    /// lend existed to jump. Measured on the audio path, that demotion starved
+    /// a boosted client for 93 ms behind a CPU hog.
+    ///
+    /// Re-arming cannot compound into an unbounded RT hold. A boosted task is
+    /// RT, so `preempt_if_due` only preempts it at its quantum end — never
+    /// earlier — and the quantum starts at the same dispatch this arms from.
+    /// `now >= until` is therefore always true at that preempt, so the window
+    /// is cleared there and a second arm needs a *new* lend. One lend buys at
+    /// most one quantum of running time at the borrowed priority (spec §8.5,
+    /// invariant I9).
+    fn arm(&mut self, now: Nanos) {
+        if let Some(until) = self.inherited {
+            if now >= until {
+                self.inherited = Some(now.after(QUANTUM_NS));
             }
         }
     }
@@ -717,11 +746,7 @@ impl<X: SchedPayload> ReadyTask<X> {
     pub(crate) fn dispatch(self, cpu: CpuId, now: Nanos) -> RunningTask<X> {
         let mut task = self.0;
         task.charge_residency(now, Residency::Ready);
-        // Also here, not only at preempt/park: a task picked *after* its
-        // window closed would otherwise carry the borrowed priority through
-        // one more whole quantum, which is exactly the slack invariant I9
-        // refuses to grant.
-        task.0.rt.expire(now);
+        task.0.rt.arm(now);
         assert!(
             task.0.shared.transition(TaskState::Ready(cpu), TaskState::Running(cpu)),
             "dispatch of a task that is not ready on this CPU: {:?}",
@@ -763,15 +788,6 @@ impl<X: SchedPayload> ReadyTask<X> {
         self.0.rt().is_rt()
     }
 
-    /// Drop a lapsed borrowed priority while the task is still queued.
-    /// `true` means it just left the RT band and must be re-inserted, so an
-    /// expired boost cannot buy a pick ahead of a genuinely RT task — the
-    /// band is chosen at insert, and nothing else revisits it.
-    pub(crate) fn expire_boost(&mut self, now: Nanos) -> bool {
-        let was_rt = self.0.rt().is_rt();
-        self.0 .0.rt.expire(now);
-        was_rt && !self.0.rt().is_rt()
-    }
 }
 
 impl<X: SchedPayload> RunningTask<X> {

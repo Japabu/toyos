@@ -811,15 +811,15 @@ impl<H: Hw, P: PreemptGuard> SchedPass<'_, '_, H, P, Disposed> {
         if self.cpu.running.is_some() {
             return;
         }
-        while let Some((vruntime, mut task)) = self.cpu.rq.pop_next() {
-            if task.expire_boost(self.now) {
-                let vruntime = task
-                    .share()
-                    .runnable_vruntime()
-                    .expect("a queued task's share must be runnable");
-                self.cpu.rq.insert(vruntime, task);
-                continue;
-            }
+        // A lapsed window is deliberately not checked here, and the task is not
+        // demoted out of the RT band for having one. Waiting in a queue spends
+        // no borrowed priority, so a lend that ran out while its holder was
+        // still queued was never spent at all; `ReadyTask::dispatch` re-arms it.
+        // Demoting instead — which is what this loop used to do — inverted the
+        // lend, dropping the task behind every normal task that queued while it
+        // waited, and it starved a boosted audio client for 93 ms behind a CPU
+        // hog. The band therefore stays chosen at insert, as before.
+        while let Some((vruntime, task)) = self.cpu.rq.pop_next() {
             if task.shared().kill_pending() {
                 // The kill bit is checked here rather than asserted absent in
                 // `dispatch`: a remote CPU sets it at any instant, so an

@@ -244,9 +244,12 @@ fn check_address_spaces(vm: &mut Vm<'_>) {
     }
 }
 
-/// I9: an inherited RT window is a *time* bound, so a boosted task that never
-/// blocks still loses the boost — the "spinning boosted client keeps RT
-/// forever" hole (spec §8.5).
+/// I9: an inherited RT window bounds the time the borrowed priority is *held*,
+/// so a boosted task that never blocks still loses the boost — the "spinning
+/// boosted client keeps RT forever" hole (spec §8.5). Checking the *running*
+/// task is what makes this the right test after the window became arm-at-
+/// dispatch: queue time is deliberately outside the bound, so a ready task
+/// carrying a lapsed window is correct and only a running one can be over.
 fn check_boost_windows(vm: &mut Vm<'_>) {
     let now = vm.clock;
     // The window may outlast its expiry by the quantum the task was already

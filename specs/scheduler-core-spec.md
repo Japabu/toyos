@@ -594,6 +594,26 @@ pub struct BoostWindow { pub until: Nanos }
 - Expiry is a **time bound**, not "until next block": `preempt`/`park` clear `inherited` when
   `now >= until`. This upgrades today's unbounded "spinning boosted client keeps RT forever" hole
   into the spec's ~one-period bound. Sim invariant I9.
+- **The bound is on time *held*, not on wall clock since the lend** (amended 2026-07-29). A task
+  waiting in a run queue holds no priority, so queue time spends none of the window: `dispatch`
+  **arms** it — a window already lapsed when the task is picked is re-armed to `now + QUANTUM_NS`
+  — and `preempt`/`park` clear it as above. The pick does **not** check it and never demotes a
+  queued task out of the RT band.
+
+  Read literally, the original wording admits an implementation in which a boosted task that is
+  slow to reach a CPU is demoted to the fair band *before it has run at all*, which inverts the
+  lend: the task lands behind exactly the normal-priority work the lend existed to jump, and the
+  only paths that re-grant a lend (a wake, or the consume point) are both unreachable from a
+  starved-ready task. That implementation existed and was measured — one demotion starved a
+  boosted audio client for 93 ms behind a CPU hog and produced a 70 ms dropout, the largest
+  recorded on this tree.
+
+  Re-arming cannot compound. A boosted task is RT, so `preempt_if_due` only preempts it at its
+  quantum end, and that quantum starts at the same dispatch the window was armed from — so
+  `now >= until` always holds there and the window is cleared. A second arm therefore requires a
+  *new* lend. **One lend buys at most one quantum of running time at the borrowed priority**, which
+  is the pre-cutover scheduler's guarantee ("cleared at the next deschedule") stated as a bound
+  rather than left as a consequence of the deschedule path.
 
 ### 8.6 Event-source funnel table
 
@@ -785,7 +805,7 @@ checkers.
 | I6 | `FairShare.runnable_threads` == actual Ready+Running count per share | sim |
 | I7 | Accounting conservation: Σ per-task ns == virtual elapsed per CPU | sim |
 | I8 | Mock-AddressSpace Arc strong count == live tasks referencing it (the crash.md detector) | sim |
-| I9 | Inherited RT never outlives its boost window + one quantum | sim |
+| I9 | A lend of inherited RT is spent only by *running*: one lend buys ≤ one quantum of running time at the borrowed priority, and a queued task never loses one it has not spent | sim |
 | I10 | Scenario end: all tasks finalized exactly once, mailboxes empty, CPUs idle, no leaks | sim |
 | I11 | No migrate/finalize of a task whose `ctx_saved` shadow is false | sim |
 | I12 | ≤1 `Wake` and ≤1 `Retire` node in flight per task; steal node free ⇔ unlinked | sim + loom |
@@ -869,7 +889,8 @@ carry a parallel old world one stage longer than the conversion requires.
 | Ready task on a CPU that halts | `SleepToken` unconstructible with nonempty rq | Unrepresentable (§7.5) |
 | Deadline exists but timer unarmed | `finish()` programs timer last; `SleepToken` requires the plan applied | Invariant T holds by construction (I3) |
 | Blocked task's deadline on a migrated task | Cannot occur: only ready tasks migrate; deadline lives in `ParkedEntry` only | Unrepresentable (§6.1) |
-| Boosted client spins without blocking | Boost expiry is a time bound checked at preempt/park | ≤ window + one quantum (I9) |
+| Boosted client spins without blocking | Window armed at dispatch, checked at preempt/park | ≤ one quantum of running time per lend (I9) |
+| Boosted client starved before it ever runs | Queue time spends no window; the pick never demotes | The lend survives to its first dispatch (I9, §8.5) |
 | Panic inside a pass | Percpu busy flag observed by `abandon_current` → CPU halts loudly; panic-reentry flag checked before any percpu/log access | One clean report; evidence preserved (B9) |
 | Task value dropped outside `finalize` | `TaskInner::drop` panics | Double-drop class converted to loud failure (§5.1) |
 | Simulator finds a violation | Seed + full decision trace + shrunk replay auto-committed to corpus | Permanent regression; deterministic repro |
