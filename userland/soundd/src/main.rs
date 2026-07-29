@@ -32,6 +32,39 @@ struct ClientResampler {
     output: Vec<Vec<f32>>,
 }
 
+/// A gain that has already crossed the trust boundary: finite, and within
+/// §7.4's [0.0, 1.0].
+///
+/// The check has to live in a type rather than at each call site because the
+/// obvious spelling of it does not work. `f32::clamp` returns NaN unchanged,
+/// so a NaN volume used to reach `set_target`, where it made `step` and then
+/// `current` NaN — and `accumulate` multiplies the *shared* mix bus by that,
+/// so one client's bad float silenced every stream for a whole ramp and then
+/// muted the sender for good, since `g == 1.0` and `g > 0.0` are both false
+/// for NaN. None of it counted as an underrun.
+#[derive(Clone, Copy)]
+struct Gain(f32);
+
+impl Gain {
+    const SILENT: Gain = Gain(0.0);
+    const UNITY: Gain = Gain(1.0);
+
+    /// §7.4 clamps out-of-range values, and ±inf is out of range. NaN is not:
+    /// it is not a value at all, every clamp of it is a guess, and guessing
+    /// hides the caller's bug. It is refused, and the control thread treats a
+    /// refusal the way it treats any other malformed message.
+    fn from_wire(gain: f32) -> Option<Gain> {
+        if gain.is_nan() {
+            return None;
+        }
+        Some(Gain(gain.clamp(0.0, 1.0)))
+    }
+
+    fn raw(self) -> f32 {
+        self.0
+    }
+}
+
 struct GainRamp {
     current: f32,
     target: f32,
@@ -40,13 +73,13 @@ struct GainRamp {
 }
 
 impl GainRamp {
-    fn new(initial: f32) -> Self {
-        Self { current: initial, target: initial, step: 0.0, remaining: 0 }
+    fn new(initial: Gain) -> Self {
+        Self { current: initial.raw(), target: initial.raw(), step: 0.0, remaining: 0 }
     }
 
-    fn set_target(&mut self, target: f32, ramp_frames: u32) {
-        self.target = target;
-        self.step = (target - self.current) / ramp_frames as f32;
+    fn set_target(&mut self, target: Gain, ramp_frames: u32) {
+        self.target = target.raw();
+        self.step = (self.target - self.current) / ramp_frames as f32;
         self.remaining = ramp_frames;
     }
 
@@ -79,7 +112,11 @@ struct ClientStream {
     client_id: usize,
     slot_reader: AudioSlotReader,
     signal_write_fd: Fd,
-    signal_read_fd: Fd,
+    /// soundd's own reference to the signal pipe's read end, released the
+    /// moment the client proves it holds one (see the mix loop). Until then
+    /// the pipe has a reader whatever the client does, which is why §5.7's
+    /// crash detection could not work.
+    signal_read_fd: Option<Fd>,
     gain: GainRamp,
     client_channels: u16,
     client_period_frames: u32,
@@ -114,12 +151,27 @@ impl ClientStream {
 // Lock-free SPSC command queue (control thread → mix thread)
 // ---------------------------------------------------------------------------
 
-const CMD_RING_SIZE: u32 = 64;
+/// Control connections soundd will hold at once.
+///
+/// The control thread watches one handle per client plus the listener in a
+/// single poller, and io_uring rings are powers of two, so the honest limit is
+/// a ring size minus one. 64 was chosen over 32 because the ring costs one
+/// 2 MiB page either way, and over 256 because 63 simultaneous streams is
+/// already far past what the mixer can render inside one 2.9 ms period. Each
+/// client also costs soundd three fds — the control connection and both ends
+/// of its signal pipe — so 63 of them spend 189 of the kernel's 1024.
+const MAX_CONTROL_CLIENTS: usize = 63;
+
+/// Deep enough that one pass of the control loop can never fill it: a pass
+/// pushes at most one `AddClient` (there is one accept per wait) plus, per
+/// connected client, one coalesced `SetVolume` and one `RemoveClient`.
+const CMD_RING_SIZE: u32 = 256;
+const _: () = assert!(CMD_RING_SIZE as usize >= 1 + 2 * MAX_CONTROL_CLIENTS);
 
 enum MixCommand {
     AddClient(Box<ClientStream>),
     RemoveClient(usize),
-    SetVolume { client_id: usize, target: f32 },
+    SetVolume { client_id: usize, target: Gain },
 }
 
 struct CommandRing {
@@ -140,15 +192,24 @@ impl CommandRing {
         }
     }
 
-    /// Panics when full: a dropped command means a ghost client (leaked shm,
-    /// app waiting forever) — a bug, not a load condition.
-    fn push(&self, cmd: MixCommand) {
+    /// Hands the command back when the ring is full, rather than dropping it or
+    /// dying of it. A dropped command is still a ghost client (leaked shm, an
+    /// app waiting on a stream nothing mixes) — but a full ring is a load
+    /// condition, and the load is a client's to choose: the control thread
+    /// drains everything a client has written before it yields, so one write of
+    /// `CMD_RING_SIZE + 1` messages used to trip an assert and take the audio
+    /// server down with it. See `submit`, which waits for room.
+    #[must_use]
+    fn try_push(&self, cmd: MixCommand) -> Result<(), MixCommand> {
         let w = self.write_idx.load(Ordering::Acquire);
         let r = self.read_idx.load(Ordering::Acquire);
-        assert!(w.wrapping_sub(r) < CMD_RING_SIZE, "soundd: command ring full");
+        if w.wrapping_sub(r) >= CMD_RING_SIZE {
+            return Err(cmd);
+        }
         let idx = (w % CMD_RING_SIZE) as usize;
         unsafe { (*self.slots.get())[idx] = Some(cmd); }
         self.write_idx.store(w.wrapping_add(1), Ordering::Release);
+        Ok(())
     }
 
     fn pop(&self) -> Option<MixCommand> {
@@ -446,14 +507,14 @@ fn open_stream(
         None
     };
 
-    let mut gain = GainRamp::new(0.0);
-    gain.set_target(1.0, ramp_frames);
+    let mut gain = GainRamp::new(Gain::SILENT);
+    gain.set_target(Gain::UNITY, ramp_frames);
 
     ClientStream {
         client_id,
         slot_reader,
         signal_write_fd: pipe_fds.write,
-        signal_read_fd: pipe_fds.read,
+        signal_read_fd: Some(pipe_fds.read),
         gain,
         client_channels: req.channels,
         client_period_frames,
@@ -568,11 +629,25 @@ fn mix_thread(
     // unplayed at that instant. See the drain count site.
     let min_drain_nanos = (num_buffers as u64 - 1) * period_nanos;
     // How much unplayed audio must still be on the wire before the mix loop may
-    // defer a buffer for a client that is mid-refill (§5.10). It has to cover
-    // the longest soundd can go between two submissions, which is its worst
-    // wake lateness: measured at 12.4 ms — 4.3 periods — over 76 config-runs
-    // after 824dd7d. Five periods rounds that up. This is a measurement, not a
-    // preference: re-derive it if that number moves.
+    // defer a buffer for a client that is mid-refill (§5.10). This is policy,
+    // not physics — the same standing the kernel's `MAX_USER_STR` and `MAX_FDS`
+    // have, and it should be read the same way. The policy: of the pipeline's
+    // 8 periods, soundd spends at most 3 waiting for a client and always keeps
+    // 5 in reserve.
+    //
+    // It is deliberately not derived from soundd's worst wake lateness, which
+    // is what this comment used to claim (12.4 ms over 76 config-runs, "five
+    // periods rounds that up"). That derivation is unsound twice over. The
+    // number did not survive a larger sample — `tests/audio-baseline.toml`
+    // records 56909us on `audio_tone.smp1` over 120 config-runs, 19.6 periods —
+    // and no floor inside the pipeline could have covered it anyway, since the
+    // whole pipeline is 8 periods and that worst wake is 2.45 pipelines. A
+    // bigger floor does not repair the reasoning; it only trades reserve for
+    // patience with a client that has genuinely stopped.
+    //
+    // What justifies 5 is the measurement, not the reasoning: at this value the
+    // baseline re-recorded at dc732e5 is 0 dropouts and 0 underruns across all
+    // 120 config-runs. Move it only with a measurement of that size.
     assert!(num_buffers > 5, "soundd: pipeline too shallow to defer safely");
     let refill_floor_nanos = 5 * period_nanos;
 
@@ -629,10 +704,24 @@ fn mix_thread(
 
         // Signal all clients BEFORE the io_uring wait. Priority inheritance
         // boosts them to RT; they fill their ring slots while soundd is blocked
-        // in the poller wait below. A write error means the client is gone —
-        // its removal arrives via the dropped control connection.
-        for stream in streams.iter() {
-            let _ = syscall::write_nonblock(stream.signal_write_fd, &[1]);
+        // in the poller wait below.
+        //
+        // §5.7/§7.3: a broken pipe here is the client's death. It is a real
+        // signal now that soundd releases its own read end (see the delivery
+        // latch below) — before that the pipe always had a reader and this
+        // write could not fail, whatever became of the client. The control
+        // connection reports the same death, but only when the control thread
+        // next reads it; a client that dies mid-stream would otherwise keep
+        // this stream `is_streaming()` and keep the mix loop deferring buffers
+        // for a producer that no longer exists. A full pipe is `Ok(0)`, not an
+        // error, so a client merely behind on its signals is untouched.
+        for stream in streams.iter_mut() {
+            let write = syscall::write_nonblock(stream.signal_write_fd, &[1]);
+            if write.is_err() && stream.signal_read_fd.is_none() && !stream.pending_removal {
+                eprintln!("soundd: client {} died, ramping down", stream.client_id);
+                stream.gain.set_target(Gain::SILENT, ramp_frames);
+                stream.pending_removal = true;
+            }
         }
 
         // The prediction this wait is armed against, when there is one.
@@ -691,7 +780,7 @@ fn mix_thread(
                 }
                 MixCommand::RemoveClient(id) => {
                     if let Some(s) = streams.iter_mut().find(|s| s.client_id == id) {
-                        s.gain.set_target(0.0, ramp_frames);
+                        s.gain.set_target(Gain::SILENT, ramp_frames);
                         s.pending_removal = true;
                     }
                 }
@@ -850,7 +939,21 @@ fn mix_thread(
                     device_channels as usize,
                     device_period_frames,
                 );
-                stream.delivered |= covered;
+                if covered && !stream.delivered {
+                    stream.delivered = true;
+                    // §5.7 wants a client crash to break soundd's next write to
+                    // the signal pipe, and it cannot while soundd holds a read
+                    // end of its own. A delivered period is the proof that the
+                    // client holds one: `AudioStream::open` maps the ring and
+                    // opens the pipe before it returns, and the thread that
+                    // fills slots is spawned after that. A client that fills
+                    // without ever opening the pipe loses its stream on the
+                    // next signal, which is the right answer for one that never
+                    // joined the protocol.
+                    if let Some(fd) = stream.signal_read_fd.take() {
+                        syscall::close(fd);
+                    }
+                }
                 any_data |= covered;
                 any_streaming |= stream.is_streaming();
             }
@@ -892,7 +995,9 @@ fn mix_thread(
             if s.pending_removal && s.gain.is_idle() {
                 eprintln!("soundd: client {} removed", s.client_id);
                 syscall::close(s.signal_write_fd);
-                syscall::close(s.signal_read_fd);
+                if let Some(fd) = s.signal_read_fd {
+                    syscall::close(fd);
+                }
                 false
             } else {
                 true
@@ -997,6 +1102,30 @@ fn reject_open(req: &StreamOpenRequest) -> Option<&'static str> {
     None
 }
 
+/// Hand one command to the mix thread, waiting for room if the ring is full.
+///
+/// The mix thread drains the whole ring at the top of every cycle, so a full
+/// ring means it has not run for a cycle and one device period is exactly how
+/// long there is to wait. Under connect/disconnect churn this throttles the
+/// control thread — which is the point — instead of dropping a command (a
+/// client stranded in the mix thread forever) or asserting (the audio server
+/// dead at a client's choosing). The retry is unbounded because the mix thread
+/// is the process's main thread: if it has stopped, soundd is already gone.
+fn submit(cmd_ring: &CommandRing, cmd_pipe_write: Fd, cmd: MixCommand, period_nanos: u64) {
+    let mut cmd = cmd;
+    loop {
+        let full = cmd_ring.try_push(cmd);
+        let _ = syscall::write_nonblock(cmd_pipe_write, &[1]);
+        match full {
+            Ok(()) => return,
+            Err(returned) => {
+                cmd = returned;
+                syscall::nanosleep(period_nanos);
+            }
+        }
+    }
+}
+
 fn control_thread(
     listener: toyos::Listener,
     cmd_ring: &CommandRing,
@@ -1007,7 +1136,10 @@ fn control_thread(
     slot_count: u32,
     ramp_frames: u32,
 ) {
-    let poller = Poller::new(32);
+    // One handle per client plus the listener; `MAX_CONTROL_CLIENTS` is derived
+    // from this ring, so the set always fits in one batch.
+    let poller = Poller::new(MAX_CONTROL_CLIENTS as u32 + 1);
+    let period_nanos = (device_period_frames as u64 * 1_000_000_000) / device_sample_rate as u64;
 
     struct ControlClient {
         conn: Connection,
@@ -1015,6 +1147,15 @@ fn control_thread(
         // Set once MSG_STREAM_OPEN succeeds; accepted-but-silent connections
         // stay pending so they cannot stall the control plane.
         stream_idx: Option<usize>,
+        /// Latest volume this client asked for, not yet handed to the mix
+        /// thread. Volume is state, not an event: `set_target` overwrites the
+        /// ramp's target, step and remaining outright, so applying N of them
+        /// back to back within one mix cycle leaves exactly what applying only
+        /// the last would. Collapsing them here is therefore lossless, and it
+        /// is what keeps a client's message rate off the command ring — the
+        /// drain loop below reads everything a client has written before it
+        /// yields, so 65 volume messages in one write used to be 65 commands.
+        pending_volume: Option<Gain>,
     }
 
     let mut clients: Vec<ControlClient> = Vec::new();
@@ -1034,8 +1175,23 @@ fn control_thread(
 
         if ready.contains(&TOKEN_LISTENER) {
             match services::accept(&listener) {
+                // Refused rather than left queued: a connection past the
+                // poller's watchable set would never be read from, so the
+                // client would wait forever on a stream soundd had accepted and
+                // then ignored. It is still accepted first — leaving it in the
+                // listener queue keeps the listener readable and spins this
+                // loop.
+                Ok(accepted) if clients.len() >= MAX_CONTROL_CLIENTS => {
+                    eprintln!("soundd: refusing connection, {MAX_CONTROL_CLIENTS} clients already connected");
+                    let _ = accepted.conn.signal(MSG_STREAM_ERROR);
+                }
                 Ok(accepted) => {
-                    clients.push(ControlClient { conn: accepted.conn, msg: MsgBuf::new(), stream_idx: None });
+                    clients.push(ControlClient {
+                        conn: accepted.conn,
+                        msg: MsgBuf::new(),
+                        stream_idx: None,
+                        pending_volume: None,
+                    });
                     client_pids.push(accepted.client_pid);
                 }
                 Err(e) => eprintln!("soundd: accept failed: {e:?}"),
@@ -1047,6 +1203,7 @@ fn control_thread(
             if !ready.contains(&(i as u64)) {
                 continue;
             }
+            let mut disconnected = false;
             'msgs: loop {
                 let c = &mut clients[i];
                 let (msg_type, plen, payload) = match c.msg.recv(&c.conn) {
@@ -1054,10 +1211,10 @@ fn control_thread(
                     Ok(None) => break 'msgs,
                     Err(()) => {
                         if let Some(idx) = c.stream_idx {
-                            cmd_ring.push(MixCommand::RemoveClient(idx));
-                            let _ = syscall::write_nonblock(cmd_pipe_write, &[1]);
+                            submit(cmd_ring, cmd_pipe_write, MixCommand::RemoveClient(idx), period_nanos);
                         }
                         dead.push(i);
+                        disconnected = true;
                         break 'msgs;
                     }
                 };
@@ -1073,6 +1230,7 @@ fn control_thread(
                                 req.sample_rate, req.channels, req.format);
                             let _ = clients[i].conn.signal(MSG_STREAM_ERROR);
                             dead.push(i);
+                            disconnected = true;
                             break 'msgs;
                         }
                         eprintln!("soundd: opening stream: {}Hz {}ch fmt={}",
@@ -1090,33 +1248,44 @@ fn control_thread(
                             slot_count,
                             ramp_frames,
                         );
-                        cmd_ring.push(MixCommand::AddClient(Box::new(client)));
-                        let _ = syscall::write_nonblock(cmd_pipe_write, &[1]);
+                        submit(cmd_ring, cmd_pipe_write, MixCommand::AddClient(Box::new(client)), period_nanos);
                         clients[i].stream_idx = Some(idx);
                     }
                     (MSG_STREAM_SET_VOLUME, Some(idx)) if plen == core::mem::size_of::<StreamSetVolume>() => {
-                        let gain = f32::from_le_bytes(payload[0..4].try_into().unwrap());
-                        cmd_ring.push(MixCommand::SetVolume {
-                            client_id: idx,
-                            target: gain.clamp(0.0, 1.0),
-                        });
-                        let _ = syscall::write_nonblock(cmd_pipe_write, &[1]);
+                        let raw = f32::from_le_bytes(payload[0..4].try_into().unwrap());
+                        let Some(gain) = Gain::from_wire(raw) else {
+                            eprintln!("soundd: volume is not a number, disconnecting client");
+                            submit(cmd_ring, cmd_pipe_write, MixCommand::RemoveClient(idx), period_nanos);
+                            dead.push(i);
+                            disconnected = true;
+                            break 'msgs;
+                        };
+                        clients[i].pending_volume = Some(gain);
                     }
                     (MSG_STREAM_CLOSE, Some(idx)) => {
-                        cmd_ring.push(MixCommand::RemoveClient(idx));
-                        let _ = syscall::write_nonblock(cmd_pipe_write, &[1]);
+                        submit(cmd_ring, cmd_pipe_write, MixCommand::RemoveClient(idx), period_nanos);
                         dead.push(i);
+                        disconnected = true;
                         break 'msgs;
                     }
                     (other, _) => {
                         eprintln!("soundd: protocol violation (msg {other}), disconnecting client");
                         if let Some(idx) = clients[i].stream_idx {
-                            cmd_ring.push(MixCommand::RemoveClient(idx));
-                            let _ = syscall::write_nonblock(cmd_pipe_write, &[1]);
+                            submit(cmd_ring, cmd_pipe_write, MixCommand::RemoveClient(idx), period_nanos);
                         }
                         dead.push(i);
+                        disconnected = true;
                         break 'msgs;
                     }
+                }
+            }
+            // One command for however many volume messages that drain carried.
+            // A disconnecting client is skipped: its `RemoveClient` is already
+            // queued, and a `SetVolume` behind it would aim the ramp at the
+            // volume instead of at silence and strand the stream unremoved.
+            if !disconnected {
+                if let (Some(client_id), Some(target)) = (clients[i].stream_idx, clients[i].pending_volume.take()) {
+                    submit(cmd_ring, cmd_pipe_write, MixCommand::SetVolume { client_id, target }, period_nanos);
                 }
             }
         }
