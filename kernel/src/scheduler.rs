@@ -242,6 +242,13 @@ pub fn do_preempt() {
         return;
     }
     crate::preempt::clear_need_resched();
+    if percpu::current_tid().is_none() {
+        // No thread on this CPU: either the idle loop, which passes every
+        // iteration anyway, or boot, which has no `CpuSched` yet — an ISR that
+        // raised the request during device init would otherwise reach the
+        // machine before it exists. The request is moot, not deferred.
+        return;
+    }
     crate::trace::trace(crate::trace::Kind::Preempt, 0);
     driver::pass(Dispose::None);
 }
