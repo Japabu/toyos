@@ -24,6 +24,7 @@ use toyos_sched_sim::explore::run;
 use toyos_sched_sim::scenarios;
 use toyos_sched_sim::shrink;
 use toyos_sched_sim::sweep;
+use toyos_sched_sim::workload::ParkShape;
 
 /// Seeds per scenario in the in-test sweep. Every seed is a complete
 /// exploration with all of I1–I12 checked after every step.
@@ -409,4 +410,63 @@ fn the_audio_pipeline_holds_on_one_cpu() {
     let result = sweep::seed_sweep(&scenarios::audio_pipeline(1), SEEDS, 3);
     assert!(result.passed(), "{}", result.report());
     assert_eq!(result.scenario, "audio_pipeline");
+}
+
+/// The fourth self-validation gate, and the newest: invariant I9's teeth.
+///
+/// I9 says one lend buys at most one quantum of running time at the borrowed
+/// priority. Commit `9c2fc4d` shipped a park that cleared the window only
+/// `if now >= until`, so a lend blocked on before it ran out survived the
+/// block — and with `RtState::arm` re-arming at every dispatch, a task that
+/// obtains one lend and thereafter runs less than a quantum before blocking
+/// holds inherited RT forever, off a single pipe interaction and with nobody
+/// renewing anything.
+///
+/// The invariant I9 that shipped alongside it could not see this, and the
+/// giveaway was that it needed no change: it compared a *running* task's
+/// `until` against the clock, and a re-armed `until` is by construction fresh.
+/// A check that passes because it stopped measuring is the same failure mode as
+/// gate A's four instrument defects, so I9 is now the cumulative form and this
+/// test is what says so. If it ever stops failing, the check has lost its teeth
+/// again and every clean I9 report above it means nothing.
+#[test]
+fn old_park_keeping_the_lend_is_caught() {
+    let scenario = scenarios::old_park_kept_the_lend().with_park(ParkShape::KeepLapsedLend);
+    let mut kinds: BTreeMap<String, usize> = BTreeMap::new();
+    let mut caught = 0;
+    for seed in 0..SEEDS {
+        let mut choices = ChoiceStream::from_seed(seed);
+        let outcome = run(scenario.clone(), &mut choices);
+        if outcome.passed() {
+            continue;
+        }
+        caught += 1;
+        for violation in &outcome.violations {
+            let id = violation.split(':').next().unwrap_or("?").to_string();
+            *kinds.entry(id).or_default() += 1;
+        }
+    }
+    assert!(
+        caught > 0,
+        "a task holding a borrowed RT priority forever off one lend went \
+         undetected in {SEEDS} schedules — invariant I9 has no teeth, and \
+         nothing it certifies elsewhere means anything",
+    );
+    assert!(
+        kinds.contains_key("I9"),
+        "expected the per-lend running-time violation; got {kinds:?}",
+    );
+
+    // The control: the same workload under the shipped park must be clean, or
+    // the gate is only detecting the workload.
+    let fixed = scenarios::old_park_kept_the_lend();
+    for seed in 0..SEEDS {
+        let mut choices = ChoiceStream::from_seed(seed);
+        let outcome = run(fixed.clone(), &mut choices);
+        assert!(
+            outcome.passed(),
+            "the shipped park failed its own gate's workload on seed {seed}: {:?}",
+            outcome.violations,
+        );
+    }
 }

@@ -474,6 +474,17 @@ pub struct RtState {
     /// Lent by a waker. Holds the instant the lend runs out; re-armed at
     /// dispatch if it lapsed while the task was queued (see [`RtState::arm`]).
     pub inherited: Option<Nanos>,
+    /// How many lends this task has been granted — bumped only when one
+    /// actually extends the window, so a lend that hands over no new time
+    /// buys none either.
+    ///
+    /// It exists to make invariant I9 *checkable*. I9 bounds running time at
+    /// the borrowed priority **per lend**, and "per lend" is not derivable from
+    /// the outside: [`RtState::arm`] moves `inherited` forward too, so an
+    /// observer watching the deadline cannot tell a fresh grant from a re-arm,
+    /// and a check that cannot tell them apart is a check with no teeth. Same
+    /// argument that puts [`TaskAccounting`] here for I7.
+    pub lends: u32,
 }
 
 impl RtState {
@@ -481,14 +492,34 @@ impl RtState {
         self.permanent || self.inherited.is_some()
     }
 
-    /// Called at every `preempt`/`park`: the window is a time bound on how long
-    /// the borrowed priority may be *held*, and holding ends here.
+    /// Called at `preempt`, where the task stays runnable and goes back to a
+    /// queue: the window bounds held time, and the task is about to hold it
+    /// again, so it survives unless it has run out.
     fn expire(&mut self, now: Nanos) {
         if let Some(until) = self.inherited {
             if now >= until {
                 self.inherited = None;
             }
         }
+    }
+
+    /// Called at `park`, where the hold ends outright — this is audio spec
+    /// §9.4's "the promotion lasts until the promoted thread blocks again", and
+    /// the pre-cutover scheduler's clear-at-deschedule.
+    ///
+    /// Unconditional, and it has to be. A conditional clear leaves a lend alive
+    /// across a block taken before the window ran out, and [`RtState::arm`] then
+    /// re-arms it at the next dispatch — so a task that obtains one lend and
+    /// thereafter runs less than a quantum before blocking holds inherited RT
+    /// forever, off a single pipe interaction and with no further lend from
+    /// anyone. That is §8.5's hole reached by blocking instead of by spinning,
+    /// and invariant I9 is written to catch it (`sim::scenarios::old_park_kept_the_lend`
+    /// is the negative gate).
+    ///
+    /// Costs the audio path nothing: every wake that matters re-lends, either
+    /// through `WakeCause::boost` or at the pipe consume point.
+    fn release(&mut self) {
+        self.inherited = None;
     }
 
     /// Called at `dispatch`. A window that lapsed while the task was *queued*
@@ -499,13 +530,14 @@ impl RtState {
     /// lend existed to jump. Measured on the audio path, that demotion starved
     /// a boosted client for 93 ms behind a CPU hog.
     ///
-    /// Re-arming cannot compound into an unbounded RT hold. A boosted task is
-    /// RT, so `preempt_if_due` only preempts it at its quantum end — never
-    /// earlier — and the quantum starts at the same dispatch this arms from.
-    /// `now >= until` is therefore always true at that preempt, so the window
-    /// is cleared there and a second arm needs a *new* lend. One lend buys at
-    /// most one quantum of running time at the borrowed priority (spec §8.5,
-    /// invariant I9).
+    /// Re-arming cannot compound into an unbounded RT hold, because both ways
+    /// out of `Running` end the lend. A boosted task is RT, so `preempt_if_due`
+    /// only preempts it at its quantum end — never earlier — and that quantum
+    /// starts at the same dispatch this arms from, so `now >= until` always
+    /// holds there and [`RtState::expire`] clears it. A `park` clears it
+    /// outright, whatever the clock says. Either way a second arm needs a *new*
+    /// lend, so one lend buys at most one quantum of running time at the
+    /// borrowed priority (spec §8.5, invariant I9).
     fn arm(&mut self, now: Nanos) {
         if let Some(until) = self.inherited {
             if now >= until {
@@ -602,10 +634,14 @@ impl<X: SchedPayload> Task<X> {
     /// Lend the borrowed RT window (spec §8.5). Called by the wake path and
     /// by a client consuming already-signalled data.
     pub(crate) fn boost(&mut self, until: Nanos) {
-        self.0.rt.inherited = match self.0.rt.inherited {
-            Some(cur) if cur >= until => Some(cur),
-            _ => Some(until),
+        let extended = match self.0.rt.inherited {
+            Some(cur) if cur >= until => false,
+            _ => true,
         };
+        if extended {
+            self.0.rt.inherited = Some(until);
+            self.0.rt.lends = self.0.rt.lends.wrapping_add(1);
+        }
     }
 
     fn charge_residency(&mut self, now: Nanos, to: Residency) {
@@ -821,6 +857,7 @@ impl<X: SchedPayload> RunningTask<X> {
         ticket: &CommittedTicket<Msg<X>>,
         cpu: CpuId,
         now: Nanos,
+        #[cfg(feature = "protocol-port")] keep_lapsed_lend: bool,
     ) -> BlockedTask<X> {
         let mut task = self.0;
         assert_eq!(
@@ -830,7 +867,14 @@ impl<X: SchedPayload> RunningTask<X> {
         );
         assert_eq!(ticket.cpu(), cpu, "park with a ticket from another CPU");
         task.charge_residency(now, Residency::Running);
-        task.0.rt.expire(now);
+        #[cfg(not(feature = "protocol-port"))]
+        task.0.rt.release();
+        #[cfg(feature = "protocol-port")]
+        if keep_lapsed_lend {
+            task.0.rt.expire(now);
+        } else {
+            task.0.rt.release();
+        }
         let state = task.0.shared.state();
         assert!(
             matches!(state, TaskState::Blocked(c) | TaskState::WakeQueued(c) if c == cpu),

@@ -244,36 +244,36 @@ fn check_address_spaces(vm: &mut Vm<'_>) {
     }
 }
 
-/// I9: an inherited RT window bounds the time the borrowed priority is *held*,
-/// so a boosted task that never blocks still loses the boost — the "spinning
-/// boosted client keeps RT forever" hole (spec §8.5). Checking the *running*
-/// task is what makes this the right test after the window became arm-at-
-/// dispatch: queue time is deliberately outside the bound, so a ready task
-/// carrying a lapsed window is correct and only a running one can be over.
+/// I9: **one lend buys at most one quantum of running time at the borrowed
+/// priority** (spec §8.5).
+///
+/// That sentence is now tested directly, against `Vm::boosted_run`'s cumulative
+/// *running* residency per lend, rather than by comparing a running task's
+/// `until` to the clock. The old form could not survive `RtState::arm`: a
+/// re-armed `until` is by construction fresh, so the check passed for the same
+/// reason it stopped measuring anything — the same shape as gate A's four
+/// instrument defects, and the reason `old_park_kept_the_lend` exists as a
+/// standing negative gate rather than a comment.
+///
+/// Queue time is deliberately outside the bound (§8.5: waiting holds nothing),
+/// which is why the accumulator only advances while the task is `Running`.
 fn check_boost_windows(vm: &mut Vm<'_>) {
-    let now = vm.clock;
-    // The window may outlast its expiry by the quantum the task was already
-    // granted (spec §8.5: "≤ window + one quantum"), plus the preempt-off
-    // section that can delay the pass which would end it, plus one execution
-    // step — the granularity at which this model advances its clock, and
-    // therefore the latest a quantum timer can be observed to fire.
-    // Two steps: one for the granularity at which the quantum timer is
-    // observed to fire, one for the pass that follows it.
-    let slack = toyos_sched::fair::QUANTUM_NS + vm.max_kernel_section() + 2 * RUN_CHUNK_NS;
-    let mut problems = Vec::new();
-    for cpu in 0..vm.scenario.cpus {
-        let Some(task) = vm.cpus[cpu].running() else {
-            continue;
-        };
-        if let Some(until) = task.rt().inherited {
-            if now.since(until) > slack {
-                problems.push(format!(
-                    "I9: {:?} still holds a boost that expired at {until:?} (now {now:?})",
-                    task.key(),
-                ));
-            }
-        }
-    }
+    // One quantum is the grant. The slack on top is measurement, not licence:
+    // a preempt-off section can overrun the quantum it started inside, and the
+    // model advances the clock in chunks, so the quantum's expiry is observed
+    // one chunk late and the pass that acts on it lands a chunk after that.
+    let bound = toyos_sched::fair::QUANTUM_NS + vm.max_kernel_section() + 2 * RUN_CHUNK_NS;
+    let problems: Vec<String> = vm
+        .boosted_run
+        .iter()
+        .filter(|(_, (_, ns))| *ns > bound)
+        .map(|(key, (lends, ns))| {
+            format!(
+                "I9: {key:?} has run {ns} ns at a borrowed priority on lend #{lends} \
+                 (bound {bound} ns) — one lend must buy at most one quantum",
+            )
+        })
+        .collect();
     for problem in problems {
         vm.violate(problem);
     }

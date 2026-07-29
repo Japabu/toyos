@@ -8,7 +8,8 @@
 use toyos_sched::task::WaitClass;
 
 use crate::workload::{
-    BlockShape, IrqSpec, Op, ProcSpec, Protocol, QueueSpec, Scenario, Script, WindowShape,
+    BlockShape, IrqSpec, Op, ParkShape, ProcSpec, Protocol, QueueSpec, Scenario, Script,
+    WindowShape,
 };
 
 const MS: u64 = 1_000_000;
@@ -32,6 +33,7 @@ fn scenario(
         protocol: Protocol::New,
         block: BlockShape::CommitInPass,
         window: WindowShape::PreemptOff,
+        park: ParkShape::ReleaseLend,
         max_steps: 20_000,
         max_tasks: 32,
     }
@@ -532,6 +534,7 @@ pub fn all() -> Vec<Scenario> {
         audio_pipeline(2),
         futex_storm(),
         fork_storm(),
+        old_park_kept_the_lend(),
     ]
 }
 
@@ -539,9 +542,77 @@ pub fn all() -> Vec<Scenario> {
 pub fn by_name(name: &str) -> Option<Scenario> {
     match name {
         "old_steal_port" => Some(old_steal_port()),
+        "old_park_kept_the_lend" => Some(old_park_kept_the_lend()),
         "old_commit_before_pass" => Some(old_commit_before_pass()),
         "old_commit_fused" => Some(old_commit_fused()),
         "old_preemptible_window" => Some(old_preemptible_window()),
         _ => all().into_iter().find(|s| s.name == name),
     }
+}
+
+/// Negative gate for invariant I9: one lend, then a task that always blocks
+/// before its quantum ends.
+///
+/// The victim is woken over and over by a waker that lends **nothing** — only
+/// the very first wake carries a window. Under [`ParkShape::ReleaseLend`] that
+/// window dies at the victim's first park and the victim spends the rest of the
+/// run as a normal task. Under [`ParkShape::KeepLapsedLend`] — commit
+/// `9c2fc4d`'s park — it survives every block, `RtState::arm` re-arms it at
+/// every dispatch, and the victim runs at the borrowed priority forever off a
+/// lend nobody renewed.
+///
+/// The victim's `Run(MS)` is deliberately far below the 10 ms quantum: that is
+/// the whole point, since a task that ran a quantum would have its window
+/// cleared at the preempt and the hole needs the *park*. Twenty iterations put
+/// ~20 ms of boosted running time on one lend, comfortably past I9's bound, so
+/// the gate fires early rather than on the last step.
+pub fn old_park_kept_the_lend() -> Scenario {
+    scenario(
+        "old_park_kept_the_lend",
+        1,
+        vec![queue(WaitClass::Pipe)],
+        vec![
+            process(
+                "victim",
+                vec![0],
+                vec![Script::looping(
+                    vec![
+                        Op::Block {
+                            queue: 0,
+                            deadline: Some(20 * MS),
+                        },
+                        Op::Run(MS),
+                    ],
+                    20,
+                )],
+            ),
+            process(
+                "waker",
+                vec![0],
+                vec![Script::new(vec![
+                    // The one and only lend in the whole scenario.
+                    Op::Wake {
+                        queue: 0,
+                        all: false,
+                        boost: Some(3 * MS),
+                    },
+                ])],
+            ),
+            process(
+                "renewer",
+                vec![0],
+                vec![Script::looping(
+                    vec![
+                        Op::Run(MS),
+                        Op::Wake {
+                            queue: 0,
+                            all: false,
+                            boost: None,
+                        },
+                    ],
+                    20,
+                )],
+            ),
+        ],
+    )
 }

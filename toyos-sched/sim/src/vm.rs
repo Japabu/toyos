@@ -35,7 +35,7 @@ use crate::msg::{SimHandles, SimMsg, SimQueue};
 use crate::payload::{
     MockAddressSpace, SimCtx, SimPayload, SimPreempt, SimShareLock, SimWaitList, StdLock,
 };
-use crate::workload::{BlockShape, Op, Protocol, Scenario, Script, WindowShape};
+use crate::workload::{BlockShape, Op, ParkShape, Protocol, Scenario, Script, WindowShape};
 
 /// How finely a `Run(ns)` op is chopped. Small enough that a 10 ms quantum
 /// expires in the middle of a run — the interesting case — without making
@@ -217,6 +217,11 @@ pub struct Vm<'q> {
     /// `pre_park_claims`: this driver has no kill check of its own any more, so
     /// a clean run is only evidence about the core's if the case occurred.
     pub killed_at_park: u64,
+    /// Invariant I9's accumulator: per task, the lend counter it was last seen
+    /// with and the running time charged to it since, while boosted. Reset when
+    /// the counter moves, which is the only way to tell a fresh lend from
+    /// [`toyos_sched::task::RtState::arm`]'s re-arm from outside the core.
+    pub boosted_run: BTreeMap<TaskKey, (u32, u64)>,
 }
 
 impl<'q> Vm<'q> {
@@ -228,7 +233,9 @@ impl<'q> Vm<'q> {
         for i in 0..n {
             let (tx, rx) = mailbox();
             handles.push(CpuHandle::new(CpuId(i as u32), tx));
-            cpus.push(CpuSched::new(CpuId(i as u32), rx, SimCtx::default()));
+            let mut cpu = CpuSched::new(CpuId(i as u32), rx, SimCtx::default());
+            cpu.set_park_keeps_lapsed_lend(scenario.park == ParkShape::KeepLapsedLend);
+            cpus.push(cpu);
         }
         let procs = scenario
             .procs
@@ -273,6 +280,7 @@ impl<'q> Vm<'q> {
             ipi_due: vec![None; n],
             resched_at: vec![None; n],
             rt_pending_since: vec![None; n],
+            boosted_run: BTreeMap::new(),
             next_irq,
             next_key: 1,
             next_spawn_cpu: 0,
@@ -324,6 +332,7 @@ impl<'q> Vm<'q> {
         let rt = RtState {
             permanent: self.procs[process].rt,
             inherited: None,
+            lends: 0,
         };
         // Spawn placement: the least-loaded CPU from the published counters
         // (spec §9.4) — never a try_lock probe of a remote queue, which is
@@ -556,8 +565,17 @@ impl<'q> Vm<'q> {
             return;
         }
         for cpu in 0..self.scenario.cpus {
-            if self.cpus[cpu].running().is_some() {
-                self.busy_ns[cpu] += delta;
+            let Some(task) = self.cpus[cpu].running() else {
+                continue;
+            };
+            self.busy_ns[cpu] += delta;
+            let (key, rt) = (task.key(), task.rt());
+            let entry = self.boosted_run.entry(key).or_insert((rt.lends, 0));
+            if entry.0 != rt.lends {
+                *entry = (rt.lends, 0);
+            }
+            if rt.inherited.is_some() {
+                entry.1 += delta;
             }
         }
         self.clock = self.clock.after(delta);

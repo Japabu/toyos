@@ -166,6 +166,9 @@ pub struct CpuSched<X: SchedPayload> {
     idle_ctx: Box<X::Ctx>,
     /// What the one-shot timer is programmed to. Bookkeeping for invariant T.
     armed: Option<Nanos>,
+    /// Negative-gate escape hatch only; see [`CpuSched::set_park_keeps_lapsed_lend`].
+    #[cfg(feature = "protocol-port")]
+    park_keeps_lapsed_lend: bool,
     _not_sync: PhantomData<*mut ()>,
 }
 
@@ -191,6 +194,8 @@ impl<X: SchedPayload> CpuSched<X> {
             loaded_ctx,
             idle_ctx,
             armed: None,
+            #[cfg(feature = "protocol-port")]
+            park_keeps_lapsed_lend: false,
             _not_sync: PhantomData,
         }
     }
@@ -295,6 +300,21 @@ impl<X: SchedPayload> CpuSched<X> {
     pub fn install_stolen(&mut self, task: ReadyTask<X>) {
         let vruntime = task.share().runnable_vruntime().unwrap_or(0);
         self.rq.insert(vruntime, task);
+    }
+
+    /// Restore the park that commit `9c2fc4d` shipped: clear the borrowed
+    /// window at a park only `if now >= until`, so a lend taken and then
+    /// blocked on before it ran out survives the block. With
+    /// [`crate::task::RtState::arm`] re-arming at the next dispatch, that is a
+    /// task holding inherited RT forever off one lend — §8.5's hole reached by
+    /// blocking rather than by spinning.
+    ///
+    /// Invariant I9 is written to catch exactly this, and
+    /// `scenarios::old_park_kept_the_lend` is the negative gate that proves it
+    /// does. Like `steal_ready`, it is behind a feature the kernel does not
+    /// enable, so the broken shape is not compiled into production at all.
+    pub fn set_park_keeps_lapsed_lend(&mut self, keep: bool) {
+        self.park_keeps_lapsed_lend = keep;
     }
 }
 
@@ -711,7 +731,13 @@ impl<'c, 'e, H: Hw, P: PreemptGuard> SchedPass<'c, 'e, H, P, Undisposed> {
             .expect("dispose_block without a running task");
         let key = current.key();
         let class = ticket.class();
-        let task = current.park(&ticket, self.cpu.id, self.now);
+        let task = current.park(
+            &ticket,
+            self.cpu.id,
+            self.now,
+            #[cfg(feature = "protocol-port")]
+            self.cpu.park_keeps_lapsed_lend,
+        );
         task.share().leave_runnable(self.env.frontier);
         if let Some(at) = deadline {
             self.cpu.deadlines.insert(at, key);

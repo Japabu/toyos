@@ -139,6 +139,23 @@ pub enum WindowShape {
     Preemptible,
 }
 
+/// What a `park` does to a borrowed RT window.
+///
+/// A scenario dimension rather than a constant for the same reason
+/// [`BlockShape`] and [`WindowShape`] are: the kernel has had both answers, and
+/// the difference between them is invariant I9's whole content.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ParkShape {
+    /// Spec §8.5, and the kernel since the park was made unconditional: a block
+    /// ends the hold outright, whatever the clock says.
+    ReleaseLend,
+    /// Commit `9c2fc4d`: clear only `if now >= until`, so a lend blocked on
+    /// before it ran out survives the block and `RtState::arm` re-arms it at the
+    /// next dispatch. One lend then buys unbounded RT.
+    /// See `scenarios::old_park_kept_the_lend`.
+    KeepLapsedLend,
+}
+
 /// Which teardown/balance algorithm the VM drives the core with.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Protocol {
@@ -162,6 +179,7 @@ pub struct Scenario {
     pub protocol: Protocol,
     pub block: BlockShape,
     pub window: WindowShape,
+    pub park: ParkShape,
     /// Safety net: a run that has not quiesced by here is reported as a
     /// non-termination failure rather than looping forever.
     pub max_steps: usize,
@@ -206,6 +224,11 @@ impl Scenario {
 
     pub fn with_window(mut self, window: WindowShape) -> Self {
         self.window = window;
+        self
+    }
+
+    pub fn with_park(mut self, park: ParkShape) -> Self {
+        self.park = park;
         self
     }
 }
