@@ -293,7 +293,10 @@ struct MixStats {
     /// measurement of how fast a client's audio thread starts, scaled by
     /// however often soundd happened to wake meanwhile.
     underruns: u32,
-    /// Cycles that found the whole DMA pipeline free (§5.9).
+    /// Cycles that found the whole DMA pipeline free (§5.9) *and* could only
+    /// have got there by soundd being late. A device that retires the pipeline
+    /// faster than it plays it empties the free list without soundd having
+    /// missed anything; see the count site.
     drains: u32,
     /// Worst overshoot of a DLL prediction soundd actually armed a timer on
     /// (§5.1) — how far behind the device's period grid a mix cycle ran. Waits
@@ -553,6 +556,12 @@ fn mix_thread(
 ) {
     let device_period_samples = device_period_frames * device_channels as usize;
     let period_nanos = (device_period_frames as u64 * 1_000_000_000) / device_sample_rate as u64;
+    // The device plays one period per `period_nanos`, so the wall-clock cost of
+    // emptying the pipeline is bounded from below. Every buffer is in flight
+    // the moment the mix loop finishes submitting, and the head one is only
+    // part-played, so more than `(num_buffers - 1)` periods of audio are still
+    // unplayed at that instant. See the drain count site.
+    let min_drain_nanos = (num_buffers as u64 - 1) * period_nanos;
 
     let mut streams: Vec<ClientStream> = Vec::new();
     let mut free_mask: u32 = 0;
@@ -568,6 +577,9 @@ fn mix_thread(
         toyos::audio::audio_submit(i as u32, device_period_bytes as u32)
             .unwrap_or_else(|e| panic!("soundd: audio_submit({i}) failed: {e}"));
     }
+    // Wall clock at the last instant the pipeline was known full. Re-stamped
+    // after every refill; read only by the drain count site.
+    let mut pipeline_filled_ns = syscall::clock_nanos();
 
     syscall::set_rt_priority(true);
 
@@ -727,13 +739,41 @@ fn mix_thread(
         // silence would cost `num_buffers` periods of audible dropout for any
         // stall, however brief, and delay that client audio by the same
         // amount. Recovery costs only the periods the clients cannot cover.
+        //
+        // Counting it is a narrower question than detecting it, and the two
+        // were the same test until it turned out that a full free list has a
+        // second cause. `drains` exists to say "soundd was late enough that the
+        // device ran out of audio", so a free list soundd cannot have caused
+        // must not raise it. Two ways to arrive at one without being late:
+        //
+        // The idle path (§5.8) empties the pipeline *by design* — it arms no
+        // timer and sleeps until the hardware has nothing left, so a drain seen
+        // on the wake that admits the first client is an idle-phase event that
+        // merely got reported inside the streaming window, exactly the shape
+        // `underruns` had. That is the one wake with `was_streaming` false —
+        // soundd names a wake time on every other one, so requiring it costs
+        // no coverage of the streaming phase.
+        //
+        // The device retiring faster than it plays. For ~50ms after a stream
+        // starts, QEMU hands back the whole 23.2ms pipeline every 5-7ms as its
+        // backend catches up from the idle sawtooth. soundd is woken *early*
+        // by those completions and still sees a full free list. The floor
+        // rejects that arithmetically rather than by timing: unplayed audio at
+        // the last refill exceeded `min_drain_nanos`, so no device playing at
+        // its own rate can present an empty pipeline sooner, and one that does
+        // consumed more audio than the elapsed wall clock contains. Nothing
+        // genuine is suppressed — the bound is necessary for a real drain, not
+        // sufficient — and a mid-stream drain still counts at any point in the
+        // stream, because what it keys on is cause and not time since connect.
         if free_mask.count_ones() as usize == num_buffers {
-            if !streams.is_empty() {
+            let since_filled = syscall::clock_nanos().saturating_sub(pipeline_filled_ns);
+            if was_streaming && since_filled >= min_drain_nanos {
                 stats.drains += 1;
             }
             dll.reset();
         }
 
+        let refilled = free_mask != 0;
         while free_mask != 0 {
             let idx = free_mask.trailing_zeros() as usize;
             assert!(idx < num_buffers, "soundd: completion for nonexistent buffer {idx}");
@@ -770,6 +810,12 @@ fn mix_thread(
                 stats.submitted += 1;
                 if any_streaming && !any_data { stats.underruns += 1; }
             }
+        }
+        // Every buffer is in flight again. Not re-stamped when nothing was
+        // refilled: no audio was added, so the pipeline's remaining depth is
+        // still measured from the previous fill.
+        if refilled {
+            pipeline_filled_ns = syscall::clock_nanos();
         }
 
         // Disconnected clients leave only after their ramp-down finishes;
