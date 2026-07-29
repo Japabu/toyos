@@ -22,10 +22,12 @@ use toyos_sched::msg::Msg;
 use toyos_sched::retire;
 use toyos_sched::sync::Arc;
 use toyos_sched::task::{
-    ReadyTask, RtState, TaskAccounting, TaskBuilder, TaskKey, TaskShared, WaitClass, WakeCause,
-    WakeReason,
+    ReadyTask, RtState, TaskAccounting, TaskBuilder, TaskKey, TaskShared, TaskState, WaitClass,
+    WakeCause, WakeReason,
 };
-use toyos_sched::waitq::{Cancelled, Commit, CommittedTicket, Registration, WaitList, WaitQueue};
+use toyos_sched::waitq::{
+    Cancelled, Commit, CommittedTicket, Registration, WaitList, WaitQueue, WaitTicket,
+};
 
 use crate::choice::ChoiceStream;
 use crate::hw_impl::SimHw;
@@ -33,7 +35,7 @@ use crate::msg::{SimHandles, SimMsg, SimQueue};
 use crate::payload::{
     MockAddressSpace, SimCtx, SimPayload, SimPreempt, SimShareLock, SimWaitList, StdLock,
 };
-use crate::workload::{Op, Protocol, Scenario, Script};
+use crate::workload::{BlockShape, Op, Protocol, Scenario, Script};
 
 /// How finely a `Run(ns)` op is chopped. Small enough that a 10 ms quantum
 /// expires in the middle of a run — the interesting case — without making
@@ -101,11 +103,39 @@ pub struct Program {
     pub run_left: u64,
 }
 
+/// A block that has done phase 1 and owes phase 2 (spec §8.1).
+///
+/// It is held *between* two steps, which is the whole point: the wait is
+/// registered, the task is still running, and every other CPU in the system
+/// can take a step before the blocking pass happens. That is the window the
+/// kernel's lost wake lived in, and it exists only because the two halves are
+/// two steps.
+pub enum BlockPhase<'q> {
+    /// The ticket is registered and uncommitted; the commit CAS belongs to the
+    /// pass (spec §8.1, kernel since `8508b37`).
+    Registered(WaitTicket<'q, SimMsg, SimWaitList>),
+    /// The commit already ran at the call site (pre-`8508b37`): the word reads
+    /// `Blocked` while the task is still `CpuSched.running`.
+    Committed(CommittedTicket<SimMsg>),
+}
+
+/// A block in progress on one CPU.
+pub struct Blocking<'q> {
+    pub key: TaskKey,
+    pub queue: usize,
+    pub deadline: Option<Nanos>,
+    pub phase: BlockPhase<'q>,
+}
+
 /// One step of the enabled-step relation (spec §10.2).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Step {
     /// Advance the task running on this CPU by one op (or one run chunk).
     Exec(usize),
+    /// Phase 2 of a block: the pass that commits the ticket and parks. A step
+    /// of its own so that the interval between a wait's registration and its
+    /// park is an interval other CPUs can act in.
+    BlockPass(usize),
     /// An involuntary scheduler pass: IRQ exit with `need_resched`, or the
     /// idle loop.
     Pass(usize),
@@ -142,6 +172,8 @@ pub struct Vm<'q> {
     /// Registrations held across a block, exactly where a kernel blocking
     /// site holds them: on the waiting task's own stack.
     pub registrations: BTreeMap<TaskKey, Registration<'q, SimMsg, SimWaitList>>,
+    /// Per CPU: a block that has registered and not yet parked.
+    pub blocking: Vec<Option<Blocking<'q>>>,
     /// OLD protocol only: the unlocked transit slot.
     pub transit: Vec<Option<ReadyTask<SimPayload>>>,
     pub clock: Nanos,
@@ -164,6 +196,10 @@ pub struct Vm<'q> {
     pub finalized: Vec<(TaskKey, TaskAccounting)>,
     pub violations: Vec<String>,
     pub steps: usize,
+    /// How many parks published `Blocked` and had it claimed before the park
+    /// itself ran — spec §8.1's residual window, and the only thing that
+    /// exercises `RunningTask::park`'s `WakeQueued` arm.
+    pub pre_park_claims: u64,
 }
 
 impl<'q> Vm<'q> {
@@ -213,6 +249,7 @@ impl<'q> Vm<'q> {
             live: BTreeSet::new(),
             shared: BTreeMap::new(),
             registrations: BTreeMap::new(),
+            blocking: (0..n).map(|_| None).collect(),
             transit: (0..n).map(|_| None).collect(),
             clock: Nanos::ZERO,
             busy_ns: vec![0; n],
@@ -225,6 +262,7 @@ impl<'q> Vm<'q> {
             finalized: Vec::new(),
             violations: Vec::new(),
             steps: 0,
+            pre_park_claims: 0,
             scenario,
         };
         for (index, spec) in vm.scenario.procs.clone().iter().enumerate() {
@@ -365,6 +403,14 @@ impl<'q> Vm<'q> {
             if halted[cpu] {
                 continue;
             }
+            // Mid-block: the task has registered on a wait queue and owes the
+            // pass that parks it. It cannot run another op, and the model does
+            // not offer it an involuntary pass — see `block_pass`, which
+            // records why and what that costs.
+            if self.blocking[cpu].is_some() {
+                steps.push(Step::BlockPass(cpu));
+                continue;
+            }
             if self.cpus[cpu].running().is_some() && !need_resched[cpu] && !delivery_owed {
                 steps.push(Step::Exec(cpu));
             }
@@ -442,7 +488,10 @@ impl<'q> Vm<'q> {
     fn execute_inner(&mut self, step: Step, choices: &mut ChoiceStream) {
         match step {
             Step::Exec(cpu) => self.exec_op(cpu, choices),
-            Step::Pass(cpu) => self.run_pass(cpu, Dispose::None),
+            Step::BlockPass(cpu) => self.block_pass(cpu, choices),
+            Step::Pass(cpu) => {
+                self.run_pass(cpu, Dispose::None);
+            }
             Step::DeliverIpi(cpu) => {
                 self.hw.with(|s| {
                     s.pending_ipi[cpu] -= 1;
@@ -518,7 +567,11 @@ impl<'q> Vm<'q> {
 
     // ------------------------------------------------------------ the pass
 
-    fn run_pass(&mut self, cpu: usize, dispose: Dispose) {
+    /// Run one pass. The returned bool is only meaningful for
+    /// [`Dispose::Commit`], where `false` says phase 2's CAS lost — a wake
+    /// landed between the registration and the commit, so the task did not
+    /// park and its wait is satisfied (spec §8.1).
+    fn run_pass(&mut self, cpu: usize, dispose: Dispose<'q>) -> bool {
         let now = self.clock;
         let kicks_before = self.hw.with(|s| {
             s.need_resched[cpu] = false;
@@ -526,7 +579,11 @@ impl<'q> Vm<'q> {
             s.kicks
         });
         self.hw.enter_pass(CpuId(cpu as u32), now);
-        let action = {
+        // Copied out before the borrow: the injection below runs while the
+        // pass holds `CpuSched`, and these are the only fields it needs.
+        let queues = self.queues;
+        let mut injected = None;
+        let (action, parked) = {
             let Vm {
                 cpus,
                 hw,
@@ -542,17 +599,74 @@ impl<'q> Vm<'q> {
                 steal: true,
             };
             let pass = SchedPass::begin(&mut cpus[cpu], env, now);
-            let disposed = match dispose {
-                Dispose::None => pass.dispose_none(),
-                Dispose::Yield => pass.dispose_yield(),
-                Dispose::Exit => pass.dispose_exit(),
-                Dispose::Block(ticket, deadline) => pass.dispose_block(ticket, deadline),
-            };
-            disposed.finish()
+            match dispose {
+                Dispose::None => (pass.dispose_none().finish(), None),
+                Dispose::Yield => (pass.dispose_yield().finish(), None),
+                Dispose::Exit => (pass.dispose_exit().finish(), None),
+                Dispose::Block(ticket, deadline) => {
+                    (pass.dispose_block(ticket, deadline).finish(), None)
+                }
+                // Phase 2 inside the pass, after `begin`'s drain (spec §8.1).
+                // Committing here puts every claim on one side of the drain or
+                // the other: an earlier one finds `Committing` and posts no
+                // message, so this CAS observes it; a later one's message
+                // arrives behind the drain and the next pass finds the task
+                // parked.
+                Dispose::Commit(ticket, deadline, after) => match ticket.commit() {
+                    Commit::Parked(committed, registration) => {
+                        let key = committed.shared().key();
+                        // The residual window the fix names and cannot close:
+                        // a waker may claim the task in the instructions
+                        // between the commit publishing `Blocked` and the park
+                        // itself. Its `Msg::Wake` lands *behind* this pass's
+                        // drain, so the next pass finds the task parked and
+                        // delivers it — which is the entire reason
+                        // `RunningTask::park` accepts `WakeQueued`. It is
+                        // injected here rather than reached by a step boundary
+                        // because `SchedPass` borrows `CpuSched` and cannot be
+                        // held across one; without it that arm is dead code in
+                        // every simulator run.
+                        if let Some(hoisted) = after {
+                            wake(
+                                queues,
+                                now,
+                                handles,
+                                hw,
+                                hoisted.queue,
+                                hoisted.all,
+                                hoisted.boost,
+                            );
+                            injected = Some(hoisted.key);
+                        }
+                        (
+                            pass.dispose_block(committed, deadline).finish(),
+                            Some((key, registration)),
+                        )
+                    }
+                    // Do not park, do not switch. The pass still runs to a
+                    // disposition, because the quantum may have expired while
+                    // the decision was being made.
+                    Commit::AlreadyWoken => (pass.dispose_none().finish(), None),
+                },
+            }
         };
+        let did_park = parked.is_some();
+        if let Some((key, registration)) = parked {
+            self.registrations.insert(key, registration);
+            // Did the injected wake claim *this* task before its park ran?
+            // Counted rather than argued: the arm it exercises was dead code in
+            // every run this simulator had ever made.
+            if injected.is_some() && matches!(self.shared[&key].state(), TaskState::WakeQueued(_)) {
+                self.pre_park_claims += 1;
+            }
+        }
+        if let Some(key) = injected {
+            self.programs.get_mut(&key).expect("live").pc += 1;
+        }
         self.apply(action);
         self.hw.leave_pass();
         self.note_kicks(kicks_before);
+        did_park
     }
 
     #[allow(unsafe_code)] // `Hw::switch` is an unsafe fn; SimHw's body derefs nothing
@@ -641,26 +755,16 @@ impl<'q> Vm<'q> {
     }
 
     fn do_wake(&mut self, queue: usize, all: bool, boost: Option<u64>) {
-        let queues = self.queues;
-        let q = &queues[queue];
-        let tokens = if all { q.queue.len().max(1) as u32 } else { 1 };
-        q.tokens.set(q.tokens.get() + tokens);
-        let cause = match boost {
-            Some(ns) => {
-                let until = self.clock.after(ns);
-                q.boost_until.set(Some(until));
-                WakeCause::boosted(WakeReason::Woken, until)
-            }
-            None => WakeCause::new(WakeReason::Woken),
-        };
         let before = self.hw.with(|s| s.kicks);
-        if all {
-            q.queue
-                .wake_all(cause, &self.handles, &self.hw, &SimPreempt);
-        } else {
-            q.queue
-                .wake_one(cause, &self.handles, &self.hw, &SimPreempt);
-        }
+        wake(
+            self.queues,
+            self.clock,
+            &self.handles,
+            &self.hw,
+            queue,
+            all,
+            boost,
+        );
         self.note_kicks(before);
     }
 
@@ -718,6 +822,8 @@ impl<'q> Vm<'q> {
             self.interfere(cpu, queue);
         }
 
+        // The re-check, at the call site where the kernel has it: register,
+        // re-check, park.
         let q = &queues[queue];
         if q.tokens.get() > 0 {
             match ticket.cancel() {
@@ -733,22 +839,114 @@ impl<'q> Vm<'q> {
             return;
         }
 
-        match ticket.commit() {
-            Commit::Parked(committed, registration) => {
-                self.registrations.insert(key, registration);
-                let at = deadline.map(|ns| self.clock.after(ns));
-                self.run_pass(cpu, Dispose::Block(committed, at));
-            }
-            // A wake landed between registration and commit: do not park, do
-            // not switch. The condition is satisfied.
-            Commit::AlreadyWoken => {
-                let q = &queues[queue];
-                if q.tokens.get() > 0 {
-                    q.tokens.set(q.tokens.get() - 1);
+        let deadline = deadline.map(|ns| self.clock.after(ns));
+        let phase = match self.scenario.block {
+            BlockShape::CommitInPass => BlockPhase::Registered(ticket),
+            BlockShape::CommitAtCallSite | BlockShape::CommitAtCallSiteFused => {
+                match ticket.commit() {
+                    Commit::Parked(committed, registration) => {
+                        self.registrations.insert(key, registration);
+                        BlockPhase::Committed(committed)
+                    }
+                    // A wake landed between registration and commit: do not
+                    // park, do not switch. The condition is satisfied.
+                    Commit::AlreadyWoken => {
+                        let q = &queues[queue];
+                        if q.tokens.get() > 0 {
+                            q.tokens.set(q.tokens.get() - 1);
+                        }
+                        self.programs.get_mut(&key).expect("live").pc += 1;
+                        return;
+                    }
                 }
-                self.programs.get_mut(&key).expect("live").pc += 1;
             }
+        };
+        self.blocking[cpu] = Some(Blocking {
+            key,
+            queue,
+            deadline,
+            phase,
+        });
+        // The fused shape is the simulator's own pre-split behaviour: the pass
+        // runs in the *same* step, so no other CPU can act between the two
+        // halves and the window is outside the step relation entirely.
+        if self.scenario.block == BlockShape::CommitAtCallSiteFused {
+            self.block_pass(cpu, choices);
         }
+    }
+
+    /// Phase 2 of the wait handshake, as a step of its own.
+    ///
+    /// Splitting it out is the whole point: the kernel takes two steps here —
+    /// the call site that registers and re-checks, and the pass that drains,
+    /// commits and parks — and a remote CPU is free to claim the waiter
+    /// between them. Fusing them, as this model used to, put that interval
+    /// outside the step relation, which is why the simulator certified a
+    /// protocol whose lost wake it could not execute (commit `8508b37`).
+    ///
+    /// One interval is still modelled as unreachable: the kernel runs the call
+    /// site with preemption *enabled*, so an involuntary pass can land on a
+    /// task whose word already reads `Committing`. `Step::Pass` is not offered
+    /// here, because `RunningTask::preempt` asserts on `Running` and would
+    /// abort the run rather than report a violation. See the audit note in
+    /// CLAUDE.md — closing it is a protocol change, not a harness one.
+    fn block_pass(&mut self, cpu: usize, choices: &mut ChoiceStream) {
+        let Blocking {
+            key,
+            queue,
+            deadline,
+            phase,
+        } = self.blocking[cpu]
+            .take()
+            .expect("a block pass with no block in progress");
+
+        let parked = match phase {
+            // The safe point, the same one `exec_op` applies before every op
+            // (spec §7.6): a killed thread dies instead of parking. It is
+            // repeated here because splitting one op into two steps must not
+            // change what the model asserts about the workload — with the
+            // halves separated, a `Retire` can now land between them.
+            //
+            // The kernel has no equivalent check, and that is a real hole
+            // rather than a modelling detail: `pass_block`'s drain finds the
+            // thread still `running`, answers `need_resched` and *drops* the
+            // retire, then parks it — and a parked task is never picked, so
+            // nothing ever reaps it. Deleting this arm reproduces it in ~33 of
+            // 400 seeds on `crash_md_exit_race`. Audit note in CLAUDE.md.
+            BlockPhase::Registered(ticket) if self.shared[&key].kill_pending() => {
+                ticket.cancel();
+                self.finish_task(cpu, key);
+                return;
+            }
+            BlockPhase::Registered(ticket) => {
+                // The commit and the park are one step here — a `SchedPass`
+                // borrows `CpuSched` and cannot be held across a step boundary
+                // — so the interval between them is reached by injection
+                // rather than by interleaving. `run_pass` explains what lives
+                // there and why the arm it exercises would otherwise be dead.
+                let after = (choices.choose(2) == 1)
+                    .then(|| self.hoist_wake(cpu, queue))
+                    .flatten();
+                self.run_pass(cpu, Dispose::Commit(ticket, deadline, after))
+            }
+            // A ticket committed at the call site has already published
+            // `Blocked`; there is no route back to `Running`, which is one more
+            // thing wrong with committing there.
+            BlockPhase::Committed(ticket) => {
+                self.run_pass(cpu, Dispose::Block(ticket, deadline));
+                true
+            }
+        };
+        if parked {
+            return;
+        }
+        // Phase 2 declined to park: the waker that claimed the ticket left a
+        // token behind, and the script moves on.
+        let q = &self.queues[queue];
+        if q.tokens.get() > 0 {
+            q.tokens.set(q.tokens.get() - 1);
+        }
+        self.programs.get_mut(&key).expect("live").pc += 1;
     }
 
     /// The consume-side half of priority inheritance: a client that was
@@ -764,11 +962,10 @@ impl<'q> Vm<'q> {
         }
     }
 
-    /// One interfering wake from another CPU, chosen from the tasks that were
-    /// about to perform one anyway. Bounded and non-blocking, so it cannot
-    /// recurse into another registration window.
-    fn interfere(&mut self, blocking_cpu: usize, queue: usize) {
-        let mut candidate = None;
+    /// Find a task on another CPU whose very next op is a wake on `queue` —
+    /// one that was going to happen anyway, so issuing it early perturbs the
+    /// *timing* of the workload and not its token accounting.
+    fn hoist_wake(&self, blocking_cpu: usize, queue: usize) -> Option<HoistedWake> {
         for cpu in 0..self.scenario.cpus {
             if cpu == blocking_cpu {
                 continue;
@@ -787,16 +984,27 @@ impl<'q> Vm<'q> {
             }) = script.ops.get(program.pc).copied()
             {
                 if q == queue {
-                    candidate = Some((key, all, boost));
-                    break;
+                    return Some(HoistedWake {
+                        key,
+                        queue,
+                        all,
+                        boost,
+                    });
                 }
             }
         }
-        let Some((key, all, boost)) = candidate else {
+        None
+    }
+
+    /// One interfering wake from another CPU, issued in the window between a
+    /// wait's registration and its commit. Bounded and non-blocking, so it
+    /// cannot recurse into another registration window.
+    fn interfere(&mut self, blocking_cpu: usize, queue: usize) {
+        let Some(hoisted) = self.hoist_wake(blocking_cpu, queue) else {
             return;
         };
-        self.do_wake(queue, all, boost);
-        self.programs.get_mut(&key).expect("live").pc += 1;
+        self.do_wake(hoisted.queue, hoisted.all, hoisted.boost);
+        self.programs.get_mut(&hoisted.key).expect("live").pc += 1;
     }
 
     fn finish_task(&mut self, cpu: usize, key: TaskKey) {
@@ -944,11 +1152,64 @@ impl<'q> Vm<'q> {
     }
 }
 
-/// How a pass is disposed. One helper covers all four, so the borrow dance
+/// Make a queue's condition true and wake its waiters.
+///
+/// A free function rather than a method because one caller — the injection
+/// that reaches the window *inside* the blocking pass — runs while `CpuSched`
+/// is mutably borrowed by that pass and can only hand over the fields a wake
+/// actually needs.
+fn wake(
+    queues: &[QueueState],
+    now: Nanos,
+    handles: &SimHandles,
+    hw: &SimHw,
+    queue: usize,
+    all: bool,
+    boost: Option<u64>,
+) {
+    let q = &queues[queue];
+    let tokens = if all { q.queue.len().max(1) as u32 } else { 1 };
+    q.tokens.set(q.tokens.get() + tokens);
+    let cause = match boost {
+        Some(ns) => {
+            let until = now.after(ns);
+            q.boost_until.set(Some(until));
+            WakeCause::boosted(WakeReason::Woken, until)
+        }
+        None => WakeCause::new(WakeReason::Woken),
+    };
+    if all {
+        q.queue.wake_all(cause, handles, hw, &SimPreempt);
+    } else {
+        q.queue.wake_one(cause, handles, hw, &SimPreempt);
+    }
+}
+
+/// A wake some other CPU's task was about to perform, lifted out of its script
+/// so it can be issued at a point the ordinary `Exec` step cannot reach.
+#[derive(Clone, Copy)]
+pub struct HoistedWake {
+    /// Whose script it came from; its program counter advances once it runs.
+    pub key: TaskKey,
+    pub queue: usize,
+    pub all: bool,
+    pub boost: Option<u64>,
+}
+
+/// How a pass is disposed. One helper covers all of them, so the borrow dance
 /// that hands `CpuSched` to the pass exists once.
-pub enum Dispose {
+pub enum Dispose<'q> {
     None,
     Yield,
     Exit,
+    /// Park with a ticket that was committed before the pass was entered.
     Block(CommittedTicket<SimMsg>, Option<Nanos>),
+    /// Commit *inside* the pass, after its drain, and park with the result —
+    /// spec §8.1's phase 2. The optional wake is issued between the commit and
+    /// the park; see [`Vm::run_pass`].
+    Commit(
+        WaitTicket<'q, SimMsg, SimWaitList>,
+        Option<Nanos>,
+        Option<HoistedWake>,
+    ),
 }

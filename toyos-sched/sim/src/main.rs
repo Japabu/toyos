@@ -17,7 +17,8 @@ usage: toyos-sched-sim <command> [args]
   sweep [seeds]                seed sweep over every scenario (default 10000)
   fuzz-sweep [steps]           fuzz-byte sweep per scenario (default 10000000)
   gate [seeds]                 the Stage 4 exit criterion, including the
-                               negative old_steal_port gate
+                               negative old_steal_port and
+                               old_commit_before_pass gates
   shrink <scenario> <seed> [pct]
                                minimize a failing seed into a corpus trace
   replay <file>                replay a committed corpus trace
@@ -35,7 +36,9 @@ fn main() -> ExitCode {
             for scenario in scenarios::all() {
                 println!("{}", scenario.name);
             }
-            println!("old_steal_port  (negative gate: must fail)");
+            println!("old_steal_port          (negative gate: must fail)");
+            println!("old_commit_before_pass  (negative gate: must fail)");
+            println!("old_commit_fused        (control: passes, and that is the point)");
             ExitCode::SUCCESS
         }
         "run" | "pct" => {
@@ -87,23 +90,41 @@ fn main() -> ExitCode {
                 clean &= result.passed();
             }
             if cmd == "gate" {
-                // The negative gate needs far fewer schedules than the
-                // positive sweep: it only has to be caught, not proven absent.
-                let negative = sweep::seed_sweep(&scenarios::old_steal_port(), budget.min(500), 1);
-                let found = !negative.passed();
+                // The negative gates need far fewer schedules than the
+                // positive sweep: they only have to be caught, not proven
+                // absent.
+                for negative in [scenarios::old_steal_port(), scenarios::old_commit_before_pass()] {
+                    let name = negative.name;
+                    let result = sweep::seed_sweep(&negative, budget.min(500), 1);
+                    let found = !result.passed();
+                    println!(
+                        "{name}: {} runs, {}",
+                        result.runs,
+                        if found {
+                            "caught (as required)"
+                        } else {
+                            "NOT CAUGHT — the harness proves nothing"
+                        },
+                    );
+                    if let Some(first) = result.failures.first() {
+                        println!("  {}", first.violations.join("\n  "));
+                    }
+                    clean &= found;
+                }
+                // And the control: the same shape with the block's two halves
+                // fused into one step must come back *clean*, because that is
+                // the blind spot this harness used to have.
+                let control = sweep::seed_sweep(&scenarios::old_commit_fused(), budget.min(500), 1);
                 println!(
-                    "old_steal_port: {} runs, {}",
-                    negative.runs,
-                    if found {
-                        "caught (as required)"
+                    "old_commit_fused: {} runs, {}",
+                    control.runs,
+                    if control.passed() {
+                        "clean (the control: no step boundary, no bug in sight)"
                     } else {
-                        "NOT CAUGHT — the harness proves nothing"
+                        "FAILED — the control no longer controls for anything"
                     },
                 );
-                if let Some(first) = negative.failures.first() {
-                    println!("  {}", first.violations.join("\n  "));
-                }
-                clean &= found;
+                clean &= control.passed();
             }
             ok(clean)
         }

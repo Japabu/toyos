@@ -5,14 +5,32 @@
 //! be evaluated exactly. Shrinking a nondeterministic repro means re-running
 //! it until it fails again; shrinking this one means running it once.
 
+use std::collections::BTreeSet;
+
 use crate::choice::ChoiceStream;
 use crate::explore::{run, Outcome};
 use crate::workload::Scenario;
 
-/// Does this decision list still reproduce a failure?
-fn fails(scenario: &Scenario, decisions: &[usize]) -> bool {
+/// The invariant identifiers a decision list violates (`I1`, `I8`, …), or
+/// `None` if it passes.
+///
+/// Shrinking must preserve this set. A candidate that fails *differently* is a
+/// different bug, and accepting it silently replaces the regression the trace
+/// was cut for — which is exactly what happened to `old_steal_port_i1.trace`
+/// when the step relation changed underneath it and the minimum became an I8.
+fn kinds(scenario: &Scenario, decisions: &[usize]) -> Option<BTreeSet<String>> {
     let mut choices = ChoiceStream::replay(decisions.to_vec());
-    !run(scenario.clone(), &mut choices).passed()
+    let outcome = run(scenario.clone(), &mut choices);
+    if outcome.passed() {
+        return None;
+    }
+    Some(
+        outcome
+            .violations
+            .iter()
+            .map(|v| v.split(':').next().unwrap_or("?").to_string())
+            .collect(),
+    )
 }
 
 /// Shrink a failing decision list to a local minimum: repeatedly try deleting
@@ -22,23 +40,21 @@ fn fails(scenario: &Scenario, decisions: &[usize]) -> bool {
 /// after N decisions rarely needs the tail, and dropping it turns a
 /// thousand-step trace into a readable one.
 pub fn shrink(scenario: &Scenario, decisions: Vec<usize>) -> Vec<usize> {
-    assert!(
-        fails(scenario, &decisions),
-        "shrink: the input trace does not fail",
-    );
+    let target = kinds(scenario, &decisions).expect("shrink: the input trace does not fail");
+    let fails = |decisions: &[usize]| kinds(scenario, decisions).as_ref() == Some(&target);
     let mut best = decisions;
 
     // Binary-search the shortest failing prefix.
     let (mut low, mut high) = (0usize, best.len());
     while low < high {
         let mid = (low + high) / 2;
-        if fails(scenario, &best[..mid]) {
+        if fails(&best[..mid]) {
             high = mid;
         } else {
             low = mid + 1;
         }
     }
-    if low < best.len() && fails(scenario, &best[..low]) {
+    if low < best.len() && fails(&best[..low]) {
         best.truncate(low);
     }
 
@@ -49,7 +65,7 @@ pub fn shrink(scenario: &Scenario, decisions: Vec<usize>) -> Vec<usize> {
             let end = (index + chunk).min(best.len());
             let mut candidate = best.clone();
             candidate.drain(index..end);
-            if fails(scenario, &candidate) {
+            if fails(&candidate) {
                 best = candidate;
             } else {
                 index += chunk;

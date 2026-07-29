@@ -62,9 +62,21 @@ fn check_single_ownership(vm: &mut Vm<'_>) {
                 | (Container::Ready, TaskState::Ready(c))
                 | (Container::Parked, TaskState::Blocked(c))
                 | (Container::Parked, TaskState::WakeQueued(c)) => c.0 as usize == cpu,
-                // A running task that has registered on a wait queue but not
-                // yet committed is still the running value (spec §8.1).
-                (Container::Running, TaskState::Committing(c, _)) => c.0 as usize == cpu,
+                // A task that has registered on a wait queue and not yet parked
+                // is still the running value (spec §8.1). Exactly two words are
+                // legal there: `Committing`, while its own commit is still
+                // owed, and `WakeQueued`, once a remote claim has taken it
+                // pre-park — §8.2's `Claim::PrePark`, which posts no message
+                // precisely because the waiter has not parked. Both are legal
+                // *only* inside that window, which is why this consults the
+                // CPU's pending block instead of accepting the words outright:
+                // a word that says the task is blocked while its CPU still runs
+                // it is otherwise exactly the single-ownership break the
+                // pre-`8508b37` blocking shape had.
+                (Container::Running, TaskState::Committing(c, _))
+                | (Container::Running, TaskState::WakeQueued(c)) => {
+                    c.0 as usize == cpu && vm.blocking[cpu].is_some()
+                }
                 (Container::Zombie, TaskState::Dead) => true,
                 _ => false,
             };
@@ -274,7 +286,16 @@ pub fn check_final(vm: &mut Vm<'_>) {
         let stuck: Vec<String> = vm
             .live
             .iter()
-            .map(|key| format!("{key:?}={:?}", vm.shared[key].state()))
+            .map(|key| {
+                let state = vm.shared[key].state();
+                // The kill bit is the discriminator between a lost wake and a
+                // lost retire — two different bugs with one symptom.
+                if vm.shared[key].kill_pending() {
+                    format!("{key:?}={state:?} killed")
+                } else {
+                    format!("{key:?}={state:?}")
+                }
+            })
             .collect();
         problems.push(format!(
             "I10: the run quiesced with {} task(s) never finalized: {}",

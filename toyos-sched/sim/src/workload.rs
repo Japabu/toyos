@@ -91,6 +91,33 @@ pub struct IrqSpec {
     pub boost_ns: Option<u64>,
 }
 
+/// Where phase 2 of the §8.1 handshake — the `Committing(gen) → Blocked` CAS —
+/// runs relative to the blocking pass.
+///
+/// This is a scenario dimension rather than a constant because the kernel has
+/// had two of these answers, and the difference between them was a real lost
+/// wake (commit `8508b37`). The VM makes the *step boundary* the thing that
+/// moves: a remote CPU can act between two steps and cannot act inside one, so
+/// which side of the boundary the commit falls on is exactly what decides
+/// whether the window is reachable.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BlockShape {
+    /// Spec §8.1, and the kernel since `8508b37`: the commit runs inside the
+    /// pass, after its mailbox drain. Every claim then lands on one side of
+    /// the drain or the other.
+    CommitInPass,
+    /// The kernel before `8508b37`: the commit runs at the call site, so the
+    /// task's word reads `Blocked` while it is still the running task and its
+    /// own CPU has not yet drained. See `scenarios::old_commit_before_pass`.
+    CommitAtCallSite,
+    /// `CommitAtCallSite` with the call site and the pass **fused into one
+    /// step** — the *simulator's* own shape until the split. Nothing can
+    /// interleave, so the window is outside the step relation and the bug is
+    /// invisible. It exists so that the harness's blind spot is a test rather
+    /// than a comment (`blind_spot_needed_the_step_split`).
+    CommitAtCallSiteFused,
+}
+
 /// Which teardown/balance algorithm the VM drives the core with.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Protocol {
@@ -112,6 +139,7 @@ pub struct Scenario {
     pub procs: Vec<ProcSpec>,
     pub irqs: Vec<IrqSpec>,
     pub protocol: Protocol,
+    pub block: BlockShape,
     /// Safety net: a run that has not quiesced by here is reported as a
     /// non-termination failure rather than looping forever.
     pub max_steps: usize,
@@ -146,6 +174,11 @@ impl Scenario {
 
     pub fn with_cpus(mut self, cpus: usize) -> Self {
         self.cpus = cpus;
+        self
+    }
+
+    pub fn with_block(mut self, block: BlockShape) -> Self {
+        self.block = block;
         self
     }
 }

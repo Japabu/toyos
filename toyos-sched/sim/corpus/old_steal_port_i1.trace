@@ -1,3 +1,5 @@
 # scenario: old_steal_port
 # expect: fail
-1 1 0 0 1 0 2 
+# note: re-shrunk after the block became two steps (registration, then the pass
+# that commits and parks), which renumbers every decision.
+1 2

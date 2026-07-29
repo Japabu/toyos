@@ -16,6 +16,7 @@ use crate::workload::Scenario;
 pub fn actor(step: &Step) -> Option<usize> {
     match step {
         Step::Exec(cpu)
+        | Step::BlockPass(cpu)
         | Step::Pass(cpu)
         | Step::DeliverIpi(cpu)
         | Step::FireTimer(cpu)
@@ -35,6 +36,10 @@ pub struct Outcome {
     pub elapsed: u64,
     pub switches: u64,
     pub kicks: u64,
+    /// Parks that had their `Blocked` word claimed before the park itself ran
+    /// (spec §8.1's residual window). Reported so a test can assert the window
+    /// was actually executed rather than merely reasoned about.
+    pub pre_park_claims: u64,
 }
 
 impl Outcome {
@@ -102,6 +107,7 @@ pub fn run(scenario: Scenario, choices: &mut ChoiceStream) -> Outcome {
         elapsed: vm.clock.0,
         switches,
         kicks,
+        pre_park_claims: vm.pre_park_claims,
     };
 
     if !outcome.passed() {
