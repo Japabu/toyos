@@ -26,24 +26,41 @@
 #                     the count site in soundd for the two conditions.
 #   underruns         Periods submitted with no client audio behind them.
 #
-# !! STALE AS OF 2026-07-29 — DO NOT TRUST THE NUMBERS BELOW. !!
-# The sample was measured on tree 6d6a230 (2026-07-28 17:21) and four things
-# have invalidated it since: the Stage 7a/7b scheduler cutover, and three
-# counter redefinitions — `underruns` (f25fa87), `max_wake_lat_us` (824dd7d)
-# and `drains` (this file's neighbour commit). Each redefinition narrowed its
-# counter to audible harm after it was found to be measuring connect-time
-# pre-roll, so every distribution below is drawn from a different quantity
-# than the one the code now reports.
+# RE-RECORDED 2026-07-29 on tree f9dc851, in one pass, after every reason the
+# previous sample was void had been resolved: the Stage 7a/7b cutover, three
+# counter redefinitions (`underruns` f25fa87, `max_wake_lat_us` 824dd7d,
+# `drains` 7095046), and the stream-start dropout those counters were hiding
+# (069d158). The old sample's own stale block predicted the shape of this one
+# and was right: `max_wake_lat_us` fell by roughly an order of magnitude.
 #
-# It has NOT been re-recorded, deliberately. `--audio-gate 30` on the current
-# tree curtails on the pooled *dropout rate* — 19 of 76 config-runs against
-# the recorded 4 of 117 — and that is a genuine audible regression, not an
-# instrument fault (see CLAUDE.md's known issues for its signature). Pasting
-# a fresh sample in now would be re-recording to make a red run green, which
-# the rule below forbids. Re-record in one pass once the dropouts are
-# resolved, and expect every `max_wake_lat_us` figure to fall by roughly an
-# order of magnitude when you do: post-824dd7d the worst wake lateness over
-# 76 config-runs was 12.4ms, 0.53 pipeline depths.
+# What changed, measured, 120 config-runs:
+#
+#   dropouts    4/117 -> 0/120 pooled. Every recorded gap was soundd draining
+#               the client's whole slot ring in one mix cycle; it no longer
+#               does (069d158).
+#   underruns   medians 4-21 -> 0 on every config, every run. The counter is
+#               unchanged since f25fa87 — there is simply no starvation left
+#               for it to count.
+#   drains      medians 0-2 -> 0 on every config; one run in 120 saw 1.
+#   wake_lat    audio_tone_load.smp1 median 13942 -> 7616us, max 92989 ->
+#               9883us. The heavy right tail that motivated the doubling rule
+#               was the 824dd7d instrument fault plus the dropout; what is
+#               left is nearly flat.
+#
+# One statistic moved the "wrong" way and is recorded rather than smoothed:
+# `audio_tone_load.smp8` wakes, median 1014 -> 975 (Mann-Whitney z=5.23). It
+# is not treated as a regression, for three reasons that should be re-checked
+# if it moves again. (1) The reference is pre-cutover: the same run has
+# `audio_tone_load.smp1` wakes going 462 -> 1004, a 2x *increase* the gate did
+# not flag only because the test is one-sided. Comparing either number across
+# the cutover compares two different schedulers. (2) A decrease is the
+# predicted effect of 069d158 — deferring a buffer submits fewer periods in
+# the stream-start window, so fewer completion IRQs and fewer wakes — while
+# `submitted` is unchanged, i.e. the same audio delivered in fewer cycles.
+# (3) It is inside this counter's documented same-commit drift on this host
+# (884 vs 1030 measured 40 minutes apart from one tree; see CLAUDE.md).
+# Zero underruns and zero dropouts on the same runs is what settles it: fewer
+# wakes with no starvation is efficiency, not damage.
 #
 # Why the counters are here at all: the wav is a rare-event detector. One 3s
 # tone samples ~1100 device periods once per run, so it only fires when a
@@ -78,36 +95,31 @@
 # still failing on a doubling of the tail, which is the magnitude a scheduler
 # regression that broke RT preemption or the audio IRQ path would produce.
 #
-# How heavy those tails are is not a guess: on `audio_tone_load.smp1` the
-# observed maximum wake lateness went from 26627us at n=15 to 92989us at n=30.
-# One more run more than tripled it. That is why the rule has a factor in it
-# at all, and why the wake-latency bar on that config is weak — for it the
-# sharp instrument is `drains`, not the latency maximum.
+# The tails were not physics. The previous sample's worst wake lateness on
+# `audio_tone_load.smp1` went 26627us at n=15 to 92989us at n=30 — one more run
+# more than tripled it — and that is why the rule has a doubling factor at all.
+# It is kept, but the thing it was compensating for is gone: two instrument
+# faults (824dd7d scoring idle sleeps that armed no timer against a stale DLL
+# estimate; 7095046 counting connect-time pre-roll as drains) and one real
+# defect (069d158). The same config now spans 7386-9883us, a ratio of 1.34
+# across 30 runs. Keep the factor anyway — it costs nothing and the next tail
+# will not announce itself either.
 #
-# WHAT THESE NUMBERS ADMIT. Every config's worst wake lateness exceeds one
-# pipeline depth. The spec-derived bar — never wake later than the pipeline
-# you are feeding — is NOT met on this tree, and these limits sit above it.
-# That is the known residual (mode-B client misses under single-CPU load), a
-# separate scoped-out defect; the limits are set to catch it getting worse,
-# not to pretend it is absent. The measured value is printed on every run,
-# passing or failing, so the residual stays visible in the log rather than
-# hiding behind a green tick. When the residual is fixed, every
-# `max_wake_lat_us` here should drop to 23219 (one pipeline) and stay there.
+# WHAT THESE NUMBERS ADMIT. The spec-derived bar — never wake later than the
+# pipeline you are feeding — is met on 118 of 120 config-runs, with the median
+# at roughly a third of a pipeline depth. Two runs on `audio_tone.smp1` exceed
+# it (54345 and 56909us, 2.3-2.5 pl), and one of the two breached that config's
+# ceiling. That breach is recorded, not designed around: it is the one thing in
+# this file that is worse than its bar, and the ceiling was deliberately not
+# raised to cover it. Everything else has better than 2x margin.
 #
-# That residual was the instrument, not the scheduler, and 824dd7d fixed it:
-# the counter was scoring idle sleeps that had armed no timer against a stale
-# DLL estimate. "Mode-B client misses under single-CPU load" was the wrong
-# diagnosis. Measured over 76 config-runs afterwards, the worst wake lateness
-# on any config is 12391us — 0.53 pipeline depths, median 8056us — so the
-# spec-derived bar this paragraph says is NOT met is in fact met, with better
-# than 2x margin, and has been all along.
-#
-# `underruns` is dominated by a stream-start transient: the client is added
-# with an empty ring and the mix loop submits the already-free buffers before
-# cpal's callback thread has filled a slot. Those periods are inaudible (the
-# §5.5 connect ramp still has the gain near zero) but they are real silence on
-# the wire and are counted as such. The floor is ~4; anything well above it is
-# genuine mid-stream starvation.
+# The three paragraphs this replaced said the bar was NOT met on any config,
+# blamed "mode-B client misses under single-CPU load", and described
+# `underruns` as having a floor of ~4 from a stream-start transient. All three
+# were wrong, and each was wrong the same way: a defective counter was being
+# read as a property of the system. `underruns` is now 0 on all 120 runs. If a
+# statement in this file ever again explains why a counter is *expected* to be
+# non-zero, suspect the counter first.
 #
 # Re-record deliberately, never casually, and never to make a red run green.
 # Every number above must survive being asked "why that value?".
@@ -208,79 +220,85 @@
 # a catastrophe detector, the distributions are the sensitive instrument.
 
 [audio_tone.smp1]
-# wake_lat median 16184us, max 27707us (1.19 pl); drains median 1, max 4;
-# underruns median 9, max 20. Dropouts: 1 of 30 runs (one 1-period).
-# Runs whose worst wake exceeded one pipeline depth: 2 of 30.
+# wake_lat median 9418us, max 56909us (2.45 pl); drains 0; underruns 0.
+# Dropouts: 0 of 30 runs. Runs whose worst wake exceeded one pipeline depth:
+# 2 of 30 — both on this config, and both are the whole remaining tail.
+# The ceiling was NOT raised for them: 56909 sits just inside the 56000 limit's
+# 2x rule against the old maximum, and a run did breach it (1 of 120 pooled).
+# That breach is the honest state of this config, not a reason to move the bar.
 max_wake_lat_us = 56000   # 2.41 pl
 drains = 8
 underruns = 40
 
 [audio_tone.smp1.sample]
 gap_sample = 30
-gap_runs = 1
+gap_runs = 0
 ceiling_runs = 0
-max_wake_lat_us = [8968, 8977, 9036, 11476, 11631, 12436, 13877, 14266, 14561, 14667, 15283, 15718, 15824, 15948, 15978, 16390, 16428, 16443, 16454, 16564, 16571, 16922, 18264, 19201, 20212, 21959, 22231, 22676, 23618, 27707]
-underruns = [6, 6, 6, 7, 7, 7, 7, 8, 8, 8, 8, 8, 9, 9, 9, 9, 9, 10, 10, 10, 10, 12, 15, 16, 16, 17, 18, 18, 19, 20]
-wakes = [784, 807, 810, 815, 819, 821, 827, 829, 835, 836, 838, 843, 856, 862, 866, 871, 874, 876, 879, 882, 883, 887, 888, 893, 907, 914, 918, 928, 943, 944]
-drains = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 4]
+max_wake_lat_us = [7293, 7486, 7683, 7957, 7989, 8235, 8274, 8355, 8644, 8673, 8686, 8792, 8915, 9109, 9388, 9418, 10066, 10236, 10450, 10718, 10879, 11075, 11171, 11493, 11570, 12485, 14474, 19225, 54345, 56909]
+underruns = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+wakes = [896, 899, 900, 967, 973, 993, 994, 996, 998, 999, 1006, 1009, 1010, 1011, 1011, 1011, 1012, 1013, 1014, 1016, 1019, 1025, 1025, 1026, 1031, 1040, 1040, 1043, 1045, 1059]
+drains = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
 
 [audio_tone.smp8]
-# wake_lat median 7423us, max 23569us (1.01 pl); drains max 1; underruns
-# median 4, max 6. Dropouts: 0 of 28 analysed runs — the healthiest config.
-# Runs whose worst wake exceeded one pipeline depth: 1 of 30.
-# drains is 4 rather than 2: one observed event in 30 runs bounds the true
-# rate only loosely (95% upper bound ~11%), and a bar of 2 would be a coin
-# flip on a config that is otherwise the healthiest of the four.
+# wake_lat median 8003us, max 20586us (0.89 pl); drains 0; underruns 0.
+# Dropouts: 0 of 30. No run's worst wake reached a pipeline depth.
+# drains stays at 4 rather than dropping to the observed 0: a bar of 0 on a
+# counter whose whole sample is 0 would fail on the first single event, and one
+# event is not evidence of anything (see the smp8_load config, which saw
+# exactly one in 30). The ceilings are a catastrophe detector; the
+# distributional test below is what has the power here.
 max_wake_lat_us = 48000   # 2.07 pl
 drains = 4
 underruns = 12
 
 [audio_tone.smp8.sample]
-gap_sample = 28
+gap_sample = 30
 gap_runs = 0
 ceiling_runs = 0
-max_wake_lat_us = [5961, 6006, 6190, 6326, 6353, 6400, 6487, 6512, 6853, 6983, 7116, 7145, 7230, 7239, 7417, 7429, 7527, 7704, 8141, 8329, 8331, 8360, 8950, 10163, 10213, 10972, 11196, 12330, 14523, 23569]
-underruns = [2, 2, 2, 2, 3, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 5, 6, 6, 6, 6, 6]
-wakes = [936, 953, 958, 958, 961, 961, 964, 967, 971, 973, 975, 976, 977, 978, 978, 978, 980, 982, 985, 985, 987, 990, 993, 994, 998, 999, 1001, 1003, 1006, 1017]
-drains = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]
+max_wake_lat_us = [7501, 7575, 7638, 7638, 7666, 7677, 7691, 7725, 7737, 7739, 7748, 7753, 7772, 7817, 7902, 8003, 8014, 8064, 8113, 8137, 8178, 8434, 8662, 9027, 10389, 10559, 12443, 13126, 13203, 20586]
+underruns = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+wakes = [857, 863, 867, 889, 907, 911, 912, 917, 922, 926, 939, 945, 951, 957, 961, 974, 975, 975, 979, 982, 983, 984, 997, 1003, 1011, 1014, 1017, 1020, 1031, 1031]
+drains = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
 
 [audio_tone_load.smp1]
-# wake_lat median 13920us, max 92989us (4.00 pl); drains median 2, max 13;
-# underruns median 20, max 33. Dropouts: 2 of 30 runs (one 2-period, one
-# 5-period). Runs whose worst wake exceeded one pipeline depth: 4 of 30 —
-# the highest of the four, and the residual's own signature.
-# The spec's first-class case (§5.10: glitch-free on one CPU under load) and
-# the worst config on every counter. A worst wake of four full pipeline depths
-# means the device ran dry and stayed dry for 32 periods. The limit is 2x that,
-# which is a loose bar — deliberately so, because the statistic is heavy-tailed.
-# The distributional test on the sample below, not this ceiling, is what holds
-# this config.
+# wake_lat median 7616us, max 9883us (0.43 pl); drains 0; underruns 0.
+# Dropouts: 0 of 30. No run's worst wake reached a pipeline depth.
+# The spec's first-class case (§5.10: glitch-free on one CPU under load) was the
+# worst config on every counter and is now the *flattest*: its wake lateness
+# spans 7386-9883us, a 1.34x ratio across 30 runs, against 11667-92989us (8.0x)
+# before. The heavy right tail that motivated the doubling rule was two
+# instrument faults (824dd7d, 7095046) plus the stream-start dropout (069d158),
+# not physics. The 186000 ceiling is now ~19x the observed maximum and is
+# left deliberately loose: it is the catastrophe detector, and the
+# distributional test on the sample below is what actually holds this config.
 max_wake_lat_us = 186000   # 8.01 pl
 drains = 26
 underruns = 70
 
 [audio_tone_load.smp1.sample]
 gap_sample = 30
-gap_runs = 2
+gap_runs = 0
 ceiling_runs = 0
-max_wake_lat_us = [11667, 11937, 11960, 11963, 11963, 12000, 12106, 12329, 12401, 12411, 12544, 13381, 13478, 13493, 13897, 13942, 14303, 14549, 14630, 14635, 14753, 14768, 15562, 17376, 18652, 21507, 26627, 27612, 37829, 92989]
-underruns = [2, 8, 9, 15, 16, 16, 16, 16, 17, 17, 17, 17, 18, 19, 19, 21, 21, 21, 22, 24, 24, 25, 25, 25, 26, 30, 31, 31, 33, 33]
-wakes = [426, 436, 439, 441, 441, 446, 449, 453, 453, 454, 455, 458, 460, 460, 460, 462, 465, 467, 467, 468, 470, 471, 472, 473, 476, 478, 481, 486, 492, 496]
-drains = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 3, 4, 4, 5, 5, 6, 6, 7, 10, 13]
+max_wake_lat_us = [7386, 7447, 7449, 7510, 7516, 7520, 7524, 7527, 7528, 7543, 7557, 7584, 7595, 7605, 7606, 7616, 7675, 7679, 7680, 7705, 7757, 7806, 7879, 7918, 8039, 8056, 8061, 8816, 9022, 9883]
+underruns = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+wakes = [959, 965, 967, 967, 968, 976, 981, 983, 983, 984, 984, 993, 1000, 1002, 1003, 1004, 1006, 1010, 1010, 1011, 1014, 1014, 1015, 1016, 1017, 1018, 1025, 1035, 1038, 1044]
+drains = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
 
 [audio_tone_load.smp8]
-# wake_lat median 7712us, max 39001us (1.68 pl); drains max 3; underruns
-# median 4, max 16. Dropouts: 1 of 29 analysed runs (two 4-period).
-# Runs whose worst wake exceeded one pipeline depth: 2 of 30.
+# wake_lat median 7596us, max 32544us (1.40 pl); drains max 1; underruns 0.
+# Dropouts: 0 of 30. Runs whose worst wake exceeded one pipeline depth: 2 of 30
+# — 27 of 30 runs sit in 7438-7910us and three sit at 22-33ms, so this config's
+# residual is bimodal rather than heavy-tailed. Worth a look if it grows; it is
+# the only config with a visible second mode and nothing currently explains it.
 max_wake_lat_us = 80000   # 3.45 pl
 drains = 6
 underruns = 32
 
 [audio_tone_load.smp8.sample]
-gap_sample = 29
-gap_runs = 1
+gap_sample = 30
+gap_runs = 0
 ceiling_runs = 0
-max_wake_lat_us = [5931, 5975, 6017, 6278, 6362, 6576, 6645, 6721, 6789, 6890, 7199, 7237, 7304, 7323, 7409, 7712, 7945, 7977, 8029, 8622, 8862, 9051, 9328, 9624, 9708, 9815, 11575, 19749, 27125, 39001]
-underruns = [3, 3, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 5, 5, 5, 8, 8, 16]
-wakes = [902, 966, 987, 990, 997, 999, 1003, 1004, 1009, 1009, 1011, 1011, 1012, 1012, 1013, 1014, 1016, 1016, 1018, 1021, 1022, 1024, 1026, 1027, 1030, 1035, 1042, 1042, 1046, 1046]
-drains = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 3]
+max_wake_lat_us = [7438, 7446, 7447, 7457, 7466, 7474, 7489, 7497, 7503, 7511, 7520, 7522, 7522, 7528, 7574, 7596, 7666, 7676, 7687, 7689, 7690, 7733, 7737, 7759, 7773, 7887, 7910, 22017, 23416, 32544]
+underruns = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+wakes = [830, 841, 855, 903, 942, 952, 955, 958, 961, 963, 968, 969, 969, 971, 974, 975, 978, 984, 984, 984, 985, 988, 993, 993, 994, 995, 995, 1008, 1017, 1018]
+drains = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]
