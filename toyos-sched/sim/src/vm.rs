@@ -539,6 +539,7 @@ impl<'q> Vm<'q> {
                 cpus: handles,
                 frontier,
                 preempt: &SimPreempt,
+                steal: true,
             };
             let pass = SchedPass::begin(&mut cpus[cpu], env, now);
             let disposed = match dispose {

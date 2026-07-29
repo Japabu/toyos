@@ -8,6 +8,7 @@ use crate::mm::PAGE_2M;
 use crate::fd::{self, FdTable};
 use crate::sync::Lock;
 use crate::symbols::SymbolTable;
+use crate::sched::payload::ThreadSched;
 use crate::{elf, pipe, scheduler, shared_memory, vfs};
 use crate::{DirectMap, UserAddr};
 use crate::loader::{
@@ -212,12 +213,21 @@ pub struct ThreadEntry {
     state: ThreadLocation,
     name: [u8; 28],
     thread_data: Arc<Lock<ThreadData>>,
+    /// The thread's scheduler faces (rendezvous word + published counters).
+    /// `None` only between the table insert that allocates the tid and the
+    /// `sched::spawn` that needs it — the task cannot exist before its own id.
+    sched: Option<ThreadSched>,
 }
 
 impl ThreadEntry {
     pub fn new(thread_data: Arc<Lock<ThreadData>>) -> Self {
-        Self { state: ThreadLocation::Scheduled, name: [0u8; 28], thread_data }
+        Self { state: ThreadLocation::Scheduled, name: [0u8; 28], thread_data, sched: None }
     }
+    pub fn set_sched(&mut self, sched: ThreadSched) {
+        assert!(self.sched.is_none(), "thread already has a scheduler record");
+        self.sched = Some(sched);
+    }
+    pub fn sched(&self) -> Option<&ThreadSched> { self.sched.as_ref() }
     pub fn state(&self) -> ThreadLocation { self.state }
     pub fn name(&self) -> &[u8; 28] { &self.name }
     pub fn set_name(&mut self, name: &[u8]) {
@@ -270,6 +280,7 @@ impl ProcessEntry {
     pub fn symbols(&self) -> &Arc<Lock<SymbolTable>> { &self.symbols }
     pub fn main_tid(&self) -> Tid { self.main_tid }
     pub fn threads(&self) -> &crate::id_map::IdMap<Tid, ThreadEntry> { &self.threads }
+    pub fn threads_mut(&mut self) -> &mut crate::id_map::IdMap<Tid, ThreadEntry> { &mut self.threads }
 }
 
 impl ProcessEntry {
@@ -757,27 +768,17 @@ pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64, stack_base: u64) -> Op
     }
     let tid = proc.threads.insert(ThreadEntry::new(thread_data));
 
-    let ctx = scheduler::TaskCtx {
-        id: TaskId(parent_process, tid),
-        kernel_stack: ks_alloc,
-        kernel_rsp: ks_rsp,
-        address_space: parent_addr_space,
+    // Placed while still holding the table lock: teardown claims the process
+    // under this lock, so a thread that passed the check above is fully visible
+    // to the scheduler before any retire sweep can start.
+    let sched = scheduler::enqueue_new(
+        TaskId(parent_process, tid),
+        ks_alloc,
+        ks_rsp,
+        parent_addr_space,
         fs_base,
-        cpu_ns: 0,
-        scheduled_at: 0,
-        blocked_on: None,
-        deadline: 0,
-        blocked_since: 0,
-        enqueued_at: 0,
-        is_rt: false,
-        rt_inherited: false,
-        accounting: scheduler::TaskAccounting::default(),
-        last_cpu: None,
-    };
-    // Enqueue while still holding the table lock: teardown claims the
-    // process under this lock, so a thread that passed the check above is
-    // fully visible to the scheduler before any retire sweep can start.
-    scheduler::enqueue_new(ctx);
+    );
+    proc.threads.get_mut(tid).unwrap().set_sched(sched);
     drop(guard);
     Some(tid)
 }
@@ -988,18 +989,20 @@ pub fn exit(code: i32) -> ! {
     // re-issued (kernel heap corruption).
     let mut main_cpu_ns = 0u64;
     for t in other_tids {
-        if let Some(ctx) = scheduler::retire_task(TaskId(process_pid, t)) {
-            let mut pdata = process_data_arc.lock();
-            ctx.accounting.merge_into(&mut pdata.accounting);
-            if t == main_tid {
-                main_cpu_ns = ctx.cpu_ns();
-            } else {
-                pdata.accounting.child_threads_cpu_ns += ctx.cpu_ns();
-            }
+        let Some(sched) = thread_sched(process_pid, t) else { continue };
+        scheduler::retire_task(&sched);
+        let cpu_ns = scheduler::task_cpu_ns(&sched);
+        let mut pdata = process_data_arc.lock();
+        sched.handle.merge_into(&mut pdata.accounting);
+        if t == main_tid {
+            main_cpu_ns = cpu_ns;
+        } else {
+            pdata.accounting.child_threads_cpu_ns += cpu_ns;
         }
     }
     if tid == main_tid {
-        main_cpu_ns = scheduler::task_cpu_ns(TaskId(process_pid, tid));
+        main_cpu_ns = thread_sched(process_pid, tid)
+            .map_or(0, |s| scheduler::task_cpu_ns(&s));
     }
 
     // Phase 3: free resources — no other thread of this process can run.
@@ -1055,7 +1058,9 @@ pub fn thread_exit(code: i32) -> ! {
     let parent_main_tid = {
         let mut guard = PROCESS_TABLE.lock();
         let table = guard.as_mut().unwrap();
-        let cpu_ms = scheduler::task_cpu_ns(TaskId(process_pid, tid)) / 1_000_000;
+        let cpu_ms = table.get(process_pid).and_then(|p| p.threads.get(tid))
+            .and_then(|t| t.sched())
+            .map_or(0, scheduler::task_cpu_ns) / 1_000_000;
         table.get_mut(process_pid).unwrap().threads.get_mut(tid).unwrap().state = ProcessState::Zombie(code);
         let proc = table.get(process_pid).unwrap();
         let name = proc.name_str();
@@ -1071,9 +1076,15 @@ pub fn thread_exit(code: i32) -> ! {
 // Blocking / scheduling
 // ---------------------------------------------------------------------------
 
-/// Block the current thread on an optional event source with optional deadline.
-pub fn block(event: Option<scheduler::EventSource>, deadline: u64) {
-    scheduler::block(event, deadline);
+/// A thread's scheduler record, cloned out of the table.
+///
+/// Cloning rather than borrowing is what keeps the wake and retire paths off
+/// the table lock: both need the rendezvous word, and neither may hold a lock
+/// while it posts.
+pub fn thread_sched(pid: Pid, tid: Tid) -> Option<ThreadSched> {
+    let guard = PROCESS_TABLE.lock();
+    let table = guard.as_ref()?;
+    table.get(pid)?.threads.get(tid)?.sched().cloned()
 }
 
 // ---------------------------------------------------------------------------
@@ -1421,11 +1432,7 @@ pub fn dump_crash_diagnostics(fault_addr: u64, rip: u64) {
 
     // Dump TLS self-pointer at FS base
     let fs_base_msr = crate::arch::cpu::rdfsbase();
-    let fs_base_saved = scheduler::with_current_ctx(|ctx| ctx.fs_base).unwrap_or(0);
     let fs_base = fs_base_msr;
-    if fs_base_msr != fs_base_saved {
-        log!("  FS base: MSR={:#x} saved={:#x} (MISMATCH!)", fs_base_msr, fs_base_saved);
-    }
     if fs_base != 0 {
         log!("  FS base: {:#x}", fs_base);
         if let Some(self_ptr) = read_user(fs_base) {
@@ -1562,14 +1569,15 @@ pub fn kill_process(target_pid: Pid) -> u64 {
     // snapshot; the retire loop is the reliable version of the same wait).
     let mut main_cpu_ns = 0u64;
     for t in tids {
-        if let Some(ctx) = scheduler::retire_task(TaskId(target_pid, t)) {
-            let mut pdata = process_data_arc.lock();
-            ctx.accounting.merge_into(&mut pdata.accounting);
-            if t == main_tid {
-                main_cpu_ns = ctx.cpu_ns();
-            } else {
-                pdata.accounting.child_threads_cpu_ns += ctx.cpu_ns();
-            }
+        let Some(sched) = thread_sched(target_pid, t) else { continue };
+        scheduler::retire_task(&sched);
+        let cpu_ns = scheduler::task_cpu_ns(&sched);
+        let mut pdata = process_data_arc.lock();
+        sched.handle.merge_into(&mut pdata.accounting);
+        if t == main_tid {
+            main_cpu_ns = cpu_ns;
+        } else {
+            pdata.accounting.child_threads_cpu_ns += cpu_ns;
         }
     }
 
@@ -1596,5 +1604,5 @@ pub fn kill_process(target_pid: Pid) -> u64 {
 
 /// AP entry into the scheduler. Called from smp::ap_entry after SMP_READY.
 pub fn ap_idle() -> ! {
-    scheduler::schedule_no_return();
+    scheduler::enter_idle_loop();
 }

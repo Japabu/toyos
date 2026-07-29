@@ -1,12 +1,17 @@
 use alloc::collections::VecDeque;
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use hashbrown::HashMap;
+
+use toyos_sched::task::WaitClass;
 
 use crate::id_map::{IdKey, IdMap};
 use crate::io_uring::RingId;
 use crate::pipe::{PipeReader, PipeWriter};
 use crate::process::Pid;
+use crate::sched::payload::KWaitQueue;
+use crate::sched::waitqs::new_queue;
 use crate::sync::Lock;
 
 // ---------------------------------------------------------------------------
@@ -53,6 +58,8 @@ struct Listener {
     owner: Pid,
     pending: VecDeque<PendingConnection>,
     io_uring_watchers: Vec<RingId>,
+    /// Threads in `accept` on this listener (spec §8.6).
+    acceptors: Arc<KWaitQueue>,
 }
 
 struct ListenerRegistry {
@@ -79,6 +86,7 @@ pub fn listen(name: &str, owner: Pid) -> Option<ListenerId> {
         owner,
         pending: VecDeque::new(),
         io_uring_watchers: Vec::new(),
+        acceptors: new_queue(WaitClass::Ipc),
     });
     reg.by_name.insert(String::from(name), id);
     Some(id)
@@ -161,6 +169,14 @@ pub fn remove_io_uring_watcher(id: ListenerId, ring_id: RingId) {
     if let Some(listener) = reg.by_id.get_mut(id) {
         listener.io_uring_watchers.retain(|&x| x != ring_id);
     }
+}
+
+/// The waiter set of this listener, cloned out for a blocking `accept` or a
+/// `connect`'s wake to hold on its own stack.
+pub fn acceptors(id: ListenerId) -> Option<Arc<KWaitQueue>> {
+    let guard = LISTENERS.lock();
+    let reg = guard.as_ref().unwrap();
+    reg.by_id.get(id).map(|l| l.acceptors.clone())
 }
 
 pub fn io_uring_watchers(id: ListenerId) -> Vec<RingId> {

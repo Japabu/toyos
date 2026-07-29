@@ -164,20 +164,6 @@ pub(crate) fn alloc_kernel_stack(
     Some((alloc, frame as u64))
 }
 
-/// Release the CPU queue lock held across context_switch, park the outgoing
-/// thread, and clear the scheduler re-entry guard.
-/// Called by process_start/thread_start before entering userspace.
-fn scheduler_unlock() {
-    scheduler::finish_fresh_thread_switch();
-    // Honor a preempt request before the first iretq: a wake targeted at
-    // this CPU during the switch (e.g. an RT enqueue that set need_resched)
-    // would otherwise stall until the next timer fire — up to a full 10ms
-    // quantum. Ordering matters: finish_fresh_thread_switch has already
-    // cleared IN_SCHEDULE (the epilogue asserts it), and the trampoline
-    // runs with IF=0 from the initial RFLAGS frame, matching the
-    // epilogue's enter-with-IF=0, return-with-IF=0 contract.
-    crate::arch::idt::kernel_exit_to_user_check();
-}
 
 /// Entry point for new processes. Entered via context_switch's `ret`.
 /// r12 = entry point, r13 = user stack pointer.
@@ -196,7 +182,7 @@ pub(crate) extern "C" fn process_start() {
         "push 0x23",        // CS: user_code | RPL=3
         "push r12",         // RIP: entry point
         "iretq",
-        unlock = sym scheduler_unlock,
+        unlock = sym crate::sched::driver::trampoline_entry,
     );
 }
 
@@ -221,7 +207,7 @@ pub(crate) extern "C" fn thread_start() {
         "push 0x23",        // CS: user_code | RPL=3
         "push r12",         // RIP: entry point
         "iretq",
-        unlock = sym scheduler_unlock,
+        unlock = sym crate::sched::driver::trampoline_entry,
     );
 }
 
@@ -972,28 +958,18 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
     ));
     let tid = table.get(pid).unwrap().main_tid();
 
-    let ctx = scheduler::TaskCtx {
-        id: scheduler::TaskId(pid, tid),
-        kernel_stack: ks_alloc,
-        kernel_rsp: ks_rsp,
-        address_space: Some(child_pt.clone()),
+    // Placed while still holding the table lock: kill_process claims teardown
+    // under this lock, so once the pid is visible its main thread is already in
+    // the scheduler — a retire sweep can never miss it in a table-insert→place
+    // gap.
+    let sched = scheduler::enqueue_new(
+        scheduler::TaskId(pid, tid),
+        ks_alloc,
+        ks_rsp,
+        Some(child_pt.clone()),
         fs_base,
-        cpu_ns: 0,
-        scheduled_at: 0,
-        blocked_on: None,
-        deadline: 0,
-        blocked_since: 0,
-        enqueued_at: 0,
-        is_rt: false,
-        rt_inherited: false,
-        accounting: scheduler::TaskAccounting::default(),
-        last_cpu: None,
-    };
-    // Enqueue while still holding the table lock: kill_process claims
-    // teardown under this lock, so once the pid is visible its main thread
-    // is already in the scheduler — a retire sweep can never miss it in a
-    // table-insert→enqueue gap.
-    scheduler::enqueue_new(ctx);
+    );
+    table.get_mut(pid).unwrap().threads_mut().get_mut(tid).unwrap().set_sched(sched);
     drop(guard);
 
     let t3 = crate::clock::nanos_since_boot();

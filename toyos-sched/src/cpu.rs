@@ -308,6 +308,13 @@ pub struct Env<'e, H: Hw, P: PreemptGuard> {
     /// The pass runs preempt-disabled (spec §6.2), which is also what its own
     /// mailbox pushes need (N3).
     pub preempt: &'e P,
+    /// Whether an idle pass probes for work and a loaded pass answers probes
+    /// (spec §7.7, §9.4's pull half). The kernel runs with this **off** for
+    /// migration stage 7a, which cuts over to the machine with wake-time push
+    /// placement only and enables the pull half at 7b; the simulator runs with
+    /// it on. It is a field rather than a `cfg` because both settings must
+    /// stay compiled and simulatable while the migration is in flight.
+    pub steal: bool,
 }
 
 impl<H: Hw, P: PreemptGuard> Clone for Env<'_, H, P> {
@@ -833,6 +840,10 @@ impl<H: Hw, P: PreemptGuard> SchedPass<'_, '_, H, P, Disposed> {
     /// Answer probes from surplus only (`fair_len() > 1`), after the pick — so
     /// a CPU can never give away the task it was about to run.
     fn answer_steal_requests(&mut self) {
+        if !self.env.steal {
+            self.cpu.steal_requests.clear();
+            return;
+        }
         while let Some(thief) = self.cpu.steal_requests.pop() {
             if self.cpu.rq.fair_len() <= 1 {
                 self.cpu.steal_requests.clear();
@@ -933,6 +944,9 @@ impl<H: Hw, P: PreemptGuard> SchedPass<'_, '_, H, P, Disposed> {
     /// outstanding probe will be answered, and this CPU sleeps with its
     /// doorbell armed.
     fn post_steal_probe(&mut self) {
+        if !self.env.steal {
+            return;
+        }
         let Some((victim, _)) = (0..self.env.cpus.len())
             .map(|i| CpuId(i as u32))
             .filter(|&cpu| cpu != self.cpu.id)

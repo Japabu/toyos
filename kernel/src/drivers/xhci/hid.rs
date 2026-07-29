@@ -29,7 +29,7 @@ impl HidDevice {
         match self.hid_type {
             HidType::Keyboard => {
                 keyboard::handle_report(&buf[..size]);
-                crate::scheduler::push_event(crate::scheduler::EventSource::Keyboard);
+                keyboard::wake_waiters();
                 let watchers = keyboard::io_uring_watchers();
                 if !watchers.is_empty() {
                     crate::io_uring::complete_pending_for_event(
@@ -40,7 +40,7 @@ impl HidDevice {
             }
             HidType::Mouse | HidType::Tablet => {
                 mouse::handle_report(&buf[..size]);
-                crate::scheduler::push_event(crate::scheduler::EventSource::Mouse);
+                mouse::wake_waiters();
                 let watchers = mouse::io_uring_watchers();
                 if !watchers.is_empty() {
                     crate::io_uring::complete_pending_for_event(

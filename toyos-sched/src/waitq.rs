@@ -46,7 +46,10 @@ pub struct WaitList<M> {
 }
 
 impl<M> WaitList<M> {
-    pub fn new() -> Self {
+    /// `const` so that an environment can put a queue in a `static` array —
+    /// the kernel's futex buckets and its device queues have no init site to
+    /// build them from.
+    pub const fn new() -> Self {
         Self {
             waiters: VecDeque::new(),
         }
@@ -91,8 +94,10 @@ pub struct WaitQueue<M, L> {
     _msg: PhantomData<fn() -> M>,
 }
 
-impl<M: SchedMsg, L: LeafLock<WaitList<M>>> WaitQueue<M, L> {
-    pub fn new(class: WaitClass, list: L) -> Self {
+/// Unbounded so the constructor can be `const`: a queue in a `static` array
+/// (the kernel's futex buckets, its per-device queues) has no init site.
+impl<M, L> WaitQueue<M, L> {
+    pub const fn new(class: WaitClass, list: L) -> Self {
         Self {
             class,
             list,
@@ -103,6 +108,9 @@ impl<M: SchedMsg, L: LeafLock<WaitList<M>>> WaitQueue<M, L> {
     pub fn class(&self) -> WaitClass {
         self.class
     }
+}
+
+impl<M: SchedMsg, L: LeafLock<WaitList<M>>> WaitQueue<M, L> {
 
     pub fn len(&self) -> usize {
         self.list.with(|l| l.len())

@@ -6,17 +6,20 @@
 //! ordering-sensitive protocol lives below this line. That is the whole
 //! contract — the simulator replaces this file and nothing else.
 //!
-//! Stage 6 implements [`Machine`], not [`toyos_sched::hw::Hw`]. The two
-//! members `Hw` adds — the context switch and the finalize sink — are the two
-//! that name a task, and the kernel has no `SchedPayload` until the cutover.
-//! Implementing them now would mean importing stage 7's task record to leave
-//! two methods unreachable.
+//! Stage 6 implemented [`Machine`] alone; stage 7a adds [`Hw`], whose two
+//! extra members — the context switch and the finalize sink — are exactly the
+//! two that name a task. The split held: nothing about the task-blind half
+//! needed changing to complete it, and the whole delta below is additive.
 
 use core::arch::asm;
 
-use toyos_sched::hw::{CpuId, Kicker, Machine, Nanos, TraceEvent};
+use toyos_sched::cpu::RunToken;
+use toyos_sched::hw::{CpuId, Hw, Kicker, Machine, Nanos, TraceEvent};
+use toyos_sched::task::{TaskAccounting, TaskKey};
 
-use crate::arch::{apic, percpu};
+use crate::arch::{apic, cpu, percpu};
+use crate::sched::driver::context_switch;
+use crate::sched::payload::{KernelCtx, KernelPayload};
 
 /// The one instance. Zero-sized: every effect is on a model-specific register
 /// of the CPU that calls it, or a targeted ICR write addressed by argument —
@@ -115,5 +118,61 @@ impl Machine for KernelHw {
 
     fn trace(&self, ev: TraceEvent) {
         crate::trace::record(ev);
+    }
+}
+
+impl Hw for KernelHw {
+    type Payload = KernelPayload;
+
+    /// Load the incoming task's machine state, then hand the stacks over.
+    ///
+    /// Everything this needs is in the two contexts the token names, and that
+    /// is deliberate: the pass that produced the token has already ended, so
+    /// there is no `CpuSched` left to consult and nothing scheduler-related to
+    /// do on either side of the switch.
+    ///
+    /// The order is forced. `fs_base` is a live register, so the outgoing
+    /// context has to capture it before anything is reloaded; the percpu
+    /// identity, the TSS stack and CR3 must all be the incoming task's *before*
+    /// the stack pointer moves, because after `context_switch` this frame no
+    /// longer exists.
+    unsafe fn switch(&self, token: RunToken<KernelPayload>) {
+        let save = token.save_ptr();
+        let restore = token.restore_ptr();
+        // SAFETY: both pointers came from `SchedPass::finish`, which formed
+        // them from live Box-backed task records (or this CPU's own idle
+        // context). A record is only freed by `release`, which runs in a later
+        // pass — i.e. never while its context is the one being switched.
+        unsafe {
+            (*save).fs_base = cpu::rdfsbase();
+            let incoming: &KernelCtx = &*restore;
+            percpu::set_current_tid(incoming.id.map(|id| id.1));
+            percpu::set_current_pid(incoming.id.map(|id| id.0));
+            match incoming.id {
+                Some(_) => {
+                    percpu::set_kernel_stack(incoming.kernel_stack_top);
+                    incoming.cr3.activate();
+                    cpu::wrfsbase(incoming.fs_base);
+                }
+                // The idle context. Its stack top is per-CPU and therefore not
+                // knowable at the boot-time init that builds the context, so it
+                // is read here, on the CPU it belongs to.
+                None => {
+                    percpu::set_kernel_stack(percpu::idle_stack_top());
+                    incoming.cr3.activate();
+                }
+            }
+            let rsp = incoming.rsp;
+            context_switch(&raw mut (*save).rsp, rsp);
+        }
+    }
+
+    /// The finalize sink. Reached exactly once per task, from the pass after
+    /// the one that killed it, which by construction runs on another stack —
+    /// so dropping the payload here frees a kernel stack nothing stands on and
+    /// releases the address-space `Arc` for the one and only time.
+    fn release(&self, _key: TaskKey, payload: KernelPayload, acct: TaskAccounting) {
+        payload.handle.finalize(acct);
+        drop(payload);
     }
 }

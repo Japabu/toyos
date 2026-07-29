@@ -13,8 +13,11 @@
 //! readiness checks (which acquire source locks internally). This is safe
 //! because no path holds source locks while acquiring IO_URINGS.
 
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
+
+use toyos_sched::task::WaitClass;
 
 use crate::fd;
 use crate::id_map::{IdKey, IdMap};
@@ -22,8 +25,9 @@ use crate::pipe;
 use crate::process::{self, Pid};
 use crate::scheduler::{self, EventSource};
 use crate::shared_memory::{self, SharedToken};
+use crate::sched::payload::KWaitQueue;
+use crate::sched::waitqs::{new_queue, wake_all};
 use crate::sync::Lock;
-use crate::waitq::WaitQueue;
 use crate::DirectMap;
 
 use toyos_abi::io_uring::{
@@ -156,6 +160,8 @@ struct IoUringInstance {
     sq_size: u32,
     cq_size: u32,
     pending_polls: Vec<PendingPoll>,
+    /// Threads waiting on this ring's completion queue (spec §8.6).
+    waiters: Arc<KWaitQueue>,
     owner_pid: Pid,
 }
 
@@ -276,6 +282,7 @@ pub fn create(depth: u32) -> Result<(RingId, SharedToken), SyscallError> {
             sq_size,
             cq_size,
             pending_polls: Vec::new(),
+            waiters: new_queue(WaitClass::Io),
             owner_pid: pid,
         })
     };
@@ -319,8 +326,9 @@ pub fn enter(
         submit_sqes(ring_id, to_submit)?;
     }
 
-    // Wait phase
-    let queue = WaitQueue::io_uring(ring_id);
+    // Wait phase. The queue is cloned out of the table so the ticket and the
+    // registration can borrow it across the park without holding the table.
+    let queue = waiters_of(ring_id)?;
     loop {
         let count = cq_count(ring_id)?;
 
@@ -341,13 +349,18 @@ pub fn enter(
         // The re-check is this ring's own condition, not mere readiness: a
         // waiter for `min_complete` CQEs that cancelled on the first one
         // would spin instead of parking.
-        let ticket = queue.prepare_wait();
+        let ticket = scheduler::prepare_wait(&queue);
         if cq_count(ring_id)? >= min_complete {
             ticket.cancel();
             continue;
         }
-        scheduler::block_on(ticket, deadline);
+        scheduler::block_on(ticket, if deadline == 1 { 0 } else { deadline });
     }
+}
+
+/// This ring's completion waiter set, cloned out of the table.
+fn waiters_of(ring_id: RingId) -> Result<Arc<KWaitQueue>, SyscallError> {
+    with_instance(ring_id, |inst| inst.waiters.clone())
 }
 
 /// Read and process SQEs from the submission ring.
@@ -459,6 +472,7 @@ fn process_poll_add(ring_id: RingId, sqe: &IoUringSqe) {
     //   1. add_watcher(new) → no-op (old watcher still registered)
     //   2. drop(old) → removes the watcher
     //   3. result: zero watchers despite an active PendingPoll
+    let mut woken: Option<Arc<KWaitQueue>> = None;
     let mut guard = IO_URINGS.lock();
     let map = guard.as_mut().expect("io_uring not initialized");
     if let Some(instance) = map.get_mut(ring_id) {
@@ -506,9 +520,13 @@ fn process_poll_add(ring_id: RingId, sqe: &IoUringSqe) {
                 if pp.flags.readable() { result_flags |= PollFlags::IN.raw(); }
                 if pp.flags.writable() { result_flags |= PollFlags::OUT.raw(); }
                 instance.post_cqe(pp.user_data, result_flags as i32, 0);
-                scheduler::push_event(EventSource::IoUring(ring_id));
+                woken = Some(instance.waiters.clone());
             }
         }
+    }
+    drop(guard);
+    if let Some(queue) = woken {
+        wake_all(&queue);
     }
 }
 
@@ -601,6 +619,9 @@ pub fn complete_pending_for_event(watchers: &[RingId], event: EventSource) {
 fn complete_pending_for_source(watchers: &[RingId], matches: impl Fn(&PendingPoll) -> bool) {
     if watchers.is_empty() { return; }
 
+    // Collect the queues, wake after the table lock is gone: a wake posts
+    // mailbox messages and may send a kick IPI, and neither needs IO_URINGS.
+    let mut to_wake: Vec<Arc<KWaitQueue>> = Vec::new();
     let mut guard = IO_URINGS.lock();
     let map = guard.as_mut().expect("io_uring not initialized");
 
@@ -620,7 +641,11 @@ fn complete_pending_for_source(watchers: &[RingId], matches: impl Fn(&PendingPol
             }
         }
 
-        scheduler::push_event(EventSource::IoUring(ring_id));
+        to_wake.push(instance.waiters.clone());
+    }
+    drop(guard);
+    for queue in to_wake {
+        wake_all(&queue);
     }
 }
 

@@ -232,7 +232,7 @@ pub(crate) extern "sysv64" fn kernel_exit_to_user_check() {
     flush_ring0_timer_fires_to_trace();
     while crate::preempt::need_resched() {
         assert!(!crate::scheduler::in_schedule_self(),
-            "exit-to-user with IN_SCHEDULE set");
+            "exit-to-user inside a scheduler pass");
         unsafe { core::arch::asm!("sti", options(nomem, nostack)); }
         crate::scheduler::do_preempt();
         unsafe { core::arch::asm!("cli", options(nomem, nostack)); }

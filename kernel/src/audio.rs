@@ -154,6 +154,11 @@ pub fn remove_io_uring_watcher(id: RingId) {
     IO_URING_WATCHERS.lock().retain(|&x| x != id);
 }
 
+/// Wake every thread blocked on an audio completion record.
+pub fn wake_waiters() {
+    crate::sched::waitqs::wake_all(&crate::sched::waitqs::AUDIO);
+}
+
 pub fn io_uring_watchers() -> Vec<RingId> {
     IO_URING_WATCHERS.lock().clone()
 }

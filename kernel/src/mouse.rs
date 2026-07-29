@@ -20,6 +20,11 @@ pub fn remove_io_uring_watcher(id: RingId) {
     IO_URING_WATCHERS.lock().retain(|&x| x != id);
 }
 
+/// Wake every thread blocked on mouse input.
+pub fn wake_waiters() {
+    crate::sched::waitqs::wake_all(&crate::sched::waitqs::MOUSE);
+}
+
 pub fn io_uring_watchers() -> Vec<RingId> {
     IO_URING_WATCHERS.lock().clone()
 }

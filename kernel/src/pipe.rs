@@ -2,9 +2,14 @@ use crate::mm::pmm;
 
 use toyos_abi::ring::{RingHeader, RING_READER_CLOSED, RING_WRITER_CLOSED};
 
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
+use toyos_sched::task::WaitClass;
+
 use crate::mm::PAGE_2M;
+use crate::sched::payload::KWaitQueue;
+use crate::sched::waitqs::new_queue;
 use crate::io_uring::RingId;
 use crate::process::Pid;
 use crate::id_map::{IdKey, IdMap};
@@ -97,6 +102,12 @@ struct Pipe {
     readers: u32,
     writers: u32,
     io_uring_watchers: Vec<RingId>,
+    /// This pipe end's waiter set (spec §8.6). Held by `Arc` so a blocking
+    /// site can clone it out from under the table lock and hold it across its
+    /// own park — the ticket and the registration borrow the queue, not the
+    /// table.
+    readers_wq: Arc<KWaitQueue>,
+    writers_wq: Arc<KWaitQueue>,
     /// An RT thread wrote to this pipe and the boost has not been claimed
     /// yet. The next thread to consume data inherits transient RT priority —
     /// covering readers that were runnable (not blocked) at write time,
@@ -110,7 +121,16 @@ impl Pipe {
     fn new(creator: Pid) -> Self {
         let page = pmm::alloc_page(pmm::Category::Pipe).expect("pipe: allocation failed");
         RingHeader::init(page.direct_map().as_mut_ptr(), PIPE_SIZE);
-        Self { page, creator, readers: 0, writers: 0, io_uring_watchers: Vec::new(), rt_boost_pending: false }
+        Self {
+            page,
+            creator,
+            readers: 0,
+            writers: 0,
+            io_uring_watchers: Vec::new(),
+            readers_wq: new_queue(WaitClass::Pipe),
+            writers_wq: new_queue(WaitClass::Pipe),
+            rt_boost_pending: false,
+        }
     }
 
     fn header(&self) -> &RingHeader {
@@ -343,6 +363,16 @@ pub fn remove_io_uring_watcher(pipe_id: PipeId, ring_id: RingId) {
             pipe.io_uring_watchers.retain(|&id| id != ring_id);
         }
     });
+}
+
+/// The waiter set of this pipe's read end, cloned out for a blocking site or a
+/// wake path to hold on its own stack.
+pub fn readers_queue(pipe_id: PipeId) -> Option<Arc<KWaitQueue>> {
+    with_pipes(|pipes| pipes.get(pipe_id).map(|p| p.readers_wq.clone()))
+}
+
+pub fn writers_queue(pipe_id: PipeId) -> Option<Arc<KWaitQueue>> {
+    with_pipes(|pipes| pipes.get(pipe_id).map(|p| p.writers_wq.clone()))
 }
 
 pub fn io_uring_watchers(pipe_id: PipeId) -> Vec<RingId> {

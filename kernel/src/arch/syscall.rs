@@ -5,7 +5,6 @@ use super::{apic, cpu, gdt};
 use crate::drivers::acpi;
 use crate::sync::Lock;
 use crate::user_ptr::SyscallContext;
-use crate::waitq::WaitQueue;
 use crate::{device, fd, keyboard, listener, log, pipe, process, shared_memory, vfs};
 use crate::{DirectMap, UserAddr};
 
@@ -497,17 +496,22 @@ fn sys_write(fd_num: u32, buf: &[u8]) -> u64 {
                 if let Some(id) = pipe_id { process::wake_pipe_readers(id); }
                 return n;
             }
-            Err(Some(id)) => WaitQueue::pipe_writable(id).wait(0),
+            Err(Some(id)) => match pipe::writers_queue(id) {
+                Some(q) => crate::scheduler::wait_until(&q, 0, || pipe::has_space(id)),
+                None => return SyscallError::NotFound.to_u64(),
+            },
             Err(None) => return SyscallError::NotFound.to_u64(),
         }
     }
 }
 
+/// What `sys_read` parks on when the fd has nothing to give. Each variant
+/// carries what its own re-check needs — the queue is registered on *before*
+/// the condition is re-read, which is what closes the check-then-block window.
 enum ReadBlock {
-    Queue(WaitQueue),
-    /// Sources stage 5 has not converted yet.
-    Event(crate::scheduler::EventSource),
-    EventWithDeadline(crate::scheduler::EventSource, u64),
+    Pipe(alloc::sync::Arc<crate::sched::payload::KWaitQueue>, pipe::PipeId),
+    Audio,
+    Keyboard(u64),
 }
 
 fn sys_read(fd_num: u32, buf: &mut [u8]) -> u64 {
@@ -521,14 +525,14 @@ fn sys_read(fd_num: u32, buf: &mut [u8]) -> u64 {
                 None => {
                     let desc = data.fds.get(fd_num);
                     if matches!(desc, Some(fd::Descriptor::Keyboard)) {
-                        Err(Some(ReadBlock::Event(crate::scheduler::EventSource::Keyboard)))
+                        Err(Some(ReadBlock::Keyboard(0)))
                     } else if matches!(desc, Some(fd::Descriptor::Audio { info_read: true, .. })) {
-                        Err(Some(ReadBlock::Queue(WaitQueue::audio())))
+                        Err(Some(ReadBlock::Audio))
                     } else if let Some(id) = desc.and_then(|d| d.pipe_id_read()) {
-                        Err(Some(ReadBlock::Queue(WaitQueue::pipe_readable(id))))
+                        Err(pipe::readers_queue(id).map(|q| ReadBlock::Pipe(q, id)))
                     } else if matches!(desc, Some(fd::Descriptor::SerialConsole)) {
                         let deadline = crate::clock::nanos_since_boot() + 10_000_000;
-                        Err(Some(ReadBlock::EventWithDeadline(crate::scheduler::EventSource::Keyboard, deadline)))
+                        Err(Some(ReadBlock::Keyboard(deadline)))
                     } else {
                         Err(None)
                     }
@@ -540,9 +544,19 @@ fn sys_read(fd_num: u32, buf: &mut [u8]) -> u64 {
                 if let Some(id) = pipe_id { process::wake_pipe_writers(id); }
                 return n;
             }
-            Err(Some(ReadBlock::Queue(queue))) => queue.wait(0),
-            Err(Some(ReadBlock::Event(event))) => process::block(Some(event), 0),
-            Err(Some(ReadBlock::EventWithDeadline(event, deadline))) => process::block(Some(event), deadline),
+            Err(Some(ReadBlock::Pipe(queue, id))) => {
+                crate::scheduler::wait_until(&queue, 0, || pipe::has_data(id))
+            }
+            Err(Some(ReadBlock::Audio)) => crate::scheduler::wait_until(
+                &crate::sched::waitqs::AUDIO,
+                0,
+                crate::audio::has_pending,
+            ),
+            Err(Some(ReadBlock::Keyboard(deadline))) => crate::scheduler::wait_until(
+                &crate::sched::waitqs::KEYBOARD,
+                deadline,
+                crate::keyboard::has_data,
+            ),
             Err(None) => return SyscallError::NotFound.to_u64(),
         }
     }
@@ -841,12 +855,12 @@ fn sys_waitpid(pid: u64, flags: u64) -> u64 {
     const WNOHANG: u64 = 1;
     let child_pid = process::Pid::from_raw(pid as u32);
     let caller = process::current_process();
-    let queue = WaitQueue::task();
+    let queue = crate::scheduler::park_lot();
     loop {
         // Registered before the table is read, so a child that exits in the
-        // park window marks the ticket instead of aiming a wake at a thread
-        // that is not parked yet.
-        let ticket = queue.prepare_wait();
+        // park window claims the registration instead of aiming a wake at a
+        // thread that is not parked yet.
+        let ticket = crate::scheduler::prepare_wait(queue);
         match process::wait_child_zombie(child_pid, caller) {
             Ok(Some(code)) => {
                 ticket.cancel();
@@ -933,7 +947,12 @@ fn sys_accept(fd_num: u32) -> u64 {
                 Err(e) => e.to_u64(),
             };
         }
-        WaitQueue::listener(listener_id).wait(0);
+        match crate::listener::acceptors(listener_id) {
+            Some(q) => crate::scheduler::wait_until(&q, 0, || {
+                crate::listener::has_pending_by_id(listener_id)
+            }),
+            None => return SyscallError::NotFound.to_u64(),
+        }
     }
 }
 
@@ -970,8 +989,10 @@ fn sys_connect(name: &str) -> u64 {
 /// Wake processes interested in this specific listener (direct blockers + io_uring watchers).
 fn wake_poll_waiters(name: &str) {
     let Some(id) = crate::listener::listener_id(name) else { return };
+    if let Some(queue) = crate::listener::acceptors(id) {
+        crate::sched::waitqs::wake_all(&queue);
+    }
     let event = crate::scheduler::EventSource::Listener(id);
-    crate::scheduler::wake_by_event(event);
     let watchers = crate::listener::io_uring_watchers(id);
     if !watchers.is_empty() {
         crate::io_uring::complete_pending_for_event(&watchers, event);
@@ -1097,9 +1118,9 @@ fn sys_munmap(addr: u64, _size: u64) -> u64 {
 fn sys_thread_join(tid: u64) -> u64 {
     let tid = process::Tid::from_raw(tid as u32);
     let caller = process::current_process();
-    let queue = WaitQueue::task();
+    let queue = crate::scheduler::park_lot();
     loop {
-        let ticket = queue.prepare_wait();
+        let ticket = crate::scheduler::prepare_wait(queue);
         match process::wait_thread_zombie(tid, caller) {
             Ok(Some(_)) => {
                 ticket.cancel();
@@ -1157,7 +1178,7 @@ fn sys_sysinfo(buf: &mut [u8]) -> u64 {
         let state: u8 = if matches!(thread.state(), process::ProcessState::Zombie(_)) {
             3
         } else {
-            crate::scheduler::task_sched_state(crate::scheduler::TaskId(proc.pid(), tid))
+            thread.sched().map_or(3, crate::scheduler::task_sched_state)
         };
         let is_thread: u8 = if tid != proc.main_tid() { 1 } else { 0 };
         let parent_pid = proc.parent().unwrap_or(process::Pid::MAX);
@@ -1174,7 +1195,7 @@ fn sys_sysinfo(buf: &mut [u8]) -> u64 {
         } else {
             0
         };
-        let cpu_ns = crate::scheduler::task_cpu_ns(crate::scheduler::TaskId(proc.pid(), tid));
+        let cpu_ns = thread.sched().map_or(0, crate::scheduler::task_cpu_ns);
         let pid = proc.pid();
 
         // Use thread name if set, otherwise process name
@@ -1217,7 +1238,9 @@ fn sys_net_recv(buf: &mut [u8], timeout_nanos: u64) -> u64 {
         if deadline > 0 && crate::clock::nanos_since_boot() >= deadline {
             return 0;
         }
-        process::block(Some(crate::scheduler::EventSource::Network), deadline);
+        crate::scheduler::wait_until(&crate::sched::waitqs::NETWORK, deadline, || {
+            crate::net::has_packet()
+        });
     }
 }
 
@@ -1225,7 +1248,10 @@ fn sys_nanosleep(nanos: u64) -> u64 {
     let deadline = crate::clock::nanos_since_boot().saturating_add(nanos);
     // No condition to re-check: the deadline is the wake, and one that has
     // already passed fires at the next scheduler entry.
-    crate::scheduler::block_on(WaitQueue::task().prepare_wait(), deadline);
+    crate::scheduler::block_on(
+        crate::scheduler::prepare_wait(crate::scheduler::park_lot()),
+        deadline,
+    );
     0
 }
 

@@ -37,7 +37,7 @@ mod symbols;
 mod process;
 mod loader;
 mod scheduler;
-mod waitq;
+mod sched;
 mod hw;
 mod preempt;
 mod irq_ring;
@@ -359,5 +359,5 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     log!("Keyboard layout: {}", crate::keyboard::layout_name());
 
     smp::set_ready();
-    crate::scheduler::schedule_no_return();
+    crate::scheduler::enter_idle_loop();
 }

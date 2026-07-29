@@ -1,0 +1,567 @@
+//! The kernel driver for the scheduler core — spec §6.2, §6.3, §7.5.
+//!
+//! This file is the whitelist of §3: percpu plumbing, the asm switch, the idle
+//! loop, the trampoline. It decides nothing. Every scheduling decision, state
+//! transition and ordering-sensitive step happens above it, in `toyos-sched`,
+//! where the simulator drives the same code.
+//!
+//! The shape of a scheduler entry is fixed and total:
+//!
+//! ```text
+//! preempt::disable()
+//! drain device IRQ records into wakes
+//! with_cpu(|cpu| SchedPass::begin(cpu, env, now).dispose_*().finish())
+//! match action { Run(tok) => switch(tok), Resume => {}, Idle(tok) => halt }
+//! preempt::enable_no_resched()
+//! ```
+//!
+//! Everything after the switch belongs to whichever task resumes on this
+//! stack, and there is nothing scheduler-related left to do there — no guard to
+//! release, no outgoing task to park. That is what park-before-switch buys, and
+//! it is sound only because a wake for the just-parked task is a *message to
+//! this same CPU*, which cannot be consumed before the switch completes.
+
+use alloc::boxed::Box;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+use core::arch::{asm, naked_asm};
+use core::cell::UnsafeCell;
+use core::ptr;
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
+
+use toyos_sched::cpu::{Action, CpuHandle, CpuHandles, CpuSched, Env, SchedPass};
+use toyos_sched::fair::Frontier;
+use toyos_sched::hw::{CpuId, Hw, Kicker, Machine, Nanos};
+use toyos_sched::mailbox::{mailbox, Kick, PreemptGuard, Urgency};
+use toyos_sched::msg::Msg;
+use toyos_sched::task::{RtState, TaskBuilder, TaskKey};
+use toyos_sched::waitq::CommittedTicket;
+
+use crate::arch::percpu;
+use crate::hw::HW;
+use crate::process::{OwnedAlloc, PageTables, TaskId, KERNEL_STACK_SIZE};
+
+use super::payload::{KMsg, KShare, KShared, KernelCtx, KernelPayload, TaskHandle, ThreadSched};
+use super::MAX_CPUS;
+
+// ---------------------------------------------------------------------------
+// Preemption proof
+// ---------------------------------------------------------------------------
+
+/// Proof that preemption is disabled for as long as the borrow lasts (spec
+/// §7.2's N3). Constructible only by the two functions below, both of which
+/// bracket it with the preempt count.
+pub struct PreemptOff(());
+
+// SAFETY: every constructor raises the kernel's preempt count first and lowers
+// it only after the borrow ends, so the executing context cannot be
+// descheduled while a value of this type is alive.
+unsafe impl PreemptGuard for PreemptOff {}
+
+/// Run `f` in a preempt-disabled region. Wake paths post mailbox messages from
+/// here; a request raised inside is honoured on the way out, which is how an
+/// RT wake reaches its own preemption.
+pub fn preempt_off<R>(f: impl FnOnce(&PreemptOff) -> R) -> R {
+    crate::preempt::disable();
+    let result = f(&PreemptOff(()));
+    crate::preempt::enable();
+    result
+}
+
+// ---------------------------------------------------------------------------
+// The globally shared, Sync half
+// ---------------------------------------------------------------------------
+
+static CPUS: AtomicPtr<CpuHandles<KMsg>> = AtomicPtr::new(ptr::null_mut());
+static FRONTIER: Frontier = Frontier::new();
+static NEXT_KEY: AtomicU64 = AtomicU64::new(1);
+
+/// Per-CPU CPU-time counters, for `total_cpu_ns`. Cache-line padded.
+#[repr(align(64))]
+struct CpuTime(AtomicU64);
+static CPU_TIME_NS: [CpuTime; MAX_CPUS] = [const { CpuTime(AtomicU64::new(0)) }; MAX_CPUS];
+
+pub fn cpus() -> &'static CpuHandles<KMsg> {
+    let ptr = CPUS.load(Ordering::Acquire);
+    assert!(!ptr.is_null(), "scheduler used before sched::init");
+    // SAFETY: set once by `init` from a leaked Box, never cleared.
+    unsafe { &*ptr }
+}
+
+pub fn frontier() -> &'static Frontier {
+    &FRONTIER
+}
+
+/// Monotonic and never reused, so a message about a dead task is provably
+/// stale rather than ambiguously about its successor (spec §5.1). Deliberately
+/// not `TaskId`: pids and tids are recycled.
+fn next_key() -> TaskKey {
+    TaskKey(NEXT_KEY.fetch_add(1, Ordering::Relaxed))
+}
+
+pub fn total_cpu_ns() -> u64 {
+    (0..crate::arch::smp::cpu_count() as usize)
+        .map(|i| CPU_TIME_NS[i].0.load(Ordering::Relaxed))
+        .sum()
+}
+
+// ---------------------------------------------------------------------------
+// The percpu CpuSched slot
+// ---------------------------------------------------------------------------
+
+struct SchedSlot(UnsafeCell<Option<CpuSched<KernelPayload>>>);
+
+// SAFETY: the cell is only ever reached through `with_cpu`, which indexes by
+// the *calling* CPU's own id and refuses reentry. `CpuSched` itself is `!Sync`,
+// so nothing it contains can escape into another CPU by any other route.
+unsafe impl Sync for SchedSlot {}
+
+static SCHEDS: [SchedSlot; MAX_CPUS] = [const { SchedSlot(UnsafeCell::new(None)) }; MAX_CPUS];
+static IN_PASS: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
+
+/// Is this CPU inside a pass? A nested pass is a bug, not something to defer —
+/// but the preempt poll can legitimately ask, and the panic path must know
+/// before it tries to rejoin.
+pub fn in_pass() -> bool {
+    IN_PASS[percpu::cpu_id() as usize].load(Ordering::Relaxed)
+}
+
+/// The only accessor. Panics on reentry: the busy flag is the typed
+/// replacement for `IN_SCHEDULE`, and a nested pass would alias `&mut`.
+fn with_cpu<R>(f: impl FnOnce(&mut CpuSched<KernelPayload>) -> R) -> R {
+    let cpu = percpu::cpu_id() as usize;
+    assert!(
+        !IN_PASS[cpu].swap(true, Ordering::Acquire),
+        "nested scheduler pass on cpu {cpu}",
+    );
+    // SAFETY: exclusive by the flag above, and by CpuId — no other CPU indexes
+    // this slot.
+    let sched = unsafe { (*SCHEDS[cpu].0.get()).as_mut() }
+        .unwrap_or_else(|| panic!("cpu {cpu} has no CpuSched"));
+    let result = f(sched);
+    IN_PASS[cpu].store(false, Ordering::Release);
+    result
+}
+
+/// A read-only peek for diagnostics that must not fail while a pass runs.
+fn try_with_cpu<R>(f: impl FnOnce(&CpuSched<KernelPayload>) -> R) -> Option<R> {
+    let cpu = percpu::cpu_id() as usize;
+    if IN_PASS[cpu].load(Ordering::Relaxed) {
+        return None;
+    }
+    // SAFETY: as `with_cpu`, and shared rather than exclusive.
+    let sched = unsafe { (*SCHEDS[cpu].0.get()).as_ref() }?;
+    Some(f(sched))
+}
+
+// ---------------------------------------------------------------------------
+// Boot
+// ---------------------------------------------------------------------------
+
+/// Build every CPU's mailbox and handle, and the BSP's `CpuSched`. Called once,
+/// before any task exists.
+pub fn init() {
+    let count = crate::arch::smp::cpu_count() as usize;
+    assert!(count <= MAX_CPUS, "cpu count {count} exceeds MAX_CPUS");
+    let mut handles = Vec::with_capacity(count);
+    for cpu in 0..count {
+        let (tx, rx) = mailbox::<KMsg>();
+        handles.push(CpuHandle::new(CpuId(cpu as u32), tx));
+        // SAFETY: single-threaded boot; the APs have not joined yet.
+        unsafe {
+            *SCHEDS[cpu].0.get() = Some(CpuSched::new(CpuId(cpu as u32), rx, idle_ctx()));
+        }
+    }
+    CPUS.store(
+        Box::into_raw(Box::new(CpuHandles::new(handles))),
+        Ordering::Release,
+    );
+}
+
+/// The context a CPU runs on when it has nothing to do. Having one is what lets
+/// a pass free the previous zombie — an idle CPU never stands on a dead task's
+/// stack.
+fn idle_ctx() -> KernelCtx {
+    KernelCtx {
+        rsp: 0,
+        cr3: crate::mm::paging::kernel_cr3(),
+        fs_base: 0,
+        kernel_stack_top: 0,
+        id: None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Spawn
+// ---------------------------------------------------------------------------
+
+/// Least-loaded CPU by published ready count (spec §9.4), scanning from a
+/// rotating start so that ties spread instead of piling on one CPU.
+///
+/// The rotation is load-bearing at boot and only there: `publish_load` runs at
+/// the end of a pass, and the init programs are all spawned before any CPU has
+/// run one, so every published load is still zero and a fixed scan order would
+/// put the whole system on CPU 0 — with balance off (7a) it would stay there.
+fn placement() -> CpuId {
+    static ROTATE: AtomicU64 = AtomicU64::new(0);
+    let count = crate::arch::smp::cpu_count();
+    let start = (ROTATE.fetch_add(1, Ordering::Relaxed) % count as u64) as u32;
+    let mut best = CpuId(start);
+    let mut best_load = cpus().get(best).load();
+    for offset in 1..count {
+        let cpu = CpuId((start + offset) % count);
+        let load = cpus().get(cpu).load();
+        if load < best_load {
+            best_load = load;
+            best = cpu;
+        }
+    }
+    best
+}
+
+/// Everything a new thread needs. `entry_rsp` points at the trampoline frame
+/// `alloc_kernel_stack` built.
+pub struct NewTask {
+    pub id: TaskId,
+    pub kernel_stack: OwnedAlloc,
+    pub entry_rsp: u64,
+    pub address_space: Option<PageTables>,
+    pub fs_base: u64,
+    pub share: Arc<KShare>,
+}
+
+/// Place a new task by message — never by reaching into the destination's
+/// queue (spec §9.4). Returns what the process table keeps.
+pub fn spawn(new: NewTask) -> ThreadSched {
+    let cr3 = new
+        .address_space
+        .as_ref()
+        .expect("spawn: task without an address space")
+        .lock()
+        .cr3();
+    let kernel_stack_top = new.kernel_stack.ptr() as u64 + KERNEL_STACK_SIZE as u64;
+    let ctx = KernelCtx {
+        rsp: new.entry_rsp,
+        cr3,
+        fs_base: new.fs_base,
+        kernel_stack_top,
+        id: Some(new.id),
+    };
+    let handle = Arc::new(TaskHandle::new());
+    let task = TaskBuilder {
+        key: next_key(),
+        share: new.share,
+        ctx,
+        ext: KernelPayload {
+            id: new.id,
+            kernel_stack: new.kernel_stack,
+            address_space: new.address_space,
+            handle: handle.clone(),
+        },
+        rt: RtState::default(),
+    }
+    .build(placement(), HW.now());
+    let sched = ThreadSched {
+        handle,
+        shared: task.shared().clone(),
+    };
+    let dst = match task.shared().state() {
+        toyos_sched::task::TaskState::InTransit(cpu) => cpu,
+        state => panic!("a freshly built task is not in transit: {state:?}"),
+    };
+    preempt_off(|p| {
+        if cpus()
+            .get(dst)
+            .post_owned(Msg::Adopt { task }, Msg::adopt_node, Urgency::Normal, p)
+            == Kick::Send
+        {
+            HW.kick(dst);
+        }
+    });
+    sched
+}
+
+// ---------------------------------------------------------------------------
+// Passes
+// ---------------------------------------------------------------------------
+
+pub enum Dispose {
+    /// An IRQ-exit poll: the pass decides for itself whether the running task
+    /// keeps the CPU.
+    None,
+    Yield,
+    Block(CommittedTicket<KMsg>, Option<Nanos>),
+    Exit,
+}
+
+/// Run one scheduler pass and execute its action.
+///
+/// The preempt count is raised here and lowered by whichever context comes back
+/// on this stack: this one after the switch returns, or a fresh task's
+/// trampoline. It balances per context, not per call.
+pub fn pass(dispose: Dispose) {
+    crate::preempt::disable();
+    drain_irqs();
+    let now = HW.now();
+    let action = with_cpu(|cpu| {
+        let env = Env {
+            hw: &HW,
+            cpus: cpus(),
+            frontier: &FRONTIER,
+            preempt: &PreemptOff(()),
+            steal: false,
+        };
+        let pass = SchedPass::begin(cpu, env, now);
+        if let Some(current) = pass.cpu().running() {
+            check_stack_canary(current.ext());
+            current.ext().handle.publish(current.acct(), None);
+        }
+        let disposed = match dispose {
+            Dispose::None => pass.dispose_none(),
+            Dispose::Yield => pass.dispose_yield(),
+            Dispose::Block(ticket, deadline) => pass.dispose_block(ticket, deadline),
+            Dispose::Exit => pass.dispose_exit(),
+        };
+        disposed.finish()
+    });
+    charge_cpu_time(now);
+    with_cpu(|cpu| {
+        if let Some(current) = cpu.running() {
+            current.ext().handle.publish(current.acct(), Some(now));
+        }
+    });
+    execute(action);
+    crate::preempt::enable_no_resched();
+}
+
+/// Per-CPU busy time, for `sysinfo`. Derived from the same `now` the pass used,
+/// so it cannot disagree with the task's own charge.
+fn charge_cpu_time(now: Nanos) {
+    let cpu = percpu::cpu_id() as usize;
+    static LAST: [CpuTime; MAX_CPUS] = [const { CpuTime(AtomicU64::new(0)) }; MAX_CPUS];
+    let last = LAST[cpu].0.swap(now.0, Ordering::Relaxed);
+    if last != 0 && percpu::current_tid().is_some() {
+        CPU_TIME_NS[cpu]
+            .0
+            .fetch_add(now.0.saturating_sub(last), Ordering::Relaxed);
+    }
+}
+
+fn execute(action: Action<KernelPayload>) {
+    match action {
+        // SAFETY: the token came from `finish`, which built it from live
+        // Box-backed task records; those records outlive the switch because the
+        // only way to free one is `Hw::release`, which runs in a later pass.
+        Action::Run(token) => unsafe { HW.switch(token) },
+        Action::Resume => {}
+        Action::Idle(token) => {
+            // The final look, with interrupts off. A message that landed after
+            // the pass's own check raised the doorbell, and its producer saw
+            // SLEEPING and sent the IPI; taking that IPI here as an ordinary
+            // interrupt and then halting is exactly B4, so re-check first.
+            //
+            // Not `Machine::irq_guard`: both exits must *set* IF — the halt
+            // because `sti;hlt` is one atom, the stay-awake exit because panic
+            // recovery reaches the idle loop with IF already 0.
+            unsafe { asm!("cli", options(nomem, nostack)) };
+            let cpu = CpuId(percpu::cpu_id());
+            let awake = cpus().get(cpu).doorbell().kick_pending()
+                || crate::preempt::need_resched()
+                || crate::irq_ring::any_pending_self()
+                || !with_cpu(|c| c.mailbox_is_empty());
+            if awake {
+                unsafe { asm!("sti", options(nomem, nostack)) };
+                drop(token);
+                return;
+            }
+            HW.idle_wait(token);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Device IRQ records → wakes
+// ---------------------------------------------------------------------------
+
+/// Consume this CPU's `irq_ring` records (spec §11 stage 2) and turn them into
+/// wakes. Runs at the top of every pass, before the mailbox drain, so a wake
+/// posted here is in the run queue by the time the pass picks.
+fn drain_irqs() {
+    // xHCI (keyboard/mouse): the controller poll dispatches HID reports, which
+    // wake the keyboard/mouse queues from inside the driver.
+    crate::drivers::xhci::poll_if_pending();
+
+    if crate::irq_ring::take(crate::irq_ring::IrqSource::Net).is_some() {
+        crate::net::wake_waiters();
+    }
+    if crate::irq_ring::take(crate::irq_ring::IrqSource::Audio).is_some() {
+        crate::audio::wake_waiters();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Idle
+// ---------------------------------------------------------------------------
+
+static IDLE_HEALTH_COUNTER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Leave the current stack for this CPU's idle stack and never come back.
+/// Boot and AP bring-up enter the scheduler here.
+pub fn enter_idle_loop() -> ! {
+    percpu::set_current_tid(None);
+    percpu::set_current_pid(None);
+    unsafe { percpu::set_kernel_stack(percpu::idle_stack_top()) };
+    unsafe { crate::mm::paging::kernel_cr3().activate() };
+    let sp = percpu::idle_stack_top();
+    unsafe {
+        asm!(
+            "mov rsp, {sp}",
+            "jmp {func}",
+            sp = in(reg) sp,
+            func = in(reg) idle_loop as *const () as usize,
+            options(noreturn),
+        );
+    }
+}
+
+extern "C" fn idle_loop() -> ! {
+    loop {
+        if IDLE_HEALTH_COUNTER.fetch_add(1, Ordering::Relaxed) % 1000 == 999 {
+            crate::scheduler::log_health();
+        }
+        crate::scheduler::reap_poisoned();
+        drain_serial();
+        pass(Dispose::None);
+    }
+}
+
+/// Flush buffered log output before sleeping. One chunk per backend
+/// acquisition: the guard holds interrupts off for its lifetime, so a
+/// full-ring drain under one guard would block them for up to 64 KiB of
+/// serial I/O.
+fn drain_serial() {
+    loop {
+        let mut backend = crate::drivers::serial::BackendGuard::lock();
+        if crate::drivers::log_ring::drain_chunk_to_serial(&mut backend) == 0 {
+            break;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Current-task accessors
+// ---------------------------------------------------------------------------
+
+/// The running task's rendezvous word, cloned so the caller can hold it across
+/// its own block without borrowing the `CpuSched`.
+pub fn current_shared() -> Option<Arc<KShared>> {
+    try_with_cpu(|cpu| cpu.running().map(|t| t.shared().clone())).flatten()
+}
+
+pub fn current_cpu() -> CpuId {
+    CpuId(percpu::cpu_id())
+}
+
+pub fn current_address_space() -> Option<PageTables> {
+    try_with_cpu(|cpu| {
+        cpu.running()
+            .and_then(|t| t.ext().address_space.clone())
+    })
+    .flatten()
+}
+
+pub fn current_handle() -> Option<Arc<TaskHandle>> {
+    try_with_cpu(|cpu| cpu.running().map(|t| t.ext().handle.clone())).flatten()
+}
+
+pub fn with_current_acct<R>(
+    f: impl FnOnce(&toyos_sched::task::TaskAccounting) -> R,
+) -> Option<R> {
+    try_with_cpu(|cpu| cpu.running().map(|t| f(t.acct()))).flatten()
+}
+
+pub fn set_current_rt(permanent: bool) {
+    with_cpu(|cpu| cpu.set_current_rt(permanent));
+}
+
+pub fn boost_current(until: Nanos) {
+    with_cpu(|cpu| cpu.boost_current(until));
+}
+
+pub fn current_is_rt() -> bool {
+    try_with_cpu(|cpu| cpu.running().is_some_and(|t| t.rt().is_rt())).unwrap_or(false)
+}
+
+pub fn ready_len() -> usize {
+    try_with_cpu(|cpu| cpu.ready_len()).unwrap_or(0)
+}
+
+pub fn parked_len() -> usize {
+    try_with_cpu(|cpu| cpu.parked().count()).unwrap_or(0)
+}
+
+pub fn for_each_parked(
+    mut f: impl FnMut(TaskKey, Option<Nanos>, toyos_sched::task::WaitClass),
+) {
+    try_with_cpu(|cpu| {
+        for (key, deadline, class) in cpu.parked() {
+            f(key, deadline, class);
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// The trampoline and the switch
+// ---------------------------------------------------------------------------
+
+/// Tail of the first switch into a fresh task, called by
+/// `process_start`/`thread_start` before the first `iretq`.
+///
+/// There is no lock to release and no outgoing task to park — the pass that
+/// switched here ended before the switch. All that is owed is the other half of
+/// that pass's preempt-count bracket, which this context now inherits.
+pub extern "sysv64" fn trampoline_entry() {
+    crate::preempt::enable_no_resched();
+    crate::arch::idt::kernel_exit_to_user_check();
+}
+
+const STACK_CANARY: u64 = 0xDEAD_BEEF_CAFE_BABE;
+
+pub fn write_stack_canary(stack: &OwnedAlloc) {
+    unsafe { *(stack.ptr() as *mut u64) = STACK_CANARY };
+}
+
+fn check_stack_canary(payload: &KernelPayload) {
+    let canary = unsafe { *(payload.kernel_stack.ptr() as *const u64) };
+    if canary != STACK_CANARY {
+        panic!(
+            "KERNEL STACK OVERFLOW: tid={} canary={:#x} expected={:#x}",
+            payload.id.1, canary, STACK_CANARY
+        );
+    }
+}
+
+/// Callee-saved register save/restore. Unchanged from the old scheduler — the
+/// switch was never the part that was wrong.
+#[unsafe(naked)]
+pub(crate) unsafe extern "C" fn context_switch(old_rsp: *mut u64, new_rsp: u64) {
+    naked_asm!(
+        "pushfq",
+        "push rbp",
+        "push rbx",
+        "push r12",
+        "push r13",
+        "push r14",
+        "push r15",
+        "mov [rdi], rsp",
+        "mov rsp, rsi",
+        "pop r15",
+        "pop r14",
+        "pop r13",
+        "pop r12",
+        "pop rbx",
+        "pop rbp",
+        "popfq",
+        "ret",
+    );
+}
