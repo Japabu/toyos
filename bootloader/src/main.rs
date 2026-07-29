@@ -59,10 +59,33 @@ fn load_file_bytes(handle: Handle, system_table: &SystemTable<Boot>, path: &CStr
         .expect("Failed to get file info");
 
     let size = file_info.file_size() as usize;
-    let mut bytes = vec![0; size];
-    file.read(&mut bytes).expect("Failed to read file");
+    let mut bytes = alloc_uninit(size);
+    let read = file.read(&mut bytes).expect("Failed to read file");
+    // Every byte handed back must have come from the file: the buffer was never
+    // zeroed, so a short read would leave allocator garbage in the tail and the
+    // caller would parse it as image content.
+    assert_eq!(read, size, "short read: {read} of {size} bytes");
 
     bytes
+}
+
+/// A buffer to be filled by a read, allocated *without* zeroing it first.
+///
+/// `vec![0; size]` here cost a full pass of `memset` over the initrd — 635 MiB
+/// on the current image — immediately before `File::read` overwrote every byte
+/// of it. The chain is not obvious, which is why it survived: `vec![0u8; n]`
+/// takes `SpecFromElem`'s zero branch to `RawVec::with_capacity_zeroed_in`,
+/// which calls `alloc_zeroed`; uefi 0.26's allocator implements only `alloc`
+/// and `dealloc`, so that falls through to `GlobalAlloc`'s default, which is
+/// `alloc` followed by `write_bytes(ptr, 0, size)`. Under TCG that pass runs on
+/// the vCPU thread and buys nothing.
+///
+/// The caller must therefore check that the read filled the whole buffer.
+fn alloc_uninit(size: usize) -> vec::Vec<u8> {
+    let layout = Layout::from_size_align(size, 1).expect("invalid layout");
+    let ptr = unsafe { alloc::alloc::alloc(layout) };
+    assert!(!ptr.is_null(), "file buffer allocation failed ({size} bytes)");
+    unsafe { vec::Vec::from_raw_parts(ptr, size, size) }
 }
 
 /// Kernel virtual base: all physical memory is mapped here in the kernel's address space.
