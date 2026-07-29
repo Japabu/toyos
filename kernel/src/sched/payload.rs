@@ -10,7 +10,7 @@
 //! payload, which only `Hw::release` ever consumes.
 
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use toyos_sched::fair::{FairShare, ShareState};
 use toyos_sched::hw::Nanos;
@@ -111,6 +111,15 @@ pub struct TaskHandle {
     /// between passes.
     running_since: AtomicU64,
     acct: Lock<TaskAccounting>,
+    /// Set by `Hw::release`, after the payload is dropped. The one fact a
+    /// retirer needs: the thread is off every CPU and its kernel stack and
+    /// address-space reference are gone.
+    released: AtomicBool,
+    /// Whoever is waiting for that (spec §8.6: a waitable object owns its
+    /// queue). At most one waiter exists — retiring is single-retirer — but a
+    /// queue costs the same as a slot and makes the wait the ordinary
+    /// register/re-check/park shape instead of a bespoke handshake.
+    released_wait: KWaitQueue,
 }
 
 impl TaskHandle {
@@ -119,6 +128,8 @@ impl TaskHandle {
             cpu_ns: AtomicU64::new(0),
             running_since: AtomicU64::new(0),
             acct: Lock::new(TaskAccounting::default()),
+            released: AtomicBool::new(false),
+            released_wait: static_queue(WaitClass::Other),
         }
     }
 
@@ -134,6 +145,22 @@ impl TaskHandle {
         self.cpu_ns.store(acct.cpu_ns, Ordering::Relaxed);
         self.running_since.store(0, Ordering::Relaxed);
         *self.acct.lock() = acct;
+    }
+
+    /// Announce the death, *after* the payload has been dropped — that
+    /// ordering is the whole guarantee a retirer buys with its park.
+    pub(crate) fn publish_released(&self) {
+        self.released.store(true, Ordering::Release);
+        super::waitqs::wake_all(&self.released_wait);
+    }
+
+    /// Has `Hw::release` run for this thread? The retire wait's condition.
+    pub fn released(&self) -> bool {
+        self.released.load(Ordering::Acquire)
+    }
+
+    pub fn released_wait(&self) -> &KWaitQueue {
+        &self.released_wait
     }
 
     pub fn cpu_ns(&self) -> u64 {

@@ -171,8 +171,16 @@ impl Hw for KernelHw {
     /// the one that killed it, which by construction runs on another stack —
     /// so dropping the payload here frees a kernel stack nothing stands on and
     /// releases the address-space `Arc` for the one and only time.
+    ///
+    /// It is also where a retirer's wait ends (stage 7b). The announcement is
+    /// deliberately the *last* thing: `retire_task` returns to a caller that is
+    /// about to free memory the dead thread's page tables mapped, and what
+    /// makes that safe is not that the thread stopped running but that this
+    /// drop already happened.
     fn release(&self, _key: TaskKey, payload: KernelPayload, acct: TaskAccounting) {
-        payload.handle.finalize(acct);
+        let handle = payload.handle.clone();
+        handle.finalize(acct);
         drop(payload);
+        handle.publish_released();
     }
 }

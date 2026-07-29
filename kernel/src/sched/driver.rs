@@ -203,7 +203,9 @@ fn idle_ctx() -> KernelCtx {
 /// The rotation is load-bearing at boot and only there: `publish_load` runs at
 /// the end of a pass, and the init programs are all spawned before any CPU has
 /// run one, so every published load is still zero and a fixed scan order would
-/// put the whole system on CPU 0 — with balance off (7a) it would stay there.
+/// put the whole system on CPU 0. Balance (7b) would eventually pull them
+/// apart, but "eventually" is measured in idle passes, and boot has none to
+/// spare.
 fn placement() -> CpuId {
     static ROTATE: AtomicU64 = AtomicU64::new(0);
     let count = crate::arch::smp::cpu_count();
@@ -295,6 +297,29 @@ pub enum Dispose {
     Exit,
 }
 
+/// The environment every pass runs against.
+///
+/// `steal` is the one policy bit in it, and it is on: an idle pass probes the
+/// busiest CPU for work and a loaded pass answers probes from surplus (spec
+/// §7.7, §9.4's pull half). 7a shipped the cutover with it off so that the
+/// machinery change could be measured without balance moving underneath it;
+/// this is 7b turning it on. Without it a task woken onto a busy CPU simply
+/// waits there — which is invisible at `-smp 1` and is the whole smp=8 wake
+/// latency tail.
+///
+/// Taking the guard by reference rather than building one is what keeps the
+/// two pass entries from each having their own copy of this: the guard's
+/// lifetime is the pass's, and it belongs to the caller that raised the count.
+fn env(preempt: &PreemptOff) -> Env<'_, crate::hw::KernelHw, PreemptOff> {
+    Env {
+        hw: &HW,
+        cpus: cpus(),
+        frontier: &FRONTIER,
+        preempt,
+        steal: true,
+    }
+}
+
 /// Run one scheduler pass and execute its action.
 ///
 /// The preempt count is raised here and lowered by whichever context comes back
@@ -312,14 +337,7 @@ pub fn pass(dispose: Dispose) {
     drain_irqs();
     let now = HW.now();
     let action = with_cpu(|cpu| {
-        let env = Env {
-            hw: &HW,
-            cpus: cpus(),
-            frontier: &FRONTIER,
-            preempt: &PreemptOff(()),
-            steal: false,
-        };
-        let pass = SchedPass::begin(cpu, env, now);
+        let pass = SchedPass::begin(cpu, env(&PreemptOff(())), now);
         if let Some(current) = pass.cpu().running() {
             check_stack_canary(current.ext());
             current.ext().handle.publish(current.acct(), None);
@@ -421,14 +439,7 @@ pub fn pass_block(ticket: Ticket<'_>, deadline: Option<Nanos>) {
     drain_irqs();
     let now = HW.now();
     let (action, registration) = with_cpu(|cpu| {
-        let env = Env {
-            hw: &HW,
-            cpus: cpus(),
-            frontier: &FRONTIER,
-            preempt: &PreemptOff(()),
-            steal: false,
-        };
-        let pass = SchedPass::begin(cpu, env, now);
+        let pass = SchedPass::begin(cpu, env(&PreemptOff(())), now);
         if let Some(current) = pass.cpu().running() {
             check_stack_canary(current.ext());
             current.ext().handle.publish(current.acct(), None);

@@ -1,6 +1,6 @@
 //! The kernel-facing scheduler API (spec §4's `kernel/src/sched/mod.rs`).
 //!
-//! Migration stage 7a: the kernel drives `toyos-sched`. Everything that used to
+//! Migration stage 7: the kernel drives `toyos-sched`. Everything that used to
 //! live in this file — the cross-CPU run queues, the global blocked pool, the
 //! kill set, the transit counter, `handle_outgoing`'s post-switch parking — has
 //! no successor, because the machine underneath now makes each of those bugs
@@ -8,9 +8,9 @@
 //! rest of the kernel calls, and it is *only* a surface: no decision, no state
 //! transition and no ordering-sensitive step happens in this file.
 //!
-//! What 7a deliberately does not do: `StealRequest` and balance stay switched
-//! off (`Env::steal = false`), so placement is spawn-time and wake-time push
-//! only. That is stage 7b.
+//! 7b completed it: `Env::steal` is on, so an idle CPU pulls work and a loaded
+//! one answers, and `retire_task` below is a message plus a park rather than a
+//! message plus a spin.
 
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -18,7 +18,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use hashbrown::HashMap;
 use toyos_sched::fair::{ShareState, QUANTUM_NS};
 use toyos_sched::hw::{Machine, Nanos};
-use toyos_sched::task::{TaskState, WakeCause, WakeReason};
+use toyos_sched::task::{WakeCause, WakeReason};
 
 use crate::arch::percpu;
 use crate::hw::HW;
@@ -347,13 +347,24 @@ pub fn futex_wake(phys_addr: DirectMap, count: usize) -> u64 {
 // Retire
 // ---------------------------------------------------------------------------
 
-/// Remove a thread from the scheduler with proof of absence: when this returns,
-/// `id` is not queued, not parked and not running, and it can never reappear —
-/// the state word says `Dead`, and the sticky kill bit means any CPU that ends
-/// up owning it reaps it on arrival (spec §7.6).
+/// Retire a thread and wait until its record is gone.
 ///
-/// Stage 7a keeps this synchronous because process teardown frees memory the
-/// target's page tables still map. Stage 7b makes it a bare message.
+/// The retire itself is one message (spec §7.6): the sticky kill bit plus
+/// `Msg::Retire` to the CPU the state word names, and whichever CPU ends up
+/// owning the task reaps it — parked, queued, in transit, or at the next safe
+/// point if it is running. Nothing scans anything and nobody spins.
+///
+/// The *wait* is what the callers need and why this is not fire-and-forget:
+/// process teardown frees memory the dead thread's page tables still map, so
+/// it may not run until that thread's payload — kernel stack and address-space
+/// reference — is dropped. That happens in `Hw::release`, which announces
+/// itself here. Stage 7a spun on the state word reading `Dead` instead, which
+/// was both a busy wait and a weaker guarantee: `Dead` is published by the
+/// reaping *transition*, one pass before the release, so the caller could free
+/// pages while the dying CPU was still standing on that thread's kernel stack.
+///
+/// The short block deadline is a liveness backstop, not a poll: the wake is a
+/// message like any other, and a lost one must fail loudly rather than hang.
 pub fn retire_task(sched: &ThreadSched) {
     if let (Some(pid), Some(tid)) = (percpu::current_pid(), percpu::current_tid()) {
         if let Some(handle) = driver::current_shared() {
@@ -364,18 +375,27 @@ pub fn retire_task(sched: &ThreadSched) {
             );
         }
     }
-    if sched.shared.state() == TaskState::Dead {
+    if sched.handle.released() {
         return;
     }
     preempt_off(|p| {
         toyos_sched::retire::begin(&sched.shared).post(cpus(), &HW, p);
     });
-    let deadline = crate::hw::now_ns() + 1_000_000_000;
-    while sched.shared.state() != TaskState::Dead {
-        if crate::hw::now_ns() > deadline {
-            panic!("retire_task: task still alive after 1s: {:?}", sched.shared.state());
+    const RECHECK_NS: u64 = 50_000_000;
+    let give_up = crate::hw::now_ns() + 1_000_000_000;
+    while !sched.handle.released() {
+        if crate::hw::now_ns() > give_up {
+            panic!(
+                "retire_task: task not released after 1s: {:?}",
+                sched.shared.state()
+            );
         }
-        yield_now();
+        let ticket = prepare_wait(sched.handle.released_wait());
+        if sched.handle.released() {
+            ticket.cancel();
+            return;
+        }
+        block_on(ticket, crate::hw::now_ns() + RECHECK_NS);
     }
 }
 
