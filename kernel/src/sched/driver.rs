@@ -301,6 +301,13 @@ pub enum Dispose {
 /// trampoline. It balances per context, not per call.
 pub fn pass(dispose: Dispose) {
     crate::preempt::disable();
+    // A pass *is* the reschedule the request asks for, so it owns the clear —
+    // and it must clear before it drains, so a request raised by this pass's
+    // own wakes survives into the next poll. Without this the idle loop never
+    // sleeps: a kick IPI to a halted CPU is taken in Ring 0, which sets
+    // `need_resched` and nothing else, and the pre-halt recheck then finds the
+    // request still standing on every iteration.
+    crate::preempt::clear_need_resched();
     drain_irqs();
     let now = HW.now();
     let action = with_cpu(|cpu| {
