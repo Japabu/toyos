@@ -49,10 +49,14 @@ impl<X: SchedPayload> SchedMsg for Msg<X> {
     }
 
     /// The spec's `Retire { key, notify: TaskRef }` carries the joiner to wake
-    /// once the reap completes. Deferred deliberately: join is an ordinary
-    /// `wake_direct` on the exiting task's own waiters (spec §8.6), so the
-    /// notify field would be a second wake path — precisely what §8.2 exists
-    /// to prevent.
+    /// once the reap completes. Deliberately absent, and settled at stage 7b:
+    /// join is an ordinary `wake_direct` on the exiting task's own waiters
+    /// (spec §8.6), so the notify field would be a second wake path — precisely
+    /// what §8.2 exists to prevent. It would also have to survive the message,
+    /// since a *running* target consumes the retire and then dies at some later
+    /// safe point. The environment's finalize sink is where both problems
+    /// vanish: it runs exactly once per task, after the payload is gone, and it
+    /// is the environment's own code, so the wait belongs there.
     fn retire(shared: Arc<TaskShared<Msg<X>>>) -> Self {
         Msg::Retire { shared }
     }

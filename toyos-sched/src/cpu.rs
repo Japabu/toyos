@@ -309,11 +309,11 @@ pub struct Env<'e, H: Hw, P: PreemptGuard> {
     /// mailbox pushes need (N3).
     pub preempt: &'e P,
     /// Whether an idle pass probes for work and a loaded pass answers probes
-    /// (spec §7.7, §9.4's pull half). The kernel runs with this **off** for
-    /// migration stage 7a, which cuts over to the machine with wake-time push
-    /// placement only and enables the pull half at 7b; the simulator runs with
-    /// it on. It is a field rather than a `cfg` because both settings must
-    /// stay compiled and simulatable while the migration is in flight.
+    /// (spec §7.7, §9.4's pull half). Migration stage 7a cut the kernel over
+    /// with this **off** — wake-time push placement only — so that the
+    /// machinery change could be measured without balance moving underneath
+    /// it; 7b turned it on. Both settings stay compiled and simulatable, which
+    /// is why it is a field and not a `cfg`.
     pub steal: bool,
 }
 
