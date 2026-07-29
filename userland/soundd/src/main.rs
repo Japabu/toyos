@@ -303,13 +303,18 @@ struct MixStats {
     /// that named no wake time contribute nothing; see the sample site.
     max_wake_lat_ns: u64,
     max_batch: u32,
+    /// Free buffers left unfilled because a streaming client was still
+    /// producing the period that belongs in them (§5.10). Each one is a period
+    /// of silence that was *not* put on the wire; it is the fix's activity
+    /// signal, not a fault, and it has no ceiling.
+    deferred: u32,
 }
 
 impl MixStats {
     fn report(&self, clients: usize) {
-        eprintln!("soundd: wakes={} completions={} submitted={} underruns={} drains={} max_wake_lat_us={} max_batch={} clients={}",
+        eprintln!("soundd: wakes={} completions={} submitted={} underruns={} drains={} max_wake_lat_us={} max_batch={} clients={} deferred={}",
             self.wakes, self.completions, self.submitted, self.underruns, self.drains,
-            self.max_wake_lat_ns / 1_000, self.max_batch, clients);
+            self.max_wake_lat_ns / 1_000, self.max_batch, clients, self.deferred);
     }
 }
 
@@ -562,6 +567,14 @@ fn mix_thread(
     // part-played, so more than `(num_buffers - 1)` periods of audio are still
     // unplayed at that instant. See the drain count site.
     let min_drain_nanos = (num_buffers as u64 - 1) * period_nanos;
+    // How much unplayed audio must still be on the wire before the mix loop may
+    // defer a buffer for a client that is mid-refill (§5.10). It has to cover
+    // the longest soundd can go between two submissions, which is its worst
+    // wake lateness: measured at 12.4 ms — 4.3 periods — over 76 config-runs
+    // after 824dd7d. Five periods rounds that up. This is a measurement, not a
+    // preference: re-derive it if that number moves.
+    assert!(num_buffers > 5, "soundd: pipeline too shallow to defer safely");
+    let refill_floor_nanos = 5 * period_nanos;
 
     let mut streams: Vec<ClientStream> = Vec::new();
     let mut free_mask: u32 = 0;
@@ -580,6 +593,13 @@ fn mix_thread(
     // Wall clock at the last instant the pipeline was known full. Re-stamped
     // after every refill; read only by the drain count site.
     let mut pipeline_filled_ns = syscall::clock_nanos();
+    // Wall clock at which everything submitted will have finished playing. The
+    // device plays one period per `period_nanos` and cannot play faster, so
+    // this is the one honest measure of how much audio is still on the wire.
+    // The free list is not: at stream start QEMU retires the whole pipeline
+    // 0.7-6.6 ms after a refill — up to 34x real time — so "free" says nothing
+    // about what has actually been heard.
+    let mut playout_until_ns = pipeline_filled_ns + num_buffers as u64 * period_nanos;
 
     syscall::set_rt_priority(true);
 
@@ -598,6 +618,9 @@ fn mix_thread(
     const TOKEN_AUDIO: u64 = u64::MAX - 1;
     const TOKEN_CMD: u64 = u64::MAX - 2;
 
+    // Buffers the previous cycle deliberately left unfilled. Read by the drain
+    // site, which must not mistake soundd's own restraint for a device stall.
+    let mut deferred_last: u32 = 0;
     let mut stats = MixStats::default();
     let mut next_stats_ns = syscall::clock_nanos() + STATS_INTERVAL_NANOS;
 
@@ -765,7 +788,13 @@ fn mix_thread(
         // genuine is suppressed — the bound is necessary for a real drain, not
         // sufficient — and a mid-stream drain still counts at any point in the
         // stream, because what it keys on is cause and not time since connect.
-        if free_mask.count_ones() as usize == num_buffers {
+        // A third way to arrive at a full free list without being late, and the
+        // only one soundd creates on purpose: the previous cycle deferred (see
+        // the mix loop). Those buffers are free because soundd chose not to
+        // fill them while audio it had already submitted was still playing —
+        // so the device did not run out, its period grid did not restart, and
+        // neither the count nor the DLL reset applies.
+        if free_mask.count_ones() as usize == num_buffers && deferred_last == 0 {
             let since_filled = syscall::clock_nanos().saturating_sub(pipeline_filled_ns);
             if was_streaming && since_filled >= min_drain_nanos {
                 stats.drains += 1;
@@ -773,11 +802,40 @@ fn mix_thread(
             dll.reset();
         }
 
-        let refilled = free_mask != 0;
+        let mut refilled = false;
+        let mut deferred: u32 = 0;
         while free_mask != 0 {
             let idx = free_mask.trailing_zeros() as usize;
             assert!(idx < num_buffers, "soundd: completion for nonexistent buffer {idx}");
             free_mask &= !(1 << idx);
+
+            // §5.10's "wait until clients have filled", reached by deferring
+            // the buffer instead of by blocking on the clients — which needs no
+            // reverse notification, because the ring indices soundd already
+            // maps say the same thing.
+            //
+            // A streaming client whose ring is empty was signalled microseconds
+            // ago and is mid-callback, not absent. The ring is `num_buffers`
+            // deep precisely so a mix cycle that outruns the client costs
+            // margin rather than audio; filling this buffer with silence spends
+            // that margin on the one thing it exists to prevent. Draining the
+            // whole ring in one cycle and then demanding it be refilled inside a
+            // single sub-period window is what put the gaps at exact multiples
+            // of the pipeline depth.
+            //
+            // Deferring is safe for exactly as long as audio already on the
+            // wire has not run out. A client that stops producing altogether
+            // still costs silence — at the floor, once the margin is genuinely
+            // spent, instead of immediately.
+            let now = syscall::clock_nanos();
+            let mid_refill = streams
+                .iter()
+                .any(|s| s.is_streaming() && s.slot_reader.peek().is_none());
+            if mid_refill && playout_until_ns.saturating_sub(now) >= refill_floor_nanos {
+                deferred |= 1 << idx;
+                stats.deferred += 1;
+                continue;
+            }
 
             mix_f32.fill(0.0);
 
@@ -806,14 +864,24 @@ fn mix_thread(
 
             toyos::audio::audio_submit(idx as u32, device_period_bytes as u32)
                 .unwrap_or_else(|e| panic!("soundd: audio_submit({idx}) failed: {e}"));
+            // One more period is on the wire. It plays after whatever was
+            // already queued, unless that has all played out, in which case the
+            // device restarts from now.
+            playout_until_ns = playout_until_ns.max(now) + period_nanos;
+            refilled = true;
             if !streams.is_empty() {
                 stats.submitted += 1;
                 if any_streaming && !any_data { stats.underruns += 1; }
             }
         }
+        // Deferred buffers stay free and are reconsidered next cycle, by which
+        // point the client has had another signal-to-mix window to produce.
+        free_mask |= deferred;
+        deferred_last = deferred;
         // Every buffer is in flight again. Not re-stamped when nothing was
-        // refilled: no audio was added, so the pipeline's remaining depth is
-        // still measured from the previous fill.
+        // submitted — including a cycle that only deferred: no audio was added,
+        // so the pipeline's remaining depth is still measured from the previous
+        // fill.
         if refilled {
             pipeline_filled_ns = syscall::clock_nanos();
         }
