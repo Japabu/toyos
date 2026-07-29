@@ -788,9 +788,18 @@ impl<X: SchedPayload> RunningTask<X> {
         ReadyTask(task)
     }
 
-    /// Park. The committed ticket is the proof that the state word is already
-    /// `Blocked` and that no wake was lost between registration and commit
-    /// (spec §8.1) — there is no way to park without one.
+    /// Park. The committed ticket is the proof that the commit CAS won, i.e.
+    /// that no wake was lost between registration and commit (spec §8.1) —
+    /// there is no way to park without one.
+    ///
+    /// The word may read `WakeQueued(cpu)` rather than `Blocked(cpu)`: a waker
+    /// is allowed to claim a `Blocked` task the instant the commit publishes it,
+    /// and there are instructions between the commit and this call. That claim
+    /// posted `Msg::Wake` to *this* CPU, and this pass has already drained its
+    /// mailbox — so the message is handled by the next pass, which finds the
+    /// task in `parked`. Parking it is therefore correct, and refusing to would
+    /// be asserting that a remote CPU cannot act between two of our own
+    /// instructions.
     pub(crate) fn park(
         self,
         ticket: &CommittedTicket<Msg<X>>,
@@ -806,10 +815,10 @@ impl<X: SchedPayload> RunningTask<X> {
         assert_eq!(ticket.cpu(), cpu, "park with a ticket from another CPU");
         task.charge_residency(now, Residency::Running);
         task.0.rt.expire(now);
-        assert_eq!(
-            task.0.shared.state(),
-            TaskState::Blocked(cpu),
-            "park without a committed ticket",
+        let state = task.0.shared.state();
+        assert!(
+            matches!(state, TaskState::Blocked(c) | TaskState::WakeQueued(c) if c == cpu),
+            "park without a committed ticket: {state:?}",
         );
         BlockedTask(task)
     }

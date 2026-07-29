@@ -35,13 +35,13 @@ use toyos_sched::hw::{CpuId, Hw, Kicker, Machine, Nanos};
 use toyos_sched::mailbox::{mailbox, Kick, PreemptGuard, Urgency};
 use toyos_sched::msg::Msg;
 use toyos_sched::task::{RtState, TaskBuilder, TaskKey};
-use toyos_sched::waitq::CommittedTicket;
+use toyos_sched::waitq::Commit;
 
 use crate::arch::percpu;
 use crate::hw::HW;
 use crate::process::{OwnedAlloc, PageTables, TaskId, KERNEL_STACK_SIZE};
 
-use super::payload::{KMsg, KShare, KShared, KernelCtx, KernelPayload, TaskHandle, ThreadSched};
+use super::payload::{KMsg, KShare, KShared, KernelCtx, KernelPayload, TaskHandle, Ticket, ThreadSched};
 use super::MAX_CPUS;
 
 // ---------------------------------------------------------------------------
@@ -290,7 +290,6 @@ pub enum Dispose {
     /// keeps the CPU.
     None,
     Yield,
-    Block(CommittedTicket<KMsg>, Option<Nanos>),
     Exit,
 }
 
@@ -326,7 +325,6 @@ pub fn pass(dispose: Dispose) {
         let disposed = match dispose {
             Dispose::None => pass.dispose_none(),
             Dispose::Yield => pass.dispose_yield(),
-            Dispose::Block(ticket, deadline) => pass.dispose_block(ticket, deadline),
             Dispose::Exit => pass.dispose_exit(),
         };
         disposed.finish()
@@ -339,6 +337,65 @@ pub fn pass(dispose: Dispose) {
     });
     execute(action);
     crate::preempt::enable_no_resched();
+}
+
+/// The blocking pass: commit the wait ticket **inside** the pass, after the
+/// mailbox drain, and park on the same pass (spec §8.1's phase 2).
+///
+/// The commit cannot happen at the call site. A remote waker that claims a
+/// task whose word already reads `Blocked` posts `Msg::Wake` to the task's home
+/// CPU — which is this one — and the pass's own drain would consume that
+/// message before the task is in `parked`, where `handle_wake` would find
+/// nothing and drop it. Committing after the drain puts the claim on one side
+/// or the other of it: an earlier claim finds `Committing` and posts nothing, so
+/// the commit itself observes it and refuses to park; a later claim's message
+/// arrives behind the drain and is handled by the next pass, which finds the
+/// task parked.
+///
+/// Returns once the thread runs again, whatever ended the park.
+pub fn pass_block(ticket: Ticket<'_>, deadline: Option<Nanos>) {
+    crate::preempt::disable();
+    crate::preempt::clear_need_resched();
+    drain_irqs();
+    let now = HW.now();
+    let (action, registration) = with_cpu(|cpu| {
+        let env = Env {
+            hw: &HW,
+            cpus: cpus(),
+            frontier: &FRONTIER,
+            preempt: &PreemptOff(()),
+            steal: false,
+        };
+        let pass = SchedPass::begin(cpu, env, now);
+        if let Some(current) = pass.cpu().running() {
+            check_stack_canary(current.ext());
+            current.ext().handle.publish(current.acct(), None);
+        }
+        match ticket.commit() {
+            Commit::Parked(committed, registration) => (
+                pass.dispose_block(committed, deadline).finish(),
+                Some(registration),
+            ),
+            // A wake landed between registration and commit: do not park, do
+            // not switch (spec §8.1). The pass still runs to its disposition,
+            // because the quantum may have expired while we were deciding.
+            Commit::AlreadyWoken => (pass.dispose_none().finish(), None),
+        }
+    });
+    charge_cpu_time(now);
+    with_cpu(|cpu| {
+        if let Some(current) = cpu.running() {
+            current.ext().handle.publish(current.acct(), Some(now));
+        }
+    });
+    execute(action);
+    crate::preempt::enable_no_resched();
+    if let Some(registration) = registration {
+        // Whatever ended the park, the node must leave the queue before this
+        // thread can register anywhere else — otherwise a later `wake_one` on
+        // the old queue would be satisfied by a waiter that is not waiting.
+        registration.finish();
+    }
 }
 
 /// Per-CPU busy time, for `sysinfo`. Derived from the same `now` the pass used,

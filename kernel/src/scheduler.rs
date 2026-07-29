@@ -19,7 +19,7 @@ use hashbrown::HashMap;
 use toyos_sched::fair::{ShareState, QUANTUM_NS};
 use toyos_sched::hw::{Machine, Nanos};
 use toyos_sched::task::{TaskState, WakeCause, WakeReason};
-use toyos_sched::waitq::{Commit, CurrentTask, WaitTicket};
+use toyos_sched::waitq::CurrentTask;
 
 use crate::arch::percpu;
 use crate::hw::HW;
@@ -28,7 +28,7 @@ use crate::listener::ListenerId;
 use crate::pipe::PipeId;
 use crate::process::{self, Pid, Tid};
 use crate::sched::driver::{self, cpus, preempt_off, Dispose, NewTask};
-use crate::sched::payload::{KShare, KWaitList, KWaitQueue, KernelLock, ThreadSched};
+use crate::sched::payload::{KShare, KWaitQueue, KernelLock, ThreadSched};
 use crate::sched::waitqs;
 use crate::sync::Lock;
 use crate::DirectMap;
@@ -37,11 +37,8 @@ pub use crate::sched::driver::{
     current_address_space, enter_idle_loop, in_pass as in_schedule_self, total_cpu_ns,
     write_stack_canary,
 };
+pub use crate::sched::payload::Ticket;
 pub use crate::sched::MAX_CPUS;
-
-/// A wait ticket in the kernel's one instantiation of the core's two-phase
-/// commit. Named here so blocking sites do not have to spell the generics.
-pub type Ticket<'q> = WaitTicket<'q, crate::sched::payload::KMsg, KWaitList>;
 
 /// Process-scoped thread identity. Tids are per-process, so the scheduler
 /// needs the pair to name a thread system-wide.
@@ -197,20 +194,7 @@ pub fn prepare_wait(queue: &KWaitQueue) -> Ticket<'_> {
 /// machine without a registration behind it is the lost-wake window, and there
 /// is no other way to construct one. `deadline = 0` means no timeout.
 pub fn block_on(ticket: Ticket<'_>, deadline: u64) {
-    match ticket.commit() {
-        Commit::Parked(committed, registration) => {
-            let at = (deadline > 0).then(|| Nanos(deadline));
-            driver::pass(Dispose::Block(committed, at));
-            // Whatever ended the park — a wake, a timeout, a spurious pass —
-            // the node must leave the queue before this thread can register
-            // anywhere else, or a later `wake_one` would be satisfied by a
-            // waiter that is no longer waiting for it.
-            registration.finish();
-        }
-        // A wake landed between registration and commit: do not park, do not
-        // switch (spec §8.1). The condition is satisfied.
-        Commit::AlreadyWoken => {}
-    }
+    driver::pass_block(ticket, (deadline > 0).then(|| Nanos(deadline)));
 }
 
 /// Register, re-check, park — for a site whose condition is exactly `ready`.
