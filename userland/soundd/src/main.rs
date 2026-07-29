@@ -84,7 +84,30 @@ struct ClientStream {
     client_channels: u16,
     client_period_frames: u32,
     resampler: Option<ClientResampler>,
+    /// Latched by the first period this client supplies.
+    delivered: bool,
     pending_removal: bool,
+}
+
+impl ClientStream {
+    /// The window in which a period this client failed to cover is starvation
+    /// rather than protocol: from the first period it delivered until it asks
+    /// to close.
+    ///
+    /// Outside it, silence is the design working. A client is registered by
+    /// `MSG_STREAM_OPEN`, which it sends *before* it has any audio — it still
+    /// has to spawn its callback thread and fill its first slots — so the
+    /// periods between the open and the first delivery precede the stream
+    /// instead of interrupting it. Symmetrically, once a client has asked to
+    /// close, §5.5's ramp is deliberately fading it to silence and it is
+    /// entitled to stop filling.
+    ///
+    /// The latch is what keeps mid-stream starvation visible: a client stays
+    /// inside this window from its first period until it closes, so one that
+    /// goes quiet in the middle counts every period it misses.
+    fn is_streaming(&self) -> bool {
+        self.delivered && !self.pending_removal
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -256,9 +279,19 @@ fn dither_and_quantize(sample: f32, rng: &mut Xorshift32) -> i16 {
 struct MixStats {
     wakes: u32,
     completions: u32,
+    /// Every period put on the wire in this window, underruns included.
     submitted: u32,
-    /// Periods submitted with no client audio behind them: silence that
-    /// actually went on the wire while a client was streaming.
+    /// Periods submitted with no client audio behind them *while at least one
+    /// client was streaming* (`ClientStream::is_streaming`) — silence that
+    /// interrupted a stream rather than preceding or following one.
+    ///
+    /// This is a strictly narrower window than `submitted`, which is scoped
+    /// like `wakes`, `completions` and `drains`: the whole time soundd has
+    /// clients. The connect-to-first-period pre-roll is a real part of that
+    /// window and is submitted silence, but it is not a dropout — nothing was
+    /// playing to drop out of — and counting it made this number a
+    /// measurement of how fast a client's audio thread starts, scaled by
+    /// however often soundd happened to wake meanwhile.
     underruns: u32,
     /// Cycles that found the whole DMA pipeline free (§5.9).
     drains: u32,
@@ -414,6 +447,7 @@ fn open_stream(
         client_channels: req.channels,
         client_period_frames,
         resampler,
+        delivered: false,
         pending_removal: false,
     }
 }
@@ -682,8 +716,9 @@ fn mix_thread(
             mix_f32.fill(0.0);
 
             let mut any_data = false;
+            let mut any_streaming = false;
             for stream in streams.iter_mut() {
-                any_data |= mix_client(
+                let covered = mix_client(
                     stream,
                     &mut mix_f32,
                     &mut decode_buf,
@@ -691,6 +726,9 @@ fn mix_thread(
                     device_channels as usize,
                     device_period_frames,
                 );
+                stream.delivered |= covered;
+                any_data |= covered;
+                any_streaming |= stream.is_streaming();
             }
 
             let dma_buf = unsafe {
@@ -704,7 +742,7 @@ fn mix_thread(
                 .unwrap_or_else(|e| panic!("soundd: audio_submit({idx}) failed: {e}"));
             if !streams.is_empty() {
                 stats.submitted += 1;
-                if !any_data { stats.underruns += 1; }
+                if any_streaming && !any_data { stats.underruns += 1; }
             }
         }
 
