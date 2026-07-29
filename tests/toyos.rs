@@ -382,6 +382,9 @@ fn measure_audio_run(
     } else {
         format!("{tag}: ")
     };
+    // Bounds every duration soundd can report: its whole life is inside this
+    // process's. See `audio::check_physical`.
+    let run_start = std::time::Instant::now();
     let mut qemu = QemuInstance::boot_with_options(
         test_config,
         c_bins,
@@ -447,7 +450,11 @@ fn measure_audio_run(
         breaches.push(regression);
     }
 
-    let mut problems = Vec::new();
+    // A counter past a physical bound is the instrument failing, so it belongs
+    // here with the other instrument checks rather than among the ceilings: it
+    // must fail loudly in both tiers, and it must never be ranked against the
+    // recorded sample or printed into the next baseline.
+    let mut problems = audio::check_physical(&counters, run_start.elapsed().as_secs_f64());
     if secs(analysis.active_samples) < TONE_MIN_ACTIVE_SECS {
         problems.push(format!(
             "tone missing: only {:.2}s of active signal (expected >= {TONE_MIN_ACTIVE_SECS}s)",

@@ -13,8 +13,11 @@
 #                     configs carry — the quality target is no dropouts, and
 #                     recording a non-empty histogram here would be a decision
 #                     to accept audible ones.
-#   max_wake_lat_us   Worst single stats window of soundd waking later than
-#                     its predicted DMA completion.
+#   max_wake_lat_us   Worst single stats window of soundd waking later than a
+#                     predicted DMA completion it armed a timer on. Waits that
+#                     named no wake time — the idle path, and the one wake
+#                     after a drain before the DLL re-locks — contribute
+#                     nothing: nothing was due, so nothing can be late.
 #   drains            Cycles that found the entire DMA pipeline free (§5.9).
 #   underruns         Periods submitted with no client audio behind them.
 #
@@ -133,6 +136,22 @@
 #   ALPHA IS 0.001 PER TEST, and it is a constant in `tests/common/stats.rs`,
 #   not a field here. A gate whose alpha can be raised is a gate that will be
 #   raised on the afternoon it goes red.
+#
+# BOTH TIERS — the physical bound (`audio::check_physical`). Every number above
+#   answers "did this get worse?". Nothing here answered "is this possible?",
+#   and the two are different questions. Stage 6's thorough tier PASSED while
+#   carrying `wake_lat 153766519us` — 153 seconds inside a test the harness
+#   kills at 30 — because a rank test is robust to exactly one absurd value,
+#   and it would then have been pasted back into `max_wake_lat_us` below as
+#   data. The bound is the wall-clock life of the QEMU process, measured by the
+#   harness: soundd's whole life is inside it, so no duration it reports can
+#   exceed it, and no count of device periods can exceed the periods that fit
+#   in it. Nothing is recorded here to be tuned. A violation is reported as a
+#   broken instrument — fatal in both tiers, and in the thorough tier it aborts
+#   before the value joins the sample. It is NOT a ceiling: it sits two orders
+#   of magnitude above the ones above, because a ceiling admits values that are
+#   bad but real, and a stall of even three seconds should still be reported as
+#   the regression it is.
 #
 # ===========================================================================
 # THE RECORDED SAMPLE
