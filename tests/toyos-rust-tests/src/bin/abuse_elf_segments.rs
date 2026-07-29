@@ -222,14 +222,35 @@ fn main() {
         ("dyn_gnuhash_far", &[(DT_GNU_HASH, 0x7000_0000)][..]),
         ("dyn_rela_far", &[(DT_RELA, 0x7000_0000), (DT_RELASZ, 24)][..]),
         ("dyn_reloc_oob", &[(DT_RELA, 0x3800), (DT_RELASZ, 24)][..]),
+        // Only RELATIVE entries used to be bounds-checked at load. Every other
+        // written type reached `LoadedLib::write_at` on a raw `r_offset`, and
+        // once the module is cached that write lands in a *smaller* private
+        // allocation than the image the check was against — so an out-of-range
+        // offset wrote outside it, above or below, with no assert at all.
+        // DTPOFF64 with `r_sym == 0` writes `r_addend` verbatim, which makes
+        // the value attacker-chosen too.
+        ("dyn_dtpoff_oob", &[(DT_RELA, 0x3800), (DT_RELASZ, 24)][..]),
+        ("dyn_globdat_oob", &[(DT_RELA, 0x3800), (DT_RELASZ, 24)][..]),
+        // An in-range r_offset whose r_sym indexes past .dynsym: the symbol
+        // read is `r_sym * 24` into a slice sized from the file's own count.
+        ("dyn_relsym_oob", &[(DT_RELA, 0x3800), (DT_RELASZ, 24)][..]),
     ] {
         let tags: Vec<(i64, u64)> = base.iter().chain(over.iter()).copied().collect();
         let mut bytes = dyn_elf(&tags);
-        if name == "dyn_reloc_oob" {
-            // One R_X86_64_RELATIVE whose r_offset is far past the image.
+        // (r_offset, r_info, r_addend) for the cases that plant one entry at
+        // vaddr 0x3800 — file offset 0x2800.
+        let entry = match name {
+            "dyn_reloc_oob" => Some((0x7000_0000u64, 8u64, 0i64)), // R_X86_64_RELATIVE
+            "dyn_dtpoff_oob" => Some((0x7000_0000, 17, 0x4141_4141_4141_4141u64 as i64)),
+            "dyn_globdat_oob" => Some((0x7000_0000, 6, 0)),
+            "dyn_relsym_oob" => Some((0x3000, (0xFFFF_FFFFu64 << 32) | 6, 0)),
+            _ => None,
+        };
+        if let Some((r_offset, r_info, r_addend)) = entry {
             let r = 0x2800; // file offset of vaddr 0x3800
-            bytes[r..r + 8].copy_from_slice(&0x7000_0000u64.to_le_bytes());
-            bytes[r + 8..r + 16].copy_from_slice(&8u64.to_le_bytes()); // R_X86_64_RELATIVE
+            bytes[r..r + 8].copy_from_slice(&r_offset.to_le_bytes());
+            bytes[r + 8..r + 16].copy_from_slice(&r_info.to_le_bytes());
+            bytes[r + 16..r + 24].copy_from_slice(&r_addend.to_le_bytes());
         }
         let msg = dlopen_err(&format!("{name}.so"), &bytes);
         assert!(!msg.is_empty(), "{name}: dlopen error message");

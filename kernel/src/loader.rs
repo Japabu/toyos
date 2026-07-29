@@ -551,12 +551,12 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
             };
 
             match elf::load_shared_lib(so_backing.as_ref()) {
-                Ok((lib, rw_vaddr, rw_end_vaddr)) => {
+                Ok((lib, rw_offset, rw_size)) => {
                     let t_load1 = crate::clock::nanos_since_boot();
                     log!("dynamic: loaded {} base={:#x} ({} syms, {}ms)",
                         lib_name, lib.phys_base, lib.sym_count,
                         (t_load1 - t_load0) / 1_000_000);
-                    let lib = elf::cache_loaded_lib_pub(&lib_path, lib, rw_vaddr, rw_end_vaddr);
+                    let lib = elf::cache_loaded_lib_pub(&lib_path, lib, rw_offset, rw_size);
                     lib_paths_vec.push(lib_path);
                     libs.push(lib);
                 }

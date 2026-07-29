@@ -1361,7 +1361,7 @@ fn sys_dlopen(path: &str, init_out: u64) -> u64 {
                 }
             };
 
-            let (lib, rw_vaddr, rw_end_vaddr) = match crate::elf::load_shared_lib(backing.as_ref()) {
+            let (lib, rw_offset, rw_size) = match crate::elf::load_shared_lib(backing.as_ref()) {
                 Ok(result) => result,
                 Err(msg) => {
                     log!("dlopen: {}", msg);
@@ -1369,7 +1369,7 @@ fn sys_dlopen(path: &str, init_out: u64) -> u64 {
                 }
             };
 
-            crate::elf::cache_loaded_lib_pub(&resolved, lib, rw_vaddr, rw_end_vaddr)
+            crate::elf::cache_loaded_lib_pub(&resolved, lib, rw_offset, rw_size)
         }
     };
 
@@ -1383,7 +1383,7 @@ fn sys_dlopen(path: &str, init_out: u64) -> u64 {
                     .expect("dlopen: out of virtual address space");
                 let delta = vaddr.raw() as i64 - lib.user_base.raw() as i64;
                 if delta != 0 {
-                    crate::elf::fixup_relative_relocs(&lib, delta);
+                    crate::elf::rebase_relative_relocs(&lib, delta);
                 }
                 lib.user_base = vaddr;
                 lib.user_end = (lib.user_end as i64 + delta) as u64;
@@ -1403,7 +1403,7 @@ fn sys_dlopen(path: &str, init_out: u64) -> u64 {
                 apic::tlb_shootdown();
                 let delta = lib_vaddr.raw() as i64 - lib.user_base.raw() as i64;
                 if delta != 0 {
-                    crate::elf::fixup_relative_relocs(&lib, delta);
+                    crate::elf::rebase_relative_relocs(&lib, delta);
                 }
                 lib.user_base = lib_vaddr;
                 lib.user_end = (lib.user_end as i64 + delta) as u64;
