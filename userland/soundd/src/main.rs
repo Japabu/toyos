@@ -295,6 +295,9 @@ struct MixStats {
     underruns: u32,
     /// Cycles that found the whole DMA pipeline free (§5.9).
     drains: u32,
+    /// Worst overshoot of a DLL prediction soundd actually armed a timer on
+    /// (§5.1) — how far behind the device's period grid a mix cycle ran. Waits
+    /// that named no wake time contribute nothing; see the sample site.
     max_wake_lat_ns: u64,
     max_batch: u32,
 }
@@ -597,6 +600,13 @@ fn mix_thread(
             let _ = syscall::write_nonblock(stream.signal_write_fd, &[1]);
         }
 
+        // The prediction this wait is armed against, when there is one.
+        // Lateness is only defined relative to an instant soundd asked to be
+        // woken at, and there are two waits that name none: the idle path
+        // (§5.8) arms no timer at all, and before the DLL has locked there is
+        // no prediction to arm on.
+        let mut armed_on: Option<f64> = None;
+
         let timeout = if streams.is_empty() {
             u64::MAX
         } else {
@@ -612,6 +622,7 @@ fn mix_thread(
                         let k = ((now - t_est) / dll.period).floor() + 1.0;
                         t_est + k * dll.period
                     };
+                    armed_on = Some(t_est);
                     // timeout 0 is the kernel's non-blocking sentinel
                     ((target - now) as u64).max(1)
                 }
@@ -668,11 +679,26 @@ fn mix_thread(
             Err(e) => panic!("soundd: read_completions failed: {e:?}"),
         };
         if n_records > 0 {
-            if let Some(t_est) = dll.t_estimated {
+            // Measured against the prediction this wait was *armed* on, not
+            // against whatever the DLL holds by the time the wait returns. The
+            // two differ on the first wake of every streaming window: the wait
+            // that delivers it was armed while soundd was still idle, where it
+            // asks for no wake time and sleeps until the hardware speaks, so
+            // the time it spent there is the idle policy working. Reading the
+            // estimate directly scored that sleep as a missed deadline — 56 to
+            // 150ms of it in seven of seven measured breaches, and 153
+            // *seconds* in one recorded gate A run.
+            //
+            // This does not hide a late wake, including the first of a window:
+            // whenever soundd armed a timer, the distance from the prediction
+            // it armed on is the sample, however large. Only a wait with no
+            // armed deadline is silent, and there is nothing to be late for in
+            // one. `armed_on` is Some only when soundd had clients at arm time
+            // and clients are removed at the foot of the loop, so a sample is
+            // inside the reporting window by construction.
+            if let Some(t_est) = armed_on {
                 let lateness = syscall::clock_nanos().saturating_sub(t_est as u64);
-                if !streams.is_empty() {
-                    stats.max_wake_lat_ns = stats.max_wake_lat_ns.max(lateness);
-                }
+                stats.max_wake_lat_ns = stats.max_wake_lat_ns.max(lateness);
             }
             let mut wake_completions = 0u32;
             for rec in &records[..n_records] {
