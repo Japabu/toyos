@@ -1,7 +1,7 @@
 //! The per-CPU run queue — spec §9.2.
 //!
 //! Two bands, deliberately today's ordering: an RT FIFO drained first, and a
-//! fair band ordered by `(vruntime, TaskKey)`. The stored-lag fairness
+//! fair band ordered by `(vruntime, insertion sequence)`. The stored-lag fairness
 //! semantics are preserved bit-identically through the machinery cutover so
 //! that any regression is attributable to the machinery; true EEVDF
 //! virtual-deadline ordering is a later, sim-gated, `queue.rs`/`fair.rs`-only
@@ -16,7 +16,18 @@ use crate::task::{ReadyTask, SchedPayload, TaskKey};
 
 pub struct RunQueue<X: SchedPayload> {
     rt: VecDeque<ReadyTask<X>>,
-    fair: BTreeMap<(u64, TaskKey), ReadyTask<X>>,
+    /// Ordered by `(vruntime, insertion sequence)`.
+    ///
+    /// The tie-break is deliberately **not** `TaskKey`. All threads of a
+    /// process share one vruntime, so an identity tie-break is deterministic:
+    /// the same thread wins every tie and its siblings only run when it blocks.
+    /// That is not hypothetical — it starved Doom's midi thread behind its game
+    /// thread on a single core, and the old scheduler carries the same
+    /// monotonic-sequence fix for the same reason. A re-inserted thread goes
+    /// *behind* its equal-vruntime siblings, so threads of one process
+    /// round-robin without gaining any cross-process share.
+    fair: BTreeMap<(u64, u64), ReadyTask<X>>,
+    insert_seq: u64,
 }
 
 impl<X: SchedPayload> RunQueue<X> {
@@ -24,6 +35,7 @@ impl<X: SchedPayload> RunQueue<X> {
         Self {
             rt: VecDeque::new(),
             fair: BTreeMap::new(),
+            insert_seq: 0,
         }
     }
 
@@ -33,10 +45,11 @@ impl<X: SchedPayload> RunQueue<X> {
         if task.rt().is_rt() {
             self.rt.push_back(task);
         } else {
-            let previous = self.fair.insert((vruntime, task.key()), task);
+            self.insert_seq += 1;
+            let previous = self.fair.insert((vruntime, self.insert_seq), task);
             assert!(
                 previous.is_none(),
-                "two ready tasks with one (vruntime, key)",
+                "two ready tasks with one (vruntime, sequence)",
             );
         }
     }
@@ -65,7 +78,7 @@ impl<X: SchedPayload> RunQueue<X> {
         if let Some(index) = self.rt.iter().position(|t| t.key() == key) {
             return self.rt.remove(index);
         }
-        let found = *self.fair.keys().find(|(_, k)| *k == key)?;
+        let found = *self.fair.iter().find(|(_, t)| t.key() == key)?.0;
         self.fair.remove(&found)
     }
 
@@ -93,7 +106,7 @@ impl<X: SchedPayload> RunQueue<X> {
         self.rt
             .iter()
             .map(|t| t.key())
-            .chain(self.fair.keys().map(|(_, k)| *k))
+            .chain(self.fair.values().map(|t| t.key()))
     }
 
     pub fn tasks(&self) -> impl Iterator<Item = &ReadyTask<X>> + '_ {
