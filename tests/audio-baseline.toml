@@ -18,8 +18,32 @@
 #                     named no wake time — the idle path, and the one wake
 #                     after a drain before the DLL re-locks — contribute
 #                     nothing: nothing was due, so nothing can be late.
-#   drains            Cycles that found the entire DMA pipeline free (§5.9).
+#   drains            Cycles that found the entire DMA pipeline free (§5.9)
+#                     *and* could only have got there by soundd being late.
+#                     The idle path empties the pipeline by design, and a
+#                     device that retires faster than it plays empties it
+#                     without anything having been due; neither counts. See
+#                     the count site in soundd for the two conditions.
 #   underruns         Periods submitted with no client audio behind them.
+#
+# !! STALE AS OF 2026-07-29 — DO NOT TRUST THE NUMBERS BELOW. !!
+# The sample was measured on tree 6d6a230 (2026-07-28 17:21) and four things
+# have invalidated it since: the Stage 7a/7b scheduler cutover, and three
+# counter redefinitions — `underruns` (f25fa87), `max_wake_lat_us` (824dd7d)
+# and `drains` (this file's neighbour commit). Each redefinition narrowed its
+# counter to audible harm after it was found to be measuring connect-time
+# pre-roll, so every distribution below is drawn from a different quantity
+# than the one the code now reports.
+#
+# It has NOT been re-recorded, deliberately. `--audio-gate 30` on the current
+# tree curtails on the pooled *dropout rate* — 19 of 76 config-runs against
+# the recorded 4 of 117 — and that is a genuine audible regression, not an
+# instrument fault (see CLAUDE.md's known issues for its signature). Pasting
+# a fresh sample in now would be re-recording to make a red run green, which
+# the rule below forbids. Re-record in one pass once the dropouts are
+# resolved, and expect every `max_wake_lat_us` figure to fall by roughly an
+# order of magnitude when you do: post-824dd7d the worst wake lateness over
+# 76 config-runs was 12.4ms, 0.53 pipeline depths.
 #
 # Why the counters are here at all: the wav is a rare-event detector. One 3s
 # tone samples ~1100 device periods once per run, so it only fires when a
@@ -69,6 +93,14 @@
 # passing or failing, so the residual stays visible in the log rather than
 # hiding behind a green tick. When the residual is fixed, every
 # `max_wake_lat_us` here should drop to 23219 (one pipeline) and stay there.
+#
+# That residual was the instrument, not the scheduler, and 824dd7d fixed it:
+# the counter was scoring idle sleeps that had armed no timer against a stale
+# DLL estimate. "Mode-B client misses under single-CPU load" was the wrong
+# diagnosis. Measured over 76 config-runs afterwards, the worst wake lateness
+# on any config is 12391us — 0.53 pipeline depths, median 8056us — so the
+# spec-derived bar this paragraph says is NOT met is in fact met, with better
+# than 2x margin, and has been all along.
 #
 # `underruns` is dominated by a stream-start transient: the client is added
 # with an empty ring and the mix loop submits the already-free buffers before
