@@ -19,7 +19,6 @@ use hashbrown::HashMap;
 use toyos_sched::fair::{ShareState, QUANTUM_NS};
 use toyos_sched::hw::{Machine, Nanos};
 use toyos_sched::task::{TaskState, WakeCause, WakeReason};
-use toyos_sched::waitq::CurrentTask;
 
 use crate::arch::percpu;
 use crate::hw::HW;
@@ -35,9 +34,8 @@ use crate::DirectMap;
 
 pub use crate::sched::driver::{
     current_address_space, enter_idle_loop, in_pass as in_schedule_self, total_cpu_ns,
-    write_stack_canary,
+    write_stack_canary, Ticket,
 };
-pub use crate::sched::payload::Ticket;
 pub use crate::sched::MAX_CPUS;
 
 /// Process-scoped thread identity. Tids are per-process, so the scheduler
@@ -181,11 +179,13 @@ pub fn enqueue_new(
 /// The caller must then re-check its condition and either cancel the ticket or
 /// block on it — registering *before* the re-check is what closes the
 /// check-then-block window.
+///
+/// The ticket holds preemption off until it is consumed; the re-check may take
+/// whatever locks it needs, and the deferred request is served by the block or
+/// by the cancel. See [`Ticket`].
 #[must_use = "a wait ticket must be blocked on or cancelled"]
 pub fn prepare_wait(queue: &KWaitQueue) -> Ticket<'_> {
-    let shared = driver::current_shared().expect("prepare_wait: no running thread");
-    let current = CurrentTask::new(&shared, driver::current_cpu());
-    queue.prepare_wait(&current)
+    Ticket::register(queue)
 }
 
 /// Phase 2: park the running thread on the queue it registered with.

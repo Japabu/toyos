@@ -521,7 +521,13 @@ impl<X: SchedPayload> CpuSched<X> {
         if self.running.as_ref().is_some_and(|r| r.key() == key) {
             // A running task cannot be yanked out from under its own kernel
             // stack. It dies at its next safe point, bounded by the quantum
-            // (spec §7.6).
+            // (spec §7.6). Consuming the message here is only sound because
+            // the sticky kill bit outlives it and *every* safe point honours
+            // it: the pick reaps a killed ready task, and `WaitTicket::commit`
+            // refuses to park a killed one. That last arm is not decoration —
+            // parking is a safe point too (§6.3), and a task that parked
+            // through this window would never be picked again, so nothing
+            // would ever reap it.
             env.hw.need_resched(self.id);
             return;
         }

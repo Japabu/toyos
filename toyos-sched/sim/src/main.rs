@@ -17,8 +17,9 @@ usage: toyos-sched-sim <command> [args]
   sweep [seeds]                seed sweep over every scenario (default 10000)
   fuzz-sweep [steps]           fuzz-byte sweep per scenario (default 10000000)
   gate [seeds]                 the Stage 4 exit criterion, including the
-                               negative old_steal_port and
-                               old_commit_before_pass gates
+                               negative old_steal_port,
+                               old_commit_before_pass and
+                               old_preemptible_window gates
   shrink <scenario> <seed> [pct]
                                minimize a failing seed into a corpus trace
   replay <file>                replay a committed corpus trace
@@ -38,6 +39,7 @@ fn main() -> ExitCode {
             }
             println!("old_steal_port          (negative gate: must fail)");
             println!("old_commit_before_pass  (negative gate: must fail)");
+            println!("old_preemptible_window  (negative gate: must abort)");
             println!("old_commit_fused        (control: passes, and that is the point)");
             ExitCode::SUCCESS
         }
@@ -111,6 +113,26 @@ fn main() -> ExitCode {
                     }
                     clean &= found;
                 }
+                // The third negative gate reports an abort rather than a
+                // verdict: a pass inside the registration window has no legal
+                // transition to take, so the core asserts instead of the walk
+                // recording anything.
+                let window = sweep::abort_gate(
+                    &scenarios::old_preemptible_window(),
+                    budget.min(500),
+                );
+                match &window {
+                    Some((seed, message)) => {
+                        println!("old_preemptible_window: caught at seed {seed} (as required)");
+                        for line in message.lines() {
+                            println!("  {line}");
+                        }
+                    }
+                    None => println!(
+                        "old_preemptible_window: NOT CAUGHT — the harness proves nothing",
+                    ),
+                }
+                clean &= window.is_some();
                 // And the control: the same shape with the block's two halves
                 // fused into one step must come back *clean*, because that is
                 // the blind spot this harness used to have.

@@ -46,9 +46,12 @@ pub type KShared = TaskShared<KMsg>;
 pub type KShare = FairShare<KernelLock<ShareState>>;
 pub type KWaitList = KernelLock<WaitList<KMsg>>;
 pub type KWaitQueue = WaitQueue<KMsg, KWaitList>;
-/// A wait ticket in the kernel's one instantiation of the two-phase commit.
-/// Named here so blocking sites do not have to spell the generics.
-pub type Ticket<'q> = WaitTicket<'q, KMsg, KWaitList>;
+/// The core's wait ticket in the kernel's one instantiation of the two-phase
+/// commit. Blocking sites never see this: they hold [`driver::Ticket`], which
+/// wraps it in the preempt guard the registration window needs.
+///
+/// [`driver::Ticket`]: super::driver::Ticket
+pub type RawTicket<'q> = WaitTicket<'q, KMsg, KWaitList>;
 
 /// A queue in a `static` — the device queues and the futex/park buckets.
 pub const fn static_queue(class: WaitClass) -> KWaitQueue {

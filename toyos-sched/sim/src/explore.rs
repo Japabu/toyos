@@ -40,6 +40,9 @@ pub struct Outcome {
     /// (spec §8.1's residual window). Reported so a test can assert the window
     /// was actually executed rather than merely reasoned about.
     pub pre_park_claims: u64,
+    /// Blocks that ended in `Commit::Killed` — a retire that landed inside the
+    /// registration window (spec §6.3, §7.6). Reported for the same reason.
+    pub killed_at_park: u64,
 }
 
 impl Outcome {
@@ -68,7 +71,54 @@ pub fn run(scenario: Scenario, choices: &mut ChoiceStream) -> Outcome {
     let max_steps = scenario.max_steps;
     let queues = build_queues(&scenario);
     let mut vm = Vm::new(scenario, &queues);
+    explore(&mut vm, choices, max_steps);
+    let outcome = outcome_of(name, &vm, choices);
+    if !outcome.passed() {
+        abandon(vm);
+    }
+    outcome
+}
 
+/// Run a scenario and report an *abort* out of the core as the verdict it is.
+///
+/// Only [`crate::scenarios::old_preemptible_window`] needs this. Everything
+/// else the simulator finds is an invariant walk's verdict, recorded and
+/// returned; what a pass landing inside the registration window provokes is
+/// the core's own `check_cpu` assertion, which unwinds instead. A `Vm` dropped
+/// during that unwind fires its linear types' drop bombs on top of it and turns
+/// the diagnosis into a non-unwinding abort, so it is abandoned here exactly as
+/// a failed run is.
+pub fn run_catching(scenario: Scenario, choices: &mut ChoiceStream) -> Result<Outcome, String> {
+    let name = scenario.name;
+    let max_steps = scenario.max_steps;
+    let queues = build_queues(&scenario);
+    let mut vm = Vm::new(scenario, &queues);
+
+    // The panic is the expected result, so it is not also news. The hook is
+    // restored before returning either way.
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        explore(&mut vm, choices, max_steps)
+    }));
+    std::panic::set_hook(hook);
+
+    match caught {
+        Ok(()) => {
+            let outcome = outcome_of(name, &vm, choices);
+            if !outcome.passed() {
+                abandon(vm);
+            }
+            Ok(outcome)
+        }
+        Err(payload) => {
+            abandon(vm);
+            Err(panic_message(payload))
+        }
+    }
+}
+
+fn explore(vm: &mut Vm<'_>, choices: &mut ChoiceStream, max_steps: usize) {
     loop {
         let steps = vm.enabled();
         if steps.is_empty() {
@@ -86,7 +136,7 @@ pub fn run(scenario: Scenario, choices: &mut ChoiceStream) -> Outcome {
         vm.execute(steps[choice], choices);
         vm.reap_released();
         vm.collect_dead_processes();
-        invariants::check_all(&mut vm);
+        invariants::check_all(vm);
         // Stop at the first violation: everything after it is a consequence,
         // and a shrunk repro of a consequence is a waste of a regression slot.
         if vm.failed() {
@@ -95,12 +145,14 @@ pub fn run(scenario: Scenario, choices: &mut ChoiceStream) -> Outcome {
     }
 
     if !vm.failed() {
-        invariants::check_final(&mut vm);
+        invariants::check_final(vm);
     }
+}
 
+fn outcome_of(scenario: &'static str, vm: &Vm<'_>, choices: &ChoiceStream) -> Outcome {
     let (switches, kicks) = vm.hw.with(|s| (s.switches, s.kicks));
-    let outcome = Outcome {
-        scenario: name,
+    Outcome {
+        scenario,
         steps: vm.steps,
         violations: vm.all_violations(),
         decisions: choices.recorded().to_vec(),
@@ -108,15 +160,28 @@ pub fn run(scenario: Scenario, choices: &mut ChoiceStream) -> Outcome {
         switches,
         kicks,
         pre_park_claims: vm.pre_park_claims,
-    };
-
-    if !outcome.passed() {
-        // A failed run leaves task values in containers, and a `Task` that is
-        // dropped outside `finalize()` panics by design (spec §5.1). Letting
-        // that fire here would replace the diagnosis with a drop bomb from
-        // the teardown; the run is a dead end either way, so it is abandoned
-        // deliberately rather than unwound.
-        std::mem::forget(vm);
+        killed_at_park: vm.killed_at_park,
     }
-    outcome
+}
+
+/// A failed run leaves task values in containers, and a `Task` dropped outside
+/// `finalize()` panics by design (spec §5.1). Letting that fire would replace
+/// the diagnosis with a drop bomb from the teardown; the run is a dead end
+/// either way, so it is abandoned deliberately rather than unwound.
+fn abandon(vm: Vm<'_>) {
+    std::mem::forget(vm);
+}
+
+/// Taken by value and downcast through the `Box`: `&Box<dyn Any + Send>`
+/// unsize-coerces to `&dyn Any` whose concrete type is the *box*, so the
+/// by-reference spelling of this silently matches nothing.
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    let payload = match payload.downcast::<String>() {
+        Ok(message) => return *message,
+        Err(payload) => payload,
+    };
+    match payload.downcast::<&'static str>() {
+        Ok(message) => (*message).to_string(),
+        Err(_) => "the core aborted with a non-string panic payload".to_string(),
+    }
 }

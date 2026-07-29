@@ -6,7 +6,7 @@
 //! gate asks for; what must never differ between them is the checking.
 
 use crate::choice::ChoiceStream;
-use crate::explore::{run, Outcome};
+use crate::explore::{run, run_catching, Outcome};
 use crate::workload::Scenario;
 
 pub struct SweepResult {
@@ -68,6 +68,28 @@ pub fn seed_sweep(scenario: &Scenario, seeds: u64, keep_failures: usize) -> Swee
         }
     }
     result
+}
+
+/// The negative gate whose failure is an *abort* rather than a verdict: run
+/// seeded schedules until the core's own assertion fires, and report the first
+/// one that does.
+///
+/// Only `old_preemptible_window` needs it. Everything the invariant walks find
+/// is a recorded violation; a pass that lands inside the registration window
+/// instead panics inside `check_cpu`, which is the correct failure and cannot
+/// be counted the ordinary way.
+pub fn abort_gate(scenario: &Scenario, seeds: u64) -> Option<(u64, String)> {
+    for seed in 0..seeds {
+        let mut choices = if seed % 2 == 0 {
+            ChoiceStream::from_seed(seed)
+        } else {
+            ChoiceStream::pct(seed, scenario.cpus, 3)
+        };
+        if let Err(message) = run_catching(scenario.clone(), &mut choices) {
+            return Some((seed, message));
+        }
+    }
+    None
 }
 
 /// Raw-byte-driven runs until `budget` *steps* have been executed — the fuzz

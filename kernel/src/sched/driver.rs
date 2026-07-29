@@ -35,13 +35,15 @@ use toyos_sched::hw::{CpuId, Hw, Kicker, Machine, Nanos};
 use toyos_sched::mailbox::{mailbox, Kick, PreemptGuard, Urgency};
 use toyos_sched::msg::Msg;
 use toyos_sched::task::{RtState, TaskBuilder, TaskKey};
-use toyos_sched::waitq::Commit;
+use toyos_sched::waitq::{Cancelled, Commit, CurrentTask};
 
 use crate::arch::percpu;
 use crate::hw::HW;
 use crate::process::{OwnedAlloc, PageTables, TaskId, KERNEL_STACK_SIZE};
 
-use super::payload::{KMsg, KShare, KShared, KernelCtx, KernelPayload, TaskHandle, Ticket, ThreadSched};
+use super::payload::{
+    KMsg, KShare, KShared, KWaitQueue, KernelCtx, KernelPayload, RawTicket, TaskHandle, ThreadSched,
+};
 use super::MAX_CPUS;
 
 // ---------------------------------------------------------------------------
@@ -339,6 +341,59 @@ pub fn pass(dispose: Dispose) {
     crate::preempt::enable_no_resched();
 }
 
+/// A wait registration, holding preemption off for the whole window between
+/// phase 1 and phase 2 of the §8.1 handshake.
+///
+/// The window is not preemptible, and the guard is what makes that true rather
+/// than hoped for. `prepare_wait` publishes `Committing(cpu, gen)` and the
+/// machine has no edge out of it except the commit or the cancel: `preempt`
+/// asserts on `Running`, and *inventing* a `Committing → Ready` edge would be
+/// worse than the assert, because a waker that pops the registration and finds
+/// the word `Ready` reports `Claim::Lost` and moves on to the next waiter —
+/// the registered task is then off the queue, unwoken, and about to park. That
+/// is a lost wake, which is the one thing this protocol exists to remove.
+///
+/// This is *not* §8.1's residual commit-to-park window, which `8508b37` had to
+/// tolerate because a remote CPU can act between two of our own instructions.
+/// Nothing remote is involved here: the only route into a pass mid-window is
+/// this CPU's own `preempt::enable` slow path, reached from the guard drop of
+/// any lock the re-check takes. A window whose only intruder is ourselves can
+/// be closed, so it is.
+///
+/// The guard is owned rather than remembered: the two ways to consume a ticket
+/// both discharge it, so "registered with preemption on" has no expression.
+#[must_use = "a wait ticket must be blocked on or cancelled"]
+pub struct Ticket<'q>(RawTicket<'q>);
+
+impl<'q> Ticket<'q> {
+    /// Phase 1: register the running thread on `queue`.
+    ///
+    /// The count goes up before the current task is even read: without it, a
+    /// preemption between reading the task and registering it would leave
+    /// `CurrentTask` naming a CPU the thread no longer runs on, and
+    /// `begin_commit` asserts on exactly that.
+    pub fn register(queue: &'q KWaitQueue) -> Self {
+        crate::preempt::disable();
+        let shared = current_shared().expect("prepare_wait: no running thread");
+        let current = CurrentTask::new(&shared, current_cpu());
+        Self(queue.prepare_wait(&current))
+    }
+
+    /// The condition became true after registering: withdraw, and take the
+    /// deferred preemption now that the thread is plainly `Running` again.
+    pub fn cancel(self) -> Cancelled {
+        let outcome = self.0.cancel();
+        crate::preempt::enable();
+        outcome
+    }
+
+    /// Hand the registration to the blocking pass. The count stays raised —
+    /// see [`pass_block`].
+    fn into_raw(self) -> RawTicket<'q> {
+        self.0
+    }
+}
+
 /// The blocking pass: commit the wait ticket **inside** the pass, after the
 /// mailbox drain, and park on the same pass (spec §8.1's phase 2).
 ///
@@ -352,9 +407,16 @@ pub fn pass(dispose: Dispose) {
 /// arrives behind the drain and is handled by the next pass, which finds the
 /// task parked.
 ///
-/// Returns once the thread runs again, whatever ended the park.
+/// Returns once the thread runs again, whatever ended the park — or not at
+/// all, if a retire caught the thread mid-registration and the commit turned
+/// the block into an exit.
 pub fn pass_block(ticket: Ticket<'_>, deadline: Option<Nanos>) {
-    crate::preempt::disable();
+    // No `preempt::disable()` of its own: the ticket has held the count raised
+    // since the registration published `Committing`, and that guard *is* this
+    // pass's bracket. The window and the pass are one continuous preempt-off
+    // region, which is the truth; taking a second level here would leave one
+    // for the resuming context to discharge and one for nobody.
+    let ticket = ticket.into_raw();
     crate::preempt::clear_need_resched();
     drain_irqs();
     let now = HW.now();
@@ -380,6 +442,11 @@ pub fn pass_block(ticket: Ticket<'_>, deadline: Option<Nanos>) {
             // not switch (spec §8.1). The pass still runs to its disposition,
             // because the quantum may have expired while we were deciding.
             Commit::AlreadyWoken => (pass.dispose_none().finish(), None),
+            // A retire landed while this thread was deciding to park. Parking
+            // is a safe point, so the kill is honoured here (spec §6.3, §7.6)
+            // — the registration is already withdrawn, and this switch does
+            // not return.
+            Commit::Killed => (pass.dispose_exit().finish(), None),
         }
     });
     charge_cpu_time(now);

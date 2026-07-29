@@ -165,6 +165,77 @@ fn old_commit_before_pass_is_caught() {
     );
 }
 
+/// A `Retire` that lands inside the registration window, and the fact that the
+/// workload driver no longer has a check of its own for it.
+///
+/// `Vm::block_pass` used to cancel the ticket and exit when it found the kill
+/// bit set. That was a compensation: the kernel's `pass_block` had no such
+/// check, so the simulator was papering over a hole rather than modelling it —
+/// the drain answers a `Retire` aimed at the *running* task with `need_resched`
+/// and consumes it, and a task that then parks is never picked, never reaped,
+/// and holds its address space forever. Deleting that arm reproduced it in 3+
+/// of 400 `crash_md_exit_race` seeds.
+///
+/// The arm is gone and the sweeps are clean, which is only evidence about
+/// `WaitTicket::commit` if the case still *happens*. So it is counted.
+#[test]
+fn a_retire_inside_the_registration_window_is_honoured_by_the_core() {
+    let mut killed = 0;
+    for seed in 0..SEEDS {
+        let mut choices = if seed % 2 == 0 {
+            ChoiceStream::from_seed(seed)
+        } else {
+            ChoiceStream::pct(seed, 2, 3)
+        };
+        let outcome = run(scenarios::crash_md_exit_race(), &mut choices);
+        assert!(outcome.passed(), "{}", outcome.report());
+        killed += outcome.killed_at_park;
+    }
+    assert!(
+        killed > 0,
+        "in {SEEDS} schedules no retire ever landed inside a registration \
+         window, so `Commit::Killed` is dead code here and these runs say \
+         nothing about the hole that arm used to hide",
+    );
+}
+
+/// The third self-validation gate: the registration window with preemption
+/// left enabled, which is what the kernel had until the wait ticket grew a
+/// guard.
+///
+/// This one is the reason `Vm::enabled` withholds `Step::Pass` while a CPU is
+/// mid-block. That withholding is a *model* of the kernel's preempt count, and
+/// a model nobody can falsify is a comment: flip the scenario's window to
+/// `Preemptible` and the same harness executes the step, on the same
+/// schedules, and the core aborts. It aborts rather than reporting a violation
+/// because a task whose word reads `Committing` has no legal preempt edge —
+/// which is exactly why the window had to be closed rather than tolerated.
+/// Teaching `RunningTask::preempt` to accept `Committing` would publish
+/// `Ready`, and every waker that pops the registration would then report
+/// `Claim::Lost` and move on: a lost wake, silently, in place of a panic.
+#[test]
+fn a_pass_inside_the_registration_window_is_caught() {
+    let scenario = scenarios::old_preemptible_window();
+    let caught = sweep::abort_gate(&scenario, SEEDS);
+    let Some((seed, message)) = caught else {
+        panic!(
+            "an involuntary pass inside the registration window went undetected \
+             in {SEEDS} schedules — the preempt guard the kernel holds there is \
+             then unfalsifiable, and so is this model of it",
+        );
+    };
+    assert!(
+        message.contains("disagrees with its state word") && message.contains("Committing"),
+        "expected the running-task word check to be what fires (seed {seed}); got: {message}",
+    );
+
+    // And the control: the identical workload with the guard modelled comes
+    // back clean over the same seeds, so the gate is measuring the guard and
+    // not the workload.
+    let guarded = sweep::seed_sweep(&scenarios::crash_md_exit_race(), SEEDS, 1);
+    assert!(guarded.passed(), "{}", guarded.report());
+}
+
 /// §8.1's *residual* window, which the fix names and deliberately does not
 /// close: a waker may claim the task in the instructions between the commit
 /// publishing `Blocked` and the park itself. That is why `RunningTask::park`

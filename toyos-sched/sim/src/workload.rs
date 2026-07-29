@@ -118,6 +118,27 @@ pub enum BlockShape {
     CommitAtCallSiteFused,
 }
 
+/// Whether an *involuntary* scheduler pass can land inside the registration
+/// window — between phase 1 of the §8.1 handshake and phase 2.
+///
+/// The window is two steps, so an interrupt can arrive in the middle of it;
+/// `DeliverIpi` and `FireTimer` are enabled there and set `need_resched`. What
+/// this decides is whether the pass that request asks for may *run* before the
+/// commit, which in the kernel is decided by the preempt count and by nothing
+/// else. It is a scenario dimension rather than a constant for the same reason
+/// [`BlockShape`] is: the kernel has had both answers, and the difference
+/// between them was a live panic.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WindowShape {
+    /// The kernel's `sched::driver::Ticket` holds the preempt count raised for
+    /// the whole window, so the request is deferred to the blocking pass.
+    PreemptOff,
+    /// No guard: the `preempt::enable` at the tail of any lock the re-check
+    /// takes drops the count to zero and runs a pass on a task whose word
+    /// reads `Committing`. See `scenarios::old_preemptible_window`.
+    Preemptible,
+}
+
 /// Which teardown/balance algorithm the VM drives the core with.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Protocol {
@@ -140,6 +161,7 @@ pub struct Scenario {
     pub irqs: Vec<IrqSpec>,
     pub protocol: Protocol,
     pub block: BlockShape,
+    pub window: WindowShape,
     /// Safety net: a run that has not quiesced by here is reported as a
     /// non-termination failure rather than looping forever.
     pub max_steps: usize,
@@ -179,6 +201,11 @@ impl Scenario {
 
     pub fn with_block(mut self, block: BlockShape) -> Self {
         self.block = block;
+        self
+    }
+
+    pub fn with_window(mut self, window: WindowShape) -> Self {
+        self.window = window;
         self
     }
 }

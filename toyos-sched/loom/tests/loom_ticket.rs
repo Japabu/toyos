@@ -17,6 +17,11 @@ use toyos_sched_loom::model::Kicks;
 
 type Queue = WaitQueue<Msg, LoomLock<WaitList<Msg>>>;
 
+/// These models are about wake-versus-commit; nothing in them retires
+/// anything, so `Commit::Killed` cannot arise. The kill-versus-commit race is
+/// `loom_retire.rs`'s.
+const NO_RETIRER: &str = "no thread in this model sets the kill bit";
+
 struct World {
     queue: Queue,
     cpus: CpuHandles<Msg>,
@@ -98,6 +103,7 @@ fn no_schedule_leaves_a_waiter_parked_with_the_condition_true() {
                     break;
                 }
                 Commit::AlreadyWoken => break,
+                Commit::Killed => unreachable!("{NO_RETIRER}"),
             }
         }
 
@@ -169,6 +175,7 @@ fn a_pre_park_claim_never_posts_a_message() {
                 assert!(msgs.is_empty(), "a pre-park claim posts nothing: {msgs:?}");
                 assert_eq!(waiter.state(), TaskState::Running(CPU0));
             }
+            Commit::Killed => unreachable!("{NO_RETIRER}"),
         }
     });
 }
@@ -189,6 +196,7 @@ fn a_wake_racing_a_timeout_is_never_swallowed_by_the_corpse() {
                 match ticket.commit() {
                     Commit::Parked(_, registration) => registration,
                     Commit::AlreadyWoken => panic!("nothing has woken these yet"),
+                    Commit::Killed => unreachable!("{NO_RETIRER}"),
                 }
             })
             .collect();

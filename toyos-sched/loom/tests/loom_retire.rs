@@ -1,18 +1,21 @@
 //! Loom: the retire protocol (spec §7.6, §12).
 //!
-//! Three races: the kill bit against a concurrent wake claim, the retire-node
-//! re-post chase against a migration, and adoption under a kill. What replaced
-//! `KILLED[16]`, `WAKE_TRANSITS` and the 1 s timeout scan is a sticky bit plus
-//! a message, so the cases worth checking are exactly the orderings of that
-//! bit and that node.
+//! Four races: the kill bit against a concurrent wake claim, the kill bit
+//! against a waiter's own park commit, the retire-node re-post chase against a
+//! migration, and adoption under a kill. What replaced `KILLED[16]`,
+//! `WAKE_TRANSITS` and the 1 s timeout scan is a sticky bit plus a message, so
+//! the cases worth checking are exactly the orderings of that bit and that
+//! node.
 
 use loom::sync::Arc;
 use toyos_sched_loom::cpu::{CpuHandle, CpuHandles};
 use toyos_sched_loom::mailbox::{mailbox, MailboxConsumer};
-use toyos_sched_loom::model::{model, Kicks, Msg, PreemptModel, RemoteGuard, CPU0, CPU1};
+use toyos_sched_loom::model::{
+    model, wait_list, Kicks, LoomLock, Msg, PreemptModel, RemoteGuard, CPU0, CPU1,
+};
 use toyos_sched_loom::retire;
-use toyos_sched_loom::task::{TaskKey, TaskShared, TaskState, WakeCause, WakeReason};
-use toyos_sched_loom::waitq::wake_direct;
+use toyos_sched_loom::task::{TaskKey, TaskShared, TaskState, WaitClass, WakeCause, WakeReason};
+use toyos_sched_loom::waitq::{wake_direct, Commit, CurrentTask, WaitList, WaitQueue};
 
 struct World {
     cpus: CpuHandles<Msg>,
@@ -84,6 +87,65 @@ fn a_wake_and_a_retire_ride_distinct_nodes() {
         assert_eq!(wakes, usize::from(woke), "a claimed wake posts one message");
         assert!(drain(&mut rx[1], &world.preempt).is_empty());
         assert!(!task.wake_node().in_flight() && !task.retire_node().in_flight());
+    });
+}
+
+/// A retire racing a waiter's own park commit — the window `Commit::Killed`
+/// closes (spec §6.3's park-as-safe-point, §7.6's "dies at its next one").
+///
+/// Whichever order the two land in, *someone* must be left able to reap the
+/// task. Either the commit observed the kill bit and withdrew — leaving the
+/// word at `Running`, which is the only thing the exit disposition can consume
+/// — or it parked, and then the retire message is queued to the CPU that now
+/// owns the parked task. The third outcome is the defect: parked, killed, and
+/// nothing left to notice, which is a thread that never dies and an address
+/// space that is never released.
+#[test]
+fn a_retire_racing_the_park_commit_always_leaves_someone_to_reap() {
+    model(|| {
+        let (world, mut rx) = world();
+        let queue: WaitQueue<Msg, LoomLock<WaitList<Msg>>> =
+            WaitQueue::new(WaitClass::Pipe, wait_list());
+        let waiter = Arc::new(TaskShared::<Msg>::new(TaskKey(1), TaskState::Running(CPU0)));
+        let ticket = queue.prepare_wait(&CurrentTask::new(&waiter, CPU0));
+
+        let retirer = {
+            let world = world.clone();
+            let waiter = waiter.clone();
+            loom::thread::spawn(move || {
+                retire::begin(&waiter).post(&world.cpus, &world.kicks, &RemoteGuard)
+            })
+        };
+
+        let outcome = ticket.commit();
+        let target = retirer.join().unwrap();
+        let msgs = drain(&mut rx[0], &world.preempt);
+
+        assert_eq!(target, Some(CPU0), "every word in this model names cpu0");
+        assert_eq!(
+            msgs,
+            [Msg::Retire(TaskKey(1))],
+            "exactly one retire message, whichever way the race went",
+        );
+        match outcome {
+            Commit::Killed => {
+                assert_eq!(
+                    waiter.state(),
+                    TaskState::Running(CPU0),
+                    "the exit disposition needs the word back at Running",
+                );
+                assert!(queue.is_empty(), "the registration is withdrawn");
+            }
+            // The commit read the bit before the retirer set it. That is fine
+            // precisely because the message above exists: the pass that drains
+            // it finds the task in `parked` and reaps it there.
+            Commit::Parked(_, registration) => {
+                assert_eq!(waiter.state(), TaskState::Blocked(CPU0));
+                registration.finish();
+            }
+            Commit::AlreadyWoken => unreachable!("nothing wakes in this model"),
+        }
+        assert!(!waiter.retire_node().in_flight());
     });
 }
 

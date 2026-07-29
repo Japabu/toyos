@@ -8,7 +8,7 @@
 use toyos_sched::task::WaitClass;
 
 use crate::workload::{
-    BlockShape, IrqSpec, Op, ProcSpec, Protocol, QueueSpec, Scenario, Script,
+    BlockShape, IrqSpec, Op, ProcSpec, Protocol, QueueSpec, Scenario, Script, WindowShape,
 };
 
 const MS: u64 = 1_000_000;
@@ -31,6 +31,7 @@ fn scenario(
         irqs: Vec::new(),
         protocol: Protocol::New,
         block: BlockShape::CommitInPass,
+        window: WindowShape::PreemptOff,
         max_steps: 20_000,
         max_tasks: 32,
     }
@@ -148,6 +149,38 @@ pub fn old_commit_before_pass() -> Scenario {
 pub fn old_commit_fused() -> Scenario {
     let mut scenario = lost_wake_pipe().with_block(BlockShape::CommitAtCallSiteFused);
     scenario.name = "old_commit_fused";
+    scenario
+}
+
+/// The third harness self-validation gate: the kernel's registration window
+/// with preemption left *enabled*, which is what it was until the ticket grew
+/// a guard.
+///
+/// It **must abort** — not merely fail. Every other gate here is a verdict the
+/// invariant walk returns; this one is the core's own `check_cpu` assertion
+/// firing from inside a pass, because a task whose word reads `Committing`
+/// while its CPU tries to preempt it has no legal transition to take. That is
+/// the right failure and the reason the window has to be closed rather than
+/// tolerated: `RunningTask::preempt` could be taught to accept `Committing`,
+/// but the `Ready` word it would publish makes every waker that pops the
+/// registration report `Claim::Lost` and move on — a lost wake, silently,
+/// instead of a panic.
+///
+/// Run it with [`crate::explore::run_catching`]; `run` would take the abort
+/// down with it.
+///
+/// The base workload is `crash_md_exit_race` rather than `lost_wake_pipe`,
+/// and the reason is worth stating: reaching the window needs an interrupt
+/// *delivered* into it, and the only messages that carry `Urgency::Preempt` —
+/// the only ones that kick unconditionally — are the retire and an RT wake.
+/// A plain pipe wake finds the waiter `Committing`, takes it with
+/// `Claim::PrePark` and posts nothing, so the only way into the window there
+/// is a quantum expiring, which needs ten foreign run chunks to elapse while
+/// the blocked CPU declines its own pass. That is reachable in principle and
+/// was not reached in 500 schedules.
+pub fn old_preemptible_window() -> Scenario {
+    let mut scenario = crash_md_exit_race().with_window(WindowShape::Preemptible);
+    scenario.name = "old_preemptible_window";
     scenario
 }
 
@@ -508,6 +541,7 @@ pub fn by_name(name: &str) -> Option<Scenario> {
         "old_steal_port" => Some(old_steal_port()),
         "old_commit_before_pass" => Some(old_commit_before_pass()),
         "old_commit_fused" => Some(old_commit_fused()),
+        "old_preemptible_window" => Some(old_preemptible_window()),
         _ => all().into_iter().find(|s| s.name == name),
     }
 }

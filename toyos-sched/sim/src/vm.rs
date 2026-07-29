@@ -35,7 +35,7 @@ use crate::msg::{SimHandles, SimMsg, SimQueue};
 use crate::payload::{
     MockAddressSpace, SimCtx, SimPayload, SimPreempt, SimShareLock, SimWaitList, StdLock,
 };
-use crate::workload::{BlockShape, Op, Protocol, Scenario, Script};
+use crate::workload::{BlockShape, Op, Protocol, Scenario, Script, WindowShape};
 
 /// How finely a `Run(ns)` op is chopped. Small enough that a 10 ms quantum
 /// expires in the middle of a run — the interesting case — without making
@@ -119,6 +119,18 @@ pub enum BlockPhase<'q> {
     Committed(CommittedTicket<SimMsg>),
 }
 
+/// How phase 2 of a block ended — the three ways `WaitTicket::commit` can
+/// answer, as the workload driver has to see them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BlockEnd {
+    Parked,
+    /// A wake claimed the registration first: the task kept the CPU and its
+    /// wait is satisfied.
+    Woken,
+    /// A retire landed inside the window; the task exited instead of parking.
+    Killed,
+}
+
 /// A block in progress on one CPU.
 pub struct Blocking<'q> {
     pub key: TaskKey,
@@ -200,6 +212,11 @@ pub struct Vm<'q> {
     /// itself ran — spec §8.1's residual window, and the only thing that
     /// exercises `RunningTask::park`'s `WakeQueued` arm.
     pub pre_park_claims: u64,
+    /// How many blocks ended in `Commit::Killed` — a retire that landed inside
+    /// the registration window. Counted for the same reason as
+    /// `pre_park_claims`: this driver has no kill check of its own any more, so
+    /// a clean run is only evidence about the core's if the case occurred.
+    pub killed_at_park: u64,
 }
 
 impl<'q> Vm<'q> {
@@ -263,6 +280,7 @@ impl<'q> Vm<'q> {
             violations: Vec::new(),
             steps: 0,
             pre_park_claims: 0,
+            killed_at_park: 0,
             scenario,
         };
         for (index, spec) in vm.scenario.procs.clone().iter().enumerate() {
@@ -404,11 +422,22 @@ impl<'q> Vm<'q> {
                 continue;
             }
             // Mid-block: the task has registered on a wait queue and owes the
-            // pass that parks it. It cannot run another op, and the model does
-            // not offer it an involuntary pass — see `block_pass`, which
-            // records why and what that costs.
+            // pass that parks it, so it cannot run another op.
+            //
+            // Whether it can be handed an *involuntary* pass is the kernel's
+            // preempt count, modelled rather than assumed. The interrupt still
+            // arrives — `DeliverIpi` and `FireTimer` are enabled above and set
+            // `need_resched` — but the registration holds preemption off
+            // (`kernel/src/sched/driver.rs`'s `Ticket`), so the pass it asks
+            // for waits for the commit. That is the whole of the kernel's
+            // deferred-preemption model, and it is why the window has exactly
+            // one legal exit. `WindowShape::Preemptible` is the kernel without
+            // that guard, and is a negative gate.
             if self.blocking[cpu].is_some() {
                 steps.push(Step::BlockPass(cpu));
+                if self.scenario.window == WindowShape::Preemptible && need_resched[cpu] {
+                    steps.push(Step::Pass(cpu));
+                }
                 continue;
             }
             if self.cpus[cpu].running().is_some() && !need_resched[cpu] && !delivery_owed {
@@ -567,11 +596,10 @@ impl<'q> Vm<'q> {
 
     // ------------------------------------------------------------ the pass
 
-    /// Run one pass. The returned bool is only meaningful for
-    /// [`Dispose::Commit`], where `false` says phase 2's CAS lost — a wake
-    /// landed between the registration and the commit, so the task did not
-    /// park and its wait is satisfied (spec §8.1).
-    fn run_pass(&mut self, cpu: usize, dispose: Dispose<'q>) -> bool {
+    /// Run one pass. The returned [`BlockEnd`] is only meaningful for
+    /// [`Dispose::Commit`]; every other disposition reports `Parked`, which
+    /// nobody reads.
+    fn run_pass(&mut self, cpu: usize, dispose: Dispose<'q>) -> BlockEnd {
         let now = self.clock;
         let kicks_before = self.hw.with(|s| {
             s.need_resched[cpu] = false;
@@ -583,7 +611,7 @@ impl<'q> Vm<'q> {
         // pass holds `CpuSched`, and these are the only fields it needs.
         let queues = self.queues;
         let mut injected = None;
-        let (action, parked) = {
+        let (action, parked, end) = {
             let Vm {
                 cpus,
                 hw,
@@ -600,12 +628,14 @@ impl<'q> Vm<'q> {
             };
             let pass = SchedPass::begin(&mut cpus[cpu], env, now);
             match dispose {
-                Dispose::None => (pass.dispose_none().finish(), None),
-                Dispose::Yield => (pass.dispose_yield().finish(), None),
-                Dispose::Exit => (pass.dispose_exit().finish(), None),
-                Dispose::Block(ticket, deadline) => {
-                    (pass.dispose_block(ticket, deadline).finish(), None)
-                }
+                Dispose::None => (pass.dispose_none().finish(), None, BlockEnd::Parked),
+                Dispose::Yield => (pass.dispose_yield().finish(), None, BlockEnd::Parked),
+                Dispose::Exit => (pass.dispose_exit().finish(), None, BlockEnd::Parked),
+                Dispose::Block(ticket, deadline) => (
+                    pass.dispose_block(ticket, deadline).finish(),
+                    None,
+                    BlockEnd::Parked,
+                ),
                 // Phase 2 inside the pass, after `begin`'s drain (spec §8.1).
                 // Committing here puts every claim on one side of the drain or
                 // the other: an earlier one finds `Committing` and posts no
@@ -641,16 +671,24 @@ impl<'q> Vm<'q> {
                         (
                             pass.dispose_block(committed, deadline).finish(),
                             Some((key, registration)),
+                            BlockEnd::Parked,
                         )
                     }
                     // Do not park, do not switch. The pass still runs to a
                     // disposition, because the quantum may have expired while
                     // the decision was being made.
-                    Commit::AlreadyWoken => (pass.dispose_none().finish(), None),
+                    Commit::AlreadyWoken => {
+                        (pass.dispose_none().finish(), None, BlockEnd::Woken)
+                    }
+                    // A retire landed while the task was deciding to park.
+                    // Parking is a safe point (spec §6.3, §7.6): the commit
+                    // withdrew the registration, and this pass buries it.
+                    Commit::Killed => {
+                        (pass.dispose_exit().finish(), None, BlockEnd::Killed)
+                    }
                 },
             }
         };
-        let did_park = parked.is_some();
         if let Some((key, registration)) = parked {
             self.registrations.insert(key, registration);
             // Did the injected wake claim *this* task before its park ran?
@@ -663,10 +701,13 @@ impl<'q> Vm<'q> {
         if let Some(key) = injected {
             self.programs.get_mut(&key).expect("live").pc += 1;
         }
+        if end == BlockEnd::Killed {
+            self.killed_at_park += 1;
+        }
         self.apply(action);
         self.hw.leave_pass();
         self.note_kicks(kicks_before);
-        did_park
+        end
     }
 
     #[allow(unsafe_code)] // `Hw::switch` is an unsafe fn; SimHw's body derefs nothing
@@ -858,6 +899,14 @@ impl<'q> Vm<'q> {
                         self.programs.get_mut(&key).expect("live").pc += 1;
                         return;
                     }
+                    // A retire beat the commit. Committing at the call site
+                    // does not change what that means — the thread dies
+                    // instead of parking — only where the pass that buries it
+                    // is entered from.
+                    Commit::Killed => {
+                        self.finish_task(cpu, key);
+                        return;
+                    }
                 }
             }
         };
@@ -884,12 +933,16 @@ impl<'q> Vm<'q> {
     /// outside the step relation, which is why the simulator certified a
     /// protocol whose lost wake it could not execute (commit `8508b37`).
     ///
-    /// One interval is still modelled as unreachable: the kernel runs the call
-    /// site with preemption *enabled*, so an involuntary pass can land on a
-    /// task whose word already reads `Committing`. `Step::Pass` is not offered
-    /// here, because `RunningTask::preempt` asserts on `Running` and would
-    /// abort the run rather than report a violation. See the audit note in
-    /// CLAUDE.md — closing it is a protocol change, not a harness one.
+    /// The one interval this step boundary opens up and does *not* offer a
+    /// pass into is the kernel's preempt-off registration window; see
+    /// `enabled`, which models the guard rather than looking away from what
+    /// happens without it.
+    ///
+    /// There is no kill check here. A `Retire` that lands between the two
+    /// halves is honoured by `WaitTicket::commit`, in the core, where both
+    /// this driver and the kernel's get it — which is where it belongs, since
+    /// a driver that forgot it would leave the task parked with nothing left
+    /// to reap it.
     fn block_pass(&mut self, cpu: usize, choices: &mut ChoiceStream) {
         let Blocking {
             key,
@@ -900,24 +953,7 @@ impl<'q> Vm<'q> {
             .take()
             .expect("a block pass with no block in progress");
 
-        let parked = match phase {
-            // The safe point, the same one `exec_op` applies before every op
-            // (spec §7.6): a killed thread dies instead of parking. It is
-            // repeated here because splitting one op into two steps must not
-            // change what the model asserts about the workload — with the
-            // halves separated, a `Retire` can now land between them.
-            //
-            // The kernel has no equivalent check, and that is a real hole
-            // rather than a modelling detail: `pass_block`'s drain finds the
-            // thread still `running`, answers `need_resched` and *drops* the
-            // retire, then parks it — and a parked task is never picked, so
-            // nothing ever reaps it. Deleting this arm reproduces it in ~33 of
-            // 400 seeds on `crash_md_exit_race`. Audit note in CLAUDE.md.
-            BlockPhase::Registered(ticket) if self.shared[&key].kill_pending() => {
-                ticket.cancel();
-                self.finish_task(cpu, key);
-                return;
-            }
+        let end = match phase {
             BlockPhase::Registered(ticket) => {
                 // The commit and the park are one step here — a `SchedPass`
                 // borrows `CpuSched` and cannot be held across a step boundary
@@ -933,20 +969,25 @@ impl<'q> Vm<'q> {
             // `Blocked`; there is no route back to `Running`, which is one more
             // thing wrong with committing there.
             BlockPhase::Committed(ticket) => {
-                self.run_pass(cpu, Dispose::Block(ticket, deadline));
-                true
+                self.run_pass(cpu, Dispose::Block(ticket, deadline))
             }
         };
-        if parked {
-            return;
+        match end {
+            BlockEnd::Parked => {}
+            // The task is dead. `reap_released` takes its program and its
+            // bookkeeping; there is no registration to finish, because the
+            // commit withdrew it.
+            BlockEnd::Killed => {}
+            // Phase 2 declined to park: the waker that claimed the ticket left
+            // a token behind, and the script moves on.
+            BlockEnd::Woken => {
+                let q = &self.queues[queue];
+                if q.tokens.get() > 0 {
+                    q.tokens.set(q.tokens.get() - 1);
+                }
+                self.programs.get_mut(&key).expect("live").pc += 1;
+            }
         }
-        // Phase 2 declined to park: the waker that claimed the ticket left a
-        // token behind, and the script moves on.
-        let q = &self.queues[queue];
-        if q.tokens.get() > 0 {
-            q.tokens.set(q.tokens.get() - 1);
-        }
-        self.programs.get_mut(&key).expect("live").pc += 1;
     }
 
     /// The consume-side half of priority inheritance: a client that was

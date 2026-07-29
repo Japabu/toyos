@@ -292,6 +292,10 @@ pub enum Commit<'q, M: SchedMsg, L: LeafLock<WaitList<M>>> {
     /// A wake landed between registration and commit: do not park, do not
     /// switch (spec §8.1).
     AlreadyWoken,
+    /// A retire landed while this task was deciding to park. The registration
+    /// is already withdrawn and the word is back to `Running(cpu)`: the caller
+    /// must dispose the pass by *exiting*, not by parking (spec §6.3, §7.6).
+    Killed,
 }
 
 /// A live registration on a queue, outstanding while its task is parked.
@@ -368,8 +372,27 @@ impl<'q, M: SchedMsg, L: LeafLock<WaitList<M>>> WaitTicket<'q, M, L> {
     }
 
     /// Phase 2, run by the blocking pass.
+    ///
+    /// A park is one of §6.3's safe points, so §7.6's promise that a killed
+    /// task "dies at its next safe point" has to be kept *here*. It cannot be
+    /// kept anywhere later: the retire message that set the kill bit was
+    /// consumed by the drain this commit runs behind, and `handle_retire`
+    /// answered it with `need_resched` because the task was still the running
+    /// one. Park it anyway and nothing is left to reap it — a parked task is
+    /// never picked, the retirer waits on a word that never reaches `Dead`,
+    /// and the address space the payload holds is never released.
+    ///
+    /// The kill check comes first because it subsumes the wake: a task that is
+    /// about to die has no use for the wake it may also have been claimed by,
+    /// and `cancel_commit` puts the word back to `Running(cpu)` either way,
+    /// which is what the exit disposition needs.
     pub fn commit(mut self) -> Commit<'q, M, L> {
         self.armed = false;
+        if self.shared.kill_pending() {
+            self.queue.dequeue(&self.shared);
+            let _ = self.shared.cancel_commit(self.cpu, self.generation);
+            return Commit::Killed;
+        }
         match self.shared.commit_park(self.cpu, self.generation) {
             ParkOutcome::Parked => Commit::Parked(
                 CommittedTicket {
@@ -478,7 +501,14 @@ mod tests {
     ) -> Registration<'q, Msg, StdLock<WaitList<Msg>>> {
         match ticket.commit() {
             Commit::Parked(_, reg) => reg,
-            Commit::AlreadyWoken => panic!("expected the park to commit"),
+            other => panic!(
+                "expected the park to commit, got {}",
+                match other {
+                    Commit::AlreadyWoken => "AlreadyWoken",
+                    Commit::Killed => "Killed",
+                    Commit::Parked(..) => unreachable!(),
+                },
+            ),
         }
     }
 
@@ -519,6 +549,46 @@ mod tests {
         assert_eq!(rx.pop(&NoPreempt), None, "pre-park claims post no message");
         assert_eq!(t.state(), TaskState::Running(C0));
         assert_eq!(kicks.count(), 0);
+    }
+
+    /// Spec §6.3 lists the park among the safe points and §7.6 promises a
+    /// killed task dies at its next one. A commit that parked instead would
+    /// put the task somewhere nothing ever looks again.
+    #[test]
+    fn a_kill_that_lands_before_the_commit_refuses_the_park() {
+        let q = queue();
+        let t = task(1);
+
+        let ticket = q.prepare_wait(&CurrentTask::new(&t, C0));
+        t.mark_kill();
+        assert!(matches!(ticket.commit(), Commit::Killed));
+        assert_eq!(
+            t.state(),
+            TaskState::Running(C0),
+            "the exit disposition needs the word back at Running",
+        );
+        assert!(q.is_empty() && !t.is_waiting(), "the registration is withdrawn");
+    }
+
+    /// The same, with a waker having claimed the registration first. The task
+    /// is dying, so the wake is moot — but the word must still land on
+    /// `Running`, which is the only thing the exit path can consume.
+    #[test]
+    fn a_kill_beats_a_pre_park_claim_to_the_commit() {
+        let q = queue();
+        let (handles, mut rx) = cpus();
+        let kicks = Kicks::default();
+        let t = task(1);
+
+        let ticket = q.prepare_wait(&CurrentTask::new(&t, C0));
+        assert_eq!(
+            q.wake_one(woken(WakeReason::Woken), &handles, &kicks, &NoPreempt),
+            1
+        );
+        t.mark_kill();
+        assert!(matches!(ticket.commit(), Commit::Killed));
+        assert_eq!(t.state(), TaskState::Running(C0));
+        assert_eq!(rx.pop(&NoPreempt), None, "pre-park claims post no message");
     }
 
     #[test]
