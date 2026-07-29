@@ -385,6 +385,52 @@ the subsystems they cover:
   again, a woken client now costs an IPI and a wake-from-halt. Both are in scope
   for a scheduling fix. `smp=1` regressed too (pre-cutover 1/24, HEAD 6/34), so
   whatever it is, it is not only the SMP placement half.
+
+  **The RT boost window is NOT the cause — eliminated 2026-07-29, two ways.**
+  (1) *Mechanism.* A temporary kernel probe counted every place `RtState::expire`
+  clears a lend, and the maxima of a boosted task's Ready and Running residencies.
+  Across ~30 config-runs and ~20k lends the window **never lapsed**: `expired
+  d/preempt/park/pick = 0/0/0/0` on 235 of 236 reporting windows, gapping runs and
+  clean runs alike. It cannot lapse in steady state — soundd re-lends every ~3 ms
+  and the window is 10 ms — and the work it has to cover fits: a boosted task's
+  Running residency is 0.5–1.3 ms in steady state and 8.1–9.5 ms for the
+  stream-start whole-ring refill, against a 10 ms window. So "one quantum" was the
+  right size after all, and shrinking it hurting (recorded above) was measuring the
+  8.5 ms refill, not the boost policy. (2) *Rate.* Same-session A/B of the one real
+  defect the probe did find (below), 60 first-boot config-runs per side: 18/60 vs
+  19/60, Fisher p=1.00. Note the base rate that session was **30%**, not the 22%
+  recorded above — these rates drift between batches on one host, so only
+  same-session numbers mean anything.
+
+  **One real cutover defect was found on that path and is fixed (`9c2fc4d`), but it
+  is a tail, not the rate.** `CpuSched::pick` demoted a queued task whose wall-clock
+  window had lapsed out of the RT band, which inverts the lend — a task that waited
+  spent none of its window, and demoting it drops it behind the normal work the lend
+  existed to jump, self-reinforcingly (the only re-grant paths are a wake and the
+  pipe consume point, and a starved *ready* task reaches neither). It fired once in
+  ~30 config-runs and that once starved the client's cpal thread 93.3 ms behind the
+  hog and produced the batch's only 24-period (70 ms) gap. The window is now armed
+  at dispatch, so queue time does not spend it; §8.5/I9 amended to say the bound is
+  on time *held*. The simulator rejected the first attempt (delete the demotion,
+  keep clearing at dispatch) on I4 — worth knowing that its seed/fuzz sweeps have
+  teeth on this exact area.
+
+  **Where to look next, with what was measured.** The evidence now points at
+  soundd's wait condition at stream start, i.e. the already-recorded defect (9) in
+  the soundd audit — "the §5.3/§5.10 'wait until clients have filled' condition does
+  not exist; the wait ends on the first DMA completion". On `smp=8`, where the
+  client is dispatched instantly (max boosted Ready = 0 µs on every run), it still
+  runs **8.1–9.5 ms** solid to regenerate its whole 8-slot ring at stream start, and
+  gaps of 1–5 periods still happen — so the common failure is not scheduling-limited
+  at all, it is soundd consuming while the client is legitimately mid-refill. That
+  also fits soundd's post-cutover `wakes` going 426–496 → 1050–1130 (recorded
+  below): the scheduler got *better*, soundd now runs ~2.4x more mix cycles across
+  the same refill, and each extra cycle is another chance to read an empty ring.
+  Fixing that is a soundd/protocol change, which is the owner's call, not a
+  scheduler change. What the scheduler was cleared of: boost window size, boost
+  expiry, boost demotion, wake→dispatch latency for the boosted client (max 3.5 ms
+  on `smp=1`, 0 on `smp=8`), and client pipe-blocked time (max 4.4–7.3 ms per 0.4 s
+  window, i.e. ~2 device periods, never the 15–70 ms a gap would need).
 - ~~The audio harness's per-test 30 s timeout fired once in 30 quiet-host runs.~~ **Diagnosed and fixed, and it was not a guest stall.** `run_test` matched `===TEST_END ` as a *line prefix*; soundd was mid-`println!` when the runner printed the marker, so the marker landed inside soundd's line and the harness never saw it. The guest had already exited cleanly. The marker is now matched anywhere in the line and the text preceding it is kept (it is usually the stats line gate A reads). Worth remembering as a class: a "guest hang" that only ever appears on the audio tests is more likely to be the shared console than the scheduler.
 - **The virtio-console has no line atomicity between writers, and it corrupts machine-readable serial output.** Kernel `log!` output and userspace `println!` interleave *mid-word* into each other's lines: soundd's stats line was split by a kernel message in 1 of 15 runs and by the tone client's own `println!("tone done")` in 2 of 120 config-runs, each time pushing the line's tail onto the following line. `tests/common/audio.rs` now reassembles both cases (strip `[kernel …]` spans; resume a field's digits after the next newline), but that is a reader-side workaround for a writer-side defect — any tool parsing serial output has the same problem. Serial writes of a whole line should be atomic.
 - ~~**Gate A records physically impossible counter values as data, and its re-baselining output would poison itself.**~~ **Fixed 2026-07-29 — `audio::check_physical`.** The bound is the wall-clock life of the QEMU process, timed by the harness: soundd's whole life is inside it, so no duration it reports can exceed it, and no count of device periods can exceed the periods that fit in it (`underruns <= submitted` rides along as a definitional check). Nothing is recorded in the toml, so there is no number to tune when a run goes red. Three properties, all verified by injecting the recorded 153766519us into soundd's stats line: the fast tier fails it as a *broken instrument* rather than a ceiling breach; the thorough tier aborts on iteration 1, before the value joins the sample; and no `toml:` line is printed on that path, so it cannot reach the next baseline. The bound landed at ~10 s (the run's own length, 430 pipeline depths), which is 54x the loosest ceiling — deliberately: the owner's "a few pipeline depths" is a *health* threshold and would collide with the recorded ceilings, which already admit 8.01. The wav capture cannot serve as the reference (its timeline is what soundd submitted — measured 3.32 s against 1130 submitted periods = 3.28 s — so a stall that submits nothing does not lengthen it). Original entry: Stage 6's thorough tier (`--audio-gate 30`, PASS) contains `iter014: audio_tone smp=1 soundd: wake_lat 153766519us (6622.44 pipelines, limit 56000us)` — 153 *seconds* of wake lateness inside a 3-second test. It cannot be a measurement; it is a counter defect (stale or unset reference in the lateness computation is the obvious candidate, unconfirmed). Three consequences, in increasing severity. (1) The thorough tier applies no per-run ceiling, only distributional comparison — so a value 2745x over its own printed limit did not fail anything. (2) Mann-Whitney is rank-based and therefore robust to exactly this: one absurd outlier at the top of a 30-sample does not move the median, which is a virtue for noise and a hole for instrument faults. (3) Worst — the gate prints toml-ready output intended to become the next baseline, and that output contains `max_wake_lat_us = [..., 24593, 153766519]`. Pasting it in sets the ceiling to 2x 153766519, permanently disabling the wake-latency check. The gate needs an *implausibility* bound distinct from its regression bound: any counter beyond a physical limit (a few pipeline depths) is an instrument fault and must fail loudly, never be ranked and never be recorded. Note the same run also had a real 5-period dropout and `windows 3` where every other run had 2.
