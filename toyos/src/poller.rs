@@ -43,11 +43,10 @@ impl Poller {
     /// Create a poller sized for `handles` concurrently watched handles.
     ///
     /// The kernel only builds power-of-two rings up to [`MAX_ENTRIES`], so the
-    /// request is rounded up and clamped instead of rejected — `poll(2)` over
-    /// three fds asks for three, and used to get `io_uring_setup: Err(
-    /// InvalidArgument)` and a panic. Registering more handles than the ring
-    /// holds is still correct (see [`poll_add_fd`](Self::poll_add_fd)); the
-    /// ring depth only decides how many reach the kernel per batch.
+    /// request is rounded up and clamped rather than rejected. Registering more
+    /// handles than the ring holds stays correct (see
+    /// [`poll_add_fd`](Self::poll_add_fd)); the depth only decides how many
+    /// reach the kernel per batch.
     pub fn new(handles: u32) -> Self {
         let entries = handles.clamp(1, MAX_ENTRIES).next_power_of_two();
         let (ring_fd, shm_token) = syscall::io_uring_setup(entries)
@@ -72,14 +71,9 @@ impl Poller {
     /// Prefer [`poll_add`](Self::poll_add) when you have a typed handle.
     pub fn poll_add_fd(&self, fd: Fd, flags: u32, token: u64) {
         // The SQ is a transport, not the caller's queue. Writing past its depth
-        // wrapped onto entries the kernel had not read yet: `submit_sqes`
-        // refuses a batch larger than the ring wholesale, so nothing was
-        // submitted, the ring head never moved, and `pending()` grew by the
-        // caller's whole registration set every iteration — permanently. Thirty
-        // two `connect("soundd")` calls were enough to wedge soundd's control
-        // thread that way, with the rejection swallowed by a discarded result.
-        // Handing the full batch to the kernel first costs one syscall per ring
-        // depth and keeps every entry.
+        // would wrap onto entries the kernel has not read yet, and it refuses
+        // an over-deep batch wholesale — so nothing would ever be submitted.
+        // Flushing first costs one syscall per ring depth and keeps every entry.
         if self.pending() == self.sq_size {
             self.submit(0, 0);
         }
@@ -111,11 +105,10 @@ impl Poller {
 
     /// Hand the queued submissions to the kernel.
     ///
-    /// The only errors `io_uring_enter` can report are about arguments this
-    /// type owns — a batch deeper than the ring, or a ring id that is not this
-    /// poller's fd — so a failure here is an SDK bug and says so. Nothing a
-    /// peer process does reaches it: a timeout or an empty completion queue is
-    /// `Ok`, not an error.
+    /// The `expect` is sound because every error `io_uring_enter` can report is
+    /// about an argument this type owns — an over-deep batch, or a ring id that
+    /// is not this poller's fd. Nothing a peer process does reaches it: a
+    /// timeout or an empty completion queue is `Ok`.
     fn submit(&self, min_complete: u32, timeout_nanos: u64) {
         let to_submit = self.pending();
         syscall::io_uring_enter(self.ring_fd, to_submit, min_complete, timeout_nanos)
@@ -142,14 +135,12 @@ impl Poller {
             let cqe = unsafe {
                 &*(self.base.add(CQ_RING_OFF as usize + 16 + idx as usize * core::mem::size_of::<IoUringCqe>()) as *const IoUringCqe)
             };
-            // Every completion is reported, whatever its result. A negative one
-            // is not noise: it is the kernel saying this registration is over
-            // and will never fire — `remove_fd` posts `-NotFound` for a watched
-            // handle that gets closed, which happens on any peer disconnect —
-            // and the caller's reaction to that is the same as to readiness,
-            // to look at the handle again and find it gone. Filtering on
-            // `result > 0` swallowed those silently, and swallowed a zero
-            // result besides: `IORING_OP_ACCEPT` reports fd 0 that way.
+            // Do not filter on `cqe.result`. A negative result is the kernel
+            // saying the registration is over and will never fire (`remove_fd`
+            // posts `-NotFound` when a watched handle closes, i.e. on any peer
+            // disconnect), and the caller must react to that exactly as to
+            // readiness — by looking at the handle again. A zero result is
+            // meaningful too: `IORING_OP_ACCEPT` reports fd 0 that way.
             f(cqe.user_data);
             cq_hdr.head.store(head.wrapping_add(1), Ordering::Release);
         }

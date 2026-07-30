@@ -70,17 +70,14 @@ fn load_file_bytes(handle: Handle, system_table: &SystemTable<Boot>, path: &CStr
 }
 
 /// A buffer to be filled by a read, allocated *without* zeroing it first.
+/// The caller must check that the read filled the whole buffer.
 ///
-/// `vec![0; size]` here cost a full pass of `memset` over the initrd — 635 MiB
-/// on the current image — immediately before `File::read` overwrote every byte
-/// of it. The chain is not obvious, which is why it survived: `vec![0u8; n]`
-/// takes `SpecFromElem`'s zero branch to `RawVec::with_capacity_zeroed_in`,
-/// which calls `alloc_zeroed`; uefi 0.26's allocator implements only `alloc`
-/// and `dealloc`, so that falls through to `GlobalAlloc`'s default, which is
-/// `alloc` followed by `write_bytes(ptr, 0, size)`. Under TCG that pass runs on
-/// the vCPU thread and buys nothing.
-///
-/// The caller must therefore check that the read filled the whole buffer.
+/// Do not simplify to `vec![0; size]`: that memsets the whole initrd
+/// immediately before `File::read` overwrites every byte. The chain is not
+/// visible at the call site — `vec![0u8; n]` takes `SpecFromElem`'s zero branch
+/// to `RawVec::with_capacity_zeroed_in` and so to `alloc_zeroed`, and uefi
+/// 0.26's allocator implements only `alloc`/`dealloc`, so it falls through to
+/// `GlobalAlloc`'s default of `alloc` plus `write_bytes(ptr, 0, size)`.
 fn alloc_uninit(size: usize) -> vec::Vec<u8> {
     let layout = Layout::from_size_align(size, 1).expect("invalid layout");
     let ptr = unsafe { alloc::alloc::alloc(layout) };
@@ -98,7 +95,6 @@ fn load_kernel_elf(kernel_elf_bytes: &[u8]) -> LoadedKernel {
     let segments = elf.segments().expect("Failed to get segments");
     let section_headers = elf.section_headers().expect("Failed to get sections");
 
-    // calculate process memory size
     let stack_size: usize = 8 * 1024 * 1024; // 8MB
 
     let mut mem_size: usize = 0;
@@ -108,7 +104,6 @@ fn load_kernel_elf(kernel_elf_bytes: &[u8]) -> LoadedKernel {
         }
     });
 
-    // reserve space for stack at the end of the memory
     println!("Kernel stack size: {}", stack_size);
     mem_size += stack_size;
 
@@ -117,7 +112,6 @@ fn load_kernel_elf(kernel_elf_bytes: &[u8]) -> LoadedKernel {
     let mut process_mem = alloc_kernel_memory(mem_size);
     println!("Kernel memory located at: {:?}", process_mem.as_ptr());
 
-    // handle load segments
     segments.iter().for_each(|segment| {
         if segment.p_type == abi::PT_LOAD {
             println!("Loading segment: {:?}", segment);
@@ -129,7 +123,6 @@ fn load_kernel_elf(kernel_elf_bytes: &[u8]) -> LoadedKernel {
         }
     });
 
-    // handle relocations
     if section_headers
         .iter()
         .find(|section| section.sh_type == abi::SHT_REL)
@@ -206,7 +199,6 @@ fn query_gop(system_table: &SystemTable<Boot>) -> Option<GopInfo> {
         }
     }
 
-    // Switch to best mode
     if let Some(target) = best_mode {
         println!("GOP: selecting best mode ({}x{})", target.info().resolution().0, target.info().resolution().1);
         gop.set_mode(&target).expect("failed to set GOP mode");
@@ -238,15 +230,6 @@ fn query_gop(system_table: &SystemTable<Boot>) -> Option<GopInfo> {
     })
 }
 
-/// Build minimal page tables for the kernel transition to the high half.
-/// Returns the physical address of the PML4.
-///
-/// Maps:
-/// - Identity map: first `identity_size` bytes (PML4[0]) for boot transition
-/// - High-half map: first `identity_size` bytes at PHYS_OFFSET (PML4[256+]) for kernel
-///
-/// Uses 2MB large pages. Page table pages are allocated from `pool` (a slice of
-/// pre-allocated zeroed pages).
 /// Build minimal boot page tables for kernel transition to high half.
 /// `pt_mem` is a pointer to PT_PAGES * 4096 bytes of zeroed memory.
 /// Returns the physical address of the PML4.
@@ -293,7 +276,6 @@ unsafe fn build_boot_page_tables(pt_mem: *mut u8, size: u64) -> u64 {
 }
 
 fn start_kernel(kernel: LoadedKernel, kernel_elf_bytes: vec::Vec<u8>, initrd: vec::Vec<u8>, rsdp_addr: u64, gop: Option<GopInfo>, system_table: SystemTable<Boot>) -> ! {
-    // Estimate memory map size
     let mms = system_table.boot_services().memory_map_size();
     let memory_map_entry_count = mms.map_size / mms.entry_size + 8;
     let mut memory_map = vec::Vec::<MemoryMapEntry>::with_capacity(memory_map_entry_count);
@@ -308,7 +290,6 @@ fn start_kernel(kernel: LoadedKernel, kernel_elf_bytes: vec::Vec<u8>, initrd: ve
 
     let (_system_table, uefi_memory_map) = system_table.exit_boot_services(MemoryType::LOADER_DATA);
 
-    // Convert memory map to a format that the kernel can understand
     uefi_memory_map.entries().for_each(|entry| {
         memory_map.push(MemoryMapEntry {
             uefi_type: entry.ty.0,
