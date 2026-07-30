@@ -34,6 +34,12 @@ should instead fall out of capability handles
 until `device::is_owner` was added, nothing outside `release` ever read them —
 this is a class, not an instance.
 
+Those gates are exactly as strong as the claim and no stronger. `SYS_OPEN_DEVICE`
+is itself first-come and ungated, so a process that beats the daemon to a device,
+or claims it after the daemon dies, holds everything the claim unlocks — for
+`DEVICE_AUDIO` that includes the RT band, which audio spec §9.4 wants to be a
+privilege. "Gated" here does not mean "privileged".
+
 ### Untrusted-input panics that remain
 
 A crafted ELF still panics the kernel outright:
@@ -131,6 +137,24 @@ what spec §8.2's retry arm exists for — but the list grows across process kil
 and a `wake_all` walks the corpses. The fix belongs with the intrusive
 `wait_node` the core still owes (`waitq.rs` holds waiters in a `VecDeque`
 instead; see its module note): with an embedded node, `reap` could unlink it.
+
+### `spawn_thread`'s late failure paths drop a mapped TLS block
+
+The two `return None`s after `PROCESS_TABLE` is taken — the process is gone, or
+`tearing_down()` claimed it between phase 1 and there — drop the `ThreadData`
+holding a `MappedPages` that is already in the parent's address space. Drop frees
+the pages; nothing unmaps the VA. Same shape as the `SYS_TLS_ALLOC_BLOCK`
+use-after-free (`fcd481f`), which is why the kernel-stack failure path above them
+now calls `MappedPages::release`.
+
+Much narrower: reaching it means losing a race with the target process's own
+exit, and the address space is destroyed moments later, so the window is a
+sibling thread that has not yet been retired. Not fixed with the rest because
+`tls_alloc` is already inside the `Arc<Lock<ThreadData>>` by then and the release
+cannot happen under the table lock (it would put `AddressSpace` under
+`PROCESS_TABLE`, a lock order this kernel does not otherwise use). Building the
+`ThreadData` after the table check, inside the same lock hold, is the shape that
+fixes it.
 
 ### Timer-vs-XHCI deadlock hazard
 
@@ -284,6 +308,22 @@ tracing and RIP sampling are not. See CLAUDE.md's diagnostics roadmap.
 ---
 
 ## 6. Build and toolchain
+
+### std leaks a whole thread stack on every `thread::spawn`
+
+`rust/library/std/src/sys/thread/toyos.rs` allocates the stack with
+`alloc::alloc` (2 MiB minimum), hands its base to `SYS_THREAD_SPAWN`, and never
+records the pointer. `Thread` holds only a tid and has no `Drop`, `join` does not
+free it, and the trampoline cannot — it is standing on it. So every spawned
+thread costs 2 MiB of heap for the life of the process, which dlmalloc serves
+from a dedicated `mmap` above its 256 KiB threshold: one leaked 2 MiB kernel
+region per spawn, walking the address space downwards.
+
+Found while testing thread-exit TLS release, where the drift swamped the signal
+(the test now drives `SYS_THREAD_SPAWN` directly on a reused stack). It also
+makes any per-process memory measurement across a thread-spawning workload wrong.
+The fix wants the stack owned by something the joiner can free — a base/layout
+pair on `Thread`, freed in `join` after the tid is reaped.
 
 ### The build system suppresses rustc warnings on success
 

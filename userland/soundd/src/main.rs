@@ -676,7 +676,10 @@ fn mix_thread(
     // about what has actually been heard.
     let mut playout_until_ns = pipeline_filled_ns + num_buffers as u64 * period_nanos;
 
-    syscall::set_rt_priority(true);
+    // Gated on the audio device claim, which `main` took before it got here;
+    // a refusal is therefore a kernel bug. Mixing on without the RT band would
+    // show up only as glitches.
+    syscall::set_rt_priority(true).expect("soundd holds the audio device claim");
 
     let poller = Poller::new(64);
     let mut mix_f32 = vec![0.0f32; device_period_samples];

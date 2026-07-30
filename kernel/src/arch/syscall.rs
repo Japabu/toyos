@@ -486,6 +486,11 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             // record of which process owns the pipeline, and soundd is the
             // only caller in the tree. Not in `scheduler::set_current_rt`,
             // which must stay callable from kernel init.
+            //
+            // This is exactly as strong as the claim and no stronger:
+            // `SYS_OPEN_DEVICE` is first-come and ungated, so whoever wins the
+            // race for the audio device gets the RT band with it. Spec §9.4
+            // wants a privilege, and a claim is not one.
             if !device::is_owner(device::DEVICE_AUDIO, process::current_process()) {
                 return SyscallError::PermissionDenied.to_u64();
             }

@@ -310,8 +310,10 @@ pub fn boost_current_rt_inherited() {
     driver::boost_current(boost_window());
 }
 
-/// `SYS_SET_RT_PRIORITY`. The privilege gate is spec §9.4's, and is still
-/// missing — see the known issue in CLAUDE.md.
+/// `SYS_SET_RT_PRIORITY`. Gated at the dispatch site on the `DEVICE_AUDIO`
+/// claim, not here — this must stay callable from kernel init. That is not yet
+/// spec §9.4's privilege gate: `SYS_OPEN_DEVICE` is first-come and ungated, so
+/// whoever wins the claim race gets the RT band with it.
 pub fn set_current_rt(enable: bool) {
     driver::set_current_rt(enable);
 }

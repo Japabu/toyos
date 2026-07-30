@@ -678,8 +678,12 @@ pub fn nanosleep(nanos: u64) {
 }
 
 /// Set or clear real-time scheduling priority on the current thread.
-pub fn set_rt_priority(enable: bool) {
-    syscall(SYS_SET_RT_PRIORITY, enable as u64, 0, 0, 0);
+///
+/// `PermissionDenied` unless the caller holds the audio device claim. A caller
+/// that discards the result drops out of the RT band with no symptom beyond
+/// the glitches the band exists to prevent.
+pub fn set_rt_priority(enable: bool) -> Result<(), SyscallError> {
+    check_unit(syscall(SYS_SET_RT_PRIORITY, enable as u64, 0, 0, 0))
 }
 
 /// Duplicate a file descriptor.
