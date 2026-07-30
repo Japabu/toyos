@@ -57,8 +57,6 @@ pub fn read_dr6() -> u64 {
     val
 }
 
-// --- Polling PTE monitor ---
-
 /// Address of a PTE to monitor. 0 = disabled.
 static MONITOR_PTE_ADDR: AtomicU64 = AtomicU64::new(0);
 /// Expected value of the PTE (set when monitoring starts).

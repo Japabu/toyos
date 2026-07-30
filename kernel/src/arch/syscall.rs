@@ -15,10 +15,6 @@ const MSR_FMASK: u32 = 0xC000_0084;
 
 use toyos_abi::syscall::*;
 
-// ---------------------------------------------------------------------------
-// Syscall entry point
-// ---------------------------------------------------------------------------
-
 pub fn init() {
     let efer = cpu::rdmsr(MSR_EFER);
     cpu::wrmsr(MSR_EFER, efer | 1);
@@ -509,10 +505,6 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
     result
 }
 
-// ---------------------------------------------------------------------------
-// Syscall implementations
-// ---------------------------------------------------------------------------
-
 fn sys_write(fd_num: u32, buf: &[u8]) -> u64 {
     loop {
         let action = process::with_fd_owner_data(|data| {
@@ -923,9 +915,7 @@ fn sys_open_device(device_type: u64) -> u64 {
     process::with_fd_owner_data(|data| fd_result(data.fds.insert(desc)))
 }
 
-// ---------------------------------------------------------------------------
 // Service IPC: listen / accept / connect
-// ---------------------------------------------------------------------------
 
 fn sys_listen(name: &str) -> u64 {
     let Some(_id) = crate::listener::listen(name, process::current_process()) else {
@@ -1638,10 +1628,6 @@ fn sys_dlsym(handle: u64, name: &str) -> u64 {
         None => u64::MAX,
     }
 }
-
-// ---------------------------------------------------------------------------
-// io_uring syscalls
-// ---------------------------------------------------------------------------
 
 fn sys_io_uring_setup(depth: u32) -> u64 {
     let (ring_id, shm_token) = match crate::io_uring::create(depth) {

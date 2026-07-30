@@ -295,8 +295,6 @@ pub fn halt() -> ! {
     }
 }
 
-// --- Port I/O ---
-
 #[inline]
 pub fn outb(port: u16, value: u8) {
     unsafe {

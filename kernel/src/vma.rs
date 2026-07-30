@@ -3,10 +3,6 @@ use alloc::sync::Arc;
 use crate::file_backing::FileBacking;
 use crate::mm::PAGE_2M;
 
-// ---------------------------------------------------------------------------
-// Address space layout constants
-// ---------------------------------------------------------------------------
-
 /// Dynamic allocations (mmap, shared memory) grow top-down from this ceiling.
 /// The stack at STACK_BASE is tracked in the regions BTreeMap, so find_gap
 /// avoids it. ALLOC_CEILING equals STACK_BASE because the stack extends upward
@@ -22,9 +18,7 @@ pub const STACK_BASE: u64 = 0x00FF_FF80_0000;
 /// 2MB guard page between allocations.
 pub const GUARD_SIZE: u64 = PAGE_2M;
 
-// ---------------------------------------------------------------------------
 // Region — what a virtual memory area is backed by
-// ---------------------------------------------------------------------------
 
 /// What backs a virtual memory region.
 pub enum RegionKind {

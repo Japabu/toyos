@@ -36,10 +36,6 @@ use toyos_abi::io_uring::{
 };
 use toyos_abi::syscall::SyscallError;
 
-// ---------------------------------------------------------------------------
-// RingId
-// ---------------------------------------------------------------------------
-
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct RingId(usize);
 
@@ -57,9 +53,7 @@ impl IdKey for RingId {
     const ONE: Self = RingId(1);
 }
 
-// ---------------------------------------------------------------------------
 // IoUringOp — type-safe op code, converted from raw u8 at boundary
-// ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy)]
 pub enum IoUringOp {
@@ -83,9 +77,7 @@ impl IoUringOp {
     }
 }
 
-// ---------------------------------------------------------------------------
 // PollFlags — type-safe poll interest flags
-// ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy)]
 pub struct PollFlags(u32);
@@ -100,9 +92,7 @@ impl PollFlags {
     pub fn raw(self) -> u32 { self.0 }
 }
 
-// ---------------------------------------------------------------------------
 // WatcherGuard — RAII cleanup of per-fd watcher lists
-// ---------------------------------------------------------------------------
 
 struct WatcherGuard {
     ring_id: RingId,
@@ -133,9 +123,7 @@ impl Drop for WatcherGuard {
     }
 }
 
-// ---------------------------------------------------------------------------
 // PendingPoll — a POLL_ADD that hasn't fired yet
-// ---------------------------------------------------------------------------
 
 struct PendingPoll {
     user_data: u64,
@@ -145,10 +133,6 @@ struct PendingPoll {
     write_source: Option<EventSource>,
     _watcher: WatcherGuard,
 }
-
-// ---------------------------------------------------------------------------
-// IoUringInstance
-// ---------------------------------------------------------------------------
 
 /// Hard cap on pending polls per ring. With dedup this should never be reached
 /// (bounded by number of open fds), but guards against future bugs.
@@ -228,19 +212,11 @@ impl IoUringInstance {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Global state
-// ---------------------------------------------------------------------------
-
 static IO_URINGS: Lock<Option<IdMap<RingId, IoUringInstance>>> = Lock::new(None);
 
 pub fn init() {
     *IO_URINGS.lock() = Some(IdMap::new());
 }
-
-// ---------------------------------------------------------------------------
-// Create
-// ---------------------------------------------------------------------------
 
 /// Largest submission ring a process may ask for. Bounds every quantity in
 /// `submit_sqes` that a process can influence.
@@ -310,9 +286,7 @@ pub fn create(depth: u32) -> Result<(RingId, SharedToken), SyscallError> {
     Ok((ring_id, shm_token))
 }
 
-// ---------------------------------------------------------------------------
 // Enter — submit SQEs and/or wait for CQEs
-// ---------------------------------------------------------------------------
 
 /// Check if a ring has unread CQEs.
 pub fn has_completions(ring_id: RingId) -> bool {
@@ -633,9 +607,7 @@ fn post_cqe_locked(ring_id: RingId, user_data: u64, result: i32, flags: u32) {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Wake path — called when a source becomes ready
-// ---------------------------------------------------------------------------
 
 /// Complete pending polls that match a given event source.
 /// Called from wake paths AFTER releasing source locks (PIPES, device locks).
@@ -678,10 +650,6 @@ fn complete_pending_for_source(watchers: &[RingId], matches: impl Fn(&PendingPol
     }
 }
 
-// ---------------------------------------------------------------------------
-// FD close integration
-// ---------------------------------------------------------------------------
-
 /// Remove all pending polls for a given fd from all affected rings.
 /// Called by the fd close path. Uses source watcher lists to find affected rings.
 pub fn remove_fd(fd_num: u32, sources: &[Option<EventSource>]) {
@@ -715,10 +683,6 @@ pub fn remove_fd(fd_num: u32, sources: &[Option<EventSource>]) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Destroy
-// ---------------------------------------------------------------------------
-
 /// Destroy an io_uring instance. Called when the ring fd is closed.
 pub fn destroy(ring_id: RingId) {
     let instance = {
@@ -735,9 +699,7 @@ pub fn destroy(ring_id: RingId) {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Watcher list operations — dispatch to the source object
-// ---------------------------------------------------------------------------
 
 /// Check if an event source is currently ready. Called under IO_URINGS lock
 /// during the TOCTOU recheck in process_poll_add.

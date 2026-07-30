@@ -58,9 +58,7 @@ impl core::fmt::Display for TaskId {
     }
 }
 
-// ---------------------------------------------------------------------------
 // What a source's readiness means — io_uring's poll key
-// ---------------------------------------------------------------------------
 
 /// What an io_uring `POLL_ADD` is registered on.
 ///
@@ -95,10 +93,6 @@ pub fn source_ready(event: &EventSource) -> bool {
         EventSource::IoUring(ring) => crate::io_uring::has_completions(*ring),
     }
 }
-
-// ---------------------------------------------------------------------------
-// Per-process fair share
-// ---------------------------------------------------------------------------
 
 /// Pid → share. Touched at spawn and at process teardown only; the *charge*
 /// path reaches the share through the task that owns it, which is what retires
@@ -149,10 +143,6 @@ pub fn global_min_vruntime() -> u64 {
     driver::frontier().get()
 }
 
-// ---------------------------------------------------------------------------
-// Spawn
-// ---------------------------------------------------------------------------
-
 /// Build and place a new task. The caller supplies everything but the share.
 pub fn enqueue_new(
     id: TaskId,
@@ -170,10 +160,6 @@ pub fn enqueue_new(
         share: share_for(id.0),
     })
 }
-
-// ---------------------------------------------------------------------------
-// Blocking
-// ---------------------------------------------------------------------------
 
 /// Phase 1 of the wait handshake: register the running thread on `queue`.
 /// The caller must then re-check its condition and either cancel the ticket or
@@ -249,10 +235,6 @@ pub fn exit_current(code: i32) -> ! {
     unreachable!("exit_current: returned from the exit pass");
 }
 
-// ---------------------------------------------------------------------------
-// Wakes
-// ---------------------------------------------------------------------------
-
 /// Wake one specific thread — waitpid, thread_join, panic-recovery notify.
 /// The same claim CAS every other wake goes through, without a queue: the
 /// waiter's own `Registration` takes its node out of the parking lot when it
@@ -318,10 +300,6 @@ pub fn set_current_rt(enable: bool) {
     driver::set_current_rt(enable);
 }
 
-// ---------------------------------------------------------------------------
-// Futex
-// ---------------------------------------------------------------------------
-
 /// Block on a futex word unless it already changed. Returns whether it parked.
 ///
 /// Registering before reading the word is the whole protocol: a `futex_wake`
@@ -344,10 +322,6 @@ pub fn futex_wait(phys_addr: DirectMap, expected: u32, deadline: u64) -> bool {
 pub fn futex_wake(phys_addr: DirectMap, count: usize) -> u64 {
     waitqs::wake_n(waitqs::futex(phys_addr), count) as u64
 }
-
-// ---------------------------------------------------------------------------
-// Retire
-// ---------------------------------------------------------------------------
 
 /// Retire a thread and wait until its record is gone.
 ///
@@ -400,10 +374,6 @@ pub fn retire_task(sched: &ThreadSched) {
         block_on(ticket, crate::hw::now_ns() + RECHECK_NS);
     }
 }
-
-// ---------------------------------------------------------------------------
-// Panic recovery
-// ---------------------------------------------------------------------------
 
 /// Per-CPU hand-off slot for a thread that died in panic recovery. The panic
 /// path may hold any lock, so it may do nothing but store here; the idle loop
@@ -463,10 +433,6 @@ pub fn schedule_no_return() -> ! {
     driver::pass(Dispose::Exit);
     unreachable!("schedule_no_return: returned from the exit pass");
 }
-
-// ---------------------------------------------------------------------------
-// Diagnostics
-// ---------------------------------------------------------------------------
 
 /// Cumulative CPU time for a thread, published by its owning CPU at each end of
 /// a pass (see `TaskHandle`). A running thread's live slice is added by the

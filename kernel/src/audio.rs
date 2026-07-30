@@ -10,9 +10,7 @@ static AUDIO: Lock<Option<SoundController>> = Lock::new(None);
 static AUDIO_INFO: Lock<Option<AudioInfo>> = Lock::new(None);
 static IO_URING_WATCHERS: Lock<Vec<RingId>> = Lock::new(Vec::new());
 
-// ---------------------------------------------------------------------------
 // Completion record ring — ISR producer, syscall consumer
-// ---------------------------------------------------------------------------
 
 const RECORD_RING_CAP: u32 = 16;
 
@@ -87,10 +85,6 @@ fn pop_completion() -> Option<AudioCompletionRecord> {
 pub fn has_pending() -> bool {
     RECORDS.head.load(Ordering::Acquire) != RECORDS.tail.load(Ordering::Acquire)
 }
-
-// ---------------------------------------------------------------------------
-// Controller access
-// ---------------------------------------------------------------------------
 
 pub fn register(controller: SoundController, info: AudioInfo) {
     *AUDIO.lock() = Some(controller);

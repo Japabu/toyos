@@ -47,9 +47,7 @@ fn child_sched_info() {
     println!("{} {} {}", info.vruntime, info.min_vruntime, info.lag);
 }
 
-// ---------------------------------------------------------------------------
 // Test 1: Listener isolation via io_uring POLL_IN
-// ---------------------------------------------------------------------------
 
 /// This tests the exact code path that froze the compositor.
 ///
@@ -107,10 +105,6 @@ fn test_listener_isolation_io_uring() {
     println!("  listener isolation (io_uring): ok");
 }
 
-// ---------------------------------------------------------------------------
-// Test 2: min_vruntime invariant
-// ---------------------------------------------------------------------------
-
 /// Verify the post-wake lag invariant: when a process transitions from
 /// non-runnable back to runnable, its lag is clamped to ±MAX_VRUNTIME_LAG_NS
 /// (50ms). Read immediately after the wake transition.
@@ -156,10 +150,6 @@ fn test_min_vruntime_invariant() {
 
     println!("  post-wake lag invariant: ok");
 }
-
-// ---------------------------------------------------------------------------
-// Test 3: Concurrent connect storm
-// ---------------------------------------------------------------------------
 
 fn test_connect_storm() {
     let num_clients = 8;

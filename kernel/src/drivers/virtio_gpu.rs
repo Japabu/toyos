@@ -59,8 +59,6 @@ fn dma() -> KernelSlice {
     DMA.lock().as_ref().unwrap().slice()
 }
 
-// ---- GPU command/response structs ----
-
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct CtrlHeader {
@@ -201,16 +199,12 @@ struct RespEdid {
     edid: [u8; 1024],
 }
 
-// ---- Framebuffer allocation tracking ----
-
 struct FbAlloc {
     tokens: [SharedToken; 2],
     phys_addrs: [u64; 2],
     ptrs: [*mut u8; 2],
     _pages: [alloc::vec::Vec<crate::mm::pmm::PhysPage>; 2],
 }
-
-// ---- GPU Controller ----
 
 unsafe impl Send for GpuController {}
 

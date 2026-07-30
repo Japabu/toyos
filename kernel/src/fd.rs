@@ -37,10 +37,6 @@ impl Clone for OpenFile {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Descriptor
-// ---------------------------------------------------------------------------
-
 pub enum Descriptor {
     File(OpenFile),
     PipeRead(PipeReader),
@@ -128,10 +124,6 @@ impl Descriptor {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// FdTable operations
-// ---------------------------------------------------------------------------
 
 const MAX_FDS: usize = 1024;
 
@@ -351,9 +343,7 @@ pub fn close_all(table: &mut FdTable, vfs: &mut Vfs, pid: Pid) {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Read / Write / Seek / Stat
-// ---------------------------------------------------------------------------
 
 pub fn try_read(table: &mut FdTable, fd: u32, buf: &mut [u8]) -> Option<u64> {
     let desc = table.get_mut(fd)?;
@@ -603,10 +593,6 @@ pub fn ftruncate(table: &mut FdTable, fd: u32, size: u64) -> u64 {
     0
 }
 
-// ---------------------------------------------------------------------------
-// Poll helpers
-// ---------------------------------------------------------------------------
-
 pub fn has_data(table: &FdTable, fd: u32) -> bool {
     match table.get(fd) {
         Some(desc) => match desc.pipe_id_read() {
@@ -636,10 +622,6 @@ pub fn has_space(table: &FdTable, fd: u32) -> bool {
         None => false,
     }
 }
-
-// ---------------------------------------------------------------------------
-// TTY marking
-// ---------------------------------------------------------------------------
 
 pub fn mark_tty(table: &mut FdTable, fd: u32) -> u64 {
     match table.get(fd) {

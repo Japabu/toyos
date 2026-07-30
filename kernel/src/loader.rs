@@ -17,10 +17,6 @@ use toyos_abi::syscall::SyscallError;
 
 const USER_STACK_SIZE: usize = 4 * PAGE_2M as usize; // 8 MB
 
-// ---------------------------------------------------------------------------
-// TLS constants
-// ---------------------------------------------------------------------------
-
 const TCB_SIZE: usize = 64;
 /// Initial DTV capacity (number of module entries).
 pub const DTV_INITIAL_CAPACITY: usize = 64;
@@ -28,10 +24,6 @@ pub const DTV_INITIAL_CAPACITY: usize = 64;
 const DTV_HEADER_SIZE: usize = 16;
 /// Sentinel value for unallocated DTV entries.
 const DTV_UNALLOCATED: u64 = !0u64;
-
-// ---------------------------------------------------------------------------
-// TLS setup
-// ---------------------------------------------------------------------------
 
 /// Allocate a TLS area using the x86-64 variant II layout:
 /// [TLS data (.tdata + .tbss)] [TCB: self-pointer]
@@ -134,10 +126,6 @@ pub fn setup_combined_tls(
     Some((page_alloc, tp_user))
 }
 
-// ---------------------------------------------------------------------------
-// Kernel stack allocation
-// ---------------------------------------------------------------------------
-
 /// Allocate a kernel stack and set up the initial register frame for context_switch.
 /// Returns (alloc, saved_rsp).
 pub(crate) fn alloc_kernel_stack(
@@ -210,10 +198,6 @@ pub(crate) extern "C" fn thread_start() {
         unlock = sym crate::sched::driver::trampoline_entry,
     );
 }
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
 
 fn make_name(path: &str) -> [u8; 28] {
     let filename = path.rsplit('/').next().unwrap_or(path);

@@ -10,10 +10,6 @@ use std::time::Duration;
 use common::qemu::{self, BootOptions, QemuInstance, TestResult};
 use common::{audio, compile, stats};
 
-// ---------------------------------------------------------------------------
-// Test definition
-// ---------------------------------------------------------------------------
-
 struct TestDef {
     name: String,
     qemu_name: String,
@@ -71,10 +67,6 @@ const C_SKIP: &[&str] = &[
     "136_atomic_gcc_style",   // needs stdatomic.h (calls process::exit, not catchable)
 ];
 
-// ---------------------------------------------------------------------------
-// Discovery
-// ---------------------------------------------------------------------------
-
 /// Discover C tests by scanning tests/testcases/tinycc/*.c.
 /// Skips companion files (contain '+') and tests in C_SKIP.
 fn discover_c_tests() -> Vec<String> {
@@ -116,10 +108,6 @@ fn discover_rust_tests(bins: &[(String, Vec<u8>)]) -> Vec<String> {
     names
 }
 
-// ---------------------------------------------------------------------------
-// Compilation
-// ---------------------------------------------------------------------------
-
 fn compile_c_tests(names: &[String]) -> Vec<(String, Vec<u8>)> {
     // Suppress panic messages during compilation — we handle failures via catch_unwind.
     let prev_hook = std::panic::take_hook();
@@ -149,10 +137,6 @@ fn compile_c_tests(names: &[String]) -> Vec<(String, Vec<u8>)> {
 
     bins
 }
-
-// ---------------------------------------------------------------------------
-// Check functions
-// ---------------------------------------------------------------------------
 
 fn check_c_result(result: &TestResult) -> bool {
     let test_name = result.name.strip_prefix("test_c_").unwrap_or(&result.name);
@@ -242,10 +226,6 @@ fn check_for(name: &str) -> fn(&TestResult) -> bool {
         _ => check_rust_result,
     }
 }
-
-// ---------------------------------------------------------------------------
-// Audio glitch tests
-// ---------------------------------------------------------------------------
 
 /// Minimum active (non-silent) playback the 3s test tone must produce.
 /// Guards against a vacuous pass when nothing plays at all.
@@ -599,9 +579,7 @@ fn run_audio_test(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
 // Thorough tier: `cargo test --test toyos-build -- --audio-gate N`
-// ---------------------------------------------------------------------------
 
 /// One config's fresh sample, accumulated over the N iterations.
 #[derive(Default)]
@@ -749,7 +727,6 @@ fn run_audio_gate(
         }
     }
 
-    // ---- verdict ----------------------------------------------------------
     let mut rejected: Vec<Verdict> = Vec::new();
     let (mut pooled_gap_k, mut pooled_gap_n) = (0, 0);
     let (mut pooled_ceil_k, mut pooled_ceil_n) = (0, 0);
@@ -868,10 +845,6 @@ fn report_config(key: &str, base: &BaselineSample, s: &GateSamples, iterations: 
     eprintln!("    toml: drains = {}", fmt(&s.drains));
 }
 
-// ---------------------------------------------------------------------------
-// Test registry
-// ---------------------------------------------------------------------------
-
 fn build_test_registry(
     rust_bins: &[(String, Vec<u8>)],
     c_names: &[String],
@@ -904,10 +877,6 @@ fn build_test_registry(
 
     tests
 }
-
-// ---------------------------------------------------------------------------
-// Debug mode
-// ---------------------------------------------------------------------------
 
 fn run_debug_mode(c_tests: &[(String, Vec<u8>)], rust_bins: &[(String, Vec<u8>)]) {
     let cmd_path = Path::new("/tmp/toyos-debug-cmd");
@@ -995,10 +964,6 @@ fn run_debug_mode(c_tests: &[(String, Vec<u8>)], rust_bins: &[(String, Vec<u8>)]
     let _ = fs::remove_file(ready_path);
     eprintln!("[debug] Shutting down QEMU...");
 }
-
-// ---------------------------------------------------------------------------
-// Main
-// ---------------------------------------------------------------------------
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();

@@ -94,10 +94,6 @@ pub const SYS_SET_RT_PRIORITY: u64 = 96;
 
 pub const WNOHANG: u64 = 1;
 
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
-
 /// Arguments for the `SYS_SPAWN` syscall, passed as a single pointer.
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -303,10 +299,6 @@ pub struct Stat {
     pub mtime: u64,
 }
 
-// ---------------------------------------------------------------------------
-// Raw syscall
-// ---------------------------------------------------------------------------
-
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 fn syscall(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
@@ -354,12 +346,6 @@ fn encode_timeout(timeout: Option<u64>) -> u64 {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Wrappers
-// ---------------------------------------------------------------------------
-
-// --- I/O ---
-
 /// Write bytes to a file descriptor. Returns number of bytes written.
 pub fn write(fd: Fd, buf: &[u8]) -> Result<usize, SyscallError> {
     check(syscall(SYS_WRITE, fd.0 as u64, buf.as_ptr() as u64, buf.len() as u64, 0)).map(|n| n as usize)
@@ -369,8 +355,6 @@ pub fn write(fd: Fd, buf: &[u8]) -> Result<usize, SyscallError> {
 pub fn read(fd: Fd, buf: &mut [u8]) -> Result<usize, SyscallError> {
     check(syscall(SYS_READ, fd.0 as u64, buf.as_mut_ptr() as u64, buf.len() as u64, 0)).map(|n| n as usize)
 }
-
-// --- Process ---
 
 /// Exit the current thread only. Does not return.
 /// Use `exit()` to exit the entire process (all threads).
@@ -428,8 +412,6 @@ pub fn mark_tty(fd: Fd) {
     syscall(SYS_MARK_TTY, fd.0 as u64, 0, 0, 0);
 }
 
-// --- Threads ---
-
 /// Spawn a new thread with the given entry point, stack pointer, argument, and stack base.
 /// `stack_base` is the bottom of the user stack (for stack info queries).
 ///
@@ -449,10 +431,6 @@ pub fn thread_join(tid: u64) -> u64 {
 pub fn set_thread_name(name: &[u8]) {
     syscall(SYS_SET_THREAD_NAME, name.as_ptr() as u64, name.len() as u64, 0, 0);
 }
-
-// --- IPC ---
-
-// --- Filesystem ---
 
 /// Open a file.
 pub fn open(path: &[u8], flags: OpenFlags) -> Result<Fd, SyscallError> {
@@ -508,14 +486,10 @@ pub fn getcwd(buf: &mut [u8]) -> usize {
     if SyscallError::from_u64(n).is_some() { 0 } else { n as usize }
 }
 
-// --- Random ---
-
 /// Fill `buf` with cryptographically secure random bytes.
 pub fn random(buf: &mut [u8]) {
     syscall(SYS_RANDOM, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0);
 }
-
-// --- Clock ---
 
 /// Nanoseconds since boot (monotonic clock).
 pub fn clock_nanos() -> u64 {
@@ -536,8 +510,6 @@ pub fn clock_realtime() -> RealTime {
 pub fn clock_epoch() -> u64 {
     syscall(SYS_CLOCK_EPOCH, 0, 0, 0, 0)
 }
-
-// --- Screen / GPU ---
 
 /// Transfer a region of the framebuffer to the GPU and flush it.
 /// Pass (0, 0, 0, 0) to flush the full screen.
@@ -579,8 +551,6 @@ pub fn shutdown() -> ! {
     loop {}
 }
 
-// --- Devices ---
-
 /// Device types for [`open_device`].
 #[repr(u64)]
 #[derive(Debug, Clone, Copy)]
@@ -597,7 +567,7 @@ pub fn open_device(device: DeviceType) -> Result<Fd, SyscallError> {
     check(syscall(SYS_OPEN_DEVICE, device as u64, 0, 0, 0)).map(|v| Fd(v as i32))
 }
 
-// --- Service IPC (listen / accept / connect) ---
+// Service IPC (listen / accept / connect)
 
 /// Register a named service and return a listener fd.
 /// Other processes can connect to this service by name.
@@ -630,8 +600,6 @@ pub fn connect(name: &str) -> Result<Fd, SyscallError> {
     check(syscall(SYS_CONNECT, name.as_ptr() as u64, name.len() as u64, 0, 0)).map(|v| Fd(v as i32))
 }
 
-// --- Shared memory ---
-
 /// Allocate a 2MB-aligned shared memory region. Returns an opaque token.
 pub fn alloc_shared(size: usize) -> u32 {
     let token = syscall(SYS_ALLOC_SHARED, size as u64, 0, 0, 0);
@@ -661,16 +629,12 @@ pub fn release_shared(token: u32) {
     assert_eq!(result, 0, "release_shared failed");
 }
 
-// --- System info ---
-
 /// Query system information (memory, CPUs, processes).
 /// Returns the number of bytes written to `buf`.
 pub fn sysinfo(buf: &mut [u8]) -> usize {
     let n = syscall(SYS_SYSINFO, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0);
     if SyscallError::from_u64(n).is_some() { 0 } else { n as usize }
 }
-
-// --- Process / OS ---
 
 /// Sleep for the given number of nanoseconds.
 pub fn nanosleep(nanos: u64) {
@@ -727,8 +691,6 @@ pub fn readlink(path: &[u8], buf: &mut [u8]) -> Result<usize, SyscallError> {
     check(syscall(SYS_READLINK, path.as_ptr() as u64, path.len() as u64, buf.as_mut_ptr() as u64, buf.len() as u64)).map(|n| n as usize)
 }
 
-// --- Dynamic linking ---
-
 /// Load a shared library (.so) into the current process.
 /// Runs .init_array constructors after loading.
 pub fn dl_open(path: &[u8]) -> Result<u64, SyscallError> {
@@ -762,8 +724,6 @@ pub fn dl_close(handle: u64) -> u64 {
     syscall(SYS_DLCLOSE, handle, 0, 0, 0)
 }
 
-// --- Futex ---
-
 /// Block if `*addr == expected`. Returns 0 on wake, 1 on timeout.
 /// `None` = wait forever, `Some(nanos)` = timeout.
 ///
@@ -781,14 +741,10 @@ pub unsafe fn futex_wake(addr: *const u32, count: u32) -> u64 {
     syscall(SYS_FUTEX_WAKE, addr as u64, count as u64, 0, 0)
 }
 
-// --- File truncate ---
-
 /// Truncate file descriptor to `size` bytes.
 pub fn ftruncate(fd: Fd, size: u64) -> Result<(), SyscallError> {
     check_unit(syscall(SYS_FTRUNCATE, fd.0 as u64, size, 0, 0))
 }
-
-// --- Stack info ---
 
 /// Get the current thread's stack base address and size.
 pub fn stack_info() -> Option<(u64, u64)> {
@@ -798,14 +754,10 @@ pub fn stack_info() -> Option<(u64, u64)> {
     if SyscallError::from_u64(r).is_some() { None } else { Some((base, size)) }
 }
 
-// --- CPU count ---
-
 /// Return the number of available CPUs.
 pub fn cpu_count() -> u32 {
     syscall(SYS_CPU_COUNT, 0, 0, 0, 0) as u32
 }
-
-// --- Memory mapping ---
 
 /// Map anonymous memory. Returns pointer on success, null on failure.
 ///
@@ -830,14 +782,10 @@ pub unsafe fn munmap(addr: *mut u8, size: usize) -> Result<(), SyscallError> {
     check_unit(syscall(SYS_MUNMAP, addr as u64, size as u64, 0, 0))
 }
 
-// --- Kill ---
-
 /// Terminate a child process.
 pub fn kill(pid: Pid) -> Result<(), SyscallError> {
     check_unit(syscall(SYS_KILL, pid.0 as u64, 0, 0, 0))
 }
-
-// --- Non-blocking I/O ---
 
 /// Non-blocking read. Returns bytes read, or `Err(WouldBlock)` if no data available.
 pub fn read_nonblock(fd: Fd, buf: &mut [u8]) -> Result<usize, SyscallError> {
@@ -848,8 +796,6 @@ pub fn read_nonblock(fd: Fd, buf: &mut [u8]) -> Result<usize, SyscallError> {
 pub fn write_nonblock(fd: Fd, buf: &[u8]) -> Result<usize, SyscallError> {
     check(syscall(SYS_WRITE_NONBLOCK, fd.0 as u64, buf.as_ptr() as u64, buf.len() as u64, 0)).map(|n| n as usize)
 }
-
-// --- Pipe operations ---
 
 /// Open an existing pipe by internal ID. `mode`: 0 = read, 1 = write.
 /// Returns a new file descriptor for the pipe.
@@ -874,8 +820,6 @@ pub fn socket_create(rx_pipe_id: u64, tx_pipe_id: u64) -> Result<Fd, SyscallErro
 pub fn pipe_map(fd: Fd) -> Result<*mut u8, SyscallError> {
     check(syscall(SYS_PIPE_MAP, fd.0 as u64, 0, 0, 0)).map(|v| v as *mut u8)
 }
-
-// --- NIC DMA control ---
 
 /// Poll for a received frame. Returns `(buf_index << 16) | frame_len`, or 0 if none.
 ///
@@ -902,8 +846,6 @@ pub fn nic_tx(total_len: u64) -> Result<(), SyscallError> {
     check_unit(syscall(SYS_NIC_TX, total_len, 0, 0, 0))
 }
 
-// --- Audio ---
-
 /// Submit a filled DMA buffer to the audio device.
 /// `buf_idx`: index of the DMA buffer (0..num_buffers).
 /// `len`: number of bytes of PCM data written to the buffer.
@@ -920,8 +862,6 @@ pub fn audio_submit(buf_idx: u32, len: u32) -> Result<(), SyscallError> {
 pub fn tls_alloc_block(module_id: u64) -> u64 {
     syscall(SYS_TLS_ALLOC_BLOCK, module_id, 0, 0, 0)
 }
-
-// --- io_uring ---
 
 /// Create an io_uring instance with the given queue depth (must be power of 2, max 256).
 /// Returns (ring_fd, shared_memory_token). The shared memory contains the SQ/CQ rings
@@ -943,7 +883,7 @@ pub fn io_uring_enter(fd: Fd, to_submit: u32, min_complete: u32, timeout_nanos: 
         .map(|n| n as u32)
 }
 
-// --- Module info (for stack unwinding / backtraces) ---
+// Module info (for stack unwinding / backtraces)
 
 /// Information about a loaded module (executable or shared library).
 ///
@@ -976,8 +916,6 @@ pub struct ModuleInfo {
 pub fn query_modules(buf: &mut [u8]) -> Result<usize, SyscallError> {
     check(syscall(SYS_QUERY_MODULES, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0)).map(|n| n as usize)
 }
-
-// --- Scheduler introspection ---
 
 /// Scheduler info for the calling process.
 #[repr(C)]

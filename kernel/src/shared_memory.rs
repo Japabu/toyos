@@ -8,9 +8,7 @@ use crate::process::{PageTables, Pid};
 use crate::sync::Lock;
 use crate::{DirectMap, UserAddr};
 
-// ---------------------------------------------------------------------------
 // SharedToken — opaque handle for a shared memory region
-// ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct SharedToken(u32);
@@ -19,10 +17,6 @@ impl SharedToken {
     pub fn raw(self) -> u32 { self.0 }
     pub fn from_raw(v: u32) -> Self { Self(v) }
 }
-
-// ---------------------------------------------------------------------------
-// Error
-// ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, Debug)]
 pub enum Error {
@@ -33,9 +27,7 @@ pub enum Error {
     OutOfMemory,
 }
 
-// ---------------------------------------------------------------------------
 // Ownership — who manages the backing memory lifetime
-// ---------------------------------------------------------------------------
 
 enum Ownership {
     /// Kernel-owned (GPU framebuffers, DMA buffers).
@@ -45,9 +37,7 @@ enum Ownership {
     Process { pid: Pid, _pages: Vec<pmm::PhysPage> },
 }
 
-// ---------------------------------------------------------------------------
 // SharedRegion — a single shared memory region
-// ---------------------------------------------------------------------------
 
 struct SharedRegion {
     phys: DirectMap,
@@ -86,10 +76,6 @@ impl SharedRegion {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Global registry
-// ---------------------------------------------------------------------------
-
 // Lock ordering: REGIONS lock → PageTables lock.
 // All public functions that call map_into/unmap_from do so while holding
 // the REGIONS lock (inside with_regions_mut), then acquire PageTables inside.
@@ -108,10 +94,6 @@ pub fn init() {
 fn next_token() -> SharedToken {
     SharedToken(NEXT_TOKEN.fetch_add(1, Ordering::Relaxed))
 }
-
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
 
 /// Allocate 2MB-aligned shared memory. Maps it into the owner's page tables.
 /// Returns a token; other processes can map it via `map()` after `grant()`.

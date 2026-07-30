@@ -265,8 +265,6 @@ pub fn exists(file_id: FileId) -> bool {
     FILE_CACHE.lock().files.contains_key(&file_id)
 }
 
-// --- Internal helpers ---
-
 fn valid_bytes_in_page(page_idx: u32, file_size: u64) -> usize {
     let page_start = page_idx as u64 * PAGE_SIZE as u64;
     if page_start >= file_size {

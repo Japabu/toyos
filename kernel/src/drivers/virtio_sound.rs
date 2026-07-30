@@ -57,7 +57,7 @@ const RESP_OFFSET: usize = 0x800;
 
 const PERIOD_BYTES: usize = 512;
 
-// ---- VirtIO sound structs (per VirtIO 1.2 spec, section 5.14) ----
+// VirtIO sound structs (per VirtIO 1.2 spec, section 5.14)
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -128,8 +128,6 @@ struct VirtioSndEvent {
     data: u32,
 }
 
-// ---- ISR-side txq used-ring consumer ----
-
 const TXQ_SIZE: usize = 32;
 
 /// State the MSI-X ISR needs to drain txq completions without locks: the
@@ -176,8 +174,6 @@ pub fn isr_drain_tx() -> u32 {
     }
     mask
 }
-
-// ---- Sound Controller ----
 
 pub(crate) const TX_INFLIGHT_MAX: usize = 8;
 

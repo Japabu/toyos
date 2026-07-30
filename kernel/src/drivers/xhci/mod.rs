@@ -13,9 +13,7 @@ use crate::sync::Lock;
 
 use hid::HidDevice;
 
-// ---------------------------------------------------------------------------
 // xHCI Capability Register offsets (from BAR0)
-// ---------------------------------------------------------------------------
 const CAP_CAPLENGTH:  u64 = 0x00; // u8
 const CAP_HCSPARAMS1: u64 = 0x04; // u32
 const CAP_HCSPARAMS2: u64 = 0x08; // u32
@@ -23,9 +21,7 @@ const CAP_HCCPARAMS1: u64 = 0x10; // u32
 const CAP_DBOFF:      u64 = 0x14; // u32
 const CAP_RTSOFF:     u64 = 0x18; // u32
 
-// ---------------------------------------------------------------------------
 // xHCI Operational Register offsets (from op_base = BAR0 + cap_length)
-// ---------------------------------------------------------------------------
 const OP_USBCMD:   u64 = 0x00;
 const OP_USBSTS:   u64 = 0x04;
 const OP_CRCR:     u64 = 0x18; // 64-bit
@@ -44,10 +40,8 @@ const PORTSC_PRC: u32 = 1 << 21;
 const PORTSC_RW1C: u32 = PORTSC_CSC | (1 << 18) | (1 << 19) | (1 << 20)
     | PORTSC_PRC | (1 << 22) | (1 << 23);
 
-// ---------------------------------------------------------------------------
 // Runtime Register offsets (from rt_base = BAR0 + rts_offset)
 // Interrupter 0 starts at offset 0x20
-// ---------------------------------------------------------------------------
 const IR0_IMAN:   u64 = 0x20; // Interrupt Management (IP + IE)
 const IR0_IMOD:   u64 = 0x24; // Interrupt Moderation
 const IR0_ERSTSZ: u64 = 0x28;
@@ -59,9 +53,7 @@ const PCI_CAP_MSIX: u8 = 0x11;
 // xHCI interrupt vector
 const XHCI_VECTOR: u8 = 0x21;
 
-// ---------------------------------------------------------------------------
 // TRB (Transfer Request Block) — 16 bytes
-// ---------------------------------------------------------------------------
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Trb {
@@ -95,9 +87,6 @@ const TRB_CONFIGURE_EP:   u32 = trb_type(12);
 const EVENT_TRANSFER:     u32 = 32;
 const EVENT_CMD_COMPLETE: u32 = 33;
 
-// ---------------------------------------------------------------------------
-// Ring sizes
-// ---------------------------------------------------------------------------
 const RING_SIZE: usize = 256; // TRBs per ring (one page = 256 * 16)
 
 /// Event Ring Segment Table entry (16 bytes).
@@ -108,9 +97,7 @@ struct ErstEntry {
     _reserved: u32,
 }
 
-// ---------------------------------------------------------------------------
 // TRB Ring — shared enqueue logic for command, EP0, and interrupt rings
-// ---------------------------------------------------------------------------
 struct TrbRing {
     base: *mut Trb,
     base_phys: u64,
@@ -144,9 +131,6 @@ impl TrbRing {
     }
 }
 
-// ---------------------------------------------------------------------------
-// DMA memory pool
-// ---------------------------------------------------------------------------
 // DMA layout (byte offsets)
 const OFF_DCBAA: usize       = 0x0000;
 const OFF_CMD_RING: usize    = 0x1000;
@@ -169,9 +153,6 @@ fn dma() -> KernelSlice {
     XHCI_DMA_POOL.lock().as_ref().unwrap().slice()
 }
 
-// ---------------------------------------------------------------------------
-// USB setup packet helper
-// ---------------------------------------------------------------------------
 fn setup_packet(bm_request_type: u8, b_request: u8, w_value: u16, w_index: u16, w_length: u16) -> u64 {
     (bm_request_type as u64)
         | ((b_request as u64) << 8)
@@ -180,9 +161,6 @@ fn setup_packet(bm_request_type: u8, b_request: u8, w_value: u16, w_index: u16, 
         | ((w_length as u64) << 48)
 }
 
-// ---------------------------------------------------------------------------
-// XhciController
-// ---------------------------------------------------------------------------
 // SAFETY: XhciController contains raw pointers to DMA memory that is valid
 // for the lifetime of the controller. Access is serialized by the Lock.
 unsafe impl Send for XhciController {}
@@ -212,9 +190,6 @@ pub struct XhciController {
 }
 
 impl XhciController {
-    // -------------------------------------------------------------------
-    // Command ring: submit + wait
-    // -------------------------------------------------------------------
     fn submit_command(&mut self, trb: Trb) {
         self.cmd_ring.enqueue(trb);
         fence(Ordering::Release);
@@ -242,9 +217,6 @@ impl XhciController {
         }
     }
 
-    // -------------------------------------------------------------------
-    // Event ring dequeue pointer management
-    // -------------------------------------------------------------------
     fn advance_event_ring(&mut self) {
         self.event_head = (self.event_head + 1) % RING_SIZE as u16;
         if self.event_head == 0 {
@@ -255,9 +227,7 @@ impl XhciController {
         self.rt_base.write_u32(IR0_IMAN, 3); // clear IP (W1C) + keep IE
     }
 
-    // -------------------------------------------------------------------
     // EP0 transfer ring: enqueue TRBs + ring doorbell
-    // -------------------------------------------------------------------
     fn enqueue_ep0(&mut self, trb: Trb) {
         self.ep0_ring.enqueue(trb);
     }
@@ -286,9 +256,7 @@ impl XhciController {
         }
     }
 
-    // -------------------------------------------------------------------
     // Control transfer (Setup → [Data] → Status)
-    // -------------------------------------------------------------------
     fn control_transfer(
         &mut self,
         bm_request_type: u8,
@@ -326,9 +294,7 @@ impl XhciController {
         self.wait_transfer()
     }
 
-    // -------------------------------------------------------------------
     // Reset EP0 ring for reuse between devices
-    // -------------------------------------------------------------------
     fn reset_ep0_ring(&mut self) {
         let dma = dma();
         let ring = dma.subslice(OFF_EP0_RING, 0x1000);
@@ -340,9 +306,7 @@ impl XhciController {
         self.ep0_ring = TrbRing::new(ring);
     }
 
-    // -------------------------------------------------------------------
     // Poll: check event ring for completed interrupt transfers
-    // -------------------------------------------------------------------
     pub fn poll(&mut self) {
         loop {
             let event = unsafe { read_volatile(self.event_ring.add(self.event_head as usize)) };
@@ -365,18 +329,12 @@ impl XhciController {
         }
     }
 
-    // -------------------------------------------------------------------
     // Write a context field into a context structure
-    // -------------------------------------------------------------------
     fn write_ctx32(&self, ctx_base: *mut u8, slot_index: usize, dword: usize, val: u32) {
         let offset = (slot_index * self.context_size) + (dword * 4);
         unsafe { write_volatile(ctx_base.add(offset) as *mut u32, val); }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Global singleton (for sys_read polling)
-// ---------------------------------------------------------------------------
 
 static XHCI: Lock<Option<XhciController>> = Lock::new(None);
 
@@ -396,10 +354,6 @@ pub fn poll_if_pending() {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// MSI-X configuration
-// ---------------------------------------------------------------------------
 
 fn setup_msix(pci_dev: &PciDevice) {
     let cap = pci_dev.capabilities().find(|c| c.id() == PCI_CAP_MSIX);
@@ -432,10 +386,6 @@ fn setup_msix(pci_dev: &PciDevice) {
 
     log!("xHCI: MSI-X enabled (vector {:#x})", XHCI_VECTOR);
 }
-
-// ---------------------------------------------------------------------------
-// Main initialization
-// ---------------------------------------------------------------------------
 
 pub fn init(ecam: &crate::mm::Mmio) -> Option<XhciController> {
     let pci_dev = PciDevice::find(ecam, 0x0C, 0x03, Some(0x30))?;

@@ -35,9 +35,7 @@ pub fn init() {
     outb(PORT + 4, 0x0F); // Normal operation mode
 }
 
-// ---------------------------------------------------------------------------
 // Backend access — slow path, used by drain / input / panic.
-// ---------------------------------------------------------------------------
 
 static BACKEND_LOCKED: AtomicBool = AtomicBool::new(false);
 
@@ -195,9 +193,7 @@ pub unsafe fn panic_flush() {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Formatter — fast path, used by every log!() invocation.
-// ---------------------------------------------------------------------------
 
 const SW_BUF_SIZE: usize = 1024;
 

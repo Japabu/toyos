@@ -14,9 +14,7 @@ use crate::sched::payload::KWaitQueue;
 use crate::sched::waitqs::new_queue;
 use crate::sync::Lock;
 
-// ---------------------------------------------------------------------------
 // ListenerId — monotonic, never reused (same pattern as PipeId)
-// ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct ListenerId(usize);
@@ -35,10 +33,6 @@ impl IdKey for ListenerId {
     const ONE: Self = ListenerId(1);
 }
 
-// ---------------------------------------------------------------------------
-// PendingConnection
-// ---------------------------------------------------------------------------
-
 /// A pending connection waiting for accept. Holds owned pipe references
 /// that keep the pipes alive even if the client disconnects before accept.
 pub struct PendingConnection {
@@ -46,10 +40,6 @@ pub struct PendingConnection {
     pub tx: PipeWriter,
     pub client_pid: Pid,
 }
-
-// ---------------------------------------------------------------------------
-// Listener + registry
-// ---------------------------------------------------------------------------
 
 struct Listener {
     /// The process that registered the name. A client's `connect` learns the
@@ -148,10 +138,6 @@ pub fn remove(name: &str) {
         reg.by_id.remove(id);
     }
 }
-
-// ---------------------------------------------------------------------------
-// Per-listener io_uring watchers
-// ---------------------------------------------------------------------------
 
 pub fn add_io_uring_watcher(id: ListenerId, ring_id: RingId) {
     let mut guard = LISTENERS.lock();

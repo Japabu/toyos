@@ -98,10 +98,6 @@ fn indices(addr: u64) -> (usize, usize, usize) {
     )
 }
 
-// ---------------------------------------------------------------------------
-// PCID and TLB management
-// ---------------------------------------------------------------------------
-
 use core::sync::atomic::AtomicBool;
 
 const CR3_NOFLUSH: u64 = 1 << 63;
@@ -187,10 +183,6 @@ impl Cr3 {
     }
 }
 
-// ---------------------------------------------------------------------------
-// PCID allocator
-// ---------------------------------------------------------------------------
-
 /// Next PCID to allocate. Range 1..4095. PCID 0 is reserved for the kernel.
 /// Lock ensures flush + shootdown completes atomically with PCID recycling.
 static NEXT_PCID: Lock<u16> = Lock::new(1);
@@ -211,10 +203,6 @@ fn alloc_pcid() -> u16 {
         1
     }
 }
-
-// ---------------------------------------------------------------------------
-// AddressSpace
-// ---------------------------------------------------------------------------
 
 /// Unified address space: hardware page tables + virtual memory region tracking.
 ///
@@ -414,10 +402,6 @@ impl AddressSpace {
         Some(super::DirectMap::from_phys(page_phys + offset))
     }
 
-    // -----------------------------------------------------------------------
-    // Virtual memory region management
-    // -----------------------------------------------------------------------
-
     /// Find a free gap of at least `size` bytes (2MB-aligned), searching top-down.
     fn find_gap(&self, size: u64) -> Option<UserAddr> {
         let aligned = align_up_2m(size);
@@ -538,10 +522,6 @@ impl AddressSpace {
         self.regions.clear();
     }
 
-    // -----------------------------------------------------------------------
-    // Direct map / MMIO
-    // -----------------------------------------------------------------------
-
     /// Map a physical region into the direct map using 2MB pages.
     /// Returns an Mmio handle for bounds-checked register access.
     pub fn map_mmio(&mut self, phys: u64, size: u64) -> super::Mmio {
@@ -620,10 +600,6 @@ impl AddressSpace {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Kernel address space
-// ---------------------------------------------------------------------------
-
 const MIN_PHYS_MAP: u64 = 4 * 1024 * 1024 * 1024;
 
 static KERNEL: Lock<Option<AddressSpace>> = Lock::new(None);
@@ -673,10 +649,6 @@ pub(super) fn init(memory_map: &[MemoryMapEntry]) {
         cr3.load_flush();
     }
 }
-
-// ---------------------------------------------------------------------------
-// Debug
-// ---------------------------------------------------------------------------
 
 fn has(entry: u64, flag: u64) -> u8 {
     if entry & flag != 0 {

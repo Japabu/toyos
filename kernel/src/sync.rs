@@ -101,9 +101,7 @@ impl<T> Lock<T> {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Lock<Option<T>> projection — lock and unwrap in one step
-// ---------------------------------------------------------------------------
 
 impl<T> Lock<Option<T>> {
     /// Lock and project through the Option, returning a guard that derefs to T.

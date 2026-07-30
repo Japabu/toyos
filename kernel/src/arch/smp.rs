@@ -41,8 +41,6 @@ pub fn set_ready() {
     SMP_READY.store(true, Ordering::Release);
 }
 
-// ---- Trampoline data block layout ----
-//
 // Shared between BSP (Rust) and AP (assembly trampoline at 0x8000).
 // Field offsets are hardcoded in the global_asm! below — the static
 // assertion at the bottom guarantees the struct matches.
@@ -91,7 +89,7 @@ struct TrampolineData {
 
 const _: () = assert!(size_of::<TrampolineData>() == 0x80);
 
-// ---- Trampoline blob (linked into .text, copied to 0x8000 at runtime) ----
+// Trampoline blob (linked into .text, copied to 0x8000 at runtime)
 
 // These are assembly labels — we must use inline asm to get their addresses
 // directly, bypassing GOT/PLT stubs that the PIE linker generates for
@@ -182,8 +180,6 @@ fn build_trampoline_data() -> TrampolineData {
     }
 }
 
-// ---- AP boot ----
-
 /// Boot all Application Processors found in the MADT.
 /// `boot_cr3` is the physical address of the bootloader's PML4 (has both
 /// identity map and high-half). APs use this during their transition to
@@ -273,8 +269,6 @@ fn delay_ms(ms: u64) {
     while clock::nanos_since_boot() - start < ms * 1_000_000 {}
 }
 
-// ---- AP trampoline assembly ----
-//
 // Real mode → protected mode → long mode → Rust entry.
 // Assembled as a blob in .text, copied to 0x8000 at runtime.
 // All memory addresses reference TrampolineData at 0x8F00.
@@ -287,7 +281,6 @@ global_asm!(
     ".global _ap_cs_reload",
     "_trampoline_start:",
 
-    // ==================== 16-bit real mode ====================
     ".code16",
     "cli",
     "xor ax, ax",
@@ -307,7 +300,6 @@ global_asm!(
     ".byte 0x66, 0xFF, 0x2E",  // data32 jmp far [disp16]
     ".word 0x8F60",
 
-    // ==================== 32-bit protected mode ====================
     ".code32",
     "_ap_pm32:",
     "mov ax, 0x10",
@@ -339,7 +331,6 @@ global_asm!(
     ".byte 0xFF, 0x2D",  // jmp far [disp32]
     ".long 0x8F68",
 
-    // ==================== 64-bit long mode ====================
     ".code64",
     "_ap_lm64:",
 

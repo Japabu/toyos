@@ -272,10 +272,6 @@ pub fn check_gap_regression(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// soundd's own counters
-// ---------------------------------------------------------------------------
-
 /// The DMA pipeline depth: `TX_INFLIGHT_MAX` = 8 buffers of one device period.
 /// This is soundd's entire timing budget — wake later than this and every
 /// buffer has already drained, so the device has run out of audio to play.

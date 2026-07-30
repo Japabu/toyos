@@ -16,10 +16,8 @@ use crate::id_map::{IdKey, IdMap};
 use crate::sync::Lock;
 use crate::DirectMap;
 
-// ---------------------------------------------------------------------------
 // PipeId — raw identifier, Copy, used internally for lookups and in
 // ProcessState. Does NOT carry a refcount. Not public outside the kernel.
-// ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct PipeId(usize);
@@ -39,10 +37,8 @@ impl IdKey for PipeId {
     const ONE: Self = PipeId(1);
 }
 
-// ---------------------------------------------------------------------------
 // PipeReader / PipeWriter — owned refcounted references.
 // Creation bumps, Drop decrements. Clone bumps. No other way to get one.
-// ---------------------------------------------------------------------------
 
 /// Owned reader reference to a pipe. Bumps reader refcount on creation/clone,
 /// decrements on drop. Like Arc but for pipe reader slots.
@@ -85,10 +81,8 @@ impl Drop for PipeWriter {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Pipe internals — owns physical memory, tracks refcounts only.
 // Mapping into user address spaces is managed by the FD layer.
-// ---------------------------------------------------------------------------
 
 pub const PIPE_SIZE: usize = PAGE_2M as usize;
 
@@ -153,10 +147,6 @@ fn with_pipes_mut<R>(f: impl FnOnce(&mut IdMap<PipeId, Pipe>) -> R) -> R {
 pub fn init() {
     *PIPES.lock() = Some(IdMap::new());
 }
-
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
 
 /// Create a new pipe. Returns owned reader + writer references.
 pub fn create(creator: Pid) -> (PipeReader, PipeWriter) {
@@ -261,9 +251,7 @@ pub fn set_rt_boost_pending(pipe_id: PipeId) {
     });
 }
 
-// ---------------------------------------------------------------------------
 // Internal refcount management (called by PipeReader/PipeWriter)
-// ---------------------------------------------------------------------------
 
 fn add_reader(pipe_id: PipeId) {
     with_pipes_mut(|pipes| {
@@ -342,10 +330,6 @@ fn close_write(pipe_id: PipeId) {
 fn free_pipe(pipe: Pipe) {
     drop(pipe); // PhysPage freed via Drop
 }
-
-// ---------------------------------------------------------------------------
-// io_uring watcher management
-// ---------------------------------------------------------------------------
 
 pub fn add_io_uring_watcher(pipe_id: PipeId, ring_id: RingId) {
     with_pipes_mut(|pipes| {

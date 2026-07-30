@@ -46,10 +46,6 @@ use super::payload::{
 };
 use super::MAX_CPUS;
 
-// ---------------------------------------------------------------------------
-// Preemption proof
-// ---------------------------------------------------------------------------
-
 /// Proof that preemption is disabled for as long as the borrow lasts (spec
 /// §7.2's N3). Constructible only by the two functions below, both of which
 /// bracket it with the preempt count.
@@ -69,10 +65,6 @@ pub fn preempt_off<R>(f: impl FnOnce(&PreemptOff) -> R) -> R {
     crate::preempt::enable();
     result
 }
-
-// ---------------------------------------------------------------------------
-// The globally shared, Sync half
-// ---------------------------------------------------------------------------
 
 static CPUS: AtomicPtr<CpuHandles<KMsg>> = AtomicPtr::new(ptr::null_mut());
 static FRONTIER: Frontier = Frontier::new();
@@ -106,10 +98,6 @@ pub fn total_cpu_ns() -> u64 {
         .map(|i| CPU_TIME_NS[i].0.load(Ordering::Relaxed))
         .sum()
 }
-
-// ---------------------------------------------------------------------------
-// The percpu CpuSched slot
-// ---------------------------------------------------------------------------
 
 struct SchedSlot(UnsafeCell<Option<CpuSched<KernelPayload>>>);
 
@@ -156,10 +144,6 @@ fn try_with_cpu<R>(f: impl FnOnce(&CpuSched<KernelPayload>) -> R) -> Option<R> {
     Some(f(sched))
 }
 
-// ---------------------------------------------------------------------------
-// Boot
-// ---------------------------------------------------------------------------
-
 /// Build every CPU's mailbox and handle, and the BSP's `CpuSched`. Called once,
 /// before any task exists.
 pub fn init() {
@@ -192,10 +176,6 @@ fn idle_ctx() -> KernelCtx {
         id: None,
     }
 }
-
-// ---------------------------------------------------------------------------
-// Spawn
-// ---------------------------------------------------------------------------
 
 /// Least-loaded CPU by published ready count (spec §9.4), scanning from a
 /// rotating start so that ties spread instead of piling on one CPU.
@@ -284,10 +264,6 @@ pub fn spawn(new: NewTask) -> ThreadSched {
     });
     sched
 }
-
-// ---------------------------------------------------------------------------
-// Passes
-// ---------------------------------------------------------------------------
 
 pub enum Dispose {
     /// An IRQ-exit poll: the pass decides for itself whether the running task
@@ -521,10 +497,6 @@ fn execute(action: Action<KernelPayload>) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Device IRQ records → wakes
-// ---------------------------------------------------------------------------
-
 /// Consume this CPU's `irq_ring` records (spec §11 stage 2) and turn them into
 /// wakes. Runs at the top of every pass, before the mailbox drain, so a wake
 /// posted here is in the run queue by the time the pass picks.
@@ -540,10 +512,6 @@ fn drain_irqs() {
         crate::audio::wake_waiters();
     }
 }
-
-// ---------------------------------------------------------------------------
-// Idle
-// ---------------------------------------------------------------------------
 
 static IDLE_HEALTH_COUNTER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
@@ -589,10 +557,6 @@ fn drain_serial() {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Current-task accessors
-// ---------------------------------------------------------------------------
 
 /// The running task's rendezvous word, cloned so the caller can hold it across
 /// its own block without borrowing the `CpuSched`.
@@ -651,10 +615,6 @@ pub fn for_each_parked(
         }
     });
 }
-
-// ---------------------------------------------------------------------------
-// The trampoline and the switch
-// ---------------------------------------------------------------------------
 
 /// Tail of the first switch into a fresh task, called by
 /// `process_start`/`thread_start` before the first `iretq`.

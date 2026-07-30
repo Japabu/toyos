@@ -113,9 +113,7 @@ struct IdtPointer {
     base: u64,
 }
 
-// ============================================================
 // Unified trap frame — contiguous struct for all exception state
-// ============================================================
 
 /// Complete CPU state at exception entry. Pushed by stub + common_entry + CPU.
 /// Layout (lowest address = first field):
@@ -150,9 +148,7 @@ pub struct TrapFrame {
     pub ss: u64,
 }
 
-// ============================================================
 // Exception entry stubs — tiny per-vector, jump to common_entry
-// ============================================================
 
 /// #DB — no CPU error code. Push dummy error code + vector, jump to common.
 #[unsafe(naked)]
@@ -280,10 +276,6 @@ extern "sysv64" fn trap_dispatch(frame: *mut TrapFrame) {
         v => panic!("unhandled exception vector {:#x}", v),
     }
 }
-
-// ============================================================
-// PIC disable + IDT init
-// ============================================================
 
 /// Disable the legacy 8259 PIC.
 fn disable_pic() {

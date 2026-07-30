@@ -11,9 +11,7 @@ pub struct Region {
     pub end: u64,
 }
 
-// ---------------------------------------------------------------------------
 // Allocation categories — every PMM allocation is tagged
-// ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -141,8 +139,6 @@ impl Drop for PhysPage {
         free_page(self.phys);
     }
 }
-
-// --- Bitmap allocator ---
 
 /// Maximum physical memory: 64 GB → 32768 2MB pages → 4096 bytes bitmap.
 const MAX_PAGES: usize = 32768;

@@ -19,10 +19,6 @@ const MIN_CLIENT_RATE: u32 = 8_000;
 const MAX_CLIENT_RATE: u32 = 192_000;
 const STATS_INTERVAL_NANOS: u64 = 2_000_000_000;
 
-// ---------------------------------------------------------------------------
-// Per-client state
-// ---------------------------------------------------------------------------
-
 struct ClientResampler {
     resampler: SincFixedOut<f32>,
     /// Planar (per-channel) client audio awaiting resampling. SincFixedOut
@@ -147,9 +143,7 @@ impl ClientStream {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Lock-free SPSC command queue (control thread → mix thread)
-// ---------------------------------------------------------------------------
 
 /// Control connections soundd will hold at once.
 ///
@@ -223,10 +217,6 @@ impl CommandRing {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Mixing helpers
-// ---------------------------------------------------------------------------
-
 fn decode_i16_to_f32(src: &[u8], dst: &mut [f32]) {
     for i in 0..dst.len() {
         let sample = i16::from_le_bytes([src[i * 2], src[i * 2 + 1]]);
@@ -299,10 +289,6 @@ fn accumulate(mix: &mut [f32], src: &[f32], channels: usize, gain: &mut GainRamp
     }
 }
 
-// ---------------------------------------------------------------------------
-// TPDF dither
-// ---------------------------------------------------------------------------
-
 struct Xorshift32(u32);
 
 impl Xorshift32 {
@@ -325,10 +311,6 @@ fn dither_and_quantize(sample: f32, rng: &mut Xorshift32) -> i16 {
     let dither = rng.next() + rng.next(); // triangular PDF in [-1.0, 1.0]
     (sample * 32767.0 + dither).round().clamp(-32768.0, 32767.0) as i16
 }
-
-// ---------------------------------------------------------------------------
-// Mix-thread accounting
-// ---------------------------------------------------------------------------
 
 /// Counters for one reporting window. A window covers streaming only: it is
 /// zeroed when the first client arrives and flushed when the last one leaves,
@@ -379,10 +361,6 @@ impl MixStats {
     }
 }
 
-// ---------------------------------------------------------------------------
-// DLL timer
-// ---------------------------------------------------------------------------
-
 struct Dll {
     t_estimated: Option<f64>,
     period: f64,
@@ -423,10 +401,6 @@ impl Dll {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Stream setup
-// ---------------------------------------------------------------------------
 
 fn open_stream(
     client_id: usize,
@@ -523,10 +497,6 @@ fn open_stream(
         pending_removal: false,
     }
 }
-
-// ---------------------------------------------------------------------------
-// Mix thread
-// ---------------------------------------------------------------------------
 
 /// Mix one period of `stream` into the bus. Returns false when the client's
 /// ring could not supply a full period (silence mixed instead).
@@ -1026,10 +996,6 @@ fn mix_thread(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Control thread
-// ---------------------------------------------------------------------------
-
 /// Reassembles one framed control message across nonblocking reads. The
 /// control thread must never block on a client: a client parking a partial
 /// header would otherwise wedge accept and volume/close/disconnect handling
@@ -1298,10 +1264,6 @@ fn control_thread(
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Main
-// ---------------------------------------------------------------------------
 
 fn main() {
     let listener = services::listen("soundd").expect("soundd already running");

@@ -35,9 +35,7 @@ pub fn vma_map(
     pt.lock().alloc_and_map(phys, size, true)
 }
 
-// ---------------------------------------------------------------------------
 // OwnedAlloc — RAII heap allocation (for kernel-only buffers < 2MB)
-// ---------------------------------------------------------------------------
 
 /// Move-only wrapper around a heap allocation. Drop calls dealloc.
 /// For kernel-only buffers (kernel stacks, TLS templates). NOT for user-mapped pages.
@@ -83,9 +81,7 @@ impl Drop for OwnedAlloc {
 
 unsafe impl Send for OwnedAlloc {}
 
-// ---------------------------------------------------------------------------
 // PageAlloc — contiguous 2MB physical pages from PMM
-// ---------------------------------------------------------------------------
 
 /// Contiguous 2MB-aligned physical pages from PMM. Provides a kernel-accessible
 /// pointer via the direct map. Pages are zeroed on allocation, freed on drop.
@@ -114,9 +110,7 @@ impl PageAlloc {
     }
 }
 
-// ---------------------------------------------------------------------------
 // MappedPages — physical pages plus the user address they were mapped at
-// ---------------------------------------------------------------------------
 
 /// Pages handed to userland through [`vma_map`], carried with the virtual
 /// address that maps them.
@@ -287,9 +281,7 @@ impl ThreadLocation {
     }
 }
 
-// ---------------------------------------------------------------------------
 // ProcessEntry + ThreadEntry — hierarchical process/thread table
-// ---------------------------------------------------------------------------
 
 /// Per-thread metadata. Tid is the HashMap key in ProcessEntry.threads.
 pub struct ThreadEntry {
@@ -401,9 +393,7 @@ impl Drop for ProcessEntry {
     }
 }
 
-// ---------------------------------------------------------------------------
 // ProcessData — per-process data behind Arc<Lock<ProcessData>>
-// ---------------------------------------------------------------------------
 
 /// Record of a single demand-paged fault, stored in a ring buffer for crash diagnostics.
 #[derive(Clone, Copy)]
@@ -513,7 +503,6 @@ pub struct ProcessData {
     /// Executable path (for SYS_QUERY_MODULES).
     pub exe_path: String,
 
-    // --- Process accounting (Layer 1 diagnostics) ---
     pub spawn_ns: u64,
     pub accounting: ProcessAccounting,
     /// Stashed stats from exited children (capped at 64).
@@ -563,9 +552,7 @@ pub struct MmapRegion {
     pub fixed: bool,
 }
 
-// ---------------------------------------------------------------------------
 // IdleProof — zero-cost proof that code runs on the per-CPU idle stack
-// ---------------------------------------------------------------------------
 
 /// Zero-sized proof that we are on the per-CPU idle stack.
 /// Required by `ProcessTable::collect_orphan_zombies` to prevent calling it
@@ -582,9 +569,7 @@ impl IdleProof {
     pub(crate) unsafe fn new_unchecked() -> Self { Self(()) }
 }
 
-// ---------------------------------------------------------------------------
 // Process table — IdMap<Pid, ProcessEntry> with lifecycle operations
-// ---------------------------------------------------------------------------
 
 pub type ProcessTable = crate::id_map::IdMap<Pid, ProcessEntry>;
 
@@ -705,9 +690,7 @@ pub fn current_address_space() -> PageTables {
     scheduler::current_address_space().expect("current_address_space: no address space")
 }
 
-// ---------------------------------------------------------------------------
 // Access patterns — ProcessData (clone Arc, drop table lock, lock ProcessData)
-// ---------------------------------------------------------------------------
 
 /// Get the current thread's ThreadData Arc (brief table lock).
 /// If the entry is gone (process killed while thread was running), exits silently.
@@ -763,10 +746,6 @@ pub fn with_fd_owner_data<R>(f: impl FnOnce(&mut ProcessData) -> R) -> R {
     let mut guard = arc.lock();
     f(&mut guard)
 }
-
-// ---------------------------------------------------------------------------
-// Spawn
-// ---------------------------------------------------------------------------
 
 /// Spawn a thread within the current process.
 pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64, stack_base: u64) -> Option<Tid> {
@@ -873,10 +852,6 @@ pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64, stack_base: u64) -> Op
     Some(tid)
 }
 
-
-// ---------------------------------------------------------------------------
-// Exit / teardown
-// ---------------------------------------------------------------------------
 
 /// Tear down a process: zombie all its threads, free all resources, wake parent.
 /// Called in two phases:
@@ -1163,10 +1138,6 @@ pub fn thread_exit(code: i32) -> ! {
     scheduler::exit_current(code);
 }
 
-// ---------------------------------------------------------------------------
-// Blocking / scheduling
-// ---------------------------------------------------------------------------
-
 /// A thread's scheduler record, cloned out of the table.
 ///
 /// Cloning rather than borrowing is what keeps the wake and retire paths off
@@ -1177,10 +1148,6 @@ pub fn thread_sched(pid: Pid, tid: Tid) -> Option<ThreadSched> {
     let table = guard.as_ref()?;
     table.get(pid)?.threads.get(tid)?.sched().cloned()
 }
-
-// ---------------------------------------------------------------------------
-// Futex
-// ---------------------------------------------------------------------------
 
 /// Atomically check a user futex word and block if it matches the expected value.
 /// Returns 0 if woken normally, 1 if timed out, u64::MAX on error.
@@ -1215,10 +1182,6 @@ pub fn futex_wake(addr: u64, count: u64) -> u64 {
     scheduler::futex_wake(phys_addr, count as usize)
 }
 
-// ---------------------------------------------------------------------------
-// Pipe wake helpers
-// ---------------------------------------------------------------------------
-
 /// Wake processes blocked on reading from a pipe that now has data.
 pub fn wake_pipe_readers(pipe_id: pipe::PipeId) {
     scheduler::wake_pipe_readers(pipe_id);
@@ -1245,10 +1208,6 @@ pub fn wake_pipe_writers(pipe_id: pipe::PipeId) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Zombie collection
-// ---------------------------------------------------------------------------
-
 /// Atomically validate parent-child relationship and collect a zombie child process.
 pub fn wait_child_zombie(child_pid: Pid, parent_pid: Pid) -> Result<Option<i32>, ()> {
     let mut guard = PROCESS_TABLE.lock();
@@ -1262,10 +1221,6 @@ pub fn wait_thread_zombie(tid: Tid, parent_pid: Pid) -> Result<Option<i32>, ()> 
     let table = guard.as_mut().unwrap();
     collect_thread_zombie(table, tid, parent_pid)
 }
-
-// ---------------------------------------------------------------------------
-// Demand paging
-// ---------------------------------------------------------------------------
 
 /// Handle a page fault at `fault_addr` by looking up the current process's VMAs.
 /// Returns true if the fault was resolved (a page was mapped), false if fatal.
@@ -1449,10 +1404,6 @@ pub fn handle_page_fault(fault_addr: u64, _error_code: u64) -> bool {
     true
 }
 
-// ---------------------------------------------------------------------------
-// Crash diagnostics
-// ---------------------------------------------------------------------------
-
 /// Dump the page fault trace and memory around `fault_addr` for the current process.
 /// Called from the exception handler on user-mode crashes.
 pub fn dump_crash_diagnostics(fault_addr: u64, rip: u64) {
@@ -1548,10 +1499,6 @@ pub fn dump_crash_diagnostics(fault_addr: u64, rip: u64) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Symbol resolution / address validation
-// ---------------------------------------------------------------------------
-
 /// Resolve and log a user-mode address against the process's symbol table.
 /// Returns true if the address was resolved and logged.
 /// Uses try_lock so it's safe to call from panic handlers.
@@ -1626,10 +1573,6 @@ pub(crate) fn find_symtab_in_memory(
         prog_base, prog_end, stack_base, stack_end,
     )
 }
-
-// ---------------------------------------------------------------------------
-// Kill
-// ---------------------------------------------------------------------------
 
 /// Kill a child process. Only the parent can kill its children.
 /// Returns 0 on success, error code on failure.

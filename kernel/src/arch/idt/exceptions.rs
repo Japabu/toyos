@@ -4,10 +4,6 @@ use crate::{log, mm, process, scheduler, symbols};
 
 use super::{Vector, TrapFrame, RPL_MASK, PF_PRESENT, PF_WRITE, PF_INSTRUCTION_FETCH};
 
-// ============================================================
-// Shared backtrace functions — allocation-free
-// ============================================================
-
 /// Walk RBP chain for kernel backtrace with symbol resolution.
 pub(crate) fn kernel_backtrace(start_rbp: u64, max_frames: usize) {
     let mut rbp = start_rbp;
@@ -48,9 +44,7 @@ fn kernel_backtrace_safe(start_rbp: u64, max_frames: usize) {
     }
 }
 
-// ============================================================
 // Safe memory reads — for exception handlers
-// ============================================================
 
 /// Safe kernel memory read. Only reads kernel direct-map addresses.
 fn safe_read_kernel(addr: u64) -> Option<u64> {
@@ -88,9 +82,7 @@ fn safe_read_u64(addr: u64, user_pml4: *const u64) -> Option<u64> {
     }
 }
 
-// ============================================================
 // Shared crash report — used by both exception and panic paths
-// ============================================================
 pub(crate) struct ExceptionContext<'a> {
     frame: &'a TrapFrame,
     cr2: u64,
@@ -314,9 +306,7 @@ pub(crate) fn try_recover_from_panic() -> ! {
     scheduler::schedule_no_return();
 }
 
-// ============================================================
 // Exception handlers — called from trap_dispatch in mod.rs
-// ============================================================
 
 /// #DB handler — logs full context when a hardware watchpoint fires.
 /// Returns to resume execution.
@@ -470,10 +460,6 @@ pub(super) fn double_fault_handler(frame: &TrapFrame) -> ! {
     apic::halt_all_cpus();
 }
 
-// ============================================================
-// Page fault handler (demand paging)
-// ============================================================
-
 /// Returns normally if the fault was resolved (page mapped in).
 /// Diverges (never returns) if the fault is fatal.
 pub(super) fn page_fault_handler(frame: &TrapFrame) {
@@ -519,9 +505,7 @@ pub(super) fn page_fault_handler(frame: &TrapFrame) {
     fatal_exception(&ctx);
 }
 
-// ============================================================
 // Fatal exception handler — shared by #UD, #GP, #PF
-// ============================================================
 
 /// Fatal exception handler for #UD and #GP. Never returns.
 pub(super) fn exception_handler(frame: &TrapFrame) -> ! {
