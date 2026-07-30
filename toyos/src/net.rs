@@ -8,19 +8,11 @@ use toyos_abi::syscall;
 use crate::ipc::IpcHeader;
 use crate::{Connection, Pipe, Handle};
 
-// ---------------------------------------------------------------------------
-// IPC payload safety
-// ---------------------------------------------------------------------------
-
 /// Marker trait for types safe to transmit over IPC.
 ///
 /// # Safety
 /// Implementors must be `#[repr(C)]` with no padding bytes and no pointers.
 pub unsafe trait IpcPayload: Copy {}
-
-// ---------------------------------------------------------------------------
-// IPC message types
-// ---------------------------------------------------------------------------
 
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -66,9 +58,7 @@ pub enum RespType {
     Error = 129,
 }
 
-// ---------------------------------------------------------------------------
 // Error codes (on the wire)
-// ---------------------------------------------------------------------------
 
 pub const ERR_CONNECTION_REFUSED: u32 = 1;
 pub const ERR_CONNECTION_RESET: u32 = 2;
@@ -78,15 +68,7 @@ pub const ERR_NOT_CONNECTED: u32 = 5;
 pub const ERR_INVALID_INPUT: u32 = 6;
 pub const ERR_OTHER: u32 = 255;
 
-// ---------------------------------------------------------------------------
-// TCP option types
-// ---------------------------------------------------------------------------
-
 pub const OPT_NODELAY: u32 = 1;
-
-// ---------------------------------------------------------------------------
-// Error type
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NetError {
@@ -116,19 +98,13 @@ impl NetError {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Typed socket IDs
-// ---------------------------------------------------------------------------
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TcpSocketId(pub u32);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UdpSocketId(pub u32);
 
-// ---------------------------------------------------------------------------
 // Protocol request/response structs
-// ---------------------------------------------------------------------------
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -283,9 +259,7 @@ struct SentBytes {
 }
 unsafe impl IpcPayload for SentBytes {}
 
-// ---------------------------------------------------------------------------
 // Return types
-// ---------------------------------------------------------------------------
 
 pub struct TcpConnection {
     pub rx: Pipe,
@@ -316,9 +290,7 @@ pub struct UdpBound {
     pub rx: Pipe,
 }
 
-// ---------------------------------------------------------------------------
 // NetdConn — per-operation IPC connection (typestate protocol)
-// ---------------------------------------------------------------------------
 
 pub struct NetdConn(Connection);
 
@@ -388,9 +360,7 @@ impl PendingResponse {
     }
 }
 
-// ---------------------------------------------------------------------------
 // TCP client functions
-// ---------------------------------------------------------------------------
 
 pub fn tcp_connect(
     addr: [u8; 4],
@@ -530,9 +500,7 @@ pub fn tcp_get_option(socket_id: TcpSocketId, option: u32) -> Result<u32, NetErr
     Ok(resp.value)
 }
 
-// ---------------------------------------------------------------------------
 // UDP client functions
-// ---------------------------------------------------------------------------
 
 pub fn udp_bind(addr: [u8; 4], port: u16) -> Result<UdpBound, NetError> {
     let tx_pipe = syscall::pipe();
@@ -598,10 +566,6 @@ pub fn udp_close(socket_id: UdpSocketId) -> Result<(), NetError> {
         .request(MsgType::UdpClose, &SocketCloseRequest { socket_id: socket_id.0 })?
         .status()
 }
-
-// ---------------------------------------------------------------------------
-// DNS
-// ---------------------------------------------------------------------------
 
 pub fn dns_lookup(hostname: &str, results: &mut [[u8; 4]]) -> Result<usize, NetError> {
     let mut buf = [0u8; 256];

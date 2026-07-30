@@ -19,10 +19,6 @@ pub enum IpcError {
     Syscall(SyscallError),
 }
 
-// ---------------------------------------------------------------------------
-// Connection — typed IPC endpoint
-// ---------------------------------------------------------------------------
-
 /// An IPC connection. Created by [`crate::services::accept`] or
 /// [`crate::services::connect`].
 pub struct Connection(pub(crate) Handle);
@@ -71,10 +67,8 @@ impl Connection {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Free functions — used by consumers that hold raw Fds (compositor, netd).
 // Will become pub(crate) once all callers migrate to Connection methods.
-// ---------------------------------------------------------------------------
 
 pub fn send<T: Copy>(fd: Fd, msg_type: u32, payload: &T) -> Result<(), IpcError> {
     let header = IpcHeader { msg_type, len: core::mem::size_of::<T>() as u32 };

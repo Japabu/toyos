@@ -7,9 +7,7 @@ use core::ptr;
 use toyos_abi::Fd;
 use toyos_abi::syscall::{self, OpenFlags, SeekFrom};
 
-// ---------------------------------------------------------------------------
 // Constants (matching POSIX / Linux values)
-// ---------------------------------------------------------------------------
 
 const O_RDONLY: i32 = 0;
 const O_WRONLY: i32 = 1;
@@ -34,9 +32,7 @@ const S_IFREG: u32 = 0o100000;
 const S_IFIFO: u32 = 0o010000;
 const S_IFCHR: u32 = 0o020000;
 
-// ---------------------------------------------------------------------------
 // Helper: set errno from toyos-abi error
-// ---------------------------------------------------------------------------
 
 fn set_errno(e: toyos_abi::syscall::SyscallError) -> i32 {
     use toyos_abi::syscall::SyscallError;
@@ -61,9 +57,7 @@ pub fn c_str_to_bytes(s: *const u8) -> &'static [u8] {
     }
 }
 
-// ---------------------------------------------------------------------------
 // File descriptor operations
-// ---------------------------------------------------------------------------
 
 #[no_mangle]
 pub unsafe extern "C" fn open(path: *const u8, flags: i32, _mode: u32) -> i32 {
@@ -188,9 +182,7 @@ pub unsafe extern "C" fn pipe(pipefd: *mut i32) -> i32 {
     0
 }
 
-// ---------------------------------------------------------------------------
 // Path operations
-// ---------------------------------------------------------------------------
 
 #[no_mangle]
 pub unsafe extern "C" fn unlink(path: *const u8) -> i32 {
@@ -313,9 +305,7 @@ pub unsafe extern "C" fn pwrite(raw_fd: i32, buf: *const u8, count: usize, offse
     n
 }
 
-// ---------------------------------------------------------------------------
 // Directory operations
-// ---------------------------------------------------------------------------
 
 #[repr(C)]
 pub struct DIR {
@@ -386,9 +376,7 @@ pub unsafe extern "C" fn closedir(dir: *mut DIR) -> i32 {
     0
 }
 
-// ---------------------------------------------------------------------------
 // struct stat
-// ---------------------------------------------------------------------------
 
 #[repr(C)]
 pub struct Stat {
@@ -407,9 +395,7 @@ pub struct Stat {
     pub st_ctime: i64,
 }
 
-// ---------------------------------------------------------------------------
 // mmap/munmap (real implementations using toyos-abi)
-// ---------------------------------------------------------------------------
 
 #[no_mangle]
 pub unsafe extern "C" fn mmap(
@@ -442,9 +428,7 @@ pub unsafe extern "C" fn munmap(addr: *mut u8, len: usize) -> i32 {
     }
 }
 
-// ---------------------------------------------------------------------------
 // poll
-// ---------------------------------------------------------------------------
 
 #[repr(C)]
 pub struct pollfd {

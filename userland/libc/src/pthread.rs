@@ -6,9 +6,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use toyos_abi::syscall;
 
-// ---------------------------------------------------------------------------
 // Types
-// ---------------------------------------------------------------------------
 
 // pthread_t is a thread ID (u64 from kernel)
 type PthreadT = u64;
@@ -55,9 +53,7 @@ fn thread_index() -> usize {
     tid % MAX_THREADS
 }
 
-// ---------------------------------------------------------------------------
 // Thread create/join
-// ---------------------------------------------------------------------------
 
 const THREAD_STACK_SIZE: usize = 1024 * 1024; // 1 MiB
 
@@ -142,9 +138,7 @@ pub unsafe extern "C" fn pthread_equal(t1: PthreadT, t2: PthreadT) -> i32 {
     (t1 == t2) as i32
 }
 
-// ---------------------------------------------------------------------------
 // Mutex (futex-based)
-// ---------------------------------------------------------------------------
 
 #[no_mangle]
 pub unsafe extern "C" fn pthread_mutex_init(
@@ -209,9 +203,7 @@ pub unsafe extern "C" fn pthread_mutexattr_settype(
     _attr: *mut PthreadMutexattrT, _type: i32,
 ) -> i32 { 0 }
 
-// ---------------------------------------------------------------------------
 // Condition variable (futex-based)
-// ---------------------------------------------------------------------------
 
 #[no_mangle]
 pub unsafe extern "C" fn pthread_cond_init(
@@ -263,9 +255,7 @@ pub unsafe extern "C" fn pthread_condattr_init(_attr: *mut PthreadCondattrT) -> 
 #[no_mangle]
 pub unsafe extern "C" fn pthread_condattr_destroy(_attr: *mut PthreadCondattrT) -> i32 { 0 }
 
-// ---------------------------------------------------------------------------
 // Once
-// ---------------------------------------------------------------------------
 
 #[no_mangle]
 pub unsafe extern "C" fn pthread_once(
@@ -297,9 +287,7 @@ pub unsafe extern "C" fn pthread_once(
     }
 }
 
-// ---------------------------------------------------------------------------
 // Thread-local storage (TLS keys)
-// ---------------------------------------------------------------------------
 
 #[no_mangle]
 pub unsafe extern "C" fn pthread_key_create(
@@ -332,9 +320,7 @@ pub unsafe extern "C" fn pthread_setspecific(key: PthreadKeyT, value: *const u8)
     0
 }
 
-// ---------------------------------------------------------------------------
 // RWLock (simple: wraps mutex, no reader parallelism)
-// ---------------------------------------------------------------------------
 
 #[repr(C)]
 pub struct PthreadRwlockT {
@@ -368,9 +354,7 @@ pub unsafe extern "C" fn pthread_rwlock_destroy(rwlock: *mut PthreadRwlockT) -> 
     pthread_mutex_destroy(&mut (*rwlock).mutex)
 }
 
-// ---------------------------------------------------------------------------
 // Attr stubs
-// ---------------------------------------------------------------------------
 
 #[no_mangle]
 pub unsafe extern "C" fn pthread_attr_init(_attr: *mut u8) -> i32 { 0 }

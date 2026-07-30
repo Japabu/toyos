@@ -6,16 +6,12 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use toyos_abi::Pid;
 use toyos_abi::syscall;
 
-// ---------------------------------------------------------------------------
 // errno (shared with other modules)
-// ---------------------------------------------------------------------------
 
 const ENOSYS: i32 = 38;
 const ECHILD: i32 = 10;
 
-// ---------------------------------------------------------------------------
 // Environment variables
-// ---------------------------------------------------------------------------
 
 // Cached environment block from kernel. Format: "KEY=VALUE\0KEY=VALUE\0\0"
 static mut ENV_BUF: [u8; 8192] = [0; 8192];
@@ -74,9 +70,7 @@ pub unsafe extern "C" fn unsetenv(_name: *const u8) -> i32 {
     0
 }
 
-// ---------------------------------------------------------------------------
 // Process
-// ---------------------------------------------------------------------------
 
 #[no_mangle]
 pub unsafe extern "C" fn getpid() -> i32 {
@@ -126,9 +120,7 @@ pub unsafe extern "C" fn waitpid(pid: i32, status: *mut i32, _options: i32) -> i
     pid
 }
 
-// ---------------------------------------------------------------------------
 // Exit / abort / atexit
-// ---------------------------------------------------------------------------
 
 const MAX_ATEXIT: usize = 32;
 static mut ATEXIT_FNS: [Option<unsafe extern "C" fn()>; MAX_ATEXIT] = [None; MAX_ATEXIT];
@@ -181,9 +173,7 @@ pub unsafe extern "C" fn abort() -> ! {
     syscall::exit(134) // SIGABRT
 }
 
-// ---------------------------------------------------------------------------
 // Signal (stubs — ToyOS has no signals)
-// ---------------------------------------------------------------------------
 
 type SigHandlerT = unsafe extern "C" fn(i32);
 
@@ -216,9 +206,7 @@ pub unsafe extern "C" fn kill(_pid: i32, _sig: i32) -> i32 {
     0
 }
 
-// ---------------------------------------------------------------------------
 // sysconf
-// ---------------------------------------------------------------------------
 
 const _SC_PAGESIZE: i32 = 30;
 const _SC_NPROCESSORS_ONLN: i32 = 84;
@@ -234,9 +222,7 @@ pub unsafe extern "C" fn sysconf(name: i32) -> i64 {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Random
-// ---------------------------------------------------------------------------
 
 static RAND_STATE: AtomicU32 = AtomicU32::new(1);
 
@@ -254,9 +240,7 @@ pub unsafe extern "C" fn rand() -> i32 {
     ((s >> 16) & 0x7fff) as i32
 }
 
-// ---------------------------------------------------------------------------
 // Sorting / searching
-// ---------------------------------------------------------------------------
 
 type CmpFn = unsafe extern "C" fn(*const u8, *const u8) -> i32;
 
@@ -305,9 +289,7 @@ pub unsafe extern "C" fn bsearch(
     ptr::null_mut()
 }
 
-// ---------------------------------------------------------------------------
 // String-to-number conversions
-// ---------------------------------------------------------------------------
 
 #[no_mangle]
 pub unsafe extern "C" fn atoi(s: *const u8) -> i32 {
@@ -416,9 +398,7 @@ pub unsafe extern "C" fn strtod(s: *const u8, endptr: *mut *mut u8) -> f64 {
     if neg { -val } else { val }
 }
 
-// ---------------------------------------------------------------------------
 // abs
-// ---------------------------------------------------------------------------
 
 #[no_mangle]
 pub unsafe extern "C" fn abs(j: i32) -> i32 {
@@ -430,9 +410,7 @@ pub unsafe extern "C" fn labs(j: i64) -> i64 {
     if j < 0 { -j } else { j }
 }
 
-// ---------------------------------------------------------------------------
 // setjmp/longjmp (minimal stub — used by some C code)
-// ---------------------------------------------------------------------------
 
 // jmp_buf is 8 * 8 bytes on x86_64 (enough for callee-saved regs + rsp + rip)
 // Real implementation would need assembly; this is a panic stub.
@@ -446,9 +424,7 @@ pub unsafe extern "C" fn longjmp(_env: *mut u8, _val: i32) -> ! {
     panic!("longjmp not implemented")
 }
 
-// ---------------------------------------------------------------------------
 // dlopen/dlsym/dlclose
-// ---------------------------------------------------------------------------
 
 #[no_mangle]
 pub unsafe extern "C" fn dlopen(path: *const u8, _flags: i32) -> *mut u8 {

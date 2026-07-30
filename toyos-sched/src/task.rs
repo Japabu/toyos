@@ -454,9 +454,7 @@ impl<M> TaskShared<M> {
     }
 }
 
-// ===========================================================================
 // The linear task value and its five lifecycle types (spec §5.1, §5.2)
-// ===========================================================================
 
 /// Whether a task is real-time, and until when a borrowed priority lasts.
 ///

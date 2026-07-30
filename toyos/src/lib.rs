@@ -21,20 +21,12 @@ pub use device::{Keyboard, Mouse, FramebufferDev, Nic, AudioDev};
 
 pub use toyos_abi::Fd;
 
-// ---------------------------------------------------------------------------
-// AsHandle — unified trait for typed handles
-// ---------------------------------------------------------------------------
-
 /// Trait for types that wrap a kernel handle (fd).
 ///
 /// Used by [`ring::Ring::poll_add`] and other APIs that accept any handle type.
 pub trait AsHandle {
     fn as_handle(&self) -> Fd;
 }
-
-// ---------------------------------------------------------------------------
-// Handle — internal RAII base
-// ---------------------------------------------------------------------------
 
 /// Internal base handle. Non-Copy. Drop calls close.
 ///
@@ -66,10 +58,6 @@ impl Drop for Handle {
         toyos_abi::syscall::close(self.0);
     }
 }
-
-// ---------------------------------------------------------------------------
-// Typed handles
-// ---------------------------------------------------------------------------
 
 /// A service listener. Created by [`services::listen`].
 pub struct Listener(pub(crate) Handle);

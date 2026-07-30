@@ -6,10 +6,6 @@ use toyos_abi::syscall;
 use crate::ipc::IpcError;
 use crate::shm::SharedMemory;
 
-// ---------------------------------------------------------------------------
-// IPC message types
-// ---------------------------------------------------------------------------
-
 pub const MSG_STREAM_OPEN: u32 = 1;
 pub const MSG_STREAM_OPENED: u32 = 2;
 pub const MSG_STREAM_SET_VOLUME: u32 = 3;
@@ -49,10 +45,6 @@ pub struct StreamSetVolume {
 pub fn audio_submit(buf_idx: u32, len: u32) -> Result<(), syscall::SyscallError> {
     syscall::audio_submit(buf_idx, len)
 }
-
-// ---------------------------------------------------------------------------
-// AudioSlotWriter — client side of slot-ring protocol
-// ---------------------------------------------------------------------------
 
 pub struct AudioSlotWriter {
     shm: SharedMemory,
@@ -112,10 +104,6 @@ impl AudioSlotWriter {
         Some(SlotWriteGuard { writer: self, idx: w })
     }
 }
-
-// ---------------------------------------------------------------------------
-// AudioSlotReader — soundd side of slot-ring protocol
-// ---------------------------------------------------------------------------
 
 pub struct AudioSlotReader {
     shm: SharedMemory,
@@ -179,10 +167,6 @@ impl SlotReadGuard<'_> {
             .store(self.idx.wrapping_add(1), Ordering::Release);
     }
 }
-
-// ---------------------------------------------------------------------------
-// AudioStream — client handle for soundd
-// ---------------------------------------------------------------------------
 
 #[derive(Debug)]
 pub enum AudioError {

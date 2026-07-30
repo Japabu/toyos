@@ -2,9 +2,7 @@ use core::ptr;
 use toyos_abi::Fd;
 use toyos_abi::syscall::{self, OpenFlags, SeekFrom};
 
-// ---------------------------------------------------------------------------
 // Platform fd operations
-// ---------------------------------------------------------------------------
 
 fn sys_open(path: &[u8], read: bool, write: bool, create: bool, truncate: bool, append: bool) -> i32 {
     let mut flags = OpenFlags(0);
@@ -62,9 +60,7 @@ fn sys_mkdir(path: &[u8]) -> i32 {
     match syscall::mkdir(path) { Ok(()) => 0, Err(_) => -1 }
 }
 
-// ---------------------------------------------------------------------------
 // FILE struct
-// ---------------------------------------------------------------------------
 
 pub struct FILE {
     fd: i32,
@@ -87,9 +83,7 @@ pub static mut stderr: *mut FILE = &raw mut STDERR_FILE;
 #[no_mangle]
 pub static mut stdin: *mut FILE = &raw mut STDIN_FILE;
 
-// ---------------------------------------------------------------------------
 // FILE I/O
-// ---------------------------------------------------------------------------
 
 unsafe fn c_str_bytes(s: *const u8) -> &'static [u8] {
     let len = super::string::strlen(s);
@@ -301,9 +295,7 @@ pub unsafe extern "C" fn puts(s: *const u8) -> i32 {
 #[no_mangle]
 pub unsafe extern "C" fn ungetc(_c: i32, _f: *mut FILE) -> i32 { -1 }
 
-// ---------------------------------------------------------------------------
 // File operations
-// ---------------------------------------------------------------------------
 
 #[no_mangle]
 pub unsafe extern "C" fn remove(path: *const u8) -> i32 {
@@ -327,9 +319,7 @@ pub unsafe extern "C" fn perror(s: *const u8) {
     fputs(b"error\n\0".as_ptr(), unsafe { stderr });
 }
 
-// ---------------------------------------------------------------------------
 // Remaining stdio-adjacent functions
-// ---------------------------------------------------------------------------
 
 #[no_mangle]
 pub unsafe extern "C" fn system(_command: *const u8) -> i32 { -1 }

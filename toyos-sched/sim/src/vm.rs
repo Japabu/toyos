@@ -315,8 +315,6 @@ impl<'q> Vm<'q> {
         all
     }
 
-    // ---------------------------------------------------------------- spawn
-
     fn spawn(&mut self, process: usize, template: usize) {
         if self.live.len() >= self.scenario.max_tasks {
             return;
@@ -392,8 +390,6 @@ impl<'q> Vm<'q> {
             self.ipi_due[cpu] = Some(self.clock.after(IPI_LATENCY_NS));
         }
     }
-
-    // ------------------------------------------------------- enabled steps
 
     pub fn enabled(&self) -> Vec<Step> {
         let mut steps = Vec::new();
@@ -508,8 +504,6 @@ impl<'q> Vm<'q> {
         armed.into_iter().flatten().chain(irqs).min()
     }
 
-    // ----------------------------------------------------------- execution
-
     pub fn execute(&mut self, step: Step, choices: &mut ChoiceStream) {
         self.steps += 1;
         self.execute_inner(step, choices);
@@ -611,8 +605,6 @@ impl<'q> Vm<'q> {
             }
         }
     }
-
-    // ------------------------------------------------------------ the pass
 
     /// Run one pass. The returned [`BlockEnd`] is only meaningful for
     /// [`Dispose::Commit`]; every other disposition reports `Parked`, which
@@ -738,8 +730,6 @@ impl<'q> Vm<'q> {
             Action::Idle(token) => self.hw.idle_wait(token),
         }
     }
-
-    // ----------------------------------------------------------- workload
 
     fn exec_op(&mut self, cpu: usize, choices: &mut ChoiceStream) {
         let Some(key) = self.cpus[cpu].running().map(|t| t.key()) else {
@@ -1074,8 +1064,6 @@ impl<'q> Vm<'q> {
         self.run_pass(cpu, Dispose::Exit);
     }
 
-    // ------------------------------------------------------------ teardown
-
     /// Process teardown: every other thread of this process must go.
     fn teardown(&mut self, by: TaskKey) {
         let process = self.programs[&by].process;
@@ -1164,8 +1152,6 @@ impl<'q> Vm<'q> {
         }
     }
 
-    // ------------------------------------------------------ old steal port
-
     fn old_steal(&mut self, thief: usize, victim: usize) {
         if let Some(task) = self.cpus[victim].steal_ready() {
             self.transit[thief] = Some(task);
@@ -1177,8 +1163,6 @@ impl<'q> Vm<'q> {
             self.cpus[thief].install_stolen(task);
         }
     }
-
-    // ------------------------------------------------------- observations
 
     /// Reconcile the VM's own bookkeeping with what the core released.
     pub fn reap_released(&mut self) {

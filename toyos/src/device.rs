@@ -7,10 +7,6 @@ use toyos_abi::syscall::{self, DeviceType, SyscallError};
 use crate::{Device, Handle, AsHandle};
 use toyos_abi::Fd;
 
-// ---------------------------------------------------------------------------
-// Generic read_info — reads a Copy struct from a device fd
-// ---------------------------------------------------------------------------
-
 pub(crate) fn read_info<T: Copy>(dev: &Device) -> Result<T, SyscallError> {
     let size = core::mem::size_of::<T>();
     let mut val = unsafe { core::mem::zeroed::<T>() };
@@ -21,10 +17,6 @@ pub(crate) fn read_info<T: Copy>(dev: &Device) -> Result<T, SyscallError> {
     assert_eq!(n, size, "device info size mismatch");
     Ok(val)
 }
-
-// ---------------------------------------------------------------------------
-// Typed devices
-// ---------------------------------------------------------------------------
 
 pub struct Keyboard(pub(crate) Device);
 

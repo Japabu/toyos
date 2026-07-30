@@ -7,9 +7,7 @@ use toyos_abi::Fd;
 use toyos_abi::syscall;
 use toyos::net::{NetError, TcpSocketId, UdpSocketId, OPT_NODELAY};
 
-// ---------------------------------------------------------------------------
 // C types matching POSIX
-// ---------------------------------------------------------------------------
 
 type SocklenT = u32;
 
@@ -66,9 +64,7 @@ const EADDRINUSE: i32 = 98;
 const ENOTCONN: i32 = 107;
 const EIO: i32 = 5;
 
-// ---------------------------------------------------------------------------
 // Internal socket table
-// ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy)]
 enum SocketKind {
@@ -121,9 +117,7 @@ fn set_errno(e: i32) {
     unsafe { super::stdio::errno = e; }
 }
 
-// ---------------------------------------------------------------------------
 // netd error conversion
-// ---------------------------------------------------------------------------
 
 fn net_err_to_errno(e: NetError) -> i32 {
     match e {
@@ -164,9 +158,7 @@ unsafe fn fill_sockaddr(addr: *mut Sockaddr, addrlen: *mut SocklenT, ip: [u8; 4]
     *addrlen = core::mem::size_of::<SockaddrIn>() as SocklenT;
 }
 
-// ---------------------------------------------------------------------------
 // BSD socket API
-// ---------------------------------------------------------------------------
 
 #[no_mangle]
 pub unsafe extern "C" fn socket(domain: i32, sock_type: i32, _protocol: i32) -> i32 {
@@ -521,9 +513,7 @@ pub unsafe extern "C" fn shutdown(fd: i32, how: i32) -> i32 {
 }
 
 
-// ---------------------------------------------------------------------------
 // close (for socket fds)
-// ---------------------------------------------------------------------------
 
 #[no_mangle]
 pub unsafe extern "C" fn close_socket(fd: i32) -> bool {
@@ -551,9 +541,7 @@ pub unsafe extern "C" fn close_socket(fd: i32) -> bool {
     true
 }
 
-// ---------------------------------------------------------------------------
 // setsockopt / getsockopt
-// ---------------------------------------------------------------------------
 
 #[no_mangle]
 pub unsafe extern "C" fn setsockopt(
@@ -634,9 +622,7 @@ pub unsafe extern "C" fn getsockopt(
     0
 }
 
-// ---------------------------------------------------------------------------
 // getpeername / getsockname
-// ---------------------------------------------------------------------------
 
 #[no_mangle]
 pub unsafe extern "C" fn getpeername(
@@ -679,9 +665,7 @@ pub unsafe extern "C" fn getsockname(
     0
 }
 
-// ---------------------------------------------------------------------------
 // DNS: getaddrinfo / freeaddrinfo
-// ---------------------------------------------------------------------------
 
 #[no_mangle]
 pub unsafe extern "C" fn getaddrinfo(
@@ -772,9 +756,7 @@ pub unsafe extern "C" fn gai_strerror(_errcode: i32) -> *const u8 {
     b"DNS lookup failed\0".as_ptr()
 }
 
-// ---------------------------------------------------------------------------
 // inet_pton / inet_ntop / htons / ntohs / htonl / ntohl
-// ---------------------------------------------------------------------------
 
 #[no_mangle]
 pub unsafe extern "C" fn inet_pton(af: i32, src: *const u8, dst: *mut u8) -> i32 {
@@ -877,9 +859,7 @@ pub unsafe extern "C" fn inet_addr(cp: *const u8) -> u32 {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Helpers
-// ---------------------------------------------------------------------------
 
 fn parse_ipv4(s: &[u8]) -> Option<[u8; 4]> {
     let mut octets = [0u8; 4];
