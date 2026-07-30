@@ -17,9 +17,7 @@ use crate::hw::Nanos;
 use crate::task::{SchedPayload, TaskKey, TaskState};
 
 /// Where a task value lives. One key may appear in exactly one of these,
-/// system-wide — the property the linear types make unrepresentable and that
-/// the simulator re-checks anyway, because a checker that only tests what the
-/// compiler already proved would prove nothing about the protocol.
+/// system-wide.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Container {
     Running,
@@ -40,12 +38,9 @@ pub fn residents<X: SchedPayload>(
         .chain(cpu.zombie_key().map(|k| (k, Container::Zombie)))
 }
 
-/// Container-versus-state-word agreement, plus invariant T.
-///
-/// This is the fail-fast layer that would have preserved crash.md's evidence:
-/// a task whose word says one thing while its value sits somewhere else dies
-/// here, at the transition that made it so, instead of being discovered later
-/// as a double-drop with the panic handler already recursing.
+/// Container-versus-state-word agreement, plus invariant T. A task whose word
+/// says one thing while its value sits somewhere else dies here, rather than
+/// later as a double-drop.
 pub fn check_cpu<X: SchedPayload>(cpu: &CpuSched<X>) {
     let id = cpu.id();
 

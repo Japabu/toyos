@@ -3,11 +3,10 @@
 //! [`Kicker`] knows only a CPU id; [`Machine`] adds the rest of the
 //! task-blind surface (clock, one-shot timer, interrupt gate, halt, trace);
 //! [`Hw`] adds the two operations that carry a task — the context switch and
-//! the finalize sink. The kernel implements the first two with LAPIC
-//! one-shot, targeted x2APIC ICR and TSC at migration stage 6, and the third
-//! with the asm switch at stage 7; the simulator implements all three over a
-//! virtual clock and vcpu bookkeeping (stage 4). No scheduling decision,
-//! state transition or ordering-sensitive code may live behind them.
+//! the finalize sink. The kernel implements them with LAPIC one-shot,
+//! targeted x2APIC ICR, TSC and the asm switch; the simulator over a virtual
+//! clock and vcpu bookkeeping. No scheduling decision, state transition or
+//! ordering-sensitive code may live behind them.
 
 use crate::cpu::{RunToken, SleepToken};
 use crate::task::{SchedPayload, TaskAccounting, TaskKey};
@@ -31,19 +30,17 @@ impl Nanos {
     }
 
     /// Elapsed since `earlier`. Saturating rather than wrapping: a pass that
-    /// samples a clock older than the last one is a driver bug, and charging
-    /// a colossal interval would hide it behind absurd accounting instead of
-    /// leaving the counters honest.
+    /// samples a clock older than the last one is a driver bug, and wrapping
+    /// would hide it behind a colossal charge.
     pub fn since(self, earlier: Nanos) -> u64 {
         self.0.saturating_sub(earlier.0)
     }
 }
 
-/// One scheduling-relevant event in the format shared by the kernel's
-/// per-CPU binary trace ring (Stage 6) and the simulator's recorder
-/// (Stage 4). `toyos-sched-sim replay --from-qemu` converts a captured
-/// kernel stream into a sim event script, turning a real-world anomaly into
-/// a deterministic host-side repro (spec §10.4).
+/// One scheduling-relevant event, in the format shared by the kernel's
+/// per-CPU binary trace ring and the simulator's recorder.
+/// `toyos-sched-sim replay --from-qemu` converts a captured kernel stream
+/// into a sim event script (spec §10.4).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct TraceEvent {
     pub ts: Nanos,
@@ -78,15 +75,8 @@ pub trait Kicker: Sync {
 }
 
 /// The half of the hardware surface that says nothing about tasks: clock,
-/// one-shot timer, interrupt gate, halt, resched request, trace sink.
-///
-/// Separate from [`Hw`] because it is separately *implementable*. Migration
-/// stage 6 puts the kernel's LAPIC/TSC/ICR behind this trait while the old
-/// scheduler still runs, so the surface meets real interrupts a stage before
-/// anything depends on it — and a stage before the kernel has a
-/// [`SchedPayload`] to name. A single trait would have made that impossible:
-/// `switch` and `release` are the only members that need the payload, and
-/// they are exactly the two the cutover brings.
+/// one-shot timer, interrupt gate, halt, resched request, trace sink. Split
+/// from [`Hw`] so an implementor needs no [`SchedPayload`] to provide it.
 pub trait Machine: Kicker + 'static {
     type IrqGuard;
 
@@ -103,15 +93,12 @@ pub trait Machine: Kicker + 'static {
 
     /// Kernel: cli/sti RAII. Sim: gates event delivery for this vcpu.
     ///
-    /// Note for whoever reaches for this: it does **not** fit the one site the
-    /// spec names for it (§7.5's "cli / final recheck / sti;hlt"). Measured at
-    /// stage 6 against the kernel: both exits from that recheck must *set* IF
-    /// unconditionally — the halt exit because `sti;hlt` is one atom, and the
-    /// stay-awake exit because the kernel's panic recovery enters the idle
-    /// loop with IF already 0, so restoring the caller's flags would strand
-    /// that CPU. An RAII guard can express neither. The kernel therefore
-    /// implements this member and calls it nowhere; the core does not call it
-    /// either. It is a designed surface with no user in either world.
+    /// Has no caller in either world, and does **not** fit the site it looks
+    /// like it should (§7.5's "cli / final recheck / sti;hlt"): both exits
+    /// from that recheck must *set* IF unconditionally — the halt exit because
+    /// `sti;hlt` is one atom, the stay-awake exit because panic recovery
+    /// enters the idle loop with IF already 0 — and an RAII guard restores
+    /// the caller's flags instead.
     fn irq_guard(&self) -> Self::IrqGuard;
 
     /// Enable interrupts and halt, atomically — on x86 the `sti;hlt` pair and
@@ -124,29 +111,23 @@ pub trait Machine: Kicker + 'static {
     /// state, so it lives above the boundary and its proof is [`SleepToken`].
     fn halt(&self);
 
-    /// Ask `cpu` to take its next safe point. The core needs this for exactly
-    /// one case the spec spells out (§7.6): a `Retire` whose target is the
-    /// task currently *running* cannot be yanked mid-syscall, so it is asked
-    /// to die at its next safe point instead. Not in the spec's trait list —
-    /// which leaves that request without a way to reach the driver.
+    /// Ask `cpu` to take its next safe point. Needed for one case: a `Retire`
+    /// whose target is the *running* task cannot be yanked mid-syscall, so it
+    /// is asked to die at its next safe point instead (spec §7.6).
     fn need_resched(&self, cpu: CpuId);
 
     fn trace(&self, ev: TraceEvent);
 
-    /// Halt on the strength of a [`SleepToken`]. Provided, and deliberately
-    /// not overridable in spirit: the token is proof, [`Self::halt`] is the
-    /// effect, and keeping the two apart is what lets a driver that cannot
-    /// yet mint a token (stage 6) still exercise the halt.
+    /// Halt on the strength of a [`SleepToken`]. The token is the proof and
+    /// [`Self::halt`] is the effect; they stay separate types.
     fn idle_wait(&self, token: SleepToken) {
         let _consumed = token;
         self.halt();
     }
 }
 
-/// The complete hardware surface. Everything above this trait — task types,
-/// state word, transitions, run queue, fairness math, mailbox, doorbell,
-/// sleep handshake, ticket protocol, deadline heap, pass logic — is real and
-/// shared between the kernel and the simulator; everything behind it is
+/// The complete hardware surface. Everything above this trait is shared
+/// between the kernel and the simulator; everything behind it is
 /// LAPIC/TSC/ICR/asm in the kernel and virtual time/pending-IPI bookkeeping
 /// in the sim (spec §10.1).
 pub trait Hw: Machine {

@@ -2,32 +2,11 @@
 //! and the host simulator through one [`hw::Hw`] boundary. The authoritative
 //! design is `specs/scheduler-core-spec.md`.
 //!
-//! Migration state (spec §11): Stage 4. [`fair`] carries the production
-//! fairness policy, called by `kernel/src/scheduler.rs` (Stage 1). The
-//! concurrency primitives are loom-verified: [`mailbox`] (the intrusive MPSC,
-//! the doorbell and the sleep handshake), [`task`] (the rendezvous state word
-//! and its CAS protocol), [`waitq`] (the two-phase wait ticket and the single
-//! wake path) and [`retire`] (kill bit + message chase). Stage 4 adds the
-//! machine those primitives serve: the linear task value and its five
-//! lifecycle types ([`task`]), the run queue ([`queue`]), the deadline heap
-//! and timer plan ([`timer`]), the message set ([`msg`]) and the per-CPU
-//! [`cpu::CpuSched`] with its [`cpu::SchedPass`] type-state.
-//!
-//! Stage 6 landed the task-blind half of the boundary: the kernel implements
-//! [`hw::Machine`] (`kernel/src/hw.rs`) and routes its LAPIC one-shot, TSC,
-//! targeted ICR, halt and trace ring through it while the old scheduler still
-//! drives. [`hw::Hw`] itself — the context switch and the finalize sink —
-//! waits for the cutover at Stage 7, which is also when the kernel first has
-//! a [`task::SchedPayload`].
-//! What drives it today is the host simulator (`toyos-sched/sim/`), which
-//! explores the protocol against invariants I1–I12 — including the deliberate
-//! port of the old steal-during-exit algorithm, which the simulator must
-//! refuse before its green runs mean anything (spec §10.3).
-//!
-//! Loom coverage lives in the sibling `toyos-sched-loom` package
-//! (`toyos-sched/loom/`), which compiles *these* source files against loom's
-//! instrumented atomics; see [`sync`] for why it is a separate package
-//! rather than a `cfg(loom)` dependency.
+//! Two host-side harnesses compile against these same sources: the simulator
+//! (`toyos-sched/sim/`), which explores the protocol against invariants
+//! I1–I12, and the `toyos-sched-loom` package (`toyos-sched/loom/`), which
+//! swaps in loom's instrumented atomics — see [`sync`] for why loom is a
+//! separate package rather than a `cfg(loom)` dependency.
 
 #![no_std]
 #![deny(unsafe_code)]

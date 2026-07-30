@@ -85,7 +85,7 @@ impl Default for DeadlineHeap {
 /// What the one-shot timer must be programmed to at the end of a pass.
 /// Produced by `finish()` after every heap mutation, applied *last* — which
 /// is the whole proof of invariant T: there is no window between the last
-/// mutation and the arming (spec §8.4, killing B5).
+/// mutation and the arming (spec §8.4).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[must_use = "a timer plan that is not applied is invariant T violated"]
 pub enum TimerPlan {

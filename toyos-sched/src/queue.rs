@@ -1,11 +1,8 @@
 //! The per-CPU run queue — spec §9.2.
 //!
-//! Two bands, deliberately today's ordering: an RT FIFO drained first, and a
-//! fair band ordered by `(vruntime, insertion sequence)`. The stored-lag fairness
-//! semantics are preserved bit-identically through the machinery cutover so
-//! that any regression is attributable to the machinery; true EEVDF
-//! virtual-deadline ordering is a later, sim-gated, `queue.rs`/`fair.rs`-only
-//! change (spec §9.1).
+//! Two bands: an RT FIFO drained first, and a fair band ordered by
+//! `(vruntime, insertion sequence)`. True EEVDF virtual-deadline ordering is a
+//! later, sim-gated, `queue.rs`/`fair.rs`-only change (spec §9.1).
 //!
 //! The queue owns [`ReadyTask`] values. A task in a queue is therefore *not*
 //! anywhere else — there is no second owner to construct.
@@ -18,14 +15,11 @@ pub struct RunQueue<X: SchedPayload> {
     rt: VecDeque<ReadyTask<X>>,
     /// Ordered by `(vruntime, insertion sequence)`.
     ///
-    /// The tie-break is deliberately **not** `TaskKey`. All threads of a
-    /// process share one vruntime, so an identity tie-break is deterministic:
-    /// the same thread wins every tie and its siblings only run when it blocks.
-    /// That is not hypothetical — it starved Doom's midi thread behind its game
-    /// thread on a single core, and the old scheduler carries the same
-    /// monotonic-sequence fix for the same reason. A re-inserted thread goes
-    /// *behind* its equal-vruntime siblings, so threads of one process
-    /// round-robin without gaining any cross-process share.
+    /// The tie-break must **not** be `TaskKey`. All threads of a process share
+    /// one vruntime, so an identity tie-break starves siblings: the same thread
+    /// wins every tie and the others only run when it blocks. With a monotonic
+    /// sequence a re-inserted thread goes *behind* its equal-vruntime siblings,
+    /// so they round-robin without gaining cross-process share.
     fair: BTreeMap<(u64, u64), ReadyTask<X>>,
     insert_seq: u64,
 }

@@ -4,8 +4,9 @@
 //! CQ, driver queue) owns a [`WaitQueue`]. Every blocking site uses the same
 //! two-phase commit, and **every** wake in the system — remote waker, local
 //! deadline fire, join, device ISR tail — terminates in the single claim CAS
-//! of [`crate::task::TaskShared::claim_wake`]. There is no second path, so
-//! the five lost-wake windows (B3) have no place left to live.
+//! of [`crate::task::TaskShared::claim_wake`]. There is no second path.
+//!
+//! The shape a blocking site must have:
 //!
 //! ```text
 //! loop {
@@ -16,18 +17,13 @@
 //! }
 //! ```
 //!
-//! Two deliberate departures from the spec sketch, both to keep `unsafe`
-//! confined to `mailbox.rs`:
-//!
-//! * The queue's list is behind a [`LeafLock`] the *environment* supplies
-//!   (kernel: the IRQ-off leaf lock of §8.1; loom: a `loom::sync::Mutex`),
-//!   instead of a raw lock implemented here. The core stays sans-IO and loom
-//!   gets to model the real critical sections.
-//! * Waiters are held as `Arc<TaskShared>` in a `VecDeque` inside that lock
-//!   rather than through an embedded `wait_node` link. `TaskShared.waiting`
-//!   still enforces the one-queue-per-task rule; what is deferred is the
-//!   allocation-free intrusive list, which needs raw links (see the report
-//!   for the Stage 5 note).
+//! Two departures from the spec sketch, both to keep `unsafe` confined to
+//! `mailbox.rs`. The queue's list is behind a [`LeafLock`] the *environment*
+//! supplies (kernel: the IRQ-off leaf lock of §8.1; loom: a
+//! `loom::sync::Mutex`) rather than a lock implemented here. And waiters are
+//! held as `Arc<TaskShared>` in a `VecDeque` rather than through an embedded
+//! `wait_node` link; `TaskShared.waiting` still enforces one queue per task,
+//! but the allocation-free intrusive list is still owed.
 
 use alloc::collections::VecDeque;
 use core::marker::PhantomData;
@@ -70,9 +66,8 @@ impl<M> Default for WaitList<M> {
     }
 }
 
-/// The running task, as the wait path sees it. Stage 4 hands this out from
-/// `RunningTask`, which is why `prepare_wait` cannot be called for anybody
-/// else's task.
+/// The running task, as the wait path sees it. Only `CpuSched::current_task`
+/// hands one out, so `prepare_wait` cannot be called for anybody else's task.
 pub struct CurrentTask<'a, M> {
     shared: &'a Arc<TaskShared<M>>,
     cpu: CpuId,
@@ -300,17 +295,16 @@ pub enum Commit<'q, M: SchedMsg, L: LeafLock<WaitList<M>>> {
 
 /// A live registration on a queue, outstanding while its task is parked.
 ///
-/// It exists because a *timeout* leaves the waiter's node behind: the local
-/// deadline fire wins the same claim CAS a waker would, and the core has no
-/// idea which queue the task was on — nor should it, since the scheduler
-/// knows only tasks, tickets and causes (spec §8.1).
+/// It exists because a *timeout* leaves the waiter behind: the local deadline
+/// fire wins the same claim CAS a waker would, and the core does not know
+/// which queue the task was on — nor should it, since the scheduler knows only
+/// tasks, tickets and causes (spec §8.1).
 ///
-/// A leftover node is not merely untidy. Once the task parks on a *second*
-/// queue, a `wake_one` on the first would find it `Blocked` and claim it:
-/// that queue's wake is consumed by a waiter that is no longer waiting for it
-/// — the "wake satisfied by a corpse" failure §8.2 exists to prevent, one
-/// level up. Holding this guard across the block, on the task's own stack,
-/// makes the cleanup structural instead of one more per-source recheck.
+/// The leftover is not merely untidy. Once the task parks on a *second* queue,
+/// a `wake_one` on the first would find it `Blocked` and claim it, spending
+/// that queue's wake on a waiter no longer waiting for it. Holding this guard
+/// across the block, on the task's own stack, makes the cleanup structural
+/// instead of one more per-source recheck.
 #[must_use = "a registration must be finished once the task runs again"]
 pub struct Registration<'q, M: SchedMsg, L: LeafLock<WaitList<M>>> {
     queue: &'q WaitQueue<M, L>,
@@ -338,8 +332,8 @@ impl<M: SchedMsg, L: LeafLock<WaitList<M>>> Drop for Registration<'_, M, L> {
     }
 }
 
-/// Proof that the task's word is `Blocked` and its registration is live —
-/// what `SchedPass::dispose_block` consumes at Stage 4.
+/// Proof that the task's word is `Blocked` and its registration is live.
+/// Consumed by `SchedPass::dispose_block`.
 pub struct CommittedTicket<M> {
     shared: Arc<TaskShared<M>>,
     cpu: CpuId,
@@ -374,18 +368,16 @@ impl<'q, M: SchedMsg, L: LeafLock<WaitList<M>>> WaitTicket<'q, M, L> {
     /// Phase 2, run by the blocking pass.
     ///
     /// A park is one of §6.3's safe points, so §7.6's promise that a killed
-    /// task "dies at its next safe point" has to be kept *here*. It cannot be
-    /// kept anywhere later: the retire message that set the kill bit was
-    /// consumed by the drain this commit runs behind, and `handle_retire`
-    /// answered it with `need_resched` because the task was still the running
-    /// one. Park it anyway and nothing is left to reap it — a parked task is
-    /// never picked, the retirer waits on a word that never reaches `Dead`,
-    /// and the address space the payload holds is never released.
+    /// task "dies at its next safe point" has to be kept *here* and cannot be
+    /// kept later: `handle_retire` already consumed the retire message and
+    /// answered it with `need_resched` because the task was still running.
+    /// Park it anyway and nothing is left to reap it — a parked task is never
+    /// picked, the retirer waits on a word that never reaches `Dead`, and the
+    /// address space the payload holds is never released.
     ///
-    /// The kill check comes first because it subsumes the wake: a task that is
-    /// about to die has no use for the wake it may also have been claimed by,
-    /// and `cancel_commit` puts the word back to `Running(cpu)` either way,
-    /// which is what the exit disposition needs.
+    /// The kill check comes first because it subsumes the wake: a task about
+    /// to die has no use for a wake, and `cancel_commit` puts the word back to
+    /// `Running(cpu)` either way, which is what the exit disposition needs.
     pub fn commit(mut self) -> Commit<'q, M, L> {
         self.armed = false;
         if self.shared.kill_pending() {

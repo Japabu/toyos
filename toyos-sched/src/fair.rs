@@ -1,15 +1,6 @@
-//! Fairness policy: per-process vruntime/lag/frontier math, relocated
-//! verbatim from `kernel/src/scheduler.rs` at migration Stage 1 (spec §9.1)
-//! so the simulator exercises the exact production arithmetic. The stored-lag
-//! semantics (kernel commits `138a625d`, `c9205ce2`, `b71d0d07`) are
-//! preserved bit-identically through the machinery cutover so regressions
-//! stay attributable; policy upgrades are separate, sim-gated stages.
-//!
-//! The kernel still owns the Pid-keyed map and its lock; each map value is a
-//! [`ShareState`]. The per-task `FairShare { state: SpinSmall<ShareState> }`
-//! wrapper of spec §9.1 arrives when tasks carry their share directly
-//! (Stages 4/7) — introducing per-share locks at Stage 1 would change lock
-//! granularity, which the policy-identical requirement forbids.
+//! Fairness policy: per-process vruntime/lag/frontier math (spec §9.1). The
+//! simulator runs this exact arithmetic, so policy changes belong here and are
+//! sim-gated.
 
 use core::num::NonZeroU32;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -33,11 +24,8 @@ pub struct NotRunnable;
 
 /// The global vruntime frontier: a monotonic-non-decreasing baseline from
 /// which non-runnable processes' lag is measured (see
-/// [`ShareState::NonRunnable`]).
-///
-/// Kept global through the cutover for attributability; replaced by a
-/// per-CPU frontier with epoch reconciliation in a scheduled, sim-gated
-/// stage (spec §11 Stage 9).
+/// [`ShareState::NonRunnable`]). A per-CPU frontier with epoch reconciliation
+/// is a later, sim-gated stage (spec §11 Stage 9).
 pub struct Frontier(AtomicU64);
 
 impl Frontier {
@@ -61,45 +49,30 @@ impl Frontier {
 
 /// Per-process fair-share state.
 ///
-/// Encodes the runnable/non-runnable split in the type system:
-/// - `Runnable` means at least one thread of this process is in a CPU run
-///   queue (ready or current). The stored `vruntime` is live and accurate;
-///   it is read directly and [`ShareState::charge`] increments it.
-///   `runnable_threads: NonZeroU32` is a refcount of threads contributing
-///   to runnability — the type forbids representing "Runnable with 0
-///   threads", a state that would mean the leave→NonRunnable transition was
-///   botched.
-///   `lag_at_wake` is the clamped lag (±[`MAX_VRUNTIME_LAG_NS`]) frozen at
-///   the most recent NonRunnable→Runnable transition (0 for newly-spawned
-///   processes that have never blocked). It is the *contract value* of
-///   lag — the scheduler guarantees |lag_at_wake| ≤ MAX_VRUNTIME_LAG_NS by
-///   construction. Live `frontier - vruntime` may exceed that bound between
-///   a wake and the actual pick, but that is a diagnostic, not a contract.
-/// - `NonRunnable` means no thread is in any run queue. We do not store a
-///   stale vruntime — instead we store `lag = frontier - vruntime` from the
-///   moment of transition, clamped to ±MAX_VRUNTIME_LAG_NS. The current
-///   "effective vruntime" is computed live as `current_frontier - lag`, so
-///   the process tracks the global frontier without stored-state writes.
-///
-/// External readers ([`ShareState::vruntime`], [`ShareState::lag`], debug
-/// dumps) compute live values from this enum — there is no separate "truth
-/// function" that mutates state behind their back.
+/// A non-runnable process stores no vruntime — a stored one would go stale as
+/// the frontier moves. It stores `lag = frontier - vruntime` instead, and
+/// re-derives `vruntime = frontier - lag` on wake, so it tracks the frontier
+/// with no writes while blocked.
 pub enum ShareState {
     Runnable {
         vruntime: u64,
+        /// Threads of this process in a run queue (ready or current).
+        /// `NonZeroU32` forbids "Runnable with 0 threads", which would mean a
+        /// botched leave→NonRunnable transition.
         runnable_threads: NonZeroU32,
-        /// Clamped lag at the most recent NonRunnable→Runnable transition
-        /// (0 for processes that have never blocked since spawn). Frozen
-        /// while the process stays Runnable; refreshed only on the next
-        /// wake. This is the value reported by [`ShareState::lag`] —
-        /// bounded ±MAX_VRUNTIME_LAG_NS by the transition contract.
+        /// Clamped lag frozen at the most recent NonRunnable→Runnable
+        /// transition (0 for a process that has never blocked since spawn).
+        ///
+        /// This is the *contract* value [`ShareState::lag`] reports: bounded
+        /// ±[`MAX_VRUNTIME_LAG_NS`] by construction. Live `frontier -
+        /// vruntime` may exceed that bound between a wake and the pick, which
+        /// is a diagnostic and not a contract.
         lag_at_wake: i64,
     },
     NonRunnable {
-        /// `lag = frontier - vruntime` at the moment of last transition,
-        /// clamped to [-MAX_VRUNTIME_LAG_NS, +MAX_VRUNTIME_LAG_NS].
-        /// Positive = process is behind the frontier (entitled to catch
-        /// up). Negative = process ran ahead (will be throttled on wake).
+        /// `lag = frontier - vruntime` at the last transition, clamped to
+        /// ±[`MAX_VRUNTIME_LAG_NS`]. Positive = behind the frontier (entitled
+        /// to catch up); negative = ran ahead (throttled on wake).
         lag: i64,
     },
 }
@@ -116,15 +89,10 @@ impl ShareState {
         }
     }
 
-    /// A thread of this process is becoming runnable. Returns the vruntime
-    /// to insert with.
-    /// - First runnable thread of a NonRunnable process: re-derive vrt from
-    ///   stored lag and transition to Runnable with refcount 1, freezing
-    ///   that same lag in `lag_at_wake`.
-    /// - Subsequent runnable thread of an already-Runnable process: bump
-    ///   refcount, return the existing vrt (all threads of one process
-    ///   share vrt). `lag_at_wake` stays frozen at the value set on the
-    ///   most recent NonRunnable→Runnable edge.
+    /// A thread of this process is becoming runnable; returns the vruntime to
+    /// insert with. All threads of one process share a vruntime, so a
+    /// subsequent thread only bumps the refcount and `lag_at_wake` stays
+    /// frozen at the most recent NonRunnable→Runnable edge.
     pub fn enter_runnable(&mut self, frontier: u64) -> u64 {
         match self {
             Self::Runnable {
@@ -197,9 +165,7 @@ impl ShareState {
     }
 
     /// Live vruntime for external readers: the stored value while Runnable,
-    /// `current_frontier - lag` while NonRunnable (computed each call, so
-    /// readers always see a value tracking the frontier without stored-state
-    /// writes).
+    /// `frontier - lag` while NonRunnable.
     pub fn vruntime(&self, frontier: u64) -> u64 {
         match self {
             Self::Runnable { vruntime, .. } => *vruntime,
@@ -219,18 +185,15 @@ impl ShareState {
     }
 }
 
-/// Lag of a Runnable process: `lag = frontier - vruntime`, unclamped. Used
-/// at the leave-runnable transition, which clamps before storing. Wrapping
-/// subtraction is deliberate: vruntimes are dense in u64 and `frontier -
-/// vrt` is the signed distance regardless of whether the frontier has
-/// wrapped past vrt.
+/// `lag = frontier - vruntime`, unclamped; the caller clamps before storing.
+/// Wrapping subtraction is deliberate: vruntimes are dense in u64, and the
+/// wrapped difference is the signed distance even once the frontier has
+/// wrapped past `vrt`.
 fn live_lag(frontier: u64, vrt: u64) -> i64 {
     (frontier as i64).wrapping_sub(vrt as i64)
 }
 
-/// Convert a stored lag back to a vruntime relative to the *current*
-/// frontier: `vrt = frontier - lag`, saturating at u64 bounds. This is how
-/// a non-runnable process re-derives its vruntime when it wakes.
+/// `vrt = frontier - lag`, saturating at u64 bounds.
 fn vrt_from_lag(frontier: u64, lag: i64) -> u64 {
     if lag >= 0 {
         frontier.saturating_sub(lag as u64)
@@ -239,13 +202,9 @@ fn vrt_from_lag(frontier: u64, lag: i64) -> u64 {
     }
 }
 
-/// One process's fair-share pot, reachable from every thread of that process
+/// One process's fair-share pot, reached through any thread that owns it
 /// (spec §9.1). The cell is supplied by the environment for the reason stated
-/// on [`LeafLock`]; the kernel's is the word-sized spin the spec calls
-/// `SpinSmall`, the simulator's a plain mutex.
-///
-/// The global `sched_state: Lock<HashMap<Pid, ..>>` — one hot lock per charge
-/// — has no successor here: a share is reached through the task that owns it.
+/// on [`LeafLock`]: the kernel's is a word-sized spin, the simulator's a mutex.
 pub struct FairShare<L> {
     state: L,
 }

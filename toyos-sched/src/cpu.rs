@@ -7,10 +7,9 @@
 //!
 //! Every entry is a [`SchedPass`]: a type-state that must be disposed exactly
 //! once and can only end in [`SchedPass::finish`], which returns an [`Action`]
-//! the driver executes. When the action is returned, every borrow of
-//! `CpuSched` has ended — so there is no guard to leak across the context
-//! switch (B2) and nothing scheduler-related runs after the switch resumes
-//! (B3's post-switch parking has no place to live).
+//! the driver executes. When the action is returned every borrow of `CpuSched`
+//! has ended, so no guard can leak across the context switch and nothing
+//! scheduler-related has anywhere to run after the switch resumes.
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
@@ -37,11 +36,9 @@ use crate::waitq::{CommittedTicket, CurrentTask};
 /// records (spec §5.1); constructed only by safe code in
 /// [`SchedPass::finish`], consumed by the driver's `unsafe Hw::switch`.
 ///
-/// The keys are not in the spec's sketch. They cost two words and buy the
-/// driver — kernel *and* simulator — the ability to do its own bookkeeping
-/// (trace, the `ctx_saved` shadow of invariant I11) without dereferencing the
-/// pointers, which is the difference between a simulator that needs `unsafe`
-/// and one that does not.
+/// The keys let a driver do its own bookkeeping (trace, invariant I11's
+/// `ctx_saved` shadow) without dereferencing the pointers — which is what
+/// keeps the simulator free of `unsafe`.
 #[must_use]
 pub struct RunToken<X: SchedPayload> {
     restore: *const X::Ctx,
@@ -51,12 +48,10 @@ pub struct RunToken<X: SchedPayload> {
 }
 
 impl<X: SchedPayload> RunToken<X> {
-    /// The incoming context to restore.
     pub fn restore_ptr(&self) -> *const X::Ctx {
         self.restore
     }
 
-    /// Where the outgoing context must be saved.
     pub fn save_ptr(&self) -> *mut X::Ctx {
         self.save
     }
@@ -103,16 +98,12 @@ impl SleepToken {
 }
 
 /// What the driver must do when the pass ends.
-///
-/// The spec lists two variants. The third, [`Action::Resume`], is the honest
-/// encoding of a pass that decided not to switch (an IRQ exit where the
-/// current task keeps the CPU): folding it into `Run` would mean handing the
-/// driver a token whose `restore` and `save` are the same context, i.e.
-/// making a self-switch representable in order to avoid naming the case.
 #[must_use]
 pub enum Action<X: SchedPayload> {
     Run(RunToken<X>),
-    /// Whatever was loaded stays loaded.
+    /// The pass decided not to switch; whatever was loaded stays loaded. Its
+    /// own variant rather than a `Run` whose `restore` and `save` are the same
+    /// context, which would make a self-switch representable.
     Resume,
     /// Nothing runnable, and this CPU is already on its idle context.
     Idle(SleepToken),
@@ -120,11 +111,9 @@ pub enum Action<X: SchedPayload> {
 
 /// A parked task, plus the two facts that are only meaningful while parked.
 ///
-/// The deadline lives *here* and nowhere else (spec §6.1): a task that is not
-/// parked structurally cannot have one, so the duplicate-truth field that made
-/// "deadline of a migrated task" thinkable does not exist. The spec's `since`
-/// field is omitted for the same reason — the residency stamp already lives in
-/// the task record, and two of them would be two truths.
+/// The deadline lives *here* and nowhere else (spec §6.1), so a task that is
+/// not parked structurally cannot have one. The spec's `since` field is
+/// omitted for the same reason: the residency stamp is in the task record.
 pub struct ParkedEntry<X: SchedPayload> {
     task: BlockedTask<X>,
     deadline: Option<Nanos>,
@@ -277,20 +266,16 @@ impl<X: SchedPayload> CpuSched<X> {
     }
 }
 
-/// The escape hatch the harness self-validation gate needs, and nothing else
-/// (spec §10.3).
+/// Broken protocol shapes, reproduced for the simulator's negative gates
+/// (spec §10.3). Behind a feature the kernel does not enable, so they are not
+/// compiled into production at all.
 ///
-/// `scenarios/old_steal_port` re-creates the OLD scheduler's idle-loop steal:
-/// pop a ready task straight out of a sibling's queue, carry it unlocked on
-/// the thief's own stack, and install it later — the transit window a
-/// concurrent `retire_task` scan could not see, which is how a task came to
-/// run with its process's address space already freed.
-///
-/// It is behind a feature the simulator enables and the kernel does not, so
-/// the old protocol is not merely unused in production code: it is not
-/// compiled into it. Note what is *not* offered — no state-word transition,
-/// exactly as the old code had no per-task location record to update. That
-/// omission is the bug, and the invariant walk catches it.
+/// `scenarios::old_steal_port` uses these two to re-create the pre-cutover
+/// idle-loop steal: pop a ready task straight out of a sibling's queue, carry
+/// it unlocked on the thief's own stack, install it later. Note what is *not*
+/// offered — a state-word transition. That omission is the bug: the transit
+/// window is invisible to a concurrent retire scan, so a task can run with its
+/// address space already freed, and the invariant walk must catch it.
 #[cfg(feature = "protocol-port")]
 impl<X: SchedPayload> CpuSched<X> {
     pub fn steal_ready(&mut self) -> Option<ReadyTask<X>> {
@@ -302,17 +287,11 @@ impl<X: SchedPayload> CpuSched<X> {
         self.rq.insert(vruntime, task);
     }
 
-    /// Restore the park that commit `9c2fc4d` shipped: clear the borrowed
-    /// window at a park only `if now >= until`, so a lend taken and then
-    /// blocked on before it ran out survives the block. With
-    /// [`crate::task::RtState::arm`] re-arming at the next dispatch, that is a
-    /// task holding inherited RT forever off one lend — §8.5's hole reached by
-    /// blocking rather than by spinning.
-    ///
-    /// Invariant I9 is written to catch exactly this, and
-    /// `scenarios::old_park_kept_the_lend` is the negative gate that proves it
-    /// does. Like `steal_ready`, it is behind a feature the kernel does not
-    /// enable, so the broken shape is not compiled into production at all.
+    /// Clear the borrowed window at a park only `if now >= until`, so a lend
+    /// blocked on before it ran out survives the block — which with
+    /// [`crate::task::RtState::arm`] re-arming at the next dispatch is a task
+    /// holding inherited RT forever off one lend. Invariant I9 must catch it;
+    /// `scenarios::old_park_kept_the_lend` is the gate that proves it does.
     pub fn set_park_keeps_lapsed_lend(&mut self, keep: bool) {
         self.park_keeps_lapsed_lend = keep;
     }
@@ -329,11 +308,8 @@ pub struct Env<'e, H: Hw, P: PreemptGuard> {
     /// mailbox pushes need (N3).
     pub preempt: &'e P,
     /// Whether an idle pass probes for work and a loaded pass answers probes
-    /// (spec §7.7, §9.4's pull half). Migration stage 7a cut the kernel over
-    /// with this **off** — wake-time push placement only — so that the
-    /// machinery change could be measured without balance moving underneath
-    /// it; 7b turned it on. Both settings stay compiled and simulatable, which
-    /// is why it is a field and not a `cfg`.
+    /// (spec §7.7, §9.4's pull half). A field and not a `cfg` so that both
+    /// settings stay compiled and simulatable.
     pub steal: bool,
 }
 
@@ -374,23 +350,19 @@ impl<X: SchedPayload> CpuSched<X> {
 
     /// Hand a dead task's payload back to the environment. The linear value is
     /// consumed here and nowhere else, so the address-space `Arc` inside it is
-    /// released exactly once — the crash.md double-drop, made unwritable.
+    /// released exactly once.
     fn release<H: Hw<Payload = X>, P: PreemptGuard>(&self, dead: DeadTask<X>, env: Env<'_, H, P>) {
         let (key, payload, acct) = dead.finalize();
         env.hw.release(key, payload, acct);
     }
 
-    /// Every death goes through here.
+    /// Every death goes through here — including the reap paths, not just the
+    /// exit path (invariant I11).
     ///
     /// A task whose context is the one this CPU is *currently executing on*
-    /// cannot be handed back yet — in the kernel that record owns the kernel
+    /// cannot be handed back yet: in the kernel that record owns the kernel
     /// stack under the running `rsp`. It becomes the zombie and is finalized
     /// by the next pass, which by then runs on another context.
-    ///
-    /// The simulator found this: a killed task preempted into the run queue
-    /// and reaped at the pick, all inside one pass, was released while the CPU
-    /// still stood on its stack (invariant I11). The exit path had the zombie
-    /// slot; the reap paths went straight to `release`.
     fn dispose_dead<H: Hw<Payload = X>, P: PreemptGuard>(
         &mut self,
         dead: DeadTask<X>,
@@ -540,14 +512,13 @@ impl<X: SchedPayload> CpuSched<X> {
         }
         if self.running.as_ref().is_some_and(|r| r.key() == key) {
             // A running task cannot be yanked out from under its own kernel
-            // stack. It dies at its next safe point, bounded by the quantum
+            // stack; it dies at its next safe point, bounded by the quantum
             // (spec §7.6). Consuming the message here is only sound because
             // the sticky kill bit outlives it and *every* safe point honours
             // it: the pick reaps a killed ready task, and `WaitTicket::commit`
-            // refuses to park a killed one. That last arm is not decoration —
-            // parking is a safe point too (§6.3), and a task that parked
-            // through this window would never be picked again, so nothing
-            // would ever reap it.
+            // refuses to park a killed one. Without that second arm a task that
+            // parked through this window would never be picked again, so
+            // nothing would ever reap it.
             env.hw.need_resched(self.id);
             return;
         }
@@ -653,10 +624,9 @@ pub struct SchedPass<'c, 'e, H: Hw, P: PreemptGuard, S: PassState> {
 impl<'c, 'e, H: Hw, P: PreemptGuard> SchedPass<'c, 'e, H, P, Undisposed> {
     /// Enter the scheduler.
     ///
-    /// `now` is sampled ONCE by the driver and threaded as a value: the old
-    /// scheduler read the clock about fifteen times mid-flight, which is
-    /// irreproducible in a simulator and was the source of the
-    /// deadline-versus-arming skew (B5).
+    /// `now` is sampled ONCE by the driver and threaded as a value. Re-reading
+    /// the clock mid-pass is irreproducible in a simulator and skews a deadline
+    /// against the arming computed from it.
     ///
     /// Entry order is load-bearing: clear the doorbell edge *before* draining
     /// (so a message posted after the drain re-raises it, §7.3), free the
@@ -786,8 +756,8 @@ impl<H: Hw, P: PreemptGuard> SchedPass<'_, '_, H, P, Disposed> {
     /// The only exit. Picks the next task, answers steal requests from
     /// surplus, publishes load, and — LAST — programs the timer. Arming after
     /// every heap mutation is the whole proof of invariant T (spec §8.4):
-    /// there is no window between the last mutation and the arming, so
-    /// "deadline exists but timer unarmed" is not a state the code can be in.
+    /// with no window between the last mutation and the arming, "deadline
+    /// exists but timer unarmed" is not a state the code can be in.
     pub fn finish(mut self) -> Action<<H as Hw>::Payload> {
         loop {
             self.preempt_if_due();
@@ -805,10 +775,8 @@ impl<H: Hw, P: PreemptGuard> SchedPass<'_, '_, H, P, Disposed> {
             }
             match self.try_sleep() {
                 Ok(action) => return action,
-                // A message landed between the drain and the final check.
-                // Consume it and decide again — this is the retry loop the
-                // sleep handshake needs, kept where the state to retry with
-                // lives.
+                // A message landed between the drain and the final check:
+                // consume it and decide again (spec §7.5).
                 Err(()) => continue,
             }
         }
@@ -837,20 +805,14 @@ impl<H: Hw, P: PreemptGuard> SchedPass<'_, '_, H, P, Disposed> {
         if self.cpu.running.is_some() {
             return;
         }
-        // A lapsed window is deliberately not checked here, and the task is not
-        // demoted out of the RT band for having one. Waiting in a queue spends
-        // no borrowed priority, so a lend that ran out while its holder was
-        // still queued was never spent at all; `ReadyTask::dispatch` re-arms it.
-        // Demoting instead — which is what this loop used to do — inverted the
-        // lend, dropping the task behind every normal task that queued while it
-        // waited, and it starved a boosted audio client for 93 ms behind a CPU
-        // hog. The band therefore stays chosen at insert, as before.
+        // A lapsed borrowed window must not demote the task out of the RT band
+        // here: queue time spends none of it, so `ReadyTask::dispatch` re-arms
+        // it instead. The band stays whatever it was at insert.
         while let Some((vruntime, task)) = self.cpu.rq.pop_next() {
             if task.shared().kill_pending() {
-                // The kill bit is checked here rather than asserted absent in
-                // `dispatch`: a remote CPU sets it at any instant, so an
-                // assert would be a race. Reaping at the pick gives the same
-                // guarantee with no false positive.
+                // Checked here rather than asserted absent in `dispatch`: a
+                // remote CPU sets the bit at any instant, so an assert would be
+                // a race. Reaping at the pick has no false positive.
                 task.share().leave_runnable(self.env.frontier);
                 let key = task.key();
                 let dead = task.reap(self.cpu.id, self.now);
@@ -889,8 +851,6 @@ impl<H: Hw, P: PreemptGuard> SchedPass<'_, '_, H, P, Disposed> {
         }
     }
 
-    /// Program the timer from `min(quantum_end, valid deadline min)` and
-    /// record what was armed.
     fn apply_timer(&mut self) -> TimerApplied {
         let deadline = self.cpu.deadlines.min_valid(&Parked(&self.cpu.parked));
         let quantum = self.cpu.running.as_ref().map(|_| self.cpu.quantum_end);
@@ -900,9 +860,9 @@ impl<H: Hw, P: PreemptGuard> SchedPass<'_, '_, H, P, Disposed> {
             TimerPlan::Stop => self.env.hw.stop_timer(),
         }
         self.cpu.armed = plan.armed();
-        // Checked here rather than anywhere earlier in the pass: invariant T
-        // is a statement about a CPU *outside* a pass, and the arming that
-        // makes it true is the last thing a pass does.
+        // Invariant T is a statement about a CPU *outside* a pass, and the
+        // arming that makes it true is the last thing a pass does — so the
+        // check cannot move earlier.
         #[cfg(feature = "check")]
         crate::invariants::check_cpu(self.cpu);
         TimerApplied::new(plan.armed())
@@ -1006,10 +966,8 @@ impl<H: Hw, P: PreemptGuard> SchedPass<'_, '_, H, P, Disposed> {
     }
 }
 
-/// The globally shared, `Sync` face of a CPU. There is no global array of
-/// `CpuSched` — a `static` of a `!Sync` type does not compile — so this is
-/// the whole remote surface: post a message, ring the doorbell, read the
-/// published load (spec §6.1).
+/// The globally shared, `Sync` face of a CPU, and the whole remote surface:
+/// post a message, ring the doorbell, read the published load (spec §6.1).
 pub struct CpuHandle<M> {
     id: CpuId,
     post: MailboxProducer<M>,

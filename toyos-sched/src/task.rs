@@ -1,11 +1,10 @@
 //! Task identity, the rendezvous state word, and the CAS protocol every
 //! wake, timeout and retire arbitrates through (spec §5.3, §8.2, §8.3).
 //!
-//! Ownership truth is the linear `Task` value and the container it sits in;
-//! those land with the per-CPU machine at migration Stage 4. What lives here
-//! is the *runtime shadow* remote CPUs need: one atomic word plus the two
-//! embedded mailbox nodes, inside an `Arc<TaskShared>` that outlives the
-//! task's death so a late message about a dead task is a benign no-op.
+//! Ownership truth is the linear `Task` value and the container it sits in.
+//! [`TaskShared`] is the *runtime shadow* remote CPUs need: one atomic word
+//! plus the two embedded mailbox nodes, in an `Arc` that outlives the task's
+//! death so a late message about a dead task is a benign no-op.
 
 use alloc::boxed::Box;
 use core::ptr::addr_of_mut;
@@ -207,10 +206,9 @@ fn unpack(word: u64) -> TaskState {
     }
 }
 
-/// The complete set of legal edges, in one place, mirroring the §5.2
-/// transition table. Anything else is a scheduler bug and panics at the
-/// transition instead of corrupting the shadow silently — the fail-fast layer
-/// that would have preserved crash.md's evidence.
+/// The complete set of legal edges, mirroring the §5.2 transition table.
+/// Anything else is a scheduler bug and panics at the transition rather than
+/// corrupting the shadow silently.
 fn legal(from: TaskState, to: TaskState) -> bool {
     use TaskState::*;
     match (from, to) {
@@ -265,9 +263,8 @@ pub enum ParkOutcome {
 }
 
 /// The rendezvous word plus the embedded nodes every remote effect rides on.
-///
 /// Generic over the mailbox message type so the primitives stay free of the
-/// task payload; Stage 4 pins `M = Msg<X>`.
+/// task payload.
 pub struct TaskShared<M> {
     key: TaskKey,
     /// `{discriminant, cpu, commit generation}` plus the sticky KILL and
@@ -474,16 +471,11 @@ pub struct RtState {
     /// Lent by a waker. Holds the instant the lend runs out; re-armed at
     /// dispatch if it lapsed while the task was queued (see [`RtState::arm`]).
     pub inherited: Option<Nanos>,
-    /// How many lends this task has been granted — bumped only when one
-    /// actually extends the window, so a lend that hands over no new time
-    /// buys none either.
-    ///
-    /// It exists to make invariant I9 *checkable*. I9 bounds running time at
-    /// the borrowed priority **per lend**, and "per lend" is not derivable from
-    /// the outside: [`RtState::arm`] moves `inherited` forward too, so an
-    /// observer watching the deadline cannot tell a fresh grant from a re-arm,
-    /// and a check that cannot tell them apart is a check with no teeth. Same
-    /// argument that puts [`TaskAccounting`] here for I7.
+    /// Lends that actually extended the window. Lives in the core so that
+    /// invariant I9 — running time at the borrowed priority, *per lend* — is
+    /// checkable at all: [`RtState::arm`] moves `inherited` forward too, so an
+    /// outside observer watching the deadline cannot tell a fresh grant from a
+    /// re-arm.
     pub lends: u32,
 }
 
@@ -503,18 +495,14 @@ impl RtState {
         }
     }
 
-    /// Called at `park`, where the hold ends outright — this is audio spec
-    /// §9.4's "the promotion lasts until the promoted thread blocks again", and
-    /// the pre-cutover scheduler's clear-at-deschedule.
+    /// Called at `park`, where the hold ends outright (audio spec §9.4: "the
+    /// promotion lasts until the promoted thread blocks again").
     ///
-    /// Unconditional, and it has to be. A conditional clear leaves a lend alive
-    /// across a block taken before the window ran out, and [`RtState::arm`] then
-    /// re-arms it at the next dispatch — so a task that obtains one lend and
-    /// thereafter runs less than a quantum before blocking holds inherited RT
-    /// forever, off a single pipe interaction and with no further lend from
-    /// anyone. That is §8.5's hole reached by blocking instead of by spinning,
-    /// and invariant I9 is written to catch it (`sim::scenarios::old_park_kept_the_lend`
-    /// is the negative gate).
+    /// Unconditional, and it has to be: a clear gated on `now >= until` leaves
+    /// a lend alive across a block taken before the window ran out, and
+    /// [`RtState::arm`] re-arms it at the next dispatch — so a task that runs
+    /// less than a quantum before blocking would hold inherited RT forever off
+    /// a single lend. Negative gate: `sim::scenarios::old_park_kept_the_lend`.
     ///
     /// Costs the audio path nothing: every wake that matters re-lends, either
     /// through `WakeCause::boost` or at the pipe consume point.
@@ -524,20 +512,17 @@ impl RtState {
 
     /// Called at `dispatch`. A window that lapsed while the task was *queued*
     /// was never spent — waiting for a CPU is the opposite of holding a
-    /// priority — so it is re-armed rather than dropped. Dropping it is what
-    /// the pre-fix code did, and it inverted the lend: the task fell out of the
-    /// RT band into the fair band, behind exactly the normal-priority work the
-    /// lend existed to jump. Measured on the audio path, that demotion starved
-    /// a boosted client for 93 ms behind a CPU hog.
+    /// priority — so it is re-armed rather than dropped. Dropping it inverts
+    /// the lend: the task falls out of the RT band, behind exactly the
+    /// normal-priority work the lend existed to jump, and nothing re-grants it.
     ///
     /// Re-arming cannot compound into an unbounded RT hold, because both ways
     /// out of `Running` end the lend. A boosted task is RT, so `preempt_if_due`
-    /// only preempts it at its quantum end — never earlier — and that quantum
-    /// starts at the same dispatch this arms from, so `now >= until` always
-    /// holds there and [`RtState::expire`] clears it. A `park` clears it
-    /// outright, whatever the clock says. Either way a second arm needs a *new*
-    /// lend, so one lend buys at most one quantum of running time at the
-    /// borrowed priority (spec §8.5, invariant I9).
+    /// only preempts it at its quantum end, and that quantum starts at the same
+    /// dispatch this arms from — so `now >= until` holds there and
+    /// [`RtState::expire`] clears it; a `park` clears it whatever the clock
+    /// says. A second arm therefore needs a *new* lend, and one lend buys at
+    /// most one quantum at the borrowed priority (spec §8.5, invariant I9).
     fn arm(&mut self, now: Nanos) {
         if let Some(until) = self.inherited {
             if now >= until {
@@ -559,10 +544,8 @@ pub struct TaskAccounting {
 
 /// The single owning value for a live thread. `!Copy`, `!Clone`.
 ///
-/// `Box`: the record has a stable heap address for the task's whole life, so
-/// a raw context pointer taken before a container move stays valid — the
-/// enabling condition for B1 (bitwise-moved `TaskCtx` across five containers)
-/// is removed rather than documented.
+/// `Box` so the record has a stable heap address for the task's whole life:
+/// a raw context pointer taken before a container move stays valid.
 pub struct Task<X: SchedPayload>(Box<TaskInner<X>>);
 
 struct TaskInner<X: SchedPayload> {
@@ -579,8 +562,8 @@ struct TaskInner<X: SchedPayload> {
     /// This task's `Adopt` message rides inside its own record (spec §7.2).
     adopt_node: MailboxNode<Msg<X>>,
     /// Taken by [`DeadTask::finalize`]; still present at drop means the task
-    /// value was dropped or leaked outside the one legal death — the B1
-    /// double-drop class, converted into a loud panic at the exact site.
+    /// value died outside the one legal death, and the drop bomb below turns
+    /// that into a panic at the site instead of a later double-drop.
     ext: Option<X>,
 }
 
@@ -620,9 +603,8 @@ impl<X: SchedPayload> Task<X> {
         &self.0.acct
     }
 
-    /// The stable address of the saved context, for [`crate::cpu::RunToken`].
-    /// Safe to form: the record is boxed, so this address outlives every
-    /// container move the task will make.
+    /// The stable address of the saved context, for [`crate::cpu::RunToken`]:
+    /// the record is boxed, so it outlives every container move the task makes.
     pub(crate) fn ctx_ptr(&mut self) -> *mut X::Ctx {
         addr_of_mut!((*self.0).ctx)
     }
@@ -844,14 +826,12 @@ impl<X: SchedPayload> RunningTask<X> {
     /// that no wake was lost between registration and commit (spec §8.1) —
     /// there is no way to park without one.
     ///
-    /// The word may read `WakeQueued(cpu)` rather than `Blocked(cpu)`: a waker
-    /// is allowed to claim a `Blocked` task the instant the commit publishes it,
-    /// and there are instructions between the commit and this call. That claim
-    /// posted `Msg::Wake` to *this* CPU, and this pass has already drained its
-    /// mailbox — so the message is handled by the next pass, which finds the
-    /// task in `parked`. Parking it is therefore correct, and refusing to would
-    /// be asserting that a remote CPU cannot act between two of our own
-    /// instructions.
+    /// The word may read `WakeQueued(cpu)` rather than `Blocked(cpu)`, and
+    /// parking anyway is correct: a waker may claim a `Blocked` task the
+    /// instant the commit publishes it, and its `Msg::Wake` went to *this* CPU,
+    /// whose mailbox this pass has already drained — so the next pass handles
+    /// it and finds the task in `parked`. Refusing would be asserting that a
+    /// remote CPU cannot act between two of our own instructions.
     pub(crate) fn park(
         self,
         ticket: &CommittedTicket<Msg<X>>,
@@ -960,10 +940,9 @@ impl<X: SchedPayload> BlockedTask<X> {
 }
 
 impl<X: SchedPayload> DeadTask<X> {
-    /// The only legal death, exactly once — the linear value is consumed, so
+    /// The only legal death, exactly once: the linear value is consumed, so
     /// the environment's payload (the kernel's address-space `Arc`) is
-    /// released exactly once by construction. This is the crash.md UAF made
-    /// unwritable.
+    /// released exactly once by construction.
     pub(crate) fn finalize(mut self) -> (TaskKey, X, TaskAccounting) {
         let key = self.0 .0.key;
         let acct = self.0 .0.acct;

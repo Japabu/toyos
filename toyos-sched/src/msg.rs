@@ -5,10 +5,8 @@
 //! overflow unrepresentable (§7.2): a queue that cannot drop a message cannot
 //! lose a task, because the message is the task.
 //!
-//! The spec sketches this enum inside `mailbox.rs`. It lives in its own module
-//! instead, so that the crate's single `#[allow(unsafe_code)]` island stays
-//! exactly the intrusive-list code and does not silently cover the message
-//! vocabulary as well.
+//! Its own module rather than part of `mailbox.rs`, so that the crate's single
+//! `#[allow(unsafe_code)]` island stays exactly the intrusive-list code.
 
 use crate::hw::CpuId;
 use crate::mailbox::{MailboxNode, SchedMsg};
@@ -48,15 +46,12 @@ impl<X: SchedPayload> SchedMsg for Msg<X> {
         Msg::Wake { key, cause }
     }
 
-    /// The spec's `Retire { key, notify: TaskRef }` carries the joiner to wake
-    /// once the reap completes. Deliberately absent, and settled at stage 7b:
-    /// join is an ordinary `wake_direct` on the exiting task's own waiters
-    /// (spec §8.6), so the notify field would be a second wake path — precisely
-    /// what §8.2 exists to prevent. It would also have to survive the message,
-    /// since a *running* target consumes the retire and then dies at some later
-    /// safe point. The environment's finalize sink is where both problems
-    /// vanish: it runs exactly once per task, after the payload is gone, and it
-    /// is the environment's own code, so the wait belongs there.
+    /// The spec's `Retire { key, notify: TaskRef }` field is deliberately
+    /// absent: a notify riding the message would be a second wake path (what
+    /// §8.2 exists to prevent) and would have to outlive the message anyway,
+    /// since a *running* target consumes the retire and dies at some later
+    /// safe point. Joiners wait on the environment's finalize sink instead,
+    /// which runs exactly once per task and after the payload is gone.
     fn retire(shared: Arc<TaskShared<Msg<X>>>) -> Self {
         Msg::Retire { shared }
     }

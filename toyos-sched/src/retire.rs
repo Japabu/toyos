@@ -1,12 +1,9 @@
-//! The retire protocol — spec §7.6. Replaces `retire_task`'s global scans,
-//! `KILLED[16]`, `WAKE_TRANSITS` and the 1 s timeout panic with a sticky kill
-//! bit plus a message chase whose termination argument is one sentence: the
-//! kill bit is already set when the message is posted, so whichever CPU ends
-//! up owning the task converts it to a dead task on arrival, and the chase is
-//! bounded by the number of in-flight hops (≤1 in practice).
+//! The retire protocol — spec §7.6: a sticky kill bit plus a message chase.
 //!
-//! Nothing here scans anything, and there is no proof-of-absence step: the
-//! home CPU recorded in the state word *is* the proof.
+//! Termination argument: the kill bit is already set when the message is
+//! posted, so whichever CPU ends up owning the task converts it to a dead task
+//! on arrival, and the chase is bounded by the number of in-flight hops (≤1 in
+//! practice). Nothing scans; the home CPU in the state word is the proof.
 
 use crate::cpu::CpuHandles;
 use crate::hw::{CpuId, Kicker};
@@ -22,12 +19,8 @@ pub struct RetireTicket<'a, M> {
 }
 
 /// Claim the right to retire `shared`: sets the sticky KILL and
-/// RETIRE_QUEUED bits.
-///
-/// Panics if a retire is already queued. A second concurrent retire of one
-/// task is a kernel bug, not a condition to tolerate — the old code's
-/// 16-slot `KILLED` table and its "too many concurrent retires" panic existed
-/// only because there was no single-retirer invariant to lean on.
+/// RETIRE_QUEUED bits. Panics if a retire is already queued — a second
+/// concurrent retire of one task is a kernel bug, not a condition to tolerate.
 pub fn begin<M>(shared: &Arc<TaskShared<M>>) -> RetireTicket<'_, M> {
     assert!(
         shared.claim_retire(),

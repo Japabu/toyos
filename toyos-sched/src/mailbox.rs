@@ -21,8 +21,7 @@
 //!   nodes live in the `Arc<TaskShared>` / boxed task record the message is
 //!   about, and the retire protocol keeps them alive until the home CPU has
 //!   consumed the message. Dropping a node while a message from it is queued
-//!   is caught by [`MailboxNode`]'s drop bomb — loudly, before the memory is
-//!   released, in the fail-fast spirit of the rest of the crate.
+//!   is caught by [`MailboxNode`]'s drop bomb, before the memory is released.
 //! * **N3 (preempt-disabled push).** Every producer pushes inside a
 //!   preempt-disabled region: [`MailboxProducer::post`] demands a
 //!   [`PreemptGuard`], so a caller *cannot* type an unguarded push. See the
@@ -37,13 +36,9 @@ use core::ptr;
 use crate::sync::{Arc, AtomicBool, AtomicPtr, AtomicU32, Ordering};
 use crate::task::{TaskKey, TaskShared, WakeCause};
 
-/// The message vocabulary the primitives need to speak.
-///
-/// The full message set of spec §7.1 — including the ownership-carrying
-/// `Adopt { task: TransitTask<X> }`, which only exists once tasks are linear
-/// values — is defined by the environment at Stage 4. Wait queues and the
-/// retire protocol construct only these two, so they stay free of the task
-/// payload type.
+/// The message vocabulary the primitives need to speak. Wait queues and the
+/// retire protocol construct only these two, which is what keeps them free of
+/// the task payload type; [`crate::msg::Msg`] is the full set of spec §7.1.
 pub trait SchedMsg: Send + Sized {
     fn wake(key: TaskKey, cause: WakeCause) -> Self;
 
