@@ -68,35 +68,24 @@ misbehaving process starves everything.
 
 ## 2. The panic path
 
-### A panic needing the allocator lock the panicking thread holds produces no output
+### A panic holding the allocator lock wedges the recovered CPU
 
-**This is its own task — do not fold it into an unrelated commit.**
+The *reporting* half is fixed: `e9f3356` flushes the crash report in the panic
+handler itself, before the recovery branch, so the report reaches serial even if
+nothing on that CPU ever runs again (measured byte-identical on the recovering
+path, and the flush is idempotent against the `halt_all_cpus` one).
 
-`mm/alloc.rs:12`'s >2 MiB assert fires inside `KernelPageSource::alloc`, which
-runs while `KernelAllocator::alloc` holds `self.dlmalloc.lock()` (`alloc.rs:78`).
-The *reporting* half of the panic path is already allocation-free and correct —
-`log!`, `crash_report`, symbolization, both backtraces and `panic_flush` use
-fixed/static buffers. Two separate causes do the damage:
-
-1. `crash_report` writes into the 64 KiB static log ring, and the only drains are
-   `panic_flush` (called from `apic::halt_all_cpus`) and opportunistic `try_lock`
-   drains. On the *syscall* path `main.rs:139` branches into
-   `try_recover_from_panic` → `cpu_idle_loop` and never reaches `halt_all_cpus`,
-   so the ring is never drained.
-2. The idle loop then allocates or frees (watcher-list `Vec` clones in
-   `net.rs`/`audio.rs`, the mailbox drain's `Box`ed task records, BTreeMap frees)
-   and spins on the held lock. `dealloc` takes the same lock, so a free is as
-   fatal as an alloc.
-
-The reentry guard cannot help: a spin is not a panic, and `main.rs:140` disarms
-the guard before recovery anyway.
-
-Cheapest real fix is one line — call `panic_flush()` at `main.rs:135`, right
-after `crash_report` and before the recovery branch, mirroring the early-panic
-branch at `main.rs:108`. A `Lock` escape hatch is also cheap: `force_unlock`
-already exists (`sync.rs:98`) and `PANIC_DEPTH` (`main.rs:77`) is already a
-GS-independent per-CPU panic flag to key off. There is no `#[alloc_error_handler]`,
-so a null return from dlmalloc wedges identically with a worse message.
+What remains: `mm/alloc.rs:12`'s >2 MiB assert fires inside
+`KernelPageSource::alloc` while `KernelAllocator::alloc` holds
+`self.dlmalloc.lock()` (`alloc.rs:78`). After `try_recover_from_panic` rejoins
+the scheduler, the idle loop's first allocation or free (watcher-list `Vec`
+clones in `net.rs`/`audio.rs`, mailbox `Box`es, BTreeMap frees — `dealloc` takes
+the same lock) spins forever on the lock the dead thread still holds. The
+reentry guard cannot help: a spin is not a panic, and `main.rs` disarms the
+guard before recovery anyway. Same family as the `PROCESS_TABLE` hang below —
+any fix should cover both (a per-CPU in-panic flag that poisons or force-releases
+locks the dying thread holds). There is no `#[alloc_error_handler]`, so a null
+return from dlmalloc wedges identically with a worse message.
 
 ### A panic while holding `PROCESS_TABLE` hangs the panicking CPU
 
