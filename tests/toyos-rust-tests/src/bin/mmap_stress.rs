@@ -55,5 +55,34 @@ fn main() {
         unsafe { munmap(ptr, size) }.expect("munmap failed");
     }
 
+    // A FIXED mapping is placed at exactly the address asked for, so a request
+    // the 2 MiB page granularity cannot express is refused rather than rounded:
+    // rounding down under-maps the range the caller is told it got, and
+    // rounding up maps past the end of the backing allocation.
+    let scratch = unsafe {
+        mmap(core::ptr::null_mut(), page_2m, MmapProt::READ | MmapProt::WRITE,
+             MmapFlags::ANONYMOUS | MmapFlags::PRIVATE)
+    };
+    assert!(!scratch.is_null(), "scratch mmap failed");
+    unsafe { munmap(scratch, page_2m) }.expect("scratch munmap failed");
+
+    for skew in [0x1000usize, page_2m - 0x1000, 1] {
+        let misaligned = scratch.wrapping_add(skew);
+        let got = unsafe {
+            mmap(misaligned, page_2m, MmapProt::READ | MmapProt::WRITE,
+                 MmapFlags::ANONYMOUS | MmapFlags::PRIVATE | MmapFlags::FIXED)
+        };
+        assert!(got.is_null(), "FIXED accepted a misaligned address {misaligned:p}");
+    }
+
+    let fixed = unsafe {
+        mmap(scratch, page_2m, MmapProt::READ | MmapProt::WRITE,
+             MmapFlags::ANONYMOUS | MmapFlags::PRIVATE | MmapFlags::FIXED)
+    };
+    assert_eq!(fixed, scratch, "FIXED did not honour an aligned address");
+    unsafe { fixed.add(page_2m - 1).write(0xA5) };
+    assert_eq!(unsafe { fixed.add(page_2m - 1).read() }, 0xA5);
+    unsafe { munmap(fixed, page_2m) }.expect("FIXED region could not be freed");
+
     println!("all mmap stress tests passed (64 regions, no overlaps)");
 }

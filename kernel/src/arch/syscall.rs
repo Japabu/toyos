@@ -1084,18 +1084,25 @@ fn sys_mmap(req_addr: u64, size: u64, _prot: u64, flags: u64) -> u64 {
     // shared kernel page directory. One unprivileged syscall was a
     // user-writable window onto physical memory of the caller's choosing,
     // visible to the kernel and to every other process.
+    //
+    // A 2 MiB-page kernel cannot honour a finer-grained `req_addr`, and there
+    // is nothing to clamp a request to when the granularity itself is what
+    // cannot be met, so a misaligned one is refused rather than rounded. That
+    // is also what `toyos-abi`'s `mmap` documents, and it keeps `start ==
+    // req_addr`, so the address recorded in `mmap_regions` is the one handed
+    // back and `munmap` can find it.
     let fixed_start = if fixed && req_addr != 0 {
-        let start = req_addr & !(crate::mm::PAGE_2M - 1);
-        let Some(end) = start.checked_add(aligned as u64) else {
+        let Some(end) = req_addr.checked_add(aligned as u64) else {
             return SyscallError::InvalidArgument.to_u64();
         };
-        if start < crate::vma::ALLOC_FLOOR
+        if req_addr & (crate::mm::PAGE_2M - 1) != 0
+            || req_addr < crate::vma::ALLOC_FLOOR
             || end > crate::vma::ALLOC_CEILING
-            || !crate::user_ptr::check_user_range(UserAddr::new(start), aligned as u64)
+            || !crate::user_ptr::check_user_range(UserAddr::new(req_addr), aligned as u64)
         {
             return SyscallError::InvalidArgument.to_u64();
         }
-        Some(start)
+        Some(req_addr)
     } else {
         None
     };
