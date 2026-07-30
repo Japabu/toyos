@@ -78,7 +78,6 @@ impl SymbolTable {
             Err(_) => return Self::empty(),
         };
 
-        // Find .symtab section header
         let shdrs = match elf.section_headers() {
             Some(s) => s,
             None => return Self::empty(),
@@ -101,7 +100,6 @@ impl SymbolTable {
 
         if symtab_off + symtab_size > data.len() { return Self::empty(); }
 
-        // Get linked strtab
         let strtab_shdr = match shdrs.get(link) {
             Ok(s) => s,
             Err(_) => return Self::empty(),

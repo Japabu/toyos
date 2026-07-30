@@ -195,7 +195,6 @@ static BITMAP: Lock<Bitmap> = Lock::new(Bitmap::new());
 pub(super) fn init(entries: &[MemoryMapEntry], reserved: &[Region]) {
     let mut bm = BITMAP.lock();
 
-    // Find the range of usable physical memory.
     let mut lo = u64::MAX;
     let mut hi = 0u64;
     for entry in entries.iter().filter(|e| is_usable(e)) {
@@ -212,7 +211,6 @@ pub(super) fn init(entries: &[MemoryMapEntry], reserved: &[Region]) {
     bm.page_count = ((hi - lo) / PAGE_2M) as usize;
     assert!(bm.page_count <= MAX_PAGES, "pmm: physical memory exceeds {} GB", MAX_PAGES * 2 / 1024);
 
-    // Mark usable pages as free (skip reserved regions).
     for entry in entries.iter().filter(|e| is_usable(e)) {
         let start = (entry.start + PAGE_2M - 1) & !(PAGE_2M - 1);
         let end = entry.end & !(PAGE_2M - 1);

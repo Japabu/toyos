@@ -23,7 +23,6 @@ fn test_mutex() {
     let v = data.lock().unwrap();
     assert_eq!(v.len(), 400, "expected 400 items, got {}", v.len());
 
-    // Verify all values present
     let mut sorted = v.clone();
     sorted.sort();
     sorted.dedup();
@@ -79,7 +78,6 @@ fn test_rwlock() {
     let data = Arc::new(RwLock::new(0u64));
     let mut handles = Vec::new();
 
-    // 4 reader threads
     for _ in 0..4 {
         let data = Arc::clone(&data);
         handles.push(thread::spawn(move || {
@@ -90,7 +88,6 @@ fn test_rwlock() {
         }));
     }
 
-    // 1 writer thread
     {
         let data = Arc::clone(&data);
         handles.push(thread::spawn(move || {

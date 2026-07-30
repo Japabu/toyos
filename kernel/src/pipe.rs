@@ -281,7 +281,6 @@ fn close_read(pipe_id: PipeId) {
             free_pipe(pipe);
             None // pipe freed, no one to wake
         } else if pipe.readers == 0 {
-            // Writers need to discover broken pipe
             Some(pipe.io_uring_watchers.clone())
         } else {
             None
@@ -310,7 +309,6 @@ fn close_write(pipe_id: PipeId) {
             free_pipe(pipe);
             None // pipe freed, no one to wake
         } else if pipe.writers == 0 {
-            // Readers need to discover EOF
             Some(pipe.io_uring_watchers.clone())
         } else {
             None

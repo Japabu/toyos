@@ -86,7 +86,6 @@ impl QemuInstance {
     ) -> Self {
         let repo = compile::repo_root();
 
-        // Package test binaries as extra initrd files
         let mut extra_files: Vec<(String, Vec<u8>)> = Vec::new();
         for (name, data) in c_tests {
             extra_files.push((format!("bin/test_c_{name}"), data.clone()));

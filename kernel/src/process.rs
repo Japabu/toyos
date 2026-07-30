@@ -440,7 +440,6 @@ impl PageFaultTrace {
 /// ELF loading artifacts and TLS state.
 pub struct ElfInfo {
     pub elf_alloc: Option<OwnedAlloc>,
-    // Thread-local storage (process-level: template, modules, layout)
     pub tls_template: Option<crate::mm::KernelSlice>,
     pub tls_memsz: usize,
     /// Multi-module TLS layout per loaded library.
@@ -482,7 +481,6 @@ pub struct ProcessData {
     /// ELF loading artifacts and TLS state.
     pub elf: ElfInfo,
 
-    // Anonymous memory mappings (mmap)
     pub mmap_regions: Vec<MmapRegion>,
     /// 2MB allocations for demand-paged pages. Freed on process exit.
     pub demand_pages: Vec<PageAlloc>,
@@ -874,7 +872,6 @@ fn teardown_resources(
         scheduler::flush_current_stats(&mut data.accounting);
     }
 
-    // Print syscall profile for processes with significant activity
     if syscall_total > 0 {
         use alloc::string::String;
         use core::fmt::Write;
@@ -888,13 +885,11 @@ fn teardown_resources(
         log!("syscalls: pid={pid} total={} syscall_wall={wall_ms}ms{profile}", syscall_total);
     }
 
-    // Print memory stats
     if data.peak_memory > 0 || data.alloc_count > 0 {
         log!("memory: pid={pid} peak={}MB allocs={} frees={}",
             data.peak_memory / (1024 * 1024), data.alloc_count, data.free_count);
     }
 
-    // Free resources
     fd::close_all(&mut data.fds, &mut *vfs::lock(), pid);
     data.elf.elf_alloc.take();
     data.elf.loaded_libs.clear();
@@ -942,7 +937,6 @@ fn teardown_bookkeeping(table: &mut ProcessTable, process_pid: Pid, code: i32,
         handle_orphans(table, orphan_cleanup);
     }
 
-    // Identify parent to wake for waitpid
     let mut to_wake = Vec::new();
     if let Some(ppid) = parent_pid {
         if let Some(parent_proc) = table.get(ppid) {
@@ -1177,7 +1171,6 @@ pub fn futex_wake(addr: u64, count: u64) -> u64 {
 /// Wake processes blocked on reading from a pipe that now has data.
 pub fn wake_pipe_readers(pipe_id: pipe::PipeId) {
     scheduler::wake_pipe_readers(pipe_id);
-    // Also complete any io_uring pending polls watching this pipe
     let watchers = pipe::io_uring_watchers(pipe_id);
     if !watchers.is_empty() {
         crate::io_uring::complete_pending_for_event(
@@ -1190,7 +1183,6 @@ pub fn wake_pipe_readers(pipe_id: pipe::PipeId) {
 /// Wake processes blocked on writing to a pipe that now has space.
 pub fn wake_pipe_writers(pipe_id: pipe::PipeId) {
     scheduler::wake_pipe_writers(pipe_id);
-    // Also complete any io_uring pending polls watching this pipe
     let watchers = pipe::io_uring_watchers(pipe_id);
     if !watchers.is_empty() {
         crate::io_uring::complete_pending_for_event(
@@ -1220,7 +1212,6 @@ pub fn handle_page_fault(fault_addr: u64, _error_code: u64) -> bool {
     let t0 = crate::clock::nanos_since_boot();
     let tid = current_tid();
     if tid == Tid::MAX {
-        //log!("handle_page_fault: no tid, fault_addr={:#x}", fault_addr);
         return false;
     }
 
@@ -1234,7 +1225,6 @@ pub fn handle_page_fault(fault_addr: u64, _error_code: u64) -> bool {
         (data, addr_space)
     };
 
-    // Round down to 2MB boundary
     let page_2m = PAGE_2M;
     let region_start = fault_addr & !(page_2m - 1);
     let region_end_full = region_start.saturating_add(page_2m);
@@ -1255,7 +1245,6 @@ pub fn handle_page_fault(fault_addr: u64, _error_code: u64) -> bool {
     let (writable, regions) = {
         let as_guard = addr_space.lock();
 
-        // Verify the fault address is within a valid region
         if as_guard.find_region(UserAddr::new(fault_addr)).is_none() {
             return false;
         }
@@ -1266,7 +1255,6 @@ pub fn handle_page_fault(fault_addr: u64, _error_code: u64) -> bool {
             return true;
         }
 
-        // Collect overlapping regions info
         let mut writable = false;
         let mut snaps = Vec::new();
         for (&start_addr, region) in as_guard.overlapping_regions(UserAddr::new(region_start), UserAddr::new(region_end_full)) {
@@ -1297,7 +1285,6 @@ pub fn handle_page_fault(fault_addr: u64, _error_code: u64) -> bool {
     let reloc_index = data.elf.reloc_index.clone();
     let elf_base = data.elf.elf_base.raw();
 
-    // Allocate a zeroed 2MB physical page
     let page_alloc = match PageAlloc::new(page_2m as usize, crate::mm::pmm::Category::DemandPage) {
         Some(a) => a,
         None => return false,
@@ -1342,7 +1329,6 @@ pub fn handle_page_fault(fault_addr: u64, _error_code: u64) -> bool {
     }
 
 
-    // Apply relocations across the entire 2MB region
     let mut total_relocs = 0u16;
     if let Some(ref ri) = reloc_index {
         let mut offset = 0u64;
@@ -1358,20 +1344,17 @@ pub fn handle_page_fault(fault_addr: u64, _error_code: u64) -> bool {
     }
 
 
-    // Map the 2MB page (writable if any overlapping VMA is writable)
     addr_space.lock().remap(UserAddr::new(region_start), page_alloc.phys(), writable);
     crate::mm::paging::invlpg(region_start);
 
     data.demand_pages.push(page_alloc);
 
-    // Update memory tracking
     data.alloc_count += 1;
     let current_mem = data.demand_pages.len() as u64 * PAGE_2M;
     if current_mem > data.peak_memory {
         data.peak_memory = current_mem;
     }
 
-    // Update fault accounting
     let fault_elapsed = crate::clock::nanos_since_boot() - t0;
     data.accounting.fault_ns += fault_elapsed;
     if io_reads > 0 {
@@ -1382,7 +1365,6 @@ pub fn handle_page_fault(fault_addr: u64, _error_code: u64) -> bool {
         data.accounting.fault_zero_count += 1;
     }
 
-    // Record fault for crash diagnostics
     let elapsed_us = (fault_elapsed / 1000).min(u16::MAX as u64) as u16;
     data.fault_trace.record(PageFaultRecord {
         fault_addr,
@@ -1417,7 +1399,6 @@ pub fn dump_crash_diagnostics(fault_addr: u64, rip: u64) {
         return;
     };
 
-    // Dump page fault trace
     let trace = &data.fault_trace;
     let count = trace.total().min(32);
     if count > 0 {
@@ -1464,20 +1445,17 @@ pub fn dump_crash_diagnostics(fault_addr: u64, rip: u64) {
     }
     dump_region("rip", rip);
 
-    // Dump TLS self-pointer at FS base
     let fs_base_msr = crate::arch::cpu::rdfsbase();
     let fs_base = fs_base_msr;
     if fs_base != 0 {
         log!("  FS base: {:#x}", fs_base);
         if let Some(self_ptr) = read_user(fs_base) {
             log!("  fs:[0] = {:#x} (expected {:#x})", self_ptr, fs_base);
-            // Dump 8 qwords at TP
             for i in 0..8u64 {
                 let addr = fs_base + i * 8;
                 let Some(val) = read_user(addr) else { break };
                 log!("    TP+{:#x} = {:#018x}", i * 8, val);
             }
-            // Also dump 4 qwords before TP (TLS data area)
             log!("  TLS data before TP:");
             for i in 1..=4u64 {
                 let addr = fs_base - i * 8;
@@ -1524,7 +1502,6 @@ pub(crate) fn find_symtab_in_memory(
     let shdr_size = sh_num * sh_entsize;
     let shdr_data = read_file_range(backing, sh_off, shdr_size);
 
-    // Find SHT_SYMTAB and its linked SHT_STRTAB.
     let mut symtab_off = 0u64;
     let mut symtab_size = 0u64;
     let mut symtab_entsize = 0u64;
@@ -1543,7 +1520,6 @@ pub(crate) fn find_symtab_in_memory(
     }
     if symtab_size == 0 { return empty(); }
 
-    // Find the linked strtab.
     let link_off = symtab_link as usize * sh_entsize;
     if link_off + 64 > shdr_data.len() { return empty(); }
     let strtab_type = u32::from_le_bytes(shdr_data[link_off + 4..link_off + 8].try_into().unwrap());
@@ -1551,7 +1527,6 @@ pub(crate) fn find_symtab_in_memory(
     let strtab_off = u64::from_le_bytes(shdr_data[link_off + 24..link_off + 32].try_into().unwrap());
     let strtab_size = u64::from_le_bytes(shdr_data[link_off + 32..link_off + 40].try_into().unwrap());
 
-    // Get in-memory pointers (only works for initrd-backed files).
     let Some(symtab_ptr) = backing.memory_ptr(symtab_off, symtab_size as usize) else { return empty() };
     let Some(strtab_ptr) = backing.memory_ptr(strtab_off, strtab_size as usize) else { return empty() };
 

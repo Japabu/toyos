@@ -46,7 +46,6 @@ impl FileSystem for TmpFs {
     }
 
     fn create(&mut self, name: &str, mtime: u64) -> Result<FileId, &'static str> {
-        // If file already exists, return its existing FileId
         if let Some((file_id, _)) = self.files.get(name) {
             return Ok(*file_id);
         }
@@ -81,11 +80,9 @@ impl FileSystem for TmpFs {
     }
 
     fn rename(&mut self, old: &str, new: &str) -> Result<(), &'static str> {
-        // Handle target: if new name exists, unlink it
         if let Some((target_id, _)) = self.files.remove(new) {
             file_cache::mark_deleted(target_id);
         }
-        // Re-key the source entry
         if let Some(entry) = self.files.remove(old) {
             self.files.insert(String::from(new), entry);
             Ok(())
@@ -102,7 +99,6 @@ impl FileSystem for TmpFs {
     }
 
     fn update_metadata(&mut self, file_id: FileId, _size: u64, mtime: u64) -> Result<(), &'static str> {
-        // Find and update mtime for this FileId
         for (_, (fid, mt)) in self.files.iter_mut() {
             if *fid == file_id {
                 *mt = mtime;

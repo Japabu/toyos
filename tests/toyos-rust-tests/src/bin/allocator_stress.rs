@@ -18,14 +18,12 @@ fn main() {
 
 /// Test all 9 slab size classes (8, 16, 32, 64, 128, 256, 512, 1024, 2048).
 fn test_slab_all_size_classes() {
-    // Allocate vectors of each size class and verify contents
     for &size in &[1, 2, 4, 8, 9, 16, 17, 32, 33, 64, 65, 128, 129, 256, 257, 512, 513, 1024, 1025, 2048] {
         let v: Vec<u8> = vec![0xAA; size];
         assert_eq!(v.len(), size);
         assert!(v.iter().all(|&b| b == 0xAA), "size {size}: corrupted data");
     }
 
-    // Verify different size classes don't alias
     let a = vec![0x11u8; 8];
     let b = vec![0x22u8; 16];
     let c = vec![0x33u8; 32];
@@ -42,7 +40,6 @@ fn test_slab_all_size_classes() {
 fn test_slab_reuse() {
     let mut ptrs = Vec::new();
 
-    // Allocate 100 boxes, record address range
     for i in 0u64..100 {
         let b = Box::new(i);
         ptrs.push(Box::into_raw(b) as usize);
@@ -50,7 +47,6 @@ fn test_slab_reuse() {
     let old_min = *ptrs.iter().min().unwrap();
     let old_max = *ptrs.iter().max().unwrap();
 
-    // Free all
     for &ptr in &ptrs {
         drop(unsafe { Box::from_raw(ptr as *mut u64) });
     }
@@ -70,7 +66,6 @@ fn test_slab_reuse() {
     assert!(in_range > 50, "freed memory not reused: only {in_range}/100 in original range \
         (old={old_min:#x}..{old_max:#x}, new={new_min:#x}..{new_max:#x})");
 
-    // Clean up
     for &ptr in &ptrs2 {
         drop(unsafe { Box::from_raw(ptr as *mut u64) });
     }
@@ -79,14 +74,12 @@ fn test_slab_reuse() {
 
 /// Test buddy allocator with page-sized allocations (>2048 bytes).
 fn test_buddy_page_allocs() {
-    // 4KB allocations (order 0)
     let pages: Vec<Vec<u8>> = (0..16).map(|i| vec![i as u8; 4096]).collect();
     for (i, page) in pages.iter().enumerate() {
         assert_eq!(page.len(), 4096);
         assert!(page.iter().all(|&b| b == i as u8), "page {i} corrupted");
     }
 
-    // 8KB allocations (order 1)
     let pages2: Vec<Vec<u8>> = (0..8).map(|i| vec![(i + 100) as u8; 8192]).collect();
     for (i, page) in pages2.iter().enumerate() {
         assert!(page.iter().all(|&b| b == (i + 100) as u8));
@@ -96,15 +89,12 @@ fn test_buddy_page_allocs() {
 
 /// Test large buddy allocations (multiple pages).
 fn test_buddy_large_allocs() {
-    // 64KB (order 4 = 16 pages)
     let big = vec![0xBBu8; 64 * 1024];
     assert!(big.iter().all(|&b| b == 0xBB));
 
-    // 1MB (order 8 = 256 pages)
     let huge = vec![0xCCu8; 1024 * 1024];
     assert!(huge.iter().all(|&b| b == 0xCC));
 
-    // 4MB (order 10 = 1024 pages)
     let very_large = vec![0xDDu8; 4 * 1024 * 1024];
     assert!(very_large.iter().all(|&b| b == 0xDD));
 
@@ -118,15 +108,12 @@ fn test_buddy_large_allocs() {
 /// Allocate two adjacent buddy blocks, free them, then allocate a block
 /// of double the size — should succeed without fragmentation.
 fn test_buddy_coalescing() {
-    // Allocate 8 x 1MB blocks
     let mut blocks: Vec<Vec<u8>> = (0..8).map(|i| vec![i as u8; 1024 * 1024]).collect();
 
-    // Verify each block
     for (i, block) in blocks.iter().enumerate() {
         assert!(block.iter().all(|&b| b == i as u8));
     }
 
-    // Free all blocks
     blocks.clear();
 
     // Now allocate a single 8MB block — requires coalescing
@@ -149,16 +136,13 @@ fn test_mixed_workload() {
             _ => unreachable!(),
         }
 
-        // Drop every 3rd item to create holes
         if i % 3 == 0 && items.len() > 1 {
             items.remove(0);
         }
     }
 
-    // Drop everything
     items.clear();
 
-    // Verify allocator still works after mixed workload
     let check = vec![0xFFu8; 65536];
     assert!(check.iter().all(|&b| b == 0xFF));
     println!("  mixed workload: ok");
@@ -180,7 +164,6 @@ fn test_alignment() {
         assert_eq!(ptr % 16, 0, "u128 not 16-byte aligned: {ptr:#x}");
     }
 
-    // Page-sized allocation should be page-aligned
     let layout = std::alloc::Layout::from_size_align(4096, 4096).unwrap();
     let ptr = unsafe { std::alloc::alloc(layout) };
     assert!(!ptr.is_null());
@@ -192,12 +175,10 @@ fn test_alignment() {
 
 /// Stress test: many small allocations simultaneously.
 fn test_many_small_allocs() {
-    // Hold 10000 allocations simultaneously
     let mut vecs: Vec<Vec<u8>> = Vec::with_capacity(10_000);
     for i in 0u16..10_000 {
         let size = (i % 64 + 1) as usize;
         let mut v = vec![0u8; size];
-        // Write a pattern
         for (j, byte) in v.iter_mut().enumerate() {
             *byte = ((i as usize + j) & 0xFF) as u8;
         }
@@ -222,13 +203,11 @@ fn test_many_small_allocs() {
 fn test_grow_and_shrink() {
     let mut map = BTreeMap::new();
 
-    // Grow: insert 5000 entries
     for i in 0..5000u32 {
         map.insert(i, vec![0u8; 64]);
     }
     assert_eq!(map.len(), 5000);
 
-    // Shrink: remove all
     map.clear();
 
     // Grow again: should reuse freed memory
@@ -237,7 +216,6 @@ fn test_grow_and_shrink() {
     }
     assert_eq!(map.len(), 5000);
 
-    // Grow further
     for i in 5000..10000u32 {
         map.insert(i, vec![0u8; 64]);
     }
@@ -260,16 +238,13 @@ fn test_fragmentation_resistance() {
         large.push(vec![((i + 128) & 0xFF) as u8; 4096]);
     }
 
-    // Free all large allocations (creating holes in buddy free lists)
     large.clear();
 
-    // Allocate many medium-sized blocks in the freed space
     let mut medium: Vec<Vec<u8>> = Vec::new();
     for _ in 0..500 {
         medium.push(vec![0xAA; 2048]);
     }
 
-    // Verify small allocations weren't corrupted
     for (i, v) in small.iter().enumerate() {
         assert!(v.iter().all(|&b| b == (i & 0xFF) as u8), "small {i} corrupted after realloc");
     }
@@ -309,7 +284,6 @@ fn test_oom_graceful() {
     let result = v.try_reserve(16 * 1024 * 1024 * 1024);
     assert!(result.is_err(), "16GB allocation should fail");
 
-    // Verify allocator still works after OOM
     let check = vec![0xAAu8; 4096];
     assert!(check.iter().all(|&b| b == 0xAA));
 
@@ -326,7 +300,6 @@ fn test_oom_graceful() {
         }
     }
 
-    // Verify allocator still works after hitting the limit
     let check2 = vec![0xBBu8; 65536];
     assert!(check2.iter().all(|&b| b == 0xBB));
 

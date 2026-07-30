@@ -848,7 +848,6 @@ fn build_test_registry(
 ) -> Vec<TestDef> {
     let mut tests = Vec::new();
 
-    // Rust tests first
     for name in discover_rust_tests(rust_bins) {
         let timeout = match name.as_str() {
             "panic_recovery" => Duration::from_secs(10),
@@ -862,7 +861,6 @@ fn build_test_registry(
         });
     }
 
-    // Then C tests
     for name in c_names {
         tests.push(TestDef {
             qemu_name: format!("test_c_{name}"),
@@ -1005,13 +1003,11 @@ fn main() {
         .find(|(i, a)| !a.starts_with('-') && !consumed.contains(i))
         .map(|(_, s)| s.as_str());
 
-    // Discover and compile C tests
     let c_names = discover_c_tests();
     eprintln!("[toyos] Compiling {} C tests...", c_names.len());
     let c_bins = compile_c_tests(&c_names);
     let c_compiled: Vec<String> = c_bins.iter().map(|(n, _)| n.clone()).collect();
 
-    // Build Rust tests
     let rust_tests_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/toyos-rust-tests");
     eprintln!("[toyos] Building Rust tests...");
     let rust_bins = qemu::build_toyos_bins(&rust_tests_dir);
@@ -1055,7 +1051,6 @@ fn main() {
         return;
     }
 
-    // Build registry and apply filter
     let all_tests = build_test_registry(&rust_bins, &c_compiled);
     let tests_to_run: Vec<&TestDef> = match filter {
         Some(f) => all_tests.iter().filter(|t| t.name.contains(f)).collect(),
@@ -1152,7 +1147,6 @@ fn main() {
 
     let suite_elapsed = suite_start.elapsed();
 
-    // Summary
     eprintln!();
     if failures.is_empty() {
         eprintln!(

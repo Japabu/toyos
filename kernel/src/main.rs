@@ -222,7 +222,7 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     let init_programs = core::str::from_utf8(init_bytes).expect("init_programs: invalid UTF-8");
     let kernel_args = &kernel_args;
 
-    // ── Phase 1: Memory ─────────────────────────────────────────────────
+    // Phase 1: Memory
     let reserved = [
         mm::Region { start: kernel_args.kernel_memory_addr, end: kernel_args.kernel_memory_addr + kernel_args.kernel_memory_size },
         mm::Region { start: kernel_args.initrd_addr, end: kernel_args.initrd_addr + kernel_args.initrd_size },
@@ -236,7 +236,7 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     let init_programs = alloc::string::String::from(init_programs);
     let init_programs: &str = &init_programs;
 
-    // ── Phase 2: CPU — exceptions, LAPIC, clock ─────────────────────────
+    // Phase 2: CPU — exceptions, LAPIC, clock
     // Get exception handlers up ASAP so bugs in later phases produce diagnostics
     // instead of triple-faulting.
     let madt = acpi::parse_madt(kernel_args.rsdp_addr).expect("ACPI: MADT not found");
@@ -258,7 +258,7 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
 
     log!("Boot: CPU ready ({}ms)", clock::nanos_since_boot() / 1_000_000);
 
-    // ── Phase 3: Storage ────────────────────────────────────────────────
+    // Phase 3: Storage
     let t_storage = clock::nanos_since_boot();
 
     let ecam_base = acpi::find_ecam_base(kernel_args.rsdp_addr)
@@ -275,7 +275,7 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
 
     log!("Boot: storage ready ({}ms)", (clock::nanos_since_boot() - t_storage) / 1_000_000);
 
-    // ── Phase 4: Peripherals ────────────────────────────────────────────
+    // Phase 4: Peripherals
     let t_periph = clock::nanos_since_boot();
 
     let xhci_ctrl = xhci::init(&ecam).expect("xHCI: no USB controller found");
@@ -284,7 +284,7 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
 
     log!("Boot: peripherals ready ({}ms)", (clock::nanos_since_boot() - t_periph) / 1_000_000);
 
-    // ── Phase 5: Kernel subsystems ──────────────────────────────────────
+    // Phase 5: Kernel subsystems
     let t_subsys = clock::nanos_since_boot();
 
     smp::boot_aps(&madt, kernel_args.boot_pml4_addr);
@@ -311,7 +311,7 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
 
     log!("Boot: subsystems ready ({}ms)", (clock::nanos_since_boot() - t_subsys) / 1_000_000);
 
-    // ── Phase 6: Devices ────────────────────────────────────────────────
+    // Phase 6: Devices
     let t_devices = clock::nanos_since_boot();
 
     virtio_console::init(&ecam);
@@ -341,7 +341,7 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
 
     log!("Boot: devices ready ({}ms)", (clock::nanos_since_boot() - t_devices) / 1_000_000);
 
-    // ── Phase 7: Userland ───────────────────────────────────────────────
+    // Phase 7: Userland
     assert!(!init_programs.is_empty(), "bootloader must provide init_programs");
     for entry in init_programs.split(';') {
         let args: Vec<&str> = entry.split_whitespace().collect();

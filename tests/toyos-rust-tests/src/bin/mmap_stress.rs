@@ -20,7 +20,6 @@ fn main() {
         };
         assert!(!ptr.is_null(), "mmap #{i} failed (size={size})");
 
-        // Verify this region doesn't overlap any previous allocation
         let base = ptr as usize;
         assert!(base % page_2m == 0, "mmap #{i} returned unaligned address {base:#x}");
         for offset in (0..size).step_by(page_2m) {
@@ -31,7 +30,6 @@ fn main() {
             );
         }
 
-        // Write a pattern to verify the pages are usable
         let tag = (i & 0xFF) as u8;
         unsafe { ptr.write(tag) };
         unsafe { ptr.add(size - 1).write(tag) };
@@ -39,7 +37,6 @@ fn main() {
         regions.push((ptr, size));
     }
 
-    // Verify patterns survived (no cross-mapping corruption)
     for (i, &(ptr, size)) in regions.iter().enumerate() {
         let tag = (i & 0xFF) as u8;
         let first = unsafe { ptr.read() };
@@ -48,7 +45,6 @@ fn main() {
         assert_eq!(last, tag, "region #{i}: last byte corrupted ({last:#x} != {tag:#x})");
     }
 
-    // Free all
     for (ptr, size) in regions {
         unsafe { munmap(ptr, size) }.expect("munmap failed");
     }

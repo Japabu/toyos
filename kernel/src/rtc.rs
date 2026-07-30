@@ -67,12 +67,10 @@ pub fn read_epoch_secs() -> u64 {
 
 /// Convert a UTC date+time to seconds since Unix epoch.
 fn datetime_to_epoch(year: u64, month: u64, day: u64, hour: u64, min: u64, sec: u64) -> u64 {
-    // Days from 1970-01-01 to start of given year
     let mut days = 0u64;
     for y in 1970..year {
         days += if is_leap(y) { 366 } else { 365 };
     }
-    // Days from start of year to start of given month
     const MONTH_DAYS: [u64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
     for m in 1..month {
         days += MONTH_DAYS[(m - 1) as usize];
