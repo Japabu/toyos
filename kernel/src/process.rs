@@ -114,6 +114,89 @@ impl PageAlloc {
     }
 }
 
+// ---------------------------------------------------------------------------
+// MappedPages — physical pages plus the user address they were mapped at
+// ---------------------------------------------------------------------------
+
+/// Pages handed to userland through [`vma_map`], carried with the virtual
+/// address that maps them.
+///
+/// `PageAlloc`'s Drop returns the pages to the PMM and reaches no address
+/// space, so pages and mapping cannot be dropped as one. Holding the two
+/// together is what makes the unmap expressible at all; enforcing it is the
+/// `SharedToken`/RAII item in `specs/known-issues.md`.
+///
+/// Dropping without unmapping is only sound when the address space itself is
+/// being destroyed (process teardown).
+pub struct MappedPages {
+    vaddr: UserAddr,
+    pages: PageAlloc,
+}
+
+impl MappedPages {
+    pub fn new(vaddr: UserAddr, pages: PageAlloc) -> Self {
+        Self { vaddr, pages }
+    }
+
+    pub fn vaddr(&self) -> UserAddr { self.vaddr }
+
+    /// Kernel pointer to the start, via the direct map.
+    pub fn ptr(&self) -> *mut u8 { self.pages.ptr() }
+
+    pub fn size(&self) -> usize { self.pages.size() }
+
+    /// Take the mapping out of `addr_space` and hand back the pages. The
+    /// caller must complete a TLB shootdown before dropping them: `unmap`'s
+    /// `invlpg` reaches this CPU only, and a sibling running another thread of
+    /// the same process can still hold an entry for a page the PMM is about to
+    /// reissue.
+    #[must_use]
+    fn unmap_from(self, addr_space: &mut crate::mm::paging::AddressSpace) -> PageAlloc {
+        addr_space.free_and_unmap(self.vaddr);
+        self.pages
+    }
+
+    pub fn release(self, pt: &PageTables) {
+        let pages = self.unmap_from(&mut pt.lock());
+        crate::arch::apic::tlb_shootdown();
+        drop(pages);
+    }
+}
+
+/// Release every user mapping an exiting thread owns — its own TLS block and
+/// one per dlopen'd module it touched.
+///
+/// Sibling threads keep the address space alive past a thread exit, so a
+/// mapping left behind here is a live user-writable window onto memory the PMM
+/// has already reissued. Process teardown does not call this: there is no
+/// address space left to unmap from.
+///
+/// `tls` arrives by value because the caller holds the `ProcessData` lock and
+/// the `ThreadData` lock is never held at the same time.
+fn release_thread_mappings(
+    data: &mut ProcessData,
+    tls: Option<MappedPages>,
+    pt: &PageTables,
+    tid: Tid,
+) {
+    let keys: Vec<(Tid, u64)> = data.elf.dynamic_tls_blocks.keys()
+        .filter(|&&(t, _)| t == tid)
+        .copied()
+        .collect();
+    let mut pages = Vec::with_capacity(keys.len() + 1);
+    {
+        let mut addr_space = pt.lock();
+        pages.extend(tls.map(|t| t.unmap_from(&mut addr_space)));
+        for key in keys {
+            let block = data.elf.dynamic_tls_blocks.remove(&key).unwrap();
+            pages.push(block.unmap_from(&mut addr_space));
+            data.free_count += 1;
+        }
+    }
+    crate::arch::apic::tlb_shootdown();
+    drop(pages);
+}
+
 pub const KERNEL_STACK_SIZE: usize = 128 * 1024;
 
 /// Type-safe user stack. Knows its virtual address (what userland sees) and
@@ -386,7 +469,7 @@ pub struct ElfInfo {
     pub next_tls_module_id: u64,
     /// Dynamically allocated TLS blocks for dlopen'd modules, keyed by (thread Tid, module_id).
     /// Stored in process-level data so the VMA and backing memory have the same lifetime.
-    pub dynamic_tls_blocks: alloc::collections::BTreeMap<(Tid, u64), PageAlloc>,
+    pub dynamic_tls_blocks: alloc::collections::BTreeMap<(Tid, u64), MappedPages>,
     /// Dynamically loaded shared libraries (indexed by dlopen handle).
     pub loaded_libs: Vec<elf::LoadedLib>,
     /// RELATIVE relocation index for demand-paged ELF (applied per-page on fault).
@@ -458,7 +541,9 @@ pub struct ProcessAccounting {
 /// Contains thread-local storage pages, stack info, syscall profiling.
 /// Accessed via `with_current_data`. Each thread has its own Arc.
 pub struct ThreadData {
-    pub tls_pages: Option<PageAlloc>,
+    pub tls_pages: Option<MappedPages>,
+    /// Main thread's user stack, at the fixed `vma::STACK_BASE`. Only ever
+    /// freed with the address space it lives in, so it needs no address here.
     pub stack_pages: Option<PageAlloc>,
     // User stack location (for SYS_STACK_INFO)
     pub user_stack_base: UserAddr,
@@ -709,7 +794,7 @@ pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64, stack_base: u64) -> Op
     } else {
         setup_tls(tls_template, tls_memsz, tls_max_align)?
     };
-    let fs_base = {
+    let (tls_alloc, fs_base) = {
         let addr_space = parent_addr_space.as_ref().expect("spawn_thread: no address space");
         let parent_data = process_data_arc.lock();
         let tls_phys = tls_alloc.phys();
@@ -739,13 +824,14 @@ pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64, stack_base: u64) -> Op
             }
         }
         drop(parent_data);
-        fs_base
+        (MappedPages::new(tls_vaddr, tls_alloc), fs_base)
     };
 
     let (ks_alloc, ks_rsp) = match alloc_kernel_stack(thread_start, entry, stack_ptr, arg) {
         Some(ks) => ks,
         None => {
-            drop(tls_alloc);
+            let pt = parent_addr_space.as_ref().expect("spawn_thread: no address space");
+            tls_alloc.release(pt);
             return None;
         }
     };
@@ -1045,18 +1131,19 @@ pub fn thread_exit(code: i32) -> ! {
         exit(code);
     }
 
-    // Thread-only exit path: free TLS, zombify, wake parent
+    // Thread-only exit path: release this thread's mappings, zombify, wake parent.
+    let addr_space = current_address_space();
     unsafe { crate::mm::paging::kernel_cr3().activate(); }
 
-    {
+    let tls = {
         let tdata_arc = current_data();
         let mut tdata = tdata_arc.lock();
-        tdata.tls_pages.take();
-    }
+        tdata.tls_pages.take()
+    };
     {
         let owner_arc = fd_owner_data();
         let mut owner_data = owner_arc.lock();
-        owner_data.elf.dynamic_tls_blocks.retain(|&(t, _), _| t != tid);
+        release_thread_mappings(&mut owner_data, tls, &addr_space, tid);
     }
 
     let parent_main_tid = {

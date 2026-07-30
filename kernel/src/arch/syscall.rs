@@ -1529,24 +1529,18 @@ fn sys_dlopen(path: &str, init_out: u64) -> u64 {
 }
 
 /// Allocate a TLS block for the current thread's DTV entry for `module_id`.
-/// Called by __tls_get_addr slow path when the DTV entry is DTV_UNALLOCATED.
-/// Returns the virtual address of the allocated TLS block (stored in DTV and
-/// returned to the caller).
+/// Called by __tls_get_addr's slow path when the DTV entry is DTV_UNALLOCATED.
+/// Returns the block's virtual address, also written into the DTV.
 ///
-/// `module_id` crosses the trust boundary, so every rejection here is an
-/// error return, not a panic — this had eight panics, two of them reachable
-/// with a single argument and no setup.
+/// `module_id` crosses the trust boundary: every rejection here is an error
+/// return, never a panic.
 ///
 /// The DTV is found through the thread's own kernel-side TLS allocation, not
-/// by following a pointer chain out of the FS base. That was the whole
-/// vulnerability: CR4.FSGSBASE is on, so userland owns its FS base; the old
-/// code read TCB[8] through it with a raw `AddressSpace::translate`, which
-/// applies no user-half check and resolves kernel addresses fine through the
-/// direct map shallow-copied into every user PML4. A thread could point FS at
-/// a buffer it controls, put any address in TCB[8], and have the kernel write
-/// a value of its choosing there. The kernel already knows where the DTV is —
-/// `setup_combined_tls` puts it at offset 0 of the allocation it hands the
-/// thread — so the indirection bought nothing and is gone.
+/// by following a pointer chain out of the FS base. CR4.FSGSBASE is on, so
+/// userland owns its FS base; reading TCB[8] through it with a raw
+/// `AddressSpace::translate` applies no user-half check and resolves kernel
+/// addresses fine through the direct map shallow-copied into every user PML4,
+/// which made the DTV write an arbitrary kernel write.
 fn sys_tls_alloc_block(module_id: u64) -> u64 {
     match tls_alloc_block(module_id) {
         Ok(vaddr) => vaddr,
@@ -1575,37 +1569,43 @@ fn tls_alloc_block(module_id: u64) -> Result<u64, SyscallError> {
         (m.memsz, m.template)
     };
 
-    // Allocate TLS block from PMM (needs 2MB alignment for user mapping)
-    let page_alloc = process::PageAlloc::new(tls_memsz.max(1), crate::mm::pmm::Category::Tls)
-        .ok_or(SyscallError::ResourceExhausted)?;
-    let block_ptr = page_alloc.ptr();
-
-    // Initialize: copy template, zero BSS (PageAlloc is already zeroed)
-    unsafe {
-        if let Some(template) = &tls_template {
-            core::ptr::copy_nonoverlapping(template.base(), block_ptr, template.size());
-        }
-    }
-
-    // Map into current process's virtual address space via VmaList
-    let block_phys = page_alloc.phys();
-    let pt = process::current_address_space();
-    let tls_vaddr = process::with_fd_owner_data(|data| {
-        let (vaddr, _) = process::vma_map(&pt, block_phys, page_alloc.size() as u64)
-            .ok_or(SyscallError::ResourceExhausted)?;
-        data.alloc_count += 1;
-        Ok(vaddr)
-    })?;
-
-    // Store in the process-level (fd-owner) data alongside the VMA allocation.
+    // A DTV entry leaves DTV_UNALLOCATED once and never returns to it, so a
+    // repeat call for the same (thread, module) is the same block asked for
+    // twice. Serving it with a fresh one frees pages userland still holds
+    // pointers into, while the first mapping stays present, USER and writable
+    // over whatever the PMM hands out next.
     let tid = process::current_tid();
-    process::with_fd_owner_data(|data| {
-        data.elf.dynamic_tls_blocks.insert((tid, module_id), page_alloc);
+    let existing = process::with_fd_owner_data(|data| {
+        data.elf.dynamic_tls_blocks.get(&(tid, module_id)).map(|b| b.vaddr())
     });
 
-    // Write the block address into this thread's DTV, which lives at offset 0
-    // of the thread's own TLS allocation. Every user thread gets one from
-    // `setup_tls`/`setup_combined_tls`, so its absence is a kernel bug.
+    let tls_vaddr = match existing {
+        Some(vaddr) => vaddr,
+        None => {
+            let page_alloc = process::PageAlloc::new(tls_memsz.max(1), crate::mm::pmm::Category::Tls)
+                .ok_or(SyscallError::ResourceExhausted)?;
+            unsafe {
+                if let Some(template) = &tls_template {
+                    core::ptr::copy_nonoverlapping(template.base(), page_alloc.ptr(), template.size());
+                }
+            }
+
+            let block_phys = page_alloc.phys();
+            let pt = process::current_address_space();
+            process::with_fd_owner_data(|data| {
+                let (vaddr, _) = process::vma_map(&pt, block_phys, page_alloc.size() as u64)
+                    .ok_or(SyscallError::ResourceExhausted)?;
+                data.alloc_count += 1;
+                data.elf.dynamic_tls_blocks
+                    .insert((tid, module_id), process::MappedPages::new(vaddr, page_alloc));
+                Ok(vaddr)
+            })?
+        }
+    };
+
+    // The DTV lives at offset 0 of the thread's own TLS allocation. Every user
+    // thread gets one from `setup_tls`/`setup_combined_tls`, so its absence is
+    // a kernel bug.
     process::with_current_data(|data| {
         let tls = data.tls_pages.as_ref().expect("sys_tls_alloc_block: thread has no TLS allocation");
         let dtv_kern = tls.ptr() as *mut u64;

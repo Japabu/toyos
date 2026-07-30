@@ -937,7 +937,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
     }));
 
     let thread_data = Arc::new(Lock::new(ThreadData {
-        tls_pages: Some(tls_alloc),
+        tls_pages: Some(crate::process::MappedPages::new(tls_vaddr, tls_alloc)),
         stack_pages: Some(stack_pages),
         user_stack_base: user_stack.base(),
         user_stack_size: user_stack.size(),
