@@ -53,7 +53,11 @@ pub struct IoUringRingHeader {
     pub head: core::sync::atomic::AtomicU32,
     pub tail: core::sync::atomic::AtomicU32,
     pub ring_size: u32,
-    pub _pad: u32,
+    /// Completions the kernel could not post because the completion ring
+    /// reported itself full. With honest indices and 2x sizing this stays 0
+    /// forever; a non-zero value means this process corrupted its own ring
+    /// head, and this is how it can tell.
+    pub dropped: core::sync::atomic::AtomicU32,
 }
 
 /// Parameters returned by io_uring_setup. Describes the layout of the

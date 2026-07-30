@@ -605,7 +605,7 @@ fn upload_cursor(cursor_buf: *mut u8, sprite: &sprite::Sprite, hw_cursor: bool) 
         }
     }
     if hw_cursor {
-        gpu::set_cursor(0, 0);
+        gpu::set_cursor(0, 0).expect("compositor owns the framebuffer");
     }
 }
 
@@ -722,7 +722,7 @@ fn main() {
     let mut cursor_x = screen_w / 2;
     let mut cursor_y = screen_h / 2;
     if hw_cursor {
-        gpu::move_cursor(cursor_x as u32, cursor_y as u32);
+        gpu::move_cursor(cursor_x as u32, cursor_y as u32).expect("compositor owns the framebuffer");
     }
     let mut dirty_rect: Option<DirtyRect> = Some(DirtyRect::full(screen_w as usize, screen_h as usize));
     let mut prev_buttons: u8 = 0;
@@ -943,7 +943,7 @@ fn main() {
                 cursor_x = (last_abs_x as i32 * screen_w / 32768).clamp(0, screen_w - 1);
                 cursor_y = (last_abs_y as i32 * screen_h / 32768).clamp(0, screen_h - 1);
                 if hw_cursor {
-                    gpu::move_cursor(cursor_x as u32, cursor_y as u32);
+                    gpu::move_cursor(cursor_x as u32, cursor_y as u32).expect("compositor owns the framebuffer");
                 } else {
                     // Software cursor: mark old and new cursor regions dirty
                     let cw = 20usize;
@@ -1548,7 +1548,8 @@ fn main() {
                     draw_software_cursor(&screen, sprite, cursor_x, cursor_y);
                 }
 
-                gpu::present(rect.x as u32, rect.y as u32, rect.w as u32, rect.h as u32);
+                gpu::present(rect.x as u32, rect.y as u32, rect.w as u32, rect.h as u32)
+                    .expect("compositor owns the framebuffer");
 
                 // Send frame callbacks to windows that presented and were composited
                 for win in windows.iter_mut() {

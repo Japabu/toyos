@@ -10,14 +10,19 @@ pub use toyos_abi::net::NicInfo;
 /// (virtio-net, RTL8125, Intel i225, etc.) and register it with `net::register()`.
 pub trait Nic: Send {
     fn mac(&self) -> [u8; 6];
-    fn send(&mut self, frame: &[u8]);
-    fn recv(&mut self, buf: &mut [u8]) -> Option<usize>;
     fn has_packet(&self) -> bool;
 
     /// Poll for a received frame without copying. Returns (buf_index, frame_len).
     fn poll_rx(&mut self) -> Option<(usize, usize)> { None }
     /// Resubmit an RX buffer to the hardware after the frame has been consumed.
-    fn refill_rx_buf(&mut self, _buf_index: usize) {}
+    ///
+    /// `buf_index` is a raw syscall argument and the slot it names is only
+    /// populated by a prior `poll_rx`, so both arms are untrusted input
+    /// rather than driver invariants. The default refuses, so a driver that
+    /// implements `poll_rx` and forgets this fails closed.
+    fn refill_rx_buf(&mut self, _buf_index: usize) -> Result<(), SyscallError> {
+        Err(SyscallError::NotSupported)
+    }
     /// Submit the TX buffer to hardware. Frame data (with net header) must already be written.
     ///
     /// `total_len` becomes the DMA descriptor length verbatim. Callers must
@@ -65,20 +70,6 @@ pub fn nic_info() -> Option<NicInfo> {
     *NIC_INFO.lock()
 }
 
-pub fn mac() -> Option<[u8; 6]> {
-    NIC.lock().as_ref().map(|n| n.mac())
-}
-
-pub fn send(frame: &[u8]) {
-    if let Some(nic) = NIC.lock().as_mut() {
-        nic.send(frame);
-    }
-}
-
-pub fn recv(buf: &mut [u8]) -> Option<usize> {
-    NIC.lock().as_mut().and_then(|nic| nic.recv(buf))
-}
-
 pub fn has_packet() -> bool {
     NIC.lock().as_ref().map_or(false, |nic| nic.has_packet())
 }
@@ -87,10 +78,10 @@ pub fn poll_rx() -> Option<(usize, usize)> {
     NIC.lock().as_mut().and_then(|nic| nic.poll_rx())
 }
 
-pub fn refill_rx_buf(buf_index: usize) {
-    if let Some(nic) = NIC.lock().as_mut() {
-        nic.refill_rx_buf(buf_index);
-    }
+pub fn refill_rx_buf(buf_index: usize) -> Result<(), SyscallError> {
+    let mut guard = NIC.lock();
+    let Some(nic) = guard.as_mut() else { return Err(SyscallError::NotFound) };
+    nic.refill_rx_buf(buf_index)
 }
 
 /// Hand the device the TX buffer's first `total_len` bytes.

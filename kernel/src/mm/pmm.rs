@@ -260,7 +260,11 @@ pub fn alloc_page(cat: Category) -> Option<PhysPage> {
 
 /// Allocate `count` physically contiguous 2MB pages.
 pub fn alloc_contiguous(count: usize, cat: Category) -> Option<alloc::vec::Vec<PhysPage>> {
-    assert!(count > 0);
+    // `count` is derived from a userland size at two call sites (`PageAlloc::new`
+    // and `shared_memory::alloc`), so an assert here cannot tell a kernel bug
+    // from a `mmap(0)`. The four driver callers all `.expect()` or `?` the
+    // Option, so a genuine driver bug asking for nothing still screams.
+    if count == 0 { return None; }
     let mut bm = BITMAP.lock();
     if bm.free_count < count { return None; }
 

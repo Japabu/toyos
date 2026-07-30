@@ -1,5 +1,5 @@
 use alloc::boxed::Box;
-use core::ptr::{copy_nonoverlapping, write_bytes};
+use core::ptr::write_bytes;
 
 use super::pci::PciDevice;
 use super::virtio::{BufDir, DescSlot, Virtqueue, VirtqueueRegions, VirtioDevice, VIRTIO_F_VERSION_1};
@@ -9,6 +9,7 @@ use crate::mm::KernelSlice;
 use crate::net::NicInfo;
 use crate::shared_memory;
 use crate::sync::Lock;
+use toyos_abi::syscall::SyscallError;
 
 const VIRTIO_VENDOR: u16 = 0x1AF4;
 const VIRTIO_NET_DEVICE: u16 = 0x1041; // 0x1040 + device_id 1
@@ -80,49 +81,8 @@ impl crate::net::Nic for VirtioNic {
         self.mac
     }
 
-    fn send(&mut self, frame: &[u8]) {
-        let max_frame = 4096 - NET_HDR_SIZE;
-        let len = frame.len().min(max_frame);
-
-        unsafe {
-            write_bytes(self.tx_ptr, 0, NET_HDR_SIZE);
-            copy_nonoverlapping(
-                frame.as_ptr(),
-                self.tx_ptr.add(NET_HDR_SIZE),
-                len,
-            );
-        }
-
-        let slot = self.tx_slot.take().expect("virtio-net: no tx slot");
-        self.tx_slot = Some(self.txq.submit_and_wait(
-            slot,
-            &[(self.tx_phys, (NET_HDR_SIZE + len) as u32, BufDir::Readable)],
-            self.device.notify_mmio(),
-            self.device.notify_off_multiplier(),
-            1,
-        ));
-    }
-
     fn has_packet(&self) -> bool {
         self.rxq.has_used()
-    }
-
-    fn recv(&mut self, buf: &mut [u8]) -> Option<usize> {
-        let (slot, written_len) = self.rxq.poll_used()?;
-        let buf_idx = self.desc_to_buf[slot.id() as usize] as usize;
-        let total = written_len as usize;
-        if total <= NET_HDR_SIZE {
-            self.refill_rx(buf_idx, slot);
-            return None;
-        }
-        let frame_len = total - NET_HDR_SIZE;
-        let copy_len = frame_len.min(buf.len());
-        let src = unsafe { self.rx_ptrs[buf_idx].add(NET_HDR_SIZE) };
-        unsafe {
-            copy_nonoverlapping(src, buf.as_mut_ptr(), copy_len);
-        }
-        self.refill_rx(buf_idx, slot);
-        Some(copy_len)
     }
 
     fn poll_rx(&mut self) -> Option<(usize, usize)> {
@@ -138,12 +98,18 @@ impl crate::net::Nic for VirtioNic {
         Some((buf_idx, total - NET_HDR_SIZE))
     }
 
-    fn refill_rx_buf(&mut self, buf_index: usize) {
-        if buf_index < RX_BUF_COUNT {
-            let slot = self.pending_rx_slots[buf_index].take()
-                .expect("refill_rx_buf: no pending slot (poll_rx not called for this buf_index)");
-            self.refill_rx(buf_index, slot);
-        }
+    fn refill_rx_buf(&mut self, buf_index: usize) -> Result<(), SyscallError> {
+        // RX_BUF_COUNT is not a chosen number: it is the length of
+        // `pending_rx_slots`/`rx_phys`/`rx_ptrs` and the buffer count baked
+        // into the DMA pool layout, so this check is exactly the array bound.
+        // An index past it used to be silently ignored *and* reported as
+        // success; an unpolled index used to panic the kernel.
+        if buf_index >= RX_BUF_COUNT { return Err(SyscallError::InvalidArgument); }
+        let Some(slot) = self.pending_rx_slots[buf_index].take() else {
+            return Err(SyscallError::InvalidArgument);
+        };
+        self.refill_rx(buf_index, slot);
+        Ok(())
     }
 
     fn tx_buf_len(&self) -> usize { TX_BUF_LEN }

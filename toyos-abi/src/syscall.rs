@@ -4,7 +4,7 @@ pub const SYS_READ: u64 = 1;
 // Syscall numbers 2-4 are unused (formerly SYS_ALLOC/FREE/REALLOC).
 pub const SYS_THREAD_EXIT: u64 = 5;
 pub const SYS_RANDOM: u64 = 6;
-pub const SYS_SCREEN_SIZE: u64 = 7;
+// Syscall number 7 unused (formerly SYS_SCREEN_SIZE).
 pub const SYS_CLOCK: u64 = 8;
 pub const SYS_OPEN: u64 = 9;
 pub const SYS_CLOSE: u64 = 10;
@@ -24,7 +24,7 @@ pub const SYS_MARK_TTY: u64 = 28;
 // Syscall numbers 29-30 unused (formerly SYS_SEND_MSG/SYS_RECV_MSG).
 pub const SYS_OPEN_DEVICE: u64 = 31;
 // Syscall numbers 32-33 unused (formerly SYS_REGISTER_NAME/SYS_FIND_PID).
-pub const SYS_SET_SCREEN_SIZE: u64 = 34;
+// Syscall number 34 unused (formerly SYS_SET_SCREEN_SIZE).
 pub const SYS_GPU_PRESENT: u64 = 35;
 pub const SYS_ALLOC_SHARED: u64 = 36;
 pub const SYS_GRANT_SHARED: u64 = 37;
@@ -36,9 +36,9 @@ pub const SYS_CLOCK_REALTIME: u64 = 42;
 pub const SYS_GPU_SET_CURSOR: u64 = 43;
 pub const SYS_GPU_MOVE_CURSOR: u64 = 44;
 pub const SYS_SYSINFO: u64 = 45;
-pub const SYS_NET_INFO: u64 = 46;
-pub const SYS_NET_SEND: u64 = 47;
-pub const SYS_NET_RECV: u64 = 48;
+// Syscall numbers 46-48 unused (formerly SYS_NET_INFO/SYS_NET_SEND/SYS_NET_RECV:
+// an ungated frame-copy path that no program ever used — netd drives the NIC
+// through its DMA descriptor instead).
 pub const SYS_NANOSLEEP: u64 = 49;
 pub const SYS_DUP: u64 = 50;
 pub const SYS_GETPID: u64 = 51;
@@ -539,31 +539,23 @@ pub fn clock_epoch() -> u64 {
 
 // --- Screen / GPU ---
 
-/// Get the screen size as (rows, columns).
-pub fn screen_size() -> (usize, usize) {
-    let raw = syscall(SYS_SCREEN_SIZE, 0, 0, 0, 0);
-    ((raw >> 32) as usize, (raw & 0xFFFF_FFFF) as usize)
-}
-
-/// Set the screen size from pixel dimensions (width, height).
-pub fn set_screen_size(width: u32, height: u32) {
-    syscall(SYS_SET_SCREEN_SIZE, width as u64, height as u64, 0, 0);
-}
-
 /// Transfer a region of the framebuffer to the GPU and flush it.
 /// Pass (0, 0, 0, 0) to flush the full screen.
-pub fn gpu_present(x: u32, y: u32, w: u32, h: u32) {
-    syscall(SYS_GPU_PRESENT, x as u64, y as u64, w as u64, h as u64);
+///
+/// Fallible because the kernel now refuses a caller that does not own the
+/// display, like `gpu_set_resolution` already did.
+pub fn gpu_present(x: u32, y: u32, w: u32, h: u32) -> Result<(), SyscallError> {
+    check_unit(syscall(SYS_GPU_PRESENT, x as u64, y as u64, w as u64, h as u64))
 }
 
 /// Upload the cursor image from backing and enable hardware cursor.
-pub fn gpu_set_cursor(hot_x: u32, hot_y: u32) {
-    syscall(SYS_GPU_SET_CURSOR, hot_x as u64, hot_y as u64, 0, 0);
+pub fn gpu_set_cursor(hot_x: u32, hot_y: u32) -> Result<(), SyscallError> {
+    check_unit(syscall(SYS_GPU_SET_CURSOR, hot_x as u64, hot_y as u64, 0, 0))
 }
 
 /// Move the hardware cursor to screen position (x, y).
-pub fn gpu_move_cursor(x: u32, y: u32) {
-    syscall(SYS_GPU_MOVE_CURSOR, x as u64, y as u64, 0, 0);
+pub fn gpu_move_cursor(x: u32, y: u32) -> Result<(), SyscallError> {
+    check_unit(syscall(SYS_GPU_MOVE_CURSOR, x as u64, y as u64, 0, 0))
 }
 
 /// Request a GPU resolution change. On success, writes the new
@@ -676,31 +668,6 @@ pub fn release_shared(token: u32) {
 pub fn sysinfo(buf: &mut [u8]) -> usize {
     let n = syscall(SYS_SYSINFO, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0);
     if SyscallError::from_u64(n).is_some() { 0 } else { n as usize }
-}
-
-// --- Networking ---
-
-/// Get the MAC address of the network interface.
-pub fn net_mac() -> Option<[u8; 6]> {
-    let mut buf = [0u8; 6];
-    let r = syscall(SYS_NET_INFO, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0);
-    if SyscallError::from_u64(r).is_some() { None } else { Some(buf) }
-}
-
-/// Send a raw Ethernet frame.
-pub fn net_send(frame: &[u8]) {
-    syscall(SYS_NET_SEND, frame.as_ptr() as u64, frame.len() as u64, 0, 0);
-}
-
-/// Receive a raw Ethernet frame. Blocks until a frame arrives.
-pub fn net_recv(buf: &mut [u8]) -> usize {
-    syscall(SYS_NET_RECV, buf.as_mut_ptr() as u64, buf.len() as u64, encode_timeout(None), 0) as usize
-}
-
-/// Receive a raw Ethernet frame with a timeout.
-/// `None` = block forever, `Some(nanos)` = timeout. Returns 0 on timeout.
-pub fn net_recv_timeout(buf: &mut [u8], timeout: Option<u64>) -> usize {
-    syscall(SYS_NET_RECV, buf.as_mut_ptr() as u64, buf.len() as u64, encode_timeout(timeout), 0) as usize
 }
 
 // --- Process / OS ---
@@ -907,18 +874,28 @@ pub fn pipe_map(fd: Fd) -> Result<*mut u8, SyscallError> {
 // --- NIC DMA control ---
 
 /// Poll for a received frame. Returns `(buf_index << 16) | frame_len`, or 0 if none.
-pub fn nic_rx_poll() -> u64 {
-    syscall(SYS_NIC_RX_POLL, 0, 0, 0, 0)
+///
+/// Fallible because the kernel now refuses a caller that does not own the
+/// NIC. The packed success value tops out at `(255 << 16) | 4096`, far below
+/// the range `SyscallError::from_u64` claims, so nothing is ambiguous.
+pub fn nic_rx_poll() -> Result<u64, SyscallError> {
+    check(syscall(SYS_NIC_RX_POLL, 0, 0, 0, 0))
 }
 
 /// Tell the kernel to refill RX buffer `buf_index` after consuming the frame.
-pub fn nic_rx_done(buf_index: u64) {
-    syscall(SYS_NIC_RX_DONE, buf_index, 0, 0, 0);
+///
+/// A dropped refill costs an RX slot permanently, so the error must not be
+/// discarded — 256 of them and the NIC stops receiving.
+pub fn nic_rx_done(buf_index: u64) -> Result<(), SyscallError> {
+    check_unit(syscall(SYS_NIC_RX_DONE, buf_index, 0, 0, 0))
 }
 
 /// Submit the TX DMA buffer to hardware. `total_len` includes the net header.
-pub fn nic_tx(total_len: u64) {
-    syscall(SYS_NIC_TX, total_len, 0, 0, 0);
+///
+/// A refused submit means the frame never goes out; silently dropping it made
+/// that indistinguishable from a delivered one.
+pub fn nic_tx(total_len: u64) -> Result<(), SyscallError> {
+    check_unit(syscall(SYS_NIC_TX, total_len, 0, 0, 0))
 }
 
 // --- Audio ---

@@ -3,7 +3,6 @@ use core::arch::naked_asm;
 use alloc::vec::Vec;
 use super::{apic, cpu, gdt};
 use crate::drivers::acpi;
-use crate::sync::Lock;
 use crate::user_ptr::SyscallContext;
 use crate::{device, fd, keyboard, listener, log, pipe, process, shared_memory, vfs};
 use crate::{DirectMap, UserAddr};
@@ -160,7 +159,6 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             let Some(buf) = ctx.user_slice_mut(UserAddr::new(a1), a2) else { return bad_addr };
             sys_random(buf)
         }
-        SYS_SCREEN_SIZE => screen_size(),
         SYS_CLOCK => crate::clock::nanos_since_boot(),
         SYS_OPEN => {
             let path = match ctx.user_str(UserAddr::new(a1), a2) { Ok(s) => s, Err(e) => return e.to_u64() };
@@ -243,34 +241,34 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         29 | 30 => SyscallError::NotSupported.to_u64(), // formerly SYS_SEND_MSG/SYS_RECV_MSG
         SYS_OPEN_DEVICE => sys_open_device(a1),
         32 | 33 => SyscallError::NotSupported.to_u64(), // formerly SYS_REGISTER_NAME/SYS_FIND_PID
-        SYS_SET_SCREEN_SIZE => { set_screen_size(a1 as u32, a2 as u32); 0 }
-        SYS_GPU_PRESENT => { crate::gpu::present_rect(a1 as u32, a2 as u32, a3 as u32, a4 as u32); 0 }
-        SYS_GPU_SET_CURSOR => { crate::gpu::set_cursor(a1 as u32, a2 as u32); 0 }
-        SYS_GPU_MOVE_CURSOR => { crate::gpu::move_cursor(a1 as u32, a2 as u32); 0 }
+        // Scanning out a rect and moving the hardware cursor are the display
+        // owner's business, exactly like SYS_GPU_SET_RESOLUTION. Ungated, any
+        // process could tear the compositor's half-drawn frames onto the
+        // screen and move the cursor under the user's hand. Framebuffer
+        // *contents* were never exposed — those are behind shared_memory
+        // grants — so this is display integrity, not a read of other memory.
+        SYS_GPU_PRESENT | SYS_GPU_SET_CURSOR | SYS_GPU_MOVE_CURSOR => {
+            if !device::is_owner(device::DEVICE_FRAMEBUFFER, process::current_process()) {
+                return SyscallError::PermissionDenied.to_u64();
+            }
+            match num {
+                SYS_GPU_PRESENT => crate::gpu::present_rect(a1 as u32, a2 as u32, a3 as u32, a4 as u32),
+                SYS_GPU_SET_CURSOR => crate::gpu::set_cursor(a1 as u32, a2 as u32),
+                _ => crate::gpu::move_cursor(a1 as u32, a2 as u32),
+            }
+            0
+        }
         SYS_ALLOC_SHARED => sys_alloc_shared(a1),
         SYS_GRANT_SHARED => sys_grant_shared(a1, a2),
         SYS_MAP_SHARED => sys_map_shared(a1),
         SYS_RELEASE_SHARED => sys_release_shared(a1),
-        SYS_THREAD_SPAWN => process::spawn_thread(a1, a2, a3, a4).map_or(SyscallError::Unknown.to_u64(), |t| t.raw() as u64),
+        SYS_THREAD_SPAWN => sys_thread_spawn(a1, a2, a3, a4),
         SYS_THREAD_JOIN => sys_thread_join(a1),
         SYS_CLOCK_REALTIME => crate::rtc::read_time(),
         SYS_CLOCK_EPOCH => crate::rtc::read_epoch_secs(),
         SYS_SYSINFO => {
             let Some(buf) = ctx.user_slice_mut(UserAddr::new(a1), a2) else { return bad_addr };
             sys_sysinfo(buf)
-        }
-        SYS_NET_INFO => {
-            let Some(buf) = ctx.user_slice_mut(UserAddr::new(a1), a2) else { return bad_addr };
-            sys_net_info(buf)
-        }
-        SYS_NET_SEND => {
-            let Some(buf) = ctx.user_slice(UserAddr::new(a1), a2) else { return bad_addr };
-            crate::net::send(buf);
-            0
-        }
-        SYS_NET_RECV => {
-            let Some(buf) = ctx.user_slice_mut(UserAddr::new(a1), a2) else { return bad_addr };
-            sys_net_recv(buf, a3)
         }
         SYS_NANOSLEEP => sys_nanosleep(a1),
         SYS_DUP => sys_dup(a1 as u32),
@@ -335,6 +333,15 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         SYS_PIPE_OPEN => sys_pipe_open(a1, a2),
         SYS_PIPE_ID => sys_pipe_id(a1 as u32),
         SYS_AUDIO_SUBMIT => {
+            // Ungated this took no fd and read no owner, so any process could
+            // start the PCM stream, put whatever soundd was mid-fill on the
+            // wire, and drain `tx_free_slots` until soundd's own submits
+            // failed — which soundd turns into a panic. The check is here
+            // rather than inside `audio::submit_buffer` because that is also
+            // reachable from init paths with no current process.
+            if !device::is_owner(device::DEVICE_AUDIO, process::current_process()) {
+                return SyscallError::PermissionDenied.to_u64();
+            }
             if crate::audio::submit_buffer(a1 as usize, a2 as u32) { 0 } else { SyscallError::InvalidArgument.to_u64() }
         }
         SYS_EXIT => sys_exit(a1 as i32),
@@ -351,13 +358,25 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         }
         SYS_SOCKET_CREATE => sys_socket_create(a1, a2),
         SYS_PIPE_MAP => sys_pipe_map(a1 as u32),
+        // Both address the NIC by ambient authority — no fd, no owner check —
+        // so any process could pop frames out of the used ring before netd
+        // saw them, and, by never refilling, exhaust all 256 RX slots and
+        // stop the NIC receiving.
         SYS_NIC_RX_POLL => {
+            if !device::is_owner(device::DEVICE_NIC, process::current_process()) {
+                return SyscallError::PermissionDenied.to_u64();
+            }
             match crate::net::poll_rx() {
                 Some((buf_idx, frame_len)) => ((buf_idx as u64) << 16) | (frame_len as u64),
                 None => 0,
             }
         }
-        SYS_NIC_RX_DONE => { crate::net::refill_rx_buf(a1 as usize); 0 }
+        SYS_NIC_RX_DONE => {
+            if !device::is_owner(device::DEVICE_NIC, process::current_process()) {
+                return SyscallError::PermissionDenied.to_u64();
+            }
+            crate::net::refill_rx_buf(a1 as usize).map_or_else(|e| e.to_u64(), |()| 0)
+        }
         SYS_NIC_TX => {
             if !device::is_owner(device::DEVICE_NIC, process::current_process()) {
                 return SyscallError::PermissionDenied.to_u64();
@@ -400,7 +419,6 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
                         flags: gpu_info.flags,
                     };
                     device::set_framebuffer_info(fb_info);
-                    set_screen_size(gpu_info.width, gpu_info.height);
                     for &token in &gpu_info.tokens {
                         if shared_memory::grant_kernel(token, pid).is_err() {
                             return SyscallError::Unknown.to_u64();
@@ -461,6 +479,16 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             0
         },
         SYS_SET_RT_PRIORITY => {
+            // The RT band has no priority above it, so an unbounded number of
+            // attacker threads in it starve soundd's mix thread at its own
+            // level — the audio subsystem's core scheduling guarantee, with
+            // nothing behind it. The audio claim is the kernel's existing
+            // record of which process owns the pipeline, and soundd is the
+            // only caller in the tree. Not in `scheduler::set_current_rt`,
+            // which must stay callable from kernel init.
+            if !device::is_owner(device::DEVICE_AUDIO, process::current_process()) {
+                return SyscallError::PermissionDenied.to_u64();
+            }
             crate::scheduler::set_current_rt(a1 != 0);
             0
         },
@@ -881,21 +909,6 @@ fn sys_waitpid(pid: u64, flags: u64) -> u64 {
     }
 }
 
-// Screen size globals (set during kernel init, font is always 8x16)
-static SCREEN_COLS: Lock<usize> = Lock::new(80);
-static SCREEN_ROWS: Lock<usize> = Lock::new(24);
-
-pub fn set_screen_size(width: u32, height: u32) {
-    *SCREEN_COLS.lock() = width as usize / 8;
-    *SCREEN_ROWS.lock() = height as usize / 16;
-}
-
-fn screen_size() -> u64 {
-    let cols = *SCREEN_COLS.lock() as u64;
-    let rows = *SCREEN_ROWS.lock() as u64;
-    (rows << 32) | cols
-}
-
 fn sys_open_device(device_type: u64) -> u64 {
     let pid = process::current_process();
     let desc = match device::try_claim(device_type, pid) {
@@ -1002,7 +1015,14 @@ fn wake_poll_waiters(name: &str) {
 fn sys_alloc_shared(size: u64) -> u64 {
     let pid = process::current_process();
     let addr_space = process::current_address_space();
-    shared_memory::alloc(size, pid, &addr_space).raw() as u64
+    match shared_memory::alloc(size, pid, &addr_space) {
+        Ok(token) => token.raw() as u64,
+        Err(shared_memory::Error::InvalidSize) => SyscallError::InvalidArgument.to_u64(),
+        Err(shared_memory::Error::OutOfMemory)
+        | Err(shared_memory::Error::OutOfVirtualMemory) => SyscallError::ResourceExhausted.to_u64(),
+        Err(shared_memory::Error::NotFound)
+        | Err(shared_memory::Error::PermissionDenied) => unreachable!("alloc grants to its own caller"),
+    }
 }
 
 fn sys_grant_shared(token: u64, target_pid: u64) -> u64 {
@@ -1012,7 +1032,9 @@ fn sys_grant_shared(token: u64, target_pid: u64) -> u64 {
         Ok(()) => 0,
         Err(shared_memory::Error::NotFound) => SyscallError::NotFound.to_u64(),
         Err(shared_memory::Error::PermissionDenied) => SyscallError::PermissionDenied.to_u64(),
-        Err(shared_memory::Error::OutOfVirtualMemory) => unreachable!(),
+        Err(shared_memory::Error::OutOfVirtualMemory)
+        | Err(shared_memory::Error::InvalidSize)
+        | Err(shared_memory::Error::OutOfMemory) => unreachable!("grant neither sizes nor maps"),
     }
 }
 
@@ -1024,6 +1046,8 @@ fn sys_map_shared(token: u64) -> u64 {
         Err(shared_memory::Error::NotFound) => SyscallError::NotFound.to_u64(),
         Err(shared_memory::Error::PermissionDenied) => SyscallError::PermissionDenied.to_u64(),
         Err(shared_memory::Error::OutOfVirtualMemory) => SyscallError::ResourceExhausted.to_u64(),
+        Err(shared_memory::Error::InvalidSize)
+        | Err(shared_memory::Error::OutOfMemory) => unreachable!("map does not allocate"),
     }
 }
 
@@ -1037,18 +1061,55 @@ fn sys_release_shared(token: u64) -> u64 {
 }
 
 fn sys_mmap(req_addr: u64, size: u64, _prot: u64, flags: u64) -> u64 {
+    // `size` crossed the trust boundary. Zero is a request for nothing, and a
+    // size whose 2 MiB rounding does not fit is a request that cannot be
+    // expressed at all; neither is an allocation failure, so neither is
+    // ResourceExhausted. Rounding cannot be allowed to wrap — with
+    // overflow-checks on (the kernel's dev profile) `align_2m` panics, and
+    // with them off it wraps a huge request down to a small one, which is
+    // exactly the silent truncation this kernel forbids. No policy ceiling is
+    // needed: every larger size is already refused by the PMM's own
+    // `free_count` check, which is a physical limit.
+    if size == 0 || (size as usize).checked_add(crate::mm::PAGE_2M as usize - 1).is_none() {
+        return SyscallError::InvalidArgument.to_u64();
+    }
     let aligned = crate::mm::align_2m(size as usize);
     let fixed = flags & 4 != 0; // MmapFlags::FIXED
 
-    let Some(pages) = process::PageAlloc::new(aligned, crate::mm::pmm::Category::Mmap) else {
-        return SyscallError::Unknown.to_u64();
+    // A fixed mapping bypasses `find_gap`, so it has to respect `find_gap`'s
+    // range itself. Nothing checked it before, and `PageTables::remap` only
+    // asserts 2 MiB alignment: a kernel-half `req_addr` reaches
+    // `ensure_table`, which ORs PAGE_USER onto the *shared* kernel PML4 entry
+    // (`new_user` shallow-copies PML4[256..512]) and writes a PDE into the
+    // shared kernel page directory. One unprivileged syscall was a
+    // user-writable window onto physical memory of the caller's choosing,
+    // visible to the kernel and to every other process.
+    let fixed_start = if fixed && req_addr != 0 {
+        let start = req_addr & !(crate::mm::PAGE_2M - 1);
+        let Some(end) = start.checked_add(aligned as u64) else {
+            return SyscallError::InvalidArgument.to_u64();
+        };
+        if start < crate::vma::ALLOC_FLOOR
+            || end > crate::vma::ALLOC_CEILING
+            || !crate::user_ptr::check_user_range(UserAddr::new(start), aligned as u64)
+        {
+            return SyscallError::InvalidArgument.to_u64();
+        }
+        Some(start)
+    } else {
+        None
     };
 
-    if fixed && req_addr != 0 {
+    // Allocate only once the request is known to be satisfiable, so a refused
+    // fixed mapping does not leak its pages.
+    let Some(pages) = process::PageAlloc::new(aligned, crate::mm::pmm::Category::Mmap) else {
+        return SyscallError::ResourceExhausted.to_u64();
+    };
+
+    if let Some(start) = fixed_start {
         let phys = pages.phys();
         let pt = process::current_address_space();
-        let start = req_addr & !(crate::mm::PAGE_2M - 1);
-        let end = (req_addr + aligned as u64 + crate::mm::PAGE_2M - 1) & !(crate::mm::PAGE_2M - 1);
+        let end = start + aligned as u64;
         let mut cur = start;
         let mut offset = 0u64;
         while cur < end {
@@ -1113,6 +1174,23 @@ fn sys_munmap(addr: u64, _size: u64) -> u64 {
             SyscallError::NotFound.to_u64()
         }
     })
+}
+
+/// `(stack_base, stack_ptr)` is a pair the kernel only ever reads back out
+/// through `SYS_STACK_INFO`, and `spawn_thread` stores their difference. Both
+/// are raw syscall arguments, so a base above the pointer underflowed: a
+/// panic with overflow-checks on, and with them off a silent wrap that has
+/// `SYS_STACK_INFO` report a ~2^64-byte stack. A base above the pointer
+/// describes no stack at all, so there is nothing to clamp it to.
+fn sys_thread_spawn(entry: u64, stack_ptr: u64, arg: u64, stack_base: u64) -> u64 {
+    if stack_base > stack_ptr {
+        return SyscallError::InvalidArgument.to_u64();
+    }
+    // Every `None` `spawn_thread` returns is a resource failure (TLS, kernel
+    // stack, virtual address space) or a teardown race — never a bad
+    // argument, which is what `Unknown` used to claim.
+    process::spawn_thread(entry, stack_ptr, arg, stack_base)
+        .map_or(SyscallError::ResourceExhausted.to_u64(), |t| t.raw() as u64)
 }
 
 fn sys_thread_join(tid: u64) -> u64 {
@@ -1216,32 +1294,6 @@ fn sys_sysinfo(buf: &mut [u8]) -> u64 {
     }
 
     pos as u64
-}
-
-fn sys_net_info(buf: &mut [u8]) -> u64 {
-    let Some(mac) = crate::net::mac() else { return SyscallError::NotFound.to_u64() };
-    if buf.len() < 6 { return SyscallError::InvalidArgument.to_u64(); }
-    buf[..6].copy_from_slice(&mac);
-    0
-}
-
-fn sys_net_recv(buf: &mut [u8], timeout_nanos: u64) -> u64 {
-    let deadline = if timeout_nanos != u64::MAX {
-        crate::clock::nanos_since_boot().saturating_add(timeout_nanos)
-    } else {
-        0
-    };
-    loop {
-        if let Some(n) = crate::net::recv(buf) {
-            return n as u64;
-        }
-        if deadline > 0 && crate::clock::nanos_since_boot() >= deadline {
-            return 0;
-        }
-        crate::scheduler::wait_until(&crate::sched::waitqs::NETWORK, deadline, || {
-            crate::net::has_packet()
-        });
-    }
 }
 
 fn sys_nanosleep(nanos: u64) -> u64 {
@@ -1478,10 +1530,40 @@ fn sys_dlopen(path: &str, init_out: u64) -> u64 {
 
 /// Allocate a TLS block for the current thread's DTV entry for `module_id`.
 /// Called by __tls_get_addr slow path when the DTV entry is DTV_UNALLOCATED.
-/// Returns the physical address of the allocated TLS block (stored in DTV and returned to caller).
+/// Returns the virtual address of the allocated TLS block (stored in DTV and
+/// returned to the caller).
+///
+/// `module_id` crosses the trust boundary, so every rejection here is an
+/// error return, not a panic — this had eight panics, two of them reachable
+/// with a single argument and no setup.
+///
+/// The DTV is found through the thread's own kernel-side TLS allocation, not
+/// by following a pointer chain out of the FS base. That was the whole
+/// vulnerability: CR4.FSGSBASE is on, so userland owns its FS base; the old
+/// code read TCB[8] through it with a raw `AddressSpace::translate`, which
+/// applies no user-half check and resolves kernel addresses fine through the
+/// direct map shallow-copied into every user PML4. A thread could point FS at
+/// a buffer it controls, put any address in TCB[8], and have the kernel write
+/// a value of its choosing there. The kernel already knows where the DTV is —
+/// `setup_combined_tls` puts it at offset 0 of the allocation it hands the
+/// thread — so the indirection bought nothing and is gone.
 fn sys_tls_alloc_block(module_id: u64) -> u64 {
+    match tls_alloc_block(module_id) {
+        Ok(vaddr) => vaddr,
+        Err(e) => e.to_u64(),
+    }
+}
+
+fn tls_alloc_block(module_id: u64) -> Result<u64, SyscallError> {
+    // The valid set is the process's own module list, which the kernel built.
     if module_id == 0 {
-        panic!("sys_tls_alloc_block: invalid module_id=0");
+        return Err(SyscallError::InvalidArgument);
+    }
+    // The DTV is a fixed-capacity array the kernel wrote; a module past its
+    // end has nowhere to be recorded. Bounded by the kernel's own constant,
+    // never by the `len` field in the DTV, which the process can rewrite.
+    if module_id > crate::loader::DTV_INITIAL_CAPACITY as u64 {
+        return Err(SyscallError::ResourceExhausted);
     }
 
     // Read module info from the process-level data (shared across threads via heap owner).
@@ -1489,13 +1571,13 @@ fn sys_tls_alloc_block(module_id: u64) -> u64 {
     let (tls_memsz, tls_template) = {
         let data = owner_arc.lock();
         let m = data.elf.tls_modules.iter().find(|m| m.module_id == module_id)
-            .unwrap_or_else(|| panic!("sys_tls_alloc_block: module_id={} not found", module_id));
+            .ok_or(SyscallError::InvalidArgument)?;
         (m.memsz, m.template)
     };
 
     // Allocate TLS block from PMM (needs 2MB alignment for user mapping)
     let page_alloc = process::PageAlloc::new(tls_memsz.max(1), crate::mm::pmm::Category::Tls)
-        .unwrap_or_else(|| panic!("sys_tls_alloc_block: failed to allocate {} bytes", tls_memsz));
+        .ok_or(SyscallError::ResourceExhausted)?;
     let block_ptr = page_alloc.ptr();
 
     // Initialize: copy template, zero BSS (PageAlloc is already zeroed)
@@ -1510,10 +1592,10 @@ fn sys_tls_alloc_block(module_id: u64) -> u64 {
     let pt = process::current_address_space();
     let tls_vaddr = process::with_fd_owner_data(|data| {
         let (vaddr, _) = process::vma_map(&pt, block_phys, page_alloc.size() as u64)
-            .expect("sys_tls_alloc_block: out of virtual address space");
+            .ok_or(SyscallError::ResourceExhausted)?;
         data.alloc_count += 1;
-        vaddr
-    });
+        Ok(vaddr)
+    })?;
 
     // Store in the process-level (fd-owner) data alongside the VMA allocation.
     let tid = process::current_tid();
@@ -1521,22 +1603,15 @@ fn sys_tls_alloc_block(module_id: u64) -> u64 {
         data.elf.dynamic_tls_blocks.insert((tid, module_id), page_alloc);
     });
 
-    // Write block address into current thread's DTV.
-    // FS base = TP (user-visible virtual address). TCB[8] = DTV pointer (virtual).
-    // We need to translate user virtual addresses to kernel direct-map pointers.
-    let tp_virt = super::cpu::rdfsbase();
-    let tp_phys = pt.lock().translate(UserAddr::new(tp_virt))
-        .expect("sys_tls_alloc_block: TP not mapped");
-    let tp_kern = tp_phys.as_ptr::<u64>();
-    let dtv_virt = unsafe { *tp_kern.add(1) }; // TCB[8] = DTV pointer (virtual)
-    assert!(dtv_virt != 0, "sys_tls_alloc_block: no DTV for module_id={}", module_id);
-    let dtv_phys = pt.lock().translate(UserAddr::new(dtv_virt))
-        .expect("sys_tls_alloc_block: DTV not mapped");
-    let dtv_kern = dtv_phys.as_mut_ptr::<u64>();
-    let dtv_len = unsafe { *dtv_kern.add(1) } as u64;
-    assert!(module_id <= dtv_len, "sys_tls_alloc_block: module_id={} exceeds DTV len={}", module_id, dtv_len);
-    unsafe { *dtv_kern.add(2 + (module_id - 1) as usize) = tls_vaddr.raw(); }
-    tls_vaddr.raw()
+    // Write the block address into this thread's DTV, which lives at offset 0
+    // of the thread's own TLS allocation. Every user thread gets one from
+    // `setup_tls`/`setup_combined_tls`, so its absence is a kernel bug.
+    process::with_current_data(|data| {
+        let tls = data.tls_pages.as_ref().expect("sys_tls_alloc_block: thread has no TLS allocation");
+        let dtv_kern = tls.ptr() as *mut u64;
+        unsafe { *dtv_kern.add(2 + (module_id - 1) as usize) = tls_vaddr.raw(); }
+    });
+    Ok(tls_vaddr.raw())
 }
 
 fn sys_dlsym(handle: u64, name: &str) -> u64 {

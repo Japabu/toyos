@@ -713,8 +713,12 @@ pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64, stack_base: u64) -> Op
         let addr_space = parent_addr_space.as_ref().expect("spawn_thread: no address space");
         let parent_data = process_data_arc.lock();
         let tls_phys = tls_alloc.phys();
-        let (tls_vaddr, _) = vma_map(addr_space, tls_phys, tls_alloc.size() as u64)
-            .expect("spawn_thread: out of virtual address space");
+        // VA exhaustion is a resource failure a process can reach by spawning
+        // threads until its range is gone, not a kernel bug. `tls_alloc`
+        // drops on the way out, returning its pages.
+        let Some((tls_vaddr, _)) = vma_map(addr_space, tls_phys, tls_alloc.size() as u64) else {
+            return None;
+        };
         // Rebase fs_base and internal TLS pointers from physical to virtual
         let tls_rebase = tls_vaddr.raw() as i64 - tls_phys as i64;
         let fs_base = (fs_base as i64 + tls_rebase) as u64;

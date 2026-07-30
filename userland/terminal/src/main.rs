@@ -5,7 +5,6 @@ use std::os::fd::AsRawFd;
 use std::os::toyos::process;
 use std::process::Command;
 
-use toyos::gpu;
 use toyos::poller::{Poller, IORING_POLL_IN};
 use toyos::Fd;
 use window::Window;
@@ -20,7 +19,6 @@ fn main() {
         .expect("failed to spawn shell");
 
     let mut window = Window::create_with_title(0, 0, "Terminal");
-    gpu::set_screen_size(window.width(), window.height());
     let fb = window.framebuffer();
     let font_data = std::fs::read("/share/fonts/JetBrainsMono-Regular-8x16.font").expect("failed to read font");
     let font = font::Font::from_prebuilt(&font_data);
@@ -109,8 +107,7 @@ fn main() {
                 }
                 window::Event::Close => break,
                 window::Event::Resized => {
-                    gpu::set_screen_size(window.width(), window.height());
-                    console.resize(window.framebuffer());
+                                    console.resize(window.framebuffer());
                     window.present();
                 }
                 window::Event::Frame => {}

@@ -183,7 +183,6 @@ fn register_gpu(driver: Box<dyn gpu::Gpu>, info: gpu::GpuInfo) {
         pixel_format: info.pixel_format,
         flags: info.flags,
     };
-    syscall::set_screen_size(fb_info.width, fb_info.height);
     crate::device::set_framebuffer_info(fb_info);
     gpu::register(driver, info);
 }

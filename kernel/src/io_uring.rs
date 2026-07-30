@@ -162,6 +162,11 @@ struct IoUringInstance {
     pending_polls: Vec<PendingPoll>,
     /// Threads waiting on this ring's completion queue (spec §8.6).
     waiters: Arc<KWaitQueue>,
+    /// The authoritative CQ tail. The copy in the shared header is a
+    /// publication for userspace, which only ever reads it; keeping the
+    /// kernel's own index here removes one of the two untrusted reads
+    /// `post_cqe` used to do. Only touched under the `IO_URINGS` lock.
+    cq_tail: core::cell::Cell<u32>,
     owner_pid: Pid,
 }
 
@@ -184,29 +189,42 @@ impl IoUringInstance {
         unsafe { &mut *(ptr.add(CQ_RING_OFF as usize + 16 + index as usize * core::mem::size_of::<IoUringCqe>()) as *mut IoUringCqe) }
     }
 
-    /// Post a CQE. Asserts CQ is not full (structurally impossible with 2× sizing).
+    /// Post a CQE, or record a drop if the ring reports itself full.
+    ///
+    /// `head` is written by the process, in the page the process maps, so the
+    /// old assert was a kernel panic four unprivileged calls away: create a
+    /// ring, map it, store `head = 1` while `tail` is still 0, submit one
+    /// SQE. `0u32.wrapping_sub(1)` is `u32::MAX`, which is not less than
+    /// `cq_size`. The SQ side of this file already refuses a dishonest
+    /// `available` with `InvalidArgument` and says why; the CQ side did not.
+    ///
+    /// A ring that reports itself full is either genuinely full — impossible
+    /// with 2x sizing and an honest head — or lying. Either way it is the
+    /// process's own ring and the process's own problem. Not a kill, because
+    /// `complete_pending_for_event` calls this on the *waker's* thread, which
+    /// belongs to a different process.
     fn post_cqe(&self, user_data: u64, result: i32, flags: u32) {
         let cq = self.cq_header();
-        let head = cq.head.load(Ordering::Acquire);
-        let tail = cq.tail.load(Ordering::Acquire);
-        assert!(
-            tail.wrapping_sub(head) < self.cq_size,
-            "io_uring CQ overflow: head={head} tail={tail} size={}", self.cq_size
-        );
+        let tail = self.cq_tail.get();
+        if tail.wrapping_sub(cq.head.load(Ordering::Acquire)) >= self.cq_size {
+            cq.dropped.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         let idx = tail & (self.cq_size - 1);
         let cqe = self.cqe_at_mut(idx);
         cqe.user_data = user_data;
         cqe.result = result;
         cqe.flags = flags;
+        self.cq_tail.set(tail.wrapping_add(1));
         cq.tail.store(tail.wrapping_add(1), Ordering::Release);
     }
 
-    /// Count available CQEs (unread by userspace).
+    /// Count available CQEs (unread by userspace). Measured against the
+    /// kernel's own tail; a process that rewrites `head` can only ever
+    /// mislead itself about how many completions are waiting for it.
     fn cq_count(&self) -> u32 {
-        let cq = self.cq_header();
-        let head = cq.head.load(Ordering::Acquire);
-        let tail = cq.tail.load(Ordering::Acquire);
-        tail.wrapping_sub(head)
+        let head = self.cq_header().head.load(Ordering::Acquire);
+        self.cq_tail.get().wrapping_sub(head)
     }
 }
 
@@ -239,7 +257,8 @@ pub fn create(depth: u32) -> Result<(RingId, SharedToken), SyscallError> {
 
     let pid = process::current_process();
     let addr_space = process::current_address_space();
-    let shm_token = shared_memory::alloc(crate::mm::PAGE_2M, pid, &addr_space);
+    let shm_token = shared_memory::alloc(crate::mm::PAGE_2M, pid, &addr_space)
+        .map_err(|_| SyscallError::ResourceExhausted)?;
 
     let shm_vaddr = shared_memory::map(shm_token, pid, &addr_space)
         .map_err(|_| SyscallError::Unknown)?;
@@ -264,14 +283,14 @@ pub fn create(depth: u32) -> Result<(RingId, SharedToken), SyscallError> {
     sq_header.head = core::sync::atomic::AtomicU32::new(0);
     sq_header.tail = core::sync::atomic::AtomicU32::new(0);
     sq_header.ring_size = sq_size;
-    sq_header._pad = 0;
+    sq_header.dropped = core::sync::atomic::AtomicU32::new(0);
 
     // Initialize CQ ring header
     let cq_header = unsafe { &mut *(base.add(CQ_RING_OFF as usize) as *mut IoUringRingHeader) };
     cq_header.head = core::sync::atomic::AtomicU32::new(0);
     cq_header.tail = core::sync::atomic::AtomicU32::new(0);
     cq_header.ring_size = cq_size;
-    cq_header._pad = 0;
+    cq_header.dropped = core::sync::atomic::AtomicU32::new(0);
 
     let ring_id = {
         let mut guard = IO_URINGS.lock();
@@ -283,6 +302,7 @@ pub fn create(depth: u32) -> Result<(RingId, SharedToken), SyscallError> {
             cq_size,
             pending_polls: Vec::new(),
             waiters: new_queue(WaitClass::Io),
+            cq_tail: core::cell::Cell::new(0),
             owner_pid: pid,
         })
     };
@@ -349,8 +369,17 @@ pub fn enter(
         // The re-check is this ring's own condition, not mere readiness: a
         // waiter for `min_complete` CQEs that cancelled on the first one
         // would spin instead of parking.
+        // The ticket must be consumed on every path out of here. A sibling
+        // thread closing this ring's fd removes it from IO_URINGS in exactly
+        // this window, so the `?` on the re-check propagated out with the
+        // ticket still armed — tripping its drop bomb, i.e. a kernel panic
+        // from two unprivileged threads.
         let ticket = scheduler::prepare_wait(&queue);
-        if cq_count(ring_id)? >= min_complete {
+        let recheck = match cq_count(ring_id) {
+            Ok(n) => n,
+            Err(e) => { ticket.cancel(); return Err(e); }
+        };
+        if recheck >= min_complete {
             ticket.cancel();
             continue;
         }

@@ -29,6 +29,8 @@ pub enum Error {
     NotFound,
     PermissionDenied,
     OutOfVirtualMemory,
+    InvalidSize,
+    OutOfMemory,
 }
 
 // ---------------------------------------------------------------------------
@@ -113,11 +115,22 @@ fn next_token() -> SharedToken {
 
 /// Allocate 2MB-aligned shared memory. Maps it into the owner's page tables.
 /// Returns a token; other processes can map it via `map()` after `grant()`.
-#[must_use]
-pub fn alloc(size: u64, owner_pid: Pid, addr_space: &PageTables) -> SharedToken {
+///
+/// Fallible because `size` comes from userland: it was infallible, and each
+/// of the three ways it can fail was an `expect` or an assert one frame down
+/// — `alloc_shared(0)` reached the PMM's `count > 0` assert, a size above
+/// free memory reached the `.expect` here, and enough calls to exhaust the
+/// caller's virtual range reached `map_into`'s. All three are now errors.
+/// No bound is invented: `alloc_contiguous` already refuses more than free
+/// physical memory, which is a physical limit rather than a chosen one.
+pub fn alloc(size: u64, owner_pid: Pid, addr_space: &PageTables) -> Result<SharedToken, Error> {
+    if size == 0 || (size as usize).checked_add(PAGE_2M as usize - 1).is_none() {
+        return Err(Error::InvalidSize);
+    }
     let aligned_size = align_2m(size as usize);
     let page_count = aligned_size / PAGE_2M as usize;
-    let pages = pmm::alloc_contiguous(page_count, pmm::Category::SharedMemory).expect("shared_memory: allocation failed");
+    let pages = pmm::alloc_contiguous(page_count, pmm::Category::SharedMemory)
+        .ok_or(Error::OutOfMemory)?;
     let phys = DirectMap::from_phys(pages[0].direct_map().phys());
 
     with_regions_mut(|regions| {
@@ -129,10 +142,11 @@ pub fn alloc(size: u64, owner_pid: Pid, addr_space: &PageTables) -> SharedToken 
             allowed: alloc::vec![owner_pid],
             mapped_in: Vec::new(),
         };
-        region.map_into(owner_pid, addr_space)
-            .expect("shared_memory::alloc: failed to map into owner");
+        // On this path the region is dropped, which returns its physical
+        // pages to the PMM — nothing leaks.
+        region.map_into(owner_pid, addr_space).ok_or(Error::OutOfVirtualMemory)?;
         regions.push((token, region));
-        token
+        Ok(token)
     })
 }
 

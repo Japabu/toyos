@@ -47,7 +47,11 @@ unsafe impl UserSafe for toyos_abi::input::RawKeyEvent {}
 unsafe impl UserSafe for toyos_abi::input::MouseEvent {}
 
 /// Check that [ptr..ptr+size) is in the user half of the address space.
-fn check_user_range(ptr: UserAddr, size: u64) -> bool {
+///
+/// Also used by `sys_mmap`, which installs mappings rather than dereferencing
+/// them: the hardware user/kernel split is the same bound either way, and a
+/// second copy of the constant is a second thing to get wrong.
+pub(crate) fn check_user_range(ptr: UserAddr, size: u64) -> bool {
     if size == 0 { return true; }
     let raw = ptr.raw();
     let Some(end) = raw.checked_add(size) else { return false };

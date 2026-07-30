@@ -63,7 +63,9 @@ impl Device for DmaNic {
     type TxToken<'a> = DmaTxToken<'a>;
 
     fn receive(&mut self, _timestamp: SmoltcpInstant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        let v = toyos_nic::nic_rx_poll();
+        // netd holds the NIC claim, so a refusal here is a kernel-side bug,
+        // not a condition to swallow.
+        let v = toyos_nic::nic_rx_poll().expect("netd owns the NIC");
         if v == 0 { return None; }
         let (buf_idx, frame_len) = ((v >> 16) as usize, (v & 0xFFFF) as usize);
         // Safety: The data slice borrows from the DMA region via the device's lifetime 'a.
@@ -105,7 +107,7 @@ impl<'a> phy::RxToken for DmaRxToken<'a> {
         F: FnOnce(&[u8]) -> R,
     {
         let result = f(self.data);
-        toyos_nic::nic_rx_done(self.buf_idx as u64);
+        toyos_nic::nic_rx_done(self.buf_idx as u64).expect("netd owns the NIC");
         result
     }
 }
@@ -128,7 +130,7 @@ impl<'a> phy::TxToken for DmaTxToken<'a> {
                 len,
             );
             let result = f(frame);
-            toyos_nic::nic_tx((self.net_hdr_size + len) as u64);
+            toyos_nic::nic_tx((self.net_hdr_size + len) as u64).expect("netd owns the NIC");
             result
         }
     }

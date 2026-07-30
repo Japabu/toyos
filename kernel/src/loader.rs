@@ -23,7 +23,7 @@ const USER_STACK_SIZE: usize = 4 * PAGE_2M as usize; // 8 MB
 
 const TCB_SIZE: usize = 64;
 /// Initial DTV capacity (number of module entries).
-const DTV_INITIAL_CAPACITY: usize = 64;
+pub const DTV_INITIAL_CAPACITY: usize = 64;
 /// Header size: generation (8) + len (8).
 const DTV_HEADER_SIZE: usize = 16;
 /// Sentinel value for unallocated DTV entries.
