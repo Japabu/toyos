@@ -68,8 +68,6 @@ Rules:
 
 The kernel ABI and SDK are Rust-native and capability-shaped. POSIX compatibility, where it is needed to run ecosystem software, belongs in a **userspace** compatibility layer (`userland/libc` — ToyOS's own code, not a fork) with explicitly relaxed rules. That layer may be ugly; the kernel may not.
 
-Settled by experiment. The `unix_compat_try` branch (2026-03) tried the opposite — make `rust-lang/libc` ToyOS's platform layer so crates would not need forks. It regressed the ToyOS-hosted rustc, dropped cargo from `system.toml`, pulled `aws-lc-rs` + `cmake` into the dependency graph the moment ToyOS claimed to be a Unix-ish libc platform, and never booted. It never touched `toyos-abi`: the experiment was always userspace impedance-matching, and it failed only because it sat *below* std instead of beside it. `specs/posix-bootstrap-cost.md` has what running autotools software would cost.
-
 ## Std library rules
 
 - **Add ToyOS as a new platform alongside unix/windows/wasi — never hijack existing cfg gates.** This is the rule that actually governs; the two below are its consequences.
@@ -187,6 +185,6 @@ One line each. **`specs/known-issues.md` has the detail and is the file to updat
 - **The build system suppresses rustc warnings on success** — `Command::output()` in `src/build.rs` captures stderr regardless of quiet mode, so the zero-warning bar is unenforced outside the kernel.
 - **`bootstrap-cc` is alive but not wired in** — nothing builds it, it inherits the wrong toolchain, and its TinyCC download is unpinned.
 - **The `memmap2` fork is 165 lines of unreachable code.** Delete `src/toyos.rs` or drop the toyos gate in `rustc_data_structures` — exactly one of the two.
-- **Design debt:** io_uring abuses `shared_memory`; `SharedToken` is a bare `u32` with no RAII; `Fd` should be `Handle`; `build_toyos_bins` belongs in the test harness; `Lock::force_unlock` has no caller.
+- **Design debt:** io_uring abuses `shared_memory`; `SharedToken` is a bare `u32` with no RAII; `Fd` should be `Handle`; `build_toyos_bins` belongs in the test harness; `Lock::force_unlock` has no caller; `KernelSlice::from_raw` trusts the caller's size — allocators should construct the slice.
 - **Hardware gaps:** PCID/INVPCID untested outside TCG; TLB shootdowns IPI every CPU for a full flush; the LAPIC timer is one-shot where TSC-deadline would be exact.
 - One unreproduced observation: `ps` appeared to stall for >2 s under heavy single-core load. If seen again, capture with LLDB before restarting.
