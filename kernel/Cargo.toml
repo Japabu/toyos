@@ -9,16 +9,7 @@ license = "MIT OR Apache-2.0"
 [features]
 debug-wait = []
 
-# The kernel had no profile section at all, so it built at opt-level 0 — with
-# `clock::nanos_since_boot` calling `rdtsc` out of line despite `#[inline]`,
-# and a `__udivti3` call in the same path. Userland learned this already (its
-# deps are at opt-level 2 because rustysynth rendered 2-4x slower than real
-# time at 0); the kernel never had the lesson applied.
-#
-# Optimisation is on, `debug-assertions` and `overflow-checks` deliberately are
-# not off. Fail-fast is a principle here, and an unchecked arithmetic wrap in
-# the kernel is exactly the class of bug that must scream rather than be fast.
-# Debug info stays for the LLDB workflow.
+# debug-assertions and overflow-checks stay on: fail-fast beats speed here.
 [profile.dev]
 opt-level = 2
 debug = true
