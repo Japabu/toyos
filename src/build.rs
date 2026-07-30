@@ -216,7 +216,6 @@ fn build_and_assemble(
 ) -> Vec<u8> {
     let userland_dir = root.join("userland");
 
-    // Partition into workspace members vs standalone
     let mut workspace_packages: Vec<&str> = Vec::new();
     let mut standalone: Vec<(&String, &ProgramConfig)> = Vec::new();
     for (name, cfg) in &config.programs {
@@ -233,7 +232,6 @@ fn build_and_assemble(
         }
     }
 
-    // Build workspace programs in one shot
     if !workspace_packages.is_empty() {
         let mut extra: Vec<&str> = Vec::new();
         if profile == "release" {
@@ -253,7 +251,6 @@ fn build_and_assemble(
         );
     }
 
-    // Build standalone programs individually
     for (name, cfg) in &standalone {
         let crate_dir = cfg.crate_dir(root, name);
         let mut extra: Vec<&str> = Vec::new();
@@ -273,7 +270,6 @@ fn build_and_assemble(
         );
     }
 
-    // Collect binaries
     let mut initrd_files: Vec<(String, Vec<u8>)> = Vec::new();
     let ws_target = userland_dir.join(format!("target/x86_64-unknown-toyos/{profile}"));
 
@@ -289,12 +285,10 @@ fn build_and_assemble(
         initrd_files.push((format!("bin/{name}"), data));
     }
 
-    // Hosted rustc
     if config.hosted_rustc {
         collect_hosted_rustc(root, &mut initrd_files);
     }
 
-    // Assets
     if !config.assets.is_empty() {
         initrd_files.extend(assets::collect(&config.assets));
     }
@@ -322,7 +316,6 @@ pub fn build(root: &Path, debug: bool, release: bool) {
 
     invalidate_stale(root, &config, &fp);
 
-    // Build kernel and bootloader in parallel
     let init_programs = config.init.join(";");
     let kernel_handle = {
         let root = root.to_path_buf();
@@ -366,16 +359,6 @@ pub fn build(root: &Path, debug: bool, release: bool) {
 
     let initrd_bytes =
         build_and_assemble(root, &config, profile, &path_env, &[], false);
-
-    // Mirror initrd to target/initrd/ for inspection
-    let initrd_dir = root.join("target/initrd");
-    if initrd_dir.exists() {
-        fs::remove_dir_all(&initrd_dir).expect("Failed to clean initrd dir");
-    }
-    // Re-parse the initrd files for mirroring (we only have the raw bytes now).
-    // Instead, we mirror before creating the initrd. But build_and_assemble already
-    // created it. For simplicity, skip the mirror or refactor later.
-    // TODO: The mirror was a debug aid. Skipping for now since initrd is a bcachefs image.
 
     let disk_bytes = image::create_boot_image(&initrd_bytes, profile);
     fs::write(root.join("target/bootable.img"), disk_bytes).expect("Failed to write image");

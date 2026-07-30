@@ -243,7 +243,6 @@ pub fn search(io: &dyn BlockIO, root: BlockNum, root_level: u16, key: &Key) -> R
         let node = Node::read(io, block)?;
 
         if level == 0 {
-            // Leaf node — search for exact key match
             for entry in &node.entries {
                 if entry.key == *key {
                     return Ok(Some(entry.value.clone()));
@@ -252,7 +251,6 @@ pub fn search(io: &dyn BlockIO, root: BlockNum, root_level: u16, key: &Key) -> R
             return Ok(None);
         }
 
-        // Interior node — descend
         block = find_child(&node, key);
         level -= 1;
     }
@@ -280,7 +278,6 @@ pub fn search_by_hash(
     let mut block = root;
     let mut level = root_level;
 
-    // Descend to leaf
     loop {
         let node = Node::read(io, block)?;
         if level == 0 {
@@ -303,7 +300,6 @@ pub fn delete(io: &dyn BlockIO, root: BlockNum, root_level: u16, key: &Key) -> R
     let mut block = root;
     let mut level = root_level;
 
-    // Descend to leaf
     loop {
         let mut node = Node::read(io, block)?;
         if level == 0 {
@@ -406,7 +402,6 @@ pub fn insert(
     match split {
         InsertResult::Done => Ok((root, root_level)),
         InsertResult::Split { new_block, split_key } => {
-            // Root was split — create new root
             let new_root_block = alloc.alloc_block(io)?;
             let old_min_key = find_min_key(io, root, root_level)?;
 
@@ -450,7 +445,6 @@ fn insert_recursive(
         // Leaf — insert into sorted position, replacing if key matches
         let pos = match node.entries.binary_search_by(|e| e.key.cmp(&entry.key)) {
             Ok(i) => {
-                // Replace existing
                 node.entries[i] = entry.clone();
                 None
             }
@@ -461,14 +455,12 @@ fn insert_recursive(
         };
 
         if node.can_fit(0) || (pos.is_none() && node.entries_size() <= MAX_PAYLOAD) {
-            // Check total entries fit
             if NODE_HEADER_SIZE + node.entries_size() <= BLOCK_SIZE {
                 node.write(io, block);
                 return Ok(InsertResult::Done);
             }
         }
 
-        // Need to split
         return split_node(io, alloc, block, node);
     }
 
@@ -531,7 +523,6 @@ fn split_node(
         entries: right_entries,
     };
 
-    // Write both halves
     node.write(io, block);
     right_node.write(io, right_block);
 

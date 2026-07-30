@@ -111,20 +111,17 @@ fn highlight_line(line: &str, in_block_comment: bool) -> (Vec<(usize, TokenKind)
             continue;
         }
 
-        // Skip whitespace
         if bytes[i] == b' ' || bytes[i] == b'\t' {
             spans.push((i, TokenKind::Normal));
             i += 1;
             continue;
         }
 
-        // Line comment
         if i + 1 < len && bytes[i] == b'/' && bytes[i + 1] == b'/' {
             spans.push((i, TokenKind::Comment));
             return (spans, in_comment);
         }
 
-        // Block comment start
         if i + 1 < len && bytes[i] == b'/' && bytes[i + 1] == b'*' {
             let start = i;
             i += 2;
@@ -150,7 +147,6 @@ fn highlight_line(line: &str, in_block_comment: bool) -> (Vec<(usize, TokenKind)
             return (spans, in_comment);
         }
 
-        // String literal
         if bytes[i] == b'"' {
             let start = i;
             i += 1;
@@ -168,7 +164,6 @@ fn highlight_line(line: &str, in_block_comment: bool) -> (Vec<(usize, TokenKind)
             continue;
         }
 
-        // Char literal
         if bytes[i] == b'\'' {
             let start = i;
             i += 1;
@@ -186,7 +181,6 @@ fn highlight_line(line: &str, in_block_comment: bool) -> (Vec<(usize, TokenKind)
             continue;
         }
 
-        // Number
         if bytes[i].is_ascii_digit()
             || (bytes[i] == b'.' && i + 1 < len && bytes[i + 1].is_ascii_digit())
         {
@@ -234,7 +228,6 @@ fn highlight_line(line: &str, in_block_comment: bool) -> (Vec<(usize, TokenKind)
             continue;
         }
 
-        // Identifier or keyword
         if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
             let start = i;
             while i < len && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
@@ -252,7 +245,6 @@ fn highlight_line(line: &str, in_block_comment: bool) -> (Vec<(usize, TokenKind)
             continue;
         }
 
-        // Other characters (operators, punctuation)
         spans.push((i, TokenKind::Normal));
         i += 1;
     }
@@ -573,7 +565,6 @@ struct Editor {
     finder: Finder,
     goto_line: GoToLine,
 
-    // Layout
     font_w: usize,
     font_h: usize,
     gutter_width: usize,
@@ -806,11 +797,9 @@ impl Editor {
         }
         let line = &self.buffer.lines[self.cursor_row];
         let mut end = self.cursor_col;
-        // Skip whitespace
         while end > 0 && line.as_bytes()[end - 1] == b' ' {
             end -= 1;
         }
-        // Skip word chars
         while end > 0 && (line.as_bytes()[end - 1].is_ascii_alphanumeric() || line.as_bytes()[end - 1] == b'_') {
             end -= 1;
         }
@@ -1212,17 +1201,14 @@ fn render(
         highlights.push(spans);
     }
 
-    // Draw lines
     for (vi, row) in (start_row..end_row).enumerate() {
         let y = top + vi * fh;
         let line = &editor.buffer.lines[row];
 
-        // Current line highlight
         if row == editor.cursor_row {
             fb.fill_rect(editor.gutter_width, y, win_w - editor.gutter_width, fh, CURLINE_BG);
         }
 
-        // Selection highlight
         if let Some(((sr, sc), (er, ec))) = sel {
             if row >= sr && row <= er {
                 let sel_start = if row == sr { sc } else { 0 };
@@ -1237,7 +1223,6 @@ fn render(
             }
         }
 
-        // Find match highlights
         if editor.finder.active {
             for (mi, &(mr, mc, ml)) in editor.finder.matches.iter().enumerate() {
                 if mr == row {
@@ -1257,13 +1242,11 @@ fn render(
             }
         }
 
-        // Gutter
         fb.fill_rect(0, y, editor.gutter_width, fh, GUTTER_BG);
         let num = format!("{}", row + 1);
         let gutter_x = editor.gutter_width - (num.len() + 1) * fw;
         font.draw_string(fb, gutter_x, y, &num, GUTTER_FG, GUTTER_BG);
 
-        // Text with syntax highlighting
         let spans = &highlights[vi];
         if spans.is_empty() {
             continue;
@@ -1280,7 +1263,6 @@ fn render(
             };
 
             let fg = if editor.finder.active {
-                // Check if this char is in the current match
                 token_color(kind)
             } else {
                 token_color(kind)
@@ -1298,13 +1280,11 @@ fn render(
 
                 let ch = bytes[ci] as char;
 
-                // Determine background for this character
                 let char_bg = if editor.finder.active
                     && editor.finder.matches.iter().enumerate().any(|(mi, &(mr, mc, ml))| {
                         mr == row && ci >= mc && ci < mc + ml && mi == editor.finder.current_match
                     })
                 {
-                    // Current match
                     font.draw_char(fb, x, y, ch, MATCH_FG, MATCH_BG);
                     continue;
                 } else if let Some(((sr, sc), (er, ec))) = sel {
@@ -1330,14 +1310,12 @@ fn render(
         }
     }
 
-    // Fill gutter below text
     let text_bottom = top + (end_row - start_row) * fh;
     if text_bottom < win_h.saturating_sub(editor.status_height) {
         fb.fill_rect(0, text_bottom, editor.gutter_width,
             win_h - editor.status_height - text_bottom, GUTTER_BG);
     }
 
-    // Cursor
     if cursor_visible {
         let cy = top + (editor.cursor_row.saturating_sub(editor.scroll_row)) * fh;
         let cx = editor.gutter_width
@@ -1348,7 +1326,6 @@ fn render(
         }
     }
 
-    // Status bar
     let status_y = win_h - editor.status_height;
     fb.fill_rect(0, status_y, win_w, editor.status_height, STATUS_BG);
     let filename = editor
@@ -1367,7 +1344,6 @@ fn render(
     let right_x = win_w.saturating_sub(right.len() * fw + 4);
     font.draw_string(fb, right_x, status_y + 2, &right, STATUS_FG, STATUS_BG);
 
-    // Find bar
     if editor.finder.active {
         fb.fill_rect(0, 0, win_w, editor.findbar_height, FINDBAR_BG);
 
@@ -1385,7 +1361,6 @@ fn render(
             win_w - input_x - 4
         };
 
-        // Find input
         fb.fill_rect(input_x, 2, input_w, fh + 4, FINDBAR_INPUT_BG);
         font.draw_string(
             fb,
@@ -1418,7 +1393,6 @@ fn render(
             }
         }
 
-        // Match count
         if !editor.finder.matches.is_empty() {
             let info = format!(
                 "{}/{}",
@@ -1430,7 +1404,6 @@ fn render(
         }
     }
 
-    // Go-to-line dialog
     if editor.goto_line.active {
         let dlg_w = 30 * fw;
         let dlg_h = fh + 8;
@@ -1494,7 +1467,6 @@ fn main() {
 
         let mut needs_redraw = false;
 
-        // Cursor blink
         if last_blink.elapsed().as_millis() as u64 >= blink_ms {
             cursor_visible = !cursor_visible;
             last_blink = Instant::now();
@@ -1571,13 +1543,11 @@ fn reset_blink(visible: &mut bool, last: &mut Instant) {
 }
 
 fn handle_key(editor: &mut Editor, key: &KeyEvent, fb: &mut Framebuffer) {
-    // Go-to-line dialog
     if editor.goto_line.active {
         handle_goto_line_key(editor, key);
         return;
     }
 
-    // Find bar
     if editor.finder.active {
         handle_find_key(editor, key);
         return;

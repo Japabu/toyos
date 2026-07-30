@@ -738,9 +738,8 @@ fn main() {
     let mut last_taskbar_update = Instant::now();
     let mut cached_stats = SystemStats { used_mb: 0, total_mb: 0, cpu_pct: 0 };
 
-    // io_uring token assignments: system fds use their fd number directly.
-    // Client fds also use their fd number. We distinguish by checking if the
-    // token matches a known system fd.
+    // Every token is its fd number, system and client alike; the dispatch
+    // below tells them apart by comparing against the known system fds.
     let token_kb = kb.fd().0 as u64;
     let token_mouse = mouse.fd().0 as u64;
     let token_listener = listener.fd().0 as u64;
@@ -1265,8 +1264,7 @@ fn main() {
             }
         }
 
-        // Collect client messages to process (fd, pid, header).
-        // We collect first to avoid borrowing windows while mutating it.
+        // Collected first to avoid borrowing `windows` while mutating it.
         let mut client_msgs: Vec<(Fd, u32, ipc::IpcHeader, Option<Connection>)> = Vec::new();
 
         if listener_ready {

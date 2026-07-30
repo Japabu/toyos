@@ -157,7 +157,6 @@ pub fn clipboard_set(text: &str) {
         let _ = conn.send(MSG_CLIPBOARD_SET_SHM, &ClipboardShmMsg { token: shm.token(), len: bytes.len() as u32 });
         *CLIPBOARD_SHM.lock().unwrap() = Some(shm);
     }
-    // conn drops here, closing the fd
 }
 
 pub struct Window {
@@ -302,6 +301,5 @@ impl std::fmt::Debug for Window {
 impl Drop for Window {
     fn drop(&mut self) {
         let _ = self.conn.signal(MSG_DESTROY_WINDOW);
-        // conn drops here, closing the fd
     }
 }

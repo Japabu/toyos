@@ -139,10 +139,7 @@ pub static DG_music_module: MusicModule = MusicModule {
 // ── SFX mixer ──
 //
 // The audio callback runs on a kernel-boosted RT thread with a ~2.9ms deadline.
-// It must never block: no locks, no allocation, no syscalls. All game-thread
-// control (start/stop/params) travels through a lock-free SPSC command ring;
-// playing-state flows back through per-channel atomics. The mixer state itself
-// is owned exclusively by the callback closure.
+// It must never block: no locks, no allocation, no syscalls.
 
 // doomgeneric's snd_channels — the engine never allocates more.
 const NUM_SFX_CHANNELS: usize = 8;
@@ -403,7 +400,6 @@ unsafe extern "C" fn toyos_init_sound(use_sfx_prefix: bool) -> bool {
 
 unsafe extern "C" fn toyos_shutdown_sound() {
     SND_INITIALIZED.store(false, Ordering::Relaxed);
-    // Dropping the stream joins the cpal audio thread, stopping the callback.
     drop(AUDIO_STREAM.lock().unwrap().take());
 }
 
@@ -491,25 +487,21 @@ unsafe extern "C" fn toyos_sound_is_playing(handle: i32) -> bool {
 // ── Music ──
 
 // TimGM6mb by Tim Brechbill (GPL-2.0, like doomgeneric itself): a compact ~6MB
-// General MIDI soundfont well suited to Doom's MIDI scores. Downloaded into
-// assets/ by build.rs and shipped in the initrd — replaces the 148MB FluidR3_GM
-// that used to be embedded in the binary via include_bytes.
+// General MIDI soundfont. Downloaded into assets/ by build.rs and shipped in
+// the initrd rather than embedded, so the binary stays small.
 const SOUNDFONT_PATH: &str = "/share/timgm6mb.sf2";
 
-// ~3s of render-ahead at 44100Hz (2^17 frames = 512KB of stereo i16 — trivial
-// next to Doom's WAD and framebuffer footprint). On a saturated single core
-// the game thread starves the midi-synth thread for hundreds of ms at a time;
-// a deep ring lets the producer bank audio during idle moments and coast
-// through those windows. Power of two so the wrapping-counter slot math is a
-// mask, not a per-frame division in the RT callback.
+// ~3s of render-ahead at 44100Hz. On a saturated single core the game thread
+// starves the midi-synth thread for hundreds of ms at a time, and a ring this
+// deep lets the producer bank audio in idle moments and coast through those
+// windows. Power of two so the wrapping-counter slot math is a mask, not a
+// per-frame division in the RT callback.
 const RING_FRAMES: usize = 131072;
 const RENDER_CHUNK: usize = 1024;
 
-// Intentionally ON for quality — turning it off is an audible tradeoff
-// reserved for a measured decision. Disabling skips rustysynth's entire
-// effects pass (reverb comb/allpass banks, chorus delay lines, four extra
-// per-voice block mixes), roughly halving synthesis cost — the cheapest
-// lever if music CPU ever becomes a problem again.
+// Disabling this skips rustysynth's whole effects pass and roughly halves
+// synthesis cost, at an audible quality cost. Do not flip it to buy CPU
+// without asking.
 const ENABLE_REVERB_AND_CHORUS: bool = true;
 
 enum MusicCmd {
@@ -518,11 +510,9 @@ enum MusicCmd {
 }
 
 // SPSC ring of pre-rendered stereo i16 frames: the midi-synth thread pushes,
-// the audio callback drains. Volume is applied at read time so changes are
-// audible immediately instead of after up to ~3s of buffered audio. Song
-// switches are equally immediate despite the depth: clear() marks all
-// buffered frames droppable and read_mix jumps the read index past them on
-// the next callback, so switch latency is one render chunk, not ring depth.
+// the audio callback drains. Volume is applied at read time, and clear() marks
+// buffered frames droppable rather than waiting for them — so neither a volume
+// change nor a song switch is delayed by the ring's ~3s of depth.
 struct MusicRing {
     buf: Box<[UnsafeCell<i16>]>,
     read: AtomicUsize,
@@ -649,11 +639,8 @@ fn handle_music_cmd(
     }
 }
 
-/// Synthesis-budget telemetry, one line per ~5s of wall time: the real-time
-/// factor (CPU cost of rendering one second of audio) is the number that
-/// decides whether full-quality synthesis fits a single core — buffering can
-/// bridge spikes but not rt >= 1.0 sustained. Off the render hot path cost:
-/// one Instant sample per 23ms chunk plus this check.
+/// Reports the real-time factor: CPU cost of rendering one second of audio.
+/// Buffering bridges spikes, but a sustained rt >= 1.0 cannot be hidden.
 fn music_telemetry(ring: &MusicRing, render_cost: std::time::Duration) {
     use std::sync::Mutex;
     use std::time::Instant;
@@ -677,8 +664,7 @@ fn music_thread(ring: Arc<MusicRing>, rx: mpsc::Receiver<MusicCmd>, sf: Arc<Soun
     let mut sequencer: Option<MidiFileSequencer> = None;
     // A finished non-looping song leaves up to a full ring (~3s) of rendered
     // frames buffered; `playing` must stay true until the callback consumes
-    // them or the tail is cut off. A Play/Stop command cancels the drain
-    // immediately, so this never delays a song switch.
+    // them or the tail is cut off.
     let mut draining = false;
     let mut left_buf = vec![0.0f32; RENDER_CHUNK];
     let mut right_buf = vec![0.0f32; RENDER_CHUNK];
@@ -722,11 +708,9 @@ fn music_thread(ring: Arc<MusicRing>, rx: mpsc::Receiver<MusicCmd>, sf: Arc<Soun
             continue;
         }
 
-        // Greedy pacing: render whenever a chunk fits, sleep only when the
-        // ring is effectively full. Every idle moment tops the bank back up
-        // to ~3s, which is what lets playback coast through starvation. The
-        // previous half-full hysteresis capped usable headroom at ~93ms —
-        // less than a single scheduling gap under load.
+        // Render whenever a chunk fits rather than waiting for the ring to
+        // drain to a low-water mark: topping the bank up in every idle moment
+        // is what gives playback its full depth to coast on.
         if ring.free_space() >= RENDER_CHUNK {
             let t0 = std::time::Instant::now();
             seq.render(&mut left_buf, &mut right_buf);

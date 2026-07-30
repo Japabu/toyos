@@ -591,7 +591,6 @@ fn collect_symtab_entries<'a>(
         });
     }
 
-    // Globals
     for (name, def) in &state.globals {
         let SymbolDef::Defined { section, value, size } = def else { continue; };
         let sec = &state.sections[*section];
@@ -918,7 +917,6 @@ pub(crate) fn emit_elf(
 
     w.reserve_until((file_rw_end - base) as usize);
 
-    // Rela count
     let rela_count = if let Some(relocs) = relocs {
         relocs.relatives.len() + relocs.glob_dats.len()
             + relocs.tpoff64s.len() + relocs.named_tpoff64s.len() + relocs.tpoff32s.len()
@@ -1023,7 +1021,6 @@ pub(crate) fn emit_elf(
         e_flags: 0,
     }).unwrap();
 
-    // Program headers
     w.write_align_program_headers();
     w.write_program_header(&ProgramHeader {
         p_type: elf::PT_LOAD,
@@ -1174,7 +1171,6 @@ pub(crate) fn emit_elf(
         w.pad_until(rw_end_off);
     }
 
-    // Dynamic symbols
     if has_dynamic_libs {
         w.write_null_dynamic_symbol();
         for (_, str_id) in &import_str_ids {
@@ -1218,7 +1214,6 @@ pub(crate) fn emit_elf(
         }
         w.write_dynstr();
 
-        // .gnu.hash
         let sym_hashes: Vec<u32> = export_str_ids.iter().map(|(_, _, _, h, _)| *h).collect();
         w.write_gnu_hash(1, 6, gnu_hash_bloom_count, gnu_hash_bucket_count, gnu_hash_sym_count, |i| sym_hashes[i as usize]);
 
@@ -1356,7 +1351,6 @@ pub(crate) fn emit_elf(
         }
     }
 
-    // Dynamic section
     if needs_dynamic {
         w.write_align_dynamic();
         if has_dynamic_libs {
@@ -1451,13 +1445,10 @@ pub(crate) fn emit_elf(
         }
     }
 
-    // Symtab + strtab
     write_symtab(&mut w, &sym_entries);
 
-    // shstrtab
     w.write_shstrtab();
 
-    // Section headers
     w.write_null_section_header();
     w.write_section_header(&SectionHeader {
         name: Some(text_name),

@@ -412,9 +412,8 @@ pub(crate) fn layout_macho(state: &mut LinkState) -> MachOLayout {
         false
     });
 
-    // Determine which output sections will exist by checking for nonzero input content.
-    // These flags are the single source of truth for section counts — used both for
-    // sizeofcmds computation and section vector construction.
+    // sizeofcmds and the section vector must be built from the same answer,
+    // so both read these flags rather than recomputing emptiness.
     let has_const = buckets.rx.iter().any(|&i| state.sections[i].kind == SectionKind::ReadOnly && state.sections[i].size > 0);
     let has_data = buckets.rw.iter().any(|&i| !state.sections[i].kind.is_nobits() && state.sections[i].size > 0);
     let has_bss = buckets.rw.iter().any(|&i| state.sections[i].kind.is_nobits() && state.sections[i].size > 0);

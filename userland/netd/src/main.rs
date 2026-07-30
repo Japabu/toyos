@@ -545,8 +545,7 @@ impl NetDaemon {
         if let Some(SocketKind::Udp(handle)) = self.sockets.remove(&req.socket_id) {
             socket_set.get_mut::<udp::Socket>(handle).close();
             socket_set.remove(handle);
-            // Pipe handles in UdpPipes auto-close on drop
-            self.udp_pipes.remove(&req.socket_id);
+                self.udp_pipes.remove(&req.socket_id);
         }
         signal_result_close(client_fd);
     }
@@ -702,8 +701,8 @@ impl NetDaemon {
         };
         let port = if req.port == 0 { self.alloc_port() } else { req.port };
 
-        // BUG 4 fix: open pipe BEFORE adding socket to socket_set.
-        // If pipe open fails, no socket to clean up.
+        // Open the pipe before the socket goes into socket_set: a pipe failure
+        // then has no half-built socket to unwind.
         let Some(notify_write_fd) = open_pipe(req.notify_pipe_id, false) else {
             send_error_close(client_fd, ERR_INVALID_INPUT);
             return;
@@ -752,8 +751,8 @@ impl NetDaemon {
         };
 
         let socket = socket_set.get_mut::<tcp::Socket>(listener.handle);
-        // BUG 5 fix: check Established, not is_active.
-        // is_active is true in SynReceived, but remote_endpoint() is None until Established.
+        // Not `is_active`: that is already true in SynReceived, where
+        // `remote_endpoint()` is still None.
         if socket.state() != tcp::State::Established {
             send_error_close(client_fd, ERR_NOT_CONNECTED);
             return;
@@ -866,8 +865,8 @@ impl NetDaemon {
     fn check_piped_listeners(&mut self, socket_set: &mut SocketSet<'_>) {
         for (_, listener) in &mut self.piped_listeners {
             let socket = socket_set.get_mut::<tcp::Socket>(listener.handle);
-            // BUG 6 fix: check Established, not is_active.
-            // is_active is true in SynReceived before the 3-way handshake completes.
+            // Not `is_active`: that is already true in SynReceived, before the
+            // three-way handshake completes.
             if socket.state() == tcp::State::Established && !listener.notified {
                 let _ = toyos_abi::syscall::write_nonblock(listener.notify_write_fd.fd(), &[1]);
                 listener.notified = true;
@@ -1051,23 +1050,17 @@ fn main() {
     const TOKEN_TX_PIPE_BASE: u64 = 0x1000;
 
     loop {
-        // 1. Drive smoltcp until quiescent
         let now = SmoltcpInstant::from_millis(epoch.elapsed().as_millis() as i64);
         while iface.poll(now, &mut device, &mut socket_set) != PollResult::None {}
 
-        // 2. Bridge piped connections (drain fully)
         daemon.bridge_piped(&mut socket_set);
 
-        // 3. Check piped listeners for Established connections
         daemon.check_piped_listeners(&mut socket_set);
 
-        // 4. Detect dead piped listeners (process crashed)
         daemon.cleanup_dead_listeners(&mut socket_set);
 
-        // 5. Process pending async operations
         daemon.process_pending(&mut socket_set);
 
-        // 6. Compute poll timeout
         let delay = iface.poll_delay(now, &socket_set);
 
         let has_pending_async = !daemon.pending_udp_recvs.is_empty()
@@ -1089,7 +1082,6 @@ fn main() {
             }
         };
 
-        // 7. Poll: listener fd + NIC fd + tx pipe fds via io_uring
         poller.poll_add(&listener, IORING_POLL_IN, TOKEN_LISTENER);
         poller.poll_add(&device.nic_fd, IORING_POLL_IN, TOKEN_NIC);
 

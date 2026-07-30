@@ -144,11 +144,9 @@ fn http_agent() -> ureq::Agent {
         .new_agent()
 }
 
-// TimGM6mb by Tim Brechbill (GPL-2.0, same license as doomgeneric): a compact
-// ~6MB General MIDI soundfont well suited to Doom's MIDI scores. Downloaded
-// into the repo assets/ dir (gitignored) so the initrd build ships it as
-// /share/timgm6mb.sf2 — doom loads it from there at music init instead of
-// embedding a 148MB font in the binary.
+// TimGM6mb by Tim Brechbill (GPL-2.0, same license as doomgeneric). Downloaded
+// into the gitignored assets/ dir so the initrd build ships it as
+// /share/timgm6mb.sf2, which is where doom loads it from at music init.
 fn download_soundfont(root: &Path) {
     let sf2_path = root.join("../../assets/timgm6mb.sf2");
     // Nonexistent path forces a rerun, which re-downloads after deletion.

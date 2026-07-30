@@ -59,12 +59,10 @@ ctrlc = { git = "https://github.com/Japabu/rust-ctrlc", branch = "toyos" }
 target-lexicon = { git = "https://github.com/Japabu/target-lexicon", branch = "toyos" }
 
 
-# Dependencies are compiled once and cached, so optimizing them costs nothing
-# in iteration speed — and unoptimized DSP/render crates are unusably slow
-# under TCG (measured: rustysynth at opt-level 0 renders music at 2-4x slower
-# than real time on one emulated core; optimized it fits comfortably).
-# Workspace members stay at the dev default for fast rebuilds, except the two
-# compute-heavy apps below.
+# Dependencies are compiled once and cached, so optimising them costs nothing
+# in iteration speed, and unoptimised DSP/render crates miss real time under
+# TCG. Workspace members stay at the dev default for fast rebuilds, except the
+# two compute-heavy apps below.
 [profile.dev.package."*"]
 opt-level = 2
 

@@ -137,7 +137,6 @@ impl FileBrowser {
 
         self.fb.fill_rect(0, 0, w, h, BG);
 
-        // Path bar
         self.fb.fill_rect(0, 0, w, PATH_BAR_HEIGHT, PATH_BG);
         let path_str = self.current_dir.display().to_string();
         let max_chars = (w - 16) / self.font.width();
@@ -185,7 +184,6 @@ impl FileBrowser {
 
             let text_bg = if self.selected == Some(i) { SELECTED_BG } else { BG };
 
-            // File name
             let max_chars = ITEM_WIDTH / self.font.width();
             let name: String = entry.name.chars().take(max_chars).collect();
             let text_x = x + (ITEM_WIDTH.saturating_sub(name.len() * self.font.width())) / 2;
@@ -205,14 +203,12 @@ impl FileBrowser {
             }
         }
 
-        // Status bar
         let status_y = h - STATUS_BAR_HEIGHT;
         self.fb.fill_rect(0, status_y, w, STATUS_BAR_HEIGHT, PATH_BG);
         let file_count = self.entries.iter().filter(|e| e.name != "..").count();
         let status = format!("{} items", file_count);
         self.font.draw_string(&self.fb, 8, status_y + 2, &status, PATH_COLOR, PATH_BG);
 
-        // Scrollbar
         if self.max_scroll() > 0 {
             let visible = self.visible_height();
             let total = self.content_height();

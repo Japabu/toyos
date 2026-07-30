@@ -130,10 +130,9 @@ impl Preprocessor {
                     i += 1;
                     continue;
                 }
-                // Barrier token: remove the named macro from the expanding set and discard.
-                // This implements the C99 §6.10.3.4 hide-set boundary: once the body tokens
-                // have all been processed, the macro name is no longer "in expansion" and can
-                // appear in the remaining input tokens without being suppressed.
+                // The C99 §6.10.3.4 hide-set boundary: past the body tokens the macro
+                // name is no longer "in expansion", so it may appear unsuppressed in the
+                // input that follows.
                 PPToken::Barrier(name) => {
                     self.expanding.remove(name);
                     i += 1;
@@ -151,9 +150,8 @@ impl Preprocessor {
                     result.push(tok);
                     continue;
                 }
-                // Macro is currently being expanded (recursion guard) — blue-paint the token
-                // so it passes through unchanged and is never re-expanded during rescanning.
-                // This implements the C99 §6.10.3.4 hide-set rule without per-token metadata.
+                // Recursion guard: blue-paint the token so rescanning never re-expands
+                // it. This is C99 §6.10.3.4's hide-set without per-token metadata.
                 PPToken::Ident(name) if self.macros.contains_key(name.trim_start_matches('\x01'))
                     && self.expanding.contains(name.trim_start_matches('\x01')) =>
                 {
@@ -263,16 +261,12 @@ impl Preprocessor {
                                 let name = name.clone();
                                 let substituted = self.substitute(&params, variadic, &body, &raw_args, &expanded_args);
 
-                                // C99 §6.10.3.4: after substitution, rescan with the macro name
-                                // added to the hide-set (blue-painted).  We implement this by:
-                                //   1. Blue-painting direct occurrences of `name` in the body.
-                                //   2. Appending a Barrier token that removes `name` from the
-                                //      `expanding` set at the exact boundary between the body
-                                //      and the following input tokens.
-                                //   3. Merging body + barrier + remaining input into one stream
-                                //      so that incomplete function calls in the body (e.g.
-                                //      `f(x` without its closing `)`) can be completed by the
-                                //      remaining tokens — exactly the C99 push-back semantics.
+                                // C99 §6.10.3.4: rescan with the macro name in the
+                                // hide-set. Body and remaining input must merge into
+                                // ONE stream — that is the standard's push-back
+                                // semantics, and it is what lets an incomplete call in
+                                // the body (`f(x` with no `)`) be completed by the
+                                // tokens that follow the invocation.
                                 let blue_painted: Vec<PPToken> = substituted.into_iter().map(|t| {
                                     if matches!(&t, PPToken::Ident(n) if n == &name) {
                                         PPToken::Ident(format!("\x01{}", name))

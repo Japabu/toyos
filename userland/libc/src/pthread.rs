@@ -157,18 +157,14 @@ pub unsafe extern "C" fn pthread_mutex_init(
 #[no_mangle]
 pub unsafe extern "C" fn pthread_mutex_lock(mutex: *mut PthreadMutexT) -> i32 {
     let state = &(*mutex).state;
-    // Fast path: try to acquire (0 -> 1)
     if state.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_ok() {
         return 0;
     }
-    // Slow path: set to 2 (locked + waiters) and wait
     loop {
-        // If not already 2, set it to mark waiters
         let old = state.swap(2, Ordering::Acquire);
         if old == 0 {
             return 0; // Got the lock
         }
-        // Wait until state changes from 2
         let addr = state as *const AtomicU32 as *const u32;
         // SAFETY: addr points to valid atomic state owned by the mutex
         unsafe { syscall::futex_wait(addr, 2, None) };
@@ -190,7 +186,6 @@ pub unsafe extern "C" fn pthread_mutex_unlock(mutex: *mut PthreadMutexT) -> i32 
     let state = &(*mutex).state;
     let old = state.swap(0, Ordering::Release);
     if old == 2 {
-        // There were waiters, wake one
         let addr = state as *const AtomicU32 as *const u32;
         // SAFETY: addr points to valid atomic state owned by the mutex
         unsafe { syscall::futex_wake(addr, 1) };

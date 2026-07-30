@@ -19,7 +19,6 @@ mod stmt;
 mod init;
 
 /// Cranelift Value paired with its C-level signedness.
-/// Prevents signedness bugs by carrying the sign through all expression results.
 #[derive(Clone, Copy)]
 #[must_use = "TypedValue carries signedness — use .coerce() or .raw()"]
 pub(crate) struct TypedValue {
@@ -77,8 +76,6 @@ pub struct Codegen {
 }
 
 /// How a local variable is stored during code generation.
-/// Unifies the old `locals`, `local_ptrs`, and `spilled_locals` maps into a single
-/// map, eliminating duplicated 3-way lookup chains across the codegen.
 #[derive(Clone, Copy)]
 pub(super) enum LocalStorage {
     /// SSA variable (cranelift Variable) — scalars that haven't had their address taken
@@ -89,9 +86,8 @@ pub(super) enum LocalStorage {
     Spilled(ir::StackSlot),
 }
 
-/// State for compiling a switch statement. Extracted from FuncCtx so that
-/// save/restore on nested switches is a single `take()`/assign, and the
-/// "no switch active" state is unambiguously `None`.
+/// State for compiling a switch statement. Held as an `Option` in `FuncCtx`
+/// so a nested switch saves and restores it with one `take()`.
 pub(super) struct SwitchCtx {
     pub pending_fallthrough: Option<ir::Block>,
     pub dispatch_entries: Vec<(i128, ir::Block)>,

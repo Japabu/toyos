@@ -290,7 +290,7 @@ pub(crate) fn collect(objects: &[(String, Vec<u8>)]) -> Result<LinkState, LinkEr
         .map(|(name, data)| parse_single_input(name, data))
         .collect::<Result<_, LinkError>>()?;
 
-    // Phase 2: merge results sequentially (fast — just extends vecs and inserts into hashmaps)
+    // Phase 2: merge results sequentially.
     let mut state = LinkState {
         sections: Vec::new(),
         relocs: Vec::new(),

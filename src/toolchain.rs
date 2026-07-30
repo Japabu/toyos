@@ -17,7 +17,6 @@ pub fn ensure(root: &Path, force_rebuild: bool) -> ChangeSet {
     let stamps_dir = root.join("target/stamps");
     fs::create_dir_all(&stamps_dir).ok();
 
-    // Check if the toolchain exists at all
     let toolchain_exists = Command::new("rustup")
         .args(["run", "toyos", "rustc", "--version"])
         .stdout(std::process::Stdio::null())
@@ -60,7 +59,6 @@ pub fn ensure(root: &Path, force_rebuild: bool) -> ChangeSet {
     }
 
     let rebuilt = if !toolchain_exists || compiler_changed || force_rebuild {
-        // Full bootstrap needed
         eprintln!("Building full toolchain (this takes a while on first run)...");
         full_bootstrap(root, &rust_dir);
         stamps::write_dir_stamp(&rust_dir.join("compiler"), &compiler_stamp);
@@ -95,7 +93,6 @@ pub fn ensure(root: &Path, force_rebuild: bool) -> ChangeSet {
         fs::write(&hosted_stamp, "").unwrap();
     }
 
-    // Link the toolchain so cargo can use it
     let host = host_triple();
     let stage2 = rust_dir.join(format!("build/{host}/stage2"));
     run("rustup", &["toolchain", "link", "toyos", stage2.to_str().unwrap()]);
@@ -139,7 +136,6 @@ fn full_bootstrap(root: &Path, rust_dir: &Path) {
         }
     }
 
-    // Run full bootstrap
     let x = if rust_dir.join("x").exists() { "./x" } else { "./x.py" };
     let status = Command::new(x)
         .args(["build", "--stage", "2", "--warnings", "warn"])

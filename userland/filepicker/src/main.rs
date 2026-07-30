@@ -178,12 +178,10 @@ fn render(fb: &Framebuffer, font: &Font, picker: &Picker) {
 
     fb.clear(BG);
 
-    // Path bar
     let path_str = picker.current_dir.to_string_lossy();
     fb.fill_rect(0, 0, w, fh + 8, PATH_BG);
     font.draw_string(fb, 8, 4, &path_str, TEXT_FG, PATH_BG);
 
-    // File list
     let list_y = fh + 8;
     let vis = picker.visible_rows(h);
 
@@ -215,7 +213,6 @@ fn render(fb: &Framebuffer, font: &Font, picker: &Picker) {
         font.draw_string(fb, 8, y, &display, fg, bg);
     }
 
-    // Bottom area
     let mut bottom_y = h;
 
     // Action bar (always at very bottom)
@@ -235,11 +232,9 @@ fn render(fb: &Framebuffer, font: &Font, picker: &Picker) {
     let action_x = w - action_w - 8;
     let cancel_x = action_x - cancel_w - 8;
 
-    // Cancel button
     fb.fill_rect(cancel_x, action_y + 2, cancel_w, fh + 4, BUTTON_BG);
     font.draw_string(fb, cancel_x, action_y + 4, cancel_label, BUTTON_FG, BUTTON_BG);
 
-    // Action button
     fb.fill_rect(action_x, action_y + 2, action_w, fh + 4, ACCENT_BG);
     font.draw_string(fb, action_x, action_y + 4, action_label, ACCENT_FG, ACCENT_BG);
 

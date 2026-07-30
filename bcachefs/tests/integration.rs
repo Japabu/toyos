@@ -540,8 +540,7 @@ fn crc_verification_on_nodes() {
 
 #[test]
 fn corrupt_data_block_returns_raw_bytes() {
-    // Data blocks have no CRC — corruption returns silently corrupted data.
-    // This documents the current limitation (Phase 4 adds per-extent checksums).
+    // Data blocks have no CRC, so corruption reads back silently.
     //
     // Layout for a 128-block filesystem:
     //   block 0: superblock

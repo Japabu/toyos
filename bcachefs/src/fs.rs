@@ -759,20 +759,17 @@ impl<IO: BlockIO> Mounted<IO, ReadWrite> {
         size: u64,
         mtime: u64,
     ) -> Result<(), FsError> {
-        // Find and delete old entry
         let (old_key, old_value) = self.find_by_name(name)?
             .ok_or(FsError::NotFound)?;
         let leaf = decode_leaf_value(&old_value)?;
         let entry_type = if old_key.key_type == KeyType::File { 1 } else { 2 };
 
-        // Delete old entry (don't free blocks — we're keeping them)
+        // Delete keeps the blocks: the new extents usually reference the same
+        // ones. Blocks the caller drops from the extent list are leaked.
         btree::delete(&self.io, self.sb.root_node, self.sb.root_level, &old_key)?;
 
-        // If extents changed, free blocks that are no longer needed
-        // (For now, just use the new extents as-is)
         let extents = if new_extents.is_empty() { leaf.extents() } else { new_extents };
 
-        // Insert updated entry
         let new_value = encode_leaf_value(entry_type, leaf.name(), size, mtime, extents);
         let (new_root, new_level) = btree::insert(
             &self.io, &mut self.alloc,

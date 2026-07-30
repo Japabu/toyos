@@ -149,7 +149,6 @@ struct PaintApp {
     drag_start: (isize, isize),
     last_draw: (isize, isize),
 
-    // Cursor tracking (canvas coordinates, -1 = not on canvas)
     cursor_x: isize,
     cursor_y: isize,
 
@@ -655,7 +654,6 @@ impl PaintApp {
             return HitZone::None;
         }
 
-        // Status bar
         if my >= self.window.height() as usize - STATUS_HEIGHT {
             return HitZone::None;
         }
@@ -694,10 +692,8 @@ impl PaintApp {
         let fw = fb.width();
         let fh = fb.height();
 
-        // Toolbar background
         fb.fill_rect(0, 0, fw, TOOLBAR_HEIGHT, TOOLBAR_BG);
 
-        // Tool buttons
         for (i, (tool, label, _)) in TOOLS.iter().enumerate() {
             let bx = Self::toolbar_tool_x(i);
             let bg = if *tool == self.tool { TOOLBAR_BTN_SEL } else { TOOLBAR_BTN };
@@ -707,7 +703,6 @@ impl PaintApp {
             self.font.draw_string(&fb, text_x, text_y, label, TOOLBAR_FG, bg);
         }
 
-        // Brush size buttons
         for i in 0..BRUSH_SIZES.len() {
             let bx = Self::toolbar_brush_x(i);
             let bg = if i == self.brush_index { TOOLBAR_BTN_SEL } else { TOOLBAR_BTN };
@@ -725,11 +720,9 @@ impl PaintApp {
             }
         }
 
-        // Filled toggle button
         let fx = Self::toolbar_filled_x();
         let fbg = if self.filled { TOOLBAR_BTN_SEL } else { TOOLBAR_BTN };
         fb.fill_rect(fx, TOOL_BTN_Y, BRUSH_BTN_SIZE, BRUSH_BTN_SIZE, fbg);
-        // Draw a small filled/outline square icon
         let icon_x = fx + 6;
         let icon_y = TOOL_BTN_Y + 6;
         let icon_s = BRUSH_BTN_SIZE - 12;
@@ -742,7 +735,6 @@ impl PaintApp {
             fb.fill_rect(icon_x + icon_s - 2, icon_y, 2, icon_s, TOOLBAR_FG);
         }
 
-        // Current color indicator
         let cx = Self::toolbar_color_x();
         fb.fill_rect(cx, TOOL_BTN_Y, BRUSH_BTN_SIZE, BRUSH_BTN_SIZE, self.color);
         for i in 0..BRUSH_BTN_SIZE {
@@ -752,7 +744,6 @@ impl PaintApp {
             fb.put_pixel(cx + BRUSH_BTN_SIZE - 1, TOOL_BTN_Y + i, SELECTED_BORDER);
         }
 
-        // Palette sidebar
         let palette_x = fw.saturating_sub(PALETTE_WIDTH);
         fb.fill_rect(palette_x, TOOLBAR_HEIGHT, PALETTE_WIDTH, fh.saturating_sub(TOOLBAR_HEIGHT), PALETTE_BG);
         let pad = (PALETTE_WIDTH - PALETTE_COLS * (SWATCH_SIZE + SWATCH_GAP) + SWATCH_GAP) / 2;
@@ -772,10 +763,8 @@ impl PaintApp {
             }
         }
 
-        // Canvas
         self.render_canvas(&fb, fw);
 
-        // Status bar
         self.render_status(&fb, fw, fh);
 
     }
@@ -850,7 +839,6 @@ impl PaintApp {
         let mx = ev.x as usize;
         let my = ev.y as usize;
 
-        // Update cursor position
         let fw = self.window.width() as usize;
         let fh = self.window.height() as usize;
         let palette_x = fw.saturating_sub(PALETTE_WIDTH);

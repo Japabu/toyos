@@ -187,9 +187,6 @@ impl BitmapAllocator {
         for i in 0..count as u64 {
             self.set_free(io, BlockNum::new(start.raw() + i));
         }
-        // free_blocks already incremented by set_free
-        // Adjust: set_free increments per call, but we want the total
-        // Actually set_free handles it correctly — each call increments by 1
     }
 
     /// Initialize bitmap on disk: zero all bitmap blocks, then mark metadata blocks as used.

@@ -58,7 +58,6 @@ pub struct EnumDef {
 }
 
 /// Result of looking up a field in a struct/union.
-/// Unifies the old `field_offset()` and `field_bit_width()` into a single lookup.
 #[derive(Debug, Clone)]
 pub struct FieldInfo {
     pub byte_offset: usize,

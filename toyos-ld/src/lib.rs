@@ -43,17 +43,9 @@ pub enum LinkError {
 
 // ── Pipeline typestate ──────────────────────────────────────────────────
 //
-// The linker pipeline flows:  Collected → LaidOut<L> → Vec<u8>
-//
-// `Collected` bundles collect + synthesize + merge into one step. Format-
-// specific prep (GC, Mach-O stubs) happens via `&mut self` before layout.
-//
-// `layout_*` methods consume `Collected`, producing `LaidOut<L>`. This
-// prevents re-layout or forgetting to collect.
-//
-// `relocate_and_emit*` methods consume `LaidOut<L>`, applying relocations
-// and emitting the final binary. This prevents emitting without layout or
-// relocating twice.
+// Collected → LaidOut<L> → Vec<u8>, each step consuming the previous state.
+// Format-specific prep (GC, Mach-O stubs) runs via `&mut self` on `Collected`,
+// before layout.
 
 /// Linker state after object collection + preparation. Ready for layout.
 pub(crate) struct Collected {
