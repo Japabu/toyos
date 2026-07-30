@@ -247,14 +247,12 @@ pub fn create(depth: u32) -> Result<(RingId, SharedToken), SyscallError> {
     params.features = 0;
     params._pad = 0;
 
-    // Initialize SQ ring header
     let sq_header = unsafe { &mut *(base.add(SQ_RING_OFF as usize) as *mut IoUringRingHeader) };
     sq_header.head = core::sync::atomic::AtomicU32::new(0);
     sq_header.tail = core::sync::atomic::AtomicU32::new(0);
     sq_header.ring_size = sq_size;
     sq_header.dropped = core::sync::atomic::AtomicU32::new(0);
 
-    // Initialize CQ ring header
     let cq_header = unsafe { &mut *(base.add(CQ_RING_OFF as usize) as *mut IoUringRingHeader) };
     cq_header.head = core::sync::atomic::AtomicU32::new(0);
     cq_header.tail = core::sync::atomic::AtomicU32::new(0);
@@ -308,7 +306,6 @@ pub fn enter(
         crate::clock::nanos_since_boot().saturating_add(timeout_nanos)
     };
 
-    // Submit phase
     if to_submit > 0 {
         submit_sqes(ring_id, to_submit)?;
     }
@@ -323,12 +320,10 @@ pub fn enter(
             return Ok(count);
         }
 
-        // Non-blocking check
         if deadline == 1 {
             return Ok(count);
         }
 
-        // Timeout check
         if deadline > 0 && crate::clock::nanos_since_boot() >= deadline {
             return Ok(count);
         }
@@ -531,10 +526,8 @@ fn process_poll_remove(ring_id: RingId, target_user_data: u64) {
     if let Some(instance) = map.get_mut(ring_id) {
         if let Some(pos) = instance.pending_polls.iter().position(|p| p.user_data == target_user_data) {
             instance.pending_polls.swap_remove(pos);
-            // Post CQE for the POLL_REMOVE itself (success)
             instance.post_cqe(target_user_data, 0, 0);
         } else {
-            // Not found — post error CQE
             instance.post_cqe(target_user_data, -(SyscallError::NotFound as i32), 0);
         }
     }
@@ -544,7 +537,6 @@ fn process_accept(ring_id: RingId, sqe: &IoUringSqe) {
     let fd_num = sqe.fd as u32;
     let user_data = sqe.user_data;
 
-    // Get the listener name from the fd
     let listener_name = process::with_fd_owner_data(|data| {
         match data.fds.get(fd_num) {
             Some(fd::Descriptor::Listener(name)) => Some(name.clone()),
@@ -559,7 +551,6 @@ fn process_accept(ring_id: RingId, sqe: &IoUringSqe) {
 
     match crate::listener::pop_connection(&name) {
         Some(conn) => {
-            // Create socket fd from the pending connection
             let new_fd = process::with_fd_owner_data(|data| {
                 data.fds.insert(fd::Descriptor::Socket {
                     rx: conn.rx,

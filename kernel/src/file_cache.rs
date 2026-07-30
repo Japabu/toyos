@@ -99,7 +99,6 @@ pub fn read_page(
             return;
         }
 
-        // Cache hit: copy out.
         if let Some(page) = file.pages.get(&page_idx) {
             let avail = valid_bytes_in_page(page_idx, file_size);
             copy_page_region_to_buf(&page[..], offset, buf, avail);
@@ -139,7 +138,6 @@ pub fn write_page(
     data: &[u8],
     backing: Option<&dyn FileBacking>,
 ) {
-    // Check if page is already cached.
     let need_fetch;
     {
         let cache = FILE_CACHE.lock();
@@ -148,7 +146,6 @@ pub fn write_page(
     }
 
     if need_fetch {
-        // Determine if we need to load existing data (partial write to existing page).
         let page_start = page_idx as u64 * PAGE_SIZE as u64;
         let mut fetched = [0u8; PAGE_SIZE];
         if let Some(backing) = backing {
@@ -177,7 +174,6 @@ pub fn write_page(
         page[offset..end].copy_from_slice(&data[..end - offset]);
         file.dirty.insert(page_idx);
 
-        // Update size if write extends past current end.
         let write_end = page_idx as u64 * PAGE_SIZE as u64 + end as u64;
         if write_end > file.size {
             file.size = write_end;
@@ -299,7 +295,6 @@ fn evict_if_needed(cache: &mut FileCache) {
         }
         let Some(file) = cache.files.get_mut(&fid) else { continue };
         if !file.evictable || file.ref_count > 0 { continue; }
-        // Evict clean pages from this file.
         let clean: alloc::vec::Vec<u32> = file.pages.keys()
             .filter(|k| !file.dirty.contains(k))
             .copied()

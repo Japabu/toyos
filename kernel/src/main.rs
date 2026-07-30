@@ -118,7 +118,6 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
         cpu::halt();
     }
 
-    // Per-CPU fault state transition
     let prev = percpu::swap_fault_state(percpu::CpuFaultState::Panic);
     if prev != percpu::CpuFaultState::Normal {
         // Nested: Panic→Panic, Fatal→Panic, PageFault→Panic. Escalate.
@@ -307,7 +306,6 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     vfs::lock().mount("home", Box::new(bcachefs_adapter::BcacheFsAdapter::new(bcachefs_instance)));
     vfs::lock().mount("tmp", Box::new(crate::tmpfs::TmpFs::new()));
 
-    // Ensure home directories exist on NVMe
     vfs::lock().create_dir("/home/root");
     vfs::lock().create_dir("/home/root/.config");
 
@@ -323,7 +321,6 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
         crate::audio::register(sound, audio_info);
     }
 
-    // Initialize GPU: try VirtIO first, fall back to UEFI GOP
     if let Some((gpu_driver, gpu_info)) = virtio_gpu::init(&ecam) {
         log!("GPU: using VirtIO");
         register_gpu(gpu_driver, gpu_info);

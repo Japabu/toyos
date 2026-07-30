@@ -12,11 +12,9 @@ use crate::log;
 use crate::shared_memory::{self, SharedToken};
 use crate::sync::Lock;
 
-// VirtIO GPU PCI identity
 const VIRTIO_VENDOR: u16 = 0x1AF4;
 const VIRTIO_GPU_DEVICE: u16 = 0x1050; // 0x1040 + device_id 16
 
-// GPU command types
 const CMD_GET_DISPLAY_INFO: u32 = 0x0100;
 const CMD_RESOURCE_CREATE_2D: u32 = 0x0101;
 const CMD_RESOURCE_UNREF: u32 = 0x0102;
@@ -28,15 +26,12 @@ const CMD_GET_EDID: u32 = 0x010a;
 const CMD_UPDATE_CURSOR: u32 = 0x0300;
 const CMD_MOVE_CURSOR: u32 = 0x0301;
 
-// GPU response types
 const RESP_OK_NODATA: u32 = 0x1100;
 const RESP_OK_DISPLAY_INFO: u32 = 0x1101;
 const RESP_OK_EDID: u32 = 0x1104;
 
-// Feature bits
 const VIRTIO_GPU_F_EDID: u64 = 1 << 1;
 
-// Pixel formats
 const FORMAT_B8G8R8A8_UNORM: u32 = 1;
 const FORMAT_B8G8R8X8_UNORM: u32 = 2;
 
@@ -252,7 +247,6 @@ impl GpuController {
         );
         self.control_slot = Some(returned);
 
-        // Read response type from header
         unsafe { read_volatile(self.resp_ptr as *const u32) }
     }
 
@@ -544,17 +538,14 @@ impl Gpu for GpuController {
         // swap below, so a refusal here leaves the display exactly as it was.
         let new_fb = self.alloc_framebuffer(fb_size).ok_or(SyscallError::ResourceExhausted)?;
 
-        // Create new GPU resource
         let old_resource = self.resource;
         self.resource += 1;
         self.create_resource(self.resource, FORMAT_B8G8R8X8_UNORM, width, height);
         self.attach_backing(self.resource, new_fb.phys_addrs[0], fb_size);
 
-        // Switch scanout to new resource
         let rect = Rect { x: 0, y: 0, width, height };
         self.set_scanout(0, self.resource, rect);
 
-        // Destroy old resource and free old framebuffer
         self.destroy_resource(old_resource);
         let old_fb = core::mem::replace(&mut self.fb, new_fb);
         self.free_framebuffer(old_fb);
@@ -668,7 +659,6 @@ pub fn init(ecam: &crate::mm::Mmio) -> Option<(Box<dyn Gpu>, GpuInfo)> {
     gpu.create_resource(gpu.resource, FORMAT_B8G8R8X8_UNORM, width, height);
     gpu.attach_backing(gpu.resource, gpu.fb.phys_addrs[0], fb_size);
 
-    // Set scanout to the single resource
     let rect = Rect { x: 0, y: 0, width, height };
     gpu.set_scanout(0, gpu.resource, rect);
 

@@ -211,10 +211,8 @@ pub fn open(table: &mut FdTable, vfs: &mut Vfs, path: &str, flags: OpenFlags) ->
         }
     }
 
-    // Handle CREATE + TRUNCATE: create (or truncate) empty file
     if truncate && create {
         let mtime = crate::clock::nanos_since_boot();
-        // Delete existing file if any
         vfs.delete(path);
         let file_id = match vfs.create_file(path, mtime) {
             Ok(id) => id,
@@ -235,7 +233,6 @@ pub fn open(table: &mut FdTable, vfs: &mut Vfs, path: &str, flags: OpenFlags) ->
         };
     }
 
-    // Try to open existing file
     match vfs.open_file(path) {
         Some((file_id, backing)) => {
             let mtime = vfs.file_mtime(path);
@@ -355,7 +352,6 @@ pub fn try_read(table: &mut FdTable, fd: u32, buf: &mut [u8]) -> Option<u64> {
             if count == 0 {
                 return Some(0);
             }
-            // Read page by page from file cache
             let mut read = 0;
             while read < count {
                 let abs_pos = file.position + read;
@@ -466,7 +462,6 @@ pub fn try_write(table: &mut FdTable, fd: u32, buf: &[u8]) -> Option<u64> {
             if !file.writable {
                 return Some(SyscallError::PermissionDenied.to_u64());
             }
-            // Write page by page to file cache
             let mut written = 0;
             while written < buf.len() {
                 let abs_pos = file.position + written;

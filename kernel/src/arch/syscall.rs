@@ -128,7 +128,6 @@ extern "sysv64" fn syscall_handler(num: u64, a1: u64, a2: u64, _: u64, a3: u64, 
 fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
     let t0 = crate::clock::nanos_since_boot();
 
-    // Count syscalls per process
     process::with_current_data(|data| {
         data.syscall_total += 1;
         if (num as usize) < data.syscall_counts.len() {
@@ -769,7 +768,6 @@ fn sys_pipe_id(fd_num: u32) -> u64 {
 }
 
 fn sys_pipe_map(fd_num: u32) -> u64 {
-    // Get the pipe's physical address and allocate a vaddr, map it, store in FD
     process::with_fd_owner_data(|data| {
         let pipe_id = match data.fds.get(fd_num) {
             Some(fd::Descriptor::PipeRead(r)) | Some(fd::Descriptor::TtyRead(r)) => Some(r.id()),
@@ -913,7 +911,6 @@ fn sys_listen(name: &str) -> u64 {
 }
 
 fn sys_accept(fd_num: u32) -> u64 {
-    // Get the listener name from the fd
     let name = process::with_fd_owner_data(|data| {
         match data.fds.get(fd_num) {
             Some(fd::Descriptor::Listener(name)) => Some(name.clone()),
@@ -970,7 +967,6 @@ fn sys_connect(name: &str) -> u64 {
     });
     wake_poll_waiters(name);
 
-    // Client's end
     process::with_fd_owner_data(|data| {
         fd_result(data.fds.insert(fd::Descriptor::Socket {
             rx: sc_reader,   // client reads from server→client
@@ -1208,7 +1204,6 @@ fn sys_sysinfo(buf: &mut [u8]) -> u64 {
     let guard = process::PROCESS_TABLE.lock();
     let table = guard.as_ref().unwrap();
 
-    // Count all entries (processes + threads)
     let entry_count: u32 = table.iter().flat_map(|(_, proc)| proc.threads().iter().map(move |(tid, thread)| (tid, proc, thread))).count() as u32;
 
     buf[0..8].copy_from_slice(&total_mem.to_le_bytes());
@@ -1255,7 +1250,6 @@ fn sys_sysinfo(buf: &mut [u8]) -> u64 {
         let cpu_ns = thread.sched().map_or(0, crate::scheduler::task_cpu_ns);
         let pid = proc.pid();
 
-        // Use thread name if set, otherwise process name
         let name = if thread.name()[0] != 0 { thread.name() } else { proc.name() };
 
         buf[pos..pos + 4].copy_from_slice(&pid.raw().to_le_bytes());
@@ -1379,7 +1373,6 @@ fn sys_dlopen(path: &str, init_out: u64) -> u64 {
     let cwd = process::with_fd_owner_data(|d| d.cwd.clone());
     let resolved = vfs::lock().resolve_absolute(&cwd, path);
 
-    // Check shared library cache first
     let lib = crate::elf::try_clone_cached(&resolved);
     let mut lib = match lib {
         Some(lib) => lib,
@@ -1404,7 +1397,6 @@ fn sys_dlopen(path: &str, init_out: u64) -> u64 {
         }
     };
 
-    // Map library into current process's virtual address space
     let pt = process::current_address_space();
     process::with_fd_owner_data(|_data| {
         match &lib.memory {
@@ -1444,7 +1436,6 @@ fn sys_dlopen(path: &str, init_out: u64) -> u64 {
 
     let lib_has_tls = lib.tls_memsz > 0;
 
-    // Resolve relocations and apply DTV relocs (ProcessData lock)
     let data_arc = process::fd_owner_data();
     {
         let mut data = data_arc.lock();
@@ -1499,7 +1490,6 @@ fn sys_dlopen(path: &str, init_out: u64) -> u64 {
         }
     }
 
-    // Store the lib in the owner process
     let mut data = data_arc.lock();
     let idx = data.elf.loaded_libs.len();
     data.elf.lib_paths.push(resolved);
@@ -1538,7 +1528,6 @@ fn tls_alloc_block(module_id: u64) -> Result<u64, SyscallError> {
         return Err(SyscallError::ResourceExhausted);
     }
 
-    // Read module info from the process-level data (shared across threads via heap owner).
     let owner_arc = process::fd_owner_data();
     let (tls_memsz, tls_template) = {
         let data = owner_arc.lock();
@@ -1615,7 +1604,6 @@ fn sys_io_uring_setup(depth: u32) -> u64 {
     });
     match fd {
         Ok(fd_num) => {
-            // Pack fd and shm_token into return value
             ((shm_token.raw() as u64) << 32) | (fd_num as u64)
         }
         Err(e) => {
@@ -1665,10 +1653,8 @@ fn sys_query_modules(buf: &mut [u8]) -> u64 {
     let info_size = core::mem::size_of::<ModuleInfo>();
 
     process::with_fd_owner_data(|data| {
-        // Count modules: 1 (exe) + loaded_libs
         let module_count = 1 + data.elf.loaded_libs.len();
 
-        // Calculate total path bytes
         let exe_path_bytes = data.exe_path.as_bytes();
         let total_path_bytes: usize = exe_path_bytes.len()
             + data.elf.lib_paths.iter().map(|p| p.as_bytes().len()).sum::<usize>();
@@ -1680,7 +1666,6 @@ fn sys_query_modules(buf: &mut [u8]) -> u64 {
 
         let mut path_offset = (module_count * info_size) as u32;
 
-        // Write exe module info
         let (eh_vaddr, eh_size) = (data.elf.exe_eh_frame_hdr_vaddr, data.elf.exe_eh_frame_hdr_size);
         let exe_info = ModuleInfo {
             base: data.elf.elf_base.raw(),
@@ -1697,7 +1682,6 @@ fn sys_query_modules(buf: &mut [u8]) -> u64 {
             .copy_from_slice(exe_path_bytes);
         path_offset += exe_path_bytes.len() as u32;
 
-        // Write library module infos
         for (i, lib) in data.elf.loaded_libs.iter().enumerate() {
             let lib_path_bytes = if i < data.elf.lib_paths.len() {
                 data.elf.lib_paths[i].as_bytes()

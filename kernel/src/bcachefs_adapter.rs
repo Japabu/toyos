@@ -76,10 +76,8 @@ impl FileSystem for BcacheFsAdapter {
     }
 
     fn open_file(&mut self, name: &str) -> Option<(FileId, Option<Arc<dyn FileBacking>>)> {
-        // Same file → same FileId
         if let Some(&file_id) = self.name_to_id.get(name) {
             file_cache::open(file_id);
-            // Return existing backing
             let info = self.open_files.get(&file_id)?;
             let backing = Arc::new(NvmeBacking::new(info.extents.clone(), file_cache::size(file_id)));
             return Some((file_id, Some(backing)));
@@ -104,7 +102,6 @@ impl FileSystem for BcacheFsAdapter {
             return Ok(file_id);
         }
 
-        // Create empty file in bcachefs
         self.fs.create(name, &[], mtime).map_err(|_| "create failed")?;
 
         let file_id = file_cache::create_file(true);
@@ -125,7 +122,6 @@ impl FileSystem for BcacheFsAdapter {
     }
 
     fn delete(&mut self, name: &str) -> bool {
-        // Handle FileId cleanup
         if let Some(&file_id) = self.name_to_id.get(name) {
             file_cache::mark_deleted(file_id);
             if file_cache::ref_count(file_id) == 0 {
@@ -137,7 +133,6 @@ impl FileSystem for BcacheFsAdapter {
     }
 
     fn delete_prefix(&mut self, prefix: &str) {
-        // Collect FileIds to clean up
         let to_delete: Vec<String> = self.name_to_id.keys()
             .filter(|k| k.starts_with(prefix))
             .cloned()
@@ -155,7 +150,6 @@ impl FileSystem for BcacheFsAdapter {
     }
 
     fn rename(&mut self, old: &str, new: &str) -> Result<(), &'static str> {
-        // Handle target's FileId if it exists
         if let Some(&target_id) = self.name_to_id.get(new) {
             file_cache::mark_deleted(target_id);
             if file_cache::ref_count(target_id) == 0 {
@@ -164,7 +158,6 @@ impl FileSystem for BcacheFsAdapter {
             self.name_to_id.remove(new);
         }
 
-        // Delegate to bcachefs
         self.fs.rename(old, new).map_err(|_| "rename failed")?;
 
         // Update name_to_id: source's FileId now lives under new name
@@ -240,7 +233,6 @@ impl FileSystem for ReadOnlyBcacheFsAdapter {
     }
 
     fn open_file(&mut self, name: &str) -> Option<(FileId, Option<Arc<dyn FileBacking>>)> {
-        // Same file → same FileId
         if let Some(&file_id) = self.name_to_id.get(name) {
             file_cache::open(file_id);
             let (extents, size) = self.fs.file_extents(name)?;
@@ -264,7 +256,6 @@ impl FileSystem for ReadOnlyBcacheFsAdapter {
 
     fn close_file(&mut self, file_id: FileId) {
         if file_cache::ref_count(file_id) == 0 {
-            // Find and remove from name_to_id
             let name = self.name_to_id.iter()
                 .find(|(_, &v)| v == file_id)
                 .map(|(k, _)| k.clone());

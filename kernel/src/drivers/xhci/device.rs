@@ -167,7 +167,6 @@ fn parse_hid_config(data_buf: *const u8) -> Option<HidInterfaceInfo> {
 
 /// Initialize and configure one USB device on a port.
 pub fn init_device(ctrl: &mut XhciController, op_base: &Mmio, port_idx: u8) {
-    // Reset port
     let portsc_off = OP_PORT_BASE + port_idx as u64 * PORT_REG_SIZE;
     let portsc = op_base.read_u32(portsc_off);
     op_base.write_u32(portsc_off, (portsc & !PORTSC_RW1C) | PORTSC_PR);
@@ -188,7 +187,6 @@ pub fn init_device(ctrl: &mut XhciController, op_base: &Mmio, port_idx: u8) {
     let speed = ((portsc >> 10) & 0xF) as u8;
     log!("xHCI: port {} reset, speed={}", port_idx + 1, speed);
 
-    // Enable Slot
     let mut enable_slot = Trb::ZERO;
     enable_slot.control = TRB_ENABLE_SLOT;
     ctrl.submit_command(enable_slot);
@@ -201,10 +199,8 @@ pub fn init_device(ctrl: &mut XhciController, op_base: &Mmio, port_idx: u8) {
     ctrl.active_slot = slot_id;
     log!("xHCI: slot {} enabled", slot_id);
 
-    // Reset EP0 ring for this device
     ctrl.reset_ep0_ring();
 
-    // Address Device
     let dma = dma();
     let input_ctx = dma.subslice(OFF_INPUT_CTX, 0x1000);
     let input_ctx_ptr = input_ctx.base();
@@ -242,7 +238,6 @@ pub fn init_device(ctrl: &mut XhciController, op_base: &Mmio, port_idx: u8) {
     }
     log!("xHCI: device addressed");
 
-    // GET_DESCRIPTOR (Device)
     let data_buf = dma.subslice(OFF_DATA_BUF, 0x1000);
     let data_buf_ptr = data_buf.base();
     let data_buf_phys = data_buf.phys();
@@ -259,7 +254,6 @@ pub fn init_device(ctrl: &mut XhciController, op_base: &Mmio, port_idx: u8) {
     };
     log!("xHCI: device class={:#x} vendor={:04x} product={:04x}", dev_class, vendor_id, product_id);
 
-    // GET_DESCRIPTOR (Configuration)
     unsafe { write_bytes(data_buf_ptr, 0, 256); }
     let code = ctrl.control_transfer(0x80, 0x06, 0x0200, 0, Some(data_buf_phys), 256);
     if code != 1 && code != 13 {
@@ -285,7 +279,6 @@ pub fn init_device(ctrl: &mut XhciController, op_base: &Mmio, port_idx: u8) {
     log!("xHCI: HID {} iface={} ep={:#x} max_pkt={} interval={} dci={}",
         kind, info.iface_num, info.ep_addr, info.ep_max_packet, info.ep_interval, int_ep_dci);
 
-    // SET_CONFIGURATION
     let code = ctrl.control_transfer(0x00, 0x09, info.config_val as u16, 0, None, 0);
     if code != 1 {
         log!("xHCI: SET_CONFIGURATION failed, code={}", code);
@@ -301,7 +294,6 @@ pub fn init_device(ctrl: &mut XhciController, op_base: &Mmio, port_idx: u8) {
         }
     }
 
-    // Choose interrupt ring and report buffer based on device type
     let (int_ring_off, report_buf_offset): (usize, usize) = match info.protocol {
         HidType::Keyboard => (OFF_KB_INT_RING, 512),
         HidType::Mouse | HidType::Tablet => (OFF_MOUSE_INT_RING, 1024),
@@ -309,7 +301,6 @@ pub fn init_device(ctrl: &mut XhciController, op_base: &Mmio, port_idx: u8) {
     let report_phys = data_buf.phys() + report_buf_offset as u64;
     let report_ptr = data_buf.ptr_at(report_buf_offset);
 
-    // Set up interrupt ring link TRB
     let int_ring = dma.subslice(int_ring_off, 0x1000);
     unsafe { int_ring.zero(); }
     let mut int_link = Trb::ZERO;
@@ -317,7 +308,6 @@ pub fn init_device(ctrl: &mut XhciController, op_base: &Mmio, port_idx: u8) {
     int_link.control = TRB_LINK | (1 << 1);
     unsafe { write_volatile((int_ring.base() as *mut Trb).add(RING_SIZE - 1), int_link); }
 
-    // Configure Endpoint
     let input_ctx = dma.subslice(OFF_INPUT_CTX, 0x1000);
     let input_ctx_ptr = input_ctx.base();
     let input_ctx_phys = input_ctx.phys();
@@ -360,7 +350,6 @@ pub fn init_device(ctrl: &mut XhciController, op_base: &Mmio, port_idx: u8) {
     }
     log!("xHCI: endpoint configured");
 
-    // Store device and queue initial interrupt transfer
     let report_size = match info.protocol {
         HidType::Keyboard => 8,
         HidType::Mouse => 4,

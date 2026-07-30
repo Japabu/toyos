@@ -5,7 +5,6 @@ use crate::mm::Mmio;
 use super::pci::PciDevice;
 use crate::log;
 
-// VirtIO PCI capability types
 const VIRTIO_PCI_CAP_COMMON_CFG: u8 = 1;
 const VIRTIO_PCI_CAP_NOTIFY_CFG: u8 = 2;
 const VIRTIO_PCI_CAP_ISR_CFG: u8 = 3;
@@ -14,13 +13,11 @@ const VIRTIO_PCI_CAP_DEVICE_CFG: u8 = 4;
 // Vendor-specific PCI capability ID
 const PCI_CAP_ID_VENDOR: u8 = 0x09;
 
-// Device status bits
 const STATUS_ACKNOWLEDGE: u8 = 1;
 const STATUS_DRIVER: u8 = 2;
 const STATUS_DRIVER_OK: u8 = 4;
 const STATUS_FEATURES_OK: u8 = 8;
 
-// Feature bits
 pub const VIRTIO_F_VERSION_1: u64 = 1 << 32;
 
 // Common config field offsets (virtio_pci_common_cfg)
@@ -39,7 +36,6 @@ pub const COMMON_QUEUE_DESC: u64 = 0x20;
 pub const COMMON_QUEUE_DRIVER: u64 = 0x28;
 pub const COMMON_QUEUE_DEVICE: u64 = 0x30;
 
-// Virtqueue descriptor flags
 const VIRTQ_DESC_F_NEXT: u16 = 1;
 const VIRTQ_DESC_F_WRITE: u16 = 2;
 
@@ -79,7 +75,6 @@ impl VirtioPciConfig {
         let mut isr = None;
         let mut device = None;
 
-        // Map all BAR regions used by VirtIO capabilities
         let mut mapped_bars: [Option<crate::mm::Mmio>; 6] = [None, None, None, None, None, None];
         for cap in pci_dev.capabilities() {
             if cap.id() != PCI_CAP_ID_VENDOR { continue; }
@@ -431,7 +426,6 @@ impl VirtioDevice {
         let features = device_features & accepted_features;
         log!("VirtIO: device features={:#x} negotiated={:#x}", device_features, features);
 
-        // Write accepted features
         common.write_u32(COMMON_DRIVER_FEATURE_SELECT, 0);
         common.write_u32(COMMON_DRIVER_FEATURE, features as u32);
         common.write_u32(COMMON_DRIVER_FEATURE_SELECT, 1);

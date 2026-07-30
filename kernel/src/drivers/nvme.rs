@@ -31,7 +31,6 @@ struct IdentifyNamespace {
     lba_formats: [u32; 64], // offset 128: LBA format descriptors (4 bytes each)
 }
 
-// NVMe command opcodes
 const ADMIN_CREATE_IO_SQ: u8 = 0x01;
 const ADMIN_CREATE_IO_CQ: u8 = 0x05;
 const ADMIN_IDENTIFY: u8 = 0x06;
@@ -370,7 +369,6 @@ pub fn init(ecam: &crate::mm::Mmio) -> Option<NvmeBlockDevice> {
     let cap = bar.read_u64(REG_CAP);
     let stride = ((cap >> 32) & 0xF) as u32;
 
-    // Disable controller
     let cc = bar.read_u32(REG_CC);
     if cc & 1 != 0 {
         bar.write_u32(REG_CC, cc & !1);

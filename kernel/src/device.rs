@@ -46,7 +46,6 @@ pub fn try_claim(device_type: u64, pid: Pid) -> Option<Descriptor> {
             }
             let info = (*FB_INFO.lock())?;
             *owner = Some(pid);
-            // Grant GPU buffer and cursor tokens to the claiming process
             for &token in &info.token {
                 if shared_memory::grant_kernel(shared_memory::SharedToken::from_raw(token), pid).is_err() {
                     *owner = None;
@@ -66,7 +65,6 @@ pub fn try_claim(device_type: u64, pid: Pid) -> Option<Descriptor> {
             }
             let info = crate::net::nic_info()?;
             *owner = Some(pid);
-            // Grant DMA buffer tokens to the claiming process
             if shared_memory::grant_kernel(shared_memory::SharedToken::from_raw(info.dma_token), pid).is_err() {
                 *owner = None;
                 return None;

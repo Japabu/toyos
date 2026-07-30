@@ -82,7 +82,6 @@ fn safe_read_u64(addr: u64, user_pml4: *const u64) -> Option<u64> {
     }
 }
 
-// Shared crash report — used by both exception and panic paths
 pub(crate) struct ExceptionContext<'a> {
     frame: &'a TrapFrame,
     cr2: u64,
@@ -130,7 +129,6 @@ fn crash_report_exception(ctx: &ExceptionContext) {
     let pid = percpu::current_pid();
     let pml4 = if is_user { crate::DirectMap::from_phys(crate::mm::paging::Cr3::current().phys()).as_ptr::<u64>() as *const u64 } else { core::ptr::null() };
 
-    // Decode page fault details once (shared by user and kernel headers)
     let (pf_action, pf_cause) = if ctx.vector() == Vector::PageFault {
         let action = if ctx.frame.error_code & PF_INSTRUCTION_FETCH != 0 { "execute" }
             else if ctx.frame.error_code & PF_WRITE != 0 { "write" }
@@ -142,7 +140,6 @@ fn crash_report_exception(ctx: &ExceptionContext) {
         ("", "")
     };
 
-    // Header
     if is_user {
         match ctx.vector() {
             Vector::PageFault => log!("SEGFAULT tid={}: {} {} at {:#x}", tid, pf_action, pf_cause, ctx.cr2),
@@ -166,7 +163,6 @@ fn crash_report_exception(ctx: &ExceptionContext) {
         }
     }
 
-    // Crash location (once — not duplicated in backtrace)
     log!("  rip:");
     if is_user {
         if let Some(pid) = pid {
@@ -184,7 +180,6 @@ fn crash_report_exception(ctx: &ExceptionContext) {
         crate::mm::paging::debug_page_walk(ctx.cr2);
     }
 
-    // Register dump
     log!("  Registers:");
     log!("    rax={:#018x}  rbx={:#018x}", ctx.frame.rax, ctx.frame.rbx);
     log!("    rcx={:#018x}  rdx={:#018x}", ctx.frame.rcx, ctx.frame.rdx);
@@ -195,7 +190,6 @@ fn crash_report_exception(ctx: &ExceptionContext) {
     log!("    r12={:#018x}  r13={:#018x}", ctx.frame.r12, ctx.frame.r13);
     log!("    r14={:#018x}  r15={:#018x}", ctx.frame.r14, ctx.frame.r15);
 
-    // Backtrace (skip RIP — already printed above)
     log!("  Backtrace:");
     if is_user {
         if let Some(pid) = pid {
@@ -204,7 +198,6 @@ fn crash_report_exception(ctx: &ExceptionContext) {
     } else {
         kernel_backtrace(ctx.frame.rbp, 32);
 
-        // If this kernel fault happened during a syscall, print the user context
         let user_rip = percpu::syscall_rip();
         if user_rip != 0 {
             if let Some(pid) = pid {
@@ -218,7 +211,6 @@ fn crash_report_exception(ctx: &ExceptionContext) {
         }
     }
 
-    // Stack dump
     if safe_read_u64(ctx.frame.rsp, pml4).is_some() {
         log!("  Stack (from RSP):");
         for i in 0..8u64 {
@@ -228,7 +220,6 @@ fn crash_report_exception(ctx: &ExceptionContext) {
         }
     }
 
-    // Full crash diagnostics for user faults
     if is_user {
         let crash_addr = if ctx.vector() == Vector::PageFault { ctx.cr2 } else { 0 };
         process::dump_crash_diagnostics(crash_addr, ctx.frame.rip);
@@ -238,7 +229,6 @@ fn crash_report_exception(ctx: &ExceptionContext) {
 fn crash_report_panic(info: &core::panic::PanicInfo, rbp: u64) {
     log!("!!! PANIC !!!: {}", info);
 
-    // Kernel backtrace
     log!("  Backtrace:");
     kernel_backtrace(rbp, 20);
 
@@ -254,7 +244,6 @@ fn crash_report_panic(info: &core::panic::PanicInfo, rbp: u64) {
             }
         }
 
-        // Syscall context + user backtrace
         let user_rip = percpu::syscall_rip();
         if user_rip != 0 {
             log!("  Syscall: num={} user_rip={:#x} user_rsp={:#x}",
@@ -354,7 +343,6 @@ pub(super) fn debug_handler(frame: &TrapFrame) {
         kernel_backtrace(frame.rbp, 20);
     }
 
-    // Read the watched address to see what was written
     let watched_addr: u64;
     unsafe { core::arch::asm!("mov {}, dr0", out(reg) watched_addr); }
     if mm::is_kernel_addr(watched_addr) && watched_addr % 8 == 0 {
@@ -469,7 +457,6 @@ pub(super) fn page_fault_handler(frame: &TrapFrame) {
 
     let fault_addr = cpu::read_cr2();
 
-    // SMAP violation detection
     if frame.error_code & PF_PRESENT != 0 && frame.cs & RPL_MASK == 0
         && mm::is_kernel_addr(fault_addr)
     {

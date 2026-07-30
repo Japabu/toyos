@@ -71,14 +71,12 @@ const TRB_CYCLE: u32 = 1;
 // TRB type field is bits [15:10]
 const fn trb_type(t: u32) -> u32 { t << 10 }
 
-// Transfer TRB types
 const TRB_NORMAL:       u32 = trb_type(1);
 const TRB_SETUP_STAGE:  u32 = trb_type(2);
 const TRB_DATA_STAGE:   u32 = trb_type(3);
 const TRB_STATUS_STAGE: u32 = trb_type(4);
 const TRB_LINK:         u32 = trb_type(6);
 
-// Command TRB types
 const TRB_ENABLE_SLOT:    u32 = trb_type(9);
 const TRB_ADDRESS_DEVICE: u32 = trb_type(11);
 const TRB_CONFIGURE_EP:   u32 = trb_type(12);
@@ -97,7 +95,6 @@ struct ErstEntry {
     _reserved: u32,
 }
 
-// TRB Ring — shared enqueue logic for command, EP0, and interrupt rings
 struct TrbRing {
     base: *mut Trb,
     base_phys: u64,
@@ -166,18 +163,14 @@ fn setup_packet(bm_request_type: u8, b_request: u8, w_value: u16, w_index: u16, 
 unsafe impl Send for XhciController {}
 
 pub struct XhciController {
-    // Base addresses (MMIO)
     db_base: Mmio,
     rt_base: Mmio,
 
-    // Capabilities
     context_size: usize, // 32 or 64
 
-    // Shared rings
     cmd_ring: TrbRing,
     ep0_ring: TrbRing,
 
-    // Event Ring
     event_ring: *const Trb,
     event_head: u16,
     event_phase: bool,
@@ -185,7 +178,6 @@ pub struct XhciController {
     // The slot_id used during init for EP0 doorbell targeting
     active_slot: u8,
 
-    // HID devices (keyboard, mouse, etc.)
     devices: Vec<HidDevice>,
 }
 
@@ -227,7 +219,6 @@ impl XhciController {
         self.rt_base.write_u32(IR0_IMAN, 3); // clear IP (W1C) + keep IE
     }
 
-    // EP0 transfer ring: enqueue TRBs + ring doorbell
     fn enqueue_ep0(&mut self, trb: Trb) {
         self.ep0_ring.enqueue(trb);
     }
@@ -256,7 +247,6 @@ impl XhciController {
         }
     }
 
-    // Control transfer (Setup → [Data] → Status)
     fn control_transfer(
         &mut self,
         bm_request_type: u8,
@@ -294,7 +284,6 @@ impl XhciController {
         self.wait_transfer()
     }
 
-    // Reset EP0 ring for reuse between devices
     fn reset_ep0_ring(&mut self) {
         let dma = dma();
         let ring = dma.subslice(OFF_EP0_RING, 0x1000);
@@ -306,7 +295,6 @@ impl XhciController {
         self.ep0_ring = TrbRing::new(ring);
     }
 
-    // Poll: check event ring for completed interrupt transfers
     pub fn poll(&mut self) {
         loop {
             let event = unsafe { read_volatile(self.event_ring.add(self.event_head as usize)) };
@@ -329,7 +317,6 @@ impl XhciController {
         }
     }
 
-    // Write a context field into a context structure
     fn write_ctx32(&self, ctx_base: *mut u8, slot_index: usize, dword: usize, val: u32) {
         let offset = (slot_index * self.context_size) + (dword * 4);
         unsafe { write_volatile(ctx_base.add(offset) as *mut u32, val); }
@@ -365,7 +352,6 @@ fn setup_msix(pci_dev: &PciDevice) {
         }
     };
 
-    // Read MSI-X table location
     let table_info = cap.read_u32(4);
     let table_bir = (table_info & 0x7) as u8;
     let table_offset = (table_info & !0x7) as u64;
@@ -398,7 +384,6 @@ pub fn init(ecam: &crate::mm::Mmio) -> Option<XhciController> {
 
     let bar = crate::mm::paging::kernel().lock().as_mut().unwrap().map_mmio(bar_addr, 0x10000);
 
-    // Configure MSI-X
     setup_msix(&pci_dev);
 
     let cap_length = bar.read_u8(CAP_CAPLENGTH) as u64;
@@ -420,7 +405,6 @@ pub fn init(ecam: &crate::mm::Mmio) -> Option<XhciController> {
 
     log!("xHCI: max_slots={} max_ports={} ctx_size={}", max_slots, max_ports, context_size);
 
-    // Halt controller
     let usbcmd = op_base.read_u32(OP_USBCMD);
     if usbcmd & 1 != 0 {
         op_base.write_u32(OP_USBCMD, usbcmd & !1);
@@ -429,7 +413,6 @@ pub fn init(ecam: &crate::mm::Mmio) -> Option<XhciController> {
         core::hint::spin_loop();
     }
 
-    // Reset controller
     op_base.write_u32(OP_USBCMD, 1 << 1);
     while op_base.read_u32(OP_USBCMD) & (1 << 1) != 0 {
         core::hint::spin_loop();
@@ -457,7 +440,6 @@ pub fn init(ecam: &crate::mm::Mmio) -> Option<XhciController> {
 
     op_base.write_u64(OP_DCBAAP, dma.phys() + OFF_DCBAA as u64);
 
-    // Command Ring
     let cmd_ring_buf = dma.subslice(OFF_CMD_RING, 0x1000);
     let mut link = Trb::ZERO;
     link.param = cmd_ring_buf.phys();
@@ -465,7 +447,6 @@ pub fn init(ecam: &crate::mm::Mmio) -> Option<XhciController> {
     unsafe { write_volatile((cmd_ring_buf.base() as *mut Trb).add(RING_SIZE - 1), link); }
     op_base.write_u64(OP_CRCR, cmd_ring_buf.phys() | 1);
 
-    // Event Ring
     let evt_ring_buf = dma.subslice(OFF_EVT_RING, 0x1000);
     let erst = dma.ptr_at(OFF_ERST) as *mut ErstEntry;
     unsafe {
@@ -510,7 +491,6 @@ pub fn init(ecam: &crate::mm::Mmio) -> Option<XhciController> {
         devices: Vec::new(),
     };
 
-    // Scan all ports and initialize connected HID devices
     device::scan_ports(&mut ctrl, &op_base, max_ports);
 
     if ctrl.devices.is_empty() {

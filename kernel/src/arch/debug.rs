@@ -82,7 +82,6 @@ pub fn check_pte_monitor() {
     // Mask out Accessed (bit 5) and Dirty (bit 6) — set by CPU hardware
     let mask = !0x60u64;
     if current & mask != expected & mask {
-        // PTE changed (ignoring A/D bits)! Disable monitor and report
         MONITOR_PTE_ADDR.store(0, Ordering::Relaxed);
 
         crate::log!("!!! PTE CORRUPTION DETECTED !!!");
@@ -91,12 +90,10 @@ pub fn check_pte_monitor() {
         crate::log!("  actual  ={:#018x}", current);
         crate::log!("  current tid={:?}", crate::arch::percpu::current_tid());
 
-        // Dump what's at the PT page — are neighboring PTEs also corrupted?
         let pt_base = addr & !0xFFF;
         let pt_idx = ((addr - pt_base) / 8) as usize;
         crate::log!("  PT base={:#x}, corrupted index={}", pt_base, pt_idx);
 
-        // Check a range around the corrupted entry
         let start = if pt_idx >= 4 { pt_idx - 4 } else { 0 };
         let end = if pt_idx + 4 < 512 { pt_idx + 4 } else { 511 };
         for i in start..=end {

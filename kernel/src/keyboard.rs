@@ -78,7 +78,6 @@ pub fn handle_report(report: &[u8]) {
         }
     }
 
-    // Key releases: keys in prev report but not in current report.
     for i in 2..8 {
         let keycode = prev[i];
         if keycode < 4 { continue; }
@@ -92,7 +91,6 @@ pub fn handle_report(report: &[u8]) {
         }
     }
 
-    // Key presses: keys in current report but not in prev report.
     for i in 2..8 {
         let keycode = report[i];
         if keycode < 4 { continue; }

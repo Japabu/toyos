@@ -9,11 +9,9 @@ use crate::log;
 use crate::shared_memory;
 use toyos_abi::audio::AudioInfo;
 
-// VirtIO sound PCI identity
 const VIRTIO_VENDOR: u16 = 0x1AF4;
 const VIRTIO_SND_DEVICE: u16 = 0x1059; // 0x1040 + device_id 25
 
-// Control request types
 const VIRTIO_SND_R_PCM_INFO: u32 = 0x0100;
 const VIRTIO_SND_R_PCM_SET_PARAMS: u32 = 0x0101;
 const VIRTIO_SND_R_PCM_PREPARE: u32 = 0x0102;
@@ -26,7 +24,6 @@ const VIRTIO_SND_EVT_JACK_DISCONNECTED: u32 = 0x1001;
 const VIRTIO_SND_EVT_PCM_PERIOD_ELAPSED: u32 = 0x1100;
 const VIRTIO_SND_EVT_PCM_XRUN: u32 = 0x1101;
 
-// Status codes
 const VIRTIO_SND_S_OK: u32 = 0x8000;
 
 // PCM formats (VirtIO 1.2 spec §5.14.6.6)
@@ -421,7 +418,6 @@ fn setup_msix(pci_dev: &PciDevice, device: &VirtioDevice) {
     table.write_u32(0x08, VIRTIO_SOUND_VECTOR as u32); // msg_data: vector
     table.write_u32(0x0C, 0);            // vector control: unmask
 
-    // Enable MSI-X in PCI capability
     let msg_ctrl = cap.read_u16(2);
     cap.write_u16(2, (msg_ctrl | (1 << 15)) & !(1 << 14));
 
@@ -548,7 +544,6 @@ pub fn init(ecam: &crate::mm::Mmio) -> Option<(SoundController, AudioInfo)> {
         );
     }
 
-    // Query PCM stream info
     let query = VirtioSndQueryInfo {
         hdr: VirtioSndHdr { code: VIRTIO_SND_R_PCM_INFO },
         start_id: 0,

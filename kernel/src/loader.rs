@@ -70,7 +70,6 @@ pub fn setup_combined_tls(
     let align = if tls_align > 1 { tls_align } else { 8 };
     let tls_start = (alloc_size - block_size) & !(align - 1);
 
-    // Zero the entire allocation (DTV area, gap, TLS block, TCB).
     unsafe { core::ptr::write_bytes(block, 0, alloc_size); }
 
     for module in modules {
@@ -89,7 +88,6 @@ pub fn setup_combined_tls(
     // TP must be a user-visible physical address (mapped with USER bit in user page tables).
     let block_phys = DirectMap::from_ptr(block).phys();
     let tp_user = block_phys + (tls_start + total_memsz) as u64;
-    // Write self-pointer via kernel direct map
     let tp_kernel = block as u64 + (tls_start + total_memsz) as u64;
     unsafe { *(tp_kernel as *mut u64) = tp_user; }
 
@@ -99,11 +97,8 @@ pub fn setup_combined_tls(
     assert!(dtv_size < tls_start, "DTV overlaps TLS data");
     let dtv_kern = block as *mut u64;
     unsafe {
-        // generation = 1 (initial)
         *dtv_kern = 1;
-        // len = DTV_INITIAL_CAPACITY
         *dtv_kern.add(1) = DTV_INITIAL_CAPACITY as u64;
-        // Initialize all entries as unallocated
         for i in 0..DTV_INITIAL_CAPACITY {
             *dtv_kern.add(2 + i) = DTV_UNALLOCATED;
         }
@@ -309,7 +304,6 @@ fn resolve_exe_tpoff(
     } else {
         let sym_name = elf::sym_name(&sym, dynstr_data);
 
-        // Search loaded libraries for the defining TLS symbol
         for lib in tls_info.libs {
             if lib.tls_memsz == 0 { continue; }
             if let Some(sym_tls_offset) = elf::tls_dlsym_pub(lib, sym_name) {
@@ -425,11 +419,9 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
         }
     };
 
-    // 2. Read first few blocks for ELF headers
     let header_size = 4096.min(backing.file_size() as usize);
     let header_data = read_file_range(backing.as_ref(), 0, header_size);
 
-    // 3. Parse ELF layout from headers
     let layout = match elf::parse_layout(&header_data) {
         Ok(l) => l,
         Err(msg) => {
@@ -448,10 +440,8 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
 
     let t1 = crate::clock::nanos_since_boot();
 
-    // 4. Choose base address in user virtual space
     let base = USER_VM_BASE - layout.vaddr_min;
 
-    // 6. Read and parse relocation tables from block map
     let rela_data = if dyn_info.rela_size > 0 {
         let rela_file_off = vaddr_to_file_offset(&layout.segments, dyn_info.rela_vaddr);
         read_file_range(backing.as_ref(), rela_file_off, dyn_info.rela_size as usize)
@@ -481,7 +471,6 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
     };
     let parsed_relas = elf::parse_rela_entries(&rela_data, &jmprel_data);
 
-    // Start building the relocation index with RELATIVE entries (pre-computed: base + addend)
     let mut reloc_index = elf::RelocationIndex::new();
     for &(r_offset, r_addend) in &parsed_relas.relative {
         reloc_index.add_u64(r_offset, (base as i64 + r_addend) as u64);
@@ -510,7 +499,6 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
             let lib_path = alloc::format!("{}/{}", exe_dir, lib_name);
             let t_load0 = crate::clock::nanos_since_boot();
 
-            // Check the shared library cache first
             if let Some(lib) = elf::try_clone_cached(&lib_path) {
                 lib_paths_vec.push(lib_path);
                 libs.push(lib);
@@ -551,7 +539,6 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
             }
         }
 
-        // 7b. Read exe .dynsym/.dynstr from block map for exe sym map
         if !libs.is_empty() {
             let dynstr_file_off = vaddr_to_file_offset(&layout.segments, dyn_info.strtab_vaddr);
             let dynstr_data = read_file_range(backing.as_ref(), dynstr_file_off, dyn_info.strsz as usize);
@@ -653,7 +640,6 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
 
     // 8c. NOW process library bind relocations (user_base is correct for all libs).
     if !loaded_libs.is_empty() {
-        // Rebuild exe_sym_map (we need it for bind relocs and exe GLOB_DAT)
         let dynstr_file_off = vaddr_to_file_offset(&layout.segments, dyn_info.strtab_vaddr);
         let dynstr_data = if dyn_info.strsz > 0 {
             read_file_range(backing.as_ref(), dynstr_file_off, dyn_info.strsz as usize)
@@ -679,12 +665,10 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
             hashbrown::HashMap::new()
         };
 
-        // Resolve lib bind relocs against exe symbols (NOW user_base is correct)
         for lib in &loaded_libs {
             elf::resolve_lib_bind_relocs_pub(lib, &exe_sym_map, &loaded_libs);
         }
 
-        // Resolve exe GLOB_DAT entries against loaded libs
         let symtab_file_off = vaddr_to_file_offset(&layout.segments, dyn_info.symtab_vaddr);
         for &(r_offset, r_sym, _r_addend) in &parsed_relas.glob_dat {
             if r_sym == 0 { continue; }
@@ -721,7 +705,6 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
         });
     }
 
-    // 10. TLS setup — read exe TLS template from page cache, build multi-module layout
     let exe_tls_template = if layout.tls_memsz > 0 {
         let tls_file_off = vaddr_to_file_offset(&layout.segments, layout.tls_vaddr);
         // Read straight into the `tls_memsz`-sized buffer rather than via an
@@ -761,7 +744,6 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
             .map(|m| m.base_offset)
             .unwrap_or(0);
 
-        // Read exe .dynsym/.dynstr for resolving named TPOFF symbols
         let dynstr_data = if dyn_info.strsz > 0 {
             let dynstr_file_off = vaddr_to_file_offset(&layout.segments, dyn_info.strtab_vaddr);
             read_file_range(backing.as_ref(), dynstr_file_off, dyn_info.strsz as usize)
@@ -785,7 +767,6 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
         }
     }
 
-    // Finalize reloc index (sort all entries)
     reloc_index.finalize();
     let reloc_index = if reloc_index.len() > 0 {
         log!("ELF: {} relocations indexed (RELATIVE + GLOB_DAT + TPOFF)", reloc_index.len());
@@ -824,7 +805,6 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
         .expect("spawn: out of virtual address space for TLS");
     let tls_rebase = tls_vaddr.raw() as i64 - tls_phys as i64;
     let fs_base = (fs_base as i64 + tls_rebase) as u64;
-    // Fix self-pointer (TCB[0]) and DTV pointer (TCB[8]) in the TLS block
     unsafe {
         let tls_base_ptr = DirectMap::from_phys(tls_phys).as_mut_ptr::<u8>();
         let tp_kern = tls_base_ptr.add((fs_base - tls_vaddr.raw()) as usize);

@@ -146,7 +146,6 @@ fn setup_msix(pci_dev: &PciDevice, device: &super::virtio::VirtioDevice) {
     table.write_u32(0x08, VIRTIO_NET_VECTOR as u32); // msg_data: vector
     table.write_u32(0x0C, 0);            // vector control: unmask
 
-    // Enable MSI-X in PCI capability
     let msg_ctrl = cap.read_u16(2);
     cap.write_u16(2, (msg_ctrl | (1 << 15)) & !(1 << 14));
 
@@ -205,7 +204,6 @@ pub fn init(ecam: &crate::mm::Mmio) {
     device.enable_queue(1);
     device.activate();
 
-    // Read MAC address from device config space (bytes 0-5)
     let cfg = device.device_config();
     let mac = [
         cfg.read_u8(0), cfg.read_u8(1), cfg.read_u8(2),

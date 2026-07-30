@@ -574,7 +574,6 @@ impl RelocationIndex {
         let end_offset = page_offset + 4096;
         let mut count = 0usize;
 
-        // Apply u64 writes
         let start = self.entries_u64.partition_point(|&(off, _)| off < page_offset);
         for &(r_offset, value) in &self.entries_u64[start..] {
             if r_offset >= end_offset { break; }
@@ -587,7 +586,6 @@ impl RelocationIndex {
             }
         }
 
-        // Apply i32 writes
         let start = self.entries_i32.partition_point(|&(off, _)| off < page_offset);
         for &(r_offset, value) in &self.entries_i32[start..] {
             if r_offset >= end_offset { break; }
@@ -724,7 +722,6 @@ pub fn build_symtab_map(
     let shent = shentsize as usize;
     let shnum = shdr_data.len() / shent;
 
-    // Find SHT_SYMTAB and its linked SHT_STRTAB
     let mut symtab_off = 0u64;
     let mut symtab_size = 0u64;
     let mut symtab_link = 0u32;
@@ -744,7 +741,6 @@ pub fn build_symtab_map(
     }
     if !found { return None; }
 
-    // Read linked .strtab
     let link_off = symtab_link as usize * shent;
     if link_off + shent > shdr_data.len() { return None; }
     let strtab_off = u64::from_le_bytes(shdr_data[link_off + 24..link_off + 32].try_into().ok()?);
@@ -1022,7 +1018,6 @@ pub fn load_shared_lib(backing: &dyn crate::file_backing::FileBacking) -> Result
     }
     let t3 = crate::clock::nanos_since_boot();
 
-    // Parse PT_DYNAMIC from loaded image
     let mut symtab_vaddr = 0u64;
     let mut has_symtab = false;
     let mut strtab_vaddr = 0u64;
@@ -1099,7 +1094,6 @@ pub fn load_shared_lib(backing: &dyn crate::file_backing::FileBacking) -> Result
     let sym_count = sym_count.min(dynsym.as_ref().map_or(0, |s| s.size() / SYM_SIZE));
     let dynstr = Some(module.slice(strtab_vaddr, strtab_size)?);
 
-    // Apply R_X86_64_RELATIVE relocations
     let base_phys = image.phys();
     let mut reloc_count = 0u64;
     let rela_slice = if rela_size > 0 {
@@ -1438,7 +1432,6 @@ fn resolve_dtpmod(lib: &LoadedLib, r_sym: u32, self_module_id: u64, tls_info: &T
     }
     let sym = lib.sym(r_sym as usize);
     if sym.st_shndx != 0 {
-        // Defined in this library
         return self_module_id;
     }
     // Cross-module: find the defining library, then look up its module_id
@@ -1519,7 +1512,6 @@ fn tls_dlsym(lib: &LoadedLib, name: &str) -> Option<u64> {
 fn resolve_cross_lib_tpoff(lib: &LoadedLib, r_sym: u32, tls_info: &TlsModuleInfo, total_memsz: usize) -> i64 {
     let sym_name = lib.sym_name(r_sym as usize);
 
-    // Search all libraries for the defining TLS symbol
     for other_lib in tls_info.libs {
         if other_lib.tls_memsz == 0 { continue; }
         if let Some(sym_tls_offset) = tls_dlsym(other_lib, sym_name) {
