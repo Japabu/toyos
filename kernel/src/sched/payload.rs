@@ -100,10 +100,9 @@ pub const SCHED_UNKNOWN: u8 = 3;
 
 /// What a thread other than the one running can be asked about.
 ///
-/// Under the old scheduler `ps` walked every CPU's queue under its lock.
-/// Per-CPU exclusive ownership makes that unwritable — a `CpuSched` is `!Sync`
-/// and reachable only from its own CPU. What a remote reader actually wants is
-/// published here instead, by the owning CPU, at each end of a pass.
+/// A `CpuSched` is `!Sync` and reachable only from its own CPU, so a remote
+/// reader cannot walk it. What one actually wants is published here instead,
+/// by the owning CPU, at each end of a pass.
 pub struct TaskHandle {
     cpu_ns: AtomicU64,
     /// Dispatch timestamp while running, 0 otherwise. A reader adds the live

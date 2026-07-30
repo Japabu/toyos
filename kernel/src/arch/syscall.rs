@@ -237,12 +237,9 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         29 | 30 => SyscallError::NotSupported.to_u64(), // formerly SYS_SEND_MSG/SYS_RECV_MSG
         SYS_OPEN_DEVICE => sys_open_device(a1),
         32 | 33 => SyscallError::NotSupported.to_u64(), // formerly SYS_REGISTER_NAME/SYS_FIND_PID
-        // Scanning out a rect and moving the hardware cursor are the display
-        // owner's business, exactly like SYS_GPU_SET_RESOLUTION. Ungated, any
-        // process could tear the compositor's half-drawn frames onto the
-        // screen and move the cursor under the user's hand. Framebuffer
-        // *contents* were never exposed — those are behind shared_memory
-        // grants — so this is display integrity, not a read of other memory.
+        // Display integrity, not memory access: framebuffer *contents* are
+        // behind shared_memory grants either way. Ungated, any process could
+        // scan out over the compositor's frames and move the cursor.
         SYS_GPU_PRESENT | SYS_GPU_SET_CURSOR | SYS_GPU_MOVE_CURSOR => {
             if !device::is_owner(device::DEVICE_FRAMEBUFFER, process::current_process()) {
                 return SyscallError::PermissionDenied.to_u64();
@@ -329,12 +326,11 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         SYS_PIPE_OPEN => sys_pipe_open(a1, a2),
         SYS_PIPE_ID => sys_pipe_id(a1 as u32),
         SYS_AUDIO_SUBMIT => {
-            // Ungated this took no fd and read no owner, so any process could
-            // start the PCM stream, put whatever soundd was mid-fill on the
-            // wire, and drain `tx_free_slots` until soundd's own submits
-            // failed — which soundd turns into a panic. The check is here
-            // rather than inside `audio::submit_buffer` because that is also
-            // reachable from init paths with no current process.
+            // Addressed by ambient authority, so without this any process
+            // could put whatever soundd is mid-fill on the wire and drain
+            // `tx_free_slots` out from under it. Checked here rather than in
+            // `audio::submit_buffer`, which init paths reach with no current
+            // process.
             if !device::is_owner(device::DEVICE_AUDIO, process::current_process()) {
                 return SyscallError::PermissionDenied.to_u64();
             }
@@ -354,10 +350,9 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         }
         SYS_SOCKET_CREATE => sys_socket_create(a1, a2),
         SYS_PIPE_MAP => sys_pipe_map(a1 as u32),
-        // Both address the NIC by ambient authority — no fd, no owner check —
-        // so any process could pop frames out of the used ring before netd
-        // saw them, and, by never refilling, exhaust all 256 RX slots and
-        // stop the NIC receiving.
+        // Both address the NIC by ambient authority, so without this any
+        // process could pop frames out of the used ring before netd sees them
+        // and, by never refilling, exhaust all 256 RX slots.
         SYS_NIC_RX_POLL => {
             if !device::is_owner(device::DEVICE_NIC, process::current_process()) {
                 return SyscallError::PermissionDenied.to_u64();
@@ -393,10 +388,8 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             sys_readlink(path, buf)
         }
         SYS_GPU_SET_RESOLUTION => {
-            // Reconfiguring the display is the display owner's business. The
-            // check is first so a non-claimant never reaches the driver, and
-            // never gets its two arbitrary u32s turned into a contiguous
-            // physical allocation.
+            // Checked before the driver, so a non-claimant never gets its two
+            // arbitrary u32s turned into a contiguous physical allocation.
             let pid = process::current_process();
             if !device::is_owner(device::DEVICE_FRAMEBUFFER, pid) {
                 return SyscallError::PermissionDenied.to_u64();
@@ -475,18 +468,14 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             0
         },
         SYS_SET_RT_PRIORITY => {
-            // The RT band has no priority above it, so an unbounded number of
-            // attacker threads in it starve soundd's mix thread at its own
-            // level — the audio subsystem's core scheduling guarantee, with
-            // nothing behind it. The audio claim is the kernel's existing
-            // record of which process owns the pipeline, and soundd is the
-            // only caller in the tree. Not in `scheduler::set_current_rt`,
-            // which must stay callable from kernel init.
+            // The RT band has no priority above it, so unbounded threads in it
+            // starve soundd's mix thread at its own level. Gated on the audio
+            // claim rather than in `scheduler::set_current_rt`, which must stay
+            // callable from kernel init.
             //
-            // This is exactly as strong as the claim and no stronger:
-            // `SYS_OPEN_DEVICE` is first-come and ungated, so whoever wins the
-            // race for the audio device gets the RT band with it. Spec §9.4
-            // wants a privilege, and a claim is not one.
+            // Exactly as strong as the claim and no stronger: `SYS_OPEN_DEVICE`
+            // is first-come and ungated, so whoever wins the race gets the RT
+            // band with it. Spec §9.4 wants a privilege; a claim is not one.
             if !device::is_owner(device::DEVICE_AUDIO, process::current_process()) {
                 return SyscallError::PermissionDenied.to_u64();
             }
@@ -714,19 +703,17 @@ fn sys_pipe() -> u64 {
 
 /// May `caller` attach to a pipe created by `creator`?
 ///
-/// `PipeId`s are dense sequential integers with no rights attached, so the
-/// answer used to be "always" — `for id in 0.. { pipe_open(id) }` attached a
-/// reader or a writer to every pipe in the system, and `SYS_PIPE_MAP` then
-/// handed over the raw 2 MiB ring page.
+/// `PipeId`s are dense sequential integers with no rights attached, so without
+/// a check `for id in 0.. { pipe_open(id) }` attaches to every pipe in the
+/// system and `SYS_PIPE_MAP` then hands over the raw 2 MiB ring page.
 ///
-/// The policy the API actually means is a delegation: an id is openable by a
-/// process it was deliberately handed to over IPC. The kernel cannot see that
-/// hand-off — the id travels inside a message payload — but it can see the
-/// channel it travelled on. So: the creator itself, or a process holding a
-/// live socket to the creator. Both real cross-process users satisfy it and
-/// neither direction is privileged — netd opens pipes its *client* created
-/// (it holds the accepted socket), an audio client opens the signal pipe
-/// *soundd* created (it holds the connected socket).
+/// The policy the API means is a delegation: an id is openable by a process it
+/// was deliberately handed to over IPC. The kernel cannot see that hand-off —
+/// the id travels inside a message payload — but it can see the channel it
+/// travelled on. So: the creator itself, or a process holding a live socket to
+/// the creator. Both real cross-process users satisfy it in opposite
+/// directions — netd opens pipes its *client* created, an audio client opens
+/// the signal pipe *soundd* created.
 ///
 /// Already holding a descriptor for the pipe also qualifies: a child that
 /// inherited a pipe fd through a spawn `fd_map` is not its creator and has no
@@ -808,12 +795,11 @@ fn sys_pipe_map(fd_num: u32) -> u64 {
 
 /// Bundle two pipes the caller already holds into one socket descriptor.
 ///
-/// The ids used to be looked up globally with no check at all, which made
-/// this a second, quieter route to any pipe in the system. Its only caller is
-/// std's `make_socket_fd`, which wraps two pipes this same process created and
-/// still holds fds for — so "you must already hold both ends, in the right
-/// direction" is exact, not conservative. Unlike `SYS_PIPE_OPEN` this grants
-/// no new access, which is why it can be this strict.
+/// Without a check this is a second, quieter route to any pipe in the system.
+/// Its only caller is std's `make_socket_fd`, which wraps two pipes this same
+/// process created and still holds fds for, so "you must already hold both
+/// ends, in the right direction" is exact rather than conservative — and
+/// unlike `SYS_PIPE_OPEN` it grants no new access, so it can be that strict.
 fn sys_socket_create(rx_pipe_id_raw: u64, tx_pipe_id_raw: u64) -> u64 {
     let rx_id = pipe::PipeId::from_raw(rx_pipe_id_raw as usize);
     let tx_id = pipe::PipeId::from_raw(tx_pipe_id_raw as usize);
@@ -1056,15 +1042,12 @@ fn sys_release_shared(token: u64) -> u64 {
 }
 
 fn sys_mmap(req_addr: u64, size: u64, _prot: u64, flags: u64) -> u64 {
-    // `size` crossed the trust boundary. Zero is a request for nothing, and a
-    // size whose 2 MiB rounding does not fit is a request that cannot be
-    // expressed at all; neither is an allocation failure, so neither is
-    // ResourceExhausted. Rounding cannot be allowed to wrap — with
-    // overflow-checks on (the kernel's dev profile) `align_2m` panics, and
-    // with them off it wraps a huge request down to a small one, which is
-    // exactly the silent truncation this kernel forbids. No policy ceiling is
-    // needed: every larger size is already refused by the PMM's own
-    // `free_count` check, which is a physical limit.
+    // `size` crossed the trust boundary. Zero is a request for nothing and a
+    // size whose 2 MiB rounding does not fit cannot be expressed at all;
+    // neither is an allocation failure, so neither is ResourceExhausted. The
+    // rounding must not be allowed to wrap — that would silently turn a huge
+    // request into a small one. No policy ceiling is needed above that: the
+    // PMM's own `free_count` check is a physical limit.
     if size == 0 || (size as usize).checked_add(crate::mm::PAGE_2M as usize - 1).is_none() {
         return SyscallError::InvalidArgument.to_u64();
     }
@@ -1072,13 +1055,11 @@ fn sys_mmap(req_addr: u64, size: u64, _prot: u64, flags: u64) -> u64 {
     let fixed = flags & 4 != 0; // MmapFlags::FIXED
 
     // A fixed mapping bypasses `find_gap`, so it has to respect `find_gap`'s
-    // range itself. Nothing checked it before, and `PageTables::remap` only
-    // asserts 2 MiB alignment: a kernel-half `req_addr` reaches
-    // `ensure_table`, which ORs PAGE_USER onto the *shared* kernel PML4 entry
-    // (`new_user` shallow-copies PML4[256..512]) and writes a PDE into the
-    // shared kernel page directory. One unprivileged syscall was a
-    // user-writable window onto physical memory of the caller's choosing,
-    // visible to the kernel and to every other process.
+    // range itself: `PageTables::remap` only asserts 2 MiB alignment, so a
+    // kernel-half `req_addr` reaches `ensure_table`, which ORs PAGE_USER onto
+    // the *shared* kernel PML4 entry (`new_user` shallow-copies PML4[256..512])
+    // and writes a PDE into the shared kernel page directory — a user-writable
+    // window visible to the kernel and every other process.
     //
     // A 2 MiB-page kernel cannot honour a finer-grained `req_addr`, and there
     // is nothing to clamp a request to when the granularity itself is what
@@ -1178,19 +1159,15 @@ fn sys_munmap(addr: u64, _size: u64) -> u64 {
     })
 }
 
-/// `(stack_base, stack_ptr)` is a pair the kernel only ever reads back out
-/// through `SYS_STACK_INFO`, and `spawn_thread` stores their difference. Both
-/// are raw syscall arguments, so a base above the pointer underflowed: a
-/// panic with overflow-checks on, and with them off a silent wrap that has
-/// `SYS_STACK_INFO` report a ~2^64-byte stack. A base above the pointer
-/// describes no stack at all, so there is nothing to clamp it to.
+/// `spawn_thread` stores `stack_ptr - stack_base`, and both are raw syscall
+/// arguments. A base above the pointer describes no stack at all, so there is
+/// nothing to clamp it to and it is refused.
 fn sys_thread_spawn(entry: u64, stack_ptr: u64, arg: u64, stack_base: u64) -> u64 {
     if stack_base > stack_ptr {
         return SyscallError::InvalidArgument.to_u64();
     }
-    // Every `None` `spawn_thread` returns is a resource failure (TLS, kernel
-    // stack, virtual address space) or a teardown race — never a bad
-    // argument, which is what `Unknown` used to claim.
+    // Every `None` from `spawn_thread` is a resource failure (TLS, kernel
+    // stack, virtual address space) or a teardown race, never a bad argument.
     process::spawn_thread(entry, stack_ptr, arg, stack_base)
         .map_or(SyscallError::ResourceExhausted.to_u64(), |t| t.raw() as u64)
 }
@@ -1537,12 +1514,11 @@ fn sys_dlopen(path: &str, init_out: u64) -> u64 {
 /// `module_id` crosses the trust boundary: every rejection here is an error
 /// return, never a panic.
 ///
-/// The DTV is found through the thread's own kernel-side TLS allocation, not
-/// by following a pointer chain out of the FS base. CR4.FSGSBASE is on, so
-/// userland owns its FS base; reading TCB[8] through it with a raw
-/// `AddressSpace::translate` applies no user-half check and resolves kernel
-/// addresses fine through the direct map shallow-copied into every user PML4,
-/// which made the DTV write an arbitrary kernel write.
+/// The DTV is found through the thread's own kernel-side TLS allocation, never
+/// by chasing a pointer out of the FS base: CR4.FSGSBASE is on, so userland
+/// owns that register, and a raw `AddressSpace::translate` of TCB[8] applies no
+/// user-half check and resolves kernel addresses through the direct map
+/// shallow-copied into every user PML4.
 fn sys_tls_alloc_block(module_id: u64) -> u64 {
     match tls_alloc_block(module_id) {
         Ok(vaddr) => vaddr,
@@ -1571,11 +1547,11 @@ fn tls_alloc_block(module_id: u64) -> Result<u64, SyscallError> {
         (m.memsz, m.template)
     };
 
-    // A DTV entry leaves DTV_UNALLOCATED once and never returns to it, so a
-    // repeat call for the same (thread, module) is the same block asked for
-    // twice. Serving it with a fresh one frees pages userland still holds
-    // pointers into, while the first mapping stays present, USER and writable
-    // over whatever the PMM hands out next.
+    // A DTV entry leaves DTV_UNALLOCATED once and never returns, so a repeat
+    // call for the same (thread, module) is the same block asked for twice.
+    // Serving a fresh one frees pages userland still points into while the
+    // first mapping stays present, USER and writable, over whatever the PMM
+    // hands out next.
     let tid = process::current_tid();
     let existing = process::with_fd_owner_data(|data| {
         data.elf.dynamic_tls_blocks.get(&(tid, module_id)).map(|b| b.vaddr())

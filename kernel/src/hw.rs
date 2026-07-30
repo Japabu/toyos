@@ -1,15 +1,10 @@
 //! `KernelHw` — the kernel's side of the scheduler-core hardware boundary
-//! (spec §10.1, migration stage 6).
+//! (spec §10.1).
 //!
 //! Everything here is x2APIC, TSC or a single instruction. Nothing here
 //! decides anything: no queue is consulted, no state machine advances, no
 //! ordering-sensitive protocol lives below this line. That is the whole
 //! contract — the simulator replaces this file and nothing else.
-//!
-//! Stage 6 implemented [`Machine`] alone; stage 7a adds [`Hw`], whose two
-//! extra members — the context switch and the finalize sink — are exactly the
-//! two that name a task. The split held: nothing about the task-blind half
-//! needed changing to complete it, and the whole delta below is additive.
 
 use core::arch::asm;
 
@@ -28,12 +23,8 @@ pub static HW: KernelHw = KernelHw;
 
 pub struct KernelHw;
 
-/// The scheduler's clock reads, as raw nanoseconds.
-///
-/// The old scheduler timestamps in `u64` and samples the clock about a dozen
-/// times per pass; stage 7 samples [`Machine::now`] once per pass and threads
-/// the [`Nanos`] as a value. Until then this is where the two meet, and its
-/// call count is the honest size of that debt.
+/// The scheduler's clock reads, as raw nanoseconds — where the kernel's `u64`
+/// timestamps meet the core's [`Nanos`].
 pub fn now_ns() -> u64 {
     HW.now().0
 }
@@ -172,11 +163,10 @@ impl Hw for KernelHw {
     /// so dropping the payload here frees a kernel stack nothing stands on and
     /// releases the address-space `Arc` for the one and only time.
     ///
-    /// It is also where a retirer's wait ends (stage 7b). The announcement is
-    /// deliberately the *last* thing: `retire_task` returns to a caller that is
-    /// about to free memory the dead thread's page tables mapped, and what
-    /// makes that safe is not that the thread stopped running but that this
-    /// drop already happened.
+    /// It is also where a retirer's wait ends. The announcement is deliberately
+    /// the *last* thing: `retire_task` returns to a caller about to free memory
+    /// the dead thread's page tables mapped, and what makes that safe is not
+    /// that the thread stopped running but that this drop already happened.
     fn release(&self, _key: TaskKey, payload: KernelPayload, acct: TaskAccounting) {
         let handle = payload.handle.clone();
         handle.finalize(acct);

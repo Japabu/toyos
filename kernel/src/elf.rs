@@ -137,9 +137,8 @@ static SO_CACHE: Lock<alloc::vec::Vec<(String, CachedLib)>> = Lock::new(alloc::v
 /// Returns a new `LoadedLib` in `Shared` mode with private RW pages.
 ///
 /// `rw_offset`/`rw_size` are the 2 MiB-aligned writable window inside the
-/// image, computed by `load_shared_lib` — the same expression that validated
-/// every relocation, so the window a relocation was checked against and the
-/// window `rw_alloc` covers cannot drift apart.
+/// image, passed in from `load_shared_lib` so that the window a relocation was
+/// validated against and the window `rw_alloc` covers cannot drift apart.
 fn cache_loaded_lib(path: &str, lib: LoadedLib, rw_offset: usize, rw_size: usize) -> LoadedLib {
     let alloc = match lib.memory {
         LibMemory::Owned(a) => a,
@@ -316,13 +315,10 @@ pub struct ElfSegment {
 /// - the file-backed extent of PT_TLS, and all of PT_DYNAMIC and
 ///   PT_GNU_EH_FRAME, lie inside `[vaddr_min, vaddr_max)`.
 ///
-/// The size pairs are the point. Downstream every one of them is a
-/// (copy length, destination size) pair — `OwnedAlloc::new(memsz)` then
-/// `copy(.., filesz)` for the exe's TLS template, an image sized from
-/// `vaddr_max` then a `filesz`-long segment read for a `dlopen`ed library —
-/// so `p_filesz <= p_memsz` is a memory-safety invariant here, not an ELF
-/// formality. The vaddr ranges are the same story one level up:
-/// `load_shared_lib` addresses the loaded image as `vaddr - vaddr_min`.
+/// Downstream every size pair is a (copy length, destination size) pair —
+/// `OwnedAlloc::new(memsz)` then `copy(.., filesz)` — so `p_filesz <= p_memsz`
+/// is a memory-safety invariant here, not an ELF formality. Likewise the vaddr
+/// ranges: `load_shared_lib` addresses the image as `vaddr - vaddr_min`.
 pub struct ElfLayout {
     pub entry_vaddr: u64,
     pub vaddr_min: u64,
@@ -462,10 +458,10 @@ pub fn parse_layout(data: &[u8]) -> Result<ElfLayout, &'static str> {
     // Every other program header names a vaddr that `load_shared_lib` turns
     // into an offset into the loaded image as `vaddr - vaddr_min`. Outside
     // `[vaddr_min, vaddr_max)` that is a wrapping subtraction into an
-    // out-of-bounds kernel pointer, so bound them here rather than at each of
-    // the seven use sites. Only the file-backed part of PT_TLS is checked:
-    // `.tbss` occupies address space the containing PT_LOAD need not cover,
-    // and it is never read from, only zeroed in a buffer of its own.
+    // out-of-bounds kernel pointer, so bound them here rather than at each use
+    // site. Only the file-backed part of PT_TLS is checked: `.tbss` occupies
+    // address space the containing PT_LOAD need not cover, and it is never
+    // read from, only zeroed in a buffer of its own.
     let in_image = |vaddr: u64, size: u64| {
         vaddr >= vaddr_min && vaddr.checked_add(size).is_some_and(|end| end <= vaddr_max)
     };
@@ -509,17 +505,13 @@ pub fn parse_layout(data: &[u8]) -> Result<ElfLayout, &'static str> {
 pub fn find_rela_dyn_from_sections(
     shdr_data: &[u8],
     shentsize: u16,
-    shstrtab_reader: &dyn Fn(u64, usize) -> Vec<u8>,
+    section_reader: &dyn Fn(u64, usize) -> Vec<u8>,
 ) -> Option<(u64, u64)> {
     let shent = shentsize as usize;
     let shnum = shdr_data.len() / shent;
 
-    // First, find .shstrtab (section name string table) — usually the last section
-    // We need it to look up section names.
-    // The shstrtab index is typically e_shstrndx, but we don't have it here.
-    // Instead, find a SHT_STRTAB section that contains ".rela.dyn" by trying each.
-
-    // SHT_RELA = 4
+    // Identified by shape, not by name: `.shstrtab` would have to be located
+    // first to read section names, and `e_shstrndx` is not in `shdr_data`.
     for i in 0..shnum {
         let off = i * shent;
         if off + shent > shdr_data.len() { break; }
@@ -528,10 +520,8 @@ pub fn find_rela_dyn_from_sections(
             let sh_offset = u64::from_le_bytes(shdr_data[off + 24..off + 32].try_into().ok()?);
             let sh_size = u64::from_le_bytes(shdr_data[off + 32..off + 40].try_into().ok()?);
             let sh_entsize = u64::from_le_bytes(shdr_data[off + 56..off + 64].try_into().ok()?);
-            // R_X86_64 RELA entries are 24 bytes each
             if sh_entsize == 24 && sh_size > 0 {
-                // Verify it contains R_X86_64_RELATIVE entries by reading first entry
-                let first = shstrtab_reader(sh_offset, 24.min(sh_size as usize));
+                let first = section_reader(sh_offset, 24.min(sh_size as usize));
                 if first.len() >= 24 {
                     let info = u64::from_le_bytes(first[8..16].try_into().unwrap());
                     let r_type = (info & 0xFFFFFFFF) as u32;
@@ -708,9 +698,8 @@ pub fn build_exe_sym_map<'a>(
     base: UserAddr,
 ) -> hashbrown::HashMap<&'a str, UserAddr> {
     // `sym_count` comes off the ELF (a .gnu.hash walk or a SYMTAB/STRTAB vaddr
-    // gap), so it is not a size to pre-allocate from. The table cannot hold
-    // more entries than `dynsym_data` has room for — the loop below breaks on
-    // exactly that — so reserve for what is actually there.
+    // gap), so it is not a size to pre-allocate from. `dynsym_data`'s length
+    // bounds what the table can actually hold; the loop below breaks there.
     let mut map = hashbrown::HashMap::with_capacity(sym_count.min(dynsym_data.len() / SYM_SIZE));
     for i in 1..sym_count {
         if (i + 1) * SYM_SIZE > dynsym_data.len() { break; }
@@ -841,15 +830,11 @@ impl LoadedLib {
     /// Write a value at a byte offset within this library's kernel mapping.
     ///
     /// `offset` is a relocation's `r_offset`, i.e. it came out of the file.
-    /// Each arm asserts the bound that actually protects *its own*
-    /// destination. That distinction is the whole point: the `Shared` arm
-    /// writes into `rw_alloc`, a separate and smaller allocation, so bounding
-    /// it by the image — as this did — admitted a multi-MiB overwrite above
-    /// and below `rw_alloc` on every module with read-only pages outside its
-    /// writable segment, which is every module. `load_shared_lib` rejects any
-    /// entry that fails the stricter of the two, so reaching either assert
-    /// means the loader let something through — a kernel bug, and fail-fast
-    /// is right for it.
+    /// Each arm asserts the bound protecting *its own* destination, which for
+    /// the `Shared` arm is `rw_alloc` — a separate, smaller allocation, so the
+    /// image's bounds do not cover it. `load_shared_lib` rejects any entry
+    /// that fails the stricter of the two, so reaching either assert means the
+    /// loader let something through: a kernel bug.
     pub unsafe fn write_at<T: Copy>(&self, offset: u64, value: T) {
         let end = (offset as usize).checked_add(core::mem::size_of::<T>())
             .expect("LoadedLib::write_at: r_offset + width overflows");
@@ -947,21 +932,15 @@ pub(crate) fn read_backing_into(backing: &dyn crate::file_backing::FileBacking, 
     }
 }
 
-/// Load a shared library (.so) into memory for dynamic linking.
-/// Reads ELF headers and segments from the file backing (no full-file buffer).
-/// Applies RELATIVE relocations and parses PT_DYNAMIC for symbol tables.
-/// Returns (LoadedLib, rw_vaddr, rw_end_vaddr) for RW region tracking.
 /// A loaded module image, addressed by the module's own virtual addresses.
 ///
-/// Every `DT_*` tag and every `r_offset` in a shared object is a vaddr the
-/// loader has to turn into an offset into this image, and all of them come
-/// from the file. Written inline as `vaddr - vaddr_min` that is a wrapping
-/// subtraction on untrusted input, producing a huge offset whose
-/// `offset + size` wraps back under the slice's own bounds check — an
-/// out-of-bounds kernel pointer that passes every assert on the way. There
-/// were nine such subtractions; this is the one place they all go through
-/// now, and it returns an error rather than asserting because a malformed
-/// `.so` is untrusted input, not a kernel bug.
+/// Every `DT_*` tag and every `r_offset` in a shared object is a file-supplied
+/// vaddr the loader has to turn into an offset into this image. Written inline
+/// as `vaddr - vaddr_min` that is a wrapping subtraction on untrusted input,
+/// producing an offset whose `offset + size` wraps back under the slice's own
+/// bounds check. Every such conversion goes through here, and it returns an
+/// error rather than asserting: a malformed `.so` is untrusted input, not a
+/// kernel bug.
 struct ModuleImage {
     image: KernelSlice,
     vaddr_min: u64,
@@ -1019,9 +998,8 @@ pub fn load_shared_lib(backing: &dyn crate::file_backing::FileBacking) -> Result
     let load_size = align_2m((vaddr_max - vaddr_min) as usize);
 
     // The 2 MiB-aligned writable window inside the image. Derived here rather
-    // than in `cache_loaded_lib` so that the window every relocation is
-    // validated against below is the same expression that later sizes
-    // `rw_alloc` — the two cannot drift.
+    // than in `cache_loaded_lib` so that the window relocations are validated
+    // against below is the same one that later sizes `rw_alloc`.
     let rw_offset = (rw_vaddr - vaddr_min) as usize & !(PAGE_2M as usize - 1);
     let rw_size = align_2m((rw_end_vaddr - vaddr_min) as usize) - rw_offset;
     let t0 = crate::clock::nanos_since_boot();
@@ -1033,11 +1011,10 @@ pub fn load_shared_lib(backing: &dyn crate::file_backing::FileBacking) -> Result
     unsafe { image.zero(); }
     let t2 = crate::clock::nanos_since_boot();
 
-    // Read PT_LOAD segments from backing directly into image. `image` is sized
-    // from `vaddr_max`, i.e. from every segment's p_memsz, so reading p_filesz
-    // bytes into it stays in bounds only because `ElfLayout` guarantees
-    // filesz <= memsz. Take the checked subslice rather than a bare `ptr_at`
-    // so a future weakening of that invariant is an assert, not an overwrite
+    // `image` is sized from `vaddr_max`, i.e. from every segment's p_memsz, so
+    // reading p_filesz bytes into it stays in bounds only because `ElfLayout`
+    // guarantees filesz <= memsz. Take the checked subslice rather than a bare
+    // `ptr_at` so a weakening of that invariant is an assert, not an overwrite
     // of whatever the PMM handed out after this allocation.
     for seg in &layout.segments {
         let dst = image.subslice((seg.vaddr - vaddr_min) as usize, seg.filesz as usize);
@@ -1114,12 +1091,10 @@ pub fn load_shared_lib(backing: &dyn crate::file_backing::FileBacking) -> Result
         count
     };
 
-    // `sym_count` is derived from a section header's sh_size or from the
-    // .gnu.hash chain walk, both file-controlled, so it is not a size to
-    // trust. `.dynsym` runs to the end of the image instead — a relocation's
-    // `r_sym` is then bounded by what the image can hold rather than by a
-    // count the file declares, and `LoadedLib::sym` stops being a
-    // `KernelSlice` assert waiting for the first out-of-range `r_info`.
+    // `sym_count` is file-controlled (a section header's sh_size or a .gnu.hash
+    // chain walk), so `.dynsym` runs to the end of the image instead: a
+    // relocation's `r_sym` is then bounded by what the image can hold rather
+    // than by a count the file declares.
     let dynsym = if has_symtab { Some(module.slice_to_end(symtab_vaddr)?) } else { None };
     let sym_count = sym_count.min(dynsym.as_ref().map_or(0, |s| s.size() / SYM_SIZE));
     let dynstr = Some(module.slice(strtab_vaddr, strtab_size)?);
@@ -1134,20 +1109,16 @@ pub fn load_shared_lib(backing: &dyn crate::file_backing::FileBacking) -> Result
         Some(module.slice(jmprel_vaddr, jmprel_size)?)
     } else { None };
 
-    // Validate every entry the loader will ever write, then apply the
-    // RELATIVE ones. The previous version validated only RELATIVE, which left
-    // GLOB_DAT, JUMP_SLOT, TPOFF64/32 and DTPMOD64/DTPOFF64 to reach
-    // `write_at` unchecked — and `write_at`'s doc comment claiming otherwise
-    // was simply false. DTPOFF64 with `r_sym == 0` writes `r_addend`
-    // verbatim, so an unvalidated `r_offset` there was an arbitrary 8-byte
-    // kernel write with an attacker-chosen value.
+    // Validate every entry the loader will ever write, not just the RELATIVE
+    // ones applied here: DTPOFF64 with `r_sym == 0` writes `r_addend`
+    // verbatim, so an unvalidated `r_offset` is an arbitrary 8-byte kernel
+    // write with a file-chosen value.
     //
     // The bound is the writable window, not the image: once this module is
     // cached the write lands in `rw_alloc`, which covers only that window.
     // Both `r_offset` conventions have to hold — the writers below index the
     // image by the raw `r_offset` while `ModuleImage::slice` subtracts
-    // `vaddr_min` — so require the entry to be valid under the stricter, as
-    // the RELATIVE-only check already did.
+    // `vaddr_min` — so require the entry to be valid under the stricter.
     for table in [&rela_slice, &jmprel_slice] {
         let Some(table) = table else { continue };
         let count = table.size() / RELA_SIZE as usize;
@@ -1161,8 +1132,8 @@ pub fn load_shared_lib(backing: &dyn crate::file_backing::FileBacking) -> Result
                 return Err("ELF: relocation r_offset outside the writable image");
             }
             // RELATIVE never touches the symbol table; every other written
-            // type resolves through `LoadedLib::sym`, whose `r_sym * 24` read
-            // was bounded by nothing at all.
+            // type resolves through `LoadedLib::sym`, which indexes it as
+            // `r_sym * 24`.
             if rela_type(&rela) != R_X86_64_RELATIVE && rela_sym(&rela) as usize >= sym_count {
                 return Err("ELF: relocation r_sym past .dynsym");
             }
@@ -1219,15 +1190,9 @@ pub fn load_shared_lib(backing: &dyn crate::file_backing::FileBacking) -> Result
 /// Rebase all R_X86_64_RELATIVE relocation entries by adding `delta` to each value.
 /// Called after user_base is assigned (differs from phys_base used during load_shared_lib).
 ///
-/// This used to have a twin, `fixup_relative_relocs`, which did the same walk
-/// but open-coded the `Shared` pointer arithmetic `write_at` already
-/// encapsulates — and so carried a second, unchecked copy of the same
-/// out-of-window write: `offset - rw_offset` with no bound, underflowing below
-/// `rw_alloc` and running off its top. Deleting the arithmetic deleted the
-/// second copy of the bug. The two read the old value from different places
-/// (this one from the shared image, the twin from the private copy) but a
-/// freshly cloned RW window is a byte-for-byte copy of the image's, which is
-/// the only state either was ever called in.
+/// Reads the old value out of the shared image rather than the private RW
+/// window: the only state this is ever called in is a freshly cloned window,
+/// which is a byte-for-byte copy of the image's.
 pub fn rebase_relative_relocs(lib: &LoadedLib, delta: i64) {
     for table in [&lib.rela, &lib.jmprel] {
         let Some(table) = table else { continue };

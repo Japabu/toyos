@@ -19,8 +19,8 @@
 //! useful at the head than at the tail — and every drain reports the
 //! accumulated drop count so loss is never silent. Userland console output
 //! (`write_chunk_blocking`) instead throttles on a full ring, draining
-//! synchronously: the console is the test-harness protocol channel and must
-//! be lossless, like the pre-ring synchronous UART writes were.
+//! synchronously: the console is the test-harness protocol channel and must be
+//! lossless.
 
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -72,10 +72,9 @@ static RING: RingCell = RingCell(UnsafeCell::new(LogRing::new()));
 static RING_LOCKED: AtomicBool = AtomicBool::new(false);
 static DROPPED_BYTES: AtomicU64 = AtomicU64::new(0);
 
-/// CLI-aware spinlock for ring access. Same pattern as the legacy
-/// `serial::LOCKED` — log!() can be called from IRQ handlers, so the
-/// spinning side must run with interrupts disabled to prevent same-CPU
-/// re-entry deadlock.
+/// CLI-aware spinlock for ring access. `log!()` can be called from IRQ
+/// handlers, so the spinning side must run with interrupts disabled to prevent
+/// same-CPU re-entry deadlock.
 struct RingGuard {
     rflags: u64,
 }

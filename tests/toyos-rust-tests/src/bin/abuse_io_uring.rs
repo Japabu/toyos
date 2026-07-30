@@ -1,9 +1,8 @@
 //! The kernel must survive a process that lies in its own io_uring SQ header.
 //!
-//! `head`/`tail` live in the 2 MiB page the process maps and writes itself.
-//! The kernel used to size a per-batch `Vec` from `tail - head` without ever
-//! clamping it to the ring depth, so a large tail was an arbitrary kernel
-//! allocation and a guaranteed panic in the 2 MiB single-allocation assert.
+//! `head`/`tail` live in the 2 MiB page the process maps and writes itself, so
+//! `tail - head` is a userland-chosen number that must never size a kernel
+//! allocation or index past the ring depth.
 
 use core::sync::atomic::Ordering;
 

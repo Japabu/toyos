@@ -1,12 +1,11 @@
 //! A process must not be able to attach to another process's pipe by guessing
 //! its id.
 //!
-//! `PipeId`s are dense sequential integers allocated from one kernel-wide
-//! counter, and `SYS_PIPE_OPEN` / `SYS_SOCKET_CREATE` took a raw one with no
-//! check beyond "does a pipe with this id exist". Mode 0 handed the caller a
-//! reader (steal the peer's stream), mode 1 a writer (inject into it), and
-//! `SYS_PIPE_MAP` on the resulting fd handed over the raw 2 MiB ring page.
-//! `for id in 0.. { pipe_open(id, 0) }` was the entire attack.
+//! `PipeId`s are dense sequential integers from one kernel-wide counter, and
+//! `SYS_PIPE_OPEN` / `SYS_SOCKET_CREATE` take a raw one. Unchecked, mode 0
+//! hands the caller a reader (steal the peer's stream), mode 1 a writer (inject
+//! into it), and `SYS_PIPE_MAP` on the resulting fd hands over the raw 2 MiB
+//! ring page — `for id in 0.. { pipe_open(id, 0) }` is the entire attack.
 //!
 //! Run as `abuse_pipe_owner child`, this binary is the victim: it creates a
 //! pipe, prints its id, and blocks on stdin so the pipe stays alive.

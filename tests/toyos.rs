@@ -396,9 +396,7 @@ fn measure_audio_run(
     let rate = wav.sample_rate as f64;
     let secs = |samples: usize| samples as f64 / rate;
 
-    // The record gate A tracks across migration stages — always printed, so
-    // every green run leaves comparable numbers in the log, including the ones
-    // that pass.
+    // Always printed, so every run leaves comparable numbers in the log.
     let gaps = audio::gap_histogram(&analysis, wav.sample_rate);
     let counters = audio::parse_soundd_counters(&serial)?;
     eprintln!(
@@ -531,13 +529,12 @@ fn measure_audio_run(
 /// trial against a per-config rate measured at 0-7%, which discriminates
 /// nothing. That is what `--audio-gate` is for.
 ///
-/// The dropout check keeps the strict zero-gap bar and adds a confirmation:
-/// a run that gaps is re-booted once, and only a second gap is a failure. No
-/// limit is widened by this. It is the 2-of-2 rule, and it is here because the
-/// alternative measured 12.8% red per invocation on an unmodified tree — a
-/// gate that cries wolf one run in eight is a gate that gets ignored, which is
-/// the failure mode that matters most for a check developers see every day.
-/// The first gap is still printed, and the capture still kept.
+/// The dropout check keeps the strict zero-gap bar and adds a confirmation: a
+/// run that gaps is re-booted once, and only a second gap fails. No limit is
+/// widened by this. Without the confirmation the per-config dropout rate alone
+/// reds one invocation in eight on a clean tree, and a gate developers see
+/// every day cannot cry wolf that often. The first gap is still printed and the
+/// capture still kept.
 fn run_audio_test(
     name: &str,
     smp: u32,

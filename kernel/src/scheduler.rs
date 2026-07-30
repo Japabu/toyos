@@ -1,16 +1,8 @@
 //! The kernel-facing scheduler API (spec §4's `kernel/src/sched/mod.rs`).
 //!
-//! Migration stage 7: the kernel drives `toyos-sched`. Everything that used to
-//! live in this file — the cross-CPU run queues, the global blocked pool, the
-//! kill set, the transit counter, `handle_outgoing`'s post-switch parking — has
-//! no successor, because the machine underneath now makes each of those bugs
-//! unrepresentable rather than guarded. What is left here is the surface the
-//! rest of the kernel calls, and it is *only* a surface: no decision, no state
-//! transition and no ordering-sensitive step happens in this file.
-//!
-//! 7b completed it: `Env::steal` is on, so an idle CPU pulls work and a loaded
-//! one answers, and `retire_task` below is a message plus a park rather than a
-//! message plus a spin.
+//! The scheduler itself is `toyos-sched`, driven by `kernel/src/sched/`. This
+//! file is *only* a surface: no decision, no state transition and no
+//! ordering-sensitive step happens here.
 
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -279,10 +271,8 @@ pub fn wake_pipe_writers(pipe_id: PipeId) {
     }
 }
 
-/// How long a lent RT priority lasts. The old code cleared the borrowed
-/// priority at the boosted thread's next deschedule, whatever that was; the
-/// core makes it a wall-clock bound instead (spec §8.5, invariant I9), and one
-/// quantum is the closest honest translation.
+/// How long a lent RT priority lasts: a wall-clock bound on time *held*
+/// (spec §8.5, invariant I9), one quantum wide.
 pub fn boost_window() -> Nanos {
     HW.now().after(QUANTUM_NS)
 }
@@ -334,10 +324,9 @@ pub fn futex_wake(phys_addr: DirectMap, count: usize) -> u64 {
 /// process teardown frees memory the dead thread's page tables still map, so
 /// it may not run until that thread's payload — kernel stack and address-space
 /// reference — is dropped. That happens in `Hw::release`, which announces
-/// itself here. Stage 7a spun on the state word reading `Dead` instead, which
-/// was both a busy wait and a weaker guarantee: `Dead` is published by the
-/// reaping *transition*, one pass before the release, so the caller could free
-/// pages while the dying CPU was still standing on that thread's kernel stack.
+/// itself here. Waiting for the state word to read `Dead` would be too weak:
+/// `Dead` is published by the reaping *transition*, one pass before the
+/// release, while the dying CPU still stands on that thread's kernel stack.
 ///
 /// The short block deadline is a liveness backstop, not a poll: the wake is a
 /// message like any other, and a lost one must fail loudly rather than hang.
@@ -485,11 +474,8 @@ pub fn log_health() {
 
 /// Dump this CPU's parked threads.
 ///
-/// Only this CPU's: a `CpuSched` is `!Sync`, so there is no way to walk a
-/// sibling's parked map, and inventing one would be inventing the shared state
-/// the whole design removes. What a cross-CPU view costs is a message round
-/// trip; whether that is worth building is a diagnostics question, not a
-/// scheduler one.
+/// Only this CPU's: a `CpuSched` is `!Sync`, so a sibling's parked map is not
+/// walkable. A cross-CPU view costs a message round trip.
 pub fn dump_blocked() {
     crate::log!(
         "=== PARKED THREADS on cpu {} ({}) ===",

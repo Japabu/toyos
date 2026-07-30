@@ -291,12 +291,10 @@ pub(crate) fn recover_or_halt(is_user: bool, is_ring3: bool) -> ! {
 ///
 /// Nothing here touches the process table, and that is the point. The faulted
 /// thread may hold any kernel lock, including the table's, so blocking on it
-/// can deadlock and a `try_lock` can fail — and a failed one used to leave the
-/// thread poisoned but never zombified, with its parent parked in `waitpid`
-/// forever. Cleanup has exactly one home now: the poison set is both the
-/// "do not re-schedule" mark and the cleanup request, and `schedule_no_return`
-/// jumps into `cpu_idle_loop`, which reaps it — zombify plus the waiter's wake
-/// — before it picks another task.
+/// can deadlock and a `try_lock` can fail. Cleanup has exactly one home: the
+/// poison set is both the "do not re-schedule" mark and the cleanup request,
+/// and `schedule_no_return` jumps into `cpu_idle_loop`, which reaps it —
+/// zombify plus the waiter's wake — before it picks another task.
 pub(crate) fn try_recover_from_panic() -> ! {
     if let Some(tid) = percpu::current_tid() {
         let pid = percpu::current_pid().unwrap_or(crate::process::Pid(u32::MAX));

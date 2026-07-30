@@ -1,10 +1,9 @@
 //! The kernel must survive a process that hands `SYS_SPAWN` absurd argv/env.
 //!
-//! `argv_len` and `env_len` are unchecked `u64` fields of a user-supplied
+//! `argv_len` and `env_len` are raw `u64` fields of a user-supplied
 //! `SpawnArgs`. The argv blob is split into a `Vec<&str>` (16 bytes per token)
-//! and the env blob is copied with `to_vec()`, so either one used to be an
-//! arbitrary kernel allocation and a panic in the 2 MiB allocation assert.
-//! An argv that contains no non-empty token also used to index `argv[0]`.
+//! and the env blob is copied with `to_vec()`, so either one sizes a kernel
+//! allocation. An argv with no non-empty token also has no `argv[0]`.
 
 use std::process::Command;
 

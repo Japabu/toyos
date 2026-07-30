@@ -1,9 +1,9 @@
 //! `SYS_GPU_SET_RESOLUTION` must be reachable only by the process that holds
 //! the framebuffer device.
 //!
-//! It used to take two arbitrary `u32`s from any process and turn them into
-//! `width * height * 4` bytes of contiguous physical memory behind an
-//! `expect("framebuffer alloc failed")`.
+//! It turns two arbitrary `u32`s into `width * height * 4` bytes of contiguous
+//! physical memory, so an ungated caller both reconfigures the display and
+//! names a kernel allocation size.
 
 use toyos_abi::syscall::{self, SyscallError};
 use toyos_abi::FramebufferInfo;

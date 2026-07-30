@@ -48,9 +48,8 @@ impl OwnedAlloc {
     /// `None` for any size the kernel heap cannot serve, so a caller sizing a
     /// buffer from untrusted input gets a value to handle rather than a panic.
     /// The heap's page source asserts above `PAGE_2M` (`mm::alloc`) instead of
-    /// returning null, so that ceiling has to be checked before the request,
-    /// not after — the two real callers (128 KiB kernel stacks, ELF TLS
-    /// templates) are far below it.
+    /// returning null, so that ceiling is checked before the request, not
+    /// after.
     pub fn new(size: usize, align: usize) -> Option<Self> {
         if size >= PAGE_2M as usize { return None; }
         let layout = Layout::from_size_align(size, align).ok()?;
@@ -63,10 +62,9 @@ impl OwnedAlloc {
 
     /// A bounds-checked view of the first `len` bytes.
     ///
-    /// The only safe way to build a `KernelSlice` over an `OwnedAlloc` — the
-    /// raw `KernelSlice::from_raw` was once handed an ELF's `p_filesz` over a
-    /// `p_memsz`-sized buffer, which made every later `copy_from`/`read` on it
-    /// out of bounds while still passing that slice's own checks.
+    /// The only safe way to build a `KernelSlice` over an `OwnedAlloc`:
+    /// `KernelSlice::from_raw` cannot check its length against the allocation,
+    /// so a slice longer than the buffer passes every check the slice makes.
     pub fn slice(&self, len: usize) -> crate::mm::KernelSlice {
         assert!(len <= self.size(), "OwnedAlloc::slice: {} > {}", len, self.size());
         unsafe { crate::mm::KernelSlice::from_raw(self.ptr(), len) }
@@ -383,12 +381,9 @@ impl ProcessEntry {
 
 impl Drop for ProcessEntry {
     fn drop(&mut self) {
-        // The scheduler's per-process vruntime entry must live exactly as
-        // long as the table entry: threads of a zombified process still
-        // yield inside their own exit path, and the Yield re-insert reads
-        // the entry. Freeing it earlier (the old teardown_resources site)
-        // let a timer preempt inside the exit window panic in
-        // current_runnable_vruntime.
+        // The scheduler's per-process vruntime entry must live exactly as long
+        // as the table entry: threads of a zombified process still yield inside
+        // their own exit path, and the Yield re-insert reads the entry.
         scheduler::remove_vruntime(self.pid);
     }
 }
@@ -442,8 +437,7 @@ impl PageFaultTrace {
     pub fn total(&self) -> u64 { self.total }
 }
 
-/// ELF loading artifacts and TLS state. Grouped separately from runtime process
-/// state to keep concerns distinct — a future lock split becomes trivial.
+/// ELF loading artifacts and TLS state.
 pub struct ElfInfo {
     pub elf_alloc: Option<OwnedAlloc>,
     // Thread-local storage (process-level: template, modules, layout)
@@ -959,10 +953,9 @@ fn teardown_bookkeeping(table: &mut ProcessTable, process_pid: Pid, code: i32,
     to_wake
 }
 
-/// Exit the entire process (all threads). If called from a thread, kills the
-/// parent process and all siblings.
-/// Build accounting snapshot from ProcessData (after all threads flushed) and stash on parent.
-/// Must be called after teardown_scheduling so child thread stats are included.
+/// Snapshot this process's accounting onto its parent, for `waitpid` to read.
+/// Must run after `teardown_scheduling`, which is what flushes the child
+/// threads' counters into `ProcessData`.
 fn stash_accounting_snapshot(
     process_data_arc: &Arc<Lock<ProcessData>>,
     pid: Pid,
@@ -1048,10 +1041,9 @@ pub fn exit(code: i32) -> ! {
 
     // Phase 2: retire every other thread. Each one is provably out of the
     // scheduler when retire_task returns — not queued, not parked, not
-    // mid-steal, not running. Only then is it safe to free memory their
-    // page tables still map: freeing earlier let a still-running thread
-    // write through stale mappings into 2MB frames the PMM had already
-    // re-issued (kernel heap corruption).
+    // mid-steal, not running. Only then may memory their page tables still map
+    // be freed: a thread still running writes through those stale mappings into
+    // 2MB frames the PMM has already re-issued.
     let mut main_cpu_ns = 0u64;
     for t in other_tids {
         let Some(sched) = thread_sched(process_pid, t) else { continue };
@@ -1597,10 +1589,8 @@ pub fn kill_process(target_pid: Pid) -> u64 {
         (Arc::clone(&proc.process_data), Arc::clone(&main_thread.thread_data), proc.main_tid, tids)
     };
 
-    // Phase 2: retire every thread. A running target is forced to a
-    // scheduling boundary and dropped there — kill no longer refuses
-    // running processes (the old WouldBlock check was a racy try_lock
-    // snapshot; the retire loop is the reliable version of the same wait).
+    // Phase 2: retire every thread. A running target is forced to a scheduling
+    // boundary and dropped there, so a running process is never refused.
     let mut main_cpu_ns = 0u64;
     for t in tids {
         let Some(sched) = thread_sched(target_pid, t) else { continue };

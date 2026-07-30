@@ -456,51 +456,35 @@ pub fn check_counters(
 /// Bounds derived from the device's clock, not from any recorded run: values
 /// on the wrong side of one did not happen, whatever the counter says.
 ///
-/// `check_counters` asks whether a run got *worse*. This asks whether it
-/// happened *at all*, and they are different questions — gate A only ever
-/// asked the first, which is how Stage 6's thorough tier PASSED while carrying
-/// `wake_lat 153766519us`: 153 seconds of wake lateness inside a test the
-/// harness kills at 30. Nothing caught it. The thorough tier applies no per-run
-/// ceiling, and its Mann-Whitney test is rank-based, so one absurd value at the
-/// top of a 30-sample moves no median — robustness to outliers is a virtue
-/// against noise and a hole against a broken instrument. Worst, that tier
-/// prints its sample as toml for the next baseline, so pasting it would have
-/// set the ceiling to twice 153766519 and retired the check for good.
-///
-/// A violation is therefore reported as a **broken instrument**, never as a
-/// regression: fatal in both tiers, and in the thorough tier it aborts the run
-/// before the value can enter the sample or the re-baselining output.
+/// `check_counters` asks whether a run got *worse*; this asks whether it
+/// happened *at all*. A violation is reported as a **broken instrument**, never
+/// as a regression: fatal in both tiers, and in the thorough tier it aborts the
+/// run before the value can enter the sample or the re-baselining output. That
+/// separation is what the thorough tier cannot provide for itself — it applies
+/// no per-run ceiling, its Mann-Whitney test is rank-based so one absurd value
+/// moves no median, and it prints its own sample as the next baseline.
 ///
 /// The reference is the wall-clock life of the QEMU process, timed by the
-/// harness. Two properties make it the right one. It is *outside* the guest, so
-/// no guest-side defect can inflate it in step with the counter it bounds — the
-/// wav capture cannot serve here, because its timeline is the stream soundd
-/// submitted (measured: capture 3.32s against 1130 submitted periods = 3.28s),
-/// so a stall that submits nothing does not lengthen it. And it needs no
-/// recorded number, so there is nothing here to tune when a run goes red.
-///
-/// The one assumption is that the guest's monotonic clock and the host's agree
-/// to within a large factor. They are the same TSC up to calibration error, and
-/// a calibration wrong by even a percent would break the DLL long before it
-/// reached these margins: the worst wake lateness ever recorded on this tree is
-/// 93ms against runs of 7-10 seconds.
+/// harness. It is *outside* the guest, so no guest-side defect can inflate it
+/// in step with the counter it bounds; the wav capture cannot serve, because
+/// its timeline is the stream soundd submitted, so a stall that submits nothing
+/// does not lengthen it. And it needs no recorded number, so there is nothing
+/// to tune when a run goes red. The one assumption is that the guest and host
+/// clocks agree to within a large factor — they are the same TSC up to
+/// calibration error, and a calibration wrong by a percent would break the DLL
+/// long before it reached these margins.
 ///
 /// These bounds sit far above every per-run ceiling in
-/// `tests/audio-baseline.toml` (2.07-8.01 pipeline depths), and they have to.
-/// A ceiling admits values that are bad but real — that config's recorded
-/// maximum is a genuine 4.0 depths — so a bound that fired anywhere near one
-/// would be answering the regression question again, in a way that could not
-/// be tuned back. "A few pipeline depths" is a health threshold, not a
-/// physical limit. Concretely: a scheduler bug that stalled soundd for three
-/// whole seconds would still be reported by the ceiling, as a regression,
-/// which is what it is.
+/// `tests/audio-baseline.toml` (2.07-8.01 pipeline depths), and they have to: a
+/// ceiling admits values that are bad but real, so a bound firing anywhere near
+/// one would be answering the regression question again. "A few pipeline
+/// depths" is a health threshold, not a physical limit.
 pub fn check_physical(counters: &SounddCounters, run_secs: f64) -> Vec<String> {
     let mut faults = Vec::new();
 
     // Lateness is the distance between two instants on the guest clock, both
     // inside the life of the soundd process, which is inside the life of the
-    // QEMU process. It is not that 6622 pipeline depths would be catastrophic
-    // — it is that they do not fit.
+    // QEMU process. A larger value does not fit, whatever it would mean.
     if counters.max_wake_lat_us as f64 > run_secs * 1e6 {
         faults.push(format!(
             "wake lateness {}us ({:.1} pipeline depths) exceeds the whole {run_secs:.2}s run \

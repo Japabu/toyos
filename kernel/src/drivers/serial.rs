@@ -216,10 +216,10 @@ impl SerialWriter {
     }
 
     /// Console-output variant: spills throttle on a full ring instead of
-    /// dropping, so userland write() is lossless like the old synchronous
-    /// UART path (the test harness protocol depends on it). Syscall context
-    /// only — `log!()` must keep the lossy writer, since it runs under
-    /// arbitrary kernel locks and must never do I/O.
+    /// dropping, so userland `write()` is lossless — the test harness protocol
+    /// depends on it. Syscall context only; `log!()` must keep the lossy
+    /// writer, since it runs under arbitrary kernel locks and must never do
+    /// I/O.
     pub fn console() -> Self {
         Self { buf: [0; SW_BUF_SIZE], len: 0, lossless: true }
     }

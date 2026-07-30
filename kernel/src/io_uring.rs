@@ -147,9 +147,9 @@ struct IoUringInstance {
     /// Threads waiting on this ring's completion queue (spec §8.6).
     waiters: Arc<KWaitQueue>,
     /// The authoritative CQ tail. The copy in the shared header is a
-    /// publication for userspace, which only ever reads it; keeping the
-    /// kernel's own index here removes one of the two untrusted reads
-    /// `post_cqe` used to do. Only touched under the `IO_URINGS` lock.
+    /// publication for userspace, which only ever reads it — the kernel must
+    /// not read its own tail back out of a page the process can write. Only
+    /// touched under the `IO_URINGS` lock.
     cq_tail: core::cell::Cell<u32>,
     owner_pid: Pid,
 }
@@ -175,18 +175,11 @@ impl IoUringInstance {
 
     /// Post a CQE, or record a drop if the ring reports itself full.
     ///
-    /// `head` is written by the process, in the page the process maps, so the
-    /// old assert was a kernel panic four unprivileged calls away: create a
-    /// ring, map it, store `head = 1` while `tail` is still 0, submit one
-    /// SQE. `0u32.wrapping_sub(1)` is `u32::MAX`, which is not less than
-    /// `cq_size`. The SQ side of this file already refuses a dishonest
-    /// `available` with `InvalidArgument` and says why; the CQ side did not.
-    ///
-    /// A ring that reports itself full is either genuinely full — impossible
-    /// with 2x sizing and an honest head — or lying. Either way it is the
-    /// process's own ring and the process's own problem. Not a kill, because
-    /// `complete_pending_for_event` calls this on the *waker's* thread, which
-    /// belongs to a different process.
+    /// `head` lives in the page the process maps and writes, so "full" is
+    /// either genuine — impossible with 2x sizing and an honest head — or a
+    /// lie. Either way it is the process's own ring and its own problem, and
+    /// not a kill: `complete_pending_for_event` calls this on the *waker's*
+    /// thread, which belongs to a different process.
     fn post_cqe(&self, user_data: u64, result: i32, flags: u32) {
         let cq = self.cq_header();
         let tail = self.cq_tail.get();
@@ -341,13 +334,12 @@ pub fn enter(
         }
 
         // The re-check is this ring's own condition, not mere readiness: a
-        // waiter for `min_complete` CQEs that cancelled on the first one
-        // would spin instead of parking.
-        // The ticket must be consumed on every path out of here. A sibling
-        // thread closing this ring's fd removes it from IO_URINGS in exactly
-        // this window, so the `?` on the re-check propagated out with the
-        // ticket still armed — tripping its drop bomb, i.e. a kernel panic
-        // from two unprivileged threads.
+        // waiter for `min_complete` CQEs that cancelled on the first one would
+        // spin instead of parking.
+        //
+        // The ticket must be consumed on every path out of here, `?` included.
+        // A sibling thread closing this ring's fd removes it from IO_URINGS in
+        // exactly this window, and a ticket dropped still armed is a panic.
         let ticket = scheduler::prepare_wait(&queue);
         let recheck = match cq_count(ring_id) {
             Ok(n) => n,
@@ -386,9 +378,9 @@ fn submit_sqes(ring_id: RingId, count: u32) -> Result<(), SyscallError> {
 
 /// Take the SQE at the ring head, advancing it. `None` when the ring is empty.
 ///
-/// One SQE at a time under the lock rather than a batch copied into a `Vec`:
-/// the batch's capacity was the only userland-sized allocation in this file,
-/// and processing needs the lock released between entries either way.
+/// One SQE at a time under the lock rather than a batch copied into a `Vec`
+/// whose capacity userland picks; processing needs the lock released between
+/// entries either way.
 fn claim_sqe(ring_id: RingId) -> Result<Option<IoUringSqe>, SyscallError> {
     with_instance(ring_id, |instance| {
         let sq = instance.sq_header();

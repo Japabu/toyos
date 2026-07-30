@@ -62,12 +62,11 @@ use arch::{apic, cpu, idt, percpu, smp, syscall};
 use drivers::{acpi, gop, nvme, pci, serial, virtio_console, virtio_gpu, virtio_net, virtio_sound, xhci};
 use toyos_abi::boot::{KernelArgs, MemoryMapEntry};
 
-/// Per-CPU panic-reentry depth, indexed by x2APIC id (masked). The panic
-/// path must not trust GS/percpu — a corrupted percpu block once made
-/// `swap_fault_state` fault, re-entering the panic handler in an unbounded
-/// recursion that smashed the stack down through the heap and destroyed the
-/// evidence. rdmsr(IA32_X2APIC_APICID) is the only per-CPU discriminator
-/// that needs no memory access at all.
+/// Per-CPU panic-reentry depth, indexed by x2APIC id (masked). The panic path
+/// must not trust GS/percpu: a corrupted percpu block makes `swap_fault_state`
+/// itself fault, re-entering the panic handler in an unbounded recursion that
+/// smashes the stack down through the heap. `rdmsr(IA32_X2APIC_APICID)` is the
+/// only per-CPU discriminator that needs no memory access at all.
 ///
 /// A single global flag was rejected: it would stay set after a *recovered*
 /// panic and silently swallow every later, independent panic report, and a

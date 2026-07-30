@@ -26,12 +26,10 @@
 //!   fixed by hand — because the readers are `memory read` in LLDB and, later,
 //!   `toyos-sched-sim replay --from-qemu`. Neither can parse a Rust enum.
 //!
-//! [`record`] is the total mapping from the first onto the second, and is
-//! what [`crate::hw::KernelHw`] installs as `Machine::trace`. The ring keeps
+//! [`record`] is the total mapping from the first onto the second, and is what
+//! [`crate::hw::KernelHw`] installs as `Machine::trace`. The ring also keeps
 //! kinds the core cannot produce ([`Kind::IrqDrain`], [`Kind::TimerArm`],
-//! [`Kind::Preempt`]): they are kernel observations below the boundary, and
-//! collapsing the ring into the core's vocabulary would delete working
-//! instruments to buy a symmetry nothing needs.
+//! [`Kind::Preempt`]) — kernel observations from below the boundary.
 
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -48,8 +46,8 @@ pub const RING_CAPACITY: usize = 4096;
 /// tool read by numeric value).
 ///
 /// 1..=13 are the kernel's own observations. 14.. are the `hw::TraceKind`
-/// variants that have no kernel-native counterpart; they arrive through
-/// [`record`] and start firing at the cutover.
+/// variants with no kernel-native counterpart, which arrive through
+/// [`record`].
 #[repr(u16)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Kind {

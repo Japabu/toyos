@@ -1,21 +1,16 @@
-/// Test that demand paging correctly preserves SSE/XMM registers.
+/// Demand paging must preserve user SSE/XMM state: the Rust page fault handler
+/// is free to clobber XMM0-XMM7 per System V, so `page_fault_entry` has to save
+/// and restore them.
 ///
-/// The bug: page_fault_entry didn't save/restore XMM registers. When a demand
-/// page fault interrupted code using XMM registers, the Rust page fault handler
-/// (free to clobber XMM0-XMM7 per System V ABI) would corrupt user SSE state.
-///
-/// Key: the data MUST be in a writable segment (.data, not .rodata) so the
-/// demand fault handler takes the copy path (alloc private page + memcpy 4KB),
-/// which uses XMM instructions internally and clobbers XMM0-XMM7.
-///
-/// Read-only data gets mapped directly from the page cache (zero-copy), which
-/// does NOT use XMM and would not catch the bug.
+/// The data MUST live in a writable segment (.data, not .rodata) so the fault
+/// takes the copy path (private page + memcpy), which uses XMM internally.
+/// Read-only data is mapped straight from the page cache and would not clobber
+/// anything.
 
 use core::arch::asm;
 
-// Mutable static: goes in .data (writable segment), not .rodata.
-// The demand fault handler must allocate a private page and memcpy from
-// the page cache, which uses SSE instructions that clobber XMM registers.
+// Mutable so it lands in .data, not .rodata: the fault handler must take the
+// allocate-and-memcpy path, which is the one that uses SSE.
 static mut DATA: [u64; 16384] = {
     let mut arr = [0u64; 16384];
     let mut i = 0;

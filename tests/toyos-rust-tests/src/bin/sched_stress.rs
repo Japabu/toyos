@@ -49,11 +49,10 @@ fn child_sched_info() {
 
 // Test 1: Listener isolation via io_uring POLL_IN
 
-/// This tests the exact code path that froze the compositor.
-///
-/// Two listeners create io_uring POLL_IN watches on their fds. A connect
-/// to svc_a should only complete svc_a's poll — not svc_b's. With the old
-/// global EventSource::Listener, both polls would complete spuriously.
+/// Two listeners create io_uring POLL_IN watches on their fds. A connect to
+/// svc_a must complete svc_a's poll and only svc_a's — a readiness signal keyed
+/// on "some listener" instead of on the object wakes every waiter in the
+/// system, which froze the compositor.
 fn test_listener_isolation_io_uring() {
     let a_ready = Arc::new(AtomicBool::new(false));
     let b_ready = Arc::new(AtomicBool::new(false));

@@ -1,21 +1,17 @@
 //! The kernel must survive an ELF whose program headers lie about their sizes.
 //!
-//! `p_filesz` and `p_memsz` were read straight out of the program header and
-//! used as a (copy length, buffer size) pair. The ELF spec requires
-//! `p_filesz <= p_memsz`, and the loader only ever handled the direction that
-//! is harmless (zeroing a `.bss` tail). Inverted, the copy overran its
-//! destination with attacker-chosen length *and* content:
+//! `p_filesz` and `p_memsz` are a (copy length, buffer size) pair to the
+//! loader, so the spec's `p_filesz <= p_memsz` is memory safety here. Inverted,
+//! the copy overruns its destination with file-chosen length *and* content:
 //!
 //! - `PT_TLS` on the exe path: `OwnedAlloc::new(tls_memsz)` then
 //!   `copy_nonoverlapping(.., tls_filesz)` — a kernel heap overflow.
 //! - `PT_LOAD` in a `dlopen`ed `.so`: the image is sized from `p_memsz` and
 //!   each segment is read in at `p_filesz` — a PMM overflow past the image.
 //!
-//! A `p_memsz` no allocator can satisfy was a kernel panic on an `.expect`,
-//! and program-header vaddrs outside the loaded image indexed a `KernelSlice`
-//! out of bounds (an assert, i.e. also a panic).
-//!
-//! Every case must now be an error return, with the kernel intact afterwards.
+//! A `p_memsz` no allocator can satisfy, and program-header vaddrs outside the
+//! loaded image, are the other two ways in. Every case must be an error return,
+//! with the kernel intact afterwards.
 
 use std::fs;
 
@@ -222,13 +218,11 @@ fn main() {
         ("dyn_gnuhash_far", &[(DT_GNU_HASH, 0x7000_0000)][..]),
         ("dyn_rela_far", &[(DT_RELA, 0x7000_0000), (DT_RELASZ, 24)][..]),
         ("dyn_reloc_oob", &[(DT_RELA, 0x3800), (DT_RELASZ, 24)][..]),
-        // Only RELATIVE entries used to be bounds-checked at load. Every other
-        // written type reached `LoadedLib::write_at` on a raw `r_offset`, and
-        // once the module is cached that write lands in a *smaller* private
-        // allocation than the image the check was against — so an out-of-range
-        // offset wrote outside it, above or below, with no assert at all.
-        // DTPOFF64 with `r_sym == 0` writes `r_addend` verbatim, which makes
-        // the value attacker-chosen too.
+        // Every written relocation type, not just RELATIVE, has to be bounds
+        // checked at load: once the module is cached the write lands in a
+        // *smaller* private allocation than the image, so the image's bounds do
+        // not cover it. DTPOFF64 with `r_sym == 0` writes `r_addend` verbatim,
+        // which makes the value file-chosen too.
         ("dyn_dtpoff_oob", &[(DT_RELA, 0x3800), (DT_RELASZ, 24)][..]),
         ("dyn_globdat_oob", &[(DT_RELA, 0x3800), (DT_RELASZ, 24)][..]),
         // An in-range r_offset whose r_sym indexes past .dynsym: the symbol

@@ -4,9 +4,7 @@ use std::collections::HashSet;
 fn main() {
     let page_2m: usize = 2 * 1024 * 1024;
 
-    // Stress test: allocate many regions and verify no overlaps.
-    // This catches the old bug where the bump allocator could hand out addresses
-    // that collide with demand-paged ELF pages.
+    // No mapping may overlap another, or collide with a demand-paged ELF page.
     let mut regions: Vec<(*mut u8, usize)> = Vec::new();
     let mut seen_pages: HashSet<usize> = HashSet::new();
 

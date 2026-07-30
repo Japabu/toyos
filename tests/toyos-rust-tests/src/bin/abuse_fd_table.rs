@@ -1,9 +1,8 @@
 //! The fd-table cap must hold on every insertion path.
 //!
-//! `MAX_FDS` used to be checked in exactly one of three insert paths, so both
-//! `dup2` and `SYS_SPAWN`'s fd_map grew a process's fd table without limit
-//! until hashbrown's next doubling exceeded the kernel's 2 MiB allocation
-//! assert.
+//! There are three of them — plain open, `dup2` and `SYS_SPAWN`'s fd_map — and
+//! a table that grows past the cap on any one reaches a hashbrown doubling
+//! above the kernel's 2 MiB single-allocation ceiling.
 
 use toyos_abi::syscall::{self, MmapFlags, MmapProt, SpawnArgs, SyscallError};
 use toyos_abi::Fd;

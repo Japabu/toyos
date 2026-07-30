@@ -724,13 +724,9 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
     // 10. TLS setup — read exe TLS template from page cache, build multi-module layout
     let exe_tls_template = if layout.tls_memsz > 0 {
         let tls_file_off = vaddr_to_file_offset(&layout.segments, layout.tls_vaddr);
-        // Allocate first, then read straight into the buffer. The old order
-        // read `tls_filesz` bytes into a `Vec` and copied them into a
-        // `tls_memsz`-sized allocation, which overran whenever the header
-        // claimed `filesz > memsz` — an ELF-controlled heap overwrite.
-        // `ElfLayout`'s invariant now rules that out, and reading in place
-        // removes the intermediate `Vec` sized by the same untrusted number.
-        // `OwnedAlloc` zeroes, so the `.tbss` tail needs no second pass.
+        // Read straight into the `tls_memsz`-sized buffer rather than via an
+        // intermediate `Vec` sized by the file's `tls_filesz`. `OwnedAlloc`
+        // zeroes, so the `.tbss` tail needs no second pass.
         let Some(tls_buf) = OwnedAlloc::new(layout.tls_memsz, 16) else {
             log!("spawn: {}: failed to allocate TLS template ({} bytes)", path, layout.tls_memsz);
             return Err(SyscallError::ResourceExhausted);

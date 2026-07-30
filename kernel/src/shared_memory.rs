@@ -98,13 +98,11 @@ fn next_token() -> SharedToken {
 /// Allocate 2MB-aligned shared memory. Maps it into the owner's page tables.
 /// Returns a token; other processes can map it via `map()` after `grant()`.
 ///
-/// Fallible because `size` comes from userland: it was infallible, and each
-/// of the three ways it can fail was an `expect` or an assert one frame down
-/// — `alloc_shared(0)` reached the PMM's `count > 0` assert, a size above
-/// free memory reached the `.expect` here, and enough calls to exhaust the
-/// caller's virtual range reached `map_into`'s. All three are now errors.
-/// No bound is invented: `alloc_contiguous` already refuses more than free
-/// physical memory, which is a physical limit rather than a chosen one.
+/// Fallible because `size` comes from userland, and all three failures — a
+/// zero size, a size above free memory, and an exhausted virtual range — are
+/// errors rather than panics. No bound is invented above that:
+/// `alloc_contiguous` already refuses more than free physical memory, which is
+/// a physical limit rather than a chosen one.
 pub fn alloc(size: u64, owner_pid: Pid, addr_space: &PageTables) -> Result<SharedToken, Error> {
     if size == 0 || (size as usize).checked_add(PAGE_2M as usize - 1).is_none() {
         return Err(Error::InvalidSize);

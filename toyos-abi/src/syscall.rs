@@ -514,8 +514,7 @@ pub fn clock_epoch() -> u64 {
 /// Transfer a region of the framebuffer to the GPU and flush it.
 /// Pass (0, 0, 0, 0) to flush the full screen.
 ///
-/// Fallible because the kernel now refuses a caller that does not own the
-/// display, like `gpu_set_resolution` already did.
+/// Fallible: the kernel refuses a caller that does not own the display.
 pub fn gpu_present(x: u32, y: u32, w: u32, h: u32) -> Result<(), SyscallError> {
     check_unit(syscall(SYS_GPU_PRESENT, x as u64, y as u64, w as u64, h as u64))
 }
@@ -823,25 +822,25 @@ pub fn pipe_map(fd: Fd) -> Result<*mut u8, SyscallError> {
 
 /// Poll for a received frame. Returns `(buf_index << 16) | frame_len`, or 0 if none.
 ///
-/// Fallible because the kernel now refuses a caller that does not own the
-/// NIC. The packed success value tops out at `(255 << 16) | 4096`, far below
-/// the range `SyscallError::from_u64` claims, so nothing is ambiguous.
+/// Fallible: the kernel refuses a caller that does not own the NIC. The packed
+/// success value tops out at `(255 << 16) | 4096`, far below the range
+/// `SyscallError::from_u64` claims, so nothing is ambiguous.
 pub fn nic_rx_poll() -> Result<u64, SyscallError> {
     check(syscall(SYS_NIC_RX_POLL, 0, 0, 0, 0))
 }
 
 /// Tell the kernel to refill RX buffer `buf_index` after consuming the frame.
 ///
-/// A dropped refill costs an RX slot permanently, so the error must not be
-/// discarded — 256 of them and the NIC stops receiving.
+/// A dropped refill costs an RX slot permanently: 256 of them and the NIC
+/// stops receiving.
 pub fn nic_rx_done(buf_index: u64) -> Result<(), SyscallError> {
     check_unit(syscall(SYS_NIC_RX_DONE, buf_index, 0, 0, 0))
 }
 
 /// Submit the TX DMA buffer to hardware. `total_len` includes the net header.
 ///
-/// A refused submit means the frame never goes out; silently dropping it made
-/// that indistinguishable from a delivered one.
+/// A refused submit means the frame never goes out, which must not be
+/// indistinguishable from a delivered one.
 pub fn nic_tx(total_len: u64) -> Result<(), SyscallError> {
     check_unit(syscall(SYS_NIC_TX, total_len, 0, 0, 0))
 }

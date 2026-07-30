@@ -31,13 +31,9 @@ struct ClientResampler {
 /// A gain that has already crossed the trust boundary: finite, and within
 /// §7.4's [0.0, 1.0].
 ///
-/// The check has to live in a type rather than at each call site because the
-/// obvious spelling of it does not work. `f32::clamp` returns NaN unchanged,
-/// so a NaN volume used to reach `set_target`, where it made `step` and then
-/// `current` NaN — and `accumulate` multiplies the *shared* mix bus by that,
-/// so one client's bad float silenced every stream for a whole ramp and then
-/// muted the sender for good, since `g == 1.0` and `g > 0.0` are both false
-/// for NaN. None of it counted as an underrun.
+/// The check has to be a type rather than a `clamp` at each call site: `clamp`
+/// returns NaN unchanged, and a NaN gain reaches the *shared* mix bus through
+/// `accumulate`, silencing every stream.
 #[derive(Clone, Copy)]
 struct Gain(f32);
 
@@ -45,10 +41,9 @@ impl Gain {
     const SILENT: Gain = Gain(0.0);
     const UNITY: Gain = Gain(1.0);
 
-    /// §7.4 clamps out-of-range values, and ±inf is out of range. NaN is not:
-    /// it is not a value at all, every clamp of it is a guess, and guessing
-    /// hides the caller's bug. It is refused, and the control thread treats a
-    /// refusal the way it treats any other malformed message.
+    /// §7.4 clamps out-of-range values, and ±inf is out of range. NaN is not a
+    /// value at all, so it is refused rather than guessed at; the control
+    /// thread treats a refusal as any other malformed message.
     fn from_wire(gain: f32) -> Option<Gain> {
         if gain.is_nan() {
             return None;
@@ -109,9 +104,9 @@ struct ClientStream {
     slot_reader: AudioSlotReader,
     signal_write_fd: Fd,
     /// soundd's own reference to the signal pipe's read end, released the
-    /// moment the client proves it holds one (see the mix loop). Until then
-    /// the pipe has a reader whatever the client does, which is why §5.7's
-    /// crash detection could not work.
+    /// moment the client proves it holds one (see the mix loop). While soundd
+    /// holds it the pipe has a reader whatever the client does, and §5.7's
+    /// crash detection cannot fire.
     signal_read_fd: Option<Fd>,
     gain: GainRamp,
     client_channels: u16,
@@ -127,33 +122,23 @@ impl ClientStream {
     /// rather than protocol: from the first period it delivered until it asks
     /// to close.
     ///
-    /// Outside it, silence is the design working. A client is registered by
-    /// `MSG_STREAM_OPEN`, which it sends *before* it has any audio — it still
-    /// has to spawn its callback thread and fill its first slots — so the
-    /// periods between the open and the first delivery precede the stream
-    /// instead of interrupting it. Symmetrically, once a client has asked to
-    /// close, §5.5's ramp is deliberately fading it to silence and it is
-    /// entitled to stop filling.
-    ///
-    /// The latch is what keeps mid-stream starvation visible: a client stays
-    /// inside this window from its first period until it closes, so one that
-    /// goes quiet in the middle counts every period it misses.
+    /// Outside it, silence is the design working. `MSG_STREAM_OPEN` arrives
+    /// before the client has any audio — it still has to spawn its callback
+    /// thread — and after a close §5.5's ramp is deliberately fading it out,
+    /// so it is entitled to stop filling.
     fn is_streaming(&self) -> bool {
         self.delivered && !self.pending_removal
     }
 }
 
-// Lock-free SPSC command queue (control thread → mix thread)
-
 /// Control connections soundd will hold at once.
 ///
 /// The control thread watches one handle per client plus the listener in a
-/// single poller, and io_uring rings are powers of two, so the honest limit is
-/// a ring size minus one. 64 was chosen over 32 because the ring costs one
-/// 2 MiB page either way, and over 256 because 63 simultaneous streams is
-/// already far past what the mixer can render inside one 2.9 ms period. Each
-/// client also costs soundd three fds — the control connection and both ends
-/// of its signal pipe — so 63 of them spend 189 of the kernel's 1024.
+/// single poller and io_uring rings are powers of two, so the limit is a ring
+/// size minus one. 64 costs the same 2 MiB page as 32; 63 simultaneous streams
+/// is already past what the mixer renders inside one 2.9 ms period, and costs
+/// 189 of the kernel's 1024 fds (a control connection plus both signal pipe
+/// ends per client).
 const MAX_CONTROL_CLIENTS: usize = 63;
 
 /// Deep enough that one pass of the control loop can never fill it: a pass
@@ -186,13 +171,10 @@ impl CommandRing {
         }
     }
 
-    /// Hands the command back when the ring is full, rather than dropping it or
-    /// dying of it. A dropped command is still a ghost client (leaked shm, an
-    /// app waiting on a stream nothing mixes) — but a full ring is a load
-    /// condition, and the load is a client's to choose: the control thread
-    /// drains everything a client has written before it yields, so one write of
-    /// `CMD_RING_SIZE + 1` messages used to trip an assert and take the audio
-    /// server down with it. See `submit`, which waits for room.
+    /// Hands the command back when the ring is full rather than dropping it (a
+    /// ghost client: leaked shm, an app waiting on a stream nothing mixes) or
+    /// asserting — a client chooses the load, since the control thread drains
+    /// everything it has written before yielding. See `submit`, which waits.
     #[must_use]
     fn try_push(&self, cmd: MixCommand) -> Result<(), MixCommand> {
         let w = self.write_idx.load(Ordering::Acquire);
@@ -300,24 +282,22 @@ impl Xorshift32 {
     }
 }
 
-/// §5.4. TPDF dither is defined against a **round-to-nearest** quantizer —
-/// that pairing is what makes the error zero-mean and its variance
-/// signal-independent. Truncating instead (`as i16` rounds toward zero) biases
-/// every sample 0.5 LSB toward zero and swallows the dither whole inside
-/// ±1 LSB, giving a 2-LSB dead zone at the zero crossing and a noise floor
-/// that collapses with the signal: exactly the crossover distortion and
-/// noise-floor modulation dither exists to remove.
+/// §5.4. TPDF dither is defined against a **round-to-nearest** quantizer; that
+/// pairing is what makes the error zero-mean and its variance
+/// signal-independent. `as i16` truncates instead, which biases every sample
+/// 0.5 LSB toward zero and swallows the dither whole — a 2-LSB dead zone at
+/// the zero crossing and a noise floor that collapses with the signal.
 fn dither_and_quantize(sample: f32, rng: &mut Xorshift32) -> i16 {
     let dither = rng.next() + rng.next(); // triangular PDF in [-1.0, 1.0]
     (sample * 32767.0 + dither).round().clamp(-32768.0, 32767.0) as i16
 }
 
-/// Counters for one reporting window. A window covers streaming only: it is
-/// zeroed when the first client arrives and flushed when the last one leaves,
-/// so no number here is diluted by the idle path — where soundd waits on raw
-/// completion IRQs with no timer, and a batched IRQ looks exactly like a
-/// missed deadline. The audio gate reads these
-/// (`tests/audio-baseline.toml`), so they have to mean one thing only.
+/// Counters for one reporting window. A window covers streaming only: zeroed
+/// when the first client arrives, flushed when the last one leaves, so no
+/// number here is diluted by the idle path — where soundd waits on raw
+/// completion IRQs with no timer and a batched IRQ is indistinguishable from a
+/// missed deadline. The audio gate reads these (`tests/audio-baseline.toml`),
+/// so each has to mean exactly one thing.
 #[derive(Default)]
 struct MixStats {
     wakes: u32,
@@ -326,15 +306,9 @@ struct MixStats {
     submitted: u32,
     /// Periods submitted with no client audio behind them *while at least one
     /// client was streaming* (`ClientStream::is_streaming`) — silence that
-    /// interrupted a stream rather than preceding or following one.
-    ///
-    /// This is a strictly narrower window than `submitted`, which is scoped
-    /// like `wakes`, `completions` and `drains`: the whole time soundd has
-    /// clients. The connect-to-first-period pre-roll is a real part of that
-    /// window and is submitted silence, but it is not a dropout — nothing was
-    /// playing to drop out of — and counting it made this number a
-    /// measurement of how fast a client's audio thread starts, scaled by
-    /// however often soundd happened to wake meanwhile.
+    /// interrupted a stream rather than preceding or following one. Strictly
+    /// narrower than `submitted`, which like `wakes`/`completions`/`drains`
+    /// covers the whole time soundd has clients.
     underruns: u32,
     /// Cycles that found the whole DMA pipeline free (§5.9) *and* could only
     /// have got there by soundd being late. A device that retires the pipeline
@@ -342,14 +316,13 @@ struct MixStats {
     /// missed anything; see the count site.
     drains: u32,
     /// Worst overshoot of a DLL prediction soundd actually armed a timer on
-    /// (§5.1) — how far behind the device's period grid a mix cycle ran. Waits
-    /// that named no wake time contribute nothing; see the sample site.
+    /// (§5.1). Waits that named no wake time contribute nothing; see the
+    /// sample site.
     max_wake_lat_ns: u64,
     max_batch: u32,
     /// Free buffers left unfilled because a streaming client was still
-    /// producing the period that belongs in them (§5.10). Each one is a period
-    /// of silence that was *not* put on the wire; it is the fix's activity
-    /// signal, not a fault, and it has no ceiling.
+    /// producing the period that belongs in them (§5.10) — an activity signal,
+    /// not a fault, and so uncapped.
     deferred: u32,
 }
 
@@ -599,25 +572,12 @@ fn mix_thread(
     // unplayed at that instant. See the drain count site.
     let min_drain_nanos = (num_buffers as u64 - 1) * period_nanos;
     // How much unplayed audio must still be on the wire before the mix loop may
-    // defer a buffer for a client that is mid-refill (§5.10). This is policy,
-    // not physics — the same standing the kernel's `MAX_USER_STR` and `MAX_FDS`
-    // have, and it should be read the same way. The policy: of the pipeline's
-    // 8 periods, soundd spends at most 3 waiting for a client and always keeps
-    // 5 in reserve.
-    //
-    // It is deliberately not derived from soundd's worst wake lateness, which
-    // is what this comment used to claim (12.4 ms over 76 config-runs, "five
-    // periods rounds that up"). That derivation is unsound twice over. The
-    // number did not survive a larger sample — `tests/audio-baseline.toml`
-    // records 56909us on `audio_tone.smp1` over 120 config-runs, 19.6 periods —
-    // and no floor inside the pipeline could have covered it anyway, since the
-    // whole pipeline is 8 periods and that worst wake is 2.45 pipelines. A
-    // bigger floor does not repair the reasoning; it only trades reserve for
-    // patience with a client that has genuinely stopped.
-    //
-    // What justifies 5 is the measurement, not the reasoning: at this value the
-    // baseline re-recorded at dc732e5 is 0 dropouts and 0 underruns across all
-    // 120 config-runs. Move it only with a measurement of that size.
+    // defer a buffer for a client that is mid-refill (§5.10). Policy, not
+    // physics, with the same standing as the kernel's `MAX_USER_STR`: of the
+    // pipeline's 8 periods, soundd spends at most 3 waiting for a client and
+    // always keeps 5 in reserve. It cannot be derived from worst-case wake
+    // lateness — the recorded worst exceeds two whole pipelines, so no floor
+    // inside the pipeline covers it. Move it only with a full re-baseline.
     assert!(num_buffers > 5, "soundd: pipeline too shallow to defer safely");
     let refill_floor_nanos = 5 * period_nanos;
 
@@ -640,15 +600,13 @@ fn mix_thread(
     let mut pipeline_filled_ns = syscall::clock_nanos();
     // Wall clock at which everything submitted will have finished playing. The
     // device plays one period per `period_nanos` and cannot play faster, so
-    // this is the one honest measure of how much audio is still on the wire.
-    // The free list is not: at stream start QEMU retires the whole pipeline
-    // 0.7-6.6 ms after a refill — up to 34x real time — so "free" says nothing
-    // about what has actually been heard.
+    // this is the only honest measure of how much audio is still on the wire.
+    // The free list is not: QEMU retires a whole pipeline in a few ms, so
+    // "free" says nothing about what has been heard.
     let mut playout_until_ns = pipeline_filled_ns + num_buffers as u64 * period_nanos;
 
-    // Gated on the audio device claim, which `main` took before it got here;
-    // a refusal is therefore a kernel bug. Mixing on without the RT band would
-    // show up only as glitches.
+    // Gated on the audio device claim `main` already took, so a refusal is a
+    // kernel bug. Mixing on without the RT band would show up only as glitches.
     syscall::set_rt_priority(true).expect("soundd holds the audio device claim");
 
     let poller = Poller::new(64);
@@ -679,15 +637,12 @@ fn mix_thread(
         // boosts them to RT; they fill their ring slots while soundd is blocked
         // in the poller wait below.
         //
-        // §5.7/§7.3: a broken pipe here is the client's death. It is a real
-        // signal now that soundd releases its own read end (see the delivery
-        // latch below) — before that the pipe always had a reader and this
-        // write could not fail, whatever became of the client. The control
-        // connection reports the same death, but only when the control thread
-        // next reads it; a client that dies mid-stream would otherwise keep
-        // this stream `is_streaming()` and keep the mix loop deferring buffers
-        // for a producer that no longer exists. A full pipe is `Ok(0)`, not an
-        // error, so a client merely behind on its signals is untouched.
+        // §5.7/§7.3: a broken pipe here is the client's death, and it must be
+        // caught here rather than left to the control connection — a client
+        // that dies mid-stream would otherwise stay `is_streaming()` and keep
+        // the mix loop deferring buffers for a producer that no longer exists.
+        // A full pipe is `Ok(0)`, not an error, so a client merely behind on
+        // its signals is untouched.
         for stream in streams.iter_mut() {
             let write = syscall::write_nonblock(stream.signal_write_fd, &[1]);
             if write.is_err() && stream.signal_read_fd.is_none() && !stream.pending_removal {
@@ -699,9 +654,8 @@ fn mix_thread(
 
         // The prediction this wait is armed against, when there is one.
         // Lateness is only defined relative to an instant soundd asked to be
-        // woken at, and there are two waits that name none: the idle path
-        // (§5.8) arms no timer at all, and before the DLL has locked there is
-        // no prediction to arm on.
+        // woken at, and two waits name none: the idle path (§5.8) arms no timer
+        // at all, and before the DLL locks there is no prediction to arm on.
         let mut armed_on: Option<f64> = None;
 
         let timeout = if streams.is_empty() {
@@ -777,22 +731,12 @@ fn mix_thread(
         };
         if n_records > 0 {
             // Measured against the prediction this wait was *armed* on, not
-            // against whatever the DLL holds by the time the wait returns. The
-            // two differ on the first wake of every streaming window: the wait
-            // that delivers it was armed while soundd was still idle, where it
-            // asks for no wake time and sleeps until the hardware speaks, so
-            // the time it spent there is the idle policy working. Reading the
-            // estimate directly scored that sleep as a missed deadline — 56 to
-            // 150ms of it in seven of seven measured breaches, and 153
-            // *seconds* in one recorded gate A run.
-            //
-            // This does not hide a late wake, including the first of a window:
-            // whenever soundd armed a timer, the distance from the prediction
-            // it armed on is the sample, however large. Only a wait with no
-            // armed deadline is silent, and there is nothing to be late for in
-            // one. `armed_on` is Some only when soundd had clients at arm time
-            // and clients are removed at the foot of the loop, so a sample is
-            // inside the reporting window by construction.
+            // against whatever the DLL holds when the wait returns. They differ
+            // on a window's first wake, armed while soundd was still idle and
+            // asking for no wake time at all — reading the estimate directly
+            // scores that sleep as a missed deadline. Nothing is hidden:
+            // whenever soundd armed a timer the distance from that prediction
+            // is the sample, however large.
             if let Some(t_est) = armed_on {
                 let lateness = syscall::clock_nanos().saturating_sub(t_est as u64);
                 stats.max_wake_lat_ns = stats.max_wake_lat_ns.max(lateness);
@@ -812,50 +756,23 @@ fn mix_thread(
             }
         }
 
-        // §5.9: every buffer free means the pipeline fully drained — a
-        // catastrophic stall. What died with it is the *clock*, not the audio:
-        // the device restarts its period grid from whatever we submit next, so
-        // the DLL estimate is meaningless and must be dropped, or the next
-        // update reads the discontinuity as clock drift and drags the period.
+        // §5.9: every buffer free means the pipeline drained. What died with it
+        // is the *clock*, not the audio — the device restarts its period grid
+        // from whatever we submit next, so the DLL estimate must be dropped or
+        // the next update reads the discontinuity as drift and drags the
+        // period. The buffers themselves are refilled by the ordinary mix loop
+        // below: submitting a full pipeline of silence instead would cost
+        // `num_buffers` periods of audible dropout for a stall of any length.
         //
-        // The buffers are refilled by the ordinary mix loop below, like any
-        // other free buffer. A drain is not a reason to discard the client
-        // audio already sitting in the ring: submitting a full pipeline of
-        // silence would cost `num_buffers` periods of audible dropout for any
-        // stall, however brief, and delay that client audio by the same
-        // amount. Recovery costs only the periods the clients cannot cover.
-        //
-        // Counting it is a narrower question than detecting it, and the two
-        // were the same test until it turned out that a full free list has a
-        // second cause. `drains` exists to say "soundd was late enough that the
-        // device ran out of audio", so a free list soundd cannot have caused
-        // must not raise it. Two ways to arrive at one without being late:
-        //
-        // The idle path (§5.8) empties the pipeline *by design* — it arms no
-        // timer and sleeps until the hardware has nothing left, so a drain seen
-        // on the wake that admits the first client is an idle-phase event that
-        // merely got reported inside the streaming window, exactly the shape
-        // `underruns` had. That is the one wake with `was_streaming` false —
-        // soundd names a wake time on every other one, so requiring it costs
-        // no coverage of the streaming phase.
-        //
-        // The device retiring faster than it plays. For ~50ms after a stream
-        // starts, QEMU hands back the whole 23.2ms pipeline every 5-7ms as its
-        // backend catches up from the idle sawtooth. soundd is woken *early*
-        // by those completions and still sees a full free list. The floor
-        // rejects that arithmetically rather than by timing: unplayed audio at
-        // the last refill exceeded `min_drain_nanos`, so no device playing at
-        // its own rate can present an empty pipeline sooner, and one that does
-        // consumed more audio than the elapsed wall clock contains. Nothing
-        // genuine is suppressed — the bound is necessary for a real drain, not
-        // sufficient — and a mid-stream drain still counts at any point in the
-        // stream, because what it keys on is cause and not time since connect.
-        // A third way to arrive at a full free list without being late, and the
-        // only one soundd creates on purpose: the previous cycle deferred (see
-        // the mix loop). Those buffers are free because soundd chose not to
-        // fill them while audio it had already submitted was still playing —
-        // so the device did not run out, its period grid did not restart, and
-        // neither the count nor the DLL reset applies.
+        // Counting a drain is narrower than detecting one. `drains` means
+        // "soundd was late enough that the device ran out of audio", so the
+        // three ways to see a full free list without being late must not raise
+        // it: the idle path (§5.8) empties the pipeline by design and is the
+        // only wake with `was_streaming` false; a device retiring faster than
+        // it plays is rejected arithmetically by `min_drain_nanos`, which no
+        // device playing at its own rate can beat; and a previous cycle's
+        // deferral is soundd's own restraint, not a stall, so it suppresses the
+        // DLL reset too.
         if free_mask.count_ones() as usize == num_buffers && deferred_last == 0 {
             let since_filled = syscall::clock_nanos().saturating_sub(pipeline_filled_ns);
             if was_streaming && since_filled >= min_drain_nanos {
@@ -872,23 +789,18 @@ fn mix_thread(
             free_mask &= !(1 << idx);
 
             // §5.10's "wait until clients have filled", reached by deferring
-            // the buffer instead of by blocking on the clients — which needs no
-            // reverse notification, because the ring indices soundd already
-            // maps say the same thing.
+            // the buffer rather than blocking on the client — which needs no
+            // reverse notification, since the ring indices soundd already maps
+            // say the same thing.
             //
             // A streaming client whose ring is empty was signalled microseconds
             // ago and is mid-callback, not absent. The ring is `num_buffers`
             // deep precisely so a mix cycle that outruns the client costs
             // margin rather than audio; filling this buffer with silence spends
-            // that margin on the one thing it exists to prevent. Draining the
-            // whole ring in one cycle and then demanding it be refilled inside a
-            // single sub-period window is what put the gaps at exact multiples
-            // of the pipeline depth.
-            //
-            // Deferring is safe for exactly as long as audio already on the
-            // wire has not run out. A client that stops producing altogether
-            // still costs silence — at the floor, once the margin is genuinely
-            // spent, instead of immediately.
+            // that margin on the one thing it exists to prevent. Deferring is
+            // safe for exactly as long as audio already on the wire has not run
+            // out, so a client that stops producing altogether still costs
+            // silence — at the floor rather than immediately.
             let now = syscall::clock_nanos();
             let mid_refill = streams
                 .iter()
@@ -915,14 +827,12 @@ fn mix_thread(
                 if covered && !stream.delivered {
                     stream.delivered = true;
                     // §5.7 wants a client crash to break soundd's next write to
-                    // the signal pipe, and it cannot while soundd holds a read
-                    // end of its own. A delivered period is the proof that the
-                    // client holds one: `AudioStream::open` maps the ring and
-                    // opens the pipe before it returns, and the thread that
-                    // fills slots is spawned after that. A client that fills
-                    // without ever opening the pipe loses its stream on the
-                    // next signal, which is the right answer for one that never
-                    // joined the protocol.
+                    // the signal pipe, which it cannot while soundd holds a
+                    // read end of its own. A delivered period proves the client
+                    // holds one: `AudioStream::open` maps the ring and opens
+                    // the pipe before returning, and the slot-filling thread is
+                    // spawned after that. A client that fills without ever
+                    // opening the pipe loses its stream on the next signal.
                     if let Some(fd) = stream.signal_read_fd.take() {
                         syscall::close(fd);
                     }
@@ -940,9 +850,8 @@ fn mix_thread(
 
             toyos::audio::audio_submit(idx as u32, device_period_bytes as u32)
                 .unwrap_or_else(|e| panic!("soundd: audio_submit({idx}) failed: {e}"));
-            // One more period is on the wire. It plays after whatever was
-            // already queued, unless that has all played out, in which case the
-            // device restarts from now.
+            // Plays after whatever is already queued — unless that has all
+            // played out, in which case the device restarts from now.
             playout_until_ns = playout_until_ns.max(now) + period_nanos;
             refilled = true;
             if !streams.is_empty() {
@@ -954,10 +863,8 @@ fn mix_thread(
         // point the client has had another signal-to-mix window to produce.
         free_mask |= deferred;
         deferred_last = deferred;
-        // Every buffer is in flight again. Not re-stamped when nothing was
-        // submitted — including a cycle that only deferred: no audio was added,
-        // so the pipeline's remaining depth is still measured from the previous
-        // fill.
+        // Not re-stamped by a cycle that only deferred: no audio was added, so
+        // the pipeline's remaining depth still dates from the previous fill.
         if refilled {
             pipeline_filled_ns = syscall::clock_nanos();
         }
@@ -977,10 +884,9 @@ fn mix_thread(
             }
         });
 
-        // Flushing on the last disconnect closes the streaming phase out
-        // completely: the tail between the final periodic window and the
-        // client leaving is short-lived audio like a test tone's whole
-        // second half, and dropping it would leave the gate blind to it.
+        // Flushing on the last disconnect keeps the tail between the final
+        // periodic window and the client leaving in the record — for a stream
+        // shorter than two windows that tail is most of it.
         let now_ns = syscall::clock_nanos();
         if was_streaming && streams.is_empty() {
             stats.report(0);
@@ -1075,11 +981,11 @@ fn reject_open(req: &StreamOpenRequest) -> Option<&'static str> {
 ///
 /// The mix thread drains the whole ring at the top of every cycle, so a full
 /// ring means it has not run for a cycle and one device period is exactly how
-/// long there is to wait. Under connect/disconnect churn this throttles the
-/// control thread — which is the point — instead of dropping a command (a
-/// client stranded in the mix thread forever) or asserting (the audio server
-/// dead at a client's choosing). The retry is unbounded because the mix thread
-/// is the process's main thread: if it has stopped, soundd is already gone.
+/// long there is to wait. Throttling the control thread is the point: the
+/// alternatives are dropping a command (a client stranded in the mix thread
+/// forever) or asserting (soundd dead at a client's choosing). The retry is
+/// unbounded because the mix thread is the process's main thread — if it has
+/// stopped, soundd is already gone.
 fn submit(cmd_ring: &CommandRing, cmd_pipe_write: Fd, cmd: MixCommand, period_nanos: u64) {
     let mut cmd = cmd;
     loop {
@@ -1118,12 +1024,11 @@ fn control_thread(
         stream_idx: Option<usize>,
         /// Latest volume this client asked for, not yet handed to the mix
         /// thread. Volume is state, not an event: `set_target` overwrites the
-        /// ramp's target, step and remaining outright, so applying N of them
-        /// back to back within one mix cycle leaves exactly what applying only
-        /// the last would. Collapsing them here is therefore lossless, and it
-        /// is what keeps a client's message rate off the command ring — the
-        /// drain loop below reads everything a client has written before it
-        /// yields, so 65 volume messages in one write used to be 65 commands.
+        /// ramp outright, so applying N of them within one mix cycle leaves
+        /// exactly what applying only the last would. Collapsing is therefore
+        /// lossless, and it keeps a client's message rate off the command ring
+        /// — the drain loop below reads everything a client has written before
+        /// it yields.
         pending_volume: Option<Gain>,
     }
 
@@ -1145,11 +1050,9 @@ fn control_thread(
         if ready.contains(&TOKEN_LISTENER) {
             match services::accept(&listener) {
                 // Refused rather than left queued: a connection past the
-                // poller's watchable set would never be read from, so the
-                // client would wait forever on a stream soundd had accepted and
-                // then ignored. It is still accepted first — leaving it in the
-                // listener queue keeps the listener readable and spins this
-                // loop.
+                // poller's watchable set would never be read from. It is still
+                // accepted first — leaving it in the listener queue keeps the
+                // listener readable and spins this loop.
                 Ok(accepted) if clients.len() >= MAX_CONTROL_CLIENTS => {
                     eprintln!("soundd: refusing connection, {MAX_CONTROL_CLIENTS} clients already connected");
                     let _ = accepted.conn.signal(MSG_STREAM_ERROR);
