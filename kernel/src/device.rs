@@ -20,72 +20,92 @@ pub fn set_framebuffer_info(info: FramebufferInfo) {
     *FB_INFO.lock() = Some(info);
 }
 
+/// Why a claim did not succeed.
+///
+/// A daemon's whole degradation decision turns on this: "this machine has no
+/// sound card" is a machine, and exiting is right; "another process holds the
+/// sound card" is a conflict, and exiting silently turns it into a session
+/// with no audio and no record of why. One `None` could not tell them apart,
+/// so soundd's and netd's "no device on this machine" line was an assertion
+/// rather than a check.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ClaimError {
+    /// Another process holds the claim.
+    Owned,
+    /// This machine has no such device — no driver ever registered one.
+    Absent,
+    /// No such device type.
+    UnknownType,
+    /// The device exists and is free, but its buffers could not be granted.
+    GrantFailed,
+}
+
 /// Try to claim exclusive access to a device. Returns the Descriptor if unclaimed.
-pub fn try_claim(device_type: u64, pid: Pid) -> Option<Descriptor> {
+pub fn try_claim(device_type: u64, pid: Pid) -> Result<Descriptor, ClaimError> {
     match device_type {
         DEVICE_KEYBOARD => {
             let mut owner = KEYBOARD_OWNER.lock();
             if owner.is_some() {
-                return None;
+                return Err(ClaimError::Owned);
             }
             *owner = Some(pid);
-            Some(Descriptor::Keyboard)
+            Ok(Descriptor::Keyboard)
         }
         DEVICE_MOUSE => {
             let mut owner = MOUSE_OWNER.lock();
             if owner.is_some() {
-                return None;
+                return Err(ClaimError::Owned);
             }
             *owner = Some(pid);
-            Some(Descriptor::Mouse)
+            Ok(Descriptor::Mouse)
         }
         DEVICE_FRAMEBUFFER => {
             let mut owner = FRAMEBUFFER_OWNER.lock();
             if owner.is_some() {
-                return None;
+                return Err(ClaimError::Owned);
             }
-            let info = (*FB_INFO.lock())?;
+            let info = (*FB_INFO.lock()).ok_or(ClaimError::Absent)?;
             *owner = Some(pid);
             for &token in &info.token {
                 if shared_memory::grant_kernel(shared_memory::SharedToken::from_raw(token), pid).is_err() {
                     *owner = None;
-                    return None;
+                    return Err(ClaimError::GrantFailed);
                 }
             }
             if shared_memory::grant_kernel(shared_memory::SharedToken::from_raw(info.cursor_token), pid).is_err() {
                 *owner = None;
-                return None;
+                return Err(ClaimError::GrantFailed);
             }
             crate::drivers::panic_console::screen_claimed_by_userland();
-            Some(Descriptor::Framebuffer(info))
+            Ok(Descriptor::Framebuffer(info))
         }
         DEVICE_NIC => {
             let mut owner = NIC_OWNER.lock();
             if owner.is_some() {
-                return None;
+                return Err(ClaimError::Owned);
             }
-            let info = crate::net::nic_info()?;
+            let info = crate::net::nic_info().ok_or(ClaimError::Absent)?;
             *owner = Some(pid);
             if shared_memory::grant_kernel(shared_memory::SharedToken::from_raw(info.dma_token), pid).is_err() {
                 *owner = None;
-                return None;
+                return Err(ClaimError::GrantFailed);
             }
-            Some(Descriptor::Nic(info))
+            Ok(Descriptor::Nic(info))
         }
         DEVICE_AUDIO => {
             let mut owner = AUDIO_OWNER.lock();
             if owner.is_some() {
-                return None;
+                return Err(ClaimError::Owned);
             }
-            let info = crate::audio::audio_info()?;
+            let info = crate::audio::audio_info().ok_or(ClaimError::Absent)?;
             *owner = Some(pid);
             if shared_memory::grant_kernel(shared_memory::SharedToken::from_raw(info.dma_token), pid).is_err() {
                 *owner = None;
-                return None;
+                return Err(ClaimError::GrantFailed);
             }
-            Some(Descriptor::Audio { info, info_read: false })
+            Ok(Descriptor::Audio { info, info_read: false })
         }
-        _ => None,
+        _ => Err(ClaimError::UnknownType),
     }
 }
 

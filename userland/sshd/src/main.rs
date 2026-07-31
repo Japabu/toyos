@@ -229,9 +229,21 @@ fn main() {
         // Every bind goes through netd, which exits on a machine with no NIC.
         // sshd has nothing to offer without one, so it says so and leaves
         // instead of dumping a tokio backtrace across the boot.
-        let Ok(listener) = tokio::net::TcpListener::bind("0.0.0.0:22").await else {
-            println!("sshd: no network on this machine, exiting");
-            return;
+        //
+        // Only for that error, though. `NetdNotFound` — no netd registered the
+        // service name — is the one that means what the message says, and std
+        // maps it to NotConnected. `AddrInUse`, a netd that died mid-request
+        // (`NetError::Io`) and a pipe failure all arrive here too, and on a
+        // laptop with a live link every one of them would have exited 0 with a
+        // line blaming the hardware. Nothing supervises init's children, so
+        // the message is the entire diagnostic.
+        let listener = match tokio::net::TcpListener::bind("0.0.0.0:22").await {
+            Ok(l) => l,
+            Err(e) if e.kind() == std::io::ErrorKind::NotConnected => {
+                println!("sshd: no network on this machine, exiting");
+                return;
+            }
+            Err(e) => panic!("sshd: cannot bind 0.0.0.0:22: {e}"),
         };
         println!("sshd: listening on port 22");
         loop {

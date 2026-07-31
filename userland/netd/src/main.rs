@@ -32,12 +32,14 @@ struct DmaNic {
 }
 
 impl DmaNic {
-    /// `None` when the machine has no NIC — metal-sim has none, and neither
-    /// does the target laptop until its own driver exists. The claim is
-    /// exclusive, so `services::listen` remains the "already running" check
-    /// and this is only ever "no hardware".
-    fn open() -> Option<Self> {
-        let nic_dev = NicDev::open().ok()?;
+    /// `NotFound` when the machine has no NIC — metal-sim has none, and
+    /// neither does the target laptop until its own driver exists. Every other
+    /// error is a conflict or a resource failure and belongs to the caller, so
+    /// the kind is propagated rather than flattened: `services::listen` is not
+    /// the whole "already running" check, since it releases the name and the
+    /// NIC claim under different locks.
+    fn open() -> Result<Self, toyos_nic::SyscallError> {
+        let nic_dev = NicDev::open()?;
         let info = nic_dev.info().expect("netd: failed to read NicInfo");
 
         let rx_buf_size = info.rx_buf_size as usize;
@@ -46,7 +48,7 @@ impl DmaNic {
         let rx_base = unsafe { dma_base.add(info.rx_buf_offset as usize) };
         let tx_ptr = unsafe { dma_base.add(info.tx_buf_offset as usize) as *mut u8 };
 
-        Some(Self {
+        Ok(Self {
             _dma_region: dma_region,
             rx_base,
             rx_buf_size,
@@ -1018,9 +1020,13 @@ impl NetDaemon {
 fn main() {
     let listener = services::listen("netd").expect("netd already running");
 
-    let Some(mut device) = DmaNic::open() else {
-        eprintln!("netd: no NIC on this machine, exiting");
-        return;
+    let mut device = match DmaNic::open() {
+        Ok(d) => d,
+        Err(toyos_nic::SyscallError::NotFound) => {
+            eprintln!("netd: no NIC on this machine, exiting");
+            return;
+        }
+        Err(e) => panic!("netd: cannot claim the NIC: {e}"),
     };
     let mac = device.mac;
 

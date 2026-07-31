@@ -938,9 +938,16 @@ fn sys_waitpid(pid: u64, flags: u64) -> u64 {
 
 fn sys_open_device(device_type: u64) -> u64 {
     let pid = process::current_process();
+    // NotFound means the machine has no such device and nothing else, because
+    // that is the one answer a daemon is entitled to degrade on. Collapsing
+    // Owned into it made soundd print "no audio device on this machine" and
+    // exit 0 whenever another process held the claim.
     let desc = match device::try_claim(device_type, pid) {
-        Some(d) => d,
-        None => return SyscallError::NotFound.to_u64(),
+        Ok(d) => d,
+        Err(device::ClaimError::Absent) => return SyscallError::NotFound.to_u64(),
+        Err(device::ClaimError::Owned) => return SyscallError::AlreadyExists.to_u64(),
+        Err(device::ClaimError::UnknownType) => return SyscallError::InvalidArgument.to_u64(),
+        Err(device::ClaimError::GrantFailed) => return SyscallError::ResourceExhausted.to_u64(),
     };
     process::with_fd_owner_data(|data| fd_result(data.fds.insert(desc)))
 }
