@@ -31,12 +31,46 @@ Verified against the current tree:
 
 | # | Class | Evidence | Closed by |
 |---|---|---|---|
-| B1 | Dual notification paths: every wake site must call both `scheduler::wake_*` and `io_uring::complete_pending_for_event`; forgetting one half is a silent lost wake | ~9 sites: `pipe.rs:272-306`, `process.rs:1037-1057`, `arch/syscall.rs:475,516,541,719,734,869,1144`, `drivers/xhci/hid.rs:32-47`, drains in `scheduler::drain_events` | One `post()` function (§4); the dual-call idiom no longer exists to forget (CT2) |
+| B1 | Dual notification paths: every wake site must call both a wait-queue wake and `io_uring::complete_pending_for_event`; forgetting one half is a silent lost wake | **11 sites across 6 files — see the inventory below** | One `post()` function (§4); the dual-call idiom no longer exists to forget (CT2) |
 | B2 | Per-source park/recheck windows: the recheck in `handle_outgoing` covers only IoUring/PipeReadable/Audio; PipeWritable, Listener, Keyboard, Mouse, Network have none; futex has a separate protocol — five closures in five styles | `scheduler.rs:1704-1712` | One exhaustive 2-variant recheck match + one proof (§7); a new wait target without a recheck arm does not compile (CT3) |
 | B3 | Open forever-hang: `sys_waitpid` blocks with `block(None, 0)` and is woken by directed `wake_task`; child exiting between the zombie check and pool insertion loses the wake forever. `SYS_THREAD_JOIN` shares it | `arch/syscall.rs:761,998` | `Source::ChildExit`/`ThreadExit` + Invariant W (§7, §8); `wake_task` is deleted entirely (§6.3) |
 | B4 | Timeout sentinels: `io_uring_enter(timeout=0)` = nonblock forces soundd's `delta==0 → full-period oversleep` hack; kernel `deadline: u64` with `0 = forever` is the opposite sentinel in the same codebase | `io_uring.rs:301-303`, `soundd/main.rs:363-366` | Continuous absolute deadlines over the whole `u64` range — no sentinel branch exists to collide (§9, CT4) |
 | B5 | ID-vs-pointer lifetime coupling: a queued `TaskCtx` referencing a freed kernel object (the motivating use-after-free) | crash dossier | Parked state names objects by Copy IDs only (`RingId`, futex `DirectMap`); destroyed objects fail lookups, never dangle (CT6) |
 | B6 | Directed-wake race: `wake_task` scans a pool the target may not have entered yet (kill/retire paths share B3's shape) | `scheduler.rs` kill/retire sites | `kill_pending` flag + universal park recheck under the same POOL-lock fence (§6.3) |
+
+### B1 inventory — the 11 dual-call sites
+
+Stage 1 is sized off this list, so it is kept exact. Re-derive it with
+`grep -rn complete_pending_for_event kernel/` (two further hits are comments in
+`io_uring.rs`) rather than trusting the count below to have aged well.
+
+| # | Site | First half — the wake | Second half |
+|---|---|---|---|
+| 1 | `pipe.rs:292` | `scheduler::wake_pipe_writers` | `complete_pending_for_event` |
+| 2 | `pipe.rs:320` | `scheduler::wake_pipe_readers` | `complete_pending_for_event` |
+| 3 | `process.rs:1176` | `scheduler::wake_pipe_readers` | `complete_pending_for_event` |
+| 4 | `process.rs:1188` | `scheduler::wake_pipe_writers` | `complete_pending_for_event` |
+| 5 | `drivers/xhci/hid.rs:45` | `keyboard::wake_waiters` | `complete_pending_for_event` |
+| 6 | `drivers/xhci/hid.rs:59` | `mouse::wake_waiters` | `complete_pending_for_event` |
+| 7 | `sched/driver.rs:524` | `net::wake_waiters` | `complete_pending_for_event` |
+| 8 | `sched/driver.rs:534` | `audio::wake_waiters` | `complete_pending_for_event` |
+| 9 | `drivers/i8042/mod.rs:270` | `keyboard::wake_waiters` | `complete_pending_for_event` |
+| 10 | `drivers/i8042/mod.rs:281` | `mouse::wake_waiters` | `complete_pending_for_event` |
+| 11 | `arch/syscall.rs:1041` | `sched::waitqs::wake_all(&queue)` | `complete_pending_for_event` |
+
+Every first half bottoms out in `sched::waitqs::wake_all` — at 7 of the 11 sites
+that is what the call plainly is (6 behind `<subsystem>::wake_waiters`, one
+direct); the other 4 reach it behind `scheduler::wake_pipe_*`. There is no
+`scheduler::wake_*` family doing this work, and the drains are in
+`sched::driver::drain_irqs`, not `scheduler::drain_events`.
+
+**This inventory previously read "~9 sites" and omitted the i8042 keyboard and
+mouse pair entirely (rows 9 and 10).** That pair is the metal-track PS/2 path —
+new machinery, added after the inventory was written, and exactly the class of
+site B1 exists to say cannot be forgotten. The inventory failed at its one job,
+which is the argument for B1's fix rather than against it: a list that must be
+maintained by hand will be wrong the first time someone adds a wake site, and
+being wrong is silent.
 
 ## 3. Architecture
 
