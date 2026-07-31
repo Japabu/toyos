@@ -46,6 +46,35 @@ evict" is evidence that someone intended to; the call site is evidence they did.
 Check that `init` has a caller, that the guard has a non-`usize::MAX` value, that
 the deleted function is actually gone.
 
+## Break it and run it — the one check you cannot do by reading
+
+**The pattern: a claim that a named test proves something, where nobody ever
+checked that the test fails.** Three turned up in a single sweep:
+
+- I5 (fairness) sat in a table headed "checked after every sim step",
+  implemented nowhere.
+- A spec sentence said kernel `check` builds carry a max-pass-duration assert.
+  No kernel build can compile that feature, and the assert does not exist.
+- A comment named `screen_late_panic` as "the one test that fails if the capture
+  stops happening". Replace `panic_console::capture`'s body with `return` and it
+  still passes.
+
+**The check: when a spec, comment, or plan claims test T guards property P, break
+P and run T.** If T still passes, the claim is false and the gap is real,
+whatever the suite says. Cheap, decisive, and the only check here that reading
+cannot satisfy — two of the three above were found this way; the third was found
+by accident.
+
+**The asymmetry is why it is worth doing: a green suite is what makes these
+invisible.** Nothing looks wrong until you try to make it go red. Prose asserting
+coverage reads exactly the same whether the coverage exists or not, and the
+passing run is taken as confirmation rather than as the thing that was never
+tested.
+
+`specs/metal-track-history.md` records the same class from the other direction —
+twelve certifications that could not fail. This is the method that would have
+caught them.
+
 ## The two traps that actually bit
 
 **Grep misses calls that go through a guard or trait object.** Searching
