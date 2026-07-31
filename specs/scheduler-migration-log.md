@@ -49,6 +49,35 @@ io_uring's poll key.
 7a deleted what the cutover orphaned, because dead code is a build error here —
 it could not leave the legacy body compiled.
 
+**One deletion at 7a was not intended and was not noticed for two months.**
+`drain_events` carried, for audio and for network, both halves of the wake
+pair: the direct-blocker queue *and* `complete_pending_for_event` for the
+io_uring ring watchers. f4d8fa7 removed both `complete_pending_for_event`
+calls along with `PERCPU_EVENTS`, while explicitly preserving the identical
+keyboard/mouse pair in `hid.rs`. A `POLL_ADD` on an audio or NIC fd could
+then complete only on submit-time readiness or on close. Neither loss was
+observable at the time — soundd's streaming wakes came from its own armed DLL
+timer and it had no idle path yet, and netd's NIC poll only matters at a full
+idle that interactive use never reaches. Restored in aeeaa01 (audio) and its
+network sibling; both commit messages and the known-issues entry originally
+attributed the deletion to Stage 7c, which only renamed `EventSource` →
+`io_uring::Source` and does not touch `drain_irqs`. The 7c review compared two
+post-7a trees, found them identical, and concluded there was nothing there.
+
+Consequence for gate A: **the recorded audio baseline (f9dc851) was measured
+on this half-wired kernel** — a descendant of f4d8fa7, so streaming wakes were
+timer-driven and idle wakes did not exist. `max_wake_lat_us` is sampled as
+`now − armed_on`, i.e. the distance from a *timer* prediction to a batched
+completion, which is what makes the recorded medians 2.6–3.2 device periods.
+With the fan-out restored, every completion IRQ posts a CQE and that term
+collapses. So the next thorough-tier A/B should be expected to move `wakes`
+and `max_wake_lat_us`, and the shift belongs to the fan-out restoration, not
+to whatever change is being gated. Both likely directions are the *unflagged*
+ones (`tests/toyos.rs` flags falling `wakes` and rising `max_wake_lat_us`), so
+a green tier is not evidence that nothing moved — read the printed
+distributions. Do not re-record the sample "to match the new normal" without
+saying which kernel it was taken on.
+
 ## Stage 7b (balance on, retire by message)
 
 `Env::steal` is `true`: an idle pass posts one `StealRequest` to the busiest CPU

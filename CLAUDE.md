@@ -153,7 +153,7 @@ system.toml       What to build and boot
 
 Three layers, built in order; each is useful on its own.
 
-1. **Process accounting (counters).** Cumulative per-process wall and user/kernel CPU time, page faults by cause, I/O ops and bytes, time blocked by reason. Incremented at existing kernel sites, read by one syscall, printed by a userland `stats` tool. **Built.**
+1. **Process accounting (counters).** Cumulative per-process wall and user/kernel CPU time, page faults by cause, I/O ops and bytes, time blocked by reason. Incremented at existing kernel sites, read by one syscall, printed by a userland `stats` tool. **Built** — but the syscall reports only an *exited direct child*, exactly once, so it cannot sample a live daemon (known-issues §5).
 2. **Event tracing.** Per-process ring of `(timestamp_ns, TraceEvent)`: syscall and fault entry/exit, I/O submit/complete, scheduled (with runqueue wait), preempted (with timeslice used), blocked/woken (with reason), lib load/relocate. ~24 bytes/event, 4096 entries (~96 KB), ~8 instrumented sites, one syscall to read. Answers "where is time going, in what order?"
 3. **RIP sampling.** Per-process `(timestamp_ns, rip)` ring on timer tick. Needs frame-pointer unwinding to be worth anything — flat RIP profiles without call stacks are nearly worthless. Build only once layers 1–2 confirm something is CPU-bound.
 

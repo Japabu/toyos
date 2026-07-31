@@ -143,7 +143,7 @@ soundd does not wake directly on DMA completion interrupts. Instead, it maintain
 
 The DLL works as follows:
 
-1. **Initialization:** after priming the DMA pipeline, soundd sets the timer period to the nominal device period (e.g., 2.667 ms).
+1. **Initialization:** soundd sets the timer period to the nominal device period (e.g., 2.667 ms). There is no prime to initialize against (§5.2); the DLL holds no estimate until the first completion, and until then each wait is one nominal period.
 2. **On each wake:** soundd reads DMA completion timestamps from the kernel. These are the actual times the hardware finished playing each buffer.
 3. **DLL update:** the DLL compares predicted vs. actual completion times and adjusts the timer frequency. A second-order IIR filter smooths the adjustment to avoid oscillation.
 4. **Timer reset:** soundd arms the timer for the next predicted completion.
@@ -462,7 +462,7 @@ Equivalent systems: Linux `PTHREAD_PRIO_INHERIT` on mutexes, Linux PI-futexes, D
 | DMA completions batch (2-3 per wake) | soundd consumes multiple client slots per cycle | Slot ring absorbs batching |
 | soundd scheduling jitter | DLL timer + pipeline depth absorbs jitter | Automatic |
 | All DMA buffers drain | soundd resets the DLL and refills from the client rings; silence only for periods no client covers | Audio resumes the same cycle |
-| No clients connected | soundd submits silence or quiesces | Zero overhead |
+| No clients connected | soundd drains the pipeline and stops the PCM stream (§5.8) — submitting silence is not an option | Zero overhead, zero wakes, device voice closed |
 | Hardware error | Driver reports error to soundd | soundd logs and attempts re-init |
 | Client connects | Gain ramps from 0 to target | No click or pop |
 | Client disconnects | Gain ramps to 0 before removal | No click or pop |
