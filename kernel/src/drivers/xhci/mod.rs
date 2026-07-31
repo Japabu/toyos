@@ -24,6 +24,7 @@ const CAP_RTSOFF:     u64 = 0x18; // u32
 // xHCI Operational Register offsets (from op_base = BAR0 + cap_length)
 const OP_USBCMD:   u64 = 0x00;
 const OP_USBSTS:   u64 = 0x04;
+const OP_PAGESIZE: u64 = 0x08;
 const OP_CRCR:     u64 = 0x18; // 64-bit
 const OP_DCBAAP:   u64 = 0x30; // 64-bit
 const OP_CONFIG:   u64 = 0x38;
@@ -128,21 +129,99 @@ impl TrbRing {
     }
 }
 
-// DMA layout (byte offsets)
-const OFF_DCBAA: usize       = 0x0000;
-const OFF_CMD_RING: usize    = 0x1000;
-const OFF_ERST: usize        = 0x2000;
-const OFF_EVT_RING: usize    = 0x3000;
-const OFF_OUT_CTX1: usize    = 0x4000;
-const OFF_INPUT_CTX: usize   = 0x5000;
-const OFF_EP0_RING: usize    = 0x6000;
-const OFF_KB_INT_RING: usize = 0x7000;
-const OFF_DATA_BUF: usize    = 0x8000;
-const OFF_SCRATCH: usize     = 0x9000;
-const OFF_OUT_CTX2: usize    = 0xA000;
-const OFF_MOUSE_INT_RING: usize = 0xB000;
-const OFF_OUT_CTX3: usize    = 0xC000;
-const DMA_SIZE: usize         = 0xD000;
+/// The granularity every structure below is placed at. It is the xHCI
+/// PAGESIZE the controller reports, and no shipping xHC reports anything else;
+/// `init` logs the register so a machine that disagrees says so.
+const PAGE: usize = 0x1000;
+
+// The pool's fixed head. Everything here is either the controller's own state
+// or enumeration scratch, and there is exactly one of each because enumeration
+// is serial — see `device::init_device`.
+const OFF_DCBAA: usize     = 0 * PAGE; // (max_slots + 1) * 8, 2 KiB at most
+const OFF_CMD_RING: usize  = 1 * PAGE;
+const OFF_ERST: usize      = 2 * PAGE;
+const OFF_EVT_RING: usize  = 3 * PAGE;
+const OFF_INPUT_CTX: usize = 4 * PAGE; // 33 contexts, so 2112 B at ctx_size 64
+const OFF_EP0_RING: usize  = 5 * PAGE;
+const OFF_DATA_BUF: usize  = 6 * PAGE;
+const SHARED_SIZE: usize   = 7 * PAGE;
+
+// One of these per device the controller gives us a slot for. All three
+// outlive enumeration: the controller writes the output context and the report
+// buffer for as long as the device is attached, and the interrupt ring carries
+// that device's transfers. Sharing any of them between two devices is a
+// silent data race, which is what keying the interrupt ring by HID class did.
+const DEV_INT_RING: usize = 0;             // 256 TRBs, exactly one page
+const DEV_OUT_CTX: usize  = PAGE;          // 32 contexts, 2 KiB at ctx_size 64
+const DEV_REPORT: usize   = PAGE + 0x800;  // 8 B, the largest boot report
+const DEV_STRIDE: usize   = 2 * PAGE;
+
+/// Device blocks to size the pool for before the controller's slot count is
+/// consulted. Only a controller with a scratchpad demand that lands just under
+/// a 2 MiB boundary can leave fewer than this in the page it forced us to
+/// allocate anyway; without the floor such a controller would get a working
+/// pool with room for one device.
+const MIN_DEVICE_BLOCKS: usize = 8;
+
+/// Cap the driver at one device block, so a test can drive the path where the
+/// controller hands back a slot the pool has no room for. Nothing else can
+/// stage it: QEMU's `nec-usb-xhci,slots=N` does not reach HCSPARAMS1 and its
+/// Enable Slot ignores MaxSlotsEn, and a real pool holds ~250 devices.
+#[cfg(feature = "xhci-one-slot")]
+const DEVICE_CEILING: usize = 1;
+#[cfg(not(feature = "xhci-one-slot"))]
+const DEVICE_CEILING: usize = usize::MAX;
+
+/// Where each structure sits in the pool, derived from what the controller
+/// reported. Nothing here is a constant except the strides above.
+#[derive(Clone, Copy)]
+struct Layout {
+    scratch_array: usize,
+    scratch_buffers: usize,
+    scratch_count: usize,
+    dev_base: usize,
+    /// Device blocks the pool holds, which is also the MaxSlotsEn written to
+    /// CONFIG: the controller is told exactly what the driver can track.
+    dev_blocks: usize,
+    pool_size: usize,
+}
+
+impl Layout {
+    /// `max_scratchpad` and `max_slots` come straight off HCSPARAMS, which is
+    /// where every number below stops being arbitrary.
+    fn new(max_scratchpad: usize, max_slots: u8) -> Self {
+        let scratch_array = SHARED_SIZE;
+        let array_bytes = (max_scratchpad * 8 + PAGE - 1) & !(PAGE - 1);
+        let scratch_buffers = scratch_array + array_bytes;
+        let dev_base = scratch_buffers + max_scratchpad * PAGE;
+
+        // DmaPool hands out whole 2 MiB pages. The head above already forces
+        // one, so every block that fits in its slack is free — and asking for
+        // more than the slack buys a second 2 MiB page for devices no root hub
+        // has ports for. The floor is what decides how many pages to take; the
+        // slack of those pages is what decides how many blocks to carve.
+        let pool_size = crate::mm::align_2m(dev_base + MIN_DEVICE_BLOCKS * DEV_STRIDE);
+        let dev_blocks = ((pool_size - dev_base) / DEV_STRIDE)
+            .min(max_slots as usize)
+            .min(DEVICE_CEILING);
+
+        Self {
+            scratch_array,
+            scratch_buffers,
+            scratch_count: max_scratchpad,
+            dev_base,
+            dev_blocks,
+            pool_size,
+        }
+    }
+
+    /// The block belonging to a 1-based slot id, or `None` when the controller
+    /// handed back a slot the pool has no room for.
+    fn device(&self, slot_id: u8) -> Option<usize> {
+        let index = (slot_id as usize).checked_sub(1)?;
+        (index < self.dev_blocks).then(|| self.dev_base + index * DEV_STRIDE)
+    }
+}
 
 static XHCI_DMA_POOL: Lock<Option<DmaPool>> = Lock::new(None);
 
@@ -167,6 +246,7 @@ pub struct XhciController {
     rt_base: Mmio,
 
     context_size: usize, // 32 or 64
+    layout: Layout,
 
     cmd_ring: TrbRing,
     ep0_ring: TrbRing,
@@ -284,9 +364,15 @@ impl XhciController {
         self.wait_transfer()
     }
 
+    /// Hand the one EP0 ring to the device being enumerated. Every device
+    /// addressed before this one still points its EP0 context here, which is
+    /// safe only because nothing rings their doorbells again: `init_device` is
+    /// the sole caller, its control transfers each complete before the next
+    /// starts, and it runs once per port from `init`. Hotplug breaks that and
+    /// has to take an enumeration lock, not a second ring.
     fn reset_ep0_ring(&mut self) {
         let dma = dma();
-        let ring = dma.subslice(OFF_EP0_RING, 0x1000);
+        let ring = dma.subslice(OFF_EP0_RING, PAGE);
         unsafe { ring.zero(); }
         let mut link = Trb::ZERO;
         link.param = ring.phys();
@@ -380,7 +466,6 @@ fn setup_msix(pci_dev: &PciDevice) {
 pub fn init(ecam: &crate::mm::Mmio) -> Option<XhciController> {
     let pci_dev = PciDevice::find(ecam, 0x0C, 0x03, Some(0x30))?;
     log!("xHCI: found at PCI {:02x}:{:02x}.{}", pci_dev.bus, pci_dev.dev, pci_dev.func);
-    *XHCI_DMA_POOL.lock() = Some(DmaPool::alloc(DMA_SIZE));
 
     let bar_addr = pci_dev.read_bar_64(0);
     pci_dev.enable_bus_master();
@@ -407,7 +492,15 @@ pub fn init(ecam: &crate::mm::Mmio) -> Option<XhciController> {
     let db_base = bar.subregion(db_offset, bar_size - db_offset);
     let rt_base = bar.subregion(rts_offset, bar_size - rts_offset);
 
-    log!("xHCI: max_slots={} max_ports={} ctx_size={}", max_slots, max_ports, context_size);
+    log!("xHCI: max_slots={} max_ports={} ctx_size={} pagesize={:#x}",
+        max_slots, max_ports, context_size, op_base.read_u32(OP_PAGESIZE));
+
+    let max_sp_hi = ((hcsparams2 >> 21) & 0x1F) as usize;
+    let max_sp_lo = ((hcsparams2 >> 27) & 0x1F) as usize;
+    let layout = Layout::new((max_sp_hi << 5) | max_sp_lo, max_slots);
+    log!("xHCI: dma {} KiB: scratchpad={} device blocks={} of {} B (max_slots={})",
+        layout.pool_size / 1024, layout.scratch_count, layout.dev_blocks, DEV_STRIDE, max_slots);
+    *XHCI_DMA_POOL.lock() = Some(DmaPool::alloc(layout.pool_size));
 
     let usbcmd = op_base.read_u32(OP_USBCMD);
     if usbcmd & 1 != 0 {
@@ -426,32 +519,39 @@ pub fn init(ecam: &crate::mm::Mmio) -> Option<XhciController> {
     }
     log!("xHCI: controller reset");
 
-    op_base.write_u32(OP_CONFIG, max_slots as u32);
+    // MaxSlotsEn is what the driver can track, not what the controller can
+    // offer: a conformant xHC then refuses Enable Slot past it rather than
+    // handing back an id with nowhere to put its context.
+    op_base.write_u32(OP_CONFIG, layout.dev_blocks as u32);
 
     let dma = dma();
     unsafe { dma.zero(); }
 
-    // Scratchpad buffers
-    let max_sp_hi = ((hcsparams2 >> 21) & 0x1F) as usize;
-    let max_sp_lo = ((hcsparams2 >> 27) & 0x1F) as usize;
-    let max_scratchpad = (max_sp_hi << 5) | max_sp_lo;
-    if max_scratchpad > 0 {
-        let sp_array = dma.ptr_at(OFF_SCRATCH) as *mut u64;
-        unsafe { write_volatile(sp_array, dma.phys() + OFF_SCRATCH as u64 + 2048); }
-        unsafe { write_volatile(dma.ptr_at(OFF_DCBAA) as *mut u64, dma.phys() + OFF_SCRATCH as u64); }
-        log!("xHCI: {} scratchpad buffers configured", max_scratchpad);
+    if layout.scratch_count > 0 {
+        let array = dma.ptr_at(layout.scratch_array) as *mut u64;
+        for i in 0..layout.scratch_count {
+            let buf = dma.phys() + (layout.scratch_buffers + i * PAGE) as u64;
+            unsafe { write_volatile(array.add(i), buf); }
+        }
+        unsafe {
+            write_volatile(
+                dma.ptr_at(OFF_DCBAA) as *mut u64,
+                dma.phys() + layout.scratch_array as u64,
+            );
+        }
+        log!("xHCI: {} scratchpad buffers configured", layout.scratch_count);
     }
 
     op_base.write_u64(OP_DCBAAP, dma.phys() + OFF_DCBAA as u64);
 
-    let cmd_ring_buf = dma.subslice(OFF_CMD_RING, 0x1000);
+    let cmd_ring_buf = dma.subslice(OFF_CMD_RING, PAGE);
     let mut link = Trb::ZERO;
     link.param = cmd_ring_buf.phys();
     link.control = TRB_LINK | (1 << 1);
     unsafe { write_volatile((cmd_ring_buf.base() as *mut Trb).add(RING_SIZE - 1), link); }
     op_base.write_u64(OP_CRCR, cmd_ring_buf.phys() | 1);
 
-    let evt_ring_buf = dma.subslice(OFF_EVT_RING, 0x1000);
+    let evt_ring_buf = dma.subslice(OFF_EVT_RING, PAGE);
     let erst = dma.ptr_at(OFF_ERST) as *mut ErstEntry;
     unsafe {
         write_volatile(erst, ErstEntry {
@@ -469,7 +569,7 @@ pub fn init(ecam: &crate::mm::Mmio) -> Option<XhciController> {
     rt_base.write_u32(IR0_IMAN, 3);
 
     // EP0 Ring (will be reset per device)
-    let ep0_buf = dma.subslice(OFF_EP0_RING, 0x1000);
+    let ep0_buf = dma.subslice(OFF_EP0_RING, PAGE);
     let mut ep0_link = Trb::ZERO;
     ep0_link.param = ep0_buf.phys();
     ep0_link.control = TRB_LINK | (1 << 1);
@@ -486,6 +586,7 @@ pub fn init(ecam: &crate::mm::Mmio) -> Option<XhciController> {
         db_base,
         rt_base,
         context_size,
+        layout,
         cmd_ring: TrbRing::new(cmd_ring_buf),
         ep0_ring: TrbRing::new(ep0_buf),
         event_ring: evt_ring_buf.base() as *const Trb,

@@ -73,6 +73,7 @@ const MACHINE_TESTS: &[&str] = &[
     "i8042_mouse",
     "i8042_absent",
     "i8042_quarantine",
+    "xhci_slot_exhaustion",
 ];
 
 /// The renderer's two text colours, as the screendump reports them.
@@ -1452,6 +1453,56 @@ fn run_machine_test(
                 usb.len(),
                 slots.len(),
                 rings.len()
+            );
+            Ok(())
+        }
+        "xhci_slot_exhaustion" => {
+            // A device count is untrusted input: more devices than the driver
+            // has room for must cost those devices and nothing else. QEMU
+            // cannot stage it — see XHCI_WIDE for why `slots=` is not the
+            // actuator it looks like — so the kernel clamps itself to one
+            // device block and the six-device bus does the rest. QEMU's Enable
+            // Slot ignores MaxSlotsEn too, so the slot ids the controller hands
+            // back really do run past the pool: this drives the driver's own
+            // bound, not the controller's politeness.
+            let options = BootOptions {
+                profile: qemu::Profile::MetalUsb,
+                kernel_features: &["xhci-one-slot"],
+                ..Default::default()
+            };
+            let argv = qemu::profile_argv(&options);
+            let usb = usb_argv(&argv);
+            if usb.len() < 3 {
+                return Err(format!("nothing to overflow with: {usb:?}"));
+            }
+
+            let qemu = QemuInstance::boot_with_options(test_config, c_bins, rust_bins, options);
+            let log = qemu.boot_log().to_string();
+
+            if !log.contains("xHCI: dma ") || !log.contains("device blocks=1") {
+                return Err(format!("the driver did not clamp itself to one block:\n{log}"));
+            }
+            // Every device past the first is dropped, one line each.
+            let slots = parse_xhci_slots(&log);
+            let over = log.matches("beyond the pool").count();
+            if over != usb.len() - 1 {
+                return Err(format!(
+                    "{over} devices dropped for want of a block, want {} (slots {slots:?}):\n{log}",
+                    usb.len() - 1
+                ));
+            }
+            for bad in ["!!! PANIC !!!", "KERNEL PANIC", "panicked at"] {
+                if log.contains(bad) {
+                    return Err(format!("{bad:?} — the driver died on a full pool:\n{log}"));
+                }
+            }
+            // Not panicking is half of it; the boot also has to finish.
+            if !log.contains(qemu::DEFAULT_READY) {
+                return Err(format!("the boot never reached userland:\n{log}"));
+            }
+            eprintln!(
+                "  [xhci] 1 block for {} devices, {over} dropped, boot survived",
+                usb.len()
             );
             Ok(())
         }

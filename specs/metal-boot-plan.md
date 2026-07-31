@@ -153,13 +153,14 @@ bar; QEMU cannot.
   missing xHCI controller survivable, which nothing has yet had a chance to
   exercise.
 
-  **Three xHCI items are filed in known issues §8, and the first is a
-  first-boot blocker rather than an M4 item**: the driver panics above slot 3
-  and the T14 has four USB devices, so "fail gracefully" is not enough — it
-  means no keyboard on the machine whose keyboard is the milestone. The other
-  two are the missing USBLEGSUP ownership handoff before HCRST, which QEMU
-  structurally cannot fail and Lenovo firmware can, and hotplug, which does
-  nothing at all and became reachable when M1 removed the zero-HID panic.
+  **The three-slot first-boot blocker is closed.** The driver sizes its DMA
+  pool from HCSPARAMS and gives every slot its own block, so the T14's four
+  internal devices enumerate; `xhci_many_devices` boots six of them every run
+  and `xhci_slot_exhaustion` proves a bus wider than the pool costs the extra
+  devices and nothing else. Two xHCI items remain in known issues §8, both
+  still M4-shaped: the missing USBLEGSUP ownership handoff before HCRST, which
+  QEMU structurally cannot fail and Lenovo firmware can, and hotplug, which
+  does nothing at all and became reachable when M1 removed the zero-HID panic.
 - **FLASH TRIGGER: metal-sim boots to the compositor with the PS/2 keyboard
   working and panics render on screen → flash the stick. MET.**
   `metal_sim_input` certifies it every run, on the machine shape and the plain

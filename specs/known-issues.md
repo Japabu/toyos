@@ -758,27 +758,30 @@ t=1.69 s on a boot that reached `Boot: complete` at 0.38 s, and its 100
 publish "no NIC" rather than not publishing at all, so the retry has something
 to observe.
 
-### FIRST-METAL-BOOT BLOCKER: the xHCI driver dies above three USB slots
+### The xHCI driver never gives a slot back
 
-`output_ctx_offset` (`kernel/src/drivers/xhci/device.rs:87-94`) matches slots
-1..3 and panics on anything else — `panic!("xHCI: too many USB slots (max 3)")`
-— and `init_device` allocates an output context for every enabled slot
-regardless of device class, which is why the non-HID boot stick already
-consumes slot 1. The T14's internal xHCI carries camera, Bluetooth and
-fingerprint reader alongside the boot stick: four devices, and `scan_ports`
-walks them all at boot. The fourth `init_device` kills the boot in phase 4 —
-the same phase, the same file and the same class of failure M1 was built to
-eliminate.
+`init_device` enables a slot for every connected port and issues no Disable
+Slot, on any path: not for the non-HID devices it walks past (the boot stick
+and any hub, camera or fingerprint reader), not when Address Device fails, not
+when the descriptor fetch fails. Each of those keeps a slot and a device block
+for a device the driver will never talk to again.
 
-metal-sim cannot reach it. The profile has exactly one USB device, so no
-metal-sim run allocates a second slot, and the whole zero-device end of the
-range is what M1 hardened. Three `-device usb-…` lines that are not HID would
-stage it; that is the cheap half of the fix, and the real one is slots
-allocated from a `Vec` rather than three fixed DMA offsets.
+Harmless where slots outnumber ports, which is every machine in reach: QEMU
+reports 64, Intel's PCH controllers 32 or more, and no root hub has that many
+ports. It stops being harmless on a controller whose slot count is below its
+device count, where a HID on a later port loses its slot to a hub on an earlier
+one. `xhci_slot_exhaustion` is what would catch the regression — it already
+proves the machine survives the shortage, not that the right devices win it.
 
-`specs/metal-boot-plan.md` M4 lists graceful failure above three slots as a
-minimum. That is not enough for a first boot: graceful failure here means no
-keyboard on the machine whose keyboard is the milestone.
+### The xHCI driver assumes the controller's PAGESIZE is 4 KiB
+
+`init` reads OP_PAGESIZE and logs it (`xHCI: max_slots=… pagesize=0x1`) and
+nothing reads it again. Every structure the driver places — rings, contexts,
+scratchpad buffers — is sized and aligned to a hardcoded 4 KiB. Bit 0 of that
+register is what says 4 KiB, and every shipping xHC sets exactly that bit; a
+controller that reported 8 KiB or 64 KiB would get scratchpad buffers smaller
+than it writes into, which is memory corruption with no diagnostic. The log
+line is there so the T14 says which it is on its first boot.
 
 ### The xHCI driver resets the controller without taking ownership from firmware
 

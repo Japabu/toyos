@@ -2,8 +2,9 @@ use core::mem::size_of;
 use core::ptr::{read_volatile, write_volatile, write_bytes};
 
 use crate::log;
-use super::{Mmio, Trb, TrbRing, XhciController, dma, RING_SIZE};
-use super::{OFF_DCBAA, OFF_INPUT_CTX, OFF_EP0_RING, OFF_DATA_BUF, OFF_OUT_CTX1, OFF_OUT_CTX2, OFF_OUT_CTX3, OFF_KB_INT_RING, OFF_MOUSE_INT_RING};
+use super::{Mmio, Trb, TrbRing, XhciController, dma, PAGE, RING_SIZE};
+use super::{OFF_DCBAA, OFF_INPUT_CTX, OFF_EP0_RING, OFF_DATA_BUF};
+use super::{DEV_INT_RING, DEV_OUT_CTX, DEV_REPORT};
 use super::{TRB_ENABLE_SLOT, TRB_ADDRESS_DEVICE, TRB_CONFIGURE_EP, TRB_LINK};
 use super::{OP_PORT_BASE, PORT_REG_SIZE, PORTSC_CCS, PORTSC_PED, PORTSC_PR, PORTSC_PRC, PORTSC_RW1C};
 use super::hid::{HidType, HidDevice};
@@ -80,16 +81,6 @@ fn max_packet_for_speed(speed: u8) -> u16 {
         3 => 64,   // High Speed
         4 => 512,  // Super Speed
         _ => 8,
-    }
-}
-
-/// Map slot_id (1-based) to DMA offset for output context.
-fn output_ctx_offset(slot_id: u8) -> usize {
-    match slot_id {
-        1 => OFF_OUT_CTX1,
-        2 => OFF_OUT_CTX2,
-        3 => OFF_OUT_CTX3,
-        _ => panic!("xHCI: too many USB slots (max 3)"),
     }
 }
 
@@ -196,13 +187,22 @@ pub fn init_device(ctrl: &mut XhciController, op_base: &Mmio, port_idx: u8) {
         return;
     }
     let slot_id = slot_id as u8;
+    // A slot id is the controller's answer, not the driver's, and CONFIG's
+    // MaxSlotsEn is only advisory to a controller that chooses to ignore it —
+    // QEMU's does. Costing this device its slot is the whole penalty; there is
+    // no state to unwind, because none has been written for it yet.
+    let Some(block) = ctrl.layout.device(slot_id) else {
+        log!("xHCI: slot {} is beyond the pool's {} device blocks, dropping port {}",
+            slot_id, ctrl.layout.dev_blocks, port_idx + 1);
+        return;
+    };
     ctrl.active_slot = slot_id;
-    log!("xHCI: slot {} enabled", slot_id);
+    log!("xHCI: slot {} enabled (dma +{:#x})", slot_id, block);
 
     ctrl.reset_ep0_ring();
 
     let dma = dma();
-    let input_ctx = dma.subslice(OFF_INPUT_CTX, 0x1000);
+    let input_ctx = dma.subslice(OFF_INPUT_CTX, PAGE);
     let input_ctx_ptr = input_ctx.base();
     let input_ctx_phys = input_ctx.phys();
     unsafe { input_ctx.zero(); }
@@ -220,7 +220,7 @@ pub fn init_device(ctrl: &mut XhciController, op_base: &Mmio, port_idx: u8) {
     ctrl.write_ctx32(input_ctx_ptr, 2, 3, (ep0_dequeue >> 32) as u32);
     ctrl.write_ctx32(input_ctx_ptr, 2, 4, 8);
 
-    let out_ctx = dma.subslice(output_ctx_offset(slot_id), 0x1000);
+    let out_ctx = dma.subslice(block + DEV_OUT_CTX, PAGE / 2);
     unsafe { out_ctx.zero(); }
     unsafe {
         let dcbaa = dma.ptr_at(OFF_DCBAA) as *mut u64;
@@ -238,7 +238,11 @@ pub fn init_device(ctrl: &mut XhciController, op_base: &Mmio, port_idx: u8) {
     }
     log!("xHCI: device addressed");
 
-    let data_buf = dma.subslice(OFF_DATA_BUF, 0x1000);
+    // Descriptor scratch, and shared for the same reason the input context and
+    // the EP0 ring are: it is dead the moment this function returns. The
+    // report buffer below is the one that is not, so it lives in the device's
+    // own block.
+    let data_buf = dma.subslice(OFF_DATA_BUF, PAGE);
     let data_buf_ptr = data_buf.base();
     let data_buf_phys = data_buf.phys();
     unsafe { write_bytes(data_buf_ptr, 0, 256); }
@@ -294,21 +298,18 @@ pub fn init_device(ctrl: &mut XhciController, op_base: &Mmio, port_idx: u8) {
         }
     }
 
-    let (int_ring_off, report_buf_offset): (usize, usize) = match info.protocol {
-        HidType::Keyboard => (OFF_KB_INT_RING, 512),
-        HidType::Mouse | HidType::Tablet => (OFF_MOUSE_INT_RING, 1024),
-    };
-    let report_phys = data_buf.phys() + report_buf_offset as u64;
-    let report_ptr = data_buf.ptr_at(report_buf_offset);
+    let report = dma.subslice(block + DEV_REPORT, 8);
+    let report_phys = report.phys();
+    let report_ptr = report.base();
 
-    let int_ring = dma.subslice(int_ring_off, 0x1000);
+    let int_ring = dma.subslice(block + DEV_INT_RING, PAGE);
     unsafe { int_ring.zero(); }
     let mut int_link = Trb::ZERO;
     int_link.param = int_ring.phys();
     int_link.control = TRB_LINK | (1 << 1);
     unsafe { write_volatile((int_ring.base() as *mut Trb).add(RING_SIZE - 1), int_link); }
 
-    let input_ctx = dma.subslice(OFF_INPUT_CTX, 0x1000);
+    let input_ctx = dma.subslice(OFF_INPUT_CTX, PAGE);
     let input_ctx_ptr = input_ctx.base();
     let input_ctx_phys = input_ctx.phys();
     unsafe { input_ctx.zero(); }
@@ -367,11 +368,16 @@ pub fn init_device(ctrl: &mut XhciController, op_base: &Mmio, port_idx: u8) {
     };
 
     dev.requeue(&ctrl.db_base);
-    log!("xHCI: USB {} ready", kind);
+    // The ring offset is in the line because two devices of one class landing
+    // on one ring is invisible from every other angle: both still enumerate,
+    // both still bind, and both still deliver until their TRBs interleave.
+    log!("xHCI: USB {} ready on slot {}, int_ring +{:#x}", kind, slot_id, block + DEV_INT_RING);
     ctrl.devices.push(dev);
 }
 
 /// Scan all ports on the controller and initialize connected HID devices.
+/// Enumeration is serial by construction, which is what lets the input
+/// context, the EP0 ring and the descriptor buffer be one each.
 pub fn scan_ports(ctrl: &mut XhciController, op_base: &Mmio, max_ports: u8) {
     for p in 0..max_ports {
         let portsc = op_base.read_u32(OP_PORT_BASE + p as u64 * PORT_REG_SIZE);

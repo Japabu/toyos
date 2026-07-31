@@ -25,6 +25,11 @@ i8042-fault = []
 # handler per device class, so two keyboards or two pointers can never both be
 # live in a guest — the merge has no end-to-end test and this is its only one.
 test-input-merge = []
+# Clamp the xHCI driver to one device block, so a test can drive the path
+# where the controller hands back a slot the DMA pool has no room for. QEMU's
+# `nec-usb-xhci,slots=N` does not reach HCSPARAMS1 and its Enable Slot ignores
+# the MaxSlotsEn a driver writes, so nothing on the host side can stage it.
+xhci-one-slot = []
 # Panic once the boot phases are done, with no thread current, so a test can
 # drive the ordinary fatal panic — the one path where the report reaches the
 # screen only because the panic handler captured it before draining the ring.

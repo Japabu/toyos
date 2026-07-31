@@ -24,7 +24,7 @@ Boundary per device class, and what exists today:
 | Input | QMP key/mouse injection | built (M2) |
 | Network | `filter-dump` pcap + harness-as-peer | planned (gate N) |
 | Storage | inspect the disk image host-side after shutdown | **nothing** |
-| xHCI | QMP `device_add` / `device_del` | **nothing** |
+| xHCI | boot-time device set, then QMP `device_add` / `device_del` | shape built (`MetalUsb`), lifecycle **nothing** |
 
 ## Priority: device *shape and lifecycle* before *protocol depth*
 
@@ -33,7 +33,8 @@ exist**, not from asserting harder against one configuration:
 
 - the boot-fatal xHCI panic — from removing HID (M1)
 - USB hotplug silently broken — from adding a device after boot
-- the 3-slot panic that will kill the first T14 boot — from having four devices
+- the 3-slot panic that would have killed the first T14 boot, and the interrupt
+  ring two keyboards shared — both from having six devices (`MetalUsb`)
 - three daemons panicking — from removing audio and the NIC (M1)
 - the audio dropout — from load
 
@@ -42,6 +43,16 @@ not new instruments. Five configs beyond metal-sim — no-USB-HID,
 four-USB-devices, no-NVMe, hotplug-after-boot, remove-under-load — cost roughly
 3–5 s per boot, so about 25 s on a suite that runs in 70. That buys the class of
 bug that has produced every metal-track blocker so far.
+
+The crowded-USB config is built: `Profile::MetalUsb` is metal-sim with six
+devices on the xHCI, two of them keyboards, and it cost two boots and no new
+instrument. It also fixed the shape of the assertion — the driver logs the DMA
+offset of each device's interrupt ring, so "these two devices are independent"
+is a text assertion rather than a hope. One caveat it recorded: a *shortage*
+scenario is not always host-stageable. QEMU's `nec-usb-xhci,slots=N` does not
+reach HCSPARAMS1 and its Enable Slot ignores the MaxSlotsEn the driver writes,
+so the exhaustion path needs a kernel feature (`xhci-one-slot`) as its
+actuator. Check that the actuator exists before promising the config.
 
 Protocol depth comes second, and only where the device is load-bearing: storage
 (data loss is unrecoverable) and network (gate N).
