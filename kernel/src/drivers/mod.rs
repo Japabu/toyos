@@ -1,6 +1,7 @@
 pub mod log_ring;
 pub mod serial;
 pub mod acpi;
+pub mod i8042;
 pub mod ioapic;
 pub mod pci;
 pub mod nvme;

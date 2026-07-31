@@ -347,6 +347,33 @@ fixes it.
 while it holds the XHCI lock via the `fd.rs` keyboard/mouse read poll. A
 `try_lock` in the timer path removes it.
 
+### A keyboard that resets behind our back is undetectable on the PS/2 wire
+
+The i8042 driver runs the keyboard in set 2 with the controller translating to
+set 1, which is Linux's default and the best-trodden EC path. The cost is that
+`0xAA` — the keyboard's BAT-complete byte after a self-reset — is bit-identical
+to left Shift's break code (`0x2A | 0x80`). `toyos-ps2` therefore does *not*
+treat it as a reset; only `0x00`/`0xFF`, the overrun and detection-error codes,
+report `Lost` and trigger `keyboard::release_all()`.
+
+Consequence on the T14, where the EC does reset the keyboard after suspend or a
+lid event: the reset is not noticed. It is survivable rather than silent
+breakage — the keyboard comes back in set 2 with controller translation still
+on, so the wire format is unchanged, and the `0xAA` it sends decodes as a Shift
+*release*, which is accidentally the right direction for the one state that
+could stick. Untested on real hardware. If it does bite, the fix is a
+controller-side reconnect probe (`0xF2` identify on a timer), not a wire
+heuristic, because no wire heuristic exists.
+
+### The `toyos` SDK's keyboard doc describes a defect that is fixed
+
+`Keyboard::read_nonblock` and `Mouse::read_nonblock` (`toyos/src/device.rs`)
+carry doc comments saying poll readiness "can be spurious ... the kernel wakes
+keyboard watchers on every HID report". It no longer does: `handle_report`
+returns an event count and both the xHCI and i8042 paths wake only on a
+non-zero one. The advice to read non-blocking is still good, the reason given
+is stale. Left alone deliberately — M2 was scoped to zero SDK changes.
+
 ### `sys_read` blocks on an empty Keyboard fd and returns `NotFound` on an empty Mouse fd
 
 Two fds of the same shape, two different answers to the same question. Pick one.
@@ -405,6 +432,30 @@ Serial writes of a whole line should be atomic.
 Related class: a "guest hang" that only ever appears on the audio tests is more
 likely to be the shared console than the scheduler. See
 `specs/audio-gate-history.md`.
+
+### On an idle machine the log ring flushes one line behind
+
+Measured while building M2's i8042 tests. With no userland process doing
+anything, a `log!` line reaches the console only when the *next* piece of work
+wakes a CPU — so the most recent line is always still in the ring. Injecting
+keystrokes 200 ms apart into an otherwise idle guest and watching serial:
+
+```
+0.144  i8042: drain bytes=2 keys=2 woke_kb=1     <- key 'a'
+0.347  i8042: drain bytes=6 keys=0 woke_kb=0     <- Pause
+0.551  i8042: drain bytes=2 keys=2 woke_kb=1     <- key 'b'
+0.754  i8042: drain bytes=2 keys=2 woke_kb=1     <- key 'c'
+                                                 <- key 'd' never appeared
+```
+
+`drain_chunk_to_serial` runs from the idle loop and the timer path, and an idle
+CPU that has just finished its work does not come back for the line it queued
+on the way out. The consequence for anyone reading serial: **the last line
+before a quiet period is not evidence of anything**, and a guest that wedges
+right after logging its final line looks like it never logged it. Every
+existing test happens to keep the guest busy, which is why this has not bitten
+before; `i8042_no_spurious_wake` drives an in-guest reader for exactly this
+reason. Fix is a flush on the transition into idle, not another poll.
 
 ### One unreproduced observation
 

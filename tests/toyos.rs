@@ -18,7 +18,7 @@ struct TestDef {
 }
 
 // Rust helper binaries that are spawned by tests, not tests themselves.
-const RUST_SKIP: &[&str] = &["segfault_child", "test_panic_child"];
+const RUST_SKIP: &[&str] = &["segfault_child", "test_panic_child", "i8042_keyboard"];
 
 // Audio glitch tests. Each runs in its own QEMU boot per SMP config and
 // asserts on the wav the virtio-sound device captured, so they are excluded
@@ -56,6 +56,8 @@ const SCREEN_TESTS: &[&str] = &[
 const INPUT_TESTS: &[&str] = &[
     "ioapic_topology",
     "input_merge",
+    "i8042_keyboard",
+    "i8042_no_spurious_wake",
 ];
 
 /// The renderer's two text colours, as the screendump reports them.
@@ -1376,8 +1378,239 @@ fn run_input_test(
             }
             Ok(())
         }
+        "i8042_keyboard" => {
+            let mut qemu = QemuInstance::boot_with_options(
+                test_config,
+                c_bins,
+                rust_bins,
+                BootOptions {
+                    usb_hid: false,
+                    qmp: true,
+                    kernel_features: &["i8042-trace"],
+                    ..Default::default()
+                },
+            );
+            // Without this the test can pass for the wrong reason, which is
+            // the single most likely way an exercise like this fools itself:
+            // QEMU routes injected keys to one handler per class, and with a
+            // usb-kbd present that handler is not the PS/2 one.
+            let argv = qemu::profile_argv(&BootOptions {
+                usb_hid: false,
+                ..Default::default()
+            });
+            if let Some(bad) = argv.iter().find(|a| a.contains("usb-kbd")) {
+                return Err(format!("the i8042 test still has a USB keyboard: {bad}"));
+            }
+            let boot = qemu.boot_log().to_string();
+            if !boot.contains("i8042: kbd set2+xlat (readback 0x41)") {
+                return Err(format!("the PS/2 keyboard never came up:\n{boot}"));
+            }
+
+            let result = qemu.run_test_hooked(
+                "test_rs_i8042_keyboard",
+                Duration::from_secs(20),
+                "===I8042_READY===",
+                |socket| {
+                    for key in ["h", "e", "l", "l", "o"] {
+                        qemu::qmp_send_keys(socket, &[(key, true), (key, false)]);
+                        thread::sleep(Duration::from_millis(20));
+                    }
+                    qemu::qmp_send_keys(
+                        socket,
+                        &[("shift", true), ("b", true), ("b", false), ("shift", false)],
+                    );
+                    thread::sleep(Duration::from_millis(20));
+                    for key in ["left", "esc"] {
+                        qemu::qmp_send_keys(socket, &[(key, true), (key, false)]);
+                        thread::sleep(Duration::from_millis(20));
+                    }
+                    // A modifier on its own, so a stuck one is visible.
+                    qemu::qmp_send_keys(socket, &[("shift", true)]);
+                    thread::sleep(Duration::from_millis(20));
+                    qemu::qmp_send_keys(socket, &[("shift", false)]);
+                },
+            );
+            if let Some(err) = &result.error {
+                return Err(format!("{err}\n{}", result.stdout));
+            }
+
+            let events = parse_key_events(&result.stdout);
+            if events.is_empty() {
+                return Err(format!("no key event reached userland:\n{}", result.stdout));
+            }
+            // Presses spell the injected text: IRQ delivery, set-1 decode,
+            // the HID mapping, the shared translate/layout path, and arrival
+            // in a userland process, in one assertion.
+            let typed: String = events
+                .iter()
+                .filter(|e| e.modifiers & 0x10 == 0)
+                .map(|e| e.translated.as_str())
+                .collect();
+            if !typed.contains("hello") {
+                return Err(format!("typed {typed:?}, want it to contain \"hello\""));
+            }
+            if !typed.contains('B') {
+                return Err(format!("typed {typed:?} — Shift+b did not produce a capital"));
+            }
+            if !typed.contains("\u{1b}[D") {
+                return Err(format!("typed {typed:?} — Left arrow produced no escape sequence"));
+            }
+            for want in [0x29u8, 0x50, 0xE1] {
+                if !events.iter().any(|e| e.usage == want) {
+                    return Err(format!("no event for HID usage {want:#04x} in {events:?}"));
+                }
+            }
+            // Every press is matched by a release.
+            for usage in [0x0Bu8, 0x08, 0x0F, 0x12, 0x05, 0x29, 0x50, 0xE1] {
+                let presses = events.iter().filter(|e| e.usage == usage && e.modifiers & 0x10 == 0).count();
+                let releases = events.iter().filter(|e| e.usage == usage && e.modifiers & 0x10 != 0).count();
+                if presses == 0 || presses != releases {
+                    return Err(format!(
+                        "usage {usage:#04x}: {presses} presses, {releases} releases"
+                    ));
+                }
+            }
+            // Nothing is left held: the bare Shift came back up.
+            let last = events.last().unwrap();
+            if last.modifiers & !0x10 != 0 {
+                return Err(format!("a modifier is stuck down: last event {last:?}"));
+            }
+            // And they came from the i8042, not from somewhere else.
+            let drained: usize = qemu
+                .boot_log()
+                .lines()
+                .chain(result.serial.lines())
+                .filter_map(trace_keys)
+                .filter(|&k| k > 0)
+                .sum();
+            if drained == 0 {
+                return Err("no i8042 drain reported a key event".to_string());
+            }
+            eprintln!("  [i8042] {} events to userland, {drained} from the driver", events.len());
+            Ok(())
+        }
+        "i8042_no_spurious_wake" => {
+            // The direct regression for the readiness defect: a stimulus that
+            // produces bytes and no events must produce no wake. Pause is
+            // that stimulus — six bytes, deliberately swallowed.
+            //
+            // It drives the same in-guest reader as `i8042_keyboard`, and not
+            // only for the userland half of the assertion: on a fully idle
+            // machine the kernel's log ring flushes one line behind, so the
+            // last trace line would never reach the console (filed in
+            // known-issues). A guest polling its fd keeps the ring moving.
+            let mut qemu = QemuInstance::boot_with_options(
+                test_config,
+                c_bins,
+                rust_bins,
+                BootOptions {
+                    usb_hid: false,
+                    qmp: true,
+                    kernel_features: &["i8042-trace"],
+                    ..Default::default()
+                },
+            );
+            let result = qemu.run_test_hooked(
+                "test_rs_i8042_keyboard",
+                Duration::from_secs(20),
+                "===I8042_READY===",
+                |socket| {
+                    for _ in 0..2 {
+                        qemu::qmp_send_keys(socket, &[("pause", true), ("pause", false)]);
+                        thread::sleep(Duration::from_millis(50));
+                        qemu::qmp_send_keys(socket, &[("a", true), ("a", false)]);
+                        thread::sleep(Duration::from_millis(50));
+                    }
+                },
+            );
+            if let Some(err) = &result.error {
+                return Err(format!("{err}\n{}", result.stdout));
+            }
+
+            let mut zero_event_drains = 0;
+            let mut key_drains = 0;
+            for line in result.serial.lines() {
+                let Some(keys) = trace_keys(line) else { continue };
+                let woke = line.contains("woke_kb=1");
+                if keys == 0 {
+                    zero_event_drains += 1;
+                    if woke {
+                        return Err(format!("a drain with no events woke the queue: {line}"));
+                    }
+                } else {
+                    key_drains += 1;
+                    if !woke {
+                        return Err(format!("a drain with events did not wake the queue: {line}"));
+                    }
+                }
+            }
+            if zero_event_drains == 0 {
+                return Err(format!(
+                    "no drain produced zero events — the stimulus never landed:\n{}",
+                    result.serial
+                ));
+            }
+            if key_drains == 0 {
+                return Err(format!("no drain produced any event:\n{}", result.serial));
+            }
+            // And the swallowed bytes stayed swallowed all the way out.
+            let events = parse_key_events(&result.stdout);
+            if events.iter().any(|e| e.usage == 0x48) {
+                return Err(format!("Pause reached userland as a key: {events:?}"));
+            }
+            if !events.iter().any(|e| e.usage == 0x04) {
+                return Err(format!("the real key never arrived: {events:?}"));
+            }
+            eprintln!(
+                "  [i8042] {zero_event_drains} zero-event drains, none woke; {key_drains} real ones, all did"
+            );
+            Ok(())
+        }
         other => Err(format!("unknown input test {other}")),
     }
+}
+
+#[derive(Debug)]
+struct KeyLine {
+    usage: u8,
+    modifiers: u8,
+    translated: String,
+}
+
+/// `kev usage=0x04 mods=0x00 tr="a"` — what the in-guest reader prints.
+fn parse_key_events(stdout: &str) -> Vec<KeyLine> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let rest = line.split("kev usage=0x").nth(1)?;
+            let (usage, rest) = rest.split_once(" mods=0x")?;
+            let (modifiers, rest) = rest.split_once(" tr=")?;
+            let translated = rest.trim().trim_matches('"');
+            Some(KeyLine {
+                usage: u8::from_str_radix(usage, 16).ok()?,
+                modifiers: u8::from_str_radix(modifiers, 16).ok()?,
+                translated: unescape(translated),
+            })
+        })
+        .collect()
+}
+
+/// The guest prints through `{:?}`, so an escape sequence arrives as the
+/// four characters `\u{1b}` rather than the byte.
+fn unescape(s: &str) -> String {
+    s.replace("\\u{1b}", "\u{1b}").replace("\\\"", "\"").replace("\\\\", "\\")
+}
+
+/// The `keys=` field of an `i8042: drain ...` trace line.
+fn trace_keys(line: &str) -> Option<usize> {
+    line.split("i8042: drain ")
+        .nth(1)?
+        .split("keys=")
+        .nth(1)?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
 }
 
 fn build_test_registry(

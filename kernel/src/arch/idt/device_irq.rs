@@ -1,11 +1,12 @@
-//! Shared MSI-X interrupt entry.
+//! Shared device interrupt entry.
 //!
-//! Every MSI-X device vector (xHCI, virtio-net, virtio-sound) has the same
-//! obligations, so one asm shape serves all three: save the SysV scratch
-//! GPRs + rbp (the Rust handler can clobber them — leaving any unsaved would
-//! leak kernel state into user regs on iretq), bracket the handler with the
-//! percpu preempt count, and on return to Ring 3 run the deferred-preempt
-//! epilogue.
+//! Every device vector (xHCI, virtio-net, virtio-sound over MSI-X; the i8042
+//! on an I/O APIC pin) has the same obligations, so one asm shape serves all
+//! of them: save the SysV scratch GPRs + rbp (the Rust handler can clobber
+//! them — leaving any unsaved would leak kernel state into user regs on
+//! iretq), bracket the handler with the percpu preempt count, and on return
+//! to Ring 3 run the deferred-preempt epilogue. How the vector was delivered
+//! makes no difference to any of that.
 //!
 //! Every handler publishes an `irq_ring` record and sets `need_resched`, so
 //! the Ring 3 epilogue may context-switch — it therefore parks the user's
@@ -17,9 +18,9 @@
 //! `kernel_exit_to_user_check`'s IF=0-on-entry contract holds without an
 //! explicit cli.
 
-/// Define a naked MSI-X entry point that calls `$handler` and runs the
-/// deferred-preempt epilogue on the Ring 3 return path.
-macro_rules! msix_entry {
+/// Define a naked device-interrupt entry point that calls `$handler` and runs
+/// the deferred-preempt epilogue on the Ring 3 return path.
+macro_rules! device_irq_entry {
     ($(#[$meta:meta])* $vis:vis fn $name:ident => $handler:path) => {
         $(#[$meta])*
         #[unsafe(naked)]
@@ -106,4 +107,4 @@ macro_rules! msix_entry {
     };
 }
 
-pub(crate) use msix_entry;
+pub(crate) use device_irq_entry;

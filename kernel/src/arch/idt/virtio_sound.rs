@@ -1,4 +1,4 @@
-use super::msix::msix_entry;
+use super::device_irq::device_irq_entry;
 use crate::irq_ring::IrqSource;
 
 /// Rust half of the MSI-X handler. Lock-free and heap-free: it may interrupt
@@ -17,7 +17,7 @@ extern "sysv64" fn virtio_sound_handler() {
     crate::arch::apic::eoi();
 }
 
-msix_entry! {
-    /// Virtio-sound MSI-X entry (see `msix_entry` for the asm contract).
+device_irq_entry! {
+    /// Virtio-sound MSI-X entry (see `device_irq_entry` for the asm contract).
     pub(super) fn virtio_sound_entry => virtio_sound_handler
 }

@@ -50,6 +50,15 @@ pub struct BootOptions {
     /// because screen tests boot their own QEMU and several may exist at once.
     pub qmp: bool,
     pub kernel_features: &'static [&'static str],
+    /// Give the guest a USB keyboard. False is what makes an i8042 test
+    /// measure anything: QEMU activates one input handler per device class,
+    /// so with `usb-kbd` present every injected keystroke goes to it and a
+    /// PS/2 test passes for the wrong reason. Ignored under
+    /// [`Profile::Metal`], which never had one.
+    pub usb_hid: bool,
+    /// Give the machine an i8042 at all. `-machine q35,i8042=off` is the one
+    /// absence scenario QEMU can stage.
+    pub i8042: bool,
     /// The console line that means the boot reached the state under test.
     /// Anything other than [`DEFAULT_READY`] also declares that a panic is the
     /// expected outcome rather than a boot failure -- the early-panic screen
@@ -70,6 +79,8 @@ impl Default for BootOptions {
             profile: Profile::Headless,
             qmp: false,
             kernel_features: &[],
+            usb_hid: true,
+            i8042: true,
             ready_marker: DEFAULT_READY,
         }
     }
@@ -333,9 +344,40 @@ impl QemuInstance {
         }
     }
 
+    /// The QMP socket this instance opened. Injection needs it, and it needs
+    /// `BootOptions { qmp: true }`.
+    pub fn qmp_socket(&self) -> &Path {
+        self.qmp_socket.as_ref().expect("qmp_socket needs BootOptions { qmp: true }")
+    }
+
     pub fn run_test(&mut self, name: &str, timeout: Duration) -> TestResult {
+        self.run_test_hooked(name, timeout, "", |_| {})
+    }
+
+    /// `run_test`, with `action` run once the guest prints `ready_line`.
+    ///
+    /// The hook is inside the read loop because that is the only place the
+    /// two facts meet: the guest is holding the keyboard fd, and the host has
+    /// not injected yet. A sleep would be a guess in both directions.
+    pub fn run_test_hooked(
+        &mut self,
+        name: &str,
+        timeout: Duration,
+        ready_line: &str,
+        action: impl FnOnce(&Path),
+    ) -> TestResult {
         writeln!(self.stdin, "run {name}").expect("Failed to write to QEMU stdin");
         self.stdin.flush().expect("Failed to flush QEMU stdin");
+
+        let mut action = Some(action);
+        let mut fire = |line: &str, socket: Option<&PathBuf>| {
+            if ready_line.is_empty() || !line.contains(ready_line) {
+                return;
+            }
+            if let Some(action) = action.take() {
+                action(socket.expect("run_test_hooked needs BootOptions { qmp: true }"));
+            }
+        };
 
         let start = Instant::now();
         let mut stdout = String::new();
@@ -355,6 +397,7 @@ impl QemuInstance {
 
             match self.rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(line) => {
+                    fire(&line, self.qmp_socket.as_ref());
                     if line.contains("===TEST_START ") {
                         in_test = true;
                     } else if let Some(at) = line.find(END_MARKER) {
@@ -440,56 +483,120 @@ impl Drop for QemuInstance {
     }
 }
 
-/// Drive one `screendump` over a QMP unix socket. QMP is a line-delimited
-/// JSON protocol: greeting, `qmp_capabilities`, then the command; the reply
-/// carrying `return` is the completion signal. Two commands and three fixed
-/// keys do not justify a JSON dependency.
-fn qmp_screendump(socket: &Path, out: &Path) {
-    use std::io::Read;
-    use std::os::unix::net::UnixStream;
+/// A QMP session. Line-delimited JSON: greeting, `qmp_capabilities`, then
+/// commands; the reply carrying `return` is the completion signal. A handful
+/// of commands with fixed shapes does not justify a JSON dependency.
+struct Qmp {
+    stream: std::os::unix::net::UnixStream,
+    pending: Vec<u8>,
+}
 
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let mut stream = loop {
-        match UnixStream::connect(socket) {
-            Ok(s) => break s,
-            Err(e) => {
-                assert!(Instant::now() < deadline, "qmp: cannot connect to {}: {e}", socket.display());
-                thread::sleep(Duration::from_millis(50));
+impl Qmp {
+    fn connect(socket: &Path) -> Self {
+        use std::os::unix::net::UnixStream;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let stream = loop {
+            match UnixStream::connect(socket) {
+                Ok(s) => break s,
+                Err(e) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "qmp: cannot connect to {}: {e}",
+                        socket.display()
+                    );
+                    thread::sleep(Duration::from_millis(50));
+                }
             }
-        }
-    };
-    stream.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+        };
+        stream.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+        let mut qmp = Self { stream, pending: Vec::new() };
+        qmp.await_reply("\"QMP\"");
+        qmp.execute("{\"execute\":\"qmp_capabilities\"}");
+        qmp
+    }
 
-    let mut pending = Vec::new();
-    let read_reply = |stream: &mut UnixStream, pending: &mut Vec<u8>, want: &str| {
+    fn await_reply(&mut self, want: &str) {
+        use std::io::Read;
         let start = Instant::now();
         loop {
-            if let Some(pos) = pending.windows(want.len()).position(|w| w == want.as_bytes()) {
-                pending.drain(..pos + want.len());
+            if let Some(pos) =
+                self.pending.windows(want.len()).position(|w| w == want.as_bytes())
+            {
+                self.pending.drain(..pos + want.len());
                 return;
             }
             assert!(
                 start.elapsed() < Duration::from_secs(20),
                 "qmp: no {want} in reply: {}",
-                String::from_utf8_lossy(pending)
+                String::from_utf8_lossy(&self.pending)
             );
             let mut buf = [0u8; 4096];
-            let n = stream.read(&mut buf).expect("qmp: read failed");
+            let n = self.stream.read(&mut buf).expect("qmp: read failed");
             assert!(n > 0, "qmp: socket closed waiting for {want}");
-            pending.extend_from_slice(&buf[..n]);
+            self.pending.extend_from_slice(&buf[..n]);
         }
-    };
+    }
 
-    read_reply(&mut stream, &mut pending, "\"QMP\"");
-    stream.write_all(b"{\"execute\":\"qmp_capabilities\"}\n").unwrap();
-    read_reply(&mut stream, &mut pending, "\"return\"");
-    writeln!(
-        stream,
+    fn execute(&mut self, command: &str) {
+        self.stream.write_all(command.as_bytes()).unwrap();
+        self.stream.write_all(b"\n").unwrap();
+        self.await_reply("\"return\"");
+    }
+}
+
+fn qmp_screendump(socket: &Path, out: &Path) {
+    let mut qmp = Qmp::connect(socket);
+    qmp.execute(&format!(
         "{{\"execute\":\"screendump\",\"arguments\":{{\"filename\":\"{}\"}}}}",
         out.display()
-    )
-    .unwrap();
-    read_reply(&mut stream, &mut pending, "\"return\"");
+    ));
+}
+
+/// One `input-send-event` carrying every key transition in `events`, given as
+/// `(qcode, down)`. Sending them as one command is what makes a chord like
+/// Shift+B arrive as a chord rather than as a race.
+pub fn qmp_send_keys(socket: &Path, events: &[(&str, bool)]) {
+    let body: Vec<String> = events
+        .iter()
+        .map(|(qcode, down)| {
+            format!(
+                "{{\"type\":\"key\",\"data\":{{\"down\":{down},\"key\":{{\"type\":\"qcode\",\"data\":\"{qcode}\"}}}}}}"
+            )
+        })
+        .collect();
+    let mut qmp = Qmp::connect(socket);
+    qmp.execute(&format!(
+        "{{\"execute\":\"input-send-event\",\"arguments\":{{\"events\":[{}]}}}}",
+        body.join(",")
+    ));
+}
+
+/// Relative pointer motion and/or a button transition, as one event batch.
+pub fn qmp_send_mouse(socket: &Path, dx: i32, dy: i32, button: Option<(&str, bool)>) {
+    let mut body: Vec<String> = Vec::new();
+    if let Some((name, down)) = button {
+        body.push(format!(
+            "{{\"type\":\"btn\",\"data\":{{\"down\":{down},\"button\":\"{name}\"}}}}"
+        ));
+    }
+    if dx != 0 {
+        body.push(format!(
+            "{{\"type\":\"rel\",\"data\":{{\"axis\":\"x\",\"value\":{dx}}}}}"
+        ));
+    }
+    if dy != 0 {
+        body.push(format!(
+            "{{\"type\":\"rel\",\"data\":{{\"axis\":\"y\",\"value\":{dy}}}}}"
+        ));
+    }
+    if body.is_empty() {
+        return;
+    }
+    let mut qmp = Qmp::connect(socket);
+    qmp.execute(&format!(
+        "{{\"execute\":\"input-send-event\",\"arguments\":{{\"events\":[{}]}}}}",
+        body.join(",")
+    ));
 }
 
 /// The argv `options` would launch QEMU with, built against placeholder
@@ -523,7 +630,7 @@ fn qemu_command(
     }
 
     qemu.arg("-machine")
-        .arg("q35")
+        .arg(if options.i8042 { "q35" } else { "q35,i8042=off" })
         .arg("-cpu")
         .arg(if kvm { "host,+rdrand,+smap,+fsgsbase,+x2apic" } else { "qemu64,+rdrand,+smap,+fsgsbase,+x2apic" })
         .arg("-smp")
@@ -567,7 +674,7 @@ fn qemu_command(
 
     // The T14's keyboard is PS/2 and its touchpad I2C-HID; it has no USB HID
     // at all, so metal-sim must not have one either.
-    if options.profile.virtio() {
+    if options.profile.virtio() && options.usb_hid {
         qemu.arg("-device").arg("usb-kbd,bus=xhci.0");
     }
 

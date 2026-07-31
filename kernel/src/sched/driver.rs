@@ -507,6 +507,9 @@ fn drain_irqs() {
     // xHCI (keyboard/mouse): the controller poll dispatches HID reports, which
     // wake the keyboard/mouse queues from inside the driver.
     crate::drivers::xhci::poll_if_pending();
+    // The i8042's bytes are already in kernel memory when the IRQ returns;
+    // this turns them into events and wakes.
+    crate::drivers::i8042::service();
 
     if crate::irq_ring::take(crate::irq_ring::IrqSource::Net).is_some() {
         crate::net::wake_waiters();

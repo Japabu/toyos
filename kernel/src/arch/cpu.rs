@@ -114,6 +114,13 @@ pub fn enable_interrupts() {
     }
 }
 
+#[inline]
+pub fn disable_interrupts() {
+    unsafe {
+        asm!("cli", options(nomem, nostack));
+    }
+}
+
 /// Enable SSE/SSE2+ by setting CR4.OSFXSR and CR4.OSXMMEXCPT.
 /// Must be called on each CPU before any SSE instructions execute.
 pub fn enable_sse() {

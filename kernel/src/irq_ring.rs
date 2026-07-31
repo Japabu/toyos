@@ -37,10 +37,11 @@ pub enum IrqSource {
     Audio,
     Net,
     Xhci,
+    I8042,
 }
 
 impl IrqSource {
-    pub const COUNT: usize = 3;
+    pub const COUNT: usize = 4;
 }
 
 /// 64-byte aligned so two CPUs' slots never share a cache line — the array

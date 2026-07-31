@@ -1,5 +1,6 @@
 pub(crate) mod exceptions;
-mod msix;
+mod device_irq;
+mod i8042;
 mod timer;
 mod tlb;
 mod virtio_net;
@@ -31,6 +32,7 @@ enum Vector {
     Xhci = 0x21,
     VirtioNet = 0x22,
     VirtioSound = 0x23,
+    I8042 = 0x24,
     HaltAll = 0xFD,
     TlbFlush = 0xFE,
 }
@@ -47,6 +49,10 @@ impl Vector {
         }
     }
 }
+
+/// The vector both PS/2 lines are routed to. Public because the driver has to
+/// name it when it programs the I/O APIC.
+pub const I8042_VECTOR: u8 = Vector::I8042 as u8;
 
 // Page fault error code bits
 const PF_PRESENT: u64 = 1 << 0;
@@ -317,6 +323,7 @@ pub fn init() {
         idt.entries[Vector::Xhci as usize] = IdtEntry::new(xhci::xhci_entry as *const () as u64);
         idt.entries[Vector::VirtioNet as usize] = IdtEntry::new(virtio_net::virtio_net_entry as *const () as u64);
         idt.entries[Vector::VirtioSound as usize] = IdtEntry::new(virtio_sound::virtio_sound_entry as *const () as u64);
+        idt.entries[Vector::I8042 as usize] = IdtEntry::new(i8042::i8042_entry as *const () as u64);
         idt.entries[Vector::HaltAll as usize] = IdtEntry::new(stub_halt_all as *const () as u64);
         idt.entries[Vector::TlbFlush as usize] = IdtEntry::new(tlb::tlb_flush_entry as *const () as u64);
     }

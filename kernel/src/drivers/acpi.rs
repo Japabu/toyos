@@ -223,6 +223,20 @@ pub fn init_power(rsdp_addr: u64) {
     log!("ACPI: PM1a={:#x} SLP_TYPa={}", pm1a, slp_typ);
 }
 
+/// FADT revision and the IA-PC boot architecture flags.
+///
+/// Bit 1 of the flags is "8042 present". It is meaningful only at revision
+/// >= 2 — ACPI 1.0 has the field reserved-zero — so the revision comes back
+/// with it and the caller decides. On a machine with no 8042, ports
+/// 0x60/0x64 may be decoded by something else entirely, which is why this is
+/// asked before they are touched.
+pub fn iapc_boot_arch(rsdp_addr: u64) -> Option<(u8, u16)> {
+    let xsdt = get_xsdt(DirectMap::from_phys(rsdp_addr));
+    let fadt_phys = find_table(xsdt, b"FACP")?;
+    let fadt = unsafe { &*fadt_phys.as_ptr::<Fadt>() };
+    Some((fadt.header.revision, fadt.iapc_boot_arch))
+}
+
 /// Trigger ACPI S5 (soft-off) shutdown.
 pub fn shutdown() -> ! {
     let pm1a = PM1A_CNT_PORT.load(Ordering::Relaxed);

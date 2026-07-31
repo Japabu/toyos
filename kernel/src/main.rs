@@ -61,7 +61,7 @@ mod vma;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use arch::{apic, cpu, idt, percpu, smp, syscall};
-use drivers::{acpi, gop, ioapic, nvme, pci, serial, virtio_console, virtio_gpu, virtio_net, virtio_sound, xhci};
+use drivers::{acpi, gop, i8042, ioapic, nvme, pci, serial, virtio_console, virtio_gpu, virtio_net, virtio_sound, xhci};
 use toyos_abi::boot::{KernelArgs, MemoryMapEntry};
 
 /// Per-CPU panic-reentry depth, indexed by x2APIC id (masked). The panic path
@@ -337,6 +337,7 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
         Some(ctrl) => xhci::set_global(ctrl),
         None => log!("xHCI: no controller on this machine, USB input unavailable"),
     }
+    i8042::init(kernel_args.rsdp_addr);
     acpi::init_power(kernel_args.rsdp_addr);
 
     boot_phase!("peripherals ready", t_periph);
