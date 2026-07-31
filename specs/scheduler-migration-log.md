@@ -162,6 +162,13 @@ it (the ticket holds the registration window's level), `do_preempt` at zero.
 `wait_until` and `futex_wait` carry `#[track_caller]` only — they delegate, and
 the location propagates through.
 
+`do_preempt` shipped without the attribute and got it in the follow-up: the
+helper being `#[track_caller]` is not enough on its own, since the location then
+resolves to the call inside the entry. It is the entry with the most to gain —
+its three routes (Ring 3 timer stub, `kernel_exit_to_user_check`,
+`preempt::enable`'s slow path) are otherwise indistinguishable in the report,
+and an unbalanced `enable` is exactly the defect this stage made fatal.
+
 Two entries deliberately do not assert. Wake paths never switch, and waking from
 inside a lock is §8.1's protocol rather than a violation of it. `schedule_no_return`
 is the panic path, which may hold any lock by construction — measurement finds

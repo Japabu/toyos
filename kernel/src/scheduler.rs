@@ -48,16 +48,26 @@ fn assert_baseline(baseline: u32) {
     );
 }
 
-/// The depth a syscall or fault handler runs at: exactly one level, raised by
-/// the entry asm (`arch/syscall.rs`, `common_entry`) and lowered on the way
-/// out. Every voluntary scheduler entry is reached from such a handler.
+/// The depth an *unnested* trap handler runs at: one level, raised by the entry
+/// asm (`arch/syscall.rs`, `common_entry`) and lowered on the way out.
+///
+/// Each entry raises its own level, so a fault taken inside a syscall runs at
+/// two — routine, not hypothetical (a demand-paging fault on a user page the
+/// handler touches). No asserting entry is reachable from there today: every
+/// kernel-mode fault funnels to `schedule_no_return`, which deliberately does
+/// not assert. The first demand-paging path that parks instead of spinning, or
+/// any decision to kill a kernel-faulting process through `process::exit`,
+/// breaks that and trips this on a nested trap holding no lock at all. The
+/// check establishes `depth != baseline`; the message names the cause that
+/// motivates it, and a nested trap is the other way to get there.
 const BASELINE_TRAP: u32 = 1;
 
 /// The depth the deferred-preempt poll runs at. Zero, and not `BASELINE_TRAP`,
-/// because every route into it is *past* the entry level: the Ring 3 timer stub
-/// never raises one, `kernel_exit_to_user_check` runs after the `lock sub`, and
-/// `preempt::enable`'s slow path only calls in at zero. The idle loop is the
-/// same zero.
+/// because all three routes into it are *past* the entry level: the Ring 3
+/// timer stub (`arch/idt/timer.rs`) never raises one, `kernel_exit_to_user_check`
+/// (`arch/idt/mod.rs`) runs after the `lock sub`, and `preempt::enable`'s slow
+/// path only calls in at zero. The idle loop reaches it through the third —
+/// `reap_poisoned`'s `PROCESS_TABLE` guard drop — not as a route of its own.
 const BASELINE_IRQ_EXIT: u32 = 0;
 
 /// Process-scoped thread identity. Tids are per-process, so the scheduler
@@ -202,6 +212,7 @@ pub fn yield_now() {
 /// and the `preempt::enable` slow path all funnel through here. The pass
 /// itself decides whether the running thread keeps the CPU (quantum expiry or
 /// an RT task in the band); this only asks it to look.
+#[track_caller]
 pub fn do_preempt() {
     if in_schedule_self() {
         return;

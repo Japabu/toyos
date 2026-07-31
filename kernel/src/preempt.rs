@@ -2,8 +2,10 @@
 //!
 //! Two per-CPU words drive the model (defined in `arch::percpu::PerCpu`):
 //!   - `preempt_count` @ gs:[240] — incremented by every IRQ entry and by
-//!     `disable()`. `lock`-prefixed because both kernel code and IRQ entries
-//!     mutate it on the same CPU.
+//!     `disable()`. Read-modify-writes are `lock`-prefixed because both kernel
+//!     code and IRQ entries mutate it on the same CPU; `set_count`'s plain
+//!     store needs no prefix (a naturally aligned 32-bit store, and a same-CPU
+//!     IRQ cannot land inside one instruction).
 //!   - `need_resched` @ gs:[244] — set by the timer ISR (and future wake
 //!     paths), cleared by the deferred-preempt epilogue. Single-byte stores
 //!     are naturally atomic on x86 — no `lock` prefix needed.
@@ -124,4 +126,3 @@ pub fn enable() {
         crate::scheduler::do_preempt();
     }
 }
-

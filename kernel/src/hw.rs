@@ -124,10 +124,9 @@ impl Hw for KernelHw {
     ///
     /// The order is forced. `fs_base` and the preempt count are live per-CPU
     /// state, so the outgoing context has to capture them before anything is
-    /// reloaded; the percpu
-    /// identity, the TSS stack and CR3 must all be the incoming task's *before*
-    /// the stack pointer moves, because after `context_switch` this frame no
-    /// longer exists.
+    /// reloaded; the percpu identity, the TSS stack and CR3 must all be the
+    /// incoming task's *before* the stack pointer moves, because after
+    /// `context_switch` this frame no longer exists.
     unsafe fn switch(&self, token: RunToken<KernelPayload>) {
         let save = token.save_ptr();
         let restore = token.restore_ptr();
