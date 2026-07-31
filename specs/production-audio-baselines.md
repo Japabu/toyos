@@ -427,15 +427,17 @@ default documents.
 | CoreAudio | no started IOProc, no I/O cycle; **0 wakeups** |
 | Windows audio engine | not streaming; **normal execution mode**, no periodic fill |
 | PulseAudio, suspend disabled (worst production case) | 2 s buffer, **~0.5 wakeups/s**, silence |
-| **ToyOS soundd** | **~43 wakeups/s, ~7% of a core**, mixing and dithering silence |
+| **ToyOS soundd** (since the suspend-on-idle series, 2026-07-31) | device stopped, soundd parked timerless; **0 wakeups, 0% CPU**, measured flat to the millisecond over 5 s |
 
-**2x line = 0%. ToyOS fails categorically.** There is no ratio to compute: production
-is structurally zero, and any positive number is unboundedly over.
-
-The nearest thing to a fair comparison is against PulseAudio with suspend explicitly
-disabled - the worst production configuration anyone actually runs - and even there we
-are ~86x the wakeup rate and doing real per-sample work (mix, dither, quantize) on
-every one of them where PulseAudio writes a pre-filled buffer.
+**2x line = 0%. ToyOS now meets it exactly** — not within 2x of zero, *at* zero,
+the same structural zero production reaches (PCM stream stopped, daemon parked
+with no timer, woken only by a client connect). Boot starts suspended, so the
+zero also covers the machine-with-no-audio-client case that dominates wall
+clock. Certified per-run by `check_suspend_structure` on all four gate configs
+and by the `audio_idle_suspend` zero-CPU-delta test. History for the record:
+the "~43 wakeups/s / ~7%" figures above described the pre-Stage-7a tree; from
+7a until the series, idle soundd was accidentally at 0% CPU but with the voice
+open in permanent underrun — the state §4.4's design explicitly rejects.
 
 ### 4.4 The design fix, in ToyOS's terms
 
@@ -647,7 +649,7 @@ the power story, and we pay for the simplicity in metric 3.
 | 1b | Output latency, client->speaker | same | same | up to 46.4 ms (8 device + 8 client periods) | Fail vs the two tightest defaults | **Yes** |
 | 1c | Output latency, low-latency config | PipeWire 0.67 ms; WASAPI/JACK 2.67 ms; CoreAudio 0.73 ms | 1.3-5.3 ms | no such configuration exists | **Fail by absence** | **Yes** |
 | 2 | RT thread wake jitter, max | PREEMPT_RT 124 us (Pi 5, 1 h, heavy load); 27 us (tuned i7-6700K); 44 us (Xeon, I/O storm); field consensus <= 250 us | ~250 us | median 7.6-9.4 ms, max 56.9 ms | Nominally ~40x/~460x over | **NO** - different metric, TCG, unoptimized kernel |
-| 3 | Idle CPU, no clients | 0% and 0 wakeups (device suspended after 5 s: PulseAudio, PipeWire, CoreAudio, WASAPI) | 0% | ~7% of a core, ~43 wakes/s | **Fail categorically** | **Yes** - it is a yes/no |
+| 3 | Idle CPU, no clients | 0% and 0 wakeups (device suspended after 5 s: PulseAudio, PipeWire, CoreAudio, WASAPI) | 0% | 0% and 0 wakeups (device stopped, timerless park; gate-certified per run) | **Pass — meets the reference exactly** | **Yes** - it is a yes/no |
 | 4a | Same-core context switch | 1.2-1.5 us pinned, ~2.2 us unpinned (Haswell, direct cost) | 2.4-4.4 us | never measured | Unknown | **NO** - and not measurable on this host |
 | 4b | Cross-CPU wake (IPI -> running) | no primary source found; schbench 99.9th spans 14 us to 1.3 ms with load | n/a | never measured | Unknown | **NO** |
 

@@ -146,7 +146,7 @@ system.toml       What to build and boot
 
 ## Ideas
 
-- **io_uring as the only blocking I/O mechanism.** The kernel has two parallel notification paths: a wait queue on the object for direct thread blocking and `io_uring::complete_pending_for_event` for ring watchers, and every wake site does both. If all fd-based blocking went through io_uring, blocking syscalls become non-blocking try-once-and-return, wake sites become a single io_uring call, and the per-object wait queues for fd sources go away. Userspace helpers in `toyos` would wrap the ring setup.
+- **io_uring as the only blocking I/O mechanism.** The kernel has two parallel notification paths: a wait queue on the object for direct thread blocking and `io_uring::complete_pending_for_event` for ring watchers; wake sites must do both, and Stage 7a proved what happens when one half goes missing (the audio/NIC fan-outs, restored at aeeaa01/6a49424). If all fd-based blocking went through io_uring, blocking syscalls become non-blocking try-once-and-return, wake sites become a single io_uring call, and the per-object wait queues for fd sources go away. Userspace helpers in `toyos` would wrap the ring setup.
 - **Capability-based resource model.** Replace global Pid/Tid integers with per-process handles (like Zircon's `zx_handle_t`) that encode both identity and rights. Unifies fds, Pids and Tids into one mechanism, eliminates confused-deputy bugs, enables fine-grained delegation. The per-process fd table is already halfway there. Zircon and seL4 are the reference designs.
 
 ## Diagnostics roadmap
@@ -181,7 +181,6 @@ One line each. **`specs/known-issues.md` has the detail and is the file to updat
 - **A thread retired while parked leaks its wait-queue node.** A leak, not a correctness hole; the fix belongs with the intrusive `wait_node` the core still owes.
 - **`handle_retire`'s `need_resched` on a running target is a request the next pass may decline.** Conformant (§7.6 bounds it by the quantum), one atomic load from meaning what it says.
 - **soundd has six audit defects open**: hardcoded cpal format, per-client shm never freed, `virtio_sound` ignores the PCM caps it queries, correlated TPDF dither draws, non-unity passthrough gain, uninitialised padding in `AudioInfo::as_bytes`.
-- **soundd idles at ~7% of a core** mixing silence at pipeline rate. Harmless; revisit with the idle policy in audio spec §5.8.
 - **Gate A can still fail a run on `drains` alone**, with no gap and no underrun. A per-run failure should require evidence of harm.
 - **`ps`/`stats`/`dump_blocked` lost their cross-CPU view at Stage 7a.** The first two were rebuilt on published counters and are accurate; `dump_blocked` now prints only the calling CPU's parked map.
 - **CORRECTED: the "~half the CPU is unattributed kernel time" claim was wrong, and its sign was backwards.** One accumulator feeds both numerators, so unattributed time cannot open a gap between them — true busy *exceeds* 97%. The 45-vs-97 gap is reader-side: `ps` compares a lifetime average against the taskbar's one-second delta. `specs/cpu-attribution.md`.

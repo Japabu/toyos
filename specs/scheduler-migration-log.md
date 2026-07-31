@@ -70,13 +70,18 @@ timer-driven and idle wakes did not exist. `max_wake_lat_us` is sampled as
 `now − armed_on`, i.e. the distance from a *timer* prediction to a batched
 completion, which is what makes the recorded medians 2.6–3.2 device periods.
 With the fan-out restored, every completion IRQ posts a CQE and that term
-collapses. So the next thorough-tier A/B should be expected to move `wakes`
-and `max_wake_lat_us`, and the shift belongs to the fan-out restoration, not
-to whatever change is being gated. Both likely directions are the *unflagged*
-ones (`tests/toyos.rs` flags falling `wakes` and rising `max_wake_lat_us`), so
-a green tier is not evidence that nothing moved — read the printed
-distributions. Do not re-record the sample "to match the new normal" without
-saying which kernel it was taken on.
+collapses. Measured (same-session A/B, 30 iterations per arm, BASE=bcf1fa1
+NEW=17a6c88, 2026-07-31): `max_wake_lat_us` medians 7.4–7.8 ms → 6.7–7.1 ms
+on all four configs (z 3.6–5.2), `wakes` down 3–18% (z 5.0–6.3), harm
+measures null in both arms (underruns and drains all-zero, dropouts 0/120
+and 0/120). One prediction here was wrong and is corrected rather than
+smoothed: `wakes` moved in the *flagged* direction (down), so the gate fired
+on all four configs instead of staying silently green — the instrument saw
+the change. The BASE load configs' bimodal wakes distributions (~840/~1050
+clusters — timer phase) collapse to one mode with the fan-out, which also
+explains audio_tone_load.smp8's previously unexplained 22–33 ms second mode.
+The sample was re-recorded on 17a6c88 with this justification written into
+`tests/audio-baseline.toml`.
 
 ## Stage 7b (balance on, retire by message)
 

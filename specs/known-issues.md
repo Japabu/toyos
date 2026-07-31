@@ -269,13 +269,6 @@ notices when it next reads, and until then the stream stays `is_streaming()` and
 the mix loop keeps deferring buffers for a producer that no longer exists.
 Bounded harmlessly by `refill_floor_nanos`.
 
-**soundd idles at ~7% of a core**, mixing and dithering silence at period rate
-with no clients. With no clients `timeout` is `u64::MAX`, so the mix loop is
-purely completion-driven and only wakes once the *whole* pipeline has emptied —
-a continuous drain→refill cycle at ~43/s (one every 23.2 ms) instead of a
-per-period cadence. Harmless (silence over silence), but worth revisiting with
-the idle policy in spec §5.8.
-
 **`f32::round()` lowers to a `compiler_builtins` `roundf` call on the ToyOS
 target, not `roundss`.** The quantizer calls it once per sample (256/period,
 ~344 periods/s ≈ 88k calls/s). SSE4.1 is universally present on the 2020+
