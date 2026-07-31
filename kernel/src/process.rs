@@ -1175,7 +1175,7 @@ pub fn wake_pipe_readers(pipe_id: pipe::PipeId) {
     if !watchers.is_empty() {
         crate::io_uring::complete_pending_for_event(
             &watchers,
-            scheduler::EventSource::PipeReadable(pipe_id),
+            crate::io_uring::Source::PipeReadable(pipe_id),
         );
     }
 }
@@ -1187,7 +1187,7 @@ pub fn wake_pipe_writers(pipe_id: pipe::PipeId) {
     if !watchers.is_empty() {
         crate::io_uring::complete_pending_for_event(
             &watchers,
-            scheduler::EventSource::PipeWritable(pipe_id),
+            crate::io_uring::Source::PipeWritable(pipe_id),
         );
     }
 }

@@ -154,7 +154,7 @@ while it holds the XHCI lock via the `fd.rs` keyboard/mouse read poll. A
 
 ### Keyboard poll readiness is spurious on repeated HID reports
 
-`HidDevice::dispatch_report` wakes `EventSource::Keyboard` watchers on every
+`HidDevice::dispatch_report` wakes `io_uring::Source::Keyboard` watchers on every
 report, but `keyboard::handle_report` diffs against the previous report and
 queues zero events for identical ones (host key auto-repeat produces a stream of
 these). A blocking `read` after such a wake parks the reader until the next real
@@ -384,11 +384,6 @@ value to hand to userspace while the owning handle stays in kernel structures.
 ToyOS has no files-are-everything model. The integer identifies pipes, devices,
 io_uring instances and IPC connections — it is a handle, not a file descriptor.
 Rename `Fd` → `Handle`. Aligns with the capability-based direction.
-
-### `Lock::force_unlock` has no caller
-
-`kernel/src/sync.rs:98`. Stage 7c should delete it, along with `EventSource` and
-`source_ready` once io_uring stops using the former as a poll key.
 
 ### `KernelSlice::from_raw` cannot check the one thing that makes the type safe
 

@@ -95,28 +95,28 @@ impl Descriptor {
         }
     }
 
-    pub fn read_event_source(&self) -> Option<crate::scheduler::EventSource> {
-        use crate::scheduler::EventSource;
+    pub fn read_source(&self) -> Option<crate::io_uring::Source> {
+        use crate::io_uring::Source;
         match self {
-            Self::Keyboard => Some(EventSource::Keyboard),
-            Self::Mouse => Some(EventSource::Mouse),
-            Self::SerialConsole => Some(EventSource::Keyboard),
-            Self::Nic(_) => Some(EventSource::Network),
-            Self::Listener(name) => listener::listener_id(name).map(EventSource::Listener),
-            Self::PipeRead(r) | Self::TtyRead(r) => Some(EventSource::PipeReadable(r.id())),
-            Self::Socket { rx, .. } => Some(EventSource::PipeReadable(rx.id())),
-            Self::Audio { .. } => Some(EventSource::Audio),
+            Self::Keyboard => Some(Source::Keyboard),
+            Self::Mouse => Some(Source::Mouse),
+            Self::SerialConsole => Some(Source::Keyboard),
+            Self::Nic(_) => Some(Source::Network),
+            Self::Listener(name) => listener::listener_id(name).map(Source::Listener),
+            Self::PipeRead(r) | Self::TtyRead(r) => Some(Source::PipeReadable(r.id())),
+            Self::Socket { rx, .. } => Some(Source::PipeReadable(rx.id())),
+            Self::Audio { .. } => Some(Source::Audio),
             Self::File(_) | Self::Framebuffer(_) => None,
             Self::PipeWrite(..) | Self::TtyWrite(_) => None,
             Self::IoUring(_) => None,
         }
     }
 
-    pub fn write_event_source(&self) -> Option<crate::scheduler::EventSource> {
-        use crate::scheduler::EventSource;
+    pub fn write_source(&self) -> Option<crate::io_uring::Source> {
+        use crate::io_uring::Source;
         match self {
-            Self::PipeWrite(w) | Self::TtyWrite(w) => Some(EventSource::PipeWritable(w.id())),
-            Self::Socket { tx, .. } => Some(EventSource::PipeWritable(tx.id())),
+            Self::PipeWrite(w) | Self::TtyWrite(w) => Some(Source::PipeWritable(w.id())),
+            Self::Socket { tx, .. } => Some(Source::PipeWritable(tx.id())),
             Self::File(_) | Self::SerialConsole => None,
             Self::Keyboard | Self::Mouse | Self::Nic(_) | Self::Audio { .. }
             | Self::Framebuffer(_) | Self::Listener(_)
@@ -284,7 +284,7 @@ pub fn close(table: &mut FdTable, vfs: &mut Vfs, fd: u32, pid: Pid) -> u64 {
     let Some(desc) = table.remove(fd) else {
         return SyscallError::NotFound.to_u64();
     };
-    let sources = [desc.read_event_source(), desc.write_event_source()];
+    let sources = [desc.read_source(), desc.write_source()];
     if sources.iter().any(|s| s.is_some()) {
         crate::io_uring::remove_fd(fd, &sources);
     }
@@ -429,7 +429,7 @@ pub fn try_read(table: &mut FdTable, fd: u32, buf: &mut [u8]) -> Option<u64> {
                 return Some(SyscallError::InvalidArgument.to_u64());
             }
             // Completion records, oldest first. Empty → None: blocking reads
-            // park on EventSource::Audio, nonblocking reads get WouldBlock.
+            // park on `waitqs::AUDIO`, nonblocking reads get WouldBlock.
             let n = crate::audio::drain_completed(buf);
             if n == 0 { None } else { Some(n as u64) }
         }

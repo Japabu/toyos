@@ -37,7 +37,6 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use toyos_sched::hw::{TraceEvent, TraceKind};
 
 use crate::arch::percpu;
-use crate::scheduler::EventSource;
 
 pub const MAX_CPUS: usize = 8;
 pub const RING_CAPACITY: usize = 4096;
@@ -56,8 +55,8 @@ pub enum Kind {
     SchedPick   = 1,
     SchedIdle   = 2,  // data = next_deadline_ms_low
     Preempt     = 3,  // data = 0
-    Block       = 4,  // data = event_source_tag (see `event_source_tag`)
-    Wake        = 5,  // data = event_source_tag
+    Block       = 4,  // data = 0
+    Wake        = 5,  // data = 0
     TimerArm    = 6,  // data = nanos (low 32)
     TimerStop   = 7,  // data = 0
     TimerFire   = 8,  // data = 0
@@ -218,20 +217,3 @@ pub fn trace_irq_drain(source: crate::irq_ring::IrqSource, latency_us: u64) {
     let data = ((source as u32) << 24) | (latency_us.min(0x00FF_FFFF) as u32);
     trace(Kind::IrqDrain, data);
 }
-
-/// Pack an EventSource into a u32 tag for the `data` field of Block/Wake events.
-/// Top byte = variant tag, low 24 bits = best-effort id (or 0 for singletons).
-pub fn event_source_tag(e: &EventSource) -> u32 {
-    match e {
-        EventSource::Keyboard        => 0x01_000000,
-        EventSource::Mouse           => 0x02_000000,
-        EventSource::Network         => 0x03_000000,
-        EventSource::Listener(id)    => 0x04_000000 | ((id.raw() as u32) & 0x00FF_FFFF),
-        EventSource::PipeReadable(p) => 0x05_000000 | ((p.raw() as u32) & 0x00FF_FFFF),
-        EventSource::PipeWritable(p) => 0x06_000000 | ((p.raw() as u32) & 0x00FF_FFFF),
-        EventSource::Audio           => 0x07_000000,
-        EventSource::Futex(_)        => 0x08_000000,
-        EventSource::IoUring(r)      => 0x09_000000 | ((r.raw() as u32) & 0x00FF_FFFF),
-    }
-}
-

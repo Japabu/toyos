@@ -34,7 +34,7 @@ impl HidDevice {
                 if !watchers.is_empty() {
                     crate::io_uring::complete_pending_for_event(
                         &watchers,
-                        crate::scheduler::EventSource::Keyboard,
+                        crate::io_uring::Source::Keyboard,
                     );
                 }
             }
@@ -45,7 +45,7 @@ impl HidDevice {
                 if !watchers.is_empty() {
                     crate::io_uring::complete_pending_for_event(
                         &watchers,
-                        crate::scheduler::EventSource::Mouse,
+                        crate::io_uring::Source::Mouse,
                     );
                 }
             }

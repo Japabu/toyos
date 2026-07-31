@@ -982,7 +982,7 @@ fn wake_poll_waiters(name: &str) {
     if let Some(queue) = crate::listener::acceptors(id) {
         crate::sched::waitqs::wake_all(&queue);
     }
-    let event = crate::scheduler::EventSource::Listener(id);
+    let event = crate::io_uring::Source::Listener(id);
     let watchers = crate::listener::io_uring_watchers(id);
     if !watchers.is_empty() {
         crate::io_uring::complete_pending_for_event(&watchers, event);

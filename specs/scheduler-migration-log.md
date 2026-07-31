@@ -5,7 +5,7 @@ protocol is; this file says how far the kernel has moved onto it, what broke on
 the way, and which harness gates prove each fix. Split out of CLAUDE.md
 2026-07-30.
 
-**State: Stage 7b done — the kernel drives the core, with balance on.**
+**State: Stage 7c done — the legacy notification path is gone.**
 
 ## Layout
 
@@ -43,7 +43,7 @@ with no change to the task-blind half.
 Wait queues live on their objects (spec §8.6) — `Arc<WaitQueue>` on pipe ends,
 listeners and io_uring rings; statics for keyboard/mouse/net/audio; fixed bucket
 arrays for futex words and for the by-name waits (waitpid/join/sleep, which are
-woken by `wake_direct` and never as a queue). `EventSource` survives only as
+woken by `wake_direct` and never as a queue). `EventSource` survived 7a only as
 io_uring's poll key.
 
 7a deleted what the cutover orphaned, because dead code is a build error here —
@@ -77,11 +77,41 @@ the payload drop. The core keeps one wake path.
 that balance would close the smp=8 tail is falsified — see
 `specs/audio-gate-history.md`.
 
-## Remaining for 7c
+## Stage 7c (the legacy notification path deleted)
 
-`EventSource` and `source_ready` (io_uring's poll key, not a scheduler concept
-any more), and `Lock::force_unlock` (`kernel/src/sync.rs:98`), which now has no
-caller at all.
+`EventSource`, `scheduler::source_ready` and `Lock::force_unlock` are gone. So
+is `io_uring::has_completions`, whose only caller was `source_ready`'s
+`IoUring` arm, and `trace::event_source_tag`, orphaned since the core started
+emitting `Block`/`Wake` with `data = 0`.
+
+7a had already emptied the enum of scheduler meaning; what 7c had to establish
+is that io_uring can key its own poll registrations. It can, and the move is a
+relocation, not a design: `io_uring::Source` is the same seven object-naming
+variants, now owned by the only subsystem that ever constructed them, with
+`is_ready`/`add_watcher`/`remove_watcher`/`watchers` as inherent methods on it.
+`Descriptor::{read,write}_event_source` became `{read,write}_source`. The names
+are the ones `specs/iouring-blocking-spec.md` §17 already writes down for
+`completion.rs`, so the eventual one-completion-primitive rewrite renames
+nothing.
+
+Two variants did not survive the move: `Futex(DirectMap)` and `IoUring(RingId)`
+were never *constructed* as poll keys — no `Descriptor` maps to either — so
+every match on them was a dead arm, and `source_ready` answered `false` for
+futexes and reached into another subsystem for rings. Deleting them makes the
+poll key total over the objects an fd can actually name.
+
+**Spec divergence, recorded deliberately.** §12's stage table says 7c removes
+`scheduler.rs`. It does not, and should not: 7a repurposed that file as the
+kernel-facing API surface (`prepare_wait`/`block_on`/`futex_*`/`retire_task`/…)
+with the driver half under `kernel/src/sched/`, which is the §4 split the spec
+itself asks for — the file the table meant to delete is the legacy *body*, and
+that body died at 7a. The table's other 7c line, preempt-count baseline asserts
+in the entry shims, also landed with the shims at 7a (`driver::pass`).
+
+Nothing in this stage can move a scheduling number: no wake path, placement
+rule or park site changed. Gate A's fast tier agrees — all four configs green,
+zero gaps, zero underruns, `drains 0` on every run — but one boot per config
+certifies no rate, so that is a consistency check and not evidence.
 
 ## Host tests and negative gates
 

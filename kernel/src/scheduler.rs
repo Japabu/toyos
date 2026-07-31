@@ -14,8 +14,6 @@ use toyos_sched::task::{WakeCause, WakeReason};
 
 use crate::arch::percpu;
 use crate::hw::HW;
-use crate::io_uring::RingId;
-use crate::listener::ListenerId;
 use crate::pipe::PipeId;
 use crate::process::{self, Pid, Tid};
 use crate::sched::driver::{self, cpus, preempt_off, Dispose, NewTask};
@@ -47,42 +45,6 @@ impl TaskId {
 impl core::fmt::Display for TaskId {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "{}:{}", self.0, self.1)
-    }
-}
-
-// What a source's readiness means — io_uring's poll key
-
-/// What an io_uring `POLL_ADD` is registered on.
-///
-/// No longer a scheduler concept: the scheduler knows only tasks, tickets and
-/// causes (spec §8.1). This is io_uring's key for "which rings care about this
-/// object", and it names the same objects the wait queues belong to.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-pub enum EventSource {
-    Keyboard,
-    Mouse,
-    Network,
-    Listener(ListenerId),
-    PipeReadable(PipeId),
-    PipeWritable(PipeId),
-    Audio,
-    Futex(DirectMap),
-    IoUring(RingId),
-}
-
-/// Is the source ready right now? Used by io_uring's poll recheck and by
-/// blocking sites whose re-check is exactly this.
-pub fn source_ready(event: &EventSource) -> bool {
-    match event {
-        EventSource::Keyboard => crate::keyboard::has_data(),
-        EventSource::Mouse => crate::mouse::has_data(),
-        EventSource::Network => crate::net::has_packet(),
-        EventSource::Listener(id) => crate::listener::has_pending_by_id(*id),
-        EventSource::PipeReadable(id) => crate::pipe::has_data(*id),
-        EventSource::PipeWritable(id) => crate::pipe::has_space(*id),
-        EventSource::Audio => crate::audio::has_pending(),
-        EventSource::Futex(_) => false,
-        EventSource::IoUring(ring) => crate::io_uring::has_completions(*ring),
     }
 }
 

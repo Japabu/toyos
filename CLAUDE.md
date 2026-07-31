@@ -142,7 +142,7 @@ system.toml       What to build and boot
 
 ## Ideas
 
-- **io_uring as the only blocking I/O mechanism.** The kernel has two parallel notification paths: `scheduler::block(event)` for direct thread blocking and `io_uring::complete_pending_for_event` for ring watchers, and every wake site does both. If all fd-based blocking went through io_uring, blocking syscalls become non-blocking try-once-and-return, wake sites become a single io_uring call, and the scheduler drops fd-related `EventSource` variants. Userspace helpers in `toyos` would wrap the ring setup.
+- **io_uring as the only blocking I/O mechanism.** The kernel has two parallel notification paths: a wait queue on the object for direct thread blocking and `io_uring::complete_pending_for_event` for ring watchers, and every wake site does both. If all fd-based blocking went through io_uring, blocking syscalls become non-blocking try-once-and-return, wake sites become a single io_uring call, and the per-object wait queues for fd sources go away. Userspace helpers in `toyos` would wrap the ring setup.
 - **Capability-based resource model.** Replace global Pid/Tid integers with per-process handles (like Zircon's `zx_handle_t`) that encode both identity and rights. Unifies fds, Pids and Tids into one mechanism, eliminates confused-deputy bugs, enables fine-grained delegation. The per-process fd table is already halfway there. Zircon and seL4 are the reference designs.
 
 ## Diagnostics roadmap
@@ -157,7 +157,7 @@ Three layers, built in order; each is useful on its own.
 
 Read the spec before touching the subsystem it covers.
 
-- `specs/scheduler-core-spec.md` — ownership-typed scheduler core as a `no_std` crate (`toyos-sched/`) with a deterministic host simulator and interleaving fuzzer; per-CPU exclusive queues, message-passing wakes, 10-stage always-green migration. **Stage 7b done: the kernel drives the core, with balance on.** The driver half is `kernel/src/sched/`; `kernel/src/scheduler.rs` is the kernel-facing API and nothing else. Host tests: `cargo test` inside `toyos-sched/` (~15 s). Stage 4's exit criterion runs from the CLI: `cargo run --release -p toyos-sched-sim -- gate 10000` and `-- fuzz-sweep 10000000`. Five negative gates prove the harnesses have teeth — do not weaken one to make a change pass. Migration state, the gates, and every defect the cutover found: `specs/scheduler-migration-log.md`.
+- `specs/scheduler-core-spec.md` — ownership-typed scheduler core as a `no_std` crate (`toyos-sched/`) with a deterministic host simulator and interleaving fuzzer; per-CPU exclusive queues, message-passing wakes, 10-stage always-green migration. **Stage 7c done: the kernel drives the core, with balance on, and the legacy notification path is deleted.** The driver half is `kernel/src/sched/`; `kernel/src/scheduler.rs` is the kernel-facing API and nothing else — the spec's "7c removes `scheduler.rs`" means the legacy body, which died at 7a (migration log records the divergence). Host tests: `cargo test` inside `toyos-sched/` (~15 s). Stage 4's exit criterion runs from the CLI: `cargo run --release -p toyos-sched-sim -- gate 10000` and `-- fuzz-sweep 10000000`. Five negative gates prove the harnesses have teeth — do not weaken one to make a change pass. Migration state, the gates, and every defect the cutover found: `specs/scheduler-migration-log.md`.
 - `specs/capability-handles-spec.md` — refcounted kernel objects behind typed per-process handles (Fd→Handle); subsumes the SharedToken/io_uring/Fd debt in known issues.
 - `specs/iouring-blocking-spec.md` — io_uring as the only blocking mechanism; one wait-free completion primitive, one park/recheck site.
 
@@ -184,6 +184,6 @@ One line each. **`specs/known-issues.md` has the detail and is the file to updat
 - **The build system suppresses rustc warnings on success** — `Command::output()` in `src/build.rs` captures stderr regardless of quiet mode, so the zero-warning bar is unenforced outside the kernel.
 - **`bootstrap-cc` is alive but not wired in** — nothing builds it, it inherits the wrong toolchain, and its TinyCC download is unpinned.
 - **The `memmap2` fork is 165 lines of unreachable code.** Delete `src/toyos.rs` or drop the toyos gate in `rustc_data_structures` — exactly one of the two.
-- **Design debt:** io_uring abuses `shared_memory`; `SharedToken` is a bare `u32` with no RAII; `Fd` should be `Handle`; `build_toyos_bins` belongs in the test harness; `Lock::force_unlock` has no caller; `KernelSlice::from_raw` trusts the caller's size — allocators should construct the slice.
+- **Design debt:** io_uring abuses `shared_memory`; `SharedToken` is a bare `u32` with no RAII; `Fd` should be `Handle`; `build_toyos_bins` belongs in the test harness; `KernelSlice::from_raw` trusts the caller's size — allocators should construct the slice.
 - **Hardware gaps:** PCID/INVPCID untested outside TCG; TLB shootdowns IPI every CPU for a full flush; the LAPIC timer is one-shot where TSC-deadline would be exact.
 - One unreproduced observation: `ps` appeared to stall for >2 s under heavy single-core load. If seen again, capture with LLDB before restarting.

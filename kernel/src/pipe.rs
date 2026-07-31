@@ -291,7 +291,7 @@ fn close_read(pipe_id: PipeId) {
         if !watchers.is_empty() {
             crate::io_uring::complete_pending_for_event(
                 &watchers,
-                crate::scheduler::EventSource::PipeWritable(pipe_id),
+                crate::io_uring::Source::PipeWritable(pipe_id),
             );
         }
     }
@@ -319,7 +319,7 @@ fn close_write(pipe_id: PipeId) {
         if !watchers.is_empty() {
             crate::io_uring::complete_pending_for_event(
                 &watchers,
-                crate::scheduler::EventSource::PipeReadable(pipe_id),
+                crate::io_uring::Source::PipeReadable(pipe_id),
             );
         }
     }
