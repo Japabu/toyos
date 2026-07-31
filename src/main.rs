@@ -50,9 +50,18 @@ fn main() {
     let release = args.iter().any(|a| a == "--release");
     let build_only = args.iter().any(|a| a == "--build-only");
     let dump_audio = args.iter().any(|a| a == "--dump-audio");
-    let gop = args.iter().any(|a| a == "--gop");
     let rebuild_toolchain = args.iter().any(|a| a == "--rebuild-toolchain");
     let smp = parse_smp(&args);
+    let profile = parse_profile(&args);
+    let uart = args.iter().any(|a| a == "--uart");
+    assert!(
+        !(dump_audio && profile == qemu::Profile::Metal),
+        "--dump-audio needs virtio-sound, which --metal-sim removes"
+    );
+    assert!(
+        !(uart && profile != qemu::Profile::Metal),
+        "--uart only means anything under --metal-sim; the others already have a console"
+    );
 
     check_prerequisites();
 
@@ -74,7 +83,20 @@ fn main() {
     println!("Build finished.");
 
     if !build_only {
-        qemu::launch(debug, dump_audio, gop, smp);
+        qemu::launch(&qemu::Options { debug, dump_audio, profile, smp, uart });
+    }
+}
+
+/// `--gop` swaps virtio-gpu for a firmware framebuffer; `--metal-sim` goes
+/// further and removes every virtio device, which is what the target laptop
+/// actually presents.
+fn parse_profile(args: &[String]) -> qemu::Profile {
+    let gop = args.iter().any(|a| a == "--gop");
+    let metal = args.iter().any(|a| a == "--metal-sim");
+    match (gop, metal) {
+        (_, true) => qemu::Profile::Metal,
+        (true, false) => qemu::Profile::Gop,
+        (false, false) => qemu::Profile::Virtio,
     }
 }
 
