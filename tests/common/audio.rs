@@ -479,15 +479,23 @@ pub fn check_counters(
 /// patterns, and chunk order is emission order for soundd's mix thread, which
 /// emits every marker here (the kernel ones from inside its own syscalls).
 ///
-/// The capture starts at ===TEST_START, after boot. A boot that wrongly
-/// started the device is still caught: the stream would already be running,
-/// no `started` line could appear in the window, and the required
-/// started-after-connect ordering fails.
+/// What this does NOT see is boot. The harness starts collecting at
+/// ===TEST_START and never joins the reader thread's full log
+/// (`tests/common/qemu.rs`), so every line soundd and the driver emit before
+/// the first test are gone. A restored boot prime — the exact code deleted in
+/// 465bc22 — would open the voice, play 8 periods, drain and suspend entirely
+/// inside that discarded prefix, and the window would then show the identical
+/// `connected → started → removed → stopped → suspended` sequence and pass
+/// every assertion below. The §5.8 boot state is certified by nothing today,
+/// in any test: `audio_idle_suspend` asserts no `stream 0 started` in its own
+/// window, which catches a device started with no client attached (the
+/// fill-loop gate at `soundd/src/main.rs` going away, or a spurious resume)
+/// but not one started before the capture opened. Catching that needs the
+/// boot capture the harness currently throws away.
 pub fn check_suspend_structure(serial: &str) -> Vec<String> {
     const STARTED: &str = "virtio-sound: stream 0 started";
     const STOPPED: &str = "virtio-sound: stream 0 stopped";
     const CONNECTED: &str = " connected (id=";
-    const REMOVED: &str = " removed";
     const SUSPENDED: &str = "soundd: suspended";
 
     let mut problems = Vec::new();
@@ -509,36 +517,53 @@ pub fn check_suspend_structure(serial: &str) -> Vec<String> {
         Some(_) => {}
     }
 
-    let Some(last_removed) = serial.rfind(REMOVED) else {
+    let Some(last_removed) = last_client_removed(serial) else {
         problems.push("suspend structure: no client removal in capture".to_string());
         return problems;
     };
-    let suspended = serial.rfind(SUSPENDED).filter(|&at| at > last_removed);
-    let stopped = serial.rfind(STOPPED).filter(|&at| at > last_removed);
-    if suspended.is_none() {
+    if !serial[last_removed..].contains(SUSPENDED) {
         problems.push(
             "suspend structure: no `soundd: suspended` after the last client removal"
                 .to_string(),
         );
     }
-    if stopped.is_none() {
+    if !serial[last_removed..].contains(STOPPED) {
         problems.push(
             "suspend structure: no `virtio-sound: stream 0 stopped` after the last \
              client removal — the device is still running with no clients"
                 .to_string(),
         );
     }
-    if let (Some(suspended), Some(stopped)) = (suspended, stopped) {
-        let quiesced = suspended.min(stopped);
-        if serial[quiesced..].contains(STATS_MARKER) {
-            problems.push(
-                "suspend structure: a soundd stats window printed after the suspend \
-                 markers — the mix loop is still running while suspended"
-                    .to_string(),
-            );
-        }
-    }
     problems
+}
+
+/// Offset of the last `soundd: client {id} removed`, the anchor the two
+/// after-the-last-client assertions above are relative to.
+///
+/// ` removed` alone is an eight-character substring that any future line in
+/// any component could carry; landing after soundd's markers it would move the
+/// anchor past them and red all four configs at once, with a message accusing
+/// soundd of the bug it does not have. Requiring the `soundd: client ` prefix
+/// makes the anchor soundd's by construction rather than by a tree-wide
+/// absence of other emitters.
+///
+/// The two halves are matched separately because they are separate console
+/// writes: `eprintln!("soundd: client {} removed", id)` emits three format
+/// pieces, so a whole foreign line can land between the prefix and the suffix
+/// (see the module doc on interleaving). A ` removed` qualifies when some
+/// `soundd: client ` precedes it with no other ` removed` in between — true
+/// for soundd's own, false for a foreign line printed after it.
+fn last_client_removed(serial: &str) -> Option<usize> {
+    const CLIENT: &str = "soundd: client ";
+    const REMOVED: &str = " removed";
+    serial
+        .match_indices(REMOVED)
+        .filter(|(at, _)| {
+            let before = &serial[..*at];
+            before.rfind(CLIENT).is_some_and(|c| !before[c..].contains(REMOVED))
+        })
+        .map(|(at, _)| at)
+        .last()
 }
 
 /// Bounds derived from the device's clock, not from any recorded run: values

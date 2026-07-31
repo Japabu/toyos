@@ -219,10 +219,38 @@ fn check_panic_recovery(result: &TestResult) -> bool {
     ok
 }
 
+/// A zero CPU delta is the signature of a suspended soundd and equally of one
+/// wedged with the device running, so the counter the test reads cannot tell
+/// them apart on its own. The serial can: in a window where no audio client
+/// ever connects, the PCM stream has no business starting.
+///
+/// This is bounded by what the harness captures — collection begins at
+/// ===TEST_START, so a device started before then (a restored boot prime) is
+/// invisible here as it is everywhere else; see `audio::check_suspend_structure`.
+/// What it does catch is a start inside the window with no client to justify
+/// it: soundd's `!streams.is_empty()` fill-loop gate going away, or a resume
+/// fired by anything other than a connect.
+fn check_audio_idle_suspend(result: &TestResult) -> bool {
+    if !check_rust_result(result) {
+        return false;
+    }
+    const STARTED: &str = "virtio-sound: stream 0 started";
+    if result.serial.contains(STARTED) {
+        eprintln!(
+            "FAIL rs::audio_idle_suspend: `{STARTED}` with no client connected — \
+             soundd's zero CPU is the device left running, not a suspend\nserial:\n{}",
+            result.serial
+        );
+        return false;
+    }
+    true
+}
+
 /// Select check function by test name convention.
 fn check_for(name: &str) -> fn(&TestResult) -> bool {
     match name {
         "panic_recovery" => check_panic_recovery,
+        "audio_idle_suspend" => check_audio_idle_suspend,
         _ => check_rust_result,
     }
 }
