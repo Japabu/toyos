@@ -88,7 +88,7 @@ The kernel ABI and SDK are Rust-native and capability-shaped. POSIX compatibilit
 - `cargo test -- --list` lists all test names without running them.
 - `cargo test --test toyos-build -- --audio-gate 30` runs gate A's thorough tier (~17 min).
 - `cargo run -- --gop` boots a UEFI GOP display (`-vga std`) instead of virtio-gpu: the config where the on-screen panic console renders.
-- `cargo run -- --metal-sim` boots the T14's hardware shape: GOP + NVMe + xHCI + i8042, no virtio device, no USB HID — with a 16550, so it is fully drivable and the input tests run on it. `--mute` takes the serial away, the T14's literal shape; one test uses it (`screen_panic_muted`). Never launch the run path without `--display none` on the owner's desktop; verify through the harness.
+- `cargo run -- --metal-sim` boots the T14's hardware shape: GOP + NVMe + xHCI + i8042, no virtio device, no USB HID — with a 16550, so it is fully drivable and the input tests run on it. `--mute` takes the serial away, the T14's literal shape; one test uses it (`screen_panic_muted`). **Agents verify through `cargo test`, never by launching `cargo run`** — the run path opens a QEMU window on the owner's desktop by design; the harness passes `-display none`.
 - `system.toml` defines which programs to build and the init sequence.
 
 **Gate A (audio) has two tiers.** `tests/audio-baseline.toml` documents both in full and justifies every number in it.
