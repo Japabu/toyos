@@ -311,7 +311,7 @@ pub fn render() {
     if PAINTING.swap(true, Ordering::SeqCst) {
         return;
     }
-    paint(Fill::Fatal);
+    paint(Fill::Fatal, Source::Captured);
 }
 
 /// Repaint at a boot phase boundary, so a machine that wedges later still
@@ -322,8 +322,7 @@ pub fn boot_checkpoint() {
     if SCREEN_OWNED_BY_USERLAND.load(Ordering::Relaxed) || PAINTING.load(Ordering::Relaxed) {
         return;
     }
-    SNAPSHOT_LEN.store(0, Ordering::Relaxed);
-    paint(Fill::Boot);
+    paint(Fill::Boot, Source::Live);
 }
 
 /// The fill colour carries "halted" versus "still booting" at zero cost, and
@@ -335,19 +334,32 @@ enum Fill {
     Boot,
 }
 
-fn paint(fill: Fill) {
+/// Which bytes to paint. `SNAPSHOT_LEN != 0` means and only means "the panic
+/// handler captured a report into SNAPSHOT" — a boot checkpoint must never
+/// leave state that a later fatal render mistakes for one, which is exactly
+/// the bug that showed up as a halted machine displaying its own boot log.
+#[derive(Clone, Copy, PartialEq)]
+enum Source {
+    Captured,
+    Live,
+}
+
+fn paint(fill: Fill, source: Source) {
     let Some(fb) = snapshot() else { return };
     if !mapped(&fb) {
         return;
     }
 
-    if SNAPSHOT_LEN.load(Ordering::Relaxed) == 0 {
-        let buf = unsafe { &mut *SNAPSHOT.0.get() };
-        let n = unsafe { crate::drivers::log_ring::peek_tail(buf) };
-        SNAPSHOT_LEN.store(n, Ordering::Relaxed);
-    }
+    let buf = unsafe { &mut *SNAPSHOT.0.get() };
+    let captured = SNAPSHOT_LEN.load(Ordering::Relaxed).min(SNAPSHOT_CAP);
+    let len = if source == Source::Captured && captured > 0 {
+        captured
+    } else {
+        // Overwrites whatever was captured, so the marker goes first.
+        SNAPSHOT_LEN.store(0, Ordering::Relaxed);
+        unsafe { crate::drivers::log_ring::peek_tail(buf) }
+    };
     let text = unsafe { &*SNAPSHOT.0.get() };
-    let len = SNAPSHOT_LEN.load(Ordering::Relaxed).min(SNAPSHOT_CAP);
 
     fill_screen(
         &fb,

@@ -34,8 +34,18 @@ const AUDIO_SMP: &[u32] = &[1, 8];
 // the guest they test is halted by the time they assert. `screen_decoder`
 // needs no guest at all; it proves the decoder against a bitmap it rendered
 // itself, before anything points it at a real screen.
-const SCREEN_TESTS: &[&str] =
-    &["screen_decoder", "screen_early_panic", "screen_boot_checkpoint"];
+const SCREEN_TESTS: &[&str] = &[
+    "screen_decoder",
+    "screen_early_panic",
+    "screen_boot_checkpoint",
+    "screen_fatal_halt",
+    "screen_recoverable_untouched",
+];
+
+/// The line `SYS_DEBUG` action 3 logs immediately before halting every CPU.
+/// Kept in sync with `kernel/src/arch/syscall.rs` by this comment and by
+/// screen_fatal_halt failing loudly if it drifts.
+const FATAL_HALT_NONCE: &str = "SYS_DEBUG: fatal halt 4b1d9e2c";
 
 // C tests that can't compile yet (missing toyos-cc features or unsupported platform APIs).
 // Tests that compile successfully are discovered automatically — only list failures here.
@@ -957,6 +967,71 @@ fn run_screen_test(
                 if !text.contains(want) {
                     return Err(format!("{want:?} not on screen\ndecoded screen:\n{text}"));
                 }
+            }
+            Ok(())
+        }
+        "screen_fatal_halt" => {
+            // The steady-state fatal path: userland is up, the display is
+            // idle, and SYS_DEBUG action 3 runs halt_all_cpus for real.
+            // No sleep — render() runs before panic_flush(), so the nonce
+            // arriving on the console proves the paint already finished.
+            let mut qemu = QemuInstance::boot_with_options(
+                test_config,
+                c_bins,
+                rust_bins,
+                BootOptions {
+                    display: qemu::Display::Gop,
+                    qmp: true,
+                    ..Default::default()
+                },
+            );
+            if !qemu.command_until(
+                "run test_rs_test_panic_child 3",
+                FATAL_HALT_NONCE,
+                Duration::from_secs(15),
+            ) {
+                return Err(format!("{FATAL_HALT_NONCE:?} never reached the console"));
+            }
+            let text = qemu.screendump().text();
+            print_screen(name, &text);
+            if !text.contains(FATAL_HALT_NONCE) {
+                return Err(format!(
+                    "{FATAL_HALT_NONCE:?} reached serial but not the screen\ndecoded screen:\n{text}"
+                ));
+            }
+            Ok(())
+        }
+        "screen_recoverable_untouched" => {
+            // The negative of screen_fatal_halt, and the property that makes
+            // the capture/render split worth having: a panic the kernel
+            // recovers from must not clobber a live display. Action 0 panics
+            // in syscall context, which the handler recovers from, so it
+            // never reaches halt_all_cpus and must leave every pixel alone.
+            let mut qemu = QemuInstance::boot_with_options(
+                test_config,
+                c_bins,
+                rust_bins,
+                BootOptions {
+                    display: qemu::Display::Gop,
+                    qmp: true,
+                    ..Default::default()
+                },
+            );
+            let before = qemu.screendump();
+            let result = qemu.run_test("test_rs_test_panic_child", Duration::from_secs(15));
+            if result.exit_code == Some(0) {
+                return Err("recoverable panic did not kill the child".to_string());
+            }
+            let after = qemu.screendump();
+            if !before.identical_to(&after) {
+                return Err("recovering panic changed the screen".to_string());
+            }
+            // A screen that was blank to begin with would pass the diff for
+            // the wrong reason.
+            let text = before.text();
+            print_screen(name, &text);
+            if !text.contains("Boot: complete") {
+                return Err(format!("nothing on screen to preserve\ndecoded screen:\n{text}"));
             }
             Ok(())
         }

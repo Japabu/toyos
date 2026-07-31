@@ -24,7 +24,11 @@ fn main() {
             eprintln!("unknown command: {cmd}");
             continue;
         };
-        let name = name.trim();
+        // `run <name> [args...]`: the markers still carry only the binary
+        // name, so the host protocol is unchanged for the argument-less case.
+        let mut words = name.split_whitespace();
+        let Some(name) = words.next() else { continue };
+        let args: Vec<&str> = words.collect();
         let path = format!("/bin/{name}");
 
         println!("===TEST_START {name}===");
@@ -32,7 +36,7 @@ fn main() {
 
         // Spawn with piped stdin (so child doesn't consume serial commands)
         // but inherited stdout/stderr (output goes directly to serial).
-        match Command::new(&path).stdin(Stdio::piped()).spawn() {
+        match Command::new(&path).args(&args).stdin(Stdio::piped()).spawn() {
             Ok(mut child) => {
                 // Drop stdin pipe so child gets EOF if it tries to read
                 drop(child.stdin.take());

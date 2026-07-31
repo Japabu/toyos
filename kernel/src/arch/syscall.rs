@@ -25,6 +25,18 @@ use toyos_abi::syscall::*;
 /// deadlock panic, which is an honest report of what a second call means.
 static LOCK_ACROSS_SWITCH: crate::sync::Lock<()> = crate::sync::Lock::new(());
 
+/// The last line `SYS_DEBUG` action 3 puts in the log ring before halting.
+///
+/// Actions 0 and 1 both satisfy the panic handler's recovery predicate and
+/// return to userland by design, so neither can exercise the fatal funnel.
+/// Action 3 reaches `halt_all_cpus` directly, which is where the on-screen
+/// panic console paints.
+///
+/// The string is the whole synchronisation mechanism for the screen test:
+/// `halt_all_cpus` renders *before* it flushes serial, so a host that has
+/// seen this line knows the paint already finished — no sleep, no polling.
+pub const FATAL_HALT_NONCE: &str = "SYS_DEBUG: fatal halt 4b1d9e2c";
+
 pub fn init() {
     let efer = cpu::rdmsr(MSR_EFER);
     cpu::wrmsr(MSR_EFER, efer | 1);
@@ -451,6 +463,7 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             0 => panic!("SYS_DEBUG: kernel panic triggered by userspace"),
             1 => { unsafe { core::ptr::read_volatile(core::ptr::null::<u64>()); } 0 }
             2 => { let _held = LOCK_ACROSS_SWITCH.lock(); crate::scheduler::yield_now(); 0 }
+            3 => { log!("{}", FATAL_HALT_NONCE); crate::arch::apic::halt_all_cpus(); }
             _ => SyscallError::InvalidArgument.to_u64(),
         },
         SYS_SCHED_INFO => {

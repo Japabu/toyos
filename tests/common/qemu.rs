@@ -249,6 +249,27 @@ impl QemuInstance {
         }
     }
 
+    /// Send `command` and wait for `marker` on the console.
+    ///
+    /// For a guest that will never report `===TEST_END`, which is any guest
+    /// the fatal path has run through: every CPU is halted by the time the
+    /// marker arrives.
+    pub fn command_until(&mut self, command: &str, marker: &str, timeout: Duration) -> bool {
+        writeln!(self.stdin, "{command}").expect("Failed to write to QEMU stdin");
+        self.stdin.flush().expect("Failed to flush QEMU stdin");
+        let deadline = Instant::now() + timeout;
+        loop {
+            let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+                return false;
+            };
+            match self.rx.recv_timeout(left) {
+                Ok(line) if line.contains(marker) => return true,
+                Ok(_) => continue,
+                Err(_) => return false,
+            }
+        }
+    }
+
     pub fn run_test(&mut self, name: &str, timeout: Duration) -> TestResult {
         writeln!(self.stdin, "run {name}").expect("Failed to write to QEMU stdin");
         self.stdin.flush().expect("Failed to flush QEMU stdin");

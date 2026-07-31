@@ -367,7 +367,10 @@ pub fn exit(code: i32) -> ! {
     loop { syscall(SYS_EXIT, code as u64, 0, 0, 0); }
 }
 
-/// Debug syscall. `action`: 0 = kernel panic, 1 = kernel fault.
+/// Debug syscall. `action`: 0 = kernel panic, 1 = kernel fault,
+/// 2 = kernel lock held across a scheduler entry, 3 = fatal halt.
+/// 0, 1 and 2 kill the calling process and the system survives; 3 halts
+/// every CPU and does not return.
 pub fn debug(action: u64) -> u64 {
     syscall(SYS_DEBUG, action, 0, 0, 0)
 }
