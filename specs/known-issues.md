@@ -7,7 +7,8 @@ narrative belongs in a dated investigation doc, not here.
 
 Verified against `a88e4ee` (2026-07-30); §2's panic-path additions and §8's
 display entry against `883a84d` (2026-07-31); §8's three metal-sim entries
-against M1 (2026-07-31).
+against M1 (2026-07-31); §1's and §3's allocation-sizing entries against
+`a6935c6` (2026-07-31), from the sweep that followed the T14's first boot.
 
 ---
 
@@ -73,12 +74,38 @@ process can exhaust its virtual address space by repeated loads and reach
 `.expect("dlopen: out of virtual address space")` at `syscall.rs:1435` and
 `:1446`.
 
+`SYS_SYSINFO` collects one 24-byte entry per live thread into a `Vec`
+(`syscall.rs:1273`) and thread count is uncapped, so ~87,000 threads makes it a
+single >2 MiB allocation and the `mm/alloc.rs:12` assert fires. Any process may
+call it.
+
+Two unchecked adds feed `align_2m`, which wraps: `elf.rs:994`
+(`vaddr_max - vaddr_min` over `PT_LOAD`, where `vaddr_max` is
+`p_vaddr + p_memsz`) and `loader.rs:63-65` (`total_memsz + TCB_SIZE + tls_align`
+from `PT_TLS`). `sys_mmap` and `shared_memory::alloc` both `checked_add` before
+the same call; these two do not, and on a wrap `loader.rs:71`'s
+`alloc_size - block_size` underflows on top.
+
 The rest of the 2026-07-28 audit is fixed: `sys_mmap(0)`/`sys_alloc_shared(0)`,
 `SYS_NIC_RX_DONE`, `SYS_TLS_ALLOC_BLOCK`, io_uring's CQ-overflow assert,
 `shared_memory`'s three infallible failure modes and `SYS_THREAD_SPAWN`'s stack
 underflow at `a88e4ee`; the ELF `Vec::with_capacity`/`HashMap::with_capacity`
 sizing, `load_shared_lib`'s unchecked `KernelSlice` offsets and the `PT_TLS`
 `filesz > memsz` heap overflow at `f49c6b3`.
+
+### The bootloader sizes every allocation from a file the ESP handed it
+
+`bootloader/src/main.rs:61-62` reads the UEFI-reported `file_size()` and
+allocates that much for the kernel and the initrd, with no bound.
+`:103,112` takes `max(p_vaddr + p_memsz)` over the kernel ELF's segments with no
+overflow check and allocates it, then `:122` copies `p_filesz` bytes into that
+`p_memsz`-sized buffer without checking `filesz <= memsz` — the kernel's own
+`elf::parse_layout:419` enforces that, the bootloader does not.
+
+Lower severity than the kernel entries above: it runs before ExitBootServices,
+on files we put on the ESP ourselves. It is on the list because the metal track
+makes the ESP a thing a user can write to, and because none of the kernel's
+protections exist yet at that point.
 
 ### No physical memory fairness
 
@@ -468,6 +495,49 @@ existing test happens to keep the guest busy, which is why this has not bitten
 before; `i8042_no_spurious_wake` drives an in-guest reader for exactly this
 reason. Fix is a flush on the transition into idle, not another poll.
 
+### Nothing the kernel logs on the shutdown path ever reaches the console
+
+The same mechanism as the entry above, with a harder ending. `SYS_SHUTDOWN`
+(`syscall.rs:219-224`) logs "Syncing filesystems...", syncs, logs
+"Shutting down." and calls `acpi::shutdown()`. Both lines go into the ring and
+the power goes off before anything drains it. Measured on the MetalDisk profile:
+the last console line of a clean shutdown is the kernel's `spawn:` line for
+`/bin/shutdown`, and QEMU exits shortly after.
+
+So a shutdown that panics or hangs mid-sync produces no diagnostic at all —
+including on the T14, where writing back is the operation with something to
+lose. `nvme_large_device` had to assert on the disk image host-side instead,
+which is a better assertion anyway but was not a free choice. Fix is the same
+flush-before-parking as the idle case, plus an explicit drain before
+`acpi::shutdown()`.
+
+### Neither cache evicts anything, and one of the two never could
+
+The block page cache's `alloc_slot` (`page_cache.rs`) only ever increments
+`next_slot` and pushes a chunk; nothing removes an entry from `block_to_slot`
+and nothing frees a chunk. `sync` writes back and frees nothing. So the cache
+grows with every distinct metadata block the filesystem touches, for the life of
+the boot. It is no longer O(device) — that was the T14 boot panic, fixed — but
+it is still unbounded, and `sync`'s `Vec<u32>` scratch inherits the same bound:
+one 2 MiB single allocation at ~524,000 resident blocks.
+
+The file cache is worse, because the machinery exists and is not wired up.
+`file_cache.rs:32` initializes `max_pages: usize::MAX`, `file_cache::init(...)`
+at `:36` has **zero call sites** anywhere in the tree, and `evict_if_needed`'s
+`total_pages <= max_pages` test at `:287` is therefore always true. Every page
+ever read off the device is a `Box<[u8; 4096]>` held until the file is deleted.
+The eviction path at `:286-309` is dead code as wired.
+
+### The NVMe driver trusts the sector size the namespace reports
+
+`drivers/nvme.rs:209-210` takes `lba_ds` out of the LBA format descriptor and
+computes `1u32 << lba_ds`. The field is 8 bits, so any value ≥ 32 is a shift
+overflow. `:300-301` then computes `4096 / ctrl.sector_size` and divides
+`ns_size` by it, so a reported sector size above 4096 makes `sectors_per_block`
+zero and the next line divides by zero. Both are firmware/device values, not
+userland, but "the device said so" is not a bound — and the metal track is
+exactly where a device we did not write starts answering these queries.
+
 ### One unreproduced observation
 
 `ps` appeared to stall for >2 s under heavy single-core load; later runs fine. If
@@ -721,6 +791,21 @@ Fix shape: allocators construct the slice. Give `PageAlloc` and the contiguous
 PMM path a `slice()` method like `OwnedAlloc`'s, sized from the allocation they
 own, then make `from_raw` private to `mm` or delete it. The loader and DmaPool
 stop naming sizes at all.
+
+### Four of the page cache's seven methods have no callers
+
+`PageCache::phys_addr`, `ensure_cached`, `prefetch` and `write` are dead.
+`PageCacheBlockIO` (`bcachefs_adapter.rs:15-40`) uses `read`, `write_new`, `sync`
+and `block_count`, and `file_backing.rs` uses the module-level
+`raw_block_read`/`raw_block_write`; nothing else calls into the module at all.
+`#[allow(dead_code)]` sits on the `mod page_cache;` declaration
+(`main.rs:29`) on top of the crate-level one, so the compiler has never said so.
+
+`prefetch` is the interesting one: it is the only coalescing read path in the
+kernel, ~45 lines, and it was converted to the new index alongside the live
+sites without ever having executed. Either wire it up — the demand-paging path
+reads runs of blocks one at a time and is the obvious caller — or delete all
+four and drop the `allow`.
 
 ---
 

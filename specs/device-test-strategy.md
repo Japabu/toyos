@@ -23,7 +23,7 @@ Boundary per device class, and what exists today:
 | Display | QMP screendump + exact glyph decode | built (M0/M1) |
 | Input | QMP key/mouse injection | built (M2) |
 | Network | `filter-dump` pcap + harness-as-peer | planned (gate N) |
-| Storage | inspect the disk image host-side after shutdown | **nothing** |
+| Storage | inspect the disk image host-side after shutdown | shape built (`MetalDisk`), depth partial |
 | xHCI | boot-time device set, then QMP `device_add` / `device_del` | shape built (`MetalUsb`), lifecycle **nothing** |
 
 ## Priority: device *shape and lifecycle* before *protocol depth*
@@ -37,6 +37,16 @@ exist**, not from asserting harder against one configuration:
   ring two keyboards shared — both from having six devices (`MetalUsb`)
 - three daemons panicking — from removing audio and the NIC (M1)
 - the audio dropout — from load
+- the page cache's device-sized index, which killed the first boot on the T14 —
+  from the disk being 244 GB instead of 128 MB
+
+**A device's *size* is part of its shape, and it is the dimension this list
+missed.** Every config above varies which devices exist; none varied how big one
+is, and a kernel structure sized per device block is invisible on a 128 MB test
+disk and fatal on a 244 GB laptop one. `Profile::MetalDisk` closes it at zero
+cost: `File::set_len` gives a sparse image, so the guest sees the T14's exact
+namespace and the host spends 7.5 MB. Any device with a capacity — and that is
+most of them — should be asked for the real number rather than a token one.
 
 A shape matrix is also the cheapest thing to build: it is boot configurations,
 not new instruments. Five configs beyond metal-sim — no-USB-HID,
@@ -103,8 +113,13 @@ a test result.
    its service name with nothing behind it.
 2. **Lifecycle.** `device_add`/`device_del` mid-run: hotplug, removal under
    active I/O, claim-then-die-then-reclaim.
-3. **Storage ground truth.** Write files in-guest, shut down, mount the image
-   host-side, verify bytes. Nothing today proves an NVMe write ever lands.
+3. **Storage ground truth.** Started. `nvme_large_device` writes a file
+   in-guest, shuts down, and decodes both superblocks out of the image
+   host-side with the kernel's own parser — the clean flag reaches the platter
+   only through `PageCache::sync` and the backup only through a write at the far
+   end of the device, so one assertion covers write-back and capacity at once.
+   What is left is the file's *bytes*: that needs a file-backed `BlockIO` so the
+   harness can walk the btree rather than just the superblocks.
 4. **Gate N.** Already specified.
 
 ## No host stress tests, and no brute-force volume runs
