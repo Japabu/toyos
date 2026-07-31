@@ -83,7 +83,8 @@ toyos-sched/sim/                 # separate package: toyos-sched-sim (std, host-
   src/hw_impl.rs                 # SimHw: Hw impl over vm.rs (mock Arc payload, ctx_saved shadow)
   src/choice.rs                  # ChoiceStream: SmallRng(seed) | raw fuzz bytes | PCT priorities
   src/explore.rs                 # step chooser over the enabled-step relation, trace recorder
-  src/shrink.rs                  # delta-debugging minimizer; emits committed replay #[test]s
+  src/shrink.rs                  # delta-debugging minimizer; emits .trace corpus entries
+                                 #   (a header + decisions), NOT generated #[test] fns
   src/workload.rs                # Script DSL: Run | Block | Wake | Spawn | Exit | FutexOp
                                  #             | IrqAt | KernelSection(ns)  (preempt-off budget)
   src/scenarios.rs               # crash_md_exit_race, lost_wake_{pipe,futex,iouring,audio,listener},
@@ -132,22 +133,37 @@ pub struct TaskKey(pub u64);
 /// before a container move stay valid (kills B1's enabling condition).
 pub struct Task<X>(Box<TaskInner<X>>);
 
-struct TaskInner<X> {
+struct TaskInner<X: SchedPayload> {
     key: TaskKey,
-    shared: Arc<TaskShared>,   // state word + sticky bits + embedded nodes; outlives death
-    share: Arc<FairShare>,     // per-process fairness pot (§9.1)
-    arch_ctx: X::Ctx,          // saved callee context; X: SchedPayload supplies the type
-    rt: RtState,               // { permanent: bool, inherited: Option<Nanos /* boost expiry */> }
+    shared: Arc<TaskShared<Msg<X>>>,  // state word + sticky bits + embedded nodes; outlives death
+    share: Arc<Share<X>>,      // per-process fairness pot (§9.1); Share<X> = FairShare<X::ShareLock>
+    ctx: X::Ctx,               // saved callee context (named `ctx`, not `arch_ctx`)
+    rt: RtState,               // { permanent, inherited, lends } — see below
     acct: TaskAccounting,      // cpu ns, blocked-by-class ns, runqueue-wait ns, timestamps
-    adopt_node: MailboxNode,   // this task's Adopt message rides inside its own record
-    pub ext: X,                // kernel: { kernel_stack, address_space Arc, fs_base, .. }
+    since: Nanos,              // when the CURRENT residency began — one field, one state
+    adopt_node: MailboxNode<Msg<X>>,  // this task's Adopt message rides inside its own record
+    ext: Option<X>,            // Option, not X: taken by finalize; still present at drop is the
+                               // drop bomb that turns an illegal death into a panic at the site
 }
 
-pub trait SchedPayload: Sized { type Ctx: Sized; }
+pub trait SchedPayload: Sized + Send + 'static {
+    type Ctx: Sized + Send;
+    /// The cell the per-process FairShare lives in — supplied by the environment
+    /// because the core crate may not implement a lock itself.
+    type ShareLock: LeafLock<ShareState> + Send;
+}
 ```
 
+`RtState` carries a third field the spec omitted: **`lends: u32`**, the count of lends that
+actually extended the window. It lives in the core because invariant I9 — running time at the
+borrowed priority, *per lend* — is not checkable without it: `RtState::arm` moves `inherited`
+forward on re-arm, so an outside observer watching the deadline alone cannot tell a fresh grant
+from a re-arm.
+
 **Deliberate omission (container-resident state data):** `TaskInner` has **no `deadline` field,
-no `blocked_on`, no `enqueued_at`**. Data meaningful only in one lifecycle state lives in that
+no `blocked_on`, no `enqueued_at`** — but it does have `since`, one timestamp reused across
+states (enqueue time while ready, dispatch time while running, park time while blocked),
+precisely because a task is in exactly one state at a time. Data meaningful only in one lifecycle state lives in that
 state's container (§6.1) — a task that is not parked *structurally cannot have* a deadline. This
 removes the duplicate-truth field that Design 0 originally carried.
 
@@ -173,16 +189,20 @@ pub struct DeadTask<X>(Task<X>);     // exists only in CpuSched.zombie, until fi
 | From | To | Function (crate-private, invoked only by `SchedPass`/mailbox handlers) | Trigger |
 |---|---|---|---|
 | (spawn) | `TransitTask` | `TaskBuilder::build(entry: X::Ctx, ext: X) -> TransitTask<X>` | spawn |
-| `TransitTask` | `ReadyTask` | `adopt(self, cpu) -> Result<ReadyTask<X>, DeadTask<X>>` — kill bit checked | `Msg::Adopt` handled |
+| `TransitTask` | `ReadyTask` | `adopt(self, cpu, now) -> Result<ReadyTask<X>, DeadTask<X>>` — kill bit checked | `Msg::Adopt` handled |
 | `ReadyTask` | `RunningTask` | `dispatch(self, cpu, now) -> RunningTask<X>` — asserts the `Ready(cpu) → Running(cpu)` transition, **not** the kill bit (see below) | pick |
-| `ReadyTask` | `TransitTask` | `migrate(self, dst) -> TransitTask<X>` | balance decision |
-| `ReadyTask` | `DeadTask` | `reap(self) -> DeadTask<X>` | kill bit observed |
-| `RunningTask` | `ReadyTask` | `preempt(self, now) -> ReadyTask<X>` — clears expired inherited RT | quantum/yield |
-| `RunningTask` | `BlockedTask` | `park(self, ticket: CommittedTicket, now) -> BlockedTask<X>` | block |
-| `RunningTask` | `DeadTask` | `die(self, now) -> DeadTask<X>` | exit / kill honored |
-| `BlockedTask` | `ReadyTask` | `wake(self, cause: WakeCause, now) -> ReadyTask<X>` — applies boost | `Msg::Wake` / local deadline |
-| `BlockedTask` | `DeadTask` | `reap(self) -> DeadTask<X>` | `Msg::Retire` handled |
+| `ReadyTask` | `TransitTask` | `migrate(self, from, dst, now) -> TransitTask<X>` | balance decision |
+| `ReadyTask` | `DeadTask` | `reap(self, cpu, now) -> DeadTask<X>` | kill bit observed |
+| `RunningTask` | `ReadyTask` | `preempt(self, cpu, now) -> ReadyTask<X>` — clears expired inherited RT | quantum/yield |
+| `RunningTask` | `BlockedTask` | `park(self, ticket: &CommittedTicket, cpu, now) -> BlockedTask<X>` — ticket **by reference**: parking does not consume the proof | block |
+| `RunningTask` | `DeadTask` | `die(self, cpu, now) -> DeadTask<X>` | exit / kill honored |
+| `BlockedTask` | `ReadyTask` | `wake(self, cpu, cause: WakeCause, class: WaitClass, now) -> ReadyTask<X>` — applies boost | `Msg::Wake` / local deadline |
+| `BlockedTask` | `DeadTask` | `reap(self, cpu, class: WaitClass, now) -> DeadTask<X>` | `Msg::Retire` handled |
 | `DeadTask` | (gone) | `finalize(self) -> (TaskKey, X, TaskAccounting)` — exactly once | next pass, different stack |
+
+Every transition takes `cpu` and `now` as values — `cpu` because identity is never an ambient
+query (§6.1) and `now` because the driver samples the clock once per pass and threads it, so a
+replay is reproducible. The spec's original signatures omitted both throughout.
 
 **Why `dispatch` does not assert the kill bit clear.** A remote CPU sets that bit at any
 instant, so the assert would be a race rather than a check — it would fire on legal
@@ -239,12 +259,23 @@ pub struct CpuSched<X: SchedPayload> {
     id: CpuId,                                   // identity is a FIELD, never an ambient query
     running: Option<RunningTask<X>>,
     rq: RunQueue<X>,                             // §9.2
-    parked: HashMap<TaskKey, ParkedEntry<X>>,
-    deadlines: BinaryHeap<Reverse<(Nanos, TaskKey)>>,  // lazy deletion; validated against `parked`
+    parked: BTreeMap<TaskKey, ParkedEntry<X>>,   // BTreeMap, not HashMap (no_std, ordered)
+    deadlines: DeadlineHeap,                     // named type; lazy deletion, validated against `parked`
     zombie: Option<DeadTask<X>>,                 // freed by the NEXT pass (can't free the stack we run on)
-    mailbox: MailboxConsumer<X>,
-    steal_probe: StealNode,                      // this CPU's single reusable StealRequest node (§7.7)
+    mailbox: MailboxConsumer<Msg<X>>,
+    steal_probe: MailboxNode<Msg<X>>,            // NOT a StealNode — see §7.7
+    steal_requests: Vec<CpuId>,                  // thieves that asked this pass; answered in `finish`
+                                                 //   from surplus, AFTER the pick, so answering can
+                                                 //   never hand away the task we were about to run
     quantum_end: Nanos,
+    loaded: Loaded,                              // which context is loaded — distinct from `running`,
+                                                 //   which is None between a park and the switch off
+                                                 //   the parked task's stack
+    loaded_ctx: *mut X::Ctx,
+    idle_ctx: Box<X::Ctx>,
+    armed: Option<Nanos>,                        // what the one-shot timer is programmed to (invariant T)
+    #[cfg(feature = "protocol-port")]
+    park_keeps_lapsed_lend: bool,                // negative-gate escape hatch only
     _not_sync: PhantomData<*mut ()>,             // !Sync, !Send
 }
 
@@ -252,7 +283,8 @@ pub struct ParkedEntry<X> {
     task: BlockedTask<X>,
     deadline: Option<Nanos>,      // THE deadline — exists only while parked (CT, §5.1)
     class: WaitClass,             // Io | Futex | Pipe | Ipc | Other — accounting
-    since: Nanos,
+    // No `since`: the park timestamp lives in `TaskInner.since`, which is the
+    // one-field-one-state rule of §5.1 applied here rather than an omission.
 }
 ```
 
@@ -299,7 +331,12 @@ impl<'c, X> SchedPass<'c, X, Undisposed> {
     /// in a simulator and the source of deadline-vs-arming skew. Entry drains the
     /// mailbox, fires due local deadlines, charges the running task's vruntime.
     /// Runs with preemption disabled, IRQs enabled.
-    pub fn begin(cpu: CpuToken<'c>, now: Nanos) -> Self;
+    // There is no `CpuToken`. The pass borrows the CpuSched directly and carries
+    // its environment: `Env { hw, cpus, frontier, preempt, steal }`.
+    pub fn begin(cpu: &'c mut CpuSched<H::Payload>, env: Env<'e, H, P>, now: Nanos) -> Self;
+    // `Env.steal` is a runtime FIELD, not a cfg — whether an idle pass probes and a
+    // loaded pass answers (§7.7, §9.4's pull half). A field so that both settings stay
+    // compiled and simulatable; Stage 7a shipped with it false and 7b turned it on.
 
     // Exactly one disposition; each consumes the pass:
     pub fn dispose_yield(self)                     -> SchedPass<'c, X, Disposed>;
@@ -368,8 +405,17 @@ Stage 2's `irq_ring`), call the wake entry (§8), and set `need_resched`. This i
 `kernel/src/scheduler.rs` entry points assert, before constructing any pass:
 
 ```rust
-assert_eq!(preempt::depth(), SCHED_BASELINE,
-    "scheduler entered while a lock is held");
+// scheduler.rs:42-49 — `assert!`, not `assert_eq!`, and `preempt::count()`,
+// not `preempt::depth()`. `#[track_caller]` all the way down is what makes the
+// message point at the offending caller instead of at these three lines.
+#[track_caller]
+fn assert_baseline(baseline: u32) {
+    let depth = crate::preempt::count();
+    assert!(
+        depth == baseline,
+        "scheduler entered while a lock is held: preempt depth {depth}, baseline {baseline}",
+    );
+}
 ```
 
 Every kernel `Lock` guard increments the preempt count, so *calling the scheduler while holding
@@ -569,28 +615,54 @@ No allocation, no recycling race; covered in `loom_mailbox.rs`.
 Every waitable kernel object (pipe end, futex bucket, listener, io_uring CQ, driver queues) owns a
 `WaitQueue`. Waiter nodes are embedded in `TaskShared.wait_node` (a task waits on at most one
 queue — multi-wait is io_uring's job, aligned with the io_uring-only-blocking direction). The
-queue's internal list is protected by an `IrqSafeRaw` leaf lock: a few-instruction, IRQ-off
-critical section that never acquires anything beneath it — the only lock the wake path ever holds,
-and it is never held across a pass or a switch.
+queue's internal list is protected by a leaf lock the **environment supplies** as the type
+parameter `L: LeafLock<WaitList<M>>` — the kernel passes its IRQ-off leaf lock, loom passes a
+`loom::sync::Mutex`. There is no `IrqSafeRaw` type in the core; inverting it this way is what
+keeps `unsafe` confined to `mailbox.rs`. The discipline is unchanged: a few-instruction critical
+section that never acquires anything beneath it, the only lock the wake path holds, never held
+across a pass or a switch.
 
 ```rust
 // toyos-sched/src/waitq.rs
-pub struct WaitQueue { class: WaitClass, /* intrusive list under IrqSafeRaw */ }
+pub struct WaitQueue<M: SchedMsg, L: LeafLock<WaitList<M>>> { /* waiters behind L */ }
 
-impl WaitQueue {
+impl<M, L> WaitQueue<M, L> {
     /// Phase 1: register current task; CAS Running -> Committing(gen).
-    #[must_use] pub fn prepare_wait(&self, cur: &CurrentTask<'_>) -> WaitTicket<'_>;
+    #[must_use] pub fn prepare_wait<'q>(&'q self, cur: &CurrentTask<'_, M>) -> WaitTicket<'q, M, L>;
     /// The ONLY wake entries in the entire kernel:
-    pub fn wake_one(&self, cause: WakeCause);
+    pub fn wake_one(&self, cause: WakeCause) -> bool;   // returns whether one was claimed
     pub fn wake_all(&self, cause: WakeCause);
 }
-impl<'q> WaitTicket<'q> {   // !Send, #[must_use = "must be blocked on or cancelled"]
-    pub fn cancel(self);    // condition became true; dequeues, Committing -> Running
+impl<'q, M, L> WaitTicket<'q, M, L> {   // !Send, #[must_use]
+    pub fn cancel(self) -> Cancelled;   // condition became true; dequeues, Committing -> Running
+    pub fn commit(self) -> Commit<'q, M, L>;   // phase 2 — see below
 }
-// Phase 2, in kernel/src/sched/mod.rs:
-pub fn block_on(t: WaitTicket<'_>, deadline: Option<Nanos>) -> WakeReason;
+
+/// The three answers phase 2 can give. The spec previously named none of them.
+pub enum Commit<'q, M, L> {
+    /// Word is `Blocked`; the pass may park. The `Registration` MUST be finished.
+    Parked(CommittedTicket<M>, Registration<'q, M, L>),
+    /// A wake landed between registration and commit: do not park, do not switch.
+    AlreadyWoken,
+    /// A retire landed while deciding to park. Registration already withdrawn,
+    /// word back to `Running(cpu)`: dispose the pass by *exiting*, not parking.
+    Killed,
+}
+
+// Phase 3, in kernel/src/scheduler.rs (NOT sched/mod.rs):
+pub fn block_on(ticket: Ticket<'_>, deadline: u64);
 // join/waitpid/sleep funnel: waitq::wake_direct(&shared, cause, ..) — free fn, same claim CAS.
 ```
+
+**`Registration` is the piece the spec omitted entirely, and it is load-bearing.** A *timeout*
+leaves the waiter on the queue: the local deadline fire wins the same claim CAS a waker would,
+and the core does not know which queue the task was on — nor should it, since the scheduler
+knows only tasks, tickets and causes. The leftover is not untidy, it is a lost wake: once the
+task parks on a *second* queue, a `wake_one` on the first finds it `Blocked`, claims it, and
+spends that queue's wake on a waiter no longer waiting for it. Holding the guard across the
+block, on the task's own stack, makes the cleanup structural instead of one more per-source
+recheck — and its `Drop` asserts, so forgetting to `finish()` is a panic at the site rather
+than a wake that vanishes later.
 
 Uniform usage (pipe read shown; futex inserts its value check; io_uring checks CQ depth):
 
@@ -739,7 +811,9 @@ exact production arithmetic:
 
 ```rust
 // toyos-sched/src/fair.rs
-pub struct FairShare { state: SpinSmall<ShareState> }    // word-sized critical sections
+pub struct FairShare<L> { state: L }   // L: LeafLock<ShareState>, supplied by the environment
+// There is no `SpinSmall` type. The core does not implement a lock; the kernel passes its
+// leaf lock and loom passes an instrumented one — same inversion as WaitQueue's `L` (§8.1).
 enum ShareState {
     Runnable { vruntime: u64, runnable_threads: NonZeroU32, lag_at_wake: i64 },
     NonRunnable { lag: i64 },     // clamped ±MAX_VRUNTIME_LAG_NS, re-derived vs frontier on wake
@@ -980,7 +1054,7 @@ strong one, and they are strong because they fire on every run. Stage 7 keeps th
 | 3 | **Primitives + loom.** `mailbox.rs` (incl. preempt-disabled push), `waitq.rs` (state word, ticket, wake_one retry), sleep handshake, retire CAS. Kernel untouched. | H (all loom suites) |
 | 4 | **Core machine + simulator + validation gate.** `cpu.rs`, `queue.rs`, `timer.rs`, `invariants.rs`; VM, ChoiceStream (seed/fuzz/PCT), shrinker, replay emitter, corpus. Scenarios: crash_md_exit_race, the five lost-wake windows, idle_hlt_race, rt_wake_latency, audio_pipeline (soundd-shaped RT daemon + hog + clients, `cpus=1` first-class), futex/fork storms. **Exit criterion: `old_steal_port` fails; new protocol passes 10⁴ seeds + 10⁷ fuzz steps per scenario class with zero violations.** | H, S |
 | 5 | **Per-source WaitQueue conversion under the OLD scheduler** — one green commit per source: pipes, futex (delete `FUTEX_WAKE_GEN` + `FUTEX_LOCK` dance), listener, audio fd, io_uring, join (`wake_task`). Each site adopts the `prepare_wait`/`cancel`/`block_on` shape via a shim that parks in the existing pool; the shim generalizes the IoUring-only `handle_outgoing` recheck into one `ticket.fired()` recheck applied to **every** converted source after pool insertion. *Honesty note:* this closes each source's practical decide-to-park window via the recheck; the structural (message-serialized) closure lands at Stage 7 — the claim "window closed" is scoped accordingly. | B, T, A per commit |
-| 6 | **KernelHw under the old scheduler.** ✅ Done. `kernel/src/hw.rs` implements `Machine` (not `Hw` — see §10.1); `arm_one_shot`/`stop_timer`/`kick_cpu`/`now`/idle `hlt`/`need_resched` and the trace ring route through it. Broadcast kicks were already dead: `kick_cpu` had been a targeted ICR since before this stage, and the two surviving broadcasts (`tlb_shootdown`, `halt_all_cpus`) are not on the scheduler path. De-risked the surface on real interrupts before cutover, and caught one real regression doing it (see §10.1 and the accounting note in `run_task_on_self`). | B, T, A |
+| 6 | **KernelHw under the old scheduler.** ✅ Done. `kernel/src/hw.rs` implements `Machine` (not `Hw` — see §10.1; it gained `Hw` at 7a, and today implements `Kicker`, `Machine` and `Hw`); `arm_one_shot`/`stop_timer`/`kick_cpu`/`now`/idle `hlt`/`need_resched` and the trace ring route through it. Broadcast kicks were already dead: `kick_cpu` had been a targeted ICR since before this stage, and the two surviving broadcasts (`tlb_shootdown`, `halt_all_cpus`) are not on the scheduler path. De-risked the surface on real interrupts before cutover, and caught one real regression doing it (see §10.1 and the accounting note in `run_task_on_self`). | B, T, A |
 | 7 | **Cutover, sub-staged** (each sub-stage boots and gates): **7a** ✅ Done — percpu `CpuSched`, driver idle loop + asm switch + trampoline, park-before-switch, message wakes, with `StealRequest`/balance **disabled** via `Env::steal` (wake-time push placement only). Scope correction learned by doing: 7a cannot leave the legacy body compiled, because the kernel builds with `-D warnings` and dead code is an error — so it deleted everything the cutover orphaned and 7c inherits only `EventSource`/`source_ready` and `Lock::force_unlock`. `retire_task` stayed synchronous (post `Msg::Retire`, then yield until the word reads `Dead`) because process teardown frees memory the target's page tables still map. **7b** ✅ Done — `Env::steal` on, so an idle pass probes and a loaded pass answers from surplus; and `retire_task` posts its message and then *parks*, on a wait queue owned by the target's own `TaskHandle` and woken by `Hw::release`. The wait condition moved from "the word reads `Dead`" to "the payload has been dropped", which is what the callers need and what `Dead` never guaranteed — it is published one pass earlier, while the dying CPU is still on that thread's kernel stack. §7.6's `notify` field was deliberately not added: a running target dies at a later safe point, so the notify would need stashing for whichever site kills it, and `Hw::release` already is that single site on the kernel side. Measured result, honestly: 7b moved **none** of the smp=8 counter breaches 7a was red on, and the same wake-lateness outlier occurs at `-smp 1`, so §9.4's pull half is not what that tail was about — see the known-issue entry in CLAUDE.md. **7c** ✅ Done — the legacy body is gone: `handle_outgoing`, `park_outgoing`, `finish_fresh_thread_switch`, `wake_by_event`/`EventSource`, `drain_events`, `PERCPU_EVENTS`, `IN_SCHEDULE`, `KILLED`, `CTX_TRANSITS`, `CpuQueueGuard::into_raw`, `Lock::force_unlock`, `loader.rs` trampoline unlock, global blocked pool, `sched_state` map — most died at 7a (dead code is a build error, so the cutover deleted what it orphaned), the rest (`EventSource` → `io_uring::Source`, `source_ready` → `Source::is_ready`, `Lock::force_unlock`) at 7c. **Correction: `POISONED` was *not* deleted** — this list said it was. It is live panic-recovery machinery: `scheduler.rs:398` declares it, `:402`/`:418` use it, and `driver.rs:568` reaps it every idle-loop iteration. Only the *scan* died. A reader taking this list literally would delete working code. `SHARES` (`scheduler.rs:96`) likewise still exists. `scheduler.rs` is **not** removed: it survives as the kernel-facing API with the driver half under `kernel/src/sched/` — the accepted divergence recorded in `specs/scheduler-migration-log.md`. The §6.4 preempt-count baseline asserts did **not** land at any sub-stage; they landed after 7c as their own task, and closing them first required making the preempt count conserved across a switch (§6.4, and the log). | B, T, **A(strict)** per sub-stage, S |
 | 8 | **Consolidation.** Remove shims (callers hold `WaitQueue`s directly, converging on io_uring-only blocking); privilege-gate `SYS_SET_RT_PRIORITY`; wire sim fuzz into CI (fixed corpus + N seeded runs, seeds logged; nightly long fuzz with auto-minimized corpus PRs); panic-path reentry flag hardening; update CLAUDE.md architecture + known issues. | B, T, A, H, S |
 | 9 | **Scale stage (sim-gated).** Per-CPU vruntime frontier with epoch reconciliation piggybacked on Adopt messages (replaces the global `fetch_max`) — gated on I5 fairness bounds vs the global-frontier reference across FairnessStorm at 1–128 vcpus; TSC-deadline `set_timer`; 128-vcpu sim sweeps as the standing scheduling-overhead benchmark; QEMU `-smp` sweep. | B, T, A, S |
