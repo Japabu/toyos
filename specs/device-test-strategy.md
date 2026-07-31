@@ -133,6 +133,29 @@ The rule: a test earns its runtime by asserting something that can be false.
 If you cannot state what a run would have to observe to go red, more iterations
 will not supply it.
 
+### Load the guest, never the host
+
+Host load has never produced a finding here and has repeatedly produced false
+ones. It does not stress the system under test — it degrades the instrument:
+
+- two agents building in one target directory produced a rustc ICE
+  (`Error writing pre-lto-bitcode file`), first read as a fork bug, actually
+  incremental-cache corruption from contention;
+- a 30-iteration audio gate run had to be killed at iteration 6 when other
+  agents started sharing the machine, rather than record data nobody could
+  trust;
+- `audio_tone.smp1`'s 54 ms and 57 ms wake-lateness outliers sat in the
+  recorded baseline as a suspected scheduler finding for two days; they never
+  reappeared in either arm of a quiet-machine A/B, and host suspend is the
+  leading explanation.
+
+Guest load is the opposite and has paid repeatedly: `audio_tone_load` runs CPU
+burners *inside* ToyOS, is the config where the stream-start dropout showed
+worst, and is audio spec §5.10's first-class case. That is load on the subject.
+
+Starving QEMU itself could be a legitimate experiment one day, but it would be
+a deliberate isolated one — never background contention during a normal run.
+
 ## What not to build
 
 A gate-A-style distributional tier per device. That instrument costs ~17 minutes
