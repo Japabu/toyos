@@ -258,9 +258,18 @@ impl Vfs {
         }
     }
 
-    /// Open a file for fd-based I/O. Returns (FileId, optional backing).
-    pub fn open_file(&mut self, path: &str) -> Option<(FileId, Option<alloc::sync::Arc<dyn crate::file_backing::FileBacking>>)> {
-        self.open_file_depth(path, 0)
+    /// Open a file for fd-based I/O.
+    ///
+    /// The backing the filesystem hands back is registered with the file
+    /// cache rather than returned: it belongs to the file, not to the fd that
+    /// happened to open it, and eviction is only sound for pages the cache
+    /// itself knows how to fetch again.
+    pub fn open_file(&mut self, path: &str) -> Option<FileId> {
+        let (file_id, backing) = self.open_file_depth(path, 0)?;
+        if let Some(backing) = backing {
+            crate::file_cache::set_backing(file_id, backing);
+        }
+        Some(file_id)
     }
 
     fn open_file_depth(&mut self, path: &str, depth: u32) -> Option<(FileId, Option<alloc::sync::Arc<dyn crate::file_backing::FileBacking>>)> {
@@ -307,10 +316,19 @@ impl Vfs {
             crate::file_cache::copy_page_out(file_id, page_idx, &mut buf);
             fs.write_page(file_id, page_idx, &buf)?;
         }
-        crate::file_cache::clear_dirty(file_id);
+        crate::file_cache::clear_dirty(file_id, &dirty);
 
         let size = crate::file_cache::size(file_id);
-        fs.update_metadata(file_id, size, mtime)
+        fs.update_metadata(file_id, size, mtime)?;
+
+        // A file created in this boot had no blocks to point a backing at,
+        // so its pages were unevictable up to here. They are on disk now.
+        if !crate::file_cache::has_backing(file_id) {
+            if let Some(backing) = fs.open_backing(&fs_path) {
+                crate::file_cache::set_backing(file_id, backing);
+            }
+        }
+        Ok(())
     }
 
     /// Close a file (release filesystem state when last ref drops).

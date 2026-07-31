@@ -26,7 +26,6 @@ mod mouse;
 #[cfg(feature = "test-input-merge")]
 mod input_merge_test;
 mod block;
-#[allow(dead_code)]
 mod page_cache;
 mod file_cache;
 mod tmpfs;
@@ -344,6 +343,7 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     pci::enumerate(&ecam);
     let nvme_dev = nvme::init(&ecam).expect("NVMe: no controller found");
     page_cache::init(Box::new(nvme_dev));
+    file_cache::init();
 
     let bcachefs_instance = match bcachefs_adapter::mount() {
         Some(fs) => fs,

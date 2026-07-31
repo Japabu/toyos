@@ -1,7 +1,9 @@
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::collections::BTreeSet;
+use alloc::sync::Arc;
 
+use crate::block;
 use crate::file_backing::FileBacking;
 use crate::sync::Lock;
 
@@ -9,32 +11,66 @@ pub type FileId = u64;
 
 const PAGE_SIZE: usize = 4096;
 
+struct CachedPage {
+    data: Box<[u8; PAGE_SIZE]>,
+    dirty: bool,
+    /// CLOCK's second-chance bit: set on every hit, cleared when the sweep
+    /// passes it over.
+    referenced: bool,
+}
+
 struct CachedFile {
-    pages: BTreeMap<u32, Box<[u8; PAGE_SIZE]>>,
-    dirty: BTreeSet<u32>,
+    pages: BTreeMap<u32, CachedPage>,
     size: u64,
     evictable: bool,
+    /// Where an evicted page comes back from. A file with no backing is one
+    /// nothing can re-read — a tmpfs file, or a disk file created in this
+    /// boot whose blocks the filesystem has not allocated yet — and dropping
+    /// one of its pages loses the only copy.
+    backing: Option<Arc<dyn FileBacking>>,
     ref_count: u32,
     deleted: bool,
+}
+
+impl CachedFile {
+    /// Whether this file's pages are a *copy* of something on disk. Only
+    /// those are governed by the budget and only those may be evicted:
+    /// a tmpfs page is the file, not a cache of it.
+    fn is_cache(&self) -> bool {
+        self.evictable && self.backing.is_some()
+    }
 }
 
 struct FileCache {
     files: BTreeMap<FileId, CachedFile>,
     next_id: u64,
-    total_pages: usize,
+    /// Resident pages belonging to files that satisfy `is_cache`.
+    cached_pages: usize,
     max_pages: usize,
+    evictions: u64,
+    /// CLOCK hand, in (file, page) key order. Kept across calls so the sweep
+    /// costs one step per eviction rather than a scan of the whole cache.
+    hand: (FileId, u32),
 }
 
 static FILE_CACHE: Lock<FileCache> = Lock::new(FileCache {
     files: BTreeMap::new(),
     next_id: 1,
-    total_pages: 0,
-    max_pages: usize::MAX,
+    cached_pages: 0,
+    // Zero, not `usize::MAX`: a budget that was never installed has to be a
+    // loud kernel bug, and this one shipped for the life of the boot as a
+    // ceiling nothing could reach.
+    max_pages: 0,
+    evictions: 0,
+    hand: (0, 0),
 });
 
-/// Initialize the file cache with a memory budget.
-pub fn init(max_pages: usize) {
+/// Install the memory budget. Must run after the PMM knows how much RAM the
+/// machine has and before any file is opened.
+pub fn init() {
+    let max_pages = block::file_cache_pages();
     FILE_CACHE.lock().max_pages = max_pages;
+    log!("file cache: budget {} pages ({} MiB)", max_pages, max_pages * PAGE_SIZE / (1024 * 1024));
 }
 
 /// Allocate a new FileId. The file cache is the sole allocator.
@@ -44,13 +80,34 @@ pub fn create_file(evictable: bool) -> FileId {
     cache.next_id += 1;
     cache.files.insert(id, CachedFile {
         pages: BTreeMap::new(),
-        dirty: BTreeSet::new(),
         size: 0,
         evictable,
+        backing: None,
         ref_count: 1,
         deleted: false,
     });
     id
+}
+
+/// Point a file at the store its evicted pages come back from. Idempotent:
+/// every open of the same file hands over an equivalent backing.
+pub fn set_backing(file_id: FileId, backing: Arc<dyn FileBacking>) {
+    let mut cache = FILE_CACHE.lock();
+    let now_governed;
+    {
+        let Some(file) = cache.files.get_mut(&file_id) else { return };
+        let was_cache = file.is_cache();
+        file.backing = Some(backing);
+        now_governed = if !was_cache && file.is_cache() { file.pages.len() } else { 0 };
+    }
+    cache.cached_pages += now_governed;
+    evict_if_needed(&mut cache);
+}
+
+/// Whether an evicted page of this file could be read back. False for tmpfs,
+/// and for a disk file created in this boot until its blocks exist.
+pub fn has_backing(file_id: FileId) -> bool {
+    FILE_CACHE.lock().files.get(&file_id).is_some_and(|f| f.backing.is_some())
 }
 
 /// Increment ref_count for an open fd.
@@ -68,8 +125,7 @@ pub fn release(file_id: FileId) -> bool {
     file.ref_count = file.ref_count.saturating_sub(1);
     if file.ref_count == 0 {
         if file.deleted || file.evictable {
-            let removed = cache.files.remove(&file_id).unwrap();
-            cache.total_pages -= removed.pages.len();
+            drop_file(&mut cache, file_id);
         }
         // Non-evictable (tmpfs) files with ref_count 0 keep their pages.
         true
@@ -78,20 +134,14 @@ pub fn release(file_id: FileId) -> bool {
     }
 }
 
-/// Read from a file page into `buf`. Handles cache miss via backing.
+/// Read from a file page into `buf`. Handles cache miss via the file's backing.
 /// Lock is NOT held during disk I/O (unlock-fetch-relock pattern).
-pub fn read_page(
-    file_id: FileId,
-    page_idx: u32,
-    offset: usize,
-    buf: &mut [u8],
-    backing: Option<&dyn FileBacking>,
-) {
-    let file_size;
+pub fn read_page(file_id: FileId, page_idx: u32, offset: usize, buf: &mut [u8]) {
+    let backing;
     {
-        let cache = FILE_CACHE.lock();
-        let Some(file) = cache.files.get(&file_id) else { return };
-        file_size = file.size;
+        let mut cache = FILE_CACHE.lock();
+        let Some(file) = cache.files.get_mut(&file_id) else { return };
+        let file_size = file.size;
 
         // Beyond file size: zero-fill, no cache insert.
         if (page_idx as u64) * PAGE_SIZE as u64 >= file_size {
@@ -99,87 +149,102 @@ pub fn read_page(
             return;
         }
 
-        if let Some(page) = file.pages.get(&page_idx) {
+        if let Some(page) = file.pages.get_mut(&page_idx) {
+            page.referenced = true;
             let avail = valid_bytes_in_page(page_idx, file_size);
-            copy_page_region_to_buf(&page[..], offset, buf, avail);
+            copy_page_region_to_buf(&page.data[..], offset, buf, avail);
             return;
         }
+        backing = file.backing.clone();
     }
     // Cache miss: unlock, fetch from backing, re-lock, insert if still absent.
 
     let mut fetched = [0u8; PAGE_SIZE];
-    if let Some(backing) = backing {
+    if let Some(backing) = &backing {
         backing.read_page(page_idx as u64 * PAGE_SIZE as u64, &mut fetched);
     }
     // else: tmpfs miss → zero-filled page (fetched is already zeroed)
 
     let mut cache = FILE_CACHE.lock();
-    let mut inserted = false;
+    let mut added = 0;
     {
         let Some(file) = cache.files.get_mut(&file_id) else { return };
+        let is_cache = file.is_cache();
         if !file.pages.contains_key(&page_idx) {
-            file.pages.insert(page_idx, Box::new(fetched));
-            inserted = true;
+            file.pages.insert(page_idx, CachedPage::new(fetched));
+            added = is_cache as usize;
         }
-        let page = &**file.pages.get(&page_idx).unwrap();
-        let avail = valid_bytes_in_page(page_idx, file.size);
-        copy_page_region_to_buf(page, offset, buf, avail);
+        let file_size = file.size;
+        let page = file.pages.get_mut(&page_idx).unwrap();
+        page.referenced = true;
+        let avail = valid_bytes_in_page(page_idx, file_size);
+        copy_page_region_to_buf(&page.data[..], offset, buf, avail);
     }
-    if inserted { cache.total_pages += 1; }
+    cache.cached_pages += added;
     evict_if_needed(&mut cache);
 }
 
-/// Write data into a file page. Handles cache miss via backing.
+/// Write data into a file page. Handles cache miss via the file's backing.
 /// Lock is NOT held during disk I/O for cache misses.
-pub fn write_page(
-    file_id: FileId,
-    page_idx: u32,
-    offset: usize,
-    data: &[u8],
-    backing: Option<&dyn FileBacking>,
-) {
-    let need_fetch;
+pub fn write_page(file_id: FileId, page_idx: u32, offset: usize, data: &[u8]) {
+    // A resident page is written under the acquisition that found it. The
+    // fetch path below drops the lock, and a sibling CPU's eviction inside
+    // that window would otherwise leave the write merging into a blank page.
+    let backing;
     {
-        let cache = FILE_CACHE.lock();
-        let Some(file) = cache.files.get(&file_id) else { return };
-        need_fetch = !file.pages.contains_key(&page_idx);
-    }
-
-    if need_fetch {
-        let page_start = page_idx as u64 * PAGE_SIZE as u64;
-        let mut fetched = [0u8; PAGE_SIZE];
-        if let Some(backing) = backing {
-            let backing_size = backing.file_size();
-            if page_start < backing_size {
-                backing.read_page(page_start, &mut fetched);
-            }
-        }
-
         let mut cache = FILE_CACHE.lock();
-        let mut inserted = false;
-        if let Some(file) = cache.files.get_mut(&file_id) {
-            if !file.pages.contains_key(&page_idx) {
-                file.pages.insert(page_idx, Box::new(fetched));
-                inserted = true;
+        {
+            let Some(file) = cache.files.get_mut(&file_id) else { return };
+            if file.pages.contains_key(&page_idx) {
+                apply_write(file, page_idx, offset, data);
+                backing = None;
+            } else {
+                backing = Some(file.backing.clone());
             }
         }
-        if inserted { cache.total_pages += 1; }
+        if backing.is_none() {
+            evict_if_needed(&mut cache);
+            return;
+        }
+    }
+    let backing = backing.unwrap();
+
+    let mut fetched = [0u8; PAGE_SIZE];
+    if let Some(backing) = &backing {
+        let page_start = page_idx as u64 * PAGE_SIZE as u64;
+        if page_start < backing.file_size() {
+            backing.read_page(page_start, &mut fetched);
+        }
     }
 
+    // Re-fetching after a sibling's eviction is always correct: only clean
+    // pages are ever evicted, and a clean page is by definition what the
+    // backing returns.
     let mut cache = FILE_CACHE.lock();
+    let mut added = 0;
     {
         let Some(file) = cache.files.get_mut(&file_id) else { return };
-        let page = file.pages.get_mut(&page_idx).unwrap();
-        let end = (offset + data.len()).min(PAGE_SIZE);
-        page[offset..end].copy_from_slice(&data[..end - offset]);
-        file.dirty.insert(page_idx);
-
-        let write_end = page_idx as u64 * PAGE_SIZE as u64 + end as u64;
-        if write_end > file.size {
-            file.size = write_end;
+        if !file.pages.contains_key(&page_idx) {
+            file.pages.insert(page_idx, CachedPage::new(fetched));
+            added = file.is_cache() as usize;
         }
+        apply_write(file, page_idx, offset, data);
     }
+    cache.cached_pages += added;
     evict_if_needed(&mut cache);
+}
+
+fn apply_write(file: &mut CachedFile, page_idx: u32, offset: usize, data: &[u8]) {
+    let page = file.pages.get_mut(&page_idx).expect("write_page: page not resident");
+    let end = (offset + data.len()).min(PAGE_SIZE);
+    page.data[offset..end].copy_from_slice(&data[..end - offset]);
+    page.dirty = true;
+    page.referenced = true;
+
+    let write_end = page_idx as u64 * PAGE_SIZE as u64 + end as u64;
+    if write_end > file.size {
+        file.size = write_end;
+    }
 }
 
 /// Copy a full page out for flushing. Lock held only for the copy.
@@ -187,7 +252,7 @@ pub fn copy_page_out(file_id: FileId, page_idx: u32, buf: &mut [u8; PAGE_SIZE]) 
     let cache = FILE_CACHE.lock();
     if let Some(file) = cache.files.get(&file_id) {
         if let Some(page) = file.pages.get(&page_idx) {
-            *buf = **page;
+            *buf = *page.data;
             return;
         }
     }
@@ -198,15 +263,24 @@ pub fn copy_page_out(file_id: FileId, page_idx: u32, buf: &mut [u8; PAGE_SIZE]) 
 pub fn clone_dirty(file_id: FileId) -> BTreeSet<u32> {
     let cache = FILE_CACHE.lock();
     cache.files.get(&file_id)
-        .map(|f| f.dirty.clone())
+        .map(|f| f.pages.iter().filter(|(_, p)| p.dirty).map(|(&i, _)| i).collect())
         .unwrap_or_default()
 }
 
-/// Clear the dirty set after a successful flush.
-pub fn clear_dirty(file_id: FileId) {
+/// Mark the pages a flush actually wrote as clean.
+///
+/// Only those: the flush drops the lock between reading the dirty set and
+/// writing each page, so a page dirtied in that window has not reached disk.
+/// Clearing the whole file marks it clean, and a clean page is one eviction
+/// is free to drop — which turns a lost write into a silent one.
+pub fn clear_dirty(file_id: FileId, flushed: &BTreeSet<u32>) {
     let mut cache = FILE_CACHE.lock();
     if let Some(file) = cache.files.get_mut(&file_id) {
-        file.dirty.clear();
+        for page_idx in flushed {
+            if let Some(page) = file.pages.get_mut(page_idx) {
+                page.dirty = false;
+            }
+        }
     }
 }
 
@@ -218,26 +292,24 @@ pub fn size(file_id: FileId) -> u64 {
 /// Set file size. Removes pages past the new size on truncation.
 pub fn set_size(file_id: FileId, new_size: u64) {
     let mut cache = FILE_CACHE.lock();
-    let n_removed = {
+    let dropped;
+    {
         let Some(file) = cache.files.get_mut(&file_id) else { return };
-        if new_size < file.size {
-            let first_removed = (new_size as usize + PAGE_SIZE - 1) / PAGE_SIZE;
-            let removed: alloc::vec::Vec<u32> = file.pages.range(first_removed as u32..)
+        dropped = if new_size < file.size {
+            let is_cache = file.is_cache();
+            let first_removed = (new_size as usize).div_ceil(PAGE_SIZE) as u32;
+            let removed: alloc::vec::Vec<u32> = file.pages.range(first_removed..)
                 .map(|(&k, _)| k).collect();
-            let n = removed.len();
             for k in &removed {
                 file.pages.remove(k);
-                file.dirty.remove(k);
             }
-            n
+            if is_cache { removed.len() } else { 0 }
         } else {
             0
-        }
-    };
-    cache.total_pages -= n_removed;
-    if let Some(file) = cache.files.get_mut(&file_id) {
+        };
         file.size = new_size;
     }
+    cache.cached_pages -= dropped;
 }
 
 /// Mark a file as deleted (unlink). If no fds hold it, free immediately.
@@ -246,8 +318,7 @@ pub fn mark_deleted(file_id: FileId) {
     let Some(file) = cache.files.get_mut(&file_id) else { return };
     file.deleted = true;
     if file.ref_count == 0 {
-        let removed = cache.files.remove(&file_id).unwrap();
-        cache.total_pages -= removed.pages.len();
+        drop_file(&mut cache, file_id);
     }
 }
 
@@ -256,9 +327,17 @@ pub fn ref_count(file_id: FileId) -> u32 {
     FILE_CACHE.lock().files.get(&file_id).map_or(0, |f| f.ref_count)
 }
 
-/// Check if a file exists in the cache.
-pub fn exists(file_id: FileId) -> bool {
-    FILE_CACHE.lock().files.contains_key(&file_id)
+impl CachedPage {
+    fn new(data: [u8; PAGE_SIZE]) -> Self {
+        Self { data: Box::new(data), dirty: false, referenced: false }
+    }
+}
+
+fn drop_file(cache: &mut FileCache, file_id: FileId) {
+    let Some(removed) = cache.files.remove(&file_id) else { return };
+    if removed.is_cache() {
+        cache.cached_pages -= removed.pages.len();
+    }
 }
 
 fn valid_bytes_in_page(page_idx: u32, file_size: u64) -> usize {
@@ -284,27 +363,83 @@ fn copy_page_region_to_buf(page: &[u8], offset: usize, buf: &mut [u8], valid: us
 }
 
 fn evict_if_needed(cache: &mut FileCache) {
-    if cache.total_pages <= cache.max_pages {
+    assert!(cache.max_pages != 0, "file cache used before init installed a budget");
+    if cache.cached_pages <= cache.max_pages {
         return;
     }
-    // Evict clean, evictable pages. Simple: scan files, drop first clean page found.
-    let file_ids: alloc::vec::Vec<FileId> = cache.files.keys().copied().collect();
-    for fid in file_ids {
-        if cache.total_pages <= cache.max_pages {
+    let before = cache.evictions;
+    while cache.cached_pages > cache.max_pages {
+        if !evict_one(cache) {
+            // Everything resident is dirty. Write-back is the fd layer's job
+            // (`vfs::flush_file` on fsync and on close), so the only bound on
+            // dirty pages is the writer's un-flushed working set.
             break;
         }
-        let Some(file) = cache.files.get_mut(&fid) else { continue };
-        if !file.evictable || file.ref_count > 0 { continue; }
-        let clean: alloc::vec::Vec<u32> = file.pages.keys()
-            .filter(|k| !file.dirty.contains(k))
-            .copied()
-            .collect();
-        for page_idx in clean {
-            file.pages.remove(&page_idx);
-            cache.total_pages -= 1;
-            if cache.total_pages <= cache.max_pages {
-                break;
+    }
+    // One line per full turnover of the cache, so the series scales with the
+    // bound instead of with a number picked here: it is the only evidence from
+    // outside the kernel that residency stays flat while evictions climb.
+    let turnover = cache.max_pages as u64;
+    if cache.evictions != before && (before == 0 || before / turnover != cache.evictions / turnover) {
+        log!("file cache: {} evictions, {}/{} pages resident",
+            cache.evictions, cache.cached_pages, cache.max_pages);
+    }
+}
+
+/// One CLOCK step-and-evict. Returns false when a full revolution found no
+/// page it was allowed to take.
+fn evict_one(cache: &mut FileCache) -> bool {
+    // Two passes over the resident set: the first may spend itself clearing
+    // reference bits, the second then cannot find every candidate referenced.
+    // `+ 2` covers the wrap step at each end.
+    let steps = cache.cached_pages * 2 + 2;
+    for _ in 0..steps {
+        let Some((fid, idx)) = seek_hand(cache) else { return false };
+        cache.hand = match idx.checked_add(1) {
+            Some(next) => (fid, next),
+            None => (fid + 1, 0),
+        };
+
+        {
+            let Some(file) = cache.files.get_mut(&fid) else { continue };
+            let Some(page) = file.pages.get_mut(&idx) else { continue };
+            if page.dirty {
+                continue;
             }
+            if page.referenced {
+                page.referenced = false;
+                continue;
+            }
+            file.pages.remove(&idx);
+        }
+        cache.cached_pages -= 1;
+        cache.evictions += 1;
+        return true;
+    }
+    false
+}
+
+/// The first resident page at or after the hand, wrapping once.
+fn seek_hand(cache: &mut FileCache) -> Option<(FileId, u32)> {
+    if let Some(found) = page_at_or_after(cache, cache.hand) {
+        return Some(found);
+    }
+    cache.hand = (0, 0);
+    page_at_or_after(cache, cache.hand)
+}
+
+fn page_at_or_after(cache: &FileCache, from: (FileId, u32)) -> Option<(FileId, u32)> {
+    for (&fid, file) in cache.files.range(from.0..) {
+        // Whole files, not pages at a time: a tmpfs file's pages can never be
+        // taken, and stepping through a large one would exhaust the sweep's
+        // budget before it reached a page it was allowed to evict.
+        if !file.is_cache() {
+            continue;
+        }
+        let start = if fid == from.0 { from.1 } else { 0 };
+        if let Some((&idx, _)) = file.pages.range(start..).next() {
+            return Some((fid, idx));
         }
     }
+    None
 }

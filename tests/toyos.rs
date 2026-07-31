@@ -5,7 +5,7 @@ use std::fs;
 use std::io::Write;
 use std::path::Path;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use common::qemu::{self, BootOptions, QemuInstance, TestResult};
 use common::{audio, compile, screen, stats};
@@ -52,6 +52,7 @@ const SCREEN_TESTS: &[&str] = &[
     "screen_recoverable_untouched",
     "screen_early_panic",
     "screen_late_panic",
+    "screen_paged_scrollback",
     "screen_panic_muted",
     "screen_fatal_halt",
 ];
@@ -75,6 +76,7 @@ const MACHINE_TESTS: &[&str] = &[
     "i8042_absent",
     "i8042_quarantine",
     "xhci_slot_exhaustion",
+    "cache_eviction",
 ];
 
 /// The renderer's two text colours, as the screendump reports them.
@@ -1144,8 +1146,11 @@ fn run_screen_test(
             );
             // Here the marker reaches serial *before* the paint — the drain is
             // what emits it — so unlike the halt paths this one has to look
-            // more than once.
-            let dump = qemu.screendump_until("!!! PANIC !!!", Duration::from_secs(10));
+            // more than once. And once the report outgrows one screen the
+            // pager cycles it, so the window in which any given page is up is
+            // `PAGE_HOLD_NS`, not forever: the timeout has to cover a whole
+            // cycle rather than just the paint.
+            let dump = qemu.screendump_until("!!! PANIC !!!", Duration::from_secs(30));
             let text = dump.text();
             print_screen(name, &text);
             for want in ["!!! PANIC !!!", "test-late-panic: on-screen console check"] {
@@ -1157,11 +1162,88 @@ fn run_screen_test(
             check_wrap(&dump)?;
             Ok(())
         }
+        "screen_paged_scrollback" => {
+            // The screen is smaller than the report, and on the target laptop
+            // there is no key to press for the rest of it. So the claim under
+            // test is not "the console renders" — `screen_late_panic` has that
+            // — but "a line the report page cannot hold reaches the screen
+            // anyway, with no input". Same feature and image as
+            // `screen_late_panic`, so it costs a boot and no rebuild.
+            let mut qemu = QemuInstance::boot_with_options(
+                test_config,
+                c_bins,
+                rust_bins,
+                BootOptions {
+                    profile: qemu::Profile::Gop,
+                    qmp: true,
+                    kernel_features: &["test-late-panic"],
+                    ready_marker: "!!! PANIC !!!",
+                    ..Default::default()
+                },
+            );
+
+            // The first kernel line of the boot, and the one a photograph of
+            // the final screen has never been able to show.
+            const HEAD: &str = "panic console: armed";
+            const TAIL: &str = "!!! PANIC !!!";
+
+            let mut pages: Vec<String> = Vec::new();
+            let mut report: Option<String> = None;
+            let mut head_seen = false;
+            let deadline = Instant::now() + Duration::from_secs(40);
+            while Instant::now() < deadline && !(head_seen && report.is_some()) {
+                let text = qemu.screendump().text();
+                let Some(footer) = text.lines().rev().find(|l| l.starts_with("[page ")) else {
+                    // Before the panic the screen still carries a boot
+                    // checkpoint; only a paginated screen has a footer.
+                    thread::sleep(Duration::from_millis(200));
+                    continue;
+                };
+                if !pages.contains(&footer.to_string()) {
+                    pages.push(footer.to_string());
+                }
+                if text.contains(TAIL) {
+                    report = Some(text.clone());
+                }
+                head_seen |= text.contains(HEAD);
+                thread::sleep(Duration::from_millis(200));
+            }
+
+            let seen = pages.join(" ");
+            print_screen(name, &format!("footers seen: {seen}"));
+            let Some(report) = report else {
+                return Err(format!("{TAIL:?} never reached the screen; footers seen: {seen}"));
+            };
+            // The premise. If one screen holds both ends there is nothing to
+            // page and the rest of this test would pass vacuously — which is
+            // the shape the metal-track review kept finding.
+            if report.contains(HEAD) {
+                return Err(format!(
+                    "one screen holds both {HEAD:?} and {TAIL:?}; nothing to page\n{report}"
+                ));
+            }
+            if !head_seen {
+                return Err(format!(
+                    "{HEAD:?} never reached the screen — the pager did not advance past the \
+                     report. footers seen: {seen}\nreport page:\n{report}"
+                ));
+            }
+            if pages.len() < 2 {
+                return Err(format!(
+                    "only one page footer ever appeared ({seen}); the pager is not cycling"
+                ));
+            }
+            Ok(())
+        }
         "screen_fatal_halt" => {
             // The steady-state fatal path: userland is up, the display is
             // idle, and SYS_DEBUG action 3 runs halt_all_cpus for real.
-            // No sleep — render() runs before panic_flush(), so the nonce
-            // arriving on the console proves the paint already finished.
+            //
+            // The path this covers used to paint a *single line*: nothing had
+            // panicked during boot, so the idle loop had drained the ring into
+            // the console long before, and `capture` found only what was
+            // logged since the last drain. It is the case that proves the ring
+            // retains what serial has already collected.
             let mut qemu = QemuInstance::boot_with_options(
                 test_config,
                 c_bins,
@@ -1180,12 +1262,35 @@ fn run_screen_test(
             ) {
                 return Err(format!("{FATAL_HALT_NONCE:?} never reached the console"));
             }
-            let dump = qemu.screendump();
+            // Polled, not sampled once: the report is longer than a screen
+            // here, so the nonce is on one page of a cycling set.
+            let dump = qemu.screendump_until(FATAL_HALT_NONCE, Duration::from_secs(30));
             let text = dump.text();
             print_screen(name, &text);
             if !text.contains(FATAL_HALT_NONCE) {
                 return Err(format!(
                     "{FATAL_HALT_NONCE:?} reached serial but not the screen\ndecoded screen:\n{text}"
+                ));
+            }
+            // The teeth for ring *retention*, and the only ones in the suite:
+            // this is the one screen test whose panic comes after the
+            // scheduler exists, so it is the only one where the idle loop has
+            // already drained the log to serial. Reading the drained cursor
+            // instead of the retained window painted exactly one row here —
+            // the nonce, and no context at all — which every assertion above
+            // passes happily, because the nonce *was* that row.
+            //
+            // Counted rather than matched on a particular line: which line
+            // lands on the page carrying the nonce depends on how much
+            // userland printed, and the measured states are 1 row and 96, so
+            // any bound between them is a five-fold margin rather than a
+            // threshold anyone has to tune.
+            const MIN_CONTEXT_ROWS: usize = 20;
+            let filled = dump.rows().iter().filter(|r| !r.is_empty()).count();
+            if filled < MIN_CONTEXT_ROWS {
+                return Err(format!(
+                    "the fatal report is {filled} rows: the ring kept only what serial had not \
+                     taken\ndecoded screen:\n{text}"
                 ));
             }
             if dump.fill() != FILL_FATAL {
@@ -1614,6 +1719,102 @@ fn run_machine_test(
                  image {} MiB on disk of {} GB apparent",
                 allocated / (1024 * 1024),
                 apparent / 1_000_000_000
+            );
+            Ok(())
+        }
+        "cache_eviction" => {
+            // Both disk caches grew for the life of the boot: nothing ever
+            // removed a block-cache slot, and the file cache's budget was
+            // `usize::MAX` because the one function that would have set it had
+            // no callers. This drives the bounds that replaced that.
+            //
+            // `test-small-caches` is the actuator for the same reason
+            // `xhci-one-slot` is: the shipped bounds are 16 MiB and 64 MiB on
+            // this guest, and filling them by doing real I/O is minutes of
+            // NVMe traffic to observe a policy that 256 KiB observes in a
+            // second. The eviction code is the shipped code — only the number
+            // moves, and the boot line below is what proves which number is in
+            // force.
+            // The T14's namespace, because the two caches are filled by
+            // different things. File pages come from the guest program below;
+            // metadata blocks come from the *device*, whose allocator bitmap
+            // is one bit per block — 1900 blocks of it on a 244 GB namespace
+            // against 8 on the 128 MiB one, which is the difference between
+            // overflowing a 64-slot cache during the format and never
+            // reaching it. Measured: 0 block-cache evictions on Headless.
+            let options = BootOptions {
+                profile: qemu::Profile::MetalDisk,
+                kernel_features: &["test-small-caches"],
+                ..Default::default()
+            };
+            let mut qemu = QemuInstance::boot_with_options(test_config, c_bins, rust_bins, options);
+            let boot = qemu.boot_log().to_string();
+
+            let Some(file_budget) = parse_cache_budget(&boot, "file cache: budget ") else {
+                return Err(format!("the file cache printed no budget:\n{boot}"));
+            };
+            let Some(block_budget) = parse_cache_budget(&boot, "cached blocks, cap ") else {
+                return Err(format!("the block cache printed no slot cap:\n{boot}"));
+            };
+            if file_budget != 64 || block_budget != 64 {
+                return Err(format!(
+                    "budgets are {file_budget} file pages and {block_budget} block slots, \
+                     not the 64 each the feature asks for — the bound under test is not the \
+                     one the workload was sized against:\n{boot}"
+                ));
+            }
+
+            let result = qemu.run_test("test_rs_cache_eviction", Duration::from_secs(180));
+            if !check_rust_result(&result) {
+                return Err(format!(
+                    "a page did not survive being evicted and re-read:\n{}\n{}",
+                    result.stdout, result.serial
+                ));
+            }
+
+            // The whole point, and the half a compile cannot fake: residency
+            // is flat while the eviction count climbs. Boot and test output
+            // both, since the block cache starts evicting during the format.
+            let log = format!("{boot}\n{}", result.serial);
+            let file_series = parse_cache_series(&log, "file cache: ", "pages resident");
+            let block_series = parse_cache_series(&log, "page cache: ", "slots resident");
+
+            for (what, series, budget) in [
+                ("file cache", &file_series, file_budget),
+                ("block cache", &block_series, block_budget),
+            ] {
+                // One turnover line means one eviction happened and nothing
+                // more; the workload is 8x the budget in each cache, so a
+                // series this short means eviction is not keeping up with the
+                // pressure — or is not running at all.
+                if series.len() < 4 {
+                    return Err(format!(
+                        "{what}: {} turnover lines, want at least 4 — {series:?}\n{log}",
+                        series.len()
+                    ));
+                }
+                for &(evictions, resident) in series {
+                    if resident > budget {
+                        return Err(format!(
+                            "{what}: {resident} entries resident against a {budget} bound \
+                             after {evictions} evictions — the bound does not hold:\n{log}"
+                        ));
+                    }
+                }
+                let (last, _) = series[series.len() - 1];
+                let (first, _) = series[0];
+                if last <= first {
+                    return Err(format!("{what}: eviction count never advanced: {series:?}"));
+                }
+            }
+
+            eprintln!(
+                "  [cache] file {} evictions over {} turnovers, block {} evictions over {}; \
+                 residency never above {file_budget}/{block_budget}",
+                file_series[file_series.len() - 1].0,
+                file_series.len(),
+                block_series[block_series.len() - 1].0,
+                block_series.len()
             );
             Ok(())
         }
@@ -2422,6 +2623,36 @@ fn parse_nvme_blocks(log: &str) -> Option<u64> {
         .next()?
         .parse()
         .ok()
+}
+
+/// The first number after `marker`, which both caches print their ceiling as
+/// exactly once at boot.
+fn parse_cache_budget(log: &str, marker: &str) -> Option<u64> {
+    log.lines()
+        .find_map(|l| l.split(marker).nth(1))?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// Every `<prefix>N evictions, R/M <unit>` line, as (evictions, resident).
+///
+/// The kernel emits one per full turnover of the cache, so the series is the
+/// shape of the answer: a cache that evicts has a climbing first column and a
+/// flat second, and a cache that only grows has no lines at all.
+fn parse_cache_series(log: &str, prefix: &str, unit: &str) -> Vec<(u64, u64)> {
+    log.lines()
+        .filter_map(|l| {
+            let tail = l.split(prefix).nth(1)?;
+            if !tail.contains(unit) {
+                return None;
+            }
+            let evictions = tail.split(" evictions,").next()?.trim().parse().ok()?;
+            let resident = tail.split("evictions, ").nth(1)?.split('/').next()?.parse().ok()?;
+            Some((evictions, resident))
+        })
+        .collect()
 }
 
 /// How many blocks the page cache's index has room for, out of

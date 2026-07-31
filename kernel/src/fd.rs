@@ -1,7 +1,5 @@
 use alloc::string::String;
-use alloc::sync::Arc;
 
-use crate::file_backing::FileBacking;
 use crate::file_cache::{self, FileId};
 use crate::id_map::IdMap;
 use crate::process::Pid;
@@ -15,7 +13,6 @@ use toyos_abi::syscall::{FileType, OpenFlags, SeekFrom, SyscallError};
 pub struct OpenFile {
     path: String,
     file_id: FileId,
-    backing: Option<Arc<dyn FileBacking>>,
     position: usize,
     writable: bool,
     modified: bool,
@@ -28,7 +25,6 @@ impl Clone for OpenFile {
         Self {
             path: self.path.clone(),
             file_id: self.file_id,
-            backing: self.backing.clone(),
             position: self.position,
             writable: self.writable,
             modified: false, // cloned fd starts unmodified
@@ -221,7 +217,6 @@ pub fn open(table: &mut FdTable, vfs: &mut Vfs, path: &str, flags: OpenFlags) ->
         let file = OpenFile {
             path: String::from(path),
             file_id,
-            backing: None,
             position: 0,
             writable,
             modified: false,
@@ -234,14 +229,13 @@ pub fn open(table: &mut FdTable, vfs: &mut Vfs, path: &str, flags: OpenFlags) ->
     }
 
     match vfs.open_file(path) {
-        Some((file_id, backing)) => {
+        Some(file_id) => {
             let mtime = vfs.file_mtime(path);
             let size = file_cache::size(file_id);
             let position = if append { size as usize } else { 0 };
             let file = OpenFile {
                 path: String::from(path),
                 file_id,
-                backing,
                 position,
                 writable,
                 modified: false,
@@ -262,7 +256,6 @@ pub fn open(table: &mut FdTable, vfs: &mut Vfs, path: &str, flags: OpenFlags) ->
                 let file = OpenFile {
                     path: String::from(path),
                     file_id,
-                    backing: None,
                     position: 0,
                     writable,
                     modified: false,
@@ -364,7 +357,6 @@ pub fn try_read(table: &mut FdTable, fd: u32, buf: &mut [u8]) -> Option<u64> {
                     page_idx,
                     offset_in_page,
                     &mut buf[read..read + to_read],
-                    file.backing.as_deref(),
                 );
                 read += to_read;
             }
@@ -474,7 +466,6 @@ pub fn try_write(table: &mut FdTable, fd: u32, buf: &[u8]) -> Option<u64> {
                     page_idx,
                     offset_in_page,
                     &buf[written..written + to_write],
-                    file.backing.as_deref(),
                 );
                 written += to_write;
             }
