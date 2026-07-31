@@ -18,6 +18,19 @@ use uefi::{
 use uefi_services::println;
 use toyos_abi::boot::{KernelArgs, MemoryMapEntry};
 
+/// The largest file the bootloader will read off the ESP.
+///
+/// Nothing here has a caller to return an error to and nothing has run that
+/// could recover, so every check in this file ends in a named panic rather
+/// than an error path. This one exists so that a corrupt or hostile directory
+/// entry is a refusal that says what it refused, instead of a firmware pool
+/// request sized by whatever the ESP claimed.
+///
+/// Policy, and generous: the largest file ToyOS puts on the ESP is the initrd
+/// at ~200 MB, so this is five times the real worst case and still far below
+/// what a UEFI implementation would serve in one allocation.
+const MAX_ESP_FILE: u64 = 1024 * 1024 * 1024;
+
 fn alloc_kernel_memory(size: usize) -> vec::Vec<u8> {
     const KERNEL_ALIGN: usize = 2 * 1024 * 1024; // 2MB
     let layout = Layout::from_size_align(size, KERNEL_ALIGN).expect("invalid layout");
@@ -58,7 +71,12 @@ fn load_file_bytes(handle: Handle, system_table: &SystemTable<Boot>, path: &CStr
         .get_info::<FileInfo>(&mut buffer)
         .expect("Failed to get file info");
 
-    let size = file_info.file_size() as usize;
+    let declared = file_info.file_size();
+    assert!(
+        declared <= MAX_ESP_FILE,
+        "the ESP reports a {declared}-byte file, past the {MAX_ESP_FILE}-byte bound"
+    );
+    let size = declared as usize;
     let mut bytes = alloc_uninit(size);
     let read = file.read(&mut bytes).expect("Failed to read file");
     // Every byte handed back must have come from the file: the buffer was never
@@ -97,15 +115,31 @@ fn load_kernel_elf(kernel_elf_bytes: &[u8]) -> LoadedKernel {
 
     let stack_size: usize = 8 * 1024 * 1024; // 8MB
 
-    let mut mem_size: usize = 0;
+    // The kernel's own `elf::parse_layout` enforces `p_filesz <= p_memsz`
+    // because the pair is a (copy length, destination size) pair to it. It is
+    // the same pair here, and nothing had checked it: the image is sized from
+    // every `p_memsz` and each segment is then copied in at `p_filesz`.
+    let mut mem_size: u64 = 0;
     segments.iter().for_each(|segment| {
         if segment.p_type == abi::PT_LOAD {
-            mem_size = mem_size.max((segment.p_vaddr + segment.p_memsz) as usize);
+            assert!(
+                segment.p_filesz <= segment.p_memsz,
+                "kernel.elf: PT_LOAD p_filesz {} > p_memsz {}",
+                segment.p_filesz, segment.p_memsz
+            );
+            let end = segment
+                .p_vaddr
+                .checked_add(segment.p_memsz)
+                .expect("kernel.elf: PT_LOAD p_vaddr + p_memsz overflows");
+            mem_size = mem_size.max(end);
         }
     });
 
     println!("Kernel stack size: {}", stack_size);
-    mem_size += stack_size;
+    let mem_size = mem_size
+        .checked_add(stack_size as u64)
+        .and_then(|n| usize::try_from(n).ok())
+        .expect("kernel.elf: image plus stack does not fit an allocation");
 
     println!("Kernel memory size: {}", mem_size);
 
@@ -116,8 +150,15 @@ fn load_kernel_elf(kernel_elf_bytes: &[u8]) -> LoadedKernel {
         if segment.p_type == abi::PT_LOAD {
             println!("Loading segment: {:?}", segment);
             let fstart = segment.p_offset as usize;
-            let fend = fstart + segment.p_filesz as usize;
+            let fend = segment
+                .p_offset
+                .checked_add(segment.p_filesz)
+                .and_then(|n| usize::try_from(n).ok())
+                .filter(|end| *end <= kernel_elf_bytes.len())
+                .expect("kernel.elf: PT_LOAD file extent is past the end of the file");
             let vstart = segment.p_vaddr as usize;
+            // In bounds by construction: `mem_size` is at least
+            // `p_vaddr + p_memsz` for this segment and `p_filesz <= p_memsz`.
             let vend = vstart + segment.p_filesz as usize;
             process_mem[vstart..vend].copy_from_slice(&kernel_elf_bytes[fstart..fend]);
         }
@@ -141,13 +182,27 @@ fn load_kernel_elf(kernel_elf_bytes: &[u8]) -> LoadedKernel {
                 .for_each(|rela| {
                     match rela.r_type {
                         abi::R_X86_64_RELATIVE => {
-                            let offset = rela.r_offset as isize;
-                            let addend = rela.r_addend as isize;
-                            let value = PHYS_OFFSET + unsafe { process_mem.as_ptr().byte_offset(addend) } as u64;
+                            // Both fields index the image and both come out of
+                            // the file: `r_offset` is the destination of an
+                            // 8-byte store and `r_addend` is the address
+                            // stored. Unchecked, the store is an arbitrary
+                            // write anywhere in the machine, made before
+                            // ExitBootServices with firmware still live.
+                            let offset = rela.r_offset;
+                            let addend = rela.r_addend;
+                            assert!(
+                                offset.checked_add(8).is_some_and(|end| end <= mem_size as u64),
+                                "kernel.elf: relocation stores 8 bytes at {offset:#x}, outside the {mem_size:#x}-byte image"
+                            );
+                            assert!(
+                                (0..=mem_size as i64).contains(&addend),
+                                "kernel.elf: relocation addend {addend:#x} is outside the {mem_size:#x}-byte image"
+                            );
+                            let value = PHYS_OFFSET + unsafe { process_mem.as_ptr().add(addend as usize) } as u64;
                             unsafe {
                                 process_mem
                                     .as_mut_ptr()
-                                    .byte_offset(offset)
+                                    .add(offset as usize)
                                     .cast::<u64>()
                                     .write(value);
                             }
