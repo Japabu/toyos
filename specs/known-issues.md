@@ -396,6 +396,60 @@ number of events it queued and `dispatch_report` wakes only on a non-zero count,
 so readiness and `has_data()` agree. Userland still reads both fds non-blocking,
 which is now belt and braces rather than a workaround.
 
+**The other half, not previously recorded: two of the wait queues are woken by
+nobody's benefit.** `sched::waitqs::MOUSE` and `sched::waitqs::NETWORK` each
+appear at exactly one site in the kernel — their own wake (`mouse.rs:104`,
+`net.rs:54`). Nothing ever parks on either. The wakes are real calls on a hot
+path doing nothing, and they are the direct consequence of the asymmetry above:
+because `sys_read` returns `NotFound` on an empty Mouse fd rather than blocking,
+there is never a parked mouse reader to wake. Fixing the asymmetry by making
+Mouse block is what would give `MOUSE` a waiter; deleting the queues is what
+would make the current behaviour honest. Do not do neither.
+
+### Three scheduler instruments the spec describes and the code does not have
+
+The worst class this project has: a spec claiming a check exists when it does
+not. `specs/metal-track-history.md` calls these "certifications that could not
+fail". All three verified 2026-08-01; an agent is assigned to build them, and
+they are filed here so they stay visible if that work does not land.
+
+**I5, fairness, is checked nowhere.** `specs/scheduler-core-spec.md` lists it in
+a table headed "checked after every sim step". `toyos-sched/src/invariants.rs`
+defines exactly four items — `residents`, `check_cpu`, `check_timer`,
+`earliest_event` — and none of them is a fairness check; the only occurrence of
+the word in the crate is a doc comment in `sim/src/hw_impl.rs:4`. Nothing checks
+fairness in a scheduler whose entire stated design is fair-share, and Stage 9's
+exit criterion gates on it, so that stage cannot be gated today.
+
+**The kernel `check` build is unreachable.** `check_cpu` is behind
+`#[cfg(feature = "check")]` (`toyos-sched/src/cpu.rs:867`). `kernel/Cargo.toml`
+declares no `check` feature and its dependency is a bare
+`toyos-sched = { path = "../toyos-sched" }` with no `features` forwarding, so
+`toyos-sched/check` cannot be turned on from any kernel build this tree can
+produce. The invariant walk has never run inside the kernel. The max-pass-duration
+assert the check build is supposed to carry does not exist in any form.
+
+**`from-qemu` is `unimplemented!()`.** `toyos-sched/sim/src/main.rs:191`. §10.4
+describes it as a working pipeline for replaying a captured kernel trace through
+the simulator; the CLI help advertises it (`main.rs:27`) and the panic message
+says the kernel's `TraceEvent` ring lands at migration Stage 6.
+
+### `sys_read` blocks: two doc comments that describe code that is not there
+
+Neither changes behaviour; both mislead a reader about an invariant.
+
+`kernel/src/fd.rs:142` — `/// Insert at the lowest unused id.` It calls
+`IdMap::insert`, which is `let id = self.next; self.next += 1` (`id_map.rs:46-51`):
+a monotonic counter that never reuses a closed fd number. Lowest-unused is a
+POSIX guarantee some code may assume; this is not it, and a long-lived process
+leaks fd-number space rather than recycling it.
+
+`kernel/src/process.rs:950` — `/// Must run after `teardown_scheduling`, which is
+what flushes the child threads' counters into `ProcessData`.` There is no
+`teardown_scheduling` anywhere in the kernel. The ordering requirement it states
+may still be real; the function that was supposed to establish it is gone, so the
+comment names no enforceable precondition.
+
 ### A keyboard flood into a blocked `sys_read` panics the kernel
 
 `prepare_wait` asserts `set_waiting()`, "a task waits on at most one queue"
@@ -558,7 +612,12 @@ aborts every cpal app.
 
 **(6) soundd never frees the per-client shm region.** `SharedMemory::Drop` only
 unmaps and nothing calls `destroy()`, so each open/close cycle strands a 2 MiB
-page for soundd's lifetime.
+page. **Bounded by the next process exit, not by soundd's lifetime** —
+`cleanup_process` sweeps every region owned by an exiting process — so this is a
+real leak with no release at close time, but not a permanent one. The entry
+previously claimed the page was stranded for soundd's whole run, which
+overstates it: a long-lived soundd accumulates only until whichever process owns
+the region exits.
 
 **(8) `virtio_sound.rs` queries PCM capabilities, logs them, then calls
 `configure(44100, 2)` unconditionally** and silently remaps unsupported rates to
