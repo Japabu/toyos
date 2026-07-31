@@ -138,13 +138,15 @@ Options, none taken: stop draining when no backend can write; keep a separate
 non-consuming history for the console; or accept it and say so in the design.
 
 **Measured under metal-sim (M1), and worse than "no scrollback".** With
-`-serial none` and no virtio-console the guest has no output channel at all
-once the last boot checkpoint has painted: `metal_sim_compositor`'s failure
-screen ends at `Boot: complete`, and soundd's and netd's exit lines — printed
-seconds later, and visible on the same boot under `--metal-sim --uart` — reach
-no pixel and no file. A running ToyOS on the T14 is mute between `Boot:
-complete` and the moment the compositor's terminal exists. That is fine for a
-first boot and not fine for debugging M2 on the machine.
+`--metal-sim --mute` and no virtio-console the guest has no output channel at
+all once the last boot checkpoint has painted: the failure screen ends at
+`Boot: complete`, and soundd's and netd's exit lines — printed seconds later,
+and read directly off the console by `metal_sim_compositor` on the same machine
+shape with the 16550 on — reach no pixel and no file. A running ToyOS on the
+T14 is mute between `Boot: complete` and the moment the compositor's terminal
+exists. That is fine for a first boot and not fine for debugging M2 on the
+machine. It is also the entire cost the mute default was buying, which is why
+the metal-sim profile now keeps its 16550 by default.
 
 ### The double-fault path overflows IST1 by ~1.4 KiB while reporting
 
@@ -724,11 +726,9 @@ was zero everywhere. `cargo run --gop` and `BootOptions { profile: Profile::Gop 
 
 **It is not the default.** Plain `cargo run` and the default test config still
 boot `-vga none` with virtio-gpu or with no display device, so `gop.rs` is
-exercised only by `--gop`, by `--metal-sim`, and by six of the seven screen
-tests (`screen_decoder` boots no guest at all). Every other test in the suite
-still says nothing about the display path a laptop takes. M1's
-`metal_sim_compositor` now covers the whole stack on GOP — kernel init,
-compositor claim, composite — but it is one test, not the default.
+exercised only by `--gop`, by `--metal-sim` (which every machine test now
+boots), and by the screen tests that boot a guest at all. Every other test in
+the suite still says nothing about the display path a laptop takes.
 
 **The mode is wrong.** `bootloader/src/main.rs:186-205` selects the mode with
 the most pixels. On QEMU stdvga that is **2048x2048** — square, non-standard,
@@ -736,17 +736,28 @@ and it makes the compositor scale a 1920x1080 wallpaper to a square. It is also
 16 MiB of framebuffer, which is what makes a panic-console repaint cost ~13 ms.
 "Largest wins" is not a mode policy; a real one would prefer the firmware's
 current mode, or the largest 16:9/16:10 mode, and only then fall back. Harmless
-for M0, wrong for M1 — and M1 shipped without fixing it, so `metal_sim_compositor`
-composites a 1920x1080 wallpaper onto a 2048x2048 square and each of its
-screendumps is 12 MiB. On the T14 the firmware will offer the panel's own mode
-and "largest wins" may or may not pick it; that is the part nothing here can
-answer.
+for M0, wrong for M1 — and M1 shipped without fixing it, so the compositor
+scales a 1920x1080 wallpaper onto a 2048x2048 square on every metal-sim boot
+and each panic screendump is 12 MiB. On the T14 the firmware will offer the
+panel's own mode and "largest wins" may or may not pick it; that is the part
+nothing here can answer.
+
+**What the repaints actually cost.** `e5e600f`'s message gives two figures that
+cannot both be true — "~13ms per repaint" and "135ms to 181ms" for six of them.
+Measured A/B in one session on this host: the same tree boots to `Boot:
+complete` in **118 ms** with no console armed (`-vga none`) and **188 ms** under
+GOP. Five repaints happen before that line is logged and the sixth after it, so
+the per-repaint figure is right (~14 ms) and the 135→181 pair is the wrong one.
+Every phase boundary also carries a `wbinvd`, which QEMU ignores entirely — on
+metal that is six full cache-hierarchy flushes on a machine that keeps running,
+and it is not measurable here.
 
 ### A device claim succeeds on a machine that has no such device
 
 `device::try_claim` gates `DEVICE_FRAMEBUFFER`, `DEVICE_NIC` and `DEVICE_AUDIO`
-on an info struct the driver registered, so those three return `None` when the
-hardware is absent — which is what makes soundd and netd able to exit cleanly.
+on an info struct the driver registered, so those three return
+`ClaimError::Absent` when the hardware is absent — which is what makes soundd
+and netd able to exit cleanly.
 `DEVICE_KEYBOARD` and `DEVICE_MOUSE` are gated on nothing at all: they hand out
 a `Descriptor` whether or not any driver will ever produce an event. Under
 metal-sim the compositor holds both claims on a machine with no HID of any kind
@@ -763,15 +774,59 @@ t=1.69 s on a boot that reached `Boot: complete` at 0.38 s, and its 100
 publish "no NIC" rather than not publishing at all, so the retry has something
 to observe.
 
-**What the repaints actually cost.** `e5e600f`'s message gives two figures that
-cannot both be true — "~13ms per repaint" and "135ms to 181ms" for six of them.
-Measured A/B in one session on this host: the same tree boots to `Boot:
-complete` in **118 ms** with no console armed (`-vga none`) and **188 ms** under
-GOP. Five repaints happen before that line is logged and the sixth after it, so
-the per-repaint figure is right (~14 ms) and the 135→181 pair is the wrong one.
-Every phase boundary also carries a `wbinvd`, which QEMU ignores entirely — on
-metal that is six full cache-hierarchy flushes on a machine that keeps running,
-and it is not measurable here.
+### FIRST-METAL-BOOT BLOCKER: the xHCI driver dies above three USB slots
+
+`output_ctx_offset` (`kernel/src/drivers/xhci/device.rs:87-94`) matches slots
+1..3 and panics on anything else — `panic!("xHCI: too many USB slots (max 3)")`
+— and `init_device` allocates an output context for every enabled slot
+regardless of device class, which is why the non-HID boot stick already
+consumes slot 1. The T14's internal xHCI carries camera, Bluetooth and
+fingerprint reader alongside the boot stick: four devices, and `scan_ports`
+walks them all at boot. The fourth `init_device` kills the boot in phase 4 —
+the same phase, the same file and the same class of failure M1 was built to
+eliminate.
+
+metal-sim cannot reach it. The profile has exactly one USB device, so no
+metal-sim run allocates a second slot, and the whole zero-device end of the
+range is what M1 hardened. Three `-device usb-…` lines that are not HID would
+stage it; that is the cheap half of the fix, and the real one is slots
+allocated from a `Vec` rather than three fixed DMA offsets.
+
+`specs/metal-boot-plan.md` M4 lists graceful failure above three slots as a
+minimum. That is not enough for a first boot: graceful failure here means no
+keyboard on the machine whose keyboard is the milestone.
+
+### The xHCI driver resets the controller without taking ownership from firmware
+
+`mod.rs:392` reads `hccparams1` and uses bit 2 (`csz`) and nothing else. The
+xECP pointer in bits 31:16 is never followed, so there is no USBLEGSUP
+BIOS-owned-semaphore handoff (xHCI §4.22.1) and no Supported Protocol parse
+before the unconditional HCRST at `mod.rs:416`. Grep the whole driver for
+`xecp|LEGSUP|legacy|BIOS` and only the `CAP_HCCPARAMS1` constant comes back.
+
+QEMU cannot fail this: nothing owns the controller once OVMF's USB stack
+releases it at ExitBootServices, so the path is certified exactly where it
+cannot go wrong. On the T14, firmware that leaves USB legacy support armed with
+SMI-on-OS-ownership gets a controller reset out from under it — the machine
+fights for it, or SMIs fire, and on a serial-less laptop that presents as a
+wedge after "storage ready" with the last checkpoint still on screen. It is the
+one xHCI-shaped first-boot risk M1's fix does not touch.
+
+### USB hotplug does nothing, and M1 made that reachable
+
+`poll` (`mod.rs:298-318`) dispatches only `EVENT_TRANSFER`, and only for a slot
+already in `devices`; every other TRB type is advanced past and dropped, Port
+Status Change events included. `scan_ports` has exactly one caller, inside
+`init`. So the set of USB devices is whatever was connected at boot, forever.
+
+This was masked until f76ea04: a machine with no USB HID panicked the boot, so
+"no keyboard, plug one in" could not happen. Now it survives, and plugging a
+keyboard into a machine with no input does nothing at all — no slot enabled, no
+event dispatched, and `device::try_claim(DEVICE_KEYBOARD)` already succeeded for
+the compositor, so nothing reports anything and the machine is indistinguishable
+from hung. That is the natural first thing to try on the T14 in the M1→M2
+window. Reproducible under `--metal-sim` with QMP `device_add usb-kbd,bus=xhci.0`
+after boot.
 
 - PCID + INVPCID codepaths untested on real hardware — QEMU TCG supports
   neither. Both are CPUID-gated, so TCG falls back to a CR3 reload. Needs KVM or

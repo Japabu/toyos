@@ -136,13 +136,17 @@ bar; QEMU cannot.
 - **M3 — USB image diet.** `hosted-rustc = false` (the initrd is 666 MB,
   rustc 478 MB of it; see `specs/boot-image-split.md`).
 - **M4 — real-firmware robustness.** Fragmented UEFI memory map vs the
-  2MiB-only PMM, real ACPI tables, PCI bridges, TSC calibration. xHCI must at
-  minimum fail gracefully when internal camera/fingerprint/Bluetooth exhaust
-  its 3 hardcoded slots (`kernel/src/drivers/xhci/mod.rs:136-145`); dynamic
-  slots are their own known issue. M1 removed the adjacent panic — zero HID
-  devices no longer kills the boot — but three is still three, and the T14's
-  internal USB devices are what will find that out. M1 also made a missing
-  xHCI controller survivable, which nothing has yet had a chance to exercise.
+  2MiB-only PMM, real ACPI tables, PCI bridges, TSC calibration. M1 made a
+  missing xHCI controller survivable, which nothing has yet had a chance to
+  exercise.
+
+  **Three xHCI items are filed in known issues §8, and the first is a
+  first-boot blocker rather than an M4 item**: the driver panics above slot 3
+  and the T14 has four USB devices, so "fail gracefully" is not enough — it
+  means no keyboard on the machine whose keyboard is the milestone. The other
+  two are the missing USBLEGSUP ownership handoff before HCRST, which QEMU
+  structurally cannot fail and Lenovo firmware can, and hotplug, which does
+  nothing at all and became reachable when M1 removed the zero-HID panic.
 - **FLASH TRIGGER: metal-sim boots to the compositor with the PS/2 keyboard
   working and panics render on screen → flash the stick. MET.**
   `metal_sim_input` certifies it every run, on the machine shape and the plain
