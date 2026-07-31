@@ -82,6 +82,7 @@ const MACHINE_TESTS: &[&str] = &[
     "i8042_quarantine",
     "xhci_slot_exhaustion",
     "cache_eviction",
+    "va_exhaustion",
 ];
 
 /// The renderer's two text colours, as the screendump reports them.
@@ -1779,6 +1780,44 @@ fn run_machine_test(
                 ));
             }
             eprintln!("  [nvme] 8 KiB-format namespace refused by name, before storage came up");
+            Ok(())
+        }
+        "va_exhaustion" => {
+            // `find_gap` returning None was an `.expect` on five paths. It is
+            // an error return now, and this is the only way to reach it: the
+            // arena is ~1015 GB and every region in it costs at worst twice
+            // its size in physical memory, so the PMM refuses hundreds of
+            // gigabytes before the address space does. `test-tiny-va` moves
+            // the floor and nothing else — the argument for the actuator is on
+            // `vma::ALLOC_FLOOR`.
+            //
+            // Which is also why the feature has to boot a whole system: an
+            // arena too small for a process to map its TLS and its heap would
+            // prove the actuator works and nothing about the kernel.
+            let options = BootOptions {
+                kernel_features: &["test-tiny-va"],
+                ..Default::default()
+            };
+            let mut qemu = QemuInstance::boot_with_options(test_config, c_bins, rust_bins, options);
+            let boot = qemu.boot_log().to_string();
+
+            let result = qemu.run_test("test_rs_va_exhaustion", Duration::from_secs(30));
+            if !check_rust_result(&result) {
+                return Err(format!("the guest did not survive exhaustion:\n{}", result.stdout));
+            }
+            // The guest asserts the mapping count itself — the band that
+            // separates "address space ran out" from "memory ran out". Here,
+            // that nothing in the kernel panicked on the way: the process
+            // exiting 0 says its own syscalls returned, not that some other
+            // CPU stayed up.
+            for (what, text) in [("boot", &boot), ("run", &result.serial)] {
+                for bad in ["!!! PANIC !!!", "KERNEL PANIC", "panicked at"] {
+                    if text.contains(bad) {
+                        return Err(format!("{bad:?} during {what}:\n{text}"));
+                    }
+                }
+            }
+            eprintln!("  [va] {}", result.stdout.trim());
             Ok(())
         }
         "cache_eviction" => {
