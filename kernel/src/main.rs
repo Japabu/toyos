@@ -105,6 +105,11 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     // Early boot: percpu not ready, just halt (single CPU at this point)
     if !log::PERCPU_READY.load(core::sync::atomic::Ordering::Relaxed) {
         log!("!!! EARLY PANIC !!!: {}", info);
+        // This branch halts directly and never reaches halt_all_cpus, so it
+        // owns both halves itself. Paint first: the flush is what empties the
+        // ring the console reads.
+        drivers::panic_console::capture();
+        drivers::panic_console::render();
         unsafe { drivers::serial::panic_flush(); }
         cpu::halt();
     }
@@ -138,6 +143,12 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     // re-enters a scheduler the panicking thread may have left holding a
     // lock. A wedge after that point loses the one message explaining it.
     // Draining twice is harmless (the second drain finds an empty ring).
+    //
+    // The on-screen console must read the report before that drain pops it,
+    // and must paint only if this panic turns out to be fatal — so the copy
+    // happens here and the paint happens in halt_all_cpus. A recovering panic
+    // captures and never paints, which is the property, not an accident.
+    drivers::panic_console::capture();
     unsafe { drivers::serial::panic_flush(); }
 
     // If in syscall context: kill the process, rejoin scheduler. This panic
@@ -190,7 +201,28 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     // which becomes inaccessible after mm::init drops the identity map.
     let kernel_args = *kernel_args;
 
+    let entry_count = kernel_args.memory_map_size as usize / core::mem::size_of::<MemoryMapEntry>();
+    let maps = core::slice::from_raw_parts(
+        DirectMap::from_phys(kernel_args.memory_map_addr).as_ptr::<MemoryMapEntry>(),
+        entry_count,
+    );
+
+    // Before serial::init, because serial::init is itself a place the kernel
+    // can die on unfamiliar hardware and the screen may be the only channel.
+    // Nothing is mapped yet beyond the bootloader's identity+high map, which
+    // is exactly what a sub-4 GiB firmware framebuffer needs.
+    drivers::panic_console::arm(&kernel_args, maps);
+
     serial::init();
+
+    // The window this exists to cover: percpu is not up, no allocator, no
+    // paging of our own, so the early-panic branch is the whole reporting
+    // mechanism. black_box keeps the rest of kernel_main reachable to the
+    // compiler; a bare `panic!` would make every later line dead code.
+    #[cfg(feature = "test-early-panic")]
+    if core::hint::black_box(true) {
+        panic!("test-early-panic: on-screen console check");
+    }
 
     #[cfg(feature = "debug-wait")]
     {
@@ -202,11 +234,6 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
 
     log!("{:?}", kernel_args);
 
-    let entry_count = kernel_args.memory_map_size as usize / core::mem::size_of::<MemoryMapEntry>();
-    let maps = core::slice::from_raw_parts(
-        DirectMap::from_phys(kernel_args.memory_map_addr).as_ptr::<MemoryMapEntry>(),
-        entry_count,
-    );
     let initrd = core::slice::from_raw_parts(
         DirectMap::from_phys(kernel_args.initrd_addr).as_ptr::<u8>(),
         kernel_args.initrd_size as usize,
@@ -233,6 +260,7 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
 
     // Copy init_programs into heap before mm::init reclaims bootloader memory.
     mm::init(maps, &reserved);
+    drivers::panic_console::remap();
     let init_programs = alloc::string::String::from(init_programs);
     let init_programs: &str = &init_programs;
 
@@ -323,6 +351,9 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
 
     if let Some((gpu_driver, gpu_info)) = virtio_gpu::init(&ecam) {
         log!("GPU: using VirtIO");
+        // virtio's scanout is only reachable through a virtqueue round trip
+        // behind GPU.lock(), which the panic path may not take.
+        drivers::panic_console::disable();
         register_gpu(gpu_driver, gpu_info);
     } else if kernel_args.gop_framebuffer != 0 {
         log!("GPU: using UEFI GOP");

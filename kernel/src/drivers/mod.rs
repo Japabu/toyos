@@ -10,6 +10,7 @@ pub mod virtio_gpu;
 pub mod virtio_net;
 pub mod virtio_sound;
 pub mod gop;
+pub mod panic_console;
 
 use alloc::vec::Vec;
 use crate::mm::pmm::PhysPage;

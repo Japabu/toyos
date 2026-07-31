@@ -103,6 +103,11 @@ pub fn halt_all_cpus() -> ! {
     if X2APIC_ENABLED.load(Ordering::Relaxed) {
         cpu::wrmsr(X2APIC_ICR, 0x000C_0000 | 0xFD);
     }
+    // Before the flush, not after. Rendering consumes nothing and has no
+    // unbounded loop, so putting it ahead of the proven channel costs the
+    // screen and never the serial report if it goes wrong — and it means a
+    // line arriving on serial proves the paint already finished.
+    crate::drivers::panic_console::render();
     unsafe { crate::drivers::serial::panic_flush(); }
     super::cpu::halt();
 }

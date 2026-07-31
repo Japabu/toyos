@@ -8,6 +8,9 @@ license = "MIT OR Apache-2.0"
 
 [features]
 debug-wait = []
+# Panic between arming the on-screen console and mm::init, so a test can
+# assert the console covers the window where nothing else can report.
+test-early-panic = []
 
 # debug-assertions and overflow-checks stay on: fail-fast beats speed here.
 [profile.dev]

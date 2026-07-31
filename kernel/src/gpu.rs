@@ -60,7 +60,16 @@ pub fn set_resolution(width: u32, height: u32) -> Result<GpuInfo, SyscallError> 
     let new_info = {
         let mut gpu = GPU.lock();
         let gpu = gpu.as_mut().ok_or(SyscallError::NotSupported)?;
-        gpu.set_resolution(width, height)?
+        // A driver that honours this allocates a new framebuffer and frees the
+        // old one, so anything caching the address would be left writing into
+        // reallocated physical memory. Blind the panic console for the window;
+        // worst case it has no screen, never a wild write.
+        crate::drivers::panic_console::detach();
+        let result = gpu.set_resolution(width, height);
+        if result.is_err() {
+            crate::drivers::panic_console::rearm();
+        }
+        result?
     };
     let mut info = INFO.lock();
     *info = Some(GpuInfo {

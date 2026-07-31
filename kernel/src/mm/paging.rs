@@ -658,6 +658,29 @@ fn has(entry: u64, flag: u64) -> u8 {
     }
 }
 
+/// Whether `addr` resolves to a present page in the *currently loaded* CR3.
+/// Lock-free, allocation-free, and silent, for the panic path to prove a
+/// mapping still exists before writing through it.
+///
+/// The current CR3 and not `kernel_cr3()`: a panic in syscall context runs on
+/// a user address space, which copies the kernel's top-half PML4 entries at
+/// creation. Shared page directories propagate later `map_2m`s, but a crash
+/// handler should prove that rather than assume it.
+pub fn present_in_current_cr3(addr: u64) -> bool {
+    let mut table = unsafe { PageTablePage::from_phys(Cr3::current().phys()) };
+    for level in 0..3 {
+        let entry = table[((addr >> (39 - level * 9)) & 0x1FF) as usize];
+        if entry & PAGE_PRESENT == 0 {
+            return false;
+        }
+        if level > 0 && entry & PAGE_SIZE_BIT != 0 {
+            return true;
+        }
+        table = unsafe { PageTablePage::from_phys(entry & ADDR_MASK) };
+    }
+    table[((addr >> 12) & 0x1FF) as usize] & PAGE_PRESENT != 0
+}
+
 /// Dump page table entries for an address. Lock-free for crash safety.
 pub fn debug_page_walk(addr: u64) {
     let cr3 = Cr3::current();

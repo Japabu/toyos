@@ -321,11 +321,16 @@ const EFI_BOOT_SERVICES_CODE: u32 = 3;
 const EFI_BOOT_SERVICES_DATA: u32 = 4;
 const EFI_CONVENTIONAL_MEMORY: u32 = 7;
 
-fn is_usable(entry: &MemoryMapEntry) -> bool {
-    matches!(entry.uefi_type,
+/// Whether a UEFI memory type becomes free RAM the PMM will hand out.
+pub fn is_usable_type(uefi_type: u32) -> bool {
+    matches!(uefi_type,
         EFI_LOADER_CODE | EFI_LOADER_DATA |
         EFI_BOOT_SERVICES_CODE | EFI_BOOT_SERVICES_DATA |
         EFI_CONVENTIONAL_MEMORY)
+}
+
+fn is_usable(entry: &MemoryMapEntry) -> bool {
+    is_usable_type(entry.uefi_type)
 }
 
 fn overlaps_reserved(start: u64, end: u64, reserved: &[Region]) -> bool {
