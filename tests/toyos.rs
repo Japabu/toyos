@@ -18,7 +18,8 @@ struct TestDef {
 }
 
 // Rust helper binaries that are spawned by tests, not tests themselves.
-const RUST_SKIP: &[&str] = &["segfault_child", "test_panic_child", "i8042_keyboard"];
+const RUST_SKIP: &[&str] =
+    &["segfault_child", "test_panic_child", "i8042_keyboard", "i8042_mouse"];
 
 // Audio glitch tests. Each runs in its own QEMU boot per SMP config and
 // asserts on the wav the virtio-sound device captured, so they are excluded
@@ -58,6 +59,7 @@ const INPUT_TESTS: &[&str] = &[
     "input_merge",
     "i8042_keyboard",
     "i8042_no_spurious_wake",
+    "i8042_mouse",
 ];
 
 /// The renderer's two text colours, as the screendump reports them.
@@ -1566,6 +1568,103 @@ fn run_input_test(
             );
             Ok(())
         }
+        "i8042_mouse" => {
+            let mut qemu = QemuInstance::boot_with_options(
+                test_config,
+                c_bins,
+                rust_bins,
+                BootOptions {
+                    usb_hid: false,
+                    qmp: true,
+                    kernel_features: &["i8042-trace"],
+                    ..Default::default()
+                },
+            );
+            let boot = qemu.boot_log().to_string();
+            if !boot.contains("i8042: aux rate=100") {
+                return Err(format!("the TrackPoint path never came up:\n{boot}"));
+            }
+
+            const BURST: usize = 1000;
+            let result = qemu.run_test_hooked(
+                "test_rs_i8042_mouse",
+                Duration::from_secs(30),
+                "===I8042_MOUSE_READY===",
+                |socket| {
+                    let mut input = qemu::QmpInput::open(socket);
+                    // Off the origin first: the position clamps at 0, so a
+                    // move up from there would be invisible.
+                    input.mouse(100, 100, None);
+                    thread::sleep(Duration::from_millis(100));
+                    input.mouse(40, -30, None);
+                    thread::sleep(Duration::from_millis(100));
+                    input.mouse(0, 0, Some(("left", true)));
+                    thread::sleep(Duration::from_millis(50));
+                    input.mouse(0, 0, Some(("left", false)));
+                    thread::sleep(Duration::from_millis(100));
+                    // One command per packet, because QEMU syncs input once
+                    // per command: 1000 commands is 1000 packets, 3000 bytes
+                    // through the framer.
+                    for i in 0..BURST {
+                        input.mouse(if i % 2 == 0 { 1 } else { -1 }, 0, None);
+                    }
+                    thread::sleep(Duration::from_millis(200));
+                    input.mouse(0, 0, Some(("left", true)));
+                    thread::sleep(Duration::from_millis(50));
+                    input.mouse(0, 0, Some(("left", false)));
+                },
+            );
+            if let Some(err) = &result.error {
+                return Err(format!("{err}\n{}", result.stdout));
+            }
+
+            let events = parse_mouse_events(&result.stdout);
+            if events.len() < BURST / 2 {
+                return Err(format!(
+                    "only {} pointer events reached userland, want at least {}",
+                    events.len(),
+                    BURST / 2
+                ));
+            }
+            // A sign error in dy is invisible to any test that only checks
+            // "it moved", and the PS/2 wire points the opposite way to the
+            // screen — so both directions are asserted separately.
+            if !events.windows(2).any(|w| w[1].x > w[0].x) {
+                return Err("the pointer never moved right".to_string());
+            }
+            if !events.windows(2).any(|w| w[1].y < w[0].y) {
+                return Err(format!(
+                    "the pointer never moved up — dy inverted? ys: {:?}",
+                    events.iter().take(8).map(|e| e.y).collect::<Vec<_>>()
+                ));
+            }
+            // PS/2 bit 0 is left, and so is HID boot-mouse bit 0.
+            if !events.iter().any(|e| e.buttons == 0x01) {
+                return Err(format!(
+                    "no left-button-down event; buttons seen: {:?}",
+                    events.iter().map(|e| e.buttons).collect::<std::collections::BTreeSet<_>>()
+                ));
+            }
+            // And after 3000 bytes of packets the framer is still aligned:
+            // the last click is reported as a click, not as motion or as the
+            // wrong button.
+            let last_press = events.iter().rposition(|e| e.buttons == 0x01);
+            let Some(last_press) = last_press else {
+                return Err("no button press at all".to_string());
+            };
+            if events[last_press..].last().map(|e| e.buttons) != Some(0x00) {
+                return Err(format!(
+                    "framing drifted: after the final click the button state is {:?}",
+                    events.last()
+                ));
+            }
+            eprintln!(
+                "  [i8042] {} pointer events, last button state {:#04x}",
+                events.len(),
+                events.last().unwrap().buttons
+            );
+            Ok(())
+        }
         other => Err(format!("unknown input test {other}")),
     }
 }
@@ -1599,6 +1698,30 @@ fn parse_key_events(stdout: &str) -> Vec<KeyLine> {
 /// four characters `\u{1b}` rather than the byte.
 fn unescape(s: &str) -> String {
     s.replace("\\u{1b}", "\u{1b}").replace("\\\"", "\"").replace("\\\\", "\\")
+}
+
+#[derive(Debug)]
+struct MouseLine {
+    buttons: u8,
+    x: u16,
+    y: u16,
+}
+
+/// `mev buttons=0x01 x=6400 y=6400` — what the in-guest reader prints.
+fn parse_mouse_events(stdout: &str) -> Vec<MouseLine> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let rest = line.split("mev buttons=0x").nth(1)?;
+            let (buttons, rest) = rest.split_once(" x=")?;
+            let (x, y) = rest.split_once(" y=")?;
+            Some(MouseLine {
+                buttons: u8::from_str_radix(buttons, 16).ok()?,
+                x: x.parse().ok()?,
+                y: y.trim().parse().ok()?,
+            })
+        })
+        .collect()
 }
 
 /// The `keys=` field of an `i8042: drain ...` trace line.

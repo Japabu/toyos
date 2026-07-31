@@ -40,7 +40,7 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
 
-use toyos_ps2::{KeyDecoder, KeyOutcome};
+use toyos_ps2::{KeyDecoder, KeyOutcome, MouseDecoder, MouseOutcome};
 
 use crate::arch::cpu::{inb, outb};
 use crate::arch::idt::I8042_VECTOR;
@@ -60,17 +60,22 @@ const AUXB: u8 = 1 << 5;
 const CMD_READ_CONFIG: u8 = 0x20;
 const CMD_WRITE_CONFIG: u8 = 0x60;
 const CMD_DISABLE_AUX: u8 = 0xA7;
+const CMD_ENABLE_AUX: u8 = 0xA8;
+const CMD_TEST_AUX: u8 = 0xA9;
 const CMD_SELF_TEST: u8 = 0xAA;
 const CMD_TEST_PORT1: u8 = 0xAB;
 const CMD_DISABLE_PORT1: u8 = 0xAD;
 const CMD_ENABLE_PORT1: u8 = 0xAE;
+const CMD_WRITE_AUX: u8 = 0xD4;
 
 const CFG_PORT1_IRQ: u8 = 1 << 0;
 const CFG_PORT2_IRQ: u8 = 1 << 1;
 const CFG_PORT1_CLOCK_OFF: u8 = 1 << 4;
+const CFG_PORT2_CLOCK_OFF: u8 = 1 << 5;
 const CFG_TRANSLATE: u8 = 1 << 6;
 
 const ISA_IRQ_KEYBOARD: u8 = 1;
+const ISA_IRQ_AUX: u8 = 12;
 
 /// The largest legitimate burst is a 3-byte mouse packet plus a 4-byte
 /// extended key sequence. Anything past this is a controller that is not
@@ -80,9 +85,11 @@ const ISR_BURST: usize = 16;
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 static QUARANTINE: AtomicBool = AtomicBool::new(false);
 static KBD_EVENTS: AtomicU32 = AtomicU32::new(0);
+static AUX_EVENTS: AtomicU32 = AtomicU32::new(0);
 static LOST_EDGES: AtomicU32 = AtomicU32::new(0);
 static DROPPED: AtomicU32 = AtomicU32::new(0);
 static KEYBOARD_GSI: AtomicU32 = AtomicU32::new(u32::MAX);
+static AUX_GSI: AtomicU32 = AtomicU32::new(u32::MAX);
 
 // The byte ring.
 //
@@ -151,9 +158,11 @@ pub extern "sysv64" fn handler() {
 
 struct Decoders {
     keys: KeyDecoder,
+    pointer: MouseDecoder,
 }
 
-static PS2: Lock<Decoders> = Lock::new(Decoders { keys: KeyDecoder::new() });
+static PS2: Lock<Decoders> =
+    Lock::new(Decoders { keys: KeyDecoder::new(), pointer: MouseDecoder::new() });
 
 /// Turn whatever the ISR published into events and wakes. Runs at the top of
 /// every scheduler pass on every CPU, so the idle cost is one atomic load.
@@ -175,7 +184,7 @@ pub fn service() {
         LOST_EDGES.fetch_add(1, Ordering::Relaxed);
     }
 
-    let (bytes, keys) = drain();
+    let Drained { bytes, keys, motion, aux_reset } = drain();
 
     // Wake only when the decode queued something. Readiness that disagrees
     // with `has_data()` parks the next reader until the following real
@@ -191,35 +200,74 @@ pub fn service() {
             );
         }
     }
-    trace_drain(bytes, keys, woke_kb);
+    let woke_ms = motion > 0;
+    if woke_ms {
+        crate::mouse::wake_waiters();
+        let watchers = crate::mouse::io_uring_watchers();
+        if !watchers.is_empty() {
+            crate::io_uring::complete_pending_for_event(
+                &watchers,
+                crate::io_uring::Source::Mouse,
+            );
+        }
+    }
+    trace_drain(bytes, keys, motion, woke_kb, woke_ms);
+
+    // Outside the guard, for the same reason the wakes are: it masks both
+    // lines and does polled I/O.
+    if aux_reset {
+        aux_reenable();
+    }
+}
+
+struct Drained {
+    bytes: usize,
+    keys: usize,
+    motion: usize,
+    aux_reset: bool,
 }
 
 /// Consume the ring. Releases `PS2` before returning, so the caller's wakes —
 /// which reach the scheduler, cross-CPU doorbells and possibly an IPI —
 /// never run under a driver lock. Lock order is PS2 → KEY_BUF, never the
 /// reverse.
-fn drain() -> (usize, usize) {
+fn drain() -> Drained {
     let mut state = PS2.lock();
-    let mut bytes = 0;
-    let mut keys = 0;
+    let mut out = Drained { bytes: 0, keys: 0, motion: 0, aux_reset: false };
     let mut lost = false;
 
     if DROPPED.swap(0, Ordering::Relaxed) > 0 {
-        // A hole in a framed stream: the prefix state is meaningless now.
+        // A hole in a framed stream: both decoders' partial state is
+        // meaningless now, and the pointer would stay one byte off forever.
         state.keys.reset();
+        state.pointer.reset();
         lost = true;
     }
 
+    let now = crate::clock::nanos_since_boot();
     while let Some((byte, aux)) = pop() {
-        bytes += 1;
+        out.bytes += 1;
         if aux {
-            // No aux device yet; the port is disabled, so this is residue.
+            match state.pointer.feed(byte, now) {
+                MouseOutcome::Packet { buttons, dx, dy } => {
+                    if crate::mouse::handle_motion(
+                        crate::mouse::PointerSource::Ps2,
+                        buttons,
+                        crate::mouse::Motion::Relative { dx, dy },
+                        0,
+                    ) {
+                        out.motion += 1;
+                    }
+                }
+                MouseOutcome::Reset => out.aux_reset = true,
+                MouseOutcome::None => {}
+            }
             continue;
         }
         match state.keys.feed(byte) {
             KeyOutcome::Key { usage, pressed } => {
                 if crate::keyboard::handle_key(usage, pressed) {
-                    keys += 1;
+                    out.keys += 1;
                 }
             }
             KeyOutcome::Lost => lost = true,
@@ -229,11 +277,12 @@ fn drain() -> (usize, usize) {
 
     if lost {
         // The break codes for whatever is down may be among what was lost.
-        keys += crate::keyboard::release_all();
+        out.keys += crate::keyboard::release_all();
     }
 
-    KBD_EVENTS.fetch_add(keys as u32, Ordering::Relaxed);
-    (bytes, keys)
+    KBD_EVENTS.fetch_add(out.keys as u32, Ordering::Relaxed);
+    AUX_EVENTS.fetch_add(out.motion as u32, Ordering::Relaxed);
+    out
 }
 
 /// A controller producing bytes faster than the ISR's bound can drain them.
@@ -248,15 +297,23 @@ fn quarantine() {
     log!("i8042: quarantined — output buffer never emptied, GSI {} masked", gsi);
 }
 
-/// `woke_kb` is the gate the wake actually ran under, not a re-derivation of
-/// it — so a test can assert the gate agrees with the event count.
+/// The `woke_*` fields are the gates the wakes actually ran under, not a
+/// re-derivation of them — so a test can assert the gate agrees with the
+/// event count.
 #[cfg(feature = "i8042-trace")]
-fn trace_drain(bytes: usize, keys: usize, woke_kb: bool) {
-    log!("i8042: drain bytes={} keys={} woke_kb={}", bytes, keys, u8::from(woke_kb));
+fn trace_drain(bytes: usize, keys: usize, motion: usize, woke_kb: bool, woke_ms: bool) {
+    log!(
+        "i8042: drain bytes={} keys={} motion={} woke_kb={} woke_ms={}",
+        bytes,
+        keys,
+        motion,
+        u8::from(woke_kb),
+        u8::from(woke_ms)
+    );
 }
 
 #[cfg(not(feature = "i8042-trace"))]
-fn trace_drain(_bytes: usize, _keys: usize, _woke_kb: bool) {}
+fn trace_drain(_b: usize, _k: usize, _m: usize, _wkb: bool, _wms: bool) {}
 
 // Polled init.
 //
@@ -341,6 +398,52 @@ fn device_command(bytes: &[u8], deadline: u64) -> bool {
     true
 }
 
+/// Same, for the aux port: every byte has to be prefixed with the controller
+/// command that redirects the next write to port 2.
+fn aux_command(bytes: &[u8], deadline: u64) -> bool {
+    for &byte in bytes {
+        if !command(CMD_WRITE_AUX, deadline) || !write_data(byte, deadline) {
+            log!("i8042: aux cmd {:#04x} — input buffer never cleared", byte);
+            return false;
+        }
+        match read_data(deadline) {
+            Some(0xFA) => {}
+            other => {
+                log!("i8042: aux cmd {:#04x} answered {:?}, not ack", byte, other);
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Re-enable data reporting after the device reset itself. The EC does this
+/// after suspend or a lid event, and without it the TrackPoint goes silent
+/// for the rest of the boot.
+///
+/// Both lines are masked first. The handshake below polls port 0x60, and the
+/// ISR is otherwise the sole reader of it; masking is what makes "sole" true
+/// from a drain, which runs on whichever CPU entered the scheduler.
+fn aux_reenable() {
+    let lines = [KEYBOARD_GSI.load(Ordering::Relaxed), AUX_GSI.load(Ordering::Relaxed)];
+    for gsi in lines {
+        if gsi != u32::MAX {
+            let _ = ioapic::set_masked(Gsi(gsi), true);
+        }
+    }
+    let ok = aux_command(&[0xF4], deadline(600));
+    // Anything the handshake left behind, and anything that arrived while
+    // the lines were masked: with edge delivery a byte left in OBF means no
+    // further interrupt ever.
+    handler_poll();
+    for gsi in lines {
+        if gsi != u32::MAX {
+            let _ = ioapic::set_masked(Gsi(gsi), false);
+        }
+    }
+    log!("i8042: aux reset itself, reporting re-enabled ({})", if ok { "ok" } else { "FAILED" });
+}
+
 pub fn init(rsdp_addr: u64) {
     match crate::drivers::acpi::iapc_boot_arch(rsdp_addr) {
         // Bit 1 is "8042 present", and it is only meaningful from revision 2.
@@ -410,8 +513,24 @@ pub fn init(rsdp_addr: u64) {
         log!("i8042: port 1 interface test {:?} — no keyboard", port1);
         return;
     }
+    // Enabling port 2 clears its clock-disable bit iff the port exists. The
+    // interface test is then the cheap way to learn it does not, instead of
+    // waiting out a 600 ms device-reset timeout on every machine without one.
+    command(CMD_ENABLE_AUX, budget);
+    let dual = read_config(budget).is_some_and(|c| c & CFG_PORT2_CLOCK_OFF == 0);
+    command(CMD_DISABLE_AUX, budget);
+    let port2 = dual && {
+        command(CMD_TEST_AUX, budget);
+        read_data(budget) == Some(0x00)
+    };
+
     command(CMD_ENABLE_PORT1, budget);
-    log!("i8042: ok selftest=0x55 cfg={:#04x}->{:#04x} port1=ok", before, wanted);
+    log!(
+        "i8042: ok selftest=0x55 cfg={:#04x}->{:#04x} port1=ok port2={}",
+        before,
+        wanted,
+        if port2 { "ok" } else if dual { "failed" } else { "absent" }
+    );
 
     // The slowest step on a real EC, hence its own budget.
     let kbd = deadline(750);
@@ -456,28 +575,84 @@ pub fn init(rsdp_addr: u64) {
         return;
     }
 
+    // The TrackPoint. Failure here costs the pointer and nothing else, so
+    // every step logs and falls through rather than returning.
+    let aux = port2 && {
+        command(CMD_ENABLE_AUX, budget);
+        let reset = deadline(600);
+        // 0xFF answers 0xFA, then 0xAA (BAT ok), then the device id.
+        aux_command(&[0xFF], reset)
+            && read_data(reset) == Some(0xAA)
+            && read_data(reset).is_some()
+            && aux_command(&[0xF2], reset)
+            && {
+                let id = read_data(reset);
+                if id != Some(0x00) {
+                    log!("i8042: aux id {:?}, not a plain 3-byte mouse — framing anyway", id);
+                }
+                true
+            }
+            // 100 samples/s, 8 counts/mm. No IntelliMouse knock: the
+            // TrackPoint has no wheel, and a fixed 3-byte frame is what
+            // makes resync trivially self-healing.
+            && aux_command(&[0xF3, 0x64], reset)
+            && aux_command(&[0xE8, 0x03], reset)
+            && aux_command(&[0xF4], reset)
+    };
+    if port2 && !aux {
+        log!("i8042: aux init failed — no pointer");
+        command(CMD_DISABLE_AUX, budget);
+    }
+
     // Steps above leave residue in the output buffer.
     flush(budget);
 
-    let Some(line) = ioapic::gsi_for_isa_irq(ISA_IRQ_KEYBOARD) else {
+    let apic_id = crate::arch::apic::id();
+    let Some(kbd_line) = ioapic::gsi_for_isa_irq(ISA_IRQ_KEYBOARD) else {
         log!("i8042: no I/O APIC covers IRQ 1 — keyboard cannot be routed");
         return;
     };
-    let apic_id = crate::arch::apic::id();
-    if let Err(e) = ioapic::route(line.gsi, I8042_VECTOR, apic_id, line.trigger, line.polarity) {
-        log!("i8042: GSI {} not routable to apic {}: {:?}", line.gsi.0, apic_id, e);
+    // The physical destination field is 8 bits without interrupt remapping,
+    // and `route` refuses rather than mis-route. A keyboard-less boot is
+    // diagnosable; an interrupt delivered to the wrong CPU is not.
+    if let Err(e) = ioapic::route(kbd_line.gsi, I8042_VECTOR, apic_id, kbd_line.trigger, kbd_line.polarity)
+    {
+        log!("i8042: GSI {} not routable to apic {}: {:?}", kbd_line.gsi.0, apic_id, e);
         return;
     }
-    KEYBOARD_GSI.store(line.gsi.0, Ordering::Relaxed);
+    KEYBOARD_GSI.store(kbd_line.gsi.0, Ordering::Relaxed);
 
-    // Arm the line with interrupts off on this CPU. The vector is pinned
+    let aux_line = aux.then(|| ioapic::gsi_for_isa_irq(ISA_IRQ_AUX)).flatten().filter(|l| {
+        match ioapic::route(l.gsi, I8042_VECTOR, apic_id, l.trigger, l.polarity) {
+            Ok(()) => true,
+            Err(e) => {
+                log!("i8042: GSI {} not routable to apic {}: {:?}", l.gsi.0, apic_id, e);
+                false
+            }
+        }
+    });
+    if let Some(l) = aux_line {
+        AUX_GSI.store(l.gsi.0, Ordering::Relaxed);
+    }
+
+    // Arm the lines with interrupts off on this CPU. The vector is pinned
     // here, so this stays the sole reader of 0x60 across the switch: a byte
     // that landed between the last flush and the unmask would otherwise sit
     // in OBF forever, because with edge delivery the controller does not
     // re-assert until it is read.
     crate::arch::cpu::disable_interrupts();
-    write_config(wanted | CFG_PORT1_IRQ, budget);
-    let unmasked = ioapic::set_masked(line.gsi, false).is_ok();
+    let mut config = wanted | CFG_PORT1_IRQ;
+    if aux_line.is_some() {
+        // Clearing the clock-disable bit as well as setting the IRQ bit:
+        // `wanted` was derived from what firmware left behind, which has
+        // port 2 disabled, and writing it back would undo the 0xA8 above.
+        config = (config | CFG_PORT2_IRQ) & !CFG_PORT2_CLOCK_OFF;
+    }
+    write_config(config, budget);
+    let unmasked = ioapic::set_masked(kbd_line.gsi, false).is_ok();
+    if let Some(l) = aux_line {
+        let _ = ioapic::set_masked(l.gsi, false);
+    }
     ACTIVE.store(true, Ordering::Relaxed);
     handler_poll();
     crate::arch::cpu::enable_interrupts();
@@ -485,11 +660,15 @@ pub fn init(rsdp_addr: u64) {
     log!(
         "i8042: kbd set2+xlat (readback {:#04x}) scanning on, GSI {} -> vec {:#04x} apic {} {}",
         mode,
-        line.gsi.0,
+        kbd_line.gsi.0,
         I8042_VECTOR,
         apic_id,
         if unmasked { "on" } else { "MASKED" }
     );
+    match aux_line {
+        Some(l) => log!("i8042: aux rate=100 res=8/mm, GSI {} -> vec {:#04x} apic {}", l.gsi.0, I8042_VECTOR, apic_id),
+        None => log!("i8042: no pointer on the aux port"),
+    }
 }
 
 /// The handler's drain loop, without the EOI. Called once from init with

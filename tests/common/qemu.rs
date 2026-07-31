@@ -552,51 +552,64 @@ fn qmp_screendump(socket: &Path, out: &Path) {
     ));
 }
 
-/// One `input-send-event` carrying every key transition in `events`, given as
-/// `(qcode, down)`. Sending them as one command is what makes a chord like
-/// Shift+B arrive as a chord rather than as a race.
-pub fn qmp_send_keys(socket: &Path, events: &[(&str, bool)]) {
-    let body: Vec<String> = events
-        .iter()
-        .map(|(qcode, down)| {
-            format!(
-                "{{\"type\":\"key\",\"data\":{{\"down\":{down},\"key\":{{\"type\":\"qcode\",\"data\":\"{qcode}\"}}}}}}"
-            )
-        })
-        .collect();
-    let mut qmp = Qmp::connect(socket);
-    qmp.execute(&format!(
-        "{{\"execute\":\"input-send-event\",\"arguments\":{{\"events\":[{}]}}}}",
-        body.join(",")
-    ));
+/// An open QMP connection for injecting input.
+///
+/// One connection rather than one per event, because QEMU delivers each
+/// `input-send-event` as its own input sync — so a thousand pointer packets
+/// is a thousand commands, and a thousand reconnects on top of that is the
+/// difference between a second and a minute.
+pub struct QmpInput(Qmp);
+
+impl QmpInput {
+    pub fn open(socket: &Path) -> Self {
+        Self(Qmp::connect(socket))
+    }
+
+    fn send(&mut self, body: &[String]) {
+        if body.is_empty() {
+            return;
+        }
+        self.0.execute(&format!(
+            "{{\"execute\":\"input-send-event\",\"arguments\":{{\"events\":[{}]}}}}",
+            body.join(",")
+        ));
+    }
+
+    /// Every key transition in `events` as one batch, so a chord like Shift+B
+    /// arrives as a chord rather than as a race.
+    pub fn keys(&mut self, events: &[(&str, bool)]) {
+        let body: Vec<String> = events
+            .iter()
+            .map(|(qcode, down)| {
+                format!(
+                    "{{\"type\":\"key\",\"data\":{{\"down\":{down},\"key\":{{\"type\":\"qcode\",\"data\":\"{qcode}\"}}}}}}"
+                )
+            })
+            .collect();
+        self.send(&body);
+    }
+
+    /// One pointer packet: relative motion and/or a button transition.
+    pub fn mouse(&mut self, dx: i32, dy: i32, button: Option<(&str, bool)>) {
+        let mut body: Vec<String> = Vec::new();
+        if let Some((name, down)) = button {
+            body.push(format!(
+                "{{\"type\":\"btn\",\"data\":{{\"down\":{down},\"button\":\"{name}\"}}}}"
+            ));
+        }
+        for (axis, value) in [("x", dx), ("y", dy)] {
+            if value != 0 {
+                body.push(format!(
+                    "{{\"type\":\"rel\",\"data\":{{\"axis\":\"{axis}\",\"value\":{value}}}}}"
+                ));
+            }
+        }
+        self.send(&body);
+    }
 }
 
-/// Relative pointer motion and/or a button transition, as one event batch.
-pub fn qmp_send_mouse(socket: &Path, dx: i32, dy: i32, button: Option<(&str, bool)>) {
-    let mut body: Vec<String> = Vec::new();
-    if let Some((name, down)) = button {
-        body.push(format!(
-            "{{\"type\":\"btn\",\"data\":{{\"down\":{down},\"button\":\"{name}\"}}}}"
-        ));
-    }
-    if dx != 0 {
-        body.push(format!(
-            "{{\"type\":\"rel\",\"data\":{{\"axis\":\"x\",\"value\":{dx}}}}}"
-        ));
-    }
-    if dy != 0 {
-        body.push(format!(
-            "{{\"type\":\"rel\",\"data\":{{\"axis\":\"y\",\"value\":{dy}}}}}"
-        ));
-    }
-    if body.is_empty() {
-        return;
-    }
-    let mut qmp = Qmp::connect(socket);
-    qmp.execute(&format!(
-        "{{\"execute\":\"input-send-event\",\"arguments\":{{\"events\":[{}]}}}}",
-        body.join(",")
-    ));
+pub fn qmp_send_keys(socket: &Path, events: &[(&str, bool)]) {
+    QmpInput::open(socket).keys(events);
 }
 
 /// The argv `options` would launch QEMU with, built against placeholder
