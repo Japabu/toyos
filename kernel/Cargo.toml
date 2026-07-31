@@ -35,6 +35,11 @@ xhci-one-slot = []
 # proving what 256 KiB proves in a second. The eviction code under test is the
 # shipped code; only the bound moves.
 test-small-caches = []
+# SYS_DEBUG action 4: take a real #DF, by faulting with an unusable RSP. The
+# only way to exercise the IST1 stack, which is the one stack in the kernel
+# whose overflow corrupts the heap while writing the report that explains the
+# fault. Nothing but a genuine double fault reaches that path.
+test-double-fault = []
 # Panic once the boot phases are done, with no thread current, so a test can
 # drive the ordinary fatal panic — the one path where the report reaches the
 # screen only because the panic handler captured it before draining the ring.

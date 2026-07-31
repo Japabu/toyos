@@ -315,12 +315,61 @@ impl core::fmt::Write for SerialWriter {
     }
 }
 
+/// Spins per byte for the transmit-holding-register-empty bit, bounded.
+///
+/// The bound is not belt-and-braces. `uart_present()` says a 16550 answered a
+/// loopback probe at boot, not that it is still draining: a UART wedged with
+/// THRE clear — flow-controlled by a host that went away, or simply broken —
+/// made this loop infinite, and it is on `panic_flush`'s bypass path, which is
+/// the last thing standing when the backend lock holder is already wedged. So
+/// the one mechanism designed for "everything else has failed" could itself
+/// hang forever, on the machine where it matters most: a laptop, where nothing
+/// is watching the console to notice. `panic_raw_uart` in `main.rs` has always
+/// bounded its wait; this is the same bound, applied where the bytes actually
+/// go. Losing a byte to a dead UART beats losing the machine to it.
+const THRE_SPIN_LIMIT: u32 = 100_000;
+
 fn uart_write_bytes(bytes: &[u8]) {
     if !uart_present() {
         return;
     }
     for &b in bytes {
-        while inb(PORT + 5) & 0x20 == 0 {}
+        for _ in 0..THRE_SPIN_LIMIT {
+            if inb(PORT + 5) & 0x20 != 0 {
+                break;
+            }
+            core::hint::spin_loop();
+        }
         outb(PORT, b);
     }
+}
+
+/// Write straight to the 16550, bypassing the ring, the backend lock and the
+/// virtio console.
+///
+/// For the two callers that have to report something *about* the machinery
+/// they would otherwise report through: the panic-reentry line, and the IST1
+/// stack verdict, which is meaningless if it travels through a ring that may
+/// be what the overflow corrupted. No lock, no allocation, bounded per byte.
+pub fn panic_raw(bytes: &[u8]) {
+    uart_write_bytes(bytes);
+}
+
+/// `panic_raw` for a number, since the callers cannot format one.
+pub fn panic_raw_dec(mut v: u64) {
+    let mut digits = [0u8; 20];
+    let mut n = 0;
+    loop {
+        digits[n] = b'0' + (v % 10) as u8;
+        n += 1;
+        v /= 10;
+        if v == 0 || n == digits.len() {
+            break;
+        }
+    }
+    let mut out = [0u8; 20];
+    for i in 0..n {
+        out[i] = digits[n - 1 - i];
+    }
+    uart_write_bytes(&out[..n]);
 }

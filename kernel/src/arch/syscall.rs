@@ -486,6 +486,31 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             // and no latch fixes that — one call is already a permanent halt.
             #[cfg(feature = "test-fatal-halt")]
             3 => { log!("{}", FATAL_HALT_NONCE); crate::arch::apic::halt_all_cpus(); }
+            // A real double fault, produced the way the hardware produces one:
+            // fault while RSP cannot be pushed to. The push below raises #SS on
+            // a non-canonical stack address, and delivering *that* needs another
+            // push to the same RSP, which is the #DF condition. Nothing
+            // simulated — the point is to run the IST1 stack, and only the CPU
+            // can put us there.
+            //
+            // Non-canonical rather than merely unmapped, because "unmapped" is
+            // a claim about this machine's memory map that a bigger machine
+            // falsifies quietly: an address inside the direct map would simply
+            // be written to, and the test would pass having faulted nothing.
+            // Only #DF has an IST, so every other vector on the way is
+            // delivered onto this same unusable stack.
+            #[cfg(feature = "test-double-fault")]
+            4 => {
+                log!("SYS_DEBUG: provoking a double fault");
+                unsafe {
+                    core::arch::asm!(
+                        "mov rsp, {bad}",
+                        "push 0",
+                        bad = in(reg) 0x0000_8000_0000_0000u64,
+                        options(noreturn),
+                    );
+                }
+            }
             _ => SyscallError::InvalidArgument.to_u64(),
         },
         SYS_SCHED_INFO => {

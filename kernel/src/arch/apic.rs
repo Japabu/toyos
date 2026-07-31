@@ -109,6 +109,11 @@ pub fn halt_all_cpus() -> ! {
     // line arriving on serial proves the paint already finished.
     let painted = crate::drivers::panic_console::render();
     unsafe { crate::drivers::serial::panic_flush(); }
+    // After the flush, because the flush is the deepest this path ever goes:
+    // it is where the drain buffer lives, and a check placed before it would
+    // certify a stack depth the report had not yet reached. No-op unless this
+    // CPU is on IST1.
+    percpu::ist1_report();
     // And the pager strictly after it, for the same reason inverted: it *is*
     // an unbounded loop, so it may only run once the serial report is out.
     // Only the CPU that painted enters it; every other one halts below.

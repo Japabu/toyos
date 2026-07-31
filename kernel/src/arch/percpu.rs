@@ -184,7 +184,29 @@ const _: () = assert!(core::mem::offset_of!(PerCpu, fault_state) == 256);
 const _: () = assert!(core::mem::offset_of!(PerCpu, last_armed_ticks) == 260);
 
 const IDLE_STACK_SIZE: usize = 16384; // 16KB
-const IST1_STACK_SIZE: usize = 4096;  // 4KB — only used by double fault handler
+
+/// The double fault stack. Only #DF uses IST1, and what runs on it is the
+/// whole crash report plus `halt_all_cpus` — render, then `panic_flush`.
+///
+/// It was 4096, and `drain_to_serial` puts a 4096-byte buffer on it, so the
+/// report overflowed the stack it was being written from and corrupted the
+/// heap underneath while producing the evidence for the fault that had just
+/// happened. Measured at 5936 bytes used before the buffers were cut and 2216
+/// after; see `ist1_report`, which is what measured it and still does.
+const IST1_STACK_SIZE: usize = 16384;
+
+/// Filled with [`STACK_FILL`] and never written by anything legitimate, so an
+/// overflow is observable after the fact.
+///
+/// Deliberately not an unmapped guard page: a page fault taken while already
+/// on the double fault stack is a triple fault, which resets the machine and
+/// takes the report with it. Detecting the overflow is worth more here than
+/// trapping it, because the report is the entire reason this stack exists.
+const IST1_GUARD_SIZE: usize = 4096;
+
+/// Chosen so a zeroed or ASCII byte cannot be mistaken for untouched stack.
+const STACK_FILL: u8 = 0xA5;
+const STACK_FILL_WORD: u64 = u64::from_ne_bytes([STACK_FILL; 8]);
 
 /// Allocate and initialize PerCpu for a CPU. Returns a raw pointer (lives forever).
 fn alloc_percpu(cpu_id: u32, lapic_id: u32) -> *mut PerCpu {
@@ -213,11 +235,75 @@ fn alloc_idle_stack(percpu: &mut PerCpu) {
 }
 
 fn alloc_ist1_stack(percpu: &mut PerCpu) {
-    let layout = Layout::from_size_align(IST1_STACK_SIZE, 4096).unwrap();
+    let total = IST1_GUARD_SIZE + IST1_STACK_SIZE;
+    let layout = Layout::from_size_align(total, 4096).unwrap();
     let base = unsafe { alloc_zeroed(layout) };
     assert!(!base.is_null(), "percpu: IST1 stack alloc failed");
-    let top = base as u64 + IST1_STACK_SIZE as u64;
+    unsafe { core::ptr::write_bytes(base, STACK_FILL, total) };
+    let top = base as u64 + total as u64;
     unsafe { core::ptr::write_unaligned(&raw mut percpu.tss.ist[0], top); }
+}
+
+/// The IST1 stack top this CPU's TSS holds, if it looks like one.
+///
+/// Read through GS like everything else here, and checked rather than trusted:
+/// the callers are on the panic path, where a corrupted percpu block is one of
+/// the things that could have brought us here.
+fn ist1_top() -> Option<u64> {
+    let percpu: *const PerCpu;
+    unsafe { core::arch::asm!("mov {}, gs:[0]", out(reg) percpu, options(nomem, nostack, preserves_flags)); }
+    if !crate::mm::is_kernel_addr(percpu as u64) {
+        return None;
+    }
+    let top = unsafe { core::ptr::read_unaligned(&raw const (*percpu).tss.ist[0]) };
+    let total = (IST1_GUARD_SIZE + IST1_STACK_SIZE) as u64;
+    let base = top.checked_sub(total)?;
+    (crate::mm::is_kernel_addr(base) && top % 4096 == 0).then_some(top)
+}
+
+/// Report how much of the double fault stack the crash report actually used,
+/// straight to the UART.
+///
+/// Called from `halt_all_cpus` *after* `panic_flush`, which is the deepest the
+/// path ever gets, and only when this CPU is running on IST1 — so it says
+/// nothing on the ordinary fatal paths, which are on an ordinary stack.
+///
+/// It bypasses the log ring on purpose. The ring has just been drained and the
+/// machine is about to halt, so anything queued there would never come out;
+/// and if this reports damage, the ring is exactly what may have been
+/// corrupted. The whole point is a channel that does not depend on the thing
+/// under suspicion.
+pub fn ist1_report() {
+    let Some(top) = ist1_top() else { return };
+    let rsp = cpu::read_rsp();
+    let stack_bottom = top - IST1_STACK_SIZE as u64;
+    if rsp < stack_bottom || rsp > top {
+        return;
+    }
+
+    let guard_base = stack_bottom - IST1_GUARD_SIZE as u64;
+    let intact = words(guard_base, IST1_GUARD_SIZE).all(|w| w == STACK_FILL_WORD);
+    let untouched = words(stack_bottom, IST1_STACK_SIZE)
+        .take_while(|&w| w == STACK_FILL_WORD)
+        .count()
+        * 8;
+    let used = IST1_STACK_SIZE - untouched;
+
+    crate::drivers::serial::panic_raw(b"\n[ist1] used ");
+    crate::drivers::serial::panic_raw_dec(used as u64);
+    crate::drivers::serial::panic_raw(b" of ");
+    crate::drivers::serial::panic_raw_dec(IST1_STACK_SIZE as u64);
+    crate::drivers::serial::panic_raw(if intact {
+        b" bytes, guard intact\n"
+    } else {
+        b" bytes, GUARD CORRUPTED\n"
+    });
+}
+
+/// Sequential u64s from `base`. Every address is inside the allocation the
+/// caller just bounds-checked, so there is nothing here that can fault.
+fn words(base: u64, len: usize) -> impl Iterator<Item = u64> {
+    (0..len / 8).map(move |i| unsafe { core::ptr::read_volatile((base as *const u64).add(i)) })
 }
 
 /// Initialize per-CPU data for the BSP. Call after paging + allocator but before IDT/syscall.
