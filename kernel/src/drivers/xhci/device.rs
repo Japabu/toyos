@@ -189,8 +189,11 @@ pub fn init_device(ctrl: &mut XhciController, op_base: &Mmio, port_idx: u8) {
     let slot_id = slot_id as u8;
     // A slot id is the controller's answer, not the driver's, and CONFIG's
     // MaxSlotsEn is only advisory to a controller that chooses to ignore it —
-    // QEMU's does. Costing this device its slot is the whole penalty; there is
-    // no state to unwind, because none has been written for it yet.
+    // QEMU's does. Nothing of the driver's is written for this device yet, so
+    // there is nothing here to unwind; the controller's own Device Slot is
+    // already allocated, and stays that way, because the driver issues no
+    // Disable Slot on any path. That leak is filed, and this is its fourth
+    // call site.
     let Some(block) = ctrl.layout.device(slot_id) else {
         log!("xHCI: slot {} is beyond the pool's {} device blocks, dropping port {}",
             slot_id, ctrl.layout.dev_blocks, port_idx + 1);

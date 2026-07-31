@@ -763,15 +763,21 @@ to observe.
 `init_device` enables a slot for every connected port and issues no Disable
 Slot, on any path: not for the non-HID devices it walks past (the boot stick
 and any hub, camera or fingerprint reader), not when Address Device fails, not
-when the descriptor fetch fails. Each of those keeps a slot and a device block
-for a device the driver will never talk to again.
+when the descriptor fetch fails, and not when the slot id comes back past the
+pool's device blocks (`device.rs:194`, the `layout.device()` `None` branch).
+Each of those keeps a slot for a device the driver will never talk to again.
+
+The fourth is the one with a test behind it: `xhci_slot_exhaustion` leaves five
+slots enabled with a zero DCBAA entry every run, which makes the entry's own
+test the largest producer of the leak it describes.
 
 Harmless where slots outnumber ports, which is every machine in reach: QEMU
 reports 64, Intel's PCH controllers 32 or more, and no root hub has that many
 ports. It stops being harmless on a controller whose slot count is below its
 device count, where a HID on a later port loses its slot to a hub on an earlier
-one. `xhci_slot_exhaustion` is what would catch the regression — it already
-proves the machine survives the shortage, not that the right devices win it.
+one. `xhci_slot_exhaustion` is what would catch the regression — it proves the
+machine survives the shortage and that the one device which fit was enumerated
+to completion, not that the right devices win it.
 
 ### The xHCI driver refuses a controller whose PAGESIZE is not 4 KiB
 
@@ -811,10 +817,22 @@ one xHCI-shaped first-boot risk M1's fix does not touch.
 
 ### USB hotplug does nothing, and M1 made that reachable
 
-`poll` (`mod.rs:298-318`) dispatches only `EVENT_TRANSFER`, and only for a slot
-already in `devices`; every other TRB type is advanced past and dropped, Port
-Status Change events included. `scan_ports` has exactly one caller, inside
-`init`. So the set of USB devices is whatever was connected at boot, forever.
+`dispatch_event` handles only `EVENT_TRANSFER`, and only for a slot already in
+`devices`; every other TRB type is advanced past and dropped, Port Status
+Change events included. `scan_ports` has exactly one caller, inside `init`. So
+the set of USB devices is whatever was connected at boot, forever.
+
+**Read this before wiring `scan_ports` to Port Status Change events.** The
+driver keeps one EP0 ring, one input context and one descriptor buffer for all
+devices, and the only thing that makes that safe is that enumeration is serial:
+`init_device` runs once per port, from `init`, on one CPU. The invariant is
+written at `mod.rs:reset_ep0_ring` and `device.rs:scan_ports`, and hotplug is
+exactly the thing that breaks it — enumeration would then run while other
+devices are live, and two devices enumerating at once share an EP0 ring. What
+hotplug needs is an enumeration lock, not more rings. The other half of the
+problem, demuxing the event ring so a bound device's interrupt completion is
+not mistaken for the enumerating device's, is already done: both waits match
+the slot id and hand everything else to `dispatch_event`.
 
 This was masked until f76ea04: a machine with no USB HID panicked the boot, so
 "no keyboard, plug one in" could not happen. Now it survives, and plugging a

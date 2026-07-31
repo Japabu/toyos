@@ -159,8 +159,11 @@ const DEV_STRIDE: usize   = 2 * PAGE;
 /// Device blocks to size the pool for before the controller's slot count is
 /// consulted. Only a controller with a scratchpad demand that lands just under
 /// a 2 MiB boundary can leave fewer than this in the page it forced us to
-/// allocate anyway; without the floor such a controller would get a working
-/// pool with room for one device.
+/// allocate anyway — and for four of the 1024 possible demands (503, 504, 1014,
+/// 1015) it leaves *nothing*: at 504, `dev_base` is exactly 2097152, so without
+/// the floor `dev_blocks` is 0, MaxSlotsEn is written as zero and the
+/// controller enumerates nothing at all. This is not defensive padding; it is
+/// what keeps the pool from having no room for devices.
 const MIN_DEVICE_BLOCKS: usize = 8;
 
 /// Cap the driver at one device block, so a test can drive the path where the

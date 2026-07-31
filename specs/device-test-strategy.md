@@ -45,8 +45,10 @@ four-USB-devices, no-NVMe, hotplug-after-boot, remove-under-load — cost roughl
 bug that has produced every metal-track blocker so far.
 
 The crowded-USB config is built: `Profile::MetalUsb` is metal-sim with six
-devices on the xHCI, two of them keyboards, and it cost two boots and no new
-instrument. It also fixed the shape of the assertion — the driver logs the DMA
+devices on the xHCI, two of them keyboards, and it cost two boots, one extra
+kernel build and no new instrument. The extra build is the shortage config's:
+a distinct `kernel_features` set is a distinct cargo fingerprint, so budget one
+rebuild per feature-carrying config, not one boot. It also fixed the shape of the assertion — the driver logs the DMA
 offset of each device's interrupt ring, so "these two devices are independent"
 is a text assertion rather than a hope. One caveat it recorded: a *shortage*
 scenario is not always host-stageable. QEMU's `nec-usb-xhci,slots=N` does not

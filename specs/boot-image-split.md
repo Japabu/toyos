@@ -223,14 +223,14 @@ event ring and `advance_event_ring`, the `Configure Endpoint` command,
 
 ### 3.2 What is missing, specifically
 
-1. **Bulk endpoints.** Transfer rings come from a fixed DMA layout —
-   `OFF_KB_INT_RING` and `OFF_MOUSE_INT_RING`, two of them, at hardcoded offsets
-   in a 0xD000-byte pool (`mod.rs:151-164`). There is no per-endpoint ring
-   allocator. Mass storage needs two more rings per device (bulk IN + bulk OUT).
-2. **Slots.** `device.rs:87-94` `output_ctx_offset` **panics past three devices**
-   — three fixed output-context offsets. Today's dev loop has exactly three USB
-   devices (stick, keyboard, tablet). Adding a real storage device to that budget
-   means replacing the fixed mapping with a proper DCBAA.
+1. **Bulk endpoints.** Since 5bb673c the pool is derived and every device gets
+   its own 8 KiB block, so there *is* a per-device allocation — but it holds one
+   interrupt ring, and nothing allocates per *endpoint*. Mass storage needs two
+   more rings per device (bulk IN + bulk OUT).
+2. **Slots.** Closed by 5bb673c. `output_ctx_offset` and its three literal
+   offsets are gone; `Layout::device` maps any slot id the pool has room for,
+   which is 252 on a controller with no scratchpad demand, and a slot id past
+   that costs one device a log line instead of panicking the boot.
 3. **Data buffers.** `OFF_DATA_BUF` is a single shared 4 KiB page and transfers
    name fixed physical offsets into it. Bulk reads must land in caller-supplied
    buffers, with TRB chaining across 64 KiB boundaries.
@@ -391,8 +391,9 @@ E2 is safe and independently worth doing regardless of its timing result:
   it.
 - Nothing in the tree depends on the stick being on the xHCI bus. `grep` across
   `tests/` finds USB only in the two QEMU command lines.
-- It **frees an xHCI slot**. §3.2 item 2: `output_ctx_offset` panics past three
-  devices, and the stick is currently one of exactly three.
+- It **frees an xHCI slot**. Worth little now that §3.2 item 2 is closed and the
+  pool holds 252 blocks, but the driver still never issues Disable Slot, so the
+  stick's slot is held for the life of the boot.
 - It removes a device the ToyOS xHCI driver enumerates, addresses, and then
   throws away on every boot.
 
@@ -676,10 +677,10 @@ argument — 31% of guest RAM, permanently held, 83% of it unused — and that
 argument should then be weighed against §3.4's kernel-growth question on its own
 terms, not smuggled in behind a boot-time number that no longer holds.
 
-One thing to do regardless of any of this: **R2's slot argument** (§4.4). The
-xHCI driver panics at four USB devices and the dev loop runs three, one of which
-is a stick the driver enumerates and discards. That is a live constraint on
-plugging in any additional USB device, and it costs four lines to remove.
+R2's slot argument (§4.4) used to be listed here as the one thing to do
+regardless. It is done: 5bb673c derives the pool from HCSPARAMS and the driver
+no longer panics at the fourth USB device, so plugging one in is no longer a
+constraint on anything.
 
 ## 8. What could not be verified
 
