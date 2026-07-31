@@ -2,7 +2,7 @@
 
 ## 1. Goals
 
-- Server-pull architecture: a DLL-synchronized timer drives all scheduling, not raw hardware interrupts
+- Server-pull architecture: soundd waits on the DMA completion interrupt with a DLL-synchronized prediction as the timeout (§5.1), so neither jitter nor a lost completion sets the pace alone
 - Multiple simultaneous audio clients with real-time additive mixing
 - Per-client sample rate, channel count, and format — soundd resamples and converts during mixing
 - End-to-end latency under 5ms (target: 2.67ms at 128 frames / 48 kHz)
@@ -88,23 +88,29 @@ Each connected client gets a shared memory region mapped into both the client's 
 
 ### 4.1 Layout
 
+`AudioSlotHeader` is `#[repr(C, align(64))]` in `toyos-abi/src/audio.rs`:
+
 ```
 Offset      Size                        Field
 ──────      ──────────────────────────  ─────────────────────────────────
 0x00        4                           write_idx (AtomicU32): next slot client will fill
-0x04        4                           read_idx  (AtomicU32): next slot soundd will read
-0x08        4                           slot_count (u32): N (number of slots)
-0x0C        4                           reserved (alignment)
-0x10        N × client_period_bytes     slot[0..N]: PCM audio data
+0x04        60                          _pad0
+0x40        4                           read_idx  (AtomicU32): next slot soundd will read
+0x44        60                          _pad1
+0x80        N × client_period_bytes     slot[0..N]: PCM audio data
 ```
+
+The header is **128 bytes**, and the padding is the point: the two indices are written by different processes at audio-period rate, so they sit on separate 64-byte cache lines. Do not pack them.
+
+**There is no `slot_count` field in the header.** It is not shared state — it is negotiated once and delivered in `MSG_STREAM_OPENED` (`StreamOpenResponse.slot_count: u16`). A client that reads a slot count out of the mapping is reading padding.
 
 Slot size is per-client: `client_period_bytes = client_period_frames × client_frame_size`. This depends on the client's negotiated sample rate, channel count, and format. soundd computes the slot size and total shared memory allocation at stream open time.
 
 Available for soundd to read: `write_idx - read_idx`. Available for client to fill: `slot_count - (write_idx - read_idx)`.
 
-Default slot count is 4 (configurable per-client by soundd at stream open). This provides 3 periods of lookahead — enough to absorb typical scheduling jitter and interrupt coalescing where 2-3 DMA completions arrive in a single wake cycle.
+Slot count is the device's DMA buffer count — `TX_INFLIGHT_MAX = 8` (`kernel/src/drivers/virtio_sound.rs:175`), passed through as `num_buffers`. The client ring is therefore exactly as deep as the DMA pipeline, which is what §5.10 relies on: a client that kept up costs no silence at all during a drain. One slot is always the one soundd is reading, so a client can fill **7 ahead**.
 
-Total per client: 16 + N × client_period_bytes. At the reference configuration with 4 slots of 512 bytes, this is 2064 bytes — fits in a single 4 KB page.
+Total per client: `128 + N × client_period_bytes`. Allocation is `SharedMemory::allocate`, which goes through `alloc_shared` to the kernel's page allocator — and ToyOS maps 2 MiB pages only, so **every client costs one 2 MiB page** regardless of how little of it the ring uses. That is the unit to reason about for per-client cost, not the ring's nominal size.
 
 ### 4.2 Slot Ownership
 
@@ -139,7 +145,9 @@ soundd is a privileged userspace daemon. It is the sole owner of the audio hardw
 
 ### 5.1 DLL Timer Scheduling
 
-soundd does not wake directly on DMA completion interrupts. Instead, it maintains a delay-locked loop (DLL) that predicts when each DMA period will complete and sets a timer to fire at the optimal moment.
+soundd wakes on **both** the DMA completion interrupt and a DLL-predicted timeout, and the interrupt is the primary edge. Every cycle it arms an io_uring poll on the audio device (`poller.poll_add(&audio_dev, IORING_POLL_IN, TOKEN_AUDIO)`, `userland/soundd/src/main.rs:710`) and then waits with the DLL's prediction as the *timeout*. The delay-locked loop predicts when each DMA period will complete; that prediction is the backstop for a completion that does not arrive, not the thing that normally wakes the process.
+
+> This paragraph used to say soundd "does not wake directly on DMA completion interrupts". That was true of an earlier design and is backwards for the shipped one. It stopped being true at `aeeaa01`: `tests/audio-baseline.toml` records the reason — a timer racing completions it received no CQE for produced an unexplained second timing mode (three runs at 22-33ms), and waking on the IRQ removed the mechanism.
 
 The DLL works as follows:
 
@@ -148,11 +156,11 @@ The DLL works as follows:
 3. **DLL update:** the DLL compares predicted vs. actual completion times and adjusts the timer frequency. A second-order IIR filter smooths the adjustment to avoid oscillation.
 4. **Timer reset:** soundd arms the timer for the next predicted completion.
 
-This decouples soundd from interrupt delivery jitter. Even if the kernel batches 2-3 interrupts or delivers them late, the DLL's timer fires at the right moment. The DMA pipeline depth absorbs the timing difference.
+This bounds soundd's exposure to interrupt delivery jitter without making it blind to the interrupt. If completions are batched or late, the DLL's timeout still fires at the right moment and the DMA pipeline depth absorbs the difference; if a completion arrives early, the poll wakes soundd immediately rather than leaving it parked until the prediction expires.
 
 The DLL bandwidth (how aggressively it tracks hardware drift) is configurable. A lower bandwidth produces smoother timing at the cost of slower convergence. Default: 0.03 (convergence within ~30 periods).
 
-**Kernel requirement:** the completion notification path must provide a monotonic timestamp for each completed buffer (e.g., the `nanos_since_boot` at interrupt time). Without timestamps, the DLL cannot function and soundd falls back to direct interrupt-driven scheduling.
+**Kernel requirement:** the completion notification path must provide a monotonic timestamp for each completed buffer (`AudioCompletionRecord.timestamp_nanos`, `nanos_since_boot` captured in the interrupt handler). Without timestamps the DLL cannot function, and soundd is left with the interrupt alone — which it already waits on, so it degrades to interrupt-driven scheduling rather than stopping.
 
 ### 5.2 Startup
 
@@ -273,7 +281,7 @@ While SUSPENDED, soundd holds zero timers and takes zero wakes; its CPU cost is 
 
 If all DMA buffers drain due to a catastrophic scheduling stall, soundd detects a full free list and resets the DLL: the device restarts its period grid from whatever is submitted next, so the old estimate is not clock drift to be tracked but a dead reference to be discarded. The DLL re-initializes from the first new completion timestamp.
 
-Recovery must be **proportional to the shortfall**. The drained buffers are refilled by the ordinary mix path, exactly like any other free buffer: client audio already sitting in the slot rings goes out immediately, and silence is submitted only for those periods no client can cover. Re-priming the whole pipeline with silence is not acceptable — it makes the cost of *any* stall, however brief, a full pipeline depth of audible dropout, and delays the client audio queued behind it by the same amount. Since the client rings are as deep as the DMA pipeline (§5.10 fallback), a stall that the clients kept up with costs no silence at all.
+Recovery must be **proportional to the shortfall**. The drained buffers are refilled by the ordinary mix path, exactly like any other free buffer: client audio already sitting in the slot rings goes out immediately, and silence is submitted only for those periods no client can cover. Re-priming the whole pipeline with silence is not acceptable — it makes the cost of *any* stall, however brief, a full pipeline depth of audible dropout, and delays the client audio queued behind it by the same amount. Since the client rings are as deep as the DMA pipeline (§4.1), a stall that the clients kept up with costs no silence at all.
 
 No path submits silence unconditionally: even the §5.8 resume prime runs the ordinary mix path, so client audio already sitting in the slot rings enters the very first buffers of the refill.
 
@@ -303,7 +311,15 @@ The audio subsystem must produce glitch-free audio on a single-CPU system runnin
 
 On a single CPU, steps 6-7 happen sequentially — each client fills its slots and blocks, yielding the CPU to the next boosted client or back to soundd. The total client fill time is bounded: N clients × callback_time. As long as this fits within one period, no underruns occur.
 
-**Fallback without priority inheritance:** if the kernel does not yet support priority inheritance on pipes, soundd falls back to a larger slot count (8 slots) to absorb scheduling jitter. This is a degraded mode, not the target design. The spec assumes priority inheritance is implemented.
+**Priority inheritance is implemented.** `Pipe::rt_boost_pending` (`kernel/src/pipe.rs:105-109`) records that an RT thread wrote to a pipe; the next thread to consume data claims the boost (`:192-193`), which covers the case the wake-time boost in `wake_pipe_readers` misses. `set_rt_boost_pending` is at `:246`.
+
+> This paragraph used to describe a "fallback without priority inheritance" in which soundd ran "a larger slot count (8 slots)" as a "degraded mode". No such mode ever existed. The ring *is* 8 slots, but because that is the device's DMA pipeline depth (§4.1), not because anything is degraded — a reader comparing the two would conclude the shipped system is in the fallback, which it is not.
+
+**Deferral: what soundd does when a client is mid-refill.** The mix loop may hold a free buffer back for a client that has not finished filling, rather than mixing without it — this is what keeps a slow client from becoming a hole in the output, and it is the fix for the ring-depth dropout class.
+
+It is bounded, and the bound is policy rather than physics — the same standing as the kernel's `MAX_USER_STR`. soundd defers only while at least `refill_floor_nanos = 5 × period_nanos` of unplayed audio is still on the wire: of the pipeline's 8 periods it will spend at most 3 waiting for a client and always keeps 5 in reserve. `assert!(num_buffers > 5, "soundd: pipeline too shallow to defer safely")` (`userland/soundd/src/main.rs:581`) refuses to run the policy on a pipeline that cannot afford it.
+
+The floor cannot be derived from worst-case wake lateness: the recorded worst exceeds two whole pipeline depths (`tests/audio-baseline.toml`), so no floor *inside* the pipeline covers it. Move the number only with a full re-baseline.
 
 **Kernel requirements:**
 
@@ -340,7 +356,7 @@ loop:
 
 The user callback receives a mutable slice pointing directly into the shared memory slot, sized to `client_period_frames`. The callback writes PCM samples at the client's own sample rate and format — zero intermediate copies between the application and the shared buffer. soundd handles any rate or format conversion.
 
-The client fills as many slots as available on each wake. With the default 4-slot ring, the client can fill up to 3 slots ahead (one is always being read by soundd). This provides buffering headroom for cycles where soundd consumes multiple slots due to batched DMA completions.
+The client fills as many slots as available on each wake. With the 8-slot ring, the client can fill up to 7 slots ahead (one is always being read by soundd). This provides buffering headroom for cycles where soundd consumes multiple slots due to batched DMA completions.
 
 When priority inheritance is active (§5.10), the client thread runs at real-time priority from the moment it wakes on the signal pipe until it blocks on the next pipe read. This window is just long enough to invoke the callback and fill slots — typically under 1ms. The client thread does not hold RT priority while idle.
 
