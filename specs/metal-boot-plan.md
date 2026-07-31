@@ -117,7 +117,9 @@ bar; QEMU cannot.
   decode garbage. `-machine q35,i8042=off` **does** clear the FADT
   `IAPC_BOOT_ARCH` 8042 bit, so the gate fires and the ports are never
   touched. IRQ 1 and IRQ 12 are uncovered by q35's override table, so they
-  stay identity/edge/high. And the aux port's presence probe, device reset and
+  stay identity/edge/high — but that is q35's answer to a per-machine
+  question, not a settled fact, and it is the one this list is most likely to
+  be wrong about on metal. And the aux port's presence probe, device reset and
   rate/resolution programming all work as specified.
 
   What QEMU still cannot decide is **R1**: whether the T14's eSPI EC lands in
@@ -126,8 +128,15 @@ bar; QEMU cannot.
   for, so the first metal boot answers it in one short line on the laptop's
   own screen. Contingency is one commit (set-2 tables, clear bit 6).
 
-  Also untested outside QEMU, in rough order of risk: SMM trapping port 0x60;
-  real EC timing against the 500 ms/750 ms/600 ms/1.5 s budgets; the aux-absent
+  Also untested outside QEMU, in rough order of risk: the interrupt topology
+  (design §12.5, R3) — QEMU has one textbook I/O APIC at 0xFEC00000 with
+  identity GSIs and a five-line override table, while the T14 has
+  firmware-programmed RTEs, possibly more than one unit, and a real ISO table,
+  so the version-register plausibility gate and `route`'s read-back are what
+  make a wrong topology one log line instead of a silently dead keyboard;
+  SMM trapping port 0x60;
+  real EC timing against the 500 ms/750 ms/600 ms stage budgets, each clamped
+  to the 1.5 s total; the aux-absent
   path (QEMU always provides one); a keyboard resetting behind our back, which
   is undetectable on this wire because `0xAA` is left Shift's break code under
   translation (filed); and coexistence of a USB and a PS/2 keyboard, which QEMU

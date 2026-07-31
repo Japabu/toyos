@@ -367,6 +367,14 @@ fn deadline(millis: u64) -> u64 {
     crate::clock::nanos_since_boot() + millis * 1_000_000
 }
 
+/// A stage's own deadline, never past the whole probe's. Each stage's number is
+/// what that step is worth waiting *from here*; the budget is what the boot is
+/// worth spending in total, and without the clamp the stages add up instead of
+/// fitting inside it.
+fn stage(millis: u64, budget: u64) -> u64 {
+    deadline(millis).min(budget)
+}
+
 fn wait_writable(deadline: u64) -> bool {
     while inb(STATUS) & IBF != 0 {
         if crate::clock::nanos_since_boot() >= deadline {
@@ -407,14 +415,17 @@ fn write_config(value: u8, deadline: u64) -> bool {
     command(CMD_WRITE_CONFIG, deadline) && write_data(value, deadline)
 }
 
-fn flush(deadline: u64) -> bool {
+/// Iteration-bounded rather than clock-bounded, and takes no deadline for that
+/// reason: draining a one-byte buffer 32 times is already past every legitimate
+/// backlog, and a controller still asserting OBF after that is not going to
+/// stop.
+fn flush() -> bool {
     for _ in 0..32 {
         if inb(STATUS) & OBF == 0 {
             return true;
         }
         inb(DATA);
     }
-    let _ = deadline;
     inb(STATUS) & OBF == 0
 }
 
@@ -503,6 +514,9 @@ pub fn init(rsdp_addr: u64) {
         None => log!("i8042: no FADT, probing"),
     }
 
+    // The whole probe, from the first port touch to the last. Every stage
+    // clamps to it, so a machine whose EC answers everything slowly costs the
+    // boot this and not the sum of the stages.
     let budget = deadline(1500);
 
     // Firmware may leave scanning on. A keystroke arriving mid-handshake
@@ -510,7 +524,7 @@ pub fn init(rsdp_addr: u64) {
     command(CMD_DISABLE_PORT1, budget);
     command(CMD_DISABLE_AUX, budget);
 
-    if !flush(budget) {
+    if !flush() {
         log!("i8042: absent (output buffer never drains)");
         return;
     }
@@ -538,7 +552,7 @@ pub fn init(rsdp_addr: u64) {
     // On a machine with no controller `inb(0x64)` returns 0xFF from a
     // floating bus and every status bit reads set. The self-test is what
     // separates "controller" from "nothing".
-    let selftest_deadline = deadline(500);
+    let selftest_deadline = stage(500, budget);
     command(CMD_SELF_TEST, selftest_deadline);
     match read_data(selftest_deadline) {
         Some(0x55) => {}
@@ -576,7 +590,7 @@ pub fn init(rsdp_addr: u64) {
     );
 
     // The slowest step on a real EC, hence its own budget.
-    let kbd = deadline(750);
+    let kbd = stage(750, budget);
     if !device_command(&[0xF5], kbd) {
         log!("i8042: kbd would not stop scanning — disabled");
         return;
@@ -622,7 +636,7 @@ pub fn init(rsdp_addr: u64) {
     // every step logs and falls through rather than returning.
     let aux = port2 && {
         command(CMD_ENABLE_AUX, budget);
-        let reset = deadline(600);
+        let reset = stage(600, budget);
         // 0xFF answers 0xFA, then 0xAA (BAT ok), then the device id.
         aux_command(&[0xFF], reset)
             && read_data(reset) == Some(0xAA)
@@ -648,7 +662,7 @@ pub fn init(rsdp_addr: u64) {
     }
 
     // Steps above leave residue in the output buffer.
-    flush(budget);
+    flush();
 
     let apic_id = crate::arch::apic::id();
     let Some(kbd_line) = ioapic::gsi_for_isa_irq(ISA_IRQ_KEYBOARD) else {
@@ -691,7 +705,27 @@ pub fn init(rsdp_addr: u64) {
         // port 2 disabled, and writing it back would undo the 0xA8 above.
         config = (config | CFG_PORT2_IRQ) & !CFG_PORT2_CLOCK_OFF;
     }
-    write_config(config, budget);
+    // The one write that arms the pin, and the only one here that had no
+    // read-back. A controller that drops it still fills the output buffer and
+    // still never asserts, so nothing downstream can tell: no byte reaches the
+    // ring, no edge is recorded as lost, and every line below prints green.
+    let wrote = write_config(config, budget);
+    let readback = read_config(budget);
+    if !wrote || readback != Some(config) {
+        crate::arch::cpu::enable_interrupts();
+        match readback {
+            Some(v) => log!(
+                "i8042: DISABLED — cfg {:#04x} did not take (read back {:#04x}); the pin would never assert",
+                config,
+                v
+            ),
+            None => log!(
+                "i8042: DISABLED — cfg {:#04x} did not take (no config byte came back); the pin would never assert",
+                config
+            ),
+        }
+        return;
+    }
     let unmasked = ioapic::set_masked(kbd_line.gsi, false).is_ok();
     if let Some(l) = aux_line {
         let _ = ioapic::set_masked(l.gsi, false);
