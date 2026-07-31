@@ -65,33 +65,86 @@ a capability, or `#[cfg(debug_assertions)]`, or deletion.
 
 ### Untrusted-input panics that remain
 
-A crafted ELF still panics the kernel outright:
-`vaddr_to_file_offset` (`kernel/src/loader.rs:265`) has no failure path for a
-vaddr that is in or near no `PT_LOAD` segment.
-
-`SYS_DLOPEN` never dedups and `SYS_DLCLOSE` is a no-op (`syscall.rs:298`), so a
-process can exhaust its virtual address space by repeated loads and reach
-`.expect("dlopen: out of virtual address space")` at `syscall.rs:1435` and
-`:1446`.
-
 `SYS_SYSINFO` collects one 24-byte entry per live thread into a `Vec`
 (`syscall.rs:1273`) and thread count is uncapped, so ~87,000 threads makes it a
 single >2 MiB allocation and the `mm/alloc.rs:12` assert fires. Any process may
 call it.
 
-Two unchecked adds feed `align_2m`, which wraps: `elf.rs:994`
-(`vaddr_max - vaddr_min` over `PT_LOAD`, where `vaddr_max` is
-`p_vaddr + p_memsz`) and `loader.rs:63-65` (`total_memsz + TCB_SIZE + tls_align`
-from `PT_TLS`). `sys_mmap` and `shared_memory::alloc` both `checked_add` before
-the same call; these two do not, and on a wrap `loader.rs:71`'s
-`alloc_size - block_size` underflows on top.
-
-The rest of the 2026-07-28 audit is fixed: `sys_mmap(0)`/`sys_alloc_shared(0)`,
+The crafted-ELF panics are closed (`679086d`, `ad38148`, `fa1e9d4`, `b362082`):
+`vaddr_to_file_offset` returns `Option` and `checked_add`s, both `align_2m`
+wraps, the `syscall.rs:1435`/`:1446` `.expect`s, the bootloader's ESP-sized
+allocations and its `filesz <= memsz` check, and the NVMe shift/divide. The
+2026-07-28 audit before them closed `sys_mmap(0)`/`sys_alloc_shared(0)`,
 `SYS_NIC_RX_DONE`, `SYS_TLS_ALLOC_BLOCK`, io_uring's CQ-overflow assert,
 `shared_memory`'s three infallible failure modes and `SYS_THREAD_SPAWN`'s stack
-underflow at `a88e4ee`; the ELF `Vec::with_capacity`/`HashMap::with_capacity`
-sizing, `load_shared_lib`'s unchecked `KernelSlice` offsets and the `PT_TLS`
-`filesz > memsz` heap overflow at `f49c6b3`.
+underflow at `a88e4ee`; the ELF `with_capacity` sizing, `load_shared_lib`'s
+unchecked `KernelSlice` offsets and the `PT_TLS` heap overflow at `f49c6b3`.
+
+### `SYS_DLOPEN` never dedups and `SYS_DLCLOSE` is a no-op
+
+A process can exhaust its virtual address space by repeated loads of the same
+library. The *panic* is closed — `syscall.rs:1435`/`:1446` no longer `.expect` —
+but the unbounded VA growth is not, and `SYS_DLCLOSE` (`syscall.rs:298`) still
+frees nothing.
+
+Deliberately left by the ELF-hardening pass rather than missed. Dedup is a
+semantic change, not a bounds check: a second `dlopen` of a loaded library would
+return a handle sharing the first module's id and TLS block, and
+`std_tls_dlopen`'s test 10 exercises exactly that case. It needs its own change
+with its own test, not a hardening drive-by.
+
+### A 3 MiB `fs::write` to `/home` panics the kernel
+
+`bcachefs/src/btree.rs:184` — `MAX_PAYLOAD - used` underflows, reached via
+`split_node` ← `sys_close` ← `flush_file`. No crafting: an ordinary userland
+write of a few megabytes. This is a "the kernel must never crash from userland"
+violation of the plainest kind. Assigned to the bcachefs owner.
+
+### `ftruncate` to a larger size does not persist on `/home`
+
+`set_len(3 MiB)` followed by `metadata().len()` returns the old length. The same
+sequence works on `/tmp`, so this is bcachefs-specific.
+
+### tmpfs has no `open_backing`, so nothing under `/tmp` is loadable
+
+`vfs.rs:62` returns `None`. Combined with the `/home` write panic above,
+**userland currently cannot create a loadable file larger than about 2 MiB
+anywhere** — which is why the two ELF allocation-ceiling tests assert on the
+declared length in the header rather than by reaching the heap assert. Those
+tests are honest about what they cover, but the ceiling itself is unexercised
+end to end.
+
+### Two allocation guards that do not cover what they claim
+
+`OwnedAlloc::new`'s `size >= PAGE_2M` guard (`process.rs:54`) is short by
+dlmalloc's bookkeeping overhead, so a request just under 2 MiB still trips the
+`mm/alloc.rs:12` assert. Being fixed.
+
+`mm::align_2m` has no checked form, and four callers take their size from a
+device or from userland: `gop.rs`, `xhci/mod.rs`, `shared_memory.rs`,
+`arch/syscall.rs`. Audit in progress.
+
+### VA exhaustion is untestable, and the NVMe sector-size case has no test
+
+The VA arena is ~1015 GB and every mapping costs physical memory at worst 2:1,
+so the PMM refuses long before the address space runs out. Testing it needs a
+test-only actuator on `vma::ALLOC_FLOOR`/`ALLOC_CEILING`.
+
+The NVMe sector-size guard (`fa1e9d4`) reproduces with two QEMU flags but has no
+in-suite test; staging it needs an `nvme_lba_size` field on `Shape`. Being built.
+
+### CLOSED, kept for the lesson: a crafted `p_vaddr` could map into the kernel half
+
+An exe image was rebased with a wrapping add, so a crafted `p_vaddr` could place
+a demand-paged VMA in the kernel half of the address space — where the first user
+touch ORs `PAGE_USER` onto the *shared kernel page tables*. That is exactly the
+mapping `sys_mmap` refuses for a FIXED request; the loader reached the same
+machinery with no such check. Closed by a `check_user_range` call.
+
+The lesson generalises and the class will recur: **a policy enforced at one entry
+point was simply absent at another that reaches the same machinery.** When a
+check is added to a syscall, the question to ask is which *other* paths reach
+what it protects — not whether that syscall is now safe.
 
 ### The bootloader sizes every allocation from a file the ESP handed it
 
