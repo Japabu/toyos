@@ -1,23 +1,19 @@
 use std::fs;
 use std::path::Path;
 
-/// Pre-rasterize a TTF font into a flat bitmap format.
-///
-/// Binary format:
-///   [2] width: u16 LE
-///   [2] height: u16 LE
-///   [4] glyph_count: u32 LE
-///   [glyph_count * 4] codepoints: [u32 LE]
-///   [glyph_count * width * height] alpha bitmaps
-fn rasterize_font(ttf_bytes: &[u8], cell_width: usize, cell_height: usize) -> Vec<u8> {
+/// Rasterize `codepoints` into `cell_width * cell_height` 8-bit alpha cells,
+/// laid out one cell after another. The pixel size is the largest at which
+/// every printable ASCII glyph fits its cell, so a fixed grid can be blitted
+/// without per-glyph metrics.
+fn rasterize_cells(
+    ttf_bytes: &[u8],
+    codepoints: &[u32],
+    cell_width: usize,
+    cell_height: usize,
+) -> Vec<u8> {
     let font = fontdue::Font::from_bytes(ttf_bytes, fontdue::FontSettings::default())
         .expect("failed to parse TTF");
 
-    let mut codepoints: Vec<u32> = (0u32..=255).collect();
-    codepoints.extend(0x2500u32..=0x257F); // Box Drawing
-    codepoints.extend(0x2580u32..=0x259F); // Block Elements
-
-    // Find the largest pixel size that fits all printable ASCII glyphs
     let mut px_size = cell_height as f32;
     loop {
         let lm = font.horizontal_line_metrics(px_size).unwrap();
@@ -37,8 +33,7 @@ fn rasterize_font(ttf_bytes: &[u8], cell_width: usize, cell_height: usize) -> Ve
     }
 
     let ascent = font.horizontal_line_metrics(px_size).unwrap().ascent.ceil() as i32;
-    let glyph_count = codepoints.len();
-    let mut data = vec![0u8; glyph_count * cell_width * cell_height];
+    let mut data = vec![0u8; codepoints.len() * cell_width * cell_height];
 
     for (idx, &cp) in codepoints.iter().enumerate() {
         let Some(c) = char::from_u32(cp) else { continue };
@@ -68,6 +63,25 @@ fn rasterize_font(ttf_bytes: &[u8], cell_width: usize, cell_height: usize) -> Ve
         }
     }
 
+    data
+}
+
+/// Pre-rasterize a TTF font into a flat bitmap format.
+///
+/// Binary format:
+///   [2] width: u16 LE
+///   [2] height: u16 LE
+///   [4] glyph_count: u32 LE
+///   [glyph_count * 4] codepoints: [u32 LE]
+///   [glyph_count * width * height] alpha bitmaps
+fn rasterize_font(ttf_bytes: &[u8], cell_width: usize, cell_height: usize) -> Vec<u8> {
+    let mut codepoints: Vec<u32> = (0u32..=255).collect();
+    codepoints.extend(0x2500u32..=0x257F); // Box Drawing
+    codepoints.extend(0x2580u32..=0x259F); // Block Elements
+
+    let data = rasterize_cells(ttf_bytes, &codepoints, cell_width, cell_height);
+    let glyph_count = codepoints.len();
+
     // Serialize to binary format
     let mut out = Vec::new();
     out.extend((cell_width as u16).to_le_bytes());
@@ -78,6 +92,58 @@ fn rasterize_font(ttf_bytes: &[u8], cell_width: usize, cell_height: usize) -> Ve
     }
     out.extend(data);
     out
+}
+
+/// Where the kernel's panic-console font lives, relative to the repo root.
+pub const PANIC_FONT_PATH: &str = "kernel/src/drivers/panic_console/font8x16.bin";
+
+/// First codepoint of the panic-console font; the file holds
+/// `PANIC_FONT_GLYPHS` consecutive glyphs starting here.
+pub const PANIC_FONT_FIRST: u8 = 0x20;
+pub const PANIC_FONT_GLYPHS: usize = 0x7F - 0x20;
+pub const PANIC_FONT_BYTES: usize = PANIC_FONT_GLYPHS * 16;
+
+/// Alpha at or above which a rasterized pixel becomes a set bit. Chosen by
+/// rendering the whole range at 8x16 and reading the decoded screendump: at
+/// 96 every glyph in `0x20..=0x7E` is distinct and stems survive; higher
+/// thresholds start eating the thin diagonals of `x` and `y`.
+const PANIC_FONT_THRESHOLD: u8 = 96;
+
+/// Regenerate `kernel/src/drivers/panic_console/font8x16.bin`.
+///
+/// Provenance: `assets/JetBrainsMono-Regular.ttf`, rasterized by fontdue at
+/// the largest pixel size whose printable-ASCII glyphs all fit an 8x16 cell,
+/// then thresholded to 1 bit at alpha >= 96. Layout is 95 glyphs of 16 bytes,
+/// codepoint `0x20 + index`, one byte per row, bit 7 leftmost.
+///
+/// The artifact is checked in so the kernel can `include_bytes!` it with no
+/// build-script coupling, and so the test harness's screendump decoder reads
+/// the exact table the renderer blits. Two consumers, one file: the decoder
+/// cannot drift from the renderer.
+pub fn regen_panic_font(root: &Path) {
+    let ttf = fs::read(root.join("assets/JetBrainsMono-Regular.ttf"))
+        .expect("regen-font: JetBrainsMono-Regular.ttf not found");
+    let codepoints: Vec<u32> =
+        (PANIC_FONT_FIRST as u32..PANIC_FONT_FIRST as u32 + PANIC_FONT_GLYPHS as u32).collect();
+    let alpha = rasterize_cells(&ttf, &codepoints, 8, 16);
+
+    let mut out = vec![0u8; PANIC_FONT_BYTES];
+    for glyph in 0..PANIC_FONT_GLYPHS {
+        for row in 0..16 {
+            let mut bits = 0u8;
+            for col in 0..8 {
+                if alpha[glyph * 128 + row * 8 + col] >= PANIC_FONT_THRESHOLD {
+                    bits |= 0x80 >> col;
+                }
+            }
+            out[glyph * 16 + row] = bits;
+        }
+    }
+
+    let path = root.join(PANIC_FONT_PATH);
+    fs::create_dir_all(path.parent().unwrap()).expect("regen-font: create dir");
+    fs::write(&path, &out).expect("regen-font: write");
+    println!("wrote {} ({} bytes)", path.display(), out.len());
 }
 
 pub fn collect(dirs: &[String]) -> Vec<(String, Vec<u8>)> {

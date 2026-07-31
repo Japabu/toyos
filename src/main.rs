@@ -58,6 +58,11 @@ fn main() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     env::set_current_dir(&root).expect("Failed to cd to project root");
 
+    if args.iter().any(|a| a == "--regen-font") {
+        toyos_build::assets::regen_panic_font(&root);
+        return;
+    }
+
     toyos_build::ensure_submodules(&root);
 
     // Ensure toolchain is up to date
