@@ -88,7 +88,14 @@ fn panic_depth_slot() -> &'static core::sync::atomic::AtomicU32 {
 
 /// Fixed-string output for the reentry path: direct UART port I/O — no
 /// locks, no log ring, no percpu, nothing that can fault or recurse.
+///
+/// Gated on the probe like every other UART access: on a machine with no
+/// 16550 the LSR reads 0xFF, so the wait falls through immediately and each
+/// byte is written to a port nothing answers.
 fn panic_raw_uart(msg: &[u8]) {
+    if !drivers::serial::uart_present() {
+        return;
+    }
     for &b in msg {
         // Bounded LSR wait so a wedged UART cannot hang the halt path.
         for _ in 0..100_000 {
@@ -106,11 +113,16 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     if !log::PERCPU_READY.load(core::sync::atomic::Ordering::Relaxed) {
         log!("!!! EARLY PANIC !!!: {}", info);
         // This branch halts directly and never reaches halt_all_cpus, so it
-        // owns both halves itself. Paint first: the flush is what empties the
-        // ring the console reads.
+        // owns both halves itself — and inverts halt_all_cpus' order. It runs
+        // before idt::init, the one window with no exception handlers at all,
+        // where a fault inside the renderer's page walk or its full-screen
+        // MMIO blit triple-faults instead of being caught. The flush goes
+        // first so that costs the screen and never the serial report; the
+        // capture above has already copied the ring, so what render() paints
+        // afterwards is byte-identical either way.
         drivers::panic_console::capture();
-        drivers::panic_console::render();
         unsafe { drivers::serial::panic_flush(); }
+        drivers::panic_console::render();
         cpu::halt();
     }
 
@@ -120,6 +132,13 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     let depth = panic_depth_slot();
     if depth.fetch_add(1, core::sync::atomic::Ordering::SeqCst) > 0 {
         panic_raw_uart(b"\n!!! PANIC REENTRY: CPU halted !!!\n");
+        // The one fatal branch that reached no channel at all on a machine
+        // with no UART. render() is safe here by construction: if the reentry
+        // came from a fault inside the renderer, PAINTING is already taken and
+        // this returns without touching a pixel. No capture() — the outer
+        // panic's snapshot is the report worth showing, and re-peeking a ring
+        // panic_flush may already have drained would replace it with nothing.
+        drivers::panic_console::render();
         cpu::halt();
     }
 
@@ -156,6 +175,10 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     // panic on this CPU still reports.
     if percpu::syscall_rip() != 0 && percpu::current_tid().is_some() {
         depth.store(0, core::sync::atomic::Ordering::SeqCst);
+        // The captured report dies with the panic it belongs to. Left set, it
+        // outlives a panic the machine survived, and the next fatal path —
+        // a #GP an hour later — paints that one as the cause of death.
+        drivers::panic_console::discard_capture();
         arch::idt::exceptions::try_recover_from_panic();
     }
 

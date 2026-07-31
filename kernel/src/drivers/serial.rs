@@ -185,6 +185,14 @@ const PANIC_LOCK_SPIN_LIMIT: u64 = 100_000_000;
 /// Panic context only — on the bypass path the ring is read unsynchronized
 /// (see `log_ring::drain_unlocked`).
 pub unsafe fn panic_flush() {
+    // No backend at all means every path below pops the ring into a writer
+    // that discards it — `drain_to_serial` consumes first and finds out
+    // second. The report is then gone from the one place still holding it,
+    // the on-screen console included. This has to be checked before the
+    // locked path, not after: that path is the common one.
+    if !uart_present() && !super::virtio_console::is_ready() {
+        return;
+    }
     for _ in 0..PANIC_LOCK_SPIN_LIMIT {
         if let Some(mut g) = BackendGuard::try_lock() {
             super::log_ring::drain_to_serial(&mut g);
@@ -192,9 +200,7 @@ pub unsafe fn panic_flush() {
         }
         core::hint::spin_loop();
     }
-    // No UART means the bypass has nowhere to write. Draining anyway would
-    // consume the report; leaving the ring intact keeps it available to any
-    // other observer of a halted machine.
+    // The bypass disables virtio-console, so it can only write to the UART.
     if !uart_present() {
         return;
     }

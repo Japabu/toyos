@@ -273,8 +273,11 @@ pub unsafe fn drain_unlocked(out: &mut [u8]) -> usize {
 /// without perturbing the serial report.
 ///
 /// # Safety
-/// Panic context only. Concurrent `append`s may be in flight, so the bytes
-/// near `head` can be a mixture of two lines.
+/// Takes no lock, so concurrent `append`s may be in flight and the bytes near
+/// `head` can be a mixture of two lines. Every index is masked, so the read
+/// stays in bounds whatever the cursors do; the caller must simply tolerate a
+/// torn result. That is why the boot checkpoints call it with interrupts
+/// enabled and IRQ handlers logging: a torn line on screen, nothing more.
 pub unsafe fn peek_tail(out: &mut [u8]) -> usize {
     let ring = unsafe { &*RING.0.get() };
     let len = ring.len.min(RING_SIZE);

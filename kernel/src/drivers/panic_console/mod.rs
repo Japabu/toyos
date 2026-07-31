@@ -23,10 +23,12 @@
 //!     contains no unbounded loop, so a bug here costs the screen and never
 //!     the serial report. It also means a nonce arriving on serial proves the
 //!     paint already finished, which is what lets the tests skip sleeping.
+//!     The early-panic branch is the one exception and inverts it: that
+//!     window has no IDT, so nothing would catch a fault in here.
 //!
-//! A panic that *recovers* therefore captures but never paints: recovery
-//! diverges before `halt_all_cpus`, so "a live desktop is never clobbered by
-//! a survivable fault" falls out of the call sites with no flag to get wrong.
+//! A panic that *recovers* therefore captures but never paints, and
+//! [`discard_capture`] drops what it captured -- otherwise the next fatal
+//! path would paint a crash the machine already survived.
 //!
 //! virtio-gpu is deliberately not supported. Reaching its scanout needs
 //! TRANSFER_TO_HOST_2D and RESOURCE_FLUSH through `submit_and_wait`'s
@@ -107,16 +109,30 @@ unsafe impl Sync for SnapshotCell {}
 static SEQ: AtomicU32 = AtomicU32::new(0);
 static FB: FbCell = FbCell(UnsafeCell::new(Fb::DETACHED));
 
-/// Set once, never cleared. Closes three modes with one instruction: two CPUs
-/// panicking at once (exactly one painter, ever), a fault *inside* the
-/// renderer (#PF -> fatal_exception -> halt_all_cpus -> re-entry -> latch ->
-/// return, so the recursion terminates at depth one), and double-panic
-/// re-entry through `halt_all_cpus`. Never cleared is correct: every caller
-/// ends in `hlt`.
+/// Exactly one painter at a time, taken by every painter without exception.
+/// Closes three modes with one instruction: two CPUs panicking at once, a
+/// fault *inside* the renderer (#PF -> fatal_exception -> halt_all_cpus ->
+/// re-entry -> latch -> return, so the recursion terminates at depth one),
+/// and double-panic re-entry through `halt_all_cpus`.
+///
+/// [`render`] never releases it, which is what stops a later boot checkpoint
+/// from painting over a fatal report; every fatal caller ends in `hlt`.
+/// [`boot_checkpoint`] does release it, because the machine keeps running.
 static PAINTING: AtomicBool = AtomicBool::new(false);
 
 static SNAPSHOT: SnapshotCell = SnapshotCell(UnsafeCell::new([0; SNAPSHOT_CAP]));
+
+/// Non-zero means, and only means, "a panic that has *not* been recovered
+/// captured this report". [`capture`] establishes the first half and
+/// [`discard_capture`] the second: without it a survived panic's report stays
+/// here and a later, unrelated fatal path paints it as the cause of death.
 static SNAPSHOT_LEN: AtomicUsize = AtomicUsize::new(0);
+
+/// Scratch for the readers that peek the *live* ring: a boot checkpoint, and
+/// a fatal path that never ran the panic handler. Separate from `SNAPSHOT`
+/// because a checkpoint sharing it would erase a report another CPU had
+/// already captured and not yet painted.
+static LIVE: SnapshotCell = SnapshotCell(UnsafeCell::new([0; SNAPSHOT_CAP]));
 
 /// Set the first time a process claims `DEVICE_FRAMEBUFFER`. Boot checkpoints
 /// stop repainting once something owns the screen; a *fatal* panic ignores
@@ -135,10 +151,19 @@ static PENDING: FbCell = FbCell(UnsafeCell::new(Fb::DETACHED));
 static RAW_PHYS: AtomicU64 = AtomicU64::new(0);
 static RAW_SIZE: AtomicU64 = AtomicU64::new(0);
 
+/// Boot-time and `set_resolution`-window only, so the load-then-store of `SEQ`
+/// needs no CAS: publishers never race each other, only readers.
 fn publish(fb: Fb) {
-    SEQ.fetch_add(1, Ordering::Release);
+    let seq = SEQ.load(Ordering::Relaxed);
+    SEQ.store(seq.wrapping_add(1), Ordering::Relaxed);
+    // Both fences are the seqlock, and neither is decoration. A release *RMW*
+    // on the odd transition would order what precedes it, not what follows,
+    // leaving the compiler free to hoist the descriptor store above the odd
+    // marker -- at which point a reader that saw an even sequence on both
+    // sides could still have read a half-written descriptor.
+    core::sync::atomic::fence(Ordering::Release);
     unsafe { *FB.0.get() = fb };
-    SEQ.fetch_add(1, Ordering::Release);
+    SEQ.store(seq.wrapping_add(2), Ordering::Release);
 }
 
 /// Stop painting until the next [`rearm`]. For a window in which the
@@ -166,6 +191,13 @@ pub fn disable() {
     detach();
 }
 
+/// Torn means unavailable, never a wild pointer -- and that has to hold on
+/// the ordering, not on the values. Today only two descriptors are ever
+/// published, one `validate`d and one all-zero, so every torn mixture is
+/// caught downstream by the null check below, by `bytes == 0` collapsing
+/// `row_base`/`put_pixel` to no-ops, or by `width == 0` giving `cols == 0`.
+/// The moment a *second valid* descriptor exists -- which `detach`/`rearm`
+/// anticipate -- that argument is gone and only the fences are left.
 fn snapshot() -> Option<Fb> {
     for _ in 0..4 {
         let before = SEQ.load(Ordering::Acquire);
@@ -173,7 +205,8 @@ fn snapshot() -> Option<Fb> {
             continue;
         }
         let fb = unsafe { *FB.0.get() };
-        if SEQ.load(Ordering::Acquire) == before {
+        core::sync::atomic::fence(Ordering::Acquire);
+        if SEQ.load(Ordering::Relaxed) == before {
             return (!fb.ptr.is_null()).then_some(fb);
         }
     }
@@ -295,6 +328,23 @@ pub fn capture() {
     SNAPSHOT_LEN.store(n, Ordering::Relaxed);
 }
 
+/// Drop the captured report: this panic was survived, so it is no longer
+/// anyone's cause of death. Called on the recovery branch, which is the only
+/// exit from the panic handler that does not paint.
+pub fn discard_capture() {
+    SNAPSHOT_LEN.store(0, Ordering::Relaxed);
+}
+
+/// The tail of the live ring, for callers with nothing captured. Mutates
+/// nothing in the ring, so a later `panic_flush` reports byte-identically.
+fn live_tail() -> &'static [u8] {
+    let base = LIVE.0.get().cast::<u8>();
+    let n = unsafe {
+        crate::drivers::log_ring::peek_tail(core::slice::from_raw_parts_mut(base, SNAPSHOT_CAP))
+    };
+    unsafe { core::slice::from_raw_parts(base, n) }
+}
+
 // DESIGN RULE: render and everything it calls acquires NO synchronization
 // primitive -- not `Lock::lock`, not `Lock::try_lock`, not `RingGuard`, not
 // `BackendGuard`. try_lock is banned too: it disables preemption on entry and
@@ -311,7 +361,16 @@ pub fn render() {
     if PAINTING.swap(true, Ordering::SeqCst) {
         return;
     }
-    paint(Fill::Fatal, Source::Captured);
+    let captured = SNAPSHOT_LEN.load(Ordering::Relaxed).min(SNAPSHOT_CAP);
+    if captured > 0 {
+        let base = SNAPSHOT.0.get().cast::<u8>();
+        paint(Fill::Fatal, unsafe { core::slice::from_raw_parts(base, captured) });
+    } else {
+        // Reached `halt_all_cpus` without the panic handler -- a fatal
+        // exception, the scheduler abort -- so nothing captured and the ring
+        // still holds the report `panic_flush` is about to drain.
+        paint(Fill::Fatal, live_tail());
+    }
 }
 
 /// Repaint at a boot phase boundary, so a machine that wedges later still
@@ -319,10 +378,18 @@ pub fn render() {
 /// did not" for free, which is the only coverage there is for a hang that
 /// never panics.
 pub fn boot_checkpoint() {
-    if SCREEN_OWNED_BY_USERLAND.load(Ordering::Relaxed) || PAINTING.load(Ordering::Relaxed) {
+    if SCREEN_OWNED_BY_USERLAND.load(Ordering::Relaxed) {
         return;
     }
-    paint(Fill::Boot, Source::Live);
+    // The same latch, taken the same way: an AP that misses `boot_aps`' 100 ms
+    // deadline can panic while the BSP is inside a checkpoint, and a plain
+    // load here let the checkpoint paint over its report. Losing the race
+    // costs a checkpoint or one fatal repaint; serial reports either way.
+    if PAINTING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    paint(Fill::Boot, live_tail());
+    PAINTING.store(false, Ordering::SeqCst);
 }
 
 /// The fill colour carries "halted" versus "still booting" at zero cost, and
@@ -334,32 +401,12 @@ enum Fill {
     Boot,
 }
 
-/// Which bytes to paint. `SNAPSHOT_LEN != 0` means and only means "the panic
-/// handler captured a report into SNAPSHOT" — a boot checkpoint must never
-/// leave state that a later fatal render mistakes for one, which is exactly
-/// the bug that showed up as a halted machine displaying its own boot log.
-#[derive(Clone, Copy, PartialEq)]
-enum Source {
-    Captured,
-    Live,
-}
-
-fn paint(fill: Fill, source: Source) {
+fn paint(fill: Fill, text: &[u8]) {
     let Some(fb) = snapshot() else { return };
     if !mapped(&fb) {
         return;
     }
-
-    let buf = unsafe { &mut *SNAPSHOT.0.get() };
-    let captured = SNAPSHOT_LEN.load(Ordering::Relaxed).min(SNAPSHOT_CAP);
-    let len = if source == Source::Captured && captured > 0 {
-        captured
-    } else {
-        // Overwrites whatever was captured, so the marker goes first.
-        SNAPSHOT_LEN.store(0, Ordering::Relaxed);
-        unsafe { crate::drivers::log_ring::peek_tail(buf) }
-    };
-    let text = unsafe { &*SNAPSHOT.0.get() };
+    let len = text.len();
 
     fill_screen(
         &fb,
@@ -418,7 +465,9 @@ fn paint(fill: Fill, source: Source) {
     // The scanout is mapped write-back over a region firmware typically marks
     // WC or UC. QEMU does not care; a real panel does, and "the text is in L2
     // and never reached the screen" is a bug that would only ever appear on
-    // metal. One instruction on a machine that is about to halt forever.
+    // metal -- so it is not optional for a boot checkpoint either, even though
+    // that path leaves the machine running and pays a full cache-hierarchy
+    // flush per phase boundary for it. Six on a GOP boot, none on any other.
     unsafe { core::arch::asm!("wbinvd", options(nostack, preserves_flags)) };
 }
 
