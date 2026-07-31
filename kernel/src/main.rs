@@ -466,9 +466,13 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
 
     // The panic no userland process can produce, by design: nothing is
     // current here, so the handler's recovery predicate fails and it runs the
-    // ordinary fatal path — crash_report, capture, drain, halt, paint. The
-    // drain empties the ring before the paint, which makes this the one test
-    // that fails if the capture stops happening.
+    // ordinary fatal path — crash_report, capture, drain, halt, paint.
+    //
+    // It used to say the drain empties the ring before the paint, "which makes
+    // this the one test that fails if the capture stops happening". That is no
+    // longer true and was measured false: a drain no longer erases what the
+    // console reads, so this test passes with `capture` stubbed out. See the
+    // note on `panic_console::capture` for what still justifies it.
     #[cfg(feature = "test-late-panic")]
     if core::hint::black_box(true) {
         late_panic::Nest::<late_panic::Nest<late_panic::Nest<late_panic::Nest<

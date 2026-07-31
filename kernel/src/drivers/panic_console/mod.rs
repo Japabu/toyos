@@ -337,6 +337,28 @@ pub fn remap() {
 /// ring. No pixels, no lock, no mutation -- one memcpy on a path that is
 /// about to halt. Skipped entirely when no framebuffer is armed, which is
 /// every headless boot, so a panic storm on a server pays nothing.
+///
+/// **Its original reason is gone, and it was kept anyway.** It existed because
+/// `panic_flush` drained the ring out from under the renderer, so a reader
+/// placed after the flush painted a blank screen. Since the ring retains what
+/// serial has collected (see `log_ring`), a drain erases nothing and
+/// [`live_tail`] after the flush returns the same text. Measured, not assumed:
+/// with the body of this function replaced by `return`, `screen_late_panic`
+/// still passes -- and `main.rs` used to claim that test was "the one test
+/// that fails if the capture stops happening". Nothing in the tree now
+/// distinguishes capture-present from capture-absent.
+///
+/// What remains is narrower than the original reason and is why it is still
+/// here: this freezes the report at the instant of the panic, while
+/// `live_tail` re-reads a ring that siblings are still writing to. The halt
+/// IPI is maskable, so a CPU with IF=0 keeps running until it re-enables, and
+/// one spinning in a `log!` loop can push 32 KiB through the ring between the
+/// panic and the paint -- which would push the report off the tail. That is
+/// unlikely, unstaged, and not what the code was written for.
+///
+/// So: delete it if you can stage that race and show it does not matter, or if
+/// you decide a diluted tail is an acceptable worst case. Do not delete it on
+/// the grounds that the tests still pass, because they will.
 pub fn capture() {
     if snapshot().is_none() {
         return;
