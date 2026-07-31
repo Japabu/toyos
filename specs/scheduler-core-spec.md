@@ -62,8 +62,9 @@ reviewed against a whitelist (percpu plumbing, asm, Hw impl, WaitQueue placement
 
 ```
 toyos-sched/                     # workspace member; no_std + alloc
-  Cargo.toml                     # features: "std", "check" (deep asserts); cfg(loom)
-  src/lib.rs                     # #![deny(unsafe_code)] — overridden ONLY in mailbox.rs
+  Cargo.toml                     # features: "std", "check" (deep asserts), "protocol-port", "loom"
+  src/lib.rs                     # #![deny(unsafe_code)] — overridden in mailbox.rs (whole file)
+                                 #   and at hw.rs:144 (one declaration; the core builds tokens safely)
   src/task.rs                    # Task linearity, five state types, AtomicTaskState
   src/queue.rs                   # RunQueue: RT FIFO band + fair BTreeMap ordering
   src/fair.rs                    # FairShare: per-process vruntime/lag/frontier math (pure)
@@ -72,10 +73,12 @@ toyos-sched/                     # workspace member; no_std + alloc
   src/timer.rs                   # per-CPU deadline heap (lazy deletion) + TimerPlan
   src/cpu.rs                     # CpuSched, SchedPass type-state, Action, sleep handshake
   src/retire.rs                  # kill bit + retire message chase
+  src/msg.rs                     # Msg: the per-CPU mailbox message type
+  src/sync.rs                    # atomics shim — resolves to loom's instrumented atomics under "loom"
   src/hw.rs                      # Hw trait, CpuId/Nanos newtypes, TraceEvent (shared format)
   src/invariants.rs              # feature="check": container/state-word cross-checks, timer invariant
 toyos-sched/sim/                 # separate package: toyos-sched-sim (std, host-only)
-  src/main.rs                    # CLI: run / fuzz / replay / shrink / from-qemu-trace
+  src/main.rs                    # CLI: run / fuzz / replay / shrink / from-qemu  [from-qemu is unimplemented!()]
   src/vm.rs                      # virtual CPUs, virtual clock, pending IPIs, IRQ-off gating
   src/hw_impl.rs                 # SimHw: Hw impl over vm.rs (mock Arc payload, ctx_saved shadow)
   src/choice.rs                  # ChoiceStream: SmallRng(seed) | raw fuzz bytes | PCT priorities
@@ -83,18 +86,26 @@ toyos-sched/sim/                 # separate package: toyos-sched-sim (std, host-
   src/shrink.rs                  # delta-debugging minimizer; emits committed replay #[test]s
   src/workload.rs                # Script DSL: Run | Block | Wake | Spawn | Exit | FutexOp
                                  #             | IrqAt | KernelSection(ns)  (preempt-off budget)
-  src/scenarios/                 # crash_md_exit_race, lost_wake_{pipe,futex,iouring,audio,listener},
+  src/scenarios.rs               # crash_md_exit_race, lost_wake_{pipe,futex,iouring,audio,listener},
                                  #   idle_hlt_race, rt_wake_latency, audio_pipeline, old_steal_port
+  src/invariants.rs              # sim-side invariant walk (distinct from the core's)
+  src/msg.rs, src/payload.rs     # sim message + payload types
+  src/sweep.rs                   # fuzz-sweep driver
   corpus/                        # checked-in minimized failing traces (permanent regressions)
+toyos-sched/loom/                # SEPARATE package: toyos-sched-loom. Compiles the core's own
+                                 # sources with feature "loom" so src/sync.rs resolves to loom atomics.
+                                 # These four are NOT under sim/.
   tests/loom_mailbox.rs          # MPSC push/drain: same-CPU IRQ torn push; preempted-producer model
   tests/loom_ticket.rs           # prepare_wait / wake / block_on / cancel / timeout races
   tests/loom_sleep.rs            # doorbell + sleep handshake (abstract pending-IPI model)
   tests/loom_retire.rs           # kill bit vs wake CAS; Retire-node re-post chase; Adopt-under-kill
 kernel/src/sched/                # driver half; kernel/src/scheduler.rs survives as the kernel-facing API
   mod.rs                         # module root over driver/payload/waitqs
-  hw.rs                          # KernelHw: LAPIC one-shot (TSC-deadline later), targeted x2APIC
   driver.rs                      # percpu CpuSched slot, idle loop, asm switch, trampoline, irq_ring
+  payload.rs                     # KernelPayload/ThreadSched — the kernel's SchedPayload
   waitqs.rs                      # WaitQueue instances owned by pipe/futex/listener/audio/io_uring/hid/net
+kernel/src/hw.rs                 # KernelHw: LAPIC one-shot (TSC-deadline later), targeted x2APIC.
+                                 # At kernel/src/, NOT kernel/src/sched/ — §11 Stage 6 has this right
 ```
 
 ARM64 portability: only `hw.rs` implementors and `driver.rs` asm are arch-specific (GIC timer,
