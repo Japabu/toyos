@@ -32,7 +32,7 @@ Verified against the current tree:
 | # | Class | Evidence | Closed by |
 |---|---|---|---|
 | B1 | Dual notification paths: every wake site must call both a wait-queue wake and `io_uring::complete_pending_for_event`; forgetting one half is a silent lost wake | **11 sites across 6 files — see the inventory below** | One `post()` function (§4); the dual-call idiom no longer exists to forget (CT2) |
-| B2 | Per-source park/recheck windows: the recheck in `handle_outgoing` covers only IoUring/PipeReadable/Audio; PipeWritable, Listener, Keyboard, Mouse, Network have none; futex has a separate protocol — five closures in five styles | `scheduler.rs:1704-1712` | One exhaustive 2-variant recheck match + one proof (§7); a new wait target without a recheck arm does not compile (CT3) |
+| B2 | Per-source park/recheck windows: five closures in five styles, with PipeWritable, Listener, Keyboard, Mouse and Network having no recheck at all | **Evidence superseded.** `handle_outgoing`, `park_outgoing` and `PERCPU_EVENTS` were all deleted at scheduler migration 7a/7c — zero hits in `kernel/` — so `scheduler.rs:1704-1712` no longer points at anything. The *shape* survives as per-object `KWaitQueue` parks in `sched::waitqs`; re-derive the site list before sizing work off this row | One exhaustive 2-variant recheck match + one proof (§7); a new wait target without a recheck arm does not compile (CT3) |
 | B3 | Open forever-hang: `sys_waitpid` blocks with `block(None, 0)` and is woken by directed `wake_task`; child exiting between the zombie check and pool insertion loses the wake forever. `SYS_THREAD_JOIN` shares it | `arch/syscall.rs:761,998` | `Source::ChildExit`/`ThreadExit` + Invariant W (§7, §8); `wake_task` is deleted entirely (§6.3) |
 | B4 | Timeout sentinels: `io_uring_enter(timeout=0)` = nonblock forces soundd's `delta==0 → full-period oversleep` hack; kernel `deadline: u64` with `0 = forever` is the opposite sentinel in the same codebase | `io_uring.rs:301-303`, `soundd/main.rs:363-366` | Continuous absolute deadlines over the whole `u64` range — no sentinel branch exists to collide (§9, CT4) |
 | B5 | ID-vs-pointer lifetime coupling: a queued `TaskCtx` referencing a freed kernel object (the motivating use-after-free) | crash dossier | Parked state names objects by Copy IDs only (`RingId`, futex `DirectMap`); destroyed objects fail lookups, never dangle (CT6) |
@@ -585,7 +585,7 @@ meaning; the `timeout=0` sentinel is removed). Semantics, total over u64:
 |---|---|---|
 | yes | — | return count |
 | no | yes | return count (0 ⇒ poll-once falls out; MAX ⇒ forever falls out) |
-| no | no | park on `Ring(id)`; deadline armed via `ensure_armed_before` |
+| no | no | park on `Ring(id)`; deadline armed via `ensure_armed_before` (**proposed primitive — does not exist yet**; §4) |
 
 Reject at entry (fail fast): `min_complete > cq_size` → `InvalidArgument`.
 
@@ -732,6 +732,8 @@ until measured — >2x rule.
 
 DLL timestamp error drops from drain-time ms-scale jitter (single shared slot) to per-CQE
 µs-scale IRQ-time stamps. Deadline fallback: `park(Ring, at(t_est))` + `ensure_armed_before`
+(proposed; nothing of that name exists in the tree today — and `apic.rs`'s `last_armed_ticks`
+is unrelated LAPIC one-shot bookkeeping, not a partial implementation of it)
 ⇒ LAPIC one-shot precision when armed locally, bounded by the 10 ms quantum otherwise.
 Gate: every migration stage keeps the audio glitch scan green (§18, §19).
 
@@ -826,8 +828,13 @@ New named tests (all run at `-smp 1` and `-smp 8`; audio tests additionally unde
 
 - `blocking_read_stress` — cross-CPU pipe ping-pong ×100 000 between two threads; the
   lost-wake canary for the pipe path. Must complete within a hard wall-clock bound.
-- `waitpid_storm` — spawn/exit children in a tight loop racing the parent's waitpid; the
-  B3 regression canary. Same for `thread_join`.
+- `waitpid_storm` — spawn/exit children in a tight loop racing the parent's waitpid. Same for
+  `thread_join`. **It is a ticket-protocol canary, not a `wake_task` canary.** B3's hang was
+  one instance of a general race — decide to park, then have the event land before the park
+  completes — and after this design the protocol that must hold is `prepare_wait` →
+  `commit` → park, with `Commit::AlreadyWoken` refusing the park. `wake_task` being gone does
+  not retire this test; it is what exercises the replacement, and it should be read as failing
+  when the ticket protocol has a hole rather than when one deleted function returns.
 - `sleep_until_accuracy` — on an idle CPU, `SYS_SLEEP_UNTIL` wake error bounded (≤ 1 ms
   under TCG; assert recorded as a test bound, tightened on KVM).
 - `enter_deadline_past` — `enter` with a past deadline returns immediately with whatever
@@ -879,7 +886,9 @@ until 4d.
 - 4b: migrate listener/accept, keyboard/mouse/serial-console, network reads.
 - 4c: `ChildExit`/`ThreadExit` sources; `sys_waitpid`/`SYS_THREAD_JOIN` migrate (closes
   B3); `nanosleep` path → `park_timeout`; kill/retire → `kill_pending` +
-  `unpark_for_kill`; `wake_task` deleted. `waitpid_storm` lands here.
+  `unpark_for_kill`; `wake_task` deleted (it still has 5 call sites today —
+  `scheduler.rs:257,435`, `process.rs:1081,1130,1615` — so this stage's deletion is
+  outstanding, not done). `waitpid_storm` lands here.
 - 4d: deletion commit — `io_uring::Source` + `complete_pending_for_event`,
   `wake_pipe_*`, ad-hoc recheck arms → single Park arm (§7), per-source fd queues →
   `by_channel`, `SYS_AUDIO_POLL` (`EventSource`, `scheduler::block`, `wake_by_event` and
