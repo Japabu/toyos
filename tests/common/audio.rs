@@ -4,6 +4,18 @@
 //! virtio-sound device played. Underruns show up as stretches of digital
 //! silence inside an otherwise active signal; clicks show up as
 //! sample-to-sample jumps no band-limited signal could produce.
+//!
+//! The capture timeline is NOT wall clock. QEMU's wav backend writes only
+//! while the guest voice is enabled, so the file freezes across every
+//! suspended stretch (audio spec §5.8) and splices the next resume directly
+//! onto the last stopped sample. Verified empirically: 25s of wall clock with
+//! the stream stopped adds zero PCM bytes. Consequence: `analyze` reports an
+//! underrun for ANY two signal regions in one capture, at ANY wall-clock gap
+//! between them — the spliced silence (drain tail + resume prime) always
+//! exceeds `MIN_GAP_SECS`, and `NEAR_SECS` is a proximity window into
+//! adjacent *samples*, not wall time, so it can never exonerate the gap. A
+//! test that plays two tones in one boot will always go red against a
+//! zero-gap baseline; keep one signal region per capture.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -451,6 +463,82 @@ pub fn check_counters(
     } else {
         Err(format!("soundd counter regression: {}", problems.join("; ")))
     }
+}
+
+/// Structural §5.8 suspend assertions, per-run and yes/no: the device stream
+/// must start only for a client and must be stopped — with soundd suspended
+/// and silent — once the last client is gone. TCG-immune, so a violation is
+/// categorical, never a rare event to be averaged.
+///
+/// Positions are byte offsets in the RAW serial. That is sound because every
+/// pattern below lands as one atomic chunk on the shared console: a kernel
+/// `log!` line is buffered whole and spilled once (`SerialWriter`), and each
+/// userspace pattern sits inside a single format piece of its `eprintln!`, so
+/// one `write` syscall carries it. Writers interleave BETWEEN chunks — whole
+/// foreign lines can land inside a soundd line — but never inside these
+/// patterns, and chunk order is emission order for soundd's mix thread, which
+/// emits every marker here (the kernel ones from inside its own syscalls).
+///
+/// The capture starts at ===TEST_START, after boot. A boot that wrongly
+/// started the device is still caught: the stream would already be running,
+/// no `started` line could appear in the window, and the required
+/// started-after-connect ordering fails.
+pub fn check_suspend_structure(serial: &str) -> Vec<String> {
+    const STARTED: &str = "virtio-sound: stream 0 started";
+    const STOPPED: &str = "virtio-sound: stream 0 stopped";
+    const CONNECTED: &str = " connected (id=";
+    const REMOVED: &str = " removed";
+    const SUSPENDED: &str = "soundd: suspended";
+
+    let mut problems = Vec::new();
+
+    let Some(first_connect) = serial.find(CONNECTED) else {
+        problems.push("suspend structure: no client connect in capture".to_string());
+        return problems;
+    };
+    match serial.find(STARTED) {
+        None => problems.push(
+            "suspend structure: the stream never started inside the test window — \
+             either the device was already running at boot (the §5.8 boot state is \
+             SUSPENDED) or the resume path is broken"
+                .to_string(),
+        ),
+        Some(at) if at < first_connect => problems.push(
+            "suspend structure: stream started before the first client connect".to_string(),
+        ),
+        Some(_) => {}
+    }
+
+    let Some(last_removed) = serial.rfind(REMOVED) else {
+        problems.push("suspend structure: no client removal in capture".to_string());
+        return problems;
+    };
+    let suspended = serial.rfind(SUSPENDED).filter(|&at| at > last_removed);
+    let stopped = serial.rfind(STOPPED).filter(|&at| at > last_removed);
+    if suspended.is_none() {
+        problems.push(
+            "suspend structure: no `soundd: suspended` after the last client removal"
+                .to_string(),
+        );
+    }
+    if stopped.is_none() {
+        problems.push(
+            "suspend structure: no `virtio-sound: stream 0 stopped` after the last \
+             client removal — the device is still running with no clients"
+                .to_string(),
+        );
+    }
+    if let (Some(suspended), Some(stopped)) = (suspended, stopped) {
+        let quiesced = suspended.min(stopped);
+        if serial[quiesced..].contains(STATS_MARKER) {
+            problems.push(
+                "suspend structure: a soundd stats window printed after the suspend \
+                 markers — the mix loop is still running while suspended"
+                    .to_string(),
+            );
+        }
+    }
+    problems
 }
 
 /// Bounds derived from the device's clock, not from any recorded run: values

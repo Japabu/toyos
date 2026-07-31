@@ -493,6 +493,10 @@ fn measure_audio_run(
         problems.push(msg);
     }
 
+    // §5.8 suspend structure — categorical per-run assertions, so they belong
+    // with the instrument checks: fatal in both tiers, never a counted rate.
+    problems.extend(audio::check_suspend_structure(&serial));
+
     // Keep every capture that shows something, so a dropout can be listened to
     // even when the tier's rule says one occurrence is not yet a verdict.
     if !problems.is_empty() || !breaches.is_empty() || !gaps.is_empty() {
