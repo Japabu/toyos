@@ -17,6 +17,10 @@ test-fatal-halt = []
 # One log line per i8042 drain: bytes seen, events queued, whether the queue
 # was woken. The only way a test can assert the wake guard from outside.
 i8042-trace = []
+# Make the ISR's output-buffer check lie, so its 16-byte bound trips and the
+# quarantine path runs. A controller that chatters forever is the one case the
+# bound alone still lets livelock a CPU, and nothing else can stage it.
+i8042-fault = []
 # Script the input core directly at end of boot. QEMU activates one input
 # handler per device class, so two keyboards or two pointers can never both be
 # live in a guest — the merge has no end-to-end test and this is its only one.

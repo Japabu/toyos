@@ -60,6 +60,8 @@ const INPUT_TESTS: &[&str] = &[
     "i8042_keyboard",
     "i8042_no_spurious_wake",
     "i8042_mouse",
+    "i8042_absent",
+    "i8042_quarantine",
 ];
 
 /// The renderer's two text colours, as the screendump reports them.
@@ -1665,6 +1667,123 @@ fn run_input_test(
             );
             Ok(())
         }
+        "i8042_absent" => {
+            // A/B in one session: the guest's own `Boot: complete (Nms)` is
+            // the instrument, because host-side timing here is dominated by
+            // image builds. A wait-loop bug that costs a second on a machine
+            // with a controller costs a minute on one without.
+            let with = QemuInstance::boot_with_options(
+                test_config,
+                c_bins,
+                rust_bins,
+                BootOptions::default(),
+            );
+            let with_log = with.boot_log().to_string();
+            let with_ms = boot_millis(&with_log)
+                .ok_or_else(|| format!("no `Boot: complete` line:\n{with_log}"))?;
+            drop(with);
+
+            let without = QemuInstance::boot_with_options(
+                test_config,
+                c_bins,
+                rust_bins,
+                BootOptions { i8042: false, ..Default::default() },
+            );
+            let log = without.boot_log().to_string();
+            // Reaching the ready marker at all is most of the assertion: the
+            // boot got past a controller that answers nothing.
+            let Some(absent) = log.lines().find(|l| l.contains("i8042: absent")) else {
+                return Err(format!("no `i8042: absent` line on a machine with no i8042:\n{log}"));
+            };
+            // Measured: `-machine q35,i8042=off` also clears the FADT
+            // IAPC_BOOT_ARCH 8042 bit, which was unverified when this driver
+            // was designed. So the gate must be what fires — any other
+            // absence line means the kernel probed 0x60/0x64 on a machine
+            // that may have something else decoding them.
+            if !absent.contains("iapc_boot_arch") {
+                return Err(format!(
+                    "the FADT gate did not fire; the kernel touched the ports instead: {absent}"
+                ));
+            }
+            let without_ms = boot_millis(&log)
+                .ok_or_else(|| format!("no `Boot: complete` line:\n{log}"))?;
+            if without_ms > with_ms + 1000 {
+                return Err(format!(
+                    "boot took {without_ms}ms without an i8042 and {with_ms}ms with one — a wait is not bounded"
+                ));
+            }
+            // Which line it is settles empirically whether QEMU also clears
+            // the FADT bit, which was unverified when this was designed.
+            eprintln!("  [i8042] absent via: {}", absent.trim());
+            eprintln!("  [i8042] boot {without_ms}ms without vs {with_ms}ms with");
+            Ok(())
+        }
+        "i8042_quarantine" => {
+            // A controller producing bytes faster than the ISR's bound can
+            // drain them is the one case the bound alone still lets livelock
+            // a CPU. It must cost a keyboard, not a CPU.
+            let mut qemu = QemuInstance::boot_with_options(
+                test_config,
+                c_bins,
+                rust_bins,
+                BootOptions {
+                    usb_hid: false,
+                    qmp: true,
+                    kernel_features: &["i8042-fault"],
+                    ..Default::default()
+                },
+            );
+            if !qemu.boot_log().contains("i8042: fault injection armed") {
+                return Err(format!(
+                    "the fault was never armed — did init fail?\n{}",
+                    qemu.boot_log()
+                ));
+            }
+            // The in-guest reader keeps a CPU doing work, so a livelocked
+            // one is visible as a dead test rather than as a quiet pass.
+            let result = qemu.run_test_hooked(
+                "test_rs_i8042_keyboard",
+                Duration::from_secs(30),
+                "===I8042_READY===",
+                |socket| {
+                    qemu::qmp_send_keys(socket, &[("a", true), ("a", false)]);
+                },
+            );
+            if let Some(err) = &result.error {
+                return Err(format!("the guest did not survive the wedge: {err}"));
+            }
+            let Some(line) = result.serial.lines().find(|l| l.contains("i8042: quarantined"))
+            else {
+                return Err(format!("no quarantine line:\n{}", result.serial));
+            };
+            // The count the driver actually achieved, not the word "masked"
+            // in a format string: a quarantine that does not take the line
+            // down leaves the CPU exposed to the next flood.
+            let masked: u32 = line
+                .split("masked=")
+                .nth(1)
+                .and_then(|r| r.split_whitespace().next())
+                .and_then(|n| n.parse().ok())
+                .ok_or_else(|| format!("unreadable quarantine line: {line}"))?;
+            if masked == 0 {
+                return Err(format!("quarantined without masking any line: {line}"));
+            }
+            // "A keyboard, not a CPU" is the claim, so measure the CPU. The
+            // idle loop logs its health every 1000 iterations and halts when
+            // there is nothing to do, so a spinning CPU is loud: the first
+            // version of this driver left the `irq_ring` record undrained
+            // after quarantine and produced 2685 of these lines in 5 s,
+            // against 1 on a healthy run.
+            let health = result.serial.matches("sched: cpu=").count();
+            if health > 50 {
+                return Err(format!(
+                    "{health} idle-health lines after the quarantine — a CPU is spinning, not halting"
+                ));
+            }
+            eprintln!("  [i8042] {}", line.trim());
+            eprintln!("  [i8042] {health} idle-health lines — the CPU still halts");
+            Ok(())
+        }
         other => Err(format!("unknown input test {other}")),
     }
 }
@@ -1722,6 +1841,16 @@ fn parse_mouse_events(stdout: &str) -> Vec<MouseLine> {
             })
         })
         .collect()
+}
+
+/// The guest's own boot duration, out of `Boot: complete (123ms)`.
+fn boot_millis(log: &str) -> Option<u64> {
+    log.lines()
+        .find_map(|l| l.split("Boot: complete (").nth(1))?
+        .split("ms)")
+        .next()?
+        .parse()
+        .ok()
 }
 
 /// The `keys=` field of an `i8042: drain ...` trace line.

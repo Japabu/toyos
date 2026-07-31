@@ -132,6 +132,21 @@ fn has_bytes() -> bool {
     HEAD.load(Ordering::Acquire) != TAIL.load(Ordering::Relaxed)
 }
 
+/// Under `i8042-fault`, armed at the end of a successful init so the next
+/// interrupt makes the output buffer look permanently full. The only way to
+/// reach the ISR's bound without a controller that is genuinely broken.
+#[cfg(feature = "i8042-fault")]
+static FAULT: AtomicBool = AtomicBool::new(false);
+
+#[inline]
+fn buffer_full(status: u8) -> bool {
+    #[cfg(feature = "i8042-fault")]
+    if FAULT.load(Ordering::Relaxed) {
+        return true;
+    }
+    status & OBF != 0
+}
+
 /// Rust half of the pin-interrupt handler. Read the module doc before adding
 /// anything to it.
 pub extern "sysv64" fn handler() {
@@ -139,13 +154,13 @@ pub extern "sysv64" fn handler() {
     let mut n = 0;
     while n < ISR_BURST {
         let status = inb(STATUS);
-        if status & OBF == 0 {
+        if !buffer_full(status) {
             break;
         }
         push_isr(inb(DATA), status & AUXB != 0);
         n += 1;
     }
-    if n == ISR_BURST && inb(STATUS) & OBF != 0 {
+    if n == ISR_BURST && buffer_full(inb(STATUS)) {
         // It cannot mask the line itself — that needs the I/O APIC lock.
         QUARANTINE.store(true, Ordering::Relaxed);
     }
@@ -167,12 +182,16 @@ static PS2: Lock<Decoders> =
 /// Turn whatever the ISR published into events and wakes. Runs at the top of
 /// every scheduler pass on every CPU, so the idle cost is one atomic load.
 pub fn service() {
-    if !ACTIVE.load(Ordering::Relaxed) {
-        return;
-    }
+    // Unconditionally, and before any other test: an undrained `irq_ring`
+    // record keeps `any_pending_self` true, and the idle loop rechecks it
+    // before halting — so a record nobody consumes spins a CPU forever. The
+    // quarantine path found this the hard way.
     let recorded = crate::irq_ring::take(IrqSource::I8042).is_some();
     if QUARANTINE.load(Ordering::Relaxed) {
         quarantine();
+        return;
+    }
+    if !ACTIVE.load(Ordering::Relaxed) {
         return;
     }
     // Unconditional, not gated on `recorded`: this is what detects a lost
@@ -181,7 +200,12 @@ pub fn service() {
         return;
     }
     if !recorded {
-        LOST_EDGES.fetch_add(1, Ordering::Relaxed);
+        // Bytes with no IRQ record: the edge was lost, or another CPU's
+        // drain took the record first. Loud the first time, silent after —
+        // a rate is what would matter and nothing reads one.
+        if LOST_EDGES.fetch_add(1, Ordering::Relaxed) == 0 {
+            log!("i8042: bytes with no IRQ record — an edge was lost");
+        }
     }
 
     let Drained { bytes, keys, motion, aux_reset } = drain();
@@ -236,7 +260,14 @@ fn drain() -> Drained {
     let mut out = Drained { bytes: 0, keys: 0, motion: 0, aux_reset: false };
     let mut lost = false;
 
-    if DROPPED.swap(0, Ordering::Relaxed) > 0 {
+    let dropped = DROPPED.swap(0, Ordering::Relaxed);
+    if dropped > 0 {
+        // Never expected: 256 slots against ~300 B/s, drained at every
+        // scheduler pass. It costs a gesture, not the framing, which is what
+        // the decoder resets below are for.
+        log!("i8042: ring overflow, {} bytes dropped — resyncing", dropped);
+    }
+    if dropped > 0 {
         // A hole in a framed stream: both decoders' partial state is
         // meaningless now, and the pointer would stay one byte off forever.
         state.keys.reset();
@@ -290,11 +321,21 @@ fn drain() -> Drained {
 fn quarantine() {
     QUARANTINE.store(false, Ordering::Relaxed);
     ACTIVE.store(false, Ordering::Relaxed);
-    let gsi = KEYBOARD_GSI.load(Ordering::Relaxed);
-    if gsi != u32::MAX {
-        let _ = ioapic::set_masked(Gsi(gsi), true);
+    // The count, not the intent: "one masked line and a dead keyboard,
+    // never a spinning CPU" is only true if the mask actually took.
+    let mut masked = 0;
+    for line in [KEYBOARD_GSI.load(Ordering::Relaxed), AUX_GSI.load(Ordering::Relaxed)] {
+        if line != u32::MAX && ioapic::set_masked(Gsi(line), true).is_ok() {
+            masked += 1;
+        }
     }
-    log!("i8042: quarantined — output buffer never emptied, GSI {} masked", gsi);
+    log!(
+        "i8042: quarantined — output buffer never emptied, masked={} (kbd={} aux={} lost={})",
+        masked,
+        KBD_EVENTS.load(Ordering::Relaxed),
+        AUX_EVENTS.load(Ordering::Relaxed),
+        LOST_EDGES.load(Ordering::Relaxed)
+    );
 }
 
 /// The `woke_*` fields are the gates the wakes actually ran under, not a
@@ -669,6 +710,12 @@ pub fn init(rsdp_addr: u64) {
         Some(l) => log!("i8042: aux rate=100 res=8/mm, GSI {} -> vec {:#04x} apic {}", l.gsi.0, I8042_VECTOR, apic_id),
         None => log!("i8042: no pointer on the aux port"),
     }
+
+    #[cfg(feature = "i8042-fault")]
+    {
+        FAULT.store(true, Ordering::Relaxed);
+        log!("i8042: fault injection armed");
+    }
 }
 
 /// The handler's drain loop, without the EOI. Called once from init with
@@ -690,6 +737,10 @@ fn handler_poll() {
 /// test of this driver fools itself.
 pub fn kbd_events() -> u32 {
     KBD_EVENTS.load(Ordering::Relaxed)
+}
+
+pub fn aux_events() -> u32 {
+    AUX_EVENTS.load(Ordering::Relaxed)
 }
 
 pub fn lost_edges() -> u32 {
