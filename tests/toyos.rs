@@ -18,8 +18,13 @@ struct TestDef {
 }
 
 // Rust helper binaries that are spawned by tests, not tests themselves.
-const RUST_SKIP: &[&str] =
-    &["segfault_child", "test_panic_child", "i8042_keyboard", "i8042_mouse"];
+const RUST_SKIP: &[&str] = &[
+    "segfault_child",
+    "test_panic_child",
+    "i8042_keyboard",
+    "i8042_mouse",
+    "input_events",
+];
 
 // Audio glitch tests. Each runs in its own QEMU boot per SMP config and
 // asserts on the wav the virtio-sound device captured, so they are excluded
@@ -30,54 +35,50 @@ const AUDIO_TESTS: &[&str] = &["audio_tone", "audio_tone_load"];
 // first-class single-CPU case, smp=8 the full-SMP case.
 const AUDIO_SMP: &[u32] = &[1, 8];
 
-// Tests that read a decoded screendump. Each boots its own QEMU with a UEFI
-// GOP display, so they cannot share the multi-test boot — the guest they test
-// is halted, or has no console, by the time they assert. `screen_decoder`
-// needs no guest at all; it proves the decoder against a bitmap it rendered
-// itself, before anything points it at a real screen. `metal_sim_compositor`
-// is M1's permanent config: the whole boot with no virtio device anywhere.
+// Tests that read a decoded screendump, which is exactly the set for which
+// the screen is the device under test: the panic console. On a machine with
+// no serial port the rendered report is the only diagnostic that exists, so
+// asserting on pixels there is asserting on the product. Everything else that
+// used to read a screendump now reads the console instead — a screenshot is a
+// poor way to ask "did the right process come up", and thresholds over a live
+// desktop are how those tests passed vacuously twice.
+// `screen_decoder` needs no guest at all; it proves the decoder against a
+// bitmap it rendered itself, before anything points it at a real screen.
 /// Feature-carrying tests last: each distinct kernel feature set is one more
 /// kernel rebuild, and ending on one leaves the plain-kernel tests above it
 /// untouched by the thrash.
 const SCREEN_TESTS: &[&str] = &[
     "screen_decoder",
-    "metal_sim_compositor",
-    "screen_boot_checkpoint",
     "screen_recoverable_untouched",
     "screen_early_panic",
     "screen_late_panic",
+    "screen_panic_muted",
     "screen_fatal_halt",
 ];
 
-/// Input-path tests. Each needs a machine shape the shared boot cannot give
-/// it — no USB HID so the PS/2 keyboard is the only source, or no i8042 at
-/// all — so each costs its own boot. `run_input_test` dispatches them.
+/// Tests whose machine shape *is* the test: metal-sim, where the PS/2
+/// keyboard is the only input source and no virtio device exists, or a q35
+/// with the i8042 switched off. None of them can share the multi-test boot,
+/// so each costs its own. `run_machine_test` dispatches them.
 /// Feature-carrying ones last, as SCREEN_TESTS does: each distinct kernel
 /// feature set is another kernel rebuild.
-const INPUT_TESTS: &[&str] = &[
+const MACHINE_TESTS: &[&str] = &[
     "ioapic_topology",
     "input_merge",
+    "metal_sim_compositor",
+    "metal_sim_input",
     "i8042_keyboard",
     "i8042_no_spurious_wake",
     "i8042_mouse",
     "i8042_absent",
     "i8042_quarantine",
-    "metal_sim_input",
 ];
 
 /// The renderer's two text colours, as the screendump reports them.
 const WHITE: [u8; 3] = [0xFF, 0xFF, 0xFF];
 const ALERT: [u8; 3] = [0xFF, 0x50, 0x50];
-/// And its two fills: dark red for a halted machine, black for a checkpoint.
+/// And the fill a halted machine leaves behind.
 const FILL_FATAL: [u8; 3] = [0x60, 0x00, 0x00];
-const FILL_BOOT: [u8; 3] = [0x00, 0x00, 0x00];
-
-/// `TASKBAR_COLOR` from `userland/compositor/src/main.rs`. The compositor
-/// fills the bottom `TASKBAR_HEIGHT` rows full-width with it before drawing
-/// anything on top, and the last pixel row stays untouched by every tab —
-/// which makes one uniform row of this colour a signature no other painter in
-/// the tree produces.
-const TASKBAR: [u8; 3] = [0x18, 0x18, 0x25];
 
 /// The line `SYS_DEBUG` action 3 logs immediately before halting every CPU.
 /// Action 3 exists only under the `test-fatal-halt` kernel feature, which
@@ -1006,6 +1007,36 @@ fn check_colors(dump: &screen::Ppm, fill: [u8; 3], alert_line: &str) -> Result<(
     Ok(())
 }
 
+/// Assert the renderer wrapped a backtrace line rather than clipping it.
+///
+/// The stimulus is the panic's own bottom frame: `late_panic::Nest` is a
+/// generic nested in itself, so its demangled symbol is wider than any
+/// console grid and its head and tail cannot share a display row. Wrap-over-
+/// clip exists precisely so the symbol at the *end* of such a line survives,
+/// which is why the tail is the thing asserted.
+fn check_wrap(dump: &screen::Ppm) -> Result<(), String> {
+    let rows = dump.rows();
+    let Some(head) = dump.row_index("late_panic::Nest") else {
+        return Err(format!(
+            "no `late_panic::Nest` frame on screen — no over-wide symbol to wrap\n{}",
+            dump.text()
+        ));
+    };
+    if rows[head].contains("on_screen_console_check") {
+        return Err(format!(
+            "the frame fit one display row ({} columns); wrap is not exercised",
+            rows[head].len()
+        ));
+    }
+    if !rows[head..].iter().take(4).any(|r| r.contains("on_screen_console_check")) {
+        return Err(format!(
+            "the tail of the demangled symbol never reached the screen — clipped?\n{}",
+            dump.text()
+        ));
+    }
+    Ok(())
+}
+
 /// Run one screen test. `Err` carries the decoded screen, because a failure
 /// here is almost always "the text is not what I expected" and the decoded
 /// grid is the only readable form of that.
@@ -1020,75 +1051,47 @@ fn run_screen_test(
             screen::self_test();
             Ok(())
         }
-        "metal_sim_compositor" => {
-            let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/metalcase");
+        "screen_panic_muted" => {
+            // The machine the whole M0/M1 line exists for: metal-sim with the
+            // 16550 taken away, so `uart_present()` is false, `panic_flush`
+            // returns without draining anywhere, and the rendered screen is
+            // the only channel the report can possibly reach. Same kernel
+            // feature and same image as `screen_late_panic`, so this costs a
+            // boot and no rebuild — and it is the one place the absent-UART
+            // branches run at all.
             let options = BootOptions {
                 profile: qemu::Profile::Metal,
                 qmp: true,
+                mute: true,
+                kernel_features: &["test-late-panic"],
                 ..Default::default()
             };
-
-            // The profile's claim is a negative one, and no screendump can
-            // see a device that is present but unused — so read the argv.
-            // Without this the test would keep passing if virtio came back.
             let argv = qemu::profile_argv(&options);
-            if let Some(bad) = argv.iter().find(|a| a.contains("virtio")) {
-                return Err(format!("metal-sim passed a virtio device to QEMU: {bad}"));
-            }
-            if let Some(bad) = argv.iter().find(|a| a.contains("usb-kbd") || a.contains("usb-tablet")) {
-                return Err(format!("metal-sim passed a USB HID device to QEMU: {bad}"));
-            }
+            metal_sim_argv_check(&argv)?;
             match argv.iter().position(|a| a == "-serial") {
                 Some(i) if argv.get(i + 1).is_some_and(|v| v == "none") => {}
-                _ => return Err(format!("metal-sim did not disable the 16550: {argv:?}")),
+                _ => return Err(format!("the muted profile still has a 16550: {argv:?}")),
+            }
+            if argv.iter().any(|a| a.contains("stdio")) {
+                return Err(format!("the muted profile still has a stdio chardev: {argv:?}"));
             }
 
-            let mut qemu = QemuInstance::boot_with_options(&config, &[], &[], options);
-            // No console, so no ready marker and no run_test: the screen is
-            // the only thing this guest can be observed through. The wait
-            // covers firmware, the initrd read off USB and the whole boot,
-            // which together take ~5s here; 30 leaves room and bounds what a
-            // regression costs, since each poll writes a 12 MiB screendump.
-            let dump = qemu.screendump_while(
-                Duration::from_secs(30),
-                Duration::from_millis(500),
-                |d| d.row_uniform(d.height - 1) == Some(TASKBAR),
-            );
+            let mut qemu =
+                QemuInstance::boot_with_options(test_config, c_bins, rust_bins, options);
+            // Nothing announces the panic here — there is no console for a
+            // marker to arrive on — so the screen is polled until it carries
+            // the report. 30s covers firmware plus the initrd read off USB.
+            let dump = qemu.screendump_until("!!! PANIC !!!", Duration::from_secs(30));
             let text = dump.text();
-            if dump.row_uniform(dump.height - 1) != Some(TASKBAR) {
-                // The decoded screen is the diagnostic: under metal-sim it
-                // carries the kernel's last boot checkpoint or its panic
-                // report, which is the whole reason M0 came first.
-                print_screen(name, &text);
-                return Err(format!(
-                    "no compositor taskbar on the {}x{} framebuffer; bottom row {:?}\ndecoded screen:\n{text}",
-                    dump.width,
-                    dump.height,
-                    dump.row_uniform(dump.height - 1),
-                ));
+            print_screen(name, &text);
+            for want in ["!!! PANIC !!!", "test-late-panic: on-screen console check"] {
+                if !text.contains(want) {
+                    return Err(format!(
+                        "{want:?} not on screen of a guest with no serial port at all\ndecoded screen:\n{text}"
+                    ));
+                }
             }
-            // A taskbar over a black screen would mean the compositor drew
-            // its furniture and nothing else; the wallpaper is what proves a
-            // full desktop composite reached the firmware framebuffer.
-            let colors = dump.distinct_colors(5);
-            if colors < 256 {
-                return Err(format!(
-                    "taskbar present but only {colors} distinct colours — no wallpaper composited"
-                ));
-            }
-            // And the kernel's own last word must be gone, which is what
-            // "userland claimed the framebuffer" looks like from outside.
-            if text.contains("Boot: complete") {
-                return Err(format!(
-                    "the kernel boot checkpoint is still on screen — the compositor never took the framebuffer\n{text}"
-                ));
-            }
-            eprintln!(
-                "  [metal-sim] {}x{} framebuffer, taskbar row {:?}, {colors} colours",
-                dump.width,
-                dump.height,
-                TASKBAR
-            );
+            check_colors(&dump, FILL_FATAL, "!!! PANIC !!!")?;
             Ok(())
         }
         "screen_early_panic" => {
@@ -1117,61 +1120,6 @@ fn run_screen_test(
                 }
             }
             check_colors(&dump, FILL_FATAL, "!!! EARLY PANIC !!!")?;
-            Ok(())
-        }
-        "screen_boot_checkpoint" => {
-            // Nothing in the test config claims the framebuffer, so the last
-            // checkpoint is still on screen once userland is up: exactly the
-            // state a machine that wedges after "devices ready" would leave.
-            let mut qemu = QemuInstance::boot_with_options(
-                test_config,
-                c_bins,
-                rust_bins,
-                BootOptions {
-                    profile: qemu::Profile::Gop,
-                    qmp: true,
-                    kernel_features: &["test-wide-log"],
-                    ..Default::default()
-                },
-            );
-            let dump = qemu.screendump();
-            let text = dump.text();
-            print_screen(name, &text);
-            for want in ["Boot: devices ready", "Boot: complete"] {
-                if !text.contains(want) {
-                    return Err(format!("{want:?} not on screen\ndecoded screen:\n{text}"));
-                }
-            }
-            // The fill is the whole difference between "still booting" and
-            // "halted", and the decoder is colour-blind by construction.
-            if dump.fill() != FILL_BOOT {
-                return Err(format!(
-                    "boot checkpoint fill is {:?}, want {FILL_BOOT:?}",
-                    dump.fill()
-                ));
-            }
-            // Wrap, not clip — the reason the renderer wraps is that a
-            // demangled Rust symbol lives at the *end* of a backtrace line,
-            // which is exactly what a clip drops.
-            //
-            // The stimulus is the kernel's own `test-wide-log` line, emitted
-            // immediately before the last checkpoint. This used to borrow
-            // `KernelArgs`, the one line in the tree naturally wider than the
-            // grid — but it sits near the top of the console's window and
-            // scrolled off whenever a `log!` was added anywhere before it,
-            // which M1 and then M2 both tripped over.
-            let rows = dump.rows();
-            let Some(head) = dump.row_index("wide-log-head") else {
-                return Err(format!("no wide-log line on screen\n{text}"));
-            };
-            if rows[head].contains("wide-log-tail") {
-                return Err("the wide line fit one display row; wrap is not exercised".to_string());
-            }
-            if !rows[head..].iter().take(4).any(|r| r.contains("wide-log-tail")) {
-                return Err(format!(
-                    "the tail of the wide line never reached the screen — clipped?\n{text}"
-                ));
-            }
             Ok(())
         }
         "screen_late_panic" => {
@@ -1203,6 +1151,7 @@ fn run_screen_test(
                 }
             }
             check_colors(&dump, FILL_FATAL, "!!! PANIC !!!")?;
+            check_wrap(&dump)?;
             Ok(())
         }
         "screen_fatal_halt" => {
@@ -1291,15 +1240,89 @@ fn run_screen_test(
     }
 }
 
-/// Run one input-path test. Like `run_screen_test`, each of these owns its
+/// Every negative claim `Profile::Metal` makes, read off the argv QEMU is
+/// launched with. A claim about which devices do *not* exist is a claim about
+/// this list and nothing else — no console line and no screendump can see a
+/// device that is present but unused.
+fn metal_sim_argv_check(argv: &[String]) -> Result<(), String> {
+    if let Some(bad) = argv.iter().find(|a| a.contains("virtio")) {
+        return Err(format!("metal-sim passed a virtio device to QEMU: {bad}"));
+    }
+    if let Some(bad) = argv.iter().find(|a| a.contains("usb-kbd") || a.contains("usb-tablet")) {
+        return Err(format!("metal-sim passed a USB HID device to QEMU: {bad}"));
+    }
+    Ok(())
+}
+
+/// Run one machine-shape test. Like `run_screen_test`, each of these owns its
 /// QEMU: the machine shape *is* the test.
-fn run_input_test(
+fn run_machine_test(
     name: &str,
     test_config: &Path,
     c_bins: &[(String, Vec<u8>)],
     rust_bins: &[(String, Vec<u8>)],
 ) -> Result<(), String> {
     match name {
+        "metal_sim_compositor" => {
+            // M1's permanent config: the whole boot with no virtio device
+            // anywhere. What it certifies is which processes survive the
+            // T14's device shape — the compositor claims a firmware
+            // framebuffer and says what it got, soundd and netd find no
+            // device and exit rather than panic. All three are the process's
+            // own words. The earlier version read the bottom pixel row
+            // instead, which says nothing about soundd or netd and stayed
+            // green with their graceful exit reverted.
+            let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/metalcase");
+            let options = BootOptions {
+                profile: qemu::Profile::Metal,
+                ..Default::default()
+            };
+            metal_sim_argv_check(&qemu::profile_argv(&options))?;
+
+            let mut qemu = QemuInstance::boot_with_options(&config, &[], &[], options);
+            // init spawns all four programs without waiting, so test-runner's
+            // ready marker races the daemons' own lines. Keep draining until
+            // every line has been said or the window closes.
+            const WANT: [&str; 3] = [
+                "compositor: ready",
+                "soundd: no audio device on this machine, exiting",
+                "netd: no NIC on this machine, exiting",
+            ];
+            let mut console = qemu.boot_log().to_string();
+            let deadline = std::time::Instant::now() + Duration::from_secs(15);
+            while std::time::Instant::now() < deadline
+                && !WANT.iter().all(|w| console.contains(w))
+            {
+                console.push_str(&qemu.drain_serial(Duration::from_millis(250)));
+            }
+            for want in WANT {
+                if !console.contains(want) {
+                    return Err(format!("{want:?} never reached the console:\n{console}"));
+                }
+            }
+            // The compositor reports the mode it was handed, which is the
+            // proof it claimed a real firmware framebuffer rather than
+            // starting on nothing.
+            let Some(mode) = console
+                .lines()
+                .find_map(|l| l.split("compositor: wallpaper ").nth(1))
+            else {
+                return Err(format!(
+                    "the compositor never said what framebuffer it got:\n{console}"
+                ));
+            };
+            // And nothing panicked on the way. A daemon that dies on its
+            // absent device fails the positive check above; this catches the
+            // rest of the boot dying instead.
+            for bad in ["!!! PANIC !!!", "KERNEL PANIC", "panicked at"] {
+                if console.contains(bad) {
+                    return Err(format!("{bad:?} on a boot that should be clean:\n{console}"));
+                }
+            }
+            eprintln!("  [metal-sim] compositor up on {}", mode.trim());
+            eprintln!("  [metal-sim] soundd and netd both exited on their absent device");
+            Ok(())
+        }
         "ioapic_topology" => {
             // Everything the I/O APIC driver says happens in Phase 2, long
             // before the virtio-console exists, so the 16550 file is where a
@@ -1390,28 +1413,19 @@ fn run_input_test(
             Ok(())
         }
         "i8042_keyboard" => {
-            let mut qemu = QemuInstance::boot_with_options(
-                test_config,
-                c_bins,
-                rust_bins,
-                BootOptions {
-                    usb_hid: false,
-                    qmp: true,
-                    kernel_features: &["i8042-trace"],
-                    ..Default::default()
-                },
-            );
-            // Without this the test can pass for the wrong reason, which is
-            // the single most likely way an exercise like this fools itself:
-            // QEMU routes injected keys to one handler per class, and with a
-            // usb-kbd present that handler is not the PS/2 one.
-            let argv = qemu::profile_argv(&BootOptions {
-                usb_hid: false,
+            // On metal-sim, because that is the machine the driver is for and
+            // the absent USB HID is what makes the test measure anything:
+            // QEMU routes injected keys to one handler per device class, and
+            // with a usb-kbd present that handler is not the PS/2 one.
+            let options = BootOptions {
+                profile: qemu::Profile::Metal,
+                qmp: true,
+                kernel_features: &["i8042-trace"],
                 ..Default::default()
-            });
-            if let Some(bad) = argv.iter().find(|a| a.contains("usb-kbd")) {
-                return Err(format!("the i8042 test still has a USB keyboard: {bad}"));
-            }
+            };
+            metal_sim_argv_check(&qemu::profile_argv(&options))?;
+            let mut qemu =
+                QemuInstance::boot_with_options(test_config, c_bins, rust_bins, options);
             let boot = qemu.boot_log().to_string();
             if !boot.contains("i8042: kbd set2+xlat (readback 0x41)") {
                 return Err(format!("the PS/2 keyboard never came up:\n{boot}"));
@@ -1515,7 +1529,7 @@ fn run_input_test(
                 c_bins,
                 rust_bins,
                 BootOptions {
-                    usb_hid: false,
+                    profile: qemu::Profile::Metal,
                     qmp: true,
                     kernel_features: &["i8042-trace"],
                     ..Default::default()
@@ -1583,7 +1597,7 @@ fn run_input_test(
                 c_bins,
                 rust_bins,
                 BootOptions {
-                    usb_hid: false,
+                    profile: qemu::Profile::Metal,
                     qmp: true,
                     kernel_features: &["i8042-trace"],
                     ..Default::default()
@@ -1683,7 +1697,7 @@ fn run_input_test(
                 test_config,
                 c_bins,
                 rust_bins,
-                BootOptions::default(),
+                BootOptions { profile: qemu::Profile::Metal, ..Default::default() },
             );
             let with_log = with.boot_log().to_string();
             let with_ms = boot_millis(&with_log)
@@ -1694,7 +1708,11 @@ fn run_input_test(
                 test_config,
                 c_bins,
                 rust_bins,
-                BootOptions { i8042: false, ..Default::default() },
+                BootOptions {
+                    profile: qemu::Profile::Metal,
+                    i8042: false,
+                    ..Default::default()
+                },
             );
             let log = without.boot_log().to_string();
             // Reaching the ready marker at all is most of the assertion: the
@@ -1734,7 +1752,7 @@ fn run_input_test(
                 c_bins,
                 rust_bins,
                 BootOptions {
-                    usb_hid: false,
+                    profile: qemu::Profile::Metal,
                     qmp: true,
                     kernel_features: &["i8042-fault"],
                     ..Default::default()
@@ -1792,132 +1810,113 @@ fn run_input_test(
             Ok(())
         }
         "metal_sim_input" => {
-            // M2's exit criterion. The metal-sim profile has no serial and no
-            // USB HID, so the i8042 is the machine's only input device and
-            // the framebuffer its only channel out — which is exactly the
-            // T14's shape. The assertions are pixels, not glyphs, and under
-            // GOP the compositor draws its cursor into the framebuffer, so
-            // injected input is directly visible.
-            let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/metalcase");
+            // M2's exit criterion, on the machine shape and the kernel that
+            // get flashed: no virtio device, no USB HID — so the i8042 is the
+            // guest's only input device — and no kernel feature turned on for
+            // the occasion, unlike the four tests above it.
+            //
+            // What it asserts is the events, read by an in-guest process and
+            // printed. The first version asserted screen pixels after a click
+            // at a fixed taskbar coordinate, which made the compositor's
+            // layout part of a kernel-delivery criterion and needed thresholds
+            // to survive the taskbar's own once-a-second repaint. M2 owns
+            // delivery — pin to userland process — so that is what this
+            // measures, and nothing here says the compositor reacted.
+            // `metal_sim_compositor` is what covers the compositor.
             let options = BootOptions {
                 profile: qemu::Profile::Metal,
                 qmp: true,
                 ..Default::default()
             };
             let argv = qemu::profile_argv(&options);
-            for bad in ["virtio", "usb-kbd", "usb-tablet"] {
-                if let Some(arg) = argv.iter().find(|a| a.contains(bad)) {
-                    return Err(format!("metal-sim grew a {bad} device: {arg}"));
-                }
-            }
+            metal_sim_argv_check(&argv)?;
             if argv.iter().any(|a| a.contains("i8042=off")) {
                 return Err("metal-sim turned the i8042 off".to_string());
             }
 
-            let mut qemu = QemuInstance::boot_with_options(&config, &[], &[], options);
-            let taskbar = |d: &screen::Ppm| d.row_uniform(d.height - 1) == Some(TASKBAR);
-            let booted = qemu.screendump_while(
+            let mut qemu =
+                QemuInstance::boot_with_options(test_config, c_bins, rust_bins, options);
+
+            // `kernel/src/mouse.rs` scales each relative count into the
+            // 0..32767 space the compositor consumes, so one PS/2 count
+            // arrives as this many units of reported position.
+            const REL_SCALE: i32 = 64;
+            const DX: i32 = 40;
+            const DY: i32 = -30;
+            let result = qemu.run_test_hooked(
+                "test_rs_input_events",
                 Duration::from_secs(30),
-                Duration::from_millis(500),
-                taskbar,
+                "===INPUT_READY===",
+                |socket| {
+                    // One connection for both halves: QEMU serves one QMP
+                    // client at a time.
+                    let mut input = qemu::QmpInput::open(socket);
+                    // Off the origin first — the accumulated position clamps
+                    // at 0, so a move up or left from there is invisible.
+                    // Under 256 counts, or the packet's overflow bit is set
+                    // and the motion is dropped by design.
+                    input.mouse(200, 200, None);
+                    thread::sleep(Duration::from_millis(100));
+                    input.mouse(DX, DY, None);
+                    thread::sleep(Duration::from_millis(100));
+                    input.mouse(0, 0, Some(("left", true)));
+                    thread::sleep(Duration::from_millis(50));
+                    input.mouse(0, 0, Some(("left", false)));
+                    thread::sleep(Duration::from_millis(100));
+                    for key in ["h", "e", "l", "l", "o"] {
+                        input.keys(&[(key, true), (key, false)]);
+                        thread::sleep(Duration::from_millis(20));
+                    }
+                },
             );
-            if !taskbar(&booted) {
-                print_screen(name, &booted.text());
+            if let Some(err) = &result.error {
+                return Err(format!("{err}\n{}", result.stdout));
+            }
+
+            let keys = parse_key_events(&result.stdout);
+            let typed: String = keys
+                .iter()
+                .filter(|e| e.modifiers & 0x10 == 0)
+                .map(|e| e.translated.as_str())
+                .collect();
+            if !typed.contains("hello") {
                 return Err(format!(
-                    "no compositor taskbar to drive; bottom row {:?}",
-                    booted.row_uniform(booted.height - 1)
+                    "typed {typed:?}, want it to contain \"hello\" — the keyboard never reached userland:\n{}",
+                    result.stdout
                 ));
             }
 
-            // Every diff below is of the screen ABOVE the taskbar. The
-            // compositor repaints the taskbar once a second for its clock and
-            // stats, so a whole-screen diff of a live desktop is always true
-            // — this test's first version passed on exactly that.
-            const TASKBAR_ROWS: usize = 32;
-            // And even above the taskbar the desktop churns by ~80 px, so the
-            // assertions are thresholds. A launcher is ~8960 px; a settled
-            // desktop returning to itself is 0.
-            const LAUNCHER_PX: usize = 4000;
-
-            let Some(idle) = settle_above(&mut qemu, TASKBAR_ROWS) else {
-                return Err(
-                    "the desktop never stops changing with no input — the diffs below would prove nothing"
-                        .to_string(),
-                );
+            let pointer = parse_mouse_events(&result.stdout);
+            // The delta the wire carried, not "it moved": a sign error in dy
+            // and a dropped high bit both survive "it moved", and the PS/2
+            // wire points the opposite way to the screen. Relative, so it
+            // says nothing about where any compositor would draw a cursor.
+            let want = (DX * REL_SCALE, DY * REL_SCALE);
+            let deltas: Vec<(i32, i32)> = pointer
+                .windows(2)
+                .map(|w| (w[1].x as i32 - w[0].x as i32, w[1].y as i32 - w[0].y as i32))
+                .collect();
+            if !deltas.contains(&want) {
+                return Err(format!(
+                    "no pointer event moved by {want:?}; deltas seen: {deltas:?}\n{}",
+                    result.stdout
+                ));
+            }
+            let Some(down) = pointer.iter().position(|e| e.buttons == 0x01) else {
+                return Err(format!(
+                    "no left-button-down event; buttons seen: {:?}",
+                    pointer.iter().map(|e| e.buttons).collect::<std::collections::BTreeSet<_>>()
+                ));
             };
-
-            // QEMU serves one QMP client at a time, and `screendump` opens
-            // its own — so every injection session is scoped closed before
-            // the next dump.
-            //
-            // Into the bottom-left corner, which with no windows open is the
-            // taskbar's "new" button. One packet per command and small steps:
-            // a delta past 9 bits sets the overflow bit and the motion is
-            // dropped, by design. The click below is what proves this
-            // arrived — with no pointer input the cursor stays at screen
-            // centre, where a click hits the desktop and changes nothing.
-            let socket = qemu.qmp_socket().to_path_buf();
-            {
-                let mut input = qemu::QmpInput::open(&socket);
-                for _ in 0..24 {
-                    input.mouse(-40, 40, None);
-                    thread::sleep(Duration::from_millis(10));
-                }
-            }
-            let Some(parked) = settle_above(&mut qemu, TASKBAR_ROWS) else {
-                return Err("the desktop never settled after the pointer moved".to_string());
-            };
-
-            {
-                let mut input = qemu::QmpInput::open(&socket);
-                input.mouse(0, 0, Some(("left", true)));
-                thread::sleep(Duration::from_millis(50));
-                input.mouse(0, 0, Some(("left", false)));
-            }
-            let clicked = qemu.screendump_while(Duration::from_secs(5), Duration::from_millis(200), |d| {
-                d.pixels_differing_above(&parked, TASKBAR_ROWS) >= LAUNCHER_PX
-            });
-            let clicked_px = clicked.pixels_differing_above(&parked, TASKBAR_ROWS);
-            if clicked_px < LAUNCHER_PX {
+            if !pointer[down + 1..].iter().any(|e| e.buttons == 0x00) {
                 return Err(format!(
-                    "the click changed {clicked_px} px, want a launcher's worth ({LAUNCHER_PX}) — the pointer never reached the taskbar, or the button never reached the compositor"
+                    "the left button went down and never came up: {pointer:?}"
                 ));
-            }
-
-            // Escape closes the launcher: the keyboard path, on the same
-            // machine shape, to the same userland process.
-            qemu::qmp_send_keys(&socket, &[("esc", true), ("esc", false)]);
-            let closed = qemu.screendump_while(Duration::from_secs(5), Duration::from_millis(200), |d| {
-                d.pixels_differing_above(&clicked, TASKBAR_ROWS) >= LAUNCHER_PX
-            });
-            let closed_px = closed.pixels_differing_above(&clicked, TASKBAR_ROWS);
-            if closed_px < LAUNCHER_PX {
-                return Err(format!(
-                    "Escape changed {closed_px} px, want a launcher's worth ({LAUNCHER_PX}) — the keyboard never reached userland"
-                ));
-            }
-            // And it closed the launcher rather than doing something else:
-            // the desktop is bit-identical to before the click. Without this
-            // the test would accept any big change, a crash repaint included.
-            let residue = closed.pixels_differing_above(&parked, TASKBAR_ROWS);
-            if residue != 0 {
-                return Err(format!(
-                    "Escape changed the screen, but {residue} px away from the pre-click desktop"
-                ));
-            }
-
-            // A crashed compositor would leave a changed screen too.
-            for (label, dump) in [("parked", &parked), ("clicked", &clicked), ("closed", &closed)] {
-                if !taskbar(dump) {
-                    print_screen(name, &dump.text());
-                    return Err(format!(
-                        "the taskbar is gone at `{label}` — the compositor died rather than responded"
-                    ));
-                }
             }
             eprintln!(
-                "  [metal-sim] {}x{} framebuffer: click opened the launcher ({clicked_px} px), Escape closed it ({closed_px} px), desktop back to {residue} px",
-                closed.width, closed.height
+                "  [metal-sim] {} key events (typed {typed:?}), {} pointer events, delta {want:?} delivered",
+                keys.len(),
+                pointer.len()
             );
             Ok(())
         }
@@ -1954,28 +1953,6 @@ fn parse_key_events(stdout: &str) -> Vec<KeyLine> {
 /// four characters `\u{1b}` rather than the byte.
 fn unescape(s: &str) -> String {
     s.replace("\\u{1b}", "\u{1b}").replace("\\\"", "\"").replace("\\\\", "\\")
-}
-
-/// Dump until two consecutive screens agree above the bottom `skip_rows`
-/// rows, and return the settled one.
-///
-/// The compositor paints its taskbar before the first full composite
-/// finishes, so the first dump carrying a taskbar is not a baseline.
-fn settle_above(qemu: &mut QemuInstance, skip_rows: usize) -> Option<screen::Ppm> {
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    let mut last = qemu.screendump();
-    loop {
-        thread::sleep(Duration::from_millis(400));
-        let next = qemu.screendump();
-        let settled = next.identical_above(&last, skip_rows);
-        last = next;
-        if settled {
-            return Some(last);
-        }
-        if std::time::Instant::now() >= deadline {
-            return None;
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -2206,7 +2183,7 @@ fn main() {
         for name in SCREEN_TESTS {
             println!("{name}");
         }
-        for name in INPUT_TESTS {
+        for name in MACHINE_TESTS {
             println!("{name}");
         }
         return;
@@ -2254,7 +2231,7 @@ fn main() {
         .copied()
         .filter(|n| filter.map_or(true, |f| n.contains(f)))
         .collect();
-    let input_to_run: Vec<&str> = INPUT_TESTS
+    let machine_to_run: Vec<&str> = MACHINE_TESTS
         .iter()
         .copied()
         .filter(|n| filter.map_or(true, |f| n.contains(f)))
@@ -2263,7 +2240,7 @@ fn main() {
     if tests_to_run.is_empty()
         && audio_to_run.is_empty()
         && screen_to_run.is_empty()
-        && input_to_run.is_empty()
+        && machine_to_run.is_empty()
     {
         eprintln!("No tests match filter {:?}", filter);
         std::process::exit(1);
@@ -2273,7 +2250,7 @@ fn main() {
     let total = tests_to_run.len()
         + audio_to_run.len() * AUDIO_SMP.len()
         + screen_to_run.len()
-        + input_to_run.len();
+        + machine_to_run.len();
     eprintln!("\nrunning {total} tests\n");
     let mut passed = 0;
     let mut failed = 0;
@@ -2350,19 +2327,19 @@ fn main() {
         }
     }
 
-    // Input tests own their QEMU because their machine shape is the test.
-    // INPUT_TESTS keeps the plain-kernel ones first for the same reason
+    // These own their QEMU because their machine shape is the test.
+    // MACHINE_TESTS keeps the plain-kernel ones first for the same reason
     // SCREEN_TESTS does.
-    if !input_to_run.is_empty() {
-        eprintln!("  --- input ---");
-        for name in &input_to_run {
+    if !machine_to_run.is_empty() {
+        eprintln!("  --- machine ---");
+        for name in &machine_to_run {
             let start = std::time::Instant::now();
             // A guest whose kernel-internal check panics never reaches the
             // ready marker, and the harness's own boot wait panics rather
             // than returning — which would take the rest of the suite with
             // it. Catch it here so one dead boot is one failed test.
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                run_input_test(name, &test_config, &c_bins, &rust_bins)
+                run_machine_test(name, &test_config, &c_bins, &rust_bins)
             }))
             .unwrap_or_else(|e| {
                 Err(e
@@ -2381,7 +2358,7 @@ fn main() {
                     failed += 1;
                     eprintln!("FAIL {name}: {reason}");
                     eprintln!("  FAIL  {name}  ({:.0?})", elapsed);
-                    let summary = reason.lines().next().unwrap_or("input check failed");
+                    let summary = reason.lines().next().unwrap_or("machine check failed");
                     failures.push((name.to_string(), summary.to_string()));
                 }
             }

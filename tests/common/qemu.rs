@@ -27,11 +27,12 @@ pub enum Profile {
     Headless,
     Gop,
     /// M1 metal-sim: GOP, NVMe, xHCI with the boot stick on it, i8042 from
-    /// q35, and nothing else -- no virtio device, no USB HID, no 16550. The
-    /// guest has no channel out but the framebuffer, so a boot under this
-    /// profile is observed with [`QemuInstance::screendump_while`] and
-    /// nothing else. Keeping a serial port here would defeat the point: the
-    /// T14 has none, and a profile that talks over one is not simulating it.
+    /// q35, and nothing else -- no virtio device and no USB HID. This is the
+    /// machine shape that gets flashed, so it is the one the input tests run
+    /// on. The 16550 stays: every defect metal-sim has found came from the
+    /// device shape, and with a console the guest can be driven over the
+    /// ===TEST_START=== protocol like any other. [`BootOptions::mute`] takes
+    /// it away for the one test that certifies the T14's literal shape.
     Metal,
 }
 
@@ -50,20 +51,20 @@ pub struct BootOptions {
     /// because screen tests boot their own QEMU and several may exist at once.
     pub qmp: bool,
     pub kernel_features: &'static [&'static str],
-    /// Give the guest a USB keyboard. False is what makes an i8042 test
-    /// measure anything: QEMU activates one input handler per device class,
-    /// so with `usb-kbd` present every injected keystroke goes to it and a
-    /// PS/2 test passes for the wrong reason. Ignored under
-    /// [`Profile::Metal`], which never had one.
-    pub usb_hid: bool,
     /// Give the machine an i8042 at all. `-machine q35,i8042=off` is the one
     /// absence scenario QEMU can stage.
     pub i8042: bool,
+    /// Take the 16550 away, leaving the framebuffer as the guest's only
+    /// channel out. Only [`Profile::Metal`] may set it -- the others carry
+    /// their console on it or on virtio-serial. A muted guest has no marker
+    /// to wait for and no `run_test` to drive, so it is observed with
+    /// [`QemuInstance::screendump_while`] and nothing else.
+    pub mute: bool,
     /// The console line that means the boot reached the state under test.
     /// Anything other than [`DEFAULT_READY`] also declares that a panic is the
     /// expected outcome rather than a boot failure -- the early-panic screen
-    /// test never reaches userland at all. Ignored under [`Profile::Metal`],
-    /// which has no console for a marker to arrive on.
+    /// test never reaches userland at all. Ignored when [`BootOptions::mute`]
+    /// is set, which leaves no console for a marker to arrive on.
     pub ready_marker: &'static str,
 }
 
@@ -79,8 +80,8 @@ impl Default for BootOptions {
             profile: Profile::Headless,
             qmp: false,
             kernel_features: &[],
-            usb_hid: true,
             i8042: true,
+            mute: false,
             ready_marker: DEFAULT_READY,
         }
     }
@@ -247,9 +248,9 @@ impl QemuInstance {
         })
     }
 
-    /// Screendump until `done`, or the timeout. The metal-sim profile has no
-    /// console, so this is the only way to observe that boot at all — and
-    /// what it watches for is a pixel pattern, not text.
+    /// Screendump until `done`, or the timeout. A muted guest has no console,
+    /// so this is the only way to observe that boot at all — and what it
+    /// watches for is a pixel pattern, not text.
     ///
     /// Returns the last dump either way; a caller that timed out gets the
     /// screen as its diagnostic, which under metal-sim is where the kernel's
@@ -275,8 +276,9 @@ impl QemuInstance {
     /// The kernel's own boot lines sit in the log ring until the scheduler
     /// drains them, by which time the virtio-console is the backend — so the
     /// 16550 file holds only the bootloader, and this is the only place a
-    /// host test can read what the kernel said while booting. Empty under
-    /// [`Profile::Metal`], which has no console to say it on.
+    /// host test can read what the kernel said while booting. Under
+    /// [`Profile::Metal`] the 16550 is the console and carries everything;
+    /// empty when [`BootOptions::mute`] takes it away.
     pub fn boot_log(&self) -> &str {
         &self.boot_log
     }
@@ -632,6 +634,11 @@ fn qemu_command(
     qmp_socket: Option<&Path>,
     options: &BootOptions,
 ) -> Command {
+    assert!(
+        !options.mute || !options.profile.virtio(),
+        "mute removes the only console a virtio profile has"
+    );
+
     let repo = compile::repo_root();
     let ovmf_dir = repo.join("ovmf");
 
@@ -686,8 +693,11 @@ fn qemu_command(
         .arg("-no-reboot");
 
     // The T14's keyboard is PS/2 and its touchpad I2C-HID; it has no USB HID
-    // at all, so metal-sim must not have one either.
-    if options.profile.virtio() && options.usb_hid {
+    // at all, so metal-sim must not have one either. That absence is also
+    // what makes an i8042 test measure anything: QEMU activates one input
+    // handler per device class, so with a usb-kbd present every injected
+    // keystroke goes to it and the PS/2 test passes for the wrong reason.
+    if options.profile.virtio() {
         qemu.arg("-device").arg("usb-kbd,bus=xhci.0");
     }
 
@@ -717,8 +727,17 @@ fn qemu_command(
             .arg("virtio-serial-pci-non-transitional,id=virtio-serial0,max_ports=1")
             .arg("-device")
             .arg("virtconsole,chardev=cs0,id=console0");
-    } else {
+    } else if options.mute {
         qemu.arg("-serial").arg("none");
+    } else {
+        // The 16550 *is* the console here: no virtio-serial exists, so the
+        // kernel's log ring drains to it and the guest reads its commands
+        // off it. signal=off matches the virtio console above, so a ^C in
+        // the stream reaches the guest rather than killing QEMU.
+        qemu.arg("-chardev")
+            .arg("stdio,id=uart0,signal=off")
+            .arg("-serial")
+            .arg("chardev:uart0");
     }
 
     if options.gdb_stub {
@@ -774,12 +793,12 @@ fn spawn_and_wait_ready(
         full_log
     });
 
-    // A metal-sim guest has no console at all, so there is no marker to wait
-    // for: the caller polls the framebuffer. Blocking here would only time out.
-    let boot_log = if options.profile.virtio() {
-        wait_for_ready(&mut child, &rx, options, &uart_log)
-    } else {
+    // A muted guest has no console at all, so there is no marker to wait for:
+    // the caller polls the framebuffer. Blocking here would only time out.
+    let boot_log = if options.mute {
         String::new()
+    } else {
+        wait_for_ready(&mut child, &rx, options, &uart_log)
     };
 
     QemuInstance {

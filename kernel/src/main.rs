@@ -58,6 +58,28 @@ mod shared_memory;
 mod user_ptr;
 mod vma;
 
+/// Where `screen_late_panic`'s panic comes from, and why it comes from here.
+///
+/// The renderer wraps rather than clips because the demangled symbol sits at
+/// the *end* of a backtrace line, so proving wrap needs a frame whose symbol
+/// is wider than the console grid — 256 columns on the 2048-px framebuffer
+/// QEMU's stdvga offers, 320 at most anywhere. A generic nested in itself
+/// demangles to one: ~25 columns per level, and the head and the tail of the
+/// same symbol are then on different display rows. It is a real backtrace
+/// frame off a real panic, which a synthetic wide `log!` line was only ever
+/// standing in for.
+#[cfg(feature = "test-late-panic")]
+mod late_panic {
+    pub struct Nest<T>(core::marker::PhantomData<T>);
+
+    impl<T> Nest<T> {
+        #[inline(never)]
+        pub fn on_screen_console_check() -> ! {
+            panic!("test-late-panic: on-screen console check");
+        }
+    }
+}
+
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use arch::{apic, cpu, idt, percpu, smp, syscall};
@@ -415,13 +437,6 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
         log!("spawned {} pid={pid}", args[0]);
     }
 
-    // Wider than the console's 320-column grid, and placed where the last
-    // checkpoint is certain to still hold it. The renderer wraps rather than
-    // clips because a demangled Rust symbol lives at the *end* of a backtrace
-    // line; proving that needs a line the test controls.
-    #[cfg(feature = "test-wide-log")]
-    log!("wide-log-head {} wide-log-tail", "=".repeat(320));
-
     boot_phase!("complete", 0);
     log!("Keyboard layout: {}", crate::keyboard::layout_name());
 
@@ -432,7 +447,9 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     // that fails if the capture stops happening.
     #[cfg(feature = "test-late-panic")]
     if core::hint::black_box(true) {
-        panic!("test-late-panic: on-screen console check");
+        late_panic::Nest::<late_panic::Nest<late_panic::Nest<late_panic::Nest<
+            late_panic::Nest<late_panic::Nest<late_panic::Nest<late_panic::Nest<
+            late_panic::Nest<late_panic::Nest<()>>>>>>>>>>::on_screen_console_check();
     }
 
     smp::set_ready();

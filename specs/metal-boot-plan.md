@@ -52,32 +52,35 @@ bar; QEMU cannot.
   8x16 text grid on the GOP framebuffer, armed *before* `serial::init` and
   taking no lock of any kind; recovering panics never paint. The six boot
   phase boundaries repaint, so a machine that wedges without panicking still
-  shows which phase it reached. Six `screen_*` tests decode the screendump
+  shows which phase it reached. The `screen_*` tests decode the screendump
   glyph-by-glyph against the same `font8x16.bin` the kernel blits, and assert
-  the fill and highlight colours the decoder is deliberately blind to. What
+  the fill and highlight colours the decoder is deliberately blind to. They are
+  the only tests that read pixels, and deliberately so: the panic console *is*
+  the screen, so a screendump is the product there rather than a proxy for it. What
   the screen carries is the *report*, not the boot log: the ring is drained
   continuously, so only what the panic handler captured before the drain is
   there (known issues §2). Detail:
   `kernel/src/drivers/panic_console/mod.rs`.
 - **M1 — "metal-sim" QEMU profile. BUILT.** `cargo run -- --metal-sim` and
   `BootOptions { profile: Profile::Metal }`: firmware GOP, NVMe, xHCI with the
-  boot stick on it, q35's i8042, and no virtio device, no USB HID and no 16550
-  anywhere. It reaches the compositor, and `metal_sim_compositor` in the suite
-  certifies that on every `cargo test` (~4 s) by decoding a QMP screendump —
-  the compositor's own `TASKBAR_COLOR` across the full bottom pixel row, a
-  composited wallpaper above it, and the kernel's last checkpoint gone from the
-  screen. Its teeth: the profile's argv is asserted to contain no `virtio`, no
-  USB HID and `-serial none`, because no screendump can see a device that is
-  present but unused.
+  boot stick on it, q35's i8042, and no virtio device and no USB HID anywhere.
+  `metal_sim_compositor` certifies it on every `cargo test`: the compositor
+  claims the firmware framebuffer and reports the mode it got, soundd and netd
+  find no device and exit rather than panic. Its teeth are the argv — no
+  `virtio`, no USB HID — because no console line and no screendump can see a
+  device that is present but unused.
 
-  **The profile keeps no serial, deliberately.** The T14 has no UART, and a
-  profile that talks over one is not simulating it — so the guest's only
-  channel out is the framebuffer, which is exactly what makes M0 the
-  prerequisite it was. `--metal-sim --uart` puts a 16550 back on stdio for
-  debugging; anything it shows has to be re-shown without it. The consequence
-  for the harness is absolute: `===TEST_START===` cannot survive, because there
-  is nothing to send `run <name>` over. A metal-sim guest is observed by
-  screendump and by nothing else.
+  **The profile keeps its 16550, deliberately** (reversed 2026-07-31; it was
+  mute by default until then). The T14 has no UART, but every defect metal-sim
+  has actually found came from the *device shape*, and the absent console found
+  exactly one thing — the observability gap now filed in known issues §8. With
+  a console the `===TEST_START===` protocol works, so the machine that gets
+  flashed is the machine the input tests run on: all five i8042 tests and
+  `metal_sim_input` boot this profile. `--metal-sim --mute` takes the 16550
+  away again; one test uses it (`screen_panic_muted`), and what it certifies is
+  the property that needs a mute machine to mean anything — a kernel panic
+  reaching the screen with `uart_present()` false and `panic_flush` draining
+  nowhere.
 
   What it found: `xhci::init` returned `None` when the controller had no HID on
   it and `kernel_main` panicked on that — which is the T14's ordinary state,
@@ -142,10 +145,15 @@ bar; QEMU cannot.
   xHCI controller survivable, which nothing has yet had a chance to exercise.
 - **FLASH TRIGGER: metal-sim boots to the compositor with the PS/2 keyboard
   working and panics render on screen → flash the stick. MET.**
-  `metal_sim_input` certifies it every run: on the profile with no virtio
-  device, no USB HID and no serial, an injected TrackPoint motion parks the
-  cursor on the taskbar, a click opens the compositor's launcher, and Escape
-  closes it — all by screendump, with the desktop returning bit-identical.
+  `metal_sim_input` certifies it every run, on the machine shape and the plain
+  kernel that get flashed: an in-guest process holds both input fds while the
+  host injects, and the assertions are the events it printed — the exact
+  relative delta the wire carried (a sign error in dy survives "it moved", and
+  PS/2 points the opposite way to the screen), a left button down and up, and
+  the typed text. It said nothing about the compositor's reaction from
+  2026-07-31 on: the pixel version asserted a click at a fixed taskbar
+  coordinate, which made compositor layout part of a kernel-delivery criterion
+  and needed thresholds to survive the taskbar's own once-a-second repaint.
   First metal boot is now an afternoon with readable failures, not a
   black-screen slog. M3 and M4 are still worth doing before the flash; the
   trigger condition itself no longer blocks.

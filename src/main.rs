@@ -53,14 +53,14 @@ fn main() {
     let rebuild_toolchain = args.iter().any(|a| a == "--rebuild-toolchain");
     let smp = parse_smp(&args);
     let profile = parse_profile(&args);
-    let uart = args.iter().any(|a| a == "--uart");
+    let mute = args.iter().any(|a| a == "--mute");
     assert!(
         !(dump_audio && profile == qemu::Profile::Metal),
         "--dump-audio needs virtio-sound, which --metal-sim removes"
     );
     assert!(
-        !(uart && profile != qemu::Profile::Metal),
-        "--uart only means anything under --metal-sim; the others already have a console"
+        !(mute && profile != qemu::Profile::Metal),
+        "--mute only means anything under --metal-sim; the others need their console"
     );
 
     check_prerequisites();
@@ -83,13 +83,13 @@ fn main() {
     println!("Build finished.");
 
     if !build_only {
-        qemu::launch(&qemu::Options { debug, dump_audio, profile, smp, uart });
+        qemu::launch(&qemu::Options { debug, dump_audio, profile, smp, mute });
     }
 }
 
 /// `--gop` swaps virtio-gpu for a firmware framebuffer; `--metal-sim` goes
 /// further and removes every virtio device, which is what the target laptop
-/// actually presents.
+/// actually presents. `--metal-sim --mute` additionally takes the 16550 away.
 fn parse_profile(args: &[String]) -> qemu::Profile {
     let gop = args.iter().any(|a| a == "--gop");
     let metal = args.iter().any(|a| a == "--metal-sim");

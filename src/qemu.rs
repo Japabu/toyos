@@ -16,8 +16,10 @@ pub enum Profile {
     Gop,
     /// M1 metal-sim: the shape a ThinkPad T14 presents. Firmware framebuffer,
     /// i8042 (q35 gives it for free), NVMe, xHCI with the boot stick on it,
-    /// and nothing else — no virtio device anywhere, no USB HID, and by
-    /// default no 16550 either. The screen is the only channel out.
+    /// and nothing else — no virtio device anywhere and no USB HID. The 16550
+    /// stays on unless [`Options::mute`] takes it away: the T14 has no serial
+    /// port, but every defect metal-sim has found came from the device shape,
+    /// and a console is what makes the shape drivable.
     Metal,
 }
 
@@ -32,10 +34,11 @@ pub struct Options {
     pub dump_audio: bool,
     pub profile: Profile,
     pub smp: u32,
-    /// Give `Profile::Metal` a 16550 on stdio anyway. The T14 has none, so a
-    /// metal-sim run that uses this is a debugging aid and not a simulation:
-    /// anything it proves has to be re-proved without it.
-    pub uart: bool,
+    /// Take `Profile::Metal`'s 16550 away, leaving the framebuffer as the
+    /// only channel out — the T14's literal shape. Everything else about the
+    /// machine is identical, so this is the observability question and not
+    /// the device-shape one.
+    pub mute: bool,
 }
 
 pub fn launch(opts: &Options) {
@@ -127,11 +130,11 @@ pub fn launch(opts: &Options) {
             .arg("virtio-serial-pci-non-transitional,id=virtio-serial0,max_ports=1")
             .arg("-device")
             .arg("virtconsole,chardev=cs0,id=console0");
-    } else if opts.uart {
-        eprintln!("metal-sim: 16550 on stdio — a channel the T14 does not have");
-        qemu.arg("-serial").arg("stdio");
-    } else {
+    } else if opts.mute {
+        eprintln!("metal-sim: no 16550 — the framebuffer is the only channel out");
         qemu.arg("-serial").arg("none");
+    } else {
+        qemu.arg("-serial").arg("stdio");
     }
 
     qemu.arg("-no-reboot")
