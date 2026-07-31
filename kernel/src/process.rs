@@ -1473,6 +1473,16 @@ pub fn dump_crash_diagnostics(fault_addr: u64, rip: u64) {
 /// Returns true if the address was resolved and logged.
 /// Uses try_lock so it's safe to call from panic handlers.
 pub fn resolve_user_symbol(pid: Pid, addr: u64) -> bool {
+    with_user_symbols(pid, |syms| crate::symbols::resolve_user(syms, addr))
+}
+
+/// [`resolve_user_symbol`] for a backtrace frame's return address — see
+/// [`crate::symbols::SymbolTable::resolve_return`].
+pub fn resolve_user_symbol_return(pid: Pid, return_addr: u64) -> bool {
+    with_user_symbols(pid, |syms| crate::symbols::resolve_user_return(syms, return_addr))
+}
+
+fn with_user_symbols(pid: Pid, f: impl FnOnce(&crate::symbols::SymbolTable) -> bool) -> bool {
     let syms_arc = {
         let Some(guard) = PROCESS_TABLE.try_lock() else { return false };
         let Some(table) = guard.as_ref() else { return false };
@@ -1482,7 +1492,7 @@ pub fn resolve_user_symbol(pid: Pid, addr: u64) -> bool {
         }
     };
     let Some(syms) = syms_arc.try_lock() else { return false };
-    crate::symbols::resolve_user(&syms, addr)
+    f(&syms)
 }
 
 /// Find .symtab and .strtab in an ELF's section headers and return pointers

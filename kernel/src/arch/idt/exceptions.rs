@@ -12,7 +12,7 @@ pub(crate) fn kernel_backtrace(start_rbp: u64, max_frames: usize) {
         let saved_rbp = unsafe { *(rbp as *const u64) };
         let return_addr = unsafe { *((rbp + 8) as *const u64) };
         if return_addr == 0 || !mm::is_kernel_addr(return_addr) { break; }
-        symbols::resolve_kernel(return_addr);
+        symbols::resolve_kernel_return(return_addr);
         rbp = saved_rbp;
     }
 }
@@ -25,7 +25,7 @@ fn user_backtrace(pid: crate::process::Pid, start_rbp: u64, pml4: *const u64, ma
         let Some(saved_rbp) = safe_read_u64(rbp, pml4) else { break };
         let Some(return_addr) = safe_read_u64(rbp + 8, pml4) else { break };
         if return_addr == 0 { break; }
-        if !process::resolve_user_symbol(pid, return_addr) {
+        if !process::resolve_user_symbol_return(pid, return_addr) {
             log!("    {:#x}", return_addr);
         }
         rbp = saved_rbp;
@@ -39,7 +39,7 @@ fn kernel_backtrace_safe(start_rbp: u64, max_frames: usize) {
         let Some(saved_rbp) = safe_read_kernel(rbp) else { break };
         let Some(return_addr) = safe_read_kernel(rbp + 8) else { break };
         if return_addr == 0 { break; }
-        symbols::resolve_kernel(return_addr);
+        symbols::resolve_kernel_return(return_addr);
         rbp = saved_rbp;
     }
 }

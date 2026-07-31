@@ -164,6 +164,19 @@ impl SymbolTable {
         Some((name, offset))
     }
 
+    /// [`resolve`](Self::resolve) for a *return address*.
+    ///
+    /// A return address is the instruction after the `call`, so when the call
+    /// is the last instruction of its function — every call to a diverging
+    /// function, and any tail position — it lands one byte past the symbol's
+    /// last byte and `resolve` correctly refuses it. Every backtrace frame but
+    /// the innermost is a return address, which is why panic reports read
+    /// `[kernel+0x…]` far more often than the symbol table's coverage explains.
+    pub fn resolve_return(&self, return_addr: u64) -> Option<(&str, u64)> {
+        let (name, offset) = self.resolve(return_addr.saturating_sub(1))?;
+        Some((name, offset + 1))
+    }
+
     fn strtab_name(&self, off: usize) -> Option<&str> {
         if self.strtab.is_null() || off >= self.strtab_len { return None; }
         let start = unsafe { self.strtab.add(off) };
@@ -199,13 +212,23 @@ pub fn load_kernel(data: &[u8], base: u64) {
 /// Resolve and log an address against kernel symbols. Lock-free, allocation-free.
 /// Safe to call from any context including panic, double fault, NMI.
 pub fn resolve_kernel(addr: u64) -> Option<u64> {
+    log_kernel(addr, |table| table.resolve(addr))
+}
+
+/// [`resolve_kernel`] for a backtrace frame's return address — see
+/// [`SymbolTable::resolve_return`].
+pub fn resolve_kernel_return(return_addr: u64) -> Option<u64> {
+    log_kernel(return_addr, |table| table.resolve_return(return_addr))
+}
+
+fn log_kernel(addr: u64, lookup: impl FnOnce(&SymbolTable) -> Option<(&str, u64)>) -> Option<u64> {
     let ptr = KERNEL_SYMS.load(Ordering::Acquire);
     if ptr.is_null() {
         log!("    {:#x}", addr);
         return None;
     }
     let table = unsafe { &*ptr };
-    if let Some((raw, offset)) = table.resolve(addr) {
+    if let Some((raw, offset)) = lookup(table) {
         log!("    {:#x}  {:#}+{:#x}", addr, rustc_demangle::demangle(raw), offset);
         Some(offset)
     } else {
@@ -222,7 +245,17 @@ pub fn resolve_kernel(addr: u64) -> Option<u64> {
 /// Resolve and log a user address against a process's symbol table.
 /// Returns true if the address could be identified.
 pub fn resolve_user(syms: &SymbolTable, addr: u64) -> bool {
-    if let Some((name, offset)) = syms.resolve(addr) {
+    log_user(syms, addr, syms.resolve(addr))
+}
+
+/// [`resolve_user`] for a backtrace frame's return address — see
+/// [`SymbolTable::resolve_return`].
+pub fn resolve_user_return(syms: &SymbolTable, return_addr: u64) -> bool {
+    log_user(syms, return_addr, syms.resolve_return(return_addr))
+}
+
+fn log_user(syms: &SymbolTable, addr: u64, resolved: Option<(&str, u64)>) -> bool {
+    if let Some((name, offset)) = resolved {
         log!("    {:#x}  {:#}+{:#x}", addr, rustc_demangle::demangle(name), offset);
         true
     } else if syms.is_valid_user_addr(addr) {
