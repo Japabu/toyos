@@ -87,9 +87,10 @@ impl Ppm {
         p[0].max(p[1]).max(p[2]) >= FG_THRESHOLD
     }
 
-    /// Reconstruct the text grid. Rows are right-trimmed and trailing blank
-    /// rows dropped, so a mostly-empty screen decodes to a short string.
-    pub fn text(&self) -> String {
+    /// Every cell row, right-trimmed, with the blank ones kept. Row `i` here
+    /// is pixel rows `i * GLYPH_H ..`, which is what makes [`Ppm::row_fg`]
+    /// addressable by the same index a text search returns.
+    pub fn rows(&self) -> Vec<String> {
         let font = Font::load();
         let mut rows: Vec<String> = Vec::new();
         for cy in 0..self.height / GLYPH_H {
@@ -109,10 +110,47 @@ impl Ppm {
             }
             rows.push(row.trim_end().to_string());
         }
+        rows
+    }
+
+    /// Reconstruct the text grid. Rows are right-trimmed and trailing blank
+    /// rows dropped, so a mostly-empty screen decodes to a short string.
+    pub fn text(&self) -> String {
+        let mut rows = self.rows();
         while rows.last().is_some_and(|r| r.is_empty()) {
             rows.pop();
         }
         rows.join("\n")
+    }
+
+    /// The colour of the first foreground pixel in cell row `cy`, or `None`
+    /// for a blank row.
+    ///
+    /// [`Ppm::bit`] deliberately throws hue away — it has to, or a red glyph
+    /// would not decode — so nothing in `text()` can tell the alert highlight
+    /// from ordinary white. This is where that claim gets checked.
+    pub fn row_fg(&self, cy: usize) -> Option<[u8; 3]> {
+        for y in cy * GLYPH_H..(cy + 1) * GLYPH_H {
+            for x in 0..self.width {
+                let p = self.pixels[y * self.width + x];
+                if p[0].max(p[1]).max(p[2]) >= FG_THRESHOLD {
+                    return Some(p);
+                }
+            }
+        }
+        None
+    }
+
+    /// The fill colour, read from the bottom-right pixel. The renderer paints
+    /// at most `MAX_ROWS` rows and never the last column of a glyph cell, so
+    /// this corner carries the fill and nothing else.
+    pub fn fill(&self) -> [u8; 3] {
+        self.pixels[self.width * self.height - 1]
+    }
+
+    /// The index of the first cell row containing `needle`.
+    pub fn row_index(&self, needle: &str) -> Option<usize> {
+        self.rows().iter().position(|r| r.contains(needle))
     }
 
     /// Whether every pixel matches `other`. The C6b negative test's whole
@@ -141,8 +179,9 @@ impl Font {
             let mut g = [0u8; GLYPH_H];
             g.copy_from_slice(&raw[i * GLYPH_H..(i + 1) * GLYPH_H]);
             bitmaps.push(g);
-            // A duplicate would make decoding ambiguous; the generator checks
-            // for it, and this is where that check pays off.
+            // A duplicate would make decoding ambiguous. Nothing on the
+            // generator side checks for it, so this assert is the only check
+            // there is — it runs on every suite via screen_decoder.
             assert!(
                 by_bitmap.insert(g, (FIRST_CH + i as u8) as char).is_none(),
                 "font8x16.bin: two glyphs share a bitmap"

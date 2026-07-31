@@ -207,6 +207,24 @@ impl QemuInstance {
         super::screen::Ppm::parse(&bytes)
     }
 
+    /// Screendump until the decoded screen carries `needle`, or the timeout.
+    ///
+    /// The halt_all_cpus paths paint before they flush, so a marker on serial
+    /// already proves the paint finished and one dump is enough. The panic
+    /// handler's own path is the other way round — the drain is what emits the
+    /// report, and the paint happens after it — so there the host has to look
+    /// more than once.
+    pub fn screendump_until(&mut self, needle: &str, timeout: Duration) -> super::screen::Ppm {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let dump = self.screendump();
+            if dump.text().contains(needle) || Instant::now() >= deadline {
+                return dump;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+
     /// Everything the guest put on the 16550 before it switched to the
     /// virtio-console — the only record a guest that died early leaves.
     pub fn uart_log(&self) -> String {

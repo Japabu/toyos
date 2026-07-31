@@ -34,13 +34,24 @@ const AUDIO_SMP: &[u32] = &[1, 8];
 // the guest they test is halted by the time they assert. `screen_decoder`
 // needs no guest at all; it proves the decoder against a bitmap it rendered
 // itself, before anything points it at a real screen.
+/// Feature-carrying tests last: each distinct kernel feature set is one more
+/// kernel rebuild, and ending on one leaves the plain-kernel tests above it
+/// untouched by the thrash.
 const SCREEN_TESTS: &[&str] = &[
     "screen_decoder",
-    "screen_early_panic",
     "screen_boot_checkpoint",
-    "screen_fatal_halt",
     "screen_recoverable_untouched",
+    "screen_early_panic",
+    "screen_late_panic",
+    "screen_fatal_halt",
 ];
+
+/// The renderer's two text colours, as the screendump reports them.
+const WHITE: [u8; 3] = [0xFF, 0xFF, 0xFF];
+const ALERT: [u8; 3] = [0xFF, 0x50, 0x50];
+/// And its two fills: dark red for a halted machine, black for a checkpoint.
+const FILL_FATAL: [u8; 3] = [0x60, 0x00, 0x00];
+const FILL_BOOT: [u8; 3] = [0x00, 0x00, 0x00];
 
 /// The line `SYS_DEBUG` action 3 logs immediately before halting every CPU.
 /// Action 3 exists only under the `test-fatal-halt` kernel feature, which
@@ -940,6 +951,35 @@ fn print_screen(name: &str, text: &str) {
     }
 }
 
+/// Assert the two colour decisions `text()` cannot see: the fill, and the
+/// alert highlight on a `!!!` line against white everywhere else.
+fn check_colors(dump: &screen::Ppm, fill: [u8; 3], alert_line: &str) -> Result<(), String> {
+    if dump.fill() != fill {
+        return Err(format!("fill is {:?}, want {fill:?}", dump.fill()));
+    }
+    let rows = dump.rows();
+    let Some(cy) = dump.row_index(alert_line) else {
+        return Err(format!("{alert_line:?} not on screen"));
+    };
+    if dump.row_fg(cy) != Some(ALERT) {
+        return Err(format!(
+            "{alert_line:?} drawn in {:?}, want alert {ALERT:?}",
+            dump.row_fg(cy)
+        ));
+    }
+    let Some(plain) = rows.iter().position(|r| !r.is_empty() && !r.contains("!!!")) else {
+        return Err("no ordinary row to compare the highlight against".to_string());
+    };
+    if dump.row_fg(plain) != Some(WHITE) {
+        return Err(format!(
+            "ordinary row {:?} drawn in {:?}, want white {WHITE:?}",
+            rows[plain],
+            dump.row_fg(plain)
+        ));
+    }
+    Ok(())
+}
+
 /// Run one screen test. `Err` carries the decoded screen, because a failure
 /// here is almost always "the text is not what I expected" and the decoded
 /// grid is the only readable form of that.
@@ -971,13 +1011,15 @@ fn run_screen_test(
                     ..Default::default()
                 },
             );
-            let text = qemu.screendump().text();
+            let dump = qemu.screendump();
+            let text = dump.text();
             print_screen(name, &text);
             for want in ["!!! EARLY PANIC !!!", "test-early-panic: on-screen console check"] {
                 if !text.contains(want) {
                     return Err(format!("{want:?} not on screen\ndecoded screen:\n{text}"));
                 }
             }
+            check_colors(&dump, FILL_FATAL, "!!! EARLY PANIC !!!")?;
             Ok(())
         }
         "screen_boot_checkpoint" => {
@@ -994,13 +1036,70 @@ fn run_screen_test(
                     ..Default::default()
                 },
             );
-            let text = qemu.screendump().text();
+            let dump = qemu.screendump();
+            let text = dump.text();
             print_screen(name, &text);
             for want in ["Boot: devices ready", "Boot: complete"] {
                 if !text.contains(want) {
                     return Err(format!("{want:?} not on screen\ndecoded screen:\n{text}"));
                 }
             }
+            // The fill is the whole difference between "still booting" and
+            // "halted", and the decoder is colour-blind by construction.
+            if dump.fill() != FILL_BOOT {
+                return Err(format!(
+                    "boot checkpoint fill is {:?}, want {FILL_BOOT:?}",
+                    dump.fill()
+                ));
+            }
+            // Wrap, not clip — the reason the renderer wraps is that a
+            // demangled Rust symbol lives at the *end* of a backtrace line,
+            // which is exactly what a clip drops. The one line in this tree
+            // wider than the grid is KernelArgs' derived Debug (~600 chars
+            // against 256 columns), and `boot_pml4_addr` is its last field.
+            let rows = dump.rows();
+            let Some(head) = dump.row_index("KernelArgs {") else {
+                return Err(format!("no KernelArgs line on screen\n{text}"));
+            };
+            if rows[head].contains("boot_pml4_addr") {
+                return Err("KernelArgs fit one display row; wrap is not exercised".to_string());
+            }
+            if !rows[head..].iter().take(4).any(|r| r.contains("boot_pml4_addr")) {
+                return Err(format!(
+                    "the tail of the KernelArgs line never reached the screen — clipped?\n{text}"
+                ));
+            }
+            Ok(())
+        }
+        "screen_late_panic" => {
+            // The ordinary fatal panic, which no userland process can produce:
+            // crash_report, capture, panic_flush, halt_all_cpus, render. The
+            // flush drains the ring before the paint, so the snapshot capture()
+            // took is the only thing left to paint from.
+            let mut qemu = QemuInstance::boot_with_options(
+                test_config,
+                c_bins,
+                rust_bins,
+                BootOptions {
+                    display: qemu::Display::Gop,
+                    qmp: true,
+                    kernel_features: &["test-late-panic"],
+                    ready_marker: "!!! PANIC !!!",
+                    ..Default::default()
+                },
+            );
+            // Here the marker reaches serial *before* the paint — the drain is
+            // what emits it — so unlike the halt paths this one has to look
+            // more than once.
+            let dump = qemu.screendump_until("!!! PANIC !!!", Duration::from_secs(10));
+            let text = dump.text();
+            print_screen(name, &text);
+            for want in ["!!! PANIC !!!", "test-late-panic: on-screen console check"] {
+                if !text.contains(want) {
+                    return Err(format!("{want:?} not on screen\ndecoded screen:\n{text}"));
+                }
+            }
+            check_colors(&dump, FILL_FATAL, "!!! PANIC !!!")?;
             Ok(())
         }
         "screen_fatal_halt" => {
@@ -1026,12 +1125,16 @@ fn run_screen_test(
             ) {
                 return Err(format!("{FATAL_HALT_NONCE:?} never reached the console"));
             }
-            let text = qemu.screendump().text();
+            let dump = qemu.screendump();
+            let text = dump.text();
             print_screen(name, &text);
             if !text.contains(FATAL_HALT_NONCE) {
                 return Err(format!(
                     "{FATAL_HALT_NONCE:?} reached serial but not the screen\ndecoded screen:\n{text}"
                 ));
+            }
+            if dump.fill() != FILL_FATAL {
+                return Err(format!("fatal fill is {:?}, want {FILL_FATAL:?}", dump.fill()));
             }
             Ok(())
         }
@@ -1053,8 +1156,20 @@ fn run_screen_test(
             );
             let before = qemu.screendump();
             let result = qemu.run_test("test_rs_test_panic_child", Duration::from_secs(15));
+            // The premise, not a formality: a timeout returns exit_code None,
+            // which the old `!= Some(0)` check accepted — so a panic that
+            // never fired left two identical screendumps and a green test.
+            if let Some(err) = &result.error {
+                return Err(format!("the recoverable panic never completed: {err}"));
+            }
             if result.exit_code == Some(0) {
                 return Err("recoverable panic did not kill the child".to_string());
+            }
+            if !result.serial.contains("SYS_DEBUG: kernel panic triggered by userspace") {
+                return Err(format!(
+                    "no kernel panic in the child's output\nserial:\n{}",
+                    result.serial
+                ));
             }
             let after = qemu.screendump();
             if !before.identical_to(&after) {
@@ -1385,9 +1500,11 @@ fn main() {
         }
     }
 
-    // Last, because they are the only tests that toggle a kernel feature and
-    // so force a kernel rebuild; running them here confines that to one
-    // rebuild per invocation instead of two.
+    // Last, because they are the only tests that build a kernel with features
+    // on. Three of them do, one feature each, so the block costs three kernel
+    // rebuilds; running it here keeps every plain-kernel test above it out of
+    // the thrash, and SCREEN_TESTS puts the three at the end for the same
+    // reason.
     if !screen_to_run.is_empty() {
         eprintln!("  --- screen ---");
         for name in &screen_to_run {

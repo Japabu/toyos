@@ -14,6 +14,10 @@ test-early-panic = []
 # SYS_DEBUG action 3: halt every CPU on demand. A test needs a fatal path it
 # can trigger from userland; a shipped kernel must not have one.
 test-fatal-halt = []
+# Panic once the boot phases are done, with no thread current, so a test can
+# drive the ordinary fatal panic — the one path where the report reaches the
+# screen only because the panic handler captured it before draining the ring.
+test-late-panic = []
 
 # debug-assertions and overflow-checks stay on: fail-fast beats speed here.
 [profile.dev]
