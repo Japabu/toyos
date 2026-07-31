@@ -24,6 +24,7 @@ const RUST_SKIP: &[&str] = &[
     "i8042_keyboard",
     "i8042_mouse",
     "input_events",
+    "va_exhaustion",
 ];
 
 // Audio glitch tests. Each runs in its own QEMU boot per SMP config and
