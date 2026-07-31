@@ -50,10 +50,20 @@ pub fn create_boot_image(initrd_bytes: &[u8], profile: &str) -> Vec<u8> {
     create_gpt_disk(esp_volume)
 }
 
+/// A raw block device rejects a write that is not a whole number of sectors, so
+/// an image whose length is not sector-aligned cannot be `dd`'d to a USB stick —
+/// the final partial write fails with `EINVAL` and the tail, including the
+/// backup GPT, never lands. QEMU reads the image as a file and never noticed.
+const SECTOR: usize = 4096;
+
+fn round_up_sectors(n: usize) -> usize {
+    n.div_ceil(SECTOR) * SECTOR
+}
+
 pub fn create_fat_volume(kernel: &[u8], bootloader: &[u8], initrd: &[u8]) -> Vec<u8> {
     let content_size = kernel.len() + bootloader.len() + initrd.len();
     // FAT32 requires at least 65525 clusters; ensure volume is large enough
-    let total_size = (content_size + 4 * 1024 * 1024).max(34 * 1024 * 1024);
+    let total_size = round_up_sectors((content_size + 4 * 1024 * 1024).max(34 * 1024 * 1024));
 
     let mut volume = vec![0u8; total_size];
 
@@ -97,7 +107,8 @@ pub fn create_fat_volume(kernel: &[u8], bootloader: &[u8], initrd: &[u8]) -> Vec
 
 pub fn create_gpt_disk(esp_volume: Vec<u8>) -> Vec<u8> {
     let overhead = 100 * 1024; // 100 KiB for GPT headers
-    let total_size = esp_volume.len() + overhead;
+    let total_size = round_up_sectors(esp_volume.len() + overhead);
+    assert_eq!(total_size % 512, 0, "image must be a whole number of 512-byte sectors to be flashable");
     let mut disk = vec![0u8; total_size];
 
     let mut cursor = Cursor::new(&mut disk);
