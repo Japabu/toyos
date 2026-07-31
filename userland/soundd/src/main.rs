@@ -580,19 +580,6 @@ fn mix_thread(
     // inside the pipeline covers it. Move it only with a full re-baseline.
     assert!(num_buffers > 5, "soundd: pipeline too shallow to defer safely");
     let refill_floor_nanos = 5 * period_nanos;
-    // Grace between the pipeline draining and the PCM STOP (§5.8). Zero, and
-    // policy like `refill_floor_nanos` above, not physics: virtio STOP does
-    // not RELEASE — SET_PARAMS and PREPARE stay valid, resume is one control
-    // verb inline with the first submit — so there is no codec pop or
-    // renegotiation for grace to amortize, and an immediate stop is what puts
-    // the suspend markers inside the audio gate's serial window on every run.
-    // The one event that makes this nonzero is a hardware backend that pops
-    // on stop, advertised per-backend through `AudioInfo`. Implement grace
-    // then as a clock comparison against a drain stamp at the idle wakes that
-    // still arrive while buffers play out — never an armed timer. The assert
-    // trips the build so the value cannot change without that rework.
-    const SUSPEND_AFTER_DRAIN_NANOS: u64 = 0;
-    const _: () = assert!(SUSPEND_AFTER_DRAIN_NANOS == 0);
 
     let mut streams: Vec<ClientStream> = Vec::new();
     // Boot starts SUSPENDED (§5.8): every buffer free, nothing submitted, the
@@ -604,6 +591,18 @@ fn mix_thread(
     // the last stop. Owned here: the kernel's own started flag is not
     // readable, and the two agree because every submit starts a stopped
     // stream and only the suspend block below stops it.
+    //
+    // Establish that agreement instead of assuming it. `false` is a claim
+    // about kernel state, and it is only true if no soundd ran before this
+    // one: the audio claim is released on descriptor close, so a soundd that
+    // died inside the drain window — last completion drained, STOP not yet
+    // issued — leaves the stream STARTED with an empty queue, and a successor
+    // that merely believed it stopped would park forever with the host voice
+    // open in permanent underrun, at exactly zero CPU. One STOP makes the
+    // belief true. It costs nothing on an ordinary boot: the kernel's
+    // `SoundController::stop` returns without a controlq round trip or a log
+    // line when the stream is already stopped.
+    audio_dev.stop().expect("soundd holds the audio device claim");
     let mut started = false;
     // Wall clock at the last instant the pipeline was known full. Re-stamped
     // after every refill; read only by the drain count site.
@@ -885,10 +884,8 @@ fn mix_thread(
             // played out, in which case the device restarts from now.
             playout_until_ns = playout_until_ns.max(now) + period_nanos;
             refilled = true;
-            if !streams.is_empty() {
-                stats.submitted += 1;
-                if any_streaming && !any_data { stats.underruns += 1; }
-            }
+            stats.submitted += 1;
+            if any_streaming && !any_data { stats.underruns += 1; }
         }
         // Deferred buffers stay free and are reconsidered next cycle, by which
         // point the client has had another signal-to-mix window to produce.
@@ -916,8 +913,21 @@ fn mix_thread(
         });
 
         // §5.8 DRAINING → SUSPENDED, on the completion that frees the last
-        // buffer. `SUSPEND_AFTER_DRAIN_NANOS` is zero, so the stop is
-        // immediate. This block must not move into the full-drain site above:
+        // buffer. The stop is immediate: grace between the drain and the PCM
+        // STOP is zero, and that is policy like `refill_floor_nanos` above,
+        // not physics. virtio STOP does not RELEASE — SET_PARAMS and PREPARE
+        // stay valid and resume is one control verb inline with the first
+        // submit — so there is no codec pop or renegotiation for grace to
+        // amortize, and stopping at once is what puts the suspend markers
+        // inside the audio gate's serial window on every run. The one event
+        // that makes grace nonzero is a hardware backend that pops on stop,
+        // advertised per-backend through `AudioInfo`; implement it then as a
+        // clock comparison against a drain stamp, evaluated at the idle wakes
+        // that still arrive while the buffers play out — never as an armed
+        // timer, which would put a periodic wake back into the idle path this
+        // whole state exists to empty.
+        //
+        // This block must not move into the full-drain site above:
         // that site is gated on `deferred_last == 0`, and a final streaming
         // cycle that deferred plus a whole-pipeline completion batch — QEMU's
         // routine cadence — would skip it, parking soundd forever with the
