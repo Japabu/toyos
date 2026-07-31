@@ -135,10 +135,14 @@ pub fn enable_sse() {
     }
 }
 
-/// Enable SMEP (Supervisor Mode Execution Prevention).
+/// Enable SMEP (Supervisor Mode Execution Prevention). Returns whether the
+/// CPU had it.
+///
 /// When enabled, the kernel cannot execute code on user-accessible pages.
-/// Must be called on each CPU during init.
-pub fn enable_smep() {
+/// Must be called on each CPU during init — silently, because every CPU in a
+/// machine answers this identically and `percpu::init_bsp` reports the answer
+/// once for all of them.
+pub fn enable_smep() -> bool {
     // Check CPUID leaf 7, subleaf 0, EBX bit 7
     let ebx: u32;
     unsafe {
@@ -157,8 +161,7 @@ pub fn enable_smep() {
         );
     }
     if ebx & (1 << 7) == 0 {
-        crate::log!("cpu: SMEP not supported, skipping");
-        return;
+        return false;
     }
     unsafe {
         asm!(
@@ -169,13 +172,16 @@ pub fn enable_smep() {
             options(nostack),
         );
     }
-    crate::log!("cpu: SMEP enabled");
+    true
 }
 
-/// Enable SMAP (Supervisor Mode Access Prevention).
+/// Enable SMAP (Supervisor Mode Access Prevention). Returns whether the CPU
+/// had it.
+///
 /// When enabled, kernel code cannot access user pages unless RFLAGS.AC=1 (set by STAC).
-/// Must be called on each CPU during init.
-pub fn enable_smap() {
+/// Must be called on each CPU during init; silent for the same reason as
+/// [`enable_smep`].
+pub fn enable_smap() -> bool {
     // Check CPUID leaf 7, subleaf 0, EBX bit 20
     // rbx cannot be used as an inline asm operand in Rust, so save/restore manually.
     let ebx: u32;
@@ -195,8 +201,7 @@ pub fn enable_smap() {
         );
     }
     if ebx & (1 << 20) == 0 {
-        crate::log!("cpu: SMAP not supported, skipping");
-        return;
+        return false;
     }
     unsafe {
         asm!(
@@ -208,7 +213,7 @@ pub fn enable_smap() {
             options(nostack),
         );
     }
-    crate::log!("cpu: SMAP enabled");
+    true
 }
 
 /// Enable FSGSBASE instructions (rdfsbase, rdgsbase, wrfsbase, wrgsbase).

@@ -232,17 +232,31 @@ pub fn init_bsp(lapic_id: u32) {
 
     unsafe { percpu.load_gdt(); }
     cpu::enable_sse();
-    cpu::enable_smep();
-    cpu::enable_smap();
+    let smep = cpu::enable_smep();
+    let smap = cpu::enable_smap();
     cpu::enable_fsgsbase();
-    crate::mm::paging::enable_pcid();
+    let pcid = crate::mm::paging::enable_pcid();
 
     cpu::wrmsr(MSR_GS_BASE, ptr as u64);
 
     // GS base is now valid — enable CPU/TID context in log! macro
     crate::log::PERCPU_READY.store(true, core::sync::atomic::Ordering::Release);
 
-    log!("percpu: BSP cpu_id=0 lapic_id={}", lapic_id);
+    // One line for the whole machine. Every CPU runs the identical sequence
+    // against identical silicon, so the per-CPU repetition this replaces was
+    // 4 lines times the core count of noise carrying one bit each — 28 of the
+    // T14's ~150 boot lines, on a screen that holds 67. Reported rather than
+    // asserted: on TCG none of the three is available, and a line claiming
+    // otherwise would be a diagnostic that lies on the only machine most of
+    // this tree's boots happen on.
+    log!(
+        "percpu: BSP cpu_id=0 lapic_id={} smep={} smap={} pcid={}",
+        lapic_id, on(smep), on(smap), on(pcid)
+    );
+}
+
+fn on(enabled: bool) -> &'static str {
+    if enabled { "on" } else { "off" }
 }
 
 /// Allocate percpu for an AP on the BSP. Returns the raw pointer for the trampoline
@@ -256,6 +270,9 @@ pub fn alloc_ap(cpu_id: u32, lapic_id: u32) -> *mut PerCpu {
 }
 
 /// Finish AP percpu initialization (called from ap_entry after GS base is set by trampoline).
+///
+/// Silent throughout: `boot_aps` already logs one line per AP that came up,
+/// and this CPU's answers to the feature questions are the BSP's answers.
 pub fn init_ap(percpu_ptr: *mut PerCpu) {
     let percpu = unsafe { &mut *percpu_ptr };
     unsafe { percpu.load_gdt(); }
@@ -264,8 +281,6 @@ pub fn init_ap(percpu_ptr: *mut PerCpu) {
     cpu::enable_smap();
     cpu::enable_fsgsbase();
     crate::mm::paging::enable_pcid();
-
-    log!("percpu: AP cpu_id={} lapic_id={}", percpu.cpu_id, percpu.lapic_id);
 }
 
 /// Update both the percpu kernel_rsp (for syscall entry) and tss.rsp0 (for interrupts).

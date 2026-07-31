@@ -45,6 +45,13 @@ pub fn init(hpet_base: u64) {
     log!("TSC: {}MHz (period={}fs, calibrated over {}ms)", tsc_freq_mhz, tsc_period_fs, calibration_ns / 1_000_000);
 }
 
+/// Whether [`nanos_since_boot`] measures anything yet. Before [`init`] the TSC
+/// period is zero and every reading is zero, so a caller that waits on a
+/// deadline would wait forever.
+pub fn calibrated() -> bool {
+    TSC_PERIOD_FS.load(Relaxed) != 0
+}
+
 /// Returns nanoseconds since boot. Lock-free, no MMIO.
 pub fn nanos_since_boot() -> u64 {
     let delta = cpu::rdtsc() - TSC_BOOT.load(Relaxed);

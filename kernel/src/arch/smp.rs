@@ -212,7 +212,6 @@ pub fn boot_aps(madt: &MadtInfo, boot_cr3: u64) {
         unsafe { core::ptr::write_unaligned(target, data); }
 
         AP_STARTED.store(false, Ordering::Release);
-        log!("SMP: starting AP (LAPIC ID {})", ap_id);
 
         // INIT-SIPI-SIPI sequence
         apic::send_init(ap_id);
@@ -232,11 +231,17 @@ pub fn boot_aps(madt: &MadtInfo, boot_cr3: u64) {
             core::hint::spin_loop();
         }
 
+        // One line per AP, carrying both halves of the identity: the cpu_id is
+        // assigned here and appears in every later log prefix, the lapic_id is
+        // what the INIT-SIPI-SIPI went to, and nothing else prints the pairing.
+        // It is what lets the three lines this replaced go — `starting AP`,
+        // `percpu: AP`, and the AP's own `Hello from CPU` each restated a
+        // subset of it, four lines per core on a machine with eight.
         if AP_STARTED.load(Ordering::Acquire) {
             CPU_COUNT.fetch_add(1, Ordering::Relaxed);
-            log!("SMP: AP {} online", ap_id);
+            log!("SMP: AP cpu{} lapic={} online", ap_cpu_id, ap_id);
         } else {
-            log!("SMP: AP {} failed to start!", ap_id);
+            log!("SMP: AP cpu{} lapic={} failed to start!", ap_cpu_id, ap_id);
         }
     }
 }
@@ -252,7 +257,6 @@ extern "C" fn ap_entry() -> ! {
     apic::init_ap();
     apic::init_timer_ap();
 
-    log!("Hello from CPU {} (LAPIC ID {})", percpu::cpu_id(), apic::id());
     AP_STARTED.store(true, Ordering::Release);
 
     // Wait for BSP to finish kernel init

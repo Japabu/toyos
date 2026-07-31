@@ -106,17 +106,18 @@ const CR3_ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 /// True when CR4.PCIDE + INVPCID are active.
 static PCID_ACTIVE: AtomicBool = AtomicBool::new(false);
 
-/// Enable PCID if the CPU supports both PCID and INVPCID.
+/// Enable PCID if the CPU supports both PCID and INVPCID. Returns whether it
+/// is now active; when it is not, context switches flush the whole TLB.
+///
 /// Without INVPCID there's no way to flush all PCIDs, so PCID alone is useless.
-/// Must be called on each CPU. CR3 must have PCID 0 when called.
-pub fn enable_pcid() {
-    use crate::arch::cpu;
-    if cpu::enable_pcid() {
+/// Must be called on each CPU. CR3 must have PCID 0 when called. Silent:
+/// `percpu::init_bsp` reports the answer once for the machine.
+pub fn enable_pcid() -> bool {
+    let active = crate::arch::cpu::enable_pcid();
+    if active {
         PCID_ACTIVE.store(true, Ordering::Relaxed);
-        crate::log!("cpu: PCID + INVPCID enabled");
-    } else {
-        crate::log!("cpu: PCID not available, context switches will flush TLB");
     }
+    active
 }
 
 pub fn pcid_active() -> bool {

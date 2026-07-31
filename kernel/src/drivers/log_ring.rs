@@ -21,6 +21,17 @@
 //! (`write_chunk_blocking`) instead throttles on a full ring, draining
 //! synchronously: the console is the test-harness protocol channel and must be
 //! lossless.
+//!
+//! **A drain moves the serial cursor; it does not erase.** `tail`/`len` are
+//! what serial still owes the host; `retained` is what is still *readable*
+//! behind `head`, and only a wrap past 64 KiB shortens it. The difference is
+//! the on-screen console's whole existence: it has no cursor of its own, and
+//! before this it read `len` — so on a machine with a UART the idle loop
+//! emptied the ring within milliseconds and a fatal panic painted the one line
+//! logged since the last drain, while on a machine *without* one the drain
+//! threw the boot log into a backend that discards it. Both are the same bug
+//! from opposite ends, and neither is visible to a host that has the serial
+//! stream anyway.
 
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -30,13 +41,19 @@ const RING_SIZE: usize = 64 * 1024;
 struct LogRing {
     buf: [u8; RING_SIZE],
     head: usize,
+    /// Where the next drain reads from, and `len` how much it owes. Both are
+    /// serial's bookkeeping alone.
     tail: usize,
     len: usize,
+    /// Bytes behind `head` that have not been overwritten, so at most
+    /// `RING_SIZE`. Independent of draining, which is what makes it the
+    /// window the on-screen console reads.
+    retained: usize,
 }
 
 impl LogRing {
     const fn new() -> Self {
-        Self { buf: [0; RING_SIZE], head: 0, tail: 0, len: 0 }
+        Self { buf: [0; RING_SIZE], head: 0, tail: 0, len: 0, retained: 0 }
     }
 
     fn append(&mut self, data: &[u8]) -> usize {
@@ -50,6 +67,9 @@ impl LogRing {
             self.buf[self.head] = b;
             self.head = (self.head + 1) % RING_SIZE;
             self.len += 1;
+            if self.retained < RING_SIZE {
+                self.retained += 1;
+            }
         }
         dropped
     }
@@ -259,11 +279,16 @@ pub unsafe fn drain_unlocked(out: &mut [u8]) -> usize {
     if ring.tail >= RING_SIZE {
         ring.tail = 0;
     }
+    // `retained` is deliberately not touched: this is the panic path's last
+    // resort and the on-screen console reads the ring *after* it runs.
     ring.drain_into(out)
 }
 
-/// Copy the newest `out.len()` bytes out of the ring without taking the lock
-/// and without consuming them. Returns the number copied.
+/// Copy the newest `out.len()` retained bytes out of the ring without taking
+/// the lock and without consuming them. Returns the number copied.
+///
+/// Reads `retained`, not `len`: what the console shows must not depend on
+/// whether serial happens to have collected it already.
 ///
 /// Strictly weaker than `drain_unlocked`: it takes no lock for the same
 /// reason, but it mutates nothing at all — not the cursors, not the clamps.
@@ -280,7 +305,7 @@ pub unsafe fn drain_unlocked(out: &mut [u8]) -> usize {
 /// enabled and IRQ handlers logging: a torn line on screen, nothing more.
 pub unsafe fn peek_tail(out: &mut [u8]) -> usize {
     let ring = unsafe { &*RING.0.get() };
-    let len = ring.len.min(RING_SIZE);
+    let len = ring.retained.min(RING_SIZE);
     let head = if ring.head >= RING_SIZE { 0 } else { ring.head };
     let n = len.min(out.len());
     let start = (head + RING_SIZE - n) % RING_SIZE;

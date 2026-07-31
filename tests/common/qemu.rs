@@ -370,11 +370,13 @@ impl QemuInstance {
 
     /// Screendump until the decoded screen carries `needle`, or the timeout.
     ///
-    /// The halt_all_cpus paths paint before they flush, so a marker on serial
-    /// already proves the paint finished and one dump is enough. The panic
-    /// handler's own path is the other way round — the drain is what emits the
-    /// report, and the paint happens after it — so there the host has to look
-    /// more than once.
+    /// Every fatal path needs this, for one of two reasons. The panic
+    /// handler's own path paints after the drain that emits the report, so a
+    /// marker on serial does not yet prove a paint. The halt_all_cpus paths
+    /// are the other way round and once *did* need only a single dump — but a
+    /// report too long for one screen now pages, so the screen a marker
+    /// proves is only the first of several and any given dump may hold a
+    /// different one.
     pub fn screendump_until(&mut self, needle: &str, timeout: Duration) -> super::screen::Ppm {
         self.screendump_while(timeout, Duration::from_millis(100), |dump| {
             dump.text().contains(needle)

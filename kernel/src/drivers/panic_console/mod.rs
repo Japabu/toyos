@@ -30,6 +30,19 @@
 //! [`discard_capture`] drops what it captured -- otherwise the next fatal
 //! path would paint a crash the machine already survived.
 //!
+//! The screen is smaller than the report. A 1080p panel is 67 rows and a boot
+//! log is ~85 display rows before a backtrace is added, so a single paint is a
+//! window over the *newest* end and everything above it is unreachable -- on a
+//! machine whose input is dead there is no key to press for the rest. So the
+//! text is paginated, and [`page_forever`] advances the page on a deadline
+//! after the machine has halted: a phone camera left running collects the
+//! whole thing. Paging happens only when the text does not fit, and the
+//! `[page n/m]` footer is what tells a photograph which slice it caught.
+//!
+//! That the halted machine spins rather than `hlt`s is the cost, and it is
+//! paid knowingly: nothing would wake it, and re-arming the LAPIC timer would
+//! aim an interrupt at the scheduler from inside a panic.
+//!
 //! virtio-gpu is deliberately not supported. Reaching its scanout needs
 //! TRANSFER_TO_HOST_2D and RESOURCE_FLUSH through `submit_and_wait`'s
 //! unbounded poll behind `GPU.lock()` -- exactly the wedge family this module
@@ -60,11 +73,16 @@ const GLYPH_H: usize = 16;
 const MAX_COLS: usize = 320;
 const MAX_ROWS: usize = 96;
 
-/// Half the log ring, sized by the assertion below: the on-screen budget must
-/// never exceed what was captured, or the top of the screen would show text
-/// the snapshot never held.
+/// Half the log ring, sized by the assertion below: one screenful must never
+/// exceed what was captured, or the top of a page would show text the snapshot
+/// never held. Paging spends the rest — at the ~70 bytes per display row a
+/// kernel log actually averages, 32 KiB is around five 96-row pages.
 const SNAPSHOT_CAP: usize = 32 * 1024;
 const _: () = assert!(SNAPSHOT_CAP >= MAX_ROWS * MAX_COLS);
+
+/// How long each page stays up. Long enough to photograph, short enough that
+/// a five-page report cycles inside a 15-second video.
+const PAGE_HOLD_NS: u64 = 3_000_000_000;
 
 /// The bootloader identity+high maps the first 4 GiB, and `paging::init`
 /// re-maps at least that much. A framebuffer below this line is therefore
@@ -356,20 +374,77 @@ fn live_tail() -> &'static [u8] {
 // fault path runs on IST1, which is 4096 bytes and already partly consumed by
 // kernel_backtrace_safe.
 
-/// Paint the captured report. Fatal paths only.
-pub fn render() {
-    if PAINTING.swap(true, Ordering::SeqCst) {
-        return;
-    }
+/// What a fatal path paints: the captured report, or -- for a path that
+/// reached `halt_all_cpus` without the panic handler, a fatal exception or the
+/// scheduler abort -- the live ring, which still holds it.
+///
+/// Idempotent for the captured case, which is the one [`page_forever`] walks
+/// repeatedly: `SNAPSHOT` is written once and never again. The live branch
+/// re-peeks, and tolerates a sibling still logging for the same reason
+/// [`live_tail`] always did.
+fn fatal_text() -> &'static [u8] {
     let captured = SNAPSHOT_LEN.load(Ordering::Relaxed).min(SNAPSHOT_CAP);
     if captured > 0 {
         let base = SNAPSHOT.0.get().cast::<u8>();
-        paint(Fill::Fatal, unsafe { core::slice::from_raw_parts(base, captured) });
+        unsafe { core::slice::from_raw_parts(base, captured) }
     } else {
-        // Reached `halt_all_cpus` without the panic handler -- a fatal
-        // exception, the scheduler abort -- so nothing captured and the ring
-        // still holds the report `panic_flush` is about to drain.
-        paint(Fill::Fatal, live_tail());
+        live_tail()
+    }
+}
+
+/// Paint the newest page of the captured report. Fatal paths only. Returns
+/// whether this call is the one that took the screen, which is what entitles
+/// its caller -- and only its caller -- to go on to [`page_forever`].
+pub fn render() -> bool {
+    if PAINTING.swap(true, Ordering::SeqCst) {
+        return false;
+    }
+    paint(Fill::Fatal, fatal_text(), Page::Last);
+    true
+}
+
+/// Cycle the report across the screen until the machine is switched off.
+///
+/// Reached only from `halt_all_cpus`, only after `panic_flush`, and only on
+/// the CPU whose [`render`] took `PAINTING` -- so the serial report is already
+/// out and nothing here can cost it, and no second CPU can be painting
+/// alongside. Returns without looping when there is nothing to page: a single
+/// page, no framebuffer, or a panic early enough that the TSC is uncalibrated
+/// and there is no deadline to wait on.
+///
+/// The panic handler's other two exits call [`render`] and not this, and the
+/// reasons are different. The early-boot branch is before `clock::init`, so
+/// the deadline does not exist yet -- and its report is four rows. The reentry
+/// branch is a panic inside the panic path: it has to stop, not settle into a
+/// loop that would keep a CPU in the code that just faulted.
+pub fn page_forever() {
+    if !crate::clock::calibrated() {
+        return;
+    }
+    let text = fatal_text();
+    let Some(fb) = snapshot() else { return };
+    let Some((cols, grid_rows)) = geometry(&fb) else { return };
+    let (_, pages, _) = pagination(text, cols, grid_rows);
+    if pages < 2 {
+        return;
+    }
+    let mut page = 0;
+    loop {
+        hold(PAGE_HOLD_NS);
+        paint(Fill::Fatal, text, Page::Nth(page));
+        page += 1;
+        if page == pages {
+            page = 0;
+        }
+    }
+}
+
+/// Busy-wait `nanos`. `nanos_since_boot` is an `rdtsc` and two relaxed loads --
+/// no lock, no MMIO, nothing the panic path is forbidden to touch.
+fn hold(nanos: u64) {
+    let target = crate::clock::nanos_since_boot().saturating_add(nanos);
+    while crate::clock::nanos_since_boot() < target {
+        core::hint::spin_loop();
     }
 }
 
@@ -388,8 +463,18 @@ pub fn boot_checkpoint() {
     if PAINTING.swap(true, Ordering::SeqCst) {
         return;
     }
-    paint(Fill::Boot, live_tail());
+    paint(Fill::Boot, live_tail(), Page::Last);
     PAINTING.store(false, Ordering::SeqCst);
+}
+
+/// Which slice of the text a paint shows.
+#[derive(Clone, Copy)]
+enum Page {
+    /// The newest screenful, whatever the page grid says. A report must fill
+    /// the screen it is painted on; a page-aligned last page would leave the
+    /// bottom two thirds blank whenever the row count divides badly.
+    Last,
+    Nth(usize),
 }
 
 /// The fill colour carries "halted" versus "still booting" at zero cost, and
@@ -401,12 +486,100 @@ enum Fill {
     Boot,
 }
 
-fn paint(fill: Fill, text: &[u8]) {
+/// The text grid a framebuffer offers, or `None` when it offers none.
+fn geometry(fb: &Fb) -> Option<(usize, usize)> {
+    let cols = (fb.width as usize / GLYPH_W).min(MAX_COLS);
+    let rows = (fb.height as usize / GLYPH_H).min(MAX_ROWS);
+    (cols != 0 && rows != 0).then_some((cols, rows))
+}
+
+/// Display rows `text` occupies, wrapping at `cols`.
+///
+/// Wrap, do not clip: a backtrace line carrying a demangled Rust symbol
+/// routinely exceeds 160 columns and the symbol is the single most valuable
+/// token on the screen.
+fn count_rows(text: &[u8], cols: usize) -> usize {
+    let mut rows = 1;
+    let mut col = 0usize;
+    let mut i = 0usize;
+    while i < text.len() {
+        let newline = text[i] == b'\n';
+        i += 1;
+        col += 1;
+        if newline || col == cols {
+            rows += 1;
+            col = 0;
+        }
+    }
+    rows
+}
+
+/// Total display rows, pages, and rows per page.
+///
+/// A text that fits gets the whole grid and one page, so a screen that never
+/// needed paging is byte-identical to what it was before paging existed. One
+/// that does not fit gives the bottom row to the `[page n/m]` footer, because
+/// a paging console whose page nobody can identify is a slideshow.
+fn pagination(text: &[u8], cols: usize, grid_rows: usize) -> (usize, usize, usize) {
+    let total = count_rows(text, cols);
+    if total <= grid_rows || grid_rows < 2 {
+        return (total, 1, grid_rows);
+    }
+    let per = grid_rows - 1;
+    (total, total.div_ceil(per), per)
+}
+
+/// Byte offsets of display rows `first ..`, one per slot in `out`. Rows past
+/// the end get `text.len()`, which draws nothing.
+fn row_offsets(text: &[u8], cols: usize, first: usize, out: &mut [u32]) {
+    let len = text.len();
+    for slot in out.iter_mut() {
+        *slot = len as u32;
+    }
+    if first == 0 {
+        if let Some(slot) = out.first_mut() {
+            *slot = 0;
+        }
+    }
+    let mut row = 0usize;
+    let mut col = 0usize;
+    let mut i = 0usize;
+    while i < len {
+        let newline = text[i] == b'\n';
+        i += 1;
+        col += 1;
+        if newline || col == cols {
+            row += 1;
+            col = 0;
+            if row >= first {
+                let slot = row - first;
+                if slot >= out.len() {
+                    return;
+                }
+                out[slot] = i as u32;
+            }
+        }
+    }
+}
+
+fn paint(fill: Fill, text: &[u8], page: Page) {
     let Some(fb) = snapshot() else { return };
     if !mapped(&fb) {
         return;
     }
+    let Some((cols, grid_rows)) = geometry(&fb) else { return };
     let len = text.len();
+    let (total, pages, per) = pagination(text, cols, grid_rows);
+    // `Last` is the newest `per` rows rather than page `pages - 1`, so the two
+    // agree on a text that divides evenly and `Last` still fills the screen
+    // when it does not. The overlap that buys is a few repeated rows at the
+    // end of a cycle, which is the cheap direction to be wrong in -- but it
+    // does mean the footer's number cannot be derived from `first`.
+    let newest = total.saturating_sub(per);
+    let (first, shown) = match page {
+        Page::Last => (newest, pages),
+        Page::Nth(n) => (n.saturating_mul(per).min(newest), (n + 1).min(pages)),
+    };
 
     fill_screen(
         &fb,
@@ -416,39 +589,17 @@ fn paint(fill: Fill, text: &[u8]) {
         },
     );
 
-    let cols = (fb.width as usize / GLYPH_W).min(MAX_COLS);
-    let rows = (fb.height as usize / GLYPH_H).min(MAX_ROWS);
-    if cols == 0 || rows == 0 {
-        return;
-    }
+    // The only array in this module and the one place the stack budget
+    // stretches; `per <= MAX_ROWS` is what keeps the slice in bounds.
+    let mut row_start = [0u32; MAX_ROWS];
+    let draw = per.min(total - first).min(MAX_ROWS);
+    row_offsets(text, cols, first, &mut row_start[..draw]);
 
-    // Wrap, do not clip: a backtrace line carrying a demangled Rust symbol
-    // routinely exceeds 160 columns and the symbol is the single most valuable
-    // token on the screen. One forward pass records where each display row
-    // starts, into a ring holding the last MAX_ROWS+1 of them -- the only
-    // array in this module and the one place the stack budget stretches.
-    let mut row_start = [0u32; MAX_ROWS + 1];
-    let mut last = 0usize;
-    let mut col = 0usize;
-    let mut i = 0usize;
-    while i < len {
-        let newline = text[i] == b'\n';
-        i += 1;
-        col += 1;
-        if newline || col == cols {
-            last += 1;
-            row_start[last % (MAX_ROWS + 1)] = i as u32;
-            col = 0;
-        }
-    }
-
-    let draw = rows.min(last + 1);
-    let first = last + 1 - draw;
     let white = rgb(&fb, 0xFF, 0xFF, 0xFF);
     let alert = rgb(&fb, 0xFF, 0x50, 0x50);
 
     for r in 0..draw {
-        let start = row_start[(first + r) % (MAX_ROWS + 1)] as usize;
+        let start = row_start[r] as usize;
         let color = if has_alert(text, start, len, cols) { alert } else { white };
         let mut off = start;
         let mut c = 0;
@@ -462,6 +613,10 @@ fn paint(fill: Fill, text: &[u8]) {
         }
     }
 
+    if pages > 1 {
+        draw_footer(&fb, cols, grid_rows - 1, shown, pages, white);
+    }
+
     // The scanout is mapped write-back over a region firmware typically marks
     // WC or UC. QEMU does not care; a real panel does, and "the text is in L2
     // and never reached the screen" is a bug that would only ever appear on
@@ -469,6 +624,51 @@ fn paint(fill: Fill, text: &[u8]) {
     // that path leaves the machine running and pays a full cache-hierarchy
     // flush per phase boundary for it. Six on a GOP boot, none on any other.
     unsafe { core::arch::asm!("wbinvd", options(nostack, preserves_flags)) };
+}
+
+/// `[page 2/4]` on the bottom row, and the module's only formatting.
+///
+/// It is not decoration. The pager advances on a timer with no key to press,
+/// so the artifact is a photograph of one page out of several: without this a
+/// reader cannot tell which slice they caught, whether the head is above them,
+/// or whether the screen is cycling at all rather than wedged.
+fn draw_footer(fb: &Fb, cols: usize, row: usize, page: usize, pages: usize, color: u32) {
+    let mut buf = [0u8; 24];
+    let mut n = 0;
+    for &b in b"[page " {
+        buf[n] = b;
+        n += 1;
+    }
+    n += write_num(&mut buf[n..], page);
+    buf[n] = b'/';
+    n += 1;
+    n += write_num(&mut buf[n..], pages);
+    buf[n] = b']';
+    n += 1;
+    for c in 0..n.min(cols) {
+        draw_glyph(fb, c, row, buf[c], color);
+    }
+}
+
+/// Decimal `v` into the front of `out`, returning the bytes written. `out` is
+/// always the tail of a 24-byte buffer holding at most two numbers, and a page
+/// count is bounded by `SNAPSHOT_CAP`, so ten digits of room is nine spare.
+fn write_num(out: &mut [u8], v: usize) -> usize {
+    let mut digits = [0u8; 20];
+    let mut n = 0;
+    let mut v = v;
+    loop {
+        digits[n] = b'0' + (v % 10) as u8;
+        n += 1;
+        v /= 10;
+        if v == 0 || n == digits.len() {
+            break;
+        }
+    }
+    for i in 0..n.min(out.len()) {
+        out[i] = digits[n - 1 - i];
+    }
+    n.min(out.len())
 }
 
 /// Every fatal marker the kernel emits already matches this: `!!! PANIC !!!`,

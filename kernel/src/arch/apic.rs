@@ -107,8 +107,14 @@ pub fn halt_all_cpus() -> ! {
     // unbounded loop, so putting it ahead of the proven channel costs the
     // screen and never the serial report if it goes wrong — and it means a
     // line arriving on serial proves the paint already finished.
-    crate::drivers::panic_console::render();
+    let painted = crate::drivers::panic_console::render();
     unsafe { crate::drivers::serial::panic_flush(); }
+    // And the pager strictly after it, for the same reason inverted: it *is*
+    // an unbounded loop, so it may only run once the serial report is out.
+    // Only the CPU that painted enters it; every other one halts below.
+    if painted {
+        crate::drivers::panic_console::page_forever();
+    }
     super::cpu::halt();
 }
 
