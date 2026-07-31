@@ -342,13 +342,6 @@ cannot happen under the table lock (it would put `AddressSpace` under
 `ThreadData` after the table check, inside the same lock hold, is the shape that
 fixes it.
 
-### Timer-vs-XHCI deadlock hazard
-
-`timer_handler` (IRQ context, IF=0) → `xhci::poll_if_pending` → `XHCI.lock()`
-(spinning ticket lock) deadlocks if the timer interrupts the same CPU's thread
-while it holds the XHCI lock via the `fd.rs` keyboard/mouse read poll. A
-`try_lock` in the timer path removes it.
-
 ### A keyboard that resets behind our back is undetectable on the PS/2 wire
 
 The i8042 driver runs the keyboard in set 2 with the controller translating to

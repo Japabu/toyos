@@ -17,9 +17,11 @@
 //!
 //! - **No `Lock`.** `Lock::lock` disables preemption but not interrupts
 //!   (`sync.rs`), so an ISR taking a lock a thread on the same CPU holds
-//!   self-deadlocks — the recorded `timer_handler → xhci::poll_if_pending →
-//!   XHCI.lock()` hazard is exactly this shape. The handler touches neither
-//!   `PS2`, nor the key/mouse queues, nor the I/O APIC.
+//!   self-deadlocks. The handler touches neither `PS2`, nor the key/mouse
+//!   queues, nor the I/O APIC. The prohibition binds every *other* ISR too:
+//!   `drain` holds those locks in thread context, so any handler that reached
+//!   them — the timer tick's device poll was the one that could — wedges the
+//!   CPU rather than this one misbehaving.
 //! - **No allocation.** `VecDeque::push_back` reaches the allocator, and a
 //!   panic holding the allocator lock wedges the recovered CPU.
 //! - **No `log!`.** It is ISR-safe, and it is still banned: at key-repeat

@@ -57,7 +57,7 @@ Write path: `pushfq`/`cli` → one `lock xadd` → memcpy into a privately-owned
 
 Today's path is worse on exactly the constraint that shaped the module. `RingGuard::lock` (log_ring.rs:84-104) does `pushfq`/`cli` then an *unbounded* `compare_exchange_weak` spin (lines 95-102), held across `append`'s per-byte loop (42-55, ~80 iterations of two modulos and a branch for a typical line). A CPU that dies holding `RING_LOCKED` wedges `log!` on every other CPU permanently. That is CLAUDE.md's "locks a dead thread can strand" class, sitting on the panic path.
 
-Re-entrancy safety is not new engineering — `trace.rs:117` already allocates slots with `head.fetch_add(1)` from IRQ context and `trace.rs:122-123` documents why it is sound. I generalize it from n=1 to n slots. The IRQ case is real, not hypothetical: `arch/idt/timer.rs:103` is an IF=0 interrupt gate reaching `xhci::poll_if_pending` → `XHCI.lock()`, with 67 `log!` sites in exceptions.rs and 273 kernel-wide (both counts verified by grep).
+Re-entrancy safety is not new engineering — `trace.rs:117` already allocates slots with `head.fetch_add(1)` from IRQ context and `trace.rs:122-123` documents why it is sound. I generalize it from n=1 to n slots. The IRQ case is real, not hypothetical: `arch/idt/timer.rs`'s tick is an IF=0 interrupt gate that drains the log ring under `RingGuard::lock`, with 67 `log!` sites in exceptions.rs and 273 kernel-wide (both counts verified by grep).
 
 I keep the `cli` across reserve→commit. Not for exclusion — for Linux's stated reason (printk_ringbuffer.c:1669-1675): to bound how long an uncommitted slot is a hole in the sequence. This is `pushfq`/`cli`/`popfq` with no lock and no spin, against today's `pushfq`/`cli`/contended-spin/per-byte-loop/`popfq`.
 

@@ -333,6 +333,10 @@ pub fn set_global(ctrl: XhciController) {
 /// Records live on the CPU that took the interrupt (which its ISR forces
 /// into the scheduler via need_resched), so on every other CPU this is one
 /// uncontended atomic op on its own cache line — callers need no cpu gate.
+///
+/// Thread context only. It takes `XHCI` and dispatches HID reports, which take
+/// the keyboard held-set and both event queues; an ISR calling this would spin
+/// on whichever of those the thread it interrupted holds.
 pub fn poll_if_pending() {
     if crate::irq_ring::take(crate::irq_ring::IrqSource::Xhci).is_some() {
         let mut guard = XHCI.lock();

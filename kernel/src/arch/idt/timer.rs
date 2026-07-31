@@ -105,6 +105,17 @@ pub(super) extern "sysv64" fn timer_entry() {
 }
 
 extern "sysv64" fn timer_handler() {
+    // Only the Ring 3 tick reaches here — the stub above branches away first
+    // — so the interrupted context is user code and this CPU holds no `Lock`.
+    // Everything below rests on that: the log ring is a spinning ticket lock,
+    // and the pass at the bottom drains the input drivers. `Lock::lock` raises
+    // the preempt count, so a nonzero count here is that gate having gone.
+    assert_eq!(
+        crate::preempt::count(),
+        0,
+        "the timer handler ran in kernel context, where a lock may be held",
+    );
+
     // Through the `Machine` boundary rather than the ring directly: this
     // handler is the driver entry the cutover builds on, and routing it now
     // is what puts the boundary's trace path on the highest-rate event the
@@ -115,11 +126,6 @@ extern "sysv64" fn timer_handler() {
         kind: TraceKind::TimerFire,
     });
     crate::arch::apic::eoi();
-
-    // Process xHCI events (keyboard/mouse) from preemption context, in case
-    // this CPU's IRQ-exit drain was deferred (Ring 0 interrupt during a long
-    // preempt-off section). No-op unless this CPU holds the irq_ring record.
-    crate::drivers::xhci::poll_if_pending();
 
     // Drain pending log output. With sustained user-mode load both CPUs
     // never enter the idle loop, so without a tick-driven drain the ring

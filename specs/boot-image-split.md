@@ -245,9 +245,9 @@ event ring and `advance_event_ring`, the `Configure Endpoint` command,
    `wait_command` discards transfer events it happens to dequeue. That is
    correct for one-shot enumeration and completely wrong once storage transfers
    race HID interrupts. A driver used after boot must block and wake through the
-   scheduler. CLAUDE.md already records a deadlock hazard — `timer_handler` →
-   `xhci::poll_if_pending` → `XHCI.lock()` — and holding that spinning ticket
-   lock across a multi-millisecond bulk transfer makes it far worse.
+   scheduler. `XHCI` is a spinning ticket lock taken from every scheduler pass
+   (`drain_irqs`) and from the `fd.rs` read path; holding it across a
+   multi-millisecond bulk transfer stalls every CPU that wants it.
 8. **A second block device.** `kernel/src/page_cache.rs:11-12` holds exactly one
    `BLOCK_DEV: Lock<Option<Box<dyn BlockDevice>>>`. `block.rs:2` defines a
    `DeviceId`, and the page cache stores it — as `_device_id`
