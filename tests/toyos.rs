@@ -1375,8 +1375,26 @@ fn run_machine_test(
             if units.is_empty() {
                 return Err(format!("no `ioapic: id=` line in the boot log:\n{log}"));
             }
+            // A window the machine does not decode answers 0xFFFFFFFF to
+            // everything, which is a *valid-looking* unit: 256 entries, all
+            // read back masked, `route` succeeds into nothing. The driver
+            // drops such a unit, so its absence from the log is the assertion.
+            if let Some(ignored) = log.lines().find(|l| l.contains("ioapic: id=") && l.contains("IGNORED")) {
+                return Err(format!("an I/O APIC failed its plausibility gate: {ignored}"));
+            }
+            let mut covered: Vec<(u32, u32)> = Vec::new();
             for unit in &units {
-                // `<id> at <addr> gsi <lo>..<hi> masked <n>/<total>`
+                // `<id> at <addr> ver=<v> gsi <lo>..<hi> masked <n>/<total>`
+                let ver = unit
+                    .split_once(" ver=0x")
+                    .and_then(|(_, rest)| rest.split_whitespace().next())
+                    .and_then(|v| u32::from_str_radix(v, 16).ok())
+                    .ok_or_else(|| format!("no version in {unit:?}"))?;
+                // Both halves of the entry count come from this register, so a
+                // version that is not a chip's makes the count meaningless.
+                if ver == 0x00 || ver == 0xFF {
+                    return Err(format!("I/O APIC version {ver:#04x} is a floating bus: {unit:?}"));
+                }
                 let (range, masked) = unit
                     .split_once(" gsi ")
                     .and_then(|(_, rest)| rest.split_once(" masked "))
@@ -1397,11 +1415,15 @@ fn run_machine_test(
                     .unwrap_or("")
                     .parse()
                     .map_err(|_| format!("bad entry count in {unit:?}"))?;
-                if hi < lo || total != hi - lo + 1 {
+                // `hi` is printed as `lo + total - 1`, so comparing them is a
+                // tautology. What is checkable is the bound the driver refuses
+                // past — a floating bus reports 256 here.
+                if hi < lo || !(1..=240).contains(&total) {
                     return Err(format!(
-                        "I/O APIC claims gsi {lo}..{hi} but {total} entries: {unit:?}"
+                        "I/O APIC claims gsi {lo}..{hi}, {total} entries — not a redirection table: {unit:?}"
                     ));
                 }
+                covered.push((lo, hi));
                 // The whole reason this driver runs before the first sti: an
                 // entry firmware left armed at a vector with no gate is a #GP
                 // that kills the boot.
@@ -1409,6 +1431,16 @@ fn run_machine_test(
                     return Err(format!(
                         "{n} of {total} redirection entries masked — {} left armed: {unit:?}",
                         total - n
+                    ));
+                }
+            }
+            // Independent of any number the log derived from another: the two
+            // pins the i8042 needs have to fall inside some unit's range, or
+            // `route` returns `NoUnit` and there is no PS/2 input at all.
+            for gsi in [1u32, 12] {
+                if !covered.iter().any(|&(lo, hi)| (lo..=hi).contains(&gsi)) {
+                    return Err(format!(
+                        "no I/O APIC covers GSI {gsi}; units cover {covered:?}"
                     ));
                 }
             }

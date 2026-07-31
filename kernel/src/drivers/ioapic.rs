@@ -5,6 +5,12 @@
 //! properties follow, and both are the point of the module rather than
 //! incidental to it:
 //!
+//! - Nothing this module reads back is trusted to be a chip. An MMIO window
+//!   the machine does not decode accepts every write and answers 0xFFFFFFFF,
+//!   which passes a mask read-back, claims 256 entries, and makes `route`
+//!   succeed into nothing — the failure mode is a green log and a dead device.
+//!   The version register is the gate: a unit whose answer is not plausibly a
+//!   redirection table is dropped, and `route` reads its entry back.
 //! - `init` masks every redirection entry on every unit it finds. Firmware
 //!   hands the OS whatever state it left the chip in, and an unmasked entry
 //!   pointing at a vector we have no IDT gate for — the ACPI SCI is the
@@ -32,9 +38,17 @@ const IOWIN: u64 = 0x10;
 const REG_VER: u32 = 0x01;
 const REG_REDTBL: u32 = 0x10;
 
+const RTE_DELIVERY_STATUS: u32 = 1 << 12;
 const RTE_POLARITY_LOW: u32 = 1 << 13;
+const RTE_REMOTE_IRR: u32 = 1 << 14;
 const RTE_TRIGGER_LEVEL: u32 = 1 << 15;
 const RTE_MASKED: u32 = 1 << 16;
+
+/// The redirection table is at most 240 entries (8 bits of "max redirection
+/// entry", and no shipped part is near that), and a version of 0x00 or 0xFF is
+/// what an undecoded MMIO window returns rather than what a chip reports. Both
+/// halves come from the one register, so one implausible read condemns it.
+const MAX_PLAUSIBLE_ENTRIES: u32 = 240;
 
 /// Global System Interrupt: the flat interrupt-input space the MADT numbers
 /// I/O APIC pins in. An ISA IRQ maps into it identically unless a type-2
@@ -64,15 +78,34 @@ pub struct IsaLine {
     pub polarity: Polarity,
 }
 
-#[derive(Debug)]
 pub enum RouteError {
     /// No discovered unit covers this GSI. A driver that gets this must
     /// refuse to enable its device rather than assume the pin works.
     NoUnit(Gsi),
     /// Physical destination is 8 bits wide without interrupt remapping, and
-    /// this APIC id does not fit. Mis-routing an interrupt is undiagnosable;
-    /// not routing it is one log line.
+    /// 0xFF in those 8 bits is the broadcast encoding — every LAPIC accepts
+    /// the message, which is the same undiagnosable mis-delivery as an id that
+    /// does not fit at all. Not routing it is one log line.
     DestTooWide(u32),
+    /// The entry did not take. An MMIO window that decodes to nothing accepts
+    /// every write and returns 0xFFFFFFFF, so a `route` that only wrote would
+    /// report success on a machine where no pin is connected to anything.
+    Readback { wrote: u32, read: u32 },
+}
+
+/// Hand-written because every field here is a register value, and the derive
+/// prints them in decimal — on a machine with no UART these lines are read off
+/// a screen repaint once.
+impl core::fmt::Debug for RouteError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::NoUnit(gsi) => write!(f, "no I/O APIC covers GSI {}", gsi.0),
+            Self::DestTooWide(id) => write!(f, "apic id {id:#x} does not fit an 8-bit destination"),
+            Self::Readback { wrote, read } => {
+                write!(f, "wrote {wrote:#010x}, read back {read:#010x}")
+            }
+        }
+    }
 }
 
 struct Unit {
@@ -122,7 +155,24 @@ pub fn init(madt: &MadtInfo) {
             .unwrap()
             .map_mmio(entry.address as u64, 0x20);
         let mut unit = Unit { mmio, gsi_base: entry.gsi_base, entries: 0 };
-        unit.entries = ((unit.read(REG_VER) >> 16) & 0xFF) + 1;
+        let ver = unit.read(REG_VER);
+        let version = ver & 0xFF;
+        unit.entries = ((ver >> 16) & 0xFF) + 1;
+        if version == 0x00
+            || version == 0xFF
+            || unit.entries > MAX_PLAUSIBLE_ENTRIES
+        {
+            // Believing this window would claim to cover every GSI a driver
+            // ever asks for, mask 256 entries that are not there, and route
+            // into the void — all of it logging green.
+            log!(
+                "ioapic: id={} at {:#x} IGNORED — version register {:#010x} is not a redirection table",
+                entry.id,
+                entry.address,
+                ver
+            );
+            continue;
+        }
         let mut masked = 0;
         for n in 0..unit.entries {
             unit.write(REG_REDTBL + 2 * n, RTE_MASKED);
@@ -134,9 +184,10 @@ pub fn init(madt: &MadtInfo) {
             }
         }
         log!(
-            "ioapic: id={} at {:#x} gsi {}..{} masked {}/{}",
+            "ioapic: id={} at {:#x} ver={:#04x} gsi {}..{} masked {}/{}",
             entry.id,
             entry.address,
+            version,
             unit.gsi_base,
             unit.gsi_base + unit.entries - 1,
             masked,
@@ -235,7 +286,7 @@ pub fn route(
     trigger: Trigger,
     polarity: Polarity,
 ) -> Result<(), RouteError> {
-    if dest_apic_id > 0xFF {
+    if dest_apic_id >= 0xFF {
         return Err(RouteError::DestTooWide(dest_apic_id));
     }
     let topology = TOPOLOGY.lock();
@@ -248,6 +299,12 @@ pub fn route(
     // word last means it is never briefly armed at the previous destination.
     unit.write(REG_REDTBL + 2 * n + 1, dest_apic_id << 24);
     unit.write(REG_REDTBL + 2 * n, low);
+    // Delivery status (12) and remote IRR (14) are the chip's, not ours.
+    let read_low = unit.read(REG_REDTBL + 2 * n) & !(RTE_DELIVERY_STATUS | RTE_REMOTE_IRR);
+    let read_dest = (unit.read(REG_REDTBL + 2 * n + 1) >> 24) & 0xFF;
+    if read_low != low || read_dest != dest_apic_id {
+        return Err(RouteError::Readback { wrote: low, read: read_low });
+    }
     Ok(())
 }
 
