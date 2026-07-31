@@ -1672,14 +1672,24 @@ fn run_machine_test(
             // ~1900 of them on a device this size against 8 on the small one,
             // so the coalescing loop is only ever exercised at scale here.
             //
-            // The kernel's own "Syncing filesystems..." is not observable:
-            // `log!` queues into the ring the scheduler drains, and
-            // acpi::shutdown() cuts the power first. So the assertions below
-            // stand outside the guest entirely.
+            // The kernel's own shutdown lines are observable now: the ring
+            // is drained in `acpi::shutdown()` before it cuts the power.
+            // Asserted below, because "how far did the sync get" is the only
+            // diagnostic a shutdown failure has, and on a machine with no
+            // serial it is the only channel there is.
             let image = qemu.nvme_image().to_path_buf();
             writeln!(qemu.stdin_mut(), "run shutdown").expect("write to QEMU stdin");
             qemu.flush_stdin();
             let tail = qemu.drain_serial(Duration::from_secs(20));
+
+            for line in ["Syncing filesystems...", "Shutting down."] {
+                if !tail.contains(line) {
+                    return Err(format!(
+                        "{line:?} never reached the host — the ring was still \
+                         holding it when the power was cut:\n{tail}"
+                    ));
+                }
+            }
 
             for (what, text) in [("boot", &log), ("shutdown", &tail)] {
                 for bad in ["!!! PANIC !!!", "KERNEL PANIC", "panicked at"] {

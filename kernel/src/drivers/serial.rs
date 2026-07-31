@@ -231,6 +231,28 @@ pub unsafe fn panic_flush() {
     }
 }
 
+/// Drain the ring before the machine stops.
+///
+/// `acpi::shutdown()` cuts power with whatever is still queued, so the tail of
+/// every clean shutdown was unobservable — including the line that says how far
+/// a filesystem sync got before it died, which is the one diagnostic a shutdown
+/// failure has. On a machine with no serial there is no other channel at all.
+///
+/// Bounded on the lock rather than blocking, for the same reason `panic_flush`
+/// is: a shutdown must not hang because another CPU is wedged holding the
+/// backend. It does *not* take that function's bypass — every CPU is still live
+/// here, and reading the ring unsynchronized is only defensible when nothing
+/// else will ever run. Losing the tail is better than not powering off.
+pub fn flush_final() {
+    for _ in 0..PANIC_LOCK_SPIN_LIMIT {
+        if let Some(mut g) = BackendGuard::try_lock() {
+            super::log_ring::drain_to_serial(&mut g);
+            return;
+        }
+        core::hint::spin_loop();
+    }
+}
+
 // Formatter — fast path, used by every log!() invocation.
 
 const SW_BUF_SIZE: usize = 1024;

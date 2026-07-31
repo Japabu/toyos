@@ -239,6 +239,9 @@ pub fn iapc_boot_arch(rsdp_addr: u64) -> Option<(u8, u16)> {
 
 /// Trigger ACPI S5 (soft-off) shutdown.
 pub fn shutdown() -> ! {
+    // Last chance: nothing drains the log ring after this point.
+    crate::drivers::serial::flush_final();
+
     let pm1a = PM1A_CNT_PORT.load(Ordering::Relaxed);
     let slp_typ = SLP_TYPA.load(Ordering::Relaxed);
 
