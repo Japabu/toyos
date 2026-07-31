@@ -1742,6 +1742,22 @@ fn run_machine_test(
             // against 8 on the 128 MiB one, which is the difference between
             // overflowing a 64-slot cache during the format and never
             // reaching it. Measured: 0 block-cache evictions on Headless.
+            //
+            // And it has to be an *unformatted* namespace, which is not what a
+            // full run leaves behind: the image is named by device size and
+            // reused, so `nvme_large_device` formats it earlier in
+            // MACHINE_TESTS and this boot then only mounts — a handful of
+            // metadata blocks and no eviction at all. Measured exactly that
+            // way: green alone, red in the suite. Removing it restores the
+            // precondition, and duplicating the harness's naming here is safe
+            // in the only direction that matters: if that name ever drifts,
+            // the boot mounts instead of formatting and the turnover
+            // assertion below goes red rather than vacuously green.
+            let stale = std::env::temp_dir()
+                .join(format!("toyos-tests-{}", std::process::id()))
+                .join(format!("test-nvme-{}.img", qemu::NVME_T14_BYTES));
+            let _ = fs::remove_file(&stale);
+
             let options = BootOptions {
                 profile: qemu::Profile::MetalDisk,
                 kernel_features: &["test-small-caches"],

@@ -83,6 +83,13 @@ fn main() {
     }
     drop(f);
 
+    // A tmpfs file has no backing: its pages are the file, not a copy of one,
+    // so the sweep must walk past them however hard the disk cache is being
+    // pressed. Written before the pressure below and read after it.
+    const TMP: &str = "/tmp/cache_tmpfs.bin";
+    const TMP_PAGES: usize = 48;
+    write_file(TMP, 100, TMP_PAGES);
+
     for tag in 0..SMALL_FILES {
         write_file(&format!("/home/cache_small_{tag}.bin"), tag + 1, SMALL_PAGES);
     }
@@ -101,6 +108,38 @@ fn main() {
         }
     }
     drop(handles);
+
+    // Dirty pages are the other thing eviction may not take: until the flush
+    // writes them out they are the only copy. Rewriting the head of the big
+    // file leaves the whole budget dirty, and the read pass underneath it is
+    // what asks the cache for room it cannot make — the case where the sweep
+    // has to give up over budget rather than take something it cannot replace.
+    const DIRTY_PAGES: usize = 64;
+    {
+        let mut w = fs::OpenOptions::new().write(true).open(BIG).expect("reopen big to rewrite");
+        for page in 0..DIRTY_PAGES {
+            w.seek(SeekFrom::Start((page * PAGE) as u64)).expect("seek to rewrite");
+            w.write_all(&page_bytes(7, page)).expect("rewrite page");
+        }
+        let path = format!("/home/cache_small_0.bin");
+        let mut r = fs::File::open(&path).expect("reopen pressure file");
+        for page in 0..SMALL_PAGES {
+            check_page(&mut r, &path, 1, page, "pressure while the budget is dirty");
+        }
+        w.sync_all().expect("fsync the rewrite");
+    }
+    {
+        let mut f = fs::File::open(BIG).expect("reopen big after rewrite");
+        for page in 0..DIRTY_PAGES {
+            check_page(&mut f, BIG, 7, page, "dirty page survived eviction pressure");
+        }
+    }
+
+    let mut tmp = fs::File::open(TMP).expect("reopen tmpfs file");
+    for page in 0..TMP_PAGES {
+        check_page(&mut tmp, TMP, 100, page, "tmpfs survives disk-cache pressure");
+    }
+    drop(tmp);
 
     // A file the cache still holds an fd for, truncated and rewritten shorter:
     // the pages past the new end must not survive as stale cache entries.
@@ -122,6 +161,6 @@ fn main() {
         assert!(bad.is_none(), "rewritten page {page} byte {} differs", bad.unwrap());
     }
 
-    let pages = BIG_PAGES * 2 + SMALL_FILES * SMALL_PAGES * 3;
+    let pages = BIG_PAGES * 2 + SMALL_FILES * SMALL_PAGES * 3 + TMP_PAGES + SMALL_PAGES + DIRTY_PAGES;
     println!("cache eviction ok: {pages} page reads verified");
 }

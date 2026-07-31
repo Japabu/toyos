@@ -4,16 +4,26 @@
 > critic, then spot-verified by hand. This records `bound` and `release` **as they
 > are today**, not as they ought to be. `Unbounded` and `Manual` are the point of
 > the document; they are not laundered anywhere.
+>
+> The four cache rows — `BlockCachePage`, `BlockCacheIndex`,
+> `BlockCacheSyncScratch`, `FileCachePage` — were re-verified against `ae2ee14`
+> (2026-08-01), which gave both caches a ceiling and an eviction policy. Their
+> analysis was right and is kept below the fix, because the reason each one grew
+> is what decided the shape of the fix.
 
 ## The numbers
 
 | | count |
 |---|---|
 | Distinct allocation owners | **65** |
-| `bound: Unbounded` | **25** |
+| `bound: Unbounded` | **25** → 23 |
 | `release: Manual` | **11** |
-| `release: Never` | 22 |
-| Flagged (leak, unbounded, or both) | **38** |
+| `release: Never` | 22 → 21 |
+| Flagged (leak, unbounded, or both) | **38** → 36 |
+
+The arrows are the two cache pages, bounded and made evictable at `ae2ee14`;
+the counts on the left are what the 2026-07-28 pass found and are left visible
+because the delta is the only honest way to read a dated inventory.
 
 65, not the ~42 I estimated. The gap is mostly transient allocations sized by an
 unvalidated syscall argument — a category I did not think to look for, and the one
@@ -67,9 +77,9 @@ this size?*
 | `ThreadTableEntry` | Proc | Heap | PerObject | Drop | **unbounded** |
 | `KernelStack` | Sched | Heap | PerObject | Drop | **unbounded** |
 | `BcacheFsOpenFileMap` | Vfs | Heap | PerObject | Drop | **leak** |
-| `BlockCachePage` | Vfs | Heap | Unbounded | Never | **unbounded** |
+| `BlockCachePage` | Vfs | Heap | Bounded | Evictable | ok — since `ae2ee14`; was Unbounded/Never |
 | `FileCacheIndex` | Vfs | Heap | PerObject | Drop | **leak** |
-| `FileCachePage` | Vfs | Heap | Unbounded | Drop | **leak+unbounded** |
+| `FileCachePage` | Vfs | Heap | Bounded | Evictable | ok — since `ae2ee14`; was Unbounded/Drop, and the Drop was the leak |
 | `OpenFilePath` | Vfs | Heap | Unbounded | OwnedBy | **unbounded** |
 | `TmpfsFileData` | Vfs | Heap | Unbounded | Manual | **leak+unbounded** |
 | `TmpfsNamespace` | Vfs | Heap | Unbounded | Manual | **leak+unbounded** |
@@ -100,7 +110,7 @@ this size?*
 | `IrqTimestampSlots` | Sched | Static | Static | Never | ok |
 | `SchedShareState` | Sched | Heap | PerProcess | Drop | ok |
 | `TraceEventRings` | Sched | Static | Static | Never | ok |
-| `BlockCacheIndex` | Vfs | Heap | Bounded | Never | ok — by the *cached set*. This row read `Bounded` while it meant O(device size), which is the schema gap above with a body count |
+| `BlockCacheIndex` | Vfs | Heap | Bounded | Reuse | ok — reserved to `max_slots` at construction, so the boot line reports the real ceiling. This row read `Bounded` twice while meaning something else: first O(device size), then O(cached set) with nothing bounding the cached set. The schema gap above, with a body count |
 | `FileBackingExtents` | Vfs | Heap | PerObject | Drop | ok |
 | `MountTable` | Vfs | Heap | Static | Never | ok |
 
@@ -116,7 +126,7 @@ this size?*
 
 - SysinfoSnapshot — kernel/src/arch/syscall.rs:1055, `Vec<(Tid, &ProcessEntry, &ThreadEntry)>` collected from the whole process table and then sorted, ~24 B per live thread. No owner. Bound: one entry per thread; thread count is uncapped (spawn_thread at kernel/src/process.rs:658-670 refuses only during teardown), so ~87,000 threads makes this a >2 MiB single allocation. Any process may call SYS_SYSINFO. Release: dropped at syscall exit. Also note kernel/src/arch/syscall.rs:1041 walks the same flat_map a second time just to count.
 
-- BlockCacheSyncScratch — `sync`'s `pending: Vec<u32>` (one dirty slot per entry), `vec![0u8; 32*4096]` (fixed 128 KiB) and `prefetch`'s `vec![0u8; run_len*4096]` (run_len capped at 32, so 128 KiB). BlockCacheIndex and BlockCachePage cover the resident cache but not these transients. `pending` is the one that matters: it is bounded by the resident slot count, which nothing evicts — so it inherits BlockCachePage's unbounded growth and crosses the 2 MiB assert at kernel/src/mm/alloc.rs:12 at ~524,000 resident blocks. Not bounded by the device: at 4 bytes per *resident* slot it takes 2 GiB of cache to get there, where the u64-per-*device*-block version sat exactly on the assert at a 1 GiB image.
+- BlockCacheSyncScratch — `sync`'s `pending: Vec<u32>` (one dirty slot per entry) and `vec![0u8; 32*4096]` (fixed 128 KiB). BlockCacheIndex and BlockCachePage cover the resident cache but not these transients. `pending` was the one that mattered: bounded by the resident slot count, which nothing evicted, so it inherited BlockCachePage's unbounded growth and crossed the 2 MiB assert at kernel/src/mm/alloc.rs:12 at ~524,000 resident blocks. FIXED at `ae2ee14`: the resident set is capped at `block::metadata_cache_blocks()`, so `pending` is 16 KiB at the shipped 4096-slot ceiling and cannot reach the assert at any bound the policy can produce. The third allocation this row named, `prefetch`'s `vec![0u8; run_len*4096]`, is gone with `prefetch` itself — the only coalescing read path in the kernel, deleted rather than wired up because file data bypasses this cache entirely and the blocks it would coalesce are metadata.
 
 - AcpiApicIdList — kernel/src/drivers/acpi.rs:246 `let mut apic_ids = Vec::new()`, pushed at :261 and :268, returned inside MadtInfo (:8-10, :278). The drivers slice flagged this as unclaimed and asked for it to be assigned; no owner took it. Bound: number of enabled CPUs in the firmware MADT — unchecked but not attacker-reachable. Release: Drop, when kernel_main's frame ends after smp::boot_aps (kernel/src/main.rs:236, :284). Trivial, but the inventory is not closed without it.
 
@@ -138,13 +148,13 @@ this size?*
 
 - KernelSymbolTable IS TOO SMALL TO BE AN OWNER — one Box of ~72 bytes (kernel/src/symbols.rs:197), leaked once at boot, cannot grow, cannot fail. Its rationale is good prose, but the row buys nothing an allocator taxonomy can act on. Same objection to GpuCursorPage: one 2 MiB page for the machine's lifetime, chosen at kernel/src/main.rs:320 or :325.
 
-- FOUR TRANSIENT OWNERS WITH ONE IDENTICAL BOUND — VfsPathScratch, VfsDirListing, ElfLoadScratch and (my new) BlockCacheSyncScratch all read: short-lived, dropped at syscall exit, sized by an unvalidated user or file input, and dangerous only by crossing kernel/src/mm/alloc.rs:12. Four owners is defensible only if their bounds differ; today they do not. Either the taxonomy grows a `Transient` disposition, or these merge and the 2 MiB assert becomes one cross-cutting invariant instead of four restatements.
+- FOUR TRANSIENT OWNERS WITH ONE IDENTICAL BOUND — VfsPathScratch, VfsDirListing, ElfLoadScratch and (my new) BlockCacheSyncScratch all read: short-lived, dropped at syscall exit, sized by an unvalidated user or file input, and dangerous only by crossing kernel/src/mm/alloc.rs:12. (BlockCacheSyncScratch has since left the set — a cap on the cache is a cap on it — which is one datum for the merge argument: the bound was never the transient's own.) Four owners is defensible only if their bounds differ; today they do not. Either the taxonomy grows a `Transient` disposition, or these merge and the 2 MiB assert becomes one cross-cutting invariant instead of four restatements.
 
 - EarlyBumpArena / KernelDirectMapTables — correctly two owners, but the real invariant lives BETWEEN them and no owner field can express it. The arena is 512 KiB (kernel/src/mm/alloc.rs:94); the boot page tables consume up to ~264 KiB of it at the 64 GiB the PMM bitmap permits (kernel/src/mm/paging.rs:627, :645-666 vs kernel/src/mm/pmm.rs:148, :217), and nothing asserts the two are compatible. This is evidence the owner schema needs a cross-owner constraint slot, not that these rows are wrong.
 
 - NAMING TEST FAILURES (rationale restates the name, so either the granularity is wrong or the owner is trivial) — NicDriverBox ('a driver singleton installed once at boot with no unregister path'), BoxedDriverInstance ('one per device class, decided at boot and never replaced'), and MountTable ('boot-time singleton set') are three rows saying the same sentence about three Box<dyn Trait> in three statics. They are one owner: 'BootSingleton: Box<dyn Trait> installed once at probe into a kernel static, never replaced, never freed — freeing it would leave live hardware with no driver.' Note gop.rs:59's Box::new(GopGpu) allocates literally nothing (GopGpu is a ZST, kernel/src/drivers/gop.rs:8), which is itself a hint the row is not about allocation.
 
-- COUNTEREXAMPLE, KEEP AS THE MODEL — FileCacheIndex / FileCachePage / TmpfsFileData is the split done right: the same allocation type (Box<[u8;4096]>, kernel/src/file_cache.rs:122,165) divided by bound and release rather than by struct, plus a separate owner for the bookkeeping that must outlive the pages. Every merge/split question above should be settled against this row, not against the type names.
+- COUNTEREXAMPLE, KEEP AS THE MODEL — FileCacheIndex / FileCachePage / TmpfsFileData is the split done right: the same allocation type (Box<[u8;4096]>, now inside `CachedPage`) divided by bound and release rather than by struct, plus a separate owner for the bookkeeping that must outlive the pages. `ae2ee14` made the split load-bearing rather than descriptive: `CachedFile::is_cache()` is exactly this row's boundary, and it decides both which pages the budget counts and which the sweep may take. Every merge/split question above should be settled against this row, not against the type names.
 
 ## Risk ranking
 
@@ -188,13 +198,15 @@ Zero bytes allocated, total and permanent failure mode — the best argument in 
 
 Same shape as DeviceClaim and same two callers (fd.rs:255, :283): a process that panics while holding a listener fd leaves its name registered forever, and listener.rs:71's uniqueness check means no process can ever listen on that service name again. A crash in one daemon permanently removes a service from the namespace. Also anchors an uncapped PendingConnection queue, so the leak drags 2 MiB per stranded pipe with it.
 
-### HIGH — `FileCachePage (kernel/src/file_cache.rs:122/165)` **userland-triggerable**
+### FIXED at `ae2ee14` — `FileCachePage` **was userland-triggerable**
 
-Not merely 'init is never called' — the fs slice proved the budget would not help if it were. evict_if_needed skips any file with ref_count>0 (file_cache.rs:303) while release deletes an evictable file outright the instant refcount hits 0 (file_cache.rs:69-73), so the set {evictable && ref_count==0} is unsatisfiable by construction and eviction can free nothing. max_pages is usize::MAX (file_cache.rs:32) and init has zero call sites. Any process can grow this by opening and reading files; a panic-exited process pins its share at refcount>=1 forever. A real fix has to evict clean pages from files that are still open, which the current code explicitly refuses to do.
+Not merely 'init is never called' — the fs slice proved the budget would not help if it were. evict_if_needed skipped any file with ref_count>0 while release deleted an evictable file outright the instant refcount hit 0, so the set {evictable && ref_count==0} was unsatisfiable by construction and eviction could free nothing. max_pages was usize::MAX and init had zero call sites. Any process could grow this by opening and reading files; a panic-exited process pinned its share at refcount>=1 forever.
+
+The fix took the shape this row demanded: eviction now takes clean pages from files that are still open, and ref_count is not consulted at all. What it added on top is the precondition the row did not name — a page may only be dropped if the cache can fetch it again, which is why the backing moved out of the fd and into `CachedFile`. `is_cache()` is the resulting predicate: evictable *and* backed. Budget is `block::file_cache_pages()`, 1/64 of usable RAM.
 
 ### HIGH — `TmpfsFileData + TmpfsNamespace + VfsCreatedDirs (kernel/src/file_cache.rs:165, kernel/src/tmpfs.rs:54, kernel/src/vfs.rs:381)` **userland-triggerable**
 
-Three unbounded userland-driven kernel-heap growers with no quota of any kind: unlimited writes to /tmp (pages are non-evictable by construction, file_cache.rs:303, and survive refcount 0, file_cache.rs:70-74), unlimited tmpfs names, unlimited mkdir paths never freed on process exit (teardown_resources at process.rs:777-830 does not touch the VFS). No MAX_PATH exists anywhere in kernel/ or toyos-abi/ and user_str applies no cap. Slower than the panic cases but unstoppable, and the terminal state is a heap OOM with no #[alloc_error_handler] — which routes into try_recover_from_panic, the path that frees nothing.
+Three unbounded userland-driven kernel-heap growers with no quota of any kind: unlimited writes to /tmp (pages are non-evictable by construction — `CachedFile::is_cache()` is false without a backing, and `ae2ee14` deliberately kept it that way, since a tmpfs page is the file and not a copy of one — and they survive refcount 0), unlimited tmpfs names, unlimited mkdir paths never freed on process exit (teardown_resources at process.rs:777-830 does not touch the VFS). No MAX_PATH exists anywhere in kernel/ or toyos-abi/ and user_str applies no cap. Slower than the panic cases but unstoppable, and the terminal state is a heap OOM with no #[alloc_error_handler] — which routes into try_recover_from_panic, the path that frees nothing.
 
 ### HIGH — `SharedRegionMapping — the `allowed` Vec (kernel/src/shared_memory.rs:182)` **userland-triggerable**
 
@@ -224,9 +236,11 @@ Producer is an interrupt with no back-pressure and no idea whether a consumer ex
 
 ~24 B per live thread collected and sorted on every SYS_SYSINFO call by any process; thread count is uncapped (spawn_thread at process.rs:658-670 refuses only during teardown), so ~87,000 threads makes it a >2 MiB single allocation. Requires building the thread count first, which is itself unbounded, so it is reachable but slow — a second-order version of the FdTable bug rather than a new one.
 
-### MEDIUM — `BlockCachePage (kernel/src/page_cache.rs:95/106/124)`
+### FIXED at `ae2ee14` — `BlockCachePage`
 
-No eviction of any kind: alloc_slot runs once per block ever touched (page_cache.rs:116-133) and nothing ever resets an entry to NOT_CACHED, so the worst case is the entire 1 GiB device image resident in kernel heap. next_slot only increments, chunks only pushes, sync writes back but frees nothing. Not directly attacker-driven (file data now bypasses it via raw_block_read, page_cache.rs:56-63, so it holds only bcachefs metadata), and nothing in the kernel reports its steady-state size — PageCache has no statistics and next_slot is not exposed, so the actual footprint on a long run is unknown.
+No eviction of any kind: alloc_slot ran once per block ever touched and nothing ever reset an entry, so the worst case was the entire device image resident in kernel heap. next_slot only incremented, chunks only pushed, sync wrote back and freed nothing. Not directly attacker-driven (file data bypasses it via raw_block_read, so it holds only bcachefs metadata), and nothing in the kernel reported its steady-state size — PageCache had no statistics and next_slot was not exposed, so the footprint on a long run was unknown.
+
+Slots are now reused under a CLOCK hand and capped at `block::metadata_cache_blocks()` — a fixed 4096 (16 MiB), because metadata residency is a property of the filesystem rather than of the machine; RAM enters only as a floor. A dirty victim is written back the way unmount writes one. The last clause of this row is answered too: the cache logs one line per full turnover, which is what `cache_eviction` reads to assert residency stays flat while the eviction count climbs.
 
 ### MEDIUM — `PcidCounter (kernel/src/mm/paging.rs:196)` **userland-triggerable**
 
@@ -236,7 +250,7 @@ Zero bytes, but a correctness bug rather than a memory one, which is why it dese
 
 Good enough to build the taxonomy from, but not to freeze — the inventory is strong on lifetime analysis and systematically weak on unvalidated-size-at-the-syscall-boundary, which is where the worst findings turned out to be.
 
-WHAT IT GETS RIGHT. The five slices did the hard part honestly. Unbounded and Manual are not laundered anywhere I checked; the release paths are traced to their actual single callers rather than to the function that looks like it should free (fd::close_all having exactly one caller at process.rs:820 is the load-bearing fact in half the rows, and every slice found it independently). Three of the mm slice's corrections to the established survey are real and I verified them: the heap does not shrink, AddressSpace.pages is always empty because its only insert is in dead code, and pmm::Category::PageTable is consequently never used at any site. The fs slice's proof that a file-cache budget would not help — {evictable && ref_count==0} is unsatisfiable by construction — is the single best piece of analysis in the document, because it kills a fix that would otherwise have looked obviously correct.
+WHAT IT GETS RIGHT. The five slices did the hard part honestly. Unbounded and Manual are not laundered anywhere I checked; the release paths are traced to their actual single callers rather than to the function that looks like it should free (fd::close_all having exactly one caller at process.rs:820 is the load-bearing fact in half the rows, and every slice found it independently). Three of the mm slice's corrections to the established survey are real and I verified them: the heap does not shrink, AddressSpace.pages is always empty because its only insert is in dead code, and pmm::Category::PageTable is consequently never used at any site. The fs slice's proof that a file-cache budget would not help — {evictable && ref_count==0} is unsatisfiable by construction — is the single best piece of analysis in the document, because it kills a fix that would otherwise have looked obviously correct. It held up: `ae2ee14` wired the budget up *and* dropped the ref_count condition, and wiring up alone would have shipped a cache that still freed nothing.
 
 WHAT I WOULD FIX FIRST, IN ORDER.
 
