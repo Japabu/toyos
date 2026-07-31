@@ -181,6 +181,33 @@ impl Ppm {
     pub fn identical_to(&self, other: &Ppm) -> bool {
         self.width == other.width && self.height == other.height && self.pixels == other.pixels
     }
+
+    /// How many pixels differ outside the bottom `skip_rows` rows?
+    pub fn pixels_differing_above(&self, other: &Ppm, skip_rows: usize) -> usize {
+        if self.width != other.width || self.height != other.height {
+            return usize::MAX;
+        }
+        let end = self.height.saturating_sub(skip_rows) * self.width;
+        self.pixels[..end]
+            .iter()
+            .zip(&other.pixels[..end])
+            .filter(|(a, b)| a != b)
+            .count()
+    }
+
+    /// Do the two dumps agree everywhere except the bottom `skip_rows` rows?
+    ///
+    /// A whole-screen diff of a live desktop is always true and therefore
+    /// proves nothing: the compositor repaints its taskbar once a second for
+    /// the clock and the system stats. Everything above the taskbar changes
+    /// only when something asked it to.
+    pub fn identical_above(&self, other: &Ppm, skip_rows: usize) -> bool {
+        if self.width != other.width || self.height != other.height {
+            return false;
+        }
+        let end = self.height.saturating_sub(skip_rows) * self.width;
+        self.pixels[..end] == other.pixels[..end]
+    }
 }
 
 pub struct Font {

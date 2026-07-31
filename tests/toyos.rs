@@ -62,6 +62,7 @@ const INPUT_TESTS: &[&str] = &[
     "i8042_mouse",
     "i8042_absent",
     "i8042_quarantine",
+    "metal_sim_input",
 ];
 
 /// The renderer's two text colours, as the screendump reports them.
@@ -1784,6 +1785,136 @@ fn run_input_test(
             eprintln!("  [i8042] {health} idle-health lines — the CPU still halts");
             Ok(())
         }
+        "metal_sim_input" => {
+            // M2's exit criterion. The metal-sim profile has no serial and no
+            // USB HID, so the i8042 is the machine's only input device and
+            // the framebuffer its only channel out — which is exactly the
+            // T14's shape. The assertions are pixels, not glyphs, and under
+            // GOP the compositor draws its cursor into the framebuffer, so
+            // injected input is directly visible.
+            let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/metalcase");
+            let options = BootOptions {
+                profile: qemu::Profile::Metal,
+                qmp: true,
+                ..Default::default()
+            };
+            let argv = qemu::profile_argv(&options);
+            for bad in ["virtio", "usb-kbd", "usb-tablet"] {
+                if let Some(arg) = argv.iter().find(|a| a.contains(bad)) {
+                    return Err(format!("metal-sim grew a {bad} device: {arg}"));
+                }
+            }
+            if argv.iter().any(|a| a.contains("i8042=off")) {
+                return Err("metal-sim turned the i8042 off".to_string());
+            }
+
+            let mut qemu = QemuInstance::boot_with_options(&config, &[], &[], options);
+            let taskbar = |d: &screen::Ppm| d.row_uniform(d.height - 1) == Some(TASKBAR);
+            let booted = qemu.screendump_while(
+                Duration::from_secs(30),
+                Duration::from_millis(500),
+                taskbar,
+            );
+            if !taskbar(&booted) {
+                print_screen(name, &booted.text());
+                return Err(format!(
+                    "no compositor taskbar to drive; bottom row {:?}",
+                    booted.row_uniform(booted.height - 1)
+                ));
+            }
+
+            // Every diff below is of the screen ABOVE the taskbar. The
+            // compositor repaints the taskbar once a second for its clock and
+            // stats, so a whole-screen diff of a live desktop is always true
+            // — this test's first version passed on exactly that.
+            const TASKBAR_ROWS: usize = 32;
+            // And even above the taskbar the desktop churns by ~80 px, so the
+            // assertions are thresholds. A launcher is ~8960 px; a settled
+            // desktop returning to itself is 0.
+            const LAUNCHER_PX: usize = 4000;
+
+            let Some(idle) = settle_above(&mut qemu, TASKBAR_ROWS) else {
+                return Err(
+                    "the desktop never stops changing with no input — the diffs below would prove nothing"
+                        .to_string(),
+                );
+            };
+
+            // QEMU serves one QMP client at a time, and `screendump` opens
+            // its own — so every injection session is scoped closed before
+            // the next dump.
+            //
+            // Into the bottom-left corner, which with no windows open is the
+            // taskbar's "new" button. One packet per command and small steps:
+            // a delta past 9 bits sets the overflow bit and the motion is
+            // dropped, by design. The click below is what proves this
+            // arrived — with no pointer input the cursor stays at screen
+            // centre, where a click hits the desktop and changes nothing.
+            let socket = qemu.qmp_socket().to_path_buf();
+            {
+                let mut input = qemu::QmpInput::open(&socket);
+                for _ in 0..24 {
+                    input.mouse(-40, 40, None);
+                    thread::sleep(Duration::from_millis(10));
+                }
+            }
+            let Some(parked) = settle_above(&mut qemu, TASKBAR_ROWS) else {
+                return Err("the desktop never settled after the pointer moved".to_string());
+            };
+
+            {
+                let mut input = qemu::QmpInput::open(&socket);
+                input.mouse(0, 0, Some(("left", true)));
+                thread::sleep(Duration::from_millis(50));
+                input.mouse(0, 0, Some(("left", false)));
+            }
+            let clicked = qemu.screendump_while(Duration::from_secs(5), Duration::from_millis(200), |d| {
+                d.pixels_differing_above(&parked, TASKBAR_ROWS) >= LAUNCHER_PX
+            });
+            let clicked_px = clicked.pixels_differing_above(&parked, TASKBAR_ROWS);
+            if clicked_px < LAUNCHER_PX {
+                return Err(format!(
+                    "the click changed {clicked_px} px, want a launcher's worth ({LAUNCHER_PX}) — the pointer never reached the taskbar, or the button never reached the compositor"
+                ));
+            }
+
+            // Escape closes the launcher: the keyboard path, on the same
+            // machine shape, to the same userland process.
+            qemu::qmp_send_keys(&socket, &[("esc", true), ("esc", false)]);
+            let closed = qemu.screendump_while(Duration::from_secs(5), Duration::from_millis(200), |d| {
+                d.pixels_differing_above(&clicked, TASKBAR_ROWS) >= LAUNCHER_PX
+            });
+            let closed_px = closed.pixels_differing_above(&clicked, TASKBAR_ROWS);
+            if closed_px < LAUNCHER_PX {
+                return Err(format!(
+                    "Escape changed {closed_px} px, want a launcher's worth ({LAUNCHER_PX}) — the keyboard never reached userland"
+                ));
+            }
+            // And it closed the launcher rather than doing something else:
+            // the desktop is bit-identical to before the click. Without this
+            // the test would accept any big change, a crash repaint included.
+            let residue = closed.pixels_differing_above(&parked, TASKBAR_ROWS);
+            if residue != 0 {
+                return Err(format!(
+                    "Escape changed the screen, but {residue} px away from the pre-click desktop"
+                ));
+            }
+
+            // A crashed compositor would leave a changed screen too.
+            for (label, dump) in [("parked", &parked), ("clicked", &clicked), ("closed", &closed)] {
+                if !taskbar(dump) {
+                    print_screen(name, &dump.text());
+                    return Err(format!(
+                        "the taskbar is gone at `{label}` — the compositor died rather than responded"
+                    ));
+                }
+            }
+            eprintln!(
+                "  [metal-sim] {}x{} framebuffer: click opened the launcher ({clicked_px} px), Escape closed it ({closed_px} px), desktop back to {residue} px",
+                closed.width, closed.height
+            );
+            Ok(())
+        }
         other => Err(format!("unknown input test {other}")),
     }
 }
@@ -1817,6 +1948,28 @@ fn parse_key_events(stdout: &str) -> Vec<KeyLine> {
 /// four characters `\u{1b}` rather than the byte.
 fn unescape(s: &str) -> String {
     s.replace("\\u{1b}", "\u{1b}").replace("\\\"", "\"").replace("\\\\", "\\")
+}
+
+/// Dump until two consecutive screens agree above the bottom `skip_rows`
+/// rows, and return the settled one.
+///
+/// The compositor paints its taskbar before the first full composite
+/// finishes, so the first dump carrying a taskbar is not a baseline.
+fn settle_above(qemu: &mut QemuInstance, skip_rows: usize) -> Option<screen::Ppm> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut last = qemu.screendump();
+    loop {
+        thread::sleep(Duration::from_millis(400));
+        let next = qemu.screendump();
+        let settled = next.identical_above(&last, skip_rows);
+        last = next;
+        if settled {
+            return Some(last);
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+    }
 }
 
 #[derive(Debug)]
