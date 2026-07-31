@@ -90,8 +90,8 @@ pub struct PerCpu {
     /// any CPU's arm/stop clobber every other CPU's re-arm fallback.
     pub last_armed_ticks: AtomicU32,       // offset 260
     /// Absolute nanos_since_boot the armed one-shot fires at (u64::MAX =
-    /// timer stopped). Read by `apic::ensure_armed_before` to close the
-    /// blocked-thread deadline-arming race.
+    /// timer stopped). Set by the scheduler's `TimerPlan` -> `Hw::set_timer`
+    /// arming path to close the blocked-thread deadline-arming race.
     pub armed_deadline_ns: AtomicU64,      // offset 264
 }
 

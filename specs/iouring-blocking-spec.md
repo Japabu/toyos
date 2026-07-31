@@ -388,7 +388,7 @@ timeout becomes an **absolute** deadline (§9.3) but the protocol is unchanged.
 
 ## 7. The park/recheck protocol — one proof instead of five
 
-`handle_outgoing`'s park arm becomes:
+`pass_block`'s (`kernel/src/sched/driver.rs`) park arm becomes:
 
 ```rust
 SwitchReason::Park { chan, deadline } => {

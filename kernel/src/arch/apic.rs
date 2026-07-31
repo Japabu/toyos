@@ -151,19 +151,6 @@ pub fn arm_one_shot(nanos: u64) {
     crate::trace::trace(crate::trace::Kind::TimerArm, nanos as u32);
 }
 
-/// Re-arm the one-shot for an absolute deadline if it precedes what this
-/// CPU already armed. The scheduler pass arms the timer from its `TimerPlan`
-/// via `Hw::set_timer` with parked deadlines folded in; this helper only
-/// ever shortens the current arming, never stretches it.
-pub fn ensure_armed_before(deadline_ns: u64) {
-    let percpu = unsafe { &*percpu::percpu_ptr() };
-    if deadline_ns < percpu.armed_deadline_ns.load(Ordering::Relaxed) {
-        let now = crate::clock::nanos_since_boot();
-        // Past-due deadlines arm the 1-tick minimum and fire immediately.
-        arm_one_shot(deadline_ns.saturating_sub(now).max(1));
-    }
-}
-
 /// Stop the timer. No more interrupts until re-armed.
 pub fn stop_timer() {
     let percpu = unsafe { &*percpu::percpu_ptr() };
