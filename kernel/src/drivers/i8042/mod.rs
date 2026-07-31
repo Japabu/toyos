@@ -34,11 +34,18 @@
 //! reach: the byte ring is a static of atomics, and everything that needs a
 //! lock lives behind `service`, which runs in thread context only.
 //!
-//! **Delivery is pinned to one CPU** (the BSP, physical destination), which
+//! **Delivery is pinned to one CPU** (`IRQ_CPU`, physical destination), which
 //! is what makes the ISR the sole reader of port 0x60 and the byte ring a
 //! genuine single-producer queue. Two CPUs taking these interrupts would
 //! race on a one-byte register. Input is ~100 Hz; there is no load argument
 //! for spreading it.
+//!
+//! The corollary binds the *drain*, which runs on whichever CPU entered the
+//! scheduler: any polled port I/O it wants to do — the aux re-enable is the
+//! only one — has to happen on `IRQ_CPU` with interrupts off there. Nothing
+//! weaker works. Masking the redirection entries does not: it stops neither an
+//! ISR already executing nor a vector already latched in that CPU's LAPIC, and
+//! an edge asserted on a masked edge-triggered entry is dropped outright.
 
 use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
 
@@ -92,6 +99,29 @@ static LOST_EDGES: AtomicU32 = AtomicU32::new(0);
 static DROPPED: AtomicU32 = AtomicU32::new(0);
 static KEYBOARD_GSI: AtomicU32 = AtomicU32::new(u32::MAX);
 static AUX_GSI: AtomicU32 = AtomicU32::new(u32::MAX);
+
+/// The CPU the vector is pinned to. Two things are only true there: the ISR is
+/// the sole reader of port 0x60, and an `irq_ring` record for this source can
+/// exist at all (records are strictly per-CPU). Both are load-bearing below.
+static IRQ_CPU: AtomicU32 = AtomicU32::new(u32::MAX);
+
+fn is_irq_cpu() -> bool {
+    IRQ_CPU.load(Ordering::Relaxed) == crate::arch::percpu::cpu_id()
+}
+
+/// The decoder saw a device reset. Handled on `IRQ_CPU`, whichever CPU noticed.
+static AUX_RESET_PENDING: AtomicBool = AtomicBool::new(false);
+static AUX_REENABLE_FAILURES: AtomicU32 = AtomicU32::new(0);
+
+/// A device that answers at all answers a one-byte command in well under a
+/// millisecond; this is interrupts-off time on the one CPU that takes the
+/// vector, so it is sized for "the controller is gone", not for slowness.
+const AUX_REENABLE_MS: u64 = 30;
+
+/// A TrackPoint that resets in a loop would otherwise buy the same handshake
+/// forever. After this many consecutive failures the aux line is masked and
+/// the pointer is written off, which is one log line rather than a stall.
+const AUX_REENABLE_GIVE_UP: u32 = 3;
 
 // The byte ring.
 //
@@ -196,15 +226,24 @@ pub fn service() {
     if !ACTIVE.load(Ordering::Relaxed) {
         return;
     }
+    // Polled port I/O, so only the CPU the vector is pinned to may do it. Any
+    // other CPU leaves the request standing; this one is in a pass at least
+    // once a tick, and a lid-open is not a deadline.
+    if AUX_RESET_PENDING.load(Ordering::Relaxed) && is_irq_cpu() {
+        aux_reenable();
+    }
     // Unconditional, not gated on `recorded`: this is what detects a lost
     // edge and what heals it in the same pass.
     if !has_bytes() {
         return;
     }
-    if !recorded {
-        // Bytes with no IRQ record: the edge was lost, or another CPU's
-        // drain took the record first. Loud the first time, silent after —
-        // a rate is what would matter and nothing reads one.
+    // Only `IRQ_CPU` can hold a record for this source, so only `IRQ_CPU` can
+    // read anything into its absence. On any other CPU `!recorded` is a fact
+    // about `irq_ring`'s per-CPU shape, and counting it there reported a lost
+    // edge on every healthy `--smp N>1` boot.
+    if !recorded && is_irq_cpu() {
+        // Loud the first time, silent after — a rate is what would matter and
+        // nothing reads one.
         if LOST_EDGES.fetch_add(1, Ordering::Relaxed) == 0 {
             log!("i8042: bytes with no IRQ record — an edge was lost");
         }
@@ -239,10 +278,8 @@ pub fn service() {
     }
     trace_drain(bytes, keys, motion, woke_kb, woke_ms);
 
-    // Outside the guard, for the same reason the wakes are: it masks both
-    // lines and does polled I/O.
     if aux_reset {
-        aux_reenable();
+        AUX_RESET_PENDING.store(true, Ordering::Relaxed);
     }
 }
 
@@ -473,29 +510,50 @@ fn aux_command(bytes: &[u8], deadline: u64) -> bool {
 
 /// Re-enable data reporting after the device reset itself. The EC does this
 /// after suspend or a lid event, and without it the TrackPoint goes silent
-/// for the rest of the boot.
+/// for the rest of the boot. Caller has already established `is_irq_cpu`.
 ///
-/// Both lines are masked first. The handshake below polls port 0x60, and the
-/// ISR is otherwise the sole reader of it; masking is what makes "sole" true
-/// from a drain, which runs on whichever CPU entered the scheduler.
+/// Interrupts off on this CPU, and the lines left alone. Masking them is what
+/// the first version did, and it was wrong twice over: masking an RTE stops
+/// neither an ISR already executing nor a vector already latched in that CPU's
+/// LAPIC, so it never made this the sole reader of the one-byte output buffer;
+/// and an edge asserted on a masked edge-triggered entry is *dropped*, so a
+/// byte landing in that window leaves OBF full with no interrupt ever again —
+/// both PS/2 devices dead for the rest of the boot, silently. Being the pinned
+/// CPU with IF=0 is what "sole reader" actually requires, and it costs no edge:
+/// one asserted here is latched in the LAPIC and delivered on the way out, to
+/// an ISR that finds the buffer already empty.
 fn aux_reenable() {
-    let lines = [KEYBOARD_GSI.load(Ordering::Relaxed), AUX_GSI.load(Ordering::Relaxed)];
-    for gsi in lines {
-        if gsi != u32::MAX {
-            let _ = ioapic::set_masked(Gsi(gsi), true);
-        }
+    AUX_RESET_PENDING.store(false, Ordering::Relaxed);
+    let ok = {
+        let _irq = crate::hw::IrqGuard::close();
+        let budget = deadline(AUX_REENABLE_MS);
+        // The keyboard is still scanning — masking the *line* does not stop
+        // the *device*. `init` disables port 1 for exactly this reason: a
+        // keystroke arriving mid-handshake is consumed as the aux ack, and
+        // with reporting still off no further aux byte would ever ask again.
+        command(CMD_DISABLE_PORT1, budget);
+        let ok = aux_command(&[0xF4], budget);
+        command(CMD_ENABLE_PORT1, budget);
+        // With edge delivery a byte left in OBF means no further interrupt
+        // ever, so the buffer must be empty before interrupts come back.
+        handler_poll();
+        ok
+    };
+    if ok {
+        AUX_REENABLE_FAILURES.store(0, Ordering::Relaxed);
+        log!("i8042: aux reset itself, reporting re-enabled");
+        return;
     }
-    let ok = aux_command(&[0xF4], deadline(600));
-    // Anything the handshake left behind, and anything that arrived while
-    // the lines were masked: with edge delivery a byte left in OBF means no
-    // further interrupt ever.
-    handler_poll();
-    for gsi in lines {
-        if gsi != u32::MAX {
-            let _ = ioapic::set_masked(Gsi(gsi), false);
-        }
+    let failures = AUX_REENABLE_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
+    if failures < AUX_REENABLE_GIVE_UP {
+        log!("i8042: aux reset itself, re-enable failed ({failures}/{AUX_REENABLE_GIVE_UP})");
+        return;
     }
-    log!("i8042: aux reset itself, reporting re-enabled ({})", if ok { "ok" } else { "FAILED" });
+    let aux = AUX_GSI.swap(u32::MAX, Ordering::Relaxed);
+    if aux != u32::MAX {
+        let _ = ioapic::set_masked(Gsi(aux), true);
+    }
+    log!("i8042: aux re-enable failed {failures} times — pointer written off, line masked");
 }
 
 pub fn init(rsdp_addr: u64) {
@@ -678,6 +736,9 @@ pub fn init(rsdp_addr: u64) {
         return;
     }
     KEYBOARD_GSI.store(kbd_line.gsi.0, Ordering::Relaxed);
+    // `apic_id` is this CPU's, so this is the CPU the vector was just pinned
+    // to. Everything downstream that says "the pinned CPU" reads it from here.
+    IRQ_CPU.store(crate::arch::percpu::cpu_id(), Ordering::Relaxed);
 
     let aux_line = aux.then(|| ioapic::gsi_for_isa_irq(ISA_IRQ_AUX)).flatten().filter(|l| {
         match ioapic::route(l.gsi, I8042_VECTOR, apic_id, l.trigger, l.polarity) {
@@ -754,9 +815,15 @@ pub fn init(rsdp_addr: u64) {
     }
 }
 
-/// The handler's drain loop, without the EOI. Called once from init with
-/// interrupts off on the CPU the vector is pinned to.
+/// The handler's drain loop, without the EOI. Runs with interrupts off on the
+/// CPU the vector is pinned to, which is what keeps `push_isr`'s single
+/// producer single.
+///
+/// It publishes the same record the ISR does. Bytes in the ring with no record
+/// is precisely what `service` reports as a lost edge, so a silent push here
+/// manufactured one on every boot that found a byte in the buffer.
 fn handler_poll() {
+    let timestamp = crate::clock::nanos_since_boot();
     let mut n = 0;
     while n < ISR_BURST {
         let status = inb(STATUS);
@@ -765,5 +832,9 @@ fn handler_poll() {
         }
         push_isr(inb(DATA), status & AUXB != 0);
         n += 1;
+    }
+    if n > 0 {
+        crate::irq_ring::isr_publish(IrqSource::I8042, timestamp);
+        crate::preempt::set_need_resched();
     }
 }

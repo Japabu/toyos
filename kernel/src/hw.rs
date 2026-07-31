@@ -37,7 +37,7 @@ pub struct IrqGuard {
 }
 
 impl IrqGuard {
-    fn close() -> Self {
+    pub fn close() -> Self {
         let rflags: u64;
         unsafe {
             asm!("pushfq", "pop {}", "cli", out(reg) rflags, options(nomem));
