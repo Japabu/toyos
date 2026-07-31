@@ -1,5 +1,24 @@
 # ToyOS Fork Estate Audit — Final Report (2026-07-27)
 
+> **PARTIALLY SUPERSEDED — this is a dated record, not current state.** The body
+> below is preserved verbatim as an accurate account of 2026-07-27. Do not act on
+> a finding without checking it first: `forks.toml` is the live manifest and
+> `specs/known-issues.md` carries current state.
+>
+> Resolved since, each verified against the code:
+>
+> | Finding | Status |
+> |---|---|
+> | Build system swallows all cargo/rustc stderr on success (§1, §5 of Priorities) | Fixed, `f8f80c4`. But the deeper half survives and is *not* in this report: cargo gives every non-path source `--cap-lints allow`, so the forks stay invisible regardless — `specs/fork-lint-audit-plan.md` |
+> | Dead `target-lexicon` patch entry in userland/Cargo.toml (§MINOR) | Deleted, `9a3e6c6`, along with three more unused entries (ctrlc, memmap2, stacker) |
+> | `bootstrap-cc` needlessly patches tar/filetime (§MINOR); bootstrap-cc rows in §2 | `bootstrap-cc` deleted entirely, `55e8ad8` — it targeted the host and did not work |
+> | "~a third of the estate (cargo + 7 satellites, ~110MB) is dormant"; the 25-fork inventory in §2 | Superseded. Nothing is vendored now; `userland/cargo`, `rustix`, `gitoxide`, `tar`, `filetime` and the rest are absent from the tree, and `forks.toml` lists 14 fork repositories consumed as git branches |
+> | "zero upstream PRs exist" (§1) | Superseded — two are open: raw-window-handle #223 and target-lexicon #134 |
+> | memmap2's `ErrorKind::Unsupported` contract violation (§3 hijack (b)) | Recorded fixed 2026-07-28 in `forks.toml`, along with three real bugs the evaluation found |
+>
+> Not re-verified here, so treat as still open until someone checks: the socket2
+> and tar cfg-gate hijacks, the split-brain `toyos-abi` snapshot, and estate drift.
+
 ## 1. Verdict
 
 The fork strategy is fundamentally sound and mostly well-executed: ~17 of 25 userland forks are textbook additive platform ports (new `toyos.rs` backends + cfg-gated dispatch, winit's sibling-crate `winit-toyos` being the model case), all upstream LICENSE files are intact, lockfiles are healthy (`--locked` passes everywhere), and spot-checked forks compile warning-free for the toyos target. The libc-free std (toyos-abi direct) removes the classic porting bottleneck. However, the strategy's stated goal — upstream-mergeable, first-class platform status — is currently aspirational: **zero upstream PRs exist**, and every PR is hard-blocked by the unpublished, unlicensed `toyos-abi`/`toyos` crates that all forks path/git-depend on. Three verified cfg-gate hijacks (socket2, memmap2, tar) violate the project's own rules, a stale GitHub-pinned `toyos-abi` snapshot creates a split-brain ABI inside shipping binaries, ~a third of the estate (cargo + 7 satellites, ~110MB) is dormant behind a commented-out system.toml entry, and the build system silently swallows all rustc warnings on success — so the fork-hygiene bar is not being enforced by tooling. The estate was synced once (2026-04-09) and is drifting; "kept up to date with upstream" is not yet a process.
