@@ -29,16 +29,18 @@ const AUDIO_TESTS: &[&str] = &["audio_tone", "audio_tone_load"];
 // first-class single-CPU case, smp=8 the full-SMP case.
 const AUDIO_SMP: &[u32] = &[1, 8];
 
-// On-screen panic console. Each boots its own QEMU with a UEFI GOP display
-// and reads a decoded screendump, so they cannot share the multi-test boot —
-// the guest they test is halted by the time they assert. `screen_decoder`
+// Tests that read a decoded screendump. Each boots its own QEMU with a UEFI
+// GOP display, so they cannot share the multi-test boot — the guest they test
+// is halted, or has no console, by the time they assert. `screen_decoder`
 // needs no guest at all; it proves the decoder against a bitmap it rendered
-// itself, before anything points it at a real screen.
+// itself, before anything points it at a real screen. `metal_sim_compositor`
+// is M1's permanent config: the whole boot with no virtio device anywhere.
 /// Feature-carrying tests last: each distinct kernel feature set is one more
 /// kernel rebuild, and ending on one leaves the plain-kernel tests above it
 /// untouched by the thrash.
 const SCREEN_TESTS: &[&str] = &[
     "screen_decoder",
+    "metal_sim_compositor",
     "screen_boot_checkpoint",
     "screen_recoverable_untouched",
     "screen_early_panic",
@@ -52,6 +54,13 @@ const ALERT: [u8; 3] = [0xFF, 0x50, 0x50];
 /// And its two fills: dark red for a halted machine, black for a checkpoint.
 const FILL_FATAL: [u8; 3] = [0x60, 0x00, 0x00];
 const FILL_BOOT: [u8; 3] = [0x00, 0x00, 0x00];
+
+/// `TASKBAR_COLOR` from `userland/compositor/src/main.rs`. The compositor
+/// fills the bottom `TASKBAR_HEIGHT` rows full-width with it before drawing
+/// anything on top, and the last pixel row stays untouched by every tab —
+/// which makes one uniform row of this colour a signature no other painter in
+/// the tree produces.
+const TASKBAR: [u8; 3] = [0x18, 0x18, 0x25];
 
 /// The line `SYS_DEBUG` action 3 logs immediately before halting every CPU.
 /// Action 3 exists only under the `test-fatal-halt` kernel feature, which
@@ -994,6 +1003,77 @@ fn run_screen_test(
             screen::self_test();
             Ok(())
         }
+        "metal_sim_compositor" => {
+            let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/metalcase");
+            let options = BootOptions {
+                profile: qemu::Profile::Metal,
+                qmp: true,
+                ..Default::default()
+            };
+
+            // The profile's claim is a negative one, and no screendump can
+            // see a device that is present but unused — so read the argv.
+            // Without this the test would keep passing if virtio came back.
+            let argv = qemu::profile_argv(&options);
+            if let Some(bad) = argv.iter().find(|a| a.contains("virtio")) {
+                return Err(format!("metal-sim passed a virtio device to QEMU: {bad}"));
+            }
+            if let Some(bad) = argv.iter().find(|a| a.contains("usb-kbd") || a.contains("usb-tablet")) {
+                return Err(format!("metal-sim passed a USB HID device to QEMU: {bad}"));
+            }
+            match argv.iter().position(|a| a == "-serial") {
+                Some(i) if argv.get(i + 1).is_some_and(|v| v == "none") => {}
+                _ => return Err(format!("metal-sim did not disable the 16550: {argv:?}")),
+            }
+
+            let mut qemu = QemuInstance::boot_with_options(&config, &[], &[], options);
+            // No console, so no ready marker and no run_test: the screen is
+            // the only thing this guest can be observed through. The wait
+            // covers firmware, the initrd read off USB and the whole boot,
+            // which together take ~5s here; 30 leaves room and bounds what a
+            // regression costs, since each poll writes a 12 MiB screendump.
+            let dump = qemu.screendump_while(
+                Duration::from_secs(30),
+                Duration::from_millis(500),
+                |d| d.row_uniform(d.height - 1) == Some(TASKBAR),
+            );
+            let text = dump.text();
+            if dump.row_uniform(dump.height - 1) != Some(TASKBAR) {
+                // The decoded screen is the diagnostic: under metal-sim it
+                // carries the kernel's last boot checkpoint or its panic
+                // report, which is the whole reason M0 came first.
+                print_screen(name, &text);
+                return Err(format!(
+                    "no compositor taskbar on the {}x{} framebuffer; bottom row {:?}\ndecoded screen:\n{text}",
+                    dump.width,
+                    dump.height,
+                    dump.row_uniform(dump.height - 1),
+                ));
+            }
+            // A taskbar over a black screen would mean the compositor drew
+            // its furniture and nothing else; the wallpaper is what proves a
+            // full desktop composite reached the firmware framebuffer.
+            let colors = dump.distinct_colors(5);
+            if colors < 256 {
+                return Err(format!(
+                    "taskbar present but only {colors} distinct colours — no wallpaper composited"
+                ));
+            }
+            // And the kernel's own last word must be gone, which is what
+            // "userland claimed the framebuffer" looks like from outside.
+            if text.contains("Boot: complete") {
+                return Err(format!(
+                    "the kernel boot checkpoint is still on screen — the compositor never took the framebuffer\n{text}"
+                ));
+            }
+            eprintln!(
+                "  [metal-sim] {}x{} framebuffer, taskbar row {:?}, {colors} colours",
+                dump.width,
+                dump.height,
+                TASKBAR
+            );
+            Ok(())
+        }
         "screen_early_panic" => {
             // The window the console exists for: percpu is not up, mm::init
             // has not run, and on a machine with no UART nothing else can
@@ -1004,7 +1084,7 @@ fn run_screen_test(
                 c_bins,
                 rust_bins,
                 BootOptions {
-                    display: qemu::Display::Gop,
+                    profile: qemu::Profile::Gop,
                     qmp: true,
                     kernel_features: &["test-early-panic"],
                     ready_marker: "!!! EARLY PANIC !!!",
@@ -1031,7 +1111,7 @@ fn run_screen_test(
                 c_bins,
                 rust_bins,
                 BootOptions {
-                    display: qemu::Display::Gop,
+                    profile: qemu::Profile::Gop,
                     qmp: true,
                     ..Default::default()
                 },
@@ -1081,7 +1161,7 @@ fn run_screen_test(
                 c_bins,
                 rust_bins,
                 BootOptions {
-                    display: qemu::Display::Gop,
+                    profile: qemu::Profile::Gop,
                     qmp: true,
                     kernel_features: &["test-late-panic"],
                     ready_marker: "!!! PANIC !!!",
@@ -1112,7 +1192,7 @@ fn run_screen_test(
                 c_bins,
                 rust_bins,
                 BootOptions {
-                    display: qemu::Display::Gop,
+                    profile: qemu::Profile::Gop,
                     qmp: true,
                     kernel_features: &["test-fatal-halt"],
                     ..Default::default()
@@ -1149,7 +1229,7 @@ fn run_screen_test(
                 c_bins,
                 rust_bins,
                 BootOptions {
-                    display: qemu::Display::Gop,
+                    profile: qemu::Profile::Gop,
                     qmp: true,
                     ..Default::default()
                 },

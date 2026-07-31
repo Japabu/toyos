@@ -1,0 +1,14 @@
+# The metal-sim boot: what `Profile::Metal` puts in front of userland.
+#
+# No test-runner, because there is no console to drive one over — the only
+# channel out of a metal-sim guest is the framebuffer, and the assertions are
+# decoded screendumps. soundd and netd are here for exactly the reason they
+# have no device: their graceful exit is half of what this config certifies.
+init = ["/bin/compositor", "/bin/soundd", "/bin/netd"]
+
+assets = ["assets"]
+
+[programs]
+compositor = {}
+soundd = {}
+netd = {}

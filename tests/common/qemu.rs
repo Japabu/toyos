@@ -14,24 +14,38 @@ pub static VERBOSE: AtomicBool = AtomicBool::new(false);
 /// Distinguishes the wav capture of each QEMU boot within one test process.
 static BOOT_SEQ: AtomicU32 = AtomicU32::new(0);
 
-/// Which display device the guest boots with.
+/// The hardware shape QEMU presents to the guest.
 ///
-/// `None` is the historical test config: no VGA and no GPU device at all, so
-/// firmware publishes no GOP and `kernel_args.gop_framebuffer` is zero.
-/// `Gop` is the path a laptop takes -- firmware publishes a linear
-/// framebuffer and there is no virtio device -- and it is the only config in
-/// which the on-screen panic console renders anything.
+/// Not a display setting: each variant is a whole machine. `Headless` is the
+/// historical test config -- no VGA and no GPU device at all, so firmware
+/// publishes no GOP and `kernel_args.gop_framebuffer` is zero. `Gop` swaps in
+/// `-vga std` so firmware publishes a linear framebuffer, which is the path a
+/// laptop takes and the only one in which the on-screen panic console renders
+/// anything. `Metal` goes the whole way to the target laptop's shape.
 #[derive(Clone, Copy, PartialEq)]
-pub enum Display {
-    None,
+pub enum Profile {
+    Headless,
     Gop,
+    /// M1 metal-sim: GOP, NVMe, xHCI with the boot stick on it, i8042 from
+    /// q35, and nothing else -- no virtio device, no USB HID, no 16550. The
+    /// guest has no channel out but the framebuffer, so a boot under this
+    /// profile is observed with [`QemuInstance::screendump_while`] and
+    /// nothing else. Keeping a serial port here would defeat the point: the
+    /// T14 has none, and a profile that talks over one is not simulating it.
+    Metal,
+}
+
+impl Profile {
+    fn virtio(self) -> bool {
+        self != Profile::Metal
+    }
 }
 
 pub struct BootOptions {
     pub gdb_stub: bool,
     pub debug_wait: bool,
     pub smp: u32,
-    pub display: Display,
+    pub profile: Profile,
     /// Open a per-instance QMP socket, which `screendump` needs. Per-instance
     /// because screen tests boot their own QEMU and several may exist at once.
     pub qmp: bool,
@@ -39,7 +53,8 @@ pub struct BootOptions {
     /// The console line that means the boot reached the state under test.
     /// Anything other than [`DEFAULT_READY`] also declares that a panic is the
     /// expected outcome rather than a boot failure -- the early-panic screen
-    /// test never reaches userland at all.
+    /// test never reaches userland at all. Ignored under [`Profile::Metal`],
+    /// which has no console for a marker to arrive on.
     pub ready_marker: &'static str,
 }
 
@@ -52,7 +67,7 @@ impl Default for BootOptions {
             gdb_stub: false,
             debug_wait: false,
             smp: 2,
-            display: Display::None,
+            profile: Profile::Headless,
             qmp: false,
             kernel_features: &[],
             ready_marker: DEFAULT_READY,
@@ -215,13 +230,31 @@ impl QemuInstance {
     /// report, and the paint happens after it — so there the host has to look
     /// more than once.
     pub fn screendump_until(&mut self, needle: &str, timeout: Duration) -> super::screen::Ppm {
+        self.screendump_while(timeout, Duration::from_millis(100), |dump| {
+            dump.text().contains(needle)
+        })
+    }
+
+    /// Screendump until `done`, or the timeout. The metal-sim profile has no
+    /// console, so this is the only way to observe that boot at all — and
+    /// what it watches for is a pixel pattern, not text.
+    ///
+    /// Returns the last dump either way; a caller that timed out gets the
+    /// screen as its diagnostic, which under metal-sim is where the kernel's
+    /// boot checkpoints and panic report are.
+    pub fn screendump_while(
+        &mut self,
+        timeout: Duration,
+        interval: Duration,
+        done: impl Fn(&super::screen::Ppm) -> bool,
+    ) -> super::screen::Ppm {
         let deadline = Instant::now() + timeout;
         loop {
             let dump = self.screendump();
-            if dump.text().contains(needle) || Instant::now() >= deadline {
+            if done(&dump) || Instant::now() >= deadline {
                 return dump;
             }
-            thread::sleep(Duration::from_millis(100));
+            thread::sleep(interval);
         }
     }
 
@@ -447,6 +480,18 @@ fn qmp_screendump(socket: &Path, out: &Path) {
     read_reply(&mut stream, &mut pending, "\"return\"");
 }
 
+/// The argv `options` would launch QEMU with, built against placeholder
+/// paths. A profile's claim about which devices exist is a claim about this
+/// list and nothing else — no screendump can see a device that is present but
+/// unused — so this is what a profile assertion has to read.
+pub fn profile_argv(options: &BootOptions) -> Vec<String> {
+    let p = Path::new("/nonexistent");
+    qemu_command(p, p, p, p, None, options)
+        .get_args()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect()
+}
+
 fn qemu_command(
     boot_image: &Path,
     nvme_image: &Path,
@@ -492,8 +537,6 @@ fn qemu_command(
         ))
         .arg("-device")
         .arg("usb-storage,bus=xhci.0,drive=stick,bootindex=0")
-        .arg("-device")
-        .arg("usb-kbd,bus=xhci.0")
         .arg("-drive")
         .arg(format!(
             "if=none,id=nvme0,format=raw,file={}",
@@ -502,38 +545,49 @@ fn qemu_command(
         .arg("-device")
         .arg("nvme,serial=deadbeef,drive=nvme0")
         .arg("-vga")
-        .arg(match options.display {
-            Display::None => "none",
-            Display::Gop => "std",
+        .arg(match options.profile {
+            Profile::Headless => "none",
+            Profile::Gop | Profile::Metal => "std",
         })
         .arg("-display")
         .arg("none")
-        .arg("-netdev")
-        .arg("user,id=net0")
-        .arg("-device")
-        .arg("virtio-net-pci-non-transitional,netdev=net0")
-        // virtio-sound records everything the guest plays into a per-boot
-        // wav for glitch analysis; timer-period matches the interactive
-        // config in src/qemu.rs so test timing represents what users hear.
-        .arg("-audiodev")
-        .arg(format!(
-            "wav,id=audio0,path={},timer-period=5000",
-            audio_wav.display()
-        ))
-        .arg("-device")
-        .arg("virtio-sound-pci,audiodev=audio0,streams=1")
-        // virtio-console on stdio is the primary I/O channel; UART goes to
-        // a temp file so early-boot logs and panic fallback still land
-        // somewhere when the kernel switches backends.
-        .arg("-serial")
-        .arg(format!("file:{}", uart_log.display()))
-        .arg("-chardev")
-        .arg("stdio,id=cs0,signal=off")
-        .arg("-device")
-        .arg("virtio-serial-pci-non-transitional,id=virtio-serial0,max_ports=1")
-        .arg("-device")
-        .arg("virtconsole,chardev=cs0,id=console0")
         .arg("-no-reboot");
+
+    // The T14's keyboard is PS/2 and its touchpad I2C-HID; it has no USB HID
+    // at all, so metal-sim must not have one either.
+    if options.profile.virtio() {
+        qemu.arg("-device").arg("usb-kbd,bus=xhci.0");
+    }
+
+    if options.profile.virtio() {
+        qemu.arg("-netdev")
+            .arg("user,id=net0")
+            .arg("-device")
+            .arg("virtio-net-pci-non-transitional,netdev=net0")
+            // virtio-sound records everything the guest plays into a per-boot
+            // wav for glitch analysis; timer-period matches the interactive
+            // config in src/qemu.rs so test timing represents what users hear.
+            .arg("-audiodev")
+            .arg(format!(
+                "wav,id=audio0,path={},timer-period=5000",
+                audio_wav.display()
+            ))
+            .arg("-device")
+            .arg("virtio-sound-pci,audiodev=audio0,streams=1")
+            // virtio-console on stdio is the primary I/O channel; UART goes to
+            // a temp file so early-boot logs and panic fallback still land
+            // somewhere when the kernel switches backends.
+            .arg("-serial")
+            .arg(format!("file:{}", uart_log.display()))
+            .arg("-chardev")
+            .arg("stdio,id=cs0,signal=off")
+            .arg("-device")
+            .arg("virtio-serial-pci-non-transitional,id=virtio-serial0,max_ports=1")
+            .arg("-device")
+            .arg("virtconsole,chardev=cs0,id=console0");
+    } else {
+        qemu.arg("-serial").arg("none");
+    }
 
     if options.gdb_stub {
         qemu.arg("-s");
@@ -554,9 +608,6 @@ fn spawn_and_wait_ready(
     qmp_socket: Option<PathBuf>,
     screendump: PathBuf,
 ) -> QemuInstance {
-    let no_timeout = options.debug_wait;
-    let ready = options.ready_marker;
-    let panic_aborts = ready == DEFAULT_READY;
     qemu.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
@@ -591,6 +642,33 @@ fn spawn_and_wait_ready(
         full_log
     });
 
+    // A metal-sim guest has no console at all, so there is no marker to wait
+    // for: the caller polls the framebuffer. Blocking here would only time out.
+    if options.profile.virtio() {
+        wait_for_ready(&mut child, &rx, options, &uart_log);
+    }
+
+    QemuInstance {
+        child,
+        stdin,
+        rx,
+        _reader_thread: reader_thread,
+        audio_wav,
+        uart_log,
+        qmp_socket,
+        screendump,
+    }
+}
+
+fn wait_for_ready(
+    child: &mut Child,
+    rx: &Receiver<String>,
+    options: &BootOptions,
+    uart_log: &Path,
+) {
+    let no_timeout = options.debug_wait;
+    let ready = options.ready_marker;
+    let panic_aborts = ready == DEFAULT_READY;
     let boot_timeout = Duration::from_secs(10);
     let start = Instant::now();
     loop {
@@ -631,7 +709,7 @@ fn spawn_and_wait_ready(
             // stdio at all; the UART file is the only channel it has.
             Err(RecvTimeoutError::Timeout) => {
                 if !panic_aborts
-                    && fs::read_to_string(&uart_log).is_ok_and(|s| s.contains(ready))
+                    && fs::read_to_string(uart_log).is_ok_and(|s| s.contains(ready))
                 {
                     break;
                 }
@@ -642,16 +720,5 @@ fn spawn_and_wait_ready(
                 panic!("[qemu] QEMU died before {ready} (status: {status:?})");
             }
         }
-    }
-
-    QemuInstance {
-        child,
-        stdin,
-        rx,
-        _reader_thread: reader_thread,
-        audio_wav,
-        uart_log,
-        qmp_socket,
-        screendump,
     }
 }

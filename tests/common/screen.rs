@@ -148,6 +148,29 @@ impl Ppm {
         self.pixels[self.width * self.height - 1]
     }
 
+    /// The colour of pixel row `y` if every pixel in it is that colour, else
+    /// `None`. A full-width band of one colour is what a `fill_rect` spanning
+    /// the screen leaves behind, and nothing narrower can fake it.
+    pub fn row_uniform(&self, y: usize) -> Option<[u8; 3]> {
+        let row = &self.pixels[y * self.width..(y + 1) * self.width];
+        let first = row[0];
+        row.iter().all(|&p| p == first).then_some(first)
+    }
+
+    /// How many distinct colours appear, sampling every `step`-th pixel in
+    /// both axes. The text console draws in two colours over one fill, so
+    /// this separates "something rendered an image here" from "something
+    /// wrote text here" without knowing what the image is.
+    pub fn distinct_colors(&self, step: usize) -> usize {
+        let mut seen = std::collections::HashSet::new();
+        for y in (0..self.height).step_by(step) {
+            for x in (0..self.width).step_by(step) {
+                seen.insert(self.pixels[y * self.width + x]);
+            }
+        }
+        seen.len()
+    }
+
     /// The index of the first cell row containing `needle`.
     pub fn row_index(&self, needle: &str) -> Option<usize> {
         self.rows().iter().position(|r| r.contains(needle))
