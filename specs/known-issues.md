@@ -773,15 +773,25 @@ device count, where a HID on a later port loses its slot to a hub on an earlier
 one. `xhci_slot_exhaustion` is what would catch the regression — it already
 proves the machine survives the shortage, not that the right devices win it.
 
-### The xHCI driver assumes the controller's PAGESIZE is 4 KiB
+### The xHCI driver refuses a controller whose PAGESIZE is not 4 KiB
 
-`init` reads OP_PAGESIZE and logs it (`xHCI: max_slots=… pagesize=0x1`) and
-nothing reads it again. Every structure the driver places — rings, contexts,
-scratchpad buffers — is sized and aligned to a hardcoded 4 KiB. Bit 0 of that
-register is what says 4 KiB, and every shipping xHC sets exactly that bit; a
-controller that reported 8 KiB or 64 KiB would get scratchpad buffers smaller
-than it writes into, which is memory corruption with no diagnostic. The log
-line is there so the T14 says which it is on its first boot.
+`init` logs OP_PAGESIZE and then asserts it is bit 0, which is the bit that
+says 4 KiB; every shipping xHC sets exactly that bit. Every structure the
+driver places — rings, contexts, scratchpad buffers — is sized and aligned to
+a hardcoded 4 KiB, so a controller reporting 8 KiB or 64 KiB is unimplemented,
+not merely unusual, and the machine says so at init instead of corrupting
+memory silently.
+
+The scratchpad is the whole exposure. Its entries are one 4 KiB page apart,
+so at PAGESIZE 8 KiB with `max_scratchpad = 8` entry 7 sits at 0xF000 and the
+controller writes [0xF000, 0x11000) — over entry 6 and into block 0's
+interrupt ring at `dev_base`. Every other consequence runs the safe way: a
+larger page size only relaxes the rule that the DCBAA and the device contexts
+must not cross one.
+
+What is still not built is honouring such a controller. If a machine ever
+trips the assert, the fix is to derive `PAGE` from the register instead of
+raising the bound.
 
 ### The xHCI driver resets the controller without taking ownership from firmware
 

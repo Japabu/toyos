@@ -131,7 +131,7 @@ impl TrbRing {
 
 /// The granularity every structure below is placed at. It is the xHCI
 /// PAGESIZE the controller reports, and no shipping xHC reports anything else;
-/// `init` logs the register so a machine that disagrees says so.
+/// `init` asserts the register rather than trusting the coincidence.
 const PAGE: usize = 0x1000;
 
 // The pool's fixed head. Everything here is either the controller's own state
@@ -509,8 +509,17 @@ pub fn init(ecam: &crate::mm::Mmio) -> Option<XhciController> {
     let db_base = bar.subregion(db_offset, bar_size - db_offset);
     let rt_base = bar.subregion(rts_offset, bar_size - rts_offset);
 
+    let pagesize = op_base.read_u32(OP_PAGESIZE) & 0xFFFF;
     log!("xHCI: max_slots={} max_ports={} ctx_size={} pagesize={:#x}",
-        max_slots, max_ports, context_size, op_base.read_u32(OP_PAGESIZE));
+        max_slots, max_ports, context_size, pagesize);
+    // Bit 0, and only bit 0, means 4 KiB. The scratchpad is the whole exposure:
+    // its entries are one PAGE apart, so a controller that means 8 KiB writes
+    // each buffer over the next and the last one past `dev_base` into block 0's
+    // interrupt ring — memory corruption with no diagnostic. Every other
+    // consequence runs the safe way, since a larger page size only relaxes the
+    // rule that the DCBAA and the contexts must not cross one.
+    assert_eq!(pagesize, 1,
+        "xHCI: controller wants a page size this driver does not implement, PAGESIZE={pagesize:#x}");
 
     let max_sp_hi = ((hcsparams2 >> 21) & 0x1F) as usize;
     let max_sp_lo = ((hcsparams2 >> 27) & 0x1F) as usize;
