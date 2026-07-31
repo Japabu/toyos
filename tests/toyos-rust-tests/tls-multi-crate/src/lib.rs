@@ -1,6 +1,6 @@
 use std::cell::Cell;
 
-/// const-initialized TLS — like cranelift's CURRENT_PASS
+// const-initialized TLS — like cranelift's CURRENT_PASS
 thread_local! {
     static CURRENT: Cell<u8> = const { Cell::new(0) };
 }

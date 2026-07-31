@@ -190,15 +190,28 @@ fn cargo_build(
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
-    if quiet {
-        // Capture stderr so we can show it only on failure (suppress warnings on success).
-        cmd.stderr(std::process::Stdio::piped());
-    }
-    let output = cmd.output()
-        .unwrap_or_else(|e| panic!("cargo build failed to launch in {}: {e}", crate_dir.display()));
-    if !output.status.success() {
-        // Always show stderr on failure so compiler errors are visible.
+    // `Command::output()` pipes any stream the builder left unset, so reaching
+    // for it is a decision to capture *both* modes, not just the quiet one.
+    // Diagnostics must survive a successful build either way: a warning nobody
+    // sees is a warning nobody fixes.
+    let status = if quiet {
+        // The caller owns the terminal (the test harness interleaves this with
+        // its own progress), so hold cargo's output until the crate is done and
+        // replay it as one block. `--quiet` reduces that block to diagnostics.
+        let output = cmd
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .unwrap_or_else(|e| {
+                panic!("cargo build failed to launch in {}: {e}", crate_dir.display())
+            });
         std::io::Write::write_all(&mut std::io::stderr(), &output.stderr).ok();
+        output.status
+    } else {
+        cmd.status().unwrap_or_else(|e| {
+            panic!("cargo build failed to launch in {}: {e}", crate_dir.display())
+        })
+    };
+    if !status.success() {
         panic!("cargo build failed in {}", crate_dir.display());
     }
 }
