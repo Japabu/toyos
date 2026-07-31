@@ -68,6 +68,7 @@ const MACHINE_TESTS: &[&str] = &[
     "metal_sim_compositor",
     "metal_sim_input",
     "xhci_many_devices",
+    "nvme_large_device",
     "i8042_keyboard",
     "i8042_no_spurious_wake",
     "i8042_mouse",
@@ -1491,6 +1492,131 @@ fn run_machine_test(
             );
             Ok(())
         }
+        "nvme_large_device" => {
+            // Device *size* is a shape dimension, and it is the one nobody had
+            // varied: every test image was small enough that an index sized
+            // per device block fit under the object allocator's 2 MiB ceiling,
+            // so the first boot on the laptop was the first time anything
+            // asked for a device-sized allocation — and it died in
+            // page_cache::init before it mounted anything.
+            let options = BootOptions {
+                profile: qemu::Profile::MetalDisk,
+                ..Default::default()
+            };
+            let mut qemu = QemuInstance::boot_with_options(test_config, c_bins, rust_bins, options);
+            let log = qemu.boot_log().to_string();
+
+            // The mechanism, not the argv: a big file on the host proves
+            // nothing until the guest's own driver says it enumerated a big
+            // namespace. This is the number the T14 printed.
+            let Some(blocks) = parse_nvme_blocks(&log) else {
+                return Err(format!("the NVMe driver printed no block count:\n{log}"));
+            };
+            if blocks != qemu::NVME_T14_BLOCKS {
+                return Err(format!(
+                    "the guest enumerated {blocks} blocks, not the T14's {}",
+                    qemu::NVME_T14_BLOCKS
+                ));
+            }
+
+            // And the cache did not size its index by that number.
+            //
+            // The bound has to sit *below* the allocator's 2 MiB ceiling to be
+            // able to fire at all, which is a narrower window than it looks:
+            // a hashbrown index costs 17 B per bucket and its capacities are
+            // 7/8 of a power of two, so the last one that fits under the
+            // ceiling is 114,688 and the next is unreachable. 16,384 leaves
+            // room for a fixed reserve mirroring `slot_to_block`'s 4096 (which
+            // rounds up to 7168) and rejects every device-proportional reserve
+            // down to one entry per 4 MiB of disk. Measured red at 57,344,
+            // which is what `block_count / 1024` asks for and the allocator
+            // lets through.
+            let Some(index) = parse_page_cache_index(&log) else {
+                return Err(format!("the page cache printed no index size:\n{log}"));
+            };
+            if index > 16_384 {
+                return Err(format!(
+                    "the block index is sized for {index} blocks on a {blocks}-block device — \
+                     that is proportional to the device again:\n{log}"
+                ));
+            }
+
+            // The whole storage stack on the real geometry, not just the boot:
+            // format, allocate, write, read back.
+            let result = qemu.run_test("test_rs_nvme_home_roundtrip", Duration::from_secs(20));
+            if !check_rust_result(&result) {
+                return Err(format!(
+                    "the /home round trip failed on a {blocks}-block device:\n{}",
+                    result.stdout
+                ));
+            }
+
+            // Then shut down, which is the only thing that runs the page
+            // cache's write-back over every dirty slot the format left —
+            // ~1900 of them on a device this size against 8 on the small one,
+            // so the coalescing loop is only ever exercised at scale here.
+            //
+            // The kernel's own "Syncing filesystems..." is not observable:
+            // `log!` queues into the ring the scheduler drains, and
+            // acpi::shutdown() cuts the power first. So the assertions below
+            // stand outside the guest entirely.
+            let image = qemu.nvme_image().to_path_buf();
+            writeln!(qemu.stdin_mut(), "run shutdown").expect("write to QEMU stdin");
+            qemu.flush_stdin();
+            let tail = qemu.drain_serial(Duration::from_secs(20));
+
+            for (what, text) in [("boot", &log), ("shutdown", &tail)] {
+                for bad in ["!!! PANIC !!!", "KERNEL PANIC", "panicked at"] {
+                    if text.contains(bad) {
+                        return Err(format!("{bad:?} during {what}, which should be clean:\n{text}"));
+                    }
+                }
+            }
+
+            // Ground truth at the hardware boundary: the backing file is what
+            // the *device* received, so this is the one place a storage claim
+            // does not rest on the guest's account of itself. The clean flag
+            // reaches the platter only through `PageCache::sync`, and the
+            // backup superblock only through a write at byte 256,060,510,208 —
+            // the far end of a 244 GB device.
+            for (name, block) in [("primary", 0), ("backup", qemu::NVME_T14_BLOCKS - 1)] {
+                let sb = read_superblock(&image, block)
+                    .map_err(|e| format!("{name} superblock at block {block}: {e}"))?;
+                if sb.block_count != qemu::NVME_T14_BLOCKS {
+                    return Err(format!(
+                        "the {name} superblock was formatted for {} blocks, not {}",
+                        sb.block_count,
+                        qemu::NVME_T14_BLOCKS
+                    ));
+                }
+                if !sb.is_clean() {
+                    return Err(format!(
+                        "the {name} superblock is not marked clean — the write-back at \
+                         shutdown did not reach the device"
+                    ));
+                }
+            }
+
+            // And the image is still sparse. A materialized one is how a test
+            // disk ends up small enough to hide this class of bug in the first
+            // place, and 244 GB of zeros is not something to leave on a laptop.
+            let (apparent, allocated) = image_extent(&image);
+            if apparent != qemu::NVME_T14_BYTES {
+                return Err(format!("the image is {apparent} bytes, want {}", qemu::NVME_T14_BYTES));
+            }
+            if allocated > 1024 * 1024 * 1024 {
+                return Err(format!(
+                    "the image occupies {allocated} bytes of the host's disk — it is not sparse"
+                ));
+            }
+            eprintln!(
+                "  [nvme] {blocks} blocks, index sized for {index}; both superblocks clean; \
+                 image {} MiB on disk of {} GB apparent",
+                allocated / (1024 * 1024),
+                apparent / 1_000_000_000
+            );
+            Ok(())
+        }
         "xhci_slot_exhaustion" => {
             // A device count is untrusted input: more devices than the driver
             // has room for must cost those devices and nothing else. QEMU
@@ -2283,6 +2409,50 @@ fn parse_mouse_events(stdout: &str) -> Vec<MouseLine> {
             })
         })
         .collect()
+}
+
+/// The block count the NVMe driver derived, out of
+/// `NVMe: block device id=1 blocks=62514774 (244198MB)`.
+fn parse_nvme_blocks(log: &str) -> Option<u64> {
+    log.lines()
+        .find_map(|l| l.split("NVMe: block device id=").nth(1))?
+        .split("blocks=")
+        .nth(1)?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// How many blocks the page cache's index has room for, out of
+/// `page cache: N device blocks, index sized for C cached blocks`.
+fn parse_page_cache_index(log: &str) -> Option<u64> {
+    log.lines()
+        .find_map(|l| l.split("index sized for ").nth(1))?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// Decode one bcachefs superblock straight out of a disk image, with the
+/// same parser the kernel uses — magic, version and CRC all checked.
+fn read_superblock(image: &Path, block: u64) -> Result<bcachefs::Superblock, String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = fs::File::open(image).map_err(|e| format!("open {}: {e}", image.display()))?;
+    f.seek(SeekFrom::Start(block * 4096)).map_err(|e| format!("seek: {e}"))?;
+    let mut buf = bcachefs::BlockBuf::zeroed();
+    f.read_exact(buf.as_bytes_mut()).map_err(|e| format!("read: {e}"))?;
+    bcachefs::Superblock::parse(&buf).map_err(|e| format!("{e:?}"))
+}
+
+/// A disk image's apparent size and the bytes it actually occupies. The gap
+/// between the two is the whole reason a 244 GB test device is affordable.
+fn image_extent(path: &Path) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    let meta = fs::metadata(path)
+        .unwrap_or_else(|e| panic!("stat {}: {e}", path.display()));
+    (meta.len(), meta.blocks() * 512)
 }
 
 /// The guest's own boot duration, out of `Boot: complete (123ms)`.

@@ -40,6 +40,13 @@ pub enum Profile {
     /// alongside whatever is plugged in, and a profile with one USB device
     /// cannot see any defect that needs a fourth.
     MetalUsb,
+    /// metal-sim with the T14's actual NVMe capacity instead of a token
+    /// image. Device *size* is a shape dimension and it was the one nobody
+    /// had varied: every test disk was small enough that a per-device-block
+    /// index fit under the object allocator's 2 MiB ceiling, so the first
+    /// boot on the laptop was the first time anything asked for a
+    /// device-sized allocation.
+    MetalDisk,
 }
 
 /// The controller every profile but [`Profile::MetalUsb`] gets. `nec-usb-xhci`
@@ -79,18 +86,49 @@ struct Shape {
     /// test measure anything: QEMU activates one input handler per device
     /// class, so with a usb-kbd present every injected keystroke goes to it.
     usb: &'static [&'static str],
+    /// The NVMe namespace's size. The backing file is sparse, so this is free
+    /// to state honestly — and it has to be stated, because a kernel
+    /// structure sized per device block is bounded by this number and by
+    /// nothing else.
+    nvme_bytes: u64,
 }
+
+/// What every profile but [`Profile::MetalDisk`] gives the guest. Large
+/// enough for a filesystem, small enough that a boot formats it quickly.
+const NVME_SMALL: u64 = 128 * 1024 * 1024;
+
+/// The T14 Gen 2's namespace, to the byte: 500,118,192 sectors of 512 B.
+/// Taken from the laptop's own boot line rather than rounded from "244 GB",
+/// so a test that asserts on the block count is asserting against the machine
+/// that gets flashed.
+pub const NVME_T14_BYTES: u64 = 500_118_192 * 512;
+/// The same device as the kernel counts it: 62,514,774 blocks of 4 KiB.
+pub const NVME_T14_BLOCKS: u64 = NVME_T14_BYTES / 4096;
 
 impl Profile {
     fn shape(self) -> Shape {
         match self {
-            Self::Headless => {
-                Shape { vga: "none", virtio: true, xhci: XHCI_DEFAULT, usb: &["usb-kbd"] }
-            }
-            Self::Gop => {
-                Shape { vga: "std", virtio: true, xhci: XHCI_DEFAULT, usb: &["usb-kbd"] }
-            }
-            Self::Metal => Shape { vga: "std", virtio: false, xhci: XHCI_DEFAULT, usb: &[] },
+            Self::Headless => Shape {
+                vga: "none",
+                virtio: true,
+                xhci: XHCI_DEFAULT,
+                usb: &["usb-kbd"],
+                nvme_bytes: NVME_SMALL,
+            },
+            Self::Gop => Shape {
+                vga: "std",
+                virtio: true,
+                xhci: XHCI_DEFAULT,
+                usb: &["usb-kbd"],
+                nvme_bytes: NVME_SMALL,
+            },
+            Self::Metal => Shape {
+                vga: "std",
+                virtio: false,
+                xhci: XHCI_DEFAULT,
+                usb: &[],
+                nvme_bytes: NVME_SMALL,
+            },
             // Two keyboards and two pointers, because the collision this
             // stages is between devices of the same HID class; a hub for a
             // second non-HID device, since it needs no backing file and the
@@ -100,6 +138,14 @@ impl Profile {
                 virtio: false,
                 xhci: XHCI_WIDE,
                 usb: &["usb-kbd", "usb-kbd", "usb-mouse", "usb-tablet", "usb-hub"],
+                nvme_bytes: NVME_SMALL,
+            },
+            Self::MetalDisk => Shape {
+                vga: "std",
+                virtio: false,
+                xhci: XHCI_DEFAULT,
+                usb: &[],
+                nvme_bytes: NVME_T14_BYTES,
             },
         }
     }
@@ -166,6 +212,7 @@ pub struct QemuInstance {
     _reader_thread: thread::JoinHandle<String>,
     audio_wav: PathBuf,
     uart_log: PathBuf,
+    nvme_image: PathBuf,
     qmp_socket: Option<PathBuf>,
     screendump: PathBuf,
     boot_log: String,
@@ -249,10 +296,12 @@ impl QemuInstance {
         let boot_image = test_dir.join("test-bootable.img");
         fs::write(&boot_image, &disk).expect("Failed to write test boot image");
 
-        let nvme_image = test_dir.join("test-nvme.img");
+        // Named by size, so two profiles that disagree about the device do
+        // not hand each other a filesystem formatted for the wrong one.
+        let nvme_bytes = options.profile.shape().nvme_bytes;
+        let nvme_image = test_dir.join(format!("test-nvme-{nvme_bytes}.img"));
         if !nvme_image.exists() {
-            fs::write(&nvme_image, vec![0u8; 128 * 1024 * 1024])
-                .expect("Failed to write NVMe image");
+            toyos_build::build::create_sparse(&nvme_image, nvme_bytes);
         }
 
         let seq = BOOT_SEQ.fetch_add(1, Ordering::Relaxed);
@@ -279,7 +328,9 @@ impl QemuInstance {
             qmp_socket.as_deref(),
             &options,
         );
-        spawn_and_wait_ready(qemu, &options, audio_wav, uart_log, qmp_socket, screendump)
+        spawn_and_wait_ready(
+            qemu, &options, audio_wav, uart_log, nvme_image, qmp_socket, screendump,
+        )
     }
 
     /// Capture the guest's scanout through QMP and return the decoded PPM.
@@ -375,6 +426,13 @@ impl QemuInstance {
     /// The RIFF size fields stay 0 until QEMU exits cleanly — parse to EOF.
     pub fn audio_wav_path(&self) -> &Path {
         &self.audio_wav
+    }
+
+    /// The NVMe backing file. It is what the *device* received, so it is the
+    /// only place a storage assertion can stand outside the guest's own
+    /// account of itself.
+    pub fn nvme_image(&self) -> &Path {
+        &self.nvme_image
     }
 
     pub fn stdin_mut(&mut self) -> &mut BufWriter<ChildStdin> {
@@ -841,6 +899,7 @@ fn spawn_and_wait_ready(
     options: &BootOptions,
     audio_wav: PathBuf,
     uart_log: PathBuf,
+    nvme_image: PathBuf,
     qmp_socket: Option<PathBuf>,
     screendump: PathBuf,
 ) -> QemuInstance {
@@ -893,6 +952,7 @@ fn spawn_and_wait_ready(
         _reader_thread: reader_thread,
         audio_wav,
         uart_log,
+        nvme_image,
         qmp_socket,
         screendump,
         boot_log,

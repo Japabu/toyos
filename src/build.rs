@@ -363,12 +363,22 @@ pub fn build(root: &Path, debug: bool, release: bool) {
     let disk_bytes = image::create_boot_image(&initrd_bytes, profile);
     fs::write(root.join("target/bootable.img"), disk_bytes).expect("Failed to write image");
 
-    // Create empty NVMe disk image if it doesn't already exist
     let nvme_path = root.join("target/nvme.img");
     if !nvme_path.exists() {
-        let nvme_bytes = vec![0u8; 1024 * 1024 * 1024];
-        fs::write(&nvme_path, nvme_bytes).expect("Failed to write NVMe image");
+        create_sparse(&nvme_path, 1024 * 1024 * 1024);
     }
+}
+
+/// Create an empty disk image the guest sees at full size and the host pays
+/// nothing for until something is written. A materialized image caps how big
+/// a device the tests may present, and device *size* is a shape dimension:
+/// an index sized per device block is invisible on a small disk and fatal on
+/// a real one.
+pub fn create_sparse(path: &Path, len: u64) {
+    let file = fs::File::create(path)
+        .unwrap_or_else(|e| panic!("create {}: {e}", path.display()));
+    file.set_len(len)
+        .unwrap_or_else(|e| panic!("set_len {} on {}: {e}", len, path.display()));
 }
 
 /// Build a test image from a system.toml config. Returns the raw disk image bytes.
