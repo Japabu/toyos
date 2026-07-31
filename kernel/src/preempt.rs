@@ -10,6 +10,11 @@
 //!
 //! When `enable()` drops the count to zero AND `need_resched` is set, the
 //! slow path runs `scheduler::do_preempt()` to actually yield.
+//!
+//! The word is per-CPU but the depth it holds belongs to the running *context*,
+//! so `Hw::switch` swaps it with the incoming context's saved depth. Without
+//! that swap the count is not conserved across a switch and its absolute value
+//! means nothing — which is what `scheduler.rs`'s §6.4 baselines rest on.
 
 use core::arch::asm;
 use core::sync::atomic::Ordering;
@@ -31,6 +36,23 @@ pub fn count() -> u32 {
             options(nomem, nostack, preserves_flags));
     }
     v
+}
+
+/// Load the depth the context being switched *to* left behind.
+///
+/// The count is a per-CPU word but the depth it counts is per *context*: a task
+/// that parks two levels deep inside a syscall owes two `enable`s, while a task
+/// preempted at IRQ exit owes one, and the idle context owes one. Handing the
+/// word over unchanged at the switch would therefore credit the incoming
+/// context with the outgoing one's depth. Every context carries its own depth
+/// in its `KernelCtx` instead, and `Hw::switch` swaps it with the word.
+#[inline]
+pub fn set_count(v: u32) {
+    if !percpu_ready() { return; }
+    unsafe {
+        asm!("mov gs:[240], {:e}", in(reg) v,
+            options(nostack, preserves_flags));
+    }
 }
 
 #[inline]
@@ -102,3 +124,4 @@ pub fn enable() {
         crate::scheduler::do_preempt();
     }
 }
+

@@ -72,6 +72,10 @@ pub struct KernelCtx {
     pub kernel_stack_top: u64,
     /// `None` is this CPU's idle context.
     pub id: Option<TaskId>,
+    /// This context's own preempt depth, swapped with the per-CPU word at every
+    /// switch (see [`crate::preempt::set_count`]). Contexts do not all owe the
+    /// same number of `enable`s, so the word cannot simply be inherited.
+    pub preempt: u32,
 }
 
 /// Everything the kernel owns per task and must release exactly once. The

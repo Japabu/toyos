@@ -122,8 +122,9 @@ impl Hw for KernelHw {
     /// there is no `CpuSched` left to consult and nothing scheduler-related to
     /// do on either side of the switch.
     ///
-    /// The order is forced. `fs_base` is a live register, so the outgoing
-    /// context has to capture it before anything is reloaded; the percpu
+    /// The order is forced. `fs_base` and the preempt count are live per-CPU
+    /// state, so the outgoing context has to capture them before anything is
+    /// reloaded; the percpu
     /// identity, the TSS stack and CR3 must all be the incoming task's *before*
     /// the stack pointer moves, because after `context_switch` this frame no
     /// longer exists.
@@ -136,7 +137,9 @@ impl Hw for KernelHw {
         // pass — i.e. never while its context is the one being switched.
         unsafe {
             (*save).fs_base = cpu::rdfsbase();
+            (*save).preempt = crate::preempt::count();
             let incoming: &KernelCtx = &*restore;
+            crate::preempt::set_count(incoming.preempt);
             percpu::set_current_tid(incoming.id.map(|id| id.1));
             percpu::set_current_pid(incoming.id.map(|id| id.0));
             match incoming.id {

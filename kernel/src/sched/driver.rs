@@ -174,6 +174,10 @@ fn idle_ctx() -> KernelCtx {
         fs_base: 0,
         kernel_stack_top: 0,
         id: None,
+        // Never read: a CPU can only switch *to* its idle context from a task,
+        // and reaching a task means it switched away from idle first, which
+        // wrote the real depth. The idle loop enters by jump, not by switch.
+        preempt: 0,
     }
 }
 
@@ -229,6 +233,8 @@ pub fn spawn(new: NewTask) -> ThreadSched {
         fs_base: new.fs_base,
         kernel_stack_top,
         id: Some(new.id),
+        // The one level `trampoline_entry` discharges before the first `iretq`.
+        preempt: 1,
     };
     let handle = Arc::new(TaskHandle::new());
     let task = TaskBuilder {
@@ -295,7 +301,9 @@ fn env(preempt: &PreemptOff) -> Env<'_, crate::hw::KernelHw, PreemptOff> {
 ///
 /// The preempt count is raised here and lowered by whichever context comes back
 /// on this stack: this one after the switch returns, or a fresh task's
-/// trampoline. It balances per context, not per call.
+/// trampoline. It balances per context, not per call — which is why the count
+/// travels *with* the context across the switch (`Hw::switch`) instead of being
+/// inherited by whoever lands on the CPU next.
 pub fn pass(dispose: Dispose) {
     crate::preempt::disable();
     // A pass *is* the reschedule the request asks for, so it owns the clear —
