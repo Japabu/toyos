@@ -493,9 +493,14 @@ pub fn init(ecam: &crate::mm::Mmio) -> Option<XhciController> {
 
     device::scan_ports(&mut ctrl, &op_base, max_ports);
 
+    // A controller with no HID on it is still a controller, and returning it
+    // is not a formality: it has been reset, started and armed with MSI-X, so
+    // dropping it here leaves a live interrupter with nothing draining its
+    // event ring. It is also the ordinary state of the target laptop, whose
+    // keyboard is PS/2 and whose touchpad is I2C-HID — under metal-sim this
+    // `None` reached `kernel_main`'s `.expect` and panicked the boot.
     if ctrl.devices.is_empty() {
         log!("xHCI: no HID devices found");
-        return None;
     }
 
     Some(ctrl)

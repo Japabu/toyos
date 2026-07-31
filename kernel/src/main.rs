@@ -329,8 +329,10 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     // Phase 4: Peripherals
     let t_periph = clock::nanos_since_boot();
 
-    let xhci_ctrl = xhci::init(&ecam).expect("xHCI: no USB controller found");
-    xhci::set_global(xhci_ctrl);
+    match xhci::init(&ecam) {
+        Some(ctrl) => xhci::set_global(ctrl),
+        None => log!("xHCI: no controller on this machine, USB input unavailable"),
+    }
     acpi::init_power(kernel_args.rsdp_addr);
 
     boot_phase!("peripherals ready", t_periph);
