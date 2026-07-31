@@ -294,6 +294,19 @@ any fix should cover both (a per-CPU in-panic flag that poisons or force-release
 locks the dying thread holds). There is no `#[alloc_error_handler]`, so a null
 return from dlmalloc wedges identically with a worse message.
 
+**Scoping result: this does not need a test-only actuator, and it is the same
+problem as the missing bound.** `KernelAllocator::alloc` takes the dlmalloc lock
+(`alloc.rs:78`) and then calls `dlm.malloc`, which calls back into
+`KernelPageSource::alloc`, whose `assert!(size <= PAGE_2M)` fires **inside that
+lock**. So "panicked while holding the allocator lock" is reachable from any
+syscall path that can be driven to request a kernel allocation over 2 MiB — an
+ordinary workload route, not injection. The same unchecked size is independently a
+userland-triggered kernel panic, so the two entries are one defect seen from two
+ends: bound the allocation and both close.
+
+Whether such a path exists is a read-only audit, in progress. **No conclusion is
+recorded here** — that is what the audit is for.
+
 ### A panic while holding `PROCESS_TABLE` hangs the panicking CPU
 
 `try_recover_from_panic` lands in `sched::driver::idle_loop`, whose
@@ -380,22 +393,41 @@ found this session, after I5 fairness and the unreachable kernel `check` build.
 In `submit_and_wait`. Bounding that wait is a `virtio.rs` semantics change that
 needs its own discussion.
 
-### `crash_report`'s own DESIGN RULE endorses a call that can re-enter the scheduler
+### CLOSED — a CPU reporting a crash could re-enter the scheduler
 
-`kernel/src/arch/idt/exceptions.rs:107-110` permits `try_lock`, and
-`crash_report_panic` uses it at `:239` for its process lookup. But
-`Lock::try_lock` calls `preempt::disable()`, and both its failure path and its
-guard's `Drop` call `preempt::enable()` (`sync.rs:48-58`, `:85-88`), which
-dispatches `scheduler::do_preempt()` when the count reaches zero with
-`need_resched` set (`preempt.rs:107-124`). A panic in syscall context at depth
-0 with a pending resched can therefore enter the scheduler from inside the
-crash report — the one place that must not happen.
+Closed centrally at `bd12795`, and **not where this entry pointed.** The entry
+proposed tightening the DESIGN RULE to ban `try_lock` and rewriting
+`crash_report_panic`'s lookup. The actual property is narrower and belongs
+elsewhere: `Lock::try_lock` raises the preempt count, and both its failure path
+and its guard's `Drop` lower it — so on the pass that took the count to zero with
+`need_resched` set, `preempt::enable` dispatched `do_preempt` **from inside the
+crash report**. `preempt::enable` now declines the slow path while
+`PerCpu::fault_state` is non-zero (`preempt.rs:129`, `faulting()`), placing "a CPU
+inside a fault or panic report is not reschedulable" where preemption is decided
+rather than chasing it across four `try_lock` call sites.
 
-Two things to do, neither done: the rule should read "no locks at all,
-including `try_lock`", and `crash_report_panic`'s process lookup should become
-a lock-free read or be dropped. `kernel/src/drivers/panic_console/mod.rs`
-already states the stricter rule and obeys it; `exceptions.rs` is the
-remaining half.
+`panic_console` had already refused `try_lock` for exactly this reason and
+documented it; the rest of the crash path kept using it. That asymmetry — one
+module obeying a stricter rule than the file that states the rule — is the shape
+worth remembering.
+
+**Caveat: it is not free.** A `fault_state` left non-Normal now costs that CPU its
+preemption for the rest of the boot. The invariant holds today (every recovery
+path sets Normal, every other path halts), but a leak is now a **hang** rather
+than a nuisance. Anyone changing fault handling needs to know that the failure
+mode moved.
+
+### No test distinguishes the crash-report preemption fix from a no-op
+
+`bd12795` rests on reading the code, which is the weakest standard this project
+accepts. Staging it needs a crash report whose preempt count returns to zero with
+`need_resched` set — a timing coincidence the harness cannot ask for. The three
+panic-path tests still passing says only that nothing regressed.
+
+Fourth instance this session of the pattern in
+`specs/spec-staleness-sweep.md` ("Break it and run it"), and the only one of the
+four where the check is genuinely hard rather than merely skipped. Recorded so it
+is not mistaken for the same tested standard as the fixes around it.
 
 ### `percpu.syscall_rip` is never cleared, so "in syscall context" is a guess
 
@@ -630,33 +662,59 @@ virtio device — that is what `--metal-sim` is for.
 Not a doc bug — a plan defect. A plan that fails the suite is not ready to execute, and the
 suite is right here. Whoever picks R2 up must re-scope it against those tests first.
 
-### Three scheduler instruments the spec describes and the code does not have
+### The scheduler's fair split degrades as the machine widens
 
-The worst class this project has: a spec claiming a check exists when it does
-not. `specs/metal-track-history.md` calls these "certifications that could not
-fail". All three verified 2026-08-01; an agent is assigned to build them, and
-they are filed here so they stay visible if that work does not land.
+Measured in the host simulator over 400 seeds: worst service spread is **30 ms at
+1 CPU and 1056 ms at 24 CPUs** — roughly 35x, and a real offset rather than noise.
+CLAUDE.md's stated requirement is scaling to 128+ cores without excessive
+overhead, and this is the fairness half of that claim failing well below 128.
 
-**I5, fairness, is checked nowhere.** `specs/scheduler-core-spec.md` lists it in
-a table headed "checked after every sim step". `toyos-sched/src/invariants.rs`
-defines exactly four items — `residents`, `check_cpu`, `check_timer`,
-`earliest_event` — and none of them is a fairness check; the only occurrence of
-the word in the crate is a doc comment in `sim/src/hw_impl.rs:4`. Nothing checks
-fairness in a scheduler whose entire stated design is fair-share, and Stage 9's
-exit criterion gates on it, so that stage cannot be gated today.
+Two qualifications, both load-bearing for whoever picks this up:
 
-**The kernel `check` build is unreachable.** `check_cpu` is behind
-`#[cfg(feature = "check")]` (`toyos-sched/src/cpu.rs:867`). `kernel/Cargo.toml`
-declares no `check` feature and its dependency is a bare
-`toyos-sched = { path = "../toyos-sched" }` with no `features` forwarding, so
-`toyos-sched/check` cannot be turned on from any kernel build this tree can
-produce. The invariant walk has never run inside the kernel. The max-pass-duration
-assert the check build is supposed to carry does not exist in any form.
+- **Simulator, not hardware.** Whether this is a property of the shipped policy or
+  an artifact of the simulator's model is *not established*, and that distinction
+  decides whether this is a defect or an instrument problem. **No conclusion is
+  recorded here** pending that answer.
+- **It was only findable because I5 measures service** — nanoseconds actually
+  delivered per process — rather than checking the vruntime bookkeeping against
+  itself. The bookkeeping form would have been true by construction and could
+  never have surfaced this. That is the dead-gate lesson
+  (`specs/spec-staleness-sweep.md`) from the other direction: the first question
+  about a gate is not whether it passes but whether it measures the quantity you
+  care about.
 
-**`from-qemu` is `unimplemented!()`.** `toyos-sched/sim/src/main.rs:191`. §10.4
-describes it as a working pipeline for replaying a captured kernel trace through
-the simulator; the CLI help advertises it (`main.rs:27`) and the panic message
-says the kernel's `TraceEvent` ring lands at migration Stage 6.
+### `src/build.rs` cannot enable `sched-check`, so no CI run exercises it
+
+The kernel check build is reachable now — `kernel/Cargo.toml:63` forwards
+`sched-check = ["toyos-sched/check"]`, and `cpu::MAX_PASS_NS` is 200 µs with
+invariant P asserting against it (`cpu.rs:618`, `:1013`). But nothing in `src/`
+mentions `sched-check`, so it can only be turned on by hand and the harness never
+does.
+
+A check build nobody can run from CI is halfway back to being unreachable, which
+is the defect it was built to fix.
+
+### CLOSED — the three uncertifiable scheduler instruments
+
+All three are resolved, and the third is resolved by *subtraction*, which is worth
+recording as a legitimate outcome:
+
+- **I5 exists** and measures service against equal entitlement over a contention
+  window, with `fairness_storm(cpus)` and a CLI form for Stage 9's 1–128. It
+  immediately found the fairness degradation above.
+- **The kernel check build is wired** (`sched-check` → `toyos-sched/check`), with
+  the CI gap filed separately above.
+- **`from-qemu` was deleted, not implemented** (`hw.rs:52-53`). The capability
+  given up is stated precisely, and it is not the subcommand — that was an
+  `unimplemented!()` — but the *promise* that a QEMU anomaly can become a
+  host-side repro. Getting it back needs: a kernel drain path; emitters for
+  `TraceKind::{Block, IdleExit, Irq}`, none of which exist; queue identity in the
+  record; and scenario synthesis. That list is the spec for anyone who wants it.
+
+The I5 bound is deliberately not recorded here: it is being re-derived from first
+principles rather than calibrated against the shipped code's current behaviour,
+with the measured behaviour kept separately as a regression sample in the style of
+`tests/audio-baseline.toml`. The gap between the two becomes its own entry.
 
 ### `sys_read` blocks: two doc comments that describe code that is not there
 
@@ -828,6 +886,75 @@ Spec: `specs/audio-subsystem-spec.md`. Numbered as in the 2026-07-28 audit;
 "wait until clients have filled" condition are fixed (`97723dc`, `9ed8eda`,
 `a88e4ee`, `069d158`).
 
+**BLOCKED ON THE CPAL FORK — one missing message, three consequences.** Killing
+wedged clients, suspending on no progress, and resuming from suspend all need the
+**same single client→soundd edge**: a resume notification on the control
+connection. Recorded as one item deliberately — filed as three, the next planner
+schedules three investigations that all reach the same wall.
+
+Established from the code on both sides. soundd's `TOKEN_CMD` carries exactly
+three commands — `MixCommand::{AddClient, RemoveClient, SetVolume}`
+(`soundd/src/main.rs:151-153`) — and none is resume. The client blocks reading the
+soundd→client signal pipe, while cpal's `play()` futex-wakes only its *own*
+thread, so **there is no client→soundd traffic in the steady state at all.**
+
+The wake path already exists: `TOKEN_CMD` is what wakes a fully idle mix loop when
+a new client connects (`:727`, `:732`). Only the message is missing, and it has to
+be sent from cpal's `play()`. **One fork change unblocks all three.**
+
+The three consequences:
+
+1. **Wedged clients cannot be distinguished from paused ones**, so neither can be
+   killed. §6.4 *specifies* pause as "no explicit coordination required", so this
+   is the spec needing to change, not the implementation.
+2. **One paused client defeats idle suspend for the life of the process.**
+   `is_streaming()` is `delivered && !pending_removal` (`main.rs:129-131`),
+   latched by the first period a client ever supplies and never cleared, so
+   `any_streaming` stays true after a pause. Audio spec §5.8's promise ("Zero
+   overhead, zero wakes, device voice closed") is defeated: a wake per period
+   forever, DMA engine running, codec voice open. It also pins that client's shm
+   region, pipe and slot ring, compounding defect (6). **Battery-relevant on the
+   T14 specifically** — the machine the metal track is building toward — because
+   the wake never stops.
+3. **Resume from suspend has no edge to fire on.**
+
+**Correction, recorded because the earlier entry said the opposite.** This file
+previously said the suspend half "may be fixable in soundd alone" pending an
+answer. The answer is in: **it is not.** A suspended soundd would wait on device
+completions that never come while the resumed client blocks forever on a signal
+byte soundd is no longer writing — battery traded for permanent silence, which is
+strictly worse and is exactly the trade the owner's standing quality rule forbids.
+
+### Stopping the device voice while keeping the timer wake — soundd-only, gate-blocked
+
+Kept out of the cluster above because **its unblock condition is different**, and
+that is the useful part: it could land *first* if the quiet tree arrives before
+fork access.
+
+Stopping the device voice while keeping the periodic timer wake recovers the DMA
+engine and the codec — the battery-relevant hardware — and gives up only the wake
+itself. Resume still works unchanged, because soundd keeps writing signal bytes,
+so it does not need the missing client→soundd message.
+
+So it is **not blocked on the fork**; it is blocked on the **audio gate**. A
+mid-session device stop/restart is an audible transient plus a DLL re-lock, which
+needs the thorough tier on a quiet tree.
+
+**A device advertising four buffers panics soundd at startup.**
+`assert!(num_buffers > 5, "soundd: pipeline too shallow to defer safely")`
+(`main.rs:597`) turns a device shape into a startup panic. Same class as the NVMe
+and xHCI zero-device panics closed today — an unanticipated device shape killing a
+process rather than being handled — and metal-relevant, since nobody knows what
+the T14's codec advertises.
+
+The fix falls out of decoupling the client slot count from the device pipeline
+depth, which turns the assert into a clamp. Which is also *why* the assert exists:
+`slot_count = num_buffers` (`main.rs:1290`) couples every client's ring geometry to
+the kernel's `TX_INFLIGHT_MAX`. The comment's own reasoning establishes
+`slot_count >= num_buffers`; **equality was assumed, not derived.** That design is
+written up and deliberately not landed — it changes ring geometry and therefore
+audio timing, so it needs the thorough gate tier on a quiet tree, not the fast one.
+
 **(5) ASSIGNED — the cpal ToyOS backend hardcodes 44100/2ch/i16** and rejects
 everything else, so soundd's resampler and channel-conversion paths (spec §6/§8)
 are unreachable from any real client and effectively untested. It also
@@ -838,6 +965,14 @@ Deferred to the quiet-tree window, not neglected: editing that fork needs
 `.cargo/config.toml` path overrides, which redirect cpal for **every** agent in
 the tree. Same scheduling constraint as the fork lint audit
 (`specs/fork-lint-audit-plan.md`).
+
+**Client liveness is blocked on this, not on soundd.** The ambiguity between a
+paused and a wedged client is *specified*: §6.4 defines pause as "no explicit
+coordination required", and the cpal backend's `pause()` is a purely local futex
+store soundd is never told about. No change confined to soundd can separate the
+two, and landing the soundd and SDK halves alone would kill every paused cpal
+client. This is a case where the **spec**, not the implementation, is what needs
+to change.
 
 **(6) soundd never frees the per-client shm region.** `SharedMemory::Drop` only
 unmaps and nothing calls `destroy()`, so each open/close cycle strands a 2 MiB
