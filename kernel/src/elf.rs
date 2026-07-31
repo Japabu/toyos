@@ -1,7 +1,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use crate::mm::{PAGE_2M, align_2m, KernelSlice};
+use crate::mm::{PAGE_2M, KernelSlice};
 use crate::process::PageAlloc;
 use crate::UserAddr;
 use crate::sync::Lock;
@@ -24,6 +24,30 @@ const R_X86_64_TPOFF32: u32 = 23;
 
 pub const SYM_SIZE: usize = core::mem::size_of::<Elf64_Sym>(); // 24
 const RELA_SIZE: u64 = core::mem::size_of::<Elf64_Rela>() as u64; // 24
+
+/// The largest single kernel heap allocation the loader will make from a size
+/// an ELF declared — a table it reads whole (`DT_STRSZ`, `DT_RELASZ`,
+/// `e_shnum * e_shentsize`, a symbol count) or the exe's TLS template.
+///
+/// Policy, not physics, but the policy is one step from physics: the kernel
+/// heap's page source asserts above `PAGE_2M` (`mm/alloc.rs`), and dlmalloc
+/// rounds a request up to a whole 2 MiB granule *plus* its own chunk and
+/// segment bookkeeping — so a request that merely fits in 2 MiB still asks the
+/// page source for 4 MiB and panics. One 4 KiB page of headroom covers that
+/// bookkeeping many times over. Above this the ELF is refused rather than
+/// truncated: a table read short is a binary that loads with a symbol table
+/// nobody knows is incomplete.
+///
+/// Nothing this tree builds comes close — the largest `.dynstr` among the
+/// binaries in `system.toml` is under 200 KiB.
+pub const MAX_ELF_ALLOC: usize = PAGE_2M as usize - 4096;
+
+/// `align_2m` for a size that came out of a file. The round-up wraps, and a
+/// wrapped size is an allocation far smaller than the caller asked for with
+/// every later bound computed from the request.
+pub fn align_2m_checked(size: usize) -> Option<usize> {
+    Some(size.checked_add(PAGE_2M as usize - 1)? & !(PAGE_2M as usize - 1))
+}
 
 pub fn read_sym(data: &[u8], index: usize) -> Elf64_Sym {
     let off = index * SYM_SIZE;
@@ -256,28 +280,54 @@ fn clone_from_cache(cached: &CachedLib) -> Option<LoadedLib> {
     })
 }
 
+/// A `.gnu.hash` field, or `None` when it lies outside the table.
+///
+/// Every index into a hash table is a file-chosen number: the bucket and bloom
+/// counts come out of its own header, and the chain array is terminated by a
+/// bit in the data rather than by any declared length. `KernelSlice`'s assert
+/// is the wrong instrument for that — it says "kernel bug" about a malformed
+/// `.so`. Both walkers below stop at the first field they cannot read.
+fn hash_u32(table: &KernelSlice, off: usize) -> Option<u32> {
+    if off.checked_add(4)? > table.size() { return None; }
+    Some(unsafe { table.read::<u32>(off) })
+}
+
+fn hash_u64(table: &KernelSlice, off: usize) -> Option<u64> {
+    if off.checked_add(8)? > table.size() { return None; }
+    Some(unsafe { table.read::<u64>(off) })
+}
+
 /// Derive total symbol count from a GNU hash table.
 /// The table is: [nbuckets, symoffset, bloom_size, bloom_shift, bloom[], buckets[], chain[]]
 /// Each bucket holds the lowest symbol index; each chain entry's bit 0 marks the end of a chain.
+///
+/// Zero for a table that cannot be walked to a terminating chain entry — a
+/// count derived from a walk that ran off the end is not a count.
 fn gnu_hash_sym_count(table: &KernelSlice) -> usize {
-    if table.size() < 16 { return 0; }
-    let nbuckets = unsafe { table.read::<u32>(0) } as usize;
-    let symoffset = unsafe { table.read::<u32>(4) } as usize;
-    let bloom_size = unsafe { table.read::<u32>(8) } as usize;
+    let (Some(nbuckets), Some(symoffset), Some(bloom_size)) =
+        (hash_u32(table, 0), hash_u32(table, 4), hash_u32(table, 8)) else { return 0 };
+    let (nbuckets, symoffset, bloom_size) =
+        (nbuckets as usize, symoffset as usize, bloom_size as usize);
     // A zero bucket or bloom count divides by zero in `gnu_dlsym`; a table
     // that cannot be walked contributes no symbols.
     if nbuckets == 0 || bloom_size == 0 { return 0; }
     let buckets_off = 16 + bloom_size * 8;
     let mut max_sym = 0usize;
     for i in 0..nbuckets {
-        let val = unsafe { table.read::<u32>(buckets_off + i * 4) } as usize;
-        if val > max_sym { max_sym = val; }
+        let Some(val) = hash_u32(table, buckets_off + i * 4) else {
+            log!("ELF: .gnu.hash bucket {} of {} is outside the table", i, nbuckets);
+            return 0;
+        };
+        if val as usize > max_sym { max_sym = val as usize; }
     }
     if max_sym < symoffset { return symoffset; }
     let chains_off = buckets_off + nbuckets * 4;
     let mut idx = max_sym - symoffset;
     loop {
-        let entry = unsafe { table.read::<u32>(chains_off + idx * 4) };
+        let Some(entry) = hash_u32(table, chains_off + idx * 4) else {
+            log!("ELF: .gnu.hash chain runs past the table");
+            return 0;
+        };
         if entry & 1 != 0 { return symoffset + idx + 1; }
         idx += 1;
     }
@@ -313,7 +363,12 @@ pub struct ElfSegment {
 ///   `file_offset + filesz` overflows;
 /// - `tls_filesz <= tls_memsz`;
 /// - the file-backed extent of PT_TLS, and all of PT_DYNAMIC and
-///   PT_GNU_EH_FRAME, lie inside `[vaddr_min, vaddr_max)`.
+///   PT_GNU_EH_FRAME, lie inside `[vaddr_min, vaddr_max)`;
+/// - `tls_align` is zero or a power of two no larger than `PAGE_2M`, so that
+///   `!(align - 1)` is a mask and the TLS block's size cannot be dominated by
+///   a number the file chose;
+/// - `section_headers`, if present, describes a table that fits in one kernel
+///   heap allocation (`MAX_ELF_ALLOC`) — every consumer reads it whole.
 ///
 /// Downstream every size pair is a (copy length, destination size) pair —
 /// `OwnedAlloc::new(memsz)` then `copy(.., filesz)` — so `p_filesz <= p_memsz`
@@ -479,11 +534,26 @@ pub fn parse_layout(data: &[u8]) -> Result<ElfLayout, &'static str> {
         }
     }
 
+    // `tls_align` reaches `setup_combined_tls` as both an addend to the block's
+    // size and the mask `!(align - 1)`. Neither survives an arbitrary u64: the
+    // addition overflows, and a non-power-of-two turns the mask into noise that
+    // can place the TLS data on top of the DTV. Zero and one mean "no alignment
+    // constraint" and the loader substitutes 8.
+    if tls_memsz > 0 && (tls_align > PAGE_2M as usize || (tls_align & tls_align.wrapping_sub(1)) != 0) {
+        return Err("ELF: PT_TLS p_align is not a power of two within a page");
+    }
+
     // `e_shentsize` is 64 for ELF64. Consumers divide a byte count by it and
     // index 64-byte fields out of each entry, so anything smaller is a
     // division by zero or a short read — drop the table instead of recording
     // a size that every consumer would have to re-check.
     let section_headers = if ehdr.e_shoff != 0 && ehdr.e_shnum > 0 && ehdr.e_shentsize >= 64 {
+        // Four call sites read the whole table into one `Vec`, including one
+        // in `process.rs` that has no failure path. Refuse the file here
+        // rather than let each of them meet the heap's ceiling separately.
+        if ehdr.e_shnum as usize * ehdr.e_shentsize as usize > MAX_ELF_ALLOC {
+            return Err("ELF: section header table larger than one kernel allocation");
+        }
         Some((ehdr.e_shoff, ehdr.e_shnum, ehdr.e_shentsize))
     } else {
         None
@@ -746,6 +816,16 @@ pub fn build_symtab_map(
     let strtab_off = u64::from_le_bytes(shdr_data[link_off + 24..link_off + 32].try_into().ok()?);
     let strtab_size = u64::from_le_bytes(shdr_data[link_off + 32..link_off + 40].try_into().ok()?);
 
+    // Both `sh_size`es are file-declared and both tables are read whole, so
+    // past one kernel allocation there is no map to build. This is the
+    // fallback map for an exe that exports nothing through `.dynsym`; dropping
+    // it degrades that binary's symbol resolution and says so, where reading
+    // part of a symbol table would degrade it silently.
+    if symtab_size as usize > MAX_ELF_ALLOC || strtab_size as usize > MAX_ELF_ALLOC {
+        log!("ELF: .symtab {} / .strtab {} exceed one kernel allocation, no symbol map",
+            symtab_size, strtab_size);
+        return None;
+    }
     let symtab_data = crate::process::read_file_range(backing, symtab_off, symtab_size as usize);
     let strtab_data = crate::process::read_file_range(backing, strtab_off, strtab_size as usize);
 
@@ -865,17 +945,16 @@ fn gnu_dlsym(lib: &LoadedLib, name: &str) -> Option<UserAddr> {
     let table = lib.gnu_hash.as_ref()?;
     let h = gnu_hash(name);
 
-    if table.size() < 16 { return None; }
-    let nbuckets = unsafe { table.read::<u32>(0) };
-    let symoffset = unsafe { table.read::<u32>(4) };
-    let bloom_size = unsafe { table.read::<u32>(8) };
-    let bloom_shift = unsafe { table.read::<u32>(12) };
+    let nbuckets = hash_u32(table, 0)?;
+    let symoffset = hash_u32(table, 4)?;
+    let bloom_size = hash_u32(table, 8)?;
+    let bloom_shift = hash_u32(table, 12)?;
     // Both are divisors below, and both come out of the file.
     if nbuckets == 0 || bloom_size == 0 { return None; }
 
     let bloom_off = 16;
     let bloom_idx = ((h as u64 / 64) % bloom_size as u64) as usize;
-    let bloom_word = unsafe { table.read::<u64>(bloom_off + bloom_idx * 8) };
+    let bloom_word = hash_u64(table, bloom_off + bloom_idx * 8)?;
     let mask = (1u64 << (h % 64)) | (1u64 << ((h >> bloom_shift) % 64));
     if bloom_word & mask != mask {
         return None;
@@ -883,23 +962,28 @@ fn gnu_dlsym(lib: &LoadedLib, name: &str) -> Option<UserAddr> {
 
     let buckets_off = bloom_off + bloom_size as usize * 8;
     let bucket_idx = h % nbuckets;
-    let sym_idx = unsafe { table.read::<u32>(buckets_off + bucket_idx as usize * 4) };
+    let sym_idx = hash_u32(table, buckets_off + bucket_idx as usize * 4)?;
     if sym_idx == 0 {
         return None;
     }
 
+    // `sym_idx` and `symoffset` are both file-chosen, so the chain index can
+    // be negative as easily as it can run off the end.
     let chains_off = buckets_off + nbuckets as usize * 4;
     let mut i = sym_idx;
     loop {
-        let chain_val = unsafe { table.read::<u32>(chains_off + (i - symoffset) as usize * 4) };
-        if (chain_val | 1) == (h | 1) {
+        let chain_val = hash_u32(table, chains_off + i.checked_sub(symoffset)? as usize * 4)?;
+        // `sym_count` is `.dynsym`'s own byte length in entries, capped at
+        // load. A chain entry naming a symbol past it indexes nothing — and
+        // the chain walk is not bounded by `sym_count` any other way.
+        if (chain_val | 1) == (h | 1) && (i as usize) < lib.sym_count {
             let sym = lib.sym(i as usize);
             if sym.st_shndx != 0 && lib.sym_name(i as usize) == name {
                 return Some(lib.user_base + sym.st_value);
             }
         }
         if chain_val & 1 != 0 { break; }
-        i += 1;
+        i = i.checked_add(1)?;
     }
     None
 }
@@ -991,13 +1075,21 @@ pub fn load_shared_lib(backing: &dyn crate::file_backing::FileBacking) -> Result
     let rw_vaddr = rw_start.unwrap_or(vaddr_max);
     let rw_end_vaddr = rw_end.unwrap_or(vaddr_max);
 
-    let load_size = align_2m((vaddr_max - vaddr_min) as usize);
+    // `vaddr_max - vaddr_min` is a span the file chose, so the round-up wraps
+    // — and a wrapped `load_size` is an allocation smaller than every offset
+    // later computed against it.
+    let (Some(load_size), Some(rw_end_aligned)) = (
+        usize::try_from(vaddr_max - vaddr_min).ok().and_then(align_2m_checked),
+        usize::try_from(rw_end_vaddr - vaddr_min).ok().and_then(align_2m_checked),
+    ) else {
+        return Err("ELF: image span does not fit an allocation");
+    };
 
     // The 2 MiB-aligned writable window inside the image. Derived here rather
     // than in `cache_loaded_lib` so that the window relocations are validated
     // against below is the same one that later sizes `rw_alloc`.
     let rw_offset = (rw_vaddr - vaddr_min) as usize & !(PAGE_2M as usize - 1);
-    let rw_size = align_2m((rw_end_vaddr - vaddr_min) as usize) - rw_offset;
+    let rw_size = rw_end_aligned - rw_offset;
     let t0 = crate::clock::nanos_since_boot();
     let alloc = PageAlloc::new(load_size, crate::mm::pmm::Category::Elf).ok_or("dlopen: allocation failed")?;
     let t1 = crate::clock::nanos_since_boot();
@@ -1426,6 +1518,11 @@ pub fn apply_dtpmod_relocs(lib: &LoadedLib, module_id: u64, tls_info: &TlsModule
 /// If r_sym == 0 (unnamed, same-module LD), use the loading module's ID.
 /// If r_sym != 0 but the symbol is defined in this lib (st_shndx != 0), use the loading module's ID.
 /// Otherwise, look up the symbol across all loaded libs to find the defining module.
+///
+/// An undefined TLS symbol that no module defines is a `.so` naming something
+/// that is not there, which `dlopen` puts squarely on the untrusted side. Every
+/// other unresolved-symbol path in this file logs and leaves the slot for
+/// userland to fault on; these two used to panic the kernel instead.
 fn resolve_dtpmod(lib: &LoadedLib, r_sym: u32, self_module_id: u64, tls_info: &TlsModuleInfo) -> u64 {
     if r_sym == 0 {
         return self_module_id;
@@ -1440,13 +1537,14 @@ fn resolve_dtpmod(lib: &LoadedLib, r_sym: u32, self_module_id: u64, tls_info: &T
         if other_lib.tls_memsz == 0 { continue; }
         if tls_dlsym(other_lib, sym_name).is_some() {
             // Find the TLS module for this library (matched by template pointer)
-            let module = tls_info.modules.iter()
-                .find(|m| m.template == other_lib.tls_template)
-                .unwrap_or_else(|| panic!("dtpmod: no TLS module for lib defining {}", sym_name));
-            return module.module_id;
+            match tls_info.modules.iter().find(|m| m.template == other_lib.tls_template) {
+                Some(module) => return module.module_id,
+                None => log!("dtpmod: no TLS module for the lib defining {}", sym_name),
+            }
         }
     }
-    panic!("dtpmod: unresolved TLS symbol: {}", sym_name);
+    log!("dtpmod: unresolved TLS symbol: {}", sym_name);
+    self_module_id
 }
 
 /// Resolve the TLS offset for a DTPOFF64 relocation.
@@ -1470,7 +1568,8 @@ fn resolve_dtpoff(lib: &LoadedLib, r_sym: u32, r_addend: i64, tls_info: &TlsModu
             return sym_tls_offset as i64 + r_addend;
         }
     }
-    panic!("dtpoff: unresolved TLS symbol: {}", sym_name);
+    log!("dtpoff: unresolved TLS symbol: {}", sym_name);
+    r_addend
 }
 
 /// Compute a TPOFF value for a relocation entry.

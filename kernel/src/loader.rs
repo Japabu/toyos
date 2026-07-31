@@ -55,19 +55,33 @@ pub fn setup_tls(tls_template: Option<crate::mm::KernelSlice>, tls_memsz: usize,
 ///   [0x10] entries[0]: u64 (pointer for module_id=1)
 ///   [0x18] entries[1]: u64 (pointer for module_id=2)
 ///   ...
+///
+/// `None` for a layout no allocation can hold. Both `total_memsz` and
+/// `tls_align` are sums of file-declared numbers, so every step of the sizing
+/// is checked: the DTV, the alignment padding and the block itself all have to
+/// fit, and the round-up to 2 MiB must not wrap. `parse_layout` has already
+/// established that `tls_align` is a power of two no larger than a 2 MiB page,
+/// which is what makes `!(align - 1)` a mask.
 pub fn setup_combined_tls(
     modules: &[crate::elf::TlsModule],
     total_memsz: usize,
     tls_align: usize,
 ) -> Option<(PageAlloc, u64)> {
-    let block_size = total_memsz + TCB_SIZE;
-    let alloc_size = crate::mm::align_2m(block_size + tls_align);
+    let dtv_size = DTV_HEADER_SIZE + DTV_INITIAL_CAPACITY * 8;
+    let align = if tls_align > 1 { tls_align } else { 8 };
+    let block_size = total_memsz.checked_add(TCB_SIZE)?;
+    // The DTV goes at the start of this same allocation and the TLS data is
+    // placed `align`-aligned above it, so both belong in the size. Sizing from
+    // the block and the alignment alone left `tls_start` free to land inside
+    // the DTV, which the assert below then caught as if it were a kernel bug.
+    let alloc_size = crate::elf::align_2m_checked(
+        block_size.checked_add(dtv_size)?.checked_add(align)?,
+    )?;
     let page_alloc = PageAlloc::new(alloc_size, crate::mm::pmm::Category::InitTls)?;
     let block = page_alloc.ptr();
 
     // Place TLS data near the end of the allocation (DTV at start, TLS after).
     // Align tls_start so that data_start (= block + tls_start) has tls_align alignment.
-    let align = if tls_align > 1 { tls_align } else { 8 };
     let tls_start = (alloc_size - block_size) & !(align - 1);
 
     unsafe { core::ptr::write_bytes(block, 0, alloc_size); }
@@ -93,7 +107,10 @@ pub fn setup_combined_tls(
 
     // Set up DTV at the start of the allocation.
     // DTV entries point to the start of each module's TLS data (user-visible addresses).
-    let dtv_size = DTV_HEADER_SIZE + DTV_INITIAL_CAPACITY * 8;
+    //
+    // The sizing above reserves `dtv_size + align` below the block and rounds
+    // `tls_start` down by `align`, so this holds by construction and a failure
+    // is a kernel bug, not a file.
     assert!(dtv_size < tls_start, "DTV overlaps TLS data");
     let dtv_kern = block as *mut u64;
     unsafe {
@@ -221,28 +238,28 @@ pub fn build_child_fds(pairs: &[[u32; 2]]) -> Result<FdTable, SyscallError> {
 const USER_VM_BASE: u64 = 0x100_0000_0000;
 
 /// Convert an ELF virtual address to a file offset by searching PT_LOAD segments.
-/// Falls back to extrapolating from the nearest segment for vaddrs outside all segments
-/// (e.g. `.rela.dyn` sections the linker places outside PT_LOAD).
-fn vaddr_to_file_offset(segments: &[elf::ElfSegment], vaddr: u64) -> u64 {
+/// Falls back to extrapolating from the nearest segment below `vaddr`, which is
+/// what `.rela.dyn` and friends need when the linker places them outside any
+/// PT_LOAD.
+///
+/// `None` when there is no segment at or below `vaddr` to extrapolate from, or
+/// when the extrapolation overflows. Every `vaddr` here is a `DT_*` tag or a
+/// program-header field, so it is untrusted: the answer to "this address is in
+/// no segment" is that the binary is malformed, not that the kernel dies.
+fn vaddr_to_file_offset(segments: &[elf::ElfSegment], vaddr: u64) -> Option<u64> {
     for seg in segments {
         if vaddr >= seg.vaddr && vaddr < seg.vaddr + seg.filesz {
-            return seg.file_offset + (vaddr - seg.vaddr);
+            return seg.file_offset.checked_add(vaddr - seg.vaddr);
         }
     }
-    // Extrapolate from the nearest segment below this vaddr.
-    // Works for PIE binaries where file_offset == vaddr (common pattern).
     let mut best: Option<&elf::ElfSegment> = None;
     for seg in segments {
-        if seg.vaddr <= vaddr {
-            if best.map_or(true, |b| seg.vaddr > b.vaddr) {
-                best = Some(seg);
-            }
+        if seg.vaddr <= vaddr && best.map_or(true, |b| seg.vaddr > b.vaddr) {
+            best = Some(seg);
         }
     }
-    match best {
-        Some(seg) => seg.file_offset + (vaddr - seg.vaddr),
-        None => panic!("vaddr_to_file_offset: {:#x} not in or near any PT_LOAD segment", vaddr),
-    }
+    let seg = best?;
+    seg.file_offset.checked_add(vaddr - seg.vaddr)
 }
 
 /// Read a byte range from a file using its block map via the page cache.
@@ -275,25 +292,49 @@ pub(crate) fn read_file_range(backing: &dyn crate::file_backing::FileBacking, of
     result
 }
 
+/// [`read_file_range`] for a length the ELF *declared* — `DT_STRSZ`,
+/// `DT_RELASZ`, `e_shnum * e_shentsize`, a symbol count.
+///
+/// `None` above [`elf::MAX_ELF_ALLOC`], which is the point where the `Vec`
+/// stops being an allocation failure and becomes an assert in the kernel
+/// heap's page source. Refusing is deliberate: clamping the length instead
+/// would load the binary with a table that is short and nothing downstream
+/// could tell.
+fn read_elf_table(
+    backing: &dyn crate::file_backing::FileBacking,
+    offset: u64,
+    len: usize,
+) -> Option<Vec<u8>> {
+    if len > elf::MAX_ELF_ALLOC {
+        return None;
+    }
+    Some(read_file_range(backing, offset, len))
+}
+
 /// Resolve a single exe TPOFF relocation entry to a pre-computed i64 value.
 /// Handles both r_sym == 0 (simple offset) and r_sym != 0 (cross-library lookup).
+///
+/// `symtab_file_off` is `None` when `DT_SYMTAB` names no file offset at all,
+/// which is the same position as a symbol read that comes back short: there is
+/// no symbol to resolve against, so the unnamed form is the only answer left.
 fn resolve_exe_tpoff(
     r_sym: u32,
     r_addend: i64,
     exe_base_offset: usize,
     total_memsz: usize,
-    segments: &[elf::ElfSegment],
-    symtab_vaddr: u64,
+    symtab_file_off: Option<u64>,
     backing: &dyn crate::file_backing::FileBacking,
     dynstr_data: &[u8],
     tls_info: &elf::TlsModuleInfo,
 ) -> i64 {
-    if r_sym == 0 {
+    let (Some(symtab_file_off), true) = (symtab_file_off, r_sym != 0) else {
         return exe_base_offset as i64 + r_addend - total_memsz as i64;
-    }
+    };
 
-    let symtab_file_off = vaddr_to_file_offset(segments, symtab_vaddr);
-    let sym_data = read_file_range(backing, symtab_file_off + r_sym as u64 * elf::SYM_SIZE as u64, elf::SYM_SIZE);
+    let Some(sym_off) = symtab_file_off.checked_add(r_sym as u64 * elf::SYM_SIZE as u64) else {
+        return exe_base_offset as i64 + r_addend - total_memsz as i64;
+    };
+    let sym_data = read_file_range(backing, sym_off, elf::SYM_SIZE);
     if sym_data.len() < elf::SYM_SIZE {
         return exe_base_offset as i64 + r_addend - total_memsz as i64;
     }
@@ -320,17 +361,43 @@ fn resolve_exe_tpoff(
 }
 
 /// Insert demand-paged regions for each PT_LOAD segment into the address space.
+///
+/// `base + seg.vaddr` must not overflow, which is what `image_fits_user_half`
+/// establishes before this is called.
+///
+/// Returns `Err` when two segments would claim the same page. A segment's
+/// regions are page-rounded, so segments that merely *share* a page are two
+/// VMAs at one address and `insert_region` asserts — a kernel-bug assert
+/// reached from a file. Checked over every pair before the first insert, so a
+/// refusal leaves the address space as it found it.
 fn insert_elf_regions(
     addr_space: &mut crate::mm::paging::AddressSpace,
     layout: &elf::ElfLayout,
     base: u64,
     backing: &Arc<dyn crate::file_backing::FileBacking>,
-) {
+) -> Result<(), SyscallError> {
     use crate::vma::{Region, RegionKind};
 
+    let extent = |seg: &elf::ElfSegment| {
+        ((base + seg.vaddr) & !0xFFF, (base + seg.vaddr + seg.memsz + 0xFFF) & !0xFFF)
+    };
+    for (i, a) in layout.segments.iter().enumerate() {
+        let (a_start, a_end) = extent(a);
+        for b in &layout.segments[i + 1..] {
+            let (b_start, b_end) = extent(b);
+            if a_start < b_end && b_start < a_end {
+                log!("spawn: PT_LOAD pages [{:#x},{:#x}) and [{:#x},{:#x}) overlap",
+                    a_start, a_end, b_start, b_end);
+                return Err(SyscallError::InvalidArgument);
+            }
+        }
+    }
+
     for seg in &layout.segments {
-        let seg_start = (base + seg.vaddr) & !0xFFF;
-        let seg_end = (base + seg.vaddr + seg.memsz + 0xFFF) & !0xFFF;
+        let (seg_start, seg_end) = extent(seg);
+        // A segment that covers no page maps nothing, and a zero-size region
+        // would sit in the map where `find_region` cannot see past it.
+        if seg_end == seg_start { continue; }
 
         let file_block_start = seg.file_offset / 4096;
         let file_blocks_needed = ((seg.filesz + (seg.file_offset % 4096) + 4095) / 4096) as usize;
@@ -357,6 +424,29 @@ fn insert_elf_regions(
             });
         }
     }
+    Ok(())
+}
+
+/// Whether the whole ELF image fits in the user half once it is rebased.
+///
+/// Every segment lands at `base + p_vaddr`, and that addition wraps: a file
+/// that names a large enough `p_vaddr` places its region anywhere in the
+/// machine. Two destinations matter. In the kernel half the region is still
+/// demand-paged, so the first user touch reaches `AddressSpace::remap`, which
+/// ORs PAGE_USER onto the page tables every process shares — the mapping
+/// `sys_mmap` refuses a FIXED request for, reached through the loader instead.
+/// Below `ALLOC_CEILING` it covers the arena `find_gap` serves every library,
+/// TLS block and mmap out of, and there is no failure path for a process that
+/// cannot be given its own TLS.
+///
+/// The image occupies `[USER_VM_BASE, USER_VM_BASE + vaddr_max - vaddr_min)`
+/// because `vaddr_min` is the smallest `p_vaddr` and `vaddr_max` the largest
+/// `p_vaddr + p_memsz`, so one range check covers every segment. The bound is
+/// `check_user_range`'s, i.e. the hardware's user/kernel split, not a policy
+/// number.
+fn image_fits_user_half(layout: &elf::ElfLayout) -> bool {
+    let span = layout.vaddr_max - layout.vaddr_min;
+    crate::user_ptr::check_user_range(UserAddr::new(USER_VM_BASE), span)
 }
 
 /// Build TLS module layout from loaded shared libraries and the exe's TLS segment.
@@ -432,7 +522,8 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
 
     // 3b. Parse PT_DYNAMIC from block map (not available in the header buffer)
     let dyn_info = if let Some((dyn_off, _, dyn_size)) = layout.dynamic {
-        let dyn_data = read_file_range(backing.as_ref(), dyn_off, dyn_size as usize);
+        let dyn_data = read_elf_table(backing.as_ref(), dyn_off, dyn_size as usize)
+            .ok_or(SyscallError::ResourceExhausted)?;
         elf::parse_dynamic(&dyn_data)
     } else {
         elf::DynamicInfo::empty()
@@ -440,20 +531,48 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
 
     let t1 = crate::clock::nanos_since_boot();
 
+    if !image_fits_user_half(&layout) {
+        log!("spawn: {}: image spans {:#x} bytes, past the user half from {:#x}",
+            path, layout.vaddr_max - layout.vaddr_min, USER_VM_BASE);
+        return Err(SyscallError::InvalidArgument);
+    }
     let base = USER_VM_BASE - layout.vaddr_min;
 
+    // Every `DT_*` tag below is a file-supplied vaddr the loader has to turn
+    // into a file offset, and there is no answer for one that lies below every
+    // PT_LOAD. Refusing the binary is the answer; the alternative this replaced
+    // was a panic in syscall context.
+    let file_off = |what: &str, vaddr: u64| match vaddr_to_file_offset(&layout.segments, vaddr) {
+        Some(off) => Ok(off),
+        None => {
+            log!("spawn: {}: {} vaddr {:#x} is in or near no PT_LOAD segment", path, what, vaddr);
+            Err(SyscallError::InvalidArgument)
+        }
+    };
+
+    // And every table length below is a number the file names. Reading one
+    // that exceeds a single kernel allocation is a panic in the heap's page
+    // source, so it is a refusal here.
+    let table = |what: &str, off: u64, len: usize| match read_elf_table(backing.as_ref(), off, len) {
+        Some(v) => Ok(v),
+        None => {
+            log!("spawn: {}: {} declares {} bytes, past one kernel allocation", path, what, len);
+            Err(SyscallError::ResourceExhausted)
+        }
+    };
+
     let rela_data = if dyn_info.rela_size > 0 {
-        let rela_file_off = vaddr_to_file_offset(&layout.segments, dyn_info.rela_vaddr);
-        read_file_range(backing.as_ref(), rela_file_off, dyn_info.rela_size as usize)
+        let rela_file_off = file_off("DT_RELA", dyn_info.rela_vaddr)?;
+        table("DT_RELASZ", rela_file_off, dyn_info.rela_size as usize)?
     } else if layout.dynamic.is_none() {
         // No PT_DYNAMIC — fall back to finding .rela.dyn from section headers
         if let Some((shoff, shnum, shentsize)) = layout.section_headers {
-            let shdr_data = read_file_range(backing.as_ref(), shoff, shnum as usize * shentsize as usize);
+            let shdr_data = table("e_shnum", shoff, shnum as usize * shentsize as usize)?;
             let bk = backing.as_ref();
             if let Some((rela_off, rela_size)) = elf::find_rela_dyn_from_sections(
                 &shdr_data, shentsize, &|off, len| read_file_range(bk, off, len),
             ) {
-                read_file_range(backing.as_ref(), rela_off, rela_size as usize)
+                table("SHT_RELA sh_size", rela_off, rela_size as usize)?
             } else {
                 Vec::new()
             }
@@ -464,8 +583,8 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
         Vec::new()
     };
     let jmprel_data = if dyn_info.jmprel_size > 0 {
-        let jmprel_file_off = vaddr_to_file_offset(&layout.segments, dyn_info.jmprel_vaddr);
-        read_file_range(backing.as_ref(), jmprel_file_off, dyn_info.jmprel_size as usize)
+        let jmprel_file_off = file_off("DT_JMPREL", dyn_info.jmprel_vaddr)?;
+        table("DT_PLTRELSZ", jmprel_file_off, dyn_info.jmprel_size as usize)?
     } else {
         Vec::new()
     };
@@ -481,8 +600,8 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
     // 7. Load shared libraries from block map (no full binary read)
     // Read DT_STRTAB from block map to get library names
     let (mut loaded_libs, lib_paths) = if !dyn_info.needed_strtab_offsets.is_empty() && dyn_info.strsz > 0 {
-        let strtab_file_off = vaddr_to_file_offset(&layout.segments, dyn_info.strtab_vaddr);
-        let strtab_data = read_file_range(backing.as_ref(), strtab_file_off, dyn_info.strsz as usize);
+        let strtab_file_off = file_off("DT_STRTAB", dyn_info.strtab_vaddr)?;
+        let strtab_data = table("DT_STRSZ", strtab_file_off, dyn_info.strsz as usize)?;
 
         let exe_dir = path.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
         let mut libs = Vec::new();
@@ -540,12 +659,12 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
         }
 
         if !libs.is_empty() {
-            let dynstr_file_off = vaddr_to_file_offset(&layout.segments, dyn_info.strtab_vaddr);
-            let dynstr_data = read_file_range(backing.as_ref(), dynstr_file_off, dyn_info.strsz as usize);
+            let dynstr_file_off = file_off("DT_STRTAB", dyn_info.strtab_vaddr)?;
+            let dynstr_data = table("DT_STRSZ", dynstr_file_off, dyn_info.strsz as usize)?;
 
             // Determine .dynsym entry count via GNU hash table or SYMTAB/STRTAB gap
             let sym_count = if dyn_info.gnu_hash_vaddr != 0 {
-                let gnu_hash_file_off = vaddr_to_file_offset(&layout.segments, dyn_info.gnu_hash_vaddr);
+                let gnu_hash_file_off = file_off("DT_GNU_HASH", dyn_info.gnu_hash_vaddr)?;
                 // Read enough for the hash table (header + bloom + buckets + chains)
                 // Start with a generous read; typical .dynsym for executables is small
                 let gnu_hash_data = read_file_range(backing.as_ref(), gnu_hash_file_off,
@@ -559,8 +678,8 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
             };
 
             let mut exe_sym_map = if sym_count > 0 {
-                let symtab_file_off = vaddr_to_file_offset(&layout.segments, dyn_info.symtab_vaddr);
-                let dynsym_data = read_file_range(backing.as_ref(), symtab_file_off, sym_count * elf::SYM_SIZE);
+                let symtab_file_off = file_off("DT_SYMTAB", dyn_info.symtab_vaddr)?;
+                let dynsym_data = table("symbol count", symtab_file_off, sym_count * elf::SYM_SIZE)?;
                 elf::build_exe_sym_map(&dynsym_data, &dynstr_data, sym_count, UserAddr::new(base))
             } else {
                 hashbrown::HashMap::new()
@@ -570,7 +689,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
             // This handles PIE executables that don't export symbols via --export-dynamic.
             if exe_sym_map.is_empty() {
                 if let Some((shoff, shnum, shentsize)) = layout.section_headers {
-                    let shdr_data = read_file_range(backing.as_ref(), shoff, shnum as usize * shentsize as usize);
+                    let shdr_data = table("e_shnum", shoff, shnum as usize * shentsize as usize)?;
                     if let Some(m) = elf::build_symtab_map(&shdr_data, shentsize, backing.as_ref(), UserAddr::new(base)) {
                         exe_sym_map = m;
                     }
@@ -596,7 +715,7 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
     let child_pt: PageTables = Arc::new(Lock::new(crate::mm::paging::AddressSpace::new_user()));
 
     // 8a. Insert ELF regions into the child address space (demand-paged)
-    insert_elf_regions(&mut child_pt.lock(), &layout, base, &backing);
+    insert_elf_regions(&mut child_pt.lock(), &layout, base, &backing)?;
 
     // 8b. Map shared libraries and assign virtual addresses.
     // This MUST happen BEFORE relocation processing so that user_base is correct
@@ -605,16 +724,20 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
         match &lib.memory {
             elf::LibMemory::Owned(alloc) => {
                 let phys = DirectMap::phys_of(alloc.ptr());
-                let (vaddr, _) = vma_map(&child_pt, phys, alloc.size() as u64)
-                    .expect("spawn: out of virtual address space for lib");
+                let Some((vaddr, _)) = vma_map(&child_pt, phys, alloc.size() as u64) else {
+                    log!("spawn: {}: out of virtual address space for a library", path);
+                    return Err(SyscallError::ResourceExhausted);
+                };
                 let delta = vaddr.raw() as i64 - lib.user_base.raw() as i64;
                 lib.user_base = vaddr;
                 lib.user_end = (lib.user_end as i64 + delta) as u64;
             }
             elf::LibMemory::Shared { rw_alloc, cached_image, rw_offset, .. } => {
                 let cached_phys = cached_image.phys();
-                let (lib_vaddr, _) = vma_map(&child_pt, cached_phys, cached_image.size() as u64)
-                    .expect("spawn: out of virtual address space for lib");
+                let Some((lib_vaddr, _)) = vma_map(&child_pt, cached_phys, cached_image.size() as u64) else {
+                    log!("spawn: {}: out of virtual address space for a library", path);
+                    return Err(SyscallError::ResourceExhausted);
+                };
                 let num_rw_pages = rw_alloc.size() / PAGE_2M as usize;
                 let rw_phys = DirectMap::phys_of(rw_alloc.ptr());
                 for i in 0..num_rw_pages {
@@ -640,15 +763,15 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
 
     // 8c. NOW process library bind relocations (user_base is correct for all libs).
     if !loaded_libs.is_empty() {
-        let dynstr_file_off = vaddr_to_file_offset(&layout.segments, dyn_info.strtab_vaddr);
         let dynstr_data = if dyn_info.strsz > 0 {
-            read_file_range(backing.as_ref(), dynstr_file_off, dyn_info.strsz as usize)
+            let dynstr_file_off = file_off("DT_STRTAB", dyn_info.strtab_vaddr)?;
+            table("DT_STRSZ", dynstr_file_off, dyn_info.strsz as usize)?
         } else {
             Vec::new()
         };
 
         let sym_count = if dyn_info.gnu_hash_vaddr != 0 {
-            let gnu_hash_file_off = vaddr_to_file_offset(&layout.segments, dyn_info.gnu_hash_vaddr);
+            let gnu_hash_file_off = file_off("DT_GNU_HASH", dyn_info.gnu_hash_vaddr)?;
             let gnu_hash_data = read_file_range(backing.as_ref(), gnu_hash_file_off, 64 * 1024);
             elf::gnu_hash_sym_count_from_data(&gnu_hash_data)
         } else if dyn_info.symtab_vaddr != 0 && dyn_info.strtab_vaddr > dyn_info.symtab_vaddr {
@@ -657,22 +780,34 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
             0
         };
 
-        let exe_sym_map = if sym_count > 0 {
-            let symtab_file_off = vaddr_to_file_offset(&layout.segments, dyn_info.symtab_vaddr);
-            let dynsym_data = read_file_range(backing.as_ref(), symtab_file_off, sym_count * elf::SYM_SIZE);
-            elf::build_exe_sym_map(&dynsym_data, &dynstr_data, sym_count, UserAddr::new(base))
+        let symtab_file_off = if dyn_info.symtab_vaddr != 0 {
+            Some(file_off("DT_SYMTAB", dyn_info.symtab_vaddr)?)
         } else {
-            hashbrown::HashMap::new()
+            None
+        };
+
+        let exe_sym_map = match (sym_count, symtab_file_off) {
+            (0, _) | (_, None) => hashbrown::HashMap::new(),
+            (_, Some(off)) => {
+                let Ok(dynsym_data) = table("symbol count", off, sym_count * elf::SYM_SIZE) else {
+                    return Err(SyscallError::ResourceExhausted);
+                };
+                elf::build_exe_sym_map(&dynsym_data, &dynstr_data, sym_count, UserAddr::new(base))
+            }
         };
 
         for lib in &loaded_libs {
             elf::resolve_lib_bind_relocs_pub(lib, &exe_sym_map, &loaded_libs);
         }
 
-        let symtab_file_off = vaddr_to_file_offset(&layout.segments, dyn_info.symtab_vaddr);
         for &(r_offset, r_sym, _r_addend) in &parsed_relas.glob_dat {
             if r_sym == 0 { continue; }
-            let sym_data = read_file_range(backing.as_ref(), symtab_file_off + r_sym as u64 * elf::SYM_SIZE as u64, elf::SYM_SIZE);
+            let Some(sym_off) = symtab_file_off
+                .and_then(|off| off.checked_add(r_sym as u64 * elf::SYM_SIZE as u64))
+            else {
+                continue;
+            };
+            let sym_data = read_file_range(backing.as_ref(), sym_off, elf::SYM_SIZE);
             if sym_data.len() < elf::SYM_SIZE { continue; }
             let sym = elf::read_sym(&sym_data, 0);
             let sym_name = elf::sym_name(&sym, &dynstr_data);
@@ -706,10 +841,20 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
     }
 
     let exe_tls_template = if layout.tls_memsz > 0 {
-        let tls_file_off = vaddr_to_file_offset(&layout.segments, layout.tls_vaddr);
+        let tls_file_off = file_off("PT_TLS", layout.tls_vaddr)?;
         // Read straight into the `tls_memsz`-sized buffer rather than via an
         // intermediate `Vec` sized by the file's `tls_filesz`. `OwnedAlloc`
         // zeroes, so the `.tbss` tail needs no second pass.
+        //
+        // `OwnedAlloc::new`'s own `size >= PAGE_2M` refusal is short by
+        // dlmalloc's per-chunk bookkeeping — a request just under 2 MiB still
+        // makes the allocator ask its page source for 4 MiB, which asserts. Ask
+        // for no more than one allocation can serve.
+        if layout.tls_memsz > elf::MAX_ELF_ALLOC {
+            log!("spawn: {}: PT_TLS memsz {} exceeds one kernel allocation",
+                path, layout.tls_memsz);
+            return Err(SyscallError::ResourceExhausted);
+        }
         let Some(tls_buf) = OwnedAlloc::new(layout.tls_memsz, 16) else {
             log!("spawn: {}: failed to allocate TLS template ({} bytes)", path, layout.tls_memsz);
             return Err(SyscallError::ResourceExhausted);
@@ -745,23 +890,28 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
             .unwrap_or(0);
 
         let dynstr_data = if dyn_info.strsz > 0 {
-            let dynstr_file_off = vaddr_to_file_offset(&layout.segments, dyn_info.strtab_vaddr);
-            read_file_range(backing.as_ref(), dynstr_file_off, dyn_info.strsz as usize)
+            let dynstr_file_off = file_off("DT_STRTAB", dyn_info.strtab_vaddr)?;
+            table("DT_STRSZ", dynstr_file_off, dyn_info.strsz as usize)?
         } else {
             Vec::new()
+        };
+        let symtab_file_off = if dyn_info.symtab_vaddr != 0 {
+            Some(file_off("DT_SYMTAB", dyn_info.symtab_vaddr)?)
+        } else {
+            None
         };
 
         for &(r_offset, r_sym, r_addend) in &parsed_relas.tpoff64 {
             let tpoff = resolve_exe_tpoff(
                 r_sym, r_addend, exe_base_offset, tls_total_memsz,
-                &layout.segments, dyn_info.symtab_vaddr, backing.as_ref(), &dynstr_data, &tls_info,
+                symtab_file_off, backing.as_ref(), &dynstr_data, &tls_info,
             );
             reloc_index.add_u64(r_offset, tpoff as u64);
         }
         for &(r_offset, r_sym, r_addend) in &parsed_relas.tpoff32 {
             let tpoff = resolve_exe_tpoff(
                 r_sym, r_addend, exe_base_offset, tls_total_memsz,
-                &layout.segments, dyn_info.symtab_vaddr, backing.as_ref(), &dynstr_data, &tls_info,
+                symtab_file_off, backing.as_ref(), &dynstr_data, &tls_info,
             );
             reloc_index.add_i32(r_offset, tpoff as i32);
         }
@@ -801,8 +951,10 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
     };
     // TLS mapped via address space — rebase all user-visible pointers from phys to vaddr
     let tls_phys = tls_alloc.phys();
-    let (tls_vaddr, _) = vma_map(&child_pt, tls_phys, tls_alloc.size() as u64)
-        .expect("spawn: out of virtual address space for TLS");
+    let Some((tls_vaddr, _)) = vma_map(&child_pt, tls_phys, tls_alloc.size() as u64) else {
+        log!("spawn: {}: out of virtual address space for TLS", path);
+        return Err(SyscallError::ResourceExhausted);
+    };
     let tls_rebase = tls_vaddr.raw() as i64 - tls_phys as i64;
     let fs_base = (fs_base as i64 + tls_rebase) as u64;
     unsafe {
