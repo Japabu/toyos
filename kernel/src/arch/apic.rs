@@ -145,8 +145,6 @@ pub fn arm_one_shot(nanos: u64) {
     cpu::wrmsr(X2APIC_LVT_TIMER, TIMER_VECTOR as u64);
     let percpu = unsafe { &*percpu::percpu_ptr() };
     percpu.last_armed_ticks.store(ticks, Ordering::Relaxed);
-    percpu.armed_deadline_ns.store(
-        crate::clock::nanos_since_boot().saturating_add(nanos), Ordering::Relaxed);
     cpu::wrmsr(X2APIC_TIMER_INIT, ticks as u64);
     crate::trace::trace(crate::trace::Kind::TimerArm, nanos as u32);
 }
@@ -155,7 +153,6 @@ pub fn arm_one_shot(nanos: u64) {
 pub fn stop_timer() {
     let percpu = unsafe { &*percpu::percpu_ptr() };
     percpu.last_armed_ticks.store(0, Ordering::Relaxed);
-    percpu.armed_deadline_ns.store(u64::MAX, Ordering::Relaxed);
     cpu::wrmsr(X2APIC_TIMER_INIT, 0);
     crate::trace::trace(crate::trace::Kind::TimerStop, 0);
 }

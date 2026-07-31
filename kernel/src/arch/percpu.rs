@@ -1,5 +1,5 @@
 use core::mem::size_of;
-use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8};
+use core::sync::atomic::{AtomicU32, AtomicU8};
 
 use alloc::alloc::alloc_zeroed;
 use core::alloc::Layout;
@@ -89,10 +89,6 @@ pub struct PerCpu {
     /// timers are armed independently on every CPU; a shared value would let
     /// any CPU's arm/stop clobber every other CPU's re-arm fallback.
     pub last_armed_ticks: AtomicU32,       // offset 260
-    /// Absolute nanos_since_boot the armed one-shot fires at (u64::MAX =
-    /// timer stopped). Set by the scheduler's `TimerPlan` -> `Hw::set_timer`
-    /// arming path to close the blocked-thread deadline-arming race.
-    pub armed_deadline_ns: AtomicU64,      // offset 264
 }
 
 // GDT layout:
@@ -186,7 +182,6 @@ const _: () = assert!(core::mem::offset_of!(PerCpu, ring0_timer_fires) == 248);
 const _: () = assert!(core::mem::offset_of!(PerCpu, last_seen_ring0_fires) == 252);
 const _: () = assert!(core::mem::offset_of!(PerCpu, fault_state) == 256);
 const _: () = assert!(core::mem::offset_of!(PerCpu, last_armed_ticks) == 260);
-const _: () = assert!(core::mem::offset_of!(PerCpu, armed_deadline_ns) == 264);
 
 const IDLE_STACK_SIZE: usize = 16384; // 16KB
 const IST1_STACK_SIZE: usize = 4096;  // 4KB — only used by double fault handler
@@ -205,8 +200,6 @@ fn alloc_percpu(cpu_id: u32, lapic_id: u32) -> *mut PerCpu {
     percpu.current_pid = u32::MAX;
     percpu.tss = Tss::new();
     percpu.gdt = GDT_ENTRIES;
-    // No one-shot armed yet — any future deadline must trigger an arm.
-    percpu.armed_deadline_ns = AtomicU64::new(u64::MAX);
     percpu.init_tss_descriptor();
     ptr
 }
