@@ -333,24 +333,47 @@ exists. That is fine for a first boot and not fine for debugging M2 on the
 machine. It is also the entire cost the mute default was buying, which is why
 the metal-sim profile now keeps its 16550 by default.
 
-### The double-fault path overflows IST1 by ~1.4 KiB while reporting
+### CLOSED — the double-fault path overflowed IST1, by 4x what was estimated
 
-IST1 is a 4096-byte heap allocation (`arch/percpu.rs:187`, `:216`) used by
-vector 8 alone. `double_fault_handler` (`arch/idt/exceptions.rs:363`) spends
-about a kilobyte on `log!`'s 1024-byte `SerialWriter` buffers and then ends in
-`halt_all_cpus` → `panic_flush`, whose entry block declares `let mut buf =
-[0u8; 4096]` (`drivers/serial.rs`). That array is reserved in the prologue on
-every path through the function, including the two early returns, so a double
-fault writes roughly 1.4 KiB below its stack into whatever heap object the
-allocator put there — while reporting the double fault.
+IST1 was 4096 bytes and the report used **9968** — an overrun of **5872**, not
+the ~1.4 KiB this entry estimated for months. Closed by growing IST1 to 16384
+(`arch/percpu.rs:207`) with a fill-pattern red zone that measures the high-water
+mark and reports it straight to the UART, bypassing the ring the overflow may
+have corrupted.
 
-Pre-existing: the panic-console series only added the early return. But it
-invalidates the reasoning the console's DESIGN RULE relies on ("stack budget is
-256 bytes plus the one wrap array; the double fault path runs on IST1, which is
-4096 bytes"), because the renderer is not the peak — `panic_flush` is, and it
-already exceeds the stack before the renderer is counted. Two independent
-fixes: size IST1 from the real worst case (16 KiB, like the idle stack), and
-give `panic_flush` a static bypass buffer instead of a stack one.
+**Keep the reasoning, because it is the reusable part:** after the drain buffers
+were cut, the report still needed **4512** bytes — so cutting buffers alone was
+never sufficient, and the stack had to grow whatever happened to them. Only
+measuring established that. A fix that trimmed the buffers, which is the obvious
+one and which this entry's own last paragraph proposed, would have looked correct
+and shipped broken.
+
+Closed in the same batch: `uart_write_bytes`'s unbounded THRE spin, now bounded
+by `THRE_SPIN_LIMIT` (`drivers/serial.rs:337`). It sat on `panic_flush`'s bypass —
+the path that runs precisely when the backend holder is *already* wedged — so the
+mechanism of last resort could hang the machine. And `main.rs`'s NVMe-absence
+panic, now covered by `Profile::Diskless` (`tests/common/qemu.rs:59`), which makes
+device **presence** a shape dimension alongside size and sector size.
+
+Still open from this entry: `crash_report`'s `try_lock`, and the recovered CPU
+wedging on the allocator lock.
+
+### Nothing distinguishes `panic_console::capture` from a no-op
+
+`capture`/`discard_capture` (`drivers/panic_console/mod.rs:362`, `:374`) have no
+test that would fail if they stopped working. Measured, not assumed: with
+`capture`'s body replaced by `return`, `screen_late_panic` still passes — and
+`main.rs` claimed that test was "the one test that fails if the capture stops
+happening". The claim was false; it has been corrected in the code.
+
+An open **testing** gap, not a code defect. The functions were kept for a
+narrower surviving reason — freezing the report at the panic instant, where
+`live_tail` re-reads a ring that siblings running with IF=0 are still writing
+to — and carry a comment saying explicitly not to delete them on the grounds
+that the tests pass.
+
+Another gate that cannot fail (`specs/metal-track-history.md`), and the third
+found this session, after I5 fairness and the unreachable kernel `check` build.
 
 ### A panic while the virtio-console TX queue is wedged *and* unlocked spins
 
@@ -805,11 +828,16 @@ Spec: `specs/audio-subsystem-spec.md`. Numbered as in the 2026-07-28 audit;
 "wait until clients have filled" condition are fixed (`97723dc`, `9ed8eda`,
 `a88e4ee`, `069d158`).
 
-**(5) The cpal ToyOS backend hardcodes 44100/2ch/i16** and rejects everything
-else, so soundd's resampler and channel-conversion paths (spec §6/§8) are
-unreachable from any real client and effectively untested. It also `assert_eq!`s
-the device rate against a compile-time constant, so changing the driver's rate
-aborts every cpal app.
+**(5) ASSIGNED — the cpal ToyOS backend hardcodes 44100/2ch/i16** and rejects
+everything else, so soundd's resampler and channel-conversion paths (spec §6/§8)
+are unreachable from any real client and effectively untested. It also
+`assert_eq!`s the device rate against a compile-time constant, so changing the
+driver's rate aborts every cpal app.
+
+Deferred to the quiet-tree window, not neglected: editing that fork needs
+`.cargo/config.toml` path overrides, which redirect cpal for **every** agent in
+the tree. Same scheduling constraint as the fork lint audit
+(`specs/fork-lint-audit-plan.md`).
 
 **(6) soundd never frees the per-client shm region.** `SharedMemory::Drop` only
 unmaps and nothing calls `destroy()`, so each open/close cycle strands a 2 MiB
@@ -820,18 +848,58 @@ previously claimed the page was stranded for soundd's whole run, which
 overstates it: a long-lived soundd accumulates only until whichever process owns
 the region exits.
 
-**(8) `virtio_sound.rs` queries PCM capabilities, logs them, then calls
-`configure(44100, 2)` unconditionally** and silently remaps unsupported rates to
-44100. Spec §9.1–§9.3 not implemented; silent degradation.
+**ASSIGNED** to the isolation agent, merged with `SYS_GRANT_SHARED`'s missing
+revocation: revoke and reclaim are one mechanism, and fixing either alone leaves
+the other holding the same page.
 
-**(10) The two TPDF dither draws are not independent** (the second is a
-deterministic function of the first) — a literal §5.4 non-conformance whose
-practical effect was not measured.
+**(8) FIXED at `4fce59c`** — `choose_params` (`virtio_sound.rs:62`) now selects a
+rate and channel count the device actually advertises, and a device offering
+nothing this driver implements logs *which* capability is missing and leaves the
+machine to boot without audio, rather than being silently remapped to 44100/2.
 
-Lower severity: decode divides by 32768 while quantize multiplies by 32767, so
-the no-conversion passthrough path is not unity gain; `AudioInfo::as_bytes`
-copies 6 bytes of uninitialised kernel stack padding to userspace; unknown audio
-device command bytes report success and do nothing.
+> **CAVEAT — not verified by a QEMU boot.** This fix changes device negotiation,
+> and seven consecutive boot attempts died in shared-toolchain contention. The
+> reasoning that it still selects (44100, 2) on QEMU is *static*, read off an
+> earlier boot log's advertised bitmaps. `cargo test -- audio` on a quiet tree is
+> owed before this is treated as proven. Recorded as a live gap because an
+> unverified change to negotiation is exactly the kind that fails on the one
+> machine nobody booted.
+
+**(10) REFUTED — the two TPDF dither draws are independent enough that nothing
+can tell.** Kept rather than deleted: the measurement is the finding, and an
+entry removed silently gets re-filed next year by the next person who reads
+`rng.next() + rng.next()` on one `Xorshift32` state and assumes.
+
+Measured over two million samples, one state stepped twice versus two
+independent states:
+
+| | variance (TPDF ideal 0.16667) | χ²/df vs triangular | lag-1 autocorrelation |
+|---|---|---|---|
+| one state, two draws | 0.16672 | 0.98 | −0.00048 |
+| two independent states | 0.16652 | 0.63 | −0.00050 |
+
+The joint distribution of the summand *pair* is where a deterministic
+relationship would actually show, and it does not: χ²/df ≈ 1.00 with zero empty
+cells at 32×32, 128×128 and 512×512, for both arrangements. The step function
+decorrelates the two draws well enough that the pair is empirically
+indistinguishable from two independent streams.
+
+**Deliberately not "fixed anyway".** Changing the dither changes the captured wav
+bit-for-bit, so it would perturb the audio gate to chase a defect nobody can
+demonstrate. This project has been bitten specifically by gates that cannot fail
+(`specs/metal-track-history.md`); spending the gate's sensitivity on a
+non-defect is the same error wearing a tidier hat.
+
+Two of the three lower-severity items are **FIXED at `4fce59c`**. The passthrough
+gain was not a rounding nicety: decoding by 32768 and quantizing by 32767 meant
+**32,703 of the 65,536 i16 values did not survive a round trip**, each off by one
+LSB. Now 0, gated by an exhaustive host test over every i16
+(`soundd/src/main.rs:1347`). `AudioInfo::as_bytes` no longer publishes
+uninitialised kernel stack: the padding is spelled out as named fields with a
+`const _` size assert, so omitting one is an E0063 compile error rather than a
+convention someone can quietly break.
+
+Still open: unknown audio device command bytes report success and do nothing.
 
 **The kernel's byte-1 audio fd verb has no SDK caller.** `kernel/src/fd.rs`
 still dispatches `1 => crate::audio::start()`, but suspend-on-idle deleted
