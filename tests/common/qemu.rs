@@ -42,12 +42,19 @@ pub enum Profile {
     MetalUsb,
 }
 
-/// The controller every profile but [`Profile::MetalUsb`] gets. QEMU's default
-/// is four USB2 root ports, one fewer than the crowded set needs.
+/// The controller every profile but [`Profile::MetalUsb`] gets. `nec-usb-xhci`
+/// registers `MAX(p2, p3)` attachable USB ports over `p2 + p3` port registers —
+/// the two ranges are two speed-specific views of the same ports, not two sets
+/// of them — so the default `p2=4,p3=4` takes **four** devices, two short of the
+/// crowded set rather than one.
 const XHCI_DEFAULT: &str = "nec-usb-xhci,id=xhci";
-/// Eight USB2 root ports. Every device in the crowded set is full or high
-/// speed, so they all land on the USB2 side however many SuperSpeed ports the
-/// controller has.
+/// Eight attachable ports, which is `MAX(p2=8, p3=4)`, over twelve port
+/// registers: 1-4 the SuperSpeed view, 5-12 the USB2 view. Measured on QEMU
+/// 11.0.2 against the kernel's own lines — `max_ports=12`, and the six devices
+/// landing on registers 1 and 6-10. The boot stick is a `usb-storage` with a
+/// SuperSpeed descriptor, so it takes the SuperSpeed view of the first port and
+/// is enumerated *before* every HID; the five devices below are full or high
+/// speed and take the USB2 view of ports 2-6. Six of eight used, two spare.
 ///
 /// `slots=` would have been the natural way to stage slot exhaustion, and it
 /// is not: on QEMU 11.0.2 `nec-usb-xhci,slots=N` reads back as N through

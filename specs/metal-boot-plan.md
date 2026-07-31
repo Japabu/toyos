@@ -156,8 +156,13 @@ bar; QEMU cannot.
   **The three-slot first-boot blocker is closed.** The driver sizes its DMA
   pool from HCSPARAMS and gives every slot its own block, so the T14's four
   internal devices enumerate; `xhci_many_devices` boots six of them every run
-  and `xhci_slot_exhaustion` proves a bus wider than the pool costs the extra
-  devices and nothing else. Two xHCI items remain in known issues §8, both
+  and checks the block count against the controller's slot count rather than
+  against a number. `xhci_slot_exhaustion` proves a bus wider than the pool
+  costs the extra devices one log line each, and that the device which did get
+  a block was enumerated to completion — but not that a HID survives the
+  shortage and delivers, because the one device that fits is the boot stick:
+  QEMU puts it on the first SuperSpeed port register, ahead of every USB2 one,
+  so it takes slot 1 and binds nothing. Two xHCI items remain in known issues §8, both
   still M4-shaped: the missing USBLEGSUP ownership handoff before HCRST, which
   QEMU structurally cannot fail and Lenovo firmware can, and hotplug, which
   does nothing at all and became reachable when M1 removed the zero-HID panic.

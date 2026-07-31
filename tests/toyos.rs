@@ -1389,6 +1389,41 @@ fn run_machine_test(
             let qemu = QemuInstance::boot_with_options(test_config, c_bins, rust_bins, options);
             let log = qemu.boot_log().to_string();
 
+            // Where the block count came from, which is the thing this work
+            // exists to protect and the thing no count of devices or rings can
+            // see: a fixed cap of any value at or above the size of this bus
+            // leaves every other assertion here green.
+            let Some(dma) = parse_xhci_layout(&log) else {
+                return Err(format!("the driver printed no DMA layout line:\n{log}"));
+            };
+            let room = dma.pool_kib * 1024 / dma.stride;
+            if room <= dma.blocks {
+                return Err(format!(
+                    "the pool holds {room} blocks of {} B and the driver claimed {}: {dma:?}",
+                    dma.stride, dma.blocks
+                ));
+            }
+            // The pool has room for four times what this controller can
+            // address, so the slot count is the binding term of the two and
+            // the block count has to be it exactly. (A cap that happened to
+            // equal 64 would still pass — no QEMU controller can tell those
+            // apart. Every other constant cannot.)
+            if dma.blocks != dma.cap_slots {
+                return Err(format!(
+                    "device blocks={} with max_slots={} and room for {room} — the block count \
+                     is not the controller's slot count:\n{log}",
+                    dma.blocks, dma.cap_slots
+                ));
+            }
+            // And it fit in the single 2 MiB page DmaPool was going to hand
+            // out for the head regardless, which is the whole cost argument.
+            if dma.pool_kib != 2048 {
+                return Err(format!(
+                    "the pool is {} KiB, not the one 2 MiB page the head already forces: {dma:?}",
+                    dma.pool_kib
+                ));
+            }
+
             // One slot per device on the bus, non-HID included: the driver
             // enables a slot before it can know what the device is.
             let slots = parse_xhci_slots(&log);
@@ -1427,12 +1462,6 @@ fn run_machine_test(
                     rings.len()
                 ));
             }
-            // A ring is only that device's if the slot it was configured
-            // against is that device's too — the doorbell is per slot.
-            if let Some(orphan) = binds.iter().find(|b| !slots.contains(&b.slot)) {
-                return Err(format!("{orphan:?} bound to a slot that was never enabled: {slots:?}"));
-            }
-
             // And the devices that are not HID were walked past rather than
             // stumbled over: the stick and the hub both take a slot and bind
             // nothing.
@@ -1449,10 +1478,16 @@ fn run_machine_test(
                 }
             }
             eprintln!(
-                "  [xhci] {} devices, {} slots, {keyboards} keyboards on {} distinct rings",
+                "  [xhci] {} devices, {} slots, {keyboards} keyboards on {} distinct rings; \
+                 {} blocks of {} B for max_slots={}, scratchpad={}, pool {} KiB",
                 usb.len(),
                 slots.len(),
-                rings.len()
+                rings.len(),
+                dma.blocks,
+                dma.stride,
+                dma.cap_slots,
+                dma.scratchpad,
+                dma.pool_kib
             );
             Ok(())
         }
@@ -1479,9 +1514,23 @@ fn run_machine_test(
             let qemu = QemuInstance::boot_with_options(test_config, c_bins, rust_bins, options);
             let log = qemu.boot_log().to_string();
 
-            if !log.contains("xHCI: dma ") || !log.contains("device blocks=1") {
-                return Err(format!("the driver did not clamp itself to one block:\n{log}"));
+            let Some(dma) = parse_xhci_layout(&log) else {
+                return Err(format!("the driver printed no DMA layout line:\n{log}"));
+            };
+            if dma.blocks != 1 {
+                return Err(format!("device blocks={}, want exactly 1: {dma:?}", dma.blocks));
             }
+            // And it is the feature that bound it. A build where the ceiling
+            // stopped reaching `Layout::new` reports the controller's own 64
+            // here and drops nothing, which is a green test with no shortage
+            // in it.
+            if dma.cap_slots <= dma.blocks {
+                return Err(format!(
+                    "max_slots={} — there is no shortage to observe: {dma:?}",
+                    dma.cap_slots
+                ));
+            }
+
             // Every device past the first is dropped, one line each.
             let slots = parse_xhci_slots(&log);
             let over = log.matches("beyond the pool").count();
@@ -1491,17 +1540,46 @@ fn run_machine_test(
                     usb.len() - 1
                 ));
             }
+            if slots != [1] {
+                return Err(format!("slots {slots:?} got a block, want just slot 1:\n{log}"));
+            }
+
+            // The one device that did get the block was enumerated to
+            // completion, which is what makes "the extra devices and nothing
+            // else" more than the absence of a panic. On this bus that device
+            // is the boot stick — QEMU puts it on the controller's first
+            // SuperSpeed port register, ahead of every USB2 one — so it binds
+            // nothing and what this proves is block 0's output context, not a
+            // HID's interrupt ring. A `dev_base` that overlapped the shared
+            // head would put slot 1's device context on the command ring and
+            // the next command would fail here.
+            for bad in [
+                "Enable Slot failed",
+                "Address Device failed",
+                "GET_DESCRIPTOR",
+                "Configure Endpoint failed",
+                "not enabled after reset",
+            ] {
+                if log.contains(bad) {
+                    return Err(format!("{bad:?} on the one device that fit:\n{log}"));
+                }
+            }
+            if !log.contains("xHCI: device addressed") {
+                return Err(format!("slot 1 got a block and was never addressed:\n{log}"));
+            }
+            if log.matches("no HID boot interface found").count() != 1 {
+                return Err(format!(
+                    "want exactly one device walked past, the stick that fit:\n{log}"
+                ));
+            }
             for bad in ["!!! PANIC !!!", "KERNEL PANIC", "panicked at"] {
                 if log.contains(bad) {
                     return Err(format!("{bad:?} — the driver died on a full pool:\n{log}"));
                 }
             }
-            // Not panicking is half of it; the boot also has to finish.
-            if !log.contains(qemu::DEFAULT_READY) {
-                return Err(format!("the boot never reached userland:\n{log}"));
-            }
             eprintln!(
-                "  [xhci] 1 block for {} devices, {over} dropped, boot survived",
+                "  [xhci] 1 block of {} for {} devices, {over} dropped, slot 1 addressed",
+                dma.stride,
                 usb.len()
             );
             Ok(())
@@ -2220,7 +2298,6 @@ fn boot_millis(log: &str) -> Option<u64> {
 #[derive(Debug)]
 struct XhciBind {
     kind: String,
-    slot: u32,
     int_ring: usize,
 }
 
@@ -2234,14 +2311,44 @@ fn parse_xhci_binds(log: &str) -> Vec<XhciBind> {
         .filter_map(|line| {
             let rest = line.split("xHCI: USB ").nth(1)?;
             let (kind, rest) = rest.split_once(" ready on slot ")?;
-            let (slot, rest) = rest.split_once(", int_ring +0x")?;
+            let (_slot, rest) = rest.split_once(", int_ring +0x")?;
             Some(XhciBind {
                 kind: kind.to_string(),
-                slot: slot.parse().ok()?,
                 int_ring: usize::from_str_radix(rest.trim().split_whitespace().next()?, 16).ok()?,
             })
         })
         .collect()
+}
+
+/// Everything the driver derived its DMA pool from, off the two lines it
+/// prints. Reading these is what makes a test see a *derivation* rather than
+/// the fact that some number was printed: every fixed cap that ever stood
+/// where `Layout::new`'s `.min(max_slots)` stands now leaves six devices
+/// enumerating on six rings and is invisible from every other angle.
+#[derive(Debug)]
+struct XhciLayout {
+    /// `xHCI: max_slots=64 max_ports=12 …`, straight off HCSPARAMS1.
+    cap_slots: usize,
+    pool_kib: usize,
+    scratchpad: usize,
+    blocks: usize,
+    stride: usize,
+}
+
+fn parse_xhci_layout(log: &str) -> Option<XhciLayout> {
+    let cap = log.lines().find_map(|l| l.split("xHCI: max_slots=").nth(1))?;
+    let dma = log.lines().find_map(|l| l.split("xHCI: dma ").nth(1))?;
+    let (pool_kib, rest) = dma.split_once(" KiB: scratchpad=")?;
+    let (scratchpad, rest) = rest.split_once(" device blocks=")?;
+    let (blocks, rest) = rest.split_once(" of ")?;
+    let stride = rest.split_once(" B (max_slots=")?.0;
+    Some(XhciLayout {
+        cap_slots: cap.split_whitespace().next()?.parse().ok()?,
+        pool_kib: pool_kib.parse().ok()?,
+        scratchpad: scratchpad.parse().ok()?,
+        blocks: blocks.parse().ok()?,
+        stride: stride.parse().ok()?,
+    })
 }
 
 /// Every slot id in an `xHCI: slot 3 enabled ...` line, in order.
