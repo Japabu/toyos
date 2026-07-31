@@ -152,10 +152,9 @@ pub fn arm_one_shot(nanos: u64) {
 }
 
 /// Re-arm the one-shot for an absolute deadline if it precedes what this
-/// CPU already armed. Closes the deadline-arming race: a blocking thread's
-/// deadline enters the pool only after its successor armed the quantum
-/// (handle_outgoing runs after run_task_on_self), so a short sleep would
-/// otherwise stretch to the full 10ms quantum.
+/// CPU already armed. The scheduler pass arms the timer from its `TimerPlan`
+/// via `Hw::set_timer` with parked deadlines folded in; this helper only
+/// ever shortens the current arming, never stretches it.
 pub fn ensure_armed_before(deadline_ns: u64) {
     let percpu = unsafe { &*percpu::percpu_ptr() };
     if deadline_ns < percpu.armed_deadline_ns.load(Ordering::Relaxed) {

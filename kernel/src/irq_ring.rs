@@ -2,10 +2,11 @@
 //! (spec §11), generalizing the audio completion pattern to every MSI-X
 //! source (B10): the ISR records the IRQ-time timestamp on the CPU that took
 //! the interrupt and sets `need_resched`; that CPU's next scheduler entry
-//! (`drain_events`) consumes the record and converts it into waiter wakes,
-//! io_uring CQEs, or controller polls. The audio DATA path (per-completion
-//! `(mask, timestamp)` records read by soundd) lives in `crate::audio` and is
-//! unrelated — this module only drives *scheduling* off IRQs.
+//! (`sched::driver::drain_irqs`) consumes the record and converts it into
+//! waiter wakes, io_uring CQEs, or controller polls. The audio DATA path
+//! (per-completion `(mask, timestamp)` records read by soundd) lives in
+//! `crate::audio` and is unrelated — this module only drives *scheduling* off
+//! IRQs.
 //!
 //! Shape: one timestamp slot per `(cpu, source)` instead of a record queue.
 //! Consumers re-derive device state at drain time (virtio used rings, xHCI

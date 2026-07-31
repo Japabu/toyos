@@ -505,7 +505,7 @@ close-cancels-poll is preserved via the koid.
 | `ListenerId` | `Listener` handle; names stay rendezvous strings | |
 | `Pid`/`Tid` in `waitpid`/`kill`/`thread_join` | `Process`/`Thread` handles | authority requires capability |
 | `Pid`/`Tid` in logs, stats, scheduler keys | **stay plain integers** | pure names; every authority path goes through a handle |
-| `EventSource::{PipeReadable, PipeWritable, IoUring, Listener}` keys | keyed by `Koid` | kernel-internal wait-list keys, never accepted from userland |
+| `io_uring::Source::{PipeReadable, PipeWritable, Listener}` keys | keyed by `Koid` | kernel-internal wait-list keys, never accepted from userland |
 | `DEVICE_*_OWNER` statics | deleted — claim-object existence is the claim | crash auto-release via §5.3 |
 
 ## 8. Handle transfer over IPC
@@ -604,7 +604,7 @@ handles today. Documented, census-monitored.
                                       (compile-time property via AllThreadsRetired).
 5. addr_space.detach_user(&proof)     drop regions + shm mappings; root untouched
 6. PROCESS_REGISTRY.remove(pid)       registry's strong Arc dropped
-7. wake EventSource::Terminated(koid) parents in SYS_PROCESS_WAIT + io_uring pollers
+7. wake io_uring::Source::Terminated(koid)  parents in SYS_PROCESS_WAIT + io_uring pollers
 8. scheduler exit_current             (self-exit only) last Task consumed; its Arc
                                       drops are the final scheduler-side refs
 ```
@@ -816,7 +816,7 @@ panics happen only for kernel bugs (fail fast); userland can never induce one.
    migration). Resource limits arrive with the separate memory-fairness work.
 8. **Per-object signal/waitset machinery** (`zx_object_wait_*`). Readiness belongs to
    io_uring (Phase 2). Objects expose readiness predicates + watcher lists; one new
-   event: `EventSource::Terminated(Koid)`.
+   event: `io_uring::Source::Terminated(Koid)`.
 9. **Handle-value randomization.** Handles index the caller's own table; nothing to
    forge.
 10. **Rights as const generics / typestate.** Rights are runtime data (dup subsets,
@@ -855,7 +855,7 @@ sites. `HandleTable` added inside `ProcessData` alongside `FdTable`, empty.
 - B3: table swap — `FdTable` deleted; `HandleTable` is the only table, stdio
   pre-seeded at slots 0/1/2 gen 0 (std fork untouched); rights populated
   (pre-existing descriptors get their natural rights); `fd.rs` dispatch becomes
-  exhaustive matches on `KObjectRef` and shrinks to `handle_io.rs`; `EventSource`
+  exhaustive matches on `KObjectRef` and shrinks to `handle_io.rs`; `io_uring::Source`
   keys become Koids; dup→`SYS_HANDLE_DUP` with the cursor-sharing audit.
   Bad handles: log + error (§4.5).
 *Gate:* full boot, full suite, audio glitch test, `handle_basic`,
@@ -878,7 +878,7 @@ gpu/net DMA windows become `SharedMem` handles installed at `SYS_OPEN_DEVICE`;
 **Stage E — Process/Thread objects + SysCap + fail-fast flip.**
 `ProcessObject`/`ThreadObject`; spawn returns a Process handle + grant vector
 (`TAG_SYSCAP`); `SYS_PROCESS_WAIT/KILL/OPEN`, `SYS_THREAD_JOIN_H`,
-`EventSource::Terminated(Koid)`; delete `SYS_WAITPID`, `SYS_KILL`, zombie/orphan
+`io_uring::Source::Terminated(Koid)`; delete `SYS_WAITPID`, `SYS_KILL`, zombie/orphan
 machinery (`zombify`, `OrphanCleanup`, `handle_orphans`, `collect_orphan_zombies`);
 std `process` pal updated; `SYS_RT_ENTER` gated on SysCap RT (system.toml `caps`),
 `SYS_SET_RT_PRIORITY` deleted. **TaskCtx retype (§9.4) lands here** — the single

@@ -167,9 +167,9 @@ pub fn flush() {
 `post_cqe` (atomics on the shared header, overflow assert with structural 2× sizing), now
 including `post.ts`. For `Sink::Kernel` it sets the fired flag and records `post.ts`.
 
-The per-CPU event queue no longer carries `EventSource::IoUring` self-posts (today's
-`push_event(IoUring)` round-trip in `io_uring.rs:481,591` dies); ring wakes go straight to
-`wake_channel`.
+The old per-CPU event queue's `EventSource::IoUring` self-post round-trip is already gone —
+scheduler migration 7a deleted `PERCPU_EVENTS`, and the never-constructed `IoUring` poll key
+died with `EventSource` at 7c; ring wakes go straight to `wake_channel`.
 
 ## 5. Rings
 
@@ -288,8 +288,9 @@ pub fn wait_current(source: Source, deadline: Deadline);
 ```rust
 impl Source {
     /// The ONLY place readiness predicates live. Used at arm time (immediate
-    /// fire if already ready) and by the overflow sweep. The scheduler's
-    /// event_ready() and io_uring's source_ready() duplicates are deleted.
+    /// fire if already ready) and by the overflow sweep. Absorbs today's single
+    /// readiness match, io_uring's Source::is_ready — the scheduler-side
+    /// event_ready() duplicate is already gone (sched migration 7a/7c).
     fn is_ready(self) -> bool {
         match self {
             Source::PipeReadable(id) => pipe::has_data(id),
@@ -349,16 +350,19 @@ pub fn unpark_for_kill(task: TaskId);
 
 ### 6.2 What dies
 
-`EventSource` is deleted. The blocked pool's `by_event` becomes
-`by_channel: BTreeMap<WaitChannel, Vec<TaskId>>`; `TaskCtx.blocked_on: Option<WaitChannel>`.
-`scheduler::block`, `wake_by_event`, `wake_pipe_readers/writers`, `take_by_event_*` for fd
-sources, `event_ready()`, `wake_task` — all deleted. `SYS_AUDIO_POLL = 84` (dead ABI)
-deleted.
+Already dead: `EventSource`, `scheduler::block`, `wake_by_event`, `event_ready()`,
+`take_by_event_*` and the blocked pool's `by_event` index all fell to scheduler migration
+7a/7c — today threads park on per-object `KWaitQueue`s (`kernel/src/sched/waitqs.rs`) with
+`io_uring::Source` as the poll key. Still to die here: `io_uring::Source` +
+`complete_pending_for_event` (readiness collapses into `WaitChannel::Ring`),
+`wake_pipe_readers/writers`, `wake_task`, and the per-source fd queues in `waitqs.rs`
+(`by_channel: BTreeMap<WaitChannel, Vec<TaskId>>` replaces them). `SYS_AUDIO_POLL = 84`
+(dead ABI) deleted.
 
-Deadlines: `Deadline::FOREVER` (`u64::MAX`) inserts no entry in the deadline BTreeMap;
-finite deadlines insert `(t, id)`. `park_outgoing` keeps `ensure_armed_before(deadline)` so
-a parked deadline is always covered by some CPU's LAPIC one-shot (the block-handoff timer
-hole stays closed).
+Deadlines: `Deadline::FOREVER` (`u64::MAX`) inserts no entry in the deadline structure;
+finite deadlines insert `(t, id)`. The per-CPU deadline heap already keeps a parked
+deadline covered by its home CPU's LAPIC one-shot (`TimerPlan` → `Hw::set_timer`), so the
+block-handoff timer hole stays closed.
 
 ### 6.3 Kill/retire protocol (deletes the directed-wake class)
 
@@ -764,8 +768,9 @@ kernel/src/completion.rs        NEW  — Source, Post queue, registry, Ring, Sin
                                 post()/flush()/arm()/wait()/wait_current()/destroy()
 kernel/src/io_uring.rs          THINNED — syscall surface: SQE decode, ops
                                 (POLL_ADD/REMOVE/ACCEPT/CLOSE/NOP); storage in completion.rs
-kernel/src/scheduler.rs         — EventSource deleted; park/park_timeout/wake_channel/
-                                unpark_for_kill; single Park arm; by_channel pool index
+kernel/src/scheduler.rs         — park/park_timeout/wake_channel/unpark_for_kill; single
+                                Park arm; by_channel index (EventSource already gone,
+                                sched migration 7a/7c)
 kernel/src/fd.rs                — Descriptor::{read,write}_source() → Source mapping
 kernel/src/pipe.rs, listener.rs, audio.rs, drivers/xhci/hid.rs, net
                                 — wake sites become one post(); per-source watcher Vecs DELETED
@@ -817,9 +822,9 @@ record ring, need_resched-on-IRQ, harness audio glitch test (`tests/common/audio
 `Source`, per-CPU Post queue, `post()`/`flush()`, registry absorbing all per-source
 watcher Vecs; percpu `in_irq` depth + `current_is_rt` mirror; `Post` carries `ts` and
 `rt` from day one (so PI timing and timestamp fidelity are preserved, not deferred).
-Rewire every wake site to a single `post()`. `flush` internally still calls the legacy
-`wake_by_event(EventSource)` for direct blockers AND the CQE fan-out — both paths, one
-entry point. Delete the per-source watcher boilerplate.
+Rewire every wake site to a single `post()`. `flush` internally still calls today's two
+paths — the `sched::waitqs` wake for direct blockers AND `complete_pending_for_event`'s
+CQE fan-out — both behind one entry point. Delete the per-source watcher boilerplate.
 Green: identical observable behavior; wake sites grep-provably single-call.
 
 **Stage 2 — time & deadline ABI.** `toyos-abi/src/time.rs`; `io_uring_enter` absolute
@@ -841,11 +846,12 @@ until 4d.
 - 4c: `ChildExit`/`ThreadExit` sources; `sys_waitpid`/`SYS_THREAD_JOIN` migrate (closes
   B3); `nanosleep` path → `park_timeout`; kill/retire → `kill_pending` +
   `unpark_for_kill`; `wake_task` deleted. `waitpid_storm` lands here.
-- 4d: deletion commit — `EventSource`, `scheduler::block`, `wake_by_event`,
-  `wake_pipe_*`, `event_ready`, ad-hoc recheck arms → single Park arm (§7), pool
-  `by_event` → `by_channel`, `SYS_AUDIO_POLL`. The deletion commit is the proof: nothing
-  else compiles against the old surface. Grep-gate: `scheduler::park` callers are exactly
-  {completion::wait, futex_wait}.
+- 4d: deletion commit — `io_uring::Source` + `complete_pending_for_event`,
+  `wake_pipe_*`, ad-hoc recheck arms → single Park arm (§7), per-source fd queues →
+  `by_channel`, `SYS_AUDIO_POLL` (`EventSource`, `scheduler::block`, `wake_by_event` and
+  `event_ready` already fell to sched migration 7a/7c). The deletion commit is the
+  proof: nothing else compiles against the old surface. Grep-gate: `scheduler::park`
+  callers are exactly {completion::wait, futex_wait}.
 
 **Stage 5 — SDK polish.** `toyos::ring::Ring` + `toyos::io` replace `Poller` (deleted);
 `CompletionKind`/`Interest` surface; cpal/soundd/netd/compositor call sites updated;

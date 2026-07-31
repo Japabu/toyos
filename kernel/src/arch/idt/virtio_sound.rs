@@ -10,8 +10,8 @@ extern "sysv64" fn virtio_sound_handler() {
     if mask != 0 {
         crate::audio::isr_push_completion(mask, timestamp);
         crate::irq_ring::isr_publish(IrqSource::Audio, timestamp);
-        // Force a scheduler entry on IRQ return so drain_events converts the
-        // record into wakes/CQEs now, not at the next 10ms quantum tick.
+        // Force a scheduler entry on IRQ return so drain_irqs converts the
+        // record into wakes now, not at the next 10ms quantum tick.
         crate::preempt::set_need_resched();
     }
     crate::arch::apic::eoi();

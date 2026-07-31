@@ -100,13 +100,18 @@ every match on them was a dead arm, and `source_ready` answered `false` for
 futexes and reached into another subsystem for rings. Deleting them makes the
 poll key total over the objects an fd can actually name.
 
-**Spec divergence, recorded deliberately.** §12's stage table says 7c removes
+**Spec divergence, recorded deliberately.** §11's stage table says 7c removes
 `scheduler.rs`. It does not, and should not: 7a repurposed that file as the
 kernel-facing API surface (`prepare_wait`/`block_on`/`futex_*`/`retire_task`/…)
 with the driver half under `kernel/src/sched/`, which is the §4 split the spec
 itself asks for — the file the table meant to delete is the legacy *body*, and
 that body died at 7a. The table's other 7c line, preempt-count baseline asserts
-in the entry shims, also landed with the shims at 7a (`driver::pass`).
+in the entry shims, is an **open divergence**: the §6.4 asserts have not landed
+at any stage. `driver::pass` only raises and lowers the preempt count — it
+compares nothing against a baseline — and the sole entry assert in the tree is
+`with_cpu`'s nested-pass check, which is §6.2's `IN_SCHEDULE` replacement, not
+§6.4's lock-across-switch tripwire. The asserts remain owed, tracked as their
+own task.
 
 Nothing in this stage can move a scheduling number: no wake path, placement
 rule or park site changed. Gate A's fast tier agrees — all four configs green,
@@ -123,7 +128,7 @@ cargo run --release -p toyos-sched-sim -- gate 10000        # 10^4 seeds/scenari
 cargo run --release -p toyos-sched-sim -- fuzz-sweep 10000000  # 10^7 fuzz steps/scenario
 ```
 
-The harnesses' teeth are proven by four negative gates, every one of which is
+The harnesses' teeth are proven by five negative gates, every one of which is
 required and every one of which is a *port of a shape the kernel actually had*:
 
 1. `TOYOS_LOOM_RAW=1 cargo test -p toyos-sched-loom --features no-preempt-guard`
