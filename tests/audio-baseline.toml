@@ -106,17 +106,20 @@
 # It is kept, but the thing it was compensating for is gone: two instrument
 # faults (824dd7d scoring idle sleeps that armed no timer against a stale DLL
 # estimate; 7095046 counting connect-time pre-roll as drains) and one real
-# defect (069d158). The same config now spans 7386-9883us, a ratio of 1.34
+# defect (069d158). The same config now spans 6057-8250us, a ratio of 1.36
 # across 30 runs. Keep the factor anyway — it costs nothing and the next tail
 # will not announce itself either.
 #
 # WHAT THESE NUMBERS ADMIT. The spec-derived bar — never wake later than the
-# pipeline you are feeding — is met on 118 of 120 config-runs, with the median
-# at roughly a third of a pipeline depth. Two runs on `audio_tone.smp1` exceed
-# it (54345 and 56909us, 2.3-2.5 pl), and one of the two breached that config's
-# ceiling. That breach is recorded, not designed around: it is the one thing in
-# this file that is worse than its bar, and the ceiling was deliberately not
-# raised to cover it. Everything else has better than 2x margin.
+# pipeline you are feeding — is met on all 120 config-runs. The median sits at
+# roughly a third of a pipeline depth (6652-7130us across the four configs) and
+# the worst single run reaches 0.43 pl (10090us, on `audio_tone.smp1`); no run
+# on any config reached a whole pipeline depth, and `ceiling_runs` is 0
+# everywhere. The previous sample's tail pair on `audio_tone.smp1` — 54345 and
+# 56909us, 2.3-2.5 pl, one of them the only ceiling breach this file has
+# recorded — did not reappear. It was suspected host suspend, and the ceiling
+# was deliberately left where it was rather than raised to cover it, so if the
+# tail is real the next sample says so.
 #
 # The three paragraphs this replaced said the bar was NOT met on any config,
 # blamed "mode-B client misses under single-CPU load", and described
