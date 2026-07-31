@@ -199,10 +199,20 @@ impl CommandRing {
     }
 }
 
+/// One scale for both directions of the i16 <-> f32 conversion.
+///
+/// Decoding by 32768 and quantizing by 32767 is not a round trip: it is a gain
+/// of 32767/32768 on everything that passes through, and 32703 of the 65536
+/// i16 values come back one LSB different from what the client sent. 32768 is
+/// the correct constant in both directions because it is the magnitude of
+/// `i16::MIN`; the positive end is one code short of full scale, which is what
+/// the clamp is for and what two's complement costs.
+const I16_SCALE: f32 = 32768.0;
+
 fn decode_i16_to_f32(src: &[u8], dst: &mut [f32]) {
     for i in 0..dst.len() {
         let sample = i16::from_le_bytes([src[i * 2], src[i * 2 + 1]]);
-        dst[i] = sample as f32 / 32768.0;
+        dst[i] = sample as f32 / I16_SCALE;
     }
 }
 
@@ -289,7 +299,13 @@ impl Xorshift32 {
 /// the zero crossing and a noise floor that collapses with the signal.
 fn dither_and_quantize(sample: f32, rng: &mut Xorshift32) -> i16 {
     let dither = rng.next() + rng.next(); // triangular PDF in [-1.0, 1.0]
-    (sample * 32767.0 + dither).round().clamp(-32768.0, 32767.0) as i16
+    quantize(sample, dither)
+}
+
+/// Split out from `dither_and_quantize` so the scale can be checked against
+/// every i16 there is without a generator in the way.
+fn quantize(sample: f32, dither: f32) -> i16 {
+    (sample * I16_SCALE + dither).round().clamp(-32768.0, 32767.0) as i16
 }
 
 /// Counters for one reporting window. A window covers streaming only: zeroed
@@ -1318,4 +1334,39 @@ fn main() {
         device_period_frames,
         ramp_frames,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A client playing i16 at the device's own rate and channel count must get
+    /// its own bytes back. Nothing resamples or mixes on that path, so any
+    /// difference here is a gain nobody asked for.
+    #[test]
+    fn passthrough_is_bit_exact_for_every_i16() {
+        let mut changed = 0;
+        for s in i16::MIN..=i16::MAX {
+            let mut decoded = [0.0f32; 1];
+            decode_i16_to_f32(&s.to_le_bytes(), &mut decoded);
+            if quantize(decoded[0], 0.0) != s {
+                changed += 1;
+            }
+        }
+        assert_eq!(changed, 0, "{changed} of 65536 i16 values do not survive a passthrough");
+    }
+
+    /// Both rails, named explicitly: `i16::MIN` is the value the scale is
+    /// derived from, and `i16::MAX` is the one the clamp has to catch rather
+    /// than wrap.
+    #[test]
+    fn full_scale_clamps_instead_of_wrapping() {
+        assert_eq!(quantize(-1.0, 0.0), i16::MIN);
+        assert_eq!(quantize(1.0, 0.0), i16::MAX);
+        assert_eq!(quantize(-2.0, 0.0), i16::MIN, "overrange must clamp");
+        assert_eq!(quantize(2.0, 0.0), i16::MAX, "overrange must clamp");
+        // Dither may not push an in-range sample past a rail either.
+        assert_eq!(quantize(-1.0, -1.0), i16::MIN);
+        assert_eq!(quantize(1.0, 1.0), i16::MAX);
+    }
 }

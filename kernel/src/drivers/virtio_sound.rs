@@ -33,6 +33,71 @@ const VIRTIO_SND_PCM_FMT_S16: u8 = 5;
 const VIRTIO_SND_PCM_RATE_44100: u8 = 6;
 const VIRTIO_SND_PCM_RATE_48000: u8 = 7;
 
+/// The rates this driver can encode, best first. 44100 leads because it is
+/// what the mixer, the resampler and the gate's recorded counters are sized
+/// against; 48000 is the one every other device offers.
+const SUPPORTED_RATES: [(u32, u8); 2] = [
+    (44100, VIRTIO_SND_PCM_RATE_44100),
+    (48000, VIRTIO_SND_PCM_RATE_48000),
+];
+
+fn rate_code(hz: u32) -> Option<u8> {
+    let mut i = 0;
+    while i < SUPPORTED_RATES.len() {
+        if SUPPORTED_RATES[i].0 == hz {
+            return Some(SUPPORTED_RATES[i].1);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Pick a rate and channel count the device actually advertises.
+///
+/// The caps were queried, logged, and then ignored: `configure(44100, 2)` ran
+/// unconditionally. `None` means the device offers nothing this driver
+/// implements — audio is optional, so the machine boots without it rather than
+/// dying over a peripheral, but the log has to name the missing capability or
+/// the next person is decoding a bitmap by hand on a laptop with no serial.
+fn choose_params(info: &VirtioSndPcmInfo) -> Option<(u32, u8)> {
+    if info.formats & (1 << VIRTIO_SND_PCM_FMT_S16) == 0 {
+        log!("virtio-sound: no usable format — device offers {:#x}, driver needs S16 (bit {})",
+            info.formats, VIRTIO_SND_PCM_FMT_S16);
+        return None;
+    }
+
+    let mut rate = None;
+    let mut i = 0;
+    while i < SUPPORTED_RATES.len() {
+        let (hz, code) = SUPPORTED_RATES[i];
+        if info.rates & (1 << code) != 0 {
+            rate = Some(hz);
+            break;
+        }
+        i += 1;
+    }
+    let Some(rate) = rate else {
+        log!("virtio-sound: no usable rate — device offers {:#x}, driver needs 44100 (bit {}) or 48000 (bit {})",
+            info.rates, VIRTIO_SND_PCM_RATE_44100, VIRTIO_SND_PCM_RATE_48000);
+        return None;
+    };
+
+    // Stereo if the device takes it; soundd converts either way, so the only
+    // unusable case is a device whose minimum is more channels than we mix.
+    if info.channels_min > 2 {
+        log!("virtio-sound: no usable channel count — device needs at least {}, driver mixes at most 2",
+            info.channels_min);
+        return None;
+    }
+    let channels = if info.channels_max >= 2 { 2 } else { info.channels_max };
+    if channels == 0 {
+        log!("virtio-sound: device advertises a maximum of zero channels");
+        return None;
+    }
+
+    Some((rate, channels))
+}
+
 // Kernel-only DMA page layout (byte offsets). Virtqueue rings, control
 // buffers and xfer/status metadata must never be reachable from userspace —
 // a process that can rewrite descriptors can point the device at arbitrary
@@ -258,11 +323,13 @@ impl SoundController {
     }
 
     pub fn configure(&mut self, sample_rate: u32, channels: u8) {
-        let rate = match sample_rate {
-            44100 => VIRTIO_SND_PCM_RATE_44100,
-            48000 => VIRTIO_SND_PCM_RATE_48000,
-            _ => VIRTIO_SND_PCM_RATE_44100,
-        };
+        // `expect`, not a fallback: `choose_params` has already checked this
+        // rate against the device's own bitmap, so an unencodable one here
+        // means the two disagree — a driver bug, not a device we cannot drive.
+        // The old `_ => RATE_44100` arm turned that into telling a device to
+        // play at a rate it never offered.
+        let rate = rate_code(sample_rate)
+            .expect("virtio-sound: configure() given a rate the driver cannot encode");
 
         let cmd = VirtioSndPcmSetParams {
             hdr: VirtioSndHdr { code: VIRTIO_SND_R_PCM_SET_PARAMS },
@@ -562,14 +629,17 @@ pub fn init(ecam: &crate::mm::Mmio) -> Option<(SoundController, AudioInfo)> {
         pcm_info.direction, pcm_info.channels_min, pcm_info.channels_max,
         pcm_info.formats, pcm_info.rates);
 
-    ctrl.configure(44100, 2);
+    let (sample_rate, channels) = choose_params(&pcm_info)?;
+    ctrl.configure(sample_rate, channels);
 
     let info = AudioInfo {
         dma_token: dma_token.raw(),
         buf_offsets,
         num_buffers: TX_INFLIGHT_MAX as u8,
-        sample_rate: 44100,
-        channels: 2,
+        _pad0: [0; 3],
+        sample_rate,
+        channels,
+        _pad1: [0; 3],
         period_bytes: PERIOD_BYTES as u32,
     };
 
