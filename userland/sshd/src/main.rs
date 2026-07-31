@@ -226,7 +226,13 @@ fn main() {
         };
         let config = Arc::new(config);
 
-        let listener = tokio::net::TcpListener::bind("0.0.0.0:22").await.unwrap();
+        // Every bind goes through netd, which exits on a machine with no NIC.
+        // sshd has nothing to offer without one, so it says so and leaves
+        // instead of dumping a tokio backtrace across the boot.
+        let Ok(listener) = tokio::net::TcpListener::bind("0.0.0.0:22").await else {
+            println!("sshd: no network on this machine, exiting");
+            return;
+        };
         println!("sshd: listening on port 22");
         loop {
             match listener.accept().await {

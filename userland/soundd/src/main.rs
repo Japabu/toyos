@@ -1237,7 +1237,16 @@ fn control_thread(
 fn main() {
     let listener = services::listen("soundd").expect("soundd already running");
 
-    let audio_dev = AudioDev::open().expect("soundd: no audio device");
+    // A machine with no sound card is a machine, not a bug — metal-sim has
+    // none and neither will the laptop's first boots. Exit and release the
+    // name; a soundd that listened without a device would leave every client
+    // blocked on a connect that can never be served. The claim is exclusive,
+    // so `listen` above stays the "already running" check and this stays the
+    // "no hardware" one.
+    let Ok(audio_dev) = AudioDev::open() else {
+        eprintln!("soundd: no audio device on this machine, exiting");
+        return;
+    };
     let info: AudioInfo = audio_dev.info().expect("soundd: failed to read audio info");
 
     let num_buffers = info.num_buffers as usize;

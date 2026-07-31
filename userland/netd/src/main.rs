@@ -32,8 +32,12 @@ struct DmaNic {
 }
 
 impl DmaNic {
-    fn new() -> Self {
-        let nic_dev = NicDev::open().expect("netd: failed to claim NIC device");
+    /// `None` when the machine has no NIC — metal-sim has none, and neither
+    /// does the target laptop until its own driver exists. The claim is
+    /// exclusive, so `services::listen` remains the "already running" check
+    /// and this is only ever "no hardware".
+    fn open() -> Option<Self> {
+        let nic_dev = NicDev::open().ok()?;
         let info = nic_dev.info().expect("netd: failed to read NicInfo");
 
         let rx_buf_size = info.rx_buf_size as usize;
@@ -42,7 +46,7 @@ impl DmaNic {
         let rx_base = unsafe { dma_base.add(info.rx_buf_offset as usize) };
         let tx_ptr = unsafe { dma_base.add(info.tx_buf_offset as usize) as *mut u8 };
 
-        Self {
+        Some(Self {
             _dma_region: dma_region,
             rx_base,
             rx_buf_size,
@@ -50,7 +54,7 @@ impl DmaNic {
             net_hdr_size: info.net_hdr_size as usize,
             mac: info.mac,
             nic_fd: nic_dev,
-        }
+        })
     }
 
     fn rx_buf(&self, idx: usize) -> *const u8 {
@@ -1014,7 +1018,10 @@ impl NetDaemon {
 fn main() {
     let listener = services::listen("netd").expect("netd already running");
 
-    let mut device = DmaNic::new();
+    let Some(mut device) = DmaNic::open() else {
+        eprintln!("netd: no NIC on this machine, exiting");
+        return;
+    };
     let mac = device.mac;
 
     eprintln!(
