@@ -5,6 +5,35 @@ use crate::fs::FsError;
 pub const MAGIC: [u8; 4] = *b"BCFS";
 pub const VERSION: u32 = 1;
 
+/// The designation stamp: the *only* thing that authorises ToyOS to destroy
+/// what is on a block device.
+///
+/// Not a bcachefs concept, and it lives here anyway, because it occupies the
+/// same block as the superblock and the one invariant that matters is that
+/// the two can never be confused — which is checkable at a glance only if
+/// they sit next to each other. The assertion below is the check.
+///
+/// Bytes 0..16 are this magic and bytes 16..24 the little-endian block count
+/// of the device the stamp designates, so a stamped image copied onto a
+/// different disk designates nothing. The rest of the block is ignored.
+///
+/// Reading it is safe on any disk; writing it is the act of designation, and
+/// it destroys whatever partition table was there. That is the point: there
+/// is no way to designate a disk by accident, and no way to do it without
+/// having already decided to lose its contents.
+pub const DESIGNATION_MAGIC: [u8; 16] = *b"TOYOS-FORMAT-ME\0";
+
+/// Bytes 16..24 of a designation stamp.
+pub const DESIGNATION_BLOCKS_OFFSET: usize = 16;
+
+const _: () = assert!(
+    DESIGNATION_MAGIC[0] != MAGIC[0]
+        || DESIGNATION_MAGIC[1] != MAGIC[1]
+        || DESIGNATION_MAGIC[2] != MAGIC[2]
+        || DESIGNATION_MAGIC[3] != MAGIC[3],
+    "a designation stamp would parse as a superblock, or the reverse",
+);
+
 /// On-disk superblock layout. Stored at block 0 and backed up at the last block.
 #[derive(Debug, Clone)]
 pub struct Superblock {

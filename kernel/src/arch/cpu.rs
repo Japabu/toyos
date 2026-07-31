@@ -217,8 +217,38 @@ pub fn enable_smap() -> bool {
 }
 
 /// Enable FSGSBASE instructions (rdfsbase, rdgsbase, wrfsbase, wrgsbase).
-/// Must be called on each CPU during init, before any FSGSBASE instruction is used.
-pub fn enable_fsgsbase() {
+/// Returns whether the CPU had it.
+///
+/// The CPUID gate is not defensive: setting a CR4 bit the CPU does not define
+/// is #GP, and this runs on the BSP before `idt::init`, where a #GP is a triple
+/// fault with no handler and no report. Every other feature here was already
+/// gated; this one was not, and nothing in TCG or on the T14 would have shown
+/// it, because both have FSGSBASE. It is a boot-time crash on the first
+/// machine we try that does not.
+///
+/// Must be called on each CPU during init, before any FSGSBASE instruction is
+/// used. Silent, for the reason [`enable_smep`] is.
+pub fn enable_fsgsbase() -> bool {
+    // CPUID leaf 7, subleaf 0, EBX bit 0.
+    let ebx: u32;
+    unsafe {
+        asm!(
+            "push rbx",
+            "mov eax, 7",
+            "xor ecx, ecx",
+            "cpuid",
+            "mov {0:e}, ebx",
+            "pop rbx",
+            out(reg) ebx,
+            out("eax") _,
+            out("ecx") _,
+            out("edx") _,
+            options(nomem),
+        );
+    }
+    if ebx & 1 == 0 {
+        return false;
+    }
     unsafe {
         asm!(
             "mov {0}, cr4",
@@ -228,6 +258,7 @@ pub fn enable_fsgsbase() {
             options(nostack),
         );
     }
+    true
 }
 
 /// Enable PCID + INVPCID if both are supported. Returns true if enabled.

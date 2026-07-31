@@ -293,16 +293,113 @@ impl FileSystem for ReadOnlyBcacheFsAdapter {
 }
 
 /// Format a new bcachefs filesystem on the NVMe device via PageCache.
-pub fn format() -> Mounted<PageCacheBlockIO, ReadWrite> {
+///
+/// Destroys everything on the device. [`probe`] is the only caller that is
+/// entitled to reach it, and only on [`Storage::Designated`].
+fn format() -> Mounted<PageCacheBlockIO, ReadWrite> {
     let io = PageCacheBlockIO;
     let fs = Formatted::format(io);
     fs.mount()
 }
 
 /// Try to mount an existing bcachefs filesystem from NVMe.
-pub fn mount() -> Option<Mounted<PageCacheBlockIO, ReadWrite>> {
+fn mount() -> Option<Mounted<PageCacheBlockIO, ReadWrite>> {
     let io = PageCacheBlockIO;
     Mounted::<PageCacheBlockIO, ReadWrite>::open(io).ok()
+}
+
+/// What the machine's block device is, as far as we are entitled to care.
+///
+/// The whole point of this enum is that there is no fourth arm and no default
+/// that writes. `Foreign` is the state of every disk that has ever belonged to
+/// anyone else, and it is also the state of a blank one — which is exactly why
+/// it cannot be treated as permission.
+pub enum Storage {
+    /// A ToyOS volume, mounted read-write. Identified positively, by its own
+    /// superblock, not by elimination.
+    Ours(Mounted<PageCacheBlockIO, ReadWrite>),
+    /// The device carries a designation stamp naming its own size: somebody
+    /// deliberately said we may destroy what is here.
+    Designated,
+    /// Anything else. Never written to, under any circumstances.
+    Foreign,
+}
+
+/// Decide what the device is, from one read of block 0.
+///
+/// **A failed mount is not consent.** It is the single most likely state of a
+/// disk that belongs to someone else: an unformatted disk, a disk holding
+/// another operating system, and a ToyOS volume too corrupt to open are all
+/// indistinguishable from each other and all three arrive here as "mount
+/// returned None". The kernel used to format on that, which meant the first
+/// boot on any machine with a disk in it would take the disk. The only reason
+/// the T14's first boot did not is that an unrelated panic in `page_cache::init`
+/// happened to come first, and that panic has since been fixed — so the bug we
+/// removed was the interlock.
+///
+/// One read decides all three because bcachefs puts its superblock at block 0
+/// too, so a disk cannot be both ours and awaiting designation. Reading is
+/// safe on any disk whatsoever; nothing below writes.
+pub fn probe() -> Storage {
+    if let Some(fs) = mount() {
+        log!("storage: mounted the ToyOS volume at block 0");
+        return Storage::Ours(fs);
+    }
+    if designated() {
+        log!("storage: block 0 designates this device for ToyOS — formatting it");
+        return Storage::Designated;
+    }
+    log!(
+        "storage: no ToyOS volume and no designation stamp at block 0 — this disk is not \
+         ours and nothing will be written to it"
+    );
+    Storage::Foreign
+}
+
+/// Whether block 0 carries a designation stamp for a device of *this* size.
+///
+/// The size is half the stamp and not decoration: without it, a designated
+/// image copied or restored onto a different disk would designate that disk
+/// too. With it, designation does not survive being moved.
+fn designated() -> bool {
+    let mut guard = page_cache::lock();
+    let blocks = guard.block_count();
+    let (cache, dev) = guard.cache_and_dev();
+    let block0 = cache.read(dev, 0);
+
+    let magic = bcachefs::DESIGNATION_MAGIC;
+    if block0.len() < bcachefs::DESIGNATION_BLOCKS_OFFSET + 8
+        || block0[..magic.len()] != magic
+    {
+        return false;
+    }
+    let mut stamped = [0u8; 8];
+    stamped.copy_from_slice(
+        &block0[bcachefs::DESIGNATION_BLOCKS_OFFSET..bcachefs::DESIGNATION_BLOCKS_OFFSET + 8],
+    );
+    let stamped = u64::from_le_bytes(stamped);
+    if stamped != blocks {
+        log!(
+            "storage: a designation stamp at block 0 names {} blocks, but this device has {} — \
+             ignoring it",
+            stamped, blocks
+        );
+        return false;
+    }
+    true
+}
+
+/// The `/home` filesystem, and the only path on which `format` runs.
+///
+/// `None` means the device is not ours: the caller mounts a tmpfs instead, so
+/// a machine whose disk we may not touch still boots to a working system with
+/// a volatile `/home` rather than panicking or, far worse, helping itself.
+pub fn open_home() -> Option<Mounted<PageCacheBlockIO, ReadWrite>> {
+    match probe() {
+        Storage::Ours(fs) => Some(fs),
+        Storage::Designated => Some(format()),
+        Storage::Foreign => None,
+    }
 }
 
 /// Mount a read-only bcachefs filesystem from a memory slice (initrd).

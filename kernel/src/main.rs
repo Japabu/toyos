@@ -345,10 +345,10 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     page_cache::init(Box::new(nvme_dev));
     file_cache::init();
 
-    let bcachefs_instance = match bcachefs_adapter::mount() {
-        Some(fs) => fs,
-        None => bcachefs_adapter::format(),
-    };
+    // `None` means the disk is not ours to write to. It is not an error and it
+    // must never become one: on any machine that already had an operating
+    // system, it is the correct answer.
+    let home_volume = bcachefs_adapter::open_home();
 
     boot_phase!("storage ready", t_storage);
 
@@ -382,8 +382,17 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     let initrd_fs = bcachefs_adapter::mount_initrd(initrd_base, initrd.len());
     vfs::lock().set_root(Box::new(bcachefs_adapter::ReadOnlyBcacheFsAdapter::new(initrd_fs, initrd_base)));
 
-    // Mount NVMe bcachefs at /home for persistent user data
-    vfs::lock().mount("home", Box::new(bcachefs_adapter::BcacheFsAdapter::new(bcachefs_instance)));
+    // NVMe bcachefs at /home when the device is ours, a tmpfs when it is not,
+    // so a machine we may not write to still boots to a working system. The
+    // difference is persistence and nothing else, which is what keeps the
+    // refusal from turning into a second failure mode further up.
+    match home_volume {
+        Some(fs) => vfs::lock().mount("home", Box::new(bcachefs_adapter::BcacheFsAdapter::new(fs))),
+        None => {
+            log!("storage: /home is a tmpfs — it will not survive a reboot");
+            vfs::lock().mount("home", Box::new(crate::tmpfs::TmpFs::new()))
+        }
+    }
     vfs::lock().mount("tmp", Box::new(crate::tmpfs::TmpFs::new()));
 
     vfs::lock().create_dir("/home/root");

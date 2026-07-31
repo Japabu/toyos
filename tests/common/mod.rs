@@ -8,3 +8,5 @@ pub mod qemu;
 pub mod screen;
 #[allow(dead_code)]
 pub mod stats;
+#[allow(dead_code)]
+pub mod storage;

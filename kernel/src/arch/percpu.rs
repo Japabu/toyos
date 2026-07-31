@@ -234,7 +234,7 @@ pub fn init_bsp(lapic_id: u32) {
     cpu::enable_sse();
     let smep = cpu::enable_smep();
     let smap = cpu::enable_smap();
-    cpu::enable_fsgsbase();
+    require_fsgsbase(cpu::enable_fsgsbase());
     let pcid = crate::mm::paging::enable_pcid();
 
     cpu::wrmsr(MSR_GS_BASE, ptr as u64);
@@ -259,6 +259,18 @@ fn on(enabled: bool) -> &'static str {
     if enabled { "on" } else { "off" }
 }
 
+/// Unlike SMEP, SMAP and PCID, FSGSBASE is not optional here: `hw.rs` saves and
+/// restores the user TLS base with `rdfsbase`/`wrfsbase` on every context
+/// switch, so a CPU without it would #UD at the first one. Said out loud rather
+/// than discovered, because the alternative is a fault on a path that has no
+/// business faulting, on some future machine, with no line explaining it.
+fn require_fsgsbase(enabled: bool) {
+    assert!(
+        enabled,
+        "cpu: FSGSBASE is required — every context switch uses rdfsbase/wrfsbase",
+    );
+}
+
 /// Allocate percpu for an AP on the BSP. Returns the raw pointer for the trampoline
 /// to write into IA32_GS_BASE before loading the IDT.
 pub fn alloc_ap(cpu_id: u32, lapic_id: u32) -> *mut PerCpu {
@@ -279,7 +291,7 @@ pub fn init_ap(percpu_ptr: *mut PerCpu) {
     cpu::enable_sse();
     cpu::enable_smep();
     cpu::enable_smap();
-    cpu::enable_fsgsbase();
+    require_fsgsbase(cpu::enable_fsgsbase());
     crate::mm::paging::enable_pcid();
 }
 

@@ -14,4 +14,4 @@ pub use block_io::{BlockIO, BlockBuf, BlockNum, SliceBlockIO};
 #[cfg(feature = "std")]
 pub use block_io::VecBlockIO;
 pub use fs::{Formatted, Mounted, ReadOnly, ReadWrite, FsError, Extent};
-pub use superblock::Superblock;
+pub use superblock::{DESIGNATION_BLOCKS_OFFSET, DESIGNATION_MAGIC, Superblock};

@@ -175,6 +175,13 @@ pub struct BootOptions {
     /// test never reaches userland at all. Ignored when [`BootOptions::mute`]
     /// is set, which leaves no console for a marker to arrive on.
     pub ready_marker: &'static str,
+    /// Boot against this disk image instead of the shared scratch one.
+    ///
+    /// The shared image is created by `create_sparse`, which designates it --
+    /// so every ordinary test boots a disk the kernel is allowed to format,
+    /// and none of them can observe what it does with one it is not. This is
+    /// how a test hands the guest somebody else's disk.
+    pub nvme_image: Option<PathBuf>,
 }
 
 /// The in-guest test runner's startup marker.
@@ -192,6 +199,7 @@ impl Default for BootOptions {
             i8042: true,
             mute: false,
             ready_marker: DEFAULT_READY,
+            nvme_image: None,
         }
     }
 }
@@ -299,10 +307,16 @@ impl QemuInstance {
         // Named by size, so two profiles that disagree about the device do
         // not hand each other a filesystem formatted for the wrong one.
         let nvme_bytes = options.profile.shape().nvme_bytes;
-        let nvme_image = test_dir.join(format!("test-nvme-{nvme_bytes}.img"));
-        if !nvme_image.exists() {
-            toyos_build::build::create_sparse(&nvme_image, nvme_bytes);
-        }
+        let nvme_image = match &options.nvme_image {
+            Some(path) => path.clone(),
+            None => {
+                let path = test_dir.join(format!("test-nvme-{nvme_bytes}.img"));
+                if !path.exists() {
+                    toyos_build::build::create_sparse(&path, nvme_bytes);
+                }
+                path
+            }
+        };
 
         let seq = BOOT_SEQ.fetch_add(1, Ordering::Relaxed);
         let audio_wav = test_dir.join(format!("audio-{seq}.wav"));

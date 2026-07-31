@@ -386,11 +386,50 @@ pub fn build(root: &Path, debug: bool, release: bool) {
 /// a device the tests may present, and device *size* is a shape dimension:
 /// an index sized per device block is invisible on a small disk and fatal on
 /// a real one.
+///
+/// Designates the result, because every caller here is making a scratch disk
+/// for a guest that expects a working `/home`, and the kernel will not format
+/// an undesignated one. Leaving it to the call sites would mean two places to
+/// forget; forgetting is not silent (the boot says so and `/home` is volatile)
+/// but it is not worth the chance.
 pub fn create_sparse(path: &Path, len: u64) {
     let file = fs::File::create(path)
         .unwrap_or_else(|e| panic!("create {}: {e}", path.display()));
     file.set_len(len)
         .unwrap_or_else(|e| panic!("set_len {} on {}: {e}", len, path.display()));
+    designate_for_format(path, len);
+}
+
+/// Stamp block 0 so the kernel is allowed to format this image.
+///
+/// The kernel never formats a device that does not carry this, which is what
+/// stops it taking the disk of any machine it is booted on. So a throwaway
+/// image has to say so, and this is the whole of the test harness's opt-in:
+/// **data on a scratch file, not a build flag.** The kernel binary and the
+/// code path are identical either way — `probe` runs the same three-way match
+/// on metal as it does here — so the configuration under test is the
+/// configuration that ships, which a `#[cfg]` could not have given us.
+///
+/// Only ever called on a file this build system just created. It is a
+/// destructive write by construction: on a device with anything on it, this
+/// overwrites the partition table.
+pub fn designate_for_format(path: &Path, len: u64) {
+    use std::io::{Seek, SeekFrom, Write};
+
+    let mut block = [0u8; 4096];
+    block[..bcachefs::DESIGNATION_MAGIC.len()].copy_from_slice(&bcachefs::DESIGNATION_MAGIC);
+    let blocks = (len / 4096).to_le_bytes();
+    let at = bcachefs::DESIGNATION_BLOCKS_OFFSET;
+    block[at..at + blocks.len()].copy_from_slice(&blocks);
+
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .unwrap_or_else(|e| panic!("open {} to designate: {e}", path.display()));
+    file.seek(SeekFrom::Start(0))
+        .unwrap_or_else(|e| panic!("seek {}: {e}", path.display()));
+    file.write_all(&block)
+        .unwrap_or_else(|e| panic!("stamp {}: {e}", path.display()));
 }
 
 /// Build a test image from a system.toml config. Returns the raw disk image bytes.
