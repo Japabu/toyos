@@ -292,7 +292,7 @@ pub fn build_toyos_bins(crate_path: &Path) -> Vec<(String, Vec<u8>)> {
 
 /// All kernel serial output goes through log!() which prepends "[kernel ...]".
 /// User program output goes through serial::write directly with no prefix.
-fn is_kernel_line(line: &str) -> bool {
+pub fn is_kernel_line(line: &str) -> bool {
     line.starts_with("[kernel ")
 }
 
