@@ -1,0 +1,9 @@
+# Its own workspace, like toyos-sched: the kernel depends on it by path and
+# `cargo test` runs here on the host, with no target-triple juggling.
+[workspace]
+
+[package]
+name = "toyos-ps2"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
