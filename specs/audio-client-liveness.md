@@ -111,6 +111,64 @@ Order: cpal fork first, then SDK, then soundd, then §6.4 and §7.3 of the spec.
 The spec change is not cosmetic — §6.4's "no explicit coordination required" is
 the sentence this whole design deletes.
 
+### 1a. Suspending on no progress — measured, and the answer is no
+
+The tempting half of §1 is that *suspending* does not need the paused/wedged
+distinction: both are "not producing", and closing the voice serves both
+correctly. Only *killing* needs the distinction, and only killing is blocked on
+the fork. So: is suspend-on-no-progress landable on its own?
+
+**No. There is no wake edge on resume.** soundd's wait has exactly two sources
+plus a timeout:
+
+```rust
+let timeout = if streams.is_empty() { u64::MAX } else { /* DLL prediction */ };
+poller.poll_add(&audio_dev, IORING_POLL_IN, TOKEN_AUDIO);   // device completions
+poller.poll_add_fd(cmd_pipe_read, IORING_POLL_IN, TOKEN_CMD); // control thread
+poller.wait(1, timeout, ...);
+```
+
+`TOKEN_CMD` carries exactly three commands — `AddClient`, `RemoveClient`,
+`SetVolume` — submitted by the control thread when it receives
+`MSG_STREAM_OPEN`, `MSG_STREAM_CLOSE` or `MSG_STREAM_SET_VOLUME`. **None of them
+corresponds to resume.**
+
+The client side confirms it. `AudioStream::wait_and_fill` *blocks reading the
+soundd→client signal pipe* and then fills slots with a shared-memory store;
+there is no client→soundd traffic in the steady state at all. cpal's `play()`
+stores `STATE_PLAYING` and futex-wakes its own thread, which then blocks on
+that read. Nothing crosses to soundd.
+
+So a suspended soundd, with the device stopped and `timeout = u64::MAX`, waits
+for completions that will never come and a command nobody will send, while the
+resumed client blocks forever on a signal byte soundd is no longer writing.
+That is a battery defect traded for permanent silence — strictly worse, and
+exactly the trade that needs the owner's sign-off and would not get it.
+
+**The missing edge, written down and not built:** a client→soundd resume
+notification. The natural home is the control connection, because the wake path
+already exists — `TOKEN_CMD` wakes a *fully idle* mix loop today, which is how a
+new client connecting wakes soundd out of `timeout = u64::MAX`. The mechanism is
+there; only the message is missing, and it must be sent from cpal's `play()`.
+
+That consolidates the roadmap: **killing wedged clients, suspending on no
+progress, and resuming from suspend all need the same one client→soundd edge.**
+One fork change unblocks all three. They are not three problems.
+
+#### The fork-independent variant, and why it is still not landable today
+
+There is one shape that keeps resume working without any client change: stop the
+*device voice* but keep the periodic timer wake, so soundd goes on writing
+signal bytes and sees the resumed client's slots on the next cycle. That
+recovers the DMA engine and the codec — the battery-relevant hardware — and
+gives up only the wake itself.
+
+It is soundd-only, so it is not blocked on the fork. It is blocked on the gate:
+stopping and restarting the device mid-session introduces a restart transient
+and a DLL re-lock, which is audible output changing, which is the thorough tier
+and a quiet tree. Recorded here as the option that becomes available first if
+the quiet window arrives before fork access.
+
 ---
 
 ## 2. Decoupling client ring depth from the device pipeline
