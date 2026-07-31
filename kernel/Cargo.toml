@@ -25,6 +25,12 @@ i8042-fault = []
 # handler per device class, so two keyboards or two pointers can never both be
 # live in a guest — the merge has no end-to-end test and this is its only one.
 test-input-merge = []
+# Emit one deliberately over-wide log line just before the last boot
+# checkpoint, so the screen test that proves the renderer wraps rather than
+# clips owns its own stimulus. It used to borrow the `KernelArgs` line, which
+# sits near the top of the console's window and scrolls off whenever a `log!`
+# is added anywhere before it.
+test-wide-log = []
 # Panic once the boot phases are done, with no thread current, so a test can
 # drive the ordinary fatal panic — the one path where the report reaches the
 # screen only because the panic handler captured it before draining the ring.

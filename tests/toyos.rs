@@ -1130,6 +1130,7 @@ fn run_screen_test(
                 BootOptions {
                     profile: qemu::Profile::Gop,
                     qmp: true,
+                    kernel_features: &["test-wide-log"],
                     ..Default::default()
                 },
             );
@@ -1151,19 +1152,24 @@ fn run_screen_test(
             }
             // Wrap, not clip — the reason the renderer wraps is that a
             // demangled Rust symbol lives at the *end* of a backtrace line,
-            // which is exactly what a clip drops. The one line in this tree
-            // wider than the grid is KernelArgs' derived Debug (~600 chars
-            // against 256 columns), and `boot_pml4_addr` is its last field.
+            // which is exactly what a clip drops.
+            //
+            // The stimulus is the kernel's own `test-wide-log` line, emitted
+            // immediately before the last checkpoint. This used to borrow
+            // `KernelArgs`, the one line in the tree naturally wider than the
+            // grid — but it sits near the top of the console's window and
+            // scrolled off whenever a `log!` was added anywhere before it,
+            // which M1 and then M2 both tripped over.
             let rows = dump.rows();
-            let Some(head) = dump.row_index("KernelArgs {") else {
-                return Err(format!("no KernelArgs line on screen\n{text}"));
+            let Some(head) = dump.row_index("wide-log-head") else {
+                return Err(format!("no wide-log line on screen\n{text}"));
             };
-            if rows[head].contains("boot_pml4_addr") {
-                return Err("KernelArgs fit one display row; wrap is not exercised".to_string());
+            if rows[head].contains("wide-log-tail") {
+                return Err("the wide line fit one display row; wrap is not exercised".to_string());
             }
-            if !rows[head..].iter().take(4).any(|r| r.contains("boot_pml4_addr")) {
+            if !rows[head..].iter().take(4).any(|r| r.contains("wide-log-tail")) {
                 return Err(format!(
-                    "the tail of the KernelArgs line never reached the screen — clipped?\n{text}"
+                    "the tail of the wide line never reached the screen — clipped?\n{text}"
                 ));
             }
             Ok(())
@@ -1349,19 +1355,19 @@ fn run_input_test(
             }
             // IRQ 1 and IRQ 12 must be uncovered by the override table, or
             // the i8042 driver's identity assumption is wrong on this machine.
-            let isos: Vec<&str> = log
+            let Some(isos) = log
                 .lines()
-                .filter_map(|l| l.split("ioapic: iso ").nth(1))
-                .collect();
+                .find_map(|l| l.split("ioapic: iso bus:irq->gsi [").nth(1))
+                .and_then(|r| r.split(']').next())
+            else {
+                return Err(format!("no `ioapic: iso` line in the boot log:\n{log}"));
+            };
+            // q35 always overrides at least IRQ 0, so an empty table means the
+            // parse found nothing rather than that the machine has nothing.
             if isos.is_empty() {
-                return Err(format!(
-                    "no `ioapic: iso` line — q35 always overrides at least IRQ 0:\n{log}"
-                ));
+                return Err(format!("the override table is empty; q35 always has IRQ 0:\n{log}"));
             }
-            eprintln!("  [ioapic] {} unit(s), {} override(s)", units.len(), isos.len());
-            for iso in &isos {
-                eprintln!("    iso {}", iso.trim());
-            }
+            eprintln!("  [ioapic] {} unit(s), overrides {isos}", units.len());
             Ok(())
         }
         "input_merge" => {

@@ -415,6 +415,13 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
         log!("spawned {} pid={pid}", args[0]);
     }
 
+    // Wider than the console's 320-column grid, and placed where the last
+    // checkpoint is certain to still hold it. The renderer wraps rather than
+    // clips because a demangled Rust symbol lives at the *end* of a backtrace
+    // line; proving that needs a line the test controls.
+    #[cfg(feature = "test-wide-log")]
+    log!("wide-log-head {} wide-log-tail", "=".repeat(320));
+
     boot_phase!("complete", 0);
     log!("Keyboard layout: {}", crate::keyboard::layout_name());
 

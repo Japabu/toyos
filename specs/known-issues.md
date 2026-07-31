@@ -659,18 +659,6 @@ real bugs in that module were found and fixed 2026-07-28 — see `forks.toml`.
 It is only called from the test harness and contains test-specific logic (cdylib
 subcrate discovery, `-L` rustflags for `.so` linking). Move it to `tests/`.
 
-### `screen_boot_checkpoint` breaks whenever a kernel log line is added
-
-The test needs the `KernelArgs` line — the one line in the tree wider than the
-display grid — to be on screen so it can prove the renderer wraps rather than
-clips. But the screen holds the newest `MAX_ROWS` lines, and `KernelArgs` is
-near the *top* of that window, so any new `log!` before the last boot checkpoint
-scrolls its head off and the test fails with `no KernelArgs line on screen`.
-M1 hit this by adding one line to `xhci::init`, and the fix was to delete the
-line rather than to change the test — which is the right precedence but not a
-sustainable one. The test wants a line it controls (a deliberately over-wide
-one it emits itself) instead of borrowing an unrelated one.
-
 ---
 
 ## 7. Design debt

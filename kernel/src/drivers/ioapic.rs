@@ -17,7 +17,9 @@
 //!   never atomic. `TOPOLOGY` serializes it and is taken from thread context
 //!   only. No ISR touches this module.
 
+use alloc::string::String;
 use alloc::vec::Vec;
+use core::fmt::Write;
 
 use crate::log;
 use crate::mm::Mmio;
@@ -143,6 +145,10 @@ pub fn init(madt: &MadtInfo) {
         topology.units.push(unit);
     }
 
+    // One line for the whole table, not one per entry: on a machine with no
+    // UART these are read off the next boot checkpoint's repaint of the log
+    // tail, which holds a fixed number of rows.
+    let mut table = String::new();
     for iso in &madt.source_overrides {
         // MPS INTI flags: 00 in either field means "conforms to the bus", and
         // the ISA bus default is edge-triggered active-high.
@@ -154,8 +160,10 @@ pub fn init(madt: &MadtInfo) {
             3 => Trigger::Level,
             _ => Trigger::Edge,
         };
-        log!(
-            "ioapic: iso bus={} irq{}->gsi{} {}",
+        let _ = write!(
+            table,
+            "{}{}:{}->{} {}",
+            if table.is_empty() { "" } else { ", " },
             iso.bus,
             iso.source_irq,
             iso.gsi,
@@ -168,6 +176,7 @@ pub fn init(madt: &MadtInfo) {
             polarity,
         });
     }
+    log!("ioapic: iso bus:irq->gsi [{}]", table);
 
     if topology.units.is_empty() {
         log!("ioapic: none in MADT — no pin interrupts on this machine");
