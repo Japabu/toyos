@@ -24,6 +24,24 @@
 - Scales to 128+ cores: the handle table is a per-process leaf lock; no global object
   registries on hot paths.
 
+**The strongest argument for this spec is a live data leak, not ergonomics.** A
+`FileBacking` outlives deletion of the file it reads: `NvmeBacking` holds extents captured
+at open and reads them by absolute block number with no re-validation, so after an unlink
+frees those blocks to bcachefs's allocator and another file takes them, a process
+demand-paging the unlinked file reads **another process's file contents**. Ordinary
+filesystem operations, no crafting (`specs/known-issues.md` §1).
+
+That is this spec's refcount, missing: the backing must keep the file's blocks alive for
+as long as it can read them. It is deliberately left unfixed pending this work, because a
+local patch — re-validating extents per read, or invalidating backings on unlink —
+reimplements refcounting badly at one call site while every other cached reference keeps
+the same shape.
+
+`known-issues.md` §1 names the pair this closes: **an id or a name treated as a
+capability** (guessing a designation) and **a reference that outlives the object it
+names** (outliving one). Handles make the first unrepresentable by carrying rights and the
+second by carrying a refcount.
+
 ## 2. Bug classes and their disposition
 
 | # | Bug class | Today | After |

@@ -14,14 +14,83 @@ against M1 (2026-07-31); §1's and §3's allocation-sizing entries against
 
 ## 1. Isolation and untrusted input
 
-### Process isolation does not hold: pipes and sockets are ungated
+### THE CLASS: an id or a name treated as a capability
 
-`SYS_PIPE_OPEN`, `SYS_SOCKET_CREATE` and `SYS_PIPE_MAP` take a `PipeId`, which is
-a small sequential integer, and check nothing. Any process can attach to any
-other process's pipe or socket and read or inject, and `PIPE_MAP` hands it the
-raw 2 MiB ring page. This is the most serious thing open in this tree.
+Three separate defects in this file are one defect. A `PipeId`, a service name
+and a `SharedToken` are all *designations* — they say which object you mean. None
+of them says you are allowed to have it. Where the kernel accepted a designation
+as authority, guessing or outliving the designation was the entire attack:
 
-Also ungated, in rough order of damage:
+- **`PipeId`** — dense sequential integers, so `for id in 0.. { pipe_open(id, 0) }`
+  walked every live pipe. Gated at `be604ef` (below).
+- **A service name** — `Descriptor::Listener` once held the *name*, so a stale fd
+  re-resolved to whichever process registered it next. Closed at `be604ef`, which
+  changed the descriptor to hold a `ListenerId`; ids come from a monotonic
+  `IdMap` and are never reused, so a descriptor that outlived its listener names
+  nothing forever (`fd.rs:52-56`, `listener.rs:125-126`).
+- **`SharedToken`** — a bare `u32` with no RAII and no ownership, still open
+  (§7).
+
+The adjacent failure, same root: **a reference that outlives the object it
+names.** `FileBacking` after an unlink is the live instance (below) — the
+reference stays valid-looking while the thing it designates is freed and reused
+underneath it. Guessing a designation and outliving one are the two ways a name
+gets you something you were never given.
+
+`specs/capability-handles-spec.md` exists to make both unrepresentable: a handle
+carries rights, so possession *is* the authority and there is no id left to
+guess; and it is a refcount on a kernel object, so the object cannot be freed
+while a handle can still reach it. Until then, every new syscall taking a raw id
+needs the first question asked, and every cached reference to a filesystem or
+device object needs the second. **This is here to predict the next instance, not
+to summarise the last four.**
+
+### A `FileBacking` outlives deletion of the file it reads
+
+Unlink a file while a process is still demand-paging it and the backing keeps
+serving reads.
+
+On `/tmp` this is a correctness wart: `copy_page_out` returns zeros, so the
+process faults in blank pages.
+
+On `/home` it is an **information disclosure**. `NvmeBacking` holds
+`extents: Vec<Extent>` captured at open (`file_backing.rs:28-31`) and
+`read_page` turns a file offset into an absolute block and calls
+`page_cache::raw_block_read` with **no re-validation that the block still belongs
+to this file** (`file_backing.rs:53-68`). Unlink returns those blocks to
+bcachefs's `BitmapAllocator`, another file allocates them, and the stale backing
+reads whatever is there now. A process can read another process's file contents
+through ordinary filesystem operations — no crafting, no crafted image, no
+privilege.
+
+Found by the filesystem owner while implementing tmpfs `open_backing`. **Not
+introduced by that work** — the `/home` half predates it.
+
+**This wants capability-handle refcounting, not a local patch.** The backing must
+keep the file's blocks alive for as long as it can read them, and that is exactly
+the refcounted-kernel-object property `specs/capability-handles-spec.md`
+provides. A local fix — re-validating extents on every read, or invalidating
+backings on unlink — reimplements refcounting badly at one call site while every
+other cached reference keeps the same shape. Unassigned deliberately: it should
+be done with that spec, not before it.
+
+### Process isolation does not hold: what is still ungated
+
+`be604ef` (2026-07-28) closed the headline. `SYS_PIPE_OPEN` now requires that the
+caller created the pipe, already holds a descriptor for it, or holds a live
+socket to the creator; `SYS_SOCKET_CREATE` must already hold both ends in the
+right direction; `SYS_PIPE_MAP` is gated derivatively because it takes an fd
+rather than an id. `tests/toyos-rust-tests/src/bin/abuse_pipe_owner.rs` is a real
+exploit test — it sweeps ids 0..256 skipping its own, asserts every live foreign
+pipe is refused, and asserts non-vacuity so it cannot pass by finding nothing.
+
+**It is a relationship check, not a capability, and it has a stated residual:
+a peer entitled to one of a creator's pipes is entitled to all of them.** A
+compromised daemon can still walk its peer's other pipes. That is the part to
+carry forward now that the alarming sentence is gone — a stopgap's known
+remainder is exactly what gets forgotten once the headline is fixed.
+
+Still ungated, in rough order of damage:
 
 - `SYS_LISTEN` — no namespace, so the first process to claim a well-known name
   impersonates that service.
