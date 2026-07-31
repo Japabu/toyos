@@ -511,23 +511,6 @@ which is a better assertion anyway but was not a free choice. Fix is the same
 flush-before-parking as the idle case, plus an explicit drain before
 `acpi::shutdown()`.
 
-### Neither cache evicts anything, and one of the two never could
-
-The block page cache's `alloc_slot` (`page_cache.rs`) only ever increments
-`next_slot` and pushes a chunk; nothing removes an entry from `block_to_slot`
-and nothing frees a chunk. `sync` writes back and frees nothing. So the cache
-grows with every distinct metadata block the filesystem touches, for the life of
-the boot. It is no longer O(device) — that was the T14 boot panic, fixed — but
-it is still unbounded, and `sync`'s `Vec<u32>` scratch inherits the same bound:
-one 2 MiB single allocation at ~524,000 resident blocks.
-
-The file cache is worse, because the machinery exists and is not wired up.
-`file_cache.rs:32` initializes `max_pages: usize::MAX`, `file_cache::init(...)`
-at `:36` has **zero call sites** anywhere in the tree, and `evict_if_needed`'s
-`total_pages <= max_pages` test at `:287` is therefore always true. Every page
-ever read off the device is a `Box<[u8; 4096]>` held until the file is deleted.
-The eviction path at `:286-309` is dead code as wired.
-
 ### The NVMe driver trusts the sector size the namespace reports
 
 `drivers/nvme.rs:209-210` takes `lba_ds` out of the LBA format descriptor and
@@ -538,10 +521,24 @@ zero and the next line divides by zero. Both are firmware/device values, not
 userland, but "the device said so" is not a bound — and the metal track is
 exactly where a device we did not write starts answering these queries.
 
-### One unreproduced observation
+### Two unreproduced observations
 
 `ps` appeared to stall for >2 s under heavy single-core load; later runs fine. If
 seen again, capture with LLDB before restarting.
+
+Doom's music was heard once at roughly half speed. It did not reproduce at HEAD,
+with or without `-nodefaults`, and the wav capture measured 1.00x — so whatever
+happened, the device-side path was never wrong. Leading hypothesis is host
+contention: another agent was building in this tree with a second QEMU running
+at the time.
+
+The durable part is the instrument, not the sighting. **Next time, read the
+numbers rather than listening**: Doom prints `[music]` synthesis
+real-time-factor telemetry every ~5 s, and soundd prints wake/underrun/latency
+stats every ~2 s. A starved synthesizer and a wrong playback clock sound
+identical to a human, and RTF is what separates them — RTF near 1.0 with the
+audio still slow means the clock, RTF well below 1.0 means synthesis is not
+keeping up.
 
 ---
 
@@ -694,51 +691,38 @@ makes any per-process memory measurement across a thread-spawning workload wrong
 The fix wants the stack owned by something the joiner can free — a base/layout
 pair on `Thread`, freed in `join` after the tid is reaped.
 
-### The build system suppresses rustc warnings on success
+### The fork estate is invisible to the zero-warning bar
 
-`src/build.rs` uses `Command::output()`, which captures stderr whether or not
-quiet mode is on, so the zero-warning bar is not enforced by
-`cargo run -- --build-only`. The kernel builds with `-D warnings` so its warnings
-are errors anyway; everything else is unchecked. To see a crate's warnings
-meanwhile:
+Cargo passes `--cap-lints allow` to every package whose source is not a *path*
+source. All 14 forks in `forks.toml` are consumed as git dependencies, so rustc
+discards their warnings before anything can print them. Measured on `sshd`'s
+graph: 140 of 143 units capped, the three exceptions being the local path crates
+`sshd`, `toyos` and `toyos_abi`.
 
-```
-cd kernel && touch src/main.rs && env -u RUSTFLAGS -u RUSTC RUSTUP_TOOLCHAIN=toyos \
-  PATH=<repo>/toyos-ld/target/<host>/release:$PATH cargo build --target x86_64-unknown-none
-```
+This is not a build-system defect and no build-system change can reach it. The
+build system used to swallow cargo's diagnostics on success as well — that is
+fixed — and the forks stayed invisible, because the cap is applied by cargo
+upstream of anything `src/build.rs` does.
 
-### `bootstrap-cc` is alive but not wired in
-
-Settled 2026-07-28: it is *not* dead code. It is the first link of a deliberate
-bootstrap chain — `toyos-cc` compiles TinyCC, TinyCC compiles progressively more
-capable C, and the chain is meant to end at a working C++ compiler hosted on
-ToyOS. That is a self-hosting goal, so it does not need a caller today to justify
-existing. What it does need: nothing references it (no build code, no
-`system.toml` entry, no test) and it is excluded from the userland workspace, so
-it silently rots. It also inherits `userland/rust-toolchain.toml`, so a bare
-`cargo check` in its directory cross-compiles a host-only tool to the ToyOS
-target and fails in `ring`/`getrandom`; it must be built with `--target <host>`.
-Its TinyCC download is https but unverified — repo.or.cz serves an on-demand cgit
-snapshot whose gzip wrapper is probably not byte-reproducible, so pinning a
-checksum needs a stable release tarball first. Wire it into the build so it is at
-least compiled, fix the toolchain inheritance, and pin the download.
+The trap to avoid is `[lints]` inside a fork: it is a manifest change, so it
+lands in `git log <base>..toyos` and would put ToyOS lint policy into every
+upstream PR the estate sends. Plan, procedure and the standing-mechanism
+question: `specs/fork-lint-audit-plan.md`. It needs a quiet tree, because
+path-overriding the forks changes what every build in the repo resolves.
 
 ### The `memmap2` fork is 165 lines of unreachable code
 
 `rust/compiler/rustc_data_structures/src/memmap.rs` cfg-gates
-`target_os = "toyos"` to a `Vec<u8>` implementation at all 8 sites, and userland
-lists memmap2 under `[patch.unused]` — so no ToyOS code path calls any memmap2
-API. `src/toyos.rs` is compiled and never called; the fork's only load-bearing
-content is the `0.9.10 → 0.2.1` version relabel that satisfies rustc's pin.
+`target_os = "toyos"` to a `Vec<u8>` implementation at all 8 sites, and
+`rust/Cargo.toml` is the only manifest that patches memmap2 at all — userland's
+duplicate entry resolved to nothing and was deleted 2026-08-01. So no ToyOS code
+path calls any memmap2 API. `src/toyos.rs` is compiled and never called; the
+fork's only load-bearing content is the `0.9.10 → 0.2.1` version relabel that
+satisfies rustc's pin.
 Either delete `src/toyos.rs` and let `stub.rs` serve, or drop the toyos gate in
 `rustc_data_structures` (the only two APIs rustc uses, `map_copy_read_only` and
 `map_anon`, are correct in the fork). Exactly one of the two should exist. Three
 real bugs in that module were found and fixed 2026-07-28 — see `forks.toml`.
-
-### `build_toyos_bins` belongs in the test harness, not `src/build.rs`
-
-It is only called from the test harness and contains test-specific logic (cdylib
-subcrate discovery, `-L` rustflags for `.so` linking). Move it to `tests/`.
 
 ---
 
@@ -791,21 +775,6 @@ Fix shape: allocators construct the slice. Give `PageAlloc` and the contiguous
 PMM path a `slice()` method like `OwnedAlloc`'s, sized from the allocation they
 own, then make `from_raw` private to `mm` or delete it. The loader and DmaPool
 stop naming sizes at all.
-
-### Four of the page cache's seven methods have no callers
-
-`PageCache::phys_addr`, `ensure_cached`, `prefetch` and `write` are dead.
-`PageCacheBlockIO` (`bcachefs_adapter.rs:15-40`) uses `read`, `write_new`, `sync`
-and `block_count`, and `file_backing.rs` uses the module-level
-`raw_block_read`/`raw_block_write`; nothing else calls into the module at all.
-`#[allow(dead_code)]` sits on the `mod page_cache;` declaration
-(`main.rs:29`) on top of the crate-level one, so the compiler has never said so.
-
-`prefetch` is the interesting one: it is the only coalescing read path in the
-kernel, ~45 lines, and it was converted to the new index alongside the live
-sites without ever having executed. Either wire it up — the demand-paging path
-reads runs of blocks one at a time and is the obvious caller — or delete all
-four and drop the `allow`.
 
 ---
 
