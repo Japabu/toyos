@@ -261,3 +261,28 @@ pub unsafe fn drain_unlocked(out: &mut [u8]) -> usize {
     }
     ring.drain_into(out)
 }
+
+/// Copy the newest `out.len()` bytes out of the ring without taking the lock
+/// and without consuming them. Returns the number copied.
+///
+/// Strictly weaker than `drain_unlocked`: it takes no lock for the same
+/// reason, but it mutates nothing at all — not the cursors, not the clamps.
+/// A torn `head`/`len` therefore costs a garbled line or two and can never
+/// leave the ring in a state that changes what a later drain reports. That is
+/// what makes it callable from the panic path *ahead* of `panic_flush`
+/// without perturbing the serial report.
+///
+/// # Safety
+/// Panic context only. Concurrent `append`s may be in flight, so the bytes
+/// near `head` can be a mixture of two lines.
+pub unsafe fn peek_tail(out: &mut [u8]) -> usize {
+    let ring = unsafe { &*RING.0.get() };
+    let len = ring.len.min(RING_SIZE);
+    let head = if ring.head >= RING_SIZE { 0 } else { ring.head };
+    let n = len.min(out.len());
+    let start = (head + RING_SIZE - n) % RING_SIZE;
+    for (i, slot) in out[..n].iter_mut().enumerate() {
+        *slot = ring.buf[(start + i) % RING_SIZE];
+    }
+    n
+}
