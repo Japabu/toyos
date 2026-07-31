@@ -641,11 +641,16 @@ fn mix_thread(
         // caught here rather than left to the control connection — a client
         // that dies mid-stream would otherwise stay `is_streaming()` and keep
         // the mix loop deferring buffers for a producer that no longer exists.
-        // A full pipe is `Ok(0)`, not an error, so a client merely behind on
-        // its signals is untouched.
+        // Death is exactly `Err(NotFound)`, the kernel's broken-pipe error; a
+        // full pipe is `Err(WouldBlock)` and means the client is merely behind
+        // on consuming signals, which must leave it untouched — a §6.4-paused
+        // client stops reading its pipe indefinitely and is still alive.
         for stream in streams.iter_mut() {
-            let write = syscall::write_nonblock(stream.signal_write_fd, &[1]);
-            if write.is_err() && stream.signal_read_fd.is_none() && !stream.pending_removal {
+            let died = matches!(
+                syscall::write_nonblock(stream.signal_write_fd, &[1]),
+                Err(syscall::SyscallError::NotFound)
+            );
+            if died && stream.signal_read_fd.is_none() && !stream.pending_removal {
                 eprintln!("soundd: client {} died, ramping down", stream.client_id);
                 stream.gain.set_target(Gain::SILENT, ramp_frames);
                 stream.pending_removal = true;
