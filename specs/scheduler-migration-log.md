@@ -31,6 +31,14 @@ audio/net/xHCI. ISRs publish and set need_resched via the shared `msix_entry!`
 macro; `drain_events` consumes the ring. No global pending flags, no `cpu == 0`
 gating.
 
+> [2026-08-01: both symbols were renamed after this was written and neither
+> exists today. `msix_entry!` is now `device_irq_entry!`
+> (`kernel/src/arch/idt/device_irq.rs:23`), and `drain_events` is now
+> `sched::driver::drain_irqs` (`kernel/src/sched/driver.rs:506`). The record is
+> left as written; the rename applies wherever this log names either symbol,
+> including the Stage 7a paragraph below. Nothing about what the stage did has
+> changed.]
+
 ## Stage 7a (cutover)
 
 `kernel/src/scheduler.rs` survives as the kernel-facing API and nothing else. The
