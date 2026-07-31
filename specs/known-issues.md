@@ -208,6 +208,28 @@ message credits the `recursive` branch with bounding a renderer fault, and that
 mechanism does not fire; the latch is doing all the work. Either widen the test
 to include `PageFault`, or stop claiming the branch bounds anything.
 
+### The panic console's memory-type gate checks only the framebuffer's first byte
+
+`kernel/src/drivers/panic_console/mod.rs:208-211`'s
+`maps.iter().find(|e| phys >= e.start && phys < e.end)` classifies the entry
+holding the scanout's first byte and ignores the rest of the range. A firmware
+map whose scanout starts in `MemoryMappedIO` but whose tail falls in a
+`BootServicesData` entry the PMM later hands out passes the gate, and the
+panic-path write lands in the heap — the one outcome the gate exists to make
+impossible. Checking every entry overlapping `[phys, phys + size)` is the same
+loop. Untestable in QEMU (its map is well-formed); a T14 firmware-map hazard,
+so fix it before the first metal boot.
+
+### `capture()` is unlatched, so two simultaneous panics interleave the snapshot
+
+`kernel/src/drivers/panic_console/mod.rs:289-296`. Both panicking CPUs take
+`cli` first (`main.rs:102`), so neither takes the other's halt IPI, and both
+`peek_tail` into the same static. Harmless in itself — same ring, `len` read
+once into a local, so indices stay in bounds — but the design's "exactly one
+painter, ever" is true of `render` and not of the buffer it paints from, and
+the screen can carry two interleaved reports. The `PAINTING` latch shape
+extends to `capture` if this is ever seen.
+
 ### `uart_write_bytes` spins unbounded on the LSR
 
 `kernel/src/drivers/serial.rs`, end of file, while `panic_raw_uart`
