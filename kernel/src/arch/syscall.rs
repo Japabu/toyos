@@ -1084,7 +1084,24 @@ fn sys_alloc_shared(size: u64) -> u64 {
 fn sys_grant_shared(token: u64, target_pid: u64) -> u64 {
     let pid = process::current_process();
     let token = shared_memory::SharedToken::from_raw(token as u32);
-    match shared_memory::grant(token, pid, process::Pid::from_raw(target_pid as u32)) {
+    let target = process::Pid::from_raw(target_pid as u32);
+
+    // `target` is a raw integer from userland and `allowed` is a kernel `Vec`
+    // that grows one entry per accepted grant, so an unchecked target is an
+    // unbounded allocation any process can drive by counting: `Pid`s never
+    // repeat, so no two of them collapse. Requiring the target to name a
+    // process the table knows bounds `allowed` by the number of processes
+    // that have ever been alive at once. Taken before the region lock, so the
+    // two are never held together.
+    let target_known = {
+        let guard = process::PROCESS_TABLE.lock();
+        guard.as_ref().is_some_and(|table| table.get(target).is_some())
+    };
+    if !target_known {
+        return SyscallError::InvalidArgument.to_u64();
+    }
+
+    match shared_memory::grant(token, pid, target) {
         Ok(()) => 0,
         Err(shared_memory::Error::NotFound) => SyscallError::NotFound.to_u64(),
         Err(shared_memory::Error::PermissionDenied) => SyscallError::PermissionDenied.to_u64(),

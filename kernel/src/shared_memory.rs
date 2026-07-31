@@ -162,14 +162,21 @@ pub fn unregister(token: SharedToken) -> Option<(DirectMap, u64)> {
     })
 }
 
-/// Grant a process permission to map a shared region.
-/// The caller must be the owner, or already in the allowed list.
+/// Grant a process permission to map a shared region. Owner only.
+///
+/// Being allowed to map is not the right to hand on: a grantee that could
+/// re-grant makes the owner's ACL transitive, so soundd's per-client audio
+/// ring reaches anyone that client names and the owner is never told. The
+/// capability design says the same thing with rights — a receiver gets a
+/// `MAP`-only handle, with no `DUP` to pass on (spec §8.3) — and this is that
+/// rule expressed against pids. `Ownership::Kernel` regions have no owner and
+/// so cannot be granted from userland at all; the framebuffer and the DMA
+/// windows are handed out by `grant_kernel` at claim time.
 pub fn grant(token: SharedToken, caller: Pid, target: Pid) -> Result<(), Error> {
     with_regions_mut(|regions| {
         let (_, region) = regions.iter_mut().find(|(t, _)| *t == token)
             .ok_or(Error::NotFound)?;
-        let is_owner = matches!(region.ownership, Ownership::Process { pid, .. } if pid == caller);
-        if !is_owner && !region.allowed.contains(&caller) {
+        if !matches!(region.ownership, Ownership::Process { pid, .. } if pid == caller) {
             return Err(Error::PermissionDenied);
         }
         if !region.allowed.contains(&target) {
@@ -209,13 +216,48 @@ pub fn map(token: SharedToken, pid: Pid, addr_space: &PageTables) -> Result<u64,
     })
 }
 
-/// Release a shared region for a process (unmap, revoke permission).
+/// Is this region unreachable, so that dropping it frees memory nobody can
+/// still be using?
+///
+/// `allowed` and `mapped_in` together are the reference count, and neither
+/// alone is: `map` requires membership in `allowed`, so a grantee that has not
+/// mapped yet is still entitled to the pages, and a mapper holds pointers into
+/// them. Only `grant` — owner only — adds to `allowed`, and only a live
+/// process can be granted to, so both sets drain.
+///
+/// Kernel-owned regions are never reclaimed here. They are device windows
+/// registered permanently by a driver, and both sets are empty for the whole
+/// window between `register` and the first claim.
+fn unreachable_region(region: &SharedRegion) -> bool {
+    matches!(region.ownership, Ownership::Process { .. })
+        && region.allowed.is_empty()
+        && region.mapped_in.is_empty()
+}
+
+/// Release a process's reference to a shared region, freeing the region once
+/// nobody holds one.
+///
+/// The reclaim test used to live only in `cleanup_process`, which made process
+/// exit the only thing that ever freed a region: a client that closed an audio
+/// stream and kept running left soundd's 2 MiB ring resident until some
+/// unrelated process happened to exit and the sweep passed over it.
+///
+/// This is a stepping stone to the refcounted handle, not a substitute for it.
+/// `SharedToken` is still a bare `u32` with no RAII, and the count it stands
+/// in for is still two `Vec`s of pids maintained by hand — the ground
+/// `specs/capability-handles-spec.md` §6.2 claims with `Arc<SharedMemObject>`
+/// is unchanged. A working reclaim path makes that debt less visible, not less
+/// real.
 pub fn release(token: SharedToken, pid: Pid) -> Result<(), Error> {
     with_regions_mut(|regions| {
-        let (_, region) = regions.iter_mut().find(|(t, _)| *t == token)
+        let pos = regions.iter().position(|(t, _)| *t == token)
             .ok_or(Error::NotFound)?;
+        let (_, region) = &mut regions[pos];
         region.allowed.retain(|p| *p != pid);
         region.unmap_from(pid);
+        if unreachable_region(region) {
+            regions.swap_remove(pos); // PhysPages freed via Drop
+        }
         Ok(())
     })
 }
@@ -238,24 +280,20 @@ pub fn destroy(token: SharedToken, owner: Pid) -> Result<(), Error> {
     })
 }
 
-/// Remove all mappings and permissions for a given PID.
-/// Also frees process-owned regions that become empty.
+/// Remove all mappings and permissions for a given PID, freeing any region
+/// that becomes unreachable.
+///
+/// Exit is now just the bulk form of `release`, and asks the same question.
+/// It used to free a region as soon as its *owner* left, which threw away
+/// pages a grantee was still entitled to map; `unreachable_region` waits for
+/// the grantee too, and cannot leak while waiting because every pid in
+/// `allowed` names a process whose own exit passes through here.
 pub fn cleanup_process(pid: Pid) {
     with_regions_mut(|regions| {
         regions.retain_mut(|(_, region)| {
             region.unmap_from(pid);
             region.allowed.retain(|p| *p != pid);
-
-            // Drop process-owned regions when the owner exits, or when the
-            // last mapper exits (handles orphaned regions whose owner already left).
-            if let Ownership::Process { pid: owner, .. } = &region.ownership {
-                if (*owner == pid || !region.allowed.contains(owner))
-                    && region.mapped_in.is_empty()
-                {
-                    return false; // PhysPages freed via Drop
-                }
-            }
-            true
+            !unreachable_region(region)
         });
     })
 }
