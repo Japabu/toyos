@@ -50,6 +50,7 @@ fn main() {
     let release = args.iter().any(|a| a == "--release");
     let build_only = args.iter().any(|a| a == "--build-only");
     let dump_audio = args.iter().any(|a| a == "--dump-audio");
+    let gop = args.iter().any(|a| a == "--gop");
     let rebuild_toolchain = args.iter().any(|a| a == "--rebuild-toolchain");
     let smp = parse_smp(&args);
 
@@ -73,7 +74,7 @@ fn main() {
     println!("Build finished.");
 
     if !build_only {
-        qemu::launch(debug, dump_audio, smp);
+        qemu::launch(debug, dump_audio, gop, smp);
     }
 }
 

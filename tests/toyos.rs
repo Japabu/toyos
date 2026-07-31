@@ -8,7 +8,7 @@ use std::thread;
 use std::time::Duration;
 
 use common::qemu::{self, BootOptions, QemuInstance, TestResult};
-use common::{audio, compile, stats};
+use common::{audio, compile, screen, stats};
 
 struct TestDef {
     name: String,
@@ -28,6 +28,13 @@ const AUDIO_TESTS: &[&str] = &["audio_tone", "audio_tone_load"];
 // Scheduler-core gate A covers both SMP configs: smp=1 is the audio spec's
 // first-class single-CPU case, smp=8 the full-SMP case.
 const AUDIO_SMP: &[u32] = &[1, 8];
+
+// On-screen panic console. Each boots its own QEMU with a UEFI GOP display
+// and reads a decoded screendump, so they cannot share the multi-test boot —
+// the guest they test is halted by the time they assert. `screen_decoder`
+// needs no guest at all; it proves the decoder against a bitmap it rendered
+// itself, before anything points it at a real screen.
+const SCREEN_TESTS: &[&str] = &["screen_decoder", "screen_early_panic"];
 
 // C tests that can't compile yet (missing toyos-cc features or unsupported platform APIs).
 // Tests that compile successfully are discovered automatically — only list failures here.
@@ -876,6 +883,63 @@ fn report_config(key: &str, base: &BaselineSample, s: &GateSamples, iterations: 
     eprintln!("    toml: drains = {}", fmt(&s.drains));
 }
 
+/// Echo what the guest actually put on screen, under `--nocapture` only —
+/// it is the measurement these tests are built on, and the audio gate prints
+/// its numbers for the same reason.
+fn print_screen(name: &str, text: &str) {
+    if !qemu::VERBOSE.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    eprintln!("        {name} decoded screen:");
+    for line in text.lines() {
+        eprintln!("        | {line}");
+    }
+}
+
+/// Run one screen test. `Err` carries the decoded screen, because a failure
+/// here is almost always "the text is not what I expected" and the decoded
+/// grid is the only readable form of that.
+fn run_screen_test(
+    name: &str,
+    test_config: &Path,
+    c_bins: &[(String, Vec<u8>)],
+    rust_bins: &[(String, Vec<u8>)],
+) -> Result<(), String> {
+    match name {
+        "screen_decoder" => {
+            screen::self_test();
+            Ok(())
+        }
+        "screen_early_panic" => {
+            // The window the console exists for: percpu is not up, mm::init
+            // has not run, and on a machine with no UART nothing else can
+            // report at all. render() runs before panic_flush, so the marker
+            // reaching the UART proves the paint already finished — no sleep.
+            let mut qemu = QemuInstance::boot_with_options(
+                test_config,
+                c_bins,
+                rust_bins,
+                BootOptions {
+                    display: qemu::Display::Gop,
+                    qmp: true,
+                    kernel_features: &["test-early-panic"],
+                    ready_marker: "!!! EARLY PANIC !!!",
+                    ..Default::default()
+                },
+            );
+            let text = qemu.screendump().text();
+            print_screen(name, &text);
+            for want in ["!!! EARLY PANIC !!!", "test-early-panic: on-screen console check"] {
+                if !text.contains(want) {
+                    return Err(format!("{want:?} not on screen\ndecoded screen:\n{text}"));
+                }
+            }
+            Ok(())
+        }
+        other => Err(format!("unknown screen test {other}")),
+    }
+}
+
 fn build_test_registry(
     rust_bins: &[(String, Vec<u8>)],
     c_names: &[String],
@@ -1055,6 +1119,9 @@ fn main() {
         for name in AUDIO_TESTS {
             println!("{name}");
         }
+        for name in SCREEN_TESTS {
+            println!("{name}");
+        }
         return;
     }
 
@@ -1095,14 +1162,20 @@ fn main() {
         .copied()
         .filter(|n| filter.map_or(true, |f| n.contains(f)))
         .collect();
+    let screen_to_run: Vec<&str> = SCREEN_TESTS
+        .iter()
+        .copied()
+        .filter(|n| filter.map_or(true, |f| n.contains(f)))
+        .collect();
 
-    if tests_to_run.is_empty() && audio_to_run.is_empty() {
+    if tests_to_run.is_empty() && audio_to_run.is_empty() && screen_to_run.is_empty() {
         eprintln!("No tests match filter {:?}", filter);
         std::process::exit(1);
     }
 
     let test_config = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/testcases");
-    let total = tests_to_run.len() + audio_to_run.len() * AUDIO_SMP.len();
+    let total =
+        tests_to_run.len() + audio_to_run.len() * AUDIO_SMP.len() + screen_to_run.len();
     eprintln!("\nrunning {total} tests\n");
     let mut passed = 0;
     let mut failed = 0;
@@ -1174,6 +1247,31 @@ fn main() {
                         let summary = reason.lines().next().unwrap_or("audio check failed");
                         failures.push((label, summary.to_string()));
                     }
+                }
+            }
+        }
+    }
+
+    // Last, because they are the only tests that toggle a kernel feature and
+    // so force a kernel rebuild; running them here confines that to one
+    // rebuild per invocation instead of two.
+    if !screen_to_run.is_empty() {
+        eprintln!("  --- screen ---");
+        for name in &screen_to_run {
+            let start = std::time::Instant::now();
+            let outcome = run_screen_test(name, &test_config, &c_bins, &rust_bins);
+            let elapsed = start.elapsed();
+            match outcome {
+                Ok(()) => {
+                    passed += 1;
+                    eprintln!("  PASS  {name}  ({:.0?})", elapsed);
+                }
+                Err(reason) => {
+                    failed += 1;
+                    eprintln!("FAIL {name}: {reason}");
+                    eprintln!("  FAIL  {name}  ({:.0?})", elapsed);
+                    let summary = reason.lines().next().unwrap_or("screen check failed");
+                    failures.push((name.to_string(), summary.to_string()));
                 }
             }
         }

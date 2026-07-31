@@ -14,11 +14,37 @@ pub static VERBOSE: AtomicBool = AtomicBool::new(false);
 /// Distinguishes the wav capture of each QEMU boot within one test process.
 static BOOT_SEQ: AtomicU32 = AtomicU32::new(0);
 
+/// Which display device the guest boots with.
+///
+/// `None` is the historical test config: no VGA and no GPU device at all, so
+/// firmware publishes no GOP and `kernel_args.gop_framebuffer` is zero.
+/// `Gop` is the path a laptop takes -- firmware publishes a linear
+/// framebuffer and there is no virtio device -- and it is the only config in
+/// which the on-screen panic console renders anything.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Display {
+    None,
+    Gop,
+}
+
 pub struct BootOptions {
     pub gdb_stub: bool,
     pub debug_wait: bool,
     pub smp: u32,
+    pub display: Display,
+    /// Open a per-instance QMP socket, which `screendump` needs. Per-instance
+    /// because screen tests boot their own QEMU and several may exist at once.
+    pub qmp: bool,
+    pub kernel_features: &'static [&'static str],
+    /// The console line that means the boot reached the state under test.
+    /// Anything other than [`DEFAULT_READY`] also declares that a panic is the
+    /// expected outcome rather than a boot failure -- the early-panic screen
+    /// test never reaches userland at all.
+    pub ready_marker: &'static str,
 }
+
+/// The in-guest test runner's startup marker.
+pub const DEFAULT_READY: &str = "===READY===";
 
 impl Default for BootOptions {
     fn default() -> Self {
@@ -26,6 +52,10 @@ impl Default for BootOptions {
             gdb_stub: false,
             debug_wait: false,
             smp: 2,
+            display: Display::None,
+            qmp: false,
+            kernel_features: &[],
+            ready_marker: DEFAULT_READY,
         }
     }
 }
@@ -45,6 +75,9 @@ pub struct QemuInstance {
     rx: Receiver<String>,
     _reader_thread: thread::JoinHandle<String>,
     audio_wav: PathBuf,
+    uart_log: PathBuf,
+    qmp_socket: Option<PathBuf>,
+    screendump: PathBuf,
 }
 
 /// Build all binaries in a test crate.
@@ -106,10 +139,14 @@ impl QemuInstance {
         );
 
         let quiet = !VERBOSE.load(Ordering::Relaxed);
+        let mut features: Vec<&str> = options.kernel_features.to_vec();
+        if options.debug_wait {
+            features.push("debug-wait");
+        }
         let disk = toyos_build::build::build_test_image(
             &repo,
             &config_path,
-            options.debug_wait,
+            &features,
             quiet,
             &extra_files,
         );
@@ -131,8 +168,49 @@ impl QemuInstance {
         let audio_wav = test_dir.join(format!("audio-{seq}.wav"));
         let _ = fs::remove_file(&audio_wav);
 
-        let qemu = qemu_command(&boot_image, &nvme_image, &audio_wav, &options);
-        spawn_and_wait_ready(qemu, options.debug_wait, audio_wav)
+        let qmp_socket = options.qmp.then(|| test_dir.join(format!("qmp-{seq}.sock")));
+        if let Some(path) = &qmp_socket {
+            let _ = fs::remove_file(path);
+        }
+        let screendump = test_dir.join(format!("screen-{seq}.ppm"));
+
+        // Per-instance, not a fixed /tmp path: the audio gate boots dozens of
+        // guests and a screen test waits on this file, so a shared one would
+        // let instances read each other's early boot.
+        let uart_log = test_dir.join(format!("uart-{seq}.log"));
+        let _ = fs::remove_file(&uart_log);
+
+        let qemu = qemu_command(
+            &boot_image,
+            &nvme_image,
+            &audio_wav,
+            &uart_log,
+            qmp_socket.as_deref(),
+            &options,
+        );
+        spawn_and_wait_ready(qemu, &options, audio_wav, uart_log, qmp_socket, screendump)
+    }
+
+    /// Capture the guest's scanout through QMP and return the decoded PPM.
+    ///
+    /// After a halt the guest is stopped, so the dump is stable. QEMU writes
+    /// the file itself, so the only synchronization needed is the command's
+    /// own reply.
+    pub fn screendump(&mut self) -> super::screen::Ppm {
+        let socket = self
+            .qmp_socket
+            .as_ref()
+            .expect("screendump needs BootOptions { qmp: true }");
+        let _ = fs::remove_file(&self.screendump);
+        qmp_screendump(socket, &self.screendump);
+        let bytes = fs::read(&self.screendump).expect("screendump: QEMU wrote no file");
+        super::screen::Ppm::parse(&bytes)
+    }
+
+    /// Everything the guest put on the 16550 before it switched to the
+    /// virtio-console — the only record a guest that died early leaves.
+    pub fn uart_log(&self) -> String {
+        fs::read_to_string(&self.uart_log).unwrap_or_default()
     }
 
     /// The wav file the virtio-sound device records into for this boot.
@@ -270,13 +348,72 @@ impl Drop for QemuInstance {
         let _ = self.child.kill();
         let _ = self.child.wait();
         let _ = fs::remove_file(&self.audio_wav);
+        let _ = fs::remove_file(&self.uart_log);
+        let _ = fs::remove_file(&self.screendump);
+        if let Some(socket) = &self.qmp_socket {
+            let _ = fs::remove_file(socket);
+        }
     }
+}
+
+/// Drive one `screendump` over a QMP unix socket. QMP is a line-delimited
+/// JSON protocol: greeting, `qmp_capabilities`, then the command; the reply
+/// carrying `return` is the completion signal. Two commands and three fixed
+/// keys do not justify a JSON dependency.
+fn qmp_screendump(socket: &Path, out: &Path) {
+    use std::io::Read;
+    use std::os::unix::net::UnixStream;
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut stream = loop {
+        match UnixStream::connect(socket) {
+            Ok(s) => break s,
+            Err(e) => {
+                assert!(Instant::now() < deadline, "qmp: cannot connect to {}: {e}", socket.display());
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+    };
+    stream.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+
+    let mut pending = Vec::new();
+    let read_reply = |stream: &mut UnixStream, pending: &mut Vec<u8>, want: &str| {
+        let start = Instant::now();
+        loop {
+            if let Some(pos) = pending.windows(want.len()).position(|w| w == want.as_bytes()) {
+                pending.drain(..pos + want.len());
+                return;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(20),
+                "qmp: no {want} in reply: {}",
+                String::from_utf8_lossy(pending)
+            );
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).expect("qmp: read failed");
+            assert!(n > 0, "qmp: socket closed waiting for {want}");
+            pending.extend_from_slice(&buf[..n]);
+        }
+    };
+
+    read_reply(&mut stream, &mut pending, "\"QMP\"");
+    stream.write_all(b"{\"execute\":\"qmp_capabilities\"}\n").unwrap();
+    read_reply(&mut stream, &mut pending, "\"return\"");
+    writeln!(
+        stream,
+        "{{\"execute\":\"screendump\",\"arguments\":{{\"filename\":\"{}\"}}}}",
+        out.display()
+    )
+    .unwrap();
+    read_reply(&mut stream, &mut pending, "\"return\"");
 }
 
 fn qemu_command(
     boot_image: &Path,
     nvme_image: &Path,
     audio_wav: &Path,
+    uart_log: &Path,
+    qmp_socket: Option<&Path>,
     options: &BootOptions,
 ) -> Command {
     let repo = compile::repo_root();
@@ -326,7 +463,10 @@ fn qemu_command(
         .arg("-device")
         .arg("nvme,serial=deadbeef,drive=nvme0")
         .arg("-vga")
-        .arg("none")
+        .arg(match options.display {
+            Display::None => "none",
+            Display::Gop => "std",
+        })
         .arg("-display")
         .arg("none")
         .arg("-netdev")
@@ -347,7 +487,7 @@ fn qemu_command(
         // a temp file so early-boot logs and panic fallback still land
         // somewhere when the kernel switches backends.
         .arg("-serial")
-        .arg("file:/tmp/toyos-test-uart-early.log")
+        .arg(format!("file:{}", uart_log.display()))
         .arg("-chardev")
         .arg("stdio,id=cs0,signal=off")
         .arg("-device")
@@ -359,11 +499,25 @@ fn qemu_command(
     if options.gdb_stub {
         qemu.arg("-s");
     }
+    if let Some(socket) = qmp_socket {
+        qemu.arg("-qmp")
+            .arg(format!("unix:{},server,nowait", socket.display()));
+    }
 
     qemu
 }
 
-fn spawn_and_wait_ready(mut qemu: Command, no_timeout: bool, audio_wav: PathBuf) -> QemuInstance {
+fn spawn_and_wait_ready(
+    mut qemu: Command,
+    options: &BootOptions,
+    audio_wav: PathBuf,
+    uart_log: PathBuf,
+    qmp_socket: Option<PathBuf>,
+    screendump: PathBuf,
+) -> QemuInstance {
+    let no_timeout = options.debug_wait;
+    let ready = options.ready_marker;
+    let panic_aborts = ready == DEFAULT_READY;
     qemu.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
@@ -403,17 +557,18 @@ fn spawn_and_wait_ready(mut qemu: Command, no_timeout: bool, audio_wav: PathBuf)
     loop {
         if !no_timeout && start.elapsed() > boot_timeout {
             let _ = child.kill();
-            panic!("[qemu] Boot timed out waiting for ===READY===");
+            panic!("[qemu] Boot timed out waiting for {ready}");
         }
         match rx.recv_timeout(Duration::from_secs(1)) {
-            Ok(line) if line.contains("===READY===") => {
+            Ok(line) if line.contains(ready) => {
                 if VERBOSE.load(Ordering::Relaxed) {
-                    eprintln!("[qemu] Test runner ready");
+                    eprintln!("[qemu] Reached {ready}");
                 }
                 break;
             }
             Ok(ref line)
-                if !no_timeout
+                if panic_aborts
+                    && !no_timeout
                     && (line.contains("SEGFAULT")
                         || line.contains("KERNEL PANIC")
                         || line.contains("!!! PANIC !!!")) =>
@@ -433,10 +588,19 @@ fn spawn_and_wait_ready(mut qemu: Command, no_timeout: bool, audio_wav: PathBuf)
                 panic!("[qemu] Init process crashed during boot:\n{crash_msg}");
             }
             Ok(_) => continue,
-            Err(RecvTimeoutError::Timeout) => continue,
+            // A guest that dies before virtio-console init never reaches
+            // stdio at all; the UART file is the only channel it has.
+            Err(RecvTimeoutError::Timeout) => {
+                if !panic_aborts
+                    && fs::read_to_string(&uart_log).is_ok_and(|s| s.contains(ready))
+                {
+                    break;
+                }
+                continue;
+            }
             Err(RecvTimeoutError::Disconnected) => {
                 let status = child.wait();
-                panic!("[qemu] QEMU died before ===READY=== (status: {status:?})");
+                panic!("[qemu] QEMU died before {ready} (status: {status:?})");
             }
         }
     }
@@ -447,5 +611,8 @@ fn spawn_and_wait_ready(mut qemu: Command, no_timeout: bool, audio_wav: PathBuf)
         rx,
         _reader_thread: reader_thread,
         audio_wav,
+        uart_log,
+        qmp_socket,
+        screendump,
     }
 }

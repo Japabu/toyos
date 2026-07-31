@@ -376,7 +376,7 @@ pub fn build(root: &Path, debug: bool, release: bool) {
 pub fn build_test_image(
     root: &Path,
     config_path: &Path,
-    debug_wait: bool,
+    kernel_features: &[&str],
     quiet: bool,
     extra_files: &[(String, Vec<u8>)],
 ) -> Vec<u8> {
@@ -388,10 +388,11 @@ pub fn build_test_image(
     invalidate_stale(root, &config, &fp);
 
     let init_programs = config.init.join(";");
+    let features = kernel_features.join(",");
     let mut kernel_extra: Vec<&str> = Vec::new();
-    if debug_wait {
+    if !features.is_empty() {
         kernel_extra.push("--features");
-        kernel_extra.push("debug-wait");
+        kernel_extra.push(&features);
     }
     cargo_build(
         &root.join("kernel"),

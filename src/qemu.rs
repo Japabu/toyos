@@ -1,7 +1,7 @@
 use std::fs::File;
 use std::process::Command;
 
-pub fn launch(debug: bool, dump_audio: bool, smp: u32) {
+pub fn launch(debug: bool, dump_audio: bool, gop: bool, smp: u32) {
     let mut qemu = Command::new("qemu-system-x86_64");
 
     if kvm_available() {
@@ -35,12 +35,22 @@ pub fn launch(debug: bool, dump_audio: bool, smp: u32) {
         .arg("-drive")
         .arg("if=none,id=nvme0,format=raw,file=target/nvme.img")
         .arg("-device")
-        .arg("nvme,serial=deadbeef,drive=nvme0")
-        .arg("-vga")
-        .arg("none")
-        .arg("-device")
-        .arg("virtio-gpu-pci,xres=1280,yres=720")
-        .arg("-netdev")
+        .arg("nvme,serial=deadbeef,drive=nvme0");
+
+    // The GOP profile is the display path a real laptop takes: firmware
+    // publishes a linear framebuffer, the kernel maps it, and there is no
+    // virtio device to fall back to. It is also the only config in which the
+    // on-screen panic console renders anything, and half of M1's metal-sim.
+    if gop {
+        qemu.arg("-vga").arg("std");
+    } else {
+        qemu.arg("-vga")
+            .arg("none")
+            .arg("-device")
+            .arg("virtio-gpu-pci,xres=1280,yres=720");
+    }
+
+    qemu.arg("-netdev")
         .arg("user,id=net0,hostfwd=tcp::2222-:22")
         .arg("-device")
         .arg("virtio-net-pci-non-transitional,netdev=net0");
