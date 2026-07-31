@@ -15,6 +15,21 @@ use toyos_abi::syscall::{self, SpawnArgs, SyscallError};
 
 const DIR: &str = "/home/abuse_loader";
 
+/// The two cases about a table larger than one kernel allocation need a file
+/// larger than one kernel allocation, because `read_file_range` clamps a
+/// declared length to what the file actually holds. tmpfs is where that is
+/// cheap: the pages are heap boxes, so a 3 MiB file costs no device I/O, and
+/// the case under test is the loader rather than the filesystem.
+///
+/// Both cases asserted on the *declared* length alone until `/tmp` became
+/// loadable — nothing in the tree could produce a >2 MiB file the loader would
+/// open, so they passed without ever reaching the heap assert they exist for.
+const BIG_DIR: &str = "/tmp/abuse_loader";
+
+/// Comfortably past `mm::MAX_HEAP_ALLOC`, and past what dlmalloc rounds a
+/// 2 MiB granule request up to.
+const BIG: usize = 3 * 1024 * 1024;
+
 /// Kernel constants this test aims at, by value.
 ///
 /// `USER_VM_BASE` (`kernel/src/loader.rs`) is where every exe image is
@@ -186,8 +201,14 @@ impl Elf {
 }
 
 fn write_file(name: &str, bytes: &[u8]) -> String {
-    let path = format!("{DIR}/{name}");
+    write_file_in(DIR, name, bytes)
+}
+
+fn write_file_in(dir: &str, name: &str, bytes: &[u8]) -> String {
+    let path = format!("{dir}/{name}");
     fs::write(&path, bytes).unwrap_or_else(|e| panic!("write {path}: {e}"));
+    let got = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    assert_eq!(got as usize, bytes.len(), "{path}: short write");
     path
 }
 
@@ -244,6 +265,7 @@ fn base_exe(size: usize) -> Elf {
 
 fn main() {
     fs::create_dir_all(DIR).expect("create /home/abuse_loader");
+    fs::create_dir_all(BIG_DIR).expect("create /tmp/abuse_loader");
 
     // 1. A DT_* vaddr below every PT_LOAD. `vaddr_to_file_offset` searched for
     //    the nearest segment at or below it and panicked outright when there
@@ -326,27 +348,37 @@ fn main() {
             .build(),
     );
 
-    // 8. A section header table the file declares as 2.4 MiB. The loader
-    //    reads a declared table into one `Vec`, and dlmalloc serves an
-    //    allocation that size by asking its page source for a 4 MiB granule,
-    //    which asserts. The declared length is what has to be refused: read
-    //    clamps it to the file, so a file that merely lies small enough would
-    //    load with a table nothing downstream knows is short.
-    spawn_refused(
+    // 8. A section header table of 2.4 MiB, in a file big enough to hold it.
+    //    The loader reads a declared table into one `Vec`, and dlmalloc serves
+    //    an allocation that size by asking its page source for a 4 MiB
+    //    granule — `mm/alloc.rs`'s assert, in syscall context.
+    //
+    //    The file has to be real: `read_file_range` clamps the declared length
+    //    to what the file holds, so a 16 KiB file with a 2.4 MiB `e_shnum`
+    //    reaches a 16 KiB allocation and proves nothing.
+    refused(
         "shnum_past_heap",
-        &base_exe(0x4000).sections(0x1000, 40_000, 64).build(),
+        spawn_path(&write_file_in(
+            BIG_DIR,
+            "shnum_past_heap",
+            &base_exe(BIG).sections(0x1000, 40_000, 64).build(),
+        )),
     );
 
     // 9. Same ceiling, reached through DT_STRSZ instead — a size no section
-    //    header has to agree with.
-    spawn_refused(
+    //    header has to agree with, in a file that can back it.
+    refused(
         "strsz_past_heap",
-        &Elf::new(0x4000)
-            .ph(Phdr::load(0, 0, 0x4000, 0x4000, PF_R | PF_W))
-            .ph(Phdr { kind: PT_DYNAMIC, flags: PF_R, offset: 0x1000, vaddr: 0x1000, filesz: 0x200, memsz: 0x200, align: 8 })
-            .entry(0)
-            .dynamic(0x1000, &[(DT_STRTAB, 0x2000), (DT_STRSZ, 2 * 1024 * 1024 + 4096)])
-            .build(),
+        spawn_path(&write_file_in(
+            BIG_DIR,
+            "strsz_past_heap",
+            &Elf::new(BIG)
+                .ph(Phdr::load(0, 0, BIG as u64, BIG as u64, PF_R | PF_W))
+                .ph(Phdr { kind: PT_DYNAMIC, flags: PF_R, offset: 0x1000, vaddr: 0x1000, filesz: 0x200, memsz: 0x200, align: 8 })
+                .entry(0)
+                .dynamic(0x1000, &[(DT_STRTAB, 0x2000), (DT_STRSZ, 2 * 1024 * 1024 + 4096)])
+                .build(),
+        )),
     );
 
     // 10. A .gnu.hash whose chain array never terminates. The symbol-count
@@ -388,6 +420,7 @@ fn main() {
     assert!(status.success(), "/bin/echo exited {status:?}");
 
     let _ = fs::remove_dir_all(DIR);
+    let _ = fs::remove_dir_all(BIG_DIR);
     println!("crafted ELF derivations rejected, kernel intact");
 }
 
