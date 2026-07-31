@@ -67,6 +67,7 @@ const MACHINE_TESTS: &[&str] = &[
     "input_merge",
     "metal_sim_compositor",
     "metal_sim_input",
+    "xhci_many_devices",
     "i8042_keyboard",
     "i8042_no_spurious_wake",
     "i8042_mouse",
@@ -1359,6 +1360,101 @@ fn run_machine_test(
             eprintln!("  [metal-sim] soundd and netd both exited on their absent device");
             Ok(())
         }
+        "xhci_many_devices" => {
+            // The T14's internal controller carries a camera, Bluetooth and a
+            // fingerprint reader next to the boot stick, and every profile in
+            // this tree had at most three devices on the bus — so no test
+            // could see a driver that stopped at three, and no test could see
+            // two devices of one class landing on one interrupt ring.
+            let options = BootOptions {
+                profile: qemu::Profile::MetalUsb,
+                ..Default::default()
+            };
+            let argv = qemu::profile_argv(&options);
+            let usb = usb_argv(&argv);
+            // The profile's claim is about the bus, so it is checked against
+            // argv: a console line cannot distinguish "the driver bound one
+            // keyboard" from "only one keyboard was ever attached".
+            if usb.len() < 4 {
+                return Err(format!("this profile needs more USB devices than {usb:?}"));
+            }
+            if usb.iter().filter(|d| d.starts_with("usb-kbd")).count() < 2 {
+                return Err(format!("two keyboards are the point; argv has {usb:?}"));
+            }
+            if !usb.iter().any(|d| d.starts_with("usb-storage")) {
+                return Err(format!("no non-HID device on the bus: {usb:?}"));
+            }
+
+            let qemu = QemuInstance::boot_with_options(test_config, c_bins, rust_bins, options);
+            let log = qemu.boot_log().to_string();
+
+            // One slot per device on the bus, non-HID included: the driver
+            // enables a slot before it can know what the device is.
+            let slots = parse_xhci_slots(&log);
+            if slots.len() != usb.len() {
+                return Err(format!(
+                    "{} devices on the bus, {} slots enabled ({slots:?}):\n{log}",
+                    usb.len(),
+                    slots.len()
+                ));
+            }
+            let mut distinct = slots.clone();
+            distinct.sort_unstable();
+            distinct.dedup();
+            if distinct.len() != slots.len() {
+                return Err(format!("a slot id came back twice: {slots:?}"));
+            }
+
+            // Each HID on its own interrupt ring and its own report buffer.
+            // Two keyboards sharing a ring is the defect this asserts against,
+            // and it is silent from every other angle.
+            let binds = parse_xhci_binds(&log);
+            let keyboards = binds.iter().filter(|b| b.kind == "keyboard").count();
+            if keyboards != 2 {
+                return Err(format!("{keyboards} keyboards bound, want 2: {binds:?}\n{log}"));
+            }
+            if binds.len() < 4 {
+                return Err(format!("only {} HID devices bound: {binds:?}\n{log}", binds.len()));
+            }
+            let mut rings: Vec<usize> = binds.iter().map(|b| b.int_ring).collect();
+            rings.sort_unstable();
+            rings.dedup();
+            if rings.len() != binds.len() {
+                return Err(format!(
+                    "{} devices share {} interrupt rings: {binds:?}",
+                    binds.len(),
+                    rings.len()
+                ));
+            }
+            // A ring is only that device's if the slot it was configured
+            // against is that device's too — the doorbell is per slot.
+            if let Some(orphan) = binds.iter().find(|b| !slots.contains(&b.slot)) {
+                return Err(format!("{orphan:?} bound to a slot that was never enabled: {slots:?}"));
+            }
+
+            // And the devices that are not HID were walked past rather than
+            // stumbled over: the stick and the hub both take a slot and bind
+            // nothing.
+            let skipped = log.matches("no HID boot interface found").count();
+            if skipped < usb.len() - binds.len() {
+                return Err(format!(
+                    "{skipped} devices skipped, want {}:\n{log}",
+                    usb.len() - binds.len()
+                ));
+            }
+            for bad in ["!!! PANIC !!!", "KERNEL PANIC", "panicked at"] {
+                if log.contains(bad) {
+                    return Err(format!("{bad:?} on a boot that should be clean:\n{log}"));
+                }
+            }
+            eprintln!(
+                "  [xhci] {} devices, {} slots, {keyboards} keyboards on {} distinct rings",
+                usb.len(),
+                slots.len(),
+                rings.len()
+            );
+            Ok(())
+        }
         "ioapic_topology" => {
             // Everything the I/O APIC driver says happens in Phase 2, long
             // before the virtio-console exists, so the 16550 file is where a
@@ -2068,6 +2164,50 @@ fn boot_millis(log: &str) -> Option<u64> {
         .next()?
         .parse()
         .ok()
+}
+
+#[derive(Debug)]
+struct XhciBind {
+    kind: String,
+    slot: u32,
+    int_ring: usize,
+}
+
+/// `xHCI: USB keyboard ready on slot 2, int_ring +0xa000` — one line per HID
+/// the driver bound, carrying the DMA offset of the ring that device's reports
+/// arrive on. The offset is in the line because two devices sharing one ring
+/// is invisible from outside: both keyboards still enumerate, still bind, and
+/// still deliver — until the second one's TRBs land on top of the first's.
+fn parse_xhci_binds(log: &str) -> Vec<XhciBind> {
+    log.lines()
+        .filter_map(|line| {
+            let rest = line.split("xHCI: USB ").nth(1)?;
+            let (kind, rest) = rest.split_once(" ready on slot ")?;
+            let (slot, rest) = rest.split_once(", int_ring +0x")?;
+            Some(XhciBind {
+                kind: kind.to_string(),
+                slot: slot.parse().ok()?,
+                int_ring: usize::from_str_radix(rest.trim().split_whitespace().next()?, 16).ok()?,
+            })
+        })
+        .collect()
+}
+
+/// Every slot id in an `xHCI: slot 3 enabled ...` line, in order.
+fn parse_xhci_slots(log: &str) -> Vec<u32> {
+    log.lines()
+        .filter_map(|line| line.split("xHCI: slot ").nth(1)?.split_once(" enabled"))
+        .filter_map(|(slot, _)| slot.parse().ok())
+        .collect()
+}
+
+/// The `-device usb-*` arguments a profile passes, boot stick included.
+fn usb_argv(argv: &[String]) -> Vec<&str> {
+    argv.windows(2)
+        .filter(|w| w[0] == "-device")
+        .map(|w| w[1].as_str())
+        .filter(|v| v.starts_with("usb-"))
+        .collect()
 }
 
 /// The `keys=` field of an `i8042: drain ...` trace line.

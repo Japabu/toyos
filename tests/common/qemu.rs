@@ -34,7 +34,27 @@ pub enum Profile {
     /// ===TEST_START=== protocol like any other. [`BootOptions::mute`] takes
     /// it away for the one test that certifies the T14's literal shape.
     Metal,
+    /// metal-sim with the T14's internal xHCI actually populated: the boot
+    /// stick plus five more devices, two of them keyboards. The laptop's
+    /// controller carries a camera, Bluetooth and a fingerprint reader
+    /// alongside whatever is plugged in, and a profile with one USB device
+    /// cannot see any defect that needs a fourth.
+    MetalUsb,
 }
+
+/// The controller every profile but [`Profile::MetalUsb`] gets. QEMU's default
+/// is four USB2 root ports, one fewer than the crowded set needs.
+const XHCI_DEFAULT: &str = "nec-usb-xhci,id=xhci";
+/// Eight USB2 root ports. Every device in the crowded set is full or high
+/// speed, so they all land on the USB2 side however many SuperSpeed ports the
+/// controller has.
+///
+/// `slots=` would have been the natural way to stage slot exhaustion, and it
+/// is not: on QEMU 11.0.2 `nec-usb-xhci,slots=N` reads back as N through
+/// `qom-get` and HCSPARAMS1 still reports 64, `qemu-xhci` has no such property
+/// at all, and Enable Slot ignores the MaxSlotsEn the driver writes to CONFIG.
+/// The kernel's own `xhci-one-slot` feature is what drives that path.
+const XHCI_WIDE: &str = "nec-usb-xhci,id=xhci,p2=8";
 
 /// Everything a profile decides about the machine, in one table. A new
 /// variant answers every question here or does not compile — which `self !=
@@ -45,18 +65,35 @@ struct Shape {
     vga: &'static str,
     /// virtio-net, virtio-sound, and the console on virtio-serial.
     virtio: bool,
-    /// A USB HID on the xHCI. Its absence is what makes an i8042 test measure
-    /// anything: QEMU activates one input handler per device class, so with a
-    /// usb-kbd present every injected keystroke goes to it.
-    usb_hid: bool,
+    /// The `-device` argument for the controller itself, port and slot counts
+    /// included. The boot stick hangs off it in every profile.
+    xhci: &'static str,
+    /// Every USB device besides the boot stick. Absence is what makes an i8042
+    /// test measure anything: QEMU activates one input handler per device
+    /// class, so with a usb-kbd present every injected keystroke goes to it.
+    usb: &'static [&'static str],
 }
 
 impl Profile {
     fn shape(self) -> Shape {
         match self {
-            Self::Headless => Shape { vga: "none", virtio: true, usb_hid: true },
-            Self::Gop => Shape { vga: "std", virtio: true, usb_hid: true },
-            Self::Metal => Shape { vga: "std", virtio: false, usb_hid: false },
+            Self::Headless => {
+                Shape { vga: "none", virtio: true, xhci: XHCI_DEFAULT, usb: &["usb-kbd"] }
+            }
+            Self::Gop => {
+                Shape { vga: "std", virtio: true, xhci: XHCI_DEFAULT, usb: &["usb-kbd"] }
+            }
+            Self::Metal => Shape { vga: "std", virtio: false, xhci: XHCI_DEFAULT, usb: &[] },
+            // Two keyboards and two pointers, because the collision this
+            // stages is between devices of the same HID class; a hub for a
+            // second non-HID device, since it needs no backing file and the
+            // driver has to walk past it exactly as it walks past the stick.
+            Self::MetalUsb => Shape {
+                vga: "std",
+                virtio: false,
+                xhci: XHCI_WIDE,
+                usb: &["usb-kbd", "usb-kbd", "usb-mouse", "usb-tablet", "usb-hub"],
+            },
         }
     }
 }
@@ -717,7 +754,7 @@ fn qemu_command(
             ovmf_dir.join("OVMF_VARS-pure-efi.fd").display()
         ))
         .arg("-device")
-        .arg("nec-usb-xhci,id=xhci")
+        .arg(shape.xhci)
         .arg("-drive")
         .arg(format!(
             "if=none,id=stick,format=raw,file={}",
@@ -738,8 +775,8 @@ fn qemu_command(
         .arg("none")
         .arg("-no-reboot");
 
-    if shape.usb_hid {
-        qemu.arg("-device").arg("usb-kbd,bus=xhci.0");
+    for dev in shape.usb {
+        qemu.arg("-device").arg(format!("{dev},bus=xhci.0"));
     }
 
     if shape.virtio {
