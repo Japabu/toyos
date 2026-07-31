@@ -95,7 +95,7 @@ pub fn ensure(root: &Path, force_rebuild: bool) -> ChangeSet {
 
     let host = host_triple();
     let stage2 = rust_dir.join(format!("build/{host}/stage2"));
-    run("rustup", &["toolchain", "link", "toyos", stage2.to_str().unwrap()]);
+    link_toolchain(&stage2);
 
     // Ensure the ToyOS sysroot has host target libraries so proc-macros can compile.
     // This must happen before any cargo builds use the toolchain, otherwise cargo
@@ -114,6 +114,40 @@ pub fn ensure(root: &Path, force_rebuild: bool) -> ChangeSet {
         linker_changed,
         compiler_changed,
     }
+}
+
+/// Point the `toyos` rustup toolchain at `stage2`, but only if it does not
+/// already.
+///
+/// `rustup toolchain link` unlinks and recreates the symlink rather than
+/// replacing it atomically, so every call opens a window in which
+/// `~/.rustup/toolchains/toyos` does not resolve. Any concurrent `rustc` proxy
+/// invocation landing in that window dies with `'rustc' is not installed for the
+/// custom toolchain 'toyos'` — which reads as a broken toolchain rather than as
+/// contention, because a probe run a moment later succeeds.
+///
+/// This ran unconditionally on every `ensure`, i.e. every build. With five
+/// agents building in one tree it cost one of them eleven consecutive
+/// `cargo test` invocations over about fifteen minutes, while
+/// `RUSTUP_TOOLCHAIN=toyos rustc --version` succeeded 20 out of 20 between the
+/// attempts.
+///
+/// A mismatched or absent link still re-links, so a moved tree or a fresh clone
+/// behaves as before; only the no-op case is skipped.
+fn link_toolchain(stage2: &Path) {
+    let rustup_home = std::env::var_os("RUSTUP_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".rustup")));
+
+    if let Some(home) = rustup_home {
+        if let Ok(current) = fs::read_link(home.join("toolchains/toyos")) {
+            if current == stage2 {
+                return;
+            }
+        }
+    }
+
+    run("rustup", &["toolchain", "link", "toyos", stage2.to_str().unwrap()]);
 }
 
 fn full_bootstrap(root: &Path, rust_dir: &Path) {
