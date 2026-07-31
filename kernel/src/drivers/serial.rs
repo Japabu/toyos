@@ -218,7 +218,7 @@ pub unsafe fn panic_flush() {
         return;
     }
     super::virtio_console::disable();
-    let mut buf = [0u8; 4096];
+    let mut buf = [0u8; super::log_ring::DRAIN_CHUNK];
     loop {
         let n = unsafe { super::log_ring::drain_unlocked(&mut buf) };
         if n == 0 { break; }

@@ -38,6 +38,22 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 const RING_SIZE: usize = 64 * 1024;
 
+/// Bytes a drain moves per pass, and the size of the stack buffer it does it
+/// through.
+///
+/// It was 4096, and the buffer is a local on the panic path — which on a
+/// double fault runs on IST1, a 4096-byte stack. Measured with `ist1_report`:
+/// the report used **9968 bytes**, so it ran 5872 bytes past the end of the
+/// stack and into the heap underneath while writing the explanation for the
+/// fault that had just happened. (Known issues estimated ~1.4 KiB; it was
+/// four times that.)
+///
+/// 512 is what `drain_chunk_to_serial` already used for the bounded-latency
+/// callers, so this is one number where there were two. The cost is 128 passes
+/// over a full ring instead of 16, each a brief lock and a memcpy — nothing
+/// against a per-byte UART wait.
+pub const DRAIN_CHUNK: usize = 512;
+
 struct LogRing {
     buf: [u8; RING_SIZE],
     head: usize,
@@ -183,7 +199,7 @@ pub fn write_chunk_blocking(bytes: &[u8]) {
 ///
 /// Caller must hold a `BackendGuard` to serialize backend access.
 pub fn drain_to_serial(backend: &mut crate::drivers::serial::BackendGuard) {
-    let mut buf = [0u8; 4096];
+    let mut buf = [0u8; DRAIN_CHUNK];
     loop {
         let n = {
             let mut g = RingGuard::lock();
@@ -204,7 +220,7 @@ pub fn drain_to_serial(backend: &mut crate::drivers::serial::BackendGuard) {
 ///
 /// Caller must hold a `BackendGuard` to serialize backend access.
 pub fn drain_chunk_to_serial(backend: &mut crate::drivers::serial::BackendGuard) -> usize {
-    let mut buf = [0u8; 512];
+    let mut buf = [0u8; DRAIN_CHUNK];
     let n = {
         let mut g = RingGuard::lock();
         g.ring().drain_into(&mut buf)

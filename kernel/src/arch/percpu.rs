@@ -188,11 +188,22 @@ const IDLE_STACK_SIZE: usize = 16384; // 16KB
 /// The double fault stack. Only #DF uses IST1, and what runs on it is the
 /// whole crash report plus `halt_all_cpus` — render, then `panic_flush`.
 ///
-/// It was 4096, and `drain_to_serial` puts a 4096-byte buffer on it, so the
+/// It was 4096, and `drain_to_serial` put a 4096-byte buffer on it, so the
 /// report overflowed the stack it was being written from and corrupted the
 /// heap underneath while producing the evidence for the fault that had just
-/// happened. Measured at 5936 bytes used before the buffers were cut and 2216
-/// after; see `ist1_report`, which is what measured it and still does.
+/// happened.
+///
+/// Both numbers here are `ist1_report`'s, off a real #DF, not estimates:
+/// **9968 bytes** used before the drain buffers were cut to `DRAIN_CHUNK`, and
+/// **4512** after. So the overrun was 5872 bytes — four times the ~1.4 KiB
+/// known issues estimated — and, more to the point, cutting the buffers was
+/// never going to be sufficient on its own: 4512 still does not fit 4096. The
+/// stack had to grow whatever happened to the buffers.
+///
+/// 16384 is then the smallest power of two that leaves the report room to
+/// double, which is the margin `double_fault_stack` asserts. It costs 20 KiB
+/// per CPU with the guard, against the 16 KiB each already pays for an idle
+/// stack.
 const IST1_STACK_SIZE: usize = 16384;
 
 /// Filled with [`STACK_FILL`] and never written by anything legitimate, so an
