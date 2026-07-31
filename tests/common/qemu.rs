@@ -36,9 +36,28 @@ pub enum Profile {
     Metal,
 }
 
+/// Everything a profile decides about the machine, in one table. A new
+/// variant answers every question here or does not compile — which `self !=
+/// Profile::Metal` did the opposite of: it handed anything that was not
+/// literally Metal the whole virtio block, a USB keyboard and a console.
+struct Shape {
+    /// `-vga` mode. "none" leaves firmware with no GOP to publish.
+    vga: &'static str,
+    /// virtio-net, virtio-sound, and the console on virtio-serial.
+    virtio: bool,
+    /// A USB HID on the xHCI. Its absence is what makes an i8042 test measure
+    /// anything: QEMU activates one input handler per device class, so with a
+    /// usb-kbd present every injected keystroke goes to it.
+    usb_hid: bool,
+}
+
 impl Profile {
-    fn virtio(self) -> bool {
-        self != Profile::Metal
+    fn shape(self) -> Shape {
+        match self {
+            Self::Headless => Shape { vga: "none", virtio: true, usb_hid: true },
+            Self::Gop => Shape { vga: "std", virtio: true, usb_hid: true },
+            Self::Metal => Shape { vga: "std", virtio: false, usb_hid: false },
+        }
     }
 }
 
@@ -634,8 +653,9 @@ fn qemu_command(
     qmp_socket: Option<&Path>,
     options: &BootOptions,
 ) -> Command {
+    let shape = options.profile.shape();
     assert!(
-        !options.mute || !options.profile.virtio(),
+        !options.mute || !shape.virtio,
         "mute removes the only console a virtio profile has"
     );
 
@@ -648,6 +668,16 @@ fn qemu_command(
     if kvm {
         qemu.arg("-accel").arg("kvm");
     }
+
+    // Without this QEMU runs its default-device pass whenever no network
+    // option is given, which is exactly and only the Metal profile: measured
+    // on QEMU 11.0.2, an e1000e at 00:02.0 with a slirp backend, an empty
+    // ide-cd on the ich9-ahci, and an isa-parallel — none of them declared by
+    // anything, none of them visible to an argv assertion, and the first of
+    // them enough to make netd claim a NIC on the machine whose whole point is
+    // that it has none. `-net none` and `-nic none` are gone in QEMU 11; this
+    // is the option that does it, and it leaves i8042/ps2-kbd/ps2-mouse alone.
+    qemu.arg("-nodefaults");
 
     qemu.arg("-machine")
         .arg(if options.i8042 { "q35" } else { "q35,i8042=off" })
@@ -684,24 +714,16 @@ fn qemu_command(
         .arg("-device")
         .arg("nvme,serial=deadbeef,drive=nvme0")
         .arg("-vga")
-        .arg(match options.profile {
-            Profile::Headless => "none",
-            Profile::Gop | Profile::Metal => "std",
-        })
+        .arg(shape.vga)
         .arg("-display")
         .arg("none")
         .arg("-no-reboot");
 
-    // The T14's keyboard is PS/2 and its touchpad I2C-HID; it has no USB HID
-    // at all, so metal-sim must not have one either. That absence is also
-    // what makes an i8042 test measure anything: QEMU activates one input
-    // handler per device class, so with a usb-kbd present every injected
-    // keystroke goes to it and the PS/2 test passes for the wrong reason.
-    if options.profile.virtio() {
+    if shape.usb_hid {
         qemu.arg("-device").arg("usb-kbd,bus=xhci.0");
     }
 
-    if options.profile.virtio() {
+    if shape.virtio {
         qemu.arg("-netdev")
             .arg("user,id=net0")
             .arg("-device")

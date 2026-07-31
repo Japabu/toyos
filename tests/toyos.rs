@@ -1248,8 +1248,27 @@ fn metal_sim_argv_check(argv: &[String]) -> Result<(), String> {
     if let Some(bad) = argv.iter().find(|a| a.contains("virtio")) {
         return Err(format!("metal-sim passed a virtio device to QEMU: {bad}"));
     }
-    if let Some(bad) = argv.iter().find(|a| a.contains("usb-kbd") || a.contains("usb-tablet")) {
-        return Err(format!("metal-sim passed a USB HID device to QEMU: {bad}"));
+    // The mechanism, not two names. `xhci::device::scan_ports` binds any
+    // boot-protocol HID — keyboard, mouse or tablet — so an enumeration of the
+    // two device names that happen to be in the tree today would let a
+    // `usb-mouse` added for debugging break the profile's only negative claim
+    // while the assertion stayed green. The boot stick is the one USB device
+    // this machine has.
+    let hid = argv
+        .windows(2)
+        .filter(|w| w[0] == "-device")
+        .map(|w| w[1].as_str())
+        .find(|v| v.starts_with("usb-") && !v.starts_with("usb-storage"));
+    if let Some(bad) = hid {
+        return Err(format!("metal-sim passed a USB device that is not the boot stick: {bad}"));
+    }
+    // Without this QEMU adds an e1000e with a slirp backend, an ide-cd and an
+    // isa-parallel that nothing declared — and the NIC is enough to make netd
+    // claim a device on the machine whose whole point is that it has none.
+    // None of them appears in argv, so this flag is the only observable form
+    // of their absence here; `query-pci` is the direct one.
+    if !argv.iter().any(|a| a == "-nodefaults") {
+        return Err("metal-sim did not pass -nodefaults; QEMU's default-device pass is back".to_string());
     }
     Ok(())
 }

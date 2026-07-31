@@ -23,9 +23,27 @@ pub enum Profile {
     Metal,
 }
 
+/// Everything a profile decides about the machine, in one table. A new
+/// variant answers every question here or does not compile — which `self !=
+/// Profile::Metal` did the opposite of: it handed anything that was not
+/// literally Metal the whole virtio block and a USB keyboard.
+struct Shape {
+    /// The display device. `Virtio` is the only profile with no firmware GOP.
+    virtio_gpu: bool,
+    /// virtio-net, virtio-sound, and the console on virtio-serial.
+    virtio: bool,
+    /// A USB HID on the xHCI. The T14's keyboard is PS/2 and its touchpad
+    /// I2C-HID; it has no USB HID at all.
+    usb_hid: bool,
+}
+
 impl Profile {
-    fn virtio(self) -> bool {
-        self != Profile::Metal
+    fn shape(self) -> Shape {
+        match self {
+            Self::Virtio => Shape { virtio_gpu: true, virtio: true, usb_hid: true },
+            Self::Gop => Shape { virtio_gpu: false, virtio: true, usb_hid: true },
+            Self::Metal => Shape { virtio_gpu: false, virtio: false, usb_hid: false },
+        }
     }
 }
 
@@ -42,7 +60,16 @@ pub struct Options {
 }
 
 pub fn launch(opts: &Options) {
+    let shape = opts.profile.shape();
     let mut qemu = Command::new("qemu-system-x86_64");
+
+    // Without this QEMU runs its default-device pass whenever no network
+    // option is given, which is exactly and only the Metal profile: measured
+    // on QEMU 11.0.2, an e1000e at 00:02.0 with a slirp backend, an empty
+    // ide-cd on the ich9-ahci, and an isa-parallel. `-net none` and `-nic
+    // none` are gone in QEMU 11; this is the option that does it, and it
+    // leaves i8042/ps2-kbd/ps2-mouse alone.
+    qemu.arg("-nodefaults");
 
     if kvm_available() {
         qemu.arg("-accel").arg("kvm");
@@ -73,21 +100,18 @@ pub fn launch(opts: &Options) {
         .arg("-device")
         .arg("nvme,serial=deadbeef,drive=nvme0");
 
-    // The T14's own keyboard and touchpad are PS/2 and I2C-HID; it has no USB
-    // HID at all. Leaving these in would let metal-sim pass on a device the
-    // machine does not have.
-    if opts.profile != Profile::Metal {
+    if shape.usb_hid {
         qemu.arg("-device")
             .arg("usb-kbd,bus=xhci.0")
             .arg("-device")
             .arg("usb-tablet,bus=xhci.0");
     }
 
-    // The GOP profile is the display path a real laptop takes: firmware
-    // publishes a linear framebuffer, the kernel maps it, and there is no
-    // virtio device to fall back to. It is also the only config in which the
-    // on-screen panic console renders anything.
-    if opts.profile == Profile::Virtio {
+    // `-vga std` is the display path a real laptop takes: firmware publishes a
+    // linear framebuffer, the kernel maps it, and there is no virtio device to
+    // fall back to. It is also the only config in which the on-screen panic
+    // console renders anything.
+    if shape.virtio_gpu {
         qemu.arg("-vga")
             .arg("none")
             .arg("-device")
@@ -96,7 +120,7 @@ pub fn launch(opts: &Options) {
         qemu.arg("-vga").arg("std");
     }
 
-    if opts.profile.virtio() {
+    if shape.virtio {
         qemu.arg("-netdev")
             .arg("user,id=net0,hostfwd=tcp::2222-:22")
             .arg("-device")
