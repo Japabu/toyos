@@ -164,6 +164,31 @@ should only wake watchers when `handle_report` actually queued events. Also
 inconsistent: `sys_read` on an empty Keyboard fd blocks, on an empty Mouse fd
 returns `NotFound`.
 
+### An io_uring `POLL_ADD` on a NIC or audio fd never completes
+
+`Source::{Network, Audio}` can be registered but is never fanned out to. The
+watcher lists exist and `process_poll_add` fills them
+(`net::add_io_uring_watcher`, `audio::add_io_uring_watcher`), but no wake site
+calls `complete_pending_for_event` with either: `drain_irqs`
+(`kernel/src/sched/driver.rs:498`) wakes only the direct-blocker queues via
+`net::wake_waiters` / `audio::wake_waiters`. Every other source has both halves
+— pipes from `process.rs:1172`/`pipe.rs` close paths, keyboard and mouse from
+`HidDevice::dispatch_report`, listeners from `wake_poll_waiters`.
+
+So a poller on a NIC or audio fd gets its CQE only if the source happened to be
+ready at submit time (the immediate post, or the TOCTOU recheck), or when the fd
+is closed and `remove_fd` posts `NotFound`. Otherwise it waits forever. Nothing
+in tree polls those two fds through io_uring today, which is why it is invisible.
+
+`net::io_uring_watchers` and `audio::io_uring_watchers` therefore have exactly
+one caller each — `Source::watchers`, on the close path — which is the shape
+that gives the bug away. The fix is two lines at the `drain_irqs` wake sites,
+mirroring `hid.rs`; the durable fix is iouring-blocking-spec's single `post()`,
+where a source cannot have one half of the pair.
+
+Found while moving the poll key off `EventSource` at Stage 7c; pre-existing,
+untouched by that commit.
+
 ### The virtio-console has no line atomicity between writers
 
 Kernel `log!` output and userspace `println!` interleave *mid-word* into each
