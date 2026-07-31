@@ -47,6 +47,21 @@ pub enum Profile {
     /// boot on the laptop was the first time anything asked for a
     /// device-sized allocation.
     MetalDisk,
+    /// metal-sim with a namespace formatted in 8 KiB logical blocks.
+    ///
+    /// Sector size is a shape dimension in exactly the sense
+    /// `specs/device-test-strategy.md` means, and it was one the harness could
+    /// not express: every profile got QEMU's implicit 512-byte namespace, so
+    /// nothing asked the driver what it does with a device it cannot address.
+    /// The answer was `4096 / sector_size == 0` and then a divide by zero, at
+    /// 0.068 s, before storage is up and before there is a console to report
+    /// it on.
+    ///
+    /// 8192 rather than something absurd because it is real: 8 KiB-format
+    /// namespaces ship, and this driver's whole stack above the sector layer
+    /// is written in 4096-byte blocks. The guest is expected to refuse the
+    /// device by name, so this profile boots no userland at all.
+    NvmeWideSector,
 }
 
 /// The controller every profile but [`Profile::MetalUsb`] gets. `nec-usb-xhci`
@@ -91,11 +106,20 @@ struct Shape {
     /// structure sized per device block is bounded by this number and by
     /// nothing else.
     nvme_bytes: u64,
+    /// The namespace's logical block size. Stated per profile for the same
+    /// reason `nvme_bytes` is: it is a dimension of the device, the driver
+    /// turns it into a shift and a divisor, and QEMU's implicit namespace only
+    /// ever produced one value of it.
+    nvme_lba_bytes: u32,
 }
 
 /// What every profile but [`Profile::MetalDisk`] gives the guest. Large
 /// enough for a filesystem, small enough that a boot formats it quickly.
 const NVME_SMALL: u64 = 128 * 1024 * 1024;
+
+/// What every namespace but [`Profile::NvmeWideSector`]'s reports — QEMU's
+/// implicit default, and the T14's.
+const NVME_LBA_DEFAULT: u32 = 512;
 
 /// The T14 Gen 2's namespace, to the byte: 500,118,192 sectors of 512 B.
 /// Taken from the laptop's own boot line rather than rounded from "244 GB",
@@ -114,6 +138,7 @@ impl Profile {
                 xhci: XHCI_DEFAULT,
                 usb: &["usb-kbd"],
                 nvme_bytes: NVME_SMALL,
+                nvme_lba_bytes: NVME_LBA_DEFAULT,
             },
             Self::Gop => Shape {
                 vga: "std",
@@ -121,6 +146,7 @@ impl Profile {
                 xhci: XHCI_DEFAULT,
                 usb: &["usb-kbd"],
                 nvme_bytes: NVME_SMALL,
+                nvme_lba_bytes: NVME_LBA_DEFAULT,
             },
             Self::Metal => Shape {
                 vga: "std",
@@ -128,6 +154,7 @@ impl Profile {
                 xhci: XHCI_DEFAULT,
                 usb: &[],
                 nvme_bytes: NVME_SMALL,
+                nvme_lba_bytes: NVME_LBA_DEFAULT,
             },
             // Two keyboards and two pointers, because the collision this
             // stages is between devices of the same HID class; a hub for a
@@ -139,6 +166,7 @@ impl Profile {
                 xhci: XHCI_WIDE,
                 usb: &["usb-kbd", "usb-kbd", "usb-mouse", "usb-tablet", "usb-hub"],
                 nvme_bytes: NVME_SMALL,
+                nvme_lba_bytes: NVME_LBA_DEFAULT,
             },
             Self::MetalDisk => Shape {
                 vga: "std",
@@ -146,6 +174,15 @@ impl Profile {
                 xhci: XHCI_DEFAULT,
                 usb: &[],
                 nvme_bytes: NVME_T14_BYTES,
+                nvme_lba_bytes: NVME_LBA_DEFAULT,
+            },
+            Self::NvmeWideSector => Shape {
+                vga: "std",
+                virtio: false,
+                xhci: XHCI_DEFAULT,
+                usb: &[],
+                nvme_bytes: NVME_SMALL,
+                nvme_lba_bytes: 8192,
             },
         }
     }
@@ -848,8 +885,16 @@ fn qemu_command(
             "if=none,id=nvme0,format=raw,file={}",
             nvme_image.display()
         ))
+        // Controller and namespace as two devices rather than QEMU's implicit
+        // one, so the logical block size is something a profile states instead
+        // of something the default decides.
         .arg("-device")
-        .arg("nvme,serial=deadbeef,drive=nvme0")
+        .arg("nvme,serial=deadbeef,id=nvme0ctl")
+        .arg("-device")
+        .arg(format!(
+            "nvme-ns,drive=nvme0,bus=nvme0ctl,logical_block_size={0},physical_block_size={0}",
+            shape.nvme_lba_bytes
+        ))
         .arg("-vga")
         .arg(shape.vga)
         .arg("-display")

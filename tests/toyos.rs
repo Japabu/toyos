@@ -8,7 +8,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use common::qemu::{self, BootOptions, QemuInstance, TestResult};
-use common::{audio, compile, screen, stats, storage};
+use common::{audio, compile, faults, screen, stats, storage};
 
 struct TestDef {
     name: String,
@@ -69,8 +69,10 @@ const MACHINE_TESTS: &[&str] = &[
     "metal_sim_compositor",
     "metal_sim_input",
     "foreign_disk_untouched",
+    "double_fault_stack",
     "xhci_many_devices",
     "nvme_large_device",
+    "nvme_wide_sector",
     "i8042_keyboard",
     "i8042_no_spurious_wake",
     "i8042_mouse",
@@ -1411,6 +1413,7 @@ fn run_machine_test(
         // Body in `tests/common/storage.rs`, so the hunk in this shared file
         // stays one line.
         "foreign_disk_untouched" => storage::foreign_disk_untouched(test_config, c_bins, rust_bins),
+        "double_fault_stack" => faults::double_fault_stack(test_config, c_bins, rust_bins),
         "metal_sim_compositor" => {
             // M1's permanent config: the whole boot with no virtio device
             // anywhere. What it certifies is which processes survive the
@@ -1724,6 +1727,55 @@ fn run_machine_test(
                 allocated / (1024 * 1024),
                 apparent / 1_000_000_000
             );
+            Ok(())
+        }
+        "nvme_wide_sector" => {
+            // The other half of "a device's size is a shape dimension": not how
+            // many sectors, but how big one is. `lba_ds` is an 8-bit
+            // device-reported shift that reached `1 << lba_ds` and then
+            // `4096 / sector_size`, so an 8 KiB-format namespace divided by
+            // zero at 0.068 s — before storage, before a console, and on a
+            // machine whose only channel out is the one that does not exist
+            // yet. Every profile in this tree took QEMU's implicit 512-byte
+            // namespace, so nothing could ask.
+            //
+            // The guest is expected to die here, which is what makes
+            // `ready_marker` the driver's own refusal: anything but
+            // DEFAULT_READY tells the harness a panic is the outcome under
+            // test rather than a boot failure.
+            const REFUSAL: &str = "NVMe: namespace reports";
+            let options = BootOptions {
+                profile: qemu::Profile::NvmeWideSector,
+                ready_marker: REFUSAL,
+                ..Default::default()
+            };
+            let qemu = QemuInstance::boot_with_options(test_config, c_bins, rust_bins, options);
+            // It dies before virtio-console exists, so the 16550 file is the
+            // only record — which is also the T14's situation exactly.
+            let log = format!("{}\n{}", qemu.boot_log(), qemu.uart_log());
+
+            // Named, not just refused: the value the device reported is the
+            // whole diagnostic on a machine that will not boot again without
+            // it. A bare "refused" line would pass with the number wrong.
+            if !log.contains("2^13-byte sectors") {
+                return Err(format!(
+                    "the driver refused the namespace without naming its sector size:\n{log}"
+                ));
+            }
+            // And it refused rather than dividing: the pre-fix failure was
+            // `attempt to divide by zero`, which is also a panic and would
+            // satisfy every check above if they only looked for one.
+            if log.contains("divide by zero") {
+                return Err(format!("the driver still divided by the sector count:\n{log}"));
+            }
+            // Nothing downstream ran. `block device id=` is the line
+            // `NvmeBlockDevice::new` logs, and it is the call that divided.
+            if log.contains("NVMe: block device id=") {
+                return Err(format!(
+                    "the driver built a block device on a namespace it cannot address:\n{log}"
+                ));
+            }
+            eprintln!("  [nvme] 8 KiB-format namespace refused by name, before storage came up");
             Ok(())
         }
         "cache_eviction" => {
