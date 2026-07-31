@@ -46,6 +46,40 @@ bug that has produced every metal-track blocker so far.
 Protocol depth comes second, and only where the device is load-bearing: storage
 (data loss is unrecoverable) and network (gate N).
 
+## How a test observes: text first, pixels only as a last resort
+
+Owner's rules, 2026-07-31. They are rules, not preferences — a test that breaks
+for the wrong reason costs more than the coverage it claimed.
+
+**Assert on text, not on pixels.** An in-guest binary that prints what it
+received is the default instrument for anything above the hardware boundary.
+Pixel-count thresholds and colour-count assertions are banned: they cannot tell
+right from wrong-but-changing, which is not hypothetical — the first two
+versions of the M2 input test passed vacuously because the compositor repaints
+a taskbar clock once a second.
+
+**Never assert on a screen position.** Clicking a fixed coordinate asserts the
+compositor's layout, an implementation detail that will change and will then
+fail a driver test for an unrelated reason. Input tests inject a *relative*
+delta and a button and assert the guest received that delta and that button —
+true no matter where anything is drawn.
+
+**The one exception: the panic console.** There the framebuffer *is* the device
+under test, and on a machine with no serial port it is the only diagnostic
+channel, so asking the question without looking at pixels is not a weaker test
+but no test. Those assertions are text anyway: the harness decodes each 8x16
+cell against the same `font8x16.bin` the kernel renders with, so kernel and
+decoder cannot drift, and the assertions read `screen_text.contains(...)`. This
+exception covers the panic-render tests, their negative control (a *recovering*
+panic must not paint — without it "the console paints" can be true while "it
+paints when it must not" is also true, which was a real defect), and the
+decoder's own host unit test. Nothing else.
+
+**Tests run headless, always.** `-display none` for every profile in the
+harness. Manual verification does not get an exemption: a `cargo run` that
+opens a window on the owner's desktop is not an acceptable way to demonstrate
+a test result.
+
 ## Build order
 
 1. **Shape matrix.** Parameterize the existing profile machinery over device
