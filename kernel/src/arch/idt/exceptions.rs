@@ -108,6 +108,22 @@ impl ExceptionContext<'_> {
 // No unwrap/expect/[], no allocation, no blocking locks. try_lock only.
 // log!() is verified panic-free (let _ = write!(), serial::write is direct outb).
 // Symbol resolution is lock-free (AtomicPtr, linear scan over static ELF data).
+//
+// "try_lock only" was not sufficient on its own, and the gap was not in this
+// file. `Lock::try_lock` raises the preempt count on entry, and both its
+// failure path and its guard's `Drop` lower it again — so on the pass that
+// takes the count back to zero with `need_resched` set, `preempt::enable`
+// dispatched `do_preempt` and the crash report reached the scheduler from
+// inside a fault. `panic_console` had already refused `try_lock` for exactly
+// this reason and said so in its own comment; the rest of the crash path kept
+// using it, and there are three more uses behind this one — the process table
+// here, plus `resolve_user_symbol` and `dump_crash_diagnostics`.
+//
+// Fixed centrally rather than per call site: `preempt::enable` now declines
+// the slow path while `PerCpu::fault_state` is non-zero. That is the honest
+// place for it — a CPU inside a fault or panic report must not be rescheduled
+// whatever it happens to call — and it covers uses this rule has not been
+// applied to yet, which chasing call sites would not.
 
 /// Source of a crash — either a hardware exception or a Rust panic.
 pub(crate) enum CrashInfo<'a> {

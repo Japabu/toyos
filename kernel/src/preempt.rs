@@ -122,7 +122,23 @@ pub fn enable() {
     // during the outer schedule's resume path — and since timers are
     // one-shot, a dropped request means the task runs without preemption
     // until something else interrupts it.
-    if count() == 0 && need_resched() {
+    if count() == 0 && need_resched() && !faulting() {
         crate::scheduler::do_preempt();
     }
+}
+
+/// Whether this CPU is inside a fault or panic report.
+///
+/// `gs:[256]` is `PerCpu::fault_state`, non-zero for PageFault/Fatal/Panic and
+/// asserted at that offset in `percpu.rs` alongside the other raw offsets this
+/// module uses.
+#[inline]
+fn faulting() -> bool {
+    if !percpu_ready() { return false; }
+    let v: u8;
+    unsafe {
+        asm!("mov {}, gs:[256]", out(reg_byte) v,
+            options(nomem, nostack, preserves_flags));
+    }
+    v != 0
 }
