@@ -26,9 +26,15 @@ impl HidDevice {
         let mut buf = [0u8; 8];
         let size = self.report_size as usize;
         unsafe { copy_nonoverlapping(self.report_ptr as *const u8, buf.as_mut_ptr(), size); }
+        // Wake only when the decode actually queued something. A report
+        // identical to the last one produces no event, and waking watchers
+        // for it made readiness disagree with `has_data()` — which froze the
+        // compositor for as long as a key was held.
         match self.hid_type {
             HidType::Keyboard => {
-                keyboard::handle_report(&buf[..size]);
+                if keyboard::handle_report(&buf[..size]) == 0 {
+                    return;
+                }
                 keyboard::wake_waiters();
                 let watchers = keyboard::io_uring_watchers();
                 if !watchers.is_empty() {
@@ -39,7 +45,9 @@ impl HidDevice {
                 }
             }
             HidType::Mouse | HidType::Tablet => {
-                mouse::handle_report(&buf[..size]);
+                if mouse::handle_report(&buf[..size]) == 0 {
+                    return;
+                }
                 mouse::wake_waiters();
                 let watchers = mouse::io_uring_watchers();
                 if !watchers.is_empty() {

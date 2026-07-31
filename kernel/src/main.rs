@@ -23,6 +23,8 @@ mod mm;
 
 mod keyboard;
 mod mouse;
+#[cfg(feature = "test-input-merge")]
+mod input_merge_test;
 mod block;
 #[allow(dead_code)]
 mod page_cache;
@@ -398,6 +400,10 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     };
 
     boot_phase!("devices ready", t_devices);
+
+    // Before userland, so nothing else is reading the input queues.
+    #[cfg(feature = "test-input-merge")]
+    input_merge_test::run();
 
     // Phase 7: Userland
     assert!(!init_programs.is_empty(), "bootloader must provide init_programs");

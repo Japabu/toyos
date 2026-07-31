@@ -347,17 +347,14 @@ fixes it.
 while it holds the XHCI lock via the `fd.rs` keyboard/mouse read poll. A
 `try_lock` in the timer path removes it.
 
-### Keyboard poll readiness is spurious on repeated HID reports
+### `sys_read` blocks on an empty Keyboard fd and returns `NotFound` on an empty Mouse fd
 
-`HidDevice::dispatch_report` wakes `io_uring::Source::Keyboard` watchers on every
-report, but `keyboard::handle_report` diffs against the previous report and
-queues zero events for identical ones (host key auto-repeat produces a stream of
-these). A blocking `read` after such a wake parks the reader until the next real
-key event — this froze the compositor, and the whole display, while a key was
-held. Userland now reads the keyboard/mouse fds non-blocking, but the kernel
-should only wake watchers when `handle_report` actually queued events. Also
-inconsistent: `sys_read` on an empty Keyboard fd blocks, on an empty Mouse fd
-returns `NotFound`.
+Two fds of the same shape, two different answers to the same question. Pick one.
+
+The spurious-readiness half of this entry is closed: `handle_report` returns the
+number of events it queued and `dispatch_report` wakes only on a non-zero count,
+so readiness and `has_data()` agree. Userland still reads both fds non-blocking,
+which is now belt and braces rather than a workaround.
 
 ### An io_uring `Source` can carry one half of the wake pair
 

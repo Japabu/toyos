@@ -51,8 +51,11 @@ const SCREEN_TESTS: &[&str] = &[
 /// Input-path tests. Each needs a machine shape the shared boot cannot give
 /// it — no USB HID so the PS/2 keyboard is the only source, or no i8042 at
 /// all — so each costs its own boot. `run_input_test` dispatches them.
+/// Feature-carrying ones last, as SCREEN_TESTS does: each distinct kernel
+/// feature set is another kernel rebuild.
 const INPUT_TESTS: &[&str] = &[
     "ioapic_topology",
+    "input_merge",
 ];
 
 /// The renderer's two text colours, as the screendump reports them.
@@ -1354,6 +1357,25 @@ fn run_input_test(
             }
             Ok(())
         }
+        "input_merge" => {
+            // The check runs in the kernel and panics on mismatch, so a
+            // failure arrives as a dead boot; the marker is the only proof it
+            // ran at all.
+            let qemu = QemuInstance::boot_with_options(
+                test_config,
+                c_bins,
+                rust_bins,
+                BootOptions {
+                    kernel_features: &["test-input-merge"],
+                    ..Default::default()
+                },
+            );
+            let log = qemu.boot_log();
+            if !log.contains("input-merge: ok") {
+                return Err(format!("the input core check never reported:\n{log}"));
+            }
+            Ok(())
+        }
         other => Err(format!("unknown input test {other}")),
     }
 }
@@ -1691,7 +1713,20 @@ fn main() {
         eprintln!("  --- input ---");
         for name in &input_to_run {
             let start = std::time::Instant::now();
-            let outcome = run_input_test(name, &test_config, &c_bins, &rust_bins);
+            // A guest whose kernel-internal check panics never reaches the
+            // ready marker, and the harness's own boot wait panics rather
+            // than returning — which would take the rest of the suite with
+            // it. Catch it here so one dead boot is one failed test.
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_input_test(name, &test_config, &c_bins, &rust_bins)
+            }))
+            .unwrap_or_else(|e| {
+                Err(e
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
+                    .unwrap_or_else(|| "the boot panicked".to_string()))
+            });
             let elapsed = start.elapsed();
             match outcome {
                 Ok(()) => {

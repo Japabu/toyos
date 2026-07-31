@@ -14,6 +14,10 @@ test-early-panic = []
 # SYS_DEBUG action 3: halt every CPU on demand. A test needs a fatal path it
 # can trigger from userland; a shipped kernel must not have one.
 test-fatal-halt = []
+# Script the input core directly at end of boot. QEMU activates one input
+# handler per device class, so two keyboards or two pointers can never both be
+# live in a guest — the merge has no end-to-end test and this is its only one.
+test-input-merge = []
 # Panic once the boot phases are done, with no thread current, so a test can
 # drive the ordinary fatal panic — the one path where the report reaches the
 # screen only because the panic handler captured it before draining the ring.
