@@ -505,6 +505,13 @@ fn drain_irqs() {
     }
     if crate::irq_ring::take(crate::irq_ring::IrqSource::Audio).is_some() {
         crate::audio::wake_waiters();
+        let watchers = crate::audio::io_uring_watchers();
+        if !watchers.is_empty() {
+            crate::io_uring::complete_pending_for_event(
+                &watchers,
+                crate::io_uring::Source::Audio,
+            );
+        }
     }
 }
 
