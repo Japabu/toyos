@@ -610,19 +610,21 @@ pub fn alloc_shared(size: usize) -> u32 {
 }
 
 /// Grant another process permission to map a shared memory region.
-pub fn grant_shared(token: u32, target_pid: Pid) {
-    let result = syscall(SYS_GRANT_SHARED, token as u64, target_pid.0 as u64, 0, 0);
-    assert_eq!(result, 0, "grant_shared failed");
+///
+/// Fallible: only the region's owner may grant, and only to a live process.
+pub fn grant_shared(token: u32, target_pid: Pid) -> Result<(), SyscallError> {
+    check_unit(syscall(SYS_GRANT_SHARED, token as u64, target_pid.0 as u64, 0, 0))
 }
 
 /// Map a shared memory region into this process's address space.
 ///
+/// Fallible: a token the caller was never granted is `PermissionDenied`.
+///
 /// # Safety
-/// Caller must ensure the token is valid and manage the returned pointer.
-pub unsafe fn map_shared(token: u32) -> *mut u8 {
-    let addr = syscall(SYS_MAP_SHARED, token as u64, 0, 0, 0);
-    assert!(SyscallError::from_u64(addr).is_none(), "map_shared failed");
-    core::ptr::with_exposed_provenance_mut(addr as usize)
+/// Caller must manage the returned pointer.
+pub unsafe fn map_shared(token: u32) -> Result<*mut u8, SyscallError> {
+    check(syscall(SYS_MAP_SHARED, token as u64, 0, 0, 0))
+        .map(|addr| core::ptr::with_exposed_provenance_mut(addr as usize))
 }
 
 /// Release this process's mapping of a shared memory region.

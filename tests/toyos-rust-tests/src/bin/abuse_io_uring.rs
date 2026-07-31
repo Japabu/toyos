@@ -13,7 +13,7 @@ const DEPTH: u32 = 8;
 
 fn main() {
     let (ring_fd, shm_token) = syscall::io_uring_setup(DEPTH).expect("io_uring_setup");
-    let base = unsafe { syscall::map_shared(shm_token) };
+    let base = unsafe { syscall::map_shared(shm_token) }.expect("map_shared");
     let sq = unsafe { &*(base.add(SQ_RING_OFF as usize) as *const IoUringRingHeader) };
 
     // 4 million entries claimed in an 8-entry ring: 160 MB of IoUringSqe.
