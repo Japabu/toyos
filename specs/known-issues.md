@@ -23,11 +23,20 @@ as authority, guessing or outliving the designation was the entire attack:
 
 - **`PipeId`** — dense sequential integers, so `for id in 0.. { pipe_open(id, 0) }`
   walked every live pipe. Gated at `be604ef` (below).
-- **A service name** — `Descriptor::Listener` once held the *name*, so a stale fd
-  re-resolved to whichever process registered it next. Closed at `be604ef`, which
-  changed the descriptor to hold a `ListenerId`; ids come from a monotonic
-  `IdMap` and are never reused, so a descriptor that outlived its listener names
-  nothing forever (`fd.rs:52-56`, `listener.rs:125-126`).
+- **A service name** — **the instance that motivated this class.**
+  `Descriptor::Listener` held the service *name*, and every operation re-resolved
+  it through the global registry, so nothing tied a descriptor to the listener it
+  was created for. `listen("compositor"); dup(fd); close(fd)` freed the name while
+  leaving the dup live: the real compositor's `listen` then *succeeded*, its own
+  "already running" check passing, and from that moment the attacker's stale fd
+  took connections meant for it. Three calls, no race, no privilege. Closed at
+  **`e42532f`** (2026-08-01) by storing a `ListenerId` — never reused, so a
+  removed id names nothing forever — with `abuse_listener_hijack.rs` as a real
+  exploit test.
+
+  Not closed by `be604ef`, which this file briefly claimed: `Listener(String)`
+  is an unchanged *context* line in that commit's own `fd.rs` hunk. See the
+  postscript at the end of this section.
 - **`SharedToken`** — a bare `u32` with no RAII and no ownership, still open
   (§7).
 
@@ -44,6 +53,19 @@ while a handle can still reach it. Until then, every new syscall taking a raw id
 needs the first question asked, and every cached reference to a filesystem or
 device object needs the second. **This is here to predict the next instance, not
 to summarise the last four.**
+
+> **Postscript, worth more than the entry above it.** On 2026-08-01 this file
+> briefly recorded the listener defect as already closed by `be604ef`, citing a
+> doc comment and a type that were sitting in the working tree — the isolation
+> agent's fix, written twenty minutes earlier and not yet committed. Read against
+> `git show HEAD:kernel/src/fd.rs`, the descriptor still held a `String` and the
+> attack still ran.
+>
+> **In a tree with six agents committing, the working tree is somebody's
+> uncommitted opinion. `git show HEAD:<path>` is the arbiter.** A finding has a
+> shelf life in *both* directions: it can go stale because the bug got fixed, and
+> it can look fixed because someone's work-in-progress is on disk. Both cost a
+> wrong conclusion here in one day. Method: `specs/spec-staleness-sweep.md`.
 
 ### A `FileBacking` outlives deletion of the file it reads
 
