@@ -1,5 +1,43 @@
 # Fork lint audit — plan
 
+## Why fork problems keep arriving as surprises
+
+**The fork estate is systematically outside every check the tree runs on itself.**
+Four instances, all confirmed:
+
+1. **Invisible to the zero-warning bar** — cargo gives every non-path source
+   `--cap-lints allow`, so rustc discards fork warnings before anything prints
+   them (this note's original subject).
+2. **Invisible to ABI signature changes** until a build breaks. A first-party
+   signature can change and no check notices that a pinned fork calls the old
+   one; `map_shared` stranded the `mio` fork and blocked every agent's workspace
+   until someone tried to build.
+3. **Holding frozen copies of first-party crates.** A fork depending on
+   `toyos-abi` by *git* rather than by version resolves — silently, against a
+   snapshot — and `[patch]` does not redirect it (`specs/known-issues.md`).
+4. **Un-fixable except in a quiet-tree window**, because editing a fork means
+   `.cargo/config.toml` path overrides, which change the build for every agent at
+   once. So fork fixes queue behind a scheduling constraint no other work has.
+
+Each was found by accident, by a build breaking, or by someone going and looking.
+None was found by a check. That is the sentence to keep: **the estate is not
+covered by the project's own instruments, so every fork problem surfaces as a
+surprise rather than as a red test.**
+
+### The enumeration lesson
+
+**"I enumerated the call sites" is only true if the enumeration covered
+`~/.cargo/git/checkouts/`.** Nothing in the tree tells you otherwise until a
+build breaks. Grepping the monorepo for callers of a first-party function is a
+*partial* enumeration, and it reads as complete — every caller you can see is a
+caller you found.
+
+This cost every agent a blocked workspace today, on an enumeration that was
+careful by every standard applied to the tree itself. Before changing any
+signature in `toyos-abi` or `toyos`, grep the checkouts too.
+
+---
+
 The zero-warning bar does not reach the fork estate, and no build-system change
 can make it. This is the hand-off note for the agent that runs the audit.
 
@@ -32,6 +70,10 @@ including untouched upstream crates.
 
 ## What running it takes
 
+0. **First, `grep` all fifteen checkouts for git-sourced ToyOS dependencies** —
+   `grep -l 'toyos-abi\|toyos =' ~/.cargo/git/checkouts/*/*/Cargo.toml` and check
+   each for the `{ git = ... }` form. Cheapest step, and it establishes whether
+   instance 3 above is live before anything else is touched.
 1. **Clone all 14 fork repos beside the monorepo** and add path overrides in
    `.cargo/config.toml` (gitignored; `.cargo/config.toml.example` documents the
    mechanism). Turning each into a path source is the *only* thing that lifts
