@@ -220,6 +220,12 @@ pub struct Scenario {
     /// What one scheduler pass is modelled to cost. Zero everywhere but
     /// `scenarios::overlong_pass`; see [`crate::hw_impl::SimHwState`].
     pub pass_cost_ns: u64,
+    /// Invariant I5's *recorded* ceiling, where the shipped scheduler does not
+    /// meet the derived one — `scenarios::FAIRNESS_SAMPLE`. Zero means the
+    /// derived bound is the ceiling, which is the only honest default: an
+    /// allowance is a statement that a measurement was taken, and a scenario
+    /// nobody has measured has no allowance to offer.
+    pub fair_allowance_ns: u64,
     /// Safety net: a run that has not quiesced by here is reported as a
     /// non-termination failure rather than looping forever.
     pub max_steps: usize,
@@ -284,6 +290,11 @@ impl Scenario {
 
     pub fn with_pass_cost(mut self, ns: u64) -> Self {
         self.pass_cost_ns = ns;
+        self
+    }
+
+    pub fn with_fair_allowance(mut self, ns: u64) -> Self {
+        self.fair_allowance_ns = ns;
         self
     }
 

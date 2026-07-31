@@ -20,6 +20,10 @@ pub struct SweepResult {
     /// only says it stayed under the bound.
     pub worst_fair_spread: u64,
     pub worst_fair_bound: u64,
+    /// Worst spread past the derived bound anywhere in the sweep. Non-zero is
+    /// the standard-versus-shipped gap, not a test failure — the run passed on
+    /// the recorded allowance.
+    pub worst_over_bound: u64,
 }
 
 impl SweepResult {
@@ -34,17 +38,26 @@ impl SweepResult {
             self.worst_fair_spread = outcome.fair_spread;
             self.worst_fair_bound = outcome.fair_bound;
         }
+        self.worst_over_bound = self.worst_over_bound.max(outcome.fair_over_bound);
     }
 
     pub fn report(&self) -> String {
         if self.passed() {
             format!(
-                "{}: {} runs, {} steps, clean (I5 worst spread {}/{} ns)",
+                "{}: {} runs, {} steps, clean (I5 worst spread {}/{} ns{})",
                 self.scenario,
                 self.runs,
                 self.steps,
                 self.worst_fair_spread,
                 self.worst_fair_bound,
+                if self.worst_over_bound == 0 {
+                    String::new()
+                } else {
+                    format!(
+                        ", {} ns PAST THE DERIVED BOUND on the recorded allowance",
+                        self.worst_over_bound,
+                    )
+                },
             )
         } else {
             format!(
@@ -74,6 +87,7 @@ pub fn seed_sweep(scenario: &Scenario, seeds: u64, keep_failures: usize) -> Swee
         failures: Vec::new(),
         worst_fair_spread: 0,
         worst_fair_bound: 0,
+        worst_over_bound: 0,
     };
     for seed in 0..seeds {
         let mut choices = if seed % 2 == 0 {
@@ -126,6 +140,7 @@ pub fn fuzz_sweep(scenario: &Scenario, budget: u64, keep_failures: usize) -> Swe
         failures: Vec::new(),
         worst_fair_spread: 0,
         worst_fair_bound: 0,
+        worst_over_bound: 0,
     };
     let mut generator = 0x9E3779B97F4A7C15u64;
     while result.steps < budget {

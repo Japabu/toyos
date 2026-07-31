@@ -249,8 +249,8 @@ fn note_rt_service(vm: &mut Vm<'_>) -> bool {
     occupied
 }
 
-/// I5: **equal shares receive equal service, to within the lag the policy
-/// allows** (spec §9.1, §10.5).
+/// I5: **equal shares receive equal service, to within the granularity the
+/// policy chooses** (spec §9.1, §10.5).
 ///
 /// Fairness is a statement about service, so this measures service — the
 /// nanoseconds the virtual CPUs actually delivered to each process — and not
@@ -260,66 +260,71 @@ fn note_rt_service(vm: &mut Vm<'_>) -> bool {
 /// no matter what the scheduler did with the CPU.
 ///
 /// **The window.** Fairness owes nothing across a block: a process with no
-/// runnable thread is not being starved, it is waiting. Nor does it owe anything
-/// on an unsaturated machine: a CPU with nothing on it is denying nobody, and a
-/// process with more threads legitimately takes more of it. So service is
-/// compared over a *contention window* — a maximal interval during which the
-/// same set of fair-band processes was continuously runnable, every CPU had a
-/// task loaded, and the RT band was empty — and the comparison restarts the
-/// moment any of the three stops holding. In a workload where everyone blocks the
-/// windows are short and this says little; in `fairness_storm`, where nothing
-/// blocks and no RT exists, the window is the whole run and it says everything.
+/// runnable thread is not being starved, it is waiting. Nor on an unsaturated
+/// machine: a CPU with nothing on it is denying nobody. Nor to a process with
+/// fewer runnable threads than its even share of the CPUs, which is limited by
+/// its own thread count and not by the scheduler. Nor while the RT band is
+/// occupied, because the RT band exists to be unfair and invariant I4 is what
+/// bounds it. So service is compared over a *contention window* — a maximal
+/// interval during which the same set of fair-band processes was continuously
+/// runnable, every CPU had a task loaded, every member could absorb its share,
+/// and the RT band was empty — and the comparison restarts the moment any of
+/// those stops holding. In a workload where everyone blocks the windows are
+/// short and this says little; in `fairness_storm`, where nothing blocks and no
+/// RT exists, the window is the whole run and it says everything.
 ///
-/// **The bound**, every term of which is a granularity the policy chooses:
+/// **The bound is derived, and it does not move.** Two terms, both of them a
+/// granularity the policy picked:
 ///
 /// * `lag_spread` — the stored lags of the contending shares. A share that
 ///   parked 50 ms behind the frontier is *entitled* to that much catch-up
-///   (§9.1), so the same number is both the clamp and the service difference the
-///   policy intends. Asserted against `MAX_VRUNTIME_LAG_NS` here rather than
-///   assumed, because the bound is only worth what the clamp is worth.
-/// * `(runnable threads + 1) × (QUANTUM + max KernelSection + 2 × RUN_CHUNK) ×
-///   cpus` — the fair band is keyed by the vruntime a task had *when it was
-///   inserted* (spec §9.2), so a process with T threads carries up to T−1 of its
-///   own dispatches' worth of stale keys and can be picked that many times over
+///   (§9.1), so the clamp and the intended service difference are the same
+///   number. Asserted against `MAX_VRUNTIME_LAG_NS` here rather than assumed,
+///   because the bound is only worth what the clamp is worth.
+/// * `(runnable threads + 1) × (QUANTUM + max KernelSection + 2 × RUN_CHUNK)` —
+///   the fair band is keyed by the vruntime a task had *when it was inserted*
+///   (spec §9.2), so a process with T threads carries up to T−1 of its own
+///   dispatches' worth of stale keys and can be picked that many times over
 ///   before its slowest thread comes up. Both sides carry it and the leader is
-///   spending one more quantum on top, hence `ΣT_i + 1`. The `cpus` factor is
-///   there because a process's vruntime advances at its *aggregate* rate — every
-///   thread of it that is running charges the same pot — so one dispatch's worth
-///   of staleness is worth up to `cpus` quanta of wall-clock service. The
-///   kernel-section and chunk terms are I9's, for I9's reason: a preempt-off
-///   section overruns the quantum it started in, and the model observes the
-///   expiry one chunk late.
+///   spending one more quantum on top, hence `ΣT_i + 1`. The kernel-section and
+///   chunk terms are I9's, for I9's reason: a preempt-off section overruns the
+///   quantum it started in, and the model observes the expiry one chunk late.
 ///
-///   **Calibrated, not derived.** The argument gives the shape; the constants
-///   come from measurement, because the first two forms tried were both brushed
-///   by the shipped scheduler on a 300-seed sweep (`Σ(T_i−1)+1` reached 74 ms
-///   against 72; `ΣT_i+1` without the `cpus` factor reached 109 ms against 108).
-///   Worst spread against this bound over 400 seeds of `fairness_storm` at
-///   1/2/3/4/6/8/12 CPUs: 30/60, 84/216, 161/468, 212/816, 372/1800, 532/3168,
-///   634/7056 ms. The margin *widens* with the machine, and it does so because
-///   the measured spread itself widens — the fair split is 17% off equal at one
-///   CPU and 37% off at eight. That is the shipped design's own behaviour, not
-///   an artefact: spec §11 Stage 9 replaces the global frontier for this reason,
-///   and its gate is a comparison against these numbers, which is why the sweep
-///   reports the spread as well as asserting the bound.
+/// Earlier drafts of this check widened that expression twice, because the
+/// shipped scheduler brushed it — 74 ms against 72, then 109 ms against 108.
+/// Widening was the wrong move and the near-misses were the signal: a bound
+/// calibrated to what the code already does cannot detect the code getting
+/// worse. The bound is therefore back to the derived form, and where the shipped
+/// scheduler does not meet it, that is recorded as a gap rather than absorbed
+/// (`scenarios::FAIRNESS_SAMPLE`, which has the measurements and names the four
+/// widths of ten where the standard is currently crossed).
 ///
-/// **RT is out of scope, and has to be.** The RT band exists to be unfair, is
-/// drained before the fair band, and does not advance the frontier
-/// (`RunQueue::pop_next` reports vruntime 0 for it). Invariant I4 is what bounds
-/// it. So a process leaves this check for good the moment one of its tasks enters
-/// that band, *and* the window closes for as long as the band is occupied at all
-/// — an RT daemon eating one CPU of two decides how much is left for the fair
-/// band and where, which is a placement outcome and not a fairness one.
+/// **What reds a run** is `max(derived bound, recorded allowance)`, so a
+/// scenario with a sample is gated on not regressing against it. The allowance
+/// never hides the standard: `Vm::fair_over_bound` records every crossing of the
+/// derived bound whatever the allowance permits, and the sweep prints it.
 fn check_fairness(vm: &mut Vm<'_>, rt_present: bool) {
     let runnable = runnable_per_process(vm);
     let saturated = (0..vm.scenario.cpus).all(|cpu| vm.cpus[cpu].running().is_some());
-    let members: Vec<usize> = if rt_present || !saturated {
+    let mut members: Vec<usize> = if rt_present || !saturated {
         Vec::new()
     } else {
         (0..vm.procs.len())
             .filter(|&p| runnable[p] > 0 && !vm.procs[p].rt_service)
             .collect()
     };
+    // A process cannot run on more CPUs than it has runnable threads, so one
+    // with fewer than its even share of the machine is limited by its own thread
+    // count and not by the scheduler. Measuring it would be measuring the
+    // workload: at 16 CPUs it is what the late windows of `fairness_storm` are,
+    // once enough threads have exited that the wide process is the only one that
+    // can still fill the machine.
+    if members
+        .iter()
+        .any(|&p| runnable[p] as usize * members.len() < vm.scenario.cpus)
+    {
+        members.clear();
+    }
 
     if members != vm.fair_epoch.members {
         vm.fair_epoch = FairEpoch {
@@ -364,8 +369,7 @@ fn check_fairness(vm: &mut Vm<'_>, rt_present: bool) {
 
     let bound = vm.fair_epoch.lag_spread
         + (vm.fair_epoch.threads as u64 + 1)
-            * (QUANTUM_NS + vm.max_kernel_section() + 2 * RUN_CHUNK_NS)
-            * vm.scenario.cpus as u64;
+            * (QUANTUM_NS + vm.max_kernel_section() + 2 * RUN_CHUNK_NS);
     let served: Vec<u64> = members
         .iter()
         .map(|&p| vm.service_ns[p] - vm.fair_epoch.base[p])
@@ -380,6 +384,14 @@ fn check_fairness(vm: &mut Vm<'_>, rt_present: bool) {
         vm.fair_bound = bound;
     }
     if spread > bound {
+        vm.fair_over_bound = vm.fair_over_bound.max(spread);
+    }
+    // The ceiling is the bound, except where a recorded sample says the shipped
+    // scheduler does not meet it (`scenarios::FAIRNESS_SAMPLE`). There the run is
+    // gated on not getting *worse*, and the gap between the two is reported by
+    // `Outcome::fair_over_bound` on every run rather than left in a document.
+    let ceiling = bound.max(vm.scenario.fair_allowance_ns);
+    if spread > ceiling {
         let detail: Vec<String> = members
             .iter()
             .zip(&served)
@@ -387,7 +399,8 @@ fn check_fairness(vm: &mut Vm<'_>, rt_present: bool) {
             .collect();
         vm.violate(format!(
             "I5: {spread} ns of service separates equal shares over one contention \
-             window (bound {bound} ns): {}",
+             window (bound {bound} ns, recorded allowance {} ns): {}",
+            vm.scenario.fair_allowance_ns,
             detail.join(" "),
         ));
     }

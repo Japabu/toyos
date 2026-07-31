@@ -434,6 +434,11 @@ fn the_audio_pipeline_holds_on_one_cpu() {
 /// The widths are the two `all()` carries. Spec §11 Stage 9 wants 1–128, which
 /// runs from the CLI as `measure fairness_storm:<cpus>`; the sweep here is what
 /// `cargo test` can afford.
+///
+/// Both widths meet the *derived* bound today — 30/60 ms and 102/108 ms at
+/// 10 000 seeds — so `worst_over_bound` must be zero here, and that is asserted:
+/// if the recorded allowance ever starts carrying these two, the suite says so
+/// rather than passing quietly on it.
 #[test]
 fn the_fairness_storm_is_measured_and_holds() {
     for cpus in [1, 2] {
@@ -446,11 +451,21 @@ fn the_fairness_storm_is_measured_and_holds() {
              verdict about nothing: {}",
             result.report(),
         );
+        assert_eq!(
+            result.worst_over_bound, 0,
+            "at {cpus} cpu(s) the shipped scheduler has started crossing the \
+             *derived* fairness bound and is passing on the recorded allowance \
+             alone. That is a regression against the standard even though the \
+             gate is green — see scenarios::FAIRNESS_SAMPLE: {}",
+            result.report(),
+        );
         // And the measurement has to be a *comparison*, not an accident of a
-        // bound so wide nothing could reach it.
+        // bound so wide nothing could reach it. Both widths sit within a factor
+        // of two of the derived bound today, so a factor of four here is slack
+        // and not a target.
         assert!(
-            result.worst_fair_spread * 8 > result.worst_fair_bound,
-            "at {cpus} cpu(s) the worst spread is more than 8x under its own \
+            result.worst_fair_spread * 4 > result.worst_fair_bound,
+            "at {cpus} cpu(s) the worst spread is more than 4x under its own \
              bound; the bound has stopped constraining anything: {}",
             result.report(),
         );

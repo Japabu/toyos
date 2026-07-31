@@ -49,6 +49,9 @@ pub struct Outcome {
     /// frontier against the global one and "both passed" is not a comparison.
     pub fair_spread: u64,
     pub fair_bound: u64,
+    /// Worst spread past the *derived* bound, even where the recorded sample
+    /// allowed the run to pass. Zero means the run met the standard.
+    pub fair_over_bound: u64,
 }
 
 impl Outcome {
@@ -175,6 +178,7 @@ fn outcome_of(scenario: &'static str, vm: &Vm<'_>, choices: &ChoiceStream) -> Ou
         killed_at_park: vm.killed_at_park,
         fair_spread: vm.fair_spread,
         fair_bound: vm.fair_bound,
+        fair_over_bound: vm.fair_over_bound,
     }
 }
 

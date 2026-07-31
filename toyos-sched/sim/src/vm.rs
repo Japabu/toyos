@@ -251,6 +251,10 @@ pub struct Vm<'q> {
     /// can compare a per-CPU frontier against the global one by a number.
     pub fair_spread: u64,
     pub fair_bound: u64,
+    /// Worst spread that exceeded the *derived* bound, whether or not the
+    /// recorded allowance let the run pass. This is the gap between the standard
+    /// and the shipped scheduler, surfaced by the instrument on every run.
+    pub fair_over_bound: u64,
 }
 
 /// One contention window: a maximal interval over which the same set of
@@ -335,6 +339,7 @@ impl<'q> Vm<'q> {
             fair_epoch: FairEpoch::default(),
             fair_spread: 0,
             fair_bound: 0,
+            fair_over_bound: 0,
             next_irq,
             next_key: 1,
             next_spawn_cpu: 0,
