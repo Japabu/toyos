@@ -165,6 +165,7 @@ Read the spec before touching the subsystem it covers.
 - `specs/capability-handles-spec.md` — refcounted kernel objects behind typed per-process handles (Fd→Handle); subsumes the SharedToken/io_uring/Fd debt in known issues.
 - `specs/iouring-blocking-spec.md` — io_uring as the only blocking mechanism; one wait-free completion primitive, one park/recheck site.
 - `specs/metal-boot-plan.md` — first boot on real hardware (ThinkPad T14 Gen 2), integrated keyboard + touchpad. Staged M0–M5; starts after the soundd idle redesign lands; flash when the metal-sim profile is green. Also the only honest instrument for the 2× performance bar.
+- `specs/net-gate-plan.md` — gate N, the network analogue of gate A: pcap as device-side ground truth, slirp + harness-as-peer configs, adversarial frames and deterministic impairment. Scheduled after the first bare-metal attempt.
 
 ## Known issues
 
