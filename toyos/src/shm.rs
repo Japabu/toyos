@@ -18,13 +18,13 @@ unsafe impl Sync for SharedMemory {}
 impl SharedMemory {
     pub fn allocate(size: usize) -> Self {
         let token = syscall::alloc_shared(size);
-        let ptr = unsafe { syscall::map_shared(token) }.expect("map_shared failed");
+        let ptr = unsafe { syscall::try_map_shared(token) }.expect("map_shared failed");
         assert!(!ptr.is_null(), "map_shared returned null");
         Self { token, ptr, size }
     }
 
     pub fn map(token: u32, size: usize) -> Self {
-        let ptr = unsafe { syscall::map_shared(token) }.expect("map_shared failed");
+        let ptr = unsafe { syscall::try_map_shared(token) }.expect("map_shared failed");
         assert!(!ptr.is_null(), "map_shared returned null");
         Self { token, ptr, size }
     }

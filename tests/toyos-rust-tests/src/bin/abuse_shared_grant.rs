@@ -51,7 +51,7 @@ fn middleman() {
 
     // The grant we were actually given still works, and this is what makes the
     // rest of the test non-vacuous: the region is real and holds the secret.
-    let ptr = unsafe { syscall::map_shared(token) }.expect("the owner granted us; this map must work");
+    let ptr = unsafe { syscall::try_map_shared(token) }.expect("the owner granted us; this map must work");
     let seen = unsafe { core::slice::from_raw_parts(ptr, SECRET.len()) };
     assert_eq!(seen, SECRET, "the owner's region did not contain the secret");
 
@@ -120,7 +120,7 @@ fn middleman() {
 
 fn owner(middleman_pid: u32) {
     let token = syscall::alloc_shared(REGION);
-    let ptr = unsafe { syscall::map_shared(token) }.expect("owner: map its own region");
+    let ptr = unsafe { syscall::try_map_shared(token) }.expect("owner: map its own region");
     unsafe { core::ptr::copy_nonoverlapping(SECRET.as_ptr(), ptr, SECRET.len()) };
 
     syscall::grant_shared(token, Pid(middleman_pid)).expect("owner: grant to the middleman");
@@ -135,7 +135,7 @@ fn owner(middleman_pid: u32) {
 fn attacker(token: u32) {
     let mut line = String::new();
     std::io::stdin().read_line(&mut line).expect("attacker: wait for go");
-    match unsafe { syscall::map_shared(token) } {
+    match unsafe { syscall::try_map_shared(token) } {
         Ok(ptr) => {
             let seen = unsafe { core::slice::from_raw_parts(ptr, SECRET.len()) };
             println!("read {}", String::from_utf8_lossy(seen));

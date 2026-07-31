@@ -51,7 +51,7 @@ impl Poller {
         let entries = handles.clamp(1, MAX_ENTRIES).next_power_of_two();
         let (ring_fd, shm_token) = syscall::io_uring_setup(entries)
             .expect("Poller::new: io_uring_setup failed");
-        let base = unsafe { syscall::map_shared(shm_token) }
+        let base = unsafe { syscall::try_map_shared(shm_token) }
             .expect("Poller::new: map_shared failed");
         let params = unsafe { &*(base as *const IoUringParams) };
         let sq_size = params.sq_ring_size;

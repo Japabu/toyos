@@ -44,7 +44,7 @@ fn main() {
     let mut tokens = Vec::new();
     for _ in 0..ROUNDS {
         let token = syscall::alloc_shared(REGION);
-        let ptr = unsafe { syscall::map_shared(token) }.expect("map own region");
+        let ptr = unsafe { syscall::try_map_shared(token) }.expect("map own region");
         unsafe { ptr.write_volatile(0xA5) };
         tokens.push(token);
     }
@@ -88,7 +88,7 @@ fn main() {
     out.read_line(&mut line).expect("donor token line");
     let token: u32 = line.trim().parse().expect("donor token");
 
-    let ptr = unsafe { syscall::map_shared(token) }
+    let ptr = unsafe { syscall::try_map_shared(token) }
         .expect("a region still granted to us was reclaimed out from under the grant");
     let seen = unsafe { core::slice::from_raw_parts(ptr, PAYLOAD.len()) };
     assert_eq!(seen, PAYLOAD, "the granted region no longer holds the donor's payload");
@@ -104,7 +104,7 @@ fn main() {
 
 fn donor(target: u32) {
     let token = syscall::alloc_shared(REGION);
-    let ptr = unsafe { syscall::map_shared(token) }.expect("donor: map own region");
+    let ptr = unsafe { syscall::try_map_shared(token) }.expect("donor: map own region");
     unsafe { core::ptr::copy_nonoverlapping(PAYLOAD.as_ptr(), ptr, PAYLOAD.len()) };
     syscall::grant_shared(token, Pid(target)).expect("donor: grant");
 

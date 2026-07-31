@@ -618,11 +618,28 @@ pub fn grant_shared(token: u32, target_pid: Pid) -> Result<(), SyscallError> {
 
 /// Map a shared memory region into this process's address space.
 ///
-/// Fallible: a token the caller was never granted is `PermissionDenied`.
+/// Panics if the kernel refuses. Kept infallible because the `mio` fork calls
+/// it — an ecosystem fork is a consumer of this crate exactly as the monorepo
+/// is, and a signature change here breaks a build nothing in the tree greps.
+/// [`try_map_shared`] is the same call with the answer kept.
 ///
 /// # Safety
 /// Caller must manage the returned pointer.
-pub unsafe fn map_shared(token: u32) -> Result<*mut u8, SyscallError> {
+pub unsafe fn map_shared(token: u32) -> *mut u8 {
+    match unsafe { try_map_shared(token) } {
+        Ok(ptr) => ptr,
+        Err(e) => panic!("map_shared failed: {e:?}"),
+    }
+}
+
+/// Map a shared memory region, reporting a refusal instead of panicking.
+///
+/// A token the caller was never granted is `PermissionDenied`, which is a
+/// thing callers and tests need to be able to observe rather than die on.
+///
+/// # Safety
+/// Caller must manage the returned pointer.
+pub unsafe fn try_map_shared(token: u32) -> Result<*mut u8, SyscallError> {
     check(syscall(SYS_MAP_SHARED, token as u64, 0, 0, 0))
         .map(|addr| core::ptr::with_exposed_provenance_mut(addr as usize))
 }
