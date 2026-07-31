@@ -8,7 +8,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use common::qemu::{self, BootOptions, QemuInstance, TestResult};
-use common::{audio, compile, screen, stats};
+use common::{audio, compile, screen, stats, storage};
 
 struct TestDef {
     name: String,
@@ -68,6 +68,7 @@ const MACHINE_TESTS: &[&str] = &[
     "input_merge",
     "metal_sim_compositor",
     "metal_sim_input",
+    "foreign_disk_untouched",
     "xhci_many_devices",
     "nvme_large_device",
     "i8042_keyboard",
@@ -1407,6 +1408,9 @@ fn run_machine_test(
     rust_bins: &[(String, Vec<u8>)],
 ) -> Result<(), String> {
     match name {
+        // Body in `tests/common/storage.rs`, so the hunk in this shared file
+        // stays one line.
+        "foreign_disk_untouched" => storage::foreign_disk_untouched(test_config, c_bins, rust_bins),
         "metal_sim_compositor" => {
             // M1's permanent config: the whole boot with no virtio device
             // anywhere. What it certifies is which processes survive the
