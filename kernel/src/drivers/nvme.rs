@@ -207,6 +207,23 @@ impl NvmeController {
         let ns = unsafe { &*(identify_ptr as *const IdentifyNamespace) };
         let fmt_idx = (ns.flbas & 0x0F) as usize;
         let lba_ds = ((ns.lba_formats[fmt_idx] >> 16) & 0xFF) as u32;
+        // `lba_ds` is an 8-bit device-reported shift, and it reaches both a
+        // shift and a divisor: `1 << lba_ds` overflows above 31, and above 12
+        // `4096 / sector_size` is zero, which `NvmeBlockDevice::new` then
+        // divides `nsze` by. Measured on QEMU 11.0.2 with
+        // `nvme-ns,logical_block_size=8192`: `#DE` at `NvmeBlockDevice::new`,
+        // before storage is up, on a machine with nothing to report it on.
+        //
+        // 512..4096 is not a policy number, it is this driver: every path
+        // above the sector layer is written in 4096-byte blocks and needs the
+        // sector size to divide one. A namespace outside it is unimplemented,
+        // and says so with the value it reported.
+        assert!(
+            (9..=12).contains(&lba_ds),
+            "NVMe: namespace reports 2^{lba_ds}-byte sectors (flbas={:#x}, format {fmt_idx}); \
+             this driver serves 4096-byte blocks and needs 512..=4096",
+            ns.flbas,
+        );
         self.sector_size = 1 << lba_ds;
         self.ns_size = ns.nsze;
         log!("NVMe: NS1 size={} sectors, sector_size={}", ns.nsze, self.sector_size);
