@@ -118,6 +118,15 @@ static PAINTING: AtomicBool = AtomicBool::new(false);
 static SNAPSHOT: SnapshotCell = SnapshotCell(UnsafeCell::new([0; SNAPSHOT_CAP]));
 static SNAPSHOT_LEN: AtomicUsize = AtomicUsize::new(0);
 
+/// Set the first time a process claims `DEVICE_FRAMEBUFFER`. Boot checkpoints
+/// stop repainting once something owns the screen; a *fatal* panic ignores
+/// this entirely and takes the screen back unconditionally.
+static SCREEN_OWNED_BY_USERLAND: AtomicBool = AtomicBool::new(false);
+
+pub fn screen_claimed_by_userland() {
+    SCREEN_OWNED_BY_USERLAND.store(true, Ordering::Relaxed);
+}
+
 /// The descriptor [`arm`] validated, held so [`remap`] and [`rearm`] can
 /// re-publish it without re-deriving anything. A null pointer here means
 /// there is no usable GOP framebuffer at all, and no later call can invent
@@ -302,10 +311,31 @@ pub fn render() {
     if PAINTING.swap(true, Ordering::SeqCst) {
         return;
     }
-    paint();
+    paint(Fill::Fatal);
 }
 
-fn paint() {
+/// Repaint at a boot phase boundary, so a machine that wedges later still
+/// shows how far it got. Converts "black screen" into "NVMe came up, xHCI
+/// did not" for free, which is the only coverage there is for a hang that
+/// never panics.
+pub fn boot_checkpoint() {
+    if SCREEN_OWNED_BY_USERLAND.load(Ordering::Relaxed) || PAINTING.load(Ordering::Relaxed) {
+        return;
+    }
+    SNAPSHOT_LEN.store(0, Ordering::Relaxed);
+    paint(Fill::Boot);
+}
+
+/// The fill colour carries "halted" versus "still booting" at zero cost, and
+/// the fill itself is the proof the console ran *this* boot rather than a
+/// stale frame surviving.
+#[derive(Clone, Copy)]
+enum Fill {
+    Fatal,
+    Boot,
+}
+
+fn paint(fill: Fill) {
     let Some(fb) = snapshot() else { return };
     if !mapped(&fb) {
         return;
@@ -319,7 +349,13 @@ fn paint() {
     let text = unsafe { &*SNAPSHOT.0.get() };
     let len = SNAPSHOT_LEN.load(Ordering::Relaxed).min(SNAPSHOT_CAP);
 
-    fill_screen(&fb, rgb(&fb, 0x60, 0x00, 0x00));
+    fill_screen(
+        &fb,
+        match fill {
+            Fill::Fatal => rgb(&fb, 0x60, 0x00, 0x00),
+            Fill::Boot => 0,
+        },
+    );
 
     let cols = (fb.width as usize / GLYPH_W).min(MAX_COLS);
     let rows = (fb.height as usize / GLYPH_H).min(MAX_ROWS);
@@ -430,12 +466,28 @@ fn put_pixel(fb: &Fb, x: usize, y: usize, color: u32) {
     unsafe { core::ptr::write_volatile(fb.ptr.add(idx as usize) as *mut u32, color) };
 }
 
-/// The fill is the proof the console ran *this* boot rather than a stale
-/// frame surviving, and it erases whatever the compositor left behind.
+/// Base pointer for a row, given that `len` pixels will be written from it.
+/// `None` means the row does not fit the published byte count, which for a
+/// left-to-right top-to-bottom walk means neither does any later row.
+fn row_base(fb: &Fb, y: usize, len: usize) -> Option<*mut u32> {
+    let start = (y as u64).checked_mul(fb.stride_px as u64)?.checked_mul(4)?;
+    let end = start.checked_add((len as u64).checked_mul(4)?)?;
+    (end <= fb.bytes).then(|| unsafe { fb.ptr.add(start as usize) as *mut u32 })
+}
+
+/// Erases whatever the compositor left behind, so nothing on screen is
+/// ambiguous about which boot it came from.
+///
+/// Proves the clamp once per row rather than once per pixel: a boot
+/// checkpoint repaints six times and a 2048x2048 panel is 4.2M pixels, so
+/// per-pixel checked arithmetic here is the difference between a repaint
+/// nobody notices and one that doubles boot time.
 fn fill_screen(fb: &Fb, color: u32) {
+    let width = fb.width as usize;
     for y in 0..fb.height as usize {
-        for x in 0..fb.width as usize {
-            put_pixel(fb, x, y, color);
+        let Some(row) = row_base(fb, y, width) else { return };
+        for x in 0..width {
+            unsafe { core::ptr::write_volatile(row.add(x), color) };
         }
     }
 }

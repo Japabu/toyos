@@ -284,7 +284,7 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     trace::enable();
     apic::init_timer();
 
-    log!("Boot: CPU ready ({}ms)", clock::nanos_since_boot() / 1_000_000);
+    boot_phase!("CPU ready", 0);
 
     // Phase 3: Storage
     let t_storage = clock::nanos_since_boot();
@@ -301,7 +301,7 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
         None => bcachefs_adapter::format(),
     };
 
-    log!("Boot: storage ready ({}ms)", (clock::nanos_since_boot() - t_storage) / 1_000_000);
+    boot_phase!("storage ready", t_storage);
 
     // Phase 4: Peripherals
     let t_periph = clock::nanos_since_boot();
@@ -310,7 +310,7 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     xhci::set_global(xhci_ctrl);
     acpi::init_power(kernel_args.rsdp_addr);
 
-    log!("Boot: peripherals ready ({}ms)", (clock::nanos_since_boot() - t_periph) / 1_000_000);
+    boot_phase!("peripherals ready", t_periph);
 
     // Phase 5: Kernel subsystems
     let t_subsys = clock::nanos_since_boot();
@@ -337,7 +337,7 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     vfs::lock().create_dir("/home/root");
     vfs::lock().create_dir("/home/root/.config");
 
-    log!("Boot: subsystems ready ({}ms)", (clock::nanos_since_boot() - t_subsys) / 1_000_000);
+    boot_phase!("subsystems ready", t_subsys);
 
     // Phase 6: Devices
     let t_devices = clock::nanos_since_boot();
@@ -370,7 +370,7 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
         log!("GPU: none found, running headless");
     };
 
-    log!("Boot: devices ready ({}ms)", (clock::nanos_since_boot() - t_devices) / 1_000_000);
+    boot_phase!("devices ready", t_devices);
 
     // Phase 7: Userland
     assert!(!init_programs.is_empty(), "bootloader must provide init_programs");
@@ -381,7 +381,7 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
         log!("spawned {} pid={pid}", args[0]);
     }
 
-    log!("Boot: complete ({}ms total)", clock::nanos_since_boot() / 1_000_000);
+    boot_phase!("complete", 0);
     log!("Keyboard layout: {}", crate::keyboard::layout_name());
 
     smp::set_ready();

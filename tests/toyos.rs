@@ -34,7 +34,8 @@ const AUDIO_SMP: &[u32] = &[1, 8];
 // the guest they test is halted by the time they assert. `screen_decoder`
 // needs no guest at all; it proves the decoder against a bitmap it rendered
 // itself, before anything points it at a real screen.
-const SCREEN_TESTS: &[&str] = &["screen_decoder", "screen_early_panic"];
+const SCREEN_TESTS: &[&str] =
+    &["screen_decoder", "screen_early_panic", "screen_boot_checkpoint"];
 
 // C tests that can't compile yet (missing toyos-cc features or unsupported platform APIs).
 // Tests that compile successfully are discovered automatically — only list failures here.
@@ -930,6 +931,29 @@ fn run_screen_test(
             let text = qemu.screendump().text();
             print_screen(name, &text);
             for want in ["!!! EARLY PANIC !!!", "test-early-panic: on-screen console check"] {
+                if !text.contains(want) {
+                    return Err(format!("{want:?} not on screen\ndecoded screen:\n{text}"));
+                }
+            }
+            Ok(())
+        }
+        "screen_boot_checkpoint" => {
+            // Nothing in the test config claims the framebuffer, so the last
+            // checkpoint is still on screen once userland is up: exactly the
+            // state a machine that wedges after "devices ready" would leave.
+            let mut qemu = QemuInstance::boot_with_options(
+                test_config,
+                c_bins,
+                rust_bins,
+                BootOptions {
+                    display: qemu::Display::Gop,
+                    qmp: true,
+                    ..Default::default()
+                },
+            );
+            let text = qemu.screendump().text();
+            print_screen(name, &text);
+            for want in ["Boot: devices ready", "Boot: complete"] {
                 if !text.contains(want) {
                     return Err(format!("{want:?} not on screen\ndecoded screen:\n{text}"));
                 }

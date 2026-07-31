@@ -38,3 +38,27 @@ macro_rules! log {
         let _ = writeln!(__w, $($arg)*);
     }};
 }
+
+/// Announce a boot phase boundary: log how long it took, and repaint the
+/// on-screen console so the last completed phase stays visible.
+///
+/// The two belong together. A machine that wedges without panicking calls
+/// nothing, so the only thing that can distinguish "hung in xHCI" from "black
+/// screen, no idea" is a checkpoint painted before it hung — and a checkpoint
+/// nobody can see is not a checkpoint. Mirroring `log!` itself was rejected:
+/// that needs a screen path callable from IRQ context under arbitrary kernel
+/// locks, with a cursor, a scroll, and a lock of its own that the panic
+/// renderer would then have to take.
+///
+/// `$since` is the phase's start timestamp; pass 0 to measure from boot.
+#[macro_export]
+macro_rules! boot_phase {
+    ($name:literal, $since:expr) => {{
+        $crate::log!(
+            "Boot: {} ({}ms)",
+            $name,
+            ($crate::clock::nanos_since_boot() - $since) / 1_000_000
+        );
+        $crate::drivers::panic_console::boot_checkpoint();
+    }};
+}

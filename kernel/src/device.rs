@@ -56,6 +56,7 @@ pub fn try_claim(device_type: u64, pid: Pid) -> Option<Descriptor> {
                 *owner = None;
                 return None;
             }
+            crate::drivers::panic_console::screen_claimed_by_userland();
             Some(Descriptor::Framebuffer(info))
         }
         DEVICE_NIC => {
