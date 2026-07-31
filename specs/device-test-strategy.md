@@ -48,9 +48,11 @@ The crowded-USB config is built: `Profile::MetalUsb` is metal-sim with six
 devices on the xHCI, two of them keyboards, and it cost two boots, one extra
 kernel build and no new instrument. The extra build is the shortage config's:
 a distinct `kernel_features` set is a distinct cargo fingerprint, so budget one
-rebuild per feature-carrying config, not one boot. It also fixed the shape of the assertion — the driver logs the DMA
-offset of each device's interrupt ring, so "these two devices are independent"
-is a text assertion rather than a hope. One caveat it recorded: a *shortage*
+rebuild per feature-carrying config, not one boot. It also fixed the shape of
+the assertion — the driver logs the DMA offset of each device's interrupt ring
+and the block count it derived, so "these two devices are independent" and "this
+number came from HCSPARAMS" are both text assertions rather than hopes. One
+caveat it recorded: a *shortage*
 scenario is not always host-stageable. QEMU's `nec-usb-xhci,slots=N` does not
 reach HCSPARAMS1 and its Enable Slot ignores the MaxSlotsEn the driver writes,
 so the exhaustion path needs a kernel feature (`xhci-one-slot`) as its
