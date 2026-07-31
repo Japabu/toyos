@@ -1,6 +1,7 @@
 use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
+use hashbrown::HashMap;
 
 use crate::block::{BlockDevice, DeviceId};
 use crate::sync::Lock;
@@ -13,9 +14,11 @@ static BLOCK_DEV: Lock<Option<Box<dyn BlockDevice>>> = Lock::new(None);
 
 /// Initialize the page cache, taking ownership of the block device.
 pub fn init(dev: Box<dyn BlockDevice>) {
-    let block_count = dev.block_count() as usize;
-    let device_id = dev.device_id();
-    *BLOCK_CACHE.lock() = Some(PageCache::new(block_count, device_id));
+    let block_count = dev.block_count();
+    let cache = PageCache::new(block_count, dev.device_id());
+    log!("page cache: {} device blocks, index sized for {} cached blocks",
+        block_count, cache.index_capacity());
+    *BLOCK_CACHE.lock() = Some(cache);
     *BLOCK_DEV.lock() = Some(dev);
 }
 
@@ -78,15 +81,16 @@ pub fn raw_block_flush() {
     dev.flush();
 }
 
-const NOT_CACHED: u32 = u32::MAX;
-
 /// Pages per chunk. 256 pages = 1MB per chunk allocation.
 const PAGES_PER_CHUNK: usize = 256;
 const CHUNK_SIZE: usize = PAGES_PER_CHUNK * 4096;
 
 pub struct PageCache {
-    /// Maps block number → slot index. NOT_CACHED if not in cache.
-    block_to_slot: Vec<u32>,
+    /// Maps block number → slot index. Keyed by the cached set, never sized
+    /// by the device: one index entry per *device* block costs 4 bytes of
+    /// heap per KiB of disk, which a 244 GB laptop NVMe turns into a 238 MB
+    /// request the object allocator refuses outright.
+    block_to_slot: HashMap<u64, u32>,
     /// Maps slot index → block number (for sync).
     slot_to_block: Vec<u64>,
     /// Dirty flag per slot.
@@ -94,29 +98,40 @@ pub struct PageCache {
     /// Page data stored in fixed-size 1MB chunks to avoid giant reallocations.
     chunks: Vec<Box<[u8; CHUNK_SIZE]>>,
     next_slot: u32,
+    /// The device's size, which the filesystem needs. Nothing in here may
+    /// size an allocation by it.
+    block_count: u64,
     _device_id: DeviceId,
 }
 
 impl PageCache {
-    fn new(block_count: usize, device_id: DeviceId) -> Self {
+    fn new(block_count: u64, device_id: DeviceId) -> Self {
         Self {
-            block_to_slot: vec![NOT_CACHED; block_count],
+            block_to_slot: HashMap::new(),
             slot_to_block: Vec::with_capacity(4096),
             dirty: Vec::with_capacity(4096),
             chunks: Vec::with_capacity(64),
             next_slot: 0,
+            block_count,
             _device_id: device_id,
         }
     }
 
     pub fn block_count(&self) -> u64 {
-        self.block_to_slot.len() as u64
+        self.block_count
+    }
+
+    /// Blocks the index has room for. A value anywhere near `block_count`
+    /// means someone sized the index by the device again — which is what the
+    /// boot line reports and `nvme_large_device` asserts against.
+    pub fn index_capacity(&self) -> usize {
+        self.block_to_slot.capacity()
     }
 
     fn alloc_slot(&mut self, block: u64) -> u32 {
         let slot = self.next_slot;
         self.next_slot += 1;
-        self.block_to_slot[block as usize] = slot;
+        self.block_to_slot.insert(block, slot);
         self.slot_to_block.push(block);
         self.dirty.push(false);
         let chunk_idx = slot as usize / PAGES_PER_CHUNK;
@@ -146,9 +161,12 @@ impl PageCache {
         &mut self.chunks[chunk_idx][off..off + 4096]
     }
 
+    fn slot_of(&self, block: u64) -> Option<u32> {
+        self.block_to_slot.get(&block).copied()
+    }
+
     pub fn phys_addr(&self, block: u64) -> Option<DirectMap> {
-        let slot = self.block_to_slot[block as usize];
-        if slot == NOT_CACHED { return None; }
+        let slot = self.slot_of(block)?;
         Some(DirectMap::from_ptr(self.slot_data(slot).as_ptr() as *const u8))
     }
 
@@ -158,8 +176,7 @@ impl PageCache {
     }
 
     pub fn read(&mut self, dev: &mut dyn BlockDevice, block: u64) -> &[u8] {
-        let slot = self.block_to_slot[block as usize];
-        if slot != NOT_CACHED {
+        if let Some(slot) = self.slot_of(block) {
             return self.slot_data(slot);
         }
         let slot = self.alloc_slot(block);
@@ -172,7 +189,7 @@ impl PageCache {
     pub fn prefetch(&mut self, dev: &mut dyn BlockDevice, blocks: &[u64]) {
         let mut i = 0;
         while i < blocks.len() {
-            if self.block_to_slot[blocks[i] as usize] != NOT_CACHED {
+            if self.slot_of(blocks[i]).is_some() {
                 i += 1;
                 continue;
             }
@@ -183,7 +200,7 @@ impl PageCache {
             while i < blocks.len()
                 && i - run_start < 32
                 && blocks[i] == first_block + (i - run_start) as u64
-                && self.block_to_slot[blocks[i] as usize] == NOT_CACHED
+                && self.slot_of(blocks[i]).is_none()
             {
                 i += 1;
             }
@@ -216,8 +233,7 @@ impl PageCache {
     }
 
     pub fn write(&mut self, dev: &mut dyn BlockDevice, block: u64) -> &mut [u8] {
-        let slot = self.block_to_slot[block as usize];
-        if slot != NOT_CACHED {
+        if let Some(slot) = self.slot_of(block) {
             self.dirty[slot as usize] = true;
             return self.slot_data_mut(slot);
         }
@@ -229,8 +245,7 @@ impl PageCache {
     }
 
     pub fn write_new(&mut self, _dev: &mut dyn BlockDevice, block: u64) -> &mut [u8] {
-        let slot = self.block_to_slot[block as usize];
-        if slot != NOT_CACHED {
+        if let Some(slot) = self.slot_of(block) {
             self.dirty[slot as usize] = true;
             let page = self.slot_data_mut(slot);
             page.fill(0);
@@ -241,46 +256,46 @@ impl PageCache {
         self.slot_data_mut(slot)
     }
 
+    /// Write every dirty slot back, coalescing runs of consecutive blocks.
+    ///
+    /// The run walks slots rather than block numbers, so the write-back needs
+    /// no index lookups at all — `slot_to_block` is the direction this pass
+    /// wants, and the index is the wrong way round for it.
     pub fn sync(&mut self, dev: &mut dyn BlockDevice) {
-        let mut dirty_blocks: Vec<u64> = (0..self.next_slot)
+        let mut pending: Vec<u32> = (0..self.next_slot)
             .filter(|&s| self.dirty[s as usize])
-            .map(|s| self.slot_to_block[s as usize])
             .collect();
 
-        if dirty_blocks.is_empty() {
+        if pending.is_empty() {
             return;
         }
-        dirty_blocks.sort_unstable();
+        pending.sort_unstable_by_key(|&s| self.slot_to_block[s as usize]);
 
         let mut buf = vec![0u8; 32 * 4096];
         let mut i = 0;
-        while i < dirty_blocks.len() {
-            let start = dirty_blocks[i];
-            let mut count = 1u32;
+        while i < pending.len() {
+            let start = self.slot_to_block[pending[i] as usize];
+            let mut count = 1usize;
 
-            while i + (count as usize) < dirty_blocks.len()
-                && dirty_blocks[i + (count as usize)] == start + count as u64
+            while i + count < pending.len()
+                && self.slot_to_block[pending[i + count] as usize] == start + count as u64
                 && count < 32
             {
                 count += 1;
             }
 
             for j in 0..count {
-                let block = start + j as u64;
-                let slot = self.block_to_slot[block as usize];
-                let page = self.slot_data(slot);
-                buf[j as usize * 4096..(j as usize + 1) * 4096].copy_from_slice(page);
+                let page = self.slot_data(pending[i + j]);
+                buf[j * 4096..(j + 1) * 4096].copy_from_slice(page);
             }
 
-            dev.write_blocks(start, count, &buf[..count as usize * 4096]);
+            dev.write_blocks(start, count as u32, &buf[..count * 4096]);
 
             for j in 0..count {
-                let block = start + j as u64;
-                let slot = self.block_to_slot[block as usize];
-                self.dirty[slot as usize] = false;
+                self.dirty[pending[i + j] as usize] = false;
             }
 
-            i += count as usize;
+            i += count;
         }
 
         dev.flush();

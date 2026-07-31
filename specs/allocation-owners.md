@@ -100,7 +100,7 @@ this size?*
 | `IrqTimestampSlots` | Sched | Static | Static | Never | ok |
 | `SchedShareState` | Sched | Heap | PerProcess | Drop | ok |
 | `TraceEventRings` | Sched | Static | Static | Never | ok |
-| `BlockCacheIndex` | Vfs | Heap | Bounded | Never | ok |
+| `BlockCacheIndex` | Vfs | Heap | Bounded | Never | ok — by the *cached set*. This row read `Bounded` while it meant O(device size), which is the schema gap above with a body count |
 | `FileBackingExtents` | Vfs | Heap | PerObject | Drop | ok |
 | `MountTable` | Vfs | Heap | Static | Never | ok |
 
@@ -116,7 +116,7 @@ this size?*
 
 - SysinfoSnapshot — kernel/src/arch/syscall.rs:1055, `Vec<(Tid, &ProcessEntry, &ThreadEntry)>` collected from the whole process table and then sorted, ~24 B per live thread. No owner. Bound: one entry per thread; thread count is uncapped (spawn_thread at kernel/src/process.rs:658-670 refuses only during teardown), so ~87,000 threads makes this a >2 MiB single allocation. Any process may call SYS_SYSINFO. Release: dropped at syscall exit. Also note kernel/src/arch/syscall.rs:1041 walks the same flat_map a second time just to count.
 
-- BlockCacheSyncScratch — kernel/src/page_cache.rs:248 `dirty_blocks: Vec<u64>` (one per dirty slot), kernel/src/page_cache.rs:255 `vec![0u8; 32*4096]` (fixed 128 KiB), kernel/src/page_cache.rs:207 `vec![0u8; run_len*4096]` (run_len capped at 32 by the loop at :180-186, so 128 KiB). BlockCacheIndex and BlockCachePage cover the resident cache but not these transients. dirty_blocks is the one that matters: it is bounded by next_slot <= block_count, and block_count = device_size/4096 = 262,144 at today's 1 GiB image (src/build.rs:386) = exactly 2 MiB — sitting on the assert boundary at kernel/src/mm/alloc.rs:12, and scaling linearly if the image ever grows.
+- BlockCacheSyncScratch — `sync`'s `pending: Vec<u32>` (one dirty slot per entry), `vec![0u8; 32*4096]` (fixed 128 KiB) and `prefetch`'s `vec![0u8; run_len*4096]` (run_len capped at 32, so 128 KiB). BlockCacheIndex and BlockCachePage cover the resident cache but not these transients. `pending` is the one that matters: it is bounded by the resident slot count, which nothing evicts — so it inherits BlockCachePage's unbounded growth and crosses the 2 MiB assert at kernel/src/mm/alloc.rs:12 at ~524,000 resident blocks. Not bounded by the device: at 4 bytes per *resident* slot it takes 2 GiB of cache to get there, where the u64-per-*device*-block version sat exactly on the assert at a 1 GiB image.
 
 - AcpiApicIdList — kernel/src/drivers/acpi.rs:246 `let mut apic_ids = Vec::new()`, pushed at :261 and :268, returned inside MadtInfo (:8-10, :278). The drivers slice flagged this as unclaimed and asked for it to be assigned; no owner took it. Bound: number of enabled CPUs in the firmware MADT — unchecked but not attacker-reachable. Release: Drop, when kernel_main's frame ends after smp::boot_aps (kernel/src/main.rs:236, :284). Trivial, but the inventory is not closed without it.
 
