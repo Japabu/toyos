@@ -10,11 +10,11 @@ The name has no meaning. This is not a hobby project. The quality bar is the sam
 - **Zero technical debt.** Every feature is scrutinized. Dead code is deleted. Every abstraction earns its place.
 - **Fail fast.** Panics over silent degradation. Exhaustive matches with panics for unexpected values. Never mask bugs. If something is unimplemented, the system screams and dies loudly.
 - **Simplicity.** Prefer the simpler solution unless the complex one brings >2x improvement. We can simplify aggressively because we have no legacy constraints.
-- **Rust is first class.** Not POSIX. Not C. The entire OS is Rust-native. C-isms tolerated only when the Rust alternative adds no safety or value.
+- **Rust is first class.** Not POSIX. Not C. The entire OS is Rust-native. C-isms tolerated only when the Rust alternative adds no safety or value. Prefer compile-time safety: unrepresentable > checked at runtime > covered by tests.
 - **Development ergonomics above all.** The ability to iterate fast matters more than feature count. Tooling comes first.
 - **Self-hosting.** The north star is building ToyOS from within ToyOS. No LLVM dependency. Cranelift as codegen backend.
-- **Efficient.** Never hog resources without purpose. Free memory when not used. Minimize kernel overhead. The OS must be fast and responsive. General improvements only — never optimize for one specific app.
-- **No slop comments.** Never add comments that restate what the code does. No "auto-closes on drop", "returns the value", "loop through items". Comments explain *why*, not *what*. If the code needs a *what* comment to be understood, rewrite the code.
+- **Efficient.** Never hog resources without purpose. Free memory when not used. Minimize kernel overhead. The OS must be fast and responsive. General improvements only — never optimize for one specific app. **Hard bar: every component at most 2× the cost of current production OSes** (Linux, macOS, Windows). Note TCG cannot measure this — the distortion is non-uniform (measured 1.06×–6.5× by operation), so only real hardware or same-session A/B counts.
+- **No slop comments.** Never add comments that restate what the code does. No "auto-closes on drop", "returns the value", "loop through items". Comments explain *why*, not *what*. If the code needs a *what* comment to be understood, rewrite the code. If a comment reads like a commit message — evidence, measurements, what the code used to do — it belongs in the commit message.
 
 ## Architecture
 
@@ -130,6 +130,7 @@ system.toml       What to build and boot
 - Stay focused on the current task. Record findings and issues in `specs/known-issues.md`, don't go fix them — a separate agent will handle it. Add a one-line summary here only if a future agent must not miss it.
 - After each task, audit CLAUDE.md and update if the architecture or project state changed. **Keep this file under ~200 lines**: it loads into every session and every subagent. Detail belongs in `specs/`, resolved narrative in `git log`.
 - If something is blocking, stop and report it. Don't work around it.
+- Never degrade audible or visual quality — even temporarily, even for a big win elsewhere — without the owner's explicit sign-off. Quality tradeoffs are the owner's call.
 - **Never truncate command output.** No `| head`, `| tail`, `| grep` to reduce output. If a command produces a lot of output or takes long, run it in the background — background tasks automatically get their output written to a file.
 - **`cargo test` and `cargo run` produce large output** (std rebuild warnings, initrd listing, serial output). Always run them in the background so the Bash tool doesn't silently truncate the output — `... [N characters truncated] ...` in tool output means data was lost. Read the output file afterward.
 - **Always be empirical.** Never assume a command succeeded or failed — read the actual output. Never assume code works — run it. Never guess at root causes — investigate. Guessing is unproductive; verify everything.
@@ -139,6 +140,9 @@ system.toml       What to build and boot
 - **Wait in the FOREGROUND; do not tight-poll a background job.** Background-task notifications work reliably for the *main* agent, but spawned subagents do not stop cleanly when they background work and wait — observed repeatedly, cause unknown. That is why polling looks necessary to them. It is not. Run long commands in the foreground with an explicit `timeout` (default is only 120000 ms; the max is 600000). For work exceeding 10 minutes, background it once and block with two or three long foreground waits on a marker file (`until [ -f done ]; do sleep 20; done`, or a FIFO `cat`) — never hundreds of short polls. Note this is the opposite of what the main agent's tooling advises; subagents differ.
 - **Never `git add -A` or `git add .`.** Stage explicit paths and check `git diff --cached --name-only` before committing. Several agents commit to this tree concurrently; a bare `add -A` has already swept up another agent's in-progress work. This also applies inside the forks.
 - **Concurrent measurement is unreliable.** Another agent building or booting QEMU in the same tree perturbs timings and shares the cargo target lock. When measuring a flaky test's rate, A/B against the same HEAD in the same session rather than comparing to a number someone recorded earlier.
+- **The dev host is a laptop that sleeps mid-session.** An agent stall or a wild wall-clock outlier usually means host suspend, not a hang or a regression — resume or re-run; never record the outlier as a finding. Bimodal timing data (tight cluster + a few enormous outliers) is the signature.
+- **Subagents get an explicit model, never the session default.** Opus for anything with judgment in it — design, debugging, review/verification, commits touching kernel/scheduler/soundd semantics. Sonnet only for zero-decision mechanical work from an exact spec. Trivial edits: no agent, do them directly. When unsure, opus — one botched "mechanical" change costs more than the model delta saves.
+- **Durable facts go in this file or `specs/`, not in private agent memory.** Owner's decision: everything lives in VCS where it is versioned and visible to every agent. Do not build up out-of-repo memory state.
 
 ## Ideas
 
@@ -160,6 +164,7 @@ Read the spec before touching the subsystem it covers.
 - `specs/scheduler-core-spec.md` — ownership-typed scheduler core as a `no_std` crate (`toyos-sched/`) with a deterministic host simulator and interleaving fuzzer; per-CPU exclusive queues, message-passing wakes, 10-stage always-green migration. **Stage 7c done: the kernel drives the core, with balance on, and the legacy notification path is deleted.** The driver half is `kernel/src/sched/`; `kernel/src/scheduler.rs` is the kernel-facing API and nothing else — the spec's "7c removes `scheduler.rs`" means the legacy body, which died at 7a (migration log records the divergence). Host tests: `cargo test` inside `toyos-sched/` (~15 s). Stage 4's exit criterion runs from the CLI: `cargo run --release -p toyos-sched-sim -- gate 10000` and `-- fuzz-sweep 10000000`. Five negative gates prove the harnesses have teeth — do not weaken one to make a change pass. Migration state, the gates, and every defect the cutover found: `specs/scheduler-migration-log.md`.
 - `specs/capability-handles-spec.md` — refcounted kernel objects behind typed per-process handles (Fd→Handle); subsumes the SharedToken/io_uring/Fd debt in known issues.
 - `specs/iouring-blocking-spec.md` — io_uring as the only blocking mechanism; one wait-free completion primitive, one park/recheck site.
+- `specs/metal-boot-plan.md` — first boot on real hardware (ThinkPad T14 Gen 2), integrated keyboard + touchpad. Staged M0–M5; starts after the soundd idle redesign lands; flash when the metal-sim profile is green. Also the only honest instrument for the 2× performance bar.
 
 ## Known issues
 
