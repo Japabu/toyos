@@ -233,10 +233,34 @@ to reading the drained cursor.
   drain no longer erases, so the live tail after the flush is the same text.
   Removing them touches the panic handler's most carefully argued ordering, so
   it is a change of its own, not a rider on this one.
-- **A pager for a *running* machine was deliberately not built.** It would close
-  known-issues §8's "no output channel once boot is done", but it changes the
-  behaviour of a live machine, needs its own gate (a screen nobody owns *and* no
-  serial backend) and its own test, and on a healthy boot the window it covers
-  is the ~200 ms before the compositor claims the framebuffer.
+- **A live on-screen channel for a *running* machine: considered and declined**
+  (2026-08-01), not deferred. It would close known-issues §8's "no output channel
+  once boot is done", and it is still the wrong trade.
+
+  A periodic repainter has to render from timer context through the same
+  renderer the panic path uses. That renderer takes **no lock of any kind** —
+  which is what makes it safe to arm before `serial::init` and to run from a
+  fatal panic under arbitrary held locks. Sharing it with a periodic painter
+  means the two interleave, and the failure mode is a garbled final frame:
+  corrupting the one diagnostic that exists on metal in order to add a
+  convenience channel. That trade is backwards.
+
+  Neither escape survives. A second framebuffer region costs memory and inherits
+  the `gpu::set_resolution` hazard already on the books — it frees the old
+  framebuffer while consumers may hold pointers into it. A lock the panic path
+  is allowed to skip reintroduces exactly the interleave the no-lock rule exists
+  to prevent.
+
+  And the coverage is thin. The mute window is `Boot: complete` → the
+  compositor's terminal, milliseconds on a healthy boot. Fatal panics already
+  paint. The six phase checkpoints already repaint, so a wedge shows the last
+  phase reached. What is left uncovered is a machine that is alive, past boot,
+  not panicking, and not reaching the compositor — narrow, against a risk taken
+  in every case.
+
+  **Reopens if** xHCI DbC (§1) fails its hardware gate, which would leave the
+  T14 with no post-boot byte channel at all. DbC is the designed fix and makes
+  every existing tool work unchanged; this is only worth its cost if that is
+  gone.
 - **`MAX_ROWS` is 96 on a 128-row QEMU screen.** With paging the cap costs a
   page boundary rather than lost text, but it is now arbitrary.
