@@ -32,7 +32,7 @@ The name has no meaning. This is not a hobby project. The quality bar is the sam
 
 **Scheduling** — Efficient, event-driven, fair-share. Per-CPU run queues. Must scale to 128+ cores without excessive overhead.
 
-**Filesystem** — VFS with mount points. Initrd, tmpfs, NVMe.
+**Filesystem** — VFS with mount points. Initrd, tmpfs, NVMe. **The kernel never formats a disk it was not given.** `bcachefs_adapter::probe` reads block 0: a bcachefs superblock is ours and gets mounted, a designation stamp (magic + that device's block count, written by `create_sparse`) authorises a format, anything else is `Foreign` and is never written to — `/home` falls back to a tmpfs. A failed mount is not consent; treating it as consent is what would have reformatted the T14's disk on its second boot.
 
 **Input** — One held-set and one button-merge for the whole machine (`keyboard::handle_key`, `mouse::handle_motion`), so two keyboards or two pointers compose rather than contradict. USB HID over xHCI and PS/2 over the i8042 both feed it in HID usage codes; wire decoding is `toyos-ps2/`. Pin interrupts arrive through `drivers/ioapic.rs`, everything else is MSI-X.
 
