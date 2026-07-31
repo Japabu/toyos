@@ -19,6 +19,29 @@ pub struct Extent {
 
 const EXTENT_SIZE: usize = 16;
 
+/// Append `count` blocks at `start`, extending the last extent when the run
+/// continues it.
+///
+/// Without this a file needed one extent per *page*: the allocator hands back
+/// consecutive blocks for consecutive single-block requests, and every one of
+/// them was pushed as a fresh 16-byte extent into a value that has to fit in a
+/// 4 KiB btree node. That is what capped a file at ~250 pages and panicked the
+/// kernel one page later. A sequentially written file of any size is now one
+/// extent, and what remains bounded is the number of *discontiguous runs*.
+fn push_extent(extents: &mut Vec<Extent>, start: u64, count: u32) {
+    if let Some(last) = extents.last_mut() {
+        // `checked_add` rather than `+`: block_count is a u32, so a run past
+        // 16 TiB has to become a second extent instead of wrapping.
+        if last.start_block + last.block_count as u64 == start {
+            if let Some(merged) = last.block_count.checked_add(count) {
+                last.block_count = merged;
+                return;
+            }
+        }
+    }
+    extents.push(Extent { start_block: start, block_count: count, _reserved: 0 });
+}
+
 /// Filesystem error type with rich context.
 #[derive(Debug)]
 pub enum FsError {
@@ -30,6 +53,13 @@ pub enum FsError {
     NotFound,
     NoSpace { requested: u32, available: u64 },
     NameTooLong { len: usize, max: usize },
+    /// A value no node could hold. Reachable from ordinary userland writes:
+    /// the extent list lives inline in the value, one entry per discontiguous
+    /// run of the file.
+    EntryTooLarge { size: usize, max: usize },
+    /// A node whose entries do not fit the block. Defence in depth behind
+    /// `EntryTooLarge` — nothing should reach it.
+    NodeOverfull { used: usize, max: usize },
 }
 
 pub struct ReadOnly;
@@ -305,7 +335,10 @@ impl<IO: BlockIO> Formatted<IO> {
             level: 0,
             entries: Vec::new(),
         };
-        root.write(&io, BlockNum::new(root_block_num));
+        // The only infallible node write in the crate: an empty node's entries
+        // occupy zero bytes, so the bound `write_to` checks cannot be crossed.
+        root.write(&io, BlockNum::new(root_block_num))
+            .expect("an empty root node cannot overflow a block");
 
         // Generate random-ish hash seed from block count (deterministic for reproducible builds)
         let mut hash_seed = [0u8; 16];
@@ -385,11 +418,7 @@ impl<IO: BlockIO> Formatted<IO> {
 
         while remaining > 0 {
             let (start, count) = self.alloc.alloc_contiguous(&self.io, remaining)?;
-            extents.push(Extent {
-                start_block: start.raw(),
-                block_count: count,
-                _reserved: 0,
-            });
+            push_extent(&mut extents, start.raw(), count);
 
             // Write data blocks
             let mut buf = BlockBuf::zeroed();
@@ -663,11 +692,7 @@ impl<IO: BlockIO> Mounted<IO, ReadWrite> {
 
         while remaining > 0 {
             let (start, count) = self.alloc.alloc_contiguous(&self.io, remaining)?;
-            extents.push(Extent {
-                start_block: start.raw(),
-                block_count: count,
-                _reserved: 0,
-            });
+            push_extent(&mut extents, start.raw(), count);
 
             let mut buf = BlockBuf::zeroed();
             for i in 0..count as u64 {
@@ -721,6 +746,12 @@ impl<IO: BlockIO> Mounted<IO, ReadWrite> {
 
     /// Rename a file or symlink. Crash-safe ordering: insert new, then delete old.
     pub fn rename(&mut self, old_name: &str, new_name: &str) -> Result<(), FsError> {
+        // Every other name-taking entry point bounds its name; this one did
+        // not, and `user_ptr::MAX_USER_STR` lets 64 KiB of it through.
+        if new_name.is_empty() || new_name.len() > MAX_NAME_LEN {
+            return Err(FsError::NameTooLong { len: new_name.len(), max: MAX_NAME_LEN });
+        }
+
         // 1. Find old entry
         let (old_key, old_value) = self.find_by_name(old_name)?
             .ok_or(FsError::NotFound)?;
@@ -764,17 +795,23 @@ impl<IO: BlockIO> Mounted<IO, ReadWrite> {
         let leaf = decode_leaf_value(&old_value)?;
         let entry_type = if old_key.key_type == KeyType::File { 1 } else { 2 };
 
+        let extents = if new_extents.is_empty() { leaf.extents() } else { new_extents };
+        let new_value = encode_leaf_value(entry_type, leaf.name(), size, mtime, extents);
+        let new_entry = Entry { key: old_key, value: new_value };
+
+        // Before the delete, not after. This is the one rejection an ordinary
+        // `write` + `fsync` can provoke, and a delete whose insert then fails
+        // is the file disappearing — a worse outcome than the error.
+        btree::check_entry_fits(&new_entry)?;
+
         // Delete keeps the blocks: the new extents usually reference the same
         // ones. Blocks the caller drops from the extent list are leaked.
         btree::delete(&self.io, self.sb.root_node, self.sb.root_level, &old_key)?;
 
-        let extents = if new_extents.is_empty() { leaf.extents() } else { new_extents };
-
-        let new_value = encode_leaf_value(entry_type, leaf.name(), size, mtime, extents);
         let (new_root, new_level) = btree::insert(
             &self.io, &mut self.alloc,
             self.sb.root_node, self.sb.root_level,
-            Entry { key: old_key, value: new_value },
+            new_entry,
         )?;
         self.sb.root_node = new_root;
         self.sb.root_level = new_level;
@@ -800,11 +837,7 @@ impl<IO: BlockIO> Mounted<IO, ReadWrite> {
         // Page is beyond existing extents — allocate new blocks to cover it
         let needed = page_idx + 1 - cursor;
         let (start, count) = self.alloc.alloc_contiguous(&self.io, needed)?;
-        extents.push(Extent {
-            start_block: start.raw(),
-            block_count: count,
-            _reserved: 0,
-        });
+        push_extent(extents, start.raw(), count);
         // The requested page_idx is at offset (page_idx - cursor) within the new extent
         Ok(start.raw() + (page_idx - cursor) as u64)
     }

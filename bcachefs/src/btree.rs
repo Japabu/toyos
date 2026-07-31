@@ -10,6 +10,30 @@ const KEY_HEADER_SIZE: usize = 24;
 const CRC_START: usize = 8; // CRC covers bytes [8..4096]
 const MAX_PAYLOAD: usize = BLOCK_SIZE - NODE_HEADER_SIZE;
 
+/// The largest `Entry::disk_size` any node can ever hold.
+///
+/// A node holds at least one entry, so an entry bigger than this cannot be
+/// stored at all — and splitting does not help: a split of one oversized entry
+/// leaves an empty left node and a right node that is still oversized. It has
+/// to be refused at the door, before anything is written, because every caller
+/// that builds a value builds it out of something userland chose (a name, or
+/// one extent per discontiguous run of a file).
+pub const MAX_ENTRY_SIZE: usize = MAX_PAYLOAD;
+
+/// Total on-disk size of a node holding these entries.
+fn node_size(entries: &[Entry]) -> usize {
+    NODE_HEADER_SIZE + entries.iter().map(|e| e.disk_size()).sum::<usize>()
+}
+
+/// Reject an entry no node could hold. Call before mutating anything.
+pub fn check_entry_fits(entry: &Entry) -> Result<(), FsError> {
+    let size = entry.disk_size();
+    if size > MAX_ENTRY_SIZE {
+        return Err(FsError::EntryTooLarge { size, max: MAX_ENTRY_SIZE });
+    }
+    Ok(())
+}
+
 /// On-disk key stored in B+ tree nodes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Key {
@@ -171,7 +195,17 @@ impl Node {
     }
 
     /// Serialize this node to a block buffer, computing the CRC.
-    pub fn write_to(&self, buf: &mut BlockBuf) {
+    ///
+    /// Fallible rather than asserting: `used` is a sum over values whose size
+    /// userland chooses, so an overfull node is an input to reject, not a
+    /// kernel bug to scream about. This bound is also what keeps every slice
+    /// index below sound — the final offset is `NODE_HEADER_SIZE + used`.
+    pub fn write_to(&self, buf: &mut BlockBuf) -> Result<(), FsError> {
+        let used = self.entries_size();
+        if used > MAX_PAYLOAD {
+            return Err(FsError::NodeOverfull { used, max: MAX_PAYLOAD });
+        }
+
         let b = buf.as_bytes_mut();
         b.fill(0);
 
@@ -180,7 +214,6 @@ impl Node {
         b[8..10].copy_from_slice(&self.level.to_le_bytes());
         b[10..12].copy_from_slice(&(self.entries.len() as u16).to_le_bytes());
 
-        let used = self.entries_size();
         let free_space = (MAX_PAYLOAD - used) as u32;
         b[12..16].copy_from_slice(&free_space.to_le_bytes());
 
@@ -203,13 +236,15 @@ impl Node {
 
         let crc = crc32c(&b[CRC_START..]);
         b[4..8].copy_from_slice(&crc.to_le_bytes());
+        Ok(())
     }
 
     /// Write this node to disk.
-    pub fn write(&self, io: &dyn BlockIO, block: BlockNum) {
+    pub fn write(&self, io: &dyn BlockIO, block: BlockNum) -> Result<(), FsError> {
         let mut buf = BlockBuf::zeroed();
-        self.write_to(&mut buf);
+        self.write_to(&mut buf)?;
         io.write_block(block, &buf);
+        Ok(())
     }
 }
 
@@ -305,7 +340,7 @@ pub fn delete(io: &dyn BlockIO, root: BlockNum, root_level: u16, key: &Key) -> R
         if level == 0 {
             if let Some(pos) = node.entries.iter().position(|e| e.key == *key) {
                 let old = node.entries.remove(pos);
-                node.write(io, block);
+                node.write(io, block)?;
                 return Ok(Some(old.value));
             }
             return Ok(None);
@@ -342,7 +377,7 @@ fn delete_matching_recursive(
         let removed = before - node.entries.len();
         if removed > 0 {
             *count += removed;
-            node.write(io, block);
+            node.write(io, block)?;
         }
     } else {
         // Collect child block numbers first (to avoid borrowing issues)
@@ -397,6 +432,7 @@ pub fn insert(
     root_level: u16,
     entry: Entry,
 ) -> Result<(BlockNum, u16), FsError> {
+    check_entry_fits(&entry)?;
     let split = insert_recursive(io, alloc, root, root_level, entry)?;
 
     match split {
@@ -417,7 +453,7 @@ pub fn insert(
                 key: split_key,
                 value: new_block.raw().to_le_bytes().to_vec(),
             });
-            new_root.write(io, new_root_block);
+            new_root.write(io, new_root_block)?;
 
             Ok((new_root_block, root_level + 1))
         }
@@ -456,7 +492,7 @@ fn insert_recursive(
 
         if node.can_fit(0) || (pos.is_none() && node.entries_size() <= MAX_PAYLOAD) {
             if NODE_HEADER_SIZE + node.entries_size() <= BLOCK_SIZE {
-                node.write(io, block);
+                node.write(io, block)?;
                 return Ok(InsertResult::Done);
             }
         }
@@ -498,7 +534,7 @@ fn insert_recursive(
             node.entries.insert(pos, new_entry);
 
             if NODE_HEADER_SIZE + node.entries_size() <= BLOCK_SIZE {
-                node.write(io, block);
+                node.write(io, block)?;
                 Ok(InsertResult::Done)
             } else {
                 split_node(io, alloc, block, node)
@@ -513,7 +549,35 @@ fn split_node(
     block: BlockNum,
     mut node: Node,
 ) -> Result<InsertResult, FsError> {
-    let mid = node.entries.len() / 2;
+    // One entry is not a split problem. Halving by *count* used to produce
+    // `mid == 0` here, which drained every entry into the right node and left
+    // an empty one behind — and the right node was still the oversized entry.
+    if node.entries.len() < 2 {
+        let size = node.entries.first().map_or(0, |e| e.disk_size());
+        return Err(FsError::EntryTooLarge { size, max: MAX_ENTRY_SIZE });
+    }
+
+    // By size, not by count: entries are variable-length (a file's extent list
+    // lives inline), so half the entries can be far more than half the bytes.
+    let mid = split_point(&node.entries);
+
+    // Both halves are checked before either is written. A split that has
+    // already replaced the left node on disk and then fails is a corrupt tree;
+    // a split that fails before writing is an error the caller can return.
+    if node_size(&node.entries[..mid]) > BLOCK_SIZE
+        || node_size(&node.entries[mid..]) > BLOCK_SIZE
+    {
+        // Unreachable while every entry is <= MAX_ENTRY_SIZE and the node was
+        // legal before this insert, except for one shape: a node of large
+        // entries where the new one lands in the middle. Splitting three ways
+        // is what would fix it; extent merging is what stops values getting
+        // near that size in the first place.
+        return Err(FsError::NodeOverfull {
+            used: node_size(&node.entries) - NODE_HEADER_SIZE,
+            max: MAX_PAYLOAD,
+        });
+    }
+
     let right_entries: Vec<Entry> = node.entries.drain(mid..).collect();
     let split_key = right_entries[0].key;
 
@@ -523,13 +587,29 @@ fn split_node(
         entries: right_entries,
     };
 
-    node.write(io, block);
-    right_node.write(io, right_block);
+    node.write(io, block)?;
+    right_node.write(io, right_block)?;
 
     Ok(InsertResult::Split {
         new_block: right_block,
         split_key,
     })
+}
+
+/// The largest prefix of `entries` that still fits in a node, clamped so both
+/// sides of the split get at least one entry. Caller guarantees `len >= 2`.
+fn split_point(entries: &[Entry]) -> usize {
+    let mut used = NODE_HEADER_SIZE;
+    let mut n = 0;
+    for entry in entries {
+        let next = used + entry.disk_size();
+        if next > BLOCK_SIZE {
+            break;
+        }
+        used = next;
+        n += 1;
+    }
+    n.clamp(1, entries.len() - 1)
 }
 
 /// Find the minimum key in a subtree.
@@ -544,5 +624,64 @@ fn find_min_key(io: &dyn BlockIO, block: BlockNum, level: u16) -> Result<Key, Fs
         let child =
             BlockNum::new(u64::from_le_bytes(node.entries[0].value[..8].try_into().unwrap()));
         find_min_key(io, child, level - 1)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::vec;
+
+    fn entry(value_len: usize) -> Entry {
+        Entry { key: Key::ZERO, value: vec![0u8; value_len] }
+    }
+
+    #[test]
+    fn split_point_is_the_largest_prefix_that_fits() {
+        // Two entries that only fit apart: the rule has to put one on each
+        // side, which halving by count also gets right.
+        let two = [entry(3000), entry(3000)];
+        assert_eq!(split_point(&two), 1);
+
+        // And the shape it does not: a small entry ahead of two large ones.
+        // Halving by count gives mid=1, leaving 6048 bytes of entries in the
+        // right node and a block that cannot hold them.
+        let skewed = [entry(1000), entry(3000), entry(3000)];
+        let mid = split_point(&skewed);
+        assert_eq!(mid, 2);
+        assert!(node_size(&skewed[..mid]) <= BLOCK_SIZE, "left half does not fit");
+        assert!(node_size(&skewed[mid..]) <= BLOCK_SIZE, "right half does not fit");
+        assert!(node_size(&skewed[..2]) > BLOCK_SIZE / 2, "the shape under test is not skewed");
+    }
+
+    #[test]
+    fn split_point_always_leaves_both_sides_a_entry() {
+        // The clamp matters at both ends. One entry so large that no prefix
+        // fits must still yield 1, not 0 — a 0 drains every entry into the
+        // right node and writes an empty one back.
+        let huge_first = [entry(MAX_ENTRY_SIZE), entry(16)];
+        assert_eq!(split_point(&huge_first), 1);
+
+        // And a node of entries that all fit must still give the right side
+        // something, or the split makes no progress.
+        let tiny = [entry(8), entry(8), entry(8)];
+        let mid = split_point(&tiny);
+        assert!(mid >= 1 && mid <= 2, "mid={mid} leaves a side empty");
+    }
+
+    #[test]
+    fn an_entry_larger_than_the_payload_is_refused() {
+        assert!(check_entry_fits(&entry(MAX_ENTRY_SIZE - KEY_HEADER_SIZE)).is_ok());
+        assert!(matches!(
+            check_entry_fits(&entry(MAX_ENTRY_SIZE)),
+            Err(FsError::EntryTooLarge { .. }),
+        ));
+    }
+
+    #[test]
+    fn write_to_refuses_an_overfull_node_instead_of_underflowing() {
+        let node = Node { level: 0, entries: vec![entry(3000), entry(3000)] };
+        let mut buf = BlockBuf::zeroed();
+        assert!(matches!(node.write_to(&mut buf), Err(FsError::NodeOverfull { .. })));
     }
 }

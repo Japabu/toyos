@@ -594,3 +594,106 @@ fn format_mount_unmount_create_mount_roundtrip() {
     assert_eq!(mounted.file_mtime("phase1.txt"), 10);
     assert_eq!(mounted.file_mtime("phase2.txt"), 20);
 }
+
+// --- Values sized by userland: the extent list lives inline in a btree node ---
+
+/// The path the kernel's flush takes: one `resolve_or_alloc_block` per dirty
+/// page, in ascending order, then one `update_metadata` for the whole file.
+fn write_pages(fs: &mut Mounted<VecBlockIO, ReadWrite>, name: &str, pages: u32) -> Vec<bcachefs::Extent> {
+    let mut extents = Vec::new();
+    for page in 0..pages {
+        fs.resolve_or_alloc_block(&mut extents, page).expect("allocate a block for the page");
+    }
+    extents
+}
+
+#[test]
+fn a_sequential_file_needs_one_extent() {
+    let mut fs = Formatted::format(VecBlockIO::new(4096)).mount();
+    fs.create("seq.bin", b"", 1).expect("create");
+
+    let extents = write_pages(&mut fs, "seq.bin", 600);
+
+    // 600 pages used to be 600 extents of 16 bytes — 9600 bytes into a value
+    // that has to fit a 4040-byte node payload.
+    assert_eq!(
+        extents.len(), 1,
+        "a run of consecutive blocks became {} extents: {:?}", extents.len(), extents,
+    );
+    assert_eq!(extents[0].block_count, 600);
+}
+
+#[test]
+fn a_file_past_the_old_extent_cap_round_trips() {
+    // ~250 pages was where `19 + name + 16*pages` crossed the node payload and
+    // `write_to` underflowed `MAX_PAYLOAD - used`. This is four times that.
+    let mut fs = Formatted::format(VecBlockIO::new(4096)).mount();
+    fs.create("big.bin", b"", 1).expect("create");
+
+    let extents = write_pages(&mut fs, "big.bin", 1000);
+    let size = 1000 * 4096;
+    fs.update_metadata("big.bin", &extents, size, 7).expect("metadata for a 1000-page file");
+
+    let (back, got_size) = fs.file_extents("big.bin").expect("reopen");
+    assert_eq!(got_size, size);
+    assert_eq!(back.len(), 1, "extents did not survive the round trip: {back:?}");
+    assert_eq!(back[0].block_count, 1000);
+}
+
+#[test]
+fn a_value_too_large_for_any_node_is_an_error_not_a_panic() {
+    let mut fs = Formatted::format(VecBlockIO::new(8192)).mount();
+    fs.create("frag.bin", b"", 1).expect("create");
+
+    // Discontiguous by construction: merging cannot help, so this is the case
+    // that has to be *refused*. Each extent is a separate 16-byte run.
+    let extents: Vec<bcachefs::Extent> = (0..400)
+        .map(|i| bcachefs::Extent { start_block: 3000 + i * 2, block_count: 1, _reserved: 0 })
+        .collect();
+
+    match fs.update_metadata("frag.bin", &extents, 400 * 4096, 7) {
+        Err(bcachefs::FsError::EntryTooLarge { size, max }) => {
+            assert!(size > max, "rejected an entry that fits: {size} <= {max}");
+        }
+        other => panic!("expected EntryTooLarge, got {other:?}"),
+    }
+
+    // And the rejection did not take the file with it. update_metadata used to
+    // delete the old entry before attempting the insert.
+    assert!(
+        fs.file_extents("frag.bin").is_some(),
+        "the file was deleted by a metadata update that failed",
+    );
+}
+
+#[test]
+fn rename_bounds_the_new_name() {
+    let mut fs = Formatted::format(VecBlockIO::new(256)).mount();
+    fs.create("short.txt", b"data", 1).expect("create");
+
+    // Every other name-taking entry point checked this one and rename did not.
+    let huge = "n".repeat(64 * 1024);
+    match fs.rename("short.txt", &huge) {
+        Err(bcachefs::FsError::NameTooLong { .. }) => {}
+        other => panic!("expected NameTooLong, got {other:?}"),
+    }
+    assert!(fs.file_extents("short.txt").is_some(), "rename lost the source file");
+}
+
+#[test]
+fn entries_of_mixed_size_survive_node_splits() {
+    // Keys are hashed, so the order entries land in a leaf is not the order
+    // they are created in. Varying the name length by two orders of magnitude
+    // is the cheapest way to put non-uniform entries in front of the split
+    // logic, which is where halving by *count* stops being the right rule.
+    let mut fs = Formatted::format(VecBlockIO::new(8192)).mount();
+    let names: Vec<String> = (0..60)
+        .map(|i| format!("{}{i:03}", "e".repeat(if i % 3 == 0 { 500 } else { 4 })))
+        .collect();
+    for (i, n) in names.iter().enumerate() {
+        fs.create(n, b"x", i as u64).expect("create");
+    }
+    for n in &names {
+        assert_eq!(fs.read_file(n).expect("read back"), b"x", "{n} did not survive splitting");
+    }
+}

@@ -13,13 +13,10 @@
 //! trip, which is why the harness asserts on the kernel's own eviction series
 //! rather than on this exit code alone.
 //!
-//! The ceiling on `BIG_PAGES` is the filesystem, not the cache: bcachefs keeps
-//! a file's extent list inline in its btree value and `resolve_or_alloc_block`
-//! pushes one extent per page without merging contiguous ones, so a value is
-//! `19 + name + 16 * pages` bytes against a 4040-byte node payload — about 250
-//! pages for a name this long, and one page past that panics the kernel from
-//! an ordinary `write` + `fsync` (known-issues, filed separately). 128 leaves
-//! that margin doubled.
+//! `BIG_PAGES` is sized against the cache and nothing else. It used to be
+//! capped near 250 by the filesystem — one inline extent per page against a
+//! 4040-byte btree value — which is how that panic was found; `fs_large_file`
+//! now covers the fixed version at four times the old ceiling.
 
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
