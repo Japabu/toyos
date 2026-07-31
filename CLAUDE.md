@@ -85,7 +85,8 @@ The kernel ABI and SDK are Rust-native and capability-shaped. POSIX compatibilit
 - `cargo test -- process_stats --nocapture` filter + serial output.
 - `cargo test -- --list` lists all test names without running them.
 - `cargo test --test toyos-build -- --audio-gate 30` runs gate A's thorough tier (~17 min).
-- `cargo run -- --gop` boots a UEFI GOP display (`-vga std`) instead of virtio-gpu: the only config where the on-screen panic console renders, and half of M1's metal-sim.
+- `cargo run -- --gop` boots a UEFI GOP display (`-vga std`) instead of virtio-gpu: the config where the on-screen panic console renders.
+- `cargo run -- --metal-sim` boots the T14's hardware shape: GOP + NVMe + xHCI + i8042, no virtio device, no USB HID, **no serial**, so the screen is the only channel out. Add `--uart` to put a 16550 on stdio for debugging — nothing it shows counts until re-shown without it. `cargo test -- metal_sim` is the CI config (~4 s, one boot, decoded screendump).
 - `system.toml` defines which programs to build and the init sequence.
 
 **Gate A (audio) has two tiers.** `tests/audio-baseline.toml` documents both in full and justifies every number in it.
@@ -167,7 +168,7 @@ Read the spec before touching the subsystem it covers.
 - `specs/scheduler-core-spec.md` — ownership-typed scheduler core as a `no_std` crate (`toyos-sched/`) with a deterministic host simulator and interleaving fuzzer; per-CPU exclusive queues, message-passing wakes, 10-stage always-green migration. **Stage 7c done: the kernel drives the core, with balance on, and the legacy notification path is deleted.** The driver half is `kernel/src/sched/`; `kernel/src/scheduler.rs` is the kernel-facing API and nothing else — the spec's "7c removes `scheduler.rs`" means the legacy body, which died at 7a (migration log records the divergence). Host tests: `cargo test` inside `toyos-sched/` (~15 s). Stage 4's exit criterion runs from the CLI: `cargo run --release -p toyos-sched-sim -- gate 10000` and `-- fuzz-sweep 10000000`. Five negative gates prove the harnesses have teeth — do not weaken one to make a change pass. Migration state, the gates, and every defect the cutover found: `specs/scheduler-migration-log.md`.
 - `specs/capability-handles-spec.md` — refcounted kernel objects behind typed per-process handles (Fd→Handle); subsumes the SharedToken/io_uring/Fd debt in known issues.
 - `specs/iouring-blocking-spec.md` — io_uring as the only blocking mechanism; one wait-free completion primitive, one park/recheck site.
-- `specs/metal-boot-plan.md` — first boot on real hardware (ThinkPad T14 Gen 2), integrated keyboard + touchpad. Staged M0–M5; starts after the soundd idle redesign lands; flash when the metal-sim profile is green. Also the only honest instrument for the 2× performance bar.
+- `specs/metal-boot-plan.md` — first boot on real hardware (ThinkPad T14 Gen 2), integrated keyboard + touchpad. Staged M0–M5; **M0 and M1 built**, M2 (i8042 driver) is the last thing before the flash trigger. Also the only honest instrument for the 2× performance bar.
 - `specs/net-gate-plan.md` — gate N, the network analogue of gate A: pcap as device-side ground truth, slirp + harness-as-peer configs, adversarial frames and deterministic impairment. Scheduled after the first bare-metal attempt.
 
 ## Known issues
@@ -194,6 +195,7 @@ One line each. **`specs/known-issues.md` has the detail and is the file to updat
 - **`bootstrap-cc` is alive but not wired in** — nothing builds it, it inherits the wrong toolchain, and its TinyCC download is unpinned.
 - **The `memmap2` fork is 165 lines of unreachable code.** Delete `src/toyos.rs` or drop the toyos gate in `rustc_data_structures` — exactly one of the two.
 - **Design debt:** io_uring abuses `shared_memory`; `SharedToken` is a bare `u32` with no RAII; `Fd` should be `Handle`; `build_toyos_bins` belongs in the test harness; `KernelSlice::from_raw` trusts the caller's size — allocators should construct the slice; `gpu::set_resolution` frees the old framebuffer while consumers may hold pointers to it.
-- **The UEFI GOP path is not the default, and picks an absurd mode when on.** `gop.rs` runs only under `--gop`/`Display::Gop`, so the rest of the suite still says nothing about the display path a laptop takes; and the bootloader selects the most-pixels mode, which on QEMU stdvga is a square 2048x2048.
-- **Hardware gaps:** PCID/INVPCID untested outside TCG; TLB shootdowns IPI every CPU for a full flush; the LAPIC timer is one-shot where TSC-deadline would be exact.
+- **The UEFI GOP path is not the default, and picks an absurd mode when on.** `gop.rs` runs only under `--gop`/`--metal-sim`, so the rest of the suite still says nothing about the display path a laptop takes; and the bootloader selects the most-pixels mode, which on QEMU stdvga is a square 2048x2048.
+- **A machine with no serial has no output channel once boot is done** — the log ring drains into nothing and the screen only repaints at checkpoints and fatal panics, so metal-sim (and the T14) is mute from `Boot: complete` until the compositor's terminal exists. Also: a keyboard or mouse claim succeeds on a machine with neither.
+- **Hardware gaps:** PCID/INVPCID untested outside TCG; TLB shootdowns IPI every CPU for a full flush; the LAPIC timer is one-shot where TSC-deadline would be exact; every network client burns a second of `connect_blocking` retry on a machine with no NIC.
 - One unreproduced observation: `ps` appeared to stall for >2 s under heavy single-core load. If seen again, capture with LLDB before restarting.

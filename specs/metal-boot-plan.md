@@ -26,6 +26,11 @@ bar; QEMU cannot.
   the xHCI HID stack is irrelevant to it and ToyOS has no i8042 driver. QEMU q35
   emulates i8042 by default, so the driver develops at full dev speed. The
   TrackPoint is PS/2 on the same controller's aux port.
+- **The 16550 probe now has a negative sample.** M0's `UART_PRESENT` latch had
+  only ever seen a UART answer; under `--metal-sim` (`-serial none`) the
+  loopback reads `0xff` and the kernel boots to the compositor with every UART
+  access gated off. The claim "the kernel survives a machine with no 16550" is
+  measured rather than argued as of M1.
 - **The touchpad is I2C-HID** behind Intel LPSS I2C, interrupt via Tiger Lake
   GPIO — a real driver stack (LPSS I2C + ACPI GpioInt + HID multitouch) that
   QEMU cannot emulate; it must be debugged on the machine itself. Unverified:
@@ -54,19 +59,38 @@ bar; QEMU cannot.
   continuously, so only what the panic handler captured before the drain is
   there (known issues §2). Detail:
   `kernel/src/drivers/panic_console/mod.rs`.
-- **M1 — "metal-sim" QEMU profile.** No virtio devices at all (GOP + i8042 +
-  NVMe only); must reach the compositor; daemons must degrade gracefully when
-  their device is absent. Becomes a permanent CI config so metal regressions
-  are caught at dev speed.
-  **Half of this exists**: `cargo run --gop` / `BootOptions { display:
-  Display::Gop }` is the `-vga std` GOP-only display half, and it is where the
-  screen tests run. Still needed: dropping virtio-net, virtio-sound and
-  virtio-console from the profile (the console is the harness's own channel,
-  so the profile needs another way to talk to the guest, or the UART back);
-  i8042 for input; the daemons degrading instead of failing when their device
-  is missing; a mode policy better than "most pixels wins", which currently
-  yields a square 2048x2048 (see known issues §8); and making the profile a
-  permanent CI config rather than five tests.
+- **M1 — "metal-sim" QEMU profile. BUILT.** `cargo run -- --metal-sim` and
+  `BootOptions { profile: Profile::Metal }`: firmware GOP, NVMe, xHCI with the
+  boot stick on it, q35's i8042, and no virtio device, no USB HID and no 16550
+  anywhere. It reaches the compositor, and `metal_sim_compositor` in the suite
+  certifies that on every `cargo test` (~4 s) by decoding a QMP screendump —
+  the compositor's own `TASKBAR_COLOR` across the full bottom pixel row, a
+  composited wallpaper above it, and the kernel's last checkpoint gone from the
+  screen. Its teeth: the profile's argv is asserted to contain no `virtio`, no
+  USB HID and `-serial none`, because no screendump can see a device that is
+  present but unused.
+
+  **The profile keeps no serial, deliberately.** The T14 has no UART, and a
+  profile that talks over one is not simulating it — so the guest's only
+  channel out is the framebuffer, which is exactly what makes M0 the
+  prerequisite it was. `--metal-sim --uart` puts a 16550 back on stdio for
+  debugging; anything it shows has to be re-shown without it. The consequence
+  for the harness is absolute: `===TEST_START===` cannot survive, because there
+  is nothing to send `run <name>` over. A metal-sim guest is observed by
+  screendump and by nothing else.
+
+  What it found: `xhci::init` returned `None` when the controller had no HID on
+  it and `kernel_main` panicked on that — which is the T14's ordinary state,
+  since its keyboard is PS/2 and its touchpad I2C-HID. soundd, netd and sshd
+  each panicked on their absent device; they now print one line and exit 0.
+  Three residuals are filed in known issues §8: a running system on a
+  serial-less machine has no output channel at all, keyboard/mouse claims
+  succeed with no hardware behind them, and every network client burns a second
+  of retry before giving up. The 2048x2048 mode policy was left alone.
+
+  Still missing from the *simulation*: input. q35 gives the guest an i8042 and
+  ToyOS has no driver for it, so metal-sim has no keyboard and no mouse at all.
+  That is M2, and it is the last thing between here and the flash trigger.
 - **M2 — i8042 driver.** Integrated keyboard + TrackPoint (aux port),
   developed against QEMU's PS/2 emulation. May also yield basic touchpad
   motion on metal if the EC has a PS/2 fallback (unverified).
@@ -76,7 +100,10 @@ bar; QEMU cannot.
   2MiB-only PMM, real ACPI tables, PCI bridges, TSC calibration. xHCI must at
   minimum fail gracefully when internal camera/fingerprint/Bluetooth exhaust
   its 3 hardcoded slots (`kernel/src/drivers/xhci/mod.rs:136-145`); dynamic
-  slots are their own known issue.
+  slots are their own known issue. M1 removed the adjacent panic — zero HID
+  devices no longer kills the boot — but three is still three, and the T14's
+  internal USB devices are what will find that out. M1 also made a missing
+  xHCI controller survivable, which nothing has yet had a chance to exercise.
 - **FLASH TRIGGER: metal-sim boots to the compositor with the PS/2 keyboard
   working and panics render on screen → flash the stick.** At that point first
   metal boot is an afternoon with readable failures, not a black-screen slog.

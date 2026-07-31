@@ -6,7 +6,8 @@ entry leaves this file when the code and `git log` carry the fix — resolved
 narrative belongs in a dated investigation doc, not here.
 
 Verified against `a88e4ee` (2026-07-30); §2's panic-path additions and §8's
-display entry against `883a84d` (2026-07-31).
+display entry against `883a84d` (2026-07-31); §8's three metal-sim entries
+against M1 (2026-07-31).
 
 ---
 
@@ -135,6 +136,15 @@ It matters for the machine M0 exists for. A drain into a backend that discards
 emptied into nothing all the time and there is no scrollback to fall back on.
 Options, none taken: stop draining when no backend can write; keep a separate
 non-consuming history for the console; or accept it and say so in the design.
+
+**Measured under metal-sim (M1), and worse than "no scrollback".** With
+`-serial none` and no virtio-console the guest has no output channel at all
+once the last boot checkpoint has painted: `metal_sim_compositor`'s failure
+screen ends at `Boot: complete`, and soundd's and netd's exit lines — printed
+seconds later, and visible on the same boot under `--metal-sim --uart` — reach
+no pixel and no file. A running ToyOS on the T14 is mute between `Boot:
+complete` and the moment the compositor's terminal exists. That is fine for a
+first boot and not fine for debugging M2 on the machine.
 
 ### The double-fault path overflows IST1 by ~1.4 KiB while reporting
 
@@ -601,6 +611,18 @@ real bugs in that module were found and fixed 2026-07-28 — see `forks.toml`.
 It is only called from the test harness and contains test-specific logic (cdylib
 subcrate discovery, `-L` rustflags for `.so` linking). Move it to `tests/`.
 
+### `screen_boot_checkpoint` breaks whenever a kernel log line is added
+
+The test needs the `KernelArgs` line — the one line in the tree wider than the
+display grid — to be on screen so it can prove the renderer wraps rather than
+clips. But the screen holds the newest `MAX_ROWS` lines, and `KernelArgs` is
+near the *top* of that window, so any new `log!` before the last boot checkpoint
+scrolls its head off and the test fails with `no KernelArgs line on screen`.
+M1 hit this by adding one line to `xhci::init`, and the fix was to delete the
+line rather than to change the test — which is the right precedence but not a
+sustainable one. The test wants a line it controls (a deliberately over-wide
+one it emits itself) instead of borrowing an unrelated one.
+
 ---
 
 ## 7. Design debt
@@ -661,15 +683,16 @@ stop naming sizes at all.
 
 Until `06ce633` no configuration in this tree produced a UEFI GOP at all:
 `kernel/src/drivers/gop.rs` had never executed and `kernel_args.gop_framebuffer`
-was zero everywhere. `cargo run --gop` and `BootOptions { display: Display::Gop }`
+was zero everywhere. `cargo run --gop` and `BootOptions { profile: Profile::Gop }`
 (`-vga std`) fixed that and the path works, but two residuals remain.
 
 **It is not the default.** Plain `cargo run` and the default test config still
 boot `-vga none` with virtio-gpu or with no display device, so `gop.rs` is
-exercised only by `--gop` and by five of the six `screen_*` tests
-(`screen_decoder` boots no guest at all). Every other test in the suite still
-says nothing about the display path a laptop takes. M1's metal-sim profile is
-what should make GOP a first-class CI config.
+exercised only by `--gop`, by `--metal-sim`, and by six of the seven screen
+tests (`screen_decoder` boots no guest at all). Every other test in the suite
+still says nothing about the display path a laptop takes. M1's
+`metal_sim_compositor` now covers the whole stack on GOP — kernel init,
+compositor claim, composite — but it is one test, not the default.
 
 **The mode is wrong.** `bootloader/src/main.rs:186-205` selects the mode with
 the most pixels. On QEMU stdvga that is **2048x2048** — square, non-standard,
@@ -677,7 +700,32 @@ and it makes the compositor scale a 1920x1080 wallpaper to a square. It is also
 16 MiB of framebuffer, which is what makes a panic-console repaint cost ~13 ms.
 "Largest wins" is not a mode policy; a real one would prefer the firmware's
 current mode, or the largest 16:9/16:10 mode, and only then fall back. Harmless
-for M0, wrong for M1.
+for M0, wrong for M1 — and M1 shipped without fixing it, so `metal_sim_compositor`
+composites a 1920x1080 wallpaper onto a 2048x2048 square and each of its
+screendumps is 12 MiB. On the T14 the firmware will offer the panel's own mode
+and "largest wins" may or may not pick it; that is the part nothing here can
+answer.
+
+### A device claim succeeds on a machine that has no such device
+
+`device::try_claim` gates `DEVICE_FRAMEBUFFER`, `DEVICE_NIC` and `DEVICE_AUDIO`
+on an info struct the driver registered, so those three return `None` when the
+hardware is absent — which is what makes soundd and netd able to exit cleanly.
+`DEVICE_KEYBOARD` and `DEVICE_MOUSE` are gated on nothing at all: they hand out
+a `Descriptor` whether or not any driver will ever produce an event. Under
+metal-sim the compositor holds both claims on a machine with no HID of any kind
+and polls them forever. Harmless today, wrong in the same way the isolation
+issues in §1 are wrong: a claim is supposed to be evidence.
+
+### Every network client pays a second of boot retry on a machine with no NIC
+
+`NetdConn::connect_blocking` (`toyos/src/net.rs:305`) retries `services::connect`
+100 times at 10 ms. That is right when netd is merely slow to start and wrong
+when it will never start: under metal-sim sshd sleeps 100 times, exits at
+t=1.69 s on a boot that reached `Boot: complete` at 0.38 s, and its 100
+`SYS_NANOSLEEP` calls are the whole of its accounting. Cheap fix: have netd
+publish "no NIC" rather than not publishing at all, so the retry has something
+to observe.
 
 **What the repaints actually cost.** `e5e600f`'s message gives two figures that
 cannot both be true — "~13ms per repaint" and "135ms to 181ms" for six of them.
