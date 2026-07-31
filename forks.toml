@@ -172,10 +172,12 @@ would have made ToyOS depend on semantics that are not mapping semantics.
 """
 dead_code = """
 OPEN QUESTION. rust/compiler/rustc_data_structures/src/memmap.rs cfg-gates
-target_os="toyos" to a Vec<u8> implementation at all 8 sites, and userland lists
-memmap2 under [patch.unused]. So NO ToyOS code path calls any memmap2 API: the
-165 lines of src/toyos.rs are compiled and unreachable, and the fork's only
-load-bearing content is the 0.9.10 → 0.2.1 version relabel.
+target_os="toyos" to a Vec<u8> implementation at all 8 sites, and rust/Cargo.toml
+is now the only manifest that patches memmap2 at all — userland used to carry a
+duplicate entry that resolved to nothing and warned on every build. So NO ToyOS
+code path calls any memmap2 API: the 165 lines of src/toyos.rs are compiled and
+unreachable, and the fork's only load-bearing content is the 0.9.10 → 0.2.1
+version relabel.
 Two coherent end-states, exactly one of which should exist:
   (a) delete src/toyos.rs and let stub.rs serve ToyOS, keeping the relabel; or
   (b) drop the toyos gate in rustc_data_structures now that map_copy_read_only

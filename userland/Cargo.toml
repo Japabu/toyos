@@ -53,10 +53,6 @@ cpal = { git = "https://github.com/Japabu/cpal", branch = "toyos" }
 softbuffer = { git = "https://github.com/Japabu/softbuffer", branch = "toyos" }
 winit = { git = "https://github.com/Japabu/winit", branch = "toyos" }
 libloading = { git = "https://github.com/Japabu/rust_libloading", branch = "toyos" }
-memmap2 = { git = "https://github.com/Japabu/memmap2-rs", branch = "toyos" }
-stacker = { git = "https://github.com/Japabu/stacker", branch = "toyos" }
-ctrlc = { git = "https://github.com/Japabu/rust-ctrlc", branch = "toyos" }
-target-lexicon = { git = "https://github.com/Japabu/target-lexicon", branch = "toyos" }
 
 
 # Dependencies are compiled once and cached, so optimising them costs nothing
