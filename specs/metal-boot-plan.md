@@ -91,9 +91,45 @@ bar; QEMU cannot.
   Still missing from the *simulation*: input. q35 gives the guest an i8042 and
   ToyOS has no driver for it, so metal-sim has no keyboard and no mouse at all.
   That is M2, and it is the last thing between here and the flash trigger.
-- **M2 — i8042 driver.** Integrated keyboard + TrackPoint (aux port),
+- **M2 — i8042 driver. BUILT.** Integrated keyboard + TrackPoint (aux port),
   developed against QEMU's PS/2 emulation. May also yield basic touchpad
   motion on metal if the EC has a PS/2 fallback (unverified).
+
+  It needed an **I/O APIC driver first**: every device vector in this tree is
+  MSI-X and the 8259 is masked at `idt::init`, so an ISA pin interrupt had
+  nowhere to land. That driver masks every redirection entry firmware left
+  behind, which closes a boot-panic hazard that exists on metal today (an
+  entry aimed at a vector with no IDT gate becomes #GP). It runs between
+  `lidt` and the first `sti`, so exception handlers are live throughout and
+  the stray-entry window never opens. Accepted: no ACPI SCI, so no
+  power-button or lid events — they were a panic before.
+
+  The wire decoders live in `toyos-ps2/`, a standalone `no_std` crate with 17
+  host tests including a 10 M-byte fuzz, on the `toyos-sched/` pattern.
+
+  Four QEMU-side questions the design left open are now answered. `0xF0 0x00`
+  reads back **0x41** (keyboard in set 2, controller translating, set-1 on the
+  wire), so QEMU honours both `0xF0 0x02` and the XLAT config bit; clearing
+  the bit makes it answer 0x02 and the driver refuses to attach rather than
+  decode garbage. `-machine q35,i8042=off` **does** clear the FADT
+  `IAPC_BOOT_ARCH` 8042 bit, so the gate fires and the ports are never
+  touched. IRQ 1 and IRQ 12 are uncovered by q35's override table, so they
+  stay identity/edge/high. And the aux port's presence probe, device reset and
+  rate/resolution programming all work as specified.
+
+  What QEMU still cannot decide is **R1**: whether the T14's eSPI EC lands in
+  set 2 + translation on. The read-back is a full determination of the wire
+  format and the driver disables rather than decodes a format it did not ask
+  for, so the first metal boot answers it in one short line on the laptop's
+  own screen. Contingency is one commit (set-2 tables, clear bit 6).
+
+  Also untested outside QEMU, in rough order of risk: SMM trapping port 0x60;
+  real EC timing against the 500 ms/750 ms/600 ms/1.5 s budgets; the aux-absent
+  path (QEMU always provides one); a keyboard resetting behind our back, which
+  is undetectable on this wire because `0xAA` is left Shift's break code under
+  translation (filed); and coexistence of a USB and a PS/2 keyboard, which QEMU
+  structurally cannot stage — it is argued from one shared held-set and tested
+  in-kernel by `input_merge`.
 - **M3 — USB image diet.** `hosted-rustc = false` (the initrd is 666 MB,
   rustc 478 MB of it; see `specs/boot-image-split.md`).
 - **M4 — real-firmware robustness.** Fragmented UEFI memory map vs the
@@ -105,8 +141,14 @@ bar; QEMU cannot.
   internal USB devices are what will find that out. M1 also made a missing
   xHCI controller survivable, which nothing has yet had a chance to exercise.
 - **FLASH TRIGGER: metal-sim boots to the compositor with the PS/2 keyboard
-  working and panics render on screen → flash the stick.** At that point first
-  metal boot is an afternoon with readable failures, not a black-screen slog.
+  working and panics render on screen → flash the stick. MET.**
+  `metal_sim_input` certifies it every run: on the profile with no virtio
+  device, no USB HID and no serial, an injected TrackPoint motion parks the
+  cursor on the taskbar, a click opens the compositor's launcher, and Escape
+  closes it — all by screendump, with the desktop returning bit-identical.
+  First metal boot is now an afternoon with readable failures, not a
+  black-screen slog. M3 and M4 are still worth doing before the flash; the
+  trigger condition itself no longer blocks.
 - **M5 — native I2C-HID touchpad** (on metal, post-first-boot): LPSS I2C
   driver, ACPI GpioInt, HID multitouch. **The milestone is not complete until
   the real touchpad works** — a PS/2 fallback with no multitouch does not

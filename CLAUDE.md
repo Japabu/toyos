@@ -34,6 +34,8 @@ The name has no meaning. This is not a hobby project. The quality bar is the sam
 
 **Filesystem** — VFS with mount points. Initrd, tmpfs, NVMe.
 
+**Input** — One held-set and one button-merge for the whole machine (`keyboard::handle_key`, `mouse::handle_motion`), so two keyboards or two pointers compose rather than contradict. USB HID over xHCI and PS/2 over the i8042 both feed it in HID usage codes; wire decoding is `toyos-ps2/`. Pin interrupts arrive through `drivers/ioapic.rs`, everything else is MSI-X.
+
 **Syscall ABI** — Defined in `toyos-abi/`. The ABI is the contract between kernel and userland. Includes struct layouts, syscall numbers, constants, and typed syscall wrappers. Completely unstable — read the code for current state. Never add or change a syscall without discussion. The `toyos/` crate builds on top with typed handles, IPC framing, and service helpers — userland code uses `toyos`, kernel uses `toyos-abi` only.
 
 **Kernel must never crash from userland.** A buggy userland process must not be able to bring down the kernel. But if the kernel itself has a bug, it must crash loudly so we can fix it and harden.
@@ -136,6 +138,7 @@ system.toml       What to build and boot
 - If something is blocking, stop and report it. Don't work around it.
 - Never degrade audible or visual quality — even temporarily, even for a big win elsewhere — without the owner's explicit sign-off. Quality tradeoffs are the owner's call.
 - **Never truncate command output.** No `| head`, `| tail`, `| grep` to reduce output. If a command produces a lot of output or takes long, run it in the background — background tasks automatically get their output written to a file.
+- Host tests outside the QEMU suite: `cargo test` inside `toyos-sched/` and inside `toyos-ps2/`.
 - **`cargo test` and `cargo run` produce large output** (std rebuild warnings, initrd listing, serial output). Always run them in the background so the Bash tool doesn't silently truncate the output — `... [N characters truncated] ...` in tool output means data was lost. Read the output file afterward.
 - **Always be empirical.** Never assume a command succeeded or failed — read the actual output. Never assume code works — run it. Never guess at root causes — investigate. Guessing is unproductive; verify everything.
 - **ToyOS is fast.** Full boot completes in under a second. Build is incremental and usually finishes in seconds. Never assume things are slow.
@@ -168,7 +171,7 @@ Read the spec before touching the subsystem it covers.
 - `specs/scheduler-core-spec.md` — ownership-typed scheduler core as a `no_std` crate (`toyos-sched/`) with a deterministic host simulator and interleaving fuzzer; per-CPU exclusive queues, message-passing wakes, 10-stage always-green migration. **Stage 7c done: the kernel drives the core, with balance on, and the legacy notification path is deleted.** The driver half is `kernel/src/sched/`; `kernel/src/scheduler.rs` is the kernel-facing API and nothing else — the spec's "7c removes `scheduler.rs`" means the legacy body, which died at 7a (migration log records the divergence). Host tests: `cargo test` inside `toyos-sched/` (~15 s). Stage 4's exit criterion runs from the CLI: `cargo run --release -p toyos-sched-sim -- gate 10000` and `-- fuzz-sweep 10000000`. Five negative gates prove the harnesses have teeth — do not weaken one to make a change pass. Migration state, the gates, and every defect the cutover found: `specs/scheduler-migration-log.md`.
 - `specs/capability-handles-spec.md` — refcounted kernel objects behind typed per-process handles (Fd→Handle); subsumes the SharedToken/io_uring/Fd debt in known issues.
 - `specs/iouring-blocking-spec.md` — io_uring as the only blocking mechanism; one wait-free completion primitive, one park/recheck site.
-- `specs/metal-boot-plan.md` — first boot on real hardware (ThinkPad T14 Gen 2), integrated keyboard + touchpad. Staged M0–M5; **M0 and M1 built**, M2 (i8042 driver) is the last thing before the flash trigger. Also the only honest instrument for the 2× performance bar.
+- `specs/metal-boot-plan.md` — first boot on real hardware (ThinkPad T14 Gen 2), integrated keyboard + touchpad. Staged M0–M5; **M0, M1 and M2 built, and the flash-trigger condition is met** — `metal_sim_input` drives the compositor with the i8042 as the machine's only input device. The one thing QEMU cannot decide is whether the T14's EC lands in scancode set 2 with translation on; the driver's `0xF0 0x00` read-back determines the wire format and refuses to attach to one it did not ask for, so that is one line on the laptop's own screen rather than a bisect. Also the only honest instrument for the 2× performance bar.
 - `specs/net-gate-plan.md` — gate N, the network analogue of gate A: pcap as device-side ground truth, slirp + harness-as-peer configs, adversarial frames and deterministic impairment. Scheduled after the first bare-metal attempt.
 
 ## Known issues
@@ -187,8 +190,10 @@ One line each. **`specs/known-issues.md` has the detail and is the file to updat
 - **A syscall runs with interrupts masked** (`MSR_FMASK` clears IF, nothing on the path re-enables) and the entry level keeps the preempt count above zero, so `preempt::enable`'s slow path is not the RT-wake safe point scheduler spec §7.4 counts on. Masking is the stronger blocker: a remote resched is only deliverable as an IPI, which a masked CPU will not take. Also: `retire_task` is never reached by `cargo test`.
 - **soundd has six audit defects open**: hardcoded cpal format, per-client shm never freed, `virtio_sound` ignores the PCM caps it queries, correlated TPDF dither draws, non-unity passthrough gain, uninitialised padding in `AudioInfo::as_bytes`.
 - **Gate A can still fail a run on `drains` alone**, with no gap and no underrun. A per-run failure should require evidence of harm.
+- **A keyboard that resets behind our back is undetectable on the PS/2 wire** — under controller translation `0xAA` is left Shift's break code. Survivable, untested on metal.
+- **On an idle machine the kernel's log ring flushes one line behind**, so the last line before a quiet period is not evidence of anything.
 - **`ps`/`stats`/`dump_blocked` lost their cross-CPU view at Stage 7a.** The first two were rebuilt on published counters and are accurate; `dump_blocked` now prints only the calling CPU's parked map.
-- **CORRECTED: the "~half the CPU is unattributed kernel time" claim was wrong, and its sign was backwards.** One accumulator feeds both numerators, so unattributed time cannot open a gap between them — true busy *exceeds* 97%. The 45-vs-97 gap is reader-side: `ps` compares a lifetime average against the taskbar's one-second delta. `specs/cpu-attribution.md`.
+- **The "~half the CPU is unattributed kernel time" claim was wrong and backwards** — the 45-vs-97 gap is reader-side, `ps` averaging a lifetime against a one-second delta. `specs/cpu-attribution.md`.
 - **Profiling layers 2 and 3 are not built** (event tracing, RIP sampling). Layer 1 is.
 - **std leaks the whole 2 MiB stack on every `thread::spawn`** — nothing records the pointer, so `join` cannot free it. One leaked kernel region per spawn; any per-process memory number across a threaded workload is wrong.
 - **The build system suppresses rustc warnings on success** — `Command::output()` in `src/build.rs` captures stderr regardless of quiet mode, so the zero-warning bar is unenforced outside the kernel.
