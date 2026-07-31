@@ -52,6 +52,17 @@ cycle time under single-CPU load is ~8 ms against a 2.9 ms period.
 
 ## 3. Real underrun, not a harness artifact
 
+> **[2026-08-01] The underruns this section diagnoses are gone, and the reasoning is
+> still correct.** `tests/audio-baseline.toml`'s current sample records `underruns = 0`
+> on all 120 config-runs across the four configs. Two instrument faults (`824dd7d`,
+> `7095046`) and one real defect (`069d158`) were closed after this was written, and
+> `aeeaa01` removed the timer-vs-completion race behind the second timing mode.
+>
+> The four lines of evidence below are why the underruns were believed real rather than
+> a harness artifact — a question that will be asked again the next time the gate goes
+> red, which is why this is a marker and not a rewrite. **Do not cite the numbers here
+> as current.** `tests/audio-baseline.toml` is the live figure.
+
 Four independent lines of evidence, all pointing the same way.
 
 **3.1 The capture is a true real-time timeline.** Every wav is ~6.7 s: leading
