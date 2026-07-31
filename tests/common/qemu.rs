@@ -246,11 +246,30 @@ impl QemuInstance {
     pub fn screendump(&mut self) -> super::screen::Ppm {
         let socket = self
             .qmp_socket
-            .as_ref()
+            .clone()
             .expect("screendump needs BootOptions { qmp: true }");
-        let _ = fs::remove_file(&self.screendump);
-        qmp_screendump(socket, &self.screendump);
-        let bytes = fs::read(&self.screendump).expect("screendump: QEMU wrote no file");
+        let out = self.screendump.clone();
+        let _ = fs::remove_file(&out);
+
+        // A guest that triple-faults exits QEMU (`-no-reboot`), and the
+        // socket then refuses every connect. Without this the retry loop
+        // spends its full ten seconds and reports `qmp: cannot connect`,
+        // which says nothing about what happened — the worst diagnostic the
+        // harness produces, for the failure class the metal profile exists to
+        // catch. `wait_for_ready` reports the same event properly, but a muted
+        // guest never goes through it and no guest goes through it twice.
+        let child = &mut self.child;
+        let mut qmp = Qmp::connect_while(&socket, || {
+            if let Ok(Some(status)) = child.try_wait() {
+                panic!("[qemu] QEMU died before the screendump (status: {status})");
+            }
+        });
+        qmp.execute(&format!(
+            "{{\"execute\":\"screendump\",\"arguments\":{{\"filename\":\"{}\"}}}}",
+            out.display()
+        ));
+
+        let bytes = fs::read(&out).expect("screendump: QEMU wrote no file");
         super::screen::Ppm::parse(&bytes)
     }
 
@@ -514,12 +533,20 @@ struct Qmp {
 
 impl Qmp {
     fn connect(socket: &Path) -> Self {
+        Self::connect_while(socket, || {})
+    }
+
+    /// `on_retry` runs between connect attempts. It is where a caller holding
+    /// the QEMU process turns "connection refused" into "QEMU is gone, and
+    /// here is its exit status" — see [`QemuInstance::screendump`].
+    fn connect_while(socket: &Path, mut on_retry: impl FnMut()) -> Self {
         use std::os::unix::net::UnixStream;
         let deadline = Instant::now() + Duration::from_secs(10);
         let stream = loop {
             match UnixStream::connect(socket) {
                 Ok(s) => break s,
                 Err(e) => {
+                    on_retry();
                     assert!(
                         Instant::now() < deadline,
                         "qmp: cannot connect to {}: {e}",
@@ -563,14 +590,6 @@ impl Qmp {
         self.stream.write_all(b"\n").unwrap();
         self.await_reply("\"return\"");
     }
-}
-
-fn qmp_screendump(socket: &Path, out: &Path) {
-    let mut qmp = Qmp::connect(socket);
-    qmp.execute(&format!(
-        "{{\"execute\":\"screendump\",\"arguments\":{{\"filename\":\"{}\"}}}}",
-        out.display()
-    ));
 }
 
 /// An open QMP connection for injecting input.

@@ -1240,6 +1240,23 @@ fn run_screen_test(
     }
 }
 
+/// Run a test that owns its QEMU, turning a panic into a failed test.
+///
+/// Every way the harness reports a dead or unreachable guest is a panic —
+/// `wait_for_ready`'s boot timeout, `assert_alive`'s exit status, `Qmp`'s
+/// connect and read asserts. Uncaught, one of those unwinds out of `main` and
+/// the suite exits 101 with no failure list, no remaining tests and no screen:
+/// the worst report for the failure class these tests exist to catch.
+fn catching(f: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_else(|e| {
+        Err(e
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
+            .unwrap_or_else(|| "the boot panicked".to_string()))
+    })
+}
+
 /// Every negative claim `Profile::Metal` makes, read off the argv QEMU is
 /// launched with. A claim about which devices do *not* exist is a claim about
 /// this list and nothing else — no console line and no screendump can see a
@@ -2353,20 +2370,7 @@ fn main() {
         eprintln!("  --- machine ---");
         for name in &machine_to_run {
             let start = std::time::Instant::now();
-            // A guest whose kernel-internal check panics never reaches the
-            // ready marker, and the harness's own boot wait panics rather
-            // than returning — which would take the rest of the suite with
-            // it. Catch it here so one dead boot is one failed test.
-            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                run_machine_test(name, &test_config, &c_bins, &rust_bins)
-            }))
-            .unwrap_or_else(|e| {
-                Err(e
-                    .downcast_ref::<String>()
-                    .cloned()
-                    .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
-                    .unwrap_or_else(|| "the boot panicked".to_string()))
-            });
+            let outcome = catching(|| run_machine_test(name, &test_config, &c_bins, &rust_bins));
             let elapsed = start.elapsed();
             match outcome {
                 Ok(()) => {
@@ -2393,7 +2397,7 @@ fn main() {
         eprintln!("  --- screen ---");
         for name in &screen_to_run {
             let start = std::time::Instant::now();
-            let outcome = run_screen_test(name, &test_config, &c_bins, &rust_bins);
+            let outcome = catching(|| run_screen_test(name, &test_config, &c_bins, &rust_bins));
             let elapsed = start.elapsed();
             match outcome {
                 Ok(()) => {
