@@ -46,11 +46,11 @@ second by carrying a refcount.
 
 | # | Bug class | Today | After |
 |---|-----------|-------|-------|
-| 1 | Object guts freed in place while shared (crash.md hypothesis 2: `AddressSpace.root`) | Possible; `teardown_scheduling` takes `_addr_space` unused, nobody can say what frees the root | **Compile-time impossible.** `AsInner.root` is non-`Option`, non-replaceable, private; freed exactly once in `Drop`. No `free()`/`destroy()`/`take()` exists on any object (§6.4). |
+| 1 | Object guts freed in place while shared (crash.md hypothesis 2: `AddressSpace.root`) | **Partly closed already.** `teardown_scheduling` is gone (only a dangling doc cross-reference at `process.rs:951` survives it), and `AddressSpace.root` is `Box<PageTablePage>` (`mm/paging.rs:214`), private and freed exactly once. What remains is the general property, not this instance | **Compile-time impossible.** `AsInner.root` is non-`Option`, non-replaceable, private; freed exactly once in `Drop`. No `free()`/`destroy()`/`take()` exists on any object (§6.4). |
 | 2 | Arc refcount underflow via bitwise `TaskCtx` duplication (crash.md hypothesis 1) | Unpoliced unsafe moves + lock-leak across `context_switch` | **Lint wall + Phase-1 contract.** `clippy.toml` bans `Arc::into_raw/from_raw/increment_strong_count/decrement_strong_count` and `mem::forget` kernel-wide (§12.2); the single `#[allow]` island is the scheduler switch path until the Phase-1 rewrite removes it. `TaskCtx` stays `!Clone`; the Phase-1 `Task` is move-only with proof-of-absence retirement (§9.4). |
 | 3 | Userland id-guessing (`signal_pipe_id`, `SharedToken`, `SYS_PIPE_OPEN` with zero access check) | `MSG_STREAM_OPENED` ships global integers | **Unrepresentable.** The namespaces are deleted; there is nothing to guess (§8). |
-| 4 | Lost peer-closed on kill-while-blocked (the cpal client's steady state IS blocked-on-signal-pipe) | n/a (no peer-closed semantics at all) | **Structural.** `handle_count` is decremented by handle-table drain at exit, independent of Arc clones stranded on raw-freed kernel stacks. EOF/BrokenPipe/device-reclaim fire from `on_zero_handles`, never from `Drop` (§5, §7). |
-| 5 | Use-after-close / double-close of descriptors | `u32` fd reuse silently aliases | **Runtime fail-fast.** Generation-tagged handles; stale handle → error during migration → kill-process at end state (§4.5). |
+| 4 | Lost peer-closed on kill-while-blocked (the cpal client's steady state IS blocked-on-signal-pipe) | **Not "none" — §5.3's own closing paragraph contradicts this cell.** Peer-closed semantics exist; what is missing is a *reliable count* under kill-while-blocked | **Structural — makes a miscount unrepresentable, rather than adding a missing semantic.** `handle_count` is decremented by handle-table drain at exit, independent of Arc clones stranded on raw-freed kernel stacks. EOF/BrokenPipe/device-reclaim fire from `on_zero_handles`, never from `Drop` (§5, §7). |
+| 5 | Use-after-close / double-close of descriptors | **Not reuse — the opposite.** `IdMap::insert` is a monotonic counter (`id_map.rs:46-51`), so fd numbers are *never* reused and nothing aliases; a long-lived process leaks fd-number space instead. `fd.rs:142`'s doc comment still claims "insert at the lowest unused id", which the code has never done | **Runtime fail-fast.** Generation-tagged handles. Note the justification: generations are not an anti-aliasing fix, because there is no aliasing to fix. They are what would make slot *reuse* safe — which is the thing a monotonic counter cannot do at all, and why reclaiming fd-number space needs them first. Stale handle → error during migration → kill-process at end state (§4.5). |
 | 6 | Kernel freeing shm/DMA while mapped elsewhere | `shared_memory::unregister/destroy` unmap behind your back | **Compile-time.** Mappings hold `Arc<SharedMemObject>`; pages die with the last Arc. No revocation of memory exists (§6.2, §14). |
 | 7 | Handle leak / double-close in userland | raw `Fd(i32)` | **Compile-time.** SDK `OwnedHandle` is `!Copy` with `Drop`; `into_raw` is the single greppable escape hatch (§10). |
 
@@ -426,6 +426,12 @@ pub struct DeviceClaim {
 }
 ```
 
+> **`SYS_AUDIO_SUBMIT` is already gated** on `device::is_owner(DEVICE_AUDIO, ..)`
+> (`arch/syscall.rs:366`), with the reason recorded at the site. The residual this
+> section should target is not the missing gate but that **a claim is not a
+> privilege**: `SYS_OPEN_DEVICE` is first-come, so whoever asks first holds
+> everything the claim unlocks — for `DEVICE_AUDIO` that includes the RT band.
+
 - **Per-claim objects, created at claim time** (`SYS_OPEN_DEVICE(class)` returns a
   fresh `DeviceClaim` handle), not one boot-time `DeviceObject` per device. A
   boot-time singleton whose master handle init retains would make
@@ -516,10 +522,10 @@ close-cancels-poll is preserved via the koid.
 
 | Today | Becomes | Why safe |
 |---|---|---|
-| `Fd(u32)` / `FdTable` / `Descriptor` | `RawHandle` / `HandleTable` / `KObjectRef` | generation bits + kill-on-stale |
+| `Fd(u32)` / `FdTable` / `Descriptor` — ids are monotonic, so stale fds fail rather than alias; generations buy *reuse*, not disambiguation | `RawHandle` / `HandleTable` / `KObjectRef` | generation bits + kill-on-stale |
 | `PipeId` + global `PIPES` map + `SYS_PIPE_OPEN/PIPE_ID` | deleted — Arc ends + transfer | no global namespace to guess |
 | `SharedToken` (`Copy` u32, no RAII — known issue) | deleted — `Arc<SharedMemObject>` | RAII by construction |
-| `RingId` (userland-visible) | `IoUring` handle; koid internally | ring owns its pages |
+| `RingId` — **not userland-visible; it is kernel-internal (no `RingId` in `toyos-abi/`)**. The real exposure is that the ring's pages come from the global shm namespace, i.e. the `SharedToken` problem one row up | `IoUring` handle; koid internally | ring owns its pages |
 | `ListenerId` | `Listener` handle; names stay rendezvous strings | |
 | `Pid`/`Tid` in `waitpid`/`kill`/`thread_join` | `Process`/`Thread` handles | authority requires capability |
 | `Pid`/`Tid` in logs, stats, scheduler keys | **stay plain integers** | pure names; every authority path goes through a handle |
@@ -654,7 +660,36 @@ comment.
 
 ### 9.4 Contract with the Phase-1 scheduler (pinned now, whichever lands second adopts)
 
+> **This section was written against a Phase-1 scheduler that did not land in this
+> shape, and five of its claims name things that do not exist.** It is the one pinned
+> coordination point between the two specs, so it is corrected here rather than left
+> for whoever implements second to discover. Verified against `HEAD` 2026-08-01.
+>
+> - **There is no `TaskCtx`.** The payload type is `KernelPayload`
+>   (`kernel/src/sched/payload.rs`), and the saved context is `KernelCtx`.
+> - **There is no `cr3()` on the task.** `cr3()` exists on `PageTables`
+>   (`mm/paging.rs:253`). Cr3 is snapshotted as a `Cr3` **value** into
+>   `KernelCtx.cr3` (`payload.rs:70`) at spawn. §6.4's hazard — "a stale queued
+>   `TaskCtx` calling `cr3()` reads live root tables" — describes a call that cannot
+>   occur, because there is no call: the value was copied.
+> - **`retire_task` returns `()`**, not owned-Task-or-proof-of-absence
+>   (`scheduler.rs:358`, `pub fn retire_task(sched: &ThreadSched)`).
+> - **`handle_outgoing` does not exist** — deleted at scheduler migration 7a/7c, zero
+>   hits in `kernel/`. The "never dropped on its own kernel stack" assert it names has
+>   no protocol behind it.
+> - **`scheduler::block` does not exist**, so the interim rule names a function nobody
+>   can hold an Arc across.
+>
+> **What genuinely remains from this section is one retype:**
+> `KernelPayload.address_space: Option<PageTables>` (`payload.rs:88`) should be
+> non-`Option`. That is what would kill the
+> `.expect("spawn: task without an address space")` at `driver.rs:224` — a real
+> unwrap on a real invariant, which is what the original `aspace: Arc<..> // non-Option`
+> line was reaching for. The rest of the block below is kept as the *intent* it
+> recorded, not as an API.
+
 ```rust
+// HISTORICAL — the shape this spec pinned. See the correction above.
 pub struct TaskCtx {   // Phase-1 `Task`
     pub thread: Arc<ThreadObject>,
     pub process: Arc<ProcessObject>,          // strong edge: a RUNNING process can
@@ -667,18 +702,10 @@ pub struct TaskCtx {   // Phase-1 `Task`
 impl TaskCtx { pub fn cr3(&self) -> Cr3 { self.aspace.cr3() } }   // no unwrap
 ```
 
-- Phase 1 guarantees: `Task` is move-only, exclusively owned by one container;
-  `retire_task(id)` returns owned-Task-or-proof-of-absence.
 - This layer guarantees Phase 1: the three Arcs' `Drop`s are safe from any context a
   Task is dropped in — they take no scheduler locks and run no zero-handle hooks
   inline (Tasks hold refs, not handles; hooks only ever run from the deferred queue).
-- Runtime assert inherited from Phase 1: a `TaskCtx` is never dropped on its own
-  kernel stack (`handle_outgoing` protocol).
-- **Interim rule until Phase 2** (stated, census-enforced): syscall code must not hold
-  object Arcs across `scheduler::block` on a retirable stack — re-look-up after wake.
-  Violations don't break semantics (§5.1) but leak until reboot; the census baseline
-  assertions in the QEMU churn tests catch them. Phase 2's try-once syscalls make the
-  rule structural and moot.
+  **This one still holds and is the substance of the contract.**
 
 ## 10. Userland SDK — `toyos/src/handle.rs`
 
@@ -759,9 +786,18 @@ transparent for stdio by §4.1): `SYS_READ/WRITE/CLOSE/SEEK/FSTAT/READ_NONBLOCK/
 
 `kernel/clippy.toml` `disallowed-methods`: `Arc::into_raw`, `Arc::from_raw`,
 `Arc::increment_strong_count`, `Arc::decrement_strong_count`, `core::mem::forget`.
-Single documented `#[allow]` island: the scheduler lock-across-`context_switch` path,
-removed by Phase 1. CI grep-gates (stage F): no `SharedToken`, no `pipe_open`, no
-pid-authority call sites.
+**There is no scheduler `#[allow]` island, and there is nothing for it to cover:** no
+banned `Arc::*` method is used anywhere in `kernel/` or `toyos-sched/src/` (checked
+2026-08-01). The lock-across-`context_switch` path this named was removed by the
+scheduler migration, not by Phase 1 of this spec.
+
+The wall would need exactly two islands, both for `core::mem::forget` and both
+deliberate: `drivers/gop.rs:69` (cursor pages live forever — the GPU is never torn
+down) and `mm/alloc.rs:16` (dlmalloc manages the lifetime). Neither is a refcount
+hazard, so a `forget` ban is the one entry on the list that is purely about intent.
+
+CI grep-gates (stage F): no `SharedToken`, no `pipe_open`, no pid-authority call
+sites.
 
 ### 12.3 Runtime fail-fast
 
