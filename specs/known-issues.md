@@ -265,6 +265,30 @@ on files we put on the ESP ourselves. It is on the list because the metal track
 makes the ESP a thing a user can write to, and because none of the kernel's
 protections exist yet at that point.
 
+### ASSIGNED — the compositor and netd do not bound what they accept
+
+Neither program has a `MAX_` constant of any kind. The compositor calls
+`Poller::new(256)` (`compositor/src/main.rs:747`) and registers three fixed fds
+plus one per window, with `windows.push` unguarded (`:127`, `:1377`). netd calls
+`Poller::new(64)` (`netd/src/main.rs:1060`) and registers two plus one per tx
+pipe. **The 256 and the 64 are guesses, not caps derived from anything.**
+
+This is the same class as the two bounds CLAUDE.md holds up as policy —
+`user_ptr::MAX_USER_STR` and `fd.rs`'s `MAX_FDS`, each sized against a stated
+ceiling and enforced at the one primitive that can breach it. Nobody wrote these
+two. A defect on its own terms, not poller plumbing: the poller capacity is where
+it happens to surface first.
+
+**It compounds "No physical memory fairness" below, and the pair is worse than
+either alone.** An unbounded window count is a memory-growth path any client can
+drive, on a system with no per-process limits, no pressure signal and no OOM
+killer. Neither entry is alarming by itself; together a single misbehaving client
+takes the machine.
+
+Fix in progress, with two requirements on its shape: the bound must state what it
+is a function of, and refusing past it must be an error return — not a panic, and
+not a silent drop.
+
 ### No physical memory fairness
 
 Any process can allocate unbounded physical memory until the system runs out.
@@ -881,10 +905,40 @@ keeping up.
 ## 4. Audio and soundd
 
 Spec: `specs/audio-subsystem-spec.md`. Numbered as in the 2026-07-28 audit;
-(1) Poller SQ overrun, (2) `CommandRing::push` assert, (3) ungated
+(1) — see the re-filing below; it was never an SQ overrun — (2) `CommandRing::push` assert, (3) ungated
 `SYS_SET_RT_PRIORITY`, (4) NaN volume, (7) crash detection and (9) the
 "wait until clients have filled" condition are fixed (`97723dc`, `9ed8eda`,
 `a88e4ee`, `069d158`).
+
+**RE-FILED — audit item (1) is not an SQ overrun; it is silent completion loss on
+the CQ.** The submission ring self-limits at four separate points: `poll_add_fd`
+flushes at `pending() == sq_size`, `submit_sqes` refuses `count > sq_size`,
+`claim_sqe` errors when `available > sq_size`, and the kernel drains `head` to
+`tail`. Nothing can overrun it.
+
+The real defect is on the completion side, and **the mid-registration flush is the
+cause rather than the protection**: flushing mid-registration makes the kernel
+process those registrations immediately, so fds that are already ready post CQEs
+while the caller is still registering the rest. Past `cq_size` (2 × `sq_size`),
+`post_cqe` increments `dropped` and returns (`kernel/src/io_uring.rs:201`) — and
+**`Poller::wait` never reads `dropped`** (no occurrence anywhere in
+`toyos/src/poller.rs`). The caller then blocks forever on an event that was thrown
+away.
+
+Kept rather than renamed in place, because the mislabel is the finding: an entry
+filed under the wrong mechanism sends everyone to the wrong ring, and the
+submission ring is exactly where you would look.
+
+**Stale prose, same class as the rest of today's:** the `Poller`'s own doc comment
+says the kernel "asserts rather than overflows" (`toyos/src/poller.rs:27`). That
+stopped being true when `post_cqe` switched to incrementing `dropped` and
+returning. Nobody re-checked the comment, and it is the sentence that would have
+stopped someone looking for the loss.
+
+Fix is three commits: make the loss loud, then make the drop unrepresentable via a
+declared capacity, then keep the tripwire as an unreachable assert. **The second is
+blocked on the compositor/netd bounds** — two callers cannot honestly declare a
+capacity until they bound what they accept.
 
 **BLOCKED ON THE CPAL FORK — one missing message, three consequences.** Killing
 wedged clients, suspending on no progress, and resuming from suspend all need the
