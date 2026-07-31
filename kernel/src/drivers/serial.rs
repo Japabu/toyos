@@ -18,6 +18,7 @@
 
 use core::sync::atomic::{AtomicBool, Ordering};
 use crate::arch::cpu::{inb, outb};
+use crate::log;
 
 const PORT: u16 = 0x3f8; // COM1
 
@@ -40,8 +41,20 @@ pub fn init() {
     outb(PORT + 4, 0x0B); // IRQs enabled, RTS/DSR set
     outb(PORT + 4, 0x1E); // Set in loopback mode, test the serial chip
     outb(PORT + 0, 0xAE); // Test serial chip (send byte 0xAE and check if serial returns same byte)
-    UART_PRESENT.store(inb(PORT + 0) == 0xAE, Ordering::Relaxed);
+    let loopback = inb(PORT + 0);
+    UART_PRESENT.store(loopback == 0xAE, Ordering::Relaxed);
     outb(PORT + 4, 0x0F); // Normal operation mode
+    // The byte, not just the verdict. Replacing the old assert with a silent
+    // latch collapsed three different situations into one `false`: no SuperIO
+    // at all (0xFF), a chip that answered wrongly, and the right chip at the
+    // wrong port. They want different next steps, and on a machine with no
+    // serial output this line is the difference — it still reaches the
+    // virtio-console and the on-screen console.
+    log!(
+        "serial: 16550 loopback read {:#04x} ({})",
+        loopback,
+        if loopback == 0xAE { "present" } else { "absent or wrong port" }
+    );
 }
 
 pub fn uart_present() -> bool {

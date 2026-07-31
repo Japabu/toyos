@@ -41,6 +41,26 @@ or claims it after the daemon dies, holds everything the claim unlocks — for
 `DEVICE_AUDIO` that includes the RT band, which audio spec §9.4 wants to be a
 privilege. "Gated" here does not mean "privileged".
 
+### `SYS_DEBUG` is ungated, and two of its actions are a diagnostic-channel DoS
+
+Action 3 — halt every CPU — no longer exists outside the `test-fatal-halt`
+feature. The other three are still reachable by any process at any time, and
+the audit that removed action 3 turned up what they cost:
+
+- **0 and 1** (`panic!`, and a null read that faults in kernel context) each
+  run a full `crash_report`: dozens of lines into the 64 KiB log ring, a
+  `PROCESS_TABLE.try_lock()`, a kernel and a user backtrace with symbol
+  resolution, and a `panic_flush` that drains the ring synchronously. A loop
+  calling `debug(0)` therefore floods the one channel the kernel reports on and
+  spends unbounded time in the panic path, and each iteration takes the
+  recovery route, which is documented above as able to strand locks.
+- **2** costs one lock permanently, by design, and is one-shot for that reason.
+
+None of this is memory-unsafe and none of it kills the machine. It is a syscall
+whose only purpose is to make the kernel misbehave, available to everything —
+the same class as `SYS_SHUTDOWN` being ungated, and it wants the same decision:
+a capability, or `#[cfg(debug_assertions)]`, or deletion.
+
 ### Untrusted-input panics that remain
 
 A crafted ELF still panics the kernel outright:
@@ -97,6 +117,44 @@ thread never releases it. Pre-existing and unchanged by the panic-recovery fix; 
 for its own holder too. The general shape — locks a dead thread can strand —
 belongs to the capability-handles/ownership work.
 
+### The on-screen console shows only what serial has *not* consumed
+
+The log ring is a queue, not a history: `drain_to_serial` pops, and the idle
+loop and timer tick drain continuously. `peek_tail` therefore returns only the
+bytes no drain has reached yet, which on a running system is the last line or
+two — `screen_fatal_halt`'s screen is exactly one line, the nonce.
+
+The panic handler's own reports are unaffected and that is not luck:
+`crash_report` writes the whole report with interrupts already off, and
+`capture()` copies it before `panic_flush` drains. So a panic screen carries
+the report and no context, and a fatal *exception* screen (which never
+captures) carries whatever its `crash_report` just wrote, for the same reason.
+
+It matters for the machine M0 exists for. A drain into a backend that discards
+— no UART, no virtio-console — still pops, so on the T14 the ring is being
+emptied into nothing all the time and there is no scrollback to fall back on.
+Options, none taken: stop draining when no backend can write; keep a separate
+non-consuming history for the console; or accept it and say so in the design.
+
+### The double-fault path overflows IST1 by ~1.4 KiB while reporting
+
+IST1 is a 4096-byte heap allocation (`arch/percpu.rs:187`, `:216`) used by
+vector 8 alone. `double_fault_handler` (`arch/idt/exceptions.rs:363`) spends
+about a kilobyte on `log!`'s 1024-byte `SerialWriter` buffers and then ends in
+`halt_all_cpus` → `panic_flush`, whose entry block declares `let mut buf =
+[0u8; 4096]` (`drivers/serial.rs`). That array is reserved in the prologue on
+every path through the function, including the two early returns, so a double
+fault writes roughly 1.4 KiB below its stack into whatever heap object the
+allocator put there — while reporting the double fault.
+
+Pre-existing: the panic-console series only added the early return. But it
+invalidates the reasoning the console's DESIGN RULE relies on ("stack budget is
+256 bytes plus the one wrap array; the double fault path runs on IST1, which is
+4096 bytes"), because the renderer is not the peak — `panic_flush` is, and it
+already exceeds the stack before the renderer is counted. Two independent
+fixes: size IST1 from the real worst case (16 KiB, like the idle stack), and
+give `panic_flush` a static bypass buffer instead of a stack one.
+
 ### A panic while the virtio-console TX queue is wedged *and* unlocked spins
 
 In `submit_and_wait`. Bounding that wait is a `virtio.rs` semantics change that
@@ -119,14 +177,50 @@ a lock-free read or be dropped. `kernel/src/drivers/panic_console/mod.rs`
 already states the stricter rule and obeys it; `exceptions.rs` is the
 remaining half.
 
+### `percpu.syscall_rip` is never cleared, so "in syscall context" is a guess
+
+`syscall_entry` stores the user RIP at `gs:[216]` on every SYSCALL and nothing
+ever zeroes it. The panic handler's recovery predicate is `syscall_rip() != 0
+&& current_tid().is_some()` (`main.rs`), so on any CPU that has ever served a
+syscall the first half is permanently true. A panic in IRQ context — a timer
+tick, a scheduler assert — with any task current is therefore treated as a
+syscall panic: `try_recover_from_panic` poisons that task, kills the process
+and rejoins the scheduler.
+
+The consequence is backwards from fail-fast: a kernel bug with nothing to do
+with the current process kills an innocent process and lets the machine run on,
+instead of halting and reporting. `crash_report_panic` prints a "Syscall:
+num=... user_rip=..." block off the same stale value, so the report also names
+a syscall that is not running. Clearing it on syscall return is one store; the
+honest predicate is a per-CPU "in syscall" depth.
+
+### `fatal_exception`'s `recursive` branch never fires for a nested `#PF`
+
+`page_fault_handler` swaps the fault state to `PageFault` *before* dispatching
+(`arch/idt/exceptions.rs:452`), and `fatal_exception`'s `recursive` tests only
+`Fatal | Panic` (`:506`). A `#PF` nested inside a panic — the exact case the
+short-circuit exists for — is therefore classified non-recursive and runs the
+full `crash_report` again.
+
+Termination still holds, through the panic console's `PAINTING` latch and the
+per-CPU reentry guard, so this is not a live loop. But `a431e02`'s commit
+message credits the `recursive` branch with bounding a renderer fault, and that
+mechanism does not fire; the latch is doing all the work. Either widen the test
+to include `PageFault`, or stop claiming the branch bounds anything.
+
 ### `uart_write_bytes` spins unbounded on the LSR
 
 `kernel/src/drivers/serial.rs`, end of file, while `panic_raw_uart`
-(`main.rs:91-99`) bounds the same wait at 100 000 iterations. A UART that is
+(`main.rs`) bounds the same wait at 100 000 iterations. A UART that is
 *present but wedged* therefore hangs every `panic_flush` bypass — the last
 resort of the panic path — where the raw reentry path would have escaped.
-Absent hardware is no longer a hazard: `2e52e8e` gates every UART access on the
-loopback probe.
+
+Absent hardware is no longer a hazard. The earlier wording here claimed
+`2e52e8e` gated *every* UART access on the loopback probe, which was not true
+of `panic_raw_uart` — it did raw `inb(0x3FD)`/`outb(0x3F8)` with no check.
+That gap is closed now, and `serial::init` logs the probe byte itself, so
+"no SuperIO" (0xFF), "chip answered wrongly" and "right chip, wrong port" are
+distinguishable instead of collapsing into one silent `false`.
 
 ---
 
@@ -550,9 +644,10 @@ was zero everywhere. `cargo run --gop` and `BootOptions { display: Display::Gop 
 
 **It is not the default.** Plain `cargo run` and the default test config still
 boot `-vga none` with virtio-gpu or with no display device, so `gop.rs` is
-exercised only by `--gop` and by the five `screen_*` tests. Every other test in
-the suite still says nothing about the display path a laptop takes. M1's
-metal-sim profile is what should make GOP a first-class CI config.
+exercised only by `--gop` and by five of the six `screen_*` tests
+(`screen_decoder` boots no guest at all). Every other test in the suite still
+says nothing about the display path a laptop takes. M1's metal-sim profile is
+what should make GOP a first-class CI config.
 
 **The mode is wrong.** `bootloader/src/main.rs:186-205` selects the mode with
 the most pixels. On QEMU stdvga that is **2048x2048** — square, non-standard,
@@ -561,6 +656,16 @@ and it makes the compositor scale a 1920x1080 wallpaper to a square. It is also
 "Largest wins" is not a mode policy; a real one would prefer the firmware's
 current mode, or the largest 16:9/16:10 mode, and only then fall back. Harmless
 for M0, wrong for M1.
+
+**What the repaints actually cost.** `e5e600f`'s message gives two figures that
+cannot both be true — "~13ms per repaint" and "135ms to 181ms" for six of them.
+Measured A/B in one session on this host: the same tree boots to `Boot:
+complete` in **118 ms** with no console armed (`-vga none`) and **188 ms** under
+GOP. Five repaints happen before that line is logged and the sixth after it, so
+the per-repaint figure is right (~14 ms) and the 135→181 pair is the wrong one.
+Every phase boundary also carries a `wbinvd`, which QEMU ignores entirely — on
+metal that is six full cache-hierarchy flushes on a machine that keeps running,
+and it is not measurable here.
 
 - PCID + INVPCID codepaths untested on real hardware — QEMU TCG supports
   neither. Both are CPUID-gated, so TCG falls back to a CR3 reload. Needs KVM or

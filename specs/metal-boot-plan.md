@@ -47,8 +47,12 @@ bar; QEMU cannot.
   8x16 text grid on the GOP framebuffer, armed *before* `serial::init` and
   taking no lock of any kind; recovering panics never paint. The six boot
   phase boundaries repaint, so a machine that wedges without panicking still
-  shows which phase it reached. Five `screen_*` tests decode the screendump
-  glyph-by-glyph against the same `font8x16.bin` the kernel blits. Detail:
+  shows which phase it reached. Six `screen_*` tests decode the screendump
+  glyph-by-glyph against the same `font8x16.bin` the kernel blits, and assert
+  the fill and highlight colours the decoder is deliberately blind to. What
+  the screen carries is the *report*, not the boot log: the ring is drained
+  continuously, so only what the panic handler captured before the drain is
+  there (known issues §2). Detail:
   `kernel/src/drivers/panic_console/mod.rs`.
 - **M1 — "metal-sim" QEMU profile.** No virtio devices at all (GOP + i8042 +
   NVMe only); must reach the compositor; daemons must degrade gracefully when
