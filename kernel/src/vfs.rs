@@ -300,11 +300,14 @@ impl Vfs {
     }
 
     /// Flush dirty pages for a file, then update metadata.
+    ///
+    /// No early return on an empty dirty set. A `ftruncate` changes the file's
+    /// size without dirtying a page, so returning here left the new size in the
+    /// file cache and never told the filesystem — correct until the last fd
+    /// closed and the cached size went with it. Callers reach this only when
+    /// the fd is marked modified, so there is always something to record.
     pub fn flush_file(&mut self, path: &str, file_id: FileId, mtime: u64) -> Result<(), &'static str> {
         let dirty = crate::file_cache::clone_dirty(file_id);
-        if dirty.is_empty() {
-            return Ok(());
-        }
 
         let (mount, file) = self.resolve_path("/", path);
         if mount.is_empty() { return Err("invalid path"); }

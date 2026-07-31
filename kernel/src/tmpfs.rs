@@ -1,9 +1,40 @@
 use alloc::collections::BTreeMap;
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
+use crate::file_backing::FileBacking;
 use crate::file_cache::{self, FileId};
 use crate::vfs::FileSystem;
+
+/// Reads a tmpfs file for the ELF loader, which demand-pages every executable
+/// through a `FileBacking` and had no way to reach a mount whose pages are its
+/// only storage. Without this nothing under /tmp was spawnable or dlopenable.
+///
+/// `copy_page_out`, not `file_cache::read_page`: a tmpfs page *is* the file, so
+/// there is no miss for a backing to satisfy — and the miss path is what calls
+/// a backing, so reading through it here would recurse.
+struct TmpfsBacking {
+    file_id: FileId,
+}
+
+impl FileBacking for TmpfsBacking {
+    fn read_page(&self, file_offset: u64, buf: &mut [u8; 4096]) {
+        if file_offset >= file_cache::size(self.file_id) {
+            buf.fill(0);
+            return;
+        }
+        file_cache::copy_page_out(self.file_id, (file_offset / 4096) as u32, buf);
+    }
+
+    fn file_size(&self) -> u64 {
+        file_cache::size(self.file_id)
+    }
+
+    // No `memory_ptr`: pages are individual heap boxes, so no run of a tmpfs
+    // file is contiguous and the loader has to copy. Only the initrd, which is
+    // one image in memory, can answer that question.
+}
 
 /// In-memory filesystem. File data lives in the unified file cache
 /// (non-evictable pages). tmpfs only stores the namespace mapping.
@@ -114,4 +145,9 @@ impl FileSystem for TmpFs {
     }
 
     fn sync(&mut self) {}
+
+    fn open_backing(&mut self, name: &str) -> Option<Arc<dyn FileBacking>> {
+        let (file_id, _) = self.files.get(name)?;
+        Some(Arc::new(TmpfsBacking { file_id: *file_id }))
+    }
 }
