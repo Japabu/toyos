@@ -103,6 +103,36 @@ a test result.
    host-side, verify bytes. Nothing today proves an NVMe write ever lands.
 4. **Gate N.** Already specified.
 
+## No host stress tests, and no brute-force volume runs
+
+Owner's rule, 2026-07-31. The dev machine is a laptop; multi-million-iteration
+loops peg it for minutes and are not how defects in this tree get found.
+
+The evidence, checked rather than assumed:
+
+- **The `toyos-ps2` 10-million-byte fuzz found nothing, and could not have.**
+  The M2 review confirmed every one of its assertions was structurally
+  unfalsifiable — `usage != 0` enforced by the emitter, the HID range by table
+  contents, `buttons < 8` by a mask, `|dx|,|dy| <= 256` by the arithmetic
+  domain. The real mouse-framing defect (a body byte with bit 3 set is a legal
+  head, so a one-byte misframe self-sustains) was found by *reading the
+  framer*, and the host test that passed over it used the one delta pair that
+  cannot masquerade as a head.
+- **`allocator_stress`, `mmap_stress` and `sched_stress` have never produced a
+  fix.** They arrived with the initial import and no commit has touched them
+  since.
+
+What does work, and is the exception that proves the rule: the scheduler's
+deterministic simulator and interleaving fuzzer (`toyos-sched/sim/`). It is not
+volume for its own sake — it explores interleavings against **ownership-typed
+invariants**, is reproducible from a seed, and its five negative gates prove it
+can still fail. Randomness there is a search strategy over a model with real
+assertions, not a substitute for having assertions.
+
+The rule: a test earns its runtime by asserting something that can be false.
+If you cannot state what a run would have to observe to go red, more iterations
+will not supply it.
+
 ## What not to build
 
 A gate-A-style distributional tier per device. That instrument costs ~17 minutes
