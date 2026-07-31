@@ -71,6 +71,7 @@ const MACHINE_TESTS: &[&str] = &[
     "metal_sim_input",
     "foreign_disk_untouched",
     "double_fault_stack",
+    "diskless_boot",
     "xhci_many_devices",
     "nvme_large_device",
     "nvme_wide_sector",
@@ -1415,6 +1416,7 @@ fn run_machine_test(
         // stays one line.
         "foreign_disk_untouched" => storage::foreign_disk_untouched(test_config, c_bins, rust_bins),
         "double_fault_stack" => faults::double_fault_stack(test_config, c_bins, rust_bins),
+        "diskless_boot" => faults::diskless_boot(test_config, c_bins, rust_bins),
         "metal_sim_compositor" => {
             // M1's permanent config: the whole boot with no virtio device
             // anywhere. What it certifies is which processes survive the

@@ -83,6 +83,47 @@ pub fn double_fault_stack(
     Ok(())
 }
 
+/// A machine with no NVMe controller must boot.
+///
+/// `.expect("NVMe: no controller found")` killed it at 0.08 s — before
+/// storage, before a console on the target laptop, and with the screen still
+/// showing whatever the last checkpoint painted. It is the same class M1
+/// closed for xHCI, on a different controller, and the same class the
+/// designation stamp closed one layer up: absence of storage is a
+/// configuration, not a failure.
+pub fn diskless_boot(
+    test_config: &Path,
+    c_bins: &[(String, Vec<u8>)],
+    rust_bins: &[(String, Vec<u8>)],
+) -> Result<(), String> {
+    let options = BootOptions {
+        profile: qemu::Profile::Diskless,
+        ..Default::default()
+    };
+    // The teeth, and the only ones: absence is invisible to every console line
+    // and every screendump, so the argv is where it has to be checked.
+    let argv = qemu::profile_argv(&options);
+    if argv.iter().any(|a| a.contains("nvme")) {
+        return Err(format!("the diskless profile still has an NVMe device: {argv:?}"));
+    }
+
+    let qemu = QemuInstance::boot_with_options(test_config, c_bins, rust_bins, options);
+    let log = qemu.boot_log().to_string();
+
+    for bad in ["!!! PANIC !!!", "panicked at", "no controller found"] {
+        if log.contains(bad) {
+            return Err(format!("{bad:?}: a machine with no disk must still boot\n{log}"));
+        }
+    }
+    if !log.contains("NVMe: no controller on this machine") {
+        return Err(format!("the kernel did not report the absent controller\n{log}"));
+    }
+    if !log.contains("Boot: complete") {
+        return Err(format!("the boot did not complete without a disk\n{log}"));
+    }
+    Ok(())
+}
+
 /// `[ist1] used N of M bytes, ...`
 fn parse(line: &str) -> Option<(usize, usize)> {
     let rest = line.split(MARKER).nth(1)?;

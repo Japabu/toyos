@@ -47,6 +47,16 @@ pub enum Profile {
     /// boot on the laptop was the first time anything asked for a
     /// device-sized allocation.
     MetalDisk,
+    /// metal-sim with no NVMe controller at all.
+    ///
+    /// Device *presence* is the shape dimension underneath size and sector
+    /// size, and it was the one nobody had varied for storage: every profile
+    /// gave the guest a disk, so nothing asked what the kernel does without
+    /// one. The answer was `.expect("NVMe: no controller found")` at 0.08 s.
+    /// The bootloader reads the initrd through UEFI before ExitBootServices,
+    /// so a machine really can boot ToyOS with no NVMe -- and a controller
+    /// hidden behind a firmware setting looks exactly the same.
+    Diskless,
     /// metal-sim with a namespace formatted in 8 KiB logical blocks.
     ///
     /// Sector size is a shape dimension in exactly the sense
@@ -146,6 +156,16 @@ impl Profile {
                 xhci: XHCI_DEFAULT,
                 usb: &["usb-kbd"],
                 nvme_bytes: NVME_SMALL,
+                nvme_lba_bytes: NVME_LBA_DEFAULT,
+            },
+            Self::Diskless => Shape {
+                vga: "std",
+                virtio: false,
+                xhci: XHCI_DEFAULT,
+                usb: &[],
+                // Zero is the absence, not a zero-length disk: `nvme_args`
+                // emits no controller, no namespace and no backing file.
+                nvme_bytes: 0,
                 nvme_lba_bytes: NVME_LBA_DEFAULT,
             },
             Self::Metal => Shape {
@@ -346,6 +366,9 @@ impl QemuInstance {
         let nvme_bytes = options.profile.shape().nvme_bytes;
         let nvme_image = match &options.nvme_image {
             Some(path) => path.clone(),
+            // A profile with no controller gets no backing file either; the
+            // path is never passed to QEMU.
+            None if nvme_bytes == 0 => test_dir.join("no-nvme"),
             None => {
                 let path = test_dir.join(format!("test-nvme-{nvme_bytes}.img"));
                 if !path.exists() {
@@ -880,26 +903,32 @@ fn qemu_command(
         ))
         .arg("-device")
         .arg("usb-storage,bus=xhci.0,drive=stick,bootindex=0")
-        .arg("-drive")
-        .arg(format!(
-            "if=none,id=nvme0,format=raw,file={}",
-            nvme_image.display()
-        ))
-        // Controller and namespace as two devices rather than QEMU's implicit
-        // one, so the logical block size is something a profile states instead
-        // of something the default decides.
-        .arg("-device")
-        .arg("nvme,serial=deadbeef,id=nvme0ctl")
-        .arg("-device")
-        .arg(format!(
-            "nvme-ns,drive=nvme0,bus=nvme0ctl,logical_block_size={0},physical_block_size={0}",
-            shape.nvme_lba_bytes
-        ))
         .arg("-vga")
         .arg(shape.vga)
         .arg("-display")
         .arg("none")
         .arg("-no-reboot");
+
+    // Controller and namespace as two devices rather than QEMU's implicit
+    // one, so the logical block size is something a profile states instead of
+    // something the default decides — and so that stating *zero* bytes gives
+    // the guest no controller at all, rather than an empty one. A machine
+    // with no NVMe is a shape, and the argv is the only place it is visible:
+    // no console line and no screendump can see a device that is absent.
+    if shape.nvme_bytes != 0 {
+        qemu.arg("-drive")
+            .arg(format!(
+                "if=none,id=nvme0,format=raw,file={}",
+                nvme_image.display()
+            ))
+            .arg("-device")
+            .arg("nvme,serial=deadbeef,id=nvme0ctl")
+            .arg("-device")
+            .arg(format!(
+                "nvme-ns,drive=nvme0,bus=nvme0ctl,logical_block_size={0},physical_block_size={0}",
+                shape.nvme_lba_bytes
+            ));
+    }
 
     for dev in shape.usb {
         qemu.arg("-device").arg(format!("{dev},bus=xhci.0"));

@@ -341,14 +341,29 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
         .expect("ACPI: failed to find ECAM base address");
     let ecam = mm::paging::kernel().lock().as_mut().unwrap().map_mmio(ecam_base, 256 * 32 * 8 * 4096);
     pci::enumerate(&ecam);
-    let nvme_dev = nvme::init(&ecam).expect("NVMe: no controller found");
-    page_cache::init(Box::new(nvme_dev));
     file_cache::init();
 
-    // `None` means the disk is not ours to write to. It is not an error and it
-    // must never become one: on any machine that already had an operating
-    // system, it is the correct answer.
-    let home_volume = bcachefs_adapter::open_home();
+    // No controller is a configuration, not a failure — the same call this
+    // kernel already makes for a missing xHCI, a missing NIC and a missing
+    // audio device. The bootloader reads the whole initrd through UEFI before
+    // ExitBootServices, so a machine can boot off a USB stick with no NVMe at
+    // all, and one where the controller sits behind a firmware setting we have
+    // not touched looks identical. `.expect` here killed both, at 0.08 s, on a
+    // machine whose only output channel is a screen that says nothing useful
+    // yet.
+    //
+    // `None` from `open_home` is the other half and means something different:
+    // there *is* a disk and it is not ours to write to. Both land on a tmpfs.
+    let home_volume = match nvme::init(&ecam) {
+        Some(nvme_dev) => {
+            page_cache::init(Box::new(nvme_dev));
+            bcachefs_adapter::open_home()
+        }
+        None => {
+            log!("NVMe: no controller on this machine, storage unavailable");
+            None
+        }
+    };
 
     boot_phase!("storage ready", t_storage);
 
