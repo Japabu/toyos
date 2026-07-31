@@ -1,7 +1,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use crate::mm::{PAGE_2M, KernelSlice};
+use crate::mm::{PAGE_2M, MAX_HEAP_ALLOC, align_2m_checked, KernelSlice};
 use crate::process::PageAlloc;
 use crate::UserAddr;
 use crate::sync::Lock;
@@ -25,29 +25,6 @@ const R_X86_64_TPOFF32: u32 = 23;
 pub const SYM_SIZE: usize = core::mem::size_of::<Elf64_Sym>(); // 24
 const RELA_SIZE: u64 = core::mem::size_of::<Elf64_Rela>() as u64; // 24
 
-/// The largest single kernel heap allocation the loader will make from a size
-/// an ELF declared — a table it reads whole (`DT_STRSZ`, `DT_RELASZ`,
-/// `e_shnum * e_shentsize`, a symbol count) or the exe's TLS template.
-///
-/// Policy, not physics, but the policy is one step from physics: the kernel
-/// heap's page source asserts above `PAGE_2M` (`mm/alloc.rs`), and dlmalloc
-/// rounds a request up to a whole 2 MiB granule *plus* its own chunk and
-/// segment bookkeeping — so a request that merely fits in 2 MiB still asks the
-/// page source for 4 MiB and panics. One 4 KiB page of headroom covers that
-/// bookkeeping many times over. Above this the ELF is refused rather than
-/// truncated: a table read short is a binary that loads with a symbol table
-/// nobody knows is incomplete.
-///
-/// Nothing this tree builds comes close — the largest `.dynstr` among the
-/// binaries in `system.toml` is under 200 KiB.
-pub const MAX_ELF_ALLOC: usize = PAGE_2M as usize - 4096;
-
-/// `align_2m` for a size that came out of a file. The round-up wraps, and a
-/// wrapped size is an allocation far smaller than the caller asked for with
-/// every later bound computed from the request.
-pub fn align_2m_checked(size: usize) -> Option<usize> {
-    Some(size.checked_add(PAGE_2M as usize - 1)? & !(PAGE_2M as usize - 1))
-}
 
 pub fn read_sym(data: &[u8], index: usize) -> Elf64_Sym {
     let off = index * SYM_SIZE;
@@ -368,7 +345,7 @@ pub struct ElfSegment {
 ///   `!(align - 1)` is a mask and the TLS block's size cannot be dominated by
 ///   a number the file chose;
 /// - `section_headers`, if present, describes a table that fits in one kernel
-///   heap allocation (`MAX_ELF_ALLOC`) — every consumer reads it whole.
+///   heap allocation (`mm::MAX_HEAP_ALLOC`) — every consumer reads it whole.
 ///
 /// Downstream every size pair is a (copy length, destination size) pair —
 /// `OwnedAlloc::new(memsz)` then `copy(.., filesz)` — so `p_filesz <= p_memsz`
@@ -551,7 +528,7 @@ pub fn parse_layout(data: &[u8]) -> Result<ElfLayout, &'static str> {
         // Four call sites read the whole table into one `Vec`, including one
         // in `process.rs` that has no failure path. Refuse the file here
         // rather than let each of them meet the heap's ceiling separately.
-        if ehdr.e_shnum as usize * ehdr.e_shentsize as usize > MAX_ELF_ALLOC {
+        if ehdr.e_shnum as usize * ehdr.e_shentsize as usize > MAX_HEAP_ALLOC {
             return Err("ELF: section header table larger than one kernel allocation");
         }
         Some((ehdr.e_shoff, ehdr.e_shnum, ehdr.e_shentsize))
@@ -821,7 +798,7 @@ pub fn build_symtab_map(
     // fallback map for an exe that exports nothing through `.dynsym`; dropping
     // it degrades that binary's symbol resolution and says so, where reading
     // part of a symbol table would degrade it silently.
-    if symtab_size as usize > MAX_ELF_ALLOC || strtab_size as usize > MAX_ELF_ALLOC {
+    if symtab_size as usize > MAX_HEAP_ALLOC || strtab_size as usize > MAX_HEAP_ALLOC {
         log!("ELF: .symtab {} / .strtab {} exceed one kernel allocation, no symbol map",
             symtab_size, strtab_size);
         return None;

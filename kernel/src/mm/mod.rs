@@ -17,9 +17,44 @@ pub const PHYS_OFFSET: u64 = 0xFFFF_8000_0000_0000;
 pub const PAGE_2M: u64 = 2 * 1024 * 1024;
 
 /// Round `size` up to the next 2MB boundary.
+///
+/// Only for a size the kernel computed. Use [`align_2m_checked`] for one that
+/// came from outside it.
 pub const fn align_2m(size: usize) -> usize {
     (size + PAGE_2M as usize - 1) & !(PAGE_2M as usize - 1)
 }
+
+/// [`align_2m`] for a size that crossed a trust boundary — an ELF field, a
+/// syscall argument, an extent firmware reported.
+///
+/// The round-up wraps, and a wrapped size is the worst possible failure: an
+/// allocation far *smaller* than the caller asked for, with every later offset
+/// still computed from the request. `None` says the size cannot be expressed,
+/// which is the honest answer and not the same as an allocation failure.
+pub const fn align_2m_checked(size: usize) -> Option<usize> {
+    match size.checked_add(PAGE_2M as usize - 1) {
+        Some(sum) => Some(sum & !(PAGE_2M as usize - 1)),
+        None => None,
+    }
+}
+
+/// The largest single allocation the kernel heap can serve.
+///
+/// [`alloc::KernelPageSource`] hands out one 2 MiB page and asserts above
+/// `PAGE_2M`, because a 2 MiB page is all it has. dlmalloc rounds a request up
+/// to a whole granule *plus* its own chunk and segment bookkeeping, so a
+/// request that merely fits in 2 MiB still asks the page source for 4 MiB and
+/// trips that assert — which is why the ceiling is not `PAGE_2M` itself.
+///
+/// The 4 KiB of headroom is policy, in the same sense as
+/// `user_ptr::MAX_USER_STR`: the number is chosen, the reason it exists is
+/// not. dlmalloc's overhead is tens of bytes, so one page is orders of
+/// magnitude of margin and no real allocation lives in the gap.
+///
+/// Anything sized from outside the kernel must be refused above this rather
+/// than reaching the assert. `OwnedAlloc::new` enforces it for its own
+/// allocations; a bare `Vec::with_capacity` has to check.
+pub const MAX_HEAP_ALLOC: usize = PAGE_2M as usize - 4096;
 
 /// Whether an address is in the kernel's high-half direct map.
 pub fn is_kernel_addr(addr: u64) -> bool {

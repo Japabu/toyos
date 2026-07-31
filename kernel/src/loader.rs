@@ -74,7 +74,7 @@ pub fn setup_combined_tls(
     // placed `align`-aligned above it, so both belong in the size. Sizing from
     // the block and the alignment alone left `tls_start` free to land inside
     // the DTV, which the assert below then caught as if it were a kernel bug.
-    let alloc_size = crate::elf::align_2m_checked(
+    let alloc_size = crate::mm::align_2m_checked(
         block_size.checked_add(dtv_size)?.checked_add(align)?,
     )?;
     let page_alloc = PageAlloc::new(alloc_size, crate::mm::pmm::Category::InitTls)?;
@@ -295,7 +295,7 @@ pub(crate) fn read_file_range(backing: &dyn crate::file_backing::FileBacking, of
 /// [`read_file_range`] for a length the ELF *declared* — `DT_STRSZ`,
 /// `DT_RELASZ`, `e_shnum * e_shentsize`, a symbol count.
 ///
-/// `None` above [`elf::MAX_ELF_ALLOC`], which is the point where the `Vec`
+/// `None` above [`crate::mm::MAX_HEAP_ALLOC`], which is the point where the `Vec`
 /// stops being an allocation failure and becomes an assert in the kernel
 /// heap's page source. Refusing is deliberate: clamping the length instead
 /// would load the binary with a table that is short and nothing downstream
@@ -305,7 +305,7 @@ fn read_elf_table(
     offset: u64,
     len: usize,
 ) -> Option<Vec<u8>> {
-    if len > elf::MAX_ELF_ALLOC {
+    if len > crate::mm::MAX_HEAP_ALLOC {
         return None;
     }
     Some(read_file_range(backing, offset, len))
@@ -846,17 +846,11 @@ pub fn spawn(argv: &[&str], fds: FdTable, parent: Option<Pid>, env: Vec<u8>) -> 
         // intermediate `Vec` sized by the file's `tls_filesz`. `OwnedAlloc`
         // zeroes, so the `.tbss` tail needs no second pass.
         //
-        // `OwnedAlloc::new`'s own `size >= PAGE_2M` refusal is short by
-        // dlmalloc's per-chunk bookkeeping — a request just under 2 MiB still
-        // makes the allocator ask its page source for 4 MiB, which asserts. Ask
-        // for no more than one allocation can serve.
-        if layout.tls_memsz > elf::MAX_ELF_ALLOC {
-            log!("spawn: {}: PT_TLS memsz {} exceeds one kernel allocation",
-                path, layout.tls_memsz);
-            return Err(SyscallError::ResourceExhausted);
-        }
+        // A `tls_memsz` above what one heap allocation can hold is refused by
+        // `OwnedAlloc::new` itself, so there is no second copy of that ceiling
+        // here.
         let Some(tls_buf) = OwnedAlloc::new(layout.tls_memsz, 16) else {
-            log!("spawn: {}: failed to allocate TLS template ({} bytes)", path, layout.tls_memsz);
+            log!("spawn: {}: cannot allocate a {}-byte TLS template", path, layout.tls_memsz);
             return Err(SyscallError::ResourceExhausted);
         };
         elf::read_backing_into(backing.as_ref(), tls_file_off, tls_buf.ptr(), layout.tls_filesz);

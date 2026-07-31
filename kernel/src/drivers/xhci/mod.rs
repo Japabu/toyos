@@ -192,6 +192,12 @@ struct Layout {
 impl Layout {
     /// `max_scratchpad` and `max_slots` come straight off HCSPARAMS, which is
     /// where every number below stops being arbitrary.
+    ///
+    /// It is also what makes the plain `align_2m` below safe where every other
+    /// caller taking a size from outside the kernel needs `align_2m_checked`:
+    /// `max_scratchpad` is two 5-bit HCSPARAMS2 fields (`init` masks both with
+    /// `0x1F`), so it is at most 1023 and `dev_base` at most about 4.2 MiB. A
+    /// controller cannot report a number that overflows this, whatever it says.
     fn new(max_scratchpad: usize, max_slots: u8) -> Self {
         let scratch_array = SHARED_SIZE;
         let array_bytes = (max_scratchpad * 8 + PAGE - 1) & !(PAGE - 1);

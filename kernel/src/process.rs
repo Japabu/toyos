@@ -47,11 +47,18 @@ pub struct OwnedAlloc {
 impl OwnedAlloc {
     /// `None` for any size the kernel heap cannot serve, so a caller sizing a
     /// buffer from untrusted input gets a value to handle rather than a panic.
-    /// The heap's page source asserts above `PAGE_2M` (`mm::alloc`) instead of
-    /// returning null, so that ceiling is checked before the request, not
+    /// The heap's page source asserts above its ceiling (`mm::alloc`) instead
+    /// of returning null, so that ceiling is checked before the request, not
     /// after.
+    ///
+    /// The ceiling is `mm::MAX_HEAP_ALLOC`, not `PAGE_2M`. Testing against
+    /// `PAGE_2M` was short by dlmalloc's own bookkeeping: a request in
+    /// `[PAGE_2M - overhead, PAGE_2M)` passed here and then made dlmalloc ask
+    /// the page source for a 4 MiB granule, which is the assert this guard
+    /// exists to keep unreachable. Reached from a `PT_TLS` `p_memsz` of
+    /// `0x1F_FFF0`.
     pub fn new(size: usize, align: usize) -> Option<Self> {
-        if size >= PAGE_2M as usize { return None; }
+        if size > crate::mm::MAX_HEAP_ALLOC { return None; }
         let layout = Layout::from_size_align(size, align).ok()?;
         let ptr = NonNull::new(unsafe { alloc_zeroed(layout) })?;
         Some(Self { ptr, layout })
