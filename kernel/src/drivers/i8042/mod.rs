@@ -731,18 +731,3 @@ fn handler_poll() {
         n += 1;
     }
 }
-
-/// Cumulative key events this driver produced. The evidence that a keystroke
-/// arrived over PS/2 and not over USB, which is the single most likely way a
-/// test of this driver fools itself.
-pub fn kbd_events() -> u32 {
-    KBD_EVENTS.load(Ordering::Relaxed)
-}
-
-pub fn aux_events() -> u32 {
-    AUX_EVENTS.load(Ordering::Relaxed)
-}
-
-pub fn lost_edges() -> u32 {
-    LOST_EDGES.load(Ordering::Relaxed)
-}
