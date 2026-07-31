@@ -544,19 +544,19 @@ fn process_accept(ring_id: RingId, sqe: &IoUringSqe) {
     let fd_num = sqe.fd as u32;
     let user_data = sqe.user_data;
 
-    let listener_name = process::with_fd_owner_data(|data| {
+    let listener_id = process::with_fd_owner_data(|data| {
         match data.fds.get(fd_num) {
-            Some(fd::Descriptor::Listener(name)) => Some(name.clone()),
+            Some(fd::Descriptor::Listener(id)) => Some(*id),
             _ => None,
         }
     });
 
-    let Some(name) = listener_name else {
+    let Some(listener_id) = listener_id else {
         post_cqe_locked(ring_id, user_data, -(SyscallError::InvalidArgument as i32), 0);
         return;
     };
 
-    match crate::listener::pop_connection(&name) {
+    match crate::listener::pop_connection(listener_id) {
         Some(conn) => {
             let new_fd = process::with_fd_owner_data(|data| {
                 data.fds.insert(fd::Descriptor::Socket {

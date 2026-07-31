@@ -42,6 +42,9 @@ pub struct PendingConnection {
 }
 
 struct Listener {
+    /// The name this listener was registered under, so `remove` can unbind it
+    /// while being addressed by id.
+    name: String,
     /// The process that registered the name. A client's `connect` learns the
     /// server's pid from here — without it a client knows only a service name
     /// and could not name its own peer.
@@ -73,6 +76,7 @@ pub fn listen(name: &str, owner: Pid) -> Option<ListenerId> {
         return None;
     }
     let id = reg.by_id.insert(Listener {
+        name: String::from(name),
         owner,
         pending: VecDeque::new(),
         io_uring_watchers: Vec::new(),
@@ -99,18 +103,10 @@ pub fn push_connection(name: &str, conn: PendingConnection) -> bool {
     true
 }
 
-pub fn pop_connection(name: &str) -> Option<PendingConnection> {
+pub fn pop_connection(id: ListenerId) -> Option<PendingConnection> {
     let mut guard = LISTENERS.lock();
     let reg = guard.as_mut().unwrap();
-    let &id = reg.by_name.get(name)?;
     reg.by_id.get_mut(id)?.pending.pop_front()
-}
-
-pub fn has_pending(name: &str) -> bool {
-    let guard = LISTENERS.lock();
-    let reg = guard.as_ref().unwrap();
-    let Some(&id) = reg.by_name.get(name) else { return false };
-    reg.by_id.get(id).map_or(false, |l| !l.pending.is_empty())
 }
 
 pub fn has_pending_by_id(id: ListenerId) -> bool {
@@ -119,23 +115,22 @@ pub fn has_pending_by_id(id: ListenerId) -> bool {
     reg.by_id.get(id).map_or(false, |l| !l.pending.is_empty())
 }
 
-pub fn exists(name: &str) -> bool {
-    let guard = LISTENERS.lock();
-    guard.as_ref().unwrap().by_name.contains_key(name)
-}
-
 pub fn listener_id(name: &str) -> Option<ListenerId> {
     let guard = LISTENERS.lock();
     guard.as_ref().unwrap().by_name.get(name).copied()
 }
 
-
 /// Remove a listener. Pending connections are dropped (PipeReader/PipeWriter Drop frees pipes).
-pub fn remove(name: &str) {
+///
+/// Addressed by id, never by name: `ListenerId`s come from an `IdMap` and are
+/// never reused, so an id that has been removed names nothing forever. A
+/// descriptor that outlived its listener therefore cannot unregister — or
+/// accept on — whichever process holds that name now.
+pub fn remove(id: ListenerId) {
     let mut guard = LISTENERS.lock();
     let reg = guard.as_mut().unwrap();
-    if let Some(id) = reg.by_name.remove(name) {
-        reg.by_id.remove(id);
+    if let Some(listener) = reg.by_id.remove(id) {
+        reg.by_name.remove(&listener.name);
     }
 }
 

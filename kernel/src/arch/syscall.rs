@@ -980,31 +980,32 @@ fn sys_open_device(device_type: u64) -> u64 {
 // Service IPC: listen / accept / connect
 
 fn sys_listen(name: &str) -> u64 {
-    let Some(_id) = crate::listener::listen(name, process::current_process()) else {
+    let Some(id) = crate::listener::listen(name, process::current_process()) else {
         return SyscallError::AlreadyExists.to_u64();
     };
-    process::with_fd_owner_data(|data| {
-        fd_result(data.fds.insert(fd::Descriptor::Listener(alloc::string::String::from(name))))
-    })
+    let fd = process::with_fd_owner_data(|data| data.fds.insert(fd::Descriptor::Listener(id)));
+    match fd {
+        Ok(fd_num) => fd_num as u64,
+        Err(e) => {
+            crate::listener::remove(id);
+            e.to_u64()
+        }
+    }
 }
 
 fn sys_accept(fd_num: u32) -> u64 {
-    let name = process::with_fd_owner_data(|data| {
+    let listener_id = process::with_fd_owner_data(|data| {
         match data.fds.get(fd_num) {
-            Some(fd::Descriptor::Listener(name)) => Some(name.clone()),
+            Some(fd::Descriptor::Listener(id)) => Some(*id),
             _ => None,
         }
     });
-    let Some(name) = name else {
-        return SyscallError::InvalidArgument.to_u64();
-    };
-
-    let Some(listener_id) = crate::listener::listener_id(&name) else {
+    let Some(listener_id) = listener_id else {
         return SyscallError::InvalidArgument.to_u64();
     };
 
     loop {
-        if let Some(conn) = crate::listener::pop_connection(&name) {
+        if let Some(conn) = crate::listener::pop_connection(listener_id) {
             let client_pid = conn.client_pid;
             // PipeReader/PipeWriter move from the queue into the Socket descriptor.
             // No refcount change — ownership transfers.

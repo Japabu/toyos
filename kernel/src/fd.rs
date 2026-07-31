@@ -49,7 +49,11 @@ pub enum Descriptor {
     Socket { rx: PipeReader, tx: PipeWriter, peer: Pid },
     Nic(crate::net::NicInfo),
     Audio { info: toyos_abi::audio::AudioInfo, info_read: bool },
-    Listener(String),
+    /// A registered service. Identified by `ListenerId` and not by name: ids
+    /// are never reused, so a descriptor that outlived its listener names
+    /// nothing, where a name would re-resolve to whichever process registered
+    /// it next. See `listener::remove`.
+    Listener(listener::ListenerId),
     IoUring(crate::io_uring::RingId),
 }
 
@@ -68,7 +72,7 @@ impl Clone for Descriptor {
             Self::Framebuffer(info) => Self::Framebuffer(*info),
             Self::Nic(info) => Self::Nic(*info),
             Self::Audio { info, info_read } => Self::Audio { info: *info, info_read: *info_read },
-            Self::Listener(name) => Self::Listener(name.clone()),
+            Self::Listener(id) => Self::Listener(*id),
             Self::IoUring(id) => Self::IoUring(*id),
         }
     }
@@ -98,7 +102,7 @@ impl Descriptor {
             Self::Mouse => Some(Source::Mouse),
             Self::SerialConsole => Some(Source::Keyboard),
             Self::Nic(_) => Some(Source::Network),
-            Self::Listener(name) => listener::listener_id(name).map(Source::Listener),
+            Self::Listener(id) => Some(Source::Listener(*id)),
             Self::PipeRead(r) | Self::TtyRead(r) => Some(Source::PipeReadable(r.id())),
             Self::Socket { rx, .. } => Some(Source::PipeReadable(rx.id())),
             Self::Audio { .. } => Some(Source::Audio),
@@ -294,8 +298,8 @@ pub fn close(table: &mut FdTable, vfs: &mut Vfs, fd: u32, pid: Pid) -> u64 {
         Descriptor::Keyboard | Descriptor::Mouse | Descriptor::Framebuffer(_) | Descriptor::Nic(_) | Descriptor::Audio { .. } => {
             device::release_descriptor(&desc, pid);
         }
-        Descriptor::Listener(name) => {
-            listener::remove(name);
+        Descriptor::Listener(id) => {
+            listener::remove(*id);
         }
         Descriptor::IoUring(id) => {
             crate::io_uring::destroy(*id);
@@ -322,8 +326,8 @@ pub fn close_all(table: &mut FdTable, vfs: &mut Vfs, pid: Pid) {
             Descriptor::Keyboard | Descriptor::Mouse | Descriptor::Framebuffer(_) | Descriptor::Nic(_) | Descriptor::Audio { .. } => {
                 device::release_descriptor(&desc, pid);
             }
-            Descriptor::Listener(name) => {
-                listener::remove(name);
+            Descriptor::Listener(id) => {
+                listener::remove(*id);
             }
             Descriptor::IoUring(id) => {
                 crate::io_uring::destroy(*id);
@@ -586,7 +590,7 @@ pub fn has_data(table: &FdTable, fd: u32) -> bool {
             None => match desc {
                 Descriptor::Keyboard => keyboard::has_data(),
                 Descriptor::Mouse => mouse::has_data(),
-                Descriptor::Listener(name) => listener::has_pending(name),
+                Descriptor::Listener(id) => listener::has_pending_by_id(*id),
                 Descriptor::SerialConsole => serial::has_data(),
                 Descriptor::Nic(_) => crate::net::has_packet(),
                 Descriptor::Audio { info_read: false, .. } => true,
