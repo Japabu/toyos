@@ -164,32 +164,40 @@ should only wake watchers when `handle_report` actually queued events. Also
 inconsistent: `sys_read` on an empty Keyboard fd blocks, on an empty Mouse fd
 returns `NotFound`.
 
-### An io_uring `POLL_ADD` on a NIC fd never completes
+### An io_uring `Source` can carry one half of the wake pair
 
-`Source::Network` can be registered but is never fanned out to. The watcher
-list exists and `process_poll_add` fills it (`net::add_io_uring_watcher`), but
-no wake site calls `complete_pending_for_event` with it: `drain_irqs`
-(`kernel/src/sched/driver.rs:498`) wakes only the direct-blocker queue via
-`net::wake_waiters`. Every other source has both halves — pipes from
-`process.rs:1172`/`pipe.rs` close paths, keyboard and mouse from
-`HidDevice::dispatch_report`, listeners from `wake_poll_waiters`, and audio
-from `drain_irqs` since soundd's suspend-on-idle made its drain phase depend
-on the completion half (before that, `Source::Audio` had the same gap — soundd
-polled the audio fd every cycle but streaming wakes came from its own armed
-timer, so the missing half was invisible; at idle it silently turned soundd's
-43/s refill into a permanent park when Stage 7c removed the legacy
-notification path).
+Every source needs two wakes at its event site: the direct-blocker queue, and
+`complete_pending_for_event` for the ring watchers `process_poll_add`
+registered. Nothing in the type system pairs them, so deleting or forgetting
+one half leaves a source that looks wired and silently never completes a
+`POLL_ADD` — the poller's CQE then arrives only on submit-time readiness (the
+immediate post or the TOCTOU recheck) or on close, when `remove_fd` posts
+`NotFound`. Otherwise it waits forever.
 
-So a poller on a NIC fd gets its CQE only if the source happened to be ready
-at submit time (the immediate post, or the TOCTOU recheck), or when the fd is
-closed and `remove_fd` posts `NotFound`. Otherwise it waits forever. Nothing
-in tree polls the NIC fd through io_uring today, which is why it stays
-invisible. The fix is one line at the `drain_irqs` net wake site, mirroring
-the audio site beside it; the durable fix is iouring-blocking-spec's single
-`post()`, where a source cannot have one half of the pair.
+Both halves are present for every source today. Audio and Network were
+restored at the `drain_irqs` site (`kernel/src/sched/driver.rs`); pipes wake
+from `process.rs`/`pipe.rs` close paths, keyboard and mouse from
+`HidDevice::dispatch_report`, listeners from `wake_poll_waiters`.
 
-Found while moving the poll key off `EventSource` at Stage 7c; pre-existing,
-untouched by that commit.
+History, because it is what makes this worth a line. Stage **7a** (f4d8fa7,
+not 7c as this entry and aeeaa01's commit message first said) deleted the
+audio and network `complete_pending_for_event` calls out of `drain_events`
+while explicitly preserving the keyboard/mouse pair in `hid.rs` — collateral
+of the cutover's `EventSource` removal, not an intended deletion; see
+`specs/scheduler-migration-log.md`. Neither loss was visible for two months.
+soundd polls the audio fd every cycle but its streaming wakes came from its
+own armed DLL timer, so only the idle path depended on the missing half —
+and there was no idle path until suspend-on-idle. netd polls its NIC fd every
+iteration (`userland/netd/src/main.rs`) and waits `u64::MAX` at full idle with
+RX being `nic_rx_poll()` only, so a frame arriving while netd is fully idle
+posted no CQE and netd slept with `net::has_packet()` true until an unrelated
+wake; that never surfaced because no test drives netd, and interactive use
+always has something else waking it. The 7c review compared two post-7a trees,
+found them identical, and concluded there was nothing there.
+
+The durable fix is iouring-blocking-spec's single `post()`, where a source
+cannot have one half of the pair, and a fan-out cannot be deleted without
+deleting the wake.
 
 ### The virtio-console has no line atomicity between writers
 
