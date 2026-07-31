@@ -580,21 +580,31 @@ fn mix_thread(
     // inside the pipeline covers it. Move it only with a full re-baseline.
     assert!(num_buffers > 5, "soundd: pipeline too shallow to defer safely");
     let refill_floor_nanos = 5 * period_nanos;
+    // Grace between the pipeline draining and the PCM STOP (§5.8). Zero, and
+    // policy like `refill_floor_nanos` above, not physics: virtio STOP does
+    // not RELEASE — SET_PARAMS and PREPARE stay valid, resume is one control
+    // verb inline with the first submit — so there is no codec pop or
+    // renegotiation for grace to amortize, and an immediate stop is what puts
+    // the suspend markers inside the audio gate's serial window on every run.
+    // The one event that makes this nonzero is a hardware backend that pops
+    // on stop, advertised per-backend through `AudioInfo`. Implement grace
+    // then as a clock comparison against a drain stamp at the idle wakes that
+    // still arrive while buffers play out — never an armed timer. The assert
+    // trips the build so the value cannot change without that rework.
+    const SUSPEND_AFTER_DRAIN_NANOS: u64 = 0;
+    const _: () = assert!(SUSPEND_AFTER_DRAIN_NANOS == 0);
 
     let mut streams: Vec<ClientStream> = Vec::new();
-    let mut free_mask: u32 = 0;
-
-    // Startup prime: nothing is in flight yet, so there is no free buffer for
-    // the mix loop to fill and no client whose audio could fill it. This is
-    // the only place silence is submitted unconditionally.
-    for i in 0..num_buffers {
-        let buf = unsafe { core::slice::from_raw_parts_mut(dma_ptrs[i], device_period_bytes) };
-        buf.fill(0);
-        // A swallowed submit failure would strand the buffer outside both
-        // free_mask and the kernel's inflight set — silent pipeline shrink.
-        toyos::audio::audio_submit(i as u32, device_period_bytes as u32)
-            .unwrap_or_else(|e| panic!("soundd: audio_submit({i}) failed: {e}"));
-    }
+    // Boot starts SUSPENDED (§5.8): every buffer free, nothing submitted, the
+    // PCM stream never started. There is no unconditional silence prime — the
+    // first client's ordinary refill fills the whole pipeline through the
+    // dithering mix path, and the kernel starts the stream on that submit.
+    let mut free_mask: u32 = (1u32 << num_buffers) - 1;
+    // Whether the device stream is running, i.e. soundd has submitted since
+    // the last stop. Owned here: the kernel's own started flag is not
+    // readable, and the two agree because every submit starts a stopped
+    // stream and only the suspend block below stops it.
+    let mut started = false;
     // Wall clock at the last instant the pipeline was known full. Re-stamped
     // after every refill; read only by the drain count site.
     let mut pipeline_filled_ns = syscall::clock_nanos();
@@ -602,8 +612,9 @@ fn mix_thread(
     // device plays one period per `period_nanos` and cannot play faster, so
     // this is the only honest measure of how much audio is still on the wire.
     // The free list is not: QEMU retires a whole pipeline in a few ms, so
-    // "free" says nothing about what has been heard.
-    let mut playout_until_ns = pipeline_filled_ns + num_buffers as u64 * period_nanos;
+    // "free" says nothing about what has been heard. Nothing is on the wire
+    // at boot.
+    let mut playout_until_ns = pipeline_filled_ns;
 
     // Gated on the audio device claim `main` already took, so a refusal is a
     // kernel bug. Mixing on without the RT band would show up only as glitches.
@@ -629,6 +640,11 @@ fn mix_thread(
     let mut deferred_last: u32 = 0;
     let mut stats = MixStats::default();
     let mut next_stats_ns = syscall::clock_nanos() + STATS_INTERVAL_NANOS;
+
+    // The state markers (`suspended`/`resumed`) are load-bearing: the audio
+    // gate asserts on them (tests/common/audio.rs), and each must stay a
+    // single format piece so it lands contiguously on the shared console.
+    eprintln!("soundd: suspended");
 
     loop {
         let was_streaming = !streams.is_empty();
@@ -788,7 +804,10 @@ fn mix_thread(
 
         let mut refilled = false;
         let mut deferred: u32 = 0;
-        while free_mask != 0 {
+        // With no clients there is nothing to mix: leaving the freed buffers
+        // unsubmitted is what drains the pipeline (§5.8) instead of feeding
+        // the device silence forever.
+        while free_mask != 0 && !streams.is_empty() {
             let idx = free_mask.trailing_zeros() as usize;
             assert!(idx < num_buffers, "soundd: completion for nonexistent buffer {idx}");
             free_mask &= !(1 << idx);
@@ -853,6 +872,13 @@ fn mix_thread(
                 dma_buf[i] = dither_and_quantize(mix_f32[i], &mut dither_rng);
             }
 
+            if !started {
+                started = true;
+                // Before the submit, because the kernel starts the stopped
+                // stream inside it: the marker must precede the kernel's own
+                // `virtio-sound: stream 0 started` line.
+                eprintln!("soundd: resumed");
+            }
             toyos::audio::audio_submit(idx as u32, device_period_bytes as u32)
                 .unwrap_or_else(|e| panic!("soundd: audio_submit({idx}) failed: {e}"));
             // Plays after whatever is already queued — unless that has all
@@ -888,6 +914,24 @@ fn mix_thread(
                 true
             }
         });
+
+        // §5.8 DRAINING → SUSPENDED, on the completion that frees the last
+        // buffer. `SUSPEND_AFTER_DRAIN_NANOS` is zero, so the stop is
+        // immediate. This block must not move into the full-drain site above:
+        // that site is gated on `deferred_last == 0`, and a final streaming
+        // cycle that deferred plus a whole-pipeline completion batch — QEMU's
+        // routine cadence — would skip it, parking soundd forever with the
+        // device started and nothing left to complete. The `started` guard
+        // keeps a stray cmd wake (a SetVolume for a removed client) from
+        // costing a controlq round trip.
+        if started && streams.is_empty() && free_mask.count_ones() as usize == num_buffers {
+            // The device's period grid dies with the stream; the next
+            // completion after resume re-initializes the estimate.
+            dll.reset();
+            audio_dev.stop().expect("soundd holds the audio device claim");
+            started = false;
+            eprintln!("soundd: suspended");
+        }
 
         // Flushing on the last disconnect keeps the tail between the final
         // periodic window and the client leaving in the record — for a stream
@@ -1200,8 +1244,6 @@ fn main() {
     for i in 0..num_buffers {
         dma_ptrs.push(unsafe { dma_base.add(info.buf_offsets[i] as usize) });
     }
-
-    audio_dev.start().expect("soundd: failed to start audio");
 
     // ~5ms connect/disconnect/volume ramp
     let ramp_frames = device_sample_rate * 5 / 1000;

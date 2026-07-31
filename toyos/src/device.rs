@@ -131,11 +131,8 @@ impl AudioDev {
         Ok(n / REC_SIZE)
     }
 
-    pub fn start(&self) -> Result<(), SyscallError> {
-        syscall::write(self.0.0.0, &[1])?;
-        Ok(())
-    }
-
+    /// PCM STOP. The reverse transition needs no method: the kernel starts a
+    /// stopped stream inside the next buffer submit.
     pub fn stop(&self) -> Result<(), SyscallError> {
         syscall::write(self.0.0.0, &[0])?;
         Ok(())

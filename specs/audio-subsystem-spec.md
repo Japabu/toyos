@@ -158,13 +158,10 @@ The DLL bandwidth (how aggressively it tracks hardware drift) is configurable. A
 
 1. Open the audio device and read hardware parameters (native sample rate, channels, format, period size, buffer count, DMA buffer offsets)
 2. Map the DMA shared memory region
-3. Start the PCM stream
-4. Prime the DMA pipeline by submitting all buffers filled with silence
-5. Initialize the DLL with the nominal period duration
-6. Arm the timer for the first expected completion
-7. Begin the main loop
+3. Initialize the DLL with the nominal period duration
+4. Begin the main loop in the SUSPENDED state (§5.8): every buffer free, nothing submitted, the PCM stream not started
 
-Priming starts the completion cycle that drives all subsequent scheduling. The device plays buffer 0, completes it, the DLL observes the completion timestamp, and the self-sustaining timer loop begins.
+There is no startup prime and no explicit PCM start. The first client's connection refills the whole pipeline through the ordinary mix path — so every buffer ever submitted goes through the §5.4 dithering path — and the kernel starts the stream on that first submit. The first completion then initializes the DLL estimate and the self-sustaining prediction loop begins (§5.8 resume).
 
 ### 5.3 Main Loop
 
@@ -250,7 +247,27 @@ If a client crashes, the read end closes and soundd's next write returns a broke
 
 ### 5.8 Idle Behavior
 
-When no clients are connected, soundd either continues submitting silence (zero connection latency, near-zero CPU) or quiesces the device and re-primes on first connection (zero idle CPU, small connection latency). Either policy is acceptable.
+soundd quiesces the device when idle. Mixing silence for an audience of zero is not an acceptable policy: it holds the host voice open, costs a wake per period forever, and on real hardware keeps the DMA engine and codec running. The mix thread is always in exactly one of three states:
+
+| State | Predicate | Submits | Wait | Wake sources |
+|---|---|---|---|---|
+| STREAMING | clients present | one period per free buffer | DLL prediction (§5.1) | completions, command pipe |
+| DRAINING | no clients, buffers in flight | none | indefinite, no timer | remaining completions, command pipe |
+| SUSPENDED | no clients, pipeline empty | none — PCM stream stopped | indefinite, no timer | command pipe only |
+
+Transitions:
+
+- **STREAMING → DRAINING:** the last client is removed, strictly after its §5.5 ramp-out completes. The in-flight periods are dithered silence and play out within one pipeline depth.
+- **DRAINING → SUSPENDED:** the completion that frees the last buffer. soundd resets the DLL (the device's period grid dies with the stream) and issues PCM STOP. Stopping only with the pipeline empty means no in-flight I/O ever meets the STOP, so no reading of the device's stop-with-pending-buffers semantics is load-bearing.
+- **DRAINING → STREAMING:** a client connects before the drain finishes. The device was never stopped; the refill queues behind what is still playing.
+- **SUSPENDED → STREAMING:** a client connects and the ordinary mix loop refills the whole pipeline — dithered silence until the client's ring has data — with the kernel starting the stopped stream inside the first submit. No pop is possible: every transition through stop and start passes through digital zero, and client audio still enters through the §5.5 connect ramp.
+- **Boot → SUSPENDED:** the initial state (§5.2). A machine with no audio client never starts the device voice at all.
+
+The idle predicate is "no client streams", not "all clients silent": a paused client (§6.4) resumes by writing shared memory, which produces no kernel event soundd could block on, so suspending under an open stream would leave soundd with no wake edge. A paused client keeps the device hot; that is correct.
+
+The grace between the drain completing and the STOP is a policy constant in soundd (`SUSPEND_AFTER_DRAIN_NANOS`), currently zero: virtio STOP does not RELEASE — stream parameters and the prepared state survive, resume is one control verb inline with the first submit — so there is no codec pop or renegotiation for grace to amortize. A hardware backend that pops on stop is the one event that justifies a nonzero value, implemented as a clock comparison at the idle wakes that still arrive during the drain — never an armed timer.
+
+While SUSPENDED, soundd holds zero timers and takes zero wakes; its CPU cost is exactly zero until a client connects.
 
 ### 5.9 Pipeline Recovery
 
@@ -258,7 +275,7 @@ If all DMA buffers drain due to a catastrophic scheduling stall, soundd detects 
 
 Recovery must be **proportional to the shortfall**. The drained buffers are refilled by the ordinary mix path, exactly like any other free buffer: client audio already sitting in the slot rings goes out immediately, and silence is submitted only for those periods no client can cover. Re-priming the whole pipeline with silence is not acceptable — it makes the cost of *any* stall, however brief, a full pipeline depth of audible dropout, and delays the client audio queued behind it by the same amount. Since the client rings are as deep as the DMA pipeline (§5.10 fallback), a stall that the clients kept up with costs no silence at all.
 
-Only the startup prime (§5.2) submits silence unconditionally: nothing is in flight, so there is no free buffer to mix into and no client to mix from.
+No path submits silence unconditionally: even the §5.8 resume prime runs the ordinary mix path, so client audio already sitting in the slot rings enters the very first buffers of the refill.
 
 ### 5.10 Synchronous Client Scheduling
 
