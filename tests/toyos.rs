@@ -8,7 +8,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use common::qemu::{self, BootOptions, QemuInstance, TestResult};
-use common::{audio, compile, faults, screen, stats, storage};
+use common::{audio, compile, faults, screen, serial, stats, storage};
 
 struct TestDef {
     name: String,
@@ -83,6 +83,7 @@ const MACHINE_TESTS: &[&str] = &[
     "xhci_slot_exhaustion",
     "cache_eviction",
     "va_exhaustion",
+    "serial_vocabulary",
 ];
 
 /// The renderer's two text colours, as the screendump reports them.
@@ -1743,6 +1744,9 @@ fn run_machine_test(
             );
             Ok(())
         }
+        // No guest: the instrument itself, in both directions. `screen_decoder`
+        // is the same idea for the framebuffer decoder.
+        "serial_vocabulary" => serial::self_check(),
         "nvme_wide_sector" => {
             // The other half of "a device's size is a shape dimension": not how
             // many sectors, but how big one is. `lba_ds` is an 8-bit
@@ -1766,29 +1770,22 @@ fn run_machine_test(
             let qemu = QemuInstance::boot_with_options(test_config, c_bins, rust_bins, options);
             // It dies before virtio-console exists, so the 16550 file is the
             // only record — which is also the T14's situation exactly.
-            let log = format!("{}\n{}", qemu.boot_log(), qemu.uart_log());
+            let mut log = serial::Serial::boot(&qemu);
+            log.push(&qemu.uart_log());
 
             // Named, not just refused: the value the device reported is the
             // whole diagnostic on a machine that will not boot again without
             // it. A bare "refused" line would pass with the number wrong.
-            if !log.contains("2^13-byte sectors") {
-                return Err(format!(
-                    "the driver refused the namespace without naming its sector size:\n{log}"
-                ));
-            }
+            log.must_say("2^13-byte sectors")?;
             // And it refused rather than dividing: the pre-fix failure was
             // `attempt to divide by zero`, which is also a panic and would
-            // satisfy every check above if they only looked for one.
-            if log.contains("divide by zero") {
-                return Err(format!("the driver still divided by the sector count:\n{log}"));
-            }
+            // satisfy the check above if it only looked for one. Both of these
+            // are absence claims, so both go through `must_not_say`, which
+            // fails rather than passing if the capture came back empty.
+            log.must_not_say("divide by zero")?;
             // Nothing downstream ran. `block device id=` is the line
             // `NvmeBlockDevice::new` logs, and it is the call that divided.
-            if log.contains("NVMe: block device id=") {
-                return Err(format!(
-                    "the driver built a block device on a namespace it cannot address:\n{log}"
-                ));
-            }
+            log.must_not_say("NVMe: block device id=")?;
             eprintln!("  [nvme] 8 KiB-format namespace refused by name, before storage came up");
             Ok(())
         }
