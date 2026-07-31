@@ -173,6 +173,7 @@ Read the spec before touching the subsystem it covers.
 - `specs/iouring-blocking-spec.md` — io_uring as the only blocking mechanism; one wait-free completion primitive, one park/recheck site.
 - `specs/metal-boot-plan.md` — first boot on real hardware (ThinkPad T14 Gen 2), integrated keyboard + touchpad. Staged M0–M5; **M0, M1 and M2 built, and the flash-trigger condition is met** — `metal_sim_input` drives the compositor with the i8042 as the machine's only input device. The one thing QEMU cannot decide is whether the T14's EC lands in scancode set 2 with translation on; the driver's `0xF0 0x00` read-back determines the wire format and refuses to attach to one it did not ask for, so that is one line on the laptop's own screen rather than a bisect. Also the only honest instrument for the 2× performance bar.
 - `specs/net-gate-plan.md` — gate N, the network analogue of gate A: pcap as device-side ground truth, slirp + harness-as-peer configs, adversarial frames and deterministic impairment. Scheduled after the first bare-metal attempt.
+- `specs/device-test-strategy.md` — the general rule the gates are instances of: ground truth at the hardware boundary, the harness as actuator, and device *shape and lifecycle* tested before protocol depth (every driver defect so far came from changing which devices exist).
 
 ## Known issues
 
