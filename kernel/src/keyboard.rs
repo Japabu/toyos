@@ -6,8 +6,20 @@ use crate::sync::Lock;
 pub use toyos_abi::input::{RawKeyEvent, MOD_SHIFT, MOD_CTRL, MOD_ALT, MOD_GUI, MOD_RELEASED};
 
 static KEY_BUF: Lock<VecDeque<RawKeyEvent>> = Lock::new(VecDeque::new());
-static PREV_REPORT: Lock<[u8; 8]> = Lock::new([0; 8]);
 static IO_URING_WATCHERS: Lock<Vec<RingId>> = Lock::new(Vec::new());
+
+/// Ctrl+Alt+D is recorded here, not acted on. `handle_key` runs under whichever
+/// driver's guard produced the transition — `PS2` on the i8042 path, `XHCI` on
+/// the USB one — and `dump_blocked` walks the scheduler and logs a line per
+/// parked thread. The scheduler pass consumes this after every device service,
+/// with no driver lock held.
+static DUMP_REQUESTED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Consume a pending Ctrl+Alt+D. Called from `drain_irqs` and nowhere else.
+pub fn take_dump_request() -> bool {
+    DUMP_REQUESTED.swap(false, core::sync::atomic::Ordering::Relaxed)
+}
 
 /// Which HID usages are currently down, one bit each, across every keyboard
 /// the machine has. Central because the modifier state is derived from it:
@@ -84,10 +96,10 @@ pub fn handle_key(usage: u8, pressed: bool) -> bool {
     let ctrl = modifiers & MOD_CTRL != 0;
     let alt = modifiers & MOD_ALT != 0;
 
-    // Ctrl+Alt+D (HID 0x07) → dump blocked threads. Outside every guard:
-    // dump_blocked walks the scheduler and used to run with KEY_BUF held.
+    // Ctrl+Alt+D (HID 0x07) → dump blocked threads. Recorded, not run: every
+    // caller of this function holds its driver's guard.
     if pressed && ctrl && alt && usage == 0x07 {
-        crate::scheduler::dump_blocked();
+        DUMP_REQUESTED.store(true, core::sync::atomic::Ordering::Relaxed);
         return false;
     }
 
@@ -121,8 +133,16 @@ pub fn release_all() -> usize {
 /// Process a HID boot protocol keyboard report (8 bytes). Returns the number
 /// of events queued — the caller wakes only on a non-zero count, so a report
 /// identical to the last one costs nothing.
-pub fn handle_report(report: &[u8]) -> usize {
-    let prev = *PREV_REPORT.lock();
+///
+/// `prev` belongs to the device, and must: a report is a *snapshot* of one
+/// keyboard, so diffing it against another one's says every key the first holds
+/// was just released. A dongle that exposes a HID keyboard interface for media
+/// keys — very common — would otherwise flap a real keyboard's held key at the
+/// combined polling rate. `HELD` stays central because it is the union across
+/// keyboards; this is per-device by the same argument.
+pub fn handle_report(state: &mut [u8; 8], report: &[u8]) -> usize {
+    let prev = *state;
+    state.copy_from_slice(&report[..8]);
     let mut queued = 0;
 
     // The boot protocol puts modifiers in report[0] as a bitmask, not as
@@ -159,7 +179,6 @@ pub fn handle_report(report: &[u8]) -> usize {
         }
     }
 
-    PREV_REPORT.lock().copy_from_slice(&report[..8]);
     queued
 }
 

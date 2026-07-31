@@ -511,7 +511,15 @@ pub fn log_health() {
 ///
 /// Only this CPU's: a `CpuSched` is `!Sync`, so a sibling's parked map is not
 /// walkable. A cross-CPU view costs a message round trip.
+///
+/// Its one caller is `drain_irqs`, past every device service, and the assert is
+/// what keeps that true: this walks the scheduler and logs a line per parked
+/// thread, and the keystroke that asks for it is decoded under a driver's guard
+/// on both input paths. `pass` owns the one level; a `Lock` guard would add
+/// another.
 pub fn dump_blocked() {
+    let depth = crate::preempt::count();
+    assert!(depth <= 1, "dump_blocked ran under a lock: preempt depth {depth}");
     crate::log!(
         "=== PARKED THREADS on cpu {} ({}) ===",
         percpu::cpu_id(),

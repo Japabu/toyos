@@ -363,6 +363,7 @@ pub fn init_device(ctrl: &mut XhciController, op_base: &Mmio, port_idx: u8) {
         report_ptr,
         report_size,
         hid_type: info.protocol,
+        prev_report: [0; 8],
     };
 
     dev.requeue(&ctrl.db_base);

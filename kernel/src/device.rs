@@ -17,6 +17,10 @@ static AUDIO_OWNER: Lock<Option<Pid>> = Lock::new(None);
 static FB_INFO: Lock<Option<FramebufferInfo>> = Lock::new(None);
 
 pub fn set_framebuffer_info(info: FramebufferInfo) {
+    // A relative pointer accumulates into a square 0..32767 space that this
+    // geometry is what gets mapped onto, so its per-axis scale is a function of
+    // the screen and has to follow a mode change.
+    crate::mouse::set_screen(info.width, info.height);
     *FB_INFO.lock() = Some(info);
 }
 

@@ -328,7 +328,7 @@ fn drain() -> Drained {
             match state.pointer.feed(byte, arrived) {
                 MouseOutcome::Packet { buttons, dx, dy } => {
                     if crate::mouse::handle_motion(
-                        crate::mouse::PointerSource::Ps2,
+                        crate::mouse::PointerSource::PS2,
                         buttons,
                         crate::mouse::Motion::Relative { dx, dy },
                         0,
@@ -353,8 +353,13 @@ fn drain() -> Drained {
     }
 
     if lost {
-        // The break codes for whatever is down may be among what was lost.
+        // The break codes for whatever is down may be among what was lost —
+        // and so may the packet that lifts a held pointer button, which no
+        // later report from another pointer can clear.
         out.keys += crate::keyboard::release_all();
+        if crate::mouse::release_buttons(crate::mouse::PointerSource::PS2) {
+            out.motion += 1;
+        }
     }
 
     KBD_EVENTS.fetch_add(out.keys as u32, Ordering::Relaxed);
@@ -367,6 +372,11 @@ fn drain() -> Drained {
 fn quarantine() {
     QUARANTINE.store(false, Ordering::Relaxed);
     ACTIVE.store(false, Ordering::Relaxed);
+    // Whatever was down stays down otherwise: no further report can arrive to
+    // lift it, and the pointer merge republishes it on every other pointer's
+    // motion for the rest of the boot.
+    crate::keyboard::release_all();
+    crate::mouse::release_buttons(crate::mouse::PointerSource::PS2);
     // The count, not the intent: "one masked line and a dead keyboard,
     // never a spinning CPU" is only true if the mask actually took.
     let mut masked = 0;
@@ -560,6 +570,7 @@ fn aux_reenable() {
     if aux != u32::MAX {
         let _ = ioapic::set_masked(Gsi(aux), true);
     }
+    crate::mouse::release_buttons(crate::mouse::PointerSource::PS2);
     log!("i8042: aux re-enable failed {failures} times — pointer written off, line masked");
 }
 

@@ -510,6 +510,12 @@ fn drain_irqs() {
     // The i8042's bytes are already in kernel memory when the IRQ returns;
     // this turns them into events and wakes.
     crate::drivers::i8042::service();
+    // Ctrl+Alt+D. Here rather than at the keystroke, which is decoded under
+    // whichever driver's guard produced it: this walks the scheduler and logs
+    // a line per parked thread, and both drivers are done above.
+    if crate::keyboard::take_dump_request() {
+        crate::scheduler::dump_blocked();
+    }
 
     if crate::irq_ring::take(crate::irq_ring::IrqSource::Net).is_some() {
         crate::net::wake_waiters();

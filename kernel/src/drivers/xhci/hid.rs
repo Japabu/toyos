@@ -19,10 +19,14 @@ pub struct HidDevice {
     pub report_ptr: *mut u8,
     pub report_size: u32,
     pub hid_type: HidType,
+    /// This keyboard's last report. Per device, because a report is a snapshot
+    /// of one keyboard and diffing it against another's synthesizes releases
+    /// for keys that are still physically down.
+    pub prev_report: [u8; 8],
 }
 
 impl HidDevice {
-    pub fn dispatch_report(&self) {
+    pub fn dispatch_report(&mut self) {
         let mut buf = [0u8; 8];
         let size = self.report_size as usize;
         unsafe { copy_nonoverlapping(self.report_ptr as *const u8, buf.as_mut_ptr(), size); }
@@ -32,7 +36,7 @@ impl HidDevice {
         // compositor for as long as a key was held.
         match self.hid_type {
             HidType::Keyboard => {
-                if keyboard::handle_report(&buf[..size]) == 0 {
+                if keyboard::handle_report(&mut self.prev_report, &buf[..size]) == 0 {
                     return;
                 }
                 keyboard::wake_waiters();
@@ -45,7 +49,8 @@ impl HidDevice {
                 }
             }
             HidType::Mouse | HidType::Tablet => {
-                if mouse::handle_report(&buf[..size]) == 0 {
+                let source = mouse::PointerSource::usb(self.slot_id);
+                if mouse::handle_report(source, &buf[..size]) == 0 {
                     return;
                 }
                 mouse::wake_waiters();

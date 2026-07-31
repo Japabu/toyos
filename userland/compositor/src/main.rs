@@ -779,10 +779,10 @@ fn main() {
                     std::mem::size_of_val(&events),
                 )
             };
-            // Never read blocking here: keyboard poll readiness can be
-            // spurious (a HID report that diffs to zero events, e.g. host
-            // key auto-repeat, still wakes pollers). A blocking read would
-            // park the compositor until the next real key event.
+            // Never read blocking here. The kernel wakes only when a report
+            // queued an event, so readiness and `has_data` agree — but a
+            // blocking read on an empty queue parks the compositor until the
+            // next real key, and one spurious wake anywhere would freeze it.
             let n = kb.read_nonblock(buf).unwrap_or(0);
             for event in &events[..n / std::mem::size_of::<window::KeyEvent>()] {
                 if launcher_open && event.pressed() && event.keycode == 0x29 {

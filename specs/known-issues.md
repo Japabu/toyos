@@ -360,15 +360,6 @@ could stick. Untested on real hardware. If it does bite, the fix is a
 controller-side reconnect probe (`0xF2` identify on a timer), not a wire
 heuristic, because no wire heuristic exists.
 
-### The `toyos` SDK's keyboard doc describes a defect that is fixed
-
-`Keyboard::read_nonblock` and `Mouse::read_nonblock` (`toyos/src/device.rs`)
-carry doc comments saying poll readiness "can be spurious ... the kernel wakes
-keyboard watchers on every HID report". It no longer does: `handle_report`
-returns an event count and both the xHCI and i8042 paths wake only on a
-non-zero one. The advice to read non-blocking is still good, the reason given
-is stale. Left alone deliberately — M2 was scoped to zero SDK changes.
-
 ### `sys_read` blocks on an empty Keyboard fd and returns `NotFound` on an empty Mouse fd
 
 Two fds of the same shape, two different answers to the same question. Pick one.

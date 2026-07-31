@@ -1906,9 +1906,22 @@ fn run_machine_test(
                 QemuInstance::boot_with_options(test_config, c_bins, rust_bins, options);
 
             // `kernel/src/mouse.rs` scales each relative count into the
-            // 0..32767 space the compositor consumes, so one PS/2 count
-            // arrives as this many units of reported position.
-            const REL_SCALE: i32 = 64;
+            // 0..32767 space the compositor consumes, per axis and derived
+            // from the screen — so the kernel is asked what it used rather
+            // than the constant being copied here, which would stop being a
+            // check the moment either side changed.
+            let boot = qemu.boot_log().to_string();
+            let Some((scale_x, scale_y)) = boot
+                .lines()
+                .find_map(|l| l.split("mouse: rel scale x=").nth(1))
+                .and_then(|r| r.split_once(" y="))
+                .and_then(|(x, rest)| {
+                    let y = rest.split_whitespace().next()?;
+                    Some((x.parse::<i32>().ok()?, y.parse::<i32>().ok()?))
+                })
+            else {
+                return Err(format!("the kernel never said what pointer scale it used:\n{boot}"));
+            };
             const DX: i32 = 40;
             const DY: i32 = -30;
             let result = qemu.run_test_hooked(
@@ -1959,7 +1972,7 @@ fn run_machine_test(
             // and a dropped high bit both survive "it moved", and the PS/2
             // wire points the opposite way to the screen. Relative, so it
             // says nothing about where any compositor would draw a cursor.
-            let want = (DX * REL_SCALE, DY * REL_SCALE);
+            let want = (DX * scale_x, DY * scale_y);
             let deltas: Vec<(i32, i32)> = pointer
                 .windows(2)
                 .map(|w| (w[1].x as i32 - w[0].x as i32, w[1].y as i32 - w[0].y as i32))

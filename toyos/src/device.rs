@@ -29,11 +29,11 @@ impl Keyboard {
 
     /// Non-blocking read of pending key events; empty surfaces as `Err(WouldBlock)`.
     ///
-    /// Poll readiness on this fd can be spurious: the kernel wakes keyboard
-    /// watchers on every HID report, including reports that diff to zero
-    /// events (host key auto-repeat). A blocking read after such a wake
-    /// parks the caller until the next real key event, so event loops must
-    /// only ever read non-blocking.
+    /// Event loops must only ever read this fd non-blocking. The kernel wakes
+    /// keyboard watchers only when a report queued an event, so readiness and
+    /// "there is data" agree today — but a blocking read that loses the race
+    /// with another reader parks the caller until the next real key, and an
+    /// event loop that stops pumping is a frozen window.
     pub fn read_nonblock(&self, buf: &mut [u8]) -> Result<usize, SyscallError> {
         self.0.0.read_nonblock(buf)
     }
@@ -54,8 +54,8 @@ impl Mouse {
 
     /// Non-blocking read of pending mouse events; empty surfaces as `Err(WouldBlock)`.
     ///
-    /// Same rationale as [`Keyboard::read_nonblock`]: poll readiness can be
-    /// spurious, so event loops must only ever read non-blocking.
+    /// Same rationale as [`Keyboard::read_nonblock`]: an event loop that can
+    /// park on an empty queue is a frozen window.
     pub fn read_nonblock(&self, buf: &mut [u8]) -> Result<usize, SyscallError> {
         self.0.0.read_nonblock(buf)
     }
