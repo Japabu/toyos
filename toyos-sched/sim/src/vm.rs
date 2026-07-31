@@ -35,7 +35,9 @@ use crate::msg::{SimHandles, SimMsg, SimQueue};
 use crate::payload::{
     MockAddressSpace, SimCtx, SimPayload, SimPreempt, SimShareLock, SimWaitList, StdLock,
 };
-use crate::workload::{BlockShape, Op, ParkShape, Protocol, Scenario, Script, WindowShape};
+use crate::workload::{
+    BlockShape, ChargeShape, Op, ParkShape, Protocol, Scenario, Script, ShareShape, WindowShape,
+};
 
 /// How finely a `Run(ns)` op is chopped. Small enough that a 10 ms quantum
 /// expires in the middle of a run — the interesting case — without making
@@ -71,6 +73,12 @@ impl QueueState {
     }
 }
 
+fn new_share() -> Arc<FairShare<SimShareLock>> {
+    Arc::new(FairShare::new(StdLock::new(ShareState::NonRunnable {
+        lag: 0,
+    })))
+}
+
 pub fn build_queues(scenario: &Scenario) -> Vec<QueueState> {
     scenario
         .queues
@@ -81,7 +89,11 @@ pub fn build_queues(scenario: &Scenario) -> Vec<QueueState> {
 
 pub struct ProcState {
     pub name: &'static str,
-    pub share: Arc<FairShare<SimShareLock>>,
+    /// Every fair share this process's threads hold. Exactly one under spec
+    /// §9.1's [`ShareShape::PerProcess`]; one per spawned thread under the
+    /// `PerThread` negative gate, which is why invariant I6 sums over the
+    /// vector rather than reading a single share.
+    pub shares: Vec<Arc<FairShare<SimShareLock>>>,
     /// The process's own reference to its address space. Dropped when the
     /// process concludes every one of its threads is gone — under the new
     /// protocol because they were all finalized, under the old one because a
@@ -89,6 +101,11 @@ pub struct ProcState {
     pub address_space: Option<StdArc<MockAddressSpace>>,
     pub templates: Vec<Script>,
     pub rt: bool,
+    /// Sticky: a thread of this process has been seen in the RT band, whether
+    /// permanently or on a lend. Fairness is a property of the fair band —
+    /// the RT band exists to be unfair, and invariant I4 is what bounds it —
+    /// so invariant I5 stops measuring a process once this is set.
+    pub rt_service: bool,
     pub live: BTreeSet<TaskKey>,
     pub torn_down: bool,
 }
@@ -222,6 +239,38 @@ pub struct Vm<'q> {
     /// the counter moves, which is the only way to tell a fresh lend from
     /// [`toyos_sched::task::RtState::arm`]'s re-arm from outside the core.
     pub boosted_run: BTreeMap<TaskKey, (u32, u64)>,
+    /// Invariant I5's measurement: CPU nanoseconds delivered to each process,
+    /// summed at the same clock advances `busy_ns` is, so the two are exact
+    /// against each other.
+    pub service_ns: Vec<u64>,
+    /// The contention window I5 measures service over; see
+    /// [`crate::invariants`].
+    pub fair_epoch: FairEpoch,
+    /// The widest service spread I5 has seen, and the bound that was in force
+    /// when it saw it. Reported rather than only asserted, so spec §11 Stage 9
+    /// can compare a per-CPU frontier against the global one by a number.
+    pub fair_spread: u64,
+    pub fair_bound: u64,
+}
+
+/// One contention window: a maximal interval over which the same set of
+/// fair-band processes was continuously runnable.
+///
+/// Fairness has nothing to say across a window boundary — a process that was
+/// blocked was not owed service — so the measurement restarts whenever the set
+/// changes, and the bound carries the widest thread count and stored-lag spread
+/// seen inside the window.
+#[derive(Default)]
+pub struct FairEpoch {
+    pub members: Vec<usize>,
+    /// Each process's `service_ns` when the window opened.
+    pub base: Vec<u64>,
+    /// Widest total runnable-thread count the window has held, and widest
+    /// stored-lag spread. Both are terms of I5's bound, and both are running
+    /// maxima so a thread that exits mid-window cannot shrink the bound under a
+    /// separation it helped create.
+    pub threads: u32,
+    pub lag_spread: u64,
 }
 
 impl<'q> Vm<'q> {
@@ -237,24 +286,25 @@ impl<'q> Vm<'q> {
             cpu.set_park_keeps_lapsed_lend(scenario.park == ParkShape::KeepLapsedLend);
             cpus.push(cpu);
         }
-        let procs = scenario
+        hw.set_pass_cost(scenario.pass_cost_ns);
+        let procs: Vec<ProcState> = scenario
             .procs
             .iter()
             .enumerate()
             .map(|(index, spec)| ProcState {
                 name: spec.name,
-                share: Arc::new(FairShare::new(StdLock::new(ShareState::NonRunnable {
-                    lag: 0,
-                }))),
+                shares: vec![new_share()],
                 address_space: Some(StdArc::new(MockAddressSpace {
                     process: index as u32,
                 })),
                 templates: spec.templates.clone(),
                 rt: spec.rt,
+                rt_service: spec.rt,
                 live: BTreeSet::new(),
                 torn_down: false,
             })
             .collect();
+        let process_count = procs.len();
         let next_irq = scenario
             .irqs
             .iter()
@@ -281,6 +331,10 @@ impl<'q> Vm<'q> {
             resched_at: vec![None; n],
             rt_pending_since: vec![None; n],
             boosted_run: BTreeMap::new(),
+            service_ns: vec![0; process_count],
+            fair_epoch: FairEpoch::default(),
+            fair_spread: 0,
+            fair_bound: 0,
             next_irq,
             next_key: 1,
             next_spawn_cpu: 0,
@@ -326,7 +380,14 @@ impl<'q> Vm<'q> {
             .address_space
             .clone()
             .expect("spawning into a process whose address space is gone");
-        let share = self.procs[process].share.clone();
+        let share = match self.scenario.share {
+            ShareShape::PerProcess => self.procs[process].shares[0].clone(),
+            ShareShape::PerThread => {
+                let share = new_share();
+                self.procs[process].shares.push(share.clone());
+                share
+            }
+        };
         let rt = RtState {
             permanent: self.procs[process].rt,
             inherited: None,
@@ -558,12 +619,25 @@ impl<'q> Vm<'q> {
         if delta == 0 {
             return;
         }
+        let doubled = match self.scenario.charge {
+            ChargeShape::Honest => None,
+            ChargeShape::Double { process } => self.scenario.process_index(process),
+        };
         for cpu in 0..self.scenario.cpus {
             let Some(task) = self.cpus[cpu].running() else {
                 continue;
             };
             self.busy_ns[cpu] += delta;
-            let (key, rt) = (task.key(), task.rt());
+            let (key, rt, process) = (task.key(), task.rt(), task.ext().process as usize);
+            if doubled == Some(process) {
+                // The second charge for one nanosecond of running: what a
+                // charge applied at two transitions instead of one looks like
+                // from outside the core.
+                task.share()
+                    .charge(delta)
+                    .expect("a running task's share is runnable");
+            }
+            self.service_ns[process] += delta;
             let entry = self.boosted_run.entry(key).or_insert((rt.lends, 0));
             if entry.0 != rt.lends {
                 *entry = (rt.lends, 0);

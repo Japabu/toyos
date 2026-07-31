@@ -20,11 +20,17 @@ usage: toyos-sched-sim <command> [args]
                                negative old_steal_port,
                                old_commit_before_pass and
                                old_preemptible_window gates
+  measure <scenario> [seeds]   seed sweep over ONE scenario, with its worst
+                               invariant-I5 service spread — the number spec
+                               §11 Stage 9 compares frontier designs by
+  find <scenario> [seeds]      first seed that fails, for `shrink` to take
   shrink <scenario> <seed> [pct]
                                minimize a failing seed into a corpus trace
   replay <file>                replay a committed corpus trace
   list                         scenario names
-  from-qemu <trace.bin>        convert a kernel TraceEvent capture";
+
+`fairness_storm:<cpus>` names the fairness workload at any width, which is what
+spec §11 Stage 9 gates on; `list` shows only the two widths the sweeps carry.";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -40,6 +46,9 @@ fn main() -> ExitCode {
             println!("old_steal_port          (negative gate: must fail)");
             println!("old_commit_before_pass  (negative gate: must fail)");
             println!("old_preemptible_window  (negative gate: must abort)");
+            println!("fair_share_per_thread   (negative gate: must fail)");
+            println!("fair_double_charge      (negative gate: must fail)");
+            println!("overlong_pass           (negative gate: must abort)");
             println!("old_commit_fused        (control: passes, and that is the point)");
             ExitCode::SUCCESS
         }
@@ -95,7 +104,12 @@ fn main() -> ExitCode {
                 // The negative gates need far fewer schedules than the
                 // positive sweep: they only have to be caught, not proven
                 // absent.
-                for negative in [scenarios::old_steal_port(), scenarios::old_commit_before_pass()] {
+                for negative in [
+                    scenarios::old_steal_port(),
+                    scenarios::old_commit_before_pass(),
+                    scenarios::fair_share_per_thread(),
+                    scenarios::fair_double_charge(),
+                ] {
                     let name = negative.name;
                     let result = sweep::seed_sweep(&negative, budget.min(500), 1);
                     let found = !result.passed();
@@ -113,26 +127,29 @@ fn main() -> ExitCode {
                     }
                     clean &= found;
                 }
-                // The third negative gate reports an abort rather than a
-                // verdict: a pass inside the registration window has no legal
-                // transition to take, so the core asserts instead of the walk
-                // recording anything.
-                let window = sweep::abort_gate(
-                    &scenarios::old_preemptible_window(),
-                    budget.min(500),
-                );
-                match &window {
-                    Some((seed, message)) => {
-                        println!("old_preemptible_window: caught at seed {seed} (as required)");
-                        for line in message.lines() {
-                            println!("  {line}");
+                // Two gates report an abort rather than a verdict, because what
+                // they break is asserted by the core itself: a pass inside the
+                // registration window has no legal transition to take, and a
+                // pass that overruns its budget is a check-build assert.
+                for aborting in [
+                    scenarios::old_preemptible_window(),
+                    scenarios::overlong_pass(),
+                ] {
+                    let name = aborting.name;
+                    let caught = sweep::abort_gate(&aborting, budget.min(500));
+                    match &caught {
+                        Some((seed, message)) => {
+                            println!("{name}: caught at seed {seed} (as required)");
+                            for line in message.lines() {
+                                println!("  {line}");
+                            }
+                        }
+                        None => {
+                            println!("{name}: NOT CAUGHT — the harness proves nothing");
                         }
                     }
-                    None => println!(
-                        "old_preemptible_window: NOT CAUGHT — the harness proves nothing",
-                    ),
+                    clean &= caught.is_some();
                 }
-                clean &= window.is_some();
                 // And the control: the same shape with the block's two halves
                 // fused into one step must come back *clean*, because that is
                 // the blind spot this harness used to have.
@@ -149,6 +166,42 @@ fn main() -> ExitCode {
                 clean &= control.passed();
             }
             ok(clean)
+        }
+        "measure" => {
+            let Some(scenario) = args.get(1).and_then(|n| scenarios::by_name(n)) else {
+                eprintln!("unknown scenario; try `list`");
+                return ExitCode::FAILURE;
+            };
+            let seeds: u64 = args.get(2).map_or(500, |s| s.parse().unwrap_or(500));
+            let result = sweep::seed_sweep(&scenario, seeds, 3);
+            println!("{}", result.report());
+            ok(result.passed())
+        }
+        // The sweeps report that a scenario failed and how badly; this reports
+        // *which schedule*, which is what `shrink` and `replay` take.
+        "find" => {
+            let Some(scenario) = args.get(1).and_then(|n| scenarios::by_name(n)) else {
+                eprintln!("unknown scenario; try `list`");
+                return ExitCode::FAILURE;
+            };
+            let seeds: u64 = args.get(2).map_or(500, |s| s.parse().unwrap_or(500));
+            for seed in 0..seeds {
+                for pct in [false, true] {
+                    let mut choices = if pct {
+                        ChoiceStream::pct(seed, scenario.cpus, 3)
+                    } else {
+                        ChoiceStream::from_seed(seed)
+                    };
+                    let outcome = run(scenario.clone(), &mut choices);
+                    if !outcome.passed() {
+                        println!("seed {seed}{}", if pct { " pct" } else { "" });
+                        println!("{}", outcome.report());
+                        return ExitCode::SUCCESS;
+                    }
+                }
+            }
+            println!("no failing seed in {seeds}");
+            ExitCode::FAILURE
         }
         "shrink" => {
             let Some(scenario) = args.get(1).and_then(|n| scenarios::by_name(n)) else {
@@ -188,10 +241,6 @@ fn main() -> ExitCode {
             println!("{}", outcome.report());
             ok(outcome.passed() != entry.expect_failure)
         }
-        "from-qemu" => unimplemented!(
-            "from-qemu: the kernel's TraceEvent ring lands at migration Stage 6 \
-             (specs/scheduler-core-spec.md §11); there is nothing to convert yet"
-        ),
         other => {
             eprintln!("unknown command {other:?}\n{USAGE}");
             ExitCode::FAILURE

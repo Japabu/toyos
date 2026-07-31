@@ -37,6 +37,15 @@ pub struct SimHwState {
     /// Which CPU's pass is running. The core has no `cpu_id()` by design, so
     /// the driver is what knows where a timer or a halt lands.
     pub current: Option<CpuId>,
+    /// What a scheduler pass is modelled to cost, in nanoseconds — the only
+    /// thing [`Machine::now`] is read for in this world.
+    ///
+    /// Zero everywhere except `scenarios::overlong_pass`, and that is the
+    /// point: the VM's clock does not advance inside a step, so the core's
+    /// `feature = "check"` pass-duration assert (`cpu::MAX_PASS_NS`) would be
+    /// arithmetic that can only ever compute zero. This is what gives it a
+    /// number to refuse.
+    pub pass_cost_ns: u64,
     /// Recorded rather than raised: a step machine has no stack to unwind
     /// from inside a `Hw` callback, and swallowing the first violation would
     /// hide it behind the cascade it causes.
@@ -63,9 +72,14 @@ impl SimHw {
                 kicks: 0,
                 switches: 0,
                 current: None,
+                pass_cost_ns: 0,
                 violations: Vec::new(),
             }),
         }
+    }
+
+    pub fn set_pass_cost(&self, ns: u64) {
+        self.with(|s| s.pass_cost_ns = ns);
     }
 
     pub fn with<R>(&self, f: impl FnOnce(&mut SimHwState) -> R) -> R {
@@ -114,8 +128,15 @@ impl Machine for SimHw {
     /// pass runs. The guard is therefore a witness with nothing to carry.
     type IrqGuard = ();
 
+    /// The VM threads `now` into every pass as a value, so this is read by
+    /// exactly one caller: the core's check-build pass-duration assert. Inside
+    /// a pass it therefore reports the pass's modelled cost; outside one it is
+    /// the VM's clock.
     fn now(&self) -> Nanos {
-        self.with(|s| s.now)
+        self.with(|s| match s.current {
+            Some(_) => s.now.after(s.pass_cost_ns),
+            None => s.now,
+        })
     }
 
     fn set_timer(&self, deadline: Nanos) {

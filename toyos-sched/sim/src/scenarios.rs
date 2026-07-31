@@ -8,8 +8,8 @@
 use toyos_sched::task::WaitClass;
 
 use crate::workload::{
-    BlockShape, IrqSpec, Op, ParkShape, ProcSpec, Protocol, QueueSpec, Scenario, Script,
-    WindowShape,
+    BlockShape, ChargeShape, IrqSpec, Op, ParkShape, ProcSpec, Protocol, QueueSpec, Scenario,
+    Script, ShareShape, WindowShape,
 };
 
 const MS: u64 = 1_000_000;
@@ -34,6 +34,9 @@ fn scenario(
         block: BlockShape::CommitInPass,
         window: WindowShape::PreemptOff,
         park: ParkShape::ReleaseLend,
+        share: ShareShape::PerProcess,
+        charge: ChargeShape::Honest,
+        pass_cost_ns: 0,
         max_steps: 20_000,
         max_tasks: 32,
     }
@@ -514,6 +517,105 @@ pub fn fork_storm() -> Scenario {
     )
 }
 
+/// Invariant I5's workload, and spec §11 Stage 9's gate: two processes of equal
+/// entitlement and unequal thread count, both pure CPU, neither ever blocking.
+///
+/// Shape, and why each part of it:
+///
+/// * **Nothing blocks and nothing yields.** Fairness owes nothing across a
+///   block, so I5 measures over contention windows; a workload with no blocks
+///   is one window from the first dispatch to the first exit. Every other
+///   scenario gives I5 windows a few milliseconds long, which is to say gives
+///   it nothing to measure.
+/// * **`solo` has one thread per CPU, `trio` three.** A fair share is per
+///   *process* (spec §9.1), so they are owed the same CPU. Under any per-thread
+///   policy `trio` takes three quarters instead of half — which is the whole
+///   distinction, and is `fair_share_per_thread`.
+/// * **Thread counts are multiples of `cpus`.** Spawn placement is
+///   least-loaded-with-rotation, so each CPU ends up with the identical mix and
+///   the run queues are balanced by construction. Balance-by-`StealRequest`
+///   only answers a probe from a CPU whose victim has *two* ready tasks (spec
+///   §7.7), so an odd thread count would leave a standing imbalance and this
+///   would be measuring placement rather than fairness.
+/// * **Each `solo` thread carries three times a `trio` thread's work**, so the
+///   two processes have the *same total* work and, under an even split, finish
+///   together. The window I5 measures over closes when the first process stops
+///   being runnable, so this is what makes it the whole run rather than the
+///   first third of it — and a bound that carries a quantum per thread needs a
+///   window many quanta wide before a broken split can clear it.
+pub fn fairness_storm(cpus: usize) -> Scenario {
+    /// One `trio` thread's work: six quanta. `solo`'s threads run three times
+    /// this, which is what equalizes the two processes' totals.
+    const WORK: u64 = 60 * MS;
+    let hog = |ns| Script::new(vec![Op::Run(ns)]);
+    let mut scenario = scenario(
+        if cpus == 1 {
+            "fairness_storm"
+        } else {
+            "fairness_storm_smp"
+        },
+        cpus,
+        // No wait queues: a queue nobody blocks on would only be scaffolding.
+        Vec::new(),
+        vec![
+            process("solo", vec![0; cpus], vec![hog(3 * WORK)]),
+            process("trio", vec![0; 3 * cpus], vec![hog(WORK)]),
+        ],
+    );
+    scenario.max_tasks = 4 * cpus;
+    scenario.max_steps = 4_000 + 4_000 * cpus;
+    scenario
+}
+
+/// Negative gate for invariant I5, first of two: spec §13.9's rejected policy,
+/// one fair share per *thread* instead of one per process.
+///
+/// It **must fail**. `trio` has three times `solo`'s threads and exactly the
+/// same entitlement; under per-thread shares it takes three quarters of the
+/// machine, and a fairness check that cannot see a 3:1 split of a two-way share
+/// is not measuring fairness. The control is `fairness_storm` itself, which is
+/// the identical workload under the shipped policy.
+pub fn fair_share_per_thread() -> Scenario {
+    let mut scenario = fairness_storm(1).with_share(ShareShape::PerThread);
+    scenario.name = "fair_share_per_thread";
+    scenario
+}
+
+/// Negative gate for invariant I5, second of two: `trio`'s share is charged
+/// twice for every nanosecond it runs.
+///
+/// It **must fail**, and it fails in the *opposite* direction to
+/// `fair_share_per_thread` — a share whose vruntime outruns its service is
+/// throttled for work it never did, so `trio` ends up with a third of the
+/// machine instead of half. The two gates together are what say I5 measures
+/// service against entitlement rather than one side of it: the ordering could
+/// be perfect and the charge wrong, or the charge perfect and the shares
+/// mis-attributed, and both are unfair.
+pub fn fair_double_charge() -> Scenario {
+    let mut scenario = fairness_storm(1).with_charge(ChargeShape::Double { process: "trio" });
+    scenario.name = "fair_double_charge";
+    scenario
+}
+
+/// Negative gate for the core's `feature = "check"` pass-duration assert
+/// (`cpu::MAX_PASS_NS`), which is the on-target counterpart to the simulator's
+/// invariants (spec §10.2).
+///
+/// It **must abort**, like `old_preemptible_window`: the assert is the core's
+/// own, so it unwinds rather than being recorded.
+///
+/// This one is not a port of a shape the kernel had — it cannot be, because the
+/// thing being asserted is a *cost* and the simulator's clock does not advance
+/// inside a step. It is calibration: `SimHw` charges every pass five times the
+/// budget, and if the assert stays quiet then it is not compiled in, or it is
+/// reading a clock that never moves, and every check build that ever came back
+/// green certified nothing about how long a pass takes.
+pub fn overlong_pass() -> Scenario {
+    let mut scenario = lost_wake_pipe().with_pass_cost(5 * toyos_sched::cpu::MAX_PASS_NS);
+    scenario.name = "overlong_pass";
+    scenario
+}
+
 /// Every scenario the exit criterion covers, in the order the spec lists them.
 /// `old_steal_port` and `old_commit_before_pass` are deliberately absent: they
 /// are the negative gates, and a sweep that treated them as scenarios to pass
@@ -534,14 +636,24 @@ pub fn all() -> Vec<Scenario> {
         audio_pipeline(2),
         futex_storm(),
         fork_storm(),
+        fairness_storm(1),
+        fairness_storm(2),
         old_park_kept_the_lend(),
     ]
 }
 
 /// Look a scenario up by name, for the CLI and the corpus replays.
 pub fn by_name(name: &str) -> Option<Scenario> {
+    // `fairness_storm:<cpus>` for any width, which is what spec §11 Stage 9
+    // gates on ("1–128 vcpus"). `all()` carries only the two cheap widths.
+    if let Some(cpus) = name.strip_prefix("fairness_storm:") {
+        return cpus.parse().ok().filter(|&n| n >= 1).map(fairness_storm);
+    }
     match name {
         "old_steal_port" => Some(old_steal_port()),
+        "fair_share_per_thread" => Some(fair_share_per_thread()),
+        "fair_double_charge" => Some(fair_double_charge()),
+        "overlong_pass" => Some(overlong_pass()),
         "old_park_kept_the_lend" => Some(old_park_kept_the_lend()),
         "old_commit_before_pass" => Some(old_commit_before_pass()),
         "old_commit_fused" => Some(old_commit_fused()),

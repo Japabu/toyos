@@ -37,10 +37,20 @@ impl Nanos {
     }
 }
 
-/// One scheduling-relevant event, in the format shared by the kernel's
-/// per-CPU binary trace ring and the simulator's recorder.
-/// `toyos-sched-sim replay --from-qemu` converts a captured kernel stream
-/// into a sim event script (spec §10.4).
+/// One scheduling-relevant event, in the vocabulary shared by the kernel's
+/// per-CPU binary trace ring and the simulator's recorder (spec §10.4).
+///
+/// Vocabulary, not wire format: this is a Rust enum with no layout guarantee.
+/// `kernel/src/trace.rs`'s `Record` is the wire form, and `trace::record` is the
+/// total mapping onto it.
+///
+/// There is deliberately **no** converter from a captured kernel ring back into
+/// a sim run. A `Scenario` is a workload — which queue each thread blocks on,
+/// what makes its condition true, how long it runs — and the ring records none
+/// of that; it records an observed schedule, from a 4096-entry buffer that
+/// wraps, so a capture is a tail with no initial state to replay from. The
+/// `from-qemu` subcommand that claimed otherwise was an `unimplemented!()` and
+/// is gone.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct TraceEvent {
     pub ts: Nanos,

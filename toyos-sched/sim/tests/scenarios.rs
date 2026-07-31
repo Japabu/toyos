@@ -33,6 +33,15 @@ const SEEDS: u64 = 500;
 /// Steps per scenario in the in-test fuzz sweep.
 const FUZZ_STEPS: u64 = 20_000;
 
+/// Seeds for the fairness gates and their controls. A fifth of [`SEEDS`],
+/// because `fairness_storm` is by far the longest scenario in the tree — it has
+/// to be, since a contention window must be many quanta wide before a broken
+/// split can clear the bound — and `every_scenario_survives_a_seed_sweep`
+/// already runs it at the full count. What these tests add is the *direction* of
+/// each failure, and a structural 3:1 split does not need 500 schedules to show
+/// up in.
+const FAIR_SEEDS: u64 = 100;
+
 #[test]
 fn every_scenario_survives_a_seed_sweep() {
     let mut failures = Vec::new();
@@ -410,6 +419,182 @@ fn the_audio_pipeline_holds_on_one_cpu() {
     let result = sweep::seed_sweep(&scenarios::audio_pipeline(1), SEEDS, 3);
     assert!(result.passed(), "{}", result.report());
     assert_eq!(result.scenario, "audio_pipeline");
+}
+
+/// Invariant I5 is *alive*, which is a separate claim from I5 being green.
+///
+/// A fairness check whose contention windows never open reports "clean" on every
+/// scenario in the tree and certifies nothing — which is exactly the shape of
+/// gate A's four instrument defects, and exactly what would happen here if the
+/// window conditions (same runnable set, saturated machine, empty RT band) were
+/// one degree stricter than the workload can satisfy. So the spread is required
+/// to be *non-zero*: some window has to have opened, stayed open long enough for
+/// a real separation to accumulate, and been measured.
+///
+/// The widths are the two `all()` carries. Spec §11 Stage 9 wants 1–128, which
+/// runs from the CLI as `measure fairness_storm:<cpus>`; the sweep here is what
+/// `cargo test` can afford.
+#[test]
+fn the_fairness_storm_is_measured_and_holds() {
+    for cpus in [1, 2] {
+        let result = sweep::seed_sweep(&scenarios::fairness_storm(cpus), FAIR_SEEDS, 3);
+        assert!(result.passed(), "{}", result.report());
+        assert!(
+            result.worst_fair_spread > 0,
+            "at {cpus} cpu(s) invariant I5 never opened a contention window it \
+             could measure, so its clean verdict on every other scenario is a \
+             verdict about nothing: {}",
+            result.report(),
+        );
+        // And the measurement has to be a *comparison*, not an accident of a
+        // bound so wide nothing could reach it.
+        assert!(
+            result.worst_fair_spread * 8 > result.worst_fair_bound,
+            "at {cpus} cpu(s) the worst spread is more than 8x under its own \
+             bound; the bound has stopped constraining anything: {}",
+            result.report(),
+        );
+    }
+}
+
+/// The fifth self-validation gate: one fair share per *thread* — spec §13.9's
+/// rejected policy — instead of one per process.
+///
+/// `trio` has three times `solo`'s threads and exactly the same entitlement.
+/// Under the shipped policy they split the CPU evenly; under per-thread shares
+/// `trio` takes three quarters. If I5 cannot see a 3:1 split of a two-way share,
+/// it is not measuring fairness, and every clean I5 report in this file means
+/// nothing.
+#[test]
+fn per_thread_fair_shares_are_caught() {
+    let broken = scenarios::fair_share_per_thread();
+    let mut caught = 0;
+    let mut kinds: BTreeMap<String, usize> = BTreeMap::new();
+    for seed in 0..FAIR_SEEDS {
+        let mut choices = ChoiceStream::from_seed(seed);
+        let outcome = run(broken.clone(), &mut choices);
+        if outcome.passed() {
+            continue;
+        }
+        caught += 1;
+        for violation in &outcome.violations {
+            let id = violation.split(':').next().unwrap_or("?").to_string();
+            *kinds.entry(id).or_default() += 1;
+        }
+    }
+    assert_eq!(
+        caught, FAIR_SEEDS as usize,
+        "a process taking three quarters of the machine off its thread count \
+         went undetected in {}/{FAIR_SEEDS} schedules",
+        FAIR_SEEDS as usize - caught,
+    );
+    assert!(
+        kinds.contains_key("I5"),
+        "expected the service-spread violation; got {kinds:?}",
+    );
+    assert_eq!(
+        kinds.len(),
+        1,
+        "per-thread shares must be caught by I5 and not as collateral in some \
+         other invariant — I6 in particular sums over a process's shares and \
+         must stay correct under either shape: {kinds:?}",
+    );
+
+    // The control: the identical workload under the shipped policy, or the gate
+    // is detecting the workload rather than the policy.
+    let shipped = sweep::seed_sweep(&scenarios::fairness_storm(1), FAIR_SEEDS, 1);
+    assert!(shipped.passed(), "{}", shipped.report());
+}
+
+/// The sixth self-validation gate, and I5's other direction: a share charged
+/// twice for every nanosecond it runs.
+///
+/// It matters that this is a *separate* gate from `per_thread_fair_shares`, and
+/// that the two fail in opposite directions. Fairness is service measured
+/// against entitlement, and there are two ways to get it wrong — mis-attribute
+/// the entitlement, or mis-measure the service. A check that saw only one of
+/// them would be half an instrument, and the half it was missing would be
+/// invisible.
+#[test]
+fn double_charging_a_share_is_caught() {
+    let broken = scenarios::fair_double_charge();
+    let mut caught = 0;
+    let mut throttled = 0;
+    for seed in 0..FAIR_SEEDS {
+        let mut choices = ChoiceStream::from_seed(seed);
+        let outcome = run(broken.clone(), &mut choices);
+        if outcome.passed() {
+            continue;
+        }
+        caught += 1;
+        // The direction is the point: the double-charged process gets *less*,
+        // which is the opposite of what per-thread shares do to it.
+        if outcome
+            .violations
+            .iter()
+            .any(|v| v.starts_with("I5") && v.contains("solo=") && v.contains("trio="))
+        {
+            let text = outcome.violations.join(" ");
+            let value = |name: &str| -> u64 {
+                text.split(name)
+                    .nth(1)
+                    .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
+                    .and_then(|n| n.parse().ok())
+                    .unwrap_or(0)
+            };
+            if value("solo=") > value("trio=") {
+                throttled += 1;
+            }
+        }
+    }
+    assert_eq!(
+        caught, FAIR_SEEDS as usize,
+        "a share throttled for work it never did went undetected in {}/{FAIR_SEEDS} \
+         schedules",
+        FAIR_SEEDS as usize - caught,
+    );
+    assert_eq!(
+        throttled, caught,
+        "the double-charged process must come out *behind*; if it is ahead, this \
+         gate is catching something other than the charge",
+    );
+
+    let shipped = sweep::seed_sweep(&scenarios::fairness_storm(1), FAIR_SEEDS, 1);
+    assert!(shipped.passed(), "{}", shipped.report());
+}
+
+/// The seventh self-validation gate: the core's `feature = "check"` pass-duration
+/// assert, which spec §10.2 makes the on-target counterpart to everything else in
+/// this file.
+///
+/// It is the one check here that says something about *cost* rather than about
+/// state, so it is the one the simulator cannot exercise for free: the VM's clock
+/// does not move inside a step, and an assert whose measured quantity is always
+/// zero is an assert that cannot fail. `SimHw` therefore charges every pass a
+/// modelled cost, and this gate turns that cost up past the budget.
+///
+/// Without it, "kernel check builds assert a max pass duration" would be a claim
+/// backed by an expression that computes `0 <= 200_000` a few thousand times a
+/// second.
+#[test]
+fn a_pass_that_overruns_its_budget_is_caught() {
+    let caught = sweep::abort_gate(&scenarios::overlong_pass(), FAIR_SEEDS);
+    let Some((seed, message)) = caught else {
+        panic!(
+            "a pass modelled at five times `cpu::MAX_PASS_NS` went undetected in \
+             {FAIR_SEEDS} schedules — either the assert is not compiled in, or the \
+             clock it reads never moves",
+        );
+    };
+    assert!(
+        message.contains("invariant P: a scheduler pass took"),
+        "expected the pass-duration assert to be what fires (seed {seed}); got: {message}",
+    );
+
+    // The control: the identical workload at the default modelled cost of zero
+    // must be clean, so the gate is measuring the budget and not the workload.
+    let free = sweep::seed_sweep(&scenarios::lost_wake_pipe(), FAIR_SEEDS, 1);
+    assert!(free.passed(), "{}", free.report());
 }
 
 /// The fourth self-validation gate, and the newest: invariant I9's teeth.

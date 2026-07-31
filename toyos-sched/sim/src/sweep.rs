@@ -14,6 +14,12 @@ pub struct SweepResult {
     pub runs: usize,
     pub steps: u64,
     pub failures: Vec<Outcome>,
+    /// Worst invariant-I5 service spread across the sweep, and the bound in
+    /// force when it happened. The sweep's fairness *measurement*, which is what
+    /// spec §11 Stage 9 compares between frontier implementations; `passed()`
+    /// only says it stayed under the bound.
+    pub worst_fair_spread: u64,
+    pub worst_fair_bound: u64,
 }
 
 impl SweepResult {
@@ -21,11 +27,24 @@ impl SweepResult {
         self.failures.is_empty()
     }
 
+    /// Fold one run's fairness measurement in. Kept next to `passed()` so a new
+    /// sweep entry point cannot forget it.
+    fn observe(&mut self, outcome: &Outcome) {
+        if outcome.fair_spread > self.worst_fair_spread {
+            self.worst_fair_spread = outcome.fair_spread;
+            self.worst_fair_bound = outcome.fair_bound;
+        }
+    }
+
     pub fn report(&self) -> String {
         if self.passed() {
             format!(
-                "{}: {} runs, {} steps, clean",
-                self.scenario, self.runs, self.steps,
+                "{}: {} runs, {} steps, clean (I5 worst spread {}/{} ns)",
+                self.scenario,
+                self.runs,
+                self.steps,
+                self.worst_fair_spread,
+                self.worst_fair_bound,
             )
         } else {
             format!(
@@ -53,6 +72,8 @@ pub fn seed_sweep(scenario: &Scenario, seeds: u64, keep_failures: usize) -> Swee
         runs: 0,
         steps: 0,
         failures: Vec::new(),
+        worst_fair_spread: 0,
+        worst_fair_bound: 0,
     };
     for seed in 0..seeds {
         let mut choices = if seed % 2 == 0 {
@@ -63,6 +84,7 @@ pub fn seed_sweep(scenario: &Scenario, seeds: u64, keep_failures: usize) -> Swee
         let outcome = run(scenario.clone(), &mut choices);
         result.runs += 1;
         result.steps += outcome.steps as u64;
+        result.observe(&outcome);
         if !outcome.passed() && result.failures.len() < keep_failures {
             result.failures.push(outcome);
         }
@@ -102,6 +124,8 @@ pub fn fuzz_sweep(scenario: &Scenario, budget: u64, keep_failures: usize) -> Swe
         runs: 0,
         steps: 0,
         failures: Vec::new(),
+        worst_fair_spread: 0,
+        worst_fair_bound: 0,
     };
     let mut generator = 0x9E3779B97F4A7C15u64;
     while result.steps < budget {
@@ -113,6 +137,7 @@ pub fn fuzz_sweep(scenario: &Scenario, budget: u64, keep_failures: usize) -> Swe
         let outcome = run(scenario.clone(), &mut choices);
         result.runs += 1;
         result.steps += outcome.steps as u64;
+        result.observe(&outcome);
         if !outcome.passed() && result.failures.len() < keep_failures {
             result.failures.push(outcome);
         }

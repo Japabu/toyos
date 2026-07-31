@@ -43,6 +43,12 @@ pub struct Outcome {
     /// Blocks that ended in `Commit::Killed` — a retire that landed inside the
     /// registration window (spec §6.3, §7.6). Reported for the same reason.
     pub killed_at_park: u64,
+    /// Invariant I5's measurement: the widest service spread seen over one
+    /// contention window, and the bound in force when it was seen. A number
+    /// rather than a verdict, because spec §11 Stage 9 compares a per-CPU
+    /// frontier against the global one and "both passed" is not a comparison.
+    pub fair_spread: u64,
+    pub fair_bound: u64,
 }
 
 impl Outcome {
@@ -53,8 +59,14 @@ impl Outcome {
     pub fn report(&self) -> String {
         if self.passed() {
             return format!(
-                "{}: ok ({} steps, {} ns, {} switches, {} kicks)",
-                self.scenario, self.steps, self.elapsed, self.switches, self.kicks,
+                "{}: ok ({} steps, {} ns, {} switches, {} kicks, I5 spread {}/{} ns)",
+                self.scenario,
+                self.steps,
+                self.elapsed,
+                self.switches,
+                self.kicks,
+                self.fair_spread,
+                self.fair_bound,
             );
         }
         format!(
@@ -161,6 +173,8 @@ fn outcome_of(scenario: &'static str, vm: &Vm<'_>, choices: &ChoiceStream) -> Ou
         kicks,
         pre_park_claims: vm.pre_park_claims,
         killed_at_park: vm.killed_at_park,
+        fair_spread: vm.fair_spread,
+        fair_bound: vm.fair_bound,
     }
 }
 

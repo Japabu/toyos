@@ -35,6 +35,12 @@ xhci-one-slot = []
 # proving what 256 KiB proves in a second. The eviction code under test is the
 # shipped code; only the bound moves.
 test-small-caches = []
+# Shrink each process's VA arena from ~1015 GB to 256 MiB, so that exhausting
+# it is a test rather than a physics problem. Every region costs at worst twice
+# its size in physical memory, so the shipped arena needs upwards of 500 GB of
+# RAM to fill and the PMM refuses long first — `find_gap` cannot be made to
+# fail by any workload this harness can express. See `vma::ALLOC_FLOOR`.
+test-tiny-va = []
 # SYS_DEBUG action 4: take a real #DF, by faulting with an unusable RSP. The
 # only way to exercise the IST1 stack, which is the one stack in the kernel
 # whose overflow corrupts the heap while writing the report that explains the
@@ -44,6 +50,17 @@ test-double-fault = []
 # drive the ordinary fatal panic — the one path where the report reaches the
 # screen only because the panic handler captured it before draining the ring.
 test-late-panic = []
+# The on-target half of the scheduler spec's invariants (spec §10.2, §10.5).
+# Turns on `toyos-sched/check`, which asserts container-vs-state-word agreement
+# and invariant T at the end of every scheduler pass, and asserts the pass
+# itself fits `toyos_sched::cpu::MAX_PASS_NS` — the term the simulator's
+# invariant I4 leaves out, because a simulated pass costs nothing.
+#
+# Off by default because it is not free: each pass gains a walk of this CPU's
+# ready queue and parked map plus a second clock read, and that lands on the
+# audio path. A bring-up, bisect or bare-metal build wants it; a build being
+# measured does not.
+sched-check = ["toyos-sched/check"]
 
 # debug-assertions and overflow-checks stay on: fail-fast beats speed here.
 [profile.dev]

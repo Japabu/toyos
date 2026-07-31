@@ -599,6 +599,24 @@ fn home_of(state: TaskState) -> Option<CpuId> {
     }
 }
 
+/// How long one scheduler pass may take on the machine it runs on (spec
+/// §10.2, §14's preempt-off risk). Asserted only in `feature = "check"`
+/// builds, which is what the kernel's `sched-check` feature turns on.
+///
+/// The number is the simulator's own modelling error made explicit. The sim
+/// charges a pass **zero** time — every step it takes is either a workload op
+/// or an interrupt — so invariant I4's RT wake-latency bound
+/// (`IPI_LATENCY_NS + max KernelSection + 2 × RUN_CHUNK_NS`) omits the pass
+/// entirely. A pass that costs more than the 200 µs the sim models for IPI
+/// delivery would be the largest unmodelled term in that bound, so that is
+/// where the budget sits: 2% of a quantum, and an order of magnitude above any
+/// pass that is doing scheduling rather than work.
+///
+/// It is a *policy* number, like `MAX_USER_STR` and `MAX_FDS`: nothing in the
+/// design forces 200 µs. If it ever fires on honest work, the honest response
+/// is to find out which pass grew and why — not to raise it.
+pub const MAX_PASS_NS: u64 = 200_000;
+
 /// Pass type-states: a pass must be disposed exactly once, and disposal is
 /// the only route to [`SchedPass::finish`].
 pub enum Undisposed {}
@@ -758,7 +776,21 @@ impl<H: Hw, P: PreemptGuard> SchedPass<'_, '_, H, P, Disposed> {
     /// every heap mutation is the whole proof of invariant T (spec §8.4):
     /// with no window between the last mutation and the arming, "deadline
     /// exists but timer unarmed" is not a state the code can be in.
-    pub fn finish(mut self) -> Action<<H as Hw>::Payload> {
+    pub fn finish(self) -> Action<<H as Hw>::Payload> {
+        // Sampled before the pass is consumed, so the second clock read below
+        // measures the pass and nothing else. `now` is threaded as a value
+        // everywhere else in the core precisely so a decision cannot depend on
+        // when it is read; this reads the clock again, which is why it exists
+        // only in a check build and feeds an assert rather than a decision.
+        #[cfg(feature = "check")]
+        let (hw, entered) = (self.env.hw, self.now);
+        let action = self.finish_inner();
+        #[cfg(feature = "check")]
+        check_pass_duration(hw, entered);
+        action
+    }
+
+    fn finish_inner(mut self) -> Action<<H as Hw>::Payload> {
         loop {
             self.preempt_if_due();
             self.pick();
@@ -964,6 +996,25 @@ impl<H: Hw, P: PreemptGuard> SchedPass<'_, '_, H, P, Disposed> {
             self.env.hw.kick(victim);
         }
     }
+}
+
+/// The on-target counterpart to the simulator's invariants (spec §10.2): the
+/// sim asserts what a pass *does*, this asserts what a pass *costs*.
+///
+/// Everything else in `feature = "check"` is a statement about state the core
+/// owns and can therefore be checked in either world. This one cannot: the
+/// simulator's clock does not advance inside a step, so on the sim side it is
+/// exercised by a modelled pass cost (`scenarios::overlong_pass`) and on the
+/// kernel side by the real TSC.
+#[cfg(feature = "check")]
+fn check_pass_duration<H: Hw>(hw: &H, entered: Nanos) {
+    let elapsed = hw.now().since(entered);
+    assert!(
+        elapsed <= MAX_PASS_NS,
+        "invariant P: a scheduler pass took {elapsed} ns, budget {MAX_PASS_NS} ns — \
+         the simulator charges a pass nothing, so invariant I4's RT wake-latency \
+         bound is optimistic by at least that much",
+    );
 }
 
 /// The globally shared, `Sync` face of a CPU, and the whole remote surface:

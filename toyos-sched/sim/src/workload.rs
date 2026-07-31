@@ -156,6 +156,41 @@ pub enum ParkShape {
     KeepLapsedLend,
 }
 
+/// What a fair share is a share *of* — spec §9.1's "all threads of one process
+/// share a vruntime".
+///
+/// A scenario dimension rather than a constant for the same reason
+/// [`BlockShape`] and [`ParkShape`] are, except that the other answer is one
+/// the design *rejected* rather than one it shipped: §13.9 turns down
+/// per-thread weight-division fairness, and per-thread vruntime is that policy
+/// in its simplest form. Invariant I5 has to be able to tell the two apart, or
+/// it is not measuring the policy the spec states.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ShareShape {
+    /// Spec §9.1: one [`toyos_sched::fair::FairShare`] per process, reached
+    /// through every thread of it.
+    PerProcess,
+    /// One share per thread, so a process buys CPU by forking. See
+    /// `scenarios::fair_share_per_thread`.
+    PerThread,
+}
+
+/// How much vruntime a running task's share is charged for the time it runs.
+///
+/// The honest answer is "the time it ran", and it is the core that computes it
+/// (`SchedPass::begin`). This dimension lets the VM charge a named process a
+/// second time on top, which is the shape of a charge applied at two
+/// transitions instead of one — and the shape invariant I5 must notice,
+/// because a share whose vruntime outruns its service is a share being
+/// throttled for work it never did.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ChargeShape {
+    Honest,
+    /// Charge this process's share twice for every nanosecond it runs. See
+    /// `scenarios::fair_double_charge`.
+    Double { process: &'static str },
+}
+
 /// Which teardown/balance algorithm the VM drives the core with.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Protocol {
@@ -180,6 +215,11 @@ pub struct Scenario {
     pub block: BlockShape,
     pub window: WindowShape,
     pub park: ParkShape,
+    pub share: ShareShape,
+    pub charge: ChargeShape,
+    /// What one scheduler pass is modelled to cost. Zero everywhere but
+    /// `scenarios::overlong_pass`; see [`crate::hw_impl::SimHwState`].
+    pub pass_cost_ns: u64,
     /// Safety net: a run that has not quiesced by here is reported as a
     /// non-termination failure rather than looping forever.
     pub max_steps: usize,
@@ -230,5 +270,25 @@ impl Scenario {
     pub fn with_park(mut self, park: ParkShape) -> Self {
         self.park = park;
         self
+    }
+
+    pub fn with_share(mut self, share: ShareShape) -> Self {
+        self.share = share;
+        self
+    }
+
+    pub fn with_charge(mut self, charge: ChargeShape) -> Self {
+        self.charge = charge;
+        self
+    }
+
+    pub fn with_pass_cost(mut self, ns: u64) -> Self {
+        self.pass_cost_ns = ns;
+        self
+    }
+
+    /// The index of a process by name, for the dimensions that name one.
+    pub fn process_index(&self, name: &str) -> Option<usize> {
+        self.procs.iter().position(|p| p.name == name)
     }
 }
