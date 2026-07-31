@@ -470,9 +470,17 @@ scenario. The old "final re-check of five ad-hoc flags under cli" collapses into
    refcount sanity every step.
 
 Deleted wholesale: `KILLED[16]`, `mark_killed`'s 16-concurrent-retire panic, `WAKE_TRANSITS`,
-`TransitGuard`, `scan_remove`, poison-set rescheduling filters. Panic recovery marks the kill bit
-and abandons via `driver::abandon_current()`, which refuses to rejoin if the percpu busy flag
-shows a pass was interrupted — same halt-loudly semantics, one mechanism.
+`TransitGuard`, `scan_remove`, poison-set rescheduling filters.
+
+Panic recovery leaves through `scheduler::schedule_no_return()` (`kernel/src/scheduler.rs:449`).
+
+> This paragraph used to say recovery "marks the kill bit and abandons via
+> `driver::abandon_current()`". **Neither half is true and neither ever was.**
+> `abandon_current` does not exist anywhere in the tree outside this line and §12's table;
+> `mark_kill` has zero kernel callers (`toyos-sched` uses it internally from `waitq.rs`, and
+> the simulator calls it). The faulted context dies through an ordinary `Running → Dead`
+> transition on its own CPU. A reader implementing panic recovery from this section would go
+> hunting for a mechanism that was never built.
 
 ### 7.7 StealRequest node recycling
 
@@ -688,8 +696,21 @@ cutover for attributability, replaced by a per-CPU frontier in a **scheduled, si
 
 ### 9.2 Ordering, RT band, quanta
 
-`RunQueue` = `rt: VecDeque<ReadyTask>` (FIFO, drained first) + `fair: BTreeMap<(u64, TaskKey),
-ReadyTask>` — today's ordering, deliberately. `dispatch` sets `quantum_end = now + QUANTUM_NS`;
+`RunQueue` = `rt: VecDeque<ReadyTask>` (FIFO, drained first) + `fair: BTreeMap<(u64, u64),
+ReadyTask>`, keyed by `(vruntime, insert_seq)` with a monotonic insertion sequence.
+
+**The tie-break must not be `TaskKey`.** All threads of a process share one vruntime, so an
+identity tie-break starves siblings: the same thread wins every tie and the others only run
+when it blocks. With a monotonic sequence a re-inserted thread goes *behind* its
+equal-vruntime siblings, so they round-robin without gaining cross-process share.
+`queue.rs:18-24` carries this reasoning next to the field. Related: `pop_surplus` takes the
+*last* fair task (`keys().next_back()`), so a steal never hands away the next-to-run one.
+
+> This section previously specified `BTreeMap<(u64, TaskKey), ReadyTask>` and called it
+> "today's ordering, deliberately". That is the ordering the code rejects as a starvation
+> bug; anyone implementing from the old text would have reintroduced it.
+
+`dispatch` sets `quantum_end = now + QUANTUM_NS`;
 `finish()` arms `min(quantum_end, heap min)`. RT tasks round-robin within the band on the same
 quantum. `SYS_SET_RT_PRIORITY` gains its privilege gate at the syscall layer (audio spec §9.4).
 
@@ -918,7 +939,7 @@ carry a parallel old world one stage longer than the conversion requires.
 | Boosted client spins without blocking | Window armed at dispatch, expiring at the quantum-end preempt | ≤ one quantum of running time per lend (I9) |
 | Boosted client starved before it ever runs | Queue time spends no window; the pick never demotes | The lend survives to its first dispatch (I9, §8.5) |
 | Boosted client blocks early, over and over, on one lend | `park` releases the window unconditionally | The lend cannot outlive one block (I9, negative gate `old_park_kept_the_lend`) |
-| Panic inside a pass | Percpu busy flag observed by `abandon_current` → CPU halts loudly; panic-reentry flag checked before any percpu/log access | One clean report; evidence preserved (B9) |
+| Panic inside a pass | Percpu busy flag observed on re-entry → CPU halts loudly; panic-reentry flag checked before any percpu/log access. (Recovery leaves via `scheduler::schedule_no_return()`; there is no `abandon_current` — see §7.6) | One clean report; evidence preserved (B9) |
 | Task value dropped outside `finalize` | `TaskInner::drop` panics | Double-drop class converted to loud failure (§5.1) |
 | Simulator finds a violation | Seed + full decision trace + shrunk replay auto-committed to corpus | Permanent regression; deterministic repro |
 
