@@ -10,6 +10,12 @@ A custom OS with bootloader, kernel, and userland built from scratch in Rust.
 
 ![Doom running on ToyOS](doom.jpg)
 
+**Booting on real hardware** -- the very first boot on a physical machine, from a USB stick on a ThinkPad T14 Gen 2. It reached CPU bring-up, x2APIC, I/O APIC, ACPI, full PCI enumeration and NVMe identification in 590 ms on the first attempt.
+
+The screenshot is the laptop's own panel: the machine has no serial port, so the kernel renders its log and panics to the framebuffer. It is reporting a real bug -- the page cache sized an index from the disk's block count, which fit in QEMU's 1 GiB test image and wanted 238 MB on a 244 GB drive.
+
+![ToyOS booting on a ThinkPad T14](first-boot.jpg)
+
 ## Prerequisites
 
 - QEMU
