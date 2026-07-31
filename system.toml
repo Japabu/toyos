@@ -28,7 +28,7 @@ input-test = {}
 proctest = {}
 toyos-ld = { path = "toyos-ld" }
 toyos-cc = { path = "toyos-cc" }
-# cargo = { path = "userland/cargo", no-default-features = true, warnings = false }
+# cargo = { path = "userland/cargo", no-default-features = true }
 
 # Symlinks created in the initrd at build time.
 # Paths are relative to the filesystem root (no leading /).

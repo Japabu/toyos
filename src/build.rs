@@ -31,7 +31,6 @@ struct SystemConfig {
 struct ProgramConfig {
     path: Option<String>,
     no_default_features: bool,
-    warnings: Option<bool>,
 }
 
 impl ProgramConfig {
@@ -47,7 +46,7 @@ impl ProgramConfig {
     /// Whether this program is a workspace member of the userland workspace.
     /// Programs with explicit paths or special flags are standalone.
     fn is_workspace_member(&self) -> bool {
-        self.path.is_none() && !self.no_default_features && self.warnings != Some(false)
+        self.path.is_none() && !self.no_default_features
     }
 }
 
