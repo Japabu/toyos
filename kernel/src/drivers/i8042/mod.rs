@@ -47,7 +47,7 @@
 //! ISR already executing nor a vector already latched in that CPU's LAPIC, and
 //! an edge asserted on a masked edge-triggered entry is dropped outright.
 
-use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use toyos_ps2::{KeyDecoder, KeyOutcome, MouseDecoder, MouseOutcome};
 
@@ -133,31 +133,39 @@ const AUX_REENABLE_GIVE_UP: u32 = 3;
 // Release/Acquire on both indices. On x86 that is a compiler fence.
 
 const RING_LEN: usize = 256;
-const AUX_FLAG: u16 = 1 << 8;
+const AUX_FLAG: u64 = 1 << 8;
+/// The rest of the slot is the arrival time in microseconds. The mouse framer
+/// resyncs on the gap between adjacent bytes and nothing else, so the time the
+/// *drain* ran is useless to it — a batch would flatten every gap to zero. 55
+/// bits of microseconds is longer than any machine stays up.
+const TIME_SHIFT: u32 = 9;
 
-static BYTES: [AtomicU16; RING_LEN] = [const { AtomicU16::new(0) }; RING_LEN];
+static BYTES: [AtomicU64; RING_LEN] = [const { AtomicU64::new(0) }; RING_LEN];
 static HEAD: AtomicU32 = AtomicU32::new(0);
 static TAIL: AtomicU32 = AtomicU32::new(0);
 
-fn push_isr(byte: u8, aux: bool) {
+fn push_isr(byte: u8, aux: bool, arrived_ns: u64) {
     let head = HEAD.load(Ordering::Relaxed);
     if head.wrapping_sub(TAIL.load(Ordering::Acquire)) as usize >= RING_LEN {
         DROPPED.fetch_add(1, Ordering::Relaxed);
         return;
     }
     let slot = &BYTES[head as usize % RING_LEN];
-    slot.store(byte as u16 | if aux { AUX_FLAG } else { 0 }, Ordering::Relaxed);
+    let value = ((arrived_ns / 1_000) << TIME_SHIFT)
+        | if aux { AUX_FLAG } else { 0 }
+        | byte as u64;
+    slot.store(value, Ordering::Relaxed);
     HEAD.store(head.wrapping_add(1), Ordering::Release);
 }
 
-fn pop() -> Option<(u8, bool)> {
+fn pop() -> Option<(u8, bool, u64)> {
     let tail = TAIL.load(Ordering::Relaxed);
     if tail == HEAD.load(Ordering::Acquire) {
         return None;
     }
     let value = BYTES[tail as usize % RING_LEN].load(Ordering::Relaxed);
     TAIL.store(tail.wrapping_add(1), Ordering::Release);
-    Some((value as u8, value & AUX_FLAG != 0))
+    Some((value as u8, value & AUX_FLAG != 0, (value >> TIME_SHIFT) * 1_000))
 }
 
 fn has_bytes() -> bool {
@@ -189,7 +197,7 @@ pub extern "sysv64" fn handler() {
         if !buffer_full(status) {
             break;
         }
-        push_isr(inb(DATA), status & AUXB != 0);
+        push_isr(inb(DATA), status & AUXB != 0, timestamp);
         n += 1;
     }
     if n == ISR_BURST && buffer_full(inb(STATUS)) {
@@ -314,11 +322,10 @@ fn drain() -> Drained {
         lost = true;
     }
 
-    let now = crate::clock::nanos_since_boot();
-    while let Some((byte, aux)) = pop() {
+    while let Some((byte, aux, arrived)) = pop() {
         out.bytes += 1;
         if aux {
-            match state.pointer.feed(byte, now) {
+            match state.pointer.feed(byte, arrived) {
                 MouseOutcome::Packet { buttons, dx, dy } => {
                     if crate::mouse::handle_motion(
                         crate::mouse::PointerSource::Ps2,
@@ -830,7 +837,7 @@ fn handler_poll() {
         if status & OBF == 0 {
             break;
         }
-        push_isr(inb(DATA), status & AUXB != 0);
+        push_isr(inb(DATA), status & AUXB != 0, timestamp);
         n += 1;
     }
     if n > 0 {

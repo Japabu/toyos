@@ -220,36 +220,64 @@ fn buttons_are_already_in_hid_order() {
     }
 }
 
-#[test]
-fn a_stream_truncated_at_any_offset_resyncs_within_two_packets() {
-    let good = packet(0, 5, 7);
-    for drop in 0..3usize {
-        let mut stream: Vec<u8> = good[drop..].to_vec();
-        for _ in 0..4 {
-            stream.extend_from_slice(&good);
-        }
-        let mut d = MouseDecoder::new();
-        let mut packets = Vec::new();
-        let mut consumed = 0;
-        for (i, &b) in stream.iter().enumerate() {
-            if let MouseOutcome::Packet { dx, dy, .. } = d.feed(b, 0) {
-                if packets.is_empty() {
-                    consumed = i + 1;
-                }
-                packets.push((dx, dy));
+/// A PS/2 byte is 11 bits at 10–16.7 kHz and the device is programmed for 100
+/// samples/s, so a packet's bytes are ~1 ms apart and the next packet is a
+/// sample period after this one started.
+const BYTE_NS: u64 = 1_000_000;
+const SAMPLE_NS: u64 = 10_000_000;
+
+/// `count` packets as they arrive on the wire, minus the first `drop` bytes of
+/// the first one. Each byte carries the time it would actually have arrived —
+/// which is the whole resync mechanism, so a stream without it tests nothing.
+fn timed_stream(good: [u8; 3], count: usize, drop: usize) -> Vec<(u8, u64)> {
+    let mut out = Vec::new();
+    for p in 0..count {
+        for (i, &b) in good.iter().enumerate() {
+            if p > 0 || i >= drop {
+                out.push((b, p as u64 * SAMPLE_NS + i as u64 * BYTE_NS));
             }
         }
-        assert!(
-            !packets.is_empty(),
-            "dropping {drop} leading byte(s) never resynced"
-        );
-        assert!(
-            consumed <= 3 + 2 * 3,
-            "dropping {drop} byte(s) took {consumed} bytes to resync, more than two packets"
-        );
-        // And once resynced it stays correct, not merely aligned.
-        for p in &packets {
-            assert_eq!(*p, (5, -7), "resynced to the wrong offset after dropping {drop}");
+    }
+    out
+}
+
+#[test]
+fn a_stream_truncated_at_any_offset_resyncs_within_two_packets() {
+    // `(10, 8)` is the case that matters: both body bytes have bit 3 set, so
+    // both are legal head bytes and the always-one rule can discard neither —
+    // a one-byte misframe then completes a bogus group every time and sustains
+    // itself. `(5, 7)` is the opposite case, where bit 3 alone does resync.
+    for (dx, dy) in [(10i16, 8i16), (5, 7)] {
+        let good = packet(0, dx, dy);
+        for drop in 0..3usize {
+            let stream = timed_stream(good, 5, drop);
+            let mut d = MouseDecoder::new();
+            let mut packets = Vec::new();
+            let mut consumed = 0;
+            for (i, &(b, at)) in stream.iter().enumerate() {
+                if let MouseOutcome::Packet { dx, dy, .. } = d.feed(b, at) {
+                    if packets.is_empty() {
+                        consumed = i + 1;
+                    }
+                    packets.push((dx, dy));
+                }
+            }
+            assert!(
+                !packets.is_empty(),
+                "dropping {drop} leading byte(s) of ({dx}, {dy}) never resynced"
+            );
+            assert!(
+                consumed <= 3 + 2 * 3,
+                "dropping {drop} byte(s) of ({dx}, {dy}) took {consumed} bytes, more than two packets"
+            );
+            // And once resynced it stays correct, not merely aligned.
+            for p in &packets {
+                assert_eq!(
+                    *p,
+                    (dx as i32, -(dy as i32)),
+                    "resynced to the wrong offset after dropping {drop} of ({dx}, {dy})"
+                );
+            }
         }
     }
 }
@@ -258,7 +286,7 @@ fn a_stream_truncated_at_any_offset_resyncs_within_two_packets() {
 fn a_stale_partial_is_abandoned_rather_than_completed() {
     let mut d = MouseDecoder::new();
     assert_eq!(d.feed(0x08, 0), MouseOutcome::None);
-    assert_eq!(d.feed(5, 0), MouseOutcome::None);
+    assert_eq!(d.feed(5, BYTE_NS), MouseOutcome::None);
     // The third byte arrives a second later — that is not one gesture.
     assert_eq!(d.feed(7, 1_000_000_000), MouseOutcome::None);
     // The next whole packet decodes cleanly rather than one byte off.
