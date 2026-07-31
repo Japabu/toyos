@@ -25,8 +25,6 @@ members = [
 exclude = [
     # no_std C runtime — uses panic=abort (own Cargo.toml profile)
     "libc",
-    # Host-only tool with its own patches
-    "bootstrap-cc",
 ]
 
 [patch.crates-io]

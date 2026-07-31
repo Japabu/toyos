@@ -12,10 +12,24 @@ Rust toolchain.
 ## Bootstrap Chain
 
 ### Already done
-1. **toyos-cc** — Our Rust-based C compiler (cross-compiles C to ToyOS)
-2. **bootstrap-cc** — Uses toyos-cc to compile TCC (Tiny C Compiler)
+1. **toyos-cc** — Our Rust-based C compiler (cross-compiles C to ToyOS).
+   Exercised against TinyCC's own test corpus: `tests/testcases/tinycc`, 155
+   cases compiled for `x86_64-unknown-toyos` and executed in the guest by
+   `cargo test`. That covers "toyos-cc handles TinyCC's C", not "toyos-cc
+   builds the TinyCC compiler".
 
 ### Needed (in order)
+
+2. **toyos-cc compiles TCC itself** — the step this plan used to claim was
+   done. A `bootstrap-cc` crate existed for it and was deleted 2026-08-01:
+   nothing built it, and it targeted the *host* (Mach-O, `-e _main`, macOS SDK
+   headers, `panic!` on any other OS), so its output could never run on ToyOS.
+   It also failed at stage 1, inside Apple's `__darwin_mcontext64` — repairing
+   it meant teaching toyos-cc macOS header internals, which buys ToyOS nothing
+   and contradicts "toyos-cc is not meant to grow". Whoever restarts this:
+   target `x86_64-unknown-toyos` against toyos-libc from the first line, and
+   pin a stable release tarball with a verified hash rather than a cgit
+   snapshot.
 
 3. **TCC compiles dash** — Minimal POSIX shell (~15k lines of C, very
    portable). Needed because GCC's `./configure` is a massive autoconf-
