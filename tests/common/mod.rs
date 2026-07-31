@@ -3,6 +3,8 @@ pub mod audio;
 #[allow(dead_code)]
 pub mod compile;
 #[allow(dead_code)]
+pub mod faults;
+#[allow(dead_code)]
 pub mod qemu;
 #[allow(dead_code)]
 pub mod screen;
