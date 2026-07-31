@@ -255,7 +255,9 @@ pub struct XhciController {
     event_head: u16,
     event_phase: bool,
 
-    // The slot_id used during init for EP0 doorbell targeting
+    /// The device `init_device` is enumerating: which doorbell EP0 transfers
+    /// ring, and which slot id their completions must carry to be this
+    /// enumeration's rather than a bound device's.
     active_slot: u8,
 
     devices: Vec<HidDevice>,
@@ -268,24 +270,50 @@ impl XhciController {
         self.db_base.write_u32(0, 0);
     }
 
+    /// One event, or `None` while the controller has not published the next.
+    /// Every reader goes through here, because the ring is a single queue
+    /// carrying command completions, the enumeration's own control transfers
+    /// and every bound device's interrupt completions at once — so a reader
+    /// that dequeues an event it did not ask for owes it to whoever did, which
+    /// is what `dispatch_event` is.
+    fn next_event(&mut self) -> Option<Trb> {
+        let event = unsafe { read_volatile(self.event_ring.add(self.event_head as usize)) };
+        if ((event.control & 1) != 0) != self.event_phase {
+            return None;
+        }
+        self.advance_event_ring();
+        Some(event)
+    }
+
+    /// Give an event to the device it names. A bound device's interrupt
+    /// endpoint carries exactly one queued TRB and `requeue` is the only thing
+    /// that puts the next one there, so an interrupt completion dropped here —
+    /// as one dequeued during a later port's enumeration used to be — leaves
+    /// that device with an empty ring for the life of the boot: no log line, no
+    /// fault, a keyboard that simply stops.
+    fn dispatch_event(&mut self, event: Trb) {
+        let trb_type = (event.control >> 10) & 0x3F;
+        let code = (event.status >> 24) & 0xFF;
+        let slot = ((event.control >> 24) & 0xFF) as u8;
+        if trb_type != EVENT_TRANSFER || (code != 1 && code != 13) {
+            return;
+        }
+        if let Some(dev) = self.devices.iter_mut().find(|d| d.slot_id == slot) {
+            dev.dispatch_report();
+            dev.requeue(&self.db_base);
+        }
+    }
+
     fn wait_command(&mut self) -> (u32, u32) {
         loop {
-            let event = unsafe { read_volatile(self.event_ring.add(self.event_head as usize)) };
-            let cycle = (event.control & 1) != 0;
-            if cycle != self.event_phase {
+            let Some(event) = self.next_event() else {
                 core::hint::spin_loop();
                 continue;
+            };
+            if (event.control >> 10) & 0x3F == EVENT_CMD_COMPLETE {
+                return ((event.status >> 24) & 0xFF, (event.control >> 24) & 0xFF);
             }
-
-            let trb_type = (event.control >> 10) & 0x3F;
-            let code = (event.status >> 24) & 0xFF;
-            let slot = (event.control >> 24) & 0xFF;
-
-            self.advance_event_ring();
-
-            if trb_type == EVENT_CMD_COMPLETE {
-                return (code, slot);
-            }
+            self.dispatch_event(event);
         }
     }
 
@@ -308,22 +336,23 @@ impl XhciController {
         self.db_base.write_u32(self.active_slot as u64 * 4, 1);
     }
 
+    /// The completion of the transfer just queued on the shared EP0 ring, which
+    /// is the one carrying the enumerating device's slot id. Any other transfer
+    /// event is a bound device delivering a report while this port enumerates;
+    /// returning its completion code would have the caller read a descriptor
+    /// buffer the controller has not written into yet.
     fn wait_transfer(&mut self) -> u32 {
         loop {
-            let event = unsafe { read_volatile(self.event_ring.add(self.event_head as usize)) };
-            let cycle = (event.control & 1) != 0;
-            if cycle != self.event_phase {
+            let Some(event) = self.next_event() else {
                 core::hint::spin_loop();
                 continue;
-            }
-
+            };
             let trb_type = (event.control >> 10) & 0x3F;
-            let code = (event.status >> 24) & 0xFF;
-            self.advance_event_ring();
-
-            if trb_type == EVENT_TRANSFER {
-                return code;
+            let slot = ((event.control >> 24) & 0xFF) as u8;
+            if trb_type == EVENT_TRANSFER && slot == self.active_slot {
+                return (event.status >> 24) & 0xFF;
             }
+            self.dispatch_event(event);
         }
     }
 
@@ -367,9 +396,13 @@ impl XhciController {
     /// Hand the one EP0 ring to the device being enumerated. Every device
     /// addressed before this one still points its EP0 context here, which is
     /// safe only because nothing rings their doorbells again: `init_device` is
-    /// the sole caller, its control transfers each complete before the next
-    /// starts, and it runs once per port from `init`. Hotplug breaks that and
-    /// has to take an enumeration lock, not a second ring.
+    /// the sole caller, it runs once per port from `init`, and each of its
+    /// control transfers completes before the next starts — the last of which
+    /// holds only because `wait_transfer` matches the completion's slot id
+    /// against the enumerating device, so a bound device delivering a report
+    /// cannot end this transfer early and let the zeroing below land on a ring
+    /// still in flight. Hotplug breaks the serial part and has to take an
+    /// enumeration lock, not a second ring.
     fn reset_ep0_ring(&mut self) {
         let dma = dma();
         let ring = dma.subslice(OFF_EP0_RING, PAGE);
@@ -382,24 +415,8 @@ impl XhciController {
     }
 
     pub fn poll(&mut self) {
-        loop {
-            let event = unsafe { read_volatile(self.event_ring.add(self.event_head as usize)) };
-            let cycle = (event.control & 1) != 0;
-            if cycle != self.event_phase {
-                return;
-            }
-
-            let trb_type = (event.control >> 10) & 0x3F;
-            let code = (event.status >> 24) & 0xFF;
-            let slot = ((event.control >> 24) & 0xFF) as u8;
-            self.advance_event_ring();
-
-            if trb_type == EVENT_TRANSFER && (code == 1 || code == 13) {
-                if let Some(dev) = self.devices.iter_mut().find(|d| d.slot_id == slot) {
-                    dev.dispatch_report();
-                    dev.requeue(&self.db_base);
-                }
-            }
+        while let Some(event) = self.next_event() {
+            self.dispatch_event(event);
         }
     }
 

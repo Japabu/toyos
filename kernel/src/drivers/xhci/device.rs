@@ -377,7 +377,10 @@ pub fn init_device(ctrl: &mut XhciController, op_base: &Mmio, port_idx: u8) {
 
 /// Scan all ports on the controller and initialize connected HID devices.
 /// Enumeration is serial by construction, which is what lets the input
-/// context, the EP0 ring and the descriptor buffer be one each.
+/// context, the EP0 ring and the descriptor buffer be one each. Serial does not
+/// mean quiet: a device bound on an earlier port is armed and delivering while
+/// a later port enumerates, so the event ring carries its completions too and
+/// both waits demux by slot id rather than by TRB type alone.
 pub fn scan_ports(ctrl: &mut XhciController, op_base: &Mmio, max_ports: u8) {
     for p in 0..max_ports {
         let portsc = op_base.read_u32(OP_PORT_BASE + p as u64 * PORT_REG_SIZE);
