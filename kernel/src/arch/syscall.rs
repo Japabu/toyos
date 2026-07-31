@@ -1450,13 +1450,18 @@ fn sys_dlopen(path: &str, init_out: u64) -> u64 {
         }
     };
 
+    // A process's virtual address space is a resource like any other, and
+    // `SYS_DLOPEN` neither dedups a path nor frees anything on `SYS_DLCLOSE`,
+    // so exhausting it is a loop any process can write. Exhaustion is an error
+    // return, not an `.expect` in syscall context.
     let pt = process::current_address_space();
-    process::with_fd_owner_data(|_data| {
+    let mapped = process::with_fd_owner_data(|_data| {
         match &lib.memory {
             crate::elf::LibMemory::Owned(alloc) => {
                 let phys = DirectMap::phys_of(alloc.ptr());
-                let (vaddr, _) = process::vma_map(&pt, phys, alloc.size() as u64)
-                    .expect("dlopen: out of virtual address space");
+                let Some((vaddr, _)) = process::vma_map(&pt, phys, alloc.size() as u64) else {
+                    return Err(SyscallError::ResourceExhausted);
+                };
                 let delta = vaddr.raw() as i64 - lib.user_base.raw() as i64;
                 if delta != 0 {
                     crate::elf::rebase_relative_relocs(&lib, delta);
@@ -1466,8 +1471,9 @@ fn sys_dlopen(path: &str, init_out: u64) -> u64 {
             }
             crate::elf::LibMemory::Shared { rw_alloc, cached_image, rw_offset, .. } => {
                 let cached_phys = cached_image.phys();
-                let (lib_vaddr, _) = process::vma_map(&pt, cached_phys, cached_image.size() as u64)
-                    .expect("dlopen: out of virtual address space");
+                let Some((lib_vaddr, _)) = process::vma_map(&pt, cached_phys, cached_image.size() as u64) else {
+                    return Err(SyscallError::ResourceExhausted);
+                };
                 let num_rw_pages = rw_alloc.size() / crate::mm::PAGE_2M as usize;
                 let rw_phys = DirectMap::phys_of(rw_alloc.ptr());
                 for i in 0..num_rw_pages {
@@ -1485,7 +1491,12 @@ fn sys_dlopen(path: &str, init_out: u64) -> u64 {
                 lib.user_end = (lib.user_end as i64 + delta) as u64;
             }
         }
+        Ok(())
     });
+    if let Err(e) = mapped {
+        log!("dlopen: {}: out of virtual address space", resolved);
+        return e.to_u64();
+    }
 
     let lib_has_tls = lib.tls_memsz > 0;
 
