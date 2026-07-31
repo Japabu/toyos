@@ -13,3 +13,6 @@ target-lexicon = "0.13"
 
 [patch.crates-io]
 target-lexicon = { git = "https://github.com/Japabu/target-lexicon", branch = "toyos" }
+
+[lints.rust]
+warnings = "deny"

@@ -14,3 +14,6 @@ toyos-ld = { path = "../toyos-ld" }
 
 [patch.crates-io]
 target-lexicon = { git = "https://github.com/Japabu/target-lexicon", branch = "toyos" }
+
+[lints.rust]
+warnings = "deny"

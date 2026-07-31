@@ -16,3 +16,6 @@ cpal = { git = "https://github.com/Japabu/cpal", branch = "toyos" }
 [patch.crates-io]
 toyos-abi = { path = "../../toyos-abi" }
 toyos = { path = "../../toyos" }
+
+[lints.rust]
+warnings = "deny"

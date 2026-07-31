@@ -8,3 +8,6 @@ crate-type = ["cdylib"]
 
 [dependencies]
 tls-dep = { path = "dep" }
+
+[lints.rust]
+warnings = "deny"
