@@ -11,6 +11,9 @@ debug-wait = []
 # Panic between arming the on-screen console and mm::init, so a test can
 # assert the console covers the window where nothing else can report.
 test-early-panic = []
+# SYS_DEBUG action 3: halt every CPU on demand. A test needs a fatal path it
+# can trigger from userland; a shipped kernel must not have one.
+test-fatal-halt = []
 
 # debug-assertions and overflow-checks stay on: fail-fast beats speed here.
 [profile.dev]

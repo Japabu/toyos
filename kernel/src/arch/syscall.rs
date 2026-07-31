@@ -45,6 +45,7 @@ static LOCK_ACROSS_SWITCH_ARMED: core::sync::atomic::AtomicBool =
 /// The string is the whole synchronisation mechanism for the screen test:
 /// `halt_all_cpus` renders *before* it flushes serial, so a host that has
 /// seen this line knows the paint already finished — no sleep, no polling.
+#[cfg(feature = "test-fatal-halt")]
 pub const FATAL_HALT_NONCE: &str = "SYS_DEBUG: fatal halt 4b1d9e2c";
 
 pub fn init() {
@@ -480,6 +481,10 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
                 crate::scheduler::yield_now();
                 0
             }
+            // Not compiled into a kernel anyone ships. Every other action
+            // costs the caller its own process; this one costs the machine,
+            // and no latch fixes that — one call is already a permanent halt.
+            #[cfg(feature = "test-fatal-halt")]
             3 => { log!("{}", FATAL_HALT_NONCE); crate::arch::apic::halt_all_cpus(); }
             _ => SyscallError::InvalidArgument.to_u64(),
         },

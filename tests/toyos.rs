@@ -43,8 +43,10 @@ const SCREEN_TESTS: &[&str] = &[
 ];
 
 /// The line `SYS_DEBUG` action 3 logs immediately before halting every CPU.
-/// Kept in sync with `kernel/src/arch/syscall.rs` by this comment and by
-/// screen_fatal_halt failing loudly if it drifts.
+/// Action 3 exists only under the `test-fatal-halt` kernel feature, which
+/// screen_fatal_halt is the only caller of. Kept in sync with
+/// `kernel/src/arch/syscall.rs` by this comment and by screen_fatal_halt
+/// failing loudly if it drifts.
 const FATAL_HALT_NONCE: &str = "SYS_DEBUG: fatal halt 4b1d9e2c";
 
 // C tests that can't compile yet (missing toyos-cc features or unsupported platform APIs).
@@ -1013,6 +1015,7 @@ fn run_screen_test(
                 BootOptions {
                     display: qemu::Display::Gop,
                     qmp: true,
+                    kernel_features: &["test-fatal-halt"],
                     ..Default::default()
                 },
             );
