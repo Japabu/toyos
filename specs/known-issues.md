@@ -93,6 +93,20 @@ return a handle sharing the first module's id and TLS block, and
 `std_tls_dlopen`'s test 10 exercises exactly that case. It needs its own change
 with its own test, not a hardening drive-by.
 
+### ASSIGNED — `RingHeader` wraps at 4 GiB and silently corrupts every pipe and `TcpStream`
+
+The ring's byte counters are `u32`. Past 4 GiB of cumulative throughput on a single pipe or
+socket they wrap, and the wrap is silent: no assert, no error, just wrong data. Every pipe and
+every `TcpStream` is affected, and 4 GiB is an afternoon of file transfer, not a theoretical
+bound. Assigned to the `pipe.rs` owner.
+
+### ASSIGNED — a machine with no NVMe controller panics the boot
+
+`kernel/src/main.rs:344` — `.expect("NVMe: no controller found")`. Same class M1 closed for
+xHCI's zero-HID panic: a machine that simply lacks a device is not a kernel bug, and the metal
+track exists precisely because the target machine's device set is not the one we chose.
+Assigned to the `main.rs` owner.
+
 ### A 3 MiB `fs::write` to `/home` panics the kernel
 
 `bcachefs/src/btree.rs:184` — `MAX_PAYLOAD - used` underflows, reached via
@@ -458,6 +472,49 @@ because `sys_read` returns `NotFound` on an empty Mouse fd rather than blocking,
 there is never a parked mouse reader to wake. Fixing the asymmetry by making
 Mouse block is what would give `MOUSE` a waiter; deleting the queues is what
 would make the current behaviour honest. Do not do neither.
+
+### The `bcachefs/` crate does not implement bcachefs — a question for the owner
+
+ToyOS's `bcachefs/` crate implements a ToyOS-native on-disk format written from scratch.
+It shares a name with Linux bcachefs and nothing else: ours is `MAGIC = b"BCFS"` plus
+`DESIGNATION_MAGIC = b"TOYOS-FORMAT-ME\0"` (`superblock.rs:5,24`) and `NODE_MAGIC = b"BTND"`
+(`btree.rs:7`), against upstream's UUID-based `BCHFS_MAGIC` / `BSET_MAGIC ^ sb.uuid` /
+`JSET_MAGIC`.
+
+`specs/bcachefs-reference.md` — real research into the *upstream* format — now carries a
+warning saying so at the top, because its filename in this repo is a trap. That fixes the
+document; it does not fix the collision. A crate that does not implement the format it is
+named after is a hazard we keep paying for, in exactly this way. Renaming it is the owner's
+call, not something to do in a docs pass.
+
+### `#[alloc_error_handler]` does not exist anywhere in the kernel
+
+Kernel heap exhaustion has no handler. It routes into `try_recover_from_panic`, the path that
+frees nothing — so the terminal state of every unbounded-growth entry in this file is an OOM
+that cannot report itself cleanly. The three unbounded userland-driven growers under §1 all end
+here, which is what makes this worth its own line rather than a clause in each.
+
+### `device-test-strategy` requires a `query-pci` verification that exists nowhere
+
+The strategy's rule is ground truth at the hardware boundary: what QEMU was *told* to create
+must be checked against what the guest actually enumerated. No such check exists — no test
+queries QMP's `query-pci` and compares it against the guest's view. Every profile's device set
+is therefore asserted only by the harness's own construction of the QEMU command line, which is
+the same source it would be verifying.
+
+Same class as the three scheduler instruments below: a spec requiring an instrument nobody
+built. This one matters most for the metal track, where the whole point is that the machine's
+device set is not what the harness chose.
+
+### `boot-image-split.md`'s R2 refactor would fail the suite as written
+
+R2 proposes removing the USB stick from the machine profiles and adding a virtio device. Both
+halves break tests that exist today: three machine tests assert on the USB stick, and the
+profile it would add a virtio device to is the one whose defining claim is that it has *no*
+virtio device — that is what `--metal-sim` is for.
+
+Not a doc bug — a plan defect. A plan that fails the suite is not ready to execute, and the
+suite is right here. Whoever picks R2 up must re-scope it against those tests first.
 
 ### Three scheduler instruments the spec describes and the code does not have
 

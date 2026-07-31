@@ -1,5 +1,21 @@
 # bcachefs On-Disk Format Reference
 
+> ## ⚠ This documents UPSTREAM bcachefs. It does NOT document ToyOS's `bcachefs/` crate.
+>
+> **The two share a name and nothing else.** This file is external research into the
+> Linux bcachefs on-disk format. ToyOS's `bcachefs/` crate implements a different,
+> ToyOS-native format that was written from scratch; not one structure below describes
+> a byte this repository reads or writes.
+>
+> The magics alone settle it. Upstream, per this document: a 16-byte UUID
+> `BCHFS_MAGIC`, `BSET_MAGIC ^ sb.uuid`, `JSET_MAGIC`. Ours: `MAGIC = b"BCFS"` — four
+> bytes — plus `DESIGNATION_MAGIC = b"TOYOS-FORMAT-ME\0"` (`bcachefs/src/superblock.rs:5,24`)
+> and `NODE_MAGIC = b"BTND"` for btree nodes (`bcachefs/src/btree.rs:7`).
+>
+> **Read `bcachefs/src/` for what ToyOS actually stores.** Kept because the upstream
+> research has value on its own — but its filename, sitting in a repo that contains a
+> `bcachefs/` crate, is a trap, which is why this warning is here rather than at the end.
+
 Collected from bcachefs.org Architecture page, bcachefs-docs.readthedocs.io,
 and linux/fs/bcachefs/ header files (v6.8).
 
