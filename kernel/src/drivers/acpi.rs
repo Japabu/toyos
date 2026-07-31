@@ -7,6 +7,26 @@ use crate::DirectMap;
 
 pub struct MadtInfo {
     pub apic_ids: Vec<u32>,
+    pub io_apics: Vec<IoApicEntry>,
+    pub source_overrides: Vec<SourceOverride>,
+}
+
+/// MADT type 1: one I/O APIC's register window and the GSI its first
+/// redirection entry carries.
+pub struct IoApicEntry {
+    pub id: u8,
+    pub address: u32,
+    pub gsi_base: u32,
+}
+
+/// MADT type 2: an ISA IRQ that does not land on the identity GSI, and/or
+/// does not use the ISA default of edge-triggered active-high. `flags` is the
+/// raw MPS INTI word — bits 0-1 polarity, 2-3 trigger mode.
+pub struct SourceOverride {
+    pub bus: u8,
+    pub source_irq: u8,
+    pub gsi: u32,
+    pub flags: u16,
 }
 
 // ACPI table structures (all packed — tables are not guaranteed aligned)
@@ -107,6 +127,24 @@ struct MadtLocalApic {
     processor_id: u8,
     apic_id: u8,
     flags: u32,
+}
+
+#[repr(C, packed)]
+struct MadtIoApic {
+    header: MadtEntryHeader,
+    io_apic_id: u8,
+    _reserved: u8,
+    address: u32,
+    gsi_base: u32,
+}
+
+#[repr(C, packed)]
+struct MadtSourceOverride {
+    header: MadtEntryHeader,
+    bus: u8,
+    source_irq: u8,
+    gsi: u32,
+    flags: u16,
 }
 
 #[repr(C, packed)]
@@ -244,6 +282,8 @@ pub fn parse_madt(rsdp_addr: u64) -> Option<MadtInfo> {
     let length = madt.header.length as usize;
 
     let mut apic_ids = Vec::new();
+    let mut io_apics = Vec::new();
+    let mut source_overrides = Vec::new();
     let entries_base: *const u8 = unsafe { madt_phys.as_ptr::<u8>().add(size_of::<Madt>()) };
     let mut offset = 0usize;
     let entries_len = length - size_of::<Madt>();
@@ -261,6 +301,25 @@ pub fn parse_madt(rsdp_addr: u64) -> Option<MadtInfo> {
                     apic_ids.push(lapic.apic_id as u32);
                 }
             }
+            // Type 1 = I/O APIC
+            1 if entry_len >= size_of::<MadtIoApic>() => {
+                let io = unsafe { &*(entries_base.add(offset) as *const MadtIoApic) };
+                io_apics.push(IoApicEntry {
+                    id: io.io_apic_id,
+                    address: io.address,
+                    gsi_base: io.gsi_base,
+                });
+            }
+            // Type 2 = Interrupt Source Override
+            2 if entry_len >= size_of::<MadtSourceOverride>() => {
+                let iso = unsafe { &*(entries_base.add(offset) as *const MadtSourceOverride) };
+                source_overrides.push(SourceOverride {
+                    bus: iso.bus,
+                    source_irq: iso.source_irq,
+                    gsi: iso.gsi,
+                    flags: iso.flags,
+                });
+            }
             // Type 9 = Processor Local x2APIC (32-bit APIC IDs)
             9 if entry_len >= size_of::<MadtLocalX2Apic>() => {
                 let x2 = unsafe { &*(entries_base.add(offset) as *const MadtLocalX2Apic) };
@@ -275,7 +334,7 @@ pub fn parse_madt(rsdp_addr: u64) -> Option<MadtInfo> {
     }
 
     log!("ACPI: MADT cpus={:?}", apic_ids);
-    Some(MadtInfo { apic_ids })
+    Some(MadtInfo { apic_ids, io_apics, source_overrides })
 }
 
 /// Scan DSDT AML bytecode for the \_S5_ package and extract SLP_TYPa.

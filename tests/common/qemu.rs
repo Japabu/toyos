@@ -93,6 +93,7 @@ pub struct QemuInstance {
     uart_log: PathBuf,
     qmp_socket: Option<PathBuf>,
     screendump: PathBuf,
+    boot_log: String,
 }
 
 /// Build all binaries in a test crate.
@@ -256,6 +257,17 @@ impl QemuInstance {
             }
             thread::sleep(interval);
         }
+    }
+
+    /// Every console line the guest printed before the ready marker.
+    ///
+    /// The kernel's own boot lines sit in the log ring until the scheduler
+    /// drains them, by which time the virtio-console is the backend — so the
+    /// 16550 file holds only the bootloader, and this is the only place a
+    /// host test can read what the kernel said while booting. Empty under
+    /// [`Profile::Metal`], which has no console to say it on.
+    pub fn boot_log(&self) -> &str {
+        &self.boot_log
     }
 
     /// Everything the guest put on the 16550 before it switched to the
@@ -644,9 +656,11 @@ fn spawn_and_wait_ready(
 
     // A metal-sim guest has no console at all, so there is no marker to wait
     // for: the caller polls the framebuffer. Blocking here would only time out.
-    if options.profile.virtio() {
-        wait_for_ready(&mut child, &rx, options, &uart_log);
-    }
+    let boot_log = if options.profile.virtio() {
+        wait_for_ready(&mut child, &rx, options, &uart_log)
+    } else {
+        String::new()
+    };
 
     QemuInstance {
         child,
@@ -657,20 +671,23 @@ fn spawn_and_wait_ready(
         uart_log,
         qmp_socket,
         screendump,
+        boot_log,
     }
 }
 
+/// Returns every line seen on the way to the marker — see [`QemuInstance::boot_log`].
 fn wait_for_ready(
     child: &mut Child,
     rx: &Receiver<String>,
     options: &BootOptions,
     uart_log: &Path,
-) {
+) -> String {
     let no_timeout = options.debug_wait;
     let ready = options.ready_marker;
     let panic_aborts = ready == DEFAULT_READY;
     let boot_timeout = Duration::from_secs(10);
     let start = Instant::now();
+    let mut seen = String::new();
     loop {
         if !no_timeout && start.elapsed() > boot_timeout {
             let _ = child.kill();
@@ -678,6 +695,8 @@ fn wait_for_ready(
         }
         match rx.recv_timeout(Duration::from_secs(1)) {
             Ok(line) if line.contains(ready) => {
+                seen.push_str(&line);
+                seen.push('\n');
                 if VERBOSE.load(Ordering::Relaxed) {
                     eprintln!("[qemu] Reached {ready}");
                 }
@@ -704,7 +723,11 @@ fn wait_for_ready(
                 let _ = child.kill();
                 panic!("[qemu] Init process crashed during boot:\n{crash_msg}");
             }
-            Ok(_) => continue,
+            Ok(line) => {
+                seen.push_str(&line);
+                seen.push('\n');
+                continue;
+            }
             // A guest that dies before virtio-console init never reaches
             // stdio at all; the UART file is the only channel it has.
             Err(RecvTimeoutError::Timeout) => {
@@ -721,4 +744,5 @@ fn wait_for_ready(
             }
         }
     }
+    seen
 }

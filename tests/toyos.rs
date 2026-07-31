@@ -48,6 +48,13 @@ const SCREEN_TESTS: &[&str] = &[
     "screen_fatal_halt",
 ];
 
+/// Input-path tests. Each needs a machine shape the shared boot cannot give
+/// it — no USB HID so the PS/2 keyboard is the only source, or no i8042 at
+/// all — so each costs its own boot. `run_input_test` dispatches them.
+const INPUT_TESTS: &[&str] = &[
+    "ioapic_topology",
+];
+
 /// The renderer's two text colours, as the screendump reports them.
 const WHITE: [u8; 3] = [0xFF, 0xFF, 0xFF];
 const ALERT: [u8; 3] = [0xFF, 0x50, 0x50];
@@ -1268,6 +1275,89 @@ fn run_screen_test(
     }
 }
 
+/// Run one input-path test. Like `run_screen_test`, each of these owns its
+/// QEMU: the machine shape *is* the test.
+fn run_input_test(
+    name: &str,
+    test_config: &Path,
+    c_bins: &[(String, Vec<u8>)],
+    rust_bins: &[(String, Vec<u8>)],
+) -> Result<(), String> {
+    match name {
+        "ioapic_topology" => {
+            // Everything the I/O APIC driver says happens in Phase 2, long
+            // before the virtio-console exists, so the 16550 file is where a
+            // host reads it. On the T14 the same lines land on the screen at
+            // the next boot checkpoint; this is the QEMU-side equivalent.
+            let qemu = QemuInstance::boot(test_config, c_bins, rust_bins);
+            // The ready marker only proves the guest booted; the lines under
+            // test were written before that, so nothing else to wait for.
+            let log = qemu.boot_log().to_string();
+            let units: Vec<&str> = log
+                .lines()
+                .filter_map(|l| l.split("ioapic: id=").nth(1))
+                .collect();
+            if units.is_empty() {
+                return Err(format!("no `ioapic: id=` line in the boot log:\n{log}"));
+            }
+            for unit in &units {
+                // `<id> at <addr> gsi <lo>..<hi> masked <n>/<total>`
+                let (range, masked) = unit
+                    .split_once(" gsi ")
+                    .and_then(|(_, rest)| rest.split_once(" masked "))
+                    .ok_or_else(|| format!("unreadable I/O APIC line: {unit:?}"))?;
+                let (lo, hi) = range
+                    .split_once("..")
+                    .ok_or_else(|| format!("no GSI range in {unit:?}"))?;
+                let lo: u32 = lo.trim().parse().map_err(|_| format!("bad GSI base in {unit:?}"))?;
+                let hi: u32 = hi.trim().parse().map_err(|_| format!("bad GSI top in {unit:?}"))?;
+                let (n, total) = masked
+                    .trim()
+                    .split_once('/')
+                    .ok_or_else(|| format!("no mask count in {unit:?}"))?;
+                let n: u32 = n.parse().map_err(|_| format!("bad mask count in {unit:?}"))?;
+                let total: u32 = total
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .parse()
+                    .map_err(|_| format!("bad entry count in {unit:?}"))?;
+                if hi < lo || total != hi - lo + 1 {
+                    return Err(format!(
+                        "I/O APIC claims gsi {lo}..{hi} but {total} entries: {unit:?}"
+                    ));
+                }
+                // The whole reason this driver runs before the first sti: an
+                // entry firmware left armed at a vector with no gate is a #GP
+                // that kills the boot.
+                if n != total {
+                    return Err(format!(
+                        "{n} of {total} redirection entries masked — {} left armed: {unit:?}",
+                        total - n
+                    ));
+                }
+            }
+            // IRQ 1 and IRQ 12 must be uncovered by the override table, or
+            // the i8042 driver's identity assumption is wrong on this machine.
+            let isos: Vec<&str> = log
+                .lines()
+                .filter_map(|l| l.split("ioapic: iso ").nth(1))
+                .collect();
+            if isos.is_empty() {
+                return Err(format!(
+                    "no `ioapic: iso` line — q35 always overrides at least IRQ 0:\n{log}"
+                ));
+            }
+            eprintln!("  [ioapic] {} unit(s), {} override(s)", units.len(), isos.len());
+            for iso in &isos {
+                eprintln!("    iso {}", iso.trim());
+            }
+            Ok(())
+        }
+        other => Err(format!("unknown input test {other}")),
+    }
+}
+
 fn build_test_registry(
     rust_bins: &[(String, Vec<u8>)],
     c_names: &[String],
@@ -1450,6 +1540,9 @@ fn main() {
         for name in SCREEN_TESTS {
             println!("{name}");
         }
+        for name in INPUT_TESTS {
+            println!("{name}");
+        }
         return;
     }
 
@@ -1495,15 +1588,26 @@ fn main() {
         .copied()
         .filter(|n| filter.map_or(true, |f| n.contains(f)))
         .collect();
+    let input_to_run: Vec<&str> = INPUT_TESTS
+        .iter()
+        .copied()
+        .filter(|n| filter.map_or(true, |f| n.contains(f)))
+        .collect();
 
-    if tests_to_run.is_empty() && audio_to_run.is_empty() && screen_to_run.is_empty() {
+    if tests_to_run.is_empty()
+        && audio_to_run.is_empty()
+        && screen_to_run.is_empty()
+        && input_to_run.is_empty()
+    {
         eprintln!("No tests match filter {:?}", filter);
         std::process::exit(1);
     }
 
     let test_config = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/testcases");
-    let total =
-        tests_to_run.len() + audio_to_run.len() * AUDIO_SMP.len() + screen_to_run.len();
+    let total = tests_to_run.len()
+        + audio_to_run.len() * AUDIO_SMP.len()
+        + screen_to_run.len()
+        + input_to_run.len();
     eprintln!("\nrunning {total} tests\n");
     let mut passed = 0;
     let mut failed = 0;
@@ -1575,6 +1679,31 @@ fn main() {
                         let summary = reason.lines().next().unwrap_or("audio check failed");
                         failures.push((label, summary.to_string()));
                     }
+                }
+            }
+        }
+    }
+
+    // Input tests own their QEMU because their machine shape is the test.
+    // INPUT_TESTS keeps the plain-kernel ones first for the same reason
+    // SCREEN_TESTS does.
+    if !input_to_run.is_empty() {
+        eprintln!("  --- input ---");
+        for name in &input_to_run {
+            let start = std::time::Instant::now();
+            let outcome = run_input_test(name, &test_config, &c_bins, &rust_bins);
+            let elapsed = start.elapsed();
+            match outcome {
+                Ok(()) => {
+                    passed += 1;
+                    eprintln!("  PASS  {name}  ({:.0?})", elapsed);
+                }
+                Err(reason) => {
+                    failed += 1;
+                    eprintln!("FAIL {name}: {reason}");
+                    eprintln!("  FAIL  {name}  ({:.0?})", elapsed);
+                    let summary = reason.lines().next().unwrap_or("input check failed");
+                    failures.push((name.to_string(), summary.to_string()));
                 }
             }
         }

@@ -59,7 +59,7 @@ mod vma;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use arch::{apic, cpu, idt, percpu, smp, syscall};
-use drivers::{acpi, gop, nvme, pci, serial, virtio_console, virtio_gpu, virtio_net, virtio_sound, xhci};
+use drivers::{acpi, gop, ioapic, nvme, pci, serial, virtio_console, virtio_gpu, virtio_net, virtio_sound, xhci};
 use toyos_abi::boot::{KernelArgs, MemoryMapEntry};
 
 /// Per-CPU panic-reentry depth, indexed by x2APIC id (masked). The panic path
@@ -294,6 +294,8 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     apic::init();
     percpu::init_bsp(apic::id());
     idt::init();
+    ioapic::init(&madt);
+    idt::enable_interrupts();
     syscall::init();
     symbols::set_kernel_base(kernel_args.kernel_memory_addr);
     if !kernel_elf.is_empty() {

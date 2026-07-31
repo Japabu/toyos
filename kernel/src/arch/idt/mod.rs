@@ -328,6 +328,13 @@ pub fn init() {
 
     unsafe {
         cpu::lidt(&ptr as *const IdtPointer as *const u8);
-        cpu::enable_interrupts();
     }
+}
+
+/// Take IF=1 on this CPU. Split from `init` so `ioapic::init` can mask every
+/// entry firmware left behind while exception handlers are already installed:
+/// an unmasked entry aimed at a vector with no gate would otherwise become a
+/// #GP the moment the boot enables interrupts.
+pub fn enable_interrupts() {
+    cpu::enable_interrupts();
 }
