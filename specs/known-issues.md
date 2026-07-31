@@ -105,6 +105,32 @@ needs its own discussion.
 
 ## 3. Kernel correctness and hazards
 
+### The whole of a syscall is a preempt-disabled section
+
+`syscall_entry` raises the preempt count before `call {handler}` and lowers it
+after, so `preempt::enable`'s `count() == 0` slow path can never fire inside a
+syscall — no matter how many locks the handler takes and drops. Spec §7.4 counts
+that slow path as an RT-wake safe point and bounds wake latency by "the longest
+preempt-disabled section"; in syscall context that section is *the entire
+syscall*, and the real bound is the next `kernel_exit_to_user_check`.
+
+This was masked until the preempt count was made conserved across a context
+switch (§6.4's baselines needed it): before that the count drifted, so a lock
+drop inside a syscall reached zero at random and preempted at random. The
+behaviour is now deterministic, and deterministically weaker than §7.4 assumes.
+Whether that matters is measurable — gate A's wake-lateness distribution is the
+instrument — and it did not move at N=8. Fixing it means either dropping the
+entry level around blocking-capable handler regions, or accepting the bound and
+correcting §7.4.
+
+### `retire_task` is never reached by `cargo test`
+
+Instrumented across all 140 tests: zero calls. Threads that `join` are removed
+from the table (`collect_thread_zombie`), so `process::exit`'s phase-2 retire
+sweep finds nothing, and no test kills a live process. Both callers —
+multi-threaded teardown with unjoined threads, and `kill_process` — are therefore
+untested, including the §7.6 message-plus-park protocol 7b rebuilt them on.
+
 ### `handle_retire`'s `need_resched` on a running target is a request the next pass may decline
 
 `preempt_if_due` fires on quantum expiry or an RT task in the band, and on

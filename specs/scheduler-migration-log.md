@@ -140,17 +140,79 @@ kernel-facing API surface (`prepare_wait`/`block_on`/`futex_*`/`retire_task`/…
 with the driver half under `kernel/src/sched/`, which is the §4 split the spec
 itself asks for — the file the table meant to delete is the legacy *body*, and
 that body died at 7a. The table's other 7c line, preempt-count baseline asserts
-in the entry shims, is an **open divergence**: the §6.4 asserts have not landed
-at any stage. `driver::pass` only raises and lowers the preempt count — it
-compares nothing against a baseline — and the sole entry assert in the tree is
-`with_cpu`'s nested-pass check, which is §6.2's `IN_SCHEDULE` replacement, not
-§6.4's lock-across-switch tripwire. The asserts remain owed, tracked as their
-own task.
+in the entry shims, was an **open divergence** from 7a through 7c: the §6.4
+asserts had not landed at any stage. `driver::pass` only raised and lowered the
+preempt count — it compared nothing against a baseline — and the sole entry
+assert in the tree was `with_cpu`'s nested-pass check, which is §6.2's
+`IN_SCHEDULE` replacement, not §6.4's lock-across-switch tripwire. **Closed
+after 7c; see "The §6.4 tripwire" below.**
 
 Nothing in this stage can move a scheduling number: no wake path, placement
 rule or park site changed. Gate A's fast tier agrees — all four configs green,
 zero gaps, zero underruns, `drains 0` on every run — but one boot per config
 certifies no rate, so that is a consistency check and not evidence.
+
+## The §6.4 tripwire (the divergence 7a–7c left open)
+
+Landed in `kernel/src/scheduler.rs`, the placement the corrected spec asks for.
+Six entries assert, all through one `#[track_caller]` helper so the panic names
+the caller's file and line rather than this one: `yield_now`, `exit_current`,
+`prepare_wait`, `retire_task` at the trap baseline, `block_on` one level above
+it (the ticket holds the registration window's level), `do_preempt` at zero.
+`wait_until` and `futex_wait` carry `#[track_caller]` only — they delegate, and
+the location propagates through.
+
+Two entries deliberately do not assert. Wake paths never switch, and waking from
+inside a lock is §8.1's protocol rather than a violation of it. `schedule_no_return`
+is the panic path, which may hold any lock by construction — measurement finds
+it at both baselines — and asserting there would turn every panic-with-a-lock
+into a double panic and lose the report.
+
+**The baseline is two numbers, not §6.4's one `SCHED_BASELINE`, and they were
+measured rather than derived.** A syscall or fault handler runs one level deep
+for its whole body (`syscall_entry` and `common_entry` bracket the call); the
+deferred-preempt poll runs past that level, at zero, on all four of its routes.
+A temporary probe logging the first sighting of each distinct count per entry,
+run over the whole 140-test suite, reports exactly one value per site: trap
+entries 1, `block_on` 2, `do_preempt`/idle/exit-to-user 0, trampoline 1, and
+`schedule_no_return` 1 *and* 2 — the one entry with no single answer, which is
+why it has no assert.
+
+**The prerequisite: the preempt count was not conserved across a context
+switch.** The same probe on the tree as it stood found `exit_to_user` at 0, 1
+and 2 and `block_on` at 2, 3 and 4 within 0.2 s of boot — user threads running
+with the count already raised. Contexts do not owe the same number of `enable`s
+(a task parked inside a syscall owes two; one preempted at IRQ exit, the idle
+context and a fresh task each owe one), and the per-CPU word was handed to
+whoever landed on the CPU next, so a switch between contexts of unequal depth
+moved the count by the difference. `driver::pass`'s own comment — "it balances
+per context, not per call" — described an invariant the code did not have.
+
+The fix is the one every other kernel uses: the depth belongs to the context, so
+`KernelCtx` carries it and `Hw::switch` swaps it with the per-CPU word. A fresh
+task's context starts at 1, the level `trampoline_entry` discharges. This also
+means a dying context's depth leaves with it, so a thread killed while holding
+locks strands nothing on the CPU.
+
+The consequence the drift was hiding is recorded in `specs/known-issues.md`: with
+the count conserved, `preempt::enable`'s slow path can never fire inside a
+syscall, so §7.4's "pass at the `preempt::enable` slow path" is not a safe point
+in syscall context and RT wake latency there is bounded by the whole syscall.
+Before the fix that same statement was true at random.
+
+Proof it fires: `SYS_DEBUG` action 2 takes a kernel spinlock private to that one
+action and calls `yield_now`. `panic_recovery`'s new `test_lock_across_switch`
+asserts the child dies; `check_panic_recovery` additionally requires the serial
+to carry the assert message *and* `arch/syscall.rs`, which is what proves the
+attribution rather than the assert. Observed: `panicked at src/arch/syscall.rs:453:59:
+scheduler entered while a lock is held: preempt depth 2, baseline 1`. It has
+teeth in the negative direction too — with the `yield_now` assert removed the
+syscall returns normally, the child exits 0 and the test fails.
+
+Gate A after the change: fast tier green on all four configs, and the thorough
+tier at N=8 passes with no statistic regressed at alpha=1e-3, 0/32 dropouts and
+0/32 ceiling breaches. N=8 is a fraction of the N=30 the tier is calibrated for,
+so it detects a gross shift and not a subtle one.
 
 ## Host tests and negative gates
 

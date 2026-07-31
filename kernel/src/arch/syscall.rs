@@ -15,6 +15,16 @@ const MSR_FMASK: u32 = 0xC000_0084;
 
 use toyos_abi::syscall::*;
 
+/// `SYS_DEBUG` action 2's lock, and nothing else's.
+///
+/// Action 2 takes it and then calls a switching scheduler entry — the shape
+/// spec §6.4's tripwire exists to refuse. The assert fires while the guard is
+/// still alive, so the guard never drops and this lock stays held for the rest
+/// of the boot; that is why it is private to the one deliberate-panic action
+/// and shared with nothing. A second call would spin into `Lock::lock`'s
+/// deadlock panic, which is an honest report of what a second call means.
+static LOCK_ACROSS_SWITCH: crate::sync::Lock<()> = crate::sync::Lock::new(());
+
 pub fn init() {
     let efer = cpu::rdmsr(MSR_EFER);
     cpu::wrmsr(MSR_EFER, efer | 1);
@@ -440,6 +450,7 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         SYS_DEBUG => match a1 {
             0 => panic!("SYS_DEBUG: kernel panic triggered by userspace"),
             1 => { unsafe { core::ptr::read_volatile(core::ptr::null::<u64>()); } 0 }
+            2 => { let _held = LOCK_ACROSS_SWITCH.lock(); crate::scheduler::yield_now(); 0 }
             _ => SyscallError::InvalidArgument.to_u64(),
         },
         SYS_SCHED_INFO => {

@@ -28,6 +28,38 @@ pub use crate::sched::driver::{
 };
 pub use crate::sched::MAX_CPUS;
 
+/// Spec §6.4's lock-across-switch tripwire.
+///
+/// A `sync::Lock` guard raises the preempt count and keeps it raised until it
+/// drops, so a count *above* what the calling context is entitled to means a
+/// spinlock is held. Reaching a switching scheduler entry that way parks the
+/// lock on a stack nothing will return to, and every other CPU that takes it
+/// then spins into `Lock::lock`'s 500M-spin DEADLOCK panic — which names the
+/// victim and never the culprit. This names the culprit, at its own call site.
+///
+/// `#[track_caller]` all the way down is what makes the message point outside
+/// this file; without it every trip reports the same three lines.
+#[track_caller]
+fn assert_baseline(baseline: u32) {
+    let depth = crate::preempt::count();
+    assert!(
+        depth == baseline,
+        "scheduler entered while a lock is held: preempt depth {depth}, baseline {baseline}",
+    );
+}
+
+/// The depth a syscall or fault handler runs at: exactly one level, raised by
+/// the entry asm (`arch/syscall.rs`, `common_entry`) and lowered on the way
+/// out. Every voluntary scheduler entry is reached from such a handler.
+const BASELINE_TRAP: u32 = 1;
+
+/// The depth the deferred-preempt poll runs at. Zero, and not `BASELINE_TRAP`,
+/// because every route into it is *past* the entry level: the Ring 3 timer stub
+/// never raises one, `kernel_exit_to_user_check` runs after the `lock sub`, and
+/// `preempt::enable`'s slow path only calls in at zero. The idle loop is the
+/// same zero.
+const BASELINE_IRQ_EXIT: u32 = 0;
+
 /// Process-scoped thread identity. Tids are per-process, so the scheduler
 /// needs the pair to name a thread system-wide.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -124,7 +156,9 @@ pub fn enqueue_new(
 /// whatever locks it needs, and the deferred request is served by the block or
 /// by the cancel. See [`Ticket`].
 #[must_use = "a wait ticket must be blocked on or cancelled"]
+#[track_caller]
 pub fn prepare_wait(queue: &KWaitQueue) -> Ticket<'_> {
+    assert_baseline(BASELINE_TRAP);
     Ticket::register(queue)
 }
 
@@ -133,11 +167,16 @@ pub fn prepare_wait(queue: &KWaitQueue) -> Ticket<'_> {
 /// Taking the ticket by value is the whole point: a park that reaches the
 /// machine without a registration behind it is the lost-wake window, and there
 /// is no other way to construct one. `deadline = 0` means no timeout.
+#[track_caller]
 pub fn block_on(ticket: Ticket<'_>, deadline: u64) {
+    // One level above the trap baseline: the ticket has held the registration
+    // window's own level since `prepare_wait`, and `pass_block` inherits it.
+    assert_baseline(BASELINE_TRAP + 1);
     driver::pass_block(ticket, (deadline > 0).then(|| Nanos(deadline)));
 }
 
 /// Register, re-check, park — for a site whose condition is exactly `ready`.
+#[track_caller]
 pub fn wait_until(queue: &KWaitQueue, deadline: u64, ready: impl Fn() -> bool) {
     let ticket = prepare_wait(queue);
     if ready() {
@@ -153,7 +192,9 @@ pub fn park_lot() -> &'static KWaitQueue {
     waitqs::park_lot(percpu::current_tid().map_or(0, |t| t.raw() as u64))
 }
 
+#[track_caller]
 pub fn yield_now() {
+    assert_baseline(BASELINE_TRAP);
     driver::pass(Dispose::Yield);
 }
 
@@ -165,6 +206,7 @@ pub fn do_preempt() {
     if in_schedule_self() {
         return;
     }
+    assert_baseline(BASELINE_IRQ_EXIT);
     crate::preempt::clear_need_resched();
     if percpu::current_tid().is_none() {
         // No thread on this CPU: either the idle loop, which passes every
@@ -177,7 +219,9 @@ pub fn do_preempt() {
     driver::pass(Dispose::None);
 }
 
+#[track_caller]
 pub fn exit_current(code: i32) -> ! {
+    assert_baseline(BASELINE_TRAP);
     {
         let mut guard = process::PROCESS_TABLE.lock();
         let table = guard.as_mut().unwrap();
@@ -193,6 +237,12 @@ pub fn exit_current(code: i32) -> ! {
 /// The same claim CAS every other wake goes through, without a queue: the
 /// waiter's own `Registration` takes its node out of the parking lot when it
 /// runs again (spec §8.2).
+///
+/// No §6.4 baseline assert here or on any other wake path: a wake posts a
+/// message and never switches, and waking from *inside* a lock is the protocol
+/// rather than a violation of it (§8.1's claim-and-post happens under the waitq
+/// leaf lock, and `KernelLock` is documented as a legal mailbox producer for
+/// exactly that reason).
 pub fn wake_task(id: TaskId) {
     let Some(sched) = process::thread_sched(id.0, id.1) else {
         return;
@@ -258,6 +308,7 @@ pub fn set_current_rt(enable: bool) {
 /// that runs after the registration either claims the ticket or finds the
 /// waiter parked, and one that ran before it stored the new value before the
 /// registration — so the read below sees it.
+#[track_caller]
 pub fn futex_wait(phys_addr: DirectMap, expected: u32, deadline: u64) -> bool {
     let queue = waitqs::futex(phys_addr);
     let ticket = prepare_wait(queue);
@@ -292,7 +343,11 @@ pub fn futex_wake(phys_addr: DirectMap, count: usize) -> u64 {
 ///
 /// The short block deadline is a liveness backstop, not a poll: the wake is a
 /// message like any other, and a lost one must fail loudly rather than hang.
+#[track_caller]
 pub fn retire_task(sched: &ThreadSched) {
+    // Also on the early-return path below, where no park happens and the two
+    // asserts inside the wait would never run.
+    assert_baseline(BASELINE_TRAP);
     if let (Some(pid), Some(tid)) = (percpu::current_pid(), percpu::current_tid()) {
         if let Some(handle) = driver::current_shared() {
             assert!(
@@ -373,6 +428,13 @@ pub(crate) fn reap_poisoned() {
 /// The panic path's exit: the faulted thread's context is unusable, so it dies
 /// where it stands. Its record becomes this CPU's zombie and is released by the
 /// next pass, which by then runs on another stack.
+///
+/// The one switching entry with no §6.4 baseline assert, deliberately: a
+/// panicking thread may hold any lock — that is the situation, not a bug to
+/// trip over — and measurement finds this entry at both baselines. Asserting
+/// here would turn every panic-with-a-lock into a double panic and lose the
+/// report. The dying context's depth leaves with it, since `Hw::switch` loads
+/// the incoming context's own.
 pub fn schedule_no_return() -> ! {
     if in_schedule_self() {
         crate::log!("schedule_no_return: panicked inside a pass, cannot rejoin");

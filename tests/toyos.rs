@@ -204,6 +204,8 @@ fn check_panic_recovery(result: &TestResult) -> bool {
         ("Syscall: num=92", "expected syscall context in panic report"),
         ("User backtrace:", "expected user backtrace in panic report"),
         ("Registers:", "expected register dump from kernel fault"),
+        ("scheduler entered while a lock is held", "expected the §6.4 lock-across-switch tripwire to fire"),
+        ("arch/syscall.rs", "expected the tripwire to name the guilty call site, not scheduler.rs"),
         ("SEGFAULT tid=", "expected SEGFAULT header"),
         ("deliberate_null_deref", "expected deliberate_null_deref in segfault backtrace"),
         ("+0x", "expected symbolized backtraces"),

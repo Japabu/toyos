@@ -3,6 +3,7 @@ use std::process::Command;
 fn main() {
     test_syscall_panic();
     test_syscall_fault();
+    test_lock_across_switch();
     test_user_segfault();
     test_system_alive();
     println!("all panic recovery tests passed");
@@ -26,6 +27,19 @@ fn test_syscall_fault() {
         .expect("failed to spawn child");
     assert!(!status.success(), "child that triggers kernel fault should be killed");
     println!("  PASS: syscall fault killed process (exit={})", status.code().unwrap_or(-1));
+}
+
+/// A kernel spinlock held across a scheduler entry → spec §6.4's baseline
+/// assert fires at the call site instead of the pass parking with the lock on a
+/// stack nothing returns to. Without the assert the syscall returns normally and
+/// the child exits 0, so this case has teeth in the negative direction too.
+fn test_lock_across_switch() {
+    let status = Command::new("/bin/test_rs_test_panic_child")
+        .arg("2")
+        .status()
+        .expect("failed to spawn child");
+    assert!(!status.success(), "child that yields under a kernel lock should be killed");
+    println!("  PASS: lock-across-switch tripwire killed process (exit={})", status.code().unwrap_or(-1));
 }
 
 /// User-mode segfault → process killed, system survives.
