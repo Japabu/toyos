@@ -85,6 +85,7 @@ The kernel ABI and SDK are Rust-native and capability-shaped. POSIX compatibilit
 - `cargo test -- process_stats --nocapture` filter + serial output.
 - `cargo test -- --list` lists all test names without running them.
 - `cargo test --test toyos-build -- --audio-gate 30` runs gate A's thorough tier (~17 min).
+- `cargo run -- --gop` boots a UEFI GOP display (`-vga std`) instead of virtio-gpu: the only config where the on-screen panic console renders, and half of M1's metal-sim.
 - `system.toml` defines which programs to build and the init sequence.
 
 **Gate A (audio) has two tiers.** `tests/audio-baseline.toml` documents both in full and justifies every number in it.
@@ -118,6 +119,8 @@ system.toml       What to build and boot
 **Via full OS**: `cargo run` in background, attach LLDB to `gdb-remote 1234`. `--debug` flag pauses kernel before init via `DEBUG_WAIT` AtomicBool (release it with `memory write -s 1 <DEBUG_WAIT addr + slide> 0`), enables QEMU's `-d int,cpu_reset` exception log at `/tmp/toyos-qemu-debug.log`, and parks QEMU on triple fault (`-action shutdown=pause`) so the faulting CPU state stays inspectable via gdb/QMP.
 
 **Audio verification**: `cargo run -- --smp N --dump-audio` captures device output to `/tmp/toyos-audio.wav` (parse to EOF — RIFF sizes stay 0 unless the guest shuts down cleanly). `cargo test -- audio` runs the single-core glitch regression tests (zero mid-signal gaps asserted). Doom's demo loop starts ~5s after its menu goes idle; soundd prints wake/underrun/latency stats every ~2s while clients exist; doom prints `[music]` synthesis real-time-factor telemetry every ~5s while music plays.
+
+**On-screen panic console** (`kernel/src/drivers/panic_console/`) — fatal panics paint the log-ring tail as an 8x16 text grid on the GOP framebuffer; recovering panics never paint; the six boot phase boundaries repaint so a wedge shows the last phase reached. Armed before `serial::init`, takes no lock of any kind. `cargo test -- screen` decodes the screendump glyph-by-glyph against the same `font8x16.bin` the kernel blits; regenerate it with `cargo run -- --regen-font`.
 
 **QMP** (QEMU Machine Protocol) — Socket at `/tmp/toyos-qmp.sock`. Script at `.claude/qmp.py`:
 - `python3 .claude/qmp.py "ls /bin"` — type string + Enter
@@ -174,7 +177,7 @@ One line each. **`specs/known-issues.md` has the detail and is the file to updat
 - **Process isolation does not hold.** `SYS_PIPE_OPEN`/`SYS_SOCKET_CREATE`/`SYS_PIPE_MAP` check nothing and PipeIds are small sequential integers, so any process can attach to any other's pipe or socket and read, inject, or map its raw 2 MiB ring page. Also ungated: `SYS_LISTEN` (no namespace, so a service name can be impersonated), `SYS_GRANT_SHARED` (re-grantable, unvalidated target, no revoke), `SYS_SET_KEYBOARD_LAYOUT`. Decide per syscall whether it wants a one-line `device::is_owner` gate or should fall out of capability handles. The existing `device::is_owner` gates are only as strong as the claim: `SYS_OPEN_DEVICE` is first-come, so "gated" is not "privileged" — including for `SYS_SET_RT_PRIORITY`, which audio spec §9.4 wants privileged.
 - **A crafted ELF still panics the kernel.** `vaddr_to_file_offset` (`loader.rs:265`) has no failure path. Separately, `SYS_DLOPEN` never dedups and `SYS_DLCLOSE` is a no-op, so VA exhaustion reaches `.expect` at `syscall.rs:1435`.
 - **No physical memory fairness.** No per-process limits, no pressure signal, no OOM killer; one process can starve the system.
-- **A panic while holding `PROCESS_TABLE` hangs that CPU**; a panic while the virtio-console TX queue is wedged spins in `submit_and_wait`; a panic holding the allocator lock wedges the recovered CPU's next alloc or free (the report gets out since `e9f3356`).
+- **A panic while holding `PROCESS_TABLE` hangs that CPU**; a panic while the virtio-console TX queue is wedged spins in `submit_and_wait`; a panic holding the allocator lock wedges the recovered CPU's next alloc or free (the report gets out since `e9f3356`). `crash_report`'s DESIGN RULE still permits `try_lock`, which can dispatch the scheduler from inside the crash report; and a present-but-wedged UART hangs every `panic_flush` bypass (`uart_write_bytes` spins unbounded where `panic_raw_uart` bounds).
 - **The virtio-console has no line atomicity between writers.** Kernel `log!` and userspace `println!` interleave mid-word, corrupting machine-readable serial output; `tests/common/audio.rs` works around it reader-side. Whole-line writes should be atomic.
 - **`timer_handler` → `xhci::poll_if_pending` → `XHCI.lock()` can deadlock** against the same CPU's `fd.rs` keyboard/mouse poll. A `try_lock` in the timer path removes it.
 - **Keyboard poll readiness is spurious on repeated HID reports** — the kernel wakes watchers for reports that queue no events, which froze the compositor while a key was held. Userland reads non-blocking to compensate.
@@ -190,6 +193,7 @@ One line each. **`specs/known-issues.md` has the detail and is the file to updat
 - **The build system suppresses rustc warnings on success** — `Command::output()` in `src/build.rs` captures stderr regardless of quiet mode, so the zero-warning bar is unenforced outside the kernel.
 - **`bootstrap-cc` is alive but not wired in** — nothing builds it, it inherits the wrong toolchain, and its TinyCC download is unpinned.
 - **The `memmap2` fork is 165 lines of unreachable code.** Delete `src/toyos.rs` or drop the toyos gate in `rustc_data_structures` — exactly one of the two.
-- **Design debt:** io_uring abuses `shared_memory`; `SharedToken` is a bare `u32` with no RAII; `Fd` should be `Handle`; `build_toyos_bins` belongs in the test harness; `KernelSlice::from_raw` trusts the caller's size — allocators should construct the slice.
+- **Design debt:** io_uring abuses `shared_memory`; `SharedToken` is a bare `u32` with no RAII; `Fd` should be `Handle`; `build_toyos_bins` belongs in the test harness; `KernelSlice::from_raw` trusts the caller's size — allocators should construct the slice; `gpu::set_resolution` frees the old framebuffer while consumers may hold pointers to it.
+- **The UEFI GOP path is not the default, and picks an absurd mode when on.** `gop.rs` runs only under `--gop`/`Display::Gop`, so the rest of the suite still says nothing about the display path a laptop takes; and the bootloader selects the most-pixels mode, which on QEMU stdvga is a square 2048x2048.
 - **Hardware gaps:** PCID/INVPCID untested outside TCG; TLB shootdowns IPI every CPU for a full flush; the LAPIC timer is one-shot where TSC-deadline would be exact.
 - One unreproduced observation: `ps` appeared to stall for >2 s under heavy single-core load. If seen again, capture with LLDB before restarting.

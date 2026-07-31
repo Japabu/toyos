@@ -5,7 +5,8 @@ under "Known issues" and points here for the detail; keep the two in step. An
 entry leaves this file when the code and `git log` carry the fix — resolved
 narrative belongs in a dated investigation doc, not here.
 
-Verified against `a88e4ee` (2026-07-30).
+Verified against `a88e4ee` (2026-07-30); §2's panic-path additions and §8's
+display entry against `883a84d` (2026-07-31).
 
 ---
 
@@ -100,6 +101,32 @@ belongs to the capability-handles/ownership work.
 
 In `submit_and_wait`. Bounding that wait is a `virtio.rs` semantics change that
 needs its own discussion.
+
+### `crash_report`'s own DESIGN RULE endorses a call that can re-enter the scheduler
+
+`kernel/src/arch/idt/exceptions.rs:107-110` permits `try_lock`, and
+`crash_report_panic` uses it at `:239` for its process lookup. But
+`Lock::try_lock` calls `preempt::disable()`, and both its failure path and its
+guard's `Drop` call `preempt::enable()` (`sync.rs:48-58`, `:85-88`), which
+dispatches `scheduler::do_preempt()` when the count reaches zero with
+`need_resched` set (`preempt.rs:107-124`). A panic in syscall context at depth
+0 with a pending resched can therefore enter the scheduler from inside the
+crash report — the one place that must not happen.
+
+Two things to do, neither done: the rule should read "no locks at all,
+including `try_lock`", and `crash_report_panic`'s process lookup should become
+a lock-free read or be dropped. `kernel/src/drivers/panic_console/mod.rs`
+already states the stricter rule and obeys it; `exceptions.rs` is the
+remaining half.
+
+### `uart_write_bytes` spins unbounded on the LSR
+
+`kernel/src/drivers/serial.rs`, end of file, while `panic_raw_uart`
+(`main.rs:91-99`) bounds the same wait at 100 000 iterations. A UART that is
+*present but wedged* therefore hangs every `panic_flush` bypass — the last
+resort of the panic path — where the raw reentry path would have escaped.
+Absent hardware is no longer a hazard: `2e52e8e` gates every UART access on the
+loopback probe.
 
 ---
 
@@ -467,6 +494,17 @@ ToyOS has no files-are-everything model. The integer identifies pipes, devices,
 io_uring instances and IPC connections — it is a handle, not a file descriptor.
 Rename `Fd` → `Handle`. Aligns with the capability-based direction.
 
+### `gpu::set_resolution` frees the old framebuffer while consumers may hold pointers to it
+
+`kernel/src/gpu.rs:59-76` calls into the driver, and virtio's implementation
+allocates a new framebuffer and frees the old one. Today the only consumer
+re-reads `GpuInfo` afterwards, so nothing breaks; the pattern is simply
+unguarded for anything that caches the address. The panic console is the first
+thing that would have cached one, and it handles the window explicitly —
+`detach()` before the call, `rearm()` if the driver refused — which is a
+per-caller workaround, not a fix. The fix is for `set_resolution` to own the
+invalidation.
+
 ### `KernelSlice::from_raw` cannot check the one thing that makes the type safe
 
 `kernel/src/mm/region.rs:16` (the live `TODO`s at `:12` and `:15`). Every bounds
@@ -486,6 +524,27 @@ stop naming sizes at all.
 ---
 
 ## 8. Hardware and performance gaps
+
+### The UEFI GOP path is off by default, and picks an absurd mode when on
+
+Until `06ce633` no configuration in this tree produced a UEFI GOP at all:
+`kernel/src/drivers/gop.rs` had never executed and `kernel_args.gop_framebuffer`
+was zero everywhere. `cargo run --gop` and `BootOptions { display: Display::Gop }`
+(`-vga std`) fixed that and the path works, but two residuals remain.
+
+**It is not the default.** Plain `cargo run` and the default test config still
+boot `-vga none` with virtio-gpu or with no display device, so `gop.rs` is
+exercised only by `--gop` and by the five `screen_*` tests. Every other test in
+the suite still says nothing about the display path a laptop takes. M1's
+metal-sim profile is what should make GOP a first-class CI config.
+
+**The mode is wrong.** `bootloader/src/main.rs:186-205` selects the mode with
+the most pixels. On QEMU stdvga that is **2048x2048** — square, non-standard,
+and it makes the compositor scale a 1920x1080 wallpaper to a square. It is also
+16 MiB of framebuffer, which is what makes a panic-console repaint cost ~13 ms.
+"Largest wins" is not a mode policy; a real one would prefer the firmware's
+current mode, or the largest 16:9/16:10 mode, and only then fall back. Harmless
+for M0, wrong for M1.
 
 - PCID + INVPCID codepaths untested on real hardware — QEMU TCG supports
   neither. Both are CPUID-gated, so TCG falls back to a CR3 reload. Needs KVM or

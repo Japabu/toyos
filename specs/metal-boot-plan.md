@@ -15,9 +15,13 @@ bar; QEMU cannot.
 
 ## Starting position (verified 2026-07-30 — re-verify before acting, this ages)
 
-- **Display is already fine.** `kernel/src/main.rs:329` tries virtio-gpu, then
-  falls back to the UEFI GOP framebuffer, both behind one `Gpu` trait; the
-  compositor is unaware. GOP cannot change resolution after boot services exit.
+- **Display is already fine, and as of `06ce633` that is measured rather than
+  assumed.** `kernel/src/main.rs` tries virtio-gpu, then falls back to the UEFI
+  GOP framebuffer, both behind one `Gpu` trait; the compositor is unaware. GOP
+  cannot change resolution after boot services exit. The GOP branch had never
+  executed in this tree before `--gop` existed; on its first run it worked
+  end to end — firmware framebuffer mapped, both shared tokens on the same
+  scanout, compositor drawing straight into it.
 - **The integrated keyboard is PS/2 via i8042** (ThinkPad-standard), not USB —
   the xHCI HID stack is irrelevant to it and ToyOS has no i8042 driver. QEMU q35
   emulates i8042 by default, so the driver develops at full dev speed. The
@@ -36,13 +40,29 @@ bar; QEMU cannot.
 
 ## Stages
 
-- **M0 — on-screen panic/log console.** The T14 has no serial port; without
-  this a failed boot is an unreadable black screen. Build first — it also
-  improves QEMU debugging.
+- **M0 — on-screen panic/log console. BUILT** (`2e52e8e`..`883a84d`). The
+  kernel survives a machine with no 16550 (the loopback `assert!` that used to
+  fire ~20 instructions into `kernel_main` is a probe now, and every UART
+  access is gated on it). Fatal panics paint the tail of the log ring as an
+  8x16 text grid on the GOP framebuffer, armed *before* `serial::init` and
+  taking no lock of any kind; recovering panics never paint. The six boot
+  phase boundaries repaint, so a machine that wedges without panicking still
+  shows which phase it reached. Five `screen_*` tests decode the screendump
+  glyph-by-glyph against the same `font8x16.bin` the kernel blits. Detail:
+  `kernel/src/drivers/panic_console/mod.rs`.
 - **M1 — "metal-sim" QEMU profile.** No virtio devices at all (GOP + i8042 +
   NVMe only); must reach the compositor; daemons must degrade gracefully when
   their device is absent. Becomes a permanent CI config so metal regressions
   are caught at dev speed.
+  **Half of this exists**: `cargo run --gop` / `BootOptions { display:
+  Display::Gop }` is the `-vga std` GOP-only display half, and it is where the
+  screen tests run. Still needed: dropping virtio-net, virtio-sound and
+  virtio-console from the profile (the console is the harness's own channel,
+  so the profile needs another way to talk to the guest, or the UART back);
+  i8042 for input; the daemons degrading instead of failing when their device
+  is missing; a mode policy better than "most pixels wins", which currently
+  yields a square 2048x2048 (see known issues §8); and making the profile a
+  permanent CI config rather than five tests.
 - **M2 — i8042 driver.** Integrated keyboard + TrackPoint (aux port),
   developed against QEMU's PS/2 emulation. May also yield basic touchpad
   motion on metal if the EC has a PS/2 fallback (unverified).
