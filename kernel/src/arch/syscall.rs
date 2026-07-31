@@ -21,9 +21,19 @@ use toyos_abi::syscall::*;
 /// spec §6.4's tripwire exists to refuse. The assert fires while the guard is
 /// still alive, so the guard never drops and this lock stays held for the rest
 /// of the boot; that is why it is private to the one deliberate-panic action
-/// and shared with nothing. A second call would spin into `Lock::lock`'s
-/// deadlock panic, which is an honest report of what a second call means.
+/// and shared with nothing.
 static LOCK_ACROSS_SWITCH: crate::sync::Lock<()> = crate::sync::Lock::new(());
+
+/// One trip per boot, because the lock above is never released.
+///
+/// `SYS_DEBUG` is ungated, so without this any process could call action 2 a
+/// second time and spin `Lock::lock`'s full 500M iterations on a lock nothing
+/// will ever hand over — with IF=0 (`MSR_FMASK` masks it on syscall entry) and
+/// preemption disabled, so on a single-CPU machine the timer, the log drains
+/// and every other thread are frozen for that whole window. Refusing the
+/// second call keeps the tripwire testable and the stall unreachable.
+static LOCK_ACROSS_SWITCH_ARMED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(true);
 
 /// The last line `SYS_DEBUG` action 3 puts in the log ring before halting.
 ///
@@ -462,7 +472,14 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         SYS_DEBUG => match a1 {
             0 => panic!("SYS_DEBUG: kernel panic triggered by userspace"),
             1 => { unsafe { core::ptr::read_volatile(core::ptr::null::<u64>()); } 0 }
-            2 => { let _held = LOCK_ACROSS_SWITCH.lock(); crate::scheduler::yield_now(); 0 }
+            2 => {
+                if !LOCK_ACROSS_SWITCH_ARMED.swap(false, core::sync::atomic::Ordering::Relaxed) {
+                    return SyscallError::InvalidArgument.to_u64();
+                }
+                let _held = LOCK_ACROSS_SWITCH.lock();
+                crate::scheduler::yield_now();
+                0
+            }
             3 => { log!("{}", FATAL_HALT_NONCE); crate::arch::apic::halt_all_cpus(); }
             _ => SyscallError::InvalidArgument.to_u64(),
         },

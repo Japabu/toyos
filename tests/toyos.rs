@@ -222,8 +222,6 @@ fn check_panic_recovery(result: &TestResult) -> bool {
         ("Syscall: num=92", "expected syscall context in panic report"),
         ("User backtrace:", "expected user backtrace in panic report"),
         ("Registers:", "expected register dump from kernel fault"),
-        ("scheduler entered while a lock is held", "expected the §6.4 lock-across-switch tripwire to fire"),
-        ("arch/syscall.rs", "expected the tripwire to name the guilty call site, not scheduler.rs"),
         ("SEGFAULT tid=", "expected SEGFAULT header"),
         ("deliberate_null_deref", "expected deliberate_null_deref in segfault backtrace"),
         ("+0x", "expected symbolized backtraces"),
@@ -236,7 +234,40 @@ fn check_panic_recovery(result: &TestResult) -> bool {
             ok = false;
         }
     }
+    if let Err(msg) = check_tripwire_attribution(&result.serial) {
+        eprintln!("FAIL rs::panic_recovery: {msg}\nserial:\n{}", result.serial);
+        ok = false;
+    }
     ok
+}
+
+/// The §6.4 tripwire must fire, and its `panicked at` must name the syscall
+/// that held the lock rather than the scheduler that caught it — which is the
+/// only thing `#[track_caller]` on `assert_baseline` buys.
+///
+/// A whole-buffer `contains("arch/syscall.rs")` certifies none of that: the
+/// same boot's `test_syscall_panic` panics in that file too, so the needle is
+/// already present before the tripwire runs. Scope it instead to the window
+/// between this panic's header and its message — `panicked at <location>` is
+/// the only thing in there, and the backtrace that names every frame comes
+/// after the message, so it cannot supply the answer either.
+fn check_tripwire_attribution(serial: &str) -> Result<(), String> {
+    const MSG: &str = "scheduler entered while a lock is held";
+    const HEADER: &str = "!!! PANIC !!!";
+    let msg_at = serial
+        .find(MSG)
+        .ok_or("expected the §6.4 lock-across-switch tripwire to fire")?;
+    let header_at = serial[..msg_at]
+        .rfind(HEADER)
+        .ok_or("tripwire message with no panic header before it")?;
+    let location = &serial[header_at..msg_at];
+    if !location.contains("arch/syscall.rs") {
+        return Err(format!(
+            "expected the tripwire to name the guilty call site, not scheduler.rs; got: {}",
+            location.trim()
+        ));
+    }
+    Ok(())
 }
 
 /// A zero CPU delta is the signature of a suspended soundd and equally of one

@@ -4,6 +4,7 @@ fn main() {
     test_syscall_panic();
     test_syscall_fault();
     test_lock_across_switch();
+    test_lock_across_switch_is_one_shot();
     test_user_segfault();
     test_system_alive();
     println!("all panic recovery tests passed");
@@ -40,6 +41,20 @@ fn test_lock_across_switch() {
         .expect("failed to spawn child");
     assert!(!status.success(), "child that yields under a kernel lock should be killed");
     println!("  PASS: lock-across-switch tripwire killed process (exit={})", status.code().unwrap_or(-1));
+}
+
+/// The trip above dies holding the kernel lock it took, and the kernel does not
+/// unwind, so nothing will ever release it. A second call must be refused: it
+/// would otherwise spin `Lock::lock` to its 500M-spin deadline with interrupts
+/// masked and preemption disabled, freezing a single-CPU machine for the whole
+/// window — from an ungated syscall. Refused means the child survives.
+fn test_lock_across_switch_is_one_shot() {
+    let status = Command::new("/bin/test_rs_test_panic_child")
+        .arg("2")
+        .status()
+        .expect("failed to spawn child");
+    assert!(status.success(), "second lock-across-switch call must be refused, not honoured");
+    println!("  PASS: second lock-across-switch call refused (exit={})", status.code().unwrap_or(-1));
 }
 
 /// User-mode segfault → process killed, system survives.
