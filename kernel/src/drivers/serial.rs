@@ -21,6 +21,15 @@ use crate::arch::cpu::{inb, outb};
 
 const PORT: u16 = 0x3f8; // COM1
 
+/// Whether a 16550 answered the loopback probe in `init`.
+///
+/// Modern laptops have no SuperIO, so every port read returns `0xFF`. That
+/// is indistinguishable from a UART reporting "receiver ready, data = 0xFF",
+/// which would feed the console an endless stream of 0xFF input bytes. The
+/// probe is the only place the difference is observable, so it is latched
+/// here and every UART access is gated on it.
+static UART_PRESENT: AtomicBool = AtomicBool::new(false);
+
 pub fn init() {
     outb(PORT + 1, 0x00); // Disable all interrupts
     outb(PORT + 3, 0x80); // Enable DLAB (set baud rate divisor)
@@ -31,8 +40,12 @@ pub fn init() {
     outb(PORT + 4, 0x0B); // IRQs enabled, RTS/DSR set
     outb(PORT + 4, 0x1E); // Set in loopback mode, test the serial chip
     outb(PORT + 0, 0xAE); // Test serial chip (send byte 0xAE and check if serial returns same byte)
-    assert!(inb(PORT + 0) == 0xAE, "serial: loopback test failed");
+    UART_PRESENT.store(inb(PORT + 0) == 0xAE, Ordering::Relaxed);
     outb(PORT + 4, 0x0F); // Normal operation mode
+}
+
+pub fn uart_present() -> bool {
+    UART_PRESENT.load(Ordering::Relaxed)
 }
 
 // Backend access — slow path, used by drain / input / panic.
@@ -91,14 +104,14 @@ impl BackendGuard {
         if super::virtio_console::is_ready() {
             super::virtio_console::has_data_locked()
         } else {
-            inb(PORT + 5) & 0x01 != 0
+            uart_present() && inb(PORT + 5) & 0x01 != 0
         }
     }
 
     pub fn try_read_byte(&mut self) -> Option<u8> {
         if super::virtio_console::is_ready() {
             super::virtio_console::try_read_byte_locked()
-        } else if inb(PORT + 5) & 0x01 != 0 {
+        } else if uart_present() && inb(PORT + 5) & 0x01 != 0 {
             Some(inb(PORT))
         } else {
             None
@@ -178,6 +191,12 @@ pub unsafe fn panic_flush() {
             return;
         }
         core::hint::spin_loop();
+    }
+    // No UART means the bypass has nowhere to write. Draining anyway would
+    // consume the report; leaving the ring intact keeps it available to any
+    // other observer of a halted machine.
+    if !uart_present() {
+        return;
     }
     super::virtio_console::disable();
     let mut buf = [0u8; 4096];
@@ -278,6 +297,9 @@ impl core::fmt::Write for SerialWriter {
 }
 
 fn uart_write_bytes(bytes: &[u8]) {
+    if !uart_present() {
+        return;
+    }
     for &b in bytes {
         while inb(PORT + 5) & 0x20 == 0 {}
         outb(PORT, b);
