@@ -136,7 +136,11 @@ bar; QEMU cannot.
   make a wrong topology one log line instead of a silently dead keyboard;
   SMM trapping port 0x60;
   real EC timing against the 500 ms/750 ms/600 ms stage budgets, each clamped
-  to the 1.5 s total; the aux-absent
+  to the 1.5 s total; the mouse framer's 5 ms packet-gap threshold, which is the
+  only thing that re-frames a PS/2 pointer stream and assumes both the 100
+  samples/s the driver programs and an interrupt latency under ~2 ms — a slower
+  ISR splits a packet, which costs one packet and self-heals at the next gap;
+  the aux-absent
   path (QEMU always provides one); a keyboard resetting behind our back, which
   is undetectable on this wire because `0xAA` is left Shift's break code under
   translation (filed); and coexistence of a USB and a PS/2 keyboard, which QEMU
