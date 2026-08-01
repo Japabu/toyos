@@ -1,0 +1,11 @@
+# Its own workspace, like toyos-ps2 and toyos-sched: the kernel depends on it
+# by path and `cargo test` runs here on the host, with no target-triple
+# juggling. A GPT is bytes somebody else wrote, so the parser has to be
+# exercised against hostile bytes far more often than a QEMU boot allows.
+[workspace]
+
+[package]
+name = "toyos-gpt"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
