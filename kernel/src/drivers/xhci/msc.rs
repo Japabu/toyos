@@ -72,6 +72,14 @@ pub struct MscDevice {
     /// every further command would spend the transfer timeout to learn what
     /// this already records.
     failed: bool,
+    /// Set once the device has said it does not implement SYNCHRONIZE CACHE.
+    ///
+    /// What it buys is that the answer is reported once rather than per flush,
+    /// and that is not tidiness: on a machine whose log lives on this stick, a
+    /// line per flush is pending content in the ring the next flush drains, so
+    /// it is the same self-sustaining write loop reading the refusal as a
+    /// failure produced.
+    no_write_cache: bool,
 }
 
 impl MscDevice {
@@ -217,6 +225,7 @@ impl XhciController {
     }
 
     pub(super) fn msc_flush(&mut self, index: usize) -> bool {
+        let disk = self.disk_base + index;
         self.with_storage(index, |ctrl, dev| {
             if dev.failed {
                 return false;
@@ -236,6 +245,11 @@ impl XhciController {
             // the wrong thing, and the caller above turns a failed sync into a
             // log line, which is itself the next flush.
             if outcome.unimplemented() {
+                if !dev.no_write_cache {
+                    dev.no_write_cache = true;
+                    log!("usb-storage: disk {disk} does not implement SYNCHRONIZE CACHE \
+                         (sense 0x05/0x20/0x00); its writes are durable once they complete");
+                }
                 return true;
             }
             match outcome {
@@ -674,6 +688,7 @@ pub fn bind(
         sectors_per_block: 0,
         blocks: 0,
         failed: false,
+        no_write_cache: false,
     };
 
     if !bring_up(ctrl, &mut dev) {
