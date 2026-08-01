@@ -62,14 +62,19 @@ planned per-share-FIFO redesign must reimplement `pop_surplus`, which feeds
 `answer_steal_requests` and can therefore change placement — so that redesign could shrink
 I13's measured coverage toward zero and **the gate would go quiet, not red.**
 
-Nothing currently asserts that a check's coverage survived the change it was written to
-guard. The remedy, recorded as a requirement on that work: **measure how many nanoseconds
-I13 actually covers on the current tree, and A/B that number across the change. A coverage
-collapse must be as loud as a violation.**
+**The remedy is built, not merely required.** `SweepResult::thread_coverage_pct` publishes
+the fraction of executed time I13 had a comparison open for, every sweep line carries it,
+and `invariant_i13_is_measured_and_holds` gates on it against the recorded 96% / 69% / 99%
+with a halving as the threshold. Proven in both directions: forcing the balance condition
+false takes the reach to 0% and the test reds with `its *reach* has collapsed`, while the
+sweep line printed beside it still reads `clean`. Evidence and per-scenario figures in
+`specs/metal-track-history.md`; the A/B across the redesign is an entry criterion in
+`specs/known-issues.md`.
 
 Generalised: whenever a change touches the machinery a gate's *precondition* depends on,
-the gate's reach is a silent casualty. Treat coverage as a measured quantity, not an
-assumed one.
+the gate's reach is a silent casualty. Whenever a check has a window, a filter or a
+precondition, publish how much it actually covered and gate on that number too. Treat
+coverage as a measured quantity, not an assumed one.
 
 ## Break it and run it — the one check you cannot do by reading
 

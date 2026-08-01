@@ -94,37 +94,36 @@ subsystem**, found by retroactively applying one rule — break what the asserti
 guards, watch it go red. `ba4d28c` fixed each paired with the regression it now
 catches.
 
-## The third shape: a live gate the change under test can switch off
+## A gate that goes quiet — the evidence
 
-Two shapes were already on record — a certification that **could not fail**, and
-a bound whose **cost nothing measured**. Scheduler invariant I13 named a third,
-and it is the one that survives the usual review because both halves look right:
-the gate has teeth, it is demonstrably red on a broken shape, and it is green on
-the tree. What nothing checks is whether it still **reaches** the thing it
-guards.
+Shape 3 of `specs/spec-staleness-sweep.md`'s taxonomy, which is where the rule
+lives. This is what it looked like in the one instance found so far, and it is
+the only one of the three found **prospectively** — before the change that would
+have silenced it exists.
 
-I13 measures service per thread inside a fair share, but only over intervals
-where every CPU carries the same number of each member's runnable threads —
-otherwise the number is placement, not ordering. The redesign it exists to guard
-must reimplement `pop_surplus`, which feeds `answer_steal_requests`, and can
-therefore change placement. **A redesign that makes placement worse makes I13
-measure less rather than fail.** The gate does not break; it goes quiet, and its
-sweep still prints `clean`.
+Scheduler invariant I13 measures service per thread inside a fair share, but only
+over intervals where every CPU carries the same number of each member's runnable
+threads; otherwise the number is placement, not ordering. The redesign it exists
+to guard must reimplement `pop_surplus`, which feeds `answer_steal_requests` and
+can therefore change placement. **A redesign that makes placement worse makes I13
+measure less rather than fail.** The gate does not break, and its sweep goes on
+printing `clean`.
 
-The remedy is the instrument, not the vigilance: `SweepResult::thread_coverage_pct`
-publishes the fraction of executed time I13 had a comparison open for, and
-`invariant_i13_is_measured_and_holds` asserts it against recorded figures — 96%,
-69% and 99% — with a halving as the threshold. Proven both ways, like everything
-else here: forcing the balance condition false takes the reach to 0% and the test
-reds with `its *reach* has collapsed`, while the sweep line beside it still reads
-`clean`. That contradiction printed on one line is the shape.
+Why it survives the usual review: both halves look right. The gate has teeth
+(`fair_identity_within_share` is red 500/500, on I13 alone), and it is green on
+the tree. Nothing in that pair asks whether it still *reaches* what it guards.
 
-**The general rule.** A gate whose applicability is *conditional on some property
-of the system* can be silenced by a change to that property, and the change that
-silences it is disproportionately likely to be the change it was written for —
-because both concern the same subsystem. Whenever a check has a window, a filter
-or a precondition, publish how much it actually covered and gate on that number
-too. Coverage collapse must be as loud as a violation.
+Reach on the current tree, `measure <scenario> 200`: `sibling_storm` 99%,
+`fairness_storm` 96%, then falling with width — 69% at two CPUs, 55% at four,
+45% at eight, because threads exit at slightly different moments and unbalance a
+wide machine sooner. Elsewhere: `crash_md_exit_race` 37%, `rt_wake_latency` 29%,
+`fork_storm` 9%, `futex_storm` 5%, `audio_pipeline` **0%** — I13 measures nothing
+at all on the audio pipeline.
+
+Proven both ways, like everything else here: forcing the balance condition false
+takes the reach to 0% and `invariant_i13_is_measured_and_holds` reds with `its
+*reach* has collapsed`, while the sweep line printed beside it still reads
+`clean`. That contradiction on one line is the shape.
 
 ## Fidelity that was not
 
