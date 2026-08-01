@@ -18,24 +18,47 @@ static IO_URING_WATCHERS: Lock<Vec<RingId>> = Lock::new(Vec::new());
 /// Keyed by device, not by bus. A USB boot mouse and a USB tablet are two
 /// pointers and both are reachable on one machine, so a shared `Usb` slot was
 /// the same defect with "the other USB pointer" in place of "PS/2".
+///
+/// Numbered as devices bind, and *not* derived from an xHCI slot id, which is
+/// what it used to be: slot ids are per controller, and a Tiger Lake machine
+/// has two controllers. A pointer on slot 1 of the Thunderbolt xHC and one on
+/// slot 1 of the PCH xHC would be a single source — the aliasing this type
+/// exists to prevent, restaged one level up.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct PointerSource(u8);
+
+/// The next unclaimed entry in `BUTTONS`. Index 0 belongs to the i8042.
+static NEXT_SOURCE: AtomicU8 = AtomicU8::new(1);
 
 impl PointerSource {
     /// The i8042's aux port, of which a machine has at most one.
     pub const PS2: Self = Self(0);
 
-    /// An xHCI device. Slot ids are 1-based, so they index the table directly
-    /// and cannot collide with the PS/2 slot.
-    pub fn usb(slot_id: u8) -> Self {
-        assert!(slot_id != 0, "xHCI slot ids are 1-based");
-        Self(slot_id)
+    /// An entry in the button table for a pointer that is binding, or `None`
+    /// when the machine has more pointers than the table names.
+    ///
+    /// A caller that cannot get one must not bind the device: handing it
+    /// somebody else's entry is worse than not having it, because the other
+    /// device's buttons then flap on every report.
+    pub fn claim() -> Option<Self> {
+        NEXT_SOURCE
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+            .ok()
+            .map(Self)
     }
+
+    /// Which entry of the button table this source publishes into. For a log
+    /// line: two devices printing the same number is the aliasing defect, and
+    /// nothing else in the system can show it.
+    pub fn id(self) -> u8 {
+        self.0
+    }
+
 }
 
-/// One byte per possible xHCI slot id plus the PS/2 slot, which is the whole
-/// space a `PointerSource` can name — no allocation, no eviction, and no way
-/// for two devices to alias. The OR runs on every pointer event, at ~100 Hz.
+/// One byte per source a `PointerSource` can name, so there is no allocation,
+/// no eviction, and no way for two devices to alias. The OR runs on every
+/// pointer event, at ~100 Hz.
 static BUTTONS: [AtomicU8; 256] = [const { AtomicU8::new(0) }; 256];
 
 fn merged_buttons() -> u8 {

@@ -170,9 +170,9 @@ fn setup_msix(pci_dev: &PciDevice, device: &super::virtio::VirtioDevice) {
         VIRTIO_NET_VECTOR, config_vec, queue_vec);
 }
 
-pub fn init(ecam: &crate::mm::Mmio) {
-    let pci_dev = match PciDevice::find_by_id(ecam, VIRTIO_VENDOR, VIRTIO_NET_DEVICE) {
-        Some(dev) => dev,
+pub fn init(devices: &[PciDevice]) {
+    let pci_dev = match devices.iter().find(|d| d.is_id(VIRTIO_VENDOR, VIRTIO_NET_DEVICE)) {
+        Some(dev) => *dev,
         None => {
             log!("VirtIO net: no device found");
             return;

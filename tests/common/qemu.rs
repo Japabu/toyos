@@ -101,6 +101,26 @@ pub enum Profile {
     /// one boot shows the error channel carrying a failure and not carrying a
     /// success.
     UsbDiskReadOnly,
+    /// Two xHCI controllers, with every device on the *second* one.
+    ///
+    /// The T14 Gen 2's literal shape, and the one that had never been staged:
+    /// Tiger Lake puts a USB4 xHCI in the Thunderbolt block at 00:0d.0 and the
+    /// PCH's at 00:14.0 — same class, same subclass, same prog_if — and the
+    /// laptop's own ports hang off the second. Nothing is attached to the
+    /// first here, exactly as nothing is plugged into the laptop's Thunderbolt
+    /// ports, so a kernel that stops at the first PCI match sees a machine
+    /// with no USB at all. The i8042 is off, which is what stops a PS/2
+    /// keyboard delivering the keystroke this profile means to route over USB.
+    MetalXhciSecond,
+    /// Two xHCI controllers with HID devices on both.
+    ///
+    /// One held-set and one button merge for the whole machine is a claim
+    /// about devices on *different controllers* as much as about two on one
+    /// bus, and it is a claim nothing could test: with one controller, an
+    /// xHCI slot id was a machine-wide name for a device. It is not — the
+    /// device lists here are shaped so both pointers land on the same slot id
+    /// of their own controller.
+    MetalXhciBoth,
 }
 
 /// The controller every profile but [`Profile::MetalUsb`] gets. `nec-usb-xhci`
@@ -123,6 +143,11 @@ const XHCI_DEFAULT: &str = "nec-usb-xhci,id=xhci";
 /// at all, and Enable Slot ignores the MaxSlotsEn the driver writes to CONFIG.
 /// The kernel's own `xhci-one-slot` feature is what drives that path.
 const XHCI_WIDE: &str = "nec-usb-xhci,id=xhci,p2=8";
+/// A second controller, for the profiles that stage a machine with two. Only
+/// the id differs — the point is precisely that the two are indistinguishable
+/// by class, subclass and prog_if, which is why taking the first PCI match
+/// looked right for as long as it did.
+const XHCI_SECOND: &str = "nec-usb-xhci,id=xhci1";
 
 /// Everything a profile decides about the machine, in one table. A new
 /// variant answers every question here or does not compile — which `self !=
@@ -133,12 +158,19 @@ struct Shape {
     vga: &'static str,
     /// virtio-net, virtio-sound, and the console on virtio-serial.
     virtio: bool,
-    /// The `-device` argument for the controller itself, port and slot counts
-    /// included. The boot stick hangs off it in every profile.
-    xhci: &'static str,
-    /// Every USB device besides the boot stick. Absence is what makes an i8042
-    /// test measure anything: QEMU activates one input handler per device
-    /// class, so with a usb-kbd present every injected keystroke goes to it.
+    /// The `-device` argument for each xHCI controller, port and slot counts
+    /// included. A list because a machine can have more than one and the T14
+    /// does — its keyboard is on the second.
+    xhci: &'static [&'static str],
+    /// The bus the boot stick and the second USB disk attach to. Named rather
+    /// than assumed, because which controller carries the storage is a shape
+    /// dimension once there is more than one: the index the block layer holds
+    /// has to name the same disk either way.
+    storage_bus: &'static str,
+    /// Every USB device besides the boot stick, each naming its own bus.
+    /// Absence is what makes an i8042 test measure anything: QEMU activates
+    /// one input handler per device class, so with a usb-kbd present every
+    /// injected keystroke goes to it.
     usb: &'static [&'static str],
     /// The NVMe namespace's size. The backing file is sparse, so this is free
     /// to state honestly — and it has to be stated, because a kernel
@@ -201,8 +233,9 @@ impl Profile {
             Self::Headless => Shape {
                 vga: "none",
                 virtio: true,
-                xhci: XHCI_DEFAULT,
-                usb: &["usb-kbd"],
+                xhci: &[XHCI_DEFAULT],
+                storage_bus: "xhci.0",
+                usb: &["usb-kbd,bus=xhci.0"],
                 nvme_bytes: NVME_SMALL,
                 nvme_lba_bytes: NVME_LBA_DEFAULT,
                 usb_disk_bytes: 0,
@@ -212,8 +245,9 @@ impl Profile {
             Self::Gop => Shape {
                 vga: "std",
                 virtio: true,
-                xhci: XHCI_DEFAULT,
-                usb: &["usb-kbd"],
+                xhci: &[XHCI_DEFAULT],
+                storage_bus: "xhci.0",
+                usb: &["usb-kbd,bus=xhci.0"],
                 nvme_bytes: NVME_SMALL,
                 nvme_lba_bytes: NVME_LBA_DEFAULT,
                 usb_disk_bytes: 0,
@@ -223,7 +257,8 @@ impl Profile {
             Self::Diskless => Shape {
                 vga: "std",
                 virtio: false,
-                xhci: XHCI_DEFAULT,
+                xhci: &[XHCI_DEFAULT],
+                storage_bus: "xhci.0",
                 usb: &[],
                 // Zero is the absence, not a zero-length disk: `nvme_args`
                 // emits no controller, no namespace and no backing file.
@@ -236,7 +271,8 @@ impl Profile {
             Self::Metal => Shape {
                 vga: "std",
                 virtio: false,
-                xhci: XHCI_DEFAULT,
+                xhci: &[XHCI_DEFAULT],
+                storage_bus: "xhci.0",
                 usb: &[],
                 nvme_bytes: NVME_SMALL,
                 nvme_lba_bytes: NVME_LBA_DEFAULT,
@@ -251,8 +287,15 @@ impl Profile {
             Self::MetalUsb => Shape {
                 vga: "std",
                 virtio: false,
-                xhci: XHCI_WIDE,
-                usb: &["usb-kbd", "usb-kbd", "usb-mouse", "usb-tablet", "usb-hub"],
+                xhci: &[XHCI_WIDE],
+                storage_bus: "xhci.0",
+                usb: &[
+                    "usb-kbd,bus=xhci.0",
+                    "usb-kbd,bus=xhci.0",
+                    "usb-mouse,bus=xhci.0",
+                    "usb-tablet,bus=xhci.0",
+                    "usb-hub,bus=xhci.0",
+                ],
                 nvme_bytes: NVME_SMALL,
                 nvme_lba_bytes: NVME_LBA_DEFAULT,
                 usb_disk_bytes: 0,
@@ -262,7 +305,8 @@ impl Profile {
             Self::MetalDisk => Shape {
                 vga: "std",
                 virtio: false,
-                xhci: XHCI_DEFAULT,
+                xhci: &[XHCI_DEFAULT],
+                storage_bus: "xhci.0",
                 usb: &[],
                 nvme_bytes: NVME_T14_BYTES,
                 nvme_lba_bytes: NVME_LBA_DEFAULT,
@@ -273,7 +317,8 @@ impl Profile {
             Self::NvmeWideSector => Shape {
                 vga: "std",
                 virtio: false,
-                xhci: XHCI_DEFAULT,
+                xhci: &[XHCI_DEFAULT],
+                storage_bus: "xhci.0",
                 usb: &[],
                 nvme_bytes: NVME_SMALL,
                 nvme_lba_bytes: 8192,
@@ -284,7 +329,8 @@ impl Profile {
             Self::UsbDisk => Shape {
                 vga: "std",
                 virtio: false,
-                xhci: XHCI_DEFAULT,
+                xhci: &[XHCI_DEFAULT],
+                storage_bus: "xhci.0",
                 usb: &[],
                 nvme_bytes: NVME_SMALL,
                 nvme_lba_bytes: NVME_LBA_DEFAULT,
@@ -295,7 +341,8 @@ impl Profile {
             Self::UsbDisk4k => Shape {
                 vga: "std",
                 virtio: false,
-                xhci: XHCI_DEFAULT,
+                xhci: &[XHCI_DEFAULT],
+                storage_bus: "xhci.0",
                 usb: &[],
                 nvme_bytes: NVME_SMALL,
                 nvme_lba_bytes: NVME_LBA_DEFAULT,
@@ -306,7 +353,8 @@ impl Profile {
             Self::UsbDiskHuge => Shape {
                 vga: "std",
                 virtio: false,
-                xhci: XHCI_DEFAULT,
+                xhci: &[XHCI_DEFAULT],
+                storage_bus: "xhci.0",
                 usb: &[],
                 nvme_bytes: NVME_SMALL,
                 nvme_lba_bytes: NVME_LBA_DEFAULT,
@@ -317,13 +365,56 @@ impl Profile {
             Self::UsbDiskReadOnly => Shape {
                 vga: "std",
                 virtio: false,
-                xhci: XHCI_DEFAULT,
+                xhci: &[XHCI_DEFAULT],
+                storage_bus: "xhci.0",
                 usb: &[],
                 nvme_bytes: NVME_SMALL,
                 nvme_lba_bytes: NVME_LBA_DEFAULT,
                 usb_disk_bytes: USB_STICK_BYTES,
                 usb_disk_lba_bytes: 512,
                 usb_disk_readonly: true,
+            },
+            // The first controller carries nothing at all — not even the boot
+            // stick, which is on the second with the HID. That is the laptop
+            // exactly: a USB-A port is a PCH port, and the Thunderbolt block's
+            // controller is empty until something is plugged into it. It also
+            // means the disk index the block layer holds names a device on a
+            // controller that is not the first, which nothing else stages.
+            Self::MetalXhciSecond => Shape {
+                vga: "std",
+                virtio: false,
+                xhci: &[XHCI_DEFAULT, XHCI_SECOND],
+                storage_bus: "xhci1.0",
+                usb: &["usb-kbd,bus=xhci1.0", "usb-mouse,bus=xhci1.0"],
+                nvme_bytes: NVME_SMALL,
+                nvme_lba_bytes: NVME_LBA_DEFAULT,
+                usb_disk_bytes: 0,
+                usb_disk_lba_bytes: NVME_LBA_DEFAULT,
+                usb_disk_readonly: false,
+            },
+            // A hub ahead of the second controller's HID, so that controller's
+            // devices take the same slot ids as the first's: the boot stick is
+            // SuperSpeed and enumerates ahead of every USB2 device, and the hub
+            // stands in for it. Both mice therefore land on one slot id, which
+            // is the collision a slot-derived pointer source turns into a
+            // single button-merge entry.
+            Self::MetalXhciBoth => Shape {
+                vga: "std",
+                virtio: false,
+                xhci: &[XHCI_DEFAULT, XHCI_SECOND],
+                storage_bus: "xhci.0",
+                usb: &[
+                    "usb-kbd,bus=xhci.0",
+                    "usb-mouse,bus=xhci.0",
+                    "usb-hub,bus=xhci1.0",
+                    "usb-kbd,bus=xhci1.0",
+                    "usb-mouse,bus=xhci1.0",
+                ],
+                nvme_bytes: NVME_SMALL,
+                nvme_lba_bytes: NVME_LBA_DEFAULT,
+                usb_disk_bytes: 0,
+                usb_disk_lba_bytes: NVME_LBA_DEFAULT,
+                usb_disk_readonly: false,
             },
         }
     }
@@ -1087,15 +1178,21 @@ fn qemu_command(
             "if=pflash,format=raw,unit=1,file={},readonly=on",
             ovmf_dir.join("OVMF_VARS-pure-efi.fd").display()
         ))
-        .arg("-device")
-        .arg(shape.xhci)
         .arg("-drive")
         .arg(format!(
             "if=none,id=stick,format=raw,file={}",
             boot_image.display()
+        ));
+
+    for controller in shape.xhci {
+        qemu.arg("-device").arg(*controller);
+    }
+
+    qemu.arg("-device")
+        .arg(format!(
+            "usb-storage,bus={},drive=stick,bootindex=0",
+            shape.storage_bus
         ))
-        .arg("-device")
-        .arg("usb-storage,bus=xhci.0,drive=stick,bootindex=0")
         .arg("-vga")
         .arg(shape.vga)
         .arg("-display")
@@ -1136,13 +1233,14 @@ fn qemu_command(
             ))
             .arg("-device")
             .arg(format!(
-                "usb-storage,bus=xhci.0,drive=usbdisk,logical_block_size={0},physical_block_size={0}",
-                shape.usb_disk_lba_bytes
+                "usb-storage,bus={1},drive=usbdisk,logical_block_size={0},physical_block_size={0}",
+                shape.usb_disk_lba_bytes,
+                shape.storage_bus
             ));
     }
 
     for dev in shape.usb {
-        qemu.arg("-device").arg(format!("{dev},bus=xhci.0"));
+        qemu.arg("-device").arg(*dev);
     }
 
     if shape.virtio {

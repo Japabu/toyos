@@ -1,12 +1,12 @@
 use core::ptr::{write_volatile, write_bytes};
 
 use crate::log;
-use super::{Mmio, Trb, TrbRing, XhciController, dma, PAGE};
+use super::{Mmio, Trb, TrbRing, XhciController, PAGE};
 use super::{OFF_DCBAA, OFF_INPUT_CTX, OFF_DATA_BUF};
 use super::{DEV_INT_RING, DEV_EP0_RING, DEV_OUT_CTX, DEV_REPORT};
 use super::{TRB_ENABLE_SLOT, TRB_ADDRESS_DEVICE, TRB_CONFIGURE_EP, CC_SUCCESS, CC_SHORT_PACKET};
 use super::{OP_PORT_BASE, PORT_REG_SIZE, PORTSC_CCS, PORTSC_PED, PORTSC_PR, PORTSC_PRC, PORTSC_RW1C};
-use super::hid::{HidType, HidDevice};
+use super::hid::{HidType, HidRole, HidDevice};
 use super::msc::MscInterface;
 
 /// How much of a configuration descriptor the driver reads and parses.
@@ -236,7 +236,7 @@ pub fn init_device(ctrl: &mut XhciController, op_base: &Mmio, port_idx: u8) {
     };
     log!("xHCI: slot {} enabled (dma +{:#x})", slot_id, block);
 
-    let dma = dma();
+    let dma = ctrl.dma();
     let mut ep0_ring = TrbRing::init(dma.subslice(block + DEV_EP0_RING, PAGE));
     let input_ctx = dma.subslice(OFF_INPUT_CTX, PAGE);
     let input_ctx_ptr = input_ctx.base();
@@ -397,6 +397,20 @@ pub fn init_device(ctrl: &mut XhciController, op_base: &Mmio, port_idx: u8) {
         HidType::Mouse => 4,
         HidType::Tablet => 6,
     };
+    let role = match info.protocol {
+        HidType::Keyboard => HidRole::Keyboard,
+        // A pointer with no entry in the button table cannot be bound: it
+        // would have to share another device's, and then each report of one
+        // publishes the other's buttons as released.
+        HidType::Mouse | HidType::Tablet => match crate::mouse::PointerSource::claim() {
+            Some(source) => HidRole::Pointer(source),
+            None => {
+                log!("xHCI: slot {} is past the pointers this machine can number, dropping it",
+                    slot_id);
+                return;
+            }
+        },
+    };
     let mut dev = HidDevice {
         slot_id,
         int_ep_dci,
@@ -404,7 +418,7 @@ pub fn init_device(ctrl: &mut XhciController, op_base: &Mmio, port_idx: u8) {
         report_phys,
         report_ptr,
         report_size,
-        hid_type: info.protocol,
+        role,
         prev_report: [0; 8],
     };
 
@@ -413,6 +427,13 @@ pub fn init_device(ctrl: &mut XhciController, op_base: &Mmio, port_idx: u8) {
     // on one ring is invisible from every other angle: both still enumerate,
     // both still bind, and both still deliver until their TRBs interleave.
     log!("xHCI: USB {} ready on slot {}, int_ring +{:#x}", kind, slot_id, block + DEV_INT_RING);
+    // The same argument one level up, and the only place the merge is visible:
+    // two pointers on two controllers both have a slot 1, so a source derived
+    // from the slot id would be one entry and each report would publish the
+    // other device's buttons as released.
+    if let HidRole::Pointer(source) = dev.role {
+        log!("xHCI: pointer on slot {} merges as source {}", slot_id, source.id());
+    }
     ctrl.devices.push(dev);
 }
 

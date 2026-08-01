@@ -344,7 +344,7 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     let ecam_base = acpi::find_ecam_base(kernel_args.rsdp_addr)
         .expect("ACPI: failed to find ECAM base address");
     let ecam = mm::paging::kernel().lock().as_mut().unwrap().map_mmio(ecam_base, 256 * 32 * 8 * 4096);
-    pci::enumerate(&ecam);
+    let pci_devices = pci::enumerate(&ecam);
     file_cache::init();
     gpt::init(kernel_args);
 
@@ -359,7 +359,7 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     //
     // `None` from `open_home` is the other half and means something different:
     // there *is* a disk and it is not ours to write to. Both land on a tmpfs.
-    let home_volume = match nvme::init(&ecam) {
+    let home_volume = match nvme::init(&pci_devices) {
         Some(mut nvme_dev) => {
             // Before the page cache takes the device: this is the one place
             // that has it in the device's own logical blocks, and asking a
@@ -381,10 +381,7 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     // Phase 4: Peripherals
     let t_periph = clock::nanos_since_boot();
 
-    match xhci::init(&ecam) {
-        Some(ctrl) => xhci::set_global(ctrl),
-        None => log!("xHCI: no controller on this machine, USB input unavailable"),
-    }
+    xhci::init(&pci_devices);
     #[cfg(feature = "usb-storage-gate")]
     usb_gate::run();
     // Here rather than beside the NVMe probe: this machine boots off a USB
@@ -448,14 +445,14 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     // Phase 6: Devices
     let t_devices = clock::nanos_since_boot();
 
-    virtio_console::init(&ecam);
-    virtio_net::init(&ecam);
+    virtio_console::init(&pci_devices);
+    virtio_net::init(&pci_devices);
 
-    if let Some((sound, audio_info)) = virtio_sound::init(&ecam) {
+    if let Some((sound, audio_info)) = virtio_sound::init(&pci_devices) {
         crate::audio::register(sound, audio_info);
     }
 
-    if let Some((gpu_driver, gpu_info)) = virtio_gpu::init(&ecam) {
+    if let Some((gpu_driver, gpu_info)) = virtio_gpu::init(&pci_devices) {
         log!("GPU: using VirtIO");
         // virtio's scanout is only reachable through a virtqueue round trip
         // behind GPU.lock(), which the panic path may not take.

@@ -4,11 +4,24 @@ use core::sync::atomic::{fence, Ordering};
 use crate::{keyboard, mouse};
 use super::{Mmio, Trb, TrbRing, TRB_NORMAL};
 
+/// What a configuration descriptor's HID interface said it was. Parse-time
+/// only: the three differ in report size and in whether SET_PROTOCOL applies,
+/// and in nothing a bound device does.
 #[derive(Clone, Copy, PartialEq)]
 pub enum HidType {
     Keyboard,
     Mouse,
     Tablet,
+}
+
+/// What a *bound* device is, which is a coarser question — the two pointer
+/// kinds dispatch identically, and `mouse::handle_report` tells them apart by
+/// report length. The source is carried rather than derived from the slot id,
+/// which is per controller and therefore not a machine-wide name for a device.
+#[derive(Clone, Copy)]
+pub enum HidRole {
+    Keyboard,
+    Pointer(mouse::PointerSource),
 }
 
 pub struct HidDevice {
@@ -18,7 +31,7 @@ pub struct HidDevice {
     pub report_phys: u64,
     pub report_ptr: *mut u8,
     pub report_size: u32,
-    pub hid_type: HidType,
+    pub role: HidRole,
     /// This keyboard's last report. Per device, because a report is a snapshot
     /// of one keyboard and diffing it against another's synthesizes releases
     /// for keys that are still physically down.
@@ -34,8 +47,8 @@ impl HidDevice {
         // identical to the last one produces no event, and waking watchers
         // for it made readiness disagree with `has_data()` — which froze the
         // compositor for as long as a key was held.
-        match self.hid_type {
-            HidType::Keyboard => {
+        match self.role {
+            HidRole::Keyboard => {
                 if keyboard::handle_report(&mut self.prev_report, &buf[..size]) == 0 {
                     return;
                 }
@@ -48,8 +61,7 @@ impl HidDevice {
                     );
                 }
             }
-            HidType::Mouse | HidType::Tablet => {
-                let source = mouse::PointerSource::usb(self.slot_id);
+            HidRole::Pointer(source) => {
                 if mouse::handle_report(source, &buf[..size]) == 0 {
                     return;
                 }

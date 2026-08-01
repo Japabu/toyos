@@ -408,8 +408,14 @@ impl BlockDevice for NvmeBlockDevice {
     }
 }
 
-pub fn init(ecam: &crate::mm::Mmio) -> Option<NvmeBlockDevice> {
-    let pci_dev = PciDevice::find(ecam, 0x01, 0x08, None)?;
+/// Bring up the machine's NVMe controller.
+///
+/// The first one, and a machine with two loses the second: unlike xHCI, where
+/// the second controller is where a Tiger Lake laptop's keyboard actually is,
+/// nothing above here can hold more than one disk yet — `page_cache::init`
+/// takes a single `BlockDevice`. Filed rather than papered over.
+pub fn init(devices: &[PciDevice]) -> Option<NvmeBlockDevice> {
+    let pci_dev = *devices.iter().find(|d| d.matches_class(0x01, 0x08, None))?;
     log!("NVMe: found at PCI {:02x}:{:02x}.{}", pci_dev.bus, pci_dev.dev, pci_dev.func);
     *DMA_POOL.lock() = Some(DmaPool::alloc(DMA_SIZE));
 

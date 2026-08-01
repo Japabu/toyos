@@ -572,8 +572,8 @@ fn fb_size_bytes(width: u32, height: u32) -> Option<u32> {
 }
 
 /// Initialize the VirtIO GPU. Returns the driver and display info on success.
-pub fn init(ecam: &crate::mm::Mmio) -> Option<(Box<dyn Gpu>, GpuInfo)> {
-    let pci_dev = PciDevice::find_by_id(ecam, VIRTIO_VENDOR, VIRTIO_GPU_DEVICE)?;
+pub fn init(devices: &[PciDevice]) -> Option<(Box<dyn Gpu>, GpuInfo)> {
+    let pci_dev = *devices.iter().find(|d| d.is_id(VIRTIO_VENDOR, VIRTIO_GPU_DEVICE))?;
     log!("VirtIO GPU: found at PCI {:02x}:{:02x}.{}", pci_dev.bus, pci_dev.dev, pci_dev.func);
     *DMA.lock() = Some(DmaPool::alloc(DMA_SIZE));
     let dma = dma();

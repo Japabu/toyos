@@ -509,8 +509,8 @@ fn setup_msix(pci_dev: &PciDevice, device: &VirtioDevice) {
 }
 
 /// Initialize the VirtIO sound device. Returns the controller and AudioInfo on success.
-pub fn init(ecam: &crate::mm::Mmio) -> Option<(SoundController, AudioInfo)> {
-    let pci_dev = PciDevice::find_by_id(ecam, VIRTIO_VENDOR, VIRTIO_SND_DEVICE)?;
+pub fn init(devices: &[PciDevice]) -> Option<(SoundController, AudioInfo)> {
+    let pci_dev = *devices.iter().find(|d| d.is_id(VIRTIO_VENDOR, VIRTIO_SND_DEVICE))?;
     log!("virtio-sound: found at PCI {:02x}:{:02x}.{}", pci_dev.bus, pci_dev.dev, pci_dev.func);
     let dma_kernel = DmaPool::alloc(KERNEL_DMA_SIZE);
     let dma_shared = DmaPool::alloc(SHARED_DMA_SIZE);

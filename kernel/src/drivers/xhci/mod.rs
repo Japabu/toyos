@@ -339,12 +339,6 @@ impl Layout {
     }
 }
 
-static XHCI_DMA_POOL: Lock<Option<DmaPool>> = Lock::new(None);
-
-fn dma() -> KernelSlice {
-    XHCI_DMA_POOL.lock().as_ref().unwrap().slice()
-}
-
 fn setup_packet(bm_request_type: u8, b_request: u8, w_value: u16, w_index: u16, w_length: u16) -> u64 {
     (bm_request_type as u64)
         | ((b_request as u64) << 8)
@@ -364,6 +358,19 @@ pub struct XhciController {
     context_size: usize, // 32 or 64
     layout: Layout,
 
+    /// This controller's DMA, and this controller's only. It used to be one
+    /// static for the driver, which was sound only while the machine had one
+    /// controller: every offset in `Layout` is relative to a pool base, so two
+    /// controllers sharing one pool put both their DCBAAs, both their command
+    /// rings and both their slot 1 device contexts at the same address.
+    pool: DmaPool,
+
+    /// The machine-wide number of this controller's first disk. Blocks in the
+    /// pool are indexed per controller and everything above `storage_read` is
+    /// indexed per machine, so this is what keeps a log line from calling two
+    /// different disks "disk 0".
+    disk_base: usize,
+
     cmd_ring: TrbRing,
 
     event_ring: *const Trb,
@@ -375,6 +382,10 @@ pub struct XhciController {
 }
 
 impl XhciController {
+    pub(super) fn dma(&self) -> KernelSlice {
+        self.pool.slice()
+    }
+
     fn submit_command(&mut self, trb: Trb) {
         self.cmd_ring.enqueue(trb);
         fence(Ordering::Release);
@@ -457,7 +468,7 @@ impl XhciController {
         if self.event_head == 0 {
             self.event_phase = !self.event_phase;
         }
-        let erdp = dma().phys() + OFF_EVT_RING as u64 + (self.event_head as u64) * 16;
+        let erdp = self.dma().phys() + OFF_EVT_RING as u64 + (self.event_head as u64) * 16;
         self.rt_base.write_u64(IR0_ERDP, erdp | (1 << 3)); // EHB clears interrupt pending
         self.rt_base.write_u32(IR0_IMAN, 3); // clear IP (W1C) + keep IE
     }
@@ -550,24 +561,30 @@ impl XhciController {
     }
 }
 
-static XHCI: Lock<Option<XhciController>> = Lock::new(None);
-
-pub fn set_global(ctrl: XhciController) {
-    *XHCI.lock() = Some(ctrl);
-}
+/// Every xHCI controller on the machine, in PCI enumeration order.
+///
+/// A `Vec` and not an `Option`, because the machine this project targets has
+/// two: Tiger Lake carries a USB4 xHCI in the Thunderbolt block *ahead* of the
+/// PCH's on the bus, and the laptop's own ports hang off the second one. The
+/// driver that kept one controller reported that the T14 had no USB input.
+static XHCI: Lock<Vec<XhciController>> = Lock::new(Vec::new());
 
 /// Process xHCI events only if this CPU has an unserviced MSI-X record.
 /// Records live on the CPU that took the interrupt (which its ISR forces
 /// into the scheduler via need_resched), so on every other CPU this is one
 /// uncontended atomic op on its own cache line — callers need no cpu gate.
 ///
+/// Every controller is polled, because every controller's MSI-X entry carries
+/// the same vector and `irq_ring` keeps one record per source: the record says
+/// that *an* xHC interrupted, never which. Polling a quiet controller costs one
+/// read of its event ring's next TRB.
+///
 /// Thread context only. It takes `XHCI` and dispatches HID reports, which take
 /// the keyboard held-set and both event queues; an ISR calling this would spin
 /// on whichever of those the thread it interrupted holds.
 pub fn poll_if_pending() {
     if crate::irq_ring::take(crate::irq_ring::IrqSource::Xhci).is_some() {
-        let mut guard = XHCI.lock();
-        if let Some(ctrl) = guard.as_mut() {
+        for ctrl in XHCI.lock().iter_mut() {
             ctrl.poll();
         }
     }
@@ -583,37 +600,44 @@ pub struct StorageGeometry {
 }
 
 pub fn storage_count() -> usize {
-    XHCI.lock().as_ref().map_or(0, |c| c.storage.len())
+    XHCI.lock().iter().map(|c| c.storage.len()).sum()
+}
+
+/// Run `f` against the machine's `index`-th disk.
+///
+/// Disks are numbered across the whole machine, in controller order: the index
+/// the block layer holds names a device, and which controller bound it is not
+/// something anything above here should have to know. A per-controller index
+/// would make disk 0 mean two different disks on a two-controller machine.
+fn with_disk<R>(index: usize, f: impl FnOnce(&mut XhciController, usize) -> R) -> Option<R> {
+    let mut guard = XHCI.lock();
+    let mut first = 0;
+    for ctrl in guard.iter_mut() {
+        let count = ctrl.storage.len();
+        if index < first + count {
+            return Some(f(ctrl, index - first));
+        }
+        first += count;
+    }
+    None
 }
 
 pub fn storage_geometry(index: usize) -> Option<StorageGeometry> {
-    XHCI.lock().as_ref()?.storage.get(index).map(msc::MscDevice::geometry)
+    with_disk(index, |ctrl, local| ctrl.storage[local].geometry())
 }
 
 /// Read `count` 4 KiB blocks at `lba`. `false` means the transfer failed and
 /// `buf` holds nothing the caller may believe.
 pub fn storage_read(index: usize, lba: u64, count: u32, buf: &mut [u8]) -> bool {
-    let mut guard = XHCI.lock();
-    match guard.as_mut() {
-        Some(ctrl) => ctrl.msc_read(index, lba, count, buf),
-        None => false,
-    }
+    with_disk(index, |ctrl, local| ctrl.msc_read(local, lba, count, buf)).unwrap_or(false)
 }
 
 pub fn storage_write(index: usize, lba: u64, count: u32, buf: &[u8]) -> bool {
-    let mut guard = XHCI.lock();
-    match guard.as_mut() {
-        Some(ctrl) => ctrl.msc_write(index, lba, count, buf),
-        None => false,
-    }
+    with_disk(index, |ctrl, local| ctrl.msc_write(local, lba, count, buf)).unwrap_or(false)
 }
 
 pub fn storage_flush(index: usize) -> bool {
-    let mut guard = XHCI.lock();
-    match guard.as_mut() {
-        Some(ctrl) => ctrl.msc_flush(index),
-        None => false,
-    }
+    with_disk(index, |ctrl, local| ctrl.msc_flush(local)).unwrap_or(false)
 }
 
 fn setup_msix(pci_dev: &PciDevice) {
@@ -647,8 +671,34 @@ fn setup_msix(pci_dev: &PciDevice) {
     log!("xHCI: MSI-X enabled (vector {:#x})", XHCI_VECTOR);
 }
 
-pub fn init(ecam: &crate::mm::Mmio) -> Option<XhciController> {
-    let pci_dev = PciDevice::find(ecam, 0x0C, 0x03, Some(0x30))?;
+/// Bring up every xHCI controller on the machine.
+///
+/// Every one, not the first: a Tiger Lake laptop has two — the Thunderbolt
+/// block's at 00:0d.0 and the PCH's at 00:14.0, identical in class, subclass
+/// and prog_if — and its keyboard and USB-A ports are on the second. Taking
+/// the first match reported that the T14 had no USB HID at all, which was true
+/// of that controller and false of the machine.
+pub fn init(devices: &[PciDevice]) {
+    let mut controllers = Vec::new();
+    let mut disks = 0;
+    for pci_dev in devices.iter().filter(|d| d.matches_class(0x0C, 0x03, Some(0x30))) {
+        if let Some(ctrl) = init_one(pci_dev, disks) {
+            disks += ctrl.storage.len();
+            controllers.push(ctrl);
+        }
+    }
+
+    if controllers.is_empty() {
+        log!("xHCI: no controller on this machine, USB input unavailable");
+        return;
+    }
+    let hid: usize = controllers.iter().map(|c| c.devices.len()).sum();
+    log!("xHCI: {} controller(s), {} HID device(s)", controllers.len(), hid);
+    log!("usb-storage: {} device(s)", disks);
+    *XHCI.lock() = controllers;
+}
+
+fn init_one(pci_dev: &PciDevice, disk_base: usize) -> Option<XhciController> {
     log!("xHCI: found at PCI {:02x}:{:02x}.{}", pci_dev.bus, pci_dev.dev, pci_dev.func);
 
     let bar_addr = pci_dev.read_bar_64(0);
@@ -657,7 +707,7 @@ pub fn init(ecam: &crate::mm::Mmio) -> Option<XhciController> {
 
     let bar = crate::mm::paging::kernel().lock().as_mut().unwrap().map_mmio(bar_addr, 0x10000);
 
-    setup_msix(&pci_dev);
+    setup_msix(pci_dev);
 
     let cap_length = bar.read_u8(CAP_CAPLENGTH) as u64;
     let hcsparams1 = bar.read_u32(CAP_HCSPARAMS1);
@@ -693,7 +743,7 @@ pub fn init(ecam: &crate::mm::Mmio) -> Option<XhciController> {
     let layout = Layout::new((max_sp_hi << 5) | max_sp_lo, max_slots);
     log!("xHCI: dma {} KiB: scratchpad={} device blocks={} of {} B (max_slots={})",
         layout.pool_size / 1024, layout.scratch_count, layout.dev_blocks, DEV_STRIDE, max_slots);
-    *XHCI_DMA_POOL.lock() = Some(DmaPool::alloc(layout.pool_size));
+    let pool = DmaPool::alloc(layout.pool_size);
 
     // Before the controller is touched at all: on a PC the firmware may still
     // own it for legacy keyboard emulation, and resetting a controller SMM is
@@ -722,7 +772,7 @@ pub fn init(ecam: &crate::mm::Mmio) -> Option<XhciController> {
     // handing back an id with nowhere to put its context.
     op_base.write_u32(OP_CONFIG, layout.dev_blocks as u32);
 
-    let dma = dma();
+    let dma = pool.slice();
     unsafe { dma.zero(); }
 
     if layout.scratch_count > 0 {
@@ -774,6 +824,8 @@ pub fn init(ecam: &crate::mm::Mmio) -> Option<XhciController> {
         rt_base,
         context_size,
         layout,
+        pool,
+        disk_base,
         cmd_ring,
         event_ring: evt_ring_buf.base() as *const Trb,
         event_head: 0,
@@ -791,9 +843,9 @@ pub fn init(ecam: &crate::mm::Mmio) -> Option<XhciController> {
     // keyboard is PS/2 and whose touchpad is I2C-HID — under metal-sim this
     // `None` reached `kernel_main`'s `.expect` and panicked the boot.
     if ctrl.devices.is_empty() {
-        log!("xHCI: no HID devices found");
+        log!("xHCI: no HID devices on the controller at {:02x}:{:02x}.{}",
+            pci_dev.bus, pci_dev.dev, pci_dev.func);
     }
-    log!("usb-storage: {} device(s)", ctrl.storage.len());
 
     Some(ctrl)
 }

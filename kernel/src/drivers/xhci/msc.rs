@@ -10,7 +10,7 @@
 use core::ptr::{copy_nonoverlapping, write_bytes};
 
 use crate::log;
-use super::{Trb, TrbRing, XhciController, StorageGeometry, dma, PAGE};
+use super::{Trb, TrbRing, XhciController, StorageGeometry, PAGE};
 use super::{CC_SUCCESS, CC_STALL, CC_SHORT_PACKET, TRB_NORMAL, TRB_CONFIGURE_EP};
 use super::{TRB_RESET_ENDPOINT, TRB_SET_TR_DEQUEUE, OFF_INPUT_CTX};
 use super::{MSC_IN_RING, MSC_OUT_RING, MSC_CBW, MSC_CSW, MSC_SCRATCH, MSC_SCRATCH_LEN};
@@ -59,7 +59,7 @@ pub struct MscDevice {
     out_ep: u8,
     in_dci: u8,
     out_dci: u8,
-    /// Byte offset of this device's block in the shared DMA pool.
+    /// Byte offset of this device's block in its controller's DMA pool.
     block: usize,
     ep0_ring: TrbRing,
     in_ring: TrbRing,
@@ -194,7 +194,7 @@ impl XhciController {
             }
         }
 
-        let dma = dma();
+        let dma = self.dma();
         let data_phys = dma.phys() + (dev.block + MSC_DATA) as u64;
         let mut done = 0u32;
         while done < count {
@@ -305,7 +305,7 @@ impl XhciController {
     /// REQUEST SENSE as a diagnostic, never as a decision. Returns
     /// (sense key, ASC, ASCQ), zeroed if the device would not say.
     fn request_sense(&mut self, dev: &mut MscDevice) -> (u8, u8, u8) {
-        let dma = dma();
+        let dma = self.dma();
         let phys = dma.phys() + (dev.block + MSC_SCRATCH) as u64;
         unsafe { write_bytes(dma.ptr_at(dev.block + MSC_SCRATCH), 0, MSC_SCRATCH_LEN); }
         let cdb = [0x03u8, 0, 0, 0, 18, 0];
@@ -341,7 +341,7 @@ impl XhciController {
         assert!(cdb_len as usize <= cdb.len() && cdb_len <= 16);
         assert!(data_len as usize <= MSC_DATA_LEN);
 
-        let dma = dma();
+        let dma = self.dma();
         let tag = dev.next_tag();
         let cbw = dma.subslice(dev.block + MSC_CBW, CBW_LEN as usize);
         unsafe {
@@ -469,7 +469,7 @@ impl XhciController {
             return false;
         }
 
-        let fresh = TrbRing::init(dma().subslice(dev.block + ring_off, PAGE));
+        let fresh = TrbRing::init(self.dma().subslice(dev.block + ring_off, PAGE));
         let dequeue = fresh.dequeue();
         if in_dir {
             dev.in_ring = fresh;
@@ -533,7 +533,7 @@ pub fn bind(
 
     let in_dci = (info.in_ep & 0x0F) * 2 + 1;
     let out_dci = (info.out_ep & 0x0F) * 2;
-    let dma = dma();
+    let dma = ctrl.dma();
     let in_ring = TrbRing::init(dma.subslice(block + MSC_IN_RING, PAGE));
     let out_ring = TrbRing::init(dma.subslice(block + MSC_OUT_RING, PAGE));
 
@@ -596,9 +596,14 @@ pub fn bind(
     if !bring_up(ctrl, &mut dev) {
         return false;
     }
+    // The machine-wide number, which is what `usb_storage::open` indexes by.
+    // `index` is this controller's own and is what picked the pool block; on a
+    // two-controller machine the two disagree, and printing the local one
+    // would call two different disks "disk 0".
     log!(
-        "usb-storage: disk {index} ready on slot {slot_id}, {} blocks of {} B \
+        "usb-storage: disk {} ready on slot {slot_id}, {} blocks of {} B \
          ({} MiB), msc_block +{:#x}",
+        ctrl.disk_base + index,
         dev.blocks,
         dev.logical_block_bytes,
         dev.blocks * HOST_BLOCK as u64 / (1024 * 1024),
@@ -641,7 +646,7 @@ fn bring_up(ctrl: &mut XhciController, dev: &mut MscDevice) -> bool {
         return false;
     }
 
-    let dma = dma();
+    let dma = ctrl.dma();
     let scratch_phys = dma.phys() + (dev.block + MSC_SCRATCH) as u64;
     let read_scratch = |ctrl: &mut XhciController,
                         dev: &mut MscDevice,

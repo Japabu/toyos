@@ -95,8 +95,9 @@ pub fn run() {
 
     // One pointer holds a button while the other reports none. Publishing
     // the second report's buttons verbatim is what made the button flap.
-    let tablet = PointerSource::usb(1);
-    let usb_mouse = PointerSource::usb(2);
+    let tablet = PointerSource::claim().expect("input-merge: no button-table entry for the tablet");
+    let usb_mouse = PointerSource::claim().expect("input-merge: no button-table entry for the mouse");
+    assert!(tablet != usb_mouse, "input-merge: two pointers claimed one source");
     assert!(
         mouse::handle_motion(PointerSource::PS2, 1, Motion::Relative { dx: 1, dy: 0 }, 0),
         "input-merge: PS/2 motion queued nothing"

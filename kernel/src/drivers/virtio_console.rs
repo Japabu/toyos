@@ -154,9 +154,9 @@ pub fn has_data_locked() -> bool {
     c.rx_pending.is_some() || c.rx.has_used()
 }
 
-pub fn init(ecam: &crate::mm::Mmio) -> bool {
-    let pci_dev = match PciDevice::find_by_id(ecam, VIRTIO_VENDOR, VIRTIO_CONSOLE_DEVICE) {
-        Some(d) => d,
+pub fn init(devices: &[PciDevice]) -> bool {
+    let pci_dev = match devices.iter().find(|d| d.is_id(VIRTIO_VENDOR, VIRTIO_CONSOLE_DEVICE)) {
+        Some(d) => *d,
         None => {
             log!("virtio-console: no device found");
             return false;

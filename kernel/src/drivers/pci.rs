@@ -1,3 +1,5 @@
+use alloc::vec::Vec;
+
 use crate::mm::Mmio;
 use crate::log;
 
@@ -42,6 +44,7 @@ impl Capability<'_> {
 }
 
 /// PCI device identified by ECAM base + Bus/Device/Function.
+#[derive(Clone, Copy)]
 pub struct PciDevice {
     mmio: Mmio,
     pub bus: u8,
@@ -105,41 +108,11 @@ impl PciDevice {
         CapabilityIter { device: self, next: first }
     }
 
-    /// Find a PCI device by class, subclass, and optional prog_if.
-    pub fn find(ecam: &crate::mm::Mmio, class: u8, subclass: u8, prog_if: Option<u8>) -> Option<Self> {
-        Self::scan(ecam, |pci| pci.matches_class(class, subclass, prog_if))
+    pub fn is_id(&self, vendor: u16, device: u16) -> bool {
+        self.vendor_id() == vendor && self.device_id() == device
     }
 
-    /// Find a PCI device by vendor and device ID.
-    pub fn find_by_id(ecam: &crate::mm::Mmio, vendor: u16, device: u16) -> Option<Self> {
-        Self::scan(ecam, |pci| pci.vendor_id() == vendor && pci.device_id() == device)
-    }
-
-    fn scan(ecam: &crate::mm::Mmio, predicate: impl Fn(&PciDevice) -> bool) -> Option<Self> {
-        for bus in 0..=255u16 {
-            for dev in 0..32u8 {
-                let pci = PciDevice::new(ecam, bus as u8, dev, 0);
-                if pci.vendor_id() == INVALID_VENDOR { continue; }
-
-                if predicate(&pci) {
-                    return Some(pci);
-                }
-
-                if pci.mmio.read_u8(HEADER_TYPE) & MULTI_FUNCTION != 0 {
-                    for func in 1..=7u8 {
-                        let pci = PciDevice::new(ecam, bus as u8, dev, func);
-                        if pci.vendor_id() == INVALID_VENDOR { continue; }
-                        if predicate(&pci) {
-                            return Some(pci);
-                        }
-                    }
-                }
-            }
-        }
-        None
-    }
-
-    fn matches_class(&self, class: u8, subclass: u8, prog_if: Option<u8>) -> bool {
+    pub fn matches_class(&self, class: u8, subclass: u8, prog_if: Option<u8>) -> bool {
         if self.mmio.read_u8(CLASS) != class { return false; }
         if self.mmio.read_u8(SUBCLASS) != subclass { return false; }
         match prog_if {
@@ -167,29 +140,49 @@ impl<'a> Iterator for CapabilityIter<'a> {
     }
 }
 
-/// Enumerate all PCIe devices via ECAM and print them.
-pub fn enumerate(ecam: &crate::mm::Mmio) {
+/// The most functions [`enumerate`] will hand back.
+///
+/// The address space allows 65536 of them — 256 buses of 32 devices of 8
+/// functions — and which of those firmware leaves decoded is not the kernel's
+/// choice, so the walk needs a ceiling that is not the address space's. The
+/// T14 Gen 2 presents 30; QEMU's q35 with every profile's devices presents
+/// fewer. A machine past this loses only the functions past it, and says so.
+const MAX_DEVICES: usize = 256;
+
+/// Every PCIe function ECAM decodes, in bus/device/function order.
+///
+/// One walk for the whole kernel, with each driver selecting out of the
+/// result — and selecting *all* of what it can drive, not the first. A first
+/// match is the wrong answer on the machine this targets: Tiger Lake puts an
+/// xHCI in the Thunderbolt block at 00:0d.0 and the PCH's at 00:14.0, both
+/// class 0c03 prog_if 30, and the laptop's keyboard hangs off the second one.
+pub fn enumerate(ecam: &crate::mm::Mmio) -> Vec<PciDevice> {
     log!("PCI: Enumerating devices...");
 
-    for bus in 0..=255u16 {
+    let mut found: Vec<PciDevice> = Vec::new();
+    'scan: for bus in 0..=255u16 {
         for dev in 0..32u8 {
-            let pci = PciDevice::new(ecam, bus as u8, dev, 0);
-            if pci.vendor_id() == INVALID_VENDOR { continue; }
+            let root = PciDevice::new(ecam, bus as u8, dev, 0);
+            if root.vendor_id() == INVALID_VENDOR { continue; }
 
-            print_device(&pci);
+            let funcs = if root.read_config_u8(HEADER_TYPE) & MULTI_FUNCTION != 0 { 8 } else { 1 };
+            for func in 0..funcs {
+                let pci = PciDevice::new(ecam, bus as u8, dev, func);
+                if pci.vendor_id() == INVALID_VENDOR { continue; }
 
-            if pci.read_config_u8(HEADER_TYPE) & MULTI_FUNCTION != 0 {
-                for func in 1..=7u8 {
-                    let pci = PciDevice::new(ecam, bus as u8, dev, func);
-                    if pci.vendor_id() != INVALID_VENDOR {
-                        print_device(&pci);
-                    }
+                print_device(&pci);
+                if found.len() == MAX_DEVICES {
+                    log!("PCI: more than {} functions decoded; the rest are not enumerated",
+                        MAX_DEVICES);
+                    break 'scan;
                 }
+                found.push(pci);
             }
         }
     }
 
-    log!("PCI: Enumeration complete.");
+    log!("PCI: Enumeration complete, {} functions.", found.len());
+    found
 }
 
 fn print_device(pci: &PciDevice) {

@@ -96,6 +96,8 @@ const MACHINE_TESTS: &[&str] = &[
     "double_fault_stack",
     "diskless_boot",
     "xhci_many_devices",
+    "xhci_second_controller",
+    "xhci_two_controllers",
     "nvme_large_device",
     "nvme_wide_sector",
     "readdir_bound",
@@ -1857,6 +1859,248 @@ fn run_machine_test(
             );
             Ok(())
         }
+        "xhci_second_controller" => {
+            // The T14's shape, and the defect that shape found. Tiger Lake has
+            // two xHCI controllers — the Thunderbolt block's at 00:0d.0 and the
+            // PCH's at 00:14.0, identical in class, subclass and prog_if — and
+            // the laptop's own ports hang off the second. The kernel took the
+            // first PCI match, so a real boot logged one `xHCI: found at PCI
+            // 00:0d.0` and then `no HID devices found` on a machine whose
+            // keyboard was one bus over. Every profile in this tree had exactly
+            // one controller, so nothing could see it.
+            let options = BootOptions {
+                profile: qemu::Profile::MetalXhciSecond,
+                qmp: true,
+                // Nothing else on this machine may be able to deliver a
+                // keystroke. With the i8042 on, a kernel that never found the
+                // second controller could still be handed the key by QEMU's
+                // PS/2 keyboard and everything below would pass with the defect
+                // intact.
+                i8042: false,
+                ..Default::default()
+            };
+            let argv = qemu::profile_argv(&options);
+            let controllers = xhci_argv(&argv);
+            if controllers.len() != 2 {
+                return Err(format!(
+                    "this profile is two controllers or it is nothing; argv has {controllers:?}"
+                ));
+            }
+            // And every USB device is on the second of them. This is the
+            // assertion that stops the test passing for the wrong reason: a
+            // keyboard on the first controller is found by the defect too, and
+            // no console line can tell that apart from the fix working.
+            let usb = usb_argv(&argv);
+            if let Some(bad) = usb.iter().find(|d| !d.contains("bus=xhci1.0")) {
+                return Err(format!(
+                    "{bad} is not on the second controller — a driver that stops at the \
+                     first would find it"
+                ));
+            }
+            for want in ["usb-kbd", "usb-mouse"] {
+                if !usb.iter().any(|d| d.starts_with(want)) {
+                    return Err(format!("no {want} to find: {usb:?}"));
+                }
+            }
+            if !argv.iter().any(|a| a.contains("i8042=off")) {
+                return Err("the i8042 is on; a PS/2 keyboard could deliver instead".to_string());
+            }
+
+            let mut qemu =
+                QemuInstance::boot_with_options(test_config, c_bins, rust_bins, options);
+            let boot = qemu.boot_log().to_string();
+
+            // Both controllers were brought up. One line here is the defect's
+            // exact signature on the laptop.
+            let found = boot.matches("xHCI: found at PCI ").count();
+            if found != 2 {
+                return Err(format!("{found} controller(s) initialised, want 2:\n{boot}"));
+            }
+            // And the empty one came up rather than being skipped: it has been
+            // reset and armed with MSI-X, so dropping it would leave a live
+            // interrupter with nothing draining its event ring.
+            if !boot.contains("xHCI: no HID devices on the controller") {
+                return Err(format!(
+                    "the controller with nothing on it never reported itself:\n{boot}"
+                ));
+            }
+            let binds = parse_xhci_binds(&boot);
+            for want in ["keyboard", "mouse"] {
+                if binds.iter().filter(|b| b.kind == want).count() != 1 {
+                    return Err(format!("{want} not bound exactly once: {binds:?}\n{boot}"));
+                }
+            }
+            // The boot stick is on the second controller too, so the disk
+            // index the block layer holds names a device the first controller
+            // does not have — the flattening `with_disk` does.
+            if boot.matches("usb-storage: disk 0 ready").count() != 1 {
+                return Err(format!("the stick on the second controller is not disk 0:\n{boot}"));
+            }
+
+            // Then the part no log line can show: an injected keystroke and an
+            // injected pointer delta reach a userland process. Ground truth is
+            // the host's own injection at the device boundary; the assertion is
+            // what the guest printed.
+            let Some((scale_x, scale_y)) = parse_rel_scale(&boot) else {
+                return Err(format!("the kernel never said what pointer scale it used:\n{boot}"));
+            };
+            const DX: i32 = 40;
+            const DY: i32 = -30;
+            let result = qemu.run_test_hooked(
+                "test_rs_input_events",
+                Duration::from_secs(30),
+                "===INPUT_READY===",
+                |socket| {
+                    let mut input = qemu::QmpInput::open(socket);
+                    // Off the origin first: the accumulated position clamps at
+                    // 0, so a move up or left from there is invisible. A boot
+                    // mouse reports each axis as an i8, so this arrives clamped
+                    // and its exact value is not something to assert on.
+                    input.mouse(100, 100, None);
+                    thread::sleep(Duration::from_millis(100));
+                    input.mouse(DX, DY, None);
+                    thread::sleep(Duration::from_millis(100));
+                    input.mouse(0, 0, Some(("left", true)));
+                    thread::sleep(Duration::from_millis(50));
+                    input.mouse(0, 0, Some(("left", false)));
+                    thread::sleep(Duration::from_millis(100));
+                    for key in ["h", "e", "l", "l", "o"] {
+                        input.keys(&[(key, true), (key, false)]);
+                        thread::sleep(Duration::from_millis(20));
+                    }
+                },
+            );
+            if let Some(err) = &result.error {
+                return Err(format!("{err}\n{}", result.stdout));
+            }
+
+            let keys = parse_key_events(&result.stdout);
+            let typed: String = keys
+                .iter()
+                .filter(|e| e.modifiers & 0x10 == 0)
+                .map(|e| e.translated.as_str())
+                .collect();
+            if !typed.contains("hello") {
+                return Err(format!(
+                    "typed {typed:?}, want it to contain \"hello\" — the keyboard on the \
+                     second controller never reached userland:\n{}",
+                    result.stdout
+                ));
+            }
+
+            let pointer = parse_mouse_events(&result.stdout);
+            // The delta the wire carried, not "it moved": a sign error in dy
+            // and a dropped high bit both survive "it moved".
+            let want = (DX * scale_x, DY * scale_y);
+            let deltas: Vec<(i32, i32)> = pointer
+                .windows(2)
+                .map(|w| (w[1].x as i32 - w[0].x as i32, w[1].y as i32 - w[0].y as i32))
+                .collect();
+            if !deltas.contains(&want) {
+                return Err(format!(
+                    "no pointer event moved by {want:?}; deltas seen: {deltas:?}\n{}",
+                    result.stdout
+                ));
+            }
+            let Some(down) = pointer.iter().position(|e| e.buttons == 0x01) else {
+                return Err(format!("no left-button-down event; buttons seen: {:?}",
+                    pointer.iter().map(|e| e.buttons).collect::<std::collections::BTreeSet<_>>()));
+            };
+            if !pointer[down + 1..].iter().any(|e| e.buttons == 0x00) {
+                return Err(format!("the left button went down and never came up: {pointer:?}"));
+            }
+            eprintln!(
+                "  [xhci] 2 controllers, HID only on the second; {} key events (typed {typed:?}), \
+                 {} pointer events, delta {want:?} delivered",
+                keys.len(),
+                pointer.len()
+            );
+            Ok(())
+        }
+        "xhci_two_controllers" => {
+            // Composition across controllers. `keyboard::handle_key` and
+            // `mouse::handle_motion` are one held-set and one button merge for
+            // the whole machine, which was argued for two devices on one bus
+            // and never asked about two buses. The pointer half of it was
+            // false: the merge was keyed by xHCI slot id, and slot ids are per
+            // controller, so a pointer on slot 1 of each of two controllers was
+            // one entry and each report published the other's buttons.
+            let options = BootOptions {
+                profile: qemu::Profile::MetalXhciBoth,
+                ..Default::default()
+            };
+            let argv = qemu::profile_argv(&options);
+            let controllers = xhci_argv(&argv);
+            if controllers.len() != 2 {
+                return Err(format!("want two controllers, argv has {controllers:?}"));
+            }
+            let usb = usb_argv(&argv);
+            for bus in ["bus=xhci.0", "bus=xhci1.0"] {
+                let pointers = usb
+                    .iter()
+                    .filter(|d| d.contains(bus) && d.starts_with("usb-mouse"))
+                    .count();
+                if pointers != 1 {
+                    return Err(format!(
+                        "{pointers} pointer(s) on {bus}; the collision needs one on each: {usb:?}"
+                    ));
+                }
+                if !usb.iter().any(|d| d.contains(bus) && d.starts_with("usb-kbd")) {
+                    return Err(format!("no keyboard on {bus}: {usb:?}"));
+                }
+            }
+
+            let qemu = QemuInstance::boot_with_options(test_config, c_bins, rust_bins, options);
+            let boot = qemu.boot_log().to_string();
+
+            let found = boot.matches("xHCI: found at PCI ").count();
+            if found != 2 {
+                return Err(format!("{found} controller(s) initialised, want 2:\n{boot}"));
+            }
+            if !boot.contains("xHCI: 2 controller(s), 4 HID device(s)") {
+                return Err(format!(
+                    "the machine-wide totals are not 2 controllers and 4 HID devices:\n{boot}"
+                ));
+            }
+            let binds = parse_xhci_binds(&boot);
+            for (want, count) in [("keyboard", 2), ("mouse", 2)] {
+                let got = binds.iter().filter(|b| b.kind == want).count();
+                if got != count {
+                    return Err(format!("{got} {want}(s) bound, want {count}: {binds:?}\n{boot}"));
+                }
+            }
+
+            // The merge itself. Two pointers, two entries in the button table,
+            // and — the reason this profile is shaped the way it is — the same
+            // slot id on both, so a source derived from the slot id is provably
+            // one entry rather than accidentally two.
+            let pointers = parse_pointer_sources(&boot);
+            if pointers.len() != 2 {
+                return Err(format!("{} pointers numbered, want 2: {pointers:?}\n{boot}",
+                    pointers.len()));
+            }
+            if pointers[0].0 != pointers[1].0 {
+                return Err(format!(
+                    "the two pointers are on slots {} and {}, so a slot-keyed merge would not \
+                     have collided and this test proves nothing:\n{boot}",
+                    pointers[0].0, pointers[1].0
+                ));
+            }
+            if pointers[0].1 == pointers[1].1 {
+                return Err(format!(
+                    "both pointers merge as source {} — one of them publishes the other's \
+                     buttons:\n{boot}",
+                    pointers[0].1
+                ));
+            }
+            serial::Serial::named("boot console", boot.as_str()).must_be_clean()?;
+            eprintln!(
+                "  [xhci] 2 controllers, 4 HID; both pointers on slot {}, merging as sources {} \
+                 and {}",
+                pointers[0].0, pointers[0].1, pointers[1].1
+            );
+            Ok(())
+        }
         "nvme_large_device" => {
             // Device *size* is a shape dimension, and it is the one nobody had
             // varied: every test image was small enough that an index sized
@@ -3341,15 +3585,7 @@ fn run_machine_test(
             // than the constant being copied here, which would stop being a
             // check the moment either side changed.
             let boot = qemu.boot_log().to_string();
-            let Some((scale_x, scale_y)) = boot
-                .lines()
-                .find_map(|l| l.split("mouse: rel scale x=").nth(1))
-                .and_then(|r| r.split_once(" y="))
-                .and_then(|(x, rest)| {
-                    let y = rest.split_whitespace().next()?;
-                    Some((x.parse::<i32>().ok()?, y.parse::<i32>().ok()?))
-                })
-            else {
+            let Some((scale_x, scale_y)) = parse_rel_scale(&boot) else {
                 return Err(format!("the kernel never said what pointer scale it used:\n{boot}"));
             };
             const DX: i32 = 40;
@@ -3635,6 +3871,49 @@ fn parse_xhci_slots(log: &str) -> Vec<u32> {
     log.lines()
         .filter_map(|line| line.split("xHCI: slot ").nth(1)?.split_once(" enabled"))
         .filter_map(|(slot, _)| slot.parse().ok())
+        .collect()
+}
+
+/// The per-axis relative-pointer scale out of `mouse: rel scale x=64 y=64`.
+///
+/// Read from the kernel rather than restated here: `kernel/src/mouse.rs`
+/// derives it from the screen, so a copy of the constant would stop being a
+/// check the moment either side changed.
+fn parse_rel_scale(log: &str) -> Option<(i32, i32)> {
+    let (x, rest) = log
+        .lines()
+        .find_map(|l| l.split("mouse: rel scale x=").nth(1))?
+        .split_once(" y=")?;
+    Some((x.parse().ok()?, rest.split_whitespace().next()?.parse().ok()?))
+}
+
+/// The `-device` arguments naming an xHCI controller. A machine's controller
+/// count is a shape claim, and argv is the only place it is visible: two
+/// controllers where one carries nothing look identical from inside a guest
+/// that never enumerated the second.
+fn xhci_argv(argv: &[String]) -> Vec<&str> {
+    argv.windows(2)
+        .filter(|w| w[0] == "-device")
+        .map(|w| w[1].as_str())
+        .filter(|v| v.contains("usb-xhci"))
+        .collect()
+}
+
+/// `(slot, source)` out of every `xHCI: pointer on slot 3 merges as source 2`.
+///
+/// The slot is there so the test can show the collision it is guarding
+/// against: two pointers on one slot id of two different controllers is
+/// exactly what a slot-derived button-merge source folded into one entry.
+fn parse_pointer_sources(log: &str) -> Vec<(u32, u32)> {
+    log.lines()
+        .filter_map(|line| {
+            let rest = line.split("xHCI: pointer on slot ").nth(1)?;
+            let (slot, source) = rest.split_once(" merges as source ")?;
+            Some((
+                slot.parse().ok()?,
+                source.trim().split_whitespace().next()?.parse().ok()?,
+            ))
+        })
         .collect()
 }
 
