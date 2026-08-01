@@ -281,13 +281,18 @@ const MSC_BLOCKS: usize = 2;
 const MSC_MAX_BLOCKS: u32 = (MSC_DATA_LEN / 4096) as u32;
 
 /// Device blocks to size the pool for before the controller's slot count is
-/// consulted. Only a controller with a scratchpad demand that lands just under
-/// a 2 MiB boundary can leave fewer than this in the page it forced us to
-/// allocate anyway — and for four of the 1024 possible demands (503, 504, 1014,
-/// 1015) it leaves *nothing*: at 504, `dev_base` is exactly 2097152, so without
-/// the floor `dev_blocks` is 0, MaxSlotsEn is written as zero and the
-/// controller enumerates nothing at all. This is not defensive padding; it is
-/// what keeps the pool from having no room for devices.
+/// consulted.
+///
+/// A scratchpad demand that lands `dev_base` on or just under a 2 MiB boundary
+/// leaves little or nothing in the page it forced us to allocate anyway, and
+/// then MaxSlotsEn is written as that number and the controller enumerates
+/// nothing. This is not defensive padding; it is what keeps the pool from
+/// having no room for devices.
+///
+/// Swept over all 1024 demands HCSPARAMS2's two 5-bit fields can express:
+/// without this floor `dev_blocks` is **0** for 32 of them (458–473 and
+/// 969–984) and as few as 5 for another 32 (442–457, 953–968); with it the
+/// smallest is 10, at 426.
 const MIN_DEVICE_BLOCKS: usize = 8;
 
 /// Cap the driver at one device block, so a test can drive the path where the
@@ -322,8 +327,9 @@ impl Layout {
     /// caller taking a size from outside the kernel needs `align_2m_checked`:
     /// `max_scratchpad` is two 5-bit HCSPARAMS2 fields (`init` masks both with
     /// `0x1F`), so it is at most 1023, and the mass-storage array adds a fixed
-    /// 128 KiB on top — `dev_base` is at most about 4.4 MiB. A controller
-    /// cannot report a number that overflows this, whatever it says.
+    /// 128 KiB on top — `dev_base` is at most 4,390,912 B, or 4.19 MiB, swept
+    /// over every demand. A controller cannot report a number that overflows
+    /// this, whatever it says.
     fn new(max_scratchpad: usize, max_slots: u8) -> Self {
         let scratch_array = SHARED_SIZE;
         let array_bytes = (max_scratchpad * 8 + PAGE - 1) & !(PAGE - 1);

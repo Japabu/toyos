@@ -16,7 +16,10 @@
 //! pointer is a strictly positive *forward* delta (spec §7.1.1: dwords from the
 //! start of *this* capability, zero meaning end of list), every read is bounds
 //! checked against the mapped window, and the iteration count is capped — and it
-//! would still terminate with any two of them removed.
+//! would still terminate with any *one* of them removed. Not any two: with the
+//! window check and the cap both gone the forward delta alone climbs through
+//! the u64 space, which is what the self-test's last case ("an endless chain
+//! inside a window that never ends") is a demonstration of.
 //!
 //! QEMU cannot exercise any of this. Its xHC publishes no Legacy Support
 //! capability and nothing owns the controller once OVMF's USB stack lets go at
