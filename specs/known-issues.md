@@ -2328,6 +2328,20 @@ What was actually established, and what was not:
   event-parsing version. `efbeed7`'s message proves teeth for
   `screen_late_panic` and not for the new `metal_sim_input`. Nothing suggests it
   is vacuous; it has simply never been shown red.
+- **The second artifact, built for the FADT-gate removal.**
+  `target/bootable-diag-3f110ad.img`, 35,753,984 bytes, sha256
+  `1f3eac841ec343a7f5ad69a9f5964a21d79b2f5e763242ef013bad871eeec3b3`. Built by
+  `build::build(.., Boot::Diag)` from a detached worktree at `3f110ad` with a
+  clean `git status --ignore-submodules=all`, so none of the five agents'
+  uncommitted work is in it; `rust/`, `toyos-ld/target` and `toyos-cc/target`
+  symlinked to the main checkout, and a throwaway `src/bin` driver rather than
+  `cargo run`, because `toolchain::ensure` re-links the shared rustup toolchain
+  from any other root. Its initrd holds exactly one file (`bin/toybox`,
+  2,140,152 bytes); the strings `i8042: fault injection armed`,
+  `i8042: drain bytes=`, `test-late-panic` and `test-runner` are absent, so it is
+  the plain default-feature kernel. Booted headless on the metal-sim shape before
+  being handed over: the four `i8042:` lines print, `Boot: complete (234ms)`,
+  toybox exits, nothing repaints after.
 - The flashed kernel is the tested kernel. `target/bootable-diet.img` contains
   `i8042: kbd set2+xlat` and `i8042: absent (FADT rev ` and does **not** contain
   `i8042: fault injection armed`, `i8042: drain bytes=`, `test-late-panic` or
