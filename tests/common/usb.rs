@@ -248,7 +248,7 @@ pub fn usb_storage_gate(
     )?;
     gate_ran(&log, 2)?;
     check_geometry(&log, bytes, lba)?;
-    if !log.contains("usb-gate: disk done reads=ok writes=ok healthy=true") {
+    if !log.contains("usb-gate: disk done reads=ok writes=ok refusal=true healthy=true") {
         return Err(format!("the guest did not report a clean pass\n{log}"));
     }
     verify(&image, bytes, nonce)?;
@@ -336,7 +336,7 @@ pub fn usb_storage_shapes(
     )?;
     gate_ran(&log, 2)?;
     check_geometry(&log, bytes, lba)?;
-    if !log.contains("usb-gate: disk done reads=ok writes=ok healthy=true") {
+    if !log.contains("usb-gate: disk done reads=ok writes=ok refusal=true healthy=true") {
         return Err(format!("the 4 KiB-sector disk did not pass\n{log}"));
     }
     verify(&image, bytes, nonce)?;
@@ -370,6 +370,75 @@ pub fn usb_storage_shapes(
     gate_ran(&log, 1)?;
 
     eprintln!("  [usb] 4096 B sectors verified host-side; a {huge} B disk refused by name");
+    Ok(())
+}
+
+/// The error channel, against a device that really refuses.
+///
+/// Every other assertion in this file is about bytes, and bytes only prove the
+/// path that works. `BlockDevice` returned `()` until recently, so a driver
+/// could fail a transfer and the caller could not tell -- and the page cache
+/// then labelled a slot with a block number whose read had not happened and
+/// served the previous tenant's bytes under it. What makes this a real gate
+/// rather than a mock is that nothing here injects anything: QEMU answers
+/// WRITE(10) on a write-protected LUN with a CHECK CONDITION, which reaches
+/// the driver as a CSW status of 1 and takes the REQUEST SENSE path that no
+/// other test in this suite touches.
+pub fn usb_storage_write_error(
+    test_config: &Path,
+    c_bins: &[(String, Vec<u8>)],
+    rust_bins: &[(String, Vec<u8>)],
+) -> Result<(), String> {
+    let (bytes, _) = Profile::UsbDiskReadOnly.usb_disk().expect("the profile declares a disk");
+    let image = test_dir().join("usb-gate-ro.img");
+    let nonce = stage(&image, bytes);
+    let before = fingerprint(&image, bytes);
+
+    let options = BootOptions {
+        profile: Profile::UsbDiskReadOnly,
+        kernel_features: GATE,
+        usb_image: Some(image.clone()),
+        ..Default::default()
+    };
+    // The claim is about how QEMU opened the file, and argv is the only place
+    // it is visible: a console line cannot tell a refused write from a write
+    // the guest never issued.
+    let argv = qemu::profile_argv(&options);
+    if !argv.iter().any(|a| a.contains("id=usbdisk") && a.contains("readonly=on")) {
+        return Err(format!("the data stick is not read-only in argv: {argv:?}"));
+    }
+
+    let log = boot_and_shutdown(test_config, c_bins, rust_bins, options)?;
+    gate_ran(&log, 2)?;
+
+    // Reads work, writes do not, and the guest could tell them apart. Before
+    // the trait carried a result this line read `writes=ok` on exactly this
+    // machine, because a refused write was indistinguishable from a completed
+    // one.
+    if !log.contains("usb-gate: disk done reads=ok writes=bad") {
+        return Err(format!(
+            "the guest did not see the device refuse its writes\n{log}"
+        ));
+    }
+    // The refusal came from the device, not from the driver's own bound: the
+    // sense data is what SCSI status 1 carries and nothing else in the driver
+    // produces this line.
+    if !log.contains("usb-storage: SCSI 0x2a failed, sense") {
+        return Err(format!("no WRITE(10) refusal with sense data in the log\n{log}"));
+    }
+    // And the reads on the same disk still verified, which is what stops
+    // "writes=bad" from being true because the whole device fell over.
+    if !log.contains("usb-gate: host block 1 verified") {
+        return Err(format!("reads failed too; this proves nothing about writes\n{log}"));
+    }
+    if fingerprint(&image, bytes) != before {
+        return Err("a write the device refused reached the backing file".to_string());
+    }
+    let _ = nonce;
+    let _ = std::fs::remove_file(&image);
+
+    eprintln!("  [usb] write-protected LUN: CSW status 1 seen, refusal reached the caller, \
+               reads on the same disk unaffected");
     Ok(())
 }
 

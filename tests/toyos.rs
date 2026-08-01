@@ -39,6 +39,9 @@ const RUST_SKIP: &[&str] = &[
     "ipc_hostile_peer",
     // Needs netd with a NIC. `netd_connection_caps` runs it on tests/netcase.
     "netd_caps",
+    // Needs a boot image the harness staged a file into before the machine
+    // started, which only `esp_filesystem` builds.
+    "esp_files",
 ];
 
 // Audio glitch tests. Each runs in its own QEMU boot per SMP config and
@@ -103,9 +106,12 @@ const MACHINE_TESTS: &[&str] = &[
     "i8042_absent",
     "i8042_quarantine",
     "i8042_budget_expiry",
+    "xhci_xecp_walk",
     "xhci_slot_exhaustion",
     "usb_storage_gate",
     "usb_storage_shapes",
+    "usb_storage_write_error",
+    "esp_filesystem",
     "cache_eviction",
     "va_exhaustion",
     "heap_ceiling_recovery",
@@ -1658,6 +1664,9 @@ fn run_machine_test(
         // Bodies in `tests/common/usb.rs`, for the same reason.
         "usb_storage_gate" => usb::usb_storage_gate(test_config, c_bins, rust_bins),
         "usb_storage_shapes" => usb::usb_storage_shapes(test_config, c_bins, rust_bins),
+        // Body in `tests/common/esp.rs`, same reason.
+        "esp_filesystem" => common::esp::esp_filesystem(test_config, c_bins, rust_bins),
+        "usb_storage_write_error" => usb::usb_storage_write_error(test_config, c_bins, rust_bins),
         "double_fault_stack" => faults::double_fault_stack(test_config, c_bins, rust_bins),
         "diskless_boot" => faults::diskless_boot(test_config, c_bins, rust_bins),
         "metal_sim_compositor" => {
@@ -2758,20 +2767,49 @@ fn run_machine_test(
         }
         "i8042_health" => {
             // The failure mode that had no line at all: `init` arms the pin,
-            // prints its green line, and nothing ever asserts. Both transitions
-            // out of that state are asserted in one boot, and their *order* is
-            // the assertion — a quiet verdict before any key is pressed, an
-            // alive line after one is. Either alone would go green on a driver
-            // that printed a constant.
+            // prints its green line, and nothing ever asserts. Two boots,
+            // because the transition is the claim and one boot can only be on
+            // one side of it — the first is never touched, the second is.
+            //
+            // Boot one waits on the verdict *as its ready marker*, so a driver
+            // that never reaches it fails as a boot timeout naming the line it
+            // waited for.
+            let quiet_boot = QemuInstance::boot_with_options(
+                test_config,
+                c_bins,
+                rust_bins,
+                BootOptions {
+                    profile: qemu::Profile::Metal,
+                    ready_marker: "the pin has never asserted",
+                    ..Default::default()
+                },
+            );
+            let quiet_log = quiet_boot.boot_log().to_string();
+            let Some(quiet) = quiet_log.lines().find(|l| l.contains("the pin has never asserted"))
+            else {
+                return Err(format!("no quiet verdict:\n{quiet_log}"));
+            };
+            // The counters, not the sentence.
+            if !quiet.contains("0 interrupts") {
+                return Err(format!("the quiet verdict does not say it saw none: {quiet}"));
+            }
+            // And nothing on this machine claimed the pin asserts, on a boot
+            // where nothing touched the keyboard. A report that printed both
+            // lines unconditionally would satisfy every search below.
+            if let Some(wrong) = quiet_log.lines().find(|l| l.contains("the pin asserts")) {
+                return Err(format!("the pin asserted with nothing to assert it: {wrong}"));
+            }
+            drop(quiet_boot);
+
+            // Boot two: the same kernel, one keystroke.
             let mut qemu = QemuInstance::boot_with_options(
                 test_config,
                 c_bins,
                 rust_bins,
                 BootOptions { profile: qemu::Profile::Metal, qmp: true, ..Default::default() },
             );
-            let boot = qemu.boot_log().to_string();
-            if !boot.contains("i8042: kbd set2+xlat") {
-                return Err(format!("the PS/2 keyboard never came up:\n{boot}"));
+            if !qemu.boot_log().contains("i8042: kbd set2+xlat") {
+                return Err(format!("the PS/2 keyboard never came up:\n{}", qemu.boot_log()));
             }
             let result = qemu.run_test_hooked(
                 "test_rs_i8042_keyboard",
@@ -2784,29 +2822,12 @@ fn run_machine_test(
             if let Some(err) = &result.error {
                 return Err(format!("{err}\n{}", result.stdout));
             }
-
-            // The console in time order: everything before the ready marker,
-            // then everything the test run produced.
-            let log = format!("{boot}\n{}", result.serial);
-            let Some(quiet) = log.find("the pin has never asserted") else {
+            let Some(line) = result.serial.lines().find(|l| l.contains("the pin asserts")) else {
                 return Err(format!(
-                    "the driver never said it was armed and silent:\n{log}"
+                    "a key was injected and the driver never said the pin asserts:\n{}",
+                    result.serial
                 ));
             };
-            let Some(alive) = log.find("the pin asserts") else {
-                return Err(format!(
-                    "a key was injected and the driver never said the pin asserts:\n{log}"
-                ));
-            };
-            if quiet > alive {
-                return Err(format!(
-                    "the quiet verdict landed after the first interrupt, so it is not \
-                     reporting silence — it is reporting nothing\n{log}"
-                ));
-            }
-            // The counters, not the sentence: a report that printed a constant
-            // would satisfy every search above.
-            let line = log[alive..].lines().next().unwrap_or_default();
             let words: Vec<&str> = line.split_whitespace().collect();
             let field = |name: &str| -> Option<u64> {
                 let at = words.iter().position(|w| w.trim_end_matches(',') == name)?;
@@ -2814,10 +2835,14 @@ fn run_machine_test(
             };
             let irqs = field("interrupts")
                 .ok_or_else(|| format!("unreadable health line: {line}"))?;
+            let bytes = field("bytes").ok_or_else(|| format!("unreadable health line: {line}"))?;
+            // The chain the line claims, end to end: the pin asserted, the ISR
+            // read the port, and the decoder produced an event. Interrupts
+            // alone would go green on a driver whose ring never filled.
             let keys = field("keys").ok_or_else(|| format!("unreadable health line: {line}"))?;
-            if irqs == 0 || keys == 0 {
+            if irqs == 0 || bytes == 0 || keys == 0 {
                 return Err(format!(
-                    "the alive line reports {irqs} interrupts and {keys} key events: {line}"
+                    "the alive line reports {irqs} interrupts, {bytes} bytes, {keys} keys: {line}"
                 ));
             }
             // `verdict_due` keeps a CPU awake for one pass. If it ever failed to
@@ -2829,9 +2854,67 @@ fn run_machine_test(
                     "{health} idle-health lines — the health verdict is holding a CPU awake"
                 ));
             }
-            eprintln!("  [i8042] {}", log[quiet..].lines().next().unwrap_or_default().trim());
+            eprintln!("  [i8042] {}", quiet.trim());
             eprintln!("  [i8042] {}", line.trim());
             eprintln!("  [i8042] {health} idle-health lines — the CPU still halts");
+            Ok(())
+        }
+        "xhci_xecp_walk" => {
+            // The xHCI extended-capability list is firmware's, and firmware is
+            // not kernel code. QEMU's controller publishes a list with no USB
+            // Legacy Support capability in it, so a boot certifies exactly one
+            // thing: the walk runs on a real controller and terminates. Every
+            // way the list can be *wrong* — a pointer out of the register
+            // window, a chain that never ends, a window reading all ones — is
+            // a shape no controller in reach produces, so the driver walks
+            // eight of them at init under this feature and says how many it
+            // refused.
+            let qemu = QemuInstance::boot_with_options(
+                test_config,
+                c_bins,
+                rust_bins,
+                BootOptions {
+                    profile: qemu::Profile::Metal,
+                    kernel_features: &["xhci-xecp-selftest"],
+                    ..Default::default()
+                },
+            );
+            let log = qemu.boot_log().to_string();
+            if let Some(bad) = log.lines().find(|l| l.contains("xecp selftest FAILED")) {
+                return Err(format!("{bad}\n{log}"));
+            }
+            let Some(verdict) = log.lines().find(|l| l.contains("xecp selftest")) else {
+                return Err(format!("the walk's self-test never ran:\n{log}"));
+            };
+            // `8/8`, not "no failures": a self-test that ran zero cases would
+            // satisfy the absence of a FAILED line.
+            if !verdict.contains("8/8") {
+                return Err(format!("not every malformed list was refused: {verdict}"));
+            }
+            // And the walk on the controller QEMU does provide.
+            let Some(real) = log
+                .lines()
+                .find(|l| l.contains("USB Legacy Support") || l.contains("ownership"))
+            else {
+                return Err(format!("no line about the handoff at all:\n{log}"));
+            };
+            // The handoff must precede the reset — a reset that already
+            // happened is what the whole capability exists to avoid.
+            let reset = log
+                .find("xHCI: controller reset")
+                .ok_or_else(|| format!("the controller was never reset:\n{log}"))?;
+            let handoff = log.find(real).expect("just found");
+            if handoff > reset {
+                return Err(format!(
+                    "the ownership handoff runs after HCRST, which is no handoff at all:\n{log}"
+                ));
+            }
+            // A controller that still enumerates its bus afterwards.
+            if !log.contains("xHCI: controller started") {
+                return Err(format!("the controller did not come up:\n{log}"));
+            }
+            eprintln!("  [xhci] {}", verdict.trim());
+            eprintln!("  [xhci] {}", real.trim());
             Ok(())
         }
         "i8042_budget_expiry" => {

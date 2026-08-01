@@ -92,6 +92,15 @@ pub enum Profile {
     /// and where the driver has to refuse a device rather than serve the first
     /// 2 TiB of it. Sparse, so the host pays for the blocks the guest touches.
     UsbDiskHuge,
+    /// [`Profile::UsbDisk`] with the second stick's backing opened read-only.
+    ///
+    /// The only configuration in this suite where a *device* refuses an I/O
+    /// the driver was right to issue: QEMU answers WRITE(10) on a write-
+    /// protected LUN with a CHECK CONDITION, which is a CSW status of 1 and
+    /// the REQUEST SENSE path behind it. Reads on the same disk still work, so
+    /// one boot shows the error channel carrying a failure and not carrying a
+    /// success.
+    UsbDiskReadOnly,
 }
 
 /// The controller every profile but [`Profile::MetalUsb`] gets. `nec-usb-xhci`
@@ -150,6 +159,10 @@ struct Shape {
     /// Its logical block size. `usb-storage` takes any power of two from 512 B
     /// up, so unlike the boot stick this is something a profile can choose.
     usb_disk_lba_bytes: u32,
+    /// Open its backing read-only, so the guest's writes are refused by the
+    /// device rather than by the driver. Nothing else in this suite can make a
+    /// real device say no to an I/O the driver was right to issue.
+    usb_disk_readonly: bool,
 }
 
 /// What every profile but [`Profile::MetalDisk`] gives the guest. Large
@@ -194,6 +207,7 @@ impl Profile {
                 nvme_lba_bytes: NVME_LBA_DEFAULT,
                 usb_disk_bytes: 0,
                 usb_disk_lba_bytes: NVME_LBA_DEFAULT,
+                usb_disk_readonly: false,
             },
             Self::Gop => Shape {
                 vga: "std",
@@ -204,6 +218,7 @@ impl Profile {
                 nvme_lba_bytes: NVME_LBA_DEFAULT,
                 usb_disk_bytes: 0,
                 usb_disk_lba_bytes: NVME_LBA_DEFAULT,
+                usb_disk_readonly: false,
             },
             Self::Diskless => Shape {
                 vga: "std",
@@ -216,6 +231,7 @@ impl Profile {
                 nvme_lba_bytes: NVME_LBA_DEFAULT,
                 usb_disk_bytes: 0,
                 usb_disk_lba_bytes: NVME_LBA_DEFAULT,
+                usb_disk_readonly: false,
             },
             Self::Metal => Shape {
                 vga: "std",
@@ -226,6 +242,7 @@ impl Profile {
                 nvme_lba_bytes: NVME_LBA_DEFAULT,
                 usb_disk_bytes: 0,
                 usb_disk_lba_bytes: NVME_LBA_DEFAULT,
+                usb_disk_readonly: false,
             },
             // Two keyboards and two pointers, because the collision this
             // stages is between devices of the same HID class; a hub for a
@@ -240,6 +257,7 @@ impl Profile {
                 nvme_lba_bytes: NVME_LBA_DEFAULT,
                 usb_disk_bytes: 0,
                 usb_disk_lba_bytes: NVME_LBA_DEFAULT,
+                usb_disk_readonly: false,
             },
             Self::MetalDisk => Shape {
                 vga: "std",
@@ -250,6 +268,7 @@ impl Profile {
                 nvme_lba_bytes: NVME_LBA_DEFAULT,
                 usb_disk_bytes: 0,
                 usb_disk_lba_bytes: NVME_LBA_DEFAULT,
+                usb_disk_readonly: false,
             },
             Self::NvmeWideSector => Shape {
                 vga: "std",
@@ -260,6 +279,7 @@ impl Profile {
                 nvme_lba_bytes: 8192,
                 usb_disk_bytes: 0,
                 usb_disk_lba_bytes: NVME_LBA_DEFAULT,
+                usb_disk_readonly: false,
             },
             Self::UsbDisk => Shape {
                 vga: "std",
@@ -270,6 +290,7 @@ impl Profile {
                 nvme_lba_bytes: NVME_LBA_DEFAULT,
                 usb_disk_bytes: USB_STICK_BYTES,
                 usb_disk_lba_bytes: 512,
+                usb_disk_readonly: false,
             },
             Self::UsbDisk4k => Shape {
                 vga: "std",
@@ -280,6 +301,7 @@ impl Profile {
                 nvme_lba_bytes: NVME_LBA_DEFAULT,
                 usb_disk_bytes: USB_STICK_BYTES,
                 usb_disk_lba_bytes: 4096,
+                usb_disk_readonly: false,
             },
             Self::UsbDiskHuge => Shape {
                 vga: "std",
@@ -290,6 +312,18 @@ impl Profile {
                 nvme_lba_bytes: NVME_LBA_DEFAULT,
                 usb_disk_bytes: USB_HUGE_BYTES,
                 usb_disk_lba_bytes: 512,
+                usb_disk_readonly: false,
+            },
+            Self::UsbDiskReadOnly => Shape {
+                vga: "std",
+                virtio: false,
+                xhci: XHCI_DEFAULT,
+                usb: &[],
+                nvme_bytes: NVME_SMALL,
+                nvme_lba_bytes: NVME_LBA_DEFAULT,
+                usb_disk_bytes: USB_STICK_BYTES,
+                usb_disk_lba_bytes: 512,
+                usb_disk_readonly: true,
             },
         }
     }
@@ -394,6 +428,48 @@ pub struct QemuInstance {
     boot_log: String,
 }
 
+/// The bootable disk image a boot with these arguments would use.
+///
+/// Public because a test that has to know what is on the boot disk *before*
+/// the machine starts — or has to put something there — cannot let
+/// `boot_with_options` build it: the image is written fresh every boot and its
+/// GPT gets a new random partition GUID with it. Such a test builds the image
+/// here, works on it, and hands it back through [`BootOptions::boot_image`].
+pub fn build_boot_image(
+    test_crate: &Path,
+    c_tests: &[(String, Vec<u8>)],
+    rust_tests: &[(String, Vec<u8>)],
+    kernel_features: &[&str],
+) -> Vec<u8> {
+    let mut extra_files: Vec<(String, Vec<u8>)> = Vec::new();
+    for (name, data) in c_tests {
+        extra_files.push((format!("bin/test_c_{name}"), data.clone()));
+    }
+    for (name, data) in rust_tests {
+        if name.ends_with(".so") {
+            extra_files.push((format!("lib/{name}"), data.clone()));
+        } else {
+            extra_files.push((format!("bin/test_rs_{name}"), data.clone()));
+        }
+    }
+
+    let config_path = test_crate.join("system.toml");
+    assert!(
+        config_path.exists(),
+        "Test crate missing system.toml: {}",
+        config_path.display()
+    );
+
+    let quiet = !VERBOSE.load(Ordering::Relaxed);
+    toyos_build::build::build_test_image(
+        &compile::repo_root(),
+        &config_path,
+        kernel_features,
+        quiet,
+        &extra_files,
+    )
+}
+
 /// Build all binaries in a test crate.
 pub fn build_toyos_bins(crate_path: &Path) -> Vec<(String, Vec<u8>)> {
     let repo = compile::repo_root();
@@ -431,39 +507,11 @@ impl QemuInstance {
         rust_tests: &[(String, Vec<u8>)],
         options: BootOptions,
     ) -> Self {
-        let repo = compile::repo_root();
-
-        let mut extra_files: Vec<(String, Vec<u8>)> = Vec::new();
-        for (name, data) in c_tests {
-            extra_files.push((format!("bin/test_c_{name}"), data.clone()));
-        }
-        for (name, data) in rust_tests {
-            if name.ends_with(".so") {
-                extra_files.push((format!("lib/{name}"), data.clone()));
-            } else {
-                extra_files.push((format!("bin/test_rs_{name}"), data.clone()));
-            }
-        }
-
-        let config_path = test_crate.join("system.toml");
-        assert!(
-            config_path.exists(),
-            "Test crate missing system.toml: {}",
-            config_path.display()
-        );
-
-        let quiet = !VERBOSE.load(Ordering::Relaxed);
         let mut features: Vec<&str> = options.kernel_features.to_vec();
         if options.debug_wait {
             features.push("debug-wait");
         }
-        let disk = toyos_build::build::build_test_image(
-            &repo,
-            &config_path,
-            &features,
-            quiet,
-            &extra_files,
-        );
+        let disk = build_boot_image(test_crate, c_tests, rust_tests, &features);
 
         let pid = std::process::id();
         let test_dir = env::temp_dir().join(format!("toyos-tests-{pid}"));
@@ -1082,8 +1130,9 @@ fn qemu_command(
     if shape.usb_disk_bytes != 0 {
         qemu.arg("-drive")
             .arg(format!(
-                "if=none,id=usbdisk,format=raw,file={}",
-                usb_image.display()
+                "if=none,id=usbdisk,format=raw,file={}{}",
+                usb_image.display(),
+                if shape.usb_disk_readonly { ",readonly=on" } else { "" }
             ))
             .arg("-device")
             .arg(format!(
