@@ -6,9 +6,9 @@
 //! module has no panic on any input path. A table that cannot be believed is a
 //! [`TableError`] with a reason, and the caller decides — because the callers
 //! want opposite things from the same refusal. The i8042 driver must tell
-//! "firmware says there is no 8042" from "firmware's answer is not readable":
-//! the first means never touch ports 0x60/0x64, the second means probe and say
-//! why. They used to be the same code path.
+//! "firmware says there is no 8042" from "firmware's answer is not readable",
+//! because it prints them differently and they are different facts; it probes
+//! on both, since its own handshake is better evidence than either.
 //!
 //! Nothing reads a table except through [`Table::open`], which is what makes
 //! the bounds hold by construction rather than by review. The two subtractions
@@ -489,11 +489,12 @@ pub fn init_power(rsdp_addr: u64) {
 
 /// FADT revision and the IA-PC boot architecture flags.
 ///
-/// Bit 1 of the flags is "8042 present". It is meaningful only at revision
-/// >= 2 — ACPI 1.0 has the field reserved-zero — so the revision comes back
-/// with it and the caller decides. On a machine with no 8042, ports
-/// 0x60/0x64 may be decoded by something else entirely, which is why this is
-/// asked before they are touched.
+/// Bit 1 of the flags is "the motherboard has a port 60/64 keyboard
+/// controller", defined from revision 3. It is a vendor's summary and this
+/// kernel treats it as one: the i8042 driver logs it and probes regardless,
+/// because its own handshake observes the hardware directly and the T14 clears
+/// the bit on a machine whose keyboard is PS/2. The revision comes back with
+/// the flags so the line can say how much the claim is worth.
 ///
 /// The error is not an absence and must not be treated as one. A caller that
 /// collapses `Err` into "the 8042 is absent" turns every firmware quirk into a

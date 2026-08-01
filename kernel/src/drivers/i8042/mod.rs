@@ -66,6 +66,20 @@ const OBF: u8 = 1 << 0;
 const IBF: u8 = 1 << 1;
 const AUXB: u8 = 1 << 5;
 
+/// `IAPC_BOOT_ARCH` bit 1, "the motherboard has a port 60/64 keyboard
+/// controller" (ACPI 6.5 table 5.10; ACPICA calls it `ACPI_FADT_8042`).
+const FADT_8042: u16 = 1 << 1;
+
+/// A port no device decodes floats high, so `0xff` is every status bit set at
+/// once: both buffers full, both error flags, the keyboard simultaneously
+/// locked and transmitting. No controller produces that, and a machine without
+/// one produces nothing else however long it is asked — so this is the value
+/// every wait below gives up on rather than waits out. A deadline alone is not
+/// enough: it makes a machine with no controller spend the whole init budget in
+/// the first wait, and since the probe no longer asks firmware's permission,
+/// that machine is now reachable.
+const FLOATING_BUS: u8 = 0xFF;
+
 const CMD_READ_CONFIG: u8 = 0x20;
 const CMD_WRITE_CONFIG: u8 = 0x60;
 const CMD_DISABLE_AUX: u8 = 0xA7;
@@ -587,9 +601,9 @@ fn deadline(millis: u64) -> u64 {
 /// An allowance, not a measurement. No real EC has ever been timed here, in
 /// either direction.
 const CONTROLLER_MS: u64 = 250;
-/// `0xAA`. A machine with no controller reads 0xFF from a floating bus and
-/// every status bit reads set, so this wait is what separates "controller"
-/// from "nothing".
+/// `0xAA`. A floating bus is already gone by here, so what this separates is
+/// "a controller" from "something else decoding 0x60/0x64" — firmware trapping
+/// the ports in SMM for USB legacy emulation is the case that exists.
 const SELFTEST_MS: u64 = 500;
 /// `0xF5`, `0xF0 0x02`, the `0xF0 0x00` read-back and `0xF4`, each acknowledged
 /// by the keyboard itself rather than by the controller.
@@ -641,22 +655,35 @@ fn budget_spent(budget: u64) -> bool {
     crate::clock::nanos_since_boot() >= budget
 }
 
+/// The status register, or `None` when nothing decodes the port.
+fn status() -> Option<u8> {
+    match inb(STATUS) {
+        FLOATING_BUS => None,
+        other => Some(other),
+    }
+}
+
 fn wait_writable(deadline: u64) -> bool {
-    while inb(STATUS) & IBF != 0 {
+    loop {
+        let Some(status) = status() else { return false };
+        if status & IBF == 0 {
+            return true;
+        }
         if crate::clock::nanos_since_boot() >= deadline {
             return false;
         }
     }
-    true
 }
 
 fn read_data(deadline: u64) -> Option<u8> {
-    while inb(STATUS) & OBF == 0 {
+    loop {
+        if status()? & OBF != 0 {
+            return Some(inb(DATA));
+        }
         if crate::clock::nanos_since_boot() >= deadline {
             return None;
         }
     }
-    Some(inb(DATA))
 }
 
 fn command(cmd: u8, deadline: u64) -> bool {
@@ -687,12 +714,15 @@ fn write_config(value: u8, deadline: u64) -> bool {
 /// stop.
 fn flush() -> bool {
     for _ in 0..32 {
-        if inb(STATUS) & OBF == 0 {
-            return true;
+        match status() {
+            None => return false,
+            Some(s) if s & OBF == 0 => return true,
+            Some(_) => {
+                inb(DATA);
+            }
         }
-        inb(DATA);
     }
-    inb(STATUS) & OBF == 0
+    status().is_some_and(|s| s & OBF == 0)
 }
 
 /// Send a device command byte by byte, each acknowledged with 0xFA.
@@ -786,26 +816,57 @@ fn aux_reenable() {
     log!("i8042: aux re-enable failed {failures} times — pointer written off, line masked");
 }
 
+/// What firmware claims about the 8042, which is never what decides.
+///
+/// The substitute is the ThinkPad T14 Gen 2's own answer, printed on its own
+/// screen: FADT revision 6, `iapc_boot_arch=0x0011` — `LEGACY_DEVICES` set,
+/// **8042 clear**, `NO_ASPM` set — on a machine whose integrated keyboard is
+/// PS/2. It exists because QEMU cannot stage the disagreement: `i8042=off`
+/// clears the bit *by removing the device*, and `-device i8042` puts the device
+/// back into the QOM tree the bit is derived from, so on QEMU the claim and the
+/// hardware always agree. Handing the driver a denial on a machine that has a
+/// controller is the only way to test that the denial does not stop it.
+#[cfg(not(feature = "i8042-fadt-denial"))]
+fn firmware_claim(rsdp_addr: u64) -> Result<(u8, u16), crate::drivers::acpi::TableError> {
+    crate::drivers::acpi::iapc_boot_arch(rsdp_addr)
+}
+
+#[cfg(feature = "i8042-fadt-denial")]
+fn firmware_claim(_rsdp_addr: u64) -> Result<(u8, u16), crate::drivers::acpi::TableError> {
+    Ok((6, 0x0011))
+}
+
 pub fn init(rsdp_addr: u64) {
-    // Three answers, and only one of them is firmware's. A refusal from the
-    // parser says nothing about the hardware — it says the table could not be
-    // believed — so it must never be spelled the way "absent" is, and it must
-    // not stop the probe. On a laptop with a dead keyboard this line is the
-    // whole question: did firmware tell us not to touch the controller, or did
-    // we decide that for ourselves out of a table we could not read?
-    match crate::drivers::acpi::iapc_boot_arch(rsdp_addr) {
-        // Bit 1 is "8042 present", and it is only meaningful from revision 2.
-        // On a machine that clears it, 0x60/0x64 may be decoded by something
-        // else, so they are never touched at all.
-        Ok((revision, flags)) if revision >= 2 && flags & 0x0002 == 0 => {
-            log!("i8042: absent (FADT rev {} iapc_boot_arch={:#06x})", revision, flags);
-            return;
-        }
-        Ok((revision, flags)) if revision < 2 => {
-            log!("i8042: FADT rev {} says nothing (flags {:#06x}), probing", revision, flags);
-        }
-        Ok(_) => {}
-        Err(e) => log!("i8042: no trustworthy FADT ({e:?}) — firmware said nothing either way, probing"),
+    // Firmware's claim is logged and not obeyed, and the asymmetry is the
+    // reason. `IAPC_BOOT_ARCH` bit 1 is one summary bit a vendor wrote once;
+    // the handshake below is a config-byte read-back, a `0xAB` port interface
+    // test and a `0xF0 0x00` scancode-set query checked against `0x41` — three
+    // direct observations of the machine in front of us, each of which is
+    // strictly better evidence than the claim. Gating the strong check on the
+    // weak one is backwards, and it cost the T14 its keyboard: bit 1 clear on a
+    // laptop whose integrated keyboard is PS/2, so the controller was never
+    // given a chance to answer.
+    //
+    // The line stays, because the *disagreement* is the diagnosis. What
+    // firmware said and what the controller answered are two separate facts,
+    // and a machine that cannot be single-stepped needs both on the same
+    // screen. An unreadable table is a third answer and is spelled differently
+    // again: a refusal from the parser says nothing about the hardware.
+    match firmware_claim(rsdp_addr) {
+        Ok((revision, flags)) => log!(
+            "i8042: FADT rev {} iapc_boot_arch={:#06x}, bit 1 (8042) {} — probing either way",
+            revision,
+            flags,
+            if flags & FADT_8042 != 0 { "set" } else { "clear" }
+        ),
+        Err(e) => log!("i8042: no trustworthy FADT ({e:?}) — firmware claims nothing either way"),
+    }
+
+    // One `inb` settles every machine that has nothing there, before a single
+    // byte is written to ports that might belong to something else.
+    if status().is_none() {
+        log!("i8042: absent — port {STATUS:#x} reads {FLOATING_BUS:#04x}, nothing decodes it");
+        return;
     }
 
     // The whole probe, from the first port touch to the last. Every stage
@@ -844,9 +905,6 @@ pub fn init(rsdp_addr: u64) {
         }
     }
 
-    // On a machine with no controller `inb(0x64)` returns 0xFF from a
-    // floating bus and every status bit reads set. The self-test is what
-    // separates "controller" from "nothing".
     let Some(selftest_deadline) = stage(SELFTEST_MS, budget, "self-test") else {
         return;
     };

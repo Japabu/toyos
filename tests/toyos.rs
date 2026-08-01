@@ -108,6 +108,7 @@ const MACHINE_TESTS: &[&str] = &[
     "i8042_absent",
     "i8042_quarantine",
     "i8042_budget_expiry",
+    "i8042_fadt_denial",
     "xhci_xecp_walk",
     "xhci_slot_exhaustion",
     "usb_storage_gate",
@@ -3205,6 +3206,66 @@ fn run_machine_test(
             eprintln!("  [i8042] {}", line.trim());
             Ok(())
         }
+        "i8042_fadt_denial" => {
+            // The T14's verdict, reproduced: firmware says there is no 8042 and
+            // there is one. `i8042-fadt-denial` hands the probe the laptop's own
+            // FADT answer — revision 6, iapc_boot_arch=0x0011 — on QEMU's
+            // working controller, because QEMU cannot stage the disagreement
+            // itself: it derives the bit from the presence of the device.
+            //
+            // Delivery to userland is the assertion, not the log line. "The
+            // driver attached" is what a gate removal is supposed to produce;
+            // "the keys arrive" is what it is *for*, and only the second one
+            // fails if some later step believes the claim instead.
+            let options = BootOptions {
+                profile: qemu::Profile::Metal,
+                qmp: true,
+                kernel_features: &["i8042-fadt-denial"],
+                ..Default::default()
+            };
+            metal_sim_argv_check(&qemu::profile_argv(&options))?;
+            let mut qemu =
+                QemuInstance::boot_with_options(test_config, c_bins, rust_bins, options);
+            let boot = qemu.boot_log().to_string();
+            // Revision 6 is what proves the substitution took: QEMU's own FADT
+            // is revision 3, so this line cannot be the machine's.
+            let want_claim = "FADT rev 6 iapc_boot_arch=0x0011, bit 1 (8042) clear";
+            let Some(claim) = boot.lines().find(|l| l.contains(want_claim)) else {
+                return Err(format!("the probe was never handed a denial:\n{boot}"));
+            };
+            if !boot.contains("i8042: kbd set2+xlat (readback 0x41)") {
+                return Err(format!(
+                    "firmware denied the controller and the driver believed it:\n{boot}"
+                ));
+            }
+            let result = qemu.run_test_hooked(
+                "test_rs_i8042_keyboard",
+                Duration::from_secs(20),
+                "===I8042_READY===",
+                |socket| {
+                    for key in ["h", "e", "l", "l", "o"] {
+                        qemu::qmp_send_keys(socket, &[(key, true), (key, false)]);
+                        thread::sleep(Duration::from_millis(20));
+                    }
+                },
+            );
+            if let Some(err) = &result.error {
+                return Err(format!("{err}\n{}", result.stdout));
+            }
+            let typed: String = parse_key_events(&result.stdout)
+                .iter()
+                .filter(|e| e.modifiers & 0x10 == 0)
+                .map(|e| e.translated.as_str())
+                .collect();
+            if !typed.contains("hello") {
+                return Err(format!(
+                    "typed {typed:?} — the keyboard firmware denied does not reach userland"
+                ));
+            }
+            eprintln!("  [i8042] {}", claim.trim());
+            eprintln!("  [i8042] typed {typed:?} through a controller firmware denied");
+            Ok(())
+        }
         "i8042_absent" => {
             // A/B in one session: the guest's own `Boot: complete (Nms)` is
             // the instrument, because host-side timing here is dominated by
@@ -3232,31 +3293,45 @@ fn run_machine_test(
                 },
             );
             let log = without.boot_log().to_string();
-            // Reaching the ready marker at all is most of the assertion: the
-            // boot got past a controller that answers nothing.
-            let Some(absent) = log.lines().find(|l| l.contains("i8042: absent")) else {
-                return Err(format!("no `i8042: absent` line on a machine with no i8042:\n{log}"));
-            };
             // Measured: `-machine q35,i8042=off` also clears the FADT
-            // IAPC_BOOT_ARCH 8042 bit, which was unverified when this driver
-            // was designed. So the gate must be what fires — any other
-            // absence line means the kernel probed 0x60/0x64 on a machine
-            // that may have something else decoding them.
-            if !absent.contains("iapc_boot_arch") {
+            // IAPC_BOOT_ARCH 8042 bit. That used to make this test certify the
+            // gate; now it is what makes it certify the opposite — firmware
+            // denies the controller, the driver probes anyway, and the
+            // *handshake* is what refuses. Both halves are asserted, because a
+            // refusal on the right machine for the wrong reason is exactly the
+            // false pass available here.
+            let Some(claim) = log.lines().find(|l| l.contains("iapc_boot_arch")) else {
+                return Err(format!("the driver never said what firmware claimed:\n{log}"));
+            };
+            if !claim.contains("bit 1 (8042) clear") {
                 return Err(format!(
-                    "the FADT gate did not fire; the kernel touched the ports instead: {absent}"
+                    "`-machine q35,i8042=off` no longer clears the FADT bit, so this \
+                     configuration no longer stages a firmware denial: {claim}"
                 ));
+            }
+            // The floating bus, not any of the sixteen handshake refusals: on a
+            // machine with nothing there the probe must cost one `inb`, and
+            // that is also what makes the timing assertion below tight.
+            let want = "i8042: absent — port 0x64 reads 0xff";
+            if !log.contains(want) {
+                return Err(format!("no `{want}` line on a machine with no i8042:\n{log}"));
             }
             let without_ms = boot_millis(&log)
                 .ok_or_else(|| format!("no `Boot: complete` line:\n{log}"))?;
-            if without_ms > with_ms + 1000 {
+            // The regression this guards is 2100 ms: with no floating-bus test
+            // the very first `wait_writable` sees IBF set in 0xff and waits out
+            // the whole init budget. The allowance is for boot-to-boot noise
+            // between two QEMU launches in one session, nothing else.
+            if without_ms > with_ms + 300 {
                 return Err(format!(
                     "boot took {without_ms}ms without an i8042 and {with_ms}ms with one — a wait is not bounded"
                 ));
             }
-            // Which line it is settles empirically whether QEMU also clears
-            // the FADT bit, which was unverified when this was designed.
-            eprintln!("  [i8042] absent via: {}", absent.trim());
+            eprintln!("  [i8042] firmware: {}", claim.trim());
+            eprintln!(
+                "  [i8042] {}",
+                log.lines().find(|l| l.contains(want)).unwrap_or_default().trim()
+            );
             eprintln!("  [i8042] boot {without_ms}ms without vs {with_ms}ms with");
             Ok(())
         }

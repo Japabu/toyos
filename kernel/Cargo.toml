@@ -26,6 +26,13 @@ i8042-fault = []
 # microseconds — the whole probe measures 0.099 s to 0.100 s on a metal-sim
 # boot — and no real EC has ever been timed, so nothing else can reach them.
 i8042-budget-expired = []
+# Hand the i8042 probe the T14's own FADT answer — revision 6,
+# iapc_boot_arch=0x0011, the 8042 bit clear — on a machine that has a working
+# controller. QEMU cannot stage that disagreement: `-machine q35,i8042=off`
+# clears the bit by removing the device and `-device i8042` puts the device back
+# into the QOM tree the bit is read from, so there the claim and the hardware
+# always agree.
+i8042-fadt-denial = []
 # Script the input core directly at end of boot. QEMU activates one input
 # handler per device class, so two keyboards or two pointers can never both be
 # live in a guest — the merge has no end-to-end test and this is its only one.

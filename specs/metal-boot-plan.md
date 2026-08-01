@@ -115,18 +115,46 @@ bar; QEMU cannot.
   wire), so QEMU honours both `0xF0 0x02` and the XLAT config bit; clearing
   the bit makes it answer 0x02 and the driver refuses to attach rather than
   decode garbage. `-machine q35,i8042=off` **does** clear the FADT
-  `IAPC_BOOT_ARCH` 8042 bit, so the gate fires and the ports are never
-  touched. IRQ 1 and IRQ 12 are uncovered by q35's override table, so they
+  `IAPC_BOOT_ARCH` 8042 bit — which was how the gate got tested, and is now how
+  its removal is: see **R0** below, since QEMU derives that bit from the
+  presence of the device and so cannot make the two disagree.
+  IRQ 1 and IRQ 12 are uncovered by q35's override table, so they
   stay identity/edge/high — but that is q35's answer to a per-machine
   question, not a settled fact, and it is the one this list is most likely to
   be wrong about on metal. And the aux port's presence probe, device reset and
   rate/resolution programming all work as specified.
 
+  **R0 — ANSWERED ON THE LAPTOP, and it changed the design.** The first
+  `--diag-boot` run printed one line and stopped there:
+
+  ```
+  i8042: absent (FADT rev 6 iapc_boot_arch=0x0011)
+  ```
+
+  The checksum passed, so this is firmware speaking rather than an unreadable
+  table. `0x0011` is `LEGACY_DEVICES` set, **8042 clear**, `NO_ASPM` set
+  (ACPICA `actbl.h`; ACPI 6.5 §5.2.9.3). The FADT contradicts itself — legacy
+  devices present, no 8042 — and the gate believed the half that was wrong: the
+  driver refused on bit 1 and never touched the controller, so the keyboard and
+  the TrackPoint were never given a chance to answer.
+
+  **Bit 1 no longer gates the probe.** Not a fallback and not a quirk: the
+  driver's own handshake — config-byte read-back, `0xAB` port interface test,
+  `0xF0 0x00` verified against `0x41` — is direct observation of the machine,
+  and a coarse vendor-written summary bit standing in front of it is backwards.
+  The claim is still logged, because the disagreement is the diagnosis. Safety
+  on a machine that genuinely has nothing there is the floating bus: `0xff` from
+  port 0x64 is every status bit set at once, which no controller produces, so
+  the probe refuses in one `inb` rather than waiting out the init budget.
+  `i8042_absent` and `i8042_fadt_denial` are the two gates.
+
   What QEMU still cannot decide is **R1**: whether the T14's eSPI EC lands in
   set 2 + translation on. The read-back is a full determination of the wire
   format and the driver disables rather than decodes a format it did not ask
   for, so the first metal boot answers it in one short line on the laptop's
-  own screen. Contingency is one commit (set-2 tables, clear bit 6).
+  own screen. Contingency is one commit (set-2 tables, clear bit 6). R0's
+  answer is what makes R1 reachable at all — until now the probe stopped
+  before the question was asked.
 
   Also untested outside QEMU, in rough order of risk: the interrupt topology
   (design §12.5, R3) — QEMU has one textbook I/O APIC at 0xFEC00000 with
@@ -134,9 +162,12 @@ bar; QEMU cannot.
   firmware-programmed RTEs, possibly more than one unit, and a real ISO table,
   so the version-register plausibility gate and `route`'s read-back are what
   make a wrong topology one log line instead of a silently dead keyboard;
-  SMM trapping port 0x60;
-  real EC timing against the 500 ms/750 ms/600 ms stage budgets, each clamped
-  to the 1.5 s total; the mouse framer's 5 ms packet-gap threshold, which is the
+  SMM trapping port 0x60 — the xHCI USBLEGSUP handoff runs immediately before
+  `i8042::init` and clears the controller's SMI enables, so the USB legacy
+  emulation that would trap those ports is disarmed by then;
+  real EC timing against the 500 ms/750 ms/600 ms stage budgets, which since
+  `d13efa6` sum *into* the total rather than past it (250 + 500 + 750 + 600 =
+  2100 ms); the mouse framer's 5 ms packet-gap threshold, which is the
   only thing that re-frames a PS/2 pointer stream and assumes both the 100
   samples/s the driver programs and an interrupt latency under ~2 ms — a slower
   ISR splits a packet, which costs one packet and self-heals at the next gap;
